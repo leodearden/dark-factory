@@ -3,17 +3,44 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import time
+from datetime import UTC, datetime
+from pathlib import Path
 from unittest.mock import AsyncMock
 
 import aiosqlite
 import pytest
 import pytest_asyncio
-from _fm_helpers import poll_until
+from _fm_held_writes import HeldWrites
+from _fm_helpers import make_retry_budget_queue
+from _fm_polling import poll_until, poll_until_dead
+from _queued_write_fixtures import (
+    EPISODE_WIRE_KEYS,
+    envelope,
+    episode_write,
+    graphiti_memory_write,
+    insert_raw_row,
+    mem0_fact,
+    queued,
+)
+from shared.async_sqlite_base import CheckpointResult
 
 import fused_memory.services.durable_queue as dq_module
 from fused_memory.services.durable_queue import DurableWriteQueue
+from fused_memory.services.queued_writes import (
+    QueueCallback,
+    QueueDecodeError,
+    QueuedEpisodeWrite,
+)
+
+
+class _UnserialisableWrite(QueuedEpisodeWrite):
+    """A write that fails while the queue inserts it, to exercise batch rollback."""
+
+    def to_json(self) -> str:
+        raise RuntimeError('cannot serialise this write')
 
 
 @pytest.fixture
@@ -43,18 +70,14 @@ async def queue(tmp_path, mock_execute):
 class TestEnqueue:
     @pytest.mark.asyncio
     async def test_enqueue_returns_id(self, queue):
-        item_id = await queue.enqueue(
-            group_id='proj1', operation='add_episode',
-            payload={'content': 'hello', 'group_id': 'proj1', 'name': 'ep'},
-        )
+        item_id = await queue.enqueue(queued('add_episode', {'content': 'hello', 'group_id': 'proj1', 'name': 'ep'}, group_id='proj1'))
         assert isinstance(item_id, int)
         assert item_id > 0
 
     @pytest.mark.asyncio
     async def test_enqueue_batch(self, queue):
         items = [
-            {'group_id': 'proj1', 'operation': 'add_episode',
-             'payload': {'content': f'item {i}', 'group_id': 'proj1', 'name': f'ep{i}'}}
+            (queued('add_episode', {'content': f'item {i}', 'group_id': 'proj1', 'name': f'ep{i}'}), None)
             for i in range(5)
         ]
         ids = await queue.enqueue_batch(items)
@@ -65,10 +88,7 @@ class TestEnqueue:
 class TestWorkerProcessing:
     @pytest.mark.asyncio
     async def test_item_gets_processed(self, queue, mock_execute):
-        await queue.enqueue(
-            group_id='proj1', operation='add_episode',
-            payload={'content': 'test', 'group_id': 'proj1', 'name': 'ep'},
-        )
+        await queue.enqueue(queued('add_episode', {'content': 'test', 'group_id': 'proj1', 'name': 'ep'}, group_id='proj1'))
 
         # Poll until the worker has picked up and completed the item, instead
         # of a fixed sleep that can race under full-suite CPU load. Polling
@@ -86,22 +106,17 @@ class TestWorkerProcessing:
     @pytest.mark.asyncio
     async def test_callback_invoked(self, queue, mock_execute):
         callback = AsyncMock()
-        queue.register_callback('test_cb', callback)
+        queue.register_callback(QueueCallback.DUAL_WRITE_EPISODE, callback)
 
-        await queue.enqueue(
-            group_id='proj1', operation='add_episode',
-            payload={'content': 'test', 'group_id': 'proj1', 'name': 'ep'},
-            callback_type='test_cb',
-        )
+        await queue.enqueue(queued('add_episode', {'content': 'test', 'group_id': 'proj1', 'name': 'ep'}, group_id='proj1'), callback=QueueCallback.DUAL_WRITE_EPISODE)
         await poll_until(
             lambda: callback.called,
             message='timed out waiting for the callback to be invoked',
         )
         callback.assert_called_once()
-        # Check callback received (callback_type, result, payload)
-        args = callback.call_args[0]
-        assert args[0] == 'test_cb'
-        assert args[1] == {'episode_uuid': 'ep-001'}
+        value, result = callback.call_args[0]
+        assert value.content == 'test'
+        assert result == {'episode_uuid': 'ep-001'}
 
 
 class TestRetry:
@@ -109,7 +124,7 @@ class TestRetry:
     async def test_retries_on_failure(self, tmp_path):
         call_count = 0
 
-        async def flaky_execute(op, payload):
+        async def flaky_execute(value):
             nonlocal call_count
             call_count += 1
             if call_count < 3:
@@ -127,10 +142,7 @@ class TestRetry:
         )
         await q.initialize()
 
-        await q.enqueue(
-            group_id='proj1', operation='add_episode',
-            payload={'content': 'test', 'group_id': 'proj1', 'name': 'ep'},
-        )
+        await q.enqueue(queued('add_episode', {'content': 'test', 'group_id': 'proj1', 'name': 'ep'}, group_id='proj1'))
 
         # Poll instead of a fixed sleep: retries involve the worker's own
         # 0.5s idle-poll floor (see _worker_loop) on top of the backoff
@@ -158,7 +170,7 @@ class TestTimeout:
     async def test_slow_write_retried(self, tmp_path):
         call_count = 0
 
-        async def slow_execute(op, payload):
+        async def slow_execute(value):
             nonlocal call_count
             call_count += 1
             if call_count == 1:
@@ -176,10 +188,7 @@ class TestTimeout:
         )
         await q.initialize()
 
-        await q.enqueue(
-            group_id='proj1', operation='add_episode',
-            payload={'content': 'test', 'group_id': 'proj1', 'name': 'ep'},
-        )
+        await q.enqueue(queued('add_episode', {'content': 'test', 'group_id': 'proj1', 'name': 'ep'}, group_id='proj1'))
 
         async def _retried_after_timeout_and_completed():
             s = await q.get_stats()
@@ -213,18 +222,14 @@ class TestDeadLetter:
         )
         await q.initialize()
 
-        await q.enqueue(
-            group_id='proj1', operation='add_episode',
-            payload={'content': 'test', 'group_id': 'proj1', 'name': 'ep'},
-        )
+        await q.enqueue(queued('add_episode', {'content': 'test', 'group_id': 'proj1', 'name': 'ep'}, group_id='proj1'))
         # Poll until the item reaches 'dead' status instead of using a fixed
         # wall-clock sleep.  The dead-letter path (attempt1→retry→attempt2→dead)
         # involves several real SQLite fsync commits; under full-suite xdist load
         # the fixed 1.0s budget was regularly exceeded, causing flaky failures.
-        # 20s is generous under any load while staying well under the 60s
-        # pytest-timeout.  The accounting itself (attempts counter, 'dead'
-        # status) is deterministic given a single worker + max_attempts=2.
-        await _poll_until_dead(q, group_id='proj1', expected_dead=1, timeout=20.0)
+        # The accounting itself (attempts counter, 'dead' status) is
+        # deterministic given a single worker + max_attempts=2.
+        await poll_until_dead(q, group_id='proj1', expected_dead=1)
 
         dead = await q.get_dead_items()
         assert len(dead) == 1
@@ -249,11 +254,8 @@ class TestDeadLetter:
 
         # Enqueue 4 items that will all be dead-lettered.
         for i in range(4):
-            await q.enqueue(
-                group_id='proj1', operation='add_episode',
-                payload={'content': f'item {i}', 'group_id': 'proj1', 'name': f'ep{i}'},
-            )
-        await _poll_until_dead(q, group_id='proj1', expected_dead=4, timeout=20.0)
+            await q.enqueue(queued('add_episode', {'content': f'item {i}', 'group_id': 'proj1', 'name': f'ep{i}'}, group_id='proj1'))
+        await poll_until_dead(q, group_id='proj1', expected_dead=4)
 
         # All 4 should be dead.
         all_dead = await q.get_dead_items()
@@ -283,7 +285,7 @@ class TestReplayDead:
     async def test_replay_resets_dead_items(self, tmp_path):
         call_count = 0
 
-        async def eventually_works(op, payload):
+        async def eventually_works(value):
             nonlocal call_count
             call_count += 1
             if call_count <= 2:
@@ -301,11 +303,8 @@ class TestReplayDead:
         )
         await q.initialize()
 
-        await q.enqueue(
-            group_id='proj1', operation='add_episode',
-            payload={'content': 'test', 'group_id': 'proj1', 'name': 'ep'},
-        )
-        await _poll_until_dead(q, group_id='proj1', expected_dead=1, timeout=20.0)
+        await q.enqueue(queued('add_episode', {'content': 'test', 'group_id': 'proj1', 'name': 'ep'}, group_id='proj1'))
+        await poll_until_dead(q, group_id='proj1', expected_dead=1)
 
         # Should be dead-lettered
         dead = await q.get_dead_items()
@@ -338,7 +337,7 @@ class TestConcurrency:
         current = 0
         lock = asyncio.Lock()
 
-        async def tracking_execute(op, payload):
+        async def tracking_execute(value):
             nonlocal max_concurrent, current
             async with lock:
                 current += 1
@@ -362,10 +361,7 @@ class TestConcurrency:
 
         # Enqueue 10 items
         for i in range(10):
-            await q.enqueue(
-                group_id='proj1', operation='add_episode',
-                payload={'content': f'item {i}', 'group_id': 'proj1', 'name': f'ep{i}'},
-            )
+            await q.enqueue(queued('add_episode', {'content': f'item {i}', 'group_id': 'proj1', 'name': f'ep{i}'}, group_id='proj1'))
 
         async def _all_completed():
             s = await q.get_stats()
@@ -398,8 +394,7 @@ class TestRecovery:
         await q.initialize()
 
         # Manually insert an in_flight item (simulating crash)
-        assert q._db is not None
-        await q._db.execute(
+        await q._require_access().connection.execute(
             'INSERT INTO write_queue '
             '(group_id, operation, payload, status, attempts, max_attempts, '
             ' next_retry_at, created_at) '
@@ -407,7 +402,7 @@ class TestRecovery:
             ('proj1', 'add_episode', '{"content":"crashed","group_id":"proj1","name":"ep"}',
              time.time()),
         )
-        await q._db.commit()
+        await q._require_access().connection.commit()
         await q.close()
 
         # Re-open — should recover
@@ -444,8 +439,8 @@ class TestMultipleGroups:
         groups_seen: dict[str, int] = {}
         lock = asyncio.Lock()
 
-        async def group_tracking_execute(op, payload):
-            gid = payload['group_id']
+        async def group_tracking_execute(value):
+            gid = value.envelope.group_id
             async with lock:
                 groups_seen[gid] = groups_seen.get(gid, 0) + 1
             await asyncio.sleep(0.02)
@@ -464,10 +459,7 @@ class TestMultipleGroups:
 
         for group in ['alpha', 'beta', 'gamma']:
             for i in range(3):
-                await q.enqueue(
-                    group_id=group, operation='add_episode',
-                    payload={'content': f'{group}-{i}', 'group_id': group, 'name': f'ep{i}'},
-                )
+                await q.enqueue(queued('add_episode', {'content': f'{group}-{i}', 'group_id': group, 'name': f'ep{i}'}, group_id=group))
 
         def _all_groups_seen_thrice():
             return all(groups_seen.get(g, 0) >= 3 for g in ('alpha', 'beta', 'gamma'))
@@ -489,31 +481,109 @@ class TestEnqueueBatchRollback:
     async def test_rollback_on_mid_batch_exception(self, queue):
         """Bug 4: enqueue_batch must roll back on a mid-batch exception.
 
-        A batch where the 2nd item is missing 'operation' (KeyError) should
+        A batch where the 2nd item cannot be serialised (RuntimeError) should
         raise, and the DB should contain 0 pending items (no partial inserts).
         """
         items = [
-            {'group_id': 'proj1', 'operation': 'add_episode',
-             'payload': {'content': 'good', 'group_id': 'proj1', 'name': 'ep1'}},
-            # Missing 'operation' key — triggers KeyError mid-batch
-            {'group_id': 'proj1',
-             'payload': {'content': 'bad', 'group_id': 'proj1', 'name': 'ep2'}},
-            {'group_id': 'proj1', 'operation': 'add_episode',
-             'payload': {'content': 'also good', 'group_id': 'proj1', 'name': 'ep3'}},
+            (episode_write(envelope=envelope(group_id='proj1'), content='good'), None),
+            (_UnserialisableWrite(
+                envelope=envelope(group_id='proj1'), content='bad',
+            ), None),
+            (episode_write(envelope=envelope(group_id='proj1'), content='also good'), None),
         ]
 
-        with pytest.raises(KeyError):
+        with pytest.raises(RuntimeError):
             await queue.enqueue_batch(items)
 
-        # Verify rollback: no items should have been persisted
-        assert queue._db is not None
-        cursor = await queue._db.execute(
-            "SELECT COUNT(*) FROM write_queue WHERE status='pending'"
+        counts = (await queue.get_stats(group_id='proj1'))['counts']
+        assert counts == {}, f'Expected no rows after rollback, got {counts}'
+
+    @pytest.mark.asyncio
+    async def test_a_failed_batch_is_atomic_while_workers_commit(self, tmp_path):
+        """A failing batch leaves nothing, and no worker's commit is discarded.
+
+        The queue shares ONE aiosqlite connection between ``enqueue_batch`` and
+        every worker, so the batch's statements and the workers' claim /
+        executed / completed / failure commits interleave on it.  A worker's
+        commit then commits whatever half of the batch was already inserted,
+        and the batch's rollback discards whatever a worker had not committed
+        yet — the connection-wide rollback of
+        ``plans/recon-sqlite-database-locked-rca-2026-09-16.md`` RC9.
+
+        Measured before ``AtomicConnection`` with a probe of this shape minus
+        the transient failures, 3 runs: 85 and 88 'batch' rows survived as
+        pending, and in the third run the batch's explicit ``BEGIN`` raised
+        ``OperationalError: cannot start a transaction within a transaction``
+        (so ``pytest.raises(KeyError)`` fails too).  This final shape, which
+        also puts ``_handle_failure``'s commit in the window, re-measured over
+        5 runs: failed 5/5 — 126, 138, 140 and 153 'batch' rows survived as
+        pending in four, and the fifth raised the same ``BEGIN`` error.  After
+        the fix: passed 5/5, no batch row left.
+
+        A CANCELLED batch is deliberately absent: it measured clean before the
+        fix (it cancels at its ``BEGIN`` and leaves nothing), and an arm that
+        passes on unfixed code asserts nothing.
+        """
+        executed: list[str] = []
+        attempts: dict[str, int] = {}
+
+        async def execute_write(value):
+            name = value.name
+            attempts[name] = attempts.get(name, 0) + 1
+            if int(name.removeprefix('w')) % 2 == 1 and attempts[name] == 1:
+                raise ConnectionError(f'first attempt of {name} fails transiently')
+            executed.append(name)
+            return {'ok': True}
+
+        q = DurableWriteQueue(
+            data_dir=tmp_path / 'queue',
+            execute_write=execute_write,
+            workers_per_group=3,
+            semaphore_limit=5,
+            max_attempts=3,
+            retry_base_seconds=0.05,
+            write_timeout_seconds=2.0,
         )
-        row = await cursor.fetchone()
-        assert row[0] == 0, (
-            f'Expected 0 pending items after rollback, got {row[0]}'
-        )
+        await q.initialize()
+        try:
+            for i in range(30):
+                await q.enqueue(queued('add_episode', {'content': f'item {i}', 'group_id': 'workers', 'name': f'w{i}'}, group_id='workers'))
+            batch = [
+                (queued('add_episode', {
+                    'content': f'batch {i}', 'group_id': 'batch', 'name': f'b{i}',
+                }), None)
+                for i in range(200)
+            ]
+            # Unserialisable — a RuntimeError after 200 INSERTs.
+            batch.append((_UnserialisableWrite(
+                envelope=envelope(group_id='batch'), content='bad', name='bad',
+            ), None))
+
+            with pytest.raises(RuntimeError):
+                await asyncio.wait_for(q.enqueue_batch(batch), 10)
+
+            async def _workers_drained():
+                stats = await q.get_stats(group_id='workers')
+                return stats if stats['counts'].get('completed', 0) == 30 else None
+
+            await poll_until(
+                _workers_drained,
+                timeout=20.0,
+                message='timed out waiting for the 30 worker items to complete',
+            )
+
+            batch_counts = (await q.get_stats(group_id='batch'))['counts']
+            assert batch_counts == {}, (
+                f'the failed batch left rows behind: {batch_counts} — a worker commit '
+                'swept up its half-inserted statements'
+            )
+            assert len(executed) == 30 and len(set(executed)) == 30, (
+                f'{len(executed)} executions of {len(set(executed))} items: a foreign '
+                'rollback discarded a claim or completion and the item re-executed'
+            )
+            assert await q.get_dead_items() == []
+        finally:
+            await q.close()
 
 
 class TestCallbackFailure:
@@ -521,16 +591,12 @@ class TestCallbackFailure:
     async def test_callback_error_triggers_retry(self, queue, mock_execute):
         """Callback failure should retry the item, not silently complete it."""
         failing_callback = AsyncMock(side_effect=ValueError('callback boom'))
-        queue.register_callback('bad_cb', failing_callback)
+        queue.register_callback(QueueCallback.DUAL_WRITE_EPISODE, failing_callback)
 
-        await queue.enqueue(
-            group_id='proj1', operation='add_episode',
-            payload={'content': 'test', 'group_id': 'proj1', 'name': 'ep'},
-            callback_type='bad_cb',
-        )
+        await queue.enqueue(queued('add_episode', {'content': 'test', 'group_id': 'proj1', 'name': 'ep'}, group_id='proj1'), callback=QueueCallback.DUAL_WRITE_EPISODE)
 
         # Wait for all retries to exhaust (max_attempts=3 in fixture)
-        await _poll_until_dead(queue, group_id='proj1', expected_dead=1, timeout=20.0)
+        await poll_until_dead(queue, group_id='proj1', expected_dead=1)
 
         stats = await queue.get_stats()
         # Item should be dead-lettered, not completed — callback kept failing
@@ -541,13 +607,9 @@ class TestCallbackFailure:
     async def test_callback_success_completes_item(self, queue, mock_execute):
         """Callback success should mark the item completed."""
         ok_callback = AsyncMock()
-        queue.register_callback('ok_cb', ok_callback)
+        queue.register_callback(QueueCallback.DUAL_WRITE_EPISODE, ok_callback)
 
-        await queue.enqueue(
-            group_id='proj1', operation='add_episode',
-            payload={'content': 'test', 'group_id': 'proj1', 'name': 'ep'},
-            callback_type='ok_cb',
-        )
+        await queue.enqueue(queued('add_episode', {'content': 'test', 'group_id': 'proj1', 'name': 'ep'}, group_id='proj1'), callback=QueueCallback.DUAL_WRITE_EPISODE)
 
         async def _completed():
             s = await queue.get_stats()
@@ -577,10 +639,7 @@ class TestShutdown:
         )
         await q.initialize()
 
-        await q.enqueue(
-            group_id='proj1', operation='add_episode',
-            payload={'content': 'test', 'group_id': 'proj1', 'name': 'ep'},
-        )
+        await q.enqueue(queued('add_episode', {'content': 'test', 'group_id': 'proj1', 'name': 'ep'}, group_id='proj1'))
         await asyncio.sleep(0.2)
 
         # Close should not raise
@@ -588,43 +647,55 @@ class TestShutdown:
 
         # Workers should be cleaned up
         assert len(q._worker_tasks) == 0
-        assert q._db is None
+        assert await q.checkpoint() == CheckpointResult.unavailable()
 
 
 class TestDeleteDead:
-    """Tests for DurableWriteQueue.delete_dead(group_id, ids)."""
+    """Tests for DurableWriteQueue.delete_dead(group_id, ids).
 
-    async def _insert_dead_row(self, q, group_id: str = 'proj1') -> int:
-        """Insert a dead row directly via SQL and return its id."""
-        assert q._db is not None
-        cursor = await q._db.execute(
-            'INSERT INTO write_queue '
-            '(group_id, operation, payload, status, attempts, max_attempts, '
-            ' next_retry_at, created_at) '
-            "VALUES (?, 'add_episode', '{\"content\":\"dead\"}', 'dead', 3, 3, 0, ?)",
-            (group_id, time.time()),
-        )
-        await q._db.commit()
-        return cursor.lastrowid  # type: ignore[return-value]
+    Rows are seeded and re-read through an independent connection to the
+    queue's database file, never through the queue's own connection.
+    """
 
-    async def _insert_pending_row(self, q, group_id: str = 'proj1') -> int:
-        """Insert a pending row directly via SQL and return its id."""
-        assert q._db is not None
-        cursor = await q._db.execute(
-            'INSERT INTO write_queue '
-            '(group_id, operation, payload, status, attempts, max_attempts, '
-            ' next_retry_at, created_at) '
-            "VALUES (?, 'add_episode', '{\"content\":\"pending\"}', 'pending', 0, 3, 0, ?)",
-            (group_id, time.time()),
-        )
-        await q._db.commit()
-        return cursor.lastrowid  # type: ignore[return-value]
+    @pytest.fixture
+    def queue_file(self, tmp_path) -> Path:
+        """The database file of a queue whose ``data_dir`` is ``tmp_path / 'queue'``."""
+        return tmp_path / 'queue' / 'write_queue.db'
+
+    @staticmethod
+    async def _insert_row(queue_file: Path, group_id: str, status: str, attempts: int) -> int:
+        async with aiosqlite.connect(str(queue_file)) as db:
+            cursor = await db.execute(
+                'INSERT INTO write_queue '
+                '(group_id, operation, payload, status, attempts, max_attempts, '
+                ' next_retry_at, created_at) '
+                "VALUES (?, 'add_episode', ?, ?, ?, 3, 0, ?)",
+                (group_id, f'{{"content":"{status}"}}', status, attempts, time.time()),
+            )
+            await db.commit()
+        assert cursor.lastrowid is not None
+        return cursor.lastrowid
+
+    async def _insert_dead_row(self, queue_file: Path, group_id: str = 'proj1') -> int:
+        return await self._insert_row(queue_file, group_id, 'dead', 3)
+
+    async def _insert_pending_row(self, queue_file: Path, group_id: str = 'proj1') -> int:
+        return await self._insert_row(queue_file, group_id, 'pending', 0)
+
+    @staticmethod
+    async def _present_ids(queue_file: Path, ids: list[int]) -> set[int]:
+        async with aiosqlite.connect(str(queue_file)) as db:
+            rows = await db.execute_fetchall(
+                f"SELECT id FROM write_queue WHERE id IN ({','.join('?' * len(ids))})",
+                tuple(ids),
+            )
+        return {row[0] for row in rows}
 
     @pytest.mark.asyncio
-    async def test_bulk_delete_dead_rows(self, queue):
+    async def test_bulk_delete_dead_rows(self, queue, queue_file):
         """Bulk-deleting dead rows returns them in 'deleted' and removes them."""
-        id1 = await self._insert_dead_row(queue, 'proj1')
-        id2 = await self._insert_dead_row(queue, 'proj1')
+        id1 = await self._insert_dead_row(queue_file, 'proj1')
+        id2 = await self._insert_dead_row(queue_file, 'proj1')
 
         result = await queue.delete_dead(group_id='proj1', ids=[id1, id2])
 
@@ -646,9 +717,9 @@ class TestDeleteDead:
         assert sorted(result['not_found']) == [88888, 99999]
 
     @pytest.mark.asyncio
-    async def test_cross_project_ids_not_deleted(self, queue):
+    async def test_cross_project_ids_not_deleted(self, queue, queue_file):
         """Dead rows from proj-b are not deleted when calling with proj-a."""
-        id_b = await self._insert_dead_row(queue, 'proj-b')
+        id_b = await self._insert_dead_row(queue_file, 'proj-b')
 
         result = await queue.delete_dead(group_id='proj-a', ids=[id_b])
 
@@ -660,22 +731,18 @@ class TestDeleteDead:
         assert any(item['id'] == id_b for item in dead_b)
 
     @pytest.mark.asyncio
-    async def test_non_dead_status_ids_not_deleted(self, queue):
+    async def test_non_dead_status_ids_not_deleted(self, queue, queue_file):
         """Pending rows are silently skipped (land in 'not_found') and stay in table."""
-        id_pending = await self._insert_pending_row(queue, 'proj1')
+        id_pending = await self._insert_pending_row(queue_file, 'proj1')
 
         result = await queue.delete_dead(group_id='proj1', ids=[id_pending])
 
         assert result['deleted'] == []
         assert result['not_found'] == [id_pending]
 
-        # Row must still be present
-        assert queue._db is not None
-        cursor = await queue._db.execute(
-            'SELECT id FROM write_queue WHERE id = ?', (id_pending,)
+        assert await self._present_ids(queue_file, [id_pending]) == {id_pending}, (
+            'Pending row must not be deleted'
         )
-        row = await cursor.fetchone()
-        assert row is not None, 'Pending row must not be deleted'
 
     @pytest.mark.asyncio
     async def test_empty_ids_no_op(self, queue):
@@ -685,11 +752,11 @@ class TestDeleteDead:
         assert result == {'deleted': [], 'not_found': []}
 
     @pytest.mark.asyncio
-    async def test_mixed_call_partitions_correctly(self, queue):
+    async def test_mixed_call_partitions_correctly(self, queue, queue_file):
         """Mixed input: valid dead, cross-project dead, non-existent, non-dead partitions."""
-        id_dead_proj1 = await self._insert_dead_row(queue, 'proj1')
-        id_dead_proj2 = await self._insert_dead_row(queue, 'proj2')
-        id_pending = await self._insert_pending_row(queue, 'proj1')
+        id_dead_proj1 = await self._insert_dead_row(queue_file, 'proj1')
+        id_dead_proj2 = await self._insert_dead_row(queue_file, 'proj2')
+        id_pending = await self._insert_pending_row(queue_file, 'proj1')
         id_nonexistent = 999999
 
         result = await queue.delete_dead(
@@ -702,7 +769,7 @@ class TestDeleteDead:
 
     @pytest.mark.asyncio
     async def test_chunks_large_id_lists_without_param_limit_error(
-        self, queue, monkeypatch
+        self, queue, queue_file, monkeypatch
     ):
         """Large id lists are processed in chunks without hitting SQLite variable limits.
 
@@ -713,11 +780,11 @@ class TestDeleteDead:
         monkeypatch.setattr(dq_module, '_DELETE_DEAD_BATCH_SIZE', 3)
 
         # Insert 7 dead rows for proj1.
-        dead_ids = [await self._insert_dead_row(queue, 'proj1') for _ in range(7)]
+        dead_ids = [await self._insert_dead_row(queue_file, 'proj1') for _ in range(7)]
 
         # Insert 1 pending row for proj1 and 1 dead row for proj2 (both ineligible).
-        pending_id = await self._insert_pending_row(queue, 'proj1')
-        cross_id = await self._insert_dead_row(queue, 'proj2')
+        pending_id = await self._insert_pending_row(queue_file, 'proj1')
+        cross_id = await self._insert_dead_row(queue_file, 'proj2')
         nonexistent_id = 999999
 
         all_input_ids = dead_ids + [pending_id, cross_id, nonexistent_id]
@@ -738,7 +805,7 @@ class TestDeleteDead:
         assert any(item['id'] == cross_id for item in proj2_items)
 
     @pytest.mark.asyncio
-    async def test_exact_batch_size_boundary(self, queue, monkeypatch):
+    async def test_exact_batch_size_boundary(self, queue, queue_file, monkeypatch):
         """ids count == batch_size exercises the loop with zero remainder.
 
         An off-by-one in ``range(0, len(ids), step)`` would silently drop the
@@ -749,7 +816,7 @@ class TestDeleteDead:
 
         # Boundary cases: batch_size-1, batch_size, batch_size+1, 2*batch_size.
         for count in (2, 3, 4, 6):
-            dead_ids = [await self._insert_dead_row(queue, 'proj1') for _ in range(count)]
+            dead_ids = [await self._insert_dead_row(queue_file, 'proj1') for _ in range(count)]
             result = await queue.delete_dead(group_id='proj1', ids=dead_ids)
             assert sorted(result['deleted']) == sorted(dead_ids), (
                 f'All {count} dead rows must be deleted (batch_size boundary)'
@@ -757,7 +824,7 @@ class TestDeleteDead:
             assert result['not_found'] == []
 
     @pytest.mark.asyncio
-    async def test_all_ineligible_chunk_followed_by_eligible_chunk(self, queue, monkeypatch):
+    async def test_all_ineligible_chunk_followed_by_eligible_chunk(self, queue, queue_file, monkeypatch):
         """An all-ineligible first chunk does not clobber the deleted accumulator.
 
         If ``deleted`` were ever overwritten instead of unioned, the second
@@ -766,8 +833,8 @@ class TestDeleteDead:
         """
         monkeypatch.setattr(dq_module, '_DELETE_DEAD_BATCH_SIZE', 3)
 
-        pending_ids = [await self._insert_pending_row(queue, 'proj1') for _ in range(3)]
-        dead_ids = [await self._insert_dead_row(queue, 'proj1') for _ in range(3)]
+        pending_ids = [await self._insert_pending_row(queue_file, 'proj1') for _ in range(3)]
+        dead_ids = [await self._insert_dead_row(queue_file, 'proj1') for _ in range(3)]
 
         # Interleave so the first chunk is all-ineligible.
         all_ids = pending_ids + dead_ids
@@ -776,34 +843,28 @@ class TestDeleteDead:
         assert sorted(result['deleted']) == sorted(dead_ids)
         assert sorted(result['not_found']) == sorted(pending_ids)
 
-        # Pending rows must still be present.
-        assert queue._db is not None
-        cursor = await queue._db.execute(
-            f"SELECT id FROM write_queue WHERE id IN ({','.join('?' * len(pending_ids))})",
-            tuple(pending_ids),
+        assert await self._present_ids(queue_file, pending_ids) == set(pending_ids), (
+            'Pending rows must not be deleted'
         )
-        rows = await cursor.fetchall()
-        found = {(row[0] if isinstance(row, tuple) else row['id']) for row in rows}
-        assert found == set(pending_ids), 'Pending rows must not be deleted'
 
     @pytest.mark.asyncio
-    async def test_operational_error_returns_typed_envelope(self, queue, monkeypatch):
+    async def test_operational_error_returns_typed_envelope(self, queue, queue_file, monkeypatch):
         """An aiosqlite.OperationalError during DELETE returns a typed retriable envelope.
 
         The function must NOT raise; instead it returns a dict with
         error_type='TransientSqliteError' and retriable=True.
         """
-        id1 = await self._insert_dead_row(queue, 'proj1')
+        id1 = await self._insert_dead_row(queue_file, 'proj1')
 
         # Replace db.execute with one that raises OperationalError on any DELETE call.
-        original_execute = queue._db.execute
+        original_execute = queue._require_access().connection.execute
 
         async def mock_execute(sql, *args, **kwargs):
             if 'DELETE' in sql.upper():
                 raise aiosqlite.OperationalError('database is locked')
             return await original_execute(sql, *args, **kwargs)
 
-        monkeypatch.setattr(queue._db, 'execute', mock_execute)
+        monkeypatch.setattr(queue._require_access().connection, 'execute', mock_execute)
 
         result = await queue.delete_dead(group_id='proj1', ids=[id1])
 
@@ -820,7 +881,7 @@ class TestDeleteDead:
 
     @pytest.mark.asyncio
     async def test_operational_error_mid_batch_preserves_deleted_progress(
-        self, queue, monkeypatch
+        self, queue, queue_file, monkeypatch
     ):
         """Mid-batch OperationalError: prior-chunk deletions are committed and reported.
 
@@ -834,11 +895,11 @@ class TestDeleteDead:
         """
         monkeypatch.setattr(dq_module, '_DELETE_DEAD_BATCH_SIZE', 3)
 
-        dead_ids = [await self._insert_dead_row(queue, 'proj1') for _ in range(7)]
+        dead_ids = [await self._insert_dead_row(queue_file, 'proj1') for _ in range(7)]
 
         # Track which DELETE invocation we're on.
         delete_call_count = 0
-        original_execute = queue._db.execute
+        original_execute = queue._require_access().connection.execute
 
         async def mock_execute(sql, *args, **kwargs):
             nonlocal delete_call_count
@@ -848,7 +909,7 @@ class TestDeleteDead:
                     raise aiosqlite.OperationalError('database is locked')
             return await original_execute(sql, *args, **kwargs)
 
-        monkeypatch.setattr(queue._db, 'execute', mock_execute)
+        monkeypatch.setattr(queue._require_access().connection, 'execute', mock_execute)
 
         result = await queue.delete_dead(group_id='proj1', ids=dead_ids)
 
@@ -868,7 +929,7 @@ class TestDeleteDead:
         # confirm the commit landed.  We avoid re-instantiating DurableWriteQueue
         # with hard-coded constructor args (which could silently diverge from the
         # fixture) — raw aiosqlite is sufficient for a table-contents check.
-        db_path = queue._data_dir / 'write_queue.db'
+        db_path = queue_file
         await queue.close()
 
         async with aiosqlite.connect(str(db_path)) as raw_db:
@@ -895,7 +956,7 @@ class TestDeleteDead:
         assert envelope_deleted | envelope_remaining == set(dead_ids)
 
     @pytest.mark.asyncio
-    async def test_duplicate_input_ids_never_overlap_buckets(self, queue, monkeypatch):
+    async def test_duplicate_input_ids_never_overlap_buckets(self, queue, queue_file, monkeypatch):
         """Duplicate ids in the input must never appear in both deleted and not_found.
 
         When batch_size=1 a list like [id1, id1] forces two separate chunks.
@@ -908,7 +969,7 @@ class TestDeleteDead:
         """
         monkeypatch.setattr(dq_module, '_DELETE_DEAD_BATCH_SIZE', 1)
 
-        id1 = await self._insert_dead_row(queue, 'proj1')
+        id1 = await self._insert_dead_row(queue_file, 'proj1')
 
         result = await queue.delete_dead(group_id='proj1', ids=[id1, id1])
 
@@ -922,7 +983,7 @@ class TestDeleteDead:
 
     @pytest.mark.asyncio
     async def test_recovery_commit_failure_logs_at_error_level_with_traceback(
-        self, queue, monkeypatch, caplog
+        self, queue, queue_file, monkeypatch, caplog
     ):
         """Recovery-commit failure must be logged at ERROR level with a traceback.
 
@@ -932,23 +993,23 @@ class TestDeleteDead:
         operators see the traceback — distinguishing logger.exception() from
         logger.error() or logger.warning().
         """
-        id1 = await self._insert_dead_row(queue, 'proj1')
+        id1 = await self._insert_dead_row(queue_file, 'proj1')
 
         # Raise OperationalError on any DELETE to trigger the error path.
-        original_execute = queue._db.execute
+        original_execute = queue._require_access().connection.execute
 
         async def mock_execute(sql, *args, **kwargs):
             if 'DELETE' in sql.upper():
                 raise aiosqlite.OperationalError('database is locked')
             return await original_execute(sql, *args, **kwargs)
 
-        monkeypatch.setattr(queue._db, 'execute', mock_execute)
+        monkeypatch.setattr(queue._require_access().connection, 'execute', mock_execute)
 
         # Also fail the recovery commit so we enter the double-failure branch.
         async def mock_commit():
             raise aiosqlite.OperationalError('disk I/O error')
 
-        monkeypatch.setattr(queue._db, 'commit', mock_commit)
+        monkeypatch.setattr(queue._require_access().connection, 'commit', mock_commit)
 
         with caplog.at_level(logging.ERROR, logger='fused_memory.services.durable_queue'):
             result = await queue.delete_dead(group_id='proj1', ids=[id1])
@@ -977,7 +1038,7 @@ class TestDeleteDead:
     @pytest.mark.parametrize('journal_mode', ['WAL', 'DELETE'])
     @pytest.mark.asyncio
     async def test_real_sqlite_busy_mid_batch_durable_recovery(
-        self, tmp_path, monkeypatch, journal_mode
+        self, tmp_path, monkeypatch, journal_mode, queue_file
     ):
         """Real SQLITE_BUSY on chunk 2: prior-chunk deletes are durable (both journal modes).
 
@@ -1004,27 +1065,26 @@ class TestDeleteDead:
             write_timeout_seconds=2.0,
         )
         await q.initialize()
-        assert q._db is not None  # narrowed from Optional after initialize()
 
         try:
             # (2) Patch batch size to 3 so 7 rows => chunks [0:3], [3:6], [6:7].
             monkeypatch.setattr(dq_module, '_DELETE_DEAD_BATCH_SIZE', 3)
-            dead_ids = [await self._insert_dead_row(q, 'proj1') for _ in range(7)]
+            dead_ids = [await self._insert_dead_row(queue_file, 'proj1') for _ in range(7)]
 
             # (3) Switch the queue connection to the parametrized journal mode.
             #     Fetch the PRAGMA result to confirm the switch actually happened —
             #     PRAGMA journal_mode silently returns the *current* mode rather
             #     than raising on failure, so discarding the cursor can mask a
             #     no-op switch (e.g. WAL→DELETE while another connection holds WAL).
-            cur = await q._db.execute(f'PRAGMA journal_mode={journal_mode}')
+            cur = await q._require_access().connection.execute(f'PRAGMA journal_mode={journal_mode}')
             row = await cur.fetchone()
             assert row is not None and row[0].lower() == journal_mode.lower(), (
                 f'journal_mode switch failed: expected {journal_mode!r}, '
                 f'got {(row[0] if row else None)!r}'
             )
-            await q._db.commit()
+            await q._require_access().connection.commit()
 
-            db_path = q._data_dir / 'write_queue.db'
+            db_path = queue_file
 
             # (4) Open conn2 to the same file; confirm the matching journal mode.
             async with aiosqlite.connect(str(db_path)) as conn2:
@@ -1036,7 +1096,7 @@ class TestDeleteDead:
                 )
                 await conn2.commit()
 
-                # (5) Install the coordinator wrapper around q._db.execute.
+                # (5) Install the coordinator wrapper around the queue connection's execute.
                 #
                 # Chunk-1 path (delete_call_count == 1):
                 #   a. Execute chunk-1 DELETE and pre-fetch RETURNING rows before
@@ -1047,14 +1107,13 @@ class TestDeleteDead:
                 #   e. Return a proxy cursor with the pre-buffered RETURNING rows.
                 # All other calls (including chunk-2 DELETE) forward to the real execute.
                 #
-                # Recovery-commit safety note: delete_dead's except-OperationalError
-                # handler calls ``await self._db.commit()`` as a recovery attempt after
-                # chunk-2 fails.  That commit is a no-op because the coordinator already
+                # Recovery-commit safety note: delete_dead's write unit commits on
+                # its clean exit after chunk-2 fails.  That commit is a no-op because the coordinator already
                 # committed chunk-1 above, leaving *no pending transaction* on the queue
                 # connection.  A no-op commit never needs the write lock, so there is no
                 # race risk from busy_timeout still being 50 ms at that point.
                 delete_call_count = 0
-                q_db = q._db
+                q_db = q._require_access().connection
                 original_execute = q_db.execute
 
                 async def coordinator(sql, *args, **kwargs):
@@ -1135,7 +1194,7 @@ class TestDeleteDead:
             )
 
         finally:
-            # close() guards against _db being None, so a double-call is a no-op.
+            # close() guards against _access being None, so a double-call is a no-op.
             await q.close()
 
 
@@ -1144,10 +1203,10 @@ class TestStats:
     async def test_stats_correct_counts(self, tmp_path):
         call_count = 0
 
-        async def mixed_execute(op, payload):
+        async def mixed_execute(value):
             nonlocal call_count
             call_count += 1
-            if payload.get('fail'):
+            if value.content == 'bad':
                 raise RuntimeError('nope')
             return {'ok': True}
 
@@ -1163,22 +1222,13 @@ class TestStats:
         await q.initialize()
 
         # 2 will succeed, 1 will dead-letter
-        await q.enqueue(
-            group_id='proj1', operation='add_episode',
-            payload={'content': 'good1', 'group_id': 'proj1', 'name': 'ep1'},
-        )
-        await q.enqueue(
-            group_id='proj1', operation='add_episode',
-            payload={'content': 'bad', 'group_id': 'proj1', 'name': 'ep2', 'fail': True},
-        )
-        await q.enqueue(
-            group_id='proj1', operation='add_episode',
-            payload={'content': 'good2', 'group_id': 'proj1', 'name': 'ep3'},
-        )
+        await q.enqueue(queued('add_episode', {'content': 'good1', 'group_id': 'proj1', 'name': 'ep1'}, group_id='proj1'))
+        await q.enqueue(queued('add_episode', {'content': 'bad', 'group_id': 'proj1', 'name': 'ep2'}, group_id='proj1'))
+        await q.enqueue(queued('add_episode', {'content': 'good2', 'group_id': 'proj1', 'name': 'ep3'}, group_id='proj1'))
         # Poll until both successful items complete and the failing item
         # dead-letters. A fixed sleep raced under full-suite CPU load: the two
         # 'good' writes had not both drained yet, yielding completed==1 (see
-        # _poll_until_dead's rationale — same fix, both terminal counts).
+        # poll_until_dead's rationale — same fix, both terminal counts).
         # Delegates to the shared poll_until (task 2377); last_counts is a
         # side-channel capture so the timeout message can still report the
         # latest observed counts, since poll_until's message is static.
@@ -1204,45 +1254,13 @@ class TestStats:
         await q.close()
 
 
-async def _poll_until_dead(
-    q: DurableWriteQueue,
-    *,
-    group_id: str | None = None,
-    expected_dead: int,
-    timeout: float = 5.0,
-) -> None:
-    """Poll queue stats until at least *expected_dead* items have status='dead'.
-
-    Thin wrapper over the shared poll_until (task 2377): replaces fixed
-    ``asyncio.sleep`` calls in tests that wait for items to dead-letter,
-    avoiding the 1.5 s floor on fast machines while still handling slow CI
-    runners via the *timeout* guard. last_counts is a side-channel capture
-    so the timeout message can still report the latest observed counts,
-    since poll_until's message is static.
-    """
-    last_counts: dict = {}
-
-    async def _dead_count_reached():
-        stats = await q.get_stats(group_id=group_id)
-        last_counts.update(stats['counts'])
-        return stats['counts'].get('dead', 0) >= expected_dead
-
-    try:
-        await poll_until(_dead_count_reached, timeout=timeout, interval=0.05)
-    except AssertionError as exc:
-        raise AssertionError(
-            f'Timed out waiting for {expected_dead} dead item(s) '
-            f'(group_id={group_id!r}); last counts={last_counts}'
-        ) from exc
-
-
 class TestGetStatsScopedByGroup:
     """get_stats(group_id=…) should filter counts and oldest-pending age by group."""
 
     @pytest.mark.asyncio
     async def test_get_stats_filters_counts_by_group_id(self, tmp_path):
         """Dead-letter counts are scoped to the requested group_id."""
-        async def always_fail(op, payload):
+        async def always_fail(value):
             raise RuntimeError('forced fail')
 
         q = DurableWriteQueue(
@@ -1259,18 +1277,12 @@ class TestGetStatsScopedByGroup:
         try:
             # 2 items for proj_a, 3 items for proj_b → all dead-lettered
             for i in range(2):
-                await q.enqueue(
-                    group_id='proj_a', operation='add_episode',
-                    payload={'content': f'a{i}', 'group_id': 'proj_a', 'name': f'a{i}'},
-                )
+                await q.enqueue(queued('add_episode', {'content': f'a{i}', 'group_id': 'proj_a', 'name': f'a{i}'}, group_id='proj_a'))
             for i in range(3):
-                await q.enqueue(
-                    group_id='proj_b', operation='add_episode',
-                    payload={'content': f'b{i}', 'group_id': 'proj_b', 'name': f'b{i}'},
-                )
+                await q.enqueue(queued('add_episode', {'content': f'b{i}', 'group_id': 'proj_b', 'name': f'b{i}'}, group_id='proj_b'))
             # Wait for all 5 items to dead-letter (2 proj_a + 3 proj_b).
             # Polling is faster than a fixed sleep and reliable on slow CI.
-            await _poll_until_dead(q, expected_dead=5)
+            await poll_until_dead(q, expected_dead=5)
 
             stats_a = await q.get_stats(group_id='proj_a')
             stats_b = await q.get_stats(group_id='proj_b')
@@ -1289,7 +1301,7 @@ class TestGetStatsScopedByGroup:
     @pytest.mark.asyncio
     async def test_get_stats_no_group_id_returns_unscoped(self, tmp_path):
         """get_stats() with no group_id returns combined counts — backward compat."""
-        async def always_fail(op, payload):
+        async def always_fail(value):
             raise RuntimeError('forced fail')
 
         q = DurableWriteQueue(
@@ -1306,17 +1318,11 @@ class TestGetStatsScopedByGroup:
         try:
             # 2 items for proj_a, 3 items for proj_b → all dead-lettered
             for i in range(2):
-                await q.enqueue(
-                    group_id='proj_a', operation='add_episode',
-                    payload={'content': f'a{i}', 'group_id': 'proj_a', 'name': f'a{i}'},
-                )
+                await q.enqueue(queued('add_episode', {'content': f'a{i}', 'group_id': 'proj_a', 'name': f'a{i}'}, group_id='proj_a'))
             for i in range(3):
-                await q.enqueue(
-                    group_id='proj_b', operation='add_episode',
-                    payload={'content': f'b{i}', 'group_id': 'proj_b', 'name': f'b{i}'},
-                )
+                await q.enqueue(queued('add_episode', {'content': f'b{i}', 'group_id': 'proj_b', 'name': f'b{i}'}, group_id='proj_b'))
             # Wait for all 5 items to dead-letter; polling avoids fixed-sleep flakiness.
-            await _poll_until_dead(q, expected_dead=5)
+            await poll_until_dead(q, expected_dead=5)
 
             stats = await q.get_stats()  # no group_id → unscoped
             # Should see the total across both groups
@@ -1347,9 +1353,8 @@ class TestGetStatsScopedByGroup:
             old_ts = now - 100.0  # proj_a item created 100 seconds ago
             recent_ts = now - 10.0  # proj_b item created 10 seconds ago
 
-            assert q._db is not None
             # Insert directly so workers aren't triggered (they'd change status)
-            await q._db.execute(
+            await q._require_access().connection.execute(
                 'INSERT INTO write_queue '
                 '(group_id, operation, payload, status, attempts, max_attempts, '
                 ' next_retry_at, created_at) '
@@ -1358,7 +1363,7 @@ class TestGetStatsScopedByGroup:
                  '{"content":"old","group_id":"proj_a","name":"old"}',
                  old_ts),
             )
-            await q._db.execute(
+            await q._require_access().connection.execute(
                 'INSERT INTO write_queue '
                 '(group_id, operation, payload, status, attempts, max_attempts, '
                 ' next_retry_at, created_at) '
@@ -1367,7 +1372,7 @@ class TestGetStatsScopedByGroup:
                  '{"content":"recent","group_id":"proj_b","name":"recent"}',
                  recent_ts),
             )
-            await q._db.commit()
+            await q._require_access().connection.commit()
 
             stats_b = await q.get_stats(group_id='proj_b')
             age_b = stats_b['oldest_pending_age_seconds']
@@ -1393,10 +1398,13 @@ class TestGetStatsScopedByGroup:
             await q.close()
 
 
-class FlakyVisibilityError(Exception):
-    """Module-local stand-in for graphiti_core's NodeNotFoundError — a
-    transient graph-visibility race that should receive an extended retry
-    budget instead of the plain ``max_attempts`` ceiling.
+class FlakyTransportError(Exception):
+    """Module-local stand-in for a genuinely-transient BACKEND TRANSPORT
+    failure — a reset connection or a backend timeout, i.e. the
+    ConnectionResetError / TimeoutError family that keeps the extended retry
+    budget. Such a failure is expected to clear on its own, so it should
+    receive ``transient_max_attempts`` rather than the plain ``max_attempts``
+    ceiling.
     """
 
 
@@ -1404,6 +1412,12 @@ class TestTransientErrorRetryPolicy:
     """Task 1936: known-transient errors get a longer retry budget
     (``transient_max_attempts``) than the plain ``max_attempts`` ceiling
     used for everything else.
+
+    Task 3585 removed the not-found family from the DEFAULT set. These tests
+    are unaffected: each passes an explicit ``transient_error_names={...}``
+    override, so they exercise the transient MECHANISM independently of which
+    names ship by default. Membership is covered by
+    TestNotFoundFamilyIsNotTransient.
     """
 
     @pytest.mark.asyncio
@@ -1420,15 +1434,12 @@ class TestTransientErrorRetryPolicy:
             retry_base_seconds=0.01,
             write_timeout_seconds=2.0,
             transient_max_attempts=5,
-            transient_error_names={'FlakyVisibilityError'},
+            transient_error_names={'FlakyTransportError'},
         )
         await q.initialize()
         try:
-            await q.enqueue(
-                group_id='proj1', operation='add_episode',
-                payload={'content': 'test', 'group_id': 'proj1', 'name': 'ep'},
-            )
-            await _poll_until_dead(q, group_id='proj1', expected_dead=1, timeout=20.0)
+            await q.enqueue(queued('add_episode', {'content': 'test', 'group_id': 'proj1', 'name': 'ep'}, group_id='proj1'))
+            await poll_until_dead(q, group_id='proj1', expected_dead=1)
 
             dead = await q.get_dead_items()
             assert len(dead) == 1
@@ -1440,7 +1451,7 @@ class TestTransientErrorRetryPolicy:
     async def test_transient_error_uses_extended_budget(self, tmp_path):
         """A configured-transient error class dead-letters at transient_max_attempts,
         not the plain (smaller) max_attempts."""
-        execute = AsyncMock(side_effect=FlakyVisibilityError('node abc-123 not found'))
+        execute = AsyncMock(side_effect=FlakyTransportError('connection reset by peer'))
         q = DurableWriteQueue(
             data_dir=tmp_path / 'queue',
             execute_write=execute,
@@ -1450,23 +1461,17 @@ class TestTransientErrorRetryPolicy:
             retry_base_seconds=0.01,
             write_timeout_seconds=2.0,
             transient_max_attempts=5,
-            transient_error_names={'FlakyVisibilityError'},
+            transient_error_names={'FlakyTransportError'},
         )
         await q.initialize()
         try:
-            await q.enqueue(
-                group_id='proj1', operation='add_episode',
-                payload={'content': 'test', 'group_id': 'proj1', 'name': 'ep'},
-            )
-            # Generous timeout: 5 attempts at a 0.01s backoff base is fast in
-            # practice, but slow CI runners need headroom (see other dead-letter
-            # tests in this file using the same 20s budget).
-            await _poll_until_dead(q, group_id='proj1', expected_dead=1, timeout=20.0)
+            await q.enqueue(queued('add_episode', {'content': 'test', 'group_id': 'proj1', 'name': 'ep'}, group_id='proj1'))
+            await poll_until_dead(q, group_id='proj1', expected_dead=1)
 
             dead = await q.get_dead_items()
             assert len(dead) == 1
             assert dead[0]['attempts'] == 5
-            assert 'FlakyVisibilityError' in dead[0]['error']
+            assert 'FlakyTransportError' in dead[0]['error']
         finally:
             await q.close()
 
@@ -1479,11 +1484,11 @@ class TestTransientErrorRetryPolicy:
         """
         call_count = 0
 
-        async def flaky_then_ok(op, payload):
+        async def flaky_then_ok(value):
             nonlocal call_count
             call_count += 1
             if call_count <= 3:
-                raise FlakyVisibilityError('node abc-123 not found')
+                raise FlakyTransportError('connection reset by peer')
             return {'ok': True}
 
         q = DurableWriteQueue(
@@ -1495,14 +1500,11 @@ class TestTransientErrorRetryPolicy:
             retry_base_seconds=0.01,
             write_timeout_seconds=2.0,
             transient_max_attempts=5,
-            transient_error_names={'FlakyVisibilityError'},
+            transient_error_names={'FlakyTransportError'},
         )
         await q.initialize()
         try:
-            await q.enqueue(
-                group_id='proj1', operation='add_episode',
-                payload={'content': 'test', 'group_id': 'proj1', 'name': 'ep'},
-            )
+            await q.enqueue(queued('add_episode', {'content': 'test', 'group_id': 'proj1', 'name': 'ep'}, group_id='proj1'))
 
             deadline = asyncio.get_event_loop().time() + 20.0
             stats = await q.get_stats(group_id='proj1')
@@ -1519,3 +1521,1666 @@ class TestTransientErrorRetryPolicy:
             assert call_count == 4
         finally:
             await q.close()
+
+
+# ------------------------------------------------------------------
+# Not-found family membership (task 3585)
+#
+# _is_transient matches by class NAME walked over type(exc).__mro__, so a
+# module-local class named NodeNotFoundError IS the contract — importing
+# graphiti_core.errors here would test the identical code path while adding
+# exactly the dependency the name-based scheme exists to avoid. It is also the
+# honest model of production: fused-memory defines its own unrelated
+# NodeNotFoundError at graphiti_client.py:219, so two distinct classes already
+# answer to this name and a name-level assertion covers both.
+# ------------------------------------------------------------------
+
+
+class NodeNotFoundError(Exception):
+    """Stand-in for any class answering to this name (graphiti_core's, or
+    fused-memory's own at graphiti_client.py:219)."""
+
+
+class EdgeNotFoundError(Exception):
+    """Stand-in for graphiti_core's EdgeNotFoundError (live: raised in
+    edges.py and the neo4j edge driver ops)."""
+
+
+class EdgesNotFoundError(Exception):
+    """Stand-in for graphiti_core's EdgesNotFoundError (defined in
+    errors.py, never raised anywhere in the library)."""
+
+
+class TestNotFoundFamilyIsNotTransient:
+    """Task 3585: the not-found family is NOT in DEFAULT_TRANSIENT_ERROR_NAMES,
+    so it dead-letters at the plain ``max_attempts`` ceiling rather than the
+    extended ``transient_max_attempts`` budget.
+
+    Membership, not mechanism — every queue here is built WITHOUT a
+    ``transient_error_names=`` override precisely so the shipped default
+    governs. TestTransientErrorRetryPolicy covers the mechanism.
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'exc_cls',
+        [NodeNotFoundError, EdgeNotFoundError, EdgesNotFoundError],
+        ids=lambda c: c.__name__,
+    )
+    async def test_not_found_family_dead_letters_at_plain_max_attempts(
+        self, tmp_path, exc_cls
+    ):
+        """A not-found error gets max_attempts (5), not transient_max_attempts (12).
+
+        The esc-3561-3 evidence: 304 execution attempts across 28 recorded
+        add_episode calls produced 0 successes. A visibility race converges;
+        this never did at any budget.
+        """
+        execute = AsyncMock(side_effect=exc_cls('uuid abc-123 not found'))
+        q = make_retry_budget_queue(tmp_path, execute)
+        await q.initialize()
+        try:
+            await q.enqueue(queued('add_episode', {'content': 'test', 'group_id': 'proj1', 'name': 'ep'}, group_id='proj1'))
+            # 12 attempts at a 0.05s delay ceiling costs well under a second,
+            # so the pre-3585 behaviour fails on the COUNT, not by timing out.
+            await poll_until_dead(q, group_id='proj1', expected_dead=1)
+
+            dead = await q.get_dead_items()
+            assert len(dead) == 1
+            assert dead[0]['attempts'] == 5, (
+                f'{exc_cls.__name__} must dead-letter at the plain max_attempts (5); '
+                f'got {dead[0]["attempts"]} — it is still being treated as transient.'
+            )
+            assert exc_cls.__name__ in dead[0]['error']
+        finally:
+            await q.close()
+
+    @pytest.mark.asyncio
+    async def test_connection_reset_still_gets_extended_budget(self, tmp_path):
+        """Control: the removal is narrow. ConnectionResetError stays in the
+        default set (and matches twice over, via its ConnectionError base), so
+        under the identical config it must still reach transient_max_attempts.
+
+        This is what fails if a later edit prunes the set too broadly.
+        """
+        execute = AsyncMock(side_effect=ConnectionResetError('connection reset by peer'))
+        q = make_retry_budget_queue(tmp_path, execute)
+        await q.initialize()
+        try:
+            await q.enqueue(queued('add_episode', {'content': 'test', 'group_id': 'proj1', 'name': 'ep'}, group_id='proj1'))
+            await poll_until_dead(q, group_id='proj1', expected_dead=1)
+
+            dead = await q.get_dead_items()
+            assert len(dead) == 1
+            assert dead[0]['attempts'] == 12, (
+                'ConnectionResetError must keep the extended transient budget (12); '
+                f'got {dead[0]["attempts"]}.'
+            )
+            assert 'ConnectionResetError' in dead[0]['error']
+        finally:
+            await q.close()
+
+
+# ------------------------------------------------------------------
+# Terminal hook (task 3582)
+#
+# The queue's two terminal transitions — _mark_completed and the dead branch of
+# _handle_failure — are the ONE seam through which every enqueue site's
+# terminal outcome can be written back to the write journal. Putting it here
+# (rather than in each producer) makes the property queue-wide by construction.
+# ------------------------------------------------------------------
+
+
+class TestTerminalHook:
+    @staticmethod
+    def _recorder():
+        calls: list[tuple] = []
+
+        async def hook(write_op_id, status, error):
+            calls.append((write_op_id, status, error))
+
+        return calls, hook
+
+    @pytest.mark.asyncio
+    async def test_completed_fires_terminal_hook(self, tmp_path):
+        calls, hook = self._recorder()
+        q = DurableWriteQueue(
+            data_dir=tmp_path / 'queue',
+            execute_write=AsyncMock(return_value={'episode_uuid': 'ep-1'}),
+            workers_per_group=1,
+            semaphore_limit=5,
+            max_attempts=3,
+            retry_base_seconds=0.01,
+            write_timeout_seconds=2.0,
+            on_terminal=hook,
+        )
+        await q.initialize()
+        try:
+            await q.enqueue(queued('add_episode', {'content': 'x', '_write_op_id': 'W1'}, group_id='proj1'))
+            await poll_until(lambda: len(calls) >= 1, timeout=20.0, interval=0.05)
+            assert calls == [('W1', 'completed', None)]
+        finally:
+            await q.close()
+
+    @pytest.mark.asyncio
+    async def test_dead_letter_fires_terminal_hook(self, tmp_path):
+        calls, hook = self._recorder()
+        # RuntimeError is NOT in DEFAULT_TRANSIENT_ERROR_NAMES, so this takes
+        # max_attempts (2), not transient_max_attempts (12).
+        q = DurableWriteQueue(
+            data_dir=tmp_path / 'queue',
+            execute_write=AsyncMock(side_effect=RuntimeError('always fails')),
+            workers_per_group=1,
+            semaphore_limit=5,
+            max_attempts=2,
+            retry_base_seconds=0.01,
+            write_timeout_seconds=2.0,
+            on_terminal=hook,
+        )
+        await q.initialize()
+        try:
+            await q.enqueue(queued('add_episode', {'content': 'x', '_write_op_id': 'W2'}, group_id='proj1'))
+            await poll_until_dead(q, group_id='proj1', expected_dead=1)
+            await poll_until(lambda: len(calls) >= 1, timeout=20.0, interval=0.05)
+            assert len(calls) == 1
+            write_op_id, status, error = calls[0]
+            assert write_op_id == 'W2'
+            assert status == 'dead'
+            assert error is not None and 'always fails' in error
+            # _execute_write itself failed, so the write did NOT land — this
+            # one is safe to replay and must not carry the post-execute flag.
+            assert not error.startswith(dq_module.POST_EXECUTE_DEAD_PREFIX)
+        finally:
+            await q.close()
+
+    @pytest.mark.asyncio
+    async def test_post_execute_dead_is_flagged_in_the_reported_error(self, tmp_path):
+        """'dead' does NOT imply the backend write never happened.
+
+        _process_item runs the registered callback AFTER _execute_write has
+        already returned, so a callback that keeps failing dead-letters an item
+        whose write DID land. Blind-replaying that duplicates the write, so the
+        two cases must be separable in whatever the hook journals.
+        """
+        calls, hook = self._recorder()
+
+        async def exploding_callback(_value, _result):
+            raise RuntimeError('callback keeps failing')
+
+        q = DurableWriteQueue(
+            data_dir=tmp_path / 'queue',
+            execute_write=AsyncMock(return_value={'episode_uuid': 'ep-1'}),
+            workers_per_group=1,
+            semaphore_limit=5,
+            max_attempts=2,
+            retry_base_seconds=0.01,
+            write_timeout_seconds=2.0,
+            on_terminal=hook,
+        )
+        q.register_callback(QueueCallback.DUAL_WRITE_EPISODE, exploding_callback)
+        await q.initialize()
+        try:
+            await q.enqueue(queued('add_episode', {'content': 'x', '_write_op_id': 'W8'}, group_id='proj1'), callback=QueueCallback.DUAL_WRITE_EPISODE)
+            await poll_until_dead(q, group_id='proj1', expected_dead=1)
+            await poll_until(lambda: len(calls) >= 1, timeout=20.0, interval=0.05)
+            assert len(calls) == 1
+            write_op_id, status, error = calls[0]
+            assert write_op_id == 'W8'
+            assert status == 'dead'
+            assert error is not None
+            assert error.startswith(dq_module.POST_EXECUTE_DEAD_PREFIX)
+            assert 'callback keeps failing' in error
+        finally:
+            await q.close()
+
+    @pytest.mark.asyncio
+    async def test_post_execute_flag_survives_a_retry_into_a_later_failed_attempt(
+        self, tmp_path
+    ):
+        """"The backend write LANDED" is an ITEM-level fact, not a per-attempt one.
+
+        POST_EXECUTE_DEAD_PREFIX's own definition, and the write journal's
+        terminal_status schema comment, both describe it as separating "safe to
+        replay" from "already landed; do not blind-replay" — a property of the
+        ITEM. It was computed from a fresh per-attempt local, so it evaporated
+        the instant an item retried.
+
+        The sequence here is ordinary, not exotic: attempt 1 executes (the
+        write LANDS), its callback raises, the item reschedules; attempt 2 dies
+        inside _execute_write and dead-letters. The operator is then told the
+        exact opposite of the truth — no prefix, i.e. "safe to replay" — and a
+        replay DUPLICATES the landed write.
+        """
+        calls, hook = self._recorder()
+
+        async def exploding_callback(_value, _result):
+            raise RuntimeError('callback keeps failing')
+
+        q = DurableWriteQueue(
+            data_dir=tmp_path / 'queue',
+            execute_write=AsyncMock(side_effect=[
+                {'episode_uuid': 'ep-1'},
+                RuntimeError('attempt 2 never reached the backend'),
+            ]),
+            workers_per_group=1,
+            semaphore_limit=5,
+            max_attempts=2,
+            retry_base_seconds=0.01,
+            write_timeout_seconds=2.0,
+            on_terminal=hook,
+        )
+        q.register_callback(QueueCallback.DUAL_WRITE_EPISODE, exploding_callback)
+        await q.initialize()
+        try:
+            await q.enqueue(queued('add_episode', {'content': 'x', '_write_op_id': 'W9'}, group_id='proj1'), callback=QueueCallback.DUAL_WRITE_EPISODE)
+            await poll_until_dead(q, group_id='proj1', expected_dead=1)
+            await poll_until(lambda: len(calls) >= 1, timeout=20.0, interval=0.05)
+            assert len(calls) == 1
+            write_op_id, status, error = calls[0]
+            assert (write_op_id, status) == ('W9', 'dead')
+            assert error is not None
+            assert error.startswith(dq_module.POST_EXECUTE_DEAD_PREFIX), (
+                'attempt 1 landed a write; the item is NOT safe to blind-replay '
+                'just because the attempt that finally killed it never reached '
+                'the backend'
+            )
+        finally:
+            await q.close()
+
+    @pytest.mark.asyncio
+    async def test_executed_fact_is_sticky_across_replay_dead(self, tmp_path):
+        """replay_dead resets the retry BUDGET, not the item's history.
+
+        "A backend write for this item landed at some point" does not stop
+        being true because an operator pressed replay — and it is precisely
+        the fact that makes a SECOND blind replay dangerous. So the flag is
+        deliberately sticky even though replay_dead does reset attempts and
+        error.
+        """
+        calls, hook = self._recorder()
+
+        async def exploding_callback(_value, _result):
+            raise RuntimeError('callback keeps failing')
+
+        q = DurableWriteQueue(
+            data_dir=tmp_path / 'queue',
+            execute_write=AsyncMock(side_effect=[
+                {'episode_uuid': 'ep-1'},
+                RuntimeError('attempt 2 never reached the backend'),
+                RuntimeError('post-replay attempt 1 never reached the backend'),
+                RuntimeError('post-replay attempt 2 never reached the backend'),
+            ]),
+            workers_per_group=1,
+            semaphore_limit=5,
+            max_attempts=2,
+            retry_base_seconds=0.01,
+            write_timeout_seconds=2.0,
+            on_terminal=hook,
+        )
+        q.register_callback(QueueCallback.DUAL_WRITE_EPISODE, exploding_callback)
+        await q.initialize()
+        try:
+            await q.enqueue(queued('add_episode', {'content': 'x', '_write_op_id': 'W10'}, group_id='proj1'), callback=QueueCallback.DUAL_WRITE_EPISODE)
+            await poll_until_dead(q, group_id='proj1', expected_dead=1)
+            await poll_until(lambda: len(calls) >= 1, timeout=20.0, interval=0.05)
+
+            assert await q.replay_dead(group_id='proj1') == 1
+            await poll_until_dead(q, group_id='proj1', expected_dead=1)
+            await poll_until(lambda: len(calls) >= 2, timeout=20.0, interval=0.05)
+
+            assert len(calls) == 2
+            write_op_id, status, error = calls[1]
+            assert (write_op_id, status) == ('W10', 'dead')
+            assert error is not None
+            assert error.startswith(dq_module.POST_EXECUTE_DEAD_PREFIX), (
+                'a replayed item is fresh with respect to its retry budget, '
+                'not with respect to whether a write already landed'
+            )
+        finally:
+            await q.close()
+
+    @pytest.mark.asyncio
+    async def test_get_dead_items_reports_whether_the_write_already_landed(
+        self, tmp_path
+    ):
+        """The replay decision should read a boolean, not parse an error string.
+
+        get_dead_items is what the ``get_dead_letters`` MCP tool serves to
+        operators, and "did this already land?" was recoverable only by
+        string-matching POST_EXECUTE_DEAD_PREFIX against free-text error
+        prose. That is the one fact a replay decision turns on, so it gets a
+        structured field.
+
+        Two items, one per polarity: a landed write killed by its callback,
+        and a plain execute failure that never reached the backend.
+        """
+        async def exploding_callback(_value, _result):
+            raise RuntimeError('callback keeps failing')
+
+        async def _execute(value):
+            if value.content == 'landed':
+                return {'episode_uuid': 'ep-1'}
+            raise RuntimeError('never reached the backend')
+
+        q = DurableWriteQueue(
+            data_dir=tmp_path / 'queue',
+            execute_write=_execute,
+            workers_per_group=1,
+            semaphore_limit=5,
+            max_attempts=2,
+            retry_base_seconds=0.01,
+            write_timeout_seconds=2.0,
+        )
+        q.register_callback(QueueCallback.DUAL_WRITE_EPISODE, exploding_callback)
+        await q.initialize()
+        try:
+            await q.enqueue(queued('add_episode', {'content': 'landed', '_write_op_id': 'W11'}, group_id='landed-grp'), callback=QueueCallback.DUAL_WRITE_EPISODE)
+            await q.enqueue(queued('add_episode', {'content': 'never', '_write_op_id': 'W12'}, group_id='never-grp'), callback=QueueCallback.DUAL_WRITE_EPISODE)
+            await poll_until_dead(q, group_id='landed-grp', expected_dead=1)
+            await poll_until_dead(q, group_id='never-grp', expected_dead=1)
+
+            landed = (await q.get_dead_items(group_id='landed-grp'))[0]
+            never = (await q.get_dead_items(group_id='never-grp'))[0]
+
+            assert landed['executed'] is True, 'this write landed — replaying duplicates it'
+            assert never['executed'] is False, 'this write never landed — safe to replay'
+        finally:
+            await q.close()
+
+    @staticmethod
+    async def _fail_flag_writes_while_in_flight(data_dir) -> None:
+        """Make the pre-callback `executed` flag write fail, on the real DB file.
+
+        A trigger installed through a second connection, so the fault lands
+        where a SQLITE_BUSY or disk error would. It is scoped to writes made
+        while the item is still in flight, which models a transient fault that
+        has cleared by the time the attempt is settled as a retry or a
+        dead-letter.
+        """
+        async with aiosqlite.connect(str(data_dir / 'write_queue.db')) as db:
+            await db.execute(
+                'CREATE TRIGGER fail_in_flight_executed_flag '
+                'BEFORE UPDATE OF executed ON write_queue '
+                "WHEN NEW.status = 'in_flight' "
+                "BEGIN SELECT RAISE(ABORT, 'injected: executed flag write failed'); END"
+            )
+            await db.commit()
+
+    @pytest.mark.asyncio
+    async def test_a_failed_flag_write_does_not_re_execute_the_landed_write(
+        self, tmp_path, caplog
+    ):
+        """Losing the `executed` flag must never cost a retry of a landed write.
+
+        The flag write is a commit between "the backend write landed" and the
+        callback. Routed like any other failure, it would reschedule the item
+        and the retry would call execute_write AGAIN. That duplicates a landed
+        backend write, which is exactly what the flag exists to prevent, and
+        no callback failure is needed to cause it.
+        """
+        calls, hook = self._recorder()
+        execute = AsyncMock(return_value={'episode_uuid': 'ep-1'})
+        callback = AsyncMock()
+        q = DurableWriteQueue(
+            data_dir=tmp_path / 'queue',
+            execute_write=execute,
+            workers_per_group=1,
+            semaphore_limit=5,
+            max_attempts=3,
+            retry_base_seconds=0.01,
+            write_timeout_seconds=2.0,
+            on_terminal=hook,
+        )
+        q.register_callback(QueueCallback.DUAL_WRITE_EPISODE, callback)
+        await q.initialize()
+        try:
+            await self._fail_flag_writes_while_in_flight(tmp_path / 'queue')
+            with caplog.at_level(logging.WARNING, logger=dq_module.__name__):
+                item_id = await q.enqueue(queued('add_episode', {'content': 'x', '_write_op_id': 'W13'}, group_id='proj1'), callback=QueueCallback.DUAL_WRITE_EPISODE)
+                await poll_until(lambda: len(calls) >= 1, timeout=20.0, interval=0.05)
+
+            assert calls == [('W13', 'completed', None)]
+            assert execute.await_count == 1, (
+                'the backend write landed once; a failed flag write must not '
+                'send it round again'
+            )
+            callback.assert_awaited_once()
+            warnings = [
+                r.getMessage() for r in caplog.records
+                if r.levelno >= logging.WARNING and r.name == dq_module.__name__
+            ]
+            assert any(
+                f'Item {item_id} ' in m and 'executed' in m for m in warnings
+            ), f'the lost flag write must still be audible; got {warnings}'
+        finally:
+            await q.close()
+
+    @pytest.mark.asyncio
+    async def test_a_failed_flag_write_is_re_recorded_when_the_attempt_fails(
+        self, tmp_path
+    ):
+        """A lost flag write must not surface later as "never landed".
+
+        Once the early flag write is best-effort, its failure leaves the row
+        saying no backend write landed. Attempt 1 lands and its callback
+        raises; attempt 2 never reaches the backend and dead-letters. If
+        nothing recorded the fact again, the dead-letter would report
+        `executed: False` with no POST_EXECUTE_DEAD_PREFIX. That tells the
+        operator a landed write is safe to replay. The commit that schedules
+        the retry has to carry the fact instead.
+        """
+        calls, hook = self._recorder()
+
+        async def exploding_callback(_value, _result):
+            raise RuntimeError('callback keeps failing')
+
+        q = DurableWriteQueue(
+            data_dir=tmp_path / 'queue',
+            execute_write=AsyncMock(side_effect=[
+                {'episode_uuid': 'ep-1'},
+                RuntimeError('attempt 2 never reached the backend'),
+            ]),
+            workers_per_group=1,
+            semaphore_limit=5,
+            max_attempts=2,
+            retry_base_seconds=0.01,
+            write_timeout_seconds=2.0,
+            on_terminal=hook,
+        )
+        q.register_callback(QueueCallback.DUAL_WRITE_EPISODE, exploding_callback)
+        await q.initialize()
+        try:
+            await self._fail_flag_writes_while_in_flight(tmp_path / 'queue')
+            await q.enqueue(queued('add_episode', {'content': 'x', '_write_op_id': 'W14'}, group_id='proj1'), callback=QueueCallback.DUAL_WRITE_EPISODE)
+            await poll_until_dead(q, group_id='proj1', expected_dead=1)
+            await poll_until(lambda: len(calls) >= 1, timeout=20.0, interval=0.05)
+
+            dead = await q.get_dead_items(group_id='proj1')
+            assert dead[0]['executed'] is True, (
+                'attempt 1 landed a write; a failed flag write must not turn '
+                'that into a licence to replay it'
+            )
+            write_op_id, status, error = calls[0]
+            assert (write_op_id, status) == ('W14', 'dead')
+            assert error is not None
+            assert error.startswith(dq_module.POST_EXECUTE_DEAD_PREFIX)
+        finally:
+            await q.close()
+
+    @pytest.mark.asyncio
+    async def test_retry_does_not_fire_terminal_hook(self, tmp_path):
+        """Never fired for an intermediate 'retry' — only terminal states."""
+        calls, hook = self._recorder()
+        attempts = {'n': 0}
+
+        async def flaky(value):
+            attempts['n'] += 1
+            if attempts['n'] <= 2:
+                raise RuntimeError('transient-ish failure')
+            return {'ok': True}
+
+        q = DurableWriteQueue(
+            data_dir=tmp_path / 'queue',
+            execute_write=flaky,
+            workers_per_group=1,
+            semaphore_limit=5,
+            max_attempts=5,
+            retry_base_seconds=0.01,
+            write_timeout_seconds=2.0,
+            on_terminal=hook,
+        )
+        await q.initialize()
+        try:
+            await q.enqueue(queued('add_episode', {'content': 'x', '_write_op_id': 'W3'}, group_id='proj1'))
+            await poll_until(lambda: len(calls) >= 1, timeout=20.0, interval=0.05)
+            assert calls == [('W3', 'completed', None)]
+            assert attempts['n'] == 3
+        finally:
+            await q.close()
+
+    @pytest.mark.asyncio
+    async def test_payload_without_write_op_id_skips_hook(self, tmp_path):
+        """replay_from_store / mem0_classify_and_add carry no _write_op_id."""
+        calls, hook = self._recorder()
+        q = DurableWriteQueue(
+            data_dir=tmp_path / 'queue',
+            execute_write=AsyncMock(return_value={'ok': True}),
+            workers_per_group=1,
+            semaphore_limit=5,
+            max_attempts=3,
+            retry_base_seconds=0.01,
+            write_timeout_seconds=2.0,
+            on_terminal=hook,
+        )
+        await q.initialize()
+        try:
+            await q.enqueue(queued('add_episode', {'content': 'no join key here'}, group_id='proj1'))
+
+            async def _completed():
+                stats = await q.get_stats(group_id='proj1')
+                return stats['counts'].get('completed', 0) >= 1
+
+            await poll_until(_completed, timeout=20.0, interval=0.05)
+            assert calls == []
+        finally:
+            await q.close()
+
+    @pytest.mark.asyncio
+    async def test_terminal_hook_exception_does_not_affect_item(self, tmp_path):
+        """A journaling hiccup must never flip a landed write back to retry."""
+        seen: list[str] = []
+
+        async def exploding_hook(write_op_id, _status, _error):
+            seen.append(write_op_id)
+            raise RuntimeError('journal is on fire')
+
+        q = DurableWriteQueue(
+            data_dir=tmp_path / 'queue',
+            execute_write=AsyncMock(return_value={'ok': True}),
+            workers_per_group=1,
+            semaphore_limit=5,
+            max_attempts=3,
+            retry_base_seconds=0.01,
+            write_timeout_seconds=2.0,
+            on_terminal=exploding_hook,
+        )
+        await q.initialize()
+        try:
+            await q.enqueue(queued('add_episode', {'content': 'a', '_write_op_id': 'W4'}, group_id='proj1'))
+            await q.enqueue(queued('add_episode', {'content': 'b', '_write_op_id': 'W5'}, group_id='proj1'))
+
+            async def _both_completed():
+                stats = await q.get_stats(group_id='proj1')
+                return stats['counts'].get('completed', 0) >= 2
+
+            # The worker keeps draining despite the hook raising on every item.
+            await poll_until(_both_completed, timeout=20.0, interval=0.05)
+            stats = await q.get_stats(group_id='proj1')
+            assert stats['counts'].get('retry', 0) == 0
+            assert stats['counts'].get('dead', 0) == 0
+            assert seen == ['W4', 'W5']
+        finally:
+            await q.close()
+
+    @pytest.mark.asyncio
+    async def test_terminal_hook_runs_after_commit(self, tmp_path):
+        """The queue's durable state never depends on the journal write-back."""
+        observed: list[str | None] = []
+        q_ref: dict = {}
+
+        async def hook(_write_op_id, _status, _error):
+            stats = await q_ref['q'].get_stats(group_id='proj1')
+            observed.append(
+                'completed' if stats['counts'].get('completed', 0) >= 1 else 'not-yet'
+            )
+
+        q = DurableWriteQueue(
+            data_dir=tmp_path / 'queue',
+            execute_write=AsyncMock(return_value={'ok': True}),
+            workers_per_group=1,
+            semaphore_limit=5,
+            max_attempts=3,
+            retry_base_seconds=0.01,
+            write_timeout_seconds=2.0,
+            on_terminal=hook,
+        )
+        q_ref['q'] = q
+        await q.initialize()
+        try:
+            await q.enqueue(queued('add_episode', {'content': 'x', '_write_op_id': 'W6'}, group_id='proj1'))
+            await poll_until(lambda: len(observed) >= 1, timeout=20.0, interval=0.05)
+            assert observed == ['completed']
+        finally:
+            await q.close()
+
+    @pytest.mark.asyncio
+    async def test_no_hook_configured_is_noop(self, tmp_path):
+        """on_terminal defaults to None — existing behaviour unchanged."""
+        q = DurableWriteQueue(
+            data_dir=tmp_path / 'queue',
+            execute_write=AsyncMock(return_value={'ok': True}),
+            workers_per_group=1,
+            semaphore_limit=5,
+            max_attempts=3,
+            retry_base_seconds=0.01,
+            write_timeout_seconds=2.0,
+        )
+        await q.initialize()
+        try:
+            assert q._on_terminal is None
+            await q.enqueue(queued('add_episode', {'content': 'x', '_write_op_id': 'W7'}, group_id='proj1'))
+
+            async def _completed():
+                stats = await q.get_stats(group_id='proj1')
+                return stats['counts'].get('completed', 0) >= 1
+
+            await poll_until(_completed, timeout=20.0, interval=0.05)
+        finally:
+            await q.close()
+
+
+# ------------------------------------------------------------------
+# Schema: the `executed` column (task 4116)
+#
+# POST_EXECUTE_DEAD_PREFIX is documented — in its own definition and again in
+# the write journal's terminal_status schema comment — as an ITEM-level fact:
+# "the backend write LANDED; do not blind-replay". It was computed from a
+# per-ATTEMPT local, so it evaporated the moment an item retried. Persisting it
+# on the row is what makes the item-level claim true.
+# ------------------------------------------------------------------
+
+
+# The pre-4116 DDL, copied literally so this is a real legacy fixture rather
+# than a reference to the current constant (which would make the migration test
+# vacuous the moment the constant changes).
+_LEGACY_CREATE_TABLE = """\
+CREATE TABLE IF NOT EXISTS write_queue (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    group_id    TEXT    NOT NULL,
+    operation   TEXT    NOT NULL,
+    payload     TEXT    NOT NULL,
+    callback_type TEXT,
+    status      TEXT    NOT NULL DEFAULT 'pending',
+    attempts    INTEGER NOT NULL DEFAULT 0,
+    max_attempts INTEGER NOT NULL DEFAULT 5,
+    next_retry_at REAL  NOT NULL DEFAULT 0,
+    created_at  REAL    NOT NULL,
+    completed_at REAL,
+    error       TEXT
+);
+"""
+
+
+class TestExecutedColumnSchema:
+    @staticmethod
+    async def _column_names(data_dir) -> tuple[str, ...]:
+        """The on-disk column order, read through a connection of our own."""
+        async with aiosqlite.connect(str(data_dir / 'write_queue.db')) as db:
+            cursor = await db.execute('PRAGMA table_info(write_queue)')
+            return tuple(row[1] for row in await cursor.fetchall())
+
+    @pytest.mark.asyncio
+    async def test_fresh_db_has_executed_column_in_slot_order(self, tmp_path):
+        """PRAGMA column order must equal QueueItem.__slots__, exactly.
+
+        QueueItem.__init__ positionally unpacks a `SELECT *` row into its
+        slots, and NOTHING at either end references the other: the schema
+        never mentions QueueItem and QueueItem never mentions the schema. So
+        the next column added in the wrong position does not raise — every
+        field silently shifts by one, `status` reading as `callback_type` and
+        `attempts` as `status`. This assertion converts that latent
+        silent-corruption trap into a named failure.
+        """
+        q = DurableWriteQueue(
+            data_dir=tmp_path / 'queue',
+            execute_write=AsyncMock(return_value={'episode_uuid': 'ep-1'}),
+            workers_per_group=1,
+            semaphore_limit=5,
+        )
+        await q.initialize()
+        try:
+            cols = await self._column_names(tmp_path / 'queue')
+            assert 'executed' in cols
+            # Both facts in one assertion: the column exists, AND the SELECT *
+            # order still lines up with the unpack.
+            assert cols == tuple(dq_module.QueueItem.__slots__)
+        finally:
+            await q.close()
+
+    @pytest.mark.asyncio
+    async def test_legacy_db_is_migrated_and_still_round_trips(self, tmp_path):
+        """A pre-4116 DB gains the column in the SAME position as a fresh one.
+
+        `CREATE TABLE IF NOT EXISTS` is a no-op against an existing table, so
+        a legacy DB needs an explicit ALTER — and ALTER can only APPEND. If the
+        fresh CREATE put `executed` anywhere but last, migrated and fresh DBs
+        would disagree on column order and one of them would corrupt every
+        QueueItem it unpacked. This pins that they agree, and that a row
+        pending at upgrade time still drains: the worker hands execute_write
+        the row's decoded value, and the item completes.
+        """
+        data_dir = tmp_path / 'queue'
+        data_dir.mkdir(parents=True, exist_ok=True)
+
+        async with aiosqlite.connect(str(data_dir / 'write_queue.db')) as legacy:
+            await legacy.execute(_LEGACY_CREATE_TABLE)
+            await legacy.execute(
+                'INSERT INTO write_queue '
+                '(group_id, operation, payload, callback_type, status, created_at) '
+                "VALUES (?, ?, ?, ?, 'pending', ?)",
+                ('legacy-grp', 'add_episode', '{"content": "pre-migration"}',
+                 None, time.time()),
+            )
+            await legacy.commit()
+
+        execute = AsyncMock(return_value={'episode_uuid': 'ep-1'})
+        q = DurableWriteQueue(
+            data_dir=data_dir,
+            execute_write=execute,
+            workers_per_group=1,
+            semaphore_limit=5,
+        )
+        await q.initialize()
+        try:
+            cols = await self._column_names(data_dir)
+            assert 'executed' in cols, 'a legacy DB must be migrated, not left behind'
+            assert cols == tuple(dq_module.QueueItem.__slots__)
+
+            async def _completed():
+                stats = await q.get_stats(group_id='legacy-grp')
+                return stats['counts'].get('completed', 0) >= 1
+
+            await poll_until(_completed, timeout=20.0, interval=0.05)
+            execute.assert_awaited_once_with(
+                queued('add_episode', {'content': 'pre-migration'}, group_id='legacy-grp')
+            )
+        finally:
+            await q.close()
+
+    @pytest.mark.asyncio
+    async def test_legacy_dead_row_reports_executed_as_unknown_not_false(
+        self, tmp_path
+    ):
+        """A migrated row's NULL means UNKNOWN, and must not report as False.
+
+        ``ALTER TABLE ... ADD COLUMN executed INTEGER`` backfills NULL, so
+        every row written before task 4116 carries no evidence either way.
+        Collapsing that into ``False`` asserts a negative the queue cannot
+        prove — and it is load-bearing, because get_dead_items' replay rule
+        has operators read this field IN PREFERENCE to
+        POST_EXECUTE_DEAD_PREFIX.
+
+        The failure scenario in full: a pre-4116 dead-letter whose backend
+        write LANDED and whose callback then killed it reads NULL after
+        migration. Reported as ``False``, an operator following that guidance
+        replays it and DUPLICATES the landed write — the exact corruption this
+        feature exists to prevent. The prefix is no fallback for such a row
+        either: it is applied only to the terminal-hook error (which lands in
+        ``write_ops.terminal_error``), never to ``write_queue.error``.
+        """
+        data_dir = tmp_path / 'queue'
+        data_dir.mkdir(parents=True, exist_ok=True)
+        db_path = data_dir / 'write_queue.db'
+
+        async with aiosqlite.connect(str(db_path)) as legacy:
+            await legacy.execute(_LEGACY_CREATE_TABLE)
+            await legacy.execute(
+                'INSERT INTO write_queue '
+                '(group_id, operation, payload, callback_type, status, '
+                ' attempts, created_at, error) '
+                "VALUES (?, ?, ?, ?, 'dead', 5, ?, ?)",
+                ('legacy-grp', 'add_episode', '{"content": "pre-migration"}',
+                 'dual_write_episode', time.time(), 'callback keeps failing'),
+            )
+            await legacy.commit()
+
+        q = DurableWriteQueue(
+            data_dir=data_dir,
+            execute_write=AsyncMock(return_value={'episode_uuid': 'ep-1'}),
+            workers_per_group=0,
+            semaphore_limit=5,
+        )
+        await q.initialize()
+        try:
+            dead = await q.get_dead_items()
+            assert len(dead) == 1
+            assert dead[0]['executed'] is None, (
+                'a row that predates the column has no evidence either way; '
+                'reporting False would license a replay of a landed write'
+            )
+        finally:
+            await q.close()
+
+    @pytest.mark.asyncio
+    async def test_enqueue_batch_records_the_never_executed_negative(self, tmp_path):
+        """A negative has to be RECORDED at insert time, not inferred.
+
+        The unknown state above is only worth anything if the queue also
+        states the negative it CAN prove. A producer that left the column
+        NULL would make an item the queue knows never touched a backend
+        indistinguishable from a legacy row of unknown history, and the honest
+        ``None`` would swallow every genuinely safe-to-replay item too.
+        ``enqueue`` is covered by TestTerminalHook's
+        test_get_dead_items_reports_whether_the_write_already_landed; this is
+        the same check for the batch producer.
+        """
+        q = DurableWriteQueue(
+            data_dir=tmp_path / 'queue',
+            execute_write=AsyncMock(side_effect=RuntimeError('never reached the backend')),
+            workers_per_group=1,
+            semaphore_limit=5,
+            max_attempts=1,
+            write_timeout_seconds=2.0,
+        )
+        await q.initialize()
+        try:
+            await q.enqueue_batch([
+                (episode_write(
+                    envelope=envelope(group_id='batch-grp'), content='via enqueue_batch',
+                ), None),
+            ])
+            await poll_until_dead(q, group_id='batch-grp', expected_dead=1)
+
+            dead = await q.get_dead_items(group_id='batch-grp')
+            assert dead[0]['executed'] is False, (
+                'the batch producer must record the negative, not leave it '
+                'indistinguishable from an unmigrated row'
+            )
+        finally:
+            await q.close()
+
+
+class TestDeadLetterHook:
+    """The PUSH seam (task 3583): `on_dead_letter`, fired for every dead item.
+
+    Distinct from `on_terminal` above, which exists to write a terminal outcome
+    back onto a `write_ops` row and therefore correctly skips an item with no
+    `_write_op_id` to join on, and fires on 'completed' too. This hook is an
+    operator ALARM: it fires only on 'dead', and it fires whether or not a join
+    key exists.
+    """
+
+    @staticmethod
+    def _recorder():
+        events: list = []
+
+        async def hook(event):
+            events.append(event)
+
+        return events, hook
+
+    @staticmethod
+    def _queue(
+        tmp_path, *, hook, execute_write, max_attempts=1,
+        retry_base_seconds=0.05, **kwargs,
+    ):
+        return DurableWriteQueue(
+            data_dir=tmp_path / 'queue',
+            execute_write=execute_write,
+            workers_per_group=1,
+            semaphore_limit=5,
+            max_attempts=max_attempts,
+            retry_base_seconds=retry_base_seconds,
+            write_timeout_seconds=2.0,
+            on_dead_letter=hook,
+            **kwargs,
+        )
+
+    @pytest.mark.asyncio
+    async def test_dead_letter_fires_the_hook_once_with_a_structured_event(
+        self, tmp_path
+    ):
+        events, hook = self._recorder()
+        q = self._queue(
+            tmp_path,
+            hook=hook,
+            execute_write=AsyncMock(side_effect=RuntimeError('boom')),
+        )
+        await q.initialize()
+        try:
+            value = queued('add_episode', {'content': 'never lands', '_write_op_id': 'W1'}, group_id='proj1')
+            await q.enqueue(value)
+            await poll_until_dead(q, group_id='proj1', expected_dead=1)
+            await poll_until(lambda: len(events) >= 1, timeout=20.0, interval=0.05)
+
+            assert len(events) == 1, f'exactly one alarm per death, got {events}'
+            event = events[0]
+            assert isinstance(event, dq_module.DeadLetterEvent)
+            assert isinstance(event.item_id, int) and event.item_id > 0
+            assert event.group_id == 'proj1'
+            assert event.operation == 'add_episode'
+            # The COMMITTED attempt count, matching the row and the WARN line —
+            # not the pre-increment value the claimed item carried.
+            assert event.attempts == 1
+            assert event.error is not None
+            assert event.error.startswith('RuntimeError: boom'), event.error
+            assert event.write_op_id == 'W1'
+            assert event.value == value
+            assert json.loads(event.raw_payload) == json.loads(value.to_json())
+            # _execute_write itself failed, so the backend write did NOT land:
+            # this one is safe to replay, and the alarm must say so structurally.
+            assert event.post_execute is False
+        finally:
+            await q.close()
+
+    @pytest.mark.asyncio
+    async def test_a_rescheduled_retry_does_not_fire_the_hook(self, tmp_path):
+        """Only permanent abandonment is worth paging on.
+
+        A retry is the queue working as designed; firing here would page once
+        per attempt for every write that eventually lands.
+        """
+        events, hook = self._recorder()
+        q = self._queue(
+            tmp_path,
+            hook=hook,
+            execute_write=AsyncMock(side_effect=RuntimeError('boom')),
+            max_attempts=3,
+            # Long enough that the item sits visibly in 'retry' while we
+            # assert, instead of racing exhaustion at the 0.05s default.
+            retry_base_seconds=10.0,
+            retry_max_delay_seconds=30.0,
+        )
+        await q.initialize()
+        try:
+            await q.enqueue(queued('add_episode', {'content': 'fails once', '_write_op_id': 'W2'}, group_id='proj1'))
+
+            async def _in_retry():
+                stats = await q.get_stats(group_id='proj1')
+                return stats['counts'].get('retry', 0) >= 1
+
+            await poll_until(_in_retry, timeout=20.0, interval=0.05)
+            assert events == [], f'a retry is not a death, got {events}'
+        finally:
+            await q.close()
+
+    @pytest.mark.asyncio
+    async def test_a_successful_completion_does_not_fire_the_hook(self, tmp_path):
+        """Unlike on_terminal, which fires on 'completed' as well."""
+        events, hook = self._recorder()
+        q = self._queue(
+            tmp_path,
+            hook=hook,
+            execute_write=AsyncMock(return_value={'episode_uuid': 'ep-1'}),
+            max_attempts=3,
+        )
+        await q.initialize()
+        try:
+            await q.enqueue(queued('add_episode', {'content': 'lands fine', '_write_op_id': 'W3'}, group_id='proj1'))
+
+            async def _completed():
+                stats = await q.get_stats(group_id='proj1')
+                return stats['counts'].get('completed', 0) >= 1
+
+            await poll_until(_completed, timeout=20.0, interval=0.05)
+            assert events == []
+        finally:
+            await q.close()
+
+    @pytest.mark.asyncio
+    async def test_the_alarm_is_not_gated_on_a_write_op_id(self, tmp_path):
+        """The hole task 3582 left, and the one point the two hooks diverge.
+
+        `_notify_terminal` skips a payload with no `_write_op_id` — correctly,
+        since there is genuinely nothing to join the outcome back to, and its
+        docstring names `replay_from_store` and `mem0_classify_and_add` as the
+        operations that shape. But that gate silently exempts every
+        `mem0_classify_and_add` (one per extracted fact per episode) from the
+        alarm, whose death today reaches nothing but a log line. An operator
+        alarm needs no join key.
+        """
+        events, hook = self._recorder()
+        terminal_calls: list = []
+
+        async def terminal_hook(write_op_id, status, error):
+            terminal_calls.append((write_op_id, status, error))
+
+        q = self._queue(
+            tmp_path,
+            hook=hook,
+            execute_write=AsyncMock(side_effect=RuntimeError('boom')),
+            on_terminal=terminal_hook,
+        )
+        await q.initialize()
+        try:
+            await q.enqueue(queued('mem0_classify_and_add', {'fact_text': 'no join key here', 'project_id': 'proj1'}, group_id='mem0_proj1'))
+            await poll_until_dead(q, group_id='mem0_proj1', expected_dead=1)
+            await poll_until(lambda: len(events) >= 1, timeout=20.0, interval=0.05)
+
+            assert len(events) == 1
+            assert events[0].write_op_id is None
+            assert events[0].operation == 'mem0_classify_and_add'
+            assert events[0].group_id == 'mem0_proj1'
+            assert terminal_calls == [], (
+                'on_terminal still has nothing to join back to and must stay '
+                'gated; only the alarm fires'
+            )
+        finally:
+            await q.close()
+
+    @pytest.mark.asyncio
+    async def test_a_post_execute_death_is_flagged_structurally(self, tmp_path):
+        """'dead' does NOT imply the backend write never happened.
+
+        The callback runs after `_execute_write` has already returned, so a
+        callback that keeps failing dead-letters an item whose write DID land.
+        That flag is what tells a triager a blind replay would DUPLICATE it, so
+        it must reach the alarm as a boolean rather than as a prefix the
+        consumer has to notice and parse.
+        """
+        events, hook = self._recorder()
+
+        async def exploding_callback(_value, _result):
+            raise RuntimeError('callback keeps failing')
+
+        q = self._queue(
+            tmp_path,
+            hook=hook,
+            execute_write=AsyncMock(return_value={'episode_uuid': 'ep-1'}),
+        )
+        q.register_callback(QueueCallback.DUAL_WRITE_EPISODE, exploding_callback)
+        await q.initialize()
+        try:
+            await q.enqueue(queued('add_episode', {'content': 'the write landed', '_write_op_id': 'W4'}, group_id='proj1'), callback=QueueCallback.DUAL_WRITE_EPISODE)
+            await poll_until_dead(q, group_id='proj1', expected_dead=1)
+            await poll_until(lambda: len(events) >= 1, timeout=20.0, interval=0.05)
+
+            assert len(events) == 1
+            event = events[0]
+            assert event.post_execute is True
+            assert event.error is not None
+            assert event.error.startswith(dq_module.POST_EXECUTE_DEAD_PREFIX)
+            assert 'callback keeps failing' in event.error
+        finally:
+            await q.close()
+
+    @pytest.mark.asyncio
+    async def test_a_raising_hook_is_swallowed_and_logged(self, tmp_path, caplog):
+        """The queue's correctness must never depend on the alarm succeeding.
+
+        The item is already committed dead by the time this runs; a raise here
+        would escape `_process_item` into `_worker_loop` and kill the worker,
+        so one failed alarm would stop the group draining entirely.
+        """
+        seen: list[int] = []
+
+        async def exploding_hook(event):
+            seen.append(event.item_id)
+            raise RuntimeError('the escalation queue is on fire')
+
+        q = self._queue(
+            tmp_path,
+            hook=exploding_hook,
+            execute_write=AsyncMock(side_effect=RuntimeError('boom')),
+        )
+        db_path = tmp_path / 'queue' / 'write_queue.db'
+        await q.initialize()
+        try:
+            with caplog.at_level(logging.WARNING, logger=dq_module.__name__):
+                first = await q.enqueue(queued('add_episode', {'content': 'a', '_write_op_id': 'W5'}, group_id='proj1'))
+                await q.enqueue(queued('add_episode', {'content': 'b', '_write_op_id': 'W6'}, group_id='proj1'))
+                # The worker keeps draining despite the hook raising on item 1.
+                await poll_until_dead(q, group_id='proj1', expected_dead=2)
+                await poll_until(
+                    lambda: len(seen) >= 2, timeout=20.0, interval=0.05
+                )
+
+            assert f'{first}' in caplog.text, caplog.text
+            assert 'add_episode' in caplog.text, caplog.text
+        finally:
+            await q.close()
+
+        async with aiosqlite.connect(str(db_path)) as raw_db:
+            raw_db.row_factory = aiosqlite.Row
+            cursor = await raw_db.execute(
+                'SELECT status FROM write_queue ORDER BY id'
+            )
+            rows = await cursor.fetchall()
+        assert [r['status'] for r in rows] == ['dead', 'dead'], (
+            'a failing alarm must not disturb the committed terminal state'
+        )
+
+
+class TestDeadByOperation:
+    """`get_stats()['dead_by_operation']` — the PULL surface for option (b).
+
+    The `durable_write_dead_letter` escalation is the PUSH alarm; this counter
+    is its health-probe confirmation, not a substitute for it. `counts['dead']`
+    alone is aggregate: it says writes were permanently abandoned but not WHICH
+    operation is dying, so an operator cannot separate a NodeNotFoundError
+    storm on `add_episode` from an unrelated failure of `add_memory_graphiti`.
+
+    Both probes the task names — `MemoryService.get_status` and the
+    `get_queue_stats` MCP tool — assign this dict straight through, so the
+    attribution reaches both of them from here.
+    """
+
+    @staticmethod
+    def _failing_queue(tmp_path):
+        async def always_fail(value):
+            raise RuntimeError('forced fail')
+
+        return DurableWriteQueue(
+            data_dir=tmp_path / 'queue',
+            execute_write=always_fail,
+            workers_per_group=1,
+            semaphore_limit=5,
+            max_attempts=1,
+            retry_base_seconds=0.01,
+            write_timeout_seconds=2.0,
+        )
+
+    @pytest.mark.asyncio
+    async def test_dead_by_operation_attributes_deaths_to_the_operation(self, tmp_path):
+        """Each dead row is counted under its own operation name."""
+        q = self._failing_queue(tmp_path)
+        await q.initialize()
+        try:
+            for i in range(2):
+                await q.enqueue(queued('add_episode', {'content': f'ep{i}', 'group_id': 'proj_a', 'name': f'ep{i}'}, group_id='proj_a'))
+            await q.enqueue(queued('add_memory_graphiti', {'content': 'mem', 'group_id': 'proj_a'}, group_id='proj_a'))
+            await poll_until_dead(q, expected_dead=3)
+
+            stats = await q.get_stats()
+
+            assert stats['dead_by_operation'] == {
+                'add_episode': 2,
+                'add_memory_graphiti': 1,
+            }, (
+                'dead_by_operation must attribute each death to its operation; '
+                f'got {stats.get("dead_by_operation")!r}'
+            )
+            # The aggregate stays the sum, so the two surfaces cannot disagree.
+            assert stats['counts'].get('dead', 0) == sum(
+                stats['dead_by_operation'].values()
+            )
+        finally:
+            await q.close()
+
+    @pytest.mark.asyncio
+    async def test_dead_by_operation_counts_only_dead_rows(self, tmp_path):
+        """An operation that COMPLETED must not appear — this counts deaths,
+        not traffic. A probe reading it as throughput would page on success."""
+        async def fail_the_marked(value):
+            if value.content == 'bad':
+                raise RuntimeError('nope')
+            return {'ok': True}
+
+        q = DurableWriteQueue(
+            data_dir=tmp_path / 'queue',
+            execute_write=fail_the_marked,
+            workers_per_group=1,
+            semaphore_limit=5,
+            max_attempts=1,
+            retry_base_seconds=0.01,
+            write_timeout_seconds=2.0,
+        )
+        await q.initialize()
+        try:
+            await q.enqueue(queued('add_episode', {'content': 'good', 'group_id': 'proj_a', 'name': 'good'}, group_id='proj_a'))
+            await q.enqueue(queued('add_memory_graphiti', {'content': 'bad', 'group_id': 'proj_a'}, group_id='proj_a'))
+            await poll_until_dead(q, expected_dead=1)
+
+            stats = await q.get_stats()
+
+            assert stats['dead_by_operation'] == {'add_memory_graphiti': 1}, (
+                'only status=dead rows may be counted; the completed '
+                f'add_episode must be absent. Got {stats.get("dead_by_operation")!r}'
+            )
+        finally:
+            await q.close()
+
+    @pytest.mark.asyncio
+    async def test_dead_by_operation_is_empty_mapping_never_absent(self, tmp_path):
+        """With no deaths the key is present and `{}` — never missing.
+
+        A probe must never have to distinguish "no deaths" from "an older
+        server that does not report this", which is exactly the ambiguity that
+        let 28 permanently-failed writes read as healthy.
+        """
+        q = DurableWriteQueue(
+            data_dir=tmp_path / 'queue',
+            execute_write=AsyncMock(return_value={'ok': True}),
+            workers_per_group=1,
+            semaphore_limit=5,
+            max_attempts=1,
+            retry_base_seconds=0.01,
+            write_timeout_seconds=2.0,
+        )
+        await q.initialize()
+        try:
+            stats = await q.get_stats()
+            assert 'dead_by_operation' in stats, (
+                f'key must always be present; got keys {sorted(stats)}'
+            )
+            assert stats['dead_by_operation'] == {}
+        finally:
+            await q.close()
+
+    @pytest.mark.asyncio
+    async def test_dead_by_operation_scoped_by_group_id(self, tmp_path):
+        """`group_id=` scopes the breakdown, matching how `counts` and
+        `oldest_pending_age_seconds` are already scoped — otherwise a
+        per-project probe would report another project's deaths."""
+        q = self._failing_queue(tmp_path)
+        await q.initialize()
+        try:
+            await q.enqueue(queued('add_episode', {'content': 'a0', 'group_id': 'proj_a', 'name': 'a0'}, group_id='proj_a'))
+            for i in range(2):
+                await q.enqueue(queued('add_memory_graphiti', {'content': f'b{i}', 'group_id': 'proj_b'}, group_id='proj_b'))
+            await poll_until_dead(q, expected_dead=3)
+
+            stats_a = await q.get_stats(group_id='proj_a')
+            stats_b = await q.get_stats(group_id='proj_b')
+            stats_c = await q.get_stats(group_id='proj_c')
+
+            assert stats_a['dead_by_operation'] == {'add_episode': 1}
+            assert stats_b['dead_by_operation'] == {'add_memory_graphiti': 2}
+            assert stats_c['dead_by_operation'] == {}, (
+                'a project with no rows at all reports an empty mapping, not '
+                f'the global breakdown. Got {stats_c.get("dead_by_operation")!r}'
+            )
+        finally:
+            await q.close()
+
+    @pytest.mark.asyncio
+    async def test_a_projects_mem0_deaths_sit_in_its_mem0_group(self, tmp_path):
+        """A project occupies TWO groups, and a scoped probe sees only one.
+
+        `_dual_write_callback` enqueues each derived fact as
+        `mem0_classify_and_add` in group `mem0_{project_id}`, while the
+        project's Graphiti writes use a group_id that IS the project_id. So
+        the scoped call an operator reaches for after a
+        `durable_write_dead_letter` alarm confirms a dead `add_episode` but
+        reports nothing for a dead `mem0_classify_and_add` in that same
+        project — the push alarm fires per item whatever group it sat in.
+
+        Pinned rather than merely documented because the gap is silent: `{}`
+        reads as "no deaths", not as "not in this group". Unioning the two
+        groups is deliberately NOT the remedy — `counts` and the
+        oldest-pending age have always meant one group, and a breakdown that
+        outgrew `counts['dead']` would break their promised consistency.
+        """
+        q = self._failing_queue(tmp_path)
+        await q.initialize()
+        try:
+            await q.enqueue(queued('add_episode', {'content': 'a0', 'group_id': 'proj_a', 'name': 'a0'}, group_id='proj_a'))
+            await q.enqueue(queued('mem0_classify_and_add', {'fact_text': 'a derived fact', 'project_id': 'proj_a'}, group_id='mem0_proj_a'))
+            await poll_until_dead(q, expected_dead=2)
+
+            scoped = await q.get_stats(group_id='proj_a')
+            mem0_scoped = await q.get_stats(group_id='mem0_proj_a')
+            unscoped = await q.get_stats()
+
+            assert scoped['dead_by_operation'] == {'add_episode': 1}, (
+                "the project-scoped probe covers the project's Graphiti group "
+                f'only. Got {scoped.get("dead_by_operation")!r}'
+            )
+            assert mem0_scoped['dead_by_operation'] == {
+                'mem0_classify_and_add': 1,
+            }, mem0_scoped.get('dead_by_operation')
+            assert unscoped['dead_by_operation'] == {
+                'add_episode': 1,
+                'mem0_classify_and_add': 1,
+            }, 'the unscoped call is the one that sees both groups'
+            # The invariant the docstring promises, per scope.
+            for stats in (scoped, mem0_scoped, unscoped):
+                assert stats['counts'].get('dead', 0) == sum(
+                    stats['dead_by_operation'].values()
+                )
+        finally:
+            await q.close()
+
+
+class TestEarliestExecutingStart:
+    """earliest_executing_start: when the oldest write still inside execute_write began."""
+
+    @staticmethod
+    async def _enqueue(queue: DurableWriteQueue, name: str) -> None:
+        await queue.enqueue(queued('add_episode', {'content': name, 'group_id': 'proj1', 'name': name}, group_id='proj1'))
+
+    @staticmethod
+    async def _wait_entered(held: HeldWrites, name: str) -> None:
+        await poll_until(
+            lambda: name in held.entered_at,
+            message=f'write {name} never entered execute_write',
+        )
+
+    @staticmethod
+    async def _wait_completed(queue: DurableWriteQueue, count: int) -> None:
+        async def _completed():
+            stats = await queue.get_stats()
+            return stats['counts'].get('completed', 0) >= count
+
+        await poll_until(_completed, message=f'fewer than {count} writes completed')
+
+    @pytest.mark.asyncio
+    async def test_idle_queue_reports_none(self, queue):
+        assert queue.earliest_executing_start('proj1') is None
+
+    @pytest.mark.asyncio
+    async def test_executing_write_reports_its_start_for_its_own_group_only(
+        self, queue, mock_execute,
+    ):
+        held = HeldWrites()
+        mock_execute.side_effect = held.execute
+        before = datetime.now(UTC)
+        try:
+            await self._enqueue(queue, 'A')
+            await self._wait_entered(held, 'A')
+
+            start = queue.earliest_executing_start('proj1')
+            assert start is not None
+            assert before <= start <= held.entered_at['A']
+            assert queue.earliest_executing_start('proj2') is None
+        finally:
+            held.release_all()
+
+    @pytest.mark.asyncio
+    async def test_reports_the_oldest_write_still_executing(self, queue, mock_execute):
+        held = HeldWrites()
+        mock_execute.side_effect = held.execute
+        try:
+            await self._enqueue(queue, 'A')
+            await self._wait_entered(held, 'A')
+            first = queue.earliest_executing_start('proj1')
+            assert first is not None
+
+            await self._enqueue(queue, 'B')
+            await self._wait_entered(held, 'B')
+            assert queue.earliest_executing_start('proj1') == first
+
+            held.release('A')
+            await self._wait_completed(queue, 1)
+            after_a = queue.earliest_executing_start('proj1')
+            assert after_a is not None
+            assert first < after_a <= held.entered_at['B']
+
+            held.release('B')
+            await self._wait_completed(queue, 2)
+            assert queue.earliest_executing_start('proj1') is None
+        finally:
+            held.release_all()
+
+    @pytest.mark.asyncio
+    async def test_failed_write_leaves_nothing_executing(self, queue, mock_execute):
+        held = HeldWrites(fail_on_release=True)
+        mock_execute.side_effect = held.execute
+        try:
+            await self._enqueue(queue, 'A')
+            await self._wait_entered(held, 'A')
+            assert queue.earliest_executing_start('proj1') is not None
+
+            held.release('A')
+            await poll_until_dead(queue, expected_dead=1)
+            assert queue.earliest_executing_start('proj1') is None
+        finally:
+            held.release_all()
+
+
+class TestTypedRowBoundary:
+    """PRD S26 boundary rows 1 and 2: the queue decodes a row once, hands the
+    executor and the callback the same frozen value, and dead-letters a row it
+    cannot decode on the first attempt without executing it."""
+
+    @staticmethod
+    def _queue(tmp_path, execute_write, **kwargs):
+        options = {
+            'workers_per_group': 1,
+            'semaphore_limit': 5,
+            'max_attempts': 3,
+            'retry_base_seconds': 0.05,
+            'write_timeout_seconds': 2.0,
+        } | kwargs
+        return DurableWriteQueue(
+            data_dir=tmp_path / 'queue', execute_write=execute_write, **options,
+        )
+
+    @staticmethod
+    async def _rows(tmp_path) -> list[tuple]:
+        async with aiosqlite.connect(str(tmp_path / 'queue' / 'write_queue.db')) as db:
+            return [tuple(row) for row in await db.execute_fetchall(
+                'SELECT operation, payload, status, attempts, error FROM write_queue ORDER BY id'
+            )]
+
+    @pytest.mark.asyncio
+    async def test_the_executor_and_the_callback_observe_one_value(self, tmp_path):
+        seen: dict = {}
+
+        async def execute(value):
+            seen['executed'] = value
+            return {'episode_uuid': 'ep-1'}
+
+        async def callback(value, result):
+            seen['callback'] = value
+            seen['result'] = result
+
+        q = self._queue(tmp_path, execute)
+        q.register_callback(QueueCallback.DUAL_WRITE_EPISODE, callback)
+        await q.initialize()
+        try:
+            value = episode_write(
+                envelope=envelope(project_id='proj1', group_id='proj1', write_op_id='W1'),
+            )
+            await q.enqueue(value, callback=QueueCallback.DUAL_WRITE_EPISODE)
+
+            async def _completed():
+                s = await q.get_stats()
+                return s if s['counts'].get('completed', 0) >= 1 else None
+
+            await poll_until(_completed, timeout=20.0)
+        finally:
+            await q.close()
+
+        assert seen['executed'] is seen['callback']
+        assert seen['executed'] == value
+        assert seen['result'] == {'episode_uuid': 'ep-1'}
+        rows = await self._rows(tmp_path)
+        assert len(rows) == 1
+        operation, payload, status, _, _ = rows[0]
+        assert operation == 'add_episode'
+        assert status == 'completed'
+        assert set(json.loads(payload)) == EPISODE_WIRE_KEYS
+
+    @pytest.mark.asyncio
+    async def test_a_completed_row_reports_its_write_op_id_to_on_terminal(self, tmp_path):
+        outcomes: list = []
+
+        async def on_terminal(write_op_id, status, error):
+            outcomes.append((write_op_id, status, error))
+
+        q = self._queue(tmp_path, AsyncMock(return_value=None), on_terminal=on_terminal)
+        await q.initialize()
+        try:
+            await q.enqueue(episode_write(
+                envelope=envelope(project_id='proj1', group_id='proj1', write_op_id='W7'),
+            ))
+            await poll_until(lambda: outcomes, timeout=20.0)
+        finally:
+            await q.close()
+
+        assert outcomes == [('W7', 'completed', None)]
+
+    UNDECODABLE_ROWS = [
+        pytest.param(
+            'typo_op', json.dumps({'content': 'looks like an episode', 'group_id': 'proj1'}),
+            None, 'UnknownQueueOperation: ', id='unknown-operation',
+        ),
+        pytest.param(
+            'add_episode', json.dumps({'group_id': 'proj1', 'name': 'no content'}),
+            None, 'QueueDecodeError: ', id='body-lacks-content',
+        ),
+        pytest.param(
+            'add_episode', '{not json', None, 'QueueDecodeError: ', id='non-json',
+        ),
+        pytest.param(
+            'typo_op', json.dumps({'content': 'fine', 'group_id': 'proj1'}),
+            'typo_cb', 'UnknownQueueOperation: ', id='unknown-operation-and-callback',
+        ),
+    ]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(('operation', 'payload_text', 'callback_type', 'error_prefix'), UNDECODABLE_ROWS)
+    async def test_an_undecodable_row_dead_letters_on_attempt_one(
+        self, tmp_path, caplog, operation, payload_text, callback_type, error_prefix,
+    ):
+        events: list = []
+
+        async def on_dead_letter(event):
+            events.append(event)
+
+        execute = AsyncMock(return_value=None)
+        writer = self._queue(tmp_path, execute)
+        await writer.initialize()
+        await writer.close()
+        await insert_raw_row(
+            tmp_path / 'queue' / 'write_queue.db', group_id='proj1',
+            operation=operation, payload_text=payload_text, callback_type=callback_type,
+        )
+        q = self._queue(tmp_path, execute, on_dead_letter=on_dead_letter)
+        try:
+            with caplog.at_level(logging.WARNING, logger='fused_memory.services.durable_queue'):
+                await q.initialize()
+                await poll_until_dead(q, group_id='proj1', expected_dead=1)
+                await poll_until(lambda: events, timeout=20.0)
+            dead = await q.get_dead_items()
+        finally:
+            await q.close()
+
+        execute.assert_not_awaited()
+        [(row_operation, _, status, attempts, error)] = await self._rows(tmp_path)
+        assert (row_operation, status, attempts) == (operation, 'dead', 1)
+        assert error.startswith(error_prefix), error
+        assert any(
+            'dead-lettered' in rec.getMessage() and '[permanent]' in rec.getMessage()
+            for rec in caplog.records
+        )
+        [event] = events
+        assert event.operation == operation
+        assert event.raw_payload == payload_text
+        assert event.value is None
+        assert event.write_op_id is None
+        assert event.attempts == 1
+        [listed] = dead
+        assert listed['operation'] == operation
+        if payload_text == '{not json':
+            assert listed['payload'] == payload_text
+
+    BAD_CALLBACK_ROWS = [
+        pytest.param('add_episode', 'typo_cb', 'typo_cb', id='unknown-callback'),
+        pytest.param(
+            'add_memory_graphiti', 'dual_write_episode', 'dual_write_episode',
+            id='callback-cannot-take-the-operation',
+        ),
+    ]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(('operation', 'callback_type', 'named'), BAD_CALLBACK_ROWS)
+    async def test_a_row_whose_callback_alone_is_bad_closes_its_journal_row(
+        self, tmp_path, operation, callback_type, named,
+    ):
+        outcomes: list = []
+        events: list = []
+
+        async def on_terminal(write_op_id, status, error):
+            outcomes.append((write_op_id, status, error))
+
+        async def on_dead_letter(event):
+            events.append(event)
+
+        execute = AsyncMock(return_value=None)
+        writer = self._queue(tmp_path, execute)
+        await writer.initialize()
+        await writer.close()
+        await insert_raw_row(
+            tmp_path / 'queue' / 'write_queue.db', group_id='proj1', operation=operation,
+            payload_text=json.dumps({'content': 'fine', 'group_id': 'proj1', '_write_op_id': 'W-cb'}),
+            callback_type=callback_type,
+        )
+        q = self._queue(
+            tmp_path, execute, on_terminal=on_terminal, on_dead_letter=on_dead_letter,
+        )
+        try:
+            await q.initialize()
+            await poll_until_dead(q, group_id='proj1', expected_dead=1)
+            await poll_until(lambda: events, timeout=20.0)
+        finally:
+            await q.close()
+
+        execute.assert_not_awaited()
+        [(_, _, status, attempts, error)] = await self._rows(tmp_path)
+        assert (status, attempts) == ('dead', 1)
+        assert error.startswith('QueueDecodeError: '), error
+        assert named in error
+        [(write_op_id, terminal_status, _)] = outcomes
+        assert (write_op_id, terminal_status) == ('W-cb', 'dead')
+        [event] = events
+        assert event.write_op_id == 'W-cb'
+        assert event.value is not None
+        assert event.value.operation == operation
+
+    MISPAIRED = [
+        pytest.param(
+            graphiti_memory_write(envelope=envelope(project_id='proj1', group_id='proj1')),
+            QueueCallback.DUAL_WRITE_EPISODE, id='dual-write-graphiti-memory',
+        ),
+        pytest.param(
+            mem0_fact(envelope=envelope(project_id='proj1', group_id='mem0_proj1')),
+            QueueCallback.REFRESH_ENTITY_SUMMARIES, id='refresh-mem0-fact',
+        ),
+    ]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(('value', 'callback'), MISPAIRED)
+    async def test_enqueue_refuses_a_callback_that_cannot_take_the_value(
+        self, tmp_path, value, callback,
+    ):
+        q = self._queue(tmp_path, AsyncMock(return_value=None))
+        await q.initialize()
+        try:
+            with pytest.raises(TypeError, match=callback.value):
+                await q.enqueue(value, callback=callback)
+            with pytest.raises(TypeError, match=callback.value):
+                await q.enqueue_batch([
+                    (episode_write(envelope=envelope(project_id='proj1', group_id='proj1')), None),
+                    (value, callback),
+                ])
+        finally:
+            await q.close()
+
+        assert await self._rows(tmp_path) == []
+
+    @pytest.mark.asyncio
+    async def test_a_decode_error_raised_by_the_executor_is_permanent(self, tmp_path):
+        execute = AsyncMock(side_effect=QueueDecodeError(
+            'reason', operation='add_episode', row_id=1, raw_payload='{}',
+        ))
+        q = self._queue(tmp_path, execute, max_attempts=5)
+        await q.initialize()
+        try:
+            await q.enqueue(episode_write(envelope=envelope(project_id='proj1', group_id='proj1')))
+            await poll_until_dead(q, group_id='proj1', expected_dead=1)
+        finally:
+            await q.close()
+
+        assert execute.await_count == 1
+        [(_, _, status, attempts, _)] = await self._rows(tmp_path)
+        assert (status, attempts) == ('dead', 1)
+
+    @pytest.mark.asyncio
+    async def test_a_message_that_mimics_a_decode_error_gets_the_normal_budget(self, tmp_path):
+        execute = AsyncMock(side_effect=ValueError("QueueDecodeError: row 1 ('add_episode'): x"))
+        q = self._queue(tmp_path, execute, max_attempts=3)
+        await q.initialize()
+        try:
+            await q.enqueue(episode_write(envelope=envelope(project_id='proj1', group_id='proj1')))
+            await poll_until_dead(q, group_id='proj1', expected_dead=1)
+        finally:
+            await q.close()
+
+        assert execute.await_count == 3
+        [(_, _, status, attempts, _)] = await self._rows(tmp_path)
+        assert (status, attempts) == ('dead', 3)
+
+    @pytest.mark.asyncio
+    async def test_enqueue_batch_takes_value_callback_pairs(self, tmp_path):
+        q = self._queue(tmp_path, AsyncMock(return_value=None))
+        await q.initialize()
+        try:
+            ids = await q.enqueue_batch([
+                (episode_write(envelope=envelope(project_id='proj1', group_id='proj1')),
+                 QueueCallback.DUAL_WRITE_EPISODE),
+                (episode_write(envelope=envelope(project_id='proj2', group_id='proj2')), None),
+            ])
+        finally:
+            await q.close()
+
+        assert len(ids) == 2
+        async with aiosqlite.connect(str(tmp_path / 'queue' / 'write_queue.db')) as db:
+            rows = list(await db.execute_fetchall(
+                'SELECT group_id, operation, callback_type FROM write_queue ORDER BY id'
+            ))
+        assert rows == [
+            ('proj1', 'add_episode', 'dual_write_episode'),
+            ('proj2', 'add_episode', None),
+        ]

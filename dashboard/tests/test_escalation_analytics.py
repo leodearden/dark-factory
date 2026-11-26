@@ -13,7 +13,16 @@ from collections import Counter
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from dashboard.data.escalation_analytics import load_regime_markers
+import pytest
+from escalation.models import RESOLUTION_CLASSES
+
+from dashboard.data.escalation_analytics import build_escalation_analytics, load_regime_markers
+from dashboard.data.escalation_corpus import (
+    EscalationView,
+    QueueKind,
+    QueueRef,
+    measure_corpus,
+)
 
 # ---------------------------------------------------------------------------
 # Schema (mirrors RUNS_SCHEMA in test_performance.py — task_results is the
@@ -76,31 +85,79 @@ def _make_runs_db(tmp_path: Path, rows: list[tuple[str, str, str | None]]) -> Pa
     return db_path
 
 
+def _orchestrator_queue(label: str, esc_dir: Path, runs_db: Path) -> QueueRef:
+    return QueueRef(
+        id=str(esc_dir), label=label, kind=QueueKind.ORCHESTRATOR, directory=esc_dir,
+        runs_db=runs_db,
+    )
+
+
+def _analytics(projects: list[tuple[str, Path, Path]], *, now: datetime, **kwargs) -> dict:
+    """``build_escalation_analytics`` over a corpus walked at *now*.
+
+    *projects* is ``[(label, escalations_dir, runs_db), ...]``, primary first.
+    """
+    queues = tuple(_orchestrator_queue(*project) for project in projects)
+    return build_escalation_analytics(measure_corpus(queues, now=now), **kwargs)
+
+
+def _aggregate(
+    project: str, esc_dir: Path, runs_db: Path, *, now: datetime,
+    pins_by_id: dict | None = None, **kwargs,
+) -> tuple[dict, int]:
+    """One project's analytics entry and the payload's ``parse_failures``."""
+    payload = _analytics(
+        [(project, esc_dir, runs_db)], now=now,
+        pins_by_project={project: pins_by_id}, **kwargs,
+    )
+    return payload['per_project'][0], payload['parse_failures']
+
+
 # ---------------------------------------------------------------------------
 # step-1: load_regime_markers
 # ---------------------------------------------------------------------------
+
+COMMITTED_REGIME_MARKERS = [
+    {'date': '2026-07-15', 'label': 'Starvation threshold raised to 72h', 'tasks': [2631]},
+    {'date': '2026-07-15', 'label': 'Auto-watcher benign closes', 'tasks': [2630]},
+    {'date': '2026-07-15', 'label': 'Verify-scope flip', 'tasks': [2593]},
+]
 
 
 class TestLoadRegimeMarkers:
     """load_regime_markers(path) -> (markers, parse_failures_delta). Never raises."""
 
     def test_default_path_parses_committed_seed_file(self):
-        """The committed dashboard/regime-markers.yaml parses to exactly 3 markers."""
+        """The committed file's regime entries, unchanged; its quality artefact is not one of them."""
         markers, parse_failures_delta = load_regime_markers()
 
         assert parse_failures_delta == 0
-        assert len(markers) == 3
-        for m in markers:
-            assert set(m) == {'date', 'label', 'tasks'}
-            # Must be JSON-serializable: yaml.safe_load parses unquoted
-            # YYYY-MM-DD as a datetime.date, which is NOT JSON-serializable —
-            # the loader must normalize it to a str.
-            assert isinstance(m['date'], str)
-            assert isinstance(m['label'], str)
-            assert isinstance(m['tasks'], list)
+        assert markers == COMMITTED_REGIME_MARKERS
 
-        all_tasks = sorted(t for m in markers for t in m['tasks'])
-        assert all_tasks == [2593, 2630, 2631]
+    def test_only_regime_entries_are_escalation_regime_markers(self, tmp_path):
+        mixed = tmp_path / 'mixed.yaml'
+        mixed.write_text(
+            '- {date: 2026-07-15, label: a regime, tasks: [1]}\n'
+            '- {date: 2026-10-16, until: 2026-10-16, kind: artefact, label: an artefact}\n'
+            '- {date: 2026-11-01, kind: effort, label: an effort change}\n'
+        )
+
+        assert load_regime_markers(mixed) == ([{'date': '2026-07-15', 'label': 'a regime', 'tasks': [1]}], 0)
+
+    def test_a_rejected_entry_is_counted_in_the_delta(self, tmp_path):
+        partly_bad = tmp_path / 'partly-bad.yaml'
+        partly_bad.write_text('- {date: 2026-07-15, label: kept}\n- not a mapping\n')
+
+        assert load_regime_markers(partly_bad) == ([{'date': '2026-07-15', 'label': 'kept', 'tasks': []}], 1)
+
+    def test_the_payload_serves_the_committed_regime_markers(self, tmp_path):
+        now = golden_now()
+        esc_dir = tmp_path / 'escalations'
+        build_golden_archive(esc_dir, now)
+
+        result = _analytics([('dark_factory', esc_dir, _make_runs_db(tmp_path, []))], now=now)
+
+        assert result['regime_markers'] == COMMITTED_REGIME_MARKERS
 
     def test_malformed_yaml_returns_empty_and_one_failure(self, tmp_path):
         """Unparseable YAML syntax -> ([], 1), never raises."""
@@ -170,12 +227,26 @@ class TestDoneByDay:
 
         assert result == {'2026-07-10': 2, '2026-07-11': 1}
 
-    def test_missing_db_returns_empty_dict(self, tmp_path):
+    def test_missing_db_is_unreadable(self, tmp_path):
+        """No runs.db is no reading — never {}, which would claim no task completed."""
         from dashboard.data.escalation_analytics import _done_by_day
 
         missing = tmp_path / 'does-not-exist' / 'runs.db'
 
-        assert _done_by_day(missing) == {}
+        assert _done_by_day(missing) is None
+
+    def test_a_failing_query_is_unreadable(self, tmp_path):
+        from dashboard.data.escalation_analytics import _done_by_day
+
+        tableless = tmp_path / 'runs.db'
+        sqlite3.connect(str(tableless)).close()
+
+        assert _done_by_day(tableless) is None
+
+    def test_a_readable_empty_db_is_a_measured_empty_dict(self, tmp_path):
+        from dashboard.data.escalation_analytics import _done_by_day
+
+        assert _done_by_day(_make_runs_db(tmp_path, [])) == {}
 
 
 # ---------------------------------------------------------------------------
@@ -333,16 +404,15 @@ def build_golden_archive(esc_dir: Path, now: datetime) -> dict:
 
 
 class TestAggregateProjectOrigin:
-    """_aggregate_project(...)['origin'] over the golden mini-archive."""
+    """_aggregate(...)['origin'] over the golden mini-archive."""
 
     def test_origin_block_and_parse_failures(self, tmp_path):
-        from dashboard.data.escalation_analytics import _aggregate_project
 
         now = golden_now()
         esc_dir = tmp_path / 'escalations'
         build_golden_archive(esc_dir, now)
 
-        entry, parse_failures = _aggregate_project(
+        entry, parse_failures = _aggregate(
             'dark_factory', esc_dir, tmp_path / 'runs.db', now=now,
         )
 
@@ -357,8 +427,8 @@ class TestAggregateProjectOrigin:
         assert impl['filings'] == 7
         # classified (terminal, valid times): 101-1 benign(inferred),
         # 102-1 actionable(inferred), 105-1 actionable(inferred).
-        assert impl['benign'] == 1
-        assert impl['actionable'] == 2
+        assert impl['classes']['benign'] == 1
+        assert impl['classes']['actionable'] == 2
         assert impl['stamped_share'] == 0.0
         assert round(impl['benign_rate'], 4) == round(1 / 3, 4)
         # n=3 < 20 -> never predictably benign regardless of rate.
@@ -368,8 +438,8 @@ class TestAggregateProjectOrigin:
         # filings: 103-1, 104-1, 104-0 = 3.
         assert arch['filings'] == 3
         # classified: 103-1 benign(STAMPED), 104-1 actionable(inferred).
-        assert arch['benign'] == 1
-        assert arch['actionable'] == 1
+        assert arch['classes']['benign'] == 1
+        assert arch['classes']['actionable'] == 1
         assert arch['stamped_share'] == 0.5
         assert arch['benign_rate'] == 0.5
         assert arch['predictably_benign'] is False
@@ -380,13 +450,12 @@ class TestAggregateProjectOrigin:
         assert origin['daily_by_source'][d101]['implementer'] == 1
 
     def test_daily_spark_is_ascending_by_date(self, tmp_path):
-        from dashboard.data.escalation_analytics import _aggregate_project
 
         now = golden_now()
         esc_dir = tmp_path / 'escalations'
         build_golden_archive(esc_dir, now)
 
-        entry, _ = _aggregate_project('dark_factory', esc_dir, tmp_path / 'runs.db', now=now)
+        entry, _ = _aggregate('dark_factory', esc_dir, tmp_path / 'runs.db', now=now)
         origin = entry['origin']
         sources_by_name = {s['source']: s for s in origin['sources']}
 
@@ -414,7 +483,6 @@ class TestPredictablyBenign:
     """predictably_benign: benign_rate>0.9 AND n>=20 in a trailing-28d (by resolved_at) window."""
 
     def test_boundary_conditions(self, tmp_path):
-        from dashboard.data.escalation_analytics import _aggregate_project
 
         now = golden_now()
         esc_dir = tmp_path / 'escalations'
@@ -455,20 +523,20 @@ class TestPredictablyBenign:
         for i in range(5):
             _write_escalation(esc_dir, _human_actionable('high-n-low-rate', 'c8', i), archived=True)
 
-        entry, _ = _aggregate_project('dark_factory', esc_dir, tmp_path / 'runs.db', now=now)
+        entry, _ = _aggregate('dark_factory', esc_dir, tmp_path / 'runs.db', now=now)
         sources_by_name = {s['source']: s for s in entry['origin']['sources']}
 
         high = sources_by_name['high-n-high-rate']
-        assert high['benign'] == 25
+        assert high['classes']['benign'] == 25
         assert high['predictably_benign'] is True
 
         low_n = sources_by_name['low-n']
-        assert low_n['benign'] == 19
+        assert low_n['classes']['benign'] == 19
         assert low_n['predictably_benign'] is False
 
         low_rate = sources_by_name['high-n-low-rate']
-        assert low_rate['benign'] == 20
-        assert low_rate['actionable'] == 5
+        assert low_rate['classes']['benign'] == 20
+        assert low_rate['classes']['actionable'] == 5
         assert low_rate['predictably_benign'] is False
 
 
@@ -478,16 +546,15 @@ class TestPredictablyBenign:
 
 
 class TestAggregateProjectLifespan:
-    """_aggregate_project(...)['lifespan'] over the golden mini-archive."""
+    """_aggregate(...)['lifespan'] over the golden mini-archive."""
 
     def test_percentiles_samples_and_promotion(self, tmp_path):
-        from dashboard.data.escalation_analytics import _aggregate_project
 
         now = golden_now()
         esc_dir = tmp_path / 'escalations'
         build_golden_archive(esc_dir, now)
 
-        entry, _ = _aggregate_project('dark_factory', esc_dir, tmp_path / 'runs.db', now=now)
+        entry, _ = _aggregate('dark_factory', esc_dir, tmp_path / 'runs.db', now=now)
         lifespan = entry['lifespan']
 
         # percentiles_by_level: level 0 -> [101-1, 102-1] both 1 day (86400s);
@@ -507,18 +574,18 @@ class TestAggregateProjectLifespan:
         samples = {tuple(row) for row in lifespan['samples']}
         assert samples == {
             ((now - timedelta(days=9)).date().isoformat(), 'reaper-sweep', 0, 86400.0),
-            ((now - timedelta(days=7)).date().isoformat(), 'human', 0, 86400.0),
+            ((now - timedelta(days=7)).date().isoformat(), 'attended-seat', 0, 86400.0),
             (
                 (now - timedelta(days=6) + timedelta(hours=2)).date().isoformat(),
                 'auto-watcher', 1, 7200.0,
             ),
             (
                 (now - timedelta(days=5) + timedelta(hours=3)).date().isoformat(),
-                'human', 2, 10800.0,
+                'attended-seat', 2, 10800.0,
             ),
             (
                 (now - timedelta(days=4) + timedelta(hours=1)).date().isoformat(),
-                'human', 2, 3600.0,
+                'attended-seat', 2, 3600.0,
             ),
         }
 
@@ -547,7 +614,6 @@ class TestAggregateProjectLifespan:
         assert 'l0_to_l1' not in lifespan
 
     def test_promotion_zero_when_member_missing_and_young_item_not_breached(self, tmp_path):
-        from dashboard.data.escalation_analytics import _aggregate_project
 
         now = golden_now()
         esc_dir = tmp_path / 'escalations'
@@ -574,11 +640,13 @@ class TestAggregateProjectLifespan:
         }
         _write_escalation(esc_dir, young_item, archived=False)
 
-        entry, _ = _aggregate_project('dark_factory', esc_dir, tmp_path / 'runs.db', now=now)
+        entry, _ = _aggregate('dark_factory', esc_dir, tmp_path / 'runs.db', now=now)
         lifespan = entry['lifespan']
 
         promo = lifespan['l1_to_l2_promotion']
-        assert promo == {'count': 0, 'p50_secs': None, 'p90_secs': None}
+        assert promo == {
+            'count': 0, 'p50_secs': None, 'p90_secs': None, 'fold_time_unknown': 0,
+        }
 
         open_by_id = {item['id']: item for item in lifespan['open_items']}
         assert open_by_id['esc-201-1']['breach_6h'] is False
@@ -590,11 +658,55 @@ class TestAggregateProjectLifespan:
 # ---------------------------------------------------------------------------
 
 
+class TestResolverTierFromTheRecord:
+    """Every block tiers a record through escalation.classify.resolver_tier
+    (plans/instruments-honesty-prd.md decision 10): the human-ruling flag first."""
+
+    def _one_terminal(self, esc_dir: Path, now: datetime, **fields) -> None:
+        esc = {
+            'id': 'esc-77-1', 'task_id': '77', 'agent_role': 'implementer',
+            'severity': 'blocking', 'category': 'scope_violation', 'summary': 'tier fixture',
+            'timestamp': _iso(now - timedelta(days=3)), 'status': 'resolved', 'level': 2,
+            'resolved_at': _iso(now - timedelta(days=3) + timedelta(hours=1)),
+            'resolution_class': 'actionable',
+        }
+        esc.update(fields)
+        _write_escalation(esc_dir, esc, archived=True)
+
+    def _tiers(self, tmp_path: Path, **fields) -> tuple[set, set, set]:
+        now = golden_now()
+        esc_dir = tmp_path / 'escalations'
+        self._one_terminal(esc_dir, now, **fields)
+        entry, _ = _aggregate('dark_factory', esc_dir, tmp_path / 'runs.db', now=now)
+        samples = {row[1] for row in entry['lifespan']['samples']}
+        weekly = {tier for week in entry['workflow']['tier_weekly'].values() for tier in week}
+        flow = {row['tier'] for row in entry['workflow']['flow_daily']}
+        return samples, weekly, flow
+
+    def test_a_human_ruling_is_human_ruled_in_every_block(self, tmp_path):
+        tiers = self._tiers(tmp_path, resolved_by='interactive', ruled_by_human=True)
+        assert tiers == ({'human-ruled'},) * 3
+
+    def test_a_seat_close_without_a_ruling_is_attended_seat_in_every_block(self, tmp_path):
+        tiers = self._tiers(tmp_path, resolved_by='interactive')
+        assert tiers == ({'attended-seat'},) * 3
+
+    def test_a_cascade_close_keeps_its_tier(self, tmp_path):
+        tiers = self._tiers(tmp_path, resolved_by='l2-cascade:esc-76-1')
+        assert tiers == ({'cascade'},) * 3
+
+    def test_an_unstamped_legacy_resolve_still_infers_actionable(self, tmp_path):
+        now = golden_now()
+        esc_dir = tmp_path / 'escalations'
+        self._one_terminal(esc_dir, now, resolved_by='interactive', resolution_class=None)
+        entry, _ = _aggregate('dark_factory', esc_dir, tmp_path / 'runs.db', now=now)
+        assert {row['class'] for row in entry['workflow']['flow_daily']} == {'actionable'}
+
+
 class TestAggregateProjectWorkflow:
-    """_aggregate_project(...)['workflow'] over the golden mini-archive."""
+    """_aggregate(...)['workflow'] over the golden mini-archive."""
 
     def test_workflow_block(self, tmp_path):
-        from dashboard.data.escalation_analytics import _aggregate_project
 
         now = golden_now()
         esc_dir = tmp_path / 'escalations'
@@ -605,10 +717,10 @@ class TestAggregateProjectWorkflow:
         # week numbers.
         expected_tier_by_resolved = [
             (now - timedelta(days=9), 'reaper-sweep'),                        # 101-1
-            (now - timedelta(days=7), 'human'),                               # 102-1
+            (now - timedelta(days=7), 'attended-seat'),                               # 102-1
             (now - timedelta(days=6) + timedelta(hours=2), 'auto-watcher'),   # 103-1
-            (now - timedelta(days=5) + timedelta(hours=3), 'human'),          # 104-1
-            (now - timedelta(days=4) + timedelta(hours=1), 'human'),          # 105-1
+            (now - timedelta(days=5) + timedelta(hours=3), 'attended-seat'),          # 104-1
+            (now - timedelta(days=4) + timedelta(hours=1), 'attended-seat'),          # 105-1
         ]
         expected_tier_weekly: dict[str, dict[str, int]] = {}
         for dt, tier in expected_tier_by_resolved:
@@ -634,7 +746,7 @@ class TestAggregateProjectWorkflow:
             ('t3', 'done', f'{done_only_day}T09:00:00+00:00'),
         ])
 
-        entry, _ = _aggregate_project('dark_factory', esc_dir, runs_db, now=now)
+        entry, _ = _aggregate('dark_factory', esc_dir, runs_db, now=now)
         workflow = entry['workflow']
 
         assert workflow['tier_weekly'] == expected_tier_weekly
@@ -668,6 +780,7 @@ class TestAggregateProjectWorkflow:
         assert by_date[done_only_day]['filings'] == 0
         assert by_date[done_only_day]['done'] == 1
         assert by_date[done_only_day]['ratio'] == 0.0
+        assert workflow['done_counts_read'] is True
 
         # flow_daily: sparse cube over the 5 terminal-with-valid-times
         # records, keyed by (date(resolved_at), source, level, tier, class).
@@ -679,22 +792,40 @@ class TestAggregateProjectWorkflow:
         }
         assert flow_cells == {
             ((now - timedelta(days=9)).date().isoformat(), 'implementer', 0, 'reaper-sweep', 'benign'),
-            ((now - timedelta(days=7)).date().isoformat(), 'implementer', 0, 'human', 'actionable'),
+            ((now - timedelta(days=7)).date().isoformat(), 'implementer', 0, 'attended-seat', 'actionable'),
             (
                 (now - timedelta(days=6) + timedelta(hours=2)).date().isoformat(),
                 'architect', 1, 'auto-watcher', 'benign',
             ),
             (
                 (now - timedelta(days=5) + timedelta(hours=3)).date().isoformat(),
-                'architect', 2, 'human', 'actionable',
+                'architect', 2, 'attended-seat', 'actionable',
             ),
             (
                 (now - timedelta(days=4) + timedelta(hours=1)).date().isoformat(),
-                'implementer', 2, 'human', 'actionable',
+                'implementer', 2, 'attended-seat', 'actionable',
             ),
         }
         assert all(row['n'] == 1 for row in workflow['flow_daily'])
         assert sum(row['n'] for row in workflow['flow_daily']) == len(entry['lifespan']['samples'])
+
+    def test_unreadable_runs_db_serves_unmeasured_done_counts(self, tmp_path):
+        """An unread runs.db is not 'no tasks completed': done and ratio are unmeasured."""
+        now = golden_now()
+        esc_dir = tmp_path / 'escalations'
+        archive = build_golden_archive(esc_dir, now)
+        expected_filings_by_date: dict[str, int] = {}
+        for esc in archive.values():
+            d = datetime.fromisoformat(esc['timestamp']).date().isoformat()
+            expected_filings_by_date[d] = expected_filings_by_date.get(d, 0) + 1
+
+        entry, _ = _aggregate('dark_factory', esc_dir, tmp_path / 'absent' / 'runs.db', now=now)
+        workflow = entry['workflow']
+
+        assert workflow['done_counts_read'] is False
+        rows = workflow['esc_per_done_daily']
+        assert {row['date']: row['filings'] for row in rows} == expected_filings_by_date
+        assert all(row['done'] is None and row['ratio'] is None for row in rows)
 
 
 # ---------------------------------------------------------------------------
@@ -713,13 +844,12 @@ class TestTriageSegments:
     """lifespan['triage_segments'] — render-when-present over triaged_at."""
 
     def test_present_and_correct_over_golden_archive(self, tmp_path):
-        from dashboard.data.escalation_analytics import _aggregate_project
 
         now = golden_now()
         esc_dir = tmp_path / 'escalations'
         build_golden_archive(esc_dir, now)
 
-        entry, _ = _aggregate_project('dark_factory', esc_dir, tmp_path / 'runs.db', now=now)
+        entry, _ = _aggregate('dark_factory', esc_dir, tmp_path / 'runs.db', now=now)
         lifespan = entry['lifespan']
 
         # Of the 5 terminal records, only esc-102-1 and esc-103-1 carry
@@ -738,7 +868,6 @@ class TestTriageSegments:
         assert segments['triaged_to_resolved']['p90'] == _percentile_2(triaged_to_resolved, 90)
 
     def test_absent_when_no_record_has_triaged_at(self, tmp_path):
-        from dashboard.data.escalation_analytics import _aggregate_project
 
         now = golden_now()
         esc_dir = tmp_path / 'escalations'
@@ -753,7 +882,7 @@ class TestTriageSegments:
         }
         _write_escalation(esc_dir, esc, archived=True)
 
-        entry, _ = _aggregate_project('dark_factory', esc_dir, tmp_path / 'runs.db', now=now)
+        entry, _ = _aggregate('dark_factory', esc_dir, tmp_path / 'runs.db', now=now)
 
         assert 'triage_segments' not in entry['lifespan']
 
@@ -778,13 +907,12 @@ class TestFlowCubeConsistency:
     """
 
     def test_flow_daily_reconciles_with_samples_tier_weekly_and_sources(self, tmp_path):
-        from dashboard.data.escalation_analytics import _aggregate_project
 
         now = golden_now()
         esc_dir = tmp_path / 'escalations'
         archive = build_golden_archive(esc_dir, now)
 
-        entry, _ = _aggregate_project('dark_factory', esc_dir, tmp_path / 'runs.db', now=now)
+        entry, _ = _aggregate('dark_factory', esc_dir, tmp_path / 'runs.db', now=now)
         samples = entry['lifespan']['samples']
         flow_daily = entry['workflow']['flow_daily']
         tier_weekly = entry['workflow']['tier_weekly']
@@ -827,8 +955,8 @@ class TestFlowCubeConsistency:
             flow_source_class_counts[(row['source'], row['class'])] += row['n']
         for s in sources:
             source = s['source']
-            assert flow_source_class_counts.get((source, 'benign'), 0) == s['benign']
-            assert flow_source_class_counts.get((source, 'actionable'), 0) == s['actionable']
+            assert flow_source_class_counts.get((source, 'benign'), 0) == s['classes']['benign']
+            assert flow_source_class_counts.get((source, 'actionable'), 0) == s['classes']['actionable']
 
 
 # ---------------------------------------------------------------------------
@@ -850,11 +978,11 @@ class TestSamplesDownsampling:
     # 3 tiers at a 3:2:1 ratio (60/40/20 of 120 total) so a threshold=40
     # downsample gives every tier a comfortably non-zero quota.
     _TIER_RESOLVERS = {
-        'human': 'interactive',
+        'attended-seat': 'interactive',
         'auto-watcher': 'escalation-watcher-auto',
         'reaper-sweep': 'auto-dismissed',
     }
-    _TIER_COUNTS = {'human': 60, 'auto-watcher': 40, 'reaper-sweep': 20}
+    _TIER_COUNTS = {'attended-seat': 60, 'auto-watcher': 40, 'reaper-sweep': 20}
 
     def _build_fixture(self, esc_dir: Path, now: datetime) -> int:
         """Write ``_TIER_COUNTS`` terminal records per tier; return the total count."""
@@ -878,7 +1006,6 @@ class TestSamplesDownsampling:
         return total
 
     def test_downsamples_above_threshold_roughly_proportional_and_deterministic(self, tmp_path):
-        from dashboard.data.escalation_analytics import _aggregate_project
 
         now = golden_now()
         esc_dir = tmp_path / 'escalations'
@@ -886,7 +1013,7 @@ class TestSamplesDownsampling:
         assert total == sum(self._TIER_COUNTS.values())
 
         threshold = 40
-        entry1, _ = _aggregate_project(
+        entry1, _ = _aggregate(
             'dark_factory', esc_dir, tmp_path / 'runs.db', now=now,
             downsample_threshold=threshold,
         )
@@ -910,20 +1037,19 @@ class TestSamplesDownsampling:
 
         # Deterministic: a second independent call over the same fixture
         # yields the exact same samples (no RNG involved).
-        entry2, _ = _aggregate_project(
+        entry2, _ = _aggregate(
             'dark_factory', esc_dir, tmp_path / 'runs.db', now=now,
             downsample_threshold=threshold,
         )
         assert entry2['lifespan']['samples'] == samples1
 
     def test_no_downsample_when_threshold_at_or_above_sample_count(self, tmp_path):
-        from dashboard.data.escalation_analytics import _aggregate_project
 
         now = golden_now()
         esc_dir = tmp_path / 'escalations'
         total = self._build_fixture(esc_dir, now)
 
-        entry, _ = _aggregate_project(
+        entry, _ = _aggregate(
             'dark_factory', esc_dir, tmp_path / 'runs.db', now=now,
             downsample_threshold=total + 1,
         )
@@ -932,6 +1058,262 @@ class TestSamplesDownsampling:
         assert len(lifespan['samples']) == total
         assert 'samples_downsampled' not in lifespan
         assert 'samples_total' not in lifespan
+
+
+# ---------------------------------------------------------------------------
+# archives_present — the payload's own "did this scan reach the archive?" signal
+# ---------------------------------------------------------------------------
+
+_ANALYTICS_KEYS = {'generated_at', 'parse_failures', 'regime_markers', 'per_project',
+                   'archives_present', 'archives_reached', 'views'}
+
+
+class TestArchivesPresent:
+    """Did every configured project's escalation archive actually exist?
+
+    The COMPLETENESS diagnostic: ``all()`` over the configured roots.  It
+    answers "was this scan whole?", which is an operator's question — the
+    cache's question ("did this scan reach anything at all?") is answered by
+    ``archives_reached`` next door, and the two are deliberately not the same
+    field.  Nothing else in the payload can answer either one:
+    ``iter_all_escalation_paths`` returns silently on a missing dir and
+    ``Path.glob`` swallows ``PermissionError``, so an absent archive, an
+    unreadable one and a genuinely empty one are otherwise byte-identical —
+    zero filings, zero parse failures, same shape.
+
+    Deliberately NOT derived from ``parse_failures``.  That counts unparseable
+    RECORDS and is a permanent property of a corrupt file, so a cache keyed on
+    it would be defeated forever by one bad record sitting in front of the
+    expensive walk.  The two fields answer different questions, and the last
+    test here pins that they stay independent in both directions.
+    """
+
+    def test_a_present_archive_reports_true(self, tmp_path):
+
+        now = golden_now()
+        esc_dir = tmp_path / 'escalations'
+        esc_dir.mkdir(parents=True)
+        runs_db = _make_runs_db(tmp_path, [])
+
+        result = _analytics([('dark_factory', esc_dir, runs_db)], now=now)
+
+        assert result['archives_present'] is True
+
+    def test_an_absent_archive_reports_false(self, tmp_path):
+        """The dir was never created — the walk had nothing to reach.
+
+        Indistinguishable from an empty archive in every other field, which is
+        exactly why this key has to exist.
+        """
+
+        now = golden_now()
+        never_created = tmp_path / 'nope' / 'data' / 'escalations'
+        runs_db = _make_runs_db(tmp_path, [])
+
+        result = _analytics([('dark_factory', never_created, runs_db)], now=now)
+
+        assert result['archives_present'] is False
+        # The rest of the payload is unchanged: still a well-formed, empty,
+        # NON-erroring entry.  This signal reports on the scan, it does not
+        # degrade the answer.
+        assert result['parse_failures'] == 0
+        assert len(result['per_project']) == 1
+        assert result['per_project'][0]['project'] == 'dark_factory'
+
+    def test_one_absent_project_of_two_reports_false(self, tmp_path):
+        """It is ``all()``, not ``any()`` — this field reports COMPLETENESS.
+
+        A multi-project payload where one root's archive is missing is a
+        partial scan, and this field says so.  It does NOT follow that a
+        partial scan is uncacheable: see ``TestArchivesReached``, which pins
+        the cache predicate onto ``any()`` precisely because the ordinary
+        production config is permanently partial.
+        """
+
+        now = golden_now()
+        present = tmp_path / 'primary' / 'data' / 'escalations'
+        present.mkdir(parents=True)
+        absent = tmp_path / 'secondary' / 'data' / 'escalations'
+        runs_db = _make_runs_db(tmp_path, [])
+
+        result = _analytics(
+            [('primary', present, runs_db), ('secondary', absent, runs_db)], now=now,
+        )
+
+        assert result['archives_present'] is False
+        assert [p['project'] for p in result['per_project']] == ['primary', 'secondary']
+
+    def test_the_existing_contract_keys_are_untouched(self, tmp_path):
+        """Additive: the four Seam-2 keys keep their names, values and shapes."""
+
+        now = golden_now()
+        esc_dir = tmp_path / 'escalations'
+        build_golden_archive(esc_dir, now)
+        runs_db = _make_runs_db(tmp_path, [])
+
+        result = _analytics([('dark_factory', esc_dir, runs_db)], now=now)
+
+        assert set(result) == _ANALYTICS_KEYS
+        assert result['generated_at'] == now.isoformat()
+        assert isinstance(result['regime_markers'], list)
+        entry = result['per_project'][0]
+        assert {'project', 'origin', 'lifespan', 'workflow'} <= set(entry)
+
+    def test_a_corrupt_record_does_not_flip_archives_present(self, tmp_path):
+        """The two signals are independent, and this is the load-bearing case.
+
+        ``build_golden_archive`` plants one non-JSON file, so ``parse_failures``
+        is >= 1 permanently.  If ``archives_present`` tracked it, the route's
+        cache would be permanently defeated by a single corrupt record — the
+        exact failure the reviewer's suggestion was NOT asking for.  The
+        archive dir exists and was walked; that a record inside it is garbage
+        is a different fact, reported by a different field.
+        """
+
+        now = golden_now()
+        esc_dir = tmp_path / 'escalations'
+        build_golden_archive(esc_dir, now)
+        runs_db = _make_runs_db(tmp_path, [])
+
+        result = _analytics([('dark_factory', esc_dir, runs_db)], now=now)
+
+        assert result['parse_failures'] >= 1
+        assert result['archives_present'] is True
+
+
+# ---------------------------------------------------------------------------
+# archives_reached — the payload's "did this scan reach ANY archive?" signal
+# ---------------------------------------------------------------------------
+
+
+class TestArchivesReached:
+    """Did the scan reach AT LEAST ONE configured archive?
+
+    ``archives_present`` (``all``) and ``archives_reached`` (``any``) answer
+    two different questions, and conflating them is what this class exists to
+    prevent.  ``all`` is the completeness DIAGNOSTIC an operator reads; ``any``
+    is the CACHE predicate, and only ``any`` is sound for that job.
+
+    Measured on this machine, 2026-08-01, against the installed unit's own
+    root list (``systemctl --user cat dark-factory-dashboard`` ->
+    ``DASHBOARD_KNOWN_PROJECT_ROOTS``, 9 roots): 2 roots
+    (``/home/leo/src/autotrade``, ``/home/leo/mission-control``) have no
+    ``data/escalations`` dir at all, while the other 7 hold ~9.1k ``esc-*.json``
+    records between them (dark_factory 3278, reify 5561, autopilot-video 69,
+    +4 smaller).  So in the CURRENT production config ``all`` is permanently
+    False and ``any`` is True.  Keying the cache on ``all`` means the 60s TTL
+    never stores anything and every 3s poll (``POLL_INTERVAL_MS``,
+    static/redux/data.js) re-runs the whole multi-second walk — i.e. ``all``
+    reports "this scan was free to redo" at exactly the moment it was most
+    expensive.  A root that has simply never escalated must not delete the
+    cache in front of the other seven.
+
+    The remaining question — is ``any`` too lax? — is answered by what the
+    predicate is FOR: a build that walked nothing is genuinely free to redo
+    (one ``is_dir`` stat per project, all of them negative), and pinning it
+    would keep the tab reporting an empty archive for a full TTL window after
+    the volume mounts.  A build that walked something paid for that walk, and
+    the cache is what stops it being paid again three seconds later.
+    """
+
+    def test_a_present_archive_reports_true(self, tmp_path):
+
+        now = golden_now()
+        esc_dir = tmp_path / 'escalations'
+        esc_dir.mkdir(parents=True)
+        runs_db = _make_runs_db(tmp_path, [])
+
+        result = _analytics([('dark_factory', esc_dir, runs_db)], now=now)
+
+        assert result['archives_reached'] is True
+
+    def test_an_absent_archive_reports_false(self, tmp_path):
+        """Nothing was walked, so nothing is worth pinning — both signals agree."""
+
+        now = golden_now()
+        never_created = tmp_path / 'nope' / 'data' / 'escalations'
+        runs_db = _make_runs_db(tmp_path, [])
+
+        result = _analytics([('dark_factory', never_created, runs_db)], now=now)
+
+        assert result['archives_reached'] is False
+        assert result['archives_present'] is False
+
+    def test_one_absent_project_of_two_is_reached_but_not_present(self, tmp_path):
+        """THE case, and the whole reason this field exists.
+
+        This is the shape of the installed 9-root config (2 archive-less roots,
+        7 holding ~9.1k records — see the class docstring).  The scan reached
+        an archive and paid the full walk for it, so the payload MUST be
+        cacheable; it did not reach every archive, so the diagnostic must still
+        say the picture is partial.  One field cannot be both.
+        """
+
+        now = golden_now()
+        present = tmp_path / 'primary' / 'data' / 'escalations'
+        present.mkdir(parents=True)
+        absent = tmp_path / 'secondary' / 'data' / 'escalations'
+        runs_db = _make_runs_db(tmp_path, [])
+
+        result = _analytics(
+            [('primary', present, runs_db), ('secondary', absent, runs_db)], now=now,
+        )
+
+        assert result['archives_reached'] is True
+        assert result['archives_present'] is False
+        assert [p['project'] for p in result['per_project']] == ['primary', 'secondary']
+
+    def test_two_absent_projects_report_false_on_both_signals(self, tmp_path):
+        """Reached nothing AND complete-of-nothing: the one case that agrees."""
+
+        now = golden_now()
+        runs_db = _make_runs_db(tmp_path, [])
+        first = tmp_path / 'primary' / 'data' / 'escalations'
+        second = tmp_path / 'secondary' / 'data' / 'escalations'
+
+        result = _analytics(
+            [('primary', first, runs_db), ('secondary', second, runs_db)], now=now,
+        )
+
+        assert result['archives_reached'] is False
+        assert result['archives_present'] is False
+
+    def test_no_configured_projects_reports_not_reached(self, tmp_path):
+        """The degenerate case, pinned deliberately rather than left to fall out.
+
+        ``any([])`` is False and ``all([])`` is True, so an empty config is the
+        one shape where the two signals INVERT: nothing was reached, yet
+        everything configured was present.  Reached-nothing is the correct
+        answer for the cache — there is no walk to protect — and writing it
+        down here means a later refactor that flips either default trips a
+        test instead of silently pinning an empty payload.
+        """
+
+        result = _analytics([], now=golden_now())
+
+        assert result['archives_reached'] is False
+        assert result['archives_present'] is True
+        assert result['per_project'] == []
+
+    def test_a_corrupt_record_does_not_flip_archives_reached(self, tmp_path):
+        """Twin of the ``archives_present`` case: the three signals stay independent.
+
+        ``build_golden_archive`` plants one non-JSON file, so ``parse_failures``
+        is >= 1 permanently.  If the cache predicate tracked it, a single
+        corrupt record would defeat the cache forever in front of the very
+        walk it protects.  The archive was reached; that a record inside it is
+        garbage is a different fact, reported by a different field.
+        """
+
+        now = golden_now()
+        esc_dir = tmp_path / 'escalations'
+        build_golden_archive(esc_dir, now)
+        runs_db = _make_runs_db(tmp_path, [])
+
+        result = _analytics([('dark_factory', esc_dir, runs_db)], now=now)
+
+        assert result['parse_failures'] >= 1
+        assert result['archives_reached'] is True
 
 
 # ---------------------------------------------------------------------------
@@ -988,7 +1370,6 @@ class TestBuildEscalationAnalyticsPerf:
     def test_cold_10k_archive_cpu_budget(self, tmp_path):
         import time
 
-        from dashboard.data.escalation_analytics import build_escalation_analytics
 
         now = golden_now()
         esc_dir = tmp_path / 'escalations'
@@ -999,7 +1380,7 @@ class TestBuildEscalationAnalyticsPerf:
         ])
 
         started = time.process_time()
-        result = build_escalation_analytics([('dark_factory', esc_dir, runs_db)], now=now)
+        result = _analytics([('dark_factory', esc_dir, runs_db)], now=now)
         cpu_elapsed = time.process_time() - started
 
         # The bound guards against an O(n^2) archive-walk regression, NOT a
@@ -1047,3 +1428,559 @@ class TestBuildEscalationAnalyticsPerf:
         # record 1:1 — no downsampling triggered.
         assert len(samples) == terminal_count
         assert 'samples_downsampled' not in project['lifespan']
+
+
+# ---------------------------------------------------------------------------
+# task 3543 step-25: pins_recovery annotation on open_items
+# ---------------------------------------------------------------------------
+#
+# `fetch_pins_recovery` (dashboard/data/escalations.py) reads each escalation
+# MCP's computed `pins_recovery` and returns a THREE-state per-project map.
+# This module is the PURE-SYNC archive walker that renders it: it must NOT
+# fetch anything (it runs inside asyncio.to_thread behind a TTL cache), so the
+# annotation is passed IN and only ever stamped onto open_items.
+#
+# The whole point is that "unknown" survives the trip.  Two omissions carry it:
+#
+#   * the project's annotation is None (its escalation MCP could not be read)
+#     -> no open_item carries the keys at all;
+#   * an individual id is absent from a non-None annotation (a pre-3543 server,
+#     or a server that computed the annotation and deliberately withheld it)
+#     -> that item carries neither key.
+#
+# Both render as nothing.  Stamping False in either case would assert "this
+# escalation pins no recovery" on evidence nobody produced — the esc-3163
+# false negative.  Render-when-present is the module's own existing idiom
+# (`triage_segments` is emitted only when there are deltas).
+
+
+def _pending_esc(esc_id: str, task_id: str, *, now: datetime, hours: int = 7,
+                 level: int = 1) -> dict:
+    """A pending escalation record aged *hours* before *now*."""
+    return {
+        'id': esc_id, 'task_id': task_id, 'agent_role': 'implementer',
+        'severity': 'blocking', 'category': 'design_concern',
+        'summary': f'open on {task_id}',
+        'timestamp': _iso(now - timedelta(hours=hours)),
+        'status': 'pending', 'level': level,
+    }
+
+
+def _pins_archive(esc_dir: Path, now: datetime) -> None:
+    """Three pending records on three tasks — the fixture every test here uses."""
+    for esc in (
+        _pending_esc('esc-300-1', '300', now=now),
+        _pending_esc('esc-301-1', '301', now=now),
+        _pending_esc('esc-302-1', '302', now=now, hours=3),
+    ):
+        _write_escalation(esc_dir, esc, archived=False)
+
+
+class TestLifespanPinsRecovery:
+    """`_lifespan_block(..., pins_by_id=...)` stamps open_items."""
+
+    def test_annotated_ids_carry_the_flag_and_task_ids(self, tmp_path):
+        """Non-empty task list -> True; empty list -> False (both are ANSWERS)."""
+
+        now = golden_now()
+        esc_dir = tmp_path / 'escalations'
+        _pins_archive(esc_dir, now)
+
+        entry, _ = _aggregate(
+            'dark_factory', esc_dir, tmp_path / 'runs.db', now=now,
+            pins_by_id={'esc-300-1': ['300'], 'esc-301-1': []},
+        )
+        open_by_id = {i['id']: i for i in entry['lifespan']['open_items']}
+
+        assert open_by_id['esc-300-1']['pins_recovery'] is True
+        assert open_by_id['esc-300-1']['pins_recovery_task_ids'] == ['300']
+        assert open_by_id['esc-301-1']['pins_recovery'] is False
+        assert open_by_id['esc-301-1']['pins_recovery_task_ids'] == []
+
+        # breach_6h is untouched — the two badges are independent signals.
+        assert open_by_id['esc-300-1']['breach_6h'] is True
+        assert open_by_id['esc-302-1']['breach_6h'] is False
+
+    def test_id_absent_from_a_non_none_annotation_is_unknown(self, tmp_path):
+        """An unannotated id carries NEITHER key — not `pins_recovery: False`.
+
+        The escalation server omits the key when it could not compute it, and
+        `fetch_pins_recovery` faithfully drops those ids rather than defaulting
+        them.  Re-introducing the default here would undo both.
+        """
+
+        now = golden_now()
+        esc_dir = tmp_path / 'escalations'
+        _pins_archive(esc_dir, now)
+
+        entry, _ = _aggregate(
+            'dark_factory', esc_dir, tmp_path / 'runs.db', now=now,
+            pins_by_id={'esc-300-1': ['300']},
+        )
+        open_by_id = {i['id']: i for i in entry['lifespan']['open_items']}
+
+        assert open_by_id['esc-300-1']['pins_recovery'] is True
+        for unannotated in ('esc-301-1', 'esc-302-1'):
+            assert 'pins_recovery' not in open_by_id[unannotated]
+            assert 'pins_recovery_task_ids' not in open_by_id[unannotated]
+
+    def test_none_annotation_omits_the_keys_everywhere(self, tmp_path):
+        """A project whose escalation MCP could not be read stamps nothing."""
+
+        now = golden_now()
+        esc_dir = tmp_path / 'escalations'
+        _pins_archive(esc_dir, now)
+
+        entry, _ = _aggregate(
+            'dark_factory', esc_dir, tmp_path / 'runs.db', now=now,
+            pins_by_id=None,
+        )
+        open_items = entry['lifespan']['open_items']
+
+        assert len(open_items) == 3
+        for item in open_items:
+            assert 'pins_recovery' not in item
+            assert 'pins_recovery_task_ids' not in item
+
+    def test_default_call_is_byte_identical_to_the_pre_3543_shape(self, tmp_path):
+        """Omitting the parameter entirely leaves open_items exactly as before."""
+
+        now = golden_now()
+        esc_dir = tmp_path / 'escalations'
+        _pins_archive(esc_dir, now)
+
+        entry, _ = _aggregate(
+            'dark_factory', esc_dir, tmp_path / 'runs.db', now=now,
+        )
+        for item in entry['lifespan']['open_items']:
+            assert set(item) == {'id', 'task_id', 'level', 'age_secs', 'breach_6h'}
+
+    def test_empty_annotation_is_not_the_same_as_none(self, tmp_path):
+        """`{}` (read succeeded, nothing annotated) also stamps nothing.
+
+        It reaches the same rendered outcome as None by a different route —
+        every id is simply absent — and that is correct: an empty successful
+        read still tells us nothing about any specific record.
+        """
+
+        now = golden_now()
+        esc_dir = tmp_path / 'escalations'
+        _pins_archive(esc_dir, now)
+
+        entry, _ = _aggregate(
+            'dark_factory', esc_dir, tmp_path / 'runs.db', now=now, pins_by_id={},
+        )
+        for item in entry['lifespan']['open_items']:
+            assert 'pins_recovery' not in item
+
+    def test_annotation_ids_outside_this_archive_are_ignored(self, tmp_path):
+        """Ids the archive has never seen are dropped without error.
+
+        The live queue and the on-disk archive are read at different instants
+        and by different mechanisms, so they routinely disagree at the edges.
+        A stale or foreign id must not raise inside a poll cycle, and must not
+        appear as a phantom open_item.
+        """
+
+        now = golden_now()
+        esc_dir = tmp_path / 'escalations'
+        _pins_archive(esc_dir, now)
+
+        entry, _ = _aggregate(
+            'dark_factory', esc_dir, tmp_path / 'runs.db', now=now,
+            pins_by_id={
+                'esc-300-1': ['300'],
+                'esc-999-9': ['999'],        # never filed here
+                'esc-recon-1': [],           # a different queue's record
+            },
+        )
+        open_by_id = {i['id']: i for i in entry['lifespan']['open_items']}
+
+        assert set(open_by_id) == {'esc-300-1', 'esc-301-1', 'esc-302-1'}
+        assert open_by_id['esc-300-1']['pins_recovery'] is True
+
+    def test_terminal_records_are_never_annotated(self, tmp_path):
+        """Only open_items carry the annotation — samples/percentiles are untouched.
+
+        A resolved record cannot pin a recovery; if the live queue somehow
+        names one, it must not leak into the lifespan block's other outputs.
+        """
+
+        now = golden_now()
+        esc_dir = tmp_path / 'escalations'
+        _pins_archive(esc_dir, now)
+        resolved = {
+            'id': 'esc-303-1', 'task_id': '303', 'agent_role': 'implementer',
+            'severity': 'blocking', 'category': 'design_concern',
+            'summary': 'already resolved',
+            'timestamp': _iso(now - timedelta(hours=9)),
+            'status': 'resolved', 'level': 1,
+            'resolved_at': _iso(now - timedelta(hours=8)),
+            'resolved_by': 'interactive',
+        }
+        _write_escalation(esc_dir, resolved, archived=True)
+
+        entry, _ = _aggregate(
+            'dark_factory', esc_dir, tmp_path / 'runs.db', now=now,
+            pins_by_id={'esc-303-1': ['303']},
+        )
+        lifespan = entry['lifespan']
+
+        assert {i['id'] for i in lifespan['open_items']} == {
+            'esc-300-1', 'esc-301-1', 'esc-302-1',
+        }
+        assert all(len(row) == 4 for row in lifespan['samples'])
+
+
+class TestBuildEscalationAnalyticsPins:
+    """`build_escalation_analytics(..., pins_by_project=...)` routing."""
+
+    def test_per_project_annotation_is_routed_by_label(self, tmp_path):
+        """Each project's own annotation reaches its own open_items — only its own."""
+
+        now = golden_now()
+        dir_a = tmp_path / 'a' / 'escalations'
+        dir_b = tmp_path / 'b' / 'escalations'
+        _write_escalation(dir_a, _pending_esc('esc-400-1', '400', now=now), archived=False)
+        _write_escalation(dir_b, _pending_esc('esc-500-1', '500', now=now), archived=False)
+
+        result = _analytics(
+            [
+                ('proj-a', dir_a, tmp_path / 'a' / 'runs.db'),
+                ('proj-b', dir_b, tmp_path / 'b' / 'runs.db'),
+            ],
+            now=now,
+            pins_by_project={'proj-a': {'esc-400-1': ['400']}, 'proj-b': None},
+        )
+        by_project = {p['project']: p for p in result['per_project']}
+
+        a_items = {i['id']: i for i in by_project['proj-a']['lifespan']['open_items']}
+        assert a_items['esc-400-1']['pins_recovery'] is True
+        assert a_items['esc-400-1']['pins_recovery_task_ids'] == ['400']
+
+        # proj-b's escalation MCP was unreadable -> unknown, stamp nothing.
+        b_items = {i['id']: i for i in by_project['proj-b']['lifespan']['open_items']}
+        assert 'pins_recovery' not in b_items['esc-500-1']
+
+    def test_project_missing_from_the_map_is_unknown(self, tmp_path):
+        """A root with no discovered escalation URL never appears in the fanout."""
+
+        now = golden_now()
+        esc_dir = tmp_path / 'escalations'
+        _write_escalation(esc_dir, _pending_esc('esc-600-1', '600', now=now), archived=False)
+
+        result = _analytics(
+            [('proj-x', esc_dir, tmp_path / 'runs.db')],
+            now=now,
+            pins_by_project={'some-other-project': {'esc-600-1': ['600']}},
+        )
+        item = result['per_project'][0]['lifespan']['open_items'][0]
+        assert 'pins_recovery' not in item
+        assert 'pins_recovery_task_ids' not in item
+
+    def test_none_pins_by_project_matches_the_unparameterised_call(self, tmp_path):
+        """Passing None (the default) changes nothing about the payload."""
+
+        now = golden_now()
+        esc_dir = tmp_path / 'escalations'
+        _write_escalation(esc_dir, _pending_esc('esc-700-1', '700', now=now), archived=False)
+        dirs = [('proj-y', esc_dir, tmp_path / 'runs.db')]
+
+        bare = _analytics(dirs, now=now)
+        explicit = _analytics(dirs, now=now, pins_by_project=None)
+        assert bare == explicit
+        assert 'pins_recovery' not in explicit['per_project'][0]['lifespan']['open_items'][0]
+
+    def test_annotation_does_not_read_the_clock(self, tmp_path):
+        """The threaded `now` is the only instant the annotated payload reports.
+
+        `build_escalation_analytics` runs inside `asyncio.to_thread` under a
+        TTL cache, so every timestamp it emits must come from the caller's
+        `now` rather than a fresh clock read — otherwise two rows in one pass
+        could be judged against different instants.  Annotating with
+        `pins_by_project` must not disturb that: `generated_at` stays exactly
+        the passed instant, and the pins stamp still lands.
+        """
+
+        now = golden_now()
+        esc_dir = tmp_path / 'escalations'
+        _write_escalation(esc_dir, _pending_esc('esc-800-1', '800', now=now), archived=False)
+        result = _analytics(
+            [('proj-z', esc_dir, tmp_path / 'runs.db')],
+            now=now,
+            pins_by_project={'proj-z': {'esc-800-1': ['800']}},
+        )
+        assert result['generated_at'] == now.isoformat()
+        item = result['per_project'][0]['lifespan']['open_items'][0]
+        assert item['pins_recovery'] is True
+        assert item['pins_recovery_task_ids'] == ['800']
+
+
+# ---------------------------------------------------------------------------
+# The corpus contract: every resolution class, one terminal denominator, views
+# ---------------------------------------------------------------------------
+
+
+def _terminal(esc_id: str, *, now: datetime, status: str, resolution_class: str | None = None,
+              resolved_at: str | None = None, action: str | None = None) -> dict:
+    return {
+        'id': esc_id, 'task_id': esc_id.split('-')[1], 'agent_role': 'implementer',
+        'severity': 'blocking', 'category': 'design_concern', 'summary': esc_id,
+        'timestamp': _iso(now - timedelta(days=3)),
+        'status': status, 'level': 0,
+        'resolved_at': resolved_at if resolved_at is not None else _iso(now - timedelta(days=2)),
+        'resolved_by': 'interactive',
+        'resolution_class': resolution_class,
+        'resolution_action': action,
+    }
+
+
+_INFERRED_CLASSES = frozenset({'benign', 'actionable'})
+
+
+def _one_terminal_per_class(esc_dir: Path, now: datetime) -> None:
+    """Unstamped dismissed and resolved, plus one stamp per other RESOLUTION_CLASSES member."""
+    stamped = [
+        _terminal(f'esc-{100 + n}-1', now=now, status='dismissed', resolution_class=cls)
+        for n, cls in enumerate(sorted(RESOLUTION_CLASSES - _INFERRED_CLASSES))
+    ]
+    for record in (
+        *stamped,
+        _terminal('esc-3-1', now=now, status='dismissed'),
+        _terminal('esc-4-1', now=now, status='resolved', action='restart'),
+    ):
+        _write_escalation(esc_dir, record, archived=True)
+
+
+class TestCompleteResolutionClasses:
+    """origin.sources[].classes names every RESOLUTION_CLASSES member, and sums to classified."""
+
+    def test_every_class_is_keyed_and_counted(self, tmp_path):
+        now = golden_now()
+        esc_dir = tmp_path / 'escalations'
+        _one_terminal_per_class(esc_dir, now)
+
+        entry, _ = _aggregate('dark_factory', esc_dir, tmp_path / 'runs.db', now=now)
+        (source,) = entry['origin']['sources']
+
+        assert set(source['classes']) == set(RESOLUTION_CLASSES)
+        for cls in RESOLUTION_CLASSES:
+            assert source['classes'][cls] == 1
+        assert source['classified'] == sum(source['classes'].values()) == len(RESOLUTION_CLASSES)
+        assert source['benign_rate'] == source['classes']['benign'] / source['classified']
+        assert 'benign' not in source and 'actionable' not in source
+
+    def test_zero_filled_when_a_class_is_absent(self, tmp_path):
+        now = golden_now()
+        esc_dir = tmp_path / 'escalations'
+        _write_escalation(esc_dir, _terminal('esc-3-1', now=now, status='dismissed'), archived=True)
+
+        entry, _ = _aggregate('dark_factory', esc_dir, tmp_path / 'runs.db', now=now)
+        (source,) = entry['origin']['sources']
+
+        assert source['classes'] == {
+            cls: (1 if cls == 'benign' else 0) for cls in RESOLUTION_CLASSES
+        }
+
+    def test_an_unexpected_stamp_gets_its_own_key(self, tmp_path):
+        now = golden_now()
+        esc_dir = tmp_path / 'escalations'
+        _one_terminal_per_class(esc_dir, now)
+        _write_escalation(
+            esc_dir,
+            _terminal('esc-5-1', now=now, status='dismissed', resolution_class='not-a-class'),
+            archived=True,
+        )
+
+        entry, _ = _aggregate('dark_factory', esc_dir, tmp_path / 'runs.db', now=now)
+        (source,) = entry['origin']['sources']
+
+        assert source['classes']['not-a-class'] == 1
+        assert source['classified'] == sum(source['classes'].values()) == len(RESOLUTION_CLASSES) + 1
+
+
+_ROUTER_CLASSES = frozenset({'addressed', 'observation-consumed', 'converted', 'status-info'})
+
+
+class TestDispositionedBucket:
+    """origin.sources[].dispositioned counts what the info-L0 router closed
+    (plans/info-l0-disposition-router-prd.md D14), beside the per-class keys."""
+
+    def test_it_counts_the_four_router_classes_and_no_other(self, tmp_path):
+        now = golden_now()
+        esc_dir = tmp_path / 'escalations'
+        _one_terminal_per_class(esc_dir, now)
+        strand = _terminal('esc-7-1', now=now, status='dismissed', resolution_class='stale-strand')
+        _write_escalation(esc_dir, {**strand, 'agent_role': 'steward'}, archived=True)
+
+        entry, _ = _aggregate('dark_factory', esc_dir, tmp_path / 'runs.db', now=now)
+        sources = {s['source']: s for s in entry['origin']['sources']}
+
+        implementer = sources['implementer']
+        assert implementer['dispositioned'] == 4
+        assert implementer['dispositioned'] == sum(implementer['classes'][c] for c in _ROUTER_CLASSES)
+        assert sources['steward']['dispositioned'] == 0
+        assert set(implementer['classes']) == set(RESOLUTION_CLASSES)
+        assert {row['class'] for row in entry['workflow']['flow_daily']} <= RESOLUTION_CLASSES
+
+    def test_the_bucket_is_drawn_from_the_resolution_vocabulary(self):
+        from dashboard.data.escalation_analytics import DISPOSITIONED_CLASSES
+
+        assert DISPOSITIONED_CLASSES == _ROUTER_CLASSES
+        assert DISPOSITIONED_CLASSES <= RESOLUTION_CLASSES
+
+
+class TestOneTerminalPopulation:
+    """classes, action_mix and terminal count the same terminal records."""
+
+    def test_an_unparseable_resolved_at_is_counted_everywhere_it_belongs(self, tmp_path):
+        now = golden_now()
+        esc_dir = tmp_path / 'escalations'
+        _one_terminal_per_class(esc_dir, now)
+        _write_escalation(
+            esc_dir,
+            _terminal('esc-6-1', now=now, status='resolved', resolved_at='not-a-date'),
+            archived=False,
+        )
+
+        entry, _ = _aggregate('dark_factory', esc_dir, tmp_path / 'runs.db', now=now)
+        classified = sum(sum(s['classes'].values()) for s in entry['origin']['sources'])
+        action_mix = entry['workflow']['action_mix']
+
+        assert entry['terminal'] == classified == sum(action_mix.values()) == len(RESOLUTION_CLASSES) + 1
+        assert action_mix == {'restart': 1, 'unspecified': len(RESOLUTION_CLASSES)}
+
+
+def _write_pending(esc_dir: Path, esc_id: str, *, now: datetime, archived: bool) -> None:
+    directory = esc_dir / 'archive' / '2026-07-01' if archived else esc_dir
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / f'{esc_id}.json').write_text(json.dumps(_pending_esc(esc_id, esc_id.split('-')[1], now=now)))
+
+
+def _sketch_10(esc_dir: Path, now: datetime) -> None:
+    """Sketch #10: 2 pending at the queue root, 3 pending left in the archive."""
+    for n in (1, 2):
+        _write_pending(esc_dir, f'esc-90{n}-1', now=now, archived=False)
+    for n in (3, 4, 5):
+        _write_pending(esc_dir, f'esc-90{n}-1', now=now, archived=True)
+
+
+class TestCorpusViewsAndProvenance:
+    """The analytics payload reads the corpus: its views, its instant, its gaps."""
+
+    def test_per_project_views_are_the_corpus_views(self, tmp_path):
+        from dashboard.data.datum import validate_datum
+
+        now = golden_now()
+        esc_dir = tmp_path / 'escalations'
+        _sketch_10(esc_dir, now)
+
+        payload = _analytics([('dark_factory', esc_dir, tmp_path / 'runs.db')], now=now)
+        (entry,) = payload['per_project']
+
+        assert entry['views'][EscalationView.QUEUE_PENDING].value == 2
+        assert entry['views'][EscalationView.OPEN_IN_HISTORY].value == 5
+        assert len(entry['lifespan']['open_items']) == 5
+        assert payload['views'][EscalationView.OPEN_IN_HISTORY].value == 5
+        for datum in (*entry['views'].values(), *payload['views'].values()):
+            assert datum.as_of == now
+            validate_datum(datum, now)
+
+    def test_an_unmeasured_corpus_is_refused_not_served_empty(self):
+        from dashboard.data.datum import unknown_datum
+
+        with pytest.raises(ValueError, match='not measured: volume offline'):
+            build_escalation_analytics(unknown_datum('volume offline', 120))
+
+    def test_each_project_reads_its_own_queues_runs_db(self, tmp_path):
+        now = golden_now()
+        projects = []
+        for label, dones in (('alpha', 1), ('beta', 2)):
+            esc_dir = tmp_path / label / 'escalations'
+            esc_dir.mkdir(parents=True)
+            rows: list[tuple[str, str, str | None]] = [
+                (str(n), 'done', now.isoformat()) for n in range(dones)
+            ]
+            projects.append((label, esc_dir, _make_runs_db(tmp_path / label, rows)))
+        projects.append(('gamma', tmp_path / 'gamma' / 'escalations', tmp_path / 'absent.db'))
+
+        payload = _analytics(projects, now=now)
+
+        read = {entry['project']: entry['workflow']['done_counts_read'] for entry in payload['per_project']}
+        assert read == {'alpha': True, 'beta': True, 'gamma': False}
+        done = {
+            entry['project']: sum(day['done'] for day in entry['workflow']['esc_per_done_daily'])
+            for entry in payload['per_project']
+            if entry['workflow']['done_counts_read']
+        }
+        assert done == {'alpha': 1, 'beta': 2}
+
+    def test_generated_at_is_the_corpus_instant(self, tmp_path):
+        now = golden_now()
+        esc_dir = tmp_path / 'escalations'
+        _write_escalation(esc_dir, _pending_esc('esc-950-1', '950', now=now, hours=7),
+                          archived=False)
+
+        payload = _analytics([('dark_factory', esc_dir, tmp_path / 'runs.db')], now=now)
+        (item,) = payload['per_project'][0]['lifespan']['open_items']
+
+        assert payload['generated_at'] == now.isoformat()
+        assert item['age_secs'] == 7 * 3600
+
+    def test_parse_failures_count_orchestrator_unreadables_and_marker_failures(self, tmp_path):
+        now = golden_now()
+        esc_dir = tmp_path / 'escalations'
+        esc_dir.mkdir(parents=True)
+        (esc_dir / 'esc-1-1.json').write_text('{not json')
+        archive = esc_dir / 'archive' / '2026-07-01'
+        archive.mkdir(parents=True)
+        (archive / 'esc-2-1.json').write_text(json.dumps({'id': 'esc-2-1'}))
+        recon_dir = tmp_path / 'recon'
+        recon_dir.mkdir()
+        (recon_dir / 'esc-3-1.json').write_text('{not json')
+        bad_markers = tmp_path / 'markers.yaml'
+        bad_markers.write_text('date: [unclosed')
+        orchestrator = _orchestrator_queue('dark_factory', esc_dir, tmp_path / 'runs.db')
+        reconciliation = QueueRef(
+            id='reconciliation', label='fused-memory', kind=QueueKind.RECONCILIATION,
+            directory=recon_dir, runs_db=None,
+        )
+
+        payload = build_escalation_analytics(
+            measure_corpus((orchestrator, reconciliation), now=now),
+            regime_markers_path=bad_markers,
+        )
+
+        assert payload['parse_failures'] == 3
+
+    def test_the_reconciliation_queue_is_not_a_project(self, tmp_path):
+        now = golden_now()
+        esc_dir = tmp_path / 'escalations'
+        _sketch_10(esc_dir, now)
+        recon_dir = tmp_path / 'recon'
+        _write_pending(recon_dir, 'esc-960-1', now=now, archived=False)
+        orchestrator = _orchestrator_queue('dark_factory', esc_dir, tmp_path / 'runs.db')
+        reconciliation = QueueRef(
+            id='reconciliation', label='fused-memory', kind=QueueKind.RECONCILIATION,
+            directory=recon_dir, runs_db=None,
+        )
+
+        payload = build_escalation_analytics(
+            measure_corpus((orchestrator, reconciliation), now=now),
+        )
+
+        assert [p['project'] for p in payload['per_project']] == ['dark_factory']
+        assert payload['archives_present'] is True
+        assert payload['views'][EscalationView.OPEN_IN_HISTORY].value == 5
+
+
+@pytest.mark.parametrize('cls', sorted(RESOLUTION_CLASSES))
+def test_flow_daily_carries_every_class(tmp_path, cls):
+    """The strip's windowed class split reads flow_daily, so every class must reach it."""
+    now = golden_now()
+    esc_dir = tmp_path / 'escalations'
+    _one_terminal_per_class(esc_dir, now)
+
+    entry, _ = _aggregate('dark_factory', esc_dir, tmp_path / 'runs.db', now=now)
+
+    assert sum(row['n'] for row in entry['workflow']['flow_daily'] if row['class'] == cls) == 1

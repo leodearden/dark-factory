@@ -6,93 +6,57 @@ Backend data layer for plans/escalation-lifecycle-dashboard-prd.md Seam 2
 workflow aggregates over the escalation archive, plus regime markers and a
 ``parse_failures`` count (INV-4 — every skipped record is loud AND counted).
 
-This module is a PURE-SYNC core: :func:`build_escalation_analytics` does a
-per-request archive walk with no ``asyncio``. The route (``dashboard.app``)
-wraps the call in ``asyncio.to_thread`` behind a short TTL cache so a cold
-~10k-record walk never blocks the event loop. Tests exercise this module's
-functions directly.
-
-Clock discipline: the only permitted clock read is via
-:func:`dashboard.data.utils.resolve_now`, threaded through once from
-:func:`build_escalation_analytics` — see ``test_clock_discipline.py``.
+This module is a PURE-SYNC core over the escalation corpus
+(:mod:`dashboard.data.escalation_corpus`): it walks nothing and reads no
+clock. The corpus' own instant is the payload's instant, so every number here
+answers for the same walk the Escalations tab reads. The route
+(``dashboard.api.escalations``) runs it in ``asyncio.to_thread``, once per
+corpus generation.
 """
 
 from __future__ import annotations
 
-import json
 import logging
 import sqlite3
 from bisect import bisect_left
-from datetime import date, datetime, timedelta
+from collections.abc import Mapping
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-import yaml
-from escalation.classify import classify_resolver_tier, effective_benign
-from escalation.models import Escalation
-from escalation.queue import iter_all_escalation_paths
+from escalation.classify import effective_benign, resolver_tier
+from escalation.models import RESOLUTION_CLASSES, Escalation
 
+from dashboard.data.datum import Datum
+from dashboard.data.escalation_corpus import EscalationCorpus, views_over
+from dashboard.data.quality_markers import MarkerKind, load_curated_markers
 from dashboard.data.stats_utils import percentile
-from dashboard.data.utils import parse_utc, resolve_now
+from dashboard.data.utils import parse_utc
 
 logger = logging.getLogger(__name__)
 
-# Module-relative default: dashboard/regime-markers.yaml (the top-level
-# `dashboard/` package dir — three levels up from
-# dashboard/src/dashboard/data/escalation_analytics.py).
-_DEFAULT_REGIME_MARKERS_PATH = Path(__file__).resolve().parents[3] / 'regime-markers.yaml'
-
 
 def load_regime_markers(path: Path | None = None) -> tuple[list[dict], int]:
-    """Load hand-curated regime markers from a committed YAML file.
+    """The curated regime markers as ``{date, label, tasks}``, and the file's rejected-entry count.
 
-    Args:
-        path: Path to the YAML file. Defaults to the committed
-            ``dashboard/regime-markers.yaml``.
-
-    Returns:
-        ``(markers, parse_failures_delta)``. Never raises:
-
-        - Missing file -> ``([], 0)`` (absent is not a failure).
-        - Unparseable YAML or a non-list top level -> ``([], 1)`` + WARNING
-          (row 9 substrate: the endpoint must never 500 on a broken markers
-          file — it degrades to an empty list and counts the failure).
-
-        Each returned marker is normalized to ``{date, label, tasks}``
-        (``tasks`` defaults to ``[]``). ``date`` is coerced to ``str`` when
-        YAML parses an unquoted ``YYYY-MM-DD`` scalar as a ``datetime.date``
-        object — otherwise the payload would fail JSON serialization at the
-        route layer.
+    A delegate of :func:`dashboard.data.quality_markers.load_curated_markers`, the one reader of
+    ``dashboard/regime-markers.yaml`` (``path`` None reads its ``CURATED_MARKERS_PATH``). Only
+    ``kind: regime`` entries are escalation regime markers; the quality markers the same file
+    holds are not. Never raises: a missing file is ``([], 0)``; an unreadable file, or one whose
+    top level is not a list, counts one failure; and each rejected entry counts one while its
+    valid siblings still load (INV-4), so the endpoint degrades instead of answering 500.
+    ``date`` is the marker's UTC day as ``YYYY-MM-DD`` text.
     """
-    p = path if path is not None else _DEFAULT_REGIME_MARKERS_PATH
-    if not p.exists():
-        return [], 0
-
-    try:
-        with p.open() as f:
-            data = yaml.safe_load(f)
-    except (OSError, yaml.YAMLError) as exc:
-        logger.warning('load_regime_markers: failed to read/parse %s: %s', p, exc)
-        return [], 1
-
-    if not isinstance(data, list):
-        logger.warning(
-            'load_regime_markers: %s top level is not a list (got %s)',
-            p, type(data).__name__,
-        )
-        return [], 1
-
-    markers: list[dict] = []
-    for item in data:
-        if not isinstance(item, dict):
-            logger.warning('load_regime_markers: skipping non-mapping entry in %s: %r', p, item)
-            continue
-        raw_date = item.get('date')
-        markers.append({
-            'date': raw_date.isoformat() if isinstance(raw_date, date) else raw_date,
-            'label': item.get('label'),
-            'tasks': item.get('tasks') or [],
-        })
-    return markers, 0
+    curated = load_curated_markers(path)
+    markers = [
+        {
+            'date': marker.at.astimezone(UTC).date().isoformat(),
+            'label': marker.label,
+            'tasks': list(marker.tasks),
+        }
+        for marker in curated.markers
+        if marker.kind is MarkerKind.REGIME
+    ]
+    return markers, curated.parse_failures
 
 
 # ---------------------------------------------------------------------------
@@ -100,20 +64,21 @@ def load_regime_markers(path: Path | None = None) -> tuple[list[dict], int]:
 # ---------------------------------------------------------------------------
 
 
-def _done_by_day(runs_db: Path) -> dict[str, int]:
+def _done_by_day(runs_db: Path) -> dict[str, int] | None:
     """Return ``{date: count}`` of ``outcome='done'`` task_results rows.
 
     Bucketed by ``date(completed_at)``. Sync, read-only (``mode=ro`` URI),
     fail-open — mirrors ``orchestrator.digest._query_events_ro``'s discipline
-    applied to ``runs.db`` instead of an events DB: a missing DB logs at
-    DEBUG and returns ``{}``; any other failure logs at WARNING and returns
-    ``{}``. Never raises.
+    applied to ``runs.db`` instead of an events DB. None when runs.db cannot
+    be read — never ``{}``, which would claim no task completed: a missing DB
+    logs at DEBUG, any other failure at WARNING. A readable DB returns its
+    dict, possibly empty. Never raises.
     """
     runs_db = Path(runs_db)
     try:
         if not runs_db.exists():
             logger.debug('_done_by_day: DB not found (fail-open): %s', runs_db)
-            return {}
+            return None
         db_uri = runs_db.resolve().as_uri() + '?mode=ro'
         conn = sqlite3.connect(db_uri, uri=True)
         try:
@@ -130,42 +95,9 @@ def _done_by_day(runs_db: Path) -> dict[str, int]:
         # rather than an unexpected failure (WARNING).
         if not runs_db.exists():
             logger.debug('_done_by_day: DB not found (fail-open): %s', runs_db)
-            return {}
+            return None
         logger.warning('_done_by_day: query failed for %s', runs_db, exc_info=True)
-        return {}
-
-
-# ---------------------------------------------------------------------------
-# Archive walk (record loading)
-# ---------------------------------------------------------------------------
-
-
-def _load_escalation_records(escalations_dir: Path) -> tuple[list[Escalation], int]:
-    """Walk *escalations_dir* (queue root + archive) parsing every escalation file.
-
-    Returns ``(records, parse_failures)``. ``triaged_at``/``triaged_by`` (2555)
-    are first-class ``Escalation`` dataclass fields (``escalation.models``), so
-    ``Escalation.from_dict``'s ``__dataclass_fields__`` filter already
-    preserves them on the parsed record — no raw dict needs to be carried
-    alongside it for later blocks (``triage_segments``) to read.
-
-    A file that is not valid JSON, or whose parsed JSON cannot construct an
-    ``Escalation`` (missing required field, non-dict top level, etc.), is
-    counted in ``parse_failures`` and skipped — never raises. INV-4: the
-    dashboard is the loud surface for a corrupt archive file (skipped AND
-    counted), not a silent drop or a 500.
-    """
-    records: list[Escalation] = []
-    parse_failures = 0
-    for path in iter_all_escalation_paths(Path(escalations_dir)):
-        try:
-            esc = Escalation.from_dict(json.loads(path.read_text()))
-        except Exception as exc:
-            logger.warning('_load_escalation_records: failed to parse %s: %s', path, exc)
-            parse_failures += 1
-            continue
-        records.append(esc)
-    return records, parse_failures
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -179,15 +111,23 @@ _PREDICTABLY_BENIGN_WINDOW_DAYS = 28
 _PREDICTABLY_BENIGN_MIN_N = 20
 _PREDICTABLY_BENIGN_MIN_RATE = 0.9
 
+# The resolution classes the info-L0 router closes records with
+# (plans/info-l0-disposition-router-prd.md D14).
+DISPOSITIONED_CLASSES = frozenset({'addressed', 'observation-consumed', 'converted', 'status-info'})
+
 
 def _origin_block(records: list[Escalation], *, now: datetime) -> dict:
     """Per-source (``agent_role``) origin aggregates over *records*.
 
     ``sources[].filings`` counts every record for that source, regardless of
-    status. ``benign``/``actionable``/``stamped_share``/``benign_rate`` are
+    status. ``classes``/``classified``/``stamped_share``/``benign_rate`` are
     computed over ALL-TIME terminal (``resolved``/``dismissed``) records only
     (pending records are excluded — nothing to classify yet), via
-    :func:`escalation.classify.effective_benign`.
+    :func:`escalation.classify.effective_benign`. ``classes`` is keyed by
+    every :data:`escalation.models.RESOLUTION_CLASSES` member, zero-filled,
+    plus any stamp outside that vocabulary under its own key, so the parts
+    always sum to ``classified``.  ``dispositioned`` is the part of
+    ``classes`` in :data:`DISPOSITIONED_CLASSES`, what the info-L0 router closed.
 
     ``predictably_benign`` is a separate, windowed computation — trailing
     ``_PREDICTABLY_BENIGN_WINDOW_DAYS`` days keyed by ``resolved_at`` — True
@@ -205,9 +145,7 @@ def _origin_block(records: list[Escalation], *, now: datetime) -> dict:
     window_cutoff = now - timedelta(days=_PREDICTABLY_BENIGN_WINDOW_DAYS)
 
     filings: dict[str, int] = {}
-    classified: dict[str, int] = {}
-    benign: dict[str, int] = {}
-    actionable: dict[str, int] = {}
+    classes: dict[str, dict[str, int]] = {}
     stamped: dict[str, int] = {}
     window_n: dict[str, int] = {}
     window_benign: dict[str, int] = {}
@@ -233,13 +171,10 @@ def _origin_block(records: list[Escalation], *, now: datetime) -> dict:
         cls, provenance = effective_benign(esc)
         if cls is None:
             continue
-        classified[source] = classified.get(source, 0) + 1
+        source_classes = classes.setdefault(source, dict.fromkeys(sorted(RESOLUTION_CLASSES), 0))
+        source_classes[cls] = source_classes.get(cls, 0) + 1
         if provenance == 'stamped':
             stamped[source] = stamped.get(source, 0) + 1
-        if cls == 'benign':
-            benign[source] = benign.get(source, 0) + 1
-        elif cls == 'actionable':
-            actionable[source] = actionable.get(source, 0) + 1
 
         try:
             resolved_dt = parse_utc(esc.resolved_at)
@@ -256,8 +191,9 @@ def _origin_block(records: list[Escalation], *, now: datetime) -> dict:
 
     sources = []
     for source, n_filings in sorted(filings.items()):
-        n_classified = classified.get(source, 0)
-        n_benign = benign.get(source, 0)
+        source_classes = classes.get(source, dict.fromkeys(sorted(RESOLUTION_CLASSES), 0))
+        n_classified = sum(source_classes.values())
+        n_benign = source_classes['benign']
         n_window = window_n.get(source, 0)
         n_window_benign = window_benign.get(source, 0)
         window_rate = n_window_benign / n_window if n_window else 0.0
@@ -266,8 +202,9 @@ def _origin_block(records: list[Escalation], *, now: datetime) -> dict:
         sources.append({
             'source': source,
             'filings': n_filings,
-            'benign': n_benign,
-            'actionable': actionable.get(source, 0),
+            'classes': source_classes,
+            'classified': n_classified,
+            'dispositioned': sum(source_classes[cls] for cls in DISPOSITIONED_CLASSES),
             'stamped_share': stamped.get(source, 0) / n_classified if n_classified else 0.0,
             'benign_rate': n_benign / n_classified if n_classified else 0.0,
             'predictably_benign': (
@@ -351,11 +288,105 @@ def _downsample_stratified(samples: list[list], threshold: int) -> list[list]:
     return downsampled
 
 
+def _member_joined_at(
+    l2: Escalation, member_id: str, l2_filed_at: datetime, member_filed_at: datetime,
+) -> datetime | None:
+    """When *member_id* joined *l2*, or ``None`` when that is unknown.
+
+    A fold stamp in ``l2.member_folded_at`` wins. Without one, a member filed
+    at or before the L2 was present at its creation and joined at
+    *l2_filed_at*; a member filed after it was folded in before fold stamps
+    existed. Raises ``TypeError``/``ValueError`` on an unparseable stamp.
+    """
+    folded_at = l2.member_folded_at.get(member_id)
+    if folded_at is not None:
+        return parse_utc(folded_at)
+    if member_filed_at <= l2_filed_at:
+        return l2_filed_at
+    return None
+
+
+def _l1_to_l2_promotion(records: list[Escalation], by_id: Mapping[str, Escalation]) -> dict:
+    """``{count, p50_secs, p90_secs, fold_time_unknown}`` of L2 member promotion delays.
+
+    Each member of every ``level == 2`` record contributes the seconds from
+    its own filing to the time it joined the cluster (:func:`_member_joined_at`),
+    whether or not the L2 is still pending. A member whose join time is unknown
+    is counted in ``fold_time_unknown`` and not logged. A missing member, an
+    unparseable time, and a join before filing are skipped with a WARNING, as
+    is a whole cluster whose ``member_folded_at`` is not a mapping.
+    ``p50_secs``/``p90_secs`` are ``None`` when no delay was measured.
+    """
+    deltas: list[float] = []
+    fold_time_unknown = 0
+    for l2 in records:
+        if l2.level != 2 or not l2.members:
+            continue
+        try:
+            l2_filed_at = parse_utc(l2.timestamp)
+        except (TypeError, ValueError):
+            logger.warning(
+                '_l1_to_l2_promotion: unparseable timestamp on L2 cluster %s: %r',
+                l2.id, l2.timestamp,
+            )
+            continue
+        if not isinstance(l2.member_folded_at, dict):
+            logger.warning(
+                '_l1_to_l2_promotion: member_folded_at on L2 cluster %s is not a mapping: %r',
+                l2.id, l2.member_folded_at,
+            )
+            continue
+        for member_id in l2.members:
+            member = by_id.get(member_id)
+            if member is None:
+                logger.warning(
+                    '_l1_to_l2_promotion: member %s of %s not found in archive',
+                    member_id, l2.id,
+                )
+                continue
+            try:
+                member_filed_at = parse_utc(member.timestamp)
+            except (TypeError, ValueError):
+                logger.warning(
+                    '_l1_to_l2_promotion: unparseable timestamp on member %s of %s',
+                    member_id, l2.id,
+                )
+                continue
+            try:
+                joined_at = _member_joined_at(l2, member_id, l2_filed_at, member_filed_at)
+            except (TypeError, ValueError):
+                logger.warning(
+                    '_l1_to_l2_promotion: unparseable member_folded_at for member %s of %s: %r',
+                    member_id, l2.id, l2.member_folded_at[member_id],
+                )
+                continue
+            if joined_at is None:
+                fold_time_unknown += 1
+                continue
+            delta = (joined_at - member_filed_at).total_seconds()
+            if delta < 0:
+                logger.warning(
+                    '_l1_to_l2_promotion: member %s joined %s %.1fs before it was filed',
+                    member_id, l2.id, -delta,
+                )
+                continue
+            deltas.append(delta)
+
+    deltas.sort()
+    return {
+        'count': len(deltas),
+        'p50_secs': percentile(deltas, 50) if deltas else None,
+        'p90_secs': percentile(deltas, 90) if deltas else None,
+        'fold_time_unknown': fold_time_unknown,
+    }
+
+
 def _lifespan_block(
     records: list[Escalation],
     *,
     now: datetime,
     downsample_threshold: int = 10_000,
+    pins_by_id: Mapping[str, list[str]] | None = None,
 ) -> dict:
     """Lifespan aggregates over *records*: percentiles, samples, open items, promotion.
 
@@ -365,19 +396,17 @@ def _lifespan_block(
     - ``samples``: one ``[date, tier, level, secs]`` row per terminal-with-
       valid-times record, ``date`` = ``date(resolved_at)`` (matches
       ``flow_daily``'s key so the two reconcile — row 11) and ``tier`` =
-      :func:`~escalation.classify.classify_resolver_tier` of ``resolved_by``.
+      :func:`~escalation.classify.resolver_tier` of the record.
     - ``open_items``: one ``{id, task_id, level, age_secs, breach_6h}`` per
       pending record, ``age_secs`` = ``now - timestamp``,
-      ``breach_6h`` = ``age_secs > 6h``.
-    - ``l1_to_l2_promotion``: ``{count, p50_secs, p90_secs}`` computed from
-      every ``level == 2`` record's ``members`` — ``L2.timestamp -
-      member.timestamp`` per member id found in the by-id index (uses the
-      L2's OWN ``timestamp``, i.e. promotion time, not its resolution —
-      this is independent of whether the L2 itself is terminal or still
-      pending). Missing members and negative deltas are skipped with a
-      WARNING. ``p50_secs``/``p90_secs`` are ``None`` when no deltas were
-      collected. No L0->L1 metric — see design_decisions (open question 7):
-      the model has no machine-readable L0->L1 link.
+      ``breach_6h`` = ``age_secs > 6h``, plus ``pins_recovery`` /
+      ``pins_recovery_task_ids`` when *pins_by_id* names that record (see
+      below).
+    - ``l1_to_l2_promotion``: ``{count, p50_secs, p90_secs,
+      fold_time_unknown}`` over every ``level == 2`` record's ``members``,
+      each measured from its filing to the time it joined the cluster — see
+      :func:`_l1_to_l2_promotion`. No L0->L1 metric — see design_decisions
+      (open question 7): the model has no machine-readable L0->L1 link.
     - ``triage_segments`` (render-when-present, 2555 forward-compat):
       ``{count, filed_to_triaged:{p50,p90}, triaged_to_resolved:{p50,p90}}``
       over terminal-with-valid-times records carrying a parseable
@@ -393,52 +422,32 @@ def _lifespan_block(
     the result carries ``samples_downsampled=True`` plus ``samples_total``
     (the pre-downsample count) — a loud marker, never silent truncation.
     Below/at threshold, ``samples`` is untouched and neither key appears.
+
+    *pins_by_id* is this project's ``{escalation_id: [task_ids]}`` annotation
+    as returned by :func:`dashboard.data.escalations.fetch_pins_recovery`,
+    passed IN rather than fetched: this module is the pure-sync core that the
+    route runs inside ``asyncio.to_thread``, so a network round-trip here
+    would block a worker thread.  An open item is stamped with
+    ``pins_recovery`` (bool) and ``pins_recovery_task_ids`` ONLY when its id
+    appears in the mapping.  Both keys are omitted — never defaulted to
+    ``False``/``[]`` — when *pins_by_id* is ``None`` (that project's
+    escalation MCP could not be read) and when the id is simply absent from a
+    non-``None`` mapping (a pre-3543 server, or one that computed the
+    annotation and deliberately withheld it).  Absent means UNKNOWN and must
+    render as nothing: a stamped ``False`` asserts "this escalation pins no
+    recovery" on evidence nobody produced, which is the esc-3163 false
+    negative that both the escalation server and the fanout already refuse to
+    emit.  Render-when-present matches ``triage_segments`` above.
     """
     by_id: dict[str, Escalation] = {esc.id: esc for esc in records}
 
     secs_by_level: dict[int, list[float]] = {}
     samples: list[list] = []
     open_items: list[dict] = []
-    promotion_deltas: list[float] = []
     filed_to_triaged_deltas: list[float] = []
     triaged_to_resolved_deltas: list[float] = []
 
     for esc in records:
-        if esc.level == 2 and esc.members:
-            try:
-                l2_filed_at = parse_utc(esc.timestamp)
-            except (TypeError, ValueError):
-                logger.warning(
-                    '_lifespan_block: unparseable timestamp on L2 cluster %s: %r',
-                    esc.id, esc.timestamp,
-                )
-                l2_filed_at = None
-            if l2_filed_at is not None:
-                for member_id in esc.members:
-                    member = by_id.get(member_id)
-                    if member is None:
-                        logger.warning(
-                            '_lifespan_block: l1_to_l2_promotion member %s of %s not found '
-                            'in archive', member_id, esc.id,
-                        )
-                        continue
-                    try:
-                        member_filed_at = parse_utc(member.timestamp)
-                    except (TypeError, ValueError):
-                        logger.warning(
-                            '_lifespan_block: unparseable timestamp on member %s of %s',
-                            member_id, esc.id,
-                        )
-                        continue
-                    delta = (l2_filed_at - member_filed_at).total_seconds()
-                    if delta < 0:
-                        logger.warning(
-                            '_lifespan_block: negative l1_to_l2_promotion delta (%.1fs) for '
-                            'member %s of %s', delta, member_id, esc.id,
-                        )
-                        continue
-                    promotion_deltas.append(delta)
-
         if esc.status == 'pending':
             try:
                 filed_at = parse_utc(esc.timestamp)
@@ -449,13 +458,22 @@ def _lifespan_block(
                 )
                 continue
             age_secs = (now - filed_at).total_seconds()
-            open_items.append({
+            item = {
                 'id': esc.id,
                 'task_id': esc.task_id,
                 'level': esc.level,
                 'age_secs': age_secs,
                 'breach_6h': age_secs > _BREACH_SECONDS,
-            })
+            }
+            # Render-when-present: `is not None` and `in`, never `.get(id, [])`.
+            # A default would convert both "this project was unreadable" and
+            # "this record carried no annotation" into a confident
+            # "pins nothing" — see the pins_by_id note in the docstring.
+            if pins_by_id is not None and esc.id in pins_by_id:
+                pinned = list(pins_by_id[esc.id])
+                item['pins_recovery'] = bool(pinned)
+                item['pins_recovery_task_ids'] = pinned
+            open_items.append(item)
             continue
 
         if esc.status not in ('resolved', 'dismissed'):
@@ -472,7 +490,7 @@ def _lifespan_block(
             continue
 
         secs = (resolved_at - filed_at).total_seconds()
-        tier = classify_resolver_tier(esc.resolved_by)
+        tier = resolver_tier(esc)
         secs_by_level.setdefault(esc.level, []).append(secs)
         samples.append([resolved_at.date().isoformat(), tier, esc.level, secs])
 
@@ -497,13 +515,6 @@ def _lifespan_block(
         for level, secs_list in secs_by_level.items()
     }
 
-    promotion_deltas.sort()
-    l1_to_l2_promotion = {
-        'count': len(promotion_deltas),
-        'p50_secs': percentile(promotion_deltas, 50) if promotion_deltas else None,
-        'p90_secs': percentile(promotion_deltas, 90) if promotion_deltas else None,
-    }
-
     samples_total = len(samples)
     downsampled = samples_total > downsample_threshold
     if downsampled:
@@ -511,7 +522,7 @@ def _lifespan_block(
 
     result = {
         'percentiles_by_level': percentiles_by_level,
-        'l1_to_l2_promotion': l1_to_l2_promotion,
+        'l1_to_l2_promotion': _l1_to_l2_promotion(records, by_id),
         'samples': samples,
         'open_items': open_items,
     }
@@ -549,15 +560,21 @@ def _workflow_block(records: list[Escalation], runs_db: Path) -> dict:
 
     - ``tier_weekly``: ISO-week (``YYYY-Www``) -> ``{tier: count}``, over
       terminal records with a parseable ``resolved_at``
-      (:func:`~escalation.classify.classify_resolver_tier` of ``resolved_by``).
-    - ``action_mix``: terminal ``resolution_action`` counts, ``None`` ->
-      ``'unspecified'`` (visible adoption gap — INV-4).
+      (:func:`~escalation.classify.resolver_tier` of the record).
+    - ``action_mix``: ``resolution_action`` counts over EVERY terminal record
+      — the population ``origin`` classifies — ``None`` -> ``'unspecified'``
+      (visible adoption gap — INV-4).
     - ``churn_daily``: ``date(timestamp) -> count`` of filings whose
       ``task_id`` had ANY other escalation resolved/dismissed within the
       24h before this filing's own ``timestamp``.
     - ``esc_per_done_daily``: per ``date(timestamp)``,
       ``{date, filings, done, ratio}`` — ``done`` from :func:`_done_by_day`
       against *runs_db*; ``ratio`` is ``None`` when ``done == 0`` (no div0).
+      When *runs_db* could not be read, every filing date's row carries
+      ``done`` and ``ratio`` ``None``.
+    - ``done_counts_read``: whether *runs_db*'s completed-task counts were
+      read. It is the authority on ``done``: a project with no filing has no
+      row, so a per-row null alone could not say its counts are unknown.
     - ``flow_daily``: sparse ``[{date,source,level,tier,class,n}]`` cube over
       terminal-with-valid-times records (same population as
       ``lifespan.samples`` — both gate on parseable ``timestamp`` AND
@@ -575,6 +592,9 @@ def _workflow_block(records: list[Escalation], runs_db: Path) -> dict:
         if esc.status not in ('resolved', 'dismissed'):
             continue
 
+        action_key = esc.resolution_action or 'unspecified'
+        action_mix[action_key] = action_mix.get(action_key, 0) + 1
+
         try:
             resolved_at = parse_utc(esc.resolved_at)
         except (TypeError, ValueError):
@@ -584,14 +604,11 @@ def _workflow_block(records: list[Escalation], runs_db: Path) -> dict:
             )
             continue
 
-        tier = classify_resolver_tier(esc.resolved_by)
+        tier = resolver_tier(esc)
         iso = resolved_at.isocalendar()
         week_key = f'{iso.year}-W{iso.week:02d}'
         week_bucket = tier_weekly.setdefault(week_key, {})
         week_bucket[tier] = week_bucket.get(tier, 0) + 1
-
-        action_key = esc.resolution_action or 'unspecified'
-        action_mix[action_key] = action_mix.get(action_key, 0) + 1
 
         cls, _provenance = effective_benign(esc)
         if cls is None:
@@ -651,17 +668,23 @@ def _workflow_block(records: list[Escalation], runs_db: Path) -> dict:
             churn_daily[date_key] = churn_daily.get(date_key, 0) + 1
 
     done_by_date = _done_by_day(Path(runs_db))
-    esc_per_done_daily = [
-        {
-            'date': d,
-            'filings': filings_by_date.get(d, 0),
-            'done': done_by_date.get(d, 0),
-            'ratio': (
-                filings_by_date.get(d, 0) / done_by_date[d] if done_by_date.get(d) else None
-            ),
-        }
-        for d in sorted(set(filings_by_date) | set(done_by_date))
-    ]
+    if done_by_date is None:
+        esc_per_done_daily = [
+            {'date': d, 'filings': filings_by_date[d], 'done': None, 'ratio': None}
+            for d in sorted(filings_by_date)
+        ]
+    else:
+        esc_per_done_daily = [
+            {
+                'date': d,
+                'filings': filings_by_date.get(d, 0),
+                'done': done_by_date.get(d, 0),
+                'ratio': (
+                    filings_by_date.get(d, 0) / done_by_date[d] if done_by_date.get(d) else None
+                ),
+            }
+            for d in sorted(set(filings_by_date) | set(done_by_date))
+        ]
 
     flow_daily = [
         {'date': d, 'source': source, 'level': level, 'tier': tier, 'class': cls, 'n': n}
@@ -673,6 +696,7 @@ def _workflow_block(records: list[Escalation], runs_db: Path) -> dict:
         'action_mix': action_mix,
         'churn_daily': churn_daily,
         'esc_per_done_daily': esc_per_done_daily,
+        'done_counts_read': done_by_date is not None,
         'flow_daily': flow_daily,
     }
 
@@ -684,24 +708,33 @@ def _workflow_block(records: list[Escalation], runs_db: Path) -> dict:
 
 def _aggregate_project(
     project: str,
-    escalations_dir: Path,
+    records: list[Escalation],
     runs_db: Path,
     *,
     now: datetime,
     downsample_threshold: int = 10_000,
-) -> tuple[dict, int]:
-    """Aggregate one project's escalation archive into a Seam-2 payload entry.
+    pins_by_id: Mapping[str, list[str]] | None = None,
+) -> dict:
+    """Aggregate one project's escalations into a Seam-2 payload entry.
 
-    Returns ``(entry, parse_failures)``.
+    ``terminal`` is the one terminal-record population that ``origin``'s
+    ``classes`` and ``workflow.action_mix`` both count, stated once so a
+    consumer can check the parts against the whole.
+
+    *pins_by_id* is THIS project's pins_recovery annotation (``None`` when its
+    escalation MCP could not be read); it is only consumed by
+    :func:`_lifespan_block`'s ``open_items``.
     """
-    records, parse_failures = _load_escalation_records(Path(escalations_dir))
-    entry = {
+    return {
         'project': project,
+        'terminal': sum(esc.status in ('resolved', 'dismissed') for esc in records),
         'origin': _origin_block(records, now=now),
-        'lifespan': _lifespan_block(records, now=now, downsample_threshold=downsample_threshold),
+        'lifespan': _lifespan_block(
+            records, now=now, downsample_threshold=downsample_threshold,
+            pins_by_id=pins_by_id,
+        ),
         'workflow': _workflow_block(records, Path(runs_db)),
     }
-    return entry, parse_failures
 
 
 # ---------------------------------------------------------------------------
@@ -710,46 +743,79 @@ def _aggregate_project(
 
 
 def build_escalation_analytics(
-    project_dirs: list[tuple[str, Path, Path]],
+    corpus_datum: Datum[EscalationCorpus],
     *,
-    now: datetime | None = None,
     regime_markers_path: Path | None = None,
     downsample_threshold: int = 10_000,
+    pins_by_project: Mapping[str, Mapping[str, list[str]] | None] | None = None,
 ) -> dict:
-    """Build the full Seam-2 escalation-analytics payload across *project_dirs*.
+    """Build the full Seam-2 escalation-analytics payload over the corpus' orchestrator queues.
 
-    *project_dirs* is ``[(label, escalations_dir, runs_db), ...]``, primary
-    project first. This is the PURE-SYNC core — the only permitted clock
-    read in this module: ``now`` is resolved once via :func:`resolve_now`
-    and threaded through every per-project aggregation, so no per-project
-    call reads the live clock independently.
+    *corpus_datum* must be a measured walk; an unknown one raises
+    ``ValueError``. Each orchestrator queue is one project, read against its
+    queue's ``runs_db``. The reconciliation queue is not a project and is not
+    aggregated here.
 
-    ``parse_failures`` combines archive-record parse failures (summed
-    across all project dirs) AND the regime-markers load's
-    ``parse_failures_delta`` into a single loud count (INV-4) — there is
-    only one ``parse_failures`` field in the payload.
+    ``generated_at`` is the corpus' ``as_of``: the payload answers for the
+    walk it was derived from, and every age in it is measured against that
+    one instant.
+
+    ``parse_failures`` combines the orchestrator queues' unreadable files
+    AND the regime-markers load's ``parse_failures_delta`` into a single loud
+    count (INV-4) — there is only one ``parse_failures`` field in the payload.
 
     ``downsample_threshold`` bounds each project's ``lifespan.samples`` —
     see :func:`_lifespan_block` and :func:`_downsample_stratified`.
+
+    ``pins_by_project`` is :func:`dashboard.data.escalations.fetch_pins_recovery`'s
+    return value passed through verbatim: ``{label: {escalation_id: [task_ids]}
+    | None}``, keyed by project label (``dashboard/project_labels.py::ProjectLabels``),
+    as are the queue labels.
+    A project absent from the mapping and a project mapped to ``None`` are
+    treated identically: UNKNOWN, so nothing is stamped.
+
+    Two queue-reach signals, read from the corpus scans:
+
+    * ``archives_present`` (``all``) — the completeness DIAGNOSTIC: did the
+      walk reach EVERY orchestrator queue?  An operator reads it to find a
+      root that is unmounted or misconfigured.
+    * ``archives_reached`` (``any``) — did it reach any at all?  The corpus
+      cache keys its cacheability on the same fact
+      (:attr:`~dashboard.data.escalation_corpus.EscalationCorpus.reached_any`).
+
+    ``views`` (per project, and across every orchestrator queue at the top
+    level) are the corpus' named views, as Datums stamped with its instant.
     """
-    resolved_now = resolve_now(now)
+    corpus, as_of = corpus_datum.value, corpus_datum.as_of
+    if corpus is None or as_of is None:
+        raise ValueError(f'the escalation corpus was not measured: {corpus_datum.reason}')
+    projects = [
+        (scan, runs_db) for scan in corpus.scans if (runs_db := scan.queue.runs_db) is not None
+    ]
+    scans = [scan for scan, _runs_db in projects]
 
     parse_failures = 0
     per_project = []
-    for project, escalations_dir, runs_db in project_dirs:
-        entry, project_parse_failures = _aggregate_project(
-            project, escalations_dir, runs_db, now=resolved_now,
+    for scan, runs_db in projects:
+        entry = _aggregate_project(
+            scan.queue.label, [record.escalation for record in scan.records],
+            runs_db, now=as_of,
             downsample_threshold=downsample_threshold,
+            pins_by_id=(pins_by_project or {}).get(scan.queue.label),
         )
-        parse_failures += project_parse_failures
+        entry['views'] = views_over(corpus_datum, [scan.queue.id])
+        parse_failures += len(scan.unreadable)
         per_project.append(entry)
 
     markers, markers_parse_failures = load_regime_markers(regime_markers_path)
     parse_failures += markers_parse_failures
 
     return {
-        'generated_at': resolved_now.isoformat(),
+        'generated_at': as_of.isoformat(),
         'parse_failures': parse_failures,
         'regime_markers': markers,
         'per_project': per_project,
+        'archives_present': all(scan.reached for scan in scans),
+        'archives_reached': any(scan.reached for scan in scans),
+        'views': views_over(corpus_datum, [scan.queue.id for scan in scans]),
     }

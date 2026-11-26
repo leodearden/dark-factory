@@ -1,0 +1,27 @@
+{
+ "stream": "S3",
+ "prd_path": "docs/prds/review-all-composition-root-per-role.md",
+ "manifest_path": "docs/prds/review-all-composition-root-per-role.capability-manifest.yaml",
+ "leaves_estimate": 8,
+ "lead_rulings_on_open_questions": [
+  "Q1 as_of policy (lead ruling, Leo may overturn): scp-bill --account passes the run's UTC date (a period starting more than 12 months before today is refused with exit 3); validation's bill_account passes period.end (golden lane stays byte-exact); the API passes the request's UTC date (closes fk-e97ffd6c1a8c); the monthly close keeps period.end. S3-beta3 is released on this ruling.",
+  "Q2-Q5 tactical: decided in-leaf per PRD \u00a713."
+ ],
+ "lead_actions_at_decompose": [
+  "cancel 1001 -> alpha; 395 and 390 -> beta1; 544 -> beta1 + epsilon (x_acceptance_reason naming the leaf)",
+  "alpha depends on 444 (in review) and 787; beta1 depends on 210 and 378",
+  "high leaves alpha, gamma, delta, epsilon -> gate 1065"
+ ],
+ "cross_reference_lines": [
+  "S2: leaves editing runtime/roles/bill.py or moving bill_account depend on S3-beta3 (one BillingService constructor, as_of required) and S3-epsilon (build_bill_graph); the push module never constructs BillingService itself.",
+  "S15's provider-port binding leaf depends on S3-epsilon.",
+  "S12: Topology carries db.session.Database (open_database), not a bare engine; leaves touching runtime.composition.graph_session depend on S3-epsilon; S3-omega migrates tests/validation/test_run.py's patches of the db.session globals.",
+  "S20-delta depends on S3-delta and S3-epsilon (compose_dispatch takes S3's Database value + store); test_composition.py split per Q4.",
+  "S23's api/routers/ops.py leaves depend on S3-beta2 (broadcaster from ApiGraph; accessors in api/deps.py).",
+  "S11: OpenAPI generation builds create_app(build_api_graph(hermetic Settings, open_database(...))); no module-level api.app:app after S3-beta1.",
+  "S6: build_timeseries_stores(settings, engine) explicit; ApiGraph gains settlement read through api/deps.py; S6<->S3 second to land adapts.",
+  "S5 <-> S3: IngestionService.from_settings(settings, *, database, store) is S3's signature; S5 owns the body.",
+  "S19/210: get_last_seen_store moves to api/deps.py reading ApiGraph.last_seen.",
+  "Briefing (interactive on main): runtime-api scenarios 'scp-migrate gates the rest' / 'runtime.asgi:app distinct from api.app:app' go stale with S3 alpha/beta1; restate to D6 + the boot-time head check."
+ ]
+}

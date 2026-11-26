@@ -34,6 +34,10 @@ from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
+from shared.merge_subject import MergeSubject, parse_merge_subject
+from shared.task_complexity import is_simple_complexity
+from shared.tasks_db_readonly import TaskDbUnreadable, connect_ro
+
 from orchestrator.agents.triage import has_simple_task_blocker
 from orchestrator.evals.snapshots import _run as _git_run
 from orchestrator.evals.snapshots import get_diff_between_commits
@@ -63,6 +67,7 @@ __all__ = [
     'materialize_reference_diff',
     'pin_eval_branch',
     'repo_of',
+    'repo_of_project',
     'resolve_task_commits_from_merge',
     'sample_stratified',
     'stratification_counts',
@@ -80,7 +85,13 @@ Cell = tuple[str, str, str]
 # The full axis product — every possible (repo, kind, path) cell. Used to
 # surface EMPTY cells loudly (a cell the corpus offers nothing for) rather
 # than letting thin coverage pass silently.
-_REPOS = ('df', 'reify')
+#
+# `_REPOS` must list EVERY stratum `repo_of` can return. `_ALL_CELLS` is what
+# `format_stratification_table` and `_coverage_notes` iterate, so a stratum
+# missing here is silently dropped from the table (its fixtures vanish from the
+# rows while still counting in TOTAL) and can never be reported as an empty
+# cell — the exact silent under-report the loud-over-silent norm forbids.
+_REPOS = ('df', 'reify', 'kl')
 _KINDS = ('bugfix', 'feature', 'refactor')
 _PATHS = ('simple', 'full')
 _ALL_CELLS: tuple[Cell, ...] = tuple(
@@ -117,26 +128,57 @@ class CompletedTaskCandidate:
 # repo_of — the repo axis (df / reify)
 # ---------------------------------------------------------------------------
 
-def repo_of(candidate: CompletedTaskCandidate) -> str:
-    """Return the repo stratum (``'df'`` or ``'reify'``) for *candidate*.
+def repo_of_project(project: str) -> str:
+    """Return the repo stratum (``'df'``, ``'reify'`` or ``'kl'``) for a raw
+    *project* string.
 
-    Normalises across the two spellings in play: fused-memory's project_id
+    The project → stratum mapping itself, exposed separately from
+    :func:`repo_of` so a caller holding only a project string (the β1 minting
+    driver and its tests, which build fixture ids as ``<repo>_task_<id>``)
+    reuses THIS table instead of re-declaring a literal copy that can silently
+    drift from it.
+
+    Raises ``ValueError`` on an unrecognised project — see :func:`repo_of`.
+    """
+    normalised = (project or '').strip().lower()
+    if 'reify' in normalised:
+        return 'reify'
+    if 'dark' in normalised and 'factory' in normalised:
+        return 'df'
+    if 'know' in normalised and 'live' in normalised:
+        return 'kl'
+    raise ValueError(
+        f'repo_of_project: unrecognised project {project!r} (expected a '
+        f'dark_factory/dark-factory, reify or know_live/know-live project)'
+    )
+
+
+def repo_of(candidate: CompletedTaskCandidate) -> str:
+    """Return the repo stratum (``'df'``, ``'reify'`` or ``'kl'``) for *candidate*.
+
+    Normalises across the spellings in play: fused-memory's project_id
     ``'dark_factory'`` and the fixture-JSON project string ``'dark-factory'``
-    both map to ``'df'``; ``'reify'`` maps to ``'reify'``.
+    both map to ``'df'``; ``'reify'`` maps to ``'reify'``; ``'know_live'`` /
+    ``'know-live'`` map to ``'kl'``.
+
+    ``kl`` was added for the fable-trial-v2 hard pool (task 3631), whose census
+    includes know-live task 543. No fixture in the standing ``evals/tasks/``
+    corpus carries a know-live project, so the axis is purely additive there.
 
     Raises ``ValueError`` on an unrecognised project — repo is a hard
     stratification axis, so an unknown value is a loud error rather than a
-    silent default (honours the loud-over-silent-degradation norm).
+    silent default (honours the loud-over-silent-degradation norm). The
+    mapping lives in :func:`repo_of_project`; this wrapper only names the
+    offending task in the error.
     """
-    project = (candidate.project or '').strip().lower()
-    if 'reify' in project:
-        return 'reify'
-    if 'dark' in project and 'factory' in project:
-        return 'df'
-    raise ValueError(
-        f'repo_of: unrecognised project {candidate.project!r} for task '
-        f'{candidate.task_id!r} (expected a dark_factory/dark-factory or reify project)'
-    )
+    try:
+        return repo_of_project(candidate.project)
+    except ValueError:
+        raise ValueError(
+            f'repo_of: unrecognised project {candidate.project!r} for task '
+            f'{candidate.task_id!r} (expected a dark_factory/dark-factory, '
+            f'reify or know_live/know-live project)'
+        ) from None
 
 
 # ---------------------------------------------------------------------------
@@ -214,7 +256,7 @@ def classify_path(candidate: CompletedTaskCandidate) -> str:
     candidate toward ``'full'`` (never toward a spurious ``'simple'``), which
     is the safe direction for an eval-corpus stratifier.
     """
-    if (candidate.complexity or '').strip().lower() != 'simple':
+    if not is_simple_complexity(candidate.complexity):
         return 'full'
     text = f'{candidate.title}\n{candidate.description}'
     if has_simple_task_blocker(text):
@@ -356,7 +398,7 @@ def sample_stratified(
 # evals/tasks/*.json fixtures (df fixtures spell it 'dark-factory'). The field
 # is provenance only: runner.load_task consumes project_root / verify_commands
 # / task_definition / modules / plan, never `project` itself.
-_CANONICAL_PROJECT = {'df': 'dark-factory', 'reify': 'reify'}
+_CANONICAL_PROJECT = {'df': 'dark-factory', 'reify': 'reify', 'kl': 'know-live'}
 
 # Per-repo standard gate command sets — byte-for-byte the commands the existing
 # fixtures already hardcode (df_task_12 / reify_task_27), so a landed task's
@@ -371,6 +413,15 @@ _DEFAULT_VERIFY_COMMANDS: dict[str, dict[str, str]] = {
         'test': 'cargo test --workspace',
         'lint': 'cargo clippy --workspace',
         'typecheck': '',
+    },
+    # know-live's own gates, read from its
+    # /home/leo/src/know-live/dark-factory-orchestrator.yaml
+    # (test_command / lint_command / type_check_command). A Python repo, so
+    # pytest/ruff/mypy — its lint gate also runs the import-linter.
+    'kl': {
+        'test': 'uv run pytest -q',
+        'lint': 'uv run ruff check src/ tests/ && uv run lint-imports',
+        'typecheck': 'uv run mypy src/',
     },
 }
 
@@ -395,15 +446,17 @@ class ReferenceCapture:
 def default_verify_commands(repo: str) -> dict[str, str]:
     """Return the per-repo standard gate command set (``{test,lint,typecheck}``).
 
-    ``df`` → pytest / ruff / pyright; ``reify`` → cargo test / clippy. Raises
-    ``ValueError`` on an unknown repo (loud-over-silent). Returns a fresh copy
-    so callers can't mutate the module-level template.
+    ``df`` → pytest / ruff / pyright; ``reify`` → cargo test / clippy;
+    ``kl`` → pytest / ruff + lint-imports / mypy. Raises ``ValueError`` on an
+    unknown repo (loud-over-silent). Returns a fresh copy so callers can't
+    mutate the module-level template.
     """
     try:
         return dict(_DEFAULT_VERIFY_COMMANDS[repo])
     except KeyError:
         raise ValueError(
-            f'default_verify_commands: unknown repo {repo!r} (expected df or reify)'
+            f'default_verify_commands: unknown repo {repo!r} '
+            f'(expected df, reify or kl)'
         ) from None
 
 
@@ -489,11 +542,6 @@ def build_fixture_record(
 # Git glue — merge-log discovery, commit resolution, reference capture, pin
 # ---------------------------------------------------------------------------
 
-# A completed-task merge subject: ``Merge task/<id> into main``. The id is the
-# task id (may be non-numeric for legacy fixtures, so ``\S+``).
-_MERGE_SUBJECT_RE = re.compile(r'Merge task/(\S+) into main')
-
-
 async def resolve_task_commits_from_merge(
     repo_root: Path | str, merge_sha: str,
 ) -> tuple[str, str]:
@@ -572,17 +620,31 @@ async def pin_eval_branch(
     return branch
 
 
+def _landed_task_id(subject: str, *, branch_prefix: str, main_branch: str) -> str | None:
+    """The task id whose ``<branch_prefix><id>`` branch *subject* lands into *main_branch*, else None."""
+    match parse_merge_subject(subject):
+        case MergeSubject(branch=branch, main_branch=target) if (
+            target == main_branch and branch.startswith(branch_prefix)
+        ):
+            return branch[len(branch_prefix):] or None
+    return None
+
+
 async def discover_completed_tasks(
     repo_root: Path | str,
     since: str | None = None,
     *,
     project: str,
     project_root: str | None = None,
+    branch_prefix: str,
+    main_branch: str,
 ) -> list[CompletedTaskCandidate]:
     """Discover completed-task merges via the git log (read-only).
 
-    Runs ``git log --grep='Merge task/' [--since=<since>]`` and parses each
-    ``Merge task/<id> into main`` subject into a :class:`CompletedTaskCandidate`
+    Pre-filters ``git log [--since=<since>]`` on the bare *branch_prefix* (it
+    survives a wrapped first paragraph, which ``%s`` joins), then re-reads each
+    subject with ``shared/src/shared/merge_subject.py::parse_merge_subject``
+    against *branch_prefix* / *main_branch*. Each landing becomes a :class:`CompletedTaskCandidate`
     STUB carrying ``task_id`` + ``merge_sha`` + resolved ``pre_commit`` (M^1) /
     ``post_commit`` (M). ``title`` / ``description`` / ``complexity`` /
     ``modules`` are left empty for a downstream enrichment pass (the CLI fills
@@ -595,7 +657,7 @@ async def discover_completed_tasks(
     """
     root = Path(repo_root)
     resolved_root = project_root or str(root)
-    cmd = ['git', 'log', '--grep=Merge task/', '--pretty=%H %s']
+    cmd = ['git', 'log', '--fixed-strings', f'--grep={branch_prefix}', '--pretty=%H %s']
     if since:
         cmd.insert(2, f'--since={since}')
     out = await _git_run(cmd, cwd=root)
@@ -603,14 +665,10 @@ async def discover_completed_tasks(
     # First pass: parse ``(task_id, merge_sha)`` from each merge subject.
     parsed: list[tuple[str, str]] = []
     for line in out.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        sha, _, subject = line.partition(' ')
-        match = _MERGE_SUBJECT_RE.search(subject)
-        if not match:
-            continue
-        parsed.append((match.group(1), sha))
+        sha, _, subject = line.strip().partition(' ')
+        task_id = _landed_task_id(subject, branch_prefix=branch_prefix, main_branch=main_branch)
+        if task_id is not None:
+            parsed.append((task_id, sha))
 
     if not parsed:
         return []
@@ -656,23 +714,17 @@ def enrich_candidates_from_task_db(
     best-effort pass looks each *numeric* task id up in the ``tasks`` table at
     *db_path* (``<project_root>/.taskmaster/tasks/tasks.db``) and returns copies
     with those fields filled (``complexity`` read from the row's ``metadata``
-    JSON blob). Opened ``mode=ro`` (mirroring
-    ``curator_corpus.read_curator_decisions``) so it never locks the live db.
+    JSON blob). Opens through
+    ``shared/src/shared/tasks_db_readonly.py::connect_ro``, so it never locks
+    the live db, and a refusal degrades to stubs with the refusal's remedy in
+    the warning.
 
     Degrades to the UNCHANGED stub — never raises — for a non-numeric id
     (legacy fixtures), an id absent from the db, or a missing/unreadable db: a
     stub still classifies (to the default cell) rather than crashing the cut.
     """
-    db_path = Path(db_path)
-    if not db_path.exists():
-        logger.warning(
-            'enrich_candidates_from_task_db: no task db at %s; keeping %d '
-            'candidate(s) as stubs', db_path, len(candidates),
-        )
-        return list(candidates)
-
     try:
-        conn = sqlite3.connect(f'file:{db_path}?mode=ro', uri=True)
+        conn = connect_ro(db_path)
         conn.row_factory = sqlite3.Row
         try:
             rows = conn.execute(
@@ -680,10 +732,10 @@ def enrich_candidates_from_task_db(
             ).fetchall()
         finally:
             conn.close()
-    except sqlite3.Error as exc:
+    except (TaskDbUnreadable, sqlite3.Error) as exc:
         logger.warning(
-            'enrich_candidates_from_task_db: read of %s failed (%s); keeping stubs',
-            db_path, exc,
+            'enrich_candidates_from_task_db: %s; keeping %d candidate(s) as stubs',
+            exc, len(candidates),
         )
         return list(candidates)
 

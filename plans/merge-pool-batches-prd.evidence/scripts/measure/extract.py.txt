@@ -1,0 +1,27 @@
+"""Extract merge-lane events (read-only) into a local JSON cache for analysis."""
+import json, sqlite3, sys
+DB = '/home/leo/src/dark-factory/data/orchestrator/runs.db'
+LO = '2026-10-20T00:00:00+00:00'
+TYPES = ['merge_verify', 'merge_queued', 'merge_dequeued', 'merge_finalized',
+         'merge_attempt', 'merge_reverify_gate', 'merge_verify_cancelled',
+         'merge_blocked', 'merge_flake_suppressed', 'merge_coalesced',
+         'merge_heartbeat']
+conn = sqlite3.connect(f'file:{DB}?mode=ro', uri=True)
+out = []
+for t in TYPES:
+    for id_, ts, task, et, data in conn.execute(
+            'SELECT id,timestamp,task_id,event_type,data FROM events '
+            'WHERE event_type=? AND timestamp>=? ORDER BY id', (t, LO)):
+        try:
+            d = json.loads(data) if data else {}
+        except Exception:
+            d = {}
+        if et == 'merge_verify' and isinstance(d.get('units'), list):
+            u = d.pop('units')
+            d['_n_units'] = len(u)
+            d['_n_red'] = sum(1 for x in u if x.get('outcome') == 'ran_red')
+            d['_red_units'] = [x.get('unit') for x in u if x.get('outcome') == 'ran_red']
+        out.append({'id': id_, 'ts': ts, 'task': task, 'type': et, 'd': d})
+out.sort(key=lambda r: r['id'])
+json.dump(out, open('/tmp/gate-10069/measure/events.json', 'w'))
+print(len(out))

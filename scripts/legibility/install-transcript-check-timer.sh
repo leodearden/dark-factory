@@ -35,7 +35,7 @@ TEMPLATES_DIR="$REPO_ROOT/scripts"                             # legibility-tran
 
 # Interpreter prefix: INSTALL_TRANSCRIPT_CHECK_TIMER_PYTHON overrides the
 # default `uv run` invocation (tests inject sys.executable to drive
-# nightly.py's resolve-config directly, without uv/--frozen). Built as an
+# nightly.py's resolve-config directly, without uv). Built as an
 # array so the default branch keeps "$REPO_ROOT/shared" as a single argv
 # token -- space-safe -- mirrors install-trickle-timer.sh's
 # INSTALL_TRICKLE_TIMER_PYTHON override.
@@ -43,7 +43,7 @@ if [ -n "${INSTALL_TRANSCRIPT_CHECK_TIMER_PYTHON:-}" ]; then
     # shellcheck disable=SC2206
     PYTHON_CMD=($INSTALL_TRANSCRIPT_CHECK_TIMER_PYTHON)
 else
-    PYTHON_CMD=(uv run --frozen --project "$REPO_ROOT/shared" python3)
+    PYTHON_CMD=(uv run --no-sync --project "$REPO_ROOT/shared" python3)
 fi
 
 echo "install-transcript-check-timer.sh: resolving legibility.yaml for project_id=${PROJECT_ID}..."
@@ -65,7 +65,14 @@ systemctl --user daemon-reload
 systemctl --user enable --now "$TIMER_UNIT"
 
 echo "install-transcript-check-timer.sh: verifying ${TIMER_UNIT} is listed..."
-if ! systemctl --user list-timers --all | grep -qF "$TIMER_UNIT"; then
+# Capture first, then match against a here-string. Do NOT pipe systemctl
+# straight into `grep -q`: under `set -o pipefail` (line 24) grep exits the
+# instant it matches, closing the pipe, and systemctl is then SIGPIPE'd
+# mid-write -- a real systemctl exits 141, and the pipeline inherits that
+# non-zero status, so the check reports "not found" even though grep MATCHED.
+# A here-string is a simple command, not a pipeline, so pipefail cannot bite.
+timers="$(systemctl --user list-timers --all)"
+if ! grep -qF "$TIMER_UNIT" <<<"$timers"; then
     echo "ERROR: ${TIMER_UNIT} not found in 'systemctl --user list-timers --all' after enable" >&2
     exit 1
 fi

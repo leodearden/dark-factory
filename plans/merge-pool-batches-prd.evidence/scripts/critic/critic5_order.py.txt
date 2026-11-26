@@ -1,0 +1,25 @@
+import sys
+sys.path.insert(0,'/tmp/gate-10069/critic5')
+from rule6 import fb_release, cost, going, plan
+r,t=0.01,0.05
+for u in (0.07,0.16):
+  for q in (0.05,0.08,0.14,0.20):
+    a_f,a_c=going(q,r,t,u)
+    C=lambda f,c: cost(f,c,q,r,t,u,a_f,a_c)
+    joint=C(12,11); split=C(12,0)+C(0,11)
+    # marginal of first cleared onto 12 new, and of first new onto 11 cleared, 12th new onto (11 new, 11 cleared)
+    m_c=C(12,1)-C(12,0); m_n=C(1,11)-C(0,11); m_n12=C(12,11)-C(11,11)
+    # hand: per-landing expected verifies. expected landings from a batch = sound members (all eventually land) -> compare cost per request
+    print(f'u={u} q={q:.2f} A_new={a_f:.3f} A_c={a_c:.3f} | C(12,0)={C(12,0):.3f} C(0,11)={C(0,11):.3f} sum={split:.3f} vs C(12,11)={joint:.3f} | +1 cleared onto 12 new={m_c:.3f} (thr {a_c:.3f}) | +1 new onto 11 cleared={m_n:.3f} (thr {a_f:.3f}) | 12th new onto (11,11)={m_n12:.3f}')
+print('--- hand check q=0.14 u=0.07: C(12,0)')
+q,u=0.14,0.07
+a_f,a_c=going(q,r,t,u)
+P=1-(1-q)**12; k=12*q/P
+B=sum((j-1)*(1-q)**(j-1)*q for j in range(1,13))/P
+F=B+1+(11-B)*a_f
+print('P',round(P,4),'k',round(k,3),'B',round(B,3),'F',round(F,3),'C',round(1+P*((1-u)*(12-k)*a_c+u*F),4),'C/12',round((1+P*((1-u)*(12-k)*a_c+u*F))/12,4))
+print('--- u sweep at q=0.14: batch chosen and its true per-member cost if every red is in fact unscannable (u_true=1)')
+for uu in (0.07,0.16,0.3,0.5,0.535,0.7,0.85,0.95,1.0):
+    a_f,a_c=going(0.14,r,t,uu); f,c=plan('new',['new']*30,0.14,r,t,uu)
+    at,ac1=going(0.14,r,t,1.0); true=cost(f,0,0.14,r,t,1.0,at,ac1)/f
+    print(f'u_est={uu}: f={f} A_new_est={a_f:.3f} true C/f at u=1: {true:.3f} (best {at:.3f})')

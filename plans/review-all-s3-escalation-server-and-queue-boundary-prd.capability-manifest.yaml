@@ -1,0 +1,614 @@
+# Machine-readable twin of review-all-s3-escalation-server-and-queue-boundary-prd.capability-manifest.md
+# Bindings verified at main e4b333a601 (2026-11-10); every grep/path polarity was measured at that
+# tree with shared.delivered_check_polarity.lint_delivered_checks against each leaf's declared files
+# (present-checks absent today, absent-checks present today). Rulings of 2026-11-10 applied: no interim
+# adapter (OQ-1), one internal enum and one total mapping (OQ-8). Fold-verified 2026-11-10 at 38a200d213
+# (lead sequencing rulings applied: 4833 lands first and owns fk-66746efddd4d; 4567 -> θ only; β after
+# S6 α; κ before θ on server.py; ε1 after S8 ε2b and 4833). task_id is stamped by commit_planning.
+prd: plans/review-all-s3-escalation-server-and-queue-boundary-prd.md
+schema_version: 1
+signal_leaves: ["μ"]
+tasks:
+  - label: "α"
+    task_id: 9152
+    title: "MergeLaneQueries port and records; dedupe_merge_request rename"
+    note: "Part of fk-c8c3406fd7f4 (the port; ε2 finishes it) and closes fk-0de72a91f89a. OQ-1 ruled (a): no adapter; the three snapshot-dict predicates stay until ε2; S6 μ (native-port task) depends on α and adds LaneQueries and LIVE_STATE_OF to queries.py. OQ-8: LiveRequestState.state is a MergeState, never empty; no raw_state. OQ-2 ruled (a): closed rename set; the stored category merge_coalesce_live_original and the sentinel task_id prefix value '__merge_coalesce_live_original__' keep their values; the prefix constant is renamed."
+    capabilities:
+      - name: "merge-lane-queries-port-defined"
+        binding: "capability→producer (α) — orchestrator/merge_lane/queries.py; S6 μ implements natively, orchestrator/mcp consumes"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "class MergeLaneQueries"
+          paths: ["orchestrator/src/orchestrator/merge_lane/queries.py"]
+          expect: present
+      - name: "live-request-record-defined"
+        binding: "capability→producer (α) — LiveRequestState carries state: MergeState (OQ-8), the record S6 μ fills"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "class LiveRequestState"
+          paths: ["orchestrator/src/orchestrator/merge_lane/queries.py"]
+          expect: present
+      - name: "query-unavailable-defined"
+        binding: "capability→producer (α) — the 'could not answer' error the native port raises (INV-2)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "class QueryUnavailable"
+          paths: ["orchestrator/src/orchestrator/merge_lane/queries.py"]
+          expect: present
+      - name: "dedupe-gate-renamed"
+        binding: "capability→producer (α) — coalesce means train formation only"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def dedupe_merge_request"
+          paths: ["orchestrator/src/orchestrator/merge_lane/intake.py"]
+          expect: present
+      - name: "old-dedupe-name-gone-from-code"
+        binding: "anti-inversion — façade and server call site follow the rename (call/def spelling only; comment mentions in S6-owned files are S6's)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "coalesce_or_enqueue_merge_request\\("
+          paths: ["orchestrator/src/", "escalation/src/"]
+          expect: absent
+      - name: "dedupe-sense-identifiers-renamed"
+        binding: "anti-inversion — the closed rename set (OQ-2): no dedupe-sense 'coalesce' identifier survives in the merge lane"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "_coalesce_onto_entry|_coalesce_reentrant_drain|coalesced_request_ids|_alarm_coalesce_live_original|_COALESCE_LIVE_ORIGINAL_SENTINEL_PREFIX"
+          paths: ["orchestrator/src/"]
+          expect: absent
+      - name: "dedupe-event-type-exists"
+        binding: "capability→producer (α) — EventType.merge_deduplicated written by all three emitters (OQ-2)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "merge_deduplicated = "
+          paths: ["orchestrator/src/orchestrator/event_store.py"]
+          expect: present
+  - label: "β"
+    task_id: 9157
+    title: "_mutate_pending/_mutate_terminal under every queue mutator; callback delivery contract"
+    note: "Closes fk-4a0626fc033d and fk-07be43f313bc. Depends on S6 α (harness.py; the lead's 2026-11-10 order puts S6 α first); not on task 4567 (θ's prerequisite only). Eight copies at e4b333a601 (task 8422 added claim_policy_class; _load_root_pending shares the load half of three and becomes the primitive's load step). D12 reads R10's 'one primitive' as one per record state. _write_late_resolution joins the primitives; submit_resolved stays a creator through the creators' shared lock-and-write helper. External lock holders (sweep relocation, backlog_policy._merge_onto_persisted, the backfill script) are named in D13, not absorbed. OQ-5 ruled (a), with the closed-loop drop."
+    capabilities:
+      - name: "mutation-primitive-exists"
+        binding: "capability→producer (β) — one locked pending-only read-modify-write"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def _mutate_pending"
+          paths: ["escalation/src/escalation/queue.py"]
+          expect: present
+      - name: "terminal-primitive-exists"
+        binding: "capability→producer (β) — the terminal twin (D12)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def _mutate_terminal"
+          paths: ["escalation/src/escalation/queue.py"]
+          expect: present
+      - name: "callback-delivery-contract"
+        binding: "capability→producer (β) — set_resolve_callback(cb, *, deliver_on=...)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "deliver_on"
+          paths: ["escalation/src/escalation/queue.py"]
+          expect: present
+      - name: "harness-registers-with-its-loop"
+        binding: "consumer wired — Harness._start_escalation_server passes deliver_on"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "deliver_on="
+          paths: ["orchestrator/src/orchestrator/harness.py"]
+          expect: present
+      - name: "no-lost-update-under-concurrent-mutators"
+        binding: "rejection of the race — boundary row 4 drives two processes against one record; row 7 the closed-loop drop"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "behavioural; asserted by β's concurrency and delivery tests"
+  - label: "γ"
+    task_id: 9162
+    title: "scan.py, late-resolution policy into amendments.py, importers repointed, queue prose"
+    note: "Closes fk-5a9e713f4055 (the amendment-framing half is fixed:0935e63d88, task 6319). Depends on β. 24 declared files, past the 15-file review trigger: 15 are one-line import or pointer edits."
+    capabilities:
+      - name: "scan-helpers-in-leaf-module"
+        binding: "capability→producer (γ) — escalation/scan.py imports models/classify/archive only"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def read_escalation_for_scan"
+          paths: ["escalation/src/escalation/scan.py"]
+          expect: present
+      - name: "no-reexport-shim-in-queue"
+        binding: "anti-inversion — queue.py no longer defines the scan helpers"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def read_escalation_for_scan"
+          paths: ["escalation/src/escalation/queue.py"]
+          expect: absent
+      - name: "late-resolution-policy-moved"
+        binding: "anti-inversion — the late-resolution policy leaves queue.py for amendments.py"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def _build_late_resolution"
+          paths: ["escalation/src/escalation/queue.py"]
+          expect: absent
+      - name: "stale-inventory-deleted"
+        binding: "anti-inversion — the 143-line scan-site inventory docstring goes"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "ALREADY GUARDED elsewhere"
+          paths: ["escalation/src/"]
+          expect: absent
+  - label: "δ"
+    task_id: 9167
+    title: "Operator tools registered from orchestrator/mcp/ops_tools.py; HarnessOps and WorkflowSlots"
+    note: "Part of fk-a8d3003e9d83 and fk-e903cc072b15. Depends on α (server.py) and β (harness.py); not held. Repoints release_warm_worktree onto shared.git_async.run_git while moving it (S5 C1 assigns that edit to S3 δ); S5 β depends on δ. WorkflowSlots (C2) is S3's (OQ-7 ruled (a)); WorkflowSlots.cancel carries the note_workflow_cancelled stamp; Harness implements it now, S8's SlotRegistry later. The eleven moved names leave fused-memory/tests/test_stages.py::_REVIEWED_STAGE_SAFE."
+    capabilities:
+      - name: "ops-registrar-exists"
+        binding: "capability→producer (δ)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def register_ops_tools"
+          paths: ["orchestrator/src/orchestrator/mcp/ops_tools.py"]
+          expect: present
+      - name: "harness-ops-protocol-exists"
+        binding: "capability→producer (δ) — the typed public harness surface (C2)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "class HarnessOps"
+          paths: ["orchestrator/src/orchestrator/mcp/ops_tools.py"]
+          expect: present
+      - name: "workflow-slots-port-exists"
+        binding: "capability→producer (δ) — the slot read surface S8 implements (OQ-7)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "class WorkflowSlots"
+          paths: ["orchestrator/src/orchestrator/mcp/ops_tools.py"]
+          expect: present
+      - name: "release-workflow-awaits-wait-cleared"
+        binding: "consumer wired — release_workflow's poll loop becomes an awaited slots.wait_cleared (the Protocol declaration does not match)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "await [A-Za-z_.]*wait_cleared\\("
+          paths: ["orchestrator/src/orchestrator/mcp/ops_tools.py"]
+          expect: present
+      - name: "warm-worktree-verbs-left-escalation"
+        binding: "anti-inversion — the operator tools are no longer defined in escalation (not satisfiable by S5)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "async def release_warm_worktree"
+          paths: ["escalation/src/"]
+          expect: absent
+      - name: "private-git-runner-import-gone"
+        binding: "anti-inversion — no private orchestrator.git_ops._run import survives (δ's own repoint onto run_git)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "from orchestrator.git_ops import _run"
+          paths: ["escalation/src/", "orchestrator/src/orchestrator/mcp/"]
+          expect: absent
+      - name: "recon-stage-classification-follows-the-move"
+        binding: "consumer kept honest — the shared escalation server no longer registers the ops tools, so the recon stage classification stops naming them (its stale-bucket assertion would fail otherwise)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "mcp__escalation__release_workflow"
+          paths: ["fused-memory/tests/test_stages.py"]
+          expect: absent
+  - label: "θ"
+    task_id: 9177
+    title: "Per-task landing index for the archive tier; root glob keeps the pending tier; honest history envelopes"
+    note: "Closes fk-e5d81cc1f1d4 and fk-ce2dc99e0305. Depends on γ (queue.py), κ (server.py) and task 4567 (queue.py, mid-flight; θ only, lead ruling 2026-11-10); placed ahead of the ladder split by the OQ-1 ruling, so it edits the history tools in server.py and ζ moves them. OQ-6 ruled (a): pending tier stays the root glob (fail-closed veto; two long-running writers per project queue — the project's orchestrator and the single fused-memory service — restart on separate clocks), index for the archive tier only, tombstones from prune_archive carrying the parsed filed_at/level/category/severity (parse before rmtree; an unparseable record is a counted WARNING with an id-only tombstone), TaskHistory.pruned built from tombstones joined to IndexEntry only when one exists, encoded filenames, reads through get(). Task 6004's premise is re-measured after this lands."
+    capabilities:
+      - name: "landing-index-written"
+        binding: "capability→producer (θ) — by-task/<encoded>.jsonl appended by submit and submit_resolved, backfilled by the sweep"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "by-task"
+          paths: ["escalation/src/escalation/queue.py"]
+          expect: present
+      - name: "archive-rglob-gone-from-get-by-task"
+        binding: "anti-inversion — the default read no longer walks the archive (present today and on task/4567's branch)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "_iter_archive_paths\\('esc-\\*\\.json'\\)"
+          paths: ["escalation/src/escalation/queue.py"]
+          expect: absent
+      - name: "prune-writes-tombstones"
+        binding: "capability→producer (θ) — 'pruned' is a positive fact (M13.3)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "tombstone"
+          paths: ["escalation/src/escalation/archive.py"]
+          expect: present
+      - name: "history-reports-pruned"
+        binding: "capability→producer (θ) — get_task_escalation_history envelope (server.py until ζ, read_tools.py after; the check reads the package)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "pruned_count"
+          paths: ["escalation/src/escalation/"]
+          expect: present
+      - name: "pruned-without-index-still-reported"
+        binding: "rejection-mechanism — a pruned record with no index line is reported from its tombstone at every level= (boundary row 14; no level=-1 placeholder)"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "behavioural; asserted by θ's row 14 test with level= set"
+      - name: "pending-visible-without-index"
+        binding: "rejection-mechanism — a record from an index-unaware writer is still returned by get_by_task(status='pending')/has_open_l1 (boundary row 12b)"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "behavioural; asserted by θ's row 12b test"
+      - name: "live-store-latency"
+        binding: "INV-8 — default get_by_task under 30 ms on the live store (baseline 316–411 ms at e4b333a601)"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "measured against data/escalations after merge; not a tree property"
+  - label: "ι"
+    task_id: 9181
+    title: "RESOLVE_GATES and PROMOTE_GATES as ordered gate tables (C8)"
+    note: "Closes fk-609a1832903b for resolve_issue and promote_to_l2; _chokepoint_or_submit's gates are S1's (R8). Depends on θ (server.py); placed ahead of the ladder split by the OQ-1 ruling, so it edits the two tools in server.py and ζ moves them. C8: resolve_issue's 12 listed steps plus the recut (task 5516) and identity-policy (task 8422) gates, and promote_to_l2's steps, classified separately as parse/gate/branch/effect; ceiling + carve-out one gate; park branch chosen before the gates."
+    capabilities:
+      - name: "gate-tables-exist"
+        binding: "capability→producer (ι)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "RESOLVE_GATES"
+          paths: ["escalation/src/escalation/ladder_gates.py"]
+          expect: present
+      - name: "refusal-type-exists"
+        binding: "capability→producer (ι) — Refusal(gate, code, facts) (INV-2)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "class Refusal"
+          paths: ["escalation/src/escalation/ladder_gates.py"]
+          expect: present
+      - name: "refusal-names-its-gate"
+        binding: "rejection-mechanism — boundary row 17 (INV-2)"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "asserted by ι's injected-gate and carve-out tests"
+  - label: "κ"
+    task_id: 9173
+    title: "Header names, the one header reader and the watcher identity in escalation/models.py"
+    note: "Closes fk-43bad4e724da. Depends on δ (server.py, harness.py) and γ (models.py); placed ahead of the ladder split by the OQ-1 ruling and first of κ, θ, ι on server.py so S6's harness.py chain (S6 β1 depends on κ) never waits on task 4567, so it edits the five header-reading tools in server.py. read_caller_headers looks up the lower-cased names (fastmcp 3.2.2 get_http_headers lower-cases). The constants sit beside HARNESS_SENTINEL_ROLE_PREFIXES (task 5224). S2 consumes the constants for parse_caller_identity. Same-file edge with task 3176 on harness.py."
+    capabilities:
+      - name: "header-constants-have-one-home"
+        binding: "capability→producer (κ) — C6"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "IDENTITY_HEADER"
+          paths: ["escalation/src/escalation/models.py"]
+          expect: present
+      - name: "one-header-reader"
+        binding: "capability→producer (κ) — read_caller_headers is the only reader (M8)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def read_caller_headers"
+          paths: ["escalation/src/escalation/models.py"]
+          expect: present
+      - name: "private-header-constants-deleted"
+        binding: "anti-inversion — no second lowercase spelling survives in the tool modules"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "_IDENTITY_HEADER"
+          paths: ["escalation/src/"]
+          expect: absent
+      - name: "harness-constant-deleted"
+        binding: "anti-inversion — the harness imports watcher_connection_headers()"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "_WATCHER_ESCALATION_HEADERS"
+          paths: ["orchestrator/src/"]
+          expect: absent
+      - name: "authority-duplicate-deleted"
+        binding: "anti-inversion — authority.py imports WATCHER_AUTO_IDENTITY"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "_WATCHER_AUTO_IDENTITY = "
+          paths: ["escalation/src/escalation/authority.py"]
+          expect: absent
+      - name: "sitting-script-imports-the-header"
+        binding: "anti-inversion — scripts/sitting/apply.py imports IDENTITY_HEADER instead of spelling it"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "IDENTITY_HEADER = "
+          paths: ["scripts/sitting/"]
+          expect: absent
+  - label: "ε1"
+    task_id: 9188
+    title: "Merge read/cancel/relane tools from orchestrator/mcp/merge_tools.py; three modules move; filing port"
+    note: "Part of fk-a8d3003e9d83, fk-e903cc072b15, fk-f8e9e0da3786. HELD: depends on S6 μ (native port and LIVE_STATE_OF, OQ-1/OQ-8), on ι (server.py), on S8 ε2b (harness.py; lead ruling 2026-11-10), on task 4651 (lands first, in S8's stranded_reconcile.py; ε1 repoints its git_authority import there), on task 4833 (lands first; deletes _get_terminal_retention and the retention= keywords; owns fk-66746efddd4d) and on S10 β1/β2 (_write_merge_lane_metadata). Wires S6's class into harness.py as lane_view. Retypes MergeCancelVerdict.state to ItemLifecycleState | None (S6's types.py and its producer in worker.py) and maps it through LIVE_STATE_OF; deletes _map_live_state and the pinned pass-through test. merge_status reads the native terminal tier from the start. Exports escalation/filing_tools.py::submit_or_dedupe, bound as file_escalation. merge_relane leaves the recon stage deny list. Task 6571 is cancelled as subsumed."
+    capabilities:
+      - name: "merge-registrar-exists"
+        binding: "capability→producer (ε1)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def register_merge_tools"
+          paths: ["orchestrator/src/orchestrator/mcp/merge_tools.py"]
+          expect: present
+      - name: "escalation-id-minted-through-the-port"
+        binding: "capability→producer (ε1) — C7a mint_escalation_id bound to queue.make_id (N3)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "mint_escalation_id"
+          paths: ["orchestrator/src/orchestrator/mcp/merge_tools.py"]
+          expect: present
+      - name: "ladder-filing-port-public"
+        binding: "capability→producer (ε1) — the moved merge_cancel files through the ladder's one submit path (M5)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "async def submit_or_dedupe\\("
+          paths: ["escalation/src/escalation/filing_tools.py"]
+          expect: present
+      - name: "merge-journal-probe-deleted"
+        binding: "anti-inversion — the journal is an explicit argument, not a harness._merge_store probe"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "_get_merge_journal"
+          paths: ["escalation/src/", "orchestrator/src/"]
+          expect: absent
+      - name: "live-state-mapping-left-escalation"
+        binding: "anti-inversion — _map_live_state is replaced by S6 μ's LIVE_STATE_OF; no copy carried into merge_tools.py (INV-5)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "_map_live_state"
+          paths: ["escalation/src/", "orchestrator/src/"]
+          expect: absent
+      - name: "tools-map-through-the-one-table"
+        binding: "consumer wired (OQ-8) — merge_cancel's refusal arm maps the typed verdict through LIVE_STATE_OF"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "LIVE_STATE_OF"
+          paths: ["orchestrator/src/orchestrator/mcp/merge_tools.py"]
+          expect: present
+      - name: "cancel-verdict-state-typed"
+        binding: "capability→producer (ε1, in S6's types.py) — MergeCancelVerdict.state carries the lane's enum, not the snapshot() wire string (OQ-8)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "state: ItemLifecycleState \\| None"
+          paths: ["orchestrator/src/orchestrator/merge_lane/types.py"]
+          expect: present
+      - name: "pass-through-pin-replaced"
+        binding: "anti-inversion (OQ-8) — the pinned pass-through test goes with _map_live_state; S6 μ's exhaustiveness test on LIVE_STATE_OF replaces it"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "test_unrecognised_raw_still_passes_through"
+          paths: ["escalation/tests/", "orchestrator/tests/"]
+          expect: absent
+      - name: "git-authority-moved-beside-its-consumer"
+        binding: "capability→producer (ε1) — git mv to orchestrator/mcp (OQ-4); reverse imports become downward"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["orchestrator/src/orchestrator/mcp/git_authority.py"]
+          expect: present
+      - name: "escalation-git-authority-gone"
+        binding: "anti-inversion — no re-export left behind in escalation"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["escalation/src/escalation/git_authority.py"]
+          expect: absent
+      - name: "recon-deny-list-follows-the-move"
+        binding: "consumer kept honest — merge_relane is no longer served on :8103, so the recon stages' merge-lane deny list stops naming it"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "mcp__escalation__merge_relane"
+          paths: ["fused-memory/src/fused_memory/reconciliation/cli_stage_runner.py"]
+          expect: absent
+      - name: "terminal-tier-read-from-its-producer"
+        binding: "INV-13 — merge_status answers a landed request from the native port's terminal_state (journal + merge_finalized), boundary row 3/9"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "behavioural; asserted by ε1's merge_status tests over S6's native class"
+  - label: "ε2"
+    task_id: 9193
+    title: "merge_request from orchestrator/mcp/merge_tools.py; the dedupe gate on the native port; the private harness probes go"
+    note: "Completes fk-a8d3003e9d83's merge side, fk-e903cc072b15, fk-f8e9e0da3786, and closes fk-c8c3406fd7f4 (the gate half). HELD: depends on ε1, S6 μ (intake.py after S6's lifecycle and limits tasks through it), task 5409 (lands first; its constructor call moves with merge_request) and S7 δ (deletes retry_failed_only first). Takes over from α (OQ-1 ruling): gate conversion onto the native port, the three predicates (186 lines) deleted, MergeDispatchResult.lane_unanswerable. Task 4833 lands before ε1 (lead ruling 2026-11-10), so the moved merge_request passes no retention ring; that deletion is 4833's, not checked here."
+    capabilities:
+      - name: "merge-request-registered-from-orchestrator"
+        binding: "capability→producer (ε2)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "async def merge_request\\("
+          paths: ["orchestrator/src/orchestrator/mcp/merge_tools.py"]
+          expect: present
+      - name: "snapshot-dict-predicates-deleted"
+        binding: "anti-inversion — the three dict parsers in intake.py are replaced by native port reads"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "_snapshot_verify_state"
+          paths: ["orchestrator/src/orchestrator/merge_lane/intake.py"]
+          expect: absent
+      - name: "live-snapshot-plumbing-removed"
+        binding: "anti-inversion — the gate takes lane: MergeLaneQueries, not live_snapshot: Callable[[], dict]"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "live_snapshot"
+          paths: ["orchestrator/src/orchestrator/merge_lane/intake.py"]
+          expect: absent
+      - name: "fail-safe-in-the-return-value"
+        binding: "rejection-mechanism — MergeDispatchResult.lane_unanswerable names the query that raised (D3, INV-11)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "lane_unanswerable"
+          paths: ["orchestrator/src/orchestrator/merge_lane/types.py"]
+          expect: present
+      - name: "unanswerable-query-is-recorded"
+        binding: "rejection-mechanism — QueryUnavailable logged + event + response field instead of a silent dedupe (boundary row 2, INV-11)"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "the fail-safe arm's event and the merge_request response field are asserted by ε2's boundary test, not a grep"
+      - name: "merge-worker-probe-deleted"
+        binding: "anti-inversion — getattr(harness, '_merge_worker') and its hasattr guards go"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "_get_merge_worker"
+          paths: ["escalation/src/", "orchestrator/src/"]
+          expect: absent
+      - name: "escalation-imports-no-orchestrator"
+        binding: "anti-inversion — zero reverse imports at any depth (ζ's test_layering pins it)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^[[:space:]]*from orchestrator[. ]"
+          paths: ["escalation/src/"]
+          expect: absent
+      - name: "briefing-known-gap-closed-with-producer"
+        binding: "contract §7 — the known_gaps entry leaves with the task that closes it"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "duck-typed harness._merge_worker"
+          paths: ["review/briefing.yaml"]
+          expect: absent
+  - label: "ζ"
+    task_id: 9200
+    title: "Ladder tools from three escalation modules; LadderLookups; create_server composition; layering guard"
+    note: "Closes fk-a8d3003e9d83 with δ/ε1/ε2 and pins fk-e903cc072b15. Depends on ε2 (held through it); S8 ε3 and S8 ω depend on ζ. OQ-3 ruled by the lead: three family modules; claim_policy_class (task 8422) joins resolve_tools.py; θ's envelopes, ι's gate tables and κ's header reader move with their tools. Ladder test call sites migrate through escalation/tests/_ladder_server.py. fused-memory's create_server(queue, store_identity=..., prefix_resolver=...) call is unchanged."
+    capabilities:
+      - name: "server-registers-no-tool-itself"
+        binding: "anti-inversion — create_server composes; the 29 @mcp.tool() decorators leave server.py (the markup-middleware comment does not match)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^[[:space:]]*@mcp\\.tool\\("
+          paths: ["escalation/src/escalation/server.py"]
+          expect: absent
+      - name: "ladder-lookups-bundle-exists"
+        binding: "capability→producer (ζ) — C3, the ladder's only orchestrator knowledge"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "class LadderLookups"
+          paths: ["escalation/src/escalation/lookups.py"]
+          expect: present
+      - name: "filing-registrar-exists"
+        binding: "capability→producer (ζ)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def register_filing_tools"
+          paths: ["escalation/src/escalation/filing_tools.py"]
+          expect: present
+      - name: "layering-guard-exists"
+        binding: "rejection-mechanism — AST walk over escalation/src; fails on a seeded fixture module (INV-10)"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["escalation/tests/test_layering.py"]
+          expect: present
+      - name: "harness-any-leaves-escalation"
+        binding: "anti-inversion — create_server takes lookups, not harness"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "harness: Any"
+          paths: ["escalation/src/"]
+          expect: absent
+  - label: "λ"
+    task_id: 9205
+    title: "Tool descriptions and module prose under the Comments stance"
+    note: "Closes fk-43f431f697a3. Depends on ζ (and through it every other leaf and task 5409). Baseline 99,454 chars across 29 tool docstrings, 0.58 prose share at e4b333a601 — recorded, not a target. Preservation: before/after lists of agent-directed imperatives diffed in the commit."
+    capabilities:
+      - name: "reviewer-addressed-prose-gone"
+        binding: "anti-inversion — 'please do not \"fix\" it' and its kind leave the agent-facing descriptions"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "please do not"
+          paths: ["escalation/src/"]
+          expect: absent
+      - name: "imperatives-preserved"
+        binding: "preservation — every MUST/NEVER/'treat … as' survives the rewrite"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "the before/after imperative lists are diffed in the leaf's commit; judged at review"
+      - name: "prose-stance-judged"
+        binding: "review against docs/code-quality.md Comments stance"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "quality judgement, not a grep"
+  - label: "μ"
+    task_id: 9210
+    title: "Integration gate and companion docs"
+    note: "Carries fk-a8d3003e9d83 as the gate. Depends on λ (transitively every leaf). Lifts the real-HTTP fixture into escalation/testing_http.py so both suites use it. Escalation suite rows 4–8, 10–14, 16, 17; orchestrator suite rows 1–3, 9, 15. Live: :8102 lists 29 tools and :8103 lists 13 after the dark-factory orchestrator restarts on the new code and fused-memory restarts on it through scripts/restart-fused-memory.sh or its staleness backstop (the fleet sweep never restarts fused-memory)."
+    capabilities:
+      - name: "importable-http-fixture"
+        binding: "capability→producer (μ) — the real-HTTP server fixture both conftests use (M14)"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["escalation/src/escalation/testing_http.py"]
+          expect: present
+      - name: "boundary-suite-exists"
+        binding: "capability→producer (μ)"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["escalation/tests/test_s3_boundary.py", "orchestrator/tests/test_s3_boundary.py"]
+          expect: present
+      - name: "architecture-doc-names-the-new-seam"
+        binding: "companion correction — ARCHITECTURE.md"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "coalesce_or_enqueue_merge_request"
+          paths: ["ARCHITECTURE.md", "skills/merge-queue/references/two-layer-model.md"]
+          expect: absent
+      - name: "live-tool-counts"
+        binding: "the served shapes after the orchestrator restart and a fused-memory restart (restart-fused-memory.sh or its staleness backstop)"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "observed against the live :8102 and :8103 servers; not a tree property"

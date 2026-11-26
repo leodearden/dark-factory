@@ -14,17 +14,25 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+import pytest
+from _filer_first_layout import FILER_PROJECT, TASK_27_FILES, stale_snapshot_registry
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+from fused_memory.middleware.curator_types import CandidateTask
 from fused_memory.middleware.path_scope_guard import (
     _RIGHT_CONTEXT,
     PathGuardVerdict,
+    all_files_foreign_owner,
     check_candidate_for_scope,
     check_files_for_scope,
     check_text_for_scope,
     find_paths,
     is_routing_override,
+    local_attesting_signals,
 )
 from fused_memory.middleware.project_prefix_registry import ProjectPrefixRegistry
-from fused_memory.middleware.task_curator import CandidateTask
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 
 def _mkproj(parent: Path, name: str, dirs: list[str]) -> Path:
@@ -324,7 +332,7 @@ class TestFindPathsRightBoundary:
     def test_known_fail_open_residue_long_extension(self):
         """MISSED detection, never a false one — pinned so the gap stays visible.
 
-        The mechanism is the ``{1,6}`` extension-LENGTH cap, not the leading
+        The mechanism is the ``{2,6}`` extension-LENGTH cap, not the leading
         dot: an extension of 7+ chars fails the extension alternative whether
         or not the stem is empty.  ``test_extension_length_cap_boundary``
         below pins the cap itself; the contrast assertion here exists so a
@@ -338,11 +346,13 @@ class TestFindPathsRightBoundary:
         assert find_paths('docs/.env', ('docs/',)) == ['docs/']
 
     def test_extension_length_cap_boundary(self):
-        """Pin the ``{1,6}`` magic number itself, on both sides of the edge.
+        """Pin the ``{2,6}`` magic number itself, on both sides of both edges.
 
-        Without this, the cap could be changed to any other value and no test
-        would notice.
+        Without this, either bound could be changed to any other value and
+        no test would notice.
         """
+        assert find_paths('crates/x.a', ('crates/',)) == []  # 1 — out (new floor)
+        assert find_paths('crates/x.ab', ('crates/',)) == ['crates/']  # 2 — in
         assert find_paths('crates/x.abcdef', ('crates/',)) == ['crates/']  # 6 — in
         assert find_paths('crates/x.abcdefg', ('crates/',)) == []  # 7 — out
 
@@ -355,6 +365,130 @@ class TestFindPathsRightBoundary:
         ``project_for_path``.
         """
         assert find_paths('plans/*.md', ('plans/',)) == []
+
+    # ------------------------------------------------------------------
+    # KNOWN FALSE-POSITIVE residue — the opposite direction, deliberately
+    # not closed (task 4160)
+    # ------------------------------------------------------------------
+
+    def test_known_false_positive_residue_three_segment_slash(self):
+        """FALSE POSITIVE — the opposite direction from every other residue
+        entry in this class — pinned so the gap stays visible.
+
+        A ``>=3``-element English slash construction still satisfies the
+        ``_SEG/`` alternative (another '/' follows), so it lexes as a path
+        even though none is present.  Deliberately NOT closed: the only
+        mechanical fix — requiring the ``_SEG/`` chain to terminate in an
+        extension — would stop detecting genuine EXTENSIONLESS directory
+        paths ('fused-memory/src/fused_memory/middleware/', 'crates/reify/src'),
+        a strictly larger and more common real-prose class in this repo than
+        the English >=3-element slash shape it would close, so closing it
+        would be a net detection loss.
+
+        Live impact is bounded: the prose advisory this feeds
+        (:func:`check_text_for_scope` / :func:`check_candidate_for_scope`)
+        NEVER rejects a submission outright, and is suppressed entirely by
+        ``local_attesting_signals`` (task 3106) whenever the declared
+        deliverables attest local work — a false positive only reaches a
+        submission with no locally-attesting declared files.
+        """
+        # DELIBERATE: asserts the WRONG answer, so the gap is executable.
+        assert find_paths('the client/server/db split', ('client/',)) == ['client/']
+        assert find_paths('a read/write/execute decision', ('read/',)) == ['read/']
+        # CONTRAST: the TWO-element shape task 3120 closed is still closed.
+        assert find_paths('not a backend/timeout error', ('backend/',)) == []
+
+    def test_known_false_positive_residue_multi_component_version_string(self):
+        """FALSE POSITIVE — a version-like string with an alphabetic final
+        component still lexes as a path, pinned so the gap stays visible.
+
+        Task 4160 closed the TWO-component version-string shape
+        ('backend/v1.2', 'corpus/0.5') by requiring the extension's LEADING
+        character to be alphabetic.  A THREE-OR-MORE-component version
+        string whose FINAL component happens to be alphabetic still
+        satisfies the extension alternative: the DOT-INCLUSIVE stem (needed
+        to keep 'gui/a.b.txt' matching, see :data:`_EXT`) backtracks past
+        the earlier dots and offers the trailing word as the "extension".
+        Deliberately NOT closed, for the same reason as the
+        three-segment-slash residue above: nothing in the regex
+        distinguishes this shape from the genuine multi-dot filename
+        'gui/a.b.txt' — both are a dot-inclusive stem followed by a 2-6
+        char alphabetic-led tail.  Live impact is bounded the same way: the
+        prose advisory never rejects and is suppressed by
+        ``local_attesting_signals`` (task 3106) whenever the declared
+        deliverables attest local work.
+        """
+        # DELIBERATE: asserts the WRONG answer, so the gap is executable.
+        assert find_paths('shipping backend/v1.2.final today', ('backend/',)) == [
+            'backend/'
+        ]
+        assert find_paths('see gui/1.0.beta notes', ('gui/',)) == ['gui/']
+        # CONTRAST: an all-numeric final component is still closed.
+        assert find_paths('backend/v1.2.3 changelog', ('backend/',)) == []
+
+    # ------------------------------------------------------------------
+    # task 4160: numeric/single-letter "extension" false positives
+    # ------------------------------------------------------------------
+
+    def test_numeric_extension_is_not_an_extension(self):
+        """Task 4160: an extension whose LEADING character is a digit no
+        longer lexes as a path.
+
+        The WIN fixtures below are MEASURED false positives from the
+        gatekeeper reproduction, not synthetic: ``[A-Za-z0-9]{1,6}`` let the
+        extension START with a digit, so a version string ('v1.2') or a
+        decimal ('0.5') satisfied the right-context extension alternative
+        and the registered prefix in front of it lexed as a path.  Only the
+        LEADING character is anchored to be alphabetic — a digit elsewhere
+        in the extension ('.mp3', '.h5') is unaffected, so those keep
+        matching rather than becoming new missed-detection residue.
+        """
+        # WIN — the reported false positives, now correctly rejected.
+        assert find_paths('upgrade backend/v1.2 protocol', ('backend/',)) == []
+        assert find_paths('threshold corpus/0.5 value', ('corpus/',)) == []
+        # generalisation: proves the LEADING character must be alphabetic —
+        # a length-only floor would accept '10' (2 chars) as an extension.
+        assert find_paths('backend/v1.10 protocol', ('backend/',)) == []
+
+        # RETENTION — a digit elsewhere in the extension is not banned;
+        # only a digit in the LEADING position is.
+        assert find_paths('crates/x.mp3', ('crates/',)) == ['crates/']
+        assert find_paths('crates/x.h5', ('crates/',)) == ['crates/']
+
+        # RETENTION companions — must stay matching through this change.
+        assert find_paths('gui/package.json', ('gui/',)) == ['gui/']
+        assert find_paths('crates/x.RS', ('crates/',)) == ['crates/']
+        assert find_paths('docs/.env', ('docs/',)) == ['docs/']
+
+    def test_single_letter_extension_is_not_an_extension(self):
+        """Task 4160: a SINGLE-CHARACTER "extension" no longer lexes as a path.
+
+        The retention half of this test is the point of it: a naive ``{2,6}``
+        floor applied to the OLD dot-free stem class (``[A-Za-z0-9_\\-]*``)
+        would break the legitimate multi-dot filename 'gui/a.b.txt', because
+        the stem cannot reach past the first dot to expose 'txt' as the
+        extension — the matcher can only ever offer 'b', which then fails the
+        floor.  These retention assertions are what force the stem to widen
+        to a dot-inclusive class rather than a bare bound change.
+        """
+        # WIN — the reported dotted-initials false positive, plus its
+        # generalisation.
+        assert find_paths('not a backend/A.I. problem', ('backend/',)) == []
+        assert find_paths('backend/U.S. policy', ('backend/',)) == []
+
+        # COST: NEW missed-detection residue — a one-character extension is
+        # no longer an extension.  'crates/x.c' and 'backend/A.I.' are
+        # structurally identical, so no rule closes one and keeps the other
+        # — this is the accepted cost.
+        assert find_paths('crates/x.c', ('crates/',)) == []
+        assert find_paths('crates/x.h', ('crates/',)) == []
+
+        # RETENTION — the trap this test exists to catch.
+        assert find_paths('gui/a.b.txt', ('gui/',)) == ['gui/']
+        assert find_paths('see gui/package.json.', ('gui/',)) == [
+            'gui/'
+        ]  # sentence-final period
+        assert find_paths('docs/.env', ('docs/',)) == ['docs/']
 
     # ------------------------------------------------------------------
     # RETENTION: the task-1494 LEFT boundary survives the right-boundary change
@@ -897,7 +1031,7 @@ class TestLocalDeliverableAttested:
         'fused-memory' (no trailing slash, no file after it) is exactly the
         shape find_paths deliberately does NOT lex as a path (task 3120's
         two-sided anchoring).  Attribution uses the certain project_for_path
-        lookup instead, so metadata.modules-style directory entries count.
+        lookup instead, so a declared directory entry counts.
         """
         from fused_memory.middleware.path_scope_guard import local_deliverable_attested
 
@@ -911,9 +1045,10 @@ class TestLocalDeliverableAttested:
         """A FOREIGN entry anywhere in the union vetoes attestation.
 
         The caller's upstream check_files_for_scope classifies a NARROWER
-        list — only ``files``, or (when absent) ``files_to_modify``, never
-        ``modules`` — so a foreign entry in the union's non-overlapping
-        remainder was never seen by the hard reject. Declining to attest
+        list — only ``files``, or (when absent) ``files_to_modify``, never a
+        ``files_to_modify`` entry shadowed by ``files`` — so a foreign entry
+        in the union's non-overlapping remainder was never seen by the hard
+        reject. Declining to attest
         keeps such a mixed declaration on the unchanged advisory path
         instead of letting one local entry buy silence for it.
         """
@@ -1116,6 +1251,166 @@ class TestAbsoluteForeignPaths:
 
 
 # ---------------------------------------------------------------------------
+# Task 4156: a metadata.files entry containing a '..' segment is classified
+# identically to its normalised spelling.
+#
+# The relative twin of TestAbsoluteForeignPaths above. project_for_path's
+# relative branch compared without normalising, so 'orchestrator/../crates/
+# foo.rs' — which IS the reify-owned crates/foo.rs — matched the prefix
+# 'orchestrator/' by bare startswith and came back 'dark_factory'. That is a
+# FALSE ownership, and it corrupted all three consumers in the same stroke:
+# the FILES-certain hard reject (task 2206) falsely REJECTED the filing
+# project, the cross-repo tagger (task 3004) missed the tag, and the
+# attestation witness (task 3106) refused a project's own file.
+# ---------------------------------------------------------------------------
+
+
+class TestParentSegmentFiles:
+    """A '..' spelling must produce the same verdict as its normalised form.
+
+    Every test asserts the equivalence against the normalised spelling as well
+    as the absolute verdict, so the two spellings of one logical file can never
+    diverge again — the property TestAbsoluteForeignPaths pins for the absolute
+    regime.
+
+    BOTH DIRECTIONS are pinned here, because normalisation is symmetric and the
+    consumer level is where the user-visible change lands:
+
+      - it REMOVES a verdict that used to fire — the first three tests, where
+        the escaped spelling falsely read as dark_factory's;
+      - it CREATES a verdict that used not to fire — the last two, where the
+        escaped spelling matched no prefix at all and so classified as unowned.
+
+    The second direction is the one with no natural alarm: an unowned file is
+    silently neutral everywhere (a hard reject that never fires, a cross-repo
+    tag written against the wrong owner), so without these two tests a
+    regression restoring the un-normalised scan would leave the whole
+    consumer-level suite green.
+    """
+
+    # Lexically 'crates/foo.rs': a REIFY-owned file, reached via a segment
+    # whose leading component belongs to dark_factory.
+    _ESCAPED = ['orchestrator/../crates/foo.rs']
+    _NORMALISED = ['crates/foo.rs']
+
+    # Lexically 'orchestrator/x.py': a DARK_FACTORY-owned file re-entered
+    # through a leading segment ('foo/') that belongs to no project at all.
+    # Before the fix this matched no prefix and was unowned, which silently
+    # DISARMED the task-2206 guard for the escaped spelling.
+    _REENTRANT = ['foo/../orchestrator/x.py']
+    _REENTRANT_NORMALISED = ['orchestrator/x.py']
+
+    # Lexically 'crates/x.rs': reify's OWN file, spelled through a
+    # dark_factory-owned leading segment. Before the fix this read as
+    # 'dark_factory' and was therefore MIS-TAGGED as a cross-repo deliverable.
+    _LOCAL_ESCAPED = ['fused-memory/../crates/x.rs']
+    _LOCAL_NORMALISED = ['crates/x.rs']
+
+    def test_check_files_for_scope_does_not_falsely_reject_filing_project(
+        self, tmp_path,
+    ):
+        """The headline harm: reify's own file hard-rejected as dark_factory's.
+
+        Measured before the fix: outcome='rejection',
+        matched_paths=('orchestrator/../crates/foo.rs',),
+        suggested_project='dark_factory'.
+        """
+        registry = _two_project_registry(tmp_path)
+
+        verdict = check_files_for_scope(self._ESCAPED, 'reify', registry)
+        assert verdict.outcome == 'ok', (
+            f'own file falsely rejected via a parent segment, got: {verdict!r}'
+        )
+        assert verdict.matched_paths == ()
+
+        norm_verdict = check_files_for_scope(self._NORMALISED, 'reify', registry)
+        assert verdict.outcome == norm_verdict.outcome
+        assert verdict.suggested_project == norm_verdict.suggested_project
+
+    def test_all_files_foreign_owner_tags_the_normalised_owner(self, tmp_path):
+        """Task-3004's allow-and-tag path must fire on the escaped spelling.
+
+        Measured before the fix: None — the file read as locally-owned by the
+        filing project, so the cross-repo tag was silently missed.
+        """
+        from fused_memory.middleware.path_scope_guard import all_files_foreign_owner
+
+        registry = _two_project_registry(tmp_path)
+
+        assert all_files_foreign_owner(
+            self._ESCAPED, 'dark_factory', registry) == 'reify'
+        assert all_files_foreign_owner(self._ESCAPED, 'dark_factory', registry) == (
+            all_files_foreign_owner(self._NORMALISED, 'dark_factory', registry)
+        )
+
+    def test_local_attesting_signals_accepts_own_file(self, tmp_path):
+        """Task-3106's witness must accept a project's own file, however spelled.
+
+        Measured before the fix: [] — the signal was classified foreign, so a
+        genuine local deliverable failed to attest.
+        """
+        from fused_memory.middleware.path_scope_guard import local_attesting_signals
+
+        registry = _two_project_registry(tmp_path)
+
+        assert local_attesting_signals(
+            self._ESCAPED, 'reify', registry) == self._ESCAPED
+        assert local_attesting_signals(
+            self._NORMALISED, 'reify', registry) == self._NORMALISED
+
+    # -- the mirrored direction: normalisation CREATES a verdict -------------
+
+    def test_check_files_for_scope_rejects_a_reentrant_parent_segment(
+        self, tmp_path,
+    ):
+        """A '..' that re-enters a FOREIGN prefix must still hard-reject.
+
+        Measured before the fix: outcome='ok' — 'foo/../orchestrator/x.py'
+        matched no prefix by bare startswith (its leading segment 'foo/' is
+        registered to nobody), so the file classified as unowned and task
+        2206's FILES-certain guard silently did not fire. Any '..' prefix was
+        therefore a bypass of the hard reject.
+        """
+        registry = _two_project_registry(tmp_path)
+
+        verdict = check_files_for_scope(self._REENTRANT, 'reify', registry)
+        assert verdict.outcome == 'rejection', (
+            f'foreign file reached via a parent segment escaped the '
+            f'FILES-certain guard, got: {verdict!r}'
+        )
+        assert verdict.suggested_project == 'dark_factory'
+        assert verdict.matched_paths == tuple(self._REENTRANT)
+
+        norm_verdict = check_files_for_scope(
+            self._REENTRANT_NORMALISED, 'reify', registry)
+        assert verdict.outcome == norm_verdict.outcome
+        assert verdict.suggested_project == norm_verdict.suggested_project
+
+    def test_all_files_foreign_owner_does_not_tag_a_locally_resolving_path(
+        self, tmp_path,
+    ):
+        """A file that normalises back to the FILER's own repo is not foreign.
+
+        Measured before the fix: 'dark_factory' — 'fused-memory/../crates/x.rs'
+        IS reify's own crates/x.rs, but the un-normalised scan matched the
+        'fused-memory/' prefix, so the submission was tagged a cross-repo
+        deliverable against a project that owns none of its files. This is a
+        tag that used to be WRITTEN and now correctly is not.
+        """
+        from fused_memory.middleware.path_scope_guard import all_files_foreign_owner
+
+        registry = _two_project_registry(tmp_path)
+
+        assert all_files_foreign_owner(
+            self._LOCAL_ESCAPED, 'reify', registry) is None, (
+            "reify's own file mis-tagged as a cross-repo deliverable"
+        )
+        assert all_files_foreign_owner(self._LOCAL_ESCAPED, 'reify', registry) == (
+            all_files_foreign_owner(self._LOCAL_NORMALISED, 'reify', registry)
+        )
+
+
+# ---------------------------------------------------------------------------
 # Verdict.to_error_dict
 # ---------------------------------------------------------------------------
 
@@ -1182,3 +1477,43 @@ class TestIsRoutingOverride:
     def test_reason_with_leading_trailing_whitespace_is_true(self):
         """A reason that is non-empty after stripping is valid."""
         assert is_routing_override('  owner confirmed  ') is True
+
+
+# ---------------------------------------------------------------------------
+# Filer-first attribution (task 7515): a relative path under the filing
+# project's own top-level dir is the filer's, even when the global table
+# collision-dropped that dir or credits it to another project (stale snapshot).
+# ---------------------------------------------------------------------------
+
+
+class TestFilerFirstAttribution:
+    PROSE = 'Record into sessions/recorded/x/session.toml and corpus/fixtures/a.trace.toml'
+
+    def test_task_27_files_pass_the_certain_check(self, tmp_path):
+        reg = stale_snapshot_registry(tmp_path)
+        assert check_files_for_scope(TASK_27_FILES, FILER_PROJECT, reg).outcome == 'ok'
+
+    def test_task_27_files_are_not_a_cross_repo_deliverable(self, tmp_path):
+        reg = stale_snapshot_registry(tmp_path)
+        assert all_files_foreign_owner(TASK_27_FILES, FILER_PROJECT, reg) is None
+
+    def test_task_27_files_attest_local_work(self, tmp_path):
+        reg = stale_snapshot_registry(tmp_path)
+        assert local_attesting_signals(
+            TASK_27_FILES, FILER_PROJECT, reg) == TASK_27_FILES
+
+    def test_prose_citing_own_dirs_is_not_a_mismatch(self, tmp_path):
+        reg = stale_snapshot_registry(tmp_path)
+        assert find_paths(self.PROSE, reg.all_prefixes()) == ['sessions/', 'corpus/']
+        assert check_text_for_scope(self.PROSE, FILER_PROJECT, reg).is_rejection is False
+        verdict = check_candidate_for_scope(
+            _candidate(description=self.PROSE), FILER_PROJECT, reg)
+        assert verdict.is_rejection is False
+
+    def test_dir_only_another_project_has_stays_foreign(self, tmp_path):
+        reg = stale_snapshot_registry(tmp_path)
+        assert all_files_foreign_owner(
+            ['orchestrator/src/x.py'], FILER_PROJECT, reg) == 'dark_factory'
+        verdict = check_text_for_scope('see orchestrator/src/x.py', FILER_PROJECT, reg)
+        assert verdict.is_rejection
+        assert verdict.suggested_project == 'dark_factory'

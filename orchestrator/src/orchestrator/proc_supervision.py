@@ -57,21 +57,175 @@ test_proc_supervision.py pending that conversion landing.
 from __future__ import annotations
 
 import asyncio
+import importlib
+import importlib.util
 import logging
+import os
+import re
 import shlex
 import sys
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from pathlib import Path
+from types import MappingProxyType
 from typing import TYPE_CHECKING
 
 from orchestrator.systemd_inspect import _empty_baseline_fresh, inspect_systemd_unit
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
+
     from escalation.models import Escalation
     from escalation.queue import EscalationQueue
 
 logger = logging.getLogger(__name__)
+
+RP4_ESCALATION_SUBMIT_FAILED_RC = 97
+"""Exit code of a fired RP-4 transient unit whose on-failure submit FAILED.
+
+Spent only when the deferred payload failed AND the `escalation submit` that
+was supposed to report that failure ALSO failed — i.e. the L2 was never filed.
+Any other outcome keeps the payload's own exit code, so journald still records
+the restart's real cause (see `_execute_detached_systemd_run`).
+
+WHY 97: it sits in the unallocated 79-124 band — clear of sysexits.h (64-78),
+of `git bisect`'s reserved 125, of the shell's 126/127 exec errors, and of the
+128+N signal codes — so collision with a genuine payload's own exit code is
+very unlikely. It is a NAMED constant specifically so the tests that assert on
+it import it rather than hardcoding a magic number in three places that could
+silently drift apart (task 3404).
+"""
+
+
+# The packages the deferred RP-4 ``python -m escalation submit`` child must be
+# able to import.  MEASURED import chain (both are load-bearing, neither is
+# speculative): ``escalation.__main__`` -> ``escalation.submit`` ->
+# ``escalation.queue`` -> ``shared.timestamps`` -> ``shared/__init__.py``.
+_SUBMIT_CHILD_PACKAGES: tuple[str, ...] = ('escalation', 'shared')
+
+# The portable environment variable name (POSIX shell ``name``) every
+# ``RestartPlan.env`` key must match. The detached path relies on it: it
+# renders each entry as an unquoted ``KEY=`` shell assignment.
+_PORTABLE_ENV_NAME = re.compile(r'[A-Za-z_][A-Za-z0-9_]*')
+
+
+def _systemd_execstart_literal(text: str) -> str:
+    """systemd expands ``${NAME}`` and ``$$`` inside an ExecStart argv element,
+    even within shell single quotes. Doubling every ``$`` makes systemd hand
+    /bin/sh the original text."""
+    return text.replace('$', '$$')
+
+
+def _submit_child_pythonpath() -> str:
+    """Build the PYTHONPATH value for the deferred submit child.
+
+    Derived entirely from THIS process's own import resolution and its own
+    environment — never from anything the child might inherit, because
+    (MEASURED) ``systemd-run --user`` propagates NONE of the caller's
+    environment to a transient unit.
+
+    Order, deduped order-preserving:
+
+    1. Every non-empty entry of this process's ``PYTHONPATH``, first — this
+       explicitly re-supplies exactly what systemd-run drops, preserving the
+       parent's own ``sys.path`` precedence.  Correct even if a future
+       deployment sets PYTHONPATH on the orchestrator unit (today it sets
+       none).
+    2. The resolved import root of each :data:`_SUBMIT_CHILD_PACKAGES` entry,
+       via ``importlib.util.find_spec(pkg).submodule_search_locations`` ->
+       ``Path(loc).resolve().parent``, as a floor.  Resolving rather than
+       hardcoding a repo layout keeps this correct under both the editable
+       install used in the deployed venv and a real wheel install.
+
+    NOTE this is only ONE of the two legs of the child's importability: it
+    covers the workspace src roots.  The third-party dependency floor
+    (``aiosqlite``, reached via ``shared/__init__.py`` ->
+    ``shared.async_sqlite_base``) lives in site-packages and is guaranteed
+    instead by the child running the SAME interpreter as this process — see
+    :meth:`EscalationSpec.to_submit_argv`.
+    """
+    roots: list[str] = []
+    seen: set[str] = set()
+
+    def _add(root: str) -> None:
+        if root and root not in seen:
+            seen.add(root)
+            roots.append(root)
+
+    for entry in os.environ.get('PYTHONPATH', '').split(os.pathsep):
+        _add(entry)
+
+    for pkg in _SUBMIT_CHILD_PACKAGES:
+        try:
+            spec = importlib.util.find_spec(pkg)
+            locations = spec.submodule_search_locations if spec is not None else None
+        except (ImportError, AttributeError, ValueError) as exc:
+            locations = None
+            reason = f'{type(exc).__name__}: {exc}'
+        else:
+            reason = 'find_spec returned no import root'
+        if not locations:
+            # Loud-over-silent (docs/legibility/design-invariants.md,
+            # no-silent-fail-soft): a narrowed PYTHONPATH still produces a
+            # plausible-looking argv, so the narrowing must be reported by
+            # name or it is indistinguishable from a healthy one.
+            logger.warning(
+                'proc_supervision: cannot resolve the import root of package %r '
+                '(%s) — the RP-4 submit child will NOT carry it on '
+                'PYTHONPATH, so the RP-4 on-failure `python -m escalation '
+                'submit` may be unable to import and file no L2 at fire time',
+                pkg, reason,
+            )
+            continue
+        for loc in locations:
+            _add(str(Path(loc).resolve().parent))
+
+    return os.pathsep.join(roots)
+
+
+def _submit_child_shell_command(spec: EscalationSpec, python_exe: str) -> str:
+    """The ``/bin/sh`` command line that runs the RP-4 submit child, already
+    escaped as an ExecStart literal (:func:`_systemd_execstart_literal`).
+
+    PYTHONPATH rides as a shell assignment prefix, so it is scoped to this one
+    command and never reaches the deploy payload sharing the unit (task 5509).
+    """
+    command = ' '.join(shlex.quote(p) for p in spec.to_submit_argv(python_exe))
+    pythonpath = _submit_child_pythonpath()
+    if not pythonpath:
+        logger.warning(
+            'proc_supervision: no PYTHONPATH roots resolved — the RP-4 submit '
+            'command carries NO PYTHONPATH prefix, so the child runs with the '
+            'empty PYTHONPATH systemd-run gives it (per-package causes logged '
+            'above)',
+        )
+        return _systemd_execstart_literal(command)
+    return _systemd_execstart_literal(f'PYTHONPATH={shlex.quote(pythonpath)} {command}')
+
+
+def _warn_if_submit_module_unimportable(transient_unit: str | None) -> None:
+    """Registration-time canary for the RP-4 on-failure submit child.
+
+    Really imports ``escalation.submit`` in this interpreter and WARNs if that
+    fails. An ``Exception`` or ``SystemExit`` from the import is reported,
+    never raised, so the restart is never blocked. A pass is not proof: the
+    wrapper's fire-time exit :data:`RP4_ESCALATION_SUBMIT_FAILED_RC` stays
+    authoritative. Real-child preflight:
+    ``orchestrator/tests/test_deterministic_runner.py::_assert_submit_cli_invokable``.
+    """
+    try:
+        importlib.import_module('escalation.submit')
+    except (Exception, SystemExit) as exc:
+        logger.warning(
+            'proc_supervision: `escalation.submit` FAILED TO IMPORT in this '
+            'process (%s): %s — the deferred /bin/sh -c on-failure branch for '
+            '%s will exit non-zero at fire time and file NO L2 escalation; the '
+            'wrapper will report that by exiting %d with an `RP-4: on-failure '
+            'escalation submit failed` line, but only into journald, long '
+            'after this deploy',
+            sys.executable, f'{type(exc).__name__}: {exc}', transient_unit,
+            RP4_ESCALATION_SUBMIT_FAILED_RC,
+        )
 
 
 @dataclass(frozen=True)
@@ -120,6 +274,24 @@ class EscalationSpec:
         Mirrors ``DeterministicRunner._default_schedule_detached_restart``'s
         ``escalation_cmd`` list (deterministic_runner.py:414-427) exactly, so
         the two restart mechanisms produce byte-identical submit invocations.
+
+        *python_exe* is load-bearing, not incidental. The child's ability to
+        ``import escalation`` rests on TWO independent legs (task 3453, both
+        MEASURED):
+
+        1. **Interpreter identity — this argument.** Callers pass
+           ``sys.executable``, so the child runs the SAME interpreter as the
+           orchestrator process and therefore the same site-packages. This leg
+           cannot be substituted by PYTHONPATH: ``python -S -m escalation
+           submit`` with the workspace src roots on PYTHONPATH still dies at
+           ``shared.async_sqlite_base`` -> ``import aiosqlite``, a
+           site-packages-only wheel. An absolute path also keeps this immune to
+           PATH, which a systemd-run child inherits from the user manager
+           rather than from the orchestrator unit.
+        2. **Workspace src roots** — supplied explicitly by the
+           ``PYTHONPATH=`` assignment prefix the RP-4 wrapper puts on this
+           command (see :func:`_submit_child_shell_command`), because
+           ``systemd-run --user`` propagates none of the caller's environment.
         """
         return [
             python_exe, '-m', 'escalation', 'submit',
@@ -274,6 +446,11 @@ class RestartPlan:
     stat-checked here (would race / force hermetic tests to create real
     files) — a missing script surfaces at runtime as exit-127, escalated by
     the RP-4 on-failure wrapper.
+
+    ``env`` holds the extra environment variables the restart script
+    receives, and every ``execute()`` path delivers them to the script alone.
+    It is stored as a read-only copy, so the ``__post_init__`` checks hold for
+    the plan's whole life.
     """
 
     script: Path
@@ -285,6 +462,7 @@ class RestartPlan:
     verify: FreshPidVerify | None
     transient_unit: str | None = None
     on_active_secs: int = 60
+    env: Mapping[str, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if not self.cwd.is_absolute():
@@ -294,6 +472,23 @@ class RestartPlan:
             )
         if not self.script.is_absolute():
             object.__setattr__(self, 'script', self.cwd / self.script)
+        object.__setattr__(self, 'env', MappingProxyType(dict(self.env)))
+        self._check_env()
+
+    def _check_env(self) -> None:
+        """Refuse an ``env`` key that is not a portable variable name, so every
+        spawn path accepts exactly the same keys."""
+        for key in self.env:
+            if not _PORTABLE_ENV_NAME.fullmatch(key):
+                raise ValueError(
+                    f'RestartPlan.env keys must be portable environment variable '
+                    f'names matching {_PORTABLE_ENV_NAME.pattern}; got {key!r}'
+                )
+
+    def _child_environ(self) -> dict[str, str] | None:
+        """``env`` overlaid on ``os.environ``, or None (full inherit) when empty: the
+        rule of ``orchestrator/src/orchestrator/before_done_script.py::run_script``."""
+        return {**os.environ, **self.env} if self.env else None
 
     async def execute(self, *, runner=None, inspector=None) -> RestartOutcome:
         """Run this restart plan, honoring RP-1..5.
@@ -499,6 +694,7 @@ class RestartPlan:
         proc = await runner(
             str(self.script), *self.args,
             cwd=str(self.cwd),
+            env=self._child_environ(),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
         )
@@ -592,8 +788,14 @@ class RestartPlan:
         """File ``self.on_failure_escalation`` (if configured) and report whether a NEW escalation was filed.
 
         Shared by the RESTART_FAILED and VERIFY_FAILED branches above — both
-        need the identical "file if configured, else log a warning and don't
-        claim escalated" fallback that RP-1's refuse branch also uses.
+        need the "file if configured, else log a warning and don't claim
+        escalated" fallback STRUCTURE. RP-1's two refuse branches in
+        ``execute()`` (the own_unit-unknown check and the same-unit-without-
+        transient-unit check) inline their own copies of that same
+        structure, but — as of task 4047, which reworded only this
+        verify-stage warning to be plan-scoped — their warning TEXT is no
+        longer identical to this method's. Don't assume a wording change
+        here also applies there, or vice versa.
 
         Returns ``False`` both when unconfigured (nothing to file) and when
         ``_file_inprocess_escalation``'s dedup guard skipped filing an
@@ -604,8 +806,13 @@ class RestartPlan:
         """
         if self.on_failure_escalation is None:
             logger.warning(
-                'proc_supervision: %s but no on_failure_escalation was '
-                'configured — no L2 escalation filed',
+                'proc_supervision: %s — this plan carries no '
+                'on_failure_escalation, so THIS PLAN did not file an L2 '
+                'itself. That claim is plan-scoped, NOT evidence of a '
+                'dropped escalation: a caller that owns escalation filing '
+                'may pass on_failure_escalation=None deliberately and file '
+                'its own L2 for this same failure instead — check for that '
+                'record before treating this report as lost.',
                 log_context,
             )
             return False
@@ -644,32 +851,93 @@ class RestartPlan:
         ``on_failure_escalation`` is None the payload is left unbranched (no
         wrapper) — still a valid ``/bin/sh -c`` invocation, just with no
         on-failure reporting.
+
+        The submit child's PYTHONPATH is supplied as a shell assignment prefix
+        on the on-failure command (:func:`_submit_child_shell_command`, value
+        from :func:`_submit_child_pythonpath`), because ``systemd-run --user``
+        propagates NO environment from its caller — MEASURED: a caller
+        exporting ``PYTHONPATH=/tmp/sentinel-df`` produced a transient unit
+        whose ``$PYTHONPATH`` was ``[]``. It is NOT a systemd-run ``--setenv``:
+        that would set it for the whole transient unit, the deploy payload
+        included (task 5509; pinned in
+        ``orchestrator/tests/test_proc_supervision_submit_child_env.py``). See
+        :meth:`EscalationSpec.to_submit_argv` for the OTHER leg of the child's
+        importability (interpreter identity, which PYTHONPATH cannot cover).
+
+        The plan's own ``env`` is scoped to the payload command, NOT the unit:
+        each entry is a ``KEY=<quoted value>`` shell assignment prefixing the
+        script, so the RP-4 submit child sees none of it and keeps only the
+        user manager's environment plus its own PYTHONPATH. ``_check_env``'s
+        name rule is what makes the unquoted ``KEY=`` a valid assignment.
+        Values are also escaped for systemd's ExecStart ``$`` expansion
+        (:func:`_systemd_execstart_literal`), so they reach the script
+        byte-for-byte.
         """
         on_active_secs = max(int(self.on_active_secs), 5)
-        payload = ' '.join(shlex.quote(p) for p in [str(self.script), *self.args])
+        env_assignments = [
+            f'{key}={_systemd_execstart_literal(shlex.quote(value))}'
+            for key, value in self.env.items()
+        ]
+        payload = ' '.join([
+            *env_assignments,
+            *(shlex.quote(p) for p in [str(self.script), *self.args]),
+        ])
         if self.on_failure_escalation is not None:
-            on_failure_argv = self.on_failure_escalation.to_submit_argv(sys.executable)
-            on_failure = ' '.join(shlex.quote(p) for p in on_failure_argv)
-            # Byte-for-byte reuse of deterministic_runner.py:439-445's wrapper
-            # shape (`_default_schedule_detached_restart`) — same three-part
-            # `payload; __rc=$?; if [ "$__rc" -ne 0 ]; then on_failure; fi;
-            # exit "$__rc"` shell. This IS intentional interim duplication,
-            # not an oversight: task 2237 (this module) is scoped OUT of
-            # deterministic_runner.py — that file belongs to task 2237's
-            # sibling, delta — so until delta lands, this wrapper and
-            # EscalationSpec.to_submit_argv's submit argv are TWO independent
-            # copies of the same shape that must be kept byte-identical by
-            # hand/convention, pinned only by
-            # TestDetachedWrapperExactnessAndRegistrationFailure (step-13)
-            # here and its deterministic_runner.py counterpart. Tracked as a
-            # follow-up (filed as a non-blocking escalation alongside this
-            # comment) for delta to make DeterministicRunner's two mechanisms
-            # delegate to this one helper (EscalationSpec.to_submit_argv /
-            # RestartPlan) instead, retiring the hand-kept-identical coupling
-            # with no behaviour delta.
+            _warn_if_submit_module_unimportable(self.transient_unit)
+            on_failure = _submit_child_shell_command(
+                self.on_failure_escalation, sys.executable,
+            )
+            # This is the SINGLE source of truth for the RP-4 wrapper. Both
+            # detached-restart entry points delegate here and build no wrapper
+            # of their own: `deterministic_runner._default_schedule_detached_
+            # restart` and `service_restart.schedule_detached_systemd_restart`
+            # are thin RestartPlan callers (a repo-wide grep for `__rc=$?`
+            # outside tests finds this builder plus one docstring illustration
+            # in deterministic_runner.py, nothing else).
+            #
+            # History (resolved, not an open follow-up): under task 2237 this
+            # wrapper WAS one of two hand-kept-byte-identical copies, because
+            # deterministic_runner.py was scoped out to task 2237's sibling
+            # delta. Task 2238/delta landed and collapsed them, retiring that
+            # coupling. The byte-exact pin lives in test_proc_supervision.py's
+            # TestDetachedWrapperExactnessAndRegistrationFailure, backed there
+            # by two behavioural tests that execute the real wrapper — the
+            # byte pin alone cannot catch a semantic error, since it is built
+            # with this same f-string (task 3404).
+            # The on_failure branch's OWN rc is captured into `__esc` and acted
+            # on (task 3404). It previously was not: `__rc` came from the
+            # payload only and the trailing `exit "$__rc"` re-exited it, so a
+            # submit that died — service down, bad argv, `escalation` not
+            # importable by the named interpreter — was indistinguishable in
+            # both exit status and journald from one that filed the L2. That is
+            # a no-silent-fail-soft violation, and the exact swallowing that
+            # masked 3404's own root cause (an investigation saw rc==7 pass
+            # while zero escalations had been filed).
+            #
+            # Three paths, each measured before being written:
+            #   payload 0            -> on_failure never runs, wrapper exits 0
+            #                           (no spurious escalation on a successful
+            #                           self-deploy — the invariant the
+            #                           `--on-active` design exists to protect)
+            #   payload N, submit 0  -> wrapper exits N, byte-identical to the
+            #                           pre-3404 observable behaviour, so
+            #                           journald keeps the real restart cause
+            #   payload N, submit M  -> diagnostic on stderr AND exit 97, so the
+            #                           unfiled L2 is both human-visible in
+            #                           journald and machine-distinguishable
+            #
+            # The `>&2` redirect and the `$__esc`/`$__rc` expansions stay inside
+            # double quotes; the whole string is handed to systemd-run as ONE
+            # argv element (`/bin/sh -c wrapped`) and is never re-parsed by an
+            # outer shell, so no further quoting is required.
             wrapped = (
                 f'{payload}; __rc=$?; '
-                f'if [ "$__rc" -ne 0 ]; then {on_failure}; fi; '
+                f'if [ "$__rc" -ne 0 ]; then {on_failure}; __esc=$?; '
+                f'if [ "$__esc" -ne 0 ]; then '
+                f'echo "RP-4: on-failure escalation submit failed '
+                f'rc=$__esc (payload rc=$__rc)" >&2; '
+                f'exit {RP4_ESCALATION_SUBMIT_FAILED_RC}; fi; '
+                f'fi; '
                 f'exit "$__rc"'
             )
         else:
@@ -751,6 +1019,7 @@ class RestartPlan:
         await runner(
             str(self.script), *self.args,
             cwd=str(self.cwd),
+            env=self._child_environ(),
             start_new_session=True,
         )
         return RestartOutcome(disposition=RestartDisposition.SCHEDULED)

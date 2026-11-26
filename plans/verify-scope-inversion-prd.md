@@ -232,6 +232,50 @@ No reciprocal-ownership ambiguity: every seam has exactly one owner.
 - **R3 (task-role pytest floor):** a source-only diff under a registered
   module ⇒ that module's full `test_command` at task role (today: zero
   pytest). Touched-test-only diffs keep file-scoped selection.
+
+  > **Post-λ amendment (task 3294).** R3 as written above is still literally
+  > true, and both of its cells are unchanged. What it left *unspecified* is
+  > the MIXED case — a production file plus a co-committed test file under
+  > the same prefix — and λ's implementation resolved it implicitly, by
+  > placing the floor BELOW `_derive_module_runs`' collectable-test branch:
+  > any co-committed test file won, and the run narrowed to that file.
+  >
+  > Task 3294 resolves the mixed case explicitly toward FULL_SUITE. The
+  > rationale is **monotonicity**: coverage must not shrink as the diff
+  > grows. Pre-3294 a source-only diff paid the owning module's full suite,
+  > while that same diff plus a test file narrowed — so *adding a test
+  > removed coverage*. Task 3033 is the incident: its diff touched
+  > `orchestrator/src/orchestrator/workflow.py` plus tests, the plan
+  > file-scoped to 36 items instead of the module's ~13188, and a regression
+  > in `orchestrator/tests/test_workflow_resume_on_progress.py` — a
+  > *different* consumer of `workflow.py` — was structurally invisible and
+  > reached a debugger.
+  >
+  > The rule is now: at `role='task'`, ANY touched SOURCE ∪ STRUCTURAL file
+  > under a module prefix runs that module's full `test_command`; only a
+  > test-tree-ONLY diff keeps file-scoped selection. The union (rather than
+  > SOURCE alone) is load-bearing — `classify_file` returns STRUCTURAL for a
+  > Protocol/TypedDict-defining production file only when content is read,
+  > i.e. only when `type_check_command` is configured, so a SOURCE-only
+  > predicate would make pytest breadth silently type-check-config-dependent
+  > and would miss `workflow.py` itself.
+  >
+  > This disturbs nothing else in the contract. **R1** holds: the widening is
+  > still confined to the owning modules of the diff — it changes each
+  > module's own breadth, never the set of modules. **R4** holds: the branch
+  > is `role == 'task'`-gated, so merge-role plans stay byte-identical to
+  > legacy (and `merge_verify_breadth='full'` never reaches
+  > `_derive_module_runs` at all — it routes through
+  > `_derive_full_suite_runs`). **Resolved decision 3** holds: selection stays
+  > at PACKAGE granularity with no import graph — the change is a branch
+  > reorder plus a one-line predicate over the already-computed `kinds` dict.
+  > Consistent with λ's own precedent, the widening ships unconditionally
+  > ("Task-role policy is unconditional (strictly better signal)"); the
+  > staged `merge_verify_breadth` knob remains merge-lane-only.
+  >
+  > `_derive_fallback_runs` is deliberately NOT given the same widening: it
+  > has no owning module, so its "full suite" is the whole-repo opaque
+  > `&&`-chain that boundary row 9 requires never appear in a task-role plan.
 - **R4 (knob):** `merge_verify_breadth='scoped'` ⇒ merge-role plans are
   byte-identical to legacy (golden-tested rollback path). Validated as a
   `Literal` at config load.

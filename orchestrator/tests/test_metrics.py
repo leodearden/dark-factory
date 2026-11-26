@@ -3,17 +3,16 @@
 from __future__ import annotations
 
 import logging
-from pathlib import Path
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from orchestrator.agents.token_pricing import FALLBACK_PRICE, TokenUsage, price_tokens
 from orchestrator.evals.metrics import (
     EvalMetrics,
-    _is_false_green,
-    _is_null_work,
     compute_composite,
+    is_false_green,
+    is_null_work,
 )
 
 
@@ -68,31 +67,31 @@ class TestFalseGreenGuard:
         return EvalMetrics(**base)
 
     def test_matches_exact_signature(self):
-        assert _is_false_green(self._sig(), max_iterations=20) is True
+        assert is_false_green(self._sig(), max_iterations=20) is True
 
     def test_exceeds_cap_still_matches(self):
-        assert _is_false_green(self._sig(iterations=25), max_iterations=20) is True
+        assert is_false_green(self._sig(iterations=25), max_iterations=20) is True
 
     def test_below_cap_does_not_match(self):
-        assert _is_false_green(self._sig(iterations=19), max_iterations=20) is False
+        assert is_false_green(self._sig(iterations=19), max_iterations=20) is False
 
     def test_any_cost_does_not_match(self):
-        assert _is_false_green(self._sig(cost_usd=0.01), max_iterations=20) is False
+        assert is_false_green(self._sig(cost_usd=0.01), max_iterations=20) is False
 
     def test_any_lines_changed_does_not_match(self):
-        assert _is_false_green(self._sig(lines_changed=1), max_iterations=20) is False
+        assert is_false_green(self._sig(lines_changed=1), max_iterations=20) is False
 
     def test_any_files_changed_does_not_match(self):
-        assert _is_false_green(self._sig(files_changed=1), max_iterations=20) is False
+        assert is_false_green(self._sig(files_changed=1), max_iterations=20) is False
 
     def test_tests_fail_does_not_match(self):
         """Baselines that already fail are score-safe and should pass through."""
         assert (
-            _is_false_green(self._sig(tests_pass=False), max_iterations=20) is False
+            is_false_green(self._sig(tests_pass=False), max_iterations=20) is False
         )
 
     def test_tests_none_does_not_match(self):
-        assert _is_false_green(self._sig(tests_pass=None), max_iterations=20) is False
+        assert is_false_green(self._sig(tests_pass=None), max_iterations=20) is False
 
     def test_legitimate_done_run_does_not_match(self):
         """A real done outcome (short, made changes, spent money) must pass through."""
@@ -105,12 +104,12 @@ class TestFalseGreenGuard:
             iterations=4,
             cost_usd=0.0,  # vLLM runs show $0; this alone is fine
         )
-        assert _is_false_green(m, max_iterations=20) is False
+        assert is_false_green(m, max_iterations=20) is False
 
     def test_higher_cap_config_raises_threshold(self):
         """A task with max_iterations=30 should not match on 20 iterations."""
-        assert _is_false_green(self._sig(iterations=20), max_iterations=30) is False
-        assert _is_false_green(self._sig(iterations=30), max_iterations=30) is True
+        assert is_false_green(self._sig(iterations=20), max_iterations=30) is False
+        assert is_false_green(self._sig(iterations=30), max_iterations=30) is True
 
 
 class TestNullWorkGuard:
@@ -130,27 +129,27 @@ class TestNullWorkGuard:
         return EvalMetrics(**base)
 
     def test_matches_exact_signature(self):
-        assert _is_null_work(self._sig()) is True
+        assert is_null_work(self._sig()) is True
 
     def test_single_iteration_matches(self):
-        assert _is_null_work(self._sig(iterations=1)) is True
+        assert is_null_work(self._sig(iterations=1)) is True
 
     def test_high_cost_still_matches(self):
-        assert _is_null_work(self._sig(cost_usd=12.50)) is True
+        assert is_null_work(self._sig(cost_usd=12.50)) is True
 
     def test_lines_changed_does_not_match(self):
-        assert _is_null_work(self._sig(lines_changed=1)) is False
+        assert is_null_work(self._sig(lines_changed=1)) is False
 
     def test_files_changed_does_not_match(self):
-        assert _is_null_work(self._sig(files_changed=1)) is False
+        assert is_null_work(self._sig(files_changed=1)) is False
 
     def test_zero_cost_does_not_match(self):
         """Zero cost is the 404-bug guard's domain, not ours."""
-        assert _is_null_work(self._sig(cost_usd=0.0)) is False
+        assert is_null_work(self._sig(cost_usd=0.0)) is False
 
     def test_zero_iterations_does_not_match(self):
         """No iterations means the implementer never ran — not our signature."""
-        assert _is_null_work(self._sig(iterations=0)) is False
+        assert is_null_work(self._sig(iterations=0)) is False
 
     def test_legitimate_run_does_not_match(self):
         """A real run that made changes must not trigger."""
@@ -163,7 +162,7 @@ class TestNullWorkGuard:
             iterations=4,
             cost_usd=1.23,
         )
-        assert _is_null_work(m) is False
+        assert is_null_work(m) is False
 
     def test_false_green_takes_priority_over_null_work(self):
         """The guards are mutually exclusive on the cost dimension:
@@ -173,137 +172,16 @@ class TestNullWorkGuard:
             tests_pass=True, lines_changed=0, files_changed=0,
             iterations=20, cost_usd=0.0,
         )
-        assert _is_false_green(m_false_green, max_iterations=20) is True
-        assert _is_null_work(m_false_green) is False
+        assert is_false_green(m_false_green, max_iterations=20) is True
+        assert is_null_work(m_false_green) is False
 
         # Null-work signature has cost > 0 -> false-green cannot match
         m_null_work = EvalMetrics(
             tests_pass=True, lines_changed=0, files_changed=0,
             iterations=5, cost_usd=0.42,
         )
-        assert _is_false_green(m_null_work, max_iterations=20) is False
-        assert _is_null_work(m_null_work) is True
-
-
-# ---------------------------------------------------------------------------
-# Task 1809 step-15: _git_diff_stats returncode check + (-1,-1) sentinel
-# ---------------------------------------------------------------------------
-
-def _make_fake_proc(returncode: int, stdout: bytes, stderr: bytes) -> MagicMock:
-    """Build a minimal fake asyncio Process mock."""
-    proc = MagicMock()
-    proc.returncode = returncode
-    proc.communicate = AsyncMock(return_value=(stdout, stderr))
-    return proc
-
-
-@pytest.mark.asyncio
-class TestGitDiffStatsReturncode:
-    """Step-15 (RED): _git_diff_stats must return (-1,-1) and emit a WARNING
-    when git exits non-zero, rather than returning (0,0) silently.
-
-    Before step-16 impl: rc!=0 path is silent and returns (0,0) → RED.
-    After step-16 impl: returns (-1,-1) + WARNING at 'orchestrator.evals.metrics'.
-    """
-
-    async def test_nonzero_returncode_returns_sentinel_and_warns(
-        self, caplog,
-    ) -> None:
-        from orchestrator.evals.metrics import _git_diff_stats
-
-        fake_proc = _make_fake_proc(
-            returncode=128,
-            stdout=b'',
-            stderr=b'fatal: bad object deadbeef',
-        )
-
-        with (
-            patch('asyncio.create_subprocess_exec', return_value=fake_proc),
-            caplog.at_level(logging.WARNING, logger='orchestrator.evals.metrics'),
-        ):
-            result = await _git_diff_stats(Path('/fake/worktree'), 'deadbeef')
-
-        assert result == (-1, -1), (
-            f'Expected (-1,-1) sentinel on rc=128; got {result!r}'
-        )
-        warning_texts = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
-        assert warning_texts, (
-            'Expected a WARNING at orchestrator.evals.metrics on rc!=0; '
-            'got no warnings'
-        )
-
-    async def test_create_subprocess_raises_returns_sentinel_and_warns(
-        self, caplog,
-    ) -> None:
-        from orchestrator.evals.metrics import _git_diff_stats
-
-        with (
-            patch(
-                'asyncio.create_subprocess_exec',
-                side_effect=OSError('no such file'),
-            ),
-            caplog.at_level(logging.WARNING, logger='orchestrator.evals.metrics'),
-        ):
-            result = await _git_diff_stats(Path('/fake/worktree'), 'deadbeef')
-
-        assert result == (-1, -1), (
-            f'Expected (-1,-1) sentinel on OSError; got {result!r}'
-        )
-        warning_texts = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
-        assert warning_texts, (
-            'Expected a WARNING at orchestrator.evals.metrics on OSError; '
-            'got no warnings'
-        )
-
-    async def test_zero_returncode_valid_stat_output_parsed(
-        self, caplog,
-    ) -> None:
-        from orchestrator.evals.metrics import _git_diff_stats
-
-        stat_output = (
-            b' src/foo.py | 10 +++++-----\n'
-            b' src/bar.py |  5 ++---\n'
-            b' 2 files changed, 15 insertions(+), 0 deletions(-)\n'
-        )
-        fake_proc = _make_fake_proc(returncode=0, stdout=stat_output, stderr=b'')
-
-        with (
-            patch('asyncio.create_subprocess_exec', return_value=fake_proc),
-            caplog.at_level(logging.WARNING, logger='orchestrator.evals.metrics'),
-        ):
-            lines, files = await _git_diff_stats(Path('/fake/worktree'), 'abc123')
-
-        assert files == 2, f'Expected files=2; got {files!r}'
-        assert lines == 15, f'Expected lines=15; got {lines!r}'
-        parse_warnings = [
-            r.message for r in caplog.records if r.levelno >= logging.WARNING
-        ]
-        assert not parse_warnings, (
-            f'No WARNING expected for successful parse; got: {parse_warnings}'
-        )
-
-    async def test_zero_returncode_empty_stdout_returns_zero_zero(
-        self, caplog,
-    ) -> None:
-        from orchestrator.evals.metrics import _git_diff_stats
-
-        fake_proc = _make_fake_proc(returncode=0, stdout=b'', stderr=b'')
-
-        with (
-            patch('asyncio.create_subprocess_exec', return_value=fake_proc),
-            caplog.at_level(logging.WARNING, logger='orchestrator.evals.metrics'),
-        ):
-            result = await _git_diff_stats(Path('/fake/worktree'), 'abc123')
-
-        assert result == (0, 0), (
-            f'Expected (0,0) for legitimate empty diff; got {result!r}'
-        )
-        parse_warnings = [
-            r.message for r in caplog.records if r.levelno >= logging.WARNING
-        ]
-        assert not parse_warnings, (
-            f'No WARNING expected for empty-diff (no-change); got: {parse_warnings}'
-        )
+        assert is_false_green(m_null_work, max_iterations=20) is False
+        assert is_null_work(m_null_work) is True
 
 
 # ---------------------------------------------------------------------------
@@ -313,8 +191,10 @@ class TestGitDiffStatsReturncode:
 class TestResolveCostUsd:
     """A PURE resolver of ``(cost_usd, cost_source)`` implementing Invariant P5.
 
-    Cost provenance ∈ {price_table, cli, unpriced_proxy}:
+    Cost provenance ∈ {price_table, price_table_no_cache_rate, cli, unpriced_proxy}:
       - price_table  → the run's model is listed in ``prices`` (trust the table)
+      - price_table_no_cache_rate → listed, but cache tokens met a missing
+                       cache rate and were priced at input_per_1m (WARNING)
       - cli          → NATIVE cloud endpoint, model unlisted (CLI cost is
                        trustworthy for the real Anthropic API)
       - unpriced_proxy → a PROXIED endpoint (is_local_model) whose model is
@@ -327,7 +207,7 @@ class TestResolveCostUsd:
 
         # 1_000_000 in @ $2/1M + 500_000 out @ $8/1M = 2.0 + 4.0 = 6.0
         cost, source = resolve_cost_usd(
-            1_000_000, 500_000,
+            TokenUsage(input_tokens=1_000_000, output_tokens=500_000),
             model='model-x',
             prices={'model-x': {'input_per_1m': 2.0, 'output_per_1m': 8.0}},
             cli_cost_usd=99.0,          # must be IGNORED when the model is priced
@@ -342,7 +222,7 @@ class TestResolveCostUsd:
         from orchestrator.evals.metrics import resolve_cost_usd
 
         cost, source = resolve_cost_usd(
-            1_000_000, 500_000,
+            TokenUsage(input_tokens=1_000_000, output_tokens=500_000),
             model='model-x',
             prices={'model-x': PriceEntry(input_per_1m=2.0, output_per_1m=8.0)},
             cli_cost_usd=99.0,
@@ -355,7 +235,7 @@ class TestResolveCostUsd:
         from orchestrator.evals.metrics import resolve_cost_usd
 
         cost, source = resolve_cost_usd(
-            1_000_000, 1_000_000,
+            TokenUsage(input_tokens=1_000_000, output_tokens=1_000_000),
             model='claude-sonnet-4',    # not in prices
             prices={},
             cli_cost_usd=3.5,
@@ -369,7 +249,7 @@ class TestResolveCostUsd:
 
         with caplog.at_level(logging.WARNING, logger='orchestrator.evals.metrics'):
             cost, source = resolve_cost_usd(
-                1_000_000, 1_000_000,
+                TokenUsage(input_tokens=1_000_000, output_tokens=1_000_000),
                 model='local-llama-70b',    # not in prices
                 prices={},
                 cli_cost_usd=0.0,           # raw CLI cost is WRONG for proxied
@@ -392,7 +272,7 @@ class TestResolveCostUsd:
         from orchestrator.evals.metrics import resolve_cost_usd
 
         cost, source = resolve_cost_usd(
-            1_000_000, 500_000,
+            TokenUsage(input_tokens=1_000_000, output_tokens=500_000),
             model='model-x',
             prices={'model-x': {'input_per_1m': 2.0, 'output_per_1m': 8.0}},
             cli_cost_usd=99.0,
@@ -400,6 +280,173 @@ class TestResolveCostUsd:
         )
         assert source == 'price_table'
         assert cost == pytest.approx(6.0)
+
+    # Measured counts of eval cell endpoint__46074e01, at GLM-5.3's published rates.
+    _MEASURED_USAGE = TokenUsage(
+        input_tokens=1_193,
+        output_tokens=12_537,
+        cache_read_tokens=1_370_402,
+        cache_create_tokens=13_702,
+    )
+    _GLM_RATES = {
+        'input_per_1m': 1.40,
+        'output_per_1m': 4.40,
+        'cached_input_per_1m': 0.26,
+        'cache_write_per_1m': 1.40,
+    }
+
+    def test_priced_model_prices_cache_tokens_at_their_own_rates(self):
+        from orchestrator.evals.metrics import resolve_cost_usd
+
+        cost, source = resolve_cost_usd(
+            self._MEASURED_USAGE,
+            model='glm-5.3',
+            prices={'glm-5.3': self._GLM_RATES},
+            cli_cost_usd=99.0,
+            is_local_model=True,
+        )
+        assert (cost, source) == (pytest.approx(0.43232032), 'price_table')
+
+    def test_missing_cached_rate_labels_and_warns(self, caplog):
+        from orchestrator.evals.metrics import resolve_cost_usd
+
+        usage = TokenUsage(input_tokens=100, output_tokens=10, cache_read_tokens=1_000)
+        with caplog.at_level(logging.WARNING, logger='orchestrator.evals.metrics'):
+            cost, source = resolve_cost_usd(
+                usage,
+                model='mimo-pro',
+                prices={'mimo-pro': {'input_per_1m': 1.0, 'output_per_1m': 4.0}},
+                cli_cost_usd=0.0,
+                is_local_model=True,
+            )
+
+        assert source == 'price_table_no_cache_rate'
+        assert cost == pytest.approx((100 * 1.0 + 1_000 * 1.0 + 10 * 4.0) / 1e6)
+        warnings = [
+            r.getMessage() for r in caplog.records
+            if r.levelno >= logging.WARNING and r.name == 'orchestrator.evals.metrics'
+        ]
+        assert any('mimo-pro' in w and 'cached_input_per_1m' in w for w in warnings), warnings
+
+    def test_missing_cache_rates_without_cache_tokens_stay_price_table(self, caplog):
+        from orchestrator.evals.metrics import resolve_cost_usd
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.evals.metrics'):
+            _, source = resolve_cost_usd(
+                TokenUsage(input_tokens=100, output_tokens=10),
+                model='mimo-pro',
+                prices={'mimo-pro': {'input_per_1m': 1.0, 'output_per_1m': 4.0}},
+                cli_cost_usd=0.0,
+                is_local_model=True,
+            )
+
+        assert source == 'price_table'
+        assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+    def test_proxied_unlisted_prices_cache_tokens_at_the_fallback(self):
+        from orchestrator.evals.metrics import resolve_cost_usd
+
+        cost, source = resolve_cost_usd(
+            self._MEASURED_USAGE,
+            model='local-llama-70b',
+            prices={},
+            cli_cost_usd=0.0,
+            is_local_model=True,
+        )
+
+        assert source == 'unpriced_proxy'
+        assert cost == pytest.approx(price_tokens(FALLBACK_PRICE, self._MEASURED_USAGE).cost_usd)
+
+
+class TestComposeCostSource:
+    """Task 3656: collapse a TWO-COMPONENT cost sum's provenance to ONE label.
+
+    ``run_architect_eval``'s ``cost_usd`` is architect spend PLUS plan-judge
+    spend. Only the architect component is resolved through
+    :func:`resolve_cost_usd`; the judge is always a native-cloud opus call, so
+    its component is always CLI-sourced and re-resolving it against the
+    candidate's price table would price opus tokens at a vLLM rate. That makes
+    one ``cost_source`` label describe two differently-sourced components the
+    moment the architect side resolves to ``price_table`` / ``unpriced_proxy``
+    — so the label COMPOSES: agreement → that source, disagreement (with judge
+    dollars actually in the sum) → ``'mixed'``.
+
+    ``'mixed'`` is deliberately the SAME word ``composite_report.py::_summarize_cost_source``
+    already emits for the cross-trial form of the same situation, so the
+    reporting vocabulary stays one word list and no report-side change is
+    needed.
+    """
+
+    _SOURCES = ('cli', 'price_table', 'unpriced_proxy')
+
+    @pytest.mark.parametrize('primary', _SOURCES)
+    def test_no_second_component_keeps_the_primary_verbatim(self, primary):
+        """$0 judge spend → no second component entered the sum, so the label
+        describes the primary alone (every judge-SKIPPED architect branch)."""
+        from orchestrator.evals.metrics import compose_cost_source
+
+        assert compose_cost_source(primary, secondary_cost_usd=0.0) == primary
+
+    def test_agreeing_sources_keep_that_source(self):
+        """TODAY'S architect cell: a native candidate resolves 'cli' and the
+        judge is 'cli' too, so a spending judge must NOT make it 'mixed'."""
+        from orchestrator.evals.metrics import compose_cost_source
+
+        assert compose_cost_source('cli', secondary_cost_usd=0.42) == 'cli'
+
+    def test_price_table_primary_with_cli_judge_is_mixed(self):
+        from orchestrator.evals.metrics import compose_cost_source
+
+        assert compose_cost_source(
+            'price_table', secondary_cost_usd=0.42,
+        ) == 'mixed'
+
+    def test_unpriced_proxy_primary_with_cli_judge_is_mixed(self):
+        from orchestrator.evals.metrics import compose_cost_source
+
+        assert compose_cost_source(
+            'unpriced_proxy', secondary_cost_usd=0.42,
+        ) == 'mixed'
+
+    @pytest.mark.parametrize('primary', _SOURCES)
+    def test_negative_secondary_is_treated_as_no_second_component(self, primary):
+        """Defensive: ``coerce_cost_usd`` already floors a nonsense figure to
+        0.0 upstream, but a negative that slipped through must never MANUFACTURE
+        a 'mixed' label out of spend that did not happen."""
+        from orchestrator.evals.metrics import compose_cost_source
+
+        assert compose_cost_source(primary, secondary_cost_usd=-1.0) == primary
+
+
+class TestIsProxiedEndpoint:
+    """Task 3656 (amendment): the proxied-endpoint predicate has ONE home.
+
+    ``ANTHROPIC_BASE_URL`` decides both whether ``build_eval_orch_config``
+    seeds the proxied price table (task 2820) and whether ``collect_metrics`` /
+    ``run_architect_eval`` stop trusting the CLI's own cost figure. Three
+    inline copies of the same env read could drift — a seeded table beside a
+    "native, trust the CLI" flag would resolve one candidate's cost two
+    different ways — so all three call the same helper.
+    """
+
+    @pytest.mark.parametrize('env_overrides,expected', [
+        ({'ANTHROPIC_BASE_URL': 'http://localhost:8000/v1'}, True),
+        ({'ANTHROPIC_BASE_URL': '', 'ANTHROPIC_MODEL': 'qwen3-coder'}, False),
+        ({'ANTHROPIC_MODEL': 'qwen3-coder'}, False),
+        ({}, False),
+        (None, False),
+    ])
+    def test_predicate(self, env_overrides, expected):
+        from orchestrator.evals.metrics import is_proxied_endpoint
+
+        assert is_proxied_endpoint(env_overrides) is expected
+
+    def test_runner_uses_the_metrics_singleton(self):
+        """Identity, not mere equality — a re-declared local copy in runner.py
+        (the price-table seeding site) would fail this."""
+        from orchestrator.evals import metrics, runner
+
+        assert runner.is_proxied_endpoint is metrics.is_proxied_endpoint
 
 
 # ---------------------------------------------------------------------------
@@ -534,6 +581,36 @@ class TestBlendComposite:
             0.95, 1.0, 1.0, tests_pass=None, plan_only=True, no_plan=True,
         ) == 0.0
 
+    def test_the_no_plan_gate_is_unconditional_not_scoped_to_plan_only(self):
+        """Pins ``blend_composite``'s own contract that the *no_plan* gate is
+        UNCONDITIONAL rather than scoped to *plan_only* — quoting its
+        docstring, "so a caller cannot silently bypass it by forgetting the
+        flag." Deliberately exercised here at a shape the report layer's
+        ``no_plan = has_plan_quality_score(m) and not produced_a_plan(m)``
+        call site never itself builds (it always passes ``plan_only``
+        alongside ``no_plan``) — a defence-in-depth contract of this PURE
+        function. (Cited by symbol/quote rather than line number: both drift
+        as the surrounding docstrings are edited.)
+
+        Both pre-existing no_plan tests above also pass ``plan_only=True``, so
+        before this test the source could be relaxed to
+        ``if plan_only and no_plan:`` and the whole eval sweep would stay
+        green (MEASURED with that mutant in place). ``plan_only`` is
+        therefore OMITTED here — not passed as ``False`` — to exercise the
+        exact "forgot the flag" hazard the docstring cites, the same
+        omit-the-flag idiom the default-behaviour tests above use.
+
+        ``tests_pass=True`` is deliberate, not incidental: under ``None`` or
+        ``False`` the FIRST gate would already return ``0.0``, and the
+        assertion would pass under the mutant too, proving nothing about the
+        second gate.
+        """
+        from orchestrator.evals.metrics import blend_composite
+
+        assert blend_composite(
+            0.9, 1.0, 1.0, tests_pass=True, no_plan=True,
+        ) == 0.0
+
     def test_no_plan_defaults_false_so_every_existing_blend_is_identical(self):
         """Additive: the default leaves the plan-only path byte-identical."""
         from orchestrator.evals.metrics import blend_composite
@@ -550,103 +627,3 @@ class TestBlendComposite:
         assert blend_composite(
             0.9, 1.0, 1.0, tests_pass=None, plan_only=True, no_plan=False,
         ) == pytest.approx(0.94, abs=1e-4)
-
-
-# ---------------------------------------------------------------------------
-# Amendment (reviewer: code-reuse) — the cost primitives (_FALLBACK_PRICE / _rate)
-# have a SINGLE home in agents.invoke; metrics re-exports rather than
-# re-declares them, so the copy cannot drift. These guards fail loudly if a
-# future edit reintroduces a local copy in metrics.py.
-# ---------------------------------------------------------------------------
-
-class TestCostPrimitivesSingleHome:
-    """metrics._FALLBACK_PRICE / metrics._rate must BE the invoke singletons
-    (identity, not mere equality) — a re-declared local copy would fail these.
-    """
-
-    def test_fallback_price_is_the_invoke_singleton(self):
-        from orchestrator.agents import invoke
-        from orchestrator.evals import metrics
-
-        assert metrics._FALLBACK_PRICE is invoke._FALLBACK_PRICE
-
-    def test_rate_accessor_is_the_invoke_singleton(self):
-        from orchestrator.agents import invoke
-        from orchestrator.evals import metrics
-
-        assert metrics._rate is invoke._rate
-
-
-# ---------------------------------------------------------------------------
-# Task 3302: THE plan-production predicate — `plan_steps > 0`, never
-# `plan_quality > 0` and never `outcome == 'done'`.
-#
-# `plan_steps` was persisted by run_architect_eval and read by NOBODY, so every
-# "did this architect actually produce a plan?" question downstream was answered
-# from plan_quality instead — a number the LLM judge can return NONZERO for a
-# stepless artifact that score_plan_structure floors to 0.0 (Graphiti episode
-# e2066ec6). These pin the predicate and its equivalence with the artifact-level
-# twin judge.is_scorable_plan.
-# ---------------------------------------------------------------------------
-
-class TestProducedAPlan:
-    """`produced_a_plan(metrics_dict)` — did this architect emit a plan?"""
-
-    def test_nonzero_plan_steps_is_a_plan(self):
-        from orchestrator.evals.metrics import produced_a_plan
-
-        assert produced_a_plan({'plan_steps': 3}) is True
-
-    def test_zero_plan_steps_is_not_a_plan(self):
-        from orchestrator.evals.metrics import produced_a_plan
-
-        assert produced_a_plan({'plan_steps': 0}) is False
-
-    def test_absent_key_is_not_a_plan(self):
-        """A legacy / hand-edited metrics dict must not read as a plan."""
-        from orchestrator.evals.metrics import produced_a_plan
-
-        assert produced_a_plan({}) is False
-
-    def test_none_plan_steps_is_not_a_plan(self):
-        """The `or 0` empty shape run_architect_eval's len(... or []) guards."""
-        from orchestrator.evals.metrics import produced_a_plan
-
-        assert produced_a_plan({'plan_steps': None}) is False
-
-    def test_does_not_consult_plan_quality(self):
-        """THE point of the predicate (task 2863 AMENDMENT §1 / e2066ec6).
-
-        The two scorers disagree exactly on a stepless artifact: the LLM plan
-        judge can score it 0.95 while score_plan_structure floors it to 0.0. So
-        a nonzero plan_quality is NOT evidence a plan exists, and a zero one is
-        NOT evidence it does not.
-        """
-        from orchestrator.evals.metrics import produced_a_plan
-
-        assert produced_a_plan({'plan_steps': 0, 'plan_quality': 0.95}) is False
-        assert produced_a_plan({'plan_steps': 4, 'plan_quality': 0.0}) is True
-
-    @pytest.mark.parametrize('plan', [
-        None,
-        {},
-        {'steps': []},
-        # The header-only stub create_plan writes on the architect's FIRST
-        # plan-tools call — TRUTHY, but not a plan.
-        {'task_id': 't', 'title': 'x', 'analysis': 'a', 'files': [], 'steps': []},
-        {'task_id': 't', 'title': 'x', 'steps': [{'id': 'step-1'}, {'id': 'step-2'}]},
-    ])
-    def test_equivalent_to_the_artifact_level_twin(self, plan):
-        """produced_a_plan(metrics) == is_scorable_plan(plan), by construction.
-
-        The report layer only ever sees a persisted metrics dict and cannot call
-        is_scorable_plan, which reads the plan ARTIFACT. run_architect_eval
-        derives plan_steps from the identical `len(plan.get('steps') or [])`, so
-        the two ask the same question — PINNED here rather than left to
-        coincidence (the drift hazard _has_plan_quality_score was written for).
-        """
-        from orchestrator.evals.judge import is_scorable_plan
-        from orchestrator.evals.metrics import produced_a_plan
-
-        persisted = {'plan_steps': len((plan or {}).get('steps') or [])}
-        assert produced_a_plan(persisted) is is_scorable_plan(plan)

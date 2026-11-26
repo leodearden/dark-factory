@@ -102,7 +102,7 @@ docs(prd): <one-line goal summary>
 
 <2–3 sentence summary of what this PRD covers + the load-bearing design decisions resolved>
 
-Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+<the Co-Authored-By trailer your session's commit-attribution instructions give, if any>
 EOF
 )"
 ```
@@ -116,11 +116,36 @@ After committing, ask: "session has room — continue into decompose mode now, h
 - **Continue inline** → switch to `decompose-mode.md`.
 - **Hand off to a sibling decompose session** → spawn it and exit rather than continuing or blocking on it (the generalized handoff pattern documented in `skills/spawn/SKILL.md`, worked for this case):
   1. Invoke `skills/spawn/spawn-claude.sh` with `CLAUDE_SPAWN_MODE=sibling` set in the environment, `run_in_background=true`, `skip_permissions=true`, `cwd` = the repo root, `title` following the convention `prd:<project> <slug>-decompose`, and a self-contained prompt naming the committed PRD by absolute path — e.g. `/prd decompose the committed PRD at <abs-path>` — never a contextual reference back to this conversation.
-  2. Write this session's own result.md: `outcome: handed-off`, `changed` = the PRD's commit sha/path, `action_needed: none`, and prose noting the decompose is now running as a sibling session (name/point at it). Write this to `$CLAUDE_SPAWN_RESULT_FILE` **only** when that env var is set — a human-launched author root has none, so skip fail-soft otherwise.
+  2. Write this session's own result.md: `outcome: handed-off`, `changed` = the PRD's commit sha/path, `action_needed: none`, and prose noting the decompose is now running as a sibling session (name/point at it). Write this to `$CLAUDE_SPAWN_RESULT_FILE` when that env var is set. When it is unset, resolve the result file through `PYTHONPATH=$DARK_FACTORY_ROOT/orchestrator/src python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/spawn_t3_lane.py self-record` (a T3-spawned session has no spawn env vars; it prints `slug=<slug|none> parent=<slug|none>`, and the result file is `<fleet_root>/sessions/<slug>/result.md`, `fleet_root` defaulting to `~/.claude/fleet` unless `$CLAUDE_FLEET_ROOT` is set). Skip fail-soft only when it prints `slug=none` — a human-launched author root.
   3. Exit cleanly.
 
   Only after the Stage 10 commit — the PRD must be on disk before the sibling decompose session can reference it.
 - **Stop without spawning** → write a hand-off note summarizing what was authored and what's pending.
+
+## Code anchors in PRD prose — cite by symbol; date any hard anchor
+
+Applies to **all PRD-family prose**: the PRD `.md`, its `.capability-manifest.md`, and the `.yaml` sidecar. This generalizes the `delivered_check` anchoring rule in `decompose-mode.md` (*"Pattern-anchored, never `file:line`"*) from mechanical checks up to the documents themselves — the same failure mode one layer out: a line number is true only against the commit it was read at, and nothing re-checks it afterwards.
+
+**Default form.** Cite the **symbol** (a function, type, method, constant, or config key), the **file**, or the **section-banner name** — never `path:line`. A symbol or banner is greppable and survives edits above it; a line number does not.
+
+**Escape hatch.** A hard `path:line` anchor is permitted only when the document's header carries an **as-of commit SHA + date** covering it. Canonical form:
+
+> **Code anchors** verified against main `<sha>` (`<YYYY-MM-DD>`). Main moves fast — cite-by-symbol; re-locate lines at implementation time.
+
+Asserting that line numbers are current *without* a SHA is forbidden: that claim is unfalsifiable at read time and decays silently. **[overlay]** may name an in-corpus exemplar header to imitate.
+
+**Never re-anchor a dated snapshot.** Once a document — or a frozen AS-AUTHORED half of one — is stamped as-of a commit, its anchors are dated **provenance**: do not re-measure them later. Refreshing a snapshot destroys its value as a record. Staleness in a stamped document is repaired by freezing the stale half and moving any still-live claim *out* of it, never by re-anchoring the frozen half itself.
+
+**The rule** (author mode Stage 2 and Stage 10; decompose mode Step 1 re-walk): reject/fix an undated `path:line` anchor **that this session itself introduces or edits**, before saving (author) or before filing the batch (decompose).
+
+Scoped to the session's own edits deliberately, on both sides:
+
+- An unscoped sweep turns decomposing any pre-existing PRD into an unbounded de-numbering job — a gate that expensive gets routed around rather than applied.
+- The cheap-looking alternative — retro-stamping an as-of SHA over anchors nobody re-located — manufactures exactly the false provenance **Never re-anchor a dated snapshot** forbids. A retro-stamp is strictly *worse* than a bare undated anchor: it converts "unknown vintage" into a confident lie.
+
+A legacy undated anchor in a document the session does not otherwise touch is **not** a batch blocker.
+
+**Enforcement posture.** No deterministic guard automates this — the /prd session reading this section *is* the enforcement, at author Stage 2 / Stage 10 and again at the decompose Step 1 re-walk. **[overlay]** may name a project's retrospective detector and its build status; absent one, this section is the sole enforcement.
 
 ## PRD section template (content-matched, not literal)
 

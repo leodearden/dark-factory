@@ -26,7 +26,24 @@ Three independent early-return gates in :func:`check`:
    :func:`is_terminal_annotation_exempt` — the single-parse combined form of
    the two predicates. It never loosens Gates 2/3.
 2. ``op == 'set_task_status'`` AND a live workflow is detected for the task
-   -> ``ReconLiveWorkflowWriteRejected``.
+   -> ``ReconLiveWorkflowWriteRejected``. The caller's ``live_status``,
+   (optionally) the task's ``task_metadata`` and (optionally) the caller's
+   full ``task_snapshot`` are forwarded to the detector as
+   ``status``/``task_kind``/``pure_gate``/``corroborated``, so the
+   project-wide orchestrator-lock signal is dropped for tasks it is not
+   evidence for (task 3751) and an in-progress task whose only "live"
+   signals are a lingering worktree registration and that same lock is
+   downgraded when no fresh per-task signal corroborates it (task 2964 —
+   see :func:`check`'s Gate 2 paragraph). Those four renderer-shared inputs
+   are exactly the tuple ``reconciliation/live_workflow_section.py``'s
+   ``render_live_workflow_section`` passes, which is the invariant task
+   2964 exists to establish: the render-time Live-Workflow Signals section
+   must never call a task not-live while this gate rejects writes to it.
+   Gate 2 adds one Gate-2-only input (task 8330): ``dependency_statuses``,
+   read by :func:`read_dependency_statuses`, feeds the detector's rule 6. The
+   remaining disagreement therefore runs one way only: the renderer can
+   over-report such a task as live, never under-report it. Parity is task
+   8385.
 3. ``snapshot_token is not None`` AND it disagrees with ``live_status``
    (op-agnostic) -> ``ReconStaleSnapshotRejected``.
 
@@ -44,13 +61,29 @@ function that always runs its gates when called.
 
 from __future__ import annotations
 
-import json
+import asyncio
+import logging
+from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Literal
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Literal, Protocol
 
+from shared.scheduler_state import SchedulerStateSnapshot
+from shared.task_fields import dependency_ids as task_dependency_ids
 from shared.task_statuses import TERMINAL as TERMINAL_STATUSES
 
-from fused_memory.services.live_workflow_detector import is_workflow_live_for_task
+from fused_memory.mcp_tools.scheduler_state import read_scheduler_state
+from fused_memory.middleware.metadata_dict import raw_metadata_dict
+from fused_memory.services.live_workflow_detector import (
+    corroboration_for_task,
+    is_pure_gate_metadata,
+    is_unclaimed_awaiting_dependency,
+    is_workflow_live_for_task,
+)
+from fused_memory.services.orchestrator_detector import orchestrator_started_at
+
+logger = logging.getLogger(__name__)
 
 # Metadata keys carrying the snapshot status a recon-stage caller observed
 # before writing. Promoted (Open Q3) from
@@ -253,11 +286,55 @@ def _reject(
 
 
 # ---------------------------------------------------------------------------
+# read_dependency_statuses() (task 8330)
+# ---------------------------------------------------------------------------
+
+
+class DependencyStatusReader(Protocol):
+    """The slice of ``TaskBackendProtocol`` that :func:`read_dependency_statuses` needs."""
+
+    async def get_statuses_raw(
+        self, project_root: str, tag: str | None = None, ids: list[str] | None = None,
+    ) -> dict[str, str]: ...
+
+
+async def read_dependency_statuses(
+    reader: DependencyStatusReader,
+    task_snapshot: object,
+    *,
+    project_root: str,
+    tag: str | None,
+) -> Mapping[str, str] | None:
+    """Read the statuses of *task_snapshot*'s dependencies for :func:`check`'s Gate 2.
+
+    One batch read, and none at all for a non-dict snapshot or a task with no
+    dependency ids. Returns ``None`` in those cases and, logged at WARNING,
+    when the read raises; ``None`` leaves detector rule 6 inert, so a failure
+    fails safe toward live.
+    """
+    if not isinstance(task_snapshot, dict):
+        return None
+    dep_ids = task_dependency_ids(task_snapshot)
+    if not dep_ids:
+        return None
+    try:
+        return await reader.get_statuses_raw(project_root, tag=tag, ids=dep_ids)
+    except Exception:
+        logger.warning(
+            'recon_write_policy.read_dependency_statuses: dependency status read failed '
+            'for task_id=%s; rule 6 stays inert (fail-safe toward live)',
+            task_snapshot.get('id'),
+            exc_info=True,
+        )
+        return None
+
+
+# ---------------------------------------------------------------------------
 # check()
 # ---------------------------------------------------------------------------
 
 
-def check(
+async def check(
     op: str,
     *,
     task_id: str,
@@ -267,12 +344,27 @@ def check(
     live_status: str,
     snapshot_token: str | None,
     is_annotation_clear: bool = False,
+    task_metadata: object = None,
+    task_snapshot: object = None,
+    dependency_statuses: Mapping[str, str] | None = None,
 ) -> Verdict:
     """Decide whether a recon-stage caller may perform *op* on *task_id*.
 
     Pure function — always runs its gates; the recon-stage scoping
     (``agent_id.startswith('recon-stage-')``) lives at the call site in
     ``task_interceptor.py``, not here.
+
+    ASYNC, and intrinsically non-blocking (task 3778). Gate 2's
+    :func:`~fused_memory.services.live_workflow_detector.is_workflow_live_for_task`
+    is a coroutine function — its three git probes await
+    :func:`shared.git_async.run_git` instead of shelling out with a blocking
+    ``subprocess.run`` — and Gate 2's remaining blocking work (the two on-disk
+    reads inside :func:`_corroboration_verdict`) is offloaded here via
+    ``asyncio.to_thread``. Callers therefore ``await check(...)`` directly:
+    both ``task_interceptor`` call sites previously differed (``set_task_status``
+    wrapped the whole call in ``asyncio.to_thread``, ``update_task`` called it
+    inline), and that asymmetry is gone. Gates 1 and 3 remain pure, allocation-
+    free comparisons and never yield.
 
     Gate 1 (terminal): ``op == 'update_task'`` AND ``live_status`` is
     terminal (done/cancelled) AND NOT ``is_annotation_clear`` ->
@@ -295,6 +387,101 @@ def check(
     suppressed for tasks in a status the orchestrator never actively
     dispatches (done/cancelled/deferred) — see
     ``live_workflow_detector.ORCH_LIVE_INELIGIBLE_STATUSES``.
+
+    ``task_metadata`` (task 3751) is the task's raw ``metadata`` payload, as
+    the caller already holds it. It is OPTIONAL and defaults to ``None``, in
+    which case the derived ``task_kind=None`` / ``pure_gate=False``
+    reproduce the prior behavior EXACTLY — every caller that does not pass
+    it is unaffected. It is resolved once through
+    :func:`fused_memory.middleware.metadata_dict.raw_metadata_dict`
+    (anything unreadable — invalid JSON, a list, a number — reads as empty
+    and is logged), so a malformed blob fails safe TOWARD live rather than
+    raising. The coercion happens only inside the
+    ``set_task_status`` branch, so no other gate pays for it. Two detector
+    inputs are derived from it:
+
+    * ``task_kind`` — forwarding this makes ``live_workflow_detector``'s
+      PRE-EXISTING rule 2 (blocked + deterministic, task 2067) reachable
+      from this gate for the first time, but is BEHAVIOR-PRESERVING here.
+      It widens nothing, for two reasons:
+
+      1. Rule 3 (blocked + normal/absent + no git evidence, task 2409) was
+         already reachable. Its task_kind clause is ``task_kind in (None,
+         NORMAL_TASK_KIND)``, and the previously-omitted kwarg defaulted to
+         ``None`` — so a blocked task with no worktree and no recent commit
+         was already exempt from the bare orchestrator lock at this gate,
+         before any metadata was plumbed through.
+      2. Rule 2's only delta over rule 3 is being unconditional on the git
+         signals, i.e. it also fires when a worktree or recent commit
+         exists. This gate consumes only
+         :func:`~fused_memory.services.live_workflow_detector.is_workflow_live_for_task`
+         — ``is_live = worktree_registered or recent_commit or
+         orchestrator_live`` — so in exactly that case ``is_live`` stays
+         True on the per-task evidence and the write is still rejected.
+         Rule 2 zeroes ``orchestrator_live``, which this gate never reads
+         on its own.
+
+      The one narrowing is that a blocked task carrying some THIRD
+      ``task_kind`` value (neither ``'normal'`` nor ``'deterministic'``)
+      no longer matches rule 3's clause, so it keeps the lock — the
+      fail-safe-toward-live direction. All of the above is pinned by
+      ``TestGate2TaskKindForwardingIsBehaviorPreserving`` in
+      tests/test_recon_write_policy.py, including the differential
+      worktree case, so the argument fails loudly if a detector rule
+      changes underneath it.
+    * ``pure_gate`` — :func:`is_pure_gate_metadata`, carrying task 3751's
+      rule 5 (pending + deterministic + pure gate). This is the ONLY
+      behavior change task 3751 makes at this gate. A pure gate
+      (``always_escalates`` truthy, no ``before_done``) never acquires a
+      worktree or branch, so the bare lock is never evidence for it; a
+      pending deterministic task WITH ``before_done`` keeps the signal
+      because it may be mid-deploy inside ``DeterministicRunner``. See
+      :func:`is_pure_gate_metadata` for the residual escalate-then-block
+      write window this accepts.
+
+    ``task_snapshot`` (task 2964) is the caller's FULL task dict, from which
+    :func:`_corroboration_verdict` derives the detector's ``corroborated``
+    input. It is a SEPARATE kwarg from ``task_metadata``, not a widening of
+    it, for two reasons: (1) corroboration reads TOP-LEVEL
+    ``claimant_run_id``/``heartbeat_at``, which a ``metadata`` payload
+    structurally cannot supply; (2) ``task_metadata``'s task-3751 contract
+    deliberately accepts a JSON-object *string* and is resolved by
+    :func:`fused_memory.middleware.metadata_dict.raw_metadata_dict` — a
+    contract a task dict does not satisfy
+    and which this task leaves completely untouched. The two are expected
+    to come from ONE snapshot (``task_interceptor`` passes the same
+    ``before`` dict it already read ``live_status`` and ``task_metadata``
+    from, under its write lock), so status, metadata and claimant can never
+    disagree. Both are optional and default to ``None``.
+
+    The corroboration gate is IN-PROGRESS-ONLY, mirroring
+    ``render_live_workflow_section``'s ``task.get('status') ==
+    'in-progress'`` guard. It exists because for an in-progress task killed
+    by a fleet redeploy the git worktree registration lingers and the
+    restarted orchestrator re-acquires the project-wide lock, so
+    ``worktree_registered or orchestrator_live`` keeps asserting liveness
+    with no ``recent_commit``. Post-task-2963 the renderer downgrades that
+    shape to indeterminate and drops it, while this gate still saw
+    ``is_live=True`` and rejected the recon-stage re-pend write — the task
+    599/600 divergence (Stage 2 guard-rejected task 599 for 5 consecutive
+    cycles, run dbfa3df8-0d7d-40e6-bc4a-bc30cce38228, while the renderer no
+    longer considered it live). Forwarding ``corroborated`` closes it.
+
+    Every error path fails safe TOWARD live: a non-``Mapping`` snapshot, an
+    absent one, a non-in-progress status, an unreadable
+    ``scheduler_state.json``/``orchestrator.lock``, or a raising assembler
+    all yield ``corroborated=None``, which leaves the detector's gate
+    byte-for-byte inert (it fires only on ``corroborated is False``) and so
+    the write is still rejected. ``None`` and ``False`` are therefore NOT
+    interchangeable here. Only an explicit ``False`` — the caller positively
+    found no fresh per-task signal — changes this gate's verdict.
+
+    ``dependency_statuses`` (task 8330) is the ``{dep_id: status}`` map of the
+    task's dependencies, normally from :func:`read_dependency_statuses`. With
+    ``task_snapshot`` it feeds :func:`is_unclaimed_awaiting_dependency`, whose
+    verdict is forwarded as ``unclaimed_awaiting_dependency`` and keys
+    detector rule 6, which drops the bare lock for a task the scheduler will
+    not dispatch. An absent or unreadable map leaves the rule inert.
 
     Gate 3 (stale snapshot, op-agnostic, checked last): ``snapshot_token is
     not None`` AND it disagrees with ``live_status`` ->
@@ -331,30 +518,60 @@ def check(
             corrective_path=TERMINAL_CORRECTIVE_PATH,
         )
 
-    if op == 'set_task_status' and is_workflow_live_for_task(
-        task_id, project_root, status=live_status,
-    ):
-        return _reject(
-            op=op,
-            task_id=task_id,
-            agent_id=agent_id,
-            error_type='ReconLiveWorkflowWriteRejected',
-            reason=(
-                f'recon-stage write blocked: task {task_id} has a live '
-                'workflow (worktree/branch or orchestrator lock active); '
-                'recon-stage agents may not write status while a workflow '
-                'is live.'
-            ),
-            hint=(
-                'A live orchestrator workflow (worktree, recent commit, or '
-                'project-level lock) is active for this task. Recon-stage '
-                'status writes would race the pipeline and are rejected; '
-                'wait for the workflow to complete.'
-            ),
-            live_status=live_status,
-            target_status=target_status,
-            snapshot_token=snapshot_token,
+    if op == 'set_task_status':
+        # Derived inside this branch only — no other gate pays for the
+        # coercion. `raw_metadata_dict` reads anything that is not a dict /
+        # JSON-object string as empty, so a malformed or absent blob
+        # degrades to task_kind=None / pure_gate=False: fail-safe TOWARD
+        # live. See this function's Gate 2 docstring paragraph for what the
+        # two derived values unlock (detector rules 2/3/5/6).
+        parsed_metadata = raw_metadata_dict(task_metadata, source='recon_write_policy.check')
+        # Per-task corroboration (task 2964). Computed inside this branch only,
+        # and only for an in-progress task — see _corroboration_verdict and this
+        # function's Gate 2 docstring paragraph. It performs two blocking on-disk
+        # reads (scheduler_state.json, orchestrator.lock). Until task 3778 those
+        # rode the asyncio.to_thread hop task_interceptor wrapped the whole
+        # check() call in, for the sake of Gate 2's then-blocking git I/O. That
+        # hop is gone — the git probes are natively async now — so the offload
+        # moves HERE, to the one call that still blocks. Without it, removing
+        # the hop would have quietly relocated two synchronous file reads per
+        # recon status write onto the event loop.
+        corroborated = await asyncio.to_thread(
+            _corroboration_verdict,
+            task_id, project_root, live_status, task_snapshot,
         )
+        if await is_workflow_live_for_task(
+            task_id,
+            project_root,
+            status=live_status,
+            task_kind=parsed_metadata.get('task_kind'),
+            pure_gate=is_pure_gate_metadata(parsed_metadata),
+            unclaimed_awaiting_dependency=is_unclaimed_awaiting_dependency(
+                task_snapshot, dependency_statuses,
+            ),
+            corroborated=corroborated,
+        ):
+            return _reject(
+                op=op,
+                task_id=task_id,
+                agent_id=agent_id,
+                error_type='ReconLiveWorkflowWriteRejected',
+                reason=(
+                    f'recon-stage write blocked: task {task_id} has a live '
+                    'workflow (worktree/branch or orchestrator lock active); '
+                    'recon-stage agents may not write status while a workflow '
+                    'is live.'
+                ),
+                hint=(
+                    'A live orchestrator workflow (worktree, recent commit, or '
+                    'project-level lock) is active for this task. Recon-stage '
+                    'status writes would race the pipeline and are rejected; '
+                    'wait for the workflow to complete.'
+                ),
+                live_status=live_status,
+                target_status=target_status,
+                snapshot_token=snapshot_token,
+            )
 
     if snapshot_token is not None and snapshot_token != live_status:
         return _reject(
@@ -395,32 +612,80 @@ def check(
 # ---------------------------------------------------------------------------
 
 
-def _coerce_metadata_dict(metadata: object) -> dict | None:
-    """Coerce an ``update_task``-style ``metadata`` payload to a ``dict``.
+def _corroboration_verdict(
+    task_id: str,
+    project_root: str,
+    live_status: str,
+    task_snapshot: object,
+) -> bool | None:
+    """Derive :func:`check`'s Gate 2 ``corroborated`` detector input (task 2964).
 
-    Shared coercion idiom (factored out of :func:`extract_snapshot_token`,
-    task 2684) mirroring ``_reject_done_provenance_in_update_metadata``'s
-    inline coercion in ``task_interceptor.py``. A ``dict`` passes through
-    unchanged; a ``str`` is parsed via ``json.loads`` and kept only if the
-    result is itself a ``dict``. Anything else — including a JSON string
-    that parses to a non-dict (e.g. a list), invalid JSON, or a non-str/dict
-    value such as ``None`` or ``42`` — returns ``None``.
+    Structurally mirrors ``reconciliation/live_workflow_section.py``'s
+    ``render_live_workflow_section`` — the reference implementation this gate
+    is being made to agree with: guard on ``status == 'in-progress'``, read the
+    two per-project corroboration inputs, delegate to
+    :func:`~fused_memory.services.live_workflow_detector.corroboration_for_task`,
+    and swallow every error to ``None`` (logged at WARNING here, so the
+    fallback is never silent).
+
+    Returns ``None`` — leaving the detector's corroboration gate byte-for-byte
+    inert — unless *live_status* is ``'in-progress'`` AND *task_snapshot* is a
+    ``Mapping``. Otherwise returns the assembler's verdict: ``True`` when at
+    least one fresh per-task signal (live claimant/heartbeat, scheduler
+    holder/park, or a routing decision postdating the orchestrator's restart)
+    corroborates the workflow, ``False`` when none does.
+
+    The two on-disk reads are per-project constants for this call, each wrapped
+    fail-safe to ``None``: ``read_scheduler_state`` (which already returns
+    ``SchedulerStateSnapshot.empty()`` for an absent/invalid file) and ``orchestrator_started_at``
+    (the restart boundary parsed from the lock's ``started <ISO>`` token). Both
+    are blocking, which is why :func:`check` dispatches this function through
+    ``asyncio.to_thread`` (task 3778). It deliberately stays SYNCHRONOUS: an
+    ``async def`` here would advertise a non-blocking contract that two
+    ``open()`` calls cannot honour, and would put the burden of remembering the
+    offload on every future caller instead of on the one that exists.
+
+    Fail-safe direction is TOWARD live at every exit: ``None`` on a non-Mapping
+    or absent snapshot, on any non-in-progress status, and on any exception, so
+    a malformed input can never turn this gate into a new way to slip a
+    recon-stage write past a genuinely live workflow.
     """
-    if isinstance(metadata, dict):
-        return metadata
-    if isinstance(metadata, str):
-        try:
-            loaded = json.loads(metadata)
-        except (ValueError, TypeError):
-            return None
-        return loaded if isinstance(loaded, dict) else None
-    return None
+    if live_status != 'in-progress' or not isinstance(task_snapshot, Mapping):
+        return None
+
+    try:
+        scheduler_state: SchedulerStateSnapshot | None = read_scheduler_state(Path(project_root))
+    except Exception:
+        scheduler_state = None
+    try:
+        orch_started: datetime | None = orchestrator_started_at(project_root)
+    except Exception:
+        orch_started = None
+
+    try:
+        return corroboration_for_task(
+            task_snapshot,
+            task_id,
+            now=datetime.now(UTC),
+            scheduler_state=scheduler_state,
+            orchestrator_started_at=orch_started,
+        )
+    except Exception:
+        logger.warning(
+            'recon_write_policy._corroboration_verdict: corroboration assembler '
+            'error for task_id=%s; falling back to corroborated=None (gate inert, '
+            'fail-safe toward live)',
+            task_id,
+            exc_info=True,
+        )
+        return None
 
 
 def extract_snapshot_token(metadata: object) -> str | None:
     """Extract the snapshot status token from ``update_task``'s ``metadata`` kwarg.
 
-    Coerces *metadata* via :func:`_coerce_metadata_dict`. Returns the value
+    Resolves *metadata* through
+    :func:`fused_memory.middleware.metadata_dict.raw_metadata_dict`. Returns the value
     of the first :data:`SNAPSHOT_TOKEN_KEYS` entry present, when that value
     is itself a non-empty ``str``. Returns ``None`` when *metadata* is not a
     dict / JSON-object string, contains neither key, or the first present
@@ -428,9 +693,7 @@ def extract_snapshot_token(metadata: object) -> str | None:
     bool) — such values are treated as an absent token rather than coerced
     via ``str()``, so they can never spuriously disagree with a live status.
     """
-    parsed = _coerce_metadata_dict(metadata)
-    if parsed is None:
-        return None
+    parsed = raw_metadata_dict(metadata, source='recon_write_policy.extract_snapshot_token')
     for key in SNAPSHOT_TOKEN_KEYS:
         if key in parsed:
             val = parsed[key]
@@ -470,8 +733,9 @@ def _pure_terminal_annotation_merge(update_kwargs: dict) -> dict | None:
         load-bearing keys; ``additive`` cannot overwrite/clear the target key
         (scalar-collision old-wins) — only ``merge`` both preserves other keys
         and overwrites the target.
-    (c) ``update_kwargs['metadata']`` coerces (via :func:`_coerce_metadata_dict`)
-        to a non-empty ``dict`` — the dict returned on success.
+    (c) ``update_kwargs['metadata']`` resolves (via
+        :func:`fused_memory.middleware.metadata_dict.raw_metadata_dict`) to a
+        non-empty ``dict`` — the dict returned on success.
     """
     if any(
         key not in _ANNOTATION_CLEAR_ALLOWED_KWARGS and value is not None
@@ -485,7 +749,9 @@ def _pure_terminal_annotation_merge(update_kwargs: dict) -> dict | None:
     if not is_merge_mode:
         return None
 
-    parsed = _coerce_metadata_dict(update_kwargs.get('metadata'))
+    parsed = raw_metadata_dict(
+        update_kwargs.get('metadata'), source='recon_write_policy.terminal_annotation_merge'
+    )
     if not parsed:
         return None
 

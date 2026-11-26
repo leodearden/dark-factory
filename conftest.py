@@ -4,12 +4,27 @@ Also pre-imports the subproject packages so pytest's importlib-mode collection
 does not register them as namespace packages (which would shadow the real
 package and break `from <subproject>.foo import ...`).
 """
+import contextlib
 import sys
 from pathlib import Path
 
 import pytest
 
-_ROOT = Path(__file__).parent
+# APPEND, never insert(0, ...): the repo root must stay LAST on sys.path, or the
+# subproject directories (orchestrator/, shared/, dashboard/, ...) resolve as
+# namespace packages pointing at the project folder instead of src/<pkg>/ —
+# precisely the failure this module's docstring exists to prevent. The src dirs
+# inserted below therefore always win.
+if str(_ROOT := Path(__file__).parent) not in sys.path:
+    sys.path.append(str(_ROOT))
+
+from df_pytest_isolation import (
+    arm_fleet_dir_isolation,
+    arm_leaked_drain_process_guard,
+    arm_test_root_isolation,
+    reject_unsafe_basetemp,
+)
+
 for subproject in [
     'cockpit', 'dashboard', 'escalation', 'fused-memory', 'orchestrator', 'sampler', 'shared',
 ]:
@@ -21,15 +36,22 @@ for subproject in [
 # register the subproject directory (e.g. dashboard/) as a namespace package
 # pointing at the project folder instead of its src/<name>/ subtree.
 for pkg_name in ['cockpit', 'dashboard', 'escalation', 'orchestrator', 'sampler', 'shared']:
-    try:
+    with contextlib.suppress(ImportError):
         __import__(pkg_name)
-    except ImportError:
-        pass
 # fused-memory's package is fused_memory (underscore)
-try:
+with contextlib.suppress(ImportError):
     __import__('fused_memory')
-except ImportError:
-    pass
+
+
+def pytest_configure(config):
+    """Refuse a --basetemp aimed inside a live task worktree (esc-3072-3), then arm the defences.
+
+    df_pytest_isolation.py's module docstring says what each armed defence guards against.
+    """
+    reject_unsafe_basetemp(config)
+    arm_test_root_isolation(config)
+    arm_fleet_dir_isolation(config)
+    arm_leaked_drain_process_guard(config)
 
 
 @pytest.fixture(autouse=True)

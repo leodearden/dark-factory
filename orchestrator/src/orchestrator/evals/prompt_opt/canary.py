@@ -146,7 +146,7 @@ def load_window_rows(
     same half-open-range convention
     ``dashboard.data.performance`` uses. Read-only sync ``sqlite3`` — no
     durability pragmas needed, mirroring
-    ``reviewer_trial.__main__._fetch_titles`` /
+    ``reviewer_trial.mining.fetch_task_titles`` /
     ``reviewer_trial.mining.mine_fn_candidates``.
 
     The numeric columns are declared with a schema ``DEFAULT``, but that
@@ -162,7 +162,7 @@ def load_window_rows(
     ``fused_memory.mcp_tools.scheduler_state.read_scheduler_events`` uses
     for this same ``runs.db``. A plain ``sqlite3.connect(str(db_path))``
     would silently CREATE an empty database file when *db_path* doesn't
-    exist — masking a misconfigured ``--runs-db``/``PROMPT_OPT_RUNS_DB``
+    exist — masking a misconfigured ``--runs-db``
     path (a caller that bypasses the CLI's own ``is_file()`` pre-check) as
     an innocuous empty-window result instead of failing loud — and would
     take a write-capable handle against a live ``runs.db`` a separate

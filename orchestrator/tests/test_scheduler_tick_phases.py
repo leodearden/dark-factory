@@ -10,15 +10,18 @@ suite that exercises full ticks end-to-end.
 import dataclasses
 import inspect
 from datetime import UTC, datetime, timedelta
+from typing import cast
 from unittest.mock import AsyncMock
 
 import pytest
 from _recording_event_store import _RecordingEventStore
 from shared.psi import PsiSample
 
-from orchestrator.config import OrchestratorConfig
-from orchestrator.overrides import OverrideRow, OverrideStore
-from orchestrator.scheduler import _CONTINUE, Scheduler, TickContext, TickOutcome
+from orchestrator.config import OrchestratorConfig, PsiAdmissionConfig, apply_reload
+from orchestrator.event_store import EventStore
+from orchestrator.overrides import OverrideRow, OverrideSource, OverrideStore
+from orchestrator.pause_policy import PauseClass
+from orchestrator.scheduler import _CONTINUE, PsiHold, Scheduler, TickContext, TickOutcome
 
 
 @pytest.fixture
@@ -64,7 +67,7 @@ class TestTickContextShape:
         assert default_ctx.candidates == []
         assert default_ctx.gated_ids == set()
         assert default_ctx.stale_ids == set()
-        assert default_ctx.psi_hold is False
+        assert default_ctx.psi_hold is None
         assert default_ctx.dispatch_deferred_emitted is False
 
 
@@ -121,7 +124,7 @@ class TestHygienePhases:
         # A non-delivered streak for the same dependent — must STILL be GC'd.
         scheduler._streak_local_backfill.counts[('10', '9')] = 2
         # '10' is tracked (pending-age anchor) but drops out of the fetch.
-        scheduler._pending_anchor['10'] = 10
+        scheduler.age_anchors.observe([{'id': '10', 'status': 'pending'}], max_id=10)
 
         ctx = TickContext(
             tasks=[],
@@ -138,7 +141,7 @@ class TestHygienePhases:
         assert scheduler._streak_local_backfill.value(('10', '9')) == 0
         # Bookkeeping cleanup preserved — '10' is still stale-swept.
         assert '10' in ctx.stale_ids
-        assert '10' not in scheduler._pending_anchor
+        assert '10' not in scheduler.age_anchors.tracked_ids()
 
     @pytest.mark.asyncio
     async def test_phase_stale_sweep_still_gcs_delivered_streaks_on_terminal_status(
@@ -148,7 +151,7 @@ class TestHygienePhases:
         GC'd — the protection is narrowed to non-terminal transient absence,
         not a blanket exemption (task 2743)."""
         scheduler._streak_delivered_fail.counts[('11', '21')] = 2
-        scheduler._pending_anchor['11'] = 11
+        scheduler.age_anchors.observe([{'id': '11', 'status': 'pending'}], max_id=11)
 
         ctx = TickContext(
             tasks=[],
@@ -161,7 +164,7 @@ class TestHygienePhases:
         # Terminal → still cleaned up (no leak on genuine completion).
         assert scheduler._streak_delivered_fail.value(('11', '21')) == 0
         assert '11' in ctx.stale_ids
-        assert '11' not in scheduler._pending_anchor
+        assert '11' not in scheduler.age_anchors.tracked_ids()
 
     @pytest.mark.asyncio
     async def test_phase_stale_sweep_protects_external_streaks_on_transient_absence(
@@ -183,7 +186,7 @@ class TestHygienePhases:
         scheduler._streak_hold.counts['10'] = 2
         scheduler._streak_local_backfill.counts[('10', '9')] = 2
         # '10' is tracked (pending-age anchor) but drops out of the fetch.
-        scheduler._pending_anchor['10'] = 10
+        scheduler.age_anchors.observe([{'id': '10', 'status': 'pending'}], max_id=10)
 
         ctx = TickContext(
             tasks=[],
@@ -201,7 +204,7 @@ class TestHygienePhases:
         assert scheduler._streak_local_backfill.value(('10', '9')) == 0
         # Bookkeeping cleanup preserved — '10' is still stale-swept.
         assert '10' in ctx.stale_ids
-        assert '10' not in scheduler._pending_anchor
+        assert '10' not in scheduler.age_anchors.tracked_ids()
 
     @pytest.mark.asyncio
     async def test_phase_stale_sweep_still_gcs_external_streaks_on_terminal_status(
@@ -213,7 +216,7 @@ class TestHygienePhases:
         (task 2746)."""
         scheduler._streak_external_unresolved.counts[('11', 'dark_factory:5')] = 2
         scheduler._streak_resolver_degraded.counts['11'] = 2
-        scheduler._pending_anchor['11'] = 11
+        scheduler.age_anchors.observe([{'id': '11', 'status': 'pending'}], max_id=11)
 
         ctx = TickContext(
             tasks=[],
@@ -227,7 +230,7 @@ class TestHygienePhases:
         assert scheduler._streak_external_unresolved.value(('11', 'dark_factory:5')) == 0
         assert scheduler._streak_resolver_degraded.value('11') == 0
         assert '11' in ctx.stale_ids
-        assert '11' not in scheduler._pending_anchor
+        assert '11' not in scheduler.age_anchors.tracked_ids()
 
     @pytest.mark.asyncio
     async def test_phase_cooldown_gc_drops_expired(self, scheduler: Scheduler):
@@ -379,7 +382,7 @@ class TestPolicySelectionPrepPhases:
         }
         reserve_row = OverrideRow(
             boost_tier=None, pinned=False, pin_order=None, reserve_now=True,
-            ttl_until=None,
+            ttl_until=None, source=OverrideSource.OPERATOR,
         )
         ctx = TickContext(
             tasks=[task],
@@ -412,7 +415,7 @@ class TestPolicySelectionPrepPhases:
 
         row = OverrideRow(
             boost_tier='high', pinned=False, pin_order=None, reserve_now=False,
-            ttl_until=None,
+            ttl_until=None, source=OverrideSource.OPERATOR,
         )
         ctx = TickContext(
             tasks=[], status_map={}, tasks_by_id={},
@@ -442,7 +445,7 @@ class TestPolicySelectionPrepPhases:
 
         row = OverrideRow(
             boost_tier='high', pinned=False, pin_order=None, reserve_now=False,
-            ttl_until=None,
+            ttl_until=None, source=OverrideSource.OPERATOR,
         )
         ctx = TickContext(
             tasks=[], status_map={}, tasks_by_id={},
@@ -615,7 +618,7 @@ class TestSelectionPhases:
         }
         pinned_row = OverrideRow(
             boost_tier=None, pinned=True, pin_order=0, reserve_now=False,
-            ttl_until=None,
+            ttl_until=None, source=OverrideSource.OPERATOR,
         )
         ctx = TickContext(
             tasks=[task],
@@ -647,7 +650,7 @@ class TestSelectionPhases:
         }
         unpinned_row = OverrideRow(
             boost_tier=None, pinned=False, pin_order=None, reserve_now=False,
-            ttl_until=None,
+            ttl_until=None, source=OverrideSource.OPERATOR,
         )
         ctx = TickContext(
             tasks=[task],
@@ -675,7 +678,9 @@ class TestSelectionPhases:
         defers its own heavy candidate against the SAME ctx — exactly one
         event per tick, as when both loops lived in one method body."""
         event_store = _RecordingEventStore()
-        config = OrchestratorConfig(max_per_module=1)
+        config = OrchestratorConfig(
+            max_per_module=1, psi_admission=PsiAdmissionConfig(cpu_some_avg10=85.0),
+        )
         store = OverrideStore(tmp_path / 'o.db')
         scheduler = Scheduler(config, event_store=event_store, override_store=store)  # type: ignore[arg-type]
         scheduler.finish_startup()
@@ -691,7 +696,7 @@ class TestSelectionPhases:
         }
         pinned_row = OverrideRow(
             boost_tier=None, pinned=True, pin_order=0, reserve_now=False,
-            ttl_until=None,
+            ttl_until=None, source=OverrideSource.OPERATOR,
         )
         ctx = TickContext(
             tasks=[pinned_task, scored_task],
@@ -700,11 +705,15 @@ class TestSelectionPhases:
             candidates=[scored_task],
             overrides={'P': pinned_row},
             effective_priorities={'P': 'medium', 'S': 'medium'},
-            psi_sample=PsiSample(
-                cpu_some10=90.0, mem_some10=0.0, mem_full10=0.0,
-                io_some10=0.0, read_ok=True,
+            psi_hold=PsiHold(
+                metric='cpu_some_avg10',
+                sample=PsiSample(
+                    cpu_some10=90.0, mem_some10=0.0, mem_full10=0.0,
+                    io_some10=0.0, read_ok=True,
+                ),
+                in_flight=1,
+                floor=1,
             ),
-            psi_hold=True,
         )
 
         pins_result = await scheduler._phase_select_pins(ctx)
@@ -734,20 +743,73 @@ class TestSelectionPhases:
         """DA-D6 fail-open: an unreadable PSI sample (``read_ok=False``) must
         never hold dispatch, even though every raw metric looks saturated —
         ``saturated()`` is unconditionally False when ``read_ok`` is False."""
-        scheduler._read_psi_sample = lambda: PsiSample(
-            cpu_some10=99.0, mem_some10=99.0, mem_full10=99.0, io_some10=99.0,
-            read_ok=False,
-        )
+        reads: list[PsiSample] = []
+
+        def _unreadable() -> PsiSample:
+            reads.append(PsiSample(
+                cpu_some10=99.0, mem_some10=99.0, mem_full10=99.0, io_some10=99.0,
+                read_ok=False,
+            ))
+            return reads[-1]
+
+        scheduler._read_psi_sample = _unreadable
         scheduler._dispatched.update({'X', 'Y'})  # in_flight >= min_inflight_floor
         ctx = TickContext(tasks=[], status_map={}, tasks_by_id={})
 
         result = await scheduler._phase_psi_gate(ctx)
 
         assert result is _CONTINUE
-        assert ctx.psi_sample is not None
-        assert ctx.psi_sample.read_ok is False
-        assert ctx.psi_hold is False, 'an unreadable PSI sample must fail OPEN'
-        assert ctx.psi_in_flight == len(scheduler._dispatched)
+        assert len(reads) == 1, 'the gate sampled PSI'
+        assert ctx.psi_hold is None, 'an unreadable PSI sample must fail OPEN'
+
+    @pytest.mark.asyncio
+    async def test_deferral_reports_the_hold_the_gate_decided_across_a_reload(self):
+        """A hot reload landing between ``_phase_psi_gate`` and a deferral
+        (``apply_reload`` mutates ``config.psi_admission`` in place) changes
+        neither the outcome nor the report: the event names the metric and
+        floor the gate decided on, even when the reload turned that arm off."""
+        event_store = _RecordingEventStore()
+        config = OrchestratorConfig(
+            max_per_module=1,
+            psi_admission=PsiAdmissionConfig(cpu_some_avg10=85.0, min_inflight_floor=1),
+        )
+        scheduler = Scheduler(config, event_store=cast(EventStore, event_store))
+        scheduler.finish_startup()
+        scheduler._read_psi_sample = lambda: PsiSample(
+            cpu_some10=90.0, mem_some10=0.0, mem_full10=0.0, io_some10=0.0, read_ok=True,
+        )
+        scheduler._dispatched.add('inflight1')
+        task = {
+            'id': 'H', 'status': 'pending', 'dependencies': [],
+            'metadata': {'files': ['mod_h/x.py']}, 'priority': 'medium',
+        }
+        ctx = TickContext(
+            tasks=[task],
+            status_map={'H': 'pending'},
+            tasks_by_id={'H': task},
+            candidates=[task],
+            candidate_signals={'H': None},
+            effective_priorities={'H': 'medium'},
+            transitive_counts={'H': 0},
+        )
+
+        await scheduler._phase_psi_gate(ctx)
+        reloaded = apply_reload(
+            scheduler.config,
+            OrchestratorConfig(
+                max_per_module=1,
+                psi_admission=PsiAdmissionConfig(cpu_some_avg10=None, min_inflight_floor=5),
+            ),
+        )
+        result = await scheduler._phase_select_scored(ctx)
+
+        assert reloaded['reloaded'] is True
+        assert scheduler.config.psi_admission.cpu_some_avg10 is None
+        assert isinstance(result, TickOutcome)
+        assert result.assignment is None, 'the tick-start hold still governs this tick'
+        [deferred] = [e for e in event_store.events if e[0] == 'dispatch_deferred']
+        assert deferred[1]['data']['metric'] == 'cpu_some_avg10'
+        assert deferred[1]['data']['floor'] == 1
 
 
 class TestTickPhaseOrderLiteral:
@@ -763,8 +825,15 @@ class TestTickPhaseOrderLiteral:
         assert isinstance(order, tuple)
         assert all(isinstance(label, str) for label in order)
 
-        # (1) drain_park_eviction before park_gc.
-        assert order.index('drain_park_eviction') < order.index('park_gc')
+        # (1) drain_park_eviction immediately before park_gc, so an operator
+        # eviction is not pre-empted by an automatic expiry; park_gc after
+        # both dependency-cache phases (its dependency arm reads their
+        # caches) and before every phase that installs parks or dispatches.
+        assert order.index('park_gc') == order.index('drain_park_eviction') + 1
+        assert order.index('external_dep_policy') < order.index('park_gc')
+        assert order.index('delivered_check_gate') < order.index('park_gc')
+        for later in ('reserve_now', 'empty_candidate_gate', 'select_pins', 'select_scored'):
+            assert order.index('park_gc') < order.index(later), later
         # (2) cooldown_gc before BOTH candidate-dispatch loops.
         assert order.index('cooldown_gc') < order.index('select_pins')
         assert order.index('cooldown_gc') < order.index('select_scored')
@@ -788,6 +857,21 @@ class TestTickPhaseOrderLiteral:
         )
         assert order.index('delivered_check_gate') < order.index('build_candidates')
         assert order.index('delivered_check_gate') < order.index('select_pins')
+        # (5) reserve_now installs at ctx.effective_priorities (task 5308),
+        # and override_diff reads the snapshot reserve_now takes.
+        assert (
+            order.index('compute_priorities')
+            < order.index('reserve_now')
+            < order.index('override_diff')
+        )
+        # (6) the already-landed consult (task 4900) is its own phase,
+        # timed separately from the landed-outbox consult it follows.
+        assert order.count('already_landed_gate') == 1
+        assert (
+            order.index('already_landed_gate') == order.index('landed_outbox_gate') + 1
+        )
+        assert order.index('build_candidates') < order.index('landed_outbox_gate')
+        assert order.index('already_landed_gate') < order.index('starvation')
 
         # Every label genuinely drives dispatch — it maps to a real
         # coroutine method on Scheduler, not just a decorative string.
@@ -828,3 +912,166 @@ class TestTickPhaseOrderLiteral:
         assert result.task_id == 'A'
         assert scheduler.lock_table.is_held('A')
         assert called == [f'_phase_{label}' for label in Scheduler._TICK_PHASE_ORDER]
+
+
+class TestTickTelemetry:
+    """``EventType.scheduler_tick`` — the per-tick latency breakdown.
+
+    The tick had NO instrumentation at all before this: no ``perf_counter``
+    anywhere in ``scheduler.py`` or ``harness.py`` and no duration event, which
+    is why a regression to ~14 minutes per tick (one uncached full-history
+    ``git log`` per candidate in the already-landed gate) survived for months.
+    These tests pin the event's shape so the next such regression is visible in
+    ``runs.db`` rather than reconstructable only from log archaeology.
+    """
+
+    @pytest.mark.asyncio
+    async def test_dispatching_tick_emits_duration_and_phase_breakdown(
+        self, scheduler: Scheduler,
+    ):
+        event_store = _RecordingEventStore()
+        scheduler.event_store = event_store  # type: ignore[assignment]
+        task = {
+            'id': 'A', 'title': 'Task A', 'status': 'pending', 'dependencies': [],
+            'metadata': {'files': ['backend']}, 'priority': 'medium',
+        }
+        scheduler.get_tasks = AsyncMock(return_value=[task])
+
+        result = await scheduler.acquire_next()
+        assert result is not None
+
+        ticks = [e for e in event_store.events if e[0] == 'scheduler_tick']
+        assert len(ticks) == 1, 'exactly one scheduler_tick event per tick'
+        payload = ticks[0][1]
+        assert payload['task_id'] == 'A'
+
+        data = payload['data']
+        # duration lives INSIDE data, not the emit() column — _RecordingEventStore
+        # discards the column, so a column-only duration is untestable.
+        assert isinstance(data['duration_ms'], int)
+        assert data['duration_ms'] >= 0
+        assert data['terminal_phase'] == 'select_scored'
+        assert data['candidates'] is not None
+        phases = data['phases']
+        assert set(phases) <= set(Scheduler._TICK_PHASE_ORDER)
+        assert 'select_scored' in phases, 'the terminal phase must be timed too'
+        assert all(isinstance(v, int) for v in phases.values())
+
+    @pytest.mark.asyncio
+    async def test_the_two_landed_consults_are_timed_as_separate_phases(
+        self, tmp_path,
+    ):
+        event_store = EventStore(tmp_path / 'runs.db', run_id='tick-phases')
+        scheduler = Scheduler(OrchestratorConfig(max_per_module=1), event_store=event_store)
+        scheduler.finish_startup()
+        task = {
+            'id': 'A', 'title': 'Task A', 'status': 'pending', 'dependencies': [],
+            'metadata': {'files': ['backend']}, 'priority': 'medium',
+        }
+        scheduler.get_tasks = AsyncMock(return_value=[task])
+        scheduler._landed_outbox_gate = AsyncMock(return_value=False)
+        scheduler._already_landed_gate = AsyncMock(return_value=False)
+
+        await scheduler.acquire_next()
+        await scheduler.work_product.join()
+
+        ticks = event_store.fetch_events_by_type('scheduler_tick')
+        assert len(ticks) == 1
+        phases = ticks[0]['data']['phases']
+        assert isinstance(phases['landed_outbox_gate'], int)
+        assert isinstance(phases['already_landed_gate'], int)
+
+    @pytest.mark.asyncio
+    async def test_already_landed_consult_still_sees_outbox_gated_candidates(
+        self, scheduler: Scheduler,
+    ):
+        """The phase split changes timing visibility only: the already-landed
+        consult is still asked about every candidate the outbox gate saw."""
+        tasks = [
+            {
+                'id': tid, 'title': f'Task {tid}', 'status': 'pending',
+                'dependencies': [], 'metadata': {'files': [f'mod_{tid}']},
+                'priority': 'medium',
+            }
+            for tid in ('Z', 'Y')
+        ]
+        scheduler.get_tasks = AsyncMock(return_value=tasks)
+        scheduler._landed_outbox_gate = AsyncMock(side_effect=lambda tid: tid == 'Z')
+        already_landed = AsyncMock(return_value=False)
+        scheduler._already_landed_gate = already_landed
+
+        result = await scheduler.acquire_next()
+
+        assert result is not None
+        assert result.task_id == 'Y'
+        assert not scheduler.lock_table.is_held('Z')
+        consulted = {call.args[0] for call in already_landed.await_args_list}
+        assert consulted == {'Z', 'Y'}
+
+    @pytest.mark.asyncio
+    async def test_early_return_tick_still_emits(self, scheduler: Scheduler):
+        """A tick that ends before the phase loop is still a tick.
+
+        The get_tasks preamble is a real per-tick cost, so the clock starts
+        above it and the empty-project early return reports itself with the
+        ``'no_active_tasks'`` pseudo-label rather than emitting nothing.
+        """
+        event_store = _RecordingEventStore()
+        scheduler.event_store = event_store  # type: ignore[assignment]
+        scheduler.get_tasks = AsyncMock(return_value=[])
+
+        result = await scheduler.acquire_next()
+        assert result is None
+
+        ticks = [e for e in event_store.events if e[0] == 'scheduler_tick']
+        assert len(ticks) == 1
+        assert ticks[0][1]['task_id'] is None
+        data = ticks[0][1]['data']
+        assert isinstance(data['duration_ms'], int)
+        assert data['terminal_phase'] == 'no_active_tasks'
+        assert data['phases'] == {}
+        assert data['candidates'] is None
+
+    @pytest.mark.asyncio
+    async def test_paused_tick_does_not_emit(self, scheduler: Scheduler):
+        """A paused scheduler is not attempting dispatch — do not spam the store.
+
+        Without this carve-out a pause held for hours would write one event per
+        ``idle_poll_secs`` for its whole duration.
+        """
+        event_store = _RecordingEventStore()
+        scheduler.event_store = event_store  # type: ignore[assignment]
+        scheduler.pause('test-pause', PauseClass.OPERATOR)
+        scheduler.get_tasks = AsyncMock(return_value=[])
+
+        result = await scheduler.acquire_next()
+        assert result is None
+
+        assert [e for e in event_store.events if e[0] == 'scheduler_tick'] == []
+
+    @pytest.mark.asyncio
+    async def test_telemetry_failure_never_breaks_dispatch(self, scheduler: Scheduler):
+        """PROPERTY 1: instrumentation must not be able to abort a tick."""
+
+        class _SelectiveBoom:
+            run_id = 'run-test'
+
+            def __init__(self) -> None:
+                self.events: list[tuple[str, dict]] = []
+
+            def emit(self, event_type, **kwargs):
+                if str(event_type) == 'scheduler_tick':
+                    raise RuntimeError('telemetry exploded')
+                self.events.append((str(event_type), kwargs))
+
+        scheduler.event_store = _SelectiveBoom()  # type: ignore[assignment]
+        task = {
+            'id': 'A', 'title': 'Task A', 'status': 'pending', 'dependencies': [],
+            'metadata': {'files': ['backend']}, 'priority': 'medium',
+        }
+        scheduler.get_tasks = AsyncMock(return_value=[task])
+
+        result = await scheduler.acquire_next()
+
+        assert result is not None, 'dispatch must survive a telemetry failure'
+        assert result.task_id == 'A'

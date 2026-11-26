@@ -9,25 +9,71 @@
 #
 # Usage:
 #   spawn-claude.sh <cwd> <skip_permissions:true|false> <title|""> <prompt>
+#   spawn-claude.sh <cwd> <skip_permissions:true|false> <title|""> --prompt-file <abs path>
+#
+# --prompt-file launches a short pointer prompt naming the file instead of
+# its contents, so a brief of any size stays under tmux's command-length limit.
 #
 # Model selection:
 #   $CLAUDE_SPAWN_MODEL — pin the spawned session's model. Forwarded verbatim
 #     to `claude --model <value>`, so it takes any alias (opus/sonnet/haiku/
 #     fable) or full id (e.g. claude-fable-5). It's an env var, not a
-#     positional, so the four-arg calling contract above is unchanged; unset =
+#     positional, so the calling forms above are unchanged; unset =
 #     inherit the spawner's default model. For other/extra claude flags use
 #     $CLAUDE_SPAWN_CLAUDE_ARGS (a raw passthrough, applied after --model).
+#   $CLAUDE_SPAWN_EFFORT — the session's reasoning effort, forwarded as
+#     `claude --effort <level>` right after --model: one of
+#     low|medium|high|xhigh|max (unset or empty = claude's default). On the
+#     t3 lane it becomes the thread's modelSelection effort option, and
+#     needs $CLAUDE_SPAWN_MODEL.
+#   $CLAUDE_SPAWN_CLAUDE_BIN — the executable the tmux and terminal-emulator
+#     lanes run in place of `claude`; see skills/spawn/SKILL.md.
 #
-# Backend selection:
-#   $CLAUDE_SPAWN_BACKEND=tmux — bypass terminal-emulator discovery entirely
+# Self-exit: $CLAUDE_SPAWN_SELF_EXIT, default per lane; see skills/spawn/SKILL.md.
+# End of work on the t3 lane: $CLAUDE_SPAWN_T3_END; see its entry in skills/spawn/SKILL.md.
+#
+# These, and every other CLAUDE_SPAWN_* var read below, are per-launch
+# INPUTS: consumed by this invocation and then REMOVED from the spawned
+# session's own environment (task 4015 -- see $sanitize_env further down), so
+# a session can never re-serve its own launch parameters to a session IT
+# spawns. Set them explicitly on each spawn; they do not propagate onward.
+#
+# Parent: with no $CLAUDE_SPAWN_SESSION_ID, on every lane, the child's parent
+#   comes from this spawner's own record (spawn_t3_lane.py `self-record`), so a
+#   hand-launched spawner's children get a parent_session_id too, and sibling
+#   mode uses that record's parent rather than an inherited
+#   $CLAUDE_SPAWN_PARENT_ID.
+#
+# Backend selection -- $CLAUDE_SPAWN_BACKEND names where the session lives:
+#   auto (or unset) — t3 when this script runs inside a T3 Code-hosted
+#     session (spawn_t3_lane.py `detect`), else wm.
+#   t3 — a T3 Code thread in the T3 project containing <cwd>, run in <cwd>:
+#     the project root, or a worktree T3 lists for it; no terminal. The lane
+#     reaches T3's MCP server with this host's credential (spawn_t3_lane.py
+#     `pair`). skip_permissions picks the runtime mode (true full-access,
+#     false approval-required). The lane refuses (exit 145) any
+#     $CLAUDE_SPAWN_CLAUDE_ARGS; $CLAUDE_SPAWN_MODEL becomes the thread's
+#     model, on the instance resolve_t3_provider picks ($CLAUDE_SPAWN_T3_PROVIDER
+#     names one explicitly; a disabled one is refused, exit 145), with
+#     $CLAUDE_SPAWN_EFFORT in its selection (refused without a model, exit
+#     145; a level T3 does not offer that model, or a thread T3 reports
+#     launched without it, exits 127). Child mode
+#     joins on the thread's result.md or archive, records spawn_t3_lane.py
+#     `wait`'s code as the session's exit and exits with it; a sibling spawn
+#     prints `record=<dir> t3_thread_id=<id>` on stdout, both values
+#     percent-encoded as the lane's verdicts are. The started-grace
+#     defaults to 300s.
+#   tmux — bypass terminal-emulator discovery entirely
 #     and launch in a crash-survivable, reattachable tmux window instead
 #     (Fleet Cockpit C6). Per-project session `fleet-<project>` (project from
 #     $CLAUDE_SPAWN_PROJECT, else basename(cwd), else "fleet"), one window
 #     per runner; override the session name via $CLAUDE_SPAWN_TMUX_SESSION.
 #     Reattach with `tmux attach -t <session>`. Requires `tmux` on $PATH —
 #     see exit code 126 below.
+#   wm — terminal-emulator discovery, below.
+#   Any other value is bad usage (exit 2).
 #
-# Emulator discovery order (when $CLAUDE_SPAWN_BACKEND != tmux):
+# Emulator discovery order (the wm backend):
 #   1. $CLAUDE_TERMINAL_CMD             (preferred env override)
 #   2. $ESCALATION_TERMINAL_CMD         (legacy fallback)
 #   3. gnome-terminal / kitty / konsole / xterm in $PATH
@@ -35,12 +81,28 @@
 #   5. exit 126 — caller must prompt user and set $CLAUDE_TERMINAL_CMD
 #
 # Exit codes:
-#   0..125 — claude's own exit code (recovered from sentinel)
-#   126    — no usable launcher (no terminal emulator found / tmux missing in tmux mode)
-#   127    — launcher itself failed (emulator exited before writing the sentinel)
+#   0..125 — claude's own exit code (recovered from sentinel); on the t3 lane,
+#            spawn_t3_lane.py `wait`'s code: 0 (final result.md, or thread
+#            archived) or 1 (the thread's last run ended without one)
+#   126    — no usable launcher (no terminal emulator found / tmux missing in tmux mode /
+#            on the t3 lane: python3 or T3's server-runtime.json missing, T3 unreachable,
+#            or this host's MCP credential unpaired, expired or not self-pairable -- run
+#            spawn_t3_lane.py `pair`); on the t3 lane also `wait`'s "T3 server unreachable
+#            beyond its grace"
+#   127    — launcher itself failed (emulator exited before writing the sentinel,
+#            or the sentinel never settled to a numeric exit code within the launch grace;
+#            on the t3 lane, the thread launch failed, the launched thread does not hold the
+#            requested effort (stderr names it), or spawn_t3_lane.py faulted). On the
+#            t3 lane also `wait`'s "the thread was deleted", and "join lost": `wait` faulted
+#            while the thread may still be running (stderr names the thread and record)
 #   129    — terminal window closed while the session was alive (SIGHUP)
+#   143    — the session's payload shell was sent SIGTERM
 #   144    — Claude never started within the started-grace window (registry marked failed-to-start)
-#   2      — bad usage
+#   145    — the selected lane cannot honour an input (t3 lane only, today: claude CLI
+#            arguments, an effort without a model, a disabled provider instance, a cwd in no live T3 project, or
+#            a worktree T3 does not list for its project)
+#   2      — bad usage (including an unknown CLAUDE_SPAWN_EFFORT; an unknown CLAUDE_SPAWN_T3_END, or one that contradicts
+#            CLAUDE_SPAWN_SELF_EXIT=1 on the t3 lane)
 
 set -u
 
@@ -49,6 +111,8 @@ set -u
 # free (0-125 claude, 126 no-emulator, 127 launcher-fail, 129 window-closed,
 # 143 SIGTERM, 2 usage), so this is additive and backward-compatible.
 EXIT_FAILED_TO_START=144
+# "This lane cannot honour that input" -- a different invariant from bad usage.
+EXIT_LANE_REFUSED=145
 
 # Absolute path to the repo root, computed from this script's own location
 # (skills/spawn/spawn-claude.sh -> skills/spawn -> skills -> repo root) so the
@@ -56,16 +120,33 @@ EXIT_FAILED_TO_START=144
 # venv, PYTHONPATH, or install required.
 REPO_ROOT="$(cd "$(dirname "$(dirname "$(dirname "${BASH_SOURCE[0]}")")")" && pwd)"
 SESSION_REGISTRY_PY="$REPO_ROOT/orchestrator/src/orchestrator/session_registry.py"
+SPAWN_T3_LANE_PY="$REPO_ROOT/orchestrator/src/orchestrator/spawn_t3_lane.py"
+CLAUDE_EXECUTABLE_PY="$REPO_ROOT/shared/src/shared/claude_executable.py"
 
-if [ $# -ne 4 ]; then
-  echo "usage: spawn-claude.sh <cwd> <skip_perms:true|false> <title> <prompt>" >&2
+if [ $# -eq 4 ] && [ "$4" != "--prompt-file" ]; then
+  prompt="$4"
+elif [ $# -eq 5 ] && [ "$4" = "--prompt-file" ]; then
+  prompt_file="$5"
+  case "$prompt_file" in
+    /*) ;;
+    *)
+      echo "spawn-claude.sh: --prompt-file needs an absolute path, got: $prompt_file" >&2
+      exit 2
+      ;;
+  esac
+  if ! { [ -f "$prompt_file" ] && [ -r "$prompt_file" ]; }; then
+    echo "spawn-claude.sh: --prompt-file is not a readable file: $prompt_file" >&2
+    exit 2
+  fi
+  prompt="Read $prompt_file and follow it as your brief; that file holds your whole task."
+else
+  echo "usage: spawn-claude.sh <cwd> <skip_perms:true|false> <title> <prompt> | --prompt-file <abs path>" >&2
   exit 2
 fi
 
 cwd="$1"
 skip_perms="$2"
 title="$3"
-prompt="$4"
 
 # Fleet Cockpit C7 (plans/fleet-cockpit-prd.md §6.1): spawn_mode selects
 # which identity the child inherits as its own CLAUDE_SPAWN_PARENT_ID (see
@@ -75,18 +156,243 @@ prompt="$4"
 # caller's behavior byte-for-byte.
 spawn_mode="${CLAUDE_SPAWN_MODE:-child}"
 
+# Runs a spawn_t3_lane.py verb under the same import contract as the hooks
+# (skills/spawn/hooks/session-start.sh). Every verb prints one verdict line:
+# a status word, then `key=value` tokens.
+t3_lane_module() {
+  PYTHONPATH="$REPO_ROOT/orchestrator/src${PYTHONPATH:+:$PYTHONPATH}" python3 "$SPAWN_T3_LANE_PY" "$@"
+}
+
+verdict_status() {
+  local status rest
+  read -r status rest <<<"$1"
+  printf '%s' "$status"
+}
+
+# $1 verdict line, $2 key; prints the key's value, or nothing.
+verdict_field() {
+  local -a words=()
+  local w
+  read -r -a words <<<"$1"
+  for w in ${words[@]+"${words[@]}"}; do
+    case "$w" in "$2="*) printf '%s' "${w#"$2="}"; return 0 ;; esac
+  done
+  return 1
+}
+
+# verdict_field with the lane's percent-encoding undone, for a message.
+verdict_text() {
+  local v
+  v=$(verdict_field "$1" "$2") || return 1
+  printf '%b' "${v//%/\\x}"
+}
+
+# $1 in the lane's token spelling (spawn_t3_lane.py::_token): percent-encoded
+# outside the same safe set, so it holds no space; `none` when empty.
+lane_token() {
+  local LC_ALL=C text="$1" encoded="" char i
+  if [ -z "$text" ]; then
+    printf 'none'
+    return 0
+  fi
+  for (( i = 0; i < ${#text}; i++ )); do
+    char="${text:i:1}"
+    case "$char" in
+      [A-Za-z0-9/_.~:@+,-]) encoded+="$char" ;;
+      *) printf -v char '%%%02X' "'$char"; encoded+="$char" ;;
+    esac
+  done
+  printf '%s' "$encoded"
+}
+
+t3_host_detected() {
+  local verdict rc
+  command -v python3 >/dev/null 2>&1 || return 1
+  verdict=$(t3_lane_module detect)
+  rc=$?
+  if [ "$rc" -ne 0 ]; then
+    echo "spawn-claude.sh: T3 host detection faulted (rc $rc); using terminal-emulator discovery" >&2
+    return 1
+  fi
+  [ "$verdict" = "t3" ]
+}
+
+# Sets spawn_backend to t3|tmux|wm and, for t3, t3_lane_origin (how the lane
+# was chosen, for refusal messages).
+resolve_spawn_backend() {
+  t3_lane_origin="explicitly (CLAUDE_SPAWN_BACKEND=t3)"
+  case "${CLAUDE_SPAWN_BACKEND:-auto}" in
+    auto)
+      spawn_backend="wm"
+      if t3_host_detected; then
+        spawn_backend="t3"
+        t3_lane_origin="by auto-selection (CLAUDE_SPAWN_BACKEND=${CLAUDE_SPAWN_BACKEND:-unset}; this spawner is T3-hosted)"
+      fi
+      ;;
+    t3|tmux|wm) spawn_backend="$CLAUDE_SPAWN_BACKEND" ;;
+    *)
+      echo "spawn-claude.sh: unknown CLAUDE_SPAWN_BACKEND='$CLAUDE_SPAWN_BACKEND' (expected auto|t3|tmux|wm)" >&2
+      exit 2
+      ;;
+  esac
+}
+
+# $1 the input refused, $2 what the caller can do instead.
+t3_lane_refuse() {
+  echo "spawn-claude.sh: the t3 lane, selected $t3_lane_origin, cannot honour $1 -- $2" >&2
+  exit "$EXIT_LANE_REFUSED"
+}
+
+# Any fault or unknown verdict from spawn_t3_lane.py is a launcher failure.
+t3_lane_call() {
+  local rc
+  t3_verdict=$(t3_lane_module "$@")
+  rc=$?
+  if [ "$rc" -ne 0 ] || [ -z "$(verdict_status "$t3_verdict")" ]; then
+    echo "spawn-claude.sh: t3 lane: spawn_t3_lane.py $1 faulted (rc $rc); treating it as a launcher failure" >&2
+    exit 127
+  fi
+}
+
+t3_lane_unexpected() {
+  echo "spawn-claude.sh: t3 lane: spawn_t3_lane.py $1 answered '$t3_verdict'; treating it as a launcher failure" >&2
+  exit 127
+}
+
+# $t3_verdict is a `refused reason=provider-disabled` line naming the instance
+# and how it was chosen (spawn_t3_provider.ProviderSource).
+refuse_disabled_t3_provider() {
+  local instance source why
+  instance=$(verdict_field "$t3_verdict" instance_id)
+  source=$(verdict_field "$t3_verdict" source)
+  case "$source" in
+    explicit) why="CLAUDE_SPAWN_T3_PROVIDER names it, and it is disabled for this T3 project" ;;
+    fallback) why="this T3 project has no default and no single enabled Claude instance, and the fallback is disabled" ;;
+    *) why="it is disabled for this T3 project ($source)" ;;
+  esac
+  t3_lane_refuse "provider instance '$instance'" \
+    "$why; name an enabled instance in CLAUDE_SPAWN_T3_PROVIDER, or set CLAUDE_SPAWN_BACKEND=tmux or wm"
+}
+
+# Sets t3_provider, the instance a model-pinned thread runs on, resolved by
+# spawn_t3_lane.py `provider` (order: $CLAUDE_SPAWN_T3_PROVIDER, the project's
+# live Claude instance, claudeAgent). Runs before the `launching` write, so a
+# disabled instance is refused without leaving a record behind.
+t3_provider=""
+resolve_t3_provider() {
+  if [ -z "${CLAUDE_SPAWN_MODEL:-}" ]; then
+    [ -z "${CLAUDE_SPAWN_T3_PROVIDER:-}" ] && return 0
+    t3_lane_refuse "CLAUDE_SPAWN_T3_PROVIDER='$CLAUDE_SPAWN_T3_PROVIDER' without CLAUDE_SPAWN_MODEL" \
+      "t3 takes a provider instance only together with a model; set CLAUDE_SPAWN_MODEL too"
+  fi
+  local -a args=(provider --cwd "$cwd")
+  [ -n "${CLAUDE_SPAWN_T3_PROVIDER:-}" ] && args+=(--provider "$CLAUDE_SPAWN_T3_PROVIDER")
+  t3_lane_call "${args[@]}"
+  case "$(verdict_status "$t3_verdict")" in
+    instance)
+      t3_provider=$(verdict_field "$t3_verdict" instance_id)
+      [ -n "$t3_provider" ] || t3_lane_unexpected provider
+      ;;
+    refused) refuse_disabled_t3_provider ;;
+    *) t3_lane_unexpected provider ;;
+  esac
+}
+
+refuse_inputs_the_t3_lane_cannot_honour() {
+  if [ -n "${CLAUDE_SPAWN_CLAUDE_ARGS:-}" ]; then
+    t3_lane_refuse "CLAUDE_SPAWN_CLAUDE_ARGS='$CLAUDE_SPAWN_CLAUDE_ARGS'" \
+      "a T3 thread takes no claude CLI arguments; unset it, or set CLAUDE_SPAWN_BACKEND=tmux or wm"
+  fi
+  if [ -n "${CLAUDE_SPAWN_EFFORT:-}" ] && [ -z "${CLAUDE_SPAWN_MODEL:-}" ]; then
+    refuse_t3_effort_without_model
+  fi
+}
+
+# Also spawn_t3_lane.py launch's `refused reason=effort-needs-model` backstop.
+refuse_t3_effort_without_model() {
+  t3_lane_refuse "CLAUDE_SPAWN_EFFORT='${CLAUDE_SPAWN_EFFORT:-}' without CLAUDE_SPAWN_MODEL" \
+    "t3 takes an effort only inside a model selection; set CLAUDE_SPAWN_MODEL too, or set CLAUDE_SPAWN_BACKEND=tmux or wm"
+}
+
+require_python3_for_the_t3_lane() {
+  if ! command -v python3 >/dev/null 2>&1; then
+    echo "spawn-claude.sh: the t3 lane, selected $t3_lane_origin, needs python3 on PATH" >&2
+    exit 126
+  fi
+}
+
+# Sets self_exit (1 or empty) and t3_end (settle, archive or empty) from
+# $CLAUDE_SPAWN_SELF_EXIT and $CLAUDE_SPAWN_T3_END for the resolved lane. A
+# T3 thread ends by the act t3_end names; elsewhere the process exit ends the
+# session, so t3_end stays empty there.
+self_exit=""
+t3_end=""
+resolve_end_of_work() {
+  local asked="${CLAUDE_SPAWN_T3_END:-none}"
+  case "$asked" in
+    none|settle|archive) ;;
+    *)
+      echo "spawn-claude.sh: unknown CLAUDE_SPAWN_T3_END='$asked' (expected none|settle|archive)" >&2
+      exit 2
+      ;;
+  esac
+  if [ "$spawn_backend" != "t3" ]; then
+    [ "${CLAUDE_SPAWN_SELF_EXIT:-}" != "0" ] && self_exit=1
+    if [ "$asked" != none ]; then
+      echo "spawn-claude.sh: CLAUDE_SPAWN_T3_END=$asked does not apply on the $spawn_backend lane (the process exit ends the session); ignoring it" >&2
+    fi
+    return 0
+  fi
+  if [ "${CLAUDE_SPAWN_SELF_EXIT:-}" = "1" ]; then
+    if [ "$asked" = settle ]; then
+      echo "spawn-claude.sh: CLAUDE_SPAWN_SELF_EXIT=1 (archive the T3 thread) contradicts CLAUDE_SPAWN_T3_END=settle; set only one" >&2
+      exit 2
+    fi
+    asked=archive
+  fi
+  [ "$asked" = none ] || t3_end="$asked"
+  [ "$t3_end" = archive ] && self_exit=1
+  return 0
+}
+
+# The levels of orchestrator/src/orchestrator/spawn_effort.py::EffortLevel,
+# copied so the wm lane rejects a bad value without python3.
+require_a_known_effort() {
+  case "${CLAUDE_SPAWN_EFFORT:-}" in
+    ''|low|medium|high|xhigh|max) ;;
+    *)
+      echo "spawn-claude.sh: unknown CLAUDE_SPAWN_EFFORT='$CLAUDE_SPAWN_EFFORT' (expected low|medium|high|xhigh|max)" >&2
+      exit 2
+      ;;
+  esac
+}
+
+resolve_spawn_backend
+resolve_end_of_work
+require_a_known_effort
+if [ "$spawn_backend" = "t3" ]; then
+  refuse_inputs_the_t3_lane_cannot_honour
+  require_python3_for_the_t3_lane
+  resolve_t3_provider
+fi
+
 # Started-verification watchdog (Attention Rail T4) state: a spawn-time
 # reference marker (mtime = spawn start, used by the step-4 transcript-
 # appearance probe to distinguish a fresh transcript from a stale one), a
 # failed-to-start marker path (NOT created here -- mktemp -u only reserves a
-# unique name; the watchdog creates the file itself when it flags), the
-# started-grace window, and the transcript-scan root. All independent of
+# unique name; the watchdog creates the file itself when it flags), a
+# payload-pid path (likewise only reserved; the payload writes its own pid
+# there for _payload_claude_alive), the started-grace window, and the
+# transcript-scan root. All independent of
 # SPAWN_LAUNCH_GRACE_SECS so genuine-launcher-failure (127) paths are
 # unaffected and existing tests (which only shrink the launch grace) never
 # trip the new code.
 spawn_ref="$(mktemp -t spawn-claude-ref-XXXXXX)"
 fts_marker="$(mktemp -u -t spawn-claude-XXXXXX.fts)"
-SPAWN_STARTED_GRACE_SECS="${SPAWN_STARTED_GRACE_SECS:-90}"
+payload_pid_file="$(mktemp -u -t spawn-claude-XXXXXX.pid)"
+started_grace_default=90
+[ "$spawn_backend" = "t3" ] && started_grace_default=300
+SPAWN_STARTED_GRACE_SECS="${SPAWN_STARTED_GRACE_SECS:-$started_grace_default}"
 CLAUDE_PROJECTS_DIR="${CLAUDE_PROJECTS_DIR:-$HOME/.claude/projects}"
 
 # Kill the started-watchdog on EVERY exit path -- MANDATORY. A backgrounded
@@ -105,7 +411,7 @@ CLAUDE_PROJECTS_DIR="${CLAUDE_PROJECTS_DIR:-$HOME/.claude/projects}"
 # spawn_ref to be removed prematurely.
 _cleanup() {
   [ -n "${watchdog_pid:-}" ] && kill "$watchdog_pid" 2>/dev/null
-  rm -f "$spawn_ref" "$fts_marker"
+  rm -f "$spawn_ref" "$fts_marker" "$payload_pid_file" ${t3_prompt_file:+"$t3_prompt_file"}
 }
 trap _cleanup EXIT
 
@@ -117,18 +423,15 @@ trap _cleanup EXIT
 # PROJECT/TASK_ID/ESCALATION_ID pass through from this process's own
 # environment when a caller already set them.
 #
-# Task 2511: the `launching` subcommand also opportunistically drives
-# session_registry's liveness sweep (mark_orphaned_sessions_exited) after it
-# writes this record -- fail-soft, and it never touches this call's stdout,
-# so the record dir captured into SESSION_RECORD_DIR below is unaffected.
-# Neither that sweep nor reap_stale_records has a periodic production driver
-# of its own (CLI-only), so every spawn is what drains prior orphaned
-# (unclean-death) records to `exited`. Task 2689: every spawn now ALSO
-# opportunistically bound-prunes terminal/stale record dirs from disk
-# (reap_stale_records(limit=REAP_BATCH_LIMIT), also fail-soft) right after
-# the mark sweep, draining the on-disk backlog over successive spawns; the
-# CLI `reap` verb remains the operator's unbounded one-shot full-drain. See
+# Task 7944: after writing this record, `launching` starts a detached full
+# `reap` of the registry and returns at once. That child's stdio is
+# /dev/null, so it never touches this call's stdout and the record dir
+# captured into SESSION_RECORD_DIR below is unaffected. The CLI `reap` verb
+# is the same pipeline run in the foreground. See
 # session_registry._run_launching's docstring.
+#
+# `launching` stamps record.self_exit and record.t3_end from the
+# CLAUDE_SPAWN_SELF_EXIT and CLAUDE_SPAWN_T3_END that resolve_end_of_work set.
 SESSION_RECORD_DIR=""
 if command -v python3 >/dev/null 2>&1; then
   SESSION_RECORD_DIR=$(
@@ -136,6 +439,8 @@ if command -v python3 >/dev/null 2>&1; then
     CLAUDE_SPAWN_PROMPT="$prompt" \
     CLAUDE_SPAWN_CWD="$cwd" \
     CLAUDE_SPAWN_LAUNCHER_PID="$$" \
+    CLAUDE_SPAWN_SELF_EXIT="$self_exit" \
+    CLAUDE_SPAWN_T3_END="$t3_end" \
     python3 "$SESSION_REGISTRY_PY" launching
   ) || true
 fi
@@ -190,22 +495,91 @@ fi
 # sessions (no CLAUDE_SPAWN_SESSION_ID in the environment) are unaffected --
 # their hooks still key on session_id, exactly as before.
 #
-# Caveat (reviewer-flagged): once exported, CLAUDE_SPAWN_SESSION_ID is
-# inherited by EVERY descendant process of the spawned session, not only its
-# top-level claude -- including a nested `claude` the spawned agent starts
-# directly by some OTHER means than this script (e.g. its own Bash tool). A
-# nested claude started THROUGH this script gets its own fresh value
-# (recomputed below from ITS OWN launcher_pid), so it is unaffected; a
-# nested claude NOT started through this script instead inherits this
-# value, and its SessionStart/Notification/Stop hooks then adopt it too --
-# collapsing that child's lifecycle writes onto THIS spawn's record instead
-# of getting a record of its own. This is a behavioral regression vs the
-# prior session_id-only keying, where every nested claude naturally got its
-# own record. Fixing it behaviorally belongs in hook_session_slug
-# (orchestrator/session_hooks.py, out of this task's module scope --
-# distinguishing a slug's first SessionStart from a later, different
-# session_id reusing the same inherited env var); documented here as a
-# known limitation rather than worked around in this script.
+# Caveat (reviewer-flagged; RESOLVED in task 4193, see below): once
+# exported, CLAUDE_SPAWN_SESSION_ID is inherited by EVERY descendant process
+# of the spawned session, not only its top-level claude -- including a nested
+# `claude` the spawned agent starts directly by some OTHER means than this
+# script (e.g. its own Bash tool). A nested claude started THROUGH this
+# script gets its own fresh value (recomputed below from ITS OWN
+# launcher_pid), so it is unaffected; a nested claude NOT started through
+# this script instead inherits this value.
+#
+# RESOLVED (task 4193) by TWO discriminators, because neither covers the
+# whole session lifetime on its own. This export and the spawn_id_export
+# below stay exactly as they are; the owner_ppid_export further down is the
+# only addition here.
+#
+#   1. ONCE THE RECORD IS BOUND -- the stdin session_id. The first hook
+#      event to adopt a slug AND prove its ownership (via discriminator 2)
+#      binds its own Claude Code session_id into
+#      record.claude_session_id (orchestrator/session_hooks.py,
+#      _bind_claude_session_id). Adoption alone is deliberately not enough:
+#      adopting is fail-soft, but a binding is permanent, so an event whose
+#      ownership is merely UNPROVEN (a session spawned before this script
+#      exported OWNER_PPID, every record already live on deploy day, or a
+#      platform with no /proc such as macOS) adopts the record WITHOUT
+#      claiming it -- leaving it open for its true owner instead of letting
+#      a nested claude capture it. Any later hook arriving with a
+#      DIFFERENT stdin session_id is recognised as an inheritor-not-owner:
+#      hook_session_slug falls through to the hand-launched
+#      build_session_slug keying, so that nested claude gets its OWN record
+#      instead of collapsing its lifecycle writes onto THIS spawn's. Note
+#      an ANCESTRY test could never do this job -- a nested claude is also a
+#      descendant of the original launcher.
+#
+#   2. BEFORE IT IS BOUND -- CLAUDE_SPAWN_OWNER_PPID (see owner_ppid_export
+#      below). Between this script's `launching` write and the spawned
+#      session's own first SessionStart, the record carries no binding at
+#      all, so discriminator 1 does not exist yet and whichever event
+#      arrives first would capture the record. That window is WIDE --
+#      measured over the live fleet, median ~27s, p90 ~141s -- and nothing
+#      bounds it. So session_ownership_probes.EventProbes.owner_ppid_verdict
+#      compares the owning claude's DIRECT PARENT against the pid this script
+#      exports from inside $inner. That is a parent-EQUALITY test on one
+#      process, not an ancestry test, and it needs no persisted state, so it
+#      works from the very first event. It also covers CLAUDE_SPAWN_MODE=sibling
+#      records, which resolve_sibling() flips to `running` at launch and which a
+#      status-based guard would therefore never match.
+#
+# Both probes are FAIL-SOFT in the same direction: whenever ownership can be
+# neither proved nor disproved (no /proc, an unreadable record, a session
+# spawned by a pre-task-4193 copy of this script), the event ADOPTS, i.e.
+# degrades to the pre-task-4193 behaviour, rather than inventing a split.
+#
+# Two consequences of that fork worth knowing when reading a forked row:
+#   * it is parented to THIS spawn's slug (the inherited CLAUDE_SPAWN_PARENT_ID
+#     names this spawn's OWN parent, which would render the nested session as
+#     this one's sibling), it does not resolve CLAUDE_SPAWN_WM_TITLE (that
+#     marker is THIS window, and a row claiming it would misdirect cockpit
+#     focus), and its launcher_pid is the nested claude itself so the row
+#     becomes reapable after that process exits -- "reapable", not "reaped":
+#     reap_stale_records' stale_pid rule ALSO requires
+#     NON_TERMINAL_HEARTBEAT_TTL of silence, and where /proc is unavailable
+#     EventProbes.nested_claude_liveness_pid falls back to os.getsid(0), the
+#     terminal's session leader, which outlives the nested claude;
+#   * the discriminator survives /clear. Claude Code re-mints session_id in
+#     place there, so the owning session's own SessionStart would look like a
+#     mismatch -- session_hooks keys off the SessionStart-only `source` field
+#     ('clear'/'compact', which have no command-line spelling and so can only
+#     be produced by the process already holding the session) and RE-binds
+#     this record instead of forking it. 'resume' is deliberately NOT in that
+#     set: --resume/--continue make a brand-new nested process report it too,
+#     so honouring it would let an inheritor rebind THIS spawn's record to
+#     itself.
+# A spawner with no CLAUDE_SPAWN_SESSION_ID (hand-launched, or T3-hosted)
+# finds its own record through its claude pid; child mode parents at that
+# record, sibling mode at that record's parent. Fail-soft: no record, no parent.
+parent_from_own_record() {
+  local verdict own
+  verdict=$(t3_lane_module self-record) || return 0
+  if [ "$spawn_mode" = "sibling" ]; then
+    own=$(verdict_field "$verdict" parent)
+  else
+    own=$(verdict_field "$verdict" slug)
+  fi
+  [ "$own" = "none" ] || printf '%s' "$own"
+}
+
 spawn_id_export=""
 parent_id_export=""
 if [ -n "$SESSION_RECORD_DIR" ]; then
@@ -213,10 +587,12 @@ if [ -n "$SESSION_RECORD_DIR" ]; then
   q_child=$(printf %q "$child_session_id")
   spawn_id_export="export CLAUDE_SPAWN_SESSION_ID=$q_child; "
 
-  if [ "$spawn_mode" = "sibling" ]; then
+  if [ -z "${CLAUDE_SPAWN_SESSION_ID:-}" ]; then
+    parent_of_child=$(parent_from_own_record)
+  elif [ "$spawn_mode" = "sibling" ]; then
     parent_of_child="${CLAUDE_SPAWN_PARENT_ID:-}"
   else
-    parent_of_child="${CLAUDE_SPAWN_SESSION_ID:-}"
+    parent_of_child="$CLAUDE_SPAWN_SESSION_ID"
   fi
   if [ -n "$parent_of_child" ]; then
     q_parent=$(printf %q "$parent_of_child")
@@ -257,8 +633,8 @@ fi
 # DELIBERATE ORDERING: the session-registry `launching` write further above
 # (CLAUDE_SPAWN_PROMPT="$prompt") already ran and persisted `prompt` BEFORE
 # this trailer is appended, so record.prompt intentionally holds the
-# caller's original prompt, not this machine-appended boilerplate --
-# record.prompt is "what the caller asked for", not "the literal argv
+# caller's prompt or the --prompt-file pointer, not this machine-appended
+# boilerplate -- record.prompt is "what the caller asked for", not "the literal argv
 # claude received". Do NOT reorder the registry call to run after this
 # block to make them match; a reader who needs the exact text claude saw
 # should reconstruct it from record.prompt plus this trailer template.
@@ -273,13 +649,53 @@ Format (markdown with a small structured header -- parent readers are
 LLMs, so keep it concise and scannable):
 
 ---
-outcome: done|blocked|abandoned|handed-off
+outcome: done|blocked|abandoned|handed-off|in-progress
 changed: (commits/branches/task ids touched, or none)
 action_needed: (what a human or parent should do next, or none)
 ---
 A few sentences of prose context.
 
-This is best-effort: writing this file must never block your normal exit."
+This is best-effort: writing this file must never block your normal exit.
+If you write it before your work is done, set outcome: in-progress and
+rewrite it with a final outcome before you end. Run /reflect before you
+end this session."
+  end_of_work_trailer=""
+  if [ "$spawn_backend" = "t3" ]; then
+    end_of_work_lead="When all work, result.md and /reflect are complete and no
+background task of yours is still running, follow
+\"Ending a T3 session\" in $REPO_ROOT/skills/spawn/SKILL.md (its T3 lane section):"
+    end_of_work_check="This act is the most you may do, not an order: first run
+the end check in \"Ending a T3 session\". If your final message or result.md asks
+anything of Leo (a question, a decision, a recommendation awaiting his go,
+an action_needed other than none, or a blocked or abandoned outcome), take
+no act, so the thread stays in his ready list, and say so in one line."
+    case "$t3_end" in
+      archive)
+        end_of_work_trailer="This session was spawned to end by archiving its own T3 thread.
+${end_of_work_check}
+Otherwise, ${end_of_work_lead} mark your own record exited, then call the
+t3_thread_organize MCP tool with action \"archive\" and no threadId as your
+final tool call."
+        ;;
+      settle)
+        end_of_work_trailer="This session was spawned to end by settling its own T3 thread.
+${end_of_work_check}
+Otherwise, ${end_of_work_lead} call the t3_thread_organize MCP tool with action
+\"settle\" and no threadId, then end the turn with no further tool call
+and no question pending."
+        ;;
+    esac
+  elif [ "$self_exit" = 1 ]; then
+    end_of_work_trailer='This session was spawned with self-exit on. When all work, result.md and
+/reflect are complete and no background task of yours is still running,
+run this as your final action (best-effort; skip it if it fails):
+printf '\''%s'\'' "$CLAUDE_CODE_SESSION_ID" > "$(dirname "$CLAUDE_SPAWN_RESULT_FILE")/exit-requested"'
+  fi
+  if [ -n "$end_of_work_trailer" ]; then
+    prompt="${prompt}
+
+${end_of_work_trailer}"
+  fi
 fi
 
 flags=""
@@ -297,6 +713,8 @@ flags=""
 # CLAUDE_SPAWN_CLAUDE_ARGS so a raw `--model` passed through that escape
 # hatch (the last --model on the argv) still wins if a caller sets both.
 [ -n "${CLAUDE_SPAWN_MODEL:-}" ] && flags="$flags --model $CLAUDE_SPAWN_MODEL"
+# The reasoning effort, a single token require_a_known_effort has checked.
+[ -n "${CLAUDE_SPAWN_EFFORT:-}" ] && flags="$flags --effort $CLAUDE_SPAWN_EFFORT"
 # Optional extra claude CLI args (e.g. CLAUDE_SPAWN_CLAUDE_ARGS='--model
 # claude-fable-5'). Baked into the payload string at construction time —
 # like $flags itself — so they reach claude even under daemon-owned
@@ -306,17 +724,82 @@ flags=""
 # CLAUDE_SPAWN_MODEL above; reserve this for other/extra claude flags.
 [ -n "${CLAUDE_SPAWN_CLAUDE_ARGS:-}" ] && flags="$flags $CLAUDE_SPAWN_CLAUDE_ARGS"
 
+# The executable run in place of bare `claude` (CLAUDE_SPAWN_CLAUDE_BIN), by the
+# rule in shared/src/shared/claude_executable.py::claude_executable. Baked into
+# the payload like $flags, so daemon-owned emulators that inherit nothing still
+# run it. An override must exec claude, keeping claude the payload shell's
+# direct child.
+resolve_claude_executable() {
+  local fallback="launching bare 'claude' and ignoring any CLAUDE_SPAWN_CLAUDE_BIN"
+  local resolver_rc=0
+  claude_executable=""
+  if ! command -v python3 >/dev/null 2>&1; then
+    echo "spawn-claude.sh: python3 is not on PATH, so the claude-executable resolver $CLAUDE_EXECUTABLE_PY cannot run; $fallback" >&2
+  else
+    claude_executable=$(python3 -I "$CLAUDE_EXECUTABLE_PY" spawn) || resolver_rc=$?
+    if [ "$resolver_rc" -ne 0 ]; then
+      echo "spawn-claude.sh: the claude-executable resolver $CLAUDE_EXECUTABLE_PY exited $resolver_rc (its stderr, if any, is above); $fallback" >&2
+      claude_executable=""
+    elif [ -z "$claude_executable" ]; then
+      echo "spawn-claude.sh: the claude-executable resolver $CLAUDE_EXECUTABLE_PY exited 0 but printed no executable; $fallback" >&2
+    fi
+  fi
+  claude_executable=${claude_executable:-claude}
+}
+resolve_claude_executable
+
 sentinel="$(mktemp -u -t spawn-claude-XXXXXX.done)"
 
 q_cwd=$(printf %q "$cwd")
+q_claude_executable=$(printf %q "$claude_executable")
 q_prompt=$(printf %q "$prompt")
 q_sentinel=$(printf %q "$sentinel")
+q_sentinel_tmp=$(printf %q "$sentinel.tmp")
 
 # Payload that runs inside the new terminal.  Traps ensure the sentinel is
 # written even when the terminal window is closed (SIGHUP/TERM) while the
 # session is alive:
 #   - EXIT trap: always writes ${ec:-$?} — claude's real code on normal exit,
 #     or a 128+signo default when pre-empted.
+#
+# ATOMIC PUBLISH (task 5137, esc-4389-4). The EXIT trap writes the code to
+# "$sentinel.tmp" and then renames it onto $sentinel, rather than
+# redirecting straight at $sentinel. `>` creates and TRUNCATES before the
+# write lands, so a plain redirect leaves the sentinel path observable
+# existing-and-zero-length; a reader in that window read back the empty
+# string (see _sentinel_settled below for the damage that caused). A
+# same-directory rename is atomic on every POSIX filesystem this script
+# already targets, so the sentinel PATH only ever appears fully written.
+#
+# That is what keeps every `-f "$sentinel"` existence gate in this script
+# content-correct WITHOUT changing any of them — await_sentinel,
+# _wait_sentinel_grace, _failed_to_start_pending, _started_watchdog (x2),
+# resolve_foreground, resolve_detached, and the mac-terminal branch. Auditing
+# and rewriting eight call sites would be a far larger and riskier change
+# than closing the window at the single writer. `mv` is coreutils — no
+# heavier a dependency than the mktemp/find/python3 this script already
+# requires.
+#
+# FAIL-CLOSED, deliberately not `&&`. The publish is a `;`-separated list
+# with two fallbacks, because the two-step form widened the failure envelope
+# in one direction that must be closed back. A single `> $tmp && mv ...`
+# skips the rename outright when the write to $tmp fails (ENOSPC) and
+# depends on an external `mv` resolved through the payload's inherited PATH,
+# where the old direct `>` needed no binary at all and — being a builtin
+# redirect — created the sentinel at open() time even when the write itself
+# failed. In both of those cases NO sentinel would ever appear, and the
+# consumer on that path is await_sentinel, which is UNBOUNDED and whose
+# started-watchdog has already returned 0 on live-claude evidence and will
+# never write the fts_marker: the script would hang forever. That trades a
+# bounded-wrong verdict for an unbounded one — strictly worse, and the same
+# direction design decision 2 refuses for await_sentinel.
+#
+# So every path ends with the sentinel PATH existing: rename it (atomic,
+# the normal case), else copy the temp over it (non-atomic, but finish()'s
+# bounded re-poll covers a torn read), else create it empty with the
+# `:` builtin (no binary required at all) so finish() renders its 127
+# verdict. The fallbacks are reached ONLY when the atomic path already
+# failed, so the normal case is byte-for-byte what it was.
 #   - HUP trap: converts SIGHUP into exit 129 so the EXIT trap records 129
 #     (distinguishable "window closed while alive" code).
 #   - TERM trap: converts SIGTERM into exit 143 (128+15).
@@ -344,10 +827,83 @@ q_sentinel=$(printf %q "$sentinel")
 # UNCONDITIONALLY — a plain literal, deliberately NOT a SESSION_RECORD_DIR-
 # gated *_export var — so persistence holds even on registry-fault fail-soft
 # paths. See the 2026-07-22 /deb RCA (session 15de5e77) and task 2893.
-inner="trap 'echo \"\${ec:-\$?}\" > $q_sentinel' EXIT; \
+#
+# sanitize_env (task 4015): strip the ENTIRE inherited CLAUDE_SPAWN_*
+# namespace from the environment the payload execs claude with, so a spawned
+# session can never re-consume its own launch parameters. Single-quoted here
+# so the OUTER shell stores it literally and only the payload shell evaluates
+# `${!CLAUDE_SPAWN_@}` -- against the CHILD's environment, not this one.
+#
+# ORDERING IS THE WHOLE CONTRACT, in both directions:
+#   - This invocation's inputs are ALREADY fully consumed by the time $inner
+#     is built -- $flags and the executable baked above
+#     (CLAUDE_SPAWN_MODEL/EFFORT/CLAUDE_ARGS/CLAUDE_BIN),
+#     spawn_mode read near the top, the `python3 ... launching` identity
+#     write (ROLE/PROJECT/TASK_ID/ESCALATION_ID) long since done in its own
+#     subprocess -- so the unset can never disturb them. Deliberate inputs
+#     still reach the direct child's argv exactly as before; what changes is
+#     only that they no longer travel onward in its ENVIRONMENT.
+#   - It must precede the re-exports below, or it would erase the very
+#     per-child values being handed over.
+# Kept to ONE logical line: the mac-terminal branch writes $inner into a
+# tmpscript via printf '#!/usr/bin/env bash\n%s\n', so an embedded newline
+# would corrupt that path.
+#
+# Placing it INSIDE $inner -- not in this launcher process -- is what makes
+# it hold for every backend, including daemon-owned emulators
+# (gnome-terminal-server) that never inherit this script's own environment.
+#
+# UNCONDITIONAL, and at the TOP LEVEL of $inner -- never nested inside the
+# `[ -n "$SESSION_RECORD_DIR" ]` / `[ -n "$CLAUDE_SPAWN_RESULT_FILE" ]`
+# guards above, whose bodies are skipped on precisely the fail-soft path
+# this most needs to cover. On a registry fault result_export is the empty
+# string, so with the unset already run the child sees NO
+# CLAUDE_SPAWN_RESULT_FILE at all -- correct -- where before it inherited
+# the SPAWNER's path and would have written its own outcome over its
+# parent's result.md. The skip path must UNSET, not merely decline to set.
+#
+# Prefix-generic (`${!CLAUDE_SPAWN_@}` enumerates variable NAMES) rather
+# than an enumerated list, so a launch knob added later cannot silently fall
+# outside it, and so a value containing a newline or an `=` cannot spoof an
+# entry the way parsing `env` output can. No subprocess; bash 2.04+, so the
+# macOS bash 3.2 path the mac-terminal branch supports is fine; a safe no-op
+# under `set -u` when the namespace is empty.
+sanitize_env='for _v in ${!CLAUDE_SPAWN_@}; do unset "$_v"; done; unset _v; '
+
+# Owner-provenance token (task 4193, L2 ruling item 4-i). CLAUDE_SPAWN_SESSION_ID
+# alone cannot tell the session THIS script launched from a nested `claude` that
+# merely inherited the variable, and during the LAUNCHING window the registry
+# record carries no claude_session_id yet, so the Python layer's stdin-session_id
+# discriminator does not exist yet either -- the window is wide (measured median
+# ~27s over the live fleet, p90 ~141s) and nothing bounds it.
+#
+# `$$` is deliberately deferred (\$\$) so it expands inside $inner at RUNTIME,
+# naming the payload bash that is about to run `claude` -- and because that
+# `claude` is invoked WITHOUT exec (`cd ... && claude ...` is part of a compound
+# list with traps and a trailing `ec=$?`), the owning claude's DIRECT PARENT is
+# always exactly this pid, on every backend branch. A nested claude started from
+# inside the session has some other parent (its agent's Bash-tool shell), so it
+# mismatches. See session_ownership_probes.EventProbes.owner_ppid_verdict.
+#
+# NOT launcher_pid: this script's own $$ is not even in the owning claude's
+# ancestry under a detached emulator (gnome-terminal reparents the payload to
+# gnome-terminal-server), so a lineage test against the launcher cannot work.
+#
+# Placed AFTER $sanitize_env like the other identity exports, so a nested
+# spawn through this script overwrites rather than inherits. Purely additive:
+# a Python layer that does not read it is unaffected.
+owner_ppid_export="export CLAUDE_SPAWN_OWNER_PPID=\$\$; "
+
+# Publishes that same pid (claude's direct parent on every lane) for the
+# started-watchdog's _payload_claude_alive. Fail-soft: a failed write only
+# leaves the transcript probe as the lane's evidence.
+q_payload_pid_file=$(printf %q "$payload_pid_file")
+payload_pid_publish="{ echo \$\$ > $q_payload_pid_file; } 2>/dev/null; "
+
+inner="trap 'echo \"\${ec:-\$?}\" > $q_sentinel_tmp; mv -f $q_sentinel_tmp $q_sentinel 2>/dev/null || cat $q_sentinel_tmp > $q_sentinel 2>/dev/null || : > $q_sentinel' EXIT; \
 trap 'exit 129' HUP; \
 trap 'exit 143' TERM; \
-${spawn_id_export}${parent_id_export}${result_export}${wm_title_export}export CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1; cd $q_cwd && claude $flags $q_prompt; ec=\$?; exit \$ec"
+${sanitize_env}${spawn_id_export}${parent_id_export}${result_export}${wm_title_export}${owner_ppid_export}${payload_pid_publish}export CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1; cd $q_cwd && $q_claude_executable $flags $q_prompt; ec=\$?; exit \$ec"
 
 # How long to wait for the sentinel to appear after the launcher returns
 # (covers a hair-late write or a very fast emulator).  Tests can shrink this.
@@ -367,18 +923,109 @@ _wait_sentinel_grace() {
   [ -f "$sentinel" ]
 }
 
-finish() {
-  local rc=127
-  if [ -f "$sentinel" ]; then
-    rc=$(cat "$sentinel" 2>/dev/null || echo 127)
-  fi
-  rm -f "$sentinel"
-  # Session-registry: record the final exit code (task 2285). rc is already
-  # fully determined from the sentinel above, independent of this call, so a
-  # registry fault here can never change the spawn's exit-code contract.
+# True when $sentinel holds a settled exit code -- content, not mere
+# existence.
+#
+# THE DEFECT THIS CLOSES (esc-4389-4, task 5137). finish() used to read the
+# sentinel as `rc=$(cat "$sentinel" 2>/dev/null || echo 127)`. That fallback
+# fires only when `cat` FAILS -- but the payload's EXIT trap publishes with
+# `>`, which CREATES and TRUNCATES before the write lands, and `cat` on a
+# zero-length file SUCCEEDS and prints nothing. So a sentinel observed in
+# that window yielded rc="" and the `|| echo 127` never fired, handing the
+# empty string to both consumers: `session_registry exit --code ''`
+# (rejected by argparse, leaving the record un-updated) and `exit ""`
+# (bash usage error -> the caller sees exit 2, not a documented verdict).
+#
+# This is the same create-then-write defect class already fixed on the
+# Python side of this suite -- see
+# tests/scripts/test_spawn_claude.py::_wait_for_path (require_nonempty,
+# task 4776), whose docstring states the general principle: existence is
+# the wrong readiness signal for a file whose CONTENT is about to be
+# parsed. It is a DIFFERENT defect from task 1643 (sentinel never written
+# at all), where the file's ABSENCE is unambiguous and the old fallback
+# did fire correctly.
+#
+# "Settled" = a plain non-negative decimal integer. The only writer is
+# `echo "${ec:-$?}"`, which can emit nothing else, so any other content --
+# the empty string above all -- is by definition a partial or corrupt
+# read. No 0-255 range check: bash's `exit` already reduces mod 256 and
+# argparse's int() accepts any integer, so a range rejection would invent
+# a failure path with no caller benefit and newly reject values this
+# script has always accepted. A `case` glob rather than a regex keeps this
+# a POSIX builtin test with no subprocess, consistent with the macOS bash
+# 3.2 support this script commits to (see the mac-terminal note above).
+#
+# On success this PRINTS the validated value; on failure it prints nothing
+# and returns 1. Callers must therefore capture it -- `v=$(_sentinel_settled)`
+# -- and never call it bare in a context whose stdout is the script's own.
+# Validating and yielding in a single read is deliberate: a caller that
+# re-`cat`s the file after a bare success test reads it a SECOND time, and if
+# the sentinel is removed or re-truncated in between, that read returns the
+# empty string -- reintroducing, inside the fix, the exact defect described
+# below. One read, validated and consumed together, has no such window (and
+# costs one fork instead of three on the happy path).
+_sentinel_settled() {
+  # `local v` on its own line, NOT `local v=$(cat ...)` -- the combined
+  # form masks the substitution's exit status behind `local`'s own success.
+  local v
+  v=$(cat "$sentinel" 2>/dev/null) || return 1
+  case "$v" in ''|*[!0-9]*) return 1 ;; esac
+  printf '%s\n' "$v"
+}
+
+# The one registry write of a session's final exit code $1 (task 2285), for
+# every lane. The code is already decided, so a registry fault here can never
+# change the spawn's exit-code contract.
+record_exit() {
   if [ -n "$SESSION_RECORD_DIR" ] && command -v python3 >/dev/null 2>&1; then
-    python3 "$SESSION_REGISTRY_PY" exit --record "$SESSION_RECORD_DIR" --code "$rc" || true
+    python3 "$SESSION_REGISTRY_PY" exit --record "$SESSION_RECORD_DIR" --code "$1" || true
   fi
+}
+
+finish() {
+  # Bounded re-poll for a sentinel that EXISTS but has not settled yet --
+  # the faithful production race: the payload's write is in flight and the
+  # real exit code is on its way, so giving up on the first empty read
+  # would trade the empty-string crash for a silently destroyed exit code.
+  # Mirrors _wait_sentinel_grace's idiom exactly (same $SECONDS arithmetic,
+  # same 0.1s cadence, same budget); the only difference is the readiness
+  # predicate -- existence there, content here.
+  #
+  # Three properties, all load-bearing:
+  #   - Entered ONLY when the sentinel already exists, so the happy path
+  #     (settled on the first read) pays nothing and no caller's wall clock
+  #     moves.
+  #   - BOUNDED, with a 127 fallback. It must never become an unbounded
+  #     wait: that is precisely why the same hardening deliberately does
+  #     NOT go into await_sentinel, which has no other escape hatch and
+  #     would hang forever on a permanently-empty sentinel (truncated
+  #     write, ENOSPC) -- the failure mode the started-watchdog exists to
+  #     prevent.
+  #   - Reuses the existing SPAWN_LAUNCH_GRACE_SECS rather than adding a
+  #     new env knob. It is already this script's "how long to tolerate a
+  #     hair-late sentinel write" tunable -- semantically the identical
+  #     question.
+  #
+  # The value is CAPTURED from the predicate rather than re-read after it:
+  # `rc_read=$(_sentinel_settled)` validates and yields in one read, so there
+  # is no window between "it looked settled" and "here is the code" for the
+  # file to be removed or re-truncated. A bare assignment (no `local` prefix)
+  # is required for the loop condition to see the substitution's real exit
+  # status -- the same gotcha _sentinel_settled's own body documents. On
+  # failure the predicate prints nothing, so rc_read is empty and rc keeps
+  # its 127 default; it can never hold unvalidated content.
+  local rc=127 rc_read=""
+  if [ -f "$sentinel" ]; then
+    local end=$(( SECONDS + SPAWN_LAUNCH_GRACE_SECS ))
+    while ! rc_read=$(_sentinel_settled) && [ "$SECONDS" -lt "$end" ]; do
+      sleep 0.1
+    done
+    if [ -n "$rc_read" ]; then
+      rc=$rc_read
+    fi
+  fi
+  rm -f "$sentinel" "$sentinel.tmp"
+  record_exit "$rc"
   exit "$rc"
 }
 
@@ -397,77 +1044,60 @@ _failed_to_start_pending() {
 finish_failed_to_start() {
   local code
   code=$(cat "$fts_marker" 2>/dev/null || echo "$EXIT_FAILED_TO_START")
-  rm -f "$fts_marker" "$sentinel"
+  rm -f "$fts_marker" "$sentinel" "$sentinel.tmp"
   exit "$code"
 }
 
-# Mirror session_registry.transcript_path_for_cwd's encoding byte-for-byte:
-# every '/' then every '.' maps to '-' (empirically re-verified 2026-07-07,
-# e.g. /home/leo/src/dark-factory -> -home-leo-src-dark-factory). Used to
-# locate this spawn's transcript directory under $CLAUDE_PROJECTS_DIR.
+# Mirror of orchestrator.session_registry.encode_cwd, THE canonical cwd
+# encoding: every '/', '.' and '_' maps to '-', and case is PRESERVED (no
+# lowercasing step). E.g. /media/leo/data_lv_1/leo/reify-build ->
+# -media-leo-data-lv-1-leo-reify-build. Used to locate this spawn's transcript
+# directory under $CLAUDE_PROJECTS_DIR.
+#
+# Do not restate this rule from memory. scripts/tests/test_legibility_inventory.py's
+# TestEncoderLockstep now pins THIS copy to the canonical and to real on-disk
+# dir names, by extracting the function below and running it (task 3464). That
+# extraction anchors on exactly two things: the definition must START at column
+# 0 as `_encode_cwd()` -- not indented, and not the `function _encode_cwd`
+# form -- and its body must END at a line that is a bare `}` at column 0.
+# Nothing else is pinned: where this function sits in the file does not matter,
+# and `()` and `{` need not share a line. Break either anchor and the
+# extraction fails loudly, rather than quietly ceasing to cover this copy.
 _encode_cwd() {
   local e="${1//\//-}"
-  printf '%s' "${e//./-}"
+  e="${e//./-}"
+  printf '%s' "${e//_/-}"
 }
 
-# Best-effort: is any process named `claude` a descendant of this script's
-# own PID? Guarded end-to-end -- ps unavailable, or any parsing hiccup,
-# yields "no descendant found" (fail-soft) rather than a fault. Scoped to
-# $$'s ancestor chain so it only matches a foreground-launched claude
-# (detached emulators reparent claude away from this script, so it is
-# correctly empty there) and never a coincidental, unrelated claude process
-# elsewhere on a busy host.
-_claude_descendant_alive() {
+# Best-effort: is a process named `claude` running as the direct child of
+# the payload shell, whose pid the payload published to $payload_pid_file?
+# That parent is the same on every lane, whoever owns the payload (tmux
+# server, gnome-terminal-server, an orphaning launcher), and it never matches
+# an unrelated claude elsewhere on the host. No pidfile yet, an empty or torn
+# read, no child yet, or no pgrep/ps all mean "no evidence this poll"; the
+# watchdog re-polls.
+_payload_claude_alive() {
+  local payload_pid children tok1 tok2 rest
+  payload_pid=$(cat "$payload_pid_file" 2>/dev/null) || return 1
+  case "$payload_pid" in ''|*[!0-9]*) return 1 ;; esac
+  command -v pgrep >/dev/null 2>&1 || return 1
   command -v ps >/dev/null 2>&1 || return 1
-  # Associative arrays (bash 4+) are required below. Stock macOS ships
-  # /bin/bash 3.2 (this script explicitly supports macOS via the
-  # mac-terminal branch), where `local -A` is a hard parse/option error, not
-  # a soft failure -- and this function is polled every ~0.25s for up to
-  # SPAWN_STARTED_GRACE_SECS (default 90s) whenever no transcript is yet
-  # present, so an unguarded error here would spam the caller-captured
-  # stderr with hundreds of lines. Fail-soft: skip this best-effort probe on
-  # bash <4 and rely on the transcript probe (_started_evidence's other
-  # branch) instead.
-  [ "${BASH_VERSINFO[0]:-0}" -ge 4 ] || return 1
-
-  local -A ppid_of=()
-  local -a claude_pids=()
-  local pid ppid rest tok1 tok2 discard
-
-  while read -r pid ppid rest; do
-    [ -n "$pid" ] || continue
-    ppid_of["$pid"]="$ppid"
-    # A real `claude` CLI is commonly a shebang wrapper (e.g. node/bash), in
-    # which case `comm` reports the INTERPRETER, not "claude" -- the kernel
-    # rewrites the exec to run the interpreter with the script's own path as
-    # an argument (empirically verified: a `#!/usr/bin/env bash` script named
-    # `claude` reports comm=bash, args="bash /path/to/claude"). Match on the
-    # first two whitespace-separated tokens of the full command line instead,
-    # covering both a raw `claude` binary (tok1) and an interpreter+script
-    # pair (tok2), by comparing each token's basename.
-    read -r tok1 tok2 discard <<<"$rest"
-    if [ "${tok1##*/}" = "claude" ] || [ "${tok2##*/}" = "claude" ]; then
-      claude_pids+=("$pid")
+  children=$(pgrep -d, -P "$payload_pid" 2>/dev/null) || return 1
+  # A `claude` CLI is commonly a shebang wrapper, whose argv is
+  # "<interpreter> /path/to/claude" (comm names the interpreter), so match
+  # the basename of either the first (native binary) or second token.
+  while read -r tok1 tok2 rest; do
+    if [ "${tok1##*/}" = claude ] || [ "${tok2##*/}" = claude ]; then
+      return 0
     fi
-  done < <(ps -eo pid=,ppid=,args= 2>/dev/null)
-
-  local cand anc hops
-  for cand in "${claude_pids[@]}"; do
-    anc="${ppid_of[$cand]:-}"
-    hops=0
-    while [ -n "$anc" ] && [ "$hops" -lt 100 ]; do
-      [ "$anc" = "$$" ] && return 0
-      anc="${ppid_of[$anc]:-}"
-      hops=$(( hops + 1 ))
-    done
-  done
+  done < <(ps -o args= -p "$children" 2>/dev/null)
   return 1
 }
 
 # Positive start-evidence: either a transcript file appeared under this
 # spawn's $CLAUDE_PROJECTS_DIR/<encoded-cwd>/ newer than the spawn-time
-# reference marker, or a claude process is running as this script's
-# descendant. The transcript probe is the primary, deterministically-tested
+# reference marker, or a claude process is running as the payload shell's
+# direct child. The transcript probe is the primary, deterministically-tested
 # signal (the motivating incident is "no transcript ever appeared"); the
 # process probe is a guarded best-effort secondary.
 #
@@ -487,7 +1117,7 @@ _started_evidence() {
   if [ -d "$d" ] && [ -n "$(find "$d" -type f -newer "$spawn_ref" -print -quit 2>/dev/null)" ]; then
     return 0
   fi
-  _claude_descendant_alive && return 0
+  _payload_claude_alive && return 0
   return 1
 }
 
@@ -496,24 +1126,18 @@ _started_evidence() {
 # the launcher turns out to be foreground (blocks until window-close) or
 # detached (returns immediately). Polls up to SPAWN_STARTED_GRACE_SECS for
 # start-evidence: the exit sentinel, a fresh transcript, or a live claude
-# descendant.
+# child of the payload shell.
 #
 # On grace-expiry with no evidence, flags failed-to-start: best-effort marks
 # the session-registry record, emits a loud caller-visible stderr line, and
 # writes the fts_marker so await_sentinel/resolve_* can break out of what
 # would otherwise be an unbounded wait.
-#
-# KNOWN LIMITATION (detached slow-start false-failure): for a DETACHED
-# launcher (konsole, or a custom $CLAUDE_TERMINAL_CMD), _claude_descendant_alive
-# is always empty by construction (setsid reparents claude away from this
-# script), so the transcript probe is the ONLY positive evidence available. A
-# real claude that is merely slow to write its first transcript (heavy load,
-# cold cache) past SPAWN_STARTED_GRACE_SECS is flagged failed-to-start even
-# though it is alive and will keep running detached -- a wrong terminal
-# status (144 + registry failed-to-start), not merely a late one. There is no
-# way to retract the flag once the caller has observed it. Callers on slow or
-# loaded hosts should raise SPAWN_STARTED_GRACE_SECS accordingly; see
-# SKILL.md's Verification section for the caller-facing note.
+mark_record_failed_to_start() {
+  if [ -n "$SESSION_RECORD_DIR" ] && command -v python3 >/dev/null 2>&1; then
+    python3 "$SESSION_REGISTRY_PY" refresh --record "$SESSION_RECORD_DIR" --status failed-to-start || true
+  fi
+}
+
 _started_watchdog() {
   # Clear inherited traps in this backgrounded copy -- without this, the
   # child would run the parent's _cleanup on its own return, which would be
@@ -521,6 +1145,21 @@ _started_watchdog() {
   # for a background job.
   trap - EXIT HUP TERM
 
+  # DELIBERATE ASYMMETRY with finish() (task 5137): both sentinel checks
+  # below stay EXISTENCE tests, and must not be "unified" with finish()'s
+  # content-aware _sentinel_settled. The two gates ask different questions.
+  # finish() asks "what exit code did the session report?", which requires
+  # CONTENT. This watchdog asks "did the payload ever start?", and the
+  # sentinel path being created AT ALL already proves it did -- the file can
+  # only come into existence because $inner's EXIT trap fired, which happens
+  # strictly after the payload shell started. Requiring non-empty here would
+  # be more conservative than the evidence warrants and could, at the grace
+  # boundary, flag a live session failed-to-start (exit 144, a loud
+  # caller-visible stderr line, and a registry status that cannot be
+  # retracted) purely because a write was mid-flight. With the atomic
+  # publish in $inner the two readings coincide anyway -- so the distinction
+  # costs nothing, but leaving it undocumented would invite exactly that
+  # unification.
   local end
   end=$(( $(date +%s) + SPAWN_STARTED_GRACE_SECS ))
   while [ "$(date +%s)" -lt "$end" ]; do
@@ -532,9 +1171,7 @@ _started_watchdog() {
   # deadline boundary.
   [ -f "$sentinel" ] && return 0
 
-  if [ -n "$SESSION_RECORD_DIR" ] && command -v python3 >/dev/null 2>&1; then
-    python3 "$SESSION_REGISTRY_PY" refresh --record "$SESSION_RECORD_DIR" --status failed-to-start || true
-  fi
+  mark_record_failed_to_start
   # Deliberately do NOT assert a specific final exit code here: resolve_foreground
   # and resolve_detached's launch_rc!=0 branch both prefer the more specific,
   # pre-existing 127 launcher-failure verdict over this flag when both fire for
@@ -595,8 +1232,12 @@ resolve_detached() {
 }
 
 # resolve_sibling: called after a sibling-mode (Fleet Cockpit C7) child has
-# been launched detached (setsid, stdio redirected off this script's own
-# pipe -- see the emulator case dispatch below). Deliberately does NOT wait
+# been launched detached (via _detach above on the emulator branches that
+# detach themselves, which applies setsid only where this host can actually
+# run it -- and not at all on the mac-terminal lane, where `open` already
+# detaches via LaunchServices and stock macOS ships no setsid -- plus stdio
+# redirected off this script's own pipe; see the emulator case dispatch
+# below). Deliberately does NOT wait
 # on the sentinel at all: the whole point of sibling mode is fire-and-forget
 # -- e.g. the /prd author->decompose handoff must spawn its sibling and exit
 # cleanly, not babysit it until it finishes. Best-effort refreshes the
@@ -611,13 +1252,18 @@ resolve_detached() {
 #
 # KNOWN LEAK (deliberate -- same shape as the mac-terminal tmpscript leak
 # further below): $inner's EXIT trap (see the `inner=` assignment above)
-# still writes `${ec:-$?}` to $sentinel whenever the detached child
+# still publishes `${ec:-$?}` to $sentinel whenever the detached child
 # eventually exits, but by then this script has long since returned via the
 # `exit 0` below. finish() and finish_failed_to_start() are the only two
 # removers of $sentinel, and sibling mode reaches neither, so one stale
-# "*.done" file per sibling spawn accumulates in TMPDIR. Not worth chasing
-# for a few stray bytes in TMPDIR -- reclaimed by normal OS tmp-dir cleanup,
-# same as the mac-terminal tmpscript leak.
+# "*.done" file per sibling spawn accumulates in TMPDIR. Still exactly ONE
+# file per spawn after the task-5137 atomic publish: the trap writes
+# "$sentinel.tmp" and RENAMES it onto $sentinel, so the temp is consumed by
+# the rename rather than added to this leak. Likewise one "*.pid" file per
+# sibling spawn: the payload publishes $payload_pid_file after _cleanup has
+# already run. Not worth chasing for a few stray bytes in TMPDIR --
+# reclaimed by normal OS tmp-dir cleanup, same as the mac-terminal tmpscript
+# leak.
 #
 # KNOWN LIMITATION (started-verification watchdog does not apply here): the
 # _started_watchdog background job (forked below, before the emulator case
@@ -635,9 +1281,184 @@ resolve_sibling() {
   exit 0
 }
 
+# _detach: launch "$@" as the detached background job a sibling-mode (Fleet
+# Cockpit C7) spawn needs, from the emulator branches that have to detach
+# themselves (xterm/kitty/konsole/custom -- NOT mac-terminal, whose `open`
+# is already detached by the LaunchServices handoff; see that branch).
+#
+# `setsid` (new session, so the emulator survives this script's exit) is
+# applied only when this host can actually run it. setsid(1) is util-linux and
+# stock macOS does not ship it, so a literal `setsid <emu> ...` there failed
+# 127 into /dev/null: the emulator was never launched at all, while
+# resolve_sibling still stamped the record RUNNING -- a false liveness
+# signal for a session that does not exist. That is the task-4058 bug, and
+# it reached every one of these branches on macOS, not just mac-terminal:
+# any $CLAUDE_TERMINAL_CMD naming a non-Terminal launcher (iTerm, wezterm,
+# alacritty, a wrapper script) lands in the custom `*)` branch below. Where
+# setsid is missing we degrade to the plain `&` -- a weaker detach than a
+# new session, but a child that is actually launched beats a silent
+# no-launch.
+#
+# A function rather than a `prefix=(setsid)` array because `set -u` is in
+# force: expanding an EMPTY array as "${prefix[@]}" aborts with "unbound
+# variable" on bash 3.2 -- the exact bash stock macOS ships, i.e. precisely
+# the host the conditional exists for.
+#
+# The `</dev/null >/dev/null 2>&1` redirect is applied in BOTH arms and is
+# not optional: without it a caller capturing this script's output (e.g.
+# /spawn's background task) blocks until the detached emulator itself exits.
+#
+# The guard is a FUNCTIONAL probe (fork a no-op through setsid) rather than
+# `command -v setsid`, because what this branch needs to know is whether
+# setsid actually RUNS here -- true-negative both when it is absent and when
+# something named setsid is on PATH but cannot execute (which is also how the
+# condition is reproduced in tests/scripts/test_spawn_claude.py, where a
+# shim exiting 127 without exec'ing its argv stands in for the macOS host).
+# Costs one fork per sibling spawn, once, at launch time.
+_detach() {
+  if setsid true >/dev/null 2>&1; then
+    setsid "$@" </dev/null >/dev/null 2>&1 &
+  else
+    "$@" </dev/null >/dev/null 2>&1 &
+  fi
+}
+
+# --- t3 lane ---------------------------------------------------------------
+# A T3 Code thread hosts the session, so the payload $inner, the sentinel and
+# the started-watchdog play no part: spawn_t3_lane.py launches the thread,
+# awaits its start (binding its transcript to the record) and, in child mode,
+# joins on its result.md. Any fault or unknown verdict is a launcher failure.
+
+launch_t3_thread() {
+  local thread_title="${title:-${SESSION_RECORD_DIR##*/}}"
+  [ -n "$thread_title" ] || thread_title="spawned claude session"
+  t3_prompt_file=$(mktemp -t spawn-claude-t3-prompt-XXXXXX)
+  printf '%s' "$prompt" > "$t3_prompt_file"
+  local -a args=(launch --cwd "$cwd" --title "$thread_title" --prompt-file "$t3_prompt_file" --record "$SESSION_RECORD_DIR")
+  [ -n "${CLAUDE_SPAWN_MODEL:-}" ] && args+=(--model "$CLAUDE_SPAWN_MODEL")
+  [ -n "${CLAUDE_SPAWN_EFFORT:-}" ] && args+=(--effort "$CLAUDE_SPAWN_EFFORT")
+  [ -n "$t3_provider" ] && args+=(--provider "$t3_provider")
+  [ -n "${parent_of_child:-}" ] && args+=(--parent "$parent_of_child")
+  [ "$skip_perms" = "true" ] && args+=(--skip-permissions)
+  t3_launch_epoch=$(date +%s)
+  t3_lane_call "${args[@]}"
+  case "$(verdict_status "$t3_verdict")" in
+    started)
+      t3_thread_id=$(verdict_field "$t3_verdict" thread_id)
+      [ -n "$t3_thread_id" ] || t3_lane_unexpected launch
+      ;;
+    no-launcher) report_no_t3_launcher ;;
+    refused) refuse_the_t3_launch ;;
+    launch-failed)
+      echo "spawn-claude.sh: t3 lane: the thread launch failed -- $(verdict_text "$t3_verdict" detail)" >&2
+      exit 127
+      ;;
+    effort-unconfirmed) report_unconfirmed_t3_effort ;;
+    *) t3_lane_unexpected launch ;;
+  esac
+}
+
+# $t3_verdict is launch's `effort-unconfirmed thread_id=... asked=... got=...`:
+# the thread was launched and runs, but T3 does not report the asked effort.
+report_unconfirmed_t3_effort() {
+  local thread asked got
+  thread=$(verdict_text "$t3_verdict" thread_id)
+  asked=$(verdict_text "$t3_verdict" asked)
+  got=$(verdict_text "$t3_verdict" got)
+  echo "spawn-claude.sh: t3 lane: T3 thread $thread was launched with effort '$got', not the requested '$asked'; it is running (record: ${SESSION_RECORD_DIR:-none}) -- archive it in T3 or reconfigure it before relying on it" >&2
+  exit 127
+}
+
+# $t3_verdict is launch's `no-launcher reason=<word> [detail=...]`; only the
+# credential family of reasons is spelled t3-mcp-*.
+report_no_t3_launcher() {
+  local reason detail
+  reason=$(verdict_field "$t3_verdict" reason)
+  detail=$(verdict_text "$t3_verdict" detail)
+  case "$reason" in
+    t3-mcp-*)
+      echo "spawn-claude.sh: the t3 lane, selected $t3_lane_origin, cannot reach T3's MCP server with this host's credential ($reason${detail:+: $detail}) -- pair it with 'PYTHONPATH=$REPO_ROOT/orchestrator/src python3 $SPAWN_T3_LANE_PY pair' ('pair --code <code>' off the T3 host), or set CLAUDE_SPAWN_BACKEND=tmux or wm" >&2
+      ;;
+    *)
+      echo "spawn-claude.sh: the t3 lane, selected $t3_lane_origin, has no launcher ($reason${detail:+: $detail}) -- start T3 Code, or set CLAUDE_SPAWN_BACKEND=tmux or wm" >&2
+      ;;
+  esac
+  exit 126
+}
+
+# $t3_verdict is launch's `refused reason=<word> [detail=...]`.
+refuse_the_t3_launch() {
+  local reason detail
+  reason=$(verdict_field "$t3_verdict" reason)
+  detail=$(verdict_text "$t3_verdict" detail)
+  case "$reason" in
+    provider-disabled) refuse_disabled_t3_provider ;;
+    effort-needs-model) refuse_t3_effort_without_model ;;
+    cwd-not-project-worktree)
+      t3_lane_refuse "cwd=$cwd ($reason: $detail)" \
+        "T3 does not list it as a worktree of its project; pass the project root or a worktree T3 lists, or set CLAUDE_SPAWN_BACKEND=tmux or wm"
+      ;;
+    project-archived)
+      t3_lane_refuse "cwd=$cwd ($reason: $detail)" \
+        "the T3 project at that root is archived; unarchive it in T3, or set CLAUDE_SPAWN_BACKEND=tmux or wm"
+      ;;
+    cwd-outside-projects)
+      t3_lane_refuse "cwd=$cwd ($reason)" \
+        "no T3 project contains it; add its project to T3, or set CLAUDE_SPAWN_BACKEND=tmux or wm"
+      ;;
+    *) t3_lane_unexpected launch ;;
+  esac
+}
+
+await_t3_thread_started() {
+  local status
+  t3_lane_call await-started --thread-id "$t3_thread_id" --cwd "$cwd" --record "$SESSION_RECORD_DIR" \
+    --timeout "$SPAWN_STARTED_GRACE_SECS" --since "$t3_launch_epoch"
+  status=$(verdict_status "$t3_verdict")
+  case "$status" in
+    started) ;;
+    failed-to-start|timeout)
+      mark_record_failed_to_start
+      echo "spawn-claude.sh: FAILED-TO-START — T3 thread $t3_thread_id did not start ($status) within ${SPAWN_STARTED_GRACE_SECS}s; registry marked failed-to-start." >&2
+      exit "$EXIT_FAILED_TO_START"
+      ;;
+    *) t3_lane_unexpected await-started ;;
+  esac
+}
+
+# Exit 127 (the table is liveness-only), but say what it means here: the
+# thread was started and may still be running.
+t3_lane_join_lost() {
+  echo "spawn-claude.sh: t3 lane: JOIN LOST — $1; T3 thread $t3_thread_id may still be running (record: ${SESSION_RECORD_DIR:-none}); check it before spawning again" >&2
+  exit 127
+}
+
+join_t3_thread() {
+  local code rc
+  t3_verdict=$(t3_lane_module wait --thread-id "$t3_thread_id" --cwd "$cwd" --record "$SESSION_RECORD_DIR")
+  rc=$?
+  if [ "$rc" -ne 0 ] || [ "$(verdict_status "$t3_verdict")" != "finished" ]; then
+    t3_lane_join_lost "spawn_t3_lane.py wait exited $rc with verdict '$t3_verdict'"
+  fi
+  code=$(verdict_field "$t3_verdict" code)
+  case "$code" in ''|*[!0-9]*) t3_lane_join_lost "spawn_t3_lane.py wait answered '$t3_verdict'" ;; esac
+  record_exit "$code"
+  exit "$code"
+}
+
+# A sibling spawn's only stdout line names the record `launch` stamped (display
+# t3, running) before it answered `started`, so the caller reads that record
+# instead of looking one up by title. Both values are lane tokens:
+# $t3_thread_id is already one, as `started` printed it.
+name_t3_sibling_on_stdout() {
+  printf 'record=%s t3_thread_id=%s\n' "$(lane_token "$SESSION_RECORD_DIR")" "$t3_thread_id"
+}
+
 # --- emulator selection ----------------------------------------------------
 
-if [ "${CLAUDE_SPAWN_BACKEND:-}" = "tmux" ]; then
+if [ "$spawn_backend" = "t3" ]; then
+  first_word="t3-lane"
+elif [ "$spawn_backend" = "tmux" ]; then
   # Fleet Cockpit C6: the tmux lane is crash-survivable/reattachable and
   # needs no terminal emulator at all -- bypass discovery entirely.
   # first_word drives the case dispatch further down exactly like a
@@ -679,13 +1500,16 @@ fi
 # _cleanup + trap installed earlier (right after the mktemp calls near the
 # top of the script), so spawn_ref can never leak -- including on the
 # `exit 126` (no emulator found) path just above. Only the fork itself
-# happens here, immediately before the emulator case dispatch. Forked
-# unconditionally, including for spawn_mode=sibling -- see resolve_sibling's
-# KNOWN LIMITATION comment above for why this watchdog can never actually
-# flag failed-to-start on that path.
+# happens here, immediately before the emulator case dispatch. Forked for
+# every lane except t3 (which has no sentinel or terminal transcript race;
+# its start is spawn_t3_lane.py `await-started`), including for
+# spawn_mode=sibling -- see resolve_sibling's KNOWN LIMITATION comment above
+# for why this watchdog can never actually flag failed-to-start on that path.
 watchdog_pid=""
-_started_watchdog &
-watchdog_pid=$!
+if [ "$first_word" != "t3-lane" ]; then
+  _started_watchdog &
+  watchdog_pid=$!
+fi
 
 case "$first_word" in
   gnome-terminal)
@@ -706,15 +1530,16 @@ case "$first_word" in
     ;;
   xterm)
     # xterm is naturally foreground -- in sibling mode (Fleet Cockpit C7) it
-    # must be detached explicitly: setsid (survive this script's exit) and
-    # stdio redirected off this script's own pipe (else a caller capturing
+    # must be detached explicitly, which is what _detach above does: setsid
+    # where this host can run it (survive this script's exit), plus stdio
+    # redirected off this script's own pipe (else a caller capturing
     # this script's output, e.g. /spawn's background task, would block
     # until the detached xterm itself exits).
     args=()
     [ -n "$title" ] && args+=(-T "$title")
     args+=(-e bash -c "$inner")
     if [ "$spawn_mode" = "sibling" ]; then
-      setsid xterm "${args[@]}" </dev/null >/dev/null 2>&1 &
+      _detach xterm "${args[@]}"
       resolve_sibling
     else
       xterm "${args[@]}"
@@ -728,7 +1553,7 @@ case "$first_word" in
     [ -n "$title" ] && args+=(--title "$title")
     args+=(bash -c "$inner")
     if [ "$spawn_mode" = "sibling" ]; then
-      setsid kitty "${args[@]}" </dev/null >/dev/null 2>&1 &
+      _detach kitty "${args[@]}"
       resolve_sibling
     else
       kitty "${args[@]}"
@@ -744,7 +1569,7 @@ case "$first_word" in
     [ -n "$title" ] && args+=(-p "tabtitle=$title")
     args+=(-e bash -c "$inner")
     if [ "$spawn_mode" = "sibling" ]; then
-      setsid konsole "${args[@]}" </dev/null >/dev/null 2>&1 &
+      _detach konsole "${args[@]}"
       resolve_sibling
     else
       konsole "${args[@]}" &
@@ -758,21 +1583,58 @@ case "$first_word" in
     printf '#!/usr/bin/env bash\n%s\n' "$inner" > "$tmpscript"
     chmod +x "$tmpscript"
     if [ "$spawn_mode" = "sibling" ]; then
-      # Detach explicitly, same as xterm/kitty above. Deliberately do NOT
-      # rm the tmpscript here (unlike the non-sibling path below) --
-      # Terminal.app is still reading/executing it after this script
-      # returns, so removing it now would race the launch; it is a
-      # best-effort leak reclaimed by normal OS tmp-dir cleanup.
-      setsid open -a Terminal "$tmpscript" </dev/null >/dev/null 2>&1 &
-      resolve_sibling
+      # NOT routed through _detach, unlike xterm/kitty/konsole above --
+      # this branch is the deliberate exception. setsid(1) is util-linux and
+      # is not installed on stock macOS, the only platform that ever selects
+      # this branch, so the prefix made the launch fail 127 into /dev/null
+      # while resolve_sibling still stamped the record RUNNING: a false
+      # liveness signal for a child that was never launched at all. `open`
+      # hands off to LaunchServices and is already detached, so the stdio
+      # redirect is the whole detach this branch needs.
+      #
+      # Run in the FOREGROUND and branch on the rc rather than discarding it
+      # behind a trailing `&`: `open` returns as soon as LaunchServices
+      # takes the handoff, so this branch (uniquely) can tell whether the
+      # launch actually happened without giving up fire-and-forget. Swallowing
+      # that rc would leave the SAME false-liveness hole open from a different
+      # cause -- Terminal.app absent/unregistered, an unreadable tmpscript, a
+      # LaunchServices error -- with resolve_sibling stamping RUNNING for a
+      # session that never started. On failure: drop the sentinel and exit
+      # 127, the same genuine-launcher-failure verdict the non-sibling path
+      # below returns; the record is left LAUNCHING (never refreshed to
+      # RUNNING) for the normal stale-pid reaper. The tmpscript is NOT removed
+      # even there -- a nonzero rc does not prove LaunchServices dropped the
+      # handoff, and racing a launch that did happen is worse than the stray
+      # bytes (see the leak note below).
+      #
+      # Deliberately do NOT rm the tmpscript here (unlike the non-sibling
+      # path below) -- Terminal.app is still reading/executing it after
+      # this script returns, so removing it now would race the launch; it
+      # is a best-effort leak reclaimed by normal OS tmp-dir cleanup.
+      if open -a Terminal "$tmpscript" </dev/null >/dev/null 2>&1; then
+        resolve_sibling
+      else
+        rm -f "$sentinel" "$sentinel.tmp"
+        exit 127
+      fi
     else
-      open -a Terminal "$tmpscript" || { rm -f "$tmpscript" "$sentinel"; exit 127; }
+      open -a Terminal "$tmpscript" || { rm -f "$tmpscript" "$sentinel" "$sentinel.tmp"; exit 127; }
       await_sentinel
       rm -f "$tmpscript"
       if _failed_to_start_pending; then
         finish_failed_to_start
       fi
       finish
+    fi
+    ;;
+  t3-lane)
+    launch_t3_thread
+    await_t3_thread_started
+    if [ "$spawn_mode" = "sibling" ]; then
+      name_t3_sibling_on_stdout
+      resolve_sibling
+    else
+      join_t3_thread
     fi
     ;;
   tmux-lane)
@@ -828,15 +1690,21 @@ case "$first_word" in
   *)
     # User-supplied launcher via $CLAUDE_TERMINAL_CMD. Assume `<cmd> -- bash -c '<payload>'`
     # and detaching semantics — wait on sentinel (or, in sibling mode,
-    # detach explicitly via setsid + stdio redirect and don't wait at all --
-    # same treatment as xterm/kitty/mac-terminal above).
+    # detach explicitly via _detach (setsid where this host can run it) +
+    # stdio redirect and don't wait at all -- same treatment as
+    # xterm/kitty/konsole above. NOT mac-terminal: that branch detaches via
+    # `open`'s LaunchServices handoff and deliberately never calls setsid --
+    # see its own note. This branch is where a macOS user who points
+    # $CLAUDE_TERMINAL_CMD at iTerm/wezterm/alacritty/a wrapper script
+    # lands, which is why its detach must be the setsid-conditional
+    # _detach and not a literal prefix).
     # Word-split $emulator into an array so multi-word commands like
     # "some-term --opt" work.  Do NOT use eval: $inner contains literal double
     # quotes which break the quoting when eval re-parses "bash -c \"$inner\"".
     # shellcheck disable=SC2206
     _emcmd=($emulator)
     if [ "$spawn_mode" = "sibling" ]; then
-      setsid "${_emcmd[@]}" -- bash -c "$inner" </dev/null >/dev/null 2>&1 &
+      _detach "${_emcmd[@]}" -- bash -c "$inner"
       resolve_sibling
     else
       "${_emcmd[@]}" -- bash -c "$inner" &

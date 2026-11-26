@@ -6,39 +6,37 @@ without sys.path pollution — mirrors the pattern in test_cleanup_count_snapsho
 from __future__ import annotations
 
 import argparse
-import importlib.util
+import asyncio
 import sys
-import types
 from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from _fm_helpers import load_script_module
+from _store_mutation_preflight_contract import (
+    SENTINEL,
+    deny,
+    fail_closed_records,
+    neutralise_fixture,
+)
+
+from fused_memory.utils.store_mutation_preflight import StoreMutationUnavailable
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'prune_recon_cycle_summaries.py'
 
 
-def _load_module() -> types.ModuleType:
-    """Load prune_recon_cycle_summaries.py from its file path.
-
-    The module is registered in sys.modules under its name so that
-    reflection-based decorators (e.g. @dataclass) work correctly.
-    """
-    mod_name = 'prune_recon_cycle_summaries'
-    spec = importlib.util.spec_from_file_location(mod_name, SCRIPT_PATH)
-    if spec is None or spec.loader is None:
-        raise ImportError(f'Cannot load {SCRIPT_PATH}')
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[mod_name] = module  # required for @dataclass __module__ lookup
-    try:
-        spec.loader.exec_module(module)  # type: ignore[union-attr]
-    except Exception:
-        sys.modules.pop(mod_name, None)
-        raise
-    return module
+_mod = load_script_module(SCRIPT_PATH, mod_name='prune_recon_cycle_summaries')
 
 
-_mod = _load_module()
+_neutralise = neutralise_fixture(
+    _mod,
+    note="""``run(..., apply=True)`` runs the preflight before it scans (task
+    4127). This suite is deliberately MOCK-unit (a MagicMock memory service, no
+    live Qdrant). ``TestRunApplyStoreMutationPreflight`` re-rigs this per test
+    -- to refuse, to record, or to pass -- so the guard's own behaviour is
+    still pinned explicitly rather than assumed away.""",
+)
 
 
 # ===========================================================================
@@ -597,7 +595,7 @@ class TestRun:
     """Async end-to-end tests for run(args, *, memory, known_projects_map)."""
 
     def _fixture_records(self) -> list[dict]:
-        """4 stage1 + 3 stage2 + 2 unrelated records.
+        """4 stage1 + 3 stage2 + 3 unrelated records.
 
         With keep_recent=2:
           stage1 (memory_consolidator): keeps the 2 newest ('s1-newest',
@@ -605,7 +603,7 @@ class TestRun:
             deletes 1 older quiescent ('s1-old-quiescent').
           stage2 (task_knowledge_sync): keeps the 2 newest ('s2-newest',
             's2-mid'); deletes 1 older quiescent ('s2-old-quiescent').
-          The 2 unrelated records must never appear in either pool.
+          The 3 unrelated records must never appear in either pool.
         """
         return [
             _cycle_summary_record('s1-newest', 'memory_consolidator', '2026-06-01T00:00:00+00:00'),
@@ -628,6 +626,15 @@ class TestRun:
             _unrelated_record(
                 'u2-wrong-stage',
                 metadata={'kind': 'cycle_summary', 'stage': 'task_knowledge_analyzer'},
+            ),
+            _unrelated_record(
+                'u3-pool-tagged-wrong-kind',
+                metadata={
+                    'kind': 'note',
+                    'stage': 'memory_consolidator',
+                    'recon_pool': 'stage1_cycle_summary',
+                    'data': '0 mutations. Quiescent cycle.',
+                },
             ),
         ]
 
@@ -710,9 +717,15 @@ class TestRun:
     @pytest.mark.asyncio
     async def test_unrelated_records_excluded_from_report(self):
         """Records with kind != cycle_summary, or an unrecognised stage, never
-        appear in either pool's scanned count or in the deletions list."""
-        memory = self._make_memory(self._fixture_records())
-        args = self._args(apply=False, project_id='dark_factory')
+        appear in either pool's scanned count or in the deletions list — even
+        when the scroll hands them over. That includes a record carrying a
+        pool's recon_pool tag and a pool stage without kind='cycle_summary':
+        the script keys on kind + stage, never on recon_pool (task 3239)."""
+        records = self._fixture_records()
+        memory = self._make_memory(records)
+        memory.mem0.scroll_by_metadata.return_value = records
+        memory.mem0.count_by_metadata.return_value = len(records)
+        args = self._args(apply=True, project_id='dark_factory')
 
         report = await _mod.run(args, memory=memory, known_projects_map=self._known_map())
 
@@ -721,10 +734,11 @@ class TestRun:
             for pools in report['projects'].values()
             for pool_stats in pools.values()
         )
-        assert total_scanned == 7  # 4 stage1 + 3 stage2; the 2 unrelated records excluded
-        all_deletion_ids = {d['id'] for d in report['deletions']}
-        assert 'u1-wrong-kind' not in all_deletion_ids
-        assert 'u2-wrong-stage' not in all_deletion_ids
+        assert total_scanned == 7  # 4 stage1 + 3 stage2; the 3 unrelated records excluded
+        unrelated_ids = {'u1-wrong-kind', 'u2-wrong-stage', 'u3-pool-tagged-wrong-kind'}
+        assert unrelated_ids.isdisjoint(d['id'] for d in report['deletions'])
+        called_ids = {c.kwargs.get('memory_id') for c in memory.delete_memory.call_args_list}
+        assert unrelated_ids.isdisjoint(called_ids)
 
     @pytest.mark.asyncio
     async def test_scan_uses_metadata_filtered_scroll(self):
@@ -909,3 +923,254 @@ class TestArgparse:
         )
         assert args.scan_limit == 2000
         assert args.limit_per_project == 50
+
+
+# ===========================================================================
+# Tests: --apply store-mutation preflight
+# ===========================================================================
+
+class TestRunApplyStoreMutationPreflight:
+    """``--apply`` refuses to START when this process cannot write mem0's store.
+
+    Ported from ``test_sweep_toolcall_xml_leak.TestRunApplyStoreMutationPreflight``
+    (task 3686), which is the in-repo precedent for this contract.
+
+    ``apply_prune`` fans its deletes out through
+    ``asyncio.gather(..., return_exceptions=True)`` and tallies per-result
+    outcomes rather than aborting, so in a write-denied environment it would
+    destroy Qdrant points one by one and report each history-write failure as
+    an individual error -- mem0's ``_delete_memory`` removes the point BEFORE
+    writing its SQLite history. Only a run-wide probe ahead of the scan bounds
+    that.
+    """
+
+    def _make_memory(self, records: list[dict] | None = None) -> MagicMock:
+        """Mirror of ``TestRun._make_memory``."""
+        memory = MagicMock()
+        mem0 = MagicMock()
+        all_records = records if records is not None else []
+        scroll_records = [
+            r for r in all_records if (r.get('metadata') or {}).get('kind') == 'cycle_summary'
+        ]
+        mem0.get_all = AsyncMock(return_value={'results': all_records})
+        mem0.scroll_by_metadata = AsyncMock(return_value=scroll_records)
+        mem0.count_by_metadata = AsyncMock(return_value=len(scroll_records))
+        memory.mem0 = mem0
+        memory.delete_memory = AsyncMock(return_value={'status': 'deleted'})
+        return memory
+
+    #: Pure-quiescent boilerplate. ``carries_remediation_history`` is fail-safe
+    #: (anything ambiguous is PRESERVED), so a deletable fixture must be
+    #: unambiguously quiescent or nothing is ever classified for deletion and
+    #: the ``--apply`` assertions become vacuous.
+    _QUIESCENT = 'Cycle summary: quiescent cycle. 0 new episodes, 0 mutations.'
+
+    def _records(self) -> list[dict]:
+        """Three quiescent summaries in one pool: with keep_recent=2 exactly
+        one (the oldest) is deletable, so ``--apply`` has real work to refuse."""
+        return [
+            _cycle_summary_record(
+                'm1', 'memory_consolidator', '2026-01-01T00:00:00+00:00', self._QUIESCENT,
+            ),
+            _cycle_summary_record(
+                'm2', 'memory_consolidator', '2026-01-02T00:00:00+00:00', self._QUIESCENT,
+            ),
+            _cycle_summary_record(
+                'm3', 'memory_consolidator', '2026-01-03T00:00:00+00:00', self._QUIESCENT,
+            ),
+        ]
+
+    def _args(
+        self, apply=True, project_id: str | None = 'dark_factory', keep_recent=2,
+        limit_per_project=1000, yes_i_am_sure=False, scan_limit=10000,
+    ) -> argparse.Namespace:
+        return argparse.Namespace(
+            apply=apply,
+            project_id=project_id,
+            keep_recent=keep_recent,
+            limit_per_project=limit_per_project,
+            yes_i_am_sure=yes_i_am_sure,
+            scan_limit=scan_limit,
+        )
+
+    def _known_map(self, pid='dark_factory') -> dict:
+        return {pid: '/some/path'}
+
+    @pytest.mark.asyncio
+    async def test_apply_performs_zero_mutations_when_the_store_is_unwritable(
+        self, monkeypatch
+    ):
+        """The whole point: refuse to start rather than half-complete."""
+        deny(_mod, monkeypatch)
+        memory = self._make_memory(self._records())
+
+        with pytest.raises(
+            StoreMutationUnavailable, match=SENTINEL
+        ):
+            await _mod.run(
+                self._args(apply=True), memory=memory,
+                known_projects_map=self._known_map(),
+            )
+
+        memory.delete_memory.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_the_guard_sits_before_the_per_project_scan(self, monkeypatch):
+        """It aborts without scanning. The scan loop issues one
+        ``scroll_by_metadata`` plus a conditional ``count_by_metadata`` PER
+        PROJECT, and ``--project-id`` is optional, so the wasted work would
+        otherwise scale with the size of the project registry."""
+        deny(_mod, monkeypatch)
+        memory = self._make_memory(self._records())
+
+        with pytest.raises(StoreMutationUnavailable):
+            await _mod.run(
+                self._args(apply=True, project_id=None), memory=memory,
+                known_projects_map={'dark_factory': '/a', 'reify': '/b', 'knowlive': '/c'},
+            )
+
+        memory.mem0.scroll_by_metadata.assert_not_awaited()
+        memory.mem0.count_by_metadata.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_dry_run_is_never_gated_on_write_capability(self, monkeypatch):
+        """A read-only run mutates nothing, so it must not require the ability
+        to mutate -- the prune report stays obtainable from anywhere."""
+        deny(_mod, monkeypatch)
+        memory = self._make_memory(self._records())
+
+        report = await _mod.run(
+            self._args(apply=False), memory=memory,
+            known_projects_map=self._known_map(),
+        )
+
+        assert report['dry_run'] is True
+        assert report['projects']['dark_factory']['memory_consolidator']['deletable'] == 1
+        assert report['projects']['dark_factory']['memory_consolidator']['deleted'] == 0
+        memory.mem0.scroll_by_metadata.assert_awaited()
+        memory.delete_memory.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_apply_is_unchanged_when_the_preflight_passes(self):
+        """Happy path: a writable environment prunes exactly as before."""
+        memory = self._make_memory(self._records())
+
+        report = await _mod.run(
+            self._args(apply=True), memory=memory,
+            known_projects_map=self._known_map(),
+        )
+
+        memory.delete_memory.assert_awaited_once()
+        assert report['dry_run'] is False
+        assert report['projects']['dark_factory']['memory_consolidator']['deleted'] == 1
+
+    @pytest.mark.asyncio
+    async def test_the_probe_names_the_operation_being_gated(self, monkeypatch):
+        """The refusal has to be attributable in a log, so the operation string
+        identifies this script and its mutating mode."""
+        calls: list[dict] = []
+        monkeypatch.setattr(
+            _mod, 'assert_store_mutation_allowed', lambda **kw: calls.append(kw)
+        )
+        memory = self._make_memory(self._records())
+
+        await _mod.run(
+            self._args(apply=True, project_id=None), memory=memory,
+            known_projects_map={'dark_factory': '/a', 'reify': '/b'},
+        )
+
+        assert len(calls) == 1, 'probed ONCE per run, not once per project or record'
+        assert 'prune_recon_cycle_summaries' in calls[0]['operation']
+        assert '--apply' in calls[0]['operation']
+
+    @pytest.mark.asyncio
+    async def test_the_refusal_is_not_masked_by_the_scan_truncation_abort(
+        self, monkeypatch
+    ):
+        """``check_scan_completeness``'s hard abort returns a report-shaped
+        payload through the NORMAL return path. If the preflight sat downstream
+        of it, a write-denied ``--apply`` could come back as an ordinary handled
+        outcome instead of a refusal. Pin that it RAISES.
+
+        Rigged so the scan WOULD abort: an empty scroll against a non-zero
+        ground-truth count is the under-count case.
+        """
+        deny(_mod, monkeypatch)
+        memory = self._make_memory([])
+        memory.mem0.count_by_metadata = AsyncMock(return_value=7)
+
+        with pytest.raises(StoreMutationUnavailable):
+            await _mod.run(
+                self._args(apply=True), memory=memory,
+                known_projects_map=self._known_map(),
+            )
+
+        memory.delete_memory.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_the_refusal_is_not_masked_by_the_limit_cap_abort(
+        self, monkeypatch
+    ):
+        """``check_limit_cap``'s hard abort likewise returns a report-shaped
+        payload through the normal return path. Rigged so the cap WOULD abort
+        (``--limit-per-project 0`` against a non-zero deletable count), a
+        denied ``--apply`` must still raise rather than return that payload.
+
+        Note ``--yes-i-am-sure`` is NOT a dry-run switch -- it only overrides
+        this cap -- so it must not affect the preflight either way.
+        """
+        deny(_mod, monkeypatch)
+        memory = self._make_memory(self._records())
+
+        with pytest.raises(StoreMutationUnavailable):
+            await _mod.run(
+                self._args(apply=True, limit_per_project=0), memory=memory,
+                known_projects_map=self._known_map(),
+            )
+
+        memory.delete_memory.assert_not_awaited()
+
+    def test_the_refusal_escapes_main_and_is_never_a_report_shaped_success(
+        self, monkeypatch, caplog
+    ):
+        """``main`` calls ``asyncio.run`` bare -- no try/except -- and its only
+        other outcomes are ``0``/``1`` derived from ``report['aborted']``. So
+        the refusal must PROPAGATE all the way out and exit the interpreter
+        non-zero via an uncaught traceback, never collapsing into either of
+        those report-shaped returns.
+
+        Driven through ``main`` (the ``purge``/``sweep`` suites' ``_drive``
+        idiom) precisely because that is where the claim lives: asserting only
+        that ``run`` raises leaves the swallowed-on-the-way-out case -- the one
+        that would read as a successful prune -- untested.
+        """
+        deny(_mod, monkeypatch)
+        memory = self._make_memory(self._records())
+        monkeypatch.setattr(
+            sys, 'argv', ['prune_recon_cycle_summaries.py', '--apply'],
+        )
+        real_asyncio_run = asyncio.run
+
+        def _drive(coro, *_a, **_kw):
+            coro.close()  # never construct the live MemoryService
+            return real_asyncio_run(
+                _mod.run(
+                    self._args(apply=True), memory=memory,
+                    known_projects_map=self._known_map(),
+                )
+            )
+
+        monkeypatch.setattr(_mod.asyncio, 'run', _drive)
+
+        with caplog.at_level('ERROR'), pytest.raises(
+            StoreMutationUnavailable, match=SENTINEL
+        ):
+            _mod.main()
+
+        (record,) = fail_closed_records(caplog, 'prune_recon_cycle_summaries')
+        assert SENTINEL in record.getMessage(), (
+            'nothing else explains this traceback -- the guard site must log '
+            'the fail-closed diagnosis before raising; got: '
+            f'{[rec.getMessage() for rec in caplog.records]}'
+        )
+        memory.delete_memory.assert_not_awaited()

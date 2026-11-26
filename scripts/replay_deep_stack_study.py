@@ -38,13 +38,15 @@ import argparse
 import datetime as dt
 import json
 import os
-import re
 import resource
 import sqlite3
 import subprocess
 import sys
 import time
 from pathlib import Path
+
+import _checkout as _checkout
+from shared.merge_subject import parse_merge_subject
 
 CLONE_MARKER = '.replay-study-clone'
 STACK_CAP = 6          # max items in a phase-A stack (queue rarely offers more)
@@ -91,7 +93,7 @@ SCRUB_ENV = [k for k in os.environ if k.startswith('CLAUDE')]
 
 
 def log(msg: str) -> None:
-    print(f'[{dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")}] {msg}',
+    print(f'[{dt.datetime.now(dt.UTC).isoformat(timespec="seconds")}] {msg}',
           flush=True)
 
 
@@ -111,7 +113,7 @@ def load_spans(db_path: Path, since_days: int) -> list[tuple[str, dt.datetime, d
     and collapses the whole window into one mega-episode.
     """
     con = sqlite3.connect(str(db_path))
-    cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=since_days)
+    cutoff = dt.datetime.now(dt.UTC) - dt.timedelta(days=since_days)
     open_q: dict[str, dt.datetime] = {}
     spans: list[tuple[str, dt.datetime, dt.datetime]] = []
     rows = con.execute(
@@ -176,15 +178,19 @@ def merge_commit_index(repo: Path) -> dict[str, str]:
     """task label -> OLDEST 'Merge task/<label> into main' commit on main.
 
     Single history walk (vs one git-log --grep per task): oldest match is the
-    first genuine landing, sidestepping pipeline-duplicate re-merges.
+    first genuine landing, sidestepping pipeline-duplicate re-merges. Only a
+    WHOLE landing subject counts, read by the merge writer's own parser.
     """
     r = git(repo, 'log', 'main', '--format=%H %s')
     idx: dict[str, str] = {}
     for line in r.stdout.splitlines():
         sha, _, subj = line.partition(' ')
-        m = re.match(r'Merge task/(\S+) into main', subj)
-        if m:
-            idx[m.group(1)] = sha  # newest-first walk: last write wins = oldest
+        subject = parse_merge_subject(subj)
+        if subject is None or subject.main_branch != 'main':
+            continue
+        if subject.branch.startswith('task/'):
+            # newest-first walk: last write wins = oldest
+            idx[subject.branch.removeprefix('task/')] = sha
     return idx
 
 
@@ -339,7 +345,7 @@ def main() -> int:
         tree_obj = git(args.repo, 'rev-parse', 'HEAD^{tree}').stdout.strip()
         rec = {**j, 'tips': [t for t, _ in j['tips']], 'tree': tree,
                'tree_object': tree_obj, 'script_version': SCRIPT_VERSION,
-               'items_merged': merged, 'started_at': dt.datetime.now(dt.timezone.utc).isoformat()}
+               'items_merged': merged, 'started_at': dt.datetime.now(dt.UTC).isoformat()}
         if merged == 0:
             rec.update(exit_code=None, passed=None, skipped='no_items_merged')
         else:

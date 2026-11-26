@@ -5,10 +5,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import uuid as uuid_mod
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
@@ -16,37 +14,79 @@ if TYPE_CHECKING:
     from anthropic.types import MessageParam, ToolParam
     from openai.types.chat import ChatCompletionMessageParam
 
-from shared.cli_invoke import AgentResult, build_failure_message, invoke_with_cap_retry
+from shared.cli_invoke import (
+    AgentFailureKind,
+    build_failure_message,
+    classify_agent_failure,
+    invoke_with_cap_retry,
+    no_mcp_servers_config,
+)
 
 from fused_memory.config.schema import ReconciliationConfig
-from fused_memory.models.reconciliation import JournalEntry
-from fused_memory.reconciliation import _RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS
+from fused_memory.models.invocation_ledger import (
+    InvocationLedger,
+    input_output_tokens,
+    ledger_invoke_kwargs,
+)
+from fused_memory.reconciliation import (
+    RECONCILIATION_CLI_ENV_OVERRIDES,
+    RECONCILIATION_CLI_SETTING_SOURCES,
+    RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS,
+)
+from fused_memory.reconciliation.reserve_step_aside import RECONCILIATION_WORK_CLASS
 
 logger = logging.getLogger(__name__)
 
-CLAUDE_CLI_RESPONSE_SCHEMA = {
-    'type': 'object',
-    'properties': {
-        'thinking': {'type': 'string'},
-        'tool_calls': {
-            'type': 'array',
-            'items': {
-                'type': 'object',
-                'properties': {
-                    'id': {'type': 'string'},
-                    'name': {'type': 'string'},
-                    'input': {'type': 'object'},
-                },
-                'required': ['id', 'name', 'input'],
-            },
-        },
-    },
-    'required': ['thinking', 'tool_calls'],
+# CLI failure kinds that end a claude_cli run as an audited agent failure
+# instead of raising, each mapped to its census token.  'api_refusal' since
+# task 6022; 'cli_max_turns' since task 4344, when one invocation came to carry
+# the whole investigation.  Every other failure kind still raises.
+_CLI_FAILURE_ORIGINS = {
+    AgentFailureKind.API_REFUSAL: 'api_refusal',
+    AgentFailureKind.MAX_TURNS: 'cli_max_turns',
 }
 
+# The CLOSED vocabulary of CLI-failure origins run() reports as
+# `warning_origin` (task 4343).  All four members are synthesised by
+# _call_claude_cli; nothing else may enter, because the value lands in
+# VerificationResult.failure_token and from there in the reconciliation.db
+# `verify/codebase` audit row that operators GROUP BY.  An unbounded or
+# agent-controlled token there would make that census unqueryable.
+CLI_WARNING_ORIGINS = frozenset({
+    'cli_output_unparseable',
+    'cli_output_empty',
+    *_CLI_FAILURE_ORIGINS.values(),
+})
 
-class CircuitBreakerError(Exception):
-    """Raised when mutation count exceeds the per-stage limit."""
+# max_turns for the claude_cli provider's ONE invocation, which carries the
+# WHOLE investigation: the CLI runs its own built-in tools turn by turn and
+# ends with StructuredOutput.
+#
+# Never 1.  With --json-schema the model emits a prose turn before it calls
+# ``StructuredOutput``, and a cap of 1 leaves no room for it: the CLI returns
+# ``error_max_turns``, which in the measured runs carried no structured payload,
+# so schema salvage had nothing to recover and the call failed.  That is
+# measured CLI behaviour, not a guarantee.
+#
+# 20 is the measured configuration, a ceiling rather than a target; spend stays
+# bounded by cli_invoke's ``max_budget_usd`` and ``agent_cli_timeout_seconds``.
+# The rates, turn counts and CLI versions are recorded only in
+# fused-memory/scripts/probe_schema_max_turns.py's docstring; re-run it rather
+# than trusting a number copied elsewhere.
+_AGENT_CLI_MAX_TURNS = 20
+
+
+def _cli_failure_payload(origin: str, text: str) -> dict:
+    """The single constructor of a CLI no-tool-call exit carrying *origin*.
+
+    The one gate on the CLOSED ``CLI_WARNING_ORIGINS`` vocabulary.
+    """
+    if origin not in CLI_WARNING_ORIGINS:
+        raise ValueError(
+            f'CLI warning_origin {origin!r} is not in the closed vocabulary '
+            f'CLI_WARNING_ORIGINS={sorted(CLI_WARNING_ORIGINS)}'
+        )
+    return {'warning': 'no_tool_calls', 'text': text, 'warning_origin': origin}
 
 
 @dataclass
@@ -57,9 +97,6 @@ class ToolDefinition:
     description: str
     parameters: dict  # JSON Schema
     function: Callable  # Async callable
-    is_mutation: bool = False
-    target_system: str = ''  # 'graphiti', 'mem0', 'taskmaster'
-    get_before_state: Callable | None = None
 
     def to_anthropic_schema(self) -> ToolParam:
         return {
@@ -70,7 +107,17 @@ class ToolDefinition:
 
 
 class AgentLoop:
-    """Runs an LLM agent with tool access until it signals completion."""
+    """Runs an LLM agent with tool access until it signals completion.
+
+    Two transports:
+
+    * The in-process providers (anthropic/openai) dispatch ``tools`` step by
+      step until ``terminal_tool`` is called.
+    * The claude_cli provider runs the whole loop inside ONE CLI invocation
+      that uses the CLI's own built-in ``cli_tools``.  There ``tools``
+      contributes only the terminal tool's ``parameters``, used as the CLI
+      output schema.
+    """
 
     def __init__(
         self,
@@ -79,26 +126,31 @@ class AgentLoop:
         tools: dict[str, ToolDefinition],
         terminal_tool: str = 'stage_complete',
         usage_gate=None,
+        cwd: Path | None = None,
+        cli_tools: Sequence[str] = (),
+        ledger: InvocationLedger | None = None,
     ):
-        # NOTE: for recon stages running via the CLI path (production), the effective
-        # terminal action is `mcp__recon-report__complete` — the stage agent calls that
-        # tool to signal completion and the assembled ReconReportState is the authoritative
-        # output channel.  `terminal_tool` here gates the in-process anthropic/openai path
-        # only; the CLI path terminates on the agent's own stop signal after the last tool
-        # result, so the default 'stage_complete' value is not exercised in that path.
         self.config = config
         self.system_prompt = system_prompt
         self.tools = tools
         self.terminal_tool = terminal_tool
-        self._journal_entries: list[JournalEntry] = []
-        self._mutation_count: int = 0
+        self.cli_tools: tuple[str, ...] = tuple(cli_tools)
         self.llm_call_count: int = 0
         self.token_count: int = 0
-        self._cli_session_id: str | None = None
         self._usage_gate = usage_gate
+        self._ledger = ledger
+        # Task 4722 / PRD D5: the codebase root this agent runs in.  The
+        # verifier now supplies the TASK's own project root per call; every
+        # other construction site passes nothing and keeps the process-global
+        # config value, so the fallback is what leaves those sites unaffected.
+        # Resolved once here so `self.cwd` is always a Path.
+        self.cwd: Path = Path(cwd) if cwd is not None else Path(config.explore_codebase_root)
 
-    async def run(self, initial_payload: str) -> tuple[dict, list[JournalEntry]]:
-        """Execute agent loop. Returns (terminal_tool_args, journal_entries)."""
+    async def run(self, initial_payload: str) -> dict:
+        """Execute the agent loop. Returns the terminal tool's arguments, or a warning payload."""
+        if self.config.agent_llm_provider == 'claude_cli':
+            return await self._call_claude_cli(initial_payload)
+
         messages: list[dict[str, Any]] = [
             {'role': 'user', 'content': initial_payload},
         ]
@@ -111,12 +163,11 @@ class AgentLoop:
             # Check for terminal tool in tool_use blocks
             tool_use_blocks = [b for b in response.content if b.type == 'tool_use']
             text_blocks = [b for b in response.content if b.type == 'text']
-            reasoning_text = '\n'.join(b.text for b in text_blocks).strip()
 
             if not tool_use_blocks:
                 # No tool calls — agent stopped
                 text = ' '.join(b.text for b in text_blocks) if text_blocks else ''
-                return {'warning': 'no_tool_calls', 'text': text}, self._journal_entries
+                return {'warning': 'no_tool_calls', 'text': text}
 
             tool_results = []
             terminal_result = None
@@ -132,14 +183,12 @@ class AgentLoop:
                     break
 
                 try:
-                    result = await self._execute_tool(block, reasoning=reasoning_text)
+                    result = await self._execute_tool(block)
                     tool_results.append({
                         'type': 'tool_result',
                         'tool_use_id': block.id,
                         'content': json.dumps(result) if not isinstance(result, str) else result,
                     })
-                except CircuitBreakerError:
-                    raise
                 except Exception as e:
                     logger.error(f'Tool {block.name} failed: {e}')
                     tool_results.append({
@@ -150,16 +199,16 @@ class AgentLoop:
                     })
 
             if terminal_result is not None:
-                return terminal_result, self._journal_entries
+                return terminal_result
 
             # Append assistant message and tool results
             messages.append({'role': 'assistant', 'content': response.content})
             messages.append({'role': 'user', 'content': tool_results})
 
-        return {'warning': 'max_steps_reached'}, self._journal_entries
+        return {'warning': 'max_steps_reached'}
 
-    async def _execute_tool(self, tool_block: Any, reasoning: str = '') -> Any:
-        """Execute a tool call, journal if mutation."""
+    async def _execute_tool(self, tool_block: Any) -> Any:
+        """Execute a tool call."""
         tool_name = tool_block.name
         tool_args = tool_block.input or {}
 
@@ -167,19 +216,6 @@ class AgentLoop:
             return {'error': f'Unknown tool: {tool_name}'}
 
         tool = self.tools[tool_name]
-
-        before_state = None
-        if tool.is_mutation:
-            self._mutation_count += 1
-            if self._mutation_count > self.config.max_mutations_per_stage:
-                raise CircuitBreakerError(
-                    f'Exceeded {self.config.max_mutations_per_stage} mutations in stage'
-                )
-            if tool.get_before_state:
-                try:
-                    before_state = await tool.get_before_state(**tool_args)
-                except Exception:
-                    before_state = None
 
         try:
             result = await asyncio.wait_for(
@@ -190,20 +226,6 @@ class AgentLoop:
             logger.warning(f'Tool {tool_name} timed out after {self.config.tool_timeout_seconds}s')
             result = {'error': f'Tool {tool_name} timed out after {self.config.tool_timeout_seconds}s'}
 
-        if tool.is_mutation:
-            self._journal_entries.append(
-                JournalEntry(
-                    id=str(uuid_mod.uuid4()),
-                    timestamp=datetime.now(UTC),
-                    operation=tool_name,
-                    target_system=tool.target_system,
-                    before_state=before_state,
-                    after_state=_safe_serialize(result),
-                    reasoning=reasoning,
-                    evidence=[],
-                )
-            )
-
         return result
 
     async def _call_llm(self, messages: list[dict[str, Any]], tool_schemas: list[ToolParam]) -> Any:
@@ -213,31 +235,25 @@ class AgentLoop:
         provider = self.config.agent_llm_provider
 
         if provider == 'anthropic':
-            client = anthropic.AsyncAnthropic()
-            response = await client.messages.create(
-                model=self.config.agent_llm_model,
-                max_tokens=self.config.agent_max_tokens,
-                system=self.system_prompt,
-                messages=cast('list[MessageParam]', messages),
-                tools=tool_schemas,
-            )
+            async with anthropic.AsyncAnthropic() as client:
+                response = await client.messages.create(
+                    model=self.config.agent_llm_model,
+                    max_tokens=self.config.agent_max_tokens,
+                    system=self.system_prompt,
+                    messages=cast('list[MessageParam]', messages),
+                    tools=tool_schemas,
+                )
             self.llm_call_count += 1
             self.token_count += response.usage.input_tokens + response.usage.output_tokens
             return response
         elif provider == 'openai':
             return await self._call_openai(messages, tool_schemas)
-        elif provider == 'claude_cli':
-            content = messages[-1]['content']
-            prompt = content if isinstance(content, str) else self._serialize_tool_results(content)
-            return await self._call_claude_cli(prompt=prompt, tools=tool_schemas)
         else:
             raise ValueError(f'Unsupported agent LLM provider: {provider}')
 
     async def _call_openai(self, messages: list[dict[str, Any]], tool_schemas: list[ToolParam]) -> Any:
         """Call OpenAI and convert response to Anthropic-like format."""
         from openai import AsyncOpenAI
-
-        client = AsyncOpenAI()
 
         # Convert Anthropic tool schemas to OpenAI format
         openai_tools: list[Any] = []
@@ -288,7 +304,8 @@ class AgentLoop:
         }
         if openai_tools:
             create_kwargs['tools'] = openai_tools
-        response = await client.chat.completions.create(**create_kwargs)
+        async with AsyncOpenAI() as client:
+            response = await client.chat.completions.create(**create_kwargs)
 
         self.llm_call_count += 1
         if response.usage:
@@ -297,93 +314,80 @@ class AgentLoop:
         # Convert OpenAI response to Anthropic-like structure
         return _OpenAIResponseAdapter(response)
 
-    def _build_cli_system_prompt(self, tool_schemas: list[ToolParam]) -> str:
-        """Build system prompt that includes tool schemas for CLI-based tool dispatch."""
-        tools_section = []
-        for t in tool_schemas:
-            tools_section.append(
-                f"### {t['name']}\n"
-                f"{t.get('description', '')}\n"
-                f"Parameters: {json.dumps(t['input_schema'], indent=2)}"
+    def _cli_system_prompt(self) -> str:
+        """The caller's system prompt plus how to finish on the CLI transport.
+
+        Names only the CLI's own tools and StructuredOutput: any in-process
+        tool name reaching the CLI, the terminal tool's included, is one the
+        model may try to call natively, and the CLI rejects every such call.
+        """
+        if self.cli_tools:
+            tools_line = (
+                f'Investigate with your {", ".join(self.cli_tools)} tools; they work '
+                'inside your working directory and no other tool is available.'
             )
+        else:
+            tools_line = 'No tool is available to you for investigation.'
         return (
-            f"{self.system_prompt}\n\n"
-            "## Available Tools\n"
-            "Respond with a JSON object matching the provided schema.\n"
-            "Use the tool_calls array to invoke tools. Each tool call needs:\n"
-            '- "id": a unique string identifier\n'
-            '- "name": the tool name from the list below\n'
-            '- "input": an object matching the tool\'s parameters\n\n'
-            "Use the \"thinking\" field to explain your reasoning before making tool calls.\n"
-            "If you have no more tool calls to make, return an empty tool_calls array.\n\n"
-            + "\n\n".join(tools_section)
+            f'{self.system_prompt}\n\n## Tools and finishing\n'
+            f'{tools_line} When you are done, call StructuredOutput once with your '
+            'findings. That call is your final answer.'
         )
 
-    @staticmethod
-    def _serialize_tool_results(tool_results: list[dict]) -> str:
-        """Format tool results as text for the next CLI turn."""
-        parts = []
-        for tr in tool_results:
-            if isinstance(tr, dict) and tr.get('type') == 'tool_result':
-                status = 'ERROR' if tr.get('is_error') else 'OK'
-                parts.append(
-                    f"[Tool Result: {tr['tool_use_id']}] ({status})\n{tr['content']}"
-                )
-        return '\n\n'.join(parts)
+    async def _call_claude_cli(self, prompt: str) -> dict:
+        """Run the whole investigation as ONE Claude CLI invocation.
 
-    async def _call_claude_cli(self, prompt: str, tools: list[ToolParam]) -> _CLIResponseAdapter:
-        """Delegate to shared.cli_invoke.invoke_with_cap_retry.
-
-        Multi-turn is handled by passing ``resume_session_id`` on subsequent
-        calls; ``_call_llm`` is responsible for serialising tool results into
-        the next turn's prompt before calling this method.
-
-        ``_cli_session_id`` is cleared to ``None`` before any exception propagates
-        out of this method — whether from ``invoke_with_cap_retry`` itself (e.g.
-        ``AllAccountsCappedException`` after the retry loop gives up) or from the
-        ``not result.success`` failure guard below — so that a subsequent
-        reconciliation retry on the same ``AgentLoop`` instance does not attempt to
-        ``--resume`` an abandoned or capped session.
+        Returns the terminal tool's payload, or a ``_cli_failure_payload`` for
+        a CLI failure in ``_CLI_FAILURE_ORIGINS`` or a structured output that
+        is unparseable or empty.  Every other failure raises RuntimeError.
         """
-        try:
-            result: AgentResult = await invoke_with_cap_retry(
-                usage_gate=self._usage_gate,
-                label=f'Reconciliation agent ({self.config.agent_llm_model})',
-                prompt=prompt,
-                system_prompt=self._build_cli_system_prompt(tools),
-                output_schema=CLAUDE_CLI_RESPONSE_SCHEMA,
-                disallowed_tools=['*'],
-                model=self.config.agent_llm_model,
-                # max_turns=1: AgentLoop.run() drives multi-turn externally by calling
-                # _call_claude_cli again with resume_session_id.  A single CLI
-                # invocation only needs one assistant turn (schema tool-use → JSON
-                # response happens within the same turn when --json-schema is used).
-                max_turns=1,
-                permission_mode='bypassPermissions',
-                timeout_seconds=float(self.config.agent_cli_timeout_seconds),
-                resume_session_id=self._cli_session_id,
-                # Task 1989 (sweep verdict): kept at explore_codebase_root, NOT
-                # switched to a neutral cwd. This is a multi-turn agent that
-                # actively adjudicates memory-vs-codebase discrepancies with
-                # CLI built-in tools disabled (disallowed_tools=['*']), so the
-                # auto-loaded CLAUDE.md is plausibly its main passive codebase
-                # signal.
-                cwd=Path(self.config.explore_codebase_root),
-                cap_wait_sanity_secs=_RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS,
+        terminal = self.tools.get(self.terminal_tool)
+        if terminal is None:
+            raise ValueError(
+                f'the claude_cli provider needs the terminal tool {self.terminal_tool!r} '
+                'in tools: its parameters are the CLI output schema'
             )
-
-            if not result.success:
-                # schema_salvaged=True implies success=True (cli_invoke.py:749-751),
-                # so `not result.success` is the complete failure guard.
-                raise RuntimeError(build_failure_message('Claude CLI agent', result))
-        except Exception:
-            # Clear stale session id so callers that retry don't --resume an abandoned session.
-            self._cli_session_id = None
-            raise
-
-        self._cli_session_id = result.session_id or self._cli_session_id
+        result = await invoke_with_cap_retry(
+            usage_gate=self._usage_gate,
+            label=f'Reconciliation agent ({self.config.agent_llm_model})',
+            prompt=prompt,
+            system_prompt=self._cli_system_prompt(),
+            output_schema=terminal.parameters,
+            available_tools=list(self.cli_tools),
+            # Read-only and confined to cwd: dontAsk denies whatever would need
+            # a permission prompt, which keeps the read tools inside cwd unless
+            # an allow rule widens them.  This call passes none and reads no
+            # settings file, so no user or project allow rule applies either;
+            # one would (measured), and so would managed policy settings.
+            # CLAUDE.md and the memory index are kept out by the env overrides.
+            permission_mode='dontAsk',
+            setting_sources=list(RECONCILIATION_CLI_SETTING_SOURCES),
+            env_overrides=dict(RECONCILIATION_CLI_ENV_OVERRIDES),
+            work_class=RECONCILIATION_WORK_CLASS,
+            # --tools does not filter MCP, so MCP is closed by the strict empty
+            # config.  cwd is the codebase root (tasks 1989/4722), which may
+            # hold a live .mcp.json.
+            mcp_config=no_mcp_servers_config(),
+            strict_mcp_config=True,
+            model=self.config.agent_llm_model,
+            # See _AGENT_CLI_MAX_TURNS for why this is not 1.
+            max_turns=_AGENT_CLI_MAX_TURNS,
+            timeout_seconds=float(self.config.agent_cli_timeout_seconds),
+            cwd=self.cwd,
+            cap_wait_sanity_secs=RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS,
+            **ledger_invoke_kwargs(self._ledger),
+        )
+        # Counted before the failure guard: a failed or refused result still
+        # reached the model and was billed.
         self.llm_call_count += 1
-        self.token_count += (result.input_tokens or 0) + (result.output_tokens or 0)
+        self.token_count += input_output_tokens(result)
+
+        if not result.success:
+            origin = _CLI_FAILURE_ORIGINS.get(classify_agent_failure(result).kind)
+            if origin is None:
+                raise RuntimeError(build_failure_message('Claude CLI agent', result))
+            logger.warning('%s: Claude CLI agent failed. Output: %s', origin, result.output[:500])
+            return _cli_failure_payload(origin, result.output)
 
         structured = result.structured_output
         if isinstance(structured, str):
@@ -392,18 +396,17 @@ class AgentLoop:
             except json.JSONDecodeError:
                 logger.warning(
                     'cli_output_unparseable: Claude CLI reported success but structured_output'
-                    ' was unparseable JSON; treating as empty tool-call turn. Raw prefix: %s',
+                    ' was unparseable JSON. Raw prefix: %s',
                     structured[:200],
                 )
-                structured = {'thinking': structured, 'tool_calls': [], 'warning': 'cli_output_unparseable'}
-        if not structured:
+                return _cli_failure_payload('cli_output_unparseable', structured)
+        if not structured or not isinstance(structured, dict):
             logger.warning(
                 'cli_output_empty: Claude CLI reported success but structured_output'
-                ' was empty/missing; treating as empty tool-call turn.',
+                ' was empty, missing or not an object.',
             )
-            structured = {'thinking': '', 'tool_calls': [], 'warning': 'cli_output_empty'}
-
-        return _CLIResponseAdapter(structured, session_id=result.session_id)
+            return _cli_failure_payload('cli_output_empty', '')
+        return structured
 
 
 class _OpenAIResponseAdapter:
@@ -428,56 +431,6 @@ class _OpenAIResponseAdapter:
                 )
 
 
-class _CLIResponseAdapter:
-    """Adapts Claude CLI structured output to look like Anthropic Messages response.
-
-    Exposes both the legacy ``.content`` list (for drop-in compatibility with
-    the anthropic/openai branches) and direct attribute access (for
-    delegation-level tests and future callers that don't need the block list):
-    ``.thinking``, ``.tool_calls``, ``.session_id``, ``.warning``.
-
-    Note on ``.warning``: this attribute surfaces the specific CLI-failure
-    token (``'cli_output_unparseable'`` / ``'cli_output_empty'``) to the log
-    and to delegation-level tests.  It is intentionally **not** propagated
-    through ``AgentLoop.run()``'s return value, which emits the generic
-    ``{'warning': 'no_tool_calls'}`` shape regardless of the origin.
-    Site-22's ``extract_agent_verdict`` guard already converts that shape
-    into the loud ``'agent-failed:no_tool_calls'`` sentinel end-to-end, so
-    threading the more specific token through ``run()`` would add surface
-    area (and break existing adapter-independent tests) for no required
-    behaviour change.  Revisit if a downstream caller ever needs to
-    distinguish the two origins.
-    """
-
-    def __init__(self, structured_output: dict, session_id: str = ''):
-        self.content = []
-        self.usage = _CLIUsage()
-
-        # Direct attribute access
-        self.thinking: str = structured_output.get('thinking', '')
-        self.tool_calls: list = structured_output.get('tool_calls', [])
-        self.session_id: str = session_id
-        self.warning: str = structured_output.get('warning', '')
-
-        if self.thinking:
-            self.content.append(_TextBlock(self.thinking))
-
-        for tc in self.tool_calls:
-            self.content.append(
-                _ToolUseBlock(
-                    id=tc.get('id', str(uuid_mod.uuid4())),
-                    name=tc['name'],
-                    input=tc.get('input', {}),
-                )
-            )
-
-
-@dataclass
-class _CLIUsage:
-    input_tokens: int = 0
-    output_tokens: int = 0
-
-
 @dataclass
 class _TextBlock:
     text: str
@@ -490,15 +443,3 @@ class _ToolUseBlock:
     name: str
     input: dict
     type: str = field(default='tool_use', repr=False)
-
-
-def _safe_serialize(obj: Any) -> dict | None:
-    """Safely convert an object to a dict for journaling."""
-    if obj is None:
-        return None
-    if isinstance(obj, dict):
-        return obj
-    try:
-        return json.loads(json.dumps(obj, default=str))
-    except (TypeError, ValueError):
-        return {'repr': str(obj)}

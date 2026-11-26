@@ -1,0 +1,552 @@
+"""The incumbent's measured LLM spend: production attempt telemetry and the controls' unit cost."""
+
+import json
+import re
+from datetime import UTC, date, datetime
+
+import pytest
+from shared.memory_eval_metrics import Metric, canonical_json_text
+
+from arm_harness._fakes import (
+    incumbent_control_spec,
+    llm_spec,
+    telemetry_row,
+    untokened_telemetry_row,
+)
+from fused_memory.arm_harness.arm_spec import LlmArmSpec, TokenPricing
+from fused_memory.arm_harness.incumbent_cost import (
+    PROJECTION_DAYS,
+    DailySpend,
+    IncumbentCostError,
+    LlmAttemptTelemetry,
+    LlmWriteOperation,
+    ProductionCost,
+    ProjectSpend,
+    ReplayUnitCost,
+    TelemetryAccountingError,
+    TelemetryRowError,
+    TelemetryWindow,
+    TelemetryWindowError,
+    derive_incumbent_cost,
+    load_incumbent_cost,
+    load_llm_attempts,
+    production_cost,
+    replay_unit_cost,
+    select_llm_attempts,
+    serialize_incumbent_cost,
+    serialize_llm_attempts,
+)
+from fused_memory.arm_harness.metrics_record import (
+    DeltaOf,
+    LlmMetricId,
+    MetricsRecord,
+    record_for,
+)
+
+PRE_START = '2026-10-05T10:59:00.000001+00:00'
+FIRST_TOKENED = '2026-10-05T11:23:27.123456+00:00'
+LATER = '2026-10-06T08:00:00+00:00'
+UNTIL_TEXT = '2026-10-08T00:00:00+00:00'
+UNTIL = datetime.fromisoformat(UNTIL_TEXT)
+POST_UNTIL = '2026-10-08T00:30:00+00:00'
+REACHES_UNTIL = untokened_telemetry_row(POST_UNTIL, backend='mem0')
+
+
+def at(text: str) -> datetime:
+    return datetime.fromisoformat(text)
+
+
+def attempt_at(text: str, **overrides) -> LlmAttemptTelemetry:
+    return LlmAttemptTelemetry.from_telemetry_row(telemetry_row(text, **overrides))
+
+
+def test_only_graphiti_add_memory_and_add_episode_rows_are_llm_attempts():
+    rows = [
+        untokened_telemetry_row(PRE_START),
+        telemetry_row(FIRST_TOKENED),
+        telemetry_row(LATER, operation='add_episode'),
+        untokened_telemetry_row('2026-10-06T09:00:00+00:00', backend='mem0'),
+        untokened_telemetry_row('2026-10-06T10:00:00+00:00', operation='update_edge'),
+        untokened_telemetry_row(
+            '2026-10-06T11:00:00+00:00',
+            backend='sqlite_task_backend',
+            operation='update_task',
+            project_id='solar_challenge',
+        ),
+        untokened_telemetry_row('2026-10-06T12:00:00+00:00', backend='graphiti', operation=None),
+        REACHES_UNTIL,
+    ]
+
+    window = select_llm_attempts(rows, until=UNTIL)
+
+    assert [(a.created_at, a.operation) for a in window.attempts] == [
+        (at(FIRST_TOKENED), LlmWriteOperation.ADD_MEMORY),
+        (at(LATER), LlmWriteOperation.ADD_EPISODE),
+    ]
+
+
+def test_window_runs_from_the_first_token_bearing_attempt_up_to_but_excluding_until():
+    rows = [
+        untokened_telemetry_row('2026-10-08T00:00:01+00:00'),
+        telemetry_row(UNTIL_TEXT),
+        telemetry_row(LATER, project_id='reify'),
+        telemetry_row(FIRST_TOKENED),
+        untokened_telemetry_row(PRE_START),
+        untokened_telemetry_row('2026-10-01T00:00:00+00:00'),
+    ]
+
+    window = select_llm_attempts(rows, until=UNTIL)
+
+    assert window.start == at(FIRST_TOKENED)
+    assert window.end == UNTIL
+    assert [a.created_at for a in window.attempts] == [at(FIRST_TOKENED), at(LATER)]
+    assert [a.project_id for a in window.attempts] == ['dark_factory', 'reify']
+
+
+@pytest.mark.parametrize(
+    'pre_start_rows',
+    [
+        [],
+        [untokened_telemetry_row(PRE_START, backend='mem0')],
+        [untokened_telemetry_row(PRE_START, operation='update_edge')],
+    ],
+)
+def test_a_dump_that_does_not_reach_back_past_the_telemetry_start_is_refused(pre_start_rows):
+    rows = [*pre_start_rows, telemetry_row(FIRST_TOKENED), telemetry_row(LATER), REACHES_UNTIL]
+
+    with pytest.raises(TelemetryWindowError, match=re.escape(FIRST_TOKENED)):
+        select_llm_attempts(rows, until=UNTIL)
+
+
+@pytest.mark.parametrize(
+    'last_row',
+    [
+        untokened_telemetry_row(UNTIL_TEXT, backend='mem0'),
+        untokened_telemetry_row(
+            POST_UNTIL, backend='sqlite_task_backend', operation='update_task'
+        ),
+        untokened_telemetry_row(POST_UNTIL),
+    ],
+)
+def test_a_row_of_any_kind_at_or_after_until_shows_the_dump_reaches_the_window_end(last_row):
+    rows = [untokened_telemetry_row(PRE_START), telemetry_row(FIRST_TOKENED), last_row]
+
+    assert select_llm_attempts(rows, until=UNTIL).end == UNTIL
+
+
+def test_a_dump_that_ends_before_until_is_refused_naming_both_moments():
+    last_seen = '2026-10-07T23:59:59+00:00'
+    rows = [
+        untokened_telemetry_row(PRE_START),
+        telemetry_row(FIRST_TOKENED),
+        telemetry_row(LATER),
+        untokened_telemetry_row(last_seen, backend='mem0'),
+    ]
+
+    with pytest.raises(TelemetryWindowError) as caught:
+        select_llm_attempts(rows, until=UNTIL)
+
+    assert f'the telemetry ends at {last_seen}, before until {UNTIL_TEXT}' in str(caught.value)
+
+
+def test_an_empty_dump_is_refused_naming_until():
+    with pytest.raises(
+        TelemetryWindowError, match=re.escape(f'no row, so it cannot reach until {UNTIL_TEXT}')
+    ):
+        select_llm_attempts([], until=UNTIL)
+
+
+def test_an_untokened_llm_attempt_inside_the_window_is_unknown_not_zero():
+    rows = [
+        untokened_telemetry_row(PRE_START),
+        telemetry_row(FIRST_TOKENED),
+        untokened_telemetry_row('2026-10-06T01:00:00+00:00'),
+        telemetry_row(LATER),
+        untokened_telemetry_row('2026-10-07T01:00:00+00:00', operation='add_episode'),
+        REACHES_UNTIL,
+    ]
+
+    with pytest.raises(TelemetryAccountingError) as caught:
+        select_llm_attempts(rows, until=UNTIL)
+
+    message = str(caught.value)
+    assert '2 ' in message
+    assert '2026-10-06T01:00:00+00:00' in message
+    assert 'unknown, not zero' in message
+
+
+def test_a_partially_tokened_llm_attempt_inside_the_window_is_refused():
+    rows = [
+        untokened_telemetry_row(PRE_START),
+        telemetry_row(FIRST_TOKENED),
+        telemetry_row(LATER, tokens=(1000, 100, None)),
+        REACHES_UNTIL,
+    ]
+
+    with pytest.raises(TelemetryAccountingError, match=re.escape(LATER)):
+        select_llm_attempts(rows, until=UNTIL)
+
+
+def test_untokened_attempts_after_until_are_outside_the_accounting():
+    rows = [
+        untokened_telemetry_row(PRE_START),
+        telemetry_row(FIRST_TOKENED),
+        untokened_telemetry_row('2026-10-08T03:00:00+00:00'),
+    ]
+
+    assert len(select_llm_attempts(rows, until=UNTIL).attempts) == 1
+
+
+@pytest.mark.parametrize(
+    'rows',
+    [
+        [untokened_telemetry_row(PRE_START), untokened_telemetry_row(LATER), REACHES_UNTIL],
+        [untokened_telemetry_row(PRE_START), telemetry_row(UNTIL_TEXT)],
+        [REACHES_UNTIL],
+    ],
+)
+def test_no_token_bearing_llm_attempt_before_until_is_refused(rows):
+    with pytest.raises(
+        TelemetryWindowError,
+        match=re.escape(f'no token-bearing LLM attempt lies before until {UNTIL_TEXT}'),
+    ):
+        select_llm_attempts(rows, until=UNTIL)
+
+
+def test_a_naive_until_is_refused():
+    rows = [untokened_telemetry_row(PRE_START), telemetry_row(FIRST_TOKENED)]
+
+    with pytest.raises(TelemetryWindowError, match='until'):
+        select_llm_attempts(rows, until=datetime(2026, 10, 8))
+
+
+@pytest.mark.parametrize(
+    ('row', 'named'),
+    [
+        (telemetry_row('2026-10-05T12:00:00'), '2026-10-05T12:00:00'),
+        (telemetry_row(LATER, tokens=(-1, 100, 9)), LATER),
+        (telemetry_row(LATER, operation='update_edge'), LATER),
+        (telemetry_row(LATER) | {'total_tokens': 1}, 'total_tokens 1 != input_tokens 1000'),
+    ],
+)
+def test_a_malformed_row_is_refused_at_the_boundary_naming_it(row, named):
+    with pytest.raises(TelemetryRowError, match=re.escape(named)):
+        LlmAttemptTelemetry.from_telemetry_row(row)
+
+
+@pytest.mark.parametrize('backend', ['graphiti', 'mem0'])
+def test_a_naive_created_at_on_any_row_is_refused_by_selection(backend):
+    rows = [
+        untokened_telemetry_row('2026-10-05T10:00:00', backend=backend),
+        telemetry_row(FIRST_TOKENED),
+        REACHES_UNTIL,
+    ]
+
+    with pytest.raises(TelemetryRowError, match=re.escape("'2026-10-05T10:00:00'")):
+        select_llm_attempts(rows, until=UNTIL)
+
+
+@pytest.mark.parametrize(('raw', 'parsed'), [(1, True), (0, False)])
+def test_success_parses_to_a_bool(raw, parsed):
+    assert attempt_at(LATER, success=raw).success is parsed
+
+
+def test_a_parsed_attempt_keeps_only_what_costing_needs():
+    attempt = attempt_at(LATER, tokens=(1650, 95, 7))
+
+    assert set(json.loads(serialize_llm_attempts([attempt]))) == {
+        'created_at',
+        'operation',
+        'project_id',
+        'success',
+        'input_tokens',
+        'output_tokens',
+        'llm_calls',
+    }
+    assert attempt.created_at == at(LATER)
+    assert attempt.created_at.tzinfo is not None
+    assert attempt.operation is LlmWriteOperation.ADD_MEMORY
+    assert (attempt.input_tokens, attempt.output_tokens, attempt.llm_calls) == (1650, 95, 7)
+
+
+def test_a_valid_window_constructs():
+    attempts = (attempt_at(FIRST_TOKENED), attempt_at(LATER))
+
+    window = TelemetryWindow(start=at(FIRST_TOKENED), end=UNTIL, attempts=attempts)
+
+    assert window.attempts == attempts
+
+
+@pytest.mark.parametrize(
+    ('start', 'end', 'stamps', 'invariant'),
+    [
+        (FIRST_TOKENED, UNTIL_TEXT, (LATER, FIRST_TOKENED), 'sorted'),
+        (FIRST_TOKENED, LATER, (FIRST_TOKENED, LATER), 'end'),
+        (FIRST_TOKENED, UNTIL_TEXT, (FIRST_TOKENED, '2026-10-09T00:00:00+00:00'), 'end'),
+        (UNTIL_TEXT, FIRST_TOKENED, (), 'end'),
+        (FIRST_TOKENED, UNTIL_TEXT, (), 'empty'),
+        (PRE_START, UNTIL_TEXT, (FIRST_TOKENED, LATER), 'first attempt'),
+    ],
+)
+def test_window_construction_enforces_its_invariant(start, end, stamps, invariant):
+    with pytest.raises(ValueError, match=invariant):
+        TelemetryWindow(
+            start=at(start), end=at(end), attempts=tuple(attempt_at(stamp) for stamp in stamps)
+        )
+
+
+PRICING = TokenPricing(usd_per_mtok_input=0.15, usd_per_mtok_output=0.60)
+MEASURED_AT = datetime(2026, 10, 7, 1, 34, tzinfo=UTC)
+SAME_DAY_FAILED = '2026-10-06T08:00:00+00:00'
+SAME_DAY_OK = '2026-10-06T21:30:00+00:00'
+LAST_DAY = '2026-10-07T12:00:00+00:00'
+
+
+def costed_window() -> TelemetryWindow:
+    attempts = (
+        attempt_at(FIRST_TOKENED, tokens=(1000, 100, 9)),
+        attempt_at(SAME_DAY_FAILED, project_id='reify', success=0, tokens=(500, 50, 3)),
+        attempt_at(SAME_DAY_OK, tokens=(2000, 200, 12)),
+        attempt_at(LAST_DAY, tokens=(1500, 150, 8)),
+    )
+    return TelemetryWindow(start=at(FIRST_TOKENED), end=UNTIL, attempts=attempts)
+
+
+def test_production_totals_count_every_attempt_failed_ones_included():
+    cost = production_cost(costed_window(), PRICING)
+
+    assert (cost.attempts, cost.failed_attempts, cost.llm_calls) == (4, 1, 32)
+    assert (cost.input_tokens, cost.output_tokens) == (5000, 500)
+    assert cost.usd == pytest.approx(
+        PRICING.usd_for(1000, 100)
+        + PRICING.usd_for(500, 50)
+        + PRICING.usd_for(2000, 200)
+        + PRICING.usd_for(1500, 150)
+    )
+    assert (cost.window_start, cost.window_end) == (at(FIRST_TOKENED), UNTIL)
+
+
+def test_production_rates_derive_from_the_totals_and_the_window_length():
+    cost = production_cost(costed_window(), PRICING)
+    days = (UNTIL - at(FIRST_TOKENED)).total_seconds() / 86400
+
+    assert cost.usd_per_ok_attempt == cost.usd / 3
+    assert cost.tokens_per_attempt == 5500 / 4
+    assert cost.days == days
+    assert cost.usd_per_day == cost.usd / days
+    assert PROJECTION_DAYS == 30
+    assert cost.projected_usd_per_30_days == cost.usd_per_day * 30
+
+
+def test_production_spend_is_broken_down_by_utc_day_and_by_project():
+    cost = production_cost(costed_window(), PRICING)
+
+    assert [(d.day, d.attempts) for d in cost.by_day] == [
+        (date(2026, 10, 5), 1),
+        (date(2026, 10, 6), 2),
+        (date(2026, 10, 7), 1),
+    ]
+    assert cost.by_day[1].usd == pytest.approx(
+        PRICING.usd_for(500, 50) + PRICING.usd_for(2000, 200)
+    )
+    assert [(p.project_id, p.attempts) for p in cost.by_project] == [
+        ('dark_factory', 3),
+        ('reify', 1),
+    ]
+    assert cost.by_project[1].usd == pytest.approx(PRICING.usd_for(500, 50))
+    assert sum(d.usd for d in cost.by_day) == pytest.approx(cost.usd)
+    assert sum(p.usd for p in cost.by_project) == pytest.approx(cost.usd)
+
+
+def test_a_window_with_no_ok_attempt_has_nothing_to_cost():
+    window = TelemetryWindow(
+        start=at(FIRST_TOKENED), end=UNTIL, attempts=(attempt_at(FIRST_TOKENED, success=0),)
+    )
+
+    with pytest.raises(IncumbentCostError, match='no ok attempt'):
+        production_cost(window, PRICING)
+
+
+@pytest.mark.parametrize(
+    ('field', 'replacement', 'refusal'),
+    [
+        ('failed_attempts', 4, 'failed_attempts 4 leaves no ok attempt among attempts 4'),
+        ('days', 1.0, 'days 1.0 != window length'),
+        (
+            'by_day',
+            (DailySpend(day=date(2026, 10, 5), attempts=1, usd=0.1),),
+            'by_day attempts 1 != attempts 4',
+        ),
+        (
+            'by_project',
+            (ProjectSpend(project_id='reify', attempts=1, usd=0.1),),
+            'by_project attempts 1 != attempts 4',
+        ),
+        (
+            'usd_per_ok_attempt',
+            1.0,
+            'usd_per_ok_attempt 1.0 != usd / (attempts - failed_attempts)',
+        ),
+        (
+            'tokens_per_attempt',
+            1.0,
+            'tokens_per_attempt 1.0 != (input_tokens + output_tokens) / attempts 1375.0',
+        ),
+        ('usd_per_day', 1.0, 'usd_per_day 1.0 != usd / days'),
+        ('projected_usd_per_30_days', 1.0, 'projected_usd_per_30_days 1.0 != usd_per_day * 30'),
+    ],
+)
+def test_production_cost_construction_checks_its_derivation(field, replacement, refusal):
+    valid = production_cost(costed_window(), PRICING)
+    data = dict(valid) | {field: replacement}
+
+    with pytest.raises(ValueError, match=re.escape(refusal)):
+        ProductionCost(**data)
+
+
+def control_record(
+    metric_id: LlmMetricId,
+    value: float,
+    *,
+    spec: LlmArmSpec | None = None,
+    n: int = 200,
+    incomplete: bool = False,
+    delta_of: DeltaOf | None = None,
+) -> MetricsRecord:
+    metric = Metric(metric_id=metric_id, kind='scalar', value=value, n=n)
+    return record_for(
+        spec or incumbent_control_spec(arm_id='incumbent-generic-a'),
+        metric,
+        measured_at=MEASURED_AT,
+        incomplete=incomplete,
+        delta_of=delta_of,
+    )
+
+
+def control_run_records(arm_id: str = 'incumbent-generic-a', tokens: float = 15688.47):
+    spec = incumbent_control_spec(arm_id=arm_id)
+    return (
+        control_record(LlmMetricId.EPISODE_LATENCY_P95, 42828.0, spec=spec),
+        control_record(LlmMetricId.TOKENS_PER_EPISODE, tokens, spec=spec, n=199),
+        control_record(LlmMetricId.USD_PER_EPISODE, 0.0027364, spec=spec),
+    )
+
+
+def test_replay_unit_cost_reads_one_control_runs_token_and_usd_records():
+    assert replay_unit_cost(control_run_records()) == ReplayUnitCost(
+        arm_id='incumbent-generic-a', n=200, tokens_per_episode=15688.47, usd_per_episode=0.0027364
+    )
+
+
+def _without(metric_id: LlmMetricId):
+    return tuple(r for r in control_run_records() if r.metric.metric_id != metric_id)
+
+
+@pytest.mark.parametrize(
+    ('records', 'named'),
+    [
+        (_without(LlmMetricId.TOKENS_PER_EPISODE), 'tokens-per-episode'),
+        (_without(LlmMetricId.USD_PER_EPISODE), 'usd-per-episode'),
+        (
+            (*control_run_records(), control_record(LlmMetricId.USD_PER_EPISODE, 0.1)),
+            'usd-per-episode',
+        ),
+        (
+            (*control_run_records(), *control_run_records(arm_id='incumbent-generic-b')[1:2]),
+            'incumbent-generic-b',
+        ),
+        ((), 'arm'),
+        (
+            (
+                control_record(LlmMetricId.TOKENS_PER_EPISODE, 1.0, incomplete=True),
+                control_record(LlmMetricId.USD_PER_EPISODE, 0.1),
+            ),
+            'incomplete',
+        ),
+        (
+            (
+                control_record(LlmMetricId.TOKENS_PER_EPISODE, 1.0, spec=llm_spec()),
+                control_record(LlmMetricId.USD_PER_EPISODE, 0.0, spec=llm_spec()),
+            ),
+            'control',
+        ),
+        (
+            (
+                control_record(LlmMetricId.TOKENS_PER_EPISODE, 1.0),
+                control_record(
+                    LlmMetricId.USD_PER_EPISODE,
+                    -0.1,
+                    delta_of=DeltaOf(
+                        minuend_arm_id='incumbent-generic-a', subtrahend_arm_id='incumbent-b'
+                    ),
+                ),
+            ),
+            'delta',
+        ),
+    ],
+)
+def test_replay_unit_cost_refuses_records_that_are_not_one_complete_control_run(records, named):
+    with pytest.raises(IncumbentCostError, match=named):
+        replay_unit_cost(records)
+
+
+def test_incumbent_cost_carries_the_price_production_and_each_control_in_order():
+    spec = incumbent_control_spec(arm_id='incumbent-generic-a')
+    run_a = control_run_records('incumbent-generic-a', tokens=15688.47)
+    run_b = control_run_records('incumbent-generic-b', tokens=15700.0)
+
+    cost = derive_incumbent_cost(costed_window(), pricing_spec=spec, control_records=[run_a, run_b])
+
+    assert cost.schema_version == 1
+    assert cost.pricing == spec.pricing
+    assert cost.pricing_arm_id == 'incumbent-generic-a'
+    assert spec.pricing is not None
+    assert cost.production == production_cost(costed_window(), spec.pricing)
+    assert cost.replay == (replay_unit_cost(run_a), replay_unit_cost(run_b))
+
+
+@pytest.mark.parametrize(
+    ('pricing_spec', 'control_records', 'named'),
+    [
+        (llm_spec(), [control_run_records()], 'pricing'),
+        (incumbent_control_spec(), [], 'control'),
+        (
+            incumbent_control_spec(),
+            [control_run_records(), control_run_records()],
+            'incumbent-generic-a',
+        ),
+    ],
+)
+def test_derive_incumbent_cost_refuses_an_unpriced_spec_or_a_bad_control_set(
+    pricing_spec, control_records, named
+):
+    with pytest.raises(IncumbentCostError, match=named):
+        derive_incumbent_cost(
+            costed_window(), pricing_spec=pricing_spec, control_records=control_records
+        )
+
+
+def test_incumbent_cost_round_trips_through_its_canonical_serialization(tmp_path):
+    cost = derive_incumbent_cost(
+        costed_window(),
+        pricing_spec=incumbent_control_spec(),
+        control_records=[control_run_records()],
+    )
+    path = tmp_path / 'incumbent-cost.json'
+    text = serialize_incumbent_cost(cost)
+    path.write_text(text)
+
+    assert text == canonical_json_text(cost.model_dump(mode='json'))
+    assert load_incumbent_cost(path) == cost
+
+
+def test_llm_attempts_round_trip_as_one_canonical_json_object_per_line(tmp_path):
+    attempts = costed_window().attempts
+    path = tmp_path / 'production-telemetry.jsonl'
+    text = serialize_llm_attempts(attempts)
+    path.write_text(text)
+
+    lines = text.splitlines()
+    assert len(lines) == len(attempts)
+    assert lines == [json.dumps(json.loads(line), sort_keys=True, ensure_ascii=False) for line in lines]
+    assert load_llm_attempts(path) == attempts

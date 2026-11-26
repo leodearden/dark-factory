@@ -8,11 +8,18 @@ Covers:
 - TestCiteRun      — cite_run UUID shape gate, run_not_found, happy path, finding_unknown (task 2595)
 - TestCiteToolsViaFastMCP — tools registered, end-to-end via call_tool, P4 schema rejection
 - TestReconReportComponentsWiring — _build_recon_report_components service injection
+- TestCiteTaskFoldPurgeRecord — task-4865 structured record of fold-purged findings
+- TestCiteTaskFoldPurgeRecordPersistence — task-4865 record restart round-trip and report contract
 """
 
 from __future__ import annotations
 
+import json
+import logging
+from unittest.mock import patch
+
 import pytest
+from _mem0_record_shapes import mem0_record
 from mcp.server.fastmcp.exceptions import ToolError
 
 # ---------------------------------------------------------------------------
@@ -268,6 +275,24 @@ class TestCiteEdge:
         assert fake.get_edge_calls == []
 
     @pytest.mark.asyncio
+    async def test_invalid_uuid_shape_trailing_newline(self):
+        """A canonical UUID with a trailing newline → invalid_uuid_shape.
+
+        Not hypothetical: the anchored `^...$` regex this gate used to apply
+        with `.match()` ACCEPTED it, because Python's `$` matches immediately
+        before a trailing newline. Such an id passed the gate and then resolved
+        to nothing downstream — the same silent no-op delete_memory now
+        hard-errors on (task 3132).
+        """
+        state, run_id, finding_id, fake = self._state_and_finding()
+
+        result = await state.cite_edge(run_id, finding_id, self._VALID_UUID + '\n')
+
+        assert result.get('error') == 'invalid_uuid_shape'
+        assert result.get('error_type') == 'ReconReportInvalidUuid'
+        assert fake.get_edge_calls == []
+
+    @pytest.mark.asyncio
     async def test_invalid_uuid_shape_leaves_cited_edges_unchanged(self):
         """UUID shape rejection must NOT mutate cited_edges."""
         state, run_id, finding_id, _ = self._state_and_finding()
@@ -450,7 +475,7 @@ class TestCiteTask:
         # Add a second finding
         r2 = state.add_finding(
             run_id=run_id,
-            severity='low',
+            severity='minor',
             category='cat',
             description='d2',
             suggested_action='a',
@@ -481,6 +506,104 @@ class TestCiteTask:
 
         assert result.get('error') == 'finding_unknown'
         assert result.get('error_type') == 'ReconReportFindingUnknown'
+
+
+    # ---- task 4864 step-5: the title-less record the producer writes -------
+    #
+    # ``title = result.get('title') or data.get('title', '')`` has NO rejection
+    # path, so a ``get_task`` record carrying no title at either level is
+    # stored as ``title=''``.  That is the ONE citation shape this validating
+    # producer mints itself, and it used to be permanently un-corroborable
+    # downstream — silently, since nothing logged it.  Titles are cosmetic
+    # (task 4864), so the citation must still be recorded; what must change is
+    # that it stops happening in silence.
+
+    TITLELESS_RECORDS = {
+        'no-title-key': {'id': '5'},
+        'title-none': {'id': '5', 'title': None},
+        'title-empty': {'id': '5', 'title': ''},
+        # Exercises the SECOND branch of the `or`: a falsy top-level title
+        # falling through to an equally title-less `data` sub-dict.
+        'data-without-title': {'id': '5', 'title': '', 'data': {'id': '5'}},
+        'data-none': {'id': '5', 'title': '', 'data': None},
+    }
+    LOGGER = 'fused_memory.server.recon_report'
+
+    def _titleless_state(self, record):
+        """A state whose interceptor returns *record* for dark_factory task 5."""
+        fake_ti = _FakeTaskInterceptor(
+            results={('5', '/home/leo/src/dark-factory'): record}
+        )
+        return self._state_and_finding(fake_ti=fake_ti)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('shape', sorted(TITLELESS_RECORDS), ids=sorted(TITLELESS_RECORDS))
+    async def test_titleless_record_still_cites_but_warns(self, shape, caplog):
+        """A cosmetic field must not veto a citation whose existence check
+        passed — but the degraded write must be audible."""
+        state, run_id, finding_id, _ = self._titleless_state(self.TITLELESS_RECORDS[shape])
+
+        with caplog.at_level(logging.INFO, logger=self.LOGGER):
+            result = await state.cite_task(run_id, finding_id, 'dark_factory', '5')
+
+        assert result.get('error') is None, (
+            f'a title-less record still EXISTS, so the citation must stand '
+            f'({shape}); got {result!r}'
+        )
+        assert result.get('project_id') == 'dark_factory' and result.get('task_id') == '5'
+        assert result.get('title') == '', (
+            f'the empty title is returned verbatim ({shape}); got {result!r}'
+        )
+
+        report = state.get_assembled_report(run_id, 'reconciler')
+        assert report is not None
+        cited = report['flagged_items'][0]['cited_tasks']
+        assert len(cited) == 1 and cited[0]['task_id'] == '5', (
+            f'the citation must be appended ({shape}); got {cited!r}'
+        )
+
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert warnings, (
+            f'a title-less citation must be logged at WARNING ({shape}); got '
+            f'{[(r.levelname, r.message) for r in caplog.records]!r}'
+        )
+        message = warnings[0].getMessage()
+        assert 'dark_factory' in message and '5' in message, (
+            f'the warning must identify the project/task ({shape}); got {message!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_record_with_a_title_logs_no_such_warning(self, caplog):
+        """Companion: the signal stays meaningful only if the ordinary path is
+        silent."""
+        state, run_id, finding_id, _ = self._state_and_finding()
+
+        with caplog.at_level(logging.INFO, logger=self.LOGGER):
+            result = await state.cite_task(run_id, finding_id, 'dark_factory', '5')
+
+        assert result.get('title') == 'T-5'
+        assert not [r for r in caplog.records if r.levelno >= logging.WARNING], (
+            'a resolvable title must not warn; got '
+            f'{[(r.levelname, r.message) for r in caplog.records]!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_title_resolved_from_the_data_fallback_logs_no_warning(self, caplog):
+        """The `or data.get('title')` fallback is a SUCCESS, not a degradation."""
+        state, run_id, finding_id, _ = self._titleless_state(
+            {'id': '5', 'data': {'id': '5', 'title': 'T-5-from-data'}}
+        )
+
+        with caplog.at_level(logging.INFO, logger=self.LOGGER):
+            result = await state.cite_task(run_id, finding_id, 'dark_factory', '5')
+
+        assert result.get('title') == 'T-5-from-data', (
+            f'the data fallback must still resolve a title; got {result!r}'
+        )
+        assert not [r for r in caplog.records if r.levelno >= logging.WARNING], (
+            'a title resolved via the data fallback must not warn; got '
+            f'{[(r.levelname, r.message) for r in caplog.records]!r}'
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -582,6 +705,7 @@ class TestCiteTaskInRunCitedTaskDedup:
         assert report is not None
         ids = [item['finding_id'] for item in report['flagged_items']]
         assert ids == [finding_id_1]
+        assert state.violations() == []
 
     @pytest.mark.asyncio
     async def test_different_primary_cited_tasks_both_survive(self):
@@ -592,12 +716,12 @@ class TestCiteTaskInRunCitedTaskDedup:
         state.start_report(run_id='run-1', stage='reconciler', project_id='dark_factory')
 
         f1 = state.add_finding(
-            run_id='run-1', severity='low', category='cross_project',
+            run_id='run-1', severity='minor', category='cross_project',
             description='desc A', suggested_action='a',
             task_id=None, flag_type=None,
         )
         f2 = state.add_finding(
-            run_id='run-1', severity='low', category='cross_project',
+            run_id='run-1', severity='minor', category='cross_project',
             description='desc B', suggested_action='a',
             task_id=None, flag_type='other_flag',
         )
@@ -624,12 +748,12 @@ class TestCiteTaskInRunCitedTaskDedup:
         state.start_report(run_id='run-1', stage='reconciler', project_id='dark_factory')
 
         f_null = state.add_finding(
-            run_id='run-1', severity='low', category='cross_project',
+            run_id='run-1', severity='minor', category='cross_project',
             description='null task_id desc', suggested_action='a',
             task_id=None, flag_type=None,
         )
         f_real = state.add_finding(
-            run_id='run-1', severity='low', category='cross_project',
+            run_id='run-1', severity='minor', category='cross_project',
             description='real task_id desc', suggested_action='a',
             task_id='9876', flag_type='some_flag',
         )
@@ -656,12 +780,12 @@ class TestCiteTaskInRunCitedTaskDedup:
         state.start_report(run_id='run-2', stage='reconciler', project_id='dark_factory')
 
         f1 = state.add_finding(
-            run_id='run-1', severity='low', category='cross_project',
+            run_id='run-1', severity='minor', category='cross_project',
             description='run1 desc', suggested_action='a',
             task_id=None, flag_type=None,
         )
         f2 = state.add_finding(
-            run_id='run-2', severity='low', category='cross_project',
+            run_id='run-2', severity='minor', category='cross_project',
             description='run2 desc', suggested_action='a',
             task_id=None, flag_type=None,
         )
@@ -689,7 +813,7 @@ class TestCiteTaskInRunCitedTaskDedup:
         state.start_report(run_id='run-1', stage='reconciler', project_id='dark_factory')
 
         f1 = state.add_finding(
-            run_id='run-1', severity='low', category='cross_project',
+            run_id='run-1', severity='minor', category='cross_project',
             description='desc one', suggested_action='a',
             task_id=None, flag_type=None,
         )
@@ -706,7 +830,7 @@ class TestCiteTaskInRunCitedTaskDedup:
         # succeed — proving the secondary citation above did not register
         # '9999' as a fold anchor.
         f2 = state.add_finding(
-            run_id='run-1', severity='low', category='cross_project',
+            run_id='run-1', severity='minor', category='cross_project',
             description='desc two', suggested_action='a',
             task_id=None, flag_type='another_flag',
         )
@@ -748,12 +872,12 @@ class TestCiteTaskInRunCitedTaskDedup:
         state.start_report(run_id='run-1', stage='memory_consolidator', project_id='dark_factory')
 
         f1 = state.add_finding(
-            run_id='run-1', severity='low', category='cross_project',
+            run_id='run-1', severity='minor', category='cross_project',
             description='mc desc one', suggested_action='a',
             task_id=None, flag_type=None,
         )
         f2 = state.add_finding(
-            run_id='run-1', severity='low', category='cross_project',
+            run_id='run-1', severity='minor', category='cross_project',
             description='mc desc two', suggested_action='a',
             task_id=None, flag_type='other_flag',
         )
@@ -776,14 +900,14 @@ class TestCiteTaskInRunCitedTaskDedup:
         anchor that a later non-mc-stage finding relies on. Stage 1 cites an
         external task first; Stage 2 (reconciler) then cites the SAME task
         as ITS OWN primary citation -- it must succeed plainly (not fold),
-        proving the Stage-1 citation registered nothing in
-        ``_run_cited_task_index`` for the non-mc stage to collide with.
+        proving the Stage-1 citation registered no cited-task key in the
+        run's finding index for the non-mc stage to collide with.
         """
         state, _ = self._make_state()
 
         state.start_report(run_id='run-1', stage='memory_consolidator', project_id='dark_factory')
         f_mc = state.add_finding(
-            run_id='run-1', severity='low', category='cross_project',
+            run_id='run-1', severity='minor', category='cross_project',
             description='mc desc', suggested_action='a',
             task_id=None, flag_type=None,
         )
@@ -799,7 +923,7 @@ class TestCiteTaskInRunCitedTaskDedup:
         # from report_recon below for a reason orthogonal to what this test
         # verifies (write-time fold-anchor isolation across stages).
         f_recon = state.add_finding(
-            run_id='run-1', severity='low', category='cross_project',
+            run_id='run-1', severity='minor', category='cross_project',
             description='recon desc', suggested_action='a',
             actionable=True, task_id=None, flag_type='recon_flag',
         )
@@ -919,7 +1043,7 @@ class TestCiteTaskEntityScopedFold:
         state.start_report(run_id='run-1', stage='task_knowledge_sync', project_id='dark_factory')
 
         occ1 = state.add_finding(
-            run_id='run-1', severity='low', category='memory_stale',
+            run_id='run-1', severity='minor', category='memory_stale',
             description='occ1 desc', suggested_action='a',
             task_id=None, flag_type='cross_project',
         )
@@ -930,7 +1054,7 @@ class TestCiteTaskEntityScopedFold:
         assert 'error' not in cite1, cite1
 
         occ2 = state.add_finding(
-            run_id='run-1', severity='low', category='memory_stale',
+            run_id='run-1', severity='minor', category='memory_stale',
             description='occ2 desc, worded differently', suggested_action='a',
             task_id='2405', flag_type='cross_project',
         )
@@ -953,7 +1077,7 @@ class TestCiteTaskEntityScopedFold:
         state.start_report(run_id='run-1', stage='task_knowledge_sync', project_id='dark_factory')
 
         occ2 = state.add_finding(
-            run_id='run-1', severity='low', category='memory_stale',
+            run_id='run-1', severity='minor', category='memory_stale',
             description='occ2 desc', suggested_action='a',
             task_id='2405', flag_type='cross_project',
         )
@@ -961,7 +1085,7 @@ class TestCiteTaskEntityScopedFold:
         fid2 = occ2['finding_id']
 
         occ1 = state.add_finding(
-            run_id='run-1', severity='low', category='memory_stale',
+            run_id='run-1', severity='minor', category='memory_stale',
             description='occ1 desc, worded differently', suggested_action='a',
             task_id=None, flag_type='cross_project',
         )
@@ -980,6 +1104,7 @@ class TestCiteTaskEntityScopedFold:
         assert report is not None
         ids = [item['finding_id'] for item in report['flagged_items']]
         assert ids == [fid2]
+        assert state.violations() == []
 
     @pytest.mark.asyncio
     async def test_same_project_single_task_id_folds(self):
@@ -990,7 +1115,7 @@ class TestCiteTaskEntityScopedFold:
         state.start_report(run_id='run-1', stage='task_knowledge_sync', project_id='dark_factory')
 
         occ_a = state.add_finding(
-            run_id='run-1', severity='low', category='memory_stale',
+            run_id='run-1', severity='minor', category='memory_stale',
             description='occ_a desc', suggested_action='a',
             task_id=None, flag_type='X',
         )
@@ -1001,7 +1126,7 @@ class TestCiteTaskEntityScopedFold:
         assert 'error' not in cite_a, cite_a
 
         occ_b = state.add_finding(
-            run_id='run-1', severity='low', category='memory_stale',
+            run_id='run-1', severity='minor', category='memory_stale',
             description='occ_b desc, worded differently', suggested_action='a',
             task_id='5040', flag_type='X',
         )
@@ -1025,7 +1150,7 @@ class TestCiteTaskEntityScopedFold:
         state.start_report(run_id='run-1', stage='memory_consolidator', project_id='dark_factory')
 
         occ_mc = state.add_finding(
-            run_id='run-1', severity='low', category='memory_stale',
+            run_id='run-1', severity='minor', category='memory_stale',
             description='mc desc', suggested_action='a',
             task_id=None, flag_type='Y',
         )
@@ -1037,7 +1162,7 @@ class TestCiteTaskEntityScopedFold:
 
         state.start_report(run_id='run-1', stage='task_knowledge_sync', project_id='dark_factory')
         occ_tks = state.add_finding(
-            run_id='run-1', severity='low', category='memory_stale',
+            run_id='run-1', severity='minor', category='memory_stale',
             description='tks desc, worded differently', suggested_action='a',
             task_id='7777', flag_type='Y',
         )
@@ -1064,7 +1189,7 @@ class TestCiteTaskEntityScopedFold:
         state.start_report(run_id='run-1', stage='task_knowledge_sync', project_id='dark_factory')
 
         occ_top = state.add_finding(
-            run_id='run-1', severity='low', category='memory_stale',
+            run_id='run-1', severity='minor', category='memory_stale',
             description='top desc', suggested_action='a',
             task_id='2405', flag_type='Z',
         )
@@ -1072,7 +1197,7 @@ class TestCiteTaskEntityScopedFold:
         fid_top = occ_top['finding_id']
 
         occ_null = state.add_finding(
-            run_id='run-1', severity='low', category='memory_stale',
+            run_id='run-1', severity='minor', category='memory_stale',
             description='null desc', suggested_action='a',
             task_id=None, flag_type='Z',
         )
@@ -1096,7 +1221,7 @@ class TestCiteTaskEntityScopedFold:
         state.start_report(run_id='run-1', stage='task_knowledge_sync', project_id='dark_factory')
 
         occ1 = state.add_finding(
-            run_id='run-1', severity='low', category='memory_stale',
+            run_id='run-1', severity='minor', category='memory_stale',
             description='occ1 desc', suggested_action='a',
             task_id=None, flag_type='flag_one',
         )
@@ -1107,7 +1232,7 @@ class TestCiteTaskEntityScopedFold:
         assert 'error' not in cite1, cite1
 
         occ2 = state.add_finding(
-            run_id='run-1', severity='low', category='memory_stale',
+            run_id='run-1', severity='minor', category='memory_stale',
             description='occ2 desc', suggested_action='a',
             task_id='2405', flag_type='flag_two',
         )
@@ -1130,7 +1255,7 @@ class TestCiteTaskEntityScopedFold:
         state.start_report(run_id='run-1', stage='task_knowledge_sync', project_id='dark_factory')
 
         occ_null = state.add_finding(
-            run_id='run-1', severity='low', category='memory_stale',
+            run_id='run-1', severity='minor', category='memory_stale',
             description='null desc', suggested_action='a',
             task_id=None, flag_type='W',
         )
@@ -1141,7 +1266,7 @@ class TestCiteTaskEntityScopedFold:
         assert 'error' not in cite_null, cite_null
 
         occ_local = state.add_finding(
-            run_id='run-1', severity='low', category='memory_stale',
+            run_id='run-1', severity='minor', category='memory_stale',
             description='local desc', suggested_action='a',
             task_id='100', flag_type='W',
         )
@@ -1177,7 +1302,7 @@ class TestCiteTaskEntityScopedFold:
         state.start_report(run_id='run-1', stage='task_knowledge_sync', project_id='dark_factory')
 
         occ1 = state.add_finding(
-            run_id='run-1', severity='low', category='memory_stale',
+            run_id='run-1', severity='minor', category='memory_stale',
             description='occ1 desc', suggested_action='a',
             task_id=None, flag_type='X',
         )
@@ -1190,7 +1315,7 @@ class TestCiteTaskEntityScopedFold:
         assert 'error' not in cite1_5149, cite1_5149
 
         occ_c = state.add_finding(
-            run_id='run-1', severity='low', category='memory_stale',
+            run_id='run-1', severity='minor', category='memory_stale',
             description='occ_c desc, worded differently', suggested_action='a',
             task_id='5040,5149', flag_type='X',
         )
@@ -1218,7 +1343,7 @@ class TestCiteTaskEntityScopedFold:
         state.start_report(run_id='run-1', stage='task_knowledge_sync', project_id='dark_factory')
 
         occ_c = state.add_finding(
-            run_id='run-1', severity='low', category='memory_stale',
+            run_id='run-1', severity='minor', category='memory_stale',
             description='occ_c desc', suggested_action='a',
             task_id='5040,5149', flag_type='X',
         )
@@ -1229,7 +1354,7 @@ class TestCiteTaskEntityScopedFold:
         assert 'error' not in cite_c, cite_c
 
         occ1 = state.add_finding(
-            run_id='run-1', severity='low', category='memory_stale',
+            run_id='run-1', severity='minor', category='memory_stale',
             description='occ1 desc, worded differently', suggested_action='a',
             task_id=None, flag_type='X',
         )
@@ -1250,13 +1375,9 @@ class TestCiteTaskEntityScopedFold:
 
     # -- Purge/refile clears the derived sig (task-2432 step-11) -------
     #
-    # _purge_finding (as of step-10) only clears the ORDINARY sig
-    # (finding.task_id, finding.flag_type) and the project-scoped
-    # _run_cited_task_index anchor -- it does not know about the derived
-    # (cited_task_id, flag_type) key the entity-scoped fold registers into
-    # _run_sig_index. Deleting a finding that was a derived-sig anchor
-    # therefore leaves a stale pointer a later refile bounces off. step-12
-    # extends _purge_finding to also clear it.
+    # Deleting a finding that was a derived-sig anchor must clear the
+    # derived (cited_task_id, flag_type) key the entity-scoped fold
+    # registered, or a later refile bounces off a stale pointer.
 
     @pytest.mark.asyncio
     async def test_delete_then_refile_matching_top_level_task_id_succeeds(self):
@@ -1269,7 +1390,7 @@ class TestCiteTaskEntityScopedFold:
         state.start_report(run_id='run-1', stage='task_knowledge_sync', project_id='dark_factory')
 
         occ1 = state.add_finding(
-            run_id='run-1', severity='low', category='memory_stale',
+            run_id='run-1', severity='minor', category='memory_stale',
             description='occ1 desc', suggested_action='a',
             task_id=None, flag_type='X',
         )
@@ -1283,7 +1404,7 @@ class TestCiteTaskEntityScopedFold:
         assert delete_result == {'status': 'deleted', 'finding_id': fid1}
 
         occ2 = state.add_finding(
-            run_id='run-1', severity='low', category='memory_stale',
+            run_id='run-1', severity='minor', category='memory_stale',
             description='occ2 desc', suggested_action='a',
             task_id='5040', flag_type='X',
         )
@@ -1293,6 +1414,7 @@ class TestCiteTaskEntityScopedFold:
         assert report is not None
         ids = [item['finding_id'] for item in report['flagged_items']]
         assert ids == [occ2['finding_id']]
+        assert state.violations() == []
 
     @pytest.mark.asyncio
     async def test_delete_then_refile_comma_joined_top_level_task_id_succeeds(self):
@@ -1305,7 +1427,7 @@ class TestCiteTaskEntityScopedFold:
         state.start_report(run_id='run-1', stage='task_knowledge_sync', project_id='dark_factory')
 
         occ1 = state.add_finding(
-            run_id='run-1', severity='low', category='memory_stale',
+            run_id='run-1', severity='minor', category='memory_stale',
             description='occ1 desc', suggested_action='a',
             task_id=None, flag_type='X',
         )
@@ -1319,7 +1441,7 @@ class TestCiteTaskEntityScopedFold:
         assert delete_result == {'status': 'deleted', 'finding_id': fid1}
 
         occ3 = state.add_finding(
-            run_id='run-1', severity='low', category='memory_stale',
+            run_id='run-1', severity='minor', category='memory_stale',
             description='occ3 desc', suggested_action='a',
             task_id='5040,5149', flag_type='X',
         )
@@ -1336,6 +1458,1332 @@ class TestCiteTaskEntityScopedFold:
 
 
 # ---------------------------------------------------------------------------
+# task-4185: TestCiteTaskCrossProjectNearCollision — the entity-scoped fold's
+# derived signature is PROJECTLESS, so two projects' findings about
+# same-numbered tasks can collide. step-1 pins the three folds that must NOT
+# change; step-2/4/6 drive the guard itself.
+# ---------------------------------------------------------------------------
+
+
+class TestCiteTaskCrossProjectNearCollision:
+    """Cross-project near-collisions on the entity-scoped derived signature
+    (task-4185).
+
+    The run finding index's derived key is ``(canonical(cited task_id),
+    flag_type)`` — deliberately PROJECTLESS. Operator ruling (2026-08-12):
+    the projectless key STAYS, because it is what lets a bare top-level
+    task_id (which names no project at all) fold onto a foreign citation,
+    and that fold is INTENDED. Only the DETECTABLE half is guarded — a
+    cite_task→cite_task collision where the ANCHOR's own primary citation
+    pins the same task id to a different project.
+
+    The three tests below are CHARACTERIZATION PINS: each was confirmed to
+    fold on unmodified code and must keep folding after the guard lands, so
+    the guard cannot silently over-reach.
+    """
+
+    def _fake_ti(self):
+        """Fake task interceptor covering the cited ids under BOTH known roots.
+
+        These tests cite the SAME numeric task id from two different
+        projects, so every id must resolve under each of ``_KNOWN_PROJECTS``'
+        roots — otherwise a foreign citation would fail with
+        ``task_not_found`` before ever reaching the fold logic.
+        """
+        results = {}
+        for pr in _KNOWN_PROJECTS.values():
+            for tid in ['42', '99', '999', '2405', '7777']:
+                results[(tid, pr)] = {'id': tid, 'title': f'T-{tid}'}
+        return _FakeTaskInterceptor(results=results)
+
+    def _make_state(self, fake_ti=None):
+        from fused_memory.server.recon_report import ReconReportState
+
+        if fake_ti is None:
+            fake_ti = self._fake_ti()
+        t = [0.0]
+        state = ReconReportState(
+            ttl_seconds=300,
+            clock=lambda: t[0],
+            task_interceptor=fake_ti,
+        )
+        state.known_projects = dict(_KNOWN_PROJECTS)
+        return state, t
+
+    # -- CHARACTERIZATION PINS (green on unmodified code) ---------------
+
+    @pytest.mark.asyncio
+    async def test_same_project_cite_task_collision_still_folds(self):
+        """(b) A genuine SAME-project duplicate must keep folding.
+
+        The anchor's primary citation pins ('dark_factory', '2405'); the
+        incoming citation names the same task in the same project, so this
+        is an ordinary duplicate, not a near-collision.
+        """
+        state, _ = self._make_state()
+        state.start_report(run_id='run-1', stage='task_knowledge_sync', project_id='dark_factory')
+
+        anchor = state.add_finding(
+            run_id='run-1', severity='minor', category='memory_stale',
+            description='anchor 2405', suggested_action='a',
+            task_id='2405', flag_type='X',
+        )
+        assert 'finding_id' in anchor, anchor
+        anchor_id = anchor['finding_id']
+
+        # Self-hit: registers the derived sig ('2405', 'X') AND records
+        # cited_tasks[0] == {'dark_factory', '2405'} as the project pin.
+        cite_anchor = await state.cite_task('run-1', anchor_id, 'dark_factory', '2405')
+        assert 'error' not in cite_anchor, cite_anchor
+
+        incoming = state.add_finding(
+            run_id='run-1', severity='minor', category='memory_stale',
+            description='incoming 2405, worded differently', suggested_action='a',
+            task_id=None, flag_type='X',
+        )
+        assert 'finding_id' in incoming, incoming
+        incoming_id = incoming['finding_id']
+
+        result = await state.cite_task('run-1', incoming_id, 'dark_factory', '2405')
+        assert result.get('error') == 'duplicate_finding'
+        assert result.get('existing_finding_id') == anchor_id
+
+        assert state._resolve_finding('run-1', incoming_id) is None
+
+        report = state.get_assembled_report('run-1', 'task_knowledge_sync')
+        assert report is not None
+        ids = [item['finding_id'] for item in report['flagged_items']]
+        assert ids == [anchor_id]
+
+    @pytest.mark.asyncio
+    async def test_anchor_citing_a_different_task_still_folds(self):
+        """(c3) An anchor whose primary citation names a DIFFERENT task
+        carries NO project pin for this derived signature — it must keep
+        folding.
+
+        The anchor's top-level task_id is '42' (which is what registered the
+        ordinary ('42', 'X') signature add_finding consults), but its only
+        citation is other_project:999 — '999' is not a member of {'42'}, so
+        that cite_task call registered no derived sig at all. A guard that
+        compared cited_tasks[0]['project_id'] against the incoming
+        project_id WITHOUT first checking the citation names the SAME task
+        would see 'other_project' != 'dark_factory' and wrongly break this
+        pre-existing fold.
+        """
+        state, _ = self._make_state()
+        state.start_report(run_id='run-1', stage='task_knowledge_sync', project_id='dark_factory')
+
+        anchor = state.add_finding(
+            run_id='run-1', severity='minor', category='memory_stale',
+            description='anchor 42', suggested_action='a',
+            task_id='42', flag_type='X',
+        )
+        assert 'finding_id' in anchor, anchor
+        anchor_id = anchor['finding_id']
+
+        cite_anchor = await state.cite_task('run-1', anchor_id, 'other_project', '999')
+        assert 'error' not in cite_anchor, cite_anchor
+
+        incoming = state.add_finding(
+            run_id='run-1', severity='minor', category='memory_stale',
+            description='incoming 42, worded differently', suggested_action='a',
+            task_id=None, flag_type='X',
+        )
+        assert 'finding_id' in incoming, incoming
+        incoming_id = incoming['finding_id']
+
+        result = await state.cite_task('run-1', incoming_id, 'dark_factory', '42')
+        assert result.get('error') == 'duplicate_finding'
+        assert result.get('existing_finding_id') == anchor_id
+
+    @pytest.mark.asyncio
+    async def test_foreign_citation_then_bare_add_finding_still_folds(self):
+        """(c2) The shape the scope ruling explicitly PROTECTS: a bare
+        top-level task_id folding onto a FOREIGN citation.
+
+        A null-task_id finding cites other_project:2405, registering the
+        projectless derived sig ('2405', 'X'); a later
+        ``add_finding(task_id='2405', flag_type='X')`` — which names no
+        project whatsoever — collapses onto it via add_finding's own
+        ordinary signature lookup. This path never enters cite_task's guard;
+        the test exists so a future attempt to project-namespace the derived
+        key fails loudly here.
+        """
+        state, _ = self._make_state()
+        state.start_report(run_id='run-1', stage='task_knowledge_sync', project_id='dark_factory')
+
+        citing = state.add_finding(
+            run_id='run-1', severity='minor', category='memory_stale',
+            description='citing foreign 2405', suggested_action='a',
+            task_id=None, flag_type='X',
+        )
+        assert 'finding_id' in citing, citing
+        citing_id = citing['finding_id']
+
+        cite_result = await state.cite_task('run-1', citing_id, 'other_project', '2405')
+        assert 'error' not in cite_result, cite_result
+
+        later = state.add_finding(
+            run_id='run-1', severity='minor', category='memory_stale',
+            description='bare 2405, worded differently', suggested_action='a',
+            task_id='2405', flag_type='X',
+        )
+        assert later.get('error') == 'duplicate_finding'
+        assert later.get('existing_finding_id') == citing_id
+
+    # -- THE BUG --------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_cross_project_near_collision_skips_the_fold(self):
+        """Two projects' findings about same-numbered tasks must BOTH survive.
+
+        The anchor's primary citation pins ('dark_factory', '42'); the
+        incoming citation names task '42' in other_project — a different
+        task entirely that merely shares a number. Before the guard, the
+        projectless derived sig ('42', 'X') made the incoming call return
+        duplicate_finding and purged the foreign finding WHOLESALE, its
+        content surviving only in the task-4184 fold-purge WARNING. With 9
+        registered project roots all carrying small-integer Taskmaster ids,
+        that numeric overlap is guaranteed-possible.
+        """
+        state, _ = self._make_state()
+        state.start_report(run_id='run-1', stage='task_knowledge_sync', project_id='dark_factory')
+
+        local = state.add_finding(
+            run_id='run-1', severity='minor', category='memory_stale',
+            description='local 42 is stale', suggested_action='a',
+            task_id='42', flag_type='X',
+        )
+        assert 'finding_id' in local, local
+        local_id = local['finding_id']
+
+        # Self-hit: registers the derived sig ('42', 'X') and pins
+        # cited_tasks[0]['project_id'] == 'dark_factory'.
+        cite_local = await state.cite_task('run-1', local_id, 'dark_factory', '42')
+        assert 'error' not in cite_local, cite_local
+
+        # Its own add_finding sig is (None, 'X'), so it allocates fresh.
+        foreign = state.add_finding(
+            run_id='run-1', severity='minor', category='memory_stale',
+            description='foreign 42, worded differently', suggested_action='a',
+            task_id=None, flag_type='X',
+        )
+        assert 'finding_id' in foreign, foreign
+        foreign_id = foreign['finding_id']
+
+        result = await state.cite_task('run-1', foreign_id, 'other_project', '42')
+
+        # Ordinary citation dict, NOT duplicate_finding.
+        assert 'error' not in result, result
+        assert result['project_id'] == 'other_project'
+        assert result['task_id'] == '42'
+
+        # Not purged.
+        assert state._resolve_finding('run-1', foreign_id) is not None
+
+        report = state.get_assembled_report('run-1', 'task_knowledge_sync')
+        assert report is not None
+        ids = {item['finding_id'] for item in report['flagged_items']}
+        assert ids == {local_id, foreign_id}
+
+        # Each finding kept its OWN citation.
+        local_resolved = state._resolve_finding('run-1', local_id)
+        assert local_resolved is not None
+        assert [
+            (c['project_id'], c['task_id']) for c in local_resolved[1].cited_tasks
+        ] == [('dark_factory', '42')]
+
+        foreign_resolved = state._resolve_finding('run-1', foreign_id)
+        assert foreign_resolved is not None
+        assert [
+            (c['project_id'], c['task_id']) for c in foreign_resolved[1].cited_tasks
+        ] == [('other_project', '42')]
+        assert state.violations() == []
+
+    @pytest.mark.asyncio
+    async def test_skipped_fold_does_not_steal_the_anchor(self):
+        """A skipped near-collision must not disable dedup for every
+        subsequent same-project duplicate of that task — first registrant
+        keeps the derived-sig anchor.
+
+        cite_task's registration tail assigns the derived sig
+        unconditionally when entity_fold_eligible, so a foreign finding
+        whose fold was SKIPPED would still overwrite the anchor. A later
+        genuine same-project duplicate would then compare against the
+        FOREIGN citation, see a mismatch, and stop folding — turning a
+        cross-project over-fold into a same-project under-fold. `third`
+        folds onto `local` on unmodified code, so this is behaviour
+        preservation, not a new rule.
+        """
+        state, _ = self._make_state()
+        state.start_report(run_id='run-1', stage='task_knowledge_sync', project_id='dark_factory')
+
+        local = state.add_finding(
+            run_id='run-1', severity='minor', category='memory_stale',
+            description='local 42 is stale', suggested_action='a',
+            task_id='42', flag_type='X',
+        )
+        assert 'finding_id' in local, local
+        local_id = local['finding_id']
+
+        cite_local = await state.cite_task('run-1', local_id, 'dark_factory', '42')
+        assert 'error' not in cite_local, cite_local
+
+        foreign = state.add_finding(
+            run_id='run-1', severity='minor', category='memory_stale',
+            description='foreign 42, worded differently', suggested_action='a',
+            task_id=None, flag_type='X',
+        )
+        assert 'finding_id' in foreign, foreign
+        foreign_id = foreign['finding_id']
+
+        cite_foreign = await state.cite_task('run-1', foreign_id, 'other_project', '42')
+        assert 'error' not in cite_foreign, cite_foreign
+
+        # Comma-joined so its OWN add_finding signature ('42,7777', 'X') is
+        # fresh; '42' is a member of its parts, so it is entity-fold-eligible
+        # for the ('42', 'X') derived sig.
+        third = state.add_finding(
+            run_id='run-1', severity='minor', category='memory_stale',
+            description='third 42 mention, worded differently', suggested_action='a',
+            task_id='42,7777', flag_type='X',
+        )
+        assert 'finding_id' in third, third
+        third_id = third['finding_id']
+
+        result = await state.cite_task('run-1', third_id, 'dark_factory', '42')
+
+        # The ORIGINAL anchor, not the foreign finding that skipped its fold.
+        assert result.get('error') == 'duplicate_finding'
+        assert result.get('existing_finding_id') == local_id
+
+        assert state._resolve_finding('run-1', third_id) is None
+
+        report = state.get_assembled_report('run-1', 'task_knowledge_sync')
+        assert report is not None
+        ids = {item['finding_id'] for item in report['flagged_items']}
+        assert ids == {local_id, foreign_id}
+
+    @pytest.mark.asyncio
+    async def test_second_foreign_citation_also_survives(self):
+        """CHARACTERIZATION of the ACCEPTED foreign-side under-fold.
+
+        Because a mismatch-skipped finding never takes derived-sig
+        ownership, the anchor stays with the FIRST registrant — so a second
+        finding citing the same FOREIGN task also finds the
+        dark_factory-pinned anchor, also mismatches, and also survives. Two
+        genuine other_project duplicates therefore both survive whenever
+        fold 1 (the project-scoped one, whose key does carry a project) is
+        ineligible for them — here because `foreign_b` has a non-null
+        top-level task_id.
+
+        This is intended, not an oversight: the alternative is handing the
+        anchor to the foreign finding and under-folding the ORIGINAL
+        project instead (see test_skipped_fold_does_not_steal_the_anchor).
+        """
+        state, _ = self._make_state()
+        state.start_report(run_id='run-1', stage='task_knowledge_sync', project_id='dark_factory')
+
+        local = state.add_finding(
+            run_id='run-1', severity='minor', category='memory_stale',
+            description='local 42 is stale', suggested_action='a',
+            task_id='42', flag_type='X',
+        )
+        assert 'finding_id' in local, local
+        local_id = local['finding_id']
+
+        cite_local = await state.cite_task('run-1', local_id, 'dark_factory', '42')
+        assert 'error' not in cite_local, cite_local
+
+        foreign_a = state.add_finding(
+            run_id='run-1', severity='minor', category='memory_stale',
+            description='foreign 42, worded differently', suggested_action='a',
+            task_id=None, flag_type='X',
+        )
+        assert 'finding_id' in foreign_a, foreign_a
+        foreign_a_id = foreign_a['finding_id']
+
+        cite_a = await state.cite_task('run-1', foreign_a_id, 'other_project', '42')
+        assert 'error' not in cite_a, cite_a
+
+        # Non-null top-level task_id ⇒ NOT fold-1 eligible, so the
+        # project-scoped index cannot catch this one; comma-joined so its own
+        # add_finding signature ('42,7777', 'X') is fresh while '42' stays a
+        # member of its parts (entity-fold eligible).
+        foreign_b = state.add_finding(
+            run_id='run-1', severity='minor', category='memory_stale',
+            description='another foreign 42, worded differently again', suggested_action='a',
+            task_id='42,7777', flag_type='X',
+        )
+        assert 'finding_id' in foreign_b, foreign_b
+        foreign_b_id = foreign_b['finding_id']
+
+        result = await state.cite_task('run-1', foreign_b_id, 'other_project', '42')
+        assert 'error' not in result, result
+
+        report = state.get_assembled_report('run-1', 'task_knowledge_sync')
+        assert report is not None
+        ids = {item['finding_id'] for item in report['flagged_items']}
+        assert ids == {local_id, foreign_a_id, foreign_b_id}
+
+        # Each kept its own citation; the anchor never moved.
+        for fid, expected in (
+            (local_id, ('dark_factory', '42')),
+            (foreign_a_id, ('other_project', '42')),
+            (foreign_b_id, ('other_project', '42')),
+        ):
+            resolved = state._resolve_finding('run-1', fid)
+            assert resolved is not None
+            assert [(c['project_id'], c['task_id']) for c in resolved[1].cited_tasks] == [expected]
+
+        run_index = state.run_index('run-1')
+        assert run_index is not None
+        assert run_index.by_signature(('42', 'X')) == local_id
+        # The fold-1 lane the comment points at: the first foreign citation
+        # DID anchor 'other_project:42' there (its key carries a project), so
+        # a null-task_id foreign duplicate would still fold.
+        assert run_index.by_cited_task('other_project:42') == foreign_a_id
+        assert state.violations() == []
+
+    # -- THE NEAR-COLLISION LOG ------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_near_collision_emits_operator_legible_warning(self, caplog):
+        """A skipped near-collision is the ONLY observable evidence that a run
+        contained numerically-colliding cross-project task ids — and the
+        UNGUARDABLE add_finding→derived-sig half of that same run may have
+        silently folded two projects' findings. The line must therefore be
+        legible enough to identify both sides without re-running the stage.
+        """
+        state, _ = self._make_state()
+        state.start_report(run_id='run-1', stage='task_knowledge_sync', project_id='dark_factory')
+
+        with caplog.at_level(logging.WARNING, logger='fused_memory.server.recon_report'):
+            local = state.add_finding(
+                run_id='run-1', severity='minor', category='memory_stale',
+                description='local 42 is stale', suggested_action='a',
+                task_id='42', flag_type='X',
+            )
+            assert 'finding_id' in local, local
+            local_id = local['finding_id']
+
+            cite_local = await state.cite_task('run-1', local_id, 'dark_factory', '42')
+            assert 'error' not in cite_local, cite_local
+
+            foreign = state.add_finding(
+                run_id='run-1', severity='minor', category='memory_stale',
+                description='foreign 42, worded differently', suggested_action='a',
+                task_id=None, flag_type='X',
+            )
+            assert 'finding_id' in foreign, foreign
+            foreign_id = foreign['finding_id']
+
+            result = await state.cite_task('run-1', foreign_id, 'other_project', '42')
+
+        # The log must not be buyable by changing behaviour.
+        assert 'error' not in result, result
+
+        warnings = _near_collision_warnings(caplog)
+        assert len(warnings) == 1, warnings
+        message = warnings[0]
+
+        for expected in (
+            foreign_id,          # the finding whose fold was skipped
+            local_id,            # the surviving anchor
+            'other_project',     # attempted citation's project
+            'dark_factory',      # anchor citation's project
+            "'42'",              # the colliding task id
+            "'X'",               # the flag_type completing the derived sig
+            "'run-1'",
+            "'task_knowledge_sync'",  # the stage that owns the skipped finding
+        ):
+            assert expected in message, (expected, message)
+
+    @pytest.mark.asyncio
+    async def test_genuine_same_project_fold_emits_no_near_collision_warning(self, caplog):
+        """Negative control: an ordinary same-project duplicate is not a
+        near-collision. Its own task-4184 purge WARNING must still fire —
+        that fold DOES destroy content — but no near-collision line.
+        """
+        state, _ = self._make_state()
+        state.start_report(run_id='run-1', stage='task_knowledge_sync', project_id='dark_factory')
+
+        with caplog.at_level(logging.WARNING, logger='fused_memory.server.recon_report'):
+            anchor = state.add_finding(
+                run_id='run-1', severity='minor', category='memory_stale',
+                description='anchor 2405', suggested_action='a',
+                task_id='2405', flag_type='X',
+            )
+            assert 'finding_id' in anchor, anchor
+            anchor_id = anchor['finding_id']
+
+            cite_anchor = await state.cite_task('run-1', anchor_id, 'dark_factory', '2405')
+            assert 'error' not in cite_anchor, cite_anchor
+
+            incoming = state.add_finding(
+                run_id='run-1', severity='minor', category='memory_stale',
+                description='incoming 2405, worded differently', suggested_action='a',
+                task_id=None, flag_type='X',
+            )
+            assert 'finding_id' in incoming, incoming
+            incoming_id = incoming['finding_id']
+
+            result = await state.cite_task('run-1', incoming_id, 'dark_factory', '2405')
+
+        assert result.get('error') == 'duplicate_finding'
+        assert result.get('existing_finding_id') == anchor_id
+
+        assert _near_collision_warnings(caplog) == []
+        assert _fold_purge_warnings(caplog) != []
+
+    @pytest.mark.asyncio
+    async def test_unpinned_anchor_fold_emits_no_near_collision_warning(self, caplog):
+        """The ACCEPTED-AMBIGUITY half, made executable rather than only
+        documented.
+
+        The anchor's derived-sig ownership came from
+        ``add_finding(task_id='99')``, which names NO project — so there is
+        nothing to compare the incoming other_project:99 citation against.
+        This fold still fires (it is the intended one per the operator
+        ruling) and must NOT be reported as a near-collision: no guard at
+        this layer can tell whether the two findings are about the same task.
+        """
+        state, _ = self._make_state()
+        state.start_report(run_id='run-1', stage='task_knowledge_sync', project_id='dark_factory')
+
+        with caplog.at_level(logging.WARNING, logger='fused_memory.server.recon_report'):
+            anchor = state.add_finding(
+                run_id='run-1', severity='minor', category='memory_stale',
+                description='anchor 99, never cited', suggested_action='a',
+                task_id='99', flag_type='X',
+            )
+            assert 'finding_id' in anchor, anchor
+            anchor_id = anchor['finding_id']
+            # Deliberately NO cite_task on the anchor: cited_tasks stays empty,
+            # so it carries no project pin at all.
+
+            incoming = state.add_finding(
+                run_id='run-1', severity='minor', category='memory_stale',
+                description='incoming 99, worded differently', suggested_action='a',
+                task_id=None, flag_type='X',
+            )
+            assert 'finding_id' in incoming, incoming
+            incoming_id = incoming['finding_id']
+
+            result = await state.cite_task('run-1', incoming_id, 'other_project', '99')
+
+        assert result.get('error') == 'duplicate_finding'
+        assert result.get('existing_finding_id') == anchor_id
+        assert state._resolve_finding('run-1', incoming_id) is None
+
+        assert _near_collision_warnings(caplog) == []
+
+    @pytest.mark.asyncio
+    async def test_project_fold_win_emits_no_near_collision_warning(self, caplog):
+        """Negative control for the ONE call where BOTH folds hit.
+
+        The entity-scoped fold is skipped for a project mismatch, but the
+        project-scoped fold (checked after the detection, and priority when
+        both would hit) purges this very finding and returns
+        duplicate_finding. The skip never took effect, so a near-collision
+        line claiming 'BOTH findings kept' would be immediately contradicted
+        by the task-4184 purge record for the SAME finding_id — a false
+        positive in the single channel an operator has for cross-project
+        numeric collisions.
+        """
+        state, _ = self._make_state()
+        state.start_report(run_id='run-1', stage='task_knowledge_sync', project_id='dark_factory')
+
+        with caplog.at_level(logging.WARNING, logger='fused_memory.server.recon_report'):
+            # Pins the derived sig ('42', 'X') to a dark_factory citation.
+            local = state.add_finding(
+                run_id='run-1', severity='minor', category='memory_stale',
+                description='local 42 is stale', suggested_action='a',
+                task_id='42', flag_type='X',
+            )
+            assert 'finding_id' in local, local
+            local_id = local['finding_id']
+
+            cite_local = await state.cite_task('run-1', local_id, 'dark_factory', '42')
+            assert 'error' not in cite_local, cite_local
+
+            # Different flag_type ⇒ no derived-sig contest; this one exists
+            # purely to anchor the PROJECT-scoped key 'other_project:42'.
+            project_anchor = state.add_finding(
+                run_id='run-1', severity='minor', category='memory_stale',
+                description='foreign 42 under another flag', suggested_action='a',
+                task_id=None, flag_type='Y',
+            )
+            assert 'finding_id' in project_anchor, project_anchor
+            project_anchor_id = project_anchor['finding_id']
+
+            cite_project_anchor = await state.cite_task(
+                'run-1', project_anchor_id, 'other_project', '42'
+            )
+            assert 'error' not in cite_project_anchor, cite_project_anchor
+
+            # Hits BOTH: project-scoped on 'other_project:42', entity-scoped
+            # on ('42', 'X') — where the anchor is dark_factory-pinned.
+            incoming = state.add_finding(
+                run_id='run-1', severity='minor', category='memory_stale',
+                description='foreign 42, worded differently', suggested_action='a',
+                task_id=None, flag_type='X',
+            )
+            assert 'finding_id' in incoming, incoming
+            incoming_id = incoming['finding_id']
+
+            result = await state.cite_task('run-1', incoming_id, 'other_project', '42')
+
+        # Fold 1 wins, unchanged by the task-4185 guard.
+        assert result.get('error') == 'duplicate_finding'
+        assert result.get('existing_finding_id') == project_anchor_id
+        assert state._resolve_finding('run-1', incoming_id) is None
+
+        assert _near_collision_warnings(caplog) == []
+        # The purge itself is still reported (task-4184).
+        purges = [m for m in _fold_purge_warnings(caplog) if incoming_id in m]
+        assert len(purges) == 1, purges
+        assert 'project_scoped' in purges[0], purges[0]
+
+
+# ---------------------------------------------------------------------------
+# task-4184 step-1/step-3: TestCiteTaskFoldPurgeLogging — RED until step-2/4
+# make both cite_task fold branches log the purged finding's content before
+# _purge_finding discards it wholesale.
+# ---------------------------------------------------------------------------
+
+_FOLD_PURGE_MARKER = 'cite_task fold purged finding'
+
+# task-4185. Deliberately shares no substring with _FOLD_PURGE_MARKER: the two
+# filters below must partition this module's cite_task warnings, so each
+# family's negative control can assert `== []` without the other's line
+# satisfying it. Nothing is purged on this path — a near-collision KEEPS both
+# findings — so it is a distinct event, not a variant of the 4184 record.
+_NEAR_COLLISION_MARKER = 'cite_task entity-scoped fold SKIPPED'
+
+
+def _fold_purge_warnings(caplog) -> list[str]:
+    """The rendered fold-purge WARNING messages captured so far.
+
+    Filtered on the stable message marker rather than on the payload, so the
+    negative control can assert ``== []`` without accidentally matching an
+    unrelated warning from the same module.
+    """
+    return [r.getMessage() for r in caplog.records if _FOLD_PURGE_MARKER in r.getMessage()]
+
+
+def _near_collision_warnings(caplog) -> list[str]:
+    """The rendered cross-project near-collision WARNINGs captured so far
+    (task-4185). Marker-filtered, mirroring :func:`_fold_purge_warnings`.
+    """
+    return [r.getMessage() for r in caplog.records if _NEAR_COLLISION_MARKER in r.getMessage()]
+
+
+class TestCiteTaskFoldPurgeLogging:
+    """Both cite_task in-run folds (task-2425 project-scoped, task-2432
+    entity-scoped) purge the losing finding WHOLESALE — its description,
+    suggested_action and any citations already attached to it are dropped
+    from the report (see _purge_finding's docstring). A WARNING carrying that
+    content is the operator-visible, long-retention recovery channel (the
+    structured ``purged_findings`` copy is pinned by TestCiteTaskFoldPurgeRecord),
+    so it must be emitted before the purge, on BOTH branches, and never on a
+    non-folding cite_task.
+    """
+
+    def _fake_ti(self):
+        """Fake task interceptor covering the external task ids these tests cite."""
+        known_roots = {'/home/leo/src/dark-factory'}
+        results = {}
+        for pr in known_roots:
+            for tid in ['2405', '2406', '9999']:
+                results[(tid, pr)] = {'id': tid, 'title': f'T-{tid}'}
+        return _FakeTaskInterceptor(results=results)
+
+    def _make_state(self, fake_ti=None, memory_service=None):
+        from fused_memory.server.recon_report import ReconReportState
+
+        if fake_ti is None:
+            fake_ti = self._fake_ti()
+        t = [0.0]
+        state = ReconReportState(
+            ttl_seconds=300,
+            clock=lambda: t[0],
+            task_interceptor=fake_ti,
+            memory_service=memory_service,
+        )
+        state.known_projects = dict(_KNOWN_PROJECTS)
+        return state, t
+
+    @pytest.mark.asyncio
+    async def test_project_scoped_fold_logs_purged_finding_content(self, caplog):
+        """Project-scoped fold (task-2425): the second null-task_id citer of
+        the same external task is purged. The WARNING must carry the purged
+        finding's id, owning stage, description and suggested_action, plus
+        the surviving anchor's id — everything needed to reconstruct what
+        was discarded.
+        """
+        memory_service = _FakeMemoryService(
+            entity_nodes=[{'uuid': 'e' * 32, 'name': 'Widget Service'}]
+        )
+        state, _ = self._make_state(memory_service=memory_service)
+        # NOT memory_consolidator — fold 1 exempts that stage.
+        state.start_report(run_id='run-1', stage='reconciler', project_id='dark_factory')
+
+        first = state.add_finding(
+            run_id='run-1',
+            severity='moderate',
+            category='cross_project',
+            description='dark_factory:2405 still pending, unchanged',
+            suggested_action='wait for upstream',
+            actionable=True,
+            task_id=None,
+            flag_type=None,
+        )
+        assert 'finding_id' in first, f'add_finding failed: {first}'
+        finding_id_1 = first['finding_id']
+
+        second = state.add_finding(
+            run_id='run-1',
+            severity='moderate',
+            category='cross_project_routing',
+            description='blocked pending dark_factory task 2405 per routing check',
+            suggested_action='reroute once unblocked',
+            actionable=True,
+            task_id=None,
+            flag_type='cross_project_routing_stale',
+        )
+        assert 'finding_id' in second, f'add_finding failed: {second}'
+        finding_id_2 = second['finding_id']
+        assert finding_id_2 != finding_id_1
+
+        cite_1 = await state.cite_task('run-1', finding_id_1, 'dark_factory', '2405')
+        assert 'error' not in cite_1, cite_1
+
+        # Pre-attach a citation to the finding that is about to be purged, so
+        # the discarded-context path _purge_finding warns about is exercised.
+        cited = await state.cite_entity('run-1', finding_id_2, 'Widget Service')
+        assert 'error' not in cited, cited
+
+        with caplog.at_level(logging.WARNING, logger='fused_memory.server.recon_report'):
+            cite_2 = await state.cite_task('run-1', finding_id_2, 'dark_factory', '2405')
+
+        # Return contract is UNCHANGED — the log cannot be bought by altering
+        # the fold's behaviour.
+        assert cite_2.get('error') == 'duplicate_finding'
+        assert cite_2.get('error_type') == 'ReconReportDuplicateFinding'
+        assert cite_2.get('existing_finding_id') == finding_id_1
+        assert state._resolve_finding('run-1', finding_id_2) is None
+
+        matching = _fold_purge_warnings(caplog)
+        assert len(matching) == 1, [r.getMessage() for r in caplog.records]
+        message = matching[0]
+
+        # The five MANDATED items.
+        assert finding_id_2 in message, message  # purged finding_id
+        assert 'reconciler' in message, message  # purged finding's owning stage
+        assert 'blocked pending dark_factory task 2405 per routing check' in message, message
+        assert 'reroute once unblocked' in message, message
+        assert finding_id_1 in message, message  # surviving anchor
+
+        # The pre-attached citation, which the purge destroys along with the
+        # finding and which appears NOWHERE else afterwards — the returned
+        # duplicate_finding error names only the survivor. Without this the
+        # cited_entities/cited_edges/cited_memories/cited_runs half of the log
+        # line could be deleted with the whole suite staying green, even
+        # though those discarded citations are the primary thing the log
+        # exists to make recoverable.
+        assert 'e' * 32 in message, message  # cite_entity's recorded entity_uuid
+        assert 'Widget Service' in message, message  # ...and its canonical name
+
+        # Discriminates this fold from the entity-scoped one.
+        assert 'project_scoped' in message, message
+
+    @pytest.mark.asyncio
+    async def test_entity_scoped_fold_logs_purged_finding_content(self, caplog):
+        """Entity-scoped fold (task-2432): the null-task_id finding whose
+        citation derives a signature already held by a top-level task_id
+        finding is purged BY cite_task. Same five mandated fields, and the
+        message must name a different fold than the project-scoped one.
+
+        Uses the reverse-order shape (top-level task_id filed FIRST, null
+        one cites second) because that is the only ordering whose fold runs
+        inside cite_task: in the other ordering add_finding's own signature
+        lookup collapses the duplicate before cite_task is ever reached, so
+        it never exercises this purge site.
+        """
+        state, _ = self._make_state()
+        state.start_report(
+            run_id='run-1', stage='task_knowledge_sync', project_id='dark_factory'
+        )
+
+        occ2 = state.add_finding(
+            run_id='run-1', severity='minor', category='memory_stale',
+            description='occ2 desc', suggested_action='a',
+            task_id='2405', flag_type='cross_project',
+        )
+        assert 'finding_id' in occ2, occ2
+        fid2 = occ2['finding_id']
+
+        occ1 = state.add_finding(
+            run_id='run-1', severity='serious', category='memory_stale',
+            description='occ1 desc, worded differently and lost on fold',
+            suggested_action='reconcile the stale memory by hand',
+            task_id=None, flag_type='cross_project',
+        )
+        assert 'finding_id' in occ1, occ1
+        fid1 = occ1['finding_id']
+        assert fid1 != fid2
+
+        with caplog.at_level(logging.WARNING, logger='fused_memory.server.recon_report'):
+            cite1 = await state.cite_task('run-1', fid1, 'dark_factory', '2405')
+
+        # Return contract unchanged.
+        assert cite1.get('error') == 'duplicate_finding'
+        assert cite1.get('existing_finding_id') == fid2
+        assert state._resolve_finding('run-1', fid1) is None
+
+        matching = _fold_purge_warnings(caplog)
+        assert len(matching) == 1, [r.getMessage() for r in caplog.records]
+        message = matching[0]
+
+        # The five MANDATED items.
+        assert fid1 in message, message  # purged finding_id
+        assert 'task_knowledge_sync' in message, message  # purged finding's stage
+        assert 'occ1 desc, worded differently and lost on fold' in message, message
+        assert 'reconcile the stale memory by hand' in message, message
+        assert fid2 in message, message  # surviving anchor
+
+        # Discriminates this fold from the project-scoped one.
+        assert 'entity_scoped' in message, message
+        assert 'project_scoped' not in message, message
+
+    @pytest.mark.asyncio
+    async def test_non_folding_cite_task_emits_no_purge_warning(self, caplog):
+        """Negative control: an ordinary cite_task, and a second finding
+        citing a DIFFERENT external task, must both succeed silently. A
+        purge WARNING here would mean the log fires on the success path.
+        """
+        state, _ = self._make_state()
+        state.start_report(run_id='run-1', stage='reconciler', project_id='dark_factory')
+
+        f1 = state.add_finding(
+            run_id='run-1', severity='minor', category='cross_project',
+            description='desc A', suggested_action='a',
+            task_id=None, flag_type=None,
+        )
+        f2 = state.add_finding(
+            run_id='run-1', severity='minor', category='cross_project',
+            description='desc B', suggested_action='a',
+            task_id=None, flag_type='other_flag',
+        )
+        fid1, fid2 = f1['finding_id'], f2['finding_id']
+
+        with caplog.at_level(logging.WARNING, logger='fused_memory.server.recon_report'):
+            cite1 = await state.cite_task('run-1', fid1, 'dark_factory', '2405')
+            cite2 = await state.cite_task('run-1', fid2, 'dark_factory', '2406')
+
+        assert 'error' not in cite1, cite1
+        assert 'error' not in cite2, cite2
+
+        assert _fold_purge_warnings(caplog) == [], [r.getMessage() for r in caplog.records]
+
+        report = state.get_assembled_report('run-1', 'reconciler')
+        assert report is not None
+        ids = [item['finding_id'] for item in report['flagged_items']]
+        assert ids == [fid1, fid2]
+
+
+
+# ---------------------------------------------------------------------------
+# task-4865 step-5: TestCiteTaskFoldPurgeRecord — RED until step-6 keeps a
+# structured copy of every fold-purged finding on the CITING stage's
+# persisted entry.
+# ---------------------------------------------------------------------------
+
+
+def _persisted_purge_record_rows(store, run_id) -> dict[str, dict]:
+    """stage -> decoded ``entry_json`` of every persisted row of *run_id*:
+    the operator's actual recovery surface for a fold-purged finding."""
+    return {
+        row['stage']: json.loads(row['entry_json'])
+        for row in store.load_all()
+        if row['run_id'] == run_id
+    }
+
+
+class _FoldPurgeRecordHarness:
+    """A real store on ``tmp_path`` and a state whose task interceptor knows
+    the external tasks these fold tests cite."""
+
+    @pytest.fixture
+    def store(self, tmp_path):
+        from fused_memory.server.recon_report_store import ReconReportStore
+
+        store = ReconReportStore(tmp_path / 'rr.db')
+        store.open()
+        yield store
+        store.close()
+
+    def _make_state(self, store, *, ttl_seconds=300, memory_service=None):
+        from fused_memory.server.recon_report import ReconReportState
+
+        known_roots = {'/home/leo/src/dark-factory'}
+        results = {
+            (tid, root): {'id': tid, 'title': f'T-{tid}'}
+            for root in known_roots
+            for tid in ['2405', '2406', '9999']
+        }
+        t = [0.0]
+        state = ReconReportState(
+            ttl_seconds=ttl_seconds,
+            clock=lambda: t[0],
+            task_interceptor=_FakeTaskInterceptor(results=results),
+            memory_service=memory_service,
+            store=store,
+        )
+        state.known_projects = dict(_KNOWN_PROJECTS)
+        return state, t
+
+    @staticmethod
+    def _file_null_task_finding(state, description, suggested_action='a', flag_type=None):
+        result = state.add_finding(
+            run_id='run-1', severity='moderate', category='cross_project',
+            description=description, suggested_action=suggested_action,
+            actionable=True, task_id=None, flag_type=flag_type,
+        )
+        assert 'finding_id' in result, result
+        return result['finding_id']
+
+    @staticmethod
+    def _flagged_ids(state, stage):
+        report = state.get_assembled_report('run-1', stage)
+        assert report is not None, stage
+        return [item['finding_id'] for item in report['flagged_items']]
+
+
+class TestCiteTaskFoldPurgeRecord(_FoldPurgeRecordHarness):
+    """A cite_task fold keeps a structured, persisted copy of the finding it
+    purges, on the CITING stage's entry (always resident, so always within
+    the run's persist reach), attributed to the stage that filed it.
+    """
+
+    @pytest.mark.asyncio
+    async def test_project_scoped_fold_persists_a_structured_record(self, store, caplog):
+        memory_service = _FakeMemoryService(
+            entity_nodes=[{'uuid': 'e' * 32, 'name': 'Widget Service'}]
+        )
+        state, _ = self._make_state(store, memory_service=memory_service)
+        state.start_report(run_id='run-1', stage='reconciler', project_id='dark_factory')
+        anchor_id = self._file_null_task_finding(state, 'dark_factory:2405 still pending')
+        loser_id = self._file_null_task_finding(
+            state, 'blocked pending dark_factory task 2405 per routing check',
+            suggested_action='reroute once unblocked',
+            flag_type='cross_project_routing_stale',
+        )
+        assert 'error' not in await state.cite_task('run-1', anchor_id, 'dark_factory', '2405')
+        assert 'error' not in await state.cite_entity('run-1', loser_id, 'Widget Service')
+
+        with caplog.at_level(logging.WARNING, logger='fused_memory.server.recon_report'):
+            folded = await state.cite_task('run-1', loser_id, 'dark_factory', '2405')
+
+        assert folded == {
+            'error': 'duplicate_finding',
+            'error_type': 'ReconReportDuplicateFinding',
+            'existing_finding_id': anchor_id,
+        }
+        assert self._flagged_ids(state, 'reconciler') == [anchor_id]
+
+        records = _persisted_purge_record_rows(store, 'run-1')['reconciler']['purged_findings']
+        assert len(records) == 1, records
+        record = records[0]
+        assert {k: v for k, v in record.items() if k != 'finding'} == {
+            'fold': 'project_scoped',
+            'owning_stage': 'reconciler',
+            'surviving_finding_id': anchor_id,
+            'attempted_citation': {'project_id': 'dark_factory', 'task_id': '2405'},
+            'truncated_fields': [],
+        }
+        purged = record['finding']
+        assert purged['finding_id'] == loser_id
+        assert purged['severity'] == 'moderate'
+        assert purged['category'] == 'cross_project'
+        assert purged['description'] == 'blocked pending dark_factory task 2405 per routing check'
+        assert purged['suggested_action'] == 'reroute once unblocked'
+        assert purged['actionable'] is True
+        assert purged['task_id'] is None
+        assert purged['flag_type'] == 'cross_project_routing_stale'
+        assert purged['cited_entities'] == [
+            {'entity_uuid': 'e' * 32, 'canonical_name': 'Widget Service'}
+        ]
+
+        warnings = _fold_purge_warnings(caplog)
+        assert len(warnings) == 1, warnings
+        assert loser_id in warnings[0]
+        assert 'blocked pending dark_factory task 2405 per routing check' in warnings[0]
+        assert 'recoverable ONLY from this line' not in warnings[0]
+        assert "recorded_on_stage='reconciler'" in warnings[0]
+
+    @pytest.mark.asyncio
+    async def test_entity_scoped_fold_persists_a_structured_record(self, store):
+        state, _ = self._make_state(store)
+        state.start_report(
+            run_id='run-1', stage='task_knowledge_sync', project_id='dark_factory'
+        )
+        survivor = state.add_finding(
+            run_id='run-1', severity='minor', category='memory_stale',
+            description='occ2 desc', suggested_action='a',
+            task_id='2405', flag_type='cross_project',
+        )
+        survivor_id = survivor['finding_id']
+        loser_id = self._file_null_task_finding(
+            state, 'occ1 desc, worded differently and lost on fold',
+            flag_type='cross_project',
+        )
+
+        folded = await state.cite_task('run-1', loser_id, 'dark_factory', '2405')
+
+        assert folded == {
+            'error': 'duplicate_finding',
+            'error_type': 'ReconReportDuplicateFinding',
+            'existing_finding_id': survivor_id,
+        }
+        assert self._flagged_ids(state, 'task_knowledge_sync') == [survivor_id]
+
+        records = _persisted_purge_record_rows(store, 'run-1')['task_knowledge_sync'][
+            'purged_findings'
+        ]
+        assert len(records) == 1, records
+        record = records[0]
+        assert record['fold'] == 'entity_scoped'
+        assert record['owning_stage'] == 'task_knowledge_sync'
+        assert record['surviving_finding_id'] == survivor_id
+        assert record['attempted_citation'] == {'project_id': 'dark_factory', 'task_id': '2405'}
+        assert record['truncated_fields'] == []
+        assert record['finding']['finding_id'] == loser_id
+        assert record['finding']['flag_type'] == 'cross_project'
+        assert record['finding']['description'] == 'occ1 desc, worded differently and lost on fold'
+
+    @pytest.mark.asyncio
+    async def test_cross_stage_fold_records_on_the_citing_stage(self, store, caplog):
+        state, _ = self._make_state(store)
+        state.start_report(run_id='run-1', stage='s1', project_id='dark_factory')
+        loser_id = self._file_null_task_finding(state, 'filed by s1, folded from s2')
+        state.start_report(run_id='run-1', stage='s2', project_id='dark_factory')
+        anchor_id = self._file_null_task_finding(state, 'anchor filed by s2')
+        assert 'error' not in await state.cite_task('run-1', anchor_id, 'dark_factory', '2405')
+
+        with caplog.at_level(logging.WARNING, logger='fused_memory.server.recon_report'):
+            folded = await state.cite_task('run-1', loser_id, 'dark_factory', '2405')
+
+        assert folded.get('existing_finding_id') == anchor_id, folded
+        rows = _persisted_purge_record_rows(store, 'run-1')
+        assert rows['s1']['purged_findings'] == []
+        records = rows['s2']['purged_findings']
+        assert [(r['owning_stage'], r['finding']['finding_id']) for r in records] == [
+            ('s1', loser_id)
+        ]
+        warnings = _fold_purge_warnings(caplog)
+        assert len(warnings) == 1, warnings
+        assert "stage='s1'" in warnings[0]
+        assert "recorded_on_stage='s2'" in warnings[0]
+
+    @pytest.mark.asyncio
+    async def test_cross_stage_fold_of_an_evicted_owner_is_still_persisted(self, store):
+        state, t = self._make_state(store, ttl_seconds=10)
+        state.start_report(run_id='run-1', stage='s1', project_id='dark_factory')
+        loser_id = self._file_null_task_finding(state, 'filed by s1 before it evicted')
+        state.complete('run-1', 's1 done')
+        state.start_report(run_id='run-1', stage='s2', project_id='dark_factory')
+        t[0] = 11.0
+        assert state.tick() == 1
+        assert state.get_assembled_report('run-1', 's1') is None
+
+        anchor_id = self._file_null_task_finding(state, 'anchor filed by s2')
+        assert 'error' not in await state.cite_task('run-1', anchor_id, 'dark_factory', '2405')
+        folded = await state.cite_task('run-1', loser_id, 'dark_factory', '2405')
+
+        assert folded == {
+            'error': 'duplicate_finding',
+            'error_type': 'ReconReportDuplicateFinding',
+            'existing_finding_id': anchor_id,
+        }
+        records = _persisted_purge_record_rows(store, 'run-1')['s2']['purged_findings']
+        assert [(r['owning_stage'], r['finding']['finding_id']) for r in records] == [
+            ('s1', loser_id)
+        ]
+
+    @pytest.mark.asyncio
+    async def test_non_folding_cite_task_records_nothing(self, store):
+        state, _ = self._make_state(store)
+        state.start_report(run_id='run-1', stage='reconciler', project_id='dark_factory')
+        first = self._file_null_task_finding(state, 'desc A')
+        second = self._file_null_task_finding(state, 'desc B', flag_type='other_flag')
+
+        assert 'error' not in await state.cite_task('run-1', first, 'dark_factory', '2405')
+        assert 'error' not in await state.cite_task('run-1', second, 'dark_factory', '2406')
+
+        rows = _persisted_purge_record_rows(store, 'run-1')
+        assert {stage: row['purged_findings'] for stage, row in rows.items()} == {
+            'reconciler': []
+        }
+
+    @pytest.mark.asyncio
+    async def test_delete_finding_records_nothing(self, store):
+        state, _ = self._make_state(store)
+        state.start_report(run_id='run-1', stage='reconciler', project_id='dark_factory')
+        anchor_id = self._file_null_task_finding(state, 'cited and kept')
+        doomed_id = self._file_null_task_finding(state, 'explicitly deleted')
+        assert 'error' not in await state.cite_task('run-1', anchor_id, 'dark_factory', '2405')
+
+        deleted = state.delete_finding('run-1', doomed_id)
+
+        assert 'error' not in deleted, deleted
+        rows = _persisted_purge_record_rows(store, 'run-1')
+        assert rows['reconciler']['purged_findings'] == []
+
+    @pytest.mark.asyncio
+    async def test_record_caps_long_text_and_names_the_truncated_fields(self, store):
+        from fused_memory.server.recon_report import (
+            MAX_FINDING_TEXT_CHARS,
+            MAX_PURGED_TEXT_CHARS,
+            RECON_TEXT_TRUNCATION_MARKER,
+        )
+
+        state, _ = self._make_state(store)
+        state.start_report(run_id='run-1', stage='reconciler', project_id='dark_factory')
+        anchor_id = self._file_null_task_finding(state, 'short anchor')
+        long_description = 'x' * MAX_FINDING_TEXT_CHARS
+        long_action = 'y' * MAX_FINDING_TEXT_CHARS
+        loser_id = self._file_null_task_finding(
+            state, long_description, suggested_action=long_action,
+        )
+        assert 'error' not in await state.cite_task('run-1', anchor_id, 'dark_factory', '2405')
+
+        folded = await state.cite_task('run-1', loser_id, 'dark_factory', '2405')
+
+        assert folded.get('existing_finding_id') == anchor_id, folded
+        (record,) = _persisted_purge_record_rows(store, 'run-1')['reconciler']['purged_findings']
+        assert record['finding']['description'] == 'x' * MAX_PURGED_TEXT_CHARS + RECON_TEXT_TRUNCATION_MARKER
+        assert record['finding']['suggested_action'] == 'y' * MAX_PURGED_TEXT_CHARS + RECON_TEXT_TRUNCATION_MARKER
+        assert record['truncated_fields'] == ['description', 'suggested_action']
+
+    @pytest.mark.asyncio
+    async def test_records_keep_the_first_n_and_count_the_overflow(self, store, caplog):
+        from fused_memory.server.recon_report import MAX_PURGED_FINDINGS
+
+        state, _ = self._make_state(store)
+        state.start_report(run_id='run-1', stage='reconciler', project_id='dark_factory')
+        anchor_id = self._file_null_task_finding(state, 'anchor')
+        assert 'error' not in await state.cite_task('run-1', anchor_id, 'dark_factory', '2405')
+
+        folded_ids = []
+        with caplog.at_level(logging.WARNING, logger='fused_memory.server.recon_report'):
+            for i in range(MAX_PURGED_FINDINGS + 3):
+                loser_id = self._file_null_task_finding(state, f'restatement #{i}')
+                folded = await state.cite_task('run-1', loser_id, 'dark_factory', '2405')
+                assert folded == {
+                    'error': 'duplicate_finding',
+                    'error_type': 'ReconReportDuplicateFinding',
+                    'existing_finding_id': anchor_id,
+                }
+                folded_ids.append(loser_id)
+
+        row = _persisted_purge_record_rows(store, 'run-1')['reconciler']
+        assert [r['finding']['finding_id'] for r in row['purged_findings']] == (
+            folded_ids[:MAX_PURGED_FINDINGS]
+        )
+        assert row['purged_findings_overflow'] == 3
+
+        warnings = _fold_purge_warnings(caplog)
+        assert len(warnings) == MAX_PURGED_FINDINGS + 3
+        for loser_id, message in zip(folded_ids, warnings, strict=True):
+            assert loser_id in message, message
+        for message in warnings[:MAX_PURGED_FINDINGS]:
+            assert 'structural_copy=kept' in message, message
+        for message in warnings[MAX_PURGED_FINDINGS:]:
+            assert 'structural_copy=dropped' in message, message
+
+    @pytest.mark.asyncio
+    async def test_below_the_cap_the_overflow_count_stays_zero(self, store):
+        state, _ = self._make_state(store)
+        state.start_report(run_id='run-1', stage='reconciler', project_id='dark_factory')
+        anchor_id = self._file_null_task_finding(state, 'anchor')
+        loser_id = self._file_null_task_finding(state, 'single restatement')
+        assert 'error' not in await state.cite_task('run-1', anchor_id, 'dark_factory', '2405')
+
+        folded = await state.cite_task('run-1', loser_id, 'dark_factory', '2405')
+
+        assert folded.get('existing_finding_id') == anchor_id, folded
+        row = _persisted_purge_record_rows(store, 'run-1')['reconciler']
+        assert len(row['purged_findings']) == 1
+        assert row['purged_findings_overflow'] == 0
+
+class TestCiteTaskFoldPurgeRecordPersistence(_FoldPurgeRecordHarness):
+    """The purge record survives a restart, including the first write after
+    it; rows persisted before the record existed still hydrate; and the
+    record never leaks into the assembled report.
+    """
+
+    async def _fold_both_ways(self, state):
+        """One project-scoped and one entity-scoped fold in 'reconciler' of
+        'run-1'. Returns ``(project_anchor_id, purged_finding_ids)``."""
+        state.start_report(run_id='run-1', stage='reconciler', project_id='dark_factory')
+        anchor_id = self._file_null_task_finding(state, 'project anchor')
+        project_loser_id = self._file_null_task_finding(state, 'project restatement')
+        survivor = state.add_finding(
+            run_id='run-1', severity='minor', category='memory_stale',
+            description='entity survivor', suggested_action='a',
+            task_id='2406', flag_type='cross_project',
+        )
+        entity_loser_id = self._file_null_task_finding(
+            state, 'entity restatement', flag_type='cross_project',
+        )
+        assert 'error' not in await state.cite_task('run-1', anchor_id, 'dark_factory', '2405')
+
+        project_fold = await state.cite_task('run-1', project_loser_id, 'dark_factory', '2405')
+        entity_fold = await state.cite_task('run-1', entity_loser_id, 'dark_factory', '2406')
+
+        assert project_fold.get('existing_finding_id') == anchor_id, project_fold
+        assert entity_fold.get('existing_finding_id') == survivor['finding_id'], entity_fold
+        return anchor_id, {project_loser_id, entity_loser_id}
+
+    @pytest.mark.asyncio
+    async def test_record_survives_a_restart_and_the_first_write_after_it(self, store):
+        state_a, _ = self._make_state(store)
+        await self._fold_both_ways(state_a)
+        before = _persisted_purge_record_rows(store, 'run-1')['reconciler']
+        assert [r['fold'] for r in before['purged_findings']] == ['project_scoped', 'entity_scoped']
+
+        state_b, _ = self._make_state(store)
+        state_b.hydrate_from_store()
+        assert 'error' not in state_b.set_stat('run-1', 'k', 1)
+
+        after = _persisted_purge_record_rows(store, 'run-1')['reconciler']
+        assert after['stats'] == {'k': 1}
+        assert after['purged_findings'] == before['purged_findings']
+        assert after['purged_findings_overflow'] == before['purged_findings_overflow']
+
+    @pytest.mark.asyncio
+    async def test_overflow_count_survives_a_restart(self, store):
+        from fused_memory.server.recon_report import MAX_PURGED_FINDINGS
+
+        state_a, _ = self._make_state(store)
+        state_a.start_report(run_id='run-1', stage='reconciler', project_id='dark_factory')
+        anchor_id = self._file_null_task_finding(state_a, 'anchor')
+        assert 'error' not in await state_a.cite_task('run-1', anchor_id, 'dark_factory', '2405')
+        for i in range(MAX_PURGED_FINDINGS + 1):
+            loser_id = self._file_null_task_finding(state_a, f'restatement #{i}')
+            folded = await state_a.cite_task('run-1', loser_id, 'dark_factory', '2405')
+            assert folded.get('existing_finding_id') == anchor_id, folded
+
+        state_b, _ = self._make_state(store)
+        state_b.hydrate_from_store()
+        assert 'error' not in state_b.set_stat('run-1', 'k', 1)
+
+        after = _persisted_purge_record_rows(store, 'run-1')['reconciler']
+        assert after['stats'] == {'k': 1}
+        assert len(after['purged_findings']) == MAX_PURGED_FINDINGS
+        assert after['purged_findings_overflow'] == 1
+
+    @pytest.mark.asyncio
+    async def test_row_persisted_before_the_record_existed_still_hydrates(self, store, caplog):
+        state_a, _ = self._make_state(store)
+        state_a.start_report(run_id='run-1', stage='reconciler', project_id='dark_factory')
+        finding_id = self._file_null_task_finding(state_a, 'filed before task 4865')
+        (row,) = [r for r in store.load_all() if r['run_id'] == 'run-1']
+        legacy = json.loads(row['entry_json'])
+        del legacy['purged_findings']
+        del legacy['purged_findings_overflow']
+        store.upsert_many([{**row, 'entry_json': json.dumps(legacy)}])
+
+        state_b, _ = self._make_state(store)
+        with caplog.at_level(logging.WARNING, logger='fused_memory.server.recon_report'):
+            state_b.hydrate_from_store()
+
+        assert self._flagged_ids(state_b, 'reconciler') == [finding_id]
+        assert [
+            r.getMessage() for r in caplog.records
+            if 'failed to deserialize persisted row' in r.getMessage()
+        ] == []
+        assert 'error' not in state_b.set_stat('run-1', 'k', 1)
+        rewritten = _persisted_purge_record_rows(store, 'run-1')['reconciler']
+        assert rewritten['purged_findings'] == []
+        assert rewritten['purged_findings_overflow'] == 0
+
+    @pytest.mark.asyncio
+    async def test_record_is_not_exposed_in_the_assembled_report(self, store):
+        state, _ = self._make_state(store)
+        await self._fold_both_ways(state)
+
+        report = state.get_assembled_report('run-1', 'reconciler')
+
+        assert report is not None
+        assert set(report) == {'summary', 'stats', 'flagged_items', 'summary_warnings'}
+        assert all('purged_findings' not in item for item in report['flagged_items'])
+
+    @pytest.mark.asyncio
+    async def test_hydrated_run_keeps_folding_onto_the_same_survivor(self, store):
+        state_a, _ = self._make_state(store)
+        anchor_id, purged_ids = await self._fold_both_ways(state_a)
+
+        state_b, _ = self._make_state(store)
+        state_b.hydrate_from_store()
+
+        assert purged_ids.isdisjoint(self._flagged_ids(state_b, 'reconciler'))
+        fresh_id = self._file_null_task_finding(state_b, 'post-restart restatement')
+        folded = await state_b.cite_task('run-1', fresh_id, 'dark_factory', '2405')
+        assert folded == {
+            'error': 'duplicate_finding',
+            'error_type': 'ReconReportDuplicateFinding',
+            'existing_finding_id': anchor_id,
+        }
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('fold', ['project_scoped', 'entity_scoped'])
+    async def test_folding_an_evicted_stages_last_finding_is_not_resurrected_by_a_restart(
+        self, store, fold
+    ):
+        state, t = self._make_state(store, ttl_seconds=10)
+        state.start_report(run_id='run-1', stage='s1', project_id='dark_factory')
+        loser_id = self._file_null_task_finding(
+            state, 'LOSER content',
+            flag_type=None if fold == 'project_scoped' else 'cross_project',
+        )
+        state.complete('run-1', 's1 done')
+        state.start_report(run_id='run-1', stage='s2', project_id='dark_factory')
+        t[0] = 11.0
+        assert state.tick() == 1
+
+        if fold == 'project_scoped':
+            anchor_id = self._file_null_task_finding(state, 'anchor filed by s2')
+            assert 'error' not in await state.cite_task(
+                'run-1', anchor_id, 'dark_factory', '2405'
+            )
+        else:
+            anchor_id = state.add_finding(
+                run_id='run-1', severity='minor', category='memory_stale',
+                description='entity survivor', suggested_action='a',
+                task_id='2405', flag_type='cross_project',
+            )['finding_id']
+
+        folded = await state.cite_task('run-1', loser_id, 'dark_factory', '2405')
+
+        assert folded.get('existing_finding_id') == anchor_id, folded
+        rows = _persisted_purge_record_rows(store, 'run-1')
+        assert [f['finding_id'] for f in rows['s1']['findings']] == []
+        assert [
+            (r['owning_stage'], r['finding']['finding_id'])
+            for r in rows['s2']['purged_findings']
+        ] == [('s1', loser_id)]
+
+        state_b, _ = self._make_state(store)
+        state_b.hydrate_from_store()
+        assert self._flagged_ids(state_b, 's1') == []
+        assert anchor_id in self._flagged_ids(state_b, 's2')
+        refolded = await state_b.cite_task('run-1', loser_id, 'dark_factory', '2405')
+        assert refolded.get('error') == 'finding_unknown', refolded
+
+# ---------------------------------------------------------------------------
 # task-2425 step-3: TestCiteTaskFoldKeyClearedOnDelete — RED until step-4
 # routes delete_finding through the shared _purge_finding helper
 # ---------------------------------------------------------------------------
@@ -1343,7 +2791,7 @@ class TestCiteTaskEntityScopedFold:
 
 class TestCiteTaskFoldKeyClearedOnDelete:
     """delete_finding must clear the primary-cited-task fold key (task-2425)
-    it registered in ``_run_cited_task_index``, mirroring how it already
+    it registered in the run's finding index, mirroring how it already
     clears the sig/desc dedup indices. Otherwise a deleted finding leaves a
     dangling fold-key pointer, and a LATER finding that cites the same
     external task as its own primary citation wrongly folds into the
@@ -1376,7 +2824,7 @@ class TestCiteTaskFoldKeyClearedOnDelete:
         state.start_report(run_id='run-1', stage='reconciler', project_id='dark_factory')
 
         f1 = state.add_finding(
-            run_id='run-1', severity='low', category='cross_project',
+            run_id='run-1', severity='minor', category='cross_project',
             description='desc one', suggested_action='a',
             task_id=None, flag_type=None,
         )
@@ -1389,7 +2837,7 @@ class TestCiteTaskFoldKeyClearedOnDelete:
         assert delete_result == {'status': 'deleted', 'finding_id': fid1}
 
         f2 = state.add_finding(
-            run_id='run-1', severity='low', category='cross_project',
+            run_id='run-1', severity='minor', category='cross_project',
             description='desc two, worded differently', suggested_action='a',
             task_id=None, flag_type='some_other_flag',
         )
@@ -1409,16 +2857,15 @@ class TestCiteTaskFoldKeyClearedOnDelete:
 
 
 # ---------------------------------------------------------------------------
-# task-2425 step-5: TestCiteTaskFoldReleasedAtRunQuiescence — RED until
-# step-6 makes tick() pop _run_cited_task_index at run quiescence
+# task-2425 step-5: TestCiteTaskFoldReleasedAtRunQuiescence
 # ---------------------------------------------------------------------------
 
 
 class TestCiteTaskFoldReleasedAtRunQuiescence:
     """tick()'s run-quiescence release (task-2088) must also release the
-    primary-cited-task fold index (task-2425) once a run's last entry
-    evicts — mirroring the existing _run_sig_index / _run_desc_index /
-    _run_finding_index release. Otherwise a stale fold key survives past
+    primary-cited-task fold key (task-2425) once a run's last entry
+    evicts, together with the rest of the run's finding index. Otherwise a
+    stale fold key survives past
     the run it belonged to and wrongly folds a citation on a later,
     unrelated run that happens to cite the same external task.
     """
@@ -1449,7 +2896,7 @@ class TestCiteTaskFoldReleasedAtRunQuiescence:
 
         state.start_report(run_id='run-1', stage='reconciler', project_id='dark_factory')
         f1 = state.add_finding(
-            run_id='run-1', severity='low', category='cross_project',
+            run_id='run-1', severity='minor', category='cross_project',
             description='desc one', suggested_action='a',
             task_id=None, flag_type=None,
         )
@@ -1457,7 +2904,10 @@ class TestCiteTaskFoldReleasedAtRunQuiescence:
 
         cite1 = await state.cite_task('run-1', fid1, 'dark_factory', '2405')
         assert 'error' not in cite1, cite1
-        assert state._run_cited_task_index.get('run-1', {}).get('dark_factory:2405') == fid1
+        run_index = state.run_index('run-1')
+        assert run_index is not None
+        assert run_index.by_cited_task('dark_factory:2405') == fid1
+        assert state.violations() == []
 
         state.complete('run-1', 'stage done')
 
@@ -1467,16 +2917,14 @@ class TestCiteTaskFoldReleasedAtRunQuiescence:
         assert evicted == 1
 
         assert state.get_assembled_report('run-1', 'reconciler') is None
-        assert 'run-1' not in state._run_sig_index
-        assert 'run-1' not in state._run_desc_index
-        assert 'run-1' not in state._run_finding_index
-        assert 'run-1' not in state._run_cited_task_index
+        assert state.run_index('run-1') is None
+        assert state.violations() == []
 
         # A FRESH run citing the SAME external task as its primary citation
         # must succeed plainly — the released index must not leak across runs.
         state.start_report(run_id='run-2', stage='reconciler', project_id='dark_factory')
         f2 = state.add_finding(
-            run_id='run-2', severity='low', category='cross_project',
+            run_id='run-2', severity='minor', category='cross_project',
             description='desc two, unrelated run', suggested_action='a',
             task_id=None, flag_type=None,
         )
@@ -1485,6 +2933,75 @@ class TestCiteTaskFoldReleasedAtRunQuiescence:
         cite2 = await state.cite_task('run-2', fid2, 'dark_factory', '2405')
         assert 'error' not in cite2, cite2
         assert cite2 == {'project_id': 'dark_factory', 'task_id': '2405', 'title': 'T-2405'}
+
+
+class _InterleavingTaskInterceptor:
+    """get_task runs *during_await* before answering, standing in for the
+    reaper or another tool call that the event loop runs while cite_task
+    awaits the task lookup."""
+
+    def __init__(self, during_await) -> None:
+        self._during_await = during_await
+
+    async def get_task(self, task_id: str, project_root: str, tag=None) -> dict:
+        self._during_await()
+        return {'id': task_id, 'title': f'T-{task_id}'}
+
+
+class TestCiteTaskActsOnlyOnWhatIsLiveAfterItsAwait:
+    def _state_with_uncited_finding(self, during_await):
+        from fused_memory.server.recon_report import ReconReportState
+
+        t = [0.0]
+        state = ReconReportState(
+            ttl_seconds=300,
+            clock=lambda: t[0],
+            task_interceptor=_InterleavingTaskInterceptor(lambda: during_await(state, t)),
+        )
+        state.known_projects = dict(_KNOWN_PROJECTS)
+        state.start_report(run_id='run-1', stage='reconciler', project_id='dark_factory')
+        fid = state.add_finding(
+            run_id='run-1', severity='minor', category='cross_project',
+            description='d', suggested_action='a', task_id=None, flag_type='X',
+        )['finding_id']
+        return state, fid
+
+    @pytest.mark.asyncio
+    async def test_run_quiesced_during_the_lookup_is_reported_unknown(self):
+        def reap(state, t):
+            state.complete('run-1', 'done')
+            t[0] = 301.0
+            assert state.tick() == 1
+
+        state, fid = self._state_with_uncited_finding(reap)
+
+        result = await state.cite_task('run-1', fid, 'dark_factory', '42')
+
+        assert result['error'] == 'run_id_unknown'
+        assert state.run_index('run-1') is None
+        assert state.violations() == []
+
+    @pytest.mark.asyncio
+    async def test_finding_deleted_during_the_lookup_is_reported_unknown(self):
+        def delete(state, _t):
+            assert state.delete_finding('run-1', fid)['status'] == 'deleted'
+
+        state, fid = self._state_with_uncited_finding(delete)
+
+        result = await state.cite_task('run-1', fid, 'dark_factory', '42')
+
+        assert result['error'] == 'finding_unknown'
+        run_index = state.run_index('run-1')
+        assert run_index is not None
+        assert run_index.owner_of(fid) is None
+        assert run_index.by_cited_task('dark_factory:42') is None
+        assert run_index.by_signature(('42', 'X')) is None
+        refiled = state.add_finding(
+            run_id='run-1', severity='minor', category='cross_project',
+            description='d2', suggested_action='a', task_id='42', flag_type='X',
+        )
+        assert 'error' not in refiled, refiled
+        assert state.violations() == []
 
 
 # ---------------------------------------------------------------------------
@@ -1613,6 +3130,91 @@ class TestCiteMemory:
 # ---------------------------------------------------------------------------
 
 
+class TestCiteMemoryOverRealMemoryService:
+    """cite_memory over the REAL MemoryService — the end-to-end pin on the measured harm.
+
+    Every other cite_memory test in this file drives ``_FakeMemoryService``,
+    which returns a CANNED fingerprint and so never exercises the real read.
+    That is precisely why the defect survived: ``MemoryService.get_memory``
+    inverted the nesting of two of the fingerprint's three fields, and nothing
+    between it and a human ever looked at a real one.
+
+    THE CHAIN THIS GUARDS.  5/5 real ``cite_memory`` calls recorded
+    ``{category: null, agent_id: null, created_at: <real>}`` against records
+    whose raw payloads carried values for both.  A citation's ``agent_id`` is
+    what says WHO wrote the memory; with it null, authorship was INFERRED
+    rather than read, and that false uniform-authorship claim reached a
+    human-gated task's description.
+
+    Asserted off ``get_assembled_report``, not off the return value: what a
+    downstream reader consumes is the citation PERSISTED into the finding.
+    """
+
+    _UUID = 'd4e5f6a7-b8c9-0123-d456-e78f9a0b1c2d'
+
+    #: One stored Qdrant payload.  The record the backend hands back is
+    #: DERIVED from it by mem0's own promotion rule
+    #: (``tests/_mem0_record_shapes.py``) rather than transcribed, so this
+    #: module cannot keep asserting a retired contract after a mem0 upgrade
+    #: while a sibling module goes red.
+    _PAYLOAD = {
+        'data': 'some text',
+        'hash': 'h',
+        'created_at': '2026-09-09T12:00:00+00:00',
+        'updated_at': None,
+        'user_id': 'dark_factory',
+        'agent_id': 'claude-review-df-3200',
+        'run_id': '0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0',
+        'category': 'observations_and_summaries',
+        'topic': 't',
+    }
+
+    @classmethod
+    def _real_service(cls, mock_config):
+        """A real MemoryService whose mem0 backend hands back a mem0-shaped record.
+
+        Only the BACKEND is mocked. ``get_memory`` — the function that held the
+        defect — runs for real.
+        """
+        from unittest.mock import AsyncMock, MagicMock
+
+        from fused_memory.services.memory_service import MemoryService
+
+        service = MemoryService(mock_config)
+        service.mem0 = MagicMock()
+        service.mem0.get = AsyncMock(
+            return_value=mem0_record(cls._PAYLOAD, memory_id=cls._UUID)
+        )
+        return service
+
+    @pytest.mark.asyncio
+    async def test_persisted_fingerprint_carries_real_category_and_agent_id(
+        self, mock_config
+    ):
+        service = self._real_service(mock_config)
+        state, run_id, finding_id = _make_state_with_finding(memory_service=service)
+
+        await state.cite_memory(run_id, finding_id, self._UUID, 'mem0')
+
+        report = state.get_assembled_report(run_id, 'reconciler')
+        assert report is not None
+        memories = report['flagged_items'][0]['cited_memories']
+        assert len(memories) == 1, f'expected one citation, got {memories!r}'
+        fingerprint = memories[0]['metadata_fingerprint']
+
+        assert fingerprint['agent_id'] == 'claude-review-df-3200', (
+            'a null agent_id is what let authorship be INFERRED rather than read; '
+            f'got fingerprint={fingerprint!r}'
+        )
+        assert fingerprint['category'] == 'observations_and_summaries', (
+            f'category lives inside mem0 metadata and must be read there; '
+            f'got fingerprint={fingerprint!r}'
+        )
+        assert fingerprint['created_at'] == '2026-09-09T12:00:00+00:00', (
+            'created_at was the one field always correct — it must stay correct'
+        )
+
+
 class TestCiteMemoryExceptionNarrowing:
     """Verifies that unexpected exceptions propagate rather than being misclassified as memory_not_found.
 
@@ -1630,7 +3232,7 @@ class TestCiteMemoryExceptionNarrowing:
     @pytest.mark.asyncio
     async def test_memory_not_found_error_caught_as_memory_not_found(self):
         """MemoryNotFoundError → {error:'memory_not_found'} and cited_memories unchanged."""
-        from fused_memory.services.memory_service import MemoryNotFoundError  # noqa: PLC0415
+        from fused_memory.services.memory_service import MemoryNotFoundError
 
         state, run_id, finding_id = self._state_and_finding(
             memory_raises=MemoryNotFoundError('not-found')
@@ -1681,6 +3283,33 @@ class TestCiteMemoryExceptionNarrowing:
 
         with pytest.raises(ValueError):
             await state.cite_memory(run_id, finding_id, self._VALID_UUID, 'graphiti')
+
+        report = state.get_assembled_report(run_id, 'reconciler')
+        assert report is not None
+        assert report['flagged_items'][0]['cited_memories'] == []
+
+    @pytest.mark.asyncio
+    async def test_read_timeout_propagates_not_reported_as_memory_not_found(self):
+        """A mem0 read TimeoutError must propagate — never render as memory_not_found.
+
+        The narrowness of cite_memory's `except (EdgeNotFoundError,
+        MemoryNotFoundError)` is LOAD-BEARING here, not incidental: this is the
+        boundary at which a timeout would otherwise become a FALSE ABSENCE
+        written into a durable report.  The chain that follows from that, and
+        the corroboration gate that bounds it, are stated once at
+        `backends/mem0_client.py::Mem0Backend.get`.
+
+        Since task 5265 `Mem0Backend.get` propagates its read timeout instead
+        of swallowing it into `None` (which `get_memory` then turned into
+        `MemoryNotFoundError`), so this is the first exception shape that can
+        actually reach here from a timed-out read.
+        """
+        state, run_id, finding_id = self._state_and_finding(
+            memory_raises=TimeoutError('Mem0 get timed out after 5.0s')
+        )
+
+        with pytest.raises(TimeoutError):
+            await state.cite_memory(run_id, finding_id, self._VALID_UUID, 'mem0')
 
         report = state.get_assembled_report(run_id, 'reconciler')
         assert report is not None
@@ -1888,7 +3517,7 @@ class TestCiteToolsViaFastMCP:
         # add_finding
         r = await tm.call_tool('add_finding', {
             'run_id': 'r1',
-            'severity': 'low',
+            'severity': 'minor',
             'category': 'cat',
             'description': 'd',
             'suggested_action': 'a',
@@ -1921,7 +3550,7 @@ class TestCiteToolsViaFastMCP:
         state.known_projects = {'dark_factory': '/home/leo/src/dark-factory'}
         state.start_report(run_id='r1', stage='s', project_id='dark_factory')
         fid = state.add_finding(
-            run_id='r1', severity='low', category='c',
+            run_id='r1', severity='minor', category='c',
             description='d', suggested_action='a'
         )['finding_id']
         tm = mcp._tool_manager
@@ -2012,7 +3641,7 @@ class TestCiteToolsViaFastMCP:
         })
         r = await tm.call_tool('add_finding', {
             'run_id': 'r1',
-            'severity': 'low',
+            'severity': 'minor',
             'category': 'cat',
             'description': 'd',
             'suggested_action': 'a',
@@ -2267,3 +3896,317 @@ class TestReconReportComponentsWiring:
         assert state._ttl_seconds == 300  # type: ignore[attr-defined]
         assert mcp.name == 'Recon Report'
         assert uv_cfg.port == 8003
+
+
+# ---------------------------------------------------------------------------
+# task 2979: apply_citation_verification — the verification write-back
+# ---------------------------------------------------------------------------
+
+
+class _WBFakeMemoryService:
+    """Minimal memory service for the write-back tests — every id 'exists' at
+    cite time, so a phantom has to be created the way production creates one:
+    cited successfully, then verified later and found gone."""
+
+    async def get_memory(self, memory_id: str, project_id: str, store: str) -> dict:
+        return {'category': 'observations_and_summaries', 'agent_id': 'x', 'created_at': 'now'}
+
+
+class TestApplyCitationVerification:
+    """``verify_cited_memories`` must reach the AUTHORITATIVE recon_report
+    record, not just the throwaway projection (task 2979, Gap B).
+
+    ``get_assembled_report`` builds a FRESH dict per finding with
+    ``'cited_memories': list(f.cited_memories)`` — a NEW list object. So the
+    verification pass in ``BaseStage.run()`` mutates that projection while the
+    authoritative ``_Finding``, and the durable SQLite row written inside the
+    CLI subprocess at add_finding/cite_memory/complete time (strictly BEFORE
+    verification runs), keep the phantom forever. Two stores then permanently
+    disagree about the same finding's citations, and which one a consumer reads
+    decides whether it sees the phantom. ``apply_citation_verification`` closes
+    that divergence.
+    """
+
+    _GOOD = 'd4e5f6a7-b8c9-0123-d456-e78f9a0b1c2d'
+    _PHANTOM = 'b47ded9b-1111-4222-8333-444444444444'
+
+    def _state_with_two_citations(self, tmp_path=None):
+        """A completed report whose single finding cites _GOOD and _PHANTOM."""
+        from fused_memory.server.recon_report import ReconReportState
+
+        store = None
+        if tmp_path is not None:
+            from fused_memory.server.recon_report_store import ReconReportStore
+
+            store = ReconReportStore(tmp_path / 'recon_report_state.db')
+            store.open()
+
+        t = [0.0]
+        state = ReconReportState(
+            ttl_seconds=300,
+            clock=lambda: t[0],
+            memory_service=_WBFakeMemoryService(),
+            store=store,
+        )
+        run_id = 'run-wb-1'
+        state.start_report(run_id=run_id, stage='memory_consolidator', project_id='dark_factory')
+        finding_id = state.add_finding(
+            run_id=run_id,
+            severity='moderate',
+            category='memory_stale',
+            description='a finding citing a phantom',
+            suggested_action='a',
+            actionable=True,
+            task_id='42',
+            flag_type='orphaned_knowledge',
+        )['finding_id']
+        return state, store, run_id, finding_id
+
+    async def _cite_both(self, state, run_id, finding_id):
+        await state.cite_memory(run_id, finding_id, self._GOOD, 'mem0')
+        await state.cite_memory(run_id, finding_id, self._PHANTOM, 'mem0')
+
+    def _verification_result(self, finding_id):
+        """What BaseStage.run()'s verification pass concluded: keep _GOOD, drop
+        _PHANTOM (get_memory_by_id returned None for it)."""
+        return [
+            {
+                'finding_id': finding_id,
+                'cited_memories': [{'memory_id': self._GOOD, 'store': 'mem0'}],
+                'citation_failures': [
+                    {'memory_id': self._PHANTOM, 'store': 'mem0', 'reason': 'memory_not_found'},
+                ],
+            },
+        ]
+
+    @pytest.mark.asyncio
+    async def test_phantom_stripped_from_authoritative_findings(self):
+        """After apply_citation_verification, neither get_findings_for_run nor
+        get_assembled_report lists the phantom id."""
+        state, _store, run_id, finding_id = self._state_with_two_citations()
+        await self._cite_both(state, run_id, finding_id)
+        state.complete(run_id, summary='s')
+
+        # Pre-condition: both ids are on the authoritative record.
+        pre = state.get_findings_for_run(run_id)[0]
+        assert [c['memory_id'] for c in pre['cited_memories']] == [self._GOOD, self._PHANTOM]
+
+        state.apply_citation_verification(run_id, self._verification_result(finding_id))
+
+        post = state.get_findings_for_run(run_id)[0]
+        assert [c['memory_id'] for c in post['cited_memories']] == [self._GOOD]
+
+        assembled = state.get_assembled_report(run_id, 'memory_consolidator')
+        assert assembled is not None
+        assembled_finding = assembled['flagged_items'][0]
+        assert [c['memory_id'] for c in assembled_finding['cited_memories']] == [self._GOOD]
+
+    @pytest.mark.asyncio
+    async def test_citation_failure_marker_is_recorded_and_projected(self):
+        """The dropped phantom is recorded on the finding and visible to BOTH
+        readers — the marker is what makes the phantom claim surfaced rather
+        than silently vanished."""
+        state, _store, run_id, finding_id = self._state_with_two_citations()
+        await self._cite_both(state, run_id, finding_id)
+        state.complete(run_id, summary='s')
+
+        state.apply_citation_verification(run_id, self._verification_result(finding_id))
+
+        expected = [{'memory_id': self._PHANTOM, 'store': 'mem0', 'reason': 'memory_not_found'}]
+        assert state.get_findings_for_run(run_id)[0]['citation_failures'] == expected
+        assembled = state.get_assembled_report(run_id, 'memory_consolidator')
+        assert assembled is not None
+        assert assembled['flagged_items'][0]['citation_failures'] == expected
+
+    @pytest.mark.asyncio
+    async def test_correction_is_durable_across_a_fresh_hydrate(self, tmp_path):
+        """The correction reaches the SQLite row, not just memory.
+
+        This is the assertion that actually closes the divergence: a brand-new
+        ReconReportState hydrating from the same db file must see the corrected
+        citations. Without the _persist_run write-back, the row still carries
+        the pre-verification phantom.
+        """
+        from fused_memory.server.recon_report import ReconReportState
+        from fused_memory.server.recon_report_store import ReconReportStore
+
+        state, store, run_id, finding_id = self._state_with_two_citations(tmp_path)
+        assert store is not None  # tmp_path was passed, so a store was built.
+        await self._cite_both(state, run_id, finding_id)
+        state.complete(run_id, summary='s')
+
+        state.apply_citation_verification(run_id, self._verification_result(finding_id))
+
+        # Re-open the same db in a fresh state object and hydrate.
+        store.close()
+        reopened = ReconReportStore(tmp_path / 'recon_report_state.db')
+        reopened.open()
+        rehydrated = ReconReportState(
+            ttl_seconds=300,
+            clock=lambda: 0.0,
+            memory_service=_WBFakeMemoryService(),
+            store=reopened,
+        )
+        rehydrated.hydrate_from_store()
+
+        durable = rehydrated.get_findings_for_run(run_id)
+        assert durable, 'the run must survive hydrate_from_store'
+        assert [c['memory_id'] for c in durable[0]['cited_memories']] == [self._GOOD], (
+            'the persisted row still carries the phantom — the verification '
+            'result never reached the durable store'
+        )
+        assert durable[0]['citation_failures'] == [
+            {'memory_id': self._PHANTOM, 'store': 'mem0', 'reason': 'memory_not_found'},
+        ]
+
+    @pytest.mark.asyncio
+    async def test_accepted_after_complete_unlike_delete_finding(self):
+        """The _ERR_ALREADY_COMPLETED guard must NOT apply here.
+
+        This write-back is a harness-side integrity correction that by
+        construction runs after the CLI subprocess called complete(), so
+        applying delete_finding's guard would reject every legitimate call. The
+        asymmetry is deliberate: unlike a retraction it only edits citation
+        lists, never adds or removes a finding, so complete()'s cached
+        flagged_count is unaffected.
+        """
+        state, _store, run_id, finding_id = self._state_with_two_citations()
+        await self._cite_both(state, run_id, finding_id)
+        completed = state.complete(run_id, summary='s')
+        flagged_count_before = completed['flagged_count']
+
+        result = state.apply_citation_verification(run_id, self._verification_result(finding_id))
+
+        assert 'error' not in result, (
+            f'post-complete write-back must be accepted, got {result!r}'
+        )
+        # Contrast: delete_finding on the same completed entry IS rejected.
+        assert state.delete_finding(run_id, finding_id).get('error') == 'report_already_completed'
+        # flagged_count is untouched — only citation lists changed.
+        assert len(state.get_findings_for_run(run_id)) == flagged_count_before
+
+    @pytest.mark.asyncio
+    async def test_repeat_pass_does_not_duplicate_citation_failure_markers(self):
+        """A second pass over the same (run_id, stage) is IDEMPOTENT.
+
+        The caller sends the FULL citation_failures list off the assembled
+        projection, not the delta it appended — and get_assembled_report
+        projects the already-persisted markers straight back out. A plain
+        extend therefore re-appended every prior marker on every repeat. A
+        repeat is architecturally reachable: start_report is deliberately
+        idempotent and RETAINS prior findings, and the resume path can
+        re-invoke stage.run() under the same run_id.
+        """
+        state, _store, run_id, finding_id = self._state_with_two_citations()
+        await self._cite_both(state, run_id, finding_id)
+        state.complete(run_id, summary='s')
+
+        state.apply_citation_verification(run_id, self._verification_result(finding_id))
+        # Second pass sends exactly what get_assembled_report now projects: the
+        # surviving citation AND the marker the first pass persisted.
+        state.apply_citation_verification(run_id, self._verification_result(finding_id))
+
+        durable = state.get_findings_for_run(run_id)[0]
+        assert durable['citation_failures'] == [
+            {'memory_id': self._PHANTOM, 'store': 'mem0', 'reason': 'memory_not_found'},
+        ], 'a repeat pass must not duplicate the marker it already persisted'
+        assert [c['memory_id'] for c in durable['cited_memories']] == [self._GOOD]
+
+    @pytest.mark.asyncio
+    async def test_repeat_verification_error_dedupes_across_error_types(self):
+        """The dedupe key is (memory_id, store, reason) — error_type excluded.
+
+        Two verification errors for the same citation record the same fact
+        ("this id could not be resolved") whichever exception class surfaced
+        it. Keying on error_type would let a flapping backend grow the list
+        without bound across repeat passes.
+        """
+        state, _store, run_id, finding_id = self._state_with_two_citations()
+        await self._cite_both(state, run_id, finding_id)
+        state.complete(run_id, summary='s')
+
+        def _err_result(error_type):
+            return [
+                {
+                    'finding_id': finding_id,
+                    'cited_memories': [
+                        {'memory_id': self._GOOD, 'store': 'mem0'},
+                        {'memory_id': self._PHANTOM, 'store': 'mem0'},
+                    ],
+                    'citation_failures': [
+                        {
+                            'memory_id': self._PHANTOM,
+                            'store': 'mem0',
+                            'reason': 'verification_error',
+                            'error_type': error_type,
+                        },
+                    ],
+                },
+            ]
+
+        state.apply_citation_verification(run_id, _err_result('TimeoutError'))
+        state.apply_citation_verification(run_id, _err_result('ConnectionError'))
+
+        durable = state.get_findings_for_run(run_id)[0]
+        assert len(durable['citation_failures']) == 1, (
+            f'error_type must not split the dedupe key, got '
+            f'{durable["citation_failures"]!r}'
+        )
+        assert durable['citation_failures'][0]['error_type'] == 'TimeoutError'
+
+    @pytest.mark.asyncio
+    async def test_no_op_result_does_not_repersist_the_run(self):
+        """A result that changes nothing must not drive a _persist_run.
+
+        _persist_run re-serialises and upserts EVERY entry of the run, and the
+        overwhelmingly common case is a clean verification pass where every
+        citation resolved. Recording "nothing moved" at the cost of a full-run
+        rewrite, once per stage per cycle, is pure waste.
+        """
+        state, _store, run_id, finding_id = self._state_with_two_citations()
+        await self._cite_both(state, run_id, finding_id)
+        state.complete(run_id, summary='s')
+
+        # Echo back exactly what the projection carries — which is what
+        # BaseStage.run() sends after a pass that dropped nothing. Built from
+        # the projection rather than hand-written so the no-op stays a no-op if
+        # cite_memory's entry shape ever gains a field.
+        projected = state.get_findings_for_run(run_id)[0]
+        no_op = [
+            {
+                'finding_id': finding_id,
+                'cited_memories': projected['cited_memories'],
+                'citation_failures': projected['citation_failures'],
+            },
+        ]
+        with patch.object(state, '_persist_run') as persist:
+            result = state.apply_citation_verification(run_id, no_op)
+
+        assert result['findings_updated'] == 1, 'the finding still RESOLVED'
+        assert result['findings_changed'] == 0, 'but nothing about it moved'
+        assert persist.call_count == 0, 'a no-op write-back must not re-persist the run'
+
+    @pytest.mark.asyncio
+    async def test_unknown_finding_id_is_skipped_not_raised(self):
+        """A post-hoc hygiene pass must never fail a stage: an unresolvable
+        finding_id is logged and skipped, and the resolvable ones still apply."""
+        state, _store, run_id, finding_id = self._state_with_two_citations()
+        await self._cite_both(state, run_id, finding_id)
+        state.complete(run_id, summary='s')
+
+        results = [
+            {'finding_id': 'no-such-finding', 'cited_memories': [], 'citation_failures': []},
+            *self._verification_result(finding_id),
+        ]
+        state.apply_citation_verification(run_id, results)  # must not raise
+
+        assert [
+            c['memory_id'] for c in state.get_findings_for_run(run_id)[0]['cited_memories']
+        ] == [self._GOOD]
+
+    def test_unknown_run_id_is_skipped_not_raised(self):
+        """Same posture for a run_id that no longer exists (TTL-reaped)."""
+        from fused_memory.server.recon_report import ReconReportState
+
+        state = ReconReportState(ttl_seconds=300, clock=lambda: 0.0)
+        state.apply_citation_verification('no-such-run', [])  # must not raise

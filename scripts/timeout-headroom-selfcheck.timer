@@ -1,0 +1,23 @@
+[Unit]
+Description=Nightly timer for the timeout-headroom self-check (task 10940)
+
+[Timer]
+# Nightly at 01:30 local time, the first slot of this machine's staggered
+# ladder, so it is done before the 02:00 repack also reads git:
+#
+#   01:30  this job
+#   02:00  shared-repo-git-maintenance
+#   02:15  fused-memory-link-heal
+#   ...
+#
+# Daily is what lets the check keep no record of its own: the verify archive
+# keeps about seven days, so every run is scanned about seven times before it
+# ages out. Persistent=true catches up a night missed to a sleeping laptop; the
+# randomized delay avoids a thundering herd. See OPERATIONS.md §12 for the
+# ladder as a whole.
+OnCalendar=*-*-* 01:30:00
+Persistent=true
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target

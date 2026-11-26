@@ -3,8 +3,12 @@
 from __future__ import annotations
 
 import asyncio
-from contextlib import contextmanager
+import sqlite3
+import threading
+from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine
+from contextlib import AbstractAsyncContextManager, asynccontextmanager, contextmanager, suppress
 from pathlib import Path
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import aiosqlite
@@ -12,8 +16,10 @@ import pytest
 
 from shared.async_sqlite_base import (
     AsyncSqliteBase,
+    AtomicConnection,
     CheckpointResult,
     apply_full_durability_pragmas,
+    apply_wal_pragmas,
     connect_daemon,
 )
 
@@ -339,22 +345,24 @@ class TestAsyncSqliteBaseClose:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.asyncio
 class TestAsyncSqliteBaseContextManager:
     """Tests for AsyncSqliteBase.__aenter__ and __aexit__."""
 
+    @pytest.mark.asyncio
     async def test_aenter_opens_connection(self, tmp_path: Path) -> None:
         """__aenter__ opens the connection (_conn is not None inside the block)."""
         store = _SimpleStore(tmp_path / 'store.db')
         async with store:
             assert store._conn is not None
 
+    @pytest.mark.asyncio
     async def test_aenter_returns_self(self, tmp_path: Path) -> None:
         """__aenter__ returns self."""
         store = _SimpleStore(tmp_path / 'store.db')
         async with store as ctx:
             assert ctx is store
 
+    @pytest.mark.asyncio
     async def test_aexit_closes_connection_on_normal_exit(self, tmp_path: Path) -> None:
         """__aexit__ closes the connection after the block exits normally."""
         store = _SimpleStore(tmp_path / 'store.db')
@@ -362,6 +370,7 @@ class TestAsyncSqliteBaseContextManager:
             pass
         assert store._conn is None
 
+    @pytest.mark.asyncio
     async def test_aexit_closes_connection_on_exception(self, tmp_path: Path) -> None:
         """__aexit__ closes the connection even when the body raises."""
         store = _SimpleStore(tmp_path / 'store.db')
@@ -655,12 +664,17 @@ class TestAsyncSqliteBaseCloseExceptionSafety:
 # ---------------------------------------------------------------------------
 
 
+def _worker_thread(conn: aiosqlite.Connection) -> threading.Thread:
+    """The connection's aiosqlite worker thread: this file's one ``._thread`` access."""
+    return conn._thread
+
+
 def _assert_daemon_thread(conn: aiosqlite.Connection, label: str = '') -> None:
     """Assert that an aiosqlite connection's worker thread is alive and daemon-marked.
 
-    Centralises the ``._thread`` access pattern so that a future aiosqlite
-    rename is caught in one place rather than in every daemon-related test
-    method.  The fused-memory counterpart lives in
+    Centralises the ``._thread`` access pattern (through :func:`_worker_thread`)
+    so that a future aiosqlite rename is caught in one place rather than in
+    every daemon-related test method.  The fused-memory counterpart lives in
     ``fused-memory/tests/test_daemon_connect_consolidation.py``.
 
     Args:
@@ -668,7 +682,7 @@ def _assert_daemon_thread(conn: aiosqlite.Connection, label: str = '') -> None:
         label: Optional label prepended to assertion failure messages.
     """
     prefix = f'{label}: ' if label else ''
-    thread = conn._thread
+    thread = _worker_thread(conn)
     assert thread.is_alive(), f'{prefix}worker thread should be alive while connection is open'
     assert thread.daemon is True, (
         f'{prefix}aiosqlite worker thread must be daemon so a leaked '
@@ -794,6 +808,58 @@ class TestSwapLeakGuard:
 
 
 # ---------------------------------------------------------------------------
+# One checkpoint parser, and one no-row contract for both checkpoint() methods
+# ---------------------------------------------------------------------------
+
+
+class TestCheckpointResultFromPragmaRows:
+    def test_parses_the_pragma_row(self) -> None:
+        assert CheckpointResult.from_pragma_rows([(0, 7, 7)]) == CheckpointResult(0, 7, 7)
+
+    def test_raises_on_no_row(self) -> None:
+        with pytest.raises(RuntimeError, match='PRAGMA wal_checkpoint returned no rows'):
+            CheckpointResult.from_pragma_rows([])
+
+
+@asynccontextmanager
+async def _open_atomic_connection(tmp_path: Path) -> AsyncIterator[AtomicConnection]:
+    conn = await connect_daemon(tmp_path / 'atomic.db')
+    try:
+        yield AtomicConnection(conn)
+    finally:
+        await conn.close()
+
+
+def _open_async_sqlite_base(tmp_path: Path) -> _SimpleStore:
+    return _SimpleStore(tmp_path / 'store.db')
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'open_checkpointer',
+    [_open_atomic_connection, _open_async_sqlite_base],
+    ids=['AtomicConnection', 'AsyncSqliteBase'],
+)
+async def test_both_checkpoint_implementations_raise_on_a_no_row_result(
+    tmp_path: Path,
+    open_checkpointer: Callable[
+        [Path], AbstractAsyncContextManager[AtomicConnection | AsyncSqliteBase]
+    ],
+) -> None:
+    """Only the one-hop ``execute_fetchall`` read yields no row here.
+
+    A checkpoint still spelled as ``execute`` + ``fetch*`` reads a real row and
+    fails this test instead of matching it by accident.
+    """
+    async with open_checkpointer(tmp_path) as checkpointer:
+        with (
+            patch.object(aiosqlite.Connection, 'execute_fetchall', AsyncMock(return_value=[])),
+            pytest.raises(RuntimeError, match='PRAGMA wal_checkpoint returned no rows'),
+        ):
+            await checkpointer.checkpoint()
+
+
+# ---------------------------------------------------------------------------
 # Step-13: AsyncSqliteBase.checkpoint()
 # ---------------------------------------------------------------------------
 
@@ -818,29 +884,6 @@ class TestAsyncSqliteBaseCheckpoint:
         assert result.busy == 0
         # TRUNCATE moves all WAL frames into the main db; log == checkpointed
         assert result.log == result.checkpointed
-
-    async def test_checkpoint_raises_if_pragma_returns_no_rows(self, tmp_path: Path) -> None:
-        """checkpoint() raises RuntimeError when PRAGMA wal_checkpoint returns no rows.
-
-        Defensive guard: SQLite always returns a row for this PRAGMA in practice,
-        but the explicit check ensures callers get a loud failure rather than a
-        silent sentinel if the behaviour ever changes.
-        """
-        mock_cursor = AsyncMock()
-        mock_cursor.fetchone = AsyncMock(return_value=None)
-        mock_cursor.__aenter__ = AsyncMock(return_value=mock_cursor)
-        mock_cursor.__aexit__ = AsyncMock(return_value=False)
-
-        mock_conn = AsyncMock()
-        # execute() must return a sync value (the cursor) so `async with conn.execute(...)`
-        # can call __aenter__ on it directly.
-        mock_conn.execute = MagicMock(return_value=mock_cursor)
-
-        store = _SimpleStore(tmp_path / 'store.db')
-        store._conn = mock_conn  # type: ignore[assignment]
-
-        with pytest.raises(RuntimeError, match='PRAGMA wal_checkpoint returned no rows'):
-            await store.checkpoint()
 
     async def test_checkpoint_truncates_wal_after_writes(self, tmp_path: Path) -> None:
         """After inserting rows, checkpoint() flushes the WAL with busy==0.
@@ -878,3 +921,696 @@ class TestAsyncSqliteBaseCheckpoint:
         # WAL file must be truncated to near-zero (SQLite WAL header = 32 bytes)
         after_size = wal_path.stat().st_size if wal_path.exists() else 0
         assert after_size <= 32, f'WAL should be truncated; got {after_size} bytes'
+
+
+# ---------------------------------------------------------------------------
+# AtomicConnection — per-connection atomic access (task 5560)
+# ---------------------------------------------------------------------------
+
+# A hang guard only: never elapses on a passing run.  It turns a harness bug
+# into a legible failure instead of a wedged worker thread.
+_GATE_HANG_GUARD_SECS = 30.0
+
+# The WHERE term depends on a column, so SQLite calls scan_gate once per row
+# scanned; the FIRST row parks.
+_GATED_SCAN = "SELECT id, v FROM items WHERE scan_gate(flag) = 'live'"
+
+_COLLIDING_UPDATE = "UPDATE items SET v = 'owner' WHERE id = 'live'"
+
+
+class _WorkerGate:
+    """Parks the connection's worker thread inside SQLite until released.
+
+    Every call blocks until :meth:`release`; the first one also sets
+    ``parked``.  Every call comes from the one worker thread, so
+    ``_has_parked`` needs no lock.  Two registrations use it:
+
+    - as the ``scan_gate(value)`` SQL function, it parks the first row in the
+      middle of ``sqlite3_step``, so the read's snapshot stays pinned;
+    - as a ``set_trace_callback``, it parks the first traced statement as it
+      starts.
+    """
+
+    def __init__(self, loop: asyncio.AbstractEventLoop) -> None:
+        self.parked = asyncio.Event()
+        self._loop = loop
+        self._released = threading.Event()
+        self._has_parked = False
+
+    def __call__(self, value: object) -> object:
+        if not self._has_parked:
+            self._has_parked = True
+            self._loop.call_soon_threadsafe(self.parked.set)
+        if not self._released.wait(timeout=_GATE_HANG_GUARD_SECS):
+            raise TimeoutError('worker gate was never released')
+        return value
+
+    async def wait_parked(self) -> None:
+        await asyncio.wait_for(self.parked.wait(), timeout=_GATE_HANG_GUARD_SECS)
+
+    def release(self) -> None:
+        self._released.set()
+
+
+async def _open_collision_pair(
+    open_conn: Callable[[Path], Awaitable[aiosqlite.Connection]], db_path: Path
+) -> tuple[aiosqlite.Connection, aiosqlite.Connection, _WorkerGate]:
+    """Open ``owner`` (with ``scan_gate`` registered) and ``foreign`` on one seeded file."""
+    owner = await open_conn(db_path)
+    foreign = await open_conn(db_path)
+    await owner.execute('CREATE TABLE items (id TEXT PRIMARY KEY, flag TEXT, v TEXT)')
+    await owner.execute("INSERT INTO items VALUES ('live', 'live', '0')")
+    await owner.execute("INSERT INTO items VALUES ('foreign', 'dead', '0')")
+    await owner.commit()
+    gate = _WorkerGate(asyncio.get_running_loop())
+    await owner.create_function('scan_gate', 1, gate)
+    return owner, foreign, gate
+
+
+async def _sqlite_error_name(op: Callable[[], Awaitable[None]]) -> str | None:
+    """Await ``op`` and return its SQLite error name, or None if it raised nothing."""
+    try:
+        await op()
+    except sqlite3.OperationalError as exc:
+        return exc.sqlite_errorname
+    return None
+
+
+async def _raw_colliding_write(conn: aiosqlite.Connection) -> None:
+    """The colliding write, issued straight on ``conn`` past any lock."""
+    await conn.execute(_COLLIDING_UPDATE)
+    await conn.commit()
+
+
+async def _collide_with_a_pinned_read(
+    foreign: aiosqlite.Connection,
+    gate: _WorkerGate,
+    *,
+    read: Callable[[], Coroutine[Any, Any, list[aiosqlite.Row]]],
+    write: Callable[[], Awaitable[None]],
+) -> tuple[list[aiosqlite.Row], str | None]:
+    """Issue ``write`` into ``read``'s pinned-snapshot window after a foreign commit.
+
+    Returns the read's rows and the write's SQLite error name (None if it
+    raised nothing).  The order is constructed, not raced:
+
+    1. ``read`` parks inside ``scan_gate`` with its snapshot pinned.
+    2. The writer task is created, then the test suspends on ``foreign``'s
+       statement.  asyncio's FIFO ready queue runs the writer's first step
+       during that suspension, which either queues its statement behind the
+       parked hop or parks it on :class:`AtomicConnection`'s lock.
+    3. ``foreign`` commits, so the owner's pinned snapshot is now stale.
+    4. Only then is the gate released.
+    """
+    async with asyncio.TaskGroup() as tasks:
+        reader = tasks.create_task(read())
+        try:
+            await gate.wait_parked()
+            writer = tasks.create_task(_sqlite_error_name(write))
+            await foreign.execute("UPDATE items SET v = 'foreign' WHERE id = 'foreign'")
+            await foreign.commit()
+        finally:
+            gate.release()
+    return reader.result(), writer.result()
+
+
+@pytest.fixture
+async def open_conn(tmp_path: Path):
+    """Hand out aiosqlite connections that are ALWAYS closed, even when a test fails.
+
+    Teardown-based closing is load-bearing, not tidiness.  A connection whose
+    worker thread is non-daemon blocks interpreter shutdown forever if it is
+    still open when an exception escapes — and during the RED phase of task
+    5560 these tests are *supposed* to fail.  pytest-timeout's thread method
+    ``os._exit()``s the xdist worker, so one hang silently takes that worker's
+    unrelated tests with it at the 300s timeout instead of reporting in
+    seconds.  Belt and braces: connections are opened through
+    :func:`connect_daemon`, the repo convention that marks the worker thread
+    daemon, so even a teardown that is itself skipped cannot wedge exit.
+
+    Its connections skip fsync (``synchronous=OFF``); see
+    :func:`test_open_conn_commits_do_not_wait_on_the_disk`.
+    """
+    conns: list[aiosqlite.Connection] = []
+
+    async def _open(db_path: Path) -> aiosqlite.Connection:
+        conn = await connect_daemon(str(db_path))
+        conns.append(conn)
+        conn.row_factory = aiosqlite.Row
+        await apply_wal_pragmas(conn, busy_timeout_ms=5000)
+        # Rationale: test_open_conn_commits_do_not_wait_on_the_disk
+        await conn.execute('PRAGMA synchronous=OFF')
+        return conn
+
+    try:
+        yield _open
+    finally:
+        for conn in conns:
+            with suppress(Exception):
+                await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_open_conn_commits_do_not_wait_on_the_disk(tmp_path, open_conn):
+    """open_conn hands out connections running with PRAGMA synchronous=OFF.
+
+    Tests built on open_conn bound their units with wall-clock hang guards
+    (asyncio.wait_for, _GATE_HANG_GUARD_SECS).  Under
+    synchronous=FULL every write unit's COMMIT and every TRUNCATE checkpoint
+    is an fsync, whose latency is set by whatever else is writing to the host
+    disk, not by the code under test.  That is how a 10s guard in
+    TestAtomicConnectionCheckpoint fired with the write unit still in its
+    commit (task 8719).  No test here kills the process, so none needs
+    power-loss durability, and the lock and transaction semantics under test
+    do not depend on synchronous.
+    """
+    conn = await open_conn(tmp_path / 'sync.db')
+    async with conn.execute('PRAGMA synchronous') as cur:
+        row = await cur.fetchone()
+    assert row is not None and row[0] == 0, (
+        f'open_conn hands out PRAGMA synchronous={None if row is None else row[0]}, expected 0 (OFF): '
+        'every commit and TRUNCATE checkpoint would wait on host-disk fsync '
+        "latency inside this module's wall-clock hang guards"
+    )
+
+
+@pytest.mark.asyncio
+class TestAtomicConnectionReads:
+    """read_all/read_one materialise rows in ONE queued worker-thread hop."""
+
+    async def test_read_all_returns_a_materialised_list_of_rows(self, tmp_path, open_conn):
+        """read_all returns a real list of aiosqlite.Row honouring the connection's row_factory."""
+        conn = await open_conn(tmp_path / 'reads.db')
+        await conn.execute('CREATE TABLE t (id TEXT PRIMARY KEY, v TEXT)')
+        await conn.executemany('INSERT INTO t VALUES (?, ?)', [('a', '1'), ('b', '2')])
+        await conn.commit()
+        access = AtomicConnection(conn)
+
+        rows = await access.read_all('SELECT id, v FROM t ORDER BY id')
+
+        assert isinstance(rows, list)
+        assert [r['id'] for r in rows] == ['a', 'b']
+        assert rows[0]['v'] == '1'
+
+    async def test_read_one_returns_first_row_or_none(self, tmp_path, open_conn):
+        """read_one gives the first row for a match and None for an empty result set."""
+        conn = await open_conn(tmp_path / 'reads.db')
+        await conn.execute('CREATE TABLE t (id TEXT PRIMARY KEY, v TEXT)')
+        await conn.execute("INSERT INTO t VALUES ('a', '1')")
+        await conn.commit()
+        access = AtomicConnection(conn)
+
+        hit = await access.read_one('SELECT v FROM t WHERE id = ?', ('a',))
+        miss = await access.read_one('SELECT v FROM t WHERE id = ?', ('nope',))
+
+        assert hit is not None
+        assert hit['v'] == '1'
+        assert miss is None
+
+
+@pytest.mark.asyncio
+class TestAtomicConnectionSnapshotPin:
+    """A write queued into a multi-hop read's snapshot window fails at once; one hop does not.
+
+    SQLite pins the read snapshot from the execute hop until the statement
+    completes; a write queued into that gap fails immediately with
+    ``SQLITE_BUSY_SNAPSHOT`` once a DIFFERENT connection to the same file has
+    committed, and ``busy_timeout`` cannot help because the busy handler is
+    never invoked while a transaction is already open.  Both arms CONSTRUCT
+    that collision by parking the read inside ``scan_gate`` rather than racing
+    threads for it, so each arm is a single deterministic run.
+    """
+
+    async def test_read_all_leaves_no_window_for_a_colliding_write(self, tmp_path, open_conn):
+        """One constructed collision raises nothing, and the write lands.
+
+        The read is parked mid-step with its snapshot pinned, a foreign
+        connection commits, and a write unit is issued into that window.
+        This pins the production pairing, the lock and the single hop
+        together: either one alone keeps it green.
+        """
+        owner, foreign, gate = await _open_collision_pair(open_conn, tmp_path / 'scan.db')
+        access = AtomicConnection(owner)
+
+        async def unit_write() -> None:
+            async with access.write() as db:
+                await db.execute(_COLLIDING_UPDATE)
+
+        rows, error = await _collide_with_a_pinned_read(
+            foreign, gate, read=lambda: access.read_all(_GATED_SCAN), write=unit_write
+        )
+
+        assert error is None
+        assert [r['id'] for r in rows] == ['live']
+        landed = await access.read_one("SELECT v FROM items WHERE id = 'live'")
+        assert landed is not None
+        assert landed['v'] == 'owner'
+
+    async def test_read_all_single_hop_survives_a_write_that_bypasses_the_lock(
+        self, tmp_path, open_conn
+    ):
+        """The single hop alone closes the window: a raw write past the lock lands too.
+
+        It issues the control's exact write, so the two arms differ only in
+        the read's shape.  This is the arm that goes red if ``read_all``
+        regresses to execute + fetch.
+        """
+        owner, foreign, gate = await _open_collision_pair(open_conn, tmp_path / 'scan.db')
+        access = AtomicConnection(owner)
+
+        rows, error = await _collide_with_a_pinned_read(
+            foreign,
+            gate,
+            read=lambda: access.read_all(_GATED_SCAN),
+            write=lambda: _raw_colliding_write(owner),
+        )
+
+        assert error is None
+        assert [r['id'] for r in rows] == ['live']
+        landed = await access.read_one("SELECT v FROM items WHERE id = 'live'")
+        assert landed is not None
+        assert landed['v'] == 'owner'
+
+    async def test_legacy_multi_hop_read_still_loses_the_race(self, tmp_path, open_conn):
+        """CONTROL: the replaced shape raises SQLITE_BUSY_SNAPSHOT in the same collision.
+
+        The single-hop arm survives this exact collision, with the same raw
+        write and only the read differing, so the replaced shape losing it
+        proves that arm discriminates rather than passing vacuously.
+        """
+        owner, foreign, gate = await _open_collision_pair(open_conn, tmp_path / 'scan.db')
+
+        async def legacy_read() -> list[aiosqlite.Row]:
+            async with owner.execute(_GATED_SCAN) as cur:
+                return list(await cur.fetchall())
+
+        rows, error = await _collide_with_a_pinned_read(
+            foreign, gate, read=legacy_read, write=lambda: _raw_colliding_write(owner)
+        )
+
+        assert error == 'SQLITE_BUSY_SNAPSHOT'
+        assert [r['id'] for r in rows] == ['live']
+
+
+@pytest.mark.asyncio
+class TestAtomicConnectionWriteUnit:
+    """write() is one atomic unit: it commits on clean exit and rolls back on any escape."""
+
+    @staticmethod
+    async def _one_row_store(open_conn, db_path: Path):
+        conn = await open_conn(db_path)
+        await conn.execute('CREATE TABLE t (id TEXT PRIMARY KEY, v TEXT)')
+        await conn.execute("INSERT INTO t VALUES ('x', '0')")
+        await conn.commit()
+        return conn, AtomicConnection(conn)
+
+    async def test_commits_on_clean_exit(self, tmp_path, open_conn):
+        """Statements issued inside the unit are durable once it exits normally."""
+        _, access = await self._one_row_store(open_conn, tmp_path / 'w.db')
+
+        async with access.write() as db:
+            await db.execute("UPDATE t SET v = 'committed' WHERE id = 'x'")
+
+        row = await access.read_one("SELECT v FROM t WHERE id = 'x'")
+        assert row is not None
+        assert row['v'] == 'committed'
+
+    async def test_rolls_back_and_reraises_on_exception(self, tmp_path, open_conn):
+        """An exception escaping the body discards the unit's statements and propagates."""
+        _, access = await self._one_row_store(open_conn, tmp_path / 'w.db')
+
+        with pytest.raises(ValueError, match='boom'):
+            async with access.write() as db:
+                await db.execute("UPDATE t SET v = 'doomed' WHERE id = 'x'")
+                raise ValueError('boom')
+
+        row = await access.read_one("SELECT v FROM t WHERE id = 'x'")
+        assert row is not None
+        assert row['v'] == '0'
+
+    async def test_rolls_back_on_cancellation(self, tmp_path, open_conn):
+        """Cancellation is a BaseException, and it must roll the unit back too.
+
+        Without this the cancelled unit leaves aiosqlite's implicit transaction
+        open, holding the writer lock for every other coroutine on the
+        connection.
+        """
+        _, access = await self._one_row_store(open_conn, tmp_path / 'w.db')
+
+        async def unit():
+            async with access.write() as db:
+                await db.execute("UPDATE t SET v = 'cancelled' WHERE id = 'x'")
+                await asyncio.sleep(5)
+
+        task = asyncio.create_task(unit())
+        await asyncio.sleep(0.05)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        row = await access.read_one("SELECT v FROM t WHERE id = 'x'")
+        assert row is not None
+        assert row['v'] == '0'
+
+    async def test_a_failing_unit_cannot_discard_another_units_write(self, tmp_path, open_conn):
+        """RC9: rolling back inside the lock keeps the rollback off everyone else's write.
+
+        X updates a row and suspends inside its unit; Y's unit then fails on a
+        duplicate primary key.  Y's rollback is connection-wide, so before this
+        primitive it discarded X's in-flight UPDATE and X's own commit then
+        succeeded silently, losing the write with no error anywhere.
+        """
+        _, access = await self._one_row_store(open_conn, tmp_path / 'rc9.db')
+
+        async def x_unit():
+            async with access.write() as db:
+                await db.execute("UPDATE t SET v = 'X' WHERE id = 'x'")
+                await asyncio.sleep(0.05)
+
+        async def y_unit():
+            with suppress(sqlite3.IntegrityError):
+                async with access.write() as db:
+                    await db.execute("INSERT INTO t VALUES ('x', 'duplicate')")
+
+        await asyncio.gather(x_unit(), y_unit())
+
+        row = await access.read_one("SELECT v FROM t WHERE id = 'x'")
+        assert row is not None
+        assert row['v'] == 'X'
+
+    async def test_legacy_txn_does_discard_another_units_write(self, tmp_path, open_conn):
+        """CONTROL: the connection-wide rollback being replaced loses X's write.
+
+        Measured on this base: the legacy shape leaves the pre-update value,
+        the write unit above leaves X's.  Without this arm the RC9 assertion
+        would not be known to discriminate.
+        """
+        conn = await open_conn(tmp_path / 'rc9-legacy.db')
+        await conn.execute('CREATE TABLE t (id TEXT PRIMARY KEY, v TEXT)')
+        await conn.execute("INSERT INTO t VALUES ('x', '0')")
+        await conn.commit()
+
+        @asynccontextmanager
+        async def legacy_txn():
+            try:
+                yield conn
+                await conn.commit()
+            except BaseException:
+                with suppress(Exception):
+                    await conn.rollback()
+                raise
+
+        async def x_unit():
+            async with legacy_txn() as db:
+                await db.execute("UPDATE t SET v = 'X' WHERE id = 'x'")
+                await asyncio.sleep(0.05)
+
+        async def y_unit():
+            with suppress(sqlite3.IntegrityError):
+                async with legacy_txn() as db:
+                    await db.execute("INSERT INTO t VALUES ('x', 'duplicate')")
+
+        await asyncio.gather(x_unit(), y_unit())
+
+        async with conn.execute("SELECT v FROM t WHERE id = 'x'") as cur:
+            row = await cur.fetchone()
+        assert row is not None
+        assert row['v'] == '0'
+
+
+@pytest.mark.asyncio
+class TestAtomicConnectionNonReentrancy:
+    """Nesting two accesses on one connection is reported, not deadlocked."""
+
+    # read_one delegates to read_all, so the guard names the entry point that
+    # actually took the lock.
+    _GUARD_NAMES = {
+        'read_all': 'read_all',
+        'read_one': 'read_all',
+        'write': 'write',
+        'checkpoint': 'checkpoint',
+    }
+
+    @pytest.mark.parametrize('nested', sorted(_GUARD_NAMES))
+    async def test_nested_access_raises_naming_the_nesting(self, tmp_path, open_conn, nested):
+        """Every entry point raises RuntimeError when called from inside an open unit.
+
+        Wrapped in wait_for so a guard regression fails as a legible
+        TimeoutError instead of blocking on the non-re-entrant lock until the
+        300s pytest timeout kills the whole xdist worker.
+        """
+        conn = await open_conn(tmp_path / 'nest.db')
+        await conn.execute('CREATE TABLE t (id TEXT PRIMARY KEY, v TEXT)')
+        await conn.commit()
+        access = AtomicConnection(conn)
+
+        async def body():
+            async with access.write() as db:
+                await db.execute("INSERT INTO t VALUES ('nested', '1')")
+                if nested == 'read_all':
+                    await access.read_all('SELECT 1')
+                elif nested == 'read_one':
+                    await access.read_one('SELECT 1')
+                elif nested == 'checkpoint':
+                    await access.checkpoint()
+                else:
+                    async with access.write():
+                        pass
+
+        expected = rf'{self._GUARD_NAMES[nested]}\(\).*write\(\)'
+        with pytest.raises(RuntimeError, match=expected):
+            await asyncio.wait_for(body(), timeout=5)
+
+        assert await access.read_one("SELECT v FROM t WHERE id = 'nested'") is None
+
+    async def test_the_guard_does_not_leak_the_lock(self, tmp_path, open_conn):
+        """After a unit aborts on the guard, an unrelated task can still take the lock."""
+        conn = await open_conn(tmp_path / 'nest.db')
+        await conn.execute('CREATE TABLE t (id TEXT PRIMARY KEY, v TEXT)')
+        await conn.commit()
+        access = AtomicConnection(conn)
+
+        async def offender():
+            async with access.write():
+                await access.read_all('SELECT 1')
+
+        with pytest.raises(RuntimeError):
+            await asyncio.wait_for(offender(), timeout=5)
+
+        async def bystander():
+            async with access.write() as db:
+                await db.execute("INSERT INTO t VALUES ('after', '1')")
+
+        await asyncio.wait_for(asyncio.create_task(bystander()), timeout=5)
+
+        row = await access.read_one("SELECT v FROM t WHERE id = 'after'")
+        assert row is not None
+        assert row['v'] == '1'
+
+
+@pytest.mark.asyncio
+class TestAtomicConnectionCheckpoint:
+    """checkpoint() cannot collide with a write unit on the same connection."""
+
+    @staticmethod
+    async def _walled_store(open_conn, db_path: Path):
+        conn = await open_conn(db_path)
+        await conn.execute('CREATE TABLE t (id TEXT PRIMARY KEY, v TEXT)')
+        await conn.commit()
+        return conn
+
+    async def test_checkpoint_returns_a_checkpoint_result(self, tmp_path, open_conn):
+        """The three stores' checkpoint contract is preserved as a CheckpointResult."""
+        conn = await self._walled_store(open_conn, tmp_path / 'ck.db')
+        access = AtomicConnection(conn)
+        async with access.write() as db:
+            await db.execute("INSERT INTO t VALUES ('a', '1')")
+
+        result = await access.checkpoint()
+
+        assert isinstance(result, CheckpointResult)
+        assert result.busy == 0
+
+    async def test_checkpoint_and_write_unit_never_collide(self, tmp_path, open_conn):
+        """20 gathered (write unit, checkpoint) pairs raise on NEITHER side."""
+        conn = await self._walled_store(open_conn, tmp_path / 'ck.db')
+        access = AtomicConnection(conn)
+
+        async def unit(i: int):
+            async with access.write() as db:
+                await db.execute('INSERT INTO t VALUES (?, ?)', (f'r{i}', str(i)))
+
+        for i in range(20):
+            await asyncio.wait_for(
+                asyncio.gather(unit(i), access.checkpoint()), timeout=10
+            )
+
+        rows = await access.read_all('SELECT id FROM t')
+        assert len(rows) == 20
+
+    async def test_legacy_checkpoint_still_collides_with_a_concurrent_write(
+        self, tmp_path, open_conn
+    ):
+        """CONTROL: the shape being replaced raises SQLITE_LOCKED — measured 20/20 here.
+
+        This is the production log line ``checkpoint recon_journal failed:
+        database table is locked`` reproduced: the pragma's execute hop is
+        queued between another coroutine's INSERT and its commit, so it runs
+        while that connection's write transaction is open.  wait_for is
+        deliberate — the legacy failure can also present as a block-forever,
+        and a TimeoutError is legible where a hang is not.
+        """
+        conn = await self._walled_store(open_conn, tmp_path / 'ck-legacy.db')
+
+        async def legacy_write(i: int):
+            await conn.execute('INSERT INTO t VALUES (?, ?)', (f'r{i}', str(i)))
+            await conn.commit()
+
+        async def legacy_checkpoint():
+            async with conn.execute('PRAGMA wal_checkpoint(TRUNCATE)') as cur:
+                return await cur.fetchone()
+
+        failures: list[str | None] = []
+        for i in range(20):
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(legacy_write(i), legacy_checkpoint()), timeout=10
+                )
+            except sqlite3.OperationalError as exc:
+                failures.append(getattr(exc, 'sqlite_errorname', None))
+            except TimeoutError:
+                failures.append('TIMEOUT')
+            with suppress(Exception):
+                await conn.rollback()
+
+        assert 'SQLITE_LOCKED' in failures
+
+
+@pytest.mark.asyncio
+class TestAtomicConnectionClose:
+    """close() truncates the WAL and never cuts off a unit that is already running."""
+
+    async def test_close_checkpoints_then_closes(self, tmp_path, open_conn):
+        """The WAL is truncated and the wrapped connection is closed."""
+        db_path = tmp_path / 'close.db'
+        wal_path = tmp_path / 'close.db-wal'
+        conn = await open_conn(db_path)
+        await conn.execute('CREATE TABLE t (id TEXT PRIMARY KEY, v TEXT)')
+        await conn.executemany(
+            'INSERT INTO t VALUES (?, ?)', [(f'r{i}', str(i)) for i in range(50)]
+        )
+        await conn.commit()
+        assert wal_path.stat().st_size > 0
+        access = AtomicConnection(conn)
+
+        await access.close()
+
+        assert not wal_path.exists() or wal_path.stat().st_size <= 32
+        with pytest.raises(ValueError):
+            await conn.execute('SELECT 1')
+
+    async def test_close_waits_for_an_in_flight_write_unit(self, tmp_path, open_conn):
+        """A unit already holding the lock finishes and commits before close lands."""
+        db_path = tmp_path / 'close-race.db'
+        conn = await open_conn(db_path)
+        await conn.execute('CREATE TABLE t (id TEXT PRIMARY KEY, v TEXT)')
+        await conn.commit()
+        access = AtomicConnection(conn)
+
+        async def unit():
+            async with access.write() as db:
+                await db.execute("INSERT INTO t VALUES ('slow', '1')")
+                await asyncio.sleep(0.1)
+
+        task = asyncio.create_task(unit())
+        await asyncio.sleep(0.01)
+        await access.close()
+        await task
+
+        verifier = await open_conn(db_path)
+        async with verifier.execute("SELECT v FROM t WHERE id = 'slow'") as cur:
+            row = await cur.fetchone()
+        assert row is not None
+        assert row['v'] == '1'
+
+    @staticmethod
+    async def _cancel_close_in_its_checkpoint(access: AtomicConnection, gate: _WorkerGate) -> None:
+        closing = asyncio.create_task(access.close())
+        await gate.wait_parked()
+        closing.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await closing
+
+    async def test_a_close_cancelled_in_its_checkpoint_still_closes_the_connection(
+        self, tmp_path, open_conn
+    ):
+        """A caller's close budget (MemoryService._safe_close) that runs out during
+        the WAL checkpoint must not leak the connection; task 7712."""
+        conn = await open_conn(tmp_path / 'cut.db')
+        access = AtomicConnection(conn)
+        worker = _worker_thread(conn)
+        gate = _WorkerGate(asyncio.get_running_loop())
+        await conn.set_trace_callback(gate)
+
+        try:
+            await self._cancel_close_in_its_checkpoint(access, gate)
+        finally:
+            gate.release()
+
+        with pytest.raises(ValueError):
+            await conn.execute('SELECT 1')
+        await asyncio.to_thread(worker.join, _GATE_HANG_GUARD_SECS)
+        assert not worker.is_alive()
+
+    async def test_a_close_after_a_cancelled_close_returns_at_once(self, tmp_path, open_conn):
+        """Re-entering aiosqlite's close() after stop() queues a second stop
+        sentinel that the exiting worker never serves, so it would hang."""
+        conn = await open_conn(tmp_path / 'recut.db')
+        access = AtomicConnection(conn)
+        worker = _worker_thread(conn)
+        gate = _WorkerGate(asyncio.get_running_loop())
+        await conn.set_trace_callback(gate)
+
+        try:
+            await self._cancel_close_in_its_checkpoint(access, gate)
+            await asyncio.wait_for(access.close(), timeout=_GATE_HANG_GUARD_SECS)
+        finally:
+            gate.release()
+
+        await asyncio.to_thread(worker.join, _GATE_HANG_GUARD_SECS)
+        assert not worker.is_alive()
+
+    async def test_a_close_cancelled_while_queued_on_the_lock_leaves_the_store_closable(
+        self, tmp_path, open_conn
+    ):
+        """A close cancelled before it takes the lock never started, so it must
+        not mark the store closed: a later close still shuts the connection."""
+        conn = await open_conn(tmp_path / 'queued.db')
+        access = AtomicConnection(conn)
+        worker = _worker_thread(conn)
+        unit_holds_the_lock = asyncio.Event()
+        end_the_unit = asyncio.Event()
+
+        async def unit() -> None:
+            async with access.write():
+                unit_holds_the_lock.set()
+                await end_the_unit.wait()
+
+        writing = asyncio.create_task(unit())
+        try:
+            await unit_holds_the_lock.wait()
+            closing = asyncio.create_task(access.close())
+            await asyncio.sleep(0)
+            closing.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await closing
+        finally:
+            end_the_unit.set()
+            await writing
+
+        await asyncio.wait_for(access.close(), timeout=_GATE_HANG_GUARD_SECS)
+
+        with pytest.raises(ValueError):
+            await conn.execute('SELECT 1')
+        await asyncio.to_thread(worker.join, _GATE_HANG_GUARD_SECS)
+        assert not worker.is_alive()

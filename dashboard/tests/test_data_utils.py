@@ -53,7 +53,7 @@ class TestParseUtc:
         from dashboard.data.utils import parse_utc
 
         with pytest.raises(TypeError):
-            parse_utc(None)  # type: ignore[arg-type]
+            parse_utc(None)
 
     def test_none_raises_type_error_with_explicit_message(self):
         """TypeError raised for None should have the explicit message 'timestamp is None'."""
@@ -62,7 +62,7 @@ class TestParseUtc:
         from dashboard.data.utils import parse_utc
 
         with pytest.raises(TypeError, match='timestamp is None'):
-            parse_utc(None)  # type: ignore[arg-type]
+            parse_utc(None)
 
     def test_docstring_describes_none_raises_type_error_explicitly(self):
         """parse_utc docstring must document None raising TypeError explicitly."""
@@ -150,6 +150,47 @@ class TestSafeGatherResult:
 
         with pytest.raises(SystemExit):
             safe_gather_result(SystemExit(0), 'default', 'myop')
+
+    def test_an_empty_message_exception_still_names_its_type(self, caplog):
+        """A bare asyncio expiry stringifies to '' — the warning must still name TimeoutError."""
+        import logging
+
+        from dashboard.data.utils import safe_gather_result
+
+        with caplog.at_level(logging.WARNING, logger='dashboard.data.utils'):
+            safe_gather_result(TimeoutError(), {'offline': True}, 'curator/state')
+
+        records = [r for r in caplog.records if r.name == 'dashboard.data.utils']
+        assert len(records) == 1
+        assert records[0].getMessage() == 'Error gathering curator/state: TimeoutError'
+
+    def test_pool_timeout_is_named(self, caplog):
+        """httpcore raises PoolTimeout with an empty message; the warning must name the type."""
+        import logging
+
+        import httpx
+
+        from dashboard.data.utils import safe_gather_result
+
+        with caplog.at_level(logging.WARNING, logger='dashboard.data.utils'):
+            safe_gather_result(httpx.PoolTimeout(''), [], 'curator/state')
+
+        records = [r for r in caplog.records if r.name == 'dashboard.data.utils']
+        assert len(records) == 1
+        assert 'PoolTimeout' in records[0].getMessage()
+
+    def test_a_messaged_exception_renders_type_and_message(self, caplog):
+        """An exception with a message renders as 'Type: message'."""
+        import logging
+
+        from dashboard.data.utils import safe_gather_result
+
+        with caplog.at_level(logging.WARNING, logger='dashboard.data.utils'):
+            safe_gather_result(RuntimeError('boom'), 'd', 'myop')
+
+        records = [r for r in caplog.records if r.name == 'dashboard.data.utils']
+        assert len(records) == 1
+        assert 'RuntimeError: boom' in records[0].getMessage()
 
 
 class TestResolveNow:

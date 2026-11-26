@@ -1,19 +1,40 @@
 """Tests for the LLM-as-judge module (judge.py)."""
 
+import logging
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _invocation_ledger import invocation_rows
+from _invocation_tokens import LEDGER_TOKENS, agent_result_with_tokens
+from _sdk_client_stubs import sdk_client_double
+from shared.cli_invoke import AgentResult
+from shared.cost_store import CostStore
+from shared.phantom_verdict import (
+    UNPARSEABLE_ISSUE_PREFIX,
+    UNPARSEABLE_VERDICT_CODE,
+    is_phantom_verdict_row,
+)
 from shared.testing import make_gate_mock
 
 from fused_memory.config.schema import ReconciliationConfig
 from fused_memory.models.reconciliation import (
     JudgeVerdict,
+    ReconciliationRun,
+    RunStatus,
+    RunType,
     VerdictAction,
     VerdictSeverity,
 )
-from fused_memory.reconciliation.judge import Judge
+from fused_memory.reconciliation import judge as judge_module
+from fused_memory.reconciliation.judge import (
+    Judge,
+    JudgeInfraError,
+    NoVerdict,
+    NoVerdictReason,
+    is_phantom_verdict,
+)
 from fused_memory.reconciliation.prompts.judge import JUDGE_SYSTEM_PROMPT
 
 
@@ -23,7 +44,6 @@ def _make_judge_config(**overrides) -> ReconciliationConfig:
         'judge_llm_model': 'claude-3-5-sonnet-20241022',
         'agent_max_steps': 10,
         'agent_max_tokens': 4096,
-        'max_mutations_per_stage': 5,
     }
     defaults.update(overrides)
     return ReconciliationConfig(**defaults)
@@ -82,12 +102,24 @@ class FakeJudgeOpenAIResponse:
     choices: list = field(default_factory=list)
 
 
+def _journal_double() -> MagicMock:
+    """A MagicMock journal whose judge-invocation write succeeds."""
+    journal = MagicMock()
+    journal.record_judge_invocation = AsyncMock(return_value=None)
+    return journal
+
+
+@pytest.fixture(autouse=True)
+def _claude_config_dir(tmp_path, monkeypatch):
+    """Keep the judge's transcript read off the real ~/.claude."""
+    monkeypatch.setenv('CLAUDE_CONFIG_DIR', str(tmp_path / 'claude-config'))
+
+
 @pytest.fixture
 def mock_journal():
     """A mock ReconciliationJournal that returns empty data."""
-    journal = MagicMock()
+    journal = _journal_double()
     journal.get_run = AsyncMock(return_value=None)
-    journal.get_entries = AsyncMock(return_value=[])
     journal.get_recent_verdicts = AsyncMock(return_value=[])
     journal.add_verdict = AsyncMock(return_value=None)
     journal.get_halt_states = AsyncMock(return_value=[])
@@ -237,11 +269,11 @@ async def test_judge_call_llm_anthropic_normal(mock_journal):
 
     mock_messages = MagicMock()
     mock_messages.create = AsyncMock(return_value=fake_response)
-    mock_client = MagicMock()
+    mock_client = sdk_client_double()
     mock_client.messages = mock_messages
 
     with patch('anthropic.AsyncAnthropic', return_value=mock_client):
-        result = await judge._call_llm('Evaluate this run.')
+        result = await judge._call_llm('Evaluate this run.', run_id='run-test')
 
     assert result == verdict_text
 
@@ -266,11 +298,11 @@ async def test_judge_call_llm_anthropic_no_text_blocks(mock_journal):
 
     mock_messages = MagicMock()
     mock_messages.create = AsyncMock(return_value=fake_response)
-    mock_client = MagicMock()
+    mock_client = sdk_client_double()
     mock_client.messages = mock_messages
 
     with patch('anthropic.AsyncAnthropic', return_value=mock_client):
-        result = await judge._call_llm('Evaluate this run.')
+        result = await judge._call_llm('Evaluate this run.', run_id='run-test')
 
     assert result == ''
 
@@ -292,11 +324,11 @@ async def test_judge_call_llm_anthropic_mixed_content(mock_journal):
 
     mock_messages = MagicMock()
     mock_messages.create = AsyncMock(return_value=fake_response)
-    mock_client = MagicMock()
+    mock_client = sdk_client_double()
     mock_client.messages = mock_messages
 
     with patch('anthropic.AsyncAnthropic', return_value=mock_client):
-        result = await judge._call_llm('Evaluate this.')
+        result = await judge._call_llm('Evaluate this.', run_id='run-test')
 
     # Only first text block's text is returned
     assert result == 'First text block'
@@ -327,11 +359,11 @@ async def test_judge_call_llm_openai_normal(mock_journal):
     mock_completions.create = AsyncMock(return_value=fake_response)
     mock_chat = MagicMock()
     mock_chat.completions = mock_completions
-    mock_client = MagicMock()
+    mock_client = sdk_client_double()
     mock_client.chat = mock_chat
 
     with patch('openai.AsyncOpenAI', return_value=mock_client):
-        result = await judge._call_llm('Evaluate this run.')
+        result = await judge._call_llm('Evaluate this run.', run_id='run-test')
 
     assert result == verdict_text
 
@@ -395,7 +427,7 @@ async def test_build_review_prompt_handles_error_dict_entries(mock_journal):
     )
 
     # Should NOT raise AttributeError
-    prompt = judge._build_review_prompt(run, entries=[], recent_verdicts=[])
+    prompt = judge._build_review_prompt(run, recent_verdicts=[])
 
     # The prompt should contain data from the valid stage report
     assert 'memory_consolidator' in prompt
@@ -454,13 +486,62 @@ async def test_build_review_prompt_excludes_recent_verdicts(mock_journal):
     ]
 
     prompt = judge._build_review_prompt(
-        run, entries=[], recent_verdicts=prior_verdicts,
+        run, recent_verdicts=prior_verdicts,
     )
 
     assert 'Recent Judge Verdicts' not in prompt
     assert 'trend context' not in prompt
     for v in prior_verdicts:
         assert v.run_id not in prompt
+
+
+@pytest.mark.asyncio
+async def test_build_review_prompt_renders_mcp_actions_without_a_journal_section(mock_journal):
+    """The run's mutation audit reaches the judge as MCP Actions only."""
+
+    from fused_memory.models.reconciliation import (
+        ReconciliationRun,
+        RunStatus,
+        RunType,
+        StageId,
+        StageReport,
+    )
+
+    config = _make_judge_config()
+    judge = Judge(config=config, journal=mock_journal)
+    now = datetime.now(UTC)
+    run = ReconciliationRun(
+        id='run-mcp-actions',
+        project_id='test-project',
+        run_type=RunType.full,
+        trigger_reason='test',
+        started_at=now,
+        events_processed=0,
+        status=RunStatus.completed,
+        stage_reports={
+            'memory_consolidator': StageReport(
+                stage=StageId.memory_consolidator,
+                started_at=now,
+                completed_at=now,
+                stats={'memories_added': 1},
+            ),
+        },
+    )
+
+    prompt = judge._build_review_prompt(
+        run,
+        recent_verdicts=[],
+        combined_actions=[{
+            'operation': 'add_memory',
+            'target': 'mem-1',
+            'source': 'run_actions',
+            'created_at': '2026-09-25T00:00:00+00:00',
+        }],
+    )
+
+    assert '### MCP Actions (1 total)' in prompt
+    assert 'mem-1' in prompt
+    assert 'Journal Entries' not in prompt
 
 
 @pytest.mark.asyncio
@@ -615,7 +696,7 @@ async def test_review_run_unparseable_response_halts_when_enabled(mock_journal):
     ):
         verdict = await judge.review_run('run-parse-halt')
 
-    assert verdict is not None
+    assert isinstance(verdict, JudgeVerdict)
     assert verdict.severity == VerdictSeverity.serious
     assert verdict.action_taken == VerdictAction.halt
     assert judge.is_halted('test-project-parse-halt')
@@ -655,7 +736,7 @@ async def test_review_run_unparseable_response_no_halt_when_disabled(mock_journa
     ):
         verdict = await judge.review_run('run-parse-no-halt')
 
-    assert verdict is not None
+    assert isinstance(verdict, JudgeVerdict)
     assert verdict.severity == VerdictSeverity.serious
     assert verdict.action_taken == VerdictAction.none
     assert not judge.is_halted('test-project-parse-no-halt')
@@ -695,7 +776,7 @@ async def test_review_run_empty_response_does_not_halt_even_when_enabled(mock_jo
     with patch.object(judge, '_call_llm', AsyncMock(return_value='')):
         verdict = await judge.review_run('run-empty-no-halt')
 
-    assert verdict is not None
+    assert isinstance(verdict, JudgeVerdict)
     assert verdict.severity == VerdictSeverity.minor
     assert verdict.action_taken == VerdictAction.none
     assert not judge.is_halted('test-project-empty-no-halt')
@@ -720,31 +801,402 @@ async def test_judge_call_llm_openai_none_content(mock_journal):
     mock_completions.create = AsyncMock(return_value=fake_response)
     mock_chat = MagicMock()
     mock_chat.completions = mock_completions
-    mock_client = MagicMock()
+    mock_client = sdk_client_double()
     mock_client.chat = mock_chat
 
     with patch('openai.AsyncOpenAI', return_value=mock_client):
-        result = await judge._call_llm('Evaluate this run.')
+        result = await judge._call_llm('Evaluate this run.', run_id='run-test')
 
     assert result == ''
+
+
+class TestJudgeCallLlmReleasesClient:
+    @pytest.mark.asyncio
+    async def test_the_anthropic_client_is_released(self, mock_journal):
+        judge = Judge(config=_make_judge_config(judge_llm_provider='anthropic'), journal=mock_journal)
+        client = sdk_client_double()
+        client.messages.create = AsyncMock(
+            return_value=FakeAnthropicResponse(content=[FakeAnthropicTextBlock(text='ok')]),
+        )
+
+        with patch('anthropic.AsyncAnthropic', return_value=client):
+            await judge._call_llm('p', run_id='run-test')
+
+        client.__aexit__.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_the_openai_client_is_released(self, mock_journal):
+        judge = Judge(
+            config=_make_judge_config(judge_llm_provider='openai', judge_llm_model='gpt-4o'),
+            journal=mock_journal,
+        )
+        client = sdk_client_double()
+        client.chat.completions.create = AsyncMock(
+            return_value=FakeJudgeOpenAIResponse(
+                choices=[FakeJudgeOpenAIChoice(message=FakeJudgeOpenAIMessage(content='ok'))],
+            ),
+        )
+
+        with patch('openai.AsyncOpenAI', return_value=client):
+            await judge._call_llm('p', run_id='run-test')
+
+        client.__aexit__.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_the_client_is_released_when_the_call_fails(self, mock_journal):
+        judge = Judge(config=_make_judge_config(judge_llm_provider='anthropic'), journal=mock_journal)
+        client = sdk_client_double()
+        client.messages.create = AsyncMock(side_effect=RuntimeError('boom'))
+
+        with (
+            patch('anthropic.AsyncAnthropic', return_value=client),
+            pytest.raises(RuntimeError, match='boom'),
+        ):
+            await judge._call_llm('p', run_id='run-test')
+
+        client.__aexit__.assert_awaited_once()
+
+
+# --- is_phantom_verdict tests ---
+
+
+def _legacy_phantom_finding() -> dict:
+    """A fresh single-finding phantom payload in the pre-2947 unmarked
+    shape: severity=serious, no 'code' key at all — the only signal
+    is_phantom_verdict has for a row written before task 2947's structured
+    marker existed. One spelling, reused by every test that needs this
+    shape so a future change to the fabricated payload needs one edit, not
+    one per call site."""
+    return {
+        'issue': (
+            'Judge response could not be parsed: Expecting value: '
+            'line 1 column 1 (char 0)'
+        ),
+        'severity': 'serious',
+        'recommendation': (
+            'This verdict was not a real review — the judge output was '
+            'unparseable. Investigate the judge LLM/CLI output before '
+            'trusting subsequent verdicts.'
+        ),
+    }
+
+
+def _marked_phantom_finding() -> dict:
+    """A fresh single-finding phantom payload in the post-2947
+    structured-marker shape: the legacy shape plus the 'code':
+    'unparseable_judge_response' marker, mirroring how _parse_verdict
+    actually derives one from the other in production."""
+    return {**_legacy_phantom_finding(), 'code': 'unparseable_judge_response'}
+
+
+class TestIsPhantomVerdict:
+    """is_phantom_verdict(verdict) — True iff *verdict* is a fabricated
+    stand-in for a review that never happened (built by
+    Judge._parse_verdict's except-block fallback when the judge output
+    could not be parsed), as opposed to a genuine judge finding.
+
+    Two shapes must be recognised: the structured-marker shape
+    (``code == 'unparseable_judge_response'``, written for every run after
+    task 2947 landed) and the legacy unmarked shape (pre-2947 rows, which
+    carry no ``code`` key at all — identified instead by severity=serious +
+    exactly one finding + an ``issue`` starting with the fixed parse-failure
+    prefix).
+    """
+
+    def test_marked_unparseable_finding_is_phantom(self):
+        """Real d741ffe3 / 33581299 / ad861d89 / c7d84e9f shape: severity=serious,
+        one finding carrying the structured code marker."""
+        verdict = JudgeVerdict(
+            run_id='run-marked',
+            reviewed_at=datetime.now(UTC),
+            severity=VerdictSeverity.serious,
+            findings=[_marked_phantom_finding()],
+        )
+        assert is_phantom_verdict(verdict) is True
+
+    def test_genuine_serious_with_five_findings_and_no_code_is_not_phantom(self):
+        """Real bc9459b8 shape: severity=serious, five substantive findings,
+        none carrying the code marker."""
+        verdict = JudgeVerdict(
+            run_id='run-genuine',
+            reviewed_at=datetime.now(UTC),
+            severity=VerdictSeverity.serious,
+            findings=[
+                {
+                    'issue': f'Substantive content issue #{i}',
+                    'severity': 'serious',
+                    'recommendation': f'Fix issue #{i}',
+                }
+                for i in range(5)
+            ],
+        )
+        assert is_phantom_verdict(verdict) is False
+
+    def test_empty_findings_is_not_phantom(self):
+        verdict = JudgeVerdict(
+            run_id='run-empty-findings',
+            reviewed_at=datetime.now(UTC),
+            severity=VerdictSeverity.serious,
+            findings=[],
+        )
+        assert is_phantom_verdict(verdict) is False
+
+    def test_ordinary_ok_verdict_is_not_phantom(self):
+        verdict = JudgeVerdict(
+            run_id='run-ok',
+            reviewed_at=datetime.now(UTC),
+            severity=VerdictSeverity.ok,
+            findings=[],
+        )
+        assert is_phantom_verdict(verdict) is False
+
+    def test_legacy_unmarked_shape_e87d8e4a_is_phantom(self):
+        """Real e87d8e4a (2026-07-20) shape: pre-2947, no code key at all."""
+        verdict = JudgeVerdict(
+            run_id='e87d8e4a',
+            reviewed_at=datetime(2026, 7, 20, tzinfo=UTC),
+            severity=VerdictSeverity.serious,
+            findings=[_legacy_phantom_finding()],
+        )
+        assert is_phantom_verdict(verdict) is True
+
+    def test_legacy_unmarked_shape_09d14a75_is_phantom(self):
+        """Real 09d14a75 (2026-07-22) shape: pre-2947, no code key at all."""
+        verdict = JudgeVerdict(
+            run_id='09d14a75',
+            reviewed_at=datetime(2026, 7, 22, tzinfo=UTC),
+            severity=VerdictSeverity.serious,
+            findings=[_legacy_phantom_finding()],
+        )
+        assert is_phantom_verdict(verdict) is True
+
+    def test_legacy_shape_with_moderate_severity_is_not_phantom(self):
+        """The fabrication path only ever emits severity=serious — a
+        moderate verdict carrying the same single finding must not match,
+        or the filter could start dropping genuine moderate evidence."""
+        verdict = JudgeVerdict(
+            run_id='run-moderate-lookalike',
+            reviewed_at=datetime.now(UTC),
+            severity=VerdictSeverity.moderate,
+            findings=[_legacy_phantom_finding()],
+        )
+        assert is_phantom_verdict(verdict) is False
+
+    def test_legacy_shape_with_two_findings_is_not_phantom(self):
+        """Two findings, only one of which carries the parse-failure issue
+        text, must not match — the single-finding conjunct is what
+        separates this from the genuine five-finding bc9459b8 row."""
+        verdict = JudgeVerdict(
+            run_id='run-two-findings',
+            reviewed_at=datetime.now(UTC),
+            severity=VerdictSeverity.serious,
+            findings=[
+                _legacy_phantom_finding(),
+                {
+                    'issue': 'A second, genuine content finding',
+                    'severity': 'serious',
+                    'recommendation': 'Fix the second issue',
+                },
+            ],
+        )
+        assert is_phantom_verdict(verdict) is False
+
+    def test_legacy_shape_unrelated_prose_mentioning_parsing_is_not_phantom(self):
+        """A single serious finding whose issue text merely mentions parsing
+        somewhere in unrelated prose — but does not START WITH the
+        parse-failure prefix — must not match. Pins that the check is a
+        startswith, not a substring containment test."""
+        verdict = JudgeVerdict(
+            run_id='run-unrelated-prose',
+            reviewed_at=datetime.now(UTC),
+            severity=VerdictSeverity.serious,
+            findings=[{
+                'issue': (
+                    'Note: the historical "Judge response could not be parsed" '
+                    'error seen in an earlier run was traced to a logging '
+                    'artifact, not a genuine content problem.'
+                ),
+                'severity': 'serious',
+                'recommendation': 'No action needed — logging bug, already fixed',
+            }],
+        )
+        assert is_phantom_verdict(verdict) is False
+
+
+class TestPhantomRuleIsTheSharedRule:
+    """Drift guard: judge.py's phantom detection must BE the shared rule
+    (``shared.phantom_verdict``), not a second copy of it.
+
+    Task 3287 hoisted the rule to ``shared`` because its two new consumers
+    cannot import judge.py — ``journal.py`` would be a circular import
+    (judge.py already imports journal at module scope) and the ``dashboard``
+    package deliberately does not depend on ``fused-memory`` at all.  The
+    hoist is only worth anything if judge.py DELEGATES rather than keeping a
+    parallel implementation, so that is what these cases pin.
+
+    The class above (``TestIsPhantomVerdict``, task 3070) stays untouched and
+    remains the behavioural net: together, "the behaviour is still right" and
+    "the behaviour comes from one place" are the two halves of the contract.
+    """
+
+    def test_marker_constants_match_the_shared_spellings(self):
+        """The two module-level constants carry the shared spellings.
+
+        EQUALITY, not identity.  The `is`-based assertions this replaces made
+        the suite's pass/fail depend on CPython constant folding: one of them
+        (`'unparseable_judge_response'`, identifier-shaped, therefore interned
+        at compile time) was a no-op that passed even before the hoist, and the
+        other was a genuine check only by accident of the same interning rules.
+        Equality is what the production code actually needs to be true, and it
+        holds under any interpreter.
+
+        Delegation itself is pinned by the two cases below — a spy that proves
+        the call happens, and an equivalence corpus that proves the answers
+        never diverge — neither of which depends on object identity.
+        """
+        assert judge_module._UNPARSEABLE_ISSUE_PREFIX == UNPARSEABLE_ISSUE_PREFIX
+        assert judge_module._UNPARSEABLE_VERDICT_CODE == UNPARSEABLE_VERDICT_CODE
+
+    def test_is_phantom_verdict_calls_the_shared_predicate(self, monkeypatch):
+        """`judge.is_phantom_verdict` DELEGATES; it does not re-implement.
+
+        Patches the name judge.py bound at import (`judge_module.
+        is_phantom_verdict_row`) with a spy that returns a value the real rule
+        never would for these inputs — an ordinary `ok` verdict with no
+        findings.  If judge.py grew a parallel implementation, it would return
+        False and this goes red.
+
+        This is the assertion the deleted `is`-identity checks were reaching
+        for, without depending on how the interpreter interns str literals.
+        """
+        calls = []
+
+        def _spy(severity, findings):
+            calls.append((severity, findings))
+            return True
+
+        monkeypatch.setattr(judge_module, 'is_phantom_verdict_row', _spy)
+        verdict = JudgeVerdict(
+            run_id='run-delegation',
+            reviewed_at=datetime.now(UTC),
+            severity=VerdictSeverity.ok,
+            findings=[],
+        )
+
+        assert is_phantom_verdict(verdict) is True
+        assert calls == [(VerdictSeverity.ok, [])]
+
+    @pytest.mark.parametrize(
+        ('severity', 'findings'),
+        [
+            pytest.param(
+                VerdictSeverity.serious,
+                [_marked_phantom_finding()],
+                id='marked-phantom-serious',
+            ),
+            pytest.param(
+                VerdictSeverity.moderate,
+                [_marked_phantom_finding()],
+                id='marked-phantom-moderate-severity-agnostic',
+            ),
+            pytest.param(
+                VerdictSeverity.serious,
+                [_legacy_phantom_finding()],
+                id='legacy-unmarked-phantom',
+            ),
+            pytest.param(
+                VerdictSeverity.moderate,
+                [_legacy_phantom_finding()],
+                id='legacy-shape-at-moderate',
+            ),
+            pytest.param(
+                VerdictSeverity.serious,
+                [
+                    {
+                        'issue': f'Substantive content issue #{i}',
+                        'severity': 'serious',
+                        'recommendation': f'Fix issue #{i}',
+                    }
+                    for i in range(5)
+                ],
+                id='genuine-five-finding-serious-bc9459b8',
+            ),
+            pytest.param(
+                VerdictSeverity.serious,
+                [_legacy_phantom_finding(), {'issue': 'A second, genuine finding'}],
+                id='two-findings-not-phantom',
+            ),
+            pytest.param(
+                VerdictSeverity.serious,
+                [
+                    {
+                        'issue': (
+                            'Note: the historical "Judge response could not be '
+                            'parsed" error was a logging artifact.'
+                        )
+                    }
+                ],
+                id='prefix-mentioned-mid-string',
+            ),
+            pytest.param(VerdictSeverity.serious, [], id='empty-findings'),
+            pytest.param(VerdictSeverity.ok, [], id='ordinary-ok'),
+            pytest.param(
+                VerdictSeverity.minor,
+                [{'issue': 'minor drift in entity summary wording'}],
+                id='ordinary-minor',
+            ),
+            pytest.param(VerdictSeverity.serious, [{}], id='finding-without-issue'),
+            pytest.param(
+                VerdictSeverity.serious, [{'issue': None}], id='issue-is-none'
+            ),
+        ],
+    )
+    def test_model_api_agrees_with_shared_row_predicate(self, severity, findings):
+        """The model-typed API and the row-level primitive must never disagree.
+
+        This is the guard that actually catches divergence: it compares the
+        two implementations' ANSWERS across every shape task 3070 and task
+        3287 care about, so a judge.py edit that changes a conjunct — or a
+        constant, interned or not — turns this red even though the public
+        signature is unchanged.
+        """
+        verdict = JudgeVerdict(
+            run_id='run-equivalence',
+            reviewed_at=datetime.now(UTC),
+            severity=severity,
+            findings=findings,
+        )
+        assert is_phantom_verdict(verdict) is is_phantom_verdict_row(severity, findings)
 
 
 # --- Error trend detection tests ---
 
 
-def _make_verdicts(severities: list[str], *, spacing_seconds: float = 60.0):
+def _make_verdicts(
+    severities: list[str],
+    *,
+    spacing_seconds: float = 60.0,
+    findings_by_index: dict[int, list[dict]] | None = None,
+):
     """Build a list of JudgeVerdict objects, oldest first.
 
     Successive verdicts are spaced ``spacing_seconds`` apart so tests exercising
     time-windowed logic have a well-defined ordering.
+
+    ``findings_by_index`` optionally overrides the findings list of specific
+    verdicts by position (e.g. to build a phantom verdict inline). Existing
+    call sites that omit it are unaffected: every verdict still defaults to
+    findings=[], exactly as before this parameter existed.
     """
     from datetime import timedelta as _td
+    findings_by_index = findings_by_index or {}
     base = datetime.now(tz=UTC)
     return [
         JudgeVerdict(
             run_id=f'run-{i}',
             reviewed_at=base + _td(seconds=i * spacing_seconds),
             severity=VerdictSeverity(s),
+            findings=findings_by_index.get(i, []),
         )
         for i, s in enumerate(severities)
     ]
@@ -872,6 +1324,332 @@ async def test_error_trend_outside_window_no_halt(mock_journal):
     await judge._check_error_trends('proj', verdicts)
 
     assert not judge.is_halted('proj')
+
+
+# --- Error trend detection: phantom-verdict exclusion (task 3070) ---
+
+
+@pytest.mark.asyncio
+async def test_error_trend_phantom_serious_alone_does_not_halt(mock_journal):
+    """Six phantom severity=serious verdicts (a mix of the marked and
+    legacy-unmarked shapes) must NOT halt — a phantom carries no evidence
+    that a review ever happened, so it must not feed either gate.
+
+    Fails on current main: six serious verdicts satisfy both the
+    consecutive-most-recent streak gate (newest three are serious) and the
+    non-ok count gate (6 >= halt_trend_moderate_count=5), so the project
+    halts on evidence that is entirely fabricated.
+    """
+    config = _make_judge_config(
+        halt_on_judge_serious=True,
+        halt_trend_moderate_count=5,
+        halt_trend_consecutive_required=3,
+        halt_trend_window_hours=24.0,
+    )
+    judge = Judge(config=config, journal=mock_journal)
+
+    verdicts = _make_verdicts(
+        ['serious'] * 6,
+        findings_by_index={
+            0: [_marked_phantom_finding()],
+            1: [_legacy_phantom_finding()],
+            2: [_marked_phantom_finding()],
+            3: [_legacy_phantom_finding()],
+            4: [_marked_phantom_finding()],
+            5: [_legacy_phantom_finding()],
+        },
+    )
+    await judge._check_error_trends('proj', verdicts)
+
+    assert not judge.is_halted('proj')
+    mock_journal.set_halt.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_error_trend_phantom_does_not_complete_consecutive_streak(mock_journal):
+    """A trailing phantom serious verdict must not hold the
+    consecutive-most-recent streak gate open. Once the phantom is excluded
+    from the evidence entirely, the true newest three verdicts are
+    moderate, moderate, ok — the ok breaks the streak.
+
+    The genuine (non-phantom) non-ok count is 6 (>= halt_trend_moderate_count
+    =5), so the count gate alone is met honestly here — this test isolates
+    the streak gate. Fails after step-6: that fix only reaches the count
+    gate (non_ok_in_window); the streak gate still reads the phantom's raw
+    severity='serious' off the unfiltered ``windowed`` list and treats it as
+    real non-ok evidence, incorrectly keeping the streak open.
+    """
+    config = _make_judge_config(
+        halt_on_judge_serious=True,
+        halt_trend_moderate_count=5,
+        halt_trend_consecutive_required=3,
+        halt_trend_window_hours=24.0,
+    )
+    judge = Judge(config=config, journal=mock_journal)
+
+    # oldest -> newest: moderate x4, ok, moderate x2, phantom-serious
+    verdicts = _make_verdicts(
+        ['moderate', 'moderate', 'moderate', 'moderate', 'ok', 'moderate',
+         'moderate', 'serious'],
+        findings_by_index={7: [_marked_phantom_finding()]},
+    )
+    await judge._check_error_trends('proj', verdicts)
+
+    assert not judge.is_halted('proj')
+    mock_journal.set_halt.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_error_trend_count_gate_excludes_phantoms_when_streak_passes_honestly(
+    mock_journal,
+):
+    """Isolates the COUNT gate from the streak gate. The three most-recent
+    verdicts are genuinely moderate, so the consecutive-most-recent streak
+    gate passes honestly and needs no phantom-exclusion help at all — but
+    the non-ok COUNT only reaches halt_trend_moderate_count=5 if the two
+    oldest phantom-serious verdicts are counted alongside the three
+    moderates. This is the primary failure mode task 3070 exists to fix
+    (phantoms inflating the count), and it would stay green even if the
+    exclusion were miswired to affect only the streak slice — unlike
+    test_error_trend_phantom_does_not_complete_consecutive_streak above,
+    which isolates the streak gate the same way in reverse.
+    """
+    config = _make_judge_config(
+        halt_on_judge_serious=True,
+        halt_trend_moderate_count=5,
+        halt_trend_consecutive_required=3,
+        halt_trend_window_hours=24.0,
+    )
+    judge = Judge(config=config, journal=mock_journal)
+
+    # oldest -> newest: phantom-serious, phantom-serious, moderate x3
+    verdicts = _make_verdicts(
+        ['serious', 'serious', 'moderate', 'moderate', 'moderate'],
+        findings_by_index={
+            0: [_marked_phantom_finding()],
+            1: [_marked_phantom_finding()],
+        },
+    )
+    await judge._check_error_trends('proj', verdicts)
+
+    assert not judge.is_halted('proj')
+    mock_journal.set_halt.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_error_trend_phantom_minor_still_breaks_streak(mock_journal):
+    """Regression guard: a phantom-SHAPED verdict whose severity is 'minor'
+    must still break the consecutive-most-recent streak, exactly like any
+    other minor verdict.
+
+    The phantom-verdict exclusion is scoped to non-ok severities only (see
+    the design rationale in _check_error_trends) — it must never remove a
+    minor/ok verdict from the ordering, or a streak could close over it and
+    make halts MORE likely, a fail-open change outside this task's ask.
+    Expected green both before and after the phantom-exclusion fix.
+    """
+    config = _make_judge_config(
+        halt_on_judge_serious=True,
+        halt_trend_moderate_count=5,
+        halt_trend_consecutive_required=3,
+        halt_trend_window_hours=24.0,
+    )
+    judge = Judge(config=config, journal=mock_journal)
+
+    # Looks phantom-shaped (single finding, parse-failure issue prefix) but
+    # is severity='minor' — is_phantom_verdict's legacy branch requires
+    # severity=serious, so this does not even classify as phantom; and even
+    # if it did, 'minor' is not a _NON_OK_SEVERITIES member and must stay in
+    # the ordering either way. The finding-level 'severity' key inside
+    # _legacy_phantom_finding() says 'serious', but is_phantom_verdict never
+    # reads it — only verdict.severity (set to 'minor' below via
+    # _make_verdicts) and the finding's 'issue'/'code' matter.
+    verdicts = _make_verdicts(
+        ['moderate'] * 7 + ['minor'],
+        findings_by_index={7: [_legacy_phantom_finding()]},
+    )
+    await judge._check_error_trends('proj', verdicts)
+
+    assert not judge.is_halted('proj')
+
+
+@pytest.mark.asyncio
+async def test_error_trend_logs_structured_record_when_phantoms_excluded(
+    mock_journal, caplog,
+):
+    """Discarding phantom evidence must be loud, not silent: an operator
+    looking at a run that did NOT halt must be able to tell "no trend"
+    apart from "trend evidence was discounted as phantom" (task 3070's
+    loud-over-silent-degradation requirement).
+
+    Fails on current main: _check_error_trends drops phantoms from the
+    evidence set with no log record at all.
+    """
+    config = _make_judge_config(
+        halt_on_judge_serious=True,
+        halt_trend_moderate_count=5,
+        halt_trend_consecutive_required=3,
+        halt_trend_window_hours=24.0,
+    )
+    judge = Judge(config=config, journal=mock_journal)
+
+    # oldest -> newest: moderate, moderate, phantom-serious, phantom-serious
+    # (run-2, run-3 per _make_verdicts' f'run-{i}' naming).
+    verdicts = _make_verdicts(
+        ['moderate', 'moderate', 'serious', 'serious'],
+        findings_by_index={
+            2: [_marked_phantom_finding()],
+            3: [_marked_phantom_finding()],
+        },
+    )
+
+    with caplog.at_level(logging.WARNING, logger='fused_memory.reconciliation.judge'):
+        await judge._check_error_trends('proj', verdicts)
+
+    excluded = [
+        r for r in caplog.records
+        if r.getMessage() == 'reconciliation.judge_trend_phantom_excluded'
+    ]
+    assert len(excluded) == 1, (
+        f"Expected exactly one phantom-excluded log record, got: "
+        f"{[r.getMessage() for r in caplog.records]}"
+    )
+    record = excluded[0]
+    assert getattr(record, 'project_id', None) == 'proj'
+    assert getattr(record, 'excluded_count', None) == 2
+    assert set(getattr(record, 'excluded_run_ids', [])) == {'run-2', 'run-3'}
+    # The two moderates (run-0, run-1) are the only genuine evidence left
+    # after excluding the two phantoms — pins that remaining_verdicts
+    # describes the surviving evidence, not e.g. the pre-exclusion total.
+    assert getattr(record, 'remaining_verdicts', None) == 2
+
+
+@pytest.mark.asyncio
+async def test_error_trend_no_log_when_no_phantoms_excluded(mock_journal, caplog):
+    """Companion silence assertion: a trend run over verdicts with NO
+    phantoms must not emit the phantom-excluded record at all."""
+    config = _make_judge_config(halt_on_judge_serious=True)
+    judge = Judge(config=config, journal=mock_journal)
+
+    verdicts = _make_verdicts(['minor'] * 10)
+
+    with caplog.at_level(logging.WARNING, logger='fused_memory.reconciliation.judge'):
+        await judge._check_error_trends('proj', verdicts)
+
+    excluded = [
+        r for r in caplog.records
+        if r.getMessage() == 'reconciliation.judge_trend_phantom_excluded'
+    ]
+    assert excluded == []
+
+
+class TestPhantomVerdictAnchors:
+    """Acceptance regression (expected green on arrival, following the
+    precedent of task 3067's commit 17ce3e3124): the six dated rows named
+    in task 3070's evidence table (a read-only inspection of the live
+    judge_verdicts table), reconstructed with their verbatim persisted
+    findings payloads rather than a guessed approximation of them.
+    """
+
+    @staticmethod
+    def _anchor_verdicts() -> list[JudgeVerdict]:
+        """The six phantom rows dated in the task's evidence table: the
+        pre-2947 unmarked legacy shape (e87d8e4a 07-20, 09d14a75 07-22) and
+        the post-2947 code-marked shape (d741ffe3 / 33581299 07-23,
+        ad861d89 07-24, c7d84e9f 07-25). Both shapes share the same
+        persisted issue text; the marked shape additionally carries the
+        structured code key task 2947 started stamping.
+        """
+        anchors = [
+            ('e87d8e4a', datetime(2026, 7, 20, tzinfo=UTC), _legacy_phantom_finding()),
+            ('09d14a75', datetime(2026, 7, 22, tzinfo=UTC), _legacy_phantom_finding()),
+            ('d741ffe3', datetime(2026, 7, 23, tzinfo=UTC), _marked_phantom_finding()),
+            ('33581299', datetime(2026, 7, 23, tzinfo=UTC), _marked_phantom_finding()),
+            ('ad861d89', datetime(2026, 7, 24, tzinfo=UTC), _marked_phantom_finding()),
+            ('c7d84e9f', datetime(2026, 7, 25, tzinfo=UTC), _marked_phantom_finding()),
+        ]
+        return [
+            JudgeVerdict(
+                run_id=run_id,
+                reviewed_at=reviewed_at,
+                severity=VerdictSeverity.serious,
+                findings=[finding],
+            )
+            for run_id, reviewed_at, finding in anchors
+        ]
+
+    # Per-row phantom classification for these six shapes is already pinned
+    # by TestIsPhantomVerdict (the marked and legacy-unmarked cases). The
+    # two tests below are what that class does NOT cover: the trend gates'
+    # behavior over a realistic window of exactly these six rows, and that
+    # a genuine severity=serious row still counts toward a halt.
+
+    @pytest.mark.asyncio
+    async def test_trend_window_of_exactly_the_six_anchors_does_not_halt(
+        self, mock_journal,
+    ):
+        """A trend window containing exactly the six dated phantom rows —
+        the real shape of the live judge_verdicts table before this fix,
+        which independently satisfies both the streak gate (all six are
+        severity=serious) and the count gate (6 >= a count of 5) on raw
+        severity alone — must not halt."""
+        config = _make_judge_config(
+            halt_on_judge_serious=True,
+            halt_trend_moderate_count=5,
+            halt_trend_consecutive_required=3,
+            # Wide enough to span the anchors' real dated timestamps from
+            # "now" without the window gate discarding them — this test is
+            # about the phantom filter, not the window gate.
+            halt_trend_window_hours=24.0 * 365,
+        )
+        judge = Judge(config=config, journal=mock_journal)
+
+        await judge._check_error_trends('proj', self._anchor_verdicts())
+
+        assert not judge.is_halted('proj')
+        mock_journal.set_halt.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_genuine_bc9459b8_is_not_phantom_and_still_counts_toward_halt(
+        self, mock_journal,
+    ):
+        """The one real severity=serious row in the live DB (bc9459b8, 5
+        substantive findings, no code key) must still count as genuine
+        non-ok evidence toward a halt when paired with genuine moderates —
+        the fix must not become a back door for suppressing a real halt.
+        (That bc9459b8's shape classifies as non-phantom is already pinned
+        at the unit level by
+        TestIsPhantomVerdict.test_genuine_serious_with_five_findings_and_no_code_is_not_phantom;
+        the halt assertion below is the stronger, behavioral proof of the
+        same property — if this verdict were mistakenly excluded as
+        phantom, the halt below would not fire.)"""
+        genuine = JudgeVerdict(
+            run_id='bc9459b8',
+            reviewed_at=datetime.now(UTC),
+            severity=VerdictSeverity.serious,
+            findings=[
+                {
+                    'issue': f'Substantive content issue #{i}',
+                    'severity': 'serious',
+                    'recommendation': f'Fix issue #{i}',
+                }
+                for i in range(5)
+            ],
+        )
+
+        config = _make_judge_config(
+            halt_on_judge_serious=True,
+            halt_trend_moderate_count=3,
+            halt_trend_consecutive_required=3,
+            halt_trend_window_hours=24.0,
+        )
+        judge = Judge(config=config, journal=mock_journal)
+        verdicts = [*_make_verdicts(['moderate', 'moderate']), genuine]
+
+        await judge._check_error_trends('proj', verdicts)
+
+        assert judge.is_halted('proj')
+        mock_journal.set_halt.assert_called_once()
 
 
 @pytest.mark.asyncio
@@ -1203,10 +1981,11 @@ async def test_call_judge_cli_delegates_to_invoke_with_cap_retry(mock_journal):
 
     Verifies the essential delegation contract: prompt, system_prompt, model,
     usage_gate, output_schema, and timeout are wired through correctly.
-    Fine-grained knobs (max_turns, permission_mode, disallowed_tools) are
-    implementation details covered by shared/tests/test_cli_invoke.py and, for
-    the schema-carrying invariants specifically, by
-    test_call_judge_cli_passes_judge_verdict_schema below.
+    Fine-grained knobs (permission_mode, disallowed_tools) are implementation
+    details covered by shared/tests/test_cli_invoke.py.  ``max_turns`` is NOT
+    one of them despite this test not asserting it — it is pinned by
+    test_call_judge_cli_passes_judge_verdict_schema below, along with the other
+    schema-carrying invariants.
     """
     from unittest.mock import AsyncMock
 
@@ -1234,7 +2013,7 @@ async def test_call_judge_cli_delegates_to_invoke_with_cap_retry(mock_journal):
     ) as mock_invoke:
         mock_invoke.return_value = fake_result
 
-        result = await judge._call_judge_cli('Evaluate this run.')
+        result = await judge._call_judge_cli('Evaluate this run.', run_id='run-test')
 
     mock_invoke.assert_called_once()
     call_kwargs = mock_invoke.call_args.kwargs
@@ -1272,13 +2051,12 @@ async def test_call_judge_cli_passes_judge_verdict_schema(mock_journal):
 
     - ``output_schema is JUDGE_VERDICT_SCHEMA`` — the contract is attached.
     - ``disallowed_tools == ['*']`` — the judge keeps passing the wildcard
-      VERBATIM.  Expanding it into the ``StructuredOutput``-preserving
-      real-builtins deny-list is cli_invoke's job (:1533-1536), not the
-      caller's, so the judge inherits future central fixes instead of pinning a
-      stale copy of the CLI's built-in list.
-    - ``max_turns >= 3`` — the schema mechanism burns a tool-use turn, so
-      ``max_turns=1`` is incompatible with ``--json-schema``
-      (task_curator.py:2366-2372); 3 is the floor both migrated siblings use.
+      VERBATIM.  Replacing it with the ``StructuredOutput``-preserving
+      ``--tools ''`` registry filter is cli_invoke's job, not the caller's, so
+      the judge inherits future central fixes.
+    - ``max_turns >= 3`` — a cap of 1 leaves no room for the prose turn the
+      model emits before calling ``StructuredOutput`` (see
+      ``_JUDGE_CLI_MAX_TURNS``); 3 is the floor both migrated siblings use.
     - ``system_prompt`` is unchanged — JUDGE_SYSTEM_PROMPT's "## Output Format"
       block stays because it is the ONLY output contract the anthropic/openai
       provider branches have (they never see ``--json-schema``).
@@ -1308,15 +2086,15 @@ async def test_call_judge_cli_passes_judge_verdict_schema(mock_journal):
         new_callable=AsyncMock,
         return_value=fake_result,
     ) as mock_invoke:
-        await judge._call_judge_cli('Evaluate this run.')
+        await judge._call_judge_cli('Evaluate this run.', run_id='run-test')
 
     call_kwargs = mock_invoke.call_args.kwargs
     assert call_kwargs['output_schema'] is JUDGE_VERDICT_SCHEMA
     assert call_kwargs['disallowed_tools'] == ['*']
     assert call_kwargs['max_turns'] >= 3, (
-        'max_turns=1 is incompatible with --json-schema: the schema mechanism '
-        'burns a tool-use turn and the CLI returns error_max_turns even when '
-        'the payload is attached (task_curator.py:2366-2372)'
+        'max_turns=1 leaves no room for the prose turn the model emits before '
+        'calling StructuredOutput, so the CLI returns error_max_turns; see '
+        '_JUDGE_CLI_MAX_TURNS'
     )
     assert call_kwargs['system_prompt'] == JUDGE_SYSTEM_PROMPT
 
@@ -1340,6 +2118,9 @@ def test_judge_verdict_schema_shape():
     properties = JUDGE_VERDICT_SCHEMA['properties']
     assert set(properties['severity']['enum']) == {'ok', 'minor', 'moderate', 'serious'}
     assert properties['findings']['type'] == 'array'
+    assert set(properties['findings']['items']['properties']) == {
+        'issue', 'severity', 'recommendation',
+    }
 
 
 @pytest.mark.asyncio
@@ -1372,7 +2153,7 @@ async def test_call_judge_cli_returns_structured_payload_ignoring_prose(mock_jou
         'fused_memory.reconciliation.judge.invoke_with_cap_retry',
         new=AsyncMock(return_value=result),
     ):
-        assert await judge._call_judge_cli('p') == payload
+        assert await judge._call_judge_cli('p', run_id='run-test') == payload
 
 
 @pytest.mark.asyncio
@@ -1402,7 +2183,7 @@ async def test_call_judge_cli_json_string_structured_output_is_loaded(mock_journ
         'fused_memory.reconciliation.judge.invoke_with_cap_retry',
         new=AsyncMock(return_value=result),
     ):
-        assert await judge._call_judge_cli('p') == {'severity': 'ok', 'findings': []}
+        assert await judge._call_judge_cli('p', run_id='run-test') == {'severity': 'ok', 'findings': []}
 
 
 @pytest.mark.asyncio
@@ -1437,9 +2218,57 @@ async def test_call_judge_cli_empty_output_returns_empty_string(mock_journal):
         new_callable=AsyncMock,
         return_value=empty_output_result,
     ):
-        result = await judge._call_judge_cli('Evaluate this run.')
+        result = await judge._call_judge_cli('Evaluate this run.', run_id='run-test')
 
     assert result == ''
+
+
+@pytest.mark.asyncio
+async def test_call_judge_cli_input_rejected_raises_infra_error(mock_journal):
+    """A pre-turn CLI rejection is INFRA, not a benign empty verdict (task 3143).
+
+    The legacy "empty stdout = valid empty verdict" contract is scoped to a
+    genuine EMPTY_OUTPUT: we asked the judge something and it returned nothing.
+    A rejection means the judge was never asked at all — returning '' there
+    would have _parse_verdict fabricate a benign severity=minor verdict for a
+    review that never happened, exactly the silent degradation this module
+    exists to prevent.  invoke_with_cap_retry has already spent its one
+    automatic retry by the time we get here, so raising is the right escalation.
+    """
+    from unittest.mock import AsyncMock
+
+    from shared.cli_invoke import AgentResult
+
+    from fused_memory.reconciliation.judge import JudgeInfraError
+
+    fake_gate = make_gate_mock()
+    config = _make_judge_config(
+        judge_llm_provider='claude_cli',
+        judge_llm_model='claude-sonnet-4-5',
+    )
+    judge = Judge(config=config, journal=mock_journal, usage_gate=fake_gate)
+
+    rejected_result = AgentResult(
+        success=False,
+        output='Agent produced no output',
+        subtype='error_cli_input_rejected',
+        stderr=(
+            'Error: Input must be provided either through stdin or as a '
+            'prompt argument when using --print\n'
+        ),
+        session_id='jsess-2',
+    )
+
+    with patch(
+        'fused_memory.reconciliation.judge.invoke_with_cap_retry',
+        new_callable=AsyncMock,
+        return_value=rejected_result,
+    ), pytest.raises(JudgeInfraError) as excinfo:
+        await judge._call_judge_cli('Evaluate this run.', run_id='run-test')
+
+    assert 'Input must be provided' in str(excinfo.value), (
+        f'the raised message must carry the CLI stderr cause, got {excinfo.value!r}'
+    )
 
 
 @pytest.mark.asyncio
@@ -1484,11 +2313,128 @@ async def test_call_judge_cli_forwards_cwd_to_invoke_claude_agent(mock_journal, 
         mock_agent.return_value = fake_result
 
         judge = Judge(config=config, journal=mock_journal, usage_gate=None)
-        await judge._call_judge_cli('Evaluate this run.')
+        await judge._call_judge_cli('Evaluate this run.', run_id='run-test')
 
     mock_agent.assert_called_once()
     call_kwargs = mock_agent.call_args.kwargs
     assert call_kwargs['cwd'] == Path(explore_root)
+
+
+@pytest.mark.asyncio
+async def test_call_judge_cli_scopes_mcp_to_no_servers(mock_journal):
+    """The judge strict-scopes its run to ZERO MCP servers.
+
+    ``disallowed_tools=['*']`` alone does NOT keep MCP tools unreachable here:
+    under an ``output_schema`` cli_invoke turns the wildcard into
+    ``--tools ''``, which removes built-in and deferred tools but does not
+    filter MCP, and ``cwd`` is
+    ``explore_codebase_root`` (the project root, task 1989), which holds a live
+    ``.mcp.json`` the CLI would ambient-merge — under ``bypassPermissions``,
+    that is unreviewed access to tools like ``halt_scheduler`` /
+    ``delete_memory``.  Closing it takes a truthy scoping ``mcp_config`` plus
+    ``strict_mcp_config=True``; the four pre-existing guarantees are asserted
+    alongside so this fix cannot be traded against them.
+    """
+    from pathlib import Path
+    from unittest.mock import AsyncMock
+
+    from shared.cli_invoke import AgentResult
+
+    from fused_memory.reconciliation.judge import JUDGE_VERDICT_SCHEMA
+
+    config = _make_judge_config(
+        judge_llm_provider='claude_cli',
+        judge_llm_model='claude-sonnet-4-5',
+    )
+    judge = Judge(config=config, journal=mock_journal, usage_gate=make_gate_mock())
+
+    # A usable structured payload: a success carrying none is classified as
+    # cli_output_empty infra, which would mask this test's kwargs assertions.
+    fake_result = AgentResult(
+        success=True,
+        output='',
+        structured_output={'severity': 'ok', 'findings': []},
+        session_id='jsess-mcp',
+    )
+
+    with patch(
+        'fused_memory.reconciliation.judge.invoke_with_cap_retry',
+        new_callable=AsyncMock,
+    ) as mock_invoke:
+        mock_invoke.return_value = fake_result
+
+        await judge._call_judge_cli('Evaluate this run.', run_id='run-test')
+
+    mock_invoke.assert_called_once()
+    call_kwargs = mock_invoke.call_args.kwargs
+
+    assert call_kwargs['strict_mcp_config'] is True
+    # A zero-server config, but a TRUTHY one — the --strict-mcp-config emit is
+    # gated on `if mcp_config:`, so an inline `{}` regression fails here.
+    assert call_kwargs['mcp_config'] == {'mcpServers': {}}
+
+    # Unregressed pre-existing guarantees.
+    assert call_kwargs['disallowed_tools'] == ['*']
+    assert call_kwargs['output_schema'] is JUDGE_VERDICT_SCHEMA
+    assert call_kwargs['permission_mode'] == 'bypassPermissions'
+    assert call_kwargs['cwd'] == Path(config.explore_codebase_root)
+
+
+@pytest.mark.asyncio
+async def test_call_judge_cli_forwards_mcp_scoping_to_invoke_claude_agent(mock_journal, tmp_path):
+    """Both MCP-scoping kwargs survive invoke_with_cap_retry's forwarding layer.
+
+    ``invoke_with_cap_retry`` takes ``**invoke_kwargs`` and forwards them blind,
+    so the kwargs-level test above proves only that the judge NAMES these
+    kwargs.  Patching one level lower with ``usage_gate=None`` (the
+    single-invocation fast path) runs the real forwarding code, proving the
+    keys are not dropped en route — same rationale as
+    test_call_judge_cli_forwards_cwd_to_invoke_claude_agent above.
+
+    ``autospec=True`` is load-bearing, not incidental: a bare ``AsyncMock`` is
+    signature-less and swallows arbitrary keywords, so a misspelled
+    ``strict_mcp_configs=True`` would be forwarded and asserted-on happily here
+    and surface as a TypeError only in production.  The autospec'd mock is
+    built from the real ``invoke_claude_agent`` signature and raises TypeError
+    on a kwarg it does not accept, so this test also pins that both names are
+    genuinely supported parameters.
+
+    Deliberately NOT asserted: that the ambient .mcp.json is actually
+    suppressed.  That is the external CLI's own documented
+    ``--strict-mcp-config`` contract, not hermetically testable here.
+    """
+    from shared.cli_invoke import AgentResult
+
+    # Use tmp_path so the cwd Path actually exists on disk.
+    config = _make_judge_config(
+        judge_llm_provider='claude_cli',
+        judge_llm_model='claude-sonnet-4-5',
+        explore_codebase_root=str(tmp_path),
+    )
+
+    fake_result = AgentResult(
+        success=True,
+        output='',
+        structured_output={'severity': 'ok', 'findings': []},
+        session_id='jsess-mcp-deep',
+    )
+
+    # autospec (not a bare AsyncMock): validates every kwarg against the real
+    # invoke_claude_agent signature, so an unsupported/misspelled one raises
+    # TypeError here instead of only in production. See the docstring.
+    with patch(
+        'shared.cli_invoke.invoke_claude_agent',
+        autospec=True,
+    ) as mock_agent:
+        mock_agent.return_value = fake_result
+
+        judge = Judge(config=config, journal=mock_journal, usage_gate=None)
+        await judge._call_judge_cli('Evaluate this run.', run_id='run-test')
+
+    mock_agent.assert_called_once()
+    call_kwargs = mock_agent.call_args.kwargs
+    assert call_kwargs['strict_mcp_config'] is True
+    assert call_kwargs['mcp_config'] == {'mcpServers': {}}
 
 
 # ---------------------------------------------------------------------------
@@ -1540,7 +2486,7 @@ async def test_call_judge_cli_failure_surfaces_stderr_and_summary_in_judge_infra
         mock_invoke.return_value = failing_result
 
         with pytest.raises(JudgeInfraError) as excinfo:
-            await judge._call_judge_cli('Evaluate this run.')
+            await judge._call_judge_cli('Evaluate this run.', run_id='run-test')
 
     msg = str(excinfo.value)
     assert msg.startswith('Claude CLI judge failed:'), f'unexpected prefix: {msg!r}'
@@ -1549,31 +2495,30 @@ async def test_call_judge_cli_failure_surfaces_stderr_and_summary_in_judge_infra
 
 
 # ─────────────────────────────────────────────────────────────────────
-# _RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS forwarded by judge to
+# RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS forwarded by judge to
 # invoke_with_cap_retry (task 1401)
 # ─────────────────────────────────────────────────────────────────────
 
 
 class TestJudgeCapWaitSanityBound:
-    """_RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS is forwarded to
+    """RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS is forwarded to
     invoke_with_cap_retry by judge; prevents stalling the reconciliation
     queue under cap."""
 
     @pytest.mark.asyncio
     async def test_call_judge_cli_forwards_cap_wait_sanity_secs(self):
-        """(b) _call_judge_cli forwards cap_wait_sanity_secs=_RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS."""
-        from unittest.mock import AsyncMock, MagicMock
+        """(b) _call_judge_cli forwards cap_wait_sanity_secs=RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS."""
+        from unittest.mock import AsyncMock
 
         from shared.cli_invoke import AgentResult
 
-        from fused_memory.reconciliation import _RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS
+        from fused_memory.reconciliation import RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS
 
         config = _make_judge_config(
             judge_llm_provider='claude_cli',
             judge_llm_model='claude-sonnet-4-5',
         )
-        mock_jrnl = MagicMock()
-        judge = Judge(config=config, journal=mock_jrnl, usage_gate=make_gate_mock())
+        judge = Judge(config=config, journal=_journal_double(), usage_gate=make_gate_mock())
         # A usable structured payload: a success carrying none is now classified
         # as cli_output_empty infra, which would mask this test's kwargs assertion.
         ok_result = AgentResult(
@@ -1584,8 +2529,8 @@ class TestJudgeCapWaitSanityBound:
             'fused_memory.reconciliation.judge.invoke_with_cap_retry',
             new=mock,
         ):
-            await judge._call_judge_cli('p')
-        assert mock.call_args.kwargs['cap_wait_sanity_secs'] == _RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS
+            await judge._call_judge_cli('p', run_id='run-test')
+        assert mock.call_args.kwargs['cap_wait_sanity_secs'] == RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -1608,7 +2553,7 @@ class TestCallJudgeCliTaxonomy:
             judge_llm_provider='claude_cli',
             judge_llm_model='claude-sonnet-4-5',
         )
-        return Judge(config=config, journal=MagicMock(), usage_gate=make_gate_mock())
+        return Judge(config=config, journal=_journal_double(), usage_gate=make_gate_mock())
 
     @pytest.mark.asyncio
     async def test_api_error_raises_judge_infra_error(self):
@@ -1625,7 +2570,7 @@ class TestCallJudgeCliTaxonomy:
             'fused_memory.reconciliation.judge.invoke_with_cap_retry',
             new=AsyncMock(return_value=result),
         ), pytest.raises(JudgeInfraError):
-            await judge._call_judge_cli('prompt')
+            await judge._call_judge_cli('prompt', run_id='run-test')
 
     @pytest.mark.asyncio
     async def test_timed_out_raises_judge_infra_error(self):
@@ -1640,7 +2585,7 @@ class TestCallJudgeCliTaxonomy:
             'fused_memory.reconciliation.judge.invoke_with_cap_retry',
             new=AsyncMock(return_value=result),
         ), pytest.raises(JudgeInfraError):
-            await judge._call_judge_cli('prompt')
+            await judge._call_judge_cli('prompt', run_id='run-test')
 
     @pytest.mark.asyncio
     async def test_genuine_empty_output_stays_benign(self):
@@ -1660,7 +2605,7 @@ class TestCallJudgeCliTaxonomy:
             'fused_memory.reconciliation.judge.invoke_with_cap_retry',
             new=AsyncMock(return_value=result),
         ):
-            assert await judge._call_judge_cli('prompt') == ''
+            assert await judge._call_judge_cli('prompt', run_id='run-test') == ''
 
     @pytest.mark.asyncio
     async def test_success_returns_structured_payload(self):
@@ -1683,7 +2628,7 @@ class TestCallJudgeCliTaxonomy:
             'fused_memory.reconciliation.judge.invoke_with_cap_retry',
             new=AsyncMock(return_value=result),
         ):
-            assert await judge._call_judge_cli('prompt') == {'severity': 'ok', 'findings': []}
+            assert await judge._call_judge_cli('prompt', run_id='run-test') == {'severity': 'ok', 'findings': []}
 
     @pytest.mark.asyncio
     async def test_all_accounts_capped_raises_judge_infra_error(self):
@@ -1700,7 +2645,7 @@ class TestCallJudgeCliTaxonomy:
             'fused_memory.reconciliation.judge.invoke_with_cap_retry',
             new=AsyncMock(side_effect=AllAccountsCappedException(3, 1800.0, 'judge')),
         ), pytest.raises(JudgeInfraError):
-            await judge._call_judge_cli('prompt')
+            await judge._call_judge_cli('prompt', run_id='run-test')
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize('subtype', ['error_max_turns', 'error_empty_output'])
@@ -1708,11 +2653,11 @@ class TestCallJudgeCliTaxonomy:
         """(f) A blocked ``StructuredOutput`` tool is a systemic config break with
         its own machine-readable code, not an anonymous UNKNOWN failure.
 
-        ``--json-schema`` rides the synthetic ``StructuredOutput`` tool, which
-        cli_invoke's wildcard expansion deliberately omits from
-        ``_REAL_BUILTIN_TOOLS_DENYLIST``.  If a future CLI change starts denying
-        it, EVERY judge run is starved of its verdict — the deny-list needs
-        fixing, and the log has to say so.  cli_invoke can only ever set
+        ``--json-schema`` rides the synthetic ``StructuredOutput`` tool, the one
+        tool cli_invoke's ``'*'`` -> ``--tools ''`` substitution keeps in the
+        registry.  If a future CLI change starts denying it, EVERY judge run is
+        starved of its verdict — that substitution needs fixing, and the log has
+        to say so.  cli_invoke can only ever set
         ``schema_tool_denied`` on a NON-success result (cli_invoke.py:1807 guards
         on ``not is_success``), so the detection has to live on this branch;
         checking it on the success branch is dead code.
@@ -1738,7 +2683,7 @@ class TestCallJudgeCliTaxonomy:
             'fused_memory.reconciliation.judge.invoke_with_cap_retry',
             new=AsyncMock(return_value=result),
         ), pytest.raises(JudgeInfraError) as exc_info:
-            await judge._call_judge_cli('prompt')
+            await judge._call_judge_cli('prompt', run_id='run-test')
         assert exc_info.value.code == 'cli_schema_tool_denied'
         assert 'cli_schema_tool_denied' in str(exc_info.value)
 
@@ -1746,7 +2691,7 @@ class TestCallJudgeCliTaxonomy:
     async def test_ordinary_transport_failure_carries_no_code(self):
         """(g) The new code is SPECIFIC: an ordinary transport failure keeps the
         generic build_failure_message dump and a ``code`` of None, so
-        _handle_infra_failure's log can tell a deny-list break apart from a
+        _record_no_verdict_failure's log can tell a deny-list break apart from a
         run-of-the-mill api_error."""
         from shared.cli_invoke import AgentResult
 
@@ -1758,7 +2703,7 @@ class TestCallJudgeCliTaxonomy:
             'fused_memory.reconciliation.judge.invoke_with_cap_retry',
             new=AsyncMock(return_value=result),
         ), pytest.raises(JudgeInfraError) as exc_info:
-            await judge._call_judge_cli('prompt')
+            await judge._call_judge_cli('prompt', run_id='run-test')
         assert exc_info.value.code is None
 
 
@@ -1787,7 +2732,7 @@ class TestCallJudgeCliStructuredOutputTaxonomy:
             judge_llm_provider='claude_cli',
             judge_llm_model='claude-sonnet-4-5',
         )
-        return Judge(config=config, journal=MagicMock(), usage_gate=make_gate_mock())
+        return Judge(config=config, journal=_journal_double(), usage_gate=make_gate_mock())
 
     async def _raises(self, result):
         """Invoke _call_judge_cli against *result*, returning the JudgeInfraError."""
@@ -1798,7 +2743,7 @@ class TestCallJudgeCliStructuredOutputTaxonomy:
             'fused_memory.reconciliation.judge.invoke_with_cap_retry',
             new=AsyncMock(return_value=result),
         ), pytest.raises(JudgeInfraError) as exc_info:
-            await judge._call_judge_cli('prompt')
+            await judge._call_judge_cli('prompt', run_id='run-test')
         return exc_info.value
 
     @pytest.mark.asyncio
@@ -1916,7 +2861,7 @@ class TestCallJudgeCliStructuredOutputTaxonomy:
                 success=True, output='', structured_output=payload,
             )),
         ):
-            assert await judge._call_judge_cli('prompt') == payload
+            assert await judge._call_judge_cli('prompt', run_id='run-test') == payload
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize('payload', [
@@ -1960,7 +2905,7 @@ class TestCallJudgeCliStructuredOutputTaxonomy:
             new=AsyncMock(return_value=result),
         ):
             # Explicitly must NOT raise.
-            assert await judge._call_judge_cli('prompt') == ''
+            assert await judge._call_judge_cli('prompt', run_id='run-test') == ''
 
 
 class TestReviewRunNoStructuredVerdict:
@@ -2046,7 +2991,8 @@ class TestReviewRunNoStructuredVerdict:
             first = await judge.review_run('run-nostruct')
 
             # First occurrence: still no fabricated severity=serious row.
-            assert first is None
+            assert isinstance(first, NoVerdict)
+            assert first.reason is NoVerdictReason.JUDGE_INFRA_FAILURE
             mock_journal.add_verdict.assert_not_called()
             mock_journal.set_halt.assert_not_called()
             assert judge.is_halted('proj-nostruct-findings') is False
@@ -2079,7 +3025,8 @@ class TestReviewRunNoStructuredVerdict:
         ):
             verdict = await judge.review_run('run-nostruct')
 
-        assert verdict is None
+        assert isinstance(verdict, NoVerdict)
+        assert verdict.reason is NoVerdictReason.JUDGE_INFRA_FAILURE
         mock_journal.add_verdict.assert_not_called()
         mock_journal.set_halt.assert_not_called()
         assert judge.is_halted('proj-nostruct-a') is False
@@ -2133,7 +3080,7 @@ class TestReviewRunNoStructuredVerdict:
         ):
             verdict = await judge.review_run('run-nostruct')
 
-        assert verdict is not None
+        assert isinstance(verdict, JudgeVerdict)
         assert verdict.severity == VerdictSeverity.serious
         assert verdict.action_taken == VerdictAction.halt
         mock_journal.add_verdict.assert_called_once()
@@ -2161,7 +3108,7 @@ class TestReviewRunNoStructuredVerdict:
         ):
             verdict = await judge.review_run('run-nostruct')
 
-        assert verdict is not None
+        assert isinstance(verdict, JudgeVerdict)
         assert verdict.severity == VerdictSeverity.moderate
         assert verdict.action_taken == VerdictAction.rollback
         assert judge.is_halted('proj-moderate-struct') is False
@@ -2225,8 +3172,9 @@ class TestReviewRunInfraFailureHandling:
             v1 = await judge.review_run('run-infra')
             v2 = await judge.review_run('run-infra')
 
-        assert v1 is None
-        assert v2 is None
+        for v in (v1, v2):
+            assert isinstance(v, NoVerdict)
+            assert v.reason is NoVerdictReason.JUDGE_INFRA_FAILURE
         mock_journal.set_halt.assert_not_called()
         mock_journal.add_verdict.assert_not_called()
         assert not judge.is_halted('proj-infra-a')
@@ -2287,7 +3235,8 @@ class TestReviewRunInfraFailureHandling:
         ):
             v = await judge.review_run('run-infra')
 
-        assert v is None
+        assert isinstance(v, NoVerdict)
+        assert v.reason is NoVerdictReason.JUDGE_INFRA_FAILURE
         assert not judge.is_halted('proj-infra-c')
         mock_journal.set_halt.assert_not_called()
 
@@ -2308,6 +3257,321 @@ class TestReviewRunInfraFailureHandling:
                 await judge.review_run('run-infra')
 
         assert not judge.is_halted('proj-infra-d')
+        mock_journal.set_halt.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_infra_halt_fires_once_per_run_and_a_fresh_run_needs_the_full_threshold(
+        self, mock_journal,
+    ):
+        """The halt ends the run: after an unhalt, two further failures do not
+        halt again and only the third does."""
+        from fused_memory.reconciliation.judge import JudgeInfraError
+
+        judge = self._setup(
+            mock_journal, 'proj-infra-e',
+            halt_on_judge_serious=True, judge_infra_max_consecutive_failures=3,
+        )
+        with patch.object(
+            judge, '_call_llm', AsyncMock(side_effect=JudgeInfraError('cap storm'))
+        ):
+            for _ in range(3):
+                await judge.review_run('run-infra')
+            assert mock_journal.set_halt.call_count == 1
+
+            await judge.unhalt('proj-infra-e')
+            for _ in range(2):
+                await judge.review_run('run-infra')
+            assert mock_journal.set_halt.call_count == 1
+            assert not judge.is_halted('proj-infra-e')
+
+            await judge.review_run('run-infra')
+
+        assert mock_journal.set_halt.call_count == 2
+        assert judge.is_halted('proj-infra-e')
+
+    @pytest.mark.asyncio
+    async def test_infra_streaks_are_independent_per_project(self, mock_journal):
+        from fused_memory.models.reconciliation import (
+            ReconciliationRun,
+            RunStatus,
+            RunType,
+        )
+        from fused_memory.reconciliation.judge import JudgeInfraError
+
+        judge = self._setup(
+            mock_journal, 'proj-A',
+            halt_on_judge_serious=True, judge_infra_max_consecutive_failures=3,
+        )
+        runs = {
+            f'run-{project}': ReconciliationRun(
+                id=f'run-{project}',
+                project_id=project,
+                run_type=RunType.full,
+                trigger_reason='buffer_size:3',
+                started_at=datetime.now(UTC),
+                events_processed=3,
+                status=RunStatus.completed,
+                stage_reports={},
+            )
+            for project in ('proj-A', 'proj-B')
+        }
+        mock_journal.get_run = AsyncMock(side_effect=lambda run_id: runs[run_id])
+
+        with patch.object(
+            judge, '_call_llm', AsyncMock(side_effect=JudgeInfraError('cap storm'))
+        ):
+            for _ in range(2):
+                await judge.review_run('run-proj-A')
+                await judge.review_run('run-proj-B')
+            assert not judge.is_halted('proj-A')
+            assert not judge.is_halted('proj-B')
+
+            await judge.review_run('run-proj-A')
+
+        assert judge.is_halted('proj-A')
+        assert not judge.is_halted('proj-B')
+        mock_journal.set_halt.assert_called_once()
+
+
+def _judge_over_one_run(mock_journal, project_id: str, run_id: str = 'run-x', **cfg) -> Judge:
+    """A judge whose journal serves one completed run of *project_id*."""
+    from fused_memory.models.reconciliation import (
+        ReconciliationRun,
+        RunStatus,
+        RunType,
+    )
+
+    judge = Judge(config=_make_judge_config(**cfg), journal=mock_journal)
+    mock_journal.get_run = AsyncMock(return_value=ReconciliationRun(
+        id=run_id,
+        project_id=project_id,
+        run_type=RunType.full,
+        trigger_reason='buffer_size:3',
+        started_at=datetime.now(UTC),
+        events_processed=3,
+        status=RunStatus.completed,
+        stage_reports={},
+    ))
+    mock_journal.get_run_actions_combined = AsyncMock(return_value=[])
+    return judge
+
+
+_OK_VERDICT_TEXT = '{"severity": "ok", "findings": []}'
+
+
+class TestReviewRunReturnsATypedNoVerdict:
+    """INV-11: every way review_run produces no verdict says which way it was."""
+
+    @pytest.mark.asyncio
+    async def test_a_missing_run_is_run_not_found(self, mock_journal):
+        judge = Judge(config=_make_judge_config(), journal=mock_journal)
+
+        result = await judge.review_run('run-x')
+
+        assert result == NoVerdict('run-x', NoVerdictReason.RUN_NOT_FOUND)
+
+    @pytest.mark.asyncio
+    async def test_a_halted_project_is_project_halted(self, mock_journal):
+        judge = _judge_over_one_run(mock_journal, 'proj-halted')
+        mock_journal.get_halt_states = AsyncMock(return_value=[{
+            'project_id': 'proj-halted', 'unhalted_at': None, 'cooldown_until': None,
+            'halted_at': None, 'reason': 'operator halt', 'unhalt_grace_remaining': 0,
+        }])
+        await judge.initialize()
+
+        result = await judge.review_run('run-x')
+
+        assert result == NoVerdict('run-x', NoVerdictReason.PROJECT_HALTED)
+
+    @pytest.mark.asyncio
+    async def test_an_infra_failure_is_judge_infra_failure(self, mock_journal):
+        judge = _judge_over_one_run(
+            mock_journal, 'proj-infra', judge_infra_max_consecutive_failures=3,
+        )
+
+        with patch.object(
+            judge, '_call_llm', AsyncMock(side_effect=JudgeInfraError('cap storm')),
+        ):
+            result = await judge.review_run('run-x')
+
+        assert isinstance(result, NoVerdict)
+        assert (result.run_id, result.reason) == ('run-x', NoVerdictReason.JUDGE_INFRA_FAILURE)
+
+    @pytest.mark.asyncio
+    async def test_a_raising_journal_read_is_review_error_naming_the_exception(
+        self, mock_journal,
+    ):
+        judge = _judge_over_one_run(mock_journal, 'proj-review-error')
+        mock_journal.get_run_actions_combined = AsyncMock(
+            side_effect=RuntimeError('actions table locked'),
+        )
+
+        result = await judge.review_run('run-x')
+
+        assert isinstance(result, NoVerdict)
+        assert (result.run_id, result.reason) == ('run-x', NoVerdictReason.REVIEW_ERROR)
+        assert 'RuntimeError' in result.detail
+        assert 'actions table locked' in result.detail
+
+    @pytest.mark.asyncio
+    async def test_a_raising_verdict_write_is_review_error(self, mock_journal):
+        judge = _judge_over_one_run(mock_journal, 'proj-review-error')
+        mock_journal.add_verdict = AsyncMock(side_effect=RuntimeError('disk full'))
+
+        with patch.object(judge, '_call_llm', AsyncMock(return_value=_OK_VERDICT_TEXT)):
+            result = await judge.review_run('run-x')
+
+        assert isinstance(result, NoVerdict)
+        assert result.reason is NoVerdictReason.REVIEW_ERROR
+
+    @pytest.mark.asyncio
+    async def test_a_healthy_review_returns_a_verdict(self, mock_journal):
+        judge = _judge_over_one_run(mock_journal, 'proj-healthy')
+
+        with patch.object(judge, '_call_llm', AsyncMock(return_value=_OK_VERDICT_TEXT)):
+            result = await judge.review_run('run-x')
+
+        assert isinstance(result, JudgeVerdict)
+        assert result.severity == VerdictSeverity.ok
+
+
+class TestARepeatedReviewErrorHaltsTruthfully:
+    """A judge that crashes on every run must eventually stop runs going ungraded.
+
+    A REVIEW_ERROR on a loaded run counts toward the same per-project
+    no-verdict streak as a JudgeInfraError, and at the threshold halts with a
+    reason naming the review error, gated on halt_on_judge_serious. Only a
+    completed review resets the streak.
+    """
+
+    _PID = 'proj-review-error'
+
+    def _judge(self, mock_journal, **cfg) -> Judge:
+        cfg.setdefault('halt_on_judge_serious', True)
+        return _judge_over_one_run(
+            mock_journal, self._PID, judge_infra_max_consecutive_failures=3, **cfg,
+        )
+
+    @staticmethod
+    def _assert_review_error_halt(judge: Judge, project_id: str) -> None:
+        assert judge.is_halted(project_id)
+        reason = judge.halt_reason(project_id)
+        assert reason is not None
+        assert reason.startswith('judge-review-error halt'), reason
+        assert 'judge-unreachable' not in reason
+        assert 'Serious verdict' not in reason
+
+    @pytest.mark.asyncio
+    async def test_the_third_consecutive_review_error_halts(self, mock_journal):
+        judge = self._judge(mock_journal)
+        mock_journal.add_verdict = AsyncMock(side_effect=RuntimeError('disk full'))
+
+        with patch.object(judge, '_call_llm', AsyncMock(return_value=_OK_VERDICT_TEXT)):
+            for _ in range(2):
+                await judge.review_run('run-x')
+            assert not judge.is_halted(self._PID)
+            mock_journal.set_halt.assert_not_called()
+
+            third = await judge.review_run('run-x')
+
+        assert isinstance(third, NoVerdict)
+        assert third.reason is NoVerdictReason.REVIEW_ERROR
+        self._assert_review_error_halt(judge, self._PID)
+
+    @pytest.mark.asyncio
+    async def test_a_completed_review_resets_the_streak(self, mock_journal):
+        judge = self._judge(mock_journal)
+        mock_journal.add_verdict = AsyncMock(side_effect=[
+            RuntimeError('disk full'), RuntimeError('disk full'), None,
+            RuntimeError('disk full'),
+        ])
+
+        with patch.object(judge, '_call_llm', AsyncMock(return_value=_OK_VERDICT_TEXT)):
+            for _ in range(4):
+                await judge.review_run('run-x')
+
+        assert not judge.is_halted(self._PID)
+        mock_journal.set_halt.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_a_persisted_verdict_is_returned_and_resets_the_streak_even_if_the_trend_check_fails(
+        self, mock_journal,
+    ):
+        unwindowable = JudgeVerdict(
+            run_id='run-old', reviewed_at=datetime(2026, 1, 1),
+            severity=VerdictSeverity.moderate,
+        )
+        mock_journal.get_recent_verdicts = AsyncMock(return_value=[unwindowable])
+        judge = self._judge(mock_journal)
+        mock_journal.add_verdict = AsyncMock(side_effect=[
+            RuntimeError('disk full'), RuntimeError('disk full'), None,
+            RuntimeError('disk full'), RuntimeError('disk full'),
+        ])
+
+        with patch.object(judge, '_call_llm', AsyncMock(return_value=_OK_VERDICT_TEXT)):
+            results = [await judge.review_run('run-x') for _ in range(5)]
+
+        assert isinstance(results[2], JudgeVerdict)
+        assert results[2].severity == VerdictSeverity.ok
+        assert not judge.is_halted(self._PID)
+        mock_journal.set_halt.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_review_errors_never_halt_with_the_master_switch_off(self, mock_journal):
+        judge = self._judge(mock_journal, halt_on_judge_serious=False)
+        mock_journal.add_verdict = AsyncMock(side_effect=RuntimeError('disk full'))
+
+        with patch.object(judge, '_call_llm', AsyncMock(return_value=_OK_VERDICT_TEXT)):
+            for _ in range(3):
+                await judge.review_run('run-x')
+
+        assert not judge.is_halted(self._PID)
+        mock_journal.set_halt.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_a_mixed_streak_halts_naming_its_last_failure(self, mock_journal):
+        judge = self._judge(mock_journal)
+        mock_journal.add_verdict = AsyncMock(side_effect=RuntimeError('disk full'))
+
+        with patch.object(judge, '_call_llm', AsyncMock(side_effect=[
+            JudgeInfraError('cap storm'), JudgeInfraError('cap storm'), _OK_VERDICT_TEXT,
+        ])):
+            for _ in range(3):
+                await judge.review_run('run-x')
+
+        self._assert_review_error_halt(judge, self._PID)
+
+    @pytest.mark.asyncio
+    async def test_a_missing_run_never_counts(self, mock_journal):
+        judge = Judge(
+            config=_make_judge_config(
+                halt_on_judge_serious=True, judge_infra_max_consecutive_failures=3,
+            ),
+            journal=mock_journal,
+        )
+
+        for _ in range(3):
+            assert await judge.review_run('run-x') == NoVerdict('run-x', NoVerdictReason.RUN_NOT_FOUND)
+
+        mock_journal.set_halt.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_a_halted_project_skip_never_counts(self, mock_journal):
+        judge = self._judge(mock_journal)
+        mock_journal.get_halt_states = AsyncMock(return_value=[{
+            'project_id': self._PID, 'unhalted_at': None, 'cooldown_until': None,
+            'halted_at': None, 'reason': 'operator halt', 'unhalt_grace_remaining': 0,
+        }])
+        await judge.initialize()
+        for _ in range(2):
+            assert await judge.review_run('run-x') == NoVerdict('run-x', NoVerdictReason.PROJECT_HALTED)
+        await judge.unhalt(self._PID)
+        mock_journal.add_verdict = AsyncMock(side_effect=RuntimeError('disk full'))
+
+        with patch.object(judge, '_call_llm', AsyncMock(return_value=_OK_VERDICT_TEXT)):
+            await judge.review_run('run-x')
+
+        assert not judge.is_halted(self._PID)
         mock_journal.set_halt.assert_not_called()
 
 
@@ -2364,7 +3628,7 @@ async def test_review_run_unparseable_content_halts_with_unparseable_reason(mock
     ):
         verdict = await judge.review_run('run-unparseable')
 
-    assert verdict is not None
+    assert isinstance(verdict, JudgeVerdict)
     assert verdict.severity == VerdictSeverity.serious
     assert judge.is_halted('proj-unparseable')
     mock_journal.set_halt.assert_called_once()
@@ -2400,7 +3664,7 @@ async def test_review_run_genuine_serious_halts_with_serious_verdict_reason(mock
     with patch.object(judge, '_call_llm', AsyncMock(return_value=serious_json)):
         verdict = await judge.review_run('run-genuine-serious')
 
-    assert verdict is not None
+    assert isinstance(verdict, JudgeVerdict)
     assert verdict.severity == VerdictSeverity.serious
     assert judge.is_halted('proj-genuine-serious')
     mock_journal.set_halt.assert_called_once()
@@ -2568,7 +3832,7 @@ class TestJudgeCapRetryResumeKeepsVerdictContract:
         )
 
         # 2. A real, parseable verdict came back.
-        assert verdict is not None
+        assert isinstance(verdict, JudgeVerdict)
         assert verdict.severity == VerdictSeverity.ok
         assert verdict.action_taken == VerdictAction.none
 
@@ -2585,3 +3849,79 @@ class TestJudgeCapRetryResumeKeepsVerdictContract:
         assert all(
             f.get('code') != 'unparseable_judge_response' for f in stamped.findings
         )
+
+
+class TestJudgeInvocationLedger:
+    """The judge's CLI call lands one invocations row under its run's keys (task 10414)."""
+
+    @staticmethod
+    def _config(tmp_path) -> ReconciliationConfig:
+        return _make_judge_config(
+            judge_llm_provider='claude_cli',
+            judge_llm_model='claude-sonnet-4-5',
+            explore_codebase_root=str(tmp_path),
+        )
+
+    @staticmethod
+    def _seed_run(mock_journal) -> None:
+        mock_journal.get_run = AsyncMock(return_value=ReconciliationRun(
+            id='run-j',
+            project_id='proj-j',
+            run_type=RunType.full,
+            trigger_reason='buffer_size:3',
+            started_at=datetime.now(UTC),
+            events_processed=3,
+            status=RunStatus.completed,
+            stage_reports={},
+        ))
+        mock_journal.get_run_actions_combined = AsyncMock(return_value=[])
+
+    async def _review_with_store(self, tmp_path, mock_journal, served: AgentResult):
+        self._seed_run(mock_journal)
+        db_path = tmp_path / 'curator_events.db'
+        async with CostStore(db_path) as store:
+            judge = Judge(config=self._config(tmp_path), journal=mock_journal, cost_store=store)
+            with patch('shared.cli_invoke.invoke_claude_agent', new=AsyncMock(return_value=served)):
+                outcome = await judge.review_run('run-j')
+        return outcome, await invocation_rows(db_path)
+
+    @pytest.mark.asyncio
+    async def test_review_lands_one_row_under_the_run_keys(self, tmp_path, mock_journal):
+        served = agent_result_with_tokens(
+            success=True, structured_output={'severity': 'ok', 'findings': []}, cost_usd=0.07,
+        )
+
+        outcome, rows = await self._review_with_store(tmp_path, mock_journal, served)
+
+        assert isinstance(outcome, JudgeVerdict)
+        assert len(rows) == 1
+        row = rows[0]
+        assert row['role'] == 'recon_judge'
+        assert row['run_id'] == 'run-j'
+        assert row['project_id'] == 'proj-j'
+        assert row['model'] == self._config(tmp_path).judge_llm_model
+        assert {key: row[key] for key in LEDGER_TOKENS} == LEDGER_TOKENS
+
+    @pytest.mark.asyncio
+    async def test_returned_failure_still_lands_a_row(self, tmp_path, mock_journal):
+        hung = agent_result_with_tokens(success=False, timed_out=True)
+
+        outcome, rows = await self._review_with_store(tmp_path, mock_journal, hung)
+
+        assert len(rows) == 1
+        assert isinstance(outcome, NoVerdict)
+        assert outcome.reason is NoVerdictReason.JUDGE_INFRA_FAILURE
+
+    @pytest.mark.asyncio
+    async def test_judge_without_store_writes_no_row(self, tmp_path, mock_journal):
+        self._seed_run(mock_journal)
+        judge = Judge(config=self._config(tmp_path), journal=mock_journal)
+        invoke = AsyncMock(return_value=AgentResult(
+            success=True, output='', structured_output={'severity': 'ok', 'findings': []},
+        ))
+
+        with patch('fused_memory.reconciliation.judge.invoke_with_cap_retry', new=invoke):
+            await judge.review_run('run-j')
+
+        assert 'cost_store' not in invoke.call_args.kwargs
+        assert 'role' not in invoke.call_args.kwargs

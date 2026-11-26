@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import logging
 from datetime import UTC, datetime, timedelta
 
@@ -60,21 +61,10 @@ class TestGetRecentRuns:
             'events_processed',
             'status',
             'duration_seconds',
-            'journal_entry_count',
         }
         for run in runs:
             assert set(run.keys()) == expected_fields
         assert runs[0]['project_id'] == 'dark_factory'
-
-    async def test_journal_entry_count(self, recon_conn):
-        """Runs include journal_entry_count from correlated subquery."""
-        from dashboard.data.reconciliation import get_recent_runs
-
-        runs = await get_recent_runs(recon_conn)
-        by_id = {r['id']: r for r in runs}
-        # run-001 has 2 journal entries in fixture, run-002 has 0
-        assert by_id['run-001']['journal_entry_count'] == 2
-        assert by_id['run-002']['journal_entry_count'] == 0
 
     async def test_completed_run_has_duration(self, recon_conn):
         """Completed runs should have duration_seconds calculated."""
@@ -626,11 +616,16 @@ class TestGetLatestVerdict:
 
         assert result is not None
         assert isinstance(result, dict)
-        expected_keys = {'run_id', 'severity', 'action_taken', 'reviewed_at'}
+        expected_keys = {
+            'run_id', 'severity', 'action_taken', 'reviewed_at', 'is_phantom',
+        }
         assert set(result.keys()) == expected_keys
         assert result['run_id'] == 'run-001'
         assert result['severity'] == 'low'
         assert result['action_taken'] == 'logged'
+        # The conftest fixture row is an ordinary verdict (severity='low', a
+        # single substantive finding) — a genuine review, not a phantom.
+        assert result['is_phantom'] is False
 
     async def test_empty_table(self, empty_recon_conn):
         """Returns None when judge_verdicts table has no data."""
@@ -645,6 +640,186 @@ class TestGetLatestVerdict:
 
         result = await get_latest_verdict(None)
         assert result is None
+
+
+class TestGetLatestVerdictPhantom:
+    """get_latest_verdict must flag a PHANTOM newest verdict.
+
+    A phantom is the placeholder the reconciliation judge fabricates when it
+    could not parse its own model output — the run went UNREVIEWED.  Left
+    unannotated, the dashboard's Reconciliation health row renders it as a red
+    ``verdict: serious · halt``, reporting a serious finding no judge ever
+    made.  Measured (task 3287): the newest row on the live DB today is an
+    ordinary ``ok``, so this is a LATENT mis-render — it was visible across
+    the 2026-07-20..29 stretch and returns the next time a phantom is newest.
+
+    The contract is ANNOTATE, never rewrite or skip: the phantom's own
+    severity and action are still reported verbatim, because a phantom being
+    newest is itself real signal an operator needs.
+    """
+
+    @staticmethod
+    def _verdict_insert(run_id, reviewed_at, severity, findings, action):
+        return (
+            'INSERT INTO judge_verdicts '
+            '(run_id, reviewed_at, severity, findings, action_taken) '
+            'VALUES (?, ?, ?, ?, ?)',
+            (run_id, reviewed_at, severity, findings, action),
+        )
+
+    # The post-2947 structured-marker shape, as stored in the live DB.
+    MARKED_PHANTOM_JSON = (
+        '[{"code": "unparseable_judge_response", "issue": "Judge response '
+        'could not be parsed: Expecting value: line 1 column 1", '
+        '"severity": "serious"}]'
+    )
+    # The pre-2947 legacy shape (live rows e87d8e4a, 09d14a75): no code key.
+    LEGACY_PHANTOM_JSON = (
+        '[{"issue": "Judge response could not be parsed: Expecting value: '
+        'line 1 column 1", "severity": "serious"}]'
+    )
+    # The sole genuine serious verdict (bc9459b8): five findings, no marker.
+    GENUINE_SERIOUS_JSON = (
+        '[{"issue": "Task Knowledge Sync stage failed"}, '
+        '{"issue": "second"}, {"issue": "third"}, '
+        '{"issue": "fourth"}, {"issue": "fifth"}]'
+    )
+
+    async def test_marked_phantom_is_flagged_and_reported_verbatim(self, tmp_path):
+        """(a) Marked phantom → is_phantom True, severity/action UNCHANGED."""
+        from _dashboard_helpers import make_recon_db
+
+        from dashboard.data.reconciliation import get_latest_verdict
+
+        inserts = [
+            self._verdict_insert(
+                'run-older', '2026-07-19T00:00:00+00:00', 'ok', '[]', 'none',
+            ),
+            self._verdict_insert(
+                'run-phantom', '2026-07-25T00:00:00+00:00', 'serious',
+                self.MARKED_PHANTOM_JSON, 'halt',
+            ),
+        ]
+        async with make_recon_db(tmp_path, inserts, name='marked.db') as db:
+            result = await get_latest_verdict(db)
+
+        assert result is not None
+        assert result['is_phantom'] is True
+        # Annotate, never rewrite: the stored row is left intact for forensics
+        # (task 3070's decision), so the read layer reports what is actually
+        # in the DB and lets the renderer decide how to present it.
+        assert result['run_id'] == 'run-phantom'
+        assert result['severity'] == 'serious'
+        assert result['action_taken'] == 'halt'
+
+    async def test_legacy_unmarked_phantom_is_flagged(self, tmp_path):
+        """(b) The pre-2947 shape has no marker and is caught by the fallback."""
+        from _dashboard_helpers import make_recon_db
+
+        from dashboard.data.reconciliation import get_latest_verdict
+
+        inserts = [
+            self._verdict_insert(
+                'e87d8e4a', '2026-07-20T00:00:00+00:00', 'serious',
+                self.LEGACY_PHANTOM_JSON, 'halt',
+            ),
+        ]
+        async with make_recon_db(tmp_path, inserts, name='legacy.db') as db:
+            result = await get_latest_verdict(db)
+
+        assert result is not None
+        assert result['is_phantom'] is True
+
+    async def test_genuine_serious_verdict_is_not_flagged(self, tmp_path):
+        """(c) A real five-finding serious review must NOT be flagged.
+
+        The regression that would matter most: suppressing a genuine serious
+        verdict is strictly worse than the over-report being fixed.
+        """
+        from _dashboard_helpers import make_recon_db
+
+        from dashboard.data.reconciliation import get_latest_verdict
+
+        inserts = [
+            self._verdict_insert(
+                'bc9459b8', '2026-04-19T00:00:00+00:00', 'serious',
+                self.GENUINE_SERIOUS_JSON, 'halt',
+            ),
+        ]
+        async with make_recon_db(tmp_path, inserts, name='genuine.db') as db:
+            result = await get_latest_verdict(db)
+
+        assert result is not None
+        assert result['is_phantom'] is False
+        assert result['severity'] == 'serious'
+
+    @pytest.mark.parametrize(
+        ('findings_value', 'case_id'),
+        [
+            ("'not json'", 'malformed'),
+            ('NULL', 'null'),
+            ("'{\"not\": \"a list\"}'", 'json-object-not-list'),
+            # A well-formed JSON LIST whose elements are not objects.  The
+            # decode succeeds, so the narrow json/TypeError guard never fires
+            # and the predicate itself is what has to tolerate the shape — an
+            # unguarded `.get()` would raise AttributeError here, and with_db
+            # catches only sqlite3.OperationalError/OSError, so it would escape
+            # and 500 the whole /api/v2/dashboard/recon poll payload.
+            ("'[\"a string\"]'", 'json-list-of-strings'),
+            ("'[null]'", 'json-list-of-nulls'),
+        ],
+    )
+    async def test_unparseable_findings_column_is_not_phantom_and_does_not_raise(
+        self, tmp_path, findings_value, case_id
+    ):
+        """(d) A malformed/NULL/degenerate findings column → False, never raises.
+
+        Decode and classification both live in
+        ``shared.phantom_verdict.is_phantom_verdict_json``, whose except is
+        narrow (``json.JSONDecodeError``/``TypeError``) rather than broad, so a
+        genuinely unexpected error still surfaces instead of being swallowed.
+        """
+        from _dashboard_helpers import make_recon_db
+
+        from dashboard.data.reconciliation import get_latest_verdict
+
+        inserts = [
+            'INSERT INTO judge_verdicts '
+            '(run_id, reviewed_at, severity, findings, action_taken) '
+            "VALUES ('run-bad', '2026-07-25T00:00:00+00:00', 'serious', "
+            f'{findings_value}, {chr(39)}halt{chr(39)})',
+        ]
+        async with make_recon_db(tmp_path, inserts, name=f'{case_id}.db') as db:
+            result = await get_latest_verdict(db)
+
+        assert result is not None
+        assert result['is_phantom'] is False
+
+    async def test_findings_json_is_not_shipped_in_the_payload(self, tmp_path):
+        """(e) ``findings`` is loaded to classify, then dropped.
+
+        ``/api/v2/dashboard/recon`` is a poll endpoint and the boolean is the
+        whole answer — shipping the raw JSON blob on every poll would be pure
+        overhead.
+        """
+        from _dashboard_helpers import make_recon_db
+
+        from dashboard.data.reconciliation import get_latest_verdict
+
+        inserts = [
+            self._verdict_insert(
+                'run-phantom', '2026-07-25T00:00:00+00:00', 'serious',
+                self.MARKED_PHANTOM_JSON, 'halt',
+            ),
+        ]
+        async with make_recon_db(tmp_path, inserts, name='nofindings.db') as db:
+            result = await get_latest_verdict(db)
+
+        assert result is not None
+        assert 'findings' not in result
+        assert set(result.keys()) == {
+            'run_id', 'severity', 'action_taken', 'reviewed_at', 'is_phantom',
+        }
 
 
 class TestExceptionLogging:
@@ -677,64 +852,6 @@ class TestExceptionLogging:
             r.levelno >= logging.WARNING and 'dashboard.data.db' in r.name
             for r in caplog.records
         ), f'Expected WARNING log from dashboard.data.db, got: {caplog.records}'
-
-
-class TestGetJournalEntries:
-    """Tests for get_journal_entries."""
-
-    async def test_happy_path_returns_entries(self, recon_conn):
-        """Returns list of journal entry dicts for a given run_id."""
-        from dashboard.data.reconciliation import get_journal_entries
-
-        entries = await get_journal_entries(recon_conn, 'run-001')
-
-        assert len(entries) == 2
-        expected_fields = {
-            'id', 'stage', 'timestamp', 'operation', 'target_system',
-            'before_state', 'after_state', 'reasoning', 'evidence',
-        }
-        for entry in entries:
-            assert set(entry.keys()) == expected_fields
-
-        # Ordered by timestamp — je-001 first
-        assert entries[0]['id'] == 'je-001'
-        assert entries[0]['operation'] == 'consolidate'
-        assert entries[0]['target_system'] == 'mem0'
-
-    async def test_json_fields_parsed(self, recon_conn):
-        """JSON fields (before_state, after_state, evidence) are parsed."""
-        from dashboard.data.reconciliation import get_journal_entries
-
-        entries = await get_journal_entries(recon_conn, 'run-001')
-
-        assert entries[0]['before_state'] == {'count': 5}
-        assert entries[0]['after_state'] == {'count': 3}
-        assert entries[0]['evidence'] == [{'source': 'mem0', 'id': 'm-1'}]
-
-    async def test_null_json_fields(self, recon_conn):
-        """NULL JSON fields return None/empty defaults."""
-        from dashboard.data.reconciliation import get_journal_entries
-
-        entries = await get_journal_entries(recon_conn, 'run-001')
-
-        # je-002 has NULL before_state
-        assert entries[1]['before_state'] is None
-        assert entries[1]['after_state'] == {'entities': 2}
-        assert entries[1]['evidence'] == []
-
-    async def test_empty_result_for_unknown_run(self, recon_conn):
-        """Returns empty list for a run_id with no entries."""
-        from dashboard.data.reconciliation import get_journal_entries
-
-        entries = await get_journal_entries(recon_conn, 'nonexistent-run')
-        assert entries == []
-
-    async def test_missing_db_file(self):
-        """Returns empty list when database connection is None."""
-        from dashboard.data.reconciliation import get_journal_entries
-
-        entries = await get_journal_entries(None, 'run-001')
-        assert entries == []
 
 
 # parse_utc tests live in tests/test_data_utils.py::TestParseUtc
@@ -998,6 +1115,57 @@ class TestPartitionBurstState:
         active, idle = partition_burst_state(agents, now=fixed)
         assert [a['agent_id'] for a in active] == ['inside']
         assert [a['agent_id'] for a in idle] == ['outside']
+
+
+class TestPartitionBurstStateActivity:
+    """Each active agent carries the arm of the one activity rule that admitted it."""
+
+    FIXED_NOW = datetime(2026, 10, 3, 12, 0, 0, tzinfo=UTC)
+    OLD_WRITE = '2020-01-01T00:00:00+00:00'
+
+    @pytest.mark.parametrize('state', ['bursting', 'cooling', 'running'])
+    def test_non_idle_state_is_stamped_non_idle_even_with_an_old_write(self, state):
+        from dashboard.data.reconciliation import AgentActivity, partition_burst_state
+
+        agents = [{'agent_id': 'a1', 'state': state, 'last_write_at': self.OLD_WRITE}]
+        active, idle = partition_burst_state(agents, now=self.FIXED_NOW)
+
+        assert [a['activity'] for a in active] == [AgentActivity.NON_IDLE]
+        assert idle == []
+
+    def test_idle_agent_with_a_recent_write_is_stamped_recent_write(self):
+        from dashboard.data.reconciliation import AgentActivity, partition_burst_state
+
+        recent = (self.FIXED_NOW - timedelta(minutes=10)).isoformat()
+        agents = [{'agent_id': 'a1', 'state': 'idle', 'last_write_at': recent}]
+        active, idle = partition_burst_state(agents, now=self.FIXED_NOW)
+
+        assert [a['activity'] for a in active] == [AgentActivity.RECENT_WRITE]
+        assert idle == []
+
+    def test_idle_agent_with_an_old_write_lands_in_idle_unstamped(self):
+        from dashboard.data.reconciliation import partition_burst_state
+
+        agents = [{'agent_id': 'a1', 'state': 'idle', 'last_write_at': self.OLD_WRITE}]
+        active, idle = partition_burst_state(agents, now=self.FIXED_NOW)
+
+        assert active == []
+        assert [a['agent_id'] for a in idle] == ['a1']
+        assert 'activity' not in idle[0]
+
+    def test_caller_dicts_are_not_mutated(self):
+        from dashboard.data.reconciliation import partition_burst_state
+
+        recent = (self.FIXED_NOW - timedelta(minutes=10)).isoformat()
+        agents = [
+            {'agent_id': 'a1', 'state': 'bursting'},
+            {'agent_id': 'a2', 'state': 'idle', 'last_write_at': recent},
+        ]
+        before = copy.deepcopy(agents)
+        active, _ = partition_burst_state(agents, now=self.FIXED_NOW)
+
+        assert agents == before
+        assert all(stamped is not given for stamped, given in zip(active, agents, strict=True))
 
 
 class TestWithDb:

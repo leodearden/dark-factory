@@ -1,0 +1,24 @@
+{
+  "task_id": "10991",
+  "reason": "net-additive guard: rebase_onto_main classifies pre-existing rebase state first and refuses to abort a foreign stale rebase (reify _lane-20 handover)",
+  "measures": [
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/git_ops.py",
+      "baseline": 1541,
+      "current": 1542
+    },
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/git_ops.py::GitOps::rebase_onto_main",
+      "baseline": 2,
+      "current": 3
+    },
+    {
+      "measure": "total:cognitive",
+      "key": "<cluster>",
+      "baseline": 5229,
+      "current": 5230
+    }
+  ]
+}

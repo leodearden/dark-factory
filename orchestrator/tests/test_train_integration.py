@@ -9,7 +9,7 @@ Scope:
   B1+B7 — a real 2-member, different-crate train lands via exactly ONE union verify;
            verifies-per-landed-task = 0.5 < the single-merge baseline 1.0
   B2     — a lower-member compile break is CAUGHT by the union verify → blocked
-  B3+B4  — real _select_train_members co-selects non-overlapping ranges, rejects overlapping
+  B3+B4  — real select_train_members co-selects non-overlapping ranges, rejects overlapping
   B8     — a lone merge-ready task merges solo without forming a train
 
 B5 (conflict-eject) and B6 (bounded attribution) are already locked by their owning
@@ -36,17 +36,18 @@ from typing import Any
 from unittest.mock import AsyncMock, patch
 
 import pytest
-from _serial_merge_worker import MergeWorker
+from _merge_lane_fakes import make_lane, merge_through_lane
 
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.event_store import EventStore
 from orchestrator.git_ops import GitOps, _run
-from orchestrator.merge_queue import (
+from orchestrator.merge_lane import MergeLane
+from orchestrator.merge_lane.types import QueuedBranch
+from orchestrator.merge_lane.worker import (
     GroupMergeRequest,
     MergeOutcome,
     MergeRequest,
 )
-from orchestrator.merge_types import QueuedBranch
 from orchestrator.verify import run_scoped_verification
 
 # Real git + real cargo integration module (see module docstring): a workspace
@@ -208,6 +209,7 @@ def make_train_config(repo: Path, target_dir: Path) -> OrchestratorConfig:
     """
     return OrchestratorConfig(
         project_root=repo,
+        escalate_preexisting_main_break=True,
         test_command="cargo test --workspace --quiet",
         lint_command="true",
         type_check_command="true",
@@ -279,7 +281,7 @@ class TestTrainIntegrationB1B7:
 
     async def test_two_member_train_lands_via_one_union_verify(
         self,
-        cargo_or_skip,  # noqa: ARG002
+        cargo_or_skip,
         shared_cargo_target: Path,
         tmp_path: Path,
     ) -> None:
@@ -333,10 +335,10 @@ class TestTrainIntegrationB1B7:
         )
 
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
-        worker = MergeWorker(git_ops, queue, event_store=spy)
+        lane = MergeLane(git_ops, queue, event_store=spy)
 
-        with patch("orchestrator.merge_queue.run_scoped_verification", side_effect=_spy_verify):
-            outcome = await worker._do_merge(req)
+        with patch("orchestrator.merge_lane.worker.run_scoped_verification", side_effect=_spy_verify):
+            outcome = await merge_through_lane(lane, queue, req)
 
         # (1) Outcome is done.
         assert outcome is not None
@@ -425,7 +427,7 @@ class TestTrainIntegrationB2:
     @pytest.mark.exercise_merge_verify
     async def test_lower_member_break_blocks_train(
         self,
-        cargo_or_skip,  # noqa: ARG002
+        cargo_or_skip,
         shared_cargo_target: Path,
         tmp_path: Path,
     ) -> None:
@@ -472,12 +474,12 @@ class TestTrainIntegrationB2:
         )
 
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
-        worker = MergeWorker(git_ops, queue, event_store=spy)
+        lane = MergeLane(git_ops, queue, event_store=spy)
 
         # The @pytest.mark.exercise_merge_verify marker (above) makes the autouse
-        # fixture skip the passed=True stub; the real run_scoped_verification runs
-        # here automatically — no in-body patch needed or added.
-        outcome = await worker._do_merge(req)
+        # fixture skip the passed=True stub; the lane's production verifier then
+        # runs the real run_scoped_verification — no in-body patch needed or added.
+        outcome = await merge_through_lane(lane, queue, req)
 
         # (1) Outcome is NOT done — compile break blocked the train.
         assert outcome is not None
@@ -515,7 +517,7 @@ class TestTrainIntegrationB2:
 
 @pytest.mark.asyncio
 class TestTrainIntegrationB3B4:
-    """B3+B4 selection contract: real _select_train_members over real git line ranges.
+    """B3+B4 selection contract: real select_train_members over real git line ranges.
 
     B3: two candidates edit the SAME file in NON-overlapping line ranges →
         co-selected (returns 2-member list).
@@ -536,7 +538,7 @@ class TestTrainIntegrationB3B4:
         parse_diff_line_ranges maps pure insertions to point ranges at their
         old-side anchor: (3,3) vs (21,21) → non-overlapping → co-selected.
         """
-        from orchestrator.workflow import _select_train_members
+        from orchestrator.merge_lane.train_selection import select_train_members
 
         repo = await seed_workspace_repo(tmp_path)
         config = make_train_config(repo, tmp_path / "target_b3")
@@ -578,7 +580,7 @@ class TestTrainIntegrationB3B4:
             "b3_candidate": ranges_candidate,
         }
 
-        result = _select_train_members(
+        result = select_train_members(
             "b3_anchor",
             ["b3_candidate"],
             ranges_by_id,
@@ -599,9 +601,9 @@ class TestTrainIntegrationB3B4:
 
         Both anchor and candidate modify line 3 of crate_a/src/lib.rs
         (the ``value`` field) → both get range (3,3) on the old side →
-        overlapping → _select_train_members returns [].
+        overlapping → select_train_members returns [].
         """
-        from orchestrator.workflow import _select_train_members
+        from orchestrator.merge_lane.train_selection import select_train_members
 
         repo = await seed_workspace_repo(tmp_path)
         config = make_train_config(repo, tmp_path / "target_b4")
@@ -645,7 +647,7 @@ class TestTrainIntegrationB3B4:
             "b4_candidate": ranges_candidate,
         }
 
-        result = _select_train_members(
+        result = select_train_members(
             "b4_anchor",
             ["b4_candidate"],
             ranges_by_id,
@@ -669,7 +671,7 @@ class TestTrainIntegrationB8:
     """B8 anti-starvation: a single merge-ready task merges solo without a train.
 
     A plain MergeRequest (not GroupMergeRequest) is driven through
-    MergeWorker._do_merge.  It must land directly with outcome.status=='done',
+    the production merge lane.  It must land directly with outcome.status=='done',
     its edit present on main, and NO train_started / train_merged events emitted.
 
     This establishes the solo-merge baseline (1 verify → 1 landed task =
@@ -680,7 +682,7 @@ class TestTrainIntegrationB8:
 
     async def test_solo_merge_no_train_events(
         self,
-        cargo_or_skip,  # noqa: ARG002
+        cargo_or_skip,
         shared_cargo_target: Path,
         tmp_path: Path,
     ) -> None:
@@ -712,9 +714,9 @@ class TestTrainIntegrationB8:
         )
 
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
-        worker = MergeWorker(git_ops, queue, event_store=spy)
+        lane = make_lane(git_ops, queue, event_store=spy)
 
-        outcome = await worker._do_merge(req)
+        outcome = await merge_through_lane(lane, queue, req)
 
         # (1) Outcome is done.
         assert outcome is not None

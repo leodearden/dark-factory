@@ -1,511 +1,35 @@
-"""Tests for orchestrator.b3_gate module.
+"""Tests for orchestrator.b3_gate.check_proposal's ordinary verdict path.
 
-Covers: state load/save, record_launch idempotency, charge rolling-24h cap,
-concurrency serialisation, check_proposal mechanical classification, freshness
-P1/P2 against real git fixtures, _read_latest_proposal, _resolve_cap, CLI
-main() wiring, and the two-way boundary test against the real _build_entry
-producer from dry_run_unblock.
+Covers: the mechanical risk/status/category/sha-anchor checks, three-state age
+reporting, P1/P2 freshness against real git fixtures, and the two-way boundary
+with dry_run_unblock._build_entry, the producer of the entries it checks.
+
+Siblings: test_b3_gate_state.py (the state file, record_launch and charge),
+test_b3_gate_hard_aborts.py (the entries check_proposal aborts whatever their
+freshness) and test_b3_gate_cli.py (the readers, cap config and CLI). Their
+shared scaffolding is _b3_gate_fixtures.py.
 """
 
 from __future__ import annotations
 
-import json
-import os
-import sqlite3
 import subprocess
-from datetime import UTC, datetime, timedelta
-from pathlib import Path
-from unittest.mock import MagicMock
+from datetime import UTC, datetime
 
-# ---------------------------------------------------------------------------
-# Shared helpers (adapted from test_dry_run_unblock.py)
-# ---------------------------------------------------------------------------
+from _agent_result_fakes import make_agent_result
+from _b3_gate_fixtures import (
+    diverged_repo,
+    fake_git_diff_fails,
+    fake_git_fresh,
+    fake_git_never_called,
+    low_risk_entry,
+)
+from _git_fixtures import RepoSeed
 
-def _init_git_repo(path: Path) -> str:
-    """Init a minimal git repo at *path* (on 'main' branch), return HEAD sha."""
-    p = str(path)
-    subprocess.run(['git', 'init', '-b', 'main', p], check=True, capture_output=True)
-    subprocess.run(['git', '-C', p, 'config', 'user.name', 'Test User'],
-                   check=True, capture_output=True)
-    subprocess.run(['git', '-C', p, 'config', 'user.email', 'test@example.com'],
-                   check=True, capture_output=True)
-    (path / 'README.md').write_text('init')
-    subprocess.run(['git', '-C', p, 'add', '.'], check=True, capture_output=True)
-    subprocess.run(['git', '-C', p, 'commit', '-m', 'initial commit'],
-                   check=True, capture_output=True)
-    result = subprocess.run(['git', '-C', p, 'rev-parse', 'HEAD'],
-                            check=True, capture_output=True, text=True)
-    return result.stdout.strip()
-
-
-def _diverge_feature_branch(path: Path) -> str:
-    """Create a feature branch with one extra commit so HEAD != main.
-
-    Returns the new HEAD sha (feature commit).
-    """
-    p = str(path)
-    subprocess.run(['git', '-C', p, 'checkout', '-b', 'feature'],
-                   check=True, capture_output=True)
-    (path / 'extra.txt').write_text('feature work')
-    subprocess.run(['git', '-C', p, 'add', '.'], check=True, capture_output=True)
-    subprocess.run(['git', '-C', p, 'commit', '-m', 'feature commit'],
-                   check=True, capture_output=True)
-    result = subprocess.run(['git', '-C', p, 'rev-parse', 'HEAD'],
-                            check=True, capture_output=True, text=True)
-    return result.stdout.strip()
-
-
-def _make_agent_result(*, success=True, cost_usd=0.50, structured_output=None,
-                       subtype='', output='', duration_ms=1000,
-                       timed_out=False, transcript_turns=None, session_id='',
-                       stderr='', turns=0, api_error_status=None,
-                       schema_salvaged=False, output_tokens=None,
-                       ended_awaiting_background=False):
-    """Create a minimal MagicMock AgentResult stand-in for _build_entry tests.
-
-    NOTE: duplicated verbatim in test_dry_run_unblock.py (task 2020 review:
-    code_duplication). Both copies must be extended together whenever
-    shared.cli_invoke.AgentResult gains/renames a field consumed by
-    classify_agent_failure(). Out of this task's locked scope: hoisting both
-    into the existing orchestrator/tests/_orch_helpers.py shared-helper
-    module (the established convention for cross-suite test helpers in this
-    package) is a follow-up.
-    """
-    r = MagicMock()
-    r.success = success
-    r.cost_usd = cost_usd
-    r.structured_output = structured_output
-    r.subtype = subtype
-    r.output = output
-    r.duration_ms = duration_ms
-    # Faithful diagnostic-field defaults (mirrors shared.cli_invoke.AgentResult).
-    # A bare MagicMock auto-vivifies every unset attribute as a truthy
-    # MagicMock, which would silently corrupt classify_agent_failure()'s
-    # decision rules: .timed_out truthy -> misclassifies every failure as
-    # TIMED_OUT -> infra; .schema_salvaged truthy -> misclassifies a generic
-    # failure as STRUCTURAL instead of UNKNOWN. Setting explicit defaults for
-    # every field classify_agent_failure() consults (including
-    # .output_tokens, read when formatting the MAX_TURNS summary) keeps
-    # these mocks faithful stand-ins for its decision rules.
-    r.timed_out = timed_out
-    r.transcript_turns = transcript_turns
-    r.session_id = session_id
-    r.stderr = stderr
-    r.turns = turns
-    r.api_error_status = api_error_status
-    r.schema_salvaged = schema_salvaged
-    r.output_tokens = output_tokens
-    # task 2761: classify_agent_failure now reads .ended_awaiting_background
-    # (rule 2, above the timed_out rule). A bare MagicMock auto-vivifies it as
-    # a truthy stand-in, which would misclassify every failure as
-    # ENDED_AWAITING_BACKGROUND -> investigation_failed. Default it False.
-    r.ended_awaiting_background = ended_awaiting_background
-    return r
-
-
-def _seed_tasks_db(
-    project_root: Path, task_id: int, proposals: list, *, description: str = '',
-) -> None:
-    """Seed a minimal tasks.db at <project_root>/.taskmaster/tasks/tasks.db.
-
-    Creates the table with columns: tag, id, status, priority, metadata,
-    updated_at, description. Inserts one row with tag='master', the given
-    task_id, and the proposals list serialised into metadata JSON as
-    {'dry_run_proposals': proposals}. `description` defaults to '' — every
-    pre-task-2509 call site omits it and gets the same empty-description row
-    as before (b3_gate._read_task_description treats '' as "no description").
-    """
-    db_dir = project_root / '.taskmaster' / 'tasks'
-    db_dir.mkdir(parents=True, exist_ok=True)
-    db_path = db_dir / 'tasks.db'
-    conn = sqlite3.connect(str(db_path))
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS tasks (
-            tag TEXT NOT NULL,
-            id INTEGER NOT NULL,
-            status TEXT,
-            priority TEXT,
-            metadata TEXT,
-            updated_at TEXT,
-            description TEXT,
-            PRIMARY KEY (tag, id)
-        )
-    """)
-    metadata = json.dumps({'dry_run_proposals': proposals})
-    conn.execute(
-        "INSERT OR REPLACE INTO tasks "
-        "(tag, id, status, priority, metadata, updated_at, description) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?)",
-        ('master', task_id, 'blocked', 'medium', metadata,
-         '2026-06-04T00:00:00+00:00', description),
-    )
-    conn.commit()
-    conn.close()
-
-
-# ---------------------------------------------------------------------------
-# step-1: state load/save round-trip + atomicity
-# ---------------------------------------------------------------------------
-
-class TestStateLoadSave:
-    def test_load_missing_returns_empty(self, tmp_path):
-        from orchestrator.b3_gate import _load_state
-        path = tmp_path / 'b3-state.json'
-        state = _load_state(path)
-        assert state == {'launches': [], 'charges': []}
-
-    def test_save_creates_parents_and_roundtrips(self, tmp_path):
-        from orchestrator.b3_gate import _load_state, _save_state
-        path = tmp_path / 'deep' / 'nested' / 'b3-state.json'
-        state = {'launches': [{'task_id': '1', 'head_sha': 'abc'}], 'charges': []}
-        _save_state(path, state)
-        assert path.exists()
-        loaded = _load_state(path)
-        assert loaded == state
-
-    def test_save_uses_atomic_replace(self, tmp_path, monkeypatch):
-        """Verify os.replace is called (atomic swap), not a direct write."""
-        from orchestrator import b3_gate
-        replaced = []
-        real_replace = os.replace
-
-        def mock_replace(src, dst):
-            replaced.append((src, dst))
-            real_replace(src, dst)
-
-        monkeypatch.setattr(os, 'replace', mock_replace)
-        path = tmp_path / 'b3-state.json'
-        b3_gate._save_state(path, {'launches': [], 'charges': []})
-        assert len(replaced) == 1, 'expected exactly one os.replace call'
-        src, dst = replaced[0]
-        assert dst == str(path) or Path(dst) == path
-        assert src != dst  # tmp != final
-
-    def test_no_leftover_tmp(self, tmp_path):
-        """No leftover .tmp file after a successful save."""
-        from orchestrator.b3_gate import _save_state
-        path = tmp_path / 'b3-state.json'
-        _save_state(path, {'launches': [], 'charges': []})
-        tmp_files = list(tmp_path.glob('*.tmp'))
-        assert tmp_files == [], f'leftover tmp files: {tmp_files}'
-
-
-# ---------------------------------------------------------------------------
-# step-3: record_launch durable + idempotent
-# ---------------------------------------------------------------------------
-
-class TestRecordLaunch:
-    _NOW = datetime(2026, 6, 4, 10, 0, 0, tzinfo=UTC)
-
-    def test_first_call_records_and_persists(self, tmp_path):
-        from orchestrator.b3_gate import _load_state, _state_path, record_launch
-        sp = _state_path(tmp_path)
-        result = record_launch(
-            '42', 'aabbcc', '2026-06-04T09:00:00+00:00',
-            state_path=sp, now=self._NOW,
-        )
-        assert result == {'recorded': True, 'already_attempted': False}
-        # Durability: reload from disk
-        state = _load_state(sp)
-        assert len(state['launches']) == 1
-        entry = state['launches'][0]
-        assert entry['task_id'] == '42'
-        assert entry['head_sha'] == 'aabbcc'
-        assert entry['investigated_at'] == '2026-06-04T09:00:00+00:00'
-        assert 'recorded_at' in entry
-
-    def test_second_call_same_key_is_idempotent(self, tmp_path):
-        from orchestrator.b3_gate import _load_state, _state_path, record_launch
-        sp = _state_path(tmp_path)
-        record_launch('42', 'aabbcc', '2026-06-04T09:00:00+00:00',
-                      state_path=sp, now=self._NOW)
-        # Second call with same (task_id, head_sha, investigated_at)
-        result2 = record_launch('42', 'aabbcc', '2026-06-04T09:00:00+00:00',
-                                state_path=sp, now=self._NOW)
-        assert result2 == {'recorded': False, 'already_attempted': True}
-        state = _load_state(sp)
-        assert len(state['launches']) == 1, 'spent key must not be re-added'
-
-    def test_different_investigated_at_rearms(self, tmp_path):
-        from orchestrator.b3_gate import _load_state, _state_path, record_launch
-        sp = _state_path(tmp_path)
-        record_launch('42', 'aabbcc', '2026-06-04T09:00:00+00:00',
-                      state_path=sp, now=self._NOW)
-        # New investigated_at == fresh investigation -> re-armed
-        result = record_launch('42', 'aabbcc', '2026-06-04T09:30:00+00:00',
-                               state_path=sp, now=self._NOW)
-        assert result == {'recorded': True, 'already_attempted': False}
-        state = _load_state(sp)
-        assert len(state['launches']) == 2
-
-    def test_different_head_sha_rearms(self, tmp_path):
-        from orchestrator.b3_gate import _load_state, _state_path, record_launch
-        sp = _state_path(tmp_path)
-        record_launch('42', 'aabbcc', '2026-06-04T09:00:00+00:00',
-                      state_path=sp, now=self._NOW)
-        result = record_launch('42', 'deadbeef', '2026-06-04T09:00:00+00:00',
-                               state_path=sp, now=self._NOW)
-        assert result == {'recorded': True, 'already_attempted': False}
-        state = _load_state(sp)
-        assert len(state['launches']) == 2
-
-    def test_durability_across_restart(self, tmp_path):
-        """Simulate restart: re-import and reload from disk confirms persistence."""
-        from orchestrator.b3_gate import _load_state, _state_path, record_launch
-        sp = _state_path(tmp_path)
-        record_launch('7', 'sha1', 'ts1', state_path=sp, now=self._NOW)
-        # Simulate restart: load fresh state from disk (no in-memory cache)
-        state_after = _load_state(sp)
-        assert len(state_after['launches']) == 1
-        # Now call again — should see the spent key
-        result = record_launch('7', 'sha1', 'ts1', state_path=sp, now=self._NOW)
-        assert result['already_attempted'] is True
-
-
-# ---------------------------------------------------------------------------
-# step-5: charge rolling-24h cap
-# ---------------------------------------------------------------------------
-
-class TestCharge:
-    _NOW = datetime(2026, 6, 4, 12, 0, 0, tzinfo=UTC)
-
-    def test_two_charges_succeed_third_refused(self, tmp_path):
-        from orchestrator.b3_gate import _state_path, charge
-        sp = _state_path(tmp_path)
-        r1 = charge('42', state_path=sp, cap=2, now=self._NOW)
-        assert r1['charged'] is True
-        assert r1['remaining'] == 1
-        r2 = charge('42', state_path=sp, cap=2, now=self._NOW)
-        assert r2['charged'] is True
-        assert r2['remaining'] == 0
-        r3 = charge('42', state_path=sp, cap=2, now=self._NOW)
-        assert r3['charged'] is False
-        assert r3['remaining'] == 0
-
-    def test_old_charge_outside_window_not_counted(self, tmp_path):
-        from orchestrator.b3_gate import _save_state, _state_path, charge
-        sp = _state_path(tmp_path)
-        # Seed an old charge older than 24h
-        old_ts = (self._NOW - timedelta(hours=25)).isoformat()
-        state = {'launches': [], 'charges': [{'task_id': '42', 'charged_at': old_ts}]}
-        _save_state(sp, state)
-        # With cap=1, the old charge must NOT count -> remaining=1 -> charge succeeds
-        r = charge('42', state_path=sp, cap=1, now=self._NOW)
-        assert r['charged'] is True
-        assert r['remaining'] == 0
-
-    def test_in_window_charge_counted(self, tmp_path):
-        from orchestrator.b3_gate import _save_state, _state_path, charge
-        sp = _state_path(tmp_path)
-        # Seed an in-window charge (12h ago)
-        recent_ts = (self._NOW - timedelta(hours=12)).isoformat()
-        state = {'launches': [], 'charges': [{'task_id': '42', 'charged_at': recent_ts}]}
-        _save_state(sp, state)
-        # With cap=1, in-window charge exhausts cap
-        r = charge('42', state_path=sp, cap=1, now=self._NOW)
-        assert r['charged'] is False
-        assert r['remaining'] == 0
-
-    def test_durability_in_window_persists_across_reload(self, tmp_path):
-        """Charges survive disk reload — count resets only when window expires."""
-        from orchestrator.b3_gate import _cap_remaining, _load_state, _state_path, charge
-        sp = _state_path(tmp_path)
-        charge('42', state_path=sp, cap=3, now=self._NOW)
-        charge('42', state_path=sp, cap=3, now=self._NOW)
-        # Reload state from disk
-        state = _load_state(sp)
-        rem = _cap_remaining(state, 3, self._NOW)
-        assert rem == 1
-
-
-# ---------------------------------------------------------------------------
-# task-1808 step-5: corrupt b3-state.json → cap-bearing paths fail CLOSED
-# ---------------------------------------------------------------------------
-
-class TestCorruptStateFailsClosed:
-    """Corrupt b3-state.json → cap-bearing paths must fail CLOSED (cap exhausted).
-
-    All three cap-bearing callers (charge, run_check, record_launch) must
-    treat a corrupt state as fully exhausted and must NOT overwrite the file
-    (preserves the corrupt bytes for forensics; prevents silent cap-reset).
-    """
-
-    _NOW = datetime(2026, 6, 4, 12, 0, 0, tzinfo=UTC)
-
-    def _make_corrupt_state(self, tmp_path):
-        """Write a corrupt JSON state file and return its Path."""
-        from orchestrator.b3_gate import _state_path
-        sp = _state_path(tmp_path)
-        sp.parent.mkdir(parents=True, exist_ok=True)
-        sp.write_text('not valid json {{{{', encoding='utf-8')
-        return sp
-
-    def test_charge_on_corrupt_returns_exhausted(self, tmp_path):
-        """charge() on corrupt state → charged=False, remaining=0 (NOT a full-cap reset)."""
-        from orchestrator.b3_gate import charge
-        sp = self._make_corrupt_state(tmp_path)
-        result = charge('t', state_path=sp, cap=6, now=self._NOW)
-        assert result['charged'] is False, (
-            f'Expected charged=False for corrupt state; got {result}'
-        )
-        assert result['remaining'] == 0, (
-            f'Expected remaining=0 for corrupt state; got {result}'
-        )
-
-    def test_charge_on_corrupt_does_not_overwrite(self, tmp_path):
-        """charge() on corrupt state must NOT overwrite the file."""
-        from orchestrator.b3_gate import charge
-        sp = self._make_corrupt_state(tmp_path)
-        original = sp.read_text(encoding='utf-8')
-        charge('t', state_path=sp, cap=6, now=self._NOW)
-        assert sp.read_text(encoding='utf-8') == original, (
-            'charge() must not overwrite a corrupt state file'
-        )
-
-    def test_run_check_cap_remaining_zero_on_corrupt(self, tmp_path):
-        """run_check with a corrupt state file reports cap_remaining==0 and already_attempted==False."""
-        import argparse
-        import contextlib
-        import io as _io
-        import json as _json
-
-        from orchestrator.b3_gate import run_check
-        self._make_corrupt_state(tmp_path)
-
-        args = argparse.Namespace(
-            task_id='42',
-            worktree=str(tmp_path),
-            project_root=str(tmp_path),
-            config=None,
-            now=self._NOW.isoformat(),
-            tag='master',
-            category=None,
-            verb='check',
-        )
-        buf = _io.StringIO()
-        with contextlib.redirect_stdout(buf):
-            run_check(args)
-        result = _json.loads(buf.getvalue())
-        assert result['cap_remaining'] == 0, (
-            f'Expected cap_remaining=0 for corrupt state; got {result}'
-        )
-        # Both state-derived fields must reflect the fail-closed contract.
-        # already_attempted=False is the *permissive* value, but it is correct
-        # here because we cannot read prior records — consumers must gate on
-        # cap_remaining (or charge()), not already_attempted.
-        assert result['already_attempted'] is False, (
-            f'Expected already_attempted=False for corrupt state; got {result}'
-        )
-
-    def test_record_launch_on_corrupt_fails_closed(self, tmp_path):
-        """record_launch() on corrupt state → recorded=False without overwriting."""
-        from orchestrator.b3_gate import record_launch
-        sp = self._make_corrupt_state(tmp_path)
-        original = sp.read_text(encoding='utf-8')
-        result = record_launch(
-            '42', 'deadbeef', '2026-06-04T09:00:00+00:00',
-            state_path=sp, now=self._NOW,
-        )
-        assert result['recorded'] is False, (
-            f'Expected recorded=False for corrupt state; got {result}'
-        )
-        assert sp.read_text(encoding='utf-8') == original, (
-            'record_launch() must not overwrite a corrupt state file'
-        )
-
-    def test_missing_state_still_yields_full_cap(self, tmp_path):
-        """MISSING state → fresh (benign), charge() succeeds at full cap."""
-        from orchestrator.b3_gate import _state_path, charge
-        sp = _state_path(tmp_path)
-        # File does not exist → benign fresh state
-        result = charge('t', state_path=sp, cap=6, now=self._NOW)
-        assert result['charged'] is True, (
-            f'Expected charged=True for missing (fresh) state; got {result}'
-        )
-        assert result['remaining'] == 5, (
-            f'Expected remaining=5 for fresh state with cap=6; got {result}'
-        )
-
-
-# ---------------------------------------------------------------------------
-# step-7: concurrency — two concurrent charge calls must serialize
-# ---------------------------------------------------------------------------
-
-class TestChargeConcurrency:
-    """Two threads racing on cap=1 must not both succeed."""
-
-    def test_only_one_charge_wins(self, tmp_path):
-        import threading
-
-        from orchestrator.b3_gate import _load_state, _state_path, charge
-
-        sp = _state_path(tmp_path)
-        # Ensure state file exists before threads start (avoids mkdir race)
-        from orchestrator.b3_gate import _save_state
-        _save_state(sp, {'launches': [], 'charges': []})
-
-        now = datetime(2026, 6, 4, 12, 0, 0, tzinfo=UTC)
-        results = []
-        barrier = threading.Barrier(2)
-
-        def worker():
-            barrier.wait()  # Both threads release simultaneously
-            r = charge('42', state_path=sp, cap=1, now=now)
-            results.append(r)
-
-        t1 = threading.Thread(target=worker)
-        t2 = threading.Thread(target=worker)
-        t1.start()
-        t2.start()
-        t1.join(timeout=10)
-        t2.join(timeout=10)
-
-        assert len(results) == 2
-        charged = [r for r in results if r['charged']]
-        refused = [r for r in results if not r['charged']]
-        assert len(charged) == 1, f'expected exactly 1 charged, got {results}'
-        assert len(refused) == 1, f'expected exactly 1 refused, got {results}'
-
-        # Persisted state must have exactly one in-window charge
-        state = _load_state(sp)
-        assert len(state['charges']) == 1, (
-            f'expected exactly 1 persisted charge, got {state["charges"]}'
-        )
-
+_FOO_ON_MAIN = RepoSeed(files=(('foo.py', 'original content'),), message='add foo.py')
 
 # ---------------------------------------------------------------------------
 # step-9: check_proposal mechanical classification (fake git runner)
 # ---------------------------------------------------------------------------
-
-def _fake_git_fresh(args, cwd):
-    """Fake git runner: HEAD == recorded sha, diff is empty (fresh)."""
-    if 'rev-parse' in args:
-        return (0, 'aaabbbccc')
-    return (0, '')  # diff empty
-
-
-def _fake_git_never_called(args, cwd):
-    raise AssertionError(f'git should not have been called; args={args}')
-
-
-def _fake_git_diff_fails(args, cwd):
-    """Fake git runner: rev-parse HEAD succeeds (P1 passes), but diff returns non-zero rc."""
-    if 'rev-parse' in args:
-        return (0, 'aaabbbccc')
-    # diff call fails (e.g. bad revision, transient error)
-    return (128, 'fatal: bad revision dddeeefff..main')
-
-
-_LOW_RISK_ENTRY = {
-    'proposal_text': 'Fix it',
-    'risk_label': 'low',
-    'files_referenced': ['foo.py'],
-    'block_reason': 'test',
-    'investigated_at': '2026-06-04T09:00:00+00:00',
-    'head_sha': 'aaabbbccc',
-    'main_sha': 'dddeeefff',
-}
-
 
 class TestCheckProposalMechanical:
     _NOW = datetime(2026, 6, 4, 12, 0, 0, tzinfo=UTC)
@@ -514,37 +38,37 @@ class TestCheckProposalMechanical:
         from orchestrator.b3_gate import ABORT, check_proposal
         result = check_proposal(
             None, worktree='/tmp', category=None,
-            run_git=_fake_git_never_called, now=self._NOW,
+            run_git=fake_git_never_called, now=self._NOW,
         )
         assert result['verdict'] == ABORT
         assert 'proposal' in result['reason'].lower()
 
     def test_medium_risk_aborts(self):
         from orchestrator.b3_gate import ABORT, check_proposal
-        entry = {**_LOW_RISK_ENTRY, 'risk_label': 'medium'}
+        entry = low_risk_entry(risk_label='medium')
         result = check_proposal(entry, worktree='/tmp', category=None,
-                                run_git=_fake_git_never_called, now=self._NOW)
+                                run_git=fake_git_never_called, now=self._NOW)
         assert result['verdict'] == ABORT
 
     def test_human_review_risk_aborts(self):
         from orchestrator.b3_gate import ABORT, check_proposal
-        entry = {**_LOW_RISK_ENTRY, 'risk_label': 'human-review-required'}
+        entry = low_risk_entry(risk_label='human-review-required')
         result = check_proposal(entry, worktree='/tmp', category=None,
-                                run_git=_fake_git_never_called, now=self._NOW)
+                                run_git=fake_git_never_called, now=self._NOW)
         assert result['verdict'] == ABORT
 
     def test_status_key_present_aborts(self):
         from orchestrator.b3_gate import ABORT, check_proposal
-        entry = {**_LOW_RISK_ENTRY, 'status': 'investigation_failed'}
+        entry = low_risk_entry(status='investigation_failed')
         result = check_proposal(entry, worktree='/tmp', category=None,
-                                run_git=_fake_git_never_called, now=self._NOW)
+                                run_git=fake_git_never_called, now=self._NOW)
         assert result['verdict'] == ABORT
 
     def test_invalid_category_aborts(self):
         from orchestrator.b3_gate import ABORT, check_proposal
         result = check_proposal(
-            _LOW_RISK_ENTRY, worktree='/tmp', category='infra_issue',
-            run_git=_fake_git_never_called, now=self._NOW,
+            low_risk_entry(), worktree='/tmp', category='infra_issue',
+            run_git=fake_git_never_called, now=self._NOW,
         )
         assert result['verdict'] == ABORT
 
@@ -553,8 +77,8 @@ class TestCheckProposalMechanical:
         for cat in ('task_failure', 'review_issues'):
             # Should NOT abort on category check (may abort/drift/fresh for other reasons)
             result = check_proposal(
-                _LOW_RISK_ENTRY, worktree='/tmp', category=cat,
-                run_git=_fake_git_fresh, now=self._NOW,
+                low_risk_entry(), worktree='/tmp', category=cat,
+                run_git=fake_git_fresh, now=self._NOW,
             )
             # Category check passes -> proceeds to freshness check -> fresh
             assert result['verdict'] != ABORT or 'category' not in result['reason'].lower(), \
@@ -564,35 +88,35 @@ class TestCheckProposalMechanical:
         from orchestrator.b3_gate import check_proposal
         # category=None -> skip category check entirely -> proceeds to freshness
         result = check_proposal(
-            _LOW_RISK_ENTRY, worktree='/tmp', category=None,
-            run_git=_fake_git_fresh, now=self._NOW,
+            low_risk_entry(), worktree='/tmp', category=None,
+            run_git=fake_git_fresh, now=self._NOW,
         )
         # Should not abort on category; may be fresh or drift depending on git
         assert 'verdict' in result
 
     def test_missing_head_sha_drifts(self):
         from orchestrator.b3_gate import DRIFT, check_proposal
-        entry = {**_LOW_RISK_ENTRY}
+        entry = low_risk_entry()
         del entry['head_sha']
         result = check_proposal(entry, worktree='/tmp', category=None,
-                                run_git=_fake_git_never_called, now=self._NOW)
+                                run_git=fake_git_never_called, now=self._NOW)
         assert result['verdict'] == DRIFT
         assert 'sha anchor' in result['reason'].lower()
 
     def test_missing_main_sha_drifts(self):
         from orchestrator.b3_gate import DRIFT, check_proposal
-        entry = {**_LOW_RISK_ENTRY}
+        entry = low_risk_entry()
         del entry['main_sha']
         result = check_proposal(entry, worktree='/tmp', category=None,
-                                run_git=_fake_git_never_called, now=self._NOW)
+                                run_git=fake_git_never_called, now=self._NOW)
         assert result['verdict'] == DRIFT
         assert 'sha anchor' in result['reason'].lower()
 
     def test_none_head_sha_drifts(self):
         from orchestrator.b3_gate import DRIFT, check_proposal
-        entry = {**_LOW_RISK_ENTRY, 'head_sha': None}
+        entry = low_risk_entry(head_sha=None)
         result = check_proposal(entry, worktree='/tmp', category=None,
-                                run_git=_fake_git_never_called, now=self._NOW)
+                                run_git=fake_git_never_called, now=self._NOW)
         assert result['verdict'] == DRIFT
 
     # step-21: P2 diff failure must not fall through to fresh (fail-closed)
@@ -601,13 +125,13 @@ class TestCheckProposalMechanical:
 
         Pin the fail-closed contract: a git failure (unreachable main_sha, missing
         'main' ref, transient git error) must never fall through to a merge-authorizing
-        FRESH verdict.  _LOW_RISK_ENTRY has files_referenced=['foo.py'] so the diff IS
-        invoked; _fake_git_diff_fails returns rc=128 for the diff call.
+        FRESH verdict.  low_risk_entry() has files_referenced=['foo.py'] so the diff IS
+        invoked; fake_git_diff_fails returns rc=128 for the diff call.
         """
         from orchestrator.b3_gate import DRIFT, check_proposal
         result = check_proposal(
-            _LOW_RISK_ENTRY, worktree='/tmp', category=None,
-            run_git=_fake_git_diff_fails, now=self._NOW,
+            low_risk_entry(), worktree='/tmp', category=None,
+            run_git=fake_git_diff_fails, now=self._NOW,
         )
         assert result['verdict'] == DRIFT, (
             f'expected DRIFT when git diff fails, got {result["verdict"]!r}: {result}'
@@ -618,63 +142,245 @@ class TestCheckProposalMechanical:
 
 
 # ---------------------------------------------------------------------------
-# step-11: freshness P1/P2 against a REAL git fixture
+# task 5361 step-1: three-state age reporting — `age_state` closed domain
 # ---------------------------------------------------------------------------
 
-def _run_git_real(args, cwd):
-    """Real git runner for freshness tests."""
-    from orchestrator.b3_gate import _run_git
-    return _run_git(args, cwd)
 
+class TestAgeStateThreeState:
+    """`check_proposal` names WHY it has no age, instead of collapsing to None.
+
+    Four distinct causes previously all surfaced as a bare `age_seconds: None`,
+    indistinguishable to every consumer: an absent timestamp, an unparseable
+    string (ValueError), an awareness mismatch between the two operands
+    (TypeError), and no clock supplied at all.  THREE states now cover those
+    four causes — hence this class's name.  The mismatch shares
+    `AGE_UNPARSEABLE` with the malformed string because the fault is the PAIR,
+    not one operand; `_age_of`'s warning names both so the shared state cannot
+    misdirect an operator.
+    """
+
+    _NOW = datetime(2026, 6, 4, 12, 0, 0, tzinfo=UTC)
+
+    @staticmethod
+    def _states():
+        from orchestrator.b3_gate import (
+            AGE_ABSENT,
+            AGE_NO_CLOCK,
+            AGE_PARSED,
+            AGE_UNPARSEABLE,
+        )
+        return {AGE_PARSED, AGE_UNPARSEABLE, AGE_ABSENT, AGE_NO_CLOCK}
+
+    def test_valid_aware_timestamp_is_parsed(self):
+        from orchestrator.b3_gate import AGE_PARSED, check_proposal
+        result = check_proposal(
+            low_risk_entry(), worktree='/tmp', category=None,
+            run_git=fake_git_fresh, now=self._NOW,
+        )
+        assert result['age_state'] == AGE_PARSED, result
+        assert result['age_seconds'] == 10800.0, result
+
+    def test_unparseable_timestamp_is_distinguished(self):
+        from orchestrator.b3_gate import AGE_UNPARSEABLE, check_proposal
+        entry = low_risk_entry(investigated_at='not-a-date')
+        result = check_proposal(
+            entry, worktree='/tmp', category=None,
+            run_git=fake_git_fresh, now=self._NOW,
+        )
+        assert result['age_state'] == AGE_UNPARSEABLE, result
+        assert result['age_seconds'] is None, result
+
+    def test_naive_timestamp_against_aware_clock_is_unparseable(self):
+        """The TypeError branch — a DIFFERENT cause from the ValueError above,
+        and the one most likely to arise from a real producer bug."""
+        from orchestrator.b3_gate import AGE_UNPARSEABLE, check_proposal
+        entry = low_risk_entry(investigated_at='2026-06-04T09:00:00')
+        result = check_proposal(
+            entry, worktree='/tmp', category=None,
+            run_git=fake_git_fresh, now=self._NOW,
+        )
+        assert result['age_state'] == AGE_UNPARSEABLE, result
+        assert result['age_seconds'] is None, result
+
+    def test_aware_timestamp_against_naive_clock_is_unparseable(self):
+        """The OPERATOR-side mismatch: `run_check._parse_now` passes any
+        `--now` string straight through `fromisoformat`, so a naive one fails
+        against a perfectly well-formed aware `investigated_at`.  Same
+        TypeError, same state, opposite culprit from the test above."""
+        from orchestrator.b3_gate import AGE_UNPARSEABLE, check_proposal
+        result = check_proposal(
+            low_risk_entry(), worktree='/tmp', category=None,
+            run_git=fake_git_fresh, now=datetime(2026, 6, 4, 12, 0, 0),
+        )
+        assert result['age_state'] == AGE_UNPARSEABLE, result
+        assert result['age_seconds'] is None, result
+
+    def test_warning_names_both_operands_not_just_the_entry(self, caplog):
+        """The state cannot say which operand is at fault, so the message must
+        name both.  Blaming `investigated_at` alone points an operator at the
+        proposal when a naive `--now` of their own is the actual fault."""
+        import logging as _logging
+
+        from orchestrator.b3_gate import check_proposal
+        naive_now = datetime(2026, 6, 4, 12, 0, 0)
+
+        with caplog.at_level(_logging.WARNING, logger='orchestrator.b3_gate'):
+            check_proposal(
+                low_risk_entry(), worktree='/tmp', category=None,
+                run_git=fake_git_fresh, now=naive_now,
+            )
+
+        messages = [
+            r.getMessage() for r in caplog.records
+            if r.levelno == _logging.WARNING and r.name == 'orchestrator.b3_gate'
+        ]
+        assert len(messages) == 1, messages
+        assert low_risk_entry()['investigated_at'] in messages[0], messages[0]
+        assert repr(naive_now) in messages[0], messages[0]
+
+    def test_missing_timestamp_key_is_absent(self):
+        from orchestrator.b3_gate import AGE_ABSENT, check_proposal
+        entry = low_risk_entry()
+        del entry['investigated_at']
+        result = check_proposal(
+            entry, worktree='/tmp', category=None,
+            run_git=fake_git_fresh, now=self._NOW,
+        )
+        assert result['age_state'] == AGE_ABSENT, result
+        assert result['age_seconds'] is None, result
+
+    def test_empty_timestamp_is_absent(self):
+        from orchestrator.b3_gate import AGE_ABSENT, check_proposal
+        entry = low_risk_entry(investigated_at='')
+        result = check_proposal(
+            entry, worktree='/tmp', category=None,
+            run_git=fake_git_fresh, now=self._NOW,
+        )
+        assert result['age_state'] == AGE_ABSENT, result
+
+    def test_no_clock_is_its_own_state(self):
+        from orchestrator.b3_gate import AGE_NO_CLOCK, check_proposal
+        result = check_proposal(
+            low_risk_entry(), worktree='/tmp', category=None,
+            run_git=fake_git_fresh, now=None,
+        )
+        assert result['age_state'] == AGE_NO_CLOCK, result
+        assert result['age_seconds'] is None, result
+
+    def test_none_entry_early_return_carries_age_state(self):
+        """Shape parity: EVERY return path carries the key, so a consumer never
+        has to distinguish 'absent key' from 'old entry' from a real state."""
+        from orchestrator.b3_gate import AGE_ABSENT, check_proposal
+        result = check_proposal(
+            None, worktree='/tmp', category=None,
+            run_git=fake_git_never_called, now=self._NOW,
+        )
+        assert result['age_state'] == AGE_ABSENT, result
+        assert result['age_state'] in self._states(), result
+
+    def test_unparseable_timestamp_warns_instead_of_swallowing(self, caplog):
+        """Replaces today's silent `except Exception: pass`."""
+        import logging as _logging
+
+        from orchestrator.b3_gate import check_proposal
+        entry = low_risk_entry(investigated_at='not-a-date')
+
+        with caplog.at_level(_logging.WARNING, logger='orchestrator.b3_gate'):
+            check_proposal(
+                entry, worktree='/tmp', category=None,
+                run_git=fake_git_fresh, now=self._NOW,
+            )
+
+        warn_records = [
+            r for r in caplog.records
+            if r.levelno == _logging.WARNING and r.name == 'orchestrator.b3_gate'
+            and 'not-a-date' in r.getMessage()
+        ]
+        assert len(warn_records) == 1, (
+            f'Expected exactly one WARNING under orchestrator.b3_gate naming the '
+            f'offending investigated_at value; got records: '
+            f'{[(r.name, r.getMessage()) for r in caplog.records]}'
+        )
+
+
+# ---------------------------------------------------------------------------
+# task 5361 step-3: the gate never certifies FRESH without a parsed age
+# ---------------------------------------------------------------------------
+
+
+class TestFreshRequiresParsedAge:
+    """FRESH authorises unattended edits and merges to main.
+
+    A gate with that authority must not certify a proposal fresh when it cannot
+    determine the proposal's age at all — whatever the cause.  The positive
+    control is the load-bearing case here: without it, "fails closed" could be
+    satisfied by a gate that never returns FRESH at all.
+    """
+
+    _NOW = datetime(2026, 6, 4, 12, 0, 0, tzinfo=UTC)
+
+    def _check(self, entry, *, now):
+        from orchestrator.b3_gate import check_proposal
+        return check_proposal(
+            entry, worktree='/tmp', category=None,
+            run_git=fake_git_fresh, now=now,
+        )
+
+    def test_parsed_age_still_certifies_fresh(self):
+        """POSITIVE CONTROL — the gate is not made vacuous by the guard."""
+        from orchestrator.b3_gate import AGE_PARSED, FRESH
+        result = self._check(low_risk_entry(), now=self._NOW)
+        assert result['verdict'] == FRESH, result
+        assert result['age_state'] == AGE_PARSED, result
+
+    def test_unparseable_timestamp_aborts(self):
+        from orchestrator.b3_gate import ABORT, AGE_UNPARSEABLE
+        entry = low_risk_entry(investigated_at='not-a-date')
+        result = self._check(entry, now=self._NOW)
+        assert result['verdict'] == ABORT, result
+        assert result['age_state'] == AGE_UNPARSEABLE, result
+        reason = result['reason'].lower()
+        assert 'age' in reason, result['reason']
+        assert AGE_UNPARSEABLE in result['reason'], result['reason']
+
+    def test_absent_timestamp_aborts(self):
+        from orchestrator.b3_gate import ABORT, AGE_ABSENT
+        entry = low_risk_entry()
+        del entry['investigated_at']
+        result = self._check(entry, now=self._NOW)
+        assert result['verdict'] == ABORT, result
+        assert result['age_state'] == AGE_ABSENT, result
+        assert 'age' in result['reason'].lower(), result['reason']
+
+    def test_no_clock_aborts(self):
+        from orchestrator.b3_gate import ABORT, AGE_NO_CLOCK
+        result = self._check(low_risk_entry(), now=None)
+        assert result['verdict'] == ABORT, result
+        assert result['age_state'] == AGE_NO_CLOCK, result
+        assert 'age' in result['reason'].lower(), result['reason']
+
+
+# ---------------------------------------------------------------------------
+# step-11: freshness P1/P2 against a REAL git fixture
+# ---------------------------------------------------------------------------
 
 class TestCheckProposalFreshness:
     """P1 (HEAD moved -> abort) and P2 (file-scoped main drift -> drift)."""
 
     _NOW = datetime(2026, 6, 4, 12, 0, 0, tzinfo=UTC)
 
-    def _make_entry(self, head_sha, main_sha, files=None):
-        return {
-            'proposal_text': 'Fix it',
-            'risk_label': 'low',
-            'files_referenced': files or ['foo.py'],
-            'block_reason': 'test',
-            'investigated_at': '2026-06-04T09:00:00+00:00',
-            'head_sha': head_sha,
-            'main_sha': main_sha,
-        }
-
-    def _setup_repo(self, tmp_path):
-        """Create repo: main at initial commit, feature branch diverges; add foo.py."""
-        repo = tmp_path / 'repo'
-        repo.mkdir()
-        main_sha = _init_git_repo(repo)
-        # Create foo.py on main so it has a history
-        (repo / 'foo.py').write_text('original content')
-        p = str(repo)
-        subprocess.run(['git', '-C', p, 'add', 'foo.py'], check=True, capture_output=True)
-        subprocess.run(['git', '-C', p, 'commit', '-m', 'add foo.py'],
-                       check=True, capture_output=True)
-        main_sha = subprocess.run(
-            ['git', '-C', p, 'rev-parse', 'main'],
-            check=True, capture_output=True, text=True,
-        ).stdout.strip()
-        # Diverge feature branch
-        head_sha = _diverge_feature_branch(repo)
-        assert head_sha != main_sha
-        return repo, head_sha, main_sha
-
     def test_clean_is_fresh(self, tmp_path):
         from orchestrator.b3_gate import FRESH, _run_git, check_proposal
-        repo, head_sha, main_sha = self._setup_repo(tmp_path)
-        entry = self._make_entry(head_sha, main_sha)
+        repo, head_sha, main_sha = diverged_repo(tmp_path, _FOO_ON_MAIN)
+        entry = low_risk_entry(head_sha=head_sha, main_sha=main_sha)
         result = check_proposal(entry, worktree=str(repo), category=None,
                                 run_git=_run_git, now=self._NOW)
         assert result['verdict'] == FRESH, f'expected fresh: {result}'
 
     def test_p1_head_moved_aborts(self, tmp_path):
         from orchestrator.b3_gate import ABORT, _run_git, check_proposal
-        repo, head_sha, main_sha = self._setup_repo(tmp_path)
-        entry = self._make_entry(head_sha, main_sha)
+        repo, head_sha, main_sha = diverged_repo(tmp_path, _FOO_ON_MAIN)
+        entry = low_risk_entry(head_sha=head_sha, main_sha=main_sha)
         # Add extra commit on feature branch so HEAD moves
         p = str(repo)
         (repo / 'extra2.txt').write_text('more work')
@@ -689,8 +395,8 @@ class TestCheckProposalFreshness:
 
     def test_p2_footprint_file_changed_on_main_drifts(self, tmp_path):
         from orchestrator.b3_gate import DRIFT, _run_git, check_proposal
-        repo, head_sha, main_sha = self._setup_repo(tmp_path)
-        entry = self._make_entry(head_sha, main_sha, files=['foo.py'])
+        repo, head_sha, main_sha = diverged_repo(tmp_path, _FOO_ON_MAIN)
+        entry = low_risk_entry(head_sha=head_sha, main_sha=main_sha, files_referenced=['foo.py'])
         # Switch to main, change foo.py, switch back
         p = str(repo)
         subprocess.run(['git', '-C', p, 'checkout', 'main'], check=True, capture_output=True)
@@ -705,9 +411,9 @@ class TestCheckProposalFreshness:
 
     def test_p2_non_footprint_file_changed_on_main_still_fresh(self, tmp_path):
         from orchestrator.b3_gate import FRESH, _run_git, check_proposal
-        repo, head_sha, main_sha = self._setup_repo(tmp_path)
+        repo, head_sha, main_sha = diverged_repo(tmp_path, _FOO_ON_MAIN)
         # footprint is foo.py only; change bar.py on main (not in footprint)
-        entry = self._make_entry(head_sha, main_sha, files=['foo.py'])
+        entry = low_risk_entry(head_sha=head_sha, main_sha=main_sha, files_referenced=['foo.py'])
         p = str(repo)
         subprocess.run(['git', '-C', p, 'checkout', 'main'], check=True, capture_output=True)
         (repo / 'bar.py').write_text('new file')
@@ -718,446 +424,6 @@ class TestCheckProposalFreshness:
         result = check_proposal(entry, worktree=str(repo), category=None,
                                 run_git=_run_git, now=self._NOW)
         assert result['verdict'] == FRESH, f'expected fresh (outside footprint): {result}'
-
-
-# ---------------------------------------------------------------------------
-# step-13: _read_latest_proposal
-# ---------------------------------------------------------------------------
-
-class TestReadLatestProposal:
-    def test_returns_last_proposal_entry(self, tmp_path):
-        from orchestrator.b3_gate import _read_latest_proposal
-        entry_a = {'proposal_text': 'first', 'risk_label': 'low'}
-        entry_b = {'proposal_text': 'second', 'risk_label': 'low'}
-        _seed_tasks_db(tmp_path, 42, [entry_a, entry_b])
-        result = _read_latest_proposal(42, tmp_path)
-        assert result == entry_b, f'expected last entry, got {result}'
-
-    def test_missing_task_id_returns_none(self, tmp_path):
-        from orchestrator.b3_gate import _read_latest_proposal
-        _seed_tasks_db(tmp_path, 42, [{'proposal_text': 'x', 'risk_label': 'low'}])
-        result = _read_latest_proposal(99, tmp_path)  # id 99 not seeded
-        assert result is None
-
-    def test_missing_db_returns_none(self, tmp_path):
-        from orchestrator.b3_gate import _read_latest_proposal
-        # No tasks.db at all
-        result = _read_latest_proposal(42, tmp_path)
-        assert result is None
-
-    def test_empty_proposals_list_returns_none(self, tmp_path):
-        from orchestrator.b3_gate import _read_latest_proposal
-        _seed_tasks_db(tmp_path, 42, [])
-        result = _read_latest_proposal(42, tmp_path)
-        assert result is None
-
-    def test_metadata_missing_dry_run_proposals_returns_none(self, tmp_path):
-        from orchestrator.b3_gate import _read_latest_proposal
-        # Seed with metadata that lacks dry_run_proposals key
-        db_dir = tmp_path / '.taskmaster' / 'tasks'
-        db_dir.mkdir(parents=True, exist_ok=True)
-        db_path = db_dir / 'tasks.db'
-        conn = sqlite3.connect(str(db_path))
-        conn.execute(
-            'CREATE TABLE IF NOT EXISTS tasks '
-            '(tag TEXT, id INTEGER, status TEXT, priority TEXT, metadata TEXT, updated_at TEXT)'
-        )
-        conn.execute(
-            "INSERT INTO tasks VALUES ('master', 42, 'blocked', 'medium', ?, ?)",
-            (json.dumps({'other_key': 'value'}), '2026-06-04T00:00:00+00:00'),
-        )
-        conn.commit()
-        conn.close()
-        result = _read_latest_proposal(42, tmp_path)
-        assert result is None
-
-    def test_uses_default_tag_master(self, tmp_path):
-        from orchestrator.b3_gate import _read_latest_proposal
-        entry = {'proposal_text': 'x', 'risk_label': 'low'}
-        _seed_tasks_db(tmp_path, 42, [entry])  # seeds tag='master'
-        result = _read_latest_proposal(42, tmp_path)  # default tag='master'
-        assert result == entry
-
-    def test_string_task_id_works(self, tmp_path):
-        from orchestrator.b3_gate import _read_latest_proposal
-        entry = {'proposal_text': 'x', 'risk_label': 'low'}
-        _seed_tasks_db(tmp_path, 42, [entry])
-        result = _read_latest_proposal('42', tmp_path)
-        assert result == entry
-
-
-# ---------------------------------------------------------------------------
-# review amendment: reader failures warn instead of failing open silently
-# ---------------------------------------------------------------------------
-
-class TestReaderFailureWarning:
-    """_read_task_description / _read_latest_proposal emit a deduped WARNING
-    when their read genuinely fails (e.g. tasks.db lacks the expected
-    column — an older/foreign schema) rather than degrading silently (task
-    2509 review amendment). The benign "no data yet" branches (missing db,
-    missing row, empty column) stay silent — only a raised exception warns.
-    """
-
-    def _seed_tasks_without_description_column(self, tmp_path, task_id=42):
-        """A 'tasks' table that lacks the 'description' column entirely —
-        the older/foreign-schema scenario the review finding names."""
-        db_dir = tmp_path / '.taskmaster' / 'tasks'
-        db_dir.mkdir(parents=True, exist_ok=True)
-        db_path = db_dir / 'tasks.db'
-        conn = sqlite3.connect(str(db_path))
-        conn.execute(
-            'CREATE TABLE IF NOT EXISTS tasks '
-            '(tag TEXT, id INTEGER, status TEXT, priority TEXT, metadata TEXT, updated_at TEXT)'
-        )
-        conn.execute(
-            "INSERT INTO tasks VALUES ('master', ?, 'blocked', 'medium', ?, ?)",
-            (task_id, json.dumps({}), '2026-06-04T00:00:00+00:00'),
-        )
-        conn.commit()
-        conn.close()
-
-    def test_missing_description_column_warns(self, tmp_path, caplog):
-        import logging as _logging
-
-        from orchestrator.b3_gate import _read_task_description
-        self._seed_tasks_without_description_column(tmp_path, task_id=42)
-
-        with caplog.at_level(_logging.WARNING, logger='orchestrator.b3_gate'):
-            result = _read_task_description(42, tmp_path)
-
-        assert result is None
-        warn_records = [
-            r for r in caplog.records
-            if r.levelno == _logging.WARNING and r.name == 'orchestrator.b3_gate'
-        ]
-        assert len(warn_records) >= 1, (
-            f'Expected a WARNING under orchestrator.b3_gate for a missing '
-            f'description column; got records: '
-            f'{[(r.name, r.message) for r in caplog.records]}'
-        )
-
-    def test_missing_description_column_warning_is_deduped(self, tmp_path, caplog):
-        """A second call for the SAME (reader, project_root, tag, task_id)
-        key must not re-warn within the same process."""
-        import logging as _logging
-
-        from orchestrator.b3_gate import _read_task_description
-        self._seed_tasks_without_description_column(tmp_path, task_id=42)
-
-        with caplog.at_level(_logging.WARNING, logger='orchestrator.b3_gate'):
-            _read_task_description(42, tmp_path)
-            _read_task_description(42, tmp_path)
-
-        warn_records = [
-            r for r in caplog.records
-            if r.levelno == _logging.WARNING and r.name == 'orchestrator.b3_gate'
-        ]
-        assert len(warn_records) == 1, (
-            f'Expected exactly one deduped WARNING across two calls with the '
-            f'same key; got {len(warn_records)}: {[r.message for r in warn_records]}'
-        )
-
-    def test_missing_db_stays_silent(self, tmp_path, caplog):
-        """Benign 'no tasks.db at all' must NOT warn — this is not a failure,
-        it's the ordinary first-run-absent case."""
-        import logging as _logging
-
-        from orchestrator.b3_gate import _read_task_description
-
-        with caplog.at_level(_logging.WARNING, logger='orchestrator.b3_gate'):
-            result = _read_task_description(42, tmp_path)
-
-        assert result is None
-        warn_records = [
-            r for r in caplog.records
-            if r.levelno == _logging.WARNING and r.name == 'orchestrator.b3_gate'
-        ]
-        assert len(warn_records) == 0, (
-            f'missing tasks.db must not warn (benign first-run absence); got: '
-            f'{[r.message for r in warn_records]}'
-        )
-
-    def test_latest_proposal_missing_metadata_column_stays_silent(self, tmp_path, caplog):
-        """_read_latest_proposal is deliberately NOT given the same WARNING
-        instrumentation as _read_task_description above, despite having the
-        identical fail-open shape (review finding explicitly named it as an
-        "ideal" sibling fix). This exact site already has a pre-existing,
-        reasoned entry in shared/tests/silent_fallthrough_allowlist.py
-        ("narrow fix deferred to follow-up"); adding a WARNING here would
-        change the handler's AST shape and require also editing that
-        allowlist file — which sits outside this task's locked module scope
-        (task 2509 review amendment: scope discipline). Locks in the
-        intentional asymmetry so a future edit doesn't "fix" this half
-        without the matching allowlist update.
-        """
-        import logging as _logging
-
-        from orchestrator.b3_gate import _read_latest_proposal
-
-        db_dir = tmp_path / '.taskmaster' / 'tasks'
-        db_dir.mkdir(parents=True, exist_ok=True)
-        db_path = db_dir / 'tasks.db'
-        conn = sqlite3.connect(str(db_path))
-        conn.execute(
-            'CREATE TABLE IF NOT EXISTS tasks '
-            '(tag TEXT, id INTEGER, status TEXT, priority TEXT, description TEXT, updated_at TEXT)'
-        )
-        conn.execute(
-            "INSERT INTO tasks VALUES ('master', 42, 'blocked', 'medium', 'desc', ?)",
-            ('2026-06-04T00:00:00+00:00',),
-        )
-        conn.commit()
-        conn.close()
-
-        with caplog.at_level(_logging.WARNING, logger='orchestrator.b3_gate'):
-            result = _read_latest_proposal(42, tmp_path)
-
-        assert result is None
-        warn_records = [
-            r for r in caplog.records
-            if r.levelno == _logging.WARNING and r.name == 'orchestrator.b3_gate'
-        ]
-        assert len(warn_records) == 0, (
-            f'_read_latest_proposal is intentionally NOT warning-instrumented '
-            f'in this amendment pass (scope discipline — see docstring); got: '
-            f'{[r.message for r in warn_records]}'
-        )
-
-
-# ---------------------------------------------------------------------------
-# step-15: _resolve_cap
-# ---------------------------------------------------------------------------
-
-class TestResolveCap:
-    def test_none_returns_default(self):
-        from orchestrator.b3_gate import DEFAULT_CAP, _resolve_cap
-        assert _resolve_cap(None) == DEFAULT_CAP
-        assert _resolve_cap(None) == 6
-
-    def test_config_path_returns_configured_cap(self, tmp_path):
-        from orchestrator.b3_gate import _resolve_cap
-        cfg_file = tmp_path / 'config.yaml'
-        cfg_file.write_text('unblock_auto:\n  b3_merge_cap_per_24h: 2\n')
-        assert _resolve_cap(str(cfg_file)) == 2
-
-    def test_config_path_different_cap(self, tmp_path):
-        from orchestrator.b3_gate import _resolve_cap
-        cfg_file = tmp_path / 'config.yaml'
-        cfg_file.write_text('unblock_auto:\n  b3_merge_cap_per_24h: 10\n')
-        assert _resolve_cap(str(cfg_file)) == 10
-
-    # task-1808 step-7: bad config → DEFAULT_CAP + WARNING under orchestrator.b3_gate
-
-    def test_bad_config_returns_default_and_warns(self, tmp_path, caplog):
-        """Malformed config YAML → DEFAULT_CAP returned AND WARNING logged.
-
-        Config corruption is NOT cap-exhausting (§4.5 — a bad/foreign config
-        legitimately falls back to DEFAULT_CAP).  But the fallback must be VISIBLE.
-        Fails today: b3_gate has no module logger → zero WARNING records.
-        """
-        import logging as _logging
-
-        from orchestrator.b3_gate import DEFAULT_CAP, _resolve_cap
-
-        cfg_file = tmp_path / 'bad_config.yaml'
-        # Write a YAML string that's structurally invalid / causes load_config to raise
-        cfg_file.write_text('unblock_auto: [unterminated\n', encoding='utf-8')
-
-        with caplog.at_level(_logging.WARNING, logger='orchestrator.b3_gate'):
-            result = _resolve_cap(str(cfg_file))
-
-        assert result == DEFAULT_CAP, (
-            f'Expected DEFAULT_CAP={DEFAULT_CAP} for bad config; got {result}'
-        )
-        warn_records = [
-            r for r in caplog.records
-            if r.levelno == _logging.WARNING
-            and r.name == 'orchestrator.b3_gate'
-        ]
-        assert len(warn_records) >= 1, (
-            f'Expected WARNING under orchestrator.b3_gate for bad config; '
-            f'got records: {[(r.name, r.message) for r in caplog.records]}'
-        )
-
-    def test_none_config_stays_silent(self, caplog):
-        """_resolve_cap(None) must NOT emit any WARNING (benign no-config path)."""
-        import logging as _logging
-
-        from orchestrator.b3_gate import _resolve_cap
-
-        with caplog.at_level(_logging.WARNING, logger='orchestrator.b3_gate'):
-            _resolve_cap(None)
-
-        warn_records = [
-            r for r in caplog.records
-            if r.levelno == _logging.WARNING
-            and r.name == 'orchestrator.b3_gate'
-        ]
-        assert len(warn_records) == 0, (
-            f'_resolve_cap(None) must not emit warnings; got: {[r.message for r in warn_records]}'
-        )
-
-
-# ---------------------------------------------------------------------------
-# step-17: CLI main() wiring for all three verbs, JSON to stdout
-# ---------------------------------------------------------------------------
-
-class TestCLIMain:
-    """Test the three CLI verbs via main(argv)."""
-
-    _NOW_ISO = '2026-06-04T12:00:00+00:00'
-    _NOW = datetime.fromisoformat(_NOW_ISO)
-
-    def _setup_repo_and_db(self, tmp_path):
-        """Create a git repo + seeded tasks.db with a fresh low-risk proposal.
-
-        Returns (repo_path, project_root, head_sha, main_sha).
-        """
-        repo = tmp_path / 'repo'
-        repo.mkdir()
-        _init_git_repo(repo)
-        head_sha = _diverge_feature_branch(repo)
-        # main sha is the sha before we diverged
-        main_sha = subprocess.run(
-            ['git', '-C', str(repo), 'rev-parse', 'main'],
-            check=True, capture_output=True, text=True,
-        ).stdout.strip()
-
-        root = tmp_path / 'root'
-        root.mkdir()
-
-        entry = {
-            'proposal_text': 'Fix the bug',
-            'risk_label': 'low',
-            'files_referenced': [],
-            'block_reason': 'test blocked',
-            'investigated_at': '2026-06-04T10:00:00+00:00',
-            'head_sha': head_sha,
-            'main_sha': main_sha,
-        }
-        _seed_tasks_db(root, 42, [entry])
-        return repo, root, head_sha, main_sha
-
-    def test_check_fresh_verdict_json(self, tmp_path, capsys):
-        """check verb: prints a single JSON object with verdict=='fresh'."""
-        from orchestrator.b3_gate import main
-        repo, root, head_sha, main_sha = self._setup_repo_and_db(tmp_path)
-
-        rc = main([
-            'check',
-            '--task-id', '42',
-            '--worktree', str(repo),
-            '--project-root', str(root),
-            '--category', 'task_failure',
-            '--now', self._NOW_ISO,
-        ])
-        assert rc == 0, f'expected exit 0, got {rc}'
-
-        out = capsys.readouterr().out.strip()
-        data = json.loads(out)  # must be parseable JSON
-        assert data['verdict'] == 'fresh', f'expected fresh: {data}'
-        assert data['cap_remaining'] == 6
-        assert data['already_attempted'] is False
-        assert 'age_seconds' in data
-        assert 'reason' in data
-
-    def test_record_launch_first_call(self, tmp_path, capsys):
-        """record-launch verb: first call prints {recorded:True, already_attempted:False}."""
-        from orchestrator.b3_gate import main
-        repo, root, head_sha, main_sha = self._setup_repo_and_db(tmp_path)
-
-        rc = main([
-            'record-launch',
-            '--task-id', '42',
-            '--worktree', str(repo),
-            '--project-root', str(root),
-        ])
-        assert rc == 0
-
-        out = capsys.readouterr().out.strip()
-        data = json.loads(out)
-        assert data['recorded'] is True
-        assert data['already_attempted'] is False
-
-    def test_record_launch_idempotent_second_call(self, tmp_path, capsys):
-        """record-launch verb: second identical call prints already_attempted:True."""
-        from orchestrator.b3_gate import main
-        repo, root, head_sha, main_sha = self._setup_repo_and_db(tmp_path)
-
-        argv = ['record-launch', '--task-id', '42',
-                '--worktree', str(repo), '--project-root', str(root)]
-        main(argv)
-        capsys.readouterr()  # discard first call output
-
-        rc = main(argv)
-        assert rc == 0
-        out = capsys.readouterr().out.strip()
-        data = json.loads(out)
-        assert data['recorded'] is False
-        assert data['already_attempted'] is True
-
-    def test_check_after_record_launch_reports_already_attempted(self, tmp_path, capsys):
-        """check verb: after record-launch, already_attempted==True."""
-        from orchestrator.b3_gate import main
-        repo, root, head_sha, main_sha = self._setup_repo_and_db(tmp_path)
-
-        # Record launch first
-        main(['record-launch', '--task-id', '42',
-              '--worktree', str(repo), '--project-root', str(root)])
-        capsys.readouterr()
-
-        # Now check — already_attempted must be True
-        rc = main([
-            'check',
-            '--task-id', '42',
-            '--worktree', str(repo),
-            '--project-root', str(root),
-            '--now', self._NOW_ISO,
-        ])
-        assert rc == 0
-        out = capsys.readouterr().out.strip()
-        data = json.loads(out)
-        assert data['already_attempted'] is True
-
-    def test_charge_succeeds_remaining_five(self, tmp_path, capsys):
-        """charge verb: first charge prints {charged:True, remaining:5} (default cap=6)."""
-        from orchestrator.b3_gate import main
-        _, root, _, _ = self._setup_repo_and_db(tmp_path)
-
-        rc = main([
-            'charge',
-            '--task-id', '42',
-            '--project-root', str(root),
-            '--now', self._NOW_ISO,
-        ])
-        assert rc == 0
-        out = capsys.readouterr().out.strip()
-        data = json.loads(out)
-        assert data['charged'] is True
-        assert data['remaining'] == 5
-
-    def test_each_verb_prints_single_parseable_json(self, tmp_path, capsys):
-        """Each verb call prints exactly one parseable JSON line to stdout."""
-        from orchestrator.b3_gate import main
-        repo, root, head_sha, main_sha = self._setup_repo_and_db(tmp_path)
-
-        for argv in [
-            ['check', '--task-id', '42', '--worktree', str(repo),
-             '--project-root', str(root), '--now', self._NOW_ISO],
-            ['record-launch', '--task-id', '42', '--worktree', str(repo),
-             '--project-root', str(root)],
-            ['charge', '--task-id', '42', '--project-root', str(root),
-             '--now', self._NOW_ISO],
-        ]:
-            rc = main(argv)
-            assert rc == 0, f'expected exit 0 for {argv[0]}'
-            out = capsys.readouterr().out.strip()
-            # Must be a single parseable JSON object
-            parsed = json.loads(out)
-            assert isinstance(parsed, dict), f'expected dict, got {type(parsed)}'
-            # stdout must not have stray lines
-            assert '\n' not in out.strip() or out.strip().count('\n') == 0, \
-                f'multiple lines in stdout for {argv[0]}'
 
 
 # ---------------------------------------------------------------------------
@@ -1173,33 +439,10 @@ class TestTwoWayBoundary:
 
     _NOW = datetime(2026, 6, 4, 12, 0, 0, tzinfo=UTC)
 
-    def _setup_boundary_repo(self, tmp_path):
-        """Create git repo: main with foo.py, feature branch diverges.
-
-        Returns (repo_path, head_sha, main_sha).
-        """
-        repo = tmp_path / 'repo'
-        repo.mkdir()
-        _init_git_repo(repo)
-        p = str(repo)
-        # Add foo.py on main so it exists in the diff history
-        (repo / 'foo.py').write_text('original content')
-        subprocess.run(['git', '-C', p, 'add', 'foo.py'], check=True, capture_output=True)
-        subprocess.run(['git', '-C', p, 'commit', '-m', 'add foo.py'],
-                       check=True, capture_output=True)
-        main_sha = subprocess.run(
-            ['git', '-C', p, 'rev-parse', 'main'],
-            check=True, capture_output=True, text=True,
-        ).stdout.strip()
-        # Diverge feature branch from main
-        head_sha = _diverge_feature_branch(repo)
-        assert head_sha != main_sha
-        return repo, head_sha, main_sha
-
     def _make_success_entry(self, head_sha, main_sha, files=None):
         """Build a genuine _build_entry output then mirror T1 sha-stamping."""
         from orchestrator.dry_run_unblock import _build_entry
-        agent_result = _make_agent_result(
+        agent_result = make_agent_result(
             success=True,
             structured_output={
                 'proposal_text': 'Fix the bug in foo.py',
@@ -1216,7 +459,7 @@ class TestTwoWayBoundary:
     def test_a_clean_repo_is_fresh(self, tmp_path):
         """(a) Clean repo (HEAD == head_sha, main unchanged) -> fresh."""
         from orchestrator.b3_gate import FRESH, _run_git, check_proposal
-        repo, head_sha, main_sha = self._setup_boundary_repo(tmp_path)
+        repo, head_sha, main_sha = diverged_repo(tmp_path, _FOO_ON_MAIN)
         entry = self._make_success_entry(head_sha, main_sha)
         verdict = check_proposal(entry, worktree=str(repo), category='task_failure',
                                  run_git=_run_git, now=self._NOW)
@@ -1225,7 +468,7 @@ class TestTwoWayBoundary:
     def test_b_head_moved_aborts_with_git_anchored_reason(self, tmp_path):
         """(b) Extra commit on feature branch -> abort, reason contains both shas."""
         from orchestrator.b3_gate import ABORT, _run_git, check_proposal
-        repo, head_sha, main_sha = self._setup_boundary_repo(tmp_path)
+        repo, head_sha, main_sha = diverged_repo(tmp_path, _FOO_ON_MAIN)
         entry = self._make_success_entry(head_sha, main_sha)
         # Add extra commit — HEAD moves
         p = str(repo)
@@ -1244,7 +487,7 @@ class TestTwoWayBoundary:
     def test_c_footprint_file_changed_on_main_drifts(self, tmp_path):
         """(c) foo.py changed on main -> drift."""
         from orchestrator.b3_gate import DRIFT, _run_git, check_proposal
-        repo, head_sha, main_sha = self._setup_boundary_repo(tmp_path)
+        repo, head_sha, main_sha = diverged_repo(tmp_path, _FOO_ON_MAIN)
         entry = self._make_success_entry(head_sha, main_sha, files=['foo.py'])
         # Change foo.py on main
         p = str(repo)
@@ -1262,8 +505,8 @@ class TestTwoWayBoundary:
         """(d) Entry without T1 sha-stamping -> drift 'no sha anchor'."""
         from orchestrator.b3_gate import DRIFT, _run_git, check_proposal
         from orchestrator.dry_run_unblock import _build_entry
-        repo, head_sha, main_sha = self._setup_boundary_repo(tmp_path)
-        agent_result = _make_agent_result(
+        repo, head_sha, main_sha = diverged_repo(tmp_path, _FOO_ON_MAIN)
+        agent_result = make_agent_result(
             success=True,
             structured_output={
                 'proposal_text': 'Fix the bug',
@@ -1286,9 +529,9 @@ class TestTwoWayBoundary:
         """Failure _build_entry carries a 'status' key; check_proposal aborts."""
         from orchestrator.b3_gate import ABORT, _run_git, check_proposal
         from orchestrator.dry_run_unblock import _build_entry
-        repo, head_sha, main_sha = self._setup_boundary_repo(tmp_path)
+        repo, head_sha, main_sha = diverged_repo(tmp_path, _FOO_ON_MAIN)
         # Build a failure entry
-        fail_agent = _make_agent_result(success=False, subtype='error', output='boom')
+        fail_agent = make_agent_result(success=False, subtype='error', output='boom')
         fail_entry = _build_entry(fail_agent, reason='blocked', budget_usd=5.0)
         # Mirror T1 stamping (failure entries also get stamped)
         fail_entry['head_sha'] = head_sha
@@ -1309,11 +552,11 @@ class TestTwoWayBoundary:
         """
         from orchestrator.b3_gate import ABORT, _run_git, check_proposal
         from orchestrator.dry_run_unblock import _build_entry
-        repo, head_sha, main_sha = self._setup_boundary_repo(tmp_path)
+        repo, head_sha, main_sha = diverged_repo(tmp_path, _FOO_ON_MAIN)
 
         # Wedge: pre-turn-1 kill at the 600s UnblockAutoConfig timeout
         # ceiling -> empty stdout + timed_out=True.
-        wedge_agent = _make_agent_result(
+        wedge_agent = make_agent_result(
             success=False,
             subtype='error_empty_output',
             output='Agent produced no output',
@@ -1330,7 +573,7 @@ class TestTwoWayBoundary:
 
         # Substantive: agent ran and concluded a human must look — not timed
         # out, not empty output.
-        substantive_agent = _make_agent_result(
+        substantive_agent = make_agent_result(
             success=False, subtype='error_max_turns', output='Exceeded max turns',
         )
         substantive_entry = _build_entry(substantive_agent, reason='blocked', budget_usd=5.0)
@@ -1347,558 +590,8 @@ class TestTwoWayBoundary:
 
     def test_success_entry_has_no_status_key(self, tmp_path):
         """Success _build_entry must NOT have a 'status' key (contract invariant)."""
-        _, head_sha, main_sha = self._setup_boundary_repo(tmp_path)
+        _, head_sha, main_sha = diverged_repo(tmp_path, _FOO_ON_MAIN)
         entry = self._make_success_entry(head_sha, main_sha)
         assert 'status' not in entry, (
             f'success entry must not carry status key: {entry.keys()}'
-        )
-
-
-# ---------------------------------------------------------------------------
-# step-1 (task 1680): post-merge red-main hard-abort in check_proposal
-# ---------------------------------------------------------------------------
-
-class TestPostMergeRedMainAbort:
-    """check_proposal hard-ABORTs any entry whose block_reason starts with
-    POST_MERGE_RED_MAIN_REASON_PREFIX — before risk_label and git checks.
-    """
-
-    _NOW = datetime(2026, 6, 4, 12, 0, 0, tzinfo=UTC)
-    # Prefix used in all cases (constant not yet defined — tests fail initially)
-    _PM_REASON = 'Post-merge unscoped type-check failed on main: foo.py (error E001)'
-
-    def test_low_risk_post_merge_reason_aborts_without_git(self):
-        """Case 1: low-risk entry with post-merge block_reason -> ABORT, no git called."""
-        from orchestrator.b3_gate import ABORT, POST_MERGE_RED_MAIN_REASON_PREFIX, check_proposal
-        entry = {**_LOW_RISK_ENTRY, 'block_reason': self._PM_REASON}
-        result = check_proposal(
-            entry, worktree='/tmp', category='task_failure',
-            run_git=_fake_git_never_called, now=self._NOW,
-        )
-        assert result['verdict'] == ABORT, f'expected ABORT, got {result}'
-        reason_lower = result['reason'].lower()
-        assert 'post-merge' in reason_lower or 'red-main' in reason_lower, (
-            f'expected "post-merge" or "red-main" in reason: {result["reason"]!r}'
-        )
-        # Sanity: prefix match is correct
-        assert self._PM_REASON.startswith(POST_MERGE_RED_MAIN_REASON_PREFIX)
-
-    def test_human_review_post_merge_reason_also_aborts(self):
-        """Case 2: risk_label='human-review-required' with post-merge reason -> ABORT.
-
-        Documents that the post-merge abort branch fires regardless of risk_label.
-        """
-        from orchestrator.b3_gate import ABORT, check_proposal
-        entry = {
-            **_LOW_RISK_ENTRY,
-            'risk_label': 'human-review-required',
-            'block_reason': self._PM_REASON,
-        }
-        result = check_proposal(
-            entry, worktree='/tmp', category='task_failure',
-            run_git=_fake_git_never_called, now=self._NOW,
-        )
-        assert result['verdict'] == ABORT, (
-            f'expected ABORT for human-review-required post-merge entry, got {result}'
-        )
-
-    def test_non_post_merge_reason_not_aborted_by_post_merge_branch(self):
-        """Case 3 (regression): block_reason='verify exhausted' does NOT trigger the
-        post-merge abort — reaches FRESH exactly as before this change.
-        """
-        from orchestrator.b3_gate import FRESH, check_proposal
-        entry = {**_LOW_RISK_ENTRY, 'block_reason': 'verify exhausted'}
-        result = check_proposal(
-            entry, worktree='/tmp', category='task_failure',
-            run_git=_fake_git_fresh, now=self._NOW,
-        )
-        assert result['verdict'] == FRESH, (
-            f'non-post-merge reason must NOT be caught by post-merge branch; got {result}'
-        )
-
-    def test_boundary_low_risk_post_merge_entry_aborts_without_git(self, tmp_path):
-        """Case 4 (end-to-end boundary): build a genuine _build_entry output with
-        block_reason=POST_MERGE_RED_MAIN_REASON_PREFIX + ' ...', stamp head/main sha,
-        then assert check_proposal aborts without consulting git.
-        """
-        from orchestrator.b3_gate import ABORT, POST_MERGE_RED_MAIN_REASON_PREFIX, check_proposal
-        from orchestrator.dry_run_unblock import _build_entry
-
-        reason = POST_MERGE_RED_MAIN_REASON_PREFIX + ' on main: foo.py'
-        agent_result = _make_agent_result(
-            success=True,
-            structured_output={
-                'proposal_text': 'Fix the type error in foo.py',
-                'risk_label': 'low',
-                'files_referenced': ['foo.py'],
-            },
-        )
-        entry = _build_entry(agent_result, reason=reason, budget_usd=5.0)
-        # Mirror T1 sha-stamping (dry_run_unblock.py)
-        entry['head_sha'] = 'aaabbbccc'
-        entry['main_sha'] = 'dddeeefff'
-
-        result = check_proposal(
-            entry, worktree='/tmp', category='task_failure',
-            run_git=_fake_git_never_called, now=self._NOW,
-        )
-        assert result['verdict'] == ABORT, (
-            f'expected ABORT for post-merge low-risk boundary entry, got {result}'
-        )
-
-    def test_coherence_prefix_matches_merge_queue_constant(self):
-        """Case 5 (coherence): b3_gate re-declares the prefix; assert it stays in sync
-        with the canonical merge_queue.POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX.
-        """
-        from orchestrator.b3_gate import POST_MERGE_RED_MAIN_REASON_PREFIX
-        from orchestrator.merge_queue import POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX
-        assert POST_MERGE_RED_MAIN_REASON_PREFIX == POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX, (
-            f'b3_gate prefix {POST_MERGE_RED_MAIN_REASON_PREFIX!r} '
-            f'!= merge_queue prefix {POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX!r}'
-        )
-
-    def test_production_format_reason_aborts_without_git(self):
-        """Case 6 (producer→gate contract): block_reason built with the exact merge_queue
-        production template (PREFIX + ': post-merge unscoped type-check failed for ...')
-        must ABORT.  Locks the ': ' separator format used by merge_queue.py:653-658 so a
-        future regression that drops the prefix from the template is caught here.
-        """
-        from orchestrator.b3_gate import ABORT, POST_MERGE_RED_MAIN_REASON_PREFIX, check_proposal
-
-        # Exact production format from merge_queue.py:
-        #   f'{POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX}: '
-        #   f'post-merge unscoped type-check failed for '
-        #   f'{", ".join(pyright_result.failing_subprojects)} '
-        #   f'on {advanced_sha[:12]}. {pyright_result.detail}'
-        production_reason = (
-            POST_MERGE_RED_MAIN_REASON_PREFIX
-            + ': post-merge unscoped type-check failed for orchestrator'
-            + ' on abc123456789. error: Type "int | None" is not assignable to "int"'
-        )
-        entry = {**_LOW_RISK_ENTRY, 'block_reason': production_reason}
-        result = check_proposal(
-            entry, worktree='/tmp', category='task_failure',
-            run_git=_fake_git_never_called, now=self._NOW,
-        )
-        assert result['verdict'] == ABORT, (
-            f'expected ABORT for production-format post-merge reason, got {result}'
-        )
-
-
-# ---------------------------------------------------------------------------
-# step-3 (task 2509): explicit stop-instruction hard-abort in check_proposal
-# ---------------------------------------------------------------------------
-
-class TestStopInstructionAbort:
-    """check_proposal hard-ABORTs any entry whose proposal_text, block_reason,
-    or extra_texts carries an explicit stop instruction — before risk_label
-    and git checks (task 2509, reconciliation finding 0aac21b4: an autonomous
-    /unblock session self-authorized around an explicit "do not apply"
-    instruction; this mechanical gate closes that hole).
-    """
-
-    _NOW = datetime(2026, 6, 4, 12, 0, 0, tzinfo=UTC)
-
-    def test_stop_instruction_in_proposal_text_aborts_without_git(self):
-        """Case (a): proposal_text carries 'do not apply' -> ABORT, no git called."""
-        from orchestrator.b3_gate import ABORT, check_proposal
-        entry = {**_LOW_RISK_ENTRY, 'proposal_text': 'Fix it — do not apply until reviewed'}
-        result = check_proposal(
-            entry, worktree='/tmp', category='task_failure',
-            run_git=_fake_git_never_called, now=self._NOW,
-        )
-        assert result['verdict'] == ABORT, f'expected ABORT, got {result}'
-        assert 'stop instruction' in result['reason'].lower(), (
-            f'expected "stop instruction" in reason: {result["reason"]!r}'
-        )
-
-    def test_stop_instruction_in_block_reason_aborts_without_git(self):
-        """Case (b): block_reason carries 'human rehearsal' -> ABORT, no git called."""
-        from orchestrator.b3_gate import ABORT, check_proposal
-        entry = {**_LOW_RISK_ENTRY, 'block_reason': 'this fix requires human rehearsal before merging'}
-        result = check_proposal(
-            entry, worktree='/tmp', category='task_failure',
-            run_git=_fake_git_never_called, now=self._NOW,
-        )
-        assert result['verdict'] == ABORT, f'expected ABORT, got {result}'
-        assert 'stop instruction' in result['reason'].lower(), (
-            f'expected "stop instruction" in reason: {result["reason"]!r}'
-        )
-
-    def test_stop_instruction_in_extra_texts_aborts_without_git(self):
-        """Case (c): a new extra_texts kwarg carries the phrase (proposal_text/
-        block_reason are benign) -> ABORT, no git called."""
-        from orchestrator.b3_gate import ABORT, check_proposal
-        result = check_proposal(
-            _LOW_RISK_ENTRY, worktree='/tmp', category='task_failure',
-            run_git=_fake_git_never_called, now=self._NOW,
-            extra_texts=['Task description: please do not apply this change yet.'],
-        )
-        assert result['verdict'] == ABORT, f'expected ABORT, got {result}'
-        assert 'stop instruction' in result['reason'].lower(), (
-            f'expected "stop instruction" in reason: {result["reason"]!r}'
-        )
-
-    def test_stop_instruction_wins_over_otherwise_fresh_entry(self):
-        """Precedence: an otherwise-FRESH low-risk entry that ALSO carries a stop
-        phrase in proposal_text -> ABORT (stop wins over fresh), and still consumes
-        no git (fires before the P1/P2 freshness checks)."""
-        from orchestrator.b3_gate import ABORT, check_proposal
-        entry = {**_LOW_RISK_ENTRY, 'proposal_text': 'Fix it — do not apply until reviewed'}
-        result = check_proposal(
-            entry, worktree='/tmp', category=None,
-            run_git=_fake_git_never_called, now=self._NOW,
-        )
-        assert result['verdict'] == ABORT, (
-            f'stop instruction must win over an otherwise-fresh entry: {result}'
-        )
-
-    def test_benign_extra_texts_does_not_abort_regression(self):
-        """Regression: benign extra_texts under a fresh low-risk entry -> FRESH (unchanged)."""
-        from orchestrator.b3_gate import FRESH, check_proposal
-        result = check_proposal(
-            _LOW_RISK_ENTRY, worktree='/tmp', category=None,
-            run_git=_fake_git_fresh, now=self._NOW,
-            extra_texts=['deploy the service'],
-        )
-        assert result['verdict'] == FRESH, f'expected FRESH, got {result}'
-
-
-# ---------------------------------------------------------------------------
-# step-3 (task 2138): typed block_class dual-read path
-# ---------------------------------------------------------------------------
-
-class TestCheckProposalBlockClass:
-    """check_proposal dual-reads a typed 'block_class' key when present,
-    falling back to the legacy block_reason-prefix/status-presence sniffs
-    only when block_class is absent (B3 legacy path — TestPostMergeRedMainAbort
-    and test_status_key_present_aborts above carry NO block_class and must
-    keep passing unchanged).
-
-    PRD: plans/verify-plan-prd.md task ζ, invariants B2/B3/B4.
-    """
-
-    _NOW = datetime(2026, 6, 4, 12, 0, 0, tzinfo=UTC)
-
-    def test_post_merge_red_main_block_class_aborts_without_git(self):
-        """B2: block_class=post_merge_red_main hard-aborts before risk/git —
-        even when block_reason carries NO post-merge prose (proves the typed
-        field alone drives the abort, not the prose prefix) — for both a
-        low-risk and a human-review-required entry.
-        """
-        from orchestrator.b3_gate import ABORT, check_proposal
-        for risk_label in ('low', 'human-review-required'):
-            entry = {
-                **_LOW_RISK_ENTRY,
-                'block_class': 'post_merge_red_main',
-                'block_reason': 'verify exhausted',
-                'risk_label': risk_label,
-            }
-            result = check_proposal(
-                entry, worktree='/tmp', category='task_failure',
-                run_git=_fake_git_never_called, now=self._NOW,
-            )
-            assert result['verdict'] == ABORT, (
-                f'risk_label={risk_label!r}: expected ABORT, got {result}'
-            )
-
-    def test_merge_verify_red_low_risk_is_gateable_not_auto_aborted(self):
-        """B4: block_class=merge_verify_red is NOT the highest-blast-radius
-        class — a low-risk entry reaches FRESH exactly like today, with
-        fresh git and category=None.
-        """
-        from orchestrator.b3_gate import FRESH, check_proposal
-        entry = {**_LOW_RISK_ENTRY, 'block_class': 'merge_verify_red'}
-        result = check_proposal(
-            entry, worktree='/tmp', category=None,
-            run_git=_fake_git_fresh, now=self._NOW,
-        )
-        assert result['verdict'] == FRESH, f'expected FRESH, got {result}'
-
-    def test_new_path_failure_entry_aborts_via_risk_label_not_status(self):
-        """New-path failure death: a real producer failure shape always sets
-        risk_label='human-review-required', so step 2 catches it — the
-        status-sniff is not what fires. Asserts the reason names risk_label.
-        """
-        from orchestrator.b3_gate import ABORT, check_proposal
-        entry = {
-            **_LOW_RISK_ENTRY,
-            'block_class': 'agent_failure',
-            'status': 'investigation_failed',
-            'risk_label': 'human-review-required',
-        }
-        result = check_proposal(
-            entry, worktree='/tmp', category=None,
-            run_git=_fake_git_never_called, now=self._NOW,
-        )
-        assert result['verdict'] == ABORT, f'expected ABORT, got {result}'
-        assert 'risk_label' in result['reason'], (
-            f'expected the risk_label check (step 2) to fire, not the '
-            f'status sniff: {result["reason"]!r}'
-        )
-
-    def test_status_presence_does_not_abort_typed_path(self):
-        """The 'status'-key presence sniff (legacy step 3) must NOT fire when
-        block_class is present — a stray/legacy 'status' key on an otherwise
-        low-risk, fresh, typed entry must not cause a false abort.
-        """
-        from orchestrator.b3_gate import FRESH, check_proposal
-        entry = {
-            **_LOW_RISK_ENTRY,
-            'block_class': 'merge_verify_red',
-            'status': 'x',
-            'risk_label': 'low',
-        }
-        result = check_proposal(
-            entry, worktree='/tmp', category=None,
-            run_git=_fake_git_fresh, now=self._NOW,
-        )
-        assert result['verdict'] == FRESH, (
-            f'status-key presence must not abort the typed path, got {result}'
-        )
-
-    def test_agent_failure_low_risk_fresh_entry_is_fresh(self):
-        """Regression: block_class=agent_failure (the common case) behaves
-        exactly like today's low-risk fresh entry.
-        """
-        from orchestrator.b3_gate import FRESH, check_proposal
-        entry = {**_LOW_RISK_ENTRY, 'block_class': 'agent_failure'}
-        result = check_proposal(
-            entry, worktree='/tmp', category=None,
-            run_git=_fake_git_fresh, now=self._NOW,
-        )
-        assert result['verdict'] == FRESH, f'expected FRESH, got {result}'
-
-
-# ---------------------------------------------------------------------------
-# step-5 (task 2509): run_check reads the task description and gates on it
-# ---------------------------------------------------------------------------
-
-class TestRunCheckStopInstruction:
-    """run_check must READ the task's description from tasks.db and forward
-    it to check_proposal as extra_texts — an explicit stop instruction in
-    the description hard-aborts even an otherwise-fresh low-risk proposal
-    (task 2509). Mirrors TestCLIMain._setup_repo_and_db's git-repo + seeded
-    tasks.db harness.
-    """
-
-    _NOW_ISO = '2026-06-04T12:00:00+00:00'
-
-    def _setup_repo_and_db(self, tmp_path, *, description):
-        """Create a git repo + seeded tasks.db with a fresh low-risk proposal
-        whose task row carries *description*. Returns (repo_path, project_root).
-        """
-        repo = tmp_path / 'repo'
-        repo.mkdir()
-        _init_git_repo(repo)
-        head_sha = _diverge_feature_branch(repo)
-        main_sha = subprocess.run(
-            ['git', '-C', str(repo), 'rev-parse', 'main'],
-            check=True, capture_output=True, text=True,
-        ).stdout.strip()
-
-        root = tmp_path / 'root'
-        root.mkdir()
-
-        entry = {
-            'proposal_text': 'Fix the bug',
-            'risk_label': 'low',
-            'files_referenced': [],
-            'block_reason': 'test blocked',
-            'investigated_at': '2026-06-04T10:00:00+00:00',
-            'head_sha': head_sha,
-            'main_sha': main_sha,
-        }
-        _seed_tasks_db(root, 42, [entry], description=description)
-        return repo, root
-
-    def test_stop_instruction_in_description_aborts(self, tmp_path, capsys):
-        """Case A: description contains 'do not apply' -> run_check prints
-        verdict=='abort' with a stop-instruction reason."""
-        from orchestrator.b3_gate import main
-        repo, root = self._setup_repo_and_db(
-            tmp_path, description='Investigate the failure, but do not apply any fix yet.',
-        )
-
-        rc = main([
-            'check',
-            '--task-id', '42',
-            '--worktree', str(repo),
-            '--project-root', str(root),
-            '--category', 'task_failure',
-            '--now', self._NOW_ISO,
-        ])
-        assert rc == 0, f'expected exit 0, got {rc}'
-
-        data = json.loads(capsys.readouterr().out.strip())
-        assert data['verdict'] == 'abort', f'expected abort, got {data}'
-        assert 'stop instruction' in data['reason'].lower(), (
-            f'expected "stop instruction" in reason: {data["reason"]!r}'
-        )
-
-    def test_benign_description_verdict_unchanged(self, tmp_path, capsys):
-        """Case B (regression): a benign description leaves the verdict exactly
-        what the proposal+git would yield today (fresh)."""
-        from orchestrator.b3_gate import main
-        repo, root = self._setup_repo_and_db(
-            tmp_path, description='This task is blocked on a flaky integration test.',
-        )
-
-        rc = main([
-            'check',
-            '--task-id', '42',
-            '--worktree', str(repo),
-            '--project-root', str(root),
-            '--category', 'task_failure',
-            '--now', self._NOW_ISO,
-        ])
-        assert rc == 0, f'expected exit 0, got {rc}'
-
-        data = json.loads(capsys.readouterr().out.strip())
-        assert data['verdict'] == 'fresh', f'expected fresh, got {data}'
-
-
-# ---------------------------------------------------------------------------
-# review amendment: run_check shares one sqlite connection (efficiency)
-# ---------------------------------------------------------------------------
-
-class TestRunCheckSharedConnection:
-    """run_check must open tasks.db at most once per invocation — the proposal
-    and description reads share a single connection (task 2509 review
-    amendment) rather than each opening (and closing) its own.
-    """
-
-    _NOW_ISO = '2026-06-04T12:00:00+00:00'
-
-    def test_run_check_opens_tasks_db_exactly_once(self, tmp_path, capsys, monkeypatch):
-        from orchestrator import b3_gate
-        from orchestrator.b3_gate import main
-
-        repo = tmp_path / 'repo'
-        repo.mkdir()
-        _init_git_repo(repo)
-        head_sha = _diverge_feature_branch(repo)
-        main_sha = subprocess.run(
-            ['git', '-C', str(repo), 'rev-parse', 'main'],
-            check=True, capture_output=True, text=True,
-        ).stdout.strip()
-
-        root = tmp_path / 'root'
-        root.mkdir()
-        entry = {
-            'proposal_text': 'Fix the bug',
-            'risk_label': 'low',
-            'files_referenced': [],
-            'block_reason': 'test blocked',
-            'investigated_at': '2026-06-04T10:00:00+00:00',
-            'head_sha': head_sha,
-            'main_sha': main_sha,
-        }
-        _seed_tasks_db(root, 42, [entry], description='benign description')
-
-        real_connect = sqlite3.connect
-        connect_calls: list[str] = []
-
-        def _counting_connect(database, *args, **kwargs):
-            connect_calls.append(database)
-            return real_connect(database, *args, **kwargs)
-
-        monkeypatch.setattr(b3_gate.sqlite3, 'connect', _counting_connect)
-
-        rc = main([
-            'check',
-            '--task-id', '42',
-            '--worktree', str(repo),
-            '--project-root', str(root),
-            '--category', 'task_failure',
-            '--now', self._NOW_ISO,
-        ])
-        assert rc == 0, f'expected exit 0, got {rc}'
-
-        # tasks.db-targeted opens only — the state-file path (b3-state.json)
-        # never goes through sqlite3.connect, so any hit here is a tasks.db read.
-        tasks_db_opens = [c for c in connect_calls if 'tasks.db' in c]
-        assert len(tasks_db_opens) == 1, (
-            f'expected exactly one tasks.db connection, got {len(tasks_db_opens)}: '
-            f'{tasks_db_opens!r}'
-        )
-
-        data = json.loads(capsys.readouterr().out.strip())
-        assert data['verdict'] == 'fresh', f'expected fresh, got {data}'
-
-
-# ---------------------------------------------------------------------------
-# step-5 (task 2633): merge-completion consumption-gate contract
-# ---------------------------------------------------------------------------
-
-class TestMergeCompletionConsumptionContract:
-    """Pins the merge-stage completion mode's CONSUMPTION-side acceptance
-    criteria against b3_gate.check_proposal (task 2633).
-
-    These are CONTRACT/regression tests, not tests driving new b3_gate code:
-    the (a)+(b)+(c) eligibility gate is enforced at GENERATION time by the
-    dry_run_unblock.run_dry_run_unblock risk_label clamp (see
-    orchestrator.merge_completion.merge_completion_eligible and
-    TestMergeCompletionRiskClamp in test_dry_run_unblock.py) —
-    check_proposal itself is UNCHANGED by task 2633. This class pins that
-    the EXISTING check_proposal behaviour already delivers the three
-    consumption outcomes the merge-completion mode depends on, so a future
-    refactor of check_proposal cannot silently break merge-completion
-    consumption without failing a test here:
-      (i)   an ineligible (clamped) MERGE_VERIFY_RED entry aborts;
-      (ii)  an eligible (low-risk, fresh) MERGE_VERIFY_RED entry is
-            consumable end-to-end; and
-      (iii) the POST_MERGE_RED_MAIN hard-abort (task 1680) is retained
-            VERBATIM.
-    """
-
-    _NOW = datetime(2026, 6, 4, 12, 0, 0, tzinfo=UTC)
-
-    def test_clamped_merge_verify_red_entry_aborts(self):
-        """(i) The step-4 clamp shape — MERGE_VERIFY_RED, risk_label clamped
-        to 'human-review-required' by the generation-time (b)+(c) gate —
-        aborts at step 2 (risk_label != 'low'), never reaching git.
-        """
-        from orchestrator.b3_gate import ABORT, check_proposal
-        entry = {
-            **_LOW_RISK_ENTRY,
-            'block_class': 'merge_verify_red',
-            'risk_label': 'human-review-required',
-        }
-        result = check_proposal(
-            entry, worktree='/tmp', category='task_failure',
-            run_git=_fake_git_never_called, now=self._NOW,
-        )
-        assert result['verdict'] == ABORT, f'expected ABORT, got {result}'
-
-    def test_eligible_merge_verify_red_entry_is_fresh(self):
-        """(ii) An eligible mechanical proposal — block_class=merge_verify_red,
-        risk_label='low' (the (b)+(c) gate passed at generation, so the clamp
-        never fired), matching HEAD, unchanged files_referenced footprint,
-        category='task_failure' (the real category post-merge-verify blocks
-        file, workflow.py:8608) — is consumable end-to-end at the gate.
-        """
-        from orchestrator.b3_gate import FRESH, check_proposal
-        entry = {**_LOW_RISK_ENTRY, 'block_class': 'merge_verify_red'}
-        result = check_proposal(
-            entry, worktree='/tmp', category='task_failure',
-            run_git=_fake_git_fresh, now=self._NOW,
-        )
-        assert result['verdict'] == FRESH, f'expected FRESH, got {result}'
-
-    def test_post_merge_red_main_entry_hard_aborts(self):
-        """(iii) task 1680 retained VERBATIM: a POST_MERGE_RED_MAIN entry
-        hard-aborts before risk_label/git checks even with risk_label='low'
-        (_LOW_RISK_ENTRY's default) — the merge-completion mode must never
-        weaken this highest-blast-radius safety rail.
-        """
-        from orchestrator.b3_gate import ABORT, check_proposal
-        entry = {**_LOW_RISK_ENTRY, 'block_class': 'post_merge_red_main'}
-        result = check_proposal(
-            entry, worktree='/tmp', category='task_failure',
-            run_git=_fake_git_never_called, now=self._NOW,
-        )
-        assert result['verdict'] == ABORT, f'expected ABORT, got {result}'
-        assert 'post-merge red-main fix-forward class' in result['reason'], (
-            f"expected the task-1680 reason text, got: {result['reason']!r}"
         )

@@ -1,0 +1,210 @@
+"""The config-role vocabulary, the reviewer collapse and the per-role settings row.
+
+``RoleName`` names every role that has a row of settings in a service's config.
+A dispatched agent's identity is not always a config role: ``config_role`` is
+the one mapping from a dispatch identity to the role whose settings it uses.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Mapping
+from enum import StrEnum
+from typing import Annotated, Final
+
+from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, TypeAdapter
+
+from shared.backends import Backend, parse_backend
+
+__all__ = [
+    'DISPATCHABLE_ROLES',
+    'FUSED_MEMORY_ROLES',
+    'ORCHESTRATOR_ROLES',
+    'REVIEWER_VARIANTS',
+    'Effort',
+    'RoleName',
+    'RoleSettings',
+    'UnknownRole',
+    'config_role',
+    'merge_role_table',
+]
+
+
+class RoleName(StrEnum):
+    ARCHITECT = 'architect'
+    IMPLEMENTER = 'implementer'
+    DEBUGGER = 'debugger'
+    REVIEWER = 'reviewer'
+    MERGER = 'merger'
+    STEWARD = 'steward'
+    TRIAGE = 'triage'
+    MODULE_TAGGER = 'module_tagger'
+    DEEP_REVIEWER = 'deep_reviewer'
+    JUDGE = 'judge'
+    SIMPLE_TASK = 'simple_task'
+    UNBLOCK_AUTO = 'unblock_auto'
+    WATCHER = 'watcher'
+    MEMORY_LLM = 'memory_llm'
+    RECON_AGENT = 'recon_agent'
+    RECON_JUDGE = 'recon_judge'
+    RECON_STAGE_STANDARD = 'recon_stage_standard'
+    RECON_STAGE_BACKLOG = 'recon_stage_backlog'
+    CURATOR = 'curator'
+    PATH_SCOPE_ADJUDICATOR = 'path_scope_adjudicator'
+    WRITE_TRIAGE_JUDGE = 'write_triage_judge'
+    LINK_ADJUDICATOR = 'link_adjudicator'
+
+
+ORCHESTRATOR_ROLES: Final[frozenset[RoleName]] = frozenset(
+    {
+        RoleName.ARCHITECT,
+        RoleName.IMPLEMENTER,
+        RoleName.DEBUGGER,
+        RoleName.REVIEWER,
+        RoleName.MERGER,
+        RoleName.STEWARD,
+        RoleName.TRIAGE,
+        RoleName.MODULE_TAGGER,
+        RoleName.DEEP_REVIEWER,
+        RoleName.JUDGE,
+        RoleName.SIMPLE_TASK,
+        RoleName.UNBLOCK_AUTO,
+        RoleName.WATCHER,
+    }
+)
+DISPATCHABLE_ROLES: Final[frozenset[RoleName]] = ORCHESTRATOR_ROLES - {
+    RoleName.UNBLOCK_AUTO,
+    RoleName.WATCHER,
+}
+FUSED_MEMORY_ROLES: Final[frozenset[RoleName]] = frozenset(
+    {
+        RoleName.MEMORY_LLM,
+        RoleName.RECON_AGENT,
+        RoleName.RECON_JUDGE,
+        RoleName.RECON_STAGE_STANDARD,
+        RoleName.RECON_STAGE_BACKLOG,
+        RoleName.CURATOR,
+        RoleName.PATH_SCOPE_ADJUDICATOR,
+        RoleName.WRITE_TRIAGE_JUDGE,
+        RoleName.LINK_ADJUDICATOR,
+    }
+)
+
+REVIEWER_VARIANTS: Final[frozenset[str]] = frozenset({'reviewer_comprehensive'})
+
+_REVIEWER_FAMILY_PREFIX: Final = 'reviewer_'
+
+
+class UnknownRole(ValueError):
+    """A name is neither a config role nor a member of the reviewer family.
+
+    A ``ValueError`` so that a pydantic validator reports it as a
+    ``ValidationError`` carrying this message.
+
+    Attributes:
+        value: The offending value, verbatim.
+        allowed: The role names that would have been accepted.
+        family_prefix: When set, any name made of this prefix and a non-empty
+            suffix would also have been accepted.
+    """
+
+    def __init__(
+        self, value: object, *, allowed: tuple[str, ...], family_prefix: str | None = None
+    ) -> None:
+        self.value = value
+        self.allowed = allowed
+        self.family_prefix = family_prefix
+        family = f'; or {family_prefix}<name>' if family_prefix is not None else ''
+        super().__init__(f'unknown role {value!r}; known roles: {", ".join(allowed)}{family}')
+
+
+def config_role(dispatch_name: str) -> RoleName:
+    """Map a dispatch identity to its config role."""
+    if (
+        isinstance(dispatch_name, str)
+        and dispatch_name.startswith(_REVIEWER_FAMILY_PREFIX)
+        and dispatch_name != _REVIEWER_FAMILY_PREFIX
+    ):
+        return RoleName.REVIEWER
+    try:
+        return RoleName(dispatch_name)
+    except ValueError:
+        raise UnknownRole(
+            dispatch_name,
+            allowed=tuple(r.value for r in RoleName),
+            family_prefix=_REVIEWER_FAMILY_PREFIX,
+        ) from None
+
+
+class Effort(StrEnum):
+    """Every reasoning-effort level a role may request: the union of the levels the backends accept."""
+
+    OFF = 'off'
+    NONE = 'none'
+    MINIMAL = 'minimal'
+    LOW = 'low'
+    MEDIUM = 'medium'
+    HIGH = 'high'
+    XHIGH = 'xhigh'
+    MAX = 'max'
+
+
+class RoleSettings(BaseModel):
+    """One role's invocation settings."""
+
+    model_config = ConfigDict(frozen=True, extra='forbid')
+
+    model: str = Field(min_length=1)
+    backend: Annotated[Backend, BeforeValidator(parse_backend)] = Backend.CLAUDE
+    effort: Effort | None = None
+    budget_usd: float | None = Field(default=None, gt=0, strict=True, allow_inf_nan=False)
+    max_turns: int | None = Field(default=None, gt=0, strict=True)
+    timeout_secs: float | None = Field(default=None, gt=0, strict=True, allow_inf_nan=False)
+
+
+_ROLE_TABLE: Final = TypeAdapter(dict[RoleName, RoleSettings])
+
+
+def merge_role_table(
+    defaults: Mapping[RoleName, RoleSettings],
+    raw: object,
+) -> dict[RoleName, RoleSettings]:
+    """The one entry-wise, knob-wise merge of a raw role table over its defaults.
+
+    It raises on an unknown role or knob and never drops one. The raw table is a
+    mapping of role to row, and each row is a mapping of knobs or a
+    ``RoleSettings``; anything else raises ``ValueError`` naming the value.
+    """
+    overrides: dict[RoleName, Mapping[str, object]] = {}
+    for key, row in _table_rows(raw).items():
+        role = _table_role(key, defaults)
+        overrides[role] = _named_knobs(role, row)
+    merged = {
+        role: {**defaults[role].model_dump(), **overrides.get(role, {})}
+        for role in RoleName
+        if role in defaults
+    }
+    return _ROLE_TABLE.validate_python(merged)
+
+
+def _table_rows(raw: object) -> Mapping[object, object]:
+    if isinstance(raw, Mapping):
+        return raw
+    raise ValueError(f'a role table must be a mapping of role to knobs, got {raw!r}')
+
+
+def _table_role(key: object, defaults: Mapping[RoleName, RoleSettings]) -> RoleName:
+    try:
+        role = RoleName(key)
+    except ValueError:
+        role = None
+    if role is None or role not in defaults:
+        raise UnknownRole(key, allowed=tuple(r.value for r in RoleName if r in defaults))
+    return role
+
+
+def _named_knobs(role: RoleName, row: object) -> Mapping[str, object]:
+    if isinstance(row, RoleSettings):
+        return row.model_dump(include=row.model_fields_set)
+    if isinstance(row, Mapping):
+        return row
+    raise ValueError(f'role {role.value!r}: a row must be a mapping of knobs, got {row!r}')

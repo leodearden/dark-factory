@@ -1,6 +1,16 @@
 /* App shell: rail nav, topbar, toolbar (filters), live feed */
 const { useState, useEffect, useMemo, useRef } = React;
-const SP_SHELL = window.DF_CHARTS.Sparkline;
+const PIP_AGE_STYLE = window.DF_CHARTS.DATUM_AGE_STYLE;
+// The badge-chip pip's type size, decided here rather than at each call site:
+// the four escalation-subsection pips each carried their own `fontSize: 9`, and
+// one of four drifting is how a summary row comes to have two type sizes.
+const PIP_BADGE_STYLE = Object.freeze({ fontSize: 9 });
+// The Datum render decision. Module scope, no fallback, bound under datum.js's
+// own name — see the CANONICAL note in datum.js's header.
+const { datumView } = window.DF_DATUM;
+// A queued row's enqueue instant. Module scope, no fallback; merge_queue.js
+// declares it a top-level `function`, which this .jsx `var` cannot collide with.
+const { queuedSince } = window.DF_MERGE_QUEUE;
 const SHELL_PROJECTS = window.DF_DATA.PROJECTS;
 const SHELL_AGENTS = window.DF_DATA.AGENTS;
 
@@ -8,30 +18,6 @@ const SHELL_AGENTS = window.DF_DATA.AGENTS;
 // Accepts plain ids ("T-19") and project-scoped uids ("dark_factory/T-19").
 function taskId(id) {
   return id == null ? '' : String(id).replace(/T-/g, '');
-}
-
-// Convert a series of cumulative-state snapshots into per-day deltas.
-// `labels` are ISO timestamps (ascending); `values` are the cumulative count
-// at each timestamp. Buckets by date prefix and returns the day-to-day diff,
-// floored at 0. Length is (#distinct days - 1); empty for sparse history.
-function dailyDeltas(labels, values) {
-  if (!labels || !values || labels.length === 0 || values.length === 0) return [];
-  const byDay = {};
-  const order = [];
-  const n = Math.min(labels.length, values.length);
-  for (let i = 0; i < n; i++) {
-    const lbl = labels[i];
-    const day = (typeof lbl === 'string' && lbl.length >= 10) ? lbl.slice(0, 10) : null;
-    if (!day) continue;
-    if (!(day in byDay)) order.push(day);
-    byDay[day] = values[i];
-  }
-  order.sort();
-  const out = [];
-  for (let i = 1; i < order.length; i++) {
-    out.push(Math.max(0, (byDay[order[i]] || 0) - (byDay[order[i - 1]] || 0)));
-  }
-  return out;
 }
 
 // Format a UTC ISO8601 timestamp as a relative string ("now", "12s", "4m", "2h", "1d").
@@ -119,6 +105,7 @@ const Glyph = ({ kind }) => {
     case 'curator':  return <svg {...props}><path d="M2 3.5h10 M2 7h10 M2 10.5h6"/><path d="M10 8.5v4 M12 8.5v4"/></svg>;
     case 'esc':      return <svg {...props}><path d="M7 2 L12 12 H2 Z"/><path d="M7 6v3"/><circle cx="7" cy="10.5" r="0.6" fill="currentColor"/></svg>;
     case 'esc-analytics': return <svg {...props}><path d="M2 12.5h10"/><path d="M4 12.5v-4 M7 12.5v-7 M10 12.5v-2.5"/></svg>;
+    case 'quality':  return <svg {...props}><path d="M2 12.5h10"/><path d="M2 9 L5 6 L8 8 L12 3"/><path d="M2 4.5h10" strokeDasharray="1.5 1.5"/></svg>;
     case 'search':   return <svg {...props}><circle cx="6" cy="6" r="3.5"/><path d="M8.5 8.5 L12 12"/></svg>;
     case 'filter':   return <svg {...props}><path d="M2 3h10 M3.5 7h7 M5 11h4"/></svg>;
     case 'chev':     return <svg {...props}><path d="M4 5l3 3 3-3"/></svg>;
@@ -144,8 +131,8 @@ function StatStrip({ live, lastUpdate, summary }) {
         <span className="val">{summary.orchTotal}</span>
       </span>
       <span className="stat-pill">
-        <span className="lbl">tasks active</span>
-        <span className="val">{summary.tasksActive}</span>
+        <span className="lbl">tasks</span>
+        <span className="val">{summary.tasks}</span>
       </span>
       <span className="stat-pill">
         <span className="lbl">queue</span>
@@ -153,7 +140,7 @@ function StatStrip({ live, lastUpdate, summary }) {
       </span>
       <span className="stat-pill">
         <span className="lbl">spend 24h</span>
-        <span className="val">${summary.spend24h.toFixed(2)}</span>
+        <span className="val">{summary.spend24h}</span>
       </span>
     </div>
   );
@@ -282,7 +269,8 @@ function Toolbar({
 //
 // Builds a unified stream from real events already present in DF_DATA:
 //   - reconciliation runs (RECON_STATE.runs) — id, status, project, events
-//   - merge queue activity (MERGE_QUEUE[pid].recent + .active) — task, outcome
+//   - merge queue activity (MERGE_QUEUE[pid].recent + .active) — task, outcome;
+//     a queued (.active) row is dated by its enqueue instant (queuedSince)
 //   - cost / account events (COSTS.events) — account, event_type, detail
 // Each source is normalised to {ts, src, msg, key}, sorted by timestamp,
 // trimmed to the most recent 60.
@@ -312,10 +300,11 @@ function buildFeedEntries(D) {
       });
     }
     for (const a of (mq.active || [])) {
-      if (!a.timestamp) continue;
+      const iso = queuedSince(mq, a);
+      if (!iso) continue;
       rows.push({
-        key: `mq-active:${pid}:${a.task_id}:${a.timestamp}`,
-        iso: a.timestamp,
+        key: `mq-active:${pid}:${a.task_id}`,
+        iso,
         src: 'queue',
         msg: `${pid} · ${a.task_id} ${a.state} · ${a.branch || ''}`.trim(),
       });
@@ -383,6 +372,7 @@ function Rail({ active, onSelect, counts }) {
     { id: 'burn',      label: 'Burndown',     glyph: 'burn',     count: '' },
     { id: 'esc',       label: 'Escalations',  glyph: 'esc',      count: counts.esc ?? '' },
     { id: 'esc-analytics', label: 'Analytics', glyph: 'esc-analytics', count: '' },
+    { id: 'quality',   label: 'Quality',      glyph: 'quality',  count: '' },
   ];
   return (
     <div className="rail">
@@ -436,6 +426,62 @@ function ProjectGroup({ id, label, open, onToggle, summary, summaryRight, childr
   );
 }
 
+// ── One pip of a project-group summary ──
+// The shared home the six caller-built pip fragments had none of. ProjectGroup
+// could not be it: it takes `summary` as an OPAQUE node, and the word "pip"
+// does not occur anywhere else in this file — every pip was a JSX fragment
+// hand-built at its call site, the six sharing only their CSS. So this is a NEW
+// component placed beside ProjectGroup, which is the closest honest reading of
+// the PRD's "ProjectGroup pips".
+//
+// The markup is the fragments' own, unchanged, so `.proj-head .summary .pip`
+// and `.pip-dot` keep styling it — a new shape would have needed new CSS in a
+// file no leaf of this PRD owns.
+//
+// ONLY PIPS THAT RENDER A MEASURED NUMBER COME THROUGH HERE. The status-word
+// pips (running/completed, offline, state unknown) are derived FLAGS with no
+// measurement instant, and wrapping a boolean in an envelope whose contract is
+// value + as_of + state would be a category error; gamma2/theta own those
+// surfaces.
+//
+// `label` is the TRAILING word ('p50', 'active', 'blocked'), kept a separate
+// prop rather than folded into `format` so the formatter stays about the VALUE
+// and the space between the two is decided once here instead of at each site.
+// A LEADING label ('L1 · 3') goes through `format` instead: two sites want one,
+// and a second placement prop would be a second way to say the same thing.
+//
+// The age is a dim suffix rather than a badge of its own: a pip sits in a dense
+// flex summary row, and a second bordered element per pip would double that
+// row's width. It shares DATUM_AGE_STYLE with StatTile, so the dashboard states
+// an age in one shape as well as one format.
+//
+// TWO LEADING GLYPHS, BECAUSE THE FRAGMENTS HAD TWO. A summary pip either
+// carries a coloured dot (the orchestrator/perf/merge/burndown rows) or renders
+// its reading inside a `.badge` chip (the escalation subsections' L1/L2 and
+// unreadable counts, where the chip's tone IS the level). Both are pre-existing
+// shared markup this component adopts unchanged rather than new variants it
+// invents; `color` and `badge` are each absent on the shape that does not use
+// it, so neither draws an empty 7px dot nor an untoned chip.
+function Pip({ datum, label, color, format, badge, rule }) {
+  const view = datumView(datum, { now: Date.now(), format });
+  const reading = <>{view.text}{label && ` ${label}`}{view.age && <span style={PIP_AGE_STYLE}> {view.age}</span>}</>;
+  return (
+    <span className="pip" title={view.title || rule || undefined}>
+      {color && <span className="pip-dot" style={{ background: color }}></span>}
+      {badge ? <span className={`badge ${badge}`} style={PIP_BADGE_STYLE}>{reading}</span> : reading}
+    </span>
+  );
+}
+
+// ── The reading for surfaces that are neither a tile nor a pip ──
+// The topbar pill, the rail badge, OrchTab's filter buttons, Progress header
+// and legend, the Overview pipeline: one datum and one `format`, the same
+// decision and the same age suffix as Pip, without the dot.
+function DatumReading({ datum, format, rule }) {
+  const view = datumView(datum, { now: Date.now(), format });
+  return <span title={view.title || rule || undefined}>{view.text}{view.age && <span style={PIP_AGE_STYLE}> {view.age}</span>}</span>;
+}
+
 // ── Segmented control ──
 function Segmented({ options, value, onChange }) {
   return (
@@ -451,4 +497,30 @@ function Segmented({ options, value, onChange }) {
   );
 }
 
-window.DF_SHELL = { Glyph, StatStrip, ChipGroup, ProjectChips, MultiSelect, Toolbar, LiveFeed, Rail, ProjectGroup, Segmented, timeago, fmtUptime, fmtDateTime, scrubIsos, taskId, dailyDeltas };
+// ── Render-failure boundary ──
+// A render throw anywhere below would otherwise unmount the whole page. React
+// accepts only a class as an error boundary. `describe(thrown)` decides the
+// notice and must be total (render_failure.js); this class never reads the
+// thrown value itself. It never resets: a parent that wants a retry remounts
+// it with a new key.
+class RenderFailureBoundary extends React.Component {
+  state = { failed: false, thrown: undefined };
+
+  static getDerivedStateFromError(thrown) {
+    return { failed: true, thrown };
+  }
+
+  render() {
+    if (!this.state.failed) return this.props.children;
+    const { describe, testId, className, style } = this.props;
+    const notice = describe(this.state.thrown);
+    return (
+      <div className={className} data-testid={testId} role="alert" style={style}>
+        <div>{notice.text}</div>
+        <div>{notice.detail}</div>
+      </div>
+    );
+  }
+}
+
+window.DF_SHELL = { Glyph, StatStrip, ChipGroup, ProjectChips, MultiSelect, Toolbar, LiveFeed, Rail, ProjectGroup, Pip, DatumReading, Segmented, RenderFailureBoundary, timeago, fmtUptime, fmtDateTime, scrubIsos, taskId };

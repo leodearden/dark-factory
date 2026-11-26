@@ -1,88 +1,41 @@
-"""Tests for evals/report.py — the C4 composite report surface (task 2477 λ).
+"""Tests for evals/composite_report.py — the C4 composite report surface (task 2477 λ).
 
-Covers the statistics substrate (mean_ci95, _ratio_score), the per-config
-price table, the composite report over the UNION of configs (retiring the
-all-tasks-intersection collapse), its deterministic renderer, and the
-union-aggregation of Elo ratings.
+Covers _ratio_score, the composite report over the UNION of configs (retiring
+the all-tasks-intersection collapse) and its deterministic renderer. The tests
+that the composite row and evals/plan_quality_report.py agree on every shared
+figure live here too, with the plan-quality table's judged-without-reference
+and decline-split rendering. The leaves composite_report.py builds on are
+tested beside them: test_eval_stats, test_eval_prices, test_eval_table_render,
+test_eval_cell_admission and test_eval_elo_report.
 """
 
 from __future__ import annotations
 
 import logging
-from math import sqrt
 
 import pytest
 
 # ---------------------------------------------------------------------------
-# Task 2477 step-05: mean_ci95 (Student-t small-sample CI) + _ratio_score
+# Task 2477 step-05: _ratio_score
 # ---------------------------------------------------------------------------
-
-class TestMeanCI95:
-    """Small-sample Student-t two-sided 95% CI, stdlib-only (no scipy/numpy)."""
-
-    def test_three_values_student_t_interval(self):
-        from orchestrator.evals.report import mean_ci95
-
-        out = mean_ci95([0.4, 0.5, 0.6])
-        assert out['mean'] == pytest.approx(0.5)
-        assert out['n'] == 3
-        assert out['sufficient'] is True
-
-        # Hand-computed: stdev(ddof=1) == 0.1; t(df=2, 0.975) == 4.303;
-        # half-width == 4.303 * 0.1 / sqrt(3) == 0.24843…
-        half = 4.303 * 0.1 / sqrt(3)
-        assert out['lo'] == pytest.approx(0.5 - half, abs=1e-3)
-        assert out['hi'] == pytest.approx(0.5 + half, abs=1e-3)
-        # Cross-check the plan's stated endpoints.
-        assert out['lo'] == pytest.approx(0.2515, abs=1e-3)
-        assert out['hi'] == pytest.approx(0.7485, abs=1e-3)
-
-    def test_single_value_has_no_interval(self):
-        from orchestrator.evals.report import mean_ci95
-
-        out = mean_ci95([0.5])
-        assert out['mean'] == pytest.approx(0.5)
-        assert out['n'] == 1
-        assert out['sufficient'] is False
-        # No CI for n<2 → the interval collapses to the point estimate.
-        assert out['lo'] == pytest.approx(0.5)
-        assert out['hi'] == pytest.approx(0.5)
-
-    def test_empty_is_zero_and_insufficient(self):
-        from orchestrator.evals.report import mean_ci95
-
-        out = mean_ci95([])
-        assert out['mean'] == 0.0
-        assert out['n'] == 0
-        assert out['sufficient'] is False
-
-    def test_two_values_has_interval_but_insufficient(self):
-        """n==2 → a CI IS computed, but 'sufficient' stays False (decision 10)."""
-        from orchestrator.evals.report import mean_ci95
-
-        out = mean_ci95([0.4, 0.6])
-        assert out['n'] == 2
-        assert out['sufficient'] is False
-        assert out['lo'] < out['mean'] < out['hi']
-
 
 class TestRatioScore:
     """best/value normalization, single-config-safe, clamped to [0, 1]."""
 
     def test_worse_value_scores_below_one(self):
-        from orchestrator.evals.report import _ratio_score
+        from orchestrator.evals.composite_report import _ratio_score
 
         # value twice the best → 0.5
         assert _ratio_score(2.0, 1.0) == pytest.approx(0.5)
 
     def test_best_equals_value_scores_one(self):
-        from orchestrator.evals.report import _ratio_score
+        from orchestrator.evals.composite_report import _ratio_score
 
         assert _ratio_score(1.0, 1.0) == pytest.approx(1.0)
 
     def test_nonpositive_best_or_value_is_neutral_one(self):
         """Undefined normalization (single-config / zero denominator) → 1.0."""
-        from orchestrator.evals.report import _ratio_score
+        from orchestrator.evals.composite_report import _ratio_score
 
         assert _ratio_score(1.0, 0.0) == pytest.approx(1.0)
         assert _ratio_score(1.0, -3.0) == pytest.approx(1.0)
@@ -90,128 +43,10 @@ class TestRatioScore:
         assert _ratio_score(-2.0, 1.0) == pytest.approx(1.0)
 
     def test_result_clamped_to_unit_interval(self):
-        from orchestrator.evals.report import _ratio_score
+        from orchestrator.evals.composite_report import _ratio_score
 
         # A value BETTER than 'best' (best/value > 1) clamps down to 1.0.
         assert _ratio_score(0.5, 1.0) == 1.0
-
-
-# ---------------------------------------------------------------------------
-# Task 2477 step-07: build_price_table — per-config C4 price table
-# ---------------------------------------------------------------------------
-
-def _cfg(name, model, role='implementer'):
-    from orchestrator.evals.configs import EvalConfig
-
-    return EvalConfig(name=name, backend='claude', model=model, effort='high', role=role)
-
-
-class TestBuildPriceTable:
-    """{config_name: {role: {input_per_1m, output_per_1m}}} pulled from prices
-    by model — an unlisted model yields an EXPLICIT unpriced marker, never a
-    silently fabricated price.
-    """
-
-    def test_priced_configs_map_role_to_price_entry(self):
-        from orchestrator.evals.report import build_price_table
-
-        prices = {
-            'model-x': {'input_per_1m': 2.0, 'output_per_1m': 8.0},
-            'model-y': {'input_per_1m': 1.0, 'output_per_1m': 4.0},
-        }
-        configs = [
-            _cfg('cfg-a', 'model-x', role='implementer'),
-            _cfg('cfg-b', 'model-y', role='architect'),
-        ]
-        table = build_price_table(configs, prices)
-        assert table['cfg-a'] == {
-            'implementer': {'input_per_1m': 2.0, 'output_per_1m': 8.0},
-        }
-        assert table['cfg-b'] == {
-            'architect': {'input_per_1m': 1.0, 'output_per_1m': 4.0},
-        }
-
-    def test_unlisted_model_gets_explicit_unpriced_marker(self):
-        from orchestrator.evals.report import build_price_table
-
-        prices = {'model-x': {'input_per_1m': 2.0, 'output_per_1m': 8.0}}
-        configs = [_cfg('cfg-z', 'unlisted-model', role='implementer')]
-        table = build_price_table(configs, prices)
-        entry = table['cfg-z']['implementer']
-        # An EXPLICIT marker, NOT a fabricated price.
-        assert 'input_per_1m' not in entry
-        assert entry.get('source') == 'unpriced'
-
-    def test_accepts_price_entry_objects(self):
-        from orchestrator.config import PriceEntry
-        from orchestrator.evals.report import build_price_table
-
-        prices = {'model-x': PriceEntry(input_per_1m=2.0, output_per_1m=8.0)}
-        table = build_price_table([_cfg('cfg-a', 'model-x')], prices)
-        assert table['cfg-a']['implementer'] == {
-            'input_per_1m': 2.0, 'output_per_1m': 8.0,
-        }
-
-    def test_deterministic_sorted_config_keys(self):
-        from orchestrator.evals.report import build_price_table
-
-        prices = {'m': {'input_per_1m': 1.0, 'output_per_1m': 2.0}}
-        configs = [_cfg('z', 'm'), _cfg('a', 'm'), _cfg('m', 'm')]
-        table = build_price_table(configs, prices)
-        assert list(table.keys()) == ['a', 'm', 'z']
-
-
-# ---------------------------------------------------------------------------
-# Task 2478 μ (amend): build_pairwise_price_table — the combined arch+impl
-# price table for the end-to-end (matrix/confirm) stages. Keyed to match
-# run_end_to_end's ``f'{arch.name}+{impl.name}'`` config_name so the rendered
-# price section aligns with the end-to-end composite rows (was individual-keyed).
-# ---------------------------------------------------------------------------
-
-class TestBuildPairwisePriceTable:
-    """{arch+impl: {architect: entry, implementer: entry}} — one combined-name
-    entry per (architect, implementer) pair, carrying BOTH roles' rates.
-    """
-
-    def test_pair_keys_combined_name_with_both_roles(self):
-        from orchestrator.evals.report import build_pairwise_price_table
-
-        prices = {
-            'arch-model': {'input_per_1m': 3.0, 'output_per_1m': 12.0},
-            'impl-model': {'input_per_1m': 1.0, 'output_per_1m': 4.0},
-        }
-        arch = _cfg('architect-x', 'arch-model', role='architect')
-        impl = _cfg('impl-y', 'impl-model', role='implementer')
-        table = build_pairwise_price_table([(arch, impl)], prices)
-        # Key is the combined name run_end_to_end stamps; both roles present.
-        assert table == {
-            'architect-x+impl-y': {
-                'architect': {'input_per_1m': 3.0, 'output_per_1m': 12.0},
-                'implementer': {'input_per_1m': 1.0, 'output_per_1m': 4.0},
-            }
-        }
-
-    def test_unlisted_model_gets_explicit_unpriced_marker(self):
-        from orchestrator.evals.report import build_pairwise_price_table
-
-        arch = _cfg('a', 'unlisted', role='architect')
-        impl = _cfg('b', 'unlisted', role='implementer')
-        table = build_pairwise_price_table([(arch, impl)], {})
-        # EXPLICIT marker for each role, never a fabricated price.
-        assert table['a+b']['architect'] == {'source': 'unpriced'}
-        assert table['a+b']['implementer'] == {'source': 'unpriced'}
-
-    def test_deterministic_sorted_combined_keys(self):
-        from orchestrator.evals.report import build_pairwise_price_table
-
-        prices = {'m': {'input_per_1m': 1.0, 'output_per_1m': 2.0}}
-        i1 = _cfg('impl-b', 'm', role='implementer')
-        pairs = [
-            (_cfg('arch-z', 'm', role='architect'), i1),
-            (_cfg('arch-a', 'm', role='architect'), i1),
-        ]
-        table = build_pairwise_price_table(pairs, prices)
-        assert list(table.keys()) == ['arch-a+impl-b', 'arch-z+impl-b']
 
 
 # ---------------------------------------------------------------------------
@@ -219,12 +54,27 @@ class TestBuildPairwisePriceTable:
 # over the UNION of configs (retiring the all-tasks-intersection collapse).
 # ---------------------------------------------------------------------------
 
+def _session_limit_records():
+    """The ``invocation_errors`` an architect refused by a session cap persists."""
+    from orchestrator.evals.measurement import (
+        MeasurementStage,
+        Unmeasured,
+        UnmeasuredCause,
+    )
+
+    return [Unmeasured(
+        MeasurementStage.ARCHITECT, UnmeasuredCause.CAP_HIT, 'session limit',
+        cost_usd=0.0,
+    ).to_record()]
+
+
 def _mresult(
     task_id, config_name, trial, *, quality, cost_usd, duration_ms,
     tests_pass: bool | None = True, cost_source='price_table', recovery_score=None,
     plan_quality=None, role_under_test='implementer', plan_steps=0,
     judge_invocations=0, judge_cost_usd=0.0,
-    cap_tainted=False, invocation_error=None,
+    cap_tainted=False, invocation_errors=None,
+    judged_without_reference=False,
 ):
     """Build a synthetic EvalResult with a production-shaped metrics dict.
 
@@ -233,8 +83,8 @@ def _mresult(
     ``plan_quality`` without the step count it came from is itself the
     self-contradictory shape this task removes.
     """
-    from orchestrator.evals.metrics import EvalMetrics
-    from orchestrator.evals.runner import EvalResult
+    from orchestrator.evals.metrics import EvalMetrics, RoleUnderTest
+    from orchestrator.evals.results import EvalResult
 
     m = EvalMetrics(
         tests_pass=tests_pass,
@@ -244,12 +94,15 @@ def _mresult(
         composite_score=quality,          # the PURE quality (compute_composite)
         recovery_score=recovery_score,
         plan_quality=plan_quality,
-        role_under_test=role_under_test,
+        role_under_test=(
+            RoleUnderTest(role_under_test) if role_under_test is not None else None
+        ),
         plan_steps=plan_steps,
         judge_invocations=judge_invocations,
         judge_cost_usd=judge_cost_usd,
         cap_tainted=cap_tainted,
-        invocation_error=invocation_error,
+        invocation_errors=invocation_errors,
+        judged_without_reference=judged_without_reference,
     )
     return EvalResult(
         task_id=task_id,
@@ -259,6 +112,20 @@ def _mresult(
         worktree_path='/tmp/eval',
         trial=trial,
     )
+
+
+def _keyless(result):
+    """Strip the σ validity marker, minting a PRE-σ cell (task 3628).
+
+    ``_mresult`` builds its metrics through ``EvalMetrics.to_dict``, which
+    emits ``judged_without_reference`` on every cell — the production shape.
+    The 2026-07-27 / 07-29 results already on disk predate the field entirely,
+    and that shape is not constructible any other way; the report layer must
+    read it as UNMEASURED rather than as a measured False, so the tests need a
+    way to say "written before the instrument existed" out loud.
+    """
+    result.metrics.pop('judged_without_reference', None)
+    return result
 
 
 def _union_dataset():
@@ -312,7 +179,7 @@ class TestBuildCompositeReport:
     """C4 per-config composite report over the UNION of configs."""
 
     def test_union_of_configs_no_intersection_collapse(self):
-        from orchestrator.evals.report import build_composite_report
+        from orchestrator.evals.composite_report import build_composite_report
 
         report = build_composite_report(_union_dataset())
         names = [row['config'] for row in report['configs']]
@@ -321,7 +188,7 @@ class TestBuildCompositeReport:
         assert names == ['A', 'B', 'C']
 
     def test_row_schema_and_hand_computed_aggregates(self):
-        from orchestrator.evals.report import build_composite_report
+        from orchestrator.evals.composite_report import build_composite_report
 
         report = build_composite_report(_union_dataset())
         rows = {row['config']: row for row in report['configs']}
@@ -363,7 +230,7 @@ class TestBuildCompositeReport:
         assert c['ci95']['composite']['sufficient'] is True
 
     def test_passthrough_recovery_plan_quality_role(self):
-        from orchestrator.evals.report import build_composite_report
+        from orchestrator.evals.composite_report import build_composite_report
 
         report = build_composite_report(_union_dataset())
         rows = {row['config']: row for row in report['configs']}
@@ -379,13 +246,13 @@ class TestBuildCompositeReport:
         # first trial was cap-refused would report plan_quality=None despite
         # having healthy trials — the infra failure blanking a real measurement
         # (task 3118). It must skip tainted trials and count the exclusions.
-        from orchestrator.evals.report import build_composite_report
+        from orchestrator.evals.composite_report import build_composite_report
 
         results = [
             _mresult('f1', 'capped-first', 1, quality=1.0, cost_usd=1.0,
                      duration_ms=1000, role_under_test='architect',
                      plan_quality=None, cap_tainted=True,
-                     invocation_error='architect:cap_hit: session limit'),
+                     invocation_errors=_session_limit_records()),
             _mresult('f1', 'capped-first', 2, quality=1.0, cost_usd=1.0,
                      duration_ms=1000, role_under_test='architect',
                      plan_quality=0.82, plan_steps=6),
@@ -407,20 +274,18 @@ class TestBuildCompositeReport:
         # tainted non-architect trial (which has no plan_quality to exclude in
         # the first place) must not inflate the composite counter either
         # (reviewer: docs-accuracy).
-        from orchestrator.evals.report import (
-            build_composite_report,
-            build_plan_quality_report,
-        )
+        from orchestrator.evals.composite_report import build_composite_report
+        from orchestrator.evals.plan_quality_report import build_plan_quality_report
 
         results = [
             _mresult('f1', 'mixed', 1, quality=1.0, cost_usd=1.0,
                      duration_ms=1000, role_under_test='architect',
                      plan_quality=None, cap_tainted=True,
-                     invocation_error='architect:cap_hit: session limit'),
+                     invocation_errors=_session_limit_records()),
             _mresult('f1', 'mixed', 2, quality=1.0, cost_usd=1.0,
                      duration_ms=1000, role_under_test='implementer',
                      plan_quality=None, cap_tainted=True,
-                     invocation_error='architect:cap_hit: session limit'),
+                     invocation_errors=_session_limit_records()),
             _mresult('f1', 'mixed', 3, quality=1.0, cost_usd=1.0,
                      duration_ms=1000, role_under_test='architect',
                      plan_quality=0.6, plan_steps=6),
@@ -438,8 +303,167 @@ class TestBuildCompositeReport:
         # of role, so a healthy trial's measurement survives.
         assert rows['mixed']['plan_quality'] == pytest.approx(0.6)
 
+    # -- judged_without_reference (eval-revival σ, task 3628) ----------------
+    #
+    # The composite twin of the θ-surface count. Same accumulator idiom as
+    # plan_quality_cap_excluded, one decisive difference: it excludes nothing.
+
+    def test_judged_without_reference_is_counted_per_config(self):
+        from orchestrator.evals.composite_report import build_composite_report
+
+        results = [
+            _mresult('f1', 'blind-first', 1, quality=1.0, cost_usd=1.0,
+                     duration_ms=1000, role_under_test='architect',
+                     plan_quality=0.8, plan_steps=6,
+                     judged_without_reference=True),
+            _mresult('f2', 'blind-first', 2, quality=1.0, cost_usd=1.0,
+                     duration_ms=1000, role_under_test='architect',
+                     plan_quality=0.6, plan_steps=6),
+            _mresult('f1', 'healthy', 1, quality=1.0, cost_usd=1.0,
+                     duration_ms=1000, role_under_test='architect',
+                     plan_quality=0.55, plan_steps=6),
+        ]
+        rows = {r['config']: r for r in build_composite_report(results)['configs']}
+
+        assert rows['blind-first']['plan_quality_judged_without_reference'] == 1
+        assert rows['healthy']['plan_quality_judged_without_reference'] == 0
+
+    def test_judged_blind_cell_stays_in_the_plan_quality_pool(self):
+        """POOL MEMBERSHIP: bounds validity, does NOT exclude.
+
+        The flagged cell's score is in the mean and the count never exceeds the
+        pool it is drawn from — the composite twin of the θ-surface's
+        "bounds, does not exclude".
+        """
+        from orchestrator.evals.composite_report import build_composite_report
+
+        results = [
+            _mresult('f1', 'mixed', 1, quality=1.0, cost_usd=1.0,
+                     duration_ms=1000, role_under_test='architect',
+                     plan_quality=0.9, plan_steps=6,
+                     judged_without_reference=True),
+            _mresult('f2', 'mixed', 1, quality=1.0, cost_usd=1.0,
+                     duration_ms=1000, role_under_test='architect',
+                     plan_quality=0.5, plan_steps=6),
+        ]
+        rows = {r['config']: r for r in build_composite_report(results)['configs']}
+        row = rows['mixed']
+
+        # Over BOTH cells (0.9 + 0.5) / 2 — not just the healthy one.
+        assert row['plan_quality'] == pytest.approx(0.7)
+        assert row['plan_quality_judged_without_reference'] == 1
+        assert (
+            row['plan_quality_judged_without_reference'] <= row['plan_quality_n']
+        )
+
+    def test_judged_blind_counter_agrees_with_the_plan_quality_surface(self):
+        """The two accumulators describe the SAME cells and must not drift.
+
+        Follows the cap_excluded agreement assertion's idiom exactly; this is
+        the test that stops the composite and θ surfaces diverging.
+        """
+        from orchestrator.evals.composite_report import build_composite_report
+        from orchestrator.evals.plan_quality_report import build_plan_quality_report
+
+        results = [
+            _mresult('f1', 'mixed', 1, quality=1.0, cost_usd=1.0,
+                     duration_ms=1000, role_under_test='architect',
+                     plan_quality=0.8, plan_steps=6,
+                     judged_without_reference=True),
+            _mresult('f2', 'mixed', 1, quality=1.0, cost_usd=1.0,
+                     duration_ms=1000, role_under_test='architect',
+                     plan_quality=0.6, plan_steps=6),
+        ]
+        rows = {r['config']: r for r in build_composite_report(results)['configs']}
+        plan_report = build_plan_quality_report(results)
+
+        assert rows['mixed']['plan_quality_judged_without_reference'] == 1
+        assert plan_report['judged_without_reference'] == 1
+        assert (
+            rows['mixed']['plan_quality_judged_without_reference']
+            == plan_report['judged_without_reference']
+        )
+
+    def test_cap_tainted_cell_carrying_the_flag_is_only_cap_excluded(self):
+        """DISJOINT: a tainted cell has no plan_quality to bound."""
+        from orchestrator.evals.composite_report import build_composite_report
+
+        results = [
+            _mresult('f1', 'capped', 1, quality=1.0, cost_usd=1.0,
+                     duration_ms=1000, role_under_test='architect',
+                     plan_quality=None, cap_tainted=True,
+                     invocation_errors=_session_limit_records(),
+                     judged_without_reference=True),
+            _mresult('f2', 'capped', 1, quality=1.0, cost_usd=1.0,
+                     duration_ms=1000, role_under_test='architect',
+                     plan_quality=0.7, plan_steps=6),
+        ]
+        rows = {r['config']: r for r in build_composite_report(results)['configs']}
+
+        assert rows['capped']['plan_quality_cap_excluded'] == 1
+        assert rows['capped']['plan_quality_judged_without_reference'] == 0
+
+    def test_a_keyless_admitted_cell_makes_the_row_count_unmeasured(self):
+        """ABSENCE IS NOT FALSE on the composite surface either.
+
+        The composite row is the surface ``select_survivors`` ranks on, so a
+        fabricated 0 here reads as "this candidate's plan_quality was fully
+        validity-bounded" for a corpus in which nothing bounded it — the same
+        inversion ``cell_admission.judged_blind_count`` refuses per config, and
+        which task 3632's campaign script inherits by consuming that count rather
+        than deriving its own (reviewer: architecture-coherence).
+        """
+        from orchestrator.evals.composite_report import build_composite_report
+
+        results = [
+            _mresult('f1', 'mixed', 1, quality=1.0, cost_usd=1.0,
+                     duration_ms=1000, role_under_test='architect',
+                     plan_quality=0.8, plan_steps=6,
+                     judged_without_reference=True),
+            _keyless(_mresult('f2', 'mixed', 1, quality=1.0, cost_usd=1.0,
+                              duration_ms=1000, role_under_test='architect',
+                              plan_quality=0.6, plan_steps=6)),
+        ]
+        rows = {r['config']: r for r in build_composite_report(results)['configs']}
+        row = rows['mixed']
+
+        assert row['plan_quality_judged_without_reference'] is None
+        assert row['plan_quality_judged_without_reference_unmeasured'] == 1
+        # Unmeasured BOUND, not an exclusion: both cells are still pooled.
+        assert row['plan_quality_n'] == 2
+        assert row['plan_quality'] == pytest.approx(0.7)
+
+    def test_unmeasured_agrees_across_both_surfaces(self):
+        """The None must appear on BOTH surfaces or on neither.
+
+        The existing agreement test pins the two accumulators on a measured
+        corpus; this is the same pin for the corpus that is already on disk —
+        the one where the two could most damagingly disagree, because θ's
+        trailer and the composite row are read side by side.
+        """
+        from orchestrator.evals.composite_report import build_composite_report
+        from orchestrator.evals.plan_quality_report import build_plan_quality_report
+
+        results = [
+            _keyless(_mresult('f1', 'legacy', 1, quality=1.0, cost_usd=1.0,
+                              duration_ms=1000, role_under_test='architect',
+                              plan_quality=0.8, plan_steps=6)),
+            _keyless(_mresult('f2', 'legacy', 1, quality=1.0, cost_usd=1.0,
+                              duration_ms=1000, role_under_test='architect',
+                              plan_quality=0.6, plan_steps=6)),
+        ]
+        rows = {r['config']: r for r in build_composite_report(results)['configs']}
+        plan_report = build_plan_quality_report(results)
+
+        assert rows['legacy']['plan_quality_judged_without_reference'] is None
+        assert plan_report['judged_without_reference'] is None
+        assert (
+            rows['legacy']['plan_quality_judged_without_reference_unmeasured']
+            == plan_report['judged_without_reference_unmeasured'] == 2
+        )
+
     def test_price_table_echo_and_sorted_rows(self):
-        from orchestrator.evals.report import build_composite_report
+        from orchestrator.evals.composite_report import build_composite_report
 
         price_table = {
             'A': {'implementer': {'input_per_1m': 2.0, 'output_per_1m': 8.0}},
@@ -451,13 +475,13 @@ class TestBuildCompositeReport:
         assert [row['config'] for row in report['configs']] == ['A', 'B', 'C']
 
     def test_price_table_defaults_to_empty_dict_when_omitted(self):
-        from orchestrator.evals.report import build_composite_report
+        from orchestrator.evals.composite_report import build_composite_report
 
         report = build_composite_report(_union_dataset())
         assert report['price_table'] == {}
 
     def test_tests_pass_false_trial_zeroes_that_trials_composite(self):
-        from orchestrator.evals.report import build_composite_report
+        from orchestrator.evals.composite_report import build_composite_report
 
         # Config P in g1: 3 trials, identical cost/latency (best == self → each
         # efficiency score 1.0). Trials 1,2 pass → blend 1.0; trial 3 FAILS →
@@ -478,7 +502,7 @@ class TestBuildCompositeReport:
         assert row['tests_pass_rate'] == pytest.approx(2 / 3)
 
     def test_judge_invocations_and_cost_are_summed(self):
-        from orchestrator.evals.report import build_composite_report
+        from orchestrator.evals.composite_report import build_composite_report
 
         results = [
             _mresult('f1', 'A', tr, quality=1.0, cost_usd=2.0, duration_ms=2000,
@@ -518,7 +542,7 @@ def _arch(task_id, config_name, trial, *, plan_quality, cost_usd, duration_ms,
         tests_pass=None, role_under_test='architect',
         plan_quality=plan_quality, plan_steps=plan_steps,
         cap_tainted=cap_tainted,
-        invocation_error='architect:cap_hit: session limit' if cap_tainted else None,
+        invocation_errors=_session_limit_records() if cap_tainted else None,
     )
 
 
@@ -539,7 +563,7 @@ class TestPlanOnlyComposite:
 
     def test_plan_only_row_scores_its_plan_quality(self):
         """The reported defect: this row used to report composite 0.0000."""
-        from orchestrator.evals.report import build_composite_report
+        from orchestrator.evals.composite_report import build_composite_report
 
         # Sole config on the fixture → it IS its own cost/latency best → both
         # efficiency axes 1.0. 0.6*0.9 + 0.2*1.0 + 0.2*1.0 == 0.94.
@@ -557,7 +581,7 @@ class TestPlanOnlyComposite:
     def test_plan_only_rows_rank_by_plan_quality(self):
         """Identical but for plan_quality → DIFFERENT, correctly-ordered
         composites. Every architect row collapsing to 0.0000 is the defect."""
-        from orchestrator.evals.report import build_composite_report
+        from orchestrator.evals.composite_report import build_composite_report
 
         results = [
             _arch('p1', 'arch-good', tr, plan_quality=0.9, cost_usd=0.3,
@@ -584,7 +608,7 @@ class TestPlanOnlyComposite:
         COUNTED, in `trials` and in `plan_quality_cap_excluded`, so nothing is
         dropped silently.
         """
-        from orchestrator.evals.report import build_composite_report
+        from orchestrator.evals.composite_report import build_composite_report
 
         results = [
             # One tainted (no plan_quality, zero cost — a 429 refusal) + one healthy.
@@ -610,7 +634,7 @@ class TestPlanOnlyComposite:
 
     def test_wholly_unmeasured_config_reports_none_not_zero(self):
         """"We measured nothing" must never read as "it scored nothing"."""
-        from orchestrator.evals.report import build_composite_report
+        from orchestrator.evals.composite_report import build_composite_report
 
         results = [
             _arch('p1', 'arch-dark', tr, plan_quality=None, cost_usd=0.0,
@@ -625,7 +649,7 @@ class TestPlanOnlyComposite:
 
     def test_plan_only_row_has_no_fabricated_tests_pass_rate(self):
         """No test ran, so there is no pass RATE — not a 0% one."""
-        from orchestrator.evals.report import build_composite_report
+        from orchestrator.evals.composite_report import build_composite_report
 
         results = [
             _arch('p1', 'arch-a', 1, plan_quality=0.9, cost_usd=0.3,
@@ -672,7 +696,7 @@ class TestUnmeasurableCellLeavesEveryPool:
         arch-mixed as 2x cheaper and 2x faster than arch-clean purely because it
         was scheduled inside a cap window (reviewer: correctness).
         """
-        from orchestrator.evals.report import build_composite_report
+        from orchestrator.evals.composite_report import build_composite_report
 
         rows = {r['config']: r for r in
                 build_composite_report(self._mixed_and_clean())['configs']}
@@ -689,7 +713,7 @@ class TestUnmeasurableCellLeavesEveryPool:
 
     def test_wholly_unmeasured_config_is_not_the_cheapest_row_in_the_table(self):
         """All-tainted ⇒ cost/latency are None ('-'), not 0.0 ("free and instant")."""
-        from orchestrator.evals.report import build_composite_report
+        from orchestrator.evals.composite_report import build_composite_report
 
         results = [
             _arch('p1', 'arch-dark', tr, plan_quality=None, cost_usd=0.0,
@@ -704,7 +728,7 @@ class TestUnmeasurableCellLeavesEveryPool:
     def test_unmeasured_row_has_no_zero_width_interval_at_zero(self):
         """One row must not say both "we measured nothing" and "we measured a
         zero-width interval at zero" (reviewer: correctness)."""
-        from orchestrator.evals.report import build_composite_report
+        from orchestrator.evals.composite_report import build_composite_report
 
         results = [
             _arch('p1', 'arch-dark', tr, plan_quality=None, cost_usd=0.0,
@@ -728,10 +752,8 @@ class TestUnmeasurableCellLeavesEveryPool:
         ``plan_quality`` cells disagree and putting a fabricated number back into
         the figure ``select_survivors`` ranks on.
         """
-        from orchestrator.evals.report import (
-            build_composite_report,
-            build_plan_quality_report,
-        )
+        from orchestrator.evals.composite_report import build_composite_report
+        from orchestrator.evals.plan_quality_report import build_plan_quality_report
 
         results = [
             # Tainted, yet carrying a score AND an outlier cost/latency.
@@ -787,7 +809,7 @@ class TestPlanQualityIsTheConfigMean:
         ]
 
     def test_row_reports_the_pooled_mean_not_the_first_scored_trial(self):
-        from orchestrator.evals.report import build_composite_report
+        from orchestrator.evals.composite_report import build_composite_report
 
         row = build_composite_report(self._varied())['configs'][0]
         assert row['plan_quality'] == pytest.approx(0.6)
@@ -802,10 +824,8 @@ class TestPlanQualityIsTheConfigMean:
     def test_agrees_bit_identically_with_the_plan_quality_surface(self):
         """ONE shared reduction, so ``==`` and not ``approx``: the two surfaces
         must be structurally incapable of drifting, not merely close today."""
-        from orchestrator.evals.report import (
-            build_composite_report,
-            build_plan_quality_report,
-        )
+        from orchestrator.evals.composite_report import build_composite_report
+        from orchestrator.evals.plan_quality_report import build_plan_quality_report
 
         results = self._varied()
         row = build_composite_report(results)['configs'][0]
@@ -817,11 +837,13 @@ class TestPlanQualityIsTheConfigMean:
         """``_emit_composite_report`` now prints both tables on one screen, so an
         operator must not be able to read contradictory answers to one question.
         """
-        from orchestrator.evals.report import (
-            _PLAN_QUALITY_MEAN_HEADER,
+        from orchestrator.evals.composite_report import (
             build_composite_report,
-            build_plan_quality_report,
             format_composite_table,
+        )
+        from orchestrator.evals.plan_quality_report import (
+            _PLAN_QUALITY_MEAN_HEADER,
+            build_plan_quality_report,
             format_plan_quality_table,
         )
 
@@ -845,7 +867,7 @@ class TestPlanQualityIsTheConfigMean:
         """Two cells of the SAME row must not contradict either: for a plan-only
         row ``quality`` is the mean of the axis that fed the composite, which is
         the same pool ``plan_quality`` now reduces."""
-        from orchestrator.evals.report import build_composite_report
+        from orchestrator.evals.composite_report import build_composite_report
 
         row = build_composite_report(self._varied())['configs'][0]
         assert row['quality'] == pytest.approx(row['plan_quality'])
@@ -853,7 +875,7 @@ class TestPlanQualityIsTheConfigMean:
     def test_identical_per_trial_scores_are_unchanged(self):
         """Regression: with no per-trial variance the mean IS the passthrough
         score, and a workflow row still reports ``None``."""
-        from orchestrator.evals.report import build_composite_report
+        from orchestrator.evals.composite_report import build_composite_report
 
         rows = {r['config']: r
                 for r in build_composite_report(_union_dataset())['configs']}
@@ -890,7 +912,7 @@ class TestSurvivorRankingUsesTheConfigMean:
     def test_the_tie_is_exact(self):
         """Pinned separately and EXACTLY so the ranking test below can never pass
         for the wrong reason — a tie that quietly stopped being one."""
-        from orchestrator.evals.report import build_composite_report
+        from orchestrator.evals.composite_report import build_composite_report
 
         rows = {r['config']: r
                 for r in build_composite_report(self._tied())['configs']}
@@ -898,10 +920,7 @@ class TestSurvivorRankingUsesTheConfigMean:
         assert rows['arch-zeta']['composite'] == rows['arch-alpha']['composite']
 
     def test_better_mean_plan_quality_wins_the_tie(self):
-        from orchestrator.evals.report import (
-            build_composite_report,
-            select_survivors,
-        )
+        from orchestrator.evals.composite_report import build_composite_report, select_survivors
 
         report = build_composite_report(self._tied())
         rows = {r['config']: r for r in report['configs']}
@@ -942,7 +961,7 @@ class TestRoleScopedEfficiencyBaseline:
 
     def test_plan_only_cell_never_sets_the_workflow_floor(self):
         """Adding an architect cell must not move ANY implementer composite."""
-        from orchestrator.evals.report import build_composite_report
+        from orchestrator.evals.composite_report import build_composite_report
 
         without = {r['config']: r['composite']
                    for r in build_composite_report(self._mixed())['configs']}
@@ -967,7 +986,7 @@ class TestRoleScopedEfficiencyBaseline:
         """Two architect configs differing only in cost must get DIFFERENT
         cost-driven composites, not both clamp to 1.0 against implementer cost.
         """
-        from orchestrator.evals.report import build_composite_report
+        from orchestrator.evals.composite_report import build_composite_report
 
         rows = {
             r['config']: r['composite']
@@ -995,7 +1014,7 @@ class TestEfficiencyBaselineIgnoresFailingTrials:
     """
 
     def test_failing_cheap_run_does_not_deflate_passing_config(self):
-        from orchestrator.evals.report import build_composite_report
+        from orchestrator.evals.composite_report import build_composite_report
 
         # Fixture h1: GOOD passes at cost/latency 2.0/2000; BADCHEAP FAILS but is
         # cheaper+faster (1.0/1000). If the failing run set the baseline, GOOD's
@@ -1020,7 +1039,7 @@ class TestEfficiencyBaselineIgnoresFailingTrials:
     def test_all_failing_fixture_falls_back_to_all_trials_baseline(self):
         """No passing trial on a fixture → baseline falls back to all trials, so
         the report still builds (every such trial hard-gates to 0 anyway)."""
-        from orchestrator.evals.report import build_composite_report
+        from orchestrator.evals.composite_report import build_composite_report
 
         results = [
             _mresult('h2', 'X', tr, quality=1.0, cost_usd=3.0, duration_ms=3000,
@@ -1040,7 +1059,7 @@ class TestCostSourceMixedLabel:
     """
 
     def test_mixed_sources_render_as_mixed(self):
-        from orchestrator.evals.report import build_composite_report
+        from orchestrator.evals.composite_report import build_composite_report
 
         results = [
             _mresult('f1', 'M', 1, quality=1.0, cost_usd=2.0, duration_ms=2000,
@@ -1055,7 +1074,7 @@ class TestCostSourceMixedLabel:
         assert row['cost_source'] == 'mixed'
 
     def test_single_source_reports_that_source(self):
-        from orchestrator.evals.report import build_composite_report
+        from orchestrator.evals.composite_report import build_composite_report
 
         results = [
             _mresult('f1', 'S', tr, quality=1.0, cost_usd=2.0, duration_ms=2000,
@@ -1084,7 +1103,7 @@ class TestNoPlanCellScoresZeroNotTheJudgesNumber:
     """A healthy architect that emitted NO plan scores 0.0, not the judge's."""
 
     def test_no_plan_cell_scores_zero_across_every_surface(self):
-        from orchestrator.evals.report import build_composite_report
+        from orchestrator.evals.composite_report import build_composite_report
 
         # The exact shape the ungated LLM judge writes for a stepless artifact:
         # healthy (not tainted), zero steps, a confident 0.95.
@@ -1110,7 +1129,7 @@ class TestNoPlanCellScoresZeroNotTheJudgesNumber:
         """A cap-tainted cell is EXCLUDED (we never asked the model); a no-plan
         cell is a genuine CONTENT measurement worth 0.0 and stays in every pool,
         including the cost and latency it really did burn."""
-        from orchestrator.evals.report import build_composite_report
+        from orchestrator.evals.composite_report import build_composite_report
 
         results = [
             _arch('p1', 'arch-noplan', tr, plan_steps=0, plan_quality=0.95,
@@ -1128,10 +1147,8 @@ class TestNoPlanCellScoresZeroNotTheJudgesNumber:
     def test_both_surfaces_agree_bit_identically(self):
         """The composite row and the θ table are ONE reduction, so the floor
         must be applied where they share it — not on one side only."""
-        from orchestrator.evals.report import (
-            build_composite_report,
-            build_plan_quality_report,
-        )
+        from orchestrator.evals.composite_report import build_composite_report
+        from orchestrator.evals.plan_quality_report import build_plan_quality_report
 
         results = [
             _arch('p1', 'arch-noplan', tr, plan_steps=0, plan_quality=0.95,
@@ -1151,10 +1168,8 @@ class TestNoPlanCellScoresZeroNotTheJudgesNumber:
 
     def test_mixed_pool_averages_the_floor_in(self):
         """One no-plan trial among two real ones: (0.0 + 0.6 + 0.6) / 3."""
-        from orchestrator.evals.report import (
-            build_composite_report,
-            build_plan_quality_report,
-        )
+        from orchestrator.evals.composite_report import build_composite_report
+        from orchestrator.evals.plan_quality_report import build_plan_quality_report
 
         results = [
             _arch('p1', 'arch-mixed', 1, plan_steps=0, plan_quality=0.9,
@@ -1173,7 +1188,7 @@ class TestNoPlanCellScoresZeroNotTheJudgesNumber:
 
     def test_a_real_plan_still_reports_its_judged_score(self):
         """The control: the floor fires ONLY on a stepless artifact."""
-        from orchestrator.evals.report import build_composite_report
+        from orchestrator.evals.composite_report import build_composite_report
 
         results = [
             _arch('p1', 'arch-real', tr, plan_steps=6, plan_quality=0.95,
@@ -1206,10 +1221,8 @@ class TestNoPlanCellsAreCounted:
         ]
 
     def test_both_surfaces_count_the_floored_cell_and_agree(self):
-        from orchestrator.evals.report import (
-            build_composite_report,
-            build_plan_quality_report,
-        )
+        from orchestrator.evals.composite_report import build_composite_report
+        from orchestrator.evals.plan_quality_report import build_plan_quality_report
 
         results = self._one_no_plan_among_two()
         row = build_composite_report(results)['configs'][0]
@@ -1221,10 +1234,8 @@ class TestNoPlanCellsAreCounted:
 
     def test_an_all_planning_config_reports_zero_never_absent(self):
         """A count that vanishes when it is zero cannot be read as 'none'."""
-        from orchestrator.evals.report import (
-            build_composite_report,
-            build_plan_quality_report,
-        )
+        from orchestrator.evals.composite_report import build_composite_report
+        from orchestrator.evals.plan_quality_report import build_plan_quality_report
 
         results = [
             _arch('p1', 'arch-real', tr, plan_steps=6, plan_quality=0.6,
@@ -1241,10 +1252,8 @@ class TestNoPlanCellsAreCounted:
         """Disjoint causes, disjoint counts: a transport refusal never got to
         ask the model, so it is not a cell that 'produced no plan' — it is a
         cell we could not measure at all (task 3118)."""
-        from orchestrator.evals.report import (
-            build_composite_report,
-            build_plan_quality_report,
-        )
+        from orchestrator.evals.composite_report import build_composite_report
+        from orchestrator.evals.plan_quality_report import build_plan_quality_report
 
         results = [
             # Refused at the transport layer: no score, no plan, EXCLUDED.
@@ -1273,7 +1282,7 @@ class TestNoPlanCellsAreCounted:
     def test_the_theta_mean_table_renders_the_count(self):
         """mean_plan_quality must be readable beside the no-plan cells it
         scored as zeros, not just the n it averaged."""
-        from orchestrator.evals.report import (
+        from orchestrator.evals.plan_quality_report import (
             _PLAN_QUALITY_MEAN_HEADER,
             build_plan_quality_report,
             format_plan_quality_table,
@@ -1300,7 +1309,7 @@ class TestNoPlanCellsAreCounted:
         ``pq_excluded`` is the second of the two counts the invariant promises
         (reviewer: design-coherence).
         """
-        from orchestrator.evals.report import (
+        from orchestrator.evals.composite_report import (
             _COMPOSITE_COLUMNS,
             build_composite_report,
             format_composite_table,
@@ -1324,7 +1333,7 @@ class TestNoPlanCellsAreCounted:
     def test_an_all_planning_config_renders_a_zero_count(self):
         """The control: the column is a COUNT, not a marker that only appears
         when it fires — a blank would read as 'not applicable'."""
-        from orchestrator.evals.report import (
+        from orchestrator.evals.composite_report import (
             build_composite_report,
             format_composite_table,
         )
@@ -1340,24 +1349,466 @@ class TestNoPlanCellsAreCounted:
         assert cells[header.index('pq_no_plan')] == '0'
 
 
+class TestPlanRateIsTheReliabilityColumn:
+    """``plan_rate`` — how OFTEN a config emitted a plan at all (task 3379).
+
+    The 2026-07-27 architect campaign's own verdict
+    (``plans/eval-architect-effort-verdict-2026-07-27.md``) found that what
+    actually separates the candidates is not how WELL they plan but how often
+    they plan at all — and the operator had to hand-compute that figure from the
+    per-cell result JSONs because no report surface exposed it. Task 3302
+    collected the counts (``plan_quality_no_plan`` beside the admitted θ pool);
+    this is the derived ratio over them.
+    """
+
+    @staticmethod
+    def _one_no_plan_among_three():
+        """3 admitted architect cells, ONE of which produced no plan.
+
+        Deliberately the shape of ``TestNoPlanCellsAreCounted.
+        _one_no_plan_among_two`` — same config, same costs — so the two
+        reliability figures this task adds are read over a dataset whose
+        no-plan/θ accounting is already pinned by that class.
+        """
+        return [
+            _arch('p1', 'arch-mixed', 1, plan_steps=0, plan_quality=0.9,
+                  cost_usd=0.3, duration_ms=60000),
+            _arch('p1', 'arch-mixed', 2, plan_steps=6, plan_quality=0.6,
+                  cost_usd=0.3, duration_ms=60000),
+            _arch('p1', 'arch-mixed', 3, plan_steps=6, plan_quality=0.6,
+                  cost_usd=0.3, duration_ms=60000),
+        ]
+
+    @staticmethod
+    def _one_tainted_one_no_plan_one_planned():
+        """One cell of each kind: REFUSED, admitted-but-planless, planned."""
+        return [
+            # Refused at the transport layer: never asked, so never answered.
+            _arch('p1', 'arch-both', 1, plan_steps=0, plan_quality=None,
+                  cost_usd=0.0, duration_ms=0, cap_tainted=True),
+            # Healthy architect, stepless artifact: asked, answered nothing.
+            _arch('p1', 'arch-both', 2, plan_steps=0, plan_quality=0.9,
+                  cost_usd=0.3, duration_ms=60000),
+            # Healthy architect, real plan.
+            _arch('p1', 'arch-both', 3, plan_steps=6, plan_quality=0.6,
+                  cost_usd=0.3, duration_ms=60000),
+        ]
+
+    def test_the_rate_is_planned_over_admitted(self):
+        from orchestrator.evals.composite_report import build_composite_report
+
+        row = build_composite_report(self._one_no_plan_among_three())['configs'][0]
+
+        # The denominator travels WITH the rate on the row, so the figure is
+        # verifiable from the row alone rather than by re-deriving it from a
+        # different surface (the module's report-a-rate-beside-its-n norm).
+        assert row['plan_quality_n'] == 3
+        # Hand-computed: (3 admitted - 1 no-plan) / 3 admitted.
+        assert row['plan_rate'] == pytest.approx(0.6667, abs=1e-4)
+
+    def test_a_cap_tainted_cell_leaves_BOTH_numerator_and_denominator(self):
+        """THE DENOMINATOR PIN: the rate is over what was actually MEASURED.
+
+        A cap-tainted cell is a transport refusal — we never got to ask the
+        model — so it is neither a cell that planned nor a cell that failed to
+        plan. Counting it in the denominator (i.e. ranging over ``trials``)
+        would report a candidate as LESS RELIABLE for a question it never got
+        to answer, purely because it happened to be scheduled inside a session-
+        cap window: precisely the schedule-attributable penalty tasks 3118 and
+        3099 spent two rounds removing, reintroduced on the surface
+        ``select_survivors`` ranks on. It also matches the campaign this
+        automates — ``plans/eval-architect-effort-verdict-2026-07-27.md``
+        computes its planRate over 19 fixtures, dropping the 3 cap-contaminated
+        ones from the denominator, not over all 22.
+        """
+        from orchestrator.evals.composite_report import build_composite_report
+
+        row = build_composite_report(
+            self._one_tainted_one_no_plan_one_planned()
+        )['configs'][0]
+
+        assert row['plan_quality_n'] == 2
+        assert row['plan_rate'] == pytest.approx(0.5, abs=1e-9)
+        # NOT 1/3 — the refused cell is not a failure to plan.
+        assert row['plan_rate'] != pytest.approx(1 / 3, abs=1e-4)
+        # …and the narrowed denominator is never silent: the sample is still
+        # reported honestly by the columns that exist to report it.
+        assert row['plan_quality_cap_excluded'] == 1
+        assert row['trials'] == 3
+
+    def test_an_all_planning_config_reports_one_never_absent(self):
+        """A rate that only appears when it FIRES cannot be read.
+
+        The control for the column being a always-present ratio rather than a
+        marker: a blank here would read as "not applicable".
+        """
+        from orchestrator.evals.composite_report import build_composite_report
+
+        results = [
+            _arch('p1', 'arch-real', tr, plan_steps=6, plan_quality=0.6,
+                  cost_usd=0.3, duration_ms=60000)
+            for tr in (1, 2, 3)
+        ]
+        row = build_composite_report(results)['configs'][0]
+
+        assert row['plan_quality_n'] == 3
+        assert row['plan_rate'] == pytest.approx(1.0, abs=1e-9)
+
+    def test_a_workflow_config_reports_None_never_zero_and_never_one(self):
+        """An EMPTY admitted pool is ``None`` — the failure mode is two-sided.
+
+        A fabricated ``0.0`` would slander a config that never ran an architect
+        cell ("it never planned"); a fabricated ``1.0`` would flatter it ("it
+        always planned"). Only ``None`` says the true thing: we measured
+        nothing (``cell_admission.mean_plan_quality`` /
+        ``table_render.optional_float_cell`` precedent).
+        """
+        from orchestrator.evals.composite_report import build_composite_report
+
+        results = [
+            _mresult('w1', 'impl-only', tr, quality=0.8, cost_usd=5.0,
+                     duration_ms=900000)
+            for tr in (1, 2, 3)
+        ]
+        row = build_composite_report(results)['configs'][0]
+
+        assert row['plan_quality_n'] == 0
+        assert row['plan_rate'] is None
+
+
+class TestBothSurfacesReportTheSamePlanRate:
+    """The θ aggregate carries ``plan_rate`` too — through THE SAME reducer.
+
+    The CLI prints ``format_composite_table`` and ``format_plan_quality_table``
+    adjacently, and ``plan_rate`` is derivable from counts BOTH surfaces already
+    hold (``n`` / ``no_plan``). Deriving it twice would leave two tables free to
+    answer the reliability question differently — the "two exclusion surfaces
+    that disagree are worse than one" hazard this module repeatedly closes, most
+    recently by :func:`cell_admission.mean_plan_quality` (task 3099) and
+    :func:`cell_admission.plan_quality_score` (task 3302).
+    """
+
+    def test_the_theta_aggregate_carries_the_same_hand_computed_rate(self):
+        from orchestrator.evals.plan_quality_report import build_plan_quality_report
+
+        theta = build_plan_quality_report(
+            TestPlanRateIsTheReliabilityColumn._one_no_plan_among_three()
+        )['configs'][0]
+
+        # The SAME hand-computed (3 - 1) / 3 the composite row reports.
+        assert theta['plan_rate'] == pytest.approx(0.6667, abs=1e-4)
+
+    def test_agrees_bit_identically_with_the_composite_row(self):
+        """``==``, not ``approx``: the point is not that the two surfaces round
+        to the same place but that they are the same computation."""
+        from orchestrator.evals.composite_report import build_composite_report
+        from orchestrator.evals.plan_quality_report import build_plan_quality_report
+
+        results = TestPlanRateIsTheReliabilityColumn._one_no_plan_among_three()
+        row = build_composite_report(results)['configs'][0]
+        theta = build_plan_quality_report(results)['configs'][0]
+
+        assert row['plan_rate'] == theta['plan_rate']
+
+    def test_agrees_bit_identically_on_the_cap_tainted_dataset(self):
+        """…and agrees where the DENOMINATOR is the interesting part.
+
+        The composite row's exposed denominator IS the θ table's ``n``: a
+        reader who checks the rate against either table's sample gets the same
+        answer, which is the whole reason ``plan_quality_n`` is on the row.
+        """
+        from orchestrator.evals.composite_report import build_composite_report
+        from orchestrator.evals.plan_quality_report import build_plan_quality_report
+
+        results = (
+            TestPlanRateIsTheReliabilityColumn
+            ._one_tainted_one_no_plan_one_planned()
+        )
+        row = build_composite_report(results)['configs'][0]
+        theta = build_plan_quality_report(results)['configs'][0]
+
+        assert row['plan_rate'] == theta['plan_rate']
+        assert theta['n'] == row['plan_quality_n'] == 2
+
+    def test_an_empty_admitted_pool_is_None_on_the_theta_surface_too(self):
+        """Every cell refused → nothing measured → no rate, on both surfaces.
+
+        ``mean_plan_quality`` is already ``None`` here; a ``plan_rate`` of 0.0
+        beside it would assert a reliability failure the transport layer never
+        let us observe.
+        """
+        from orchestrator.evals.composite_report import build_composite_report
+        from orchestrator.evals.plan_quality_report import build_plan_quality_report
+
+        results = [
+            _arch('p1', 'arch-refused', tr, plan_steps=0, plan_quality=None,
+                  cost_usd=0.0, duration_ms=0, cap_tainted=True)
+            for tr in (1, 2, 3)
+        ]
+        theta = build_plan_quality_report(results)['configs'][0]
+        row = build_composite_report(results)['configs'][0]
+
+        assert theta['n'] == 0
+        assert theta['mean_plan_quality'] is None
+        assert theta['plan_rate'] is None
+        assert row['plan_rate'] is None
+
+
+class TestCostPerUsablePlan:
+    """``cost_per_plan`` — what a config charges per plan you can actually USE.
+
+    The asymmetry IS the column: the numerator keeps the spend of cells that
+    produced NOTHING, the denominator counts only the cells that produced
+    something. A no-plan cell burns real budget and returns nothing
+    (``plans/eval-architect-effort-verdict-2026-07-27.md`` measured $0.5–$3
+    against a real plan's ~$3.7), so a cheap-but-unreliable candidate's
+    per-fixture cost advantage is partly ILLUSORY — the doc's own arithmetic put
+    fable at $3.456/fixture but $4.731 per usable plan, i.e. no cheaper than the
+    opus-max incumbent while failing to plan 5x as often. Netting the failed
+    attempts out of the numerator would report exactly the illusion this column
+    exists to remove.
+    """
+
+    @staticmethod
+    def _three_at_30c_one_planless():
+        return [
+            _arch('p1', 'arch-mixed', 1, plan_steps=0, plan_quality=0.9,
+                  cost_usd=0.30, duration_ms=60000),
+            _arch('p1', 'arch-mixed', 2, plan_steps=6, plan_quality=0.6,
+                  cost_usd=0.30, duration_ms=60000),
+            _arch('p1', 'arch-mixed', 3, plan_steps=6, plan_quality=0.6,
+                  cost_usd=0.30, duration_ms=60000),
+        ]
+
+    def test_the_failed_attempts_spend_stays_in_the_numerator(self):
+        from orchestrator.evals.composite_report import build_composite_report
+
+        row = build_composite_report(self._three_at_30c_one_planless())['configs'][0]
+
+        # Hand-computed: (0.30 * 3 admitted) / 2 that planned. You paid for the
+        # failed attempt; that is the entire content of "$ per USABLE plan".
+        assert row['cost_per_plan'] == pytest.approx(0.45, abs=1e-9)
+
+    def test_it_exceeds_the_plain_cost_mean_whenever_a_cell_failed_to_plan(self):
+        """The illusory-cheapness signal, stated as a relation.
+
+        Reading ``cost_usd`` alone, this config looks like a $0.30 candidate.
+        Two thirds of the time that is what a plan costs; the other third bought
+        nothing, and the gap between the two cells is what an operator comparing
+        candidates needs to see.
+        """
+        from orchestrator.evals.composite_report import build_composite_report
+
+        row = build_composite_report(self._three_at_30c_one_planless())['configs'][0]
+
+        assert row['cost_usd'] == pytest.approx(0.30, abs=1e-9)
+        assert row['cost_per_plan'] > row['cost_usd']
+
+    def test_a_cap_tainted_cell_contributes_to_NEITHER_side(self):
+        """One admission decision sources both numerator and denominator.
+
+        A refused cell's recorded $0.00 is the price of a run that never
+        happened, not a measurement — the same reason
+        ``cell_admission.is_unmeasurable`` keeps it out of the ``cost`` pool.
+        Letting it into the numerator would DILUTE $/plan with a free run,
+        reporting the cap window as a discount.
+        """
+        from orchestrator.evals.composite_report import build_composite_report
+
+        results = [
+            _arch('p1', 'arch-both', 1, plan_steps=0, plan_quality=None,
+                  cost_usd=0.0, duration_ms=0, cap_tainted=True),
+            _arch('p1', 'arch-both', 2, plan_steps=0, plan_quality=0.9,
+                  cost_usd=0.30, duration_ms=60000),
+            _arch('p1', 'arch-both', 3, plan_steps=6, plan_quality=0.6,
+                  cost_usd=0.30, duration_ms=60000),
+        ]
+        row = build_composite_report(results)['configs'][0]
+
+        # (0.30 + 0.30) / 1 planned — NOT (0.00 + 0.30 + 0.30) / 1.
+        assert row['cost_per_plan'] == pytest.approx(0.60, abs=1e-9)
+
+    def test_a_config_that_never_planned_reports_None_not_zero(self):
+        """"We got no plan at any price" must not render as "plans were free".
+
+        Nor may it raise: a config that failed to plan on every cell is a real
+        campaign outcome, and it is the one whose row an operator most needs.
+        """
+        from orchestrator.evals.composite_report import build_composite_report
+
+        results = [
+            _arch('p1', 'arch-planless', tr, plan_steps=0, plan_quality=0.9,
+                  cost_usd=0.30, duration_ms=60000)
+            for tr in (1, 2, 3)
+        ]
+        row = build_composite_report(results)['configs'][0]
+
+        assert row['plan_quality_n'] == 3
+        assert row['plan_rate'] == pytest.approx(0.0, abs=1e-9)
+        assert row['cost_per_plan'] is None
+
+    def test_a_workflow_config_reports_None(self):
+        """No plan-only cell at all → no $/plan, rather than a fabricated 0.0."""
+        from orchestrator.evals.composite_report import build_composite_report
+
+        results = [
+            _mresult('w1', 'impl-only', tr, quality=0.8, cost_usd=5.0,
+                     duration_ms=900000)
+            for tr in (1, 2, 3)
+        ]
+        row = build_composite_report(results)['configs'][0]
+
+        assert row['cost_per_plan'] is None
+
+
+class TestTheReliabilityColumnsAreRendered:
+    """Both figures must reach the surfaces an OPERATOR reads.
+
+    ``format_composite_table`` is what ``select_survivors`` ranks on and what a
+    human compares candidates with; a figure that exists only in the row JSON
+    leaves the 2026-07-27 operator exactly where they started — recomputing it
+    by hand from the per-cell result JSONs.
+    """
+
+    def test_the_composite_table_renders_both_new_columns(self):
+        from orchestrator.evals.composite_report import (
+            _COMPOSITE_COLUMNS,
+            build_composite_report,
+            format_composite_table,
+        )
+
+        # Pin the column tuple FIRST, so a reorder fails here rather than
+        # silently re-aiming the cell assertions below (the idiom
+        # TestNoPlanCellsAreCounted established). The pre-existing pins must
+        # still hold: plan_rate is INSERTED after them, not in place of them.
+        assert _COMPOSITE_COLUMNS[4] == 'pq_excluded'
+        assert _COMPOSITE_COLUMNS[5] == 'pq_no_plan'
+        assert _COMPOSITE_COLUMNS[7] == 'plan_rate'
+        # $/plan reads beside the plain cost it corrects, not across the table.
+        assert (
+            _COMPOSITE_COLUMNS[_COMPOSITE_COLUMNS.index('cost_usd') + 1]
+            == 'cost_per_plan'
+        )
+
+        out = format_composite_table(build_composite_report(
+            TestCostPerUsablePlan._three_at_30c_one_planless()
+        ))
+        header = out.splitlines()[1].split()
+        cells = _table_row_cells(out, 'arch-mixed')
+
+        assert cells[header.index('plan_rate')] == '0.6667'
+        assert cells[header.index('cost_per_plan')] == '0.4500'
+        # …and it reads as dearer than the $0.30/cell it would look like from
+        # the cost column alone.
+        assert cells[header.index('cost_usd')] == '0.3000'
+
+    def test_a_workflow_row_renders_dashes_in_both(self):
+        """Never ``0.0000`` and never ``1.0000``: a cell that measured nothing
+        must not read as one that scored zero — nor, here, as a perfect one."""
+        from orchestrator.evals.composite_report import (
+            build_composite_report,
+            format_composite_table,
+        )
+
+        results = [
+            _mresult('w1', 'impl-only', tr, quality=0.8, cost_usd=5.0,
+                     duration_ms=900000)
+            for tr in (1, 2, 3)
+        ]
+        out = format_composite_table(build_composite_report(results))
+        header = out.splitlines()[1].split()
+        cells = _table_row_cells(out, 'impl-only')
+
+        assert cells[header.index('plan_rate')] == '-'
+        assert cells[header.index('cost_per_plan')] == '-'
+
+    def test_an_all_planning_config_renders_a_full_rate(self):
+        """The control: a rate that only appears when it FIRES cannot be read,
+        so the column is present-and-1.0000, not blank."""
+        from orchestrator.evals.composite_report import (
+            build_composite_report,
+            format_composite_table,
+        )
+
+        results = [
+            _arch('p1', 'arch-real', tr, plan_steps=6, plan_quality=0.6,
+                  cost_usd=0.30, duration_ms=60000)
+            for tr in (1, 2, 3)
+        ]
+        out = format_composite_table(build_composite_report(results))
+        header = out.splitlines()[1].split()
+        cells = _table_row_cells(out, 'arch-real')
+
+        assert cells[header.index('plan_rate')] == '1.0000'
+        # Every cell planned, so $/plan IS the per-cell cost.
+        assert cells[header.index('cost_per_plan')] == '0.3000'
+
+    def test_the_theta_mean_table_renders_the_rate(self):
+        """On the θ surface too, beside the n / cap_excluded / no_plan it was
+        computed over — the module's report-a-figure-with-its-sample norm."""
+        from orchestrator.evals.plan_quality_report import (
+            _PLAN_QUALITY_MEAN_COLUMNS,
+            _PLAN_QUALITY_MEAN_HEADER,
+            build_plan_quality_report,
+            format_plan_quality_table,
+        )
+
+        assert 'plan_rate' in _PLAN_QUALITY_MEAN_COLUMNS
+        out = format_plan_quality_table(build_plan_quality_report(
+            TestPlanRateIsTheReliabilityColumn._one_no_plan_among_three()
+        ))
+        header = _table_row_cells(
+            out, 'config_name', section=_PLAN_QUALITY_MEAN_HEADER,
+        )
+        cells = _table_row_cells(
+            out, 'arch-mixed', section=_PLAN_QUALITY_MEAN_HEADER,
+        )
+
+        assert cells[header.index('plan_rate')] == '0.6667'
+        # The sample it was computed over stays legible beside it.
+        assert cells[header.index('n')] == '3'
+        assert cells[header.index('no_plan')] == '1'
+
+    def test_rendering_is_byte_deterministic(self):
+        """The widened tuples must not cost the surface its byte-stability."""
+        from orchestrator.evals.composite_report import (
+            build_composite_report,
+            format_composite_table,
+        )
+        from orchestrator.evals.plan_quality_report import (
+            build_plan_quality_report,
+            format_plan_quality_table,
+        )
+
+        results = TestCostPerUsablePlan._three_at_30c_one_planless()
+        composite = build_composite_report(results)
+        theta = build_plan_quality_report(results)
+
+        assert format_composite_table(composite) == format_composite_table(composite)
+        assert (
+            format_plan_quality_table(theta) == format_plan_quality_table(theta)
+        )
+
+
 class TestTheDiscardedJudgeScoreIsLoggedNotSwallowed:
     """The floor DISCARDS a persisted LLM-judge score — loudly, or not at all.
 
-    `_plan_quality_score`'s warning is the ONLY runtime signal that a number
-    written to disk was overridden at read time, and the two-scorer disagreement
-    it reports (Graphiti e2066ec6) is exactly what an operator needs to see. An
-    untested log line is a log line a refactor deletes (reviewer: test-coverage);
-    these also exercise the `where=` plumbing that exists solely to serve it.
+    `cell_admission.plan_quality_score`'s warning is the ONLY runtime signal
+    that a number written to disk was overridden at read time, and the
+    two-scorer disagreement it reports (Graphiti e2066ec6) is exactly what an
+    operator needs to see. An untested log line is a log line a refactor deletes
+    (reviewer: test-coverage); these also exercise the `where=` plumbing that
+    exists solely to serve it.
     """
 
-    _LOGGER = 'orchestrator.evals.report'
+    _LOGGER = 'orchestrator.evals.cell_admission'
 
     @staticmethod
     def _floor_records(caplog):
         return [r for r in caplog.records if 'Plan-quality floor' in r.getMessage()]
 
     def test_a_discarded_nonzero_score_warns_once_and_names_the_cell(self, caplog):
-        from orchestrator.evals.report import build_composite_report
+        from orchestrator.evals.composite_report import build_composite_report
 
         results = [
             _arch('p1', 'arch-noplan', 1, plan_steps=0, plan_quality=0.9,
@@ -1384,7 +1835,7 @@ class TestTheDiscardedJudgeScoreIsLoggedNotSwallowed:
     def test_a_cell_that_scored_zero_anyway_does_not_warn(self, caplog):
         """Nothing was discarded: the judge and the floor AGREE at 0.0, so there
         is no two-scorer disagreement to report and the line would be noise."""
-        from orchestrator.evals.report import build_composite_report
+        from orchestrator.evals.composite_report import build_composite_report
 
         results = [
             _arch('p1', 'arch-noplan', tr, plan_steps=0, plan_quality=0.0,
@@ -1399,10 +1850,8 @@ class TestTheDiscardedJudgeScoreIsLoggedNotSwallowed:
     def test_a_real_plan_never_warns(self, caplog):
         """The control: the floor — and its warning — fire ONLY on a stepless
         artifact, so a healthy campaign's log stays readable."""
-        from orchestrator.evals.report import (
-            build_composite_report,
-            build_plan_quality_report,
-        )
+        from orchestrator.evals.composite_report import build_composite_report
+        from orchestrator.evals.plan_quality_report import build_plan_quality_report
 
         results = [
             _arch('p1', 'arch-real', tr, plan_steps=6, plan_quality=0.9,
@@ -1419,10 +1868,10 @@ class TestTheDiscardedJudgeScoreIsLoggedNotSwallowed:
         """Each surface reports the floor decisions IT made: the accessor is
         pure, so the warning belongs to the build that read the cell. The CLI
         builds both, so a floored cell warns once per surface — documented on
-        :func:`_plan_quality_score`, and pinned here so the count is a decision
-        rather than an accident.
+        :func:`cell_admission.plan_quality_score`, and pinned here so the count
+        is a decision rather than an accident.
         """
-        from orchestrator.evals.report import build_plan_quality_report
+        from orchestrator.evals.plan_quality_report import build_plan_quality_report
 
         results = [
             _arch('p1', 'arch-noplan', 1, plan_steps=0, plan_quality=0.9,
@@ -1461,7 +1910,7 @@ class TestNoPlanCellCannotSetTheEfficiencyFloor:
         ]
 
     def test_the_plan_producing_config_is_its_own_floor(self):
-        from orchestrator.evals.report import build_composite_report
+        from orchestrator.evals.composite_report import build_composite_report
 
         rows = {r['config']: r
                 for r in build_composite_report(self._two_configs())['configs']}
@@ -1476,7 +1925,7 @@ class TestNoPlanCellCannotSetTheEfficiencyFloor:
     def test_the_no_plan_cells_spend_is_still_reported(self):
         """Barred from the BASELINE, not from the pools: it really did burn
         budget, and dropping that would hide what the failure cost."""
-        from orchestrator.evals.report import build_composite_report
+        from orchestrator.evals.composite_report import build_composite_report
 
         rows = {r['config']: r
                 for r in build_composite_report(self._two_configs())['configs']}
@@ -1487,10 +1936,7 @@ class TestNoPlanCellCannotSetTheEfficiencyFloor:
 
     def test_survivor_selection_promotes_the_config_that_planned(self):
         """The end-to-end consequence, through the real pipeline path."""
-        from orchestrator.evals.report import (
-            build_composite_report,
-            select_survivors,
-        )
+        from orchestrator.evals.composite_report import build_composite_report, select_survivors
 
         report = build_composite_report(self._two_configs())
         assert select_survivors(report, top_k=1, roles=['architect']) == {
@@ -1535,7 +1981,7 @@ class TestNoPlanCellCannotOutrankAPlanProducingConfig:
         ]
 
     def _rows(self):
-        from orchestrator.evals.report import build_composite_report
+        from orchestrator.evals.composite_report import build_composite_report
 
         report = build_composite_report(self._counterexample())
         return report, {r['config']: r for r in report['configs']}
@@ -1562,7 +2008,7 @@ class TestNoPlanCellCannotOutrankAPlanProducingConfig:
         Today this returns ``['C', 'A']``: the no-plan config survives and B —
         which produced a real plan — is cut.
         """
-        from orchestrator.evals.report import select_survivors
+        from orchestrator.evals.composite_report import select_survivors
 
         report, _ = self._rows()
         assert select_survivors(report, top_k=2, roles=['architect']) == {
@@ -1595,7 +2041,7 @@ def _priced_unpriced_report():
     A's cost_source is 'price_table' and it is listed in the price table; U's
     cost_source is 'unpriced_proxy' and it carries the explicit unpriced marker.
     """
-    from orchestrator.evals.report import build_composite_report
+    from orchestrator.evals.composite_report import build_composite_report
 
     results = [
         _mresult('f1', 'A', tr, quality=1.0, cost_usd=2.0, duration_ms=2000,
@@ -1617,7 +2063,7 @@ class TestFormatCompositeTable:
     """Deterministic ljust-width renderer mirroring format_recovery_table."""
 
     def test_per_config_rows_and_columns(self):
-        from orchestrator.evals.report import format_composite_table
+        from orchestrator.evals.composite_report import format_composite_table
 
         out = format_composite_table(_priced_unpriced_report())
         # A row line per config.
@@ -1630,14 +2076,14 @@ class TestFormatCompositeTable:
     def test_ci95_bracket_rendering(self):
         import re
 
-        from orchestrator.evals.report import format_composite_table
+        from orchestrator.evals.composite_report import format_composite_table
 
         out = format_composite_table(_priced_unpriced_report())
         # A CI95 interval renders as ``[lo, hi]`` (e.g. [1.0000, 1.0000]).
         assert re.search(r'\[\s*-?\d+\.\d+,\s*-?\d+\.\d+\]', out) is not None
 
     def test_distinct_price_table_section(self):
-        from orchestrator.evals.report import format_composite_table
+        from orchestrator.evals.composite_report import format_composite_table
 
         out = format_composite_table(_priced_unpriced_report())
         lower = out.lower()
@@ -1649,7 +2095,7 @@ class TestFormatCompositeTable:
         assert 'implementer' in out
 
     def test_unpriced_config_shows_explicit_marker_not_blank(self):
-        from orchestrator.evals.report import format_composite_table
+        from orchestrator.evals.composite_report import format_composite_table
 
         out = format_composite_table(_priced_unpriced_report())
         # The per-config cost_source column shows the explicit proxy marker…
@@ -1660,7 +2106,7 @@ class TestFormatCompositeTable:
         assert 'unpriced' in out
 
     def test_renders_byte_identically_across_two_calls(self):
-        from orchestrator.evals.report import format_composite_table
+        from orchestrator.evals.composite_report import format_composite_table
 
         report = _priced_unpriced_report()
         # No wall-clock / dict-order dependence: same report → identical bytes.
@@ -1669,7 +2115,7 @@ class TestFormatCompositeTable:
     # -- task 3099: the plan-only columns ---------------------------------
 
     def _arch_report(self):
-        from orchestrator.evals.report import build_composite_report
+        from orchestrator.evals.composite_report import build_composite_report
 
         return build_composite_report(
             [
@@ -1702,7 +2148,7 @@ class TestFormatCompositeTable:
         return _table_row_cells(out, config)
 
     def test_header_carries_plan_quality_and_exclusion_columns(self):
-        from orchestrator.evals.report import format_composite_table
+        from orchestrator.evals.composite_report import format_composite_table
 
         out = format_composite_table(self._arch_report())
         header = out.splitlines()[1]
@@ -1718,10 +2164,7 @@ class TestFormatCompositeTable:
         column reorder fails loudly here instead of silently re-aiming every
         positional assertion below at the wrong cell.
         """
-        from orchestrator.evals.report import (
-            _COMPOSITE_COLUMNS,
-            format_composite_table,
-        )
+        from orchestrator.evals.composite_report import _COMPOSITE_COLUMNS, format_composite_table
 
         assert _COMPOSITE_COLUMNS[3] == 'plan_quality'
         assert _COMPOSITE_COLUMNS[4] == 'pq_excluded'
@@ -1732,7 +2175,7 @@ class TestFormatCompositeTable:
         assert self._row(out, 'arch-dark')[4] == '3'
 
     def test_non_architect_row_renders_dash_not_a_fabricated_zero(self):
-        from orchestrator.evals.report import format_composite_table
+        from orchestrator.evals.composite_report import format_composite_table
 
         out = format_composite_table(self._arch_report())
         cells = self._row(out, 'impl-a')
@@ -1745,14 +2188,15 @@ class TestFormatCompositeTable:
     def test_wholly_unmeasured_row_renders_dash_for_every_measured_cell(self):
         """Not just composite/quality: an all-tainted row must not render as the
         cheapest and fastest config in the table, nor carry a zero-width CI."""
-        from orchestrator.evals.report import (
-            _COMPOSITE_COLUMNS,
-            format_composite_table,
-        )
+        from orchestrator.evals.composite_report import _COMPOSITE_COLUMNS, format_composite_table
 
-        assert _COMPOSITE_COLUMNS[6] == 'cost_usd'
-        assert _COMPOSITE_COLUMNS[8] == 'latency_secs'
-        assert _COMPOSITE_COLUMNS[9] == 'ci95_composite'
+        # Shifted right by task 3379, which inserted `plan_rate` at 6 and
+        # `cost_per_plan` after `cost_usd`, then again by task 3628's `pq_no_ref`
+        # at 6. The pins are what MADE each shift visible instead of silently
+        # re-aiming the cell assertions below at the new columns.
+        assert _COMPOSITE_COLUMNS[8] == 'cost_usd'
+        assert _COMPOSITE_COLUMNS[11] == 'latency_secs'
+        assert _COMPOSITE_COLUMNS[12] == 'ci95_composite'
         out = format_composite_table(self._arch_report())
         cells = self._row(out, 'arch-dark')
         # composite and quality are both None → '-'. "We measured nothing" must
@@ -1764,20 +2208,23 @@ class TestFormatCompositeTable:
         # config that never ran the cheapest and fastest row on the screen), nor
         # the CI95 cell, which used to render '[0.0000, 0.0000]' right beside the
         # composite '-' (reviewer: correctness).
-        assert cells[6] == '-'
         assert cells[8] == '-'
-        assert cells[9] == '-'
+        assert cells[11] == '-'
+        assert cells[12] == '-'
 
     def test_cap_window_is_not_rendered_as_a_cost_advantage(self):
         """arch-mixed's measured cell is arch-good's price; only its plan quality
         differs. The table must not present it as half the cost/latency."""
-        from orchestrator.evals.report import format_composite_table
+        from orchestrator.evals.composite_report import format_composite_table
 
         out = format_composite_table(self._arch_report())
         mixed = self._row(out, 'arch-mixed')
         good = self._row(out, 'arch-good')
-        assert mixed[6] == good[6] == '0.3000'
-        assert mixed[8] == good[8] == '60.00'
+        # cost_usd / latency_secs, at the indices the sibling test pins (shifted
+        # right by task 3379's plan_rate / cost_per_plan insertion, then by task
+        # 3628's pq_no_ref).
+        assert mixed[8] == good[8] == '0.3000'
+        assert mixed[11] == good[11] == '60.00'
 
     def test_operator_can_rank_architects_from_the_table_alone(self):
         """The acceptance assertion for the reported defect.
@@ -1786,7 +2233,7 @@ class TestFormatCompositeTable:
         the table could not be ranked and the scores had to be recomputed by
         hand from the per-cell result JSONs (defect 1).
         """
-        from orchestrator.evals.report import format_composite_table
+        from orchestrator.evals.composite_report import format_composite_table
 
         out = format_composite_table(self._arch_report())
         good = self._row(out, 'arch-good')[1]
@@ -1796,105 +2243,675 @@ class TestFormatCompositeTable:
         assert float(good) > float(weak)
 
     def test_plan_only_table_renders_byte_identically(self):
-        from orchestrator.evals.report import format_composite_table
+        from orchestrator.evals.composite_report import format_composite_table
 
         report = self._arch_report()
         assert format_composite_table(report) == format_composite_table(report)
 
 
 # ---------------------------------------------------------------------------
-# _render_fixed_table — the ONE home for the width-computed ljust idiom every
-# deterministic table above shares (task 3118 amendment). It was copied five
-# times, and that duplication is what let the '-'-not-'0.0000' rstrip fix land
-# in only two of the copies. Pinned here so the shared contract can't drift.
+# Rendered surfaces for judged_without_reference (eval-revival σ, task 3628)
+#
+# A count that is loud only in JSON is still mute where an operator reads it.
+# Both tables gain a cell, and the θ table's trailer gains a summary line —
+# a mean_plan_quality printed WITHOUT saying how many of its cells were judged
+# blind is the same silent degradation one layer up.
 # ---------------------------------------------------------------------------
 
-class TestRenderFixedTable:
-    _COLUMNS = ('name', 'score')
+class TestJudgedWithoutReferenceRendering:
+    @staticmethod
+    def _blind_results():
+        return [
+            _mresult('f1', 'arch-blind', 1, quality=1.0, cost_usd=0.30,
+                     duration_ms=60000, role_under_test='architect',
+                     plan_quality=0.8, plan_steps=6,
+                     judged_without_reference=True),
+            _mresult('f2', 'arch-blind', 1, quality=1.0, cost_usd=0.30,
+                     duration_ms=60000, role_under_test='architect',
+                     plan_quality=0.6, plan_steps=6),
+        ]
 
-    def test_widths_are_max_of_header_and_cells(self):
-        from orchestrator.evals.report import _render_fixed_table
+    @staticmethod
+    def _clean_results():
+        return [
+            _mresult('f1', 'arch-clean', 1, quality=1.0, cost_usd=0.30,
+                     duration_ms=60000, role_under_test='architect',
+                     plan_quality=0.8, plan_steps=6),
+        ]
 
-        lines = _render_fixed_table(
-            self._COLUMNS,
-            [{'name': 'a-very-long-config', 'score': '1.0000'}],
-            header='demo:',
+    @staticmethod
+    def _legacy_results():
+        """A PRE-σ campaign: every cell scored, none of them measured."""
+        return [
+            _keyless(_mresult('f1', 'arch-legacy', 1, quality=1.0,
+                              cost_usd=0.30, duration_ms=60000,
+                              role_under_test='architect',
+                              plan_quality=0.8, plan_steps=6)),
+            _keyless(_mresult('f2', 'arch-legacy', 1, quality=1.0,
+                              cost_usd=0.30, duration_ms=60000,
+                              role_under_test='architect',
+                              plan_quality=0.6, plan_steps=6)),
+        ]
+
+    def test_composite_column_is_inserted_beside_its_siblings(self):
+        from orchestrator.evals.composite_report import _COMPOSITE_COLUMNS
+
+        # Pin the column tuple FIRST (the file's established idiom), so a
+        # reorder fails here rather than silently re-aiming cell assertions.
+        # The new column is INSERTED after its two siblings, not appended away
+        # from them — the three counts describe one pool and must read together.
+        assert _COMPOSITE_COLUMNS[4:8] == (
+            'pq_excluded', 'pq_no_plan', 'pq_no_ref', 'plan_rate',
         )
-        assert lines[0] == 'demo:'
-        # The header cell is padded out to the widest row cell, so the columns
-        # line up; the dashes rule matches those same widths.
-        assert lines[1].startswith('name'.ljust(len('a-very-long-config')))
-        assert len(lines[2].split('  ')[0]) == len('a-very-long-config')
-        assert lines[3].startswith('a-very-long-config')
-
-    def test_trailing_padding_is_stripped(self):
-        # Invisible trailing whitespace makes an otherwise-identical table
-        # differ byte-for-byte, and it hides a line's real ending — the
-        # per-config mean block asserts on a trailing '-' meaning "nothing
-        # scored", which must never read as 0.0000.
-        from orchestrator.evals.report import _render_fixed_table
-
-        lines = _render_fixed_table(
-            self._COLUMNS,
-            [{'name': 'a', 'score': 'a-long-score-cell'}, {'name': 'b', 'score': '-'}],
-            header='demo:',
+        # …and the relative $/plan pin still holds across the insertion.
+        assert (
+            _COMPOSITE_COLUMNS[_COMPOSITE_COLUMNS.index('cost_usd') + 1]
+            == 'cost_per_plan'
         )
-        assert all(ln == ln.rstrip() for ln in lines)
-        assert lines[-1].endswith('-')
 
-    def test_empty_rows_still_render_headers_and_rule(self):
-        # No rows must not mean no table: the header/rule still render at the
-        # header widths rather than raising on the max() of an empty sequence.
-        from orchestrator.evals.report import _render_fixed_table
+    def test_composite_table_renders_the_count(self):
+        from orchestrator.evals.composite_report import (
+            build_composite_report,
+            format_composite_table,
+        )
 
-        lines = _render_fixed_table(self._COLUMNS, [], header='demo:')
-        assert lines[0] == 'demo:'
-        assert lines[1] == 'name  score'
-        assert lines[2] == '----  -----'
-        assert len(lines) == 3
+        out = format_composite_table(build_composite_report(self._blind_results()))
+        header = out.splitlines()[1].split()
+        cells = _table_row_cells(out, 'arch-blind')
 
-    def test_header_is_optional(self):
-        from orchestrator.evals.report import _render_fixed_table
+        assert cells[header.index('pq_no_ref')] == '1'
 
-        lines = _render_fixed_table(self._COLUMNS, [])
-        assert lines[0] == 'name  score'
+    def test_mean_columns_keep_the_mean_last(self):
+        from orchestrator.evals.plan_quality_report import _PLAN_QUALITY_MEAN_COLUMNS
+
+        assert 'judged_without_reference' in _PLAN_QUALITY_MEAN_COLUMNS
+        # BEFORE the mean it bounds…
+        assert (
+            _PLAN_QUALITY_MEAN_COLUMNS.index('judged_without_reference')
+            < _PLAN_QUALITY_MEAN_COLUMNS.index('mean_plan_quality')
+        )
+        # …and the mean stays LAST, which other tests depend on positionally
+        # (the mean-section `means[-1]` read, and the doomed-config line whose
+        # rendering must still `endswith('-')`).
+        assert _PLAN_QUALITY_MEAN_COLUMNS[-1] == 'mean_plan_quality'
+
+    def test_plan_quality_mean_section_renders_the_count(self):
+        from orchestrator.evals.plan_quality_report import (
+            build_plan_quality_report,
+            format_plan_quality_table,
+        )
+
+        out = format_plan_quality_table(
+            build_plan_quality_report(self._blind_results())
+        )
+        section = 'plan_quality by config:'
+        header = out.partition(section)[2].splitlines()[1].split()
+        cells = _table_row_cells(out, 'arch-blind', section=section)
+
+        assert cells[header.index('judged_without_reference')] == '1'
+
+    def test_trailer_reports_the_total_against_the_scored_pool(self):
+        from orchestrator.evals.plan_quality_report import (
+            build_plan_quality_report,
+            format_plan_quality_table,
+        )
+
+        out = format_plan_quality_table(
+            build_plan_quality_report(self._blind_results())
+        )
+        # 1 of the 2 scored cells — the bound stated against its own pool,
+        # beside the existing `excluded: N ... of M architect cell(s)` line.
+        # Asserted as an EXACT substring, not as "'1' in line and '2' in line"
+        # (reviewer: test-quality): the loose form passes on a TRANSPOSED line
+        # reading "2 of 1", which is precisely the count/pool confusion this
+        # trailer exists to prevent.
+        assert 'judged without reference: 1 of 2 scored cell(s)' in out
+        assert 'excluded:' in out
+
+    def test_a_clean_campaign_does_not_grow_a_scary_line(self):
+        """A MEASURED-clean run prints no line at all.
+
+        Asserted outright rather than as "absent OR starting with 0"
+        (reviewer: test-quality): ``format_plan_quality_table`` guards the
+        trailer with a conditional, so the disjunct could never fail and the
+        test could not detect a count mis-plumbed to always read 0. Paired with
+        the two tests below, which prove the line DOES appear when the bound is
+        non-zero and when it is unmeasured — suppression is then a behaviour
+        rather than a tautology.
+        """
+        from orchestrator.evals.plan_quality_report import (
+            build_plan_quality_report,
+            format_plan_quality_table,
+        )
+
+        out = format_plan_quality_table(
+            build_plan_quality_report(self._clean_results())
+        )
+        lines = [
+            ln for ln in out.splitlines()
+            if ln.startswith('judged without reference:')
+        ]
+        assert lines == []
+
+    def test_a_blind_campaign_does_grow_the_line(self):
+        """The suppression's twin: exactly one trailer when the bound is real."""
+        from orchestrator.evals.plan_quality_report import (
+            build_plan_quality_report,
+            format_plan_quality_table,
+        )
+
+        out = format_plan_quality_table(
+            build_plan_quality_report(self._blind_results())
+        )
+        lines = [
+            ln for ln in out.splitlines()
+            if ln.startswith('judged without reference:')
+        ]
+        assert len(lines) == 1, lines
+
+    # -- the PRE-σ corpus already on disk (reviewer: architecture-coherence) --
+    #
+    # Rebuilding a report over the 2026-07-27 / 07-29 results — the campaign
+    # this repo's own docs say was judged blind on half the hard subset — must
+    # not render byte-identically to a campaign graded against real landed
+    # diffs. Absence is not False on any surface an operator reads.
+
+    def test_composite_table_renders_a_dash_for_an_unmeasured_bound(self):
+        from orchestrator.evals.composite_report import (
+            build_composite_report,
+            format_composite_table,
+        )
+
+        out = format_composite_table(
+            build_composite_report(self._legacy_results())
+        )
+        header = out.splitlines()[1].split()
+        cells = _table_row_cells(out, 'arch-legacy')
+
+        assert cells[header.index('pq_no_ref')] == '-'
+
+    def test_mean_section_renders_a_dash_for_an_unmeasured_bound(self):
+        from orchestrator.evals.plan_quality_report import (
+            build_plan_quality_report,
+            format_plan_quality_table,
+        )
+
+        out = format_plan_quality_table(
+            build_plan_quality_report(self._legacy_results())
+        )
+        section = 'plan_quality by config:'
+        header = out.partition(section)[2].splitlines()[1].split()
+        cells = _table_row_cells(out, 'arch-legacy', section=section)
+
+        assert cells[header.index('judged_without_reference')] == '-'
+
+    def test_trailer_is_printed_not_suppressed_when_unmeasured(self):
+        """The one case the old `if count:` guard silently swallowed.
+
+        A pre-σ report has a count of 0 measured-blind cells, so a guard on the
+        count alone suppressed the line — making "nothing bounded these scores"
+        render exactly like "every score was graded against a landed diff".
+        """
+        from orchestrator.evals.plan_quality_report import (
+            build_plan_quality_report,
+            format_plan_quality_table,
+        )
+
+        out = format_plan_quality_table(
+            build_plan_quality_report(self._legacy_results())
+        )
+        line = next(
+            ln for ln in out.splitlines()
+            if ln.startswith('judged without reference:')
+        )
+
+        assert 'UNMEASURED' in line
+        # Stated against the same pool as its measured twin, and naming how
+        # much of that pool is unmeasured — 2 of 2 here, which an operator must
+        # be able to tell from 1 of 50.
+        assert '2 of 2 scored cell(s)' in line
+        # …and it must not read as the clean answer.
+        assert 'judged without reference: 0 ' not in out
 
 
 # ---------------------------------------------------------------------------
-# Task 2477 step-13: compute_aggregate_ratings — UNION, not intersection.
+# Task 4760: the no-plan band, split by TERMINAL CAUSE
+#
+# ``no_plan`` says HOW MANY architect cells emitted no plan; it never said WHY.
+# Tranche 1 read 47 of 53 ``plan_steps = 0`` cells as an 89% planning failure
+# when every one of them was an explicit, adversarially-verified-true decline
+# (``report_false_premise`` and friends) — a CORRECT refusal. The split below is
+# EXPLANATORY: it moves no cell between pools and changes no existing number.
 # ---------------------------------------------------------------------------
 
-class TestAggregateRatingsUnion:
-    """The April all-tasks-INTERSECTION collapse is retired: the aggregate
-    leaderboard spans the UNION of configs, each averaged over only the tasks in
-    which it actually appears.
+def _kinded(result, terminal_kind):
+    """Stamp the persisted ``terminal_kind`` onto a built cell (task 4760).
+
+    ``_mresult`` builds its metrics through ``EvalMetrics.to_dict``, which emits
+    ``terminal_kind=None`` on every cell — the "not measured" shape. A cell that
+    RESOLVED to a kind is what ``run_architect_eval`` now persists, so the
+    fixtures say which kind out loud rather than leaving the report layer to
+    infer one from ``plan_steps``.
+    """
+    result.metrics['terminal_kind'] = terminal_kind
+    return result
+
+
+def _pre_terminal_kind(result):
+    """A cell written BEFORE ``terminal_kind`` existed — the key is ABSENT.
+
+    The ``_keyless`` precedent one field over (task 3628): the tranche-1 corpus
+    already on disk carries no such key, and that shape is not constructible any
+    other way. The report layer must read it as UNMEASURED, never as "this cell
+    was measured and did not decline" — a partial count that wears the
+    appearance of a complete one is the exact defect this task removes.
+    """
+    result.metrics.pop('terminal_kind', None)
+    return result
+
+
+class TestPlanQualityReportSplitsNoPlanByDecline:
+    """``no_plan`` gains a WHY, and ``plan_rate`` keeps its historical HOW MANY.
+
+    Four new keys, all describing the SAME admitted pool ``n`` / ``no_plan`` /
+    ``plan_rate`` / ``mean_plan_quality`` already describe:
+
+    - ``declined`` — admitted cells whose terminal statement was one of the five
+      explicit plan-tools decline exits;
+    - ``declined_by_kind`` — that total broken out by kind, key-sorted, for the
+      same reason ``cap_excluded_by_cause`` is: the kinds are not
+      interchangeable;
+    - ``no_plan_declined`` — the intersection with ``no_plan``, i.e. THE tranche-1
+      number ("47 of 47 no-plan cells were declines");
+    - ``terminal_kind_unmeasured`` — admitted cells carrying no resolved
+      terminal kind (an absent key, or an explicit null — ``terminal_kind_of``
+      reads the two alike), so a partial split never reads as a complete one.
     """
 
-    def _state(self):
-        from orchestrator.evals.elo import JudgeState, TaskPool
+    @staticmethod
+    def _four_cells_three_no_plan():
+        """2 declines + 1 silent no-plan + 1 planned cell, all admitted.
 
-        return JudgeState(per_task={
-            't1': TaskPool(ratings={'A': 1100.0, 'B': 1000.0, 'C': 900.0}),
-            't2': TaskPool(ratings={'A': 1200.0, 'B': 1050.0}),
-        })
+        THE tranche-1 shape in miniature: three cells recorded
+        ``plan_steps = 0`` and only ONE of them is a genuine "could not plan".
+        """
+        return [
+            _kinded(_arch('p1', 'arch-split', 1, plan_steps=0, plan_quality=0.0,
+                          cost_usd=0.3, duration_ms=60000), 'false_premise'),
+            _kinded(_arch('p2', 'arch-split', 1, plan_steps=0, plan_quality=0.0,
+                          cost_usd=0.3, duration_ms=60000), 'already_done'),
+            _kinded(_arch('p3', 'arch-split', 1, plan_steps=0, plan_quality=0.0,
+                          cost_usd=0.3, duration_ms=60000), 'none'),
+            _kinded(_arch('p4', 'arch-split', 1, plan_steps=6, plan_quality=0.8,
+                          cost_usd=0.3, duration_ms=60000), 'planned'),
+        ]
 
-    def test_union_includes_config_present_in_only_one_task(self):
-        from orchestrator.evals.report import compute_aggregate_ratings
+    # -- (a) the per-row field -------------------------------------------
 
-        agg = compute_aggregate_ratings(self._state())
-        # C ran ONLY in t1 but MUST survive — no collapse-to-2-entries.
-        assert set(agg.keys()) == {'A', 'B', 'C'}
+    def test_every_row_carries_the_persisted_terminal_kind(self):
+        from orchestrator.evals.plan_quality_report import build_plan_quality_report
 
-    def test_aggregate_is_mean_over_tasks_where_config_appears(self):
-        from orchestrator.evals.report import compute_aggregate_ratings
+        report = build_plan_quality_report(self._four_cells_three_no_plan())
+        by_task = {r['task_id']: r['terminal_kind'] for r in report['rows']}
 
-        agg = compute_aggregate_ratings(self._state())
-        assert agg['A'] == pytest.approx(1150.0)   # mean(1100, 1200)
-        assert agg['B'] == pytest.approx(1025.0)   # mean(1000, 1050)
-        assert agg['C'] == pytest.approx(900.0)    # only t1 → its t1 rating
+        assert by_task == {
+            'p1': 'false_premise',
+            'p2': 'already_done',
+            'p3': 'none',
+            'p4': 'planned',
+        }
 
-    def test_empty_state_is_empty(self):
-        from orchestrator.evals.elo import JudgeState
-        from orchestrator.evals.report import compute_aggregate_ratings
+    def test_an_unmeasured_row_carries_none_never_a_fabricated_kind(self):
+        """Both unmeasured shapes read ``None``: an implementer cell (the field
+        does not apply) and a legacy cell (the field did not exist)."""
+        from orchestrator.evals.plan_quality_report import build_plan_quality_report
 
-        assert compute_aggregate_ratings(JudgeState(per_task={})) == {}
+        results = [
+            _mresult('impl', 'impl-cfg', 1, quality=1.0, cost_usd=0.3,
+                     duration_ms=60000),
+            _pre_terminal_kind(
+                _arch('legacy', 'arch-legacy', 1, plan_steps=0,
+                      plan_quality=0.0, cost_usd=0.3, duration_ms=60000)
+            ),
+        ]
+        report = build_plan_quality_report(results)
+        by_task = {r['task_id']: r for r in report['rows']}
+
+        assert by_task['impl']['terminal_kind'] is None
+        assert by_task['legacy']['terminal_kind'] is None
+        # …and the key is PRESENT on every row, so a consumer never has to tell
+        # "absent" from "None" at the row layer.
+        assert all('terminal_kind' in r for r in report['rows'])
+
+    # -- (b) the per-config counts ---------------------------------------
+
+    def test_declined_counts_the_explicit_decline_exits_by_kind(self):
+        from orchestrator.evals.metrics import DECLINE_KINDS
+        from orchestrator.evals.plan_quality_report import build_plan_quality_report
+
+        cfg = build_plan_quality_report(
+            self._four_cells_three_no_plan()
+        )['configs'][0]
+
+        assert cfg['declined'] == 2
+        # Key-SORTED, mirroring cap_excluded_by_cause: the rendered split must
+        # not reorder itself between two builds over the same results.
+        assert cfg['declined_by_kind'] == {'already_done': 1, 'false_premise': 1}
+        assert list(cfg['declined_by_kind']) == sorted(cfg['declined_by_kind'])
+        # Only the five explicit exits count — 'planned' and 'none' are terminal
+        # kinds but not declines, and neither may leak into the tally.
+        assert set(cfg['declined_by_kind']) <= set(DECLINE_KINDS)
+
+    # -- (c) the tranche-1 number, beside an UNCHANGED plan_rate ----------
+
+    def test_the_no_plan_band_splits_three_ways_without_moving_plan_rate(self):
+        """THE acceptance shape: the same 3 no-plan cells, now readable.
+
+        ``plan_rate`` keeps its exact historical derivation (``plan_steps > 0``
+        over the admitted pool) so every committed campaign artifact stays
+        comparable; the split is reported ALONGSIDE it.
+        """
+        from orchestrator.evals.plan_quality_report import build_plan_quality_report
+
+        cfg = build_plan_quality_report(
+            self._four_cells_three_no_plan()
+        )['configs'][0]
+
+        assert cfg['n'] == 4
+        assert cfg['no_plan'] == 3
+        assert cfg['no_plan_declined'] == 2
+        assert cfg['declined'] == 2
+        assert cfg['plan_rate'] == 0.25
+        # The silent "could not plan" cell is what is LEFT — the one cell the
+        # 89%-failure reading was ever entitled to.
+        assert cfg['no_plan'] - cfg['no_plan_declined'] == 1
+
+    # -- (d) the plan-then-decline cell ----------------------------------
+
+    def test_a_plan_then_decline_cell_is_declined_but_not_no_plan(self):
+        """reify_task_4026 / run e522b1b0: a 6-step plan, then ``already_done``.
+
+        BOTH facts survive — ``plan_steps=6`` keeps it out of ``no_plan`` and
+        out of ``plan_rate``'s numerator complement, while ``declined`` records
+        the terminal call. ``declined - no_plan_declined`` recovers it exactly.
+        """
+        from orchestrator.evals.plan_quality_report import build_plan_quality_report
+
+        results = [
+            *self._four_cells_three_no_plan(),
+            _kinded(_arch('p5', 'arch-split', 1, plan_steps=6, plan_quality=0.7,
+                          cost_usd=0.3, duration_ms=60000), 'already_done'),
+        ]
+        cfg = build_plan_quality_report(results)['configs'][0]
+
+        assert cfg['n'] == 5
+        assert cfg['no_plan'] == 3            # unchanged: this cell planned
+        assert cfg['no_plan_declined'] == 2   # unchanged: it is not a no-plan
+        assert cfg['declined'] == 3           # …but it IS a decline
+        assert cfg['declined_by_kind'] == {'already_done': 2, 'false_premise': 1}
+        assert cfg['declined'] - cfg['no_plan_declined'] == 1
+
+    # -- (e) pool discipline ---------------------------------------------
+
+    def test_a_cap_tainted_decline_is_in_neither_new_count(self):
+        """A cap-tainted cell is not in the admitted pool AT ALL.
+
+        It belongs to ``cap_excluded`` alone — exactly as it already does for
+        ``no_plan`` and ``judged_without_reference``. Counting its stale
+        terminal kind would describe a cell the mean beside it never saw.
+        """
+        from orchestrator.evals.plan_quality_report import build_plan_quality_report
+
+        results = [
+            *self._four_cells_three_no_plan(),
+            _kinded(_arch('p9', 'arch-split', 1, plan_steps=0, plan_quality=0.0,
+                          cost_usd=0.0, duration_ms=0, cap_tainted=True),
+                    'false_premise'),
+        ]
+        cfg = build_plan_quality_report(results)['configs'][0]
+
+        assert cfg['cap_excluded'] == 1
+        assert cfg['total'] == 5
+        assert cfg['n'] == 4                      # the admitted pool, unchanged
+        assert cfg['declined'] == 2               # the tainted cell is absent
+        assert cfg['declined_by_kind'] == {'already_done': 1, 'false_premise': 1}
+        assert cfg['terminal_kind_unmeasured'] == 0
+
+    # -- (f) the legacy cell ---------------------------------------------
+
+    def test_a_keyless_cell_is_unmeasured_not_not_declined(self):
+        """Absence is not "did not decline" — the ``judged_without_reference``
+        rule, applied to the field beside it."""
+        from orchestrator.evals.plan_quality_report import build_plan_quality_report
+
+        results = [
+            *self._four_cells_three_no_plan(),
+            _pre_terminal_kind(
+                _arch('p8', 'arch-split', 1, plan_steps=0, plan_quality=0.0,
+                      cost_usd=0.3, duration_ms=60000)
+            ),
+        ]
+        cfg = build_plan_quality_report(results)['configs'][0]
+
+        assert cfg['n'] == 5
+        assert cfg['no_plan'] == 4
+        assert cfg['terminal_kind_unmeasured'] == 1
+        assert cfg['declined'] == 2               # NOT 3, and NOT silently 2/5
+        assert cfg['no_plan_declined'] == 2
+
+    def test_an_explicit_null_kind_is_unmeasured_too(self):
+        """Key PRESENT, value null — counted WITH the keyless cells.
+
+        ``terminal_kind_of`` answers ``None`` for an absent key and for a
+        written null alike, and this count is over that answer, so the two
+        shapes must land in the same bucket. The alternative — counting only
+        key ABSENCE — would drop this cell into neither ``declined`` nor
+        ``terminal_kind_unmeasured``, i.e. read it back as "measured, did not
+        decline", the collapse the count exists to prevent.
+
+        The live instrument cannot mint this shape on an architect cell
+        (``run_architect_eval`` always resolves a string, and the write is
+        unconditional), which is exactly why it is constructed here: the day a
+        second producer persists an architect cell with a null kind, this
+        assertion is what keeps the split honest instead of quietly partial.
+        """
+        from orchestrator.evals.plan_quality_report import build_plan_quality_report
+
+        null_kinded = _kinded(
+            _arch('p9', 'arch-split', 1, plan_steps=0, plan_quality=0.0,
+                  cost_usd=0.3, duration_ms=60000),
+            None,
+        )
+        assert 'terminal_kind' in null_kinded.metrics        # PRESENT...
+        assert null_kinded.metrics['terminal_kind'] is None   # ...and null
+
+        cfg = build_plan_quality_report(
+            [*self._four_cells_three_no_plan(), null_kinded]
+        )['configs'][0]
+
+        assert cfg['n'] == 5
+        assert cfg['no_plan'] == 4
+        assert cfg['terminal_kind_unmeasured'] == 1
+        assert cfg['declined'] == 2                # NOT 3, and NOT silently 2/5
+
+    def test_a_fully_measured_config_reports_zero_unmeasured(self):
+        """A count that only appears when it fires cannot be read."""
+        from orchestrator.evals.plan_quality_report import build_plan_quality_report
+
+        cfg = build_plan_quality_report(
+            self._four_cells_three_no_plan()
+        )['configs'][0]
+
+        assert cfg['terminal_kind_unmeasured'] == 0
+        assert cfg['declined_by_kind'] != {} or cfg['declined'] == 0
+
+    # -- (g) report-level totals -----------------------------------------
+
+    def test_report_totals_equal_the_per_config_sums(self):
+        from orchestrator.evals.plan_quality_report import build_plan_quality_report
+
+        results = [
+            *self._four_cells_three_no_plan(),
+            _kinded(_arch('q1', 'arch-other', 1, plan_steps=0, plan_quality=0.0,
+                          cost_usd=0.3, duration_ms=60000), 'unactionable'),
+            _kinded(_arch('q2', 'arch-other', 1, plan_steps=6, plan_quality=0.9,
+                          cost_usd=0.3, duration_ms=60000), 'planned'),
+        ]
+        report = build_plan_quality_report(results)
+
+        assert report['declined'] == sum(c['declined'] for c in report['configs'])
+        assert report['declined'] == 3
+        assert report['declined_by_kind'] == {
+            'already_done': 1, 'false_premise': 1, 'unactionable': 1,
+        }
+        assert list(report['declined_by_kind']) == sorted(
+            report['declined_by_kind']
+        )
+        merged: dict[str, int] = {}
+        for c in report['configs']:
+            for kind, n in c['declined_by_kind'].items():
+                merged[kind] = merged.get(kind, 0) + n
+        assert report['declined_by_kind'] == merged
+
+    # -- (h) the rendered surface ----------------------------------------
+
+    def test_the_mean_section_renders_a_declined_column(self):
+        from orchestrator.evals.plan_quality_report import (
+            _PLAN_QUALITY_MEAN_COLUMNS,
+            _PLAN_QUALITY_MEAN_HEADER,
+            build_plan_quality_report,
+            format_plan_quality_table,
+        )
+
+        # Pin the column tuple FIRST (the file's established idiom): the split
+        # is rendered IMMEDIATELY AFTER the number it explains, never appended
+        # away from it, and the mean stays last.
+        assert (
+            _PLAN_QUALITY_MEAN_COLUMNS.index('declined')
+            == _PLAN_QUALITY_MEAN_COLUMNS.index('no_plan') + 1
+        )
+        assert _PLAN_QUALITY_MEAN_COLUMNS[-1] == 'mean_plan_quality'
+
+        out = format_plan_quality_table(
+            build_plan_quality_report(self._four_cells_three_no_plan())
+        )
+        header = _table_row_cells(
+            out, 'config_name', section=_PLAN_QUALITY_MEAN_HEADER,
+        )
+        cells = _table_row_cells(
+            out, 'arch-split', section=_PLAN_QUALITY_MEAN_HEADER,
+        )
+
+        assert cells[header.index('declined')] == '2'
+        # The numbers it explains stay legible beside it, unchanged.
+        assert cells[header.index('no_plan')] == '3'
+        assert cells[header.index('plan_rate')] == '0.2500'
+
+    def test_a_config_with_no_declines_renders_zero_not_the_null_sentinel(self):
+        """``-`` already means "not an architect run" on this surface; a
+        measured zero must not borrow it."""
+        from orchestrator.evals.plan_quality_report import (
+            _PLAN_QUALITY_MEAN_HEADER,
+            build_plan_quality_report,
+            format_plan_quality_table,
+        )
+
+        results = [
+            _kinded(_arch('p1', 'arch-clean', 1, plan_steps=6, plan_quality=0.8,
+                          cost_usd=0.3, duration_ms=60000), 'planned'),
+        ]
+        out = format_plan_quality_table(build_plan_quality_report(results))
+        header = _table_row_cells(
+            out, 'config_name', section=_PLAN_QUALITY_MEAN_HEADER,
+        )
+        cells = _table_row_cells(
+            out, 'arch-clean', section=_PLAN_QUALITY_MEAN_HEADER,
+        )
+
+        assert cells[header.index('declined')] == '0'
+
+    def test_the_decline_split_section_names_each_kind_and_count(self):
+        from orchestrator.evals.plan_quality_report import (
+            build_plan_quality_report,
+            format_plan_quality_table,
+        )
+
+        out = format_plan_quality_table(
+            build_plan_quality_report(self._four_cells_three_no_plan())
+        )
+        line = next(
+            ln for ln in out.splitlines() if ln.startswith('declined:')
+        )
+
+        # Stated against its OWN pool as an EXACT substring, so a TRANSPOSED
+        # "4 of 2" cannot pass (the cap_excluded / judged-without-reference
+        # precedent one section up).
+        assert 'declined: 2 of 4 scored cell(s)' in line
+        assert 'already_done: 1' in line
+        assert 'false_premise: 1' in line
+        # THE tranche-1 sentence: how much of the no-plan band was a refusal.
+        assert '2 of 3 no-plan cell(s)' in line
+        # …and the existing sections are untouched.
+        assert 'excluded:' in out
+
+    def test_the_split_section_notes_an_unmeasured_population(self):
+        """A PARTIAL split must say so, or it reads as a complete one."""
+        from orchestrator.evals.plan_quality_report import (
+            build_plan_quality_report,
+            format_plan_quality_table,
+        )
+
+        results = [
+            *self._four_cells_three_no_plan(),
+            _pre_terminal_kind(
+                _arch('p8', 'arch-split', 1, plan_steps=0, plan_quality=0.0,
+                      cost_usd=0.3, duration_ms=60000)
+            ),
+        ]
+        out = format_plan_quality_table(build_plan_quality_report(results))
+        line = next(
+            ln for ln in out.splitlines() if ln.startswith('terminal kind:')
+        )
+
+        assert 'UNMEASURED' in line
+        assert '1 of 5 scored cell(s)' in line
+
+    def test_a_fully_measured_report_grows_no_unmeasured_note(self):
+        from orchestrator.evals.plan_quality_report import (
+            build_plan_quality_report,
+            format_plan_quality_table,
+        )
+
+        out = format_plan_quality_table(
+            build_plan_quality_report(self._four_cells_three_no_plan())
+        )
+
+        assert 'terminal kind:' not in out
+
+    def test_the_widened_surface_stays_byte_deterministic(self):
+        from orchestrator.evals.plan_quality_report import (
+            build_plan_quality_report,
+            format_plan_quality_table,
+        )
+
+        report = build_plan_quality_report(self._four_cells_three_no_plan())
+
+        assert (
+            format_plan_quality_table(report)
+            == format_plan_quality_table(report)
+        )
+
+    def test_no_existing_key_or_number_is_disturbed(self):
+        """The split is EXPLANATORY: it moves no cell and changes no number."""
+        from orchestrator.evals.plan_quality_report import build_plan_quality_report
+
+        cfg = build_plan_quality_report(
+            self._four_cells_three_no_plan()
+        )['configs'][0]
+
+        # mean over [0.0, 0.0, 0.0, 0.8] — the three no-plan cells still floor
+        # to 0.0 and stay IN the mean, declines and all.
+        assert cfg['mean_plan_quality'] == pytest.approx(0.2)
+        assert cfg['cap_excluded'] == 0
+        assert cfg['judged_without_reference'] == 0
+        assert cfg['total'] == 4

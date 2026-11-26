@@ -1,96 +1,29 @@
 """scripts/legibility/census_trigger.py — periodic legibility census trigger
-evaluator + census-state reader.
+evaluator.
 
-See plans/confusion-reduction-prd.md §6 (task ζ: fire logic + hard floor),
-§7.4 (per-project census config block), §7.5 (census state contract),
-§8.5 (boundary-test matrix — day-9-no-spike/day-7+130-landed/
-day-6+4-candidates-in-72h/day-4+spike -> no-fire/fire/fire/no-fire(floor)).
+The trigger contract is plans/census-incremental-prd.md C7. The census fires
+on (a) the previous run's weighted completion -- scripts/check_run_completion.py
+over the tasks that run filed under ``x_finding_run``, against
+``census.completion_threshold_pct`` -- or (b) a novelty spike relative to a
+trailing baseline (§4.7 (b)). Neither fires inside the floor, measured from
+the session watermark (§4.7 Floor). Elapsed time alone fires nothing.
+plans/confusion-reduction-prd.md §6, §7.4 and §7.5 are the original trigger,
+config-block and census-state contracts this refines.
 
-Evaluated at the end of each nightly trickle run (wired by PRD task ε) and
-via the standalone `evaluate` CLI subcommand below.
+Evaluated at the end of each nightly trickle run, by census.py's own gate,
+and via the standalone ``evaluate`` CLI subcommand below.
 
-Extended census-state READ contract (for task η, which WRITES/advances
-docs/legibility/census-state.json): in addition to the §7.5 minimal shape
-`{last_census_at, last_census_report}`, this module reads an OPTIONAL
-`last_census_done_count` integer baseline — the fused-memory get_statuses()
-done-task count as of the last census, used to compute the "tasks landed
-since last census" delta for condition (b). fused-memory's get_statuses
-returns only a `{id: status}` status snapshot with no timestamps, so that
-delta is uncomputable without a persisted baseline. That baseline is
-THREE-VALUED (task 3291):
+The completion check runs as a subprocess through an injected
+``CompletionRunner`` (default ``run_completion_check``), so the decision core
+stays pure and every failure of the check is testable with a fake. Its
+verdict is parsed once, at that boundary, into a ``Completion``.
 
-  * an int — a real observed done-count as of the last census. A real `0`
-    (a project with no done tasks) is included and is NOT treated as
-    missing;
-  * `null` — the count could not be OBSERVED at census time. Condition (b)
-    fails SAFE, exactly as for an absent key, until the next successful
-    census; condition (a) (`max_interval_days`) remains the unconditional
-    backstop;
-  * absent — never censused, or η not yet writing it. Condition (b) fails
-    SAFE.
+The trigger reads the census block of the ``LegibilityConfig`` its caller
+loaded (``legibility.config.load_config`` validates it strictly), and the
+census state through ``census_state.load``.
 
-Only a real int ever arms condition (b). A FABRICATED `0` used to be the
-fourth case, and it was the dangerous one: `census.py` wrote 0 whenever the
-get_statuses call failed, and that 0 was persisted as a real baseline on
-2026-07-24 and on 2026-07-31. It is UNSOUND rather than immediately
-visible, and the distinction matters for anyone debugging over-firing —
-these are the measured facts (2026-07-31 decision replayed against the
-pre-task code at merge-base `2b0afe47d9`, with the historical state and
-codebook from `3e462e1b56^`):
-
-  * while the fetch was ALSO broken the fabricated 0 was self-cancelling.
-    The same relative-project_root defect zeroed `current_done` too, so the
-    delta was `0 - 0 = 0` — far under the 120 threshold. Replay of the real
-    pre-fix census.py gate reports `tasks-landed: 0 landed since last
-    census (threshold 120)`: condition (b) did NOT fire. In the nightly
-    trickle it could not fire at all, since `run_nightly` defaults
-    `status_fetcher=None` (nightly.py:727 -> :901) and (b) is structurally
-    N/A there;
-  * but it ARMS (b) the moment the fetch is repaired: with a working
-    fetcher the same replay reports `tasks-landed: 2872 landed since last
-    census (threshold 120) -> FIRE`, ~24x over. So the root-cause fix below
-    would have DETONATED the poisoned baseline had the two not landed
-    together with the on-disk data repair.
-
-What actually fired the 2026-07-31 census was condition (c): `novelty-spike:
-25 candidate(s) within 72h (threshold 4)`. Condition (a) did not fire either
-(7.4d elapsed, 10d threshold). Recalibrating the novelty-spike thresholds is
-NOT part of task 3291 — see the follow-up filed against
-docs/legibility/legibility.yaml.
-
-Task 3291 removed the fabricated-0 path; `census.advance_census_state` now
-persists `null` for an unobservable count, and `extract_done_count` below is
-the single chokepoint that refuses to turn an unusable payload into a
-number.
-
-This module does NOT import task β's `legibility.yaml` config *loader*
-(`legibility.config.load_config`): that loader requires four mandatory
-top-level fields and raises `pydantic.ValidationError` on malformed input,
-which is the wrong contract for this module's fail-safe/silent-defaults
-`census:` block reader -- `load_census_config` instead reads the `census:`
-block directly with a light pyyaml read, falling back to defaults on a
-missing/malformed file. Those defaults ARE sourced from β's
-`legibility.config.Census` pydantic model (scripts/legibility/config.py),
-though -- now that β has landed, it is the single source of truth for the
-six §7.4 threshold values, so `CensusConfig`'s fields read their defaults
-from it rather than re-hardcoding them (see the `CensusConfig` docstring).
-
-The get_statuses done-count fetch is injected (`status_fetcher`), not a
-hardcoded MCP/HTTP client: the scripts/ test env (`uv run --project
-shared`) has no httpx and no MCP client available (see
-shared/pyproject.toml), so the pure decision core stays fully unit-testable
-and "a failing get_statuses fails SAFE" is testable with a raising fake.
-`default_status_fetcher` provides a best-effort glue implementation for the
-standalone CLI, unwrapping the real MCP `tools/call` JSON-RPC envelope via
-`_extract_tool_result` (the tool's actual return value lives at
-`result.structuredContent` or `result.content[0].text`, never at the
-envelope's top level); task ε injects the real MCP-backed fetcher. It
-resolves its `project_root` to an ABSOLUTE path before sending it: the MCP
-argument is interpreted by the server's cwd, not the client's, and
-fused-memory's `_normalize_project_root` hard-rejects any relative path
-(task 3291). Whatever the fetcher returns is converted to a number by
-`extract_done_count`, never by an inline `.get("statuses")` -- see that
-function for why.
+The get_statuses helpers (``extract_statuses``, ``default_status_fetcher``)
+serve census.py's outcome feed, not the trigger.
 """
 from __future__ import annotations
 
@@ -98,85 +31,223 @@ import argparse
 import json
 import logging
 import os
+import statistics
+import subprocess
 import sys
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, time, timedelta
+from enum import Enum, StrEnum
 from pathlib import Path
+from typing import Any, assert_never, overload
 
-import yaml
+from legibility import census_identity, census_state, codebook, layout, state_docs
+from legibility.config import Census, LegibilityConfig, load_config, project_root_mismatch
 
-from legibility import codebook
-from legibility.config import Census as _LegibilityCensus
+if (_SHARED_SRC := str(Path(__file__).resolve().parents[2] / "shared" / "src")) not in sys.path:
+    sys.path.insert(0, _SHARED_SRC)
+
+from shared.mcp_session import McpCallError, SyncMcpSession
 
 logger = logging.getLogger("legibility.census_trigger")
+
+
+@overload
+def _as_utc(value: datetime) -> datetime: ...
+
+
+@overload
+def _as_utc(value: None) -> None: ...
 
 
 def _as_utc(value: datetime | None) -> datetime | None:
     """Normalize a datetime to timezone-aware UTC. A naive datetime (e.g.
     parsed from a bare `YYYY-MM-DD` codebook date) is assumed to already be
-    UTC. `None` passes through unchanged."""
+    UTC. `None` passes through unchanged.
+
+    Overloaded because the pass-through is exactly correlated with the input:
+    the plain `datetime | None -> datetime | None` signature discarded that,
+    so `evaluate`'s `now` (declared non-Optional) came back Optional and made
+    every subsequent arithmetic on it a type error. The overloads state what
+    the body already does; the runtime implementation is unchanged."""
     if value is None:
         return None
     if value.tzinfo is None:
-        return value.replace(tzinfo=timezone.utc)
-    return value.astimezone(timezone.utc)
+        return value.replace(tzinfo=UTC)
+    return value.astimezone(UTC)
 
 
 # ---------------------------------------------------------------------------
-# CensusConfig — §7.4 census: block, with hardcoded defaults
+# completion — condition (a): the previous run's weighted completion
+# (plans/census-incremental-prd.md C7 (a))
 # ---------------------------------------------------------------------------
 
-# Single source of truth for the six §7.4 threshold *values*: task β's
-# `Census` pydantic model (scripts/legibility/config.py), instantiated once
-# at import time. `CensusConfig` below stays its own flat dataclass (not
-# `Census` itself) because its nested `novelty_spike.count`/`window_hours`
-# shape doesn't match the flat attributes `evaluate()` and `from_mapping`
-# read/merge -- but its field *defaults* are pulled from here so the two
-# schemas cannot silently drift apart (review finding, task 2579 amendment
-# pass: config.py did not exist yet when this module was first written).
-_CENSUS_DEFAULTS = _LegibilityCensus()
+class CompletionStatus(StrEnum):
+    FIRE = "fire"
+    NOT_YET = "not_yet"
+    NO_PREVIOUS_RUN = "no_previous_run"
+    FILED_NOTHING = "filed_nothing"
+    ERROR = "error"
+
+
+_MEASURED = frozenset({CompletionStatus.FIRE, CompletionStatus.NOT_YET})
 
 
 @dataclass(frozen=True)
-class CensusConfig:
-    """The six §7.4 census-trigger thresholds. Field defaults are sourced
-    from `legibility.config.Census` (see `_CENSUS_DEFAULTS` above), not
-    re-hardcoded here. `from_mapping` merges a partial override mapping
-    (e.g. the `census:` sub-dict of a project's legibility.yaml) over these
-    defaults."""
+class Completion:
+    """What scripts/check_run_completion.py said about the previous census
+    run's filed tasks, parsed once at the subprocess boundary.
 
-    max_interval_days: int = _CENSUS_DEFAULTS.max_interval_days
-    tasks_landed_threshold: int = _CENSUS_DEFAULTS.tasks_landed_threshold
-    tasks_landed_min_days: int = _CENSUS_DEFAULTS.tasks_landed_min_days
-    novelty_spike_count: int = _CENSUS_DEFAULTS.novelty_spike.count
-    novelty_spike_window_hours: int = _CENSUS_DEFAULTS.novelty_spike.window_hours
-    floor_days: int = _CENSUS_DEFAULTS.floor_days
+    Each field belongs to the statuses that use it: ``run_id`` is None
+    exactly for NO_PREVIOUS_RUN, ``share`` and ``vacuous`` are set only on a
+    measured FIRE or NOT_YET, and ``detail`` is set exactly for ERROR."""
 
-    @classmethod
-    def from_mapping(cls, mapping: dict | None) -> "CensusConfig":
-        """Build a CensusConfig by merging `mapping` (shaped like §7.4's
-        `census:` block, e.g. `{"max_interval_days": 3, "novelty_spike":
-        {"count": 9}}`) over the defaults. Keys absent from `mapping`
-        (including either nested `novelty_spike` key) keep their default
-        value. `mapping=None` (or `{}`) returns plain defaults."""
-        defaults = cls()
-        mapping = mapping or {}
-        novelty_spike = mapping.get("novelty_spike") or {}
-        return cls(
-            max_interval_days=mapping.get("max_interval_days", defaults.max_interval_days),
-            tasks_landed_threshold=mapping.get(
-                "tasks_landed_threshold", defaults.tasks_landed_threshold
-            ),
-            tasks_landed_min_days=mapping.get(
-                "tasks_landed_min_days", defaults.tasks_landed_min_days
-            ),
-            novelty_spike_count=novelty_spike.get("count", defaults.novelty_spike_count),
-            novelty_spike_window_hours=novelty_spike.get(
-                "window_hours", defaults.novelty_spike_window_hours
-            ),
-            floor_days=mapping.get("floor_days", defaults.floor_days),
+    status: CompletionStatus
+    run_id: str | None
+    threshold_pct: int
+    share: float | None = None
+    vacuous: bool = False
+    detail: str = ""
+
+    def __post_init__(self) -> None:
+        if (self.run_id is None) != (self.status is CompletionStatus.NO_PREVIOUS_RUN):
+            raise ValueError(f"Completion {self.status}: run_id {self.run_id!r} does not fit")
+        if self.status not in _MEASURED and (self.share is not None or self.vacuous):
+            raise ValueError(f"Completion {self.status}: carries a share, but measured nothing")
+        if bool(self.detail) != (self.status is CompletionStatus.ERROR):
+            raise ValueError(f"Completion {self.status}: detail {self.detail!r} does not fit")
+
+    @property
+    def fires(self) -> bool:
+        return self.status is CompletionStatus.FIRE
+
+    @property
+    def reason(self) -> str:
+        threshold = f"(threshold {self.threshold_pct / 100:.2f})"
+        match self.status:
+            case CompletionStatus.FIRE | CompletionStatus.NOT_YET:
+                line = f"completion: {self._shown_share()} of {self.run_id} {threshold}"
+                return line + (" -> FIRE" if self.fires else "")
+            case CompletionStatus.NO_PREVIOUS_RUN:
+                return "completion: no previous run id (census-state has no last_census_run_id) -> N/A"
+            case CompletionStatus.FILED_NOTHING:
+                return f"completion: run {self.run_id} filed no tasks -> N/A"
+            case CompletionStatus.ERROR:
+                return f"completion: check of {self.run_id} failed ({self.detail}) -> N/A"
+
+    def _shown_share(self) -> str:
+        if self.share is not None:
+            return f"{self.share:g}"
+        return "vacuous" if self.vacuous else "unreadable"
+
+
+COMPLETION_SCRIPT = Path(__file__).resolve().parents[1] / "check_run_completion.py"
+COMPLETION_CHECK_TIMEOUT_SECS = 120
+CompletionRunner = Callable[[Sequence[str]], subprocess.CompletedProcess[str]]
+
+_EMPTY_RUN_ERROR = "empty_run"
+
+
+def run_completion_check(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+    """Run check_run_completion.py under this interpreter, capturing stdout;
+    its stderr diagnostics go straight to the caller's journal."""
+    return subprocess.run(
+        [sys.executable, str(COMPLETION_SCRIPT), *args],
+        stdout=subprocess.PIPE,
+        text=True,
+        timeout=COMPLETION_CHECK_TIMEOUT_SECS,
+        check=False,
+    )
+
+
+def _verdict_line(stdout: str | None) -> Mapping[str, Any] | None:
+    lines = [line for line in (stdout or "").splitlines() if line.strip()]
+    if not lines:
+        return None
+    try:
+        verdict = json.loads(lines[-1])
+    except json.JSONDecodeError:
+        return None
+    return verdict if isinstance(verdict, dict) else None
+
+
+def _completion_from_exit(
+    run_id: str, threshold_pct: int, returncode: int, verdict: Mapping[str, Any] | None
+) -> Completion:
+    verdict = verdict or {}
+    share = verdict.get("share")
+    concluded = {os.EX_OK: CompletionStatus.FIRE, os.EX_TEMPFAIL: CompletionStatus.NOT_YET}
+    if returncode in concluded:
+        return Completion(
+            concluded[returncode],
+            run_id,
+            threshold_pct,
+            share=share if isinstance(share, float) else None,
+            vacuous=verdict.get("vacuous") is True,
         )
+    error_code = verdict.get("error")
+    if returncode == 2 and error_code == _EMPTY_RUN_ERROR:
+        return Completion(CompletionStatus.FILED_NOTHING, run_id, threshold_pct)
+    named = (
+        "no verdict line" if not verdict
+        else error_code if isinstance(error_code, str)
+        else "no error code"
+    )
+    return Completion(
+        CompletionStatus.ERROR, run_id, threshold_pct, detail=f"exit {returncode}, {named}"
+    )
+
+
+def _warn_not_applicable(completion: Completion, check_output: str = "") -> None:
+    logger.warning(
+        "%s -- condition (a) fails safe (no fire on completion); the novelty spike "
+        "still evaluates (plans/census-incremental-prd.md C7 (a))%s",
+        completion.reason,
+        f"; check output: {bounded_repr(check_output)}" if check_output else "",
+    )
+
+
+def check_completion(
+    run_id: str | None,
+    *,
+    project_root: str | Path,
+    threshold_pct: int,
+    runner: CompletionRunner,
+) -> Completion:
+    """Condition (a): whether the previous census run *run_id* has landed
+    *threshold_pct* percent of its filed tasks' weight in *project_root*,
+    and only there (D9). Never raises; every outcome that is not FIRE or
+    NOT_YET logs exactly one WARNING."""
+    if run_id is None:
+        completion = Completion(CompletionStatus.NO_PREVIOUS_RUN, None, threshold_pct)
+        _warn_not_applicable(completion)
+        return completion
+
+    args = [
+        "--run", run_id,
+        "--threshold", f"{threshold_pct / 100:g}",
+        "--project-root", str(Path(project_root).resolve()),
+    ]
+    try:
+        done = runner(args)
+    except Exception as exc:
+        completion = Completion(
+            CompletionStatus.ERROR,
+            run_id,
+            threshold_pct,
+            detail=f"{type(exc).__name__}: {bounded_repr(str(exc))}",
+        )
+        _warn_not_applicable(completion)
+        return completion
+
+    completion = _completion_from_exit(
+        run_id, threshold_pct, done.returncode, _verdict_line(done.stdout)
+    )
+    if completion.status is CompletionStatus.ERROR:
+        _warn_not_applicable(completion, (done.stdout or "").strip())
+    elif completion.status is CompletionStatus.FILED_NOTHING:
+        _warn_not_applicable(completion)
+    return completion
 
 
 # ---------------------------------------------------------------------------
@@ -185,154 +256,102 @@ class CensusConfig:
 
 @dataclass(frozen=True)
 class Decision:
-    """The census-trigger verdict: whether to fire, plus one human-readable
-    reason line per evaluated condition (and the floor), for logging /
-    CLI display."""
+    """The census-trigger verdict: whether to fire, one human-readable reason
+    line per condition and the floor, and the completion arm's verdict (None
+    when the evaluation never reached it)."""
 
     fire: bool
     reasons: list[str]
+    completion: Completion | None = None
+
+
+class FloorAnchorKind(Enum):
+    SESSION_WATERMARK = "session watermark"
+    LAST_CENSUS_AT = "last_census_at (no watermark yet)"
+    EARLIEST_CODEBOOK_DATE = "earliest codebook date (never censused)"
+
+
+@dataclass(frozen=True)
+class FloorAnchor:
+    """The instant the census floor is measured from, and where it came from."""
+
+    kind: FloorAnchorKind
+    at: datetime
+
+
+def _floor_condition(
+    now_utc: datetime, anchor: FloorAnchor | None, config: Census
+) -> tuple[bool, str]:
+    if anchor is None:
+        return True, (
+            "floor: no anchor (no session watermark, last_census_at or codebook date)"
+            " -> BLOCKS all conditions"
+        )
+    days = (now_utc - _as_utc(anchor.at)).total_seconds() / 86400.0
+    blocks = days < config.floor_days
+    line = f"floor: {days:.1f}d since {anchor.kind.value} (floor {config.floor_days}d)"
+    return blocks, line + (" -> BLOCKS all conditions" if blocks else "")
+
+
+def _count_within(first_seens_utc: list[datetime], *, end: datetime, hours: int) -> int:
+    start = end - timedelta(hours=hours)
+    return sum(1 for fs in first_seens_utc if start <= fs <= end)
+
+
+def _novelty_condition(
+    now_utc: datetime, candidate_first_seens: list[datetime], config: Census
+) -> tuple[bool, str]:
+    seen = [_as_utc(fs) for fs in candidate_first_seens]
+    novelty = config.novelty_spike
+    hours = novelty.window_hours
+    baseline_days = novelty.baseline_days
+    count = _count_within(seen, end=now_utc, hours=hours)
+    head = f"novelty-spike: {count} within {hours}h"
+
+    history_days = (now_utc - min(seen)).total_seconds() / 86400.0 if seen else 0.0
+    if history_days < baseline_days:
+        return False, (
+            f"{head} (baseline needs {baseline_days}d of candidate history, "
+            f"have {history_days:.1f}d) -> N/A"
+        )
+
+    baseline = (
+        statistics.median(
+            _count_within(seen, end=now_utc - timedelta(days=k), hours=hours)
+            for k in range(1, baseline_days + 1)
+        )
+        if baseline_days
+        else 0.0
+    )
+    spike = count >= novelty.count and count >= novelty.multiple * baseline
+    line = f"{head} (baseline median {baseline:g}, x{novelty.multiple})"
+    return spike, line + (" -> FIRE" if spike else "")
 
 
 def evaluate(
     *,
     now: datetime,
-    last_census_at: datetime | None,
-    never_censused: bool,
-    tasks_landed: int | None,
+    floor_anchor: FloorAnchor | None,
+    completion: Completion,
     candidate_first_seens: list[datetime],
-    config: CensusConfig,
+    config: Census,
 ) -> Decision:
-    """Pure decision core for the §6/§8.5 fire logic. Fires at the earliest
-    of condition (a) max_interval_days, (b) tasks_landed_min_days +
-    tasks_landed_threshold, (c) novelty_spike — currently only (a) is
-    implemented; (b)/(c)/the hard floor are added by later steps. No I/O:
-    all inputs are plain values so the full §8.5 matrix is testable without
-    a filesystem or a live get_statuses call.
+    """Pure decision core (plans/census-incremental-prd.md C7): fire when
+    (a) *completion* fires or (b) the novelty spike does, unless the floor
+    measured from *floor_anchor* blocks. The floor never fires by itself, and
+    its reason line always names its anchor. The novelty condition is
+    relative to the median of the daily window counts over the trailing
+    baseline_days, and N/A until that much candidate history exists. The
+    reasons are the completion, novelty and floor lines, in that order.
     """
     now_utc = _as_utc(now)
-    last_utc = _as_utc(last_census_at)
-    days_since = (
-        (now_utc - last_utc).total_seconds() / 86400.0 if last_utc is not None else None
+    spike, novelty_line = _novelty_condition(now_utc, candidate_first_seens, config)
+    floor_blocks, floor_line = _floor_condition(now_utc, floor_anchor, config)
+    return Decision(
+        fire=(completion.fires or spike) and not floor_blocks,
+        reasons=[completion.reason, novelty_line, floor_line],
+        completion=completion,
     )
-
-    reasons: list[str] = []
-
-    cond_a = days_since is not None and days_since >= config.max_interval_days
-    if days_since is not None:
-        reasons.append(
-            "max-interval: {:.1f}d since last census (threshold {}d){}".format(
-                days_since, config.max_interval_days, " -> FIRE" if cond_a else ""
-            )
-        )
-    else:
-        reasons.append("max-interval: no last-census anchor available -> N/A")
-
-    cond_b = (
-        days_since is not None
-        and days_since >= config.tasks_landed_min_days
-        and tasks_landed is not None
-        and tasks_landed >= config.tasks_landed_threshold
-    )
-    if tasks_landed is None:
-        reasons.append("tasks-landed: delta unavailable (no baseline/fetcher) -> N/A")
-    elif days_since is None or days_since < config.tasks_landed_min_days:
-        reasons.append(
-            "tasks-landed: {} landed but only {:.1f}d elapsed (min {}d) -> N/A".format(
-                tasks_landed, days_since if days_since is not None else 0.0,
-                config.tasks_landed_min_days,
-            )
-        )
-    else:
-        reasons.append(
-            "tasks-landed: {} landed since last census (threshold {}){}".format(
-                tasks_landed, config.tasks_landed_threshold, " -> FIRE" if cond_b else ""
-            )
-        )
-
-    window_start = now_utc - timedelta(hours=config.novelty_spike_window_hours)
-    in_window = [
-        fs for fs in candidate_first_seens if window_start <= _as_utc(fs) <= now_utc
-    ]
-    cond_c = len(in_window) >= config.novelty_spike_count
-    reasons.append(
-        "novelty-spike: {} candidate(s) within {}h (threshold {}){}".format(
-            len(in_window),
-            config.novelty_spike_window_hours,
-            config.novelty_spike_count,
-            " -> FIRE" if cond_c else "",
-        )
-    )
-
-    triggered = cond_a or cond_b or cond_c
-
-    floor_blocks = (
-        not never_censused and days_since is not None and days_since < config.floor_days
-    )
-    if floor_blocks:
-        reasons.append(
-            "floor: only {:.1f}d since last census (floor {}d) -> BLOCKS all conditions".format(
-                days_since, config.floor_days
-            )
-        )
-    elif never_censused:
-        reasons.append("floor: never censused -> exempt")
-
-    fire = triggered and not floor_blocks
-
-    return Decision(fire=fire, reasons=reasons)
-
-
-# ---------------------------------------------------------------------------
-# load_census_state — §7.5 census-state.json reader (three-valued)
-# ---------------------------------------------------------------------------
-
-def load_census_state(path: str | Path) -> tuple[str, dict | None]:
-    """Read `docs/legibility/census-state.json` (§7.5, extended with the
-    optional `last_census_done_count` baseline documented in this module's
-    docstring). Three-valued result distinguishing "never censused" from
-    "fail safe":
-
-    - path does not exist -> `("missing", None)`, no warning logged. A
-      project that has never run a census is a normal, expected state, not
-      a degradation.
-    - unreadable / invalid JSON / non-dict top level / unparseable
-      `last_census_at` -> `("malformed", None)` + exactly one WARNING.
-      Callers must fail SAFE (never fire) rather than guess a timestamp.
-    - otherwise -> `("ok", data)`.
-    """
-    path = Path(path)
-    if not path.exists():
-        return "missing", None
-
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-    except (OSError, json.JSONDecodeError) as exc:
-        logger.warning("census state at %s is malformed: %s", path, exc)
-        return "malformed", None
-
-    if not isinstance(data, dict):
-        logger.warning(
-            "census state at %s is malformed: expected a JSON object, got %s",
-            path,
-            type(data).__name__,
-        )
-        return "malformed", None
-
-    last_census_at = data.get("last_census_at")
-    if last_census_at is not None:
-        try:
-            datetime.fromisoformat(last_census_at)
-        except (TypeError, ValueError) as exc:
-            logger.warning(
-                "census state at %s is malformed: unparseable last_census_at %r: %s",
-                path,
-                last_census_at,
-                exc,
-            )
-            return "malformed", None
-
-    return "ok", data
 
 
 # ---------------------------------------------------------------------------
@@ -356,9 +375,8 @@ def codebook_signal(codebook: dict) -> tuple[datetime | None, list[datetime]]:
     """Extract the census-trigger signal from a `codebook.load()`-shaped
     dict (task γ / 2575's schema): the earliest structured sighting or
     candidate `first_seen`/sighting date across the WHOLE codebook (used to
-    anchor condition (a) when `never_censused`), and every candidate's
-    `first_seen` date on its own (used for condition (c)'s novelty-spike
-    window count). Unparseable dates are skipped rather than raising.
+    anchor the floor when never censused), and every candidate's
+    `first_seen` date on its own (used for the novelty-spike window count). Unparseable dates are skipped rather than raising.
 
     Returns `(earliest_or_None, sorted_candidate_first_seens)`. An empty
     codebook (`entries: []`, `candidates: []`) returns `(None, [])`.
@@ -387,79 +405,30 @@ def codebook_signal(codebook: dict) -> tuple[datetime | None, list[datetime]]:
 
 
 # ---------------------------------------------------------------------------
-# load_census_config — §7.4 census: block reader (independent of task β)
-# ---------------------------------------------------------------------------
-
-def load_census_config(project_root: str | Path) -> CensusConfig:
-    """Read `<project_root>/docs/legibility/legibility.yaml`'s `census:`
-    sub-dict (§7.4) directly via a light pyyaml read -- deliberately NOT
-    task β's `legibility.config.load_config` loader, whose four required
-    top-level fields and raise-on-malformed-input contract are the wrong
-    shape for this fail-safe reader (see module docstring). An absent file
-    returns defaults silently (no legibility.yaml is a normal pre-adoption
-    state). A malformed file (YAML parse error, non-dict top level, or a
-    non-dict `census:` block) returns defaults plus exactly one WARNING --
-    never raises. Those defaults are `Census`'s, not independently
-    hardcoded -- see `CensusConfig`.
-    """
-    path = Path(project_root) / "docs" / "legibility" / "legibility.yaml"
-    if not path.exists():
-        return CensusConfig()
-
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = yaml.safe_load(f)
-    except (OSError, yaml.YAMLError) as exc:
-        logger.warning("legibility config at %s is malformed: %s", path, exc)
-        return CensusConfig()
-
-    if not isinstance(data, dict):
-        logger.warning(
-            "legibility config at %s is malformed: expected a YAML mapping, got %s",
-            path,
-            type(data).__name__,
-        )
-        return CensusConfig()
-
-    census_block = data.get("census")
-    if census_block is not None and not isinstance(census_block, dict):
-        logger.warning(
-            "legibility config at %s has a malformed census: block (expected a mapping, got %s)",
-            path,
-            type(census_block).__name__,
-        )
-        return CensusConfig()
-
-    return CensusConfig.from_mapping(census_block)
-
-
-# ---------------------------------------------------------------------------
-# compute_tasks_landed + default_status_fetcher — fail-safe done-count delta
+# extract_statuses + default_status_fetcher — the census run's get_statuses
+# outcome feed (census_run.py::_read_statuses)
 # ---------------------------------------------------------------------------
 
 class StatusFetchUnavailable(Exception):
     """Raised by a status_fetcher (in particular `default_status_fetcher`'s
-    returned callable) when the get_statuses done-count cannot be obtained
-    for any reason -- missing dependency, no network, a non-2xx response, a
-    malformed payload. A dedicated exception (rather than letting an
-    arbitrary one propagate) lets `compute_tasks_landed` -- and any other
-    caller -- catch fetch failures deterministically."""
+    returned callable) or by `extract_statuses` when a usable get_statuses
+    snapshot cannot be obtained -- no network, a non-2xx response, a
+    malformed payload. A dedicated exception lets the census run's outcome feed
+    (`census_run.py::_read_statuses`) catch fetch failures deterministically."""
 
 
-# Every `StatusFetchUnavailable` message below is re-emitted verbatim by
-# `compute_tasks_landed`'s WARNING and by `census.run_census`'s "done-count
-# unobservable (%s)" WARNING, i.e. into the nightly systemd journal. An
-# unbounded `{payload!r}` there would dump a whole malformed-but-large body
-# (get_statuses over a big project is thousands of entries) into a single log
-# line -- the opposite of the legible failure this module is for. Diagnosis
-# only ever needs the shape, so the reprs are truncated and the type
-# name/key list, which is what actually identifies the fault, is always
-# reported outside the truncated part.
-_MAX_REPR_CHARS = 200
-_MAX_REPORTED_KEYS = 20
+# A `StatusFetchUnavailable` message is re-emitted verbatim into the census
+# report and the nightly journal, and `bounded_repr` also bounds this
+# module's own WARNINGs. An unbounded `{payload!r}` would dump a whole
+# malformed-but-large body (get_statuses over a big project is thousands of
+# entries) into a single line. Diagnosis needs only the shape, so reprs are
+# truncated and the type name / key list, which identifies the fault, is
+# always reported outside the truncated part.
+MAX_REPR_CHARS = 200
+MAX_REPORTED_KEYS = 20
 
 
-def _bounded_repr(value, limit: int = _MAX_REPR_CHARS) -> str:
+def bounded_repr(value, limit: int = MAX_REPR_CHARS) -> str:
     """`repr(value)` truncated to *limit* chars with an explicit elision
     marker, so a log line stays one readable line regardless of payload size."""
     text = repr(value)
@@ -468,70 +437,36 @@ def _bounded_repr(value, limit: int = _MAX_REPR_CHARS) -> str:
     return f"{text[:limit]}... (repr truncated, {len(text)} chars total)"
 
 
-def _bounded_keys(mapping) -> str:
+def bounded_keys(mapping) -> str:
     """A bounded, order-stable summary of a mapping's keys. Sorts by `str` so
     a payload with mixed-type keys cannot raise `TypeError` from inside the
     error path itself -- a failure while reporting a failure is the worst
     possible place to be clever."""
     keys = sorted(mapping, key=str)
-    shown = keys[:_MAX_REPORTED_KEYS]
-    suffix = f", ... ({len(keys)} total)" if len(keys) > _MAX_REPORTED_KEYS else ""
+    shown = keys[:MAX_REPORTED_KEYS]
+    suffix = f", ... ({len(keys)} total)" if len(keys) > MAX_REPORTED_KEYS else ""
     return f"{shown}{suffix}"
 
 
-def extract_done_count(payload) -> int:
-    """Count `"done"` values in a get_statuses payload, or raise
-    `StatusFetchUnavailable` if *payload* is not a usable get_statuses
-    envelope.
+def extract_statuses(payload) -> Mapping[str, Any]:
+    """The `{task id string: status}` mapping of a get_statuses payload, or
+    raise `StatusFetchUnavailable` if *payload* is not a usable get_statuses
+    envelope. Its one consumer is the census run's outcome feed
+    (`census_run.py::_read_statuses`).
 
-    This is the SOLE place a get_statuses payload is turned into a number,
-    and it exists because the idiom it replaces silently fabricated
-    baselines. Both `compute_tasks_landed` below and `census.run_census`
-    used to inline `sum(1 for v in (payload.get("statuses") or {}).values()
-    if v == "done")`. That `or {}` swallowed *every* unusable payload into a
-    done-count of 0 -- no warning, no exception, no way to tell a real
-    empty project from a failed call. fused-memory's `@mcp_tool_errors`
-    returns its `{"error", "error_type"}` dict on an `isError: false`
-    JSON-RPC response, so `_extract_tool_result` unwraps it as though it
-    were a genuine result and the old idiom read it as 0. That fabricated 0
-    was persisted as a real census baseline on 2026-07-24 and on 2026-07-31
-    (task 3291) — an unsound baseline that stayed latent only for as long as
-    the fetch itself was broken (the same defect zeroed `current_done`, so
-    the delta was `0 - 0`), and that arms condition (b) with a delta of
-    ~2872 — every done task ever, ~24x its 120 threshold — as soon as the
-    fetch is repaired. See the module docstring for the replayed
-    measurements, including what actually fired the 2026-07-31 census.
-
-    `{"statuses": {}}` is deliberately a VALID done-count of 0: a project
-    with no done tasks is a real, expected state, and
-    `census.advance_census_state`'s contract explicitly guarantees a real 0
-    is never dropped as falsy. The distinction that matters is
-    presence-of-shape, not emptiness-of-content -- only a missing or
-    non-mapping `statuses` key, a non-dict payload, or the tool-error
-    envelope is treated as unavailable.
-
-    Note this strictness deliberately lives HERE and not in
-    `_extract_tool_result`: that unwrapper is shared with
-    `census._post_mcp_tool_call`, which serves `submit_task` and
-    `escalate_info`, and those callers legitimately receive and inspect the
-    `{"error": ...}` dict (submit_task's documented rejection shape).
-    Raising there would break unrelated paths; raising at the
-    get_statuses-specific boundary closes the hole at both call sites at
-    once without touching them.
-
-    Raises:
-        StatusFetchUnavailable: with a message naming the offending shape --
-            or quoting the server's own `error` text -- so the operator sees
-            the real cause rather than a generic complaint. The identifying
-            facts (type name, key list, container length) are always stated
-            in full; any embedded value repr is bounded, because this message
-            is re-emitted into the nightly journal as a single log line (see
-            `_bounded_repr`).
+    `{"statuses": {}}` is a valid, empty answer; only a non-dict payload, a
+    missing or non-mapping `statuses`, the tool-error envelope, or a
+    `pagination` that does not prove the page is the whole population
+    (`_require_whole_population`) is unusable. fused-memory's
+    `@mcp_tool_errors` returns its `{"error", "error_type"}` dict on an
+    `isError: false` response, so it
+    reaches the caller looking like a genuine reply, and reading it as an
+    empty snapshot once fabricated a census baseline (task 3291).
     """
     if not isinstance(payload, dict):
         raise StatusFetchUnavailable(
             f"get_statuses payload is not a dict (got {type(payload).__name__}): "
-            f"{_bounded_repr(payload)}"
+            f"{bounded_repr(payload)}"
         )
 
     # The fused-memory tool-error envelope, checked before the shape
@@ -542,12 +477,12 @@ def extract_done_count(payload) -> int:
         raise StatusFetchUnavailable(
             f"get_statuses returned a tool-error envelope "
             f"({payload.get('error_type') or 'error'}): "
-            f"{_bounded_repr(payload.get('error'))}"
+            f"{bounded_repr(payload.get('error'))}"
         )
 
     if "statuses" not in payload:
         raise StatusFetchUnavailable(
-            f"get_statuses payload has no 'statuses' key (keys: {_bounded_keys(payload)})"
+            f"get_statuses payload has no 'statuses' key (keys: {bounded_keys(payload)})"
         )
 
     statuses = payload["statuses"]
@@ -555,217 +490,73 @@ def extract_done_count(payload) -> int:
         sized = f", len={len(statuses)}" if hasattr(statuses, "__len__") else ""
         raise StatusFetchUnavailable(
             f"get_statuses 'statuses' is not a mapping "
-            f"(got {type(statuses).__name__}{sized}): {_bounded_repr(statuses)}"
+            f"(got {type(statuses).__name__}{sized}): {bounded_repr(statuses)}"
         )
 
-    return sum(1 for status in statuses.values() if status == "done")
+    if "pagination" in payload:
+        _require_whole_population(payload["pagination"])
+
+    return statuses
 
 
-def compute_tasks_landed(*, state: dict | None, status_fetcher) -> int | None:
-    """Fail-SAFE "tasks done since last census" delta for condition (b).
+def _require_whole_population(pagination) -> None:
+    """Raise `StatusFetchUnavailable` unless a get_statuses `pagination`
+    envelope proves its page is the whole population: the first page
+    (`offset` 0) with nothing left to fetch (`has_more` exactly `False`).
 
-    Returns `None` (never fires condition (b)) plus exactly one WARNING
-    when: `status_fetcher` is `None`; `state` has no `last_census_done_count`
-    baseline (§7.5 extended read contract, see module docstring); calling
-    `status_fetcher` raises for any reason; or the fetched payload is not a
-    usable `{"statuses": {id: status}}` envelope (matching get_statuses' real
-    shape -- fused-memory/src/fused_memory/server/tools.py:2665). In
-    particular fused-memory's `{"error", "error_type"}` tool-error dict --
-    which rides an `isError: false` JSON-RPC response and so survives
-    `_extract_tool_result` intact -- fails SAFE here rather than counting
-    zero; see `extract_done_count` for why counting zero was the defect
-    (task 3291). Otherwise returns `current_done - baseline`.
-
-    A bad payload and an unreachable server deliberately share ONE code path
-    and ONE warning, so there is no separate failure mode to reason about --
-    only the warning TEXT distinguishes them in the journal.
-    """
-    baseline = (state or {}).get("last_census_done_count")
-    if baseline is None:
-        logger.warning(
-            "tasks-landed: no last_census_done_count baseline in census state "
-            "-- condition (b) fails safe (no fire)"
+    The server omits `pagination` from a complete response
+    (`fused-memory/src/fused_memory/server/tools.py::get_statuses`), so a
+    present one must prove completeness, not merely fail to disprove it. A
+    last page at a non-zero offset is a partial census, and a malformed
+    envelope proves nothing."""
+    if not isinstance(pagination, Mapping):
+        raise StatusFetchUnavailable(
+            f"get_statuses 'pagination' is not a mapping "
+            f"(got {type(pagination).__name__}): {bounded_repr(pagination)}"
         )
-        return None
 
-    if status_fetcher is None:
-        logger.warning(
-            "tasks-landed: no status_fetcher configured -- condition (b) fails safe (no fire)"
+    offset = pagination.get("offset", 0)
+    has_more = pagination.get("has_more")
+    is_first_page = type(offset) is int and offset == 0
+    if has_more is not False or not is_first_page:
+        raise StatusFetchUnavailable(
+            f"get_statuses returned a partial page, not the full census "
+            f"(offset={bounded_repr(offset)}, has_more={bounded_repr(has_more)}, "
+            f"returned={bounded_repr(pagination.get('returned'))}, "
+            f"total={bounded_repr(pagination.get('total'))})"
         )
-        return None
-
-    try:
-        payload = status_fetcher()
-    except Exception as exc:  # noqa: BLE001 - any fetch failure must fail safe
-        logger.warning("tasks-landed: status_fetcher failed: %s", exc)
-        return None
-
-    # Extraction is guarded separately from the fetch so the warning TEXT can
-    # distinguish "server unreachable" from "server answered with something
-    # unusable" -- but both land on the same return-None fail-safe branch.
-    try:
-        current_done = extract_done_count(payload)
-    except StatusFetchUnavailable as exc:
-        logger.warning("tasks-landed: get_statuses returned an unusable payload: %s", exc)
-        return None
-
-    return current_done - baseline
 
 
 _FUSED_MEMORY_URL_ENV_VAR = "FUSED_MEMORY_MCP_URL"
 _DEFAULT_FUSED_MEMORY_URL = "http://localhost:8002"  # dashboard.config.DEFAULT_FUSED_MEMORY_URLS[0]
 
-# Single source of truth for the headers every legibility poster must send on
-# a `tools/call` POST to a local MCP `/mcp` endpoint. The streamable-HTTP MCP
-# transport 406s ("Not Acceptable: Client must accept application/json")
-# *before* even dispatching the tools/call if `Accept` doesn't include BOTH
-# media types -- verified live against localhost:8002 (and :8003). With this
-# header present the server's response Content-Type is `application/json` (not
-# SSE-framed) for these calls, so `response.json()` needs no `data:`-line
-# parsing. Kept load-bearing-constant-single-sourced here (census_trigger is
-# already imported by census.py, nightly.py, and check_transcript_persistence.py)
-# so a future transport change is a one-line edit, not four lockstep edits
-# with a silent-406 risk on any one that's missed. See nightly._default_poster,
-# census._post_mcp_tool_call, and check_transcript_persistence._default_poster
-# for the other three consumers.
-MCP_STREAMABLE_HTTP_HEADERS = {
-    "Accept": "application/json, text/event-stream",
-    "Content-Type": "application/json",
-}
-
-
-def _extract_tool_result(rpc_response: dict) -> dict:
-    """Unwrap a JSON-RPC `tools/call` response into the tool's actual
-    return value.
-
-    An MCP `tools/call` response does NOT put the tool's result at the top
-    level of the JSON-RPC envelope: FastMCP places it at
-    `result.structuredContent` (get_statuses declares a typed return,
-    `-> dict[str, Any]`) and/or as a JSON string at `result.content[0].text`
-    (the universal fallback every MCP client must support). Returning
-    `response.json()` verbatim -- the envelope, not the unwrapped value --
-    left `compute_tasks_landed` reading a `statuses` key that was never
-    there, so `current_done` was silently always `0` and the delta always
-    negative (never fires condition (b), but with zero visibility into why;
-    review finding, task 2579 amendment pass).
-
-    Prefers `structuredContent` (already a dict, no string to parse);
-    falls back to parsing `content[0].text` (mirrors
-    `dashboard.data.memory._extract_tool_result`, the same unwrap this
-    codebase already relies on elsewhere for a live get_statuses call).
-
-    Raises `StatusFetchUnavailable` -- rather than returning `{}` -- when
-    neither shape is present/parseable, so a malformed envelope fails safe
-    through the exact same path as a network failure (one WARNING logged by
-    `compute_tasks_landed`) instead of silently degrading to an
-    unwarned-about negative delta.
-    """
-    result = rpc_response.get("result") if isinstance(rpc_response, dict) else None
-    if not isinstance(result, dict):
-        raise StatusFetchUnavailable(
-            f"malformed MCP response (no result): {_bounded_repr(rpc_response)}"
-        )
-
-    structured = result.get("structuredContent")
-    if isinstance(structured, dict):
-        return structured
-
-    content = result.get("content")
-    if isinstance(content, list) and content:
-        first = content[0]
-        text = first.get("text") if isinstance(first, dict) else None
-        if isinstance(text, str):
-            try:
-                parsed = json.loads(text)
-            except json.JSONDecodeError as exc:
-                raise StatusFetchUnavailable(f"unparseable MCP content text: {exc}") from exc
-            if isinstance(parsed, dict):
-                return parsed
-
-    raise StatusFetchUnavailable(
-        f"MCP tools/call result has neither structuredContent nor parseable "
-        f"content: {_bounded_repr(result)}"
-    )
-
 
 def default_status_fetcher(project_root: str | Path):
-    """Return a zero-arg best-effort get_statuses caller for the standalone
-    `evaluate` CLI (task ε injects the real MCP-backed fetcher for the
-    nightly trickle instead -- see module docstring). Reads the fused-memory
-    MCP endpoint from the `FUSED_MEMORY_MCP_URL` env var, defaulting to
-    `http://localhost:8002`. `httpx` is imported lazily since it is not a
-    scripts/ dependency (see module docstring); that ImportError, along with
-    any network/HTTP/parse failure, is wrapped as `StatusFetchUnavailable`
-    so callers can catch fetch failures deterministically rather than a bare
-    Exception. The raw JSON-RPC `tools/call` response is unwrapped via
-    `_extract_tool_result` before returning, so the callable's return value
-    matches `compute_tasks_landed`'s expected `{"statuses": {...}}` shape
-    instead of the outer JSON-RPC envelope.
+    """Return a zero-arg get_statuses caller for *project_root*.
 
-    *project_root* is resolved to an ABSOLUTE path before it crosses the
-    wire: the MCP `get_statuses` argument is interpreted by the SERVER's
-    cwd, not the client's, so a relative path is meaningless there and is
-    hard-rejected by fused-memory's `_normalize_project_root` (task 3291 --
-    see the comment at the resolve call below).
+    The production fetcher for census.py's outcome feed (`census.main`). It
+    calls fused-memory at `$FUSED_MEMORY_MCP_URL` (default
+    `http://localhost:8002`) and returns the tool's reply, the
+    `{"statuses": {...}}` mapping `extract_statuses` reads. Any failure
+    raises `StatusFetchUnavailable` naming the URL.
+
+    *project_root* is resolved to an ABSOLUTE path here, at the wire, for
+    every consumer at once: the server resolves the argument against its own
+    cwd, and fused-memory's `_normalize_project_root` rejects a relative
+    path. An absolute root is sent unchanged.
     """
-    # THE ROOT-CAUSE FIX (task 3291). The MCP argument is resolved by the
-    # server process, not this one, so a relative path is not merely
-    # fragile -- fused-memory's `_normalize_project_root` rejects it
-    # outright with {"error": "project_root must be a non-empty absolute
-    # path, got: '.'", "error_type": "ValidationError"}. That envelope rides
-    # an `isError: false` JSON-RPC response, so it used to sail through
-    # `_extract_tool_result` and get counted as a done-count of 0.
-    #
-    # In production this call ALWAYS carried a relative path: census.py's
-    # CLI defaults --project-root to "." and nightly._default_census_launcher
-    # (nightly.py:521) launches census.py with no arguments at all.
-    #
-    # Resolving HERE, at the wire boundary, rather than at each CLI
-    # entrypoint, fixes every consumer at once -- census.py's main(), the
-    # nightly trickle's decide_for_project, and the `evaluate` CLI all build
-    # their fetcher through this one function. Fixing it at the CLIs instead
-    # would need lockstep edits with the same silent-failure risk this
-    # module already single-sources MCP_STREAMABLE_HTTP_HEADERS to avoid.
-    #
-    # census.py's own Path(args.project_root) stays relative-friendly: it is
-    # used for local filesystem access (config, codebook, report, state),
-    # where a cwd-relative path resolves correctly in-process. Only the
-    # over-the-wire argument was ever broken.
     project_root_str = str(Path(project_root).resolve())
-    url = os.environ.get(_FUSED_MEMORY_URL_ENV_VAR, _DEFAULT_FUSED_MEMORY_URL)
+    base_url = os.environ.get(_FUSED_MEMORY_URL_ENV_VAR, _DEFAULT_FUSED_MEMORY_URL)
 
     def _fetch() -> dict:
         try:
-            import httpx
-        except ImportError as exc:
-            raise StatusFetchUnavailable("httpx is not installed") from exc
-
-        try:
-            response = httpx.post(
-                f"{url}/mcp",
-                json={
-                    "jsonrpc": "2.0",
-                    "id": 1,
-                    "method": "tools/call",
-                    "params": {
-                        "name": "get_statuses",
-                        "arguments": {"project_root": project_root_str},
-                    },
-                },
-                # Required by the streamable-HTTP MCP transport (see
-                # MCP_STREAMABLE_HTTP_HEADERS above for why both values
-                # matter); omitting it 406s before the tools/call is
-                # dispatched.
-                headers=MCP_STREAMABLE_HTTP_HEADERS,
-                timeout=10.0,
-            )
-            response.raise_for_status()
-            return _extract_tool_result(response.json())
-        except StatusFetchUnavailable:
-            raise
-        except Exception as exc:  # noqa: BLE001 - any failure must fail safe
+            with SyncMcpSession(
+                base_url, client_name="legibility-census-outcome-feed", timeout=10.0,
+            ) as session:
+                return session.call_tool("get_statuses", {"project_root": project_root_str})
+        except McpCallError as exc:
             raise StatusFetchUnavailable(
-                f"get_statuses unreachable at {url}: {exc}"
+                f"get_statuses unreachable at {base_url}: {exc}"
             ) from exc
 
     return _fetch
@@ -775,81 +566,124 @@ def default_status_fetcher(project_root: str | Path):
 # decide_for_project — high-level assembly (config + state + codebook signal)
 # ---------------------------------------------------------------------------
 
+def _floor_anchor(
+    read: state_docs.Missing | state_docs.Ok[census_state.CensusState],
+    *,
+    earliest_codebook_date: datetime | None,
+) -> FloorAnchor | None:
+    """The instant the floor is measured from: the session watermark, else
+    midnight UTC of last_census_at, else, for a never-censused project, the
+    earliest codebook date."""
+    match read:
+        case state_docs.Missing():
+            if earliest_codebook_date is None:
+                return None
+            return FloorAnchor(FloorAnchorKind.EARLIEST_CODEBOOK_DATE, earliest_codebook_date)
+        case state_docs.Ok(value=state):
+            if state.session_watermark is not None:
+                return FloorAnchor(FloorAnchorKind.SESSION_WATERMARK, state.session_watermark)
+            if state.last_census_at is None:
+                return None
+            return FloorAnchor(
+                FloorAnchorKind.LAST_CENSUS_AT,
+                datetime.combine(state.last_census_at, time.min, tzinfo=UTC),
+            )
+        case _:
+            assert_never(read)
+
+
 def decide_for_project(
-    project_root: str | Path,
+    cfg: LegibilityConfig,
     *,
     now: datetime | None = None,
-    status_fetcher=None,
+    completion_runner: CompletionRunner = run_completion_check,
 ) -> Decision:
-    """Assemble the full §6/§8.5 census-trigger Decision for `project_root`:
-    loads the `census:` config (§7.4), the census state (§7.5, extended),
-    and the codebook novelty signal (task γ), computes the tasks-landed
-    delta via `status_fetcher`, and calls the pure `evaluate()` core. This
-    is what task ε's nightly trickle imports and what the `evaluate` CLI
-    subcommand below calls.
+    """Assemble the census-trigger Decision for *cfg*'s project: the census
+    state, the codebook novelty signal and the previous run's completion
+    (its run id read from the census state), fed with *cfg*'s census
+    thresholds to the pure `evaluate()` core. The nightly trickle, census.py's
+    gate and the `evaluate` CLI all decide through here.
 
-    `now` defaults to the current UTC time. A malformed census state
-    short-circuits to a fail-safe `Decision(fire=False, ...)` immediately
-    (before touching the codebook or `status_fetcher`) -- `load_census_state`
-    has already logged its one WARNING, so nothing else needs to.
+    The thresholds are the validated config's, so there is no config fallback
+    left. *now* defaults to the current UTC time. A malformed census state
+    short-circuits to a NO-FIRE Decision with no completion, before the
+    codebook or the completion check is touched -- `census_state.load` has
+    already logged its one WARNING.
+
+    This function NEVER raises. The census state, the codebook and the
+    completion check are each an operator-editable file or an external check,
+    so each is validated and degrades to a neutral value plus one WARNING,
+    taking out only the condition it feeds. `nightly.evaluate_census_step`
+    documents this guarantee; it is held here.
     """
-    project_root = Path(project_root)
-    now = now if now is not None else datetime.now(timezone.utc)
+    project_root = Path(cfg.project_root)
+    now = now if now is not None else datetime.now(UTC)
 
-    config = load_census_config(project_root)
-
-    state_status, state = load_census_state(
-        project_root / "docs" / "legibility" / "census-state.json"
-    )
-    if state_status == "malformed":
+    read = census_state.load(layout.census_state_path(project_root))
+    if isinstance(read, state_docs.Malformed):
         return Decision(
             fire=False,
             reasons=["census state is malformed -- failing safe (no fire)"],
         )
 
-    never_censused = state_status == "missing"
-
-    codebook_path = project_root / "docs" / "legibility" / "confusion-codebook.yaml"
+    codebook_path = layout.codebook_path(project_root)
     try:
         codebook_data = codebook.load(codebook_path)
         if not isinstance(codebook_data, dict):
             raise ValueError(f"expected a YAML mapping, got {type(codebook_data).__name__}")
         earliest_sighting, candidate_first_seens = codebook_signal(codebook_data)
-    except Exception as exc:  # noqa: BLE001 - a bad codebook must fail safe, not crash
+    except Exception as exc:  # a bad codebook must fail safe, not crash
         logger.warning("codebook at %s is unreadable: %s", codebook_path, exc)
         earliest_sighting, candidate_first_seens = None, []
 
-    if never_censused:
-        last_census_at = earliest_sighting
-    else:
-        raw_last_census_at = (state or {}).get("last_census_at")
-        last_census_at = (
-            datetime.fromisoformat(raw_last_census_at) if raw_last_census_at else None
-        )
-
-    tasks_landed = compute_tasks_landed(state=state, status_fetcher=status_fetcher)
-
+    completion = check_completion(
+        census_identity.prior_census(read).run_id,
+        project_root=project_root,
+        threshold_pct=cfg.census.completion_threshold_pct,
+        runner=completion_runner,
+    )
     return evaluate(
         now=now,
-        last_census_at=last_census_at,
-        never_censused=never_censused,
-        tasks_landed=tasks_landed,
+        floor_anchor=_floor_anchor(read, earliest_codebook_date=earliest_sighting),
+        completion=completion,
         candidate_first_seens=candidate_first_seens,
-        config=config,
+        config=cfg.census,
     )
 
 
 # ---------------------------------------------------------------------------
-# CLI — `evaluate --project-root <path>` (always exits 0; fail-safe, never
-# crashes the nightly trickle that calls this at the end of a run -- PRD
-# task ε)
+# CLI — `evaluate --project-root <path> [--config <path>]`
 # ---------------------------------------------------------------------------
 
-def _cmd_evaluate(args: argparse.Namespace) -> int:
-    project_root = Path(args.project_root)
-    status_fetcher = default_status_fetcher(project_root)
-    decision = decide_for_project(project_root, status_fetcher=status_fetcher)
+def _config_line(config_path: Path, cfg: LegibilityConfig) -> str:
+    census = cfg.census
+    novelty = census.novelty_spike
+    return (
+        f"config: {config_path} (project_root {cfg.project_root}) -- "
+        f"completion_threshold_pct={census.completion_threshold_pct} "
+        f"floor_days={census.floor_days} "
+        f"novelty_spike.count={novelty.count} "
+        f"novelty_spike.window_hours={novelty.window_hours} "
+        f"novelty_spike.multiple={novelty.multiple} "
+        f"novelty_spike.baseline_days={novelty.baseline_days}"
+    )
 
+
+def _cmd_evaluate(args: argparse.Namespace) -> int:
+    project_root = Path(args.project_root).resolve()
+    config_path = Path(args.config) if args.config else layout.config_path(project_root)
+    try:
+        cfg = load_config(config_path)
+    except Exception as exc:
+        print(f"census_trigger: failed to load config at {config_path}: {exc}", file=sys.stderr)
+        return 1
+    mismatch = project_root_mismatch(project_root, cfg, config_path)
+    if mismatch is not None:
+        print(f"census_trigger: {mismatch}", file=sys.stderr)
+        return 1
+
+    print(_config_line(config_path, cfg))
+    decision = decide_for_project(cfg)
     print(f"DECISION: {'FIRE' if decision.fire else 'NO-FIRE'}")
     for reason in decision.reasons:
         print(reason)
@@ -860,8 +694,9 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="census_trigger",
         description="Legibility periodic-census trigger evaluator "
-        "(plans/confusion-reduction-prd.md §6/§8.5). Always exits 0 -- "
-        "fail-safe, never crashes the nightly trickle.",
+        "(plans/census-incremental-prd.md C7). Exits 1 when the legibility.yaml "
+        "does not load or names another project_root than --project-root, else "
+        "0; an evaluation error prints NO-FIRE.",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -869,12 +704,17 @@ def main(argv: list[str] | None = None) -> int:
         "evaluate", help="evaluate whether the periodic census should fire"
     )
     evaluate_parser.add_argument("--project-root", default=".")
+    evaluate_parser.add_argument(
+        "--config", default=None,
+        help="Path to the project's legibility.yaml "
+        "(default: <project-root>/docs/legibility/legibility.yaml).",
+    )
     evaluate_parser.set_defaults(func=_cmd_evaluate)
 
     args = parser.parse_args(argv)
     try:
         return args.func(args)
-    except Exception as exc:  # noqa: BLE001 - never crash the nightly trickle
+    except Exception as exc:
         logger.warning("census_trigger evaluate failed unexpectedly: %s", exc)
         print(f"DECISION: NO-FIRE (evaluator error: {exc})")
         return 0

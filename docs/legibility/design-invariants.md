@@ -1,16 +1,40 @@
 # Design invariants
 
-A gate checklist, not an essay. These five invariants encode
+A gate checklist, not an essay. INV-1..INV-5 encode
 the agent-legibility survey's cross-cutting root causes
 (`plans/agent-legibility-survey-2026-07-13.md` §3) as named,
-checkable design-time questions. They will gate `/prd` decompose (G7,
-`skills/prd/references/gates.md`) and `/review` phase 2's cross-module
-audit — both consumers Read this doc at run time once sibling tasks
-β/γ wire the G7 section and phase-2 step (neither lands with this doc);
+checkable design-time questions; INV-6..INV-7 were added 2026-08-02
+from the task/escalation strand investigation
+(`docs/task-escalation-state-spec.md`); INV-8 was added 2026-08-06 from
+the reconciliation loop-blocking incident (task 3778); INV-9 was added
+2026-08-24 from the answered-but-unrecorded escalation investigation
+(esc-6107-7, plus five further instances measured 2026-08-22→24);
+INV-10 was added 2026-08-30 from the doc-guard reconciliation
+(task 4666); INV-11 was added by promoting `no-silent-fail-soft`,
+which this codebase had minted independently across 55 tracked files
+(measured on base eba215060c — a pinned measurement, not a live count:
+it grows as citations accrue) and cited as if canonical while no
+heading defined it (task 3803; rehearsal walked 2026-08-20); INV-12
+was added 2026-09-18 from the exception-register PRD's own incident
+evidence (`plans/inv12-exceptions-owned-or-ratified-prd.md`); INV-13 was
+added 2026-09-25 from the two-empty-ledgers investigation — four
+never-written ledgers, each with a live reader rendering emptiness as
+healthy (tasks 3790, 4863, 4718, 5890); INV-14 was added 2026-10-12 from
+the `/review-all` sampler-vocabulary finding (`fk-e86a10b9e217`, task
+6773); INV-15 was added 2026-11-21 from the merge lane's restart-lost
+un-chained mark (`plans/merge-pool-batches-prd.md` L7, task 11060). They
+gate `/prd`
+decompose (G7, `skills/prd/references/gates.md`) and `/review` phase 2's
+cross-module audit — both consumers Read this doc at run time;
 it is the single normative copy (no restatement, per INV-5). Stable slug
 ids are load-bearing: G7 waivers, `/review`'s `invariant_findings`, and
 the confusion census's optional `invariant_violated` field all reference
-them. Numeric aliases INV-1..INV-5 are prose convenience only.
+them. Numeric aliases are prose convenience only.
+
+Adding or removing an invariant? Append/remove its trigger shape in
+`skills/prd/references/gates.md` §G7 **in the same commit** — that list is
+hand-maintained and has drifted twice (2026-08-02, 2026-08-06); task 3802
+mechanizes the pairing check.
 
 ## INV-1 `contracts-machine-checked`
 
@@ -78,7 +102,7 @@ an hour, who hears about it, and via what counter?
 (`one-shot-subagent-contract`, 17); curator degrade-to-create; 1755
 storm-counter precedent.
 
-**House pattern**: Consecutive-streak gate (`merge_liveness.py`, generalized
+**House pattern**: Consecutive-streak gate (`merge_lane/liveness.py`, generalized
 by 2558); storm counter (1755); LLM-adjudicated guard failing safe to
 strict.
 
@@ -93,25 +117,532 @@ or prompt text that must stay in agreement with another site? What is the
 shared-helper / render-from-code alternative?
 
 **Survey evidence**: `canonical_queued_branch_name` un-normalized site
-(`server.py:1000`); already-merged guard duplicated until 5026;
-sibling-tool envelope divergence; hand-transcribed prompt text drifted
-twice in one file.
+(`escalation/src/escalation/server.py::merge_request`); already-merged
+guard duplicated until 5026; sibling-tool envelope divergence;
+hand-transcribed prompt text drifted twice in one file.
 
 **House pattern**: Extract helper (`canonical_queued_branch_name`); render
 prompts/examples from live schemas (2559) with drift/pinning tests.
 
+## INV-6 `status-matches-liveness`
+
+**Rule**: A status implying active ownership (`in-progress`) is legal only
+while a live claimant exists. Every exit from a claimed state writes its
+successor status through the transition's designated choke point *before*
+the claim is released, and any operator-facing aggregate of "active work"
+reconciles against the enforcing ground truth (live slots / claimants),
+alarming on divergence. Sweeps are crash backstops — never a path's
+designed exit.
+
+**Checkable design question(s)**: Does any exit/bail/park/requeue path in
+this feature leave a task in a status whose implied owner is gone
+(claimant released, no steward)? Which choke point writes the successor
+status, and what test pins every exit? If the feature counts or surfaces
+"active" tasks, can a stranded row be counted as active without an alarm?
+
+**Evidence**: Path B merge-entry bail — 9 tasks stranded 13-52h, 7 pinned
+by their own dead-steward L0 (`docs/task-escalation-state-spec.md`
+§8-E1); `_OUTCOME_ALLOWED`'s IN_PROGRESS-bearing entries as documented
+strand windows (E10); burndown `in_progress` exceeded
+`max_concurrent_tasks` in 859/7871 snapshots (peak 33 vs 24) with no
+parity alarm (E12).
+
+**House pattern**: claimant columns + `is_stranded` oracle
+(task-status-authority D4); `_mark_blocked` sole-writer choke point; W9
+SM-2 run()-exit consistency check, made loud per spec §5; spec §5
+outcome contract.
+
+## INV-7 `holds-owned-and-bounded`
+
+**Rule**: Every hold on a non-terminal task — a parked status, an open
+escalation pinning recovery, a wait loop — names a machine-readable owner
+(the actor that will exit it unprompted) and carries a bound: a deadline
+or progress-refreshed idle window for automation waits, a streak/cap
+escalation for repeating suppressions, or a supervised consumer plus age
+surfacing for queue-backed handoffs. `park` is the only sanctioned
+unbounded hold. A hold that vetoes recovery emits a structured fact
+naming the pinning record (INV-2 applied to holds).
+
+**Checkable design question(s)**: For each held state this feature
+introduces or touches: who exits it, what bounds it, and where does an
+operator see the hold with its reason? If the exit owner dies (process
+exit, the 8h fleet redeploy), which mechanism notices — and does the
+hold's record survive or expire coherently across restart?
+
+**Evidence**: the any-level recovery veto held tasks 13-52h in silence —
+211 `reverted` log lines, zero non-revert explanations
+(`docs/task-escalation-state-spec.md` §8-E7/E12); the merge-halt
+unbounded `_escalation_event.wait()` (E3); an L2 queue at 70 pending and
+not draining turns "held pending human" into "held indefinitely" with no
+age alarm.
+
+**House pattern**: steward-wait idle window (task 3170) —
+progress-refreshed deadline + escalation-of-escalation; orphan-L0 reaper
+(`orphan_l0_timeout_secs`); watcher-outage L2 tripwire; `park` →
+`blocked` + open L2 as the explicit unbounded marker (task 1792);
+gate-backlog age reporting (tasks 3520-3522).
+
+## INV-8 `loop-thread-occupancy-bounded`
+
+**Rule**: In a long-lived async process, no coroutine occupies the
+event-loop thread for an unbounded time. Any call that can block
+(subprocess, network, filesystem, lock, sleep) is either non-blocking or
+offloaded (`asyncio.to_thread`/executor); AND any per-item work that can
+block or whose per-item cost is non-trivial, fanned out over a collection
+whose size is not already bounded by an upstream contract (pagination, a
+config cap, a fixed enum), has its loop-invariant part hoisted out of the
+body and its item count explicitly bounded. Neither limb alone bounds
+occupancy — offloading an unbounded fan-out still burns unbounded wall
+clock, and capping a still-blocking fan-out still stalls the loop — so a
+fan-out tripping both needs both fixes. A cheap, fully non-blocking loop
+over an upstream-bounded collection trips neither.
+
+**Checkable design question(s)**: For each coroutine this feature adds or
+touches: what is the worst-case wall time it holds the loop thread, and
+what makes that case worst rather than typical? If it iterates a
+collection doing work that can block or is non-trivial per item, who
+bounds that collection's size — "already bounded upstream" is complete
+on its own only for small bounds (a fixed enum, a single-digit config
+cap); for anything page-sized or configurable, state the numeric bound
+and the worst-case per-item cost, because the product, not the existence
+of a bound, answers the question (this repo's own pagination contract
+permits page_size 2000; 2000 × 30 ms of fully non-blocking per-item CPU
+still holds the loop for ~60 s) — and which work
+inside the body is invariant across iterations? If it shells out, does
+the process spawn itself (fork/exec) run on the loop thread?
+
+**Evidence**: the renderer that task 3778 measured (today's home:
+`fused-memory/src/fused_memory/reconciliation/live_workflow_section.py::build_live_workflow_snapshot`,
+now an `async def`; it was `_render_live_workflow_section` in
+`fused-memory/src/fused_memory/reconciliation/stages/task_knowledge_sync.py`,
+a sync `def` called from `async def assemble_payload`) fanned three
+blocking `subprocess.run(['git', ...])` calls over the uncapped
+`filtered.active_tasks`: 56.7 ms/task × 514 (dark_factory) and
+82.7 ms/task × 525 (reify) => 29-43 s per render on the loop thread.
+`/health` went 12-35 ms idle -> 31-43 s under recon load; 184 freezes
+>=12 s over Aug 02-05. `asyncio.timeout(5)` could not fire because the
+loop enforcing it *was* the blocked thread. 726 of the sampled
+subprocesses were a byte-identical, render-invariant
+`git worktree list --porcelain`. (task 3778)
+
+That fix was correct; the CENSUS accompanying it was not, and it took three
+further batches to notice. Two methodology defects, both since confirmed
+against the live tree. (1) It enumerated the sites where the blocking
+PRIMITIVE is written and then made a per-MODULE offload claim —
+`services/recon_claim_verification_guard.py` was recorded as "already
+offloaded at its call sites", which was true of the callers it looked at and
+false of the others, so one offloaded caller made the whole module read as
+clean and every other caller was invisible. The census question is "which
+CALLERS reach this primitive without a hop", not "is this module offloaded".
+(2) It enumerated `subprocess.run` only, while the Rule above names
+filesystem and lock too; `read_text` and `yaml.safe_load` misses accounted
+for tasks 4091 and 4201 independently of (1). Tasks 4091 and 4201 each found
+live sites in that blind spot, and task 4484's caller-side re-run found 60 —
+including four same-shape `async def _maybe_*` registry loaders in
+`fused-memory/src/fused_memory/middleware/task_curator.py`, two of which had
+no task filed at all. (tasks 3778, 4091, 4201, 4484)
+
+**House pattern**: `asyncio.to_thread` at the boundary
+(`fused-memory/src/fused_memory/middleware/task_interceptor.py::_apply_status_transition`;
+`middleware/task_curator.py::curate_batch_prepared`); the async
+subprocess runner `orchestrator/src/orchestrator/git_ops.py::_run`;
+hoist the loop-invariant probe out of the body and bound the fan-out with
+an explicit cap that logs what it dropped (no silent truncation); loop-lag
+heartbeat firing above a threshold (INV-4 applied to scheduling).
+Mechanical enforcement now stands behind this slug:
+`tests/repo_guards/test_loop_blocking_gate.py` scans `fused-memory/src` caller-side
+(`tests/repo_guards/loop_blocking_scan.py::find_loop_blocking_sites`) and ratchets
+every coroutine call site reaching a blocking primitive against a
+dispositioned ledger, `tests/repo_guards/loop_blocking_allowlist.py`. A new site
+must be fixed or blessed with a stated reason in the same change, and a landed
+fix must delete its blessing. This is what the Census seam section below asks
+for when a slug is violated across repeated census batches — INV-8 was missed
+across three (3778, 4091, 4201) before the guard was filed as task 4484.
+
+## INV-9 `one-fact-one-home`
+
+**Rule**: A fact about the world — a design ruling, a premise, a state
+claim — has exactly one authoritative home; every other surface that
+mentions it carries a dated pointer (id + commit/date anchor) or is
+rendered from the home, never an independent copy. Where two surfaces
+must both assert it and cannot be collapsed, an explicit reconciliation
+mechanism (a cascade, a sweep, render-from-source) names which side wins
+and when it runs. INV-5 is this rule scoped to code/prompt text; INV-9
+is the same rule for world-facts across records and stores.
+
+**Checkable design question(s)**: Does this feature write the same
+world-fact into more than one record/store (task metadata, escalation
+record, PRD, manifest, memory, a session note)? Which surface is the
+home, and do the others point at it rather than restate it? If a copy is
+machine-read (a `delivered_check`, a gate predicate), what re-checks its
+premise against the home, and on what cadence? When the fact changes at
+the home, which mechanism updates or invalidates each copy — and if
+none, what is the accepted staleness window and who measures it?
+
+**Evidence**: esc-6107-7 — a ruled, implemented, measured design
+decision propagated into four sibling task descriptions but never into
+the escalation record, its cockpit DecisionRecord, or the PRD; the
+record sat answered-but-unrecorded 183h and a fresh session re-derived
+the settled answer. The 2026-08-22→24 watcher sweep measured five such
+records (category-agnostic), 30.2 answered-yet-open days, including a
+Leo-released, fully-verified fix (task 3875) not shipping for 6.8 days.
+A manifest `delivered_check` (`expect: absent`) actively enforced a
+premise that had become false. ~14 memory-corpus entries record the same
+decay family.
+
+**House pattern**: escalation record + git as the two homes for a ruling
+(ratified 2026-08-24); correction blocks citing `esc-id + commit +
+date`; ruling-time amendment (unblock SKILL.md Step 4) bumping
+`updated_at` to re-arm the watcher's re-verify; the ruled-elsewhere
+check + `scripts/member-chain-sweep.py` as the drift detector;
+`reap-decisions` closure-sync.
+
+## INV-10 `guards-exercise-behaviour`
+
+**Rule**: A guard exercises the behaviour it protects; it does not match
+text that describes it. Where the protected claim is an instruction or a
+recipe, the guard RUNS it against a fixture and asserts the outcome.
+Where nothing is runnable, it mirrors a marker-delimited span against the
+live artifact that span must agree with — a config value, a model, a
+family derived from its own source of truth — so that rewording moves
+nothing. A regex or substring over prose is not a guard: it pins wording
+rather than behaviour, goes red on edits that broke nothing, and carries
+an untested matcher whose characteristic failure is a silent green. This
+is INV-1 (`contracts-machine-checked`) applied to the checks themselves.
+
+**Checkable design question(s)**: Does this feature add a test or check
+whose assertion target is TEXT rather than behaviour? If what needs
+protecting is an instruction, a documented command, or a payload example,
+can it be EXECUTED against a fixture instead of matched? If it genuinely
+cannot, which live artifact does it mirror, and what delimits the span?
+If a matcher is unavoidable, what proves the matcher itself correct, and
+what goes red when it silently stops matching? Would fully rewording the
+surrounding sentence, with the mechanism unchanged, turn this check red —
+and if so, why is that the right behaviour?
+
+**Evidence**: eleven prose-pinning test modules or blocks were deleted on
+review between 2026-04-24 and 2026-08-25 — `4ed37e9367`, `d53cd62b68`,
+`3e8d369b24`, `10978d1ddc`, `9427896b8c`, `fabba102c7`, `d733c1bdc7`,
+`9c73deb78d`, `cb6d74359e`, `c3f8fa0b35`, `ba7fcffdbc` — the largest a
+769-line marker-anchored module whose revert message records that it
+"exercised no runtime behaviour". The predicted matcher bug is not
+hypothetical: task 4095's own guard scopes SHA derivations with a
+character class excluding the hyphen, so `skills/orchestrate/SKILL.md`'s
+`task/<task-id>` placeholder makes it report that runbook's CORRECT
+instructions as violations. The same failure reaches non-test checks —
+capability `qdrant-vector-access-for-ann` (task 3210) was gated by a
+file-scoped `grep` that would have reported DELIVERED had the parameter
+landed on the wrong function (`scripts/check_method_param_wiring.py`),
+and `docs/task-authoring.md`'s `delivered_checks` guidance states the
+same rule for that mechanism.
+
+**House pattern**: a three-tier ladder, in preference order. (1) EXECUTE
+the documented thing — `tests/scripts/test_package_source_lookup_convention.py`
+(task 3959) runs the recipe CLAUDE.md hands agents and asserts it resolves
+a real package. (2) MIRROR a marker-delimited span against the live
+artifact — `tests/scripts/test_contributing_lint_command_drift.py` (task
+3558) against `dark-factory-orchestrator.yaml`'s `lint_command`, and
+`tests/repo_guards/test_design_invariants_consistency.py` (task 3802) against
+this doc's own headings. (3) Nothing else: a substring/regex over prose is
+a finding, not a guard, and "harden the regex" is not a remedy. The
+reviewer's standing discriminator
+(`orchestrator/src/orchestrator/agents/roles.py::REVIEWER_COMPREHENSIVE`)
+is the same test stated from the other side — if fully rewording the
+surrounding sentence while keeping the mechanism leaves the check green,
+it is referential integrity rather than a wording pin.
+
+## INV-11 `no-silent-fail-soft`
+
+**Rule**: A failure or degradation is never indistinguishable from a clean
+success at the point of consumption. Every failure, fallback, coercion or
+partial-enumeration path either REFUSES (raises, errors, exits nonzero) or
+carries the degradation in the RESULT a caller sees — a named delta, a
+false completeness flag, an UNKNOWN/SKIP sentinel — never in a log line
+alone. A log is not a return value: the caller that must act on the
+shortfall is not the reader who would find it there.
+
+**Checkable design question(s)**: For each failure, fallback, coercion or
+partial-enumeration path this feature adds — what value does the caller
+receive, and can that value be told apart from the success value? If the
+answer is "the log says so", the path is silent. If it is "the caller gets
+fewer items", what tells the caller that fewer is not all?
+
+**Evidence**: Already machine-enforced per occurrence, with no slug to
+name it: `tests/repo_guards/test_silent_fallthrough_gate.py` lints all
+first-party source for `except (Exception|BaseException|bare):` returning
+an empty/None value with no WARN+ log and no re-raise, against the
+burn-down allowlist `tests/repo_guards/silent_fallthrough_allowlist.py`
+(scanner `tests/repo_guards/silent_fallthrough_scan.py`, PRD
+`plans/silent-fallthrough-dedup-prd.md`). The concept was ALSO minted
+independently as a bare phrase across 55 tracked files (measured on base
+eba215060c; the figure grows as citations accrue); where those citations
+reached for a number they split five to INV-2 and one to INV-4, and the
+INV-4 one needed both invariants in a single sentence because neither fit
+alone (task 3803).
+
+**House pattern**: refuse at the boundary
+(`fused-memory/src/fused_memory/backends/mem0_client.py`'s truncated-scroll
+raise rather than a short return; `escalation/src/escalation/classify.py`
+raising on an unmodelled status rather than folding it into `excluded`);
+carry the shortfall in the result
+(`fused-memory/scripts/census_memory_metadata.py`'s `coverage.complete =
+false` plus a NAMED entry in `coverage.deltas`, with a nonzero caller
+exit); SKIP is not ALLOW.
+
+**Family boundary**: INV-2, INV-11 and INV-4 are adjacent, and a walker has
+to pick exactly one. INV-2 `structured-facts-at-failure` constrains the
+SHAPE of a signal that already exists — structured facts at the failure
+point, not a log-scrape of what the emitter had in a variable. INV-11
+constrains its EXISTENCE, per occurrence: can the caller tell the returned
+value apart from the success value? INV-4 `storm-escape-required`
+constrains the AGGREGATE audibility of a fail-soft path deliberately
+RETAINED, and presupposes that path is legitimate. One occurrence is
+already an INV-11 defect, where INV-4 only asks about the hundredth.
+
+## INV-12 `exceptions-owned-or-ratified`
+
+**Rule**: For an allow-list that tracks exceptions to a rule intended to be
+uniform, every entry is either `Debt(owner)` — owner a live task or ticket:
+not `done`, `cancelled` or `deferred` — or `Policy(ratified)`, the id of a
+row in the ratification table
+(`docs/legibility/exception-ratifications.yaml`), for an exemption that is a
+deliberate permanent ruling rather than debt. No entry may be neither.
+Inline suppressions are in scope, under their own register and ratchet.
+Entries predating the register's seeding may carry no disposition, but their
+count may only fall, never rise; every entry added or touched after it
+carries one.
+
+**Checkable design question(s)**: Does this feature add or touch an
+allow-list, registry, or inline suppression whose entries silence a
+detector — a lint, a guard test, a census warning, an alarm, a sweep, a
+failure classifier, a finding pipeline? Suppressors are in scope; a list
+whose entries grant a capability (who may promote, what auto-heals, which
+fields hot-reload) is design, reviewed as design, and out of scope here. If
+it is a suppressor: where does each entry's disposition live — a cited live
+task, a cited ticket, or a ratification-table row id — and what notices
+when its owner dies?
+
+**Evidence**: `verify.py::_KNOWN_LOAD_FLAKE_NODEID_RES` (since retired, in
+b5bf73106e; the incident predates the retirement) carried an entry that
+outlived the task that owned it (2733, done 2026-07-18) with no owner
+recorded on the entry itself, and the same test recurred at task 4545's gate
+on 2026-09-06 (esc-4545-6); a missing-id check would not have caught this —
+only a **liveness** check would have. A register in the tree made that point
+checkable while it stood:
+`orchestrator/tests/test_timeout_marker_inversion_guard.py::_GRANDFATHERED`
+(since retired, in task 5149, its owner, which migrated the last entry)
+asserted every entry still named a live REFERENT — a real in-band site — while
+recording no owner on an entry at all: a dead referent failed, a dead owner
+did not. (A second register of the same shape, the
+serial-worker import guard's allowlist, went with that fixture in task 5034.) A census of the repo's named allow-lists found the same gap under
+tasks 4354, 4920 and 5215, each owning a burn-down that nothing connects to
+the entries it retires, so nothing notices when one of those tasks completes
+and entries remain.
+
+**House pattern**: `shared/src/shared/governed_exceptions.py` (the
+disposition vocabulary, the `governed_exceptions(...)` declaration and the
+inline-marker grammar), `shared/src/shared/ratchet.py` (the multiset ratchet
+kernel), `scripts/inline_suppressions.py` (the inline-suppression gate and
+ratchet over its committed baseline), `scripts/exception_register.py` (the
+exception register, the ratification-table loader and `--report`),
+`scripts/exception_owner_sweep.py` (the nightly owner-liveness sweep) and
+`docs/legibility/exception-ratifications.yaml` (the ratification table).
+Rationale: `plans/inv12-exceptions-owned-or-ratified-prd.md`. Operator
+runbook: `OPERATIONS.md` §12a.
+
+**Family boundary**: INV-7 `holds-owned-and-bounded` and INV-12 are
+adjacent — both ask who owns a thing and what notices when the owner is
+gone — but govern different objects. INV-7 governs held RUNTIME STATES: a
+parked status, an open escalation, a wait loop, legal only while a live
+claimant exists. INV-12 governs TREE-RESIDENT EXCEPTION LISTS: an allow-list
+entry or an inline suppression, legal only while its cited task or ticket is
+live, or it is explicitly ratified. A walker facing a park/wait/hold state
+checks INV-7; a walker facing an exception list or inline suppression checks
+INV-12.
+
+## INV-13 `readers-prove-their-producer`
+
+**Rule**: A reader over a store — a report, a gate, a health counter, a
+judge-prompt section, a dashboard view — lands only with evidence that its
+producer has written to that store in production: a row observed in the live
+store under the producer's real trigger, not a row a test seeded. If the
+producer lands in a later slice, the reader must render "no producer has
+written here" as a state distinct from "nothing happened", never as healthy.
+A cutover that moves a read source states its backfill decision per record
+kind: self-repopulating, migrated, or abandoned.
+
+**Checkable design question(s)**: Does this feature add or move a reader
+over a ledger, table or store? Name the producer and the trigger that fires
+it. Has that trigger fired in production, and did a row appear — measured,
+not assumed? If the producer is a different slice, what does the reader
+print until it lands, and can an operator tell "no producer wired" from "no
+events"? If a read source is cut over, does each record kind carry its own
+backfill decision, or is one kind's reasoning ("markers self-repopulate")
+silently applied to a kind it does not describe?
+
+**Evidence**: measured 2026-09-23 across every zero-row table under `data/`:
+six were healthy transient queues and four were never-written ledgers whose
+readers reported healthy. `recon_ledger` held zero `stage1_flag_suppression`
+rows fleet-wide since the task-2227 read-side cutover, whose no-backfill
+reasoning named only markers; `filter_suppressed` passed everything through
+while 41 stage-authored Mem0 records sat inert (task 4863). `runs.db::flake_debt`
+had zero rows while five tests had been suppressed; `orchestrator flake-ledger`
+printed `OPEN DEBT (no open debt)` and `unowned=0 status ok`, because "unowned"
+was derived from debt rows and a suppression without a row was invisible
+(task 3790). `reconciliation.db::journal_entries` was built by an agent loop
+whose sole caller discards the list, and the judge summarised the empty
+result into every review prompt (task 5890).
+`curator_events.db::invocations` had no `sqlite_sequence` row at all — never
+one insert — while a three-day curator outage went untraced (task 4718). In
+every case each call succeeded and the emptiness was honest; the healthy
+rendering was the defect.
+
+**House pattern**: `orchestrator/src/orchestrator/flake_report.py::compute_non_convergence`
+renders an open row without an owner as `*** NO OWNER (invariant breach) ***`
+rather than folding it into the healthy count; `orchestrator/src/orchestrator/flake_ledger.py::UNKNOWN_TEST_ID`
+counts an observation that names no test instead of dropping it. For the
+producer-has-written check, an AUTOINCREMENT table's `sqlite_sequence` row is
+the cheap probe: absent means never inserted, not merely empty now.
+
+**Family boundary**: INV-11 `no-silent-fail-soft` governs a failure a caller
+cannot tell from success at one call; INV-13 governs a reader whose producer
+never ran — no call fails anywhere. INV-10 `guards-exercise-behaviour`
+governs a guard that asserts prose instead of behaviour; INV-13's rejected
+proof is the fixture-seeded row, a guard-shaped mistake made by a reader. A
+walker facing a swallowed exception checks INV-11; facing a test of a check,
+INV-10; facing a report, gate or counter over a store, INV-13.
+
+## INV-14 `sampler-vocabulary-one-table`
+
+**Rule**: The load sampler's metric vocabulary has one declaring table,
+`sampler.metrics.METRIC_GROUPS`. The emitted names, the per-group admission
+sets, the gate-arm table, the calibration selectors and the dashboard's
+served metrics are projections computed from it. No other Python module
+spells a metric name, and a parity test between two spellings is not
+compliance. One known second spelling remains outside the guard's scope: the
+Host load card's presentation list (`METRICS` in
+`dashboard/src/dashboard/static/redux/tab_overview.jsx`), which renders only
+the names it lists; a served metric missing from it is not displayed.
+
+**Checkable design question(s)**: Does this feature add, rename or read a
+load-sampler metric, an admission rule, an arm-to-metric mapping, or a
+dashboard-served metric? Is it a projection of `METRIC_GROUPS`, or a new
+spelling that something must reconcile?
+
+**Evidence**: at `6551b75aba` the vocabulary had five homes and four
+reconciler tests, and the dashboard dropped unknown names silently
+(`fk-e86a10b9e217`, run `review-all-dark_factory-20261008`).
+
+**House pattern**: `sampler/src/sampler/metrics.py::METRIC_GROUPS`, with
+`arm_metrics`, `exact_metric_names` and `TICK_CLOCK` as its projections and
+`sampler/src/sampler/sampler.py::run_tick` admitting each group against its
+own entry; the guard `sampler/tests/test_vocabulary_one_table.py` drives a
+spec added to an injected table through every projection and AST-scans the
+consumers for a metric name spelled outside the table.
+
+**Family boundary**: INV-5 `no-lockstep-duplication` governs duplicated
+logic in general and accepts a drift test as a house pattern; this
+invariant governs one named vocabulary and rejects the drift test as its
+enforcement. INV-9 `one-fact-one-home` governs world-facts written to
+records; this governs a code vocabulary.
+
+## INV-15 `scheduling-state-survives-restart`
+
+**Rule**: In-memory state that changes which task or merge request is
+picked, batched or held, or how it is verified, has one declared restart
+disposition:
+
+- (a) **restored** from a named store;
+- (b) **rebuilt** from named rows;
+- (c) **dropped** by declaration, stating what happens after a restart and
+  citing an owner task or a row in
+  `docs/legibility/exception-ratifications.yaml`.
+
+State under (a) or (b) has a test that restarts through the public seam (a
+fresh instance over the same store) and observes the state again. State
+with no declaration is a violation even when losing it is harmless: silence
+is not (c). The three words are exactly restored, rebuilt and dropped, as
+task 11062's register uses them; its fourth value, "not scheduling state",
+is this rule's scope boundary.
+
+**Checkable design question(s)**: Does this feature add or touch an
+attribute, a module-level mutable or a field on an in-memory request that a
+pick, batch, hold or verify decision reads? For each one:
+
+- Which of (a), (b) or (c) is it, and where is that declared?
+- Under (a) or (b): which store or rows, who writes them in the same step
+  as the change, and which test restarts through the public seam and sees
+  the same decision?
+- Under (c): what is done differently after a restart, and which live task
+  or ratification row owns that?
+
+**Evidence**: the merge lane's un-chained mark
+(`orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker._next_dispatch_unchained`,
+task 10617; as of 2026-11-21) lives only in memory. Measured 2026-11-17 to
+11-19, all 31 red-batch members that were batched again before their solo
+verify had crossed an orchestrator restart (`plans/merge-pool-batches-prd.md` §2 and L7; counting
+rule in `plans/merge-pool-batches-prd.evidence/REPORT.md` §1). The same
+inventory (REPORT.md §5) found the conflict-bounce registry, the retry
+counters, an operator's halt and the redispatch park's front priority lost
+the same way, none of them declared.
+
+**Owners of the state that exists today** (as of 2026-11-21): the merge
+lane's scheduling state is task 11062's (PRD ι2: the lane's register, and
+a guard that fails on undeclared state);
+`orchestrator/src/orchestrator/scheduler.py::Scheduler`'s state is task
+11063's (PRD ι3: the design gate that rules its register). A `/review`
+finding on state that predates this invariant in either component is
+answered by that task, not filed again. State a change ADDS is that
+change's own.
+
+**House pattern**: (a) `orchestrator/src/orchestrator/guard_state.py::PersistentSet`
+for the write-on-every-mutation substrate. Its load fails open, which suits
+a one-strike guard; scheduling state restored through it must still surface
+a failed or corrupt load in a result (INV-11), as (b)'s `ok: false` row
+does.
+(b) `orchestrator/src/orchestrator/merge_halt_rehydration.py::rehydrate_merge_halt`,
+which re-asserts the WIP halts from preserved escalation records at start;
+and the rebuild design in `plans/merge-pool-batches-prd.md` §6.6 — a change
+row written in the same step as the change, a checkpoint row, and a rebuild
+row per start whose `ok: false` says the state started empty (INV-11).
+(c) The owner-or-ratification vocabulary of INV-12
+(`shared/src/shared/governed_exceptions.py`). A restart test constructs a
+fresh instance through the public constructor — for the lane,
+`orchestrator/tests/_merge_lane_fakes.py::make_lane` over the same store —
+and observes the decision, never a private attribute.
+
+**Family boundary**: INV-7 `holds-owned-and-bounded` asks of a HOLD who
+exits it and what bounds it; INV-15 asks of ANY in-memory value a
+scheduling decision reads — a mark, a counter, a window, a priority — what
+becomes of it at restart. A hold falls under both. INV-12
+`exceptions-owned-or-ratified` governs tree-resident exception lists; (c)
+borrows its vocabulary for runtime state. INV-13
+`readers-prove-their-producer` governs a reader whose producer never
+wrote; under (b), the rows are that producer. A walker facing a held state
+checks INV-7, and INV-15 as well when the hold lives only in memory; facing
+any other in-memory state a pick, batch or verify reads, INV-15.
+
 ## Census seam
 
 Incident records MAY carry an optional `invariant_violated: <slug>` field.
-The slug vocabulary is *this* doc — the five ids above. The coding pipeline
+The slug vocabulary is *this* doc — the ids above. The coding pipeline
 that populates the field is owned by `plans/confusion-reduction-prd.md`,
 which ships the field in its γ task and names this doc reciprocally in its
 §10 (Cross-PRD relationship). A slug violated repeatedly across census
 batches is an enforcement gap: file a guard task.
+Populating the field and checking its slugs are owned by
+`plans/census-incremental-prd.md` leaf L9 (as of 2026-10-05).
 
 ## Fixtures
 
 Calibration fixtures — two seeded violations per invariant plus a rehearsal
-verdict table exercising the as-landed G7 and `/review` phase-2 text — will
-live at `docs/legibility/design-invariants-fixtures.md` once sibling task ε
-lands (file not yet present as of this doc's landing).
+verdict table exercising the as-landed G7 and `/review` phase-2 text — live
+at `docs/legibility/design-invariants-fixtures.md` (landed 2026-07-14;
+INV-6/INV-7 fixtures added 2026-08-02; INV-8 fixtures added 2026-08-06;
+INV-9 fixtures added 2026-08-24; INV-10 fixtures added 2026-08-30;
+INV-11 fixtures added with the `no-silent-fail-soft` promotion; INV-12
+fixtures added 2026-09-18 with the `exceptions-owned-or-ratified`
+invariant; INV-13 fixtures added 2026-09-25 with the
+`readers-prove-their-producer` invariant; INV-14 fixtures added 2026-10-12
+with the `sampler-vocabulary-one-table` invariant; INV-15 fixtures added
+2026-11-21 with the `scheduling-state-survives-restart` invariant).

@@ -1,0 +1,545 @@
+# Task × escalation state graph — functional specification
+
+**Status:** normative — authored 2026-08-02 from the strand investigation
+(brief `2026-08-02-task-escalation-state-graph-spec`; research verified
+against working tree `c26d8dd6fa`, cites re-verified unchanged at
+`298556cc25`; adversarially reviewed — 15 attack findings folded in). This document states what the
+task-status × escalation-state graph **should** do — not what the code
+does. §8 lists where the code diverges today; the remediation PRD is
+`plans/task-escalation-state-graph-prd.md`. The invariants this spec
+grounds are `status-matches-liveness` (INV-6) and
+`holds-owned-and-bounded` (INV-7) in
+`docs/legibility/design-invariants.md` — that doc is the normative copy
+of the invariant text (INV-5: no restatement here).
+
+ARCHITECTURE.md §3/§6 remain the descriptive introduction; where the two
+disagree, this spec is the intent and the divergence is a defect (either
+doc or code). `shared/src/shared/task_transitions.py` (Table A),
+`escalation/src/escalation/action_effects.py` (Table B), and
+`orchestrator/src/orchestrator/task_ground_truth.py` (`_RECOVERY`) remain
+the sole machine-readable authorities per the task-status-authority PRD
+D1 and program decision #4 — this spec constrains their *content*, it is
+not a fourth table.
+
+## 1. Definitions
+
+- **Claimant / liveness.** A task is **claimed** when `claimant_run_id`
+  is set and `heartbeat_at` is fresh within TTL — the columns and the
+  `is_stranded` predicate in `shared/src/shared/task_claimant.py` are the
+  canonical oracle (task-status-authority D4). For statuses outside
+  `in-progress` (which `is_stranded` deliberately gates on), the
+  status-agnostic claimant-liveness core is the oracle — two consumers
+  must never disagree about the same row's liveness because they chose
+  different status-gated wrappers. **Stranded** = non-terminal, status
+  implies activity, no live claimant.
+- **Hold.** Any condition that keeps a non-terminal task from
+  dispatching or completing: a parked status, an open escalation that
+  pins recovery, a gate, a wait loop.
+- **Handoff.** An escalation record whose consumer tier is expected to
+  act: L0 → the per-task steward, L1 → the auto-watcher rotation, L2 →
+  human (ARCHITECTURE.md §6).
+- **Live handoff vs dead record.** An L0 is a live handoff **only while
+  its steward/workflow process lives** — stewards are in-process, and the
+  fleet redeploys on an 8h clock, so an open L0 with no live workflow is
+  a dead record, not a handoff. L1/L2 records are queue-backed handoffs:
+  durable, with supervised consumers (the watcher rotation and its
+  outage tripwire; the human attention surfaces). This distinction is
+  load-bearing for §3-S6: 7 of the 9 tasks stranded on 2026-08-02 were
+  pinned by their **own dead-steward L0**.
+
+## 2. Competing demands this spec holds simultaneously
+
+The graph serves many constituencies; prior incidents show each demand
+below being individually reasonable and jointly conflicting. The spec's
+resolutions are §3; the mapping demand → resolution is §6.
+
+1. Never second-guess a deliberate handoff (open escalation = someone is
+   nominally on it).
+2. Never strand (a task not making progress is visibly not making
+   progress, with an owner and an exit).
+3. Never phantom-done (recovery flips to `done` only on positive,
+   attributed, provenance-carrying evidence).
+4. Preserve WIP (branch, worktree, `.task/plan.json`, warm-lane session)
+   across parks and blocks.
+5. Merge-train parking: the train worker owns `merge-deferred` rows.
+6. Infra hold: resume-at-verify without re-competing for footprint.
+7. Deterministic gates: born-at-L2 quiescence — `blocked` and
+   un-dispatched while the L2 is open.
+8. Escalation dedup: the open record IS the dedup key; recovery must not
+   force re-files or stack duplicates.
+9. Restart survivability: in-memory state dies every ≤8h; on-disk state
+   can go stale; L0s are amnestied at startup, L1/L2 survive.
+10. Throughput: a stranded task starves its dependents — fleet-scoped,
+    since cross-project external deps read these statuses live.
+11. Escalation records are load-bearing ownership tokens elsewhere
+    (merge-halt rehydration scans preserved L1s) — records must not be
+    auto-expired or auto-resolved by recovery.
+12. Anti-churn: requeue caps, the signature-keyed reblock guard, and
+    park-and-stop all count status flips; recovery must not fight them.
+13. Every done-flip passes the delivered-checks gate and provenance
+    integrity; "held awaiting provenance arbitration" (`stale_conflict`)
+    is a legitimate third disposition.
+
+## 3. Core principles (the resolutions)
+
+**S1 — Truthful liveness.** `in-progress` means exactly: a live claimant
+owns this task. That covers a running pipeline and a workflow waiting
+in-slot on its steward (Path A) — both hold a fresh heartbeat. No exit
+path may leave `in-progress` behind after the claimant is released.
+Every `run()`/slot exit writes its successor status through the
+transition's designated choke point **before** the harness nulls the
+claimant. Sweeps are crash backstops, never a path's designed exit ("the
+stranded sweep will pick it up" is a forbidden design).
+
+**S2 — Single writer per transition class.** Each transition class has
+one choke point (`_mark_blocked` for failure-parks, `mark_done` +
+provenance for done, the train worker for `merge-deferred` exits, Table
+B effects for resolution actions). A path that needs a new exit shape
+extends the choke point; it does not write status ad hoc or skip the
+write.
+
+**S3 — Parks are visible and owned.** A task waiting on an escalation
+with no live workflow is `blocked` (or its dedicated park status:
+`merge-deferred`, `infra-hold`) — never `in-progress`. The standing
+invariant `blocked ⇒ open escalation record or gate marker` is hereby
+documented (it held empirically 52/53 on 2026-08-02; the deterministic
+MILESTONE carve-out is the sanctioned exception). The record is
+simultaneously the dedup key, the ownership token, and the wake edge:
+resolution events flip `blocked` rows via Table B — so any hold
+expressed as `blocked` + open record inherits the whole existing exit
+machinery (resolve actions, blocked-redispatch on close, b3 auto-unblock,
+needs-attention surfaces) for free.
+
+**S4 — Handoffs are honored by conversion, not by silence.** When
+recovery meets a stranded row that carries an open escalation, it
+neither reverts it to `pending` underneath the responder (demand 1) nor
+leaves it stranded (demand 2): it **converts the row to `blocked`**,
+attributed to the pinning record — no new escalation filed (demand 8),
+WIP preserved (`blocked` is workflow-preserve, demand 4), and a
+structured fact emitted naming task, decision, and pinning escalation
+ids (INV-2). Conversion re-couples the strand to the escalation ladder's
+existing ownership and wake edges (S3) instead of inventing a new
+consumer loop. A stranded row with **no** open escalation takes the
+record-free dispositions exactly as today: revert to `pending`, `done`
+with provenance via S7, or — for the verified-green stranded-blocked
+shape — the stranding-remediation-α merge-queue-direct path.
+
+**S5 — Bounded unless parked.** Every hold carries a bound: a deadline
+or progress-refreshed idle window for automation waits (the task-3170
+steward-wait pattern), a cap/streak escalation for repeating suppressions
+(INV-4), or a supervised consumer + age surfacing for queue-backed
+handoffs. `park` (human, L2 kept open) is the **only** sanctioned
+unbounded hold — the explicit "deliberately forever" marker. An unbounded
+`await` on an escalation event with no deadline is a defect.
+
+**S6 — Recovery discriminates record class, never `bool(open)`.** The
+"does an open escalation pin recovery?" predicate is **one shared
+function**, consumed by every sweep and gate (INV-5). It distinguishes:
+(i) the task's own gating L0 whose **filing incarnation** is dead — a
+dead record, not a handoff: recovery converts per S4 and the orphan-L0
+reaper promotes it for visibility. Liveness of a handoff is judged
+against the incarnation that *filed* the record (escalation references
+carry the filing claimant/session identity), not against "some workflow
+for this task is alive" — a newer incarnation never keeps a prior
+incarnation's unconsumed L0 alive, and the reaper promotes on
+filing-incarnation death regardless of newer live workflows;
+(ii) queue-backed L1/L2 — a real handoff: hold as
+`blocked` (S4), bounded by the ladder's consumer supervision and age
+surfacing; (iii) `info`-severity records — never pin anything. A record
+with missing or out-of-vocabulary severity **fails safe to pinning**
+(treated as a handoff), never to conversion. Severity
+and level must therefore travel with every escalation reference
+(`EscalationRef` carries them); a predicate that cannot see severity
+cannot implement this spec. **Store correctness is part of the
+predicate's contract** (the esc-3163 wrong-store lesson): the records
+are read from the task's owning orchestrator's escalation store — the
+same instance the harness files into, never the reconciliation store —
+and "store unavailable / read failed" is a distinguishable third
+result, mapped to LEAVE plus a structured
+`recovery_left(reason=escalation_store_unavailable)` emission. It is
+**never** collapsed into "no records", because under S4 a false `[]`
+would route a genuinely-pinned strand into the plain revert branch —
+the precise demand-1 violation conversion exists to prevent.
+
+**S7 — Done only with provenance.** Unchanged from
+found-on-main-provenance-integrity and delivered-checks: recovery may
+flip to `done` only through `MARK_DONE_WITH_PROVENANCE` with the
+capability gate consulted; conflicting evidence yields `stale_conflict`
+(held, in-progress, awaiting arbitration) — a legitimate tri-state, not
+a failure to decide.
+
+**S8 — Surfaces tell the truth.** Live, stranded, and held-by-escalation
+must be distinguishable on every operator surface that shows activity:
+task rows carry claimant/heartbeat-derived state, escalation views mark
+records that pin a task's recovery, and any aggregate presented as
+"active work" reconciles against the enforcing ground truth (live slots
+vs rows-by-status), alarming on divergence instead of silently counting
+strands as activity.
+
+## 4. The state × owner table (normative)
+
+Every non-terminal state names the actor that owns its exit and the
+bound on the hold. "Owner" = the component that will, unprompted, move
+the task out of this state.
+
+| Status | Means exactly | Entry writer(s) | Exit owner | Exit triggers | Bound |
+|---|---|---|---|---|---|
+| `pending` | dispatchable when gates pass | submit/curator; requeue writers; resolution actions; recovery revert | scheduler | dispatch (pending-only by design) | starvation/fairness ladder; dispatch gates are visible per-tick |
+| `deferred` | parked off the scheduler with a recorded hold (`metadata.deferral`) | `planning_mode` submit (server stamps `planning`); any caller via `set_task_status` with a `deferral` record (`carried_by` / `until_condition` / `held_by_session`) | whoever the record's kind names: the planning session, the carrier's human, the human judging an `until_condition`, the holding session; for a `legacy_unknown` row, the human the census surfaces it to; for a dead holder or lapsed `expires_at`, the deferral sweep (task 6526, not yet landed) | `set_task_status(pending)`, or a direct `done`/`cancelled` write; `commit_planning` for `planning` holds and unrecorded rows; sweep release (not yet landed) | age surfacing by the deferral census (`scripts/deferral_census.py` over `shared/src/shared/task_deferral.py::needs_human`; `/review-briefing` check 6); the holder lease and `expires_at` once the sweep lands. Not tied to a planning session. Kinds, refusals and release rules: `docs/task-authoring.md` §9 "Deferring a task" |
+| `in-progress` | a live claimant owns it (running, or Path-A escalated-waiting) | the dispatching workflow (claim stamp + heartbeat) | the workflow slot | `run()` outcome via its choke point (S1/S2) | heartbeat TTL; steward-wait idle window (task 3170) for the escalated case |
+| `blocked` | parked with an open escalation record or gate marker that owns re-entry (S3) | `_mark_blocked`; Table B `park`; deterministic gate; recovery conversion (S4) | the record's consumer tier (L0 steward / L1 watcher / L2 human); scheduler blocked-redispatch after close | resolve actions (Table B); redispatch when record closed + deps clear | ladder promotion (L0 reaper 600s); watcher supervision + outage tripwire; L2 age surfacing; `park` = explicit unbounded |
+| `merge-deferred` | parked in an atomic train; train worker owns it | train park choke point | group-merge worker | train lands / fails / re-drives | train terminal outcome (worker supervised; queue state durable and rehydrated across restarts — two-layer merge queue) |
+| `infra-hold` | parked for infra weather; resume-at-verify without re-compete | `_mark_blocked(block_status='infra-hold')` | infra-resume machinery (cascade on resolution) | resume-at-verify | `max_consecutive_infra_resumes` |
+| `review` | *(residue — zero code writers; retained only so human writes are not rejected; candidate for retirement, §8-E14)* | human | human | human | *none — a knowingly non-conforming S5 residue, tolerated only pending the E14 retirement decision* |
+
+**Status × escalation-state legality.** `in-progress` may coexist with
+open escalations **only** while the claimant is live (Path A's steward
+wait; a run that filed an info record and continued). `in-progress` +
+open escalation + no live claimant is illegal beyond one sweep interval
+— the sweep converts it (S4). `blocked` requires an open record or gate
+marker; `blocked` with neither is a strand of the blocked shape and is
+owned by the blocked-redispatch sweep. Terminal statuses may carry open
+records transiently (operational closes race task_kind coercion); the
+escalation queue's own hygiene owns closing them.
+
+## 5. The outcome contract
+
+`WorkflowOutcome` → allowed exit status-row, as the spec requires it
+(the code's current loose table and the paths that force each loosening
+are in §8):
+
+| Outcome | Row at exit (spec) | Rule |
+|---|---|---|
+| `done` | `done` — or `cancelled` reported as CANCELLED | a producer observing a cancelled row returns CANCELLED, never DONE |
+| `blocked` | `blocked` / `infra-hold`; steward terminal decisions (`cancelled`/`deferred`/`merge-deferred`) reported distinctly or via the preserve carve-out | every BLOCKED exit passes `_mark_blocked` (or the documented preserve guard); no BLOCKED exit leaves `in-progress` |
+| `escalated` | `blocked` | ESCALATED is an *internal* condition handled by the escalated-wait machinery (steward, bounded); a run() **exit** with ESCALATED means the wait concluded in re-escalation → `_mark_blocked` ran. No steward-less ESCALATED exit exists |
+| `requeued` | `pending` | the producer (or its choke point) writes `pending` before exit; no "deferred-to-stranded-sweep window" |
+| `merge-deferred` | `merge-deferred` | unchanged |
+| `cancelled` / `soft-cancelled` | the cancel choke point's written status (`cancelled`, or the park/teardown target); never silently "wherever it was" for designed (non-crash) paths | crash-shaped cancels are the sweep's legitimate backstop case |
+| `planned` | *(internal-only; never a run() exit — drop from the exit contract)* | |
+
+Two sanctioned relaxations (races are real): every row additionally
+admits an **observed terminal** reported as that terminal (a concurrent
+out-of-band cancel/complete wins; the producer reports what it
+observed), and a **status-write failure at exit** (store down, typed
+rejection after retries) reclassifies the exit as crash-shaped — the
+sweep's sanctioned backstop — emitting **one** structured
+store-unavailable record, not a per-task contract-violation storm.
+
+Violations of this contract at run()-exit are otherwise **loud**: the
+consistency check escalates (files a structured record) rather than
+degrading to a mislabeled synthetic report (INV-4; today's soft-fail is
+§8-E11).
+
+Because the current loose entries are live-enforced expectations (SM-2
+asserts them in-process; the store enforces Table A transitions with
+`enforce_transitions: true` since 2026-07-14), **tightening lands
+log-mode-first behind a soak, and only after the producer fixes land**
+(task-status-authority D6 precedent; deploy per D8).
+
+## 6. Demand → resolution map
+
+| Demand (§2) | Resolved by |
+|---|---|
+| 1 handoff vs 2 never-strand | S4 conversion + S6 record-class discrimination: live handoffs hold as visible `blocked`; dead records don't pin; nothing is reverted under a responder; nothing stays stranded |
+| 3 phantom-done | S7; plus the recovery-veto family stays for done-flips (any non-info open record still vetoes MARK_DONE — that half of the veto is correct and keeps its protective rationale) |
+| 4 WIP | S4 converts to workflow-preserve `blocked`; lanes/branches/plan.json untouched; warm-lane holding policy unchanged |
+| 5 train / 6 infra / 7 deterministic gates | dedicated park statuses with named owners (§4); S4 conversion never touches them (`merge-deferred`, `infra-hold` are not strand shapes; deterministic quiescence rides `blocked` + open L2 per S3) |
+| 8 dedup | S4 files nothing new; the existing record moves with the task into `blocked`; `has_open_l1`-keyed re-file logic sees the same record |
+| 9 restart survivability | status + record are durable; conversion is idempotent and recomputable from (status × claimant × open records) at startup; L0 amnesty interplay: a strand whose L0 was amnestied has no record → plain revert path (S4's else-branch) |
+| 10 throughput | conversion → `blocked` → record resolution → existing redispatch; dependents unblock at ladder latency instead of never; Path B's producer fix (§8-E1) removes the dispatch-burn loop entirely |
+| 11 records as ownership tokens | S4/S6 never resolve, expire, or dismiss records; only consumers do |
+| 12 anti-churn | conversion is not a blocked→pending flip (charges no reblock counter) — but it IS a blocked *transition*, so the conversion writer is excluded from the park-and-stop window (else converting an accumulated backlog trips a false storm and pauses the scheduler) and carries its own INV-4 streak counter; and because the startup L0 amnesty can dissolve a converted row's pin, the **sweep-driven** blocked→pending flip must charge the same signature-keyed counter the cascade flip charges — otherwise strand→convert→amnesty→flip→re-strand cycles at the 8h fleet period with every cap reading zero |
+| 13 tri-state done | S7 keeps `stale_conflict` |
+
+## 7. Recovery & sweep contract
+
+1. **One classifier.** `_RECOVERY` (TaskGroundTruth) stays the single
+   classification table (W10 TG-2); the escalation-pin predicate inside
+   it is the one shared function of S6. Sweeps and gates dispatch on the
+   classifier's action — they do not re-derive policy in guard order.
+2. **The missing shapes get explicit rows.** `(in-progress, no live
+   claimant, open-escalation)` → CONVERT_TO_BLOCKED (S4) for **all four**
+   branch states — `EXISTS_OFF_MAIN`, `GONE_NO_MARKER`, **and**
+   `ON_MAIN` / `GONE_WITH_MERGE_MARKER` (a landed-but-pinned row converts
+   too: the record closes → redispatch → the any-level dispatch gate
+   completes it with provenance; leaving it would violate demand 2 while
+   S7 correctly keeps the done-flip veto). No shape falls to a silent
+   LEAVE default: an unenumerated shape is itself a loud structured fact
+   (INV-2). Conversion mechanics: **clear the claimant before the status
+   write** (so every liveness oracle agrees the row is unclaimed) and
+   **re-read (status, claimant, record-open) immediately before writing**
+   (INV-3 CAS) — on any mismatch (record resolved, row re-pended, live
+   claimant) fall to the matching other branch, never clobber.
+3. **Every veto/LEAVE emits.** A structured event
+   (`recovery_vetoed`/`recovery_left` with task id, shape, pinning
+   record ids + ages) — never a bare `return None`/`continue`. A streak
+   of N identical vetoes on one task escalates (INV-4). An unreachable
+   or wrong escalation store is its own emitted LEAVE reason, never an
+   empty-records result (S6).
+4. **Wake edges.** Converted rows ride the existing
+   resolution-event → cascade wake for `blocked` (demand-free: no new
+   machinery). `resume` acts on claimant-liveness, not on
+   `status == 'blocked'` string equality (completes task-status-authority
+   goal 5 / B2), and the L0-resolution path must reach orphaned rows
+   (the level ≥ 1 gate assumed every L0 has a live workflow — false for
+   any crash between file and exit).
+5. **Producer fixes precede sweep hardening.** The sweep-conversion is
+   the backstop; the designed exits (§5) are the fix. Order of landing:
+   emission (observability) → producer fixes → conversion log-mode →
+   conversion enforced → table tightening, each behind the D6/D8 gates.
+6. **Orphaned parks get re-owned.** A `blocked` or `infra-hold` row with
+   no open pinning record, no gate marker, and no live claimant has lost
+   its exit owner (crashed cascade, amnestied/close_only'd record) — a
+   startup/periodic invariant re-owns it (re-pend, or the existing
+   re-file row) instead of leaving a permanently silent hold. The
+   deterministic-gate carve-out keeps its own owner (the
+   deterministic-recon re-file sweep; its archive-inclusive dedup — a
+   human-resolved gate record deliberately stays parked — is the
+   documented operator-owned exception).
+7. **Startup ordering is pinned.** L0 amnesty → halt/queue rehydration →
+   stranded reconcile. Conversion must never attribute a hold to a
+   record the amnesty dismissed milliseconds later.
+8. **Converted rows and the ladder.** Conversion files nothing, so the
+   pinning record carries no dry-run proposal — the b3 low-risk
+   auto-unblocker aborting on it is by design (expected, not a defect);
+   the escalation-watcher playbook carries an explicit row for the
+   `strand_converted` marker so the L1 rotation has a disposition for
+   these records (the missing-playbook-row failure class).
+9. **Merge-halt holds keep their token semantics.** The halt's owner is
+   the durable halt-category record: the **only** unhalt edge is that
+   record's resolution. A bounded exit from the in-slot wait (or its
+   removal) must not run the cancellation cleanup that unhalts today;
+   halt rehydration matches on category at level ≥ 1 (promotion must not
+   change rehydration identity), and recovery never re-files a sibling
+   halt-category record. Across a restart the halt is re-asserted only
+   while its project_root predicate measures true or cannot be measured; a
+   record measured clean is stamped released and never re-owns a halt
+   (task 3876; see `OPERATIONS.md` §"Merge-halt semantics").
+
+## 8. Divergence register (code vs this spec, 2026-08-02)
+
+Verified sites; consequences characterized. E-numbers are referenced by
+the PRD's tasks. Each entry's original text stays as the audit trail; the
+closing sentences appended to it ("Closed by task N (leaf X)", "Partly
+closed …", or "Still open …") record what later landed, re-verified
+against code on 2026-10-26 (task 6082).
+
+- **E1 — Path B merge-entry bail** (`workflow.py:3457-3464`): returns
+  ESCALATED with no steward, no status write → permanent strand vetoed
+  by its own record (9 live strands; 7 self-pinned by the task-2505
+  tripwire's blocking L0 filed 12 lines earlier against a "purely
+  observational" comment). Fix: enter the same escalated-wait machinery
+  as Path A (bounded; L2/critical short-circuits to `_mark_blocked`).
+  The *gate itself is correct* (stop-the-line, repend D4) — the defect
+  is the missing post-bail owner. Closed by task 3536 (leaf γ1):
+  `workflow.py::TaskWorkflow._handle_merge_gate_escalations` enters the
+  same steward + `_wait_for_resolution` machinery as Path A. A born-at-L2
+  record, wait expiry, or a gating record still open at the single-shot
+  re-check parks the row via `_mark_blocked`; a steward terminal decision
+  is honoured as written; a cleared gate merges in-slot. No exit leaves
+  `in-progress` without a claimant (pinned by
+  `orchestrator/tests/test_workflow_merge_gating_strand.py`).
+- **E2 — `_mark_blocked(merge_phase=True)` writes no status** (every
+  `_submit_to_merge_queue` block path): BLOCKED exits leave
+  `in-progress`. Investigate the carve-out's original rationale, then
+  make merge-phase blocks write their park status. Closed by task 3537
+  (leaf γ2): every slot-exiting return of `_mark_blocked(merge_phase=True)`
+  writes its park status through
+  `workflow.py::TaskWorkflow._park_merge_phase_row`. The entry-write
+  suppression remains only for the in-slot merge-retry loop, whose live
+  claimant keeps `in-progress` truthful (the investigation is recorded as
+  MERGE_PHASE_RATIONALE in `_mark_blocked`'s docstring).
+- **E3 — merge-halt trio** (`_handle_wip_recovery_no_advance` /
+  `_handle_unmerged_state` / `_handle_stash_failed`): unbounded
+  `_escalation_event.wait()` (violates S5) and post-resolution BLOCKED
+  return with no write (violates S1; heals only via sweep latency).
+  Fix constraint (§7.9): the wait's existing cleanup unhalts on ANY
+  exit when the waiter owns the halt — a bound or an escalate-and-block
+  rewrite must exit without that cleanup, and halt rehydration's
+  `level == 1` filter must widen before any promotion of halt-owner
+  records is possible. Closed by task 3537 (leaf γ2) for the three named
+  handlers: each files its halt-owning L1 (`_file_halt_owning_l1`) and
+  returns `_mark_blocked(...)` without waiting. The record's resolution is
+  the sole unhalt edge, and `harness.py::Harness._rehydrate_merge_halt`
+  matches the halt categories at `level >= 1`. Outside this entry's list
+  and still open: `_handle_wip_conflict` and `_handle_wip_recovery` still
+  await `_submit_halt_escalation_and_wait`'s unbounded
+  `_escalation_event.wait()` in-slot (live claimant, so no strand, but no
+  S5 bound). Task 4224 owns that.
+- **E4 — REQUEUED without `pending`**: `WarmLaneRequeue`
+  (`workflow.py:2853-2901`) and the soft-cancel spurious-wakeup fallback
+  rely on the sweep; any open escalation converts a transient capacity
+  signal into a Path-B-class strand. Closed by task 3538 (leaf γ3):
+  `workflow.py::TaskWorkflow._repend_for_requeue` writes `pending` before
+  the REQUEUED exit on the `WarmLaneRequeue` path and the soft-cancel
+  spurious-wakeup fallback (and, since task 3316,
+  `_requeue_on_server_error`). A failed write is recorded in the
+  run()-exit write-failure ledger (`_note_exit_status_write`; §5's
+  status-write-failure relaxation) instead of escaping.
+- **E5 — infra-hold resume manufactures the strand shape**
+  (`harness.py:12846-12866` writes claimant-less `in-progress` and
+  waits for the sweep): re-creates the 3465 starvation whenever any
+  record is open. Resume should write a truthful dispatchable status.
+  Closed by task 3538 (leaf γ3): the infra-hold arm of
+  `harness.py::Harness._cascade_unblock_member` writes `pending`, not
+  claimant-less `in-progress`. Resume-at-verify is branch-keyed
+  (`TaskWorkflow._has_prior_implementation`), not status-keyed. A refused
+  write escalates via `_escalate_cascade_status_rejection` (pinned by
+  `orchestrator/tests/test_harness_infra_resume_truthful.py`).
+- **E6 — blast-radius requeue pending-write failure**
+  (`scheduler.py:7024-7037`): held in-memory locks make the row read as
+  actively-held → LEAVE until restart; the "next reconcile cycle"
+  comment is false. Partly closed by task 6051 (spawned from θ's review;
+  not a PRD leaf): `scheduler.py::Scheduler.handle_blast_radius_expansion`
+  returns `BlastRadiusResult(applied=False, repend_error=e)` instead of a
+  bare `False`, and `workflow.py::TaskWorkflow._requeue_on_lock_conflict`
+  records the error in the run()-exit write-failure ledger, so the failure
+  yields one STORE_UNAVAILABLE exit-contract record. Still open: the
+  scheduler keeps its locks "for reconcile to recover", but
+  `harness.py::Harness._run_slot`'s exit releases them anyway
+  (`SlotLease.release` → `Scheduler.release`). The row is left
+  `(in-progress, NULL claimant)`, an ordinary strand for the stranded
+  sweep rather than the actively-held LEAVE described above. Task 5735
+  owns making that contract explicit; task 6119 owns
+  `TaskWorkflow._apply_revalidation_skip` falling through on a
+  not-applied result instead of exiting.
+- **E7 — the recovery veto is `bool(open)` at any level/severity**,
+  five hand-rolled copies (task_ground_truth `_shape`; harness
+  `:5560`; scheduler `:5719`; harness `:11759`+`:11373`), silent at
+  four of the five sites (the fifth, `:11373`, logs an info line — not
+  a structured fact); `EscalationRef` drops severity so no site *can*
+  discriminate (S6), and no site distinguishes a wrong/unavailable
+  store from "no records" (S6 store-correctness). The in-progress applier re-derives resolver policy
+  in guard order (INV-5). Closed by tasks 3533 (leaf α), 3535 (leaf β)
+  and 3541 (leaf η): `EscalationRef` carries `severity`,
+  `filing_claimant_run_id` and `created_at`. Every recovery, redispatch
+  and done-flip veto asks the one predicate,
+  `escalation/src/escalation/pins.py::classify_pins`, through
+  `orchestrator/src/orchestrator/recovery_pins.py`: `.pins` for recovery
+  and redispatch (including `Scheduler._phase_redispatch_stranded_blocked`),
+  `.vetoes_done_flip` for MARK_DONE (`task_ground_truth.py::_shape`). The
+  in-progress applier consumes the resolver's answer, and the duplicate
+  deterministic-recon pair is collapsed. A failed store read is the third
+  state `TruthReport.escalation_store_unavailable`, which maps to
+  `recovery_left(reason=escalation_store_unavailable)`; every veto emits
+  `recovery_vetoed`/`recovery_left`.
+  `orchestrator/tests/test_recovery_veto_predicate_collapse.py` guards the
+  single predicate.
+- **E8 — `_already_landed_dispatch_gate` (`harness.py:10137-10142`) is
+  still L1-only** while every sibling went any-level: a pending task
+  with only an open L0/L2 can be auto-flipped to done past a human
+  handoff — the live *inverse* hazard (phantom-done). Highest-urgency
+  small fix in the family. Closed by task 3534 (leaf η0):
+  `harness.py::Harness._already_landed_dispatch_gate` vetoes on
+  `classify_pins(...).vetoes_done_flip` over every open record at any
+  level (info carved out). A failed read is treated as store-unavailable,
+  and since task 3535 both of its holds emit a structured
+  `recovery_vetoed`.
+- **E9 — B2/goal-5 unimplemented**: `_cascade_unblock_member` requires
+  `status == 'blocked'` (`harness.py:12873`) and the resolution path
+  gates L0 at `level >= 1` (`harness.py:12014`) — `resume` on a strand
+  reaches no re-pend path at all; `granted_files` scope grants deliver
+  to nobody. Closed by task 3540 (leaf ζ):
+  `harness.py::Harness._cascade_unblock_member` re-pends any
+  `_RESUME_REPEND_STATUSES` row (`blocked`, `in-progress`) with no live
+  claimant (`_resume_repend_liveness`), with an INV-3 corroborating
+  re-read before the write. `Harness._on_escalation_resolved` no longer
+  wraps `resume` in `level >= 1`, and `_fold_granted_files_on_repend`
+  delivers `granted_files` on the re-pend path.
+- **E10 — `_OUTCOME_ALLOWED` loose entries are documented strand
+  windows** (`task_transitions.py:279-330`): `escalated`/`requeued`/
+  `blocked`/`soft-cancelled` ⊇ {IN_PROGRESS}; `planned` unreachable;
+  `requeued→BLOCKED`'s comment cites a flip SM-2 can never observe; two
+  DONE producers can report a cancelled row as DONE. Task 3542 tightened
+  every row to §5 except `soft-cancelled`, which keeps
+  {IN_PROGRESS, MERGE_DEFERRED}: `release_workflow` parks the row only
+  after the slot clears, so at the instant of exit it is still
+  "wherever it was". That part stays open.
+- **E11 — SM-2 violation handling is soft-fail**: AssertionError →
+  generic catch → synthetic BLOCKED with empty reason, no escalation —
+  the false-done detector's alarm goes to a log line (INV-4). Closed by
+  task 3542 (leaf θ), enforced by task 3546 (leaf μ): `run()` judges both
+  SM-2 halves through
+  `orchestrator/src/orchestrator/exit_contract.py::judge_exit` and
+  records the verdict with `record_exit_verdict` (a WARNING plus a
+  `workflow_exit_contract` event). It always returns its real report, so
+  there is no synthetic BLOCKED. Since μ, the
+  `workflow_exit_contract_enforce` key in `dark-factory-orchestrator.yaml`
+  is on, so a violation also files one deduped blocking L1.
+- **E12 — silent sweeps**: the stranded sweep logs nothing when every
+  candidate is vetoed; summary tallies omit vetoed/left; Path B's bail
+  logs a count, not ids; burndown counts strands as active (859/7871
+  snapshots over cap, peak 33 vs 24) with no parity alarm; dashboards
+  drop claimant fields at ingest and render strands with an agent chip.
+  Closed by tasks 3535 (leaf β) and 3543 (leaf ι); Path B's bail is gone
+  (E1). The stranded sweep logs a summary every pass, with held/left
+  tallies and pinning ids
+  (`orchestrator/src/orchestrator/recovery_emission.py::RecoverySweepTally`);
+  vetoes emit `recovery_vetoed`/`recovery_left` naming the ids; and a veto
+  streak raises an alarm. The burndown splits `in_progress` into
+  live/stranded with a parity alarm
+  (`dashboard/src/dashboard/data/burndown.py::compute_parity_alarm`).
+  Dashboard task rows keep `claimant_run_id`/`heartbeat_at` and render a
+  stranded badge, and escalations carry a `pins_recovery` annotation
+  shown as a PINNING chip.
+- **E13 — doc/comment divergences**: ARCHITECTURE.md §3.6 (no Path B),
+  §3.7 (veto omitted; "sole choke point" false — six other blocked
+  writers), transition diagram missing 8+ live edges (incl. the
+  deterministic `pending→blocked` edge its own contract depends on);
+  `harness.py:4156-4165` warm-lane invariant comment assumes the
+  pre-veto sweep; `_reconcile_one_stranded` docstring says "L1-only"
+  and cites a dead line; `workflow.py:3438-3439` "purely observational";
+  stale `resolve_issue` docstring; `_UNION`'s call-site anchors rotted.
+  Partly closed.
+  - Closed:
+    - ARCHITECTURE.md §3.1 (the diagram now draws Table A in full,
+      including the deterministic `pending→blocked` edge), §3.6 (both
+      ESCALATED dispositions, MERGE entry included) and §3.7 (the veto
+      and every sibling `blocked` writer), by task 3544 (leaf κ); task
+      4172 later moved §3.7/§6 to present tense.
+    - The "purely observational" tripwire comment, by task 3536 (leaf γ1).
+    - The `_reconcile_one_stranded` veto bullet, by task 3541 (leaf η).
+    - The `_UNION` anchors, now `path::symbol`, by task 3542 (leaf θ).
+    - The `resolve_issue` NOTE calling Table B wiring an out-of-scope
+      follow-up, by task 6607.
+  - Still open (task 7506 owns all three):
+    - `escalation/src/escalation/server.py`'s `resolve_issue` action
+      table still lists `resume`'s task-status effect as "stays
+      in-progress", true since task 3540 only for a live claimant.
+    - `harness.py::Harness._warm_lane_reclaim_candidates` still grounds
+      its ownership invariant on the sweep reverting stranded rows.
+    - `_reconcile_one_stranded`'s merge-deferred bullet still says
+      "open-L1 veto pattern".
+- **E14 — `review` status has zero code writers** — vocabulary residue;
+  decide retire-or-document. Still open, by decision: no code writer
+  exists (`TaskStatus.REVIEW` appears only in Table A pairs and
+  `shared/src/shared/task_claimant.py`). The PRD's out-of-scope list and
+  open question 3 keep `review` in the vocabulary as human-only, and no
+  task owns its retirement.
+- **E15 — adjacent tasks**: 3429 (tripwire gating decision — correctly
+  identifies the contradiction and defers the strand to 3423) and 3423
+  (the strand-fix owner on paper, but recon has since redirected its
+  description to the reify-5879 flap investigation, so no task currently
+  owns the strand fix; its `metadata.files` still names the never-landed
+  strand test). Reconciled at PRD queue time. Closed at PRD queue time
+  per PRD D11: task 3423's strand-fix half moved to 3536/3542 (its
+  `metadata.files` were emptied) and the task was cancelled on
+  2026-08-03; task 3429 is done; and task 3536 (leaf γ1) delivered the
+  promised `orchestrator/tests/test_workflow_merge_gating_strand.py`.
+
+## 9. Non-goals
+
+- **No weakening of merge gating.** Stop-the-line at MERGE entry stays,
+  including prior-incarnation born-at-L2 records (repend D4).
+- **No auto-expiry or auto-resolution of escalation records** by
+  recovery (demand 11).
+- **No new status.** `blocked` + the pinning record already carries the
+  needed semantics with its full exit machinery (S3/S4); a `stranded`
+  status would need its own consumer loop and would join the sweep
+  carve-out treadmill the two prior splits document.
+- **No change to warm-lane holding policy** (non-terminal tasks pin
+  lanes deliberately, for session resume).
+- **No live-fleet mutation while landing this**: the 9 dark-factory + 3
+  reify strands are the validation evidence; fixes demonstrate on tests,
+  and the strands recover through the landed mechanisms.

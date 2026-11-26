@@ -118,6 +118,41 @@ class TestTaskRuntimeSnapshot:
         snapshot = TaskRuntimeSnapshot()
         assert snapshot.offline is False
         assert snapshot.tasks == []
+        # offline_reason is the same species as offline: always None as
+        # emitted by the server, synthesized client-side by the dashboard.
+        assert snapshot.offline_reason is None
+
+    @pytest.mark.parametrize('reason', ['unreachable', 'deadline_exceeded'])
+    def test_offline_reason_accepts_vocabulary(self, reason):
+        """Both members of the discriminator vocabulary are preserved as-given.
+
+        ``deadline_exceeded`` (the probe's own budget fired — under a starved
+        dashboard event loop that is the DASHBOARD's fault) and
+        ``unreachable`` (connect refused / HTTP error / malformed payload —
+        the orchestrator's fault) must stay separable on the wire, which is
+        the whole point of task 3517.
+        """
+        snapshot = TaskRuntimeSnapshot(offline=True, offline_reason=reason)
+        assert snapshot.offline is True
+        assert snapshot.offline_reason == reason
+
+    def test_bogus_offline_reason_raises_validation_error(self):
+        """offline_reason is a machine-checked enum — an out-of-vocab value
+        raises (INV-1: the model surfaces drift instead of silently widening),
+        mirroring the lane_state guard above."""
+        with pytest.raises(ValidationError):
+            TaskRuntimeSnapshot(
+                offline=True,
+                offline_reason='wat',  # type: ignore[arg-type]
+            )
+
+    def test_offline_without_reason_is_constructible(self):
+        """offline=True with no reason stays legal — it is out-of-contract for
+        a dashboard-synthesized snapshot, and consumers must render it as an
+        honest 'unknown' rather than fabricate a diagnosis."""
+        snapshot = TaskRuntimeSnapshot(offline=True)
+        assert snapshot.offline is True
+        assert snapshot.offline_reason is None
 
     def test_model_dump_round_trip(self):
         entry = TaskRuntimeEntry(
@@ -135,6 +170,7 @@ class TestTaskRuntimeSnapshot:
         dumped = snapshot.model_dump(mode='json')
         assert dumped == {
             'offline': False,
+            'offline_reason': None,
             'tasks': [
                 {
                     'task_id': 42,
@@ -149,3 +185,17 @@ class TestTaskRuntimeSnapshot:
                 }
             ],
         }
+
+    def test_model_dump_round_trip_carries_offline_reason(self):
+        """A non-None reason survives the JSON dump — the discriminator has to
+        cross the wire, not just live in memory."""
+        snapshot = TaskRuntimeSnapshot(
+            offline=True, offline_reason='deadline_exceeded'
+        )
+        dumped = snapshot.model_dump(mode='json')
+        assert dumped == {
+            'offline': True,
+            'offline_reason': 'deadline_exceeded',
+            'tasks': [],
+        }
+        assert TaskRuntimeSnapshot(**dumped) == snapshot

@@ -1,0 +1,26 @@
+import json,collections
+E=[json.loads(l) for l in open('/tmp/gate-10069/forensics/ev.jsonl')]
+c=collections.Counter()
+for e in E:
+    if e['et']=='merge_attempt': c[(e['d'].get('outcome'),e['d'].get('disposition'))]+=1
+print(c)
+c=collections.Counter()
+for e in E:
+    if e['et']=='merge_blocked': c[(e['d'].get('category'),e['d'].get('failure_category'),e['d'].get('cause_hint'))]+=1
+print(c)
+c=collections.Counter()
+for e in E:
+    if e['et']=='merge_verify_cancelled': c[e['d'].get('cause')]+=1
+print(c)
+c=collections.Counter()
+for e in E:
+    if e['et'] in('verdict_voided','speculative_discard'): c[(e['et'],e['d'].get('reason'),e['d'].get('point'),json.dumps(e['d'].get('killer',{}).get('site') if e['d'].get('killer') else None))]+=1
+print(c)
+c=collections.Counter()
+for e in E:
+    if e['et']=='merge_finalized': c[(e['d'].get('state'),(e['d'].get('reason') or '')[:50])]+=1
+for k,v in c.most_common(40): print(v,k)
+for e in E:
+    if e['et']=='merge_attempt' and e['d'].get('failing_tests'): print(e['id'],e['ts'][:19],e['task'],json.dumps(e['d'])[:700])
+for e in E:
+    if e['et']=='merge_flake_suppressed': print(e['id'],e['ts'][:19],e['task'],json.dumps(e['d'])[:400])

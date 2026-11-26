@@ -28,9 +28,11 @@ import json
 import shlex
 import shutil
 import subprocess
+from datetime import datetime
 from pathlib import Path
 
 import pytest
+from _orch_helpers import env_resolving_running_interpreter
 
 # Reused verbatim from the sibling shipped-script contract rather than
 # re-derived: WARM_LANE_SCRIPT_DIR is resolved from __file__ (not the process
@@ -39,7 +41,7 @@ import pytest
 # keys (REIFY_WARM_LANE_MOUNT, GIT_DIR, GIT_WORK_TREE) that git hooks and
 # `git rebase --exec` export — without which a passing result here could be an
 # artifact of the ambient checkout instead of the synthetic mount.
-from test_warm_lane_scripts_shipped import (  # noqa: E402
+from test_warm_lane_scripts_shipped import (
     WARM_LANE_SCRIPT_DIR,
     _sanitized_env,
 )
@@ -56,6 +58,24 @@ _BASH = shutil.which('bash') or '/bin/bash'
 # harness
 # ---------------------------------------------------------------------------
 
+def _sanitized_env_with_test_python3(
+    extra: dict[str, str] | None = None,
+) -> dict[str, str]:
+    """``_sanitized_env`` with a bare ``python3`` bound to the interpreter running this test.
+
+    That interpreter is capable by construction (this module imports
+    ``orchestrator.git_ops``), so a bridge case never depends on what the host's
+    ``PATH`` carries.  A ``PATH`` in *extra* is refused: prepending a capable
+    interpreter ahead of a stub would make a hostile-``PATH`` case pass vacuously.
+    """
+    if extra is not None and 'PATH' in extra:
+        raise ValueError(
+            "extra['PATH'] would be shadowed by the test interpreter's bin dir; "
+            'a PATH-stubbing case must call _sanitized_env directly',
+        )
+    return env_resolving_running_interpreter(_sanitized_env(extra=extra))
+
+
 def _run_sourced(
     snippet: str,
     *,
@@ -69,7 +89,9 @@ def _run_sourced(
     ``lane_protect_glob`` cases: unlike the pure-bash lane-state half, those
     pay a real ``python3`` interpreter start plus the ``orchestrator.git_ops``
     import chain, which on a loaded host (this repo's own fleet saturates it)
-    measures single-digit seconds cold.
+    measures single-digit seconds cold.  The default *env* binds a bare
+    ``python3`` to the running interpreter, so a bridge case never depends on
+    what the host's ``PATH`` carries.
     """
     script = f'source {shlex.quote(str(LIB))}\n{snippet}\n'
     return subprocess.run(
@@ -78,7 +100,7 @@ def _run_sourced(
         text=True,
         timeout=timeout,
         cwd=str(cwd if cwd is not None else WARM_LANE_SCRIPT_DIR),
-        env=_sanitized_env() if env is None else env,
+        env=_sanitized_env_with_test_python3() if env is None else env,
     )
 
 
@@ -113,11 +135,12 @@ def _globals(stdout: str) -> dict[str, str]:
     return out
 
 
-#: Appended to a snippet to publish the three globals for inspection.  Printed
+#: Appended to a snippet to publish the four globals for inspection.  Printed
 #: one per line with no quoting so an empty value is an empty tail.
 _ECHO_GLOBALS = (
-    "printf 'RAW=%s\\nTASK=%s\\nCAUSE=%s\\n' "
-    '"$LANE_STATE_RAW" "$LANE_STATE_TASK_ID" "$LANE_STATE_CAUSE"'
+    "printf 'RAW=%s\\nTASK=%s\\nCAUSE=%s\\nUPDATED=%s\\n' "
+    '"$LANE_STATE_RAW" "$LANE_STATE_TASK_ID" "$LANE_STATE_CAUSE" '
+    '"$LANE_STATE_UPDATED_AT"'
 )
 
 #: A realistic record: the shape ``LaneRecord`` actually serializes.
@@ -163,7 +186,7 @@ class TestLaneStateReadHappyPath:
             f'path; got {proc.stdout!r}'
         )
 
-    def test_publishes_the_three_globals_for_an_assigned_lane(
+    def test_publishes_the_four_globals_for_an_assigned_lane(
         self, tmp_path: Path,
     ) -> None:
         base = _mount(tmp_path / 'mount', {'_lane-28': _ASSIGNED_RECORD})
@@ -173,12 +196,17 @@ class TestLaneStateReadHappyPath:
         )
         assert proc.returncode == 0, f'stderr={proc.stderr!r}'
         published = _globals(proc.stdout)
-        assert published == {'RAW': 'assigned', 'TASK': '5551', 'CAUSE': ''}, (
-            'the three globals must describe ONE observation of ONE record; '
+        assert published == {
+            'RAW': 'assigned',
+            'TASK': '5551',
+            'CAUSE': '',
+            'UPDATED': _ASSIGNED_RECORD['updated_at'],
+        }, (
+            'the four globals must describe ONE observation of ONE record; '
             f'got {published!r}'
         )
 
-    def test_publishes_the_three_globals_for_a_recordless_lane(
+    def test_publishes_the_four_globals_for_a_recordless_lane(
         self, tmp_path: Path,
     ) -> None:
         base = _mount(tmp_path / 'mount', {'_iact-demo': None})
@@ -193,6 +221,9 @@ class TestLaneStateReadHappyPath:
         )
         assert published['TASK'] == '', (
             f'no record means no task id to publish; got {published!r}'
+        )
+        assert published['UPDATED'] == '', (
+            f'no record means no timestamp to publish; got {published!r}'
         )
 
     def test_accepts_a_bare_lane_name_against_an_explicit_state_dir(
@@ -310,7 +341,9 @@ class TestLaneStateReadFailsOpenWithAnAttributableCause:
             f'a null task_id must not suppress the state; got {proc.stdout!r}'
         )
         published = _globals(proc.stdout)
-        assert published == {'RAW': 'released', 'TASK': '', 'CAUSE': ''}, published
+        assert published == {
+            'RAW': 'released', 'TASK': '', 'CAUSE': '', 'UPDATED': '',
+        }, published
 
     def test_absent_task_id_key_reads_empty_without_losing_the_state(
         self, tmp_path: Path,
@@ -321,7 +354,9 @@ class TestLaneStateReadFailsOpenWithAnAttributableCause:
         )
         assert proc.stdout.startswith('seed\n'), proc.stdout
         published = _globals(proc.stdout)
-        assert published == {'RAW': 'seed', 'TASK': '', 'CAUSE': ''}, published
+        assert published == {
+            'RAW': 'seed', 'TASK': '', 'CAUSE': '', 'UPDATED': '',
+        }, published
 
 
 class TestLaneStateReadIsNonCreating:
@@ -458,10 +493,199 @@ class TestLaneStateReadNeverInheritsAPredecessorsValues:
             f'{_ECHO_GLOBALS}',
         )
         published = _globals(proc.stdout)
-        assert published == {'RAW': 'assigned', 'TASK': '5551', 'CAUSE': ''}, (
+        assert published == {
+            'RAW': 'assigned',
+            'TASK': '5551',
+            'CAUSE': '',
+            'UPDATED': _ASSIGNED_RECORD['updated_at'],
+        }, (
             'a successful read must clear the previous lane\'s UNKNOWN cause, or '
             f'the audit would warn about a lane that resolved fine; {published!r}'
         )
+
+
+class TestLaneStateReadPublishesUpdatedAt:
+    """``updated_at`` is the FOURTH global, from the SAME single slurp.
+
+    ``warm-lane-gc.sh``'s Pass-1 record gate bounds an ASSIGNED preserve by the
+    record's age, so it needs the record's timestamp alongside its state and
+    task id.  Publishing it from the same slurp is the whole point: the
+    orchestrator rewrites these records on every acquire and release, so a
+    second read of the record would be a DIFFERENT INSTANT and could pair a
+    state with a timestamp that never coexisted — which on the gc side would
+    mean judging a live lane's freshness by a released record's stamp.
+
+    The EMPTY string is the "age unjudgeable" reading the consumer acts on, and
+    it must be reachable from every way a timestamp can be missing: no record,
+    an unparseable record, and a readable record with no ``updated_at`` key.
+    """
+
+    def test_assigned_record_publishes_its_timestamp_verbatim(
+        self, tmp_path: Path,
+    ) -> None:
+        base = _mount(tmp_path / 'mount', {'_lane-28': _ASSIGNED_RECORD})
+        proc = _run_sourced(
+            f'lane_state_read {shlex.quote(str(base / "_lane-28"))} >/dev/null\n'
+            f'{_ECHO_GLOBALS}',
+        )
+        assert proc.returncode == 0, f'stderr={proc.stderr!r}'
+        published = _globals(proc.stdout)
+        assert published['UPDATED'] == _ASSIGNED_RECORD['updated_at'], (
+            'LANE_STATE_UPDATED_AT must carry the record\'s `updated_at` string '
+            f'verbatim, unreformatted; got {published!r}'
+        )
+
+    def test_recordless_lane_publishes_the_empty_string(self, tmp_path: Path) -> None:
+        base = _mount(tmp_path / 'mount', {'_iact-demo': None})
+        proc = _run_sourced(
+            f'lane_state_read {shlex.quote(str(base / "_iact-demo"))} >/dev/null\n'
+            f'{_ECHO_GLOBALS}',
+        )
+        published = _globals(proc.stdout)
+        assert published['UPDATED'] == '', (
+            'a lane with no record has no age to judge, and that reading is the '
+            'EMPTY string — not "unknown", which would be indistinguishable from '
+            f'a record literally carrying that text; got {published!r}'
+        )
+
+    def test_corrupt_record_publishes_the_empty_string(self, tmp_path: Path) -> None:
+        base = _mount(
+            tmp_path / 'mount',
+            {'_lane-9': '{"state": "assig'},   # truncated mid-write
+        )
+        proc = _run_sourced(
+            f'lane_state_read {shlex.quote(str(base / "_lane-9"))} >/dev/null\n'
+            f'{_ECHO_GLOBALS}',
+        )
+        published = _globals(proc.stdout)
+        assert published['CAUSE'] == 'unparseable-record', published
+        assert published['UPDATED'] == '', (
+            'a record truncated before its `updated_at` yields no timestamp; '
+            f'got {published!r}'
+        )
+
+    def test_record_with_no_updated_at_key_publishes_the_empty_string(
+        self, tmp_path: Path,
+    ) -> None:
+        """A readable ``assigned`` record can still lack the timestamp.
+
+        This is the case that separates the two facts: the STATE is trustworthy
+        and the AGE is not, which is exactly the split the gc gate's fail-safe
+        direction turns on.
+        """
+        base = _mount(
+            tmp_path / 'mount',
+            {'_lane-9': {'state': 'assigned', 'task_id': '77'}},
+        )
+        proc = _run_sourced(
+            f'lane_state_read {shlex.quote(str(base / "_lane-9"))} >/dev/null\n'
+            f'{_ECHO_GLOBALS}',
+        )
+        published = _globals(proc.stdout)
+        assert published['RAW'] == 'assigned', (
+            f'the state must still resolve normally; got {published!r}'
+        )
+        assert published['UPDATED'] == '', (
+            f'an absent `updated_at` key yields no timestamp; got {published!r}'
+        )
+
+    def test_recordless_lane_after_an_assigned_one_never_inherits_its_timestamp(
+        self, tmp_path: Path,
+    ) -> None:
+        """The reset-at-entry contract, extended to the fourth global.
+
+        Without it a recordless lane would report the PREVIOUS lane's stamp —
+        and on the gc side a fresh predecessor's timestamp would make an
+        unjudgeable lane read as judgeably fresh, silently disabling the bound
+        for exactly the lanes whose records are in the worst shape.
+        """
+        base = _mount(
+            tmp_path / 'mount',
+            {'_lane-28': _ASSIGNED_RECORD, '_iact-demo': None},
+        )
+        proc = _run_sourced(
+            f'lane_state_read {shlex.quote(str(base / "_lane-28"))} >/dev/null\n'
+            f'lane_state_read {shlex.quote(str(base / "_iact-demo"))} >/dev/null\n'
+            f'{_ECHO_GLOBALS}',
+        )
+        published = _globals(proc.stdout)
+        assert published['UPDATED'] == '', (
+            'the recordless lane inherited its predecessor\'s timestamp — the '
+            f'fourth global must be reset at entry too; got {published!r}'
+        )
+
+    def test_the_default_before_any_read_matches_a_failed_read(
+        self, tmp_path: Path,
+    ) -> None:
+        """Sourcing the lib alone must publish the same fail-open shape.
+
+        A caller that inspects the globals before its first read must not see an
+        UNBOUND variable — under ``set -u`` (which ``warm-lane-gc.sh`` runs
+        under) that is an abort, not a degraded read.
+        """
+        proc = _run_sourced(f'set -u\n{_ECHO_GLOBALS}')
+        assert proc.returncode == 0, (
+            'the published defaults must satisfy `set -u` before any read; '
+            f'stderr={proc.stderr!r}'
+        )
+        published = _globals(proc.stdout)
+        assert published['UPDATED'] == '', (
+            f'the pre-read default must be the unjudgeable reading; {published!r}'
+        )
+
+
+def _epoch(timestamp: str) -> tuple[int, list[str]]:
+    """Run the SHIPPED ``lane_state_epoch`` on *timestamp*: its rc, and stdout lines."""
+    proc = _run_sourced(
+        f'lane_state_epoch {shlex.quote(timestamp)}\nprintf \'RC=%s\\n\' "$?"',
+    )
+    lines = proc.stdout.splitlines()
+    assert lines and lines[-1].startswith('RC='), (
+        f'the snippet did not report a return code; stdout={proc.stdout!r} '
+        f'stderr={proc.stderr!r}'
+    )
+    return int(lines[-1].removeprefix('RC=')), lines[:-1]
+
+
+class TestLaneStateEpoch:
+    """``lane_state_epoch`` is the ONE parse of a record's ``updated_at``.
+
+    Two consumers judge a lane's age by it (warm-lane-gc.sh's Pass-1 gate and
+    warm-lane-audit.sh's ``age_min``), so the unjudgeable readings must be the
+    same in both: a non-zero return and NOTHING on stdout.
+    """
+
+    @pytest.mark.parametrize(
+        'timestamp',
+        [
+            _ASSIGNED_RECORD['updated_at'],
+            # datetime.isoformat() of an aware datetime with microseconds: the
+            # shape LaneRecord actually stamps.
+            '2026-07-26T12:43:10.704531+00:00',
+        ],
+    )
+    def test_the_producers_shape_converts_to_epoch_seconds(self, timestamp: str) -> None:
+        rc, printed = _epoch(timestamp)
+        assert rc == 0, f'{timestamp!r} must be judgeable; printed={printed!r}'
+        # GNU date truncates the fractional seconds, as int() does.
+        assert printed == [str(int(datetime.fromisoformat(timestamp).timestamp()))], (
+            f'{timestamp!r} must print exactly its epoch seconds; got {printed!r}'
+        )
+
+    def test_the_empty_string_is_unjudgeable(self) -> None:
+        """The gotcha this function exists to own: GNU ``date -d ''`` exits 0.
+
+        It answers today's midnight, so a parse that handed it an unstamped
+        record's empty ``updated_at`` would read that record as stamped today.
+        """
+        rc, printed = _epoch('')
+        assert rc == 1, f'an empty stamp must be unjudgeable; rc={rc} printed={printed!r}'
+        assert printed == [], f'an unjudgeable stamp must print nothing; {printed!r}'
+
+    def test_garbage_is_unjudgeable(self) -> None:
+        rc, printed = _epoch('not-a-timestamp')
+        assert rc == 1, f'garbage must be unjudgeable; rc={rc} printed={printed!r}'
+        assert printed == [], f'an unjudgeable stamp must print nothing; {printed!r}'
 
 
 class TestLaneStateClass:
@@ -1307,7 +1531,9 @@ class TestLaneProtectGlobHonoursTheConfiguredIactBand:
         proc = _run_sourced(
             'lane_protect_glob _lane- _spec-',
             cwd=tmp_path,
-            env=_sanitized_env(extra={'REIFY_WARM_LANE_IACT_PREFIX': '_int-'}),
+            env=_sanitized_env_with_test_python3(
+                extra={'REIFY_WARM_LANE_IACT_PREFIX': '_int-'},
+            ),
             timeout=_BRIDGE_TIMEOUT,
         )
         assert proc.returncode == 0, proc.stderr
@@ -1334,7 +1560,9 @@ class TestLaneProtectGlobHonoursTheConfiguredIactBand:
         proc = _run_sourced(
             'lane_protect_glob',
             cwd=tmp_path,
-            env=_sanitized_env(extra={'REIFY_WARM_LANE_IACT_PREFIX': ''}),
+            env=_sanitized_env_with_test_python3(
+                extra={'REIFY_WARM_LANE_IACT_PREFIX': ''},
+            ),
             timeout=_BRIDGE_TIMEOUT,
         )
         assert proc.returncode == 0, proc.stderr
@@ -1377,6 +1605,39 @@ def _uncovered_bands(rendered: str, fallback: str) -> list[str]:
             fnmatch.fnmatchcase(_representative(band), pattern) for pattern in patterns
         )
     ]
+
+
+def _fallback_band_diff(rendered: str, fallback: str) -> tuple[list[str], list[str]]:
+    """(bands only in *rendered*, bands only in *fallback*), each in its own order."""
+    rendered_bands = [b for b in rendered.split(',') if b]
+    fallback_bands = [b for b in fallback.split(',') if b]
+    return (
+        [b for b in rendered_bands if b not in fallback_bands],
+        [b for b in fallback_bands if b not in rendered_bands],
+    )
+
+
+def _fallback_drift_report(rendered: str, fallback: str) -> str | None:
+    """``None`` iff *fallback* is byte-equal to *rendered*, else a fix-it report."""
+    if rendered == fallback:
+        return None
+    only_rendered, only_fallback = _fallback_band_diff(rendered, fallback)
+    lines = [
+        'LANE_PROTECT_GLOB_FALLBACK is not a verbatim render of PROTECTED_PREFIXES.',
+        f'  in the render, missing from the fallback: {only_rendered}',
+        f'  in the fallback, missing from the render: {only_fallback}',
+    ]
+    if not only_rendered and not only_fallback:
+        lines.append('  same bands, different order')
+    return '\n'.join([
+        *lines,
+        f'  rendered: {rendered}',
+        f'  fallback: {fallback}',
+        'Fix: in orchestrator/scripts/warm-lane/lib_lane_state.sh set',
+        f"  LANE_PROTECT_GLOB_FALLBACK='{rendered}'",
+        'Both gc suites pin REIFY_WARM_LANE_GC_PROTECT_GLOB to it, so until then '
+        'they exercise warm-lane-gc.sh with a protect set production never uses.',
+    ])
 
 
 @pytest.fixture
@@ -1472,3 +1733,85 @@ class TestProtectGlobFallbackDrift:
                 f'the fallback protects pool band {band!r} via {offenders!r} — a '
                 f'python3 outage would freeze reclaim instead of degrading it'
             )
+
+
+class TestProtectGlobFallbackIsAVerbatimRender:
+    """``LANE_PROTECT_GLOB_FALLBACK`` must equal the registry render byte for byte.
+
+    Both gc suites pin ``REIFY_WARM_LANE_GC_PROTECT_GLOB`` to the fallback, which
+    is behaviour-neutral only under that equality; production's python3-outage
+    backstop needs only :class:`TestProtectGlobFallbackDrift`'s containment.
+    """
+
+    @staticmethod
+    def _render() -> str:
+        from orchestrator import git_ops
+
+        return git_ops.render_protect_glob(owned=git_ops.PROTECT_GLOB_OWNED_POOL_BANDS)
+
+    @staticmethod
+    def _swap_registry(monkeypatch, registry: dict[str, str]) -> None:
+        """Replace the registry whole: ``delitem``'s undo re-inserts at the END."""
+        from orchestrator import git_ops
+
+        monkeypatch.setattr(git_ops, 'PROTECTED_PREFIXES', registry)
+
+    def test_the_fallback_is_a_verbatim_render_of_the_registry(self, fallback) -> None:
+        rendered = self._render()
+        assert _fallback_drift_report(rendered, fallback) is None, (
+            _fallback_drift_report(rendered, fallback)
+        )
+
+    def test_the_equality_gate_fires_on_an_unmirrored_new_band(
+        self, fallback, monkeypatch,
+    ) -> None:
+        from orchestrator import git_ops
+
+        monkeypatch.setitem(git_ops.PROTECTED_PREFIXES, '_newband-', 'test-only')
+        rendered = self._render()
+        assert _fallback_band_diff(rendered, fallback) == (['_newband-*'], [])
+        report = _fallback_drift_report(rendered, fallback)
+        assert report is not None
+        assert '_newband-*' in report, report
+        assert f"LANE_PROTECT_GLOB_FALLBACK='{rendered}'" in report, report
+
+    def test_the_equality_gate_catches_a_band_containment_waves_through(
+        self, fallback, monkeypatch,
+    ) -> None:
+        from orchestrator import git_ops
+
+        monkeypatch.setitem(git_ops.PROTECTED_PREFIXES, '_merge-extra', 'test-only')
+        rendered = self._render()
+        assert _uncovered_bands(rendered, fallback) == []
+        assert _fallback_band_diff(rendered, fallback) == (['_merge-extra'], [])
+        assert _fallback_drift_report(rendered, fallback) is not None
+
+    def test_the_equality_gate_catches_a_strict_superset_fallback(
+        self, fallback, monkeypatch,
+    ) -> None:
+        from orchestrator import git_ops
+
+        self._swap_registry(monkeypatch, {
+            key: owner
+            for key, owner in git_ops.PROTECTED_PREFIXES.items()
+            if key != '_solo-'
+        })
+        rendered = self._render()
+        assert _uncovered_bands(rendered, fallback) == []
+        assert _fallback_band_diff(rendered, fallback) == ([], ['_solo-*'])
+        assert _fallback_drift_report(rendered, fallback) is not None
+
+    def test_the_equality_gate_catches_an_order_only_difference(
+        self, fallback, monkeypatch,
+    ) -> None:
+        from orchestrator import git_ops
+
+        registry = dict(git_ops.PROTECTED_PREFIXES)
+        moved = registry.pop('_merge-')
+        self._swap_registry(monkeypatch, {**registry, '_merge-': moved})
+        rendered = self._render()
+        assert _fallback_band_diff(rendered, fallback) == ([], [])
+        report = _fallback_drift_report(rendered, fallback)
+        assert report is not None
+        assert 'same bands, different order' in report, report
+        assert f"LANE_PROTECT_GLOB_FALLBACK='{rendered}'" in report, report

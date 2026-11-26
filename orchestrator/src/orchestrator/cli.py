@@ -1,6 +1,9 @@
 """CLI entry point: `orchestrator run [--prd X]`."""
 
 import asyncio
+import contextlib
+import functools
+import importlib
 import json
 import logging
 import os
@@ -8,17 +11,22 @@ import signal
 import socket
 import sys
 import threading
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine, Iterator
+from contextlib import AbstractContextManager
 from pathlib import Path
-from typing import Any, NamedTuple
+from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar
 
 import click
-from dotenv import load_dotenv
+from shared.spawn_temp_files import sweep_orphaned_spawn_temp_files
 
-from orchestrator.config import ConfigRequiredError, load_config
+from orchestrator.cli_config import CONFIG_OPTION_HELP_PREFIX, load_program_dotenv, pass_config
+from orchestrator.config import OrchestratorConfig
+from orchestrator.config_census_ignore import audit_census_ignore_entries
+from orchestrator.evals.cli import eval_cli
 from orchestrator.verify_cancel import (
     WATCHDOG_HEARTBEAT_TIMEOUT_SECS,
     WATCHDOG_KILL_GRACE_SECS,
+    WatchdogTrigger,
     acquire_merge_verify_flock,
     cancel_request,
     fire_watchdog_kill,
@@ -29,13 +37,19 @@ from orchestrator.verify_cancel import (
     release_merge_verify_flock,
     remove_lock_holder_pgid,
     remove_pgid_file,
+    remove_worktree_path,
     start_own_process_group,
     start_stdin_watchdog,
     write_lock_holder_pgid,
     write_pgid_file,
+    write_worktree_path,
 )
 
-load_dotenv()  # loads .env into os.environ (e.g. CLAUDE_OAUTH_TOKEN_A/B)
+if TYPE_CHECKING:
+    from orchestrator.git_ops import GitOps
+    from orchestrator.task_verify_spec import TaskVerifySpec
+    from orchestrator.verify import VerifyResult
+    from orchestrator.verify_runner import MergeVerifySpec
 
 LOG_FORMAT = '%(asctime)s %(levelname)-8s [%(name)s] %(message)s'
 DATE_FORMAT = '%Y-%m-%d %H:%M:%S'
@@ -43,8 +57,12 @@ DATE_FORMAT = '%Y-%m-%d %H:%M:%S'
 # How long after asyncio.run() returns to wait before force-exiting.
 # The watchdog is armed AFTER asyncio.run() returns (not before) so that
 # long orchestration runs are never affected. After this deadline a diagnostic
-# dump is written to stderr and os._exit(137) fires.
+# dump is written to stderr and os._exit(137) fires. asyncio.run()'s own
+# teardown is bounded separately, by the teardown watchdog below.
 SHUTDOWN_WATCHDOG_TIMEOUT_SECS = 30
+
+# Bounds asyncio.run()'s own teardown, which starts once the main coroutine has ended.
+TEARDOWN_WATCHDOG_TIMEOUT_SECS = 10
 
 # Bounded wait (task 2306 α) for acquiring the laptop persistent-worktree
 # merge-verify fcntl.flock (verify_cancel.acquire_merge_verify_flock) when
@@ -61,7 +79,8 @@ def _env_float(name: str, default: float) -> float:
     timing constants (flock wait, watchdog heartbeat timeout/grace) are
     module-level and otherwise untunable from outside the spawned
     ``verify-merge`` child, making an integration gate wall-clock-bound on
-    the 10-15s production windows. Unset, unparseable, or non-positive
+    the production windows (since task 4195, a 90.0s heartbeat timeout plus a
+    5.0s kill grace). Unset, unparseable, or non-positive
     values fall back to *default* so production behavior is byte-identical
     when the env var is absent. The non-positive guard matters beyond
     "byte-identical": every current caller feeds a timing window
@@ -93,6 +112,7 @@ def _force_exit_after_delay(
     *,
     stream=None,
     _exit: 'Callable[[int], None] | None' = None,
+    phase: str = 'after asyncio.run() returned',
 ) -> 'WatchdogHandle':
     """Arm a daemon-thread watchdog that force-exits if not disarmed in time.
 
@@ -113,9 +133,10 @@ def _force_exit_after_delay(
     and ``thread: threading.Thread``).  Calling ``handle.disarm()`` (even
     multiple times) is safe and prevents the watchdog from firing.
     ``handle.thread`` is exposed for tests that want to ``join()`` after
-    assertions to guarantee the watchdog thread has exited; the orchestrator
-    intentionally never disarms so the watchdog guards interpreter shutdown
-    (atexit callbacks + ``threading._shutdown()`` joining non-daemon threads).
+    assertions to guarantee the watchdog thread has exited. The orchestrator
+    intentionally never disarms its post-run watchdog, so it guards interpreter
+    shutdown (atexit callbacks + ``threading._shutdown()`` joining non-daemon
+    threads). *phase* names the window being guarded in the dump header.
 
     The ``_exit`` parameter is an injectable exit callable (default
     ``os._exit``). Injecting a stub in tests means a leaked/late-firing daemon
@@ -140,7 +161,7 @@ def _force_exit_after_delay(
         try:
             import traceback
 
-            lines = ['SHUTDOWN WATCHDOG FIRED — process hung after asyncio.run() returned\n']
+            lines = [f'SHUTDOWN WATCHDOG FIRED — process hung {phase}\n']
             frames = sys._current_frames()
             for t in threading.enumerate():
                 frame = frames.get(t.ident) if t.ident is not None else None
@@ -172,6 +193,54 @@ def _force_exit_after_delay(
     return WatchdogHandle(disarm=disarm, thread=thread)
 
 
+_T = TypeVar('_T')
+
+
+def _run_with_bounded_teardown(
+    main: Callable[[], Awaitable[_T]],
+    *,
+    teardown_secs: float,
+    _exit: Callable[[int], None] | None = None,
+) -> _T:
+    """``asyncio.run(main())``, force-exiting if asyncio.run's teardown hangs.
+
+    asyncio.run cancels every task left when *main* ends and waits on them with
+    no timeout, so one task that ignores its cancel would hold the process
+    forever (task 7247). The watchdog is armed only once *main* has ended and
+    is disarmed when asyncio.run returns.
+    """
+    armed: list[WatchdogHandle] = []
+
+    async def _main_then_arm() -> _T:
+        try:
+            return await main()
+        finally:
+            armed.append(_force_exit_after_delay(
+                teardown_secs, _exit=_exit, phase="in asyncio.run()'s teardown",
+            ))
+            _log_tasks_left_for_teardown()
+
+    try:
+        return asyncio.run(_main_then_arm())
+    finally:
+        for handle in armed:
+            handle.disarm()
+
+
+def _log_tasks_left_for_teardown() -> None:
+    """Name, at WARNING, every task asyncio.run()'s teardown will cancel and wait on.
+
+    The teardown watchdog's dump shows thread stacks only, so this line is what
+    names the task that ignored its cancel.
+    """
+    current = asyncio.current_task()
+    leftovers = sorted(t.get_name() for t in asyncio.all_tasks() if t is not current)
+    if leftovers:
+        logging.getLogger(__name__).warning(
+            "asyncio.run()'s teardown will cancel and wait on %d task(s): %s", len(leftovers), leftovers,
+        )
+
+
 def _make_cancel_handler(main_task, logger):
     """Build an idempotent SIGTERM/SIGINT handler.
 
@@ -197,7 +266,15 @@ def _make_cancel_handler(main_task, logger):
     return _cancel
 
 
-@click.group()
+class _DotenvProgramGroup(click.Group):
+    """Root group that loads .env when run as a program (console script, python -m), never on import or CliRunner.invoke."""
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        load_program_dotenv()
+        return super().__call__(*args, **kwargs)
+
+
+@click.group(cls=_DotenvProgramGroup)
 @click.option('--verbose', is_flag=True, help='Enable debug logging')
 def main(verbose: bool):
     """Dark Factory agent orchestrator."""
@@ -213,11 +290,7 @@ def main(verbose: bool):
 @main.command()
 @click.option('--prd', type=click.Path(exists=True, path_type=Path), default=None,
               help='Path to PRD markdown file (omit to run existing tasks)')
-@click.option('--config', 'config_path', type=click.Path(exists=True, path_type=Path),
-              default=None,
-              help='Path to orchestrator config YAML (REQUIRED unless ORCH_CONFIG_PATH '
-                   'is set). Selects the target project — sets project_root and '
-                   'fused_memory.project_id.')
+@pass_config()
 @click.option('--dry-run', is_flag=True, help='Populate tasks only, do not execute')
 @click.option('--delay', default=None,
               help='Delay before executing tasks (e.g. 4h, 30m, 90s). '
@@ -230,19 +303,39 @@ def main(verbose: bool):
 @click.option('--until-idle', is_flag=True,
               help='Exit when the task queue drains (default: run forever, '
                    'idling for newly-scheduled tasks)')
-def run(prd: Path | None, config_path: Path | None, dry_run: bool, delay: str | None,
+def run(prd: Path | None, config: OrchestratorConfig, dry_run: bool, delay: str | None,
         force_dirty_start: bool, retag_modules: bool, until_idle: bool):
     """Run the orchestrator against a PRD, or execute existing tasks if no PRD given."""
+    from orchestrator.deployed_sha import capture_deployed_sha, resolve_code_checkout
+
+    # Task 6565 (D1): importing the harness loads the whole verify wire path, so
+    # bracketing this one import records which commit the process runs.
+    deployed_sha = capture_deployed_sha(
+        resolve_code_checkout(), lambda: importlib.import_module('orchestrator.harness'),
+    )
     from orchestrator.harness import Harness
 
     delay_secs = _parse_duration(delay) if delay else 0
-    try:
-        config = load_config(config_path)
-    except ConfigRequiredError as e:
-        click.echo(f'Error: {e}', err=True)
+    if deployed_sha is None and config.enabled_verify_runners:
+        click.echo(
+            'Error: a remote verify runner is enabled but this process cannot read the '
+            'commit it runs (no readable git checkout above its code); the remote gate '
+            'needs that sha (task 6565). Run from a git checkout or disable the runner.',
+            err=True,
+        )
         sys.exit(1)
-    harness = Harness(config)
     logger = logging.getLogger(__name__)
+    # Process start, before this process spawns any agent; the sweep is host-wide, so it
+    # also reclaims fused-memory's and scripts' orphans. See
+    # shared/src/shared/spawn_temp_files.py::sweep_orphaned_spawn_temp_files.
+    try:
+        sweep_orphaned_spawn_temp_files()
+    except Exception:
+        logger.warning(
+            'Startup sweep of orphaned agent-spawn temp files failed (non-fatal, startup continues)',
+            exc_info=True,
+        )
+    harness = Harness(config, deployed_sha=deployed_sha)
 
     async def _main():
         # Route SIGTERM/SIGINT through asyncio so CancelledError flows into
@@ -268,13 +361,15 @@ def run(prd: Path | None, config_path: Path | None, dry_run: bool, delay: str | 
             force_dirty_start=force_dirty_start,
             retag_modules=retag_modules,
             until_idle=until_idle,
+            apply_project_slice_weight=True,
         )
 
     try:
-        report = asyncio.run(_main())
+        report = _run_with_bounded_teardown(_main, teardown_secs=TEARDOWN_WATCHDOG_TIMEOUT_SECS)
     except asyncio.CancelledError:
         click.echo('Orchestrator cancelled', err=True)
-        # asyncio.run() has returned — arm the watchdog NOW to guard interpreter
+        # asyncio.run() has returned, its teardown bounded by the teardown
+        # watchdog and that watchdog disarmed — arm this one NOW to guard interpreter
         # shutdown (atexit callbacks + threading._shutdown() joining non-daemon
         # threads). The watchdog is intentionally NOT disarmed: if shutdown
         # completes cleanly, the daemon thread is killed with the process;
@@ -289,7 +384,9 @@ def run(prd: Path | None, config_path: Path | None, dry_run: bool, delay: str | 
 
     # asyncio.run() has returned and the report has been emitted — arm the watchdog
     # NOW to guard interpreter shutdown (atexit callbacks + threading._shutdown()
-    # joining non-daemon threads). Placed AFTER click.echo so user-visible work is
+    # joining non-daemon threads). asyncio.run()'s own teardown was bounded
+    # separately, by the teardown watchdog, which is disarmed before the report
+    # echo. Placed AFTER click.echo so user-visible work is
     # not covered by the timer; placed BEFORE the sys.exit(1) branch so both the
     # clean and blocked-exit paths are guarded — non-daemon threads from
     # harness.run() can linger regardless of whether tasks were blocked.
@@ -309,21 +406,12 @@ def run(prd: Path | None, config_path: Path | None, dry_run: bool, delay: str | 
 
 
 @main.command()
-@click.option('--config', 'config_path', type=click.Path(exists=True, path_type=Path),
-              default=None,
-              help='Path to orchestrator config YAML (REQUIRED unless ORCH_CONFIG_PATH '
-                   'is set). Selects the target project — sets project_root and '
-                   'fused_memory.project_id.')
-def status(config_path: Path | None):
+@pass_config()
+def status(config: OrchestratorConfig):
     """Show current task tree and status."""
     from orchestrator.overrides import OverrideStore
     from orchestrator.scheduler import Scheduler
 
-    try:
-        config = load_config(config_path)
-    except ConfigRequiredError as e:
-        click.echo(f'Error: {e}', err=True)
-        sys.exit(1)
     scheduler = Scheduler(config, override_store=OverrideStore.from_config(config))
 
     async def _show():
@@ -342,12 +430,134 @@ def status(config_path: Path | None):
     asyncio.run(_show())
 
 
+@main.command('flake-ledger')
+@pass_config()
+def flake_ledger_cmd(config: OrchestratorConfig):
+    """Print the flake ledger report: open debt, recurrence chains, health counters.
+
+    READ ONLY. This command opens no debt, files no task, resolves nothing and
+    escalates nothing, and it will NOT create a ledger DB for a project that has
+    none — it reports the absence instead. It also reads each open row's owner
+    status live from fused-memory, and says READ FAILED when it cannot.
+    """
+    # Named flake_ledger_cmd so the function does not shadow the flake_ledger module.
+    from orchestrator.flake_ledger import ledger_db_path
+    from orchestrator.flake_report import build_report, corroborate_owners, render_report
+
+    # Built only when there are owners to read, so an absent ledger never builds one.
+    async def read_statuses(ids: list[str]) -> tuple[dict[str, str], Exception | None]:
+        from orchestrator.chronic_flake import SchedulerChronicFlakeTaskClient
+        from orchestrator.scheduler import Scheduler
+
+        client = SchedulerChronicFlakeTaskClient(Scheduler(config), config.project_root)
+        return await client.get_statuses(ids)
+
+    report = build_report(ledger_db_path(Path(config.project_root)))
+    report = asyncio.run(corroborate_owners(report, read_statuses))
+    click.echo(render_report(report))
+
+
+@main.group('verify-cache')
+def verify_cache_group():
+    """The verify-result cache (plans/verify-result-cache-prd.md)."""
+
+
+@verify_cache_group.command('status')
+@pass_config()
+def verify_cache_status_cmd(config: OrchestratorConfig):
+    """Print each role's cache mode, the registry's greens by tier, and the kill switch.
+
+    READ ONLY: it will NOT create a registry for a project that has none.
+    """
+    from datetime import UTC, datetime
+
+    from orchestrator.verify_cache.registry import (
+        Registry,
+        RegistryError,
+        RegistrySummary,
+        registry_db_path,
+    )
+    from orchestrator.verify_cache.status import render_status
+
+    summary: RegistrySummary | RegistryError
+    try:
+        summary = asyncio.run(Registry(registry_db_path(Path(config.project_root))).summary())
+    except RegistryError as e:
+        summary = e
+    for line in render_status(config.verify_cache, summary, datetime.now(UTC)):
+        click.echo(line)
+
+
+@verify_cache_group.command('audit-run')
+@pass_config(help=f'{CONFIG_OPTION_HELP_PREFIX} Its project_root is the tree audited.')
+@click.option('--log-dir', type=click.Path(path_type=Path), default=None,
+              help='Where each module\'s raw output is written '
+                   '(default: <project_root>/.df-verify-cache-audit).')
+def verify_cache_audit_run_cmd(config: OrchestratorConfig, log_dir: Path | None):
+    """Run every module's test leg uncached, printing failures as <module>::<node id>.
+
+    The offline lane's verify-cache-audit command (plans/verify-result-cache-prd.md § Audit).
+    """
+    from orchestrator.verify_cache.audit_run import DEFAULT_LOG_DIR, drop_runner_only_env, run_audit
+
+    drop_runner_only_env(os.environ)
+    tree = Path(config.project_root)
+    sys.exit(asyncio.run(run_audit(tree, config, log_dir or tree / DEFAULT_LOG_DIR)))
+
+
+@verify_cache_group.command('enable')
+@click.option('--reason', required=True, help='Why the cache is safe to re-enable; recorded on the policy row.')
+@pass_config(help=f'{CONFIG_OPTION_HELP_PREFIX} Selects the target project.')
+def verify_cache_enable_cmd(reason: str, config: OrchestratorConfig):
+    """Clear the verify cache's kill switch (an operator write, plans/verify-result-cache-prd.md § Audit).
+
+    Also resolves the pending kill-switch L2 blockers, whose disable this ends.
+    """
+    from datetime import UTC, datetime
+
+    from escalation.queue import EscalationQueue
+    from shared.project_layout import escalation_queue_dir
+
+    from orchestrator.verify_cache.audit import enable
+    from orchestrator.verify_cache.audit_hook import resolve_ended_blockers
+    from orchestrator.verify_cache.registry import Registry, RegistryError, registry_db_path
+    from orchestrator.verify_cache.status import render_status
+
+    project_root = Path(config.project_root)
+    registry = Registry(registry_db_path(project_root))
+    now = datetime.now(UTC)
+    try:
+        policy = asyncio.run(enable(registry, reason, now))
+        summary = asyncio.run(registry.summary())
+    except RegistryError as e:
+        click.echo(f'Error: {e}', err=True)
+        sys.exit(1)
+    except ValueError as e:
+        raise click.BadParameter(str(e), param_hint='--reason') from e
+    for line in render_status(config.verify_cache, summary, now):
+        click.echo(line)
+    queue_dir = escalation_queue_dir(project_root)
+    if not queue_dir.is_dir():
+        return
+    try:
+        resolved = resolve_ended_blockers(
+            EscalationQueue(queue_dir), policy, now,
+            resolved_by='interactive', resolution_class='actionable',
+            resolution=f'Verify cache re-enabled by the operator: {policy.reason}',
+        )
+    except OSError as e:
+        click.echo(
+            f'Error: the cache is re-enabled, but resolving its kill-switch blocker in {queue_dir} failed: {e}; '
+            'resolve it with resolve_issue',
+            err=True,
+        )
+        sys.exit(1)
+    for escalation_id in resolved:
+        click.echo(f'resolved kill-switch blocker {escalation_id}')
+
+
 @main.command('probe-models')
-@click.option('--config', 'config_path', type=click.Path(exists=True, path_type=Path),
-              default=None,
-              help='Path to orchestrator config YAML (REQUIRED unless ORCH_CONFIG_PATH '
-                   'is set). Selects the target project — sets project_root and '
-                   'fused_memory.project_id.')
+@pass_config()
 @click.option('--models', 'models_csv', default=None,
               help='Comma-separated model list to probe, overriding the default '
                    '(config.routing.allowed_models plus the fable candidate model).')
@@ -355,23 +565,32 @@ def status(config_path: Path | None):
               default=None,
               help='Where to write the rendered probe artifact YAML (default: '
                    'routing.DEFAULT_PROBE_ARTIFACT_PATH, i.e. config/model-availability.yaml).')
-def probe_models(config_path: Path | None, models_csv: str | None, output_path: Path | None):
+@click.option('--budget-usd', 'budget_usd',
+              type=click.FloatRange(min=0.0, min_open=True),
+              default=None,
+              help='Per-invocation USD ceiling for each probe turn (default: '
+                   'routing.DEFAULT_PROBE_BUDGET_USD). Must exceed one turn of the '
+                   'most expensive probed model — undershooting it reports '
+                   'budget_too_low, not unavailability.')
+def probe_models(config: OrchestratorConfig, models_csv: str | None, output_path: Path | None,
+                 budget_usd: float | None):
     """Probe every configured pool account x candidate model for availability
     and write the rendered status artifact (default config/model-availability.yaml).
 
     The probed model set defaults to config.routing.allowed_models plus the
     fable candidate model (see routing.probe_models); pass --models to
     override with an explicit comma-separated list.
+
+    The per-turn budget defaults to routing.DEFAULT_PROBE_BUDGET_USD and must
+    clear one turn of the most expensive probed model; a pair that aborts on
+    that ceiling is recorded as budget_too_low, never as unavailability. Such
+    pairs are counted and warned about on stderr, and a run in which EVERY
+    probed pair aborted exits non-zero -- it produced no availability
+    evidence at all, so it must not read as a successful probe.
     """
     from datetime import UTC, datetime
 
     from orchestrator import routing
-
-    try:
-        config = load_config(config_path)
-    except ConfigRequiredError as e:
-        click.echo(f'Error: {e}', err=True)
-        sys.exit(1)
 
     models = (
         [m.strip() for m in models_csv.split(',') if m.strip()] or None
@@ -379,8 +598,10 @@ def probe_models(config_path: Path | None, models_csv: str | None, output_path: 
         else None
     )
 
+    budget = routing.DEFAULT_PROBE_BUDGET_USD if budget_usd is None else budget_usd
     report = asyncio.run(routing.probe_models(
         config.usage_cap.accounts, config.routing.allowed_models, models=models,
+        budget_usd=budget,
     ))
 
     generated_at = datetime.now(UTC).isoformat()
@@ -391,6 +612,30 @@ def probe_models(config_path: Path | None, models_csv: str | None, output_path: 
     out_path.write_text(artifact)
 
     click.echo(f'Wrote model availability artifact to {out_path}')
+
+    # A POSITIVE but mis-sized ceiling passes the parse-time FloatRange check
+    # and still yields an artifact that is uniformly and plausibly wrong, so
+    # the artifact alone cannot be the only signal: an operator who never
+    # opens the YAML would read exit 0 as evidence the models are available.
+    # The artifact is written first either way -- budget_too_low rows are
+    # honest evidence about the BUDGET, and must not be discarded.
+    statuses = [status for row in report.accounts.values() for status in row.values()]
+    aborted = sum(1 for status in statuses
+                  if status == routing.PROBE_BUDGET_TOO_LOW_STATUS)
+    if aborted:
+        click.echo(
+            f'WARNING: {aborted} of {len(statuses)} (account, model) pairs aborted '
+            f'on the budget ceiling in force (--budget-usd {budget}); those rows are '
+            f'NOT availability evidence. Re-run with a higher --budget-usd.',
+            err=True,
+        )
+        if aborted == len(statuses):
+            click.echo(
+                'Error: every probed pair aborted on the budget ceiling — this run '
+                'produced no availability evidence.',
+                err=True,
+            )
+            sys.exit(1)
 
 
 @main.command('check-config')
@@ -416,13 +661,38 @@ def check_config(config_path: Path | None):
     \b
       * name it with the reserved ``x_``/``x-`` prefix (works at any depth, no
         config ceremony) — the preferred form for a NEW knob;
-      * add its dotted path to ``config_key_census.ignore`` in the same YAML
-        (fnmatch globs, so ``cpu_governance.*`` opts out a whole namespace) —
-        for existing names other tooling already greps for.
+      * add it to ``config_key_census.ignore`` in the same YAML (fnmatch globs,
+        so ``cpu_governance.*`` opts out a whole namespace) — for existing
+        names other tooling already greps for.
 
-    Exits 1 if any GENUINELY-unknown key is found, else 0.
+    An ignore entry is an ASSERTION that some non-orchestrator consumer reads
+    the key, so it should carry a justification:
+
+    \b
+      config_key_census:
+        ignore:
+          - path: cpu_governance.weights
+            reason: read verbatim by scripts/cpu-governed-exec.sh
+          - path: warm_lane_pool
+            reason: temporary — pending #5908, which deletes this entry
+
+    A bare string still works but reports as un-reasoned DEBT.  If the consumer
+    has NOT landed yet, the reason must cite its tracking task as ``#NNNN``:
+    an uncited "pending" claim has no expiry, so nothing will ever re-check it.
+
+    \b
+    Exit codes:
+      0 — no unknown keys and no HARD ignore-entry findings (advisory findings
+          are reported but stay exit-neutral).  An EMPTY project YAML is a
+          legitimate clean result — it means "use all defaults" — and exits 0;
+      1 — at least one GENUINELY-unknown key, OR the file could not be read or
+          parsed at all (a census of nothing is not a clean census, task 4124);
+          dominates 2;
+      2 — no unknown keys, but at least one HARD ignore-entry finding
+          (self-refuting / missing-cite / orphaned).
     """
     from orchestrator.config import census_config_keys
+    from orchestrator.config_census_ignore import HARD_KINDS
 
     # Resolve the config path (arg wins, then ORCH_CONFIG_PATH) without
     # constructing a validated config — census only needs the raw YAML path.
@@ -440,6 +710,31 @@ def check_config(config_path: Path | None):
 
     census = census_config_keys(config_path)
 
+    # An empty census has two very different causes.  Fail CLOSED when nothing
+    # could be parsed: the census's own fail-open contract (config.py) makes
+    # `unknown` empty for an unreadable/unparseable file, so printing the
+    # affirmative OK below would tell an operator a config is safe precisely
+    # when it could not be inspected at all.  The ignored/OK sections are both
+    # vacuous in this case, so return before either — and so is the
+    # ignore-entry audit below, which re-reads the same unparseable file.
+    if census.parse_error:
+        click.echo(f'Error: {census.parse_error}', err=True)
+        click.echo(
+            'Could not lint this file, so its config keys are UNKNOWN — this is '
+            'NOT a clean result. Fix the file and re-run.',
+            err=True,
+        )
+        sys.exit(1)
+
+    # A broken lint must never turn a working gate into a crash, so the audit
+    # (which reaches the filesystem and a sqlite store) degrades to "no
+    # findings" rather than taking check-config down with it.
+    try:
+        findings = audit_census_ignore_entries(config_path)
+    except Exception as exc:  # reported, never swallowed
+        click.echo(f'WARNING: ignore-entry audit failed ({exc}) — skipped.', err=True)
+        findings = []
+
     # Informational FIRST, and explicitly marked as such: these keys were
     # deliberately excused, so listing them keeps an over-broad glob auditable
     # without ever reading as a failure or touching the exit code.
@@ -453,10 +748,37 @@ def check_config(config_path: Path | None):
             '(informational — does not affect the exit code):'
         )
         for ik in census.ignored:
-            click.echo(f'  {ik.path}  ({_REASONS.get(ik.reason, f"ignored: {ik.reason}")})')
+            label = _REASONS.get(ik.reason, f'ignored: {ik.reason}')
+            # An allowlisted key with no operator justification is DEBT, and
+            # saying so is the whole point: an unexplained entry is an
+            # unfalsifiable assertion about a consumer nobody can check.
+            if ik.note:
+                suffix = f'  — {ik.note}'
+            elif ik.reason == 'allowlist':
+                suffix = '  — no reason given (undocumented debt)'
+            else:
+                suffix = ''
+            click.echo(f'  {ik.path}  ({label}){suffix}')
+        click.echo('')
+
+    hard = [f for f in findings if f.kind in HARD_KINDS]
+    if findings:
+        advisory = [f for f in findings if f.kind not in HARD_KINDS]
+        click.echo(f'{len(findings)} finding(s) in config_key_census.ignore entries:')
+        for f in hard + advisory:
+            click.echo(f'  [{f.severity}] {f.kind}: {f.detail}')
+        click.echo(
+            f'  ({len(advisory)} advisory finding(s) do not affect the exit code.)'
+        )
         click.echo('')
 
     if not census.unknown:
+        if hard:
+            click.echo(
+                f'FAIL: {config_path} has {len(hard)} hard ignore-entry '
+                'finding(s) (no unknown config keys).'
+            )
+            sys.exit(2)
         click.echo(f'OK: {config_path} has no unknown config keys.')
         sys.exit(0)
 
@@ -472,79 +794,79 @@ def check_config(config_path: Path | None):
     sys.exit(1)
 
 
-@main.command('verify-merge')
-@click.option('--sha', required=True, help='Merge commit SHA to verify (must be present in the local repo)')
-@click.option('--spec', 'spec_json', required=True, help='MergeVerifySpec as a JSON string (from RemoteRunner dispatch)')
-@click.option('--config', 'config_path', type=click.Path(exists=True, path_type=Path),
-              default=None,
-              help='Path to orchestrator config YAML (REQUIRED unless ORCH_CONFIG_PATH '
-                   'is set). Selects the target project — sets project_root and '
-                   'fused_memory.project_id.')
-@click.option('--request-id', default=None,
-              help='Optional request ID for cancellation support (task 1732 α).  '
-                   'When provided: joins a new process group via setsid, writes the pgid to '
-                   '<worktree_base>/.merge_verify_pgids/<request-id> at startup, and removes '
-                   'it on exit (normal or exceptional).  A concurrent '
-                   '``orchestrator cancel-verify --request-id X`` can then kill the entire '
-                   'descendant tree (including start_new_session build escapes).  '
-                   'Absent → today\'s exact behavior, back-compat.  '
-                   'RemoteRunner wiring is deferred to tasks β/γ.')
-def verify_merge(sha: str, spec_json: str, config_path: Path | None, request_id: str | None):
-    """Run the merge-verify bundle at a given SHA and emit a VerifyResult JSON to stdout.
+def _hand_exit_to_fired_watchdog(
+    fired: threading.Event | None, thread: threading.Thread | None,
+) -> None:
+    """If the stdin watchdog has fired, block on it; it owns the remote verify's exit.
 
-    Materialises a detached worktree at --sha, runs the same scoped + unscoped
-    verify bundle the merge queue uses (fidelity by construction), and emits a
-    single VerifyResult JSON document to stdout.  All logs go to stderr.  Exit
-    code is 0 on success (even when passed=False); non-zero only on bad input or
-    infrastructure errors.
+    A fired watchdog has already tree-killed the build and is mid-way through
+    its own SIGTERM -> grace_secs sleep -> SIGKILL escalation (see
+    fire_watchdog_kill), so never print a (misleading) VerifyResult for a
+    build we just killed out from under ourselves. Block on the watchdog
+    thread instead of exiting immediately: a bare sys.exit(1) begins
+    interpreter shutdown right away, and since the watchdog thread is a
+    daemon thread, shutdown does not wait for it -- it can be torn down
+    mid-sleep, before the SIGKILL escalation that exists specifically to reap
+    start_new_session grandchildren (cargo/rustc) that survived SIGTERM.
+    Joining lets fire_watchdog_kill's own unconditional os._exit(1) be the
+    authoritative exit once the full escalation has run to completion.
 
-    When ``git.persistent_merge_worktree`` is on (PRD §8 η), the subcommand
-    reuses the host's own fixed-path warm worktree (``_merge-verify``) across
-    invocations via :meth:`~orchestrator.git_ops.GitOps.acquire_host_verify_worktree`,
-    mirroring κ invariants 1–6 on the laptop host.  The periodic from-scratch
-    safety valve (invariant 6) is driven by a disk-persistent per-host attempt
-    counter so it fires correctly even across stateless CLI invocations.
+    The watchdog's SIGTERM routinely makes the body RAISE rather than return
+    (e.g. it kills ``git worktree add``, rc=-15), so the shared prologue
+    (:func:`_run_remote_verify`) calls this from its ``finally``: every exit
+    path must hand off, not just a return.
+    """
+    if fired is None or not fired.is_set():
+        return
+    if thread is not None:
+        thread.join()
+    sys.exit(1)
 
-    When ``--request-id`` is supplied, the subcommand also calls ``os.setsid``
-    (via :func:`~orchestrator.verify_cancel.start_own_process_group`) to join a
-    new process group and writes its pgid to
-    ``<worktree_base>/.merge_verify_pgids/<request-id>``.  The file is removed
-    on exit.  A concurrent ``orchestrator cancel-verify --request-id X`` reads
-    the file and kills the full descendant tree (capturing ``start_new_session``
-    build escapes via a ``/proc`` PPID walk) plus a ``killpg`` backstop.
 
-    **pgid-file directory**: ``<worktree_base>/.merge_verify_pgids`` —
-    host-side, per-project, never pruned or git-cleaned (mirrors the
-    ``.merge_verify_host_attempts`` counter precedent at the same path).
-    ``worktree_base`` is ``GitOps(config.git, config.project_root).worktree_base``.
-    Both hosts run the ``df`` checkout, so landing ``--request-id`` support on
-    ``main`` ships the contract to the laptop via its normal checkout sync.
+class _RemoteVerifyContext(NamedTuple):
+    """One remote verify invocation's host state, shared by its preflight and body."""
 
-    Consumer: RemoteRunner (δ) parses stdout as a VerifyResult.
+    config: OrchestratorConfig
+    git_ops: 'GitOps'
+    pgid_path: Path | None
+
+
+_SpecT = TypeVar('_SpecT')
+
+
+def _run_remote_verify(
+    config: OrchestratorConfig,
+    spec_json: str,
+    request_id: str | None,
+    *,
+    parse_spec: Callable[[str], _SpecT],
+    body: Callable[[_RemoteVerifyContext, _SpecT], Coroutine[Any, Any, 'VerifyResult']],
+    preflight: Callable[
+        [_RemoteVerifyContext], AbstractContextManager['VerifyResult | None']
+    ] | None = None,
+) -> None:
+    """The prologue and exit contract every remote verify subcommand shares.
+
+    Parses ``--spec``, joins its own process group and writes
+    the pgid file (with ``--request-id``), enters *preflight*, starts the
+    stdin watchdog, then runs *body*.  Prints one VerifyResult JSON to stdout
+    and exits 0 whenever it has one (even ``passed=False``); exits 1 on bad
+    input or an infrastructure error.  *preflight* yields a VerifyResult to
+    emit instead of running *body*, or None to proceed; whatever it holds is
+    released first on the way out.
     """
     from orchestrator.git_ops import GitOps
-    from orchestrator.verify_runner import (
-        make_flock_contention_result,
-        result_to_json,
-        run_merge_verify_on_worktree,
-        spec_from_json,
-    )
+    from orchestrator.verify_runner import result_to_json
 
     try:
-        config = load_config(config_path)
-    except ConfigRequiredError as e:
-        click.echo(f'Error: {e}', err=True)
-        sys.exit(1)
-
-    try:
-        spec = spec_from_json(spec_json)
+        spec = parse_spec(spec_json)
     except Exception as e:
         click.echo(f'Error: invalid --spec: {e}', err=True)
         sys.exit(1)
 
     # Construct GitOps once; reused for both pgid-path derivation (when --request-id
-    # is set) and the async worktree acquisition inside _run().  GitOps.__init__ is
-    # side-effect-free so constructing it here is safe in all paths.
+    # is set) and the body's worktree work.  GitOps.__init__ is side-effect-free so
+    # constructing it here is safe in all paths.
     git_ops = GitOps(config.git, config.project_root)
 
     # Cancellation support: write pgid file before starting work so that a
@@ -554,51 +876,82 @@ def verify_merge(sha: str, spec_json: str, config_path: Path | None, request_id:
         pgf = pgid_file(git_ops.worktree_base, request_id)
         pgid = start_own_process_group()
         write_pgid_file(pgf, pgid)
+    ctx = _RemoteVerifyContext(config, git_ops, pgf)
 
-    async def _run():
-        # git_ops closed over from outer scope — same instance, no redundant construction.
-        wt = await git_ops.acquire_host_verify_worktree(sha)
-        try:
-            # LANE-lock hold scoped to the BUILD only (task 2830, esc-2830-1).
-            #
-            # acquire_host_verify_worktree -> reset_persistent_merge_worktree
-            # (git_ops.py) itself acquires the SAME lane lock across its tree
-            # mutation and releases it before returning. The CLI span therefore
-            # must NOT hold the lane lock across the reset: a second in-process
-            # fcntl.flock on the same inode via an independent fd self-conflicts
-            # (flock(2): independent fds are treated independently and deny each
-            # other), so reset's bounded lane-lock wait could never succeed —
-            # 30s timeout -> RuntimeError -> verify exits without ever building.
-            #
-            # Instead mirror the LOCAL flow (merge_queue.py: reset-hold released,
-            # THEN merge_verify_lease re-acquires the same lane lock around the
-            # build): re-take the lane lock HERE, after the reset returns, for the
-            # build's duration only, and record the shared holder-pgid so a
-            # concurrent lane actor / waiter reads the correct holder. Fail-OPEN
-            # on a contended acquire (proceed unrecorded, mirroring
-            # GitOps.merge_verify_lease) — any live actor is already excluded by
-            # the pre-flight gate + the compat co-lock held across the whole span.
-            build_lane_fd: int | None = None
-            if config.git.persistent_merge_worktree:
-                build_wait = _env_float(
-                    'ORCH_MERGE_VERIFY_FLOCK_WAIT_SECS', MERGE_VERIFY_FLOCK_WAIT_SECS
-                )
-                build_lane_fd = await asyncio.to_thread(
-                    acquire_merge_verify_flock,
-                    lane_lock_path(git_ops.persistent_merge_worktree_path),
-                    build_wait,
-                )
-                if build_lane_fd is not None:
-                    write_lock_holder_pgid(git_ops.worktree_base, os.getpgrp())
-            try:
-                return await run_merge_verify_on_worktree(wt, config, spec, merge_sha=sha)
-            finally:
-                if build_lane_fd is not None:
-                    remove_lock_holder_pgid(git_ops.worktree_base)
-                    release_merge_verify_flock(build_lane_fd)
-        finally:
-            await git_ops.cleanup_merge_worktree(wt)
+    preflight_hold = contextlib.ExitStack()
+    preflight_result = (
+        preflight_hold.enter_context(preflight(ctx)) if preflight is not None else None
+    )
+    if preflight_result is not None:
+        preflight_hold.close()
+        # Always remove the pgid file so cancel-verify knows this run is done.
+        if pgf is not None:
+            remove_pgid_file(pgf)
+        # Any preflight result exits 0: stdout is the only channel to
+        # RemoteRunner, which reads a non-zero exit as RunnerUnavailable and
+        # discards the result.
+        click.echo(result_to_json(preflight_result))
+        return
 
+    # Connection-death watchdog (task 2308 γ): ties this process's lifetime to
+    # the ssh dispatch channel on fd 0. Fires on stdin EOF (channel closed) or
+    # heartbeat starvation (hard partition), killing the build subtree and
+    # self-exiting instead of surviving as a setsid orphan. Same pgid as the
+    # pgid file, so a concurrent cancel-verify still tree-kills coherently.
+    #
+    # watchdog_fired is set as the FIRST action of the fire callback --
+    # strictly before any signal is sent -- so it always happens-before the
+    # kill that unblocks _run_cmd's awaited subprocess. Without this flag,
+    # a killed build command returns a normal (if failed) VerifyResult up
+    # through the body, and the main thread can reach the click.echo/return
+    # below and exit 0 in a race against fire_watchdog_kill's own grace-period
+    # sleep + os._exit(1) -- observed as flaky exit codes on the same
+    # watchdog-fired outcome (task 2309 boundary gate).
+    watchdog_fired: threading.Event | None = None
+    watchdog_thread: threading.Thread | None = None
+    if request_id is not None:
+        heartbeat_timeout = _env_float(
+            'ORCH_WATCHDOG_HEARTBEAT_TIMEOUT_SECS', WATCHDOG_HEARTBEAT_TIMEOUT_SECS
+        )
+        grace_secs = _env_float('ORCH_WATCHDOG_KILL_GRACE_SECS', WATCHDOG_KILL_GRACE_SECS)
+        watchdog_fired = threading.Event()
+
+        def _on_watchdog_fire(trigger: WatchdogTrigger) -> None:
+            watchdog_fired.set()
+            fire_watchdog_kill(pgid, trigger=trigger, grace_secs=grace_secs)
+
+        watchdog_thread = start_stdin_watchdog(
+            pgid, heartbeat_timeout=heartbeat_timeout, fire=_on_watchdog_fire
+        )
+
+    try:
+        result = asyncio.run(body(ctx, spec))
+    except Exception as e:
+        click.echo(f'Error: {e}', err=True)
+        sys.exit(1)
+    finally:
+        preflight_hold.close()
+        # Always remove the pgid file so cancel-verify knows this run is done.
+        if pgf is not None:
+            remove_pgid_file(pgf)
+        _hand_exit_to_fired_watchdog(watchdog_fired, watchdog_thread)
+
+    click.echo(result_to_json(result))
+
+
+@contextlib.contextmanager
+def _merge_lane_gate(ctx: _RemoteVerifyContext) -> Iterator['VerifyResult | None']:
+    """verify-merge's preflight: the laptop lane-lock contention gate.
+
+    Yields a distinguished contention VerifyResult when a lane actor holds the
+    lane (the caller emits it without touching the tree), else None while
+    holding the compat co-lock until exit.  The contention result is a
+    passed=False verdict that exits 0, so beta receives its discriminant
+    rather than a RunnerUnavailable.
+    """
+    from orchestrator.verify_runner import make_flock_contention_result
+
+    git_ops = ctx.git_ops
     # Flock guard (task 2306 α; converged onto the shared lane lock in task 2830):
     # serialize the verify span under a laptop-side exclusive fcntl.flock when the
     # persistent-worktree knob is on — the per-host serial invariant that
@@ -611,14 +964,14 @@ def verify_merge(sha: str, spec_json: str, config_path: Path | None, request_id:
     # GitOps.reset_persistent_merge_worktree, and reify's seed/thin/gc take (task
     # 2685) — so a laptop lane actor is mutually excluded from a live laptop verify.
     # Because reset_persistent_merge_worktree re-acquires this SAME lane lock across
-    # its own tree mutation, the CLI CANNOT hold it continuously across _run() (an
+    # its own tree mutation, the CLI CANNOT hold it continuously across the body (an
     # in-process second flock on the same inode self-conflicts — esc-2830-1). The
     # lane lock therefore has a SPLIT lifetime, mirroring the LOCAL flow's sequential
     # reset-hold-then-lease-hold (merge_queue.py):
     #   (a) here, PRE-FLIGHT — a bounded-wait acquire used purely as a contention
     #       GATE (a live lane actor -> distinguished result, NO tree touch, PRD
-    #       Invariant 5), then RELEASED before _run() so reset can take it;
-    #   (b) inside _run(), re-acquired around the BUILD only (see _run above).
+    #       Invariant 5), then RELEASED before the body so reset can take it;
+    #   (b) inside _verify_merge_body, re-acquired around the BUILD only.
     #
     # The divergent .merge_verify.lock (merge_verify_lock_path) is RETAINED as a
     # transitional rollout CO-lock, held across the WHOLE span: it is a DIFFERENT
@@ -630,7 +983,7 @@ def verify_merge(sha: str, spec_json: str, config_path: Path | None, request_id:
     # lock's split lifetime alone (matching merge_verify_lease).
     #
     # Acquire LANE-first (the gate), then COMPAT. The shared holder-pgid is written
-    # by _run()'s build-scoped hold, NOT here: an in-flight OLD caller wrote that
+    # by the body's build-scoped hold, NOT here: an in-flight OLD caller wrote that
     # holder when it took the old lock, so a NEW waiter that loses the bounded wait
     # must still read the CORRECT (un-clobbered) holder on the contention path below.
     # acquire_merge_verify_flock is a bounded-wait poll (returns None on timeout,
@@ -641,7 +994,7 @@ def verify_merge(sha: str, spec_json: str, config_path: Path | None, request_id:
     lane_fd: int | None = None
     compat_fd: int | None = None
     contention_result = None
-    if config.git.persistent_merge_worktree:
+    if ctx.config.git.persistent_merge_worktree:
         flock_wait_secs = _env_float(
             'ORCH_MERGE_VERIFY_FLOCK_WAIT_SECS', MERGE_VERIFY_FLOCK_WAIT_SECS
         )
@@ -656,7 +1009,7 @@ def verify_merge(sha: str, spec_json: str, config_path: Path | None, request_id:
             # ephemeral _merge-<uuid> fallback — PRD Invariant 5).
             #
             # holder_pgid can legitimately be None here — a DIAGNOSTIC-only window,
-            # not a correctness gap. The shared holder is written by _run()'s
+            # not a correctness gap. The shared holder is written by the body's
             # build-scoped hold, NOT at this gate (see the DUAL-LOCK note above). So
             # when the current holder is another NEW-code verify-merge that has
             # passed its own gate, released the lane lock, and is mid-reset inside
@@ -666,8 +1019,8 @@ def verify_merge(sha: str, spec_json: str, config_path: Path | None, request_id:
             # are intact; make_flock_contention_result tolerates holder_pgid=None
             # (only the diagnostic's holder_pgid field is null). A follow-up could
             # restore always-present holder visibility by also writing the shared
-            # holder at this gate, at the cost of extra cleanup on _run()'s fail-open
-            # (build_lane_fd is None) path.
+            # holder at this gate, at the cost of extra cleanup on the body's
+            # fail-open (build_lane_fd is None) path.
             holder_pgid = read_lock_holder_pgid(git_ops.worktree_base)
             contention_result = make_flock_contention_result(
                 host=socket.gethostname(),
@@ -701,7 +1054,7 @@ def verify_merge(sha: str, spec_json: str, config_path: Path | None, request_id:
                 # lane lock now: reset_persistent_merge_worktree (inside
                 # acquire_host_verify_worktree) re-acquires this SAME lane lock
                 # across its tree mutation, and an in-process second flock on the
-                # same inode would self-conflict (esc-2830-1). _run() re-takes the
+                # same inode would self-conflict (esc-2830-1). The body re-takes the
                 # lane lock and writes the shared holder-pgid for the build's
                 # duration only. The compat co-lock (compat_fd) stays held across
                 # the WHOLE span — a DIFFERENT inode, so no self-conflict — closing
@@ -710,93 +1063,299 @@ def verify_merge(sha: str, spec_json: str, config_path: Path | None, request_id:
                 release_merge_verify_flock(lane_fd)
                 lane_fd = None
 
-    if contention_result is not None:
-        # Always remove the pgid file so cancel-verify knows this run is done.
-        if pgf is not None:
-            remove_pgid_file(pgf)
-        # Contention must exit 0: a passed=False VerifyResult on stdout is the
-        # only delivery channel to beta — a non-zero exit makes RemoteRunner
-        # treat this as RunnerUnavailable and beta never sees the discriminant.
-        click.echo(result_to_json(contention_result))
-        return
-
-    # Connection-death watchdog (task 2308 γ): ties this process's lifetime to
-    # the ssh dispatch channel on fd 0. Fires on stdin EOF (channel closed) or
-    # heartbeat starvation (hard partition), killing the build subtree and
-    # self-exiting instead of surviving as a setsid orphan. Same pgid as the
-    # pgid file, so a concurrent cancel-verify still tree-kills coherently.
-    #
-    # watchdog_fired is set as the FIRST action of the fire callback --
-    # strictly before any signal is sent -- so it always happens-before the
-    # kill that unblocks _run_cmd's awaited subprocess. Without this flag,
-    # a killed build command returns a normal (if failed) VerifyResult up
-    # through _run(), and the main thread can reach the click.echo/return
-    # below and exit 0 in a race against fire_watchdog_kill's own grace-period
-    # sleep + os._exit(1) -- observed as flaky exit codes on the same
-    # watchdog-fired outcome (task 2309 boundary gate).
-    watchdog_fired: threading.Event | None = None
-    watchdog_thread: threading.Thread | None = None
-    if request_id is not None:
-        heartbeat_timeout = _env_float(
-            'ORCH_WATCHDOG_HEARTBEAT_TIMEOUT_SECS', WATCHDOG_HEARTBEAT_TIMEOUT_SECS
-        )
-        grace_secs = _env_float('ORCH_WATCHDOG_KILL_GRACE_SECS', WATCHDOG_KILL_GRACE_SECS)
-        watchdog_fired = threading.Event()
-
-        def _on_watchdog_fire() -> None:
-            watchdog_fired.set()
-            fire_watchdog_kill(pgid, grace_secs=grace_secs)
-
-        watchdog_thread = start_stdin_watchdog(
-            pgid, heartbeat_timeout=heartbeat_timeout, fire=_on_watchdog_fire
-        )
-
     try:
-        result = asyncio.run(_run())
-    except Exception as e:
-        click.echo(f'Error: {e}', err=True)
-        sys.exit(1)
+        yield contention_result
     finally:
         # Past the contention gate the lane lock is already released (the gate
-        # holds it only pre-flight; _run()'s build-scoped hold manages the lane
+        # holds it only pre-flight; the body's build-scoped hold manages the lane
         # lock and the shared holder-pgid — task 2830 split lifetime, esc-2830-1).
-        # Only the compat co-lock is held across the whole span here; release it.
+        # Only the compat co-lock is held across the whole span; release it.
         if compat_fd is not None:
             release_merge_verify_flock(compat_fd)
-        # Always remove the pgid file so cancel-verify knows this run is done.
-        if pgf is not None:
-            remove_pgid_file(pgf)
 
-    if watchdog_fired is not None and watchdog_fired.is_set():
-        # The watchdog already tree-killed the build and is mid-way through
-        # its own SIGTERM -> grace_secs sleep -> SIGKILL escalation (see
-        # fire_watchdog_kill) -- never print a (misleading) VerifyResult for
-        # a build we just killed out from under ourselves. Block on the
-        # watchdog thread itself here instead of exiting immediately: a bare
-        # sys.exit(1) begins interpreter shutdown right away, and since the
-        # watchdog thread is a daemon thread, shutdown does not wait for it --
-        # it can be torn down mid-sleep, before the SIGKILL escalation that
-        # exists specifically to reap start_new_session grandchildren
-        # (cargo/rustc) that survived SIGTERM. Joining lets
-        # fire_watchdog_kill's own unconditional os._exit(1) be the
-        # authoritative exit once the full escalation has run to completion.
-        if watchdog_thread is not None:
-            watchdog_thread.join()
-        sys.exit(1)  # pragma: no cover - fire_watchdog_kill os._exit()s first
 
-    click.echo(result_to_json(result))
+@contextlib.asynccontextmanager
+async def _verify_worktree_lifetime(
+    ctx: _RemoteVerifyContext, wt: Path,
+) -> AsyncIterator[Path]:
+    """Own *wt* for one remote verify: record it beside the pgid file, always remove it.
+
+    The record lets a cancel-verify, whose SIGKILL skips this ``finally``, reap
+    *wt* instead.
+    """
+    try:
+        if ctx.pgid_path is not None:
+            write_worktree_path(ctx.pgid_path, wt)
+        yield wt
+    finally:
+        await ctx.git_ops.cleanup_merge_worktree(wt)
+        if ctx.pgid_path is not None:
+            remove_worktree_path(ctx.pgid_path)
+
+
+async def _verify_merge_body(
+    sha: str, ctx: _RemoteVerifyContext, spec: 'MergeVerifySpec',
+) -> 'VerifyResult':
+    """verify-merge's body: the host's verify worktree at *sha*, then the merge bundle."""
+    from orchestrator.verify_runner import run_merge_verify_on_worktree
+
+    git_ops = ctx.git_ops
+    wt = await git_ops.acquire_host_verify_worktree(sha)
+    async with _verify_worktree_lifetime(ctx, wt):
+        # LANE-lock hold scoped to the BUILD only (task 2830, esc-2830-1).
+        #
+        # acquire_host_verify_worktree -> reset_persistent_merge_worktree
+        # (git_ops.py) itself acquires the SAME lane lock across its tree
+        # mutation and releases it before returning. The CLI span therefore
+        # must NOT hold the lane lock across the reset: a second in-process
+        # fcntl.flock on the same inode via an independent fd self-conflicts
+        # (flock(2): independent fds are treated independently and deny each
+        # other), so reset's bounded lane-lock wait could never succeed —
+        # 30s timeout -> RuntimeError -> verify exits without ever building.
+        #
+        # Instead mirror the LOCAL flow (merge_queue.py: reset-hold released,
+        # THEN merge_verify_lease re-acquires the same lane lock around the
+        # build): re-take the lane lock HERE, after the reset returns, for the
+        # build's duration only, and record the shared holder-pgid so a
+        # concurrent lane actor / waiter reads the correct holder. Fail-OPEN
+        # on a contended acquire (proceed unrecorded, mirroring
+        # GitOps.merge_verify_lease) — any live actor is already excluded by
+        # the pre-flight gate + the compat co-lock held across the whole span.
+        build_lane_fd: int | None = None
+        if ctx.config.git.persistent_merge_worktree:
+            build_wait = _env_float(
+                'ORCH_MERGE_VERIFY_FLOCK_WAIT_SECS', MERGE_VERIFY_FLOCK_WAIT_SECS
+            )
+            build_lane_fd = await asyncio.to_thread(
+                acquire_merge_verify_flock,
+                lane_lock_path(git_ops.persistent_merge_worktree_path),
+                build_wait,
+            )
+            if build_lane_fd is not None:
+                write_lock_holder_pgid(git_ops.worktree_base, os.getpgrp())
+        try:
+            return await run_merge_verify_on_worktree(wt, ctx.config, spec, merge_sha=sha)
+        finally:
+            if build_lane_fd is not None:
+                remove_lock_holder_pgid(git_ops.worktree_base)
+                release_merge_verify_flock(build_lane_fd)
+
+
+@main.command('verify-merge')
+@click.option('--sha', required=True, help='Merge commit SHA to verify (must be present in the local repo)')
+@click.option('--spec', 'spec_json', required=True, help='MergeVerifySpec as a JSON string (from RemoteRunner dispatch)')
+@pass_config()
+@click.option('--request-id', default=None,
+              help='Optional request ID for cancellation support (task 1732 α).  '
+                   'When provided: joins a new process group via setsid, writes the pgid to '
+                   '<worktree_base>/.merge_verify_pgids/<request-id> at startup, and removes '
+                   'it on exit (normal or exceptional).  A concurrent '
+                   '``orchestrator cancel-verify --request-id X`` can then kill the entire '
+                   'descendant tree (including start_new_session build escapes).  '
+                   'Absent → today\'s exact behavior, back-compat.  '
+                   'RemoteRunner wiring is deferred to tasks β/γ.')
+def verify_merge(sha: str, spec_json: str, config: OrchestratorConfig, request_id: str | None):
+    """Run the merge-verify bundle at a given SHA and emit a VerifyResult JSON to stdout.
+
+    Materialises a detached worktree at --sha, runs the same scoped + unscoped
+    verify bundle the merge queue uses (fidelity by construction), and emits a
+    single VerifyResult JSON document to stdout.  All logs go to stderr.  Exit
+    code is 0 on success (even when passed=False); non-zero only on bad input or
+    infrastructure errors.
+
+    When ``git.persistent_merge_worktree`` is on (PRD §8 η), the subcommand
+    reuses the host's own fixed-path warm worktree (``_merge-verify``) across
+    invocations via :meth:`~orchestrator.git_ops.GitOps.acquire_host_verify_worktree`,
+    mirroring κ invariants 1–6 on the laptop host.  The periodic from-scratch
+    safety valve (invariant 6) is driven by a disk-persistent per-host attempt
+    counter so it fires correctly even across stateless CLI invocations.
+
+    When ``--request-id`` is supplied, the subcommand also calls ``os.setsid``
+    (via :func:`~orchestrator.verify_cancel.start_own_process_group`) to join a
+    new process group and writes its pgid to
+    ``<worktree_base>/.merge_verify_pgids/<request-id>``, recording its
+    worktree beside it.  Both are removed on exit.  A concurrent
+    ``orchestrator cancel-verify --request-id X`` reads the file, kills the
+    full descendant tree (capturing ``start_new_session`` build escapes via a
+    ``/proc`` PPID walk) plus a ``killpg`` backstop, and reaps the worktree.
+
+    **pgid-file directory**: ``<worktree_base>/.merge_verify_pgids`` —
+    host-side, per-project, never pruned or git-cleaned (mirrors the
+    ``.merge_verify_host_attempts`` counter precedent at the same path).
+    ``worktree_base`` is ``GitOps(config.git, config.project_root).worktree_base``.
+    Both hosts run the ``df`` checkout, so landing ``--request-id`` support on
+    ``main`` ships the contract to the laptop via its normal checkout sync.
+
+    Consumer: RemoteRunner (δ) parses stdout as a VerifyResult.
+    """
+    from orchestrator.verify_runner import spec_from_json
+
+    _run_remote_verify(
+        config, spec_json, request_id,
+        parse_spec=spec_from_json,
+        body=functools.partial(_verify_merge_body, sha),
+        preflight=_merge_lane_gate,
+    )
+
+
+def _task_spec_for_sha(sha: str, spec_json: str) -> 'TaskVerifySpec':
+    """Parse ``--spec``, refusing a spec whose tip_sha is not ``--sha`` (INV-3, receiving end)."""
+    from orchestrator.task_verify_spec import task_spec_from_json
+
+    spec = task_spec_from_json(spec_json)
+    if spec.tip_sha != sha:
+        raise ValueError(f'spec tip_sha {spec.tip_sha} is not --sha {sha}')
+    return spec
+
+
+async def _verify_task_body(
+    sha: str, ctx: _RemoteVerifyContext, spec: 'TaskVerifySpec',
+) -> 'VerifyResult':
+    """verify-task's body: a fresh ephemeral worktree at *sha*, then the task-role verify."""
+    from orchestrator.task_verify_run import run_task_verify_on_worktree
+
+    wt = await ctx.git_ops.create_ephemeral_verify_worktree(sha)
+    async with _verify_worktree_lifetime(ctx, wt):
+        return await run_task_verify_on_worktree(wt, ctx.config, spec)
+
+
+@main.command('verify-task')
+@click.option('--sha', required=True, help='Task tip SHA to verify (must be present in the local repo)')
+@click.option('--spec', 'spec_json', required=True,
+              help='TaskVerifySpec as a JSON string (from RemoteRunner.run_task_verify)')
+@pass_config()
+@click.option('--request-id', default=None,
+              help='Optional cancellation key: joins a new process group and records the '
+                   'pgid and worktree under <worktree_base>/.merge_verify_pgids/ for '
+                   '``orchestrator cancel-verify --request-id X``.')
+def verify_task(sha: str, spec_json: str, config: OrchestratorConfig, request_id: str | None):
+    """Run a task-role verify of --sha on a fresh ephemeral worktree; print one VerifyResult JSON.
+
+    Exit 0 on any verdict; exit 1 on a config, spec or infrastructure error, or
+    when the stdin watchdog fires.  The worktree is recorded beside the pgid
+    file so ``cancel-verify`` reaps it.  Always ephemeral: no lane flock, no
+    unscoped typecheck, no flake suppression.  PRD:
+    plans/remote-task-leg-verify-prd.md §5.3.
+    """
+    _run_remote_verify(
+        config, spec_json, request_id,
+        parse_spec=functools.partial(_task_spec_for_sha, sha),
+        body=functools.partial(_verify_task_body, sha),
+    )
+
+
+@main.command('verify-host-preflight')
+@click.option('--runner', required=True, help='A declared verify runner, enabled or not')
+@click.option('--sha', default=None, help='Commit to verify (default: the tip of git.main_branch)')
+@click.option('--reference', default=None,
+              help='A second declared runner verifying the same commit, for skip parity')
+@click.option('--json', 'as_json', is_flag=True, help="Print the runner's record as JSON")
+@pass_config()
+def verify_host_preflight(
+    runner: str, sha: str | None, reference: str | None, as_json: bool, config: OrchestratorConfig,
+):
+    """Run the full merge gate on one verify host through the production remote path.
+
+    Exit 0 when the gate passed and, with --reference, skip parity holds; 1
+    when the gate is red, vacuous or produced no verdict, or parity is broken
+    or undetermined; 2 when refused before any dispatch.  The record lands in
+    data/verify-logs/preflight/<runner>-<sha>.json; see
+    docs/verify-host-preflight.md.
+    """
+    from orchestrator.deployed_sha import capture_deployed_sha, resolve_code_checkout
+
+    # The gate the preflight builds is this process's own wire path (task 6565 D1).
+    deployed_sha = capture_deployed_sha(
+        resolve_code_checkout(),
+        lambda: importlib.import_module('orchestrator.verify_host_preflight'),
+    )
+    from orchestrator import verify_host_preflight as preflight
+
+    if deployed_sha is None:
+        click.echo(
+            'Error: this process cannot read the commit it runs (no readable git checkout '
+            'above its code), and the remote gate is built from that sha (task 6565)',
+            err=True,
+        )
+        sys.exit(2)
+    try:
+        outcome = asyncio.run(preflight.run_preflight(
+            config, runner=runner, sha=sha, reference=reference, deployed_sha=deployed_sha,
+            build_runner=preflight.production_runner_builder(config, deployed_sha),
+        ))
+    except (preflight.PreflightRefused, preflight.SkipParityExceptionsError) as exc:
+        click.echo(f'Error: {exc}', err=True)
+        sys.exit(2)
+    if as_json:
+        click.echo(preflight.record_json(outcome.primary, outcome.parity))
+    else:
+        click.echo(preflight.render_summary(outcome))
+    sys.exit(0 if outcome.ok else 1)
+
+
+def _recorded_merge_worktree_remover(git_ops: 'GitOps') -> Callable[[Path], None]:
+    """Return cancel-verify's remover for the worktree a killed run recorded.
+
+    It reaps only a ``_merge-`` band entry directly under ``worktree_base``,
+    through the single guarded remover: ``cleanup_merge_worktree``'s primary
+    path does not band-check, so a corrupt record must not reach it with a
+    task worktree.
+    """
+    from orchestrator.git_ops import classify_worktree_entry
+
+    def remove(worktree: Path) -> None:
+        in_merge_band = (
+            worktree.resolve().parent == git_ops.worktree_base.resolve()
+            and classify_worktree_entry(worktree.name) == 'merge'
+        )
+        if not in_merge_band:
+            click.echo(
+                f'cancel-verify: not removing recorded worktree {worktree}: it is '
+                f'not a _merge- entry directly under {git_ops.worktree_base}',
+                err=True,
+            )
+            return
+        asyncio.run(git_ops.cleanup_merge_worktree(worktree))
+
+    return remove
+
+
+@main.command('gate-identity')
+def gate_identity():
+    """Print this checkout's gate identity as one JSON line (task 6565, D3).
+
+    ``{"code_sha": <HEAD of the checkout holding this code>,
+    "wire_fingerprint": <remote_gate.wire_fingerprint of the wire classes>}``.
+    A remote gate answers this before any verify is dispatched to it; the
+    dispatcher proceeds only when both values equal its own.  Importing the
+    wire classes to fingerprint them also proves the gate's codec imports.
+    Exits 1 with the cause on stderr when the checkout's HEAD cannot be read.
+    """
+    import subprocess
+
+    from orchestrator.deployed_sha import checkout_head, resolve_code_checkout
+    from orchestrator.remote_gate import local_gate_identity
+
+    checkout = resolve_code_checkout()
+    if checkout is None:
+        click.echo('Error: no git checkout holds this orchestrator code', err=True)
+        sys.exit(1)
+    try:
+        code_sha = checkout_head(checkout)
+    except (OSError, subprocess.CalledProcessError) as exc:
+        click.echo(f'Error: cannot read HEAD of {checkout}: {exc}', err=True)
+        sys.exit(1)
+    click.echo(json.dumps(local_gate_identity(code_sha).to_wire()))
 
 
 @main.command('cancel-verify')
 @click.option('--request-id', required=True,
-              help='Request ID passed to the verify-merge invocation to cancel.')
-@click.option('--config', 'config_path', type=click.Path(exists=True, path_type=Path),
-              default=None,
-              help='Path to orchestrator config YAML (REQUIRED unless ORCH_CONFIG_PATH '
-                   'is set). Selects the target project — determines worktree_base for '
-                   'the pgid-file lookup.')
-def cancel_verify(request_id: str, config_path: Path | None):
-    """Kill the verify-merge process tree identified by --request-id and exit 0.
+              help='Request ID passed to the verify-merge or verify-task invocation '
+                   'to cancel; the worktree that run recorded is reaped too.')
+@pass_config(help=f'{CONFIG_OPTION_HELP_PREFIX} Selects the target project — determines '
+                  'worktree_base for the pgid-file lookup.')
+def cancel_verify(request_id: str, config: OrchestratorConfig):
+    """Kill the verify-merge or verify-task tree identified by --request-id and exit 0.
 
     Reads the pgid file at
     ``<worktree_base>/.merge_verify_pgids/<request-id>`` (written by
@@ -804,7 +1363,9 @@ def cancel_verify(request_id: str, config_path: Path | None):
     ``SIGKILL``\\s every descendant plus a ``killpg`` backstop.  This reaps the
     entire process tree including ``start_new_session`` build-command escapes
     (which leave ``verify-merge``'s process group but remain its descendants in
-    the ``/proc`` parent chain).
+    the ``/proc`` parent chain).  The SIGKILL skips that run's own ``finally``,
+    so the ``_merge-`` worktree it recorded beside the pgid file is reaped here
+    (:func:`_recorded_merge_worktree_remover`).
 
     **Idempotent**: exits 0 when the file is absent (already cancelled or never
     started), when the content is corrupt, or when all processes are already
@@ -823,16 +1384,61 @@ def cancel_verify(request_id: str, config_path: Path | None):
     """
     from orchestrator.git_ops import GitOps
 
-    try:
-        config = load_config(config_path)
-    except ConfigRequiredError as e:
-        click.echo(f'Error: {e}', err=True)
-        sys.exit(1)
-
     git_ops = GitOps(config.git, config.project_root)
     pgf = pgid_file(git_ops.worktree_base, request_id)
     failed_pids: list[int] = []
-    rc = cancel_request(pgf, failed_pids_out=failed_pids)
+    killed_pgid: list[int] = []
+    rc = cancel_request(
+        pgf, failed_pids_out=failed_pids, killed_pgid_out=killed_pgid,
+        remove_worktree=_recorded_merge_worktree_remover(git_ops),
+    )
+    # ── task 3186 (PRD δ): CLEAR THE FIXED-KEY HOLDER RENDEZVOUS ────────────
+    # `cancel_request` SIGKILLs the verify-merge tree, which skips that
+    # process's own `finally` — the one that would have called
+    # `remove_lock_holder_pgid`.  The per-request pgid file it removes itself
+    # is harmless when leaked (request ids are uuid4 and never revisited), but
+    # the FIXED key is a different animal: every run overwrites it, and
+    # `GitOps._merge_verify_lease_active` probes it with `killpg(pgid, 0)`.  A
+    # leaked — or, once the pid counter wraps, RECYCLED — entry there reads as
+    # a LIVE holder, and `reset_persistent_merge_worktree` consumes that
+    # predicate FAIL-CLOSED: it raises `MergeVerifyLeaseHeld` and the warm
+    # `_merge-verify` lane is wedged until some later run happens to overwrite
+    # the key.  See verify_cancel.py's stale-file / PID-reuse note for the
+    # measured picture.
+    #
+    # GATED ON IDENTITY, NOT ON rc.  Two facts make an unconditional
+    # `if rc == 0` clear unsafe:
+    #
+    #   * rc == 0 does not mean anything was killed.  Three of `cancel_request`'s
+    #     four return-0 paths never send a signal (absent file, corrupt content,
+    #     `pgid <= 0`), and the absent-file one is the COMMON case — a
+    #     verify-merge that completes normally removes its own per-request pgid
+    #     file in its `finally`, so a cancel racing normal completion (exactly
+    #     the race δ's head teardown creates) kills nothing at all.
+    #   * The key is SHARED.  Its owner writes it only when it won the build-lane
+    #     flock and clears it only in its own `finally` (see the `verify-merge`
+    #     span above), so it routinely names a DIFFERENT, live verify than the
+    #     request being cancelled.
+    #
+    # Clearing it in either of those situations makes the lease read fail-OPEN
+    # (`read_lock_holder_pgid` -> None -> "not held"): the typed
+    # `MergeVerifyLeaseHeld` diagnosis is lost and DF-3071's admission guard
+    # reads `_merge-verify` as IDLE while a verify is live, so the fleet
+    # REDEPLOYS over it instead of deferring — trading the wedged-lane risk
+    # above for a strictly worse one.  So clear only when this cancel actually
+    # swept a pgid AND the key names that same pgid.
+    #
+    # The rc != 0 case is subsumed and stays fail-closed for its own reason: a
+    # LIVE process refused SIGKILL, so it plausibly still holds both lease axes
+    # and `cancel_request` reports no kill.  Same reasoning as its retention of
+    # the per-request pgid file on that path.
+    #
+    # SCOPE: this closes the merge-worker-initiated cancel — the route δ's
+    # head-verify teardown takes for a REMOTE lease.  The `fire_watchdog_kill`
+    # `os._exit(1)` leak (verify_cancel.py's stale-file note) is a different
+    # route and is deliberately NOT addressed here.
+    if killed_pgid and read_lock_holder_pgid(git_ops.worktree_base) == killed_pgid[0]:
+        remove_lock_holder_pgid(git_ops.worktree_base)
     for pid in failed_pids:
         click.echo(
             f'cancel-verify: PermissionError: could not SIGKILL pid {pid} '
@@ -842,967 +1448,8 @@ def cancel_verify(request_id: str, config_path: Path | None):
     sys.exit(rc)
 
 
-@main.command('eval')
-@click.option('--task', 'task_path', type=click.Path(exists=True, path_type=Path),
-              default=None, help='Path to a single task JSON file')
-@click.option('--config-name', default=None,
-              help='Eval config name (e.g. claude-opus-high) or "all"')
-@click.option('--matrix', is_flag=True, help='Run full eval matrix (all tasks × all configs)')
-@click.option('--judge', is_flag=True, help='Run Elo-based LLM judge on existing results')
-@click.option('--plan-only', is_flag=True, help='Generate plans for tasks (no execution)')
-@click.option('--config', 'config_path', type=click.Path(exists=True, path_type=Path),
-              default=None,
-              help='Path to orchestrator config YAML (REQUIRED unless ORCH_CONFIG_PATH '
-                   'is set). Selects the target project — sets project_root and '
-                   'fused_memory.project_id.')
-@click.option('--max-parallel', type=int, default=None,
-              help='Max concurrent eval runs (default: unlimited)')
-@click.option('--trials', type=int, default=1,
-              help='Number of trials per (task, config) pair')
-@click.option('--force', is_flag=True, help='Re-run even if results exist')
-@click.option('--cleanup', is_flag=True, help='Remove eval worktrees')
-@click.option('--timeout', type=int, default=None,
-              help='Timeout in minutes per eval run (overrides task JSON)')
-@click.option('--max-rounds', type=int, default=50,
-              help='Max judge invocations per task (default: 50)')
-@click.option('--reset', is_flag=True, help='Clear judge state and start fresh')
-@click.option('--report', 'report_only', is_flag=True,
-              help='Generate report from existing state (no new judge calls)')
-@click.option('--vllm-url', default=None,
-              help='vLLM endpoint URL (e.g. http://workstation:8000)')
-@click.option('--worktree', 'worktree_path', type=click.Path(exists=True, path_type=Path),
-              default=None,
-              help='Reuse an existing eval worktree (skip create + use its .task state)')
-@click.option('--compare', nargs=2, default=None,
-              help='Compare two model groups head-to-head via LLM assessment. '
-                   'Each arg is a config name (use canonical name from '
-                   '--combine-runs if merging).')
-@click.option('--combine-runs', multiple=True,
-              help='Merge config names as one model (comma-separated, first is '
-                   'canonical). Can be supplied multiple times.')
-def eval_cmd(
-    task_path: Path | None,
-    config_name: str | None,
-    matrix: bool,
-    judge: bool,
-    plan_only: bool,
-    config_path: Path | None,
-    max_parallel: int | None,
-    trials: int,
-    force: bool,
-    cleanup: bool,
-    timeout: int | None,
-    max_rounds: int,
-    reset: bool,
-    report_only: bool,
-    vllm_url: str | None,
-    worktree_path: Path | None,
-    compare: tuple[str, str] | None,
-    combine_runs: tuple[str, ...],
-):
-    """Run multi-provider implementor evaluations."""
-    try:
-        base_config = load_config(config_path)
-    except ConfigRequiredError as e:
-        click.echo(f'Error: {e}', err=True)
-        sys.exit(1)
-
-    # Inject ANTHROPIC_BASE_URL into vLLM configs when --vllm-url is set
-    if vllm_url:
-        from orchestrator.evals.configs import FINAL_RUN_CONFIGS, VLLM_EVAL_CONFIGS
-        for cfg in [*VLLM_EVAL_CONFIGS, *FINAL_RUN_CONFIGS]:
-            if cfg.env_overrides:  # only vLLM configs have env_overrides
-                cfg.env_overrides['ANTHROPIC_BASE_URL'] = vllm_url
-
-    if cleanup:
-        _run_cleanup(base_config)
-        return
-
-    if report_only:
-        _run_report_cmd()
-        return
-
-    if compare:
-        _run_compare_cmd(compare, combine_runs)
-        return
-
-    if judge:
-        _run_judge_cmd(max_rounds=max_rounds, reset=reset)
-        return
-
-    if plan_only:
-        _run_plan_only(task_path, base_config)
-        return
-
-    if matrix:
-        _run_matrix_cmd(
-            base_config,
-            max_parallel=max_parallel, trials=trials,
-            force=force, timeout=timeout,
-        )
-        return
-
-    if task_path is None:
-        click.echo('Error: --task is required (or use --matrix / --judge / --plan-only)', err=True)
-        sys.exit(1)
-
-    _run_single_eval(
-        task_path, config_name, base_config,
-        force=force, timeout=timeout, worktree_path=worktree_path,
-    )
-
-
-def _load_fixture_dir(tasks_dir: Path) -> list[dict]:
-    """Load every ``*.json`` eval fixture in *tasks_dir* (empty list if absent).
-
-    A malformed or truncated fixture (e.g. an interrupted ``eval-sample`` write)
-    is surfaced loudly with the offending file NAMED — a clean CLI error rather
-    than an opaque ``JSONDecodeError`` traceback with no filename context.
-    """
-    fixtures: list[dict] = []
-    if tasks_dir.exists():
-        for tp in sorted(tasks_dir.glob('*.json')):
-            try:
-                fixtures.append(json.loads(tp.read_text()))
-            except json.JSONDecodeError as exc:
-                raise click.ClickException(
-                    f'malformed eval fixture {tp}: {exc}'
-                ) from exc
-    return fixtures
-
-
-@main.command('eval-list-fixtures')
-@click.option('--tasks-dir', type=click.Path(path_type=Path), default=None,
-              help='Fixture dir to list (default: orchestrator/evals/tasks)')
-@click.option('--cohort', default=None,
-              help='Scope the stratification to one cohort (e.g. revival-zeta)')
-@click.option('--audit', is_flag=True,
-              help='Also run the corpus audit (band + per-fixture completeness) '
-                   'over ONE cohort; exits non-zero on any audit failure. '
-                   'Scopes to --cohort when given, else defaults to the '
-                   'revival-zeta band cohort — so a bare --audit never flags '
-                   'the retained legacy fixtures (band overflow / unpinned '
-                   'branches) as failures.')
-def eval_list_fixtures_cmd(tasks_dir: Path | None, cohort: str | None, audit: bool):
-    """Print the eval-fixture stratification (repo×kind×path) counts.
-
-    Reads only the fixtures dir — needs no orchestrator config.
-    """
-    from orchestrator.evals.task_sampler import (
-        DEFAULT_COHORT,
-        audit_fixture_corpus,
-        format_stratification_table,
-        git_ref_exists,
-        stratification_counts,
-    )
-    tasks_dir = tasks_dir or (Path(__file__).parent / 'evals' / 'tasks')
-    fixtures = _load_fixture_dir(tasks_dir)
-    counts = stratification_counts(fixtures, cohort=cohort)
-    click.echo(format_stratification_table(counts))
-
-    if audit:
-        # The band [10,14] + evals/<id> branch-pin checks are revival-ζ
-        # invariants. A bare --audit over ALL cohorts would falsely fail on the
-        # retained legacy fixtures (df_task_12/13/18, reify_task_12/27): band
-        # overflow (>14 total) + missing_branch for every unpinned legacy id.
-        # So scope the audit to the requested cohort, defaulting to revival-ζ.
-        audit_cohort = cohort if cohort is not None else DEFAULT_COHORT
-        scoped = [f for f in fixtures if f.get('cohort') == audit_cohort]
-        report = audit_fixture_corpus(scoped, ref_exists=git_ref_exists)
-        click.echo('')
-        click.echo(f'audit ({audit_cohort}): ok={report.ok} count={report.count}')
-        for failure in report.failures:
-            click.echo(f'  FAIL {failure}')
-        if not report.ok:
-            sys.exit(1)
-
-
-@main.command('eval-sample')
-@click.option('--since', default='6 weeks ago',
-              help="git --since discovery window (default: '6 weeks ago')")
-@click.option('--target-low', type=int, default=10, help='Band floor (default 10)')
-@click.option('--target-high', type=int, default=14, help='Band ceiling (default 14)')
-@click.option('--seed', type=int, default=0, help='Deterministic sampling seed')
-@click.option('--cohort', default='revival-zeta',
-              help='Cohort marker stamped on each cut fixture')
-@click.option('--dry-run', is_flag=True,
-              help='Print the intended stratified selection without pinning '
-                   'branches or writing fixtures')
-@click.option('--tasks-dir', type=click.Path(path_type=Path), default=None,
-              help='Where fixture JSONs are written (default: orchestrator/evals/tasks)')
-@click.option('--df-root', type=click.Path(path_type=Path),
-              default=Path('/home/leo/src/dark-factory'),
-              help='dark_factory checkout to discover merges in')
-@click.option('--reify-root', type=click.Path(path_type=Path),
-              default=Path('/home/leo/src/reify'),
-              help='reify checkout to discover merges in')
-@click.option('--sampled-at', default=None,
-              help='ISO-8601 provenance timestamp (default: now, UTC)')
-def eval_sample_cmd(since: str, target_low: int, target_high: int, seed: int,
-                    cohort: str, dry_run: bool, tasks_dir: Path | None,
-                    df_root: Path, reify_root: Path, sampled_at: str | None):
-    """Cut a stratified near-HEAD eval-fixture corpus from both repos.
-
-    Discovers completed-task merges in the df + reify checkouts, samples them
-    down to the [target_low, target_high] band round-robin across
-    repo×kind×path cells, and (unless --dry-run) captures each reference diff,
-    pins its ``evals/<id>`` branch, and writes the fixture JSON. Needs no
-    orchestrator config — the seed + sampled_at are supplied here at the CLI
-    boundary so the sampler library stays wall-clock-free.
-    """
-    asyncio.run(_run_eval_sample(
-        since=since, target_low=target_low, target_high=target_high, seed=seed,
-        cohort=cohort, dry_run=dry_run, tasks_dir=tasks_dir,
-        df_root=Path(df_root), reify_root=Path(reify_root), sampled_at=sampled_at,
-    ))
-
-
-async def _run_eval_sample(*, since: str, target_low: int, target_high: int,
-                           seed: int, cohort: str, dry_run: bool,
-                           tasks_dir: Path | None, df_root: Path,
-                           reify_root: Path, sampled_at: str | None):
-    """Async worker for ``eval-sample`` (discover → sample → capture/pin/write)."""
-    from datetime import UTC, datetime
-
-    from orchestrator.evals.task_sampler import (
-        build_fixture_record,
-        capture_reference,
-        default_verify_commands,
-        discover_completed_tasks,
-        enrich_candidates_from_task_db,
-        pin_eval_branch,
-        repo_of,
-        sample_stratified,
-    )
-
-    tasks_dir = tasks_dir or (Path(__file__).parent / 'evals' / 'tasks')
-
-    candidates = []
-    for project, root in (('dark_factory', df_root), ('reify', reify_root)):
-        if not root.exists():
-            click.echo(f'WARNING: {project} checkout {root} not found; skipping',
-                       err=True)
-            continue
-        found = await discover_completed_tasks(
-            root, since=since, project=project, project_root=str(root),
-        )
-        found = enrich_candidates_from_task_db(
-            found, root / '.taskmaster' / 'tasks' / 'tasks.db',
-        )
-        click.echo(f'discovered {len(found)} completed-task merge(s) in {project}')
-        candidates.extend(found)
-
-    result = sample_stratified(
-        candidates, target_low=target_low, target_high=target_high, seed=seed,
-    )
-    click.echo(f'selected {len(result.selected)} of {len(candidates)} candidate(s):')
-    for cell, count in sorted(result.cell_counts.items()):
-        click.echo(f'  {cell[0]}/{cell[1]}/{cell[2]}: {count}')
-    for note in result.notes:
-        click.echo(f'  note: {note}')
-
-    if dry_run:
-        click.echo('(dry-run) no branches pinned, no fixtures written')
-        return
-
-    if sampled_at is None:
-        sampled_at = datetime.now(UTC).isoformat()
-    tasks_dir.mkdir(parents=True, exist_ok=True)
-    written = 0
-    for cand in result.selected:
-        repo = repo_of(cand)
-        reference = await capture_reference(
-            cand.project_root, cand.pre_commit, cand.post_commit,
-        )
-        record = build_fixture_record(
-            cand, reference, default_verify_commands(repo), plan=None,
-            cohort=cohort, sampled_at=sampled_at, seed=seed,
-        )
-        branch = await pin_eval_branch(
-            cand.project_root, record['id'], cand.post_commit,
-        )
-        (tasks_dir / f'{record["id"]}.json').write_text(
-            json.dumps(record, indent=2) + '\n',
-        )
-        click.echo(f'  wrote {record["id"]}.json + pinned {branch}')
-        written += 1
-    click.echo(f'wrote {written} fixture(s) to {tasks_dir}')
-
-
-def _run_single_eval(
-    task_path: Path, config_name: str | None, base_config,
-    force: bool = False, timeout: int | None = None,
-    worktree_path: Path | None = None,
-):
-    """Run eval for a single task with one or all configs.
-
-    A candidate whose ``role == 'architect'`` (eval-revival θ) is dispatched to
-    ``run_architect_eval`` — the plan-only architect eval that scores the
-    produced plan against the real landed diff and FREEZES every downstream
-    role — and its per-fixture ``plan_quality`` score is surfaced (plus a
-    plan-quality table across all architect runs). Ordinary implementer configs
-    still route to ``run_eval``, unchanged.
-    """
-    from orchestrator.evals.configs import EVAL_CONFIGS, get_config_by_name
-    from orchestrator.evals.report import (
-        build_plan_quality_report,
-        format_plan_quality_table,
-    )
-    from orchestrator.evals.runner import run_architect_eval, run_eval
-
-    all_configs = EVAL_CONFIGS
-
-    if config_name and config_name != 'all':
-        cfg = get_config_by_name(config_name)
-        if not cfg:
-            click.echo(f'Unknown config: {config_name}', err=True)
-            click.echo(f'Available: {", ".join(c.name for c in all_configs)}', err=True)
-            sys.exit(1)
-        configs = [cfg]
-    else:
-        configs = all_configs
-
-    async def _run():
-        architect_results = []
-        for cfg in configs:
-            if cfg.role == 'architect':
-                # θ: plan-only architect eval — downstream roles frozen.
-                # run_architect_eval manages its own eval worktree at the
-                # fixture's pre_task_commit, so it takes no worktree_path.
-                result = await run_architect_eval(
-                    task_path, cfg, base_config, timeout_override=timeout,
-                )
-                architect_results.append(result)
-                plan_quality = result.metrics.get('plan_quality')
-                # A cap-tainted cell names its infra failure inline, so an
-                # operator watching the run sees it LIVE rather than a bare
-                # `plan_quality=None` that reads like a scoring quirk. Healthy
-                # cells echo exactly as before.
-                #
-                # 'unmeasurable', not 'cap-tainted': the flag covers every cause
-                # that left no model content (cap hit, auth failure,
-                # model-not-found, wedge, harness error), and a PERMANENT config
-                # error must not read to the operator as a transient cap window.
-                # The marker that follows always names the actual cause.
-                taint = (
-                    f' unmeasurable: {result.metrics.get("invocation_error")}'
-                    if result.metrics.get('cap_tainted') else ''
-                )
-                # `steps=` is echoed BESIDE the score (task 3302) because it is
-                # the plan-production predicate the whole pipeline now keys on:
-                # `steps=0` beside any plan_quality means the architect produced
-                # nothing, which the final table floors to 0.0. Showing it live
-                # is what stops a no-plan candidate from looking healthy for the
-                # length of a campaign.
-                click.echo(
-                    f'{result.task_id} × {result.config_name}: '
-                    f'{result.outcome} plan_quality={plan_quality} '
-                    f'steps={result.metrics.get("plan_steps")}{taint} '
-                    f'({result.wall_clock_ms / 1000:.1f}s)'
-                )
-            else:
-                result = await run_eval(
-                    task_path, cfg, base_config, timeout_override=timeout,
-                    worktree_path=worktree_path,
-                )
-                click.echo(
-                    f'{result.task_id} × {result.config_name}: '
-                    f'{result.outcome} ({result.wall_clock_ms / 1000:.1f}s)'
-                )
-
-        # Surface the θ plan-quality table across all architect runs.
-        if architect_results:
-            click.echo('')
-            click.echo(
-                format_plan_quality_table(
-                    build_plan_quality_report(architect_results)
-                )
-            )
-
-    asyncio.run(_run())
-
-
-def _run_matrix_cmd(
-    base_config,
-    max_parallel: int | None = None,
-    trials: int = 1,
-    force: bool = False,
-    timeout: int | None = None,
-):
-    """Backward-compatible ``eval --matrix`` alias → the μ matrix driver (task 2478).
-
-    Open-Q4 resolution: the legacy ``--matrix`` flag now routes to the both-live
-    architect×implementer matrix driver (:func:`_run_matrix_driver` →
-    ``run_matrix_stage``) and emits the C4 composite report, instead of the old
-    all-configs ``run_eval_matrix`` summary. The signature is preserved verbatim
-    so the ``eval --matrix`` dispatch (and the vLLM-injection CLI test that pins
-    this routing) is unchanged; ``force`` is retained for kwarg back-compat — the
-    μ screen/matrix stages always run fresh, so it is not consulted.
-    """
-    _run_matrix_driver(
-        base_config, tasks_dir=None,
-        max_parallel=max_parallel, trials=trials, timeout=timeout,
-    )
-
-
-def _resolve_eval_task_paths(base_config, tasks_dir: Path | None) -> list[Path]:
-    """Resolve the eval-fixture dir → the sorted ``*.json`` task paths (μ driver).
-
-    Defaults to the packaged ``evals/tasks`` dir (falling back to the one under
-    *base_config.project_root* when the packaged dir is absent, mirroring
-    :func:`_run_single_eval`). :func:`_load_fixture_dir` validates the corpus
-    first — a malformed fixture is surfaced loudly with the offending file NAMED
-    — and an empty corpus is a clean CLI error, not a silent no-op.
-    """
-    tasks_dir = tasks_dir or (Path(__file__).parent / 'evals' / 'tasks')
-    if not tasks_dir.exists():
-        tasks_dir = Path(base_config.project_root) / 'orchestrator' / 'evals' / 'tasks'
-    # Loud validation (malformed fixture → named ClickException) + emptiness guard.
-    if not _load_fixture_dir(tasks_dir):
-        click.echo(f'No eval fixtures found in {tasks_dir}', err=True)
-        sys.exit(1)
-    return sorted(tasks_dir.glob('*.json'))
-
-
-def _eval_prices(base_config) -> dict[str, Any]:
-    """The μ driver's price map: ``base_config.prices`` or the packaged
-    :func:`default_price_table` fallback. Single-sourced so every stage seeds its
-    price table (individual or combined-name) from the same map.
-    """
-    from orchestrator.config import default_price_table
-
-    return base_config.prices or default_price_table()
-
-
-def _emit_composite_report(results, price_table) -> None:
-    """Emit the C4 composite report for *results* (the μ driver stages' surface).
-
-    *price_table* is the pre-built ``{config_name: {role: entry}}`` table the
-    caller seeds — λ's :func:`build_price_table` (OFAT's individual configs) or
-    :func:`build_pairwise_price_table` (the matrix/confirm end-to-end stages,
-    whose report rows are keyed by the combined ``arch+impl`` name, so the price
-    section must be keyed the same way to stay aligned). Builds λ's per-config
-    composite/cost/latency/CI95/judge report and prints
-    :func:`format_composite_table`. The quality figure is single-sourced in λ's
-    ``compute_composite`` — the driver never re-derives a score.
-
-    When *results* contain any PLAN-ONLY architect run, the θ plan-quality table
-    is emitted after it (task 3099), mirroring the precedent already in
-    :func:`_run_single_eval` rather than inventing a second rendering path. The
-    two tables are complementary, not redundant: the composite row reports the
-    cap-exclusion as a COUNT, while only the plan-quality table breaks it out BY
-    CAUSE — and that is what tells an operator reading an OFAT run whether a
-    missing architect cell is a transient cap window (rerun it) or a permanent
-    model-not-found (that candidate can never run at all). A result set with no
-    architect rows emits the composite table alone, so the existing
-    ``eval-matrix`` / ``eval-confirm`` end-to-end surfaces are unchanged.
-    """
-    from orchestrator.evals.report import (
-        build_composite_report,
-        build_plan_quality_report,
-        format_composite_table,
-        format_plan_quality_table,
-    )
-
-    report = build_composite_report(results, price_table=price_table)
-    click.echo(format_composite_table(report))
-
-    if any(r.metrics.get('role_under_test') == 'architect' for r in results):
-        click.echo('')
-        click.echo(format_plan_quality_table(build_plan_quality_report(results)))
-
-
-def _run_ofat_driver(
-    base_config, *, tasks_dir: Path | None,
-    max_parallel: int | None, trials: int, timeout: int | None,
-) -> None:
-    """OFAT screen: ``run_ofat_stage`` over ``ofat_candidates()`` → composite (μ)."""
-    from orchestrator.evals.configs import ofat_candidates
-    from orchestrator.evals.report import build_price_table
-    from orchestrator.evals.runner import run_ofat_stage
-
-    task_paths = _resolve_eval_task_paths(base_config, tasks_dir)
-    candidates = ofat_candidates()
-    results = asyncio.run(run_ofat_stage(
-        task_paths, candidates, base_config,
-        max_parallel=max_parallel, trials=trials, timeout_override=timeout,
-    ))
-    # OFAT rows are keyed by the individual candidate name → individual price table.
-    _emit_composite_report(
-        results, build_price_table(candidates, _eval_prices(base_config)),
-    )
-
-
-def _run_matrix_driver(
-    base_config, *, tasks_dir: Path | None,
-    max_parallel: int | None, trials: int, timeout: int | None,
-) -> None:
-    """Matrix stage: both-live architect×implementer cross product → composite (μ).
-
-    Splits ``ofat_candidates()`` by role into the architect and implementer
-    survivor inputs; ``run_matrix_stage`` expands the FULL cross product
-    (INCLUDING same-family diagonals) via ``configs.matrix_pairs``.
-    """
-    from orchestrator.evals.configs import matrix_pairs, ofat_candidates
-    from orchestrator.evals.report import build_pairwise_price_table
-    from orchestrator.evals.runner import run_matrix_stage
-
-    task_paths = _resolve_eval_task_paths(base_config, tasks_dir)
-    candidates = ofat_candidates()
-    arch_cfgs = [c for c in candidates if c.role == 'architect']
-    impl_cfgs = [c for c in candidates if c.role == 'implementer']
-    results = asyncio.run(run_matrix_stage(
-        task_paths, arch_cfgs, impl_cfgs, base_config,
-        max_parallel=max_parallel, trials=trials, timeout_override=timeout,
-    ))
-    # End-to-end rows are keyed by the combined arch+impl name → a combined-name
-    # price table over the FULL cross product, so the price section aligns.
-    _emit_composite_report(
-        results,
-        build_pairwise_price_table(
-            matrix_pairs(arch_cfgs, impl_cfgs), _eval_prices(base_config),
-        ),
-    )
-
-
-def _run_confirm_driver(
-    base_config, *, arch: str, impl: str, tasks_dir: Path | None,
-    max_parallel: int | None, trials: int, timeout: int | None,
-) -> None:
-    """Confirmation batch: the single winning ``(arch, impl)`` combo → composite (μ)."""
-    from orchestrator.evals.configs import get_config_by_name
-    from orchestrator.evals.report import build_pairwise_price_table
-    from orchestrator.evals.runner import run_confirm_stage
-
-    arch_cfg = get_config_by_name(arch)
-    impl_cfg = get_config_by_name(impl)
-    if arch_cfg is None or impl_cfg is None:
-        missing = arch if arch_cfg is None else impl
-        click.echo(f'Unknown config: {missing}', err=True)
-        sys.exit(1)
-    # Loud-over-silent: --arch must resolve to an ARCHITECT config and --impl to
-    # an IMPLEMENTER one. Swapping the flags otherwise resolves fine and silently
-    # builds a nonsensical both-live combo (implementer pinned as the architect
-    # and vice-versa) — reject the mismatch NAMING the offending flag + role.
-    if arch_cfg.role != 'architect':
-        click.echo(
-            f'--arch: {arch!r} is a {arch_cfg.role} config, expected an architect',
-            err=True,
-        )
-        sys.exit(1)
-    if impl_cfg.role != 'implementer':
-        click.echo(
-            f'--impl: {impl!r} is a {impl_cfg.role} config, expected an implementer',
-            err=True,
-        )
-        sys.exit(1)
-
-    task_paths = _resolve_eval_task_paths(base_config, tasks_dir)
-    results = asyncio.run(run_confirm_stage(
-        task_paths, arch_cfg, impl_cfg, base_config,
-        max_parallel=max_parallel, trials=trials, timeout_override=timeout,
-    ))
-    # The single winning combo's rows are keyed by the combined arch+impl name.
-    _emit_composite_report(
-        results,
-        build_pairwise_price_table(
-            [(arch_cfg, impl_cfg)], _eval_prices(base_config),
-        ),
-    )
-
-
-@main.command('eval-ofat')
-@click.option('--config', 'config_path', type=click.Path(exists=True, path_type=Path),
-              default=None,
-              help='Path to orchestrator config YAML (REQUIRED unless '
-                   'ORCH_CONFIG_PATH is set).')
-@click.option('--tasks-dir', type=click.Path(path_type=Path), default=None,
-              help='Fixture dir (default: orchestrator/evals/tasks)')
-@click.option('--trials', type=int, default=1,
-              help='Trials per (fixture, candidate) cell (default: 1)')
-@click.option('--max-parallel', type=int, default=None,
-              help='Max concurrent eval runs (default: unlimited)')
-@click.option('--timeout', type=int, default=None,
-              help='Timeout in minutes per eval run (overrides task JSON)')
-def eval_ofat_cmd(config_path, tasks_dir, trials, max_parallel, timeout):
-    """OFAT screen (μ): vary ONE role per candidate, pin the rest to incumbents.
-
-    Each candidate varies exactly one role — implementer incumbents (Opus AND
-    Sonnet, the G2 >=2-config floor) drive ``run_eval`` with the plan frozen;
-    architect candidates drive ``run_architect_eval`` live with downstream roles
-    frozen. Emits the C4 composite report.
-    """
-    try:
-        base_config = load_config(config_path)
-    except ConfigRequiredError as e:
-        click.echo(f'Error: {e}', err=True)
-        sys.exit(1)
-    _run_ofat_driver(
-        base_config, tasks_dir=tasks_dir,
-        max_parallel=max_parallel, trials=trials, timeout=timeout,
-    )
-
-
-@main.command('eval-matrix')
-@click.option('--config', 'config_path', type=click.Path(exists=True, path_type=Path),
-              default=None,
-              help='Path to orchestrator config YAML (REQUIRED unless '
-                   'ORCH_CONFIG_PATH is set).')
-@click.option('--tasks-dir', type=click.Path(path_type=Path), default=None,
-              help='Fixture dir (default: orchestrator/evals/tasks)')
-@click.option('--trials', type=int, default=1,
-              help='Trials per (fixture, pair) cell (default: 1)')
-@click.option('--max-parallel', type=int, default=None,
-              help='Max concurrent eval runs (default: unlimited)')
-@click.option('--timeout', type=int, default=None,
-              help='Timeout in minutes per eval run (overrides task JSON)')
-def eval_matrix_cmd(config_path, tasks_dir, trials, max_parallel, timeout):
-    """Matrix stage (μ): both-live architect×implementer cross product.
-
-    Runs the FULL architect×implementer cross product over the OFAT survivors,
-    INCLUDING same-family diagonals (the plan-style/implementer coupling
-    hypothesis, PRD decision 9). Emits the C4 composite report.
-    """
-    try:
-        base_config = load_config(config_path)
-    except ConfigRequiredError as e:
-        click.echo(f'Error: {e}', err=True)
-        sys.exit(1)
-    _run_matrix_driver(
-        base_config, tasks_dir=tasks_dir,
-        max_parallel=max_parallel, trials=trials, timeout=timeout,
-    )
-
-
-@main.command('eval-confirm')
-@click.option('--config', 'config_path', type=click.Path(exists=True, path_type=Path),
-              default=None,
-              help='Path to orchestrator config YAML (REQUIRED unless '
-                   'ORCH_CONFIG_PATH is set).')
-@click.option('--arch', required=True,
-              help='Winning architect config name (e.g. architect-opus-high)')
-@click.option('--impl', required=True,
-              help='Winning implementer config name (e.g. claude-opus-high)')
-@click.option('--tasks-dir', type=click.Path(path_type=Path), default=None,
-              help='Fixture dir (default: orchestrator/evals/tasks)')
-@click.option('--trials', type=int, default=3,
-              help='Confirmation trials per fixture (default: 3, decision 10 floor)')
-@click.option('--max-parallel', type=int, default=None,
-              help='Max concurrent eval runs (default: unlimited)')
-@click.option('--timeout', type=int, default=None,
-              help='Timeout in minutes per eval run (overrides task JSON)')
-def eval_confirm_cmd(config_path, arch, impl, tasks_dir, trials, max_parallel, timeout):
-    """Confirmation batch (μ): one end-to-end batch of the winning combo.
-
-    Runs the single winning (architect, implementer) combo across all fixtures ×
-    N trials (default 3 — decision 10's statistics floor, enough repeats for a
-    CI95 on the winner). Emits the C4 composite report.
-    """
-    try:
-        base_config = load_config(config_path)
-    except ConfigRequiredError as e:
-        click.echo(f'Error: {e}', err=True)
-        sys.exit(1)
-    _run_confirm_driver(
-        base_config, arch=arch, impl=impl, tasks_dir=tasks_dir,
-        max_parallel=max_parallel, trials=trials, timeout=timeout,
-    )
-
-
-def _run_judge_cmd(max_rounds: int = 50, reset: bool = False):
-    """Run Elo-based judge on existing results."""
-    from orchestrator.evals.elo import JudgeState, TaskPool, load_state, save_state
-    from orchestrator.evals.judge import run_elo_tournament
-    from orchestrator.evals.report import build_report, format_markdown, save_report
-    from orchestrator.evals.runner import load_results, load_task
-    from orchestrator.evals.snapshots import get_diff_between_commits
-
-    # Load or reset state
-    if reset:
-        state = JudgeState()
-        click.echo('Judge state reset.')
-    else:
-        state = load_state()
-        if state.per_task:
-            click.echo(f'Resuming from existing state ({len(state.per_task)} tasks)')
-
-    results = load_results()
-    if not results:
-        click.echo('No existing results found in evals/results/', err=True)
-        sys.exit(1)
-
-    # Group by task, filter to passing with existing worktrees
-    by_task: dict[str, list] = {}
-    for r in results:
-        by_task.setdefault(r.task_id, []).append(r)
-
-    passing: dict[str, list[dict]] = {}
-    for task_id, task_results in by_task.items():
-        p = [r.to_dict() for r in task_results
-             if r.metrics.get('tests_pass', False)
-             and Path(r.worktree_path).exists()]
-        if p:
-            passing[task_id] = p
-            click.echo(f'  {task_id}: {len(p)} contenders with worktrees')
-
-    if not passing:
-        click.echo('No passing results with existing worktrees found', err=True)
-        sys.exit(1)
-
-    tasks_dir = Path(__file__).parent / 'evals' / 'tasks'
-
-    async def _run():
-        for task_id, result_dicts in passing.items():
-            task_file = tasks_dir / f'{task_id}.json'
-            if not task_file.exists():
-                click.echo(f'Skipping {task_id}: task file not found')
-                continue
-
-            task = load_task(task_file)
-
-            # Add reference implementation if post_task_commit exists
-            pre = task.get('pre_task_commit')
-            post = task.get('post_task_commit')
-            if pre and post:
-                try:
-                    project_root = Path(task['project_root'])
-                    ref_diff = await get_diff_between_commits(project_root, pre, post)
-                    if ref_diff.strip():
-                        result_dicts.append({
-                            'config_name': 'reference',
-                            'diff': ref_diff,
-                            'worktree_path': '',
-                        })
-                        click.echo(f'  {task_id}: added reference implementation')
-                except Exception as e:
-                    click.echo(f'  {task_id}: could not compute reference diff: {e}')
-
-            if len(result_dicts) < 2:
-                click.echo(f'Skipping {task_id}: need at least 2 contenders')
-                continue
-
-            # Get or create task pool
-            if task_id not in state.per_task:
-                state.per_task[task_id] = TaskPool()
-            pool = state.per_task[task_id]
-
-            click.echo(
-                f'\nJudging {task_id} '
-                f'({len(result_dicts)} contenders, max {max_rounds} rounds)...'
-            )
-            rounds_used = await run_elo_tournament(
-                result_dicts, task, pool, max_rounds,
-            )
-            click.echo(f'  {task_id}: {rounds_used} judge calls')
-
-            # Save state after each task (crash resilience)
-            save_state(state)
-
-        # Generate and print report
-        report = build_report(state)
-        report_path = save_report(report)
-        click.echo(f'\nReport saved to {report_path}')
-        click.echo('\n' + format_markdown(report))
-
-    asyncio.run(_run())
-
-
-def _run_report_cmd():
-    """Generate report from existing judge state (no new judge calls)."""
-    from orchestrator.evals.elo import load_state
-    from orchestrator.evals.report import build_report, format_markdown, save_report
-
-    state = load_state()
-    if not state.per_task:
-        click.echo('No judge state found. Run --judge first.', err=True)
-        sys.exit(1)
-
-    report = build_report(state)
-    report_path = save_report(report)
-    click.echo(f'Report saved to {report_path}')
-    click.echo('\n' + format_markdown(report))
-
-
-def _run_compare_cmd(
-    compare: tuple[str, str],
-    combine_runs: tuple[str, ...],
-):
-    """Compare two model groups via LLM-powered qualitative assessment."""
-    from orchestrator.evals.compare import (
-        apply_combine_runs,
-        compare_models,
-        format_comparison_markdown,
-    )
-    from orchestrator.evals.runner import load_results, load_task
-
-    results = load_results()
-    if not results:
-        click.echo('No existing results found in evals/results/', err=True)
-        sys.exit(1)
-
-    # Apply combine-runs aliasing
-    combine_groups = [g.split(',') for g in combine_runs]
-    if combine_groups:
-        results = apply_combine_runs(results, combine_groups)
-
-    group_a_configs = compare[0].split(',')
-    group_b_configs = compare[1].split(',')
-
-    # Load task definitions for descriptions
-    tasks_dir = Path(__file__).parent / 'evals' / 'tasks'
-    tasks: dict[str, dict] = {}
-    if tasks_dir.exists():
-        for tp in sorted(tasks_dir.glob('*.json')):
-            task = load_task(tp)
-            tasks[task['id']] = task
-
-    # Determine canonical group names
-    group_a_name = group_a_configs[0]
-    group_b_name = group_b_configs[0]
-
-    click.echo(
-        f'Comparing {group_a_name} vs {group_b_name} '
-        f'({len(results)} total results loaded)'
-    )
-
-    async def _run():
-        report = await compare_models(
-            results, group_a_configs, group_b_configs, tasks,
-            group_a_name=group_a_name,
-            group_b_name=group_b_name,
-        )
-        click.echo('\n' + format_comparison_markdown(report))
-
-    asyncio.run(_run())
-
-
-def _run_cleanup(base_config):
-    """Remove all eval worktrees."""
-    from orchestrator.evals.snapshots import (
-        cleanup_eval_worktree,
-        eval_worktree_root,
-    )
-
-    # Eval worktrees live OUTSIDE project_root (a sibling of the repo) so a
-    # nested pytest/pyright/ruff/cargo run cannot collect the main repo's
-    # ancestor config (Defect B, task 2881). Discover them at that same
-    # relocated root — sharing eval_worktree_root with create_eval_worktree so
-    # placement and cleanup cannot drift.
-    worktree_root = eval_worktree_root(base_config.project_root)
-    if not worktree_root.exists():
-        click.echo('No eval worktrees found.')
-        return
-
-    async def _cleanup():
-        count = 0
-        for task_dir in sorted(worktree_root.iterdir()):
-            if not task_dir.is_dir():
-                continue
-            for run_dir in sorted(task_dir.iterdir()):
-                if run_dir.is_dir():
-                    await cleanup_eval_worktree(base_config.project_root, run_dir)
-                    count += 1
-        click.echo(f'Cleaned up {count} eval worktrees.')
-
-    asyncio.run(_cleanup())
-
-
-def _run_plan_only(task_path: Path | None, base_config):
-    """Generate plans for eval tasks using the architect (opus-high).
-
-    Runs the architect against the pre-task commit for each task,
-    saves the resulting plan into the task JSON file.
-    """
-    from orchestrator.evals.runner import load_task
-    from orchestrator.evals.snapshots import cleanup_eval_worktree, create_eval_worktree
-
-    tasks_dir = Path(__file__).parent / 'evals' / 'tasks'
-
-    task_paths = [task_path] if task_path else sorted(tasks_dir.glob('*.json'))
-
-    if not task_paths:
-        click.echo('No task files found', err=True)
-        sys.exit(1)
-
-    async def _run():
-        from orchestrator.agents.briefing import BriefingAssembler
-        from orchestrator.agents.invoke import invoke_agent
-        from orchestrator.agents.roles import ARCHITECT
-        from orchestrator.artifacts import TaskArtifacts
-
-        briefing = BriefingAssembler(base_config)
-
-        for tp in task_paths:
-            task = load_task(tp)
-            task_id = task['id']
-
-            if task.get('plan'):
-                click.echo(f'  {task_id}: already has plan ({len(task["plan"].get("steps", []))} steps), skipping')
-                continue
-
-            click.echo(f'  {task_id}: generating plan...')
-            project_root = Path(task['project_root'])
-
-            # Create worktree at pre-task commit
-            worktree, _run_id = await create_eval_worktree(
-                project_root, task_id, task['pre_task_commit'],
-                setup_commands=task.get('setup_commands'),
-            )
-
-            try:
-                # Init artifacts so architect has a place to write
-                artifacts = TaskArtifacts(worktree)
-                artifacts.init(
-                    task_id,
-                    task.get('task_definition', {}).get('title', ''),
-                    task.get('task_definition', {}).get('description', ''),
-                    base_commit=task['pre_task_commit'],
-                )
-
-                # Build architect prompt
-                task_def = task.get('task_definition', {})
-                prompt = await briefing.build_architect_prompt(task_def, worktree=worktree)
-
-                # Invoke architect (opus-high, always Claude)
-                result = await invoke_agent(
-                    prompt=prompt,
-                    system_prompt=ARCHITECT.system_prompt,
-                    cwd=worktree,
-                    model='opus',
-                    max_turns=50,
-                    max_budget_usd=5.0,
-                    allowed_tools=ARCHITECT.allowed_tools or None,
-                    disallowed_tools=ARCHITECT.disallowed_tools or None,
-                    effort='high',
-                    backend='claude',
-                )
-
-                if not result.success:
-                    click.echo(f'    FAILED: {result.output[:200]}', err=True)
-                    continue
-
-                # Read the plan the architect wrote
-                plan = artifacts.read_plan()
-                if not plan:
-                    click.echo('    FAILED: architect produced no plan.json', err=True)
-                    continue
-
-                # Save plan into task JSON
-                task['plan'] = plan
-                with open(tp, 'w') as f:
-                    json.dump(task, f, indent=2)
-                    f.write('\n')
-
-                step_count = len(plan.get('steps', []))
-                click.echo(
-                    f'    OK: {step_count} steps, '
-                    f'cost=${result.cost_usd:.2f}'
-                )
-
-            finally:
-                await cleanup_eval_worktree(project_root, worktree)
-
-    asyncio.run(_run())
+for command in eval_cli.commands.values():
+    main.add_command(command)
 
 
 def _parse_duration(s: str) -> int:

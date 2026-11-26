@@ -27,6 +27,32 @@ You have been invoked because a task transitioned to `blocked`. The caller has p
 - `worktree` — absolute path to the task's worktree (e.g. `.worktrees/<id>/`)
 - `reason` — the high-level block reason (e.g. "verify exhausted", "review failed", "merge conflict")
 - `detail` — additional context captured at the moment of blocking
+- `**Reviews directory:**` — the absolute path of the task's reviewer verdict files,
+  which live in task-scoped storage outside the worktree; `(unavailable: <reason>)`
+  means no such path exists for this task, so skip the reviews scan
+- `**Granted tools:**` — the tools and Bash command rules your run holds, rendered from
+  the CLI envelope itself. Any shell command no rule there admits — `cat`, `head`,
+  `tail`, `ls`, `find`, a shell `grep`, or any command with a pipe or a redirection — is
+  denied for the whole session, and a retry is denied again. Read a file with `Read`,
+  search file contents with `Grep`, and list paths with `Glob`
+- the blocked task's own record, rendered as `**Title:**`, `**Description:**` and
+  `**Details:**` — each capped per field, with an oversized field clipped and marked
+  `... [<field> truncated] ...` so you can see when you are reading a partial value
+- `**Declared files:**` — the task's declared file footprint (`metadata.files`). This is
+  the declared scope the `human-review-required` trigger "changes are outside the
+  architect's declared file scope" in §"Risk assessment" is judged against; the
+  `plan.json` `files` list that trigger names is the authoritative copy, which Step 1a
+  has you read.
+
+If the orchestrator could not fetch the task record, you get an explicit
+`**Task record:** unavailable` marker in place of all of the above, rather than a
+silently missing block. When you see it you are investigating with neither the task
+text nor its declared scope — label scope conservatively.
+
+If the fetch succeeded but the record carries no title, description, details or
+declared files, you get `**Task record:** fetched but empty` instead. Treat it the
+same way: there is no task text and no declared scope to judge against, so label
+scope conservatively.
 
 ---
 
@@ -36,19 +62,19 @@ Collect all available information **in parallel**:
 
 ### 1a. Worktree artifacts
 ```
-Read <worktree>/.task/metadata.json   # task identity, base commit, plan files
 Read <worktree>/.task/plan.json       # TDD plan: steps done/pending, design decisions
 Read <worktree>/.task/iterations.jsonl  # execution log: what each agent attempted
 ```
-Also scan `<worktree>/.task/reviews/` for reviewer verdict files (`*.json`).
+Also scan the `**Reviews directory:**` path from your prompt for reviewer verdict files (`*.json`).
 
 ### 1b. Git state (read-only commands only)
+You run with the task worktree as your working directory. The `**Granted tools:**` line lists every Bash command rule you hold: any shell command outside it is denied without a prompt.
 ```bash
-git -C <worktree> log --oneline -15
-git -C <worktree> diff $(git -C <worktree> merge-base main HEAD)..HEAD --stat
-git -C <worktree> status --porcelain
+git log --oneline -15
+git diff main...HEAD --stat
+git status --porcelain
 ```
-Use the merge-base/three-dot form, not two-dot `main..HEAD` — two-dot charges everything that landed on main since the branch base to the task branch.
+Use the merge-base/three-dot form `main...HEAD`, not two-dot `main..HEAD` — two-dot charges everything that landed on main since the branch base to the task branch.
 
 ### 1c. Task metadata
 ```
@@ -58,8 +84,8 @@ Check `metadata.dry_run_proposals` — if prior proposals exist, note what was a
 
 ### 1d. Error context
 If `reason` contains "verify" or "test": read recent test output from iterations.jsonl.
-If `reason` contains "review": read `<worktree>/.task/reviews/*.json` for specific issues.
-If `reason` contains "merge": check `git -C <worktree> diff main --name-only` for conflict files.
+If `reason` contains "review": read the `*.json` files under the `**Reviews directory:**` path for specific issues.
+If `reason` contains "merge": check `git diff main --name-only` for conflict files.
 
 ---
 
@@ -87,18 +113,20 @@ landing on the current `main` tip (e.g. "post-merge verify failed", a
 rebase conflict, a pyright/lint break against the new main tip) — this
 investigation is running on the **merge-stage completion mode** path
 (orchestrator `block_class == MERGE_VERIFY_RED`; see
-`orchestrator/src/orchestrator/merge_completion.py`). This is narrower than
+`orchestrator/src/orchestrator/merge_lane/completion.py`). This is narrower than
 the general risk assessment above: only label `risk_label: "low"` for
 **MECHANICAL** completion classes:
 
-- **Rebase/conflict resolution** confined strictly to files that are
-  already part of the task's own diff (no edits outside the task's
-  declared footprint).
 - **Import/type/lint repairs** against the new `main` tip (e.g. a renamed
   symbol, a moved module, a newly-strict lint rule) — small, mechanical,
   and clearly attributable to the main-tip move.
 - Under a **small line cap** — a handful of lines, not a substantive
   rewrite.
+
+A **rebase conflict against `main` is never `low` in this mode**: the
+low-risk skill aborts on any conflict at its rebase step, so a `low` label
+would only spend an unattended run to end in an abort. Label it `medium` or
+`human-review-required`.
 
 Anything **semantic** — logic edits, a genuinely new test failure unrelated
 to the main-tip move, cross-module changes, or any edit outside the task's

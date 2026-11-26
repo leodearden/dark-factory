@@ -26,10 +26,12 @@
 # WHY THE TWO HALVES USE DIFFERENT MECHANISMS
 # -------------------------------------------
 # The lane-state half is pure bash: NO jq, NO python3. It is called once per
-# lane from warm-lane-audit.sh, which runs from a systemd timer and from the
-# disk-pressure paths and is forbidden from ever aborting — a hard jq/python3
-# requirement there would be a new environmental failure mode for an
-# advisory-only read of two flat top-level string scalars.
+# lane from warm-lane-audit.sh, which is meant to run unattended (its one
+# automated caller is
+# orchestrator/src/orchestrator/git_ops.py::GitOps._run_warm_lane_audit, on the
+# θ soft-floor defer path) and is forbidden from ever aborting — a hard
+# jq/python3 requirement there would be a new environmental failure mode for
+# an advisory-only read of flat top-level string scalars.
 #
 # The protected-prefix half DOES shell out to python3, because
 # PROTECTED_PREFIXES cannot be faithfully text-scraped: five of its keys are
@@ -90,14 +92,30 @@ _lane_state_record() {
 # lane_state_read <lane-dir|lane-name> [<state-dir>]
 #
 # Resolves EVERYTHING a caller needs about <lane>'s assignment from a SINGLE
-# read of <state-dir>/<lane>.json, publishing it in three globals and echoing
+# read of <state-dir>/<lane>.json, publishing it in four globals and echoing
 # the headline pair on stdout:
 #
-#   LANE_STATE_RAW      the record's raw `state` string; 'unknown' when none
-#                       could be read
-#   LANE_STATE_TASK_ID  the record's task_id ('' when absent, null, or unread)
-#   LANE_STATE_CAUSE    why the state is unknown; EMPTY when it is not
-#   stdout              '<raw>' or '<raw> <task_id>'
+#   LANE_STATE_RAW         the record's raw `state` string; 'unknown' when none
+#                          could be read
+#   LANE_STATE_TASK_ID     the record's task_id ('' when absent, null, unread)
+#   LANE_STATE_CAUSE       why the state is unknown; EMPTY when it is not
+#   LANE_STATE_UPDATED_AT  the record's `updated_at` string, VERBATIM and
+#                          unreformatted; '' when the record is absent,
+#                          unparseable, or carries no such key. That EMPTY
+#                          reading means "this record's age is unjudgeable" —
+#                          it is not a claim that the lane is new. Both
+#                          consumers turn it into an age via lane_state_epoch
+#                          and handle an unjudgeable stamp in opposite ways.
+#                          warm-lane-gc.sh's Pass-1 record gate fails SAFE: it
+#                          preserves the lane and warns, because it deletes.
+#                          warm-lane-audit.sh falls back to the lane dir mtime
+#                          and labels the row `age_source=dir-mtime`, because
+#                          it only reports.
+#   stdout                 '<raw>' or '<raw> <task_id>'
+#
+# stdout carries only the headline pair, NOT the timestamp: warm-lane-audit.sh
+# parses that string, and the timestamp has no column there. It travels in the
+# global alone.
 #
 # <state-dir> defaults to `<dirname of lane-dir>/.lane-state`; an explicit
 # second argument WINS and is honoured verbatim, including a path outside the
@@ -110,10 +128,11 @@ _lane_state_record() {
 # release, so a second read is a DIFFERENT INSTANT and can report a pair of
 # values that never coexisted.
 #
-# FAILS OPEN to 'unknown', always — callers include a systemd-timer audit and
-# the disk-pressure paths, which must never abort on one bad lane. The two
-# causes are kept DISTINCT because they send an operator to two different
-# places:
+# FAILS OPEN to 'unknown', always — callers include the timer-driven gc sweep
+# (warm-lane-gc-sweep.sh, which execs warm-lane-gc.sh) and warm-lane-audit.sh
+# (its caller is named in the header above), and neither may abort on one bad
+# lane. The two causes are kept DISTINCT because they send an operator to two
+# different places:
 #   no-readable-record   no state dir, or no readable <lane>.json there. The
 #                        only cause that is a filesystem/permissions question,
 #                        and the ordinary reading for every recordless _iact-*
@@ -126,13 +145,16 @@ _lane_state_record() {
 # the caller from lane_state_class returning UNKNOWN for a non-empty raw, so
 # there is no second copy of the recognized-state table to drift out of sync.
 lane_state_read() {
-    # Reset FIRST: every lane's triple is resolved from scratch, so a lane whose
-    # record cannot be read can never inherit its predecessor's values. Without
+    # Reset FIRST: every lane's values are resolved from scratch, so a lane
+    # whose record cannot be read can never inherit its predecessor's. Without
     # this the audit's `pin` column would report "lane X is held by task N" —
-    # a claim about a lane that X's record never made.
+    # a claim about a lane that X's record never made — and the gc gate's age
+    # bound would judge an unjudgeable lane by a fresh predecessor's stamp,
+    # silently disabling itself for the records in the worst shape.
     LANE_STATE_RAW='unknown'
     LANE_STATE_TASK_ID=''
     LANE_STATE_CAUSE=''
+    LANE_STATE_UPDATED_AT=''
 
     local raw_arg="${1:-}" explicit_dir="${2:-}"
 
@@ -161,6 +183,12 @@ lane_state_read() {
     fi
 
     LANE_STATE_TASK_ID="$(_lane_state_scalar "$text" task_id)"
+    # From the SAME already-slurped $text, through the SAME extractor: no second
+    # read, no second parser. `updated_at` is a flat top-level quoted string,
+    # the exact shape _lane_state_scalar documents itself as handling, and its
+    # miss behaviour (absent key or non-string value yields empty) is already
+    # the unjudgeable-age reading both consumers want.
+    LANE_STATE_UPDATED_AT="$(_lane_state_scalar "$text" updated_at)"
     local raw
     raw="$(_lane_state_scalar "$text" state)"
     if [ -n "$raw" ]; then
@@ -174,6 +202,25 @@ lane_state_read() {
     else
         printf '%s\n' "$LANE_STATE_RAW"
     fi
+    return 0
+}
+
+# lane_state_epoch <updated-at>
+# THE ONE parse of a record's `updated_at` into epoch seconds. Prints the epoch
+# and returns 0, or prints NOTHING and returns 1 when the stamp is unjudgeable:
+# empty, or anything `date -d` cannot turn into an integer (including on a
+# non-GNU date that cannot parse ISO-8601). Call it in an `if` condition so a
+# `set -euo pipefail` caller never aborts on it.
+#
+# The empty case is tested FIRST, before `date` runs, because GNU `date -d ''`
+# does not fail: it exits 0 and answers today's midnight, which would read an
+# unstamped record as stamped today.
+lane_state_epoch() {
+    local stamp="${1:-}" epoch
+    [ -n "$stamp" ] || return 1
+    epoch="$(date -d "$stamp" +%s 2>/dev/null)" || return 1
+    [[ "$epoch" =~ ^-?[0-9]+$ ]] || return 1
+    printf '%s\n' "$epoch"
     return 0
 }
 
@@ -227,12 +274,16 @@ lane_state_class() {
 # The difference from the hand-copied glob this lib replaced (warm-lane-gc.sh's
 # old PROTECT_GLOB default, whose comment admitted the coupling and asked future
 # editors to keep it in sync across a repo boundary) is that this backstop is
-# MACHINE CHECKED. The drift gate is
-# orchestrator/tests/test_lane_state_lib.py::TestProtectGlobFallbackDrift: it
-# fails the build if PROTECTED_PREFIXES gains a band no pattern here covers, and
-# it proves it can fail by re-running itself against a monkeypatched registry.
-# So do not sync this by hand — add the band to PROTECTED_PREFIXES in
-# orchestrator/src/orchestrator/git_ops.py and let the gate tell you.
+# MACHINE CHECKED, by two gates in orchestrator/tests/test_lane_state_lib.py.
+# TestProtectGlobFallbackDrift is the production contract: it fails the build if
+# PROTECTED_PREFIXES gains a band no pattern here covers or if this string ever
+# protects an owned pool band, and it proves it can fail by re-running itself
+# against a monkeypatched registry. TestProtectGlobFallbackIsAVerbatimRender is
+# the stricter one the gc suites' REIFY_WARM_LANE_GC_PROTECT_GLOB pins depend
+# on: it fails on ANY byte difference from the render and prints the exact
+# replacement assignment. So do not sync this by hand — add the band to
+# PROTECTED_PREFIXES in orchestrator/src/orchestrator/git_ops.py and let the
+# gate tell you.
 #
 # Authored complete against the current registry MINUS the owned pool bands.
 # `_lane-*` and `_spec-*` must NEVER appear here: protecting them would make
@@ -243,7 +294,7 @@ lane_state_class() {
 # `_merge-verify` is redundant against `_merge-*` and kept anyway: this string is
 # a verbatim render of the registry, so an operator can diff it against
 # `lane_protect_glob` output directly.
-LANE_PROTECT_GLOB_FALLBACK='_merge-*,_solo-*,_substrate-gate-*,_merge-verify,_offline-deep,.lane-state,.task-meta,_mainprobe-*,_mainsweep-*,_iact-*'
+LANE_PROTECT_GLOB_FALLBACK='_merge-*,_solo-*,_substrate-gate-*,_merge-verify,_offline-deep,.lane-state,.task-meta,_mainprobe-*,_mainsweep-*,_driftcheck-*,_iact-*'
 
 # _LANE_STATE_LIB_DIR / _LANE_STATE_REPO_ROOT — resolved ONCE, at source time,
 # by pure path arithmetic: no git invocation, no environment read. The lib ships
@@ -377,12 +428,22 @@ print(render_protect_glob(default_protected_prefixes(band), owned=sys.argv[1:]))
 #
 #     glob="$(lane_protect_glob _lane- _spec-)" || glob="$LANE_PROTECT_GLOB_FALLBACK"
 #
-# NOTE: as of leaf β there is NO in-tree consumer — this function and
-# LANE_PROTECT_GLOB_FALLBACK ship ahead of the caller that uses them. The
-# intended callers (warm-lane-gc.sh / warm-lane-gc-sweep.sh, wired by leaf γ,
-# which owns those files) run `set -euo pipefail`, so a caller that FORGETS the
-# `||` will abort on the non-zero return rather than sweep with an empty glob.
-# That is a property of γ's wiring, not something validated in situ here.
+# THE CONSUMER: warm-lane-gc.sh's PROTECT_GLOB default (task 3292), which calls
+# exactly the line above. It is the only one, and one is enough —
+# warm-lane-gc-sweep.sh carries no protect glob of its own and never has (its
+# terminal `exec "$GC_SCRIPT" "${args[@]}"` passes `reclaim --mount …` plus an
+# optional `--disk-pressure`), so it INHERITS gc.sh's resolution transitively.
+# Wiring it too would double the render cost on the one path that runs from a
+# systemd timer, for no behaviour change; it is deliberately not a caller.
+#
+# The `||` contract above is therefore an OBSERVED behaviour now, not a claim:
+# Block X-degrade in orchestrator/tests/warm-lane/test_warm_lane_gc_native.sh
+# drives a RELOCATED copy of gc.sh whose resolved repo root carries no
+# dark-factory checkout, so this function really does return non-zero there,
+# and the block asserts that gc.sh — which runs `set -euo pipefail` — degrades
+# to LANE_PROTECT_GLOB_FALLBACK with exactly one [warn] instead of aborting its
+# sweep. A future caller that FORGETS the `||` still aborts; that hazard is
+# unchanged, it is just no longer unexercised in-tree.
 lane_protect_glob() {
     # One guard for both root failures — an unresolvable root and a resolved root
     # that is not a dark-factory checkout are the same thing to a caller
@@ -430,6 +491,9 @@ lane_protect_glob() {
 
 # Published defaults, so a caller that sources this lib and inspects the
 # globals before any read sees the same fail-open shape a failed read yields.
+# Under the callers' `set -u` an unpublished global would abort the script
+# rather than degrade one lane, which is the opposite of this lib's contract.
 LANE_STATE_RAW='unknown'
 LANE_STATE_TASK_ID=''
 LANE_STATE_CAUSE=''
+LANE_STATE_UPDATED_AT=''

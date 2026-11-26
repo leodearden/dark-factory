@@ -1,0 +1,885 @@
+"""The escalation channel the MCP boundary guards file their records through.
+
+ONE mechanism, shared by every orchestrator-side registration site of
+:class:`shared.mcp_markup_middleware.MarkupGuardMiddleware` (PRD
+``plans/toolcall-markup-containment-prd.md``, contract C2 / INV-7).
+
+Born as ``plan_tools``' private sink (task 4457) and promoted here by task 3690
+when verdict-tools needed the identical thing. The promotion is the point: a
+second, weaker preservation mechanism on a sibling boundary is precisely the
+INV-5 failure this PRD exists to rule against, and the review that caught it
+named the duplication before it shipped. Everything server-specific — the
+attribution role, the two queue anchors, and the four sentences of prose a
+human reads — arrives in a :class:`MarkupSinkSpec`; nothing here is inferred
+from a tool name or a server name at call time.
+
+``MarkupGuardMiddleware`` takes its escalation emitter as an INJECTED callable
+because ``shared`` is the base layer every other package imports and so cannot
+import ``escalation`` without a cycle. This module is the orchestrator-side
+concrete emitter, wired at each registration site against that site's own spec.
+
+Shape inherited from ``fused_memory.server.markup_tripwire.
+emit_markup_storm_escalation``, the in-repo precedent for filing from an MCP
+server process: same queue dir, same never-raises posture, same
+log-and-return-None on any failure.
+"""
+
+from __future__ import annotations
+
+import ast
+import asyncio
+import enum
+import logging
+import subprocess
+from collections.abc import Awaitable, Callable, Mapping
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+from shared.eval_lane import eval_lane_provenance
+from shared.markup_residue_custody import ResidueCall, residue_prose
+from shared.mcp_markup_middleware import (
+    MARKUP_BOUNDARY_STORM_CATEGORY,
+    MARKUP_RECURRENCE_ROUTING,
+    MARKUP_RESIDUE_ERROR_TYPES,
+    MARKUP_STORM_ERROR_TYPE,
+    residue_header_lines,
+)
+from shared.project_layout import escalation_queue_dir
+
+logger = logging.getLogger(__name__)
+
+#: Rendered as the subject when there is no plan to read it from and the
+#: worktree has no name either. Never a guess — an explicit "nobody knows".
+MARKUP_UNATTRIBUTED_SUBJECT = 'unattributed'
+
+#: The ERROR line for a record the queue could not take: why, what it cost
+#: (:func:`_loss_account`), and whose call it was.
+_LOSS_LOG_FORMAT = 'markup guard: %s, so %s (subject %r)'
+
+
+class LossCause(enum.Enum):
+    """Why a record the queue could not take was lost.
+
+    Deliberately not a ``str``: the sink's body answers a queued id OR one of
+    these, and only a non-``str`` cause keeps that union discriminated for the
+    type checker. Its ``value`` is what the loss record carries.
+    """
+
+    ROOT_UNRESOLVED = 'project_root_unresolved'
+    QUEUE_UNOPENED = 'queue_unopened'
+    SUBMIT_FAILED = 'submit_failed'
+    SINK_FAILED = 'sink_failed'
+
+
+_LOSS_PROSE: Mapping[LossCause, str] = {
+    LossCause.ROOT_UNRESOLVED: 'the project root could not be resolved',
+    LossCause.QUEUE_UNOPENED: 'the escalation queue could not be opened',
+    LossCause.SUBMIT_FAILED: 'the escalation could not be submitted',
+    LossCause.SINK_FAILED: 'the escalation sink could not run',
+}
+
+#: The ``fact`` and ``outcome`` of the record a lost record is handed to the
+#: loss sink as. The outcome must stay disjoint from the middleware's
+#: ``OUTCOMES`` and from verdict-tools' ``IssueIntakeOutcome``: a journal line
+#: cut to its floor keys is told apart by ``outcome`` alone.
+MARKUP_RECORD_LOST_FACT = 'markup_record_lost'
+MARKUP_RECORD_LOST_OUTCOME = 'lost'
+
+#: The burst alarm's level — this sink's OWN decision, because the
+#: middleware's storm record declares none. Its category is not decided here:
+#: it is the middleware's ``MARKUP_BOUNDARY_STORM_CATEGORY``, one spelling for
+#: every registration site. The residue record carries both and its vocabulary
+#: is therefore never re-decided here (INV-7).
+#:
+#: ``level=1`` matches ``markup_tripwire``'s storm record, the in-repo
+#: precedent for a burst alarm filed from an MCP server process: it is an
+#: operator-facing heads-up about a leak that is running now, not a hold on one
+#: caller's data.
+MARKUP_STORM_LEVEL = 1
+
+#: The storm detail's SUBJECT line, spelled ONCE: :func:`storm_detail` writes it
+#: and :func:`_recorded_subject` reads it back off an already-open record to
+#: tell an operator when a burst folded into a record naming a DIFFERENT
+#: caller. Two spellings would make that comparison silently always-differ —
+#: the same trap ``markup_tripwire._DETAIL_OUTCOME_KEY`` exists to avoid for its
+#: own outcome line.
+#:
+#: It is also the FIRST line of the body, which is defence in depth: no
+#: caller-supplied value can be rendered ahead of it, so a forged
+#: ``subject_task_id=`` line could never be the one this parser reads even if
+#: the ``!r`` escaping below were ever dropped.
+DETAIL_SUBJECT_KEY = 'subject_task_id='
+
+#: Only ever used for a record the middleware grew LATER and this sink does not
+#: recognise. Filing it under a visible fallback is the point: silently
+#: discarding a record kind is the fail-soft this PRD exists to end.
+ESCALATION_FALLBACK_CATEGORY = 'mcp_markup_residue'
+
+
+@dataclass(frozen=True)
+class MarkupSinkSpec:
+    """Everything one registration site must DECLARE about its own channel.
+
+    A frozen dataclass rather than a pile of keyword arguments so a new
+    registration site cannot half-configure itself: every field below is
+    required, so adding a server is a decision at every axis rather than an
+    inheritance of plan-tools' answers.
+    """
+
+    #: The server's own name, as it appears in a human-facing sentence and in
+    #: the two anchors below. ``'plan-tools'``, ``'verdict-tools'``.
+    server_label: str
+
+    #: Filed-by attribution. Names the GUARD, not the leaking agent. The
+    #: leaking caller rides in the detail instead, read off the record: no
+    #: tool on these servers declares ``agent_id`` / ``project_root`` /
+    #: ``project_id``, so the middleware's ``agent_id`` is ``None`` here, and
+    #: so is its role unless the registration site wires host attribution
+    #: (``shared/src/shared/mcp_markup_middleware.py::HostAttribution``). An
+    #: axis nothing resolves is rendered as the null it is — as ``agent_id``
+    #: on a residue record and as ``crossing_agent_id`` on a storm record —
+    #: rather than being guessed at.
+    #:
+    #: The SUBJECT task does not come from the middleware at all:
+    #: ``make_escalation_sink``'s ``subject_task_id`` thunk supplies it per
+    #: record, and both filers render it first. That is why the thunk exists.
+    agent_role: str
+
+    #: The queue routing key for EVERY residue record — a NON-TASK anchor,
+    #: exactly as ``markup_tripwire`` files under its own ``markup-tripwire``
+    #: anchor rather than under whichever task happened to be running.
+    #:
+    #: THIS IS LOAD-BEARING, not cosmetic. The middleware declares residue at
+    #: ``level=2``, and a pending level>=2 record carrying a LIVE task id halts
+    #: that task. Preserving one payload must not cost the run that produced
+    #: it: the leaking caller is told to resend from its own copy and carry on.
+    #: The anchor changes only WHERE the record is filed — its level, owner and
+    #: category are still the middleware's, and the subject task is not lost:
+    #: it rides in the summary and the detail, which is where a human reader
+    #: looks anyway.
+    residue_anchor_task_id: str
+
+    #: The dedup anchor for bursts. A burst is a property of the SERVER's
+    #: rolling window, not of the task whose call happened to cross the
+    #: threshold, so it is filed under a stable id of its own — which is also
+    #: what makes the open-record lookup stable enough to dedup against. Kept
+    #: DISTINCT from the residue anchor: a residue record is about ONE caller's
+    #: payload, and folding it under the server-wide burst anchor would make
+    #: the two indistinguishable to a reader.
+    storm_anchor_task_id: str
+
+    #: What the refusal COST, in one sentence, rendered only into a REFUSED
+    #: residue record's body. Server-specific because the loss is: a refused
+    #: plan-tools call writes nothing to plan.json, while a refused
+    #: verdict-tools call leaves a review gate open until the reviewer
+    #: resends.
+    refusal_consequence: str
+
+    #: What an ACTIVE burst threatens if the guard is disabled, in one
+    #: sentence, rendered into the storm alarm's body.
+    storm_consequence: str
+
+    #: WHERE an operator can identify the leaking caller for THIS boundary, as
+    #: an instruction they can follow. Rendered into the storm alarm's detail
+    #: and its suggested_action.
+    #:
+    #: REQUIRED, not defaulted, and that is load-bearing (task 4744). This field
+    #: replaced a hard-coded "grep the orchestrator logs for 'markup guard:'"
+    #: sentence that was measured UNFOLLOWABLE on 2026-08-25::
+    #:
+    #:     journalctl --user --since 2026-08-22 | grep 'markup guard:'
+    #:         ->  0 plan-tools lines
+    #:
+    #: against 35 real plan-tools rejections in data/orchestrator/
+    #: agent-transcripts/ over the same span. These servers are per-agent STDIO
+    #: SUBPROCESSES whose stderr the CLI agent that spawned them consumes, so
+    #: those lines reach no durable sink; an operator following that instruction
+    #: correctly concluded "no evidence" and was wrong. A DEFAULT here would let
+    #: the next such server silently inherit the same false sentence, which is
+    #: the exact defect being fixed — so each boundary states its own answer.
+    attribution_source: str
+
+    @property
+    def fallback_summary(self) -> str:
+        return (
+            f'Unrecognised MCP markup-guard record filed by the '
+            f'{self.server_label} boundary guard — see the detail below'
+        )
+
+
+def resolve_project_root(worktree: Path) -> Path | None:
+    """The project root whose escalation queue this server files into.
+
+    ``--git-common-dir``, NOT ``--show-toplevel``: from a task worktree the
+    toplevel is the WORKTREE, while the common dir is the MAIN checkout's
+    ``.git`` — whose parent is project_root, the one queue every lane and every
+    watcher already reads. Measured in a live task worktree.
+
+    Never raises: a git failure degrades to a logged ``None``, which costs the
+    operator a queued record rather than turning a decided refusal into an
+    outage of its own.
+    """
+    try:
+        result = subprocess.run(
+            ['git', 'rev-parse', '--git-common-dir'],
+            cwd=str(worktree),
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (subprocess.SubprocessError, OSError) as exc:
+        logger.warning(
+            'markup guard: could not resolve project_root from %s (%s); the '
+            'residue will not be queued', worktree, exc,
+        )
+        return None
+    common_dir = result.stdout.strip()
+    if not common_dir:
+        logger.warning(
+            'markup guard: git named no common dir for %s; the residue will '
+            'not be queued', worktree,
+        )
+        return None
+    git_dir = Path(common_dir)
+    if not git_dir.is_absolute():
+        # A plain checkout answers with the relative ``.git``; a linked
+        # worktree answers with the main checkout's absolute path.
+        git_dir = (worktree / git_dir).resolve()
+    return git_dir.parent
+
+
+def resolve_subject(
+    subject_task_id: Callable[[], str], worktree: Path, *, what: str
+) -> str:
+    """Who this record is attributed to: the site's answer, then a ladder.
+
+    ONE ladder, shared by every channel a boundary guard emits through — the
+    escalation sink below and ``markup_journal.make_fact_journal``. Kept here
+    rather than reimplemented per channel because the two channels' records are
+    asserted to name the SAME subject: two copies of an attribution ladder can
+    drift in opposite directions on one boundary, and a guard whose escalation
+    and whose journal disagree about who leaked is worse than either alone.
+    That sibling duplication is the INV-5 shape this module's own header rules
+    against.
+
+    The rungs, in order: the site's own answer (plan.json's ``task_id`` for
+    plan-tools), then the worktree directory NAME (a task worktree is named for
+    its task), then an explicit ``MARKUP_UNATTRIBUTED_SUBJECT`` — never ``None``
+    and never absent, because a consumer must be able to tell "nobody knows"
+    from "that emitter forgot the key".
+
+    A RAISING thunk falls to the same ladder rather than costing the record.
+    Attribution is what these channels are FOR, but a record that says
+    "something leaked from add_design_decision at 16:52:34" is still strictly
+    more than the nothing that was written before they existed.
+
+    *what* names the record kind in the fallback log line, so an operator
+    reading the warning knows which channel degraded.
+    """
+    try:
+        resolved = subject_task_id()
+    except Exception:
+        logger.warning(
+            'markup guard: could not attribute the %s under %s; falling back '
+            'to the worktree name', what, worktree,
+        )
+        resolved = ''
+    return resolved or worktree.name or MARKUP_UNATTRIBUTED_SUBJECT
+
+
+def open_escalation_channel(project_root: Path) -> tuple[Any, Any] | None:
+    """Open ``(Escalation, EscalationQueue)`` for *project_root*, or ``None``.
+
+    THE IMPORT IS LAZY, and deliberately not hoisted to module scope. MCP
+    server startup latency is load-bearing: the orchestrator spawns one of
+    these per agent invocation over stdio, and an import stall past
+    ``MCP_TIMEOUT`` gets the server silently dropped, producing 0-turn
+    ``error_empty_output`` failures (tasks 1775 / 1776 / 2942). This path runs
+    only on the measured 0.27% of calls that carry a leak, so it pays for
+    itself the first time it is needed and never before.
+
+    An ImportError degrades to a logged ``None`` exactly as
+    ``markup_tripwire``'s ``HAS_ESCALATION`` guard does — ``escalation`` is a
+    workspace dependency of orchestrator, so this is a defensive floor rather
+    than an expected branch.
+    """
+    try:
+        from escalation.models import Escalation
+        from escalation.queue import EscalationQueue
+    except ImportError:
+        logger.warning(
+            'markup guard: the escalation package is unavailable, so the '
+            'residue of a refused call will not be preserved anywhere',
+        )
+        return None
+    try:
+        return Escalation, EscalationQueue(escalation_queue_dir(project_root))
+    except Exception:
+        logger.exception(
+            'markup guard: failed to open the escalation queue under %s', project_root,
+        )
+        return None
+
+
+def _residue_account(record: Mapping[str, Any], spec: MarkupSinkSpec) -> list[str]:
+    """Who filed the record, then what happened to the call and its payload.
+
+    The outcome and custody are :func:`shared.markup_residue_custody.residue_prose`'s;
+    only a REFUSED call adds what the refusal cost on this server.
+    """
+    prose = residue_prose(record)
+    consequence = [spec.refusal_consequence, ''] if prose.call is ResidueCall.REFUSED else []
+    return [
+        f'Filed by the {spec.server_label} MCP boundary guard.',
+        '',
+        prose.outcome,
+        '',
+        *consequence,
+        prose.custody,
+    ]
+
+
+def residue_detail(
+    record: Mapping[str, Any], subject_task_id: str, spec: MarkupSinkSpec
+) -> str:
+    """The residue record's body — flat fields, then the payload VERBATIM.
+
+    The raw value is rendered last, unquoted and unescaped, so it can be
+    recovered byte for byte. Whether anyone else still holds it depends on the
+    kind, and the account between them (:func:`_residue_account`) says
+    which. Everything above it is diagnostic and is written with ``!r``
+    so an empty or ``None`` field reads as itself rather than as a blank line.
+
+    The header lines are ``residue_header_lines``', the one rendering every
+    residue filer shares, with ``subject_task_id`` overlaid by this site's
+    thunk: the record's own ``task_id`` field is the non-gating anchor, so this
+    is the only place a reader learns whose call leaked. ``owner`` is rendered
+    for the same class of reason: the middleware declares it as INV-7's
+    machine-readable owner and :class:`escalation.models.Escalation` has no
+    field for it, so rendering it is what keeps a declared contract field from
+    being silently dropped at the one sink whose whole argument is against
+    silent drops.
+    """
+    return '\n'.join([
+        *residue_header_lines({**record, 'subject_task_id': subject_task_id}),
+        f'owner={record.get("owner")!r}',
+        f'tool={record.get("tool")!r}',
+        f'field={record.get("field")!r}',
+        f'matched_pattern={record.get("matched_pattern")!r}',
+        '',
+        *_residue_account(record, spec),
+        '',
+        'Recover the payload below for the caller if it is still needed, then '
+        'chase the harness serialization leak that produced it and '
+        f'{MARKUP_RECURRENCE_ROUTING}.',
+        '',
+        'RAW PAYLOAD (verbatim):',
+        str(record.get('raw_value')),
+    ])
+
+
+def storm_detail(
+    record: Mapping[str, Any], subject_task_id: str, spec: MarkupSinkSpec
+) -> str:
+    """The burst alarm's body — who leaked, the window's numbers, what to do.
+
+    The routing sentence is
+    ``shared/src/shared/mcp_markup_middleware.py::MARKUP_RECURRENCE_ROUTING``.
+
+    ``subject_task_id`` leads for the same reason it leads in
+    :func:`residue_detail` — the record's own ``task_id`` field is the
+    non-gating burst anchor, so this is the only place a reader learns whose
+    calls leaked. It is also the axis that RESOLVES on these servers: the
+    middleware reads its attribution off the call's own arguments, and no tool
+    here declares ``agent_id`` / ``project_root`` / ``project_id``.
+
+    The middleware's own axes are rendered beneath it, nulls included. A
+    ``None`` is a FACT about this boundary, and rendering it as itself is what
+    tells a reader the guard resolved nothing rather than that this sink
+    dropped a field.
+
+    Every line is ``!r``, and on the ``crossing_*`` and ``callers`` lines that
+    is load-bearing rather than stylistic: those are strings the leaking CALLER
+    supplied, and this body is LINE-ORIENTED — a run of ``key=`` lines an
+    operator reads top-down and :func:`_recorded_subject` parses back off an
+    already-open record to catch a differently-attributed fold. An unescaped
+    newline in a caller-supplied value would let that caller forge any of those
+    lines. ``!r`` escapes newlines, and every line here uses it.
+
+    ``markup_tripwire._recorded_outcome`` does NOT read this body, and the
+    rationale above deliberately does not lean on it: that parser only ever
+    reads records it fetched from its OWN ``markup-tripwire`` / ``markup-guard``
+    anchors, while these are filed under ``spec.storm_anchor_task_id``
+    (``plan-tools-markup-storm``, ``verdict-tools-markup-storm``). The escaping
+    requirement here is this body's own. Should a cross-filer parse-back ever be
+    wanted, the ``outcome=`` line would first have to move ABOVE the
+    caller-supplied lines to satisfy the ordering ``markup_tripwire`` declares
+    mandatory; today it sits below them, and only ``!r`` makes that safe.
+
+    The record's own attribution LEADS; the per-boundary corroboration route
+    follows it and is the SPEC's (:attr:`MarkupSinkSpec.attribution_source`),
+    not this module's, because the honest answer differs per boundary — and a
+    wrong one here is worse than none, since a reader who follows it concludes
+    "no evidence" rather than "I looked in the wrong place".
+    """
+    return '\n'.join([
+        f'{DETAIL_SUBJECT_KEY}{subject_task_id!r}',
+        f'crossing_agent_id={record.get("crossing_agent_id")!r}',
+        f'crossing_subject_task_id={record.get("crossing_subject_task_id")!r}',
+        f'crossing_subject_agent_role={record.get("crossing_subject_agent_role")!r}',
+        f'callers={record.get("callers")!r}',
+        f'count={record.get("count")!r}',
+        f'threshold={record.get("threshold")!r}',
+        f'window_seconds={record.get("window_seconds")!r}',
+        f'outcome={record.get("outcome")!r}',
+        f'project={record.get("project")!r}',
+        '',
+        f'The {spec.server_label} MCP boundary guard saw multiple tool calls '
+        'carrying raw tool-call envelope markup inside one rolling window. A '
+        'BURST means the upstream harness serialization leak is ACTIVE right '
+        'now, not that the guard is misfiring — do NOT disable it, or '
+        + spec.storm_consequence,
+        '',
+        'The caller is named ABOVE: subject_task_id is whose plan this server '
+        'was serving, crossing_* names the one call that crossed the '
+        'threshold, and callers lists every distinct caller seen in the '
+        f'window. Start there, then {MARKUP_RECURRENCE_ROUTING}.',
+        '',
+        # BOUNDARY-SCOPED, not universal, and no longer this filer's to
+        # phrase. The route to a per-event answer differs per registration
+        # site — plan-tools and verdict-tools each journal every fact to
+        # their own file (tasks 4744 and 4917), the escalation server only
+        # logs — so each site declares its own sentence in
+        # ``MarkupSinkSpec.attribution_source``. This filer is shared, so a sentence baked
+        # in here would be silently inherited as a falsehood in a level-1
+        # operator record by the next site registered.
+        'For per-event corroboration — one line per call rather than the '
+        "window's fold — " + spec.attribution_source + '.',
+    ])
+
+
+def file_residue(
+    escalation_cls: Any,
+    queue: Any,
+    worktree: Path,
+    subject_task_id: str,
+    record: Mapping[str, Any],
+    spec: MarkupSinkSpec,
+) -> str | None:
+    """File one residue record. NEVER deduped, and that is the point.
+
+    Each record holds a DIFFERENT caller's payload, so folding two of them
+    into one open escalation would destroy one. The storm
+    anchor's dedup exists because a burst is the same alarm twice; this is the
+    opposite case, and the open-record lookup is not even performed.
+
+    Filed under the residue ANCHOR, never under the leaking task's own id: at
+    the ``level=2`` the middleware declares, a pending record carrying a live
+    task id halts that task. See :attr:`MarkupSinkSpec.residue_anchor_task_id`.
+    """
+    esc = escalation_cls(
+        id=queue.make_id(spec.residue_anchor_task_id),
+        task_id=spec.residue_anchor_task_id,
+        agent_role=spec.agent_role,
+        # 'blocking' even for the level-2 record the middleware declares, and
+        # the reason is the SENTINEL-ROLE rule, not squeamishness: a born-at-L2
+        # severity (`escalation.models.BORN_AT_L2_SEVERITIES`) is legal only for
+        # a role in `escalation/models.py::HARNESS_SENTINEL_ROLE_PREFIXES`, which
+        # `_chokepoint_or_submit` enforces by downgrading and `submit.py` by
+        # rejecting. Every spec on this module's callers files under its own
+        # server-named role (`plan-tools-markup-guard`,
+        # `verdict-tools-markup-guard`) — deliberately, so a reader can tell
+        # WHICH boundary leaked — and none of those is a sentinel, so 'blocking'
+        # is the only severity these records may legally carry.
+        #
+        # The guard registered INSIDE the escalation server files the same
+        # record class at 'critical' (`escalation.server._MARKUP_RESIDUE_SEVERITY`)
+        # because it files as `harness-markup-guard`, which IS a sentinel. That
+        # is one rule resolving two ways, not two sites disagreeing; neither may
+        # be "made to match" the other by changing the severity alone, because
+        # the severity follows the role. Both sites reach the queue through a
+        # direct `submit` that bypasses the gate, so each honours the rule by
+        # construction rather than by being checked.
+        severity='blocking',
+        # The middleware OWNS this vocabulary (INV-7). A second site re-deciding
+        # a record's category or level is exactly the two-mechanisms-on-one-
+        # boundary failure this module exists to rule against.
+        category=record.get('category', ESCALATION_FALLBACK_CATEGORY),
+        # The subject is PREFIXED rather than folded into the middleware's own
+        # sentence: the queue's task_id is the anchor, so a reader scanning
+        # summaries alone would otherwise have no way to tell whose call leaked.
+        summary=f'[{subject_task_id}] ' + record.get('summary', spec.fallback_summary),
+        suggested_action=record.get('suggested_action', ''),
+        detail=residue_detail(record, subject_task_id, spec),
+        worktree=str(worktree),
+        level=record.get('level', 0),
+    )
+    return queue.submit(esc)
+
+
+def _recorded_subject(escalation: Any) -> str | None:
+    """The subject an ALREADY-OPEN burst alarm was filed with, or ``None``.
+
+    Read back off that record's own :data:`DETAIL_SUBJECT_KEY` line — the very
+    line :func:`storm_detail` writes — because the anchor dedup is
+    subject-AGNOSTIC. The anchor lives in the PROJECT-ROOT queue that every
+    worktree's server files into, so the burst that OPENS the record fixes
+    whose task id headlines it, and a later burst from a different worktree
+    folds in behind that headline. Without this read the queue would confidently
+    name one caller while another's burst left no trace at all — the exact
+    misattribution the ``crossing_`` prefix exists to avoid, one layer up.
+
+    ``None`` for a record naming no subject, which covers both a body this
+    module did not write (another producer squatting the shared anchor) and one
+    written before this line existed. NEVER raises: it feeds a log line on a
+    path whose only job is to return an id. Shape copied from
+    ``markup_tripwire._recorded_outcome``, the in-repo precedent for exactly
+    this read.
+    """
+    detail = getattr(escalation, 'detail', None)
+    if not isinstance(detail, str):
+        return None
+    for line in detail.splitlines():
+        if not line.startswith(DETAIL_SUBJECT_KEY):
+            continue
+        try:
+            value = ast.literal_eval(line[len(DETAIL_SUBJECT_KEY):])
+        except (ValueError, SyntaxError):
+            return None
+        return value if isinstance(value, str) else None
+    return None
+
+
+def file_storm(
+    escalation_cls: Any,
+    queue: Any,
+    worktree: Path,
+    subject_task_id: str,
+    record: Mapping[str, Any],
+    spec: MarkupSinkSpec,
+) -> str | None:
+    """File one burst alarm, folding into an already-open one if there is one.
+
+    The anchor dedup matters beyond the counter's own per-window rate limit: a
+    leak running for hours would otherwise file one escalation per window, so
+    those collapse into the single open record until an operator resolves it.
+
+    That fold is subject-BLIND, and the anchor sits in the project-root queue
+    every worktree's server files into — so a fold can quietly bury a burst
+    from a DIFFERENT caller behind the first one's headline. It is not silent:
+    :func:`_recorded_subject` reads the open record's own subject line back and
+    a mismatch is logged at ERROR, the same posture ``markup_tripwire`` takes
+    for a fold that names a different outcome. Not filing a second record is
+    still the right trade — the alarm is about the LEAK, which is one leak —
+    but "we chose not to file this" must not read as "nothing happened".
+
+    A queue READ failure falls THROUGH to filing rather than bailing out —
+    losing duplicate suppression is strictly better than losing the alarm for
+    an actively running leak. Same posture ``markup_tripwire`` takes.
+
+    ``subject_task_id`` is taken in the position :func:`file_residue` already
+    puts it, so a reader of one filer is not surprised by the other. It rides
+    the summary and the detail ONLY: the escalation's ``task_id`` stays
+    ``spec.storm_anchor_task_id``, because moving the subject there would
+    re-point the dedup lookup at a live task and file a level-1 record against
+    it — the failure :attr:`MarkupSinkSpec.storm_anchor_task_id` exists to
+    rule out.
+    """
+    try:
+        existing = queue.get_by_task(spec.storm_anchor_task_id, status='pending')
+    except Exception:
+        logger.exception(
+            'markup guard: could not check for an open burst alarm; filing a '
+            'new one rather than losing it',
+        )
+        existing = []
+    open_alarms = [
+        esc for esc in existing
+        if getattr(esc, 'category', None) == MARKUP_BOUNDARY_STORM_CATEGORY
+    ]
+    if open_alarms:
+        open_subject = _recorded_subject(open_alarms[0])
+        if open_subject == subject_task_id:
+            logger.info(
+                'markup guard: %s is already open for this burst (%r now); not '
+                'filing a duplicate', open_alarms[0].id, record,
+            )
+        else:
+            # ERROR, not info, and mirroring ``markup_tripwire``'s SUPPRESSED
+            # line: the queue is about to say nothing at all about THIS
+            # caller. The summary is headlined with the subject, so a silent
+            # fold leaves a record confidently naming task A while task B's
+            # burst is invisible — the failure the attribution work exists to
+            # end, reintroduced by the dedup.
+            #
+            # On a per-agent stdio site (plan-tools and verdict-tools today)
+            # this line goes to the subprocess's stderr, which the spawning
+            # CLI keeps nowhere durable: neither journald nor the CLI's own
+            # MCP log cache holds tool-time stderr. The fold is a sink event,
+            # not a middleware fact, so the site's markup journal never
+            # records it either. On such a site the line is a floor and not
+            # the fix: the FIX an operator has is in the message — resolving
+            # the open record lets the next burst file under its own subject.
+            logger.error(
+                'markup guard: markup_guard_storm SUPPRESSED — %s is already '
+                'open naming subject_task_id=%r, so this burst from '
+                'subject_task_id=%r gets no record of its own and its caller is '
+                'invisible in the queue; resolve that escalation to let the '
+                'next burst file. record=%r',
+                open_alarms[0].id, open_subject, subject_task_id, record,
+            )
+        return open_alarms[0].id
+
+    esc = escalation_cls(
+        id=queue.make_id(spec.storm_anchor_task_id),
+        task_id=spec.storm_anchor_task_id,
+        agent_role=spec.agent_role,
+        severity='blocking',
+        category=MARKUP_BOUNDARY_STORM_CATEGORY,
+        # PREFIXED exactly as ``file_residue`` prefixes its own: the queue's
+        # task_id is the burst anchor, so a reader scanning summaries alone
+        # would otherwise have no way to tell whose calls leaked — and the L2
+        # watcher's notification projects the summary and the suggested_action
+        # and nothing else.
+        summary=(
+            f'[{subject_task_id}] '
+            f'{record.get("count")} {spec.server_label} tool call(s) '
+            f'{record.get("outcome")} for leaked envelope markup in '
+            f'{record.get("window_seconds")}s — the serialization leak is '
+            'ACTIVE (see plans/toolcall-markup-containment-prd.md)'
+        ),
+        detail=storm_detail(record, subject_task_id, spec),
+        # Leads with the attribution the record now CARRIES. It used to lead
+        # with "identify the leaking caller from the guard's log lines", an
+        # instruction that cannot be followed at all on a per-agent stdio
+        # site — whose stderr the spawning CLI consumes and never forwards to
+        # journald — and that on any other site expires inside this host's
+        # ~72h `journald --user` window, while the measured
+        # esc-plan-tools-markup-storm-* records were read at 6-7 days old.
+        suggested_action=(
+            f'the record names its caller: subject_task_id={subject_task_id!r}, '
+            'with crossing_* naming the call that crossed the threshold and '
+            'callers listing every caller seen in the window — read those off '
+            f'the detail and {MARKUP_RECURRENCE_ROUTING}. For per-event '
+            'corroboration, '
+            + spec.attribution_source
+        ),
+        worktree=str(worktree),
+        level=MARKUP_STORM_LEVEL,
+    )
+    esc_id = queue.submit(esc)
+    logger.warning('markup guard: queued %s for the burst %r', esc_id, record)
+    return esc_id
+
+
+def _loss_account(record: dict[str, Any]) -> str:
+    """What a record the queue could not take cost, in its OWN kind's terms.
+
+    A burst alarm carries no payload and no caller is waiting to resend one,
+    so the payload kinds' size-and-resend account would be false for it.
+    """
+    if record.get('error_type') == MARKUP_STORM_ERROR_TYPE:
+        return (
+            f'the burst alarm ({record.get("count")} {record.get("outcome")} '
+            f'outcome(s) in {record.get("window_seconds")}s) was NOT QUEUED; '
+            'the leak is active and the queue does not say so'
+        )
+    return (
+        f'the {record.get("error_type")!r} record for '
+        f'{record.get("tool")}.{record.get("field")} '
+        f'({_raw_value_chars(record) or 0}-char raw value) was preserved '
+        'NOWHERE; the caller is told nothing was preserved and to resend from '
+        'its own copy'
+    )
+
+
+def _raw_value_chars(record: Mapping[str, Any]) -> int | None:
+    """The size of *record*'s payload, or ``None`` for a record that carries none."""
+    raw_value = record.get('raw_value')
+    return len(raw_value) if isinstance(raw_value, str) else None
+
+
+def _loss_fact(record: Mapping[str, Any], cause: LossCause) -> dict[str, Any]:
+    """The loss sink's record for *record*: what was lost and why, never the payload.
+
+    ``param`` is the journal's floor-key name for the record's ``field``, so a
+    line cut to its floor still names the tool and the parameter.
+    """
+    return {
+        'fact': MARKUP_RECORD_LOST_FACT,
+        'outcome': MARKUP_RECORD_LOST_OUTCOME,
+        'cause': cause.value,
+        'error_type': record.get('error_type'),
+        'tool': record.get('tool'),
+        'param': record.get('field'),
+        'raw_value_chars': _raw_value_chars(record),
+    }
+
+
+def make_escalation_sink(
+    *,
+    worktree: Path,
+    spec: MarkupSinkSpec,
+    subject_task_id: Callable[[], str],
+    loss_sink: Callable[[dict[str, Any]], Awaitable[object]],
+    resolve_root: Callable[[Path], Path | None] = resolve_project_root,
+    open_channel: Callable[[Path], tuple[Any, Any] | None] = open_escalation_channel,
+) -> Callable[[dict[str, Any]], Awaitable[str | None]]:
+    """Build the emitter a boundary guard files its records through.
+
+    Returns the id of the queued record, which the middleware folds into the
+    caller-facing refusal so the payload can be looked up — or ``None`` when
+    nothing was filed (the queue could not take it, or the record came from the
+    eval lane — see below).
+
+    AN EVAL-LANE RECORD IS NOT FILED AT ALL, of any kind (task 6479).
+    plan-tools is injected into every eval cell, an eval worktree is a linked
+    worktree of the main checkout, and both filers reach the queue through a
+    direct ``submit`` that bypasses the eval-lane gate in
+    ``escalation/src/escalation/server.py::_chokepoint_or_submit``. So the
+    record is checked here, by that gate's own rule
+    (``shared.eval_lane.eval_lane_provenance`` on the subject and the
+    worktree), before any root is resolved or queue opened, and answered with
+    an INFO line and ``None`` — "nothing was preserved", which is true.
+
+    THE PAYLOAD FLOOR IS THE QUEUE OR NOTHING, for every boundary on this
+    sink. A record the queue cannot take is logged once at ERROR and answered
+    with ``None``, which is what makes the middleware tell the caller — the one
+    party still holding the payload — that nothing was preserved and to resend
+    from its own copy. A worktree-local copy was tried and retired (task 4584):
+    it died with the lane unread, while its filename bought the caller a false
+    "preserved verbatim".
+
+    THE LOSS ITSELF IS DURABLE AND COUNTABLE (task 7128, INV-4). Every record
+    the queue could not take, of any kind and for any :class:`LossCause`, is
+    also handed to *loss_sink* as one ``MARKUP_RECORD_LOST_FACT`` record. On a
+    per-agent stdio site the ERROR line reaches no durable sink, so this record
+    is the only account of the loss. It names the kind, the cause, the tool,
+    the parameter and the payload's size, and never carries the payload. An
+    eval-lane record is deliberately not filed, which is not a loss, so it
+    reaches *loss_sink* not at all. Each site passes the markup journal it
+    already uses as its fact sink, the SAME instance: the middleware emits the
+    fact before it files, so that journal has already resolved its project
+    root when this sink's own resolution fails. A loss sink that fails is
+    logged at WARNING, because the loss already has its ERROR line.
+
+    *subject_task_id* is a THUNK, not a value: the middleware cannot resolve
+    the leaking task (``MarkupGuardMiddleware._identity`` reads its identity
+    off the call's own arguments, and no tool on these servers declares
+    ``agent_id`` / ``project_root`` / ``project_id``), and the attribution a
+    concrete site can offer may not exist yet at ``create_server`` time — a
+    plan-tools ``create_plan`` refused before any plan exists is the case. So
+    it is evaluated per record, on the worker thread, never at wiring time.
+
+    It serves every record kind, the burst alarm included, not residue alone.
+    A burst alarm whose only route to the caller was a grep of the guard's log
+    lines was undischargeable on a per-agent stdio site — whose stderr the
+    spawning CLI consumes and never forwards to journald — so the storm branch
+    reads the same thunk, and this is the axis that resolves for it.
+
+    ASYNC, with every blocking step on a worker thread. The middleware calls
+    this from inside the server's event loop, and one record can run a
+    ``git rev-parse`` subprocess, open a queue directory, take a cross-process
+    file lock and do two fsync'd writes.
+
+    NEVER RAISES. The middleware's own ``_call_sink`` already contains a sink
+    that throws, but this keeps its own contract so it stays safe under any
+    future caller: the call's outcome is decided before either channel runs, so
+    a queue outage must cost an operator visibility, never turn a working guard
+    into an outage of its own.
+    """
+    #: Both memos hold SUCCESSES ONLY. A failed git resolution or a failed
+    #: queue open is TRANSIENT by nature (a fork failure under load, an EINTR,
+    #: a timeout, an index.lock storm), and caching one would permanently
+    #: disable residue preservation for every later refused call on this
+    #: server — losing each of their payloads' residue record, which is the
+    #: exact loss this sink exists to prevent.
+    project_root: Path | None = None
+    channel: tuple[Any, Any] | None = None
+
+    def report_lost(
+        record: dict[str, Any], cause: LossCause, *, exc_info: bool | None = None,
+    ) -> LossCause:
+        logger.error(
+            _LOSS_LOG_FORMAT, _LOSS_PROSE[cause], _loss_account(record), _subject(),
+            exc_info=exc_info,
+        )
+        return cause
+
+    def file_record(record: dict[str, Any]) -> str | LossCause | None:
+        """The blocking body, run on a worker thread.
+
+        The queued id, the cause of a loss, or ``None`` for a record that was
+        deliberately not filed.
+        """
+        nonlocal project_root, channel
+        subject = _subject()
+        eval_lane_reason = eval_lane_provenance(subject, worktree)
+        if eval_lane_reason is not None:
+            logger.info(
+                'markup guard: not filing the %r record from %s (subject %r): '
+                'eval-lane artifact (%s), not a production signal',
+                record.get('error_type'), worktree, subject, eval_lane_reason,
+            )
+            return None
+        if project_root is None:
+            project_root = resolve_root(worktree)
+            if project_root is None:
+                return report_lost(record, LossCause.ROOT_UNRESOLVED)
+        if channel is None:
+            # Memoised alongside project_root so a queue directory is opened
+            # (and mkdir'd) once per server rather than once per record.
+            channel = open_channel(project_root)
+            if channel is None:
+                return report_lost(record, LossCause.QUEUE_UNOPENED)
+        escalation_cls, queue = channel
+
+        error_type = record.get('error_type')
+        try:
+            if error_type == MARKUP_STORM_ERROR_TYPE:
+                return file_storm(
+                    escalation_cls, queue, worktree, subject, record, spec,
+                )
+            if error_type not in MARKUP_RESIDUE_ERROR_TYPES:
+                # A kind the middleware grew later. FILE IT rather than
+                # dropping it: silently discarding a record kind is the
+                # fail-soft this PRD exists to end, and an unfamiliar record in
+                # the queue is a question an operator can answer.
+                logger.warning(
+                    'markup guard: filing an unrecognised record kind %r as '
+                    'residue — the middleware emits something this sink does '
+                    'not know about (known: %s)', error_type,
+                    sorted(MARKUP_RESIDUE_ERROR_TYPES | {MARKUP_STORM_ERROR_TYPE}),
+                )
+            return file_residue(
+                escalation_cls, queue, worktree, subject, record, spec,
+            )
+        except Exception:
+            return report_lost(record, LossCause.SUBMIT_FAILED, exc_info=True)
+
+    def _subject() -> str:
+        return resolve_subject(subject_task_id, worktree, what='record')
+
+    async def sink(record: dict[str, Any]) -> str | None:
+        try:
+            result = await asyncio.to_thread(file_record, record)
+        except Exception:
+            # ``file_record`` already contains every filing failure; this is the
+            # floor under the thread hop itself, so the never-raises contract
+            # holds for the whole emitter and not merely for its body.
+            result = report_lost(record, LossCause.SINK_FAILED, exc_info=True)
+        if not isinstance(result, LossCause):
+            return result
+        try:
+            await loss_sink(_loss_fact(record, result))
+        except Exception:
+            logger.warning(
+                'markup guard: the loss of the %r record (%s) could not be '
+                'handed to the loss sink', record.get('error_type'), result.value,
+                exc_info=True,
+            )
+        return None
+
+    return sink

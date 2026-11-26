@@ -1,0 +1,876 @@
+# The MCP tool-call XML serialization leak
+
+**Task 3083 · root-cause artifact · 2026-07-29**
+
+Corrupted fragments of serialized tool-call XML have been turning up inside
+stored task descriptions and stored memories. This document records what
+they are, where they come from, why they were invisible for so long, and what
+this repo now does about them.
+
+> **Notation.** Every sentinel below is written with the HTML escape
+> `&#60;` in place of a literal `<`. This is not cosmetic. Writing the raw
+> literal into a source, test, or doc file forces the authoring agent to emit
+> that literal inside its own tool call — reproducing the exact bug this
+> document describes and corrupting the file being written. The same rule is
+> enforced in code with the `\x3c` escape; see the "Sentinel-literal hazard"
+> section at the top of `shared/src/shared/toolcall_markup.py` — the owner of
+> the rule — and, secondarily, the matching comment in
+> `fused-memory/src/fused_memory/utils/toolcall_xml_leak.py`.
+
+---
+
+## 1. Verdict: one bug, and it is not in this repo
+
+Two failure shapes were reported separately and looked like two problems. They
+are **one defect with two manifestations**, and it lives at the harness's
+tool-call XML serialization boundary, **upstream of this repository**.
+
+The mechanism: the model emits a parameter's **closing** tag in the wrong
+dialect — echoing the parameter *name* (`&#60;/description>`, `&#60;/content>`,
+`&#60;/rationale>`) instead of the canonical `&#60;/parameter>` — and frequently
+continues the remaining parameters in that same wrong dialect. The harness's
+tool-call parser does not find the closer it expects. It **over-consumes**: it
+runs forward to the next available terminator — a later well-formed
+`&#60;/parameter>`, else `&#60;/invoke>` — dumps everything it swallowed along
+the way into the *current* parameter's value, and **silently drops every
+parameter in between**.
+
+That direction, not early termination, is what the evidence requires. The
+observed signature is a fragment **inside** the stored value *and* sibling
+parameters **missing**. Early termination is inconsistent with both halves at
+once: it would end the argument *at* the tag, so the fragment would be
+**absent** from the stored text rather than embedded in it, and the parser
+would resume normally at the next parameter, so the siblings would be
+**intact** rather than missing. Only over-consumption produces both halves
+together — a fragment landing inside the value *and* everything between it
+and the fallback terminator disappearing.
+
+### The four specimen shapes
+
+Four measured specimens (`plans/toolcall-markup-containment-prd.md` §2.1) show
+the mechanism end to end — what the model emitted, what the parser actually
+kept, and what silently never arrived:
+
+| Call | Value tail (as parsed) | Keys received | Dropped |
+|---|---|---|---|
+| `submit_task` 07-30T16:47Z | `…direction.&#60;/description>\n&#60;priority>medium&#60;/priority>\n&#60;agent_id>…&#60;/agent_id>\n&#60;metadata">{…}&#60;/metadata">\n&#60;/invoke>` | `project_root, title, description` | **priority, agent_id, metadata** |
+| `submit_task` 08-04T12:13Z | `…automatically).&#60;/description>\n&#60;parameter name="priority">low` | no `priority` | **priority** (intended `low`) |
+| `add_memory` 08-04T16:58Z | `…by design.&#60;/content>\n&#60;/invoke>` | all | none — `content` was the **last** parameter, so over-consumption ran straight to the invoke closer with nothing in between |
+| `update_memory` 08-02T21:26Z | `…scoped).&#60;/parameter>\n&#60;parameter name="agent_id">escalation-watcher-l2` | no `agent_id` | **agent_id** — that boundary is **ungated**, so the corrupted value landed |
+
+Specimen 1's metadata tags are a literal blend of the two dialects — a stray
+double quote before the angle bracket, the model interpolating between the
+canonical `&#60;parameter name="X">` opener and the name-echoing `&#60;X>`
+form. `shared.toolcall_markup`'s repairer carries a one-character blend
+tolerance (the trailing `"?` in its closer/opener regexes) for exactly this
+specimen — without it, the blended item is leftover text and the repair is
+rejected.
+
+### Blast radius
+
+334 corrupted calls out of 128,066 tool calls measured = **0.26%**
+(`plans/toolcall-markup-containment-prd.md` §2.3; measured from the archived
+agent transcripts against the collection predicate stated in PRD §2 — the
+tree grows live, so a later re-run will find a larger denominator). Per
+server:
+
+| Server | Corrupted calls | Guarded at measurement (2026-08-05) |
+|---|---|---|
+| orchestrator/plan-tools | 198 (59.3%) | **no** |
+| fused-memory | 96 (28.7%) | 4 of 6 write tools |
+| orchestrator/verdict-tools | 19 (5.7%) | **no** |
+| escalation | 18 (5.4%) | **no** |
+| Claude Code builtins (`Agent`, `Edit`) | 3 (0.9%) | out of scope — not our servers |
+
+Top victims: `add_design_decision.rationale` (109), `add_memory.content` (90),
+`add_design_decision.decision` (33), `add_reuse_item.how` (33),
+`submit_review_verdict.summary` (19), `escalate_info.detail` (17).
+
+The "no" rows are not permanent, and **no single task closes them** — they span
+four servers, and PRD §9 split that registration work three ways on 2026-08-19
+(operator commit `965f3206eb`). Per row of the table above:
+`orchestrator/plan-tools` is **γ2 / task 4457**, `fused-memory` is **γ3 / task
+4458**, and `orchestrator/verdict-tools` and `escalation` are **γ1 / task 3690**.
+
+**Those rows went stale on 2026-08-20**, when all three leaves landed — `07a967fab0`
+(escalation), `0beb3c706a` (verdict-tools), `37eed69c97` (plan-tools), `60293e0d8c`
+(fused-memory); γ1, γ2 and γ3 are all `done`. The column is dated for exactly that
+reason: it describes coverage **at measurement**, not coverage today, so this table
+cannot silently rot into a false present-tense claim. The 2026-08-05 figures above
+are therefore left exactly as measured, and this update is recorded alongside them
+rather than written over them.
+
+### The negative evidence that settles it
+
+The original report blamed "the submit_task/update_task description parser."
+That parser does not exist. Measured on the base branch:
+
+| Probe | Result |
+|---|---|
+| `ElementTree` / `xml.etree` / `lxml` / `BeautifulSoup` / `html.parser` in `fused-memory/src/` | **zero hits** — there is no XML parser in fused-memory at all |
+| Serialized tool-call literals in any production write path across `fused-memory/src/`, `orchestrator/src/`, `shared/src/`, `escalation/src/` | **zero hits that emit envelope markup** — the only literal-grep hits are prose mentions inside guard-module docstrings (`markup_tripwire.py`'s own hazard description); no production code path in this repo emits one |
+| `submit_task` / `update_task` priority parameter | `priority: str \| None = None` — no enum, no `Literal[...]`, no pydantic `Field` |
+
+Since nothing here parses or emits tool-call XML, a fragment appearing in
+stored text is **positive evidence** that the corruption happened before the
+MCP boundary was reached. fused-memory stores the corrupted string faithfully;
+it is a witness, not a culprit.
+
+The silent default that turns the corruption into a *wrong value* is real and
+in this repo, though:
+
+- `fused-memory/src/fused_memory/backends/sqlite_task_backend.py::SqliteTaskBackend.add_task` —
+  `priority or 'medium'` in the INSERT
+- `fused-memory/src/fused_memory/middleware/task_interceptor.py::TaskInterceptor._build_candidate` —
+  `priority=str(kwargs.get('priority') or 'medium'),`
+
+Both catch `None`. Neither logs anything. Since task 4419, a write whose text
+carries a leaked fragment can no longer reach either default, because the
+task-store chokepoint refuses it first and names the swallowed value (§4,
+"The storage-layer refusal"). An ordinary omitted priority still defaults
+silently, and that is correct.
+
+### The single literal source (INV-5)
+
+`shared/src/shared/toolcall_markup.py` (task 3688) is now the **one** place
+the envelope literals are enumerated.
+`fused_memory.server.markup_tripwire.MCP_MARKUP_PATTERNS`
+(`markup_tripwire.py:68`) and
+`fused_memory.utils.toolcall_xml_leak.PREFILTER_NEEDLES`
+(`toolcall_xml_leak.py:124`) are both now **re-exports** of names defined
+there — two named predicates over one literal set, not two literal sets —
+and no third site enumerates them.
+
+That arrangement preserves the write-time recall-first vs. read-time
+precision calibration split: `MCP_MARKUP_PATTERNS` still over-reports on
+purpose at the write boundary, where a false positive costs only a retry,
+and `PREFILTER_NEEDLES` still under-reports on purpose over already-stored
+content, where a false positive would silently rewrite a user's memory.
+Be precise about what the consolidation does and does not remove. It
+removes the **independent spelling**: the two lists are no longer typed out
+at two sites, so they can no longer drift apart by accident. It does *not*
+collapse their membership, which still differs by calibration —
+`MCP_MARKUP_PATTERNS` carries one closing tag (plus the opener prefix and
+the invoke closer) while `PREFILTER_NEEDLES` carries the four parameter
+closers, and `ENVELOPE_LITERALS` is their union.
+
+So the write-time **diagnostic gap was still open when this was written**.
+`markup_tripwire.find_markup_pattern` (then at `markup_tripwire.py:170`) scanned
+`MCP_MARKUP_PATTERNS` only, so a mis-closed `description` at the fused-memory
+write boundary could not report its own tag and blamed whatever happened to
+follow it. What closes that gap is `detect()` over `ENVELOPE_LITERALS` — the
+earliest literal by position over the full union — reaching the write boundary
+when `MarkupGuardMiddleware` is registered across the servers: **γ1 / task 3690**
+(escalation, verdict-tools), **γ2 / task 4457** (plan-tools) and **γ3 / task
+4458** (fused-memory) — the same *set* the coverage table above is dated against,
+not any one task.
+
+**Re-verified 2026-08-20: that gap is CLOSED, and the mechanism described above no
+longer exists.** All three leaves are `done`. `find_markup_pattern` and
+`find_markup_violation` were **deleted by γ3 / task 4458**, together with the
+write-time gate they served — `markup_tripwire.py` records the deletion in place
+and now re-exports `MCP_MARKUP_PATTERNS` only to feed a same-file drift guard. The
+live path as of that date is `shared.toolcall_markup.detect` over
+`ENVELOPE_LITERALS`, which `shared/src/shared/mcp_markup_middleware.py` imports and
+calls at the boundary — that is, precisely the generalisation this paragraph names
+as the fix. The parameter-aware `detect_for` that same boundary also calls *today*
+is **not** part of this 2026-08-20 reading: it did not exist until 2026-08-25 (task
+**4696**). The next paragraph dates that difference, because it changes what a
+`matched_pattern` is allowed to mean.
+
+**How to read a write-time `matched_pattern`, by date.** THREE windows, not two,
+because the scan widened twice and only the second widening makes the pattern name
+the mis-closed tag in general.
+
+- **On or after 2026-08-25** — task **4696**: `cb68bc3369` added `detect_for`, the
+  parameter-aware predicate, and `ac6f9e538e` made the live write boundary call it.
+  The scan is widened with the scanned argument's OWN name-echoing closer, so
+  `matched_pattern` **may be read as the tag that was mis-closed**.
+- **Between 2026-08-20 and 2026-08-25** the guard was live but scanned the FIXED
+  `ENVELOPE_LITERALS` only — six members, not one of them derived from the argument
+  being scanned. In that window it names the mis-closed tag **only when that tag is
+  one of `description`, `parameter`, `details` or `content`**; for every other
+  parameter name it still names whatever FOLLOWS the mis-closed tag. Worked example:
+  `esc-plan-tools-markup-residue-1` (`reify`), fired 2026-08-21T21:17:56Z, from
+  `/home/leo/src/reify/data/escalations/archive/2026-08-22/` — the record whose
+  `add_design_decision.decision` argument absorbed the following `rationale`
+  parameter, tabled in the containment PRD
+  (`plans/toolcall-markup-containment-prd.md` §2.5). The mis-closed tag there was
+  `decision`, which is not one of the four; the reported `matched_pattern` is the
+  canonical parameter-opener prefix, i.e. the opening of the `rationale` argument
+  that followed it. A reader applying the post-2026-08-25 rule to that record would
+  conclude the mis-closed tag was `parameter`. (Measured 2026-09-22: retention has
+  since pruned that archive directory — its oldest surviving day is 2026-08-23 — so
+  the PRD transcription is now the only copy, which is the reason it was transcribed.)
+- **Before 2026-08-20** — which is every specimen catalogued in this document — the
+  narrower reading still holds: "an envelope literal was seen here", not "this is
+  the tag that was mis-closed".
+
+**One accepted residual survives the 2026-08-25 widening, at the GENERIC boundary
+only.** `shared/src/shared/mcp_markup_middleware.py::MarkupGuardMiddleware._markup_arguments`
+documents it in place: a CROSS-FIELD misclose — a closer naming a *different*
+parameter of the *same* tool — still passes, because that scan calls
+`detect_for(value, param)` with the argument's own name and **no schema**, so
+`matched_pattern` blames the follower exactly as in the middle window above. Two
+qualifiers travel with it, or it reads worse than it is. The schema is withheld
+**deliberately**: widening would put an awaited `get_tool` round-trip on every clean
+call, which is what the boundary's ordering exists to avoid. And the same 2026-08-25
+corpus measurement that sized the widening — 444 corrupted entries over the fleet's
+`plan.json` files — puts the cross-field population at **zero**. The residual is also
+narrower than "the write boundary": the sites that hold their schema for free DO pass
+it — `orchestrator/src/orchestrator/mcp/plan_tools.py` calls
+`detect_for(value, record.field, record.schema_params)` at two sites, and
+`scripts/sweep_toolcall_markup.py` passes its own key set — so it does not apply at
+plan-tools, which is where most catalogued specimens were caught.
+
+---
+
+## 2. The two manifestations
+
+### Vector 1 — sibling-argument loss (silent, and the dangerous one)
+
+Over-consumption swallows every parameter between the mis-closed tag and the
+terminator it falls back to, so those parameters silently never reach the MCP
+boundary. `priority` never reaches the MCP boundary, arrives as `None`, and
+`priority or 'medium'` substitutes a plausible wrong value. The intended
+priority survives only as *text inside the description*, where nothing reads
+it.
+
+Nothing is logged. Nothing looks broken. The task simply runs at the wrong
+priority forever.
+
+Evidence: reify tasks **#3210** and **#5219**; and three of the four live
+fixtures in `scripts/tests/test_scan_task_toolcall_leaks.py` — tasks **992**
+(`priority` = `low`), **1068** (`priority` = `high`), and **1067**
+(`priority` = `polish`). The fourth, task **2691**, is the swallowed-`details`
+variant: an entire serialized `details` argument leaked into `description`
+while the real `details` column was left empty. That three of four recorded
+specimens are a lost `priority` argument is the direct corroboration of this
+vector.
+
+### Vector 2 — content self-duplication (visible)
+
+The text over-consumption dumped into the surviving value leaves a visible
+tail plus a verbatim duplicate of the body text — the same shape the sweep
+classifies as `repairable_duplicate` (§5).
+
+Evidence: Mem0 records **9f2d2ae6** and **c759c53b** (both 2026-07-27).
+
+These are the same defect seen from two sides: vector 1 is what happens to
+the parameters over-consumption swallowed, vector 2 is what happens to the
+text it dumped into the surviving value. Treating them as one is not a
+rhetorical claim — it is enforced in code by a single shared detector,
+`fused_memory.utils.toolcall_xml_leak` (whose literals are now
+`shared.toolcall_markup` re-exports; see §1), which all three consumers
+import.
+
+### The three observable surfaces — why the recorded rate is a lower bound
+
+The two vectors above are what the corruption *does*. This is what it *looks
+like from outside*, which is a different axis and the one that governs how much
+of it ever gets counted.
+
+There is **one mechanism** — parameter-boundary swallowing: parameter N's value
+absorbs parameter N+1's entire serialization, and N+1 is then absent from the
+call. But it surfaces **three different ways**, depending on what was swallowed:
+
+| # | What was absorbed | What the caller observes | Who sees it |
+|---|---|---|---|
+| 1 | An **optional** parameter, and the value carries guarded markup | The write-time tripwire rejects the write | **The tripwire — and only here** |
+| 2 | A **required** parameter | A pydantic missing-required-field error | Nobody; the tripwire is never consulted |
+| 3 | An **optional** parameter, and the value carries no guarded markup | **Nothing raises.** The call succeeds and the dropped parameter silently takes its **default** | Nobody, by construction |
+
+Surface 1 is the only row the tripwire can see, and every prior entry in task
+3083's log is one of them.
+
+Surface 2 was observed first-hand on 2026-08-11 (task 3083, burst8 and its
+addendum): an `add_memory` call whose `content` swallowed the required
+`project_id`. The write never reached the tripwire — argument validation
+rejected it first — so it was recorded by hand rather than by the guard. This is
+the shape PRD boundary row B14 now pins.
+
+Surface 3 is the incident recorded in `submit_task`'s own docstring
+(`fused-memory/src/fused_memory/server/tools.py`): a reify task was filed
+`priority=high` and stored as `medium`. Nothing was logged, nothing looked
+broken, and the task simply ran at the wrong priority.
+
+**The consequence, stated plainly:** because the tripwire samples only surface
+1, task 3083's recorded leak rate systematically **under-counts** the true rate.
+It must be read as a **lower bound**, not as a measurement.
+
+**The containment answer.** A blanket boundary middleware is the right shape
+precisely *because* it is not restricted to tripwire-guarded fields — it
+inspects every argument of every guarded call, so surfaces 2 and 3 stop being
+invisible. That it can reach surface 2 at all is a measured property of the
+substrate, not an assumption: on fastmcp 3.2.2 the middleware's `on_call_tool`
+runs **strictly before** pydantic argument validation, so a required absorbed
+parameter is still recoverable. It has exactly **one precondition** — FastMCP's
+`strict_input_validation` must stay **off**, since with it on the SDK validates
+against the tool's input schema and returns an error before the middleware chain
+is ever entered, emitting no fact and counting no storm. Both halves are pinned
+executably: PRD boundary rows B14/B15 in
+`plans/toolcall-markup-containment-prd.md` §10, asserted in
+`shared/tests/test_mcp_markup_middleware.py`.
+
+---
+
+## 3. Why `search` could never find these
+
+The obvious remediation — search the corpus for the fragment — does not work,
+and the reason matters because it is why the leak went unswept for months.
+
+`search` is **semantic**. A leaked fragment is punctuation and tag names; it
+carries almost no semantic signal, so it ranks nowhere. A live watcher probe
+on **2026-07-26** searched for exactly these fragments and returned **zero
+results** against a corpus that provably contained them.
+
+The other two read paths did not help either. `get_memories_by_metadata` and
+`count_memories_by_metadata` match **metadata equality**, not payload text —
+and the leak is in the text. `get_memory_by_id` needs an id you do not have.
+
+There was simply no way to ask "which memories contain this substring."
+
+That is now `scan_memory_content` (WORK b): a **literal** substring scan over
+Qdrant payload text. It uses a server-side `MatchText` prefilter for speed and
+then judges **every** walked record in Python, which is the authoritative
+verdict. With the default sentinels that verdict is the shared detector. With
+caller-supplied `needles` it is the needles themselves: a literal,
+case-sensitive substring match over the record text (task 4857; before that,
+a record containing a custom needle was never reported). `exhaustive=True`
+skips the prefilter, and nothing else, and paginates the whole collection —
+that is the mode for an incidence-rate claim, so the number rests on nothing
+but the Python verdict. The prefilter reads only the `data` key, so a complete
+literal enumeration, one that also sees text under the `memory`/`content`
+fallbacks, passes `needles` with `exhaustive=True, limit=None`; that is also
+the mode that does not depend on `data` staying un-indexed (§7). `scanned` is
+the number of records walked: the prefilter population, or the whole
+collection when exhaustive.
+
+The MCP tool defaults to `limit=1000` and returns each match's `metadata`
+without its text keys. `excerpt` is a fixed-width window of the text centred
+where the earliest matched fragment begins, with `…` on each elided side, so a
+tail leak or a deep needle is visible in it; `get_memory_by_id` gives the full
+body. `MemoryService.scan_memory_content` and
+`Mem0Backend.scan_payload_text` keep no default limit and return the full raw
+payload, because the in-process sweep (§5) repairs from it.
+
+Pagination is mandatory in both modes. A silently-capped scan would answer
+"what is the true incidence rate" *wrongly*, which is the same silent-wrong-value
+failure class this whole task exists to kill.
+
+---
+
+## 4. What changed in this repo
+
+| Change | What it does |
+|---|---|
+| `fused_memory/utils/toolcall_xml_leak.py` | The single shared detector. Promoted from `scripts/scan_task_toolcall_leaks.py` (task 2939) and generalized for the Mem0 specimens; its envelope literals are now `shared.toolcall_markup` re-exports (task 3688, §1). |
+| `fused_memory/server/markup_guard.py::build_markup_guard`, installed by `fused_memory/server/boundary_guards.py::install_boundary_guards` (task 4458, which replaced task 3141's `markup_tripwire.py` gate, see §1 — NOT this task) | Live rejection at the MCP write boundary, for every tool on the fused-memory server. Listed here only so the picture is complete; see "The boundary rejection" below for why this task ships no guard of its own. |
+| `fused_memory/backends/task_text_markup_gate.py` (task 4419 — NOT this task) | Storage-layer refusal inside `SqliteTaskBackend.add_task` / `.update_task`, covering the task writers that never cross MCP dispatch. See "The storage-layer refusal" below. |
+| `Mem0Backend.scan_payload_text` → `MemoryService.scan_memory_content` → `scan_memory_content` MCP tool | The missing read capability (§3). |
+| `fused-memory/scripts/sweep_toolcall_xml_leak.py` | The corpus sweep (§5). |
+| `GraphitiBackend.redact_episode_content` + MCP tool | The residual-episode path (§6). |
+
+### The boundary rejection — owned by task 4458, not by this task
+
+Every tool on the fused-memory server **rejects** a call whose arguments carry
+envelope markup, before anything is persisted. The live guard is
+`fused-memory/src/fused_memory/server/markup_guard.py::build_markup_guard`
+(task 4458), installed by
+`fused-memory/src/fused_memory/server/boundary_guards.py::install_boundary_guards`.
+It wraps the server's `call_tool` with
+`shared/src/shared/mcp_markup_middleware.py::MarkupGuardMiddleware` and answers
+with one of two `error_type` values. `mcp_markup_detected` carries a
+`repaired_call`: the complete argument map with the swallowed parameters
+restored and named in `recovered_params`. `mcp_markup_unrepairable` refuses
+without one. Opt-out: `metadata={'allow_mcp_markup': True}` — load-bearing
+rather than theoretical, since this task's own description quotes every
+sentinel verbatim and this document could not otherwise be filed as a task.
+Send `metadata` as the FIRST argument, ahead of the string that carries the
+markup. A leak swallows only the parameters that follow the leaking one, so an
+override sent after it arrives inside the leaked value. The guard never honours
+an override found there, because finding it there proves the leak is real. It
+reports it as `override_swallowed: true` on the refusal and on the residue
+record, and its hint repeats the metadata-first remedy (task 5055). A
+`repaired_call` restores the swallowed `metadata` without the flag, so
+resubmitting it verbatim is guarded again.
+
+When this section was first written, the guard was task 3141's
+`fused_memory/server/markup_tripwire.py`, returning
+`error_type = 'McpEnvelopeMarkupWriteRejected'` at four tools. §1 records its
+replacement on 2026-08-20.
+**This task deliberately ships no write-boundary guard of its own.** An earlier
+revision of this branch did, and it had to be withdrawn: it would have been a
+second enumeration of the envelope literals at the same four call sites, which
+directly contradicts the invariant `shared/src/shared/toolcall_markup.py` now
+states — that it, not `markup_tripwire.py`, is the **one** owner of the
+envelope-literal enumeration (INV-5), and `markup_tripwire.MCP_MARKUP_PATTERNS`
+is merely a re-export from it (§1, "The single literal source"). Two rival
+guards at one boundary is precisely the drift this task exists to close, not
+to reproduce.
+
+The division of labour that survives is real and worth stating, because the two
+detectors are calibrated in **opposite** directions on purpose:
+
+| | MCP boundary guard (4458) | `utils/toolcall_xml_leak` (this task) | storage gate (4419) |
+|---|---|---|---|
+| Runs at | write time, at MCP dispatch | over already-stored content | write time, inside the task store's write transaction |
+| Method | substring scan over the envelope literals | precise regex, requires real whitespace | the same precise regex, over `SCANNED_COLUMNS` |
+| Calibration | over-reports to maximise recall | under-reports to avoid false positives | under-reports, like the sweep |
+| Cost of a false positive | a retry | an unnecessary rewrite of stored memory | a refused write that no caller can resubmit |
+
+Neither is redundant, and they must not be collapsed. A write-time false
+positive costs the caller one retry; a sweep-time false positive silently
+rewrites content a user wrote. That asymmetry is the whole justification for
+maintaining two detectors — but it justifies two *predicates*, not two
+*literal lists*. Both are now derived from the single literal vocabulary
+defined once in `shared.toolcall_markup` — see §1, "The single literal
+source" for the two tuples' exact membership. What still differs, on
+purpose, is method and calibration, exactly as the table above states.
+
+The storage gate is not a third predicate. It reuses the read-time detector
+and its column list, because it judges text a writer has already composed,
+where a false positive refuses a write that no caller can resubmit. That
+precision is also what lets it pass prose quoting the leak in the escaped
+convention (the nine prose-mention tasks below). Nor is it redundant with the
+MCP guard, which wraps `call_tool` only and so never sees the in-process
+writers below it. The two must not be collapsed.
+
+One diagnostic did not survive the withdrawal and was worth recovering:
+the retired guard's message named the **sibling-argument risk** explicitly —
+that a sentinel in `description` means parameters such as `priority` may have
+been silently dropped. That sentence converts the invisible vector-1 failure
+into a visible one at the moment it happens, and `matched_pattern` plus a
+200-character excerpt does not convey it. It has since been recovered as
+structured data rather than a sentence: at the MCP boundary as
+`recovered_params` and `repaired_call` (task 4458), and at the storage layer
+too, as `LeakedEnvelopeMarkupError.recovered` (task 4419).
+
+### The storage-layer refusal — task 4419
+
+`SqliteTaskBackend.add_task` and `SqliteTaskBackend.update_task` in
+`fused-memory/src/fused_memory/backends/sqlite_task_backend.py` hold the only
+INSERT INTO tasks and the only UPDATE that can set task text, so every task
+writer passes through them. Five writers of task text run in-process below
+`call_tool`, where the MCP guard cannot see them:
+
+| Writer | What it writes |
+|---|---|
+| `fused-memory/src/fused_memory/middleware/task_interceptor.py::TaskInterceptor._execute_combine` | the curator LLM's rewrite of a live task's title, description and details |
+| `fused-memory/src/fused_memory/middleware/task_interceptor.py::TaskInterceptor._dispatch_ticket_decision` | the curator worker's deferred replay of a ticket, hours after the guarded submit |
+| `fused-memory/src/fused_memory/middleware/task_interceptor.py::TaskInterceptor._submit_task_planning_mode` | a `deferred` insert under planning mode |
+| `fused-memory/src/fused_memory/middleware/task_interceptor.py::TaskInterceptor.update_task` | description and details, for any in-process caller |
+| `fused-memory/src/fused_memory/reconciliation/stages/task_knowledge_sync.py::queue_briefing_refresh_tasks` | a briefing-refresh task composed from stage output, bypassing the curator |
+
+Both sinks call
+`fused-memory/src/fused_memory/backends/task_text_markup_gate.py::refuse_leaked_task_text`
+inside their write transaction, beside the metadata validation, so a refusal
+rolls the whole write back. The rules:
+
+- The predicate is `toolcall_xml_leak.detect_leak` over
+  `toolcall_xml_leak.SCANNED_COLUMNS`, the same detector and columns as the
+  task-DB sweep. `metadata` is outside those columns, so remediation records
+  that quote a fragment stay writable.
+- `update_task` judges only the columns the write supplies, and `details` on
+  the value that would be persisted: the append concatenation, or a `prompt`
+  fed into details. A row corrupted before the gate existed stays writable, so
+  its remediation can land.
+- There is no override. The `allow_mcp_markup` flag is consumed before
+  dispatch, and prose written in the escaped convention never matches the
+  precise detector.
+- The refusal is `LeakedEnvelopeMarkupError`
+  (`fused-memory/src/fused_memory/backends/task_backend_errors.py`), a
+  `TaskmasterError` carrying `column`, `fragment`, `recovered` and
+  `clean_value`. `recovered` comes from `shared.toolcall_markup.repair` and
+  names the swallowed arguments, which are the values a default would
+  otherwise have replaced. It is empty when no boundary is provable.
+- The fragment is never stripped, because it is the evidence of which writer
+  leaked.
+- The two riskiest writers classify the refusal ahead of their broad fallback.
+  The combine logs `task_curator: combine refused ...` and the briefing refresh
+  logs `briefing_refresh_add_task_refused_leaked_markup`. Each record carries
+  `column`, `fragment` and `recovered` in its `extra`.
+
+**Audit answer, 2026-09-25.** Task 4358, filed 2026-08-17 as an agent-followup
+from task 3842, lost `priority='low'` to a leaked description closer and was
+stored as `medium`. The agent-followup path is an ordinary, guarded
+`submit_task` MCP call. Task 4458's boundary guard landed on 2026-08-20, after
+task 4358 was filed. Measured while planning task 4419, the byte-exact 4358
+specimen is now refused at that boundary, with `priority='low'` recovered into
+`repaired_call`. So the specimen predates the fix and is not evidence of a live
+MCP hole. The gap it pointed at was the in-process writers above.
+
+**Re-scan, 2026-09-25. This is a report; nothing was remediated.**
+`scripts/scan_task_toolcall_leaks.py --project-root /home/leo/src/dark-factory`
+over all 5838 rows of the live dark_factory store printed "no leaked tool-call
+fragments found" and exited 0. A naive substring scan for the envelope literals
+hits 9 tasks, and so does `shared.toolcall_markup.detect`: 2938, 2939, 2944,
+3083, 3141, 3233, 4696, 4896 and 5055. Each of them only discusses the leak.
+The same 9 were measured on 2026-09-20 over 5669 rows. So nothing has
+accumulated since task 2944's sweep, and those 9 tasks are the standing
+negative control for the precise detector: the storage gate accepts all of
+them.
+
+---
+
+## 5. Operator runbook — sweeping the corpus
+
+> **Run this sweep BEFORE any further large consolidation pass.** Routine
+> consolidation deletes corrupted entries as a merge side effect and silently
+> destroys the specimens. Both 2026-07-27 instances (Mem0 `c759c53b` and
+> `9f2d2ae6`) were lost exactly that way. Once a specimen is consolidated
+> away, the incidence rate can no longer be measured.
+
+**Captured runs.** `docs/toolcall-xml-leak-sweep-2026-08-05/` holds the first
+authoritative live-corpus measurement (task 3567): an exhaustive walk of 21,080
+points found **41 leak-carrying records (~0.19%)** — 1 `repairable_duplicate`,
+40 `manual_review`, 0 `repairable_tail`. The verbatim report, a provenance
+sidecar, and the per-record adjudication are committed there. Both 2026-07-27
+specimens named above were already gone by then, so that directory is now the
+corpus of record — and `dry-run-report.json` doubles as a ready-made regression
+fixture of 41 real specimens with verified classifications.
+
+From `fused-memory/`:
+
+```bash
+# 1. Dry run. This is the default and it mutates nothing.
+#    The printed JSON report IS the investigation.
+python scripts/sweep_toolcall_xml_leak.py --exhaustive
+
+# 2. Read the report. Every record is classified as one of:
+#      clean                 — no leak
+#      repairable_tail       — fragment runs to end-of-content; removing it
+#                              leaves non-empty text
+#      repairable_duplicate  — the 9f2d2ae6 shape: text after the fragment is
+#                              a verbatim duplicate of the text before it
+#      manual_review         — carries a leak but matches neither shape
+#
+#    Review every `manual_review` entry BY HAND. They are never auto-mutated.
+
+# 3. Apply. Repairs the confidently-classified records only.
+python scripts/sweep_toolcall_xml_leak.py --apply --exhaustive
+```
+
+> **Do NOT run `--apply` from a sandboxed agent session.** Measured 2026-08-05
+> (task 3567): the sandbox denies file *creation* under `~/.mem0`, so SQLite
+> cannot create its rollback journal and mem0's history write fails with
+> *"attempt to write a readonly database"* — while the Qdrant delete, being a
+> network call to `localhost:6333`, succeeds. That splits delete-then-re-add
+> exactly down the middle. One record was deleted from Qdrant with no re-add;
+> its text survived only because the dry-run report had already been committed.
+> The db file itself is mode `0644`, uid 1000, `W_OK=True` — this is an
+> environment property, not a filesystem permissions defect, and not a sweep
+> defect. Run `--apply` from an ordinary interactive shell.
+>
+> **This is now MACHINE-ENFORCED, not left to memory** (task 3686). Before it
+> scans anything, an `--apply` run probes whether this process can actually
+> create a file in mem0's history directory
+> (`fused_memory.utils.store_mutation_preflight.assert_store_mutation_allowed`).
+> If it cannot, the run refuses to start: nothing is scanned, nothing is
+> mutated, and the refusal surfaces as `aborted: true` and exit 2. A dry run is
+> deliberately **not** gated — it mutates nothing, so the classification report
+> stays obtainable from anywhere.
+>
+> The general policy the guard encodes:
+>
+> > **Mutating memory operations go through the fused-memory MCP server — the
+> > single, unsandboxed owner of the store. An in-sandbox script must never
+> > mutate the shared store directly.**
+>
+> That works because `.mcp.json` declares fused-memory as a separate HTTP
+> process (`http://127.0.0.1:8002/mcp`), so an MCP write executes outside the
+> calling agent's landlock. Note the asymmetry that caused this incident is
+> unfixable by sandbox configuration: landlock governs the **filesystem only**
+> and can never block the Qdrant network delete, so no write-set widening could
+> have made the two-phase mutation atomic. Adding `~/.mem0` to the sandbox
+> write-set was considered and declined for that reason among others — see
+> `docs/toolcall-xml-leak-sweep-2026-08-05/investigation.md` §"Decision (2)".
+>
+> **The one record lost to this has been recovered** (task 3686). `7d073281` was
+> re-added via the MCP `add_memory` tool and lives under a new id; see
+> `docs/toolcall-xml-leak-sweep-2026-08-05/recovery-tracking.json` for that id
+> and how the write was verified. Do **not** re-run the sweep to recover a
+> record — that is what the rest of this runbook warns against.
+
+`--apply` exits **non-zero** if it left any `manual_review` record behind, so
+a partial sweep can never be mistaken for a complete one, and likewise if the
+scan was truncated (`--limit` reached), since it then covered an unknown
+fraction of the corpus.
+
+Repair is **delete + re-add**, never an in-place Qdrant payload `SET`. The
+repaired text must be re-embedded; an in-place write would leave a stale vector
+pointing at the corrupted string. The report records old id, new id, and both
+before/after contents so every repair is auditable — the same mapping shape as
+Stage 1's `2c47b5cb` → `0a4f4848`.
+
+### What "content-preserving" means, precisely
+
+The repair preserves two things: the memory **text** in full, and the **payload
+metadata** that is the record's only metadata-scoped retrieval axis.
+
+That second half is not decoration. `get_memories_by_metadata` and
+`count_memories_by_metadata` match payload *keys* by equality via `MatchValue`,
+so a repaired record that lost its `task_id` / `kind` / `x_*` keys would become
+invisible to every metadata-scoped consumer that could previously find it — a
+second, undisclosed mutation of stored state layered on the harness's first.
+
+The carry-over rule is `payload keys - _MEM0_OWNED_KEYS`, where the owned set is
+what mem0/Qdrant assign or re-derive on write (`id`, `hash`, the content keys,
+`created_at`/`updated_at`, `user_id`/`agent_id`/`run_id`/`actor_id`/`role`, and
+`category`, which the service overwrites anyway). The scope identities go back
+in as **arguments** — `agent_id=` and `session_id=`, since mem0 writes its
+`run_id` payload key from `Scope.session_id` — rather than being forged as
+metadata. Every record in the report names its own `metadata_preserved` and
+`metadata_dropped` key lists, so anything that could not be carried is *named*
+rather than dropped silently.
+
+### The sweep verifies persistence; it does not trust a returned response
+
+`MemoryService.add_memory` **swallows a Mem0 write failure**: it catches
+`Exception`, logs it, folds the failure into `AddMemoryResponse.message` as
+`[mem0_error: ...]`, and returns *normally*. A returned response is therefore
+not by itself evidence that anything was written. The sweep checks three
+independent things before marking a record repaired — non-empty `memory_ids`,
+`mem0` present in `stores_written`, and no `mem0_error` in `message` — and a
+non-raising add that fails any of them is treated **identically to a throw**.
+
+### The four non-zero exit conditions that need a human
+
+| Record flag | What happened | What to do |
+| --- | --- | --- |
+| `content_lost_in_flight` | The delete landed but the re-add did **not** persist (raised, or returned without evidence of a mem0 write). The original text now exists **only in the printed JSON report**. | Restore it by hand from the report — it carries the old id, the original content, the repaired content, and `metadata_preserved` / `metadata_dropped` — **before** re-running the sweep. |
+| `skipped_not_mem0_routed` | A repairable record whose `category` does not route to mem0 (or is absent/unrecognised). Left **entirely untouched**: nothing deleted, nothing added. | Needs a human decision. Neither option is safe unattended — a plain re-add would route the repaired text to Graphiti only and the Qdrant copy the delete removed would be gone, while `dual_write=True` would duplicate the Graphiti copy that the mem0-scoped delete deliberately left alive. |
+| `skipped_metadata_would_be_rejected` | A repairable record whose carried metadata would fail `add_memory`'s own validation, under the enforcement flags resolved for that run. The pre-flight refused to delete it, so it is left **entirely untouched**. | Fix the metadata (the record's `metadata_preserved` / `metadata_dropped` lists name what it carries) or relax the enforcement setting, then re-run. Without this pre-flight the rejection would land *after* the delete and turn a repairable record into a `content_lost_in_flight`. |
+| `record_error` | That record's repair aborted on an unexpected error (a `delete_memory` transport failure, a Qdrant outage, or a pre-flight raising before anything was deleted). The sweep **continued** to the remaining records rather than unwinding. | Read the record's `delete_landed` field, which has **three** readings on a `record_error` record (the reasoning is in `delete_landed_note`). `false` — the delete demonstrably did not land, nothing was destroyed, re-sweep the record. **Key absent** — the failure happened *before* any delete was attempted, so nothing was touched; re-sweep it too. `null` — the sweep could not tell: check the record's id in the store by hand, read-only, before re-running. `record['error']` always holds the **original** failure, never the probe's. |
+
+#### A raised delete is adjudicated, not assumed unknown
+
+`record_error` used to mean flatly "whether the delete landed is unknown", and
+the runbook told you to go and check the id yourself. That was too weak, because
+a **raised `delete_memory` does not mean the delete failed**: mem0 removes the
+Qdrant point *before* writing its SQLite history, so a failure in the second
+half raises with the content already gone.
+
+The sweep now performs that read-only id check itself (`probe_delete_landed`,
+via `MemoryService.get_memory_by_id`) and records its three-valued verdict on
+the record as `delete_landed` — so the field has **four** readings in a report,
+the three verdicts plus "no delete was attempted, so no verdict was ever
+recorded":
+
+| `delete_landed` | Meaning | Flag the record gets |
+| --- | --- | --- |
+| `true` | The point is **absent** — the delete landed and the stored copy is gone. | `content_lost_in_flight` |
+| `false` | The point **survived** — nothing was destroyed. | `record_error` |
+| `null` | The probe could not answer (timeout, transport error, or a service without the method). | `record_error` |
+| *(key absent)* | No delete was ever **attempted** — the record failed a pre-flight (`routes_to_mem0` / `carried_metadata` / `metadata_accepted` raising), so there was nothing to probe. Nothing was touched. | `record_error` |
+
+An absent key is a real reading, not an omission: the field is written only by
+the code paths that ran a delete, so its absence is itself the evidence that
+none did. Do not read it as "unknown" — that is what `null` means.
+
+The verdict **measures** rather than infers: it reads the store, and never
+sniffs the exception's type or message, which would encode mem0's internal
+delete-then-write-history ordering as a string match in a repair script. The
+`null` case stays `record_error` on purpose — collapsing an unanswerable probe
+into either verdict just re-creates the old defect pointing the other way, and
+`record_error` has always meant "a human must go and check this id", which is
+the honest label for a genuine unknown.
+
+A successful repair also carries `delete_landed: true`. It is **evidence, not an
+outcome**: it is deliberately not one of the four flags above and never by
+itself makes a run exit non-zero. A record that reached `repaired: true` is
+therefore never escalated to `content_lost_in_flight` on the strength of that
+field — its re-add was vouched for, so the text is live in the store, and the
+two flags can never appear together on one record.
+
+*This was motivated by a real incident* —
+`docs/toolcall-xml-leak-sweep-2026-08-05/investigation.md` §4, which predates the
+fix. There the delete *had* landed, making it a `content_lost_in_flight`
+situation that arrived under the `record_error` flag; today the sweep would
+label it correctly on its own. Two lessons still generalise. First, **read the
+record flags, not just the exit code**: exit 1 was overdetermined on that run (40
+leftover `manual_review` records *and* the `record_error`), so the exit code
+alone would have hidden the mutation. Second, the id check was not optional — it
+is what established the delete had landed, and it must be a **read-only** lookup.
+That second lesson is now exactly what the sweep automates.
+
+### The report always survives, even a fatal abort
+
+Because the only copy of a `content_lost_in_flight` record's original text is
+the printed report, the report must never be discarded on the way out. Two
+redundant mechanisms guarantee that:
+
+- **Per-record isolation.** Each record is added to the report *before* any
+  store mutation is attempted, and its repair runs under its own `try`. One
+  record's transport error is recorded on that record — as `record_error`, or as
+  `content_lost_in_flight` where `delete_landed` shows the point is already gone
+  — and the sweep carries on; it can no longer void every earlier record's entry.
+- **Caller-owned progress.** Should anything escape anyway, `main()` still holds
+  the accumulated records and **prints the partial report** (with
+  `"aborted": true`) before exiting `2`. The partial report uses exactly the
+  same shape as a complete one, so there is no second format to drift out of
+  step.
+
+---
+
+## 6. Residual-episode policy: redact, never cascade-delete
+
+Graphiti episodes are a different store with a different transport; the
+Qdrant sweep structurally cannot reach them. The known residual is episode
+`d12b0eb4-f027-4d0c-a26c-096ccd0e75c2`.
+
+**Do not use `delete_episode(cascade=True)` on it.** Cascade removes the
+entities and edges exclusively sourced from that episode — which here includes
+demonstrably-valid collateral such as edge `ea4072dc`. Those edges were
+extracted from the *clean* portion of the text, before the truncation point;
+the fragment contributed no facts. Deleting real knowledge to fix appearance
+is strictly worse than the leak.
+
+Use `redact_episode_content` instead. It sets **only** the `content` property
+on **one** `Episodic` node, scoped by uuid *and* group_id. EpisodicNodes carry
+no embedding of their own, so an in-place content set leaves no stale vector
+behind (unlike the Mem0 path, which must delete-then-re-add to re-embed). It
+refuses loudly on a blank replacement, on a replacement that itself still
+carries a leak, and on an absent uuid — a typo can never read as a success.
+
+### Discovery: finding which episodes carry a leak (task 3233)
+
+`MemoryService.scan_episode_toolcall_leaks(project_id)` delegates to
+`GraphitiBackend.scan_episode_toolcall_leaks`, which runs
+`fused-memory/src/fused_memory/backends/episode_toolcall_leak_scan.py::read_episode_toolcall_leaks`
+and applies the shared `apply_incompleteness_policy` to it. The read works in
+four parts:
+
+- **A server-side prefilter that cannot miss a leak.** FalkorDB keeps only the
+  group's episodes whose `content` CONTAINS one of `PREFILTER_NEEDLES`, which
+  are bound as a list parameter. Every match of the shared detector begins
+  with one of those literal closing tags, and CONTAINS is an exact,
+  case-sensitive substring test. So the prefilter is a superset of the
+  detector's matches, and unlike the Qdrant `MatchText` caveat in §7, no index
+  can change that. The server still reads every episode; only the transfer is
+  narrowed, which is why there is no `--exhaustive` mode.
+- **The shared detector as the verdict.** Each candidate is re-checked with
+  `find_toolcall_xml_leak`, and only confirmed leaks come back.
+- **A paged, census-proven read.** Candidates are paged in `uuid` order
+  against a `count(*)` over the identical match. A short read is reported as
+  incomplete, not passed off as a clean group, and a structural refusal raises
+  `IncompleteEnumerationError`.
+- **A denominator.** A census of all the group's episodes comes back as
+  `episodes_in_group`, so the result is an incidence rate.
+
+The operator entry point is `fused-memory/scripts/sweep_episode_toolcall_xml_leak.py`.
+It classifies each leak with the shared `classify_leak_shape`, the same rule
+the Mem0 sweep uses.
+
+- A dry run is the default. It mutates nothing, opens the service for reads
+  only, and exits 0.
+- `--apply` first runs the store-mutation preflight. It then redacts each
+  `repairable_tail` and `repairable_duplicate` episode in place through
+  `redact_episode_content`, writing exactly the repaired body. It never
+  deletes, and it never touches `manual_review` episodes.
+- Under `--apply` the exit code is 1 when something is left for a human: any
+  `manual_review` episode, an incomplete scan, a failed redaction
+  (`record_error`), or content that changed between the scan and its
+  redaction (`content_changed_since_scan`). A `content_changed_since_scan`
+  record carries the text the redaction overwrote as `replaced_content`,
+  beside the scanned `content`. The write journal does not hold that text: it
+  stores only a truncated `new_content`. The printed `--apply` report is the
+  only full copy, so redirect it to a file before adjudicating.
+- Exit 2 means the run aborted. The partial report is printed first. An
+  interrupt (Ctrl-C) prints the partial report too, then propagates.
+
+**Measured 2026-11-25** with read-only queries against production graph
+`dark_factory`:
+
+- 14,456 episodes have `group_id = 'dark_factory'`. The prefilter returned 12
+  candidates in 13-19 ms.
+- Known positives `4d88a40f`, `72c293b3` and `1f588c77` are present. Each
+  content ends with a closing content tag, a newline and a bare closing
+  invoke tag, which is the `repairable_tail` shape.
+- `d12b0eb4` is no longer in the `dark_factory` graph: a uuid lookup returned
+  no row.
+
+**Scope.** The scan covers episodes whose `group_id` equals the graph's
+project. It does not cover cross-graph residue: episodes whose `group_id`
+names another project (76 in the `dark_factory` graph on that date).
+`redact_episode_content` matches on uuid *and* group_id, so it could not
+reach them, and the cross-graph migration owns them. An incidence rate from
+this scan describes the project's own episodes only.
+
+---
+
+## 7. Standing caveat: the `MatchText` prefilter relies on un-indexed semantics
+
+A read-only live probe (Qdrant 1.17.1, collection `fused_dark_factory`, 19,321
+points) established that on an **un-indexed** payload field, `MatchText`
+performs a **literal, case-sensitive, order-preserving substring** match —
+mid-word hits, reversed-word-order misses, and case sensitivity together prove
+`contains`, not tokenization. Today `data` is un-indexed: `payload_schema`
+carries keyword indexes on `actor_id`/`agent_id`/`run_id`/`user_id` only, and
+nothing in `src/`, `tests/`, or `scripts/` calls `create_payload_index`.
+
+**If a text payload index is ever added to `data`, `MatchText` silently flips
+to tokenized word-matching.** A silent semantic flip is precisely the failure
+class this task exists to kill, so the design does not depend on it:
+
+- The prefilter is only ever a **speed optimisation**. Every returned record is
+  judged in Python, which is the authoritative verdict: the shared detector for
+  the default sentinels, and the caller's `needles` as a literal, case-sensitive
+  substring match otherwise (task 4857). The verdict can only discard what the
+  prefilter returned, never recover what it skipped, so a prefiltered answer is
+  exact only while the prefilter is a superset of the verdict's matches.
+- For the **default sentinels** the flip fails **safe**. Tokenized matching is
+  strictly *more* permissive for them (text containing `&#60;parameter name=`
+  necessarily contains the tokens `parameter` and `name`), so the prefilter
+  remains a superset and the answer stays exact. Only speed degrades.
+- For **custom `needles`** the flip is **not** safe. A needle that is not a
+  whole token is a literal substring but no token match (the tripwire's
+  mid-word `econciliatio` is the counter-example), so an indexed prefilter
+  would silently skip records the verdict would report: false absence. A
+  prefiltered custom-needle scan is exact only under un-indexed substring
+  semantics.
+- `exhaustive=True` bypasses the prefilter entirely, so it is the
+  index-independent path for either verdict.
+
+The tripwire is
+`TestMem0BackendScanPayloadTextIntegration::test_matchtext_prefilter_is_a_literal_substring_match`
+in `fused-memory/tests/test_mem0_client.py` — a `qdrant_skipif`-gated
+integration test that fails **loudly** if the semantics ever change. It runs
+against its own test collection, so it cannot see an index created on a
+production collection; a custom-needle hunt whose completeness matters uses
+`exhaustive=True`.
+
+---
+
+## 8. Known out of scope
+
+`orchestrator/src/orchestrator/config.py:56-60` — `coerce_tier` silently maps
+an unknown priority string to `'medium'` with no log, warning, or counter.
+Different subsystem, and an intentional fail-safe, but the same silence
+anti-pattern that turned this leak into a wrong value rather than an error.
+Not addressed here.
+
+---
+
+## Related
+
+- `docs/toolcall-xml-leak-sweep-2026-08-05/` (task 3567) — the first live-corpus
+  sweep: verbatim report, provenance sidecar, and `investigation.md` carrying the
+  incidence measurement, the hand-adjudication of all 40 `manual_review` records,
+  and the partial-mutation incident that `--apply` hit from a sandboxed session
+- `fused-memory/tests/test_toolcall_xml_leak_sweep_artifacts.py` — validates any
+  committed sweep artifact by re-running `classify_record` over each record's own
+  stored content; hermetic, so it does not need Qdrant up
+- `shared/src/shared/toolcall_markup.py` (task 3688) — the owner of the
+  envelope-literal enumeration (INV-5); `markup_tripwire` and
+  `toolcall_xml_leak` both re-export from it (§1, "The single literal
+  source")
+- `fused-memory/src/fused_memory/utils/toolcall_xml_leak.py` — the detector,
+  and the rationale for its deliberately conservative real-whitespace
+  discriminator (which excludes the tasks 2938/2939 false-positive shape)
+- `scripts/scan_task_toolcall_leaks.py` (task 2939) — the read-only Taskmaster
+  task-DB sweep, where the detector was originally written and hardened
+- `fused-memory/scripts/clear_malformed_empty_memory.py` — the cleanup-script
+  template the sweep follows
+- `docs/legibility/design-invariants.md` — `no-silent-fail-soft` and
+  `structured-facts-at-failure`, both of which this leak violated end to end

@@ -68,14 +68,42 @@ production (next point).
    one thing the MCP surface cannot do. This is failure mode 1, reproduced verbatim in the guard's
    own remediation text — the guard has been telling agents to do the impossible since it shipped.
 
-2. **Three maintenance scripts were forced to delete records that only needed a patch —
-   permanently losing `created_at` and provenance.**
+2. **Two maintenance scripts deleted records that arguably only needed a patch —
+   permanently losing `created_at` and provenance.** *(The "forced" causal claim here is
+   corrected below; see the 2026-08-02 note.)*
    `fused-memory/scripts/prune_recon_cycle_summaries.py:25-30` states this outright: *"Mem0/Qdrant
    exposes `delete_memory` but no in-place payload-update primitive on this path — the same
    constraint documented in `scripts/sweep_orphan_flag_markers.py` (task-1659) ... Re-tagging via
    delete+re-add would also change `created_at` and lose provenance. So the effective operation
    here is PRUNE-to-N."* `scripts/sweep_orphan_flag_markers.py` (task-1659) hit the identical wall
    and also deleted rather than retagged.
+
+   > **Correction (2026-08-02, task 3175 / escalation `esc-3175-1`).** Re-verified against this
+   > repo, this "forced" claim does not hold for either script — the missing in-place-update
+   > primitive was not the actual blocker in either case. For `sweep_orphan_flag_markers.py`:
+   > backfilling the missing `kind` key would restore no capability, because nothing reads these
+   > Mem0 marker records — task 2406 retired the Mem0 marker write path,
+   > `fused-memory/src/fused_memory/reconciliation/flag_dedup.py:127-131` confirms reads in that
+   > module never consult Mem0 and the recon_ledger SQLite table is the sole read source, and the
+   > only live runtime reader of the Mem0 marker population is a reaper that enumerates markers
+   > only to delete them (`_sweep_stale_mem0_flag_markers`,
+   > `reconciliation/stages/task_knowledge_sync.py:1272-1340`). For
+   > `prune_recon_cycle_summaries.py`: backfilling `recon_pool` would make pre-existing piles
+   > visible to standing enforcement's filter (`reconciliation/summary_pool.py:314`), but the
+   > eviction sort key (`summary_pool.py:365-388`) is `(is_ledger_stamp, has_parseable_created_at,
+   > created_at)` ascending with the head deleted, against a cap of 2 hardcoded at
+   > `reconciliation/stages/memory_consolidator.py:83` — a backfilled pre-existing *narrative*
+   > summary (i.e. not a `record_type=ledger_stamp` record, which sorts to the tail and survives)
+   > sorts to the head — `is_ledger_stamp=False` first, then `0` for a parseable `created_at` ahead
+   > of a sibling whose `created_at` is still missing/unparseable, then oldest-`created_at` first —
+   > and is deleted on the next cycle in which the pool exceeds the cap of 2. Preserving
+   > `created_at` makes that outcome *more* certain, not less; retagging there would have been
+   > deferred deletion, not a fix. See task 3175 and `esc-3175-1` for the full evidence trail. This
+   > correction does not
+   > reopen the DECISION recorded in §3-§7 of this document (building `update_memory` stands on its
+   > own merits) — it corrects only this specific misattributed justification for it. Amending the
+   > adjudicated decision text itself is task 3055/3088 owner territory; this note is deliberately
+   > additive, not a rewrite.
 
 3. **A working in-place precedent already exists in this repo, and it already solved the hard
    part.** `scripts/tag_cgl_eta_rehome_scope.py` DOES edit Mem0 entries in place, by calling
@@ -762,6 +790,12 @@ Qdrant.
   whose *absence* forced `prune_recon_cycle_summaries.py` and `sweep_orphan_flag_markers.py` to
   delete rather than retag (§2). Both arms must preserve it; the RED test list in §5(d) makes this
   non-negotiable rather than aspirational.
+
+  > **Correction (2026-08-02, task 3175 / escalation `esc-3175-1`).** The "forced ... to delete
+  > rather than retag" causal claim above does not survive verification for either script — see
+  > the correction note in §2 for the full evidence. The `created_at`-preservation requirement
+  > stands on §3-§5 merits; the causal justification for *why it was "the entire point"* does not
+  > — see the §2 correction, not this bullet, for the mechanism.
 - **INV-5 `no-lockstep-duplication` — the module-location call for `_MEM0_MANAGED_METADATA_KEYS`.**
   §3 deferred *where* the shared extraction lands; deciding it here: **`fused_memory/backends/mem0_client.py`**
   (module-level, alongside `Mem0Backend`), **not** `fused_memory/maintenance/rehome_scope_tag.py`.
@@ -889,3 +923,29 @@ marked `done`.
   the shallow-merge contract in §3 already supports multi-key patches without change, but a
   schema-validated metadata vocabulary would need its own reserved-key list layered on top of
   `_MEM0_MANAGED_METADATA_KEYS`, not a replacement of it.
+
+### Addendum 2026-08-12 — the under-scoping clause fired, and resolved differently than predicted
+
+The second falsification bullet above ("the authorization model is under-scoped if a second,
+non-`recon-stage-*` caller needs content-amend or metadata-patch authority… a real second caller
+arriving quickly would validate widening one list, not redesigning the gate") **fired** within two
+weeks of shipping: the interactive memory-consolidation sitting (task 3524 / esc-3524-1, the exact
+"interactive curator-gate correction flow" the bullet names). Two of its predictions held and one
+did not:
+
+- **Held:** the gate mechanism needed no redesign — the resolver, arms, and kill switch are
+  untouched.
+- **Held:** the new caller arrived under a dedicated narrow prefix (`curator-`), not a broad one.
+- **Did not hold:** the resolution widened **both** lists, not one. Ruling (b) on esc-3524-1
+  (2026-08-11) granted `curator-` content-amend AND metadata-patch, because gate 3200's
+  retain-and-tag write shape stamps retained peers via metadata-only patches — content-amend alone
+  would be the destructive half without the preserving half. "Widen the metadata bar alone"
+  remains the supported path for tagging-only flows; consolidation is not one.
+
+A second ruling (2026-08-12) then promoted the grant from a per-machine `config.yaml` override to
+the **schema default** (`['recon-stage-', 'curator-']` on both arms), after the override tripped
+the `test_recon_amend_tool_advertisement.py` premise tests: the skill that performs the sitting
+(`skills/curate-fused-memories`) does not work without the grant, so it belongs to every
+deployment, and `config.yaml`'s `mem0_update:` block returns to fully-commented. §4's code block
+above shows the original single-entry defaults; read it as the design as first shipped, not the
+current values.

@@ -1,4 +1,4 @@
-"""Tests for Harness._reconcile_stranded_in_progress and the _pid_alive helper."""
+"""Tests for Harness._reconcile_stranded_in_progress."""
 
 import asyncio
 import json
@@ -7,21 +7,90 @@ import os
 import re
 import shutil
 import time as _time
-from datetime import UTC, datetime
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import cast
 from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
-from _orch_helpers import mock_lock_table, pydantic_spec, wire_scheduler_liveness_mock
+from _harness_store_paths import point_harness_stores_at
+from _landing_evidence_helpers import differential_confirms, landing_reject_rows
+from _orch_helpers import (
+    mock_lock_table,
+    pydantic_spec,
+    wire_clear_claim_then_set_status,
+    wire_live_status_from_get_task,
+    wire_scheduler_liveness_mock,
+)
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 
-from orchestrator.config import GitConfig, OrchestratorConfig
-from orchestrator.delivered_checks import DeliveredChecksVerdict
-from orchestrator.harness import Harness, _pid_alive
-from orchestrator.landed_outbox import LandedOutbox, LandedRow, MergeProvenance
+from orchestrator.artifacts import TaskArtifacts
+from orchestrator.config import DeliveredChecksConfig, GitConfig, OrchestratorConfig
+from orchestrator.delivered_checks import (
+    DeliveredChecksBlock,
+    DeliveredChecksVerdict,
+)
+from orchestrator.event_store import EventStore
+from orchestrator.git_ops import CommitEffectProbe
+from orchestrator.harness import Harness
+from orchestrator.merge_lane.landed_outbox import LandedOutbox, LandedRow, MergeProvenance
+from orchestrator.recovery_emission import RecoverySweepTally
+from orchestrator.startup_steps import EntryFailures
 from orchestrator.warm_lane_pool import WarmLanePool
+
+
+async def _reconcile_stranded(
+    harness: Harness, tid: str, status: str, *, mid_run: bool = False,
+    tally: RecoverySweepTally | None = None,
+) -> str | None:
+    """Drive ONE stranded-task reconciliation.
+
+    The suite's coupling to this private driver lives here and nowhere else,
+    so a signature change costs one edit instead of one per test.
+    """
+    return await harness._reconcile_one_stranded(
+        tid, status, mid_run=mid_run, tally=tally,
+    )
+
+
+def _stage_valid_looking_lock(harness: Harness, tid: str) -> Path:
+    """Stage an in-progress *tid* whose plan.lock sits where the resolver READS it (task 4028)."""
+    harness.scheduler.get_statuses = AsyncMock(return_value=({tid: 'in-progress'}, None))
+    worktree_path = harness.git_ops.worktree_base / tid
+    worktree_path.mkdir(parents=True)
+    lock_dir = _resolver_lock_dir(worktree_path, tid)
+    lock_dir.mkdir(parents=True)
+    lock_path = lock_dir / 'plan.lock'
+    lock_path.write_text(f'{{"session_id": "{tid}-xyz", "owner_pid": 1}}')
+    return lock_path
+
+
+def _bind_queue(harness: Harness, path: Path) -> EscalationQueue:
+    """Bind a real EscalationQueue rooted at *path* and hand it back.
+
+    The suite's coupling to this private attribute lives here and nowhere
+    else, so a rename costs one edit instead of one per test.
+    """
+    queue = EscalationQueue(path)
+    harness._escalation_queue = queue
+    return queue
+
+
+@contextmanager
+def _spy_dispositions(harness: Harness) -> Iterator[MagicMock]:
+    """Wrap the recovery-disposition emitter and hand back the spy.
+
+    The suite's coupling to this private emitter lives here and nowhere else,
+    so a rename costs one edit instead of one per test.
+    """
+    with patch.object(
+        harness, '_emit_recovery_disposition',
+        wraps=harness._emit_recovery_disposition,
+    ) as spy:
+        yield spy
 
 
 @pytest.fixture(autouse=True)
@@ -45,62 +114,48 @@ def _bind_landed_row(tmp_path: Path, *, task_id: str, advanced_sha: str) -> None
     MergeProvenance.bind(outbox)
 
 
-# ---------------------------------------------------------------------------
-# _pid_alive helper tests
-# ---------------------------------------------------------------------------
+def _resolver_lock_dir(worktree: Path, tid: str) -> Path:
+    """The directory the stranded sweep actually READS *tid*'s plan.lock from.
 
-class TestPidAlive:
-    def test_current_pid_is_alive(self):
-        assert _pid_alive(os.getpid()) is True
+    ``<worktree_base>/.task-meta/task-<tid>`` — plan.lock is task-scoped, so
+    it lives in the task root (``TaskArtifacts.task_root_for``), where the
+    sole production writer (``TaskWorkflow``) puts it and where
+    ``TaskGroundTruth._resolve_live_claimant`` reads it (tasks 4028, 3155).
+    Mirrors ``_plan_lock_artifacts`` in test_task_ground_truth.py.
 
-    def test_impossible_pid_is_dead(self):
-        # PID well beyond the Linux kernel max (2^22 on 64-bit, 2^15 on 32-bit).
-        # 2**31-1 is always invalid on all Linux systems.
-        assert _pid_alive(2**31 - 1) is False
+    Every fixture whose lock CONTENT must be INTERPRETED — live vs dead
+    ``owner_pid``, fresh vs expired ``locked_at``, malformed JSON — must
+    stage it here.  A lock anywhere else is invisible to the resolver, so
+    such a test would pass vacuously: it would assert the revert-to-pending
+    that lock ABSENCE produces, never reaching ``_pid_alive`` /
+    ``_lock_fresh`` / the ``except (ValueError, OSError)`` degradation arm at
+    all.
+    """
+    return TaskArtifacts.task_root_for(worktree.parent, tid)
 
-    # ------------------------------------------------------------------
-    # Branch-mocked tests — each covers exactly one code path in _pid_alive
-    # ------------------------------------------------------------------
 
-    def test_pid_zero_returns_false_without_calling_os_kill(self, monkeypatch):
-        """pid=0 guard → returns False before os.kill is ever called."""
-        calls: list[tuple[int, int]] = []
-        monkeypatch.setattr(os, 'kill', lambda pid, sig: calls.append((pid, sig)))
-        assert _pid_alive(0) is False
-        assert calls == [], 'os.kill must not be called for pid=0'
+def _vestigial_lock_dir(worktree: Path) -> Path:
+    """The LEGACY ``<worktree>/.task`` directory — deliberately NOT the
+    resolver's address (task 4028).
 
-    def test_negative_pid_returns_false_without_calling_os_kill(self, monkeypatch):
-        """pid=-1 guard → returns False before os.kill is ever called."""
-        calls: list[tuple[int, int]] = []
-        monkeypatch.setattr(os, 'kill', lambda pid, sig: calls.append((pid, sig)))
-        assert _pid_alive(-1) is False
-        assert calls == [], 'os.kill must not be called for pid=-1'
+    Nothing has written a lock here since the meta-root migration and
+    ``_resolve_live_claimant`` never reads it, so a lock staged here is
+    inert CONTENT-wise by design.  It is still the exact — and only — path
+    that the two physical side-effects of the sweep target:
 
-    def test_process_lookup_error_returns_false(self, monkeypatch):
-        """os.kill raises ProcessLookupError → process is dead → False."""
-        def _raise(pid: int, sig: int) -> None:
-            raise ProcessLookupError()
-        monkeypatch.setattr(os, 'kill', _raise)
-        assert _pid_alive(12345) is False
+      * ``_revert_in_progress_if_no_live_claimant``'s defensive
+        ``lock_path.unlink(missing_ok=True)`` (harness.py, the documented
+        "plan.lock unlink" side-effect), which joins ``.task`` itself; and
+      * ``cleanup_worktree``'s rmtree of the worktree dir, which cannot
+        reach the ``.task-meta`` SIBLING.
 
-    def test_permission_error_returns_true(self, monkeypatch):
-        """os.kill raises PermissionError → process exists (no permission to signal) → True."""
-        def _raise(pid: int, sig: int) -> None:
-            raise PermissionError()
-        monkeypatch.setattr(os, 'kill', _raise)
-        assert _pid_alive(12345) is True
-
-    def test_generic_oserror_returns_false(self, monkeypatch):
-        """os.kill raises generic OSError → treat as dead → False."""
-        def _raise(pid: int, sig: int) -> None:
-            raise OSError(5, 'io error')
-        monkeypatch.setattr(os, 'kill', _raise)
-        assert _pid_alive(12345) is False
-
-    def test_successful_signal_returns_true(self, monkeypatch):
-        """os.kill succeeds → process is alive → True."""
-        monkeypatch.setattr(os, 'kill', lambda pid, sig: None)
-        assert _pid_alive(12345) is True
+    Fixtures that exist to pin one of those side-effects (``assert not
+    lock_path.exists()``, or ``assert lock_path.exists()`` proving the
+    unlink did NOT run) stage their lock here on purpose.  Migrating them
+    to the resolver address would silently retarget the assertion at a path
+    neither side-effect touches.
+    """
+    return worktree / '.task'
 
 
 # ---------------------------------------------------------------------------
@@ -108,25 +163,21 @@ class TestPidAlive:
 # ---------------------------------------------------------------------------
 
 @pytest.fixture
-def harness(tmp_path: Path, mock_orch_config):
-    """Create a Harness with mocked internals for unit testing reconciliation."""
-    with patch('orchestrator.harness.McpLifecycle'), \
-         patch('orchestrator.harness.Scheduler'), \
-         patch('orchestrator.harness.BriefingAssembler'):
-        h = Harness(mock_orch_config)
-
-    # Replace scheduler with async mocks
-    h.scheduler = MagicMock()
+def scheduler_double() -> MagicMock:
+    """The Scheduler stand-in the `harness` fixture installs, typed as the MagicMock it is."""
+    scheduler = MagicMock()
     # Wire real (non-auto-mock) liveness-accessor behaviour (task 2235:
     # harness.py now calls scheduler.is_dispatched/.is_actively_held/
     # .workflow_cancel_recent/.note_workflow_cancelled/.clear_workflow_cancel
     # instead of reaching into _dispatched/lock_table._held/_workflow_cancel_at
     # directly) so the mid-run sweep and stranded-blocked gate tests below
     # exercise real semantics instead of an auto-mocked (always-truthy) stub.
-    wire_scheduler_liveness_mock(h.scheduler)
-    h.scheduler.get_tasks = AsyncMock(return_value=[])
-    h.scheduler.get_statuses = AsyncMock(return_value=({}, None))
-    h.scheduler.set_task_status = AsyncMock()
+    wire_scheduler_liveness_mock(scheduler)
+    wire_clear_claim_then_set_status(scheduler)
+    wire_live_status_from_get_task(scheduler)
+    scheduler.get_tasks = AsyncMock(return_value=[])
+    scheduler.get_statuses = AsyncMock(return_value=({}, None))
+    scheduler.set_task_status = AsyncMock()
 
     # mark_done forwards to set_task_status so the existing assertions on
     # set_task_status.call_args_list / set_task_status.assert_awaited_once_with
@@ -136,10 +187,59 @@ def harness(tmp_path: Path, mock_orch_config):
         provenance = {'kind': kind, 'commit': sha}
         if note is not None:
             provenance['note'] = note
-        await h.scheduler.set_task_status(
+        await scheduler.set_task_status(
             tid, 'done', done_provenance=provenance,
         )
-    h.scheduler.mark_done = AsyncMock(side_effect=_fake_mark_done)
+    scheduler.mark_done = AsyncMock(side_effect=_fake_mark_done)
+
+    # Default: get_task synthesizes {'status': ..., 'metadata': {}} from
+    # whatever get_statuses() is currently configured to return for that tid
+    # (task 2243, W10-θ2: TaskGroundTruth.derive_truth's db_status is sourced
+    # from get_task(tid)['status'] — a DIFFERENT accessor than the per-tid
+    # `status` string the sweep loop itself reads from get_statuses(). In
+    # production both reflect the same row; the fixture keeps them
+    # consistent by construction here rather than requiring every test to
+    # duplicate the status in two places). Falls back to None (no row) when
+    # get_statuses' return_value isn't a plain (dict, err) tuple or has no
+    # entry for tid — matching the old unconditional-None default for any
+    # test that doesn't care. Individual tests that need branch_base_sha (or
+    # any other task-row shape) override get_task explicitly and are
+    # responsible for including a matching 'status' key themselves.
+    def _default_get_task(tid: str) -> dict | None:
+        try:
+            statuses, _err = scheduler.get_statuses.return_value
+        except (TypeError, ValueError):
+            return None
+        status = statuses.get(tid) if isinstance(statuses, dict) else None
+        return None if status is None else {'status': status, 'metadata': {}}
+    scheduler.get_task = AsyncMock(side_effect=_default_get_task)
+
+    return scheduler
+
+
+@pytest.fixture
+def harness(tmp_path: Path, mock_orch_config, scheduler_double: MagicMock):
+    """Create a Harness with mocked internals for unit testing reconciliation."""
+    with patch('orchestrator.harness.McpLifecycle'), \
+         patch('orchestrator.harness.Scheduler'), \
+         patch('orchestrator.harness.BriefingAssembler'):
+        h = Harness(mock_orch_config)
+
+    # Task 3539 — pin the observe-before-enforce flag to its PRODUCTION
+    # default.  `mock_orch_config` is a `MagicMock(spec_set=...)`, so every
+    # bool field it is not explicitly given reads back as a truthy child mock;
+    # `convert_to_blocked_enforce` would therefore enforce here while the real
+    # `OrchestratorConfig` ships it False.  Pinning it restores production
+    # semantics, which is what every assertion in this file was written
+    # against: these suites pin the PRE-3539 LEAVE contract for an
+    # escalation-pinned, unclaimed stranded row, and that contract is exactly
+    # what log mode preserves byte-for-byte.  The enforce arm has its own
+    # fixture (`enforce_harness` in test_convert_to_blocked.py), so nothing is
+    # left uncovered by this pin.
+    h.config.convert_to_blocked_enforce = False
+
+    # Replace scheduler with async mocks
+    h.scheduler = scheduler_double
 
     # Keep worktree_base real (under tmp_path) so we can create fake worktrees
     h.git_ops.worktree_base = (tmp_path / '.worktrees').resolve()
@@ -174,28 +274,6 @@ def harness(tmp_path: Path, mock_orch_config):
     h.git_ops.find_task_citation_commit = AsyncMock(
         return_value='deadbeef' + 'a' * 32,
     )
-
-    # Default: get_task synthesizes {'status': ..., 'metadata': {}} from
-    # whatever get_statuses() is currently configured to return for that tid
-    # (task 2243, W10-θ2: TaskGroundTruth.derive_truth's db_status is sourced
-    # from get_task(tid)['status'] — a DIFFERENT accessor than the per-tid
-    # `status` string the sweep loop itself reads from get_statuses(). In
-    # production both reflect the same row; the fixture keeps them
-    # consistent by construction here rather than requiring every test to
-    # duplicate the status in two places). Falls back to None (no row) when
-    # get_statuses' return_value isn't a plain (dict, err) tuple or has no
-    # entry for tid — matching the old unconditional-None default for any
-    # test that doesn't care. Individual tests that need branch_base_sha (or
-    # any other task-row shape) override get_task explicitly and are
-    # responsible for including a matching 'status' key themselves.
-    def _default_get_task(tid: str) -> dict | None:
-        try:
-            statuses, _err = cast(AsyncMock, h.scheduler.get_statuses).return_value
-        except (TypeError, ValueError):
-            return None
-        status = statuses.get(tid) if isinstance(statuses, dict) else None
-        return None if status is None else {'status': status, 'metadata': {}}
-    h.scheduler.get_task = AsyncMock(side_effect=_default_get_task)
 
     # Default: warm_lane_ref_is_degenerate returns False (task 2112 angle B) so
     # the metadata-independent fallback never fires for existing tests and the
@@ -303,10 +381,9 @@ class TestReconcileOneStrandedGroundTruthMarkDone:
 # task 2678 extends this refinement to the GONE_WITH_MERGE_MARKER sub-case
 # too (routed through validate_landing_evidence in CANDIDATE mode on
 # report.branch_state.sha, applied uniformly to both sub-cases): previously
-# the inline check here was gated on ``on_main``, so a branch-deleted merge
-# marker whose effect had been reverted at current main HEAD skipped the
-# guard entirely and was stamped done unconditionally — the task-1175
-# clobber shape, reproduced inside this sweep.
+# the inline check here was gated on ``on_main``, so the marker sub-case
+# skipped the guard and an empty-net-diff merge marker was stamped done —
+# the task-1175 shape, a re-derivation clobber rather than a revert.
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
@@ -335,8 +412,7 @@ class TestReconcileOneStrandedEffectPresentGuard:
 
         harness.scheduler.mark_done.assert_not_called()  # type: ignore[attr-defined]
         harness.git_ops.commit_effect_present_in_main.assert_awaited_once_with(  # type: ignore[attr-defined]
-            recovered_sha,
-        )
+            recovered_sha, )
         harness.scheduler.set_task_status.assert_awaited_once_with(  # type: ignore[attr-defined]
             tid, 'pending',
         )
@@ -375,8 +451,7 @@ class TestReconcileOneStrandedEffectPresentGuard:
             },
         )
         harness.git_ops.commit_effect_present_in_main.assert_awaited_once_with(  # type: ignore[attr-defined]
-            marker_sha,
-        )
+            marker_sha, )
         assert result == 1
 
     async def test_marker_effect_absent_in_progress_reverts_instead_of_marking_done(
@@ -401,8 +476,7 @@ class TestReconcileOneStrandedEffectPresentGuard:
 
         harness.scheduler.mark_done.assert_not_called()  # type: ignore[attr-defined]
         harness.git_ops.commit_effect_present_in_main.assert_awaited_once_with(  # type: ignore[attr-defined]
-            marker_sha,
-        )
+            marker_sha, )
         harness.scheduler.set_task_status.assert_awaited_once_with(  # type: ignore[attr-defined]
             tid, 'pending',
         )
@@ -432,6 +506,240 @@ class TestReconcileOneStrandedEffectPresentGuard:
         harness.scheduler.set_task_status.assert_not_called()  # type: ignore[attr-defined]
         harness.scheduler.mark_done.assert_not_called()  # type: ignore[attr-defined]
         assert result == 0
+
+
+# ---------------------------------------------------------------------------
+# task 4496 — the MARK_DONE arm's landing-evidence reject is recorded as a
+# landing_evidence_rejected event, BEFORE any revert reaps the worktree.
+# Canonical WHY: orchestrator/src/orchestrator/landing_reject_emission.py.
+# ---------------------------------------------------------------------------
+
+
+def _bind_event_store(harness: Harness, tmp_path: Path) -> EventStore:
+    store = EventStore(tmp_path / 'runs.db', 'run-test')
+    harness.event_store = store
+    return store
+
+
+_RECOVERED_SHA = 'deadbeef' + 'a' * 32
+
+
+def _on_main_effect_absent(
+    harness: Harness, tid: str, monkeypatch: pytest.MonkeyPatch,
+    *, metadata: dict | None = None,
+) -> None:
+    scheduler = cast(MagicMock, harness.scheduler)
+    scheduler.get_statuses.return_value = ({tid: 'in-progress'}, None)
+    scheduler.get_task = AsyncMock(
+        return_value={'status': 'in-progress', 'metadata': metadata or {}},
+    )
+    monkeypatch.setattr(harness.git_ops, 'is_ancestor', AsyncMock(return_value=True))
+    monkeypatch.setattr(
+        harness.git_ops, 'resolve_branch_sha', AsyncMock(return_value=_RECOVERED_SHA),
+    )
+    monkeypatch.setattr(
+        harness.git_ops, 'commit_effect_present_in_main', AsyncMock(return_value=False),
+    )
+    monkeypatch.setattr(
+        harness.git_ops, 'describe_commit_effect_in_main',
+        AsyncMock(return_value=CommitEffectProbe(
+            present=False, diverged_paths=('src/y.py',), anchor_sha=_RECOVERED_SHA,
+            failure='effect_not_survived', aggregate_survival=0.3, added_lines_total=40,
+        )),
+    )
+
+
+def _blocked_marker_effect_absent(
+    harness: Harness, tid: str, marker_sha: str, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scheduler = cast(MagicMock, harness.scheduler)
+    scheduler.get_statuses.return_value = ({tid: 'blocked'}, None)
+    scheduler.get_task = AsyncMock(
+        return_value={'status': 'blocked', 'metadata': {}},
+    )
+    monkeypatch.setattr(harness.git_ops, 'resolve_branch_sha', AsyncMock(return_value=None))
+    monkeypatch.setattr(harness.git_ops, 'find_merge_marker', AsyncMock(return_value=marker_sha))
+    monkeypatch.setattr(
+        harness.git_ops, 'commit_effect_present_in_main', AsyncMock(return_value=False),
+    )
+    monkeypatch.setattr(
+        harness.git_ops, 'describe_commit_effect_in_main',
+        AsyncMock(return_value=CommitEffectProbe(
+            present=False, diverged_paths=('src/z.py',), anchor_sha=marker_sha,
+            failure='effect_not_survived', aggregate_survival=0.2, added_lines_total=30,
+        )),
+    )
+
+
+@pytest.mark.asyncio
+class TestReconcileOneStrandedLandingRejectEmission:
+    async def test_on_main_effect_absent_reject_is_recorded_and_still_reverts(
+        self, harness: Harness, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        tid = '9020'
+        store = _bind_event_store(harness, tmp_path)
+        _on_main_effect_absent(harness, tid, monkeypatch)
+
+        await harness._reconcile_stranded_in_progress()
+
+        cast(AsyncMock, harness.scheduler.set_task_status).assert_awaited_once_with(
+            tid, 'pending',
+        )
+        [row] = landing_reject_rows(store)
+        assert row['task_id'] == tid
+        data = row['data']
+        assert data['site'] == 'reconcile_sweep'
+        assert data['task_status'] == 'in-progress'
+        assert data['reason'] == 'effect_absent'
+        assert data['citation'] == _RECOVERED_SHA
+        assert data['effect_check_sha'] == _RECOVERED_SHA
+        assert data['branch_tip_sha'] == _RECOVERED_SHA
+        assert data['diverged_paths'] == ['src/y.py']
+        assert data['aggregate_survival'] == 0.3
+
+    async def test_the_row_exists_before_the_revert_begins(
+        self, harness: Harness, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        tid = '9021'
+        store = _bind_event_store(harness, tmp_path)
+        _on_main_effect_absent(harness, tid, monkeypatch)
+        scheduler = cast(MagicMock, harness.scheduler)
+        rows_at_write: list[int] = []
+
+        async def _record(*_args, **_kwargs):
+            rows_at_write.append(len(landing_reject_rows(store)))
+
+        scheduler.set_task_claimant.side_effect = _record
+        scheduler.set_task_status.side_effect = _record
+
+        await harness._reconcile_stranded_in_progress()
+
+        assert rows_at_write == [1, 1]
+
+    async def test_blocked_marker_effect_absent_reject_is_recorded(
+        self, harness: Harness, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        tid = '9022'
+        marker_sha = 'c6' * 20
+        store = _bind_event_store(harness, tmp_path)
+        _blocked_marker_effect_absent(harness, tid, marker_sha, monkeypatch)
+
+        await harness._reconcile_stranded_in_progress()
+
+        cast(AsyncMock, harness.scheduler.set_task_status).assert_not_called()
+        [row] = landing_reject_rows(store)
+        assert row['data']['task_status'] == 'blocked'
+        assert row['data']['citation'] == marker_sha
+        assert row['data']['branch_tip_sha'] is None
+
+    async def test_a_second_sweep_over_the_same_blocked_task_adds_no_row(
+        self, harness: Harness, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        tid = '9023'
+        store = _bind_event_store(harness, tmp_path)
+        _blocked_marker_effect_absent(harness, tid, 'c7' * 20, monkeypatch)
+
+        await harness._reconcile_stranded_in_progress()
+        await harness._reconcile_stranded_in_progress()
+
+        assert len(landing_reject_rows(store)) == 1
+
+
+    async def test_a_task_declaring_no_checks_is_recorded_as_none_declared(
+        self, harness: Harness, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        tid = '9024'
+        store = _bind_event_store(harness, tmp_path)
+        _on_main_effect_absent(harness, tid, monkeypatch, metadata={})
+
+        await harness._reconcile_stranded_in_progress()
+
+        [row] = landing_reject_rows(store)
+        assert row['data']['delivered_checks_state'] == 'none_declared'
+
+    async def test_a_differential_rescue_marks_done_and_discloses_it(
+        self, harness: Harness, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        tid = '9025'
+        store = _bind_event_store(harness, tmp_path)
+        _on_main_effect_absent(harness, tid, monkeypatch, metadata={'delivered_checks': [
+            {'name': 'cap-x', 'kind': 'grep', 'pattern': 'P', 'expect': 'present'},
+        ]})
+
+        with patch('orchestrator.delivered_checks.run_delivered_check', differential_confirms), \
+             patch('orchestrator.harness.gate_mark_done_on_delivered_checks',
+                   AsyncMock(return_value=None)):
+            await harness._reconcile_stranded_in_progress()
+
+        set_task_status = cast(AsyncMock, harness.scheduler.set_task_status)
+        set_task_status.assert_awaited_once()
+        call = set_task_status.await_args
+        assert call is not None
+        assert call.args == (tid, 'done')
+        provenance = call.kwargs['done_provenance']
+        assert provenance['kind'] == 'found_on_main'
+        assert provenance['commit'] == _RECOVERED_SHA
+        assert 'cap-x' in provenance['note']
+        assert landing_reject_rows(store) == []
+
+    async def test_a_disarmed_kill_switch_stops_the_rescue_and_reverts(
+        self, harness: Harness, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        tid = '9026'
+        store = _bind_event_store(harness, tmp_path)
+        _on_main_effect_absent(harness, tid, monkeypatch, metadata={'delivered_checks': [
+            {'name': 'cap-x', 'kind': 'grep', 'pattern': 'P', 'expect': 'present'},
+        ]})
+        harness.config.delivered_checks = DeliveredChecksConfig(enabled=False)
+        runner = AsyncMock(side_effect=differential_confirms)
+
+        with patch('orchestrator.delivered_checks.run_delivered_check', runner):
+            await _reconcile_stranded(harness, tid, 'in-progress')
+
+        runner.assert_not_awaited()
+        scheduler = cast(MagicMock, harness.scheduler)
+        scheduler.mark_done.assert_not_called()
+        cast(AsyncMock, scheduler.set_task_status).assert_awaited_once_with(tid, 'pending')
+        [row] = landing_reject_rows(store)
+        assert row['data']['delivered_checks_outcome'] == 'disabled'
+
+
+_ArrangeEffectAbsent = Callable[[Harness, str, pytest.MonkeyPatch], None]
+
+
+@pytest.mark.asyncio
+class TestReconcileSweepKeepsTheMergeMarkerPolicy:
+    @pytest.mark.parametrize(('arrange', 'status'), [
+        pytest.param(_on_main_effect_absent, 'in-progress', id='on_main'),
+        pytest.param(
+            lambda harness, tid, monkeypatch: _blocked_marker_effect_absent(
+                harness, tid, 'c8' * 20, monkeypatch,
+            ),
+            'blocked',
+            id='merge_marker',
+        ),
+    ])
+    async def test_the_reject_row_names_the_merge_marker_method(
+        self, harness: Harness, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+        arrange: _ArrangeEffectAbsent, status: str,
+    ):
+        """Both sub-cases keep ``validate_landing_evidence`` CANDIDATE (task 4648).
+
+        Task 4648 moved the dispatch gate's live-branch arms to
+        ``branch_work_landed``; this sweep deliberately keeps the legacy
+        effect-present policy, so its verdict's method is ``merge_marker``,
+        never ``patch_id``.  The ruling and its reason are recorded in
+        ``docs/prds/landed-not-done-recovery.effect-present-caller-enumeration.md`` §7.
+        """
+        tid = '9030'
+        store = _bind_event_store(harness, tmp_path)
+        arrange(harness, tid, monkeypatch)
+
+        await _reconcile_stranded(harness, tid, status)
+
+        [row] = landing_reject_rows(store)
+        assert row['data']['site'] == 'reconcile_sweep'
+        assert row['data']['method'] == 'merge_marker'
 
 
 # ---------------------------------------------------------------------------
@@ -786,8 +1094,12 @@ class TestReconcileStrandedInProgress:
     ):
         """In-progress task with plan.lock pointing to live PID → untouched, no revert logged."""
         harness.scheduler.get_statuses.return_value = ({'7': 'in-progress'}, None)  # type: ignore[attr-defined]
-        # Create worktree with a plan.lock containing our own (live) PID
-        lock_dir = harness.git_ops.worktree_base / '7' / '.task'
+        # Create the worktree, plus a plan.lock containing our own (live) PID
+        # WHERE THE RESOLVER READS IT — the live-pid content is the whole
+        # premise here, so it must be visible (task 4028).
+        worktree_path = harness.git_ops.worktree_base / '7'
+        worktree_path.mkdir(parents=True)
+        lock_dir = _resolver_lock_dir(worktree_path, '7')
         lock_dir.mkdir(parents=True)
         lock_path = lock_dir / 'plan.lock'
         lock_path.write_text(json.dumps({
@@ -806,35 +1118,66 @@ class TestReconcileStrandedInProgress:
         # No revert must have been logged ('reverted task' matches the stable log format)
         assert not any('reverted task' in r.message for r in caplog.records)
 
-    async def test_stale_plan_lock_cleared_and_reverted(
-        self, harness: Harness, monkeypatch
+    @pytest.mark.parametrize('owner_pid', [10**20, True], ids=['unrepresentable', 'json-true'])
+    async def test_corrupt_owner_pid_reads_as_no_claimant_and_reverts(
+        self, harness: Harness, scheduler_double: MagicMock, owner_pid: object
     ):
-        """In-progress task with stale plan.lock (dead PID) → lock cleared and task reverted."""
-        harness.scheduler.get_statuses.return_value = ({'8': 'in-progress'}, None)  # type: ignore[attr-defined]
-        # Use a synthetic owner_pid — _pid_alive is mocked to always return False,
-        # so no real PID is needed and there is no kernel-recycle race.
-        owner_pid = 99999
-        monkeypatch.setattr('orchestrator.harness._pid_alive', lambda pid: False)
-
-        # Create worktree with plan.lock referencing the synthetic dead PID
-        lock_dir = harness.git_ops.worktree_base / '8' / '.task'
+        """One corrupt lock degrades to 'no plan-lock claimant'; startup step 2d survives."""
+        scheduler_double.get_statuses.return_value = ({'43': 'in-progress'}, None)
+        worktree_path = harness.git_ops.worktree_base / '43'
+        worktree_path.mkdir(parents=True)
+        lock_dir = _resolver_lock_dir(worktree_path, '43')
         lock_dir.mkdir(parents=True)
-        lock_path = lock_dir / 'plan.lock'
-        lock_path.write_text(json.dumps({
-            'session_id': '8-dead0001',
+        (lock_dir / 'plan.lock').write_text(json.dumps({
+            'session_id': '43-abcd1234',
             'locked_at': datetime.now(UTC).isoformat(),
             'owner_pid': owner_pid,
         }))
 
         await harness._reconcile_stranded_in_progress()
 
+        scheduler_double.set_task_status.assert_called_once_with('43', 'pending')
+
+    async def test_revert_unlinks_the_vestigial_worktree_lock(
+        self, harness: Harness
+    ):
+        """No live claimant → task reverted AND the worktree's plan.lock gone.
+
+        The revert here is driven by lock ABSENCE at the resolver's address
+        (nothing is staged under `.task-meta`), NOT by the staleness of the
+        lock below — post-4028 the sweep never reads the worktree lock at
+        all, so its content decides nothing (see
+        test_vestigial_worktree_lock_is_inert_and_unlinked).  What this pins
+        is the physical side-effect: the applier's defensive
+        `lock_path.unlink(missing_ok=True)` leaves no `<worktree>/.task/
+        plan.lock` behind.  No `_pid_alive` patch: `orchestrator.harness.
+        _pid_alive` is no longer called on this path (the resolver has its
+        own, in task_ground_truth), so patching it influenced no branch.
+        """
+        harness.scheduler.get_statuses.return_value = ({'8': 'in-progress'}, None)  # type: ignore[attr-defined]
+
+        # LEGACY address ON PURPOSE: the `assert not lock_path.exists()` below
+        # pins the applier's defensive `lock_path.unlink(missing_ok=True)`
+        # (harness.py), which joins `<worktree>/.task` — the meta-root lock is
+        # not that side-effect's target and would survive (task 4028).
+        lock_dir = _vestigial_lock_dir(harness.git_ops.worktree_base / '8')
+        lock_dir.mkdir(parents=True)
+        lock_path = lock_dir / 'plan.lock'
+        lock_path.write_text(json.dumps({
+            'session_id': '8-dead0001',
+            'locked_at': datetime.now(UTC).isoformat(),
+            'owner_pid': 99999,
+        }))
+
+        await harness._reconcile_stranded_in_progress()
+
         # Task must be reverted to pending
         harness.scheduler.set_task_status.assert_called_once_with('8', 'pending')  # type: ignore[attr-defined]
-        # Stale lock must be deleted
+        # The vestigial lock must be gone
         assert not lock_path.exists()
 
     async def test_stale_plan_lock_but_live_db_claimant_left_alone(
-        self, harness: Harness, monkeypatch, caplog
+        self, harness: Harness, caplog
     ):
         """Task-2588 regression pin.
 
@@ -843,22 +1186,28 @@ class TestReconcileStrandedInProgress:
         reverted above) — the pre-2243 sweep's actual root cause for the
         2588 un-claim (a live task reverted out from under its own live
         claimant). But get_task returns a FRESH db claimant
-        (claimant_run_id + heartbeat within _RECONCILE_HEARTBEAT_TTL), so
+        (claimant_run_id + heartbeat within
+        shared.task_claimant.DEFAULT_CLAIMANT_HEARTBEAT_TTL), so
         recovery_for's live_claimant resolution defers to the db signal and
         classifies LEAVE: _revert_in_progress_if_no_live_claimant must
         never be dispatched — no revert, no un-claim, lock preserved.
         """
         harness.scheduler.get_statuses.return_value = ({'62': 'in-progress'}, None)  # type: ignore[attr-defined]
-        # Same dead-PID staging as test_stale_plan_lock_cleared_and_reverted:
-        # plan.lock/owner_pid forensics alone would read "stale".
-        monkeypatch.setattr('orchestrator.harness._pid_alive', lambda pid: False)
-        lock_dir = harness.git_ops.worktree_base / '62' / '.task'
+        # Dead-PID staging: plan.lock/owner_pid forensics alone would read
+        # "stale".  The owner pid below is dead by construction (2**31 - 1,
+        # beyond any real pid_max).
+        # Staged where the resolver READS it (task 4028): "the db claimant
+        # PRECEDES the stale plan.lock" only means something if the lock is
+        # actually visible to the resolver that is supposed to skip it.
+        worktree_path = harness.git_ops.worktree_base / '62'
+        worktree_path.mkdir(parents=True)
+        lock_dir = _resolver_lock_dir(worktree_path, '62')
         lock_dir.mkdir(parents=True)
         lock_path = lock_dir / 'plan.lock'
         lock_path.write_text(json.dumps({
             'session_id': '62-dead0001',
             'locked_at': datetime.now(UTC).isoformat(),
-            'owner_pid': 99999,
+            'owner_pid': 2**31 - 1,
         }))
 
         # But the DB row carries a fresh claimant — the live cross-process
@@ -886,25 +1235,31 @@ class TestReconcileStrandedInProgress:
         assert not any('reverted task' in r.message for r in caplog.records)
 
     async def test_in_progress_with_open_l1_left_intact(
-        self, harness: Harness, monkeypatch
+        self, harness: Harness
     ):
         """In-progress task with an open L1 escalation → worktree NOT reaped.
 
         Reproduces the /unblock-session reap: an escalated task sits at
-        'in-progress' with an open L1 while a human edits its worktree.  The
-        worktree's plan.lock is stale (the agent exited), so WITHOUT the L1
-        guard the stranded sweep would clear the lock, force-delete the
-        worktree, and revert to pending.  The open L1 must veto all of that —
-        return None, no cleanup_worktree, no status change, lock preserved.
+        'in-progress' with an open L1 while a human edits its worktree.  No
+        live claimant is resolvable (nothing is staged at the resolver's
+        `.task-meta` address), so WITHOUT the L1 guard the stranded sweep
+        would unlink the worktree lock, force-delete the worktree, and revert
+        to pending.  The open L1 must veto all of that — return None, no
+        cleanup_worktree, no status change, lock preserved.  The surviving
+        lock is what MAKES the veto observable, so the assertion is really
+        "the L1 suppressed the unlink" (no `_pid_alive` patch: the harness
+        copy is no longer called on this path, task 4028).
         """
         from escalation.models import Escalation
-        from escalation.queue import EscalationQueue
 
         harness.scheduler.get_statuses.return_value = ({'60': 'in-progress'}, None)  # type: ignore[attr-defined]
 
-        # Stale lock (dead PID) — the would-be-reaped shape absent the guard.
-        monkeypatch.setattr('orchestrator.harness._pid_alive', lambda pid: False)
-        lock_dir = harness.git_ops.worktree_base / '60' / '.task'
+        # LEGACY address ON PURPOSE: the `assert lock_path.exists()` below is
+        # what proves the veto fired — only the applier's defensive
+        # `<worktree>/.task/plan.lock` unlink could have removed it, so at the
+        # meta root (which nothing in this path unlinks) it would be trivially
+        # true (task 4028).
+        lock_dir = _vestigial_lock_dir(harness.git_ops.worktree_base / '60')
         lock_dir.mkdir(parents=True)
         lock_path = lock_dir / 'plan.lock'
         lock_path.write_text(json.dumps({
@@ -915,9 +1270,9 @@ class TestReconcileStrandedInProgress:
 
         # Real EscalationQueue with an open L1 for task 60 (the human handoff).
         queue_dir = harness.git_ops.worktree_base.parent / 'escalations'
-        harness._escalation_queue = EscalationQueue(queue_dir)
-        harness._escalation_queue.submit(Escalation(
-            id=harness._escalation_queue.make_id('60'),
+        queue = _bind_queue(harness, queue_dir)
+        queue.submit(Escalation(
+            id=queue.make_id('60'),
             task_id='60',
             agent_role='task-steward',
             severity='blocking',
@@ -935,21 +1290,26 @@ class TestReconcileStrandedInProgress:
         assert lock_path.exists()
 
     async def test_in_progress_without_l1_still_reaped(
-        self, harness: Harness, monkeypatch
+        self, harness: Harness
     ):
-        """Inverse of the L1 guard: a stale-lock in-progress task with NO open
+        """Inverse of the L1 guard: an unclaimed in-progress task with NO open
         L1 for *that* task is still reaped — pins the guard to the specific tid.
 
         An L1 exists for a *different* task (999); the target (61) has none, so
-        has_open_l1('61') is False and the stale-lock recovery proceeds.
+        has_open_l1('61') is False and the no-live-claimant recovery proceeds
+        — including the worktree-lock unlink the veto suppresses above (no
+        `_pid_alive` patch: the harness copy is no longer called on this
+        path, task 4028).
         """
         from escalation.models import Escalation
-        from escalation.queue import EscalationQueue
 
         harness.scheduler.get_statuses.return_value = ({'61': 'in-progress'}, None)  # type: ignore[attr-defined]
 
-        monkeypatch.setattr('orchestrator.harness._pid_alive', lambda pid: False)
-        lock_dir = harness.git_ops.worktree_base / '61' / '.task'
+        # LEGACY address ON PURPOSE — mirror of the test above: the
+        # `assert not lock_path.exists()` is the applier's defensive
+        # `<worktree>/.task/plan.lock` unlink, the side-effect the L1 veto
+        # suppresses there and permits here (task 4028).
+        lock_dir = _vestigial_lock_dir(harness.git_ops.worktree_base / '61')
         lock_dir.mkdir(parents=True)
         lock_path = lock_dir / 'plan.lock'
         lock_path.write_text(json.dumps({
@@ -959,10 +1319,10 @@ class TestReconcileStrandedInProgress:
         }))
 
         queue_dir = harness.git_ops.worktree_base.parent / 'escalations'
-        harness._escalation_queue = EscalationQueue(queue_dir)
+        queue = _bind_queue(harness, queue_dir)
         # L1 belongs to an unrelated task — must NOT shield task 61.
-        harness._escalation_queue.submit(Escalation(
-            id=harness._escalation_queue.make_id('999'),
+        queue.submit(Escalation(
+            id=queue.make_id('999'),
             task_id='999',
             agent_role='task-steward',
             severity='blocking',
@@ -974,158 +1334,104 @@ class TestReconcileStrandedInProgress:
 
         await harness._reconcile_stranded_in_progress()
 
-        # No L1 for 61 → normal stale-lock recovery: reaped + reverted.
+        # No L1 for 61 → normal no-live-claimant recovery: reaped + reverted.
         harness.git_ops.cleanup_worktree.assert_awaited_once()  # type: ignore[attr-defined]
         harness.scheduler.set_task_status.assert_called_once_with('61', 'pending')  # type: ignore[attr-defined]
         assert not lock_path.exists()
 
     @pytest.mark.parametrize(
-        'lock_contents,task_id,expect_reverted,expect_lock_exists,warn_pattern',
+        'lock_contents,task_id',
         [
-            # (a) Corrupt JSON → task 2763: the applier no longer READS the
-            #     worktree lock for liveness, so a corrupt lock no longer fails
-            #     closed. recovery_for already ruled out a live claimant →
-            #     REVERT: cleanup_worktree called, task reverted, lock gone,
-            #     no ERROR.
-            pytest.param(
-                'not-valid-json', 9, True, False,
-                None,
-                id='corrupt-json',
-            ),
-            # (b) Missing owner_pid key → reverted. Task 2763: the applier no
-            #     longer reads the lock, so the old 'no owner_pid; treating as
-            #     stale' observability WARNING is gone (warn_pattern=None); the
-            #     task still reverts (cleanup_worktree called, lock gone).
-            pytest.param(
-                json.dumps({'session_id': 'test-10', 'locked_at': '2026-01-01T00:00:00+00:00'}),
-                '10', True, False, None,
-                id='missing-owner-pid',
-            ),
-            # (b2) Explicit null owner_pid → reverted, same as (b): no warning
-            #      (applier no longer reads the lock), cleanup called, lock gone.
-            pytest.param(
-                json.dumps({'session_id': 'test-16', 'locked_at': '2026-01-01T00:00:00+00:00', 'owner_pid': None}),
-                16, True, False, None,
-                id='null-owner-pid',
-            ),
-            # (b3) Non-numeric owner_pid → int('abc') raises ValueError
-            #      → except (TypeError, ValueError) catches it → owner_alive=False
-            #      → stale-lock path: cleanup_worktree called, task reverted, lock gone
-            pytest.param(
-                json.dumps({'session_id': 'test-42', 'locked_at': '2026-01-01T00:00:00+00:00', 'owner_pid': 'abc'}),
-                42, True, False, None,
-                id='non-numeric-owner-pid',
-            ),
-            # (e) Non-dict JSON (list) → task 2763: same as (a). The applier no
-            #     longer reads the lock, so a non-dict lock no longer fails
-            #     closed → REVERT: cleanup_worktree called, task reverted, lock
-            #     gone, no ERROR.
-            pytest.param(
-                '["not", "an", "object"]', 14, True, False,
-                None,
-                id='non-dict-json',
-            ),
-            # (c) Numeric-string owner_pid of a live process → task IS reverted.
-            #     Task 2243, W10-θ2 step-16: the applier no longer re-derives
-            #     plan.lock owner_pid liveness (formerly this case's live pid
-            #     short-circuited the revert here) — recovery_for's
-            #     live_claimant already ruled out a live claimant (this
-            #     lock's locked_at is far outside heartbeat_ttl, so the
-            #     resolver treats it as stale regardless of pid liveness)
-            #     before REVERT_TO_PENDING reaches the applier.
-            pytest.param(
-                'LIVE_PID', 11, True, False, None,
-                id='live-pid-as-string',
-            ),
-            # (d1) No lock file, id as int → reverted via no-lock branch
-            pytest.param(None, 12, True, False, None, id='no-lock-int-id'),
-            # (d2) No lock file, id as str → reverted via no-lock branch
-            pytest.param(None, '13', True, False, None, id='no-lock-str-id'),
+            # A lock that WOULD read as a live claimant if it sat where the
+            # resolver reads: well-formed JSON, this process's own (alive)
+            # owner_pid, locked_at = now.  Staged at the vestigial worktree
+            # address instead it changes NOTHING — the task still reverts and
+            # the file is still gone afterwards.  That inertness IS the
+            # invariant this parametrization pins.
+            #
+            # This single case replaces six former ones (corrupt-json,
+            # missing-/null-/non-numeric-owner-pid, non-dict-json,
+            # live-pid-as-string; task 4028).  Each staged different CONTENT
+            # at an address the sweep never reads and asserted the identical
+            # outcome, making them indistinguishable duplicates of one
+            # another — while their comments still narrated resolver logic
+            # (``int('abc')`` raising ValueError, ``locked_at`` outside
+            # heartbeat_ttl) that nothing in this file reaches any more.
+            # Resolver-side format degradation is covered where the resolver
+            # actually reads, in test_task_ground_truth.py:
+            # TestDeriveTruthLiveClaimant's corrupt-JSON / non-UTF-8 /
+            # non-dict / malformed-owner_pid / stale-locked_at cases, plus the
+            # TestClaimantRunIdIsComposedOrNone family.
+            pytest.param('LIVE_FRESH', 9, id='lock-present-any-content'),
+            # No lock at all — the no-lock revert branch.  Kept as a PAIR
+            # because int-vs-str task id is the one axis these two genuinely
+            # discriminate (``tid_str = str(task_id)`` feeds every assertion
+            # and the cleanup_worktree call args below).
+            pytest.param(None, 12, id='no-lock-int-id'),
+            pytest.param(None, '13', id='no-lock-str-id'),
         ],
     )
-    async def test_reconcile_lock_format_variants(
-        self,
-        harness: Harness,
-        caplog,
-        lock_contents,
-        task_id,
-        expect_reverted: bool,
-        expect_lock_exists: bool,
-        warn_pattern,
+    async def test_vestigial_worktree_lock_is_inert_and_unlinked(
+        self, harness: Harness,
+        lock_contents, task_id,
     ):
-        """Parametrized coverage of plan.lock format edge cases."""
-        import logging
+        """The worktree's ``.task/plan.lock`` cannot influence the sweep, and
+        does not survive a revert.
 
+        Post-4028 the liveness verdict comes from
+        ``TaskGroundTruth._resolve_live_claimant``, which reads the
+        ``.task-meta`` SIBLING — so nothing under ``<worktree>/.task``
+        reaches the classification, whatever it contains.  What remains true
+        of the worktree lock is purely physical: when recovery reverts a
+        task, the applier's defensive ``lock_path.unlink(missing_ok=True)``
+        (and ``cleanup_worktree``'s rmtree of the worktree dir) remove it
+        unconditionally.
+
+        Both halves are asserted: the revert fires regardless of content, and
+        the file is gone afterwards.
+        """
         harness.scheduler.get_statuses.return_value = ({str(task_id): 'in-progress'}, None)  # type: ignore[attr-defined]
 
         tid_str = str(task_id)
-        lock_dir = harness.git_ops.worktree_base / tid_str / '.task'
+        # LEGACY address ON PURPOSE — see ``_vestigial_lock_dir``'s docstring.
+        lock_dir = _vestigial_lock_dir(harness.git_ops.worktree_base / tid_str)
         lock_path = lock_dir / 'plan.lock'
 
         if lock_contents is not None:
-            # Resolve sentinel for live-PID case
-            if lock_contents == 'LIVE_PID':
+            # Resolve the sentinel for the maximally claimant-looking payload.
+            if lock_contents == 'LIVE_FRESH':
                 lock_contents = json.dumps({
                     'session_id': f'{tid_str}-live',
-                    'locked_at': '2026-01-01T00:00:00+00:00',
-                    'owner_pid': str(os.getpid()),
+                    'locked_at': datetime.now(UTC).isoformat(),
+                    'owner_pid': os.getpid(),
                 })
             lock_dir.mkdir(parents=True, exist_ok=True)
             lock_path.write_text(lock_contents)
 
-        with caplog.at_level(logging.WARNING, logger='orchestrator.harness'):
-            await harness._reconcile_stranded_in_progress()
+        await harness._reconcile_stranded_in_progress()
 
+        # (1) Reverted in every case — the worktree lock is never consulted.
         calls = harness.scheduler.set_task_status.call_args_list  # type: ignore[attr-defined]
-        if expect_reverted:
-            assert len(calls) == 1, f'Expected 1 revert call, got: {calls}'
-            assert calls[0].args[0] == tid_str, (
-                f'Expected set_task_status called with id={tid_str!r}, got {calls[0].args[0]!r}'
-            )
-            assert calls[0].args[1] == 'pending'
-        else:
-            assert len(calls) == 0, f'Expected no calls (task untouched), got: {calls}'
+        assert len(calls) == 1, f'Expected 1 revert call, got: {calls}'
+        assert calls[0].args[0] == tid_str, (
+            f'Expected set_task_status called with id={tid_str!r}, got {calls[0].args[0]!r}'
+        )
+        assert calls[0].args[1] == 'pending'
 
-        assert lock_path.exists() == expect_lock_exists, (
-            f'Lock file existence mismatch: expected {expect_lock_exists}, '
-            f'got {lock_path.exists()}'
+        # (2) No plan.lock left behind at the worktree address.
+        assert not lock_path.exists(), (
+            f'vestigial worktree lock must not survive the revert: {lock_path}'
         )
 
-        if warn_pattern is not None:
-            matching = [
-                r for r in caplog.records
-                if re.search(warn_pattern, r.message, re.IGNORECASE)
-            ]
-            assert len(matching) >= 1, (
-                f'Expected log record matching {warn_pattern!r} in orchestrator.harness logs, '
-                f'got: {[r.message for r in caplog.records]}'
-            )
-            # Corrupt/unreadable lock on startup → ERROR (task stranded indefinitely,
-            # operator action required). Other warn_pattern cases (missing/null owner_pid)
-            # remain at WARNING level.
-            expected_level = (
-                logging.ERROR
-                if re.search(r'(unreadable|corrupt).*leaving worktree intact', warn_pattern)
-                else logging.WARNING
-            )
-            assert matching[0].levelno == expected_level, (
-                f'Expected {logging.getLevelName(expected_level)} level, '
-                f'got {logging.getLevelName(matching[0].levelno)}'
-            )
-
-        # Verify cleanup_worktree call behavior.
-        # When a worktree was created on disk (lock_contents is not None) and the
-        # task was reverted, cleanup_worktree must have been called with the correct
-        # args.  When no worktree exists (no-lock-*-id cases, lock_contents=None) or
-        # the task was left alone (live-pid-as-string), cleanup_worktree must not fire.
+        # cleanup_worktree fires only when a worktree dir existed on disk —
+        # here exactly the case that staged a lock.
         worktree_path = harness.git_ops.worktree_base / tid_str
-        if expect_reverted and lock_contents is not None:
+        if lock_contents is not None:
             harness.git_ops.cleanup_worktree.assert_called_once_with(  # type: ignore[attr-defined]
                 worktree_path, tid_str
             )
         else:
             harness.git_ops.cleanup_worktree.assert_not_called()  # type: ignore[attr-defined]
-
     async def test_corrupt_plan_lock_reverted_on_startup(
         self, harness: Harness, caplog
     ):
@@ -1147,7 +1453,10 @@ class TestReconcileStrandedInProgress:
         tid = '200'
         harness.scheduler.get_statuses.return_value = ({tid: 'in-progress'}, None)  # type: ignore[attr-defined]
 
-        lock_dir = harness.git_ops.worktree_base / tid / '.task'
+        # LEGACY address ON PURPOSE: this test IS about the vestigial
+        # `<worktree>/.task/plan.lock` named in its docstring — that the
+        # applier no longer reads it and defensively unlinks it (task 4028).
+        lock_dir = _vestigial_lock_dir(harness.git_ops.worktree_base / tid)
         lock_dir.mkdir(parents=True)
         lock_path = lock_dir / 'plan.lock'
         lock_path.write_text('not-valid-json')
@@ -1272,21 +1581,29 @@ class TestReconcileStrandedInProgress:
         assert worktree_path.exists()
         harness.scheduler.set_task_status.assert_called_once_with(str(tid), 'pending')  # type: ignore[attr-defined]
 
-    async def test_stale_lock_worktree_preserved_when_in_preserved_set(
-        self, harness: Harness, monkeypatch
+    async def test_worktree_preserved_when_in_preserved_set_lock_still_unlinked(
+        self, harness: Harness
     ):
-        """Stale plan.lock + task IS in _preserved_worktrees →
-        cleanup_worktree NOT called, worktree kept, stale lock unlinked,
+        """No live claimant + task IS in _preserved_worktrees →
+        cleanup_worktree NOT called, worktree kept, worktree lock unlinked,
         task reverted.  Defensive: _recover_crashed_tasks already unlinks
         plan.lock when adding to _preserved_worktrees, so this combined
         state shouldn't appear in practice — locks the invariant against
-        future drift, mirroring test_stale_lock_worktree_preserved_when_recovered.
+        future drift, mirroring
+        test_worktree_preserved_when_recovered_lock_still_unlinked.
+
+        The revert is driven by lock ABSENCE at the resolver's `.task-meta`
+        address, not by the staged lock's staleness (task 4028); no
+        `_pid_alive` patch, since the harness copy is no longer called here.
         """
         tid = '35'
         harness.scheduler.get_statuses.return_value = ({str(tid): 'in-progress'}, None)  # type: ignore[attr-defined]
-        monkeypatch.setattr('orchestrator.harness._pid_alive', lambda pid: False)
 
-        lock_dir = harness.git_ops.worktree_base / str(tid) / '.task'
+        # LEGACY address ON PURPOSE: with cleanup_worktree suppressed by
+        # _preserved_worktrees, the `assert not lock_path.exists()` below can
+        # only be the applier's defensive `<worktree>/.task/plan.lock` unlink
+        # — the sole side-effect this test is here to pin (task 4028).
+        lock_dir = _vestigial_lock_dir(harness.git_ops.worktree_base / str(tid))
         lock_dir.mkdir(parents=True)
         lock_path = lock_dir / 'plan.lock'
         lock_path.write_text(json.dumps({
@@ -1305,24 +1622,30 @@ class TestReconcileStrandedInProgress:
         harness.scheduler.set_task_status.assert_called_once_with(str(tid), 'pending')  # type: ignore[attr-defined]
 
     async def test_stale_lock_worktree_cleaned_when_not_recovered(
-        self, harness: Harness, monkeypatch
+        self, harness: Harness
     ):
         """In-progress task with stale plan.lock (dead PID), not in _recovered_plans
         → cleanup_worktree called (removing entire worktree dir), task reverted."""
         tid = 32
         harness.scheduler.get_statuses.return_value = ({str(tid): 'in-progress'}, None)  # type: ignore[attr-defined]
-        monkeypatch.setattr('orchestrator.harness._pid_alive', lambda pid: False)
+        # The owner pid below is dead by construction (2**31 - 1, beyond any
+        # real pid_max).  Belt-and-braces here: the expired locked_at below
+        # already decides staleness on its own.
 
-        # Create worktree with a plan.lock referencing a synthetic dead PID
-        lock_dir = harness.git_ops.worktree_base / str(tid) / '.task'
+        # Create the worktree, plus a plan.lock referencing a synthetic dead
+        # PID where the RESOLVER reads it (task 4028) — the expired
+        # locked_at is what makes _lock_fresh return False, which is the
+        # stale-lock premise this test names.
+        worktree_path = harness.git_ops.worktree_base / str(tid)
+        worktree_path.mkdir(parents=True)
+        lock_dir = _resolver_lock_dir(worktree_path, str(tid))
         lock_dir.mkdir(parents=True)
         lock_path = lock_dir / 'plan.lock'
         lock_path.write_text(json.dumps({
             'session_id': f'{tid}-dead',
             'locked_at': '2026-01-01T00:00:00+00:00',
-            'owner_pid': 99999,
+            'owner_pid': 2**31 - 1,
         }))
-        worktree_path = harness.git_ops.worktree_base / str(tid)
         # _recovered_plans is empty (default)
 
         await harness._reconcile_stranded_in_progress()
@@ -1334,24 +1657,32 @@ class TestReconcileStrandedInProgress:
         # The entire worktree dir is gone (side_effect rmtree'd it)
         assert not worktree_path.exists()
 
-    async def test_stale_lock_worktree_preserved_when_recovered(
-        self, harness: Harness, monkeypatch
+    async def test_worktree_preserved_when_recovered_lock_still_unlinked(
+        self, harness: Harness
     ):
-        """In-progress task with stale plan.lock (dead PID), task IS in _recovered_plans
-        → cleanup_worktree NOT called, worktree preserved, stale lock unlinked, task reverted.
+        """In-progress task with no live claimant, task IS in _recovered_plans
+        → cleanup_worktree NOT called, worktree preserved, worktree lock unlinked,
+        task reverted.
 
-        NOTE — defensive branch only: this combined state (recovered plan + stale lock still
-        present) is unreachable in the normal startup flow.  _recover_crashed_tasks always
-        unlinks plan.lock before adding a task to _recovered_plans (harness.py:864-868), so
-        in practice a recovered task arrives at the no-lock branch, not the stale-lock branch.
-        This test exists to lock the invariant against future drift in the recovery path.
+        NOTE — defensive branch only: this combined state (recovered plan + a
+        worktree lock still present) is unreachable in the normal startup flow.
+        _recover_crashed_tasks always unlinks plan.lock before adding a task to
+        _recovered_plans, so in practice a recovered task arrives here with no
+        lock on disk at all.  This test exists to lock the invariant against
+        future drift in the recovery path.
+
+        The revert is driven by lock ABSENCE at the resolver's `.task-meta`
+        address, not by the staged lock's staleness (task 4028); no
+        `_pid_alive` patch, since the harness copy is no longer called here.
         """
         tid = 33
         harness.scheduler.get_statuses.return_value = ({str(tid): 'in-progress'}, None)  # type: ignore[attr-defined]
-        monkeypatch.setattr('orchestrator.harness._pid_alive', lambda pid: False)
 
-        # Create worktree with a plan.lock referencing a synthetic dead PID
-        lock_dir = harness.git_ops.worktree_base / str(tid) / '.task'
+        # LEGACY address ON PURPOSE: with cleanup_worktree suppressed by
+        # _recovered_plans, the `assert not lock_path.exists()` below can only
+        # be the applier's defensive `<worktree>/.task/plan.lock` unlink — the
+        # sole side-effect this test is here to pin (task 4028).
+        lock_dir = _vestigial_lock_dir(harness.git_ops.worktree_base / str(tid))
         lock_dir.mkdir(parents=True)
         lock_path = lock_dir / 'plan.lock'
         lock_path.write_text(json.dumps({
@@ -1369,7 +1700,8 @@ class TestReconcileStrandedInProgress:
         harness.git_ops.cleanup_worktree.assert_not_called()  # type: ignore[attr-defined]
         # Worktree directory must still exist
         assert worktree_path.exists()
-        # Stale lock must be removed (so the resumed session doesn't immediately requeue)
+        # The worktree lock must be removed (so the resumed session doesn't
+        # immediately requeue)
         assert not lock_path.exists()
         # Task must be reverted to pending
         harness.scheduler.set_task_status.assert_called_once_with(str(tid), 'pending')  # type: ignore[attr-defined]
@@ -1435,26 +1767,45 @@ class TestReconcileStrandedInProgress:
     ):
         """TypeError from json.loads must propagate — not be silently swallowed.
 
-        RED against current code: `except Exception:` catches TypeError and
-        treats the lock as stale (task reverted, lock deleted, no exception).
-        After the fix (narrow to OSError/JSONDecodeError/ValueError), TypeError
-        propagates out, set_task_status is never called, and the lock survives.
+        The plan.lock read now lives in ``TaskArtifacts.read_plan_lock``
+        (orchestrator/artifacts.py), reached from
+        ``TaskGroundTruth._resolve_live_claimant``.  Its degradation arm is
+        deliberately NARROW — ``except (ValueError, OSError)`` — so a
+        TypeError from ``json.loads`` is NOT absorbed as "lock unreadable,
+        treat as stale": it propagates out of the sweep, set_task_status is
+        never called, and the lock survives.  A blanket ``except Exception:``
+        there would swallow it and silently revert the task.
+
+        The patch targets ``orchestrator.artifacts.json.loads`` — the module
+        that actually performs the read (task 4028; it formerly named
+        ``orchestrator.harness``, which still bit only because both names
+        resolve to the one shared ``json`` module object).
         """
-        from unittest.mock import patch as _patch
+        lock_path = _stage_valid_looking_lock(harness, '15')
 
-        harness.scheduler.get_statuses.return_value = ({'15': 'in-progress'}, None)  # type: ignore[attr-defined]
-        lock_dir = harness.git_ops.worktree_base / '15' / '.task'
-        lock_dir.mkdir(parents=True)
-        lock_path = lock_dir / 'plan.lock'
-        lock_path.write_text('{"session_id": "15-xyz", "owner_pid": 1}')  # valid-looking
-
-        with _patch('orchestrator.harness.json.loads', side_effect=TypeError('unexpected')), pytest.raises(TypeError, match='unexpected'):
+        with patch('orchestrator.artifacts.json.loads', side_effect=TypeError('unexpected')), pytest.raises(TypeError, match='unexpected'):
             await harness._reconcile_stranded_in_progress()
 
         # No revert must have happened
         harness.scheduler.set_task_status.assert_not_called()  # type: ignore[attr-defined]
         # Lock file must not have been deleted
         assert lock_path.exists(), 'Lock file must survive when an unexpected exception propagates'
+
+    async def test_unexpected_exception_is_recorded_into_a_supplied_collector(
+        self, harness: Harness
+    ):
+        """With a collector (the startup caller) the same TypeError is an entry failure."""
+        lock_path = _stage_valid_looking_lock(harness, '15')
+        set_status = AsyncMock()
+        harness.scheduler.set_task_status = set_status
+        failures = EntryFailures('Reconcile')
+
+        with patch('orchestrator.artifacts.json.loads', side_effect=TypeError('unexpected')):
+            await harness._reconcile_stranded_in_progress(failures=failures)
+
+        assert [(f.entry, f.exception_type) for f in failures.failures] == [('15', 'TypeError')]
+        set_status.assert_not_called()
+        assert lock_path.exists()
 
     async def test_already_merged_branch_marked_done_with_provenance(
         self, harness: Harness
@@ -1513,13 +1864,12 @@ class TestReconcileStrandedInProgress:
         observation.
         """
         from escalation.models import Escalation
-        from escalation.queue import EscalationQueue
 
         # Wire up a real EscalationQueue and submit an L1 record for task 50.
         queue_dir = tmp_path / 'escalations'
-        harness._escalation_queue = EscalationQueue(queue_dir)
-        harness._escalation_queue.submit(Escalation(
-            id=harness._escalation_queue.make_id('50'),
+        queue = _bind_queue(harness, queue_dir)
+        queue.submit(Escalation(
+            id=queue.make_id('50'),
             task_id='50',
             agent_role='task-steward',
             severity='blocking',
@@ -1602,28 +1952,32 @@ class TestReconcileStrandedInProgress:
             'worktree dir must be removed by cleanup_worktree'
         )
 
-    async def test_already_merged_takes_precedence_over_stale_lock(
-        self, harness: Harness, monkeypatch
+    async def test_already_merged_takes_precedence_over_lock_state_analysis(
+        self, harness: Harness
     ):
         """Placement-precedence regression lock: is_ancestor guard fires BEFORE
-        the stale-lock analysis.
+        the lock-state analysis.
 
-        A task with a stale plan.lock AND is_ancestor=True must take the done
-        path (no pending revert, stale-lock analysis bypassed). The guard also
-        cleans up the stale worktree dir (amendment: prevents worktree cruft
-        accumulation when orchestrator crashed after merge but before cleanup).
-        This test would fail if a future refactor moved the guard below the
-        lock analysis (set_task_status would be called with 'pending').
+        A task with a worktree plan.lock AND is_ancestor=True must take the
+        done path (no pending revert, lock-state analysis bypassed). The guard
+        also cleans up the leftover worktree dir (amendment: prevents worktree
+        cruft accumulation when orchestrator crashed after merge but before
+        cleanup).  This test would fail if a future refactor moved the guard
+        below the lock analysis (set_task_status would be called with
+        'pending').  No `_pid_alive` patch: the harness copy is no longer
+        called on this path, and the staged lock is at the vestigial address
+        the sweep never reads anyway (task 4028).
         """
         harness.git_ops.is_ancestor = AsyncMock(return_value=True)  # type: ignore[attr-defined]
         harness.scheduler.get_statuses.return_value = (  # type: ignore[attr-defined]
             {'51': 'in-progress'}, None
         )
-        monkeypatch.setattr('orchestrator.harness._pid_alive', lambda pid: False)
 
-        # Create a worktree with a stale plan.lock (dead PID)
+        # LEGACY address ON PURPOSE: the `assert not lock_path.exists()` below
+        # is a proxy for "cleanup_worktree's rmtree ran", and rmtree of the
+        # worktree dir cannot reach the `.task-meta` SIBLING (task 4028).
         worktree_path = harness.git_ops.worktree_base / '51'
-        lock_dir = worktree_path / '.task'
+        lock_dir = _vestigial_lock_dir(worktree_path)
         lock_dir.mkdir(parents=True)
         lock_path = lock_dir / 'plan.lock'
         lock_path.write_text(json.dumps({
@@ -1733,11 +2087,16 @@ class TestReconcileStrandedInProgress:
         harness.scheduler.set_task_status.assert_awaited_once_with('50', 'pending')  # type: ignore[attr-defined]
         harness.scheduler.mark_done.assert_not_called()  # type: ignore[attr-defined]
 
-    async def test_degenerate_in_progress_no_citation_stale_lock_reverted(
-        self, harness: Harness, monkeypatch
+    async def test_degenerate_in_progress_no_citation_reverted_and_lock_unlinked(
+        self, harness: Harness
     ):
-        """Guard 2 path with a stale plan.lock (dead owner_pid): lock cleared and
-        in-progress task reverted to pending."""
+        """Guard 2 path with a worktree plan.lock present: task reverted to
+        pending and the vestigial lock unlinked.
+
+        The revert comes from the degenerate-branch/no-citation classification
+        plus lock ABSENCE at the resolver's `.task-meta` address — not from
+        the staged lock's owner_pid, which the sweep never reads (task 4028).
+        Hence no `_pid_alive` patch."""
         branch_tip = 'deadbeef' + 'a' * 32
         harness.git_ops.is_ancestor = AsyncMock(return_value=True)  # type: ignore[attr-defined]
         harness.git_ops.find_task_citation_commit = AsyncMock(return_value=None)  # type: ignore[attr-defined]
@@ -1746,8 +2105,10 @@ class TestReconcileStrandedInProgress:
             return_value={'id': '8', 'metadata': {'branch_base_sha': branch_tip}}
         )
         harness.scheduler.get_statuses.return_value = ({'8': 'in-progress'}, None)  # type: ignore[attr-defined]
-        monkeypatch.setattr('orchestrator.harness._pid_alive', lambda pid: False)
-        lock_dir = harness.git_ops.worktree_base / '8' / '.task'
+        # LEGACY address ON PURPOSE: the `assert not lock_path.exists()` below
+        # pins the applier's defensive `<worktree>/.task/plan.lock` unlink,
+        # which is the only thing that removes it here (task 4028).
+        lock_dir = _vestigial_lock_dir(harness.git_ops.worktree_base / '8')
         lock_dir.mkdir(parents=True)
         lock_path = lock_dir / 'plan.lock'
         lock_path.write_text(json.dumps({
@@ -1875,15 +2236,18 @@ class TestReconcileStrandedInProgress:
             tid, 'pending'
         )
 
-    async def test_marker_takes_precedence_over_stale_lock(
-        self, harness: Harness, monkeypatch
+    async def test_marker_takes_precedence_over_lock_state_analysis(
+        self, harness: Harness
     ):
         """Placement-precedence: find_merge_marker guard fires BEFORE the
-        stale-lock analysis.
+        lock-state analysis.
 
-        A task with a stale plan.lock AND a merge marker must take the done
+        A task with a worktree plan.lock AND a merge marker must take the done
         path with marker provenance.  cleanup_worktree is called once (worktree
-        dir existed), and the stale-lock branch is bypassed entirely.
+        dir existed), and the lock-state branch is bypassed entirely.  No
+        `_pid_alive` patch: the harness copy is no longer called on this path,
+        and the staged lock is at the vestigial address the sweep never reads
+        (task 4028).
         """
         tid = '72'
         marker_sha = 'deadc0de' + 'b' * 32
@@ -1898,11 +2262,11 @@ class TestReconcileStrandedInProgress:
         harness.scheduler.get_statuses.return_value = (  # type: ignore[attr-defined]
             {tid: 'in-progress'}, None
         )
-        monkeypatch.setattr('orchestrator.harness._pid_alive', lambda pid: False)
-
-        # Create a worktree with a stale plan.lock (dead PID)
+        # LEGACY address ON PURPOSE: the `assert not lock_path.exists()` below
+        # is a proxy for "cleanup_worktree's rmtree ran", and rmtree of the
+        # worktree dir cannot reach the `.task-meta` SIBLING (task 4028).
         worktree_path = harness.git_ops.worktree_base / tid
-        lock_dir = worktree_path / '.task'
+        lock_dir = _vestigial_lock_dir(worktree_path)
         lock_dir.mkdir(parents=True)
         lock_path = lock_dir / 'plan.lock'
         lock_path.write_text(json.dumps({
@@ -2049,8 +2413,7 @@ class TestReconcileStrandedInProgress:
                 '64': 'review',
                 '65': 'deferred',
             },
-            None,
-        )
+            None, )
 
         await harness._reconcile_stranded_in_progress()
 
@@ -2076,8 +2439,7 @@ class TestReconcileStrandedInProgress:
                 '84': 'review',
                 '85': 'deferred',
             },
-            None,
-        )
+            None, )
 
         await harness._reconcile_stranded_in_progress()
 
@@ -2095,61 +2457,52 @@ class TestReconcileStrandedInProgress:
         [
             pytest.param(
                 'is_ancestor',
-                True,
-                None,
+                True, None,
                 'branch-already-on-main',
                 {
                     'kind': 'found_on_main',
                     'commit': 'deadbeef' + 'a' * 32,
                     'note': 'reconcile: branch already on main when stranded in-progress',
                 },
-                False,
-                id='is_ancestor-branch-success',
+                False, id='is_ancestor-branch-success',
             ),
             pytest.param(
                 'marker',
-                False,
-                'cafebabe' + 'd' * 32,
+                False, 'cafebabe' + 'd' * 32,
                 'branch-deleted-marker-found',
                 {
                     'kind': 'found_on_main',
                     'commit': 'cafebabe' + 'd' * 32,
                     'note': 'reconcile: branch deleted but merge marker found on main',
                 },
-                False,
-                id='marker-branch-success',
+                False, id='marker-branch-success',
             ),
             pytest.param(
                 'is_ancestor',
-                True,
-                None,
+                True, None,
                 'branch-already-on-main',
                 {
                     'kind': 'found_on_main',
                     'commit': 'deadbeef' + 'a' * 32,
                     'note': 'reconcile: branch already on main when stranded in-progress',
                 },
-                True,
-                id='is_ancestor-branch-cleanup-fails',
+                True, id='is_ancestor-branch-cleanup-fails',
             ),
             pytest.param(
                 'marker',
-                False,
-                'cafebabe' + 'd' * 32,
+                False, 'cafebabe' + 'd' * 32,
                 'branch-deleted-marker-found',
                 {
                     'kind': 'found_on_main',
                     'commit': 'cafebabe' + 'd' * 32,
                     'note': 'reconcile: branch deleted but merge marker found on main',
                 },
-                True,
-                id='marker-branch-cleanup-fails',
+                True, id='marker-branch-cleanup-fails',
             ),
         ],
     )
     async def test_done_branch_side_effects(
-        self,
-        harness: Harness,
+        self, harness: Harness,
         tmp_path: Path,
         caplog: pytest.LogCaptureFixture,
         scenario: str,
@@ -2237,23 +2590,20 @@ class TestReconcileStrandedInProgress:
         [
             pytest.param(
                 'is_ancestor',
-                True,
-                None,
+                True, None,
                 'deadbeef' + 'a' * 32,
                 id='is_ancestor-branch',
             ),
             pytest.param(
                 'marker',
-                False,
-                'cafebabe' + 'd' * 32,
+                False, 'cafebabe' + 'd' * 32,
                 'cafebabe' + 'd' * 32,
                 id='marker-branch',
             ),
         ],
     )
     async def test_absent_worktree_dir_skips_cleanup(
-        self,
-        harness: Harness,
+        self, harness: Harness,
         scenario: str,
         is_ancestor_val: bool,
         marker_sha_val: str | None,
@@ -2340,12 +2690,11 @@ async def test_harness_run_invokes_reconcile_before_scheduler_loop(
     config.review.enabled = False
     config.sandbox.backend = 'auto'
     config.max_concurrent_tasks = 2
+    # Harness.run builds RunSlots from this; a spec'd MagicMock raises TypeError in asyncio.Semaphore.
+    config.main_health_fix_reserved_slots = 1
     config.fused_memory.project_id = 'test'
     config.sandbox.backend = 'auto'
-    # Real Path so OverrideStore.from_config(config) can call .parent.mkdir()
-    # and sqlite3.connect(str(...)) without leaking MagicMock-named files —
-    # Harness.__init__ wires OverrideStore unconditionally (task 1313).
-    config.overrides_db_path = tmp_path / 'overrides.db'
+    point_harness_stores_at(config, tmp_path)
     # No-landings breaker (task 1918): ints are read at construction (deque
     # maxlen); enabled=False keeps run() from spinning up the breaker loop.
     config.no_landings_breaker_enabled = False
@@ -2391,21 +2740,24 @@ async def test_harness_run_invokes_reconcile_before_scheduler_loop(
     h.scheduler.set_task_status = AsyncMock()
 
     # Track ordering: _recover_crashed_tasks
-    async def _fake_recover():
+    async def _fake_recover() -> EntryFailures:
         call_order.append('recover')
+        return EntryFailures('Recovery')
     h._recover_crashed_tasks = _fake_recover
 
     # Runs between recover and reconcile-stranded; not under test here.
     h._reconcile_lane_checkouts = AsyncMock()
 
     # Track ordering: _reconcile_stranded_in_progress
-    async def _fake_reconcile(*, mid_run: bool = False) -> int:
+    async def _fake_reconcile(
+        *, mid_run: bool = False, failures: EntryFailures | None = None,
+    ) -> int:
         call_order.append('reconcile')
         return 0
     h._reconcile_stranded_in_progress = _fake_reconcile
 
     # Track ordering: acquire_next — append then raise to break the loop
-    async def _fake_acquire():
+    async def _fake_acquire(*_args, **_kwargs):
         call_order.append('acquire')
         raise RuntimeError('stop the loop')
     h.scheduler.acquire_next = _fake_acquire
@@ -2454,8 +2806,7 @@ async def test_terminal_and_pending_statuses_ignored(harness: Harness):
             '25': 'in-progress',  # orphan-revert candidate
             '26': 'deferred',
         },
-        None,
-    )
+        None, )
     # No worktree for task 25 (orphan)
 
     await harness._reconcile_stranded_in_progress()
@@ -2581,7 +2932,7 @@ async def test_one_task_rejection_does_not_kill_sweep(harness: Harness, caplog):
     assert not hasattr(harness, '_reconcile_failure_counts')
     # Honest log mentions the error_code, not "marked done".
     assert any(
-        'failed to mark task 100 done' in r.getMessage()
+        'reconcile write refused for task 100 (unknown -> done)' in r.getMessage()
         and 'done_gate_missing_files' in r.getMessage()
         for r in caplog.records
     )
@@ -2607,9 +2958,9 @@ async def test_rejection_escalates_immediately_no_counter_threshold(harness: Har
             return f'esc-{task_id}-{len(submissions)}'
         def submit(self, esc):
             submissions.append(esc)
-        def has_open_l1(self, task_id):  # noqa: ARG002
+        def has_open_l1(self, task_id):
             return False
-        def get_by_task(self, task_id, status=None):  # noqa: ARG002
+        def get_by_task(self, task_id, status=None):
             # TaskGroundTruth._resolve_open_escalations (task 2243, W10-θ2)
             # consults this to fold open escalations into the recovery
             # shape — no escalation is open for this test's task.
@@ -2634,7 +2985,7 @@ async def test_rejection_escalates_immediately_no_counter_threshold(harness: Har
     await harness._reconcile_stranded_in_progress()
 
     assert len(submissions) == 1, (
-        f'expected exactly one L1 submission after a single rejection, '
+        f'expected exactly one escalation submission after a single rejection, '
         f'got {len(submissions)}'
     )
     esc = submissions[0]
@@ -2647,7 +2998,7 @@ async def test_rejection_escalates_immediately_no_counter_threshold(harness: Har
     # dedup counter left to suppress it.
     await harness._reconcile_stranded_in_progress()
     assert len(submissions) == 2, (
-        f'expected a second L1 submission on the next rejection (no dedup '
+        f'expected a second escalation submission on the next rejection (no dedup '
         f'counter remains), got {len(submissions)}'
     )
 
@@ -2680,7 +3031,7 @@ async def test_rejection_escalates_immediately_no_counter_threshold(harness: Har
 
 # ---------------------------------------------------------------------------
 # task 2677 step-5/step-6 — done_evidence_stale must never be treated as
-# marked_done, must not file the generic L1 reconcile_persistent_rejection
+# marked_done, must not file the generic reconcile_persistent_rejection
 # (that path is for OTHER SetTaskStatusRejected subclasses), must not
 # release the warm lane (the task is NOT done), and must file exactly one
 # born-at-L2 provenance_conflict escalation via the shared
@@ -2696,7 +3047,7 @@ def _wire_stale_evidence_mark_done(harness: Harness, *, evidence_commit: str = '
     """
     from orchestrator.scheduler import StaleEvidenceRejection
 
-    async def _stale_reject(tid, *, kind, sha, note=None):  # noqa: ARG001
+    async def _stale_reject(tid, *, kind, sha, note=None):
         raise StaleEvidenceRejection(
             task_id=tid,
             evidence_commit=evidence_commit,
@@ -2728,9 +3079,9 @@ class TestReconcileOneStrandedStaleEvidenceConflict:
                 'metadata': {'reopen_at': '2026-07-15T00:00:00+00:00'},
             },
         )
-        harness._escalation_queue = EscalationQueue(tmp_path / 'esc')
+        queue = _bind_queue(harness, tmp_path / 'esc')
         harness._provenance_conflict_sink = ProvenanceConflictSink(
-            escalation_queue=harness._escalation_queue,
+            escalation_queue=queue,
         )
         harness.git_ops.release_lane_for_terminal_task = AsyncMock(  # type: ignore[attr-defined]
             return_value=False,
@@ -2747,7 +3098,7 @@ class TestReconcileOneStrandedStaleEvidenceConflict:
     ):
         """The full sweep (_reconcile_stranded_in_progress) must route a
         stale-evidence rejection to exactly one pending L2
-        provenance_conflict — never the generic L1
+        provenance_conflict — never the generic
         reconcile_persistent_rejection — and a second sweep at the same
         reopen_at must not create a second pending record (should_skip
         short-circuit or dedupe_count fold — either mechanism is
@@ -2764,9 +3115,9 @@ class TestReconcileOneStrandedStaleEvidenceConflict:
                 'metadata': {'reopen_at': '2026-07-15T00:00:00+00:00'},
             },
         )
-        harness._escalation_queue = EscalationQueue(tmp_path / 'esc')
+        queue = _bind_queue(harness, tmp_path / 'esc')
         harness._provenance_conflict_sink = ProvenanceConflictSink(
-            escalation_queue=harness._escalation_queue,
+            escalation_queue=queue,
         )
         harness.git_ops.release_lane_for_terminal_task = AsyncMock(  # type: ignore[attr-defined]
             return_value=False,
@@ -2775,7 +3126,7 @@ class TestReconcileOneStrandedStaleEvidenceConflict:
 
         await harness._reconcile_stranded_in_progress()
 
-        pending = harness._escalation_queue.get_by_task(tid, status='pending')
+        pending = queue.get_by_task(tid, status='pending')
         assert not any(e.category == 'reconcile_persistent_rejection' for e in pending), (
             'a stale-evidence rejection must not be escalated as a generic '
             'persistence-layer rejection (wrong escalation category)'
@@ -2787,7 +3138,7 @@ class TestReconcileOneStrandedStaleEvidenceConflict:
 
         # Second full sweep, unchanged reopen_at.
         await harness._reconcile_stranded_in_progress()
-        pending_after = harness._escalation_queue.get_by_task(tid, status='pending')
+        pending_after = queue.get_by_task(tid, status='pending')
         conflicts_after = [e for e in pending_after if e.category == 'provenance_conflict']
         assert len(conflicts_after) == 1, (
             f'expected still exactly one pending L2 after a second sweep, '
@@ -2817,8 +3168,14 @@ async def test_mid_run_alive_owner_pid_not_in_dispatch_recovers(
         {'400': 'in-progress'}, None,
     )
 
-    # Create a worktree with plan.lock pointing to OUR pid (harness.pid).
-    lock_dir = harness.git_ops.worktree_base / '400' / '.task'
+    # Create a worktree, plus a plan.lock pointing to OUR pid (harness.pid)
+    # WHERE THE RESOLVER READS IT (task 4028).  Visibility is what makes this
+    # a live PLAN_LOCK-sourced claimant, and therefore what makes the R3
+    # mid-run exception (harness.py, plan_lock_mid_run_exception) the branch
+    # under test rather than the plain no-claimant revert.
+    worktree_path = harness.git_ops.worktree_base / '400'
+    worktree_path.mkdir(parents=True)
+    lock_dir = _resolver_lock_dir(worktree_path, '400')
     lock_dir.mkdir(parents=True)
     (lock_dir / 'plan.lock').write_text(json.dumps({
         'session_id': '400-x', 'locked_at': datetime.now(UTC).isoformat(),
@@ -2843,7 +3200,11 @@ async def test_startup_alive_owner_pid_left_alone(harness: Harness):
         {'401': 'in-progress'}, None,
     )
 
-    lock_dir = harness.git_ops.worktree_base / '401' / '.task'
+    # Staged where the resolver READS it (task 4028) — an alive owner_pid can
+    # only "skip recovery" if the lock carrying it is actually visible.
+    worktree_path = harness.git_ops.worktree_base / '401'
+    worktree_path.mkdir(parents=True)
+    lock_dir = _resolver_lock_dir(worktree_path, '401')
     lock_dir.mkdir(parents=True)
     (lock_dir / 'plan.lock').write_text(json.dumps({
         'session_id': '401-x', 'locked_at': datetime.now(UTC).isoformat(),
@@ -2938,7 +3299,10 @@ async def test_mid_run_live_claimant_not_shortcut_by_driver_guard(harness: Harne
 
     changed = await harness._reconcile_stranded_in_progress(mid_run=True)
 
-    spy.assert_awaited_once_with('70', 'in-progress', mid_run=True)
+    # tally=ANY: task 3535 threads an OPTIONAL per-pass accumulator down to
+    # the per-task reconciler.  This assertion is about the driver NOT
+    # short-circuiting a live-claimant task, not about the accumulator.
+    spy.assert_awaited_once_with('70', 'in-progress', mid_run=True, tally=ANY)
     assert changed == 0
     harness.scheduler.set_task_status.assert_not_called()  # type: ignore[attr-defined]
 
@@ -2997,9 +3361,9 @@ async def test_in_progress_on_main_with_open_l2_escalation_leaves_untouched(
     # No plan.lock/worktree for '71' — if the sweep fell through to the
     # revert applier, it would revert (no-lock orphan path).
 
-    harness._escalation_queue = EscalationQueue(tmp_path / 'esc_l2_on_main')
-    harness._escalation_queue.submit(Escalation(
-        id=harness._escalation_queue.make_id('71'),
+    queue = _bind_queue(harness, tmp_path / 'esc_l2_on_main')
+    queue.submit(Escalation(
+        id=queue.make_id('71'),
         task_id='71', agent_role='steward', severity='critical',
         category='infra_issue', summary='open L2, on-main evidence present',
         level=2, status='pending',
@@ -3312,41 +3676,70 @@ def _attach_reconcile_pool(harness: Harness, size: int = 2) -> WarmLanePool:
 
 
 @pytest.mark.asyncio
-async def test_reconcile_stale_lock_uses_lane_path(harness: Harness, monkeypatch):
+async def test_reconcile_stale_lock_uses_lane_path(harness: Harness):
     """_reconcile_one_stranded resolves the worktree via the pool assignment.
 
     When a WarmLanePool is attached and task '42' is assigned to '_lane-0',
-    the lock-state classification must inspect base/'_lane-0'/.task/plan.lock
-    (not the non-existent base/'42'/.task/plan.lock).  After clearing the stale
-    lock, cleanup_worktree must be called with (base/'_lane-0', '42').
+    the lock-state classification must inspect TASK 42's lock — which lives
+    at base/'.task-meta'/'task-42'/plan.lock, whichever lane the task ran in
+    (task 3155) — and no lane-keyed address.  After finding it stale,
+    cleanup_worktree must be called with (base/'_lane-0', '42').
 
-    Fails today because worktree_path = worktree_base / tid computes base/'42'.
+    The addresses are made to DISCRIMINATE, so this is not settled by the
+    cleanup_worktree call args alone (those come from _resolve_task_worktree,
+    not from the lock read):
+
+      * the TASK-root lock is alive-but-EXPIRED (this process's own
+        owner_pid, locked_at far outside heartbeat_ttl) -> _lock_fresh False
+        -> no live claimant -> revert;
+      * the two lane-keyed roots — the lane's own base/'.task-meta'/'_lane-0'
+        and the cold base/'.task-meta'/'42' — each hold a lock that is alive
+        AND FRESH; reading either would resolve a live PLAN_LOCK claimant,
+        classify LEAVE, and skip the revert entirely.
+
+    So a regression to any lane-keyed address turns the set_task_status
+    assertion below red, not just the cleanup-path one.  Neither _pid_alive
+    is patched: every lock carries os.getpid(), so liveness is genuinely true
+    everywhere and locked_at is the only discriminator.
     """
     pool = _attach_reconcile_pool(harness, size=2)
     base = harness.git_ops.worktree_base
     lane_path = base / '_lane-0'
     cold_path = base / '42'
 
-    # Create the lane dir with a stale plan.lock (dead PID)
-    lock_dir = lane_path / '.task'
+    # The task's lock, at its RESOLVER address: live owner_pid, but locked_at
+    # is far outside heartbeat_ttl -> stale -> no live claimant.
+    lane_path.mkdir(parents=True, exist_ok=True)
+    lock_dir = _resolver_lock_dir(lane_path, '42')
     lock_dir.mkdir(parents=True)
     lock_path = lock_dir / 'plan.lock'
     lock_path.write_text(json.dumps({
-        'session_id': '42-dead',
-        'locked_at': datetime.now(UTC).isoformat(),
-        'owner_pid': 99999,
+        'session_id': '42-stale',
+        'locked_at': '2026-01-01T00:00:00+00:00',
+        'owner_pid': os.getpid(),
     }))
+
+    # TRIPWIRES: both lane-keyed roots, each holding a lock that is live AND
+    # fresh.  Nothing must ever read these.
+    for worktree in (lane_path, cold_path):
+        tripwire_dir = TaskArtifacts.meta_root_for(base, worktree.name)
+        tripwire_dir.mkdir(parents=True)
+        (tripwire_dir / 'plan.lock').write_text(json.dumps({
+            'session_id': '42-live',
+            'locked_at': datetime.now(UTC).isoformat(),
+            'owner_pid': os.getpid(),
+        }))
 
     # Restore the assignment so the pool knows '42' lives in '_lane-0'
     pool.restore_assignment('42', lane_path)
 
-    monkeypatch.setattr('orchestrator.harness._pid_alive', lambda pid: False)
     # is_ancestor False → skip the found-on-main path, go to lock-state branch
     harness.git_ops.is_ancestor = AsyncMock(return_value=False)  # type: ignore[attr-defined]
 
     await harness._reconcile_one_stranded('42', 'in-progress', mid_run=False)
 
-    # Task must be reverted to pending
+    # Task must be reverted to pending — i.e. the STALE lane lock was the one
+    # read, not the fresh cold-path tripwire.
     harness.scheduler.set_task_status.assert_called_once_with('42', 'pending')  # type: ignore[attr-defined]
     # cleanup_worktree must have been called with the LANE path, not base/'42'
     cleanup_calls = harness.git_ops.cleanup_worktree.call_args_list  # type: ignore[attr-defined]
@@ -3473,18 +3866,64 @@ class TestReconcileStrandedResolverGuard:
 # the same ON_MAIN git-fallback setup (is_ancestor True, resolve_branch_sha
 # <sha>, commit_effect_present_in_main default True so control reaches the
 # NEW guard AFTER the effect-present downgrade), but with a truthy
-# metadata.delivered_checks and orchestrator.harness.verify_delivered_checks_on_main
-# patched to return each row of the acceptance matrix. The capability guard
-# asks the orthogonal question git attribution + effect-present cannot: is
-# the task's OWN declared capability actually present on main? A hollow-done
-# (attribution/effect present, but the declared capability absent) must
-# re-dispatch (in-progress) or be left alone (blocked), never stamped
-# found_on_main.
+# metadata.delivered_checks and the guard patched to return each row of the
+# acceptance matrix. The capability guard asks the orthogonal question git
+# attribution + effect-present cannot: is the task's OWN declared capability
+# actually present on main? A hollow-done (attribution/effect present, but
+# the declared capability absent) must re-dispatch (in-progress) or be left
+# alone (blocked), never stamped found_on_main.
+#
+# RETARGETED by task 3057 step-19: the patch target moved DOWN a layer, from
+# the low-level `verify_delivered_checks_on_main` runner to the shared
+# `gate_mark_done_on_delivered_checks` DECISION that all eleven
+# attribution-shaped stamp seams now route through. Every behavioural
+# assertion below is preserved verbatim — only the staged mock return values
+# change (DeliveredChecksVerdict -> DeliveredChecksBlock | None). That is
+# what proves the generalization is behaviour-preserving on the one arm that
+# already had coverage.
+#
+# Consequence of single-sourcing: the harness no longer decides ANYTHING
+# locally. Inertness (no delivered_checks), the kill switch, and main-SHA
+# resolution all moved INTO the helper, so rows that used to assert
+# "helper not awaited" now assert "delegated, with the right inputs". The
+# coverage those rows lost is not gone — it is pinned AT SOURCE in
+# test_delivered_check_gate.py::TestGateMarkDoneOnDeliveredChecks.
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
 class TestReconcileOneStrandedDeliveredChecksGuard:
-    _PATCH_TARGET = 'orchestrator.harness.verify_delivered_checks_on_main'
+    _PATCH_TARGET = 'orchestrator.harness.gate_mark_done_on_delivered_checks'
+
+    @staticmethod
+    def _gate(block: DeliveredChecksBlock | None) -> AsyncMock:
+        """Stand-in for the shared helper that returns *block*.
+
+        Faithful to the real helper in the one respect these rows assert on:
+        a ``reason='failed'`` decision emits its WARNING on the
+        CALLER-SUPPLIED ``log``, never on the delivered_checks module logger.
+
+        SCOPE OF WHAT THAT PROVES (amendment, reviewer suggestion 5): because
+        this stand-in composes the message itself, the caplog-content
+        assertions below pin only the WIRING — that whatever the helper logs
+        lands on the ``orchestrator.harness`` stream, i.e. that the harness
+        hands its own module logger through. They do NOT pin the real
+        helper's message CONTENT; substituting a different message here would
+        keep them green. Task 2794's operator-facing WARNING content contract
+        is pinned separately, against the REAL helper, in
+        ``TestStrandedArmRealHelperWarningContent`` below.
+        """
+        async def _impl(task_id, metadata, *, log, **kwargs):
+            if block is not None and block.reason == 'failed':
+                failed = block.failed_check or {}
+                log.warning(
+                    'Task %s: delivered check %r (pattern %r) is NOT present '
+                    'on main %s — withholding the done stamp',
+                    task_id, failed.get('name'), failed.get('pattern'),
+                    block.main_sha,
+                )
+            return block
+
+        return AsyncMock(side_effect=_impl)
 
     def _on_main_in_progress(self, harness: Harness, tid: str, *, sha: str,
                              main_sha: str, metadata: dict) -> None:
@@ -3524,10 +3963,9 @@ class TestReconcileOneStrandedDeliveredChecksGuard:
             harness, tid, sha=sha, main_sha=main_sha,
             metadata={'delivered_checks': [failing]},
         )
-        verdict = DeliveredChecksVerdict(
-            outcome='failed', main_sha=main_sha, failed_check=failing,
-        )
-        helper = AsyncMock(return_value=verdict)
+        helper = self._gate(DeliveredChecksBlock(
+            reason='failed', main_sha=main_sha, failed_check=failing,
+        ))
 
         with patch(self._PATCH_TARGET, helper), \
                 caplog.at_level(logging.WARNING, logger='orchestrator.harness'):
@@ -3539,6 +3977,18 @@ class TestReconcileOneStrandedDeliveredChecksGuard:
         )
         assert result == 1
         helper.assert_awaited_once()
+        # The WARNING now comes FROM the helper, but must still be addressable
+        # as 'orchestrator.harness' — that holds only because the harness
+        # passes its own module logger through as log=. Pinned directly...
+        assert helper.await_args is not None
+        assert helper.await_args.kwargs['log'] is logging.getLogger(
+            'orchestrator.harness',
+        )
+        # ...and end-to-end through caplog: _gate emits on whatever `log` it
+        # was handed, so these reaching the 'orchestrator.harness' stream at
+        # all proves the harness passed its own module logger. This pins the
+        # WIRING only — the real helper's message CONTENT is pinned against
+        # the real helper in TestStrandedArmRealHelperWarningContent.
         assert tid in caplog.text
         assert 'cap-x' in caplog.text
         assert 'SomePattern' in caplog.text
@@ -3557,8 +4007,7 @@ class TestReconcileOneStrandedDeliveredChecksGuard:
             harness, tid, sha=sha, main_sha=main_sha,
             metadata={'delivered_checks': [check]},
         )
-        verdict = DeliveredChecksVerdict(outcome='all_delivered', main_sha=main_sha)
-        helper = AsyncMock(return_value=verdict)
+        helper = self._gate(None)
 
         with patch(self._PATCH_TARGET, helper):
             result = await harness._reconcile_stranded_in_progress()
@@ -3570,19 +4019,28 @@ class TestReconcileOneStrandedDeliveredChecksGuard:
         assert result == 1
         helper.assert_awaited_once()
 
-    # --- row 4: no delivered_checks -> guard inert, mark done, helper skipped -
+    # --- row 4: no delivered_checks -> DELEGATED, and inertly marks done ----
 
-    async def test_no_delivered_checks_marks_done_and_skips_helper(
+    async def test_no_delivered_checks_marks_done_and_delegates(
         self, harness: Harness,
     ):
         """A check-less task must not gain a new requirement: it is stamped
-        found_on_main exactly as today and the helper is never consulted."""
+        found_on_main exactly as today.
+
+        Changed by 3057 step-19: the harness now DELEGATES unconditionally
+        rather than short-circuiting on `metadata.delivered_checks` itself —
+        the inertness lives in the shared helper (one implementation for all
+        eleven seams), pinned at source by
+        test_delivered_check_gate.py::TestGateMarkDoneOnDeliveredChecks row 4,
+        which additionally asserts the zero-I/O property (no get_main_sha, no
+        check run) that cannot be observed from here.
+        """
         tid = '2794003'
         sha = 'deadbeef' + 'c' * 32
         self._on_main_in_progress(
             harness, tid, sha=sha, main_sha='mc' * 20, metadata={},
         )
-        helper = AsyncMock()
+        helper = self._gate(None)
 
         with patch(self._PATCH_TARGET, helper):
             result = await harness._reconcile_stranded_in_progress()
@@ -3592,7 +4050,9 @@ class TestReconcileOneStrandedDeliveredChecksGuard:
             done_provenance={'kind': 'found_on_main', 'commit': sha, 'note': ANY},
         )
         assert result == 1
-        helper.assert_not_awaited()
+        helper.assert_awaited_once()
+        assert helper.await_args is not None
+        assert 'delivered_checks' not in helper.await_args.args[1]
 
     # --- row 5: ERRORED/timeout -> fail-safe (no mark, no revert) ------------
 
@@ -3607,8 +4067,9 @@ class TestReconcileOneStrandedDeliveredChecksGuard:
             harness, tid, sha='deadbeef' + 'd' * 32, main_sha=main_sha,
             metadata={'delivered_checks': [check]},
         )
-        verdict = DeliveredChecksVerdict(outcome='errored', main_sha=main_sha)
-        helper = AsyncMock(return_value=verdict)
+        helper = self._gate(DeliveredChecksBlock(
+            reason='errored', main_sha=main_sha,
+        ))
 
         with patch(self._PATCH_TARGET, helper):
             result = await harness._reconcile_stranded_in_progress()
@@ -3621,9 +4082,18 @@ class TestReconcileOneStrandedDeliveredChecksGuard:
     # --- main-sha unresolved -> fail-safe (sibling of ERRORED) --------------
 
     async def test_main_sha_unresolved_is_fail_safe(self, harness: Harness):
-        """If get_main_sha() raises, we cannot resolve the ref the checks
-        would run against: fail-safe no-op (no mark, no revert, no helper
-        call), retried next sweep."""
+        """An unresolvable main SHA means the checks have no ref to run
+        against: fail-safe no-op (no mark, no revert), retried next sweep.
+
+        Changed by 3057 step-19: main-SHA resolution moved INTO the shared
+        helper, so this row now stages the resulting decision rather than the
+        git failure that produces it. The raises-vs-empty-string distinction
+        this test used to own is not lost — it is pinned AT SOURCE, as two
+        separate rows, in
+        test_delivered_check_gate.py::TestGateMarkDoneOnDeliveredChecks
+        (get_main_sha raising, and get_main_sha returning ''), where the
+        helper's own fail-safe arms live.
+        """
         tid = '2794005'
         check = {'name': 'cap-z', 'kind': 'grep', 'pattern': 'Pat'}
         self._on_main_in_progress(
@@ -3633,7 +4103,7 @@ class TestReconcileOneStrandedDeliveredChecksGuard:
         harness.git_ops.get_main_sha = AsyncMock(  # type: ignore[attr-defined]
             side_effect=RuntimeError('git rev-parse failed'),
         )
-        helper = AsyncMock()
+        helper = self._gate(DeliveredChecksBlock(reason='main_sha_unresolved'))
 
         with patch(self._PATCH_TARGET, helper):
             result = await harness._reconcile_stranded_in_progress()
@@ -3641,35 +4111,34 @@ class TestReconcileOneStrandedDeliveredChecksGuard:
         harness.scheduler.mark_done.assert_not_called()  # type: ignore[attr-defined]
         harness.scheduler.set_task_status.assert_not_called()  # type: ignore[attr-defined]
         assert result == 0
-        helper.assert_not_awaited()
+        helper.assert_awaited_once()
 
-    # --- main-sha empty string -> fail-safe (distinct from the raises path) --
+    # --- main_sha_unresolved must NOT revert, unlike 'failed' ---------------
 
-    async def test_main_sha_empty_is_fail_safe(self, harness: Harness):
-        """If get_main_sha() returns an empty/falsy string (rather than
-        raising), we still cannot resolve the ref the checks would run
-        against: the ``if not main_sha`` arm defers mark-done exactly like the
-        raises path — no mark, no revert, no helper call, retried next sweep.
+    async def test_main_sha_unresolved_does_not_revert_in_progress(
+        self, harness: Harness,
+    ):
+        """The fail-safe reasons are DISTINCT from 'failed' at this seam.
 
-        This pins the empty-string branch of the fail-safe, which is DISTINCT
-        from test_main_sha_unresolved_is_fail_safe (that covers get_main_sha()
-        *raising*). Without this, a regression dropping the ``if not main_sha``
-        guard would still pass CI."""
-        tid = '2794008'
+        'failed' is a definitive absence and drives revert-to-pending;
+        'main_sha_unresolved' makes no claim either way, so an in-progress
+        task must be left exactly as it is. Pinned separately so a refactor
+        that collapsed the two reasons into one branch — losing the
+        distinction 2794 established — fails here.
+        """
+        tid = '2794010'
         check = {'name': 'cap-z', 'kind': 'grep', 'pattern': 'Pat'}
         self._on_main_in_progress(
-            harness, tid, sha='deadbeef' + '8' * 32, main_sha='',
+            harness, tid, sha='deadbeef' + '0' * 32, main_sha='m0' * 20,
             metadata={'delivered_checks': [check]},
         )
-        helper = AsyncMock()
+        helper = self._gate(DeliveredChecksBlock(reason='main_sha_unresolved'))
 
         with patch(self._PATCH_TARGET, helper):
             result = await harness._reconcile_stranded_in_progress()
 
-        harness.scheduler.mark_done.assert_not_called()  # type: ignore[attr-defined]
         harness.scheduler.set_task_status.assert_not_called()  # type: ignore[attr-defined]
         assert result == 0
-        helper.assert_not_awaited()
 
     # --- row 6: FAILED, blocked -> leave untouched (blocked discipline) ------
 
@@ -3691,10 +4160,9 @@ class TestReconcileOneStrandedDeliveredChecksGuard:
             return_value='deadbeef' + 'f' * 32,
         )
         harness.git_ops.get_main_sha = AsyncMock(return_value=main_sha)  # type: ignore[attr-defined]
-        verdict = DeliveredChecksVerdict(
-            outcome='failed', main_sha=main_sha, failed_check=failing,
-        )
-        helper = AsyncMock(return_value=verdict)
+        helper = self._gate(DeliveredChecksBlock(
+            reason='failed', main_sha=main_sha, failed_check=failing,
+        ))
 
         with patch(self._PATCH_TARGET, helper):
             result = await harness._reconcile_stranded_in_progress()
@@ -3728,8 +4196,9 @@ class TestReconcileOneStrandedDeliveredChecksGuard:
             return_value='deadbeef' + '9' * 32,
         )
         harness.git_ops.get_main_sha = AsyncMock(return_value=main_sha)  # type: ignore[attr-defined]
-        verdict = DeliveredChecksVerdict(outcome='errored', main_sha=main_sha)
-        helper = AsyncMock(return_value=verdict)
+        helper = self._gate(DeliveredChecksBlock(
+            reason='errored', main_sha=main_sha,
+        ))
 
         with patch(self._PATCH_TARGET, helper):
             result = await harness._reconcile_stranded_in_progress()
@@ -3739,15 +4208,24 @@ class TestReconcileOneStrandedDeliveredChecksGuard:
         assert result == 0
         helper.assert_awaited_once()
 
-    # --- kill switch: enabled=False -> guard inert even on a FAILED verdict --
+    # --- kill switch: enabled=False -> FORWARDED, and inertly marks done ----
 
-    async def test_kill_switch_disabled_marks_done_and_skips_helper(
+    async def test_kill_switch_disabled_is_forwarded_and_marks_done(
         self, harness: Harness,
     ):
-        """config.delivered_checks.enabled=False turns the whole guard off:
-        even with a FAILED verdict staged, the task is STILL marked done and
-        the helper is never consulted — kill-switch parity with the
-        dependent-side dispatch gate's documented inertness."""
+        """config.delivered_checks.enabled=False turns the whole guard off,
+        and the task is STILL marked done.
+
+        Changed by 3057 step-19: the harness FORWARDS `enabled=False` rather
+        than short-circuiting on it. That is the point of single-sourcing —
+        the kill switch has exactly one implementation, so one hot reload
+        disarms all eleven attribution-shaped seams together instead of
+        eleven local checks drifting apart. The inert-when-disabled behaviour
+        itself is pinned at source in
+        test_delivered_check_gate.py::TestGateMarkDoneOnDeliveredChecks row 6,
+        which also asserts that neither get_main_sha nor the check runner is
+        awaited.
+        """
         tid = '2794007'
         sha = 'deadbeef' + '7' * 32
         failing = {'name': 'cap-k', 'kind': 'grep', 'pattern': 'KPat'}
@@ -3756,10 +4234,8 @@ class TestReconcileOneStrandedDeliveredChecksGuard:
             harness, tid, sha=sha, main_sha='mk' * 20,
             metadata={'delivered_checks': [failing]},
         )
-        verdict = DeliveredChecksVerdict(
-            outcome='failed', main_sha='mk' * 20, failed_check=failing,
-        )
-        helper = AsyncMock(return_value=verdict)
+        # The REAL helper is inert when disabled, so stage its inert answer.
+        helper = self._gate(None)
 
         with patch(self._PATCH_TARGET, helper):
             result = await harness._reconcile_stranded_in_progress()
@@ -3769,4 +4245,996 @@ class TestReconcileOneStrandedDeliveredChecksGuard:
             done_provenance={'kind': 'found_on_main', 'commit': sha, 'note': ANY},
         )
         assert result == 1
-        helper.assert_not_awaited()
+        helper.assert_awaited_once()
+        assert helper.await_args is not None
+        assert helper.await_args.kwargs['enabled'] is False
+
+
+# ---------------------------------------------------------------------------
+# Amendment (reviewer suggestion 5) — task 2794's WARNING CONTENT contract,
+# pinned against the REAL shared helper.
+#
+# The matrix above patches `gate_mark_done_on_delivered_checks` with a
+# stand-in that composes its own message, so its caplog-content assertions
+# pin the log= WIRING and nothing more. The operator-facing content contract
+# 2794 actually established — a stranded-arm withholding names the task, the
+# failed check, its pattern and the main SHA at WARNING on
+# 'orchestrator.harness' — therefore needs one row that runs the real
+# decision end to end. The ONLY thing faked here is the low-level check
+# runner (`verify_delivered_checks_on_main`), so main-SHA plumbing, the
+# verdict collapse, the log= hand-off and the message itself are all real.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestStrandedArmRealHelperWarningContent:
+    _VERIFY_TARGET = 'orchestrator.delivered_checks.verify_delivered_checks_on_main'
+
+    async def test_failed_withholding_warns_with_the_2794_content(
+        self, harness: Harness, caplog,
+    ):
+        tid = '2794100'
+        sha = 'deadbeef' + 'e' * 32
+        main_sha = 'mr' * 20
+        failing = {
+            'name': 'cap-real', 'kind': 'grep', 'pattern': 'RealPattern',
+            'expect': 'present',
+        }
+        guard = TestReconcileOneStrandedDeliveredChecksGuard()
+        guard._on_main_in_progress(
+            harness, tid, sha=sha, main_sha=main_sha,
+            metadata={'delivered_checks': [failing]},
+        )
+
+        verify = AsyncMock(return_value=DeliveredChecksVerdict(
+            outcome='failed', main_sha=main_sha, failed_check=failing,
+        ))
+        # NOTE: `gate_mark_done_on_delivered_checks` is deliberately NOT
+        # patched — this exercises the real decision.
+        with patch(self._VERIFY_TARGET, verify), \
+                caplog.at_level(logging.WARNING, logger='orchestrator.harness'):
+            result = await harness._reconcile_stranded_in_progress()
+
+        # Behaviour is the matrix's row 2, reached through the real helper.
+        harness.scheduler.mark_done.assert_not_called()  # type: ignore[attr-defined]
+        harness.scheduler.set_task_status.assert_awaited_once_with(  # type: ignore[attr-defined]
+            tid, 'pending',
+        )
+        assert result == 1
+
+        # ...and the real WARNING carries task 2794's operator-facing content
+        # on the harness logger. Deleting or hollowing any of these four
+        # fields in the shared helper's message now fails HERE.
+        assert tid in caplog.text
+        assert 'cap-real' in caplog.text
+        assert 'RealPattern' in caplog.text
+        assert main_sha in caplog.text
+        # The `site` label the guard was adopted with — how an operator tells
+        # WHICH seam withheld — is part of the same message.
+        assert 'reconcile-stranded-found-on-main' in caplog.text
+        assert any(
+            r.levelno == logging.WARNING and r.name == 'orchestrator.harness'
+            for r in caplog.records
+        ), 'the withholding must be operator-visible at WARNING, on the harness logger'
+
+    async def test_all_delivered_stamps_without_a_warning(
+        self, harness: Harness, caplog,
+    ):
+        """The mirror row: a satisfied verdict through the REAL helper stamps
+        as today and emits NO delivered-checks WARNING, so the assertions
+        above cannot be passing off unrelated log noise."""
+        tid = '2794101'
+        sha = 'deadbeef' + 'f' * 32
+        main_sha = 'ms' * 20
+        check = {
+            'name': 'cap-real', 'kind': 'grep', 'pattern': 'RealPattern',
+            'expect': 'present',
+        }
+        guard = TestReconcileOneStrandedDeliveredChecksGuard()
+        guard._on_main_in_progress(
+            harness, tid, sha=sha, main_sha=main_sha,
+            metadata={'delivered_checks': [check]},
+        )
+
+        verify = AsyncMock(return_value=DeliveredChecksVerdict(
+            outcome='all_delivered', main_sha=main_sha,
+        ))
+        with patch(self._VERIFY_TARGET, verify), \
+                caplog.at_level(logging.WARNING, logger='orchestrator.harness'):
+            result = await harness._reconcile_stranded_in_progress()
+
+        harness.scheduler.set_task_status.assert_awaited_once_with(  # type: ignore[attr-defined]
+            tid, 'done',
+            done_provenance={'kind': 'found_on_main', 'commit': sha, 'note': ANY},
+        )
+        assert result == 1
+        assert 'cap-real' not in caplog.text
+        assert 'Delivered-checks guard' not in caplog.text
+
+
+# ===========================================================================
+# Task 3057 step-23 (RED) — the withheld train member's recovery edge.
+#
+# All four delivered-checks train seams (harness `mark_member_done` /
+# `redrive_member`, workflow's inline `_mark_member_done` /
+# `_attribute_train_failure` solo-passer) originally withheld the done-flip by
+# RETURNING with the member's status untouched at 'merge-deferred', on the
+# documented promise that the stranded sweep would re-evaluate it.  That loop
+# does not exist.  'merge-deferred' is a status with NO recovery edge at all:
+#
+#   1. `_RECONCILE_SWEEP_STATUSES` excludes it, so the sweep never iterates it;
+#   2. `_reconcile_one_stranded` early-returns on it even if the sweep did;
+#   3. the train already advanced main, so the merge worker will not re-drive;
+#   4. `_WARM_LANE_RECLAIM_PROTECTED_STATUSES` contains it, so even its warm
+#      lane leaks (`release_lane_for_terminal_task` is on the skipped
+#      fall-through, and the member is not terminal).
+#
+# This class pins (1), (2) and (4) against the REAL imported constants — not
+# literals — so a future edit to either filter surfaces here, and pins that
+# the status the withhold path reverts to actually satisfies the
+# reclaim-eligibility PREDICATE rather than a hardcoded 'pending'.
+# ===========================================================================
+
+_WEDGE_TRAIN = 'train-wedge'
+_WEDGE_MID = '7001'
+_WEDGE_CHECK = {
+    'name': 'cap-x', 'kind': 'grep', 'pattern': 'SomePattern', 'expect': 'present',
+}
+
+
+class _RecordingScheduler:
+    """Scheduler double that HOLDS the member's status like the real one.
+
+    Deliberately not a MagicMock: the property under test is what the member's
+    status actually BECOMES, which an auto-mock cannot express.
+    """
+
+    def __init__(self, mid: str = _WEDGE_MID, status: str = 'merge-deferred') -> None:
+        self.mid = mid
+        self.status = status
+        self.marked_done: list[str] = []
+        self.clear_requeue_count = MagicMock()
+
+    async def get_statuses(self, ids):
+        return ({i: self.status for i in ids if i == self.mid}, None)
+
+    async def get_task(self, tid):
+        return {'id': tid, 'metadata': {'delivered_checks': [_WEDGE_CHECK]}}
+
+    async def mark_done(self, tid, **kwargs):
+        self.marked_done.append(tid)
+        self.status = 'done'
+
+    async def set_task_status(self, tid, status, **kwargs):
+        if tid == self.mid:
+            self.status = status
+
+
+def _wedge_config(tmp_path: Path) -> MagicMock:
+    from orchestrator.config import DeliveredChecksConfig
+
+    config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
+    config.project_root = tmp_path
+    config.delivered_checks = DeliveredChecksConfig(
+        enabled=True, check_timeout_secs=7.5,
+    )
+    return config
+
+
+async def _drive_withheld_flip(tmp_path: Path) -> _RecordingScheduler:
+    """Drive `mark_member_done` with a FAILED block; return the scheduler."""
+    from orchestrator.harness import build_train_callback_factory
+
+    sched = _RecordingScheduler()
+    git_ops = MagicMock()
+    git_ops.release_lane_for_terminal_task = AsyncMock()
+    cbs = build_train_callback_factory(
+        sched, git_ops, _wedge_config(tmp_path),
+    )(_WEDGE_TRAIN)
+
+    block = DeliveredChecksBlock(
+        reason='failed', main_sha='m' * 40, failed_check=_WEDGE_CHECK,
+    )
+    with patch(
+        'orchestrator.harness.gate_mark_done_on_delivered_checks',
+        AsyncMock(return_value=block),
+    ), patch('orchestrator.harness.MergeProvenance'):
+        await cbs.mark_member_done(_WEDGE_MID, 'deadbeefcafe')
+
+    assert sched.marked_done == [], 'the withholding must not stamp'
+    return sched
+
+
+class TestWithheldTrainMemberHasRecoveryEdge:
+    """'merge-deferred' is a permanent wedge — the withhold path must leave it."""
+
+    def test_merge_deferred_is_excluded_from_the_stranded_sweep(self) -> None:
+        """Filter (1): the sweep never even iterates a merge-deferred task."""
+        from orchestrator import harness as harness_mod
+
+        assert 'merge-deferred' not in harness_mod._RECONCILE_SWEEP_STATUSES, (
+            'if merge-deferred is ever swept, revisit the withhold recovery '
+            'edge — the sweep would then be a real second recovery path'
+        )
+
+    def test_merge_deferred_lane_is_protected_from_reclaim(self) -> None:
+        """Filter (4): the leaked warm lane cannot be reclaimed either."""
+        from orchestrator import harness as harness_mod
+
+        assert 'merge-deferred' in harness_mod._WARM_LANE_RECLAIM_PROTECTED_STATUSES
+
+    @pytest.mark.asyncio
+    async def test_reconcile_one_stranded_is_not_the_recovery_edge(
+        self, harness: Harness,
+    ) -> None:
+        """Filter (2): the early return is real, so the sweep cannot recover it.
+
+        Pinned HERE (not only in ``test_skips_merge_deferred_status``) because
+        the four train seams' recovery design depends on this specific fact.
+        """
+        result = await _reconcile_stranded(
+            harness, _WEDGE_MID, 'merge-deferred', mid_run=False,
+        )
+
+        assert result is None
+        harness.scheduler.mark_done.assert_not_called()  # type: ignore[attr-defined]
+        harness.scheduler.set_task_status.assert_not_called()  # type: ignore[attr-defined]
+
+    @pytest.mark.asyncio
+    async def test_withheld_member_leaves_merge_deferred(
+        self, tmp_path: Path,
+    ) -> None:
+        sched = await _drive_withheld_flip(tmp_path)
+
+        assert sched.status != 'merge-deferred', (
+            'a member left at merge-deferred has no recovery edge at all'
+        )
+
+    @pytest.mark.asyncio
+    async def test_withheld_status_satisfies_the_reclaim_predicate(
+        self, tmp_path: Path,
+    ) -> None:
+        """The PREDICATE, never the literal 'pending'.
+
+        ``_warm_lane_reclaim_candidates`` admits any status that is
+        non-terminal and not protected; asserting the predicate means the
+        lane-leak fix cannot regress if either status set is edited later.
+        """
+        from orchestrator import harness as harness_mod
+        from orchestrator.task_status import TERMINAL_STATUSES
+
+        sched = await _drive_withheld_flip(tmp_path)
+
+        assert sched.status not in TERMINAL_STATUSES, (
+            f'{sched.status!r} would make the member terminal-by-status'
+        )
+        assert sched.status not in harness_mod._WARM_LANE_RECLAIM_PROTECTED_STATUSES, (
+            f'{sched.status!r} would keep the warm lane leaked'
+        )
+
+    @pytest.mark.asyncio
+    async def test_withheld_members_lane_becomes_a_reclaim_candidate(
+        self, harness: Harness, tmp_path: Path,
+    ) -> None:
+        """End-to-end through the REAL reclaim-candidate provider."""
+        sched = await _drive_withheld_flip(tmp_path)
+        branch = f'task/{_WEDGE_MID}'
+        harness.scheduler.get_statuses = AsyncMock(  # type: ignore[attr-defined]
+            return_value=({branch: sched.status}, None),
+        )
+
+        admitted = await harness._warm_lane_reclaim_candidates([branch])
+
+        assert admitted == {branch}, (
+            f'status {sched.status!r} must un-leak the lane, got {admitted!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_withheld_status_matches_the_harness_hand_back_edge(
+        self, tmp_path: Path,
+    ) -> None:
+        """Same status the factory's OWN re-dispatch edge already uses.
+
+        ``redrive_member``'s not-on-main arm is the harness's established
+        "hand this member back to the scheduler" transition, and the scheduler
+        dispatches from exactly that status.  Comparing the two production
+        paths (rather than a literal) keeps them from drifting apart.
+        """
+        from orchestrator.harness import build_train_callback_factory
+
+        withheld = await _drive_withheld_flip(tmp_path)
+
+        hand_back = _RecordingScheduler()
+        cbs = build_train_callback_factory(
+            hand_back, MagicMock(), _wedge_config(tmp_path),
+        )(_WEDGE_TRAIN)
+        assert cbs.redrive_member is not None
+        await cbs.redrive_member(_WEDGE_MID, False, None)
+
+        assert withheld.status == hand_back.status, (
+            f'withhold reverts to {withheld.status!r} but the factory hands '
+            f'members back at {hand_back.status!r}'
+        )
+
+
+# ---------------------------------------------------------------------------
+# Task 3535 (beta), part 2 — the sweep summary that speaks even when nothing
+# moved.  Before this, the line was gated on `if reverted or marked_done or
+# stale_conflicts`, so a sweep in which EVERY candidate was vetoed emitted no
+# journal line at all: the strand was invisible from the logs alone.
+#
+# The report builders are imported from the sibling wiring module rather than
+# re-declared: two copies of "what does a pinned on-main strand look like"
+# would drift, and this suite asserts against the same shapes that one does.
+#
+# Task 3539 re-anchored the HELD shape those builders produce (sanctioned
+# fixture repair, esc-3539-1): a pinned, unclaimed IN_PROGRESS strand now
+# classifies CONVERT_TO_BLOCKED instead of holding silently forever, so the
+# still-held population these `held=` assertions need is `_pinned_hold` —
+# the same facts on a `blocked` task, which is also what 3539 converts the
+# in-progress row INTO.  The summary contract itself is unchanged.
+# ---------------------------------------------------------------------------
+
+from shared.deploy_state import DeployPhase  # noqa: E402
+from test_recovery_emission_wiring import (  # noqa: E402
+    _bind_reports,
+    _live_claimant,
+    _pinned_hold,
+    _ref,
+    _report,
+)
+
+from orchestrator.config import RecoveryEmissionConfig  # noqa: E402
+from orchestrator.task_ground_truth import BranchStateKind  # noqa: E402
+
+
+def _summary_lines(caplog) -> list[str]:
+    """Every reconcile summary line the sweep logged this pass."""
+    return [
+        r.getMessage() for r in caplog.records
+        if 'stranded task(s) reverted to pending' in r.getMessage()
+    ]
+
+
+@pytest.mark.asyncio
+class TestReconcileSweepSummaryAlwaysSpeaks:
+    @staticmethod
+    def _arm(harness):
+        harness.config.recovery_emission = RecoveryEmissionConfig()
+        harness.config.stranded_blocked_escalate_enabled = False
+
+    async def test_all_vetoed_sweep_still_logs_exactly_one_summary(
+        self, harness, caplog,
+    ):
+        """Today this sweep logs NOTHING — every candidate is held, so all
+        three legacy counters are zero and the line is gated away."""
+        TestReconcileSweepSummaryAlwaysSpeaks._arm(harness)
+        _bind_reports(harness, {
+            'T1': _pinned_hold(escalations=[_ref('esc-1')]),
+            'T2': _pinned_hold(escalations=[_ref('esc-2')]),
+        })
+
+        with caplog.at_level(logging.INFO, logger='orchestrator.harness'):
+            await harness._reconcile_stranded_in_progress(mid_run=False)
+
+        assert len(_summary_lines(caplog)) == 1
+
+    async def test_summary_names_the_held_count_and_the_pinning_ids(
+        self, harness, caplog,
+    ):
+        """The operator payoff: the first post-deploy sweep names each
+        currently-stranded task's pinning ids in the journal, with no
+        event-store query."""
+        TestReconcileSweepSummaryAlwaysSpeaks._arm(harness)
+        _bind_reports(harness, {
+            'T1': _pinned_hold(escalations=[_ref('esc-1')]),
+            'T2': _pinned_hold(escalations=[_ref('esc-2')]),
+        })
+
+        with caplog.at_level(logging.INFO, logger='orchestrator.harness'):
+            await harness._reconcile_stranded_in_progress(mid_run=False)
+
+        line = _summary_lines(caplog)[0]
+        # EXACT, not substring: a substring assertion here passes against a
+        # dataclass repr that merely CONTAINS the id, which is how the tally's
+        # id-flattening defect shipped once already (task 3535 S25).
+        assert 'held=2 (esc-1, esc-2)' in line
+
+    async def test_summary_breaks_the_left_count_down_by_reason(
+        self, harness, caplog,
+    ):
+        """A hold and a fall-through are different operator problems, so the
+        line must not merge them into one opaque count."""
+        TestReconcileSweepSummaryAlwaysSpeaks._arm(harness)
+        _bind_reports(harness, {
+            'T1': _pinned_hold(escalations=[_ref('esc-1')]),
+            'T2': _report(
+                branch=BranchStateKind.EXISTS_OFF_MAIN, sha=None,
+                deploy_phase=DeployPhase.FAILED,
+            ),
+        })
+
+        with caplog.at_level(logging.INFO, logger='orchestrator.harness'):
+            await harness._reconcile_stranded_in_progress(mid_run=False)
+
+        line = _summary_lines(caplog)[0]
+        assert 'held=1' in line
+        assert 'left=1' in line
+        assert 'deploy_phase_in_flight' in line
+
+    async def test_summary_counts_a_sweep_that_acted_on_an_unreadable_store(
+        self, harness, caplog,
+    ):
+        """The disposition went ahead UNCHANGED on incomplete information —
+        visible, but never a reason to have decided differently."""
+        TestReconcileSweepSummaryAlwaysSpeaks._arm(harness)
+        _bind_reports(harness, {
+            'T1': _report(
+                branch=BranchStateKind.EXISTS_OFF_MAIN, sha=None,
+                store_unavailable=True,
+            ),
+        })
+        harness._revert_in_progress_if_no_live_claimant = AsyncMock(
+            return_value='reverted',
+        )
+
+        with caplog.at_level(logging.INFO, logger='orchestrator.harness'):
+            result = await harness._reconcile_stranded_in_progress(mid_run=False)
+
+        assert result == 1, 'the revert still happened — nothing was held'
+        assert 'store-unavailable=1' in _summary_lines(caplog)[0]
+
+    async def test_mixed_sweep_keeps_the_three_legacy_counts_verbatim(
+        self, harness, caplog,
+    ):
+        """No regression to the existing wording: the new counters are
+        APPENDED, never a rewrite of what operators already grep for."""
+        TestReconcileSweepSummaryAlwaysSpeaks._arm(harness)
+        _bind_reports(harness, {
+            'T1': _pinned_hold(escalations=[_ref('esc-1')]),
+            'T2': _report(branch=BranchStateKind.EXISTS_OFF_MAIN, sha=None),
+        })
+        harness._revert_in_progress_if_no_live_claimant = AsyncMock(
+            return_value='reverted',
+        )
+
+        with caplog.at_level(logging.INFO, logger='orchestrator.harness'):
+            await harness._reconcile_stranded_in_progress(mid_run=False)
+
+        line = _summary_lines(caplog)[0]
+        assert '1 stranded task(s) reverted to pending' in line
+        assert '0 marked done (branch already on main)' in line
+        assert '0 held on provenance conflict (done_evidence_stale)' in line
+        assert 'held=1' in line
+
+    async def test_return_value_never_starts_counting_holds(self, harness):
+        """The driver's int is consumed to decide whether the main loop keeps
+        running; folding holds into it would make a fully-stuck fleet look
+        busy forever."""
+        TestReconcileSweepSummaryAlwaysSpeaks._arm(harness)
+        _bind_reports(harness, {
+            'T1': _pinned_hold(escalations=[_ref('esc-1')]),
+            'T2': _pinned_hold(escalations=[_ref('esc-2')]),
+            'T3': _report(branch=BranchStateKind.EXISTS_OFF_MAIN, sha=None),
+        })
+        harness._revert_in_progress_if_no_live_claimant = AsyncMock(
+            return_value='reverted',
+        )
+
+        assert await harness._reconcile_stranded_in_progress(mid_run=False) == 1
+
+    async def test_a_quiet_fleet_reports_zeroes_at_info_not_warning(
+        self, harness, caplog,
+    ):
+        """Nothing is stranded — every candidate is simply running.  A quiet
+        fleet must not read as an incident."""
+        TestReconcileSweepSummaryAlwaysSpeaks._arm(harness)
+        _bind_reports(harness, {'T1': _report(claimant=_live_claimant())})
+
+        with caplog.at_level(logging.INFO, logger='orchestrator.harness'):
+            await harness._reconcile_stranded_in_progress(mid_run=False)
+
+        lines = _summary_lines(caplog)
+        assert len(lines) == 1
+        assert 'held=0' in lines[0] and 'left=0' in lines[0]
+        assert [
+            r for r in caplog.records
+            if r.levelno >= logging.WARNING and 'held=' in r.getMessage()
+        ] == []
+
+
+# ---------------------------------------------------------------------------
+# task 3541 (eta) — the IN-PROGRESS APPLIER stops re-deriving resolver policy.
+#
+# E7 names this site: "the in-progress applier re-derives resolver policy in
+# guard order (INV-5)".  Its `if report.open_escalations: return None` is the
+# fifth hand-rolled `bool(open)` copy, and it now disagrees with the resolver —
+# `_shape` stopped counting an info record as a pin in step-4, but this guard
+# still holds the strand, so the revert boundary #8 asks for never happens.
+#
+# The surgical change is the PREDICATE only.  The rest of the tail STAYS, and
+# these tests pin why: the log-mode downgrade must still hold a pinned strand
+# (demand-1), and the R3 mid-run PLAN_LOCK exception is a fact `_shape`
+# structurally cannot express.
+# ---------------------------------------------------------------------------
+
+
+def _submit_open(
+    harness: Harness,
+    tmp_path: Path,
+    tid: str,
+    *,
+    severity: str = 'blocking',
+    category: str = 'task_failure',
+    level: int = 1,
+) -> Escalation:
+    """Bind a real queue and open ONE record on *tid*."""
+    queue = _bind_queue(harness, tmp_path / f'esc_{tid}')
+    esc = Escalation(
+        id=queue.make_id(tid),
+        task_id=tid,
+        agent_role='steward',
+        severity=severity,
+        category=category,
+        summary=f'{severity} {category} on {tid}',
+        level=level,
+        status='pending',
+    )
+    queue.submit(esc)
+    return esc
+
+
+def _off_main_in_progress(harness: Harness, tid: str) -> None:
+    """Wire *tid* as a stranded in-progress task whose branch is EXISTS_OFF_MAIN."""
+    harness.scheduler.get_statuses.return_value = ({tid: 'in-progress'}, None)  # type: ignore[attr-defined]
+    harness.git_ops.is_ancestor = AsyncMock(return_value=False)
+    harness.git_ops.resolve_branch_sha = AsyncMock(return_value='b' * 40)
+    harness.git_ops.find_merge_marker = AsyncMock(return_value=None)
+
+
+def _off_main_blocked(harness: Harness, tid: str) -> None:
+    """Wire *tid* as a stranded BLOCKED task whose branch is EXISTS_OFF_MAIN."""
+    _off_main_in_progress(harness, tid)
+    harness.scheduler.get_statuses.return_value = ({tid: 'blocked'}, None)  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+class TestInProgressApplierConsumesTheSharedPredicate:
+    """The applier's veto becomes the resolver's own answer (INV-5)."""
+
+    async def test_log_mode_downgraded_pin_still_holds(
+        self, harness: Harness, tmp_path: Path,
+    ):
+        """DEMAND-1 REGRESSION GUARD — the case a naive deletion would break.
+
+        Under `convert_to_blocked_enforce=False` (the production default) a
+        CONVERT row is downgraded to LEAVE and falls all the way through to
+        this tail.  If the guard simply went away, the strand would be reverted
+        underneath its responder — precisely the violation conversion exists to
+        prevent.  The rewired predicate folds `downgraded_reason` in for this
+        reason, so the hold survives the rewiring.
+        """
+        harness.config.convert_to_blocked_enforce = False
+        _off_main_in_progress(harness, '3541')
+        _submit_open(harness, tmp_path, '3541')
+
+        result = await _reconcile_stranded(
+            harness, '3541', 'in-progress', mid_run=False,
+        )
+
+        assert result is None
+        harness.scheduler.set_task_status.assert_not_called()  # type: ignore[attr-defined]
+
+    async def test_info_only_strand_is_reverted_to_pending(
+        self, harness: Harness, tmp_path: Path,
+    ):
+        """PRD boundary #8, END TO END through the applier.
+
+        Step-4's resolver change is what delivers this one: `_shape` keys row
+        (c), and the explicit `action == REVERT_TO_PENDING` arm returns BEFORE
+        the guard tail, so the tail's own `bool(open_escalations)` copy never
+        sees it.  Pinned here anyway, because the tail is what step-6 edits and
+        nothing else asserts that the two cannot start disagreeing about this
+        shape.
+        """
+        _off_main_in_progress(harness, '3542')
+        _submit_open(harness, tmp_path, '3542', severity='info', level=0)
+
+        result = await _reconcile_stranded(
+            harness, '3542', 'in-progress', mid_run=False,
+        )
+
+        assert result == 'reverted'
+        harness.scheduler.set_task_status.assert_awaited_once_with('3542', 'pending')  # type: ignore[attr-defined]
+
+    async def test_dead_l0_strand_is_still_held(
+        self, harness: Harness, tmp_path: Path,
+    ):
+        """A dead-filer L0 keys the CONVERT rows, so log mode holds it.
+
+        `records_pin_recovery` alone would call this unpinned — the hold comes
+        from `downgraded_reason`, which is exactly why that disjunct is not
+        redundant.
+        """
+        harness.config.convert_to_blocked_enforce = False
+        _off_main_in_progress(harness, '3543')
+        _submit_open(harness, tmp_path, '3543', level=0)
+
+        result = await _reconcile_stranded(
+            harness, '3543', 'in-progress', mid_run=False,
+        )
+
+        assert result is None
+        harness.scheduler.set_task_status.assert_not_called()  # type: ignore[attr-defined]
+
+    async def test_pinned_hold_emits_exactly_one_recovery_row(
+        self, harness: Harness, tmp_path: Path,
+    ):
+        """The chokepoint owns the emission; the tail must not double it."""
+        harness.config.convert_to_blocked_enforce = False
+        _off_main_in_progress(harness, '3544')
+        _submit_open(harness, tmp_path, '3544')
+
+        with _spy_dispositions(harness) as spy:
+            await _reconcile_stranded(harness, '3544', 'in-progress')
+
+        assert spy.call_count == 1, (
+            'the tail arm is belt-and-braces for a future refactor, not a '
+            'second live emission path'
+        )
+
+
+@pytest.mark.asyncio
+class TestMidRunPlanLockExceptionSurvives:
+    """R3: a fact `_shape` structurally cannot express, so the tail keeps it.
+
+    A plan.lock's `owner_pid` is usually the harness's OWN pid, so a live lock
+    proves nothing mid-run — while `_shape` sees only `live_claimant is not
+    None`.  Deleting the applier tail wholesale would drop this recovery path.
+    """
+
+    @staticmethod
+    def _stage_live_plan_lock(harness: Harness, tid: str) -> None:
+        worktree = harness.git_ops.worktree_base / tid
+        worktree.mkdir(parents=True, exist_ok=True)
+        lock_dir = _resolver_lock_dir(worktree, tid)
+        lock_dir.mkdir(parents=True, exist_ok=True)
+        (lock_dir / 'plan.lock').write_text(json.dumps({
+            'session_id': f'{tid}-x',
+            'locked_at': datetime.now(UTC).isoformat(),
+            'owner_pid': os.getpid(),
+        }))
+
+    async def test_mid_run_plan_lock_claimant_with_no_records_reverts(
+        self, harness: Harness, tmp_path: Path,
+    ):
+        _bind_queue(harness, tmp_path / 'esc_r3_empty')
+        _off_main_in_progress(harness, '3545')
+        self._stage_live_plan_lock(harness, '3545')
+
+        result = await _reconcile_stranded(
+            harness, '3545', 'in-progress', mid_run=True,
+        )
+
+        assert result == 'reverted'
+        harness.scheduler.set_task_status.assert_awaited_once_with('3545', 'pending')  # type: ignore[attr-defined]
+
+    async def test_mid_run_plan_lock_claimant_with_a_pinning_record_holds(
+        self, harness: Harness, tmp_path: Path,
+    ):
+        _off_main_in_progress(harness, '3546')
+        _submit_open(harness, tmp_path, '3546')
+        self._stage_live_plan_lock(harness, '3546')
+
+        result = await _reconcile_stranded(
+            harness, '3546', 'in-progress', mid_run=True,
+        )
+
+        assert result is None
+        harness.scheduler.set_task_status.assert_not_called()  # type: ignore[attr-defined]
+
+    async def test_mid_run_plan_lock_claimant_with_an_info_record_reverts(
+        self, harness: Harness, tmp_path: Path,
+    ):
+        """THE reachable disposition the tail's predicate actually decides.
+
+        A live claimant sends the report to the table's LEAVE default, so this
+        shape reaches the guard tail with a non-empty `open_escalations` — the
+        one live route that does.  Today the tail's `bool(open_escalations)`
+        copy holds it, which pins a strand on an ANNOTATION and silently
+        overrides the R3 mid-run PLAN_LOCK recovery path.  With the shared
+        predicate the record does not pin, and R3 recovers the strand exactly
+        as it does when no record is open at all.
+        """
+        _off_main_in_progress(harness, '3547')
+        _submit_open(harness, tmp_path, '3547', severity='info', level=0)
+        self._stage_live_plan_lock(harness, '3547')
+
+        result = await _reconcile_stranded(
+            harness, '3547', 'in-progress', mid_run=True,
+        )
+
+        assert result == 'reverted'
+        harness.scheduler.set_task_status.assert_awaited_once_with('3547', 'pending')  # type: ignore[attr-defined]
+
+    async def test_mid_run_plan_lock_claimant_with_a_dead_l0_still_holds(
+        self, harness: Harness, tmp_path: Path,
+    ):
+        """Fail-safe: a plan.lock with no run_id resolves an UNKNOWN identity.
+
+        `classify_pins` may only convert an L0 when it can PROVE the filing
+        incarnation dead.  It cannot here — neither side carries a composed
+        identity — so the record stays a QUEUE_HANDOFF and the hold survives.
+        """
+        _off_main_in_progress(harness, '3548')
+        _submit_open(harness, tmp_path, '3548', level=0)
+        self._stage_live_plan_lock(harness, '3548')
+
+        result = await _reconcile_stranded(
+            harness, '3548', 'in-progress', mid_run=True,
+        )
+
+        assert result is None
+        harness.scheduler.set_task_status.assert_not_called()  # type: ignore[attr-defined]
+
+
+# ---------------------------------------------------------------------------
+# REVIEW FINDING 1 — the dedup guard must stop swallowing a re-file the
+# rewired resolver legitimately ORDERS, and must never hold silently.
+#
+# Task eta made `_shape`'s escalation element pin-class-aware, so an info-only
+# strand now keys `vetoes_done_flip=False`, hits `_RECOVERY` row (g) and the
+# table returns RE_FILE_ESCALATION (pre-eta it keyed True and fell to the LEAVE
+# default).  The applier's `if report.open_escalations:` then counts that same
+# info record and returns None: nothing pins the task, nothing re-files, and
+# because the chokepoint only emits for LEAVE the disposition is never
+# described either — an unowned, unreported hold.
+#
+# Spec §7.6 ("orphaned parks get re-owned ... instead of leaving a permanently
+# silent hold") and §7.3 ("every veto/LEAVE emits ... never a bare
+# `return None`").
+# ---------------------------------------------------------------------------
+
+
+def _gone_no_marker_blocked(harness: Harness, tid: str) -> None:
+    """Wire *tid* as a stranded BLOCKED task whose branch is GONE_NO_MARKER."""
+    harness.scheduler.get_statuses.return_value = ({tid: 'blocked'}, None)  # type: ignore[attr-defined]
+    harness.git_ops.is_ancestor = AsyncMock(return_value=False)
+    harness.git_ops.resolve_branch_sha = AsyncMock(return_value=None)
+    harness.git_ops.find_merge_marker = AsyncMock(return_value=None)
+
+
+def _pending_ids(harness: Harness, tid: str) -> list[tuple[str, int, str]]:
+    rows = harness._escalation_queue.get_by_task(tid, status='pending')  # type: ignore[union-attr]
+    return sorted((e.id, e.level, e.category) for e in rows)
+
+
+@pytest.mark.asyncio
+class TestDedupGuardDoesNotSwallowAnOrderedReFile:
+    """The regression cell the suite lacked: row (g) reached past an annotation."""
+
+    async def test_an_info_only_blocked_strand_is_re_filed(
+        self, harness: Harness, tmp_path: Path,
+    ):
+        """Row (g) ORDERED a re-file; the dedup must not veto it.
+
+        An info annotation has no consumer, so there is no handoff for the
+        fresh L1 to duplicate — which is the only thing this guard exists to
+        prevent.
+        """
+        harness.config.stranded_blocked_escalate_enabled = True
+        _gone_no_marker_blocked(harness, '7')
+        probe = _submit_open(
+            harness, tmp_path, '7',
+            severity='info', category='design_concern', level=0,
+        )
+
+        await _reconcile_stranded(harness, '7', 'blocked')
+
+        after = _pending_ids(harness, '7')
+        assert (probe.id, 0, 'design_concern') in after, 'the annotation is untouched'
+        assert any(
+            level == 1 and category == 'stranded_blocked' for _, level, category in after
+        ), f'row (g) ordered a re-file and nothing filed one: {after}'
+
+    async def test_a_pinning_l1_still_dedups_and_now_speaks(
+        self, harness: Harness, tmp_path: Path,
+    ):
+        """When the guard DOES fire, the hold must be DESCRIBED (spec §7.3).
+
+        The chokepoint above cannot cover this one: `action` here is
+        RE_FILE_ESCALATION, not LEAVE, so a bare `return None` leaves an
+        operator with no row at all for a task the sweep decided to hold.
+        """
+        harness.config.stranded_blocked_escalate_enabled = True
+        _off_main_blocked(harness, '8')
+        seeded = _submit_open(
+            harness, tmp_path, '8', category='stranded_blocked', level=1,
+        )
+
+        tally = RecoverySweepTally()
+        with patch(
+            'orchestrator.harness.detect_verified_green', AsyncMock(return_value=None),
+        ), _spy_dispositions(harness) as spy:
+            result = await _reconcile_stranded(harness, '8', 'blocked', tally=tally)
+
+        assert result is None
+        assert _pending_ids(harness, '8') == [
+            (seeded.id, 1, 'stranded_blocked'),
+        ], 'must not stack a second stranded_blocked L1'
+        assert spy.call_count == 1, (
+            'the hold must be emitted exactly once — never a bare return None, '
+            'and never doubled by the tail arm'
+        )
+        from orchestrator.recovery_emission import LeaveReason
+
+        assert spy.call_args.kwargs['reason'] == LeaveReason.escalation_pinned
+        # esc-3541-7: the hold must be CHARGED to the pass's tally, not only
+        # to the tracker.  `_release_recovery_veto_streaks` pops every tracked
+        # task absent from `observed_task_ids`, so a tally-less emission is
+        # un-charged in the same sweep — the streak detector never climbs and
+        # a prior streak alarm flaps.
+        assert spy.call_args.kwargs['tally'] is tally
+        assert '8' in tally.observed_task_ids
+        assert tally.held == 1
+
+    async def test_a_dead_filer_l0_still_dedups_and_speaks(
+        self, harness: Harness, tmp_path: Path,
+    ):
+        """A dead L0 is not a PIN but IS a record with an owner-to-be.
+
+        Part 4 of this task promotes it to L1, so a second L1 filed now would
+        be exactly the duplicate this guard prevents.  Asserted so the
+        dead-L0 dedup is a checked decision rather than a side effect of
+        whichever predicate the site happened to call.
+        """
+        harness.config.stranded_blocked_escalate_enabled = True
+        _off_main_blocked(harness, '9')
+        seeded = _submit_open(
+            harness, tmp_path, '9', category='stranded_blocked', level=0,
+        )
+
+        with patch(
+            'orchestrator.harness.detect_verified_green', AsyncMock(return_value=None),
+        ), _spy_dispositions(harness) as spy:
+            result = await _reconcile_stranded(harness, '9', 'blocked')
+
+        assert result is None
+        assert _pending_ids(harness, '9') == [(seeded.id, 0, 'stranded_blocked')]
+        assert spy.call_count == 1
+
+
+# ---------------------------------------------------------------------------
+# Task 4623 — a claimant stale past the TTL no longer vetoes row (g).
+#
+# The resolver's liveness read is status-agnostic
+# (docs/prds/claimant-invariant-enforcement.md D4 / C4-E6), so the next
+# reconcile sweep re-files a stranded blocked row that a crash left claimed.
+# ---------------------------------------------------------------------------
+
+
+def _claimed_blocked_row(*, heartbeat_age: timedelta) -> dict:
+    """A blocked row still carrying a claimant last heard from *heartbeat_age* ago.
+
+    Wall-clock relative: the harness builds its resolver with the real clock
+    and the shared default TTL.
+    """
+    return {
+        'status': 'blocked',
+        'metadata': {},
+        'claimant_run_id': 'run-dead/sess-dead/pid=1',
+        'heartbeat_at': (datetime.now(UTC) - heartbeat_age).isoformat(),
+    }
+
+
+@pytest.mark.asyncio
+class TestStaleClaimantBlockedStrandIsReFiled:
+
+    async def _sweep_claimed_blocked(
+        self, harness: Harness, tmp_path: Path, *, heartbeat_age: timedelta,
+    ) -> tuple[EscalationQueue, AsyncMock]:
+        """Reconcile one claimed GONE_NO_MARKER blocked row into a real queue.
+
+        Returns the bound queue and the ``set_task_status`` mock every status
+        flip routes through, for asserting that nothing was re-pended.
+        """
+        harness.config.stranded_blocked_escalate_enabled = True
+        _gone_no_marker_blocked(harness, '4623')
+        queue = _bind_queue(harness, tmp_path / 'esc')
+        harness.scheduler.get_task = AsyncMock(
+            return_value=_claimed_blocked_row(heartbeat_age=heartbeat_age),
+        )
+        set_task_status = AsyncMock()
+        harness.scheduler.set_task_status = set_task_status
+
+        await _reconcile_stranded(harness, '4623', 'blocked')
+
+        return queue, set_task_status
+
+    async def test_stale_claimant_blocked_strand_gets_one_reaper_l1(
+        self, harness: Harness, tmp_path: Path,
+    ):
+        queue, set_task_status = await self._sweep_claimed_blocked(
+            harness, tmp_path, heartbeat_age=timedelta(hours=12),
+        )
+
+        set_task_status.assert_not_called()
+        filed = [
+            (e.level, e.category, e.agent_role) for e in _pending(queue, '4623')
+        ]
+        assert filed == [(1, 'stranded_blocked', 'harness-stranded-blocked-reaper')]
+
+    async def test_fresh_claimant_blocked_strand_files_nothing(
+        self, harness: Harness, tmp_path: Path,
+    ):
+        queue, set_task_status = await self._sweep_claimed_blocked(
+            harness, tmp_path, heartbeat_age=timedelta(minutes=1),
+        )
+
+        set_task_status.assert_not_called()
+        assert _pending(queue, '4623') == []
+
+
+@pytest.mark.asyncio
+class TestReconcileStrandedStartupIsolation:
+    """At startup a supplied collector isolates each task; mid-run callers pass none."""
+
+    @staticmethod
+    def _fail_revert_of(harness: Harness, failing_tid: str) -> AsyncMock:
+        async def set_task_status(tid, status, **kwargs):
+            if tid == failing_tid:
+                raise RuntimeError('boom')
+
+        set_status = AsyncMock(side_effect=set_task_status)
+        harness.scheduler.set_task_status = set_status
+        harness.scheduler.get_statuses = AsyncMock(
+            return_value=({'15': 'in-progress', '16': 'in-progress'}, None),
+        )
+        return set_status
+
+    async def test_one_failing_task_is_recorded_and_the_sweep_continues(
+        self, harness: Harness,
+    ):
+        set_status = self._fail_revert_of(harness, '15')
+        failures = EntryFailures('Reconcile')
+
+        await harness._reconcile_stranded_in_progress(failures=failures)
+
+        set_status.assert_any_await('16', 'pending')
+        assert [f.entry for f in failures.failures] == ['15']
+
+    async def test_rejection_with_collector_still_escalates_and_is_not_an_entry_failure(
+        self, harness: Harness, tmp_path: Path,
+    ):
+        from orchestrator.scheduler import DoneGateRejection
+
+        queue = _bind_queue(harness, tmp_path / 'escalations')
+        harness.git_ops.is_ancestor = AsyncMock(return_value=True)
+        harness.scheduler.get_statuses = AsyncMock(
+            return_value=({'200': 'in-progress'}, None),
+        )
+
+        async def always_reject(tid, *, kind, sha, note=None):
+            raise DoneGateRejection(
+                task_id=tid, missing_files=['x.py'],
+                raw='done_gate_missing_files — metadata.files lists missing paths',
+            )
+
+        harness.scheduler.mark_done = AsyncMock(side_effect=always_reject)
+        failures = EntryFailures('Reconcile')
+
+        await harness._reconcile_stranded_in_progress(failures=failures)
+
+        [esc] = queue.get_by_task('200', status='pending')
+        assert esc.category == 'reconcile_persistent_rejection'
+        assert failures.failures == ()
+
+    async def test_startup_entry_point_returns_the_populated_collector(
+        self, harness: Harness,
+    ):
+        set_status = self._fail_revert_of(harness, '15')
+
+        failures = await harness._reconcile_stranded_at_startup()
+
+        assert isinstance(failures, EntryFailures)
+        assert [f.entry for f in failures.failures] == ['15']
+        set_status.assert_any_await('16', 'pending')

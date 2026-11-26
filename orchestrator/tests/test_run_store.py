@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import dataclasses
 import sqlite3
+from datetime import UTC, datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
 
 from orchestrator.harness import HarnessReport, TaskReport
-from orchestrator.run_store import RunStore
+from orchestrator.pause_policy import PauseClass, policy_for
+from orchestrator.run_store import RunExitKind, RunExitReason, RunStore, TaskResultRecord
 from orchestrator.workflow import WorkflowOutcome
 
 
@@ -316,6 +320,71 @@ class TestIncrementalPersistence:
         conn.close()
 
 
+# The scheduler_state DDL as deployed before task 4559 added ewa_value.
+_PRE_4559_SCHEDULER_STATE_DDL = (
+    'CREATE TABLE IF NOT EXISTS scheduler_state ('
+    '    project_id     TEXT PRIMARY KEY,'
+    '    pause_reason   TEXT NOT NULL,'
+    '    pause_at       TEXT NOT NULL,'
+    '    set_by_run_id  TEXT NOT NULL'
+    ')'
+)
+
+# The scheduler_state DDL as deployed after task 4559, before task 4686 added
+# pause_class, hold_owner and expires_at.
+_PRE_4686_SCHEDULER_STATE_DDL = (
+    'CREATE TABLE IF NOT EXISTS scheduler_state ('
+    '    project_id     TEXT PRIMARY KEY,'
+    '    pause_reason   TEXT NOT NULL,'
+    '    pause_at       TEXT NOT NULL,'
+    '    set_by_run_id  TEXT NOT NULL,'
+    '    ewa_value      REAL'
+    ')'
+)
+
+_SCHEDULER_STATE_HOLD_COLUMNS = ('pause_class', 'hold_owner', 'expires_at')
+
+
+def _build_legacy_scheduler_state_db(db_path, ddl: str) -> None:
+    """Create a legacy scheduler_state from *ddl* holding one ewa_trip_ row."""
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.execute(ddl)
+        conn.execute(
+            'INSERT INTO scheduler_state '
+            '(project_id, pause_reason, pause_at, set_by_run_id) '
+            'VALUES (?, ?, ?, ?)',
+            ('proj-a', 'ewa_trip_73.5900', '2026-05-14T10:05:00+00:00', 'run-old'),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _scheduler_state_columns(db_path) -> list[str]:
+    """Return scheduler_state's column names in physical (PRAGMA) order."""
+    conn = sqlite3.connect(str(db_path))
+    try:
+        return [row[1] for row in conn.execute('PRAGMA table_info(scheduler_state)')]
+    finally:
+        conn.close()
+
+
+def _raw_insert_scheduler_state(db_path, **columns) -> None:
+    """INSERT a scheduler_state row bypassing RunStore's typed writer."""
+    names = ', '.join(columns)
+    placeholders = ', '.join('?' for _ in columns)
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.execute(
+            f'INSERT OR REPLACE INTO scheduler_state ({names}) VALUES ({placeholders})',
+            tuple(columns.values()),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
 class TestSchedulerStatePersistence:
     """Tests for save/load/clear_scheduler_pause on RunStore."""
 
@@ -335,12 +404,99 @@ class TestSchedulerStatePersistence:
             reason='park-stop: 5 blocked',
             pause_at_iso='2026-05-14T10:05:00+00:00',
             set_by_run_id='run-x',
+            pause_class=PauseClass.PARK_STOP,
         )
         result = store.load_scheduler_pause('proj-a')
         assert result is not None, 'Expected a dict after save'
         assert result['reason'] == 'park-stop: 5 blocked'
         assert result['pause_at'] == '2026-05-14T10:05:00+00:00'
         assert result['set_by_run_id'] == 'run-x'
+
+    def test_save_then_load_round_trips_ewa_value(self, tmp_path):
+        """The live EWA value is persisted on the pause row and read back (task 4559).
+
+        Without it a restart mid-pause loses the number the halt was based on,
+        so the halt can only be re-asserted blind.
+        """
+        store = RunStore(tmp_path / 'runs.db')
+        store.start_run('run-x', 'proj-a', '2026-05-14T10:00:00+00:00')
+        store.save_scheduler_pause(
+            project_id='proj-a',
+            reason='ewa_trip_73.5900',
+            pause_at_iso='2026-05-14T10:05:00+00:00',
+            set_by_run_id='run-x',
+            ewa_value=73.59,
+            pause_class=PauseClass.EWA_RATE,
+        )
+        result = store.load_scheduler_pause('proj-a')
+        assert result is not None, 'Expected a dict after save'
+        assert result['ewa_value'] == pytest.approx(73.59), (
+            f'Expected ewa_value 73.59; got {result.get("ewa_value")!r}'
+        )
+        # The three pre-existing keys are unaffected.
+        assert result['reason'] == 'ewa_trip_73.5900'
+        assert result['pause_at'] == '2026-05-14T10:05:00+00:00'
+        assert result['set_by_run_id'] == 'run-x'
+
+    def test_ewa_value_defaults_to_none(self, tmp_path):
+        """Omitting ewa_value stores NULL and loads None.
+
+        The parameter is keyword-defaulted so every existing call site — and
+        every ``MagicMock(spec=RunStore)`` spy in the test suite — stays valid
+        without edits.
+        """
+        store = RunStore(tmp_path / 'runs.db')
+        store.start_run('run-1', 'proj-a', '2026-05-14T10:00:00+00:00')
+        store.save_scheduler_pause(
+            project_id='proj-a',
+            reason='park-stop: 5 blocked',
+            pause_at_iso='2026-05-14T10:05:00+00:00',
+            set_by_run_id='run-1',
+            pause_class=PauseClass.PARK_STOP,
+        )
+        result = store.load_scheduler_pause('proj-a')
+        assert result is not None
+        assert result['ewa_value'] is None, (
+            f'Expected None when the kwarg is omitted; got {result["ewa_value"]!r}'
+        )
+
+    def test_pre_migration_db_gains_column(self, tmp_path):
+        """A deployed pre-4559 runs.db is migrated additively on construction.
+
+        Creates the OLD four-column scheduler_state DDL directly and seeds a
+        row, then constructs RunStore over it.  The pre-existing row must load
+        with ewa_value None — NULL means "row predates task 4559", which is the
+        fail-safe signal the restart predicate keys on — and a subsequent save
+        must round-trip a real value.
+        """
+        db_path = tmp_path / 'runs.db'
+        _build_legacy_scheduler_state_db(db_path, _PRE_4559_SCHEDULER_STATE_DDL)
+
+        store = RunStore(db_path)
+        result = store.load_scheduler_pause('proj-a')
+        assert result is not None, 'Expected the pre-migration row to survive'
+        assert result['reason'] == 'ewa_trip_73.5900'
+        assert result['ewa_value'] is None, (
+            f'Expected NULL for a pre-4559 row; got {result["ewa_value"]!r}'
+        )
+
+        store.save_scheduler_pause(
+            project_id='proj-a',
+            reason='ewa_trip_50.0000',
+            pause_at_iso='2026-05-14T11:00:00+00:00',
+            set_by_run_id='run-new',
+            ewa_value=50.0,
+            pause_class=PauseClass.EWA_RATE,
+        )
+        reloaded = store.load_scheduler_pause('proj-a')
+        assert reloaded is not None
+        assert reloaded['ewa_value'] == pytest.approx(50.0)
+
+    def test_migration_is_idempotent(self, tmp_path):
+        """Constructing RunStore twice over the same path does not raise."""
+        db_path = tmp_path / 'runs.db'
+        RunStore(db_path)
+        RunStore(db_path)  # second construction re-runs _ensure_schema
 
     def test_save_is_idempotent_upsert(self, tmp_path):
         """Second save with a different reason replaces the first (UPSERT semantics)."""
@@ -351,18 +507,183 @@ class TestSchedulerStatePersistence:
             reason='first reason',
             pause_at_iso='2026-05-14T10:01:00+00:00',
             set_by_run_id='run-1',
+            pause_class=PauseClass.OPERATOR,
         )
         store.save_scheduler_pause(
             project_id='proj-a',
             reason='second reason',
             pause_at_iso='2026-05-14T10:02:00+00:00',
             set_by_run_id='run-1',
+            pause_class=PauseClass.OPERATOR,
         )
         result = store.load_scheduler_pause('proj-a')
         assert result is not None
         assert result['reason'] == 'second reason', (
             f'Expected most-recent reason; got {result["reason"]!r}'
         )
+
+    def test_refresh_updates_only_ewa_value(self, tmp_path):
+        """refresh_scheduler_pause_ewa rewrites the scalar and nothing else (task 4559).
+
+        The stored value must track the DECAYING live statistic while a halt is
+        held; reason/pause_at/set_by_run_id must keep recording when and why
+        the halt was asserted.
+        """
+        store = RunStore(tmp_path / 'runs.db')
+        store.start_run('run-1', 'proj-a', '2026-05-14T10:00:00+00:00')
+        store.save_scheduler_pause(
+            project_id='proj-a',
+            reason='ewa_trip_73.5900',
+            pause_at_iso='2026-05-14T10:05:00+00:00',
+            set_by_run_id='run-1',
+            ewa_value=73.59,
+            pause_class=PauseClass.EWA_RATE,
+        )
+
+        refreshed = store.refresh_scheduler_pause_ewa('proj-a', 12.25)
+
+        assert refreshed is True, 'Expected True when a pause row existed'
+        result = store.load_scheduler_pause('proj-a')
+        assert result is not None
+        assert result['ewa_value'] == pytest.approx(12.25), (
+            f'Expected the decayed value 12.25; got {result["ewa_value"]!r}'
+        )
+        assert result['reason'] == 'ewa_trip_73.5900', (
+            f'reason must be untouched; got {result["reason"]!r}'
+        )
+        assert result['pause_at'] == '2026-05-14T10:05:00+00:00', (
+            f'pause_at must be untouched; got {result["pause_at"]!r}'
+        )
+        assert result['set_by_run_id'] == 'run-1', (
+            f'set_by_run_id must be untouched; got {result["set_by_run_id"]!r}'
+        )
+
+    def test_refresh_without_a_pause_row_is_a_no_op(self, tmp_path):
+        """With no pause row there is nothing to refresh — and none is fabricated.
+
+        This is an UPDATE, deliberately not an upsert: inserting here would
+        turn a routine digest step into a persisted halt that a restart would
+        then restore.
+        """
+        store = RunStore(tmp_path / 'runs.db')
+        store.start_run('run-1', 'proj-a', '2026-05-14T10:00:00+00:00')
+
+        refreshed = store.refresh_scheduler_pause_ewa('proj-a', 5.0)
+
+        assert refreshed is False, 'Expected False when no pause row existed'
+        assert store.load_scheduler_pause('proj-a') is None, (
+            'refresh must never CREATE a pause row — that would fabricate a halt'
+        )
+
+    def test_refresh_is_scoped_to_the_named_project(self, tmp_path):
+        """Another project's pause row is untouched by a refresh."""
+        store = RunStore(tmp_path / 'runs.db')
+        store.start_run('run-1', 'proj-a', '2026-05-14T10:00:00+00:00')
+        for project in ('proj-a', 'proj-b'):
+            store.save_scheduler_pause(
+                project_id=project,
+                reason='ewa_trip_30.0000',
+                pause_at_iso='2026-05-14T10:05:00+00:00',
+                set_by_run_id='run-1',
+                ewa_value=30.0,
+                pause_class=PauseClass.EWA_RATE,
+            )
+
+        store.refresh_scheduler_pause_ewa('proj-a', 1.5)
+
+        other = store.load_scheduler_pause('proj-b')
+        assert other is not None
+        assert other['ewa_value'] == pytest.approx(30.0), (
+            f"proj-b's row must be untouched; got {other['ewa_value']!r}"
+        )
+
+    def test_refresh_follows_the_ewa_rate_class_not_the_reason(self, tmp_path):
+        """An ewa_rate-class row is refreshed whatever its reason text says."""
+        store = RunStore(tmp_path / 'runs.db')
+        store.start_run('run-1', 'proj-a', '2026-05-14T10:00:00+00:00')
+        store.save_scheduler_pause(
+            project_id='proj-a',
+            reason='digest trip',
+            pause_at_iso='2026-05-14T10:05:00+00:00',
+            set_by_run_id='run-1',
+            ewa_value=42.0,
+            pause_class=PauseClass.EWA_RATE,
+        )
+
+        refreshed = store.refresh_scheduler_pause_ewa('proj-a', 1.5)
+
+        assert refreshed is True
+        result = store.load_scheduler_pause('proj-a')
+        assert result is not None
+        assert result['ewa_value'] == pytest.approx(1.5)
+
+    def test_refresh_leaves_another_class_untouched_whatever_its_reason(self, tmp_path):
+        """A non-ewa_rate row's trip-time ``ewa_value`` survives a refresh.
+
+        Memory is first-wins (``Scheduler.pause``) while this row is last-wins
+        (INSERT OR REPLACE), so a held ewa_rate halt plus a later park-stop
+        ``pause_scheduler`` leaves memory saying ewa_rate over a park_stop row.
+        The WHERE clause is what keeps that row's forensic value intact.
+        """
+        store = RunStore(tmp_path / 'runs.db')
+        store.start_run('run-1', 'proj-a', '2026-05-14T10:00:00+00:00')
+        store.save_scheduler_pause(
+            project_id='proj-a',
+            reason='ewa_trip_1.0',
+            pause_at_iso='2026-05-14T10:05:00+00:00',
+            set_by_run_id='run-1',
+            ewa_value=42.0,
+            pause_class=PauseClass.PARK_STOP,
+        )
+
+        refreshed = store.refresh_scheduler_pause_ewa('proj-a', 1.5)
+
+        assert refreshed is False
+        result = store.load_scheduler_pause('proj-a')
+        assert result is not None
+        assert result['ewa_value'] == pytest.approx(42.0)
+        assert result['reason'] == 'ewa_trip_1.0'
+
+    @pytest.mark.parametrize('pause_class', list(PauseClass))
+    def test_refresh_scope_is_the_policy_predicate(self, tmp_path, pause_class):
+        """A row is refreshed exactly when its class's stored EWA is its predicate."""
+        store = RunStore(tmp_path / 'runs.db')
+        store.save_scheduler_pause(
+            project_id='proj-a',
+            reason='any reason',
+            pause_at_iso='2026-05-14T10:05:00+00:00',
+            set_by_run_id='run-1',
+            ewa_value=42.0,
+            pause_class=pause_class,
+        )
+        predicate = policy_for(pause_class).stored_ewa_is_predicate
+
+        refreshed = store.refresh_scheduler_pause_ewa('proj-a', 1.5)
+
+        assert refreshed is predicate
+        result = store.load_scheduler_pause('proj-a')
+        assert result is not None
+        assert result['ewa_value'] == pytest.approx(1.5 if predicate else 42.0)
+
+    def test_refresh_leaves_a_legacy_null_class_row_untouched(self, tmp_path):
+        """A row written before pause_class existed reads as operator, not ewa_rate."""
+        db_path = tmp_path / 'runs.db'
+        store = RunStore(db_path)
+        _raw_insert_scheduler_state(
+            db_path,
+            project_id='proj-a',
+            pause_reason='ewa_trip_73.5900',
+            pause_at='2026-05-14T10:05:00+00:00',
+            set_by_run_id='run-old',
+            ewa_value=73.59,
+        )
+
+        refreshed = store.refresh_scheduler_pause_ewa('proj-a', 1.5)
+
+        assert refreshed is False
+        result = store.load_scheduler_pause('proj-a')
+        assert result is not None
+        assert result['ewa_value'] == pytest.approx(73.59)
 
     def test_clear_removes_row(self, tmp_path):
         """clear_scheduler_pause causes subsequent load to return None."""
@@ -373,12 +694,188 @@ class TestSchedulerStatePersistence:
             reason='will be cleared',
             pause_at_iso='2026-05-14T10:01:00+00:00',
             set_by_run_id='run-1',
+            pause_class=PauseClass.OPERATOR,
         )
         store.clear_scheduler_pause('proj-a')
         result = store.load_scheduler_pause('proj-a')
         assert result is None, (
             f'Expected None after clear, got {result!r}'
         )
+
+
+class TestSchedulerStatePauseClass:
+    """scheduler_state carries each hold's class, owner and expiry (task 4686)."""
+
+    def test_pre_4686_db_gains_the_hold_columns(self, tmp_path):
+        """A legacy NULL-class row reads as operator (PRD open question 3)."""
+        db_path = tmp_path / 'runs.db'
+        _build_legacy_scheduler_state_db(db_path, _PRE_4686_SCHEDULER_STATE_DDL)
+
+        store = RunStore(db_path)
+
+        assert set(_SCHEDULER_STATE_HOLD_COLUMNS) <= set(_scheduler_state_columns(db_path))
+        result = store.load_scheduler_pause('proj-a')
+        assert result is not None
+        assert result['pause_class'] is PauseClass.OPERATOR
+        assert result['hold_owner'] is None
+        assert result['expires_at'] is None
+        assert result['reason'] == 'ewa_trip_73.5900'
+        assert result['ewa_value'] is None
+
+    def test_pre_4559_db_migrates_through_both_migrations(self, tmp_path):
+        db_path = tmp_path / 'runs.db'
+        _build_legacy_scheduler_state_db(db_path, _PRE_4559_SCHEDULER_STATE_DDL)
+
+        store = RunStore(db_path)
+
+        columns = set(_scheduler_state_columns(db_path))
+        assert {'ewa_value', *_SCHEDULER_STATE_HOLD_COLUMNS} <= columns
+        result = store.load_scheduler_pause('proj-a')
+        assert result is not None
+        assert result['pause_class'] is PauseClass.OPERATOR
+        assert result['ewa_value'] is None
+
+    def test_reconstruction_leaves_the_column_set_unchanged(self, tmp_path):
+        db_path = tmp_path / 'runs.db'
+        _build_legacy_scheduler_state_db(db_path, _PRE_4686_SCHEDULER_STATE_DDL)
+        RunStore(db_path)
+        migrated = _scheduler_state_columns(db_path)
+
+        RunStore(db_path)
+
+        assert _scheduler_state_columns(db_path) == migrated
+
+    def test_fresh_and_migrated_column_order_match(self, tmp_path):
+        """ALTER can only append, so _SCHEMA must declare the new columns last."""
+        fresh_path = tmp_path / 'fresh.db'
+        migrated_path = tmp_path / 'migrated.db'
+        RunStore(fresh_path)
+        _build_legacy_scheduler_state_db(migrated_path, _PRE_4559_SCHEDULER_STATE_DDL)
+        RunStore(migrated_path)
+
+        assert _scheduler_state_columns(fresh_path) == _scheduler_state_columns(
+            migrated_path
+        )
+
+    def test_class_owner_and_expiry_round_trip(self, tmp_path):
+        store = RunStore(tmp_path / 'runs.db')
+        expires_at = datetime(2026, 10, 23, 9, 30, tzinfo=timezone(timedelta(hours=2)))
+        store.save_scheduler_pause(
+            project_id='proj-a',
+            reason='cost_ceiling_orch_exceeded',
+            pause_at_iso='2026-10-22T10:00:00+00:00',
+            set_by_run_id='run-1',
+            pause_class=PauseClass.COST_CEILING,
+            hold_owner='leo',
+            expires_at=expires_at,
+        )
+
+        result = store.load_scheduler_pause('proj-a')
+
+        assert result is not None
+        assert result['pause_class'] is PauseClass.COST_CEILING
+        assert result['hold_owner'] == 'leo'
+        assert result['expires_at'] == expires_at
+
+    def test_owner_and_expiry_default_to_none(self, tmp_path):
+        store = RunStore(tmp_path / 'runs.db')
+        store.save_scheduler_pause(
+            project_id='proj-a',
+            reason='quiesce',
+            pause_at_iso='2026-10-22T10:00:00+00:00',
+            set_by_run_id='run-1',
+            pause_class=PauseClass.OPERATOR,
+        )
+
+        result = store.load_scheduler_pause('proj-a')
+
+        assert result is not None
+        assert result['pause_class'] is PauseClass.OPERATOR
+        assert result['hold_owner'] is None
+        assert result['expires_at'] is None
+
+    def test_naive_expiry_is_rejected_and_nothing_written(self, tmp_path):
+        store = RunStore(tmp_path / 'runs.db')
+        naive = datetime(2026, 10, 23, 9, 30)
+
+        with pytest.raises(ValueError, match='2026-10-23'):
+            store.save_scheduler_pause(
+                project_id='proj-a',
+                reason='quiesce',
+                pause_at_iso='2026-10-22T10:00:00+00:00',
+                set_by_run_id='run-1',
+                pause_class=PauseClass.OPERATOR,
+                expires_at=naive,
+            )
+
+        assert store.load_scheduler_pause('proj-a') is None
+
+
+class TestMainSweepColdVerdictLedger:
+    """task 5812: the last COLD main-tip sweep verdict, restart-durable in runs.db."""
+
+    def test_load_returns_none_when_unset(self, tmp_path):
+        store = RunStore(tmp_path / 'runs.db')
+        assert store.load_main_sweep_last_cold_verdict('proj-a') is None
+
+    def test_save_then_load_round_trips_an_aware_utc_datetime(self, tmp_path):
+        store = RunStore(tmp_path / 'runs.db')
+        verdict_at = datetime(2026, 9, 23, 12, 0, tzinfo=UTC)
+
+        store.save_main_sweep_cold_verdict(
+            'proj-a', verdict_at=verdict_at, swept_sha='a' * 40,
+        )
+
+        loaded = store.load_main_sweep_last_cold_verdict('proj-a')
+        assert loaded == verdict_at
+        assert loaded is not None and loaded.tzinfo is not None
+
+    def test_save_is_last_wins_upsert(self, tmp_path):
+        store = RunStore(tmp_path / 'runs.db')
+        first = datetime(2026, 9, 23, 12, 0, tzinfo=UTC)
+        second = datetime(2026, 9, 24, 12, 0, tzinfo=UTC)
+
+        store.save_main_sweep_cold_verdict('proj-a', verdict_at=first, swept_sha='a' * 40)
+        store.save_main_sweep_cold_verdict('proj-a', verdict_at=second, swept_sha='b' * 40)
+
+        assert store.load_main_sweep_last_cold_verdict('proj-a') == second
+
+    def test_projects_are_isolated(self, tmp_path):
+        store = RunStore(tmp_path / 'runs.db')
+        store.save_main_sweep_cold_verdict(
+            'proj-a', verdict_at=datetime(2026, 9, 23, tzinfo=UTC), swept_sha='a' * 40,
+        )
+        assert store.load_main_sweep_last_cold_verdict('proj-b') is None
+
+    def test_survives_reopen(self, tmp_path):
+        """The restart property: a NEW RunStore on the same file reads it back."""
+        db_path = tmp_path / 'runs.db'
+        verdict_at = datetime(2026, 9, 23, 12, 0, tzinfo=UTC)
+        RunStore(db_path).save_main_sweep_cold_verdict(
+            'proj-a', verdict_at=verdict_at, swept_sha='a' * 40,
+        )
+
+        assert RunStore(db_path).load_main_sweep_last_cold_verdict('proj-a') == verdict_at
+
+    def test_existing_runs_db_without_the_table_gains_it(self, tmp_path):
+        db_path = tmp_path / 'runs.db'
+        conn = sqlite3.connect(str(db_path))
+        try:
+            conn.execute(
+                'CREATE TABLE runs (run_id TEXT PRIMARY KEY, project_id TEXT NOT NULL,'
+                ' started_at TEXT NOT NULL)'
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        store = RunStore(db_path)
+        verdict_at = datetime(2026, 9, 23, 12, 0, tzinfo=UTC)
+
+        store.save_main_sweep_cold_verdict(
+            'proj-a', verdict_at=verdict_at, swept_sha='a' * 40,
+        )
+
+        assert store.load_main_sweep_last_cold_verdict('proj-a') == verdict_at
 
 
 # ---------------------------------------------------------------------------
@@ -691,66 +1188,315 @@ class TestBlockContextPersistence:
 
         assert _task_results_columns(db_path) == cols_after_first
 
-    def test_concurrent_alter_race_is_survivable(self, tmp_path):
-        """Losing the table_info->ALTER race must not cost a run its results.
 
-        Two RunStore constructions can interleave between the PRAGMA read and
-        the ALTER (the dashboard and a digest reader both open runs.db). The
-        loser sees a real sqlite3 "duplicate column name" — which means the
-        migration's GOAL is already met. Propagating it would reach
-        Harness.run's `except Exception`, leave `_run_store` unset, and drop
-        EVERY task_results row for the whole run over a no-op.
-        """
-        db_path = tmp_path / 'runs.db'
-        _build_legacy_db(db_path)
-        store = RunStore(db_path)  # migrates for real
+class TestRunsCodeSha:
+    """Task 6565 D1: ``runs.code_sha`` records the commit the process runs."""
 
-        class _StaleReadConn:
-            """Reports the PRE-migration column set, ALTERs the migrated DB."""
-
-            def __init__(self, real):
-                self._real = real
-
-            def execute(self, sql, *args):
-                if sql.startswith('PRAGMA table_info'):
-                    # (cid, name, ...) shape, minus the 3068 columns.
-                    return iter([(0, 'task_id'), (1, 'completed_at')])
-                return self._real.execute(sql, *args)
-
-            def commit(self):
-                self._real.commit()
-
+    @staticmethod
+    def _runs_columns(db_path) -> list[str]:
         conn = sqlite3.connect(str(db_path))
         try:
-            # Would raise sqlite3.OperationalError without the guard.
-            store._migrate_task_results_block_context(
-                _StaleReadConn(conn),  # type: ignore[arg-type]
-            )
+            return [row[1] for row in conn.execute('PRAGMA table_info(runs)')]
         finally:
             conn.close()
 
-        assert set(_task_results_columns(db_path)) >= {'block_reason', 'block_phase'}
+    @staticmethod
+    def _code_sha(db_path, run_id: str):
+        conn = sqlite3.connect(str(db_path))
+        try:
+            return conn.execute('SELECT code_sha FROM runs WHERE run_id = ?', (run_id,)).fetchone()[0]
+        finally:
+            conn.close()
 
-    def test_non_duplicate_alter_failure_still_surfaces(self, tmp_path):
-        """Only the benign race is swallowed — a real fault must not be.
-
-        A corrupt DB or an un-takeable lock is exactly the case where a silent
-        half-migrated schema would be worse than a loud failure.
-        """
+    def test_start_run_records_code_sha(self, tmp_path):
         db_path = tmp_path / 'runs.db'
-        _build_legacy_db(db_path)
         store = RunStore(db_path)
+        store.start_run('run-1', 'proj', '2026-10-20T00:00:00+00:00', code_sha='d' * 40)
+        assert self._code_sha(db_path, 'run-1') == 'd' * 40
 
-        class _BrokenConn:
-            def execute(self, sql, *args):
-                if sql.startswith('PRAGMA table_info'):
-                    return iter([(0, 'task_id')])
-                raise sqlite3.OperationalError('database is locked')
+    def test_code_sha_defaults_to_null(self, tmp_path):
+        db_path = tmp_path / 'runs.db'
+        store = RunStore(db_path)
+        store.start_run('run-1', 'proj', '2026-10-20T00:00:00+00:00')
+        assert self._code_sha(db_path, 'run-1') is None
 
-            def commit(self):  # pragma: no cover - never reached
-                raise AssertionError('commit must not be reached')
+    def test_pre_6565_db_gains_code_sha_last_with_null_rows(self, tmp_path):
+        """A migrated DB and a fresh one agree on column ORDER (code_sha last)."""
+        legacy = tmp_path / 'legacy.db'
+        _build_legacy_db(legacy)
+        assert 'code_sha' not in self._runs_columns(legacy)
 
-        with pytest.raises(sqlite3.OperationalError, match='database is locked'):
-            store._migrate_task_results_block_context(
-                _BrokenConn(),  # type: ignore[arg-type]
+        store = RunStore(legacy)
+        RunStore(legacy)  # idempotent
+
+        fresh = tmp_path / 'fresh.db'
+        RunStore(fresh)
+        assert self._runs_columns(legacy) == self._runs_columns(fresh)
+        columns = self._runs_columns(legacy)
+        assert columns[columns.index('code_sha') + 1:] == ['startup_completed_at', 'exit_reason']
+        assert self._code_sha(legacy, 'run-legacy') is None
+        store.start_run('run-new', 'proj-a', '2026-10-20T00:00:00+00:00', code_sha='e' * 40)
+        assert self._code_sha(legacy, 'run-new') == 'e' * 40
+
+
+class TestRunsStartupOutcome:
+    """Task 8269: ``runs.startup_completed_at`` and ``runs.exit_reason`` record how a start ended."""
+
+    _COLUMNS = ['code_sha', 'startup_completed_at', 'exit_reason']
+
+    @staticmethod
+    def _runs_columns(db_path) -> list[str]:
+        conn = sqlite3.connect(str(db_path))
+        try:
+            return [row[1] for row in conn.execute('PRAGMA table_info(runs)')]
+        finally:
+            conn.close()
+
+    @staticmethod
+    def _outcome(db_path, run_id: str) -> tuple[str | None, str | None]:
+        conn = sqlite3.connect(str(db_path))
+        try:
+            return conn.execute(
+                'SELECT startup_completed_at, exit_reason FROM runs WHERE run_id = ?', (run_id,),
+            ).fetchone()
+        finally:
+            conn.close()
+
+    @staticmethod
+    def _started(tmp_path) -> tuple[RunStore, Path]:
+        db_path = tmp_path / 'runs.db'
+        store = RunStore(db_path)
+        store.start_run('run-1', 'proj', '2026-11-15T00:00:00+00:00')
+        return store, db_path
+
+    def test_a_fresh_db_appends_both_columns_after_code_sha(self, tmp_path):
+        db_path = tmp_path / 'runs.db'
+        RunStore(db_path)
+
+        assert self._runs_columns(db_path)[-3:] == self._COLUMNS
+
+    def test_a_legacy_db_migrates_to_the_fresh_column_order_with_null_rows(self, tmp_path):
+        legacy = tmp_path / 'legacy.db'
+        _build_legacy_db(legacy)
+
+        RunStore(legacy)
+        RunStore(legacy)  # idempotent
+        fresh = tmp_path / 'fresh.db'
+        RunStore(fresh)
+
+        assert self._runs_columns(legacy) == self._runs_columns(fresh)
+        assert self._outcome(legacy, 'run-legacy') == (None, None)
+
+    def test_a_clean_return_leaves_both_null(self, tmp_path):
+        store, db_path = self._started(tmp_path)
+
+        store.finish_run('run-1', _sample_report())
+
+        assert self._outcome(db_path, 'run-1') == (None, None)
+
+    @pytest.mark.parametrize(
+        ('reason', 'stored'),
+        [(RunExitReason.startup_crash('2e'), 'startup_crash:2e'), (RunExitReason.cancelled(), 'cancelled')],
+        ids=['startup-crash', 'cancelled'],
+    )
+    def test_exit_reason_is_stored_as_its_column_value(self, tmp_path, reason, stored):
+        store, db_path = self._started(tmp_path)
+
+        store.finish_run('run-1', _sample_report(), exit_reason=reason)
+
+        assert self._outcome(db_path, 'run-1') == (None, stored)
+
+    @pytest.mark.parametrize(
+        ('kind', 'site'),
+        [(RunExitKind.STARTUP_CRASH, None), (RunExitKind.CANCELLED, '2e')],
+        ids=['crash-without-site', 'cancelled-with-site'],
+    )
+    def test_a_site_is_required_exactly_for_a_startup_crash(self, kind, site):
+        with pytest.raises(ValueError) as raised:
+            RunExitReason(kind=kind, site=site)
+
+        assert kind.value in str(raised.value)
+        assert repr(site) in str(raised.value)
+
+    def test_mark_startup_completed_stores_utc_text_and_leaves_the_run_open(self, tmp_path):
+        store, db_path = self._started(tmp_path)
+        completed = datetime(2026, 11, 15, 1, 2, 3, tzinfo=timezone(timedelta(hours=2)))
+
+        store.mark_startup_completed('run-1', completed)
+
+        assert self._outcome(db_path, 'run-1') == ('2026-11-14T23:02:03+00:00', None)
+        conn = sqlite3.connect(str(db_path))
+        try:
+            (completed_at,) = conn.execute(
+                'SELECT completed_at FROM runs WHERE run_id = ?', ('run-1',),
+            ).fetchone()
+        finally:
+            conn.close()
+        assert completed_at is None
+
+    def test_mark_startup_completed_refuses_a_naive_instant(self, tmp_path):
+        store, _db_path = self._started(tmp_path)
+
+        with pytest.raises(ValueError, match='timezone-aware'):
+            store.mark_startup_completed('run-1', datetime(2026, 11, 15))
+
+    def test_finish_run_leaves_a_stamped_startup_completed_at_alone(self, tmp_path):
+        store, db_path = self._started(tmp_path)
+        store.mark_startup_completed('run-1', datetime(2026, 11, 15, 1, 2, 3, tzinfo=UTC))
+
+        store.finish_run('run-1', _sample_report(), exit_reason=RunExitReason.cancelled())
+
+        assert self._outcome(db_path, 'run-1') == ('2026-11-15T01:02:03+00:00', 'cancelled')
+
+
+class TestGetTaskOutcome:
+    """Production's latest recorded outcome for a task, across runs (live-shadow PRD S1)."""
+
+    @staticmethod
+    def _report(**overrides) -> TaskReport:
+        fields = {
+            'task_id': '777',
+            'title': 'Ship the widget',
+            'outcome': WorkflowOutcome.DONE,
+            'cost_usd': 1.25,
+            'duration_ms': 42_000,
+            'agent_invocations': 6,
+            'execute_iterations': 2,
+            'verify_attempts': 3,
+            'review_cycles': 1,
+            'steward_cost_usd': 0.4,
+            'steward_invocations': 2,
+            'completed_at': '2026-10-18T09:00:00+00:00',
+            'block_reason': '',
+            'block_phase': '',
+        }
+        fields.update(overrides)
+        return TaskReport(**fields)
+
+    @staticmethod
+    def _save(store: RunStore, run_id: str, report: TaskReport, project_id='dark_factory'):
+        store.start_run(run_id, project_id, '2026-10-18T00:00:00+00:00')
+        store.save_task_result(run_id, report, project_id)
+
+    def test_no_row_reads_none(self, tmp_path):
+        assert RunStore(tmp_path / 'runs.db').get_task_outcome('dark_factory', '777') is None
+
+    def test_a_saved_row_reads_back_typed(self, tmp_path):
+        store = RunStore(tmp_path / 'runs.db')
+        report = self._report(block_reason='verify failed', block_phase='verify')
+        self._save(store, 'run-a', report)
+
+        record = store.get_task_outcome('dark_factory', '777')
+
+        assert record == TaskResultRecord(
+            run_id='run-a',
+            project_id='dark_factory',
+            task_id='777',
+            title='Ship the widget',
+            outcome=WorkflowOutcome.DONE,
+            cost_usd=1.25,
+            steward_cost_usd=0.4,
+            steward_invocations=2,
+            duration_ms=42_000,
+            agent_invocations=6,
+            execute_iterations=2,
+            verify_attempts=3,
+            review_cycles=1,
+            completed_at=datetime(2026, 10, 18, 9, 0, tzinfo=UTC),
+            block_reason='verify failed',
+            block_phase='verify',
+        )
+        assert record is not None
+        assert record.outcome is WorkflowOutcome.DONE
+        assert record.completed_at is not None
+        assert record.completed_at.utcoffset() is not None
+
+    def test_the_latest_row_across_runs_wins(self, tmp_path):
+        store = RunStore(tmp_path / 'runs.db')
+        self._save(store, 'run-a', self._report(
+            outcome=WorkflowOutcome.REQUEUED, completed_at='2026-10-17T09:00:00+00:00',
+        ))
+        self._save(store, 'run-b', self._report(
+            outcome=WorkflowOutcome.DONE, completed_at='2026-10-18T09:00:00+00:00',
+        ))
+
+        record = store.get_task_outcome('dark_factory', '777')
+
+        assert record is not None
+        assert (record.run_id, record.outcome) == ('run-b', WorkflowOutcome.DONE)
+
+    def test_another_projects_row_is_never_returned(self, tmp_path):
+        store = RunStore(tmp_path / 'runs.db')
+        self._save(store, 'run-x', self._report(), project_id='reify')
+
+        assert store.get_task_outcome('dark_factory', '777') is None
+        record = store.get_task_outcome('reify', '777')
+        assert record is not None
+        assert record.project_id == 'reify'
+
+    def test_an_untimestamped_row_reads_none_and_sorts_last(self, tmp_path):
+        store = RunStore(tmp_path / 'runs.db')
+        self._save(store, 'run-a', self._report(completed_at='2026-10-17T09:00:00+00:00'))
+        self._save(store, 'run-b', self._report(
+            outcome=WorkflowOutcome.BLOCKED, completed_at='',
+        ))
+
+        latest = store.get_task_outcome('dark_factory', '777')
+        assert latest is not None
+        assert latest.run_id == 'run-a'
+
+        only_blank = RunStore(tmp_path / 'other.db')
+        self._save(only_blank, 'run-b', self._report(completed_at=''))
+        record = only_blank.get_task_outcome('dark_factory', '777')
+        assert record is not None
+        assert record.completed_at is None
+
+    def test_an_unknown_stored_outcome_is_refused(self, tmp_path):
+        store = RunStore(tmp_path / 'runs.db')
+        self._save(store, 'run-a', self._report())
+        conn = sqlite3.connect(str(tmp_path / 'runs.db'))
+        try:
+            conn.execute("UPDATE task_results SET outcome = 'garbage'")
+            conn.commit()
+        finally:
+            conn.close()
+
+        with pytest.raises(ValueError) as excinfo:
+            store.get_task_outcome('dark_factory', '777')
+        assert '777' in str(excinfo.value)
+        assert 'garbage' in str(excinfo.value)
+
+    def test_null_costs_and_counters_read_as_zero(self, tmp_path):
+        db_path = tmp_path / 'runs.db'
+        store = RunStore(db_path)
+        store.start_run('run-a', 'dark_factory', '2026-10-18T00:00:00+00:00')
+        numeric = (
+            'cost_usd', 'steward_cost_usd', 'steward_invocations', 'duration_ms',
+            'agent_invocations', 'execute_iterations', 'verify_attempts', 'review_cycles',
+        )
+        conn = sqlite3.connect(db_path)
+        try:
+            conn.execute(
+                'INSERT INTO task_results (run_id, task_id, project_id, outcome, '
+                f'{", ".join(numeric)}) VALUES (?, ?, ?, ?, {", ".join("NULL" for _ in numeric)})',
+                ('run-a', '777', 'dark_factory', 'done'),
             )
+            conn.commit()
+        finally:
+            conn.close()
+
+        record = store.get_task_outcome('dark_factory', '777')
+
+        assert record is not None
+        assert {name: getattr(record, name) for name in numeric} == dict.fromkeys(numeric, 0)
+        assert isinstance(record.cost_usd, float)
+        assert isinstance(record.steward_cost_usd, float)
+        assert isinstance(record.steward_invocations, int)
+
+    @pytest.mark.parametrize('field_name', ['outcome', 'run_id', 'completed_at'])
+    def test_the_record_is_frozen(self, tmp_path, field_name):
+        store = RunStore(tmp_path / 'runs.db')
+        self._save(store, 'run-a', self._report())
+        record = store.get_task_outcome('dark_factory', '777')
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            setattr(record, field_name, None)

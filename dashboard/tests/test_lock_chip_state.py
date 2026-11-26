@@ -1,70 +1,163 @@
-"""Behavioral (node-vm) tests for lockChipState — the lock-chip precedence helper.
+"""Behavioral (node-vm) tests for lockChipStateFor, the one lock classifier.
 
-Executes lockChipState({holder, isMine, parkedBy, parkedOwnerLive}) from
-scheduler_utils.jsx inside a node vm sandbox and asserts the returned
-{cls, hint, ownerLabel} across the full precedence matrix:
+Executes lockChipStateFor(module, taskId, project) from scheduler_utils.jsx in a
+node vm context and asserts the returned {cls, ownerLabel} across the full
+precedence matrix:
 
-  holder (mine/taken) > parked > free
+  mine > held against (taken) > parked > free
 
-Uses the same node-vm harness established in test_chip_label_disambiguation.py.
-Tests skip when node is absent from PATH (CI requires node).
+A key held by others below its holder limit is not held against the task, so
+it reads by its park, else free.
+
+It is the module's only classifier export, and it applies the precedence to a
+task's view of a SCHEDULER.modules entry. isLockHolder decides whether the lock
+is mine and lockHeldAgainst whether it blocks the task; both are executed below
+as well. The Scheduler heatmap's cellStateFor is executed below beside it, and
+must answer every lock state exactly as the task-row LockChip does; membership
+(rowTouchesModule) is the only thing it adds.
 """
 
 from __future__ import annotations
 
 import json
-import os
-import pathlib
-import shutil
 import subprocess
 
 import pytest
-
-SCHED_UTILS_PATH = str(
-    pathlib.Path(__file__).parent.parent / 'src/dashboard/static/redux/scheduler_utils.jsx'
+from _dashboard_helpers import node_path
+from _lock_chip_matrix import (
+    CELL_MATRIX,
+    MODULE_PATH,
+    ROW_PROJECT,
+    ROW_TASK,
+    SCHED_UTILS_PATH,
+    heatmap_cell_and_chip,
+    heatmap_module,
+    heatmap_row,
+    lock_chip_states_for,
+    lock_predicates_for,
 )
 
-# Node driver: extracts the pure-JS helper section from scheduler_utils.jsx
-# (everything before the window.DF_SCHED_UTILS export line) and runs it in a
-# vm sandbox.  Returns a plain object via JSON.stringify.
-_DRIVER = r"""
+# ---------------------------------------------------------------------------
+# lockChipStateFor across the precedence matrix (node-vm runtime)
+# ---------------------------------------------------------------------------
+
+# Each case: the SCHEDULER.modules entry (None when the scheduler does not list
+# the module), and the (cls, ownerLabel) task ROW_TASK of ROW_PROJECT reads it as.
+_CASES = {
+    'own task, own project': (heatmap_module(holder=ROW_TASK, holder_project=ROW_PROJECT), 'lock-mine', None),
+    'own task, no holder_project': (heatmap_module(holder=ROW_TASK), 'lock-mine', None),
+    'own task id, another project': (
+        heatmap_module(holder=ROW_TASK, holder_project='Q'), 'lock-taken', f'T-{ROW_TASK}',
+    ),
+    'another task, own project': (heatmap_module(holder='A', holder_project=ROW_PROJECT), 'lock-taken', 'T-A'),
+    'another task, no holder_project': (heatmap_module(holder='A'), 'lock-taken', 'T-A'),
+    'parked, live owner': (heatmap_module(parked_by='C', parked_owner_live=True), 'lock-parked', 'T-C'),
+    'parked, dead owner': (heatmap_module(parked_by='C', parked_owner_live=False), 'lock-parked', 'T-C ⚠'),
+    'held and parked, the holder wins': (
+        heatmap_module(holder='A', parked_by='C', parked_owner_live=True), 'lock-taken', 'T-A',
+    ),
+    'co-holder of a shared key': (
+        heatmap_module(holder='A', holders=['A', ROW_TASK], holder_project=ROW_PROJECT, at_holder_limit=False),
+        'lock-mine', None,
+    ),
+    'co-holder of a full key': (
+        heatmap_module(holder='A', holders=['A', ROW_TASK], holder_project=ROW_PROJECT, at_holder_limit=True),
+        'lock-mine', None,
+    ),
+    'another task, below its limit': (
+        heatmap_module(holder='A', holders=['A'], holder_project=ROW_PROJECT, at_holder_limit=False),
+        'lock-free', None,
+    ),
+    'two other tasks fill it': (
+        heatmap_module(holder='A', holders=['A', 'C'], holder_project=ROW_PROJECT, at_holder_limit=True),
+        'lock-taken', 'T-A +1',
+    ),
+    'below its limit and parked, the park shows': (
+        heatmap_module(holder='A', holders=['A'], at_holder_limit=False, parked_by='C', parked_owner_live=True),
+        'lock-parked', 'T-C',
+    ),
+    'free': (heatmap_module(), 'lock-free', None),
+    'not listed by the scheduler': (None, 'lock-free', None),
+}
+
+
+@pytest.fixture(scope='module')
+def chip_states() -> dict[str, dict]:
+    """lockChipStateFor's answer for every _CASES case, from one node process."""
+    cases = [(module, ROW_TASK, ROW_PROJECT) for module, _cls, _owner in _CASES.values()]
+    return dict(zip(_CASES, lock_chip_states_for(cases), strict=True))
+
+
+class TestLockChipStateFor:
+    """lockChipStateFor(module, taskId, project) applies the precedence to isLockHolder and lockHeldAgainst.
+
+    Mine means held by this task id IN this project; a module that names no
+    holder_project is read as the task's own project. A holder outranks a park.
+    """
+
+    @pytest.mark.parametrize('case', list(_CASES))
+    def test_classifies(self, chip_states, case):
+        _module, cls, owner_label = _CASES[case]
+        state = chip_states[case]
+        assert (state['cls'], state['ownerLabel']) == (cls, owner_label), f'{case}: {state!r}'
+
+    def test_a_key_shared_below_its_limit_names_its_holders_in_the_hint(self, chip_states):
+        assert 'T-A' in chip_states['another task, below its limit']['hint']
+
+    def test_a_full_key_held_by_several_names_every_holder_in_the_hint(self, chip_states):
+        hint = chip_states['two other tasks fill it']['hint']
+        assert 'T-A' in hint and 'T-C' in hint, hint
+
+
+# Each case: the module entry, and (isLockHolder, lockHeldAgainst) for task
+# ROW_TASK of ROW_PROJECT.
+_PREDICATE_CASES = {
+    'held by this task': (heatmap_module(holder=ROW_TASK, holder_project=ROW_PROJECT), True, False),
+    'co-holder of a shared key': (
+        heatmap_module(holder='A', holders=['A', ROW_TASK], holder_project=ROW_PROJECT, at_holder_limit=False),
+        True, False,
+    ),
+    'full key held by another': (heatmap_module(holder='A', holder_project=ROW_PROJECT), False, True),
+    'full key held by this task id in another project': (
+        heatmap_module(holder=ROW_TASK, holder_project='Q'), False, True,
+    ),
+    'shared key below its limit held by another': (
+        heatmap_module(holder='A', holders=['A'], holder_project=ROW_PROJECT, at_holder_limit=False),
+        False, False,
+    ),
+    'unknown limit verdict stays inert': (
+        {'project': ROW_PROJECT, 'path': MODULE_PATH, 'holder': 'A', 'holders': ['A']}, False, False,
+    ),
+    'not listed by the scheduler': (None, False, False),
+}
+
+
+@pytest.fixture(scope='module')
+def predicates() -> dict[str, dict]:
+    cases = [(module, ROW_TASK, ROW_PROJECT) for module, _holder, _against in _PREDICATE_CASES.values()]
+    return dict(zip(_PREDICATE_CASES, lock_predicates_for(cases), strict=True))
+
+
+@pytest.mark.parametrize('case', list(_PREDICATE_CASES))
+def test_is_lock_holder_and_lock_held_against(predicates, case):
+    """isLockHolder is the one place a task holds a lock; lockHeldAgainst the one place a lock blocks it."""
+    _module, holder, against = _PREDICATE_CASES[case]
+    assert predicates[case] == {'isLockHolder': holder, 'lockHeldAgainst': against}, case
+
+
+_EXPORTS_DRIVER = r"""
 const vm = require('vm');
 const fs = require('fs');
-const src = fs.readFileSync(process.argv[1], 'utf8');
-
-// Extract everything before the window.DF_SCHED_UTILS export line.
-const endIdx = src.lastIndexOf('\nwindow.DF_SCHED_UTILS');
-if (endIdx < 0) throw new Error('window.DF_SCHED_UTILS not found — check scheduler_utils.jsx');
-const helpersSrc = src.slice(0, endIdx);
-
-const name    = process.argv[2];
-const argsJson = process.argv[3];
-
-const sandbox = { Math, console };
-if (argsJson !== undefined) sandbox.__args = JSON.parse(argsJson);
-
-const scriptBody = argsJson !== undefined
-  ? 'var r = ' + name + '(...__args); if (r instanceof Map) r = Object.fromEntries(r); var __result = r;'
-  : 'var r = ' + name + '; if (r instanceof Map) r = Object.fromEntries(r); var __result = r;';
-
-vm.runInNewContext(helpersSrc + '\n' + scriptBody, sandbox);
-process.stdout.write(JSON.stringify(sandbox.__result) + '\n');
+const [utilsPath] = process.argv.slice(1);
+const context = vm.createContext({ console, window: {} });
+vm.runInContext(fs.readFileSync(utilsPath, 'utf8'), context, { filename: utilsPath });
+process.stdout.write(JSON.stringify(Object.keys(context.window.DF_SCHED_UTILS)) + '\n');
 """
 
 
-def _node():
-    path = shutil.which('node')
-    if not path:
-        if os.environ.get('CI'):
-            pytest.fail('node is required in CI but not found on PATH')
-        pytest.skip('node not available')
-    return path
-
-
-def _eval_sched_utils_fn(fn_name, *args):
-    """Call fn_name(*args) in a node vm sandbox and return the decoded result."""
+def _exported_sched_utils_keys() -> list[str]:
     result = subprocess.run(
-        [_node(), '-e', _DRIVER, SCHED_UTILS_PATH, fn_name, json.dumps(list(args))],
+        [node_path(), '-e', _EXPORTS_DRIVER, SCHED_UTILS_PATH],
         capture_output=True,
         text=True,
         check=True,
@@ -72,80 +165,55 @@ def _eval_sched_utils_fn(fn_name, *args):
     return json.loads(result.stdout.strip())
 
 
-def lock_chip_state(holder, isMine=False, parkedBy=None, parkedOwnerLive=None):
-    """Invoke lockChipState({...}) in the vm sandbox and return the decoded dict."""
-    return _eval_sched_utils_fn(
-        'lockChipState',
-        {
-            'holder': holder,
-            'isMine': isMine,
-            'parkedBy': parkedBy,
-            'parkedOwnerLive': parkedOwnerLive,
-        },
+def test_lock_chip_state_for_is_the_only_classifier_exported():
+    """window.DF_SCHED_UTILS offers no entry point that takes a caller-computed isMine."""
+    exported = _exported_sched_utils_keys()
+    assert 'lockChipStateFor' in exported, exported
+    assert 'lockChipState' not in exported, (
+        'window.DF_SCHED_UTILS still exports the bare lockChipState, which takes a '
+        'caller-computed isMine; isLockHolder decides whether a lock is mine, and '
+        'lockChipStateFor is the one entry point that applies the precedence to it'
     )
 
 
 # ---------------------------------------------------------------------------
-# Precedence-matrix tests (node-vm runtime)
+# The heatmap cell is classified by lockChipStateFor too (PRD sketch #12,
+# second half). cellStateFor is EXECUTED, not grepped, by
+# _lock_chip_matrix.heatmap_cell_and_chip.
 # ---------------------------------------------------------------------------
 
-class TestLockChipStatePrecedence:
-    def test_held_by_self_is_lock_mine(self):
-        """(a) held-by-self: holder present + isMine=True → cls='lock-mine'."""
-        result = lock_chip_state(holder='me', isMine=True)
-        assert result['cls'] == 'lock-mine', (
-            f"held-by-self must yield cls='lock-mine', got {result!r}"
-        )
 
-    def test_held_by_other_is_lock_taken_with_owner_label(self):
-        """(b) held-by-other: holder present + isMine=False → cls='lock-taken',
-        ownerLabel='T-other'."""
-        result = lock_chip_state(holder='other', isMine=False)
-        assert result['cls'] == 'lock-taken', (
-            f"held-by-other must yield cls='lock-taken', got {result!r}"
-        )
-        assert result['ownerLabel'] == 'T-other', (
-            f"held-by-other ownerLabel must be 'T-other', got {result.get('ownerLabel')!r}"
-        )
+class TestHeatmapCellIsTheLockChip:
+    def test_parked_and_held_reads_as_taken_in_both(self):
+        """A cell held by A and parked by this row's own task is lock-taken, as the chip is.
 
-    def test_unheld_parked_live_is_lock_parked(self):
-        """(c) [B6] unheld+parked-live → cls='lock-parked', ownerLabel='T-owner'
-        (no warning glyph when parkedOwnerLive is True)."""
-        result = lock_chip_state(holder=None, parkedBy='owner', parkedOwnerLive=True)
-        assert result['cls'] == 'lock-parked', (
-            f"unheld+parked-live must yield cls='lock-parked', got {result!r}"
-        )
-        assert result['ownerLabel'] == 'T-owner', (
-            f"ownerLabel must be 'T-owner' (live), got {result.get('ownerLabel')!r}"
-        )
-
-    def test_unheld_parked_stale_has_warning_glyph(self):
-        """(d) unheld+parked-stale (parkedOwnerLive=False) → ownerLabel includes ⚠."""
-        result = lock_chip_state(holder=None, parkedBy='owner', parkedOwnerLive=False)
-        assert result['cls'] == 'lock-parked', (
-            f"unheld+parked-stale must yield cls='lock-parked', got {result!r}"
-        )
-        assert result['ownerLabel'] == 'T-owner ⚠', (
-            f"stale ownerLabel must be 'T-owner ⚠', got {result.get('ownerLabel')!r}"
-        )
-
-    def test_unheld_unparked_is_lock_free(self):
-        """(e) unheld+free → cls='lock-free'."""
-        result = lock_chip_state(holder=None, parkedBy=None)
-        assert result['cls'] == 'lock-free', (
-            f"unheld+unparked must yield cls='lock-free', got {result!r}"
-        )
-
-    def test_held_and_parked_holder_wins(self):
-        """(f) [B7] held+parked → holder beats parked, cls='lock-taken' not 'lock-parked'.
-
-        Proves the holder > parked precedence by EXECUTING the helper — robust to any
-        source-level refactor of the chip code that preserves this runtime contract.
+        The heatmap used to rank parked-by-me first and the chip ranks the
+        holder first, so the same lock read 'parked' in one view and 'taken'
+        in the other.
         """
-        result = lock_chip_state(holder='other', isMine=False, parkedBy='owner', parkedOwnerLive=True)
-        assert result['cls'] == 'lock-taken', (
-            f"held+parked must yield cls='lock-taken' (holder wins), got {result!r}"
+        module = heatmap_module(holder='A', holder_project=ROW_PROJECT,
+                                parked_by=ROW_TASK, parked_owner_live=True)
+        row = heatmap_row(module)
+        assert row['park_state'] == {'modules': [MODULE_PATH]}
+        cell, chip = heatmap_cell_and_chip(row, module)
+        assert cell == chip, f'heatmap cell {cell!r} disagrees with the lock chip {chip!r}'
+        assert chip['cls'] == 'lock-taken'
+
+    @pytest.mark.parametrize('case', sorted(CELL_MATRIX))
+    def test_every_lock_state_classifies_as_the_chip_does(self, case):
+        module = heatmap_module(**CELL_MATRIX[case])
+        cell, chip = heatmap_cell_and_chip(heatmap_row(module), module)
+        assert cell == chip, f'{case}: heatmap cell {cell!r} disagrees with the lock chip {chip!r}'
+
+    @pytest.mark.parametrize('row_project, lock_set', [
+        (ROW_PROJECT, ()),
+        ('Q', (MODULE_PATH,)),
+    ], ids=['module outside the lock set', 'same path, another project'])
+    def test_a_module_the_row_does_not_lock_is_not_in_set(self, row_project, lock_set):
+        module = heatmap_module(holder='A', holder_project=ROW_PROJECT)
+        row = {**heatmap_row(module, lock_set=lock_set), 'project': row_project}
+        cell, _chip = heatmap_cell_and_chip(row, module)
+        assert isinstance(cell, dict) and set(cell) == {'cls', 'hint', 'ownerLabel'}, (
+            f'cellStateFor does not answer in lockChipState\'s shape: {cell!r}'
         )
-        assert result['cls'] != 'lock-parked', (
-            "held+parked must NOT yield cls='lock-parked' — holder takes precedence"
-        )
+        assert cell['cls'] == 'not-in-set'

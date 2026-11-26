@@ -1,0 +1,788 @@
+# PRD: Resume charter-loss remediation — restore, harden, observe, then unlock the substrate
+
+**Status**: active · authored 2026-08-10 · programme contract absorbing the
+incident batch **3983-3994** (filed 2026-08-10 pre-PRD under incident
+pressure) and filling its gaps with nine new leaves (α-ι).
+**Author**: /prd session from brief
+`~/.claude/spawn-briefs/resume-sysprompt-prd-brief.md` (investigation
+2026-08-10, reviewed and partly ratified by Leo — his decisions are marked
+**[LEO APPROVED]** and are load-bearing).
+**Companion artifacts**: `resume-charter-loss-remediation-prd.capability-manifest.md`
+(+ `.capability-manifest.yaml` sidecar) beside this file.
+
+## 1. Goal
+
+Every `claude` CLI invocation the factory makes — fresh or resumed —
+runs under its **current role charter**, every resume is **observable**
+after the fact, the constraints that matter are **enforced by the CLI or
+a server rather than by prose**, and only then are the two currently-dead
+resume substrates (crash-recovery R3, recon adopt R6) brought back to
+life. Plus the economic follow-on Leo approved: the escalation watcher
+stops paying for empty polling (exit-on-drain), safely.
+
+## 2. Background — the defect and the proven premise (G6)
+
+`build_claude_argv` (`shared/src/shared/cli_invoke.py`) skipped
+`--system-prompt-file` whenever `resume_session_id` was set, on the
+strength of a comment claiming the flags are "(incompatible)". **False**
+— proven by controlled experiment (CLI 2.1.226, canary prompt with an
+unguessable token, `--fork-session` arms):
+
+| Arm | Flags | first-turn `input_tokens` | Charter honoured |
+|---|---|---|---|
+| fresh | `--system-prompt-file` | 245 | yes |
+| pre-fix code | `--resume` only | **2066 (stock)** | **NO** |
+| Fix A | `--resume --system-prompt-file` | 446 | **yes** |
+| append variant | `--resume --append-system-prompt-file` | 2132 | layered over stock |
+
+The system prompt is a per-process invocation parameter, never persisted
+in the transcript; a resumed agent ran under the stock Claude Code
+prompt with no role charter. Measured blast radius (2×2 over all 3,607
+escalation-watcher-auto rotations, two independent implementations):
+resumed **362/1681 breached (21.5%)**, never-resumed **0/1926 (0.0%)**.
+96 unauthorised merges landed. Re-passing the prompt is a prompt-cache
+HIT; omitting it was a total miss — **the fix is cheaper than the bug**.
+
+**Organising principle** (predicts the blast radius exactly, and drives
+this PRD's thrust 2):
+
+> Anything enforced by the CLI or a server SURVIVES resume. Anything
+> enforced by prose does NOT.
+
+**Fix A landed** as task 3983 (merge `03ff70c5dd`, 2026-08-10):
+`--system-prompt-file` is now emitted unconditionally, the three pinning
+tests are inverted (the :159 tripwire consciously retired citing 3067),
+and the in-file false docstrings/comment are corrected. This PRD's
+remaining work is everything Fix A does **not** cover.
+
+### The resume-site inventory (verified 2026-08-10)
+
+| # | Site | Status post-Fix-A |
+|---|---|---|
+| R1 | `cli_invoke.py` cap-hit auto-resume (all 13 callers, 2,608 cap events) | charter restored by 3983; observability still absent (3986); structural de-resume for watcher/unblock_auto still wanted (3987) |
+| R7 | recon `agent_loop.py` every turn ≥ 2 | charter restored; **tool results still destroyed** — needs `resume_delivers_prompt=True` (3984) |
+| R4 | gamma ceiling-kill (`workflow.py`) | charter restored; still delivers a **false** "orchestrator restart" story (3985) |
+| R5 | steward | charter restored (user prompt was already safe) |
+| R3 | crash-recovery resume | **DEAD** (0 successes / 260 fallbacks, ever) — substrate owned by task 3578's PRD; gated here via θ |
+| R6 | recon adopt-and-resume | **DEAD — Landlock**: recon's config dir sits outside the sandbox writable set, so no recon transcript has been written since 2026-07-18 (task 2744); fixed by η |
+| new | curator/adjudicator/judge/deep_reviewer/module_tagger/watcher-auto/unblock_auto via R1 | charter restored; 3986/3987/ζ harden |
+
+### Why the dead paths matter (G5 — the key sequencing insight)
+
+R3 and R6 being dead is what made them *safe* pre-Fix-A: a path that
+never resumes never strips a charter. Reviving either **before** Fix A
+would have switched charter-stripping ON for task roles at every 8h
+fleet redeploy (R3) and for 56-66k-char recon stage charters (R6).
+**[LEO APPROVED]: Fix A gates both substrate fixes — as dependency
+edges, not prose.** Fix A is now merged, so the gates are satisfied, but
+the edges are wired anyway (3578 already carries `depends_on 3983`; η
+carries it too) so the ordering is machine-visible in the task graph and
+survives any revert/reland of 3983.
+
+## 3. Sketch of approach — five thrusts
+
+1. **Restore delivery** (landed + pending): Fix A (3983, done) restored
+   the charter on all seven sites; 3984 restores R7's per-turn tool
+   results; 3985 gives the gamma ceiling-kill an honest resume prompt.
+2. **Enforce, don't exhort**: convert the constraints the breaches
+   actually violated from prose to CLI/server enforcement — stop
+   resuming the two roles where resume buys nothing and costs the whole
+   charter (3987), deny `Skill` to the auto-watcher (3993), make role
+   leases real locks (3994), make `start_report` idempotent (3988),
+   give unblock_auto a CLI-enforced read-only envelope + a governing
+   cap-wait bound (ζ).
+3. **Observe**: record that a resume happened and detect a
+   system-prompt swap from the first assistant turn (3986); then audit
+   the damage with human-approved scope (3992).
+4. **Watcher economics [LEO APPROVED: exit-on-drain]**: first make the
+   drain protocol durable so accumulated context stops substituting for
+   the durable channels (α, β, γ), then exit-on-drain **with the
+   <120s degenerate-exit guard change in the same task** (δ), plus
+   quiet-project cost containment (ε).
+5. **Unlock the substrate + fix the beliefs**: verify 3727 is actually
+   deployed (θ) → 3578 (transcript restore, other PRD) → reassess
+   3730/3733 (ι); recon Landlock fix (η) activates R6 and recon
+   transcripts; correct the 9 false-belief doc sites and settle both
+   kill-switches (3991, amended).
+
+## 4. Resolved design decisions
+
+- **D1 [LEO APPROVED]** — Fix A gates both substrate fixes (R3 revival
+  via 3578, R6 revival via η). Wired as dependency edges on 3983.
+- **D2** — Replace, don't append: `--system-prompt-file` (replace)
+  is the correct form. Roles are restrictive charters; layering over
+  the stock prompt keeps a contradicting general-purpose identity in
+  force. Replace makes resumed and fresh invocations byte-identical in
+  contract. (Landed with 3983.)
+- **D3** — A resumed session receives the **current** role prompt, not
+  the original bytes. No role prompt is templated with per-invocation
+  task context, so this is safe; the four caveats (Stage 2 branches on
+  `project_id`; reviewer/curator are model-keyed artifacts; Stage 1/3
+  introspect live FastMCP signatures; recon-verify is tool-list
+  templated) are documented in 3983. Consequence: both kill-switches
+  (`session_resume.enabled`, `resume_after_restart`) lose their stated
+  purpose — their fate is decided in 3991.
+- **D4 [LEO APPROVED]** — R3 is **not** retired. Order: Fix A (done) →
+  verify 3727 actually deployed and writing archives (θ) → 3578 →
+  reassess 3730/3733 (ι). Task 3989 (the decide-task) was cancelled
+  2026-08-10 20:59Z once this ruling superseded it; its architect
+  dry-run's polarity dispute (does `reseeded=0` prove the config dir
+  survives or was deleted?) is folded into θ as an explicit
+  question-to-settle, since it determines what 3578's restore actually
+  has to fix. The "pause 3732" directive in the brief is **moot**: 3732
+  went done 2026-08-10 16:09Z, and it is a recon-reliability task (Stage
+  2 cycle-summary backstop), not an eligibility-seam leaf as the brief
+  assumed.
+- **D5 [LEO APPROVED]** — Exit-on-drain, not rotation-length tuning.
+  Rotation length is a ±3.5% knob (2-6h plateau); 58.2% of all watcher
+  spend happens after the last unit of work, and 88.4% of turns are a
+  poll loop `_watcher_has_actionable_l1()` already runs for free at 60s
+  cadence between rotations. Prerequisites first (α, β, γ): the
+  session-context dependence is an artifact of calling the API wrong
+  (compact drain drops `root_cause`/`members`; `add_members_to_l2`
+  discards 24.3% of authored framing; the archive is never queried), so
+  make the durable channels sufficient **before** shortening the
+  effective window. `watcher_rotation_hours` is left alone.
+- **D6** — The exit-on-drain landmine: 5 clean exits under
+  `watcher_misconfigured_min_rotation_secs` (120s) in 10 minutes trips
+  `pause_scheduler('watcher_misconfigured')` — pausing the **scheduler**,
+  not just the watcher. Exit-on-drain is behaviourally identical to the
+  failure this guard catches, so **the exit reason must become explicit
+  and machine-readable, and the guard change lands in the same task as
+  exit-on-drain (δ), never separately**. The guard's storm-escape
+  purpose is retained for exits *without* the drained marker (INV-4).
+- **D7** — Recon Landlock fix shape (η): grant the **per-run** recon
+  config dir to the sandbox writable set as a **computed writable extra**
+  appended per invocation, with containment machine-checked at
+  `resolve_recon_sandbox_wrap`. Neither of the two shapes originally
+  floated here — a `sandbox_recon_writable_extras` schema default, or
+  relocating `recon_config_base_dir` under `<explore_codebase_root>/.task/`
+  — is taken: both leave every run's config dir writable by every other
+  run, i.e. cross-run `.credentials.json` write access (see §11 open
+  question 5, decided in this leaf). This *activates* R6 and
+  recon transcripts — acceptable only because Fix A is on main (D1).
+  Side benefits: the recon cap-retry veto stops force-fresh re-work
+  (~110-150k tokens/day floor), `count_transcript_turns` starts
+  returning real values so the progress-based timeout extension engages
+  for recon, and task 3972 (recon transcript archival) becomes
+  satisfiable — it gains a dependency edge on η.
+- **D8** — Observability detector: the `cache_read_tokens == 0` rule
+  does **not** work against `runs.db` (run-level aggregate; 0 of 20,644
+  rows have it). The detector reads the **first assistant message** of
+  the transcript; sharpest discriminator is that message's
+  `input_tokens` (~2066 stock vs 245-446 custom). Owned by 3986; 3992's
+  audit depends on it. A *generalized* "substrate liveness gate"
+  (assert a recovery path has executed at least once, fleet-wide) is
+  out of scope (§8); the specific instances land via 3986's events and
+  θ's deployment check.
+
+## 5. Pre-conditions for activating
+
+All satisfied at authoring time:
+- Fix A on main (`03ff70c5dd`), tests inverted — verified by reading
+  `main` (not the working tree).
+- Substrate facts for every new leaf verified against main 2026-08-10
+  (see the capability manifest beside this PRD).
+- 3727 (`durable_archive_path` + `archive_available` instrumentation)
+  is `done` — but its **deployment** to the running fleet is exactly
+  what θ exists to verify before 3578 proceeds
+  (`data.archive_available` is NULL on all 260 historical fallbacks,
+  consistent with known fleet-deploy staleness).
+
+  > **CORRECTION 2026-08-11: the staleness reading is REFUTED.** The
+  > NULLs are not evidence of a stale fleet, and nothing was "cleared"
+  > by a restart. The error was splitting the corpus on the **fleet
+  > restart**; splitting it on the **3727 merge** instead dissolves the
+  > reading entirely.
+  >
+  > Anchors (verified this session):
+  > - the merge is `c2ece76742` "Merge task/3727 into main", author and
+  >   commit date `2026-08-10T07:55:57+01:00` = **`2026-08-10T06:55:57Z`**,
+  >   confirmed first-parent on `main`;
+  > - the fleet boot is `orchestrator-dark-factory.service`
+  >   `ExecMainStartTimestamp` = `2026-08-11 10:10:37 BST` =
+  >   **`2026-08-11T09:10:37Z`**.
+  >
+  > Measured against `data/orchestrator/runs.db`:
+  > - dark-factory emitted **ZERO** `session_resume_fallback` events in
+  >   the whole window between the merge and the boot. The last of the
+  >   260 NULL events is `2026-08-09T19:41:38Z` — **before** the merge;
+  >   the first non-NULL is `2026-08-11T09:22:50Z` — **after** the boot.
+  >   The split on the merge is a clean 2×2 with empty off-diagonals:
+  >   **260/260 NULL predate the merge, 8/8 non-NULL postdate it.** So
+  >   the NULLs simply PREDATE the instrumentation reaching main. They
+  >   were never evidence about deployment at all.
+  > - the restart is exonerated by a second project: **reify** emitted
+  >   two events INSIDE the post-merge/pre-boot window
+  >   (`2026-08-10T16:47:04Z` and `2026-08-10T17:33:15Z`), both already
+  >   carrying `archive_available=true`, from the PREVIOUS process
+  >   incarnation. The field was live *before* any restart.
+  >
+  > **The field went live AT THE MERGE, not at the restart.** Nothing
+  > was broken. This matters beyond θ: the "known fleet-deploy
+  > staleness" framing has already propagated into other records, and
+  > it is wrong here. θ's *deployed-code check* remains worth doing on
+  > its own merits — but it is no longer diagnosing a suspected
+  > outage, and the RED premise it was given has evaporated.
+  >
+  > Source: the θ gate report recorded on task **4005** (now `done`);
+  > re-verified independently against git, systemd and `runs.db`.
+
+## 6. Cross-PRD relationship (G4)
+
+| Other PRD / owner | Direction | Seam mechanism | Owner | Status |
+|---|---|---|---|---|
+| `plans/session-resume-eligibility-seam-prd.md` (3727 done; 3728/3729/3730/3731/3733 pending) | this PRD gates | ordering: eligibility tuning must not outrun a working substrate | eligibility PRD owns its leaves; **this PRD owns the gates** (θ before 3578; ι reassesses 3730/3733 after) | θ, ι queued |
+| `plans/transcript-preservation-seam-prd.md` (3578, 3618, 3619) | this PRD gates | R3 revival = charter-stripping switch-on hazard (D1) | that PRD owns the restore; this PRD owns the Fix-A gate (wired: 3578 `depends_on` 3983) + the θ deployment gate (wired: 3578 `depends_on` θ) | wired |
+| `plans/warm-lane-session-resume-prd.md` | consumes correction | false-belief §9 site 3 ("resumed session runs under the pre-restart system prompt by construction") | 3991 (this programme) | queued |
+| `plans/agent-liveness-telemetry-resume-prd.md` | adjacent | `invocations` schema additions (`resumed`, `session_id`, `sysprompt_sha`) | 3986 (this programme) produces; liveness PRD consumes | noted in 3986 |
+| escalation-l2-tiering machinery (tasks 1499/1504, landed) | this PRD amends | compact projection fields; `add_members_to_l2` write path; `find_pending_l2_by_root_cause` matching | α, β (this PRD) | queued |
+| task 3089 (pending, `/tmp` hygiene) | referenced | orphaned `/tmp/sysprompt_*.txt` producer-side fix (step-0 leftover) | 3089 | already filed — not duplicated here |
+| task 3972 (pending, recon transcript archival) | this PRD unblocks | recon transcripts must exist before they can be archived | 3972 owns archival; η owns existence (wired: 3972 `depends_on` η) | wired |
+| `plans/recon-reliability-prd.md` (3732) | none (moot) | brief assumed 3732 built on R3 — it does not, and it is done | — | closed |
+
+## 7. Decomposition plan
+
+### 7a. Absorbed batch (already filed 2026-08-10; listed for the programme record — do NOT re-file)
+
+| Task | Step (brief §12) | Status | Deps | Signal (as filed) |
+|---|---|---|---|---|
+| 3983 | 0 — Fix A | **done** (merged `03ff70c5dd`) | — | resumed argv contains `--system-prompt-file`; first-turn `input_tokens` custom-sized |
+| 3984 | 1b — R7 `resume_delivers_prompt=True` | pending | — | serialized tool results reach the CLI on turn ≥ 2 (not `CRASH_RECOVERY_RESUME_PROMPT`) |
+| 3985 | 1a — gamma-specific resume prompt | pending | — | ceiling-kill resume delivers a truthful prompt; new test (do not edit `test_crash_recovery.py:2427-2461`) |
+| 3986 | 2 — resume observability | pending | — | `invocations` carries `resumed`/`session_id`; cap-hit resume emits an event; first-turn detector |
+| 3987 | 3 — stop resuming watcher + unblock_auto; bound cap retries | pending | 3983 | those two roles retry FRESH on cap hit |
+| 3988 | 5 — `start_report` idempotency guard | pending | — | second `start_report` no-ops/errors loudly; findings survive |
+| 3989 | (R3 decision) | **cancelled** — superseded by D4 | — | — |
+| 3990 | (recon transcript question) | **to cancel at decompose** — answered: Landlock (§2, D7); resolution recorded in-task before the flip | — | — |
+| 3991 | 6 — false-belief + kill-switch remediation | pending | 3983 | all §9 sites corrected; kill-switches decided + documented in OPERATIONS.md; **amended at decompose to add §9 item 9** (escalation-watcher SKILL.md's inverse-differential incident note) |
+| 3992 | 8 — damage audit (scope sign-off first) | pending | 3986 | scoping proposal → human sign-off → audit of ~30 recent breaches first |
+| 3993 | (defence-in-depth) deny `Skill` to watcher-auto | pending | — | `Skill` in `_WATCHER_DISALLOWED_TOOLS` + test |
+| 3994 | (defence-in-depth) lease ownership checks | pending | — | `lease-release`/`heartbeat` enforce holder-only mutation via `--slug`; contention message legible. *(Task 4248 later moved the slug into the CLI — `--slug` is now derived, not required; the ownership check is unchanged.)* |
+
+### 7b. New leaves (filed by this decompose; Greek labels stamped into the sidecar)
+
+| Label | Title | Modules | Prio | Deps | User-observable signal (RED today) | Consumer |
+|---|---|---|---|---|---|---|
+| α | Escalation drain durability: compact projection carries `root_cause`+`member_ids`; `add_members_to_l2` stops discarding authored framing | `escalation/src/escalation/server.py`, `escalation/src/escalation/queue.py` | high | — | `get_pending_escalations(compact=True)` rows carry `root_cause` and `member_ids` (today: dropped); a promote that folds into an existing L2 preserves the incoming `root_cause`/`evidence`/`options` text on the record (today: only `members` survive — 24.3% of authored L2 framing discarded at write time); pinning tests `test_compact_projection_carries_root_cause`, `test_add_members_preserves_incoming_framing`. En route: fix the tool docstring drift (it lists 9 compact fields; the tuple returns 13 — the 4 triage-ack fields are undocumented) | γ, δ; every watcher rotation (can rebuild `already_promoted` from the queue instead of memory) |
+| β | Root-cause canonicalisation in `find_pending_l2_by_root_cause` (~155 duplicate L2s = 30% of all created) | `escalation/src/escalation/queue.py` (**the function β must change** — `find_pending_l2_by_root_cause` at ~:825-864, exact-match expression at ~:851), `escalation/src/escalation/server.py` (docstring only) — **CORRECTION 2026-08-11:** this cell originally named `server.py` alone, which is wrong: `server.py` holds no implementation of the match, only the "exact-string dedup key" docstring at `:1340-1342`. Verified with `git grep -n "def find_pending_l2_by_root_cause"` (sole non-test definition: `queue.py:825`). The capability manifest's β section already had this right. | high | α | two promotes whose `root_cause` differ only in case/whitespace/punctuation fold into ONE L2 (today: exact string match only); pinning test `test_root_cause_match_is_canonicalised` | δ; the human L2 queue (fewer duplicates) |
+| γ | Auto-watcher drain loop: drain non-compact (or the α-enriched projection) + query the escalation archive | `skills/escalation-watcher-auto/SKILL.md` | high | α | the drain loop's documented queries include an archive-inclusive read (`get_task_escalations(status=None)`; `get_pending_escalations` is pending-only **by design**, server.py) and rebuild `already_promoted` from projection fields, not session memory. Sharper defect fixed en route (verified 2026-08-10): today's step 3 unions `members` of *pending* L2s only, so a **resolved** L2's members fall straight back into `work_batch` — the archive read closes that hole. The 17 window-dependent finding classes become recoverable at any window length | δ; watcher rotations |
+| δ | **[LEO APPROVED]** Exit-on-drain + degenerate-exit guard change **in the same task** | `skills/escalation-watcher-auto/SKILL.md`, `orchestrator/src/orchestrator/harness.py`, orchestrator defaults config | high | α, β, γ | a rotation that finds the queue drained exits early with a machine-readable `exit_reason=drained` marker the supervisor reads; drained exits do NOT count toward `watcher_max_misconfigured_clean_exits`; a <120s clean exit *without* the marker still trips the guard (pinning tests `test_drained_exit_does_not_trip_misconfigured_guard`, `test_unmarked_fast_exit_still_trips_guard`); watcher spend after last-work drops from 58.2% | fleet cost budget; scheduler safety (guard keeps its storm escape) |
+| ε | Quiet-project watcher cost containment + fix the daily-ceiling under-count | orchestrator config for the 4 quiet projects; `orchestrator/src/orchestrator/harness.py` (ceiling enforcement) | medium | — | zero-work rotations stop launching on know-live / autopilot-video / my-solar-challenge / solar-challenge (verify the 2629 empty-queue launch gate is deployed & firing there — deployed-code check, not source check); `watcher_daily_cost_ceiling_usd` enforcement compensates the measured ~40% runs.db under-count; quiet-project watcher spend (was $1,960 / 28% of fleet for 138 dispositions) drops measurably | fleet cost budget |
+| ζ | unblock_auto: CLI-enforced read-only envelope + a cap-wait bound that actually governs | `orchestrator/src/orchestrator/dry_run_unblock.py`, `shared/src/shared/cli_invoke.py` / `usage_gate.py`, orchestrator config | high | 3987 | the dry-run invocation argv carries an explicit permission mode + a write-tool denylist (today: `permission_mode` never passed at the call site — inherits `bypassPermissions` from `invoke_claude_agent`'s default; read-only is prose + advisory allowlist); the 1800s `_DRY_RUN_CAP_WAIT_SANITY_SECS` bounds the **real** wait — today `_check_cap_wait` is a `cli_invoke.py` closure called only inside the cap-hit retry loop (`:1896`/`:1988`), while the actual wait sits in `usage_gate.invoke_slot`, bounded by nothing (overshot 11× at 19,805s); pinning tests `test_dry_run_argv_denies_write_tools`, `test_cap_wait_sanity_bound_governs_slot_wait`. Dep on 3987: same cap-retry seam in `cli_invoke.py`, and the bound must be designed against 3987's fresh-retry semantics for this role | `/unblock-low-risk` (its `risk_label` gates autonomous merge-to-main); the fleet cost budget |
+| η | Recon Landlock fix: put the recon config dir inside the sandbox writable set (activates R6 + recon transcripts) | `fused-memory/src/fused_memory/config/schema.py` or `.../reconciliation/cli_stage_runner.py`, `orchestrator/src/orchestrator/agents/landlock_exec.py` (stale comment) | high | 3983 | a recon stage session writes a transcript into its per-run config dir (today: ZERO transcripts anywhere since 2026-07-18 — probe: `CLAUDE_CONFIG_DIR/projects` → `PermissionError`); a capped recon stage RESUMES instead of retrying fresh; `count_transcript_turns` returns non-None for recon; pinning test `test_recon_config_dir_is_landlock_writable` | recon stages (~9 cap hits/day stop paying full re-work); R6; 3972 (archival — dep wired); 3990's answer made durable |
+| θ | Verify 3727 is deployed & writing `archive_available`; settle the `no_transcript` polarity dispute — gate for 3578 | operational: fleet units, `runs.db`, `data/orchestrator/agent-transcripts/` | high | — | a fresh `session_resume_fallback` event carries non-NULL `data.archive_available` (today: NULL on ALL 260, despite 3727 landing 2026-08-06/07 — the discriminator between "not deployed" and "deployed but broken") — **CORRECTION 2026-08-11: both halves of that parenthesis are wrong.** (a) **The landing date is wrong.** 2026-08-06/07 are *branch-authoring* dates; the merge to main is `c2ece76742`, `2026-08-10T07:55:57+01:00` = **`2026-08-10T06:55:57Z`**, verified first-parent on `main`. (b) **"NULL on ALL 260" reports the NULL arm as the total** — 260 NULL + 4 non-NULL = 264 at gate-report time, 268 (260 + 8) as of 2026-08-11T15:12Z. (c) Consequently the discriminator this row was built to resolve **does not apply**: the corpus splits cleanly on the *merge* (260/260 NULL before, 8/8 non-NULL after, zero events in between), so the instrumentation is neither "not deployed" nor "deployed but broken" — it went live at the merge and is emitting. See the §5 correction; source is the gate report on task 4005 (`done`). The deployed-code check retains value as routine hygiene, but its RED premise is gone; plus a written answer to the 3989-architect polarity dispute (`reseeded=0`: does the config dir survive or not in the `no_transcript` population?) with per-event evidence; `ExecMainStart`-style deployed-code check, not a source check | 3578 (dep wired); the transcript-preservation PRD |
+| ι | Reassess 3728/3729/3730/3733 against a working resume baseline | decision (no code) | medium | 3578 | each of 3728/3729/3730/3733 is either re-affirmed (note recorded on the task) or cancelled/re-scoped with rationale — decided against MEASURED post-3578 resume data, not the pre-fix baseline | the eligibility-seam PRD's remaining leaves |
+
+### 7c. Amendments to existing records (performed at decompose, not new tasks)
+
+1. **3990** — record the answer (Landlock, §2/D7; R6 dead; breach rates
+   re-derived: resumed 73.8% vs non-resumed 1.26%, direction unambiguous,
+   exact historical percentages unsupported) in the task's `details`,
+   then `cancelled`. No dependents exist (verified across the batch), so
+   the cancel arms nothing.
+2. **3991** — append to `details` (verified against main `03ff70c5dd`):
+   (i) §9 item 9: the `skills/escalation-watcher/SKILL.md` task-2796
+   note at ~:1048-1059 (section "Recognizing the supervised
+   auto-watcher's resolutions") frames this failure class as its
+   **inverse** ("Capped identity leaking into an interactive session")
+   and closes the differential with "the supervised rotation is no
+   longer the likely culprit — suspect a hand-injected `--mcp-config`"
+   — the real third cause (a resumed rotation that lost its charter and
+   believes it is interactive) is absent; a 2026-08-08 rotation read it
+   and certified the wrong self-diagnosis. Add the third differential.
+   (ii) Post-Fix-A reframing: the sites that stated the drop mechanism
+   CORRECTLY as in-tree evidence (`judge.py:36-37/:212-213/:605-606`,
+   `test_judge.py:1774/:3036`) are now **stale present-tense** — they
+   describe a drop that no longer exists on main. Recast them as
+   historical ("dropped until task 3983, 2026-08-10") preserving the
+   incident record, and refresh the rotted `cli_invoke.py` citations
+   (`1501-1503`→ current `~2202-2218`, `1552-1553`→`~2220`,
+   `1270-1272`→`~1870-1871`). (iii) Confirmed still-false sites beyond
+   the task's existing list: both plans (`warm-lane-session-resume-prd.md
+   :138-144`, `fused-memory-restart-survey-2026-07-17.md:197-200`) were
+   NOT touched by 3983's docs commit (it changed only `cli_invoke.py`),
+   and `reconciliation/harness.py`'s `InterruptedRunResumeDisabled`
+   branch is now at `:1656-1673`.
+3. **3578** — `add_dependency` on θ (deployment gate before the restore
+   work dispatches). Its 3983 edge already exists.
+4. **3972** — `add_dependency` on η (no recon transcripts exist to
+   archive until Landlock admits them), plus a one-line `details` note.
+5. **3089** — one-line `details` note: Fix A **doubled** the
+   `/tmp/sysprompt_*.txt` creation rate (the resume path now mkstemps
+   one per invocation too), and cleanup remains purely per-call
+   `finally` — no sweeper exists (verified: repo-wide grep finds only
+   the mkstemp + per-call unlinks). The SIGKILL-orphan population now
+   grows faster than when 3089 was filed.
+
+## 8. Out of scope
+
+- **Performing** the damage audit (3992 delivers scope first; execution
+  needs human sign-off — the brief's step 8 says scope it, do not do it).
+- Retiring R3 (D4 rules it stays) or redesigning warm-lane semantics —
+  owned by `transcript-preservation-seam-prd`.
+- A generalized substrate-liveness gate ("every recovery path must
+  prove it has executed at least once") — a real idea the R3/R6 pattern
+  motivates (two subsystems built, tested and refined on never-executed
+  substrate), but a fleet-wide mechanism deserves its own PRD once
+  3986's events exist to build it on. The specific instances are
+  covered (3986, θ).
+- Changing `watcher_rotation_hours` (D5: ±3.5% knob, wrong lever).
+- The `/tmp/sysprompt_*.txt` leak — owned by existing task 3089.
+- `--agent`-based reinforcement of charters (appends over stock;
+  ARG_MAX hazard; explicitly NOT a substitute for Fix A).
+
+## 9. Contract section (B+H — new seams only)
+
+**C1. Compact drain projection (α).** `get_pending_escalations(compact=True)`
+returns, per escalation: today's compact fields **plus** `root_cause: str`
+and `member_ids: list[str]`. `detail` stays dropped (the size rationale
+survives). Consumers may rebuild `already_promoted` as
+`{canonical(root_cause) for L2s} ∪ {member_ids}` with no session memory.
+
+**C2. Promote-fold preservation (α).** When `promote_to_l2` folds into an
+existing L2 (`status:'updated'`), the incoming `root_cause`/`evidence`/
+`options` text is appended to the record (amendment list or appended
+evidence block with timestamp + submitting session), never discarded.
+Storage growth is bounded (cap the amendment list; log on truncation —
+no silent loss).
+
+**C3. Canonical root-cause matching (β).** `find_pending_l2_by_root_cause`
+matches on a canonicalised form (case/whitespace/punctuation-normalised;
+optionally similarity-thresholded). Canonicalisation lives in exactly
+one function used by both match and store paths (INV-5). Two L2s created
+before β with equivalent root causes are NOT retro-merged (out of scope).
+
+**C4. Drained-exit marker (δ).** A rotation exiting because
+`get_pending_escalations` (per the γ protocol, archive-inclusive where
+specified) returns no actionable work emits a machine-readable marker —
+a structured final-output field or sentinel the supervisor parses
+(`exit_reason=drained`), not free prose. Supervisor contract: an exit
+WITH the marker bypasses the `watcher_max_misconfigured_clean_exits`
+counter (its own bounded counter/telemetry instead); an exit WITHOUT it
+keeps today's guard semantics unchanged. Today's supervisor splits at
+`duration < watcher_misconfigured_min_rotation_secs` (harness.py:11492):
+degenerate-clean feeds the guard, and **only healthy-clean clears the
+watcher-outage L2** (`:11538-11548`) — δ must define the drained exit's
+relation to BOTH: it must not feed the misconfigured guard, and it must
+count as a liveness signal for outage-clearing purposes (the watcher
+demonstrably ran and drained). `_watcher_has_actionable_l1()` remains
+the relaunch gate, so drain-exit cannot thrash (it already subtracts
+pending-L2 members).
+
+**C5. unblock_auto envelope (ζ).** The dry-run invocation passes an
+explicit permission mode and a denylist covering write tools (`Edit`,
+`Write`, `NotebookEdit`, plus mutation-bearing MCP tools it must not
+call) — flag-enforced, resume-surviving per the organising principle.
+The cap-wait sanity bound is enforced where the wait actually happens
+(`usage_gate.invoke_slot` path), not only in the cap-hit branch.
+
+**C6. Recon writable set (η).** The **per-run** recon config dir —
+`<data_dir>/recon-config/claude-config-<run_id>` — is a member of the
+sandbox writable set for that run's stage invocations, granted as a
+**computed writable extra** appended per invocation by
+`cli_stage_runner.run_stage_via_cli`. `recon_config_base_dir(data_dir)`
+itself is **never** granted, so every sibling run's config dir (and its
+`.credentials.json`) remains read-only under the ruleset. Containment is
+**machine-checked** at `sandbox_guard.resolve_recon_sandbox_wrap`, which
+fails closed (`RemediationSandboxUnavailable`) if the config dir it is
+handed is not inside the writable set that will be built — so a future
+edit that drops the grant refuses to launch instead of silently
+producing a transcript-less stage. The stale claim in `landlock_exec.py`
+(~:20-23) is corrected in the same change, along with its twin in
+`sandbox.py`'s bwrap docstring.
+
+The containment roots are `<cwd>/.task` **plus each existing extra** — and
+pointedly **not** `/tmp` (amendment, 2026-08-18). Landlock grants the host
+`/tmp` blanket but `build_bwrap_command` mounts `--tmpfs /tmp` before its
+binds, so "under `/tmp`" denotes two different things per backend: a config
+dir there that is not *also* an explicit extra would lose its pre-spawn
+`.credentials.json` and write its session JSONL into a tmpfs the parent can
+never read — the 2026-07-18 defect reproduced while the check said PASS.
+Symmetrically, the "does this root exist?" filter applies to the **extras
+only**: both backends `makedirs` `<cwd>/.task` before granting it, so
+filtering it out would fail closed on a fresh cwd and — since
+`run_stage_via_cli` treats that as fatal — error every stage. That matters
+directly to open question 5, whose considered alternative is relocating the
+config dir under `<cwd>/.task/`.
+
+Credential isolation is **enforced by the ruleset**, not merely preserved
+by naming: it is the per-run grant plus the containment assertion that
+keep it, and the earlier framing — "nothing new is shared across runs —
+per-run dirs stay per-run" — was FALSE for the schema-default-grant shape
+this section originally admitted. Granting the base would have made every
+run's `.credentials.json` writable by every other run, a capability that
+does not exist today (corrected under η's Amendment finding 1).
+
+> **CORRECTION 2026-08-11: the credential-isolation clause is true for
+> directory NAMING and FALSE for the WRITABLE SET.** Per-run dirs do
+> stay per-run — but that is a statement about paths, not about who can
+> write them, and C6 as drafted conflates the two.
+>
+> The first sentence of C6 grants "the recon per-run config dir
+> **root**". That root is `recon_config_base_dir(data_dir)`, which
+> returns `data_dir / 'recon-config'`
+> (`fused-memory/src/fused_memory/reconciliation/cli_stage_runner.py:369-377`)
+> — the single directory *under which every run's*
+> `claude-config-<run_id>` lives. Granting the ROOT to a Landlock
+> ruleset therefore gives **every recon stage write access to every
+> other run's `.credentials.json`**. "Nothing new is shared across
+> runs" is exactly what the schema-default-grant remedy would break.
+>
+> **Open question 5 is therefore a SECURITY decision, not a tactical
+> placement choice**, and must be recorded as one — see §11 Q5.
+>
+> **Resolved in the safe direction.** Task **4003** (in-progress at the
+> time of writing — recorded here as the decision, not as landed code)
+> grants the **per-run** dir as a *computed extra*, never the base,
+> with regression assertions that both the base dir and a sibling run's
+> dir are NOT writable. Once 4003 lands, C6's isolation clause becomes
+> true of the writable set as well as of the naming.
+
+## 10. Boundary-test sketch (B+H)
+
+| # | Scenario | Preconditions | Postconditions |
+|---|---|---|---|
+| B1 | producer side, α: compact projection carries the new fields | pending L2 with root_cause + members | `compact=True` row has `root_cause`, `member_ids`; no `detail` |
+| B2 | consumer side, γ→α: rebuild `already_promoted` cold | fresh session, 2 pending L2s, 1 archived | dedup set correct with zero session memory |
+| B3 | producer side, α: fold preserves framing | existing L2; promote with new evidence text | record carries both framings; nothing dropped |
+| B4 | β both sides: near-duplicate root causes fold | L2 "Watcher lease stolen."; promote "watcher lease STOLEN" | `status:'updated'`, one L2, member linked |
+| B5 | δ supervisor side: drained exit is benign | rotation exits <120s WITH marker, 6× in 10 min | no `pause_scheduler('watcher_misconfigured')`; drained counter increments |
+| B6 | δ guard side: storm escape retained | rotation exits <120s WITHOUT marker, 5× in 10 min | guard trips exactly as today |
+| B7 | ζ CLI side: denylist survives resume | dry-run resumed (pre-3987) or fresh | write-tool call fails at the CLI, not by prose |
+| B8 | η sandbox side: transcript exists | recon stage runs under the real ruleset | `<config_dir>/projects/**/*.jsonl` exists; `count_transcript_turns` ≥ 1 |
+| B9 | η veto side: cap-hit resume proceeds | capped recon stage, transcript present | resume (not force-fresh); charter present post-3983 |
+| B10 | θ operational: instrumentation live | fresh fallback event on a restarted unit | `data.archive_available` non-NULL either way; polarity question answered from the same event's config-dir stat |
+
+## 11. Open questions (tactical only)
+
+1. **α field naming** — `member_ids` vs reusing `members` with ids-only
+   shape. Suggested: new key `member_ids`, leaving `members` semantics
+   untouched for non-compact consumers. Decide in α.
+2. **β similarity mechanism** — pure canonicalisation vs embedding/fuzzy
+   threshold. Suggested: start with deterministic canonicalisation
+   (measurable, no tuning); revisit if the duplicate rate stays high.
+   Decide in β.
+3. **δ marker transport** — structured stdout sentinel vs a file the
+   supervisor stats vs exit-code repurposing. Constraint: the supervisor
+   currently reads only two booleans (3986 §evidence), so whichever
+   transport is chosen must be read there. Decide in δ with 3986's hook
+   points in view.
+
+   > **NOTE 2026-08-11 — a fourth option, now RECOMMENDED.** All three
+   > options above put the contract in prose or convention (a sentinel
+   > the supervisor must agree to parse, a filename both sides must
+   > agree on, an exit code both sides must agree to interpret), which
+   > is precisely what INV-1 `contracts-machine-checked` exists to
+   > prevent. The fourth option: pass an **`output_schema`** with a
+   > required `exit_reason` enum, so the marker is **CLI-validated** at
+   > the producing boundary rather than agreed by convention at the
+   > consuming one. In-repo precedent:
+   > `orchestrator/src/orchestrator/dry_run_unblock.py:368`
+   > (`output_schema=DRY_RUN_PROPOSAL_SCHEMA`); the same seam is used
+   > by the module tagger (`harness.py:2883`) and plumbed centrally
+   > through `shared/src/shared/cli_invoke.py:1142`. Verified this
+   > session. This also settles δ's own §12 INV-1 line in the strong
+   > direction rather than the "structured sentinel" one.
+4. **ε mechanism split** — how much of the quiet-project saving δ
+   already captures; ε's description directs re-measuring after δ lands
+   before adding config. Decide in ε.
+5. **η placement** — **DECIDED in η (task 4003): neither.** The per-run
+   config dir is granted as a **computed writable extra** per invocation,
+   with containment machine-checked at `resolve_recon_sandbox_wrap`.
+   Both originally-offered options lose on the same axis — cross-run
+   credential write access:
+   - *schema-default grant* — the value would have to be
+     `recon_config_base_dir(data_dir)`, the root under which every run's
+     `claude-config-<run_id>/.credentials.json` lives, so every recon
+     stage would gain write access to every other run's credentials.
+   - *relocation under `<explore_codebase_root>/.task/`* — does not fix
+     that in substance: `.task` is granted as a whole subtree, so all
+     sibling run dirs would still be mutually writable, and it would
+     additionally move OAuth credentials inside the repo checkout and
+     force GC (`gc_run_config_dir`) and harness-sweep path changes.
+
+   > **RESOLVED 2026-08-11 — and it was a SECURITY decision, not a
+   > tactical one.** This question was framed as a placement trade-off
+   > weighing blast radius against contract documentation. That framing
+   > understated it. As recorded in the §9 C6 correction, the
+   > schema-default-grant reading of C6 grants
+   > `recon_config_base_dir(data_dir)` = `data_dir / 'recon-config'`
+   > (`cli_stage_runner.py:369-377`) — the **root** over all runs — which
+   > would hand every recon stage write access to every other run's
+   > `.credentials.json`. The choice was therefore between two options
+   > with materially different credential-isolation properties, not
+   > between two equally-safe placements.
+   >
+   > **Resolution: grant the PER-RUN dir as a computed extra, never the
+   > base.** Owned by task **4003** (in-progress at time of writing),
+   > which carries regression assertions that the base dir and a sibling
+   > run's dir are NOT writable.
+
+## 12. G7 walk (advisory record; full walk at decompose)
+
+- α/C2: INV-2 applied (stop discarding emitter-known facts at write
+  time); bounded amendment list satisfies INV-7's bound requirement.
+
+  > **CORRECTION 2026-08-11 — INV-2 is a LOOSE FIT here.** INV-2's shape
+  > requires a **re-derivation site**: some consumer forced to recover by
+  > log-scraping a fact the emitter already held. There is no such site
+  > for C2 — no consumer re-derives the discarded framing from logs; the
+  > emitter simply drops the data and it is gone. That is a real defect,
+  > but it is not the defect INV-2 names. α's actual invariant hits,
+  > established by a full walk against
+  > `docs/legibility/design-invariants.md`:
+  >
+  > - **INV-5 `no-lockstep-duplication`** — the compact-projection field
+  >   list is hand-maintained in **multiple copies that have ALREADY
+  >   DRIFTED**. Source of truth is the tuple
+  >   `_COMPACT_ESCALATION_FIELDS` at
+  >   `escalation/src/escalation/server.py:292-296`, which returns **13**
+  >   fields. The `get_pending_escalations` docstring at
+  >   `server.py:1081-1088` enumerates only **9** — the four triage-ack
+  >   fields (`triaged_at`, `triaged_by`, `triage_note`, `updated_at`)
+  >   are undocumented. Two further hand-maintained copies enumerate all
+  >   13 and are correct *today*, with nothing holding them so:
+  >   `escalation/tests/test_server.py:338-342` (a literal
+  >   `_COMPACT_KEYS` set, **not** derived from the constant — a test
+  >   encoding a constant's VALUE rather than its NAME) and
+  >   `skills/escalation-watcher/SKILL.md:106-107`. α already owns
+  >   fixing the docstring drift (§7b α row); INV-5 says the fix is
+  >   **render-from-source or a drift test**, not a fourth transcription.
+  > - **INV-4 `storm-escape-required`** — C2's "log on truncation" is
+  >   **not a storm escape**. It names no rate, no streak threshold, and
+  >   no hearer; INV-4's checkable question ("if this fires 100× in an
+  >   hour, who hears about it, and via what counter?") has no answer as
+  >   drafted.
+  > - **INV-7 `holds-owned-and-bounded`** — C2 says "cap the amendment
+  >   list" but names **no cap VALUE and no owner**. INV-7 requires a
+  >   machine-readable owner plus an actual bound; "bounded" as an
+  >   adjective does not discharge it. The original line above claims
+  >   this requirement is already satisfied — it is not.
+- δ/C4: INV-1 (exit reason machine-checked at the consuming supervisor,
+  not prose); INV-4 (the misconfigured guard's storm escape retained for
+  unmarked exits; drained exits get their own bounded counter).
+- ζ/C5: INV-1 (read-only becomes a CLI-enforced envelope);
+  INV-7 (the unbounded `invoke_slot` wait gains its governing bound).
+- ε: INV-4 repair (a cost ceiling enforced against an under-counted
+  store is a silent fail-soft).
+- η/C6: INV-1 `contracts-machine-checked` (a capability envelope — "the
+  per-task `CLAUDE_CONFIG_DIR` is writable" — lived in a prose comment
+  plus an empty-by-default config list, and the mismatch between the two
+  was discovered by failure three weeks late; the containment assertion
+  at `resolve_recon_sandbox_wrap` converts it to an enforced check) and
+  INV-4 `storm-escape-required` (the None-transcript degrade absorbed the
+  `PermissionError` with no rate, no bound and no signal;
+  `note_unreadable_transcript` is the escape — see the scope note below).
+  Correcting the `landlock_exec.py` comment does **not** satisfy INV-1 —
+  a corrected comment is still a prose contract, and the whole failure
+  is that a comment cannot notice when it stops being true.
+
+  > **CORRECTION 2026-08-11 — WRONG SLUG.** This row originally read
+  > `INV-3`; the slugs above are the corrected assignment. INV-3
+  > `corroborate-before-acting` governs state read from a
+  > snapshot/cache/metadata and then **acted on** without
+  > re-corroboration. Nothing ACTS on the stale `landlock_exec.py`
+  > comment — it is documentation, not a read — and there is no
+  > snapshot-vs-ground-truth read anywhere in this seam to re-corroborate.
+  > INV-3 does not fit. η's actual hits:
+  >
+  > - **INV-1 `contracts-machine-checked`** — this is the textbook
+  >   instance. A **capability envelope** (what the recon sandbox may
+  >   write) lives in a **prose comment** at
+  >   `orchestrator/src/orchestrator/agents/landlock_exec.py:20-23`
+  >   plus an **empty-by-default list**
+  >   (`sandbox_recon_writable_extras`, `schema.py:1116`, defaulting to
+  >   `[]` and unset in `fused-memory/config/config.yaml`). INV-1's own
+  >   checkable question — "does a new tool/agent surface declare its
+  >   envelope where callers see it, or is it **discovered by
+  >   failure**?" — is answered by this incident: it was discovered by
+  >   failure, over three weeks late. INV-1's cited survey evidence even
+  >   names `watcher-capability-envelope` as the same family.
+  > - **INV-4 `storm-escape-required`** — the second and more
+  >   consequential hit. The `PermissionError` did not surface for over
+  >   three weeks (ZERO recon transcripts anywhere since 2026-07-18, per
+  >   η's RED premise) because it was **absorbed by fail-soft `except
+  >   OSError` handling that degrades to a WARNING and continues**
+  >   (`PermissionError` is an `OSError` subclass; e.g.
+  >   `shared/src/shared/config_dir.py:247-248` on the config-dir setup
+  >   path). No rate, no streak, no counter — so a failure that fired on
+  >   **every recon stage, every run, for three weeks** was
+  >   indistinguishable from silence. That is exactly the fail-soft
+  >   INV-4 exists to forbid, and it is what turned a one-line config
+  >   defect into a three-week subsystem outage.
+  >
+  >   **SCOPE of the escape as built (amendment, 2026-08-18).**
+  >   `note_unreadable_transcript` is wired into the **watchdog poll
+  >   sites only** (`shared/src/shared/cli_invoke.py`, both
+  >   `count_transcript_turns() is None` branches). The **cap-retry
+  >   force-fresh** — the other consumer of the same unreadable
+  >   transcript — is deliberately NOT routed through it: that branch
+  >   already emits its own WARNING at the point of decision (*"capped
+  >   session … has no transcript under … — retrying FRESH"*), naming
+  >   the session it is about to drop. It is a one-shot decision rather
+  >   than a poll loop, so it has no streak to latch and needs no
+  >   escape; INV-4's checkable question is answered there by that
+  >   existing WARNING. Read the claim above as covering the watchdog
+  >   path — the one that was genuinely counterless AND silent.
+  >
+  >   The escape's gate is **wall-clock, not a poll count**: it fires at
+  >   the caller's `startup_grace_secs`, the budget already defined as
+  >   "how long before we may conclude something is wrong", and latches
+  >   once per crossing in the caller. A poll-count threshold was
+  >   rejected on amendment review: it denotes two unrelated durations
+  >   in the watchdog's two regimes (5 s vs 60 s per poll) and, in the
+  >   startup regime, would fire ~15 s after spawn — inside the MCP-init
+  >   window a healthy recon stage routinely spends before its first
+  >   record lands, i.e. it would emit the WARNING once on *every*
+  >   healthy invocation, which is how a warning gets tuned out.
+- θ: INV-2 (structured per-event evidence, observation separated from
+  hypothesis — required by the polarity dispute it settles).
+- No leaf introduces an unbounded hold, a new prose contract, a
+  log-scrape, lock-step duplication, or loop-thread work (INV-8: α/β
+  are synchronous server-side dict shaping, bounded by queue size which
+  is already paginated upstream).
+
+  > **CORRECTION 2026-08-11 — this sweep-up line is FALSE in two
+  > separate ways, and it examines the wrong leaf.**
+  >
+  > **(1) "No leaf introduces … lock-step duplication" — FALSE.** α
+  > does. See the α/C2 correction above: the compact-projection field
+  > list is hand-maintained in four places, one of which
+  > (`server.py:1081-1088`, listing 9 of 13) has already drifted.
+  >
+  > **(2) "bounded by queue size which is already paginated upstream" —
+  > FALSE.** `escalation/src/escalation/queue.py` has **no pagination
+  > anywhere**; verified with
+  > `git grep -nE "limit|offset|page" escalation/src/escalation/queue.py`
+  > → **zero matches**. `get_pending()` (`queue.py:507-510`) and
+  > `get_by_task()` (`queue.py:400-432`) each **glob and read the entire
+  > directory**. There is no upstream contract bounding the item count,
+  > so INV-8's second limb is not discharged by anything.
+  >
+  > **(3) The real INV-8 exposure is γ, which this section OMITS.** γ's
+  > archive-inclusive read calls `get_task_escalations` — registered
+  > `@mcp.tool()` as a **plain sync `def`** at
+  > `escalation/src/escalation/server.py:1105`, which FastMCP **3.2.2**
+  > (the installed version; `escalation/pyproject.toml` only pins
+  > `>=2.0`) runs **INLINE on the event-loop thread**. It fans out over
+  > ~3,000 escalation files (measured: 3,065 = 77 queue-root + 2,988
+  > archived), at ~387 ms per call per the gate report on task 3999 — a
+  > warm-cache re-measure this session put glob+read+parse of the same
+  > corpus at ~155 ms, corroborating the order of magnitude — **once per
+  > `work_batch` candidate**, inside the same process that serves
+  > `merge_request` (`server.py:1437`), `merge_status` (`:2505`) and
+  > `merge_cancel` (`:2664`), all of which are `async def` on that same
+  > loop. This trips **both** INV-8 limbs at once — blocking work AND an
+  > unbounded fan-out — which is precisely the case INV-8 says needs
+  > **both** fixes.
+  >
+  > **Resolution now recorded on task 3999:** scope the glob to
+  > `esc-{task_id}-*.json` — the in-repo precedent is `make_id` in the
+  > same file (`queue.py:1258-1259`), which already scans both halves of
+  > the namespace with exactly that pattern — **plus** offload. Both
+  > halves are required: scoping removes the read+parse cost but the
+  > archive `rglob` directory walk remains (measured ~13 ms even when it
+  > matches zero files), so offloading is what actually frees the loop
+  > thread. A **date-windowed archive scan was considered and REJECTED**
+  > as the wrong axis: the query is task-keyed, not time-keyed, and a
+  > date window would reintroduce exactly the window-dependence γ exists
+  > to remove.
+  >
+  > **CORRECTION 2026-08-20 (esc-3999-2 ruling, HEAD `ca7459b0a9`) — the
+  > threading premise above is FALSE and the resolution is WITHDRAWN.
+  > Neither half is to be built as specified.**
+  >
+  > **(i) "FastMCP 3.2.2 runs sync tool functions INLINE on the
+  > event-loop thread" — FALSE.** The cited path `fastmcp/tools/tool.py`
+  > does not exist in 3.2.2; `tool.py` was renamed to `base.py`, which
+  > `shared/pyproject.toml:41-42` already documents in-tree.
+  > `fastmcp/tools/function_tool.py:252` and `:275` both
+  > `await call_sync_fn_in_threadpool(...)` for any non-coroutine tool fn,
+  > delegating to `anyio.to_thread.run_sync` via
+  > `utilities/async_utils.py:26-34`. Proved at runtime, not only by
+  > reading: a sync `@mcp.tool()` invoked through FastMCP's own client
+  > path reports an AnyIO worker thread ident and a 5 ms asyncio
+  > heartbeat keeps ticking through a 250 ms hard block, while an `async
+  > def` control tool in the same run reports the loop's own ident — so
+  > the probe discriminates. `get_task_escalations` (sync `def`,
+  > `server.py:1548`) is therefore ALREADY off-loop, and "plus offload"
+  > is a no-op for it. Do NOT edit the `FastMCP threadpool worker`
+  > comment at `server.py:3628-3630`: it is TRUE, and six further sites
+  > depend on the same fact — including `harness.py:13533-13538`, which
+  > names the 2026-05-29 reify incident that assuming otherwise caused.
+  >
+  > **(ii) The scoping half is a CORRECTNESS REGRESSION, not a pure I/O
+  > reduction.** `make_id` takes an id-namespace KEY, not the record's
+  > stored `task_id`, and 5 production sites pass a divergent one
+  > (`curator_escalator.py:422/493/603` key `'curator'`;
+  > `ticket_janitor.py:284/491` key `'ticket-janitor'`). Measured on the
+  > live corpus: 42 records whose stem does not start with
+  > `esc-{task_id}-`. For the exact query γ's cross-check would issue,
+  > `get_task_escalations('task-curator', level=1)`, a scoped glob
+  > returns **0 of 37 records — 100% loss** — because the L1s are minted
+  > under the role key while `promote_to_l2` mints L2s under the real
+  > task_id, so the glob preserves exactly the L2s and destroys exactly
+  > the L1s. `esc-curator-35` is pending in the queue root today. The
+  > cited precedent does not transfer either: `make_id` is counter-file
+  > based as of `queue.py:1642` ("the retired directory/archive-scan
+  > derivation"), and the surviving glob in `_recover_seq_from_disk`
+  > scopes on the KEY — the thing that IS in the filename — which is
+  > exactly what its "never parsed back out of a filename" safety
+  > argument depends on. Scoping also erodes contract D11
+  > (`index_drift_detector.py:16-27`, task 3709), which adopted an opaque
+  > dedup key in the `task_id` slot precisely BECAUSE `get_by_task`
+  > filters on the stored field.
+  >
+  > **(iii) The motivation does not survive measurement — INV-8's
+  > premise here was never checked.** Nobody had ever timed the scan.
+  > Measured (medians over >=15 reps, load 60-168): archive-inclusive
+  > `get_by_task` **261-297 ms warm** (~950-1,100 ms cold), independent
+  > of hit count; root-only (`status='pending'`, 67 of 79 call sites)
+  > **~26 ms**. Rate: **~3.2 archive-inclusive MCP calls/day** over a
+  > 9.29-day transcript window, plus a bounded ~80-330 internal calls/day
+  > => **20-90 CPU-seconds/day**. The scoped-glob speedup is **15x**, not
+  > the 80-600x claimed. And "growing ~100/day with no pruning ...
+  > degrades monotonically forever" is FALSE: `archive.prune_archive`
+  > with `DEFAULT_RETENTION_DAYS = 30` runs as pass 3 of
+  > `sweep.run_startup_sweep`, the archive spans exactly 30 days, and the
+  > corpus **shrank** from the 3,039 files measured 2026-08-11 to 2,969
+  > on 2026-08-20. It is bounded at ~2,825 archived files and never
+  > reaches the ~10,700 needed for a 1 s call.
+  >
+  > **(iv) The real INV-8 exposure — the hazard is genuine, the site was
+  > wrong.** The escalation server has no loop of its own: it is a task
+  > on the ORCHESTRATOR's loop (`harness.py:11030`,
+  > `asyncio.create_task(_serve())`), so escalation-port latency IS
+  > orchestrator loop lag. What actually occupies that loop is the
+  > `async def` tools, exactly inverting the amendment: `async def
+  > get_pending_escalations` (`server.py:1450`) scans inline at `:1514`
+  > and awaits `_annotate_pins_recovery`, whose `level is not None`
+  > branch fans out one full root scan PER task_id at `server.py:544-546`
+  > — measured **2.1-4.9 s of loop occupancy per L2 drain cycle**. Plus
+  > seven in-process orchestrator sites doing archive-inclusive
+  > `get_by_task` inline inside `async def`, where FastMCP offload cannot
+  > help at all: `workflow.py:5620, 5702, 13024, 15525`,
+  > `deterministic_runner.py:2677, 2899`, `harness.py:13434`. Note the
+  > fanout POSTDATES this correction's own premise: `get_pending_escalations`
+  > became `async def` on 2026-08-17 (`b8e3bc95a3`, task 3543), six days
+  > after the 2026-08-11 analysis above — so the hazard named on
+  > 2026-08-11 was fictional, and a larger real one of the same shape has
+  > appeared since at a different site.
+  >
+  > **(v) The lever that measurement actually favours, which nobody
+  > proposed.** The queue root holds **8,901 dirents to serve 145
+  > records** — 7,531 `.json.lock` sidecars and 1,218 `.seq` counters —
+  > of which **3,334 record locks are ORPHANED** (their record was pruned
+  > by retention), the oldest dating to 2026-06-09.
+  > `run_startup_sweep`'s three passes reap records but never their
+  > locks, so this — not the record corpus — is the system's only
+  > unbounded growth vector, and it sits on the HOT path. Reaping is
+  > worth **24x** on the root glob (76.8 ms -> 1.70 ms measured) with zero
+  > semantic change, and projects to 131 ms at +6 months / 673 ms at
+  > +4.5 years if left alone.
+  >
+  > **Disposition:** γ (task 3999) is narrowed back to its decomposed
+  > SKILL.md scope; the `queue.py`/`server.py` work is withdrawn from it
+  > and re-filed against the sites above. INV-8 for γ is discharged by
+  > the fact that `get_task_escalations` is already off-loop.

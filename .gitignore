@@ -54,11 +54,39 @@ __pycache__/
 htmlcov/
 coverage.xml
 
+# ── Mutation-testing artifacts — mutmut run products ─────────────────
+# `mutmut run` (configured under [tool.mutmut] in orchestrator/pyproject.toml,
+# task 5035) copies the source tree plus every mutant into mutants/ in its
+# working directory: hundreds of MB, never to be committed. The two symlinks
+# are the run's harness (plans/merge-lane-quality-prd.mutation-baseline.md).
+mutants/
+/orchestrator/dark-factory-orchestrator.yaml
+/orchestrator/df_pytest_isolation.py
+
 # ── Test SQLite artifacts — MagicMock path side-effects ──────────────
-# OverrideStore creates an SQLite DB at config.overrides_db_path; when
-# tests pass an unpatched MagicMock as config the stringified mock name
-# becomes the path, producing files like "<MagicMock name='...' id='...'>".
+# A mock passed where code wants a path leaves one of two shapes, each led
+# by the mock's OWN CLASS NAME, not always "MagicMock". The str(mock)/repr
+# FILE "<ClassName name=... id=...>" (e.g. OverrideStore's SQLite DB) comes
+# from every stdlib mock, df_pytest_isolation.py::STDLIB_MOCK_CLASSES. The
+# os.fspath() DIRECTORY tree "<ClassName>/..." comes only from the
+# MagicMixin-based, PathLike ones, df_pytest_isolation.py::MOCK_FSPATH_ROOT_NAMES.
+# AsyncMock is not a MagicMock subclass but shares MagicMixin; it reached a
+# commit in task 4592 because only MagicMock was listed.
+# tests/scripts/test_mock_fspath_dir_isolation.py fails if a name is missing.
+# These entries are containment only. The DIRECTORY shape's fence is
+# df_pytest_isolation.py::_df_no_mock_derived_stray_dirs; in the orchestrator
+# suite the FILE shape's is orchestrator/tests/conftest.py::_no_mock_repr_stray_entries.
+<AsyncMock*
 <MagicMock*
+<Mock*
+<NonCallableMagicMock*
+<NonCallableMock*
+<PropertyMock*
+<ThreadingMock*
+MagicMock/
+AsyncMock/
+NonCallableMagicMock/
+ThreadingMock/
 
 # ── pytest scratch debris — `--basetemp` inside a checkout ───────────
 # An agent passing `pytest --basetemp=.pytest-tmp` (legal and expected —
@@ -94,15 +122,38 @@ coverage.xml
 /logs/
 # Runtime data (combine_audit.jsonl, etc.) — note /data/ above is root-only:
 orchestrator/data/
+# Same gap for the dashboard: DashboardConfig.project_root defaults off cwd, so
+# running `python -m dashboard` (or anything that boots the app lifespan) from
+# dashboard/ creates live WAL stores at dashboard/data/burndown/*.db.  Two such
+# empty DBs were committed by accident on branch task/3549 and removed again.
+# Keep the /data/ anchor above intact so dashboard/src/dashboard/data/ (a real
+# Python package) stays tracked — this rule is deliberately narrower than that.
+dashboard/data/
 # recon-escalation-watcher run manifests (mcp.json + run.sh stay tracked):
 recon-watch/close-manifest*.json
-# /review skill phase outputs (review/briefing.yaml stays tracked):
-review/reports/
+# /review run reports (review/reports/<run_id>.*) are tracked. Only the
+# pre-contract phase1/phase2/summary files, which carry no as_of_sha and are
+# not reports (skills/review/SKILL.md "Report home"), stay ignored.
+# Guard: tests/scripts/test_review_report_home_gitignore.py
+review/reports/phase[12]-*.json
+review/reports/summary-*.md
 # Editor/tool temp-backup files (e.g. foo.py.tmp.<pid>.<hash>) — one was
 # accidentally committed as test_merge_queue_concurrent_verify.py.tmp.* (task 1990):
 *.tmp.*
 # Same, scoped explicitly to Python source backups:
 *.py.tmp.*
+# pytest marker-probe scratch dirs.  These fixtures mkdtemp INTO the tests
+# dir on purpose (a system-tmp path makes pytest walk from / when locating
+# the config, costing tens of seconds), and clean up with
+# ignore_errors=True, so a killed run leaves one behind.  One rode a
+# `git add -A` WIP commit onto a task branch and broke the
+# `ruff check fused-memory/tests` directory sweep with I001 (task 3581).
+# Generators: fused-memory/tests/test_integration_marker_config.py:85,
+# cockpit/tests/test_smoke_marker_config.py:64.
+# Deliberately unanchored — these land under <pkg>/tests/, not the repo
+# root — for the same reason recorded for .pytest-tmp/ above:
+.integration_marker_probe*/
+.smoke_marker_probe*/
 
 # ── Node / codex CLI install (ad-hoc, not a project dependency) ──────
 node_modules/

@@ -8,6 +8,62 @@
       "severity": "suggestion",
       "description": "The test's local `_shape_task` helper copies the recency key from `task.get('updated_at')` (snake_case), whereas production `tasks.py:_shape_task` reads `task.get('updatedAt')` (camelCase, the actual MCP/Taskmaster field name). The three new tests feed already-snake_cased fake tasks, so they exercise the max/None logic but never validate the real camelCase\u2192snake_case conversion; a regression in that field mapping would silently make `last_update` always None and go uncaught.",
       "mutation_type": "test_gap"
+    },
+    {
+      "id": "mined_1751_pool_01",
+      "location": "dashboard/src/dashboard/data/orchestrator.py:303",
+      "category": "comments_stance",
+      "severity": "suggestion",
+      "description": "A six-line inline comment above last_update defends the lexicographic max, names a rejected alternative and a scope rationale; it relies on an unenforced cross-package invariant (updatedAt always written by fused-memory sqlite_task_backend._now as UTC 'YYYY-MM-DDTHH:MM:SS.mmmZ') and its last line ('flatten the task tree first') is misleading since tasks._shape_task drops subtasks. The max itself is correct today.",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "mined_1751_pool_02",
+      "location": "dashboard/src/dashboard/static/redux/tabs.jsx:328",
+      "category": "spec_wording_deviation",
+      "severity": "suggestion",
+      "description": "The task's user-observable signal is 'updated 4m ago', but DF_SHELL.timeago returns a bare unit ('4m'), so OrchTab renders 'Updated \u00b7 4m' and the overview renders '4m' under an 'Updated' header. The '\u2014' empty state is met by timeago itself.",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "mined_1751_pool_03",
+      "location": "dashboard/src/dashboard/static/redux/tab_overview.jsx:229",
+      "category": "test_gap",
+      "severity": "suggestion",
+      "description": "Neither new render site (tab_overview.jsx Updated column, tabs.jsx 'Updated \u00b7' line) is covered by the repo's existing text-wiring JSX tests, so removing or misnaming timeago(o.last_update) would not be caught.",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "mined_1751_pool_04",
+      "location": "dashboard/tests/test_orchestrator.py:1019",
+      "category": "unrealistic_fixtures",
+      "severity": "suggestion",
+      "description": "The new last_update tests use naive '2026-06-12T15:30:00' values instead of the production 'YYYY-MM-DDTHH:MM:SS.mmmZ' format, and no case covers an empty-string updated_at (the backend COALESCEs NULL to '').",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "mined_1751_pool_05",
+      "location": "dashboard/tests/test_orchestrator.py:1009",
+      "category": "test_duplication",
+      "severity": "suggestion",
+      "description": "The three new last_update tests repeat identical setup (function-local imports, config, find_running_orchestrators patch, discover call, length assert), differing only in the task list and expected value.",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "mined_1751_pool_06",
+      "location": "dashboard/src/dashboard/data/redux_api.py:63",
+      "category": "inconsistent_absent_encoding",
+      "severity": "suggestion",
+      "description": "In the ORCHESTRATORS payload the sibling 'started' field encodes absence as '' while the new 'last_update' passes None through, giving two absent encodings for timestamp-like fields; both render as '\u2014' today only because timeago treats any falsy value alike.",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "mined_1751_pool_07",
+      "location": "dashboard/src/dashboard/data/orchestrator.py:247",
+      "category": "stale_docstring",
+      "severity": "suggestion",
+      "description": "discover_orchestrators' docstring lists the enrichment keys it attaches (tasks, worktrees, summary) but was not updated for the new derived 'last_update' key.",
+      "mutation_type": "pooled_2026_10_22"
     }
   ],
   "provenance": {
@@ -33,5 +89,45 @@
         "path": "/home/leo/src/dark-factory/data/escalations/archive/2026-06-15/esc-1751-10.json"
       }
     ]
+  },
+  "context": {
+    "task": {
+      "title": "Dashboard Orchestrators panel: per-orchestrator last-update timestamp",
+      "description": "Add a per-orchestrator \"last update\" timestamp to the dashboard Orchestrators section so a viewer can distinguish a progressing orchestrator from a stalled one (today only the process `started` time is shown).\n\nImplementation:\n- In `discover_orchestrators()` (dashboard/src/dashboard/data/orchestrator.py, ~line 300 where `summary` is built and `tasks` is in scope), compute `last_update = max(t['updated_at'] for t in tasks if t.get('updated_at'))`, or `None` when no task carries `updated_at`. Add `'last_update'` to the per-orchestrator result dict (sibling of `summary`/`started`).\n- In `shape_orchestrators()` (dashboard/src/dashboard/data/redux_api.py, ~line 53), copy it onto each ORCHESTRATORS entry as a sibling of `'started'`: `'last_update': o.get('last_update')`.\n- Render in `OrchTab` (dashboard/src/dashboard/static/redux/tabs.jsx) and the overview row (dashboard/src/dashboard/static/redux/tab_overview.jsx) as a relative time (\"updated 4m ago\"); show \"\u2014\" when `last_update` is absent. Reuse an existing JS time-format helper in static/redux/ if one exists, else add a small local one (tactical \u2014 PRD Open question 1).\n\nSubstrate: tasks already carry `updated_at` (preserved from `updatedAt` at data/tasks.py:66; recency key in data/active_tasks.py). Backend ships the raw ISO string; frontend formats (matches the existing raw-`started` pattern). Empty \u2192 \"\u2014\" (no synthetic data).\n\nPRD: plans/dashboard-orch-update-and-fm-uptime-prd.md task \u03b1\nCapability manifest: plans/dashboard-orch-update-and-fm-uptime.capability-manifest.md\n\nUser-observable signal: An orchestrator row in the Orchestrators tab AND the overview panel shows \"updated <relative> ago\" reflecting its most recently updated task; \"\u2014\" when the tree has no dated tasks.\nConsumer: dashboard operator (Orchestrators tab + overview panel).\nModules touched: dashboard",
+      "test_strategy": "",
+      "details": "",
+      "authored": false,
+      "id": "1751",
+      "record_source": {
+        "path": ".taskmaster/tasks/tasks.db",
+        "tag": "master",
+        "read_at": "2026-09-11",
+        "updated_at": "2026-06-15T07:19:17.516Z",
+        "updated_after_merge": false,
+        "run_time_title_matches": true
+      }
+    },
+    "changed_files": [
+      "dashboard/src/dashboard/data/orchestrator.py",
+      "dashboard/src/dashboard/data/redux_api.py",
+      "dashboard/src/dashboard/static/redux/tab_overview.jsx",
+      "dashboard/src/dashboard/static/redux/tabs.jsx",
+      "dashboard/tests/test_orchestrator.py",
+      "dashboard/tests/test_redux_api.py"
+    ],
+    "base_sha": "55a0e228017bace9c961a7f99da9b27728c0c7a6",
+    "branch_sha": "1739325a2a86f34bb1f83467066cf1d3d68bdd4e",
+    "base_sha_reason": null,
+    "plan": null,
+    "plan_reason": "no plan.json survives for this task. Absent: .worktrees/.task-meta/<id>/plan.json; data/orchestrator/agent-transcripts/<id>/; ~/.claude/projects/-home-leo-src-dark-factory--worktrees-<id>/; runs.db events with a plan payload (design_decisions/steps); runs.db plan-phase events (other than invocation/routing/phase bookkeeping) with a payload; data/orchestrator/landed_outbox.json entry. Wider hunt (escalations archive, fleet sessions, branch commit messages, branch tree, fused-memory) found nothing for this task",
+    "verification": {
+      "merge_sha": "715f569e6acb53dbda6db9ef5ef4e4f4abd10004",
+      "merge_base_sha": "55a0e228017bace9c961a7f99da9b27728c0c7a6",
+      "diff_reproduces_from": "git diff 55a0e22801 715f569e6a",
+      "diff_reproduces": true,
+      "merge_tree_equals_merge_commit_tree": true,
+      "changed_files_match_diff_headers": true,
+      "verified_at": "2026-09-11"
+    }
   }
 }

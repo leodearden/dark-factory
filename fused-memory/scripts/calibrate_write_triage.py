@@ -50,11 +50,24 @@ Qdrant.
 
 Usage
 -----
-  # Report only (default): measure, derive, write the report, change nothing.
+  # Full run: re-derives the bands into the report, which config.yaml contradicts until --write-config.
   python scripts/calibrate_write_triage.py --project-id reify
 
   # Also write the derived thresholds into config.yaml's write_triage block.
   python scripts/calibrate_write_triage.py --project-id reify --write-config
+
+  # Calibrate another project on its own fixture; write ONLY its per-project cutoffs.
+  python scripts/calibrate_write_triage.py --config config/config.yaml --project-id dark_factory \\
+      --fixture tests/fixtures/write_triage_calibration_dark_factory.jsonl \\
+      --report-path calibration/write_triage_calibration_report_dark_factory.json \\
+      --retrieval production --k 1 --k 3 --k 5 --k 10 --k 20 --write-project-config
+
+  # Regenerate the committed report: production recall re-measured, bands of record carried.
+  python scripts/calibrate_write_triage.py --project-id reify --retrieval production \\
+      --canonical-aliases tests/fixtures/write_triage_calibration.canonical_aliases.json \\
+      --bands-from calibration/write_triage_calibration_report.json \\
+      --report-path calibration/write_triage_calibration_report.json \\
+      --k 1 --k 3 --k 5 --k 10 --k 20 --k 50
 """
 from __future__ import annotations
 
@@ -64,6 +77,10 @@ import math
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
+
+import yaml
+
+from fused_memory.config.overlay import WRITE_TRIAGE_BAND_KEYS
 
 logger = logging.getLogger(__name__)
 
@@ -127,6 +144,35 @@ def load_fixture(path: str | Path) -> list[dict[str, Any]]:
     return records
 
 
+def load_canonical_aliases(path: str | Path) -> dict[str, str]:
+    """Read the ``{old_cluster_canonical_id: current_memory_id}`` alias map.
+
+    Resolves a rotated-canonical corpus gap: a fixture's ``cluster_id``
+    that no longer exists in the live store because the cluster was
+    re-consolidated under a new id. The map is external, hand-verified
+    data (each entry's target must be confirmed live before it is trusted
+    — see the calibration run's provenance/summary for that evidence), not
+    something this script derives.
+
+    Strict like ``load_fixture``: a malformed file raises rather than
+    silently degrading to an empty map, which would make ``--canonical-
+    aliases`` a silent no-op indistinguishable from "nothing to resolve".
+    """
+    path = Path(path)
+    try:
+        raw = json.loads(path.read_text())
+    except json.JSONDecodeError as exc:
+        raise ValueError(f'{path}: malformed JSON: {exc}') from exc
+    if not isinstance(raw, dict):
+        raise ValueError(f'{path}: expected a JSON object, got {type(raw).__name__}')
+    for key, value in raw.items():
+        if not isinstance(key, str) or not isinstance(value, str):
+            raise ValueError(
+                f'{path}: alias entries must be str -> str, got {key!r} -> {value!r}',
+            )
+    return dict(raw)
+
+
 # ---------------------------------------------------------------------------
 # Pair construction
 # ---------------------------------------------------------------------------
@@ -175,6 +221,82 @@ def build_pair_sets(records: list[dict[str, Any]]) -> dict[str, list[dict[str, s
         'unrelated_pairs': unrelated,
         'hard_negative_pairs': hard_negative,
     }
+
+
+def _classify_pair(left: Mapping[str, Any], right: Mapping[str, Any]) -> str:
+    """Name the pair class of one unordered pair — ``build_pair_sets``' rule.
+
+    ``build_pair_sets`` is deliberately left untouched (its three-class
+    return shape is bound by ten-plus tests and its output is the pooled
+    calibration of record, so this task's change stays provably additive).
+    That leaves the rule stated twice, so
+    ``TestPartitionPairsByCategory.test_classification_matches_build_pair_sets_within_a_category``
+    pins the two against each other on the same records: a divergence in
+    what counts as a hard negative fails the suite rather than silently
+    calibrating a category against a different population.
+    """
+    if left['cluster_id'] != right['cluster_id']:
+        return 'unrelated_pairs'
+    if left['label'] in _NEGATIVE_LABELS or right['label'] in _NEGATIVE_LABELS:
+        return 'hard_negative_pairs'
+    return 'true_dup_pairs'
+
+
+def partition_pairs_by_category(
+    records: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Bucket the same three pair classes per Mem0 category.
+
+    A SIBLING of ``build_pair_sets``, not a replacement: the pooled
+    measurement is the current calibration of record and must stay
+    byte-identical, so the per-category evidence is added rather than
+    substituted.
+
+    **Cross-category pairs are excluded, and the exclusion is counted.**
+    ``audit_duplicate_memories.fetch_ann_neighbors`` pushes the querying
+    record's own category into every Qdrant query as a payload filter, so a
+    cross-category ANN pair is structurally impossible rather than merely
+    filtered later. Calibrating a category's cutoff against pairs the
+    consumer can never form would measure the wrong population. The count
+    is emitted as ``cross_category_dropped`` rather than absorbed silently,
+    matching this script's standing rule that every dropped measurement is
+    a reported number.
+
+    A record with a missing or empty ``category`` forms no pair at all: it
+    has no bucket to belong to, and guessing one would invent the very
+    label the calibration is supposed to measure. Those drops are counted
+    the same way.
+
+    Returns ``{'by_category': {category: {<three classes>}},
+    'cross_category_dropped': int}``. Every category present in the input
+    appears in ``by_category`` even when it forms no pairs — omission would
+    read as "not measured" rather than "measured, and empty".
+    """
+    by_category: dict[str, dict[str, list[dict[str, str]]]] = {}
+    for record in records:
+        category = record.get('category')
+        if category:
+            by_category.setdefault(str(category), {
+                'true_dup_pairs': [], 'unrelated_pairs': [], 'hard_negative_pairs': [],
+            })
+
+    cross_category_dropped = 0
+    n = len(records)
+    for i in range(n):
+        left = records[i]
+        left_category = left.get('category')
+        for j in range(i + 1, n):
+            right = records[j]
+            right_category = right.get('category')
+            if not left_category or not right_category or left_category != right_category:
+                cross_category_dropped += 1
+                continue
+            a, b = sorted((str(left['memory_id']), str(right['memory_id'])))
+            by_category[str(left_category)][_classify_pair(left, right)].append(
+                {'a': a, 'b': b},
+            )
+
+    return {'by_category': by_category, 'cross_category_dropped': cross_category_dropped}
 
 
 # ---------------------------------------------------------------------------
@@ -249,6 +371,31 @@ def summarize_distribution(scores: Sequence[float]) -> dict[str, Any]:
 REASON_EMPTY_CLASS = 'empty_class'
 REASON_NOT_SEPARABLE = 'not_separable'
 REASON_NO_JUDGE_BAND = 'no_judge_band'
+REASON_INSUFFICIENT_PAIRS = 'insufficient_pairs'
+
+MIN_CATEGORY_PAIRS = 20
+"""Pairs a CATEGORY must contribute, per class, to earn a cutoff of its own.
+
+Not a taste threshold — an exceedance bound. Both band edges are fitted to a
+single order statistic of a small sample: ``t_high`` is the smallest duplicate
+strictly above the observed MAXIMUM negative, and ``t_low`` is the duplicate
+p05, which under :func:`_order_statistic`'s nearest-rank rule IS the sample
+minimum for every n <= 20. For n exchangeable draws, a fresh draw falls outside
+the sample's observed extreme with expected probability ``1/(n+1)``. So 20
+pairs pin the expected leak past either fitted edge at <= ~4.8%; at 4 pairs it
+is ~20%, and a cutoff fitted there is a coin-flip dressed as a measurement.
+
+Applied ONLY per category (:func:`derive_bands_per_category`), never to the
+pooled derivation: the pooled band is the calibration of record and clears this
+bar by orders of magnitude, and re-gating it here would be a second policy in
+a function many callers already bind.
+
+A category that fails the bar is not merely un-preferred — it is UNCALIBRATED,
+absent from ``t_high_by_category``, run on the disclosed pooled fallback, and
+fenced out of ``--apply`` deletion by
+``audit_duplicate_memories.restrict_delete_candidates_for_apply``. That fence
+is about STRENGTH of evidence, so a token sample must not buy past it.
+"""
 
 
 def derive_bands(
@@ -309,20 +456,59 @@ def derive_bands(
 # Candidate-retrieval recall
 # ---------------------------------------------------------------------------
 
+def _first_match_rank(
+    candidates: Sequence[str],
+    match_ids: frozenset[str],
+    candidate_parents: Mapping[str, str],
+) -> int:
+    """1-based rank of the first *candidates* entry that reaches *match_ids*.
+
+    A candidate reaches *match_ids* by its own id, or — when
+    *candidate_parents* carries an entry for it — by the id it hoists to.
+    ``candidate_parents`` mirrors production's
+    ``write_triage.py::canonical_id_of``: a sighting/amendment child is
+    counted as reaching whatever its ``metadata.parent_id`` resolves to,
+    the same hoist a live triaged write gets credit for. Returns -1 if no
+    candidate reaches *match_ids*.
+    """
+    for rank, candidate_id in enumerate(candidates, start=1):
+        if candidate_id in match_ids or candidate_parents.get(candidate_id) in match_ids:
+            return rank
+    return -1
+
+
 def compute_recall_at_k(
     retrievals: Sequence[dict[str, Any]],
     ks: Sequence[int],
+    aliases: Mapping[str, str] | None = None,
+    *,
+    count_absent_as_miss: bool = False,
 ) -> dict[str, Any]:
     """Measure how often the existing search surfaces the ground-truth canonical.
 
     Each retrieval carries ``memory_id``, ``canonical_id``,
-    ``canonical_present`` and the ranked ``candidates`` search returned.
+    ``canonical_present``, the ranked ``candidates`` search returned, and
+    optionally ``candidate_parents`` (candidate id -> the parent it hoists to).
 
-    Retrievals whose canonical is not in the corpus are listed under
-    ``canonical_absent`` and dropped from the denominator. The session's
-    duplicates were deleted, so an absent canonical is a CORPUS GAP rather
-    than a retrieval failure; scoring it as a miss would understate recall
-    and could push T_low lower than the evidence supports.
+    A candidate REACHES the canonical by its own id or by the parent
+    ``candidate_parents`` hoists it to. That is production's attach rule
+    (``write_triage.py::canonical_id_of``), so it holds whatever the two
+    independent choices below are:
+
+    - ``aliases`` ({old_canonical: current_id}) also lets a candidate reach an
+      absent canonical's rotated successor, directly or through a child.
+    - ``count_absent_as_miss`` picks the population. False (default): a
+      retrieval whose canonical is not in the corpus is listed under
+      ``canonical_absent`` and DROPPED from the denominator. A session's
+      duplicates were deleted, so an absent canonical is a CORPUS GAP rather
+      than a retrieval failure when nothing resolves it; scoring it as a miss
+      would understate recall and could push T_low lower than the evidence
+      supports. True: every retrieval is scored, and an absent canonical is a
+      miss unless an alias or a hoisted child reaches it.
+
+    ``canonical_absent`` is always populated from the raw ``canonical_present``
+    flag (informational), independent of which population is scored;
+    ``absent_in_denominator`` says which population that was.
 
     An empty denominator reports ``recall=None``, not ``0.0`` — no
     measurement is not a measured zero.
@@ -330,9 +516,10 @@ def compute_recall_at_k(
     scorable: list[dict[str, Any]] = []
     absent: list[dict[str, str]] = []
     for item in retrievals:
-        if item.get('canonical_present'):
+        present = bool(item.get('canonical_present'))
+        if present or count_absent_as_miss:
             scorable.append(item)
-        else:
+        if not present:
             absent.append({
                 'memory_id': str(item.get('memory_id')),
                 'canonical_id': str(item.get('canonical_id')),
@@ -340,10 +527,17 @@ def compute_recall_at_k(
 
     per_k: list[dict[str, Any]] = []
     for k in ks:
-        hits = sum(
-            1 for item in scorable
-            if item['canonical_id'] in list(item.get('candidates') or [])[:k]
-        )
+        hits = 0
+        for item in scorable:
+            canonical_id = item['canonical_id']
+            match_ids = {canonical_id}
+            alias = aliases.get(canonical_id) if aliases is not None else None
+            if alias:
+                match_ids.add(alias)
+            candidates = list(item.get('candidates') or [])[:k]
+            parents = item.get('candidate_parents') or {}
+            if _first_match_rank(candidates, frozenset(match_ids), parents) != -1:
+                hits += 1
         total = len(scorable)
         per_k.append({
             'k': k,
@@ -352,7 +546,49 @@ def compute_recall_at_k(
             'recall': (hits / total) if total else None,
         })
 
-    return {'per_k': per_k, 'canonical_absent': absent}
+    return {
+        'per_k': per_k,
+        'canonical_absent': absent,
+        'absent_in_denominator': count_absent_as_miss,
+    }
+
+
+def compute_first_hit_ranks(
+    retrievals: Sequence[dict[str, Any]],
+    aliases: Mapping[str, str] | None = None,
+) -> list[dict[str, Any]]:
+    """Per-record rank at which its canonical first appears, or -1.
+
+    Reached by :func:`compute_recall_at_k`'s rule: the candidate's own id, or
+    the parent ``candidate_parents`` hoists it to. ``rank`` reaches the
+    canonical alone.
+
+    ``alias_id`` / ``rank_with_aliases`` are present only for a record whose
+    ``canonical_id`` has an entry in *aliases*: ``rank_with_aliases`` is the
+    first rank reaching the canonical or its alias.
+
+    Both ranks are 1-based; -1 means the ranked candidates never reach it.
+    """
+    aliases = dict(aliases or {})
+    rows: list[dict[str, Any]] = []
+    for item in retrievals:
+        canonical_id = item['canonical_id']
+        candidates = list(item.get('candidates') or [])
+        parents = item.get('candidate_parents') or {}
+        row: dict[str, Any] = {
+            'memory_id': item['memory_id'],
+            'canonical_id': canonical_id,
+            'canonical_present': bool(item.get('canonical_present')),
+            'rank': _first_match_rank(candidates, frozenset({canonical_id}), parents),
+        }
+        alias = aliases.get(canonical_id)
+        if alias is not None:
+            row['alias_id'] = alias
+            row['rank_with_aliases'] = _first_match_rank(
+                candidates, frozenset({canonical_id, alias}), parents,
+            )
+        rows.append(row)
+    return rows
 
 
 # ---------------------------------------------------------------------------
@@ -392,6 +628,90 @@ def _band_counts(
     }
 
 
+def derive_bands_per_category(
+    scores_by_category_and_class: Mapping[str, Mapping[str, Sequence[float]]],
+    pooled_t_high: float | None,
+    pooled_t_low: float | None,
+    *,
+    min_dup_pairs: int = MIN_CATEGORY_PAIRS,
+    min_negative_pairs: int = MIN_CATEGORY_PAIRS,
+) -> dict[str, dict[str, Any]]:
+    """Derive one band pair per Mem0 category, delegating to ``derive_bands``.
+
+    No second derivation path: each category's cutoff is exactly as
+    evidence-bound as the pooled one, and refuses on the same terms. A
+    category with no negatives (the measured ``preferences_and_norms`` case
+    — all its records in one cluster) yields ``REASON_EMPTY_CLASS``; one
+    whose negatives reach every duplicate yields ``REASON_NOT_SEPARABLE``.
+    Either way the refusal, not a fabricated number, is the finding.
+
+    On TOP of those, and the one rule that is this function's own: a category
+    too THIN to fit a band gets ``REASON_INSUFFICIENT_PAIRS`` even when the
+    arithmetic happened to produce a number. Separability on a handful of
+    pairs is not evidence of separability — see :data:`MIN_CATEGORY_PAIRS`
+    for the exceedance bound that sets the bar, and why a category that fails
+    it must fall back to the pooled cutoff (and its fence) rather than be
+    promoted to full deletion authority on a token sample. The gate applies
+    only to an entry that DERIVED a cutoff, so ``empty_class`` /
+    ``not_separable`` keep naming the more specific reason they already do.
+
+    *min_dup_pairs* / *min_negative_pairs* exist so a test can exercise the
+    delegation on a small hand-built sample; the recorded calibration is
+    produced at the defaults, and lowering them in a real run would put a
+    number into config that :data:`MIN_CATEGORY_PAIRS` says is not evidence.
+
+    Every category present in the input is present in the output, an
+    uncalibrated one INCLUDED with a null ``t_high`` and its reason code.
+    Omitting it would read as "not measured" rather than "measured, and
+    refused" — the ambiguity this calibration exists to remove.
+
+    ``pooled_t_high_negatives_admitted`` counts the category's OWN negatives
+    that the POOLED cutoff would restate deterministically. That count is
+    the direct evidence for or against one cutoff serving every category. It
+    is ``None`` when there is no pooled band to measure against, since ``0``
+    would read as "measured, and safe".
+    """
+    per_category: dict[str, dict[str, Any]] = {}
+    for category, scores_by_class in scores_by_category_and_class.items():
+        scores = {name: list(scores_by_class.get(name) or []) for name in PAIR_CLASSES}
+        negatives = [s for name in NEGATIVE_PAIR_CLASSES for s in scores[name]]
+        t_high, t_low, reason = derive_bands(scores['true_dup'], negatives)
+        if t_high is not None and (
+            len(scores['true_dup']) < min_dup_pairs or len(negatives) < min_negative_pairs
+        ):
+            # A derived number, WITHDRAWN: the sample is too small for either
+            # fitted edge to mean what a cutoff claims. The refusal replaces
+            # any reason derive_bands returned (including no_judge_band) —
+            # there is no band left to qualify.
+            t_high, t_low, reason = None, None, (
+                f'{REASON_INSUFFICIENT_PAIRS}: {len(scores["true_dup"])} duplicate and '
+                f'{len(negatives)} negative pair(s) measured, below the '
+                f'{min_dup_pairs}/{min_negative_pairs} minimum. A fresh pair falls '
+                f'outside a sample this small\'s observed extreme with expected '
+                f'probability 1/(n+1), and both band edges are fitted to exactly '
+                f'that extreme. Refusing a cutoff the sample size cannot support — '
+                f'this category runs on the disclosed pooled fallback instead.'
+            )
+        admitted = (
+            None if pooled_t_high is None
+            else sum(
+                _band_counts(scores[name], pooled_t_high, pooled_t_low)['deterministic']
+                for name in NEGATIVE_PAIR_CLASSES
+            )
+        )
+        per_category[category] = {
+            'distributions': {
+                name: summarize_distribution(values) for name, values in scores.items()
+            },
+            't_high': t_high,
+            't_low': t_low,
+            'reason': reason,
+            'pair_counts': {name: len(values) for name, values in scores.items()},
+            'pooled_t_high_negatives_admitted': admitted,
+        }
+    return per_category
+
+
 def build_report(
     scores_by_class: Mapping[str, Sequence[float]],
     t_high: float | None,
@@ -399,6 +719,7 @@ def build_report(
     reason: str | None,
     recall: dict[str, Any],
     provenance: dict[str, Any],
+    per_category: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Assemble the JSON-serializable calibration report.
 
@@ -413,6 +734,14 @@ def build_report(
     refusal, so they are still emitted. The false-positive tally is then
     ``None`` rather than ``0`` — with no deterministic band, ``0`` would
     read as "measured, and safe".
+
+    ``per_category`` (from ``derive_bands_per_category``) is carried
+    verbatim under ``per_category``. It is strictly ADDITIVE: the pooled
+    numbers above are unchanged by its presence, since the pooled t_high
+    remains the calibration of record and this section is the evidence
+    about whether it is warranted per category. It defaults to
+    present-and-empty rather than absent, because an absent key cannot be
+    told apart from an artifact predating the measurement.
     """
     scores = {name: list(scores_by_class.get(name) or []) for name in PAIR_CLASSES}
 
@@ -424,8 +753,12 @@ def build_report(
         else sum(per_band[name]['deterministic'] for name in NEGATIVE_PAIR_CLASSES)
     )
 
+    per_category = dict(per_category or {})
     run_provenance = dict(provenance)
     run_provenance['pair_counts'] = {name: len(values) for name, values in scores.items()}
+    run_provenance['per_category_pair_counts'] = {
+        category: entry['pair_counts'] for category, entry in per_category.items()
+    }
 
     return {
         'chosen_t_high': t_high,
@@ -436,6 +769,7 @@ def build_report(
             name: summarize_distribution(values) for name, values in scores.items()
         },
         'per_band': per_band,
+        'per_category': per_category,
         'recall_at_k': recall,
         'provenance': run_provenance,
     }
@@ -448,11 +782,200 @@ def build_report(
 _BLOCK_KEY = 'write_triage:'
 
 
+def _interior_comment_run(pending: Sequence[str]) -> list[str]:
+    """The leading sub-run of *pending* that belongs to the value ABOVE it.
+
+    A comment run sitting between a preserved key's last child and the next
+    ``indent<=2`` key is ambiguous: it either TRAILS the nested value it
+    follows or HEADS the key beneath it. INDENT decides, the same way it
+    decides child membership everywhere else in this parser — a comment
+    indented deeper than 2 is interior to the value above; one at indent<=2
+    is a header for what comes next.
+
+    Only the leading deep sub-run is returned, so a mixed run splits at the
+    first indent<=2 comment. A trailing blank run is dropped: a blank line is
+    pure separator and belongs to nobody, which is the same rule that keeps
+    ``trailing`` comment-only.
+    """
+    interior: list[str] = []
+    for line in pending:
+        stripped = line.strip()
+        if not stripped:
+            interior.append(line)
+            continue
+        if len(line) - len(line.lstrip()) <= 2:
+            break
+        interior.append(line)
+    while interior and not interior[-1].strip():
+        interior.pop()
+    return interior
+
+
+def _preserved_block_lines(lines: Sequence[str]) -> tuple[list[str], list[str]]:
+    """Split an existing ``write_triage:`` body into the parts this writer does not own.
+
+    *lines* is the block body only (the ``write_triage:`` line excluded).
+    Returns ``(preserved, trailing)``:
+
+    * ``preserved`` — every two-space-indented ``key:`` line whose key is not
+      in ``WRITE_TRIAGE_BAND_KEYS``, together with the run of comment lines
+      immediately above it (its explanatory note) and ALL deeper-indented
+      child lines below it (its nested value), interior comments and blank
+      separators included -- including a comment that TRAILS the value with
+      no child line after it, which ``_interior_comment_run`` splits out by
+      indent. A comment run that HEADS an OWNED key -- the
+      ``# CALIBRATION OUTPUT`` fence and its explanation -- is dropped,
+      because the rebuilt block re-emits its own copy.
+    * ``trailing`` — a comment run at the very END of the body, with no key
+      beneath it. This is hand-written operator prose (config.yaml's
+      ``# EVIDENCE STATUS`` note); it belongs to no key, so it is re-emitted
+      at the END of the rebuilt block rather than above the fence. Putting it
+      back where it was found is what makes it survive repeated runs: emitted
+      above the fence it would become a comment run followed by an owned key
+      on the NEXT parse, and be dropped -- present-then-gone rather than
+      preserved.
+
+    ``keeping_children`` is (re)decided ONLY at an indent<=2 key line. An
+    interior comment or blank line inside a nested value must NOT end the
+    child run: doing so silently discarded every child after the first
+    interior comment, which is the exact config data loss this function
+    exists to prevent.
+
+    Line-oriented for the same reason the caller is: pyyaml is the only YAML
+    dependency, and a safe_dump round-trip would strip config.yaml's
+    operator-facing comments.
+    """
+    kept: list[str] = []
+    # Comment/blank lines whose fate is not yet decided: they belong to
+    # whatever line comes next, and are discarded if that line is dropped (or
+    # if nothing follows a blank-terminated run).
+    pending: list[str] = []
+    keeping_children = False
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            # A blank line is a separator, never content on its own. It is
+            # BUFFERED whenever discarding it would take hand-written text
+            # with it -- inside a preserved key's nested value, so the block's
+            # internal spacing round-trips, AND inside a COMMENT RUN, where a
+            # blank is a paragraph break rather than a terminator.
+            #
+            # The second case is not symmetry for its own sake. `pending.clear()`
+            # here discards the comment run ABOVE the blank, and that run is
+            # never re-emitted by anyone: config.yaml ships exactly this shape
+            # (the `# EVIDENCE STATUS` prose follows `t_high_by_category`, an
+            # OWNED key, so `keeping_children` is False for it), so one blank
+            # line typed into that note silently deleted nine lines of operator
+            # prose -- and the deletion was IDEMPOTENT, so no later run showed a
+            # diff to notice it by. That is the hand-written-config loss this
+            # whole function exists to prevent, in the one branch that was
+            # still doing it.
+            #
+            # A blank with no comment above it is still dropped, which is what
+            # keeps the rebuilt block from accumulating a growing run of
+            # separators across successive runs. Buffered blanks cannot
+            # accumulate either: every flush site either re-emits the run
+            # verbatim (stable under re-parse) or filters blanks out entirely
+            # (`_interior_comment_run`, and the `trailing` comprehension below).
+            if keeping_children or any(p.lstrip().startswith('#') for p in pending):
+                pending.append(line)
+            else:
+                pending.clear()
+            continue
+        if stripped.startswith('#'):
+            pending.append(line)
+            continue
+        indent = len(line) - len(line.lstrip())
+        if indent > 2:
+            # A child of whatever indent<=2 key we last saw.
+            if keeping_children:
+                kept.extend(pending)
+                kept.append(line)
+            pending.clear()
+            continue
+        key = stripped.split(':', 1)[0].strip()
+        was_keeping = keeping_children
+        keeping_children = key not in WRITE_TRIAGE_BAND_KEYS
+        if keeping_children:
+            kept.extend(pending)
+            kept.append(line)
+        elif was_keeping:
+            # An OWNED key ends a preserved value's child run, and `pending`
+            # may hold a comment that TRAILED that value rather than heading
+            # this key. Dropping the whole run wholesale lost it — narrower
+            # than the severed-children defect above, and the same class of
+            # hand-written-config loss this function exists to prevent.
+            kept.extend(_interior_comment_run(pending))
+        pending.clear()
+    # Whatever is still pending is a comment run with no key beneath it — with
+    # the same ambiguity an owned key creates, so it is split the same way: a
+    # deeper-indented leading run trailed the last preserved VALUE and stays
+    # with it, and only the rest is operator prose belonging to the block.
+    if keeping_children:
+        interior = _interior_comment_run(pending)
+        kept.extend(interior)
+        pending = list(pending[len(interior):])
+    # Only the comments are kept (a trailing blank run is pure separator); they
+    # are returned separately so the caller can re-emit them at the end.
+    trailing = [line for line in pending if line.strip()]
+    return kept, trailing
+
+
+def _top_level_block_span(lines: Sequence[str], block_key: str) -> tuple[int | None, int]:
+    """``(start, end)`` of the top-level section opened by *block_key*.
+
+    ``start`` is the index of the column-0 key line, or ``None`` when the
+    section is absent (``end`` is then ``len(lines)``). ``end`` is exclusive.
+
+    The scan runs to the next line that opens a new TOP-LEVEL key (column 0,
+    not a comment and not blank). Bounding the span this way is what keeps a
+    section declared after this one from being eaten.
+
+    Then ``end`` walks back: a run of COLUMN-0 comment lines, plus any blank
+    lines before it, is the HEADER for the section that FOLLOWS — that is
+    config.yaml's convention throughout (see the 6-line comment block before
+    `summary_rebuild:`). It must survive a replacement rather than being
+    consumed as block-internal. The column-0 test is deliberately
+    `startswith('#')` and NOT `lstrip().startswith('#')`: an INDENTED comment
+    belongs to the block it sits inside, so the walk stops at it.
+    """
+    start = next(
+        (i for i, line in enumerate(lines) if line.startswith(block_key)),
+        None,
+    )
+    end = len(lines)
+    if start is None:
+        return None, end
+    for i in range(start + 1, len(lines)):
+        line = lines[i]
+        if line.strip() and not line[0].isspace() and not line.lstrip().startswith('#'):
+            end = i
+            break
+    while end > start + 1 and (
+        not lines[end - 1].strip() or lines[end - 1].startswith('#')
+    ):
+        end -= 1
+    return start, end
+
+
+def _splice_block(yaml_text: str, lines: Sequence[str], span: tuple[int | None, int],
+                  block: str) -> str:
+    """Put *block* where *span* was, or append it at EOF when the section is absent."""
+    start, end = span
+    if start is None:
+        separator = '' if yaml_text.endswith('\n\n') or not yaml_text else '\n'
+        return yaml_text + separator + block
+    # No trailing accumulator: `lines[end:]` already emits every reclaimed line
+    # verbatim, so collecting them separately would double-emit them.
+    return ''.join(lines[:start]) + block + ''.join(lines[end:])
+
+
 def write_triage_config_block(
     yaml_text: str,
     t_high: float | None,
     t_low: float | None,
     report_path: str,
+    t_high_by_category: Mapping[str, float] | None = None,
 ) -> str:
     """Return *yaml_text* with only its ``write_triage:`` block replaced.
 
@@ -461,9 +984,34 @@ def write_triage_config_block(
     would strip config.yaml's extensive explanatory comments, which are
     load-bearing for operators.
 
-    Raises when either threshold is ``None`` — an uncalibrated run must
-    never put a null threshold into config. The input string is never
-    mutated, so a refusal leaves no partial block behind.
+    This writer OWNS exactly four keys -- ``t_high``, ``t_low``,
+    ``calibration_report_path``, ``t_high_by_category`` -- and PRESERVES
+    everything else it finds in the block, comments and nested values
+    included, re-emitting it above the calibration fence. The one exception
+    is a trailing comment run that belongs to no key, which is re-emitted
+    BELOW the derived keys, where it was found -- see
+    ``_preserved_block_lines`` for why position is what makes it survive a
+    second run. The rule is
+    "preserve what this writer does not own", not an allowlist of known
+    knobs, so a key a later leaf adds is not dropped by a recalibration that
+    predates it. The reason it matters: ``write_triage.enabled`` is a
+    green-tier hot-reloadable operator kill switch living in this same
+    section, and ``reload_config`` re-reads config.yaml -- so rebuilding the
+    block from scratch would revert triage to off with nothing logged and
+    nothing to grep, and would make the flag unflippable at runtime besides.
+
+    Raises when either POOLED threshold is ``None`` — an uncalibrated run
+    must never put a null threshold into config, and a per-category map
+    never licenses one. The input string is never mutated, so a refusal
+    leaves no partial block behind.
+
+    ``t_high_by_category`` carries only the categories whose band was
+    actually DERIVED. A category with no derived cutoff is ABSENT from the
+    map, and that is the only spelling of it: emitting it with a null would
+    give "no evidence for this category" two representations that the
+    reader would then have to disambiguate. An empty map omits the key
+    entirely for the same reason. Keys are sorted, so two runs over the
+    same measurement produce the same bytes.
     """
     if t_high is None or t_low is None:
         raise ValueError(
@@ -472,8 +1020,39 @@ def write_triage_config_block(
             'triage fails open to `stored`.',
         )
 
+    by_category = ''
+    if t_high_by_category:
+        by_category = (
+            '  # Per-category cutoffs, measured the same way over each category\'s\n'
+            '  # OWN pairs. A category ABSENT here has no derived cutoff — see the\n'
+            "  # report's per_category section for the refusal and its reason.\n"
+            '  t_high_by_category:\n'
+        ) + ''.join(
+            f'    {category}: {t_high_by_category[category]}\n'
+            for category in sorted(t_high_by_category)
+        )
+
+    lines = yaml_text.splitlines(keepends=True)
+    start, end = _top_level_block_span(lines, _BLOCK_KEY)
+
+    # Hand-set knobs found in the existing block, re-emitted ABOVE the
+    # calibration fence so the shipped file's layout round-trips unchanged and
+    # the derived and hand-set halves stay visually separable.
+    preserved_lines, trailing_lines = (
+        _preserved_block_lines(lines[start + 1:end])
+        if start is not None else ([], [])
+    )
+    preserved = ''.join(preserved_lines)
+    # Hand-written prose that belonged to no key is re-emitted at the END,
+    # where it was found -- see _preserved_block_lines. Above the fence it
+    # would be swallowed by the next run's "comment run above an owned key"
+    # rule, which is how config.yaml's `# EVIDENCE STATUS` note used to be
+    # lost.
+    trailing = ''.join(trailing_lines)
+
     block = (
         f'{_BLOCK_KEY}\n'
+        f'{preserved}'
         '  # CALIBRATION OUTPUT — do not hand-edit.\n'
         '  # Derived from measured similarity distributions by\n'
         '  # scripts/calibrate_write_triage.py; both values are order statistics of\n'
@@ -484,40 +1063,107 @@ def write_triage_config_block(
         f'  t_high: {t_high}\n'
         f'  t_low: {t_low}\n'
         f'  calibration_report_path: {report_path}\n'
+        f'{by_category}'
+        f'{trailing}'
     )
 
+    return _splice_block(yaml_text, lines, (start, end), block)
+
+
+def derived_category_cutoffs(report: Mapping[str, Any]) -> dict[str, float]:
+    """``{category: t_high}`` for exactly the categories whose band was DERIVED.
+
+    A refused category is ABSENT rather than mapped to a null, so a consumer
+    reads "uncalibrated for this category" from one unambiguous signal.
+    """
+    return {
+        category: entry['t_high']
+        for category, entry in report.get('per_category', {}).items()
+        if entry['t_high'] is not None
+    }
+
+
+_PROJECT_SECTION = 'write_triage_project_calibrations'
+_PROJECT_BLOCK_KEY = f'{_PROJECT_SECTION}:'
+
+# Indented, so the fence belongs to the section's own span: a column-0 run
+# would be read by _top_level_block_span's walk-back as the NEXT section's
+# header and stranded outside it.
+_PROJECT_BLOCK_FENCE = (
+    '  # CALIBRATION OUTPUT — machine-owned; do not hand-edit.\n'
+    "  # Per-project per-category cutoffs, each measured on that project's own\n"
+    '  # fixture by scripts/calibrate_write_triage.py --write-project-config.\n'
+    '  # Read only by scripts/audit_duplicate_memories.py for a run whose\n'
+    "  # --project-id equals the key; never pooled with write_triage's bands.\n"
+    '  # Hand edits inside this section are not preserved.\n'
+)
+# A long report path stays on its key's line rather than being folded.
+_NO_LINE_FOLDING = 1 << 16
+
+
+def _render_project_section(entries: Mapping[str, Mapping[str, Any]]) -> str:
+    """The whole section, projects and categories sorted, so equal input is equal bytes.
+
+    The body is rendered by the same YAML library that parses it back, so a
+    project id such as ``123`` or ``yes`` stays a quoted string key and a
+    report path is never re-read as YAML syntax.
+    """
+    body = yaml.safe_dump(
+        {
+            project: {
+                'calibration_report_path': entry['calibration_report_path'],
+                't_high_by_category': dict(entry['t_high_by_category']),
+            }
+            for project, entry in entries.items()
+        },
+        sort_keys=True, default_flow_style=False, allow_unicode=True, width=_NO_LINE_FOLDING,
+    )
+    indented = ''.join(f'  {line}' for line in body.splitlines(keepends=True))
+    return f'{_PROJECT_BLOCK_KEY}\n{_PROJECT_BLOCK_FENCE}{indented}'
+
+
+def _existing_project_entries(section_text: str) -> dict[str, Any]:
+    """The parsed section's entries; refuses a project key that did not load as a string."""
+    entries = yaml.safe_load(section_text)[_PROJECT_SECTION] or {}
+    non_string = sorted(repr(key) for key in entries if not isinstance(key, str))
+    if non_string:
+        raise ValueError(
+            f'{_PROJECT_SECTION} carries project key(s) {", ".join(non_string)} that YAML '
+            'loaded as a non-string; quote them in config.yaml before re-running.',
+        )
+    return dict(entries)
+
+
+def write_project_calibration_block(
+    yaml_text: str,
+    project_id: str,
+    report_path: str,
+    t_high_by_category: Mapping[str, float],
+) -> str:
+    """Return *yaml_text* with ``write_triage_project_calibrations.<project_id>`` replaced.
+
+    Writes ONLY that one project's entry, replacing it wholesale (a category
+    the latest run stopped deriving is dropped, never merged), and never
+    touches ``write_triage:``'s pooled keys. The section is machine-owned, so
+    unlike ``write_triage_config_block`` it is parsed and re-rendered whole;
+    hand edits inside it are not preserved. Raises on an empty map, and the
+    input string is never mutated, so a refusal leaves nothing half-written.
+    """
+    if not t_high_by_category:
+        raise ValueError(
+            f'refusing to write a {project_id!r} project entry with no derived '
+            'category: a calibration that evidences nothing must stay absent.',
+        )
     lines = yaml_text.splitlines(keepends=True)
-    start = next(
-        (i for i, line in enumerate(lines) if line.startswith(_BLOCK_KEY)),
-        None,
+    start, end = _top_level_block_span(lines, _PROJECT_BLOCK_KEY)
+    entries = (
+        _existing_project_entries(''.join(lines[start:end])) if start is not None else {}
     )
-    if start is None:
-        separator = '' if yaml_text.endswith('\n\n') or not yaml_text else '\n'
-        return yaml_text + separator + block
-
-    # Scan to the next line that opens a new TOP-LEVEL key (column 0, not a
-    # comment and not blank). Bounding the span this way is what keeps a
-    # section declared after write_triage from being eaten.
-    end = len(lines)
-    for i in range(start + 1, len(lines)):
-        line = lines[i]
-        if line.strip() and not line[0].isspace() and not line.lstrip().startswith('#'):
-            end = i
-            break
-
-    # Then walk `end` back: a run of COLUMN-0 comment lines, plus any blank
-    # lines before it, is the HEADER for the section that FOLLOWS — that is
-    # config.yaml's convention throughout (see the 6-line comment block before
-    # `summary_rebuild:`). It must survive the replacement rather than being
-    # consumed as block-internal. The column-0 test is deliberately
-    # `startswith('#')` and NOT `lstrip().startswith('#')`: an INDENTED comment
-    # belongs to the block it sits inside, so the walk stops at it.
-    while end > start + 1 and (not lines[end - 1].strip() or lines[end - 1].startswith('#')):
-        end -= 1
-
-    # No trailing accumulator: `lines[end:]` already emits every reclaimed line
-    # verbatim, so collecting them separately would double-emit them.
-    return ''.join(lines[:start]) + block + ''.join(lines[end:])
+    entries[project_id] = {
+        'calibration_report_path': report_path,
+        't_high_by_category': dict(t_high_by_category),
+    }
+    return _splice_block(yaml_text, lines, (start, end), _render_project_section(entries))
 
 
 def render_markdown(report: dict[str, Any]) -> str:
@@ -551,13 +1197,34 @@ def render_markdown(report: dict[str, Any]) -> str:
     for name in PAIR_CLASSES:
         b = report['per_band'][name]
         lines.append(f'| {name} | {b["deterministic"]} | {b["judge"]} | {b["store"]} |')
+    per_category = report.get('per_category') or {}
+    if per_category:
+        lines += ['', '## Per-category bands', '',
+                  '| category | n true_dup | n negative | t_high | t_low '
+                  '| pooled t_high admits | reason |',
+                  '|---|---|---|---|---|---|---|']
+        for name in sorted(per_category):
+            entry = per_category[name]
+            counts = entry['pair_counts']
+            lines.append(
+                f'| {name} | {counts["true_dup"]} '
+                f'| {counts["unrelated"] + counts["hard_negative"]} '
+                f'| {entry["t_high"]} | {entry["t_low"]} '
+                f'| {entry["pooled_t_high_negatives_admitted"]} '
+                f'| {entry["reason"] or ""} |',
+            )
+    recall = report['recall_at_k']
     lines += ['', '## Candidate-retrieval recall', '',
               '| k | hits | total | recall |', '|---|---|---|---|']
-    for row in report['recall_at_k'].get('per_k', []):
+    for row in recall.get('per_k', []):
         lines.append(f'| {row["k"]} | {row["hits"]} | {row["total"]} | {row["recall"]} |')
-    absent = report['recall_at_k'].get('canonical_absent') or []
-    lines += ['', f'Canonicals absent from the corpus (excluded from the denominator): '
-                  f'{len(absent)}', '', '## Provenance', '']
+    absent = recall.get('canonical_absent') or []
+    population = (
+        'counted in the denominator; each is a miss unless an alias or a hoisted child '
+        'reaches it' if recall['absent_in_denominator'] else 'excluded from the denominator'
+    )
+    lines += ['', f'Canonicals absent from the corpus ({population}): {len(absent)}',
+              '', '## Provenance', '']
     for key, value in report['provenance'].items():
         lines.append(f'- `{key}`: `{value}`')
     return '\n'.join(lines) + '\n'
@@ -570,17 +1237,24 @@ def run_calibration(
     report_path: str | Path,
     ks: Sequence[int],
     provenance: dict[str, Any],
+    aliases: Mapping[str, str] | None = None,
+    count_absent_as_miss: bool = False,
 ) -> dict[str, Any]:
     """Measure, derive, and write the report. Never writes config.
 
     ``embed_fn(memory_id, content)`` is called exactly ONCE per distinct
     record — embedding per pair would multiply API cost by O(n).
-    ``search_fn(record, k)`` returns ``{candidates, canonical_present}``.
+    ``search_fn(record, k)`` returns ``{candidates, canonical_present}``,
+    plus optionally ``candidate_parents`` (see ``compute_recall_at_k``) and
+    ``degraded`` (see ``fetch_recall_hit``).
 
     Neither callable's failure is caught. A swallowed embed error would
     silently shrink the measured population, producing a report whose
     thresholds look fine but were computed on a subset; a swallowed search
     error would be indistinguishable from a genuine recall miss.
+
+    ``aliases`` and ``count_absent_as_miss`` are recall's two independent
+    choices; see :func:`compute_recall_at_k`.
     """
     vectors = {r['memory_id']: embed_fn(r['memory_id'], r['content']) for r in records}
     logger.info('Embedded %d distinct record(s)', len(vectors))
@@ -599,6 +1273,124 @@ def run_calibration(
     if reason:
         logger.warning('Band derivation returned no complete calibration: %s', reason)
 
+    # Measured a SECOND way out of the SAME `vectors` — no extra embed calls,
+    # so the O(n) embed budget above is unchanged.
+    partition = partition_pairs_by_category(records)
+    scores_by_category_and_class = {
+        category: {
+            name: [
+                cosine_similarity(vectors[p['a']], vectors[p['b']])
+                for p in buckets[f'{name}_pairs']
+            ]
+            for name in PAIR_CLASSES
+        }
+        for category, buckets in partition['by_category'].items()
+    }
+    per_category = derive_bands_per_category(scores_by_category_and_class, t_high, t_low)
+    for category, entry in sorted(per_category.items()):
+        if entry['reason']:
+            logger.warning('Category %s: %s', category, entry['reason'])
+
+    recall, retrievals, degraded_count = _measure_recall(
+        records, search_fn, ks, aliases, count_absent_as_miss,
+    )
+
+    per_category_record_counts: dict[str, int] = {}
+    for record in records:
+        category = record.get('category')
+        if category:
+            per_category_record_counts[str(category)] = (
+                per_category_record_counts.get(str(category), 0) + 1
+            )
+
+    run_provenance = dict(provenance)
+    run_provenance.setdefault('record_count', len(records))
+    run_provenance.setdefault('cluster_count', len({r['cluster_id'] for r in records}))
+    run_provenance.setdefault('per_category_record_counts', per_category_record_counts)
+    run_provenance.setdefault('cross_category_dropped', partition['cross_category_dropped'])
+    run_provenance.setdefault('degraded_retrievals', degraded_count)
+    report = build_report(
+        scores_by_class=scores_by_class, t_high=t_high, t_low=t_low,
+        reason=reason, recall=recall, provenance=run_provenance,
+        per_category=per_category,
+    )
+    _write_report(report, report_path)
+
+    return {
+        'report': report, 'scores_by_class': scores_by_class,
+        't_high': t_high, 't_low': t_low, 'reason': reason,
+        'config_written': False, 'retrievals': retrievals,
+    }
+
+
+#: The provenance keys that describe how the BANDS were measured. A
+#: recall-only run carries these from its base report and re-measures the rest.
+BAND_PROVENANCE_KEYS = (
+    'fixture_path', 'embedder_model', 'embedder_dimensions', 'record_count',
+    'cluster_count', 'per_category_record_counts', 'cross_category_dropped',
+    'pair_counts', 'per_category_pair_counts',
+)
+
+
+def remeasure_recall(
+    base_report: Mapping[str, Any],
+    records: list[dict[str, Any]],
+    search_fn: Any,
+    report_path: str | Path,
+    ks: Sequence[int],
+    provenance: Mapping[str, Any],
+    bands_from: str | Path,
+    aliases: Mapping[str, str] | None = None,
+    count_absent_as_miss: bool = False,
+) -> dict[str, Any]:
+    """Re-measure recall alone, carrying *base_report*'s band section verbatim.
+
+    Recall comes from the live store and the bands from embedded fixture
+    pairs, so recall can be re-measured without re-deriving thresholds away
+    from the ones config.yaml deploys (PRD D2). Never embeds; never writes
+    config. *provenance* is this run's, and its band-side keys yield to the
+    base's.
+    """
+    base_provenance = base_report['provenance']
+    if base_provenance.get('fixture_path') != provenance['fixture_path']:
+        raise ValueError(
+            f'{bands_from} measured its bands on {base_provenance.get("fixture_path")!r}, '
+            f'but this run loads {provenance["fixture_path"]!r}',
+        )
+    if base_provenance.get('record_count') != len(records):
+        raise ValueError(
+            f'{bands_from} measured its bands on {base_provenance.get("record_count")} '
+            f'records, but this run loads {len(records)}',
+        )
+
+    recall, retrievals, degraded_count = _measure_recall(
+        records, search_fn, ks, aliases, count_absent_as_miss,
+    )
+    carried = {k: v for k, v in base_provenance.items() if k in BAND_PROVENANCE_KEYS}
+    recall_side = {k: v for k, v in provenance.items() if k not in BAND_PROVENANCE_KEYS}
+    report = {
+        **base_report,
+        'recall_at_k': recall,
+        'provenance': carried | recall_side | {
+            'degraded_retrievals': degraded_count,
+            'bands_from': package_relative(bands_from),
+        },
+    }
+    _write_report(report, report_path)
+    return {'report': report, 'retrievals': retrievals}
+
+
+def _measure_recall(
+    records: list[dict[str, Any]],
+    search_fn: Any,
+    ks: Sequence[int],
+    aliases: Mapping[str, str] | None,
+    count_absent_as_miss: bool,
+) -> tuple[dict[str, Any], list[dict[str, Any]], int]:
+    """Search each non-canonical record once at ``max(ks)``; score recall@k.
+
+    Returns the recall section, the raw retrievals and the degraded count.
+    """
     max_k = max(ks) if ks else 0
     retrievals = []
     for record in records:
@@ -610,33 +1402,117 @@ def run_calibration(
             'canonical_id': record['cluster_id'],
             'canonical_present': bool(hit.get('canonical_present')),
             'candidates': list(hit.get('candidates') or []),
+            'candidate_parents': dict(hit.get('candidate_parents') or {}),
+            'degraded': bool(hit.get('degraded')),
         })
-    recall = compute_recall_at_k(retrievals, list(ks))
-
-    run_provenance = dict(provenance)
-    run_provenance.setdefault('record_count', len(records))
-    run_provenance.setdefault('cluster_count', len({r['cluster_id'] for r in records}))
-    report = build_report(
-        scores_by_class=scores_by_class, t_high=t_high, t_low=t_low,
-        reason=reason, recall=recall, provenance=run_provenance,
+    degraded = [r['memory_id'] for r in retrievals if r['degraded']]
+    if degraded:
+        logger.warning(
+            '%d retrieval(s) came back DEGRADED, so each scores as a recall miss that '
+            'measured nothing: %s', len(degraded), ', '.join(degraded),
+        )
+    recall = compute_recall_at_k(
+        retrievals, list(ks), aliases=aliases, count_absent_as_miss=count_absent_as_miss,
     )
+    return recall, retrievals, len(degraded)
 
+
+def _write_report(report: dict[str, Any], report_path: str | Path) -> None:
+    """The JSON report and its rendered .md sibling, written from one dict."""
     report_path = Path(report_path)
     report_path.parent.mkdir(parents=True, exist_ok=True)
     report_path.write_text(json.dumps(report, indent=2) + '\n')
     report_path.with_suffix('.md').write_text(render_markdown(report))
     logger.info('Wrote %s and its .md sibling', report_path)
 
-    return {
-        'report': report, 'scores_by_class': scores_by_class,
-        't_high': t_high, 't_low': t_low, 'reason': reason,
-        'config_written': False,
-    }
-
 
 # ---------------------------------------------------------------------------
 # Live edge / CLI
 # ---------------------------------------------------------------------------
+
+RETRIEVAL_LEGACY = 'legacy'
+RETRIEVAL_PRODUCTION = 'production'
+
+#: Each ``--retrieval`` mode, and the search call provenance names for it.
+RETRIEVAL_CALLS = {
+    RETRIEVAL_LEGACY: "fused_memory.services.memory_service::MemoryService.search(stores=['mem0'])",
+    RETRIEVAL_PRODUCTION: 'fused_memory.server.write_triage::retrieve_candidates',
+}
+RETRIEVAL_MODES = tuple(RETRIEVAL_CALLS)
+
+
+def _require_retrieval_mode(retrieval_mode: str) -> None:
+    if retrieval_mode not in RETRIEVAL_CALLS:
+        raise ValueError(
+            f'unknown --retrieval mode {retrieval_mode!r}; expected one of {RETRIEVAL_MODES}',
+        )
+
+
+def recall_provenance(
+    *,
+    project_id: str,
+    retrieval_mode: str,
+    canonical_aliases_path: str | Path | None,
+    aliases: Mapping[str, str] | None,
+) -> dict[str, Any]:
+    """The recall side of a report's provenance.
+
+    It names the search call rather than restating its kwargs, so the record
+    cannot drift from what the call actually sends.
+    """
+    _require_retrieval_mode(retrieval_mode)
+    return {
+        'project_id': project_id,
+        'retrieval_mode': retrieval_mode,
+        'retrieval_call': RETRIEVAL_CALLS[retrieval_mode],
+        'canonical_aliases_path': (
+            package_relative(canonical_aliases_path) if canonical_aliases_path else None
+        ),
+        'canonical_aliases_count': len(aliases) if aliases else 0,
+    }
+
+
+async def fetch_recall_hit(
+    memory_service: Any,
+    record: Mapping[str, Any],
+    *,
+    project_id: str,
+    k: int,
+    retrieval_mode: str,
+) -> dict[str, Any]:
+    """One record's search as *retrieval_mode* makes it, plus its canonical's liveness.
+
+    Returns the ranked candidate ids, the parent each sighting/amendment
+    candidate hoists to (the attach target production would use), whether the
+    canonical is live, and whether the search came back degraded.
+    """
+    _require_retrieval_mode(retrieval_mode)
+    from fused_memory.server.write_triage import (
+        canonical_id_of,
+        retrieve_candidates,
+    )
+
+    if retrieval_mode == RETRIEVAL_PRODUCTION:
+        rows = await retrieve_candidates(memory_service, record['content'], project_id, k)
+    else:
+        # stores=['mem0'] is load-bearing: unscoped, the read router sends this
+        # corpus's queries to graphiti alone, whose edge UUIDs never equal a
+        # mem0 memory_id (measured: 0/6 canonicals in top-10 vs 4/6 scoped).
+        rows = await memory_service.search(
+            query=record['content'], project_id=project_id, limit=k, stores=['mem0'],
+        )
+    degraded = bool(getattr(rows, 'degraded', False))
+    return {
+        'candidates': [row.id for row in rows],
+        'candidate_parents': {
+            row.id: hoisted for row in rows if (hoisted := canonical_id_of(row)) != row.id
+        },
+        'canonical_present': (
+            await memory_service.get_memory_by_id(project_id, record['cluster_id']) is not None
+        ),
+        'degraded': degraded,
+    }
+
 
 def build_embed_fn(config: Any) -> Any:
     """Mirror Mem0's own embedder wiring — model + api_key, NO dimensions.
@@ -645,7 +1521,7 @@ def build_embed_fn(config: Any) -> Any:
     measurement into a different metric space than the guard's
     relevance_score, making the derived thresholds inapplicable.
     """
-    from openai import OpenAI  # noqa: PLC0415
+    from openai import OpenAI
 
     embedder = config.embedder
     openai_provider = embedder.providers.openai
@@ -663,56 +1539,123 @@ def build_embed_fn(config: Any) -> Any:
     return embed
 
 
-async def _run(args: Any) -> int:
-    import os  # noqa: PLC0415
+def _warn_refused_categories(
+    report: Mapping[str, Any], derived: Mapping[str, float], destination: str,
+) -> None:
+    refused = sorted(set(report.get('per_category', {})) - set(derived))
+    if refused:
+        logger.warning(
+            'No per-category cutoff derived for %s — left ABSENT from '
+            '%s; see the report per_category section for '
+            'each refusal reason.', ', '.join(refused), destination,
+        )
 
-    from fused_memory.config.schema import FusedMemoryConfig  # noqa: PLC0415
-    from fused_memory.services.memory_service import MemoryService  # noqa: PLC0415
+
+def pooled_corpus_conflict(
+    project_id: str,
+    report_path: str | Path,
+    *,
+    pooled_report: Path | None,
+    pooled_project_id: str | None,
+) -> str | None:
+    """Why a ``--write-project-config`` run would clobber or shadow the pooled corpus, or None.
+
+    Checked before any I/O: the report is written before the config entry, so
+    a refusal after the run would come too late to save the report of record.
+    A project entry for the pooled corpus's own project would shadow
+    ``write_triage.t_high_by_category`` for every audit of that project.
+    """
+    if pooled_report is not None and Path(report_path).resolve() == pooled_report.resolve():
+        return f'--report-path {report_path} is the pooled report of record'
+    if project_id == pooled_project_id:
+        return f'--project-id {project_id} is the pooled corpus of record'
+    return None
+
+
+def _pooled_corpus_of_record(config: Any) -> tuple[Path | None, str | None]:
+    """The pooled report config.yaml names, and the project its provenance records."""
+    named = config.write_triage.calibration_report_path
+    if named is None:
+        return None, None
+    report = _PACKAGE_ROOT / named
+    if not report.exists():
+        return report, None
+    return report, json.loads(report.read_text())['provenance']['project_id']
+
+
+def _write_project_config(
+    report: Mapping[str, Any], config_path: Path, project_id: str, report_path: str,
+) -> int:
+    """Write ONLY ``write_triage_project_calibrations.<project_id>``, or refuse.
+
+    The run's pooled chosen_t_high/t_low describe this project's corpus alone,
+    which no consumer reads, so they are never written: write_triage keeps the
+    pooled bands of record (R3).
+    """
+    cutoffs = derived_category_cutoffs(report)
+    destination = f'{_PROJECT_SECTION}.{project_id}'
+    if not cutoffs:
+        logger.error(
+            'ABORT: no per-category cutoff derived for project %s (reasons: %s) — '
+            'refusing to write config; %s stays absent.',
+            project_id,
+            '; '.join(
+                f'{category}: {entry["reason"]}'
+                for category, entry in sorted(report.get('per_category', {}).items())
+            ) or 'no per_category section',
+            destination,
+        )
+        return 1
+    _warn_refused_categories(report, cutoffs, destination)
+    logger.info(
+        'Pooled chosen_t_high=%s / chosen_t_low=%s of this %s run are NOT written; '
+        'write_triage keeps its pooled bands of record.',
+        report.get('chosen_t_high'), report.get('chosen_t_low'), project_id,
+    )
+    config_path.write_text(write_project_calibration_block(
+        config_path.read_text(), project_id, package_relative(report_path), cutoffs,
+    ))
+    logger.info(
+        'Wrote %s to %s (per-category cutoffs: %s)',
+        destination, config_path, ', '.join(sorted(cutoffs)),
+    )
+    return 0
+
+
+async def _run(args: Any) -> int:
+    import os
+
+    from fused_memory.config.schema import FusedMemoryConfig
+    from fused_memory.maintenance._utils import maintenance_service
 
     logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
     if args.config:
         os.environ['CONFIG_PATH'] = str(args.config)
 
+    aliases = load_canonical_aliases(args.canonical_aliases) if args.canonical_aliases else None
+    # The CLI's one policy coupling: resolving rotated canonicals is what
+    # makes the full population honest to score.
+    count_absent_as_miss = aliases is not None
+    recall_side = recall_provenance(
+        project_id=args.project_id, retrieval_mode=args.retrieval,
+        canonical_aliases_path=args.canonical_aliases, aliases=aliases,
+    )
+    # Read before anything is written: regenerating the base in place is the norm.
+    base_report = json.loads(Path(args.bands_from).read_text()) if args.bands_from else None
+
     config = FusedMemoryConfig()
-    memory = MemoryService(config)
-    await memory.initialize()
-    try:
+    if args.write_project_config:
+        pooled_report, pooled_project_id = _pooled_corpus_of_record(config)
+        conflict = pooled_corpus_conflict(
+            args.project_id, args.report_path,
+            pooled_report=pooled_report, pooled_project_id=pooled_project_id,
+        )
+        if conflict:
+            logger.error('ABORT: %s — refusing to calibrate; nothing was written.', conflict)
+            return 1
+    async with maintenance_service(config=config) as (_, memory):
         records = load_fixture(args.fixture)
         logger.info('Loaded %d labeled record(s) from %s', len(records), args.fixture)
-
-        embed_fn = build_embed_fn(config)
-
-        async def _search_async(record: dict, k: int) -> dict:
-            # stores=['mem0'] is load-bearing, not a narrowing convenience.
-            # An unscoped MemoryService.search runs the read ROUTER first, and
-            # for this corpus the router sends every fixture query to graphiti
-            # alone — so the top-k comes back full of graphiti edge UUIDs,
-            # which can never equal a mem0 memory_id, and recall reads ~0 for
-            # reasons that have nothing to do with retrieval quality.
-            # Write triage's candidate set is the mem0/Qdrant neighbourhood
-            # (near_duplicate_guard searches mem0; the 21 canonicals live in
-            # the fused_reify Qdrant collection), so mem0 is the store whose
-            # recall the bands actually depend on. Measured on a 6-record
-            # probe: 0/6 canonicals in top-10 unscoped vs 4/6 scoped to mem0.
-            results = await memory.search(
-                query=record['content'], project_id=args.project_id, limit=k,
-                stores=['mem0'],
-            )
-            rows = results.get('results', results) if isinstance(results, dict) else results
-            # MemoryService.search returns pydantic MemoryResult rows, not dicts.
-            candidates = [
-                str(r['id'] if isinstance(r, dict) else r.id) for r in rows or []
-            ]
-            canonical = await memory.get_memory_by_id(
-                args.project_id, record['cluster_id'],
-            )
-            if canonical is None:
-                present = False
-            elif isinstance(canonical, dict):
-                present = bool(canonical.get('found', True))
-            else:
-                present = bool(getattr(canonical, 'found', True))
-            return {'candidates': candidates, 'canonical_present': present}
 
         # Pre-resolve retrievals on this loop, then hand run_calibration a
         # plain lookup — keeps the orchestrator fully synchronous and
@@ -721,31 +1664,59 @@ async def _run(args: Any) -> int:
         prefetched: dict[str, dict] = {}
         for record in records:
             if record['label'] != LABEL_CANONICAL:
-                prefetched[record['memory_id']] = await _search_async(record, max_k)
+                prefetched[record['memory_id']] = await fetch_recall_hit(
+                    memory, record, project_id=args.project_id, k=max_k,
+                    retrieval_mode=args.retrieval,
+                )
 
-        result = run_calibration(
-            records=records,
-            embed_fn=embed_fn,
-            search_fn=lambda record, k: prefetched[record['memory_id']],
-            report_path=args.report_path,
-            ks=args.k,
-            provenance={
-                'fixture_path': package_relative(args.fixture),
-                'project_id': args.project_id,
-                'embedder_model': config.embedder.model,
-                'embedder_dimensions': getattr(config.embedder, 'dimensions', None),
-                'search_stores': 'mem0 (MemoryService.search, stores=[mem0])',
-                'search_categories': 'all',
-            },
-        )
+        def search_fn(record: dict, k: int) -> dict:
+            return prefetched[record['memory_id']]
 
-        print(json.dumps(result['report'], indent=2))
+        provenance = {
+            'fixture_path': package_relative(args.fixture),
+            'embedder_model': config.embedder.model,
+            'embedder_dimensions': getattr(config.embedder, 'dimensions', None),
+            **recall_side,
+        }
+        if base_report is not None:
+            result = remeasure_recall(
+                base_report=base_report, records=records, search_fn=search_fn,
+                report_path=args.report_path, ks=args.k, provenance=provenance,
+                bands_from=args.bands_from, aliases=aliases,
+                count_absent_as_miss=count_absent_as_miss,
+            )
+        else:
+            result = run_calibration(
+                records=records, embed_fn=build_embed_fn(config), search_fn=search_fn,
+                report_path=args.report_path, ks=args.k, provenance=provenance,
+                aliases=aliases, count_absent_as_miss=count_absent_as_miss,
+            )
+
+        if args.ranks_path:
+            ranks = compute_first_hit_ranks(result['retrievals'], aliases=aliases)
+            ranks_path = Path(args.ranks_path)
+            ranks_path.parent.mkdir(parents=True, exist_ok=True)
+            ranks_path.write_text(
+                '\n'.join(json.dumps(row) for row in ranks) + ('\n' if ranks else ''),
+            )
+            logger.info('Wrote %d rank row(s) to %s', len(ranks), ranks_path)
+
+        report = result['report']
+        print(json.dumps(report, indent=2))
         logger.info(
             't_high=%s t_low=%s deterministic-band false positives=%s',
-            result['t_high'], result['t_low'],
-            result['report']['deterministic_band_false_positives'],
+            report['chosen_t_high'], report['chosen_t_low'],
+            report['deterministic_band_false_positives'],
         )
 
+        if args.bands_from:
+            logger.info('Recall only — bands carried from %s; config unchanged.', args.bands_from)
+            return 0
+        config_path = Path(args.config) if args.config else (
+            Path(__file__).parent.parent / 'config' / 'config.yaml'
+        )
+        if args.write_project_config:
+            return _write_project_config(report, config_path, args.project_id, args.report_path)
         if not args.write_config:
             logger.info('Report only — config unchanged. Use --write-config to commit.')
             return 0
@@ -758,39 +1729,73 @@ async def _run(args: Any) -> int:
             )
             return 1
 
-        config_path = Path(args.config) if args.config else (
-            Path(__file__).parent.parent / 'config' / 'config.yaml'
-        )
+        derived_by_category = derived_category_cutoffs(report)
+        _warn_refused_categories(report, derived_by_category, 't_high_by_category')
         updated = write_triage_config_block(
             config_path.read_text(), result['t_high'], result['t_low'],
             package_relative(args.report_path),
+            t_high_by_category=derived_by_category,
         )
         config_path.write_text(updated)
-        logger.info('Wrote write_triage block to %s', config_path)
+        logger.info(
+            'Wrote write_triage block to %s (per-category cutoffs: %s)',
+            config_path, ', '.join(sorted(derived_by_category)) or 'none',
+        )
         return 0
-    finally:
-        await memory.close()
 
 
 def main() -> int:
-    import argparse  # noqa: PLC0415
-    import asyncio  # noqa: PLC0415
+    import argparse
+    import asyncio
 
     repo = Path(__file__).parent.parent
+    pooled_fixture = repo / 'tests' / 'fixtures' / 'write_triage_calibration.jsonl'
+    pooled_report = repo / 'calibration' / 'write_triage_calibration_report.json'
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--fixture', default=str(
-        repo / 'tests' / 'fixtures' / 'write_triage_calibration.jsonl'))
+    parser.add_argument('--fixture', default=None,
+                        help=f'default: {pooled_fixture} (required with --write-project-config)')
     parser.add_argument('--project-id', dest='project_id', default='reify')
     parser.add_argument('--k', type=int, action='append', default=None,
                         help='recall@k value (repeatable; default 1 3 5 10)')
-    parser.add_argument('--report-path', dest='report_path', default=str(
-        repo / 'calibration' / 'write_triage_calibration_report.json'))
+    parser.add_argument('--report-path', dest='report_path', default=None,
+                        help=f'default: {pooled_report} (required with --write-project-config)')
     parser.add_argument('--config', default=None,
                         help='Path to fused-memory config file (sets CONFIG_PATH)')
-    parser.add_argument('--write-config', dest='write_config', action='store_true',
-                        help='Write the derived thresholds into config.yaml '
-                             '(default: report only)')
+    outcome = parser.add_mutually_exclusive_group()
+    outcome.add_argument('--write-config', dest='write_config', action='store_true',
+                         help='Write the derived thresholds into config.yaml '
+                              '(default: report only)')
+    outcome.add_argument('--write-project-config', dest='write_project_config',
+                         action='store_true',
+                         help='Write ONLY write_triage_project_calibrations.<--project-id> '
+                              'from the per-category cutoffs this run derived; never '
+                              "touches write_triage's pooled keys (R3).")
+    outcome.add_argument('--bands-from', dest='bands_from', default=None,
+                         help='Recall-only: re-measure recall_at_k and carry this '
+                              "report's band section verbatim, with no embedding and no "
+                              'new thresholds. See remeasure_recall.')
+    parser.add_argument('--retrieval', choices=RETRIEVAL_MODES, default=RETRIEVAL_LEGACY,
+                        help="'production' calls write_triage.py::retrieve_candidates, the "
+                             "search a live triaged write makes; 'legacy' (default) is the "
+                             'older MemoryService.search(stores=[mem0]) shape, kept to '
+                             'reproduce historical reports.')
+    parser.add_argument('--canonical-aliases', dest='canonical_aliases', default=None,
+                        help='Path to a JSON {old_cluster_canonical_id: current_memory_id} '
+                             'map resolving rotated canonicals. When given, recall is '
+                             'measured against the full population (absent canonicals '
+                             'counted, reached through their alias) instead of the '
+                             'legacy present-only population.')
+    parser.add_argument('--ranks-path', dest='ranks_path', default=None,
+                        help='Optional path to write one JSON line per non-canonical '
+                             'record: the rank at which its canonical (or, with '
+                             '--canonical-aliases, its alias) is first reached, '
+                             'or -1. See compute_first_hit_ranks.')
     args = parser.parse_args()
+    if args.write_project_config and (args.fixture is None or args.report_path is None):
+        parser.error('--write-project-config requires an explicit --fixture and --report-path: '
+                     'their defaults are the pooled corpus and its report of record')
+    args.fixture = args.fixture or str(pooled_fixture)
+    args.report_path = args.report_path or str(pooled_report)
     if not args.k:
         args.k = [1, 3, 5, 10]
     return asyncio.run(_run(args))

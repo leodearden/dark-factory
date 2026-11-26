@@ -57,6 +57,7 @@ asserted against the REAL born-at-L2 writer, which ``tests/scripts/`` cannot
 import).
 """
 
+import contextlib
 import json
 import os
 import subprocess
@@ -145,9 +146,17 @@ STATE_PATH = os.environ.get(
 )
 
 #: File-backed escalation queue the storm escape writes into — the same
-#: directory dark-factory-orchestrator.yaml:116 configures as
-#: ``escalation.queue_dir``, so the record is visible to the dashboard and the
-#: escalation server without an MCP round-trip.
+#: directory dark-factory-orchestrator.yaml's ``escalation.queue_dir`` key
+#: configures, so the record is visible to the dashboard and the escalation
+#: server without an MCP round-trip. That key holds a RELATIVE path resolved
+#: against ``project_root`` (``orchestrator.harness`` joins
+#: ``Path(config.project_root) / config.escalation.queue_dir``), which is why
+#: this constant is REPO_DIR-anchored rather than a bare relative path.
+#: The coupling is pinned by tests/scripts/test_dashboard_watchdog.py::
+#: test_b6_escalation_queue_dir_matches_the_configured_escalation_queue_dir, so
+#: repointing either ``escalation.queue_dir`` or ``project_root`` fails that
+#: test instead of silently sending born-at-L2 ceiling records to a directory
+#: nothing reads.
 ESCALATION_QUEUE_DIR = os.environ.get(
     "DASHBOARD_WATCHDOG_QUEUE_DIR", os.path.join(REPO_DIR, "data", "escalations")
 )
@@ -205,6 +214,20 @@ def log(msg: str) -> None:
     entirely with no signal. That is precisely the silent degradation the
     storm escape exists to eliminate, arriving through the LOGGING path.
     ``TimeoutStartSec`` in the unit file is the belt-and-braces second bound.
+
+    NEVER raises from either journal route. A tooling failure in the logging
+    path must not become a control-flow event at a call site — dashboard-
+    watchdog has no per-unit loop, but every log() call inside tick() — the
+    startup-grace streak reset, the healthy-again streak reset, and the
+    ceiling re-trip log that precedes the ceiling_open write — is ordered
+    BEFORE the save_state() it narrates, so an exception escaping here
+    aborts tick() mid-branch and skips that write: a stale streak survives a
+    startup grace or a recovery (arming a restart of a *healthy* dashboard
+    on the next single missed probe), or the ``ceiling_open`` write is lost.
+    main()'s ``except Exception`` does NOT cover this — it only keeps the
+    process exit code at 0; the tick's state write is already skipped by the
+    time that handler runs. (An unrelated non-tooling exception type is
+    still deliberately propagated — see the narrow except clause below.)
     """
     try:
         subprocess.run(
@@ -217,7 +240,22 @@ def log(msg: str) -> None:
     except (OSError, subprocess.SubprocessError) as exc:
         # systemd-cat missing/unexecutable (OSError) or wedged past the bound
         # (TimeoutExpired, a SubprocessError) — still emit, just via stderr.
-        print(f"{LOG_TAG}: {msg} [systemd-cat unusable: {exc!r}]", file=sys.stderr)
+        # The fallback print is guarded BROADLY BY DESIGN, like
+        # _JournalLog.warning below: both journal routes are already gone by
+        # the time it runs, so there is nothing left to report WITH, and
+        # dropping the message beats dropping the rest of the tick with it
+        # (see the never-raises contract above). Enumerating what a degraded
+        # stderr can raise would close instances rather than the class that
+        # contract promises — a broken pipe or a full/failing journal socket
+        # raise OSError, a CLOSED stream raises ValueError, and the message
+        # is formatted INSIDE the guard. Bug-surfacing lives in the narrow
+        # OUTER clause above, which stays narrow and is pinned by
+        # test_log_swallows_only_os_and_subprocess_errors.
+        with contextlib.suppress(Exception):
+            print(
+                f"{LOG_TAG}: {msg} [systemd-cat unusable: {exc!r}]",
+                file=sys.stderr,
+            )
 
 
 class _JournalLog:
@@ -228,18 +266,17 @@ class _JournalLog:
 
     Intentionally exposes ONLY ``.warning()`` — the minimal attribute-call
     surface required by the silent-fallthrough gate's WARN_METHODS check
-    (shared/tests/silent_fallthrough_scan.py::_handler_has_warn_log, whose
-    _SCOPE_ROOTS includes ``scripts``). This is not a general-purpose logging
+    (tests/repo_guards/silent_fallthrough_scan.py::_handler_has_warn_log, whose
+    SCOPE_ROOTS includes ``scripts``). This is not a general-purpose logging
     facade; non-handler call sites in this module keep calling bare ``log()``.
     Copied deliberately from scripts/orchestrator-watchdog.py so the two
     watchdogs' journal behaviour stays identical.
     """
 
     def warning(self, msg: str) -> None:
-        try:
+        # Broad by design: logging must never break a fail-soft path.
+        with contextlib.suppress(Exception):
             log(f"WARNING: {msg}")
-        except Exception:  # noqa: BLE001 -- logging must never break a fail-soft path
-            pass
 
 
 logger = _JournalLog()
@@ -284,7 +321,7 @@ def probe_health(url: str = PROBE_URL, timeout: float = PROBE_TIMEOUT) -> bool:
         # legitimately return anything else, so this is a real failure.
         log(f"probe_health({url!r}) got HTTP {exc.code} (expected 200)")
         return False
-    except Exception as exc:  # noqa: BLE001 -- any other failure means no 200
+    except Exception as exc:  # any other failure means no 200
         logger.warning(
             f"probe_health({url!r}) got no usable response "
             f"({type(exc).__name__}: {exc}); counting as a failed probe"
@@ -424,12 +461,10 @@ def save_state(state: dict, path: str = STATE_PATH) -> None:
             f.write(payload + "\n")
         os.replace(tmp_path, path)
         tmp_path = None  # renamed away — nothing to clean up
-    except Exception as exc:  # noqa: BLE001 -- a failed stamp must not crash the tick
+    except Exception as exc:  # a failed stamp must not crash the tick
         if tmp_path is not None:
-            try:
+            with contextlib.suppress(OSError):
                 os.unlink(tmp_path)
-            except OSError:
-                pass
         logger.warning(f"save_state: failed to persist state to {path}: {exc!r}")
 
 
@@ -499,7 +534,7 @@ def _unit_active_enter_epoch(unit: str = DASHBOARD_UNIT) -> int | None:
                 return None
             return epoch
         return None
-    except Exception as exc:  # noqa: BLE001 -- a query failure must not crash the tick
+    except Exception as exc:  # a query failure must not crash the tick
         logger.warning(
             f"_unit_active_enter_epoch({unit!r}): swallowed {exc!r}; "
             "returning None (grace undeterminable this tick)"
@@ -550,7 +585,7 @@ def restart_unit(unit: str = DASHBOARD_UNIT) -> None:
             f"systemctl reset-failed {unit} timed out after 10s; "
             "attempting the restart anyway"
         )
-    except Exception as exc:  # noqa: BLE001 -- actuation must never crash the oneshot
+    except Exception as exc:  # actuation must never crash the oneshot
         logger.warning(f"systemctl reset-failed {unit} failed: {exc!r}")
 
     try:
@@ -559,7 +594,7 @@ def restart_unit(unit: str = DASHBOARD_UNIT) -> None:
         )
     except subprocess.TimeoutExpired:
         logger.warning(f"systemctl restart {unit} timed out after 45s")
-    except Exception as exc:  # noqa: BLE001 -- actuation must never crash the oneshot
+    except Exception as exc:  # actuation must never crash the oneshot
         logger.warning(f"systemctl restart {unit} failed: {exc!r}")
 
 
@@ -582,10 +617,12 @@ def _prune_restarts(restarts: list[int], now: int) -> list[int]:
 def file_ceiling_escalation(restart_count: int, window_secs: int) -> None:
     """File a born-at-L2 escalation reporting the restart ceiling.
 
-    Shells out to ``escalation submit`` through ``uv run --project`` rather
-    than importing it: this script is stdlib-only by design (it must run as a
-    bare ``Type=oneshot`` with no environment of its own), and ``escalation``
-    is not on its import path.
+    Shells out to ``escalation submit`` through ``uv run --no-sync --project``
+    rather than importing it: this script is stdlib-only by design (it must run
+    as a bare ``Type=oneshot`` with no environment of its own), and
+    ``escalation`` is not on its import path. ``--no-sync`` so filing the page
+    never re-syncs the shared root .venv
+    (tests/scripts/test_uv_run_venv_isolation.py).
 
     The argv is built against submit.py's ENFORCED argparse boundary, not
     against convenience. That CLI constructs ``Escalation(level=2, ...)``
@@ -650,6 +687,7 @@ def file_ceiling_escalation(restart_count: int, window_secs: int) -> None:
     argv = [
         UV_BIN,
         "run",
+        "--no-sync",
         "--project",
         os.path.join(REPO_DIR, "escalation"),
         "escalation",
@@ -680,7 +718,7 @@ def file_ceiling_escalation(restart_count: int, window_secs: int) -> None:
             )
             return
         log(f"filed born-at-L2 restart-ceiling escalation for {DASHBOARD_UNIT}")
-    except Exception as exc:  # noqa: BLE001 -- a failed submit must not resume the flap
+    except Exception as exc:  # a failed submit must not resume the flap
         logger.warning(
             f"file_ceiling_escalation: could not run `escalation submit` "
             f"({type(exc).__name__}: {exc}). The ceiling stays tripped, so the "
@@ -880,7 +918,7 @@ def main() -> int:
     """
     try:
         tick()
-    except Exception as exc:  # noqa: BLE001 -- a wedged tick must not fail the unit
+    except Exception as exc:  # a wedged tick must not fail the unit
         logger.warning(
             f"tick() raised {type(exc).__name__}: {exc}; skipping this tick. "
             "The unit still exits 0 so the timer keeps firing."

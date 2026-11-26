@@ -7,20 +7,23 @@ Covers:
   4. Write-once: backend has value, in-memory is stale → adopt backend, no re-stamp (step-7/8).
   5. Persistence failure is non-fatal (step-9/10).
   6. _submit_to_merge_queue threads merge_first_enqueued_at onto the MergeRequest (step-11/12).
+  7. _submit_to_merge_queue marks its MergeRequest awaited_by_workflow (task 4953).
 """
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from _orch_helpers import pydantic_spec
+from _merge_lane_fakes import DrivenMerge, drive_merge
+from _orch_helpers import MOCK_WORKFLOW_PROJECT_ROOT, pydantic_spec
 
 from orchestrator.config import OrchestratorConfig
-from orchestrator.merge_queue import MergeOutcome, MergeRequest
-from orchestrator.merge_types import QueuedBranch
+from orchestrator.merge_lane.types import QueuedBranch
+from orchestrator.merge_lane.worker import MergeOutcome, MergeRequest
 from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
 
 # ---------------------------------------------------------------------------
@@ -57,7 +60,7 @@ def _make(
     config.fused_memory.url = 'http://localhost:8002'
     config.lock_depth = 2
     config.steward_completion_timeout = 300.0
-    config.project_root = Path('/tmp/non-existent-for-test')
+    config.project_root = MOCK_WORKFLOW_PROJECT_ROOT
     config.max_consecutive_merge_thrash = 2
     config.git.branch_prefix = 'task/'
 
@@ -319,10 +322,40 @@ async def test_persistence_failure_is_non_fatal():
 # ---------------------------------------------------------------------------
 
 
+async def _drive_submission(f: _Fixture, worktree: Path) -> DrivenMerge:
+    """Run the REAL _submit_to_merge_queue for task '99' and play the merger.
+
+    A REAL queue, so the REAL register_and_enqueue_merge_request runs and the
+    request a test reads is the one the production path actually enqueued --
+    not one handed to a substitute. Nothing is draining the queue, so the
+    submit parks on its result until drive_merge takes the enqueued request
+    off it, resolves it, and lets the submit finish.
+    """
+    wf = f.wf
+    wf.worktree = worktree
+    wf.worktree.mkdir(parents=True, exist_ok=True)
+    merge_queue: asyncio.Queue = asyncio.Queue()
+    wf.merge_queue = merge_queue
+    wf.merge_inflight_registry = None  # skip attach branch
+    wf.plan = {'files': []}
+    wf._module_configs = []
+    # task-1923: _submit_to_merge_queue now calls rebind_branch_to_head
+    # (belt-and-braces rebind before enqueue); must be AsyncMock for await.
+    wf.git_ops.rebind_branch_to_head = AsyncMock(return_value=True)
+
+    driven = await drive_merge(
+        wf._submit_to_merge_queue('99', pre_rebased=False),
+        merge_queue,
+        MergeOutcome('blocked', reason='generic'),
+    )
+
+    assert merge_queue.empty(), 'exactly one request must be enqueued'
+    return driven
+
+
 @pytest.mark.asyncio
 async def test_submit_to_merge_queue_threads_first_enqueued_at_onto_request(
     tmp_path: Path,
-    monkeypatch,
 ):
     """_submit_to_merge_queue passes merge_first_enqueued_at=111.0 to MergeRequest.
 
@@ -336,37 +369,21 @@ async def test_submit_to_merge_queue_threads_first_enqueued_at_onto_request(
         metadata={'retry_ledger': {'merge_first_enqueued_at': str(111.0)}},
         get_task_metadata={'retry_ledger': {'merge_first_enqueued_at': str(111.0)}},
     )
-    wf = f.wf
-    wf.worktree = tmp_path / 'wt'
-    wf.worktree.mkdir(parents=True, exist_ok=True)
-    wf.merge_queue = MagicMock()
-    wf.merge_inflight_registry = None  # skip attach branch
-    wf.plan = {'files': []}
-    wf._module_configs = []
-    # task-1923: _submit_to_merge_queue now calls rebind_branch_to_head
-    # (belt-and-braces rebind before enqueue); must be AsyncMock for await.
-    wf.git_ops.rebind_branch_to_head = AsyncMock(return_value=True)
 
-    captured: list[MergeRequest] = []
+    driven = await _drive_submission(f, tmp_path / 'wt')
 
-    async def fake_register_and_enqueue(
-        queue, req: MergeRequest, event_store, registry, *, retention=None,
-    ):
-        # Intercept the function actually called on this path so the patch
-        # stays valid even if register_and_enqueue_merge_request is ever
-        # refactored to stop delegating to enqueue_merge_request internally.
-        captured.append(req)
-        req.result.set_result(MergeOutcome('blocked', reason='generic'))
-        return True
-
-    monkeypatch.setattr(
-        'orchestrator.merge_queue.register_and_enqueue_merge_request',
-        fake_register_and_enqueue,
-    )
-
-    await wf._submit_to_merge_queue('99', pre_rebased=False)
-
-    assert len(captured) == 1
-    assert captured[0].merge_first_enqueued_at == 111.0
+    assert driven.request.merge_first_enqueued_at == 111.0
     # Write-once fast-path: no persist call
     f.update_task.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_submit_to_merge_queue_marks_its_request_workflow_awaited(tmp_path: Path):
+    """The workflow parks its task merge-deferred on a 'superseded' outcome, so
+    its request is the one kind the coalescing pass may absorb (task 4953).
+
+    If this site forgot the flag, coalescing would silently stop for everyone.
+    """
+    driven = await _drive_submission(_make(), tmp_path / 'wt')
+
+    assert driven.request.awaited_by_workflow is True

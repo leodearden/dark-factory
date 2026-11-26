@@ -23,7 +23,7 @@ import logging
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from _orch_helpers import assert_update_wire_mode
+from _orch_helpers import assert_update_wire_mode, wire_scheduler_liveness_mock
 from escalation.models import Escalation
 
 from orchestrator.config import OrchestratorConfig
@@ -48,9 +48,20 @@ def harness(mock_orch_config) -> Harness:
 
     # Replace scheduler with async mocks
     h.scheduler = MagicMock()
+    # Task 3540: is_actively_held auto-mocks TRUTHY on a bare MagicMock,
+    # so every row would read as having a live claimant and every
+    # resume flip would be silently skipped. Wire the real accessors.
+    wire_scheduler_liveness_mock(h.scheduler)
     h.scheduler.get_status = AsyncMock(return_value='blocked')
     h.scheduler.set_task_status = AsyncMock()
-    h.scheduler.get_task = AsyncMock(return_value={'id': '42', 'metadata': {}})
+    # Task 3540: the row must carry 'status' too, and it must AGREE with
+    # get_status above. _cascade_unblock_member re-reads the row immediately
+    # before the write and re-applies the status/liveness gate to THAT
+    # snapshot (INV-3), so a row that omits 'status' describes a task that
+    # cannot exist and reads as "left the re-pendable statuses" -> no write.
+    h.scheduler.get_task = AsyncMock(
+        return_value={'id': '42', 'status': 'blocked', 'metadata': {}}
+    )
     h.scheduler.update_task = AsyncMock(return_value=True)
 
     # No escalation queue by default (bare-harness style)
@@ -145,20 +156,29 @@ class TestSignatureDerivation:
 # ---------------------------------------------------------------------------
 
 
-def _make_fake_scheduler(harness, initial_metadata: dict | None = None):
+def _make_fake_scheduler(
+    harness, initial_metadata: dict | None = None, status: str = 'blocked'
+):
     """Wire harness.scheduler with a simple in-memory task backend.
 
     Returns (persisted_metadata, call_order) so tests can inspect state.
     The backend simulates:
-      - get_task: returns the current persisted_metadata
+      - get_task: returns the current persisted_metadata, under *status*
       - update_task: applies update (with optional append/merge semantics)
       - set_task_status: records the call in call_order
+
+    *status* must AGREE with the ``harness`` fixture's ``get_status`` stub.
+    Task 3540: ``_cascade_unblock_member`` re-reads the row immediately before
+    the write and re-applies the status/liveness gate to THAT snapshot
+    (INV-3), so a row omitting ``status`` describes a task that cannot exist
+    and reads as "left the re-pendable statuses" — the flip would be skipped
+    and every ordering assertion below would go vacuous.
     """
     persisted_metadata: dict = dict(initial_metadata or {})
     call_order: list[str] = []
 
     async def fake_get_task(tid):
-        return {'id': tid, 'metadata': dict(persisted_metadata)}
+        return {'id': tid, 'status': status, 'metadata': dict(persisted_metadata)}
 
     async def fake_update_task(tid, md, *, append=False, metadata_mode=None):
         if isinstance(md, dict):
@@ -417,10 +437,12 @@ class TestReblockGuardEscalationEvent:
         Asserts:
         - set_task_status is NOT called (flip withheld)
         - Exactly one L2 submitted to the queue
+        - The L2 is filed against the real task with the reblock-guard root
+          cause and suggested action
         - event_store.emit called exactly once with positional
           EventType.escalation_created, task_id='42', and a data dict
-          carrying escalation_id/category/severity/level for the just-filed
-          L2.
+          carrying escalation_id/category/severity/level/reason for the
+          just-filed L2.
         """
         task_id = '42'
         esc = _make_l1_esc(
@@ -454,6 +476,9 @@ class TestReblockGuardEscalationEvent:
             f'Expected 1 L2 submitted, got {len(q._submitted)}'
         )
         filed = q._submitted[0]
+        assert filed.task_id == task_id
+        assert filed.root_cause == 'reblock-guard:42'
+        assert filed.suggested_action == 'investigate_reblock_loop'
 
         # escalation_created must be emitted exactly once, for the new L2
         harness.event_store.emit.assert_called_once()
@@ -465,6 +490,7 @@ class TestReblockGuardEscalationEvent:
         assert data.get('category') == 'task_failure'
         assert data.get('severity') == 'urgent'
         assert data.get('level') == 2
+        assert data.get('reason') == 'reblock-guard-threshold'
 
     async def test_dedup_withhold_emits_no_escalation_created_event(
         self, harness: Harness

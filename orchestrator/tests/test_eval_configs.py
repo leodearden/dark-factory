@@ -1,4 +1,6 @@
-"""Tests for eval configuration matrix — EVAL_CONFIGS, VLLM_EVAL_CONFIGS, and get_config_by_name."""
+"""Tests for eval configuration matrix — EVAL_CONFIGS, VLLM_EVAL_CONFIGS,
+ARCHITECT_EVAL_CONFIGS, and get_config_by_name.
+"""
 
 from __future__ import annotations
 
@@ -9,11 +11,14 @@ from click.testing import CliRunner
 
 from orchestrator.cli import main
 from orchestrator.evals.configs import (
+    ARCHITECT_EVAL_CONFIGS,
     EVAL_CONFIGS,
     VLLM_EVAL_CONFIGS,
     EvalConfig,
     get_config_by_name,
+    ofat_candidates,
 )
+from orchestrator.evals.metrics import RoleUnderTest
 
 VLLM_NAMES: frozenset[str] = frozenset(cfg.name for cfg in VLLM_EVAL_CONFIGS)
 
@@ -155,6 +160,22 @@ class TestDroppedQwen25Regression:
             )
 
 
+class TestRetiredMarchCloudBaselines:
+    """Regression guard: the retired codex/gemini cloud baselines must not reappear."""
+
+    def test_march_dated_codex_and_gemini_entries_are_absent(self):
+        """Added 2026-03-19 (d3b14de8107), retired by task 5384 — do not restore."""
+        retired_models = {
+            'gpt-5.4', 'gpt-5.4-mini', 'gemini-3.1-pro-preview', 'gemini-3-flash-preview',
+        }
+        retired_names = {
+            'codex-gpt54-xhigh', 'codex-gpt54mini-xhigh',
+            'gemini-31-pro-high', 'gemini-3-flash-high',
+        }
+        assert {c.model for c in EVAL_CONFIGS} & retired_models == set()
+        assert {c.name for c in EVAL_CONFIGS} & retired_names == set()
+
+
 class TestEnforceEagerOnQwen3:
     """Regression guard: qwen3-coder-next-fp8-new must set ENFORCE_EAGER=1.
 
@@ -199,7 +220,7 @@ class TestNoNameCollisions:
 class TestEvalConfigsIncludesVllm:
     """EVAL_CONFIGS must be the canonical list that includes vLLM configs."""
 
-    _CLOUD_BASELINE_COUNT = 7
+    _CLOUD_BASELINE_COUNT = 3
     _VLLM_COUNT = 15
 
     def test_eval_configs_includes_all_vllm_configs(self):
@@ -210,7 +231,7 @@ class TestEvalConfigsIncludesVllm:
         )
 
     def test_eval_configs_total_count(self):
-        """EVAL_CONFIGS must have 7 cloud baselines + 15 vLLM = 22 total entries."""
+        """EVAL_CONFIGS must have 3 cloud baselines + 15 vLLM = 18 total entries."""
         expected = self._CLOUD_BASELINE_COUNT + self._VLLM_COUNT
         assert len(EVAL_CONFIGS) == expected, (
             f'Expected {expected} configs, got {len(EVAL_CONFIGS)}: '
@@ -220,11 +241,7 @@ class TestEvalConfigsIncludesVllm:
     def test_cloud_baselines_equal_eval_minus_vllm(self):
         """Cloud baselines derived by set-difference must equal the known literal set."""
         derived = {cfg.name for cfg in EVAL_CONFIGS} - VLLM_NAMES
-        expected = {
-            'claude-opus-high', 'claude-opus-max', 'claude-sonnet-max',
-            'codex-gpt54-xhigh', 'codex-gpt54mini-xhigh',
-            'gemini-31-pro-high', 'gemini-3-flash-high',
-        }
+        expected = {'claude-opus-high', 'claude-opus-max', 'claude-sonnet-max'}
         assert derived == expected, (
             f'Derived cloud baselines do not match expected set.\n'
             f'  Extra:   {derived - expected}\n'
@@ -334,8 +351,8 @@ class TestVllmUrlInjection:
             for cfg in EVAL_CONFIGS:
                 captured_state[cfg.name] = dict(cfg.env_overrides)
 
-        monkeypatch.setattr('orchestrator.cli._run_matrix_cmd', stub_run_matrix)
-        monkeypatch.setattr('orchestrator.cli.load_config', lambda *a: object())
+        monkeypatch.setattr('orchestrator.evals.cli._run_matrix_cmd', stub_run_matrix)
+        monkeypatch.setattr('orchestrator.cli_config.load_config', lambda *a: object())
 
         runner = CliRunner()
         result = runner.invoke(main, ['eval', '--matrix', '--vllm-url', self._VLLM_URL])
@@ -369,3 +386,117 @@ class TestVllmUrlInjection:
             f'Cloud baseline configs leaked ANTHROPIC_BASE_URL via CLI path: {cloud_with_base_url}'
         )
 
+
+# ---------------------------------------------------------------------------
+# Architect-role candidate in configs.py (step-7/8)
+#
+# EvalConfig gains role (default 'implementer' → every existing EVAL_CONFIGS
+# entry unchanged); ARCHITECT_EVAL_CONFIGS carries role=='architect' candidates;
+# get_config_by_name resolves them. Pure-data assertions, no LLM.
+# ---------------------------------------------------------------------------
+
+class TestArchitectEvalConfigs:
+    def test_evalconfig_role_defaults_to_implementer(self):
+        cfg = EvalConfig('x', 'claude', 'opus', 'high')
+        assert cfg.role == 'implementer'
+
+    def test_existing_eval_configs_all_resolve_implementer(self):
+        assert EVAL_CONFIGS  # non-empty
+        assert all(c.role == 'implementer' for c in EVAL_CONFIGS)
+
+    def test_architect_eval_configs_exist_with_architect_role(self):
+        assert len(ARCHITECT_EVAL_CONFIGS) >= 1
+        assert all(c.role == 'architect' for c in ARCHITECT_EVAL_CONFIGS)
+        # Candidate names are unique (they key results/lookup).
+        names = [c.name for c in ARCHITECT_EVAL_CONFIGS]
+        assert len(names) == len(set(names))
+
+    def test_get_config_by_name_resolves_architect_candidate(self):
+        name = ARCHITECT_EVAL_CONFIGS[0].name
+        cfg = get_config_by_name(name)
+        assert cfg is not None
+        assert cfg.name == name
+        assert cfg.role == 'architect'
+
+    def test_architect_fable_candidate_added_existing_byte_unchanged(self):
+        """eval-revival π/ρ: architect-fable-high and architect-fable-max join
+        ARCHITECT_EVAL_CONFIGS.
+
+        Parity discipline (eval-revival decision 11): the four pre-existing
+        candidates stay byte-unchanged (dataclass equality) when a new
+        candidate is appended; the new candidate is config-only — it rides
+        run_ofat_stage's existing generic role='architect' branch (task 2478).
+        """
+        existing = [
+            EvalConfig('architect-opus-high', 'claude', 'opus', 'high', role=RoleUnderTest.ARCHITECT),
+            EvalConfig('architect-opus-max', 'claude', 'opus', 'max', role=RoleUnderTest.ARCHITECT),
+            EvalConfig('architect-sonnet-high', 'claude', 'sonnet', 'high', role=RoleUnderTest.ARCHITECT),
+            EvalConfig('architect-fable-high', 'claude', 'claude-fable-5', 'high', role=RoleUnderTest.ARCHITECT),
+        ]
+        by_name = {c.name: c for c in ARCHITECT_EVAL_CONFIGS}
+        for expected in existing:
+            assert by_name[expected.name] == expected
+
+        fable = by_name['architect-fable-high']
+        assert fable.backend == 'claude'
+        assert fable.model == 'claude-fable-5'
+        assert fable.effort == 'high'
+        assert fable.role == 'architect'
+
+        # architect-fable-max's field-level shape (backend/model/effort/role)
+        # is pinned by test_architect_fable_max_is_effort_matched_to_opus_incumbent
+        # below, not duplicated here — this test's job is parity + membership.
+        assert {c.name for c in ARCHITECT_EVAL_CONFIGS} == {
+            'architect-opus-high',
+            'architect-opus-max',
+            'architect-sonnet-high',
+            'architect-fable-high',
+            'architect-fable-max',
+            'architect-fable52-high',
+            'architect-fable52-max',
+        }
+
+    @pytest.mark.parametrize(('name', 'effort'), [
+        ('architect-fable52-high', 'high'),
+        ('architect-fable52-max', 'max'),
+    ])
+    def test_architect_fable52_arms_field_shape(self, name, effort):
+        """Task 10488: Fable 5.2 arms are native claude architect candidates."""
+        cfg = get_config_by_name(name)
+        assert cfg is not None
+        assert cfg.backend == 'claude'
+        assert cfg.model == 'claude-fable-5-2'
+        assert cfg.effort == effort
+        assert cfg.role == 'architect'
+        assert not cfg.env_overrides
+
+    def test_architect_fable_max_is_effort_matched_to_opus_incumbent(self):
+        """eval-revival ρ: architect-fable-max is the effort-matched fable variant.
+
+        Per the OFAT methodology (mirroring JUDGE_EVAL_CONFIGS: "effort fixed →
+        ONLY the model varies"), architect-fable-max holds effort/role/backend
+        equal to its architect-opus-max incumbent and varies EXACTLY the model
+        axis. v1's screen compared fable@high against opus@max — a confound —
+        so fable-trial-v2 δ's stage-2 screen needs this effort-matched pair to
+        isolate the model delta cleanly.
+        """
+        cfg = get_config_by_name('architect-fable-max')
+        assert cfg is not None
+        assert cfg.backend == 'claude'
+        assert cfg.model == 'claude-fable-5'
+        assert cfg.effort == 'max'
+        assert cfg.role == 'architect'
+        # A native cloud claude candidate, never a proxied bundle (the same
+        # discriminator _cloud_implementer_incumbents uses).
+        assert not cfg.env_overrides
+
+        incumbent = get_config_by_name('architect-opus-max')
+        assert incumbent is not None
+        assert cfg.effort == incumbent.effort
+        assert cfg.role == incumbent.role
+        assert cfg.backend == incumbent.backend
+        assert cfg.model != incumbent.model
+
+        assert 'architect-fable-max' in {
+            c.name for c in ofat_candidates() if c.role == 'architect'
+        }

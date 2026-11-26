@@ -14,13 +14,31 @@ that suppresses spam from a stuck curator.
 
 from __future__ import annotations
 
+import asyncio
 import fcntl
+import importlib
+import json
+import logging
+import sys
+import threading
 from typing import IO, Any, Literal, overload
 
 import pytest
+from _escalation_queue_probe import probe_escalation_queue_io
+from _fm_helpers import LOOP_FREEDOM_CEILING_SECONDS, LoopFreedomProbe
+from _swallowed_failure_log import swallowed_causes
+from escalation.dedupe import compute_content_fingerprint
+from escalation.queue import EscalationQueue
+from shared.project_layout import escalation_queue_dir
 
+from fused_memory.middleware import curator_escalator
 from fused_memory.middleware.curator_escalator import CuratorEscalator
-from fused_memory.middleware.task_curator import CuratorFailureError
+from fused_memory.middleware.curator_registry import RegistryHealth, RegistryState
+from fused_memory.middleware.curator_types import CuratorFailureError
+from fused_memory.middleware.curator_zot_duplicate_sweep import (
+    DUPLICATE_METADATA_KEY,
+    DuplicateFinding,
+)
 
 
 @overload
@@ -44,26 +62,6 @@ def _make_orchestrator_layout(root, *, hold_lock: bool) -> IO[bytes] | None:
     handle = lock_path.open('r+b')
     fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
     return handle
-
-
-class TestOrchestratorLivenessProbe:
-    def test_missing_lock_file_reports_not_running(self, tmp_path):
-        escalator = CuratorEscalator()
-        # No lock file created — treat as "no orchestrator".
-        assert escalator._orchestrator_running(str(tmp_path)) is False
-
-    def test_unlocked_file_reports_not_running(self, tmp_path):
-        _make_orchestrator_layout(tmp_path, hold_lock=False)
-        escalator = CuratorEscalator()
-        assert escalator._orchestrator_running(str(tmp_path)) is False
-
-    def test_held_exclusive_lock_reports_running(self, tmp_path):
-        handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
-        try:
-            escalator = CuratorEscalator()
-            assert escalator._orchestrator_running(str(tmp_path)) is True
-        finally:
-            handle.close()
 
 
 class TestReportFailure:
@@ -98,6 +96,24 @@ class TestReportFailure:
             assert '"level": 1' in body
             assert 'max_turns exhausted' in body
             assert 'Add Type::Error arm' in body
+        finally:
+            handle.close()
+
+    @pytest.mark.asyncio
+    async def test_files_into_the_layout_escalation_queue_when_relocated(
+        self, tmp_path, escalation_queue_relocation,
+    ):
+        handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
+        try:
+            await CuratorEscalator().report_failure(
+                project_root=str(tmp_path),
+                project_id='proj-x',
+                justification='max_turns exhausted',
+                candidate_title='Add Type::Error arm',
+            )
+
+            assert len(sorted(escalation_queue_dir(tmp_path).glob('esc-*.json'))) == 1
+            assert not (tmp_path / escalation_queue_relocation.legacy_relpath).exists()
         finally:
             handle.close()
 
@@ -288,8 +304,8 @@ class TestReportFailure:
 
 class TestSchemaToolDeniedEscalation:
     """CLI-semantics-break guard (CLI 2.1.168): a ``schema_tool_denied`` failure
-    is a systemic config break (the cli_invoke deny-list no longer permits the
-    ``StructuredOutput`` schema tool), NOT a flaky candidate.  It must ALWAYS
+    is a systemic config break (cli_invoke's ``--tools ''`` substitution no
+    longer permits the ``StructuredOutput`` schema tool), NOT a flaky candidate.  It must ALWAYS
     surface — bypassing the first-3/hr burst suppression — with a distinct,
     self-describing summary that names the concrete fix location.
     """
@@ -441,10 +457,1084 @@ class TestZeroOutputTimeoutEscalation:
         finally:
             handle.close()
 
+    @pytest.mark.asyncio
+    async def test_concurrent_batch_bisect_files_one_record_and_hands_every_sibling_its_id(
+        self, tmp_path, monkeypatch,
+    ):
+        """The barrier releases every sibling's liveness probe together, before any window check."""
+        n = 4
+        barrier = threading.Barrier(n)
+
+        def _all_siblings_clear_the_probe_together(project_root):
+            barrier.wait(timeout=LOOP_FREEDOM_CEILING_SECONDS)
+            return True
+
+        monkeypatch.setattr(
+            curator_escalator, 'is_orchestrator_lock_held', _all_siblings_clear_the_probe_together,
+        )
+        escalator = CuratorEscalator()
+
+        ids = await asyncio.gather(
+            *(escalator.report_failure(**_zot_report(tmp_path)) for _ in range(n)),
+        )
+
+        [record] = _pending_records(tmp_path)
+        assert record['dedupe_count'] == 0
+        assert ids == [record['id']] * n
+
+    @pytest.mark.asyncio
+    async def test_siblings_queued_behind_a_filing_slower_than_the_window_still_get_its_id(
+        self, tmp_path, monkeypatch,
+    ):
+        """The window counts from the end of the filing attempt, not from its start."""
+        clock = _SteppedClock()
+        real_make_id = EscalationQueue.make_id
+
+        def _minting_slower_than_the_window(self, *args, **kwargs):
+            clock.advance(3600)
+            return real_make_id(self, *args, **kwargs)
+
+        monkeypatch.setattr(EscalationQueue, 'make_id', _minting_slower_than_the_window)
+        handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
+        try:
+            escalator = CuratorEscalator(monotonic=clock)
+
+            ids = await asyncio.gather(
+                *(escalator.report_failure(**_zot_report(tmp_path)) for _ in range(3)),
+            )
+
+            [record] = _pending_records(tmp_path)
+            assert record['dedupe_count'] == 0
+            assert ids == [record['id']] * 3
+        finally:
+            handle.close()
+
+    # Recurrence folding, per Leo's 2026-08-27 ACCEPT-AND-RETUNE ruling on
+    # esc-task-curator-17. A SEPARATE CuratorEscalator per report stands in for
+    # "hours apart / across a restart" without touching the 60s in-process
+    # dedup or its clock. The root_cause is a literal on purpose: it is the
+    # key recurrences fold under, so a renamed key is a new incident class.
+
+    @pytest.mark.asyncio
+    async def test_recurrence_folds_under_the_pinned_root_cause(self, tmp_path):
+        handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
+        try:
+            await CuratorEscalator().report_failure(**_zot_report(tmp_path))
+            await CuratorEscalator().report_failure(**_zot_report(tmp_path))
+
+            [parent] = _pending_records(tmp_path)
+            assert parent['root_cause'] == _PINNED_ZOT_ROOT_CAUSE
+            assert parent['dedupe_fingerprint']
+            assert parent['dedupe_count'] == 1
+            assert parent['dedupe_children'] == ['esc-curator-2']
+        finally:
+            handle.close()
+
+    @pytest.mark.asyncio
+    async def test_recurrence_after_resolution_is_a_new_incident(self, tmp_path):
+        handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
+        try:
+            await CuratorEscalator().report_failure(**_zot_report(tmp_path))
+            await CuratorEscalator().report_failure(**_zot_report(tmp_path))
+            [parent] = _pending_records(tmp_path)
+            EscalationQueue(tmp_path / 'data' / 'escalations').resolve(
+                parent['id'], 'backend recovered', resolved_by='test',
+            )
+
+            await CuratorEscalator().report_failure(**_zot_report(tmp_path))
+
+            [fresh] = _pending_records(tmp_path)
+            assert fresh['id'] != parent['id']
+            assert fresh['root_cause'] == _PINNED_ZOT_ROOT_CAUSE
+        finally:
+            handle.close()
+
+    @pytest.mark.asyncio
+    async def test_folding_is_scoped_to_the_project(self, tmp_path):
+        handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
+        try:
+            await CuratorEscalator().report_failure(**_zot_report(tmp_path, 'proj-a'))
+            await CuratorEscalator().report_failure(**_zot_report(tmp_path, 'proj-b'))
+
+            records = _pending_records(tmp_path)
+            assert len(records) == 2
+            assert all(r['dedupe_fingerprint'] for r in records)
+            assert records[0]['dedupe_fingerprint'] != records[1]['dedupe_fingerprint']
+        finally:
+            handle.close()
+
+    @pytest.mark.asyncio
+    async def test_folding_stays_within_the_zot_category(self, tmp_path):
+        handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
+        try:
+            await CuratorEscalator().report_failure(**_zot_report(tmp_path))
+            await CuratorEscalator().report_failure(
+                project_root=str(tmp_path), project_id='proj-fold',
+                justification='ordinary', candidate_title='T',
+            )
+            await CuratorEscalator().report_failure(
+                project_root=str(tmp_path), project_id='proj-fold',
+                justification='denied', candidate_title='T', schema_tool_denied=True,
+            )
+            await CuratorEscalator().report_failure(**_zot_report(tmp_path))
+
+            records = _pending_records(tmp_path)
+            by_category = {r['category']: r for r in records}
+            assert len(records) == 3
+            assert by_category['curator_zero_output_hang']['dedupe_count'] == 1
+            assert by_category['curator_failure']['dedupe_count'] == 0
+            assert by_category['curator_schema_tool_denied']['dedupe_count'] == 0
+        finally:
+            handle.close()
+
+    @pytest.mark.asyncio
+    async def test_detail_cites_the_ruling_not_a_diagnosis(self, tmp_path):
+        handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
+        try:
+            await CuratorEscalator().report_failure(**_zot_report(tmp_path))
+
+            detail = _only_escalation_detail(tmp_path)
+            assert 'esc-task-curator-17' in detail
+            assert _PINNED_ZOT_ROOT_CAUSE in detail
+            assert 'dedupe_count' in detail
+        finally:
+            handle.close()
+
+    @pytest.mark.asyncio
+    async def test_zot_fingerprint_survives_the_shared_folding_filer(self, tmp_path):
+        """Live pending ZOT records keep folding only while their fold key is unchanged."""
+        handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
+        try:
+            await CuratorEscalator().report_failure(**_zot_report(tmp_path, 'proj-fold'))
+
+            [parent] = _pending_records(tmp_path)
+            assert parent['dedupe_fingerprint'] == compute_content_fingerprint(
+                'curator_zero_output_hang', _PINNED_ZOT_ROOT_CAUSE,
+                affected_ids=['project:proj-fold'],
+            )
+        finally:
+            handle.close()
+
+
+
+class TestReportFailureReturnsZotEscalationId:
+    """Task 5491: report_failure returns the live ZOT record id, or None."""
+
+    @pytest.mark.asyncio
+    async def test_first_zot_report_returns_the_pending_record_id(self, tmp_path):
+        handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
+        try:
+            returned = await CuratorEscalator().report_failure(**_zot_report(tmp_path))
+
+            [record] = _pending_records(tmp_path)
+            assert isinstance(returned, str)
+            assert returned == record['id']
+            assert record['category'] == 'curator_zero_output_hang'
+        finally:
+            handle.close()
+
+    @pytest.mark.asyncio
+    async def test_batch_sibling_inside_window_returns_the_same_id(self, tmp_path):
+        handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
+        try:
+            escalator = CuratorEscalator()
+            first = await escalator.report_failure(**_zot_report(tmp_path))
+            sibling = await escalator.report_failure(**_zot_report(tmp_path))
+
+            [record] = _pending_records(tmp_path)
+            assert first == record['id']
+            assert sibling == first
+        finally:
+            handle.close()
+
+    @pytest.mark.asyncio
+    async def test_folded_recurrence_returns_the_parent_id(self, tmp_path):
+        handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
+        try:
+            first = await CuratorEscalator().report_failure(**_zot_report(tmp_path))
+            folded = await CuratorEscalator().report_failure(**_zot_report(tmp_path))
+
+            [parent] = _pending_records(tmp_path)
+            assert first == parent['id']
+            assert folded == parent['id']
+            assert folded not in parent['dedupe_children']
+        finally:
+            handle.close()
+
+    @pytest.mark.asyncio
+    async def test_non_zot_branches_return_none(self, tmp_path):
+        handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
+        try:
+            escalator = CuratorEscalator()
+            burst = await escalator.report_failure(
+                project_root=str(tmp_path), project_id='proj-x',
+                justification='ordinary', candidate_title='T',
+            )
+            denied = await escalator.report_failure(
+                project_root=str(tmp_path), project_id='proj-x',
+                justification='denied', candidate_title='T', schema_tool_denied=True,
+            )
+            assert burst is None
+            assert denied is None
+            assert len(_pending_records(tmp_path)) == 2
+        finally:
+            handle.close()
+
+    @pytest.mark.asyncio
+    async def test_suppressed_burst_report_returns_none(self, tmp_path):
+        handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
+        try:
+            escalator = CuratorEscalator(cooldown_secs=3600.0)
+            for _ in range(3):
+                await escalator.report_failure(
+                    project_root=str(tmp_path), project_id='proj-x',
+                    justification='repeat', candidate_title='T',
+                )
+            suppressed = await escalator.report_failure(
+                project_root=str(tmp_path), project_id='proj-x',
+                justification='repeat', candidate_title='T',
+            )
+            assert suppressed is None
+            assert len(_pending_records(tmp_path)) == 3
+        finally:
+            handle.close()
+
+    @pytest.mark.asyncio
+    async def test_failed_submit_returns_none_and_never_a_stale_id(
+        self, tmp_path, monkeypatch,
+    ):
+        handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
+        try:
+            def _broken_submit(*_args, **_kwargs):
+                raise OSError('queue dir unwritable')
+
+            monkeypatch.setattr(
+                'fused_memory.middleware.curator_escalator.submit_or_dedupe',
+                _broken_submit,
+            )
+            escalator = CuratorEscalator()
+            failed = await escalator.report_failure(**_zot_report(tmp_path))
+            follow_up = await escalator.report_failure(**_zot_report(tmp_path))
+
+            assert failed is None
+            assert follow_up is None
+            assert _pending_records(tmp_path) == []
+        finally:
+            handle.close()
+
+
+
+class TestRaisedFailureKeepsZotMarker:
+    """Task 5491: the interactive-path raise still says whether it was a ZOT."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('zero_output_timeout', [True, False])
+    async def test_raise_carries_zero_output_timeout(self, tmp_path, zero_output_timeout):
+        with pytest.raises(CuratorFailureError) as exc_info:
+            await CuratorEscalator().report_failure(
+                project_root=str(tmp_path), project_id='proj-x',
+                justification='hang', candidate_title='T',
+                zero_output_timeout=zero_output_timeout,
+            )
+        assert exc_info.value.zero_output_timeout is zero_output_timeout
+
+
+_FINDING = DuplicateFinding(
+    task_id='7416', duplicate_task_id='7383', duplicate_title='Existing gate fix', score=0.6812,
+)
+
+
+def _duplicate_report(
+    root,
+    finding: DuplicateFinding = _FINDING,
+    zot_escalation_id: str | None = 'esc-curator-41',
+    *,
+    stamped: bool = True,
+) -> dict[str, Any]:
+    return dict(
+        project_root=str(root), project_id='proj-dup',
+        finding=finding, candidate_title='Re-filed gate fix',
+        zot_escalation_id=zot_escalation_id, stamped=stamped,
+    )
+
+
+class TestReportZotDuplicate:
+    """Task 5491: each post-ZOT duplicate finding files its own L1 record."""
+
+    @pytest.mark.asyncio
+    async def test_files_one_record_carrying_the_finding(self, tmp_path):
+        handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
+        try:
+            await CuratorEscalator().report_zot_duplicate(**_duplicate_report(tmp_path))
+
+            [record] = _pending_records(tmp_path)
+            assert record['category'] == 'curator_zot_duplicate'
+            assert record['level'] == 1
+            assert record['severity'] == 'blocking'
+            detail = record['detail']
+            for value in ('7416', '7383', '0.681', 'Re-filed gate fix', 'proj-dup', 'esc-curator-41'):
+                assert value in detail
+            assert f'The new task carries metadata.{DUPLICATE_METADATA_KEY}.' in detail
+            assert 'FAILED' not in detail
+        finally:
+            handle.close()
+
+    @pytest.mark.asyncio
+    async def test_unstamped_finding_never_claims_the_metadata(self, tmp_path):
+        handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
+        try:
+            await CuratorEscalator().report_zot_duplicate(
+                **_duplicate_report(tmp_path, stamped=False),
+            )
+
+            detail = _only_escalation_detail(tmp_path)
+            assert 'The new task carries' not in detail
+            assert f'Stamping metadata.{DUPLICATE_METADATA_KEY} on the new task FAILED' in detail
+        finally:
+            handle.close()
+
+    @pytest.mark.asyncio
+    async def test_absent_zot_id_still_files_without_a_fake_id(self, tmp_path):
+        handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
+        try:
+            await CuratorEscalator().report_zot_duplicate(
+                **_duplicate_report(tmp_path, zot_escalation_id=None),
+            )
+
+            [record] = _pending_records(tmp_path)
+            assert record['category'] == 'curator_zot_duplicate'
+            assert 'esc-' not in record['detail']
+            assert "zot_escalation_id='None'" not in record['detail']
+            assert 'zot_escalation_id=None' not in record['detail']
+        finally:
+            handle.close()
+
+    @pytest.mark.asyncio
+    async def test_no_orchestrator_returns_quietly(self, tmp_path):
+        _make_orchestrator_layout(tmp_path, hold_lock=False)
+
+        await CuratorEscalator().report_zot_duplicate(**_duplicate_report(tmp_path))
+
+        assert not list((tmp_path / 'data' / 'escalations').glob('esc-*.json'))
+
+    @pytest.mark.asyncio
+    async def test_queue_failure_is_swallowed(self, tmp_path, monkeypatch):
+        handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
+        try:
+            def _broken_submit(self, escalation):
+                raise OSError('queue dir unwritable')
+
+            monkeypatch.setattr(EscalationQueue, 'submit', _broken_submit)
+
+            await CuratorEscalator().report_zot_duplicate(**_duplicate_report(tmp_path))
+        finally:
+            handle.close()
+
+    @pytest.mark.asyncio
+    async def test_distinct_findings_file_distinct_records(self, tmp_path):
+        handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
+        try:
+            escalator = CuratorEscalator()
+            await escalator.report_zot_duplicate(**_duplicate_report(tmp_path))
+            await escalator.report_zot_duplicate(**_duplicate_report(
+                tmp_path,
+                finding=DuplicateFinding(
+                    task_id='6583', duplicate_task_id='5436',
+                    duplicate_title='Other', score=0.9,
+                ),
+            ))
+
+            records = _pending_records(tmp_path)
+            assert len(records) == 2
+            assert {r['category'] for r in records} == {'curator_zot_duplicate'}
+            assert all(r['dedupe_count'] == 0 for r in records)
+        finally:
+            handle.close()
+
+
+_PINNED_ZOT_ROOT_CAUSE = 'curator-empty-output-pre-turn-hang'
+
+
+class _SteppedClock:
+    """A monotonic clock that moves only when a test advances it."""
+
+    def __init__(self) -> None:
+        self._now = 0.0
+
+    def __call__(self) -> float:
+        return self._now
+
+    def advance(self, seconds: float) -> None:
+        self._now += seconds
+
+
+def _zot_report(root, project_id: str = 'proj-fold') -> dict[str, Any]:
+    return dict(
+        project_root=str(root), project_id=project_id,
+        justification='ZOT', candidate_title='T',
+        zero_output_timeout=True, timed_out=True, duration_ms=181_966,
+        transcript_turns=0, tools_used=(),
+    )
+
+
+def _streak_alarm(root, project_id: str = 'proj-x') -> dict[str, Any]:
+    return dict(
+        project_root=str(root), project_id=project_id,
+        streak=5, threshold=5,
+        last_justification='llm-failed: RuntimeError: boom', candidate_title='T',
+    )
+
+
+def _pending_records(root) -> list[dict[str, Any]]:
+    return [
+        json.loads(path.read_text())
+        for path in sorted((root / 'data' / 'escalations').glob('esc-*.json'))
+    ]
+
+
+def _only_escalation_detail(root) -> str:
+    [path] = sorted((root / 'data' / 'escalations').glob('esc-*.json'))
+    return json.loads(path.read_text())['detail']
+
+
+class TestOrchestratorProbeRunsOffTheEventLoop:
+    """Every orchestrator-liveness probe runs off the event loop's thread.
+
+    The stub stands in for the lock file: it blocks on a LoopFreedomProbe
+    and returns True, and the filed record proves that verdict was honoured.
+    """
+
+    @pytest.mark.asyncio
+    async def test_report_failure_probes_off_the_event_loop(self, tmp_path, monkeypatch):
+        probe = LoopFreedomProbe()
+        seen: list[str] = []
+
+        def _blocking_lock_probe(project_root):
+            seen.append(project_root)
+            probe.block()
+            return True
+
+        monkeypatch.setattr(curator_escalator, 'is_orchestrator_lock_held', _blocking_lock_probe)
+
+        await CuratorEscalator().report_failure(
+            project_root=str(tmp_path), project_id='proj-x',
+            justification='boom', candidate_title='T',
+        )
+
+        probe.assert_loop_stayed_free()
+        assert seen == [str(tmp_path)]
+        assert [r['category'] for r in _pending_records(tmp_path)] == ['curator_failure']
+
+    @pytest.mark.asyncio
+    async def test_report_zot_duplicate_probes_off_the_event_loop(self, tmp_path, monkeypatch):
+        probe = LoopFreedomProbe()
+
+        def _blocking_lock_probe(project_root):
+            probe.block()
+            return True
+
+        monkeypatch.setattr(curator_escalator, 'is_orchestrator_lock_held', _blocking_lock_probe)
+
+        await CuratorEscalator().report_zot_duplicate(**_duplicate_report(tmp_path))
+
+        probe.assert_loop_stayed_free()
+        assert [r['category'] for r in _pending_records(tmp_path)] == ['curator_zot_duplicate']
+
+
+class TestTranscriptEvidenceInDetail:
+    """The escalation detail says what the failed run did, from its transcript.
+
+    An absent measurement is spelled out as unknown and never reads as zero:
+    ``transcript_turns=0`` is a transcript-confirmed pre-turn stall.
+    """
+
+    @pytest.mark.asyncio
+    async def test_generic_detail_renders_turns_and_tools(self, tmp_path):
+        handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
+        try:
+            await CuratorEscalator().report_failure(
+                project_root=str(tmp_path), project_id='proj-e',
+                justification='killed with progress', candidate_title='T',
+                timed_out=True, transcript_turns=6,
+                tools_used=('ToolSearch', 'TaskGet', 'ToolSearch'),
+            )
+            detail = _only_escalation_detail(tmp_path)
+            assert 'transcript_turns=6' in detail
+            assert 'tools_used=ToolSearch,TaskGet,ToolSearch' in detail
+        finally:
+            handle.close()
+
+    @pytest.mark.asyncio
+    async def test_generic_detail_spells_out_an_unread_transcript(self, tmp_path):
+        handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
+        try:
+            await CuratorEscalator().report_failure(
+                project_root=str(tmp_path), project_id='proj-e',
+                justification='failed', candidate_title='T',
+                transcript_turns=None, tools_used=None,
+            )
+            detail = _only_escalation_detail(tmp_path)
+            assert 'transcript_turns=unknown (transcript unreadable)' in detail
+            assert 'tools_used=unknown' in detail
+        finally:
+            handle.close()
+
+    @pytest.mark.asyncio
+    async def test_zot_detail_renders_a_confirmed_pre_turn_stall(self, tmp_path):
+        handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
+        try:
+            await CuratorEscalator().report_failure(
+                project_root=str(tmp_path), project_id='proj-e',
+                justification='ZOT', candidate_title='T',
+                zero_output_timeout=True, timed_out=True, duration_ms=181_966,
+                transcript_turns=0, tools_used=(),
+            )
+            detail = _only_escalation_detail(tmp_path)
+            assert 'transcript_turns=0' in detail
+            assert 'tools_used=(none)' in detail
+        finally:
+            handle.close()
+
+    @pytest.mark.asyncio
+    async def test_zot_detail_spells_out_an_unread_transcript(self, tmp_path):
+        handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
+        try:
+            await CuratorEscalator().report_failure(
+                project_root=str(tmp_path), project_id='proj-e',
+                justification='ZOT', candidate_title='T',
+                zero_output_timeout=True, timed_out=True, duration_ms=181_966,
+            )
+            detail = _only_escalation_detail(tmp_path)
+            assert 'transcript_turns=unknown (transcript unreadable)' in detail
+            assert 'tools_used=unknown' in detail
+        finally:
+            handle.close()
+
 
 # ----------------------------------------------------------------------
 # Burst log keyed by (project_id, subtype) — independent counters
 # ----------------------------------------------------------------------
+
+
+class TestConsecutiveDegradedEscalation:
+    """The class-agnostic backstop: N consecutive degraded curations, whatever
+    the cause, is itself the alarm.
+
+    Per-exception-class instrumentation always has a hole — the next outage
+    arrives as an exception class nobody has written a handler for yet. This
+    path is reached by streak, not by type, so the hole cannot hide an outage
+    for longer than ``threshold`` curations.
+    """
+
+    @pytest.mark.asyncio
+    async def test_queues_one_escalation_with_streak_evidence(self, tmp_path):
+        handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
+        try:
+            escalator = CuratorEscalator()
+            await escalator.report_consecutive_degraded(
+                project_root=str(tmp_path),
+                project_id='proj-x',
+                streak=5,
+                threshold=5,
+                last_justification='llm-failed: FileNotFoundError: claude',
+                candidate_title='T',
+            )
+
+            files = sorted((tmp_path / 'data' / 'escalations').glob('esc-*.json'))
+            assert len(files) == 1
+            body = files[0].read_text()
+            assert 'curator_consecutive_degraded' in body
+            assert '"level": 1' in body
+            assert '"severity": "blocking"' in body
+            assert 'streak=5' in body
+            assert 'threshold=5' in body
+            assert 'llm-failed: FileNotFoundError: claude' in body
+            assert 'T' in body
+            assert 'dedupe_count' in json.loads(body)['detail']
+        finally:
+            handle.close()
+
+    # Recurring runs fold into one pending record per project, mirroring the
+    # ZOT fold (task 3995): every run still counts, as the parent's
+    # dedupe_count. A folded run's own evidence lives in the log, not the record.
+
+    @pytest.mark.asyncio
+    async def test_recurring_alarms_fold_into_one_pending_record(self, tmp_path):
+        handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
+        try:
+            escalator = CuratorEscalator()
+            for _ in range(5):
+                await escalator.report_consecutive_degraded(**_streak_alarm(tmp_path))
+
+            [parent] = _pending_records(tmp_path)
+            assert parent['category'] == 'curator_consecutive_degraded'
+            assert parent['dedupe_fingerprint']
+            assert parent['dedupe_count'] == 4
+            assert len(parent['dedupe_children']) == 4
+        finally:
+            handle.close()
+
+    @pytest.mark.asyncio
+    async def test_a_folded_run_logs_its_own_cause_at_error(self, tmp_path, caplog):
+        """The record keeps the first run's cause; a later, novel cause is only in the log, so it must be as loud."""
+        handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
+        try:
+            escalator = CuratorEscalator()
+            await escalator.report_consecutive_degraded(**_streak_alarm(tmp_path))
+            with caplog.at_level(logging.ERROR):
+                await escalator.report_consecutive_degraded(**{
+                    **_streak_alarm(tmp_path),
+                    'last_justification': 'llm-failed: NovelClassError: B',
+                    'candidate_title': 'second run',
+                })
+
+            [parent] = _pending_records(tmp_path)
+            assert 'NovelClassError' not in parent['detail']
+            [folded] = [
+                r for r in caplog.records
+                if r.levelno >= logging.ERROR and 'NovelClassError' in r.getMessage()
+            ]
+            assert f"folded into {parent['id']}" in folded.getMessage()
+            assert 'second run' in folded.getMessage()
+        finally:
+            handle.close()
+
+    @pytest.mark.asyncio
+    async def test_detail_points_at_the_log_for_later_runs_causes(self, tmp_path):
+        handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
+        try:
+            await CuratorEscalator().report_consecutive_degraded(**_streak_alarm(tmp_path))
+
+            detail = _only_escalation_detail(tmp_path)
+            assert 'fused-memory log' in detail
+            assert 'consecutive-degraded run for project' in detail
+        finally:
+            handle.close()
+
+    @pytest.mark.asyncio
+    async def test_alarm_after_resolution_is_a_new_record(self, tmp_path):
+        handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
+        try:
+            escalator = CuratorEscalator()
+            await escalator.report_consecutive_degraded(**_streak_alarm(tmp_path))
+            await escalator.report_consecutive_degraded(**_streak_alarm(tmp_path))
+            [parent] = _pending_records(tmp_path)
+            EscalationQueue(tmp_path / 'data' / 'escalations').resolve(
+                parent['id'], 'curator recovered', resolved_by='test',
+            )
+
+            await escalator.report_consecutive_degraded(**_streak_alarm(tmp_path))
+
+            [fresh] = _pending_records(tmp_path)
+            assert fresh['id'] != parent['id']
+        finally:
+            handle.close()
+
+    @pytest.mark.asyncio
+    async def test_folding_is_scoped_to_the_project(self, tmp_path):
+        handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
+        try:
+            escalator = CuratorEscalator()
+            await escalator.report_consecutive_degraded(**_streak_alarm(tmp_path, 'proj-a'))
+            await escalator.report_consecutive_degraded(**_streak_alarm(tmp_path, 'proj-b'))
+
+            records = _pending_records(tmp_path)
+            assert len(records) == 2
+            assert all(r['dedupe_fingerprint'] for r in records)
+            assert records[0]['dedupe_fingerprint'] != records[1]['dedupe_fingerprint']
+        finally:
+            handle.close()
+
+    @pytest.mark.asyncio
+    async def test_folding_never_crosses_the_zot_record(self, tmp_path):
+        """A ZOT outage keeps both records pending: the diagnosis and the backstop."""
+        handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
+        try:
+            await CuratorEscalator().report_failure(**_zot_report(tmp_path))
+            escalator = CuratorEscalator()
+            await escalator.report_consecutive_degraded(**_streak_alarm(tmp_path, 'proj-fold'))
+            await escalator.report_consecutive_degraded(**_streak_alarm(tmp_path, 'proj-fold'))
+            await CuratorEscalator().report_failure(**_zot_report(tmp_path))
+
+            records = _pending_records(tmp_path)
+            by_category = {r['category']: r for r in records}
+            assert len(records) == 2
+            assert by_category['curator_zero_output_hang']['dedupe_count'] == 1
+            assert by_category['curator_consecutive_degraded']['dedupe_count'] == 1
+        finally:
+            handle.close()
+
+    @pytest.mark.asyncio
+    async def test_streak_alarms_leave_the_burst_window_untouched(self, tmp_path):
+        """The ordinary failure budget of three per window survives any number of streak alarms."""
+        handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
+        try:
+            escalator = CuratorEscalator(cooldown_secs=3600.0)
+            for _ in range(5):
+                await escalator.report_consecutive_degraded(**_streak_alarm(tmp_path))
+            for _ in range(3):
+                await escalator.report_failure(
+                    project_root=str(tmp_path), project_id='proj-x',
+                    justification='boom', candidate_title='T',
+                )
+
+            categories = sorted(r['category'] for r in _pending_records(tmp_path))
+            assert categories == [
+                'curator_consecutive_degraded',
+                'curator_failure', 'curator_failure', 'curator_failure',
+            ]
+        finally:
+            handle.close()
+
+    @pytest.mark.asyncio
+    async def test_no_orchestrator_logs_and_does_not_raise(self, tmp_path, caplog):
+        """Unlike report_failure, this alarm must never raise.
+
+        report_failure raises with no orchestrator so an interactive MCP caller
+        sees the outage. This is a monitoring alarm reached from inside
+        curate()'s degraded path — raising here would convert a curator that is
+        merely degrading into a curator that fails add_task outright, breaking
+        the fail-open contract the alarm exists to observe.
+        """
+        escalator = CuratorEscalator()
+        with caplog.at_level(logging.ERROR):
+            await escalator.report_consecutive_degraded(
+                project_root=str(tmp_path),
+                project_id='proj-x',
+                streak=5,
+                threshold=5,
+                last_justification='llm-failed: RuntimeError: boom',
+                candidate_title='T',
+            )
+
+        assert not list((tmp_path / 'data' / 'escalations').glob('esc-*.json'))
+        errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+        assert errors, 'a dropped alarm must still be loud in the log'
+        assert any('proj-x' in r.getMessage() for r in errors)
+
+
+class TestBackendBinaryUnresolvableEscalation:
+    """The curator's backend binary does not resolve — a total, not partial, outage.
+
+    Every curation will degrade to create, for every project, until someone
+    changes the environment. That is a config break, not a flaky candidate, so
+    it carries its own category and its own remediation rather than arriving as
+    one more generic curator failure.
+    """
+
+    @pytest.mark.asyncio
+    async def test_queues_one_escalation_with_remediation(self, tmp_path):
+        handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
+        try:
+            escalator = CuratorEscalator()
+            await escalator.report_backend_binary_unresolvable(
+                project_root=str(tmp_path),
+                project_id='proj-x',
+                binary_spec='claude',
+                search_path='/usr/bin:/bin',
+            )
+
+            files = sorted((tmp_path / 'data' / 'escalations').glob('esc-*.json'))
+            assert len(files) == 1
+            body = files[0].read_text()
+            assert 'curator_backend_binary_unresolvable' in body
+            assert '"level": 1' in body
+            assert '"severity": "blocking"' in body
+            assert 'claude' in body
+            assert '/usr/bin:/bin' in body
+            # An operator reading this must not have to derive the fix.
+            assert 'CLAUDE_BINARY' in body
+        finally:
+            handle.close()
+
+    @pytest.mark.asyncio
+    async def test_bypasses_burst_suppression(self, tmp_path):
+        handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
+        try:
+            escalator = CuratorEscalator(cooldown_secs=3600.0)
+            for _ in range(4):
+                await escalator.report_backend_binary_unresolvable(
+                    project_root=str(tmp_path),
+                    project_id='proj-x',
+                    binary_spec='claude',
+                    search_path='/usr/bin:/bin',
+                )
+
+            categories = [r['category'] for r in _pending_records(tmp_path)]
+            assert categories == ['curator_backend_binary_unresolvable'] * 4
+        finally:
+            handle.close()
+
+    @pytest.mark.asyncio
+    async def test_binary_alarms_leave_the_burst_window_untouched(self, tmp_path):
+        """The ordinary failure budget of three per window survives any number of binary alarms."""
+        handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
+        try:
+            escalator = CuratorEscalator(cooldown_secs=3600.0)
+            for _ in range(4):
+                await escalator.report_backend_binary_unresolvable(
+                    project_root=str(tmp_path), project_id='proj-x',
+                    binary_spec='claude', search_path='/usr/bin:/bin',
+                )
+            for _ in range(3):
+                await escalator.report_failure(
+                    project_root=str(tmp_path), project_id='proj-x',
+                    justification='boom', candidate_title='T',
+                )
+
+            categories = [r['category'] for r in _pending_records(tmp_path)]
+            assert categories.count('curator_failure') == 3
+        finally:
+            handle.close()
+
+    @pytest.mark.asyncio
+    async def test_no_orchestrator_logs_and_does_not_raise(self, tmp_path, caplog):
+        """Raising here would break the curator's fail-open contract at startup."""
+        escalator = CuratorEscalator()
+        with caplog.at_level(logging.ERROR):
+            await escalator.report_backend_binary_unresolvable(
+                project_root=str(tmp_path),
+                project_id='proj-x',
+                binary_spec='claude',
+                search_path='/usr/bin:/bin',
+            )
+
+        assert not list((tmp_path / 'data' / 'escalations').glob('esc-*.json'))
+        errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+        assert errors, 'a dropped alarm must still be loud in the log'
+        assert any('claude' in r.getMessage() for r in errors)
+
+
+def _failed_registry_health(
+    label: str = 'blocklist', config_key: str = 'cancelled_premise_blocklist_path',
+) -> RegistryHealth:
+    return RegistryHealth(
+        label=label,
+        config_key=config_key,
+        state=RegistryState.FAILED,
+        path=f'/srv/config/{label}.yaml',
+        error=f'YamlListFileError: file not found: /srv/config/{label}.yaml',
+        failures=2,
+    )
+
+
+class TestReportRegistryLoadFailed:
+    """A curator guard registry failed to load, so that guard fails open and
+    curation looks like a healthy curator with an empty registry."""
+
+    @pytest.mark.asyncio
+    async def test_queues_one_level_one_escalation_with_remediation(self, tmp_path):
+        handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
+        try:
+            health = _failed_registry_health()
+            await CuratorEscalator().report_registry_load_failed(
+                project_root=str(tmp_path), project_id='proj-x', health=health,
+            )
+
+            [record] = _pending_records(tmp_path)
+            assert record['category'] == 'curator_registry_load_failed'
+            assert record['level'] == 1
+            assert record['task_id'] == curator_escalator._ANCHOR_TASK_ID
+            assert 'blocklist' in record['summary']
+            detail = record['detail']
+            for expected in (
+                'proj-x', 'blocklist', health.config_key, health.path, health.error,
+                'failures=2',
+            ):
+                assert expected in detail
+            assert health.config_key in detail.split('FIX', 1)[1]
+        finally:
+            handle.close()
+
+    @pytest.mark.asyncio
+    async def test_repeat_reports_for_one_label_fold_into_one_record(self, tmp_path):
+        handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
+        try:
+            escalator = CuratorEscalator()
+            for _ in range(2):
+                await escalator.report_registry_load_failed(
+                    project_root=str(tmp_path), project_id='proj-x',
+                    health=_failed_registry_health(),
+                )
+
+            [parent] = _pending_records(tmp_path)
+            assert parent['dedupe_fingerprint']
+            assert parent['dedupe_count'] == 1
+        finally:
+            handle.close()
+
+    @pytest.mark.asyncio
+    async def test_each_label_gets_its_own_record(self, tmp_path):
+        handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
+        try:
+            escalator = CuratorEscalator()
+            await escalator.report_registry_load_failed(
+                project_root=str(tmp_path), project_id='proj-x',
+                health=_failed_registry_health(),
+            )
+            await escalator.report_registry_load_failed(
+                project_root=str(tmp_path), project_id='proj-x',
+                health=_failed_registry_health(
+                    'operational-ask', 'operational_ask_registry_path',
+                ),
+            )
+
+            records = _pending_records(tmp_path)
+            assert len(records) == 2
+            assert records[0]['dedupe_fingerprint'] != records[1]['dedupe_fingerprint']
+        finally:
+            handle.close()
+
+    @pytest.mark.asyncio
+    async def test_no_orchestrator_logs_and_does_not_raise(self, tmp_path, caplog):
+        """Raising here would break the curator's fail-open contract at startup."""
+        with caplog.at_level(logging.ERROR):
+            await CuratorEscalator().report_registry_load_failed(
+                project_root=str(tmp_path), project_id='proj-x',
+                health=_failed_registry_health(),
+            )
+
+        assert not list((tmp_path / 'data' / 'escalations').glob('esc-*.json'))
+        errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+        assert errors, 'a dropped alarm must still be loud in the log'
+        assert any('blocklist' in r.getMessage() for r in errors)
+
+
+_EVERY_ROUTE = [
+    pytest.param(
+        'report_failure',
+        dict(justification='max_turns exhausted', candidate_title='T'),
+        id='failure',
+    ),
+    pytest.param(
+        'report_failure',
+        dict(
+            justification='denied', candidate_title='T',
+            schema_tool_denied=True,
+        ),
+        id='schema-tool-denied',
+    ),
+    pytest.param(
+        'report_failure',
+        dict(
+            justification='ZOT', candidate_title='T',
+            zero_output_timeout=True, timed_out=True,
+            duration_ms=181_966, transcript_turns=0, tools_used=(),
+        ),
+        id='zero-output-timeout',
+    ),
+    pytest.param(
+        'report_zot_duplicate',
+        dict(
+            finding=_FINDING, candidate_title='T',
+            zot_escalation_id='esc-curator-41', stamped=True,
+        ),
+        id='zot-duplicate',
+    ),
+    pytest.param(
+        'report_consecutive_degraded',
+        dict(
+            streak=5, threshold=5, last_justification='j',
+            candidate_title='T',
+        ),
+        id='consecutive-degraded',
+    ),
+    pytest.param(
+        'report_backend_binary_unresolvable',
+        dict(binary_spec='claude', search_path='/usr/bin'),
+        id='backend-binary-unresolvable',
+    ),
+    pytest.param(
+        'report_registry_load_failed',
+        dict(health=_failed_registry_health()),
+        id='registry-load-failed',
+    ),
+]
+
+
+class TestEveryRouteFilesUnderItsAnchor:
+    """The value filed must be the constant that
+    tests/test_folded_escalation.py::TestNoTwoFilersShareAnAnchor sweeps, or a
+    site with a diverging literal escapes the collision check."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(('method_name', 'kwargs'), _EVERY_ROUTE)
+    async def test_the_filed_task_id_is_the_anchor_constant(
+        self, tmp_path, method_name: str, kwargs: dict[str, Any],
+    ):
+        handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
+        try:
+            await getattr(CuratorEscalator(), method_name)(
+                project_root=str(tmp_path), project_id='proj-x', **kwargs,
+            )
+
+            [record] = _pending_records(tmp_path)
+            assert record['task_id'] == curator_escalator._ANCHOR_TASK_ID
+        finally:
+            handle.close()
+
+
+class TestQueueFilingRunsOffTheEventLoop:
+    """Every route mints its id and submits off the loop, and survives a queue that cannot mint."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(('method_name', 'kwargs'), _EVERY_ROUTE)
+    async def test_every_route_mints_and_submits_off_the_event_loop(
+        self, tmp_path, monkeypatch, method_name: str, kwargs: dict[str, Any],
+    ):
+        handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
+        try:
+            probe = LoopFreedomProbe()
+            probe_escalation_queue_io(monkeypatch, probe)
+
+            await getattr(CuratorEscalator(), method_name)(
+                project_root=str(tmp_path), project_id='proj-x', **kwargs,
+            )
+
+            probe.assert_loop_stayed_free()
+            [record] = _pending_records(tmp_path)
+        finally:
+            handle.close()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(('method_name', 'kwargs'), _EVERY_ROUTE)
+    async def test_every_route_swallows_a_queue_that_cannot_mint_an_id(
+        self, tmp_path, monkeypatch, caplog, method_name: str, kwargs: dict[str, Any],
+    ):
+        caplog.set_level(logging.WARNING, logger='fused_memory.middleware.curator_escalator')
+        handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
+        try:
+            def _unmintable(self, key):
+                raise OSError('counter unwritable')
+
+            monkeypatch.setattr(EscalationQueue, 'make_id', _unmintable)
+
+            await getattr(CuratorEscalator(), method_name)(
+                project_root=str(tmp_path), project_id='proj-x', **kwargs,
+            )
+
+            assert _pending_records(tmp_path) == []
+            assert swallowed_causes(caplog, 'failed to submit', 'proj-x') == [OSError]
+        finally:
+            handle.close()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(('method_name', 'kwargs'), _EVERY_ROUTE)
+    async def test_every_route_swallows_a_queue_that_cannot_be_opened(
+        self, tmp_path, caplog, method_name: str, kwargs: dict[str, Any],
+    ):
+        caplog.set_level(logging.WARNING, logger='fused_memory.middleware.curator_escalator')
+        handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
+        try:
+            escalation_queue_dir(tmp_path).write_text('a file where the queue directory belongs')
+
+            await getattr(CuratorEscalator(), method_name)(
+                project_root=str(tmp_path), project_id='proj-x', **kwargs,
+            )
+
+            assert swallowed_causes(caplog, 'failed to submit', 'proj-x') == [FileExistsError]
+        finally:
+            handle.close()
 
 
 class TestBurstLogCompositeKey:
@@ -654,31 +1744,37 @@ class TestPersistStateConcurrency:
         and must not corrupt or lose any burst-log entry."""
         import asyncio
         import json
+        import os
+        import time
 
         state_path = tmp_path / 'curator_escalator_state.json'
         handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
         try:
             escalator = CuratorEscalator(cooldown_secs=3600.0, state_path=state_path)
 
-            # ── Instrumentation ─────────────────────────────────────────────────
+            # ── Instrumentation: count writers landing on the state file ────────
             in_flight = 0
             max_in_flight = 0
-            real_to_thread = asyncio.to_thread
+            counter_lock = threading.Lock()
+            real_replace = os.replace
 
-            async def _patched_to_thread(func, *args, **kwargs):
+            def _counting_replace(src, dst, *args, **kwargs):
                 nonlocal in_flight, max_in_flight
-                in_flight += 1
-                if in_flight > max_in_flight:
-                    max_in_flight = in_flight
-                # Widen the interleave window so concurrent coroutines can enter
-                # before the first one returns — exposes the race without the lock.
-                await asyncio.sleep(0.02)
+                if os.fspath(dst) != os.fspath(state_path):
+                    return real_replace(src, dst, *args, **kwargs)
+                with counter_lock:
+                    in_flight += 1
+                    max_in_flight = max(max_in_flight, in_flight)
                 try:
-                    return await real_to_thread(func, *args, **kwargs)
+                    # Widen the overlap window so unserialised writers would
+                    # land here together — exposes the race without the lock.
+                    time.sleep(0.02)
+                    return real_replace(src, dst, *args, **kwargs)
                 finally:
-                    in_flight -= 1
+                    with counter_lock:
+                        in_flight -= 1
 
-            monkeypatch.setattr(asyncio, 'to_thread', _patched_to_thread)
+            monkeypatch.setattr(os, 'replace', _counting_replace)
 
             # ── Fire 5 concurrent report_failure calls ───────────────────────
             # Same project_id, DISTINCT subtypes → independent _failure_log keys
@@ -724,3 +1820,18 @@ class TestPersistStateConcurrency:
                 )
         finally:
             handle.close()
+
+
+class TestEscalationPackageIsRequired:
+    """Task 10057: escalation is a declared dependency; its absence is a loud import error, not a silent degrade."""
+
+    def test_import_fails_loudly_without_the_escalation_package(self, monkeypatch):
+        for name in ('escalation', 'escalation.dedupe', 'escalation.models', 'escalation.queue'):
+            monkeypatch.setitem(sys.modules, name, None)
+        monkeypatch.delitem(sys.modules, curator_escalator.__name__)
+
+        with pytest.raises(ImportError) as exc_info:
+            importlib.import_module(curator_escalator.__name__)
+
+        assert exc_info.value.name is not None
+        assert exc_info.value.name.split('.')[0] == 'escalation'

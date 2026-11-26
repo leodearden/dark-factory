@@ -6,7 +6,8 @@ from __future__ import annotations
 import pytest
 
 from shared.locking import (
-    CODE_EXTENSIONS,
+    EXTENSIONLESS_FILENAMES,
+    FILE_EXTENSIONS,
     directory_locks,
     files_to_modules,
     is_file_path,
@@ -14,11 +15,14 @@ from shared.locking import (
     normalize_lock,
     strip_directory_locks,
 )
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 # ---------------------------------------------------------------------------
-# Drift guard — pins shared.locking.CODE_EXTENSIONS to the canonical vector.
+# Drift guard — pins shared.locking.FILE_EXTENSIONS to the canonical vector.
 #
-# Update _CANONICAL_EXTENSIONS AND CODE_EXTENSIONS together when the allowlist
+# Update _CANONICAL_EXTENSIONS AND FILE_EXTENSIONS together when the allowlist
 # changes.  Also update the verbatim copy in
 # fused-memory/src/fused_memory/middleware/lock_charter_guard.py AND its
 # corresponding _CANONICAL_EXTENSIONS in
@@ -26,7 +30,7 @@ from shared.locking import (
 # ---------------------------------------------------------------------------
 
 _CANONICAL_EXTENSIONS = [
-    'c', 'cc', 'cjs', 'conf', 'cpp', 'css', 'cts', 'cxx',
+    'c', 'cc', 'cjs', 'conf', 'cpp', 'css', 'csv', 'cts', 'cxx',
     'diff', 'envrc', 'example', 'example-systemd-config',
     'gcode', 'gitattributes', 'gitignore', 'gitkeep', 'gitmodules', 'golden', 'grammar',
     'h', 'hh', 'hpp', 'html',
@@ -36,14 +40,14 @@ _CANONICAL_EXTENSIONS = [
     'manifest', 'md', 'mjs', 'mts',
     'npmrc', 'png', 'py', 'python-version',
     'ri', 'rs', 'scss', 'service', 'sh', 'step', 'stl', 'svg',
-    'template', 'timer', 'toml', 'ts', 'tsx', 'txt', 'typed',
+    'template', 'timer', 'tombstones', 'toml', 'ts', 'tsv', 'tsx', 'txt', 'typed',
     'yaml', 'yml',
 ]
 
 # ---------------------------------------------------------------------------
 # Classification corpora — deliberate verbatim duplicates of the corpora in
 # fused-memory/tests/test_lock_charter_guard.py, for the same reason the two
-# CODE_EXTENSIONS frozensets are duplicated (locking.py:16-25): the two copies
+# FILE_EXTENSIONS frozensets are duplicated (locking.py:16-25): the two copies
 # are NOT linked by a re-export, so each must be pinned INDEPENDENTLY — and
 # this is the copy the orchestrator scheduler (the α enforcement point) actually
 # imports.  Keeping the two lists byte-identical is what lets a reader diff them.
@@ -55,8 +59,8 @@ _CANONICAL_EXTENSIONS = [
 # would defeat the point of independent pinning.  Duplication + the two drift
 # guards below is the cheaper and more faithful trade.
 #
-# One real tracked path per canonical extension (58 extensions / 61 paths) —
-# dark-factory unless the comment says reify.  Enforced by
+# One real tracked path per canonical extension — dark-factory unless the
+# comment says reify.  Enforced by
 # TestIsFilePath::test_accept_corpus_covers_every_canonical_extension.
 # ---------------------------------------------------------------------------
 
@@ -94,6 +98,7 @@ _ACCEPT_PATHS = [
     'src/comp.cjs',
     'src/mod.cts',
     'src/styles.css',
+    'plans/evidence/scheduler-scoring-2026-08-06/candidates_scored.csv',
     'src/styles.scss',
     'src/icon.svg',
     'Cargo.toml',
@@ -131,6 +136,12 @@ _ACCEPT_PATHS = [
     'gui/src-tauri/icons/icon.ico',  # reify
     'scripts/reify-audit-snapshot-filter.jq',  # reify
     'tree-sitter-reify/.npmrc',  # reify
+    # Widened 59 -> 60 for reify #6758 (spec-conformance α): the first tracked
+    # reify file with a `tombstones` extension; filename is PRD-normative
+    # (reify docs/prds/v0_6/spec-conformance-suite.md D3).
+    'docs/reify-language-spec.tombstones',  # reify
+    # reify #9058 (α-first): the first tracked reify `.tsv`, landed by reify #8662.
+    'tests/infra/affected-crates-direct-sets.tsv',  # reify
 ]
 
 # REJECT corpus (α/γ shared vector — all must return False).  Verbatim duplicate
@@ -161,6 +172,63 @@ _DOTTED_DIRECTORY_PATHS = [
     '.taskmaster',
 ]
 
+# ---------------------------------------------------------------------------
+# Extension-less tracked FILES (dark_factory #3248).
+#
+# The second half of the classifier: real tracked files whose final segment
+# carries NO extension at all, so the FILE_EXTENSIONS lookup can never reach
+# them.  Before #3248 every one of these classified as a DIRECTORY, which made
+# `hooks/project-checks` undeclarable in metadata.files (γ rejected it with a
+# LockCharterViolation) and — worse, because it was silent — made a task
+# declaring ONLY such paths strip to an empty charter and fall through to the
+# per-task `task-<id>` synthetic lock, holding no lock on the file it edits.
+#
+# Update _CANONICAL_EXTENSIONLESS AND EXTENSIONLESS_FILENAMES together when the
+# vector changes.  Also update the verbatim copies in
+# fused-memory/src/fused_memory/middleware/lock_charter_guard.py AND
+# fused-memory/tests/test_lock_charter_guard.py.
+#
+# EVIDENCE — `git ls-files -s` over BOTH repos, re-measured 2026-08-09 (and
+# identical to the 2026-07-31 measurement): every tracked path whose final
+# segment contains no '.'.  dark-factory contributes Dockerfile LICENSE
+# pre-commit pre-merge-commit project-checks; reify adds cargo
+# cargo-audit-orphans reference-transaction, and sccache
+# (scripts/canon-bin/guard/sccache, reify task 10232, measured on reify main
+# 2026-11-23).  Union = the 9 below.
+# ---------------------------------------------------------------------------
+
+_CANONICAL_EXTENSIONLESS = [
+    'Dockerfile',
+    'LICENSE',
+    'cargo',
+    'cargo-audit-orphans',
+    'pre-commit',
+    'pre-merge-commit',
+    'project-checks',
+    'reference-transaction',
+    'sccache',
+]
+
+# One REAL tracked path per canonical extension-less name — dark-factory unless
+# the comment says reify (same convention as _ACCEPT_PATHS above).  Verified
+# tracked with `git ls-files --error-unmatch` on 2026-08-09 (the sccache entry
+# on 2026-11-23).  Enforced complete
+# by TestExtensionlessFilenames::test_accept_corpus_covers_every_canonical_name.
+_EXTENSIONLESS_ACCEPT_PATHS = [
+    'LICENSE',
+    'fused-memory/docker/Dockerfile',
+    'hooks/pre-commit',
+    'hooks/pre-merge-commit',
+    'hooks/project-checks',
+    # reify
+    'hooks/reference-transaction',
+    # reify
+    'scripts/agent-bin/cargo',
+    # reify
+    'scripts/canon-bin/guard/sccache',
+    # reify
+    'scripts/cargo-audit-orphans',
+]
 
 class TestNormalizeLock:
     def test_default_depth_is_two(self):
@@ -278,25 +346,25 @@ class TestIsFilePath:
         assert not is_file_path('src/server/')
 
     def test_uppercase_extension_is_not_file_case_sensitive(self):
-        # Case-sensitive allowlist: 'MD' not in CODE_EXTENSIONS
+        # Case-sensitive allowlist: 'MD' not in FILE_EXTENSIONS
         assert not is_file_path('README.MD')
 
-    def test_code_extensions_is_frozenset(self):
-        assert isinstance(CODE_EXTENSIONS, frozenset)
+    def test_file_extensions_is_frozenset(self):
+        assert isinstance(FILE_EXTENSIONS, frozenset)
         # Spot-check canonical members
-        assert 'py' in CODE_EXTENSIONS
-        assert 'rs' in CODE_EXTENSIONS
-        assert 'ts' in CODE_EXTENSIONS
-        assert 'md' in CODE_EXTENSIONS
+        assert 'py' in FILE_EXTENSIONS
+        assert 'rs' in FILE_EXTENSIONS
+        assert 'ts' in FILE_EXTENSIONS
+        assert 'md' in FILE_EXTENSIONS
 
     @pytest.mark.parametrize('path', _ACCEPT_PATHS)
     def test_accept_corpus_paths_are_files(self, path: str):
         """Every canonical extension is run through the α copy of the predicate.
 
-        One representative path per canonical extension (all 58, not just the 22
-        added by the 2026-07-28 sweep).  Before this amendment only the 22 new
+        One representative path per canonical extension (every one, not just the
+        22 added by the 2026-07-28 sweep).  Before this amendment only the 22 new
         extensions had behavioural coverage here while the original 36 had nothing
-        but four spot-checks in ``test_code_extensions_is_frozenset`` — leaving
+        but four spot-checks in ``test_file_extensions_is_frozenset`` — leaving
         the copy the orchestrator scheduler actually imports pinned strictly
         weaker than the fused-memory copy, which defeats the point of
         independently pinning two deliberately-duplicated definitions.
@@ -310,7 +378,7 @@ class TestIsFilePath:
         """
         assert is_file_path(path) is True, (
             f'{path!r} must classify as a file — its extension is on the '
-            f'canonical allowlist (58 entries as of reify #5726 / #3117)'
+            'canonical allowlist'
         )
 
     @pytest.mark.parametrize('path', _REJECT_PATHS)
@@ -324,7 +392,7 @@ class TestIsFilePath:
         """_ACCEPT_PATHS must exercise every entry in _CANONICAL_EXTENSIONS.
 
         Turns the corpus comment's "one path per canonical extension" claim into
-        an enforced invariant, so an extension cannot be added to CODE_EXTENSIONS
+        an enforced invariant, so an extension cannot be added to FILE_EXTENSIONS
         and pinned in the drift guard while never being run through an actual
         classification assertion.  Mirrors the assertion of the same name in
         fused-memory/tests/test_lock_charter_guard.py, which also carries the
@@ -389,6 +457,80 @@ class TestIsFilePath:
         )
 
 
+class TestExtensionlessFilenamesDriftGuard:
+    """Pins shared.locking.EXTENSIONLESS_FILENAMES to the canonical vector."""
+
+    def test_matches_canonical_vector(self):
+        assert sorted(EXTENSIONLESS_FILENAMES) == _CANONICAL_EXTENSIONLESS
+
+    def test_is_frozenset(self):
+        assert isinstance(EXTENSIONLESS_FILENAMES, frozenset)
+
+    def test_members_are_bare_final_segments(self):
+        """Every member must be a non-empty, dot-free, slash-free name.
+
+        Structural invariant, not style policing.  A member is compared against
+        a path's FINAL SEGMENT, so:
+          - a name containing '.' is in the wrong allowlist — its post-dot token
+            belongs in FILE_EXTENSIONS, and putting it here would shadow that
+            lookup with an exact-name match that almost never fires;
+          - a name containing '/' could never equal a final segment, so it would
+            be permanently dead weight that reads as coverage.
+        """
+        for name in sorted(EXTENSIONLESS_FILENAMES):
+            assert isinstance(name, str) and name, f'{name!r} must be a non-empty str'
+            assert '.' not in name, (
+                f'{name!r} contains a dot — a dotted name is an EXTENSION and '
+                f'belongs in FILE_EXTENSIONS, not EXTENSIONLESS_FILENAMES'
+            )
+            assert '/' not in name, (
+                f'{name!r} contains a slash — members are matched against a '
+                f"path's final segment, which can never contain '/'"
+            )
+
+
+class TestExtensionlessFilenames:
+    """Extension-less tracked FILES classify as files (dark_factory #3248).
+
+    The hazard these pin, stated concretely: two tasks editing
+    ``hooks/project-checks`` concurrently could both hold NO lock on it, because
+    a charter that strips to empty degrades to a per-task ``task-<id>`` synthetic
+    lock that conflicts with nothing.
+    """
+
+    @pytest.mark.parametrize('path', _EXTENSIONLESS_ACCEPT_PATHS)
+    def test_extensionless_accept_corpus_paths_are_files(self, path: str):
+        assert is_file_path(path) is True, (
+            f'{path!r} is a real tracked FILE whose final segment carries no '
+            f'extension; it must classify as a file via EXTENSIONLESS_FILENAMES'
+        )
+
+    def test_accept_corpus_covers_every_canonical_name(self):
+        """_EXTENSIONLESS_ACCEPT_PATHS must exercise every canonical name.
+
+        The GAMMA-4 trap guard, mirroring
+        test_accept_corpus_covers_every_canonical_extension.  Adding a name to
+        the allowlist without a matching real accept path would otherwise swap
+        one red test for a different red test rather than closing the gap.
+
+        Coverage is derived from ``is_file_path`` itself rather than a
+        re-implementation of its segment parsing: a path counts for ``name``
+        only if the predicate ACCEPTS it and its final segment IS ``name``.
+        """
+        accepted = [p for p in _EXTENSIONLESS_ACCEPT_PATHS if is_file_path(p)]
+        uncovered = sorted(
+            name
+            for name in _CANONICAL_EXTENSIONLESS
+            if not any(p.rsplit('/', 1)[-1] == name for p in accepted)
+        )
+        assert not uncovered, (
+            f'{len(uncovered)} allowlisted name(s) are pinned in '
+            f'_CANONICAL_EXTENSIONLESS but never classified by any '
+            f'_EXTENSIONLESS_ACCEPT_PATHS entry: {uncovered!r}\n'
+            f'Add one real tracked representative path per name.'
+        )
+
+
 class TestDirectoryLocks:
     """directory_locks — returns ordered directory-like entries, drops files."""
 
@@ -442,8 +584,8 @@ class TestStripDirectoryLocks:
         assert strip_directory_locks(files) == ['src/foo.py']
 
 
-class TestCodeExtensionsDriftGuard:
-    """Pin shared.locking.CODE_EXTENSIONS to the canonical extension vector.
+class TestFileExtensionsDriftGuard:
+    """Pin shared.locking.FILE_EXTENSIONS to the canonical extension vector.
 
     This is the α-copy drift guard for the shared.locking canonical source.
     The corresponding γ-copy guard lives in
@@ -453,16 +595,16 @@ class TestCodeExtensionsDriftGuard:
     """
 
     def test_extension_drift_guard(self):
-        """sorted(CODE_EXTENSIONS) must match _CANONICAL_EXTENSIONS.
+        """sorted(FILE_EXTENSIONS) must match _CANONICAL_EXTENSIONS.
 
-        Update _CANONICAL_EXTENSIONS AND CODE_EXTENSIONS together when the
+        Update _CANONICAL_EXTENSIONS AND FILE_EXTENSIONS together when the
         allowlist changes.  Also update the verbatim copy in
         lock_charter_guard.py and its _CANONICAL_EXTENSIONS list.
         """
-        assert sorted(CODE_EXTENSIONS) == _CANONICAL_EXTENSIONS, (
-            f'shared.locking.CODE_EXTENSIONS has drifted from the canonical vector.\n'
+        assert sorted(FILE_EXTENSIONS) == _CANONICAL_EXTENSIONS, (
+            f'shared.locking.FILE_EXTENSIONS has drifted from the canonical vector.\n'
             f'  canonical : {_CANONICAL_EXTENSIONS!r}\n'
-            f'  actual    : {sorted(CODE_EXTENSIONS)!r}\n'
-            f'Update CODE_EXTENSIONS and _CANONICAL_EXTENSIONS together; also update '
+            f'  actual    : {sorted(FILE_EXTENSIONS)!r}\n'
+            f'Update FILE_EXTENSIONS and _CANONICAL_EXTENSIONS together; also update '
             f'lock_charter_guard.py.'
         )

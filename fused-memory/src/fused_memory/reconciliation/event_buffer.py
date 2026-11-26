@@ -1,22 +1,35 @@
 """SQLite-backed event buffer with burst detection and quiescence triggers."""
 
-import contextlib
 import json
 import logging
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
+from enum import StrEnum
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 from uuid import uuid4
 
 import aiosqlite
-from shared.async_sqlite_base import apply_full_durability_pragmas, connect_daemon
+from shared.async_sqlite_base import (
+    AtomicConnection,
+    CheckpointResult,
+    apply_full_durability_pragmas,
+    connect_daemon,
+)
+from shared.sqlite_column_migration import add_column_if_missing
 
 from fused_memory.models.reconciliation import (
     EventSource,
     EventType,
     ReconciliationEvent,
 )
+from fused_memory.reconciliation.coalescing import (
+    coalesce_key,
+    coalesced_count,
+    merge_coalesced_payload,
+)
+from fused_memory.reconciliation.throughput import utc_hour_bucket
+from fused_memory.utils.sqlite_connector import Connector
 
 logger = logging.getLogger(__name__)
 
@@ -31,7 +44,9 @@ CREATE TABLE IF NOT EXISTS event_buffer (
     timestamp TEXT NOT NULL,
     payload TEXT NOT NULL DEFAULT '{}',
     status TEXT NOT NULL DEFAULT 'buffered',
-    drained_by_run_id TEXT
+    drained_by_run_id TEXT,
+    coalesce_key TEXT,
+    drained_by_instance_id TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_eb_project_status ON event_buffer(project_id, status);
 CREATE INDEX IF NOT EXISTS idx_eb_agent_timestamp ON event_buffer(agent_id, timestamp)
@@ -62,12 +77,100 @@ CREATE TABLE IF NOT EXISTS deferred_writes (
     claimed_at TEXT,
     attempt_count INTEGER NOT NULL DEFAULT 0
 );
-CREATE INDEX IF NOT EXISTS idx_dw_project_claimed ON deferred_writes(project_id, claimed_at);
+
+-- Task 3049: durable hourly inflow record.  event_buffer rows are DELETEd by
+-- cleanup_drained once they are drained and older than max_age_seconds
+-- (default 3600s), so arrival history otherwise survives ~1 hour, not a week.
+-- cleanup_drained rolls the rows it is about to delete into this aggregate in
+-- the SAME transaction as the DELETE, which is what makes the count exact:
+-- an event is either still live in event_buffer or already counted here,
+-- never both and never neither.  Idempotent DDL, so existing DBs pick the
+-- table up on their next initialize().
+CREATE TABLE IF NOT EXISTS event_arrival_hourly (
+    project_id TEXT NOT NULL,
+    hour_bucket TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    event_count INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (project_id, hour_bucket, event_type)
+);
+
+-- Task 4278 (recon lever 3): events push() folded into an older buffered row.
+-- Counted in the same write unit as the fold, so every pushed event is a live
+-- event_buffer row, OR in event_arrival_hourly, OR in event_coalesced_hourly.
+-- One bound: a redelivered event that folded in as an older or middle
+-- constituent is not recognised as a redelivery, so it is counted here again.
+CREATE TABLE IF NOT EXISTS event_coalesced_hourly (
+    project_id TEXT NOT NULL,
+    hour_bucket TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    coalesced_count INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (project_id, hour_bucket, event_type)
+);
 """
 
 # Maximum number of replay attempts before a deferred write is treated as a poison-pill
 # and permanently dropped (logged at ERROR).
 _MAX_DEFERRED_WRITE_ATTEMPTS: int = 5
+
+# Rows fetched per fetchmany() call when draining cleanup_drained's
+# DELETE ... RETURNING cursor.  Bounds peak memory at O(chunk) instead of
+# O(rows deleted) — see cleanup_drained's docstring for the measurement.
+_CLEANUP_FETCH_CHUNK: int = 10_000
+
+# A folded row announces itself at WARNING each time its fold count reaches a
+# multiple of this.  A looping task no longer builds backlog once its events
+# fold, so the reconciliation_backlog alarm cannot see it; this line can.
+_COALESCE_HOT_TASK_WARNING_INTERVAL: int = 100
+
+
+class _PushOutcome(StrEnum):
+    """What one push did to the buffer."""
+
+    buffered = 'buffered'  # a new row
+    coalesced = 'coalesced'  # folded into an older buffered row
+    redelivered = 'redelivered'  # already stored, so nothing changed
+
+
+class _PushResult(NamedTuple):
+    outcome: _PushOutcome
+    fold_count: int = 1
+
+
+class DrainedRun(NamedTuple):
+    """One run's drained events, named by the instance that drained them."""
+
+    project_id: str
+    run_id: str
+    instance_id: str
+
+
+_UNFOLDED_PUSH_LOG_LINE = {
+    _PushOutcome.buffered: 'reconciliation.event_buffered',
+    _PushOutcome.redelivered: 'reconciliation.event_redelivered',
+}
+
+
+def _log_push(event: ReconciliationEvent, key: str | None, result: _PushResult) -> None:
+    """One structured line per push; a WARNING when a folded row turns hot."""
+    if result.outcome is not _PushOutcome.coalesced:
+        logger.info(
+            _UNFOLDED_PUSH_LOG_LINE[result.outcome],
+            extra={
+                'project_id': event.project_id,
+                'event_type': event.type.value,
+                'agent_id': event.agent_id,
+            },
+        )
+        return
+    fold_extra = {
+        'project_id': event.project_id,
+        'event_type': event.type.value,
+        'coalesce_key': key,
+        'coalesced_count': result.fold_count,
+    }
+    logger.info('reconciliation.event_coalesced', extra=fold_extra)
+    if result.fold_count % _COALESCE_HOT_TASK_WARNING_INTERVAL == 0:
+        logger.warning('reconciliation.coalesce_hot_task', extra=fold_extra)
 
 
 class EventBuffer:
@@ -91,7 +194,15 @@ class EventBuffer:
         stale_lock_seconds: float = 7200.0,
         queue_stats_fn: Callable[[], Any] | None = None,
         instance_id: str | None = None,
+        *,
+        connect: Connector = connect_daemon,
+        coalesce_task_events: bool = True,
     ):
+        """*connect* is how ``initialize`` opens the buffer's one connection.
+
+        It is given the database path and defaults to ``connect_daemon``.
+        *coalesce_task_events* switches push-time folding (see ``push``).
+        """
         # _in_memory is derived from the caller's intent (db_path is None),
         # not from the resolved string ':memory:'.  This means explicitly
         # passing db_path=Path(':memory:') is treated as a file path and
@@ -107,13 +218,15 @@ class EventBuffer:
         self.stale_lock_seconds = stale_lock_seconds
         self._queue_stats_fn = queue_stats_fn
         self.instance_id = instance_id or str(uuid4())
-        self._db: aiosqlite.Connection | None = None
+        self._connect = connect
+        self.coalesce_task_events = coalesce_task_events
+        self._access: AtomicConnection | None = None
         self._manual_triggers: set[str] = set()
 
     async def initialize(self) -> None:
         """Open SQLite connection and ensure schema exists."""
-        self._db = await connect_daemon(self._db_path)
-        self._db.row_factory = aiosqlite.Row
+        conn = await self._connect(self._db_path)
+        conn.row_factory = aiosqlite.Row
         # WAL mode cannot be enabled on in-memory SQLite DBs — SQLite
         # returns 'memory' from PRAGMA journal_mode=WAL which would trigger
         # the helper's RuntimeError guard.  The in-memory path is used by
@@ -123,134 +236,102 @@ class EventBuffer:
         # literal ':memory:' string, so that the contract is tied to the
         # caller's intent rather than to a particular string representation.
         if not self._in_memory:
-            await apply_full_durability_pragmas(self._db, busy_timeout_ms=5000)
-        await self._db.executescript(_BUFFER_SCHEMA_SQL)
-        await self._db.commit()
+            await apply_full_durability_pragmas(conn, busy_timeout_ms=5000)
+        self._access = AtomicConnection(conn)
+        async with self._access.write() as db:
+            await db.executescript(_BUFFER_SCHEMA_SQL)
         # Idempotent migration: add claimed_at column for pre-existing DBs.
         await self._migrate()
         logger.info(f'EventBuffer initialized (db={self._db_path}, instance={self.instance_id})')
 
     async def _migrate(self) -> None:
-        """Add new columns to pre-existing DBs (idempotent).
+        """Add new columns to pre-existing DBs."""
+        async with self._require_access().write() as db:
+            # Add drained_by_run_id if missing — attributes a drained row to the run
+            # that drained it (task 2711 / E7) so restore_drained() can be scoped to
+            # a single run instead of unconditionally restoring the whole project.
+            if await add_column_if_missing(db, 'event_buffer', 'drained_by_run_id', 'TEXT'):
+                logger.info('EventBuffer: migrated event_buffer — added drained_by_run_id column')
 
-        Each ALTER TABLE is:
-        * Guarded by a PRAGMA table_info check so we only run it when the column
-          is missing.
-        * Wrapped in try/except to survive the narrow race where two processes both
-          call initialize() on the same file concurrently — SQLite's ALTER TABLE
-          has no IF NOT EXISTS syntax, so the second writer would otherwise fail
-          with 'duplicate column name'.
-        """
-        db = self._require_db()
-        async with db.execute('PRAGMA table_info(deferred_writes)') as cursor:
-            columns = {row['name'] async for row in cursor}
+            # Add coalesce_key if missing (task 4278).  Rows written before it
+            # keep NULL and are never fold targets.  The index lives here, not
+            # in _BUFFER_SCHEMA_SQL, because that script runs first and would
+            # name a column a pre-existing table does not have yet.
+            if await add_column_if_missing(db, 'event_buffer', 'coalesce_key', 'TEXT'):
+                logger.info('EventBuffer: migrated event_buffer — added coalesce_key column')
+            await db.execute(
+                'CREATE INDEX IF NOT EXISTS idx_eb_coalesce'
+                ' ON event_buffer(project_id, coalesce_key, status)'
+                ' WHERE coalesce_key IS NOT NULL'
+            )
 
-        async with db.execute('PRAGMA table_info(event_buffer)') as cursor:
-            eb_columns = {row['name'] async for row in cursor}
-
-        # Add drained_by_run_id if missing — attributes a drained row to the run
-        # that drained it (task 2711 / E7) so restore_drained() can be scoped to
-        # a single run instead of unconditionally restoring the whole project.
-        if 'drained_by_run_id' not in eb_columns:
-            try:
-                await db.execute('ALTER TABLE event_buffer ADD COLUMN drained_by_run_id TEXT')
+            # Add drained_by_instance_id if missing (task 9655): names the
+            # instance whose lock a drain ran under, so a startup sweep can
+            # recover a dead predecessor's run-less drains.
+            if await add_column_if_missing(db, 'event_buffer', 'drained_by_instance_id', 'TEXT'):
                 logger.info(
-                    'EventBuffer: migrated event_buffer — added drained_by_run_id column'
+                    'EventBuffer: migrated event_buffer — added drained_by_instance_id column'
                 )
-            except Exception as exc:
-                if 'duplicate column name' not in str(exc).lower():
-                    raise
-                logger.debug('EventBuffer: drained_by_run_id already exists (concurrent init)')
 
-        # Drop the now-redundant single-column project index.  idx_dw_project_claimed
-        # (project_id, claimed_at) is a strict superset; keeping both wastes write
-        # IOPS and disk.  IF EXISTS makes this a no-op for fresh DBs that never
-        # had idx_dw_project.
-        await db.execute('DROP INDEX IF EXISTS idx_dw_project')
+            # Drop the now-redundant single-column project index.  idx_dw_project_claimed
+            # (project_id, claimed_at) is a strict superset; keeping both wastes write
+            # IOPS and disk.  IF EXISTS makes this a no-op for fresh DBs that never
+            # had idx_dw_project.
+            await db.execute('DROP INDEX IF EXISTS idx_dw_project')
 
-        # Add claimed_at if missing.
-        if 'claimed_at' not in columns:
-            try:
-                await db.execute('ALTER TABLE deferred_writes ADD COLUMN claimed_at TEXT')
-                await db.execute(
-                    'CREATE INDEX IF NOT EXISTS idx_dw_project_claimed'
-                    ' ON deferred_writes(project_id, claimed_at)'
-                )
+            # Same placement as idx_eb_coalesce above, for the same reason.
+            if await add_column_if_missing(db, 'deferred_writes', 'claimed_at', 'TEXT'):
                 logger.info('EventBuffer: migrated deferred_writes — added claimed_at column')
-            except Exception as exc:
-                if 'duplicate column name' not in str(exc).lower():
-                    raise
-                logger.debug('EventBuffer: claimed_at already exists (concurrent init)')
+            await db.execute(
+                'CREATE INDEX IF NOT EXISTS idx_dw_project_claimed'
+                ' ON deferred_writes(project_id, claimed_at)'
+            )
 
-        # Add attempt_count if missing — tracks poison-pill detection across restarts.
-        if 'attempt_count' not in columns:
-            try:
-                await db.execute(
-                    'ALTER TABLE deferred_writes'
-                    ' ADD COLUMN attempt_count INTEGER NOT NULL DEFAULT 0'
-                )
+            # Add attempt_count if missing — tracks poison-pill detection across restarts.
+            if await add_column_if_missing(
+                db, 'deferred_writes', 'attempt_count', 'INTEGER NOT NULL DEFAULT 0'
+            ):
                 logger.info('EventBuffer: migrated deferred_writes — added attempt_count column')
-            except Exception as exc:
-                if 'duplicate column name' not in str(exc).lower():
-                    raise
-                logger.debug('EventBuffer: attempt_count already exists (concurrent init)')
 
-        await db.commit()
-
-    def _require_db(self) -> aiosqlite.Connection:
-        if self._db is None:
+    def _require_access(self) -> AtomicConnection:
+        if self._access is None:
             raise RuntimeError('EventBuffer not initialized — call initialize() first')
-        return self._db
-
-    async def _safe_rollback(self) -> None:
-        """Best-effort rollback — never raises."""
-        if self._db is None:
-            return
-        with contextlib.suppress(Exception):
-            await self._db.rollback()
-
-    @contextlib.asynccontextmanager
-    async def _txn(self):
-        """Explicit transaction wrapper — commit on success, rollback on any exception.
-
-        ``BaseException`` so cancellation also rolls back; otherwise aiosqlite's
-        implicit transaction would stay open and hold the writer lock until
-        the connection is closed.
-        """
-        db = self._require_db()
-        try:
-            yield db
-            await db.commit()
-        except BaseException:
-            await self._safe_rollback()
-            raise
+        return self._access
 
     # ── Push ───────────────────────────────────────────────────────────
 
     async def push(self, event: ReconciliationEvent) -> None:
-        """Insert event into the shared buffer.
+        """Insert event into the shared buffer, folding a repeat task event.
 
-        Idempotent on the event id (UUID primary key): the conflict clause is
-        scoped to the primary key with ``ON CONFLICT(id) DO NOTHING`` so
-        re-pushing an already-committed event is a harmless no-op rather than an
-        IntegrityError. A duplicate only ever occurs on EventJournal-driven
-        startup recovery, which redelivers in-flight events at-least-once — the
-        drainer can be killed after this push commits but before it marks the
-        journal row processed, so recover() re-enqueues and re-pushes it (task
-        2709). Without the conflict clause the drainer would treat the duplicate
-        as a non-retriable error and dead-letter a perfectly good event.
+        Idempotent on the event id: ``ON CONFLICT(id) DO NOTHING`` makes the
+        at-least-once redelivery of EventJournal startup recovery a no-op
+        (task 2709), while any other constraint violation still raises.
 
-        Scoping to ``(id)`` rather than a bare ``INSERT OR IGNORE`` is
-        deliberate (loud-over-silent): only the intended duplicate-id case is
-        swallowed; any *other* constraint violation on this row — e.g. a
-        NOT NULL breach on project_id/event_type/event_source/timestamp — still
-        raises loudly instead of silently dropping the event.
+        An event with a ``coalescing.coalesce_key`` folds into the OLDEST
+        buffered row with the same key (task 4278).  That row keeps its id, so
+        an id ``peek_buffered`` handed out still drains via ``drain_by_ids``,
+        and its timestamp, which only ever moves earlier, so ``ORDER BY
+        timestamp`` positions and the ``MIN(timestamp)`` staleness trigger
+        hold.  A folded event leaves no row of its own for ``ON CONFLICT`` to
+        hit, so its redelivery is recognised only when it is the row's newest
+        constituent (``coalescing.merge_coalesced_payload``); an older or
+        middle constituent folds again and over-counts by one.
+        The INSERT runs first: a unit whose first statement writes is
+        serialised against other connections, which a unit that SELECTs first
+        is not (``AtomicConnection.write``).  A transition into done never
+        folds (``coalescing.coalesce_key``), so ``select_done_transitions`` sees
+        each with its own ``done_provenance``; every other drained task-event
+        reader uses task_id or the live task.  That also makes a fold landing
+        between ``peek_buffered`` and ``drain_by_ids`` benign: the stage gets
+        the pre-fold payload, and no done event can have folded into it.
         """
-        async with self._txn() as db:
-            await db.execute(
+        key = coalesce_key(event)
+        async with self._require_access().write() as db:
+            cursor = await db.execute(
                 """INSERT INTO event_buffer
-                   (id, project_id, event_type, event_source, agent_id, timestamp, payload, status)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, 'buffered')
+                   (id, project_id, event_type, event_source, agent_id, timestamp, payload,
+                    status, coalesce_key)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, 'buffered', ?)
                    ON CONFLICT(id) DO NOTHING""",
                 (
                     event.id,
@@ -260,39 +341,88 @@ class EventBuffer:
                     event.agent_id,
                     event.timestamp.isoformat(),
                     json.dumps(event.payload),
+                    key,
                 ),
             )
+            if cursor.rowcount == 0:
+                result = _PushResult(_PushOutcome.redelivered)
+            elif self.coalesce_task_events and key is not None:
+                result = await self._fold_into_oldest(db, event, key)
+            else:
+                result = _PushResult(_PushOutcome.buffered)
 
         if event.agent_id is not None:
             await self._update_burst_state(event.agent_id, event.timestamp)
 
-        logger.info(
-            'reconciliation.event_buffered',
-            extra={
-                'project_id': event.project_id,
-                'event_type': event.type.value,
-                'agent_id': event.agent_id,
-            },
+        _log_push(event, key, result)
+
+    async def _fold_into_oldest(
+        self, db: aiosqlite.Connection, event: ReconciliationEvent, key: str,
+    ) -> _PushResult:
+        """Fold the row ``push`` just inserted into the oldest buffered row sharing ``key``.
+
+        Runs on the open write unit's connection.  The just-inserted row is
+        uncommitted, so deleting it leaves no trace any reader could see.
+        """
+        # Oldest buffered row: stable id, MIN(timestamp) and ORDER BY position (see push).
+        async with db.execute(
+            """SELECT id, payload, timestamp FROM event_buffer
+               WHERE project_id = ? AND coalesce_key = ? AND status = 'buffered'
+                 AND id != ?
+               ORDER BY timestamp ASC
+               LIMIT 1""",
+            (event.project_id, key, event.id),
+        ) as cursor:
+            target = await cursor.fetchone()
+        if target is None:
+            return _PushResult(_PushOutcome.buffered)
+
+        await db.execute('DELETE FROM event_buffer WHERE id = ?', (event.id,))
+        fold = merge_coalesced_payload(
+            json.loads(target['payload']),
+            event.payload,
+            event_type=event.type,
+            incoming_id=event.id,
+            incoming_ts=event.timestamp,
+            row_ts=datetime.fromisoformat(target['timestamp']),
         )
+        if fold is None:
+            return _PushResult(_PushOutcome.redelivered)
+
+        await db.execute(
+            'UPDATE event_buffer SET payload = ?, timestamp = ? WHERE id = ?',
+            (json.dumps(fold.payload), fold.row_timestamp.isoformat(), target['id']),
+        )
+        await db.execute(
+            """INSERT INTO event_coalesced_hourly
+                   (project_id, hour_bucket, event_type, coalesced_count)
+               VALUES (?, ?, ?, 1)
+               ON CONFLICT(project_id, hour_bucket, event_type)
+               DO UPDATE SET coalesced_count = coalesced_count + excluded.coalesced_count""",
+            (
+                event.project_id,
+                utc_hour_bucket(fold.folded_timestamp.isoformat()),
+                event.type.value,
+            ),
+        )
+        return _PushResult(_PushOutcome.coalesced, coalesced_count(fold.payload))
 
     # ── Burst detection ────────────────────────────────────────────────
 
     async def _update_burst_state(self, agent_id: str, timestamp: datetime) -> None:
         """Track per-agent write bursts.  2+ writes within burst_window → bursting."""
-        db = self._require_db()
         ts_iso = timestamp.isoformat()
         cutoff = (timestamp.timestamp() - self.burst_window_seconds)
         cutoff_iso = datetime.fromtimestamp(cutoff, tz=UTC).isoformat()
 
-        async with db.execute(
+        row = await self._require_access().read_one(
             """SELECT COUNT(*) as cnt FROM event_buffer
                WHERE agent_id = ? AND timestamp >= ?""",
             (agent_id, cutoff_iso),
-        ) as cursor:
-            row = await cursor.fetchone()
-            recent_count = row['cnt'] if row else 0
+        )
+        recent_count = row['cnt'] if row else 0
 
-        async with self._txn() as db:
+        async with self._require_access().write() as db:
             if recent_count >= 2:
                 await db.execute(
                     """INSERT INTO burst_state (agent_id, state, last_write_at, burst_started_at)
@@ -319,8 +449,6 @@ class EventBuffer:
 
         Returns (should_trigger, reason).
         """
-        db = self._require_db()
-
         # Check run lock
         if await self._is_run_locked(project_id):
             return False, ''
@@ -330,13 +458,12 @@ class EventBuffer:
             return True, 'manual_trigger'
 
         # Count pending events + oldest timestamp
-        async with db.execute(
+        row = await self._require_access().read_one(
             """SELECT COUNT(*) as cnt, MIN(timestamp) as oldest
                FROM event_buffer
                WHERE project_id = ? AND status = 'buffered'""",
             (project_id,),
-        ) as cursor:
-            row = await cursor.fetchone()
+        )
 
         count = row['cnt'] if row else 0
         oldest_str = row['oldest'] if row else None
@@ -373,18 +500,17 @@ class EventBuffer:
             datetime.now(UTC).timestamp() - self.stale_lock_seconds,
             tz=UTC,
         ).isoformat()
-        async with self._txn() as db:
+        async with self._require_access().write() as db:
             await db.execute(
                 'DELETE FROM reconciliation_locks WHERE heartbeat_at < ?',
                 (cutoff,),
             )
 
-        db = self._require_db()
-        async with db.execute(
+        row = await self._require_access().read_one(
             'SELECT 1 FROM reconciliation_locks WHERE project_id = ?',
             (project_id,),
-        ) as cursor:
-            return await cursor.fetchone() is not None
+        )
+        return row is not None
 
     async def get_lock_status(
         self, project_id: str
@@ -403,18 +529,16 @@ class EventBuffer:
             datetime.now(UTC).timestamp() - self.stale_lock_seconds,
             tz=UTC,
         ).isoformat()
-        async with self._txn() as db:
+        async with self._require_access().write() as db:
             await db.execute(
                 'DELETE FROM reconciliation_locks WHERE heartbeat_at < ?',
                 (cutoff,),
             )
 
-        db = self._require_db()
-        async with db.execute(
+        row = await self._require_access().read_one(
             'SELECT instance_id, heartbeat_at FROM reconciliation_locks WHERE project_id = ?',
             (project_id,),
-        ) as cursor:
-            row = await cursor.fetchone()
+        )
         if row is None:
             return (None, None)
         hb = datetime.fromisoformat(row['heartbeat_at'])
@@ -438,7 +562,7 @@ class EventBuffer:
             datetime.now(UTC).timestamp() - self.burst_cooldown_seconds,
             tz=UTC,
         ).isoformat()
-        async with self._txn() as db:
+        async with self._require_access().write() as db:
             cursor = await db.execute(
                 "UPDATE burst_state SET state = 'idle', burst_started_at = NULL "
                 "WHERE state = 'bursting' AND last_write_at < ?",
@@ -449,16 +573,14 @@ class EventBuffer:
 
     async def _is_quiescent(self) -> bool:
         """System is quiescent when no agent is bursting and durable queue is idle."""
-        db = self._require_db()
-
         await self.expire_stale_bursts()
 
         # Any agents still bursting?
-        async with db.execute(
+        bursting = await self._require_access().read_one(
             "SELECT 1 FROM burst_state WHERE state = 'bursting' LIMIT 1"
-        ) as cursor:
-            if await cursor.fetchone() is not None:
-                return False
+        )
+        if bursting is not None:
+            return False
 
         # Check durable queue
         if self._queue_stats_fn is not None:
@@ -479,34 +601,33 @@ class EventBuffer:
     # ── Drain ──────────────────────────────────────────────────────────
 
     async def drain(
-        self, project_id: str, run_id: str | None = None,
+        self, project_id: str, run_id: str,
     ) -> list[ReconciliationEvent]:
-        """Atomically drain buffered events for a project.
+        """Atomically drain a project's buffered events as run *run_id*.
 
-        When ``run_id`` is provided, the drained rows are stamped with
-        ``drained_by_run_id = run_id`` so a later run-scoped ``restore_drained``
-        can restore exactly this run's events without touching a concurrent
-        run's drained rows (task 2711 / E7).
+        Each drained row is stamped ``drained_by_run_id = run_id`` and with this
+        instance's ``drained_by_instance_id``, so a later run-scoped
+        ``restore_drained`` can restore exactly this run's events without
+        touching a concurrent run's drained rows (task 2711 / E7). *run_id* is
+        required so this path can never leave an unattributed row (task 6784).
         """
-        db = self._require_db()
-        async with db.execute(
+        rows = await self._require_access().read_all(
             """SELECT * FROM event_buffer
                WHERE project_id = ? AND status = 'buffered'
                ORDER BY timestamp""",
             (project_id,),
-        ) as cursor:
-            rows = await cursor.fetchall()
+        )
 
         if not rows:
             return []
 
         ids = [row['id'] for row in rows]
         placeholders = ','.join('?' for _ in ids)
-        async with self._txn() as db:
+        async with self._require_access().write() as db:
             await db.execute(
-                f"UPDATE event_buffer SET status = 'drained', drained_by_run_id = ? "
-                f"WHERE id IN ({placeholders})",
-                [run_id, *ids],
+                f"UPDATE event_buffer SET status = 'drained', drained_by_run_id = ?, "
+                f"drained_by_instance_id = ? WHERE id IN ({placeholders})",
+                [run_id, self.instance_id, *ids],
             )
 
         events = []
@@ -523,17 +644,20 @@ class EventBuffer:
         return events
 
     async def drain_oldest_chunk(
-        self, project_id: str, limit: int,
+        self, project_id: str, limit: int, run_id: str,
         before: datetime | None = None,
     ) -> list[ReconciliationEvent]:
-        """Drain the oldest `limit` buffered events for a project.
+        """Drain the oldest `limit` buffered events for a project as run *run_id*.
+
+        Stamps the drained rows like ``drain`` does: ``drained_by_run_id`` and
+        ``drained_by_instance_id``. *run_id* is required so this path can never
+        leave an unattributed row (task 6784).
 
         Args:
             before: If set, only drain events with timestamp < this value.
                     Used by BacklogIterator to ignore events that arrived
                     after the backlog snapshot was taken.
         """
-        db = self._require_db()
         if before is not None:
             query = """SELECT * FROM event_buffer
                        WHERE project_id = ? AND status = 'buffered'
@@ -547,18 +671,18 @@ class EventBuffer:
                        ORDER BY timestamp ASC
                        LIMIT ?"""
             params = (project_id, limit)
-        async with db.execute(query, params) as cursor:
-            rows = await cursor.fetchall()
+        rows = await self._require_access().read_all(query, params)
 
         if not rows:
             return []
 
         ids = [row['id'] for row in rows]
         placeholders = ','.join('?' for _ in ids)
-        async with self._txn() as db:
+        async with self._require_access().write() as db:
             await db.execute(
-                f"UPDATE event_buffer SET status = 'drained' WHERE id IN ({placeholders})",
-                ids,
+                f"UPDATE event_buffer SET status = 'drained', drained_by_run_id = ?, "
+                f"drained_by_instance_id = ? WHERE id IN ({placeholders})",
+                [run_id, self.instance_id, *ids],
             )
 
         events = []
@@ -584,7 +708,6 @@ class EventBuffer:
         ContextAssembler to determine which events fit the token budget
         before committing to a drain.
         """
-        db = self._require_db()
         if before is not None:
             query = """SELECT * FROM event_buffer
                        WHERE project_id = ? AND status = 'buffered'
@@ -598,8 +721,7 @@ class EventBuffer:
                        ORDER BY timestamp ASC
                        LIMIT ?"""
             params = (project_id, limit)
-        async with db.execute(query, params) as cursor:
-            rows = await cursor.fetchall()
+        rows = await self._require_access().read_all(query, params)
 
         return [
             ReconciliationEvent(
@@ -627,14 +749,12 @@ class EventBuffer:
         stages while the events stay drained, so a resumed cycle never
         double-processes them.
         """
-        db = self._require_db()
-        async with db.execute(
+        rows = await self._require_access().read_all(
             """SELECT * FROM event_buffer
                WHERE project_id = ? AND status = 'drained' AND drained_by_run_id = ?
                ORDER BY timestamp""",
             (project_id, run_id),
-        ) as cursor:
-            rows = await cursor.fetchall()
+        )
 
         return [
             ReconciliationEvent(
@@ -650,22 +770,26 @@ class EventBuffer:
         ]
 
     async def drain_by_ids(
-        self, project_id: str, ids: list[str],
+        self, project_id: str, ids: list[str], run_id: str,
     ) -> int:
-        """Mark specific event IDs as drained.
+        """Mark specific event IDs as drained by run *run_id*.
 
         Used after the ContextAssembler determines which events fit the
-        token budget.  Returns the number of rows updated.
+        token budget.  Returns the number of rows updated.  *run_id* is
+        stamped as ``drained_by_run_id`` so a later run-scoped
+        ``restore_drained`` can target exactly this chunk; it is required so
+        this path can never leave an unattributed row (task 6453).
         """
         if not ids:
             return 0
         placeholders = ','.join('?' for _ in ids)
-        async with self._txn() as db:
+        async with self._require_access().write() as db:
             cursor = await db.execute(
-                f"""UPDATE event_buffer SET status = 'drained'
+                f"""UPDATE event_buffer SET status = 'drained', drained_by_run_id = ?,
+                        drained_by_instance_id = ?
                     WHERE project_id = ? AND id IN ({placeholders})
                       AND status = 'buffered'""",
-                [project_id, *ids],
+                [run_id, self.instance_id, project_id, *ids],
             )
             rowcount = cursor.rowcount
         return rowcount
@@ -673,73 +797,84 @@ class EventBuffer:
     async def restore_drained(
         self,
         project_id: str,
-        run_id: str | None = None,
+        run_id: str,
         *,
         include_unattributed: bool = False,
     ) -> int:
-        """Restore drained events to 'buffered' after a failed run.
+        """Restore one run's drained events to 'buffered' after it failed.
 
-        When ``run_id`` is provided, only rows stamped with
-        ``drained_by_run_id = run_id`` are restored — this protects a
-        concurrent live run's drained events from being clobbered when the
-        reaper recovers a *different* orphaned run on the same project (task
-        2711 / E7). When omitted (the default), behaviour is unchanged: every
-        drained row for the project is restored, project-wide.
+        Only rows stamped with ``drained_by_run_id = run_id`` are restored —
+        this protects a concurrent live run's drained events from being
+        clobbered when the reaper recovers a *different* orphaned run on the
+        same project (task 2711 / E7), and an earlier completed run's consumed
+        events from being re-processed (task 6453). There is deliberately no
+        project-wide mode.
 
         ``include_unattributed`` additionally restores rows with
-        ``drained_by_run_id IS NULL`` when ``run_id`` is set (ignored
-        otherwise — the project-wide path already covers them). This closes
-        the upgrade-boundary gap where events drained by a pre-task-2711
-        process carry no run attribution: since every current code path now
-        always stamps ``drained_by_run_id`` on drain, a NULL row can only be
-        left over from a process that no longer exists by the time a recovery
-        pass runs, so it is provably safe to fold into a *specific* run's
-        recovery without reintroducing the concurrent-run clobber the run
-        scoping was added to prevent (task 2711 amendment, reviewer finding).
+        ``drained_by_run_id IS NULL``. This closes the upgrade-boundary gap
+        where events drained by a pre-task-2711 process carry no run
+        attribution: since every drain path (``drain``,
+        ``drain_oldest_chunk``, ``drain_by_ids``) requires a ``run_id`` and
+        stamps it as it drains (tasks 6453, 6784), a NULL row can only be left
+        over from a process that no longer exists by the time a recovery pass
+        runs, so it is provably safe to fold into a *specific* run's recovery
+        without reintroducing the concurrent-run clobber the run scoping was
+        added to prevent (task 2711 amendment, reviewer finding).
         Callers that need the exact-match-only contract (e.g. one caller's
         ``mark_drained_run_id`` attribution racing another's) must keep the
         default ``False``.
+
+        A restored row loses both drain stamps, so a stamp only ever names the
+        drain a row is currently in (task 9655).
         """
-        if run_id is None:
-            async with self._txn() as db:
-                cursor = await db.execute(
-                    "UPDATE event_buffer SET status = 'buffered' "
-                    "WHERE project_id = ? AND status = 'drained'",
-                    (project_id,),
-                )
-                count = cursor.rowcount
-        elif include_unattributed:
-            async with self._txn() as db:
-                cursor = await db.execute(
-                    "UPDATE event_buffer SET status = 'buffered' "
-                    "WHERE project_id = ? AND status = 'drained' "
-                    "AND (drained_by_run_id = ? OR drained_by_run_id IS NULL)",
-                    (project_id, run_id),
-                )
-                count = cursor.rowcount
-        else:
-            async with self._txn() as db:
-                cursor = await db.execute(
-                    "UPDATE event_buffer SET status = 'buffered' "
-                    "WHERE project_id = ? AND status = 'drained' AND drained_by_run_id = ?",
-                    (project_id, run_id),
-                )
-                count = cursor.rowcount
+        run_match = (
+            '(drained_by_run_id = ? OR drained_by_run_id IS NULL)'
+            if include_unattributed
+            else 'drained_by_run_id = ?'
+        )
+        async with self._require_access().write() as db:
+            cursor = await db.execute(
+                "UPDATE event_buffer SET status = 'buffered', "
+                "drained_by_run_id = NULL, drained_by_instance_id = NULL "
+                f"WHERE project_id = ? AND status = 'drained' AND {run_match}",
+                (project_id, run_id),
+            )
+            count = cursor.rowcount
         if count:
             logger.info(f'Restored {count} drained events to buffered for {project_id}')
         return count
+
+    async def drained_runs_of_other_instances(self) -> list[DrainedRun]:
+        """Each run with rows still drained under another instance's drain."""
+        rows = await self._require_access().read_all(
+            """SELECT DISTINCT project_id, drained_by_run_id, drained_by_instance_id
+               FROM event_buffer
+               WHERE status = 'drained'
+                 AND drained_by_run_id IS NOT NULL
+                 AND drained_by_instance_id IS NOT NULL
+                 AND drained_by_instance_id != ?
+               ORDER BY project_id, drained_by_run_id""",
+            (self.instance_id,),
+        )
+        return [
+            DrainedRun(
+                project_id=row['project_id'],
+                run_id=row['drained_by_run_id'],
+                instance_id=row['drained_by_instance_id'],
+            )
+            for row in rows
+        ]
 
     async def mark_drained_run_id(
         self, project_id: str, event_ids: list[str], run_id: str,
     ) -> int:
         """Attribute already-drained rows to the run about to process them.
 
-        Used by the BacklogIterator path: ``drain_by_ids`` drains a chunk's
-        events *before* ``run_full_cycle`` mints that chunk's run_id, so those
-        rows would otherwise carry no ``drained_by_run_id`` attribution. This
-        lets the harness stamp them retroactively so a later run-scoped
-        ``restore_drained`` can restore exactly that chunk's events (task 2711
-        / E7).
+        ``run_full_cycle``'s attribution for caller-supplied ``events``, so a
+        later run-scoped ``restore_drained`` can restore exactly that run's
+        events (task 2711 / E7). BacklogIterator already stamps each chunk's
+        run_id at ``drain_by_ids`` (task 6453), which makes this an idempotent
+        re-stamp on that path.
 
         Only rows currently ``status = 'drained'`` are touched; ids that don't
         exist, aren't currently drained, or are empty are silently ignored (no
@@ -748,7 +883,7 @@ class EventBuffer:
         if not event_ids:
             return 0
         placeholders = ','.join('?' for _ in event_ids)
-        async with self._txn() as db:
+        async with self._require_access().write() as db:
             cursor = await db.execute(
                 f"""UPDATE event_buffer SET drained_by_run_id = ?
                     WHERE project_id = ? AND status = 'drained'
@@ -766,7 +901,7 @@ class EventBuffer:
         get_active_projects() (which selects WHERE status='buffered') from returning
         the project_id, ending the management-loop respawn storm (2026-05-28 incident).
 
-        Mirrors restore_drained: UPDATE-by-status using the same _txn() pattern.
+        Mirrors restore_drained: UPDATE-by-status in a single write unit.
         See task 1143 (read-side UnknownProjectError) and task 1549 (this write-side
         complement: quarantine so get_active_projects stops respawning the loop).
 
@@ -780,7 +915,7 @@ class EventBuffer:
         event_buffer table directly (``SELECT * FROM event_buffer WHERE
         status='dead_letter'``).  A cleanup helper can be added as a follow-up.
         """
-        async with self._txn() as db:
+        async with self._require_access().write() as db:
             cursor = await db.execute(
                 "UPDATE event_buffer SET status = 'dead_letter' "
                 "WHERE project_id = ? AND status = 'buffered'",
@@ -796,12 +931,10 @@ class EventBuffer:
 
     async def count_buffered(self, project_id: str) -> int:
         """Return count of buffered events for a project."""
-        db = self._require_db()
-        async with db.execute(
+        row = await self._require_access().read_one(
             "SELECT COUNT(*) as cnt FROM event_buffer WHERE project_id = ? AND status = 'buffered'",
             (project_id,),
-        ) as cursor:
-            row = await cursor.fetchone()
+        )
         return row['cnt'] if row else 0
 
     # ── Run locking ────────────────────────────────────────────────────
@@ -813,7 +946,7 @@ class EventBuffer:
             datetime.now(UTC).timestamp() - self.stale_lock_seconds,
             tz=UTC,
         ).isoformat()
-        async with self._txn() as db:
+        async with self._require_access().write() as db:
             await db.execute(
                 'DELETE FROM reconciliation_locks WHERE heartbeat_at < ?',
                 (cutoff,),
@@ -821,7 +954,7 @@ class EventBuffer:
 
         now = datetime.now(UTC).isoformat()
         try:
-            async with self._txn() as db:
+            async with self._require_access().write() as db:
                 await db.execute(
                     """INSERT INTO reconciliation_locks (project_id, instance_id, acquired_at, heartbeat_at)
                        VALUES (?, ?, ?, ?)""",
@@ -830,7 +963,7 @@ class EventBuffer:
             return True
         except Exception:
             # PK constraint violation — another instance holds the lock.
-            # _txn() already rolled back.
+            # The write unit already rolled back.
             return False
 
     async def mark_run_complete(
@@ -847,7 +980,7 @@ class EventBuffer:
 
         Returns the rowcount so callers can detect a no-op release.
         """
-        async with self._txn() as db:
+        async with self._require_access().write() as db:
             if instance_id is None:
                 cursor = await db.execute(
                     'DELETE FROM reconciliation_locks WHERE project_id = ?',
@@ -864,7 +997,7 @@ class EventBuffer:
     async def heartbeat(self, project_id: str) -> None:
         """Update lock heartbeat to prevent stale-lock recovery."""
         now = datetime.now(UTC).isoformat()
-        async with self._txn() as db:
+        async with self._require_access().write() as db:
             await db.execute(
                 'UPDATE reconciliation_locks SET heartbeat_at = ? WHERE project_id = ? AND instance_id = ?',
                 (now, project_id, self.instance_id),
@@ -886,7 +1019,7 @@ class EventBuffer:
     ) -> str:
         """Queue a memory write for replay after the current full cycle completes."""
         write_id = str(uuid4())
-        async with self._txn() as db:
+        async with self._require_access().write() as db:
             await db.execute(
                 """INSERT INTO deferred_writes
                    (id, project_id, content, category, metadata, agent_id, created_at)
@@ -923,7 +1056,7 @@ class EventBuffer:
         replays each project's writes at a time.
         """
         now_iso = datetime.now(UTC).isoformat()
-        async with self._txn() as db:
+        async with self._require_access().write() as db:
             # Fetch pending rows inside the transaction
             async with db.execute(
                 """SELECT id, content, category, metadata, agent_id, created_at
@@ -958,7 +1091,7 @@ class EventBuffer:
 
     async def delete_deferred_write(self, write_id: str) -> None:
         """Delete a single deferred write by primary key (no-op if not found)."""
-        async with self._txn() as db:
+        async with self._require_access().write() as db:
             await db.execute('DELETE FROM deferred_writes WHERE id = ?', (write_id,))
 
     async def _debug_get_deferred_row(self, write_id: str) -> dict | None:
@@ -973,14 +1106,12 @@ class EventBuffer:
         The leading underscore marks this as a test-support API, not part of
         EventBuffer's production interface.
         """
-        db = self._require_db()
-        async with db.execute(
+        row = await self._require_access().read_one(
             'SELECT id, project_id, content, category, metadata, agent_id,'
             '       created_at, claimed_at, attempt_count'
             ' FROM deferred_writes WHERE id = ?',
             (write_id,),
-        ) as cursor:
-            row = await cursor.fetchone()
+        )
         if row is None:
             return None
         return {
@@ -1010,7 +1141,7 @@ class EventBuffer:
         Returns the number of rows re-queued (exhausted rows are not counted).
         """
         cutoff_iso = (datetime.now(UTC) - timedelta(seconds=max_age_seconds)).isoformat()
-        async with self._txn() as db:
+        async with self._require_access().write() as db:
             # Fetch all stale rows to split recoverable vs. exhausted.
             async with db.execute(
                 'SELECT id, content, attempt_count FROM deferred_writes'
@@ -1063,23 +1194,19 @@ class EventBuffer:
 
     async def get_active_projects(self) -> list[str]:
         """Return project IDs that have buffered events."""
-        db = self._require_db()
-        async with db.execute(
+        rows = await self._require_access().read_all(
             "SELECT DISTINCT project_id FROM event_buffer WHERE status = 'buffered'"
-        ) as cursor:
-            rows = await cursor.fetchall()
+        )
         return [row['project_id'] for row in rows]
 
     async def get_buffer_stats(self, project_id: str) -> dict:
         """Buffer size and oldest event age for a project."""
-        db = self._require_db()
-        async with db.execute(
+        row = await self._require_access().read_one(
             """SELECT COUNT(*) as cnt, MIN(timestamp) as oldest
                FROM event_buffer
                WHERE project_id = ? AND status = 'buffered'""",
             (project_id,),
-        ) as cursor:
-            row = await cursor.fetchone()
+        )
 
         count = row['cnt'] if row else 0
         oldest_str = row['oldest'] if row else None
@@ -1096,23 +1223,161 @@ class EventBuffer:
     # ── Maintenance ────────────────────────────────────────────────────
 
     async def cleanup_drained(self, max_age_seconds: float = 3600.0) -> int:
-        """Delete drained events older than cutoff, skipping locked projects."""
+        """Delete drained events older than cutoff, skipping locked projects.
+
+        Task 3049: before deleting, roll the very same rows up into
+        ``event_arrival_hourly`` so the project's arrival history survives the
+        DELETE.  This is the only DELETE of a COMMITTED ``event_buffer`` row in
+        the codebase — the single chokepoint where inflow history is destroyed
+        — so rolling up here captures 100% of events regardless of which drain
+        path (``drain`` / ``drain_oldest_chunk`` / ``drain_by_ids``) marked
+        them.  ``push``'s fold deletes only the row it inserted earlier in the
+        same uncommitted unit, and counts that event in
+        ``event_coalesced_hourly``.
+
+        The rollup runs inside the SAME write unit as the DELETE, and takes its
+        rows FROM that delete via ``DELETE ... RETURNING`` (SQLite >= 3.35,
+        already relied on by ``services/durable_queue.py``).  That is the
+        correctness property: each row is counted exactly once, because it is
+        either still live in ``event_buffer`` (countable directly) or in the
+        aggregate (countable there), never both and never neither.  Deriving
+        the aggregated set from the deletion itself — rather than re-evaluating
+        the same predicate in a separate SELECT — is what makes the two halves
+        structurally incapable of disagreeing, and it halves the scan cost of a
+        sweep that runs every 50s against a table that can hold six-figure row
+        counts after a deep backlog drain.  In particular the lock exclusion is
+        honoured by construction: a locked project's rows are not deleted, so
+        they are not returned, so they are not rolled up — they simply roll up
+        on the later sweep that does delete them.
+
+        This "never both and never neither" guarantee, and the atomicity a
+        mid-sweep fault rolls back to, both require that no *other* commit lands
+        on the shared connection while this sweep is in flight.  That is now
+        ENFORCED rather than assumed: ``AtomicConnection.write()`` holds the
+        per-connection lock across the whole chunked fold, so the harness's
+        concurrently running per-project tasks cannot interleave their own
+        ``push``/``drain`` commits into it.  The enforcement matters most here,
+        because draining the RETURNING cursor via chunked ``fetchmany`` (below)
+        suspends once per chunk (~101 times at N=1,000,000) rather than once
+        after a single ``fetchall()`` — a window the old unlocked transaction
+        wrapper could only document, not close.
+
+        A row whose timestamp cannot be parsed is still DELETED; it is only
+        left out of the rollup, with a structured warning naming it.  Bucketing
+        raises ``ValueError`` on a malformed timestamp and this transaction is
+        the ONLY path that prunes the buffer, so letting one poison row abort
+        it would wedge cleanup permanently (the caller logs a WARNING and
+        retries every 50s forever) and grow ``event_buffer`` without bound.
+        Losing one row from an inflow aggregate is a rounding error; losing the
+        only pruning path is an outage.
+
+        The RETURNING cursor is drained through a bounded
+        ``fetchmany(_CLEANUP_FETCH_CHUNK)`` loop rather than a single
+        ``fetchall()``, which keeps peak memory at O(chunk + distinct hour
+        buckets) instead of O(rows deleted).  Measured on CPython 3.13 /
+        aiosqlite 0.22.1 / SQLite 3.50.4 with N = 1,000,000 drained rows
+        folding into 3,336 hour buckets: ``fetchall()`` (the prior shape)
+        took 1 round-trip for a 281 MB tracemalloc peak and +505 MB max RSS
+        over baseline; ``async for`` at aiosqlite's driver-default
+        ``iter_chunk_size=64`` took 15,626 round-trips for a 1.0 MB peak and
+        flat RSS; ``fetchmany(10_000)`` (this method) takes 101 round-trips
+        for a 6.5 MB peak and flat RSS.  ``fetchmany(10_000)`` wins on
+        memory — eliminating the 505 MB spike a single ``fetchall()`` holds
+        under the writer lock — and on round-trips (155x fewer than
+        ``async for``'s default), and is never slower than ``fetchall()``.
+        It is NOT a speedup: run-to-run wall clock spread was 7.5-15.0s
+        across all three shapes, swamping any between-shape difference,
+        because per-row ``sqlite3.Row`` construction and the dict fold
+        dominate, not driver round-trips.  10_000 is the knee of a
+        chunk-size sweep at N=200,000 (1_000 -> 0.7 MB / 201 round-trips,
+        10_000 -> 5.7 MB / 21, 50_000 -> 27.8 MB / 5): each step past it
+        buys back progressively less memory per extra round-trip.  These
+        numbers are host- and version-pinned — re-measure rather than trust
+        them if the driver, SQLite version, or row shape changes materially.
+
+        A connection-wide ``iter_chunk_size`` on ``connect_daemon`` plus
+        ``async for`` was considered and rejected: it is a shared knob that
+        would silently affect every ``async for row in cursor`` on that
+        connection, present and future, and the bound would live hundreds of
+        lines from the code whose comment explains it.
+
+        Correction to the assumption this method was originally written
+        under: abandoning a ``DELETE ... RETURNING`` cursor early does NOT
+        leave the delete unmodified.  Measured on SQLite 3.50.4: consuming
+        100 of 1,000 RETURNING rows, exiting the cursor, and committing
+        still deleted all 1,000 rows — SQLite runs the DML to completion and
+        stages RETURNING output before emitting the first row.  So the
+        reason to consume the cursor to completion is NOT that the DELETE
+        would otherwise be left half-done; it is that an early exit silently
+        under-counts and under-rolls-up while the rows are already gone,
+        permanently breaking the "never both and never neither" guarantee
+        above with unrecoverable inflow loss.  This is a SQLite
+        implementation detail, not a documented guarantee — re-verify it if
+        the pinned version ever moves.
+
+        Returns:
+            The number of rows deleted — counted from the RETURNING output, so
+            it stays exact regardless of how the driver reports ``rowcount``
+            for a returning statement.
+        """
         cutoff = datetime.fromtimestamp(
             datetime.now(UTC).timestamp() - max_age_seconds,
             tz=UTC,
         ).isoformat()
-        async with self._txn() as db:
-            cursor = await db.execute(
+        counts: dict[tuple[str, str, str], int] = {}
+        deleted_count = 0
+        async with self._require_access().write() as db:
+            async with db.execute(
                 """DELETE FROM event_buffer
                    WHERE status = 'drained'
                      AND timestamp < ?
                      AND project_id NOT IN (
                          SELECT project_id FROM reconciliation_locks
-                     )""",
+                     )
+                   RETURNING project_id, timestamp, event_type""",
                 (cutoff,),
-            )
-            rowcount = cursor.rowcount
-        return rowcount
+            ) as cursor:
+                while True:
+                    # list() bounds at _CLEANUP_FETCH_CHUNK: fetchmany() is
+                    # typed Iterable[Row] like fetchall(), so len() needs a
+                    # Sized (61ae0ee799).
+                    chunk = list(await cursor.fetchmany(_CLEANUP_FETCH_CHUNK))
+                    if not chunk:
+                        break
+                    deleted_count += len(chunk)
+                    for row in chunk:
+                        # Bucket by PARSING, never by a SQL comparison against a
+                        # datetime('now') literal — see throughput's METHOD NOTE:
+                        # event_buffer.timestamp carries an offset and is
+                        # 'T'-separated, so string-comparing it against SQLite's
+                        # space-separated render collapses a whole day into one bucket.
+                        try:
+                            bucket = utc_hour_bucket(row['timestamp'])
+                        except ValueError as exc:
+                            logger.warning(
+                                'event_buffer.rollup_unparseable_timestamp',
+                                extra={
+                                    'project_id': row['project_id'],
+                                    'event_type': row['event_type'],
+                                    'timestamp': row['timestamp'],
+                                    'error': str(exc),
+                                },
+                            )
+                            continue
+                        key = (row['project_id'], bucket, row['event_type'])
+                        counts[key] = counts.get(key, 0) + 1
+
+            if counts:
+                await db.executemany(
+                    """INSERT INTO event_arrival_hourly
+                           (project_id, hour_bucket, event_type, event_count)
+                       VALUES (?, ?, ?, ?)
+                       ON CONFLICT(project_id, hour_bucket, event_type)
+                       DO UPDATE SET event_count = event_count + excluded.event_count""",
+                    [(pid, bucket, etype, n) for (pid, bucket, etype), n in counts.items()],
+                )
+
+        return deleted_count
 
     async def request_trigger(self, project_id: str) -> None:
         """Manually request a reconciliation trigger for a project.
@@ -1144,18 +1409,9 @@ class EventBuffer:
 
     async def close(self) -> None:
         """Close the database connection."""
-        if self._db:
-            with contextlib.suppress(Exception):
-                await self._db.execute('PRAGMA wal_checkpoint(TRUNCATE)')
-            await self._db.close()
-            self._db = None
+        if self._access is not None:
+            await self._access.close()
+            self._access = None
 
-    async def checkpoint(self) -> tuple[int, int, int]:
-        """``PRAGMA wal_checkpoint(TRUNCATE)`` → ``(busy, log, checkpointed)``."""
-        if self._db is None:
-            return (-1, -1, -1)
-        cursor = await self._db.execute('PRAGMA wal_checkpoint(TRUNCATE)')
-        row = await cursor.fetchone()
-        if row is None:
-            return (-1, -1, -1)
-        return int(row[0]), int(row[1]), int(row[2])
+    async def checkpoint(self) -> CheckpointResult:
+        return await AtomicConnection.checkpoint_or_unavailable(self._access)

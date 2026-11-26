@@ -20,9 +20,12 @@ dark-factory-shared = { workspace = true }
 
 [tool.pyright]
 include = ["src", "tests"]
-extraPaths = ["src", "../shared/src"]
+# ".." LAST (mirrors tests/conftest.py's sys.path.append): resolves the repo-root
+# df_pytest_isolation module without letting project dirs shadow their own src/.
+extraPaths = ["src", "../shared/src", ".."]
 pythonVersion = "3.11"
 typeCheckingMode = "basic"
+reportUnnecessaryTypeIgnoreComment = "error"
 venvPath = ".."
 venv = ".venv"
 
@@ -33,13 +36,40 @@ line-length = 100
 select = ["E", "F", "UP", "B", "SIM", "I"]
 ignore = ["E501"]
 
+# NOT an enforced gate — style config only: it shapes an ad-hoc or editor-on-save
+# `ruff format` into a repo-consistent single-quoted diff. Do not delete as unused,
+# do not promote to a gate. Why, and the measurements: CONTRIBUTING.md section 3;
+# both directions guarded by tests/scripts/test_ruff_format_policy.py (task 3441).
 [tool.ruff.format]
 quote-style = "single"
 indent-style = "space"
 docstring-code-format = true
 
 [tool.pytest.ini_options]
+markers = [
+    "defect(ref): this test reproduces the declared defect <ref>; the binding is read statically by shared/src/shared/defect_enumerator.py (plans/defect-tests-prd.md decision 8). Not deselected by default.",
+    "criterion(id): this test evidences acceptance criterion <id> (plans/client-feed-prd.md §7.7). Not deselected by default.",
+    "timing(reason): a deadline, grace period or timeout is the behaviour under test, named by reason=; the timing-dependence lint (fused-memory/scripts/_timing_dependence.py) accepts a real sleep, an elapsed-vs-literal assert or a literal wait deadline only under it. Not deselected by default.",
+]
 asyncio_mode = "auto"
+# Default per-test timeout. This entry CLOSES A TOTAL-ABSENCE GAP rather than
+# updating a stale value: until task 5442 this config declared neither key, so
+# this suite ran uncapped even though pytest-timeout was already a dev
+# dependency — the plugin was installed and inert.
+# `signal` — but NOT because this suite is serial, which it is not. It declares
+# no addopts and so no `-n` of its own, and that used to be given as the reason;
+# verify.py::_with_pytest_numprocesses_str falsifies it by appending
+# `-n <verify_admission_pytest_n>` ("8") to every pytest leg at the gated roles.
+# dark-factory-orchestrator.yaml records the MEASURED render of THIS module's
+# command as `cd sampler && uv run pytest ... -n 8 tests/`.
+# The choice is the same one, on the same evidence, as every other config here:
+# signal measured green under xdist (task 5408). The signal-vs-thread trade is
+# not reopened here; it lives once, in
+# tests/scripts/test_timeout_method_policy.py.
+# Value provenance: plans/pytest-per-test-timeout-measurement-2026-09-17.md.
+# Rationale for the setting: shared/pyproject.toml. Neither is restated here.
+timeout = 420
+timeout_method = "signal"
 
 [dependency-groups]
 dev = [
@@ -47,5 +77,7 @@ dev = [
     "pytest>=8.0.0",
     "pytest-asyncio>=0.21.0",
     "pytest-timeout>=2.4.0",
+    # verify's injected -n; see tests/scripts/test_merge_gate_parallelism_config.py::RULED_SERIAL_MEMBERS
+    "pytest-xdist>=3.6.0",
     "ruff>=0.7.1",
 ]

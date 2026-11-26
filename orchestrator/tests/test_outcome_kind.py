@@ -2,12 +2,12 @@
 
 Task 2165: ``OutcomeKind(StrEnum)`` is the enumerated contract for the
 ``data['outcome']`` values emitted by ``_emit_merge_attempt`` (merge_queue.py).
-These tests pin: the exact 22-member vocabulary, str-compatibility (existing
+These tests pin: the exact 24-member vocabulary, str-compatibility (existing
 ``==``/``in``/json comparisons must keep working unchanged), the
 ``is_terminal`` classification, byte-identical payloads through the real
 ``EventStore`` emit chokepoint, and the non-terminal set as a frozen contract
-(mirrored by the dashboard's ``_ACTIVE_ONLY`` allowlist — see
-plans/dashboard-alignment-prd.md).
+(stated at ``orchestrator/src/orchestrator/merge_lane/types.py::_NON_TERMINAL_OUTCOMES``)
+and its scripts/ mirror.
 """
 
 from __future__ import annotations
@@ -17,12 +17,13 @@ import sqlite3
 from pathlib import Path
 
 import pytest
+from _scripts_loader import load_script
 
 from orchestrator.event_store import EventStore
-from orchestrator.merge_queue import _emit_merge_attempt
-from orchestrator.merge_types import OutcomeKind
+from orchestrator.merge_lane.types import OutcomeKind
+from orchestrator.merge_lane.worker import _emit_merge_attempt
 
-# The exact 22-member vocabulary emitted through _emit_merge_attempt (see its
+# The exact 24-member vocabulary emitted through _emit_merge_attempt (see its
 # docstring at merge_queue.py:1363 and plans/dashboard-alignment-prd.md).
 # 'blocked' is intentionally excluded: bare-infrastructure 'blocked' outcomes
 # are documented as NOT emitted by _emit_merge_attempt.
@@ -33,6 +34,13 @@ _EXPECTED_VALUES = {
     'train_partial_flip', 'cas_exhausted', 'main_health_red',
     'post_merge_equivalence_failed', 'post_merge_pyright_broken',
     'plan_files_not_touched', 'plan_files_narrowed', 'plan_files_cross_repo',
+    # Task 3539 — the already-landed carve-out.  TERMINAL, exactly like its
+    # sibling `plan_files_cross_repo`: both name a branch that is legitimately
+    # EMPTY, so there is nothing left for a retry to do.
+    'plan_files_already_landed',
+    # Task 3918 — a not-touched verdict that measured nothing; terminal like
+    # `plan_files_already_landed`.
+    'plan_files_unmeasured',
     'cas_retry', 'gate_retry', 'post_merge_generation_chained',
 }
 
@@ -44,7 +52,7 @@ _NON_TERMINAL_VALUES = {
 
 
 class TestOutcomeKindVocabulary:
-    """The enum's value set is exactly the 22-member _emit_merge_attempt vocabulary."""
+    """The enum's value set is exactly the 24-member _emit_merge_attempt vocabulary."""
 
     def test_value_set_is_exact(self) -> None:
         assert {m.value for m in OutcomeKind} == _EXPECTED_VALUES
@@ -80,16 +88,31 @@ class TestOutcomeKindIsTerminal:
 
     def test_terminal_members_are_terminal(self) -> None:
         terminal_values = _EXPECTED_VALUES - _NON_TERMINAL_VALUES
-        assert len(terminal_values) == 18
+        assert len(terminal_values) == 20
         for value in terminal_values:
             member = OutcomeKind(value)
             assert member.is_terminal is True, f'{member!r} should be terminal'
 
+    def test_plan_files_already_landed_is_terminal(self) -> None:
+        """Task 3539's already-landed outcome is TERMINAL for the same reason
+        its sibling ``plan_files_cross_repo`` is: both name a branch that is
+        legitimately EMPTY, so there is nothing a retry could add.  Keeping it
+        OUT of the non-terminal frozen set is what classifies an already-landed
+        attempt as finished rather than still live."""
+        from orchestrator.merge_lane.types import _NON_TERMINAL_OUTCOMES
+
+        assert OutcomeKind.plan_files_already_landed.is_terminal is True
+        assert (
+            OutcomeKind.plan_files_already_landed not in _NON_TERMINAL_OUTCOMES
+        )
+
+    def test_plan_files_unmeasured_is_terminal(self) -> None:
+        assert OutcomeKind.plan_files_unmeasured.is_terminal is True
+
     def test_plan_files_cross_repo_is_terminal(self) -> None:
         """The new cross-repo outcome is TERMINAL (ends the merge attempt) and
-        stays OUT of the non-terminal frozen set, so the dashboard
-        ``_ACTIVE_ONLY`` mirror + ``TestOutcomeKindFrozenContract`` are
-        unaffected."""
+        stays OUT of the non-terminal frozen set, so the frozen contract pinned
+        by ``TestOutcomeKindFrozenContract`` is unaffected."""
         assert OutcomeKind('plan_files_cross_repo').is_terminal is True
         assert 'plan_files_cross_repo' not in _NON_TERMINAL_VALUES
 
@@ -123,19 +146,30 @@ class TestOutcomeKindPayloadIdentity:
 
 
 class TestOutcomeKindFrozenContract:
-    """Pins the non-terminal set as a frozen contract.
+    """Pins the non-terminal set as a frozen contract, and its scripts/ mirror to it.
 
-    Changing this set REQUIRES updating
-    dashboard/src/dashboard/data/merge_queue.py's ``_ACTIVE_ONLY`` allowlist
-    in the SAME change — the dashboard mirrors this set with no orchestrator
-    import, so nothing on the dashboard side will fail automatically if this
-    set changes without a matching dashboard edit. This test is the drift
-    tripwire.
+    The set decides which merge_attempt outcomes mean the attempt or merge is
+    still live; the contract lives at
+    ``orchestrator/src/orchestrator/merge_lane/types.py::_NON_TERMINAL_OUTCOMES``.
+    ``test_non_terminal_set_is_frozen`` pins it against this file's literal.
+    ``scripts/merge_lane_throughput.py::NON_TERMINAL_OUTCOMES`` keeps it as
+    literal strings because scripts/ must import without orchestrator;
+    ``test_merge_lane_throughput_mirror_matches`` loads that script by path and
+    compares its copy to ``OutcomeKind.is_terminal``.
     """
 
     def test_non_terminal_set_is_frozen(self) -> None:
         non_terminal = {m for m in OutcomeKind if not m.is_terminal}
         assert non_terminal == {OutcomeKind(v) for v in _NON_TERMINAL_VALUES}
+
+    def test_merge_lane_throughput_mirror_matches(self) -> None:
+        script = load_script('merge_lane_throughput.py', '_merge_lane_throughput_outcome_mirror')
+        expected = {m.value for m in OutcomeKind if not m.is_terminal}
+        assert expected == script.NON_TERMINAL_OUTCOMES, (
+            'scripts/merge_lane_throughput.py::NON_TERMINAL_OUTCOMES has drifted from '
+            'orchestrator/src/orchestrator/merge_lane/types.py::_NON_TERMINAL_OUTCOMES: '
+            f'mirror={sorted(script.NON_TERMINAL_OUTCOMES)} canonical={sorted(expected)}'
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -144,7 +178,7 @@ class TestOutcomeKindFrozenContract:
 # ---------------------------------------------------------------------------
 
 _SRC_DIR = Path(__file__).parent.parent / 'src' / 'orchestrator'
-_CALL_SITE_FILES = ['merge_queue.py', 'merge_gates.py', 'workflow.py']
+_CALL_SITE_FILES = ['merge_lane/worker.py', 'merge_lane/gates.py', 'workflow.py']
 
 
 def _is_outcome_kind_attribute(node: ast.expr) -> bool:

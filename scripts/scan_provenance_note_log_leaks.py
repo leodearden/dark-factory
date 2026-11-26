@@ -2,12 +2,13 @@
 """Detect leaked server-log lines in a task's ``metadata.done_provenance.note``.
 
 READ-ONLY / DETECTION-ONLY: this module and its CLI never mutate task data.
-Every database connection it opens is a read-only SQLite URI
-(``sqlite3.connect(f"file:{path}?mode=ro", uri=True)``), so the sweep is
-structurally incapable of the auto-mutation this tool is explicitly forbidden
-from doing. Remediation of any match it finds is a separate, manual,
-individually-reviewed follow-up (matching the safe-vs-irreversible handling
-already applied to tasks 2080 and 2865) — never bulk-edited by this script.
+Every database connection it opens goes through
+``shared/src/shared/tasks_db_readonly.py::connect_ro``, a read-only SQLite URI
+(``mode=ro``), so the sweep is structurally incapable of the auto-mutation this
+tool is explicitly forbidden from doing. Remediation of any match it finds is a
+separate, manual, individually-reviewed follow-up (matching the
+safe-vs-irreversible handling already applied to tasks 2080 and 2865) — never
+bulk-edited by this script.
 
 Background (task 3286): ``DeterministicRunner._run_predicate`` stamped a
 predicate check's raw stdout tail straight into ``done_provenance.note``.
@@ -48,8 +49,8 @@ would therefore appear mid-line. See the comment on ``LOG_LINE_LEAK``.
 Known blind spot, shared with the writer it guards: a log line under a
 ``%(name)s %(message)s``-style formatter (no timestamp, no level token) is
 matched by neither this discriminator nor
-``deterministic_runner._LOG_LINE_RE``, so such a line can reach a note and go
-unreported here. Detecting it would require naming logger substrings, which
+``orchestrator/src/orchestrator/predicate_output.py::_LOG_LINE_RE``, so such a
+line can reach a note and go unreported here. Detecting it would require naming logger substrings, which
 is precisely the over-reporting failure above. The writer's cap bounds the
 exposure to one ≤400-char line; a predicate script wanting a guaranteed-clean
 note should emit its verdict as trailing JSON.
@@ -58,12 +59,19 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import re
-import sqlite3
 import sys
-from pathlib import Path
 from typing import NamedTuple
+
+from _task_db_scan import (
+    SCAN_EXIT_CODE_EPILOG,
+    add_db_discovery_args,
+    format_json,
+    group_matches_by_db,
+    run_scan_cli,
+    truncate,
+)
+from shared.tasks_db_readonly import connect_ro
 
 # A real log line: ISO date+time (with optional ,milliseconds), then a
 # whitespace-separated logger-name field, then a standalone level token.
@@ -116,11 +124,10 @@ class NoteLeakMatch(NamedTuple):
 def scan_db(db_path: str) -> list[NoteLeakMatch]:
     """Scan *db_path* read-only for leaked log lines in done_provenance notes.
 
-    Opens the database via a read-only SQLite URI (``mode=ro``) so the scan is
-    structurally incapable of mutating live task data — even while the
-    fused-memory server holds the same file open in WAL mode for concurrent
-    writers. This matters concretely here: task 2902's note is a preserved
-    forensic specimen, and this tool must be unable to touch it.
+    Opens through ``shared/src/shared/tasks_db_readonly.py::connect_ro``
+    (read-only; see there for refusals). The read-only open matters concretely
+    here: task 2902's note is a preserved forensic specimen, and this tool must
+    be unable to touch it.
 
     Every row shape is tolerated: metadata that is NULL, undecodable, or a
     JSON scalar/array rather than an object, and a ``done_provenance`` that is
@@ -128,7 +135,7 @@ def scan_db(db_path: str) -> list[NoteLeakMatch]:
     among thousands of rows must never abort a sweep.
     """
     matches: list[NoteLeakMatch] = []
-    conn = sqlite3.connect(f'file:{db_path}?mode=ro', uri=True)
+    conn = connect_ro(db_path)
     try:
         for tag, task_id, metadata in conn.execute(
             'SELECT tag, id, metadata FROM tasks'
@@ -153,45 +160,6 @@ def scan_db(db_path: str) -> list[NoteLeakMatch]:
     return matches
 
 
-# Multi-project discovery fallback, mirroring scan_task_toolcall_leaks.py's.
-_DEFAULT_PROJECT_ROOTS = ('/home/leo/src/dark-factory',)
-
-
-def _tasks_db_path(project_root: str) -> str:
-    return str(Path(project_root) / '.taskmaster' / 'tasks' / 'tasks.db')
-
-
-def discover_db_paths(
-    explicit_dbs: list[str] | None = None,
-    project_roots: list[str] | None = None,
-    env: dict[str, str] | None = None,
-) -> list[str]:
-    """Resolve the list of tasks.db paths to scan.
-
-    Precedence (first supplied wins): *explicit_dbs* > *project_roots* >
-    ``DASHBOARD_KNOWN_PROJECT_ROOTS`` (read from *env*, defaulting to the real
-    ``os.environ`` when *env* is None) > the dark-factory default root.
-
-    A resolved db path that does not exist on disk is silently skipped — this
-    never raises on a missing/not-yet-set-up project.
-    """
-    if explicit_dbs is not None:
-        candidates = list(explicit_dbs)
-    else:
-        if project_roots is not None:
-            roots = list(project_roots)
-        else:
-            environ = env if env is not None else os.environ
-            roots_env = (environ.get('DASHBOARD_KNOWN_PROJECT_ROOTS') or '').strip()
-            if roots_env:
-                roots = [r.strip() for r in roots_env.split(',') if r.strip()]
-            else:
-                roots = list(_DEFAULT_PROJECT_ROOTS)
-        candidates = [_tasks_db_path(root) for root in roots]
-
-    return [path for path in candidates if os.path.exists(path)]
-
-
 _DEFAULT_MAX_LINE_LEN = 100
 
 
@@ -208,17 +176,11 @@ def format_report(
     if not matches:
         return 'no leaked log lines found in done_provenance notes'
 
-    by_db: dict[str, list[NoteLeakMatch]] = {}
-    for m in matches:
-        by_db.setdefault(m.db_path, []).append(m)
-
     lines: list[str] = []
-    for db_path in sorted(by_db):
+    for db_path, db_matches in group_matches_by_db(matches).items():
         lines.append(f'{db_path}:')
-        for m in by_db[db_path]:
-            leak_line = m.leak_line
-            if len(leak_line) > max_line_len:
-                leak_line = leak_line[:max_line_len] + '...'
+        for m in db_matches:
+            leak_line = truncate(m.leak_line, max_line_len)
             lines.append(
                 f'  task_id={m.task_id} tag={m.tag} '
                 f'provenance_kind={m.provenance_kind} leak_line={leak_line!r}'
@@ -227,11 +189,6 @@ def format_report(
     distinct_tasks = {(m.db_path, m.tag, m.task_id) for m in matches}
     lines.append(f'{len(matches)} leaked notes across {len(distinct_tasks)} tasks')
     return '\n'.join(lines)
-
-
-def format_json(matches: list[NoteLeakMatch]) -> str:
-    """Render *matches* as a JSON array, carrying the FULL untruncated line."""
-    return json.dumps([m._asdict() for m in matches])
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -243,21 +200,18 @@ def _build_parser() -> argparse.ArgumentParser:
             "check's raw stdout tail). Detection/reporting only -- never "
             'mutates task data.'
         ),
+        # The 0/1/2/3 codes are RETURNED BY run_scan_cli() in _task_db_scan.py,
+        # not by anything in this file -- SCAN_EXIT_CODE_EPILOG (defined there,
+        # beside NO_DB_RESOLVED_MESSAGE) is just a --help-visible copy of that
+        # contract, shared with scan_task_toolcall_leaks.py so the two
+        # scanners' epilogs cannot drift apart (task 3744, follow-up to 3547).
+        # main()'s docstring below restates the same numbers in its own prose,
+        # and nothing keeps the two in lockstep -- change them together.
+        epilog=SCAN_EXIT_CODE_EPILOG,
     )
-    parser.add_argument(
-        '--db', dest='dbs', action='append',
-        help='Explicit tasks.db path to scan. May be repeated.',
-    )
-    parser.add_argument(
-        '--project-root', dest='project_roots', action='append',
-        help=(
-            'Project root to scan (maps to <root>/.taskmaster/tasks/tasks.db). '
-            'May be repeated.'
-        ),
-    )
-    parser.add_argument(
-        '--json', action='store_true',
-        help='Emit a JSON array (full untruncated leak lines) instead of a report.',
+    add_db_discovery_args(
+        parser,
+        json_help='Emit a JSON array (full untruncated leak lines) instead of a report.',
     )
     parser.add_argument(
         '--max-line-len', type=int, default=_DEFAULT_MAX_LINE_LEN,
@@ -272,46 +226,29 @@ def main(argv: list[str] | None = None) -> int:
 
     Exit codes: 0 = clean, 1 = at least one leak found, 2 = no tasks.db could
     be resolved from --db / --project-root / DASHBOARD_KNOWN_PROJECT_ROOTS /
-    the dark-factory default.
+    the dark-factory default, 3 = every resolved tasks.db was unreadable, so
+    NOTHING was scanned (never treat 3 as a clean run).
 
     A single unreadable database (e.g. a stale/corrupt file, or a transient
     "database is locked"/"file is not a database" condition) does not abort
     the sweep: it is logged to stderr and skipped so every other resolvable
-    database is still scanned and reported.
+    database is still scanned and reported. That warn-and-continue skip is
+    exit 0/1 on the readable remainder — it is only when ALL of them fail,
+    leaving nothing scanned at all, that the run is exit 3.
+
+    On exit 3 stdout STILL looks clean: the report is printed before the exit
+    code is decided, so --json emits an empty ``[]`` and the plain report emits
+    its ordinary "nothing found" line. A consumer that reads only stdout cannot
+    tell a total failure from a clean sweep — branch on the exit code.
     """
-    args = _build_parser().parse_args(argv)
+    def _render(matches: list[NoteLeakMatch], args: argparse.Namespace) -> str:
+        if args.json:
+            return format_json(matches)
+        return format_report(matches, max_line_len=args.max_line_len)
 
-    db_paths = discover_db_paths(explicit_dbs=args.dbs, project_roots=args.project_roots)
-    if not db_paths:
-        print(
-            'no tasks.db resolvable (checked --db / --project-root / '
-            'DASHBOARD_KNOWN_PROJECT_ROOTS / the dark-factory default)',
-            file=sys.stderr,
-        )
-        return 2
-
-    matches: list[NoteLeakMatch] = []
-    unreadable: list[str] = []
-    for db_path in db_paths:
-        try:
-            matches.extend(scan_db(db_path))
-        except sqlite3.Error as exc:
-            print(f'warning: skipping unreadable database {db_path}: {exc}', file=sys.stderr)
-            unreadable.append(db_path)
-
-    if unreadable:
-        print(
-            f'warning: {len(unreadable)} database(s) skipped due to read errors '
-            '(see warnings above); results below are incomplete',
-            file=sys.stderr,
-        )
-
-    if args.json:
-        print(format_json(matches))
-    else:
-        print(format_report(matches, max_line_len=args.max_line_len))
-
-    return 1 if matches else 0
+    return run_scan_cli(
+        argv, parser=_build_parser(), scan_fn=scan_db, render=_render
+    )
 
 
 if __name__ == '__main__':

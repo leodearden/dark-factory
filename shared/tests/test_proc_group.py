@@ -7,50 +7,163 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import errno
 import logging
 import os
+import re
 import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+from typing import NamedTuple, cast
 
 import pytest
+from _synthetic_proc import synthetic_stat_line
 
+import shared.proc_group as proc_group_module
 from shared.proc_group import (
+    MalformedStatLine,
+    ProcessGroupMember,
+    SigkillDispatch,
+    StatFields,
+    cpu_ticks_under_path,
+    parse_start_ticks,
+    pid_running,
+    process_group_members,
+    process_group_terminated,
+    read_cpu_ticks,
+    read_session_id,
+    read_stat_fields,
     reap_process_groups,
     scan_process_groups_under_path,
+    sigkill_process_group,
     snapshot_process_group,
     terminate_process_group,
+    unified_cgroup_path,
 )
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 
-async def _pgid_gone_within(pgid: int, timeout: float = 5.0, step: float = 0.1) -> bool:
-    """Poll until a process group is fully reaped by the kernel.
+async def _await_group_membership(
+    pgid: int,
+    *,
+    total: int,
+    comm: str,
+    comm_count: int,
+    # Must-not-hang guard, not a latency SLA — the same 5.0s budget as
+    # _await_group_terminated below.
+    timeout: float = 5.0,
+    # A single snapshot_process_group walk (all of /proc: stat/wchan/comm/
+    # cmdline per pid) measured median 448ms idle / 911ms loaded, p95
+    # ~2.4-2.6s, max 3.95s on a 32-core host (task 3347). A deadline-only
+    # bound could therefore admit just ONE attempt on a slower or larger-
+    # /proc host, silently degrading back into the single-observation race
+    # this helper exists to remove. The attempt floor makes the guarantee
+    # independent of walk cost, at zero cost in the happy path (1 attempt
+    # sufficed in ~97% of measured runs).
+    min_attempts: int = 3,
+    step: float = 0.05,
+) -> str:
+    """Poll snapshot_process_group(pgid) until it reaches an expected shape.
 
-    After terminate_process_group reaps the bash leader, any grandchild
-    processes are reparented to the user's ``systemd --user`` subreaper
-    (or pid 1) and become zombies until that subreaper waitpids them.
-    Until that happens, ``os.killpg(pgid, 0)`` still returns 0 rather
-    than raising ProcessLookupError.  Observed subreaper latency is
-    0–500 ms in isolation but stretches under 32-worker xdist load.
-    The default 5 s budget is comfortably longer than any observed reap
-    latency; a genuine leak (regression) causes the caller's assert to
-    fire.
+    A readiness line observed via ``_await_shell_ready`` proves only that
+    bash's ``fork()`` calls for a background job returned in the PARENT —
+    not that the child has finished ``execve()`` into its target binary.
+    Between fork and exec a child still reports the parent's comm/cmdline
+    (e.g. ``comm=sh`` instead of ``comm=sleep``), so judging group
+    membership from a single post-readiness snapshot races the fork->exec
+    window: measured at a 4.5% hit rate over 200 idle iterations on a
+    32-core host (task 3347 review round 2). This helper absorbs that
+    window by polling for the full expected shape instead of trusting a
+    single observation.
 
-    PermissionError (EPERM): in the theoretically possible (though
-    practically negligible) case where the kernel recycles *pgid* to a
-    process owned by another user during the poll window,
-    ``os.killpg(pgid, 0)`` raises EPERM rather than ESRCH.  Both mean
-    "no longer our group to worry about", so EPERM is treated as success.
-    This cannot mask a genuine leak: EPERM only fires once the pgid has
-    been assigned to a different user's process, at which point the group
-    we spawned is definitively gone.
+    Bounded by BOTH *timeout* (wall-clock) AND *min_attempts* — exhaustion
+    requires both to be exceeded, whichever is more generous. *timeout*
+    defaults to 5.0s, the same budget as ``_await_group_terminated``.
+    *min_attempts* defaults to 3 because a
+    single ``snapshot_process_group`` walk measured median 448ms idle /
+    911ms loaded, p95 ~2.4-2.6s, max 3.95s — a deadline-only bound could
+    admit just ONE attempt on a slower or larger-/proc host, silently
+    degrading back into the single-observation race this helper exists to
+    remove. This is a must-not-hang guard, not a latency SLA: measured 0
+    convergence failures in 180 runs (60 idle + 120 loaded) with these
+    defaults, attempts actually needed maxing at 4.
+
+    Returns the converged snapshot (str) once the group contains exactly
+    *total* processes, of which exactly *comm_count* have ``comm={comm}``.
+
+    Raises ``_GroupMembershipTimeout`` (never a bare TimeoutError, never a
+    silent return) if that shape is never reached. The deadline is only
+    ever checked after a completed attempt, so a slow /proc walk alone can
+    never produce a zero-retry failure. The message reports
+    expected-vs-observed for both clauses separately (naming which was
+    unmet), the attempt count, elapsed time, and the last snapshot
+    verbatim.
     """
-    iterations = max(1, int(timeout / step))
-    for _ in range(iterations):
-        try:
-            os.killpg(pgid, 0)
-        except (ProcessLookupError, PermissionError):
-            return True
+    started = asyncio.get_running_loop().time()
+    attempts = 0
+    while True:
+        snapshot = snapshot_process_group(pgid)
+        rows = [
+            line for line in snapshot.splitlines()
+            if re.match(r'^\s*pid=', line)
+        ]
+        matching = [row for row in rows if f'comm={comm}' in row]
+        attempts += 1
+        if len(rows) == total and len(matching) == comm_count:
+            return snapshot
+
+        elapsed = asyncio.get_running_loop().time() - started
+        if attempts >= min_attempts and elapsed >= timeout:
+            unmet = []
+            if len(rows) != total:
+                unmet.append(f'total (expected {total}, observed {len(rows)})')
+            if len(matching) != comm_count:
+                unmet.append(
+                    f'comm={comm!r} count (expected {comm_count}, '
+                    f'observed {len(matching)})'
+                )
+            raise _GroupMembershipTimeout(
+                f'group {pgid} did not reach the expected shape after '
+                f'{attempts} attempt(s) / {elapsed:.3f}s elapsed (timeout='
+                f'{timeout}s, min_attempts={min_attempts}) — unmet: '
+                f'{"; ".join(unmet)}. total processes: expected {total}, '
+                f'observed {len(rows)}. comm={comm!r} processes: expected '
+                f'{comm_count}, observed {len(matching)}. last snapshot:\n'
+                f'{snapshot}'
+            )
         await asyncio.sleep(step)
-    return False
+
+
+async def _await_group_terminated(
+    pgid: int,
+    *,
+    timeout: float = 5.0,
+    min_attempts: int = 3,
+    step: float = 0.05,
+) -> None:
+    """Poll until every member of group *pgid* has terminated.
+
+    A zombie awaiting its subreaper's reap counts as terminated (see
+    ``shared.proc_group.ProcessGroupMember.terminated``).  Bounded like
+    ``_await_group_membership``, by BOTH *timeout* and *min_attempts*, since
+    one /proc walk can take seconds on a loaded host; raises
+    ``_GroupTerminationTimeout`` on exhaustion.
+    """
+    started = asyncio.get_running_loop().time()
+    attempts = 0
+    while True:
+        attempts += 1
+        if process_group_terminated(pgid):
+            return
+        elapsed = asyncio.get_running_loop().time() - started
+        if attempts >= min_attempts and elapsed >= timeout:
+            running = tuple(m for m in process_group_members(pgid) if not m.terminated)
+            raise _GroupTerminationTimeout(pgid, running, attempts, elapsed)
+        await asyncio.sleep(step)
 
 
 async def _spawn_sleeper_in(cwd) -> asyncio.subprocess.Process:
@@ -84,8 +197,106 @@ def _kill_group(pgid: int) -> None:
         os.killpg(pgid, signal.SIGKILL)
 
 
-class _TrapReadinessError(AssertionError):
-    """The SIGTERM-trap readiness precondition was not observed.
+def _sigkill_running_members(pgid: int) -> None:
+    """Best-effort SIGKILL, by pid, of each running member of group *pgid* (test cleanup).
+
+    For a group whose leader may already be reaped, where ``_kill_group``'s
+    precondition does not hold: only pids seen in the group are signalled.
+    """
+    for member in process_group_members(pgid):
+        if not member.terminated:
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(member.pid, signal.SIGKILL)
+
+
+class _KillpgCall(NamedTuple):
+    target: int
+    sig: int
+    at: float
+
+
+def _record_killpg(monkeypatch: pytest.MonkeyPatch) -> list[_KillpgCall]:
+    """Record every ``os.killpg`` call in this process, then forward it to the real one.
+
+    The patch target resolves to the ``os`` module itself, so it replaces
+    ``os.killpg`` process-wide: calls from the test's own helpers are
+    recorded alongside ``shared.proc_group``'s. Each call is stamped with
+    ``time.monotonic()`` before it is forwarded. The returned list is live:
+    it keeps growing until *monkeypatch* undoes the patch, so snapshot it
+    before any later call that probes with killpg.
+    """
+    real = os.killpg
+    calls: list[_KillpgCall] = []
+
+    def recording(target: int, sig: int) -> None:
+        calls.append(_KillpgCall(target, sig, time.monotonic()))
+        real(target, sig)
+
+    monkeypatch.setattr('shared.proc_group.os.killpg', recording)
+    return calls
+
+
+def _assert_sigterm_then_sigkill(
+    dispatched: tuple[_KillpgCall, ...], pgid: int, grace_secs: float
+) -> tuple[_KillpgCall, _KillpgCall]:
+    """Assert *dispatched* is one SIGTERM of group *pgid*, then one SIGKILL at least *grace_secs* later.
+
+    Returns the ``(sigterm, sigkill)`` calls so a caller can bound the legs further.
+    """
+    assert [(c.target, c.sig) for c in dispatched] == [
+        (pgid, signal.SIGTERM),
+        (pgid, signal.SIGKILL),
+    ], f'expected one SIGTERM then one SIGKILL of group {pgid}; killpg calls: {dispatched}'
+    sigterm, sigkill = dispatched
+    assert sigkill.at - sigterm.at >= grace_secs, (
+        f'the SIGTERM leg was cut short: SIGKILL came '
+        f'{sigkill.at - sigterm.at:.2f}s after SIGTERM, for grace {grace_secs}s'
+    )
+    return sigterm, sigkill
+
+
+@pytest.fixture
+def unreaped_zombie_pgid():
+    """Yield the pgid of a one-member group whose only member is an unreaped zombie.
+
+    ``waitid(..., WNOWAIT)`` blocks until the SIGKILLed child has terminated
+    without reaping it, and this process stays its parent until teardown, so
+    the group provably still exists (and its pgid cannot be recycled) for the
+    whole test.
+    """
+    p = subprocess.Popen(
+        ['sleep', '30'],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    try:
+        os.kill(p.pid, signal.SIGKILL)
+        os.waitid(os.P_PID, p.pid, os.WEXITED | os.WNOWAIT)
+        yield p.pid
+    finally:
+        p.wait()
+
+
+#: ``python -c`` source that renames its own process to the undecodable comm
+#: ``b'\xff\xfe'`` (prctl PR_SET_NAME), prints ``ready``, then sleeps.
+_UNDECODABLE_COMM_SLEEPER = (
+    'import ctypes, time\n'
+    "ctypes.CDLL(None).prctl(15, b'\\xff\\xfe', 0, 0, 0)\n"
+    "print('ready', flush=True)\n"
+    'time.sleep(30)\n'
+)
+
+#: ``python -c`` source that prints ``ready`` from its own code, then sleeps.
+_READY_SLEEPER = (
+    'import time\n'
+    "print('ready', flush=True)\n"
+    'time.sleep(30)\n'
+)
+
+
+class _ShellReadinessError(AssertionError):
+    """An announced-readiness precondition was not observed.
 
     Subclasses AssertionError so an unmet precondition surfaces as a
     test FAILURE (never a bare TimeoutError, never a silent return).
@@ -95,41 +306,96 @@ class _TrapReadinessError(AssertionError):
     """
 
 
-class _TrapReadinessTimeout(_TrapReadinessError):
+class _ShellReadinessTimeout(_ShellReadinessError):
     """No readiness line arrived within the bounded deadline."""
 
 
-class _TrapReadinessEOF(_TrapReadinessError):
+class _ShellReadinessEOF(_ShellReadinessError):
     """The child closed stdout before announcing readiness (early exit)."""
 
 
-async def _await_trap_installed(
+class _GroupMembershipTimeout(AssertionError):
+    """A process group did not reach an expected membership shape in time.
+
+    Subclasses AssertionError — like the _ShellReadinessError family above
+    — so an unmet precondition surfaces as a test FAILURE, never a bare
+    TimeoutError and never a silent return. One class, not a hierarchy:
+    there is genuinely only one failure mode here (the poll exhausted its
+    budget). As with _ShellReadinessError, the concrete TYPE is the
+    contract; the message stays free to carry the full last-observed
+    snapshot for diagnosis.
+    """
+
+
+class _GroupTerminationTimeout(AssertionError):
+    """A process group still had a running member when the poll ran out.
+
+    Subclasses AssertionError, like _GroupMembershipTimeout, so exhaustion is
+    a test FAILURE, never a bare TimeoutError and never a silent return.  The
+    concrete TYPE and the structured ``running`` members are the contract;
+    the message stays free to change.
+    """
+
+    def __init__(
+        self,
+        pgid: int,
+        running: tuple[ProcessGroupMember, ...],
+        attempts: int,
+        elapsed: float,
+    ) -> None:
+        self.running = running
+        budget = f'after {attempts} attempt(s) / {elapsed:.3f}s'
+        if running:
+            members = '; '.join(
+                f'pid={m.pid} ppid={m.ppid} state={m.state} comm={m.comm}' for m in running
+            )
+            message = f'group {pgid} still had running member(s) {budget}: {members}'
+        else:
+            message = (
+                f'group {pgid} was never concluded terminated {budget}: killpg '
+                f'still saw the group but /proc showed no running member'
+            )
+        super().__init__(message)
+
+
+async def _await_shell_ready(
     proc: asyncio.subprocess.Process,
     *,
+    what: str = 'the precondition',
     # Must-not-hang guard, not a latency SLA — see task 3337 for the
     # measured headroom and the derivation of this value.
     timeout: float = 10.0,
 ) -> None:
-    """Wait for a shell child to announce that its SIGTERM trap is armed.
+    """Wait for a shell child to announce a readiness precondition via stdout.
 
-    Callers spawn a shell whose command starts with ``trap '' TERM; echo
-    ready; ...``.  Bash only reaches the ``echo`` once the preceding `trap`
-    builtin has returned, so observing the ``ready`` line on stdout is a
-    happens-before edge proving SIGTERM's disposition is already SIG_IGN in
-    the kernel — not a wall-clock guess about how long installation takes
-    (the fixed ``asyncio.sleep(0.2)`` this helper replaces was exactly such
-    a guess, and it starved under CPU oversubscription).  See task 3337 for
-    the measurement backing this claim (readiness latency and a direct
-    ``/proc/<pid>/status`` SigIgn check at the instant "ready" arrives).
+    Callers spawn a shell whose command ends each preceding step with
+    ``echo ready`` before continuing (e.g. ``trap '' TERM; echo ready;
+    sleep 30``, or ``sleep 60 & sleep 60 & echo ready; wait``).  Bash only
+    reaches the ``echo`` once every preceding builtin/job-control step has
+    completed, so observing the ``ready`` line on stdout is a happens-before
+    edge proving whatever precondition it was placed after (SIGTERM already
+    SIG_IGN, both background jobs already forked, ...) has already happened
+    in the kernel — not a wall-clock guess about how long that step takes
+    (the fixed ``asyncio.sleep(0.2)`` this helper replaces in each caller was
+    exactly such a guess, and it starved under CPU oversubscription).
+
+    *what* is a short caller-supplied description of the precondition being
+    awaited (e.g. ``'SIGTERM trap installed'``, ``'both background jobs
+    forked'``), interpolated into the raised message so each caller still
+    gets a specific diagnostic even though the helper itself is agnostic to
+    which precondition it's waiting on.  See task 3337 for the measurement
+    backing the SIGTERM-trap case (readiness latency and a direct
+    ``/proc/<pid>/status`` SigIgn check at the instant "ready" arrives) and
+    task 3347 for the grandchild-fork case.
 
     Raises (never a bare ``TimeoutError``, and never returns normally) if
     the precondition is not observed:
-    - ``_TrapReadinessTimeout`` — the deadline elapsed with no line.
-    - ``_TrapReadinessEOF`` — the child closed stdout (EOF) first, e.g. it
+    - ``_ShellReadinessTimeout`` — the deadline elapsed with no line.
+    - ``_ShellReadinessEOF`` — the child closed stdout (EOF) first, e.g. it
       exited before reaching the ``echo``, which would otherwise look
       identical to "line not yet available" and let a naive caller mistake
-      early-exit for a successfully armed trap.
-    - ``_TrapReadinessError`` — a line arrived but wasn't ``ready`` (compared
+      early-exit for a successfully observed precondition.
+    - ``_ShellReadinessError`` — a line arrived but wasn't ``ready`` (compared
       after stripping surrounding whitespace).
 
     All three subclass ``AssertionError``; the concrete subclass is the
@@ -140,20 +406,20 @@ async def _await_trap_installed(
     try:
         line = await asyncio.wait_for(proc.stdout.readline(), timeout)
     except TimeoutError:
-        raise _TrapReadinessTimeout(
-            f'shell pid={proc.pid} never announced "ready" within {timeout}s '
-            f'(returncode={proc.returncode}) — the SIGTERM trap was never '
-            f'confirmed installed, so escalation cannot be tested'
+        raise _ShellReadinessTimeout(
+            f'shell pid={proc.pid} never announced readiness within '
+            f'{timeout}s (returncode={proc.returncode}) — {what!r} was '
+            f'never confirmed'
         ) from None
     if not line:
-        raise _TrapReadinessEOF(
+        raise _ShellReadinessEOF(
             f'shell pid={proc.pid} closed stdout (EOF) after '
             f'{asyncio.get_running_loop().time() - started:.3f}s without '
-            f'announcing "ready" (returncode={proc.returncode}) — it exited '
-            f'before installing the SIGTERM trap'
+            f'announcing readiness (returncode={proc.returncode}) — it '
+            f'exited before confirming {what!r}'
         )
     if line.strip() != b'ready':
-        raise _TrapReadinessError(
+        raise _ShellReadinessError(
             f'shell pid={proc.pid} announced {line!r}, expected "ready" '
             f'(compared after stripping surrounding whitespace)'
         )
@@ -161,8 +427,8 @@ async def _await_trap_installed(
 
 @pytest.mark.asyncio
 @pytest.mark.timeout(30)
-async def test_await_trap_installed_fails_loudly_when_readiness_never_arrives():
-    """_await_trap_installed never silently returns and never lets a bare
+async def test_await_shell_ready_fails_loudly_when_readiness_never_arrives():
+    """_await_shell_ready never silently returns and never lets a bare
     TimeoutError escape when the readiness precondition is unmet — it must
     raise instead.  This pins the no-silent-fail-soft contract so a future
     starvation can't quietly regress this helper back into the racy
@@ -174,15 +440,15 @@ async def test_await_trap_installed_fails_loudly_when_readiness_never_arrives():
     "disclosed"):
 
     (a) the shell never announces readiness — readline() blocks until the
-        bounded deadline.  Must raise _TrapReadinessTimeout — never a bare
+        bounded deadline.  Must raise _ShellReadinessTimeout — never a bare
         TimeoutError, and never a normal return.
     (b) the shell exits immediately without announcing — readline() hits
         EOF (returns b'') right away, well inside the deadline, which a
         naive implementation would treat as success.  Must raise
-        _TrapReadinessEOF, a type distinct from (a)'s, so EOF can never be
+        _ShellReadinessEOF, a type distinct from (a)'s, so EOF can never be
         silently reclassified as — or fall through to — a deadline expiry.
     (c) the shell announces something other than "ready" — must raise the
-        base _TrapReadinessError and NEITHER subclass, so a wrong-content
+        base _ShellReadinessError and NEITHER subclass, so a wrong-content
         line can't be misreported as a timeout or an EOF.
 
     All three are AssertionError subclasses, which each sub-case confirms
@@ -198,8 +464,8 @@ async def test_await_trap_installed_fails_loudly_when_readiness_never_arrives():
         start_new_session=True,
     )
     try:
-        with pytest.raises(_TrapReadinessTimeout) as excinfo:
-            await _await_trap_installed(proc, timeout=0.3)
+        with pytest.raises(_ShellReadinessTimeout) as excinfo:
+            await _await_shell_ready(proc, timeout=0.3)
         assert isinstance(excinfo.value, AssertionError)
     finally:
         if proc.returncode is None:
@@ -217,13 +483,13 @@ async def test_await_trap_installed_fails_loudly_when_readiness_never_arrives():
     try:
         # The discrimination this sub-case buys — EOF detected as EOF
         # immediately, not swallowed and re-surfaced later as a deadline
-        # expiry (which would raise _TrapReadinessTimeout and fail this
+        # expiry (which would raise _ShellReadinessTimeout and fail this
         # assertion) — holds for any non-expiring deadline; it doesn't
         # pin a specific number.  Use the helper's own default rather
         # than a tuned value so this test carries no wall-clock
         # assumption of its own.
-        with pytest.raises(_TrapReadinessEOF) as excinfo2:
-            await _await_trap_installed(proc2)
+        with pytest.raises(_ShellReadinessEOF) as excinfo2:
+            await _await_shell_ready(proc2)
         assert isinstance(excinfo2.value, AssertionError)
     finally:
         # `true` has already exited: reap it rather than killpg-ing a pid
@@ -244,14 +510,14 @@ async def test_await_trap_installed_fails_loudly_when_readiness_never_arrives():
         start_new_session=True,
     )
     try:
-        with pytest.raises(_TrapReadinessError) as excinfo3:
-            await _await_trap_installed(proc3)
-        # Exact-type, not isinstance: _TrapReadinessTimeout and
-        # _TrapReadinessEOF are themselves _TrapReadinessError, so
+        with pytest.raises(_ShellReadinessError) as excinfo3:
+            await _await_shell_ready(proc3)
+        # Exact-type, not isinstance: _ShellReadinessTimeout and
+        # _ShellReadinessEOF are themselves _ShellReadinessError, so
         # isinstance alone wouldn't prove THIS branch fired rather than
         # one of the other two.
-        assert type(excinfo3.value) is _TrapReadinessError, (
-            f'expected the base _TrapReadinessError (not a subclass), got '
+        assert type(excinfo3.value) is _ShellReadinessError, (
+            f'expected the base _ShellReadinessError (not a subclass), got '
             f'{type(excinfo3.value).__name__}'
         )
     finally:
@@ -259,6 +525,154 @@ async def test_await_trap_installed_fails_loudly_when_readiness_never_arrives():
             _kill_group(proc3.pid)
         with contextlib.suppress(Exception):
             await proc3.wait()
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(45)
+async def test_await_group_membership_polls_through_fork_exec_window():
+    """_await_group_membership polls for the full expected group shape rather
+    than judging on a single snapshot, and fails loudly (never a bare
+    TimeoutError, never a silent return) when that shape can never be
+    reached.
+
+    Direct meta-test for the (not-yet-existing) polling helper, following
+    the precedent test_await_shell_ready_fails_loudly_when_readiness_never_
+    arrives sets in this file for unit-testing a private helper's contract
+    on its own rather than only indirectly through the grandchild test that
+    consumes it.
+
+    Rationale: `_await_shell_ready`'s "ready" line proves only that bash's
+    fork() calls for a background job RETURNED IN THE PARENT — not that the
+    child has finished execve() into its target binary. Between fork and
+    exec a child still reports the parent's comm/cmdline, so judging group
+    membership from a single post-ready snapshot races the fork->exec
+    window (task 3347 review round 2, confirmed empirically: ~4.5% hit rate
+    over 200 idle iterations). `_await_group_membership` absorbs that
+    window by polling for the full expected shape, bounded by both a
+    wall-clock deadline and a minimum attempt count.
+
+    Each sub-case spawns its own shell with start_new_session=True,
+    consumes the ready line via the existing `_await_shell_ready`, and
+    cleans up in try/finally with `_kill_group` + `await proc.wait()` — the
+    same cleanup shape the prior review round required of the grandchild
+    test.
+
+    (a) CONVERGES LATE — 'echo ready; sleep 0.3; sleep 60 & sleep 60 &
+        wait'. The foreground `sleep 0.3` runs to completion BEFORE either
+        background `sleep 60` is even forked, so the group is deliberately
+        NOT yet in the expected shape at the ready line — the helper must
+        poll rather than judge on a single observation. Validated 30/30
+        idle and 30/30 under 128-spinner load on a 32-core host, needing
+        2-4 attempts and at most 2.67s. This cannot false-positive on the
+        transient foreground `sleep 0.3` (which also has comm=sleep): it is
+        reaped before the shell forks the two `sleep 60`s, so the group
+        never presents 3 rows with 2 sleeps until the real grandchildren
+        exist. Asserts the call returns normally and the returned snapshot
+        contains exactly 2 comm=sleep rows.
+
+    (b) NEVER CONVERGES — 'echo ready; sleep 60', a group that can never
+        reach 3 rows / 2 sleeps. Called with a deliberately small budget
+        (timeout=0.2, min_attempts=2) so this sub-case stays fast. Asserts
+        it raises `_GroupMembershipTimeout` — an AssertionError subclass,
+        so an unmet precondition can only ever surface as a test FAILURE,
+        never a bare TimeoutError and never a silent return — with a
+        message embedding the last snapshot (a `pid=` row) and both
+        observed counts. Validated 30/30 idle and loaded, max 4.05s
+        (dominated by /proc walk cost, not the deadline).
+
+    This test must fail first: `_await_group_membership` and
+    `_GroupMembershipTimeout` do not exist until the next step lands, so
+    name resolution fails until then.
+    """
+    # (a) Converges late: NOT in the expected shape at the ready line — the
+    # helper must poll through the fork->exec window rather than judge on
+    # a single snapshot.
+    proc = await asyncio.create_subprocess_shell(
+        'echo ready; sleep 0.3; sleep 60 & sleep 60 & wait',
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        start_new_session=True,
+    )
+    pgid = proc.pid
+    try:
+        await _await_shell_ready(proc, what='readiness line printed')
+        snapshot = await _await_group_membership(
+            pgid, total=3, comm='sleep', comm_count=2,
+        )
+        sleep_rows = [
+            line for line in snapshot.splitlines() if 'comm=sleep' in line
+        ]
+        assert len(sleep_rows) == 2, (
+            f'expected exactly 2 comm=sleep rows in the returned snapshot '
+            f'once _await_group_membership converged:\n{snapshot}'
+        )
+    finally:
+        if proc.returncode is None:
+            _kill_group(pgid)
+        with contextlib.suppress(Exception):
+            await proc.wait()
+
+    # (b) Never converges: the group can never reach 3 rows / 2 sleeps, so
+    # the helper must exhaust its (deliberately small) budget and raise
+    # rather than hang or silently return.
+    proc2 = await asyncio.create_subprocess_shell(
+        'echo ready; sleep 60',
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        start_new_session=True,
+    )
+    pgid2 = proc2.pid
+    try:
+        await _await_shell_ready(proc2, what='readiness line printed')
+        with pytest.raises(_GroupMembershipTimeout) as excinfo:
+            await _await_group_membership(
+                pgid2, total=3, comm='sleep', comm_count=2,
+                timeout=0.2, min_attempts=2,
+            )
+        assert isinstance(excinfo.value, AssertionError)
+        message = str(excinfo.value)
+        assert 'pid=' in message, (
+            f'expected the last snapshot (a pid= row) embedded in the '
+            f'exhaustion message, got: {message}'
+        )
+        assert 'expected 3' in message and 'expected 2' in message, (
+            f'expected both observed counts (total vs expected 3, comm '
+            f'count vs expected 2) embedded in the exhaustion message, '
+            f'got: {message}'
+        )
+    finally:
+        if proc2.returncode is None:
+            _kill_group(pgid2)
+        with contextlib.suppress(Exception):
+            await proc2.wait()
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(30)
+async def test_await_group_terminated_accepts_unreaped_zombies_and_fails_loudly_on_a_live_member(
+    unreaped_zombie_pgid, tmp_path
+):
+    """_await_group_terminated concludes on termination, never on anyone's reap.
+
+    (a) It returns while the zombie group still exists (killpg succeeds
+    afterwards): the state on which the killpg-based probe it replaces timed
+    out, red in task 6024's merge verify while systemd --user stalled.
+    (b) A running member exhausts the budget and raises the typed failure,
+    carrying the running members as data.
+    """
+    await _await_group_terminated(unreaped_zombie_pgid)
+    os.killpg(unreaped_zombie_pgid, 0)
+
+    proc = await _spawn_sleeper_in(tmp_path)
+    pgid = proc.pid
+    try:
+        with pytest.raises(_GroupTerminationTimeout) as excinfo:
+            await _await_group_terminated(pgid, timeout=0.2, min_attempts=2)
+        assert isinstance(excinfo.value, AssertionError)
+        assert [m.pid for m in excinfo.value.running] == [pgid]
+    finally:
+        _kill_group(pgid)
+        await proc.wait()
 
 
 class TestTerminateProcessGroup:
@@ -272,8 +686,10 @@ class TestTerminateProcessGroup:
         Spawn bash with start_new_session=True so it leads its own process
         group. After terminate_process_group returns:
         - proc.returncode must be set (process reaped)
-        - os.killpg(pgid, 0) must eventually raise ProcessLookupError once
-          the kernel reaps any reparented grandchild zombies (bounded 5 s poll)
+        - every member of the group must have terminated; a zombie still
+          awaiting its reparented reap by systemd --user counts as
+          terminated, because that reap is not terminate_process_group's to
+          perform
         """
         proc = await asyncio.create_subprocess_shell(
             'sleep 30',
@@ -288,19 +704,18 @@ class TestTerminateProcessGroup:
         assert proc.returncode is not None, (
             f'Process group {pgid} not reaped: proc.returncode is None'
         )
-        assert await _pgid_gone_within(pgid), (
-            f'Process group {pgid} was not fully reaped within 5 s — '
-            f'kernel zombie-reap race or genuine leak.'
-        )
+        await _await_group_terminated(pgid)
 
     @pytest.mark.asyncio
     @pytest.mark.timeout(30)
-    async def test_terminate_process_group_escalates_to_sigkill(self):
-        """When the child ignores SIGTERM, SIGKILL fires after grace_secs.
+    async def test_terminate_process_group_escalates_to_sigkill(self, monkeypatch):
+        """A group that ignores SIGTERM is SIGKILLed once the grace is spent.
 
-        bash traps SIGTERM (ignores it) so the SIGTERM leg times out, then
-        SIGKILL should kill the group. proc.returncode == -9 (SIGKILL).
+        The leader dies of that SIGKILL. Its reap is awaited rather than read
+        at return, because terminate_process_group bounds its SIGKILL leg by
+        grace_secs too.
         """
+        grace_secs = 0.5
         proc = await asyncio.create_subprocess_shell(
             "trap '' TERM; echo ready; sleep 30",
             stdout=asyncio.subprocess.PIPE,
@@ -308,48 +723,202 @@ class TestTerminateProcessGroup:
             start_new_session=True,
         )
         pgid = proc.pid
+        try:
+            # The "ready" line is a happens-before edge proving SIGTERM is
+            # already SIG_IGN before we signal (task 3337 de-flake).
+            await _await_shell_ready(proc, what='SIGTERM trap installed')
+            calls = _record_killpg(monkeypatch)
 
-        # The "ready" line is a happens-before edge proving `trap '' TERM`
-        # has already returned — i.e. SIGTERM's disposition is SIG_IGN
-        # before we signal — rather than a wall-clock assumption that a
-        # fixed sleep was long enough (task 3337 de-flake).
-        await _await_trap_installed(proc)
+            await terminate_process_group(proc, pgid, grace_secs=grace_secs)
 
-        await terminate_process_group(proc, pgid, grace_secs=0.5)
-
-        assert proc.returncode is not None, (
-            'Process was not killed even after SIGKILL escalation'
-        )
-        assert proc.returncode == -signal.SIGKILL, (
-            f'Expected returncode -9 (SIGKILL), got {proc.returncode}'
-        )
+            _assert_sigterm_then_sigkill(tuple(calls), pgid, grace_secs)
+            await proc.wait()
+            assert proc.returncode == -signal.SIGKILL, (
+                f'the leader must die of the SIGKILL, got {proc.returncode}'
+            )
+        finally:
+            _sigkill_running_members(pgid)
+            await proc.wait()
 
     @pytest.mark.asyncio
-    @pytest.mark.timeout(15)
+    @pytest.mark.timeout(60)
     async def test_terminate_process_group_reaps_grandchildren(self):
         """terminate_process_group kills grandchildren (bash → sleep sleep).
 
         Reproduces the canonical cargo → rustc incident shape: bash spawns two
         background sleeps and waits for them.  After terminate_process_group,
-        pgrep must report no processes in the group.
+        every member of the group must have terminated.
         """
         proc = await asyncio.create_subprocess_shell(
-            'sleep 60 & sleep 60 & wait',
+            'sleep 60 & sleep 60 & echo ready; wait',
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             start_new_session=True,
         )
         pgid = proc.pid
 
-        # Brief settle so grandchildren actually start.
-        await asyncio.sleep(0.2)
+        try:
+            # The "ready" line is a happens-before edge proving both background
+            # `sleep`s have already been forked (bash only reaches the `echo`
+            # after both `&` jobs are launched) — rather than a wall-clock
+            # assumption that a fixed sleep was long enough (task 3347
+            # de-flake; the fixed 0.2s settle it replaces did not fail loudly
+            # when too short — it silently degraded this test to vacuous
+            # instead).
+            await _await_shell_ready(proc, what='both background jobs forked')
 
-        await terminate_process_group(proc, pgid, grace_secs=5.0)
+            # Assert the precondition directly — bash + 2 sleep children must
+            # actually be in the group before we terminate it — so this test
+            # fails loudly rather than silently passing vacuously if that
+            # ever regresses.  `total == 3` IS proven by the readiness edge
+            # above: fork membership is inherited at fork (non-interactive
+            # sh means no job control and no setpgid), observed true on the
+            # first snapshot in 730/730 measured runs.  The 2 comm=sleep
+            # children are only EVENTUALLY true — between fork and exec a
+            # child still reports comm=sh, so _await_group_membership polls
+            # to absorb exactly that fork->exec window (task 3347 review
+            # round 2).  Do not weaken this to `>= 1 sleep`: the
+            # sleep-children clause is what actually proves grandchildren
+            # exist to be reaped, which is the anti-vacuity point of this
+            # test.
+            await _await_group_membership(pgid, total=3, comm='sleep', comm_count=2)
 
-        assert await _pgid_gone_within(pgid), (
-            f'Process group {pgid} was not fully reaped within 5 s — '
-            f'grandchildren leaked.'
+            await terminate_process_group(proc, pgid, grace_secs=5.0)
+        finally:
+            if proc.returncode is None:
+                _kill_group(pgid)
+            with contextlib.suppress(Exception):
+                await proc.wait()
+
+        await _await_group_terminated(pgid)
+
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(30)
+    @pytest.mark.parametrize(
+        'survivor_cmd',
+        [
+            pytest.param(
+                "(trap '' TERM; echo ready; exec sleep 30) & wait",
+                id='survivor_holds_the_pipe',
+            ),
+            pytest.param(
+                "(trap '' TERM; echo ready; exec sleep 30 >/dev/null 2>&1) & wait",
+                id='survivor_released_the_pipe',
+            ),
+        ],
+    )
+    async def test_a_member_that_ignores_sigterm_is_sigkilled_after_the_leader_exits(
+        self, monkeypatch, survivor_cmd
+    ):
+        """The escalation follows the group, not the leader.
+
+        A survivor holding the stdout pipe keeps ``proc.wait()`` pending past
+        the grace; one that released it lets ``proc.wait()`` return at once.
+        Either way the SIGTERM leg spends one grace, and the SIGKILL leg ends
+        as soon as the group is dead rather than spending a second one.
+        Each leg is timed from its own killpg, because the /proc walks around
+        the end of the grace cost a load-dependent amount.
+        """
+        grace_secs = 5.0
+        proc = await asyncio.create_subprocess_shell(
+            survivor_cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            start_new_session=True,
         )
+        pgid = proc.pid
+        try:
+            await _await_shell_ready(proc, what='survivor SIGTERM trap installed')
+            await _await_group_membership(pgid, total=2, comm='sleep', comm_count=1)
+            calls = _record_killpg(monkeypatch)
+
+            await terminate_process_group(proc, pgid, grace_secs=grace_secs)
+
+            returned_at = time.monotonic()
+            _, sigkill = _assert_sigterm_then_sigkill(tuple(calls), pgid, grace_secs)
+            assert returned_at - sigkill.at < grace_secs, (
+                f'the SIGKILL leg spent its own grace instead of ending once the group was '
+                f'dead: {returned_at - sigkill.at:.2f}s after SIGKILL, for grace {grace_secs}s'
+            )
+            assert proc.returncode == -signal.SIGTERM, (
+                f'the leader must die of the SIGTERM itself, got {proc.returncode}'
+            )
+            await _await_group_terminated(pgid)
+        finally:
+            _sigkill_running_members(pgid)
+            await proc.wait()
+
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(60)
+    async def test_a_group_that_dies_on_sigterm_gets_no_sigkill_and_no_grace_wait(
+        self, monkeypatch
+    ):
+        proc = await asyncio.create_subprocess_shell(
+            'sleep 60 & sleep 60 & echo ready; wait',
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            start_new_session=True,
+        )
+        pgid = proc.pid
+        try:
+            await _await_shell_ready(proc, what='both background jobs forked')
+            await _await_group_membership(pgid, total=3, comm='sleep', comm_count=2)
+            calls = _record_killpg(monkeypatch)
+            loop = asyncio.get_running_loop()
+            started = loop.time()
+
+            await terminate_process_group(proc, pgid, grace_secs=30.0)
+
+            elapsed = loop.time() - started
+            assert elapsed < 30.0, f'a group dead on SIGTERM cost the grace: {elapsed:.2f}s'
+            assert signal.SIGKILL not in [c.sig for c in calls], (
+                f'a group dead on SIGTERM must not be SIGKILLed; killpg calls: {calls}'
+            )
+            await _await_group_terminated(pgid)
+        finally:
+            _sigkill_running_members(pgid)
+            await proc.wait()
+
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(10)
+    @pytest.mark.parametrize(
+        ('states_by_pid_offset', 'expected_signals'),
+        [
+            pytest.param(
+                {1: 'S'},
+                [signal.SIGTERM, signal.SIGKILL],
+                id='a_running_survivor_pins_the_pgid',
+            ),
+            pytest.param({1: 'Z'}, [signal.SIGTERM], id='only_zombies_remain'),
+            pytest.param(
+                {0: 'S', 1: 'S'},
+                [signal.SIGTERM],
+                id='the_pgid_was_recycled_to_a_new_leader',
+            ),
+        ],
+    )
+    async def test_once_the_leader_is_reaped_only_a_running_survivor_that_pins_the_pgid_is_sigkilled(
+        self, tmp_path, monkeypatch, states_by_pid_offset, expected_signals
+    ):
+        """A live pid equal to the reaped leader's proves the number was recycled to a stranger."""
+        pgid = _pgid_no_guard_refuses()
+        proc_root = tmp_path / 'proc'
+        for offset, state in states_by_pid_offset.items():
+            entry = proc_root / str(pgid + offset)
+            entry.mkdir(parents=True)
+            (entry / 'stat').write_text(synthetic_stat_line(pgid + offset, pgid, state=state))
+        monkeypatch.setattr('shared.proc_group._PROC_ROOT', proc_root)
+        calls: list[tuple[int, int]] = []
+        monkeypatch.setattr(
+            'shared.proc_group.os.killpg', lambda target, sig: calls.append((target, sig))
+        )
+        fake = _ReapedOnWaitProc(pid=pgid)
+
+        await terminate_process_group(
+            cast(asyncio.subprocess.Process, fake), pgid, grace_secs=0.2
+        )
+
+        assert calls == [(pgid, sig) for sig in expected_signals]
 
     @pytest.mark.asyncio
     @pytest.mark.timeout(10)
@@ -507,6 +1076,137 @@ class TestTerminateProcessGroup:
         assert calls == []
 
 
+class _KillRecordingProc:
+    """A fake live proc handle whose ``kill()`` records that it was called."""
+
+    returncode = None
+
+    def __init__(self, pid: int) -> None:
+        self.pid = pid
+        self.killed = False
+
+    def kill(self) -> None:
+        self.killed = True
+
+
+class _ReapedOnWaitProc:
+    """A fake leader handle, live until ``wait()`` reaps it as dead of SIGTERM."""
+
+    def __init__(self, pid: int) -> None:
+        self.pid = pid
+        self.returncode: int | None = None
+
+    async def wait(self) -> int:
+        self.returncode = -signal.SIGTERM
+        return self.returncode
+
+
+def _pgid_no_guard_refuses() -> int:
+    """A stand-in pgid distinct from this process's pid, parent pid and own group."""
+    live = {os.getpid(), os.getppid(), os.getpgrp()}
+    candidate = 12345
+    while candidate in live:
+        candidate += 1
+    return candidate
+
+
+class TestSigkillProcessGroup:
+    """sigkill_process_group: an immediate, signal-only SIGKILL of a frozen pgid."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(60)
+    async def test_sigkills_the_whole_group_including_grandchildren(self):
+        proc = await asyncio.create_subprocess_shell(
+            'sleep 60 & sleep 60 & echo ready; wait',
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            start_new_session=True,
+        )
+        pgid = proc.pid
+
+        try:
+            # Same anti-vacuity arrange as
+            # test_terminate_process_group_reaps_grandchildren: the grandchildren
+            # must provably exist before the kill.
+            await _await_shell_ready(proc, what='both background jobs forked')
+            await _await_group_membership(pgid, total=3, comm='sleep', comm_count=2)
+
+            dispatch = sigkill_process_group(proc, pgid)
+
+            await proc.wait()
+            assert dispatch is SigkillDispatch.GROUP_KILLED
+            assert proc.returncode == -signal.SIGKILL, (
+                f'expected an immediate SIGKILL (-9), got {proc.returncode}'
+            )
+        finally:
+            if proc.returncode is None:
+                _kill_group(pgid)
+            with contextlib.suppress(Exception):
+                await proc.wait()
+
+        await _await_group_terminated(pgid)
+
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(10)
+    async def test_dispatches_nothing_once_the_leader_is_reaped(self, monkeypatch):
+        """A reaped leader's pid may be recycled: refusing a stranger beats reaping an orphan."""
+        proc = await asyncio.create_subprocess_shell(
+            'true',
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            start_new_session=True,
+        )
+        pgid = proc.pid
+        await proc.wait()
+
+        calls: list[tuple[int, int]] = []
+        monkeypatch.setattr(
+            'shared.proc_group.os.killpg', lambda pgid, sig: calls.append((pgid, sig))
+        )
+
+        dispatch = sigkill_process_group(proc, pgid)
+
+        assert dispatch is SigkillDispatch.NOT_SIGNALLED
+        assert calls == [], f'killpg must not fire on a reaped leader; got {calls}'
+
+    @pytest.mark.timeout(5)
+    def test_unsafe_pgid_is_refused_and_degrades_to_a_direct_kill(self, monkeypatch, caplog):
+        pgid = _pgid_no_guard_refuses()
+        calls: list[tuple[int, int]] = []
+        monkeypatch.setattr(
+            'shared.proc_group.os.killpg', lambda target, sig: calls.append((target, sig))
+        )
+        fake = _KillRecordingProc(pid=pgid + 1)
+
+        with caplog.at_level(logging.ERROR, logger='shared.proc_group'):
+            dispatch = sigkill_process_group(cast(asyncio.subprocess.Process, fake), pgid)
+
+        assert dispatch is SigkillDispatch.DIRECT_KILLED
+        assert calls == [], f'killpg should be refused; got {calls}'
+        assert fake.killed, 'a refused group kill must still kill the direct child'
+        assert any(
+            'refusing to killpg' in rec.message.lower() for rec in caplog.records
+        ), f'expected a refusal log record, got {[r.message for r in caplog.records]}'
+
+    @pytest.mark.timeout(5)
+    def test_killpg_failure_degrades_to_a_direct_kill(self, monkeypatch):
+        pgid = _pgid_no_guard_refuses()
+        calls: list[tuple[int, int]] = []
+
+        def failing_killpg(target: int, sig: int) -> None:
+            calls.append((target, sig))
+            raise ProcessLookupError(errno.ESRCH, 'no such process group')
+
+        monkeypatch.setattr('shared.proc_group.os.killpg', failing_killpg)
+        fake = _KillRecordingProc(pid=pgid)
+
+        dispatch = sigkill_process_group(cast(asyncio.subprocess.Process, fake), pgid)
+
+        assert dispatch is SigkillDispatch.DIRECT_KILLED
+        assert calls == [(pgid, signal.SIGKILL)]
+        assert fake.killed, 'a failed group kill must still kill the direct child'
+
+
 class TestSnapshotProcessGroup:
     """Tests for snapshot_process_group(pgid) — /proc-based process-group snapshot.
 
@@ -616,166 +1316,103 @@ class TestSnapshotProcessGroup:
         )
 
     def test_stat_line_with_comm_containing_spaces_and_parens(self, monkeypatch, tmp_path):
-        """stat-line parser handles comm names with spaces and nested parens.
+        """The snapshot takes comm, state, ppid and pgrp from one stat parse.
 
-        The kernel's /proc/<pid>/stat format wraps the comm field in parens:
+        The kernel's /proc/<pid>/stat wraps comm in parens:
             "pid (comm with spaces (and parens)) state ppid pgrp ..."
-        The parser uses rfind(')') to locate the end of comm, then reads the
-        remaining fields positionally.  This test locks in that offset logic
-        against a hand-crafted synthetic stat line.
+        so the parser must end comm at the LAST ``)``.  The fabricated pid has
+        no ``comm`` file, so the name in the row can only have come from stat.
         """
-        from pathlib import Path
-        from unittest.mock import patch
-
-        # Synthetic pgid we want to match
         target_pgid = 77777
-
-        # Build a synthetic /proc/<pid>/ tree under tmp_path
         fake_pid = 77778
-        pid_dir = tmp_path / str(fake_pid)
-        pid_dir.mkdir()
-
-        # Comm with embedded spaces and parens — the adversarial case
         comm_name = 'my weird (proc) name'
-        stat_content = (
-            f'{fake_pid} ({comm_name}) S '  # pid (comm) state
-            f'1 {target_pgid} {target_pgid} 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n'
-            # fields after state: ppid=1, pgrp=target_pgid, session=target_pgid, ...
+        proc_root = tmp_path / 'proc'
+        entry = proc_root / str(fake_pid)
+        entry.mkdir(parents=True)
+        (entry / 'stat').write_text(
+            synthetic_stat_line(fake_pid, target_pgid, comm=comm_name)
         )
-        (pid_dir / 'stat').write_text(stat_content)
-        (pid_dir / 'comm').write_text(comm_name + '\n')
-        (pid_dir / 'wchan').write_text('do_wait\n')
+        (entry / 'wchan').write_text('do_wait\n')
+        (proc_root / 'version').write_text('Linux 5.x')  # non-numeric, must be skipped
+        monkeypatch.setattr('shared.proc_group._PROC_ROOT', proc_root)
 
-        # Make a fake /proc directory that only has our synthetic pid entry plus
-        # some non-numeric entries (should be skipped by the implementation).
-        fake_proc = tmp_path / 'fake_proc'
-        fake_proc.mkdir()
-        # Symlink or recreate the pid subdir under fake_proc
-        import shutil
-        shutil.copytree(str(pid_dir), str(fake_proc / str(fake_pid)))
-        (fake_proc / 'version').write_text('Linux 5.x')  # non-numeric, must be skipped
+        rows = snapshot_process_group(target_pgid).splitlines()
 
-        from shared import proc_group as _pg
+        assert rows[1:] == [
+            f'  pid={fake_pid} ppid=1 state=S wchan=do_wait comm={comm_name} cmdline=?'
+        ], rows
 
-        original_exists = Path.exists
-
-        def patched_exists(self) -> bool:
-            if str(self) == '/proc':
-                return True
-            return original_exists(self)
-
-        with (
-            patch.object(Path, 'exists', patched_exists),
-            patch.object(_pg, '_snapshot_process_group_unsafe') as mock_unsafe,
-        ):
-            # Use the real _snapshot_process_group_unsafe but with a fake proc dir.
-            # Because monkeypatching iterdir on Path is fragile, call the internal
-            # function directly with a patched proc_dir reference instead.
-            mock_unsafe.side_effect = lambda pgid: _snapshot_impl_with_proc_dir(
-                pgid, fake_proc
-            )
-            result = snapshot_process_group(target_pgid)
-
-        assert isinstance(result, str)
-        assert result, f'Expected non-empty snapshot, got: {result!r}'
-        # The comm with spaces/parens must be present in the output
-        assert comm_name in result or str(fake_pid) in result, (
-            f'Expected comm {comm_name!r} or pid {fake_pid} in snapshot:\n{result}'
+    def test_an_undecodable_wchan_still_yields_the_row(self, monkeypatch, tmp_path):
+        """wchan is arbitrary bytes; they render as U+FFFD instead of losing the snapshot."""
+        target_pgid = 77777
+        fake_pid = 77778
+        proc_root = tmp_path / 'proc'
+        entry = proc_root / str(fake_pid)
+        entry.mkdir(parents=True)
+        (entry / 'stat').write_text(
+            synthetic_stat_line(fake_pid, target_pgid, comm='plain')
         )
+        (entry / 'wchan').write_bytes(b'\xff\xfe\n')
+        monkeypatch.setattr('shared.proc_group._PROC_ROOT', proc_root)
 
-    @pytest.mark.asyncio
+        rows = snapshot_process_group(target_pgid).splitlines()
+
+        assert rows[1:] == [
+            f'  pid={fake_pid} ppid=1 state=S wchan=�� comm=plain cmdline=?'
+        ], rows
+
+    def test_a_member_with_no_published_argv_reports_an_empty_cmdline_not_its_comm(
+        self, monkeypatch, tmp_path
+    ):
+        """An empty /proc/<pid>/cmdline means no argv is published (mid-exec or exiting).
+
+        The row must say so rather than repeat comm as if it were the argv.
+        """
+        target_pgid = 77777
+        fake_pid = 77778
+        proc_root = tmp_path / 'proc'
+        entry = proc_root / str(fake_pid)
+        entry.mkdir(parents=True)
+        (entry / 'stat').write_text(
+            synthetic_stat_line(fake_pid, target_pgid, state='R', comm='sleep')
+        )
+        (entry / 'wchan').write_text('0\n')
+        (entry / 'cmdline').write_bytes(b'')
+        monkeypatch.setattr('shared.proc_group._PROC_ROOT', proc_root)
+
+        rows = snapshot_process_group(target_pgid).splitlines()
+
+        assert rows[1:] == [
+            f'  pid={fake_pid} ppid=1 state=R wchan=0 comm=sleep cmdline=(empty)'
+        ], rows
+
     @pytest.mark.timeout(10)
-    async def test_snapshot_includes_cmdline(self, tmp_path):
+    def test_snapshot_includes_cmdline(self):
         """Snapshot includes the full cmdline of each process, not just the 15-char comm.
 
-        Spawn a child with a DISTINCTIVE argv token ('31.4159') that cannot
-        appear in the 15-char comm field (which is just 'sleep').  Assert that
-        the token appears in the snapshot — it can only come from
-        /proc/<pid>/cmdline, proving the new field is captured.
+        The token '31.4159' rides in the child's argv, so it can come only from
+        /proc/<pid>/cmdline, never from comm.  The spawn returning proves only that
+        exec passed its point of no return, with comm already renamed, not that the
+        argv is published; so the test waits for the child's own ready line first.
         """
-        proc = await asyncio.create_subprocess_exec(
-            'sleep', '31.4159',
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+        with subprocess.Popen(
+            [sys.executable, '-c', _READY_SLEEPER, '31.4159'],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
             start_new_session=True,
-        )
-        pgid = proc.pid
-        try:
-            snapshot = snapshot_process_group(pgid)
-            assert snapshot, f'Expected non-empty snapshot for pgid={pgid}'
-            assert '31.4159' in snapshot, (
-                f"Expected distinctive arg '31.4159' (from /proc/cmdline) in snapshot; "
-                f"got:\n{snapshot}"
-            )
-        finally:
-            proc.kill()
-            await proc.wait()
-
-
-def _snapshot_impl_with_proc_dir(pgid: int, proc_dir) -> str:
-    """Re-implementation of _snapshot_process_group_unsafe with an injectable proc_dir.
-
-    Used by the synthetic-stat-line test to point at a fake /proc tree built
-    under tmp_path.  Mirrors the real implementation exactly so the test locks
-    in the field-offset logic under the adversarial (spaces+parens in comm) case.
-    """
-    from pathlib import Path
-
-    if pgid <= 0:
-        return f'snapshot_process_group({pgid}): pgid <= 0 — no snapshot taken'
-
-    proc_dir = Path(proc_dir)
-    if not proc_dir.exists():
-        return f'snapshot_process_group({pgid}): /proc not available'
-
-    rows: list[str] = []
-    try:
-        entries = list(proc_dir.iterdir())
-    except OSError:
-        return f'snapshot_process_group({pgid}): could not list /proc'
-
-    for entry in entries:
-        if not entry.name.isdigit():
-            continue
-        pid = int(entry.name)
-
-        try:
-            stat_text = (entry / 'stat').read_text()
-        except OSError:
-            continue
-
-        try:
-            rparen = stat_text.rfind(')')
-            if rparen < 0:
-                continue
-            tail = stat_text[rparen + 2:]
-            fields = tail.split()
-            state = fields[0]
-            ppid = int(fields[1])
-            pgrp = int(fields[2])
-        except (IndexError, ValueError):
-            continue
-
-        if pgrp != pgid:
-            continue
-
-        try:
-            comm = (entry / 'comm').read_text().strip()
-        except OSError:
-            comm = '?'
-
-        try:
-            wchan = (entry / 'wchan').read_text().strip()
-        except OSError:
-            wchan = '?'
-
-        rows.append(f'  pid={pid} ppid={ppid} state={state} wchan={wchan} comm={comm}')
-
-    if not rows:
-        return f'snapshot_process_group({pgid}): no processes found in group'
-
-    header = f'snapshot_process_group({pgid}): {len(rows)} process(es) in group:'
-    return '\n'.join([header] + rows)
+        ) as p:
+            pgid = p.pid
+            try:
+                assert p.stdout is not None
+                assert p.stdout.readline().strip() == b'ready'
+                snapshot = snapshot_process_group(pgid)
+                assert snapshot, f'Expected non-empty snapshot for pgid={pgid}'
+                assert '31.4159' in snapshot, (
+                    f"Expected distinctive arg '31.4159' (from /proc/cmdline) in snapshot; "
+                    f"got:\n{snapshot}"
+                )
+            finally:
+                _kill_group(pgid)
 
 
 class TestScanProcessGroupsUnderPath:
@@ -785,6 +1422,11 @@ class TestScanProcessGroupsUnderPath:
     whose cwd / open fds / mmap'd paths fall at-or-under the ``_merge-verify``
     worktree of a *previous* orchestrator run.  Like snapshot_process_group it
     must never raise, even on vanished/permission-denied pids.
+
+    Every test here pays for a walk of the real /proc, whose cost scales with
+    the host's process count (task 4520). So each makes one walk and keeps
+    only what a fabricated /proc cannot show; the rest belongs in
+    :class:`TestScanProcessGroupsAgainstASyntheticProc`.
     """
 
     @pytest.mark.asyncio
@@ -833,22 +1475,124 @@ class TestScanProcessGroupsUnderPath:
     @pytest.mark.asyncio
     @pytest.mark.timeout(15)
     async def test_scan_respects_exclude_pgids(self, tmp_path):
-        """A pgid in *exclude_pgids* is dropped even when its cwd is under root.
+        """END TO END: a REAL pgid under root is dropped, its neighbour kept.
 
-        Also exercises the equality branch (cwd == root exactly).
+        ONE /proc walk, deliberately (task 4520). Each walk reads every live
+        pid on the host — 1100+ pids and 23.3 MB of ``maps`` when this was
+        measured — so its cost scales with the machine's process count and CPU
+        contention, and this was the only test in the class paying for that
+        twice. It is the file's slowest item against a 15s budget that (per
+        pytest-timeout's ``func_only=False``) also covers setup and teardown.
+        The bound is untouched; the WORK is halved.
+
+        TWO sleepers, ONE walk — and the second one is load-bearing, not
+        decoration. ``scan_process_groups_under_path`` wraps the entire walk in
+        a blanket ``except Exception: return set()``, so "the excluded pid is
+        absent" is equally satisfied by a scan that never saw the tree at all:
+        a stat-format change, a ``_PROC_ROOT`` mishap or a permissions change
+        would blow the walk up, get laundered into an empty set, and turn this
+        test GREEN. The unexcluded ``keeper`` is the witness that separates
+        EXCLUDED from NEVER FOUND AT ALL. It costs a fork, not a second walk;
+        the walk count is the thing this test exists to keep at one.
+
+        The coverage that a single walk cannot carry is carried elsewhere,
+        against the identical helper:
+
+        * the ``<root>XYZ`` prefix boundary and the "outside" case —
+          :meth:`test_scan_matches_cwd_under_root_and_respects_boundary`;
+        * the cwd == root EQUALITY branch, selective exclusion across several
+          groups, and same-pgrp de-duplication —
+          :class:`TestScanProcessGroupsAgainstASyntheticProc`, exhaustively and
+          deterministically, because it controls the whole pid population,
+          which a walk over 1100 uncontrolled pids cannot.
+
+        What only a REAL walk can prove, and what this test therefore keeps:
+        genuinely live process groups under root are told apart — one named in
+        *exclude_pgids* dropped, one not named returned — end-to-end through
+        the real procfs.
         """
         root = tmp_path.resolve() / '_merge-verify'
-        root.mkdir()
-        proc = await _spawn_sleeper_in(root)
+        keeper_cwd = root / 'build'
+        keeper_cwd.mkdir(parents=True)
+        excluded = await _spawn_sleeper_in(root)
+        keeper = await _spawn_sleeper_in(keeper_cwd)
         try:
-            assert proc.pid in scan_process_groups_under_path(root)
-            assert proc.pid not in scan_process_groups_under_path(
-                root, exclude_pgids=frozenset({proc.pid})
+            found = scan_process_groups_under_path(
+                root, exclude_pgids=frozenset({excluded.pid})
+            )
+            assert excluded.pid not in found, (
+                f'pgid {excluded.pid} was named in exclude_pgids and must not '
+                f'be returned; got {found}'
+            )
+            assert keeper.pid in found, (
+                f'pgid {keeper.pid} (cwd {keeper_cwd}, NOT excluded) is missing '
+                f'from {found} — the walk never reached the tree, which would '
+                f'make the exclusion assertion above pass vacuously'
             )
         finally:
-            _kill_group(proc.pid)
-            with contextlib.suppress(Exception):
-                await proc.wait()
+            for p in (excluded, keeper):
+                _kill_group(p.pid)
+                with contextlib.suppress(Exception):
+                    await p.wait()
+
+    @pytest.mark.timeout(15)
+    def test_a_pid_with_an_undecodable_mmapd_path_under_root_is_still_found(self, tmp_path):
+        """maps pathnames are raw bytes; a non-UTF-8 one must not empty the scan.
+
+        The child maps the file through libc directly (``mmap.mmap`` would
+        keep a dup of the fd open), closes its only fd, and runs with its cwd
+        outside root, so its maps line is the only thing tying its group to
+        root. The fd precondition is asserted, not assumed.
+
+        What only this real walk shows is that the kernel writes the raw,
+        unescaped non-UTF-8 bytes into maps. The decoding choice itself is
+        pinned by the synthetic
+        ``test_a_mapped_path_matches_a_root_whose_own_name_holds_arbitrary_bytes``.
+        """
+        base = tmp_path.resolve()
+        root = base / '_merge-verify'
+        elsewhere = base / 'elsewhere'
+        root.mkdir()
+        elsewhere.mkdir()
+        mapped = os.path.join(os.fsencode(root), b'\xff\xfe.bin')
+        with open(mapped, 'wb') as f:
+            f.write(b'x')
+        script = (
+            'import ctypes, mmap, os, sys, time\n'
+            'libc = ctypes.CDLL(None)\n'
+            'libc.mmap.restype = ctypes.c_void_p\n'
+            'libc.mmap.argtypes = (ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int,'
+            ' ctypes.c_int, ctypes.c_int, ctypes.c_long)\n'
+            'fd = os.open(os.fsencode(sys.argv[1]), os.O_RDONLY)\n'
+            'addr = libc.mmap(None, 1, mmap.PROT_READ, mmap.MAP_PRIVATE, fd, 0)\n'
+            'os.close(fd)\n'
+            "print('mmap failed' if addr == ctypes.c_void_p(-1).value else 'ready',"
+            ' flush=True)\n'
+            'time.sleep(30)\n'
+        )
+        with subprocess.Popen(
+            [sys.executable, '-c', script, mapped],
+            cwd=elsewhere,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        ) as p:
+            pgid = p.pid
+            try:
+                assert p.stdout is not None
+                assert p.stdout.readline().strip() == b'ready'
+                fd_dir = f'/proc/{pgid}/fd'
+                fd_targets = [os.readlink(f'{fd_dir}/{n}') for n in os.listdir(fd_dir)]
+                assert not [t for t in fd_targets if t.startswith(f'{root}{os.sep}')], (
+                    fd_targets
+                )
+                found = scan_process_groups_under_path(root)
+                assert pgid in found, (
+                    f'pgid {pgid} is missing from {found}; its only reference '
+                    f'to {root} is an mmap of the non-UTF-8-named {mapped!r}'
+                )
+            finally:
+                _kill_group(pgid)
 
     def test_scan_never_raises_on_unreadable_pid(self, monkeypatch, tmp_path):
         """A readlink that raises (vanished / permission-denied pid) is swallowed.
@@ -877,13 +1621,555 @@ class TestScanProcessGroupsUnderPath:
         assert result == set()
 
 
+class TestScanProcessGroupsAgainstASyntheticProc:
+    """The scan's branches, pinned against a FABRICATED /proc — no real walk.
+
+    A real-/proc walk cannot control its pid population: it reads 1100+ live
+    pids (23.3 MB of ``maps`` alone), it cannot assert that two pids sharing a
+    pgrp are de-duplicated, and it costs 0.8-1.5s that scales with host load —
+    which is how the two-walk ``test_scan_respects_exclude_pgids`` came to sit
+    against a 15s budget with thin headroom (task 4520). A fabricated tree
+    controls every pid, covers strictly more branches, and costs microseconds.
+
+    Points the module at the fake tree via ``shared.proc_group._PROC_ROOT``,
+    the same monkeypatch-module-internals idiom
+    ``test_scan_never_raises_on_unreadable_pid`` (``os.readlink``) and
+    ``test_reap_refuses_unsafe_pgids`` (``os.killpg``) already use — rather
+    than adding a test-only parameter to the public function.
+    """
+
+    @pytest.fixture
+    def fake_proc(self, tmp_path, monkeypatch):
+        """Build the fabricated /proc and the root the scan is aimed at.
+
+        Returns ``(proc_root, root)``. Population:
+
+        ==== ===== ============================ =========================
+        pid  pgrp  cwd                          expectation
+        ==== ===== ============================ =========================
+        100  100   <root>                       match (equality branch)
+        200  200   <root>/build/deep            match (strictly under)
+        300  300   <root>XYZ                    NO match (prefix boundary)
+        400  400   an unrelated dir             NO match
+        510  500   <root>/build                 match
+        520  500   <root>/build                 same group, de-duplicated
+        600  --    stat is a DIRECTORY          skipped (OSError on read)
+        700  --    no stat at all               skipped (OSError on read)
+        800  --    stat has no ')'              skipped (parse failure)
+        810  --    stat pgrp is not an int      skipped (parse failure)
+        ==== ===== ============================ =========================
+
+        Plus non-numeric entries (``self``, ``cpuinfo``) that must be ignored.
+        No ``fd`` dir and no ``maps`` file anywhere, so every decision here is
+        made on ``cwd`` alone — the other two signals have their own coverage.
+        """
+        proc_root = tmp_path / 'proc'
+        proc_root.mkdir()
+        base = (tmp_path / 'work').resolve()
+        root = base / '_merge-verify'
+        (root / 'build' / 'deep').mkdir(parents=True)
+        sibling = base / '_merge-verifyXYZ'
+        outside = base / 'other'
+        for d in (sibling, outside):
+            d.mkdir(parents=True)
+
+        def _pid(pid: int, pgrp: int, cwd) -> None:
+            entry = proc_root / str(pid)
+            entry.mkdir()
+            (entry / 'stat').write_text(synthetic_stat_line(pid, pgrp))
+            (entry / 'cwd').symlink_to(cwd)
+
+        _pid(100, 100, root)
+        _pid(200, 200, root / 'build' / 'deep')
+        _pid(300, 300, sibling)
+        _pid(400, 400, outside)
+        _pid(510, 500, root / 'build')
+        _pid(520, 500, root / 'build')
+
+        # 600: stat is a directory — IsADirectoryError (an OSError) on read,
+        # and unlike chmod 0o000 it stays unreadable when the suite runs as root.
+        (proc_root / '600' / 'stat').mkdir(parents=True)
+        (proc_root / '600' / 'cwd').symlink_to(root)
+        # 700: no stat at all — FileNotFoundError.
+        (proc_root / '700').mkdir()
+        (proc_root / '700' / 'cwd').symlink_to(root)
+        # 800 / 810: stat present but unparseable.
+        (proc_root / '800').mkdir()
+        (proc_root / '800' / 'stat').write_text('no closing paren here\n')
+        (proc_root / '800' / 'cwd').symlink_to(root)
+        (proc_root / '810').mkdir()
+        (proc_root / '810' / 'stat').write_text('810 (x) S 1 not-a-number 0\n')
+        (proc_root / '810' / 'cwd').symlink_to(root)
+        # Non-numeric entries: a dir and a file, both ignored.
+        (proc_root / 'self').mkdir()
+        (proc_root / 'cpuinfo').write_text('processor : 0\n')
+
+        monkeypatch.setattr('shared.proc_group._PROC_ROOT', proc_root)
+        return proc_root, root
+
+    def test_matches_equality_and_under_but_not_the_prefix_sibling(self, fake_proc):
+        """cwd == root and cwd under root match; <root>XYZ and outside do not."""
+        _proc_root, root = fake_proc
+        found = scan_process_groups_under_path(root)
+        assert found == {100, 200, 500}, (
+            f'expected pgids 100 (cwd == root), 200 (under root) and 500 '
+            f'(two pids, one group); got {found}'
+        )
+        assert 300 not in found, 'a <root>XYZ sibling must not match root'
+        assert 400 not in found, 'an unrelated cwd must not match root'
+
+    def test_exclude_pgids_drops_only_the_named_group(self, fake_proc):
+        """The excluded pgid goes; every other matching pgid stays."""
+        _proc_root, root = fake_proc
+        assert scan_process_groups_under_path(
+            root, exclude_pgids=frozenset({500})
+        ) == {100, 200}
+        assert scan_process_groups_under_path(
+            root, exclude_pgids=frozenset({100, 200, 500})
+        ) == set()
+
+    def test_two_pids_in_one_group_are_inspected_once(self, fake_proc, monkeypatch):
+        """The ``pgrp in result`` short-circuit skips the group's second pid.
+
+        A set result would hide a missing short-circuit, so this counts the
+        expensive per-pid inspection instead — which is the thing that reads
+        ``cwd``, every open fd, and the whole ``maps`` file.
+        """
+        _proc_root, root = fake_proc
+        inspected: list[str] = []
+        real = proc_group_module._pid_references_path_at_or_under
+
+        def counting(entry, target):
+            inspected.append(entry.name)
+            return real(entry, target)
+
+        monkeypatch.setattr(
+            'shared.proc_group._pid_references_path_at_or_under', counting
+        )
+        assert scan_process_groups_under_path(root) == {100, 200, 500}
+        group_500 = [name for name in inspected if name in ('510', '520')]
+        assert len(group_500) == 1, (
+            f'both pids of pgid 500 were inspected ({group_500}); the '
+            f'`pgrp in result` short-circuit is not working'
+        )
+
+    def test_excluded_group_is_never_inspected(self, fake_proc, monkeypatch):
+        """An excluded pgid must skip the fd/maps inspection entirely."""
+        _proc_root, root = fake_proc
+        inspected: list[str] = []
+        monkeypatch.setattr(
+            'shared.proc_group._pid_references_path_at_or_under',
+            lambda entry, target: inspected.append(entry.name) or False,
+        )
+        scan_process_groups_under_path(root, exclude_pgids=frozenset({500}))
+        assert '510' not in inspected and '520' not in inspected, (
+            f'an excluded pgid must not pay for inspection; inspected {inspected}'
+        )
+
+    def test_unreadable_and_malformed_pids_are_skipped_not_raised(self, fake_proc):
+        """A pid whose stat cannot be read or parsed is skipped, never fatal.
+
+        All four are planted with a cwd EXACTLY at root, so a scan that failed
+        to skip them would show up as an extra pgid rather than as silence.
+        """
+        _proc_root, root = fake_proc
+        found = scan_process_groups_under_path(root)
+        assert found == {100, 200, 500}
+        assert 600 not in found and 700 not in found
+        assert 800 not in found and 810 not in found
+
+    @pytest.mark.parametrize(
+        'odd_bytes',
+        [
+            pytest.param(b'\xff', id='undecodable'),
+            pytest.param(b'\r', id='carriage-return'),
+            pytest.param(b'\x0b', id='vertical-tab'),
+            pytest.param(b'\x0c', id='form-feed'),
+            pytest.param(b'\x1c', id='file-separator'),
+            pytest.param(b'\xc2\x85', id='next-line-U+0085'),
+            pytest.param(b'\xe2\x80\xa8', id='line-separator-U+2028'),
+        ],
+    )
+    def test_a_mapped_path_matches_a_root_whose_own_name_holds_arbitrary_bytes(
+        self, tmp_path, monkeypatch, odd_bytes
+    ):
+        """A maps pathname matches a root whose name holds any byte but a newline.
+
+        Two ways such a byte in root's own name costs the match. An undecodable
+        one raises under a strict decode and becomes U+FFFD under 'replace', and
+        neither equals root's surrogate-escaped form, the str space readlink and
+        str(Path) use. A line break other than '\\n' cuts the pathname under
+        ``str.splitlines``, although the kernel escapes only '\\n' in maps. No
+        cwd and no fd dir, so maps alone decides.
+        """
+        proc_root = tmp_path / 'proc'
+        entry = proc_root / '900'
+        entry.mkdir(parents=True)
+        (entry / 'stat').write_text(synthetic_stat_line(900, 900))
+        root_bytes = os.fsencode(tmp_path) + b'/_merge-verify-' + odd_bytes
+        (entry / 'maps').write_bytes(
+            b'55d4c7e1a000-55d4c7e3b000 rw-p 00000000 00:00 0          [heap]\n'
+            b'7f0a1c000000-7f0a1c021000 r--p 00000000 08:01 1311       /usr/lib/libc.so.6\n'
+            b'7f0a1d000000-7f0a1d002000 r-xp 00000000 08:01 4242       '
+            + root_bytes
+            + b'/\xfe.so\n'
+        )
+        monkeypatch.setattr('shared.proc_group._PROC_ROOT', proc_root)
+
+        assert scan_process_groups_under_path(os.fsdecode(root_bytes)) == {900}
+
+    def test_a_missing_proc_root_yields_an_empty_set(self, tmp_path, monkeypatch):
+        """The `not proc_dir.exists()` branch — an empty result, not a raise.
+
+        Asserted against the UNSAFE helper, because the public wrapper cannot
+        express this: it converts ANY exception into ``set()``, so an empty
+        result from it is equally consistent with the intended early return,
+        with an unexpected raise from anywhere in the walk, and with a walk
+        that simply matched nothing — the branch named in this docstring would
+        not actually be pinned. Against
+        ``_scan_process_groups_under_path_unsafe`` a raise FAILS the test
+        instead of being laundered into the expected answer. Reaching a module
+        internal is the idiom this class already relies on (``_PROC_ROOT``,
+        ``_pid_references_path_at_or_under``).
+
+        The public wrapper is then asserted too, so the branch stays pinned
+        through the layer callers actually use.
+        """
+        monkeypatch.setattr('shared.proc_group._PROC_ROOT', tmp_path / 'absent')
+        assert proc_group_module._scan_process_groups_under_path_unsafe(
+            str(tmp_path), frozenset()
+        ) == set()
+        assert scan_process_groups_under_path(tmp_path) == set()
+
+
+_MALFORMED_STAT_LINES = [
+    pytest.param('no closing paren here\n', id='no-closing-paren'),
+    pytest.param('810 (x) S 1 not-a-number 0\n', id='pgrp-not-an-int'),
+    pytest.param('7 (x) S\n', id='truncated'),
+    pytest.param('7 (x) S notint 7\n', id='ppid-not-an-int'),
+]
+
+_BOTH_POLICIES = pytest.mark.parametrize(
+    'skip_malformed', [pytest.param(True, id='skip'), pytest.param(False, id='raise')]
+)
+
+
+class TestReadStatFields:
+    """The one ``/proc/<pid>/stat`` reader and the malformed-line policy each caller states.
+
+    An unreadable entry (the pid is gone) is None under either policy.  A
+    malformed line is skipped (None) where that only loses one reading, and
+    raised where a None would be taken for "gone".
+    """
+
+    @_BOTH_POLICIES
+    def test_a_well_formed_line_parses_with_comm_up_to_the_last_paren(
+        self, tmp_path, skip_malformed
+    ):
+        entry = tmp_path / '4242'
+        entry.mkdir()
+        (entry / 'stat').write_text(synthetic_stat_line(4242, 4242, state='S'))
+
+        assert read_stat_fields(entry, skip_malformed=skip_malformed) == StatFields(
+            comm='weird (name) proc', state='S', ppid=1, pgrp=4242
+        )
+
+    @_BOTH_POLICIES
+    @pytest.mark.parametrize('stat_is_a_directory', [False, True], ids=['missing', 'directory'])
+    def test_an_unreadable_entry_is_none(self, tmp_path, skip_malformed, stat_is_a_directory):
+        """A directory stays unreadable even when the suite runs as root, unlike chmod 0o000."""
+        entry = tmp_path / '600'
+        entry.mkdir()
+        if stat_is_a_directory:
+            (entry / 'stat').mkdir()
+
+        assert read_stat_fields(entry, skip_malformed=skip_malformed) is None
+
+    @pytest.mark.parametrize('text', _MALFORMED_STAT_LINES)
+    def test_a_malformed_line_raises_naming_its_path_and_text(self, tmp_path, text):
+        entry = tmp_path / '810'
+        entry.mkdir()
+        (entry / 'stat').write_text(text)
+
+        with pytest.raises(MalformedStatLine) as excinfo:
+            read_stat_fields(entry, skip_malformed=False)
+
+        exc = excinfo.value
+        assert isinstance(exc, ValueError)
+        assert (exc.path, exc.text) == (entry / 'stat', text)
+        assert str(entry / 'stat') in str(exc)
+        assert repr(text) in str(exc)
+
+    @pytest.mark.parametrize('text', _MALFORMED_STAT_LINES)
+    def test_a_malformed_line_is_skipped_as_none(self, tmp_path, text):
+        entry = tmp_path / '810'
+        entry.mkdir()
+        (entry / 'stat').write_text(text)
+
+        assert read_stat_fields(entry, skip_malformed=True) is None
+
+    @pytest.mark.timeout(15)
+    def test_a_live_child_is_running_and_parented_to_this_process(self):
+        with subprocess.Popen(
+            ['sleep', '30'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        ) as p:
+            try:
+                fields = read_stat_fields(Path('/proc') / str(p.pid), skip_malformed=False)
+                assert fields is not None
+                assert (fields.ppid, fields.terminated) == (os.getpid(), False), fields
+            finally:
+                p.kill()
+
+    @pytest.mark.timeout(15)
+    def test_an_unreaped_zombie_is_terminated_and_a_reaped_pid_is_none(self):
+        """``waitid(..., WNOWAIT)`` yields the zombie by a condition wait, never a sleep."""
+        p = subprocess.Popen(['sleep', '30'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        entry = Path('/proc') / str(p.pid)
+        try:
+            p.kill()
+            os.waitid(os.P_PID, p.pid, os.WEXITED | os.WNOWAIT)
+            fields = read_stat_fields(entry, skip_malformed=False)
+            assert fields is not None
+            assert (fields.state, fields.ppid, fields.terminated) == ('Z', os.getpid(), True)
+        finally:
+            p.wait()
+
+        assert read_stat_fields(entry, skip_malformed=False) is None
+
+    @pytest.mark.timeout(15)
+    def test_an_undecodable_comm_reads_back_replaced(self):
+        with subprocess.Popen(
+            [sys.executable, '-c', _UNDECODABLE_COMM_SLEEPER],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        ) as p:
+            try:
+                assert p.stdout is not None
+                assert p.stdout.readline().strip() == b'ready'
+                fields = read_stat_fields(Path('/proc') / str(p.pid), skip_malformed=False)
+                assert fields is not None
+                assert (fields.comm, fields.terminated) == ('��', False)
+            finally:
+                p.kill()
+
+
+class TestPidRunning:
+    """The single-pid liveness probe: a zombie is not running, and a malformed stat raises."""
+
+    @pytest.mark.timeout(15)
+    def test_a_live_child_is_running(self):
+        with subprocess.Popen(
+            ['sleep', '30'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        ) as p:
+            try:
+                assert pid_running(p.pid) is True
+            finally:
+                p.kill()
+
+    @pytest.mark.timeout(15)
+    def test_an_unreaped_zombie_and_a_reaped_pid_are_not_running(self):
+        """``waitid(..., WNOWAIT)`` yields the zombie by a condition wait, never a sleep."""
+        p = subprocess.Popen(['sleep', '30'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            p.kill()
+            os.waitid(os.P_PID, p.pid, os.WEXITED | os.WNOWAIT)
+            assert pid_running(p.pid) is False
+        finally:
+            p.wait()
+
+        assert pid_running(p.pid) is False
+
+    @pytest.mark.parametrize('pid', [0, -1])
+    def test_a_non_positive_pid_is_not_running(self, pid):
+        assert pid_running(pid) is False
+
+    @pytest.mark.parametrize('text', _MALFORMED_STAT_LINES)
+    def test_a_malformed_stat_raises_rather_than_reading_as_gone(
+        self, tmp_path, monkeypatch, text
+    ):
+        monkeypatch.setattr('shared.proc_group._PROC_ROOT', tmp_path)
+        entry = tmp_path / '810'
+        entry.mkdir()
+        (entry / 'stat').write_text(text)
+
+        with pytest.raises(MalformedStatLine):
+            pid_running(810)
+
+
+class TestProcessGroupTermination:
+    """A group has terminated once every member is dead, zombies included.
+
+    A zombie has exited and awaits only its parent's reap; once orphaned that
+    parent is systemd --user, whose latency the group's signaller neither
+    owns nor bounds.  ``os.killpg(pgid, 0)`` still succeeds on such a group,
+    which is why it is not the termination criterion.
+    """
+
+    @pytest.mark.parametrize(
+        'record_in',
+        [
+            pytest.param(
+                lambda state: ProcessGroupMember(pid=4242, ppid=1, state=state, comm='x'),
+                id='ProcessGroupMember',
+            ),
+            pytest.param(
+                lambda state: StatFields(comm='x', state=state, ppid=1, pgrp=1),
+                id='StatFields',
+            ),
+        ],
+    )
+    @pytest.mark.parametrize(
+        ('state', 'terminated'),
+        [
+            ('Z', True),
+            ('X', True),
+            ('R', False),
+            ('S', False),
+            ('D', False),
+            ('T', False),
+            ('t', False),
+            ('I', False),
+        ],
+    )
+    def test_terminated_is_true_exactly_for_zombie_and_dead_states(
+        self, record_in, state, terminated
+    ):
+        assert record_in(state).terminated is terminated
+
+    @pytest.mark.timeout(15)
+    def test_a_live_group_has_one_running_member_and_is_not_terminated(self):
+        p = subprocess.Popen(
+            ['sleep', '30'],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        pgid = p.pid
+        try:
+            members = process_group_members(pgid)
+            assert [(m.pid, m.comm, m.terminated) for m in members] == [
+                (pgid, 'sleep', False)
+            ], members
+            assert process_group_terminated(pgid) is False
+        finally:
+            _kill_group(pgid)
+            p.wait()
+
+    @pytest.mark.timeout(15)
+    def test_an_unreaped_zombie_group_counts_as_terminated(self, unreaped_zombie_pgid):
+        """The group still exists (killpg succeeds) yet has terminated."""
+        pgid = unreaped_zombie_pgid
+        members = process_group_members(pgid)
+        assert [(m.pid, m.state, m.terminated) for m in members] == [
+            (pgid, 'Z', True)
+        ], members
+        assert process_group_terminated(pgid) is True
+        os.killpg(pgid, 0)
+
+    @pytest.mark.timeout(15)
+    def test_a_zombie_leader_with_a_live_member_is_not_terminated(self):
+        """Termination needs EVERY member dead, so a leaked member always fails."""
+        with subprocess.Popen(
+            ['sh', '-c', 'sleep 30 & echo ready; exec sleep 31'],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        ) as p:
+            pgid = p.pid
+            try:
+                assert p.stdout is not None
+                assert p.stdout.readline().strip() == b'ready'
+                os.kill(pgid, signal.SIGKILL)
+                os.waitid(os.P_PID, pgid, os.WEXITED | os.WNOWAIT)
+
+                members = process_group_members(pgid)
+                assert [m.pid for m in members if m.terminated] == [pgid], members
+                assert [m for m in members if not m.terminated], members
+                assert process_group_terminated(pgid) is False
+            finally:
+                _kill_group(pgid)
+
+    @pytest.mark.timeout(15)
+    def test_a_member_with_an_undecodable_comm_is_still_listed(self):
+        """comm is arbitrary bytes; a member must never drop out of the walk over them."""
+        with subprocess.Popen(
+            [sys.executable, '-c', _UNDECODABLE_COMM_SLEEPER],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        ) as p:
+            pgid = p.pid
+            try:
+                assert p.stdout is not None
+                assert p.stdout.readline().strip() == b'ready'
+                members = process_group_members(pgid)
+                assert [(m.pid, m.comm, m.terminated) for m in members] == [
+                    (pgid, '��', False)
+                ], members
+                assert process_group_terminated(pgid) is False
+            finally:
+                _kill_group(pgid)
+
+    def test_a_nonexistent_group_is_terminated_with_no_members(self):
+        beyond_pid_max = 2**30
+        assert process_group_members(beyond_pid_max) == []
+        assert process_group_terminated(beyond_pid_max) is True
+
+    @pytest.mark.timeout(15)
+    def test_a_live_group_the_walk_cannot_see_is_not_terminated(self, tmp_path, monkeypatch):
+        """killpg sees the group but /proc shows no member: inconclusive, so False.
+
+        This stands in for an unreadable /proc (hidepid, another pid namespace), which
+        must never pass a live group as dead.
+        """
+        p = subprocess.Popen(
+            ['sleep', '30'],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        pgid = p.pid
+        try:
+            monkeypatch.setattr('shared.proc_group._PROC_ROOT', tmp_path)
+            assert process_group_members(pgid) == []
+            assert process_group_terminated(pgid) is False
+        finally:
+            _kill_group(pgid)
+            p.wait()
+
+    @pytest.mark.timeout(15)
+    def test_a_group_killpg_may_not_signal_is_terminated(self, monkeypatch):
+        """EPERM means the pgid now belongs to another user, so our group is gone.
+
+        The group is really alive, so True can only come from the failed probe and
+        never from the /proc walk.
+        """
+
+        def eperm(pgid: int, sig: int) -> None:
+            raise PermissionError(errno.EPERM, os.strerror(errno.EPERM))
+
+        p = subprocess.Popen(
+            ['sleep', '30'],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        try:
+            with monkeypatch.context() as patched:
+                patched.setattr('shared.proc_group.os.killpg', eperm)
+                assert process_group_terminated(p.pid) is True
+        finally:
+            _kill_group(p.pid)
+            p.wait()
+
+
 class TestReapProcessGroups:
     """Tests for reap_process_groups — SIGTERM→wait→SIGKILL over a set of pgids.
 
     The barrier's reaping half: generalizes terminate_process_group's
     escalation from a single owned proc handle to a set of foreign pgids,
     refusing any unsafe pgid (self/parent/own-group/init) via
-    _unsafe_pgid_reason.
+    unsafe_pgid_reason.
     """
 
     @pytest.mark.asyncio
@@ -898,13 +2184,66 @@ class TestReapProcessGroups:
             # asyncio.to_thread(reap...) call site).
             outcomes = await asyncio.to_thread(reap_process_groups, {pgid})
             assert outcomes.get(pgid) == 'reaped', f'unexpected outcomes: {outcomes}'
-            assert await _pgid_gone_within(pgid), (
-                f'process group {pgid} not gone after reap'
-            )
+            await _await_group_terminated(pgid)
         finally:
             _kill_group(pgid)
             with contextlib.suppress(Exception):
                 await proc.wait()
+
+    @pytest.mark.timeout(15)
+    def test_reap_reports_a_group_of_only_unreaped_zombies_as_reaped(self, unreaped_zombie_pgid):
+        """Members awaiting their parent's reap have terminated; that is 'reaped'.
+
+        The zombie is held unreaped for the whole call, so the verdict does
+        not depend on grace_secs; it is small only to keep a regression fast.
+        """
+        pgid = unreaped_zombie_pgid
+        outcomes = reap_process_groups({pgid}, grace_secs=0.2)
+        assert outcomes == {pgid: 'reaped'}
+        os.killpg(pgid, 0)
+
+    @pytest.mark.timeout(5)
+    def test_one_proc_walk_judges_every_group_killpg_still_sees(self, tmp_path, monkeypatch):
+        """Each poll walks /proc once for all still-visible groups, never once per group.
+
+        Three zombie-only groups stay visible to killpg, a fourth is already
+        gone, and the fabricated /proc also holds one unrelated live pid. Every
+        pgid is above PID_MAX_LIMIT (2**22), so none can be a real group. One
+        walk reads each fabricated stat exactly once; a walk per visible group
+        would read each of them three times, and a reap of only gone groups
+        needs no walk at all. Stat reads are counted the same way
+        test_two_pids_in_one_group_are_inspected_once counts its per-pid
+        inspection.
+        """
+        zombie_groups = (5_000_100, 5_000_200, 5_000_300)
+        gone_group = 5_000_900
+        proc_root = tmp_path / 'proc'
+        planted = [(pgid + 1, pgid, 'Z') for pgid in zombie_groups] + [(5_000_401, 5_000_400, 'S')]
+        for pid, pgrp, state in planted:
+            (proc_root / str(pid)).mkdir(parents=True)
+            (proc_root / str(pid) / 'stat').write_text(synthetic_stat_line(pid, pgrp, state=state))
+        monkeypatch.setattr('shared.proc_group._PROC_ROOT', proc_root)
+
+        def killpg(pgid: int, sig: int) -> None:
+            if pgid == gone_group:
+                raise ProcessLookupError(errno.ESRCH, os.strerror(errno.ESRCH))
+
+        monkeypatch.setattr('shared.proc_group.os.killpg', killpg)
+        stat_reads: list[str] = []
+        real_read = proc_group_module.read_stat_fields
+        monkeypatch.setattr(
+            'shared.proc_group.read_stat_fields',
+            lambda entry, **kwargs: stat_reads.append(entry.name) or real_read(entry, **kwargs),
+        )
+
+        outcomes = reap_process_groups({*zombie_groups, gone_group}, grace_secs=0)
+
+        assert outcomes == dict.fromkeys((*zombie_groups, gone_group), 'reaped')
+        assert sorted(stat_reads) == sorted(str(pid) for pid, _, _ in planted)
+
+        stat_reads.clear()
+        assert reap_process_groups({gone_group}, grace_secs=0) == {gone_group: 'reaped'}
+        assert stat_reads == []
 
     @pytest.mark.timeout(5)
     def test_reap_refuses_unsafe_pgids(self, monkeypatch):
@@ -926,3 +2265,296 @@ class TestReapProcessGroups:
         assert calls == [], (
             f'refused pgids must never be signalled; got killpg calls {calls}'
         )
+
+
+class TestCpuTicksUnderPathAgainstASyntheticProc:
+    """The CPU-time fingerprint of the processes working under a directory (task 5290).
+
+    Fabricated /proc, as in :class:`TestScanProcessGroupsAgainstASyntheticProc`.
+    The fingerprint is utime+stime+cutime+cstime summed per PID (not per
+    group) over the pids whose cwd is at-or-under root.
+    """
+
+    @pytest.fixture
+    def fake_proc(self, tmp_path, monkeypatch):
+        """Build the fabricated /proc; returns ``(proc_root, root)``.
+
+        ==== ===== ============================ ============== ==========
+        pid  pgrp  cwd                          cpu            counted
+        ==== ===== ============================ ============== ==========
+        100  100   <root>                       1+2+3+4        yes (==)
+        200  200   <root>/build/deep            10+20+30+40    yes (under)
+        300  300   <root>XYZ                    1000           no
+        400  400   an unrelated dir             5000           no
+        510  500   <root>/build                 100            yes
+        520  500   <root>/build                 200            yes (same group, own pid)
+        600  --    stat is a DIRECTORY          --             skipped
+        700  --    no stat at all               --             skipped
+        800  --    stat has no ')'              --             skipped
+        820  820   <root>, CPU fields not ints  --             skipped
+        900  900   unrelated cwd, fd+maps in    7000           no (cwd only)
+        ==== ===== ============================ ============== ==========
+        """
+        proc_root = tmp_path / 'proc'
+        proc_root.mkdir()
+        base = (tmp_path / 'work').resolve()
+        root = base / '_merge-verify'
+        (root / 'build' / 'deep').mkdir(parents=True)
+        sibling = base / '_merge-verifyXYZ'
+        outside = base / 'other'
+        for d in (sibling, outside):
+            d.mkdir(parents=True)
+
+        def _pid(pid: int, pgrp: int, cwd, cpu: tuple[int, int, int, int]) -> Path:
+            entry = proc_root / str(pid)
+            entry.mkdir()
+            (entry / 'stat').write_text(synthetic_stat_line(pid, pgrp, cpu=cpu))
+            (entry / 'cwd').symlink_to(cwd)
+            return entry
+
+        _pid(100, 100, root, (1, 2, 3, 4))
+        _pid(200, 200, root / 'build' / 'deep', (10, 20, 30, 40))
+        _pid(300, 300, sibling, (1000, 0, 0, 0))
+        _pid(400, 400, outside, (5000, 0, 0, 0))
+        _pid(510, 500, root / 'build', (100, 0, 0, 0))
+        _pid(520, 500, root / 'build', (0, 200, 0, 0))
+
+        (proc_root / '600' / 'stat').mkdir(parents=True)
+        (proc_root / '600' / 'cwd').symlink_to(root)
+        (proc_root / '700').mkdir()
+        (proc_root / '700' / 'cwd').symlink_to(root)
+        (proc_root / '800').mkdir()
+        (proc_root / '800' / 'stat').write_text('no closing paren here\n')
+        (proc_root / '800' / 'cwd').symlink_to(root)
+        (proc_root / '820').mkdir()
+        (proc_root / '820' / 'stat').write_text(
+            '820 (x) S 1 820 820 0 -1 4194304 0 0 0 0 u s cu cs 0 0\n'
+        )
+        (proc_root / '820' / 'cwd').symlink_to(root)
+
+        fd_only = _pid(900, 900, outside, (7000, 0, 0, 0))
+        (fd_only / 'fd').mkdir()
+        (fd_only / 'fd' / '3').symlink_to(root / 'build')
+        (fd_only / 'maps').write_text(
+            f'7f0a1d000000-7f0a1d002000 r-xp 00000000 08:01 4242       {root}/lib.so\n'
+        )
+
+        (proc_root / 'self').mkdir()
+        (proc_root / 'cpuinfo').write_text('processor : 0\n')
+
+        monkeypatch.setattr('shared.proc_group._PROC_ROOT', proc_root)
+        return proc_root, root
+
+    def test_sums_every_pid_whose_cwd_is_at_or_under_root(self, fake_proc):
+        """Equality and strictly-under count; the <root>XYZ sibling and outside do not."""
+        _proc_root, root = fake_proc
+        assert cpu_ticks_under_path(root) == 10 + 100 + 100 + 200
+
+    def test_exclude_pgids_drops_pids_by_their_group(self, fake_proc):
+        _proc_root, root = fake_proc
+        assert cpu_ticks_under_path(root, exclude_pgids=frozenset({500})) == 10 + 100
+        assert cpu_ticks_under_path(root, exclude_pgids=frozenset({100, 200, 500})) is None
+
+    def test_unreadable_and_malformed_pids_are_skipped_not_raised(self, fake_proc):
+        """600/700/800/820 all sit at root, so a failure to skip one would change the sum."""
+        proc_root, root = fake_proc
+        assert cpu_ticks_under_path(root) == 410
+        for pid in ('600', '700', '800', '820'):
+            assert read_cpu_ticks(proc_root / pid) is None, pid
+
+    def test_a_link_through_an_fd_or_maps_alone_is_not_counted(self, fake_proc):
+        """Only cwd decides: the cost decision is two small reads per pid, no fd or maps walk.
+
+        The group scan, which does read fds and maps, finds pid 900 for the
+        same root, so its links are real.
+        """
+        _proc_root, root = fake_proc
+        assert 900 in scan_process_groups_under_path(root)
+        assert cpu_ticks_under_path(root) == 410
+
+    def test_no_process_is_none_and_an_idle_one_is_zero(self, tmp_path, monkeypatch):
+        """'No process' is not 'an idle process'."""
+        proc_root = tmp_path / 'proc'
+        idle_root = (tmp_path / 'idle').resolve()
+        empty_root = (tmp_path / 'empty').resolve()
+        for d in (idle_root, empty_root):
+            d.mkdir()
+        entry = proc_root / '100'
+        entry.mkdir(parents=True)
+        (entry / 'stat').write_text(synthetic_stat_line(100, 100))
+        (entry / 'cwd').symlink_to(idle_root)
+        monkeypatch.setattr('shared.proc_group._PROC_ROOT', proc_root)
+
+        assert cpu_ticks_under_path(idle_root) == 0
+        assert cpu_ticks_under_path(empty_root) is None
+
+    def test_a_missing_proc_root_is_none(self, tmp_path, monkeypatch):
+        monkeypatch.setattr('shared.proc_group._PROC_ROOT', tmp_path / 'absent')
+        assert cpu_ticks_under_path(tmp_path) is None
+
+
+class TestReadCpuTicks:
+    """utime+stime+cutime+cstime of one ``/proc/<pid>``, on the parse read_stat_fields uses."""
+
+    def test_a_well_formed_line_sums_the_four_cpu_fields(self, tmp_path):
+        entry = tmp_path / '4242'
+        entry.mkdir()
+        (entry / 'stat').write_text(synthetic_stat_line(4242, 4242, cpu=(5, 6, 7, 8)))
+
+        assert read_cpu_ticks(entry) == 26
+        assert read_stat_fields(entry, skip_malformed=False) == StatFields(
+            comm='weird (name) proc', state='S', ppid=1, pgrp=4242
+        )
+
+    @pytest.mark.parametrize(
+        'text',
+        [
+            *_MALFORMED_STAT_LINES,
+            pytest.param('7 (x) S 1 7 7 0 -1 0 0 0 0 0 1 2\n', id='cpu-fields-truncated'),
+            pytest.param('7 (x) S 1 7 7 0 -1 0 0 0 0 0 1 2 x 4\n', id='cpu-field-not-an-int'),
+        ],
+    )
+    def test_a_malformed_line_is_none(self, tmp_path, text):
+        entry = tmp_path / '810'
+        entry.mkdir()
+        (entry / 'stat').write_text(text)
+
+        assert read_cpu_ticks(entry) is None
+
+    @pytest.mark.parametrize('stat_is_a_directory', [False, True], ids=['missing', 'directory'])
+    def test_an_unreadable_entry_is_none(self, tmp_path, stat_is_a_directory):
+        entry = tmp_path / '600'
+        entry.mkdir()
+        if stat_is_a_directory:
+            (entry / 'stat').mkdir()
+
+        assert read_cpu_ticks(entry) is None
+
+
+class TestReadSessionId:
+    """The session id (stat field 6) of one ``/proc/<pid>``, on the parse read_stat_fields uses."""
+
+    def test_a_well_formed_line_reads_field_six_not_the_pgrp(self, tmp_path):
+        entry = tmp_path / '4242'
+        entry.mkdir()
+        (entry / 'stat').write_text(synthetic_stat_line(4242, 4242, session=777))
+
+        assert read_session_id(entry) == 777
+
+    @pytest.mark.parametrize(
+        'text',
+        [
+            *_MALFORMED_STAT_LINES,
+            pytest.param('7 (x) S 1 7\n', id='session-truncated'),
+            pytest.param('7 (x) S 1 7 x 0\n', id='session-not-an-int'),
+        ],
+    )
+    def test_a_malformed_line_is_none(self, tmp_path, text):
+        entry = tmp_path / '810'
+        entry.mkdir()
+        (entry / 'stat').write_text(text)
+
+        assert read_session_id(entry) is None
+
+    @pytest.mark.parametrize('stat_is_a_directory', [False, True], ids=['missing', 'directory'])
+    def test_an_unreadable_entry_is_none(self, tmp_path, stat_is_a_directory):
+        entry = tmp_path / '600'
+        entry.mkdir()
+        if stat_is_a_directory:
+            (entry / 'stat').mkdir()
+
+        assert read_session_id(entry) is None
+
+    def test_on_the_real_proc_it_is_our_own_session(self):
+        assert read_session_id(Path('/proc') / str(os.getpid())) == os.getsid(0)
+
+
+def _with_start_ticks_token(token: str) -> str:
+    return synthetic_stat_line(810, 810, start_ticks=424242).replace(' 424242 ', f' {token} ')
+
+
+class TestParseStartTicks:
+    """Start time (stat field 22) of a ``/proc/<pid>/stat`` text, on the split read_stat_fields uses."""
+
+    def test_a_well_formed_line_reads_field_22_after_the_last_paren(self):
+        text = synthetic_stat_line(4242, 4242, cpu=(5, 6, 7, 8), session=777, start_ticks=31337)
+
+        assert parse_start_ticks(Path('/proc/4242/stat'), text) == 31337
+
+    @pytest.mark.parametrize(
+        'text',
+        [
+            *_MALFORMED_STAT_LINES,
+            pytest.param(
+                '7 (x) S 1 7 7 0 -1 0 0 0 0 0 0 0 0 0 0 0 0 0\n', id='start-ticks-truncated'
+            ),
+            pytest.param(_with_start_ticks_token('soon'), id='start-ticks-not-a-number'),
+            pytest.param(_with_start_ticks_token('-1'), id='start-ticks-negative'),
+            pytest.param(_with_start_ticks_token('+5'), id='start-ticks-signed'),
+            pytest.param(_with_start_ticks_token('1_0'), id='start-ticks-underscored'),
+        ],
+    )
+    def test_a_malformed_line_raises_naming_its_path_and_text(self, text):
+        path = Path('/proc/810/stat')
+
+        with pytest.raises(MalformedStatLine) as excinfo:
+            parse_start_ticks(path, text)
+
+        exc = excinfo.value
+        assert isinstance(exc, ValueError)
+        assert (exc.path, exc.text) == (path, text)
+
+
+class TestUnifiedCgroupPath:
+    """The ``0::`` path of a ``/proc/<pid>/cgroup`` text."""
+
+    def test_the_unified_line_is_read_among_v1_lines(self):
+        text = '12:pids:/user.slice\n1:name=systemd:/x\n0::/user.slice/run-u7.scope\n'
+
+        assert unified_cgroup_path(text) == '/user.slice/run-u7.scope'
+
+    def test_the_root_cgroup_is_a_path(self):
+        assert unified_cgroup_path('0::/\n') == '/'
+
+    @pytest.mark.parametrize(
+        'text',
+        [
+            pytest.param('', id='empty'),
+            pytest.param('1:name=systemd:/x\n', id='v1-only'),
+            pytest.param('0::\n', id='no-path'),
+        ],
+    )
+    def test_no_unified_path_is_none(self, text):
+        assert unified_cgroup_path(text) is None
+
+    def test_on_the_real_proc_it_is_an_absolute_path(self):
+        unified = unified_cgroup_path((Path('/proc') / str(os.getpid()) / 'cgroup').read_text())
+
+        assert unified is not None and unified.startswith('/')
+
+
+class TestCpuTicksUnderPathOnTheRealProc:
+    """One bounded walk of the real /proc: a busy child's ticks rise."""
+
+    @pytest.mark.timeout(60)
+    def test_a_busy_child_working_under_root_moves_the_sum(self, tmp_path):
+        root = tmp_path.resolve()
+        proc = subprocess.Popen(
+            [sys.executable, '-c', 'while True: pass'],
+            cwd=root,
+            start_new_session=True,
+        )
+        try:
+            first = None
+            deadline = time.monotonic() + 30.0
+            while time.monotonic() < deadline:
+                ticks = cpu_ticks_under_path(root)
+                if ticks is not None and first is None:
+                    first = ticks
+                elif ticks is not None and first is not None and ticks > first:
+                    return
+                time.sleep(0.05)
+            pytest.fail(f'cpu ticks under {root} never rose past {first} within 30s')
+        finally:
+            _kill_group(proc.pid)
+            proc.wait()

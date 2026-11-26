@@ -25,7 +25,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from orchestrator.git_ops import MergeResult
-from orchestrator.merge_queue import (
+from orchestrator.merge_lane.worker import (
     DecidedItem,
     InflightEntry,
     InflightVerifyResult,
@@ -127,9 +127,9 @@ class TestSpeculativeItemUnionAlias:
         assert isinstance(DecidedItem(**_decided_kwargs()), SpeculativeItem)
 
     def test_importable_from_merge_types(self) -> None:
-        from orchestrator.merge_types import DecidedItem as mt_DecidedItem
-        from orchestrator.merge_types import RealMergeItem as mt_RealMergeItem
-        from orchestrator.merge_types import SpeculativeItem as mt_SpeculativeItem
+        from orchestrator.merge_lane.types import DecidedItem as mt_DecidedItem
+        from orchestrator.merge_lane.types import RealMergeItem as mt_RealMergeItem
+        from orchestrator.merge_lane.types import SpeculativeItem as mt_SpeculativeItem
         assert mt_SpeculativeItem is SpeculativeItem
         assert mt_RealMergeItem is RealMergeItem
         assert mt_DecidedItem is DecidedItem
@@ -195,26 +195,26 @@ class TestInflightStatusEnum:
     )
 
     def test_importable_from_merge_types(self) -> None:
-        from orchestrator.merge_types import InflightStatus
+        from orchestrator.merge_lane.types import InflightStatus
         assert issubclass(InflightStatus, str)
 
     def test_importable_from_merge_queue_reexport_shim(self) -> None:
-        from orchestrator.merge_queue import InflightStatus
+        from orchestrator.merge_lane.worker import InflightStatus
         assert issubclass(InflightStatus, str)
 
     def test_members_exist_with_value_equal_to_name(self) -> None:
-        from orchestrator.merge_types import InflightStatus
+        from orchestrator.merge_lane.types import InflightStatus
         for name in self._MEMBER_NAMES:
             member = getattr(InflightStatus, name)
             assert member.value == name
 
     def test_str_compatibility(self) -> None:
-        from orchestrator.merge_types import InflightStatus
+        from orchestrator.merge_lane.types import InflightStatus
         assert InflightStatus.DROPPED == 'DROPPED'
         assert InflightStatus.REQUEUED in ('DROPPED', 'REQUEUED')
 
     def test_inflight_verify_result_status_is_str_compatible(self) -> None:
-        from orchestrator.merge_types import InflightStatus
+        from orchestrator.merge_lane.types import InflightStatus
         result = InflightVerifyResult(outcome=None, merge_wt=None, status=InflightStatus.DROPPED)
         assert result.status == 'DROPPED'
 
@@ -233,7 +233,7 @@ class TestInflightVerifyResultStatusInvariant:
         assert result.status is None
 
     def test_each_valid_member_constructs(self) -> None:
-        from orchestrator.merge_types import InflightStatus
+        from orchestrator.merge_lane.types import InflightStatus
         for member in (
             InflightStatus.DROPPED,
             InflightStatus.REQUEUED,
@@ -251,14 +251,14 @@ class TestInflightVerifyResultStatusInvariant:
         assert result.status == 'DROPPED'
 
     def test_predispatch_only_member_raises(self) -> None:
-        from orchestrator.merge_types import InflightStatus
+        from orchestrator.merge_lane.types import InflightStatus
         with pytest.raises(ValueError):
             InflightVerifyResult(
                 outcome=None, merge_wt=None, status=InflightStatus.ABANDONED_PREDISPATCH,
             )
 
     def test_other_predispatch_only_member_raises(self) -> None:
-        from orchestrator.merge_types import InflightStatus
+        from orchestrator.merge_lane.types import InflightStatus
         with pytest.raises(ValueError):
             InflightVerifyResult(
                 outcome=None, merge_wt=None, status=InflightStatus.REQUEUED_PREDISPATCH,

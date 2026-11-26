@@ -12,15 +12,19 @@ Dependency-light: stdlib + logging only.  Mirrors b3_gate.py's structure
 (injectable run_subprocess, frozen verdict dataclass, exit-code→verdict
 mapping).  No CLI — this module runs in-process inside the harness's
 ``_run_slot``, unlike b3_gate which is invoked cross-process by the steward.
+
+The module also renders the L1 text a FLIP verdict is filed with
+(``flip_escalation_text``), mirroring ``cross_repo_gate.block_escalation_text``.
 """
 
 from __future__ import annotations
 
-import json
 import logging
 import subprocess
 from dataclasses import dataclass
 from typing import Any
+
+from shared.task_metadata_wire import coerce_task_metadata
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +61,10 @@ class SubstrateVerdict:
         reason: Human-readable explanation of the verdict.
         stdout: Truncated checker stdout (first 2000 chars).
         stderr: Truncated checker stderr (first 2000 chars).
+        unverifiable: True when the recheck never produced a probe result
+            (gate worktree, checker launch/crash/unknown rc, or a
+            malformed/checkerless descriptor), so this fail-closed FLIP
+            establishes nothing about the probe set.
     """
 
     verdict: str
@@ -66,6 +74,14 @@ class SubstrateVerdict:
     reason: str
     stdout: str = ''
     stderr: str = ''
+    unverifiable: bool = False
+
+    def __post_init__(self) -> None:
+        if self.unverifiable and self.verdict != FLIP:
+            raise ValueError(
+                f'SubstrateVerdict invariant: unverifiable=True requires verdict={FLIP!r}; '
+                f'got verdict={self.verdict!r}'
+            )
 
     @property
     def flipped(self) -> bool:
@@ -73,75 +89,69 @@ class SubstrateVerdict:
         return self.verdict == FLIP
 
 
+def unverifiable_verdict(
+    reason: str,
+    *,
+    exit_code: int | None = None,
+    checker_argv: list[str] | None = None,
+    probe_set: str | None = None,
+    stdout: str = '',
+    stderr: str = '',
+) -> SubstrateVerdict:
+    """The fail-CLOSED verdict for a recheck that produced no probe result."""
+    return SubstrateVerdict(
+        verdict=FLIP,
+        exit_code=exit_code,
+        checker_argv=checker_argv,
+        probe_set=probe_set,
+        reason=reason,
+        stdout=stdout,
+        stderr=stderr,
+        unverifiable=True,
+    )
+
+
 # ---------------------------------------------------------------------------
-# extract_probe_set
+# Probe detection
 # ---------------------------------------------------------------------------
 
 
 def carries_substrate_probe(task: dict[str, Any]) -> bool:
     """Return True iff the task dict declares a ``substrate_probe`` key in metadata.
 
-    Uses the same JSON-string→dict coercion as ``extract_probe_set`` so the
-    predicate is robust to the fused-memory wire format (metadata may arrive as
-    a dict, a JSON string, or absent/None).
+    Metadata is read through ``shared.task_metadata_wire.coerce_task_metadata``.
+    Unreadable metadata is treated as carrying no probe — silently here, because
+    the scheduler has already warned about it at the wire boundary.
 
-    Returns True when:
-    - ``task['metadata']`` is a dict (or JSON string that decodes to a dict)
-    - the dict contains ``'substrate_probe'`` as a key (regardless of its value)
-
-    Returns False in all other cases (no metadata, non-dict, parse error).
+    Returns True when the readable metadata contains ``'substrate_probe'`` as a
+    key (regardless of its value); False otherwise.
 
     Used by ``run_substrate_recheck`` to distinguish "probe declared but malformed"
     (should fail CLOSED) from "probe genuinely absent" (should SKIP).
     """
-    raw = task.get('metadata')
-
-    # Coerce JSON string to dict (mirrors extract_probe_set / Scheduler._normalize)
-    if isinstance(raw, str):
-        try:
-            parsed = json.loads(raw)
-        except (json.JSONDecodeError, TypeError, ValueError):
-            return False
-        if not isinstance(parsed, dict):
-            return False
-        raw = parsed
-
-    if not isinstance(raw, dict):
-        return False
-
-    return 'substrate_probe' in raw
+    meta = coerce_task_metadata(task.get('metadata'))
+    return meta is not None and 'substrate_probe' in meta
 
 
 def extract_probe_set(task: dict[str, Any]) -> dict[str, Any] | None:
     """Extract the ``substrate_probe`` descriptor from a task dict, or None.
 
-    Mirrors ``Scheduler._normalize_task_metadata``'s JSON-string→dict
-    coercion so the read is robust to the fused-memory wire format (metadata
-    may arrive as a dict, a JSON string, or absent/None).
+    Metadata is read through ``shared.task_metadata_wire.coerce_task_metadata``.
+    Unreadable metadata is treated as carrying no probe — silently here, because
+    the scheduler has already warned about it at the wire boundary.
 
     Returns the descriptor dict when:
-    - ``task['metadata']`` is a dict (or JSON string that decodes to a dict)
-    - the dict contains ``'substrate_probe'`` as a nested dict
+    - the readable metadata contains ``'substrate_probe'`` as a nested dict
     - that nested dict contains a non-empty ``'probe_set'`` key
 
-    Returns None in all other cases (no metadata, malformed, no probe_set).
+    Returns None in all other cases (no metadata, unreadable, malformed, no
+    probe_set).
     """
-    raw = task.get('metadata')
-
-    # Coerce JSON string to dict (mirrors Scheduler._normalize_task_metadata)
-    if isinstance(raw, str):
-        try:
-            parsed = json.loads(raw)
-        except (json.JSONDecodeError, TypeError, ValueError):
-            return None
-        if not isinstance(parsed, dict):
-            return None
-        raw = parsed
-
-    if not isinstance(raw, dict):
+    meta = coerce_task_metadata(task.get('metadata'))
+    if meta is None:
         return None
 
-    descriptor = raw.get('substrate_probe')
+    descriptor = meta.get('substrate_probe')
     if not isinstance(descriptor, dict):
         return None
 
@@ -246,7 +256,8 @@ def run_substrate_recheck(
     - rc=0  → PASS  (all probes still pass; dispatch allowed)
     - rc=1  → FLIP  (≥1 FAIL; PASS→FAIL drift detected)
     - rc=2  → FLIP  (≥1 UNPROVABLE; treated as blocked premise)
-    - other non-zero / timeout / missing checker → FLIP ("substrate unverifiable")
+    - other non-zero / timeout / missing checker / malformed descriptor →
+      FLIP (unverifiable=True: "substrate unverifiable")
     - no descriptor → SKIP (gate is a no-op; non-probe task)
 
     Args:
@@ -271,12 +282,8 @@ def run_substrate_recheck(
                 'malformed — failing closed (verdict=FLIP)',
                 task.get('id'),
             )
-            return SubstrateVerdict(
-                verdict=FLIP,
-                exit_code=None,
-                checker_argv=None,
-                probe_set=None,
-                reason='substrate_probe declared but malformed — failing closed',
+            return unverifiable_verdict(
+                'substrate_probe declared but malformed — failing closed',
             )
         return SubstrateVerdict(
             verdict=SKIP,
@@ -291,12 +298,9 @@ def run_substrate_recheck(
 
     # --- No resolvable checker → FLIP ---
     if not argv:
-        return SubstrateVerdict(
-            verdict=FLIP,
-            exit_code=None,
-            checker_argv=None,
+        return unverifiable_verdict(
+            'probe set declared but no checker command resolvable',
             probe_set=probe_set,
-            reason='probe set declared but no checker command resolvable',
         )
 
     # --- Run the checker ---
@@ -309,12 +313,10 @@ def run_substrate_recheck(
     try:
         rc, stdout, stderr = run_subprocess(argv, cwd=worktree, timeout=timeout)
     except Exception as exc:
-        return SubstrateVerdict(
-            verdict=FLIP,
-            exit_code=None,
+        return unverifiable_verdict(
+            f'substrate unverifiable / run_subprocess raised: {exc}',
             checker_argv=argv,
             probe_set=probe_set,
-            reason=f'substrate unverifiable / run_subprocess raised: {exc}',
         )
 
     stdout_trunc = (stdout or '')[:_MAX_OUTPUT]
@@ -352,12 +354,89 @@ def run_substrate_recheck(
             stderr=stderr_trunc,
         )
     else:
-        return SubstrateVerdict(
-            verdict=FLIP,
+        return unverifiable_verdict(
+            f'substrate unverifiable / checker error rc={rc}',
             exit_code=rc,
             checker_argv=argv,
             probe_set=probe_set,
-            reason=f'substrate unverifiable / checker error rc={rc}',
             stdout=stdout_trunc,
             stderr=stderr_trunc,
         )
+
+
+# ---------------------------------------------------------------------------
+# L1 escalation text
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class FlipEscalationText:
+    """The summary, detail and dedupe root cause a FLIP verdict's L1 is filed with.
+
+    The summary is untruncated.  The root cause is task-scoped and differs per
+    rendering, so an open L1 of one kind never covers the other.
+    """
+
+    summary: str
+    detail: str
+    root_cause: str
+
+
+def flip_escalation_text(task_id: str, verdict: SubstrateVerdict) -> FlipEscalationText:
+    """Render the L1 text for a FLIP *verdict* on *task_id*.
+
+    An unverifiable recheck established nothing about the probe set, so it
+    gets its own rendering; every other FLIP is a checker result about the
+    probe set on current main.
+
+    Raises:
+        ValueError: *verdict* is not a FLIP — there is nothing to file.
+    """
+    if not verdict.flipped:
+        raise ValueError(
+            f'flip_escalation_text requires a FLIP verdict; '
+            f'got verdict={verdict.verdict!r} for task {task_id}'
+        )
+    if verdict.unverifiable:
+        return _unverifiable_text(task_id, verdict)
+    return _probe_flip_text(task_id, verdict)
+
+
+def _probe_flip_text(task_id: str, verdict: SubstrateVerdict) -> FlipEscalationText:
+    summary = f'SUBSTRATE_FLIP: probe set PASS→FAIL on current main (task {task_id})'
+    detail = (
+        f'Dispatch-time substrate re-check detected a PASS→FAIL flip.\n'
+        f'Verdict: {verdict.verdict!r} | exit_code={verdict.exit_code} | '
+        f'probe_set={verdict.probe_set!r}\n'
+        f'Reason: {verdict.reason}\n'
+        f'The task premise (probe set authored at investigation time) no longer holds '
+        f'on current main — re-spec required before dispatch.'
+    )
+    return FlipEscalationText(
+        summary=summary, detail=detail, root_cause=f'substrate-flip:{task_id}',
+    )
+
+
+def _unverifiable_text(task_id: str, verdict: SubstrateVerdict) -> FlipEscalationText:
+    summary = (
+        f'SUBSTRATE_UNVERIFIED: task {task_id} could not be re-checked: the recheck '
+        f'produced no probe result on current main, so nothing about the probe set '
+        f'was established'
+    )
+    detail = (
+        'Dispatch-time substrate re-check blocked this task BEFORE any agent spun up, '
+        'because the recheck produced no probe result and the gate fails CLOSED.\n'
+        f'Verdict: {verdict.verdict!r} (unverifiable) | exit_code={verdict.exit_code} | '
+        f'probe_set={verdict.probe_set!r}\n'
+        f'Reason: {verdict.reason}\n'
+        f'Checker stderr: {verdict.stderr or "(none captured)"}\n'
+        'Nothing about the probe set was established: no probe result was read on '
+        'current main. This block is NOT evidence that the task premise changed, so do '
+        'not re-spec or cancel the task on this L1. The fix is to resolve the cause on '
+        'the Reason line (the gate worktree, the checker command, or a malformed '
+        'metadata.substrate_probe descriptor), then unblock the task so the gate can '
+        'run again.'
+    )
+    return FlipEscalationText(
+        summary=summary, detail=detail, root_cause=f'substrate-unverified:{task_id}',
+    )

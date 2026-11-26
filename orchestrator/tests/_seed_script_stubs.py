@@ -1,0 +1,175 @@
+"""Real-git fixtures plus stubs of reify's ``seed-warm-lane.sh`` contracts,
+and the default warm base every warm-lane acquire test seeds.
+
+Shared by the lane-lock re-entrancy, main-tip-sweep seed-mode, spec-lane
+re-acquire and spec-lane cancellation suites, so the one model of how today's
+seed script takes, refuses and accepts an asserted ``<lane_dir>.lock``, and of
+how each mode treats an existing ``<lane_dir>/target``, lives in one place.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+
+import pytest
+from _git_fixtures import seed_repo
+from _interrupt_points import wait_until_exists
+
+from orchestrator.config import GitConfig
+from orchestrator.git_ops import PERSISTENT_MERGE_WORKTREE_NAME, _run
+from orchestrator.lane_lifecycle import POOL_ROOT_SENTINEL
+
+# Models TODAY's reify script (post-5354 + post-5568): it takes
+# ${LANE_DIR}.lock itself unless told the caller already holds it, and refuses
+# with 77 under --distinct-lock-refusal-rc.  Stricter than the real script, it
+# VERIFIES an --assume-lane-lock-held assertion (exit 3 if the lock is in fact
+# free), so a caller asserting a lock it does not hold fails loudly instead of
+# silently dropping inv.2 exclusivity.
+CURRENT_LOCKING_SEED_SCRIPT = """#!/usr/bin/env bash
+# Supported flags include --assume-lane-lock-held and --distinct-lock-refusal-rc.
+set -u
+lane_dir="$2"
+refusal_rc=75
+assume_held=""
+for a in "$@"; do
+    case "$a" in
+        --distinct-lock-refusal-rc) refusal_rc=77 ;;
+        --assume-lane-lock-held) assume_held=1 ;;
+    esac
+done
+if [ -z "$assume_held" ]; then
+    exec 9>"${lane_dir}.lock"
+    if ! flock -n 9; then
+        echo "LANE_LOCK_CONTENDED: ${lane_dir}.lock held by a live consumer" >&2
+        exit "$refusal_rc"
+    fi
+elif flock -n "${lane_dir}.lock" true; then
+    echo "asserted lane lock ${lane_dir}.lock is not actually held" >&2
+    exit 3
+fi
+mkdir -p "$lane_dir/target"
+echo seeded > "$lane_dir/target/seeded.bin"
+exit 0
+"""
+
+_BASH_PREAMBLE = """#!/usr/bin/env bash
+set -u
+"""
+
+# Models reify seed-warm-lane.sh's MODE SPLIT over an existing <lane_dir>/target.
+_TARGET_MODE_BODY = """target="$2/target"
+if [ -d "$target" ] && [ -n "$(ls -A "$target")" ]; then
+    case "$3" in
+        --reset-in-place)
+            echo "Clobber guard: $target already exists and is non-empty" >&2
+            exit 1
+            ;;
+        --fresh-checkout) rm -rf "$target" ;;
+        *) exit 2 ;;
+    esac
+fi
+rmdir "$target" 2>/dev/null || true
+cp -a "$1" "$target"
+exit 0
+"""
+
+TARGET_MODE_SEED_SCRIPT = _BASH_PREAMBLE + _TARGET_MODE_BODY
+
+SEED_BLOCK_FILE_ENV = 'SEED_BLOCK_FILE'
+SEED_STARTED_FILE_ENV = 'SEED_STARTED_FILE'
+
+# TARGET_MODE_SEED_SCRIPT that, while armed, half-clones target/ and hangs, so
+# a test can interrupt a seed mid-copy the way a deadline or shutdown does.
+BLOCKING_TARGET_MODE_SEED_SCRIPT = _BASH_PREAMBLE + f"""\
+if [ -n "${{{SEED_BLOCK_FILE_ENV}:-}}" ] && [ -e "${SEED_BLOCK_FILE_ENV}" ]; then
+    mkdir -p "$2/target"
+    echo partial > "$2/target/partial.bin"
+    touch "${{{SEED_STARTED_FILE_ENV}:-$2.seed-started}}"
+    sleep 60
+fi
+""" + _TARGET_MODE_BODY
+
+
+@dataclass(frozen=True)
+class SeedBlock:
+    """An armed BLOCKING_TARGET_MODE_SEED_SCRIPT: ``started`` appears once a seed hangs."""
+
+    block_file: Path
+    started: Path
+
+    async def wait_started(self) -> None:
+        await wait_until_exists(self.started)
+
+    def disarm(self) -> None:
+        self.block_file.unlink(missing_ok=True)
+
+
+def arm_seed_block(monkeypatch: pytest.MonkeyPatch, where: Path) -> SeedBlock:
+    """Make every seed run by BLOCKING_TARGET_MODE_SEED_SCRIPT hang until disarmed.
+
+    The seed subprocess inherits ``os.environ`` (shared/git_async.py::run_git),
+    so the environment is the arming channel.
+    """
+    where.mkdir(parents=True, exist_ok=True)
+    block = SeedBlock(block_file=where / 'seed-block', started=where / 'seed-started')
+    block.block_file.touch()
+    monkeypatch.setenv(SEED_BLOCK_FILE_ENV, str(block.block_file))
+    monkeypatch.setenv(SEED_STARTED_FILE_ENV, str(block.started))
+    return block
+
+
+def warm_pool_git_config() -> GitConfig:
+    return GitConfig(
+        main_branch='main',
+        branch_prefix='task/',
+        remote='origin',
+        worktree_dir='.worktrees',
+        push_after_advance=False,
+        warm_lane_pool=True,
+        merge_spec_warm_lane_pool=True,
+    )
+
+
+def seed_default_warm_base(repo: Path, *, pool_root: bool = True) -> None:
+    """Pre-create the DEFAULT derived warm-lane base under ``repo``.
+
+    The base is non-empty, so ``acquire_warm_lane``'s pre-acquire base-health
+    gate (task 2061) reports ``WarmBaseHealth.OK``.  Unless ``pool_root`` is
+    False it also writes the ``.pool-root`` sentinel, so the create-once
+    mount-presence guard (task 2099) reads the host as an already-running
+    warm-lane host; ``pool_root=False`` leaves the first-seed bootstrap state.
+    """
+    worktree_base = repo / '.worktrees'
+    base = worktree_base / PERSISTENT_MERGE_WORKTREE_NAME / 'target'
+    base.mkdir(parents=True, exist_ok=True)
+    (base / '.keep').write_text('warm base sentinel\n')
+    if pool_root:
+        (worktree_base / POOL_ROOT_SENTINEL).touch()
+
+
+def make_seed_test_repo(tmp_path: Path, *, warm_base: bool = True) -> Path:
+    """A committed repo under ``tmp_path``, optionally with a resolvable warm base."""
+    repo = seed_repo(tmp_path / 'repo')
+    if warm_base:
+        seed_default_warm_base(repo, pool_root=False)
+    return repo
+
+
+async def commit_seed_script(repo: Path, script_body: str) -> None:
+    """Commit ``script_body`` as the repo's seed script so POOL lanes carry it.
+
+    Unlike a manually-registered lane (which gets the script written into it),
+    ``acquire_warm_lane`` creates its own ``_lane-N`` worktrees, so the script
+    has to be in the committed tree for the lane checkout to pick it up.
+    """
+    scripts_dir = repo / 'scripts'
+    scripts_dir.mkdir(parents=True, exist_ok=True)
+    seed = scripts_dir / 'seed-warm-lane.sh'
+    seed.write_text(script_body)
+    seed.chmod(0o755)
+    debug = scripts_dir / 'setup-worktree-debug-port.sh'
+    debug.write_text('#!/usr/bin/env bash\necho 39411\n')
+    debug.chmod(0o755)
+    await _run(['git', 'add', '-A'], cwd=repo)
+    await _run(['git', 'commit', '-m', 'add seed + debug-port scripts'], cwd=repo)

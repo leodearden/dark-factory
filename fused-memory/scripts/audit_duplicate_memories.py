@@ -24,6 +24,12 @@ about what a cluster IS -- only about which pairs are candidates.
     lexical scan cannot, at zero embedding API calls and with no second
     metric space.
 
+The adjudicated-ANN detector (``ann_candidate_pairs`` + ``adjudicate_pairs``
++ ``adjudicated_pairs``, task 10243) re-scores cutoff-free ANN candidates
+with an injected slate scorer. It is a LIBRARY path, not wired into
+``build_sweep_plan``, the stdout plan or ``--apply``, so it can never produce
+a delete candidate; ``scripts/measure_duplicate_detector_recall.py`` measures it.
+
 The ANN path is NOT a replacement -- swapping one detector for the other
 would lose signal, so the actioned plan clusters over the UNION and every
 emitted cluster records which path(s) found it (``found_by``,
@@ -53,17 +59,37 @@ Ownership seam: task 3098 authorizes DETECTION of this pattern only. The
 disposition of the specific existing solar_challenge entries is a separate
 human-gated decision on solar_challenge task 99.
 
-The ANN cutoff is READ, never invented
---------------------------------------
-It comes from ``config.write_triage.t_high`` -- a calibration OUTPUT derived
-by ``scripts/calibrate_write_triage.py`` from measured similarity
+The ANN cutoff is READ, never invented -- and read PER CATEGORY
+---------------------------------------------------------------
+It comes from ``config.write_triage`` -- a calibration OUTPUT derived by
+``scripts/calibrate_write_triage.py`` from measured similarity
 distributions, with ``calibration_report_path`` recording its provenance.
-``--ann-threshold`` overrides it for an operator run, and the value actually
-in effect is echoed into the report. When the config is uncalibrated and no
-override is given the ANN path is DISABLED, logged at ERROR and counted as
-``ann_disabled_uncalibrated``; the lexical path still runs. A plausible
-stand-in cutoff would silently mis-cluster the corpus -- and under
-``--apply`` that means wrong deletions.
+Task 3357 made that calibration per-category, so the resolution is too, in
+strict priority per swept category:
+
+  1. ``--ann-threshold``: an explicit operator number, for every category.
+     It is a RECALL KNOB, not evidence -- it displaces even a category's own
+     measured cutoff, so under it NO category is gated by its own labeled
+     pairs and every one is withheld from ``--apply`` deletion, weaker
+     evidence than the pooled fallback below.
+  2. ``config.write_triage_project_calibrations[<--project-id>]``: per-project
+     cutoffs, measured on that project's own fixture (task 5547).
+  3. ``config.write_triage.t_high_by_category[category]``: the cutoff
+     measured on THAT category's own labeled pairs.
+  4. ``config.write_triage.t_high``: the POOLED cutoff, used as a disclosed
+     fallback and counted as ``ann_pooled_fallback_categories``. The pooled
+     corpus is overwhelmingly one category, so a fallback category runs on
+     evidence gathered elsewhere -- weaker, hence counted, hence withheld
+     from ``--apply`` deletion (see ``restrict_delete_candidates_for_apply``).
+  5. Nothing: that category is ABSENT from the resolved mapping -- its ANN
+     path is DISABLED, logged at ERROR and counted as
+     ``ann_disabled_uncalibrated``. The lexical path still runs.
+
+A category with no derivable cutoff is a real outcome, not a defect: the
+committed calibration refuses one for a category with no negative pairs to
+separate against, and that refusal is itself the recorded finding. A
+plausible stand-in cutoff would silently mis-cluster the corpus -- and
+under ``--apply`` that means wrong deletions.
 
 Every cap is counted
 --------------------
@@ -71,11 +97,14 @@ The ANN path can lose candidates where a full scan cannot, so each loss is a
 metric rather than invisible recall: ``top_k_saturated``,
 ``below_threshold_dropped``, ``unknown_neighbor_dropped``, ``missing_vector``,
 ``cross_category_dropped``, ``unswept_category_dropped``, ``ann_query_errors``,
-per-category ``scan_truncated``, and ``ann_disabled_uncalibrated``. The
+per-category ``scan_truncated``, ``ann_disabled_uncalibrated``, and
+``ann_pooled_fallback_categories`` (not a lost candidate but a weaker one:
+how many categories ran on a cutoff measured on a different population). The
 liveness path adds ``liveness_snapshot_untasked`` (a recognised snapshot that
 resolves to no subject task, so no group can hold it) and
-``liveness_snapshot_unfielded`` (point-in-time framing whose live fields could
-not be read).
+``liveness_snapshot_unfielded`` (point-in-time framing over a live-status
+marker whose fields could not ALL be read — none parsed at all, or one
+recognised field's value could not be read while a sibling's did).
 
 Only chain-free evidence may DELETE
 -----------------------------------
@@ -86,7 +115,9 @@ sub-graph is a CLIQUE. Otherwise a member could be in the cluster purely by
 transitivity — A~B and B~C above the cutoff while A~C is far below it — and
 under ``--apply`` every non-survivor of that chain is an irreversible delete.
 Withheld clusters are reported (``apply_withheld_groups``), never silently
-dropped. See ``restrict_delete_candidates_for_apply``.
+dropped, and their count is also a metric series
+(``apply_withheld_clusters``) so recall loss from the gate is alarmable, not
+just visible in the plan JSON. See ``restrict_delete_candidates_for_apply``.
 
 Scope: all three Mem0 categories (``procedural_knowledge``,
 ``preferences_and_norms``, ``observations_and_summaries``). Clustering runs
@@ -107,12 +138,12 @@ additionally carries ``liveness_snapshot_recurrence_groups``,
 alongside the pre-existing keys, which keep their exact meaning and shape.
 Suppress the artifacts with ``--no-metrics``.
 
-ORDERING NOTE -- scheduling and gate-filing belong to task 3136, not here.
-This script is a detector with a stable CLI and a stable stdout contract;
-3136 owns when it runs and what is done with the report. 3136's timer may
-subsume the eval program's leaf-epsilon invocation, so NEITHER owns the only
-schedule: adding a second trigger here would create a duplicate, and
-assuming 3136 always fires would leave the eval series with holes.
+ORDERING NOTE -- scheduling belongs to the callers, not here. This script
+is a detector with a stable CLI and a stable stdout contract. Task 3136's
+weekly timer drives it through ``scripts/duplicate_cluster_report.py``, once
+per category and with ``--no-metrics``, so the e6 metric series keeps
+``memory_eval_runner`` as its single producer. Do not add a trigger here:
+it would duplicate one of those two schedules.
 
 Structural parallel to ``scripts/audit_duplicate_tasks.py`` (union-find
 near-duplicate clustering + pick_survivor + dry-run/apply split) and the Mem0
@@ -137,6 +168,11 @@ Safety carve-outs:
     (see "Only chain-free evidence may DELETE" above).
   - A cluster whose members all share one ``metadata.topic`` is task 3136's
     Option-C carve-out: an expected shape, never a delete candidate.
+  - In any other cluster, a member carrying a non-empty ``metadata.topic``
+    (a retained Option-C peer) or ``metadata.parent_id`` (an amendment or
+    sighting child) is never a delete candidate either: it is reported in
+    ``retained_members`` and counted in ``retained_carveout`` (see
+    ``split_retained``).
   - Liveness-snapshot recurrence groups are report-only BY CONSTRUCTION --
     they are never added to the delete lists, rather than filtered out of
     them downstream where a later refactor could drop the filter.
@@ -158,23 +194,58 @@ Usage
 
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
+
 import argparse
 import asyncio
+import contextlib
 import difflib
 import json
 import logging
+import math
 import re
-import sys
-from collections.abc import Iterable, Iterator
-from datetime import datetime
-from pathlib import Path
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from dataclasses import dataclass
 from typing import Any
 
+from shared.cli_boundary import LoudArgumentParser, run_cli
+
+from fused_memory.canonical_marker import is_canonical
 from fused_memory.reconciliation.task_filter import (
     LIVE_TASK_STATUS_RE,
     POINT_IN_TIME_CHECK_RE,
     TASK_REF_RE,
+    # `WIDE_CLAUSE_BOUNDARY_RE` is for ALLOWLISTED consumers only — an AST
+    # scan over `src/` and `scripts/` (tests/test_task_filter.py
+    # ::test_clause_split_re_has_no_out_of_module_consumers) enforces an
+    # explicit allowlist, because the WIDENED splitter is only defensible for
+    # callers that fail toward something self-healing. This module qualifies:
+    # `find_liveness_snapshot_recurrences` is REPORT-ONLY — its groups never
+    # reach `delete_candidates` (pinned by
+    # `test_no_liveness_member_is_ever_a_delete_candidate` and
+    # `test_the_apply_gate_is_never_handed_a_liveness_group`) — and the report
+    # is regenerated from scratch every run, so an over-long clause costs a
+    # reviewer one glance and is gone next cycle. Same fail-safe direction as
+    # the two soft-block write gates, which is why `STRICT_CLAUSE_BOUNDARY_RE`
+    # is the WRONG constant here: its narrow alphabet is precisely what
+    # returned the empty set on all four real records.
+    #
+    # Report-only bounds what `--apply` can DELETE, not what the metric
+    # series can ALARM on: `liveness_snapshot_recurrences` is a
+    # `count`/`higher_is_worse` metric, so a group this splitter manufactures
+    # is a false accretion signal until the next run, not a harmless one a
+    # reviewer's glance fully absorbs. That is why
+    # `liveness_snapshot_subject_facts` gates a clause-scoped key on TWO
+    # conditions — divergence, and field-vocabulary equality with the
+    # record's own key — rather than trusting the widened splitter alone.
+    WIDE_CLAUSE_BOUNDARY_RE,
 )
+from fused_memory.utils.created_at import parse_created_at
+from fused_memory.utils.mem0_content_keys import mem0_payload_text
+from fused_memory.utils.store_mutation_preflight import assert_store_mutation_allowed
 
 logger = logging.getLogger('audit_duplicate_memories')
 
@@ -380,8 +451,13 @@ _LIVE_FIELD_NAMES: tuple[str, ...] = (
     'pid',
 )
 
-# ``<field> = <value>``, as EITHER a fully-quoted value or a bare token — never
-# a half-read mixture of the two.
+# ``<field>=<value>``, as EITHER a fully-quoted value or a bare token — never
+# a half-read mixture of the two, and never fabricated from thin air: the
+# value group is OPTIONAL, so a recognised field written in assignment form
+# with no value this pattern can read still matches the field alone, with
+# `quoted` AND `bare` both `None`. One pattern with an optional value group
+# is what lets "read whole" and "seen but unreadable" stay one shape instead
+# of two kept in sync by hand.
 #
 # The quoted branch is deliberately all-or-nothing. An earlier single-branch
 # form (``"?([A-Za-z0-9_./:+-]+)"?``) let the value class terminate INSIDE a
@@ -402,11 +478,57 @@ _LIVE_FIELD_NAMES: tuple[str, ...] = (
 # the delimiter into the key; the characters it does admit (`-`, `.`, `/`,
 # `:`, `+`) are the ones real values need — `in-progress`, a path, an ISO
 # timestamp.
-_LIVE_FIELD_ASSIGNMENT_RE = re.compile(
-    r'\b(' + '|'.join(_LIVE_FIELD_NAMES) + r')\s*=\s*'
-    r'(?:"([^"|\n]+)"|([A-Za-z0-9_./:+-]+))',
+#
+# The value must directly ABUT `=` — there is no ``\s*`` between them, unlike
+# the gap before it. A gap there would let the bare branch silently absorb
+# the next word of ordinary prose as though it had been assigned: measured
+# live, ``The pid= field is unset`` would otherwise read as the fabricated
+# pair `pid=field` rather than the unreadable mention it actually is.
+# Requiring the value to start immediately at `=` makes a whitespace-
+# separated following token fail the value group instead of being misread
+# as it, so it falls through to the same unreadable case an absent value
+# produces.
+_LIVE_FIELD_ALT = '|'.join(_LIVE_FIELD_NAMES)
+_LIVE_FIELD_SCAN_RE = re.compile(
+    r'\b(?P<field>' + _LIVE_FIELD_ALT + r')\s*='
+    r'(?:"(?P<quoted>[^"|\n]+)"|(?P<bare>[A-Za-z0-9_./:+-]+))?',
     re.IGNORECASE,
 )
+
+
+def _readable_field_pairs(text: str) -> set[str] | None:
+    """Every readable ``field=value`` pair in *text*, or None if any is not.
+
+    The SINGLE copy of the pair-reading logic, shared by the record-level
+    classifier and the per-clause scan `liveness_snapshot_subject_facts`
+    runs. A second hand-rolled copy of the same normalisation is exactly the
+    drift `_classify_liveness_snapshot`'s "deliberately single-copy" note
+    warns about.
+
+    Returns:
+        The set of ``<field>=<value>`` pairs — field name lowercased, value
+        whitespace-normalised, trailing delimiter/punctuation stripped, and
+        lowercased. Empty when *text* names no recognised field in assignment
+        form at all. None when a recognised ``<field>=`` was found but its
+        value could not be read WHOLE (an absent value group, or one that
+        cleaned to empty) — the distinction the record-level caller turns into
+        a `liveness_snapshot_unfielded` disclosure rather than a key built
+        from the survivors.
+    """
+    pairs: set[str] = set()
+    for m in _LIVE_FIELD_SCAN_RE.finditer(text):
+        if m.group('quoted') is None and m.group('bare') is None:
+            return None
+        # Exactly one of `quoted`/`bare` ever participates; `' '.join(split())`
+        # normalises the whitespace a quoted value may now legitimately carry
+        # (and is a no-op on a bare token).
+        cleaned = ' '.join(
+            (m.group('quoted') or m.group('bare')).split(),
+        ).rstrip('./:+-').lower()
+        if not cleaned:
+            return None
+        pairs.add(f"{m.group('field').lower()}={cleaned}")
+    return pairs
 
 
 def _classify_liveness_snapshot(content: str) -> tuple[bool, str | None]:
@@ -428,9 +550,22 @@ def _classify_liveness_snapshot(content: str) -> tuple[bool, str | None]:
         * ``(False, None)`` — not a liveness snapshot, and not a loss either:
           the content never entered this detector's scope.
         * ``(True, None)`` — point-in-time framing over a live-status marker
-          whose fields could not be read whole. THE counted
-          ``liveness_snapshot_unfielded`` loss; the caller owns that counter,
-          so this function stays a pure classifier.
+          where NO assignment was readable, OR where ANY ONE recognised
+          field's value could not be read whole even though others did. THE
+          counted ``liveness_snapshot_unfielded`` loss; the caller owns that
+          counter, so this function stays a pure classifier. Never a key
+          built from only the readable survivors of the ASSIGNMENT-form
+          fields ``_LIVE_FIELD_SCAN_RE`` recognises, since under ``--apply``
+          a false cluster like that is an irreversible delete. That
+          guarantee is scoped to the assignment form specifically: a status
+          spelled a way the scan does not recognise at all — a ``status:``
+          colon, or a bare ``LIVE_TASK_STATUS_RE`` paraphrase such as
+          "currently running" — is invisible to the scan rather than an
+          unread mention of one, so it can still combine with readable
+          sibling assignments into a survivors-only key. Pre-existing and
+          narrower than the defect this function fixes; pinned as a known
+          limitation, not closed here, by
+          ``test_a_non_assignment_status_can_still_false_group``.
         * ``(True, key)`` — a snapshot, with its canonical key.
 
         ``POINT_IN_TIME_CHECK_RE`` is consulted AT MOST ONCE per call, and not
@@ -444,26 +579,25 @@ def _classify_liveness_snapshot(content: str) -> tuple[bool, str | None]:
     # ``LIVE_TASK_STATUS_RE`` — and a non-match is the overwhelmingly common
     # case: this detector always runs, with no flag to disable it, over a
     # default 5000-records-per-category scan of mostly ordinary prose.
-    # The gate is SOUND because ``_LIVE_FIELD_ASSIGNMENT_RE`` is
-    # ``LIVE_TASK_STATUS_RE``'s first alternative plus extra obligations, so
-    # an assignment hit implies a live-status hit: a record failing this check
-    # could never have yielded a key anyway. A record it rejects reports
-    # ``framed=False`` even if the point-in-time framing would have matched —
-    # which is the intended contract, since such a record is out of scope
-    # rather than a loss.
+    # The gate is SOUND because every ``_LIVE_FIELD_SCAN_RE`` match requires
+    # ``LIVE_TASK_STATUS_RE``'s first alternative (a bare ``<field>=``) as a
+    # prefix, whether or not the optional value group goes on to match, so a
+    # scan hit — read OR unreadable — implies a live-status hit: a record
+    # failing this check could never have yielded a key, nor an unfielded
+    # loss, anyway. A record it rejects
+    # reports ``framed=False`` even if the point-in-time framing would have
+    # matched — which is the intended contract, since such a record is out
+    # of scope rather than a loss.
     if not LIVE_TASK_STATUS_RE.search(content):
         return False, None
     if not POINT_IN_TIME_CHECK_RE.search(content):
         return False, None
 
-    pairs: set[str] = set()
-    for field, quoted, bare in _LIVE_FIELD_ASSIGNMENT_RE.findall(content):
-        # Exactly one branch ever participates; `' '.join(split())` normalises
-        # the whitespace a quoted value may now legitimately carry (and is a
-        # no-op on a bare token).
-        cleaned = ' '.join((quoted or bare).split()).rstrip('./:+-').lower()
-        if cleaned:
-            pairs.add(f'{field.lower()}={cleaned}')
+    # `not pairs` covers BOTH None (a field whose value could not be read
+    # whole) and the empty set (a `LIVE_TASK_STATUS_RE` paraphrase naming no
+    # readable field at all) — the two branches that separately returned
+    # `(True, None)` before the reader was extracted.
+    pairs = _readable_field_pairs(content)
     if not pairs:
         return True, None
     return True, '|'.join(sorted(pairs))
@@ -543,6 +677,11 @@ def liveness_snapshot_subject_task_ids(record: dict) -> set[str]:
     rather than two. A ``related_task_ids`` that is not a collection degrades
     without raising: a scalar contributes itself, anything else contributes
     nothing. Does not mutate *record*.
+
+    Answers WHICH tasks a record is about. For WHAT each of them is asserted
+    to be — the per-subject core fact this detector actually buckets on — see
+    ``liveness_snapshot_subject_facts``, which takes this function's output as
+    its subject set.
     """
     metadata = record.get('metadata') or {}
     subjects: set[str] = set()
@@ -567,11 +706,172 @@ def liveness_snapshot_subject_task_ids(record: dict) -> set[str]:
     return subjects
 
 
+def _field_names(pairs: Iterable[str]) -> list[str]:
+    """Field names of an iterable of `<field>=<value>` pairs, duplicates kept.
+
+    The one split both `_key_field_names` (a core_fact's `|`-joined pairs)
+    and `liveness_snapshot_subject_facts`'s field-vocabulary gate (a
+    clause's pair set) route through, so the module keeps a single copy of
+    this read rather than two hand-rolled ones that could drift apart.
+    """
+    return [pair.split('=', 1)[0] for pair in pairs]
+
+
+def _key_field_names(core_fact: str) -> list[str]:
+    """Field names a `|`-joined core_fact key names, in order, duplicates kept.
+
+    Reads the KEY, not the content: pairs are `|`-joined and no value can
+    contain a `|` (`_LIVE_FIELD_SCAN_RE` excludes it from both branches), so
+    this costs a split and no regex consult.
+    """
+    return _field_names(core_fact.split('|'))
+
+
+def _asserts_one_field_twice(core_fact: str) -> bool:
+    """Does a whole-record key carry TWO values for ONE field?
+
+    True means the record's union key is a CHIMERA no single-task snapshot
+    can ever match -- the one shape clause scoping exists to rescue.
+    """
+    names = _key_field_names(core_fact)
+    return len(names) != len(set(names))
+
+
+def liveness_snapshot_subject_facts(
+    record: dict, core_fact: str, *, subjects: set[str] | None = None,
+) -> dict[str, set[str]]:
+    """WHAT each subject of a liveness snapshot is asserted to be.
+
+    The per-subject sibling of ``liveness_snapshot_subject_task_ids``: that one
+    answers WHICH tasks a record is about, this one what it says about each.
+
+    Every subject keys on *core_fact* — always, unconditionally. A
+    clause-scoped key is ADDED beside it, never substituted, and only when
+    *core_fact* names one field twice: that union is a chimera no single-task
+    snapshot can match, which is the divergence this projection exists to
+    rescue. A COHERENT union gains nothing from clause scoping — every clause
+    key is then a strict WEAKENING of it — and adding one would make grouping
+    turn on where the author put a full stop, since ``.`` and a newline are
+    both clause boundaries. Gating on divergence also skips the clause scan
+    entirely for the overwhelmingly common coherent record.
+
+    A clause-scoped key clears a SECOND gate before it is added: it must name
+    the SAME SET of field NAMES as *core_fact* itself, not merely a non-empty
+    one. Divergence DUPLICATES a field name — the name set is unchanged — while
+    a FRAGMENT (a clause that names only some of the fields its record was
+    recognised to speak about) OMITS one, shrinking the name set. Field-NAME-set
+    equality is what separates the case clause scoping exists for from the case
+    that manufactures a group the whole-record key never would have. A
+    PAIR-level "not a strict subset of *core_fact*" predicate does NOT work
+    here — do not "simplify" it back to one: a divergent record's union key is
+    the UNION of the conflicting values, so the GOOD clause key (e.g.
+    ``claimant_run_id=null|heartbeat_at=null|status=in-progress``) IS a strict
+    pair-subset of the union (e.g.
+    ``claimant_run_id=null|heartbeat_at=null|status=done|status=in-progress``)
+    — that predicate would kill the exact case this rescope exists to serve.
+    A clause key that SURVIVES this gate therefore states its record's whole
+    field vocabulary for its subject, so when it collides with another
+    record's whole-record key, both sides assert the same COMPLETE fact about
+    the same subject — a true recurrence, not a fragment collision.
+
+    The comparison target, *core_fact*, is the RECORD's whole-document union
+    — the field vocabulary named anywhere in the record, across every
+    subject's clauses — not a vocabulary re-derived for one subject alone.
+    That is a deliberate, CONSERVATIVE choice with a known recall cost: a
+    clause can be a COMPLETE statement about its own subject and still be
+    dropped, when some OTHER subject's clause in the same record names
+    additional fields the first clause does not. ``_LIVENESS_DIVERGENT_PARTIAL_94``
+    is exactly this shape — task 94's clause names only ``status``, which is
+    the entire claim any clause in that record ever makes about task 94, yet
+    it is dropped because task 96's separate clause names two more fields
+    elsewhere in the same content (``TestLivenessClauseFragmentFalseGroup``
+    pins the resulting refusal). The trade is accepted because the failure
+    direction is safe: dropping a key can only cost a report-only group,
+    never manufacture a false one, and it never vacates the subject's own
+    unconditional *core_fact* bucket.
+
+    The clause-scoped key comes from splitting the content with
+    ``task_filter.WIDE_CLAUSE_BOUNDARY_RE`` and reading each clause's task refs
+    (``TASK_REF_RE``) and ``<field>=<value>`` assignments separately — the
+    technique ``task_filter.find_conflicting_task_status_ids`` uses — unioned
+    over the clauses that NAME the subject. A clause ``_readable_field_pairs``
+    declines contributes nothing rather than a survivors-only fragment: the
+    record-level gate has already proved every recognised field in the whole
+    content reads whole, so an unreadable CLAUSE is a boundary landing inside
+    a value, never a field this detector failed to see.
+
+    Args:
+        record: A memory dict the caller has already classified as a liveness
+            snapshot.
+        core_fact: That record's whole-record key, taken as a PARAMETER rather
+            than re-derived — ``extract_liveness_snapshot_fact`` would consult
+            the quadratic ``POINT_IN_TIME_CHECK_RE`` a SECOND time per record,
+            which ``TestLivenessDetectorRegexBudget``'s consult-count pins
+            forbid.
+        subjects: That record's subject set, threaded for the same reason: the
+            caller already derives it for the untasked disclosure, and
+            re-deriving costs a second whole-content ``TASK_REF_RE`` pass.
+            Defaults to ``liveness_snapshot_subject_task_ids(record)``.
+
+    Returns:
+        ``{subject_task_id: {facts to bucket it under}}``, carrying EVERY
+        subject. Each set ALWAYS contains *core_fact*, plus the subject's
+        clause-scoped fact under the divergence and field-vocabulary gates
+        above. Because *core_fact* is unconditional this projection is ADDITIVE by
+        construction — no pre-rescope bucket membership can be vacated, so it
+        warrants no new ``_LIVENESS_DISCLOSURE_KEYS`` counter
+        (``TestLivenessSubjectFactsIsAdditive``). Does not mutate *record*.
+    """
+    if subjects is None:
+        subjects = liveness_snapshot_subject_task_ids(record)
+
+    scoped: dict[str, set[str]] = {}
+    if _asserts_one_field_twice(core_fact):
+        for clause in WIDE_CLAUSE_BOUNDARY_RE.split(record.get('content') or ''):
+            if not clause.strip():
+                continue
+            refs = {str(ref) for ref in TASK_REF_RE.findall(clause)}
+            if not refs:
+                continue
+            pairs = _readable_field_pairs(clause) or set()
+            for ref in refs:
+                scoped.setdefault(ref, set()).update(pairs)
+
+    if scoped:
+        # SECOND gate: a clause key earns its bucket only when it names the
+        # SAME field-NAME set as the record's own union key -- see the
+        # docstring's field-vocabulary paragraph for why this must be a
+        # name-SET comparison, not a pair-subset one, and for the known
+        # recall trade this record-level comparison makes. A subject
+        # dropped here still keys on the unconditional seed below, so this
+        # cannot vacate a bucket. Guarded on `scoped` so the overwhelmingly
+        # common coherent record (or a divergent one whose clauses named no
+        # subject) does no extra work here either.
+        record_fields = set(_key_field_names(core_fact))
+        scoped = {
+            ref: pairs for ref, pairs in scoped.items()
+            if set(_field_names(pairs)) == record_fields
+        }
+
+    facts: dict[str, set[str]] = {}
+    for subject in subjects:
+        # SEED unconditionally, ADD beside it — the whole monotonicity
+        # argument. A clause-scoped key that REPLACED this one would not be
+        # additive: a subject whose clause carried only SOME of the record's
+        # fields would key on a partial fact matching nothing and quietly
+        # leave the bucket it used to share.
+        keys = {core_fact}
+        if clause_pairs := scoped.get(subject):
+            keys.add('|'.join(sorted(clause_pairs)))
+        facts[subject] = keys
+    return facts
+
+
 # The three Mem0-backed categories, enumerated ONCE. Graphiti-backed
 # categories (entities_and_relations, temporal_facts, decisions_and_rationale)
 # are deliberately absent: this detector reads the Mem0/Qdrant collection, and
 # a Graphiti edge has no vector here to cluster on.
-_ALL_CATEGORIES: tuple[str, ...] = (
+ALL_CATEGORIES: tuple[str, ...] = (
     'procedural_knowledge',
     'preferences_and_norms',
     'observations_and_summaries',
@@ -588,6 +888,7 @@ _ANN_DISCLOSURE_KEYS: tuple[str, ...] = (
     'below_threshold_dropped',
     'unknown_neighbor_dropped',
     'missing_vector',
+    'uncalibrated_category_dropped',
 )
 
 
@@ -605,7 +906,7 @@ _LIVENESS_DISCLOSURE_KEYS: tuple[str, ...] = (
 def find_liveness_snapshot_recurrences(
     memories: list[dict],
     *,
-    categories: Iterable[str] = _ALL_CATEGORIES,
+    categories: Iterable[str] = ALL_CATEGORIES,
 ) -> tuple[list[dict[str, Any]], dict[str, int]]:
     """Group point-in-time liveness snapshots that re-assert one core FACT.
 
@@ -616,36 +917,62 @@ def find_liveness_snapshot_recurrences(
     Buckets by ``(category, subject_task_id, core_fact)`` and emits every
     bucket with >= 2 members — the same >= 2 rule ``cluster_memories_by_pairs``
     already applies, so "what counts as a group" does not acquire a second
-    meaning. Grouping is PER CATEGORY for the same reason ``build_sweep_plan``
-    clusters per category: a preference and an observation that happen to
+    meaning. The one subtraction is the same-member collapse below, which
+    drops a restatement rather than a finding. Grouping is PER CATEGORY for
+    the same reason ``build_sweep_plan`` clusters per category: a preference and an observation that happen to
     report the same live fields are different kinds of knowledge, and unioning
     them would be cross-store conflation rather than deduplication.
 
-    A record contributes to one bucket per subject it names, so a
+    A record contributes to one bucket per ``(subject, fact)`` pair, so a
     re-verification covering two tasks joins both their groups — which is
-    exactly how memory 1eef7df7 links to the earlier 94 and 96 snapshots.
+    exactly how memory 1eef7df7 links to the earlier 94 and 96 snapshots. Each
+    of those buckets carries that subject's OWN fact, not one key shared
+    across every subject the record happens to mention.
 
-    KNOWN LIMITATION, deliberate: the core fact is built ONCE PER RECORD by
-    unioning every assignment in its content, then attributed to every subject
-    that record names. When a multi-task re-verification reports DIVERGENT
-    values per task, that merged key matches neither single-task snapshot and
-    the recurrence goes unreported — pinned, so the behaviour is visible
-    rather than discovered later, by
-    ``test_divergent_per_task_statuses_do_not_group``. The real motivating
-    record (1eef7df7) reports identical values for both its subjects, so the
-    detector fires on the corpus that motivated it; a future divergent one
-    would be a RECALL gap in a report-only path, never a wrong delete.
+    A subject can own two buckets for one record — its clause-scoped fact and
+    the whole-record union — but never two GROUPS over the SAME member set: a
+    clause-scoped bucket reaching identical membership is one finding keyed
+    twice, and ``liveness_snapshot_recurrences`` is an ARMED count. The richer
+    key wins that collapse — always the whole-record one, since a clause key's
+    pairs are a subset — so the survivor is the group that predates clause
+    scoping. A clause-scoped bucket only exists when both of
+    ``liveness_snapshot_subject_facts``'s gates below let it through, so a
+    bucket that can never exist can never join some unrelated record's
+    whole-record bucket either.
 
-    Per-subject key scoping was tried and rejected on evidence, not taste.
-    Splitting content into per-task clauses with
-    ``task_filter._CLAUSE_SPLIT_RE`` and keying each subject on its own clause
-    (the technique ``task_filter.find_conflicting_task_status_ids`` uses)
-    yields the EMPTY SET on all four real records: ``_CLAUSE_SPLIT_RE`` splits
-    on ``.``, which shatters ``dark-factory-orchestrator.yaml`` and
-    ``CLAUDE.md:95`` mid-sentence, and the nearby reference is written
-    ``task/94``, which ``TASK_REF_RE``'s ``\\s*#?\\s*`` separator does not
-    match. Adopting it would trade a bounded, pinned recall gap for a detector
-    inert on its own motivating corpus.
+    The core fact is keyed PER SUBJECT by ``liveness_snapshot_subject_facts``,
+    which splits the content into clauses with
+    ``task_filter.WIDE_CLAUSE_BOUNDARY_RE`` and adds each subject's own
+    clause-scoped key beside the whole-record one — but only when BOTH of
+    that function's gates hold: the DIVERGENCE gate
+    (the record's union key names one field twice) and the FIELD-VOCABULARY
+    gate (the clause names every field that union names, not a strict subset
+    of them — a fragment). A multi-task re-verification reporting DIVERGENT
+    values per task therefore joins each subject's own group, where that
+    union matched neither single-task snapshot and the recurrence went
+    unreported (pinned by
+    ``test_divergent_per_task_statuses_group_per_subject``). A record whose
+    union is COHERENT keys exactly as it did before clause scoping, so
+    grouping never turns on where the author put a full stop — ``.`` and
+    a newline are both clause boundaries, and every clause key of a coherent
+    record is a strict weakening of it.
+
+    EVERY subject buckets under the whole-record union key unconditionally,
+    which is what makes the rescope monotone: a bucket membership that existed
+    before clause scoping cannot be vacated by it, so the rescope can only ADD
+    recall and grows no new disclosure counter
+    (``TestLivenessSubjectFactsIsAdditive``).
+
+    Clause scoping was INERT when the detector was first written:
+    ``task_filter``'s clause splitter split on EVERY ``.``, shattering
+    ``dark-factory-orchestrator.yaml`` mid-sentence, and the real content
+    writes ``task/94``, which ``TASK_REF_RE``'s separator did not match —
+    together the EMPTY SET on all four real records. Task 3403 fixed both at
+    the source, and this rescope RE-MEASURED the technique against those same
+    four records rather than assuming it now returns non-empty. That
+    measurement lives in ``TestLivenessSnapshotSubjectFacts``, where a
+    regression in either shared regex fails naming the subject and the fact
+    rather than an absent group.
 
     Args:
         memories: Raw memory list (any/all categories).
@@ -661,17 +988,23 @@ def find_liveness_snapshot_recurrences(
         usable timestamp" keeps the one definition it shares with
         ``pick_survivor``; a group whose members ALL lack a parseable
         timestamp reports None for all three rather than fabricating a span.
-        Groups are sorted by ``(category, subject_task_id, first member id)``
-        so two identical runs serialise byte-identically. Does not mutate
-        *memories* or its dicts.
+        Groups are sorted by ``(category, subject_task_id, first member id,
+        core_fact)`` so two identical runs serialise byte-identically.
+        ``core_fact`` is load-bearing, not decoration: one subject can own two
+        groups whose member sets DIFFER but whose first member id is shared,
+        which the first three components do not discriminate. Does not mutate *memories* or its dicts.
 
         *disclosure* carries every ``_LIVENESS_DISCLOSURE_KEYS`` counter —
         ``liveness_snapshot_untasked`` (a recognised snapshot that resolves to
         no subject, so no bucket can hold it) and
         ``liveness_snapshot_unfielded`` (point-in-time framing over a
-        ``LIVE_TASK_STATUS_RE`` marker whose fields could not be read — a
-        paraphrase naming no fields, or a value ``_LIVE_FIELD_ASSIGNMENT_RE``
-        declines to read half-way, such as an unterminated quote).
+        ``LIVE_TASK_STATUS_RE`` marker whose fields could not ALL be read —
+        a paraphrase naming no fields, a value ``_LIVE_FIELD_SCAN_RE``
+        declines to read half-way (such as an unterminated quote), OR a
+        record where ONE recognised field's value could not be read whole
+        while a sibling's did. The verdict is per-field: any one of these
+        makes the WHOLE record a loss rather than a key built from the
+        survivors).
         Both are always present, always ints, always 0 on a clean run.
     """
     swept = set(categories)
@@ -699,8 +1032,18 @@ def find_liveness_snapshot_recurrences(
             # A recognised snapshot no bucket can hold: real recall, counted
             # rather than invisible.
             disclosure['liveness_snapshot_untasked'] += 1
-        for subject in subjects:
-            buckets.setdefault((category, subject, core_fact), []).append(record)
+        # PER SUBJECT. `subjects` is threaded in rather than re-derived: it
+        # is the same set, and re-deriving costs a second whole-content
+        # `TASK_REF_RE` pass per record.
+        for subject, subject_facts in liveness_snapshot_subject_facts(
+            record, core_fact, subjects=subjects,
+        ).items():
+            # `sorted`, not bare set iteration: insertion order decides
+            # nothing stable across runs, and the Returns contract promises
+            # byte-identical serialisation. One comparison on a 1-or-2 element
+            # set removes the question.
+            for fact in sorted(subject_facts):
+                buckets.setdefault((category, subject, fact), []).append(record)
 
     groups: list[dict[str, Any]] = []
     for (category, subject, core_fact), members in buckets.items():
@@ -731,8 +1074,31 @@ def find_liveness_snapshot_recurrences(
             'span_days': span_days,
         })
 
+    # One subject, ONE group per member set. A clause-scoped bucket that
+    # reaches the identical membership as the whole-record bucket is the same
+    # finding keyed twice, and `liveness_snapshot_recurrences` is an ARMED
+    # `higher_is_worse` count — a structural 2x there is a false accretion
+    # signal, and a duplicate row for the human reader. The richer key wins,
+    # which is always the whole-record one (a clause key's pairs are a subset
+    # of the record's), so the survivor is the group that predates clause
+    # scoping; `core_fact` breaks a tie no pair-count can.
+    survivors: dict[tuple[Any, str, tuple[str, ...]], dict[str, Any]] = {}
+    for group in groups:
+        ident = (
+            group['category'], group['subject_task_id'],
+            tuple(str(member) for member in group['member_ids']),
+        )
+        rank = (str(group['core_fact']).count('|'), str(group['core_fact']))
+        held = survivors.get(ident)
+        if held is None or rank > (
+            str(held['core_fact']).count('|'), str(held['core_fact'])
+        ):
+            survivors[ident] = group
+
+    groups = list(survivors.values())
     groups.sort(key=lambda g: (
         str(g['category']), g['subject_task_id'], str(g['member_ids'][0]),
+        str(g['core_fact']),
     ))
     return groups, disclosure
 
@@ -740,7 +1106,7 @@ def find_liveness_snapshot_recurrences(
 def ann_pairs_from_neighbors(
     memories: list[dict],
     neighbors_by_id: dict[Any, list[dict]],
-    threshold: float,
+    threshold: float | Mapping[str, float],
     *,
     top_k: int | None = None,
 ) -> tuple[list[tuple[int, int]], dict[str, int]]:
@@ -762,7 +1128,15 @@ def ann_pairs_from_neighbors(
         neighbors_by_id: ``{memory_id: [{'id': ..., 'score': ...}, ...]}``.
             A record absent from this mapping simply contributes no pairs.
         threshold: Minimum score for a hit to become a candidate pair.
-            INCLUSIVE — a hit exactly at *threshold* is kept.
+            INCLUSIVE — a hit exactly at *threshold* is kept. Either a scalar
+            (one cutoff for every record) or, since task 3357, a
+            ``{category: cutoff}`` mapping from ``resolve_ann_threshold``:
+            each hit is then gated by the cutoff measured for the QUERYING
+            record's own category, and a record whose category is absent from
+            the mapping is UNCALIBRATED — its hits form no pairs at all
+            rather than being gated by a number measured on a different
+            population. This is the authoritative per-category filter; the
+            scalar pushed down to Qdrant is only a MIN-of-cutoffs floor.
         top_k: The per-record neighbour cap the query was issued with. When
             given, a neighbour list filled to the cap is counted as
             ``top_k_saturated``: further matches may have been cut off.
@@ -775,12 +1149,24 @@ def ann_pairs_from_neighbors(
           - ``top_k_saturated`` — records whose neighbour list hit the cap.
             A property of the QUERY, so counted regardless of how many hits
             then survived the threshold.
-          - ``below_threshold_dropped`` — hits scored under *threshold*.
+          - ``below_threshold_dropped`` — hits scored under the cutoff that
+            APPLIES to them (the querying record's category cutoff when a
+            mapping was given).
           - ``unknown_neighbor_dropped`` — hits naming a record outside the
             scanned set (excluded by the category filter, or written between
             the scroll and the query); it cannot be clustered, so it is lost.
           - ``missing_vector`` — records with no stored vector to query with,
             so they were never used as a query point.
+          - ``uncalibrated_category_dropped`` — hits on a record whose
+            category has NO cutoff in the mapping (including a record with no
+            category at all). Counted separately from
+            ``below_threshold_dropped`` because the cause and the fix differ:
+            those hits were never eligible, so the recall was lost to missing
+            calibration, not to a cutoff doing its job. Reads zero when the
+            caller passed the same mapping to ``fetch_ann_neighbors``, which
+            then never issues the query at all and counts the RECORD under
+            ``ann_query_skipped_uncalibrated`` instead — the same loss,
+            attributed to the layer that actually declined it.
 
         A self-hit is dropped silently: a record is always its own nearest
         neighbour, which is expected rather than a loss.
@@ -800,13 +1186,30 @@ def ann_pairs_from_neighbors(
 
         hits = neighbors_by_id.get(memory.get('id')) or []
         if top_k is not None and len(hits) >= top_k:
+            # A property of the QUERY, which was issued regardless of whether
+            # this record's category ended up calibrated.
             disclosure['top_k_saturated'] += 1
+
+        # The cutoff that APPLIES to this record. Absent from a mapping means
+        # UNCALIBRATED for that category — its hits are not eligible at all,
+        # rather than gated by a number measured on another population. A
+        # record carrying no category (or a non-string one) is uncalibrated by
+        # the same rule: there is no category whose cutoff could apply to it.
+        category = memory.get('category')
+        cutoff = (
+            (threshold.get(category) if isinstance(category, str) else None)
+            if isinstance(threshold, Mapping)
+            else threshold
+        )
 
         for hit in hits:
             hit_id = hit.get('id')
             if hit_id == memory.get('id'):
                 continue  # self-hit: expected, not a loss
-            if (hit.get('score') or 0.0) < threshold:
+            if cutoff is None:
+                disclosure['uncalibrated_category_dropped'] += 1
+                continue
+            if (hit.get('score') or 0.0) < cutoff:
                 disclosure['below_threshold_dropped'] += 1
                 continue
             j = index_by_id.get(hit_id)
@@ -888,28 +1291,84 @@ def ann_scores_for_pairs(
     return scores
 
 
+def ann_candidate_pairs(
+    memories: list[dict],
+    neighbors_by_id: dict[Any, list[dict]],
+    *,
+    top_k: int | None,
+) -> tuple[list[tuple[int, int]], dict[str, int]]:
+    """ANN as the candidate GENERATOR for an adjudicator: every hit is a pair.
+
+    No similarity cutoff applies; the disclosure is ``ann_pairs_from_neighbors``'s.
+    """
+    return ann_pairs_from_neighbors(memories, neighbors_by_id, -math.inf, top_k=top_k)
+
+
+SlateScorer = Callable[[str, Sequence[str]], Sequence[float]]
+
+
+def adjudicate_pairs(
+    memories: list[dict],
+    pairs: Iterable[tuple[int, int]],
+    score_slate: SlateScorer,
+) -> dict[tuple[int, int], float]:
+    """Score each canonical pair as the mean of its two directional scores.
+
+    *score_slate* is called once per record, with its partners in index
+    order. A pair with an empty endpoint is never scored and is absent.
+    """
+    texts = [(m.get('content') or '').strip() for m in memories]
+    scorable = {(i, j) for i, j in pairs if texts[i] and texts[j]}
+    partners: dict[int, list[int]] = {}
+    for i, j in scorable:
+        partners.setdefault(i, []).append(j)
+        partners.setdefault(j, []).append(i)
+
+    directional: dict[tuple[int, int], float] = {}
+    for i in sorted(partners):
+        others = sorted(partners[i])
+        scores = score_slate(texts[i], [texts[j] for j in others])
+        if len(scores) != len(others):
+            raise ValueError(
+                f'score_slate returned {len(scores)} scores for memory '
+                f'{memories[i].get("id")!r}, expected {len(others)}',
+            )
+        directional.update(((i, j), float(s)) for j, s in zip(others, scores, strict=True))
+
+    return {
+        (i, j): (directional[(i, j)] + directional[(j, i)]) / 2
+        for i, j in sorted(scorable)
+    }
+
+
+def adjudicated_pairs(
+    scores: Mapping[tuple[int, int], float],
+    threshold: float,
+) -> list[tuple[int, int]]:
+    """The pairs scoring at or above *threshold* (inclusive), sorted."""
+    return sorted(pair for pair, score in scores.items() if score >= threshold)
+
+
 def _created_at_sort_key(created_at: Any) -> tuple[int, float]:
     """Sort key placing parseable ``created_at`` oldest-first, unparseable last.
 
     Returns ``(0, timestamp)`` for a parseable ISO datetime string (so the
     oldest instant sorts first), or ``(1, 0.0)`` for ``None``/unparseable
     values — always after every parseable entry, so a record with no usable
-    timestamp is never mistakenly picked as "the oldest".
+    timestamp is never mistakenly picked as "the oldest". The parse is
+    ``fused_memory.utils.created_at.parse_created_at``'s.
     """
-    if not isinstance(created_at, str) or not created_at:
-        return (1, 0.0)
-    try:
-        return (0, datetime.fromisoformat(created_at).timestamp())
-    except (ValueError, TypeError):
-        return (1, 0.0)
+    moment = parse_created_at(created_at)
+    return (1, 0.0) if moment is None else (0, moment.timestamp())
 
 
 def pick_survivor(group: list[dict]) -> tuple[dict, list[dict]]:
     """Pick the survivor from a near-duplicate memory group.
 
     Survivor selection (in order):
-      1. A member explicitly flagged canonical (``metadata.get('canonical')``
-         truthy) wins, regardless of age.
+      1. A member whose metadata claims canonical per
+         ``canonical_marker.py::is_canonical`` (bool ``True`` only; ``'true'``
+         or ``1`` is not a claim) wins, regardless of age.
       2. Otherwise, the oldest member by ``created_at`` (ISO string) wins.
          Records with a missing/unparseable ``created_at`` sort last (see
          ``_created_at_sort_key``) so they are never chosen as "oldest"
@@ -925,7 +1384,7 @@ def pick_survivor(group: list[dict]) -> tuple[dict, list[dict]]:
         raise ValueError(f'pick_survivor requires a group of >= 2 memories, got {len(group)}')
 
     def _sort_key(m: dict) -> tuple[bool, int, float, str]:
-        canonical = bool((m.get('metadata') or {}).get('canonical'))
+        canonical = is_canonical(m.get('metadata'))
         bucket, ts = _created_at_sort_key(m.get('created_at'))
         # `not canonical` so canonical=True sorts first (False < True);
         # bucket/ts ascending so the oldest parseable timestamp sorts first;
@@ -961,10 +1420,11 @@ def partition_topic_carveout(
     survivor selection, so carved-out clusters never reach ``pick_survivor``,
     whose contract is untouched. Do NOT re-derive this rule elsewhere.
 
-    The boundary is deliberately narrow: only a FULLY shared, non-empty topic
-    carves out. Differing topics, a partially-missing topic, or an
-    empty-string topic all stay actionable — a cluster is only exempt when
-    every member was deliberately tagged the same way.
+    This is the CLUSTER half of the carve-out: only a FULLY shared, non-empty
+    topic removes a whole cluster from the report. A cluster with differing
+    or partially-missing topics stays actionable and reported, and
+    ``split_retained`` is the per-member half that still keeps each of its
+    stamped (and child) members out of the delete lists.
 
     Note ``metadata.topic`` has zero corpus footprint until 3195/3201 land,
     so this is inert-but-correct today by design: implemented now so it is
@@ -975,6 +1435,97 @@ def partition_topic_carveout(
     for group in groups:
         (carved_out if _shared_topic(group) else actionable).append(group)
     return actionable, carved_out
+
+
+_RETAINED_CHILD_RECORD = 'child_record'
+_RETAINED_TOPIC_STAMPED = 'topic_stamped'
+_RETENTION_REASONS = (_RETAINED_TOPIC_STAMPED, _RETAINED_CHILD_RECORD)
+
+
+def _retention_reason(record: dict) -> str | None:
+    """Why ``--apply`` may never delete *record*, or None when it may.
+
+    The ONE definition. A record attached to a parent (``metadata.parent_id``,
+    an amendment or sighting child) would be orphaned from its parent's
+    lineage, and a topic-stamped record is a deliberately retained Option-C
+    peer whose siblings need not sit in the same cluster. ``child_record`` is
+    checked first, so a stamped child is reported once.
+    """
+    metadata = record.get('metadata') or {}
+    if metadata.get('parent_id'):
+        return _RETAINED_CHILD_RECORD
+    if metadata.get('topic'):
+        return _RETAINED_TOPIC_STAMPED
+    return None
+
+
+def split_retained(losers: list[dict]) -> tuple[list[dict], list[dict[str, Any]]]:
+    """Split a cluster's *losers* into ``(deletable, retained)``.
+
+    The per-member half of task 3136's carve-out (``partition_topic_carveout``
+    is the whole-cluster half). Retained entries are ``{'id', 'reason'}``
+    with the reason from ``_retention_reason``, in *losers* order.
+    """
+    deletable: list[dict] = []
+    retained: list[dict[str, Any]] = []
+    for loser in losers:
+        reason = _retention_reason(loser)
+        if reason is None:
+            deletable.append(loser)
+        else:
+            retained.append({'id': loser.get('id'), 'reason': reason})
+    return deletable, retained
+
+
+def member_facts(record: dict) -> dict[str, Any]:
+    """The per-member projection the duplicate-cluster report diffs on.
+
+    ``canonical`` is the same strict reading ``pick_survivor`` uses, so the
+    word means one thing across the survivor choice and the report.
+    """
+    metadata = record.get('metadata') or {}
+    return {
+        'id': record.get('id'),
+        'created_at': record.get('created_at'),
+        'topic': metadata.get('topic'),
+        'canonical': is_canonical(metadata),
+        'parent_id': metadata.get('parent_id'),
+        'kind': metadata.get('kind'),
+    }
+
+
+def count_children(
+    memories: Iterable[dict], categories: Iterable[str],
+) -> list[dict[str, Any]]:
+    """Count the records in *categories* per ``(parent_id, kind, category)``.
+
+    Every scanned record counts, clustered or not: after the write-triage
+    flip a re-emission attaches as a sighting child, so its recurrence shows
+    up here rather than as cluster growth. Kind-agnostic by design: the
+    recorded ``metadata.kind`` is the key, so no kind vocabulary is imported.
+    A row ``{parent_id, kind, category, count}`` names the child record's own
+    ``category``, so a consumer can tell which category's sweep counted it.
+    Rows are sorted by ``(-count, str(parent_id), str(kind), str(category))``.
+    """
+    swept = frozenset(categories)
+    counts: dict[tuple[Any, Any, Any], int] = {}
+    for record in memories:
+        category = record.get('category')
+        if category not in swept:
+            continue
+        metadata = record.get('metadata') or {}
+        parent_id = metadata.get('parent_id')
+        if parent_id:
+            key = (parent_id, metadata.get('kind'), category)
+            counts[key] = counts.get(key, 0) + 1
+    rows = [
+        {'parent_id': parent_id, 'kind': kind, 'category': category, 'count': count}
+        for (parent_id, kind, category), count in counts.items()
+    ]
+    rows.sort(key=lambda r: (
+        -r['count'], str(r['parent_id']), str(r['kind']), str(r['category']),
+    ))
+    return rows
 
 
 _MAX_LEXICAL_RATIO_MEMBERS = 40
@@ -1139,6 +1690,7 @@ def _pairs_span_members(
 
 def restrict_delete_candidates_for_apply(
     groups: Iterable[dict[str, Any]],
+    unevidenced_categories: Iterable[str] = (),
 ) -> tuple[list[Any], list[dict[str, Any]]]:
     """Narrow the reported delete candidates to the ones ``--apply`` may act on.
 
@@ -1150,10 +1702,16 @@ def restrict_delete_candidates_for_apply(
     Two facts make the ANN path riskier than the lexical one it joins, and
     only on deletion:
 
-      1. Its cutoff (``config.write_triage.t_high``) was calibrated for the
-         write-triage decision on a corpus that is overwhelmingly
-         ``procedural_knowledge``. Its pairwise precision on the two
-         newly-swept categories is thinly evidenced by comparison.
+      1. Its cutoff is only as good as the corpus it was measured on. Task
+         3357 made that measurable PER CATEGORY: a category with its own
+         derived cutoff in ``config.write_triage.t_high_by_category`` is
+         evidenced on its own labeled pairs, while one that fell back to the
+         pooled ``t_high`` is gated by a number measured on a corpus that is
+         overwhelmingly ``procedural_knowledge``. The calibration REFUSES a
+         cutoff for a category with no negative pairs to separate against,
+         and that refusal is a recorded finding, not a defect — so the
+         un-evidenced categories are named (*unevidenced_categories*) and
+         fenced out of deletion rather than silently trusted.
       2. Pairwise precision does not imply CLUSTER precision. The transitive
          closure chains A~B and B~C into one cluster even when A~C is far
          below the cutoff, and under ``--apply`` every non-survivor of that
@@ -1166,31 +1724,51 @@ def restrict_delete_candidates_for_apply(
         i.e. the cluster is one this detector would have actioned before the
         ANN path existed. Pre-existing behaviour, unchanged.
       - ``ann_clique`` — EVERY member pair independently cleared the ANN
-        cutoff, so no member is in the cluster by transitivity alone.
+        cutoff, so no member is in the cluster by transitivity alone — AND
+        that cutoff was measured for the cluster's own category.
 
     Anything else is withheld, with its ids and the reason reported so the
     withholding is legible rather than a silent shortfall.
 
     Args:
         groups: The plan's ``near_duplicate_groups`` entries.
+        unevidenced_categories: Categories whose ANN cutoff was NOT derived
+            for that category — either they ran on the POOLED fallback, or an
+            operator ``--ann-threshold`` displaced every measured cutoff with
+            one recall knob (see ``categories_without_own_cutoff``). Both are
+            numbers measured somewhere other than these pairs, so a group in
+            one of them may not contribute deletions on ANN evidence alone. A
+            ``lexical_spanning`` group is unaffected: its evidence never
+            depended on the ANN cutoff.
 
     Returns:
         ``(delete_candidates, withheld_groups)``.
     """
+    unevidenced = frozenset(unevidenced_categories)
     actionable: list[Any] = []
     withheld: list[dict[str, Any]] = []
     for group in groups:
         losers = list(group.get('delete_candidate_ids') or ())
         if not losers:
             continue
-        if group.get('lexical_spanning') or group.get('ann_clique'):
+        if group.get('lexical_spanning'):
             actionable.extend(losers)
             continue
+        if group.get('ann_clique'):
+            if group.get('category') not in unevidenced:
+                actionable.extend(losers)
+                continue
+            reason = 'ann_cutoff_not_evidenced_for_category'
+        else:
+            # The stricter, pre-existing refusal wins: a chained cluster is
+            # not actionable in ANY category, so naming the weaker reason
+            # here would understate why it was withheld.
+            reason = 'ann_chained_without_lexical_span_or_ann_clique'
         withheld.append({
             'member_ids': list(group.get('member_ids') or ()),
             'category': group.get('category'),
             'withheld_ids': losers,
-            'reason': 'ann_chained_without_lexical_span_or_ann_clique',
+            'reason': reason,
         })
     return actionable, withheld
 
@@ -1199,11 +1777,14 @@ def build_sweep_plan(
     memories: list[dict],
     threshold: float = 0.85,
     *,
-    categories: Iterable[str] = _ALL_CATEGORIES,
+    categories: Iterable[str] = ALL_CATEGORIES,
     ann_pairs: Iterable[tuple[int, int]] | None = None,
     ann_scores: dict[tuple[int, int], float] | None = None,
     ann_disclosure: dict[str, int] | None = None,
     ann_threshold: float | None = None,
+    ann_threshold_by_category: Mapping[str, float] | None = None,
+    unevidenced_categories: Iterable[str] = (),
+    scan_coverage: Mapping[str, Mapping[str, int]] | None = None,
 ) -> dict[str, Any]:
     """Orchestrate filtering -> dual-path clustering -> survivor selection -> report.
 
@@ -1234,8 +1815,21 @@ def build_sweep_plan(
             The remap-owned counters in ``_PLAN_DISCLOSURE_KEYS`` are MERGED
             into the echoed copy (the caller's dict is never mutated), so the
             plan carries the ANN path's complete loss accounting.
-        ann_threshold: The ANN cutoff actually in effect, echoed so a reader
-            of the report never has to guess which number produced it.
+        ann_threshold: The scalar ANN cutoff pushed down to Qdrant — the MIN
+            of the per-category cutoffs — echoed so a reader of the report
+            never has to guess which floor produced the candidate set.
+        unevidenced_categories: Categories running on the pooled fallback
+            cutoff; passed through to
+            ``restrict_delete_candidates_for_apply``, which withholds their
+            ANN-only clusters from ``--apply``. The REPORT still lists them.
+        ann_threshold_by_category: The cutoff that AUTHORITATIVELY gated each
+            category (task 3357), echoed alongside the floor so a reader can
+            tell which number gated which category. An EMPTY mapping says no
+            category was calibrated; ``None`` means the caller ran without
+            the ANN path at all.
+        scan_coverage: The caller's per-category scan counts, echoed so a
+            consumer of the stdout plan can tell a truncated scan from a
+            clean one. ``None`` when the caller has none (a pure-core call).
 
     Returns:
         JSON-serialisable plan dict. Pre-existing keys keep their exact
@@ -1246,10 +1840,13 @@ def build_sweep_plan(
         ``found_by`` (``['ann']``, ``['lexical']`` or both),
         ``lexical_clustered``, ``lexical_spanning``, ``ann_clique``,
         ``ann_max_score``, ``lexical_max_ratio``,
-        ``lexical_max_ratio_sampled`` and ``delete_candidate_ids``; the plan
-        additionally carries ``threshold``, ``ann_threshold``,
-        ``ann_disclosure``, ``topic_carveout_clusters`` /
-        ``topic_carveout_groups`` (see ``partition_topic_carveout``),
+        ``lexical_max_ratio_sampled``, ``delete_candidate_ids`` and
+        ``retained_members`` (losers ``split_retained`` keeps out of every
+        delete list, as ``{'id', 'reason'}``); the plan additionally carries
+        ``threshold``, ``ann_threshold``, ``ann_disclosure``,
+        ``topic_carveout_clusters`` / ``topic_carveout_groups`` (see
+        ``partition_topic_carveout``), ``retained_carveout`` (retained losers
+        counted per reason, every reason always present),
         ``apply_delete_candidates`` / ``apply_withheld_clusters`` /
         ``apply_withheld_groups`` (see
         ``restrict_delete_candidates_for_apply``) and ``path_verdicts``
@@ -1265,6 +1862,11 @@ def build_sweep_plan(
         apply gate — it is surfaced for human review and consolidation only.
         Task 3098 authorizes detection of the pattern, not disposition of the
         records that exhibit it.
+
+        Three keys feed task 3136's duplicate-cluster report: each group's
+        ``members`` (one ``member_facts`` row per ``member_ids`` entry, same
+        order), the plan's ``child_counts`` (see ``count_children``) and
+        ``scan_coverage`` (the *scan_coverage* argument echoed, or ``None``).
     """
     near_duplicate_groups: list[dict[str, Any]] = []
     # Mem0/Qdrant point ids can be int or str (ExtendedPointId), so this is
@@ -1273,6 +1875,7 @@ def build_sweep_plan(
     lexical_only = ann_only = both_paths = 0
     clusters_total = 0
     topic_carveout_groups: list[dict[str, Any]] = []
+    retained_carveout = dict.fromkeys(_RETENTION_REASONS, 0)
 
     # Cluster PER CATEGORY. Widening the filter must not merge the corpus: a
     # preference and a procedure that happen to read alike are different
@@ -1378,11 +1981,15 @@ def build_sweep_plan(
             )
 
             survivor, losers = pick_survivor(group)
-            loser_ids = [m.get('id') for m in losers]
+            deletable, retained = split_retained(losers)
+            deletable_ids = [m.get('id') for m in deletable]
+            for entry in retained:
+                retained_carveout[entry['reason']] += 1
             near_duplicate_groups.append({
                 'survivor_id': survivor.get('id'),
                 'survivor_content': survivor.get('content'),
                 'member_ids': [m.get('id') for m in group],
+                'members': [member_facts(m) for m in group],
                 'category': category,
                 'found_by': found_by,
                 'lexical_clustered': bool(group_lexical),
@@ -1394,9 +2001,10 @@ def build_sweep_plan(
                 'ann_max_score': max(scores) if scores else None,
                 'lexical_max_ratio': max_ratio,
                 'lexical_max_ratio_sampled': ratio_sampled,
-                'delete_candidate_ids': loser_ids,
+                'delete_candidate_ids': deletable_ids,
+                'retained_members': retained,
             })
-            delete_candidates.extend(loser_ids)
+            delete_candidates.extend(deletable_ids)
 
     # The THIRD candidate class, run ONCE over the whole list rather than
     # inside the per-category loop above: it does its own
@@ -1410,7 +2018,7 @@ def build_sweep_plan(
     )
 
     apply_candidates, apply_withheld = restrict_delete_candidates_for_apply(
-        near_duplicate_groups,
+        near_duplicate_groups, unevidenced_categories,
     )
     echoed_disclosure: dict[str, int] | None = None
     if ann_disclosure is not None or ann_pairs is not None:
@@ -1425,9 +2033,21 @@ def build_sweep_plan(
         'delete_candidates': delete_candidates,
         'threshold': threshold,
         'ann_threshold': ann_threshold,
+        'ann_threshold_by_category': (
+            dict(ann_threshold_by_category)
+            if ann_threshold_by_category is not None
+            else {}
+        ),
         'ann_disclosure': echoed_disclosure,
         'topic_carveout_clusters': len(topic_carveout_groups),
         'topic_carveout_groups': topic_carveout_groups,
+        'retained_carveout': retained_carveout,
+        'child_counts': count_children(memories, categories),
+        'scan_coverage': (
+            {c: dict(stats) for c, stats in scan_coverage.items()}
+            if scan_coverage is not None
+            else None
+        ),
         'liveness_snapshot_recurrence_clusters': len(liveness_groups),
         'liveness_snapshot_recurrence_groups': liveness_groups,
         'liveness_snapshot_disclosure': liveness_disclosure,
@@ -1581,8 +2201,9 @@ def _consolidation_events(
 ) -> list[dict[str, Any]]:
     """Per-consolidation net delta: what accreted after it minus what it absorbed.
 
-    A consolidation event is a record carrying ``canonical: true`` and/or a
-    non-empty ``supersedes``. Its peer set — the population that can accrete
+    A consolidation event is a record whose metadata claims canonical
+    (``canonical_marker.py::is_canonical``) and/or carries a non-empty
+    ``supersedes``. Its peer set — the population that can accrete
     "after" it — is its shared ``metadata.topic`` when it has one, else the
     near-duplicate cluster it belongs to. An event with neither has no
     identifiable peers, so nothing is attributed to it (0), rather than
@@ -1617,7 +2238,7 @@ def _consolidation_events(
     events: list[dict[str, Any]] = []
     for index, record in enumerate(records):
         metadata = record.get('metadata') or {}
-        if not (metadata.get('canonical') or metadata.get('supersedes')):
+        if not (is_canonical(metadata) or metadata.get('supersedes')):
             continue
         topic = topic_by_index[index]
         event_ts = ts_by_index[index]
@@ -1700,7 +2321,7 @@ def compute_cluster_metrics(
     zero-trial proportion, and emitting 0.0 would assert "0% of this corpus is
     duplicated" about a corpus that contains nothing to measure.
     """
-    from shared.memory_eval_metrics import Metric  # noqa: PLC0415
+    from shared.memory_eval_metrics import Metric
 
     metrics: list[Any] = []
     details: dict[str, Any] = {'categories': {}}
@@ -1764,6 +2385,17 @@ def compute_cluster_metrics(
         # indefinite accretion this detector exists to surface. Emitted for
         # every swept category, empty ones included — an absent metric is
         # indistinguishable from "not measured".
+        #
+        # The value counts GROUPS, one per `(category, subject, member set)`
+        # — not one per bucket. `find_liveness_snapshot_recurrences` collapses
+        # a subject keyed twice over the SAME members (its clause-scoped fact
+        # and its whole-record union) to the single richer-keyed group before
+        # returning, so this reads a regression only on new membership, never
+        # on a second key over membership already counted.
+        # `TestLivenessRecurrenceMetricsUnderDualKeying` arms that guarantee
+        # at THIS layer, not just the detector's own return, so a reader who
+        # changes the keying can see which number moves and where it is
+        # pinned.
         #
         # Carries `details_path` like every other metric whose full shape
         # lives in the companion file: the scalar says HOW MANY groups, but
@@ -1872,7 +2504,7 @@ def emit_metrics_artifact(
     Returns:
         ``(metrics_path, report_path, details_path)``.
     """
-    from shared.memory_eval_metrics import (  # noqa: PLC0415
+    from shared.memory_eval_metrics import (
         _atomic_write_text,
         write_metric_series,
     )
@@ -1926,7 +2558,7 @@ def build_metric_series(
     Raises:
         MetricSchemaError: The series is not emittable.
     """
-    from shared.memory_eval_metrics import (  # noqa: PLC0415
+    from shared.memory_eval_metrics import (
         SCHEMA_VERSION,
         Metric,
         MetricSeries,
@@ -1955,21 +2587,12 @@ def build_metric_series(
 # I/O layer: fetch (thin, mock-tested)
 # ---------------------------------------------------------------------------
 
-# Payload keys tried in order when extracting a Mem0 memory's text content
-# from its scroll_by_metadata() 'metadata' payload dict. 'data' is the
-# canonical scroll-payload key (mirrors prune_recon_cycle_summaries.py, which
-# reads only metadata.get('data')) so it is tried first; 'memory' is a
-# search-result-layer key (memory_service.py's MemoryResult.content, built
-# from Mem0's search API, not scroll) that can appear stale on a scroll
-# payload, so it is only a fallback; 'content' is a defensive third fallback.
-_CONTENT_KEYS: tuple[str, ...] = ('data', 'memory', 'content')
-
 
 async def fetch_memories(
     memory: Any,
     project_id: str,
     *,
-    categories: Iterable[str] = _ALL_CATEGORIES,
+    categories: Iterable[str] = ALL_CATEGORIES,
     scan_limit: int = 5000,
     with_vectors: bool = False,
 ) -> tuple[list[dict[str, Any]], dict[str, dict[str, int]]]:
@@ -1984,9 +2607,10 @@ async def fetch_memories(
     (plus ``'vector'`` when *with_vectors*). The top-level ``'category'`` is
     lifted out of the payload because ``build_sweep_plan`` filters on it —
     without the lift every record would read as category ``None`` and the
-    sweep would be a silent no-op. Content is extracted by trying
-    ``_CONTENT_KEYS`` in order, falling back to ``''``; a record with no
-    extractable content never clusters and is never deleted.
+    sweep would be a silent no-op. Content is extracted by
+    ``fused_memory/utils/mem0_content_keys.py::mem0_payload_text``, falling
+    back to ``''``; a record with no extractable content never clusters and is
+    never deleted.
 
     Args:
         memory: Live (or mock) MemoryService instance.
@@ -2008,7 +2632,7 @@ async def fetch_memories(
             to an empty list (``scroll_by_metadata`` no longer swallows it),
             so a timed-out scan is never mistaken for an empty corpus.
     """
-    from fused_memory.models.scope import Scope  # noqa: PLC0415
+    from fused_memory.models.scope import Scope
 
     scope = Scope(project_id=project_id)
     records: list[dict[str, Any]] = []
@@ -2031,15 +2655,9 @@ async def fetch_memories(
         }
         for record in raw_records:
             payload = record.get('metadata') or {}
-            content = ''
-            for key in _CONTENT_KEYS:
-                value = payload.get(key)
-                if isinstance(value, str) and value:
-                    content = value
-                    break
             normalized: dict[str, Any] = {
                 'id': record.get('id'),
-                'content': content,
+                'content': mem0_payload_text(payload),
                 'category': payload.get('category'),
                 'created_at': record.get('created_at'),
                 'metadata': payload,
@@ -2079,55 +2697,265 @@ async def fetch_procedural_memories(
 # I/O layer: ANN candidate generation (thin, mock-tested)
 # ---------------------------------------------------------------------------
 
+def _calibrated_float(value: Any) -> float | None:
+    """A measured cutoff, or ``None`` if this leaf is not one.
+
+    ``near_duplicate_guard.resolve_near_dup_threshold``'s leaf check, hoisted
+    so the pooled scalar and every per-category map VALUE are screened by one
+    rule. ``bool`` is excluded deliberately (it is an ``int`` subclass, and
+    ``True`` would resolve as a cutoff of 1.0), and so is every non-numeric
+    object — including the attribute an unspecced Mock auto-generates.
+    """
+    if isinstance(value, int | float) and not isinstance(value, bool):
+        return float(value)
+    return None
+
+
+@dataclass(frozen=True)
+class _CalibrationCutoffs:
+    """What :func:`_write_triage_cutoffs` read, already merged for one project.
+
+    *by_category* is the global ``t_high_by_category`` with the project's
+    screened cutoffs laid OVER it; *project_categories* names the ones the
+    project supplied, and *project_report_path* their provenance. *raw_t_high*
+    is the unscreened pooled ``t_high``, kept only so a failure can report
+    what it actually found.
+    """
+
+    raw_t_high: Any
+    pooled: float | None
+    by_category: Mapping[str, Any]
+    project_categories: frozenset[str]
+    project_report_path: Any
+
+
+def _project_cutoffs(config: Any, project_id: str | None) -> tuple[dict[str, float], Any]:
+    """``(cutoffs, report_path)`` of *project_id*'s calibration entry, screened.
+
+    Anything that is not a Mapping of measured floats — an unspecced Mock, a
+    stray scalar, a bool — contributes nothing, so junk falls back exactly as
+    if there were no project entry at all.
+    """
+    projects = getattr(config, 'write_triage_project_calibrations', None)
+    if project_id is None or not isinstance(projects, Mapping) or project_id not in projects:
+        return {}, None
+    entry = projects[project_id]
+    raw = getattr(entry, 't_high_by_category', None)
+    if not isinstance(raw, Mapping):
+        return {}, None
+    cutoffs = {
+        category: value for category, value in raw.items()
+        if _calibrated_float(value) is not None
+    }
+    return cutoffs, getattr(entry, 'calibration_report_path', None)
+
+
+def _write_triage_cutoffs(config: Any, project_id: str | None = None) -> _CalibrationCutoffs:
+    """The ONE read of the calibration config, merged for *project_id*.
+
+    Both the cutoff resolver and :func:`categories_without_own_cutoff` need
+    the same calibration leaves, so the defensive getattr chain AND the
+    project-over-global merge live here once — the config keeps a single
+    reader, and the two consumers can never disagree about what it said.
+    """
+    write_triage = getattr(config, 'write_triage', None)
+    raw_t_high = getattr(write_triage, 't_high', None)
+    global_map = getattr(write_triage, 't_high_by_category', None)
+    if not isinstance(global_map, Mapping):
+        global_map = {}
+    project_map, report_path = _project_cutoffs(config, project_id)
+    return _CalibrationCutoffs(
+        raw_t_high=raw_t_high,
+        pooled=_calibrated_float(raw_t_high),
+        by_category={**global_map, **project_map},
+        project_categories=frozenset(project_map),
+        project_report_path=report_path,
+    )
+
+
+def categories_without_own_cutoff(
+    memory_service: Any,
+    categories: Iterable[str],
+    override: float | None = None,
+    *,
+    project_id: str | None = None,
+) -> frozenset[str]:
+    """Swept categories for which the calibration derived NO cutoff.
+
+    These ran on the pooled fallback, or on an operator override — a recall
+    knob, not evidence — so their ANN clusters rest on a number that was not
+    measured on their own labeled pairs. ``build_sweep_plan`` hands this set
+    to ``restrict_delete_candidates_for_apply``, which keeps them in the
+    REPORT and out of irreversible deletion.
+
+    An *override* is applied uniformly to EVERY category by
+    :func:`resolve_ann_threshold`'s priority-1 branch, displacing even a
+    category's own measured cutoff — so under one, no category is gated by
+    evidence of its own and none may contribute an ANN-only deletion. The
+    override is screened by :func:`_calibrated_float`, not a bare ``is not
+    None``, so this predicate fences on exactly the values the resolver would
+    actually force: the two consumers of :func:`_write_triage_cutoffs` must
+    keep agreeing about what gated the sweep.
+    """
+    if _calibrated_float(override) is not None:
+        return frozenset(categories)
+    by_category = _write_triage_cutoffs(
+        getattr(memory_service, 'config', None), project_id,
+    ).by_category
+    return frozenset(
+        category for category in categories
+        if _calibrated_float(by_category.get(category)) is None
+    )
+
+
 def resolve_ann_threshold(
     memory_service: Any,
     override: float | None = None,
-) -> tuple[float | None, dict[str, int]]:
-    """Resolve the ANN cosine cutoff. READ, never invented.
+    categories: Iterable[str] = ALL_CATEGORIES,
+    *,
+    project_id: str | None = None,
+) -> tuple[dict[str, float], dict[str, int]]:
+    """:func:`resolve_ann_cutoffs` over *memory_service*'s ``config``."""
+    return resolve_ann_cutoffs(
+        getattr(memory_service, 'config', None), override, categories, project_id=project_id,
+    )
 
-    The cutoff comes from ``config.write_triage.t_high`` — a CALIBRATION
-    OUTPUT derived by ``scripts/calibrate_write_triage.py`` from measured
-    similarity distributions over the curator-labeled corpus, with
+
+def resolve_ann_cutoffs(
+    config: Any,
+    override: float | None = None,
+    categories: Iterable[str] = ALL_CATEGORIES,
+    *,
+    project_id: str | None = None,
+) -> tuple[dict[str, float], dict[str, int]]:
+    """Resolve the ANN cosine cutoff PER CATEGORY from *config*. READ, never invented.
+
+    Every cutoff is a CALIBRATION OUTPUT derived by
+    ``scripts/calibrate_write_triage.py`` from measured similarity
+    distributions over the curator-labeled corpus, with
     ``calibration_report_path`` recording its provenance. This detector reads
-    that single home; it never restates the number and never supplies a
+    that single home; it never restates a number and never supplies a
     fallback of its own.
 
-    Follows ``near_duplicate_guard.resolve_near_dup_threshold``'s defensive
-    getattr-at-every-hop shape and its ``isinstance(int | float) and not
-    bool`` leaf check (which also rejects the auto-generated attributes an
-    unspecced Mock would hand back) — but returns ``None`` instead of a
-    module default, because substituting an uncalibrated stand-in here is
-    precisely the invented threshold that is forbidden.
+    Priority per swept category (task 3357):
+
+      1. ``override`` — an explicit operator number, applied to every
+         category, including over a populated per-category map.
+      2. ``config.write_triage_project_calibrations[project_id]`` — the
+         cutoff measured on that project's own fixture (task 5547).
+      3. ``config.write_triage.t_high_by_category[category]`` — the cutoff
+         measured on THAT category's own labeled pairs.
+      4. ``config.write_triage.t_high`` — the POOLED cutoff, a DISCLOSED
+         fallback counted in ``ann_pooled_fallback_categories``. It is real
+         evidence, but gathered on a corpus dominated by one category, so a
+         fallback category is additionally withheld from ``--apply``
+         deletion by ``restrict_delete_candidates_for_apply``.
+      5. None of these — the category is ABSENT from the returned mapping.
+         Its ANN path is disabled rather than run on a guess.
+
+    Follows ``resolve_near_dup_threshold``'s defensive getattr-at-every-hop
+    shape and its ``isinstance(int | float) and not bool`` leaf check (see
+    :func:`_calibrated_float`), applied to the map's VALUES too — but returns
+    ABSENCE instead of a module default, because substituting an uncalibrated
+    stand-in here is precisely the invented threshold that is forbidden. A
+    ``t_high_by_category`` that is not a Mapping (an unspecced Mock, a stray
+    scalar) is ignored wholesale rather than probed.
 
     Args:
-        memory_service: Live (or mock) MemoryService.
+        config: A FusedMemoryConfig (or a stand-in), read defensively.
         override: Operator-supplied ``--ann-threshold``. Wins when given,
             including over an uncalibrated config.
+        categories: The categories actually being swept. Nothing is resolved
+            for a category that was not asked for. Defaults to
+            ``ALL_CATEGORIES``, matching :func:`build_sweep_plan`'s default
+            for the same argument — an empty DEFAULT would have silently
+            disabled the whole ANN path for an omitting caller, with a
+            zero-filled disclosure and no ERROR, which is precisely the
+            silently missing detector this function exists to prevent.
+            Passing an empty iterable EXPLICITLY still yields an empty
+            mapping: asking for nothing is a caller's choice, not a default.
+        project_id: The run's ``--project-id``. Selects that project's
+            calibration entry; ``None`` (the default) reads none.
 
     Returns:
-        ``(threshold, disclosure)``. *threshold* is ``None`` when the config
-        is uncalibrated and no override was given — the caller must then
-        DISABLE the ANN path rather than guess. *disclosure* carries
-        ``ann_disabled_uncalibrated`` (0 or 1) so a disabled path is a
-        counted, alarmable metric rather than a silently missing detector.
+        ``({category: threshold}, disclosure)``. A category is present only
+        when a MEASURED cutoff resolved for it; an EMPTY mapping means no
+        category resolved and the caller must DISABLE the ANN path entirely
+        rather than guess. *disclosure* always carries both
+        ``ann_disabled_uncalibrated`` (how many swept categories resolved to
+        nothing) and ``ann_pooled_fallback_categories`` (how many ran on the
+        pooled number), so neither a disabled path nor weaker evidence is a
+        silently missing detector.
     """
-    if isinstance(override, int | float) and not isinstance(override, bool):
-        return float(override), {'ann_disabled_uncalibrated': 0}
+    swept = tuple(categories)
 
-    value = getattr(getattr(memory_service, 'config', None), 'write_triage', None)
-    t_high = getattr(value, 't_high', None)
-    if isinstance(t_high, int | float) and not isinstance(t_high, bool):
-        return float(t_high), {'ann_disabled_uncalibrated': 0}
+    forced = _calibrated_float(override)
+    if forced is not None:
+        return (
+            dict.fromkeys(swept, forced),
+            {'ann_disabled_uncalibrated': 0, 'ann_pooled_fallback_categories': 0},
+        )
 
-    logger.error(
-        'ANN path DISABLED: config.write_triage.t_high is not calibrated '
-        '(got %r) and no --ann-threshold override was given. Refusing to '
-        'invent a similarity cutoff — run scripts/calibrate_write_triage.py, '
-        'or pass --ann-threshold explicitly. The lexical path still runs.',
-        t_high,
-    )
-    return None, {'ann_disabled_uncalibrated': 1}
+    cutoffs = _write_triage_cutoffs(config, project_id)
+    raw_t_high, pooled, by_category = cutoffs.raw_t_high, cutoffs.pooled, cutoffs.by_category
+    from_project = sorted(cutoffs.project_categories.intersection(swept))
+    if from_project:
+        logger.info(
+            'ANN cutoff for %s read from the %s project calibration (%s)',
+            ', '.join(from_project), project_id, cutoffs.project_report_path,
+        )
 
+    resolved: dict[str, float] = {}
+    pooled_fallback: list[str] = []
+    uncalibrated: list[str] = []
+    for category in swept:
+        own = _calibrated_float(by_category.get(category))
+        if own is not None:
+            resolved[category] = own
+        elif pooled is not None:
+            resolved[category] = pooled
+            pooled_fallback.append(category)
+        else:
+            uncalibrated.append(category)
+
+    if pooled_fallback:
+        logger.warning(
+            'ANN cutoff for %s falls back to the POOLED '
+            'config.write_triage.t_high (%r): the calibration derived no '
+            'cutoff of their own, so they are gated by a number measured on '
+            'a different population. Weaker evidence — these categories are '
+            'withheld from --apply deletion.',
+            ', '.join(pooled_fallback), pooled,
+        )
+    if uncalibrated:
+        logger.error(
+            'ANN path DISABLED for %s: neither config.write_triage'
+            '.t_high_by_category nor the pooled t_high is calibrated (pooled '
+            'got %r) and no --ann-threshold override was given. Refusing to '
+            'invent a similarity cutoff — run scripts/calibrate_write_triage.py, '
+            'or pass --ann-threshold explicitly. The lexical path still runs.',
+            ', '.join(uncalibrated), raw_t_high,
+        )
+
+    return resolved, {
+        'ann_disabled_uncalibrated': len(uncalibrated),
+        'ann_pooled_fallback_categories': len(pooled_fallback),
+    }
+
+
+_ANN_QUERY_DISCLOSURE_KEYS: tuple[str, ...] = (
+    'ann_query_errors',
+    'ann_query_skipped_uncalibrated',
+)
+"""Every way the ANN QUERY layer loses a record, enumerated ONCE.
+
+A FOURTH sibling of ``_ANN_DISCLOSURE_KEYS`` / ``_PLAN_DISCLOSURE_KEYS`` /
+``_LIVENESS_DISCLOSURE_KEYS``, and kept separate for the same reason: these
+are properties of what was ASKED (a query that failed, a query never issued),
+while ``_ANN_DISCLOSURE_KEYS`` counts what came BACK. Same contract as its
+siblings: every key always present, always an int, always zero-filled on a
+clean run — an absent counter is indistinguishable from "not measured".
+"""
 
 _ANN_QUERY_CONCURRENCY = 16
 """ANN queries in flight at once.
@@ -2149,6 +2977,7 @@ async def fetch_ann_neighbors(
     *,
     top_k: int,
     score_threshold: float,
+    cutoff_by_category: Mapping[str, float] | None = None,
     concurrency: int = _ANN_QUERY_CONCURRENCY,
 ) -> tuple[dict[Any, list[dict[str, Any]]], dict[str, int]]:
     """ANN neighbours for each record, queried with the record's OWN vector.
@@ -2177,7 +3006,20 @@ async def fetch_ann_neighbors(
         records: Normalised records, each optionally carrying ``'vector'``.
         top_k: Neighbours wanted per record. The query asks for ``top_k + 1``
             so the record's own guaranteed self-hit does not consume a slot.
-        score_threshold: Cutoff pushed down into Qdrant.
+        score_threshold: Cutoff pushed down into Qdrant. Deliberately the
+            MIN-of-cutoffs floor rather than each record's own cutoff: a
+            tighter per-record push-down would drop hits at the DB before
+            ``ann_pairs_from_neighbors`` could count them as
+            ``below_threshold_dropped``, trading disclosure for speed.
+        cutoff_by_category: The resolved ``{category: cutoff}`` mapping, when
+            the caller has one. A record whose category is ABSENT from it is
+            uncalibrated — every hit it could return would be discarded by
+            ``ann_pairs_from_neighbors``, so the query is NOT ISSUED at all
+            and the record is counted under
+            ``ann_query_skipped_uncalibrated``. That is a pure cost saving:
+            it removes queries whose results can never form a pair, and never
+            removes a query whose results could. ``None`` (the default) keeps
+            the pre-3357 behaviour of querying every record with a vector.
         concurrency: Max queries in flight (see
             :data:`_ANN_QUERY_CONCURRENCY`).
 
@@ -2185,23 +3027,50 @@ async def fetch_ann_neighbors(
         ``({memory_id: [{'id', 'score'}, ...]}, disclosure)``, with records in
         input order so two identical runs produce identical output. A record
         with no vector is skipped (``ann_pairs_from_neighbors`` counts it as
-        ``missing_vector``). *disclosure* carries ``ann_query_errors``: a
-        failure on one record is logged and counted, and the sweep continues,
-        so one bad point never costs the whole scan.
-    """
-    from qdrant_client.http import models as qmodels  # noqa: PLC0415
+        ``missing_vector``). *disclosure* carries:
 
-    from fused_memory.models.scope import Scope  # noqa: PLC0415
+          - ``ann_query_errors`` — a failure on one record is logged and
+            counted, and the sweep continues, so one bad point never costs
+            the whole scan.
+          - ``ann_query_skipped_uncalibrated`` — records never queried
+            because their category has no cutoff. Counted HERE, per RECORD,
+            rather than left to ``ann_pairs_from_neighbors``'s per-HIT
+            ``uncalibrated_category_dropped``, which necessarily reads zero
+            for a record that was never asked: the recall lost to missing
+            calibration stays a counted number either way.
+    """
+    from qdrant_client.http import models as qmodels
+
+    from fused_memory.models.scope import Scope
 
     neighbors: dict[Any, list[dict[str, Any]]] = {}
-    disclosure = {'ann_query_errors': 0}
-    queryable = [r for r in records if r.get('vector') is not None]
+    disclosure = dict.fromkeys(_ANN_QUERY_DISCLOSURE_KEYS, 0)
+    with_vectors = [r for r in records if r.get('vector') is not None]
+    if cutoff_by_category is None:
+        queryable = with_vectors
+    else:
+        # A record whose category has no cutoff can contribute no pair, so
+        # its query is pure cost. Counted, never silently dropped.
+        queryable = [
+            r for r in with_vectors
+            if isinstance(r.get('category'), str) and r['category'] in cutoff_by_category
+        ]
+        skipped = len(with_vectors) - len(queryable)
+        disclosure['ann_query_skipped_uncalibrated'] = skipped
+        if skipped:
+            logger.warning(
+                'Skipped the ANN query for %d record(s) whose category has no '
+                'resolved cutoff: every hit would have been discarded as '
+                'uncalibrated. Recall lost to missing calibration, not to a '
+                'cutoff — counted as ann_query_skipped_uncalibrated.',
+                skipped,
+            )
     if not queryable:
         return neighbors, disclosure
 
     scope = Scope(project_id=project_id)
     collection_name = scope.mem0_collection_name(memory.config.mem0.collection_prefix)
-    client = await memory.mem0._get_async_qdrant()  # noqa: SLF001
+    client = await memory.mem0._get_async_qdrant()
 
     filter_by_category: dict[Any, Any] = {}
 
@@ -2325,20 +3194,72 @@ def _apply_refusal_reason(
     return None
 
 
+EXIT_RUN_FAILED = 1
+"""The run did not finish: the store could not be opened, the metrics artifact
+could not be written, ``--apply`` was refused or had nothing to apply, a
+deletion failed, or stdout failed.
+
+Agrees with ``shared.cli_boundary.EXIT_STDOUT_FAILED``.
+"""
+
+
 async def _run(args: argparse.Namespace) -> int:
     logging.basicConfig(
         level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s',
     )
 
-    import os  # noqa: PLC0415
+    import os
 
-    from shared.memory_eval_metrics import run_stamp  # noqa: PLC0415
+    from shared.memory_eval_metrics import run_stamp
 
-    import fused_memory.config.schema as _schema  # noqa: PLC0415
-    import fused_memory.services.memory_service as _service  # noqa: PLC0415
+    import fused_memory.config.schema as _schema
+    from fused_memory.maintenance._utils import maintenance_service
 
     if args.config:
         os.environ['CONFIG_PATH'] = str(args.config)
+
+    # Fail-CLOSED capability preflight, one probe per run, BEFORE anything.
+    #
+    # Why THIS line specifically. It sits before ``MemoryService`` is
+    # constructed and before ``memory.initialize()``, so a refused --apply
+    # never opens a client at all -- which is also why it stays OUTSIDE the
+    # ``maintenance_service`` entry below. Guarding inside would entangle the
+    # refusal with the teardown of a service that was never initialized. It
+    # likewise precedes the whole scan:
+    # ``fetch_memories``' per-category ``scroll_by_metadata`` with
+    # ``with_vectors=True``, ``fetch_ann_neighbors``' per-record
+    # ``query_points`` fan-out, clustering, metrics, and the artifact write.
+    #
+    # Why run-wide rather than per-record: the delete loop in
+    # ``apply_deletions`` wraps each ``memory.delete_memory`` in an
+    # ``except Exception`` and increments ``delete_errors``, so a write-denied
+    # environment yields N logged errors and N already-destroyed Qdrant points
+    # -- mem0's ``_delete_memory`` removes the point BEFORE writing its SQLite
+    # history. This module's docstring already warns that under --apply every
+    # non-survivor is an irreversible delete; this guard is what makes that
+    # warning enforceable rather than advisory.
+    #
+    # Why it RAISES, unlike the refusal this script already has:
+    # ``_apply_refusal_reason`` refuses --apply on empty-scan/truncation
+    # grounds and returns through the NORMAL path -- a handled outcome an
+    # operator can reasonably read past. A write-capability denial is
+    # categorically different, because proceeding would leave a
+    # half-completed, unrecoverable store mutation. Raising keeps it
+    # un-maskable by, and un-confusable with, that report-shaped refusal.
+    #
+    # ``logging.basicConfig`` already ran above, so the guard's refusal record
+    # is emitted.
+    if args.apply:
+        assert_store_mutation_allowed(
+            operation='audit_duplicate_memories --apply',
+            logger=logger,
+            extra_detail=(
+                'each deletion would remove a Qdrant point and then fail to write '
+                'its history, irreversibly destroying the non-survivors of every '
+                'cluster. Nothing was scanned and nothing was mutated, and no '
+                'client was opened.'
+            ),
+        )
 
     # De-duplicate while preserving the caller's order. A repeated
     # --categories value would otherwise ingest the same Qdrant points twice
@@ -2350,13 +3271,27 @@ async def _run(args: argparse.Namespace) -> int:
     stamp = run_stamp()
 
     config = _schema.FusedMemoryConfig()
-    memory = _service.MemoryService(config)
-    await memory.initialize()
-    try:
+    async with contextlib.AsyncExitStack() as stack:
+        try:
+            _, memory = await stack.enter_async_context(maintenance_service(config=config))
+        except OSError as exc:
+            logger.error(
+                'ABORT: the memory store could not be opened (%s): %s',
+                type(exc).__name__, exc,
+            )
+            return EXIT_RUN_FAILED
         # The ANN cutoff is READ from the calibration (or an explicit
-        # override). None means uncalibrated: the ANN path is disabled and
-        # counted, never run against a guessed threshold.
-        ann_threshold, disclosures = resolve_ann_threshold(memory, args.ann_threshold)
+        # override), PER CATEGORY. An empty mapping means no category is
+        # calibrated: the ANN path is disabled and counted, never run against
+        # a guessed threshold.
+        ann_thresholds, disclosures = resolve_ann_threshold(
+            memory, args.ann_threshold, categories, project_id=args.project_id,
+        )
+        # Floor pushed down to Qdrant: the MIN of the resolved cutoffs cannot
+        # drop a candidate any category would have accepted (every cutoff is
+        # >= the min). The authoritative per-category filtering happens in the
+        # pure ann_pairs_from_neighbors.
+        ann_threshold = min(ann_thresholds.values()) if ann_thresholds else None
 
         records, scan_stats = await fetch_memories(
             memory, args.project_id, categories=categories,
@@ -2372,10 +3307,18 @@ async def _run(args: argparse.Namespace) -> int:
             neighbors, query_disclosure = await fetch_ann_neighbors(
                 memory, args.project_id, records,
                 top_k=args.ann_top_k, score_threshold=ann_threshold,
+                # The same mapping that gates the pairs below. A record in a
+                # category it does not cover is never queried: its hits could
+                # only ever be discarded, so the query is cost with no
+                # possible pair. The skip is counted, not silent.
+                cutoff_by_category=ann_thresholds,
             )
             disclosures.update(query_disclosure)
+            # The MAPPING, not the floor: the floor only shaped what Qdrant
+            # returned; the cutoff that actually gates a pair is its own
+            # category's.
             ann_pairs, pair_disclosure = ann_pairs_from_neighbors(
-                records, neighbors, ann_threshold, top_k=args.ann_top_k,
+                records, neighbors, ann_thresholds, top_k=args.ann_top_k,
             )
             disclosures.update(pair_disclosure)
             # Scans BOTH endpoints' lists: neighbour lists are asymmetric, so
@@ -2383,15 +3326,27 @@ async def _run(args: argparse.Namespace) -> int:
             ann_scores = ann_scores_for_pairs(records, neighbors, ann_pairs)
         else:
             disclosures.update(dict.fromkeys(_ANN_DISCLOSURE_KEYS, 0))
-            disclosures['ann_query_errors'] = 0
+            disclosures.update(dict.fromkeys(_ANN_QUERY_DISCLOSURE_KEYS, 0))
 
         plan = build_sweep_plan(
             records, threshold=args.threshold, categories=categories,
             ann_pairs=ann_pairs, ann_scores=ann_scores,
             ann_disclosure=disclosures, ann_threshold=ann_threshold,
+            ann_threshold_by_category=ann_thresholds,
+            # Same override that produced ann_thresholds two statements ago:
+            # an operator number gates every category, so it is what makes
+            # them un-evidenced. One value, one story.
+            unevidenced_categories=categories_without_own_cutoff(
+                memory, categories, args.ann_threshold, project_id=args.project_id,
+            ),
+            scan_coverage={
+                c: {**scan_stats[c], 'scan_limit': args.scan_limit} for c in categories
+            },
         )
         # stdout is task 3136's report contract — unchanged shape, one JSON doc.
+        # A failed stdout stops the run before any side effect.
         print(json.dumps(plan, indent=2, default=str))
+        sys.stdout.flush()
 
         # build_sweep_plan owns the remap-stage losses (a cross-category or
         # unswept-category ANN pair), so the plan's echoed copy — not the dict
@@ -2417,6 +3372,18 @@ async def _run(args: argparse.Namespace) -> int:
                         c: int(scan_stats.get(c, {}).get('truncated', 0))
                         for c in categories
                     },
+                    # Run-global: the apply gate is one pass over the whole
+                    # plan, not a per-category decision — per-category detail
+                    # for drill-down stays available in
+                    # plan['apply_withheld_groups']. Must be a series because
+                    # the plan JSON carries the number but the plan is not the
+                    # artifact the eval programme reads; without this, a
+                    # growing share of clusters withheld from --apply would be
+                    # un-alarmable recall loss. Direct subscript (not .get):
+                    # build_sweep_plan returns this key unconditionally, and a
+                    # defaulted read would silently emit a fabricated 0.0 if a
+                    # future refactor ever dropped it.
+                    'apply_withheld_clusters': plan['apply_withheld_clusters'],
                 },
                 details_path=details_artifact_path(stamp),
             )
@@ -2425,9 +3392,16 @@ async def _run(args: argparse.Namespace) -> int:
                 corpus_counts={c: len(v) for c, v in records_by_category.items()},
                 eval_id=args.eval_id, run_stamp=stamp,
             )
-            metrics_path, _report, _details = emit_metrics_artifact(
-                series, details, args.metrics_root, stamp,
-            )
+            try:
+                metrics_path, _report, _details = emit_metrics_artifact(
+                    series, details, args.metrics_root, stamp,
+                )
+            except OSError as exc:
+                logger.error(
+                    'ABORT: cannot write the metrics artifact under %s: %s',
+                    args.metrics_root, exc,
+                )
+                return EXIT_RUN_FAILED
             logger.info('Wrote metrics artifact %s', metrics_path)
 
         if not args.apply:
@@ -2437,7 +3411,7 @@ async def _run(args: argparse.Namespace) -> int:
         refusal = _apply_refusal_reason(records, scan_stats, args.scan_limit)
         if refusal:
             logger.error('ABORT: %s.', refusal)
-            return 1
+            return EXIT_RUN_FAILED
 
         # The apply gate: clusters whose only evidence is an ANN CHAIN stay in
         # the report but never reach an irreversible delete.
@@ -2457,7 +3431,7 @@ async def _run(args: argparse.Namespace) -> int:
                 'cluster(s) withheld by the apply gate) — nothing to apply.',
                 len(plan['delete_candidates']), len(withheld),
             )
-            return 1
+            return EXIT_RUN_FAILED
 
         result = await apply_deletions(
             memory, args.project_id, plan, dry_run=False,
@@ -2467,9 +3441,7 @@ async def _run(args: argparse.Namespace) -> int:
             'Applied: deleted %d/%d memory/memories; %d error(s)',
             result['deleted'], len(apply_candidates), result['delete_errors'],
         )
-        return 1 if result['delete_errors'] > 0 else 0
-    finally:
-        await memory.close()
+        return EXIT_RUN_FAILED if result['delete_errors'] > 0 else 0
 
 
 _DEFAULT_METRICS_ROOT = str(Path(__file__).resolve().parent.parent / 'data' / 'memory-evals')
@@ -2480,7 +3452,7 @@ relative default would scatter artifacts wherever the scheduler happened to
 start — invisible to the limits evaluator, which scans one root.
 """
 
-_DEFAULT_ANN_TOP_K = 10
+DEFAULT_ANN_TOP_K = 10
 """Neighbours requested per record.
 
 A resource knob, not a similarity threshold: it trades query cost against
@@ -2490,14 +3462,14 @@ never set here — see :func:`resolve_ann_threshold`.
 """
 
 
-def _build_parser() -> argparse.ArgumentParser:
+def build_parser() -> LoudArgumentParser:
     """The CLI surface. Every flag added after the first release is optional.
 
     ``--project-id X`` and ``--project-id X --apply`` — the invocation task
     3136 schedules — must keep parsing byte-for-byte, so all of this task's
     flags carry defaults.
     """
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = LoudArgumentParser(description=__doc__)
     parser.add_argument(
         '--project-id', dest='project_id', required=True,
         help='Project id to scan for near-duplicate memories',
@@ -2520,16 +3492,16 @@ def _build_parser() -> argparse.ArgumentParser:
         help='Path to fused-memory config file (sets CONFIG_PATH env var)',
     )
     parser.add_argument(
-        '--categories', nargs='+', default=list(_ALL_CATEGORIES),
-        choices=list(_ALL_CATEGORIES),
-        help=f'Mem0 categories to sweep (default: {" ".join(_ALL_CATEGORIES)}). '
+        '--categories', nargs='+', default=list(ALL_CATEGORIES),
+        choices=list(ALL_CATEGORIES),
+        help=f'Mem0 categories to sweep (default: {" ".join(ALL_CATEGORIES)}). '
              'Only Mem0-backed categories are accepted; a Graphiti-backed or '
              'unknown name is rejected at parse time rather than silently '
              'scrolling an empty corpus and reporting a clean sweep.',
     )
     parser.add_argument(
-        '--ann-top-k', dest='ann_top_k', type=int, default=_DEFAULT_ANN_TOP_K,
-        help=f'ANN neighbours per record (default: {_DEFAULT_ANN_TOP_K}). '
+        '--ann-top-k', dest='ann_top_k', type=int, default=DEFAULT_ANN_TOP_K,
+        help=f'ANN neighbours per record (default: {DEFAULT_ANN_TOP_K}). '
              'Saturation is reported as top_k_saturated.',
     )
     parser.add_argument(
@@ -2552,10 +3524,14 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+# fused-memory/tests/test_memory_eval_runner.py::_PRODUCER_CLI names the parser privately.
+_build_parser = build_parser
+
+
 def main() -> int:
-    args = _build_parser().parse_args()
+    args = build_parser().parse_args()
     return asyncio.run(_run(args))
 
 
 if __name__ == '__main__':
-    sys.exit(main())
+    sys.exit(run_cli(main))

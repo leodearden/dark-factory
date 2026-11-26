@@ -1,0 +1,114 @@
+{
+  "check_results": [
+    {
+      "check_id": "code-sha-matches-checkout",
+      "detail": "HEAD 8bb8c8893b0f58957753954ab0338d47f4b609b9 is clean and matches the spec",
+      "offenders": [],
+      "passed": true
+    },
+    {
+      "check_id": "preregistration-sha",
+      "detail": "be4a44d6243b58a3293d66eb73f0ba56fa206efd carries plans/local-memory-models-eval-preregistration.md",
+      "offenders": [],
+      "passed": true
+    },
+    {
+      "check_id": "frozen-reference-unchanged",
+      "detail": "'evalmem_lme_ref_incumbent_a' still hashes to 56de651d10aff70b81e78911cc125eb8be0e81a254a856ef8e3c923c01a9085f",
+      "offenders": [],
+      "passed": true
+    },
+    {
+      "check_id": "reembed-integrity",
+      "detail": "'evalmem_lme_emb_granite_embedding_english_r2' keeps the reference topology: 1834 nodes, 3101 edges",
+      "offenders": [],
+      "passed": true
+    },
+    {
+      "check_id": "index-configuration",
+      "detail": "fulltext probe on 'evalmem_lme_emb_granite_embedding_english_r2' gave 0 row(s), as embedding-only expects",
+      "offenders": [],
+      "passed": true
+    },
+    {
+      "check_id": "index-configuration",
+      "detail": "fulltext probe on 'evalmem_lme_emb_granite_embedding_english_r2' gave 1 row(s), as with-indices expects",
+      "offenders": [],
+      "passed": true
+    },
+    {
+      "check_id": "reembed-integrity",
+      "detail": "'evalmem_lme_emb_granite_embedding_english_r2' keeps the reference topology: 1834 nodes, 3101 edges",
+      "offenders": [],
+      "passed": true
+    }
+  ],
+  "effective_embedder": {
+    "dimensions": 768,
+    "model": "granite-embedding-english-r2"
+  },
+  "finished_at": "2026-10-09T09:54:21.007359Z",
+  "graph_reembed": {
+    "edge_count": 1087,
+    "embed_seconds": 2.0089190448634326,
+    "entity_count": 1634,
+    "failures": [],
+    "raw_norms": {
+      "count": 2721,
+      "max": 31.009593844070295,
+      "median": 30.429260271028717,
+      "min": 29.86564496364469
+    },
+    "write_seconds": 2.940914032049477,
+    "written": 2721
+  },
+  "query_failures": {
+    "known_item": {
+      "embedding-only": 0,
+      "with-indices": 0
+    },
+    "mem0_known_item": 0,
+    "query_latency": 0
+  },
+  "replica_reembed": {
+    "embed_seconds": 49.60572837200016,
+    "failures": [],
+    "points": 31237,
+    "raw_norms": {
+      "count": 31237,
+      "max": 31.077514196097084,
+      "median": 30.280170387327757,
+      "min": 29.655121146647815
+    },
+    "write_seconds": 27.168360037729144,
+    "written": 31237
+  },
+  "schema_version": 1,
+  "settings": {
+    "embed_batch_size": 64,
+    "embed_concurrency": 4,
+    "mem0_project_id": "dark_factory",
+    "query_concurrency": 3,
+    "search_k": 10,
+    "search_timeout_s": 30.0,
+    "transcript_queries": 500
+  },
+  "spec": {
+    "arm_id": "granite-embedding-english-r2",
+    "arm_role": "candidate",
+    "axis": "embedding",
+    "code_sha": "8bb8c8893b0f58957753954ab0338d47f4b609b9",
+    "corpus_sha": "1eb3ed883afb5396fcba47a240e41f4b501d5b678789c48541325eb7c811b287",
+    "embedding_dim": 768,
+    "model_id": "granite-embedding-english-r2",
+    "preregistration_sha": "be4a44d6243b58a3293d66eb73f0ba56fa206efd",
+    "scratch_group_id": "evalmem_lme_emb_granite_embedding_english_r2",
+    "serving": {
+      "base_url": "http://127.0.0.1:8415/v1",
+      "quant": "none",
+      "stack": "vllm",
+      "unit_name": "lms-arm@granite-embedding-english-r2.service"
+    }
+  },
+  "started_at": "2026-10-09T09:51:42.086024Z"
+}

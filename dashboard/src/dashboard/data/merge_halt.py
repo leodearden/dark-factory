@@ -4,11 +4,26 @@ Each orchestrator runs its own escalation MCP, and that MCP owns the
 merge-queue halt state for its orchestrator. To surface halt status on
 the dashboard we fan out ``get_merge_halt_status`` calls across every
 known escalation URL concurrently and aggregate the results into a
-``{project_label: {wired, halted, owner_esc_id, offline}}`` dict.
+``{project_label: {wired, halted, owner_esc_id, offline}}`` dict, keyed by
+project label (``dashboard/project_labels.py::ProjectLabels``).
 
 The default ``mcp_tool_call`` timeout is 10s — too slow for a 3s polling
-loop. We wrap each call in ``asyncio.wait_for`` so worst-case latency is
-capped close to ``per_call_timeout`` even when every orchestrator is down.
+loop. The probe budget is bounded at **two complementary layers**, both
+required:
+
+1. **Per HTTP request** — ``per_call_timeout`` is threaded into
+   ``mcp_tool_call``, which hands it to ``client.post``. This bounds
+   connect/read/write *and pool acquisition*; without it a probe on a 2.0s
+   budget could still block up to httpx's 10s default waiting for a free
+   connection slot on the shared client.
+2. **Per whole operation** — each call stays wrapped in
+   ``asyncio.wait_for`` so worst-case latency is capped at
+   ``memory.py::enclosing_deadline(per_call_timeout)`` even when every
+   orchestrator is down. That bound is strictly above the per-request budget,
+   so the transport's own exception (``httpx.PoolTimeout`` above all) is not
+   pre-empted. Layer 1 alone cannot deliver the cap: a *cold* session
+   performs three posts (initialize, notifications/initialized, tools/call),
+   so a per-request bound of T permits roughly 3T overall.
 """
 
 from __future__ import annotations
@@ -19,11 +34,18 @@ from typing import Any
 
 import httpx
 
-from dashboard.data.memory import mcp_tool_call
+from dashboard.data.mcp_fanout import FANOUT_FAILURE_EXCEPTIONS, describe_exc
+from dashboard.data.memory import enclosing_deadline, mcp_tool_call
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_PER_CALL_TIMEOUT = 2.0
+
+# OSError is this probe's own addition on top of the shared fan-out failure
+# set: anything escaping _probe_one 500s /merge-queue.
+_PROBE_FAILURE_EXCEPTIONS: tuple[type[Exception], ...] = (
+    *FANOUT_FAILURE_EXCEPTIONS, OSError,
+)
 
 
 async def _probe_one(
@@ -33,12 +55,15 @@ async def _probe_one(
 ) -> dict[str, Any]:
     try:
         result = await asyncio.wait_for(
-            mcp_tool_call(client, base_url, 'get_merge_halt_status', {}),
-            timeout=timeout,
+            mcp_tool_call(
+                client, base_url, 'get_merge_halt_status', {}, timeout=timeout,
+            ),
+            timeout=enclosing_deadline(timeout),
         )
-    except (TimeoutError, httpx.ConnectError, httpx.TimeoutException, httpx.HTTPStatusError, ValueError, OSError) as exc:
-        logger.debug('get_merge_halt_status failed for %s: %s', base_url, exc)
-        return {'wired': False, 'halted': False, 'offline': True, 'error': str(exc)}
+    except _PROBE_FAILURE_EXCEPTIONS as exc:
+        detail = describe_exc(exc)
+        logger.debug('get_merge_halt_status failed for %s: %s', base_url, detail)
+        return {'wired': False, 'halted': False, 'offline': True, 'error': detail}
     return {
         'wired': bool(result.get('wired', True)),
         'halted': bool(result.get('halted', False)),
@@ -56,8 +81,9 @@ async def get_merge_halt_status(
     """Probe every escalation URL concurrently; return ``{label: status}``.
 
     Per-project labels match the keys used by ``shape_merge_queue`` (project
-    basename). Failures are reported as ``{wired, halted: False, offline: True}``
-    so the UI can render an Offline pill rather than a blank panel.
+    label — ``dashboard/project_labels.py::ProjectLabels``). Failures are
+    reported as ``{wired, halted: False, offline: True}`` so the UI can render
+    an Offline pill rather than a blank panel.
     """
     if not escalation_urls:
         return {}

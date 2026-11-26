@@ -168,6 +168,33 @@ async def test_search_kwargs_forwarded():
     assert call_kwargs.get('limit') == 37
 
 
+@pytest.mark.asyncio
+async def test_search_opts_out_of_topic_anchoring():
+    """REGRESSION GUARD (task 3111, review esc-3111-2).
+
+    This is an IDEMPOTENCY check: the window is post-filtered by task_id, so a
+    prior record displaced out of it reads as "no prior memory" and the caller
+    re-writes a duplicate recon record.  Topic-anchored recall PROMOTES rather
+    than adds -- the window stays exactly `limit` long -- so an anchored pin
+    can only ever cost this window a genuine candidate.  The opt-out must be
+    passed explicitly; the service-side default is True.
+    """
+    from fused_memory.reconciliation.mem0_dedup import find_prior_memory
+
+    memory_service = MagicMock()
+    memory_service.search = AsyncMock(return_value=[])
+
+    await find_prior_memory(
+        memory_service,
+        project_id='p',
+        task_id='42',
+        kind={'flag_type': 'foo'},
+        query='Q',
+    )
+
+    assert memory_service.search.call_args.kwargs.get('anchor_topics') is False
+
+
 # ---------------------------------------------------------------------------
 # Step 13 — multi-key kind discriminator: ALL keys must match
 # ---------------------------------------------------------------------------
@@ -335,4 +362,53 @@ async def test_find_prior_memories_search_failure_returns_empty_list_and_warns(c
     ), (
         f'Expected a WARNING mentioning task 77 but got: '
         f'{[r.message for r in caplog.records]}'
+    )
+
+
+# ---------------------------------------------------------------------------
+# Task 3129 (leaf δ) — the child-suppression filter must NOT leak into
+# MemoryService.search (task detail item 4 / docs/prds/memory-metadata-vocabulary.md).
+#
+# find_prior_memories post-filters RAW service results on task_id + kind.  If
+# grouped_read's suppression ever moved down into the service layer, amendment
+# and sighting rows would vanish before that loop ran — hiding duplicates from
+# the recon dedup detector and candidates from the near-duplicate write guard.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_child_records_survive_to_the_per_record_post_filter():
+    """Amendment/sighting rows must reach find_prior_memories' task_id/kind filter."""
+    from fused_memory.reconciliation.mem0_dedup import find_prior_memories
+
+    amendment = _make_memory_result(
+        {'task_id': '42', 'kind': 'amendment', 'parent_id': '11111111-1111-4111-8111-111111111111'}
+    )
+    sighting = _make_memory_result(
+        {'task_id': '42', 'kind': 'sighting', 'parent_id': '11111111-1111-4111-8111-111111111111'}
+    )
+
+    memory_service = MagicMock()
+    memory_service.search = AsyncMock(return_value=[amendment, sighting])
+
+    amendments = await find_prior_memories(
+        memory_service,
+        project_id='p',
+        task_id='42',
+        kind={'kind': 'amendment'},
+        query='q',
+    )
+    sightings = await find_prior_memories(
+        memory_service,
+        project_id='p',
+        task_id='42',
+        kind={'kind': 'sighting'},
+        query='q',
+    )
+
+    assert amendments == [amendment], (
+        f'A child record must survive to the per-record post-filter, got {amendments!r}'
+    )
+    assert sightings == [sighting], (
+        f'A child record must survive to the per-record post-filter, got {sightings!r}'
     )

@@ -12,11 +12,6 @@ Every test here is marked ``@pytest.mark.real_verify_admission`` to opt out of
 the autouse ``_neutralize_verify_admission`` conftest fixture, which otherwise
 forces the module seam ``orchestrator.verify._verify_admission_active`` to
 False for every other test in the suite (task 2390 pre-1).
-
-Fixtures are kept MODULE-LOCAL (not conftest.py) — a conftest.py edit trips
-verify.py's has_conftest and forces the merge-time verify to fall back to
-running the full owning-package suite instead of a scoped subset (mirrors
-test_config_psi_admission_reload.py's stated rationale).
 """
 
 from __future__ import annotations
@@ -26,48 +21,25 @@ import contextlib
 import hashlib
 import os
 import shlex
-from typing import Any
 from unittest.mock import patch
 
 import pytest
+from _orch_helpers import (
+    ADMISSION_LINT_CMD,
+    ADMISSION_TEST_CMD,
+    ADMISSION_TYPE_CMD,
+    admission_leg_for_cmd,
+    admission_module_config,
+)
 
-from orchestrator.config import ModuleConfig, OrchestratorConfig
+from orchestrator.config import OrchestratorConfig
+from orchestrator.defect_tests_config import DefectTestsConfig, DefectTestsMode
 from orchestrator.verify import run_verification
+from orchestrator.verify_cmd import parse_config_command, render, with_defect_plugin
 
-# module_config commands used across these tests are chosen to be uniquely
-# identifiable by exact string match, so a spy `_run_cmd` can label which leg
-# is running without needing `label` (which is a `_run_or_skip_timed`-local
-# closure variable, never passed down to `_run_cmd`).
-_TEST_CMD = 'pytest tests/'
-_LINT_CMD = 'ruff'
-_TYPE_CMD = 'pyright'
-def _leg_for_cmd(cmd: str) -> str:
-    """Label which leg *cmd* belongs to by substring, not exact match — an
-    active admission gate nice-wraps the test leg (``<nice argv> /bin/bash -c
-    <shlex.quote(cmd)>``), so its captured cmd still CONTAINS ``_TEST_CMD``
-    but is no longer equal to it. lint/type are never wrapped either way.
-    """
-    if _TEST_CMD in cmd:
-        return 'test'
-    if _LINT_CMD in cmd:
-        return 'lint'
-    if _TYPE_CMD in cmd:
-        return 'type'
-    return cmd
-
-
-def _module_config(**overrides: Any) -> ModuleConfig:
-    kwargs: dict[str, Any] = dict(
-        prefix='pkg',
-        test_command=_TEST_CMD,
-        lint_command=_LINT_CMD,
-        type_check_command=_TYPE_CMD,
-        # Sequential so the three legs run strictly test -> lint -> type,
-        # making ordering assertions deterministic (no gather interleaving).
-        concurrent_verify=False,
-    )
-    kwargs.update(overrides)
-    return ModuleConfig(**kwargs)
+#: The configured test command as the test leg runs it: the default defect
+#: mode (shadow) adds ``-p _df_defect_plugin``.
+INJECTED_TEST_CMD = render(with_defect_plugin(parse_config_command(ADMISSION_TEST_CMD)))
 
 
 class TestVerifyAdmissionAcquireWiring:
@@ -75,6 +47,7 @@ class TestVerifyAdmissionAcquireWiring:
 
     @pytest.mark.real_verify_admission
     @pytest.mark.asyncio
+    @pytest.mark.usefixtures("code_default_config")
     async def test_acquire_called_once_before_test_leg_only(self, tmp_path):
         events: list = []
 
@@ -84,7 +57,7 @@ class TestVerifyAdmissionAcquireWiring:
             yield True
 
         async def spy_run_cmd(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
-            events.append(f'run:{_leg_for_cmd(cmd)}')
+            events.append(f'run:{admission_leg_for_cmd(cmd)}')
             return 0, '', False
 
         slots_dir = tmp_path / 'slots'
@@ -100,7 +73,7 @@ class TestVerifyAdmissionAcquireWiring:
             await run_verification(
                 worktree=worktree,
                 config=config,
-                module_config=_module_config(),
+                module_config=admission_module_config(),
                 role='task',
                 attempt_id=None,
             )
@@ -128,6 +101,7 @@ class TestVerifyAdmissionAcquireWiring:
             verify_admission_enabled=False,
             verify_admission_slots_dir=str(slots_dir),
             verify_admission_task_slots=1,
+            defect_tests=DefectTestsConfig(mode=DefectTestsMode.OFF),
         )
         worktree = tmp_path / 'wt'
         worktree.mkdir()
@@ -137,14 +111,14 @@ class TestVerifyAdmissionAcquireWiring:
             await run_verification(
                 worktree=worktree,
                 config=config,
-                module_config=_module_config(),
+                module_config=admission_module_config(),
                 role='task',
                 attempt_id=None,
             )
 
         mock_acquire.assert_not_called()
         assert not slots_dir.exists(), 'disabled admission must never create slots_dir'
-        assert captured_cmds[0] == _TEST_CMD, 'disabled admission must send the byte-identical, unwrapped cmd'
+        assert captured_cmds[0] == ADMISSION_TEST_CMD, 'disabled admission must send the byte-identical, unwrapped cmd'
 
     @pytest.mark.real_verify_admission
     @pytest.mark.asyncio
@@ -158,7 +132,7 @@ class TestVerifyAdmissionAcquireWiring:
             yield False  # T1 C-merge-priority: merge never actually holds a slot
 
         async def spy_run_cmd(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
-            events.append(f'run:{_leg_for_cmd(cmd)}')
+            events.append(f'run:{admission_leg_for_cmd(cmd)}')
             return 0, '', False
 
         slots_dir = tmp_path / 'slots'
@@ -174,7 +148,7 @@ class TestVerifyAdmissionAcquireWiring:
             await run_verification(
                 worktree=worktree,
                 config=config,
-                module_config=_module_config(),
+                module_config=admission_module_config(),
                 role='merge',
                 attempt_id=None,
             )
@@ -185,6 +159,7 @@ class TestVerifyAdmissionAcquireWiring:
 
     @pytest.mark.real_verify_admission
     @pytest.mark.asyncio
+    @pytest.mark.usefixtures("code_default_config")
     async def test_fail_open_when_slots_dir_unmkdirable(self, tmp_path):
         run_cmd_calls: list[str] = []
 
@@ -210,23 +185,24 @@ class TestVerifyAdmissionAcquireWiring:
             await run_verification(
                 worktree=worktree,
                 config=config,
-                module_config=_module_config(),
+                module_config=admission_module_config(),
                 role='task',
                 attempt_id=None,
             )
 
-        assert [_leg_for_cmd(c) for c in run_cmd_calls] == ['test', 'lint', 'type'], (
+        assert [admission_leg_for_cmd(c) for c in run_cmd_calls] == ['test', 'lint', 'type'], (
             'an unmkdir-able slots_dir must fail open (verify still runs), not raise; '
             f'got {run_cmd_calls!r}'
         )
         # The slot ACQUIRE fails open (no flock held), but the nice-prefix wrap is
         # independent of acquisition and still applies to the test leg.
-        assert run_cmd_calls[0] == 'nice -n 15 ionice -c2 -n7 /bin/bash -c ' + shlex.quote(_TEST_CMD)
-        assert run_cmd_calls[1] == _LINT_CMD
-        assert run_cmd_calls[2] == _TYPE_CMD
+        assert run_cmd_calls[0] == 'nice -n 15 ionice -c2 -n7 /bin/bash -c ' + shlex.quote(INJECTED_TEST_CMD)
+        assert run_cmd_calls[1] == ADMISSION_LINT_CMD
+        assert run_cmd_calls[2] == ADMISSION_TYPE_CMD
 
     @pytest.mark.real_verify_admission
     @pytest.mark.asyncio
+    @pytest.mark.usefixtures("code_default_config")
     async def test_real_acquire_serializes_test_leg_across_concurrent_verifies(self, tmp_path):
         slots_dir = tmp_path / 'slots'
         config = OrchestratorConfig(
@@ -239,7 +215,7 @@ class TestVerifyAdmissionAcquireWiring:
 
         async def spy_run_cmd(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
             nonlocal current, max_seen
-            if _leg_for_cmd(cmd) != 'test':
+            if admission_leg_for_cmd(cmd) != 'test':
                 return 0, '', False
             current += 1
             max_seen = max(max_seen, current)
@@ -260,11 +236,11 @@ class TestVerifyAdmissionAcquireWiring:
         with patch('orchestrator.verify._run_cmd', side_effect=spy_run_cmd):
             results = await asyncio.gather(
                 run_verification(
-                    worktree=worktree_a, config=config, module_config=_module_config(),
+                    worktree=worktree_a, config=config, module_config=admission_module_config(),
                     role='task', attempt_id=None,
                 ),
                 run_verification(
-                    worktree=worktree_b, config=config, module_config=_module_config(),
+                    worktree=worktree_b, config=config, module_config=admission_module_config(),
                     role='task', attempt_id=None,
                 ),
             )
@@ -324,6 +300,7 @@ class TestNicePrefixIntegration:
 
     @pytest.mark.real_verify_admission
     @pytest.mark.asyncio
+    @pytest.mark.usefixtures("code_default_config")
     async def test_task_role_wraps_test_leg_with_nice_and_bash_c(self, tmp_path):
         captured_cmds: list[str] = []
 
@@ -343,14 +320,14 @@ class TestNicePrefixIntegration:
             await run_verification(
                 worktree=worktree,
                 config=config,
-                module_config=_module_config(),
+                module_config=admission_module_config(),
                 role='task',
                 attempt_id=None,
             )
 
-        assert captured_cmds[0] == 'nice -n 15 ionice -c2 -n7 /bin/bash -c ' + shlex.quote(_TEST_CMD)
-        assert captured_cmds[1] == _LINT_CMD, 'lint leg must not be niced'
-        assert captured_cmds[2] == _TYPE_CMD, 'type leg must not be niced'
+        assert captured_cmds[0] == 'nice -n 15 ionice -c2 -n7 /bin/bash -c ' + shlex.quote(INJECTED_TEST_CMD)
+        assert captured_cmds[1] == ADMISSION_LINT_CMD, 'lint leg must not be niced'
+        assert captured_cmds[2] == ADMISSION_TYPE_CMD, 'type leg must not be niced'
 
     @pytest.mark.real_verify_admission
     @pytest.mark.asyncio
@@ -366,6 +343,7 @@ class TestNicePrefixIntegration:
         config = OrchestratorConfig(
             verify_admission_slots_dir=str(slots_dir),
             verify_admission_task_slots=1,
+            merge_verify_breadth='scoped',
         )
         worktree = tmp_path / 'wt'
         worktree.mkdir()
@@ -374,14 +352,14 @@ class TestNicePrefixIntegration:
             await run_verification(
                 worktree=worktree,
                 config=config,
-                module_config=_module_config(),
+                module_config=admission_module_config(),
                 role='merge',
                 attempt_id=None,
             )
 
-        assert captured_cmds[0] == 'nice -n 5 /bin/bash -c ' + shlex.quote(_TEST_CMD)
-        assert captured_cmds[1] == _LINT_CMD, 'lint leg must not be niced'
-        assert captured_cmds[2] == _TYPE_CMD, 'type leg must not be niced'
+        assert captured_cmds[0] == 'nice -n 5 /bin/bash -c ' + shlex.quote(INJECTED_TEST_CMD)
+        assert captured_cmds[1] == ADMISSION_LINT_CMD, 'lint leg must not be niced'
+        assert captured_cmds[2] == ADMISSION_TYPE_CMD, 'type leg must not be niced'
 
     @pytest.mark.real_verify_admission
     @pytest.mark.asyncio
@@ -397,6 +375,7 @@ class TestNicePrefixIntegration:
             verify_admission_enabled=False,
             verify_admission_slots_dir=str(slots_dir),
             verify_admission_task_slots=1,
+            defect_tests=DefectTestsConfig(mode=DefectTestsMode.OFF),
         )
         worktree = tmp_path / 'wt'
         worktree.mkdir()
@@ -405,16 +384,17 @@ class TestNicePrefixIntegration:
             await run_verification(
                 worktree=worktree,
                 config=config,
-                module_config=_module_config(),
+                module_config=admission_module_config(),
                 role='task',
                 attempt_id=None,
             )
 
-        assert captured_cmds[0] == _TEST_CMD, 'disabled admission must never nice/bash-c wrap the test leg'
-        assert captured_cmds[1] == _LINT_CMD
-        assert captured_cmds[2] == _TYPE_CMD
+        assert captured_cmds[0] == ADMISSION_TEST_CMD, 'disabled admission must never nice/bash-c wrap the test leg'
+        assert captured_cmds[1] == ADMISSION_LINT_CMD
+        assert captured_cmds[2] == ADMISSION_TYPE_CMD
 
 
+@pytest.mark.usefixtures("code_default_config")
 class TestVerifyAdmissionSlotsDirDefault:
     """Golden construction invariants for the per-project default of
     ``verify_admission_slots_dir`` (task 2501).
@@ -433,9 +413,7 @@ class TestVerifyAdmissionSlotsDirDefault:
         digest = hashlib.sha256(str(project_root.resolve()).encode()).hexdigest()[:12]
         return f'/tmp/df-verify-slots-{os.getuid()}-{digest}'
 
-    def test_distinct_project_roots_yield_distinct_slots_dirs(self, monkeypatch, tmp_path):
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+    def test_distinct_project_roots_yield_distinct_slots_dirs(self, tmp_path):
         proj_a = tmp_path / 'proj_a'
         proj_b = tmp_path / 'proj_b'
         config_a = OrchestratorConfig(project_root=proj_a)
@@ -445,9 +423,7 @@ class TestVerifyAdmissionSlotsDirDefault:
         assert config_a.verify_admission_slots_dir == self._expected_slots_dir(proj_a)
         assert config_b.verify_admission_slots_dir == self._expected_slots_dir(proj_b)
 
-    def test_same_project_root_yields_identical_slots_dir(self, monkeypatch, tmp_path):
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+    def test_same_project_root_yields_identical_slots_dir(self, tmp_path):
         proj = tmp_path / 'proj'
         config_1 = OrchestratorConfig(project_root=proj)
         config_2 = OrchestratorConfig(project_root=proj)
@@ -455,9 +431,7 @@ class TestVerifyAdmissionSlotsDirDefault:
         assert config_1.verify_admission_slots_dir == config_2.verify_admission_slots_dir
         assert config_1.verify_admission_slots_dir == self._expected_slots_dir(proj)
 
-    def test_explicit_override_preserved_verbatim(self, monkeypatch, tmp_path):
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+    def test_explicit_override_preserved_verbatim(self, tmp_path):
         config = OrchestratorConfig(
             project_root=tmp_path / 'proj',
             verify_admission_slots_dir='/explicit/override',
@@ -465,9 +439,7 @@ class TestVerifyAdmissionSlotsDirDefault:
 
         assert config.verify_admission_slots_dir == '/explicit/override'
 
-    def test_default_is_not_host_global_and_stays_uid_scoped(self, monkeypatch, tmp_path):
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+    def test_default_is_not_host_global_and_stays_uid_scoped(self, tmp_path):
         config = OrchestratorConfig(project_root=tmp_path / 'proj')
         old_host_global = f'/tmp/df-verify-slots-{os.getuid()}'
 
@@ -488,6 +460,7 @@ class TestBackgroundRoleWiring:
 
     @pytest.mark.real_verify_admission
     @pytest.mark.asyncio
+    @pytest.mark.usefixtures("code_default_config")
     async def test_background_role_acquires_slot_and_applies_nice_19_tier(self, tmp_path):
         events: list = []
 
@@ -500,7 +473,7 @@ class TestBackgroundRoleWiring:
 
         async def spy_run_cmd(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
             captured_cmds.append(cmd)
-            events.append(f'run:{_leg_for_cmd(cmd)}')
+            events.append(f'run:{admission_leg_for_cmd(cmd)}')
             return 0, '', False
 
         slots_dir = tmp_path / 'slots'
@@ -516,7 +489,7 @@ class TestBackgroundRoleWiring:
             await run_verification(
                 worktree=worktree,
                 config=config,
-                module_config=_module_config(),
+                module_config=admission_module_config(),
                 role='background',
                 attempt_id=None,
             )
@@ -526,12 +499,12 @@ class TestBackgroundRoleWiring:
             f'Expected the background role to acquire a slot before the test leg runs; '
             f'got events={events!r}'
         )
-        assert captured_cmds[0] == 'nice -n 19 ionice -c3 /bin/bash -c ' + shlex.quote(_TEST_CMD), (
+        assert captured_cmds[0] == 'nice -n 19 ionice -c3 /bin/bash -c ' + shlex.quote(INJECTED_TEST_CMD), (
             f'Expected the test leg to be wrapped with the background nice-19/ionice-idle '
             f'tier; got {captured_cmds[0]!r}'
         )
-        assert captured_cmds[1] == _LINT_CMD, 'lint leg must not be niced'
-        assert captured_cmds[2] == _TYPE_CMD, 'type leg must not be niced'
+        assert captured_cmds[1] == ADMISSION_LINT_CMD, 'lint leg must not be niced'
+        assert captured_cmds[2] == ADMISSION_TYPE_CMD, 'type leg must not be niced'
 
 
 class TestEnvRecoveryRetryAdmission:
@@ -589,7 +562,7 @@ class TestEnvRecoveryRetryAdmission:
             result = await run_verification(
                 worktree=worktree,
                 config=config,
-                module_config=_module_config(),
+                module_config=admission_module_config(),
                 role='task',
                 attempt_id=None,
             )

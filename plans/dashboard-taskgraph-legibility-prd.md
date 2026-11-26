@@ -98,6 +98,11 @@ order).
 
 ### Part 2 — PRD progress view
 
+> *Superseded 2026-10-09 by `plans/dashboard-prd-lanes-prd.md` task 6585 (δ). The PRD box
+> grid (`ProjectPrdGroups`, `PrdBox`, `prd_grouping.js`) is replaced by server-computed lanes.
+> Part 1 stands: `TaskGraph`, `TaskGraphEdges`, `graph_layout.js` and focus mode become the
+> expanded body of a PRD row.*
+
 **Backend** (`data/active_tasks.py` + `data/tasks.py`):
 - Every task row gains a **`prd`** field: coalesce
   `metadata.prd_path → metadata.prd → metadata.prd_ref`, strip `#anchor` and
@@ -106,7 +111,8 @@ order).
   `_ACTIVE_STATUSES`, its done/cancelled members are included as rows even
   beyond the bounded 50-cap, **with real `deps` populated** (they keep
   `started: 0` + `completed`). This makes "n/m done" counts and intra-box
-  edges truthful. `DONE_COUNTS` semantics unchanged.
+  edges truthful. `DONE_COUNTS` semantics unchanged (superseded: see the
+  2026-09-27 amendment under §Contract).
 
 **Frontend** (`tab_tasks.jsx` + `styles.css`):
 - A per-project **"group by PRD"** toggle (persisted via the existing
@@ -173,6 +179,33 @@ order).
   with populated `deps`, exempt from the 50-cap; other terminal rows are
   unchanged (cap applies, `deps: []`).
 
+**Amended 2026-09-27 (task 5590, PRD dashboard-one-datum-one-path decision 5/8):**
+
+- **The Terminal-member exemption bullet above is RETIRED.** The default
+  `/tasks` render fetches no terminal rows. They arrive only through the
+  on-demand `?terminal=<project>` window
+  (`data/task_snapshot.py::acquire_terminal_window`): the newest 400 terminal
+  rows by task id, served as one `lower_bound` Datum.
+  `data/task_snapshot.py::_TERMINAL_FETCH_WINDOW` is deliberately NOT lowered.
+- **Task 4416 is resolved by its option (a).** A live PRD's terminal members
+  are "the live members inside the fetched window". The under-count is
+  disclosed, not sanctioned silently: the PRD box renders `≥ n/m terminal`
+  (n counts done + cancelled) from a `lower_bound` Datum,
+  `prd_grouping.js::prdProgress`, a `datum.js::combinedDatum` over the
+  snapshot rows and the window, with the window's reason as its tooltip. The
+  Tasks tab requests the window when the terminal view filter or that
+  project's PRD grouping toggle is on
+  (`task_snapshot.js::terminalWindowProjects`).
+- **`DONE_COUNTS` is retired** in favour of `TASKS_SNAPSHOT[p].census`. This
+  supersedes Part 2's "`DONE_COUNTS` semantics unchanged".
+- **Part 2's Box chrome aggregate and progress bucket rules are superseded**
+  by the generated views, `in_flight` / `backlog` / `terminal`, from
+  `shared.task_statuses` via `task_vocab.js`
+  (`prd_grouping.js::summarizePrdMembers`). The bar draws one segment per
+  member status (`prd_grouping.js::prdBarSegments`).
+
+The rationale lives in `plans/dashboard-one-datum-one-path-prd.md`.
+
 ## Pre-conditions for activating
 
 None — all substrate exists on main (deps edge list client-side,
@@ -232,6 +265,17 @@ rows, delivered upstream by δ.
 2. **Payload growth from done-member inclusion.** Always-on per decision 7.
    **Suggested resolution:** if `/api/v2/dashboard/tasks` exceeds ~1 MB in
    practice, add a `?prd_members=` opt-out then. Decide if observed.
+
+   *Note, 2026-10-21 (task 5824).* The ~1 MB trigger was crossed and nothing
+   observed it. The endpoint measured 16.6 MB on 2026-09-20 and 17.4 MB on
+   2026-09-23. Task 5815 then cut it to about 4.4 MB (4,351,859 bytes on
+   2026-10-15). The done-member inclusion this question is about is retired:
+   `dashboard/src/dashboard/api/tasks.py::api_tasks` documents that the live-PRD
+   terminal-member exemption is gone and that terminal rows travel only on a
+   `?terminal=` request. The trigger is no longer prose. Every request has a
+   mechanized budget in `dashboard/src/dashboard/payload_budgets.json`,
+   enforced pre-merge by a fixture sweep and live by a daily predicate
+   (`OPERATIONS.md`, "Payload budgets").
 3. **Focus-mode affordance placement** (button in detail panel vs
    double-click vs both). **Suggested resolution:** button in the detail
    panel + double-click shortcut. Decide during γ.

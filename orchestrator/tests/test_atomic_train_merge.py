@@ -27,21 +27,23 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _merge_lane_fakes import make_lane, merge_through_lane, running_lane, times_out
 from _orch_helpers import wire_scheduler_liveness_mock
-from _serial_merge_worker import MergeWorker
 
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import AdvanceOutcome, GitOps, TrainMembership, _run
-from orchestrator.merge_queue import (
+from orchestrator.merge_lane import MergeLane
+from orchestrator.merge_lane.types import QueuedBranch
+from orchestrator.merge_lane.verify_failure_outcome import TRANSIENT_INFRA_REASON_PREFIX
+from orchestrator.merge_lane.worker import (
     ABANDONED_REASON_PREFIX,
     POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX,
     TRAIN_REBASE_CONFLICT_REASON_PREFIX,
-    TRANSIENT_INFRA_REASON_PREFIX,
     GroupMergeRequest,
     MergeOutcome,
     MergeRequest,
 )
-from orchestrator.merge_types import QueuedBranch
+from orchestrator.quarantine_provenance import QuarantineOutcome
 from orchestrator.verify import VerifyResult, run_scoped_verification
 
 # Real git + real cargo integration module (see module docstring): a workspace
@@ -202,8 +204,24 @@ def build_group_merge_request(
 
 
 # ---------------------------------------------------------------------------
-# Helper: build an OrchestratorConfig for cargo workspace train tests
+# Helpers: build this file's OrchestratorConfigs
 # ---------------------------------------------------------------------------
+
+
+def _probe_on_scene_config(project_root: Path, **overrides: Any) -> OrchestratorConfig:
+    """This file's scene config: the main-health probe stays on, as shipped."""
+    return OrchestratorConfig(
+        project_root=project_root,
+        escalate_preexisting_main_break=True,
+        git=GitConfig(
+            main_branch="main",
+            branch_prefix="task/",
+            remote="origin",
+            worktree_dir=".worktrees",
+            push_after_advance=False,
+        ),
+        **overrides,
+    )
 
 
 def make_train_config(repo: Path, target_dir: Path) -> OrchestratorConfig:
@@ -217,8 +235,8 @@ def make_train_config(repo: Path, target_dir: Path) -> OrchestratorConfig:
       use the shared incremental build cache
     - verify_command_timeout_secs=300  (generous for CI; trivial workspace is fast)
     """
-    return OrchestratorConfig(
-        project_root=repo,
+    return _probe_on_scene_config(
+        repo,
         test_command="cargo test --workspace --quiet",
         # Use no-op shell builtins so lint/type_check don't interfere with
         # the Rust workspace.  'true' always exits 0.
@@ -226,13 +244,6 @@ def make_train_config(repo: Path, target_dir: Path) -> OrchestratorConfig:
         type_check_command="true",
         verify_env={"CARGO_TARGET_DIR": str(target_dir)},
         verify_command_timeout_secs=300.0,
-        git=GitConfig(
-            main_branch="main",
-            branch_prefix="task/",
-            remote="origin",
-            worktree_dir=".worktrees",
-            push_after_advance=False,
-        ),
     )
 
 
@@ -252,7 +263,7 @@ class TestScenario1HappyPath:
 
     async def test_happy_path_3_train_single_merge(
         self,
-        cargo_or_skip,            # noqa: ARG002  (skip guard; value unused)
+        cargo_or_skip,  # (skip guard; value unused)
         shared_cargo_target: Path,
         tmp_path: Path,
     ) -> None:
@@ -316,7 +327,7 @@ class TestScenario1HappyPath:
         )
         merge_commits_before = int(before_log.strip())
 
-        # --- drive the GroupMergeRequest through real MergeWorker -------------
+        # --- drive the GroupMergeRequest through the production lane ----------
         req = build_group_merge_request(
             git_ops=git_ops,
             config=config,
@@ -327,8 +338,8 @@ class TestScenario1HappyPath:
         )
 
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
-        worker = MergeWorker(git_ops, queue)
-        outcome = await worker._do_merge(req)
+        lane = make_lane(git_ops, queue)
+        outcome = await merge_through_lane(lane, queue, req)
 
         # --- (iii) outcome is done --------------------------------------------
         assert outcome is not None
@@ -447,7 +458,7 @@ class TestScenario2WorktreeBase:
 
         # Create α branch off main with one commit so it has a non-main tip.
         wt_a, alpha_sha = await make_stacked_member(
-            git_ops, "alpha", (await git_ops._freshen_main())[0],
+            git_ops, "alpha", await git_ops._freshen_main(),
             lambda wt: (wt / "alpha.txt").write_text("alpha\n"),
         )
 
@@ -499,16 +510,7 @@ class TestScenario3IntraTrainDispatch:
 
         from orchestrator.scheduler import Scheduler
 
-        config = OrchestratorConfig(
-            project_root=tmp_path,
-            git=GitConfig(
-                main_branch="main",
-                branch_prefix="task/",
-                remote="origin",
-                worktree_dir=".worktrees",
-                push_after_advance=False,
-            ),
-        )
+        config = _probe_on_scene_config(tmp_path)
         scheduler = Scheduler(config)
 
         alpha_task = {
@@ -553,16 +555,7 @@ class TestScenario4ExtraTrainDispatchBlocked:
         """_deps_satisfied returns False when dependent has no train metadata."""
         from orchestrator.scheduler import Scheduler
 
-        config = OrchestratorConfig(
-            project_root=tmp_path,
-            git=GitConfig(
-                main_branch="main",
-                branch_prefix="task/",
-                remote="origin",
-                worktree_dir=".worktrees",
-                push_after_advance=False,
-            ),
-        )
+        config = _probe_on_scene_config(tmp_path)
         scheduler = Scheduler(config)
 
         alpha_task = {
@@ -601,16 +594,7 @@ class TestScenario4ExtraTrainDispatchBlocked:
         """
         from orchestrator.scheduler import Scheduler
 
-        config = OrchestratorConfig(
-            project_root=tmp_path,
-            git=GitConfig(
-                main_branch="main",
-                branch_prefix="task/",
-                remote="origin",
-                worktree_dir=".worktrees",
-                push_after_advance=False,
-            ),
-        )
+        config = _probe_on_scene_config(tmp_path)
         scheduler = Scheduler(config)
 
         alpha_task = {
@@ -663,7 +647,7 @@ class TestScenario5GroupMergeVerify:
 
     async def test_group_merge_workspace_verify_green(
         self,
-        cargo_or_skip,  # noqa: ARG002
+        cargo_or_skip,
         shared_cargo_target: Path,
         tmp_path: Path,
     ) -> None:
@@ -709,10 +693,10 @@ class TestScenario5GroupMergeVerify:
         )
 
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
-        worker = MergeWorker(git_ops, queue)
+        lane = MergeLane(git_ops, queue)
 
-        with patch("orchestrator.merge_queue.run_scoped_verification", side_effect=_spy_verify):
-            outcome = await worker._do_merge(req)
+        with patch("orchestrator.merge_lane.worker.run_scoped_verification", side_effect=_spy_verify):
+            outcome = await merge_through_lane(lane, queue, req)
 
         # (i) Outcome is done.
         assert outcome is not None
@@ -747,7 +731,7 @@ class TestScenario5GroupMergeVerify:
     @pytest.mark.exercise_merge_verify
     async def test_group_merge_workspace_verify_red(
         self,
-        cargo_or_skip,  # noqa: ARG002
+        cargo_or_skip,
         shared_cargo_target: Path,
         tmp_path: Path,
     ) -> None:
@@ -800,12 +784,12 @@ class TestScenario5GroupMergeVerify:
         )
 
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
-        worker = MergeWorker(git_ops, queue)
+        lane = MergeLane(git_ops, queue)
 
         # The @pytest.mark.exercise_merge_verify marker (above) makes the autouse
-        # fixture skip the passed=True stub; the real run_scoped_verification runs
-        # here automatically — no in-body patch needed or added.
-        outcome = await worker._do_merge(req)
+        # fixture skip the passed=True stub; the lane's production verifier then
+        # runs the real run_scoped_verification — no in-body patch needed or added.
+        outcome = await merge_through_lane(lane, queue, req)
 
         # (i) Outcome is blocked (not done).
         assert outcome is not None
@@ -896,6 +880,18 @@ def _make_workflow(
     scheduler = MagicMock()
     scheduler.get_statuses = AsyncMock(return_value=get_statuses_return)
     scheduler.mark_done = AsyncMock()
+    # Task 3057: the train-member done-flip now reads the member's row to
+    # check its declared delivered_checks before stamping, so the double must
+    # answer get_task. A row carrying no 'delivered_checks' leaves the guard
+    # inert — these scenarios assert merge/flip mechanics, not capability
+    # verification, so they keep their pre-3057 behaviour. Without this stub
+    # the MagicMock attribute is un-awaitable and every flip fail-safes into
+    # withholding.
+    scheduler.get_task = AsyncMock(
+        side_effect=lambda tid, **_kw: {
+            "id": tid, "title": tid, "status": "in-progress", "metadata": {},
+        },
+    )
     scheduler.tasks_by_train = AsyncMock(
         return_value=(tasks_by_train_return or [])
     )
@@ -989,17 +985,10 @@ class TestScenario6ParkPrefixDerail:
         await _run(["git", "add", "-A"], cwd=repo6)
         await _run(["git", "commit", "-m", "initial"], cwd=repo6)
 
-        config6 = OrchestratorConfig(
-            project_root=repo6,
+        config6 = _probe_on_scene_config(
+            repo6,
             max_verify_attempts=5,
             max_failure_signature_repeat=3,
-            git=GitConfig(
-                main_branch="main",
-                branch_prefix="task/",
-                remote="origin",
-                worktree_dir=".worktrees",
-                push_after_advance=False,
-            ),
         )
         git_ops6 = GitOps(config6.git, repo6)
 
@@ -1057,16 +1046,7 @@ class TestScenario6ParkPrefixDerail:
         await _run(["git", "add", "-A"], cwd=repo6b)
         await _run(["git", "commit", "-m", "initial"], cwd=repo6b)
 
-        config6b = OrchestratorConfig(
-            project_root=repo6b,
-            git=GitConfig(
-                main_branch="main",
-                branch_prefix="task/",
-                remote="origin",
-                worktree_dir=".worktrees",
-                push_after_advance=False,
-            ),
-        )
+        config6b = _probe_on_scene_config(repo6b)
         git_ops6b = GitOps(config6b.git, repo6b)
 
         wt_info = await git_ops6b.create_worktree("gamma6")
@@ -1118,7 +1098,7 @@ class TestScenario6ParkPrefixDerail:
         # to this test's live-vs-orphan routing.
         harness.git_ops.mark_pool_storage_present()
         harness.git_ops.worktree_has_unsaved_work = AsyncMock(return_value=False)
-        harness.git_ops.quarantine_worktree = AsyncMock(return_value=tmp_path / "q-dest")
+        harness.git_ops.quarantine_worktree = AsyncMock(return_value=QuarantineOutcome(dest=tmp_path / "q-dest"))
         harness.git_ops.cleanup_worktree = AsyncMock()
         harness.git_ops.prune_worktrees = AsyncMock()
         harness.config.worktree_orphan_reaper_enabled = True
@@ -1182,7 +1162,7 @@ class TestScenario7TrainResume:
     After γ's verify loop is unblocked (verify becomes green) and all members
     are merge-deferred, calling _maybe_enqueue_group_merge() on the tip (γ)
     enqueues a GroupMergeRequest and — when the request is driven through
-    MergeWorker — yields scenario-1 postconditions (single merge commit, 3 done).
+    the production merge lane — yields scenario-1 postconditions (single merge commit, 3 done).
 
     Uses real git (for the merge) with mocked verify (no cargo needed).
     """
@@ -1200,18 +1180,11 @@ class TestScenario7TrainResume:
         await _run(["git", "add", "-A"], cwd=repo)
         await _run(["git", "commit", "-m", "initial"], cwd=repo)
 
-        config7 = OrchestratorConfig(
-            project_root=repo,
+        config7 = _probe_on_scene_config(
+            repo,
             test_command="true",   # no real cargo — verify is mocked
             lint_command="true",
             type_check_command="true",
-            git=GitConfig(
-                main_branch="main",
-                branch_prefix="task/",
-                remote="origin",
-                worktree_dir=".worktrees",
-                push_after_advance=False,
-            ),
         )
         git_ops7 = GitOps(config7.git, repo)
 
@@ -1259,37 +1232,29 @@ class TestScenario7TrainResume:
         _, main_sha_before, _ = await _run(["git", "rev-parse", "main"], cwd=repo)
         main_sha_before = main_sha_before.strip()
 
-        # ── Mock verify: always passes (no cargo run in this scenario) ─────
-        passed_result = VerifyResult(
-            passed=True, test_output="ok\n", lint_output="", type_output="",
-            summary="all green", timed_out=False,
+        # Run _maybe_enqueue_group_merge as a background task; it enqueues
+        # the GroupMergeRequest and awaits the future.
+        enqueue_task = asyncio.create_task(wf7._maybe_enqueue_group_merge())
+
+        # Use wait_for instead of sleep(0)+get_nowait: deterministic regardless
+        # of how many internal awaits the implementation does before enqueuing.
+        req7 = await asyncio.wait_for(merge_q.get(), timeout=2.0)
+        assert isinstance(req7, GroupMergeRequest), (
+            f"expected GroupMergeRequest in queue, got {type(req7).__name__}"
         )
+        assert req7.train_id == "T7"
+        assert req7.member_task_ids == ["alpha7", "beta7", "gamma7"]
 
-        with patch("orchestrator.merge_queue.run_scoped_verification", AsyncMock(return_value=passed_result)):
-            # Run _maybe_enqueue_group_merge as a background task; it enqueues
-            # the GroupMergeRequest and awaits the future.
-            enqueue_task = asyncio.create_task(wf7._maybe_enqueue_group_merge())
+        # Drive the request through the production lane. Verify passes on the
+        # conftest autouse stub, not on make_lane's FakeVerifier, which a train
+        # ignores (task 6160); no cargo runs. The lane resolves req7.result
+        # itself, which unblocks _maybe_enqueue_group_merge.
+        worker_q: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        lane = make_lane(git_ops7, worker_q)
+        await merge_through_lane(lane, worker_q, req7)
 
-            # Use wait_for instead of sleep(0)+get_nowait: deterministic regardless
-            # of how many internal awaits the implementation does before enqueuing.
-            req7 = await asyncio.wait_for(merge_q.get(), timeout=2.0)
-            assert isinstance(req7, GroupMergeRequest), (
-                f"expected GroupMergeRequest in queue, got {type(req7).__name__}"
-            )
-            assert req7.train_id == "T7"
-            assert req7.member_task_ids == ["alpha7", "beta7", "gamma7"]
-
-            # Drive the request through a real MergeWorker.
-            worker_q: asyncio.Queue[MergeRequest] = asyncio.Queue()
-            worker = MergeWorker(git_ops7, worker_q)
-            merge_outcome = await worker._do_merge(req7)
-
-            # Resolve the future to unblock _maybe_enqueue_group_merge.
-            if merge_outcome is not None and not req7.result.done():
-                req7.result.set_result(merge_outcome)
-
-            # Wait for _maybe_enqueue_group_merge to return.
-            wf_outcome = await enqueue_task
+        # Wait for _maybe_enqueue_group_merge to return.
+        wf_outcome = await enqueue_task
 
         # ── Scenario-1 postconditions ──────────────────────────────────────
 
@@ -1331,7 +1296,7 @@ class TestScenario8MainAdvances:
     """PRD §10 row 8: main advances while train is in the merge-deferred holding window.
 
     CLEAN variant: unrelated commit lands on main between stacking and the
-    group merge; the worker rebases the tip onto new main, then merges —
+    group merge; the lane rebases the tip onto new main, then merges —
     main contains both the unrelated commit AND all 3 member files, single
     new merge commit, outcome done.  Uses real cargo (cargo_or_skip).
 
@@ -1343,7 +1308,7 @@ class TestScenario8MainAdvances:
 
     async def test_main_advances_then_train_merges_clean(
         self,
-        cargo_or_skip,  # noqa: ARG002
+        cargo_or_skip,
         shared_cargo_target: Path,
         tmp_path: Path,
     ) -> None:
@@ -1390,7 +1355,7 @@ class TestScenario8MainAdvances:
         )
         merges_before = int(merges_before_str.strip())
 
-        # Drive the GroupMergeRequest — worker rebases tip onto new main then merges.
+        # Drive the GroupMergeRequest — lane rebases tip onto new main then merges.
         req = build_group_merge_request(
             git_ops=git_ops,
             config=config,
@@ -1401,8 +1366,8 @@ class TestScenario8MainAdvances:
         )
 
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
-        worker = MergeWorker(git_ops, queue)
-        outcome = await worker._do_merge(req)
+        lane = make_lane(git_ops, queue)
+        outcome = await merge_through_lane(lane, queue, req)
 
         # (i) Outcome done.
         assert outcome is not None
@@ -1469,7 +1434,7 @@ class TestScenario8MainAdvances:
         """CONFLICT: main edit conflicts with member → TRAIN_REBASE_CONFLICT outcome.
 
         Lands a commit on main that edits the SAME LINE as gamma's crate_c
-        change.  rebase_onto_main genuinely conflicts → worker returns the
+        change.  rebase_onto_main genuinely conflicts → lane returns the
         TRAIN_REBASE_CONFLICT_REASON_PREFIX reason, advance_main NOT called,
         main SHA unmoved, zero mark_member_done calls.
 
@@ -1485,18 +1450,11 @@ class TestScenario8MainAdvances:
         await _run(["git", "add", "-A"], cwd=repo)
         await _run(["git", "commit", "-m", "initial"], cwd=repo)
 
-        config8r = OrchestratorConfig(
-            project_root=repo,
+        config8r = _probe_on_scene_config(
+            repo,
             test_command="true",
             lint_command="true",
             type_check_command="true",
-            git=GitConfig(
-                main_branch="main",
-                branch_prefix="task/",
-                remote="origin",
-                worktree_dir=".worktrees",
-                push_after_advance=False,
-            ),
         )
         git_ops8r = GitOps(config8r.git, repo)
 
@@ -1546,8 +1504,8 @@ class TestScenario8MainAdvances:
         )
 
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
-        worker = MergeWorker(git_ops8r, queue)
-        outcome = await worker._do_merge(req)
+        lane = make_lane(git_ops8r, queue)
+        outcome = await merge_through_lane(lane, queue, req)
 
         # (i) Outcome reason starts with TRAIN_REBASE_CONFLICT_REASON_PREFIX.
         assert outcome is not None
@@ -1618,17 +1576,10 @@ class TestScenario9LoopGuardNonTrain:
         await _run(["git", "add", "-A"], cwd=repo9)
         await _run(["git", "commit", "-m", "initial"], cwd=repo9)
 
-        config9 = OrchestratorConfig(
-            project_root=repo9,
+        config9 = _probe_on_scene_config(
+            repo9,
             max_verify_attempts=5,
             max_failure_signature_repeat=3,
-            git=GitConfig(
-                main_branch="main",
-                branch_prefix="task/",
-                remote="origin",
-                worktree_dir=".worktrees",
-                push_after_advance=False,
-            ),
         )
         git_ops9 = GitOps(config9.git, repo9)
 
@@ -1694,16 +1645,7 @@ class TestScenario10DoneProvGateUnweakened:
 
         # Build a real Scheduler with a minimal OrchestratorConfig.
         # mcp_session=None → uses mcp_call HTTP path (monkeypatched below).
-        config10 = OrchestratorConfig(
-            project_root=tmp_path,
-            git=GitConfig(
-                main_branch="main",
-                branch_prefix="task/",
-                remote="origin",
-                worktree_dir=".worktrees",
-                push_after_advance=False,
-            ),
-        )
+        config10 = _probe_on_scene_config(tmp_path)
         sched10 = Scheduler(config10)
 
         # Stub the MCP transport to return a done_provenance_invalid rejection.
@@ -1777,13 +1719,13 @@ class TestScenario11NonTrainRegression:
     merge path:
     - create_worktree (no train kwarg) → worktree base == main tip
     - real cargo post-merge verify via test_command (not forced-workspace flag)
-    - single MergeRequest through MergeWorker → done, one merge commit
+    - single MergeRequest through the production lane → done, one merge commit
     - no merge-deferred state ever entered
     """
 
     async def test_non_train_regression(
         self,
-        cargo_or_skip,  # noqa: ARG002
+        cargo_or_skip,
         shared_cargo_target: Path,
         tmp_path: Path,
     ) -> None:
@@ -1822,7 +1764,7 @@ class TestScenario11NonTrainRegression:
         )
         merges_before = int(merges_before_str.strip())
 
-        # (ii) Drive a plain MergeRequest through the real single-task worker.
+        # (ii) Drive a plain MergeRequest through the production lane's single-task path.
         req11 = _build_plain_merge_request(
             git_ops=git_ops11,
             config=config11,
@@ -1830,8 +1772,8 @@ class TestScenario11NonTrainRegression:
             worktree=wt_a11,
         )
         queue11: asyncio.Queue[MergeRequest] = asyncio.Queue()
-        worker11 = MergeWorker(git_ops11, queue11)
-        outcome11 = await worker11._do_merge(req11)
+        lane11 = make_lane(git_ops11, queue11)
+        outcome11 = await merge_through_lane(lane11, queue11, req11)
 
         # (iii) Assertions: done, single new merge commit, merge_sha is set.
         assert outcome11 is not None
@@ -1883,7 +1825,7 @@ class TestScenario12DegenerateTrainOfOne:
 
     async def test_degenerate_train_of_one(
         self,
-        cargo_or_skip,  # noqa: ARG002
+        cargo_or_skip,
         shared_cargo_target: Path,
         tmp_path: Path,
     ) -> None:
@@ -1935,8 +1877,8 @@ class TestScenario12DegenerateTrainOfOne:
         )
 
         queue12: asyncio.Queue[MergeRequest] = asyncio.Queue()
-        worker12 = MergeWorker(git_ops12, queue12)
-        outcome12 = await worker12._do_merge(req12)
+        lane12 = make_lane(git_ops12, queue12)
+        outcome12 = await merge_through_lane(lane12, queue12, req12)
 
         # (iv) Assertions: done, single merge commit, member marked done once.
         assert outcome12 is not None
@@ -1993,7 +1935,7 @@ class TestScenario12DegenerateTrainOfOne:
 
 # ---------------------------------------------------------------------------
 # Gate tests (steps 01-10): disk-guard, loop-breaker, equivalence, push,
-# wip-halt — drive through MergeWorker._do_merge, no cargo required.
+# wip-halt — drive through the production MergeLane, no cargo required.
 # These tests use a simple git repo (plain text files) rather than the cargo
 # fixture, so they run on any machine regardless of Rust toolchain availability.
 # ---------------------------------------------------------------------------
@@ -2020,11 +1962,9 @@ async def _setup_gate_train(
 ) -> tuple[GitOps, OrchestratorConfig, GroupMergeRequest]:
     """Set up a minimal git repo with a real stacked 3-member train (no cargo).
 
-    Returns (git_ops, config, req) ready for worker._do_merge() testing.
+    Returns (git_ops, config, req) ready to submit to a lane.
     Each member adds one unique .txt file so diffs are always non-empty.
     """
-    from orchestrator.config import GitConfig, OrchestratorConfig
-
     repo = tmp_path / "repo"
     repo.mkdir()
     await _run(["git", "init", "-b", "main"], cwd=repo)
@@ -2034,15 +1974,8 @@ async def _setup_gate_train(
     await _run(["git", "add", "-A"], cwd=repo)
     await _run(["git", "commit", "-m", "initial"], cwd=repo)
 
-    git_cfg = GitConfig(
-        main_branch="main",
-        branch_prefix="task/",
-        remote="origin",
-        worktree_dir=".worktrees",
-        push_after_advance=False,
-    )
-    config = OrchestratorConfig(project_root=repo, git=git_cfg)
-    git_ops = GitOps(git_cfg, repo)
+    config = _probe_on_scene_config(repo)
+    git_ops = GitOps(config.git, repo)
 
     a_name, b_name, c_name = member_names
 
@@ -2084,7 +2017,7 @@ async def _setup_gate_train(
 class TestGate01TrainDiskGuard:
     """step-01 RED: _do_train_merge has no disk guard; disk pressure is ignored.
 
-    After step-02 (GREEN): _do_train_merge uses _run_post_merge_verify which
+    After step-02 (GREEN): _do_train_merge uses run_post_merge_verify which
     runs the pre-verify disk guard; persistent low disk → blocked/verify_skipped.
     """
 
@@ -2101,15 +2034,15 @@ class TestGate01TrainDiskGuard:
         main_sha_before = main_sha_before.strip()
 
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
-        worker = MergeWorker(git_ops, queue)
+        lane = MergeLane(git_ops, queue)
 
         with (
             patch(
-                "orchestrator.merge_queue.run_scoped_verification",
+                "orchestrator.merge_lane.worker.run_scoped_verification",
                 AsyncMock(return_value=_make_passing_verify_result()),
             ),
             patch(
-                "orchestrator.merge_queue.shutil.disk_usage",
+                "orchestrator.merge_lane.worker.shutil.disk_usage",
                 return_value=MagicMock(free=1 * _GIB),  # 1 GiB << 10 GiB threshold
             ),
             patch.object(
@@ -2118,7 +2051,7 @@ class TestGate01TrainDiskGuard:
                 AsyncMock(return_value=[]),  # prune frees nothing
             ),
         ):
-            outcome = await worker._do_merge(req)
+            outcome = await merge_through_lane(lane, queue, req)
 
         # (1) Outcome is blocked with the disk-guard reason.
         assert outcome is not None
@@ -2155,54 +2088,65 @@ class TestGate01TrainDiskGuard:
 class TestGate03TrainVerifyTimeoutLoopBreaker:
     """step-03 RED: _do_train_merge has no loop-breaker short-circuit.
 
-    Pre-seeding worker._post_merge_verify_timeouts[tip] = MAX doesn't stop
-    _do_train_merge from doing git work today; with mocked passing verify it
-    returns 'done'.  After step-04 the loop-breaker fires before any git work
-    and returns blocked/ABANDONED prefix.
+    Without it, a train whose tip keeps timing out in post-merge verify redoes
+    its git work and verify on every resubmission.  After step-04 the
+    loop-breaker fires before any git work once the tip has timed out
+    MAX_POST_MERGE_VERIFY_TIMEOUTS times, and returns blocked/ABANDONED prefix.
     """
 
     async def test_train_abandons_after_verify_timeout_threshold(
         self, tmp_path: Path,
     ) -> None:
-        """Pre-seeded timeout counter at threshold → abandoned, no git work, 0 flips."""
-        git_ops, config, req = await _setup_gate_train(
+        """Verify times out MAX times → next submission abandoned, no git work, 0 flips."""
+        git_ops, config, first_req = await _setup_gate_train(
             tmp_path, train_id="train-loop-breaker",
         )
 
-        # Record main SHA before attempt.
+        def resubmission() -> GroupMergeRequest:
+            return build_group_merge_request(
+                git_ops=git_ops, config=config, train_id="train-loop-breaker",
+                member_names=["g-a", "g-b", "g-c"], tip_name="g-c",
+                tip_worktree=first_req.worktree,
+            )
+
         _, main_sha_before, _ = await _run(
             ["git", "rev-parse", "main"], cwd=git_ops.project_root,
         )
         main_sha_before = main_sha_before.strip()
 
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
-        worker = MergeWorker(git_ops, queue)
+        lane = MergeLane(git_ops, queue)
+        verify = AsyncMock(return_value=times_out().result)
 
-        # Pre-seed the timeout counter at the threshold.
-        tip_task_id = req.task_id  # tip is 'g-c' for default member names
-        worker._post_merge_verify_timeouts[tip_task_id] = (
-            worker.MAX_POST_MERGE_VERIFY_TIMEOUTS
-        )
+        with patch("orchestrator.merge_lane.worker.run_scoped_verification", verify):
+            async with running_lane(lane) as run:
+                # Submissions 1..MAX run merge + verify and surface the timeout.
+                requests = [first_req]
+                for attempt in range(lane.MAX_POST_MERGE_VERIFY_TIMEOUTS):
+                    if attempt:
+                        requests.append(resubmission())
+                    await queue.put(requests[-1])
+                    outcome = await run.outcome(requests[-1], timeout=60)
+                    assert outcome.status == "blocked", f"expected blocked, got: {outcome!r}"
+                assert verify.await_count == lane.MAX_POST_MERGE_VERIFY_TIMEOUTS
 
-        # Spy on merge_to_main — the loop-breaker must short-circuit BEFORE any git work.
-        with (
-            patch.object(git_ops, "merge_to_main", wraps=git_ops.merge_to_main) as spy_merge,
-            patch(
-                "orchestrator.merge_queue.run_scoped_verification",
-                AsyncMock(return_value=_make_passing_verify_result()),
-            ),
-        ):
-            outcome = await worker._do_merge(req)
+                # Spy on merge_to_main — the loop-breaker must short-circuit BEFORE any git work.
+                final_req = resubmission()
+                with patch.object(
+                    git_ops, "merge_to_main", wraps=git_ops.merge_to_main,
+                ) as spy_merge:
+                    await queue.put(final_req)
+                    outcome = await run.outcome(final_req, timeout=60)
 
         # (1) Outcome is blocked with the ABANDONED prefix.
-        assert outcome is not None
         assert outcome.status == "blocked", f"expected blocked, got: {outcome!r}"
         assert outcome.reason.startswith(ABANDONED_REASON_PREFIX), (
             f"expected ABANDONED prefix, got: {outcome.reason!r}"
         )
 
-        # (2) No git work ran (loop-breaker must fire before merge_to_main).
+        # (2) No git work and no verify ran (loop-breaker fires before merge_to_main).
         spy_merge.assert_not_called()
+        assert verify.await_count == lane.MAX_POST_MERGE_VERIFY_TIMEOUTS
 
         # (3) Main SHA must be unmoved.
         _, main_sha_after, _ = await _run(
@@ -2213,11 +2157,12 @@ class TestGate03TrainVerifyTimeoutLoopBreaker:
             f"moved from {main_sha_before!r} to {main_sha_after.strip()!r}"
         )
 
-        # (4) No member flips.
-        assert req.mark_member_done.call_count == 0, (  # type: ignore[union-attr]
-            f"mark_member_done must not fire when loop-breaker abandons; "
-            f"got {req.mark_member_done.call_count} call(s)"  # type: ignore[union-attr]
-        )
+        # (4) No member flips on any submission.
+        for req in (*requests, final_req):
+            assert req.mark_member_done.call_count == 0, (  # type: ignore[union-attr]
+                f"mark_member_done must not fire when loop-breaker abandons; "
+                f"got {req.mark_member_done.call_count} call(s)"  # type: ignore[union-attr]
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -2243,19 +2188,19 @@ class TestGate05TrainPostMergeEquivalence:
         )
 
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
-        worker = MergeWorker(git_ops, queue)
+        lane = MergeLane(git_ops, queue)
 
         with (
             patch(
-                "orchestrator.merge_queue.run_scoped_verification",
+                "orchestrator.merge_lane.worker.run_scoped_verification",
                 AsyncMock(return_value=_make_passing_verify_result()),
             ),
             patch(
-                "orchestrator.merge_queue._check_post_merge_equivalence",
+                "orchestrator.merge_lane.gates._check_post_merge_equivalence",
                 AsyncMock(return_value=["g-a/src/lib.rs"]),
             ),
         ):
-            outcome = await worker._do_merge(req)
+            outcome = await merge_through_lane(lane, queue, req)
 
         # (1) Outcome is blocked with equivalence-failure reason.
         assert outcome is not None
@@ -2342,20 +2287,14 @@ class TestGate07TrainPushAndTelemetry:
 
         spy_store = _SpyEventStore()
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
-        # Pass the spy event store to the worker.
-        worker = MergeWorker(git_ops, queue, event_store=spy_store)  # type: ignore[arg-type]
+        # Pass the spy event store to the lane.
+        lane = make_lane(git_ops, queue, event_store=spy_store)
 
-        with (
-            patch(
-                "orchestrator.merge_queue.run_scoped_verification",
-                AsyncMock(return_value=_make_passing_verify_result()),
-            ),
-            patch.object(
-                git_ops, "push_main",
-                AsyncMock(return_value="pushed"),
-            ) as mock_push,
-        ):
-            outcome = await worker._do_merge(req)
+        with patch.object(
+            git_ops, "push_main",
+            AsyncMock(return_value="pushed"),
+        ) as mock_push:
+            outcome = await merge_through_lane(lane, queue, req)
 
         # (1) Outcome is done with push_status set by finalize.
         assert outcome is not None
@@ -2416,7 +2355,7 @@ class TestGate09TrainWipOverlapHalt:
         )
 
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
-        worker = MergeWorker(git_ops, queue)
+        lane = make_lane(git_ops, queue)
 
         _OVERLAP_FILES = ["crate_a/src/lib.rs"]
 
@@ -2424,17 +2363,16 @@ class TestGate09TrainWipOverlapHalt:
             git_ops._last_overlap_files = _OVERLAP_FILES
             return AdvanceOutcome("wip_overlap")
 
-        with (
-            patch(
-                "orchestrator.merge_queue.run_scoped_verification",
-                AsyncMock(return_value=_make_passing_verify_result()),
-            ),
-            patch.object(
-                git_ops, "advance_main",
-                side_effect=_wip_overlap_advance,
-            ),
+        with patch.object(
+            git_ops, "advance_main",
+            side_effect=_wip_overlap_advance,
         ):
-            outcome = await worker._do_merge(req)
+            async with running_lane(lane) as run:
+                await queue.put(req)
+                outcome = await run.outcome(req, timeout=60)
+                # Read the halt while the lane is still running: stopping a lane
+                # releases its halts.
+                lane_halted = lane.is_wip_halted
 
         assert outcome is not None
         assert outcome.status == "wip_halted", (
@@ -2443,8 +2381,8 @@ class TestGate09TrainWipOverlapHalt:
         assert outcome.overlap_files == _OVERLAP_FILES, (
             f"expected overlap_files={_OVERLAP_FILES!r}, got: {outcome.overlap_files!r}"
         )
-        assert worker.is_wip_halted, (
-            "expected worker.is_wip_halted to be True after wip_overlap"
+        assert lane_halted, (
+            "expected lane.is_wip_halted to be True after wip_overlap"
         )
         # No member flips — main did NOT land cleanly.
         assert req.mark_member_done.call_count == 0, (  # type: ignore[union-attr]

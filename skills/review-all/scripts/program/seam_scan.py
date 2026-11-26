@@ -1,0 +1,208 @@
+#!/usr/bin/env python3
+"""List one stream's G4 seam candidates: open tasks outside the program that name a path it touches.
+
+Read-only: it reads the stream's applied author return and the task store, prints
+one candidate row per task in the skills/prd/references/gates.md G4 columns, and
+writes nothing. Direction, Owner and Status stay ``?`` for the author's G4 ruling.
+"""
+from __future__ import annotations
+
+import argparse
+import enum
+import sys
+from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, NamedTuple
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import run_cli
+import state
+
+
+class Exit(enum.IntEnum):
+    LISTED = 0
+    UNSCANNED = run_cli.COULD_NOT_RUN
+
+
+_EXIT_MEANINGS: Mapping[Exit, str] = {
+    Exit.LISTED: 'the candidates, or the none-line, are listed',
+    Exit.UNSCANNED: 'the scan could not run (usage, run home, author return, or store)',
+}
+
+G4_COLUMNS = ('Other PRD', 'Direction', 'Seam mechanism', 'Owner', 'Status')
+UNRULED = '?'
+NONE_LINE = 'no non-terminal task outside the program declares any touched path'
+UNNAMED_CHECK = '<unnamed check>'
+
+
+class Anchor(NamedTuple):
+    path: str
+    check: str
+
+
+@dataclass(frozen=True)
+class SeamCandidate:
+    task_id: int
+    title: str
+    status: str
+    prd_path: str | None
+    declared: tuple[str, ...]
+    anchored: tuple[Anchor, ...]
+
+
+class Scan(NamedTuple):
+    """The candidates, and when the store was first read for them; None when it was not read."""
+
+    candidates: tuple[SeamCandidate, ...]
+    measured_at: str | None
+
+
+def _require_stream(program: state.Program, stream: str) -> None:
+    if stream not in program.stream_ids:
+        raise state.StateError(
+            f'{stream} is not a stream of {program.run_id}; its streams are '
+            f'{", ".join(program.stream_ids)}'
+        )
+
+
+def _parsed_return(run: run_cli.Run, path: Path, reader: state.StoreReader) -> state.PrdReturn:
+    check = state.validate_return(
+        path.read_text(), program=run.program, ledger=run.ledger, store=reader,
+    )
+    if check.value is None:
+        raise state.StateError(
+            f'{path} is not a valid return: ' + '; '.join(str(r) for r in check.rejections)
+        )
+    return check.value
+
+
+def _author_return(run: run_cli.Run, stream: str, reader: state.StoreReader) -> state.PrdReturn:
+    """The stream's applied author return, the single home of its touches."""
+    if not run.views[stream].authored:
+        raise state.StateError(
+            f'{stream} has no applied author return: the ledger has no stream_status authored '
+            f'line for {stream}'
+        )
+    path = run.home.returns_file(stream, state.Pass.AUTHOR)
+    if not path.is_file():
+        raise state.StateError(
+            f'{stream} has no applied author return ({path} absent); seam_scan reads its touches'
+        )
+    ret = _parsed_return(run, path, reader)
+    if (ret.stream, ret.pass_) != (stream, state.Pass.AUTHOR):
+        raise state.StateError(
+            f'{path} carries the {ret.stream} {ret.pass_} return, not the {stream} author return'
+        )
+    return ret
+
+
+def _listed(value: Any) -> Sequence[Any]:
+    return value if isinstance(value, list | tuple) else ()
+
+
+def _declared(row: state.TaskRow, touches: Sequence[str]) -> tuple[str, ...]:
+    files = _listed(row.metadata.get('files'))
+    return tuple(path for path in touches if path in files)
+
+
+def _check_name(check: Mapping[str, Any]) -> str:
+    name = check.get('name')
+    return UNNAMED_CHECK if name is None or name == '' else str(name)
+
+
+def _anchored(row: state.TaskRow, touches: Sequence[str]) -> tuple[Anchor, ...]:
+    """Each (touched path, check name) where the check's ``paths`` names the path exactly.
+
+    Exactly, as metadata.files is matched: a directory never anchors the files under it.
+    """
+    return tuple(
+        Anchor(path, _check_name(check))
+        for check in _listed(row.metadata.get('delivered_checks')) if isinstance(check, Mapping)
+        for path in touches if path in _listed(check.get('paths'))
+    )
+
+
+def _candidate(row: state.TaskRow, touches: Sequence[str]) -> SeamCandidate:
+    prd_path = row.metadata.get('prd_path')
+    return SeamCandidate(
+        task_id=row.task_id, title=row.title, status=row.status,
+        prd_path=prd_path if isinstance(prd_path, str) else None,
+        declared=_declared(row, touches), anchored=_anchored(row, touches),
+    )
+
+
+def _candidates(
+    rows: Iterable[state.TaskRow], program_ids: frozenset[int], touches: Sequence[str],
+) -> tuple[SeamCandidate, ...]:
+    outside = {row.task_id: row for row in rows if row.task_id not in program_ids}
+    found = (_candidate(outside[task_id], touches) for task_id in sorted(outside))
+    return tuple(c for c in found if c.declared or c.anchored)
+
+
+def _scan(reader: state.StoreReader, run: run_cli.Run, touches: Sequence[str]) -> Scan:
+    if not touches:
+        return Scan((), None)
+    reads = (
+        reader.program_tasks(run.program.run_id, run.prd_paths),
+        reader.tasks_declaring_files(touches),
+        reader.tasks_with_delivered_checks(),
+    )
+    program, declaring, checked = reads
+    program_ids = frozenset(row.task_id for row in program.rows)
+    candidates = _candidates((*declaring.rows, *checked.rows), program_ids, touches)
+    return Scan(candidates, min(read.measured_at for read in reads))
+
+
+def _cell(text: str) -> str:
+    return text.replace('|', r'\|')
+
+
+def _table_row(cells: Sequence[str]) -> str:
+    return '| ' + ' | '.join(_cell(cell) for cell in cells) + ' |'
+
+
+def _candidate_line(candidate: SeamCandidate) -> str:
+    prd = '' if candidate.prd_path is None else f'; prd_path {candidate.prd_path}'
+    mechanisms = [f'{path} declared in metadata.files' for path in candidate.declared]
+    mechanisms += [f'{a.path} anchored by delivered check {a.check}' for a in candidate.anchored]
+    return _table_row([
+        f'task {candidate.task_id}: {candidate.title} ({candidate.status}{prd})',
+        UNRULED, '; '.join(mechanisms), UNRULED, UNRULED,
+    ])
+
+
+def _report(ret: state.PrdReturn, scan: Scan) -> None:
+    read = 'store not read' if scan.measured_at is None else f'store read {scan.measured_at}'
+    print(f'seam_scan: {ret.stream} ({ret.prd_path}) touches {len(ret.touches)} paths; {read}')
+    print(_table_row(G4_COLUMNS))
+    print(_table_row(['---'] * len(G4_COLUMNS)))
+    for candidate in scan.candidates:
+        print(_candidate_line(candidate))
+    if not scan.candidates:
+        print(NONE_LINE)
+
+
+def _add_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument('stream', help='the stream whose applied author return to scan')
+
+
+def _scan_stream(run: run_cli.Run, args: argparse.Namespace) -> Exit:
+    stream: str = args.stream
+    _require_stream(run.program, stream)
+    reader = state.open_reader(run.program)
+    ret = _author_return(run, stream, reader)
+    _report(ret, _scan(reader, run, ret.touches))
+    return Exit.LISTED
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    return run_cli.main(
+        __doc__, _EXIT_MEANINGS, _scan_stream, failure='cannot scan',
+        add_arguments=_add_arguments, argv=argv,
+    )
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

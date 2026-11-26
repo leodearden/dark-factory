@@ -4,53 +4,144 @@ Mem0/Qdrant — records missing the ``kind='stage1_flag_marker'`` metadata key
 (task-1659 orphans), lacking a usable ``task_id`` (task-2108 orphans), stale by age
 (task-1944 precedent), or referencing only terminal tasks (task-2103/2150 precedent).
 
+The residual this sweep cannot reach is a CHECKED, REPORTED constraint rather
+than a caveat (task 4436): every run emits a ``structural_floor`` block, and a
+``--check --max-backlog`` set below that floor is reported as
+``gate_unsatisfiable`` and logged as an ERROR instead of rendering as an
+ordinary over-backlog a re-run might clear. See
+``docs/flag-marker-sweep-recurring.md`` and :func:`find_undrainable_markers`.
+
 Task 2596 background
 ---------------------
 Task 2406 retired the Mem0 marker WRITE path entirely — ``flag_dedup.dedup_flags``
 now persists markers only to the ``recon_ledger`` SQLite table. Task 2228 (W5-κ)
 then deleted the two Mem0 sweeps (``_sweep_stale_flag_markers``,
 ``_sweep_terminal_task_flag_markers``) that used to drain the legacy Mem0 marker
-population, since the ledger's own ``gc()`` pass reaps ledger rows directly. Nothing
-was left to drain the pre-2406 Mem0 records, which are pure dead weight (nothing
-reads them — see ``find_stale_markers``/``find_terminal_task_markers`` docstrings).
-This script's ``find_stale_markers`` and ``find_terminal_task_markers`` restore
-those two sweeps' semantics here, as a standalone, deterministic, exit-code-driven
-tool usable as a ``task_kind='deterministic'`` ``before_done.script`` (see
-``backlog_verdict`` / ``--check``).
+population, since the ledger's own ``gc()`` pass reaps ledger rows directly, leaving
+the pre-2406 Mem0 records with no in-cycle collector. That gap has since been partly
+closed: task 2853 restored an automatic, in-cycle, per-project collector —
+``_sweep_stale_mem0_flag_markers`` (``reconciliation/stages/task_knowledge_sync.py``),
+called unconditionally every cycle from ``TaskKnowledgeSync.run()`` via the shared
+``_sweep_stale_mem0_pool`` helper. It enumerates both the ``source`` and ``kind``
+spellings of the pool (``_STAGE1_FLAG_MARKER_MEM0_ENUM_FILTER_VARIANTS``, task
+3915), a cohort wider than this script's ``source``-only scroll, withholds records
+that declare a foreign ``kind`` (task 6241), and age-GCs at 14 days for every
+project, as this script's nightly timer has also done since task 2917; see
+``_sweep_stale_mem0_flag_markers``'s own docstring for the gap it documents closing.
+
+``_sweep_stale_mem0_flag_markers`` is not the whole in-cycle drain, though
+(task 3897). Task 2966 shipped a SECOND in-cycle
+collector, ``_sweep_stale_mem0_flag_for_stage2_markers``, which enumerates on
+``{'flag_for_stage2': True}`` (``_FLAG_FOR_STAGE2_ENUM_FILTERS``) and is likewise
+wired unconditionally per-project every cycle
+(``task_knowledge_sync.py:3038``, recording
+``report.stats['stale_mem0_flag_for_stage2_markers_gc_swept']``). THAT collector —
+not this script — is what drains the live Stage-1 -> Stage-2 relay pool. The
+distinction matters because the two collectors address disjoint populations, and
+this script can only see the first one (see "Enumeration strategy" below).
+
+That collector's ENUMERATION filter is still the boolean payload key above — it
+is deliberately kept wide, because 165 of the 288 records it destroyed carried
+no ``kind`` at all and 248 no ``source``, so no positive allowlist can identify
+the genuine relay pool. Its RETIREMENT rule, however, is no longer a plain
+14-day age GC (task 4375): a marker is deleted only when it is past the 14-day
+cutoff AND is not a protected cycle_summary mirror AND its ``kind`` is not in
+``mem0_tombstone.PROTECTED_AUDIT_KINDS`` AND its ``task_id`` is confirmed
+terminal for that cycle. The age-only rule destroyed 40 ``kind='cadence_check'``
+audit records in autopilot_video, every one at exactly 14 days old, all citing a
+task that is merely ``deferred``.
+
+The pre-2406 Mem0 records remain pure dead weight (nothing reads them — see
+``find_stale_markers``/``find_terminal_task_markers`` docstrings); they are simply
+no longer *uncollected* dead weight. This script is therefore a manual adjunct to
+that automatic drain, not the only thing standing between the repo and an unbounded
+pool. Task 3498 ruled this script KEPT, but corrected *why*: its load-bearing
+role is the task-3897 ``cross_check`` census — the only instrument that renders
+``orphan_count: 0`` legible as "saw nothing" rather than "there was nothing" —
+and NOT the drain. ``--delete-ids`` and ``--terminal-drain`` read the same
+``source``-filtered ``members`` scroll every predicate reads (``targeted`` is
+the intersection of ``delete_ids`` with ``members``), and task 3923 retired the
+``--check --max-backlog`` gate for want of any ``before_done`` consumer. The
+delete-set predicates are retained per task 3897's own MEASURED-ZERO-RETAINED
+ruling; full rationale in ``docs/flag-marker-sweep-recurring.md`` §"Decision
+(task 3498)". In passing: the in-cycle drain's ``source`` variant matches
+records that carry no ``kind`` at all, and its foreign-kind arm withholds only a
+DECLARED different kind
+(``fused-memory/src/fused_memory/reconciliation/mem0_tombstone.py::is_foreign_kind_record``
+returns False when ``kind`` is None), so it already collects those task-1659
+missing-``kind`` orphans that are older than 14 days and carry a parseable
+``created_at``; records with a missing or unparseable ``created_at`` are skipped by
+``_sweep_stale_mem0_pool``'s fail-safe KEEP-on-uncertainty age filter (see that
+helper's own docstring) and remain this script's job — one more reason (see
+"Deletion vs backfill" below) that backfilling the missing ``kind`` would not
+preserve anything a live path still needs for the population it does reach. This
+script's ``find_stale_markers`` and ``find_terminal_task_markers``
+restore the retired sweeps' semantics here, as a standalone, deterministic,
+exit-code-driven tool usable as a ``task_kind='deterministic'`` ``before_done.script``
+(see ``backlog_verdict`` / ``--check``).
 
 Original background (task-1659/2108)
 -------------------------------------
+MEASURED-ZERO, RETAINED (task 3897, work item (c)). Both predicates below —
+:func:`find_orphan_markers` (missing ``kind``) and :func:`find_taskless_markers`
+(missing ``task_id``) — operate on a population that measures 0 in every project
+probed, and are deliberately KEPT rather than retired: they remain this script's
+delete-set contract, stay reachable through ``--delete-ids``, are the only
+collector for dead weight the in-cycle 14-day age GC never reaches (markers
+younger than 14 days or undated), and the blind-spot
+cross-check is DEFINED as the comparison between this ``source`` enumeration and
+the adjacent population. Full rationale and the dated census:
+``docs/flag-marker-sweep-recurring.md``.
 
-Background
-----------
 Prior to task-1659, ``flag_dedup._write_and_confirm_marker`` wrote markers with
 ``metadata.source='stage1_flag_marker'`` but omitted ``metadata.kind``.  Dual-filter
-queries keyed on *both* source and kind silently under-count those markers.  Fix (1) in
-task-1659 adds kind to every new write; this script is Fix (2): a one-time sweep to
-remove the 6 pre-existing orphans so the counts converge immediately.
+queries keyed on *both* source and kind silently under-count those markers.  At the
+time, Fix (1) in task-1659 added ``kind`` to every new write; this script was Fix (2):
+a one-time sweep that removed the 6 pre-existing orphans so the counts converged
+immediately.  (Task 2406 has since retired the write path Fix (1) touched — see
+"Task 2596 background" above; there is no longer a new write for it to apply to.)
 
 Deletion vs backfill
 --------------------
-Orphan markers are deleted (not updated in place) for two reasons:
- 1. Mem0/Qdrant exposes ``delete_memory`` but no payload-update primitive on this path.
- 2. stage1_flag_markers are self-healing: a deleted marker is rewritten with both keys
-    on the next MISS cycle (at most one extra re-escalation, within the existing
-    best-effort-replacement tolerance).
+Mem0/Qdrant now exposes an in-place payload-update primitive: task 3088 shipped
+``MemoryService.update_memory`` (``services/memory_service.py``) over
+``Mem0Backend.set_payload`` (``backends/mem0_client.py``), a genuine
+server-side partial merge that preserves the Qdrant point id, ``created_at``,
+and every unnamed sibling key. The old "no payload-update primitive on this
+path" objection no longer applies, so this script's choice to delete rather
+than backfill ``kind`` in place is no longer forced by a missing capability.
+
+Orphan markers are still deleted, not backfilled, for a stronger reason:
+nothing reads them. Task 2406 retired the Mem0 marker write path —
+``flag_dedup`` persists markers only to the ``recon_ledger`` SQLite table, and
+its module docstring (``reconciliation/flag_dedup.py``) states plainly:
+"Reads in this module NEVER consult Mem0 — the ledger is the sole read
+source." The write path is doubly closed too: there is no ``add_memory``
+call left in ``flag_dedup`` for markers, and the ``add_memory`` MCP tool's
+own server-side gate (``server/tools.py``) independently rejects any
+``recon-stage-*`` write whose metadata carries ``source`` or ``kind`` equal to
+``'stage1_flag_marker'``. So a backfilled ``kind`` on one of these orphans
+would be consulted by nothing — it would restore zero dedup capability,
+because the population it would join has no live reader left, only a deleter
+(see "Task 2596 background" above).
+
+Deletion here is therefore permanent, not self-healing: no code path rewrites
+a Mem0 marker on a later MISS cycle any more (that behavior existed before
+task 2406 and does not exist now). An operator running ``--apply`` should
+read this as an irreversible delete of dead records, not as a correction a
+later cycle will reapply.
 
 Taskless markers (task 2108)
 -----------------------------
 In addition to the missing-``kind`` orphans above, this sweep also purges
 stage1_flag_marker records that carry a valid ``kind`` but lack a usable
 ``task_id`` (missing key, ``None``, or ``''``) — see ``find_taskless_markers``.
-This is safe for the same self-healing reason as above, plus one more:
-``mem0_dedup.find_prior_memories`` filters candidate priors by
-``str(meta.get('task_id', '')) != task_id_str`` (see
-``fused_memory.reconciliation.flag_dedup``), so a marker without a task_id can
-*never* be returned as a dedup prior. It cannot collapse a repeat flag,
-cannot suppress re-escalation, and Stage 2 never sweeps it either — it is
-pure dead weight from the moment it is written. Deleting it therefore loses
-zero dedup capability; if the underlying flag recurs, the next MISS cycle
-writes a fresh marker with both ``kind`` and ``task_id`` set.
+This is safe for the same reason as the missing-``kind`` orphans above:
+nothing reads the Mem0 marker population at all (see "Deletion vs backfill"),
+so a taskless marker is pure dead weight regardless of whether it also
+carries a ``kind``. It cannot collapse a repeat flag, cannot suppress
+re-escalation, and Stage 2 never sweeps it either. Deleting it loses zero
+dedup capability.
 
 Enumeration strategy
 --------------------
@@ -58,6 +149,60 @@ Markers are enumerated via ``get_memories_by_metadata(filters={'source':MARKER_S
 which performs a deterministic Qdrant payload-filter scroll — NOT semantic search.
 Semantic top-N silently drops low-similarity markers (the documented failure mode in
 ``_query_stage2_flags``), making it unsuitable for exhaustive enumeration.
+
+READ THE ``cross_check`` BLOCK, NOT JUST ``orphan_count`` (task 3897). In every
+project probed so far this ``source`` filter — and the ``kind`` one — matches ZERO
+records, while the adjacent ``{'flag_for_stage2': True}`` relay pool is non-empty,
+so this script's enumeration is STRUCTURALLY EMPTY: it scrolls a filter that
+matches nothing. Two consequences an operator must not misread:
+
+1. ``before.total_source`` is always 0, so ``backlog_verdict(0, N)`` holds
+   unconditionally and forever — a ``--check`` gate wired on it structurally
+   cannot fail.
+2. The nightly timer prints ``orphan_count: 0`` every night. That is not a clean
+   bill of health; it is a count taken against a pool this filter cannot see.
+
+:func:`run` therefore issues a count-only census probe on
+``FLAG_FOR_STAGE2_FILTERS`` and emits a ``cross_check`` report block plus a
+WARNING when :func:`enumeration_blind_spot` fires. Since task 3923 that
+divergence escalates ``--check`` to a non-zero exit code BY DEFAULT — a
+verdict rendered from an enumeration that matched nothing must not read as a
+pass. Pass ``--no-fail-on-blind-spot`` (with ``--check``) to opt out and get
+the plain backlog verdict for an ad-hoc census.
+
+The adjacent pool is CENSUSED, NEVER DELETED here: the probe counts it and stops,
+never enumerating it, never running a predicate over it, never adding it to the
+delete set — a boundary enforced by ``TestFlagForStage2IsNeverDeleted``. That
+ruling now rests on two reasons, not three: live relay markers would be caught by
+this script's own ``find_taskless_markers`` / ``--terminal-drain`` predicates (they
+are live, not dead weight), and task 2966's in-cycle collector already drains that
+pool, so a second collector here would race a correct one. The third reason is
+retired — task 4435 closed the parity gap it named, and this script now applies
+BOTH the ``is_protected_mirror_record`` guard (at :func:`delete_orphan_markers`,
+the delete choke point, so every caller inherits it) and the
+``record_mem0_deletion_tombstones`` write over its confirmed deletes, as the
+in-cycle ``_sweep_stale_mem0_pool`` does. Closing it changes nothing about the
+boundary: the two surviving reasons are each independently sufficient.
+
+Task 5286 ported the THIRD guard ``_sweep_stale_mem0_pool`` applies —
+``mem0_tombstone.is_protected_audit_record`` / ``PROTECTED_AUDIT_KINDS`` (task
+4375), added after the age-only rule destroyed the 40 ``kind='cadence_check'``
+audit records described above — and added a primary arm, the FOREIGN-KIND arm
+(:func:`protection_reason`): a record declaring any ``kind`` other than
+``MARKER_KIND`` belongs to another pool and is never deleted here. Task 6241
+gave the in-cycle collector the same arm; both call
+``mem0_tombstone.is_foreign_kind_record``. The denylist alone is not enough in
+this script, because ``find_orphan_markers`` nominates every foreign-kind
+record on the first run at any age, and ``--terminal-drain`` inverts the
+terminal-task-closure gate that is the ``flag_for_stage2`` collector's primary
+defence. The decision record is ``docs/flag-marker-sweep-recurring.md``.
+
+SINGLE SOURCE OF TRUTH for the dated census (which filter matched how many
+records, in which project, when), for the full censused-never-deleted
+rationale, and for the task-3923 retirement ruling plus what an operator must
+do if the armed verdict trips: ``docs/flag-marker-sweep-recurring.md``. Those
+are point-in-time measurements of live data; they are deliberately NOT restated
+here, so there is only one copy to keep current.
 
 Usage
 -----
@@ -75,24 +220,55 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import enum
 import json
 import logging
+import os
 import sys
 from datetime import UTC, datetime, timedelta
 from functools import partial
+from pathlib import Path
 from typing import Any
 
-from fused_memory.reconciliation.flag_dedup import is_content_fingerprint_task_id
+from fused_memory.reconciliation.flag_identity import is_content_fingerprint_task_id
+from fused_memory.reconciliation.mem0_tombstone import (
+    is_foreign_kind_record,
+    is_protected_audit_record,
+    is_protected_mirror_record,
+    record_mem0_deletion_tombstones,
+)
+from fused_memory.utils.store_mutation_preflight import assert_store_mutation_allowed
 
 # ---------------------------------------------------------------------------
 # Module-level constants
-# Cross-reference: payload contract defined in
-#   fused_memory.reconciliation.flag_dedup._write_and_confirm_marker
-#   (task-1659 adds kind to metadata dict alongside source).
+# MARKER_SOURCE/MARKER_KIND below describe the payload shape of the LEGACY
+# pre-2406 Mem0 records this script sweeps — no live writer produces that
+# shape any more. ``flag_dedup._write_and_confirm_marker``, the Mem0 writer
+# that used to emit it, was deleted by task 2406. The equivalent payload
+# keys are written today to the recon_ledger row's payload_json by
+# ``flag_dedup.dedup_flags`` instead (``reconciliation/flag_dedup.py`` — its
+# ``payload`` dict sets ``source``/``kind``, and the ``ReconLedgerRecord`` it
+# upserts sets ``record_kind='stage1_flag_marker'``) — that is the live
+# contract now, and it is not reachable from Mem0 at all (see "Task 2596
+# background" above).
 # ---------------------------------------------------------------------------
 
 MARKER_SOURCE: str = 'stage1_flag_marker'
 MARKER_KIND: str = 'stage1_flag_marker'
+
+# The ADJACENT population this script censuses but never deletes (task 3897).
+# Deliberately mirrors ``task_knowledge_sync._FLAG_FOR_STAGE2_ENUM_FILTERS``
+# by value rather than importing it, for the same reason already recorded for
+# the local ``_assume_utc`` copy below: this script's pure predicates stay
+# decoupled from the heavier reconciliation-stage module.
+#
+# The boolean ``True`` is load-bearing. Qdrant payload filters are
+# type-sensitive: the string variant ``{'flag_for_stage2': 'true'}`` matches
+# nothing (the same drift
+# ``task_knowledge_sync._FLAG_FOR_STAGE2_STRING_VARIANT_FILTERS`` exists to
+# detect). A str/bool slip here would silently reintroduce the very
+# zero-matching blind spot the cross-check exists to detect.
+FLAG_FOR_STAGE2_FILTERS: dict = {'flag_for_stage2': True}
 
 logger = logging.getLogger('sweep_orphan_flag_markers')
 
@@ -103,6 +279,11 @@ logger = logging.getLogger('sweep_orphan_flag_markers')
 
 def find_orphan_markers(members: list[dict]) -> list[dict]:
     """Return members whose metadata lacks ``kind == MARKER_KIND``.
+
+    Only the KIND-ABSENT nominations are ever deletable. A nomination that
+    declares some other ``kind`` is always withheld by the foreign-kind arm
+    of :func:`protection_reason`; it is nominated so that ``run()`` reports
+    it under ``protected_skipped_ids``, not so that it is deleted.
 
     Args:
         members: List of scroll-shaped dicts ``{'id', 'created_at', 'metadata'}``,
@@ -180,6 +361,49 @@ def classify_marker_task_id(tid: Any) -> str:
     if len(components) >= 2 and all(part.strip().isdigit() for part in components):
         return 'comma_joined'
     return 'null_or_invalid'
+
+
+def enumeration_blind_spot(enumerated_count: int, adjacent_count: int) -> bool:
+    """Did this sweep's enumeration filter fail to see a population that exists?
+
+    Distinguishes the two very different situations that both render as
+    ``0 swept``:
+
+    - "swept nothing because there was nothing" — a true no-op, the healthy
+      steady state, reported as ``False``;
+    - "swept nothing because the enumeration filter cannot see the
+      population" — a BLIND SPOT, reported as ``True``.
+
+    Task 3897 exists because this script cannot currently tell them apart.
+    It enumerates on ``{'source': MARKER_SOURCE}``, which matches 0 records
+    in every project probed, while the adjacent ``FLAG_FOR_STAGE2_FILTERS``
+    relay pool is non-empty (dated census:
+    ``docs/flag-marker-sweep-recurring.md``, the single home for those
+    measurements). Because ``before.total_source`` is therefore always 0,
+    :func:`backlog_verdict` holds unconditionally and forever — a
+    ``task_kind='deterministic'`` gate that structurally cannot fail — and
+    the nightly timer prints ``orphan_count: 0`` as a clean bill of health
+    issued against a pool it never looked at.
+
+    An adjacent population merely being non-empty is NOT a blind spot: the
+    two pools are distinct, and both being non-empty is normal. Only the
+    combination "I saw nothing" + "something is there" is diagnostic.
+
+    Pure, sync, no I/O.
+
+    Args:
+        enumerated_count: What this script's own enumeration filter matched
+            (``before.total_source``).
+        adjacent_count: What the adjacent ``FLAG_FOR_STAGE2_FILTERS`` census
+            probe matched. Callers must pass a real observed int — never a
+            placeholder for an unknown/failed probe, since an unobserved
+            population must never be asserted as a blind spot (see
+            :func:`run`'s ``probe_failed`` handling).
+
+    Returns:
+        ``True`` iff ``enumerated_count == 0 and adjacent_count > 0``.
+    """
+    return enumerated_count == 0 and adjacent_count > 0
 
 
 def _assume_utc(dt: datetime) -> datetime:
@@ -330,6 +554,189 @@ def find_terminal_task_markers(
     return result
 
 
+def _member_metadata(member: dict) -> dict:
+    """Return *member*'s metadata dict, or ``{}`` for any non-dict payload.
+
+    The sibling ``find_*`` predicates use ``(m.get('metadata') or {})``, which
+    is enough for a truthiness test but raises ``AttributeError`` on a
+    metadata that is present and NOT a dict (a list, a string). The
+    protected-record log lines below read INDIVIDUAL keys off a payload the
+    guard has already flagged as anomalous, so they use this stricter form:
+    a weird payload must never crash the sweep from inside the reporting for
+    the guard that exists to make it safer.
+
+    Pure, sync, no I/O.
+    """
+    metadata = member.get('metadata')
+    return metadata if isinstance(metadata, dict) else {}
+
+
+class ProtectionReason(enum.Enum):
+    """Which guard withholds a record from this sweep; see :func:`protection_reason`."""
+
+    CYCLE_SUMMARY_MIRROR = 'cycle_summary_mirror'
+    PROTECTED_AUDIT_KIND = 'protected_audit_kind'
+    FOREIGN_KIND = 'foreign_kind'
+
+
+def protection_reason(metadata: Any) -> ProtectionReason | None:
+    """Return the FIRST guard that withholds a record with *metadata*, or ``None``.
+
+    Arms, checked in this order:
+
+    - ``CYCLE_SUMMARY_MIRROR`` — ``mem0_tombstone.is_protected_mirror_record``
+      (task 3041/4435).
+    - ``PROTECTED_AUDIT_KIND`` — ``mem0_tombstone.is_protected_audit_record``,
+      the ``PROTECTED_AUDIT_KINDS`` denylist (task 4375).
+    - ``FOREIGN_KIND`` — this sweep's PRIMARY arm (task 5286):
+      ``mem0_tombstone.is_foreign_kind_record`` against :data:`MARKER_KIND`,
+      shared with the in-cycle collector (task 6241). The legacy pool's shape
+      is exactly "kind absent or MARKER_KIND", so a declared different kind
+      is positive evidence that the record belongs to another pool. The arm
+      is structurally opt-in: an UNREGISTERED audit kind is protected without
+      anyone editing ``PROTECTED_AUDIT_KINDS``. It does not consult task
+      status, so ``--terminal-drain``, which inverts the in-cycle
+      terminal-closure gate, cannot weaken it.
+
+    The order IS the attribution: a mirror or audit record is reported under
+    its specific reason, never as merely foreign.
+
+    Pure, sync, no I/O, never raises.
+    """
+    if is_protected_mirror_record(metadata):
+        return ProtectionReason.CYCLE_SUMMARY_MIRROR
+    if is_protected_audit_record(metadata):
+        return ProtectionReason.PROTECTED_AUDIT_KIND
+    if is_foreign_kind_record(metadata, MARKER_KIND):
+        return ProtectionReason.FOREIGN_KIND
+    return None
+
+
+def find_protected_markers(members: list[dict]) -> list[dict]:
+    """Return members this sweep must NEVER delete (tasks 3041/4435, 4375, 5286).
+
+    A member is protected when :func:`protection_reason` names any arm for
+    it: a ``cycle_summary`` ledger MIRROR (tasks 3041/4435), a
+    deliberately-permanent audit record whose kind is in
+    ``PROTECTED_AUDIT_KINDS`` (task 4375), or a record declaring any other
+    non-marker ``kind`` (the foreign-kind arm, task 5286). Deleting one is
+    unrecoverable (see the module docstring's "Deletion vs backfill":
+    deletion here is permanent, not self-healing), so it is refused
+    unconditionally, however it reached the delete set.
+
+    This one KEEP set feeds all three consumers — the choke point in
+    :func:`delete_orphan_markers`, ``run()``'s enumeration-scoped subtraction
+    and report, and the absolute arm of :func:`find_undrainable_markers` — so
+    each arm widens every one of them at once. Attribution survives the
+    union: :func:`find_protected_markers_with_reasons` pairs each member with
+    the arm that matched, and the log lines and the report render it.
+    ``find_orphan_markers`` still nominates foreign-kind records; they are
+    subtracted here, exactly as mirrors always were.
+
+    Restores parity with the in-cycle collector
+    ``stages/task_knowledge_sync.py::_sweep_stale_mem0_pool`` on its two
+    denylist guards. Both collectors also apply the foreign-kind arm, through
+    ``mem0_tombstone.is_foreign_kind_record`` (task 6241). The decision
+    record is ``docs/flag-marker-sweep-recurring.md``.
+
+    The two ``mem0_tombstone`` predicates are deliberately IMPORTED rather
+    than copied here, and stay separate predicates there. A local copy would
+    be exactly the lockstep literal duplication INV-5 forbids, and
+    ``mem0_tombstone``'s own module docstring records that private copies
+    "kept in sync BY CONVENTION" already produced a half-disabled-guard
+    failure once. (This is a deliberate exception to the by-value mirroring
+    used for ``FLAG_FOR_STAGE2_FILTERS`` above: that rationale is about
+    staying decoupled from the heavy reconciliation-STAGE module, and
+    ``mem0_tombstone`` is a near-leaf that pulls in neither
+    ``fused_memory.services.*`` nor ``task_knowledge_sync``.)
+
+    Pure, sync, no I/O, never raises on a weird payload.
+
+    Args:
+        members: List of scroll-shaped dicts ``{'id', 'created_at', 'metadata'}``,
+            as returned by ``MemoryService.get_memories_by_metadata``.
+
+    Returns:
+        Subset of *members* :func:`protection_reason` withholds. Order and
+        object identity are preserved. An unprotected input returns ``[]``.
+    """
+    return [member for member, _ in find_protected_markers_with_reasons(members)]
+
+
+def find_protected_markers_with_reasons(
+    members: list[dict],
+) -> list[tuple[dict, ProtectionReason]]:
+    """:func:`find_protected_markers`, with each member paired with its arm.
+
+    The single place :func:`protection_reason` is applied to a member list,
+    so every consumer that renders the reason reads the one computed here.
+
+    Returns:
+        ``(member, reason)`` for each member :func:`protection_reason`
+        withholds, in input order, with object identity preserved.
+    """
+    pairs: list[tuple[dict, ProtectionReason]] = []
+    for member in members:
+        reason = protection_reason(member.get('metadata'))
+        if reason is not None:
+            pairs.append((member, reason))
+    return pairs
+
+
+def find_undrainable_markers(
+    members: list[dict],
+    drained_ids: set[str] | frozenset[str],
+) -> list[dict]:
+    """Return the PERMANENT floor on ``after.total_source`` for this run.
+
+    The enumerated members no invocation of this sweep can reach, minus the
+    ones *drained_ids* — this run's finished delete set — already covers.
+    ``run()`` publishes it as ``structural_floor.undrainable_count``, which
+    :func:`unsatisfiable_backlog_gate` turns into the checked constraint
+    (task 4436).
+
+    The two arms treat *drained_ids* differently, which is the only thing
+    about the body that is not self-evident:
+
+    - UNDATED (:func:`find_undated_markers`) is INVOCATION-RELATIVE — no age
+      cutoff reaches these, but ``--delete-ids`` and ``--terminal-drain`` do,
+      so a member this run deletes floors nothing and IS subtracted.
+    - PROTECTED (:func:`find_protected_markers`) is ABSOLUTE — refused
+      unconditionally at the delete choke point, overriding even
+      ``--delete-ids`` (task 3041/4435), so it is NOT subtracted: a protected
+      member sits in ``after.total_source`` whatever a caller believes it is
+      deleting, and subtracting it would UNDER-report the floor.
+
+    The PROTECTED arm covers every :func:`protection_reason` arm: mirror,
+    audit and foreign-kind records alike. ``undated_kept_count`` is NOT this
+    floor, and the two differ in both directions. That divergence and the
+    per-arm remedies are stated once in
+    ``docs/flag-marker-sweep-recurring.md`` §``structural_floor`` — the
+    single copy, not restated here.
+
+    Pure, sync, no I/O. Composed from the two keep-predicates rather than
+    re-deriving either rule, so neither can drift from its floor consequence.
+
+    Args:
+        members: List of scroll-shaped dicts ``{'id', 'created_at', 'metadata'}``,
+            as returned by ``MemoryService.get_memories_by_metadata``.
+        drained_ids: Ids this run's delete set covers — ``run()`` passes the
+            FINAL, post-protected-subtraction ``orphan_ids``.
+
+    Returns:
+        Subset of *members* that is undated OR protected and not in
+        *drained_ids*. Scroll order and object identity are preserved, and a
+        member matching both arms appears exactly once.
+    """
+    undated_ids = {m['id'] for m in find_undated_markers(members)}
+    protected_ids = {m['id'] for m in find_protected_markers(members)}
+    return [
+        m for m in members
+        if m['id'] in protected_ids
+        or (m['id'] in undated_ids and m['id'] not in drained_ids)
+    ]
+
+
 # ---------------------------------------------------------------------------
 # Async delete
 # ---------------------------------------------------------------------------
@@ -347,6 +754,23 @@ async def delete_orphan_markers(
     asyncio.gather with return_exceptions=True, per-item WARNING on failure,
     count only successes.
 
+    Protected-record guard (tasks 3041/4435, 4375, 5286)
+    ----------------------------------------------------
+    Every :func:`protection_reason` arm is enforced here: cycle_summary
+    mirrors, ``PROTECTED_AUDIT_KINDS`` audit records, and foreign-kind
+    records. This is the sweep's DELETE CHOKE POINT, so the guard lives here:
+    every current and future caller inherits it, including one that never
+    consults :func:`find_protected_markers` itself. It is UNCONDITIONAL — it overrides
+    ``--delete-ids``, the operator's targeted-correction lever, exactly as
+    ``_sweep_stale_mem0_pool``'s guard is a ``continue`` no caller can opt out
+    of. The asymmetry that settles it is the one ``mem0_tombstone`` states:
+    over-protecting a marker costs one loudly-logged skipped GC, while
+    under-protecting a mirror or an audit record costs the record an auditor
+    is about to look for — and here that loss is unrecoverable, since "deletion here is
+    permanent, not self-healing" (module docstring). An operator who genuinely
+    needs a specific protected record gone has the unguarded, individually
+    authorised fused-memory MCP ``delete_memory`` tool.
+
     Args:
         memory_service: Live (or mock) MemoryService instance.
         project_id: Project scope passed to each delete_memory call.
@@ -354,10 +778,49 @@ async def delete_orphan_markers(
         causation_id: Optional causation id forwarded to each delete_memory call.
 
     Returns:
-        ``{'deleted': int, 'failed': [ids]}``
+        ``{'deleted': int, 'failed': [ids], 'protected_skipped': [ids],
+        'tombstoned': int}``. ``protected_skipped`` lists the members refused
+        by the guard above under any of its arms, in input order, each named
+        with its reason in its WARNING. ``tombstoned`` is the number of
+        task-3041 ledger rows written for this sweep's confirmed deletes — a
+        value below ``deleted`` means records were destroyed with an
+        incomplete audit trail (no ``recon_ledger`` wired, or a failed batch
+        write; both logged at WARNING), never that a delete failed. All four
+        keys are present unconditionally, including on the empty-input fast
+        path, so no caller needs a ``.get`` fallback.
     """
     if not orphans:
-        return {'deleted': 0, 'failed': []}
+        return {'deleted': 0, 'failed': [], 'protected_skipped': [], 'tombstoned': 0}
+
+    # Enforcement, checked BEFORE the gather so an over-broad delete set
+    # degrades to a loud skip rather than collateral loss. One WARNING per
+    # member, naming the guard that withheld it, so a mirror skip is never
+    # logged as an audit skip, or vice versa.
+    protected_pairs = find_protected_markers_with_reasons(orphans)
+    protected = [member for member, _ in protected_pairs]
+    if protected:
+        protected_ids = {id(m) for m in protected}  # builtin id(), see NOTE below
+        for member, reason in protected_pairs:
+            metadata = _member_metadata(member)
+            logger.warning(
+                'sweep_orphan_flag_markers: SKIPPING a protected record '
+                '(reason=%s) memory_id=%s (kind=%s record_type=%s) — this '
+                'record must never be deleted by a marker sweep; reaching this '
+                "guard means this run's delete set was over-broad and the "
+                'predicate or --delete-ids that produced it should be '
+                'tightened (task 3041/4435/5286).',
+                reason.value,
+                member.get('id'), metadata.get('kind'), metadata.get('record_type'),
+                extra={'project_id': project_id, 'memory_id': member.get('id')},
+            )
+        orphans = [m for m in orphans if id(m) not in protected_ids]
+    # NOTE ``id(m)`` above is the BUILTIN object identity, not the member's
+    # ``'id'`` payload key. find_protected_markers_with_reasons returns the very
+    # objects it was handed, so object identity is the exact complement of the protected
+    # subset and needs no assumption that memory uuids are unique within one
+    # delete set (they are, but that is the caller's invariant, not this
+    # function's).
+    protected_skipped = [m.get('id') for m in protected]
 
     async def _delete_one(orphan: dict):
         return await memory_service.delete_memory(
@@ -375,6 +838,7 @@ async def delete_orphan_markers(
 
     deleted = 0
     failed: list[str] = []
+    tombstone_victims: list[dict] = []
     for orphan, result in zip(orphans, results, strict=False):
         if isinstance(result, BaseException):
             logger.warning(
@@ -384,8 +848,63 @@ async def delete_orphan_markers(
             failed.append(orphan['id'])
         else:
             deleted += 1
+            # Success branch ONLY (task 3041): a tombstone must never claim a
+            # record that is still alive, so the failure branch above is
+            # deliberately left untouched. `deleted`/`failed` are therefore
+            # fully computed before the tombstone block below, and no path
+            # through it can perturb them.
+            tombstone_victims.append(orphan)
 
-    return {'deleted': deleted, 'failed': failed}
+    tombstoned = 0
+    if tombstone_victims:
+        # ONE ledger transaction for the whole sweep, not one per victim: each
+        # `upsert` is its own commit — hence its own fsync, serialized on the
+        # single aiosqlite worker thread — so a per-victim loop would cost N
+        # sequential fsyncs on a backlog sweep (task-3041 amendment finding).
+        #
+        # `deleter` is deliberately the same literal already passed to
+        # delete_memory as `_source`, per record_mem0_deletion_tombstone's
+        # documented contract for the field ("the delete's `_source` audit
+        # tag, i.e. WHICH sweep took it") — so the write journal and the
+        # tombstone name this sweep identically.
+        #
+        # record_mem0_deletion_tombstones is internally fail-safe (returns 0,
+        # never raises); this try/except is a SECOND belt so that even a
+        # helper that is patched or broken cannot raise out of — or alter the
+        # count of — this sweep, while still saying so out loud rather than
+        # swallowing it. `deleted`/`failed` are already final above, so no
+        # path through here can perturb what the caller is told.
+        try:
+            tombstoned = await record_mem0_deletion_tombstones(
+                memory_service,
+                project_id,
+                tombstone_victims,
+                deleter='sweep_orphan_flag_markers',
+                # Same id the deletes above were journaled under, which is
+                # what makes the two cross-referenceable. A manual/nightly
+                # sweep has no reconciliation run, so '' is the honest value
+                # (and matches the ledger row's own run_id default).
+                deleting_run_id=causation_id or '',
+            )
+        except Exception:
+            logger.warning(
+                'sweep_orphan_flag_markers: tombstone batch raised for %d '
+                'deleted record(s); the deletes themselves succeeded and are '
+                'counted, but this sweep left no task-3041 audit trail for '
+                'them — an auditor chasing one of these memory ids will find '
+                'nothing distinguishing this sweep from silent data loss.',
+                len(tombstone_victims),
+                exc_info=True,
+                extra={'project_id': project_id},
+            )
+            tombstoned = 0
+
+    return {
+        'deleted': deleted,
+        'failed': failed,
+        'protected_skipped': protected_skipped,
+        'tombstoned': tombstoned,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -415,6 +934,14 @@ async def run(
           (e.g. a numeric task_id that is still pending, or a comma-joined
           composite id) that no automatic predicate can catch.
     A member matched by more than one predicate/list is deleted exactly once.
+
+    Protected records — all three :func:`protection_reason` arms: mirrors,
+    audit records and foreign-kind records — are then SUBTRACTED from that
+    union (:func:`find_protected_markers`, tasks 3041/4435, 4375, 5286) before
+    any count is taken, so ``orphan_count``/``orphan_ids``/``bucket_counts``
+    all describe the delete set actually taken. The subtraction is
+    unconditional and overrides the targeted correction list too — see
+    :func:`delete_orphan_markers` for why.
 
     Args:
         args: argparse.Namespace (or SimpleNamespace) with at least:
@@ -460,8 +987,80 @@ async def run(
             - targeted_correction_ids (list[str]): the subset of
               ``args.delete_ids`` actually found among the enumerated
               members (the found-intersection, not the raw input list).
+              Deliberately NOT narrowed by the protected-record subtraction:
+              it records what the operator's ids MATCHED, which must stay
+              visible even when the guard then refuses them, so a refused
+              request reads as refused rather than as silently lost.
+            - protected_skipped_count (int) / protected_skipped_ids
+              (list[str]): every ENUMERATED member matched by
+              :func:`find_protected_markers` — records this sweep must never
+              delete — in scroll order. Scoped to the enumeration rather than
+              to the delete set on purpose: the finding is that this script's
+              filter matched a protected record at all, and a member no
+              predicate happens to catch today is precisely the one a
+              union-scoped count would hide until an operator's
+              ``--delete-ids`` named it. Every id listed here is absent from
+              ``orphan_ids``. Present unconditionally in BOTH modes
+              (``0``/``[]`` when nothing was protected), so the skip is a
+              first-class, greppable fact in the nightly JSON. A non-empty
+              subset ALSO emits one aggregate WARNING naming each id with
+              its reason, so the event is greppable in the journal
+              too — the report key and the log line are complements here,
+              exactly as they are for ``undated_kept_count``.
+            - protected_skipped_reasons (dict[str, str]): each
+              ``protected_skipped_ids`` id mapped to the
+              :class:`ProtectionReason` value that withheld it, in the same
+              order, so a consumer tells a foreign-kind skip from a mirror
+              or audit skip without parsing the journal. Present
+              unconditionally (``{}`` when nothing was protected).
+            - cross_check (dict): adjacent-population census (task 3897) —
+              ``{'source_total', 'flag_for_stage2_total', 'blind_spot',
+              'probe_failed'}``. Diagnostic only, NEVER part of the delete
+              set: it exists so a ``0 swept`` result taken against a pool
+              this script's ``source`` filter cannot see is legible as a
+              blind spot rather than a clean bill of health. See
+              :func:`enumeration_blind_spot`. ``flag_for_stage2_total`` is
+              ``None`` and ``probe_failed`` is ``True`` when the probe could
+              not be taken; ``blind_spot`` is then ``False``, since an
+              unobserved population must never be asserted as a blind spot.
+            - structural_floor (dict): the PERMANENT floor on the residual
+              backlog (task 4436) — ``{'undated_kept_count',
+              'undrainable_count', 'undrainable_ids', 'max_backlog',
+              'gate_unsatisfiable', 'gate_evaluated'}``. Diagnostic only,
+              NEVER part of the delete set, and the exit code is unchanged
+              either way: this block is the machine-readable discriminator
+              between a ``--check`` violation no re-run can clear and a
+              transient over-backlog, as ``cross_check`` is for the blind
+              spot. ``max_backlog`` is the EFFECTIVE ceiling (default ``0``
+              when the namespace carries no ``--max-backlog``) and
+              ``gate_unsatisfiable`` is :func:`unsatisfiable_backlog_gate`
+              over it and ``undrainable_count``, computed unconditionally —
+              so ``gate_evaluated`` (``args.check``) is what separates a
+              verdict on a gate that RAN from one on the hypothetical gate
+              the nightly drain never evaluates. Arms, remedies and why
+              ``undated_kept_count`` is republished beside the floor:
+              :func:`find_undrainable_markers` and
+              ``docs/flag-marker-sweep-recurring.md``.
             - deleted (int, only when apply=True)
             - failed (list[str], only when apply=True)
+            - tombstoned (int, only when apply=True): task-3041 ledger rows
+              written for this sweep's confirmed deletes. A value below
+              ``deleted`` means records were destroyed with an incomplete
+              audit trail (typically no ``recon_ledger`` wired, or a failed
+              batch write — both logged at WARNING); it never indicates a
+              failed delete, which is reported by ``failed`` instead.
+            - enforced_protected_skipped (list[str], only when
+              apply=True): ids the UNCONDITIONAL guard inside
+              :func:`delete_orphan_markers` refused at the delete choke
+              point. Normally ``[]``, because the protected subtraction
+              above already removed them from the delete set — so a
+              non-empty value means the choke-point guard caught something
+              that partition did not, and it is the only key that accounts
+              for ``deleted + len(failed) < orphan_count``. Deliberately
+              NOT merged into ``protected_skipped_ids``, which is
+              enumeration-scoped and answers a different question (what
+              this script's filter matched, vs. what was refused at the
+              door).
             - after (dict with counts, only when apply=True)
     """
     project_id: str = getattr(args, 'project_id', 'dark_factory')
@@ -469,6 +1068,59 @@ async def run(
     terminal_ids: set[str] = terminal_task_ids if terminal_task_ids else set()
     max_age_days: int = getattr(args, 'max_age_days', 14)
     delete_ids: set[str] = set(getattr(args, 'delete_ids', None) or [])
+
+    # Fail-CLOSED capability preflight, one probe per run, BEFORE every read.
+    #
+    # This slot precedes all four of THIS function's backend round-trips --
+    # the two before-counts, the flag_for_stage2 census probe, and the scroll
+    # enumeration -- so a doomed --apply enumerates no marker and mutates
+    # nothing.
+    #
+    # Scoped deliberately to what ``run`` controls, because a doomed --apply is
+    # NOT free end-to-end: ``main`` has already constructed the MemoryService,
+    # awaited ``initialize()``, and -- under ``--terminal-drain``, the mode the
+    # committed nightly wrapper (scripts/fused-memory-flag-marker-sweep.sh)
+    # runs -- awaited ``_resolve_terminal_task_ids()``, a full task-status
+    # resolution round-trip, before ``run`` is entered. Of the scripts guarded
+    # in task 4127 only ``audit_duplicate_memories`` refuses before any client
+    # exists at all, and only its comment claims that. The comment and the
+    # message below therefore say "no marker was enumerated and nothing was
+    # mutated" rather than "nothing happened": both are true here, and only the
+    # first is checkable from inside this function.
+    #
+    # Guarding inside ``delete_orphan_markers`` (before its gather) would be
+    # too late: that gather uses ``return_exceptions=True`` and tallies
+    # per-record results, so in a write-denied environment it would delete
+    # Qdrant points one at a time and record each history-write failure as an
+    # individual error rather than aborting the run. mem0's ``_delete_memory``
+    # removes the point BEFORE writing its SQLite history, so every one of
+    # those "errors" is an already-destroyed record. A per-record probe detects
+    # a run-wide condition one destroyed record too late.
+    #
+    # The refusal reaches ``main``'s blanket ``except Exception``
+    # (StoreMutationUnavailable subclasses RuntimeError), which logs and
+    # returns 2. That is loud and non-zero, but the generic handler will label
+    # it a fatal sweep error -- which is exactly why the guard is handed this
+    # script's logger: its refusal record carries the fail-closed diagnosis
+    # (what was refused, that no marker was enumerated and nothing was
+    # mutated, and the remedy) BEFORE the raise. This also holds
+    # under the ``--apply --check --max-backlog N`` predicate mode: a refused
+    # run exits 2, so it can never be mistaken for a satisfied backlog gate.
+    #
+    # Gated on ``args.apply`` (there is no ``dry_run`` local -- the report
+    # builds ``'dry_run': not args.apply`` inline) so a read-only run stays
+    # pure-read and needs no write capability at all.
+    if args.apply:
+        assert_store_mutation_allowed(
+            operation='sweep_orphan_flag_markers --apply',
+            logger=logger,
+            extra_detail=(
+                'deleting a marker would remove its Qdrant point and then fail to '
+                'write the history, destroying records that survive nowhere but '
+                'this log. No marker was enumerated, nothing was mutated, and no '
+                'backlog predicate was evaluated.'
+            ),
+        )
 
     # --- Before counts (deterministic Qdrant payload-filter, not semantic) ---
     source_filter = {'source': MARKER_SOURCE}
@@ -481,6 +1133,86 @@ async def run(
         project_id=project_id, filters=kind_filter,
     )
     before = {'total_source': total_source, 'total_with_kind': total_with_kind}
+
+    # --- Adjacent-population census (task 3897) ---
+    # COUNT-ONLY. The records this probe counts are never enumerated, never
+    # added to `members`, never run through a predicate, and never deleted —
+    # see TestFlagForStage2IsNeverDeleted for the guard that enforces it, and
+    # the module docstring's "Why the flag_for_stage2 pool is censused, never
+    # deleted here" section for why that boundary is load-bearing.
+    # FAIL-SAFE, mirroring task_knowledge_sync._warn_on_flag_for_stage2_type_drift:
+    # any failure degrades this diagnostic to "unknown" and lets the sweep
+    # proceed, rather than letting a census probe abort a run whose real job
+    # is the delete set.
+    flag_for_stage2_total: int | None
+    probe_failed = False
+    try:
+        probe_result = await memory_service.count_memories_by_metadata(
+            project_id=project_id, filters=FLAG_FOR_STAGE2_FILTERS,
+        )
+    except Exception:
+        logger.warning(
+            'sweep_orphan_flag_markers: flag_for_stage2 census probe failed; '
+            'reporting the adjacent population as unknown (probe_failed=True) '
+            'and continuing the sweep unchanged. NOTE: a failed probe is NOT '
+            'evidence of a clean bill of health — the blind-spot cross-check '
+            'simply could not be taken this run.',
+            exc_info=True,
+        )
+        flag_for_stage2_total = None
+        probe_failed = True
+    else:
+        # `bool` is excluded deliberately: it is an int subclass, so a bare
+        # isinstance(x, int) would admit True and report the nonsense census
+        # `flag_for_stage2_total: true`. Any other unexpected shape (None, a
+        # str, a float, a Mock) degrades to unknown rather than raising on
+        # the `> 0` comparison inside enumeration_blind_spot.
+        if isinstance(probe_result, int) and not isinstance(probe_result, bool):
+            flag_for_stage2_total = probe_result
+        else:
+            logger.warning(
+                'sweep_orphan_flag_markers: flag_for_stage2 census probe '
+                'returned a non-int value of type %s (%r); treating the '
+                'adjacent population as unknown (probe_failed=True). The '
+                'sweep itself is unaffected.',
+                type(probe_result).__name__, probe_result,
+            )
+            flag_for_stage2_total = None
+            probe_failed = True
+
+    # Consulted ONLY when the probe produced a real int: the sweep must never
+    # claim a blind spot it did not actually observe, so an unknown adjacent
+    # population is reported as blind_spot=False (with probe_failed=True
+    # carrying the uncertainty) rather than as a finding.
+    blind_spot = (
+        False if flag_for_stage2_total is None
+        else enumeration_blind_spot(total_source, flag_for_stage2_total)
+    )
+    if blind_spot:
+        logger.warning(
+            'sweep_orphan_flag_markers: ENUMERATION BLIND SPOT — this sweep '
+            "enumerates on {'source': %r} and matched %d records, while an "
+            "adjacent {'flag_for_stage2': True} population of %d records "
+            'exists in project %r. This run\'s "0 swept" is therefore NOT a '
+            'clean bill of health: it is a count taken against a pool this '
+            'filter cannot see. The flag_for_stage2 relay pool is drained by '
+            'the IN-CYCLE collector _sweep_stale_mem0_flag_for_stage2_markers '
+            '(task 2966, reconciliation/stages/task_knowledge_sync.py) on a '
+            'rolling 14-day window — those records are not uncollected, and '
+            'this script deliberately censuses them rather than deleting '
+            'them. Since task 3923 this divergence FAILS --check by default. '
+            'To remediate, fix the source/kind enumeration so it sees the '
+            'real marker population before wiring any gate on it; '
+            '--no-fail-on-blind-spot is census-only and must not be used as '
+            'a gate configuration. See docs/flag-marker-sweep-recurring.md.',
+            MARKER_SOURCE, total_source, flag_for_stage2_total, project_id,
+        )
+    cross_check = {
+        'source_total': total_source,
+        'flag_for_stage2_total': flag_for_stage2_total,
+        'blind_spot': blind_spot,
+        'probe_failed': probe_failed,
+    }
 
     # --- Enumerate via scroll (NOT semantic search) ---
     scroll_limit: int = getattr(args, 'limit', 1000)
@@ -511,23 +1243,6 @@ async def run(
     stale = find_stale_markers(members, now_dt, max_age_days=max_age_days)
     terminal = find_terminal_task_markers(members, terminal_ids)
 
-    # Diagnostic only — never added to the delete set. Surfaces the subset of
-    # `members` find_stale_markers can never drain regardless of
-    # --max-age-days (task 2596 amendment, reviewer_comprehensive #1/#2): an
-    # operator wiring --check --max-backlog 0 against a population with a
-    # nonzero undated_kept_count would otherwise see a perpetual violation
-    # with no visibility into why the residual floors above zero.
-    undated_kept = find_undated_markers(members)
-    if undated_kept:
-        logger.warning(
-            'sweep_orphan_flag_markers: %d of %d enumerated markers have a '
-            'missing/unparseable created_at and are permanently kept by '
-            'find_stale_markers regardless of --max-age-days (even 0) — '
-            'this sets a floor on the residual backlog that age-draining '
-            'alone cannot reach below for --check/--max-backlog. Use '
-            '--delete-ids or --terminal-drain to remove them if warranted.',
-            len(undated_kept), len(members),
-        )
     # Best-effort: an id in delete_ids that doesn't match any enumerated
     # member is simply absent from `targeted` — never a crash.
     targeted = [m for m in members if m['id'] in delete_ids]
@@ -539,7 +1254,166 @@ async def run(
             seen_ids.add(m['id'])
             orphans.append(m)
 
+    # Protected-record subtraction (tasks 3041/4435, 4375, 5286), applied BEFORE
+    # orphan_ids/targeted_correction_ids/bucket_counts are computed, so all
+    # three stay consistent with the delete set actually taken.
+    #
+    # The predicate runs over the whole ENUMERATED population, not just the
+    # union, and the delete set is then narrowed by object identity. Since
+    # `orphans` is a subset of `members`, that removes exactly the same
+    # members from the delete set either way — what widens is only what gets
+    # REPORTED. That is deliberate: the finding this guard exists to surface
+    # is that the enumeration filter matched a record it must never delete
+    # (mem0_tombstone's "the enumeration filter is over-broad for this pool"),
+    # which is a property of the enumeration, not of whichever predicate
+    # happened to also catch it. A ledger_stamp that no automatic predicate
+    # catches is exactly the case a union-scoped count would hide until the
+    # night an operator's --delete-ids named it.
+    #
+    # This partition exists ALONGSIDE the choke-point guard inside
+    # delete_orphan_markers, not instead of it, because the two have different
+    # jobs. This one is REPORTING: a DRY RUN never reaches
+    # delete_orphan_markers at all, so it is the only thing that keeps
+    # `orphan_count`'s documented meaning ("the actual number of records
+    # deleted (or that would be deleted)") true in the mode an operator reads
+    # before deciding to --apply. The choke-point guard is ENFORCEMENT, and is
+    # inherited by every current and future caller of delete_orphan_markers,
+    # including ones that never consult this predicate. Called from here the
+    # choke-point guard therefore never fires; it stays as defence in depth
+    # and is pinned directly by its own tests.
+    protected_pairs = find_protected_markers_with_reasons(members)
+    protected = [member for member, _ in protected_pairs]
+    if protected:
+        # The subtraction is never SILENT. Because it happens here, the
+        # choke-point guard's own per-member WARNING can no longer fire on
+        # this path, so this is the only journal output the event produces —
+        # and the systemd journal, not the JSON report, is where an operator
+        # greps after a nightly run has already scrolled past. The report key
+        # is not a substitute for it; `undated_kept_count` above sets the
+        # precedent that a "why do this run's numbers look like that"
+        # condition warrants BOTH.
+        #
+        # Aggregate rather than one-per-member (the shape the choke-point
+        # guard uses, mirroring ``_sweep_stale_mem0_pool``): this warning is
+        # enumeration-scoped like `undated_kept`'s directly above it, and
+        # says the same class of thing — a permanent floor under
+        # ``--check --max-backlog`` that draining cannot reach below.
+        rendered: list[str] = []
+        for member, reason in protected_pairs:
+            metadata = _member_metadata(member)
+            rendered.append(
+                f"{member.get('id')}(reason={reason.value} "
+                f"kind={metadata.get('kind')!r} "
+                f"record_type={metadata.get('record_type')!r})"
+            )
+        logger.warning(
+            'sweep_orphan_flag_markers: %d of %d enumerated markers are '
+            'protected records that must never be deleted by a marker sweep '
+            'and are excluded from the delete set: %s. Reaching this means '
+            "this run's source enumeration matched a record belonging to "
+            'another pool (mem0_tombstone: the enumeration filter is '
+            'over-broad for this pool), so that filter — or the --delete-ids '
+            'that named one — should be tightened. These records also floor '
+            'the residual backlog permanently: no amount of draining removes '
+            'them, so a --check/--max-backlog gate set below that floor can '
+            'never pass (task 3041/4435/5286).',
+            len(protected), len(members), ', '.join(rendered),
+            extra={'project_id': project_id},
+        )
+        protected_obj_ids = {id(m) for m in protected}  # builtin id(), not the key
+        orphans = [m for m in orphans if id(m) not in protected_obj_ids]
+
     orphan_ids = [o['id'] for o in orphans]
+
+    # --- Structural floor (task 4436) ---
+    #
+    # Diagnostic only — computed FROM the finished delete set and never fed
+    # back into it. The PLACEMENT is load-bearing: it must follow the
+    # protected subtraction above, because the union loop's `seen_ids` is a
+    # strict SUPERSET of what is actually deleted (a `cycle_summary` mirror
+    # is a kind-orphan too), so deriving the floor from it would classify a
+    # protected member as drained and UNDER-report the floor. Using the
+    # report's own published `orphan_ids` also keeps the block consistent
+    # with `orphan_count` by construction rather than by a second derivation.
+    #
+    # Gate config is read with the module's defensive getattr idiom (see
+    # project_id/max_age_days/delete_ids above), NOT bare attribute access:
+    # ~40 existing callers build a namespace carrying neither field.
+    #
+    # Why `undated_kept_count` is republished inside the block, and how the
+    # two counts diverge: docs/flag-marker-sweep-recurring.md.
+    max_backlog: int = getattr(args, 'max_backlog', 0)
+    check: bool = getattr(args, 'check', False)
+    drained_ids = set(orphan_ids)
+    undated_kept = find_undated_markers(members)
+    undrainable = find_undrainable_markers(members, drained_ids)
+    gate_unsatisfiable = unsatisfiable_backlog_gate(len(undrainable), max_backlog)
+    # Keyed on the undated members this run does NOT delete, and scoped to
+    # the UNDATED arm alone: the other predicates never consult created_at,
+    # so an undated member they catch is drained here and floors nothing,
+    # and "missing/unparseable created_at" is simply false of a protected
+    # mirror — which keeps its own WARNING above. One subject and one remedy
+    # per line. A member the sweep is about to delete is not a finding, so
+    # the drained case gets no WARNING of its own.
+    undated_undrained = [m for m in undated_kept if m['id'] not in drained_ids]
+    if undated_undrained:
+        logger.warning(
+            'sweep_orphan_flag_markers: %d of %d enumerated markers have a '
+            'missing/unparseable created_at AND are uncovered by this run\'s '
+            'delete set, so they are a permanent floor on the residual that '
+            'no --max-age-days (including 0) reaches below. Remedies: name '
+            'them in --delete-ids, or add --terminal-drain if they cite '
+            'terminal tasks. Raising --max-backlog to at least '
+            'structural_floor.undrainable_count is NECESSARY but NOT '
+            'sufficient — a --check verdict compares this run\'s whole '
+            'residual, not the floor. See '
+            'docs/flag-marker-sweep-recurring.md.',
+            len(undated_undrained), len(members),
+        )
+
+    # The exit code is deliberately NOT changed (design decision 3, and the
+    # already-adjudicated ruling in
+    # scripts/fused-memory-flag-marker-check.sh's header): `structural_floor`
+    # IS the machine-readable discriminator, exactly as `cross_check` is for
+    # the blind spot. It can never flip a passing verdict either — every
+    # floor member matches the `source` filter and survives the delete, so
+    # the residual is always >= len(undrainable).
+    #
+    # Field vs. log splits on `check` so both audiences are right: the
+    # nightly --apply --terminal-drain service records the fact in its
+    # journal JSON, flagged `gate_evaluated: false`, without a spurious ERROR
+    # for a gate it never runs; an operator who IS evaluating one gets an
+    # unmissable "stop re-running this".
+    if check and gate_unsatisfiable:
+        # Partitioned on PROTECTED-ness, not on undated-ness: a member that
+        # is both belongs under the protected arm, because --delete-ids
+        # cannot reach it and naming that remedy for it would be wrong.
+        protected_ids = {m['id'] for m in protected}
+        protected_floor_ids = [m['id'] for m in undrainable if m['id'] in protected_ids]
+        undated_floor_ids = [m['id'] for m in undrainable if m['id'] not in protected_ids]
+        logger.error(
+            'sweep_orphan_flag_markers: --check --max-backlog %d is '
+            'STRUCTURALLY UNSATISFIABLE against this population: %d '
+            'enumerated markers can never be drained by this script, so no '
+            're-run of it can ever clear this gate. Undrainable: %s. '
+            'Remedies differ by arm — undated ids (%s) can be named in '
+            '--delete-ids, or reached with --terminal-drain if they cite '
+            'terminal tasks; protected ids (%s) need the fused-memory MCP '
+            'delete_memory tool or a corrected source enumeration (see '
+            'delete_orphan_markers). Raising --max-backlog to at least %d is '
+            'NECESSARY but NOT sufficient: the verdict compares this run\'s '
+            'whole residual total_source — before.total_source (%d) on a '
+            'dry-run --check, which deletes nothing, or after.total_source '
+            'on an --apply run. See '
+            'docs/flag-marker-sweep-recurring.md.',
+            max_backlog, len(undrainable),
+            ', '.join(m['id'] for m in undrainable),
+            ', '.join(undated_floor_ids) or 'none',
+            ', '.join(protected_floor_ids) or 'none',
+            len(undrainable), before['total_source'],
+            extra={'project_id': project_id},
+        )
+
     # The found-intersection of args.delete_ids with the enumerated members
     # (not the raw input list) — order-preserving per `members`.
     targeted_correction_ids = [m['id'] for m in targeted]
@@ -569,6 +1443,20 @@ async def run(
         'undated_kept_count': len(undated_kept),
         'bucket_counts': bucket_counts,
         'targeted_correction_ids': targeted_correction_ids,
+        'protected_skipped_count': len(protected),
+        'protected_skipped_ids': [m['id'] for m in protected],
+        'protected_skipped_reasons': {
+            member['id']: reason.value for member, reason in protected_pairs
+        },
+        'cross_check': cross_check,
+        'structural_floor': {
+            'undated_kept_count': len(undated_kept),
+            'undrainable_count': len(undrainable),
+            'undrainable_ids': [m['id'] for m in undrainable],
+            'max_backlog': max_backlog,
+            'gate_unsatisfiable': gate_unsatisfiable,
+            'gate_evaluated': check,
+        },
     }
 
     if args.apply:
@@ -577,6 +1465,19 @@ async def run(
         )
         report['deleted'] = delete_result['deleted']
         report['failed'] = delete_result['failed']
+        report['tombstoned'] = delete_result['tombstoned']
+        # What the CHOKE-POINT guard actually refused, as distinct from what
+        # the enumeration-scoped partition above skipped. Today it is always
+        # [] — the partition hands delete_orphan_markers a delete set the
+        # guard has nothing left to catch — and that identity is exactly what
+        # must not degrade silently: without this key, a future edit that
+        # reorders or drops the partition would make the guard fire, leave
+        # deleted + len(failed) < orphan_count, and put NOTHING in the report
+        # accounting for the difference (protected_skipped_ids reports the
+        # enumeration, not what was refused at the door). Reported under its
+        # own name rather than unioned into protected_skipped_ids so the two
+        # views stay distinguishable; the identity is pinned by a test.
+        report['enforced_protected_skipped'] = delete_result['protected_skipped']
 
         # After counts
         after_source = await memory_service.count_memories_by_metadata(
@@ -618,7 +1519,60 @@ def backlog_verdict(after_total_source: int, max_backlog: int) -> int:
     return 0 if after_total_source <= max_backlog else 1
 
 
-def _resolve_check_exit_code(report: dict, max_backlog: int) -> int:
+def unsatisfiable_backlog_gate(structural_floor: int, max_backlog: int) -> bool:
+    """Is this gate configuration structurally incapable of EVER passing?
+
+    The sibling of :func:`enumeration_blind_spot`, asked of the GATE rather
+    than of the population. It distinguishes the two very different
+    situations that both render as a plain ``rc=1``:
+
+    - a TRANSIENT backlog violation — the residual is over the ceiling
+      today, and a drain (or simply a later run) clears it, reported as
+      ``False``;
+    - a PERMANENT one — the residual can never fall to the ceiling because
+      records this sweep cannot delete already exceed it, reported as
+      ``True``. Re-running is futile, and the remedy is a different flag or
+      a different ceiling, not patience.
+
+    Task 4436 exists because that distinction was carried only by prose. See
+    :func:`find_undrainable_markers` for what composes the floor and which
+    of its two arms each remedy addresses.
+
+    SAFE TO ADD WITHOUT TOUCHING THE VERDICT. Every floor member matches the
+    ``source`` filter and survives the delete, so
+    ``after.total_source >= structural_floor`` always; a ``True`` here
+    therefore already implies :func:`backlog_verdict` returns ``1``. This
+    predicate refines the DIAGNOSIS and can never flip a passing verdict to
+    failing. A scroll cap only makes the observed floor an UNDER-estimate,
+    which keeps that inequality safe in the same direction.
+
+    Both ceilings are inclusive, so this is the strict complement of
+    :func:`backlog_verdict` at the boundary: for every ``(floor, ceiling)``,
+    ``unsatisfiable_backlog_gate(f, c) is (backlog_verdict(f, c) == 1)``.
+    That identity is pinned by a test — the two must never drift into
+    disagreeing, which would make the report claim "unsatisfiable" about a
+    gate that in fact passes.
+
+    Pure, sync, no I/O.
+
+    Args:
+        structural_floor: Count of members no invocation of this sweep can
+            drain — ``len(find_undrainable_markers(...))``, published as
+            ``structural_floor.undrainable_count``.
+        max_backlog: Ceiling the residual count must not exceed.
+
+    Returns:
+        ``True`` iff ``structural_floor > max_backlog``.
+    """
+    return structural_floor > max_backlog
+
+
+def _resolve_check_exit_code(
+    report: dict,
+    max_backlog: int,
+    *,
+    fail_on_blind_spot: bool = True,
+) -> int:
     """Resolve --check's exit code from a sweep report.
 
     Extracted from :func:`main` (task 2596 amendment, reviewer_comprehensive
@@ -628,16 +1582,37 @@ def _resolve_check_exit_code(report: dict, max_backlog: int) -> int:
     ``report['before']['total_source']`` otherwise (a dry-run/``--check``-only
     invocation, which never populates ``'after'``).
 
+    The blind-spot escalation was opt-in when task 3897 added it and is
+    ARMED BY DEFAULT since task 3923 (the gate's only consumer, task 2902,
+    is done): a verdict rendered from an enumeration that matched NOTHING
+    must not read as a pass. Ruling, dated census and the remediation path
+    when it trips: ``docs/flag-marker-sweep-recurring.md`` §"Decision (task
+    3923)".
+
     Pure, sync, no I/O.
 
     Args:
         report: The dict returned by :func:`run`.
         max_backlog: Ceiling forwarded to :func:`backlog_verdict`.
+        fail_on_blind_spot: Defaults to ``True`` (task 3923). When ``True``,
+            an OBSERVED enumeration blind spot
+            (``report['cross_check']['blind_spot']``) resolves to ``1``
+            regardless of the backlog verdict. A failed probe never triggers
+            this — ``blind_spot`` is ``False`` whenever the adjacent
+            population could not be observed (see :func:`run`), so the gate
+            escalates on observed divergence only and a transient backend
+            blip cannot flap a deterministic ``before_done`` predicate.
+            ``False`` (via ``--no-fail-on-blind-spot``) relaxes ONLY this
+            vacuity check; the backlog verdict still applies.
 
     Returns:
         ``0`` if the resolved count holds, else ``1`` — see
         :func:`backlog_verdict`.
     """
+    # .get chains throughout: a report shape without a 'cross_check' block
+    # (e.g. one cached from before task 3897) must resolve, not raise.
+    if fail_on_blind_spot and report.get('cross_check', {}).get('blind_spot'):
+        return 1
     after = report.get('after', report['before'])
     return backlog_verdict(after['total_source'], max_backlog)
 
@@ -713,6 +1688,10 @@ def _build_parser() -> argparse.ArgumentParser:
     the new ``--max-age-days``, ``--delete-ids``, ``--terminal-drain``,
     ``--check``, and ``--max-backlog`` flags — is testable without any live
     I/O.
+
+    ``allow_abbrev=False`` makes ``--apply`` the only spelling of a
+    deletion, which is what lets ``scripts/fused-memory-flag-marker-check.sh``
+    keep its read-only promise by refusing that one literal (task 3498).
     """
     parser = argparse.ArgumentParser(
         description=(
@@ -720,6 +1699,7 @@ def _build_parser() -> argparse.ArgumentParser:
             'records: missing kind/task_id, stale by age, referencing only '
             'terminal tasks, or explicitly targeted for correction.'
         ),
+        allow_abbrev=False,
     )
     parser.add_argument(
         '--apply', action='store_true', default=False,
@@ -761,7 +1741,10 @@ def _build_parser() -> argparse.ArgumentParser:
         '--check', action='store_true', default=False,
         help="Exit 0 if the residual backlog is within --max-backlog, else "
              "1 — usable as a task_kind='deterministic' before_done "
-             'predicate (mirrors scripts/check_merge_flakiness.sh).',
+             'predicate (mirrors scripts/check_merge_flakiness.sh). Also '
+             'exits 1 on an OBSERVED enumeration blind spot, so a verdict '
+             'rendered from a census that matched nothing does not read as '
+             'a pass; opt out with --no-fail-on-blind-spot.',
     )
     parser.add_argument(
         '--max-backlog', dest='max_backlog',
@@ -770,19 +1753,370 @@ def _build_parser() -> argparse.ArgumentParser:
             'Residual stage1_flag_marker ceiling checked by --check '
             '(default: 0). Negative values are rejected (a negative '
             'ceiling reached by typo would make backlog_verdict violate '
-            'on any residual, forever, with no explanation). A '
-            'before_done predicate wired with the default 0 may never be '
-            'satisfiable if the population has a nonzero '
-            "undated_kept_count (see run()'s report and WARNING log) — "
-            'set --max-backlog to at least that count, or run '
-            '--delete-ids/--terminal-drain first to clear it.'
+            'on any residual, forever, with no explanation). A predicate '
+            'wired with the default 0 may never be satisfiable: '
+            'structural_floor.undrainable_count is the population no '
+            'invocation of this script can drain, so a ceiling below it '
+            'reports gate_unsatisfiable: true and logs an ERROR. Clearing '
+            'that floor is NECESSARY but not sufficient — the verdict '
+            'compares the whole residual (before.total_source on a dry-run '
+            '--check). Do NOT read undated_kept_count as the floor. Block '
+            'reference: docs/flag-marker-sweep-recurring.md.'
+        ),
+    )
+    parser.add_argument(
+        '--list-known-projects', dest='list_known_projects',
+        action='store_true', default=False,
+        help=(
+            'Print one registered project_id per line to stdout and exit '
+            'WITHOUT sweeping. This is the seam '
+            'scripts/fused-memory-flag-marker-sweep.sh uses to per-projectize '
+            'the nightly drain: before this existed the wrapper swept exactly '
+            'one project (this parser\'s own --project-id default) while the '
+            "sweep's per-project census output read as if the fleet were "
+            'covered. The list comes from the same {project_id: project_root} '
+            'registry the fused-memory server is configured from, i.e. this '
+            'root plus DASHBOARD_KNOWN_PROJECT_ROOTS; exits 1 if it resolves '
+            'empty so the caller can detect the degradation. Rejected at '
+            'parse time alongside any sweep-performing flag (see '
+            '_parse_args).'
+        ),
+    )
+    parser.add_argument(
+        '--fail-on-blind-spot', dest='fail_on_blind_spot',
+        action='store_true', default=None,
+        help=(
+            'REQUIRES --check (rejected at parse time without it). Escalate '
+            'an OBSERVED enumeration blind spot (this sweep matched 0 records '
+            "while an adjacent {'flag_for_stage2': True} population is "
+            'non-empty) to exit 1. This is the DEFAULT since task 3923; the '
+            'flag remains accepted as an explicit affirmation of it. A '
+            'failed census probe never trips it, so a transient backend blip '
+            'cannot flap the verdict, and the blind spot is reported either '
+            "way (log WARNING + the JSON report's cross_check block). "
+            'Ruling, dated census and remediation: '
+            'docs/flag-marker-sweep-recurring.md.'
+        ),
+    )
+    parser.add_argument(
+        '--no-fail-on-blind-spot', dest='fail_on_blind_spot',
+        action='store_false', default=None,
+        help=(
+            'REQUIRES --check (rejected at parse time without it). Opt OUT '
+            'of the blind-spot escalation, returning --check to a plain '
+            'backlog verdict. CENSUS-ONLY, never a gate configuration: it '
+            'restores the vacuous pass task 3923 armed the default to '
+            'eliminate. Relaxes ONLY the vacuity check — a residual backlog '
+            'over --max-backlog still exits 1. Ruling and remediation: '
+            'docs/flag-marker-sweep-recurring.md.'
         ),
     )
     return parser
 
 
-async def _resolve_terminal_task_ids() -> set[str]:
+def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    """Parse CLI args, rejecting combinations that would silently no-op.
+
+    Thin wrapper over :func:`_build_parser` so the cross-flag validation is
+    testable without invoking :func:`main` (which builds a live
+    ``MemoryService``).
+
+    ``--fail-on-blind-spot`` / ``--no-fail-on-blind-spot`` reach an exit code
+    only through :func:`_resolve_check_exit_code`, which :func:`main` consults
+    ONLY under ``--check``. Left un-validated, ``--apply
+    --fail-on-blind-spot`` — or a bare dry run with either spelling — would
+    therefore silently no-op: an operator wiring the opt-in as a
+    ``before_done.script`` predicate without ``--check`` would get a gate
+    that STRUCTURALLY CANNOT FAIL (the exact defect class task 3897 exists to
+    eliminate), and one passing the opt-out would believe they had relaxed a
+    gate that was never running. Honouring either as a silent no-op would
+    violate the repo's loud-over-silent-degradation norm, so the combination
+    is rejected at parse time (argparse exit code 2) instead.
+
+    ``scripts/fused-memory-flag-marker-check.sh`` already hardcodes
+    ``--check`` in its ``exec`` line, so passing either spelling through that
+    wrapper is unaffected.
+
+    Task 3923 makes the blind-spot policy a TRI-STATE: argparse leaves it
+    ``None`` when neither spelling is passed, and this function resolves that
+    sentinel to ``True`` (armed) only AFTER the validation above. THE
+    ORDERING IS LOAD-BEARING — it keys the rejection on the flag having been
+    passed EXPLICITLY, so the nightly ``--apply --terminal-drain`` service
+    (which passes neither, and never reaches the verdict path) keeps parsing
+    cleanly instead of failing with exit 2 under a default it never asked
+    for. Pinned by
+    ``test_nightly_sweep_argv_still_parses_under_the_armed_default``.
+
+    Args:
+        argv: Argument list to parse; ``None`` reads ``sys.argv[1:]``.
+
+    Returns:
+        The parsed namespace, with ``fail_on_blind_spot`` resolved to a
+        concrete ``bool`` (never the ``None`` sentinel).
+
+    ``--list-known-projects`` (task 2917) extends the same
+    rejecting-combinations-that-would-silently-no-op contract in the other
+    direction: it RETURNS from ``main`` before the sweep runs, so combining it
+    with a sweep-performing or verdict-rendering flag (``--apply``,
+    ``--check``, ``--terminal-drain``, a non-empty ``--delete-ids``) would
+    print the project list and silently skip the drain. An operator who added
+    it to the nightly ``--apply --terminal-drain`` service would get a green
+    run that drained nothing, so those combinations are rejected too.
+
+    Raises:
+        SystemExit: Code 2, via ``parser.error``, when either
+            ``--fail-on-blind-spot`` or ``--no-fail-on-blind-spot`` is passed
+            without ``--check``, or when ``--list-known-projects`` is combined
+            with a sweep-performing/verdict-rendering flag.
+    """
+    parser = _build_parser()
+    args = parser.parse_args(argv)
+    # `is not None` — not truthiness — so BOTH spellings are validated
+    # (task 3923). Keying on the value would silently accept
+    # --no-fail-on-blind-spot without --check, which is just as inert as
+    # the opt-in spelling: an operator would believe they had relaxed a
+    # gate that was never running.
+    if args.fail_on_blind_spot is not None and not args.check:
+        passed = (
+            '--fail-on-blind-spot' if args.fail_on_blind_spot
+            else '--no-fail-on-blind-spot'
+        )
+        parser.error(
+            f'{passed} requires --check: --fail-on-blind-spot / '
+            '--no-fail-on-blind-spot resolve an exit code only through the '
+            '--check verdict path, so on its own either spelling would '
+            'silently no-op — exiting 0 even on an observed blind spot, a '
+            'gate that cannot fail. Pass --check as well (the '
+            'scripts/fused-memory-flag-marker-check.sh wrapper already does), '
+            f'or drop {passed}: the blind spot is reported in the log and in '
+            "the JSON report's cross_check block either way."
+        )
+    # task 2917: --list-known-projects returns before the sweep, so any of
+    # these would print the list and silently skip the drain. Sits HERE,
+    # alongside the check above and BEFORE the tri-state resolution below, so
+    # it cannot disturb the load-bearing ordering that keys the
+    # --fail-on-blind-spot rejection on explicit passage.
+    if args.list_known_projects:
+        conflicting = [
+            flag for flag, passed in (
+                ('--apply', args.apply),
+                ('--check', args.check),
+                ('--terminal-drain', args.terminal_drain),
+                ('--delete-ids', bool(args.delete_ids)),
+            ) if passed
+        ]
+        if conflicting:
+            parser.error(
+                f'--list-known-projects cannot be combined with '
+                f'{", ".join(conflicting)}: --list-known-projects prints the '
+                'registered project_ids and RETURNS before the sweep runs, so '
+                'the combination would silently skip the drain entirely — a '
+                'run that looks green while sweeping nothing. Run '
+                '--list-known-projects on its own to resolve the list, then '
+                'invoke the sweep once per project_id (this is what '
+                'scripts/fused-memory-flag-marker-sweep.sh does).'
+            )
+    # Resolve the tri-state sentinel AFTER the validation above — see the
+    # load-bearing-ordering paragraph in this function's docstring.
+    if args.fail_on_blind_spot is None:
+        args.fail_on_blind_spot = True
+    return args
+
+
+def _known_projects_map() -> dict[str, str]:
+    """Best-effort resolve the registered ``{project_id: project_root}`` map.
+
+    Backs ``--list-known-projects`` (which prints ``sorted()`` of the keys) and
+    :func:`_known_projects_coverage_issue` (which judges coverage against the
+    VALUES). Returning the MAP rather than just the ids is what lets the
+    coverage predicate compare against the registry builder's own single
+    derivation of each root instead of re-deriving one itself (task 2917
+    amendment, reviewer_comprehensive #6): two independent derivations of the
+    same value made the predicate fragile — a symlinked root resolves
+    differently in each path — and it re-read every project manifest a second
+    time on every nightly run.
+
+    Why this lives in the sweep script rather than inline in
+    ``scripts/fused-memory-flag-marker-sweep.sh``: the wrapper needs a list of
+    project_ids to loop over, and deriving one in bash would mean
+    reimplementing the registry's root-to-id rule
+    (:func:`~fused_memory.models.scope.resolve_project_id_for_root`, which
+    prefers the id declared in ``<root>/dark-factory-orchestrator.yaml`` over
+    the basename, and resolves symlinks first). A bash basename derivation
+    would compute ids that no memory is stored under for any project whose
+    manifest id differs from its directory name — and since the sweep does no
+    known-project validation, such a run counts 0, sweeps 0 and exits 0: a
+    SILENT green, the same failure class this flag exists to close. Resolving
+    here reuses the one registry builder and keeps the wrapper a plain loop.
+
+    Fail-safe posture mirrors :func:`_resolve_terminal_task_ids`: any failure
+    (import error, unreadable root, broken registry) degrades to ``{}``,
+    logged at WARNING with a traceback, rather than raising. ``main`` turns an
+    empty map into a non-zero exit so the degradation is still loud.
+
+    Returns:
+        ``{project_id: resolved project_root}`` for every registered project,
+        exactly as :func:`~fused_memory.models.scope.build_known_projects_map`
+        built it; ``{}`` on any failure.
+    """
+    try:
+        from fused_memory.models import scope
+
+        # PROJECT_ROOT is the var the wrapper already exports; fall back to
+        # this checkout (scripts/ -> fused-memory/ -> repo root).
+        primary_root = os.environ.get('PROJECT_ROOT') or str(
+            Path(__file__).resolve().parent.parent.parent
+        )
+        # extra_roots left None on purpose: build_known_projects_map then
+        # defaults it from known_project_roots_from_env(), so the
+        # DASHBOARD_KNOWN_PROJECT_ROOTS parse has exactly one owner.
+        return scope.build_known_projects_map(primary_root)
+    except Exception:
+        logger.warning(
+            '_known_projects_map: could not resolve the registered-project map; '
+            'degrading to an empty map (the caller reports this as a non-zero '
+            'exit rather than silently sweeping nothing)',
+            exc_info=True,
+        )
+        return {}
+
+
+def _known_projects_coverage_issue(known: dict[str, str]) -> str | None:
+    """Describe how far short of fleet-wide the resolved project map falls.
+
+    EMPTINESS IS THE WRONG KEY for this, which is why this predicate exists
+    separately from :func:`_known_projects_map`' own ``{}`` fail-safe.
+    :func:`~fused_memory.models.scope.build_known_projects_map` seeds its
+    candidate list with the PRIMARY root before extending it with the env
+    roots, so an unset ``DASHBOARD_KNOWN_PROJECT_ROOTS`` produces a ONE-entry
+    map, never an empty one — an ``if not known`` check is unreachable in
+    exactly the degradation it looks like it guards, and the nightly drain
+    narrows to a single project at exit 0, silently.
+
+    Judged against the registry's OWN derivation. Each env-named root is
+    compared by RESOLVED PATH against ``known.values()`` — the very strings
+    ``build_known_projects_map`` stored — so this predicate never re-derives a
+    project_id (task 2917 amendment, reviewer_comprehensive #1/#6). The
+    previous id-membership test could not fire for either cause it named:
+    a first-wins collision leaves the dropped root's id in the map (so the
+    test passes), and a root that is not a directory is ADMITTED to the map
+    deliberately (task 5286, arm (b); the builder's docstring says why).
+
+    Three cases, deliberately told apart:
+      (i)   the env var is SET and names a root that IS NOT A DIRECTORY on
+            this host — a typo, or a moved/unmounted checkout. The builder
+            admits it DELIBERATELY and logs a WARNING at build time (task
+            5286, arm (b)). This report still names it, because the nightly
+            wrapper sweeps that phantom id, enumerates 0, deletes 0 and exits
+            0: the SILENT green this whole feature exists to close.
+      (ii)  the env var is SET and names a root whose resolved path is ABSENT
+            from the map — its project_id was already claimed by an earlier
+            root (``build_known_projects_map`` is first-wins, primary seeded
+            first), or the path could not be resolved at all. That checkout is
+            NOT swept.
+      (iii) the env var is UNSET — the map is primary-only, so coverage is
+            single-project and the census is not fleet-wide. Reported, but the
+            caller must NOT treat it as a hard failure: a legitimately
+            single-project install would otherwise warn-as-error forever.
+
+    Counting roots is NOT a substitute for any of the above. MEASURED on the
+    live registry, ``DASHBOARD_KNOWN_PROJECT_ROOTS`` lists the primary root
+    too, and ``build_known_projects_map`` drops it as a duplicate project_id
+    (logged at INFO) — so ``len(map) < 1 + len(named_roots)`` would cry
+    degradation on every healthy nightly run. Comparing resolved PATHS is
+    duplicate-proof: the repeated primary root resolves to a path that IS in
+    ``known.values()``.
+
+    Args:
+        known: The ``{project_id: project_root}`` map
+            :func:`_known_projects_map` resolved.
+
+    Returns:
+        A human-readable degradation description, or ``None`` when coverage is
+        fleet-wide. Fail-safe: an unexpected failure logs at WARNING with a
+        traceback and returns ``None`` rather than raising — this is a
+        diagnostic, and it must never be the thing that breaks the drain.
+    """
+    try:
+        from fused_memory.models import scope
+
+        named_roots = scope.known_project_roots_from_env()
+        if not named_roots:
+            resolved = ', '.join(sorted(known)) if known else '<none>'
+            return (
+                f'{scope.KNOWN_PROJECT_ROOTS_ENV} is UNSET, so the '
+                f'registered-project map is PRIMARY-ONLY ({resolved}). Coverage '
+                f'is single-project and this census is NOT fleet-wide. On a '
+                f'genuinely single-project install that is correct and expected; '
+                f'on the dark-factory host it means the var did not reach this '
+                f'process — it lives as an Environment= line on the installed '
+                f'fused-memory.service unit, not in the repo .env.'
+            )
+
+        registered_roots = set(known.values())
+        phantom: list[str] = []   # case (i): named, but not a directory
+        unmapped: list[str] = []  # case (ii): named, but absent from the map
+        for raw in named_roots:
+            if scope.is_phantom_project_root(raw):
+                phantom.append(raw)
+                continue
+            try:
+                resolved_root = str(Path(raw).resolve())
+            except OSError:
+                unmapped.append(raw)
+                continue
+            if resolved_root not in registered_roots:
+                unmapped.append(raw)
+
+        problems: list[str] = []
+        if phantom:
+            problems.append(
+                f'{len(phantom)} of them IS NOT A DIRECTORY on this host: '
+                f'{", ".join(phantom)}. build_known_projects_map admits '
+                f'such a root deliberately (task 5286) and WARNs at build '
+                f'time; the nightly sweep then runs that phantom id, '
+                f'enumerates 0 '
+                f'markers, deletes 0 and exits 0 (a SILENT green). Likely '
+                f'cause: a typo in the root path, or a moved/unmounted '
+                f'checkout.'
+            )
+        if unmapped:
+            problems.append(
+                f'{len(unmapped)} of them did not make it into the '
+                f'registered-project map: {", ".join(unmapped)}. '
+                f'build_known_projects_map is first-wins on project_id (the '
+                f'primary root is seeded first), so such a root lost its id to '
+                f'one listed earlier, or could not be resolved at all. Those '
+                f'projects will NOT be swept.'
+            )
+        if not problems:
+            return None
+        return (
+            f'{scope.KNOWN_PROJECT_ROOTS_ENV} names {len(named_roots)} root(s) '
+            f'and the registered-project map covers {len(known)} project(s), '
+            f'but ' + ' '.join(problems)
+        )
+    except Exception:
+        logger.warning(
+            '_known_projects_coverage_issue: could not evaluate registry '
+            'coverage; reporting no issue (this is a diagnostic and must never '
+            'be what breaks the drain)',
+            exc_info=True,
+        )
+        return None
+
+
+async def _resolve_terminal_task_ids(project_id: str) -> tuple[set[str], str]:
     """Best-effort resolve terminal-status task ids for ``--terminal-drain``.
+
+    Returns the ids AND the REASON they came out that way (task 2917
+    amendment, reviewer_comprehensive #4). An empty set is reached four
+    different ways, and the journal must not spell them the same word: a
+    correctly narrowed sibling project, an unconfigured taskmaster, a backend
+    that failed to open, and a primary project that genuinely has zero
+    terminal tasks are four distinct operational states. Only the caller's
+    ``--terminal-drain`` flag is missing from that list, and ``main`` supplies
+    ``'not-requested'`` for it without calling this function at all.
 
     Mirrors
     ``fused_memory.reconciliation.stages.task_knowledge_sync._resolve_terminal_task_ids``'s
@@ -791,20 +2125,91 @@ async def _resolve_terminal_task_ids() -> set[str]:
     raising, logged at WARNING. Only called when ``--terminal-drain`` is
     passed, so the default run path has no taskmaster dependency at all.
 
+    TERMINAL-DRAIN IS PRIMARY-PROJECT-ONLY (task 2917, esc-2917-3 ruling).
+    *project_id* is the project about to be swept; this function resolves ids
+    from exactly ONE task store — the one THIS process is configured with
+    (``config.taskmaster.project_root``) — and returns them only when the two
+    identify the same project. Otherwise it returns ``set()`` and says so at
+    WARNING.
+
+    Why the guard exists, and why HERE. Before task 2917 the nightly wrapper
+    swept a single project, so "the terminal ids" and "the swept project" were
+    trivially the same one. EDIT 1 turns that into a loop over every
+    registered project, and :func:`run` matches markers against this set by
+    PLAIN STRING MEMBERSHIP: a sibling project's marker whose ``task_id``
+    merely COLLIDES with a terminal dark_factory id would be deleted. Task ids
+    are small integers, so collision is the common case, not the corner one
+    (measured ~96% on the live registry). The delete is UNRECOVERABLE —
+    mem0's ``_delete_memory`` removes the Qdrant point BEFORE writing its
+    SQLite history — so the damage asymmetry is total: guarding wrongly costs
+    a lingering marker that the age predicate drains anyway, while not
+    guarding costs records that survive nowhere.
+
+    The alternative (resolve each project's terminal ids from ITS OWN task
+    store) is mechanically possible — ``SqliteTaskBackend.get_statuses``
+    accepts an arbitrary root — but it EXTENDS a cross-project contract to arm
+    deletions in projects whose task store this process does not own. That was
+    rejected-for-now rather than refuted; see
+    ``docs/flag-marker-sweep-recurring.md``. Declining to extend a contract
+    needs no broader authority; extending one does.
+
+    The guard lives at this chokepoint rather than in
+    ``scripts/fused-memory-flag-marker-sweep.sh`` because it is a single
+    unit-testable site that every caller — including a hand-typed
+    ``--project-id <other> --terminal-drain --apply`` — passes through, and it
+    keeps the wrapper a plain loop (the same rationale recorded in
+    :func:`_known_projects_map`).
+
+    Args:
+        project_id: The project this sweep run will operate on, i.e.
+            ``args.project_id``.
+
     Returns:
-        Set of task_id strings whose status is terminal (``done`` or
-        ``cancelled`` per ``shared.task_statuses.TERMINAL``); empty set on
-        any failure or unconfigured taskmaster.
+        ``(task_ids, mode)``. *task_ids* is the set of task_id strings whose
+        status is terminal (``done`` or ``cancelled`` per
+        ``shared.task_statuses.TERMINAL``); empty on any failure,
+        unconfigured taskmaster, or a non-primary *project_id*. *mode* is one
+        of :data:`_EFFECTIVE_MODE_LABELS`' keys plus ``'terminal-drain'``:
+
+          ``'terminal-drain'``       resolved from this project's own task
+                                     store; the set is authoritative, ZERO
+                                     included.
+          ``'narrowed-non-primary'`` the primary-project guard fired.
+          ``'unconfigured'``         no taskmaster on this process.
+          ``'resolution-failed'``    the backend raised; see the WARNING.
     """
     try:
-        from shared.task_statuses import TERMINAL as TERMINAL_STATUSES  # noqa: PLC0415
+        from shared.task_statuses import TERMINAL as TERMINAL_STATUSES
 
-        from fused_memory.backends.sqlite_task_backend import SqliteTaskBackend  # noqa: PLC0415
-        from fused_memory.config.schema import FusedMemoryConfig  # noqa: PLC0415
+        from fused_memory.backends.sqlite_task_backend import SqliteTaskBackend
+        from fused_memory.config.schema import FusedMemoryConfig
+        from fused_memory.models import scope
 
         config = FusedMemoryConfig()
         if config.taskmaster is None:
-            return set()
+            return set(), 'unconfigured'
+
+        # Resolved with the same rename-stable resolver the registry builder
+        # uses, so a manifest-declared id (not the directory basename) is
+        # compared against the same id space --list-known-projects emits.
+        primary_project_id = scope.resolve_project_id_for_root(
+            config.taskmaster.project_root
+        )
+        if primary_project_id != project_id:
+            logger.warning(
+                'sweep_orphan_flag_markers: --terminal-drain requested for '
+                'project_id=%r, but this process is configured with the task '
+                'store of project_id=%r (%s). Terminal ids are deliberately '
+                'NOT applied across projects -- they would be matched against '
+                "%r's markers by plain string membership, and colliding task "
+                'ids would be deleted unrecoverably. Proceeding AGE-ONLY for '
+                '%r (task 2917, esc-2917-3 ruling: see '
+                'docs/flag-marker-sweep-recurring.md).',
+                project_id, primary_project_id, config.taskmaster.project_root,
+                project_id, project_id,
+            )
+            return set(), 'narrowed-non-primary'
+
         backend = SqliteTaskBackend(config.taskmaster)
         await backend.start()
         try:
@@ -813,7 +2218,7 @@ async def _resolve_terminal_task_ids() -> set[str]:
             await backend.close()
         return {
             str(tid) for tid, status in statuses.items() if status in TERMINAL_STATUSES
-        }
+        }, 'terminal-drain'
     except Exception:
         # exc_info=True (task 2596 amendment, reviewer_comprehensive #3): a
         # genuine wiring failure (wrong attr, backend import error) must
@@ -824,7 +2229,58 @@ async def _resolve_terminal_task_ids() -> set[str]:
             'failed; falling back to age-only sweep (terminal_task_ids=set()).',
             exc_info=True,
         )
-        return set()
+        return set(), 'resolution-failed'
+
+
+# Human-readable rendering of every NON-terminal-drain outcome, keyed by the
+# mode :func:`_resolve_terminal_task_ids` reports. Keeping the strings here
+# rather than inline at the log site is what stops the producer and the
+# formatter drifting apart (task 2917 amendment, reviewer_comprehensive #4).
+_EFFECTIVE_MODE_LABELS: dict[str, str] = {
+    'narrowed-non-primary': (
+        'age-only (--terminal-drain requested, but NARROWED: this process is '
+        'configured with another project\'s task store -- see the WARNING '
+        'above)'
+    ),
+    'unconfigured': (
+        'age-only (--terminal-drain requested, but this process has NO '
+        'taskmaster configured, so no terminal ids exist to drain)'
+    ),
+    'resolution-failed': (
+        'age-only (--terminal-drain requested, but terminal-id resolution '
+        'FAILED -- see the WARNING with the traceback above)'
+    ),
+    'not-requested': 'age-only (--terminal-drain not requested)',
+}
+
+
+def _effective_mode_label(mode: str, terminal_task_ids: set[str]) -> str:
+    """Render the per-project coverage line for the journal.
+
+    Why not ``'terminal-drain' if terminal_task_ids else 'age-only'``: keying
+    on the truthiness of the SET collapses four states into one word, and the
+    one an operator most needs to tell apart -- the primary project resolving
+    ZERO terminal ids because the task store failed to open -- then reads
+    identically to a correctly narrowed sibling project. A nightly whose task
+    backend is broken must not look like a healthy one.
+
+    Args:
+        mode: The mode :func:`_resolve_terminal_task_ids` reported, or
+            ``'not-requested'`` when ``--terminal-drain`` was never passed.
+        terminal_task_ids: The resolved set, used only for its size.
+
+    Returns:
+        A single-line description of the mode that ACTUALLY ran.
+    """
+    if mode == 'terminal-drain':
+        return f'terminal-drain ({len(terminal_task_ids)} terminal task ids)'
+    return _EFFECTIVE_MODE_LABELS.get(
+        mode,
+        # Unreachable by construction; still legible if a new mode is added
+        # to the resolver without a label, rather than silently printing
+        # "age-only" for something that is not age-only.
+        f'UNKNOWN mode {mode!r} (treated as age-only)',
+    )
 
 
 def main() -> int:
@@ -833,27 +2289,65 @@ def main() -> int:
         level=logging.INFO,
         format='%(asctime)s %(name)s %(levelname)s %(message)s',
     )
-    parser = _build_parser()
-    args = parser.parse_args()
+    args = _parse_args()
+
+    # Resolution-only mode: return BEFORE any MemoryService is constructed, so
+    # listing the fleet needs no live store connection at all.
+    if args.list_known_projects:
+        known_projects = _known_projects_map()
+        # Coverage is reported on its OWN predicate, not on emptiness: the
+        # primary root is always seeded into the map, so the most likely
+        # degradation (DASHBOARD_KNOWN_PROJECT_ROOTS never reaching this
+        # process) yields a one-entry list that the emptiness check below can
+        # never see. Warned, but NOT fatal -- a single-project install is
+        # legitimate, and warn-as-error there would be noise forever.
+        coverage_issue = _known_projects_coverage_issue(known_projects)
+        if coverage_issue:
+            logger.warning(
+                'sweep_orphan_flag_markers --list-known-projects: %s',
+                coverage_issue,
+            )
+        if not known_projects:
+            logger.warning(
+                'sweep_orphan_flag_markers --list-known-projects: resolved NO '
+                'registered projects. DASHBOARD_KNOWN_PROJECT_ROOTS is the '
+                'likely-unset cause (it is not in the repo .env; it lives as an '
+                'Environment= line on the installed fused-memory.service unit). '
+                'Exiting non-zero so the caller narrows loudly instead of '
+                'silently sweeping nothing.'
+            )
+            return 1
+        for project_id in sorted(known_projects):
+            print(project_id)
+        return 0
 
     async def _run_live() -> dict:
-        from fused_memory.config.schema import FusedMemoryConfig  # noqa: PLC0415
-        from fused_memory.services.memory_service import MemoryService  # noqa: PLC0415
+        from fused_memory.config.schema import FusedMemoryConfig
+        from fused_memory.maintenance._utils import maintenance_service
 
         config = FusedMemoryConfig()
-        memory = MemoryService(config)
         now_dt = datetime.now(UTC)
-        terminal_task_ids = (
-            await _resolve_terminal_task_ids() if args.terminal_drain else set()
+        if args.terminal_drain:
+            terminal_task_ids, drain_mode = await _resolve_terminal_task_ids(
+                args.project_id
+            )
+        else:
+            terminal_task_ids, drain_mode = set(), 'not-requested'
+        # Census honesty (task 2917 EDIT 1): the wrapper loops over the whole
+        # registered fleet and requests --terminal-drain uniformly, but the
+        # guard above narrows every non-primary project to age-only. Say which
+        # mode ACTUALLY ran, per project, so the journal reports coverage
+        # rather than intent -- including WHY, since four different states
+        # produce an empty set (task 2917 amendment).
+        logger.info(
+            'sweep_orphan_flag_markers: project_id=%s effective mode=%s',
+            args.project_id,
+            _effective_mode_label(drain_mode, terminal_task_ids),
         )
-        try:
-            await memory.initialize()
+        async with maintenance_service(config=config) as (_, memory):
             return await run(
                 args, memory, now=now_dt, terminal_task_ids=terminal_task_ids,
             )
-        finally:
-            if hasattr(memory, 'close'):
-                await memory.close()
 
     try:
         report = asyncio.run(_run_live())
@@ -864,7 +2358,10 @@ def main() -> int:
     print(json.dumps(report, indent=2))
 
     if args.check:
-        return _resolve_check_exit_code(report, args.max_backlog)
+        return _resolve_check_exit_code(
+            report, args.max_backlog,
+            fail_on_blind_spot=args.fail_on_blind_spot,
+        )
 
     return 0
 

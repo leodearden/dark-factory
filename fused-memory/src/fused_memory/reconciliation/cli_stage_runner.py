@@ -6,17 +6,36 @@ import json
 import logging
 import shutil
 import time
-from dataclasses import dataclass, field
-from pathlib import Path
+from dataclasses import InitVar, dataclass, field
+from pathlib import Path, PurePath
 from typing import TYPE_CHECKING, Any
 
-from shared.cli_invoke import AgentResult, AllAccountsCappedException, invoke_with_cap_retry
+from shared.cli_invoke import (
+    AgentResult,
+    AllAccountsCappedException,
+    invoke_with_cap_retry,
+    is_zero_output_timeout,
+)
+from shared.config_dir import CONFIG_DIR_PREFIX
+from shared.transcript_archive import archive_before_delete, resolve_archive_root
 
-from fused_memory.reconciliation import _RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS
+from fused_memory.models.invocation_ledger import (
+    InvocationLedger,
+    input_output_tokens,
+    ledger_invoke_kwargs,
+)
+from fused_memory.models.reconciliation import FINDING_SEVERITY_VALUES, StageAgentOutcome
+from fused_memory.reconciliation import (
+    RECONCILIATION_CLI_ENV_OVERRIDES,
+    RECONCILIATION_CLI_SETTING_SOURCES,
+    RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS,
+)
+from fused_memory.reconciliation.reserve_step_aside import RECONCILIATION_WORK_CLASS
 from fused_memory.reconciliation.sandbox_guard import (
     RemediationSandboxUnavailable,
     resolve_recon_sandbox_wrap,
 )
+from fused_memory.utils.clip_disclosure import elide_text, truncation_fields
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -30,14 +49,24 @@ logger = logging.getLogger(__name__)
 
 # ── Disallowed tool lists ──────────────────────────────────────────────
 
-# Non-MCP built-in tools that stages should never use
-DISALLOW_BUILTIN = ['Bash', 'Edit', 'Write', 'NotebookEdit']
+# Non-MCP built-in tools no stage calls. Skill and Workflow go together: with Skill denied
+# alone, Workflow's description inlines a ~17,400-char reference (task 10451).
+DISALLOW_BUILTIN = [
+    'Bash', 'Edit', 'Write', 'NotebookEdit',
+    'Agent', 'ListAgents', 'ReportFindings', 'ScheduleWakeup', 'Skill', 'Workflow',
+    'CronCreate', 'CronDelete', 'CronList', 'DesignSync', 'EnterWorktree', 'ExitWorktree',
+    'Monitor', 'PushNotification', 'RemoteTrigger', 'SendMessage', 'TaskStop', 'WebFetch',
+    'WebSearch',
+]
 
-# Task write tools (disallowed in Stage 1 — memory consolidation only)
+# Task write tools (disallowed in Stage 1 and Stage 3; Stage 2 files tasks).
 DISALLOW_TASK_WRITES = [
     'mcp__fused-memory__set_task_status',
     'mcp__fused-memory__submit_task',
     'mcp__fused-memory__resolve_ticket',
+    'mcp__fused-memory__cancel_ticket',
+    'mcp__fused-memory__commit_planning',
+    'mcp__fused-memory__set_task_claimant',
     'mcp__fused-memory__update_task',
     'mcp__fused-memory__remove_task',
     'mcp__fused-memory__add_dependency',
@@ -45,13 +74,36 @@ DISALLOW_TASK_WRITES = [
 ]
 
 # Memory write tools (disallowed in Stage 3 — read-only integrity check)
+#
+# update_memory (task 3088, esc-3623-3) is an in-place SILENT-REWRITE primitive
+# — it changes what a Mem0 record says while preserving its point id and
+# created_at — and shipped unclassified: it was in NO disallow list at all, so
+# Stage 3 (the read-only integrity check) was neither denied it here nor
+# turned away by the mem0_update authz gate, whose shipped default
+# content_amend_allowed_agent_prefixes=['recon-stage-', 'curator-'] admits
+# every recon stage's f'recon-stage-{stage_id}' agent_id via its recon-stage-
+# entry (curator-, added for the interactive consolidation sitting per
+# esc-3524-1, matches no recon stage and does not move this reasoning).
+# Stage 1 and Stage 2 KEEP the
+# tool because neither STAGE1_DISALLOWED nor STAGE2_DISALLOWED (below) folds
+# DISALLOW_MEMORY_WRITES — the very asymmetry the AMEND_AND_EPISODE_TOOLS_BLOCK
+# prompt addition (prompts/__init__.py) now advertises.
 DISALLOW_MEMORY_WRITES = [
     'mcp__fused-memory__add_episode',
     'mcp__fused-memory__add_memory',
+    'mcp__fused-memory__add_system_record',
     'mcp__fused-memory__delete_memory',
+    'mcp__fused-memory__update_memory',
+    # consolidate_memories (task 3133) is classified in the SAME change that
+    # adds the tool, deliberately: it writes a canonical, patches N retained
+    # peers, re-homes their children and DELETES its supersedes, so shipping
+    # it unlisted would repeat the update_memory incident above with a larger
+    # blast radius. This is its safety classification; DISALLOW_CONSOLIDATION_OP
+    # below additionally denies it to Stages 1 and 2 (task 5239).
+    'mcp__fused-memory__consolidate_memories',
     'mcp__fused-memory__delete_episode',
+    'mcp__fused-memory__redact_episode_content',
     'mcp__fused-memory__replay_to_graphiti',
-    'mcp__fused-memory__replay_dead_letters',
     'mcp__fused-memory__refresh_entity_summary',
     'mcp__fused-memory__set_entity_summary',
     'mcp__fused-memory__rename_entity',
@@ -60,6 +112,35 @@ DISALLOW_MEMORY_WRITES = [
     'mcp__fused-memory__delete_entity',
     'mcp__fused-memory__rebuild_entity_summaries',
     'mcp__fused-memory__update_edge',
+    # ensure_entity_node (task 4932) is the identity-MINT primitive — strictly
+    # more CREATIVE than every sibling in this list, all of which only mutate or
+    # remove an ALREADY-EXISTING node. It is classified in the SAME change that
+    # adds the tool, deliberately, so it does not repeat the update_memory
+    # incident the block comment at the head of this list records.
+    #
+    # The tool-level denial here is LOAD-BEARING, not redundant with the tool's
+    # own authorization gate: the shipped
+    # entity_mint.allowed_agent_prefixes=['recon-stage-', 'curator-']
+    # (config/schema.py::EntityMintConfig) admits every reconciliation stage's
+    # canonical f'recon-stage-{stage_id}' agent_id (reconciliation/stages/base.py,
+    # reconciliation/stage_stats.py), so
+    # server/entity_mint_authz.py::resolve_entity_mint_authorization ALONE would
+    # NOT turn Stage 3 away — the same two-layer gap the update_memory incident
+    # describes, where a write primitive was in no disallow list AND was admitted
+    # by an allowlist whose default covers every recon stage.
+    #
+    # And nothing sweeps orphan minted nodes (as server/entity_mint_authz.py and
+    # the tool docstring both state), so a Stage 3 mint would leave a durable,
+    # un-reversed artifact — created by the stage that is read-only by contract
+    # and that is itself the DETECTOR of identity anomalies, collapsing
+    # detect-and-repair into one unaccountable actor. That is the same rationale
+    # the repair_memory_citation carve-out below records.
+    #
+    # Stage 1 and the curator are the sanctioned callers, so STAGE1_DISALLOWED
+    # and STAGE2_DISALLOWED are deliberately untouched (neither folds this list).
+    # Stage 1's ADVERTISEMENT of the op in the stage prompts is separate work;
+    # this is the safety classification, which belongs with the tool.
+    'mcp__fused-memory__ensure_entity_node',
 ]
 
 # Recon-report tools that perform DURABLE writes (disallowed outside Stage 2).
@@ -71,6 +152,75 @@ DISALLOW_MEMORY_WRITES = [
 # would miss Stage 1) or DISALLOW_TASK_WRITES (semantically wrong).
 DISALLOW_RECON_REPORT_LEDGER_WRITES = [
     'mcp__recon-report__write_entity_standing_decision',
+]
+
+# Recon-report tools that write to the reconciliation JOURNAL (disallowed in
+# Stage 3 only).
+# task 3065: repair_memory_citation is the second recon-report tool that writes
+# past in-process ReconReportState — it rewrites the durable `runs.stage_reports`
+# blob of an ALREADY-COMPLETED run, to re-point or drop a cited memory id that no
+# longer resolves. It is a SEPARATE sublist from the ledger writes above because
+# the journal is not the ledger: same class of hazard, different store, and
+# keeping them distinct keeps each name honest and each stage's grant
+# independently adjustable.
+#
+# Denied in Stage 3 alone. Stage 3 (integrity_check) is read-only by contract AND
+# is the stage that DETECTS a dangling cross-run citation; letting it also repair
+# would break that contract and collapse detect-and-repair into one unaccountable
+# actor. Stage 1 keeps it because Stage 1 is where a supersession deletes the
+# predecessor memory — i.e. where cross-run citations become dangling in the
+# first place — and it is already citation_verifier's own caller, so repair-at-
+# source belongs there. Stage 2 keeps it because Stage 2 is the remediation stage
+# whose blocked repair attempt originated this task.
+DISALLOW_RECON_REPORT_JOURNAL_WRITES = [
+    'mcp__recon-report__repair_memory_citation',
+]
+
+# fused-memory CONTROL-PLANE mutators (disallowed in every stage — task 3250):
+# tools that mutate the machinery running a stage — reconciliation, config, the
+# scheduler, dead-letter queues and indexes — rather than the data it curates.
+#
+# Every registered fused-memory tool must be in a deny bucket or reviewed as
+# read-only — see
+# tests/test_stages.py::TestDisallowedToolLists::test_every_fused_memory_tool_is_classified.
+DISALLOW_FUSED_MEMORY_CONTROL_PLANE_WRITES = [
+    'mcp__fused-memory__trigger_reconciliation',
+    'mcp__fused-memory__unhalt_reconciliation',
+    'mcp__fused-memory__reload_config',
+    'mcp__fused-memory__rebuild_candidate_key_index',
+    'mcp__fused-memory__replay_dead_letters',
+    'mcp__fused-memory__replay_event_dead_letters',
+    'mcp__fused-memory__delete_dead_letters',
+    'mcp__fused-memory__set_task_priority_override',
+    'mcp__fused-memory__clear_task_priority_override',
+    'mcp__fused-memory__reorder_pin_queue',
+    'mcp__fused-memory__request_park_eviction',
+]
+
+# Consolidation PROPOSALS (disallowed in Stage 2 and Stage 3 — task 5239, PRD
+# plans/memory-auto-consolidation-prd.md D12/C1): Stage 1 is the one proposer of
+# a near-duplicate cluster; code decides and executes. An additive sublist on
+# the DISALLOW_RECON_REPORT_LEDGER_WRITES pattern, since no existing bucket
+# denies a tool to exactly Stages 2 and 3.
+DISALLOW_CONSOLIDATION_PROPOSALS = [
+    'mcp__fused-memory__propose_consolidation',
+]
+
+# consolidate_memories, denied to Stage 1 and Stage 2 (task 5239, PRD
+# plans/memory-auto-consolidation-prd.md D12). A stage-scoping OVERLAY, not a
+# classification bucket: the tool stays classified in DISALLOW_MEMORY_WRITES,
+# which already carries it into Stage 3, so this folds into Stages 1 and 2 only.
+# Auto-consolidation's executor and the curator sitting (curator- agents) are
+# the op's callers now; Stage 1 proposes through propose_consolidation instead.
+DISALLOW_CONSOLIDATION_OP = [
+    'mcp__fused-memory__consolidate_memories',
+]
+
+# Defect-record writers (disallowed in every stage — plans/defect-tests-prd.md
+# decision 7): no recon stage declares, rules on or proves a defect.
+DISALLOW_DEFECT_RECORD_WRITES = [
+    'mcp__fused-memory__declare_defect',
+    'mcp__fused-memory__record_defect_outcome',
 ]
 
 # Escalation READ tools (disallowed in every stage — task 3163,
@@ -87,10 +237,8 @@ DISALLOW_RECON_REPORT_LEDGER_WRITES = [
 # the source; the boundary paragraph in the stage prompts
 # (prompts/__init__.py ESCALATION_BOUNDARY_NOTE) explains the absence.
 #
-# The escalation WRITE tool (escalate_blocker) is deliberately NOT denied: it is
-# the sole sanctioned recon escalation use — Stage 2's Stale Flag Escalation
-# (FIX D) — and it writes to the reconciliation store, which is the correct
-# destination for it. Over-denying here breaks FIX D.
+# The escalation WRITE tools are NOT in this list; they have their own
+# per-stage list, DISALLOW_ESCALATION_WRITES, below.
 #
 # PRD open question 4 (reject-vs-omit) resolved during α: `--disallowed-tools`
 # OMITS a denied MCP tool from the agent's tool listing rather than surfacing it
@@ -132,23 +280,94 @@ DISALLOW_ESCALATION_READS = [
     'mcp__escalation__get_escalation',
     'mcp__escalation__get_task_escalations',
     'mcp__escalation__get_task_escalation_history',
+    # A by-id record read, denied for the same reason as get_escalation
+    # (task 5751).
+    'mcp__escalation__resolve_escalation_shas',
+]
+
+# SILENT standalone orchestrator RUNTIME reads (disallowed in every stage —
+# task 6553, plans/escalation-store-ambiguity-prd.md §11 OQ3): with no harness
+# attached they answer an empty-but-live result instead of an error.
+#
+# The recon escalation server is built with no orchestrator harness
+# (reconciliation/harness.py::ReconciliationHarness._start_escalation_server),
+# so escalation/server.py::create_server's get_task_runtime_state answers with
+# the snapshot model's default envelope: offline=False, tasks=[]. That is the
+# categorical empty DISALLOW_ESCALATION_READS exists to stop, made worse by a
+# positive "online, nothing running" claim. It is a separate bucket because it
+# reads orchestrator runtime state, not escalation records. Reading runtime
+# state alone does not qualify a tool: the merge-queue reads stay reviewed-safe
+# because standalone they fail loudly. S3 δ moving get_task_runtime_state off
+# create_server supersedes this bucket; OQ3's resolution names what δ retires.
+DISALLOW_ESCALATION_RUNTIME_READS = [
+    'mcp__escalation__get_task_runtime_state',
+]
+
+# Escalation FILING tools (disallowed in Stage 1 and Stage 3 — task 3250).
+#
+# The write path is sanctioned in Stage 2 only: the FIX D Stale Flag Escalation
+# in prompts/stage2.py, driven from stages/task_knowledge_sync.py::TaskKnowledgeSync.
+# Denying escalate_blocker in Stage 2 would break FIX D, so this list must never
+# be folded into STAGE2_DISALLOWED.
+#
+# Stage 1 (MemoryConsolidator) and Stage 3 (IntegrityCheck) have no sanctioned
+# escalation write. Their prompts have said so since task 3163 via
+# prompts/__init__.py::render_escalation_boundary_note(can_escalate=False); this
+# list is the mechanical half of that clause. escalate_info rides along because
+# no recon prompt or stage references it. `--disallowed-tools` omits rather than
+# rejects (see above), and _ESCALATION_BOUNDARY_NO_ACTION already explains the
+# absence to a Stage 1/3 agent.
+DISALLOW_ESCALATION_WRITES = [
+    'mcp__escalation__escalate_blocker',
+    'mcp__escalation__escalate_info',
+]
+
+# Operator merge-lane control (disallowed in every stage — task 5246, Leo
+# 2026-10-21): operator merge-lane control; reconciliation stages must not
+# re-prioritise merges.
+DISALLOW_ESCALATION_MERGE_LANE_CONTROL = [
+    'mcp__escalation__merge_relane',
 ]
 
 # Per-stage disallowed lists
 STAGE1_DISALLOWED = (
     DISALLOW_TASK_WRITES
+    + DISALLOW_CONSOLIDATION_OP
     + DISALLOW_RECON_REPORT_LEDGER_WRITES
+    + DISALLOW_FUSED_MEMORY_CONTROL_PLANE_WRITES
+    + DISALLOW_DEFECT_RECORD_WRITES
     + DISALLOW_ESCALATION_READS
+    + DISALLOW_ESCALATION_RUNTIME_READS
+    + DISALLOW_ESCALATION_MERGE_LANE_CONTROL
+    + DISALLOW_ESCALATION_WRITES
     + DISALLOW_BUILTIN
 )
-# Stage 2 keeps full memory + task write access; only built-ins and the
-# escalation reads are blocked.
-STAGE2_DISALLOWED = DISALLOW_ESCALATION_READS + DISALLOW_BUILTIN
+# Stage 2 keeps its memory + task write access except the consolidation op and
+# the proposal tool; built-ins, the escalation reads, the orchestrator runtime
+# snapshot read, operator merge-lane control, the fused-memory control-plane
+# mutators and the defect-record writers are blocked too.
+STAGE2_DISALLOWED = (
+    DISALLOW_CONSOLIDATION_OP
+    + DISALLOW_CONSOLIDATION_PROPOSALS
+    + DISALLOW_FUSED_MEMORY_CONTROL_PLANE_WRITES
+    + DISALLOW_DEFECT_RECORD_WRITES
+    + DISALLOW_ESCALATION_READS
+    + DISALLOW_ESCALATION_RUNTIME_READS
+    + DISALLOW_ESCALATION_MERGE_LANE_CONTROL
+    + DISALLOW_BUILTIN
+)
 STAGE3_DISALLOWED = (
     DISALLOW_TASK_WRITES
     + DISALLOW_MEMORY_WRITES
     + DISALLOW_RECON_REPORT_LEDGER_WRITES
+    + DISALLOW_RECON_REPORT_JOURNAL_WRITES
+    + DISALLOW_CONSOLIDATION_PROPOSALS
+    + DISALLOW_FUSED_MEMORY_CONTROL_PLANE_WRITES
+    + DISALLOW_DEFECT_RECORD_WRITES
     + DISALLOW_ESCALATION_READS
+    + DISALLOW_ESCALATION_RUNTIME_READS
+    + DISALLOW_ESCALATION_MERGE_LANE_CONTROL
+    + DISALLOW_ESCALATION_WRITES
     + DISALLOW_BUILTIN
 )
 # NOTE: the IN-PROCESS-STATE `mcp__recon-report__*` tools (start_report, add_finding,
@@ -159,6 +378,17 @@ STAGE3_DISALLOWED = (
 # CARVE-OUT (task 2895 β): write_entity_standing_decision is the exception — the first
 # recon-report tool with a durable SQLite-ledger write. It IS blocked in Stage 1 and
 # Stage 3 (via DISALLOW_RECON_REPORT_LEDGER_WRITES above) and callable only in Stage 2.
+# CARVE-OUT (task 3065): repair_memory_citation is the SECOND such exception — the first
+# recon-report tool that writes to the reconciliation JOURNAL, rewriting the durable
+# `runs.stage_reports` blob of an already-completed run to re-point or drop a cited
+# memory id that no longer resolves. It is denied in Stage 3 ONLY (via
+# DISALLOW_RECON_REPORT_JOURNAL_WRITES above), because Stage 3 is read-only by contract
+# and is the stage that DETECTS dangling citations — detect and repair must not be the
+# same actor. Stage 1 keeps it (Stage 1's supersessions are what strand the citation in
+# the first place, and it already calls citation_verifier); Stage 2 keeps it (it is the
+# remediation stage whose blocked attempt originated the task). The two carve-outs stay
+# on separate sublists on purpose: the ledger and the journal are different stores, and a
+# single list named for one of them would lie about the other.
 
 # Output schema for stage reports
 STAGE_REPORT_SCHEMA: dict[str, Any] = {
@@ -202,7 +432,7 @@ FINDING_ITEM_SCHEMA: dict[str, Any] = {
         },
         'severity': {
             'type': 'string',
-            'enum': ['minor', 'moderate', 'serious'],
+            'enum': list(FINDING_SEVERITY_VALUES),
             'description': 'Severity level of the finding',
         },
         'actionable': {
@@ -339,18 +569,51 @@ STAGE3_REPORT_SCHEMA: dict[str, Any] = {
 }
 
 
-@dataclass
+@dataclass(frozen=True)
 class StageResult:
-    """Result from a single CLI stage invocation."""
+    """Result from a single CLI stage invocation.
+
+    ``outcome`` is ``declared_outcome`` when one is given, else derived from
+    ``success``; only a successful agent is ever ``completed``.
+
+    ``tokens_used`` is the input plus output tokens of the stage's one CLI
+    invocation (``models/invocation_ledger.py::input_output_tokens``). Cache
+    reads and cache creations are carried in their own fields, never in that
+    sum. All three are 0 when the CLI reported none or no model ran.
+    """
 
     report: dict = field(default_factory=dict)
     llm_calls: int = 0
     tokens_used: int = 0
+    cache_read_tokens: int = 0
+    cache_create_tokens: int = 0
     cost_usd: float = 0.0
     duration_ms: int = 0
     model: str = ''
     success: bool = False
     error: str = ''
+    declared_outcome: InitVar[StageAgentOutcome | None] = None
+    outcome: StageAgentOutcome = field(init=False)
+
+    def __post_init__(self, declared_outcome: StageAgentOutcome | None) -> None:
+        derived = StageAgentOutcome.completed if self.success else StageAgentOutcome.failed
+        outcome = derived if declared_outcome is None else declared_outcome
+        if (outcome is StageAgentOutcome.completed) != self.success:
+            raise ValueError(
+                f'StageResult outcome={outcome.value!r} contradicts '
+                f'success={self.success}: only a successful agent is completed.'
+            )
+        object.__setattr__(self, 'outcome', outcome)
+
+
+def _classify_agent_outcome(agent_result: AgentResult) -> StageAgentOutcome:
+    if agent_result.success:
+        return StageAgentOutcome.completed
+    if is_zero_output_timeout(agent_result):
+        return StageAgentOutcome.zero_output_timeout
+    if agent_result.timed_out:
+        return StageAgentOutcome.timed_out
+    return StageAgentOutcome.failed
 
 
 def recon_config_base_dir(data_dir: Path) -> Path:
@@ -360,23 +623,226 @@ def recon_config_base_dir(data_dir: Path) -> Path:
     (``BaseStage.run``) and the GC (``harness``) derive the same path from
     ``(journal.data_dir, run_id)`` without passing a ``TaskConfigDir`` across
     scopes.
+
+    The returned root is always ABSOLUTE, and that is load-bearing (task 4592).
+    It becomes ``TaskConfigDir.path``, which is BOTH the ``CLAUDE_CONFIG_DIR``
+    handed to the CLI child (``shared/src/shared/cli_invoke.py::invoke_claude_agent``
+    sets ``env['CLAUDE_CONFIG_DIR'] = str(config_dir)``) and the path the parent
+    verifies for sandbox containment
+    (``fused-memory/src/fused_memory/reconciliation/sandbox_guard.py::_assert_config_dir_writable``).
+    A RELATIVE string is resolved against two DIFFERENT cwds: the child's — the
+    wrapped argv is spawned with ``cwd=`` ``config.explore_codebase_root``, see
+    ``run_stage_via_cli`` below — and the parent's, where every
+    ``os.path.realpath`` in the guard runs. Verified path A, written path B: the
+    fail-closed containment check reports PASS while the kernel denies every
+    transcript write, which is exactly the 2026-07-18 -> 2026-08-11 silent
+    transcript loss that task 4003's check exists to make impossible.
+    Since task 5462 a config-sourced ``data_dir`` arrives ABSOLUTE: a relative
+    ``reconciliation.data_dir`` is anchored at load by
+    ``fused-memory/src/fused_memory/config/checkout_anchor.py::anchor_at_checkout``
+    at the checkout root, which in production equals the unit's
+    ``WorkingDirectory`` and ``PROJECT_ROOT``
+    (``scripts/fused-memory.service.template``), and a MANAGED spawn injects an
+    absolute XDG path (``orchestrator/src/orchestrator/mcp_lifecycle.py``). The
+    relative branch below therefore engages only for a direct caller handing a
+    relative ``Path``; it stays as this boundary's own guarantee that
+    ``CLAUDE_CONFIG_DIR`` is absolute whatever the caller passes.
+
+    THIS DOCSTRING IS THE CANONICAL STATEMENT of that deployment story. The other
+    sites that depend on it — ``journal.py::ReconciliationJournal.__init__``,
+    ``config/schema.py``'s ``sandbox_recon_writable_extras`` comment,
+    ``sandbox_guard.py``'s module docstring, and the two test modules — state
+    only their LOCAL invariant and cite back here, so a change to the deployment
+    story has exactly one place to be corrected.
+
+    The anchor for a relative input is ``Path.cwd()``. This function's job is
+    only to make the parent and the child NAME THE SAME DIRECTORY, which any
+    absolute anchor achieves; ``config.explore_codebase_root`` could relocate the
+    per-run config dirs away from the journal DB they are keyed to, and the
+    checkout root would make a direct caller's relative test path mkdir inside
+    the checkout. Capturing ``Path.cwd()`` per call is safe because ``os.chdir``
+    appears nowhere in ``shared/src``, ``orchestrator/src`` or
+    ``fused-memory/src``, so the process cwd is stable for the life of a run.
+
+    ``Path.cwd() / base`` rather than ``.resolve()`` / ``.absolute()`` is also
+    deliberate: it leaves an already-absolute input BYTE-IDENTICAL. ``.resolve()``
+    would additionally collapse symlink components, rewriting the string handed to
+    the child and to ``landlock-exec`` for every existing absolute deployment
+    (including the XDG ``RECONCILIATION_DATA_DIR`` that
+    ``orchestrator/src/orchestrator/mcp_lifecycle.py`` injects under a managed
+    spawn). Symlink resolution is not needed here anyway — ``sandbox_guard``
+    realpaths both sides of the containment comparison, which is the semantics
+    Landlock itself uses (it resolves rules by O_PATH fd).
+
+    ``data_dir`` is used AS GIVEN rather than re-wrapped in ``Path(...)``, which
+    honours the annotation instead of widening it to "anything os.PathLike".
+    Both production construction sites already pass a real ``Path``
+    (``fused-memory/src/fused_memory/server/main.py::resolve_data_dir`` returns
+    one, and ``fused-memory/scripts/repair_recon_citation.py`` builds
+    ``Path(config.reconciliation.data_dir)`` before handing it to
+    ``ReconciliationJournal``), so the wrap would buy nothing there — while
+    costing something real elsewhere: ``MagicMock``/``AsyncMock`` implement
+    ``__fspath__``, so ``Path(mock)`` silently coerces a mock journal's
+    ``data_dir`` into the RELATIVE path ``AsyncMock/mock.data_dir/<id>``, which
+    this function would then anchor at the cwd and ``TaskConfigDir.__init__``
+    would really ``mkdir(parents=True)`` — littering the repo with directories on
+    every suite run. Used as given, a mock's ``__truediv__`` returns another mock
+    and nothing reaches the filesystem, exactly as before this function
+    absolutized anything.
+
+    The ``isinstance(base, PurePath)`` guard extends that "leave a duck type
+    strictly alone" contract from the coercion to the CALL. Without it,
+    ``is_absolute()`` is invoked on the mock, and for the ``AsyncMock`` journal
+    the stage suite actually uses (``fused-memory/tests/reconciliation/test_base_stage_cutover.py``)
+    that returns a COROUTINE, not a bool: truthy, so the branch is skipped and no
+    directory is created, but the coroutine is never awaited and CPython emits
+    ``RuntimeWarning: coroutine 'AsyncMockMixin._execute_mock_call' was never
+    awaited``. ``orchestrator/pyproject.toml`` already promotes that exact
+    warning to an error in its ``filterwarnings``, so leaking one here would
+    plant an anti-pattern the repo has decided to fail on — and would break
+    fused-memory's suite the day it adopts the same filters. Testing the type
+    first also states the real precondition: absolutization is a ``PurePath``
+    operation, and anything else is none of this function's business.
+
+    Shape precedent:
+    ``fused-memory/src/fused_memory/reconciliation/harness.py::ReconciliationHarness._start_escalation_server``.
+    ``gc_run_config_dir`` inherits the fix for free — it derives its rmtree target
+    from this function.
     """
-    return data_dir / 'recon-config'
+    base = data_dir
+    if isinstance(base, PurePath) and not base.is_absolute():
+        base = Path.cwd() / base
+    return base / 'recon-config'
 
 
-def gc_run_config_dir(data_dir: Path, run_id: str) -> None:
+def run_config_dir_path(data_dir: Path, run_id: str) -> Path:
+    """Path of a run's per-run recon CLI config dir — a PURE derivation.
+
+    Names exactly ``TaskConfigDir(task_id=run_id, base_dir=recon_config_base_dir(data_dir)).path``
+    without constructing one. That is the point: ``TaskConfigDir.__init__``
+    mkdirs the dir and symlinks settings into it, so a caller that only needs
+    the path — ``gc_run_config_dir``, removing a dir that may never have been
+    created — would resurrect the very directory it is acting on.
+    """
+    return recon_config_base_dir(data_dir) / f'{CONFIG_DIR_PREFIX}{run_id}'
+
+
+def recon_transcript_archive_key(run_id: str) -> str:
+    """Key a recon run's transcripts are archived under, inside the archive root.
+
+    ``shared.transcript_archive`` files everything under a key it calls
+    ``task_id``, but a recon run has no task id — its run_id is a UUID — so the
+    run needs a key of its own. Its shape is fixed by two constraints:
+
+    - EXACTLY ONE path segment. The archive layout is ``<key>/<enc>/<sid>.jsonl``
+      and ``scripts/legibility/inventory.py::_archive_enc`` reads the
+      archive-root-relative ``parts[1]`` as ``<enc>``; a key with an extra
+      segment would land the archives on disk yet make them unenumerable.
+    - A ``recon-`` prefix. Recon shares the archive root with the
+      orchestrator, whose per-task dirs are bare numeric task ids; the prefix
+      keeps the two producers distinguishable.
+    """
+    return f'recon-{run_id}'
+
+
+def recon_archive_root(config: ReconciliationConfig) -> Path | None:
+    """Archive root for recon transcripts, or ``None`` when archival is off.
+
+    The SINGLE composition home for both consumers — the ``BaseStage.run``
+    producer hook and ``gc_run_config_dir``'s teardown hook — for the reason
+    ``shared/src/shared/transcript_archive.py::resolve_archive_root`` gives
+    (INV-5): a layout with one home in read and write but several in
+    composition can still drift.
+
+    Anchored at ``explore_codebase_root``, the cwd every recon stage runs in.
+    That makes it ONE root for every project_id this server reconciles: recon
+    is dark-factory's own agent work whatever project's memory it touches, so
+    its transcripts are mined as dark-factory's. A relative anchor resolves
+    against the process cwd; ``announce_recon_archive_root`` says so at start.
+
+    ``resolve_archive_root`` is deliberately not total. A malformed config
+    (e.g. a reload that lands a non-path root) disables archival with one
+    WARNING instead of raising on the recon dispatch path — the posture the
+    orchestrator's ``Harness._archive_available`` takes for the same call.
+    """
+    if not config.transcript_archive_enabled:
+        return None
+    try:
+        return resolve_archive_root(
+            config.explore_codebase_root, config.transcript_archive_root,
+        )
+    except (TypeError, ValueError) as exc:
+        logger.warning(
+            'recon transcript archival disabled: archive root unresolvable '
+            '(explore_codebase_root=%r transcript_archive_root=%r): %s: %s',
+            config.explore_codebase_root,
+            config.transcript_archive_root,
+            type(exc).__name__,
+            exc,
+        )
+        return None
+
+
+def announce_recon_archive_root(config: ReconciliationConfig) -> None:
+    """Log, once at harness start, where recon transcripts will be archived.
+
+    A relative root WARNs with its absolute resolution: it lands under the
+    process cwd, which ``docs/legibility/legibility.yaml``'s
+    ``agent_transcript_roots`` reach only when that cwd is the repo root.
+    """
+    archive_root = recon_archive_root(config)
+    if archive_root is None:
+        logger.info('recon transcript archival: disabled')
+    elif archive_root.is_absolute():
+        logger.info('recon transcript archive root: %s', archive_root)
+    else:
+        logger.warning(
+            'recon transcript archive root %s is relative '
+            '(explore_codebase_root=%r) and resolves against the process cwd '
+            'to %s; set PROJECT_ROOT so the legibility miner finds it',
+            archive_root,
+            config.explore_codebase_root,
+            Path.cwd() / archive_root,
+        )
+
+
+def gc_run_config_dir(
+    data_dir: Path, run_id: str, *, archive_root: Path | None,
+) -> None:
     """Remove a run's per-run recon CLI config dir, if present (task 2744).
 
-    ``TaskConfigDir(task_id=run_id, base_dir=recon_config_base_dir(data_dir)).path``
-    is ``recon_config_base_dir(data_dir) / f'claude-config-{run_id}'`` by
-    construction (config_dir.py's deterministic naming); this rmtrees exactly
-    that path. ``ignore_errors=True`` makes it a silent no-op when the dir was
-    never created (e.g. a run that short-circuited before any stage launch).
+    Targets ``run_config_dir_path(data_dir, run_id)``, the same path the
+    creator builds, and is a silent no-op when the dir was never created (e.g.
+    a run that short-circuited before any stage launch).
+
+    With an ``archive_root``, deletion is a step archival LICENSES rather than
+    one scheduled after it (task 3619's shape): ``archive_before_delete`` moves
+    each transcript into the archive and unlinks it only once the durable copy
+    exists, holding any it cannot archive. ``archive_root=None`` is the
+    DISABLED branch (``recon_archive_root`` returned None) and keeps the plain
+    rmtree. The keyword is required so every caller states which it means.
+
+    SYNCHRONOUS by contract and never raises: callers must not wrap it in
+    ``asyncio.to_thread``, since an ``await`` is a cancellation point and a
+    SIGTERM-driven teardown is exactly what would then skip it.
     """
-    shutil.rmtree(
-        recon_config_base_dir(data_dir) / f'claude-config-{run_id}',
-        ignore_errors=True,
+    config_dir = run_config_dir_path(data_dir, run_id)
+    if archive_root is None:
+        shutil.rmtree(config_dir, ignore_errors=True)
+        return
+    outcome = archive_before_delete(
+        config_dir, recon_transcript_archive_key(run_id), archive_root=archive_root,
     )
+    if outcome.archived or outcome.held:
+        logger.info(
+            'recon run %s transcripts archived before gc: archived=%d '
+            'already_current=%d held=%d archive_root=%s',
+            run_id,
+            outcome.archived,
+            outcome.already_current,
+            len(outcome.held),
+            archive_root,
+        )
 
 
 async def run_stage_via_cli(
@@ -391,8 +857,7 @@ async def run_stage_via_cli(
     output_schema: dict | None = None,
     session_id: str | None = None,
     config_dir: TaskConfigDir | None = None,
-    resume_session_id: str | None = None,
-    resume_delivers_prompt: bool = False,
+    ledger: InvocationLedger | None = None,
 ) -> StageResult:
     """Invoke a reconciliation stage via Claude CLI with MCP tools.
 
@@ -406,14 +871,13 @@ async def run_stage_via_cli(
     call sites keep today's behavior. BaseStage.run mints/persists the session
     before calling here (mint-before-spawn); this runner stays generic.
 
-    ``resume_session_id`` / ``resume_delivers_prompt`` (task 2717 σ) are likewise
-    forwarded straight to ``invoke_with_cap_retry`` for the startup
-    adopt-and-resume path: when set, the stage subprocess ``--resume``s an
-    in-flight session and (with ``resume_delivers_prompt=True``) receives the
-    caller's real ``payload`` as its continuation prompt instead of the generic
-    CRASH_RECOVERY placeholder. Both default to None/False so non-resume call
-    sites are byte-identical. BaseStage.run validates the transcript exists and
-    builds the recovery prompt before setting these; this runner stays generic.
+    ``config_dir`` is ALSO the sandbox grant (task 4003), not merely a CLI env
+    var: when confinement is on, ``config_dir.path`` is appended to the writable
+    extras so the CLI can actually write the transcript inside it. Setting
+    ``config_dir`` without that grant is the 2026-07-18 defect — the CLI is told
+    where to write and then denied the write, silently.
+
+    ``ledger`` is where the stage's invocations-ledger row lands; None writes none.
     """
     effective_model = model or config.agent_llm_model
     # Task 1989 (sweep verdict): kept at explore_codebase_root, NOT switched to
@@ -431,12 +895,63 @@ async def run_stage_via_cli(
     # Fail-CLOSED: if confinement is requested but no backend is available,
     # return an error StageResult WITHOUT calling invoke_with_cap_retry (never
     # run an unconfined agent when confinement is explicitly enabled).
+    #
+    # The PER-RUN config dir is granted as a computed writable extra (task 4003).
+    # Without it the CLI cannot write its session JSONL: from task 2744
+    # (2026-07-18) until 2026-08-11 the recon config dir lived under
+    # `recon_config_base_dir(data_dir)` — neither /tmp nor <cwd>/.task, i.e.
+    # outside every writable root either backend grants — so every recon stage
+    # silently produced zero transcripts, the liveness watchdog went inert
+    # (count_transcript_turns returned None) and every cap-retry force-freshed
+    # instead of resuming.
+    #
+    # It is the PER-RUN dir that is granted, NEVER `recon_config_base_dir(...)`:
+    # the base is the root under which EVERY run's `claude-config-<run_id>` (and
+    # its `.credentials.json`) lives, so granting it would hand every recon stage
+    # write access to every other run's OAuth credentials — a capability that
+    # does not exist today. (PRD open question 5 / D7, decided under task 4003's
+    # Amendment finding 1.) The append is deliberate: operator-configured
+    # `sandbox_recon_writable_extras` must survive, never be replaced.
+    #
+    # `TaskConfigDir.__init__` has already mkdir'ed the path by the time
+    # `BaseStage.run` reaches here, which is load-bearing: `landlock_exec._add_path`
+    # returns SILENTLY for a non-existent dir, so a grant issued before creation
+    # would be vacuous.
     sandbox_wrap: Callable[[list[str]], list[str]] | None = None
     if config.sandbox_recon_agents:
+        writable_extras = list(config.sandbox_recon_writable_extras)
+        if config_dir is not None:
+            writable_extras.append(str(config_dir.path))
+        else:
+            # The ONE configuration that bypasses the containment guard, so it
+            # must not be silent. With no config_dir there is nothing to grant
+            # and nothing to verify, and the CLI falls back to the process
+            # default ~/.claude — which NEITHER backend makes writable. That is
+            # the identical silent-transcript-loss shape this grant exists to
+            # end, merely arrived at from the other direction. Unreachable in
+            # production today (BaseStage.run always mints a TaskConfigDir), but
+            # nothing in this runner enforces that and the module's docstrings
+            # now advertise the invariant as machine-checked — so say so rather
+            # than let a future caller rediscover it by three weeks of silence.
+            logger.warning(
+                'Reconciliation sandboxing is ON but this stage was given no '
+                'config_dir: the CLI will fall back to the process-default '
+                '~/.claude, which is NOT in the sandbox writable set, so it can '
+                'write no session transcript (count_transcript_turns -> None, '
+                'liveness watchdog inert, every cap-retry force-freshes). The '
+                'containment check is skipped for this invocation because there '
+                'is no path to check. Pass a TaskConfigDir (BaseStage.run does) '
+                'or set reconciliation.sandbox_recon_agents=false.',
+            )
         try:
             sandbox_wrap = resolve_recon_sandbox_wrap(
                 effective_cwd,
-                list(config.sandbox_recon_writable_extras),
+                writable_extras,
+                # Hand the dir back to the guard so the grant above is VERIFIED,
+                # not merely intended: if a future edit drops the append, the
+                # guard fails closed instead of launching a stage that can never
+                # write a transcript. Policy here, verification there.
+                config_dir=config_dir.path if config_dir is not None else None,
             )
         except RemediationSandboxUnavailable as exc:
             logger.error(
@@ -447,6 +962,7 @@ async def run_stage_via_cli(
                 error=str(exc),
                 duration_ms=duration_ms,
                 model=effective_model,
+                declared_outcome=StageAgentOutcome.not_launched,
             )
 
     try:
@@ -461,15 +977,20 @@ async def run_stage_via_cli(
             max_budget_usd=5.0,
             disallowed_tools=disallowed_tools,
             mcp_config=mcp_config,
+            # Only the servers BaseStage._build_mcp_config names, never the checkout's .mcp.json.
+            strict_mcp_config=True,
+            setting_sources=list(RECONCILIATION_CLI_SETTING_SOURCES),
+            env_overrides=dict(RECONCILIATION_CLI_ENV_OVERRIDES),
+            work_class=RECONCILIATION_WORK_CLASS,
             output_schema=output_schema,  # PRD γ: pass None straight through when caller opts out
             permission_mode='bypassPermissions',
             timeout_seconds=float(config.stage_timeout_seconds),
-            cap_wait_sanity_secs=_RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS,
+            startup_grace_secs=config.stage_startup_grace_secs,
+            cap_wait_sanity_secs=RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS,
             sandbox_wrap=sandbox_wrap,
             session_id=session_id,
             config_dir=config_dir,
-            resume_session_id=resume_session_id,
-            resume_delivers_prompt=resume_delivers_prompt,
+            **ledger_invoke_kwargs(ledger),
         )
     except AllAccountsCappedException:
         logger.warning(
@@ -483,6 +1004,7 @@ async def run_stage_via_cli(
             error=str(e),
             duration_ms=duration_ms,
             model=effective_model,
+            declared_outcome=StageAgentOutcome.failed,
         )
 
     duration_ms = int(time.monotonic() * 1000) - start_ms
@@ -493,13 +1015,27 @@ async def run_stage_via_cli(
     return StageResult(
         report=report,
         llm_calls=agent_result.turns,
-        tokens_used=0,  # CLI doesn't expose token counts
+        tokens_used=input_output_tokens(agent_result),
+        cache_read_tokens=agent_result.cache_read_tokens or 0,
+        cache_create_tokens=agent_result.cache_create_tokens or 0,
         cost_usd=agent_result.cost_usd,
         duration_ms=duration_ms,
         model=effective_model,
         success=agent_result.success,
         error='' if agent_result.success else (agent_result.output or 'Agent failed'),
+        declared_outcome=_classify_agent_outcome(agent_result),
     )
+
+
+# The stats flag on a report whose agent reply was prose rather than a JSON report.
+RAW_TEXT_FALLBACK_STAT = 'raw_text_fallback'
+_FALLBACK_SUMMARY_CHARS = 2000
+
+
+def _raw_text_fallback_report(output: str) -> dict:
+    clip = elide_text(output, _FALLBACK_SUMMARY_CHARS, field='summary')
+    stats = {RAW_TEXT_FALLBACK_STAT: True, **truncation_fields(clip.fact)}
+    return {'summary': clip.text, 'flagged_items': [], 'stats': stats}
 
 
 def _normalize_report(report: dict) -> dict:
@@ -559,8 +1095,7 @@ def _extract_report(result: AgentResult) -> dict:
         except json.JSONDecodeError:
             pass
 
-        # Fallback: wrap raw text as summary
-        return {'summary': result.output[:2000]}
+        return _raw_text_fallback_report(result.output)
 
     # PRD γ: return {} instead of a placeholder so BaseStage.run's recon_report
     # fallback path (empty assembled dict) triggers cleanly rather than masking

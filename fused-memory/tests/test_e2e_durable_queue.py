@@ -1,45 +1,77 @@
 """E2E + concurrency stress tests — MemoryService wired to a real DurableWriteQueue.
 
 Only Graphiti/Mem0 backends are mocked; the queue uses real SQLite via tmp_path.
+integrated_service's queue commits skip fsync (synchronous=OFF), so its drains
+are not bounded by host-disk latency; see
+test_integrated_service_queue_commits_do_not_wait_on_the_disk.
 """
 
 from __future__ import annotations
 
 import asyncio
+import collections
+import json
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import pytest_asyncio
-from _fm_helpers import poll_until
+from _fm_helpers import mock_memory_backends
+from _fm_polling import poll_until
+from _queued_write_fixtures import insert_raw_row, queued
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
+from fused_memory.middleware import dead_letter_escalator
+from fused_memory.middleware.dead_letter_escalator import (
+    _REPORTED_TO_CALLER,
+    _REPORTED_TO_CALLER_DEFAULT,
+)
 from fused_memory.models.enums import SourceStore
+from fused_memory.models.memory import Mem0WriteState, render_add_memory_message
+from fused_memory.reconciliation.stage_stats import derive_stage_stats
 from fused_memory.services.memory_service import MemoryService
+from fused_memory.services.queued_writes import QueueOperation
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 
 @pytest_asyncio.fixture
 async def integrated_service(mock_config):
     """MemoryService with real DurableWriteQueue, mocked Graphiti/Mem0."""
-    svc = MemoryService(mock_config)
-
-    # Mock backends so we never hit real FalkorDB/Qdrant
-    svc.graphiti = MagicMock()
-    svc.graphiti.initialize = AsyncMock()
-    svc.graphiti.add_episode = AsyncMock(return_value=None)
-    svc.graphiti.close = AsyncMock()
-    svc.graphiti._require_client = MagicMock()
-
-    svc.mem0 = MagicMock()
-    svc.mem0.search = AsyncMock(return_value={'results': []})
-    svc.mem0.add = AsyncMock(return_value={'results': [{'id': 'mem0-1'}]})
-    svc.mem0.get_all = AsyncMock(return_value={'results': []})
-    svc.mem0.delete = AsyncMock(return_value={'message': 'deleted'})
+    svc = mock_memory_backends(MemoryService(mock_config))
 
     # Real initialize — creates DurableWriteQueue with real SQLite
     await svc.initialize()
+    queue = svc.durable_queue
+    assert queue is not None, 'MemoryService.initialize() built no DurableWriteQueue'
+    # Rationale: test_integrated_service_queue_commits_do_not_wait_on_the_disk
+    async with queue._require_access().write() as db:
+        await db.execute('PRAGMA synchronous=OFF')
 
     yield svc
 
     await svc.close()
+
+
+@pytest.mark.asyncio
+async def test_integrated_service_queue_commits_do_not_wait_on_the_disk(
+    integrated_service,
+):
+    """integrated_service's queue runs with PRAGMA synchronous=OFF.
+
+    Tests on this fixture bound their drains by wall clock. Under
+    synchronous=FULL every queue commit is an fsync, whose latency is set by
+    whatever else is writing to the host disk, not by the code under test.
+    No test on this fixture kills the process, so none needs power-loss
+    durability.
+    """
+    rows = await integrated_service.durable_queue._require_access().read_all(
+        'PRAGMA synchronous'
+    )
+    assert rows[0][0] == 0, (
+        f'integrated_service queue reports PRAGMA synchronous={rows[0][0]}, '
+        'expected 0 (OFF): its drains would wait on host-disk fsync latency'
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -58,7 +90,7 @@ class TestIntegrationFlow:
             category='entities_and_relations',
             project_id='test',
         )
-        assert SourceStore.graphiti in result.stores_written
+        assert SourceStore.graphiti in result.stores_queued
 
         # Poll until the worker has processed the item, instead of a fixed
         # sleep that can race under full-suite CPU load.
@@ -94,8 +126,16 @@ class TestIntegrationFlow:
         assert stats['counts'].get('completed', 0) == 0
 
     @pytest.mark.asyncio
-    async def test_add_episode_uuid_survives_full_flow(self, integrated_service):
-        """add_episode uuid passes through queue serialization to graphiti.add_episode."""
+    async def test_add_episode_reaches_backend_with_no_uuid_full_flow(
+        self, integrated_service
+    ):
+        """The full enqueue/serialize/drain path calls graphiti.add_episode with uuid=None.
+
+        Retargeted from the old "uuid survives the full flow" contract (task
+        3561): surviving the flow was the DEFECT. graphiti_core reads a
+        caller-supplied uuid as "LOAD this existing episode", so anything but
+        None here is NodeNotFoundError once the write actually executes.
+        """
         svc = integrated_service
         svc.graphiti.add_episode.return_value = None
 
@@ -113,18 +153,21 @@ class TestIntegrationFlow:
         )
         svc.graphiti.add_episode.assert_called_once()
         call_kwargs = svc.graphiti.add_episode.call_args[1]
-        assert call_kwargs.get('uuid') == result.episode_id
+        assert call_kwargs.get('uuid') is None
 
     @pytest.mark.asyncio
     async def test_add_episode_processed_with_callback(self, integrated_service):
         """add_episode -> enqueued with dual_write_episode callback -> graphiti called -> facts enqueued for mem0."""
         svc = integrated_service
 
-        # graphiti.add_episode returns result with entity_edges for dual-write
+        # graphiti.add_episode returns a result with edges for dual-write. `edges`
+        # must be set explicitly: _dual_write_callback reads it first, and a
+        # MagicMock would auto-create a truthy, empty-iterating one.
+        fact = 'Always format code with black'  # preferences -> mem0 primary
         mock_result = MagicMock()
-        edge = MagicMock()
-        edge.fact = 'Always format code with black'  # preferences -> mem0 primary
-        mock_result.entity_edges = [edge]
+        mock_result.edges = [
+            MagicMock(fact=fact, source_node_uuid='', target_node_uuid='')
+        ]
         svc.graphiti.add_episode.return_value = mock_result
 
         result = await svc.add_episode(
@@ -133,20 +176,21 @@ class TestIntegrationFlow:
         )
         assert result.status == 'queued'
 
-        # Poll until at least the episode item has completed (worker +
-        # callback + mem0 classify_and_add may enqueue further items),
-        # instead of a fixed sleep that can race under full-suite CPU load.
-        async def _completed():
+        # Poll until both the episode item and the mem0_classify_and_add item
+        # its callback enqueued have completed, instead of a fixed sleep that
+        # can race under full-suite CPU load.
+        async def _both_completed():
             s = await svc.durable_queue.get_stats()
-            return s if s['counts'].get('completed', 0) >= 1 else None
+            return s if s['counts'].get('completed', 0) >= 2 else None
 
-        stats = await poll_until(_completed, message='timed out waiting for the episode item to complete')
+        stats = await poll_until(
+            _both_completed,
+            message='timed out waiting for the episode and mem0 fact items to complete',
+        )
         svc.graphiti.add_episode.assert_called_once()
-        # The callback enqueues mem0_classify_and_add items which the queue processes.
-        # The fact "Always format code with black" should classify as preferences_and_norms
-        # (mem0 primary) and trigger a mem0.add call.
-        # At minimum the episode item completed; mem0 items may also be completed
-        assert stats['counts'].get('completed', 0) >= 1
+        assert stats['counts'] == {'completed': 2}
+        svc.mem0.add.assert_awaited_once()
+        assert svc.mem0.add.await_args.kwargs['content'] == fact
 
     @pytest.mark.asyncio
     async def test_dual_write_both_paths(self, integrated_service):
@@ -159,7 +203,7 @@ class TestIntegrationFlow:
             project_id='test',
             dual_write=True,
         )
-        assert SourceStore.graphiti in result.stores_written
+        assert SourceStore.graphiti in result.stores_queued
         assert SourceStore.mem0 in result.stores_written
 
         # Poll until the queue has processed both writes, instead of a fixed
@@ -321,14 +365,7 @@ class TestFailureRecovery:
     async def test_crash_recovery(self, mock_config):
         """Enqueue item, close before processing, new service recovers and processes it."""
         # Service 1: enqueue but close quickly
-        svc1 = MemoryService(mock_config)
-        svc1.graphiti = MagicMock()
-        svc1.graphiti.initialize = AsyncMock()
-        svc1.graphiti.add_episode = AsyncMock(return_value=None)
-        svc1.graphiti.close = AsyncMock()
-        svc1.graphiti._require_client = MagicMock()
-        svc1.mem0 = MagicMock()
-        svc1.mem0.add = AsyncMock(return_value={'results': []})
+        svc1 = mock_memory_backends(MemoryService(mock_config))
 
         await svc1.initialize()
 
@@ -342,14 +379,8 @@ class TestFailureRecovery:
         await svc1.close()
 
         # Service 2: same data_dir -> should recover the item
-        svc2 = MemoryService(mock_config)
-        svc2.graphiti = MagicMock()
-        svc2.graphiti.initialize = AsyncMock()
+        svc2 = mock_memory_backends(MemoryService(mock_config))
         svc2.graphiti.add_episode = AsyncMock(return_value={'ok': True})
-        svc2.graphiti.close = AsyncMock()
-        svc2.graphiti._require_client = MagicMock()
-        svc2.mem0 = MagicMock()
-        svc2.mem0.add = AsyncMock(return_value={'results': []})
 
         await svc2.initialize()
         assert svc2.durable_queue is not None
@@ -468,8 +499,9 @@ class TestConcurrencyStress:
         svc = integrated_service
         svc.graphiti.add_episode = AsyncMock(return_value={'ok': True})
 
+        projects = ['alpha', 'beta', 'gamma']
         tasks = []
-        for project in ['alpha', 'beta', 'gamma']:
+        for project in projects:
             for i in range(20):
                 tasks.append(
                     svc.add_memory(
@@ -494,6 +526,13 @@ class TestConcurrencyStress:
         )
         assert stats['counts'].get('completed', 0) == 60
         assert svc.graphiti.add_episode.call_count == 60
+
+        for project in projects:
+            project_stats = await svc.durable_queue.get_stats(group_id=project)
+            assert project_stats['counts'] == {'completed': 20}, project
+        assert collections.Counter(
+            c.kwargs['group_id'] for c in svc.graphiti.add_episode.call_args_list
+        ) == {p: 20 for p in projects}
 
     @pytest.mark.asyncio
     @pytest.mark.timeout(30)
@@ -545,13 +584,13 @@ class TestConcurrencyStress:
         call_index = 0
         lock = asyncio.Lock()
 
-        async def selective_fail(operation, payload):
+        async def selective_fail(value):
             nonlocal call_index
             async with lock:
                 _ = call_index
                 call_index += 1
-            # Items with index 0-based, every 5th one has 'fail' in content
-            if payload.get('should_fail'):
+            # Every 5th item carries the ' fail' marker in its content
+            if value.content.endswith(' fail'):
                 raise RuntimeError('permanent failure')
             return {'ok': True}
 
@@ -560,20 +599,15 @@ class TestConcurrencyStress:
 
         tasks = []
         for i in range(50):
-            should_fail = (i % 5 == 0)
+            marker = ' fail' if i % 5 == 0 else ''
             tasks.append(
-                svc.durable_queue.enqueue(
-                    group_id='test',
-                    operation='add_memory_graphiti',
-                    payload={
+                svc.durable_queue.enqueue(queued('add_memory_graphiti', {
                         'name': f'memory_{i}',
-                        'content': f'item {i}',
+                        'content': f'item {i}{marker}',
                         'source': 'text',
                         'group_id': 'test',
                         'source_description': 'test',
-                        'should_fail': should_fail,
-                    },
-                )
+                    }, group_id='test'))
             )
         await asyncio.gather(*tasks)
 
@@ -613,16 +647,12 @@ class TestQueueStats:
         svc.graphiti.add_episode = slow_graphiti
 
         for i in range(10):
-            await svc.durable_queue.enqueue(
-                group_id='test',
-                operation='add_episode',
-                payload={
+            await svc.durable_queue.enqueue(queued('add_episode', {
                     'content': f'item {i}',
                     'group_id': 'test',
                     'name': f'ep{i}',
                     'source': 'text',
-                },
-            )
+                }, group_id='test'))
 
         # Poll until processing has genuinely started (at least one item has
         # left 'pending'), instead of a fixed sleep, so the mid-flight
@@ -657,16 +687,12 @@ class TestQueueStats:
         svc.graphiti.add_episode = AsyncMock(return_value={'ok': True})
 
         for i in range(15):
-            await svc.durable_queue.enqueue(
-                group_id='test',
-                operation='add_episode',
-                payload={
+            await svc.durable_queue.enqueue(queued('add_episode', {
                     'content': f'item {i}',
                     'group_id': 'test',
                     'name': f'ep{i}',
                     'source': 'text',
-                },
-            )
+                }, group_id='test'))
 
         # Poll until all items complete, delegating to the shared helper
         # (task 2377) instead of a hand-rolled bounded loop.
@@ -680,3 +706,605 @@ class TestQueueStats:
             message='timed out waiting for all 15 items to complete',
         )
         assert stats['counts'].get('completed', 0) == 15
+
+
+@pytest.mark.asyncio
+async def test_durable_queue_wired_with_terminal_hook(integrated_service):
+    """The construction site actually passes the terminal write-back hook."""
+    svc = integrated_service
+    assert (
+        svc.durable_queue._on_terminal
+        == svc._record_queue_terminal_outcome
+    )
+
+
+# ---------------------------------------------------------------------------
+# Terminal queue outcome written back to write_ops (task 3582)
+#
+# Before this, `write_ops.success = 1` was stamped the instant enqueue()
+# committed, so a row for a write with a 0% landing rate was byte-for-byte
+# indistinguishable from a row for a write that landed. That is what made the
+# esc-3561-3 blast radius unknowable.
+# ---------------------------------------------------------------------------
+
+
+@pytest_asyncio.fixture
+async def journaled_service(mock_config, tmp_path):
+    """integrated_service + a real WriteJournal, wired in PRODUCTION order.
+
+    server/main.py calls initialize() before set_write_journal(), so the queue
+    (and its on_terminal hook) is built while the journal is still None.
+    """
+    from fused_memory.services.write_journal import WriteJournal
+
+    # Same mocked-backend definition as integrated_service — deliberately not a
+    # second copy of it.
+    svc = mock_memory_backends(MemoryService(mock_config))
+
+    await svc.initialize()
+
+    journal = WriteJournal(tmp_path / 'wj_e2e')
+    await journal.initialize()
+    svc.set_write_journal(journal)
+
+    yield svc, journal
+
+    await svc.close()
+    await journal.close()
+
+
+async def _sole_queue_write_op_id(svc) -> str:
+    """Recover the enqueued `_write_op_id` — the caller never sees it."""
+    import json
+
+    db = svc.durable_queue._require_access().connection
+    async with db.execute('SELECT payload FROM write_queue ORDER BY id') as cursor:
+        rows = await cursor.fetchall()
+    ids = [
+        json.loads(r[0])['_write_op_id']
+        for r in rows
+        if '_write_op_id' in json.loads(r[0])
+    ]
+    assert len(ids) == 1, f'expected exactly one queued write, got {ids}'
+    return ids[0]
+
+
+async def _poll_dead(svc, expected: int = 1) -> None:
+    async def _dead():
+        s = await svc.durable_queue.get_stats()
+        return s['counts'].get('dead', 0) >= expected
+
+    await poll_until(
+        _dead, timeout=20.0, message='timed out waiting for the item to dead-letter'
+    )
+
+
+class TestTerminalOutcomeWrittenBack:
+    @pytest.mark.asyncio
+    async def test_dead_lettered_add_episode_row_shows_dead(self, journaled_service):
+        svc, journal = journaled_service
+        svc.graphiti.add_episode = AsyncMock(side_effect=RuntimeError('always fails'))
+
+        await svc.add_episode(content='an episode that never lands', project_id='test')
+        write_op_id = await _sole_queue_write_op_id(svc)
+        await _poll_dead(svc)
+
+        async def _stamped():
+            row = await journal.get_write_op(write_op_id)
+            return row is not None and row['terminal_status'] is not None
+
+        await poll_until(
+            _stamped, timeout=20.0, message='terminal outcome never reached write_ops'
+        )
+
+        # THE acceptance signal: this row ALONE, no backend_ops join.
+        row = await journal.get_write_op(write_op_id)
+        assert row['terminal_status'] == 'dead'
+        assert 'always fails' in row['terminal_error']
+        # ...and "the enqueue was accepted" is still recorded, unchanged.
+        assert row['success'] == 1
+
+    @pytest.mark.asyncio
+    async def test_dead_lettered_add_memory_graphiti_row_shows_dead(
+        self, journaled_service
+    ):
+        """Queue-wide, not add_episode-specific."""
+        svc, journal = journaled_service
+        svc.graphiti.add_episode = AsyncMock(side_effect=RuntimeError('always fails'))
+
+        await svc.add_memory(
+            content='The auth service depends on Redis',
+            category='entities_and_relations',
+            project_id='test',
+        )
+        write_op_id = await _sole_queue_write_op_id(svc)
+        await _poll_dead(svc)
+
+        async def _stamped():
+            row = await journal.get_write_op(write_op_id)
+            return row is not None and row['terminal_status'] == 'dead'
+
+        await poll_until(
+            _stamped, timeout=20.0, message='terminal outcome never reached write_ops'
+        )
+        row = await journal.get_write_op(write_op_id)
+        assert row['terminal_status'] == 'dead'
+        assert row['success'] == 1
+
+    @pytest.mark.asyncio
+    async def test_completed_write_row_shows_completed(self, journaled_service):
+        svc, journal = journaled_service
+
+        await svc.add_episode(content='an episode that lands', project_id='test')
+        write_op_id = await _sole_queue_write_op_id(svc)
+
+        async def _completed():
+            row = await journal.get_write_op(write_op_id)
+            return row is not None and row['terminal_status'] == 'completed'
+
+        await poll_until(
+            _completed, timeout=20.0, message='write never stamped completed'
+        )
+        row = await journal.get_write_op(write_op_id)
+        assert row['terminal_status'] == 'completed'
+        assert row['terminal_error'] is None
+        backend_ops = await journal.get_backend_ops_for_write_op(write_op_id)
+        assert [(op['backend'], op['success']) for op in backend_ops] == [
+            ('graphiti', 1)
+        ], 'expected exactly one successful graphiti backend_ops row for this write'
+        assert journal.journal_drop_stats()['dropped_total'] == 0
+
+    @pytest.mark.asyncio
+    async def test_terminal_state_survives_dead_letter_deletion(
+        self, journaled_service
+    ):
+        """The precise failure mode from the esc-3561-3 triage.
+
+        26 of 28 dead queue rows had been removed by delete_dead_letters, so
+        write_queue.db alone reported a denominator of 2 instead of 28. The
+        journal must keep the truth after the queue row is gone.
+        """
+        svc, journal = journaled_service
+        svc.graphiti.add_episode = AsyncMock(side_effect=RuntimeError('always fails'))
+
+        await svc.add_episode(content='an episode that never lands', project_id='test')
+        write_op_id = await _sole_queue_write_op_id(svc)
+        await _poll_dead(svc)
+
+        async def _stamped():
+            row = await journal.get_write_op(write_op_id)
+            return row is not None and row['terminal_status'] == 'dead'
+
+        await poll_until(_stamped, timeout=20.0, message='never stamped dead')
+
+        dead = await svc.durable_queue.get_dead_items()
+        assert len(dead) == 1
+        result = await svc.durable_queue.delete_dead(
+            dead[0]['group_id'], [dead[0]['id']]
+        )
+        assert result['deleted'] == [dead[0]['id']]
+
+        row = await journal.get_write_op(write_op_id)
+        assert row['terminal_status'] == 'dead'
+        assert 'always fails' in row['terminal_error']
+
+    @pytest.mark.asyncio
+    async def test_replayed_dead_letter_row_shows_completed(self, journaled_service):
+        """Last-write-wins is the correct final truth after a good replay."""
+        svc, journal = journaled_service
+        svc.graphiti.add_episode = AsyncMock(side_effect=RuntimeError('always fails'))
+
+        await svc.add_episode(content='an episode that eventually lands',
+                              project_id='test')
+        write_op_id = await _sole_queue_write_op_id(svc)
+        await _poll_dead(svc)
+
+        async def _stamped_dead():
+            row = await journal.get_write_op(write_op_id)
+            return row is not None and row['terminal_status'] == 'dead'
+
+        await poll_until(_stamped_dead, timeout=20.0, message='never stamped dead')
+
+        svc.graphiti.add_episode = AsyncMock(return_value=None)
+        assert await svc.durable_queue.replay_dead() >= 1
+
+        async def _stamped_completed():
+            row = await journal.get_write_op(write_op_id)
+            return row is not None and row['terminal_status'] == 'completed'
+
+        await poll_until(
+            _stamped_completed, timeout=20.0,
+            message='replayed write never re-stamped completed',
+        )
+        row = await journal.get_write_op(write_op_id)
+        assert row['terminal_status'] == 'completed'
+        assert row['terminal_error'] is None
+
+    @pytest.mark.asyncio
+    async def test_terminal_outcome_survives_an_arbitrarily_slow_producer(
+        self, journaled_service
+    ):
+        """The unbounded-window case, end to end.
+
+        add_memory enqueues the Graphiti leg immediately but journals its
+        Layer-1 write_ops row only after the SYNCHRONOUS Mem0 leg — a real
+        network/LLM round trip whose width is unbounded, and which routinely
+        outlasts the queue worker. Here Mem0 is held open until the terminal
+        write-back has provably landed, so the producer's row is written
+        strictly afterwards. A time-boxed retry ladder would drop the outcome
+        exactly in this case — the slow-producer case — which is precisely when
+        an operator most needs it.
+        """
+        svc, journal = journaled_service
+
+        stamped = asyncio.Event()
+        original_record = journal.record_terminal_outcome
+
+        async def _record_then_release(**kwargs):
+            result = await original_record(**kwargs)
+            stamped.set()
+            return result
+
+        journal.record_terminal_outcome = _record_then_release
+
+        async def _mem0_add_slower_than_the_queue(*_args, **_kwargs):
+            await asyncio.wait_for(stamped.wait(), timeout=20.0)
+            return {'results': [{'id': 'mem0-1'}]}
+
+        svc.mem0.add = AsyncMock(side_effect=_mem0_add_slower_than_the_queue)
+
+        await svc.add_memory(
+            content='The auth service depends on Redis',
+            category='entities_and_relations',
+            project_id='test',
+            dual_write=True,
+        )
+        write_op_id = await _sole_queue_write_op_id(svc)
+
+        row = await journal.get_write_op(write_op_id)
+        assert row is not None
+        # The producer's Layer-1 fields landed...
+        assert row['operation'] == 'add_memory'
+        assert row['success'] == 1
+        # ...on top of a terminal outcome that got there first, without
+        # clobbering it.
+        assert row['terminal_status'] == 'completed'
+        assert row['terminal_error'] is None
+
+
+class TestAddMemoryReportsGraphitiQueued:
+    @pytest.mark.asyncio
+    async def test_a_dual_write_reports_mem0_written_and_graphiti_queued(
+        self, journaled_service
+    ):
+        svc, journal = journaled_service
+
+        response = await svc.add_memory(
+            content='We decided to use PostgreSQL for its JSON support',
+            category='decisions_and_rationale',
+            project_id='test',
+            dual_write=True,
+        )
+
+        assert response.stores_written == [SourceStore.mem0]
+        assert response.stores_queued == [SourceStore.graphiti]
+        assert response.stores_pending_retry == []
+        assert response.mem0_write_state is Mem0WriteState.LANDED
+        assert response.message == render_add_memory_message(
+            stores_written=[SourceStore.mem0], stores_queued=[SourceStore.graphiti]
+        )
+        row = await journal.get_write_op(await _sole_queue_write_op_id(svc))
+        assert row is not None
+        result_summary = json.loads(row['result_summary'])
+        assert result_summary['stores_queued'] == ['graphiti']
+        assert result_summary['stores'] == ['mem0']
+
+    @pytest.mark.asyncio
+    async def test_a_real_graphiti_only_add_memory_counts_as_graphiti_writes_queued(
+        self, journaled_service
+    ):
+        svc, journal = journaled_service
+        stage_agent_id = 'recon-stage-memory_consolidator'
+        causation_id = 'run-9147-graphiti-only'
+
+        await svc.add_memory(
+            content='The auth service depends on Redis',
+            category='entities_and_relations',
+            project_id='test',
+            agent_id=stage_agent_id,
+            causation_id=causation_id,
+        )
+        write_op_id = await _sole_queue_write_op_id(svc)
+
+        async def _completed():
+            row = await journal.get_write_op(write_op_id)
+            return row is not None and row['terminal_status'] == 'completed'
+
+        await poll_until(_completed, timeout=20.0, message='write never stamped completed')
+
+        ops = await journal.get_ops_by_causation(causation_id)
+        assert derive_stage_stats(ops, stage_agent_id)['graphiti_writes_queued'] == 1
+
+
+# ---------------------------------------------------------------------------
+# THE ACCEPTANCE TEST (task 3583).
+#
+# The property under test is not "a dead-letter is recorded" — task 3582
+# already established that, on `write_ops.terminal_status`. It is that the
+# failure REACHES someone: observable by reading the escalation queue ALONE,
+# with write_queue.db and write_journal.db never opened. Those two are exactly
+# what an operator does not have once routine `delete_dead_letters` cleanup has
+# run, which is how 28 permanently-failed writes went unnoticed for three and a
+# half months in the esc-3561-3 investigation.
+# ---------------------------------------------------------------------------
+
+
+def _filed_escalations(root):
+    """The parsed escalation payloads under ``{root}/data/escalations``."""
+    import json
+
+    queue_dir = root / 'data' / 'escalations'
+    if not queue_dir.exists():
+        return []
+    return [json.loads(p.read_text()) for p in sorted(queue_dir.glob('esc-*.json'))]
+
+
+async def _poll_for_escalation(root):
+    """Wait for the alarm to land, reading ONLY the escalation queue."""
+    return await poll_until(
+        lambda: _filed_escalations(root) or None,
+        timeout=20.0,
+        interval=0.05,
+        message=f'no escalation was ever filed under {root}/data/escalations',
+    )
+
+
+class TestAddEpisodeDeadLetterIsObservable:
+    @pytest.mark.asyncio
+    async def test_a_dead_lettered_add_episode_reaches_the_escalation_queue(
+        self, journaled_service, tmp_path,
+    ):
+        svc, _journal = journaled_service
+        # The esc-3561-3 shape: NodeNotFoundError, one per write, each naming a
+        # different uuid — which is why the fold keys on the class, not the text.
+        svc.graphiti.add_episode = AsyncMock(
+            side_effect=RuntimeError('node 0e1d2c3b-aaaa-bbbb-cccc-444455556666 not found')
+        )
+        # The fixture deliberately does NOT do this, mirroring server/main.py's
+        # initialize()-then-inject order. Without it the escalation correctly
+        # refuses to file rather than guessing a root.
+        svc.set_known_projects({'main': str(tmp_path)})
+
+        response = await svc.add_episode(
+            content='an episode the caller was told had been accepted',
+            project_id='main',
+        )
+
+        # The synchronous contract is deliberately UNCHANGED: hedging the word
+        # would not fix a caller that gets 'queued' and later gets nothing.
+        assert response.status.value == 'queued'
+        episode_id = response.episode_id
+
+        filed = await _poll_for_escalation(tmp_path)
+
+        assert len(filed) == 1, f'expected one alarm, got {filed}'
+        record = filed[0]
+        assert record['category'] == 'durable_write_dead_letter'
+        assert "operation='add_episode'" in record['detail'], record['detail']
+        assert 'add_episode' in record['summary'], record['summary']
+        assert "project_id='main'" in record['detail'], record['detail']
+
+        # The line that makes this actionable rather than merely alarming: it
+        # says not only that a write died but that a caller ACTED on a success
+        # that will never be true, and names the id that caller holds.
+        assert 'reported_to_caller=' in record['detail'], record['detail']
+        assert _REPORTED_TO_CALLER['add_episode'].text in record['detail'], (
+            record['detail']
+        )
+        assert episode_id in record['detail'], (
+            'the returned episode_id must appear verbatim so an operator can '
+            'tie the alarm back to the call that was lied to'
+        )
+
+    @pytest.mark.asyncio
+    async def test_nothing_but_the_escalation_queue_was_needed(
+        self, journaled_service, tmp_path,
+    ):
+        """The negative half of the property: the alarm is self-sufficient.
+
+        Deletes BOTH sqlite files before asserting, reproducing the state an
+        operator is actually in after `delete_dead_letters` — and then reads
+        the escalation and finds the operation, the project, the attempt count
+        and the lost content still there.
+        """
+        svc, journal = journaled_service
+        svc.graphiti.add_episode = AsyncMock(side_effect=RuntimeError('always fails'))
+        svc.set_known_projects({'main': str(tmp_path)})
+
+        await svc.add_episode(
+            content='the only surviving copy of this content', project_id='main',
+        )
+        await _poll_for_escalation(tmp_path)
+
+        await svc.close()
+        await journal.close()
+        for db in tmp_path.rglob('*.db*'):
+            db.unlink()
+
+        record = _filed_escalations(tmp_path)[0]
+        assert "operation='add_episode'" in record['detail'], record['detail']
+        assert "project_id='main'" in record['detail'], record['detail']
+        assert 'attempts=' in record['detail'], record['detail']
+        assert 'the only surviving copy of this content' in record['detail'], (
+            'the content preview is the last trace of what was lost'
+        )
+
+
+class TestAddMemoryGraphitiLegDeadLetterIsObservable:
+    """The asymmetry the task names, and the regression that anchors it.
+
+    `add_memory`'s Mem0 leg is a direct synchronous call, so its failure is
+    visible to the caller immediately. Its Graphiti leg is reported in
+    `stores_queued` at enqueue time: durably accepted, not yet in the graph.
+    `add_memory` structurally CANNOT wait for the Graphiti write (that is the
+    whole purpose of the queue), so its eventual death is pushed as this
+    escalation.
+    """
+
+    @pytest.mark.asyncio
+    async def test_the_caller_is_told_graphiti_was_queued_at_enqueue_time(
+        self, journaled_service, tmp_path,
+    ):
+        """The claim the response makes, and the one the alarm says it made."""
+        from fused_memory.models.enums import MemoryCategory
+
+        svc, _journal = journaled_service
+        svc.set_known_projects({'main': str(tmp_path)})
+
+        response = await svc.add_memory(
+            content='a decision the caller was told had been recorded',
+            category=MemoryCategory.decisions_and_rationale.value,
+            project_id='main',
+        )
+
+        assert SourceStore.graphiti in response.stores_queued, (
+            'reported at ENQUEUE time as durably queued'
+        )
+        assert SourceStore.graphiti not in response.stores_written, (
+            'an enqueue is not a write to the graph'
+        )
+        lists_holding_graphiti = [
+            f
+            for f in ('stores_written', 'stores_queued', 'stores_pending_retry')
+            if SourceStore.graphiti in getattr(response, f)
+        ]
+        assert lists_holding_graphiti == ['stores_queued']
+        claim = _REPORTED_TO_CALLER[QueueOperation.ADD_MEMORY_GRAPHITI].text
+        assert lists_holding_graphiti[0] in claim, (
+            'the dead-letter alarm must name the claim the response actually made'
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_dead_lettered_graphiti_leg_reaches_the_escalation_queue(
+        self, journaled_service, tmp_path,
+    ):
+        from fused_memory.models.enums import MemoryCategory
+
+        svc, _journal = journaled_service
+        svc.graphiti.add_episode = AsyncMock(
+            side_effect=RuntimeError('node 0e1d2c3b-aaaa-bbbb-cccc-444455556666 not found')
+        )
+        svc.set_known_projects({'main': str(tmp_path)})
+
+        response = await svc.add_memory(
+            content='a decision the caller was told had been recorded',
+            category=MemoryCategory.decisions_and_rationale.value,
+            project_id='main',
+        )
+        assert SourceStore.graphiti in response.stores_queued
+
+        filed = await _poll_for_escalation(tmp_path)
+        detail = filed[0]['detail']
+
+        assert "operation='add_memory_graphiti'" in detail, detail
+        assert 'add_memory_graphiti' in filed[0]['summary'], filed[0]['summary']
+
+        # THE REGRESSION. Step 14 implemented only the add_episode entry, so
+        # this record currently claims no synchronous success was reported —
+        # which is false, and is exactly the lie the alarm exists to surface.
+        assert 'reported_to_caller=' in detail, detail
+        assert _REPORTED_TO_CALLER['add_memory_graphiti'].text in detail, (
+            'the caller was told graphiti was QUEUED; an alarm that misreports '
+            'what the caller was promised is not triageable'
+        )
+        assert _REPORTED_TO_CALLER['add_episode'].text not in detail, (
+            "add_episode's status='queued' is a distinct claim from add_memory's "
+            'stores_queued, and the alarm must name the one this caller received'
+        )
+
+    @pytest.mark.asyncio
+    async def test_an_operation_with_no_synchronous_claim_says_so(
+        self, journaled_service, tmp_path,
+    ):
+        """The neutral default, so an operator is not told a lie was told when
+        it wasn't.
+
+        `mem0_classify_and_add` carries no `_write_op_id` and makes no
+        synchronous promise to anybody — it is enqueued by
+        `_dual_write_callback`, long after the caller has gone.
+        """
+        svc, _journal = journaled_service
+        svc.set_known_projects({'main': str(tmp_path)})
+        svc.mem0.add = AsyncMock(side_effect=RuntimeError('mem0 is down'))
+
+        # Enqueued directly, exactly as `_dual_write_callback` does it: one
+        # item per extracted fact, in the project's mem0_ group, with no
+        # `_write_op_id` because there is no write_ops row to join back to.
+        await svc.durable_queue.enqueue(queued('mem0_classify_and_add', {'fact_text': 'a derived fact nobody will ever see',
+                     'project_id': 'main'}, group_id='mem0_main'))
+
+        filed = await _poll_for_escalation(tmp_path)
+        detail = filed[0]['detail']
+
+        assert "operation='mem0_classify_and_add'" in detail, detail
+        assert 'write_op_id=None' in detail, (
+            'the operation 3582\'s terminal hook skips — and the hole this '
+            'alarm exists to close'
+        )
+        assert _REPORTED_TO_CALLER_DEFAULT in detail, detail
+
+
+class TestUndecodableRowIsRefusedNotExecuted:
+    """A row whose operation no producer writes must die loudly, not be guessed at."""
+
+    @pytest.mark.asyncio
+    async def test_a_typo_operation_dead_letters_unexecuted_and_alarms_with_its_raw_body(
+        self, mock_config, tmp_path, monkeypatch,
+    ):
+        filed: list[dict] = []
+        monkeypatch.setattr(
+            dead_letter_escalator, 'emit_dead_letter_escalation',
+            lambda *args, **kwargs: filed.append(kwargs),
+        )
+        body = json.dumps({
+            'content': 'looks exactly like an add_episode body',
+            'group_id': 'main',
+            'name': 'typo-episode',
+            'source': 'text',
+            'source_description': 'hand inserted',
+        })
+
+        # The row is written by another build: it is already in the store
+        # when this service starts, and startup recovery picks it up.
+        writer = mock_memory_backends(MemoryService(mock_config))
+        await writer.initialize()
+        await writer.close()
+        await insert_raw_row(
+            Path(mock_config.queue.data_dir) / 'write_queue.db',
+            group_id='main', operation='typo_op', payload_text=body,
+        )
+
+        svc = mock_memory_backends(MemoryService(mock_config))
+        graphiti_add_episode = AsyncMock(return_value=None)
+        svc.graphiti.add_episode = graphiti_add_episode
+        svc.set_known_projects({'main': str(tmp_path)})
+        await svc.initialize()
+        try:
+            queue = svc.durable_queue
+            assert queue is not None
+
+            async def _dead():
+                items = await queue.get_dead_items()
+                return items or None
+
+            dead = await poll_until(_dead, timeout=20.0, interval=0.05)
+            await poll_until(lambda: filed or None, timeout=20.0, interval=0.05)
+        finally:
+            await svc.close()
+
+        assert len(dead) == 1
+        assert dead[0]['operation'] == 'typo_op'
+        assert dead[0]['attempts'] == 1
+        assert dead[0]['error'].startswith('UnknownQueueOperation: '), dead[0]['error']
+        graphiti_add_episode.assert_not_awaited()
+        assert [call['content_preview'] for call in filed] == [body]

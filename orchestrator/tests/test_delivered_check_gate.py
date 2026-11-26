@@ -18,17 +18,30 @@ decisions for the point-by-point mirror rationale.
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import logging
+import os
+import signal
 from pathlib import Path
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from _recording_event_store import _RecordingEventStore
+from df_pytest_isolation import PIPE_CLOSING_LEAKER_SRC, read_leaked_pid, wait_pid_gone
 from pydantic import ValidationError
+from shared.delivered_check_polarity import (
+    CheckOutcome,
+    build_grep_argv,
+    build_path_argv,
+    interpret_grep_rc,
+)
 
 from orchestrator.config import RELOADABLE_FIELDS, DeliveredChecksConfig, OrchestratorConfig
 from orchestrator.delivered_checks import (
     DeliveredCheckResult,
+    DeliveredChecksBlock,
     DeliveredChecksVerdict,
+    gate_mark_done_on_delivered_checks,
     run_delivered_check,
     verify_delivered_checks_on_main,
 )
@@ -41,6 +54,19 @@ from orchestrator.scheduler import (
     _build_delivered_check_escalation,
     _delivered_checks_descriptor_digest,
 )
+
+
+def _gate_on_config(max_per_module: int) -> OrchestratorConfig:
+    """A config with the delivered-checks gate pinned ON.
+
+    For tests about gate BEHAVIOUR.  The flag's default is
+    ``TestDeliveredChecksConfig::test_default_enabled_is_true``'s claim; every
+    other key still reads the operational config.
+    """
+    config = OrchestratorConfig(max_per_module=max_per_module)
+    config.delivered_checks.enabled = True
+    return config
+
 
 # ---------------------------------------------------------------------------
 # TestRunnerGrepKind (task 2580 — step-1 RED / step-2 GREEN)
@@ -148,6 +174,153 @@ class TestRunnerGrepKind:
 
 
 # ---------------------------------------------------------------------------
+# TestRunnerGrepDelegatesToSharedPrimitive (task 3500 — step-3 RED / step-4 GREEN)
+# ---------------------------------------------------------------------------
+
+
+class TestRunnerGrepDelegatesToSharedPrimitive:
+    """``_run_grep_check`` must CALL ``shared.delivered_check_polarity``, not
+    rebuild git-grep semantics locally.
+
+    Task 3500 adds an AUTHORING-TIME polarity gate that evaluates the very
+    same grep checks before they are ever committed to a task's metadata.
+    If that gate and this runtime runner drift — on POSIX-ERE-via-``git grep
+    -E`` vs Python ``re``, on the ``-e`` separator, on ``--`` pathspec
+    placement, or on the ``rc >= 2 → ERRORED`` boundary — the gate becomes a
+    new source of the defect it exists to prevent: a check the lint judges
+    healthy but this runner later fails still wedges its dependent forever.
+    One builder plus one interpreter, shared by both, makes that divergence
+    structurally impossible.
+
+    These tests assert the DELEGATION (patching a name that does not exist
+    yet is an AttributeError, which is what makes them RED before step-4) as
+    well as the resulting parity, and then re-pin the whole rc→verdict
+    mapping through the public entry point so the refactor is provably
+    bit-identical.
+    """
+
+    def _fake_runner(self, rc: int, out: str = '', err: str = ''):
+        calls: list[list[str]] = []
+
+        async def _runner(argv, **kwargs):
+            calls.append(argv)
+            return (rc, out, err)
+
+        return _runner, calls
+
+    @pytest.mark.asyncio
+    async def test_argv_is_built_by_the_shared_builder_with_paths(self):
+        runner, calls = self._fake_runner(rc=0)
+        check = {
+            'name': 'cap',
+            'kind': 'grep',
+            'pattern': 'FooBar',
+            'expect': 'present',
+            'paths': ['src/a.py', 'src/b.py'],
+        }
+
+        with patch(
+            'orchestrator.delivered_checks.build_grep_argv', wraps=build_grep_argv
+        ) as spy:
+            await run_delivered_check(check, project_root='/proj', ref='main', runner=runner)
+
+        assert spy.call_count == 1
+        assert calls == [
+            build_grep_argv(
+                'FooBar', ['src/a.py', 'src/b.py'], project_root='/proj', ref='main'
+            )
+        ]
+
+    @pytest.mark.asyncio
+    async def test_argv_is_built_by_the_shared_builder_without_paths(self):
+        runner, calls = self._fake_runner(rc=0)
+        check = {'name': 'cap', 'kind': 'grep', 'pattern': 'FooBar', 'expect': 'present'}
+
+        with patch(
+            'orchestrator.delivered_checks.build_grep_argv', wraps=build_grep_argv
+        ) as spy:
+            await run_delivered_check(check, project_root='/proj', ref='main', runner=runner)
+
+        assert spy.call_count == 1
+        assert calls == [build_grep_argv('FooBar', [], project_root='/proj', ref='main')]
+
+    @pytest.mark.asyncio
+    async def test_leading_dash_pattern_still_lands_after_the_e_separator(self):
+        """The one argv subtlety that MUST survive the refactor: without the
+        ``-e`` separator a pattern beginning with ``'-'`` is parsed by ``git
+        grep`` as an option and the check ERRORs instead of running."""
+        runner, calls = self._fake_runner(rc=0)
+        check = {'name': 'cap', 'kind': 'grep', 'pattern': '--force', 'expect': 'present'}
+
+        await run_delivered_check(check, project_root='/proj', ref='main', runner=runner)
+
+        assert calls == [build_grep_argv('--force', [], project_root='/proj', ref='main')]
+        assert calls[0][calls[0].index('-e') + 1] == '--force'
+
+    @pytest.mark.asyncio
+    async def test_verdict_comes_from_the_shared_interpreter(self):
+        runner, _calls = self._fake_runner(rc=1)
+        check = {'name': 'cap', 'kind': 'grep', 'pattern': 'x', 'expect': 'absent'}
+
+        with patch(
+            'orchestrator.delivered_checks.interpret_grep_rc', wraps=interpret_grep_rc
+        ) as spy:
+            result = await run_delivered_check(check, project_root='/proj', runner=runner)
+
+        assert spy.call_count == 1
+        assert spy.call_args.args == (1, 'absent')
+        assert result is DeliveredCheckResult.DELIVERED
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ('rc', 'expect', 'expected'),
+        [
+            (0, 'present', DeliveredCheckResult.DELIVERED),
+            (1, 'present', DeliveredCheckResult.FAILED),
+            (2, 'present', DeliveredCheckResult.ERRORED),
+            (128, 'present', DeliveredCheckResult.ERRORED),
+            (0, 'absent', DeliveredCheckResult.FAILED),
+            (1, 'absent', DeliveredCheckResult.DELIVERED),
+            (2, 'absent', DeliveredCheckResult.ERRORED),
+            (128, 'absent', DeliveredCheckResult.ERRORED),
+        ],
+    )
+    async def test_rc_mapping_is_bit_identical_after_delegation(self, rc, expect, expected):
+        """The whole rc→verdict table, re-pinned through the PUBLIC entry
+        point. ``CheckOutcome`` is a different enum from
+        ``DeliveredCheckResult`` on purpose (predicate-held vs
+        capability-delivered), so the mapping between them is the one place
+        the refactor could silently change an outcome."""
+        runner, _calls = self._fake_runner(rc=rc)
+        check = {'name': 'cap', 'kind': 'grep', 'pattern': 'x', 'expect': expect}
+
+        result = await run_delivered_check(check, project_root='/proj', runner=runner)
+
+        assert result is expected
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ('rc', 'outcome', 'expected'),
+        [
+            (0, CheckOutcome.PASS, DeliveredCheckResult.DELIVERED),
+            (1, CheckOutcome.FAIL, DeliveredCheckResult.FAILED),
+            (2, CheckOutcome.ERRORED, DeliveredCheckResult.ERRORED),
+        ],
+    )
+    async def test_every_check_outcome_member_maps_onto_a_result_member(
+        self, rc, outcome, expected
+    ):
+        """Exhaustive over ``CheckOutcome``: no member may fall through the
+        mapping (which would either raise or, worse, quietly return the
+        wrong verdict for a whole class of checks)."""
+        runner, _calls = self._fake_runner(rc=rc)
+        check = {'name': 'cap', 'kind': 'grep', 'pattern': 'x', 'expect': 'present'}
+
+        assert interpret_grep_rc(rc, 'present') is outcome
+        assert await run_delivered_check(check, project_root='/proj', runner=runner) is expected
+
+
+# ---------------------------------------------------------------------------
 # TestRunnerScriptKind (task 2580 — step-3 RED / step-4 GREEN)
 # ---------------------------------------------------------------------------
 
@@ -237,6 +410,447 @@ class TestRunnerScriptKind:
 
         assert called, 'the injected runner must actually be invoked'
         assert result is DeliveredCheckResult.ERRORED
+
+    @pytest.mark.asyncio
+    async def test_timeout_kills_the_scripts_helpers_too(self, tmp_path, monkeypatch):
+        """A real script run through the DEFAULT runner (task 4155): on timeout,
+        a helper the script backgrounded dies with it.
+
+        The helper is judged while the check is still in flight and only then
+        awaited: a surviving helper holds the script's pipes open, so awaiting
+        first would hang rather than fail.
+        """
+        leaker = tmp_path / 'leaker.sh'
+        leaker.write_text('#!/bin/sh\n' + PIPE_CLOSING_LEAKER_SRC)
+        leaker.chmod(0o755)
+        pidfile = tmp_path / 'leaked.pid'
+        monkeypatch.setenv('LEAK_PIDFILE', str(pidfile))
+        check = {'name': 'cap', 'kind': 'script', 'script': 'leaker.sh', 'timeout_secs': 1}
+
+        task = asyncio.ensure_future(run_delivered_check(check, project_root=tmp_path))
+        leaked_pid = None
+        try:
+            leaked_pid = await asyncio.to_thread(read_leaked_pid, pidfile)
+
+            assert await asyncio.to_thread(
+                wait_pid_gone, leaked_pid, timeout=check['timeout_secs'] + 5.0
+            ), (
+                f'pid {leaked_pid}, a helper the script backgrounded, survived its timeout'
+            )
+            assert await task is DeliveredCheckResult.ERRORED
+        finally:
+            task.cancel()
+            if leaked_pid is not None:
+                with contextlib.suppress(OSError):
+                    os.kill(leaked_pid, signal.SIGKILL)
+
+
+# ---------------------------------------------------------------------------
+# TestRunnerPathKind (task 4743 — step-7 RED / step-8 GREEN)
+# ---------------------------------------------------------------------------
+
+
+class TestRunnerPathKind:
+    """``run_delivered_check``'s path-kind branch: argv shape + stdout mapping.
+
+    The contract INVERTS the grep kind's and must not be derived from it by
+    analogy. ``git grep`` signals its answer through rc (0=match, 1=no
+    match), so ``_run_grep_check`` reads ``matched = rc == 0``. ``git
+    ls-tree`` does NOT: a MISSING path still exits 0 and simply prints
+    nothing, while an existing path exits 0 WITH output. Copying grep's
+    idiom would make every path check report DELIVERED — a universal false
+    green on a dispatch gate.
+    """
+
+    def _fake_runner(self, rc: int, out: str = '', err: str = ''):
+        """Build an injected fake runner recording every argv it's called with."""
+        calls: list[list[str]] = []
+
+        async def _runner(argv, **kwargs):
+            calls.append(argv)
+            return (rc, out, err)
+
+        return _runner, calls
+
+    def _scripted_runner(self, responses: list[tuple[int, str]]):
+        """A runner replaying one (rc, stdout) per call, in order.
+
+        Needed for the multi-path cases, where each ``ls-tree`` invocation
+        must answer differently.
+        """
+        calls: list[list[str]] = []
+
+        async def _runner(argv, **kwargs):
+            calls.append(argv)
+            rc, out = responses[len(calls) - 1]
+            return (rc, out, '')
+
+        return _runner, calls
+
+    @pytest.mark.asyncio
+    async def test_argv_shape(self):
+        runner, calls = self._fake_runner(rc=0, out='orchestrator/tests/test_x.py\n')
+        check = {
+            'name': 'cap',
+            'kind': 'path',
+            'expect': 'present',
+            'paths': ['orchestrator/tests/test_x.py'],
+        }
+
+        await run_delivered_check(check, project_root='/proj', ref='main', runner=runner)
+
+        assert calls == [
+            [
+                'git',
+                '-C',
+                '/proj',
+                'ls-tree',
+                '-r',
+                '--full-tree',
+                '--name-only',
+                'main',
+                '--',
+                'orchestrator/tests/test_x.py',
+            ]
+        ]
+
+    @pytest.mark.asyncio
+    async def test_default_ref_is_main(self):
+        runner, calls = self._fake_runner(rc=0, out='a/one.py\n')
+        check = {'name': 'cap', 'kind': 'path', 'expect': 'present', 'paths': ['a/one.py']}
+
+        # ref= omitted entirely — default must be 'main'.
+        await run_delivered_check(check, project_root='/proj', runner=runner)
+
+        assert calls[0][7] == 'main'
+
+    @pytest.mark.asyncio
+    async def test_non_default_ref_is_forwarded(self):
+        runner, calls = self._fake_runner(rc=0, out='a/one.py\n')
+        check = {'name': 'cap', 'kind': 'path', 'expect': 'present', 'paths': ['a/one.py']}
+
+        await run_delivered_check(check, project_root='/proj', ref='abc123', runner=runner)
+
+        assert calls[0][7] == 'abc123'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ('expect', 'stdout', 'expected'),
+        [
+            ('present', 'a/one.py\n', DeliveredCheckResult.DELIVERED),
+            ('present', '', DeliveredCheckResult.FAILED),
+            ('present', '   \n', DeliveredCheckResult.FAILED),
+            ('absent', '', DeliveredCheckResult.DELIVERED),
+            ('absent', 'a/one.py\n', DeliveredCheckResult.FAILED),
+            ('absent', '   \n', DeliveredCheckResult.DELIVERED),
+        ],
+    )
+    async def test_existence_is_read_from_stdout_not_rc(self, expect, stdout, expected):
+        """rc is 0 in EVERY case here — only stdout distinguishes them."""
+        runner, _calls = self._fake_runner(rc=0, out=stdout)
+        check = {'name': 'cap', 'kind': 'path', 'expect': expect, 'paths': ['a/one.py']}
+
+        result = await run_delivered_check(check, project_root='/proj', runner=runner)
+
+        assert result is expected
+
+    @pytest.mark.asyncio
+    async def test_every_probe_is_the_shared_builders_argv(self):
+        """Parity with the authoring-time lint (task 3500): both gates build
+        each ``ls-tree`` probe with ``shared.delivered_check_polarity.build_path_argv``,
+        so they cannot disagree about what a path check asks git."""
+        runner, calls = self._fake_runner(rc=0, out='hit\n')
+        check = {
+            'name': 'cap',
+            'kind': 'path',
+            'expect': 'present',
+            'paths': ['a/one.py', 'b/two'],
+        }
+
+        await run_delivered_check(check, project_root='/proj', ref='abc123', runner=runner)
+
+        assert calls == [
+            build_path_argv('a/one.py', project_root='/proj', ref='abc123'),
+            build_path_argv('b/two', project_root='/proj', ref='abc123'),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_multiple_paths_issue_one_call_each(self):
+        runner, calls = self._fake_runner(rc=0, out='hit\n')
+        check = {
+            'name': 'cap',
+            'kind': 'path',
+            'expect': 'present',
+            'paths': ['a/one.py', 'b/two.py', 'c/three.py'],
+        }
+
+        await run_delivered_check(check, project_root='/proj', runner=runner)
+
+        assert [argv[-1] for argv in calls] == ['a/one.py', 'b/two.py', 'c/three.py']
+
+    @pytest.mark.asyncio
+    async def test_present_all_exist_is_delivered(self):
+        runner, calls = self._scripted_runner([(0, 'a/one.py\n'), (0, 'b/two.py\n')])
+        check = {
+            'name': 'cap',
+            'kind': 'path',
+            'expect': 'present',
+            'paths': ['a/one.py', 'b/two.py'],
+        }
+
+        result = await run_delivered_check(check, project_root='/proj', runner=runner)
+
+        assert result is DeliveredCheckResult.DELIVERED
+        assert len(calls) == 2
+
+    @pytest.mark.asyncio
+    async def test_present_one_missing_among_several_is_failed(self):
+        """Conjunctive, not disjunctive: a gate must fail closed."""
+        runner, calls = self._scripted_runner([(0, 'a/one.py\n'), (0, ''), (0, 'c/three.py\n')])
+        check = {
+            'name': 'cap',
+            'kind': 'path',
+            'expect': 'present',
+            'paths': ['a/one.py', 'b/two.py', 'c/three.py'],
+        }
+
+        result = await run_delivered_check(check, project_root='/proj', runner=runner)
+
+        assert result is DeliveredCheckResult.FAILED
+        # Short-circuits: the third path is never probed.
+        assert [argv[-1] for argv in calls] == ['a/one.py', 'b/two.py']
+
+    @pytest.mark.asyncio
+    async def test_absent_all_gone_is_delivered(self):
+        runner, _calls = self._scripted_runner([(0, ''), (0, '')])
+        check = {
+            'name': 'cap',
+            'kind': 'path',
+            'expect': 'absent',
+            'paths': ['a/one.py', 'b/two.py'],
+        }
+
+        result = await run_delivered_check(check, project_root='/proj', runner=runner)
+
+        assert result is DeliveredCheckResult.DELIVERED
+
+    @pytest.mark.asyncio
+    async def test_absent_one_still_present_among_several_is_failed(self):
+        runner, calls = self._scripted_runner([(0, ''), (0, 'b/two.py\n'), (0, '')])
+        check = {
+            'name': 'cap',
+            'kind': 'path',
+            'expect': 'absent',
+            'paths': ['a/one.py', 'b/two.py', 'c/three.py'],
+        }
+
+        result = await run_delivered_check(check, project_root='/proj', runner=runner)
+
+        assert result is DeliveredCheckResult.FAILED
+        assert [argv[-1] for argv in calls] == ['a/one.py', 'b/two.py']
+
+
+# ---------------------------------------------------------------------------
+# TestRunnerPathKindFailSafe (task 4743 — step-9 RED / step-10 GREEN)
+# ---------------------------------------------------------------------------
+
+
+class TestRunnerPathKindFailSafe:
+    """The kind='path' ERRORED boundary — where an unresolvable check lands.
+
+    Separated from TestRunnerPathKind because the boundary is the part most
+    easily got wrong: `ls-tree` prints nothing on a MISSING path AND
+    nothing on a git error, so an implementation that only inspected stdout
+    would silently collapse "genuinely absent" (FAILED, a definitive answer
+    a caller can act on) into the same bucket as "could not be evaluated"
+    (ERRORED, a fail-safe wait). Only rc separates them.
+    """
+
+    def _scripted_runner(self, responses: list[tuple[int, str]]):
+        calls: list[list[str]] = []
+
+        async def _runner(argv, **kwargs):
+            calls.append(argv)
+            rc, out = responses[len(calls) - 1]
+            return (rc, out, '')
+
+        return _runner, calls
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'expect', [pytest.param('present', id='present'), pytest.param('absent', id='absent')]
+    )
+    async def test_bad_ref_is_errored_not_failed(self, expect):
+        """A bad ref exits 128 with empty stdout — measured. Empty stdout
+        alone would read as "does not exist"; only rc distinguishes it."""
+        runner, _calls = self._scripted_runner([(128, '')])
+        check = {'name': 'cap', 'kind': 'path', 'expect': expect, 'paths': ['a/one.py']}
+
+        result = await run_delivered_check(check, project_root='/proj', runner=runner)
+
+        assert result is DeliveredCheckResult.ERRORED
+
+    @pytest.mark.asyncio
+    async def test_pathspec_outside_repository_is_errored(self):
+        """`git ls-tree ... -- /etc/passwd` exits 128 ("outside repository")
+        — measured. The schema validator refuses such a descriptor at
+        authoring time; this is the runner's defense in depth."""
+        runner, _calls = self._scripted_runner([(128, '')])
+        check = {'name': 'cap', 'kind': 'path', 'expect': 'present', 'paths': ['a/one.py']}
+
+        result = await run_delivered_check(check, project_root='/proj', runner=runner)
+
+        assert result is DeliveredCheckResult.ERRORED
+
+    @pytest.mark.asyncio
+    async def test_git_error_short_circuits_remaining_paths(self):
+        runner, calls = self._scripted_runner([(0, 'a/one.py\n'), (128, ''), (0, 'c/three.py\n')])
+        check = {
+            'name': 'cap',
+            'kind': 'path',
+            'expect': 'present',
+            'paths': ['a/one.py', 'b/two.py', 'c/three.py'],
+        }
+
+        result = await run_delivered_check(check, project_root='/proj', runner=runner)
+
+        assert result is DeliveredCheckResult.ERRORED
+        assert [argv[-1] for argv in calls] == ['a/one.py', 'b/two.py']
+
+    @pytest.mark.asyncio
+    async def test_runner_raising_oserror_is_errored(self):
+        called = False
+
+        async def _runner(argv, **kwargs):
+            nonlocal called
+            called = True
+            raise OSError('git not on PATH')
+
+        check = {'name': 'cap', 'kind': 'path', 'expect': 'present', 'paths': ['a/one.py']}
+
+        result = await run_delivered_check(check, project_root='/proj', runner=_runner)
+
+        assert called, 'the injected runner must actually be invoked'
+        assert result is DeliveredCheckResult.ERRORED
+
+    @pytest.mark.asyncio
+    async def test_runner_raising_timeout_is_errored(self):
+        called = False
+
+        async def _runner(argv, **kwargs):
+            nonlocal called
+            called = True
+            raise TimeoutError('simulated timeout')
+
+        check = {'name': 'cap', 'kind': 'path', 'expect': 'present', 'paths': ['a/one.py']}
+
+        result = await run_delivered_check(check, project_root='/proj', runner=_runner)
+
+        assert called, 'the injected runner must actually be invoked'
+        assert result is DeliveredCheckResult.ERRORED
+
+
+class TestVerifyOnMainWithPathKind:
+    """A path check participates in verify_delivered_checks_on_main's collapse.
+
+    The aggregate precedence (all_delivered > failed > errored) is
+    kind-agnostic, so these tests are what confirm no path-specific wiring
+    was needed there — and that verdict.failed_check carries the PATH
+    descriptor rather than some other check's.
+    """
+
+    def _runner_for(self, by_path: dict[str, tuple[int, str]]):
+        """Answer per requested pathspec (argv's last element), so several
+        checks can be evaluated concurrently and still be distinguished."""
+
+        async def _runner(argv, **kwargs):
+            if 'ls-tree' in argv:
+                rc, out = by_path[argv[-1]]
+                return (rc, out, '')
+            # grep kind: rc 0 == match
+            return (0, '', '')
+
+        return _runner
+
+    @pytest.mark.asyncio
+    async def test_path_check_delivered_collapses_to_all_delivered(self):
+        checks = [
+            {'name': 'cap-path', 'kind': 'path', 'expect': 'present', 'paths': ['a/one.py']}
+        ]
+
+        verdict = await verify_delivered_checks_on_main(
+            checks,
+            project_root='/proj',
+            main_sha='abc123',
+            check_timeout_secs=5,
+            runner=self._runner_for({'a/one.py': (0, 'a/one.py\n')}),
+        )
+
+        assert verdict.outcome == 'all_delivered'
+        assert verdict.main_sha == 'abc123'
+
+    @pytest.mark.asyncio
+    async def test_failed_path_check_is_carried_as_failed_check(self):
+        path_check = {
+            'name': 'cap-path',
+            'kind': 'path',
+            'expect': 'present',
+            'paths': ['a/missing.py'],
+        }
+        checks = [{'name': 'cap-grep', 'kind': 'grep', 'pattern': 'x', 'expect': 'present'}, path_check]
+
+        verdict = await verify_delivered_checks_on_main(
+            checks,
+            project_root='/proj',
+            main_sha='abc123',
+            check_timeout_secs=5,
+            runner=self._runner_for({'a/missing.py': (0, '')}),
+        )
+
+        assert verdict.outcome == 'failed'
+        assert verdict.failed_check == path_check
+
+    @pytest.mark.asyncio
+    async def test_errored_path_check_alone_collapses_to_errored(self):
+        checks = [
+            {'name': 'cap-path', 'kind': 'path', 'expect': 'present', 'paths': ['a/one.py']}
+        ]
+
+        verdict = await verify_delivered_checks_on_main(
+            checks,
+            project_root='/proj',
+            main_sha='abc123',
+            check_timeout_secs=5,
+            runner=self._runner_for({'a/one.py': (128, '')}),
+        )
+
+        assert verdict.outcome == 'errored'
+
+    @pytest.mark.asyncio
+    async def test_failed_path_check_outranks_an_errored_sibling(self):
+        """FAILED > ERRORED: a definitive absence drives the clean recovery
+        and must not be masked into a fail-safe no-op."""
+        failing = {
+            'name': 'cap-missing',
+            'kind': 'path',
+            'expect': 'present',
+            'paths': ['a/missing.py'],
+        }
+        checks = [
+            {'name': 'cap-broken', 'kind': 'path', 'expect': 'present', 'paths': ['a/broken.py']},
+            failing,
+        ]
+
+        verdict = await verify_delivered_checks_on_main(
+            checks,
+            project_root='/proj',
+            main_sha='abc123',
+            check_timeout_secs=5,
+            runner=self._runner_for({'a/broken.py': (128, ''), 'a/missing.py': (0, '')}),
+        )
+
+        assert verdict.outcome == 'failed'
+        assert verdict.failed_check == failing
 
 
 # ---------------------------------------------------------------------------
@@ -716,7 +1330,7 @@ class TestPhaseBackfillTerminalDepRecords:
 
     @pytest.fixture
     def scheduler(self) -> Scheduler:
-        config = OrchestratorConfig(max_per_module=1)
+        config = _gate_on_config(max_per_module=1)
         scheduler = Scheduler(config)
         scheduler.finish_startup()
         return scheduler
@@ -750,22 +1364,25 @@ class TestPhaseBackfillTerminalDepRecords:
         scheduler.get_task.assert_awaited_once_with('20')
         assert ctx.terminal_dep_records == {'20': fetched}
 
-    # --- (b) kill switch: delivered_checks.enabled=False -> no fetch -------
+    # --- (b) delivered_checks.enabled=False -> still fetched ---------------
 
     @pytest.mark.asyncio
-    async def test_disabled_kill_switch_skips_fetch(self, scheduler: Scheduler):
+    async def test_disabled_delivered_checks_still_backfills_records(self, scheduler: Scheduler):
+        """The records also feed the scheduled-deploy hold, so the delivered-check
+        kill switch does not switch the backfill off."""
         scheduler.config.delivered_checks.enabled = False
         dependent = self._dependent()
         ctx = TickContext(
             tasks=[dependent], status_map={'20': 'done'}, tasks_by_id={'10': dependent}
         )
-        scheduler.get_task = AsyncMock(return_value={'id': '20'})
+        fetched = {'id': '20', 'status': 'done', 'metadata': {}}
+        scheduler.get_task = AsyncMock(return_value=fetched)
 
         result = await scheduler._phase_backfill_terminal_dep_records(ctx)
 
         assert result is _CONTINUE
-        scheduler.get_task.assert_not_awaited()
-        assert ctx.terminal_dep_records == {}
+        scheduler.get_task.assert_awaited_once_with('20')
+        assert ctx.terminal_dep_records == {'20': fetched}
 
     # --- (c) dep already in tasks_by_id -> not "missing", no fetch ---------
 
@@ -913,6 +1530,33 @@ class TestPhaseBackfillTerminalDepRecords:
         assert ctx.terminal_dep_records['20'] == corrected_record
         assert scheduler._terminal_dep_record_cache['20'] == corrected_record
 
+    @pytest.mark.asyncio
+    async def test_warmed_record_carrying_only_an_unreadable_entry_is_refetched(
+        self, scheduler: Scheduler
+    ):
+        """An unreadable declaration is still a declaration: the record can be
+        repaired in place, so it is never served from the cross-tick cache."""
+        stale_record = {'id': '20', 'status': 'done', 'metadata': {'delivered_checks': ['garbage']}}
+        scheduler._terminal_dep_record_cache['20'] = stale_record
+        repaired_record = {
+            'id': '20',
+            'status': 'done',
+            'metadata': {'delivered_checks': [{'kind': 'grep', 'name': 'c', 'pattern': 'FIXED'}]},
+        }
+        dependent = self._dependent()
+        ctx = TickContext(
+            tasks=[dependent],
+            status_map={'20': 'done'},
+            tasks_by_id={'10': dependent},
+        )
+        scheduler.get_task = AsyncMock(return_value=repaired_record)
+
+        result = await scheduler._phase_backfill_terminal_dep_records(ctx)
+
+        assert result is _CONTINUE
+        scheduler.get_task.assert_awaited_once_with('20')
+        assert ctx.terminal_dep_records['20'] == repaired_record
+
     # --- (i) warmed CHECKLESS record -> still served from cache, no re-fetch --
 
     @pytest.mark.asyncio
@@ -963,7 +1607,7 @@ class TestPhaseBackfillTerminalDepRecords:
         tick after tick. Dep ids are chosen so plain alphabetical sort
         ('21' < '29') would pick the WRONG (re-validation) dep first
         without the fix, proving this isn't an accident of sort order."""
-        scheduler.config.delivered_checks.max_checks_per_tick = 1
+        scheduler.config.delivered_checks.max_record_fetches_per_tick = 1
         stale_record = {
             'id': '21',
             'status': 'done',
@@ -993,6 +1637,280 @@ class TestPhaseBackfillTerminalDepRecords:
         )
         # the stale cache entry is untouched (not overwritten, not evicted)
         assert scheduler._terminal_dep_record_cache['21'] == stale_record
+
+
+    # --- (k) a held scheduled self-deploy record is mutable until verified ---
+
+    @staticmethod
+    def _scheduled_deploy_record(dep_id: str, phase: str) -> dict:
+        return {
+            'id': dep_id,
+            'status': 'done',
+            'metadata': {
+                'done_provenance': {
+                    'kind': 'deterministic-deploy-scheduled',
+                    'unit': 'orchestrator-dark-factory.service',
+                    'transient_unit': f'orch-redeploy-restart-{dep_id}.service',
+                    'fire_delay_secs': 60,
+                },
+                'deploy_state': {'phase': phase},
+            },
+        }
+
+    @pytest.mark.asyncio
+    async def test_warmed_record_awaiting_scheduled_restart_is_refetched(
+        self, scheduler: Scheduler
+    ):
+        scheduler._terminal_dep_record_cache['20'] = self._scheduled_deploy_record(
+            '20', 'scheduled'
+        )
+        verified = self._scheduled_deploy_record('20', 'verified')
+        dependent = self._dependent()
+        ctx = TickContext(
+            tasks=[dependent], status_map={'20': 'done'}, tasks_by_id={'10': dependent}
+        )
+        scheduler.get_task = AsyncMock(return_value=verified)
+
+        result = await scheduler._phase_backfill_terminal_dep_records(ctx)
+
+        assert result is _CONTINUE
+        scheduler.get_task.assert_awaited_once_with('20')
+        assert ctx.terminal_dep_records['20'] == verified
+        assert scheduler._terminal_dep_record_cache['20'] == verified
+
+    async def _warm_record_cache(self, scheduler: Scheduler, *records: dict) -> None:
+        """Cache *records* the way production does: one tick fetching each as never-cached."""
+        by_id = {record['id']: record for record in records}
+        dependents = [self._dependent(task_id=f'9{dep_id}', dep_id=dep_id) for dep_id in by_id]
+        ctx = TickContext(
+            tasks=dependents,
+            status_map=dict.fromkeys(by_id, 'done'),
+            tasks_by_id={str(t['id']): t for t in dependents},
+        )
+        scheduler.get_task = AsyncMock(side_effect=by_id.__getitem__)
+        await scheduler._phase_backfill_terminal_dep_records(ctx)
+
+    @pytest.mark.asyncio
+    async def test_budget_reserves_a_slot_for_a_never_cached_dep_over_held_revalidation(
+        self, scheduler: Scheduler, caplog
+    ):
+        """Held re-validations recur every tick until the settler releases them,
+        so held-first would starve a never-cached dep forever once they fill the
+        budget.  A deferred held record keeps serving from cache, hold in place,
+        and is counted in the deferral WARNING.  '21' < '29', so held-first or a
+        plain sort would pick the held dep."""
+        held = self._scheduled_deploy_record('21', 'scheduled')
+        await self._warm_record_cache(scheduler, held)
+        scheduler.config.delivered_checks.max_record_fetches_per_tick = 1
+        task_a = self._dependent(task_id='10', dep_id='21')  # held re-validation
+        task_b = self._dependent(task_id='11', dep_id='29')  # never cached
+        ctx = TickContext(
+            tasks=[task_a, task_b],
+            status_map={'21': 'done', '29': 'done'},
+            tasks_by_id={'10': task_a, '11': task_b},
+        )
+        new_record = {'id': '29', 'status': 'done', 'metadata': {}}
+        scheduler.get_task = AsyncMock(return_value=new_record)
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.scheduler'):
+            result = await scheduler._phase_backfill_terminal_dep_records(ctx)
+
+        assert result is _CONTINUE
+        scheduler.get_task.assert_awaited_once_with('29')
+        assert ctx.terminal_dep_records == {'21': held, '29': new_record}
+        assert ctx.deferred_terminal_deps == frozenset()
+        warnings = [
+            r for r in caplog.records
+            if r.name == 'orchestrator.scheduler' and r.levelno == logging.WARNING
+        ]
+        assert len(warnings) == 1
+        assert isinstance(warnings[0].args, tuple)
+        *_, deferred, deferred_held, deferred_new, deferred_revalidation = warnings[0].args
+        assert (deferred, deferred_held, deferred_new, deferred_revalidation) == (1, 1, 0, 0)
+
+    @pytest.mark.asyncio
+    async def test_held_revalidations_keep_all_but_one_slot_while_a_never_cached_dep_waits(
+        self, scheduler: Scheduler
+    ):
+        held_22 = self._scheduled_deploy_record('22', 'scheduled')
+        await self._warm_record_cache(
+            scheduler, self._scheduled_deploy_record('20', 'scheduled'), held_22
+        )
+        scheduler.config.delivered_checks.max_record_fetches_per_tick = 2
+        dependents = [
+            self._dependent(task_id=task_id, dep_id=dep_id)
+            for task_id, dep_id in (('10', '20'), ('11', '22'), ('12', '29'))
+        ]
+        ctx = TickContext(
+            tasks=dependents,
+            status_map={'20': 'done', '22': 'done', '29': 'done'},
+            tasks_by_id={str(t['id']): t for t in dependents},
+        )
+
+        async def _fake_get_task(task_id):
+            if task_id == '29':
+                return {'id': '29', 'status': 'done', 'metadata': {}}
+            return self._scheduled_deploy_record(task_id, 'scheduled')
+
+        scheduler.get_task = AsyncMock(side_effect=_fake_get_task)
+
+        await scheduler._phase_backfill_terminal_dep_records(ctx)
+
+        assert {c.args[0] for c in scheduler.get_task.await_args_list} == {'20', '29'}
+        assert ctx.terminal_dep_records['22'] is held_22
+        assert ctx.deferred_terminal_deps == frozenset()
+
+    # --- (l) a held record survives a failed or deferred re-fetch ----------
+
+    def _held_ctx(self, scheduler: Scheduler) -> tuple[TickContext, dict]:
+        held = self._scheduled_deploy_record('20', 'scheduled')
+        scheduler._terminal_dep_record_cache['20'] = held
+        dependent = self._dependent()
+        ctx = TickContext(
+            tasks=[dependent], status_map={'20': 'done'}, tasks_by_id={'10': dependent}
+        )
+        return ctx, held
+
+    @pytest.mark.asyncio
+    async def test_held_record_is_still_served_when_its_refetch_returns_none(
+        self, scheduler: Scheduler, caplog
+    ):
+        ctx, held = self._held_ctx(scheduler)
+        scheduler.get_task = AsyncMock(return_value=None)
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.scheduler'):
+            result = await scheduler._phase_backfill_terminal_dep_records(ctx)
+
+        assert result is _CONTINUE
+        assert ctx.terminal_dep_records['20'] == held
+        assert scheduler._terminal_dep_record_cache['20'] == held
+        assert any(
+            'hold retained' in r.getMessage() and '20' in r.getMessage()
+            for r in caplog.records if r.levelno == logging.WARNING
+        )
+
+    @pytest.mark.asyncio
+    async def test_held_record_is_still_served_when_its_refetch_raises(
+        self, scheduler: Scheduler
+    ):
+        ctx, held = self._held_ctx(scheduler)
+        scheduler.get_task = AsyncMock(side_effect=RuntimeError('fused-memory down'))
+
+        result = await scheduler._phase_backfill_terminal_dep_records(ctx)
+
+        assert result is _CONTINUE
+        assert ctx.terminal_dep_records['20'] == held
+
+    @pytest.mark.asyncio
+    async def test_held_record_deferred_by_the_budget_is_still_served(
+        self, scheduler: Scheduler
+    ):
+        scheduler.config.delivered_checks.max_record_fetches_per_tick = 1
+        held_21 = self._scheduled_deploy_record('21', 'scheduled')
+        scheduler._terminal_dep_record_cache['20'] = self._scheduled_deploy_record('20', 'scheduled')
+        scheduler._terminal_dep_record_cache['21'] = held_21
+        task_a = self._dependent(task_id='10', dep_id='20')
+        task_b = self._dependent(task_id='11', dep_id='21')
+        ctx = TickContext(
+            tasks=[task_a, task_b],
+            status_map={'20': 'done', '21': 'done'},
+            tasks_by_id={'10': task_a, '11': task_b},
+        )
+        still_held_20 = self._scheduled_deploy_record('20', 'scheduled')
+        scheduler.get_task = AsyncMock(return_value=still_held_20)
+
+        await scheduler._phase_backfill_terminal_dep_records(ctx)
+
+        scheduler.get_task.assert_awaited_once_with('20')
+        assert ctx.terminal_dep_records == {'20': still_held_20, '21': held_21}
+        assert ctx.deferred_terminal_deps == frozenset()
+
+    # --- (m) a never-cached dep deferred by the budget is named on ctx -----
+
+    @pytest.mark.asyncio
+    async def test_only_a_never_cached_dep_deferred_by_the_budget_is_named_on_ctx(
+        self, scheduler: Scheduler
+    ):
+        """A deferred dep with no record would fail open; the scheduled-deploy
+        arm waits on it instead.  A deferred re-validation keeps its cached,
+        known-unheld record, so it is not named."""
+        scheduler.config.delivered_checks.max_record_fetches_per_tick = 1
+        scheduler._terminal_dep_record_cache['22'] = {
+            'id': '22',
+            'status': 'done',
+            'metadata': {'delivered_checks': [{'kind': 'grep', 'name': 'c', 'pattern': 'P'}]},
+        }
+        dependents = [
+            self._dependent(task_id=task_id, dep_id=dep_id)
+            for task_id, dep_id in (('10', '20'), ('11', '21'), ('12', '22'))
+        ]
+        ctx = TickContext(
+            tasks=dependents,
+            status_map={'20': 'done', '21': 'done', '22': 'done'},
+            tasks_by_id={str(t['id']): t for t in dependents},
+        )
+        scheduler.get_task = AsyncMock(return_value={'id': '20', 'status': 'done', 'metadata': {}})
+
+        await scheduler._phase_backfill_terminal_dep_records(ctx)
+
+        scheduler.get_task.assert_awaited_once_with('20')
+        assert ctx.deferred_terminal_deps == frozenset({'21'})
+
+    # --- (n) the record-fetch budget is its own knob -----------------------
+
+    def _two_never_cached_deps_ctx(self) -> tuple[TickContext, dict]:
+        dependents = [
+            self._dependent(task_id='10', dep_id='20'),
+            self._dependent(task_id='11', dep_id='21'),
+        ]
+        ctx = TickContext(
+            tasks=dependents,
+            status_map={'20': 'done', '21': 'done'},
+            tasks_by_id={str(t['id']): t for t in dependents},
+        )
+        records = {
+            dep_id: {'id': dep_id, 'status': 'done', 'metadata': {}}
+            for dep_id in ('20', '21')
+        }
+        return ctx, records
+
+    @pytest.mark.asyncio
+    async def test_check_budget_does_not_throttle_record_fetches(
+        self, scheduler: Scheduler
+    ):
+        scheduler.config.delivered_checks.max_checks_per_tick = 1
+        ctx, records = self._two_never_cached_deps_ctx()
+
+        async def _fake_get_task(task_id):
+            return records[task_id]
+
+        scheduler.get_task = AsyncMock(side_effect=_fake_get_task)
+
+        await scheduler._phase_backfill_terminal_dep_records(ctx)
+
+        assert scheduler.get_task.await_count == 2
+        assert ctx.terminal_dep_records == records
+        assert ctx.deferred_terminal_deps == frozenset()
+
+    @pytest.mark.asyncio
+    async def test_deferral_warning_names_the_record_fetch_budget(
+        self, scheduler: Scheduler, caplog
+    ):
+        scheduler.config.delivered_checks.max_record_fetches_per_tick = 1
+        ctx, records = self._two_never_cached_deps_ctx()
+
+        async def _fake_get_task(task_id):
+            return records[task_id]
+
+        scheduler.get_task = AsyncMock(side_effect=_fake_get_task)
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.scheduler'):
+            await scheduler._phase_backfill_terminal_dep_records(ctx)
+
+        assert any(
+            'delivered_checks.max_record_fetches_per_tick' in r.getMessage()
+            for r in caplog.records if r.levelno == logging.WARNING
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1030,6 +1948,7 @@ class TestDeliveredChecksConfig:
     sub-model.
     """
 
+    @pytest.mark.usefixtures("code_default_config")
     def test_default_max_checks_per_tick_is_50(self):
         config = OrchestratorConfig()
         assert config.delivered_checks.max_checks_per_tick == 50
@@ -1047,14 +1966,28 @@ class TestDeliveredChecksConfig:
         budget via mcp__escalation__reload_config without a restart."""
         assert 'delivered_checks.max_checks_per_tick' in RELOADABLE_FIELDS
 
+    @pytest.mark.usefixtures("code_default_config")
+    def test_default_max_record_fetches_per_tick_is_50(self):
+        config = OrchestratorConfig()
+        assert config.delivered_checks.max_record_fetches_per_tick == 50
+
+    def test_max_record_fetches_per_tick_rejects_zero(self):
+        with pytest.raises(ValidationError):
+            DeliveredChecksConfig(max_record_fetches_per_tick=0)
+
+    def test_max_record_fetches_per_tick_is_hot_reloadable(self):
+        assert 'delivered_checks.max_record_fetches_per_tick' in RELOADABLE_FIELDS
+
     # --- task 2583 (epsilon) knobs: enabled / grace_cycles / check_timeout_secs -
 
+    @pytest.mark.usefixtures("code_default_config")
     def test_default_enabled_is_true(self):
         """The gate is inert without metadata.delivered_checks on any dep, so
         it defaults ON — an operator must opt OUT explicitly."""
         config = OrchestratorConfig()
         assert config.delivered_checks.enabled is True
 
+    @pytest.mark.usefixtures("code_default_config")
     def test_default_grace_cycles_is_3(self):
         config = OrchestratorConfig()
         assert config.delivered_checks.grace_cycles == 3
@@ -1067,6 +2000,7 @@ class TestDeliveredChecksConfig:
         with pytest.raises(ValidationError):
             DeliveredChecksConfig(grace_cycles=-1)
 
+    @pytest.mark.usefixtures("code_default_config")
     def test_default_check_timeout_secs_is_120(self):
         config = OrchestratorConfig()
         assert config.delivered_checks.check_timeout_secs == 120
@@ -1104,7 +2038,7 @@ class TestDeliveredCheckGateEnabledSwitch:
 
     @pytest.fixture
     def scheduler(self) -> Scheduler:
-        config = OrchestratorConfig(max_per_module=1)
+        config = _gate_on_config(max_per_module=1)
         scheduler = Scheduler(config, event_store=_RecordingEventStore())  # type: ignore[arg-type]
         scheduler.finish_startup()
         return scheduler
@@ -1171,7 +2105,7 @@ class TestBuildDeliveredCheckEscalation:
         assert 'src/' in detail
         assert 'present' in detail
         assert 'FAILED' in detail
-        assert 'set task 10 back to pending' in detail
+        assert detail.splitlines()[-1] == 'observed: FAILED'
 
     def test_script_kind_detail_names_script_and_args_not_pattern(self):
         check = {
@@ -1200,7 +2134,39 @@ class TestBuildDeliveredCheckEscalation:
         assert 'exit_zero' in detail
         assert 'FAILED' in detail
         assert 'pattern' not in detail, 'script-kind detail must not mention pattern'
-        assert 'set task 11 back to pending' in detail
+        assert detail.splitlines()[-1] == 'observed: FAILED'
+
+    def test_path_kind_detail_names_paths_and_expect_not_pattern(self):
+        """A path descriptor has no ``pattern``; the binary that used to
+        render this body emitted a bare ``pattern: None`` line into a
+        born-at-L2 escalation that routes straight to a human. A gate that
+        fails and then misdescribes itself to the human it paged is the
+        costliest form of mis-handling a new kind."""
+        check = {
+            'name': 'cap-three',
+            'kind': 'path',
+            'expect': 'present',
+            'paths': ['orchestrator/tests/test_workflow_merge_gating_strand.py'],
+        }
+
+        summary, detail = _build_delivered_check_escalation(
+            task_id='11',
+            dep_id='21',
+            dep_status='done',
+            check=check,
+            main_sha='0123456789abcdef',
+        )
+
+        assert summary == (
+            "DEP_CAPABILITY_NOT_DELIVERED: task 11 — dep 21 done but check "
+            "'cap-three' fails on main@0123456789ab"
+        ), f'unexpected summary: {summary!r}'
+        assert 'kind=path' in detail
+        assert 'orchestrator/tests/test_workflow_merge_gating_strand.py' in detail
+        assert 'expect: present' in detail
+        assert 'FAILED' in detail
+        assert 'pattern' not in detail, 'path-kind detail must not mention pattern'
+        assert 'script' not in detail, 'path-kind detail must not mention script'
 
 
 # ---------------------------------------------------------------------------
@@ -1598,6 +2564,107 @@ class TestComputeDeliveredCheckCache:
         assert scheduler._streak_delivered_hold.value('10') == 0
         assert self._held_events(scheduler) == []
 
+    # --- (d2) an entry that is not a check descriptor folds into ERRORED ---
+
+    @pytest.mark.parametrize(
+        'declaration',
+        [
+            pytest.param(['garbage'], id='non-dict-entry'),
+            pytest.param(
+                {'name': 'cap-one', 'kind': 'grep', 'pattern': 'foo', 'expect': 'present'},
+                id='bare-dict-value',
+            ),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_unreadable_declaration_is_errored_never_run_never_cached(
+        self, scheduler: Scheduler, monkeypatch, declaration
+    ):
+        scheduler._resolve_main_sha, _sha_calls = self._fake_sha('sha1')
+        fake_runner, calls = self._fake_runner({})
+        monkeypatch.setattr('orchestrator.scheduler.run_delivered_check', fake_runner)
+        task = self._dependent()
+        dep = self._dep()
+        dep['metadata'] = {'delivered_checks': declaration}
+        status_map = {'20': 'done'}
+        tasks_by_id = {'20': dep, '10': task}
+
+        result = await scheduler._compute_delivered_check_cache([task], status_map, tasks_by_id)
+
+        assert calls == []
+        assert result == {}
+        assert not any(k[0] == '20' for k in scheduler._delivered_check_cache)
+        assert self._held_events(scheduler) == []
+        assert scheduler._delivered_check_error_streak.get('20') == 1
+
+    @pytest.mark.asyncio
+    async def test_unreadable_entry_beside_a_delivered_check_is_errored(
+        self, scheduler: Scheduler, monkeypatch
+    ):
+        scheduler._resolve_main_sha, _sha_calls = self._fake_sha('sha1')
+        fake_runner, calls = self._fake_runner({'cap-one': DeliveredCheckResult.DELIVERED})
+        monkeypatch.setattr('orchestrator.scheduler.run_delivered_check', fake_runner)
+        task = self._dependent()
+        dep = self._dep(checks=[*self._ONE_CHECK, 'garbage'])
+        status_map = {'20': 'done'}
+        tasks_by_id = {'20': dep, '10': task}
+
+        result = await scheduler._compute_delivered_check_cache([task], status_map, tasks_by_id)
+
+        assert calls == ['cap-one']
+        assert result == {}
+        assert not any(k[0] == '20' for k in scheduler._delivered_check_cache)
+
+    @pytest.mark.asyncio
+    async def test_failed_check_outranks_an_unreadable_sibling(
+        self, scheduler: Scheduler, monkeypatch
+    ):
+        scheduler._resolve_main_sha, _sha_calls = self._fake_sha('sha1')
+        fake_runner, _calls = self._fake_runner({'cap-one': DeliveredCheckResult.FAILED})
+        monkeypatch.setattr('orchestrator.scheduler.run_delivered_check', fake_runner)
+        task = self._dependent()
+        dep = self._dep(checks=[*self._ONE_CHECK, 'garbage'])
+        status_map = {'20': 'done'}
+        tasks_by_id = {'20': dep, '10': task}
+
+        result = await scheduler._compute_delivered_check_cache([task], status_map, tasks_by_id)
+
+        assert result == {'20': False}
+        assert len(self._held_events(scheduler)) == 1
+
+    @pytest.mark.parametrize(
+        'corrupted',
+        [
+            pytest.param(
+                [{'name': 'cap-one', 'kind': 'grep', 'pattern': 'foo', 'expect': 'present'}, 'garbage'],
+                id='garbage-entry-added',
+            ),
+            pytest.param(
+                {'name': 'cap-one', 'kind': 'grep', 'pattern': 'foo', 'expect': 'present'},
+                id='list-unwrapped-to-bare-dict',
+            ),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_cached_delivered_is_not_served_once_the_declaration_turns_unreadable(
+        self, scheduler: Scheduler, monkeypatch, corrupted
+    ):
+        scheduler._resolve_main_sha, _sha_calls = self._fake_sha('sha1')
+        fake_runner, _calls = self._fake_runner({'cap-one': DeliveredCheckResult.DELIVERED})
+        monkeypatch.setattr('orchestrator.scheduler.run_delivered_check', fake_runner)
+        task = self._dependent()
+        dep = self._dep(checks=list(self._ONE_CHECK))
+        status_map = {'20': 'done'}
+        tasks_by_id = {'20': dep, '10': task}
+
+        first = await scheduler._compute_delivered_check_cache([task], status_map, tasks_by_id)
+        assert first == {'20': True}
+
+        dep['metadata'] = {'delivered_checks': corrupted}
+        second = await scheduler._compute_delivered_check_cache([task], status_map, tasks_by_id)
+
+        assert second.get('20') is not True
+
     # --- (e) budget: the first dep this sweep is guaranteed to resolve -----
 
     @pytest.mark.asyncio
@@ -1679,6 +2746,37 @@ class TestComputeDeliveredCheckCache:
         assert not any(
             k[0] == '21' and k[1] == 'sha1' for k in scheduler._delivered_check_cache
         ), 'the deferred dep must not leave ANY digest-variant cache entry'
+
+    # --- (e3) a dep that runs no check leaves the guarantee to the next ----
+
+    @pytest.mark.asyncio
+    async def test_unreadable_only_first_dep_leaves_the_guarantee_to_the_next(
+        self, scheduler: Scheduler, monkeypatch
+    ):
+        """A wholly unreadable declaration runs no check, so it must not use
+        up the sweep's forward-progress guarantee. Otherwise a later dep with
+        more checks than the budget is deferred on every sweep for as long as
+        the malformed record stays unrepaired."""
+        scheduler.config.delivered_checks.max_checks_per_tick = 1
+        scheduler._resolve_main_sha, _sha_calls = self._fake_sha('sha1')
+        fake_runner, calls = self._fake_runner({
+            'cap-a': DeliveredCheckResult.DELIVERED,
+            'cap-b': DeliveredCheckResult.DELIVERED,
+        })
+        monkeypatch.setattr('orchestrator.scheduler.run_delivered_check', fake_runner)
+        task_a = self._dependent(task_id='10', dep_id='20')
+        dep_a = self._dep(dep_id='20', checks=['garbage'])
+        task_b = self._dependent(task_id='11', dep_id='21')
+        dep_b = self._dep(dep_id='21', checks=self._TWO_CHECKS)
+        status_map = {'20': 'done', '21': 'done'}
+        tasks_by_id = {'20': dep_a, '21': dep_b, '10': task_a, '11': task_b}
+
+        result = await scheduler._compute_delivered_check_cache(
+            [task_a, task_b], status_map, tasks_by_id
+        )
+
+        assert result == {'21': True}
+        assert calls == ['cap-a', 'cap-b']
 
     # --- (f) cache hit: same-sha re-sweep does NOT re-invoke the runner ----
 
@@ -2277,7 +3375,7 @@ class TestDeliveredCheckGraceEscalation:
 
     @pytest.fixture
     def scheduler(self) -> Scheduler:
-        config = OrchestratorConfig(max_per_module=1)
+        config = _gate_on_config(max_per_module=1)
         config.delivered_checks.grace_cycles = 3
         scheduler = Scheduler(
             config,
@@ -2360,9 +3458,40 @@ class TestDeliveredCheckGraceEscalation:
         assert 'cap-one' in call_kwargs['summary']
         assert '20' in call_kwargs['summary']
         assert 'sha1' in call_kwargs['summary']
+        # The scheduler hands over the failed descriptor and the DEPENDENCY
+        # (not the blocked dependent) as the check's owner.
+        assert call_kwargs['check'] == dep['metadata']['delivered_checks'][0]
+        assert call_kwargs['owner'] == {
+            'task_id': '20',
+            'check_name': 'cap-one',
+            'sidecar': None,
+        }
         assert scheduler._streak_delivered_fail.value(('10', '20')) == 0
         # No held event on the escalation (3rd) tick — only ticks 1 and 2.
         assert len(self._held_events(scheduler)) == 2
+
+    @pytest.mark.asyncio
+    async def test_escalation_names_the_failed_check_past_an_unreadable_entry(
+        self, scheduler: Scheduler, monkeypatch
+    ):
+        scheduler._resolve_main_sha = self._fake_sha('sha1')
+        monkeypatch.setattr(
+            'orchestrator.scheduler.run_delivered_check',
+            self._fake_runner({'cap-one': DeliveredCheckResult.FAILED}),
+        )
+        task = self._dependent()
+        failing = self._ONE_CHECK[0]
+        dep = self._dep(checks=['garbage', failing])
+        status_map = {'20': 'done'}
+        tasks_by_id = {'20': dep, '10': task}
+        callback = scheduler._callbacks.on_delivered_check_block
+        assert callback is not None
+
+        for _ in range(scheduler.config.delivered_checks.grace_cycles):
+            await scheduler._compute_delivered_check_cache([task], status_map, tasks_by_id)
+
+        callback.assert_called_once()
+        assert callback.call_args.kwargs['check'] == failing
 
     @pytest.mark.asyncio
     async def test_escalation_survives_sha_advances_and_transient_absence(
@@ -2402,10 +3531,10 @@ class TestDeliveredCheckGraceEscalation:
             sha_box['value'] = sha
             if present:
                 # The dependent is pending and gate-held — the real tick's
-                # _update_age_anchors stamps its pending-age anchor each tick
+                # AgeAnchors.observe stamps its pending-age anchor each tick
                 # it appears in the fetch; model that so tick3's absence
                 # exercises the stale_sweep absence-GC path under test.
-                scheduler._pending_anchor['10'] = 10
+                scheduler.age_anchors.observe([task], max_id=10)
                 ctx = TickContext(
                     tasks=[task],
                     status_map={'20': 'done'},
@@ -2592,7 +3721,7 @@ class TestAcquireNextDeliveredGate:
 
     @pytest.fixture
     def scheduler(self) -> Scheduler:
-        config = OrchestratorConfig(max_per_module=2)
+        config = _gate_on_config(max_per_module=2)
         scheduler = Scheduler(config, event_store=_RecordingEventStore())  # type: ignore[arg-type]
         scheduler.finish_startup()
         return scheduler
@@ -2783,7 +3912,7 @@ class TestAcquireNextDeliveredGateRealFilteredFetch:
 
     @pytest.fixture
     def scheduler(self) -> Scheduler:
-        config = OrchestratorConfig(max_per_module=2)
+        config = _gate_on_config(max_per_module=2)
         scheduler = Scheduler(config, event_store=_RecordingEventStore())  # type: ignore[arg-type]
         scheduler.finish_startup()
         return scheduler
@@ -3060,3 +4189,493 @@ class TestVerifyDeliveredChecksOnMain:
         )
 
         assert verdict.outcome == 'errored'
+
+
+# ---------------------------------------------------------------------------
+# TestGateMarkDoneOnDeliveredChecks (task 3057 — step-1 RED / step-2 GREEN)
+# ---------------------------------------------------------------------------
+
+#: The caller-supplied logger every row below passes as ``log=``. The helper
+#: MUST log on THIS logger (not ``orchestrator.delivered_checks``) so each
+#: adopting seam keeps its own module logger and its existing
+#: caplog-addressable name — that is the contract task 2794's stranded-arm
+#: caplog assertions (logger='orchestrator.harness') depend on surviving the
+#: step-20 refactor onto this helper.
+_SEAM_LOGGER = logging.getLogger('test.orchestrator.gate_seam')
+
+_VERIFY_TARGET = 'orchestrator.delivered_checks.verify_delivered_checks_on_main'
+
+
+class TestGateMarkDoneOnDeliveredChecks:
+    """``gate_mark_done_on_delivered_checks`` — the ONE shared mark-done
+    decision routed through by all eleven attribution-shaped stamp seams
+    (task 3057).
+
+    ``None`` <=> "mark-done may proceed"; a :class:`DeliveredChecksBlock`
+    <=> "do NOT stamp done here". Pins task 2794's six-row acceptance matrix
+    AT SOURCE, so the ten adopting seams only have to pin their own
+    delegation + recovery rather than re-deriving the decision.
+
+    ``verify_delivered_checks_on_main`` is patched throughout: this class
+    pins the DECISION layer. The check-runner semantics it delegates to are
+    pinned by ``TestVerifyDeliveredChecksOnMain`` above — the helper must
+    reuse that function VERBATIM and never fork a second check runner.
+    """
+
+    _SHA = 'a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2'
+    _SITE = 'unit-test-seam'
+
+    # -- fixtures ----------------------------------------------------------
+
+    def _grep_check(self, name: str = 'cap-x', pattern: str = 'SomePattern') -> dict:
+        return {'name': name, 'kind': 'grep', 'pattern': pattern, 'expect': 'present'}
+
+    def _script_check(
+        self, name: str = 'cap-s', script: str = 'scripts/verify_cap.sh'
+    ) -> dict:
+        return {'name': name, 'kind': 'script', 'script': script, 'timeout_secs': 5.0}
+
+    def _path_check(
+        self, name: str = 'cap-p', path: str = 'orchestrator/tests/test_x.py'
+    ) -> dict:
+        return {'name': name, 'kind': 'path', 'expect': 'present', 'paths': [path]}
+
+    def _meta(self, checks: list[dict] | None = None) -> dict:
+        return {'delivered_checks': checks if checks is not None else [self._grep_check()]}
+
+    def _git_ops(self, sha: str | None = None, raises: bool = False):
+        """Stub git_ops exposing ONLY ``get_main_sha`` (the sole attribute the
+        helper is permitted to touch — a wider stub would let an accidental
+        second git call pass unnoticed)."""
+        stub = AsyncMock()
+        if raises:
+            stub.get_main_sha = AsyncMock(side_effect=RuntimeError('git exploded'))
+        else:
+            stub.get_main_sha = AsyncMock(
+                return_value=self._SHA if sha is None else sha
+            )
+        return stub
+
+    def _warnings(self, caplog) -> list[logging.LogRecord]:
+        return [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING and r.name == _SEAM_LOGGER.name
+        ]
+
+    async def _call(self, metadata, *, verify_mock, **kwargs):
+        """Invoke the helper with ``verify_delivered_checks_on_main`` patched."""
+        kwargs.setdefault('project_root', '/proj')
+        kwargs.setdefault('check_timeout_secs', 5.0)
+        kwargs.setdefault('site', self._SITE)
+        kwargs.setdefault('log', _SEAM_LOGGER)
+        with patch(_VERIFY_TARGET, verify_mock):
+            return await gate_mark_done_on_delivered_checks('t-1', metadata, **kwargs)
+
+    # -- Row 1: hollow-done regression / FAILED ----------------------------
+
+    @pytest.mark.asyncio
+    async def test_failed_verdict_blocks_and_warns(self, caplog):
+        """Row 1 — the hollow-done regression this task exists to close.
+
+        A FAILED verdict must yield a ``reason='failed'`` block carrying the
+        SHA and the offending descriptor, and emit exactly ONE WARNING on the
+        CALLER's logger naming task id / check name / pattern / main SHA /
+        site — everything an operator needs to see WHY a done was withheld.
+        """
+        failed_check = self._grep_check()
+        verify = AsyncMock(return_value=DeliveredChecksVerdict(
+            outcome='failed', main_sha=self._SHA, failed_check=failed_check,
+        ))
+        git_ops = self._git_ops()
+
+        with caplog.at_level(logging.WARNING, logger=_SEAM_LOGGER.name):
+            block = await self._call(
+                self._meta(), verify_mock=verify, git_ops=git_ops,
+            )
+
+        assert isinstance(block, DeliveredChecksBlock)
+        assert block.reason == 'failed'
+        assert block.main_sha == self._SHA
+        assert block.failed_check == failed_check
+
+        warnings = self._warnings(caplog)
+        assert len(warnings) == 1, f'expected exactly one WARNING, got {warnings}'
+        text = warnings[0].getMessage()
+        assert 't-1' in text
+        assert 'cap-x' in text
+        assert 'SomePattern' in text
+        assert self._SHA in text
+        assert self._SITE in text
+
+    # -- Row 2: FAILED, script kind ----------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_failed_script_check_warning_names_the_script(self, caplog):
+        """Row 2 — pins the is_grep branch of the WARNING: a script-kind
+        descriptor has no ``pattern``, so the message must name the SCRIPT
+        (naming a ``None`` pattern would be useless to an operator)."""
+        failed_check = self._script_check()
+        verify = AsyncMock(return_value=DeliveredChecksVerdict(
+            outcome='failed', main_sha=self._SHA, failed_check=failed_check,
+        ))
+
+        with caplog.at_level(logging.WARNING, logger=_SEAM_LOGGER.name):
+            block = await self._call(
+                self._meta([failed_check]),
+                verify_mock=verify,
+                git_ops=self._git_ops(),
+            )
+
+        assert block is not None and block.reason == 'failed'
+        text = self._warnings(caplog)[0].getMessage()
+        assert 'scripts/verify_cap.sh' in text
+        assert 'cap-s' in text
+
+    @pytest.mark.asyncio
+    async def test_failed_path_check_warning_names_the_paths(self, caplog):
+        """Row 2b — the same defect one kind over. ``is_grep`` is False for
+        a path descriptor, so the old binary logged ``script=None``: it
+        named a field the descriptor does not have, carrying a value that
+        is not the problem. The WARNING must name ``paths`` and the actual
+        path instead."""
+        failed_check = self._path_check()
+        verify = AsyncMock(return_value=DeliveredChecksVerdict(
+            outcome='failed', main_sha=self._SHA, failed_check=failed_check,
+        ))
+
+        with caplog.at_level(logging.WARNING, logger=_SEAM_LOGGER.name):
+            block = await self._call(
+                self._meta([failed_check]),
+                verify_mock=verify,
+                git_ops=self._git_ops(),
+            )
+
+        assert block is not None and block.reason == 'failed'
+        text = self._warnings(caplog)[0].getMessage()
+        assert 'cap-p' in text
+        assert 'orchestrator/tests/test_x.py' in text
+        assert 'paths' in text
+        assert 'script' not in text, (
+            'a path descriptor has no script; naming one (with a None value) '
+            f'misdescribes the failure: {text!r}'
+        )
+
+    # -- Row 3: all_delivered ----------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_all_delivered_returns_none_and_is_silent(self, caplog):
+        """Row 3 — the capability IS on main: mark-done proceeds (``None``),
+        and nothing is logged at WARNING (a verified done is not an event
+        worth warning about)."""
+        verify = AsyncMock(return_value=DeliveredChecksVerdict(
+            outcome='all_delivered', main_sha=self._SHA,
+        ))
+
+        with caplog.at_level(logging.WARNING, logger=_SEAM_LOGGER.name):
+            block = await self._call(
+                self._meta(), verify_mock=verify, git_ops=self._git_ops(),
+            )
+
+        assert block is None
+        assert self._warnings(caplog) == []
+
+    # -- Row 4: no delivered_checks (inertness) ----------------------------
+
+    @pytest.mark.parametrize(
+        'metadata',
+        [
+            pytest.param({}, id='empty-metadata'),
+            pytest.param(None, id='none-metadata'),
+            pytest.param({'delivered_checks': []}, id='empty-checks-list'),
+            pytest.param({'delivered_checks': {}}, id='empty-dict-value'),
+            pytest.param({'delivered_checks': ''}, id='empty-str-value'),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_no_delivered_checks_is_inert_with_zero_io(self, metadata):
+        """Row 4 — check-less tasks (the overwhelmingly common case) keep
+        their exact pre-guard behavior with ZERO I/O: no git call, no check
+        run. This inertness lives HERE, in one place, which is why every
+        adopting seam is allowed to delegate unconditionally."""
+        verify = AsyncMock()
+        git_ops = self._git_ops()
+
+        block = await self._call(metadata, verify_mock=verify, git_ops=git_ops)
+
+        assert block is None
+        verify.assert_not_awaited()
+        git_ops.get_main_sha.assert_not_awaited()
+
+    # -- Row 5: check-runner ERROR/timeout ---------------------------------
+
+    @pytest.mark.asyncio
+    async def test_errored_verdict_blocks_fail_safe(self, caplog):
+        """Row 5 — the checks could not be evaluated: make no claim either
+        way. Still a BLOCK (never stamp on unknown capability state), but
+        ``reason='errored'`` so callers can tell it apart from a definitive
+        absence."""
+        verify = AsyncMock(return_value=DeliveredChecksVerdict(
+            outcome='errored', main_sha=self._SHA,
+        ))
+
+        with caplog.at_level(logging.WARNING, logger=_SEAM_LOGGER.name):
+            block = await self._call(
+                self._meta(), verify_mock=verify, git_ops=self._git_ops(),
+            )
+
+        assert block is not None
+        assert block.reason == 'errored'
+        assert block.main_sha == self._SHA
+        assert block.failed_check is None
+
+        text = self._warnings(caplog)[0].getMessage()
+        assert 't-1' in text
+        assert self._SHA in text
+        assert self._SITE in text
+
+    # -- Row 5b: an entry that is not a check descriptor -------------------
+
+    @pytest.mark.parametrize(
+        ('metadata', 'unreadable'),
+        [
+            pytest.param({'delivered_checks': ['garbage']}, 'garbage', id='non-dict-entry'),
+            pytest.param(
+                {'delivered_checks': {'name': 'cap', 'kind': 'grep', 'pattern': 'X', 'expect': 'present'}},
+                {'name': 'cap', 'kind': 'grep', 'pattern': 'X', 'expect': 'present'},
+                id='bare-dict-value',
+            ),
+            pytest.param({'delivered_checks': 'cap-one'}, 'cap-one', id='str-value'),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_an_unreadable_declaration_is_never_inert_and_blocks_errored(
+        self, caplog, metadata, unreadable
+    ):
+        """A declaration that is not a list of check descriptors can never be
+        evaluated, so it blocks as ``errored`` even when everything that WAS
+        readable delivered. It is never iterated key- or character-wise."""
+        verify = AsyncMock(return_value=DeliveredChecksVerdict(
+            outcome='all_delivered', main_sha=self._SHA,
+        ))
+
+        with caplog.at_level(logging.WARNING, logger=_SEAM_LOGGER.name):
+            block = await self._call(metadata, verify_mock=verify, git_ops=self._git_ops())
+
+        assert isinstance(block, DeliveredChecksBlock)
+        assert block.reason == 'errored'
+        for awaited in verify.await_args_list:
+            assert awaited.args[0] == []
+        warnings = self._warnings(caplog)
+        assert len(warnings) == 1, f'expected exactly one WARNING, got {warnings}'
+        text = warnings[0].getMessage()
+        assert 't-1' in text
+        assert self._SITE in text
+        assert repr(unreadable) in text
+
+    @pytest.mark.asyncio
+    async def test_an_unreadable_entry_beside_a_delivered_check_still_blocks_errored(self):
+        valid = self._grep_check()
+        verify = AsyncMock(return_value=DeliveredChecksVerdict(
+            outcome='all_delivered', main_sha=self._SHA,
+        ))
+
+        block = await self._call(
+            {'delivered_checks': [valid, 'garbage']}, verify_mock=verify, git_ops=self._git_ops(),
+        )
+
+        assert block is not None and block.reason == 'errored'
+        verify.assert_awaited_once()
+        assert verify.await_args is not None
+        assert verify.await_args.args[0] == [valid]
+
+    @pytest.mark.asyncio
+    async def test_a_failed_check_outranks_an_unreadable_sibling(self):
+        valid = self._grep_check()
+        verify = AsyncMock(return_value=DeliveredChecksVerdict(
+            outcome='failed', main_sha=self._SHA, failed_check=valid,
+        ))
+
+        block = await self._call(
+            {'delivered_checks': [valid, 'garbage']}, verify_mock=verify, git_ops=self._git_ops(),
+        )
+
+        assert block is not None
+        assert block.reason == 'failed'
+        assert block.failed_check == valid
+
+    # -- Row 6: kill switch ------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_enabled_false_is_the_single_kill_switch(self):
+        """Row 6 — ``enabled=False`` disarms the guard even with a FAILED
+        verdict staged, and costs ZERO I/O. Every seam FORWARDS the config
+        flag here rather than short-circuiting locally, so one hot-reload of
+        ``delivered_checks.enabled`` disarms all eleven guards at once."""
+        verify = AsyncMock(return_value=DeliveredChecksVerdict(
+            outcome='failed', main_sha=self._SHA, failed_check=self._grep_check(),
+        ))
+        git_ops = self._git_ops()
+
+        block = await self._call(
+            self._meta(), verify_mock=verify, git_ops=git_ops, enabled=False,
+        )
+
+        assert block is None
+        verify.assert_not_awaited()
+        git_ops.get_main_sha.assert_not_awaited()
+
+    # -- main-SHA resolution fail-safe arms (kept DISTINCT) ----------------
+
+    @pytest.mark.asyncio
+    async def test_get_main_sha_raising_is_fail_safe(self, caplog):
+        """``get_main_sha()`` raising (git error) -> ``main_sha_unresolved``
+        with a ``None`` SHA, and the checks are NEVER run (there is no ref to
+        run them against)."""
+        verify = AsyncMock()
+
+        with caplog.at_level(logging.WARNING, logger=_SEAM_LOGGER.name):
+            block = await self._call(
+                self._meta(), verify_mock=verify, git_ops=self._git_ops(raises=True),
+            )
+
+        assert block is not None
+        assert block.reason == 'main_sha_unresolved'
+        assert block.main_sha is None
+        verify.assert_not_awaited()
+        assert 't-1' in self._warnings(caplog)[0].getMessage()
+
+    @pytest.mark.asyncio
+    async def test_get_main_sha_empty_is_fail_safe_with_distinct_warning(self, caplog):
+        """``get_main_sha()`` returning ``''`` -> the same block class, but a
+        DISTINCT warning text. Kept separate from the raising arm so a
+        regression that drops either one is caught: an empty SHA is a silent
+        git-state anomaly, not an exception."""
+        verify = AsyncMock()
+
+        with caplog.at_level(logging.WARNING, logger=_SEAM_LOGGER.name):
+            block = await self._call(
+                self._meta(), verify_mock=verify, git_ops=self._git_ops(sha=''),
+            )
+
+        assert block is not None
+        assert block.reason == 'main_sha_unresolved'
+        assert block.main_sha is None
+        verify.assert_not_awaited()
+
+        empty_text = self._warnings(caplog)[0].getMessage()
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger=_SEAM_LOGGER.name):
+            await self._call(
+                self._meta(), verify_mock=AsyncMock(),
+                git_ops=self._git_ops(raises=True),
+            )
+        raising_text = self._warnings(caplog)[0].getMessage()
+        assert empty_text != raising_text
+
+    # -- never-raises -------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_verify_raising_degrades_to_errored_block(self, caplog):
+        """Defence in depth: ``verify_delivered_checks_on_main`` documents
+        "Never raises", but if that contract is ever broken the guard must
+        still not be able to CRASH a mark-done path. It degrades to a
+        fail-safe ``errored`` block instead of propagating."""
+        verify = AsyncMock(side_effect=RuntimeError('verify exploded'))
+
+        with caplog.at_level(logging.WARNING, logger=_SEAM_LOGGER.name):
+            block = await self._call(
+                self._meta(), verify_mock=verify, git_ops=self._git_ops(),
+            )
+
+        assert block is not None
+        assert block.reason == 'errored'
+        assert block.main_sha == self._SHA
+
+    # -- pre-resolved main_sha mode ----------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_supplied_main_sha_short_circuits_git(self):
+        """The two seams that already hold a main SHA (``reconcile_landed_row``
+        RC-2 and ``_handle_already_done_report``) pass it through.
+
+        Not merely an optimization — a CORRECTNESS requirement: both have
+        already made an ancestry decision against that exact SHA, and
+        re-resolving could audit a DIFFERENT (newer) main than the decision
+        being gated.
+        """
+        supplied = 'f' * 40
+        verify = AsyncMock(return_value=DeliveredChecksVerdict(
+            outcome='all_delivered', main_sha=supplied,
+        ))
+        git_ops = self._git_ops()
+
+        block = await self._call(
+            self._meta(), verify_mock=verify, git_ops=git_ops, main_sha=supplied,
+        )
+
+        assert block is None
+        git_ops.get_main_sha.assert_not_awaited()
+        assert verify.await_args is not None
+        assert verify.await_args.kwargs['main_sha'] == supplied
+
+    @pytest.mark.asyncio
+    async def test_supplied_main_sha_permits_no_git_ops(self):
+        """In pre-resolved mode ``git_ops=None`` is acceptable — merge_queue's
+        module-level ``reconcile_landed_row`` has no git_ops handle at all."""
+        supplied = 'e' * 40
+        verify = AsyncMock(return_value=DeliveredChecksVerdict(
+            outcome='all_delivered', main_sha=supplied,
+        ))
+
+        block = await self._call(
+            self._meta(), verify_mock=verify, git_ops=None, main_sha=supplied,
+        )
+
+        assert block is None
+        assert verify.await_args is not None
+        assert verify.await_args.kwargs['main_sha'] == supplied
+
+    @pytest.mark.asyncio
+    async def test_no_git_ops_and_no_main_sha_is_fail_safe(self):
+        """Conversely: no git_ops AND no pre-resolved SHA means the guard
+        cannot resolve a ref at all -> fail-safe block, never a silent pass."""
+        verify = AsyncMock()
+
+        block = await self._call(self._meta(), verify_mock=verify, git_ops=None)
+
+        assert block is not None
+        assert block.reason == 'main_sha_unresolved'
+        verify.assert_not_awaited()
+
+    # -- delegation contract ------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_forwards_project_root_timeout_and_runner_verbatim(self):
+        """The helper is a DECISION layer, not a second check runner: the
+        checks list, project_root, check_timeout_secs and the injected runner
+        all reach ``verify_delivered_checks_on_main`` verbatim."""
+        checks = [self._grep_check('a', 'PatA'), self._grep_check('b', 'PatB')]
+        verify = AsyncMock(return_value=DeliveredChecksVerdict(
+            outcome='all_delivered', main_sha=self._SHA,
+        ))
+
+        async def _custom_runner(argv, **kwargs):
+            return (0, '', '')
+
+        block = await self._call(
+            self._meta(checks),
+            verify_mock=verify,
+            git_ops=self._git_ops(),
+            project_root='/some/main/checkout',
+            check_timeout_secs=17.5,
+            runner=_custom_runner,
+        )
+
+        assert block is None
+        verify.assert_awaited_once()
+        assert verify.await_args is not None
+        assert verify.await_args.args[0] == checks
+        assert verify.await_args.kwargs['project_root'] == '/some/main/checkout'
+        assert verify.await_args.kwargs['check_timeout_secs'] == 17.5
+        assert verify.await_args.kwargs['main_sha'] == self._SHA
+        assert verify.await_args.kwargs['runner'] is _custom_runner

@@ -1,0 +1,18 @@
+{
+  "task_id": "5229",
+  "reason": "IndexLockStandOff.__post_init__ enforces its documented holder_scan-iff-not-cleared invariant (review amendment); one guard branch is net-additive",
+  "measures": [
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/git_ops.py",
+      "baseline": 1579,
+      "current": 1580
+    },
+    {
+      "measure": "total:cognitive",
+      "key": "<cluster>",
+      "baseline": 5272,
+      "current": 5273
+    }
+  ]
+}

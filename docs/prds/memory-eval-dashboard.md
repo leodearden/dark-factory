@@ -49,7 +49,7 @@ Bare B: blast radius is one package (dashboard), <8 mechanisms, one downstream c
 | In-browser Babel + script-tag registration; MemoryTab exists | `static/redux/index.html:16-41`; `tabs.jsx:555` (`MemoryTab`) |
 | Frontend structural-contract test idiom + backend TestClient idiom | `dashboard/tests/test_tab_escalations.py:1-6`; `test_app.py` et al. |
 | `Escalation.dedupe_fingerprint` structured field | `escalation/src/escalation/models.py` (dataclass field, "content fingerprint") |
-| `.jsx`/`.html`/`.js`/`.py` legal in `metadata.files` | `fused-memory/src/fused_memory/middleware/lock_charter_guard.py:84-91` (`CODE_EXTENSIONS`) |
+| `.jsx`/`.html`/`.js`/`.py` legal in `metadata.files` | `fused-memory/src/fused_memory/middleware/lock_charter_guard.py:107-120` (`FILE_EXTENSIONS`) |
 | M1 metrics artifacts + committed exemplar fixtures (`shared/tests/fixtures/`) | producer **3207** (in-progress) — upstream dep of α |
 | M2 limits artifact (`limits-current.json`) | producer **3207** — same dep |
 | Verdicts artifact + escalation `dedupe_fingerprint` stamping + exemplar fixture | producer **3211** (pending; amended 2026-07-29, `0ddaf23753`) — upstream dep of γ |

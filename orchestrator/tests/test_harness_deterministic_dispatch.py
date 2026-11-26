@@ -14,8 +14,10 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from escalation.queue import EscalationQueue
 
+from orchestrator.config import DeterministicConfig
 from orchestrator.harness import Harness
 from orchestrator.scheduler import Scheduler, TaskAssignment
+from orchestrator.slot_lease import SlotLease
 from orchestrator.workflow import TerminalReport, WorkflowOutcome, WorkflowState
 
 # ---------------------------------------------------------------------------
@@ -38,8 +40,8 @@ def harness(tmp_path: Path, mock_orch_config) -> Harness:
     ):
         h = Harness(mock_orch_config)
 
-    # Async-mock scheduler
-    h.scheduler = MagicMock()
+    # Async-mock scheduler; pinned unpaused, since a bare MagicMock().is_paused is truthy.
+    h.scheduler = MagicMock(is_paused=False, pause_reason=None)
     h.scheduler.is_deterministic = MagicMock(return_value=False)  # overridden per test
     h.scheduler.get_status = AsyncMock(return_value='blocked')
     h.scheduler.set_task_status = AsyncMock()
@@ -105,7 +107,7 @@ class TestRunSlotRouting:
             mock_runner.run = AsyncMock(return_value=WorkflowOutcome.BLOCKED)
             mock_dr.return_value = mock_runner
 
-            await harness._run_slot(assignment, _make_sem())
+            await harness._run_slot(assignment, SlotLease(assignment.task_id, harness.scheduler, _make_sem()))
 
         # TaskWorkflow must never have been instantiated
         mock_tw.assert_not_called()
@@ -125,7 +127,7 @@ class TestRunSlotRouting:
             mock_runner.run = AsyncMock(return_value=WorkflowOutcome.BLOCKED)
             mock_dr.return_value = mock_runner
 
-            report = await harness._run_slot(assignment, _make_sem())
+            report = await harness._run_slot(assignment, SlotLease(assignment.task_id, harness.scheduler, _make_sem()))
 
         assert report is not None
         assert report.outcome == WorkflowOutcome.BLOCKED
@@ -145,7 +147,7 @@ class TestRunSlotRouting:
             mock_runner.run = AsyncMock(return_value=WorkflowOutcome.BLOCKED)
             mock_dr.return_value = mock_runner
 
-            report = await harness._run_slot(assignment, _make_sem())
+            report = await harness._run_slot(assignment, SlotLease(assignment.task_id, harness.scheduler, _make_sem()))
 
         assert report is not None
         assert report.block_reason == 'deterministic_gate'
@@ -165,7 +167,7 @@ class TestRunSlotRouting:
             mock_runner.run = AsyncMock(return_value=WorkflowOutcome.DONE)
             mock_dr.return_value = mock_runner
 
-            report = await harness._run_slot(assignment, _make_sem())
+            report = await harness._run_slot(assignment, SlotLease(assignment.task_id, harness.scheduler, _make_sem()))
 
         assert report is not None
         assert report.outcome == WorkflowOutcome.DONE
@@ -205,7 +207,7 @@ class TestRunSlotRouting:
             mock_wf._steward = None
             mock_tw.return_value = mock_wf
 
-            await harness._run_slot(assignment, _make_sem())
+            await harness._run_slot(assignment, SlotLease(assignment.task_id, harness.scheduler, _make_sem()))
 
         # DeterministicRunner must NOT have been called
         mock_dr.assert_not_called()
@@ -271,7 +273,7 @@ class TestRestartStampClear:
         harness.scheduler.is_deterministic = MagicMock(return_value=True)
         harness.scheduler.get_status = AsyncMock(return_value='blocked')
 
-        await harness._action_teardown_and_set_status(task_id, 'pending', 'restart')
+        await harness._action_teardown_and_set_status(task_id, 'pending', 'restart', escalation_id=f'esc-{task_id}-1')
 
         # update_task must have been called to clear the stamps
         harness.scheduler.update_task.assert_awaited()  # type: ignore[attr-defined]
@@ -296,7 +298,7 @@ class TestRestartStampClear:
         harness.scheduler.is_deterministic = MagicMock(return_value=True)
         harness.scheduler.get_status = AsyncMock(return_value='blocked')
 
-        await harness._action_teardown_and_set_status(task_id, 'pending', 'restart')
+        await harness._action_teardown_and_set_status(task_id, 'pending', 'restart', escalation_id=f'esc-{task_id}-1')
 
         # Check before_done_ran_at is also cleared
         stamp_clear_calls = [
@@ -315,7 +317,7 @@ class TestRestartStampClear:
         harness.scheduler.is_deterministic = MagicMock(return_value=True)
         harness.scheduler.get_status = AsyncMock(return_value='blocked')
 
-        await harness._action_teardown_and_set_status(task_id, 'blocked', 'park')
+        await harness._action_teardown_and_set_status(task_id, 'blocked', 'park', escalation_id=f'esc-{task_id}-1')
 
         # update_task must NOT be called for stamp clearing on park
         stamp_clear_calls = [
@@ -336,7 +338,7 @@ class TestRestartStampClear:
         harness.scheduler.is_deterministic = MagicMock(return_value=True)
         harness.scheduler.get_status = AsyncMock(return_value='blocked')
 
-        await harness._action_teardown_and_set_status(task_id, 'cancelled', 'abandon')
+        await harness._action_teardown_and_set_status(task_id, 'cancelled', 'abandon', escalation_id=f'esc-{task_id}-1')
 
         stamp_clear_calls = [
             c for c in harness.scheduler.update_task.call_args_list  # type: ignore[attr-defined]
@@ -417,3 +419,31 @@ class TestDeterministicDispatchDoubleDispatchGuard:
         # Report reflects the runner's outcome (not the benign skip).
         assert report.outcome == WorkflowOutcome.BLOCKED
         assert report.block_reason == 'deterministic_gate'
+
+
+@pytest.mark.asyncio
+class TestDeterministicSlotReadsTheStallCap:
+    """``deterministic.predicate_recheck_stall_cap`` is green-tier: every slot
+    builds its runner from the live config, so a reload applies from the next
+    dispatch (plans/completion-driven-triggers-prd.md C1)."""
+
+    async def test_each_slot_passes_the_current_cap(self, harness: Harness, tmp_path: Path):
+        assignment = _make_assignment(_det_task(task_id='6387'))
+        harness.scheduler.is_deterministic = MagicMock(return_value=True)
+        harness.scheduler.get_status = AsyncMock(return_value='pending')
+        harness._escalation_queue = EscalationQueue(tmp_path)
+
+        with patch('orchestrator.harness.DeterministicRunner') as mock_dr:
+            mock_runner = MagicMock()
+            mock_runner.run = AsyncMock(return_value=WorkflowOutcome.REQUEUED)
+            mock_dr.return_value = mock_runner
+
+            harness.config.deterministic = DeterministicConfig(predicate_recheck_stall_cap=7)
+            first = await harness._run_deterministic_slot(assignment)
+            harness.config.deterministic = DeterministicConfig(predicate_recheck_stall_cap=3)
+            await harness._run_deterministic_slot(assignment)
+
+        caps = [call.kwargs['predicate_recheck_stall_cap'] for call in mock_dr.call_args_list]
+        assert caps == [7, 3]
+        assert first.outcome == WorkflowOutcome.REQUEUED
+        assert first.block_reason == ''

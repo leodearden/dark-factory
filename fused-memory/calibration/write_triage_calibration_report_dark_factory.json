@@ -1,0 +1,223 @@
+{
+  "chosen_t_high": null,
+  "chosen_t_low": null,
+  "reason": "not_separable: the highest measured negative (0.9268408843200905) is at or above every measured duplicate (max=0.9217958509264798), so no measured value separates the classes. Refusing to interpolate a threshold the data does not support \u2014 this outcome is itself the calibration finding.",
+  "deterministic_band_false_positives": null,
+  "distributions": {
+    "true_dup": {
+      "n": 49,
+      "min": 0.6062306005178615,
+      "max": 0.9217958509264798,
+      "mean": 0.7596692104446414,
+      "median": 0.7575111086083243,
+      "p05": 0.6348691398752037,
+      "p25": 0.6890775730058293,
+      "p75": 0.8151815449799091,
+      "p95": 0.8930307512252953
+    },
+    "unrelated": {
+      "n": 5359,
+      "min": 0.11653607694274686,
+      "max": 0.8808805140029784,
+      "mean": 0.3887776002528078,
+      "median": 0.38608712555746844,
+      "p05": 0.23396745122358378,
+      "p25": 0.31776004546169756,
+      "p75": 0.45616958234382227,
+      "p95": 0.5555462107985322
+    },
+    "hard_negative": {
+      "n": 478,
+      "min": 0.2868297144774432,
+      "max": 0.9268408843200905,
+      "mean": 0.6591701533505547,
+      "median": 0.6683184443517652,
+      "p05": 0.4423091977418062,
+      "p25": 0.5960853862189479,
+      "p75": 0.7403295155698358,
+      "p95": 0.8224868246994009
+    }
+  },
+  "per_band": {
+    "true_dup": {
+      "deterministic": 0,
+      "judge": 0,
+      "store": 49
+    },
+    "unrelated": {
+      "deterministic": 0,
+      "judge": 0,
+      "store": 5359
+    },
+    "hard_negative": {
+      "deterministic": 0,
+      "judge": 0,
+      "store": 478
+    }
+  },
+  "per_category": {
+    "preferences_and_norms": {
+      "distributions": {
+        "true_dup": {
+          "n": 10,
+          "min": 0.6881197565497752,
+          "max": 0.9217958509264798,
+          "mean": 0.8018214072888428,
+          "median": 0.7785953332022347,
+          "p05": 0.6881197565497752,
+          "p25": 0.7365058306049741,
+          "p75": 0.8713596864798853,
+          "p95": 0.9217958509264798
+        },
+        "unrelated": {
+          "n": 1629,
+          "min": 0.11653607694274686,
+          "max": 0.8808805140029784,
+          "mean": 0.41515320017246454,
+          "median": 0.4103785790605616,
+          "p05": 0.2647168699136665,
+          "p25": 0.3446849499733894,
+          "p75": 0.4801669337525975,
+          "p95": 0.5754179887123984
+        },
+        "hard_negative": {
+          "n": 377,
+          "min": 0.2868297144774432,
+          "max": 0.9268408843200905,
+          "mean": 0.6508198985838697,
+          "median": 0.6593882304834113,
+          "p05": 0.4323449591082335,
+          "p25": 0.5776458195666665,
+          "p75": 0.7372534636699833,
+          "p95": 0.8263958471746586
+        }
+      },
+      "t_high": null,
+      "t_low": null,
+      "reason": "not_separable: the highest measured negative (0.9268408843200905) is at or above every measured duplicate (max=0.9217958509264798), so no measured value separates the classes. Refusing to interpolate a threshold the data does not support \u2014 this outcome is itself the calibration finding.",
+      "pair_counts": {
+        "true_dup": 10,
+        "unrelated": 1629,
+        "hard_negative": 377
+      },
+      "pooled_t_high_negatives_admitted": null
+    },
+    "observations_and_summaries": {
+      "distributions": {
+        "true_dup": {
+          "n": 39,
+          "min": 0.6062306005178615,
+          "max": 0.9113608278206357,
+          "mean": 0.7488609548435642,
+          "median": 0.7527376858026495,
+          "p05": 0.6310130700781506,
+          "p25": 0.6852700815275279,
+          "p75": 0.8061213529440064,
+          "p95": 0.8930307512252953
+        },
+        "unrelated": {
+          "n": 871,
+          "min": 0.1613920888959007,
+          "max": 0.769899139893841,
+          "mean": 0.38153717744201976,
+          "median": 0.3766406449943909,
+          "p05": 0.22714127575662724,
+          "p25": 0.3153640404589709,
+          "p75": 0.44475909050499474,
+          "p95": 0.5366858474513071
+        },
+        "hard_negative": {
+          "n": 80,
+          "min": 0.47708271437202887,
+          "max": 0.8380073276180046,
+          "mean": 0.6924919994410675,
+          "median": 0.68551542967373,
+          "p05": 0.5592359871298351,
+          "p25": 0.6353298390555889,
+          "p75": 0.7587606079702675,
+          "p95": 0.8126198358174146
+        }
+      },
+      "t_high": 0.8578402160989046,
+      "t_low": 0.6310130700781506,
+      "reason": null,
+      "pair_counts": {
+        "true_dup": 39,
+        "unrelated": 871,
+        "hard_negative": 80
+      },
+      "pooled_t_high_negatives_admitted": null
+    }
+  },
+  "recall_at_k": {
+    "per_k": [
+      {
+        "k": 1,
+        "hits": 0,
+        "total": 91,
+        "recall": 0.0
+      },
+      {
+        "k": 3,
+        "hits": 10,
+        "total": 91,
+        "recall": 0.10989010989010989
+      },
+      {
+        "k": 5,
+        "hits": 23,
+        "total": 91,
+        "recall": 0.25274725274725274
+      },
+      {
+        "k": 10,
+        "hits": 36,
+        "total": 91,
+        "recall": 0.3956043956043956
+      },
+      {
+        "k": 20,
+        "hits": 61,
+        "total": 91,
+        "recall": 0.6703296703296703
+      }
+    ],
+    "canonical_absent": [],
+    "absent_in_denominator": false
+  },
+  "provenance": {
+    "fixture_path": "tests/fixtures/write_triage_calibration_dark_factory.jsonl",
+    "embedder_model": "text-embedding-3-small",
+    "embedder_dimensions": 1536,
+    "project_id": "dark_factory",
+    "retrieval_mode": "production",
+    "retrieval_call": "fused_memory.server.write_triage::retrieve_candidates",
+    "canonical_aliases_path": null,
+    "canonical_aliases_count": 0,
+    "record_count": 109,
+    "cluster_count": 18,
+    "per_category_record_counts": {
+      "preferences_and_norms": 64,
+      "observations_and_summaries": 45
+    },
+    "cross_category_dropped": 2880,
+    "degraded_retrievals": 0,
+    "pair_counts": {
+      "true_dup": 49,
+      "unrelated": 5359,
+      "hard_negative": 478
+    },
+    "per_category_pair_counts": {
+      "preferences_and_norms": {
+        "true_dup": 10,
+        "unrelated": 1629,
+        "hard_negative": 377
+      },
+      "observations_and_summaries": {
+        "true_dup": 39,
+        "unrelated": 871,
+        "hard_negative": 80
+      }
+    }
+  }
+}

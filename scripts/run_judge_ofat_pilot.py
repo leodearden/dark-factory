@@ -11,8 +11,8 @@ process exit code). Two modes:
 * ``--run`` — invoke the eval-revival ο OFAT seam
   (``run_ofat_stage(task_paths, JUDGE_EVAL_CONFIGS, trials=N)``) over the fixtures
   to PRODUCE results (a live, hours-long, real-API-spend run of a Sonnet-max
-  implementer × fixtures × trials — NOT unit-tested by design), persist them, then
-  fall through to the same analysis.
+  implementer × fixtures × trials — NOT unit-tested by design; every executor
+  persists its own cell), then fall through to the same analysis.
 
 Exit codes gate the decide-and-act flip: ``0`` adopt · ``1`` marginal · ``2``
 reject · ``2`` on any other verdict. On a clear ``adopt`` an operator/CI applies
@@ -23,7 +23,6 @@ sonnet and escalate with the generated report.
 from __future__ import annotations
 
 import argparse
-import json
 import sys
 from pathlib import Path
 
@@ -35,7 +34,16 @@ for _rel in ('orchestrator/src', 'shared/src', 'escalation/src'):
     _p = str(_REPO_ROOT / _rel)
     if _p not in sys.path:
         sys.path.insert(0, _p)
+# scripts/ itself: implicit on sys.path[0] when run standalone (Python adds the
+# main script's own dir), and explicit via scripts/tests/conftest.py under
+# pytest — but not guaranteed when this module is loaded via
+# importlib.util.spec_from_file_location (orchestrator/tests/test_judge_ofat_pilot.py),
+# so make it explicit here too (idempotent).
+_p = str(_REPO_ROOT / 'scripts')
+if _p not in sys.path:
+    sys.path.insert(0, _p)
 
+from _eval_results_io import load_results_from_dir  # noqa: E402
 from orchestrator.evals.judge_pilot import (  # noqa: E402
     CANDIDATE_JUDGE,
     DEFAULT_NON_INFERIORITY_MARGIN,
@@ -49,31 +57,17 @@ from orchestrator.evals.judge_pilot import (  # noqa: E402
 _EXIT_BY_VERDICT = {'adopt': 0, 'marginal': 1, 'reject': 2}
 
 
-def _load_results_from_dir(results_dir: Path) -> list:
-    """Load every persisted ``EvalResult`` JSON in *results_dir*.
-
-    Mirrors ``runner.load_results`` (filter to known dataclass fields so results
-    predating a field still load) but over an arbitrary dir rather than the
-    packaged ``RESULTS_DIR`` — the ``--results-dir`` override.
-    """
-    from orchestrator.evals.runner import EvalResult
-
-    known = {f.name for f in EvalResult.__dataclass_fields__.values()}
-    results = []
-    for path in sorted(Path(results_dir).glob('*.json')):
-        with open(path) as f:
-            data = json.load(f)
-        results.append(EvalResult(**{k: v for k, v in data.items() if k in known}))
-    return results
-
-
 def _load_results(results_dir: Path | None) -> list:
-    """Persisted results from *results_dir*, or the packaged ``RESULTS_DIR``."""
-    if results_dir is not None:
-        return _load_results_from_dir(results_dir)
-    from orchestrator.evals.runner import load_results
+    """Persisted results from *results_dir*, or the packaged store's directory.
 
-    return load_results()
+    Both branches go through :func:`_eval_results_io.load_results_from_dir`, so
+    a missing dir or a malformed cell exits naming it either way.
+    """
+    from orchestrator.evals.results import ResultStore
+
+    return load_results_from_dir(
+        results_dir if results_dir is not None else ResultStore.packaged().directory
+    )
 
 
 def _run_pilot(
@@ -88,15 +82,15 @@ def _run_pilot(
 
     Loads the base orchestrator config, resolves the fixture corpus, and fans
     ``run_ofat_stage`` over ``JUDGE_EVAL_CONFIGS`` × fixtures × trials — the ο seam
-    consumed UNMODIFIED (decision 11). Each result is persisted via
-    ``save_result`` so a later ``--analyze-only`` can re-read it. Not unit-tested:
-    it spawns full agentic workflows with real API spend.
+    consumed UNMODIFIED (decision 11). Every executor persists its own cell
+    into the packaged store, so a later ``--analyze-only`` can re-read it. Not
+    unit-tested: it spawns full agentic workflows with real API spend.
     """
     import asyncio
 
     from orchestrator.config import ConfigRequiredError, load_config
     from orchestrator.evals.configs import JUDGE_EVAL_CONFIGS
-    from orchestrator.evals.runner import run_ofat_stage, save_result
+    from orchestrator.evals.runner import run_ofat_stage
 
     try:
         base_config = load_config(config_path)
@@ -113,19 +107,16 @@ def _run_pilot(
     if not task_paths:
         raise SystemExit(f'No eval fixtures found in {resolved_tasks_dir}')
 
-    results = asyncio.run(run_ofat_stage(
+    return asyncio.run(run_ofat_stage(
         task_paths, JUDGE_EVAL_CONFIGS, base_config,
         max_parallel=max_parallel, trials=trials, timeout_override=timeout,
     ))
-    for r in results:
-        save_result(r)
-    return results
 
 
 def _default_out() -> Path:
-    from orchestrator.evals.runner import RESULTS_DIR
+    from orchestrator.evals.results import ResultStore
 
-    return RESULTS_DIR / 'judge_ofat_pilot_report.md'
+    return ResultStore.packaged().directory / 'judge_ofat_pilot_report.md'
 
 
 def _build_parser() -> argparse.ArgumentParser:

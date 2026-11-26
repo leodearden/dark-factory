@@ -21,7 +21,7 @@ from typing import Any
 from unittest.mock import AsyncMock, patch
 
 import pytest
-from _workflow_helpers import FakeBriefing, FakeMcp, FakeScheduler
+from _workflow_helpers import FakeBriefing, FakeMcp, FakeScheduler, fixed_prompt
 from shared.config_dir import TaskConfigDir
 
 from orchestrator.agents.invoke import AgentResult
@@ -125,14 +125,12 @@ async def _make_workflow(config, git_ops, task_assignment, resume_session_id=Non
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("code_default_config")
 class TestSidecarV2Wiring:
     """MECHANISM 1 wiring: _invoke writes the v2 sidecar binding (task_id +
     resume_count) through write_agent_session."""
 
-    async def test_invoke_writes_v2_sidecar_binding(
-        self, monkeypatch, git_repo, git_ops, task_assignment
-    ):
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+    async def test_invoke_writes_v2_sidecar_binding(self, git_repo, git_ops, task_assignment):
         config = _config(git_repo)
         workflow, cwd = await _make_workflow(config, git_ops, task_assignment)
 
@@ -154,16 +152,15 @@ class TestSidecarV2Wiring:
             new_callable=AsyncMock,
             side_effect=_side_effect,
         ):
-            await workflow._invoke(SIMPLE_TASK, 'p', cwd)
+            await workflow._invoke(SIMPLE_TASK, fixed_prompt('p'), cwd)
 
         assert seen['task_id'] == str(workflow.task_id)
         assert seen['schema_version'] == 2
         assert seen['resume_count'] == 0
 
     async def test_invoke_increments_resume_count_on_adopted_resume(
-        self, monkeypatch, git_repo, git_ops, task_assignment
+        self, git_repo, git_ops, task_assignment
     ):
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         config = _config(git_repo)
         resume = {
             'session_id': 'prior-sess-xyz',
@@ -173,6 +170,19 @@ class TestSidecarV2Wiring:
         workflow, cwd = await _make_workflow(
             config, git_ops, task_assignment, resume_session_id=resume
         )
+        # Make this row's previously-IMPLICIT premise explicit (task 3578): the
+        # arm site now corroborates the recovered session against the config dir
+        # it is about to export as CLAUDE_CONFIG_DIR, so an adopted resume only
+        # happens when the transcript is genuinely reachable there.  Without the
+        # seed, _invoke correctly vetoes and this row would be asserting the
+        # resume-count bump on a path that no longer resumes.
+        assert workflow._config_dir is not None
+        transcript = (
+            workflow._config_dir.path / 'projects' / '-enc-cwd'
+            / 'prior-sess-xyz.jsonl'
+        )
+        transcript.parent.mkdir(parents=True, exist_ok=True)
+        transcript.write_text('{"type": "user"}\n')
 
         seen: dict[str, Any] = {}
 
@@ -189,7 +199,7 @@ class TestSidecarV2Wiring:
             new_callable=AsyncMock,
             side_effect=_side_effect,
         ):
-            await workflow._invoke(SIMPLE_TASK, 'p', cwd)
+            await workflow._invoke(SIMPLE_TASK, fixed_prompt('p'), cwd)
 
         # base count 2 + 1 for this adopted resume = 3
         assert seen['resume_count'] == 3
@@ -210,15 +220,13 @@ def _preserve_records(caplog) -> list[logging.LogRecord]:
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("code_default_config")
 class TestPreserveOnCancellation:
     """MECHANISM 2 (I1): _invoke clears the sidecar on completion but PRESERVES
     it on CancelledError (cancellation is not completion), emitting a structured
     agent_session_preserved fact at the preserve point."""
 
-    async def test_completion_clears_sidecar(
-        self, monkeypatch, caplog, git_repo, git_ops, task_assignment
-    ):
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+    async def test_completion_clears_sidecar(self, caplog, git_repo, git_ops, task_assignment):
         caplog.set_level(logging.INFO)
         config = _config(git_repo)
         workflow, cwd = await _make_workflow(config, git_ops, task_assignment)
@@ -228,7 +236,7 @@ class TestPreserveOnCancellation:
             new_callable=AsyncMock,
             return_value=AgentResult(success=True, output=''),
         ):
-            await workflow._invoke(SIMPLE_TASK, 'p', cwd)
+            await workflow._invoke(SIMPLE_TASK, fixed_prompt('p'), cwd)
 
         # Completion → sidecar cleared, and NO preserve fact was emitted.
         assert workflow.artifacts is not None
@@ -236,9 +244,8 @@ class TestPreserveOnCancellation:
         assert _preserve_records(caplog) == []
 
     async def test_cancellation_preserves_sidecar_and_emits_fact(
-        self, monkeypatch, caplog, git_repo, git_ops, task_assignment
+        self, caplog, git_repo, git_ops, task_assignment
     ):
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         caplog.set_level(logging.INFO)
         config = _config(git_repo)
         workflow, cwd = await _make_workflow(config, git_ops, task_assignment)
@@ -248,7 +255,7 @@ class TestPreserveOnCancellation:
             new_callable=AsyncMock,
             side_effect=asyncio.CancelledError,
         ), pytest.raises(asyncio.CancelledError):
-            await workflow._invoke(SIMPLE_TASK, 'p', cwd)
+            await workflow._invoke(SIMPLE_TASK, fixed_prompt('p'), cwd)
 
         # CancelledError from the invoke → the sidecar SURVIVES (still in-flight),
         # carrying the durable v2 binding.
@@ -271,7 +278,7 @@ class TestPreserveOnCancellation:
         assert getattr(rec, 'role', None) == SIMPLE_TASK.name
 
     async def test_non_cancelled_exception_clears_sidecar(
-        self, monkeypatch, caplog, git_repo, git_ops, task_assignment
+        self, caplog, git_repo, git_ops, task_assignment
     ):
         """The THIRD documented branch (design decision 3): a hard, non-
         CancelledError failure is an abnormal terminal end — NOT a resumable
@@ -279,7 +286,6 @@ class TestPreserveOnCancellation:
         sidecar, emitting no preserve fact. Only CancelledError preserves; this
         guards against a regression that broadened the except to preserve (and
         emit the fact) on any exception."""
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         caplog.set_level(logging.INFO)
         config = _config(git_repo)
         workflow, cwd = await _make_workflow(config, git_ops, task_assignment)
@@ -289,7 +295,7 @@ class TestPreserveOnCancellation:
             new_callable=AsyncMock,
             side_effect=RuntimeError('boom'),
         ), pytest.raises(RuntimeError, match='boom'):
-            await workflow._invoke(SIMPLE_TASK, 'p', cwd)
+            await workflow._invoke(SIMPLE_TASK, fixed_prompt('p'), cwd)
 
         # Non-CancelledError → sidecar cleared (session_preserved stayed False),
         # and NO preserve fact was emitted.

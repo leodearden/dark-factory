@@ -100,3 +100,24 @@ Guard **semantics** are not reliably greppable — bound `manual` in the sidecar
 - Rejection-mechanism: θ's is bound and mechanically checkable; γ's
   behavioural invariants are `manual` by nature and excluded from the
   dispatch gate.
+
+## Unbound task labels (task 4907 adjudication)
+
+**Class B — an out-of-plan task with a hand-written label.** One task, `done`
+when measured on 2026-09-23, carries this PRD's `metadata.prd_path` and a
+`prd_task_label` the YAML sidecar does not declare: **3289** `restore-gate`.
+`commit_planning`'s label→task-id stamper binds nothing for it.
+
+Evidence. The PRD's "Decomposition plan" table is exactly α–θ, and the sidecar
+declares exactly those eight labels (stamped 3304–3313). 3289 appears only in
+that section's "Out-of-batch dependent" paragraph, as the batch's terminal
+gate. It predates the batch (its id is lower than 3304) and is operational
+work (`execution_class: operational`, closed with `done_provenance` kind
+`operational-verified`).
+
+**Verdict: the label is spurious, but the task is done, so there is no live
+hazard.** A task filed against a PRD from outside its decomposition plan
+carries no `prd_task_label` (`skills/prd/references/decompose-mode.md`, Step
+3), and this one was given one. No `restore-gate` entry is added to the sidecar,
+because the plan declares no such label, and the done record is left as it
+is.

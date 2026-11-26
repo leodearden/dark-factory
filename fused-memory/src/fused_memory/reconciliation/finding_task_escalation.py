@@ -1,0 +1,547 @@
+"""Pure helpers that route a Stage-3 finding naming a task id onto that task's
+ORCHESTRATOR escalation queue (task 4821, arm 3 of task 4764).
+
+## Why this exists
+
+A Stage-3 integrity finding that names a task id currently DEAD-ENDS in memory.
+``ReconciliationHarness._escalate`` files it to the RECON queue
+(``config.escalation_queue_dir``, drained by the port-8103 watcher) under a
+SYNTHETIC ``recon-<run8>`` task id — so the real task id survives only inside
+the JSON ``detail`` blob and the dedupe fingerprint's ``affected_ids``. Nothing
+on the task's own ladder ever sees it.
+
+The motivating incident (reify task 4458): an operator resolved ``esc-4458-87``
+choosing Option A, and an implementer then committed the opposite. Reconciliation
+DID flag the divergence — and the flag went to a queue nobody reading task 4458
+would ever look at.
+
+This module supplies the PURE parts of the fix: deciding WHICH task a
+finding names, building the escalation payload, deciding whether a pending
+record already covers a finding, and deciding whether a recent conversion of
+it holds a refile back. The impure half — queue construction, the record
+scans and submit — lives on the harness as
+``ReconciliationHarness._file_finding_task_escalation``, because it needs the
+harness's ``_known_projects`` registry and its guarded ``HAS_ESCALATION``
+import.
+
+Explicitly OUT OF SCOPE (per task 4764's own wording): semantic contradiction
+DETECTION. This arm is the plumbing only.
+
+## Purity
+
+This module performs NO filesystem or network I/O and imports nothing from the
+``escalation`` package (which is an optional workspace member — see the guarded
+imports in ``reconciliation/reconciler_escalation.py`` and ``reconciliation/harness.py``).
+Its one side effect is the WARNING ``shared.timestamps.parse_timestamp_or_warn``
+logs for an unreadable stamp.
+That keeps it hermetically testable from plain dicts, mirroring the stated
+purity contract of the sibling module ``reconciliation/predicate_contradiction.py``.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+from collections.abc import Mapping
+from collections.abc import Set as AbstractSet
+from datetime import datetime, timedelta
+from typing import Any, Protocol
+
+from shared.timestamps import parse_timestamp_or_warn
+
+__all__ = [
+    'FINDING_TASK_ESCALATION_CATEGORY',
+    'FINDING_TASK_ESCALATION_LEVEL',
+    'LIVENESS_UNKNOWN_DETAIL_KEY',
+    'RoutedRecordView',
+    'TerminalRoutedRecordView',
+    'build_finding_task_escalation_kwargs',
+    'is_routable_task_id',
+    'liveness_unknown_detail',
+    'recent_conversion_suppresses_refile',
+    'resolve_finding_task_target',
+    'routed_record_carries_finding',
+    'routed_record_covers_finding',
+]
+
+# Escalation category for a Stage-3 finding routed onto its named task's
+# ORCHESTRATOR queue.  A new, honest, greppable name that deliberately does NOT
+# over-claim contradiction semantics: full semantic contradiction DETECTION is
+# out of scope for this arm (task 4764's own wording), so a category like
+# `recon_contradiction` would promise a calibration this plumbing does not have.
+#
+# REFACTOR TRIGGER, forwarded: `Escalation.category` in
+# `escalation/src/escalation/models.py` carries a task-3709 comment saying the
+# NEXT category addition should promote that prose vocabulary to an enum (or a
+# submit-time lint) rather than growing another line.  THIS IS THAT ADDITION.
+# Promoting it is out of scope here — it touches the shared `escalation`
+# package, whose filer/reader spelling contract is depended on by every
+# categorized detector — so the trigger is recorded rather than discharged.
+# Because nothing rejects a typo'd category at submit time, the name is
+# single-sourced through this constant: the builder and
+# `routed_record_covers_finding` read the SAME symbol, which is the property the
+# trigger's comment says the dedup correctness of a categorized detector
+# depends on.
+FINDING_TASK_ESCALATION_CATEGORY = 'recon_task_finding'
+
+# Fixed routing fields for every record this module builds.
+#
+# `level=0`, and the argument for it is STRUCTURAL, not a matter of degree.
+#
+# Every orchestrator guard that a recon-authored record could hijack reads the
+# escalation queue through a level-1-ONLY test: `EscalationQueue.has_open_l1`
+# (`escalation/src/escalation/queue.py`), or in the workflow
+# `orchestrator/workflow.py::_is_l1_handoff` (level == 1 AND
+# `escalation.pins.is_queue_handoff`).  `has_open_l1` filters on `level` +
+# `status` and an OPTIONAL `category`, and is documented as answering "a human
+# is already on this task, so the workflow must not auto-requeue it".
+# Crucially it never reads `.severity` at all, so for any `has_open_l1` reader
+# a severity choice cannot mitigate the collision — only the level can.  The
+# workflow's test, by contrast, is severity-aware, so an info L1 never hands
+# off there (`plans/info-l0-disposition-router-prd.md` D3); for it, level 0 is
+# defence in depth that also keeps the record clear of any future uncategorized
+# `has_open_l1` reader.  Both are level-1-ONLY, so a level-0 record is
+# invisible to every one of them by construction:
+#
+#   - `orchestrator/workflow.py::_is_l1_handoff`, the workflow's single rule
+#     for an open L1 that hands the task to a human.
+#     `TaskWorkflow._open_l1_handoffs` applies it for
+#     `_await_steward_completion`'s requeue-diversion override and
+#     `_awaited_record_outcome`'s cross-task check;
+#     `TaskWorkflow._wait_for_resolution`'s tail applies it, next to
+#     `escalation.pins.needs_human`, over the full pending set.
+#
+# The orphan-L0 reaper (`orchestrator/harness.py::Harness._reap_orphan_l0_escalations`)
+# is not a reader: since task 5223 its coverage rule is
+# `escalation/queue.py::EscalationQueue.dismiss_if_covered`, scoped to the L0's
+# own category, so an L1 of another category cannot hijack it.
+#
+# workflow.py holds no uncategorized `has_open_l1` read.  Grep `has_open_l1(`
+# and `_is_l1_handoff` before editing this list.
+#
+# That is the population this closes.  Two classes of `has_open_l1` reader are
+# deliberately NOT in it, and were re-measured rather than assumed: the
+# sentinel filers (`_ARCHIVAL_STORM_SENTINEL`, `_SCHEDULER_PAUSE_SENTINEL`, the
+# `main-sweep-<sha12>` tip sweep, ...) key on SYNTHETIC ids that no real task id
+# can collide with, and the CATEGORIZED reads in `orchestrator/workflow.py` and
+# `orchestrator/harness.py` pass their own `category=`, which
+# `FINDING_TASK_ESCALATION_CATEGORY` never matches.  Those include
+# `orchestrator/harness.py::Harness._file_harness_l1`, through which the
+# external-dep, cross-repo and substrate-flip dispatch gates (and the re-cut
+# gate) file category-scoped since task 7170.  Keep this list in
+# `path::symbol` form (CLAUDE.md) — an earlier revision carried bare line pins
+# and two of them had already drifted onto unrelated statements.  A passive observation must not start
+# gating dispatch as a side effect of a PLUMBING change, and level 0 is the
+# only spelling that guarantees it — pinned executably by
+# `test_routed_record_is_invisible_to_the_orchestrator_l1_guards`.
+#
+# Routing note: filed at `severity='info', level=0`.  Level-0 records are
+# surfaced via the steward's pending-escalation view and any external monitor
+# polling the queue.  The notes on
+# `orchestrator/harness.py::_file_starvation_info` and
+# `::_file_warm_base_hard_down_notice` claim level-0 records "do NOT
+# auto-promote"; that does not hold for this one.  Once a routed L0 is aged and
+# unattended, `orchestrator/harness.py::Harness._reap_orphan_l0_escalations`
+# acts on it.  What the reaper does with it is the orchestrator's contract,
+# pinned there by
+# `orchestrator/tests/test_info_l0_router_harness.py::TestReaperRoutesInfoOrphans`
+# (info L0s, router on and off) and `::TestBlockingDedupIsCategoryScoped` (its
+# category-scoped coverage branch).  Read it there, not here.  This filer
+# relies on one property of it only: no L1 of another category closes a routed
+# L0, the same task-2757 scope `routed_record_covers_finding` applies.
+#
+# That is why no escalate-if-unattended behaviour needs asserting here: an
+# unattended routed finding reaches a consumer on its own, delivered by the
+# component that OWNS strand-detection semantics (liveness, hold state,
+# duplicate suppression).  Re-deriving any of that at this filer would mean
+# re-deriving those signals from a process that cannot see them.  After the
+# info-L0 router converts a record, `recent_conversion_suppresses_refile` holds
+# the finding's refile back for the recon recurrence window (task 7894).
+#
+# PUBLIC (and in `__all__`), like `FINDING_TASK_ESCALATION_CATEGORY` above:
+# the level a routed record is filed at is part of this module's CROSS-MODULE
+# contract, not an implementation detail.  It is what
+# `ReconciliationHarness._file_finding_task_escalation`'s docstring, the
+# call-site comment in `_run_remediation_pass` and
+# `test_routed_record_is_invisible_to_the_orchestrator_l1_guards` all reason
+# about.  A leading underscore would have signalled module-local and invited a
+# future reader to inline the literal — and, worse, to weaken it without
+# noticing the guard sites enumerated above.
+FINDING_TASK_ESCALATION_LEVEL = 0
+
+# `severity='info'`, NOT the 'blocking' used by the `_sweep_escalate_l1`
+# template this filer is otherwise transcribed from.  This is an OBSERVATION
+# about a task, not a claim that the task is broken: the finding is
+# LLM-authored and this arm ships the plumbing only, with semantic
+# contradiction DETECTION explicitly out of scope (task 4764's own wording).
+# The follow-up arm can file at 'blocking' on the narrower population where
+# that is warranted.  Matches the closest fused-memory precedent for a
+# code-path orchestrator-queue filing, `middleware/scope_violation_
+# escalator.py`, in its severity choice.
+#
+# Note that severity is NOT what keeps this record off the orchestrator's guard
+# surface — `has_open_l1` never reads it.  `FINDING_TASK_ESCALATION_LEVEL`
+# above does that work, alone.
+#
+# Severity is deliberately NOT derived from the finding's own
+# 'minor'/'moderate'/'serious' field: that vocabulary is LLM-authored free text
+# with no calibration against the escalation ladder's semantics.
+_ESCALATION_SEVERITY = 'info'
+
+_AGENT_ROLE = 'reconciliation-harness'
+
+_FINDING_FINGERPRINT_KEY = 'finding_fingerprint'
+
+#: Detail key, on both a persistent-finding recon escalation and a routed
+#: finding-task record, listing the task ids whose liveness probe failed: the
+#: record was filed because no id was confirmed live, not because each was
+#: confirmed not live (task 5370).
+LIVENESS_UNKNOWN_DETAIL_KEY = 'liveness_unknown_task_ids'
+
+
+def liveness_unknown_detail(task_ids: AbstractSet[str]) -> dict[str, list[str]]:
+    """The detail entries recording *task_ids* as liveness-unknown.
+
+    *task_ids* sorted under ``LIVENESS_UNKNOWN_DETAIL_KEY``, or no entry at all
+    when it is empty, so a record whose probes all ran carries no such key.
+    """
+    return {LIVENESS_UNKNOWN_DETAIL_KEY: sorted(task_ids)} if task_ids else {}
+
+_ROUTABLE_TASK_ID = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]*')
+
+
+def is_routable_task_id(task_id: str) -> bool:
+    """Whether *task_id* is safe to use as an orchestrator-queue key.
+
+    The id becomes part of a filename (``EscalationQueue.make_id`` builds
+    ``esc-{key}-{seq}`` and ``submit`` writes ``{id}.json``), so only a
+    conservative shape is routed: path separators, ``':'`` (cross-project
+    refs), whitespace and control characters are refused.
+    """
+    return _ROUTABLE_TASK_ID.fullmatch(task_id) is not None
+
+
+def _sole_task_id_part(value: object) -> str | None:
+    """Return the single task id inside *value*, or None if it is not exactly one.
+
+    A ``task_id`` field is NOT guaranteed to hold one id. A comma-joined value
+    (e.g. ``'5040,5149'``) is a DOCUMENTED supported shape: ``add_finding``
+    stores the value canonicalized by
+    ``fused_memory/server/recon_report.py::_canonicalize_task_id_string``, which
+    splits on ``','``, sorts and REJOINS with ``','`` — and ``flagged_items``
+    copies that straight through. So a finding about two tasks arrives here as
+    a single joined string.
+
+    Routing such a value verbatim would be worse than not routing it. The id is
+    load-bearing twice over: ``EscalationQueue.make_id`` builds
+    ``esc-{task_id}-{seq}`` from it, and ``EscalationQueue.get_by_task`` filters
+    on EXACT equality of the stored field. A record stored under
+    ``'5040,5149'`` is therefore invisible to ``get_by_task('5040')`` AND to
+    ``get_by_task('5149')`` — it surfaces on no task's ladder at all, which is
+    precisely the dead-end this module exists to close, only now wearing a
+    well-formed-looking record and consuming a queue slot. Worse,
+    ``Harness._reap_orphan_l0_escalations`` scans ``get_pending()`` without any
+    task-existence check and would eventually promote that L0 to L1 under a
+    task id that does not exist.
+
+    A multi-part value therefore returns None and is simply NOT ROUTED. This is
+    deliberately conservative rather than clever: picking one part would file
+    against an arbitrary task and silently drop the others, and splitting into N
+    records would breach the volume-parity guarantee documented on
+    ``_file_finding_task_escalation``. Deciding which of several tasks a
+    contradiction belongs to is semantic work, and semantic detection is
+    explicitly out of scope for this arm. Not routing is no worse than today's
+    behaviour: the recon-queue filing via ``_escalate`` still fires either way.
+
+    Splitting also normalizes the single-id case, so a value that merely carries
+    stray whitespace or a trailing comma (``' 5040 , '``) still resolves to
+    ``'5040'`` instead of being routed verbatim.
+    """
+    if value is None:
+        return None
+    # Same split shape as recon_report.py::_split_task_id_parts, kept as a local
+    # literal rather than an import: this module's purity contract (see the
+    # module docstring) keeps it free of server/ imports, and the expression is
+    # one line.
+    parts = {p.strip() for p in str(value).split(',') if p.strip()}
+    if len(parts) != 1:
+        return None
+    return parts.pop()
+
+
+def _routable_task_id(value: object) -> str | None:
+    candidate = _sole_task_id_part(value)
+    if candidate is None or not is_routable_task_id(candidate):
+        return None
+    return candidate
+
+
+def resolve_finding_task_target(
+    finding: Mapping,
+    project_id: str,
+) -> str | None:
+    """Return the task id *finding* names within *project_id*, or None.
+
+    ``finding`` is a ``flagged_items`` finding dict as produced by the
+    ``finding_dict`` projection in ``fused_memory/server/recon_report.py`` (and
+    as carried through the harness's remediation pass).
+
+    Two branches, in precedence order:
+
+    1. The bare ``finding['task_id']`` field, INTERPRETED as belonging to
+       *project_id* without being matched against it.
+    2. Otherwise, the first ``finding['cited_tasks']`` entry whose
+       ``project_id`` EQUALS *project_id*.
+
+    The asymmetry between them is deliberate and is the guard that keeps a
+    foreign project's task id out of this project's queue.  The task-4185
+    operator ruling recorded in ``fused_memory/server/recon_report.py`` (the
+    projectless-signature comment on the in-run signature index) states it
+    plainly: an ``add_finding(task_id='42', ...)`` call "carries no project
+    whatsoever", so a run containing two projects' findings about task 42 can
+    collapse there and no guard at that layer can tell that from a genuine
+    duplicate.  A bare ``task_id`` therefore NAMES no project and cannot be
+    project-matched — only interpreted.  A ``cited_tasks`` entry, by contrast,
+    IS project-qualified (``{project_id, task_id, title}``, written by
+    ``cite_task``), so it can be matched — and is, because routing a foreign
+    project's id onto this project's same-numbered task would file a record
+    that looks entirely well-formed while pointing at an unrelated task.
+
+    Cross-project routing (filing into the OTHER project's queue) is
+    deliberately not attempted: it would require resolving a second project's
+    root and reasoning about a second orchestrator's liveness.  A finding whose
+    only citations are foreign resolves to None and is simply not routed.
+
+    Both branches are LLM-authored input, so every value is passed through
+    :func:`_sole_task_id_part` (coerce, strip, and reject a comma-joined
+    multi-id value — see that docstring for why routing one verbatim is worse
+    than not routing it) and then :func:`is_routable_task_id` (reject a shape
+    unsafe as a queue key), and a malformed ``cited_tasks`` entry is SKIPPED
+    rather than raised — a bad citation must not abort the remediation pass.
+    """
+    raw = finding.get('task_id')
+    if raw is not None:
+        candidate = _routable_task_id(raw)
+        if candidate:
+            return candidate
+
+    cited = finding.get('cited_tasks')
+    if not isinstance(cited, (list, tuple)):
+        return None
+    for entry in cited:
+        if not isinstance(entry, Mapping):
+            continue
+        if str(entry.get('project_id') or '').strip() != project_id:
+            continue
+        entry_task_id = entry.get('task_id')
+        if entry_task_id is None:
+            continue
+        # Same multi-part rejection as the bare branch. `cite_task` is expected
+        # to write one id per entry, so this is defence in depth rather than a
+        # known shape -- but a joined value here would be just as unroutable,
+        # and skipping the entry lets a well-formed later citation still win.
+        candidate = _routable_task_id(entry_task_id)
+        if candidate:
+            return candidate
+    return None
+
+
+def build_finding_task_escalation_kwargs(
+    finding: Mapping,
+    *,
+    task_id: str,
+    project_id: str,
+    run_id: str,
+    persistence: int,
+    finding_fingerprint: str,
+    target_liveness_unknown: bool = False,
+) -> dict[str, Any]:
+    """Build the ``Escalation(...)`` keyword arguments for *finding*.
+
+    *task_id* is the ALREADY-RESOLVED target from
+    :func:`resolve_finding_task_target` — the REAL task id, never the synthetic
+    ``recon-<run8>`` id that ``ReconciliationHarness._escalate`` puts on the
+    recon queue.  Carrying the real id is the entire point of this arm: it is
+    what makes ``get_by_task`` (which filters on the STORED ``task_id`` field)
+    surface the record on the task's own ladder.
+
+    Returns a dict whose keys are a strict subset of
+    ``Escalation.__dataclass_fields__`` MINUS ``id``:
+
+    - No ``id``: it must come from ``queue.make_id(...)``, a durable per-key
+      counter, which a pure function has no access to.
+    - No key outside the dataclass: ``Escalation.to_dict`` is a bare ``asdict``
+      and ``from_dict`` filters to ``__dataclass_fields__``, while
+      ``EscalationQueue.resolve`` rewrites the record from ``esc.to_json()`` —
+      so an extra key on disk is DESTROYED on the first resolve.  That is the
+      defect ``BacklogPolicy._restore_policy_keys`` exists to work around; ALL
+      provenance goes into ``detail`` (a real field) as JSON so we never need
+      that workaround.
+    - No ``dedupe_fingerprint``: the finding's identity,
+      *finding_fingerprint*, rides in ``detail`` instead, because the orphan
+      reaper's promotion copies ``detail`` and drops ``dedupe_fingerprint``
+      (see :func:`routed_record_covers_finding`).  Setting one would also risk
+      unintended folding should a future ``submit_or_dedupe`` config ever name
+      the category.  The value equals the recon-side twin's
+      ``dedupe_fingerprint``, so ``detail`` correlates the two queues.
+    - No ``suggested_action``: it is left at its ``''`` default rather than
+      guessed from the ``expand_scope|create_followup_task|abort_task``
+      vocabulary, because the correct disposition is exactly what the ladder
+      exists to decide.  The finding's OWN ``suggested_action`` text is carried
+      in ``detail``.
+
+    *target_liveness_unknown* records that *task_id*'s liveness probe failed:
+    ``detail`` then lists it per :func:`liveness_unknown_detail`.  A routed
+    record is about its one target, so no other id can be marked.
+
+    Pure: no I/O, and *finding* is not mutated.
+    """
+    finding_category = str(finding.get('category') or '') or 'unknown'
+    description = str(finding.get('description') or '') or '(no description)'
+    summary = (
+        f'Recon finding on task {task_id} ({finding_category}, '
+        f'{persistence} cycles): {" ".join(description.split())}'
+    )
+
+    detail_dict: dict[str, Any] = {
+        'finding_id': finding.get('finding_id'),
+        'category': finding.get('category'),
+        'severity': finding.get('severity'),
+        'description': finding.get('description'),
+        'suggested_action': finding.get('suggested_action'),
+        'actionable': finding.get('actionable'),
+        'affected_ids': finding.get('affected_ids'),
+        'cited_tasks': finding.get('cited_tasks'),
+        'run_id': run_id,
+        'project_id': project_id,
+        'persistence': persistence,
+        _FINDING_FINGERPRINT_KEY: finding_fingerprint,
+        **liveness_unknown_detail({task_id} if target_liveness_unknown else frozenset()),
+    }
+    detail = json.dumps(detail_dict, default=str, indent=2)
+
+    return {
+        'task_id': task_id,
+        'agent_role': _AGENT_ROLE,
+        'severity': _ESCALATION_SEVERITY,
+        'category': FINDING_TASK_ESCALATION_CATEGORY,
+        'summary': summary,
+        'detail': detail,
+        'level': FINDING_TASK_ESCALATION_LEVEL,
+    }
+
+
+class RoutedRecordView(Protocol):
+    """The fields of a pending escalation that the coverage decision reads."""
+
+    @property
+    def category(self) -> str: ...
+
+    @property
+    def level(self) -> int: ...
+
+    @property
+    def detail(self) -> str: ...
+
+
+def _finding_fingerprint_of(detail: str) -> str | None:
+    try:
+        parsed = json.loads(detail)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    value = parsed.get(_FINDING_FINGERPRINT_KEY)
+    return value if isinstance(value, str) and value else None
+
+
+def routed_record_covers_finding(
+    record: RoutedRecordView,
+    finding_fingerprint: str,
+) -> bool:
+    """Whether pending *record* already covers the finding *finding_fingerprint*.
+
+    Only a record of ``FINDING_TASK_ESCALATION_CATEGORY`` can cover: an
+    unrelated open record on the task must not swallow a new root cause (the
+    task-2757 property).  Among those, a level-0 record covers only the SAME
+    finding, so two distinct findings on one task each get a record.  An absent
+    identity on either side never folds.
+
+    The fingerprint is the finding's PERSISTENCE identity (the key the harness
+    counts recurrence under), not its ``finding_id``:
+    ``fused_memory/server/recon_report.py::ReconReportState.add_finding`` mints
+    a fresh uuid4 per call, so the same persistent finding carries a new id
+    every run.
+
+    A record ABOVE ``FINDING_TASK_ESCALATION_LEVEL`` covers EVERY finding.  It
+    is a routed finding a human already holds, so a refile would only hand the
+    orphan reaper a duplicate to dispose of every cycle.  Promotion builds a
+    new record that keeps ``detail`` (with a suffix appended) but not
+    ``dedupe_fingerprint``, which is why the level alone decides here.
+
+    An L1 of another category covers nothing, here or in the orphan reaper,
+    which applies the same task-2757 category scope (task 6341).
+
+    The caller passes PENDING records only, so a finding reaches the ladder
+    again once the covering record is closed, whether a human adjudicated it
+    or the info-L0 router (on by default) converted it to a task.  In the
+    second case :func:`recent_conversion_suppresses_refile` holds the refile
+    back for a window.
+    """
+    if record.category != FINDING_TASK_ESCALATION_CATEGORY:
+        return False
+    if record.level > FINDING_TASK_ESCALATION_LEVEL:
+        return True
+    return routed_record_carries_finding(record, finding_fingerprint)
+
+
+def routed_record_carries_finding(
+    record: RoutedRecordView,
+    finding_fingerprint: str,
+) -> bool:
+    """Whether *record* is a routed record of the finding *finding_fingerprint*.
+
+    Identity only, at any level and in any status.  A promoted record's
+    suffixed ``detail`` no longer parses, so it carries no finding.
+    """
+    return (
+        record.category == FINDING_TASK_ESCALATION_CATEGORY
+        and bool(finding_fingerprint)
+        and _finding_fingerprint_of(record.detail) == finding_fingerprint
+    )
+
+
+class TerminalRoutedRecordView(Protocol):
+    """The fields of a closed routed record that the conversion hold reads."""
+
+    @property
+    def resolution_class(self) -> str | None: ...
+
+    @property
+    def resolved_at(self) -> object: ...
+
+
+def recent_conversion_suppresses_refile(
+    record: TerminalRoutedRecordView | None,
+    *,
+    converted_class: str,
+    now: datetime,
+    window: timedelta,
+) -> bool:
+    """Whether *record*, the finding's newest closed routed record, holds its refile back.
+
+    Only a conversion to a task, closed less than *window* before *now*, holds
+    it: an adjudication is newer information and lets the refile through, and
+    an unreadable ``resolved_at`` files rather than suppresses.  The stamp is
+    read by the same rule ``EscalationQueue.newest_terminal_by_task`` picked
+    the record by, so a naive stamp reads as UTC.
+
+    *converted_class* is ``escalation.disposition.ConvertViaCurator.resolution_class``,
+    passed in because this module imports nothing from ``escalation``.
+    """
+    if record is None or record.resolution_class != converted_class:
+        return False
+    resolved_at, readable = parse_timestamp_or_warn(
+        record.resolved_at, context='recon.conversion_hold',
+    )
+    return readable and now - resolved_at < window

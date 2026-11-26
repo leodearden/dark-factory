@@ -7,22 +7,66 @@ import contextlib
 import json
 import logging
 import os
+import time
 import uuid as uuid_mod
-from datetime import UTC, datetime
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 import aiosqlite
 from mcp.server.fastmcp import Context, FastMCP
+from pydantic import StrictBool
 from shared.async_sqlite_base import CheckpointResult, apply_full_durability_pragmas, connect_daemon
+from shared.defects import DeclareEvent, MalformedDefectRef, OutcomeEvent
+from shared.delivered_check_polarity import (
+    GATE_REF,
+    extract_delivered_checks,
+    lint_delivered_checks,
+    polarity_error,
+)
+from shared.project_id import normalize_project_id
+from shared.pure_gate_provenance import PURE_GATE_FROM_KEY
+from shared.task_metadata import TASK_METADATA_CAPABILITIES
+from shared.task_statuses import ACTIVE
+from shared.task_statuses import TERMINAL as TERMINAL_STATUSES
+from shared.task_submit import is_ticket_id, looks_like_task_id
+from shared.uuid_prefix import strip_uuid_prefix_override
+from shared.uuid_prefix_guard import Namespace, PrefixResolver, Resolution, ResolverUnavailable
 
+from fused_memory.backends.defect_records import (
+    DefectEventInvalid,
+    parse_declare_wire,
+    parse_outcome_wire,
+)
 from fused_memory.backends.graphiti_client import NodeNotFoundError
+from fused_memory.backends.mem0_client import (
+    _FUSED_MEMORY_OWNED_METADATA_KEYS,
+    MEM0_MANAGED_METADATA_KEYS,
+)
+from fused_memory.backends.metadata_lookup import (
+    DEFAULT_LOOKUP_LIMIT,
+    InvalidMetadataLookupError,
+    validate_metadata_query,
+)
+from fused_memory.backends.task_projection import (
+    InvalidTaskProjectionField,
+    parse_task_projection,
+)
 from fused_memory.config.reload import apply_reload
 from fused_memory.config.schema import DEFAULT_CONFIG_PATH, FusedMemoryConfig
+from fused_memory.embedder.endpoint_probe import EmbedderEndpointProbe
+from fused_memory.embedder.status import embedder_identity_status
 from fused_memory.mcp_tools.scheduler_state import (
     read_scheduler_events,
     read_scheduler_state,
 )
+from fused_memory.memory_metadata import (
+    SUPERSEDED_BY_METADATA_KEY,
+    TRIAGE_CONTESTED_METADATA_KEY,
+)
+from fused_memory.middleware.deferral_gate import StatusWriteScope
 from fused_memory.middleware.deterministic_task_guard import (
     deterministic_task_error,
     inject_task_kind,
@@ -30,6 +74,14 @@ from fused_memory.middleware.deterministic_task_guard import (
 from fused_memory.middleware.execution_class_guard import (
     execution_class_error,
     inject_execution_class,
+)
+from fused_memory.middleware.gitignored_deliverable_guard import (
+    gitignored_deliverable_enforced,
+    gitignored_deliverable_finding,
+    gitignored_deliverable_reject,
+    gitignored_deliverable_warning,
+    log_gitignored_deliverable_flagged,
+    make_gitignore_probe,
 )
 from fused_memory.middleware.lock_charter_guard import (
     directory_locks,
@@ -45,21 +97,52 @@ from fused_memory.middleware.operational_suggestion_guard import (
     operational_suggestion_warning,
 )
 from fused_memory.middleware.premise_lint_guard import premise_lint_error
+from fused_memory.middleware.recurring_gate_guard import recurring_gate_guard_error
+from fused_memory.middleware.retired_key_modules_guard import retired_key_modules_error
 from fused_memory.middleware.routing_intent_guard import (
     routing_intent_enforced,
     routing_intent_finding,
     routing_intent_reject,
     routing_intent_warning,
 )
+from fused_memory.middleware.simple_task_files_guard import simple_task_files_error
+from fused_memory.middleware.task_facts import Lookup, TaskFactsReader, TaskRef, read_task_facts
 from fused_memory.middleware.task_interceptor import (
-    TERMINAL_STATUSES,
-    _is_ticket_id,
-    _looks_like_task_id,
+    TicketStoreNotConfiguredError,
+    interceptor_write_succeeded,
 )
-from fused_memory.models.enums import MemoryCategory, SourceStore
+from fused_memory.middleware.task_text_write_guard import TASK_TEXT_FP_KEY, text_fp_of
+from fused_memory.middleware.trigger_chain_guard import trigger_chain_open_error
+from fused_memory.models.enums import (
+    MEM0_PRIMARY,
+    MemoryCategory,
+    SourceStore,
+    routes_to_graphiti,
+)
 from fused_memory.models.scope import resolve_main_checkout, resolve_project_id
+from fused_memory.reconciliation.citation_verifier import (
+    find_live_citation_occurrences,
+    is_concrete_memory_id,
+    repoint_task_citations,
+)
+from fused_memory.reconciliation.consolidation_proposal import (
+    PROPOSER_AGENT_ID,
+    ConsolidationProposal,
+    record_proposal,
+)
+from fused_memory.reconciliation.enumeration_guard import (
+    enumeration_gate_for_filing,
+    enumeration_gate_for_update,
+)
+from fused_memory.reconciliation.flag_record_contract import (
+    recon_stage_flag_kind_refusal,
+)
+from fused_memory.reconciliation.mem0_tombstone import (
+    record_mem0_deletion_tombstones,
+)
 from fused_memory.reconciliation.task_filter import (
     ACTIVE_TASK_STATUSES,
+    INACTIVE_TASK_STATUSES,
     find_conflicting_task_status_ids,
     find_present_tense_completion_claim_task_ids,
     frames_live_task_status_as_current_fact,
@@ -68,15 +151,48 @@ from fused_memory.reconciliation.task_filter import (
     is_mixed_temporal_framing,
     is_proposed_resolution_framing,
 )
-from fused_memory.server.manifest_stamping import stamp_capability_manifests
+from fused_memory.server.consolidation import (
+    ProposalLimits,
+    build_consolidation_result,
+    validate_consolidate_args,
+    validate_proposal_args,
+)
+from fused_memory.server.entities_gate import entities_gate
+from fused_memory.server.entity_mint_authz import (
+    resolve_entity_mint_authorization,
+    validate_mint_name,
+)
+from fused_memory.server.grouped_read import (
+    # The landed single home for the child-record wire names (task 3195/3197,
+    # PRD leaf delta). Grouping is strictly `metadata.parent_id` + the child
+    # `kind`, so write triage MUST spell them from here rather than as
+    # literals — a drift between the write side and the read side would
+    # produce children that exist but never group, which reads as content
+    # loss without being one.
+    AMENDMENT_KIND,
+    CONTESTED_METADATA_KEY,
+    PARENT_ID_KEY,
+    SIGHTING_KIND,
+    group_memory_document,
+    group_search_results,
+)
+from fused_memory.server.guard_excerpt import excerpt_fields
+from fused_memory.server.manifest_root import resolve_manifest_root
+from fused_memory.server.manifest_stamping import (
+    stamp_capability_manifests,
+    stamping_action_required,
+)
 from fused_memory.server.markup_tripwire import (
-    MarkupStormCounter,
-    build_markup_block,
-    emit_markup_storm_escalation,
-    find_markup_violation,
-    markup_override_requested,
+    # The write-time gate this module hosted was retired in task 4458: the ONE
+    # markup mechanism now runs at the dispatch boundary
+    # (fused_memory.server.markup_guard), before any tool body is entered. Only
+    # the override STRIP is still a tool-body responsibility — the guard
+    # forwards allow_mcp_markup UNCHANGED to a tool that declares `metadata`,
+    # so the body remains the party that keeps a write-time control flag out of
+    # persistence.
     strip_markup_override,
 )
+from fused_memory.server.mem0_update_authz import resolve_mem0_update_authorization
 from fused_memory.server.near_duplicate_guard import (
     build_near_duplicate_block,
     build_topic_cluster_block,
@@ -84,14 +200,73 @@ from fused_memory.server.near_duplicate_guard import (
     find_near_duplicate_memory,
     resolve_near_dup_guard_enabled,
     resolve_near_dup_threshold,
+    resolve_retired_derived_topic_ids,
+    resolve_topic_cluster_autoseed_enabled,
     resolve_topic_guard_clusters,
 )
+from fused_memory.server.resolve_prefix_route import (
+    register_resolve_prefix_route,
+    resolver_unavailable_body,
+)
 from fused_memory.server.tool_errors import mcp_tool_errors
-from fused_memory.services.memory_service import MemoryService
+from fused_memory.server.topic_cluster_store import TopicClusterStore, seed_topic_cluster
+from fused_memory.server.write_triage import (
+    CANONICAL_ID_KEY,
+    FAIL_OPEN_ESCALATION_ID_KEY,
+    OUTCOME_AMENDED,
+    OUTCOME_CONTESTED,
+    OUTCOME_RESTATED,
+    OUTCOME_STORED,
+    ROUTED_KEY,
+    TRIAGE_FAIL_OPEN_KEY,
+    FailOpenStage,
+    TriageFailOpenCounter,
+    attach_write_durable,
+    declares_attach_keys,
+    declares_supersession,
+    emit_triage_fail_open_storm_escalation,
+    is_orchestrator_completion_write,
+    resolve_write_triage_enabled,
+    triage_write,
+)
+
+# The middle-band judge, imported HERE and nowhere else. `tools.py` is the
+# single wiring point on purpose: `write_triage_judge` imports `write_triage`
+# for the OUTCOME_* vocabulary, so `write_triage` importing the judge back
+# would close a cycle. Keeping the attachment at the consumer leaves that
+# dependency one-way, and leaves `_stub_judge` as `triage_write`'s default for
+# direct callers and for beta's judge-slot contract tests — which is what keeps
+# those tests meaningful rather than tautological.
+from fused_memory.server.write_triage_judge import judge_write, resolve_judge_field_chars
+from fused_memory.services.completion_claim_gate import (
+    UNRESOLVABLE,
+    UNVERIFIED_CLAIM_TAG,
+    build_unverified_flag,
+    emit_unverified_claim_escalation,
+    extract_completion_claims,
+    make_registry_commit_probe,
+    verify_claims,
+)
+from fused_memory.services.consolidation_ops import (
+    RetainArmRefused,
+    apply_retain_arm,
+    patch_memory_metadata,
+    read_topic_closure,
+)
+from fused_memory.services.id_resolver import IdResolver, is_uuid_prefix
+from fused_memory.services.memory_service import MemoryService, metadata_row_text
+from fused_memory.services.read_telemetry import (
+    fallback_search_summary,
+    summarize_search_query,
+    summarize_search_results,
+)
+from fused_memory.services.supersession_mark import mark_superseded
+from fused_memory.utils.clip_disclosure import truncation_fields
+from fused_memory.utils.mem0_content_keys import payload_without_text
 from fused_memory.utils.validation import (
     PathShapedProjectIdError,
-    _to_underscore_canonical,
     canonicalize_project_id,
+    validate_full_uuid,
     validate_int_ids,
     validate_known_project_id,
     validate_project_id,
@@ -105,6 +280,7 @@ if TYPE_CHECKING:
     from fused_memory.reconciliation.backlog_policy import BacklogPolicy
     from fused_memory.reconciliation.event_queue import EventQueue
     from fused_memory.reconciliation.harness import ReconciliationHarness
+    from fused_memory.server.markup_residue_spool import MarkupResidueSpool
     from fused_memory.services.write_journal import WriteJournal
 
 logger = logging.getLogger(__name__)
@@ -136,12 +312,38 @@ CREATE TABLE IF NOT EXISTS overrides (
     ttl_until     TEXT,
     created_at    TEXT NOT NULL,
     updated_at    TEXT NOT NULL,
+    source        TEXT NOT NULL DEFAULT 'operator',
     PRIMARY KEY (project_root, task_id)
 );
 
 CREATE INDEX IF NOT EXISTS idx_overrides_pinned
     ON overrides(project_root, pinned, pin_order);
-"""  # Source of truth: orchestrator/src/orchestrator/overrides.py:33-49
+"""  # Source of truth: orchestrator/src/orchestrator/overrides.py::_SCHEMA
+
+# Mirrors orchestrator/src/orchestrator/overrides.py::_migrate_add_source_column.
+# Every write through these tools is an operator write, so it stamps this value
+# and takes ownership of the row from the starvation watchdog.
+_OPERATOR_SOURCE = 'operator'
+
+
+async def _migrate_overrides_source_column(db: aiosqlite.Connection) -> None:
+    """Add ``source`` to a pre-ownership overrides table, idempotently.
+
+    The orchestrator migrates the same file, so losing the race to its ALTER
+    ('duplicate column name') is success, not failure.
+    """
+    cursor = await db.execute('PRAGMA table_info(overrides)')
+    columns = {row[1] for row in await cursor.fetchall()}
+    if 'source' in columns:
+        return
+    try:
+        await db.execute(
+            'ALTER TABLE overrides ADD COLUMN source TEXT NOT NULL '
+            f"DEFAULT '{_OPERATOR_SOURCE}'"
+        )
+    except aiosqlite.OperationalError as exc:
+        if 'duplicate column name' not in str(exc):
+            raise
 
 # Mirrors orchestrator/src/orchestrator/config.py PRIORITY_RANK keys.
 # Source of truth: orchestrator/src/orchestrator/config.py:27.
@@ -197,6 +399,7 @@ async def _open_overrides_db(
     busy_ms = 30000 if autocommit else 5000
     await apply_full_durability_pragmas(db, busy_timeout_ms=busy_ms)
     await db.executescript(_OVERRIDE_SCHEMA)
+    await _migrate_overrides_source_column(db)
     return db
 
 
@@ -365,20 +568,30 @@ Write operations:
 - add_memory: Lightweight classified write (skip extraction, direct store)
 
 Read operations:
-- search: Unified search across both stores with automatic routing
+- search: Unified search across both stores with automatic routing. Finding any member of a
+  consolidated cluster IN YOUR RESULT WINDOW also surfaces that topic's CANONICAL record,
+  promoted to first and flagged topic_anchored=True (its relevance_score is not meaningful —
+  it is pinned by order, and the window stays exactly `limit` long, so the pin costs the
+  lowest-ranked result its slot; topics are read from the window you see, never from hits
+  that were cut). NOTE this is currently a no-op for almost every search: stamping coverage, not
+  ranking, is the binding constraint, and that coverage is still being built out.
 - get_entity: Direct entity lookup in the knowledge graph
 - get_episodes: Retrieve raw episode history
+- scan_memory_content: Literal substring scan over Mem0 memory TEXT (deterministic, not semantic) — use when search cannot find a string because it carries no semantic signal
 
 Task operations (when Taskmaster is connected):
 - get_tasks / get_task: Read task tree
 - get_statuses: Compact {id: status} mapping (~95% smaller than get_tasks) for status-only callers; pass page_size/offset to paginate (keep page_size <= 2000 — larger pages can exceed the MCP tool-response transport limit and be rejected wholesale), with auto_paginate=True as an opt-in one-page fallback (never automatic — see the tool docstring)
 - search_tasks: Semantic search over already-filed tasks (ranked by similarity, enriched with current status) — use to check if a task like X was already filed
+- find_tasks_by_metadata: Exact lookup of tasks carrying top-level metadata key K (value omitted = presence; a str/int matches a scalar by equality or a list by membership), across every status including deferred and cancelled; paged (limit <= 100; page on has_more with offset += returned); include_value=True adds matched_value; include_rows=True adds metadata and dependencies (echoed as include_rows)
 - set_task_status: Update status (triggers reconciliation for done/blocked/cancelled)
 - update_task / remove_task: Task CRUD
 - add_dependency / remove_dependency: Dependency management
 Management:
 - delete_memory: Remove a specific memory (edges for Graphiti, vector entries for Mem0)
+- consolidate_memories: The SANCTIONED path for folding a duplicate Mem0 cluster into one canonical entry — use it instead of hand-rolling add_memory + N delete_memory calls, which nets +1 entry per failed pass. Writes the canonical first, tags retained peers in place (the ratified default: peers keep their point ids), re-homes children before deleting their parent, and returns a `survivors` list CORROBORATED by a live re-read rather than inferred from the delete calls' return values. Requires run_id whenever supersedes is non-empty (it attributes the deletion). A `partial` result is NOT a retry signal — there is no resume arm, so re-running it for the same topic writes a SECOND canonical; finish the named ids by hand, per the envelope's `hint`.
 - delete_episode: Remove a Graphiti episode (with optional cascade)
+- redact_episode_content: Replace a Graphiti episode's raw content in place (non-destructive; PREFER over delete_episode(cascade=True) for corrupted text — preserves the extracted entities/edges a cascade would destroy)
 - update_edge: Update an existing Graphiti edge's fact text directly (no LLM pipeline)
 - refresh_entity_summary: Rebuild an entity node's summary from its valid edges (accepts entity_uuid or entity_name)
 - set_entity_summary: Overwrite an entity node's summary with explicit text (empty clears); bypasses edge-derivation — use to force-clear baked-in stale narrative
@@ -388,8 +601,8 @@ Management:
 - delete_entity: Delete an entity node by UUID (DETACH DELETE; guards on active edges unless force=True; refreshes neighbour summaries)
 - get_status: Health check for all backends
 - get_dead_letters: Inspect dead-lettered items from the durable write queue and event queue
-- replay_dead_letters: Reset dead-lettered queue items to pending for retry (use for retriable transient failures)
-- delete_dead_letters: Permanently delete dead-lettered items by id (use for non-retriable errors such as NodeNotFoundError after a graph wipe)
+- replay_dead_letters: Reset dead-lettered queue items to pending for retry (the safe default, once the underlying cause is fixed)
+- delete_dead_letters: Permanently delete dead-lettered items by id — DESTRUCTIVE; discards the payload and the only evidence of the failure. Only once the cause is identified and the item is known unrecoverable
 
 Reconciliation:
 - Task status transitions (done/blocked/cancelled/deferred) trigger targeted reconciliation
@@ -401,24 +614,48 @@ Conventions:
 - Always include project_id on every call (scopes data isolation).
 - Include agent_id for attribution (e.g. "claude-interactive", "claude-task-7").
 - Prefer add_memory over add_episode for discrete, pre-distilled facts (lower cost: 0-3 vs 5-15 LLM calls).
-- Before writing a procedural_knowledge memory, search first for an existing entry on the same
-  workflow/gotcha and update or skip instead of writing a near-duplicate. add_memory enforces this
-  at write time with two guards: (1) a deterministic topic-cluster guard that soft-blocks a write
-  matching a known-contradictory topic cluster (error_type=ProceduralKnowledgeKnownTopicClusterWriteRejected)
-  — do not add another entry; consolidate/update the existing entries or add context to the human gate
-  task named in the hint; and (2) a cosine guard that soft-blocks a write matching an existing entry at
-  high similarity (error_type=ProceduralKnowledgeNearDuplicateWriteRejected). For either, override with
-  metadata={'allow_near_duplicate': True} only when the content is genuinely distinct; recon-stage-*
-  agents are exempt from both.
-- Never write raw MCP envelope markup into a payload. add_memory/add_episode content and
-  submit_task/update_task title/description/details/prompt are REJECTED
-  (error_type=McpEnvelopeMarkupWriteRejected) when they carry a leaked tool-call envelope
-  fragment; the response names the matched pattern and the offending field. This catches a
+- Before writing a procedural_knowledge or preferences_and_norms memory, search first for an existing
+  entry on the same workflow/gotcha/norm and update or skip instead of writing a near-duplicate.
+  add_memory enforces this at write time with up to two guards: (1) a deterministic topic-cluster
+  guard — covering BOTH categories — that soft-blocks a write matching a known-contradictory topic
+  cluster (error_type=ProceduralKnowledgeKnownTopicClusterWriteRejected) — do not add another entry;
+  consolidate/update the existing entries or add context to the human gate task named in the hint;
+  and (2) a cosine guard, scoped to procedural_knowledge only, that soft-blocks a write matching an
+  existing entry at high similarity (error_type=ProceduralKnowledgeNearDuplicateWriteRejected). For either, override with
+  metadata={'allow_near_duplicate': True} only when the content is genuinely distinct. No agent
+  class is exempt. Both guards apply only while write_triage.enabled is false (the
+  shipped default); with it on, an explicit Mem0-primary write is REDIRECTED instead of rejected —
+  nothing is soft-blocked, the ack carries routed (stored | restated | amended | contested) plus
+  canonical_id on an attach, and a restated write becomes a sighting CHILD of the memory it
+  restates rather than a standalone entry, so the full text you submitted is kept and the canonical
+  is never edited; restated means a near-verbatim repeat that adds nothing, since a write merely
+  about the same thing is judged and filed amended or contested. There, allow_near_duplicate means force-store (store it standalone, do not
+  reroute it) rather than bypass-the-reject. Searching first is worth doing either way: it is how
+  you find the entry to update instead of restating it.
+- Never write raw MCP envelope markup into a payload. EVERY tool's string parameters are
+  REJECTED (error_type=mcp_markup_detected, or mcp_markup_unrepairable when the residue
+  cannot be parsed) when they carry a leaked tool-call envelope fragment; the response
+  names the matched pattern and the offending field. This catches a
   harness serialization bug whose specimens are permanent once stored (and which made a task
   parser derive a wrong priority silently), so strip the fragment and resubmit rather than
   rewording around it. Override with metadata={'allow_mcp_markup': True} only when the markup
   is quoted deliberately (e.g. documenting the leak). The authoritative pattern list and
-  rationale live in fused_memory/server/markup_tripwire.py.
+  rationale live in fused_memory/server/markup_guard.py. The guard runs at the
+  dispatch boundary, so it covers EVERY tool and EVERY string parameter — including
+  add_system_record and update_memory, which never had a write-time check — and its
+  rejection carries a repaired_call: the COMPLETE argument map with the fragment
+  removed and any parameter it swallowed restored. Resubmit that verbatim rather
+  than rewording.
+- A store='mem0' delete_memory is REFUSED (error_type=CitationRepointRequired) while a live
+  (non-terminal) task still cites the entry in its metadata — dispatch follows those pointers,
+  and the delete is irreversible. This is a property of the RECORD, not of who is deleting, so
+  it applies to every caller. The refusal names each citing task and path. Retry with
+  replacement_memory_id=<the surviving entry's full 36-char UUID> and the citers are repointed
+  before the delete runs; that is the answer for a consolidation, which has a survivor by
+  definition. Only for a plain drop with NO survivor to repoint to, pass
+  metadata={'allow_dangling_citations': True} — literal boolean True only, same as above. The
+  override is recorded at WARNING and the response names every citation it strands. An
+  unreadable task DB fails CLOSED (CitationScanFailed), override or not.
 - Tasks may carry memory_hints in metadata — structured pointers (search queries + entity names)
   that help future agents prefetch relevant context. Execute hint queries via search, look up
   hint entities via get_entity.
@@ -491,6 +728,356 @@ def _canonicalize_project_id_arg(project_id: str) -> tuple[str, dict[str, str] |
         return canonicalize_project_id(project_id), None
     except PathShapedProjectIdError as e:
         return project_id, {'error': str(e), 'error_type': type(e).__name__}
+
+
+#: The refusal a read tool gives a prefix that names several ids; the uuid
+#: prefix guard refuses with the same error_type.
+_AMBIGUOUS_UUID_PREFIX = 'ambiguous_uuid_prefix'
+
+
+def per_use_id_resolver(
+    memory_service: MemoryService, id_resolver: IdResolver | None = None,
+) -> Callable[[], IdResolver]:
+    """The ``IdResolver`` for the NEXT resolution: *id_resolver* when injected, else one built from *memory_service*.
+
+    Built per use: the resolver is stateless and its factory reads the
+    service's CURRENT config, so a hot reload of the Mem0 read timeout or
+    collection prefix applies to the next resolution.
+    """
+    return lambda: id_resolver or IdResolver.for_memory_service(memory_service)
+
+
+def per_use_prefix_resolver(
+    memory_service: MemoryService, id_resolver: IdResolver | None = None,
+) -> PrefixResolver:
+    """:func:`per_use_id_resolver`'s ``resolve_prefix``: the uuid-prefix guard's and /resolve-prefix's resolver."""
+    resolver = per_use_id_resolver(memory_service, id_resolver)
+    return lambda project_id, prefix: resolver().resolve_prefix(project_id, prefix)
+
+
+@dataclass(frozen=True)
+class _ResolvedId:
+    """The prefix named exactly one live id in the tool's namespace: read *full_id*."""
+
+    full_id: str
+
+
+@dataclass(frozen=True)
+class _PrefixResponse:
+    """The prefix named no one readable id: *body* is the tool's whole response."""
+
+    body: dict[str, Any]
+
+
+async def _resolve_or_respond(
+    id_resolver: IdResolver, project_id: str, prefix: str, *, serves: Namespace,
+) -> _ResolvedId | _PrefixResponse:
+    """Resolve a read tool's prefix-shaped id argument, or answer for the tool (PRD C4).
+
+    The response is the outage (``prefix_checked: False``, never a miss —
+    INV-11), the ambiguity refusal with its candidates, or the miss report of
+    what each namespace holds.
+    """
+    try:
+        resolution = await id_resolver.resolve_prefix(project_id, prefix)
+    except ResolverUnavailable as exc:
+        return _PrefixResponse({
+            **resolver_unavailable_body(exc),
+            'prefix': prefix,
+            'project_id': project_id,
+            'prefix_checked': False,
+        })
+    if resolution.outcome == 'ambiguous':
+        return _PrefixResponse({
+            'error': (
+                f'{prefix!r} is the prefix of {len(resolution.candidates)} ids; '
+                'pass the full uuid of the one you mean'
+            ),
+            'error_type': _AMBIGUOUS_UUID_PREFIX,
+            'prefix': prefix,
+            'project_id': project_id,
+            'prefix_checked': True,
+            'candidates': [candidate._asdict() for candidate in resolution.candidates],
+        })
+    if resolution.outcome == 'unique' and resolution.candidates[0].namespace == serves:
+        return _ResolvedId(resolution.candidates[0].id)
+    return _PrefixResponse({
+        'found': False,
+        'prefix_checked': True,
+        'prefix': prefix,
+        'project_id': project_id,
+        'namespaces': await id_resolver.miss_report(project_id, prefix, resolution),
+        'hint': _prefix_miss_hint(prefix, resolution, serves),
+    })
+
+
+def _prefix_miss_hint(prefix: str, resolution: Resolution, serves: Namespace) -> str:
+    malformed = validate_full_uuid(prefix)
+    remediation = malformed['hint'] if malformed else ''
+    if resolution.candidates:
+        elsewhere = resolution.candidates[0].namespace
+        return (
+            f'No {serves} id starts with {prefix!r}, but a live {elsewhere} id does '
+            f'(see namespaces). {remediation}'
+        )
+    return f'No live id in any namespace starts with {prefix!r}. {remediation}'
+
+
+_UPDATE_MEMORY_MODES = ('merge', 'replace')
+
+#: ``consolidate_memories``' audit tag, used as BOTH the delete's ``_source``
+#: and the tombstone's ``deleter`` — the idiom the two recon sweeps follow
+#: with their own ``trim_source``/``gc_sweep_source`` constants. One string
+#: for both is what lets an auditor join a ``WriteJournal`` row to the
+#: tombstone that explains it.
+_CONSOLIDATE_SOURCE = 'consolidate_memories'
+
+#: The ONE citation-gate refusal ``consolidate_memories``' pre-flight does
+#: not treat as a blocker.
+#:
+#: ``CitationRepointRequired`` means "live tasks cite this id and you named
+#: no replacement". The pre-flight runs BEFORE the canonical write — that
+#: ordering is what makes a refused consolidation leave the corpus
+#: byte-identical — so at that point the replacement genuinely does not
+#: exist yet, and the complaint is about an argument this op has not
+#: computed rather than about the corpus. It is answered a few lines later
+#: by writing the canonical, and the MUTATING pass then re-asks the same
+#: question of every id with that concrete replacement in hand, refusing
+#: any delete it still cannot clear. Every OTHER refusal — the scan
+#: failures, and anything a future revision adds — stays a blocker, so the
+#: default remains fail-closed.
+_PREFLIGHT_DEFERRED_CITATION_REFUSAL = 'CitationRepointRequired'
+
+
+def _update_memory_arm_presence_error(
+    *,
+    content: str | None,
+    metadata_patch: dict | None,
+    metadata_delete_keys: list[str] | None,
+    metadata_mode: str,
+) -> dict[str, str] | None:
+    """The one slice of arm validation that must precede the authorization gate.
+
+    The gate's question is "is this caller authorized for THESE arms", which
+    cannot be asked of an argument set that names no writable arm at all. So
+    ``update_memory`` answers arm PRESENCE first, then authorizes, then runs the
+    rest of the argument checks (:func:`_validate_update_memory_arms`).
+
+    This does not weaken the gate-first ordering the tool documents. That rule
+    protects an unauthorized caller from having work done on its behalf and from
+    learning anything about the system; these two checks read no config, touch no
+    service state and describe nothing but the caller's own arguments. The
+    resolver keeps its own no-arm denial as a fail-closed backstop for any other
+    caller — this simply stops the tool from ever asking it an empty question,
+    which would surface an argument bug as an authorization error.
+
+    Both cases mean "there is nothing here to authorize":
+
+    - no arm supplied at all (an empty dict/list is an ABSENT arm, not a present
+      one — otherwise a caller whose patch computed to ``{}`` gets a success
+      envelope for a write that never happened);
+    - ``metadata_mode='replace'`` with no ``metadata_patch``, which is a request
+      to DELETE every custom key rather than to write one. The reachable shape is
+      ``update_memory(memory_id=..., content='new text', metadata_mode='replace')``:
+      ``content`` satisfies the at-least-one-arm bar, so without this check the
+      record's provenance is wiped as a side effect of an ordinary amend, and
+      unrecoverably so.
+    """
+    has_patch = bool(metadata_patch)
+    has_delete = bool(metadata_delete_keys)
+
+    if metadata_mode == 'replace' and not has_patch:
+        return {
+            'error': (
+                "update_memory: `metadata_mode='replace'` requires a non-empty "
+                '`metadata_patch`. An empty replace would delete every custom '
+                "metadata key on the record. Use `metadata_mode='merge'` (the "
+                'default) to leave metadata untouched, or name the keys to keep '
+                'in `metadata_patch`.'
+            ),
+            'error_type': 'ValidationError',
+        }
+
+    if content is None and not has_patch and not has_delete:
+        return {
+            'error': (
+                'update_memory requires at least one arm: `content` (amend the '
+                'text), `metadata_patch` (write metadata keys), or '
+                '`metadata_delete_keys` (remove metadata keys). An empty '
+                'dict/list counts as no arm.'
+            ),
+            'error_type': 'ValidationError',
+        }
+
+    return None
+
+
+def _validate_update_memory_arms(
+    *,
+    content: str | None,
+    metadata_patch: dict | None,
+    metadata_delete_keys: list[str] | None,
+    metadata_mode: str,
+    reason: str | None,
+) -> dict[str, str] | None:
+    """Validate ``update_memory``'s arm arguments — §5(a) guard steps 5-7.
+
+    Returns a structured ``ValidationError`` dict on the first violation, or
+    ``None`` when the argument set is coherent. Module level (not inside the
+    ``create_mcp_server`` closure) so the rules are reachable from a unit test
+    without standing up an MCP server, and so the tool body stays readable.
+
+    Every rejection NAMES the offending argument, and every check runs BEFORE
+    dispatch — an in-place amendment is invisible to every downstream reader,
+    so the one thing a caller must never be able to do is come away believing
+    it wrote something it did not. Same fail-loud posture as ``update_edge``'s
+    ``invalid_at``/``clear_invalid_at`` mutual-exclusivity check; nothing here
+    is silently dropped, coerced, or half-applied.
+
+    The two ``category`` rules below live at this boundary ONLY, deliberately.
+    ``MemoryService.update_memory`` stays permissive for a direct in-process
+    caller (recon Stage 1 dispatches it with ``_source`` set): the service
+    layer's job is preventing SILENT loss, which
+    ``_apply_metadata_delta``'s protected-key carry-through does structurally
+    for every caller, while this boundary is where a self-reported EXTERNAL
+    caller's explicit destructive intent is refused. Do not "helpfully"
+    duplicate these checks down into the service — two copies of a rule this
+    narrow will drift, and the service-side copy would also have to re-decide
+    what an in-process migration script is allowed to do.
+
+    Task 3195's metadata-vocabulary validators are NOT routed through here:
+    re-verified at implementation time that the module has not landed (no
+    shape validators for topic/canonical/kind/parent_id/supersedes exist in
+    the package). Per this task's SEAM NOTE, ``metadata_patch`` and
+    ``metadata_delete_keys`` route through them once it does.
+    """
+    def _err(message: str) -> dict[str, str]:
+        return {'error': message, 'error_type': 'ValidationError'}
+
+    # Re-run the pre-gate presence checks so this function is TOTAL when called
+    # directly (a unit test, or any future caller that skips the gate). The tool
+    # has already run them, so this is a cheap idempotent repeat, not a second
+    # source of truth.
+    if err := _update_memory_arm_presence_error(
+        content=content,
+        metadata_patch=metadata_patch,
+        metadata_delete_keys=metadata_delete_keys,
+        metadata_mode=metadata_mode,
+    ):
+        return err
+
+    has_patch = bool(metadata_patch)
+    has_delete = bool(metadata_delete_keys)
+
+    if content is not None and not str(content).strip():
+        # Amending a record to whitespace destroys it as surely as deleting it,
+        # and does so while reporting success.
+        return _err(
+            'update_memory: `content` was supplied but is empty or whitespace. '
+            'Omit `content` for a metadata-only update; pass the full replacement '
+            'text to amend the record.'
+        )
+
+    if content is not None and not (reason or '').strip():
+        # A silent rewrite is invisible to every downstream reader; the reason
+        # is the only durable record of WHY the text changed. Deliberately NOT
+        # required on the metadata arms — a mistagged patch is cheap to notice
+        # and cheap to correct.
+        return _err(
+            'update_memory: `reason` is required whenever `content` is supplied. '
+            'A content amend rewrites the record in place, so the justification '
+            'is the only durable record of why the text changed.'
+        )
+
+    if metadata_mode not in _UPDATE_MEMORY_MODES:
+        return _err(
+            f'update_memory: invalid `metadata_mode` {metadata_mode!r}. '
+            f'Must be one of {list(_UPDATE_MEMORY_MODES)}.'
+        )
+
+    # mem0-owned keys are rejected at the boundary rather than silently
+    # stripped, in BOTH directions. Writing one is futile (mem0 recomputes or
+    # restores it); deleting one is worse — mem0's own get/search read those
+    # keys, so a successful deletion would make the point unreadable by the
+    # store that owns it.
+    for key in metadata_patch or {}:
+        if key in MEM0_MANAGED_METADATA_KEYS:
+            return _err(
+                f'update_memory: `metadata_patch` names mem0-owned key {key!r}, '
+                f'which this tool will not write. mem0 recomputes or restores '
+                f'{sorted(MEM0_MANAGED_METADATA_KEYS)} on every write, so the '
+                'value would not survive. Remove the key and retry.'
+            )
+    for key in metadata_delete_keys or []:
+        if key in MEM0_MANAGED_METADATA_KEYS:
+            return _err(
+                f'update_memory: `metadata_delete_keys` names mem0-owned key '
+                f'{key!r}, which this tool will not remove. mem0 reads '
+                f'{sorted(MEM0_MANAGED_METADATA_KEYS)} to serve get/search, so '
+                'deleting one would make the record unreadable by its own store.'
+            )
+
+    # Fused-memory-owned keys are protected only from the DELETE arm — a
+    # deliberately narrower rule than the mem0-owned one above, and the
+    # asymmetry is load-bearing. mem0 recomputes its own keys, so writing one
+    # is futile in both directions; `category` by contrast is freely patchable
+    # (that is how a record gets re-categorized) but has no coherent removal
+    # intent behind it: Mem0Backend.search pushes it down as a Qdrant payload
+    # filter, so a record without it is unreachable by every category-scoped
+    # search, forever, with no other symptom.
+    for key in metadata_delete_keys or []:
+        if key in _FUSED_MEMORY_OWNED_METADATA_KEYS:
+            return _err(
+                f'update_memory: `metadata_delete_keys` names {key!r}, which '
+                'this tool will not remove. It is a Qdrant payload filter — '
+                'search pushes it down as an equality match — so a record '
+                'without it is permanently unreachable by every '
+                'category-scoped search, with no error and no other symptom. '
+                f'To change it, pass {key!r} in `metadata_patch` instead.'
+            )
+
+    # A category no filter can ever match leaves the record exactly as
+    # unreachable as a missing one, so validating the KEY without validating
+    # the VALUE would leave the same hole open. Resolved through the same
+    # MemoryCategory enum add_memory and add_system_record stamp records with;
+    # the ValueError becomes a structured rejection rather than an exception
+    # escaping the tool (INV-1: fail loud, but in the response envelope).
+    if metadata_patch and 'category' in metadata_patch:
+        try:
+            MemoryCategory(metadata_patch['category'])
+        except ValueError:
+            return _err(
+                f'update_memory: `metadata_patch` sets `category` to '
+                f'{metadata_patch["category"]!r}, which is not a valid memory '
+                f'category. Qdrant matches the payload filter exactly, so an '
+                f'unrecognised value makes the record unreachable by every '
+                f'category-scoped search. Must be one of '
+                f'{sorted(c.value for c in MemoryCategory)}.'
+            )
+
+    # Write it and remove it cannot both be honoured; picking one silently
+    # would make the outcome depend on implementation order.
+    if has_patch and has_delete:
+        overlap = sorted(set(metadata_patch or {}) & set(metadata_delete_keys or []))
+        if overlap:
+            return _err(
+                f'update_memory: {overlap} appear in BOTH `metadata_patch` and '
+                '`metadata_delete_keys`. Write and remove are contradictory '
+                'intents for the same key — name each key in exactly one list.'
+            )
+
+    # Replace already decides the whole custom subset, so a delete list is
+    # either redundant or contradictory — never meaningful. (The empty-replace
+    # case is caught earlier, by the pre-gate presence check.)
+    if metadata_mode == 'replace' and has_delete:
+        return _err(
+            "update_memory: `metadata_mode='replace'` cannot be combined with "
+            '`metadata_delete_keys`. Replace already sets the entire '
+            'custom-metadata subset, so anything omitted from `metadata_patch` '
+            'is removed by construction.'
+        )
+
+    return None
 
 
 def _extract_causation(metadata: dict | None, agent_id: str | None) -> tuple[str, str, dict | None]:
@@ -628,11 +1215,11 @@ def _truncate_payload(payload: Any) -> tuple[Any, bool]:
 #
 # RESERVED VALUE: '__unset__' is reserved and can never be stamped — a
 # caller that passed it literally as claimant_run_id would be silently
-# treated as "omitted" rather than stamped. This cannot happen today because
-# claimant_run_id is always machine-composed by
+# treated as "omitted" rather than stamped. The orchestrator's producer is
 # shared.task_claimant.compose_claimant_run_id() (format 'run/session/pid=N'),
-# never freeform text, but keep the reservation in mind before relaxing that
-# producer or introducing a new one.
+# but the wire accepts any string and freeform claimants exist in the corpus
+# (reify task 5225 carries 'agent-esc-5053-2-docs-fix' with heartbeat_at
+# NULL), so the reservation is a real constraint on every producer.
 _CLAIMANT_WIRE_UNSET = '__unset__'
 
 
@@ -707,14 +1294,16 @@ def _status_page(
     return {k: statuses[k] for k in page_keys}, len(ordered)
 
 
-def _validate_paging(page_size: Any, offset: Any) -> dict[str, Any] | None:
+def _validate_paging(
+    page_size: Any, offset: Any, *, size_arg: str = 'page_size',
+) -> dict[str, Any] | None:
     """Validate shared ``page_size``/``offset`` paging inputs.
 
     Returns a ValidationError payload dict when an input is malformed, or None
-    when both are acceptable.  Shared by ``get_tasks`` and ``get_statuses`` so
-    both tools reject identical inputs identically and a future fix to the
-    bool/int guard lands in ONE place (it was previously copy-pasted, so it
-    had to be fixed twice).
+    when both are acceptable.  Shared by ``get_tasks``, ``get_statuses`` and
+    ``find_tasks_by_metadata`` so they reject identical inputs identically and
+    a future fix to the bool/int guard lands in ONE place (it was previously
+    copy-pasted, so it had to be fixed twice).
 
     ``bool`` is rejected explicitly because it is an ``int`` subclass:
     ``page_size=True`` would otherwise silently mean a 1-entry page.
@@ -722,21 +1311,90 @@ def _validate_paging(page_size: Any, offset: Any) -> dict[str, Any] | None:
     would spin a paging caller forever.
 
     Callers must invoke this BEFORE touching the interceptor, so a malformed
-    request costs no backend work.
+    request costs no backend work. ``size_arg`` is the page-size argument's
+    name in the calling tool, so the error names what the caller passed.
     """
     if page_size is not None and (
         not isinstance(page_size, int) or isinstance(page_size, bool) or page_size <= 0
     ):
         return {
-            'error': 'page_size must be a positive integer',
+            'error': f'{size_arg} must be a positive integer; got {page_size!r}',
             'error_type': 'ValidationError',
         }
     if not isinstance(offset, int) or isinstance(offset, bool) or offset < 0:
         return {
-            'error': 'offset must be a non-negative integer',
+            'error': f'offset must be a non-negative integer; got {offset!r}',
             'error_type': 'ValidationError',
         }
     return None
+
+
+def _validate_statuses(statuses: Any) -> dict[str, Any] | None:
+    """Return a ValidationError payload unless ``statuses`` is None or a list of str.
+
+    ``[]`` is valid and matches nothing. Shared by ``get_tasks`` and
+    ``find_tasks_by_metadata``, so a bare string is rejected identically by both.
+    """
+    if statuses is None or (
+        isinstance(statuses, list) and all(isinstance(s, str) for s in statuses)
+    ):
+        return None
+    return {
+        'error': f'statuses must be a list of status strings; got {statuses!r}',
+        'error_type': 'ValidationError',
+    }
+
+
+def _validate_fields(fields: Any) -> dict[str, Any] | None:
+    """Return the INV-2 ValidationError payload unless ``fields`` is a valid ``get_tasks`` projection."""
+    try:
+        parse_task_projection(fields)
+    except InvalidTaskProjectionField as e:
+        return {
+            'error': str(e),
+            'error_type': 'ValidationError',
+            'field': e.field,
+            'allowed': list(e.allowed),
+        }
+    return None
+
+
+# find_tasks_by_metadata's page-size cap, and the page budget its include_value
+# and include_rows pages share, in serialized bytes of ``results``
+# (plans/task-metadata-lookup-prd.md decision 6).
+METADATA_LOOKUP_LIMIT_CAP = 100
+RESULT_BYTE_BUDGET = 48_000
+# Each opt-in payload field a lone over-budget row elides, and the flag marking it.
+_ELIDABLE_FIELDS = (('matched_value', 'truncated_value'), ('metadata', 'truncated_row'))
+
+
+def _json_bytes(obj: Any) -> int:
+    """Serialized size as the lookup contract measures it: stdlib ``json.dumps``, UTF-8 bytes."""
+    return len(json.dumps(obj).encode('utf-8'))
+
+
+def _elided_row(row: Mapping[str, Any]) -> dict[str, Any]:
+    elided = dict(row)
+    for field, flag in _ELIDABLE_FIELDS:
+        if field in row:
+            elided[field] = {'_elided': True, 'bytes': _json_bytes(row[field])}
+            elided[flag] = True
+    return elided
+
+
+def _fit_rows_to_budget(rows: Sequence[Mapping[str, Any]]) -> list[Mapping[str, Any]]:
+    """The longest prefix of *rows* whose serialized list fits ``RESULT_BYTE_BUDGET``.
+
+    Sizes add up exactly as ``json.dumps`` of the list: ``[]`` plus each row
+    plus a ``', '`` between rows. A first row too big to fit alone comes back
+    as the only row, with every opted-in payload elided.
+    """
+    size = len('[]')
+    for count, row in enumerate(rows):
+        size += _json_bytes(row) + (len(', ') if count else 0)
+        if size > RESULT_BYTE_BUDGET:
+            return list(rows[:count]) if count else [_elided_row(row)]
+    return list(rows)
 
 
 def _pagination_meta(
@@ -785,11 +1443,18 @@ def create_mcp_server(
     event_queue: EventQueue | None = None,
     curator_usage_gate: UsageGate | None = None,
     known_projects: dict[str, str] | None = None,
+    topic_cluster_store: TopicClusterStore | None = None,
+    id_resolver: IdResolver | None = None,
+    markup_residue_spool: MarkupResidueSpool | None = None,
+    embedder_probe: EmbedderEndpointProbe | None = None,
 ) -> FastMCP:
     """Create and configure the FastMCP server with all tools."""
 
     mcp = FastMCP('Fused Memory', instructions=FUSED_MEMORY_INSTRUCTIONS)
+
+    _resolver = per_use_id_resolver(memory_service, id_resolver)
     _taskmaster_configured = task_interceptor is not None
+    _task_facts_reader: TaskFactsReader | None = task_interceptor
 
     async def _backlog_gate(project_id: str) -> dict | None:
         """WP-D: reject memory writes when the per-project backlog is over the
@@ -861,91 +1526,86 @@ def create_mcp_server(
     # the loop quarantines those rows on first encounter and stops respawning.
     _kp = known_projects or {}
 
+    # One write-triage fail-open counter per server (INV-4). A closure-local
+    # binding rather than a module global, so nothing bleeds between servers
+    # or between tests — the same reasoning
+    # Mem0UpdateStormEscalator's per-instance state is built on.
+    _triage_fail_open_counter = TriageFailOpenCounter()
+
+    async def _file_triage_fail_open_storm(storm: dict, project_id: str) -> str | None:
+        """File the fail-open storm escalation for every project in the window.
+
+        Returns one filed escalation id to echo back, or None.
+
+        The counter's window is per-SERVER, not per-project, so a burst can
+        span several projects; each has its own escalation queue, so each gets
+        the alarm rather than only whichever write happened to cross the
+        threshold. The emitter dedupes per queue on its own anchor, so filing
+        into a queue that already has an open record folds into it.
+
+        project_root resolution copies the live sibling in ``add_episode``:
+        ``_kp.get(...)`` passed STRAIGHT to a never-raising emitter, and
+        wrapped in try/except anyway — a call site that RELIED on that promise
+        would turn a future regression there into an outage on the write path.
+        An unresolvable project yields no root at all, which the emitter
+        treats as a quiet no-op.
+
+        ASYNC ON PURPOSE — do not re-inline the escalation hop.
+        ``emit_triage_fail_open_storm_escalation`` does BLOCKING filesystem
+        I/O (queue construction, a queue-directory scan in ``get_by_task``, and
+        an fsync-flushed ``submit``), and this loop runs it once per project in
+        the window. Called directly from this coroutine it would run that I/O
+        ON the event loop and stall every other concurrent memory write for its
+        duration, so each call is handed to ``asyncio.to_thread``. Same
+        treatment, and the same reasoning, as
+        ``memory_service._validate_and_census``'s
+        ``file_unknown_key_storm_escalation`` hop. Rare by construction (one
+        crossing per rolling window) but this is the higher-volume
+        ``add_memory`` path, so the cheap hop is worth taking.
+        """
+        esc_id = None
+        storm_with_counts = {
+            **storm,
+            'mem0_intents_in_window': await _mem0_intents_in_window(storm),
+        }
+        # `or [project_id]`: a burst whose labels were all unresolvable still
+        # deserves an alarm somewhere, and this call's own project is the only
+        # queue we can name.
+        for pid in storm.get('projects') or [project_id]:
+            try:
+                filed = await asyncio.to_thread(
+                    emit_triage_fail_open_storm_escalation, _kp.get(pid), storm_with_counts,
+                )
+            except Exception:  # pragma: no cover — defensive only
+                logger.exception(
+                    'write_triage: emit_triage_fail_open_storm_escalation raised '
+                    'for project_id=%r; the write is unaffected',
+                    pid,
+                )
+                filed = None
+            if filed is not None and esc_id is None:
+                esc_id = filed
+        return esc_id
+
+    async def _mem0_intents_in_window(storm: dict) -> dict[str, int] | None:
+        """Mem0 intent counts by status over the storm's window; None when unavailable."""
+        if write_journal is None:
+            return None
+        since = datetime.now(UTC) - timedelta(seconds=float(storm.get('window_seconds') or 0))
+        try:
+            return await write_journal.count_mem0_intents_by_status(since=since)
+        except Exception as exc:
+            logger.warning(
+                'write_triage: could not count mem0_intents for the fail-open storm '
+                'record (%s: %s); it will say the counts are unavailable',
+                type(exc).__name__,
+                exc,
+            )
+            return None
+
     def _known_project_gate(project_id: str) -> dict | None:
         """Return an error dict if project_id is absent from the known_projects registry."""
         return validate_known_project_id(project_id, _kp)
-
-    # Task 3141 (PRD memory-write-path-convergence §9 leaf o): reject writes
-    # carrying raw MCP envelope markup at all four write boundaries. Per-server
-    # (not module-global) so no counter state bleeds between servers or tests.
-    # DF 3083 owns the root cause and the retroactive corpus sweep.
-    _markup_storm = MarkupStormCounter()
-
-    def _markup_gate(
-        fields: dict[str, object],
-        agent_id: str | None,
-        metadata: object,
-        project_root: str | None,
-    ) -> dict | None:
-        """Return the structured rejection dict if any of *fields* carries markup.
-
-        Returns ``None`` when the write is clean or the caller set the explicit
-        ``allow_mcp_markup`` override (see markup_tripwire's module docstring for
-        why that hatch exists). Every rejection feeds the storm counter, so a
-        burst — meaning the upstream serialization leak is actively running — is
-        surfaced rather than silently absorbed into a stream of bounced writes.
-        """
-        if markup_override_requested(metadata):
-            return None
-        violation = find_markup_violation(fields)
-        if violation is None:
-            return None
-        field, pattern = violation
-        logger.warning(
-            'markup_tripwire: rejected write with leaked MCP envelope markup '
-            '(agent_id=%r field=%r matched_pattern=%r project_root=%r)',
-            agent_id, field, pattern, project_root,
-        )
-        storm = _markup_storm.record(project_root)
-        if storm is not None:
-            # A burst, not an isolated slip: the upstream leak is live. Log it at
-            # ERROR on one greppable line first — the block dict below only ever
-            # reaches the leaking caller, which is the party least likely to act
-            # on it, so this line is the operator-facing half of INV-4.
-            logger.error(
-                'markup_tripwire_storm: %d markup writes rejected in %.0fs '
-                '(threshold=%d agent_id=%r field=%r matched_pattern=%r '
-                'project_root=%r) — the upstream serialization leak is ACTIVE; '
-                'DF 3083 owns the root cause',
-                storm.get('count', -1), storm.get('window_seconds', -1.0),
-                storm.get('threshold', -1), agent_id, field, pattern, project_root,
-            )
-            # File against EVERY project seen in the window, not just the one
-            # whose write happened to cross the threshold: the counter is shared
-            # across all projects this server serves, so escalating only the
-            # crossing write would name the wrong leaker AND leave the actually
-            # leaking project with nothing (the per-window rate limit means it
-            # gets no second chance until the window rolls over). The per-project
-            # anchor dedup collapses repeats inside each queue.
-            targets = storm.get('projects') or ([project_root] if project_root else [])
-            filed: dict[str, str] = {}
-            for target in targets:
-                # Escalation is purely additive — the rejection is already
-                # decided. emit_markup_storm_escalation is built never to raise,
-                # but a call site that relied on that promise would turn a future
-                # regression there into an outage here (same reasoning as
-                # task_interceptor's wrapping of scope_violation_escalator).
-                try:
-                    esc_id = emit_markup_storm_escalation(target, storm)
-                except Exception:  # pragma: no cover — defensive only
-                    logger.exception(
-                        'markup_tripwire: emit_markup_storm_escalation raised for '
-                        'project_root=%r; continuing with the rejection',
-                        target,
-                    )
-                    continue
-                if esc_id is not None:
-                    filed[target] = esc_id
-            if filed:
-                # Echoed back so the refused caller (or a reviewer reading the
-                # response) can find the filed escalation without grepping logs —
-                # preferring THIS caller's project, falling back to any filed id
-                # when the caller's own project resolved to nothing.
-                storm = {
-                    **storm,
-                    'escalation_id': filed.get(project_root or '') or next(iter(filed.values())),
-                }
-        return build_markup_block(agent_id, field, pattern, str(fields[field]), storm=storm)
 
     async def _log_read(
         operation: str,
@@ -975,6 +1635,10 @@ def create_mcp_server(
                 error=error,
             )
         except Exception as e:
+            # Feed the SAME counter WriteJournal increments internally (INV-5).
+            # This outer handler fires rarely — log_write_op swallows its own
+            # failure first — but when it does the row is just as lost.
+            write_journal.record_journal_drop(operation)
             logger.warning(f'Failed to log read op: {e}')
 
     # ------------------------------------------------------------------
@@ -1022,38 +1686,102 @@ def create_mcp_server(
         return JSONResponse(body, status_code=200 if ok else 503)
 
     # ------------------------------------------------------------------
+    # Liveness endpoint — ALIVENESS, not readiness (task 3765)
+    #
+    # DO NOT "improve" this handler by making it check a backing store. The
+    # whole point is that it checks NOTHING:
+    #
+    #   ALIVENESS (this route)  — is the asyncio event loop still serving?
+    #   READINESS (/health)     — are FalkorDB and Qdrant usable?
+    #
+    # WHY THE ROUTE EXISTS. scripts/orchestrator-watchdog.py decides whether to
+    # KILL fused-memory.service from an HTTP fetch, and it used to fetch
+    # /health — which awaits two sequential backing-store round-trips. That
+    # made the kill decision a LOAD measurement: a slow FalkorDB/Qdrant, or a
+    # busy-but-perfectly-advancing loop, manufactured a false "wedged" verdict
+    # and got the single shared MCP server all 7 orchestrators depend on
+    # restarted, cancelling in-flight reconciliation work for nothing.
+    #
+    # WHY IT IS STILL A VALID WEDGE DETECTOR. Task 1731 moved the systemd
+    # WATCHDOG=1 heartbeat onto a dedicated OS thread, so it pings
+    # unconditionally and Type=notify/WatchdogSec can NEVER catch a hung
+    # asyncio loop — only an HTTP fetch SERVED BY THAT LOOP can, which is why
+    # the task-2713 liveness pass exists at all. This route is served by that
+    # same loop, so a genuinely wedged loop still fails to answer it and is
+    # still killed. What disappears is only the false wedge.
+    #
+    # /health is deliberately left byte-for-byte unchanged (200/503 semantics
+    # and recon_busy field included): mcp_lifecycle._wait_for_health,
+    # restart-fused-memory.sh's recon gate and post-start verification,
+    # recon_busy_check.parse_health(), and the watchdog's own --report
+    # recon-busy column all consume its exact shape. This is purely additive.
+    # ------------------------------------------------------------------
+
+    _ALIVE_BODY = {'status': 'alive'}
+
+    @mcp.custom_route('/alive', methods=['GET'])
+    async def alive_check(request: Request) -> JSONResponse:
+        # No await, no closure state (memory_service / reconciliation_harness /
+        # task_interceptor / write_journal), no disk, no clock. Being served at
+        # all IS the signal; the body is a fixed constant so nothing dynamic
+        # can creep in and turn this back into a state read.
+        return JSONResponse(_ALIVE_BODY, status_code=200)
+
+    # POST /resolve-prefix: the uuid-prefix resolver for out-of-process callers (PRD C5).
+    register_resolve_prefix_route(
+        mcp, per_use_prefix_resolver(memory_service, id_resolver), known_projects=_kp,
+    )
+
+    # ------------------------------------------------------------------
     # Write tools
     # ------------------------------------------------------------------
 
     _VALID_TEMPORAL_CONTEXTS = frozenset({'retrospective', 'planning', 'current'})
     # Derived from the authoritative sets so this validator stays in lockstep
     # automatically when a new status is added to either partition. Both names
-    # are re-exported from shared.task_statuses (PRD task-status-authority
-    # C1/C2, finding 6.4) — the single source of truth:
+    # come from shared.task_statuses (PRD task-status-authority C1/C2,
+    # finding 6.4) — the single source of truth:
     #   ACTIVE_TASK_STATUSES  — shared.ACTIVE: non-terminal in-flight statuses
     #                           (re-exported by fused_memory.reconciliation.task_filter)
     #   TERMINAL_STATUSES     — shared.TERMINAL: terminal statuses requiring
-    #                           reopen_reason to exit (re-exported by
-    #                           fused_memory.middleware.task_interceptor)
+    #                           reopen_reason to exit (imported directly)
     # Do NOT hardcode this as a literal; use the union so a future status added
     # to shared.task_statuses.TaskStatus is automatically accepted here without
     # a separate edit to this file.
     #
-    # Cross-package ordering note (task 2171 / rho1a): this union now includes
-    # 'infra-hold', so add_task/set_task_status accept it from ANY caller as
-    # of this change — not just a future orchestrator writer. orchestrator/
-    # src/orchestrator/task_status.py's own ACTIVE_TASK_STATUSES is a separate
-    # 6-member literal (out of this task's fused-memory-only scope) and has
-    # NOT been migrated to shared.task_statuses.ACTIVE yet, so it still does
-    # not recognize 'infra-hold'. Until that orchestrator-side migration
-    # lands (tracked as follow-up omega2/omega3 work), a task externally set
-    # to 'infra-hold' is classified active here but would not be recognized
-    # as such by the orchestrator scheduler. No current writer emits
-    # 'infra-hold', so this is inert today; do not treat its acceptance here
-    # as evidence the orchestrator side is also ready.
+    # Cross-package note (task 2171 / rho1a): this union includes
+    # 'infra-hold', so add_task/set_task_status accept it from ANY caller.
+    # The orchestrator emits it: orchestrator/src/orchestrator/workflow.py::
+    # TaskWorkflow._mark_blocked takes a block_status (default 'blocked'), and
+    # TaskWorkflow._execute_verify_review_loop passes 'infra-hold'. Its
+    # orchestrator/src/orchestrator/task_status.py::ACTIVE_TASK_STATUSES is
+    # deliberately ACTIVE - {TaskStatus.INFRA_HOLD}, so the scheduler's
+    # active fetch excludes a row this set classifies active.
     _VALID_TASK_STATUSES = ACTIVE_TASK_STATUSES | TERMINAL_STATUSES
     _VALID_STORES = frozenset(v.value for v in SourceStore)
     _VALID_CATEGORIES = frozenset(v.value for v in MemoryCategory)
+    # The categories write triage covers, as the wire strings `category`
+    # actually arrives as. COMPOSED from MEM0_PRIMARY rather than spelled
+    # out, so a fourth Mem0-primary category is triaged automatically.
+    _TRIAGED_CATEGORIES = frozenset(c.value for c in MEM0_PRIMARY)
+    # outcome -> child `kind` for the ATTACH outcomes. Membership in this
+    # map is the definition of "attach outcome": anything absent is stored
+    # standalone.
+    #
+    # `contested` maps to AMENDMENT_KIND and NOT to SIGHTING_KIND, and the
+    # difference is content visibility rather than bookkeeping: grouped_read
+    # CARRIES amendment text into the grouped document, while sightings are
+    # only COUNTED. A contested child filed as a sighting has its correction
+    # suppressed to a tally underneath the very entry it contests — the
+    # esc-5712 five-week-wrong-appendix shape that grouped_read.
+    # is_contested_child exists to prevent. Its child additionally carries
+    # CONTESTED_METADATA_KEY (stamped in the attach below), which is what
+    # distinguishes it from an ordinary amendment for the read side.
+    _TRIAGE_ATTACH_KINDS = {
+        OUTCOME_RESTATED: SIGHTING_KIND,
+        OUTCOME_AMENDED: AMENDMENT_KIND,
+        OUTCOME_CONTESTED: AMENDMENT_KIND,
+    }
     # Remediation hint returned alongside conflicting_task_status_framing_write_blocked
     # (task 2276 amendment) so a blocked recon-stage agent can self-correct instead of
     # guessing why an accurate before/after summary was rejected.
@@ -1062,13 +1790,21 @@ def create_mcp_server(
         'valid_at timestamps instead of one write describing both the prior and '
         'resulting task status'
     )
-    # Remediation hint returned alongside flag_marker_write_blocked (task 2596):
-    # stage1_flag_marker records are code-managed via the recon_ledger (task
-    # 2406 UPSERT-only path) — no legitimate add_memory call should persist one.
-    _FLAG_MARKER_WRITE_HINT = (
-        'stage1_flag_marker persistence is code-managed via the recon_ledger; '
-        'add_memory is not a valid write path for it'
-    )
+
+    def _flag_kind_refusal_block(
+        agent_id: str | None, content: str, metadata: object
+    ) -> dict[str, Any] | None:
+        refusal = recon_stage_flag_kind_refusal(agent_id, metadata)
+        if refusal is None:
+            return None
+        return {
+            'error': refusal.error,
+            'error_type': refusal.error_type,
+            'agent_id': agent_id,
+            **excerpt_fields(content_excerpt=content),
+            'hint': refusal.hint,
+        }
+
     # Remediation hint returned alongside live_task_status_current_fact_write_blocked
     # (task 2628, Stage-1 reify finding 82c8a42a) so a blocked recon-stage agent can
     # self-correct instead of guessing why a liveness/status snapshot was rejected.
@@ -1097,6 +1833,134 @@ def create_mcp_server(
         'rephrase to past/aspirational tense — "will land" / "planned to resolve" / '
         '"intended to enforce" — or wait until the task is actually done/cancelled'
     )
+    # (task 3108) Actionable remediation for a refused consolidation delete.
+    # Names the concrete fix AND rules out the incident's re-derive-via-search
+    # "correction", which resolved back to the superseded cluster members the
+    # consolidation was collapsing.
+    _CITATION_REPOINT_HINT = (
+        'retry with replacement_memory_id=<the surviving entry\'s full 36-char '
+        'UUID>; the cited tasks will be repointed to it before the delete runs. '
+        'It must be an EXISTING entry that still resolves in the store, and it '
+        'must not be the id being deleted — copy it from the search result '
+        'rather than reconstructing it. A search(query=...) instruction is NOT '
+        'an acceptable replacement value — re-deriving at read time resolves '
+        'back to the superseded duplicates this consolidation is collapsing. '
+        'Terminal (done/cancelled) citers are reported, never rewritten.'
+    )
+    # (task 3624) The escape is advertised on the CitationRepointRequired
+    # refusal ONLY, which is why this is a separate constant rather than a
+    # sentence appended to the shared one. The CitationReplacement* refusals
+    # reuse _CITATION_REPOINT_HINT unchanged: a caller who typo'd, truncated or
+    # hallucinated a survivor UUID demonstrably HAS a survivor, so their fix is
+    # "copy the correct UUID" and offering a one-flag bypass there would invite
+    # exactly the stranded-pointer incident this gate closes. The same logic
+    # bounds who should take it at all — a consolidation delete has a survivor
+    # by definition, so the escape is never right for one, and the sentence
+    # says so rather than leaving the Stage-1 agent to infer it.
+    _CITATION_REPOINT_REQUIRED_HINT = (
+        _CITATION_REPOINT_HINT
+        + ' If there is no surviving entry to repoint to — a plain drop rather '
+          'than a consolidation, which replacement_memory_id cannot express — '
+          "pass metadata={'allow_dangling_citations': True} to accept dangling "
+          'these citations deliberately; the override is recorded at WARNING '
+          'and the response names every citer it strands. A consolidation '
+          'delete has a survivor by definition, so name it instead: taking the '
+          'escape there strands exactly the live pointers this gate exists to '
+          'protect.'
+    )
+    # (task 3624) Appended to whichever refusal a caller gets when they DID send
+    # allow_dangling_citations but not as a literal boolean True. Without it the
+    # strictness degrades silently into a dead end: the value is dropped, the
+    # ordinary refusal comes back, and its hint instructs them to pass the very
+    # flag they believe they just passed — a retry loop for an LLM caller.
+    _IGNORED_DANGLING_OVERRIDE_HINT = (
+        'NOTE: allow_dangling_citations was supplied but its value is not the '
+        'literal boolean True, so it was IGNORED and this refusal stands. Only '
+        'a literal True counts (the same rule as allow_near_duplicate and '
+        "allow_mcp_markup) — a truthy 'yes', 1 or 'true' must not unlock an "
+        'irreversible delete. Resend it as JSON true if you meant to override.'
+    )
+    _CITATION_REPLACEMENT_NOT_FOUND_HINT = (
+        'replacement_memory_id is well-formed but resolves to nothing, so '
+        'repointing to it would rewrite every live citation to address a '
+        'memory that does not exist — the dangling pointers this gate '
+        'prevents, merely relocated. Re-read the surviving entry\'s id from '
+        'the search/consolidation result and retry with that exact value.'
+    )
+    _CITATION_REPLACEMENT_CHECK_FAILED_HINT = (
+        'the surviving entry could not be resolved, so "exists" cannot be '
+        'distinguished from "does not exist". This delete is irreversible, so '
+        'it is refused rather than risked; retry once the memory store is '
+        'reachable.'
+    )
+    _CITATION_SCAN_FAILED_HINT = (
+        'the task DB could not be read, so an unknown citation state cannot be '
+        'distinguished from "no citations". This delete is irreversible, so it '
+        'is refused rather than risked; retry once the task backend is reachable.'
+    )
+    _CITATION_REPOINT_FAILED_HINT = (
+        'the listed tasks still cite the doomed entry — deleting now would '
+        'strand exactly the pointers this gate protects. Inspect unrepointed[] '
+        'for each write rejection, then retry the delete; already-repointed '
+        'tasks are idempotent on a second pass.'
+    )
+    # (task 3197) A cascade is one intent over a whole subtree, so its refusal
+    # names escapes that apply to the whole subtree — and one that does not
+    # require an escape at all. Same vocabulary as the _CITATION_*_HINT
+    # constants above, so a caller reading either refusal learns the same
+    # remedies by the same names.
+    _CASCADE_GATE_HINT = (
+        'nothing was deleted and nothing was repointed. Every record listed in '
+        'blocked[] carries its own error_type and citing_tasks, so fix them in '
+        'one pass rather than one refusal at a time: supply '
+        'replacement_memory_id (it is applied to the WHOLE cascade set, not '
+        'just the target), or pass '
+        "metadata={'allow_dangling_citations': True} to accept dangling every "
+        'listed citation deliberately. If neither fits, delete or reparent the '
+        'named descendants individually first — each then pays its own gate — '
+        'and retry the cascade once they are clear.'
+    )
+    # (task 3197) The scan-incomplete refusals need their OWN hint. Reusing
+    # _CASCADE_GATE_HINT above told the caller to read blocked[] — a key that
+    # envelope does not carry — and to retry with replacement_memory_id or
+    # allow_dangling_citations, neither of which unlocks anything here:
+    # _cascade_enumerate refuses BEFORE either escape is ever consulted. A
+    # hint that prescribes a retry into an identical refusal is worse than no
+    # hint, because it reads as a way out and is not one. Its closing advice
+    # ("delete the NAMED descendants individually") is likewise unusable on
+    # the truncated arm, where the whole point is that they were not all named.
+    _CASCADE_SCAN_INCOMPLETE_HINT = (
+        'nothing was deleted. This is a VISIBILITY failure, not a citation '
+        'failure: the cascade set could not be fully enumerated, so no claim '
+        'about its citations was ever made. replacement_memory_id and '
+        "metadata={'allow_dangling_citations': True} do NOT unlock this "
+        'refusal — both are consulted only once the set is known, so a retry '
+        'carrying either returns this same error. If scan_error is present '
+        'the enumeration RAISED: retry once the memory store is reachable. '
+        'If truncated is true the subtree is larger than one scroll page: '
+        'cascade it from the LEAVES up in smaller subtrees — each pays its '
+        'own gate — until what remains fits, or raise the descendant scan '
+        'limit.'
+    )
+    # (task 3133) `consolidate_memories` runs the same gate over its
+    # supersedes set but exposes NEITHER escape the two hints above
+    # advertise: its replacement is always the canonical it writes, and it
+    # takes no allow_dangling_citations argument. Pointing a consolidating
+    # caller at two knobs their tool does not have is the same defect
+    # _CASCADE_SCAN_INCOMPLETE_HINT was split off to avoid — a hint that
+    # reads as a way out and is not one.
+    _CONSOLIDATE_GATE_HINT = (
+        'nothing was written and nothing was deleted, so the corpus is '
+        'byte-identical to before this call — the pre-flight runs before '
+        'the canonical is created precisely so a refusal costs nothing. '
+        'Every id in blocked[] carries its own error_type and, where the '
+        'scan got that far, its citing_tasks. A CitationScanFailed entry '
+        'means the task DB was unreadable and an unknown citation state '
+        'must not be read as "no citations" before an irreversible delete: '
+        'retry once the task backend is reachable. There is deliberately no '
+        'dangling-citation escape here — a consolidation always has a '
+        'concrete survivor to repoint at, so it never needs one.'
+    )
     # Categories the premature-completion-claim guard (task 2824) covers — the
     # same four the live-task-status guard (task 2628) covers.
     # preferences_and_norms/procedural_knowledge are deliberately excluded: a norm
@@ -1108,6 +1972,19 @@ def create_mcp_server(
             'observations_and_summaries',
             'entities_and_relations',
             'temporal_facts',
+        }
+    )
+    # Categories the deterministic topic-cluster pre-check covers (task 3430).
+    # ENUMERATED rather than composed from MEM0_PRIMARY the way _TRIAGED_CATEGORIES
+    # is: observations_and_summaries is deliberately excluded here — extending to
+    # it is sibling task 4729's call, with its own false-positive analysis this
+    # task has not done. This frozenset is the one-line widening point for 4729.
+    # Built from `.value` (not string literals) so a category rename cannot
+    # silently break the gate.
+    _TOPIC_GUARD_GATED_CATEGORIES = frozenset(
+        {
+            MemoryCategory.procedural_knowledge.value,
+            MemoryCategory.preferences_and_norms.value,
         }
     )
 
@@ -1161,10 +2038,1159 @@ def create_mcp_server(
             'error': 'premature_completion_claim_write_blocked',
             'error_type': 'ReconPrematureCompletionClaimWriteRejected',
             'agent_id': agent_id,
-            'content_excerpt': content[:200],
+            **excerpt_fields(content_excerpt=content),
             'blocked_task_ids': sorted(blocked),
             'hint': _PREMATURE_COMPLETION_HINT,
         }
+
+    # ------------------------------------------------------------------ #
+    # Task 3142 / PRD leaf pi: completion-claim verification gate
+    # ------------------------------------------------------------------ #
+    #
+    # Verifies "the fix has been applied" / "re-filed as ticket tkt_..." claims
+    # against the live task, ticket-registry and git authorities, and TAGS the
+    # episode when a claim cannot be confirmed. Reify esc-5603-1 is the
+    # motivating incident (one unverified sentence fanned out by extraction into
+    # five false Graphiti edges); esc-3085-1 extended it to filing/dispatch
+    # claims and across projects.
+    #
+    # Deliberately unlike _premature_completion_block above in TWO ways:
+    #   * It LABELS instead of rejecting, so it runs for EVERY writer rather
+    #     than only recon-stage- agents — a false completion claim does the same
+    #     corpus damage whoever writes it, and the 2824 gate's blast radius (a
+    #     bounced write) is what confined it to recon agents in the first place.
+    #   * An unresolvable authority TAGS instead of failing open. See
+    #     completion_claim_gate.verify_claims for the full argument: this gate's
+    #     worst case on a false positive is one extra source_description prefix
+    #     on a kept episode, while its worst case on a false NEGATIVE is another
+    #     batch of false edges.
+
+    def _group_refs_by_project(
+        claims: list[Any], subject: str
+    ) -> dict[str | None, list[str]]:
+        """Group *subject* claims' refs by the project that ADJUDICATES them.
+
+        The grouping key is the claim's own resolved project, not the writer's:
+        esc-3085-1's whole point is that the two differ, and reading the
+        writer's tree for "dark_factory task 3142 has landed" answers a question
+        nobody asked — confidently, and with the wrong tree.
+        """
+        grouped: dict[str | None, list[str]] = {}
+        for claim in claims:
+            if claim.subject != subject:
+                continue
+            refs = grouped.setdefault(claim.project_id, [])
+            if claim.ref not in refs:
+                refs.append(claim.ref)
+        return grouped
+
+    async def _claim_task_statuses(
+        claims: list[Any], project_id: str
+    ) -> dict[tuple[str | None, str], str]:
+        """Live status for every task claim, keyed ``(project_id, ref)``.
+
+        One batched read per CLAIMED project, through ``read_task_facts``. An
+        ABSENT key is the unresolvable signal: the sync probe handed to
+        verify_claims returns None for it, which lands the claim on
+        'unverifiable' and therefore tagged. Only FOUND facts get a key, so "no
+        such task", "could not check" and an unusable status all stay absent
+        rather than fabricating a permissive answer.
+        """
+        refs = {
+            TaskRef(claim.project_id, claim.ref)
+            for claim in claims
+            if claim.subject == 'task' and claim.project_id
+        }
+        if not refs:
+            return {}
+        facts = await read_task_facts(refs, reader=_task_facts_reader, known_projects=_kp)
+        for fact in facts.values():
+            if fact.lookup is Lookup.COULD_NOT_CHECK:
+                logger.warning(
+                    'completion_claim_gate (writer_project=%r): live status unresolvable '
+                    'for task %r in project %r (%s)',
+                    project_id, fact.ref.task_id, fact.ref.project_id, fact.reason,
+                )
+        return {
+            (fact.ref.project_id, fact.ref.task_id): fact.status
+            for fact in facts.values()
+            if fact.lookup is Lookup.FOUND and fact.status is not None
+        }
+
+    async def _verify_mint_referent(referent: Any, project_id: str) -> dict | None:
+        """Guard 4: refuse to mint a node for a task the registry does not have.
+
+        Returns an ``EntityMintUnknownTask`` refusal dict, or ``None`` to
+        proceed, by the referent's ``Lookup``: FOUND proceeds; NO_SUCH_TASK
+        refuses, because the store answered and a node for a task that does not
+        exist is an orphan nothing sweeps; COULD_NOT_CHECK logs a WARNING and
+        proceeds, because an unreachable registry must not make this tool
+        unusable.
+
+        The adjudicating project is the REFERENT's own
+        (``referent.project_id or project_id``), never the writer's: reading the
+        writing project's tree for "does reify task 132 exist" answers a
+        question nobody asked, confidently and with the wrong tree — the
+        esc-3085-1 mistake ``_group_refs_by_project`` exists to avoid.
+        """
+        claimed_project = getattr(referent, 'project_id', '') or project_id
+        ref = str(getattr(referent, 'number', '') or '')
+        if not ref:
+            return None
+        task_ref = TaskRef(claimed_project, ref)
+        facts = (await read_task_facts(
+            [task_ref], reader=_task_facts_reader, known_projects=_kp,
+        ))[task_ref]
+        if facts.lookup is Lookup.NO_SUCH_TASK:
+            return {
+                'status': 'refused',
+                'error': (
+                    f'task {ref} does not exist in project '
+                    f'{claimed_project!r}, so no Entity node will be minted for '
+                    'it. The task registry was consulted successfully and '
+                    'reported no such task — check the number, or file the task '
+                    'first.'
+                ),
+                'error_type': 'EntityMintUnknownTask',
+                'project_id': claimed_project,
+                'ref': ref,
+            }
+        if facts.lookup is Lookup.COULD_NOT_CHECK:
+            logger.warning(
+                'entity_mint: could not verify task %r in project %r against the '
+                'task registry (%s); minting anyway rather than refusing, because '
+                'an unreachable registry must not make this tool unusable. '
+                'writer_project=%r',
+                ref, claimed_project, facts.reason, project_id,
+            )
+        return None
+
+    async def _claim_ticket_rows(claims: list[Any]) -> dict[str, Any]:
+        """Registry row per ticket claim, keyed by ticket id.
+
+        A key mapped to None means the registry answered NO SUCH TICKET (a
+        mismatch — esc-3085-1 instance (2)); an ABSENT key means the registry
+        could not be consulted (unverifiable), whether the read failed or no
+        ticket store is configured at all. Conflating the two would put a false
+        accusation in the flag, so they stay distinct (INV-2).
+        """
+        refs = [c.ref for c in claims if c.subject == 'ticket']
+        if not refs:
+            return {}
+        if not _taskmaster_configured:
+            logger.warning(
+                'completion_claim_gate: no task_interceptor; %d ticket claim(s) '
+                'are UNVERIFIABLE and will be tagged', len(refs),
+            )
+            return {}
+        rows: dict[str, Any] = {}
+        for ref in dict.fromkeys(refs):
+            try:
+                # A globally unique PK lookup over the one shared tickets.db —
+                # so it needs no project and answers a cross-project claim
+                # correctly (see TaskInterceptor.get_ticket_row).
+                rows[ref] = await task_interceptor.get_ticket_row(ref)  # type: ignore[union-attr]
+            except TicketStoreNotConfiguredError:
+                logger.warning(
+                    'completion_claim_gate: ticket store not configured; %d ticket '
+                    'claim(s) are UNVERIFIABLE', len(refs),
+                )
+                return {}
+            except Exception:
+                logger.warning(
+                    'completion_claim_gate: get_ticket_row failed for %r; the claim '
+                    'is UNVERIFIABLE and will be tagged', ref, exc_info=True,
+                )
+        return rows
+
+    # Built once per server, so each repository's git top level is resolved once
+    # per process rather than once per episode.
+    _registry_commit_probe = make_registry_commit_probe(_kp)
+
+    async def _claim_commit_presence(
+        claims: list[Any], project_id: str
+    ) -> dict[tuple[str | None, str], bool]:
+        """Commit existence per commit claim, keyed ``(project_id, sha)``.
+
+        Each sha is looked up in the CLAIMED project's repository first, then
+        in every other registered one (completion_claim_gate.
+        make_registry_commit_probe): a sha is near-globally unique, and the
+        writer often names a commit that landed in another project's repo. An
+        absent key is unresolvable (no repository could rule the sha out). The
+        probe is a subprocess, so it runs under asyncio.to_thread — a blocking
+        git call on the event loop would stall every other in-flight MCP
+        request behind one episode's verification.
+        """
+        grouped = _group_refs_by_project(claims, 'commit')
+        if not grouped:
+            return {}
+        present: dict[tuple[str | None, str], bool] = {}
+        for claimed_project, refs in grouped.items():
+            for ref in refs:
+                answer = await asyncio.to_thread(
+                    _registry_commit_probe, ref, claimed_project
+                )
+                if answer is None:
+                    logger.warning(
+                        'completion_claim_gate: commit %r could not be ruled in or '
+                        'out across the registered repositories; the claim is '
+                        'UNVERIFIABLE and will be tagged (claimed_project=%r '
+                        'writer_project=%r)',
+                        ref, claimed_project, project_id,
+                    )
+                    continue
+                present[(claimed_project, ref)] = answer
+        return present
+
+    async def _completion_claim_gate(
+        content: str, agent_id: str | None, project_id: str
+    ) -> dict[str, Any] | None:
+        """Return the structured unverified-claim flag for *content*, or None.
+
+        None means "nothing to say": either the content carries no completion
+        claim naming a concrete ref (the overwhelmingly common case, in which no
+        authority is consulted at all and the write is exactly as it was before
+        this gate existed), or every claim it does carry was CONFIRMED.
+
+        Never rejects and never mutates the write — the caller only stamps the
+        tag and echoes the flag.
+
+        DELIBERATE INVERSION, do not "fix" it into a fail-open: every
+        unresolvable authority above is mapped onto a MISSING map key, which the
+        probes below turn into None, which verify_claims turns into
+        'unverifiable', which tags. The sibling gate two definitions up
+        (_premature_completion_block, task 2824) does the opposite and is right
+        to — it REJECTS, so a transient status-read failure bouncing a
+        legitimate write is worse than the stale claim it would have caught.
+        Here the costs run the other way: a spurious tag is one extra
+        source_description prefix on an episode that is kept regardless, while a
+        missed tag is another batch of false extracted edges (reify esc-5603-1:
+        five, from one sentence). The argument is written out in full in
+        completion_claim_gate.verify_claims' docstring.
+
+        Total containment: the gate is advisory machinery bolted onto the write
+        path, so no defect in it may ever cost the caller their ingestion. The
+        exception is logged at ERROR rather than swallowed quietly — a silent
+        except is how a gate stops gating without anyone noticing.
+        """
+        try:
+            claims = extract_completion_claims(
+                content,
+                default_project_id=project_id,
+                known_project_ids=set(_kp),
+            )
+            if not claims:
+                return None
+            statuses = await _claim_task_statuses(claims, project_id)
+            tickets = await _claim_ticket_rows(claims)
+            commits = await _claim_commit_presence(claims, project_id)
+            # The three probes are pure lookups over the maps resolved above:
+            # verify_claims is sync (so it stays unit-testable with no I/O), and
+            # the authorities are async, so the awaiting happens here and the
+            # adjudication there. A MISSING key is the unresolvable signal in
+            # every map.
+            verdicts = verify_claims(
+                claims,
+                task_status_probe=lambda ref, pid: statuses.get((pid, ref)),
+                ticket_probe=lambda ref: tickets.get(ref, UNRESOLVABLE),
+                commit_probe=lambda ref, pid: commits.get((pid, ref)),
+            )
+            return build_unverified_flag(verdicts, text=content)
+        except Exception:
+            logger.exception(
+                'completion_claim_gate: verification raised for agent_id=%r '
+                'project_id=%r — the write is ingested UNTAGGED; the gate is '
+                'advisory and must never cost a caller their write',
+                agent_id, project_id,
+            )
+            return None
+
+    def _log_unverified_claims(flag: dict[str, Any], agent_id: str | None) -> None:
+        """Emit the grep-stable operator-facing line for a flagged write.
+
+        One line per claim, each naming the ref, the authority consulted and
+        what was actually OBSERVED, so an operator reading logs can act without
+        re-deriving the verdict from the corpus (INV-2 / INV-4).
+        """
+        for entry in flag.get('claims') or []:
+            logger.warning(
+                'completion_claim_gate.unverified: %s claim about %s %r is %s '
+                '(agent_id=%r project_id=%r observed=%r) — write INGESTED and '
+                'tagged %r, not rejected',
+                entry.get('kind'), entry.get('subject'), entry.get('ref'),
+                entry.get('status'), agent_id, entry.get('project_id'),
+                entry.get('observed'), UNVERIFIED_CLAIM_TAG,
+            )
+
+    def _report_unverified_claims(
+        flag: dict[str, Any], agent_id: str | None, project_id: str
+    ) -> dict[str, Any]:
+        """Report a write the completion-claim gate flagged; the ONE home for it.
+
+        The gate has two halves, and each write tool runs them in this order:
+        ``_completion_claim_gate`` BEFORE the service call, so the caller can
+        forward ``unverified_claim=True`` and the tag reaches the stored
+        artefacts; then this, only AFTER the service has accepted the write,
+        because both things it emits say the write was INGESTED. A write
+        rejected anywhere, at a tool guard or inside the service, reports
+        nothing.
+
+        It logs every flagged claim, files (or folds onto) the per-ref operator
+        escalation for the writer's project, and returns the flag to echo under
+        ``UNVERIFIED_CLAIM_TAG``, carrying ``escalation_id`` when one was filed.
+        The tag labels the corpus; the escalation reaches an operator. Both,
+        or the finding lives only in a WARNING nobody greps (INV-4).
+        """
+        _log_unverified_claims(flag, agent_id)
+        # emit_unverified_claim_escalation is built never to raise, but a call
+        # site that RELIED on that promise would turn a future regression there
+        # into an outage on the write path — same reasoning as the markup guard
+        # sink's wrapping of its own emitter.
+        try:
+            esc_id = emit_unverified_claim_escalation(_kp.get(project_id), flag)
+        except Exception:  # pragma: no cover — defensive only
+            logger.exception(
+                'completion_claim_gate: emit_unverified_claim_escalation raised '
+                'for project_id=%r; the write is still ingested and tagged',
+                project_id,
+            )
+            esc_id = None
+        if esc_id is None:
+            return flag
+        return {**flag, 'escalation_id': esc_id}
+
+    def _citation_gate_applies(store: str, project_id: str) -> bool:
+        """Is the citation gate live for this (record, project)?
+
+        ONE home for the precondition (INV-5), called both by the gate's own
+        early-out and by the cascade pre-flight.  Two copies could drift, and
+        the drift has a shape: a pre-flight that enumerated a whole subtree
+        for a project the gate would then decline to check would pay for a
+        walk whose result it must discard — or worse, refuse a cascade on
+        behalf of a gate that is not even running.
+
+        ``store == 'mem0'``: the incident's citations were Mem0 entry UUIDs,
+        the same scoping ``verify_cited_memories`` uses, and the same one
+        ``metadata.parent_id`` (a Mem0 payload key) has.  A registered
+        project: without one there is no live task DB to scan, so the
+        pre-existing behaviour for unregistered projects is preserved
+        exactly.  Note what is NOT here — the caller's ``agent_id`` (task
+        3624): "will this delete dangle a live pointer?" is a property of the
+        record and the task DB, not of who asked.
+        """
+        return store == 'mem0' and _taskmaster_configured and project_id in _kp
+
+    async def _citation_repoint_gate(
+        memory_id: str,
+        store: str,
+        project_id: str,
+        agent_id: str | None,
+        replacement_memory_id: str | None,
+        allow_dangling_citations: bool = False,
+        *,
+        scan_only: bool = False,
+        replacement_cache: dict[tuple[str, str], Any] | None = None,
+    ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+        """Repoint live task-metadata citations BEFORE an irreversible delete.
+
+        Returns ``(rejection, repoint_stats)``: a structured error dict to
+        REFUSE the delete, or ``(None, stats)`` to allow it. Same
+        "return None to allow / return an error dict to reject" contract as
+        :func:`_premature_completion_block` (task 2824), and the same
+        ``_taskmaster_configured and project_id in _kp`` precondition — but the
+        opposite failure posture, deliberately (see below).
+
+        Scoped to the RECORD, not to the caller (task 3624): ``store == 'mem0'``
+        and a scannable registered project. "Will this delete dangle a live
+        pointer?" is a property of the entry and the task DB, so an identical
+        delete is gated identically no matter who issues it — including a caller
+        with no ``agent_id`` at all. The original scoping added a
+        ``recon-stage-*`` ``agent_id`` predicate to bound the blast radius; that
+        left the interactive path — how the 25-gate consolidation batch of task
+        3524 is actually driven — landing unguarded, stranding exactly the
+        pointers this gate exists to protect, and it made an unidentified caller
+        the LEAST guarded one. The mem0 scoping mirrors
+        ``verify_cited_memories``' own: the incident's citations were Mem0 entry
+        UUIDs.
+
+        ``allow_dangling_citations`` is the deliberate escape, for a caller with
+        no surviving entry to repoint to — a plain drop rather than a
+        consolidation, which ``replacement_memory_id`` cannot express. It is a
+        property of stated intent, not of identity, so it is available to every
+        caller. It is checked AFTER the scan, not as an early-out, for two
+        reasons: it must be able to NAME what it dangles (the WARNING it emits
+        reuses ``citing_tasks``, and an override that lands silently is the same
+        class of defect as the gate that never ran), and that ordering keeps the
+        fail-closed posture below intact — an override plus an unreadable task
+        DB is still ``CitationScanFailed``, because the flag means "I accept
+        dangling the citers you just showed me" and with nothing enumerated
+        there is nothing to knowingly accept. Cost: an override pays the one
+        ``get_tasks`` read. The trace is the point — and it is returned to the
+        caller (``dangled_citations`` / ``dangled_citation_count``, plus
+        ``ignored_replacement_memory_id`` when one was supplied and dropped) as
+        well as logged, because an MCP caller never sees the server's log
+        stream and a bare ``{'status': 'deleted'}`` would be silent to the very
+        session this escape exists to serve.
+
+        Why here and not in ``MemoryConsolidator.run()``: the consolidator
+        never deletes from Python — the Stage-1 LLM agent calls this very tool
+        (``STAGE1_DISALLOWED`` in ``cli_stage_runner.py:138-143`` does NOT
+        include ``DISALLOW_MEMORY_WRITES``, so the call is permitted and
+        prompt-level discipline was the only guard). A sweep inside ``run()``
+        would therefore execute AFTER the delete and could only report damage.
+        This handler is the one seam that is both strictly before the
+        irreversible destruction and where the surviving id is knowable.
+
+        ``replacement_memory_id`` must clear three preconditions, all of them
+        AFTER the no-live-citers early-out so an uncited delete pays nothing:
+        it must be a concrete 36-char UUID (not prose —
+        ``CitationReplacementInvalid``), it must not be the id being deleted
+        (a self-substitution that reports success while every citation still
+        addresses the destroyed entry — ``CitationReplacementInvalid``), and it
+        must RESOLVE in the store (``CitationReplacementNotFound``; a raised
+        lookup fails closed as ``CitationReplacementCheckFailed``). Shape alone
+        is not enough: ``is_concrete_memory_id`` rules out prose and claims
+        nothing about existence, so a hallucinated-but-well-formed id would
+        otherwise rewrite every live citer to address nothing and THEN land the
+        irreversible delete — the incident's dangling pointers, merely
+        relocated.
+
+        Fails CLOSED. If the task-DB read raises, the delete is REJECTED rather
+        than allowed. This diverges from ``_premature_completion_block``'s
+        fail-open posture on purpose, and the distinction is the cost of being
+        wrong: that gate blocks a cheap, correctable status claim, this one
+        blocks an irreversible destruction whose harm — a dangling live pointer
+        — is exactly what "unknown" might be hiding. It follows
+        ``flag_dedup.filter_false_absence_flags``' posture instead ("present or
+        inconclusive -> drop, to prevent irreversible delete_memory ops"). A
+        refused delete is retried next cycle; a silently permitted one
+        manufactures the L2.
+
+        ``scan_only`` is a DRY-RUN MODE, not a second scanner (task 3197).
+        The cascade pre-flight has to ask this same question of every record
+        a ``cascade=True`` delete would destroy, and it must ask it without
+        mutating anything — otherwise a set that turns out to be unfixable
+        would have left repoints behind on an operation that reported
+        failure. In this mode every rule above still runs (the scan, the
+        fail-closed-on-scan-error arm, the live-citer check, the
+        ``allow_dangling_citations`` arm and all three
+        ``replacement_memory_id`` preconditions) and every rejection is still
+        returned verbatim; only the terminal ``repoint_task_citations``
+        mutation and the override WARNING are skipped. The WARNING in
+        particular must fire exactly once per record — the real pass emits
+        it, so a dry run that also logged would double-count the one signal
+        an operator uses to audit the escape. Making this a mode rather than
+        a copy is what keeps every rule with exactly one home (INV-5); a
+        duplicated scanner would drift, and the drift would be silent
+        because both halves would still "work".
+
+        ``replacement_cache`` memoizes ONE thing — the
+        ``replacement_memory_id`` existence probe — for the duration of ONE
+        ``delete_memory`` invocation, and nothing outside it (there is no
+        module-level cache, no TTL, no reuse across calls). A cascade of K
+        cited records otherwise re-reads the same Qdrant point 2K times,
+        once per record per pass, for an answer that cannot differ between
+        them. Do NOT confuse this with the citation snapshot, which is
+        deliberately uncached and must stay so: that read is the fail-closed
+        guarantee itself, because a task can begin citing a doomed id at any
+        moment. The replacement's liveness is not that racy quantity —
+        ``_cascade_replacement_outside_set`` has already proved the
+        replacement is not one of the records this call destroys, so no
+        write by this operation can change the answer mid-invocation. A
+        RAISED lookup is not cached, so the fail-closed arm keeps re-probing
+        rather than remembering a failure.
+        """
+        if not _citation_gate_applies(store, project_id):
+            return None, None
+
+        project_root = _kp[project_id]
+        try:
+            citers = await _scan_task_citations(project_root, memory_id)
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except Exception as exc:
+            logger.warning(
+                'citation gate: task scan failed for %s; failing closed',
+                memory_id,
+                exc_info=True,
+            )
+            return {
+                'error': (
+                    'Could not determine whether any task still cites '
+                    f'{memory_id}; refusing an irreversible delete on an '
+                    'unknown citation state.'
+                ),
+                'error_type': 'CitationScanFailed',
+                'memory_id': memory_id,
+                'scan_error': str(exc),
+                'scan_error_type': type(exc).__name__,
+                'hint': _CITATION_SCAN_FAILED_HINT,
+            }, None
+
+        live_citers = [c for c in citers if not c['terminal']]
+        if not live_citers:
+            # Nothing live points at this id, so the delete cannot dangle one.
+            return None, None
+
+        # Every rejection below names the citers, so the caller is never left to
+        # re-derive the enumeration by hand — the step that found 3 of 8 in the
+        # incident.
+        citing_tasks = [
+            {'task_id': c['task_id'], 'status': c['status'], 'paths': c['paths']}
+            for c in live_citers
+        ]
+
+        # The deliberate escape, placed HERE rather than as an early-out at the
+        # top of the gate on purpose: it must be able to name what it dangles.
+        # An early return before the scan would be cheaper but structurally
+        # unable to enumerate anything, which is the silent-override defect
+        # this whole gate argues against. The placement also preserves the
+        # fail-CLOSED posture for free — the scan-error return above precedes
+        # it, so an override plus an unreadable task DB is still
+        # CitationScanFailed. That is the right semantics: the flag means "I
+        # accept dangling the citers you just showed me", and with nothing
+        # enumerated there is nothing to knowingly accept.
+        if allow_dangling_citations:
+            if scan_only:
+                # The override covers this record, so the pre-flight has no
+                # blocker to report — and it stays silent: the real pass
+                # logs the WARNING, and one override must produce one
+                # WARNING per record, not two.
+                return None, None
+            # An override that lands SILENTLY is the same class of defect as the
+            # gate that never ran, so record what is being knowingly dangled —
+            # reusing the enumeration above so the trace and the rejection's
+            # citing_tasks name the same citers the same way. A replacement
+            # supplied alongside the flag is contradictory ("repoint them" vs
+            # "dangle them"); the override wins, and the dropped argument is
+            # named rather than discarded in silence.
+            ignored_replacement = (
+                '' if replacement_memory_id is None
+                else f'; replacement_memory_id {replacement_memory_id} was '
+                     'supplied but NOT used'
+            )
+            logger.warning(
+                'citation gate: allow_dangling_citations override by %s — deleting '
+                '%s, leaving %d live citation(s) dangling: %s%s',
+                agent_id,
+                memory_id,
+                len(citing_tasks),
+                citing_tasks,
+                ignored_replacement,
+            )
+            # ...and report the same enumeration to the CALLER, not just to the
+            # server log. The caller this escape exists to serve drives a
+            # consolidation batch over MCP and never sees the orchestrator's log
+            # stream, so a bare {'status': 'deleted'} would make the override
+            # silent from the only vantage point that matters to them. This
+            # rides the same (None, stats) success channel the repoint path uses
+            # — merged into the tool result by delete_memory — and names the
+            # citers with the same shape the refusal reports in citing_tasks, so
+            # "refused" and "overridden" are diffable rather than two vocabularies.
+            dangled: dict[str, Any] = {
+                'dangled_citations': citing_tasks,
+                'dangled_citation_count': len(citing_tasks),
+            }
+            if replacement_memory_id is not None:
+                dangled['ignored_replacement_memory_id'] = replacement_memory_id
+            return None, dangled
+
+        if replacement_memory_id is None:
+            return {
+                'error': (
+                    f'{len(live_citers)} live task(s) still cite {memory_id}. '
+                    'Supply replacement_memory_id so those citations are '
+                    'repointed before this irreversible delete.'
+                ),
+                'error_type': 'CitationRepointRequired',
+                'memory_id': memory_id,
+                'citing_tasks': citing_tasks,
+                # The ONE refusal that advertises the escape: this caller has
+                # named no survivor and may genuinely have none. The
+                # CitationReplacement* refusals below keep the plain hint —
+                # they were reached BY naming a survivor, so the fix is to
+                # correct that value, not to bypass the gate.
+                'hint': _CITATION_REPOINT_REQUIRED_HINT,
+            }, None
+
+        # A forwarding pointer is only a pointer if it is a concrete id. This
+        # is the mechanical form of incident failure mode (2): prose describing
+        # how to FIND the survivor (the re-derive-via-search "correction") is
+        # not a survivor, and re-deriving at read time resolved straight back
+        # into the superseded duplicates this delete is collapsing.
+        if not is_concrete_memory_id(replacement_memory_id):
+            return {
+                'error': (
+                    f'replacement_memory_id {replacement_memory_id!r} is not a '
+                    'concrete 36-char UUID, so it cannot forward the citations '
+                    f'that {len(live_citers)} live task(s) hold on {memory_id}.'
+                ),
+                'error_type': 'CitationReplacementInvalid',
+                'memory_id': memory_id,
+                'replacement_memory_id': replacement_memory_id,
+                'citing_tasks': citing_tasks,
+                'hint': _CITATION_REPOINT_HINT,
+            }, None
+
+        # Shape is necessary but not sufficient: is_concrete_memory_id rules out
+        # PROSE and claims nothing about what the id addresses. Two further
+        # preconditions, both deliberately AFTER the no-live-citers early-out so
+        # an uncited delete pays nothing for them.
+        #
+        # (1) SELF-REPOINT. Rewriting the doomed id to itself is a
+        # self-substitution that still reports count > 0 and zero failures, so
+        # the gate would declare a successful repoint while every citation still
+        # addressed the entry this call is about to destroy.
+        if replacement_memory_id == memory_id:
+            return {
+                'error': (
+                    f'replacement_memory_id {replacement_memory_id!r} is the '
+                    'same id being deleted, so repointing to itself would leave '
+                    f'{len(live_citers)} live task(s) citing a destroyed entry '
+                    'while reporting a successful repoint.'
+                ),
+                'error_type': 'CitationReplacementInvalid',
+                'memory_id': memory_id,
+                'replacement_memory_id': replacement_memory_id,
+                'citing_tasks': citing_tasks,
+                'hint': _CITATION_REPOINT_HINT,
+            }, None
+
+        # (2) EXISTENCE. A hallucinated/typo'd id is root cause (1) named in
+        # verify_cited_memories' own docstring, and here it is worse than a bad
+        # citation: it would rewrite every live citer to address nothing and
+        # THEN land the irreversible delete. get_memory_by_id is the same
+        # Mem0/Qdrant point read verify_cited_memories uses, and the gate's
+        # store == 'mem0' scoping already matches its Mem0-only contract.
+        #
+        # Memoized per delete_memory invocation (see `replacement_cache` in the
+        # docstring): every cited record in a cascade, on both passes, asks
+        # this same question of the same id. The citation scan above stays
+        # LIVE — that one is the fail-closed guarantee.
+        cache_key = (project_id, replacement_memory_id)
+        if replacement_cache is not None and cache_key in replacement_cache:
+            replacement_record = replacement_cache[cache_key]
+        else:
+            try:
+                replacement_record = await memory_service.get_memory_by_id(
+                    project_id, replacement_memory_id,
+                )
+            except (KeyboardInterrupt, SystemExit):
+                raise
+            except Exception as exc:
+                # Fail closed, exactly as the scan does: 'unknown' must not be
+                # read as 'resolves' immediately before an irreversible delete.
+                # NOT cached — a remembered failure would outlive its cause,
+                # and the next id in the set deserves its own live answer.
+                logger.warning(
+                    'citation gate: replacement lookup failed for %s; failing closed',
+                    replacement_memory_id,
+                    exc_info=True,
+                )
+                return {
+                    'error': (
+                        f'Could not determine whether replacement_memory_id '
+                        f'{replacement_memory_id} exists; refusing an irreversible '
+                        'delete rather than repointing to a possibly-absent entry.'
+                    ),
+                    'error_type': 'CitationReplacementCheckFailed',
+                    'memory_id': memory_id,
+                    'replacement_memory_id': replacement_memory_id,
+                    'citing_tasks': citing_tasks,
+                    'check_error': str(exc),
+                    'check_error_type': type(exc).__name__,
+                    'hint': _CITATION_REPLACEMENT_CHECK_FAILED_HINT,
+                }, None
+            if replacement_cache is not None:
+                replacement_cache[cache_key] = replacement_record
+
+        if not replacement_record:
+            # Distinct from ...Invalid on purpose: the caller must be able to
+            # tell a wrong-but-well-formed id from a malformed value.
+            return {
+                'error': (
+                    f'replacement_memory_id {replacement_memory_id} does not '
+                    f'resolve, so repointing the {len(live_citers)} live '
+                    f'citation(s) of {memory_id} to it would strand them on a '
+                    'memory that does not exist.'
+                ),
+                'error_type': 'CitationReplacementNotFound',
+                'memory_id': memory_id,
+                'replacement_memory_id': replacement_memory_id,
+                'citing_tasks': citing_tasks,
+                'hint': _CITATION_REPLACEMENT_NOT_FOUND_HINT,
+            }, None
+
+        # Every rule has now been checked and none of them refused, which is
+        # the whole answer a dry run owes its caller. Stopping HERE — after
+        # the preconditions, before the only mutation — is what lets the
+        # cascade pre-flight prove a whole set is clearable without having
+        # rewritten a single citation on a set it may yet refuse.
+        if scan_only:
+            return None, None
+
+        # Repoint BEFORE the delete. The caller falls through to
+        # memory_service.delete_memory only after this returns, which is the
+        # ordering guarantee: no window exists in which the entry is gone but a
+        # live task still points at it.
+        try:
+            stats = await repoint_task_citations(
+                task_interceptor,
+                project_root,
+                memory_id=memory_id,
+                replacement_id=replacement_memory_id,
+                run_id=None,
+            )
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except Exception as exc:
+            logger.warning(
+                'citation gate: repoint sweep failed for %s; failing closed',
+                memory_id,
+                exc_info=True,
+            )
+            return {
+                'error': (
+                    f'Citation repoint sweep failed for {memory_id}; refusing '
+                    'the delete so no live citation is left dangling.'
+                ),
+                'error_type': 'CitationRepointFailed',
+                'memory_id': memory_id,
+                'replacement_memory_id': replacement_memory_id,
+                'unrepointed': [],
+                'repoint_error': str(exc),
+                'repoint_error_type': type(exc).__name__,
+                'hint': _CITATION_SCAN_FAILED_HINT,
+            }, None
+
+        if stats['stage1_citation_repoint_failures']:
+            # At least one live citer was NOT repointed. Deleting now would
+            # strand exactly the pointer this gate exists to protect, so the
+            # delete is refused and retried next cycle instead.
+            return {
+                'error': (
+                    f'{stats["stage1_citation_repoint_failures"]} live citation(s) '
+                    f'of {memory_id} could not be repointed to '
+                    f'{replacement_memory_id}; refusing the delete.'
+                ),
+                'error_type': 'CitationRepointFailed',
+                'memory_id': memory_id,
+                'replacement_memory_id': replacement_memory_id,
+                'unrepointed': stats['unrepointed'],
+                'citation_repoint': stats,
+                'hint': _CITATION_REPOINT_FAILED_HINT,
+            }, None
+
+        return None, {'citation_repoint': stats}
+
+    async def _cascade_enumerate(
+        memory_id: str, project_id: str
+    ) -> tuple[dict[str, Any] | None, list[str]]:
+        """The cascade set the gate will reason over — or a REFUSAL.
+
+        Returns ``(None, [descendants..., memory_id])`` — deepest-first with
+        the target last, the order the cascade destroys in — or
+        ``(rejection, [])`` when the set could not be fully enumerated.
+
+        Both failure arms refuse rather than warn. A cascade the gate could
+        not fully SEE is exactly the case where a silent success manufactures
+        the dangling pointers this gate exists to prevent: it would destroy
+        records nobody checked while reporting them verified, which is worse
+        than the original defect because it would LOOK verified. This is the
+        same posture the gate already takes twice — ``CitationScanFailed`` on
+        an unreadable task DB, ``CitationReplacementCheckFailed`` on an
+        unresolvable replacement — applied to the one remaining unknown.
+
+        ``truncated`` is not a lesser case than a raised walk, which is why
+        both carry the same ``error_type``: partial visibility and no
+        visibility are the same claim ("I cannot prove this set is safe")
+        with different causes, and the causes are in the message.
+        """
+        try:
+            scan = await memory_service.list_descendant_ids(
+                memory_id, project_id=project_id
+            )
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except Exception as exc:
+            logger.warning(
+                'cascade gate: descendant enumeration failed for %s; failing closed',
+                memory_id,
+                exc_info=True,
+            )
+            return {
+                'error': (
+                    f'Could not enumerate what a cascade delete of {memory_id} '
+                    'would destroy, so its records cannot be checked for live '
+                    'citations. Nothing was deleted.'
+                ),
+                'error_type': 'CascadeCitationScanIncomplete',
+                'memory_id': memory_id,
+                'scan_error': str(exc),
+                'scan_error_type': type(exc).__name__,
+                'hint': _CASCADE_SCAN_INCOMPLETE_HINT,
+            }, []
+
+        if scan.truncated:
+            return {
+                'error': (
+                    f'A cascade delete of {memory_id} would destroy more '
+                    f'records than could be enumerated ({len(scan.ids)} seen), '
+                    'so the unseen ones cannot be checked for live citations. '
+                    'Nothing was deleted.'
+                ),
+                'error_type': 'CascadeCitationScanIncomplete',
+                'memory_id': memory_id,
+                'cascade_size': len(scan.ids) + 1,
+                'truncated': True,
+                'hint': _CASCADE_SCAN_INCOMPLETE_HINT,
+            }, []
+
+        return None, [*scan.ids, memory_id]
+
+    def _cascade_replacement_outside_set(
+        cascade_ids: list[str],
+        memory_id: str,
+        replacement_memory_id: str | None,
+    ) -> dict[str, Any] | None:
+        """Refuse naming a survivor that this same cascade destroys.
+
+        The single-record gate's self-repoint check
+        (``replacement_memory_id == memory_id``) is the degenerate case of
+        this one, but it cannot generalise to the cascade on its own for a
+        structural reason: the pre-flight applies that gate PER ID, and each
+        per-id run returns early at ``not live_citers`` — strictly before the
+        comparison. So an UNCITED descendant named as the replacement is never
+        compared to anything. The pre-flight clears it, the target's own
+        citers are then repointed TO it, and the service destroys it moments
+        later, with the tombstone ledger recording it as the survivor. That
+        reports success while manufacturing the dangling pointer the gate
+        exists to prevent.
+
+        Hence a set-membership test, not a per-id one, and placed BEFORE the
+        pre-flight: it is never coherent to forward a citation to a record
+        this call destroys, so the answer cannot depend on which members
+        happen to be cited today. It is also total and free — no I/O, and it
+        holds for an entirely uncited cascade, where every per-id path
+        short-circuits.
+
+        The refusal reuses ``_cascade_gate_rejection`` so the wire shape stays
+        uniform, carrying the single-record ``CitationReplacementInvalid``
+        error_type in ``blocked[0]`` exactly as the per-id refusals do.
+        """
+        if replacement_memory_id is None or replacement_memory_id not in cascade_ids:
+            return None
+
+        is_target = replacement_memory_id == memory_id
+        role = 'the id being deleted' if is_target else 'a descendant of it'
+        return _cascade_gate_rejection(
+            memory_id,
+            len(cascade_ids),
+            [{
+                'error': (
+                    f'replacement_memory_id {replacement_memory_id!r} is '
+                    f'{role}, so this cascade would destroy the very record '
+                    'the citations were forwarded to. Nothing was deleted.'
+                ),
+                'error_type': 'CitationReplacementInvalid',
+                'memory_id': memory_id,
+                'replacement_memory_id': replacement_memory_id,
+                'hint': _CITATION_REPOINT_HINT,
+            }],
+            error=(
+                f'replacement_memory_id {replacement_memory_id!r} is itself '
+                f'scheduled for destruction by this cascade delete of '
+                f'{memory_id}. Nothing was deleted.'
+            ),
+            replacement_memory_id=replacement_memory_id,
+        )
+
+    async def _cascade_citation_preflight(
+        cascade_ids: list[str],
+        memory_id: str,
+        store: str,
+        project_id: str,
+        agent_id: str | None,
+        replacement_memory_id: str | None,
+        allow_dangling_citations: bool = False,
+        *,
+        replacement_cache: dict[tuple[str, str], Any] | None = None,
+    ) -> dict[str, Any] | None:
+        """Refuse a cascade if ANY record it would destroy is still cited.
+
+        The defect this closes: the cascade recurses inside
+        ``MemoryService.delete_memory``, BELOW the tool layer this gate lives
+        at, so a ``cascade=True`` delete gated its target and destroyed every
+        descendant unchecked — one guarded record, N unguarded ones, reported
+        as a success.
+
+        Two properties a single fused pass cannot give, which is why this is
+        a separate NON-MUTATING pass over the set:
+
+        1. ATOMIC REFUSAL. With a ``replacement_memory_id`` supplied, a fused
+           pass would repoint ids 1..k-1 before discovering that id k is
+           unfixable — mutations left behind by an operation that reported
+           failure. A refused cascade must have changed nothing.
+        2. COMPLETE ENUMERATION. A fused pass refuses at the FIRST cited
+           descendant, so N cited children cost N refuse-fix-retry round
+           trips, each re-paying a full enumeration. Collecting every blocker
+           applies the gate's own stated principle one level up: "every
+           rejection names the citers, so the caller is never left to
+           re-derive the enumeration by hand — the step that found 3 of 8 in
+           the incident."
+
+        COST, stated honestly. Every record in the set is scanned against
+        the whole task tree TWICE — once here, once again in
+        ``_cascade_citation_repoint_pass`` — and each
+        ``_citation_repoint_gate`` call runs its own ``_scan_task_citations``,
+        which is one ``task_interceptor.get_tasks`` plus an
+        O(tasks x metadata-nodes) walk. So a cascade of N records costs 2N
+        full task-DB reads and 2N deep metadata walks, not the "one extra
+        read per id" an earlier revision of this docstring claimed.
+
+        That is accepted rather than optimised, and the two halves are
+        accepted for DIFFERENT reasons, so neither should be traded away on
+        the other's argument:
+
+        * The mutating pass's per-id re-read is the fail-closed guarantee
+          itself, for the reason ``_scan_task_citations`` already documents:
+          a snapshot cache trades that guarantee for a race on the one
+          operation whose harm motivated the gate. It must stay live.
+        * This pass's per-id read is NOT load-bearing for freshness — the
+          mutating pass re-reads anyway — so it could in principle collapse
+          to a single bucketing walk over the whole id set. It does not,
+          because that means a second implementation of "which tasks cite
+          this id", drifting from the gate's own (tombstone-excluding
+          ``find_live_citation_occurrences``, fail-closed-on-scan-error, and
+          all three ``replacement_memory_id`` preconditions). ``scan_only``
+          is a MODE on the one gate precisely so every rule keeps one home
+          (INV-5); N redundant reads is the price of that, and it is paid
+          only on the ``cascade=True`` path.
+        * The ``replacement_memory_id`` existence probe IS shared across
+          both passes (``replacement_cache``), and is the only read that
+          is. It asks the same question of the same id every time, and
+          unlike the citation scan its answer cannot be changed by anything
+          this call does: ``_cascade_replacement_outside_set`` has already
+          proved the replacement lies OUTSIDE the set this cascade
+          destroys. Re-reading it 2K times bought nothing.
+
+        *cascade_ids* is descendants-first with the target LAST, mirroring
+        the children-before-parent order the cascade actually deletes in.
+        """
+        blocked: list[dict[str, Any]] = []
+        for target in cascade_ids:
+            rejection, _ = await _citation_repoint_gate(
+                target,
+                store,
+                project_id,
+                agent_id,
+                replacement_memory_id,
+                allow_dangling_citations=allow_dangling_citations,
+                scan_only=True,
+                replacement_cache=replacement_cache,
+            )
+            if rejection:
+                # Verbatim: the per-id envelope already names the citers,
+                # their statuses and the exact metadata paths. Summarising it
+                # here would make the aggregate strictly less actionable than
+                # the single-record refusal it generalises.
+                blocked.append(rejection)
+
+        if not blocked:
+            return None
+        return _cascade_gate_rejection(
+            memory_id,
+            len(cascade_ids),
+            blocked,
+            error=(
+                f'{len(blocked)} of the {len(cascade_ids)} record(s) a cascade '
+                f'delete of {memory_id} would destroy still have live task '
+                'citations. Nothing was deleted.'
+            ),
+        )
+
+    def _cascade_gate_rejection(
+        memory_id: str,
+        cascade_size: int,
+        blocked: list[dict[str, Any]],
+        *,
+        error: str,
+        **extra: Any,
+    ) -> dict[str, Any]:
+        """ONE envelope shape for every cascade-gate refusal.
+
+        The error type keys on the FLAG the caller passed, not on corpus
+        state they cannot see: whether the tree happened to have children
+        this time is invisible to them, so branching the wire contract on it
+        would force every cascade error handler to handle both shapes
+        anyway. ``blocked[0]`` still carries the verbatim per-id rejection,
+        so nothing the single-record envelope reported is lost.
+        """
+        return {
+            'error': error,
+            'error_type': 'CascadeCitationGateRejected',
+            'memory_id': memory_id,
+            'cascade_size': cascade_size,
+            'blocked': blocked,
+            'hint': _CASCADE_GATE_HINT,
+            **extra,
+        }
+
+    async def _cascade_citation_repoint_pass(
+        cascade_ids: list[str],
+        store: str,
+        project_id: str,
+        agent_id: str | None,
+        replacement_memory_id: str | None,
+        allow_dangling_citations: bool = False,
+        *,
+        replacement_cache: dict[tuple[str, str], Any] | None = None,
+    ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+        """The MUTATING second pass, after the pre-flight cleared the set.
+
+        Runs the gate in normal mode over the same deepest-first sequence,
+        merging each record's stats under ITS OWN id: a cascade touches N
+        records, and one anonymous stats blob would leave the caller unable
+        to tell which descendant's citations were rewritten.
+
+        Each per-id entry carries an explicit ``outcome`` —
+        ``'repointed'`` or ``'dangled'`` — because the gate returns BOTH on
+        the same success channel and their payloads differ
+        (``citation_repoint`` stats vs ``dangled_citations``). Without it a
+        caller has to shape-sniff to tell a rewritten citation from one
+        knowingly stranded, which are opposite outcomes.
+
+        Two residuals this two-pass design does NOT close, stated rather than
+        left for a later reader to discover:
+
+        1. A rejection HERE (a repoint sweep that fails, or a citer written
+           between the two passes) still returns before the service call, so
+           nothing is deleted — but ids EARLIER in the sequence may already
+           have been repointed. That is not a dangling pointer: those
+           citations now address the verified-live ``replacement_memory_id``
+           while the original record still exists. A retry converges,
+           because a repointed id no longer has live citers. The already-
+           repointed ids are named on the refusal rather than left implicit
+           — and ONLY the genuinely repointed ones: a ``dangled`` record
+           rewrote nothing, so listing it would tell an operator citations
+           were rewritten when none were.
+        2. The service's cascade re-reads its children LIVE, so a child
+           written between this pass and the cascade is deleted without
+           having passed the gate. That is the same write-after-scan race the
+           single-record path already accepts — and accepts deliberately,
+           which is why ``_scan_task_citations`` refuses to cache its
+           snapshot: caching would trade the fail-closed guarantee for a race
+           on the one operation whose harm motivated the gate.
+        """
+        per_id: dict[str, Any] = {}
+        # Ids whose citations were actually REWRITTEN, in pass order. Kept
+        # separately from `per_id` because the gate returns dangles on the
+        # same success channel: under `allow_dangling_citations` every record
+        # yields stats while nothing is mutated at all, so `per_id`'s keys
+        # would report repoints that never happened.
+        repointed: list[str] = []
+        for target in cascade_ids:
+            rejection, stats = await _citation_repoint_gate(
+                target,
+                store,
+                project_id,
+                agent_id,
+                replacement_memory_id,
+                allow_dangling_citations=allow_dangling_citations,
+                replacement_cache=replacement_cache,
+            )
+            if rejection:
+                return _cascade_gate_rejection(
+                    cascade_ids[-1],
+                    len(cascade_ids),
+                    [rejection],
+                    error=(
+                        f'A record in the cascade of {cascade_ids[-1]} could not '
+                        'be cleared on the repoint pass, so the delete was '
+                        'refused. Nothing was deleted.'
+                    ),
+                    # Honest residual: these were rewritten before the
+                    # refusal. They point at the verified-live replacement,
+                    # not at a destroyed record, and a retry is idempotent.
+                    # Deepest-first, the order the rewrites happened in.
+                    repointed_before_refusal=list(repointed),
+                ), None
+            if stats:
+                # 'citation_repoint' is present iff the repoint sweep ran;
+                # the override arm returns 'dangled_citations' instead.
+                did_repoint = 'citation_repoint' in stats
+                per_id[target] = {
+                    **stats,
+                    'outcome': 'repointed' if did_repoint else 'dangled',
+                }
+                if did_repoint:
+                    repointed.append(target)
+        return None, ({'cascade_citation_repoint': per_id} if per_id else None)
+
+    async def _scan_task_citations(
+        project_root: str, memory_id: str
+    ) -> list[dict[str, Any]]:
+        """Return one record per task whose metadata LIVE-cites *memory_id*.
+
+        A read-only pre-pass over the same snapshot semantics
+        ``repoint_task_citations`` uses, so the gate can decide whether a
+        repoint is needed (and name the citers in a refusal) before committing
+        to any write.
+
+        "Cites" is ``find_live_citation_occurrences``, which excludes the
+        ``x_memory_citation_tombstones`` ledger. That exclusion is load-bearing
+        here: a tombstone's ``superseded_memory_id`` names the deleted id BY
+        DESIGN, so counting it would make an already-repointed task look like an
+        outstanding citer forever — and the retry ``_CITATION_REPOINT_FAILED_HINT``
+        instructs the caller to perform would never terminate. The gate and
+        ``repoint_task_citations`` MUST agree on this definition: they read the
+        same snapshot, and a disagreement surfaces as a gate demanding a repoint
+        that the sweep then reports zero work for.
+
+        COST, and why the snapshot is deliberately NOT cached (task 3624).
+        Broadening the gate to every caller means every mem0 delete pays one
+        full ``get_tasks`` read plus an O(tasks x metadata-nodes) walk, so a
+        25-delete consolidation batch pays it 25 times with no reuse. A
+        per-batch or short-TTL snapshot cache would collapse that and is
+        refused on purpose: this is the LAST read before an irreversible
+        delete, and a task that begins citing the doomed id after the snapshot
+        was taken would be invisible to it — trading the gate's fail-closed
+        guarantee for a race, on precisely the operation whose harm motivated
+        the gate. The cost is made OBSERVABLE instead: each scan reports its
+        task count and duration at DEBUG, so a project large enough for this to
+        matter surfaces as a measurement rather than as a hunch.
+        """
+        started = time.perf_counter()
+        tasks_data = await task_interceptor.get_tasks(project_root)  # type: ignore[union-attr]
+        tasks = (tasks_data or {}).get('tasks') or []
+        found: list[dict[str, Any]] = []
+        if not isinstance(tasks, list):
+            return found
+        for task in tasks:
+            if not isinstance(task, dict):
+                continue
+            paths = find_live_citation_occurrences(task.get('metadata'), memory_id)
+            if not paths:
+                continue
+            status = task.get('status')
+            found.append({
+                'task_id': str(task.get('id')),
+                'status': status,
+                'paths': paths,
+                'terminal': status in INACTIVE_TASK_STATUSES,
+            })
+        # DEBUG, not INFO: this now runs on EVERY mem0 delete, so it is the
+        # common path and must not be chatty by default. It is the only place
+        # the broadened gate's per-delete cost is measurable.
+        logger.debug(
+            'citation gate: scanned %d task(s) for citations of %s in %.1f ms '
+            '(%d citer(s) found)',
+            len(tasks),
+            memory_id,
+            (time.perf_counter() - started) * 1000,
+            len(found),
+        )
+        return found
 
     @mcp.tool()
     @mcp_tool_errors()
@@ -1178,6 +3204,14 @@ def create_mcp_server(
         metadata: dict | None = None,
         temporal_context: str | None = None,
         reference_time: str | None = None,
+        # `Any`, not `list[dict] | None`, on purpose — see the identical note
+        # at `add_memory` below and `entities_gate`'s module docstring: a
+        # narrower annotation would let pydantic reject the two commonest
+        # mistakes (a bare string, a single un-wrapped dict) BEFORE the gate
+        # runs, with a raw ToolError carrying no remediation. Same precedent as
+        # `get_tasks(statuses: Any = None)`, which is `Any` for this exact
+        # reason.
+        entities: Any = None,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
         """Add an episode to memory. Full ingestion pipeline: raw content is processed
@@ -1185,15 +3219,47 @@ def create_mcp_server(
         to Mem0 as appropriate. Returns immediately; processing happens in background.
 
         Content carrying a raw MCP envelope fragment is REJECTED outright
-        (error_type=McpEnvelopeMarkupWriteRejected) — a harness serialization
-        bug has been leaking tool-call envelope markup into write payloads, and
-        each one that lands is a permanent corpus specimen (worse here than for
-        add_memory: extraction would fan the fragment out across derived facts).
-        Strip the fragment and resubmit, or set
+        (error_type=mcp_markup_detected, or mcp_markup_unrepairable when the
+        residue cannot be parsed) — a harness serialization bug has been leaking
+        tool-call envelope markup into write payloads, and each one that lands is
+        a permanent corpus specimen (worse here than for add_memory: extraction
+        would fan the fragment out across derived facts). A mcp_markup_detected
+        rejection carries ``repaired_call``: the COMPLETE argument map with the
+        fragment removed and any parameter the leak swallowed restored — resubmit
+        it verbatim rather than rewording around it. Or set
         metadata={'allow_mcp_markup': True} if you are quoting the markup
-        deliberately. :mod:`fused_memory.server.markup_tripwire` holds the
-        authoritative pattern list and the rationale — it is deliberately the
-        only place in the package that enumerates the literals.
+        deliberately. The check runs at the dispatch BOUNDARY, before this tool
+        body is entered, so it covers every tool and every string parameter;
+        :mod:`fused_memory.server.markup_guard` holds it and the rationale, the
+        literals themselves are enumerated once, in :mod:`shared.toolcall_markup`,
+        and nothing in this package spells them.
+
+        Content asserting that concrete, NAMED work is complete ("task N's fix
+        has been applied", "re-filed as ticket tkt_...") is cross-checked
+        against the live task status / ticket registry / git, and TAGGED — not
+        rejected — when a claim is contradicted or cannot be confirmed. The
+        episode is always ingested; the tag rides through to the Graphiti
+        episodic ``source_description`` (prefixed ``'[unverified_claim] '``) and
+        to every derived Mem0 fact's metadata, and the structured flag is echoed
+        back under an ``unverified_claim`` response key naming what was claimed
+        and what was actually OBSERVED. Unlike the recon-stage-only
+        premature-completion gate, this applies to every writer, and an
+        authority that cannot be reached tags rather than passes — see
+        :mod:`fused_memory.services.completion_claim_gate` for why the fail
+        direction is inverted there.
+
+        Optionally DECLARE what the episode is about with `entities`. A
+        declaration outranks the referents scanned out of the content, so it is
+        how you correct prose that names a task ambiguously or not at all. A
+        declaration your own content CONTRADICTS is rejected
+        (error_type=DeclaredReferentConflictRejected) and the episode is not
+        ingested — the block names both what you declared and what the content
+        actually cites. A conflict is a near-miss typo (the content names a
+        task one edit away from a declared id and writes the declared number
+        nowhere) or the declared number under another project. Fix the id if
+        it is wrong; if it is right, write `task NNN` in the content. Only a
+        conflict is ever rejected: an absent declaration, or [] (you
+        considered referents and none applied), never is.
 
         Args:
             content: Raw text, conversation, or JSON to ingest
@@ -1205,7 +3271,7 @@ def create_mcp_server(
             metadata: Optional key-value pairs. Read here for _causation_id/source
                 routing only — add_episode does NOT persist metadata on the
                 episode. Set {'allow_mcp_markup': True} to bypass the MCP-markup
-                tripwire when the content quotes envelope markup deliberately;
+                boundary guard when the content quotes envelope markup deliberately;
                 the flag is write-time-only and is never forwarded.
             temporal_context: Optional temporal framing — one of "retrospective",
                 "planning", or "current". When set, the value is prepended to
@@ -1218,6 +3284,30 @@ def create_mcp_server(
                 time instead of the date the described state was current).
                 Complements temporal_context='retrospective': temporal_context marks
                 the *kind* of episode; reference_time sets the *timestamp*.
+            entities: Optional explicit declaration of WHICH referents this
+                episode is about. TRI-STATE: omit it (or None) to say you never
+                considered referents and let the content scan derive them; pass
+                [] to say you DID consider them and none apply; pass a list to
+                declare them. Each entry is
+                {'kind': 'task', 'id': <digits>, 'project_id': <optional>} —
+                'kind' and 'project_id' are optional and default to 'task' and
+                the local project; 'id' is the task number's digits (an int, or
+                a string of ASCII digits), never a label like "Task 3127". This
+                is NOT "all entities": extraction legitimately derives entities
+                no caller could predict, and this parameter names only the
+                referents the episode is ABOUT. A declaration the content
+                contradicts — a near-miss typo of a declared task number, or
+                that number under another project — is REJECTED
+                (error_type=DeclaredReferentConflictRejected) and nothing is
+                ingested; fix the id, or write `task NNN` in the content. ANY
+                wrong shape — a bare string, a single un-wrapped dict, a bad
+                entry inside the list — is rejected as a ValidationError whose
+                message carries the accepted entry shape, so you never have to
+                guess the remedy. Absence is never rejected.
+                One asymmetry against add_memory, and it is a tier below this
+                parameter: add_episode persists no metadata, so there is no
+                metadata['task_id'] fallback here — a declaration overrides
+                only the derived content scan.
         """
         agent_id, session_id = _resolve_identity(agent_id, session_id, ctx)
         project_id, err = _canonicalize_project_id_arg(project_id)
@@ -1229,18 +3319,23 @@ def create_mcp_server(
             return err
         if err := await _backlog_gate(project_id):
             return err
-        # Task 3141 / PRD leaf o: reject leaked MCP envelope markup BEFORE the
-        # recon-stage content guards below, so a partly-serialized payload can
-        # never be run through is_mixed_temporal_framing / the batch-plan and
-        # proposed-resolution auto-taggers and come back as some other, more
-        # misleading verdict. DF 3083 owns the root cause + corpus sweep.
-        if block := _markup_gate({'content': content}, agent_id, metadata, _kp.get(project_id)):
-            return block
+        # MCP-markup rejection no longer happens here: task 4458 retired this
+        # tool body's in-line gate in favour of the ONE boundary guard
+        # (fused_memory.server.markup_guard), which runs before this function is
+        # entered — so a partly-serialized payload still cannot reach the
+        # recon-stage content guards below and come back as some other, more
+        # misleading verdict. plans/toolcall-markup-containment-prd.md owns the
+        # live work; DF 3083 is the closed predecessor. Only the override STRIP
+        # remains a tool-body responsibility, because the guard forwards
+        # allow_mcp_markup UNCHANGED to a tool that declares `metadata`.
         # DEFENSIVE ONLY — nothing observes this today: add_episode reads metadata
         # for _causation_id/source and never forwards it to the store, so the
         # write-time flag cannot reach persistence by this path. Kept so a future
         # metadata pass-through cannot silently start persisting it.
+        # The uuid-prefix guard forwards allow_uuid_prefix the same way, so it
+        # is stripped here too.
         metadata = strip_markup_override(metadata)
+        metadata = strip_uuid_prefix_override(metadata)
         if temporal_context is not None and temporal_context not in _VALID_TEMPORAL_CONTEXTS:
             return {
                 'error': (
@@ -1249,6 +3344,25 @@ def create_mcp_server(
                 ),
                 'error_type': 'ValidationError',
             }
+        # task 3669 / PRD leaf delta: reject a declaration the content
+        # contradicts. Grouped with the structural argument validations above
+        # deliberately — everything BELOW this line does live authority I/O
+        # (the 2824 premature-completion gate reads task statuses,
+        # _completion_claim_gate reads statuses / tickets / git), and a
+        # self-contradictory or malformed declaration should cost none of it.
+        # This gate is a pure in-memory scan and, for the undeclared majority,
+        # not even that: `entities is None` short-circuits before scanning.
+        #
+        # It must still come AFTER `_canonicalize_project_id_arg`: the gate's
+        # `group_id` has to be the CANONICAL project id, because
+        # `Scope.graphiti_group_id` IS `project_id` and both sides canonicalize
+        # through `canonicalize_project_id` — so the gate and `MemoryService`
+        # classify local-vs-foreign referents identically. A raw id here would
+        # let the two disagree about whether a qualifier names us.
+        if err := entities_gate(
+            entities, content=content, group_id=project_id, agent_id=agent_id,
+        ):
+            return err
         # task 2022: auto-upgrade the batch-queue / decompose-and-queue plan-episode
         # shape to temporal_context='planning' so its Graphiti-extracted completion
         # edges are registered as planned (excluded from default search) instead of
@@ -1289,7 +3403,7 @@ def create_mcp_server(
                 'error': 'mixed_temporal_framing_write_blocked',
                 'error_type': 'ReconMixedFramingWriteRejected',
                 'agent_id': agent_id,
-                'content_excerpt': content[:200],
+                **excerpt_fields(content_excerpt=content),
             }
         if isinstance(agent_id, str) and agent_id.startswith('recon-stage-'):
             conflicting_task_ids = find_conflicting_task_status_ids(content)
@@ -1298,7 +3412,7 @@ def create_mcp_server(
                     'error': 'conflicting_task_status_framing_write_blocked',
                     'error_type': 'ReconConflictingTaskStatusWriteRejected',
                     'agent_id': agent_id,
-                    'content_excerpt': content[:200],
+                    **excerpt_fields(content_excerpt=content),
                     'conflicting_task_ids': sorted(conflicting_task_ids),
                     'hint': _CONFLICTING_TASK_STATUS_HINT,
                 }
@@ -1311,7 +3425,7 @@ def create_mcp_server(
                 'error': 'live_task_status_current_fact_write_blocked',
                 'error_type': 'ReconLiveTaskStatusWriteRejected',
                 'agent_id': agent_id,
-                'content_excerpt': content[:200],
+                **excerpt_fields(content_excerpt=content),
                 'hint': _LIVE_TASK_STATUS_HINT,
             }
         # task 2824: reject a recon-stage present-tense completion claim ("task N
@@ -1324,7 +3438,23 @@ def create_mcp_server(
             premature_block = await _premature_completion_block(content, agent_id, project_id)
             if premature_block is not None:
                 return premature_block
+        # task 3142 / PRD leaf pi: verify completion claims naming a concrete
+        # task / commit / ticket against the live authorities and TAG the
+        # episode when one cannot be confirmed. Deliberately NOT under a
+        # recon-stage- guard like the 2824 gate immediately above: this one only
+        # labels, so it costs a non-recon writer nothing, and a false completion
+        # claim damages the corpus identically whoever writes it. Reported only
+        # after the service call below; see _report_unverified_claims.
+        unverified_flag = await _completion_claim_gate(content, agent_id, project_id)
         causation_id, op_source, _ = _extract_causation(metadata, agent_id)
+        extra: dict[str, Any] = {}
+        if unverified_flag is not None:
+            # Ride the same channel temporal_context does — a service parameter,
+            # then a durable-queue payload key, then the Graphiti
+            # source_description prefix and every derived Mem0 fact's metadata.
+            # A response-only flag would have labelled none of the artefacts that
+            # actually caused harm in esc-5603-1.
+            extra['unverified_claim'] = True
         result = await memory_service.add_episode(
             content=content,
             source=source,
@@ -1335,9 +3465,24 @@ def create_mcp_server(
             causation_id=causation_id,
             temporal_context=temporal_context,
             reference_time=parsed_reference_time,
+            # Forwarded VERBATIM, unparsed: `entities_gate` above has already
+            # proved this list parses, and the service is the single site that
+            # resolves and encodes it onto the durable-queue payload. Parsing
+            # twice would fork what `declared` means between the boundary and
+            # the producer. Unlike add_memory, this tool has exactly ONE
+            # service call site, so there is no fallback path to keep in step.
+            declared_referents=entities,
             _source=op_source,
+            **extra,
         )
-        return result.model_dump()
+        payload = result.model_dump()
+        if unverified_flag is not None:
+            unverified_flag = _report_unverified_claims(
+                unverified_flag, agent_id, project_id,
+            )
+            if isinstance(payload, dict):
+                payload[UNVERIFIED_CLAIM_TAG] = unverified_flag
+        return payload
 
     @mcp.tool()
     @mcp_tool_errors()
@@ -1349,16 +3494,33 @@ def create_mcp_server(
         session_id: str | None = None,
         metadata: dict | None = None,
         dual_write: bool = False,
+        # `Any`, not `list[dict] | None`, on purpose. This parameter's whole
+        # error surface is `entities_gate`, whose rejection folds gamma's
+        # `_DECLARED_REFERENT_HINT` — the accepted entry shape AND the
+        # remediation — into one structured house-shape block. A narrower
+        # annotation hands the shape check to pydantic, which runs BEFORE this
+        # body and answers a bare `'task 3127'` or a single un-wrapped
+        # `{'kind': ..., 'id': ...}` — precisely the two mistakes an agent is
+        # likeliest to make — with a raw ToolError carrying no hint at all, so
+        # the remediation reaches an agent or not depending on WHICH way it got
+        # the shape wrong. `Any` makes every wrong shape reach the one gate and
+        # get the one answer. Precedent: `get_tasks(statuses: Any = None)`,
+        # widened for the same reason (a bare string there is rejected in the
+        # body, not by pydantic). The accepted shape stays documented in the
+        # Args block below, which is what an agent actually reads.
+        entities: Any = None,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
         """Add a classified memory directly. Skips the extraction pipeline.
         Use when the agent has already identified a specific, discrete memory.
 
-        Before writing a procedural_knowledge memory, search first for an
-        existing entry covering the same workflow/gotcha and update or skip
-        instead of writing a near-duplicate. procedural_knowledge writes are
-        soft-blocked at write time by two guards: (1) a deterministic
-        topic-cluster guard that fires FIRST when the content matches a
+        Before writing a procedural_knowledge or preferences_and_norms memory,
+        search first for an existing entry covering the same workflow/gotcha/
+        norm and update or skip instead of writing a near-duplicate.
+        procedural_knowledge writes are soft-blocked at write time by two
+        guards, the first of which also covers preferences_and_norms (see
+        below): (1) a deterministic topic-cluster guard that fires FIRST when
+        the content matches a
         known-contradictory topic cluster
         (error_type=ProceduralKnowledgeKnownTopicClusterWriteRejected) — do NOT
         add another entry; consolidate/update the existing entries for that
@@ -1367,24 +3529,137 @@ def create_mcp_server(
         existing entry at high similarity
         (error_type=ProceduralKnowledgeNearDuplicateWriteRejected). For either,
         override with metadata={'allow_near_duplicate': True} only when the
-        content is genuinely distinct. Both guards only cover writes with an
-        explicit category='procedural_knowledge' (a category=None write that
-        auto-classifies to procedural_knowledge is not covered), share the
-        procedural_knowledge_near_dup_guard_enabled kill-switch, and exempt
-        recon-stage-* agents (Stage-1 consolidation writes a merged/canonical
-        entry that is expected to closely resemble the duplicates it
-        replaces, with no ordering guarantee that those duplicates are
-        deleted first).
+        content is genuinely distinct. The topic-cluster guard (1) covers
+        writes with an explicit category='procedural_knowledge' OR
+        category='preferences_and_norms'; the cosine near-duplicate guard (2)
+        remains scoped to an explicit category='procedural_knowledge' write
+        only (a category=None write that auto-classifies to
+        procedural_knowledge is covered by neither). Both guards share the
+        procedural_knowledge_near_dup_guard_enabled kill-switch. NO agent
+        class is exempt (task 3134): Stage-1 consolidation now folds a
+        cluster with `consolidate_memories`, whose canonical write goes
+        through `memory_service.add_memory` and so never meets these
+        tool-layer guards, and which writes that canonical BEFORE any
+        delete.
+
+        BOTH GUARDS ABOVE APPLY ONLY WHILE ``write_triage.enabled`` IS FALSE
+        (its shipped default). With write triage ON, an explicit Mem0-primary
+        write (preferences_and_norms / procedural_knowledge /
+        observations_and_summaries) is REDIRECTED rather than rejected: nothing
+        is ever soft-blocked, and the response carries two extra fields.
+
+        * ``routed`` — what triage did with the write, one of ``stored``
+          (a new standalone memory), ``restated`` (it repeats an existing
+          memory near-verbatim, adding nothing), ``amended`` (it adds to
+          one) or ``contested`` (it says one is wrong, outdated or
+          different).
+        * ``canonical_id`` — the memory the write was attached to. Present
+          ONLY on an attach outcome; absent entirely for ``stored``.
+
+        A ``restated`` write becomes a SIGHTING CHILD of its canonical rather
+        than a standalone entry: the full text you submitted is stored, the
+        rediscovery is counted, and the canonical is never edited. Nothing is
+        lost and no write is ever blocked — a retrieval or judge failure
+        degrades to a plain ``stored``, never to an error.
+
+        ``restated`` is rare. It means your write repeats an existing memory
+        near-verbatim (the rule is ``server/near_verbatim.py``), which is
+        why a sighting's text can be only counted. A write that is merely
+        about the same thing, however similar, is judged and filed
+        ``amended``, its text then digested into the canonical's grouped
+        document, or ``contested``. So a ``restated`` ack really does mean
+        your write added nothing.
+
+        A ``contested`` write becomes an AMENDMENT CHILD flagged as contesting
+        its parent. Nothing was blocked and nothing was decided: triage
+        DETECTS that your write says the memory it names is wrong, outdated
+        or different, explicitly or implicitly (ruling:
+        plans/write-triage-flip-readiness-prd.md §11.3 C1''); it does not
+        adjudicate which of the two is right. Your full text is stored and
+        readable in the canonical's grouped document (every amendment's
+        text is carried there in full up to
+        ``write_triage.judge_field_chars``; sighting text is still only
+        counted) and marked as
+        contesting it, and the memory you contradict is left untouched. No
+        adjudication is scheduled and nothing is escalated: the flag is a
+        marker a human reads, not a work item anything picks up. Getting a ``contested`` ack is not a
+        rejection and needs no action from you — but it is the ack worth
+        reading, because it says the corpus now holds a claim your write
+        disputes.
+
+        With triage on, ``metadata={'allow_near_duplicate': True}`` is
+        reinterpreted rather than retired: it now means FORCE-STORE — store
+        this standalone, do not reroute it — for the same reason it meant
+        "do not reject me" before, as is any write whose own metadata already
+        sets ``parent_id`` or ``kind`` — the two keys an attach would
+        overwrite. No agent class is force-stored (task 3134).
+        Your own classification of a record is not triage's to replace.
+
+        To correct a memory, write the correction as a new memory with
+        ``metadata={'supersedes': [<id>]}``: it is always stored standalone
+        (never attached under the record it replaces), and each superseded
+        record is marked with ``metadata.x_superseded_by=<the new id>``, which
+        ``search`` and ``get_memory_by_id`` return, briefings render as
+        ``superseded by <id>``, and the ack's ``supersession`` key reports.
+
+        Optionally DECLARE what the memory is about with `entities`. A
+        declaration outranks the referents scanned out of the content, so it is
+        how you correct a body whose prose names a task ambiguously or not at
+        all. A declaration your own content CONTRADICTS is rejected
+        (error_type=DeclaredReferentConflictRejected) and the write does not
+        happen — the block names both what you declared and what the content
+        actually cites. A conflict is a near-miss typo (the content names a
+        task one edit away from a declared id and writes the declared number
+        nowhere) or the declared number under another project. Fix the id if
+        it is wrong; if it is right, write `task NNN` in the content. Only a
+        conflict is ever rejected: an absent declaration, or [] (you
+        considered referents and none applied), never is.
+
+        A declaration is RECORDED only on a write that reaches Graphiti — an
+        entities_and_relations, temporal_facts or decisions_and_rationale
+        category, or dual_write=True. On an explicit Mem0-primary category
+        (procedural_knowledge, preferences_and_norms,
+        observations_and_summaries) without dual_write, the referent set has
+        nowhere to live: your `entities` is shape-checked, then discarded, and
+        never conflict-rejected. With category omitted it IS conflict-checked,
+        because the destination is not known until the write is classified.
+
+        Content asserting that concrete, NAMED work is complete ("task N's fix
+        has been applied", "re-filed as ticket tkt_...") is cross-checked
+        against the live task status / ticket registry / git, and TAGGED — not
+        rejected — when a claim is contradicted or cannot be confirmed, whatever
+        the category and whoever the writer; this check never blocks the write.
+        On a write reaching Graphiti the episodic ``source_description`` is prefixed
+        ``'[unverified_claim] '``; on a write reaching Mem0 the record's
+        metadata carries ``unverified_claim=True``. The structured flag naming
+        what was claimed and what was actually OBSERVED is echoed back under an
+        ``unverified_claim`` response key, with ``escalation_id`` when an
+        operator escalation was filed.
 
         Content carrying a raw MCP envelope fragment is REJECTED outright
-        (error_type=McpEnvelopeMarkupWriteRejected) — a harness serialization
-        bug has been leaking tool-call envelope markup into write payloads, and
-        each one that lands is a permanent corpus specimen. Strip the fragment
-        and resubmit. If you are quoting such markup DELIBERATELY (documenting
-        the leak itself), set metadata={'allow_mcp_markup': True}.
-        :mod:`fused_memory.server.markup_tripwire` holds the authoritative
-        pattern list and the rationale — it is deliberately the only place in
-        the package that enumerates the literals.
+        (error_type=mcp_markup_detected, or mcp_markup_unrepairable when the
+        residue cannot be parsed) — a harness serialization bug has been leaking
+        tool-call envelope markup into write payloads, and each one that lands is
+        a permanent corpus specimen. A mcp_markup_detected rejection carries
+        ``repaired_call``: the COMPLETE argument map with the fragment removed and
+        any parameter the leak swallowed restored — resubmit it verbatim rather
+        than rewording around it. If you are quoting such markup DELIBERATELY
+        (documenting the leak itself), set metadata={'allow_mcp_markup': True}.
+        The check runs at the dispatch BOUNDARY, before this tool body is entered,
+        so it covers every tool and every string parameter;
+        :mod:`fused_memory.server.markup_guard` holds the boundary guard
+        pattern list and the rationale; the literals themselves are enumerated
+        once, in :mod:`shared.toolcall_markup`, and nothing in this package
+        spells them.
+
+        If the embedding provider fails transiently (429, 5xx, connection), the
+        Mem0 leg is NOT dropped: the ack carries stores_pending_retry=['mem0'],
+        memory_ids is empty, the message says mem0_pending_retry, and the
+        server retries the write for as long as its failures stay transient. A
+        later non-transient failure dead-letters it (status 'dead' in the
+        write journal's mem0_intents, logged at ERROR). Do NOT re-submit the
+        same content (that would duplicate it). The Mem0 leg has landed only
+        when the ack lists mem0 in stores_written and memory_ids is non-empty.
 
         Args:
             content: The memory itself (a fact, preference, procedure, etc.)
@@ -1397,11 +3672,39 @@ def create_mcp_server(
             metadata: Arbitrary key-value pairs (optional). For procedural_knowledge,
                       set {'allow_near_duplicate': True} to bypass both the topic-cluster
                       and near-duplicate write guards when the content is genuinely
-                      distinct. Set {'allow_mcp_markup': True} to bypass the MCP-markup
-                      tripwire when the content quotes envelope markup deliberately.
+                      distinct — or, when write_triage.enabled is true, to force a
+                      plain standalone store instead of an attach. Set
+                      {'allow_mcp_markup': True} to bypass the MCP-markup
+                      boundary guard when the content quotes envelope markup deliberately.
                       Both flags are write-time-only and are stripped before
                       persistence — neither is ever stored on the resulting memory.
             dual_write: Force write to both stores (default: false)
+            entities: Optional explicit declaration of WHICH referents this
+                      memory is about. TRI-STATE: omit it (or None) to say you
+                      never considered referents and let the content scan derive
+                      them; pass [] to say you DID consider them and none apply;
+                      pass a list to declare them. Each entry is
+                      {'kind': 'task', 'id': <digits>, 'project_id': <optional>}
+                      — 'kind' and 'project_id' are optional and default to
+                      'task' and the local project; 'id' is the task number's
+                      digits (an int, or a string of ASCII digits), never a
+                      label like "Task 3127". This is NOT "all entities": the
+                      extraction pipeline legitimately derives entities no caller
+                      could predict, and this parameter names only the referents
+                      the memory is ABOUT. A declaration the content contradicts
+                      — a near-miss typo of a declared task number, or that
+                      number under another project — is REJECTED
+                      (error_type=DeclaredReferentConflictRejected) and nothing
+                      is written; fix the id, or write `task NNN` in the
+                      content. ANY wrong shape — a bare string,
+                      a single un-wrapped dict, a bad entry inside the list — is
+                      rejected as a ValidationError whose message carries the
+                      accepted entry shape, so you never have to guess the
+                      remedy. Absence is never rejected. RECORDED only on a write that
+                      reaches Graphiti (a GRAPHITI_PRIMARY category, or
+                      dual_write=True); on an explicit Mem0-primary category
+                      without dual_write it is shape-checked, then discarded,
+                      and never conflict-rejected — see the scope note above.
         """
         agent_id, session_id = _resolve_identity(agent_id, session_id, ctx)
         project_id, err = _canonicalize_project_id_arg(project_id)
@@ -1421,14 +3724,49 @@ def create_mcp_server(
                 ),
                 'error_type': 'ValidationError',
             }
-        # Task 3141 / PRD leaf o: reject leaked MCP envelope markup BEFORE the
-        # recon-stage content guards below, so a partly-serialized payload can
-        # never be run through is_count_snapshot / is_mixed_temporal_framing and
-        # come back as some other, more misleading verdict. DF 3083 owns the root
-        # cause + corpus sweep.
-        if block := _markup_gate({'content': content}, agent_id, metadata, _kp.get(project_id)):
-            return block
+        # task 3669 / PRD leaf delta: reject a declaration the content itself
+        # contradicts. Grouped with the structural argument validations above
+        # and deliberately ahead of EVERY I/O-bearing gate below — the
+        # `_premature_completion_block` live task-status lookup, write triage's
+        # judge call and the near-duplicate embedding round trip. This gate is
+        # a pure in-memory scan; a structurally invalid or self-contradictory
+        # declaration should cost none of them.
+        #
+        # It must still come AFTER `_canonicalize_project_id_arg`: the gate's
+        # `group_id` has to be the CANONICAL project id, because
+        # `Scope.graphiti_group_id` IS `project_id` and both sides canonicalize
+        # through `canonicalize_project_id` — so the gate and `MemoryService`
+        # classify local-vs-foreign referents identically. A raw id here would
+        # let the two disagree about whether a qualifier names us.
+        #
+        # `category is None` counts as recorded: the classifier picks the
+        # destination below this boundary, and running it here too would be a
+        # second classification site (INV-5).
+        declaration_recorded = category is None or routes_to_graphiti(
+            MemoryCategory(category), dual_write=dual_write,
+        )
+        if err := entities_gate(
+            entities,
+            content=content,
+            group_id=project_id,
+            agent_id=agent_id,
+            declaration_recorded=declaration_recorded,
+        ):
+            return err
+        # MCP-markup rejection no longer happens here: task 4458 retired this
+        # tool body's in-line gate in favour of the ONE boundary guard
+        # (fused_memory.server.markup_guard), which runs before this function is
+        # entered — so a partly-serialized payload still cannot reach the
+        # recon-stage content guards below and be run through is_count_snapshot /
+        # is_mixed_temporal_framing to come back as some other, more misleading
+        # verdict. plans/toolcall-markup-containment-prd.md owns the live work;
+        # DF 3083 is the closed predecessor. Only the override STRIP remains a
+        # tool-body responsibility, because the guard forwards allow_mcp_markup
+        # UNCHANGED to a tool that declares `metadata`.
+        # The uuid-prefix guard forwards allow_uuid_prefix the same way, so it
+        # is stripped here too.
         metadata = strip_markup_override(metadata)
+        metadata = strip_uuid_prefix_override(metadata)
         if (
             category == 'temporal_facts'
             and isinstance(agent_id, str)
@@ -1439,7 +3777,7 @@ def create_mcp_server(
                 'error': 'count_snapshot_write_blocked',
                 'error_type': 'ReconSnapshotWriteRejected',
                 'agent_id': agent_id,
-                'content_excerpt': content[:200],
+                **excerpt_fields(content_excerpt=content),
             }
         if (
             category == 'temporal_facts'
@@ -1451,7 +3789,7 @@ def create_mcp_server(
                 'error': 'mixed_temporal_framing_write_blocked',
                 'error_type': 'ReconMixedFramingWriteRejected',
                 'agent_id': agent_id,
-                'content_excerpt': content[:200],
+                **excerpt_fields(content_excerpt=content),
             }
         if (
             category == 'temporal_facts'
@@ -1464,26 +3802,12 @@ def create_mcp_server(
                     'error': 'conflicting_task_status_framing_write_blocked',
                     'error_type': 'ReconConflictingTaskStatusWriteRejected',
                     'agent_id': agent_id,
-                    'content_excerpt': content[:200],
+                    **excerpt_fields(content_excerpt=content),
                     'conflicting_task_ids': sorted(conflicting_task_ids),
                     'hint': _CONFLICTING_TASK_STATUS_HINT,
                 }
-        if (
-            isinstance(agent_id, str)
-            and agent_id.startswith('recon-stage-')
-            and isinstance(metadata, dict)
-            and (
-                metadata.get('source') == 'stage1_flag_marker'
-                or metadata.get('kind') == 'stage1_flag_marker'
-            )
-        ):
-            return {
-                'error': 'flag_marker_write_blocked',
-                'error_type': 'ReconFlagMarkerWriteRejected',
-                'agent_id': agent_id,
-                'content_excerpt': content[:200],
-                'hint': _FLAG_MARKER_WRITE_HINT,
-            }
+        if (block := _flag_kind_refusal_block(agent_id, content, metadata)) is not None:
+            return block
         if (
             category in _LIVE_STATUS_GATED_CATEGORIES
             and isinstance(agent_id, str)
@@ -1494,7 +3818,7 @@ def create_mcp_server(
                 'error': 'live_task_status_current_fact_write_blocked',
                 'error_type': 'ReconLiveTaskStatusWriteRejected',
                 'agent_id': agent_id,
-                'content_excerpt': content[:200],
+                **excerpt_fields(content_excerpt=content),
                 'hint': _LIVE_TASK_STATUS_HINT,
             }
         # task 2824: reject a recon-stage present-tense completion claim ("task N
@@ -1512,29 +3836,153 @@ def create_mcp_server(
         allow_near_duplicate = (
             isinstance(metadata, dict) and metadata.get('allow_near_duplicate') is True
         )
-        is_recon_stage_agent = isinstance(agent_id, str) and agent_id.startswith('recon-stage-')
+        # `parent_id` and `kind` are caller-supplied Tier-A metadata keys that
+        # the attach below OVERWRITES, so a caller that set either force-stores
+        # exactly like allow_near_duplicate. See write_triage.declares_attach_keys
+        # for why ANY `kind` counts (not just the child kinds) and what that
+        # costs in coverage. An orchestrator completion record force-stores even
+        # without its kind; see write_triage.is_orchestrator_completion_write.
+        caller_owns_attach_keys = declares_attach_keys(metadata)
+        caller_declares_supersession = declares_supersession(metadata)
+        caller_is_completion_record = is_orchestrator_completion_write(metadata)
+        # Write triage (task 3127, PRD leaf beta) SUPERSEDES the two reject
+        # guards below rather than layering on top of them (D2: redirect
+        # supersedes reject). The two paths are mutually exclusive: when triage
+        # is on, neither reject error_type is reachable for a triaged write,
+        # because a restatement is attached instead of bounced.
+        #
+        # Scoped to an EXPLICIT Mem0-primary category. A category=None write
+        # auto-classifies inside MemoryService.add_memory, BELOW this seam, so
+        # triaging it here would mean running the classifier a second time
+        # (INV-5); a Graphiti-primary category is out of scope for a leaf whose
+        # retrieval is a mem0 vector search.
+        triage_enabled = (
+            category in _TRIAGED_CATEGORIES
+            and resolve_write_triage_enabled(memory_service)
+        )
+        triage_decision = None
+        if triage_enabled:
+            triage_decision = await triage_write(
+                memory_service,
+                content=content,
+                project_id=project_id,
+                counter=_triage_fail_open_counter,
+                # Leaf gamma. Until this line the judge slot ran `_stub_judge`,
+                # so every middle-band write acked `stored` no matter what it
+                # said — building `write_triage_judge` changed no observable
+                # behaviour on its own, and this is the one line that makes it
+                # load-bearing. `triage_write` still owns the fail-open
+                # apparatus around it (INV-4): `judge_write` raises on
+                # transport error, timeout and unparseable output, and that
+                # `except` arm counts it and returns `stored`.
+                judge=judge_write,
+                # The predicates are already derived above, from the metadata
+                # and agent_id this body holds. Passed IN rather than
+                # recomputed inside triage_write: a second derivation is a
+                # second place for the two to disagree about who is exempt.
+                allow_near_duplicate=allow_near_duplicate,
+                caller_owns_attach_keys=caller_owns_attach_keys,
+                caller_declares_supersession=caller_declares_supersession,
+                caller_is_completion_record=caller_is_completion_record,
+            )
+        # DEFERRED, DELIBERATELY: the topic-cluster signal contributes nothing
+        # to triage routing in this leaf. The PRD's band rule (§Bands) is
+        # "`s < T_high` with a topic-cluster hit still goes to the judge", and
+        # what happens here instead is that the deterministic topic pre-check
+        # below is switched off with the cosine reject it shares a gate with,
+        # so a topic hit under `t_high` routes to `stored`.
+        #
+        # It costs nothing OBSERVABLE today, which is why it is deferred whole
+        # rather than half-built: `_stub_judge` answers `stored`, so routing a
+        # topic hit to the judge would produce the same ack, the same persisted
+        # record and the same counter reading as not routing it. The arm is
+        # worth writing alongside something that can act on it — leaf GAMMA's
+        # real judge — and worth reading from a cluster store worth reading,
+        # which is leaf ZETA's job (the config-seeded list is 5
+        # dark-factory-only topics fed by a manual hop that most topics never
+        # got). Both land before task 3169, the deterministic flip gate, so
+        # the operator reviewing that gate sees the PRD rule either
+        # implemented or still named here.
+        #
+        # The signpost for whoever restores it:
+        # `test_a_topic_cluster_match_lands_rather_than_bouncing` asserts
+        # `routed == stored` for a topic match, and a real judge may answer
+        # otherwise. That assertion is EXPECTED to change with this arm — it
+        # pins the retirement of the soft-block, not the outcome `stored`.
+        # (task 3134, PRD leaf iota) NO recon-stage exemption. It rested on
+        # Stage-1 consolidation writing a merged canonical through THIS tool
+        # with no ordering guarantee that the duplicates it resembles were
+        # deleted first. Stage 1 now folds a cluster with
+        # `consolidate_memories`, which writes its canonical through
+        # `memory_service.add_memory` — the SERVICE method, below this tool —
+        # so the sanctioned path never meets this guard at all, and that op
+        # writes the canonical BEFORE any delete, supplying the very ordering
+        # guarantee whose absence the exemption cited. A recon-stage write
+        # arriving HERE is an ordinary duplicate and is treated as one.
+        #
+        # Shared exemptions for both dup-guard blocks below (task 3430 review,
+        # reviewer_comprehensive #1 duplication): hoisted to a single source
+        # of truth so a future new exemption (an agent-id carve-out, a
+        # triage-mode tweak) is a one-place edit instead of two conjunct
+        # chains that can silently drift apart. Deliberately EXCLUDES the
+        # category predicate and the resolve_near_dup_guard_enabled() call:
+        # each block below still spells out its own `category in/== ...`
+        # conjunct ahead of the resolver call, so a write in a category
+        # neither block gates still never calls resolve_near_dup_guard_enabled
+        # — identical short-circuit behaviour to before this hoist, and the
+        # cosine block's behaviour for procedural_knowledge stays provably
+        # unchanged (same truth table, same call count, order of the pure
+        # boolean reads is immaterial since none of them has a side effect).
+        dup_guard_base_exempt = not triage_enabled and not allow_near_duplicate
         if (
-            category == 'procedural_knowledge'
-            and not allow_near_duplicate
-            and not is_recon_stage_agent
+            dup_guard_base_exempt
+            and category in _TOPIC_GUARD_GATED_CATEGORIES
             and resolve_near_dup_guard_enabled(memory_service)
         ):
-            # Deterministic topic-keyed pre-check (task 2845): if the content
-            # matches a known-contradictory topic cluster, soft-block BEFORE the
+            # Deterministic topic-keyed pre-check (task 2845; widened in task
+            # 3430 to also gate preferences_and_norms): if the content matches
+            # a known-contradictory topic cluster, soft-block BEFORE the
             # cosine search. This is strictly cheaper (no embedding round-trip)
             # and catches same-topic paraphrases the cosine guard misses. On no
-            # match (or an empty/unconfigured clusters list) fall through to the
-            # existing cosine path unchanged. Shares the allow_near_duplicate /
-            # recon-stage exemptions and the enabled kill-switch above with the
-            # cosine guard.
-            topic_clusters = resolve_topic_guard_clusters(memory_service)
+            # match (or an empty/unconfigured clusters list) fall through — to
+            # the cosine path below for procedural_knowledge, or straight
+            # through to the write for any other _TOPIC_GUARD_GATED_CATEGORIES
+            # member. Shares the allow_near_duplicate exemption and the
+            # enabled kill-switch with the cosine guard below.
+            #
+            # TOPIC-keyed rather than category-keyed: unlike the cosine guard
+            # below, this check is not scoped to a single category — it covers
+            # every category in _TOPIC_GUARD_GATED_CATEGORIES.
+            topic_clusters = resolve_topic_guard_clusters(
+                memory_service, runtime_store=topic_cluster_store, project_id=project_id
+            )
             if topic_clusters:
                 topic_match = find_matching_topic_cluster(content, topic_clusters)
                 if topic_match is not None:
                     matched_cluster, matched_phrases = topic_match
-                    return build_topic_cluster_block(
-                        agent_id, content, matched_cluster, matched_phrases
-                    )
+                    return {
+                        **build_topic_cluster_block(
+                            agent_id, content, matched_cluster, matched_phrases
+                        ),
+                        'category': category,
+                    }
+        # Cosine near-duplicate search — kept procedural_knowledge-only. Unlike
+        # the topic pre-check above (task 3430 widened that one to also cover
+        # preferences_and_norms), this path stays scoped to procedural_knowledge:
+        # the search(categories=['procedural_knowledge'], stores=['mem0'])
+        # round-trip below and find_near_duplicate_memory's category filter are
+        # both procedural-specific, and deciding whether/how to compare a
+        # preferences_and_norms write against procedural (or preferences)
+        # entries is a separate cost/semantics decision this task does not
+        # make. Reuses dup_guard_base_exempt from the block above (the shared
+        # exemptions) and re-spells only its own category predicate, so this
+        # block's behaviour for procedural_knowledge stays provably unchanged
+        # by the split.
+        if (
+            dup_guard_base_exempt
+            and category == 'procedural_knowledge'
+            and resolve_near_dup_guard_enabled(memory_service)
+        ):
             near_dup_threshold = resolve_near_dup_threshold(memory_service)
             try:
                 # NOTE: this is an extra semantic search round-trip (embedding +
@@ -1549,6 +3997,18 @@ def create_mcp_server(
                     categories=['procedural_knowledge'],
                     stores=['mem0'],
                     limit=5,
+                    # OPT OUT of topic-anchored recall (task 3111).  These 5
+                    # slots are a CANDIDATE SET, not a presentation: the pin
+                    # promotes rather than adds, so each pinned canonical would
+                    # evict the lowest-ranked genuine cosine hit from a window
+                    # only 5 deep.  Worse, a pinned canonical deliberately
+                    # carries no metadata['store_score'], so it can never
+                    # qualify in find_near_duplicate_memory -- every pin is a
+                    # slot spent on a record this guard must ignore.  Leaving
+                    # it on would let a true near-duplicate sitting at rank 5
+                    # fall off the end, return None, and land the duplicate on
+                    # exactly the consolidated topics this guard protects.
+                    anchor_topics=False,
                 )
             except (TypeError, AttributeError, NameError):
                 # These indicate a wiring/programming bug (e.g. a future
@@ -1572,23 +4032,266 @@ def create_mcp_server(
                 return build_near_duplicate_block(
                     agent_id, content, near_dup_match, near_dup_threshold
                 )
+        # task 4715: checked after every tool-level reject guard above, so a
+        # write they reject pays no authority I/O; for every writer, like
+        # add_episode's. Reported only once the service has accepted the write
+        # (below), so a service-level reject files nothing either; see
+        # _report_unverified_claims for the contract.
+        unverified_flag = await _completion_claim_gate(content, agent_id, project_id)
+        claim_kwargs: dict[str, Any] = (
+            {'unverified_claim': True} if unverified_flag is not None else {}
+        )
         causation_id, source, cleaned_meta = _extract_causation(metadata, agent_id)
         if isinstance(cleaned_meta, dict):
             # allow_near_duplicate is a write-time-only control flag for the
             # guard above; it must never be persisted into stored metadata.
             cleaned_meta.pop('allow_near_duplicate', None)
-        result = await memory_service.add_memory(
-            content=content,
-            category=category,
+            # Only the contested attach below may write this, so no caller can
+            # make a hand-declared contest look triage-written.
+            cleaned_meta.pop(TRIAGE_CONTESTED_METADATA_KEY, None)
+            # Only services/supersession_mark.py::mark_superseded may write this.
+            cleaned_meta.pop(SUPERSEDED_BY_METADATA_KEY, None)
+        # An ATTACH outcome reroutes this same write into a child of the memory
+        # it restates: same content, same category, same agent, plus the parent
+        # link. It does NOT touch the canonical — triage issues no
+        # update_memory and no delete_memory on any path, which is what keeps a
+        # wrong attach cheap to undo (D4: re-parenting a child is a metadata
+        # edit; an overwritten canonical is unrecoverable).
+        attach_kind = (
+            _TRIAGE_ATTACH_KINDS.get(triage_decision.outcome)
+            if triage_decision is not None
+            else None
+        )
+        # The `triage_decision is not None` conjunct is redundant at runtime
+        # (attach_kind is None whenever triage_decision is), but attach_kind is
+        # computed in a separate expression above, so the type checker cannot
+        # carry that implication across and narrow the Optional here.
+        attached_to = (
+            triage_decision.canonical_id
+            if triage_decision is not None and attach_kind is not None
+            else None
+        )
+        fail_open_stage = triage_decision.fail_open_stage if triage_decision is not None else None
+        if (
+            triage_decision is not None
+            and attach_kind is None
+            and triage_decision.outcome != OUTCOME_STORED
+        ):
+            # A verdict this body cannot ACT on. Without this arm the verdict
+            # is discarded and the ack quietly reports `stored`,
+            # indistinguishable from "nothing matched" — so a consumer waiting
+            # on that outcome waits forever with nothing to grep.
+            #
+            # NOT DEAD CODE, despite now being unreachable for all four
+            # published outcomes: task 3128 wired `contested`, which is the
+            # case this arm was originally laid as a trap for, and wiring it
+            # sprung the trap the right way round. What remains is the guard
+            # for the FIFTH verdict — a future judge whose vocabulary grows
+            # without _TRIAGE_ATTACH_KINDS growing with it. Deleting it as
+            # unreachable restores exactly the silence it was written to
+            # break. tests/server/test_add_memory_write_triage_gate.py::
+            # TestAVerdictWithNoWiredAttachKindIsVisible holds it live against
+            # a stand-in verdict for that reason.
+            #
+            # Counted as a fail-open for the same reason `triage_write` counts
+            # an out-of-vocabulary verdict: the write still lands untriaged
+            # (C1 holds), but a gap between the judge's vocabulary and this
+            # body's wiring must surface as a storm escalation rather than as
+            # nothing at all.
+            logger.warning(
+                'write_triage: outcome=%r has no attach kind wired at the tool '
+                'seam; the write is stored standalone and the ack reports %r. '
+                'This is a wiring gap between the judge vocabulary and '
+                '_TRIAGE_ATTACH_KINDS, not a routing decision.',
+                triage_decision.outcome, OUTCOME_STORED,
+            )
+            _triage_fail_open_counter.record(project=project_id)
+            fail_open_stage = FailOpenStage.UNWIRED_VERDICT
+        write_meta = cleaned_meta
+        if attached_to is not None:
+            # Every key written here is an ATTACH_OWNED_KEY (the triage-contest
+            # marker excepted: TestOnlyTriageWritesTheTriageContestMarker), and
+            # overwriting them is safe ONLY because `caller_owns_attach_keys`
+            # force-stored every write that carried any one of them — so none
+            # can be present here. Adding a key to this dict without adding it to
+            # ATTACH_OWNED_KEYS re-opens the loss for that key; the gate suite
+            # pins the two sets against each other for exactly that reason,
+            # unioned across the outcomes because they no longer write the
+            # same keys.
+            write_meta = {
+                **(cleaned_meta or {}),
+                PARENT_ID_KEY: attached_to,
+                'kind': attach_kind,
+            }
+            if triage_decision is not None and triage_decision.outcome == OUTCOME_CONTESTED:
+                # The one key that distinguishes a contested child from an
+                # ordinary amendment — both are AMENDMENT_KIND, because both
+                # need their text CARRIED in the grouped document rather
+                # than counted. Composed from grouped_read's constant, never
+                # the 'x_contested' literal: that module owns the read-side
+                # predicate (is_contested_child) which has to recognise what
+                # is stamped here, and two spellings would produce children
+                # flagged in a way nothing reads.
+                #
+                # Triage DETECTS that the entry contests the record it names
+                # (wrong, outdated or different:
+                # plans/write-triage-flip-readiness-prd.md §11.3 C1''); it
+                # does not adjudicate it (D3). What the flag actually does,
+                # measured rather than assumed: the only consumer of
+                # CONTESTED_METADATA_KEY /
+                # is_contested_child is grouped_read's READ-SIDE suppression,
+                # which keeps the submitted text visible, carried in the
+                # canonical's grouped document while marking it as contesting.
+                # There is no gate, no escalation and no operator surface --
+                # reconciliation/consolidation_gate.py keys on a DIFFERENT
+                # metadata key (x_recon_consolidation_gate) and never reads
+                # this one. The canonical it contradicts is left exactly as it
+                # was, and nothing is scheduled to settle the disagreement.
+                write_meta[CONTESTED_METADATA_KEY] = True
+                # Read by link-heal's H1 row 2: a contest triage made is healable.
+                write_meta[TRIAGE_CONTESTED_METADATA_KEY] = True
+        try:
+            result = await memory_service.add_memory(
+                content=content,
+                category=category,
+                project_id=project_id,
+                agent_id=agent_id,
+                session_id=session_id,
+                metadata=write_meta,
+                dual_write=dual_write,
+                causation_id=causation_id,
+                _source=source,
+                # Forwarded VERBATIM, unparsed: `entities_gate` above has
+                # already proved this list parses (a malformed one cannot reach
+                # here), and `MemoryService` is the single site that resolves
+                # and encodes it. Parsing twice would fork what `declared` means
+                # between this boundary and the producer.
+                declared_referents=entities,
+                **claim_kwargs,
+            )
+        except Exception:
+            if attached_to is None:
+                # Not an attach — this is the ordinary write failing, exactly
+                # as it would without triage. Surface it through
+                # @mcp_tool_errors() unchanged; swallowing it here would
+                # invent a success the caller never got.
+                raise
+            # C1's sharpest case: the REDIRECT failed, so the WRITE must not.
+            # Without this fallback triage would convert a write that
+            # succeeded before this leaf into a hard failure — content loss
+            # caused by the mechanism built to prevent it. Retried standalone
+            # with the SAME full content and the caller's own metadata, i.e.
+            # the exact pre-triage outcome. The failed parent link is dropped:
+            # re-sending it would just fail the same way.
+            logger.exception(
+                'write_triage: attaching to canonical=%r failed; falling back to '
+                'a standalone store of the same content (contract C1: never '
+                'lose content, never block a write)',
+                attached_to,
+            )
+            _triage_fail_open_counter.record(project=project_id)
+            fail_open_stage = FailOpenStage.ATTACH_WRITE
+            attached_to = None
+            result = await memory_service.add_memory(
+                content=content,
+                category=category,
+                project_id=project_id,
+                agent_id=agent_id,
+                session_id=session_id,
+                metadata=cleaned_meta,
+                dual_write=dual_write,
+                causation_id=causation_id,
+                _source=source,
+                # KEPT, unlike the failed parent link this fallback deliberately
+                # drops — and for the same reason it keeps the full content: the
+                # retry is meant to reproduce the exact pre-triage outcome. A
+                # silently downgraded referent source is content loss in the
+                # telemetry dimension: the write would land stamped `derived`
+                # while the agent believes it declared, and nothing would say so.
+                declared_referents=entities,
+                # Kept for the same reason: the pre-triage write carried the tag.
+                **claim_kwargs,
+            )
+        if attached_to is not None and not attach_write_durable(result):
+            # A RAISE IS ONLY HALF THE FAILURE SURFACE — and the smaller half,
+            # the same asymmetry `triage_write` handles for retrieval.
+            # `MemoryService.add_memory` does NOT raise when a store fails: it
+            # catches the Graphiti/Mem0 exception into `_graphiti_error` /
+            # `_mem0_error`, folds it into `message`, and returns an ordinary
+            # AddMemoryResponse with NO memory_ids (a Mem0 leg durably queued
+            # for server-side retry is not such a failure: it lists mem0 under
+            # `stores_pending_retry`, and the retry lands the child the ack
+            # names). So a child write that died at the store never reaches
+            # the `except` arm above, and the ack
+            # would otherwise announce `restated` + canonical_id for a link
+            # that was never persisted — precisely the "ack claiming an attach
+            # that did not happen" the comment below calls worse than no ack.
+            #
+            # NOT retried standalone, unlike the `except` arm. There the
+            # failure is attributable to the INJECTED parent link (a
+            # MemoryMetadataValidationError raised before any backend call), so
+            # dropping the link and re-writing genuinely helps. Here the store
+            # itself just failed on this exact content; re-issuing it would
+            # fail the same way, and would risk a duplicate if the response
+            # under-reports a partial success. The caller gets the failed
+            # response unchanged — message and all — which is the exact
+            # pre-triage outcome.
+            logger.warning(
+                'write_triage: the child write for canonical=%r did not persist '
+                '(no memory_ids returned); acking as %r rather than claiming an '
+                'attach that never landed. Response message: %r',
+                attached_to, OUTCOME_STORED, getattr(result, 'message', None),
+            )
+            _triage_fail_open_counter.record(project=project_id)
+            fail_open_stage = FailOpenStage.ATTACH_NOT_DURABLE
+            attached_to = None
+        # Marks each record this write supersedes, now that the new id exists.
+        # Not a triage event; see services/supersession_mark.py.
+        supersession = await mark_superseded(
+            memory_service,
+            metadata=metadata,
+            written=result,
             project_id=project_id,
             agent_id=agent_id,
             session_id=session_id,
-            metadata=cleaned_meta,
-            dual_write=dual_write,
             causation_id=causation_id,
-            _source=source,
+            source=source,
         )
-        return result.model_dump()
+        ack = result.model_dump()
+        if supersession is not None:
+            ack.update(supersession.to_ack())
+        if unverified_flag is not None:
+            ack[UNVERIFIED_CLAIM_TAG] = _report_unverified_claims(
+                unverified_flag, agent_id, project_id,
+            )
+        if triage_decision is not None:
+            # Purely ADDITIVE over the AddMemoryResponse: every existing caller
+            # reads those fields and must keep working untouched.
+            #
+            # `attached_to`, not the decision's canonical_id: a fallback above
+            # cleared it, and an ack claiming an attach that did not happen
+            # would be worse than no ack at all. canonical_id is OMITTED rather
+            # than emitted as null for a non-attach — an absent key is
+            # unambiguous, a null is a value the reader has to disambiguate.
+            outcome = triage_decision.outcome if attached_to is not None else OUTCOME_STORED
+            ack = {**ack, ROUTED_KEY: outcome}
+            if attached_to is not None:
+                ack[CANONICAL_ID_KEY] = attached_to
+            # See write_triage.TRIAGE_FAIL_OPEN_KEY.
+            if fail_open_stage is not None:
+                ack[TRIAGE_FAIL_OPEN_KEY] = fail_open_stage.value
+            ack.update(truncation_fields(*triage_decision.truncation_facts))
+            # Drained AFTER any fallback record above, so one drain covers both
+            # triage_write's internal fail-opens and this body's own.
+            storm = _triage_fail_open_counter.drain_storm()
+            if storm:
+                esc_id = await _file_triage_fail_open_storm(storm, project_id)
+                if esc_id is not None:
+                    # Echoed so the writer (or a reviewer reading the response)
+                    # can find the filed record without grepping logs — the
+                    # same convention add_episode uses for its own escalation.
+                    ack[FAIL_OPEN_ESCALATION_ID_KEY] = esc_id
+        return ack
 
     @mcp.tool()
     @mcp_tool_errors()
@@ -1618,6 +4321,14 @@ def create_mcp_server(
         A caller that deliberately passes agent_id='recon-stage-*' can
         still reach this path; the gate's purpose is to prevent accidental
         use by ordinary callers, not to defend against a malicious one.
+
+        If the embedding provider fails transiently (429, 5xx, connection), the
+        write is NOT dropped: the ack carries stores_pending_retry=['mem0'] and
+        empty memory_ids, the message says mem0_pending_retry, and the server
+        re-issues it through the same dedup-exempt backend method. A later
+        non-transient failure dead-letters it (status 'dead' in the write
+        journal's mem0_intents). Do NOT re-submit the same content. The write
+        has landed only when memory_ids is non-empty.
 
         Args:
             content: The system record content (e.g. a deterministic cycle summary).
@@ -1660,6 +4371,25 @@ def create_mcp_server(
                 ),
                 'error_type': 'ValidationError',
             }
+        if (block := _flag_kind_refusal_block(agent_id, content, metadata)) is not None:
+            return block
+        # LOAD-BEARING, unlike add_episode's defensive strip above: this tool
+        # FORWARDS the cleaned metadata to the store (`metadata=cleaned_meta`
+        # below), so without this the write-time control flag is persisted into
+        # the Mem0 corpus and rides along on every future read of a record that
+        # needed it exactly once. The boundary guard cannot do this for us —
+        # MarkupGuardMiddleware._apply_override forwards `allow_mcp_markup`
+        # UNCHANGED to any tool DECLARING a `metadata` parameter, by design, so
+        # the tool body remains the party that keeps it out of the corpus.
+        #
+        # Placed immediately before `_extract_causation` because that call is
+        # the single point where the caller's `metadata` becomes persisted
+        # state: stripping here cannot be bypassed by a later edit that adds
+        # another persistence path off `cleaned_meta`.
+        # The uuid-prefix guard forwards allow_uuid_prefix the same way, so it
+        # is stripped here too.
+        metadata = strip_markup_override(metadata)
+        metadata = strip_uuid_prefix_override(metadata)
         causation_id, source, cleaned_meta = _extract_causation(metadata, agent_id)
         result = await memory_service.add_system_record(
             content=content,
@@ -1672,6 +4402,107 @@ def create_mcp_server(
             _source=source,
         )
         return result.model_dump()
+
+    @mcp.tool()
+    @mcp_tool_errors()
+    async def propose_consolidation(
+        project_id: str,
+        run_id: str,
+        topic: str,
+        member_ids: list[str],
+        category: str,
+        claim: str,
+        rationale: str,
+        seeded_from: str | None = None,
+        agent_id: str | None = None,
+        ctx: Context | None = None,
+    ) -> dict[str, Any]:
+        """Propose consolidating a near-duplicate Mem0 cluster. Recon Stage 1's one channel for it.
+
+        You propose; code decides whether the cluster is consolidated and
+        executes it. A ValidationError names every offender at once, with a
+        hint: fix them all and call again in the same turn. Re-calling for the
+        same (project, topic, run) overwrites the earlier proposal until code
+        has acted on it; after that the call is refused. Only recon
+        Stage 1 may propose: agent_id must be 'recon-stage-memory_consolidator'
+        — a naming convention, not authentication.
+
+        Args:
+            project_id: Project scope.
+            run_id: The reconciliation run emitting this proposal.
+            topic: Topic slug the cluster belongs under (lowercase, hyphenated).
+            member_ids: Full 36-character ids of the cluster's records.
+            category: Memory category the canonical is written under.
+            claim: ONE assertion on one line; it becomes the canonical's first
+                   paragraph verbatim.
+            rationale: Why these records are one cluster. Reviewer-facing;
+                       never reaches the canonical.
+            seeded_from: What surfaced the cluster, e.g. a near-duplicate
+                         soft-block (optional). Reviewer-facing.
+            agent_id: Must be 'recon-stage-memory_consolidator' (optional,
+                      auto-derived from MCP context).
+        """
+        agent_id, _ = _resolve_identity(agent_id, None, ctx)
+        if agent_id != PROPOSER_AGENT_ID:
+            return {
+                'error': 'consolidation_proposal_not_permitted',
+                'error_type': 'ConsolidationProposalNotPermitted',
+                'agent_id': agent_id,
+            }
+        project_id, err = _canonicalize_project_id_arg(project_id)
+        if err:
+            return err
+        if err := validate_project_id(project_id):
+            return err
+        if err := _known_project_gate(project_id):
+            return err
+        # Read per call, never captured, so a reload_config of these leaves
+        # applies to the next proposal.
+        config = memory_service.config.consolidation_auto
+        err, members = validate_proposal_args(
+            topic=topic,
+            member_ids=member_ids,
+            run_id=run_id,
+            claim=claim,
+            category=category,
+            rationale=rationale,
+            seeded_from=seeded_from,
+            limits=ProposalLimits.from_config(config),
+        )
+        if err:
+            return err
+        ledger = memory_service.recon_ledger
+        if ledger is None:
+            return {
+                'error': (
+                    'no reconciliation ledger is wired on this server, so the '
+                    'proposal could not be persisted'
+                ),
+                'error_type': 'ReconLedgerUnavailable',
+            }
+        proposal = ConsolidationProposal(
+            project_id=project_id,
+            run_id=run_id,
+            topic=topic,
+            member_ids=tuple(members),
+            category=category,
+            claim=claim,
+            rationale=rationale,
+            seeded_from=seeded_from,
+        )
+        recorded = await record_proposal(
+            ledger, proposal, now=datetime.now(UTC), ttl_hours=config.proposal_ttl_hours
+        )
+        if not recorded:
+            return {
+                'error': (
+                    'the proposal for this (project, topic, run) has already been '
+                    'acted on, so it was not overwritten'
+                ),
+                'error_type': 'ConsolidationProposalAlreadyActed',
+                'ledger_key': proposal.ledger_key(),
+            }
+        return {'ok': True, 'ledger_key': proposal.ledger_key()}
 
     # ------------------------------------------------------------------
     # Read tools
@@ -1688,6 +4519,21 @@ def create_mcp_server(
         agent_id: str | None = None,
         session_id: str | None = None,
         include_planned: bool = False,
+        # ATTRIBUTION, not filtering (task 3212, INV-1).  These record WHO IS
+        # ASKING in the journal and are never passed to memory_service.search —
+        # conflating them with the agent_id FILTER above is the design conflict
+        # that left 99.7% of journal rows unattributed.
+        #
+        # _resolve_identity's clientInfo read is deliberately left exactly as it
+        # is and is NOT repurposed for this: clientInfo is hardcoded to
+        # 'orchestrator' in orchestrator/mcp/mcp_lifecycle.py and is dropped
+        # entirely by stateless HTTP, so it can never carry per-task identity.
+        #
+        # Consumer: task 3659 threads these from the briefing assembler across
+        # all its builders.  This task is server-side only and edits no
+        # orchestrator briefing code.  No other tool gains these params.
+        caller_agent_id: str | None = None,
+        caller_task_id: str | None = None,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
         """Search across both memory stores with automatic routing.
@@ -1716,6 +4562,75 @@ def create_mcp_server(
             agent_id: Filter by authoring agent (optional, auto-derived from MCP context)
             session_id: Filter by session (optional, auto-derived from MCP context)
             include_planned: Include planning-episode edges (default: False)
+            caller_agent_id: Who is ASKING — recorded in the journal, never used to filter
+            caller_task_id: Which task is asking — recorded in the journal, never used to filter
+
+        Returns:
+            {'results': [...]} — plus 'degraded'/'failed_stores'/
+            'failed_store_diagnostics' ONLY when a selected store failed.
+
+            Results are GROUPED (task 3129): an amendment or sighting (a record
+            whose metadata carries parent_id) does not appear as its own
+            top-level hit — it folds into the hit for the canonical it attaches
+            to, and a child-only match is replaced by that canonical. So a
+            search with limit=10 can legitimately return FEWER than 10 top-level
+            results, and a matched child's id/body is found INSIDE its parent's
+            entry, not beside it.
+
+            A result carrying children gains a 'grouped' block:
+            {'amendments': [{'id','content','created_at','kind'}],
+             'amendment_count': int, 'sighting_count': int} — the counts are
+            EXACT while the amendment list is bounded and TRUNCATED to a cap
+            (marked 'truncated': True), so never read the list as the whole
+            set.  Each amendment's 'content' is its text capped at
+            write_triage.judge_field_chars, with the counted elision marker
+            when cut; one that contests its parent is also marked
+            'contested': True.  Any child that was folded away is pinned into
+            'grouped'['matched_children'] as
+            {'id','content','created_at','kind','matched': True} carrying its
+            FULL body — that is where a matched child's text lives.  An
+            amendment entry already listing the matched child is marked
+            'matched': True in place instead and its 'content' becomes that
+            same FULL body, so a matched child's text is never shortened by
+            grouping wherever it ends up.
+
+            Loud-fault keys, present only when something is genuinely unknown:
+            'grouped'['children_unavailable'] (+ 'error_type') means the child
+            reads FAILED — not that there are no children — and such a hit
+            suppresses nothing; a top-level 'parent_unresolved': True means the
+            hit is a child whose parent_id no store could resolve, and it stays
+            a top-level hit.  A record that is neither a child nor has children
+            carries no 'grouped' key at all.
+
+            ATTRIBUTION (task 3137).  Every top-level result carries 'agent_id' (the writer),
+            'task_id' (the writer's metadata task_id, as a string) and 'project_id' (the
+            project scope the record is STORED under) beside 'created_at', each null when the
+            store recorded none.  Graphiti results never carry agent_id or task_id.  project_id
+            is the storage scope, not the origin: a rehomed record's origin is still read from
+            metadata.src_project.  Nested 'grouped' entries do not carry these keys.
+
+            TOPIC-PINNED RESULTS (task 3111).  Every result carries a
+            'topic_anchored' bool.  When True, that result was PROMOTED into
+            the window BY RULE rather than earned its place by rank: when a
+            record IN THE RETURNED WINDOW carries a metadata.topic, that
+            topic's canonical:true record is looked up and seated first.
+            Topics are harvested from the window you actually see, never from
+            lower-ranked hits that were cut — so a pin can only ever cost you a
+            slot for a cluster you genuinely matched.  'relevance_score' is NOT
+            meaningful for such a result — it is pinned by ORDER, never by
+            score.  Promotion is not addition: the window stays exactly `limit`
+            long, so a pin costs the lowest-ranked result its slot.  This
+            COMPOSES WITH, rather than replaces, the parent_id grouping
+            described above — pinning happens first, in the service, and
+            grouping then runs over the pinned list.
+
+            HONESTY CAVEAT: on the live corpus today this is a NO-OP for almost
+            every search.  Stamping COVERAGE, not ranking, is the binding
+            constraint — metadata.topic is present on 491 of 49,628 records and
+            metadata.canonical:true on 6 — and coverage is task 4006's scope
+            (still PENDING), not this transform's.  No live-corpus recall
+            improvement is claimed.  Task 3659 (briefing assembler) is a FUTURE
+            consumer, explicitly not a live one.
         """
         agent_id, session_id = _resolve_identity(agent_id, session_id, ctx)
         project_id, err = _canonicalize_project_id_arg(project_id)
@@ -1730,6 +4645,21 @@ def create_mcp_server(
             }
         if limit > 1000:
             limit = 1000
+        # One params dict for both journalling sites (success and error), built
+        # once so the two cannot drift.  The query text and its disclosed cap
+        # come from read_telemetry, the same single home that owns the
+        # result_summary shape — see the summarise site below.  The
+        # caller-identity keys are present only when supplied, so an
+        # un-attributed caller's row shape is byte-identical to what it was
+        # before this channel existed.
+        journal_params: dict[str, Any] = {
+            **summarize_search_query(query),
+            'limit': limit,
+        }
+        if caller_agent_id is not None:
+            journal_params['caller_agent_id'] = caller_agent_id
+        if caller_task_id is not None:
+            journal_params['caller_task_id'] = caller_task_id
         try:
             results = await memory_service.search(
                 query=query,
@@ -1741,7 +4671,35 @@ def create_mcp_server(
                 session_id=session_id,
                 include_planned=include_planned,
             )
-            response: dict[str, Any] = {'results': [r.model_dump() for r in results]}
+            # Grouping lives in server/grouped_read.py and is applied HERE, at
+            # the MCP boundary — never inside MemoryService.search.  Pushing it
+            # down a layer would strip amendment/sighting rows from
+            # reconciliation/mem0_dedup.py::find_prior_memories, whose
+            # per-record task_id/kind post-filter iterates raw service results,
+            # hiding duplicates from the dedup detector and candidates from the
+            # near-duplicate write guard (task 3129 / PRD V2 bullet 4).
+            #
+            # degraded/failed_stores/failure_diagnostics are read BELOW off
+            # `results` (the SearchResults object), never off the grouped list —
+            # that metadata does not survive a list transform.
+            try:
+                grouped_results = await group_search_results(
+                    memory_service,
+                    project_id,
+                    results,
+                    amendment_text_chars=resolve_judge_field_chars(memory_service),
+                )
+            except Exception:
+                # A grouping fault must never turn a working search into an
+                # error dict; degrade to the ungrouped list and say so loudly.
+                logger.warning(
+                    'search: grouped read FAILED for project=%s; returning ungrouped results',
+                    project_id,
+                    exc_info=True,
+                    extra={'project_id': project_id},
+                )
+                grouped_results = [r.model_dump() for r in results]
+            response: dict[str, Any] = {'results': grouped_results}
             # Fault-only loudness: surface degraded/failed_stores only when the
             # search was degraded (a selected store timed out or raised).  Uses
             # getattr so a plain list return (back-compat callers) is harmless.
@@ -1751,13 +4709,53 @@ def create_mcp_server(
                 diagnostics = getattr(results, 'failure_diagnostics', [])
                 if diagnostics:
                     response['failed_store_diagnostics'] = diagnostics
+            # The shape's SINGLE home is
+            # fused_memory/services/read_telemetry.py::summarize_search_results
+            # — three producers, one contract (INV-5).  Summarise
+            # `grouped_results`, not `results`: grouping runs at THIS boundary,
+            # so the grouped list is literally what the agent was shown, and
+            # leaf eta's (task 3213) question is "was the agent SHOWN the thing
+            # it then re-wrote?".  The raw list would over-report top-level
+            # visibility and omit the folded child ids the agent did see.
+            #
+            # The near-full query is journalled for search rows only — the
+            # 200-char convention at every other _log_read caller is
+            # deliberately left alone.  A retrieval metric computed from half a
+            # query measures the wrong thing.
+            #
+            # failed_stores is read off `results` (the SearchResults object)
+            # exactly as the response block above does — it does not survive the
+            # list transform — and handed to the summariser rather than bolted
+            # onto its output, so all three producers stamp degraded/
+            # failed_stores by one rule instead of three.
+            degraded_stores = getattr(results, 'failed_stores', None)
+            try:
+                search_summary: dict[str, Any] = summarize_search_results(
+                    grouped_results, failed_stores=degraded_stores,
+                )
+            except Exception:
+                # A telemetry fault must never turn a working search into an
+                # error — same degradation posture as the grouping guard above.
+                # The fallback is the FULL envelope marked telemetry_error, not
+                # a bare count: a consumer must be able to tell "the summariser
+                # broke" from "the agent was shown nothing".
+                logger.warning(
+                    'search: result telemetry FAILED for project=%s; journalling the '
+                    'telemetry_error envelope',
+                    project_id,
+                    exc_info=True,
+                    extra={'project_id': project_id},
+                )
+                search_summary = fallback_search_summary(
+                    len(results), failed_stores=degraded_stores,
+                )
             await _log_read(
                 operation='search',
                 project_id=project_id,
                 agent_id=agent_id,
                 session_id=session_id,
-                params={'query': query[:200], 'limit': limit},
-                result_summary={'count': len(results)},
+                params=journal_params,
+                result_summary=search_summary,
             )
             return response
         except Exception as e:
@@ -1766,7 +4764,7 @@ def create_mcp_server(
                 project_id=project_id,
                 agent_id=agent_id,
                 session_id=session_id,
-                params={'query': query[:200], 'limit': limit},
+                params=journal_params,
                 success=False,
                 error=str(e),
             )
@@ -1849,11 +4847,48 @@ def create_mcp_server(
         (``task_knowledge_sync``) rows written under the same ``run_id``.
 
         Return shape: ``{'present': bool, 'ledger_available': bool,
-        'project_id': str, 'run_id': str, 'stage': str}``. When the ledger is
-        not wired (``ledger_available: False``), ``present`` is always
-        ``False`` and MUST be treated as inconclusive, not a definitive
-        absence — mirrors ``write_cycle_summary`` returning ``False`` when
-        unwired.
+        'project_id': str, 'run_id': str, 'stage': str, 'remediation':
+        bool | None, 'agent_outcome': str | None, 'reason': str, 'expected':
+        bool | None, 'run_lookup_available': bool, 'run_status': str | None}``.
+        When the ledger is not wired (``ledger_available: False``),
+        ``present`` is always ``False`` and MUST be treated as inconclusive,
+        not a definitive absence — mirrors ``write_cycle_summary`` returning
+        ``False`` when unwired.
+
+        A present row whose ``agent_outcome`` is not ``'completed'`` records a
+        stage agent that died or was never launched — not a healthy zero-work
+        cycle. ``agent_outcome: None`` means unrecorded.
+
+        ``present: False`` alone does NOT mean a summary was lost — it
+        conflates four unrelated situations, and ``reason`` names which one:
+
+        - ``present`` — the row is there.
+        - ``missing`` — the stage ran, the run is within the retention
+          window, and no row exists. **This is the only genuine gap.**
+        - ``stage_not_run`` — the run ENDED without reaching this stage, so
+          there was never anything to write. Not a defect; do not report it
+          as one. Only a SETTLED run can report this: a run still executing
+          has not persisted a finished ``stage_reports`` — including one
+          resumed from ``interrupted``, which executes again behind a disk
+          status that still reads terminal — so it reports ``run_unknown``
+          rather than a confident "never ran".
+        - ``expired`` — the run is older than the retention window, so the
+          row would have been reaped by ``ReconLedgerStore.gc()`` whether or
+          not it was ever written. Absence here carries no information.
+        - ``run_unknown`` / ``ledger_unavailable`` — nothing available to
+          answer with; inconclusive.
+
+        ``expected`` collapses that into the one gate to act on. **Conclude a
+        genuine gap ONLY when ``present`` is False AND ``expected`` is True.**
+        ``expected: False`` means there was nothing to write; ``expected:
+        None`` means the question is unanswerable, and the caller should fall
+        through to its existing best-effort fallback exactly as before.
+
+        ``run_status`` is DIAGNOSTIC ONLY — useful as evidence on a finding,
+        but never a gating condition. Gating on it looks right on the majority
+        case and is wrong: measured ``failed`` runs really did execute their
+        stage and lose the ledger write, so a status gate suppresses precisely
+        the real findings it appears to filter.
 
         This tool is intentionally read-only and is NOT included in any
         DISALLOW_* list, so it is auto-allowed in Stage 3's read-only
@@ -1875,6 +4910,110 @@ def create_mcp_server(
             run_id=run_id,
             stage=stage,
         )
+
+    @mcp.tool()
+    @mcp_tool_errors()
+    async def scan_memory_content(
+        project_id: str,
+        needles: list[str] | None = None,
+        filters: dict | None = None,
+        exhaustive: bool = False,
+        limit: int | None = 1000,
+        ctx: Context | None = None,
+    ) -> dict[str, Any]:
+        """Scan memory TEXT for literal substrings (deterministic substring match, not semantic).
+
+        Complements ``search`` and ``get_memories_by_metadata`` by covering the
+        third axis: ``search`` ranks by EMBEDDING SIMILARITY, and
+        ``get_memories_by_metadata`` matches payload KEYS by equality — neither can
+        find a literal string embedded inside a memory's text. That is not a
+        theoretical gap: a leaked serialized tool-call XML fragment carries almost no
+        semantic signal, so a live 2026-07-26 semantic probe for the known corrupted
+        records returned ZERO, and the corpus was structurally unsweepable until this
+        tool existed (task 3083).
+
+        Every walked record is judged in Python, and that is the authoritative
+        verdict: a literal, case-sensitive substring match of your *needles* when
+        given, else the shared tool-call-leak detector
+        (``fused_memory.utils.toolcall_xml_leak``). The store-side prefilter is a
+        speed optimisation only, and it reads only the ``data`` text key. With
+        custom *needles*, a prefiltered scan is complete only while ``data``
+        carries no text index (an index makes the prefilter match whole tokens and
+        skip mid-word needles); ``exhaustive=True`` does not depend on it.
+
+        **Mem0/Qdrant-only scope:** This tool scans only memories stored in the
+        Mem0/Qdrant backend (categories: observations_and_summaries,
+        preferences_and_norms, procedural_knowledge). It does NOT scan Graphiti
+        episodes or edges; a leaked episode must be found and remediated separately.
+
+        **No silent caps:** the walk stops after *limit* records (default 1000,
+        matching ``get_memories_by_metadata``); pass ``limit=null`` to walk to the end
+        of the collection. When the limit stops it early, the response self-discloses
+        this via ``truncated`` (bool) alongside ``scanned`` (the number of records
+        actually examined, and the correct denominator for an incidence rate).
+
+        Example call (a whole-collection incidence walk):
+            scan_memory_content(
+                project_id="dark_factory",
+                exhaustive=True,
+                limit=None,
+            )
+
+        This tool is intentionally read-only and is NOT included in any DISALLOW_*
+        list, so it is auto-allowed in Stage 3's read-only integrity-check mode (the
+        same property ``get_memories_by_metadata`` documents).
+
+        Args:
+            project_id: Project scope (required)
+            needles: Literal substrings to find; a record matches when its text
+                contains one. They also drive the prefilter, which *exhaustive*
+                skips. Omit (None) to scan for the shared tool-call-leak sentinels.
+                An empty-string needle is rejected, since every record contains it.
+            filters: Optional exact metadata key-value pairs narrowing the scan
+                (e.g. {'category': 'procedural_knowledge'}). Applies in both modes.
+            exhaustive: Skip the prefilter and walk every record. Slower, but the
+                answer then depends on nothing but the Python verdict, and it also
+                sees text under the ``memory``/``content`` fallback keys — use this
+                when establishing a true incidence rate or a complete literal hunt.
+            limit: Maximum records to WALK (default 1000). ``null`` walks to the end;
+                an early stop is disclosed by ``truncated``.
+
+        Returns:
+            {'matches': [{'id', 'created_at', 'matched_fragments', 'excerpt',
+            'metadata'}, ...], 'scanned': int, 'truncated': bool, 'exhaustive': ...,
+            'limit': ..., 'project_id': ...} on success, or {'error': ...,
+            'error_type': ...} on failure. An empty ``matches`` list is a SUCCESSFUL
+            scan of a clean corpus, not an error. A match's ``excerpt`` is a
+            fixed-width window of its text
+            (``fused_memory/backends/mem0_client.py::_EXCERPT_LEN`` characters)
+            centred where the earliest matched fragment begins, with ``…`` marking
+            each elided side. Its ``metadata``
+            omits the text keys (``data``/``memory``/``content``);
+            ``get_memory_by_id`` returns the full body.
+        """
+        project_id, err = _canonicalize_project_id_arg(project_id)
+        if err:
+            return err
+        if err := validate_project_id(project_id):
+            return err
+        result = await memory_service.scan_memory_content(
+            project_id=project_id,
+            needles=needles,
+            filters=filters,
+            exhaustive=exhaustive,
+            limit=limit,
+        )
+        return {
+            'matches': [
+                {**match, 'metadata': payload_without_text(match.get('metadata') or {})}
+                for match in result.get('matches', [])
+            ],
+            'scanned': result.get('scanned', 0),
+            'truncated': result.get('truncated', False),
+            'exhaustive': exhaustive,
+            'limit': limit,
+            'project_id': project_id,
+        }
 
     @mcp.tool()
     @mcp_tool_errors()
@@ -1988,8 +5127,10 @@ def create_mcp_server(
         distinction semantic search's silent low-similarity drop could not make.
 
         A miss now carries an optional ``tombstone`` key (task 3041) when the
-        record was DELIBERATELY reaped by a named reconciliation sweep. Its
-        presence proves the record is gone on purpose — naming the sweep
+        record was DELIBERATELY deleted by a tombstone-writing delete path —
+        one of the deleter tags listed at
+        ``reconciliation/recon_self_model.py::MEM0_TOMBSTONE_DELETERS``. Its
+        presence proves the record is gone on purpose — naming the deleter
         (``deleter``), the run that performed the deletion
         (``deleting_run_id``, distinct from the victim's own ``run_id``), when,
         and the victim's identifying metadata — rather than lost. This closes
@@ -2000,9 +5141,13 @@ def create_mcp_server(
 
         The key is OMITTED (not ``None``) when no tombstone exists, so its
         presence is itself the signal and the ordinary never-existed miss keeps
-        its original shape. Absence is NOT proof of the converse: tombstones
-        are TTL-bounded, so one older than
-        ``mem0_tombstone.MEM0_TOMBSTONE_TTL_DAYS`` has itself expired. The
+        its original shape. Absence is NOT proof of the converse: a miss with
+        no ``tombstone`` key is not evidence that the record was not
+        deliberately deleted, for two independent reasons. (1) Several Mem0
+        delete paths write no tombstone at all;
+        ``reconciliation/recon_self_model.py::render_cycle_summary_section``
+        is the maintained enumeration of them. (2) Even a written tombstone
+        expires after ``mem0_tombstone.MEM0_TOMBSTONE_TTL_DAYS``. The
         lookup is guarded and never runs on the hit branch, so it can only add
         information to an already-correct answer — a tombstone failure can
         never convert a correct ``found: False`` into an error, and a backend
@@ -2015,22 +5160,68 @@ def create_mcp_server(
 
         Args:
             project_id: Project scope (required)
-            memory_id: Raw Mem0/Qdrant point-id (memory UUID) to look up
+            memory_id: Raw Mem0/Qdrant point-id (memory UUID) to look up, or
+                an 8-31 lowercase-hex prefix of one
 
         Returns:
+            For a PREFIX that names exactly one live memory: that memory's
+            hit or miss below, plus ``resolved_from_prefix``. For any other
+            prefix: the miss report ``{'found': False, 'prefix_checked': True,
+            'prefix', 'project_id', 'namespaces', 'hint'}`` listing what each
+            namespace (mem0, mem0_tombstone, graphiti_node, graphiti_edge)
+            holds, with ``mem0_tombstone: None`` when the tombstone store could
+            not be read; ``{'error_type': 'ambiguous_uuid_prefix', 'candidates', ...}``
+            when it names several ids; ``{'error_type': 'resolver_unavailable',
+            'store', 'prefix_checked': False, ...}`` when a store could not be
+            read. Any other non-uuid id is a ``ValidationError`` with a ``hint``.
+
             ``{'found': True, 'memory_id', 'project_id', 'content', 'metadata'}``
             on a hit (``metadata`` is the full raw Qdrant payload); ``{'found':
             False, 'memory_id', 'project_id'}`` on a genuine miss — plus
-            ``'tombstone': {'deleter', 'deleting_run_id', 'deleted_at', victim
+            ``'tombstone': {'deleter', 'deleting_run_id', 'deleted_at',
+            'absorbed_by', victim
             'kind'/'record_type'/'source'/'recon_pool'/'run_id'/'created_at',
             'tombstone_created_at', 'tombstone_expires_at'}`` when the record
             was deliberately reaped; or ``{'error', 'error_type'}`` on a
-            backend failure.
+            backend failure. ``absorbed_by`` (task 3133) is the surviving
+            canonical id that folded this record in — the REVERSE pointer,
+            and the field that answers "where did its content go?" from the
+            dead id alone. It is ``None`` for a GC/trim sweep, which absorbs
+            nothing into anything.
+
+            A hit additionally carries an optional ``grouped`` key (task 3129)
+            when the record participates in a parent/child group: a CANONICAL
+            gains ``{'amendments': [entries], 'amendment_count', 'sighting_count'}``
+            (each entry ``{'id', 'content', 'created_at', 'kind'}``, its
+            ``content`` capped at ``write_triage.judge_field_chars`` with the
+            counted elision marker, one that contests its parent also marked
+            ``'contested': True``; plus ``'truncated': True`` when the
+            amendment listing is bounded, or
+            ``{'children_unavailable': True, 'error_type'}`` when the child
+            reads failed); a CHILD gains ``{'parent': {'id', ...same block...}}``
+            while keeping its OWN ``content``/``metadata``/``memory_id``.  On
+            that child branch the parent pointer is VERIFIED, so
+            ``grouped['parent_unresolved'] is True`` marks a dangling
+            ``parent_id`` (the parent does not exist) and
+            ``grouped['parent_unavailable'] is True`` (+ ``error_type``) marks a
+            probe that FAILED — i.e. the pointer is unverified, which is not the
+            same claim as unresolved.  The key is OMITTED entirely when the
+            record has no children and is not itself a child, so an ungrouped
+            response is unchanged.
         """
         project_id, err = _canonicalize_project_id_arg(project_id)
         if err:
             return err
         if err := validate_project_id(project_id):
+            return err
+        resolved_from_prefix: str | None = None
+        if is_uuid_prefix(memory_id):
+            match await _resolve_or_respond(_resolver(), project_id, memory_id, serves='mem0'):
+                case _PrefixResponse(body=response):
+                    return response
+                case _ResolvedId(full_id=full_id):
+                    resolved_from_prefix, memory_id = memory_id, full_id
+        elif err := validate_full_uuid(memory_id, field_name='memory_id'):
             return err
         record = await memory_service.get_memory_by_id(
             project_id=project_id,
@@ -2042,6 +5233,8 @@ def create_mcp_server(
                 'memory_id': memory_id,
                 'project_id': project_id,
             }
+            if resolved_from_prefix is not None:
+                miss['resolved_from_prefix'] = resolved_from_prefix
             # A miss may be a DELIBERATE reap rather than a never-existed. The
             # lookup is guarded and the key omitted when empty, so this can
             # only ever add information to an answer that is already correct —
@@ -2071,13 +5264,43 @@ def create_mcp_server(
             if tombstone:
                 miss['tombstone'] = tombstone
             return miss
-        return {
+        hit: dict[str, Any] = {
             'found': True,
             'memory_id': memory_id,
             'project_id': project_id,
             'content': record['content'],
             'metadata': record['metadata'],
         }
+        if resolved_from_prefix is not None:
+            hit['resolved_from_prefix'] = resolved_from_prefix
+        # ADDITIVE ONLY (task 3129): a canonical gains its group; a CHILD keeps
+        # its own content/metadata/memory_id and gains only grouped.parent —
+        # replacing a child's body with its parent's would make a citation
+        # verify against different text.  Guarded and never run on the miss
+        # branch, so — exactly like the tombstone lookup above — it can only add
+        # information to an already-correct answer, never convert a correct
+        # found:True into an error dict.
+        try:
+            grouped = await group_memory_document(
+                memory_service,
+                project_id,
+                memory_id,
+                record,
+                amendment_text_chars=resolve_judge_field_chars(memory_service),
+            )
+        except Exception:
+            logger.warning(
+                'get_memory_by_id: grouped read FAILED for memory_id=%s in project=%s; '
+                'returning the (correct) hit without a grouped block',
+                memory_id,
+                project_id,
+                exc_info=True,
+                extra={'project_id': project_id, 'memory_id': memory_id},
+            )
+            grouped = None
+        if grouped:
+            hit['grouped'] = grouped
+        return hit
 
     @mcp.tool()
     @mcp_tool_errors()
@@ -2189,8 +5412,15 @@ def create_mcp_server(
         want to confirm its identity without the fuzzy/semantic matching that
         can mask duplicate-node pathology.
 
+        An 8-31 lowercase-hex PREFIX naming exactly one Entity node is read
+        through to it (the result gains ``resolved_from_prefix``, as does the
+        NodeNotFoundError, with the resolved ``entity_uuid``, if the node is
+        gone by read time); any other prefix returns get_memory_by_id's miss
+        report, ambiguity refusal or ``resolver_unavailable`` shape instead of
+        a NodeNotFoundError.
+
         Args:
-            entity_uuid: UUID of the Entity node to look up
+            entity_uuid: UUID of the Entity node to look up, or a prefix of one
             project_id: Project scope (required)
             agent_id: Which agent is reading (optional, auto-derived from MCP context)
             session_id: Session context (optional, auto-derived from MCP context)
@@ -2201,6 +5431,26 @@ def create_mcp_server(
             return err
         if err := validate_project_id(project_id):
             return err
+        resolved_from_prefix: str | None = None
+        if is_uuid_prefix(entity_uuid):
+            match await _resolve_or_respond(
+                _resolver(), project_id, entity_uuid, serves='graphiti_node',
+            ):
+                case _PrefixResponse(body=response):
+                    await _log_read(
+                        operation='get_entity_by_uuid',
+                        project_id=project_id,
+                        agent_id=agent_id,
+                        session_id=session_id,
+                        params={'entity_uuid': entity_uuid},
+                        result_summary={
+                            'prefix_checked': response['prefix_checked'],
+                            'outcome': response.get('error_type', 'miss_report'),
+                        },
+                    )
+                    return response
+                case _ResolvedId(full_id=full_id):
+                    resolved_from_prefix, entity_uuid = entity_uuid, full_id
         try:
             result = await memory_service.get_entity_by_uuid(
                 entity_uuid=entity_uuid, project_id=project_id
@@ -2217,6 +5467,8 @@ def create_mcp_server(
                     'has_summary': bool(result.get('summary')),
                 },
             )
+            if resolved_from_prefix is not None:
+                return {**result, 'resolved_from_prefix': resolved_from_prefix}
             return result
         except NodeNotFoundError as e:
             # Expected diagnostic outcome, not a backend failure — this tool
@@ -2231,7 +5483,10 @@ def create_mcp_server(
                 params={'entity_uuid': entity_uuid},
                 result_summary={'found': False},
             )
-            return {'error': str(e), 'error_type': type(e).__name__}
+            miss = {'error': str(e), 'error_type': type(e).__name__}
+            if resolved_from_prefix is not None:
+                miss |= {'entity_uuid': entity_uuid, 'resolved_from_prefix': resolved_from_prefix}
+            return miss
         except Exception as e:
             await _log_read(
                 operation='get_entity_by_uuid',
@@ -2318,6 +5573,8 @@ def create_mcp_server(
         agent_id: str | None = None,
         session_id: str | None = None,
         metadata: dict | None = None,
+        replacement_memory_id: str | None = None,
+        cascade: bool = False,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
         """Delete a specific memory from a store. IRREVERSIBLE.
@@ -2334,6 +5591,23 @@ def create_mcp_server(
         search results and this tool's own response return). Exactly one must
         be provided; supplying both with conflicting values is an error.
 
+        **Every ``store='mem0'`` delete** passes through the citation-repoint
+        gate, whoever issues it (task 3624): task metadata still citing the
+        doomed entry is repointed to *replacement_memory_id* BEFORE the delete
+        runs, and the delete is refused outright if that cannot be done. The
+        gate keys on the record, not the caller — "will this dangle a live
+        pointer?" does not depend on who asked. An uncited entry is unaffected:
+        the scan finds nothing live and the delete proceeds. A delete with no
+        surviving entry to repoint to needs
+        ``metadata={'allow_dangling_citations': True}``. See
+        ``_citation_repoint_gate``.
+
+        **A ``cascade=True`` delete passes every record it would destroy**
+        through that same gate, not just the target (task 3197). The cascade
+        recurses inside the service, below this layer, so without the
+        pre-flight each descendant would be destroyed unchecked — one guarded
+        record and N unguarded ones, reported as a success.
+
         Args:
             store: "graphiti" or "mem0" (from search results)
             project_id: Project scope (required)
@@ -2343,7 +5617,62 @@ def create_mcp_server(
                 memory_id is provided)
             agent_id: Which agent is deleting (optional, auto-derived from MCP context)
             session_id: Session context (optional, auto-derived from MCP context)
-            metadata: Optional key-value pairs (may contain _causation_id for recon)
+            metadata: Optional key-value pairs (may contain _causation_id for
+                recon). Set {'allow_dangling_citations': True} to accept
+                dangling live task citations deliberately, for a drop with no
+                surviving entry to repoint to; only a LITERAL ``True`` counts,
+                the override is recorded at WARNING with every citer it strands,
+                and it does not unlock the fail-closed ``CitationScanFailed``
+                path. The flag is write-time-only and is never forwarded to the
+                store.
+            replacement_memory_id: The SURVIVING entry's full 36-char UUID, when
+                this delete supersedes one duplicate in favour of another.
+                Required for a consolidation delete whose id is still cited by a
+                live task. Three requirements, each checked mechanically:
+                (1) it must be a concrete UUID — a ``search(query=...)``
+                instruction is rejected (``CitationReplacementInvalid``),
+                because re-deriving at read time resolves back to the
+                superseded entries consolidation was collapsing;
+                (2) it must RESOLVE in the store — a well-formed but nonexistent
+                id is refused (``CitationReplacementNotFound``) rather than
+                written into every citation, which would strand them exactly as
+                the delete itself would;
+                (3) it must not be any record THIS call destroys
+                (``CitationReplacementInvalid``) — the id being deleted, or,
+                under ``cascade=True``, any descendant in the cascade set.
+                Forwarding citations to a record the same call destroys
+                reports success while every citation still addresses a
+                destroyed entry. Copy the value from the search/consolidation
+                result rather than reconstructing it.
+            cascade: Delete this record's CHILDREN too (default False).
+                ``store='mem0'`` only — ``metadata.parent_id`` is a Mem0
+                payload key, so a graphiti edge has no children and the
+                combination is REJECTED (``ValidationError``) rather than
+                silently downgraded to a plain delete. The
+                WHOLE cascade is refused — nothing deleted, nothing repointed
+                — if any record it would destroy still has live task citers
+                and neither escape was given
+                (``CascadeCitationGateRejected``, whose ``blocked[]`` names
+                every offending record with its own citers, so the set is
+                fixed in one pass rather than one refusal at a time). Both
+                escapes apply to the ENTIRE cascade set, not just the target:
+                ``replacement_memory_id`` repoints every cited record in it,
+                and ``allow_dangling_citations`` accepts dangling every one of
+                them. A cascade set that cannot be fully enumerated is also
+                refused (``CascadeCitationScanIncomplete``) — a set the gate
+                could not see is one it cannot prove safe, and destroying
+                unchecked records while reporting them verified is worse than
+                not checking at all.
+
+        Deleting a Mem0 entry that other records point at via
+        `metadata.parent_id` REFUSES with `ParentHasChildrenError`, listing
+        the child ids, rather than silently orphaning them. `cascade=true`
+        is the explicit opt-in: the children are deleted first, then this
+        record. The alternative is to reparent or delete the children
+        yourself first. That refusal is checked BEFORE the citation gate
+        repoints anything, so a delete refused for having children has not
+        rewritten any task's metadata either — nothing happened, in both
+        senses.
         """
         agent_id, session_id = _resolve_identity(agent_id, session_id, ctx)
         project_id, err = _canonicalize_project_id_arg(project_id)
@@ -2372,8 +5701,168 @@ def create_mcp_server(
                 'error': (f'Invalid store {store!r}. Must be one of {sorted(_VALID_STORES)}.'),
                 'error_type': 'ValidationError',
             }
+        # `cascade` is MEM0-ONLY, and an unhonourable request is REFUSED rather
+        # than tolerated as a no-op (task 3197 review). A graphiti edge has no
+        # `metadata.parent_id`, so nothing here or in the service could recurse:
+        # the caller got a bare {'status': 'deleted'} for a delete they asked to
+        # cascade, while the reconciliation event recorded `cascade: True` with
+        # an empty child list — an audit trail claiming a cascade was requested
+        # and satisfied when nothing recursive ran. Same posture as the
+        # ignored_override / ignored_replacement_memory_id reporting below:
+        # never drop a caller's instruction in silence.
+        #
+        # The service raises ValueError on the same combination; the check is
+        # repeated here — one rule, two enforcement points, exactly as the
+        # `validate_full_uuid` guard below — because `mcp_tool_errors` flattens
+        # an exception to {'error', 'error_type'} and this envelope names the
+        # remedy. Position mirrors the service's: after the store check, before
+        # the id-shape check, so both layers report a bad store first.
+        if cascade and store != 'mem0':
+            return {
+                'error': (
+                    f'cascade=True is not supported for store={store!r}: '
+                    'parent/child links are the Mem0 payload key '
+                    f'metadata.parent_id, so a {store} record has no children '
+                    'to cascade to. Retry without cascade if a plain delete of '
+                    'this record is what was meant.'
+                ),
+                'error_type': 'ValidationError',
+            }
+        # A truncated id (e.g. an 8-char hex prefix read out of a search-result
+        # snippet) used to produce a fully confirming {'status': 'deleted'},
+        # because both backends treat a miss as "already deleted".  The service
+        # now raises on it too; the check is repeated here — delegating to the
+        # same shared predicate, so there is no second copy of the rule — because
+        # ``mcp_tool_errors`` flattens an exception to {'error', 'error_type'}
+        # and would drop the ``hint`` that tells the caller how to obtain the
+        # real id.
+        #
+        # Position is load-bearing in three directions: AFTER the project_id
+        # prologue (canonicalization stays the first project_id operation),
+        # AFTER the conflict/presence checks (so the more specific "which arg"
+        # errors still win and ``resolved_id`` is non-None), and AFTER the
+        # store check but BEFORE ``_citation_repoint_gate`` — that gate mutates
+        # live task metadata ahead of an irreversible delete, so a malformed id
+        # must never get far enough to drive a repoint.
+        #
+        # Only ``resolved_id`` is validated here.  ``replacement_memory_id`` is
+        # the gate's own argument, answered by its distinct
+        # ``CitationReplacementInvalid``/``NotFound`` contract; the two share
+        # the shape predicate, not the error envelope.
+        #
+        # The label follows the argument the caller actually supplied: telling
+        # someone who passed the documented ``id`` alias that "memory_id must
+        # be a full 36-character UUID" names a parameter they never sent.
+        if err := validate_full_uuid(
+            resolved_id, field_name='memory_id' if memory_id is not None else 'id'
+        ):
+            return err
         causation_id, source, _ = _extract_causation(metadata, agent_id)
-        return await memory_service.delete_memory(
+        # Same write-time override idiom as add_memory's allow_near_duplicate
+        # (see below in this module): read off the RAW envelope, and only a
+        # LITERAL True counts — a truthy 'yes' must not unlock an irreversible
+        # delete.
+        override_supplied = (
+            isinstance(metadata, dict) and 'allow_dangling_citations' in metadata
+        )
+        raw_override = (
+            metadata.get('allow_dangling_citations') if isinstance(metadata, dict) else None
+        )
+        allow_dangling_citations = raw_override is True
+        # Repoint live task-metadata citations BEFORE the irreversible delete.
+        # Order is the whole point: a rejection here never reaches the service
+        # call, so the dangling-pointer window is closed rather than moved.
+        rejection: dict[str, Any] | None = None
+        repoint_stats: dict[str, Any] | None = None
+        cascade_ids: list[str] = []
+        # Scoped to THIS invocation and passed by reference, so the two
+        # cascade passes share one answer about the replacement's existence
+        # instead of re-reading the same Qdrant point once per cited record
+        # per pass. It dies with the call — no module state, no TTL. The
+        # citation scan is deliberately NOT memoized (see
+        # `_scan_task_citations`); this read is not the racy one.
+        replacement_cache: dict[tuple[str, str], Any] = {}
+        # A cascade destroys the whole subtree inside the SERVICE, below this
+        # gate, so the gate has to be applied to the set BEFORE the call —
+        # otherwise every descendant is deleted unchecked. The
+        # `_citation_gate_applies` short-circuit comes FIRST so an inactive
+        # gate pays for no enumeration at all: walking a tree whose result
+        # would be discarded is pure cost.
+        if cascade and _citation_gate_applies(store, project_id):
+            # Descendants first, target LAST — the order the cascade will
+            # destroy them in, so the set that is gated and the sequence that
+            # runs are read the same way. A set that cannot be fully
+            # enumerated refuses here and never reaches the pre-flight.
+            rejection, cascade_ids = await _cascade_enumerate(
+                resolved_id, project_id
+            )
+            if rejection is None:
+                rejection = _cascade_replacement_outside_set(
+                    cascade_ids, resolved_id, replacement_memory_id,
+                )
+            if rejection is None:
+                rejection = await _cascade_citation_preflight(
+                    cascade_ids, resolved_id, store, project_id, agent_id,
+                    replacement_memory_id,
+                    allow_dangling_citations=allow_dangling_citations,
+                    replacement_cache=replacement_cache,
+                )
+        if rejection is None and cascade_ids:
+            # The pre-flight proved the whole set is clearable; now clear it,
+            # in the same deepest-first order, before the delete runs.
+            rejection, repoint_stats = await _cascade_citation_repoint_pass(
+                cascade_ids, store, project_id, agent_id, replacement_memory_id,
+                allow_dangling_citations=allow_dangling_citations,
+                replacement_cache=replacement_cache,
+            )
+        elif rejection is None:
+            # CHILD PRE-FLIGHT for the single-record path (task 3197 review),
+            # the non-cascade counterpart of `_cascade_enumerate` running
+            # before `_cascade_citation_preflight`. The gate below mutates
+            # live task metadata; the service's child refusal fires AFTER it.
+            # So a delete of a cited PARENT used to repoint every citation to
+            # the replacement and only then be refused with
+            # ParentHasChildrenError — mutation left behind by an operation
+            # that reported failure, contradicting the service's own "a
+            # refused delete leaves nothing claiming a deletion happened".
+            # The raise propagates to `mcp_tool_errors`, which produces the
+            # identical wire envelope the service's own refusal does, because
+            # it IS the same refusal (one home for its construction, INV-5).
+            #
+            # Charged only where the gate has something to lose: the mutating
+            # arm needs a replacement_memory_id, and the override arm logs a
+            # WARNING naming citations it claims to have dangled on a delete
+            # that then never happened. A plain uncited delete — the common
+            # path, and every one of the six in-repo recon callers — pays
+            # nothing extra.
+            if _citation_gate_applies(store, project_id) and (
+                replacement_memory_id is not None or allow_dangling_citations
+            ):
+                await memory_service.refuse_if_children(
+                    resolved_id, project_id=project_id
+                )
+            rejection, repoint_stats = await _citation_repoint_gate(
+                resolved_id, store, project_id, agent_id, replacement_memory_id,
+                allow_dangling_citations=allow_dangling_citations,
+            )
+        if rejection:
+            # The `is True` strictness above is right, but dropping a
+            # non-conforming value in SILENCE is not: the caller would get back
+            # a refusal whose hint tells them to pass the flag they believe they
+            # just passed, and would retry into the same wall. Name the value
+            # that was ignored instead (loud-over-silent-degradation). A literal
+            # False is a deliberate "no", not a malformed yes, so it is honoured
+            # without comment — this fires only for a non-boolean value.
+            if override_supplied and not isinstance(raw_override, bool):
+                rejection = {
+                    **rejection,
+                    'ignored_override': {'allow_dangling_citations': raw_override},
+                    'hint': ' '.join(
+                        p for p in (rejection.get('hint'), _IGNORED_DANGLING_OVERRIDE_HINT) if p
+                    ),
+                }
+            return rejection
+        result = await memory_service.delete_memory(
             memory_id=resolved_id,
             store=store,
             project_id=project_id,
@@ -2381,6 +5870,1142 @@ def create_mcp_server(
             session_id=session_id,
             causation_id=causation_id,
             _source=source,
+            cascade=cascade,
+        )
+        if repoint_stats and isinstance(result, dict):
+            result = {**result, **repoint_stats}
+        return result
+
+    @mcp.tool()
+    @mcp_tool_errors()
+    async def update_memory(
+        memory_id: str,
+        store: str,
+        project_id: str,
+        content: str | None = None,
+        metadata_patch: dict | None = None,
+        metadata_delete_keys: list[str] | None = None,
+        metadata_mode: str = 'merge',
+        reason: str | None = None,
+        agent_id: str | None = None,
+        session_id: str | None = None,
+        metadata: dict | None = None,
+        ctx: Context | None = None,
+    ) -> dict[str, Any]:
+        """Amend a Mem0 memory's content and/or patch its metadata IN PLACE.
+
+        The Qdrant point id is preserved, so the record keeps its identity and
+        every reference to it stays valid. Use this to correct a record or tag
+        it for a deterministic (non-semantic) `get_memories_by_metadata` lookup,
+        instead of delete-then-re-add, which mints a new id.
+
+        Mem0 only. `store='graphiti'` is rejected — use `update_edge`.
+
+        NAMING (deliberate, do not "fix"): `metadata_patch` is the record
+        payload you are writing; `metadata` is the causation/envelope kwarg
+        every other tool takes and is NEVER stored on the record. The envelope
+        is consumed for causation and never written; `metadata_patch` is record
+        payload and is never read for causation.
+
+        At least one arm is required. Contradictory or under-specified argument
+        sets are rejected LOUD, naming the offending argument — nothing is
+        silently dropped: a mem0-owned key in either metadata list, the same key
+        in both lists, and `metadata_mode='replace'` without a non-empty
+        `metadata_patch` (an empty replace would delete every custom key).
+
+        A well-formed argument set can still be turned away, by a SECOND and
+        later rejection class (task 3523): `metadata_patch` is validated
+        against the Mem0 metadata vocabulary at the service seam — the same
+        one `add_memory` and `add_system_record` go through — so an
+        off-vocabulary `topic` spelling, or a second `canonical` for a topic
+        already taken, is refused there rather than written. The checks above
+        are decided BEFORE dispatch; this one after, and only for a metadata
+        arm (a content-only amend is exempt, and an existing violation the
+        patch does not touch is not re-judged).
+
+        Both surface the way every other failure of this tool does — as an
+        `{'error', 'error_type'}` envelope, never as a `status='updated'`
+        success — because `@mcp_tool_errors()` converts the service seam's
+        `MemoryMetadataValidationError` / `CanonicalUniquenessViolation` for
+        us. It wraps `add_memory` and `add_system_record` identically, so a
+        seam rejection reads the same on every write path. `error_type` names
+        the exact class and is the whole of that distinction at this layer: a
+        caller cannot `except` an envelope, so collapsing either into a shared
+        'ValidationError' would erase a difference PRD V1 requires — malformed
+        metadata is fixable by reshaping the patch, a canonical collision is
+        not, and its message names the incumbent record to go look at.
+
+        Args:
+            memory_id: The memory ID (from search results)
+            store: Must be "mem0"
+            project_id: Project scope (required)
+            content: New content text (the amend arm). Re-embeds the record.
+            metadata_patch: Metadata keys to write (the patch arm)
+            metadata_delete_keys: Metadata keys to remove. There is no magic
+                deletion sentinel: a key is deleted iff it is named here.
+            metadata_mode: "merge" (default) or "replace". Replace swaps the
+                custom-provenance subset only — mem0-owned keys survive.
+            reason: Why the record is being amended. Required with `content`.
+            agent_id: Which agent is updating (optional, auto-derived from MCP context)
+            session_id: Session context (optional, auto-derived from MCP context)
+            metadata: Optional key-value pairs (may contain _causation_id for recon)
+        """
+        # (1) Identity first — nothing downstream can gate an unresolved agent_id.
+        agent_id, session_id = _resolve_identity(agent_id, session_id, ctx)
+
+        # (1b) Arm PRESENCE only — the gate below asks "is this caller
+        # authorized for THESE arms", which is not a question an argument set
+        # naming no writable arm can answer. Reads no config and touches no
+        # service state, so an unauthorized caller still learns nothing about
+        # the system; see _update_memory_arm_presence_error for the full
+        # rationale, and note the resolver keeps its own no-arm denial as a
+        # fail-closed backstop.
+        if err := _update_memory_arm_presence_error(
+            content=content,
+            metadata_patch=metadata_patch,
+            metadata_delete_keys=metadata_delete_keys,
+            metadata_mode=metadata_mode,
+        ):
+            return err
+
+        # (2) Authorization immediately next, BEFORE project canonicalization,
+        # store validation or the remaining arm validation. In-place amendment
+        # is a silent-rewrite primitive, so this gate is the whole point of the
+        # tool: an unauthorized caller is turned away before any work is done on
+        # its behalf, and learns nothing about the validity of its other
+        # arguments. Same ordering rationale add_system_record records for its
+        # own gate.
+        decision = resolve_mem0_update_authorization(
+            memory_service,
+            agent_id=agent_id,
+            content_amend=content is not None,
+            metadata_patch=bool(metadata_patch or metadata_delete_keys),
+        )
+        if not decision.allowed:
+            return {
+                'error': decision.error,
+                'error_type': decision.error_type,
+                'agent_id': agent_id,
+            }
+
+        # (3) delete_memory's prologue verbatim. NO _backlog_gate: that gate is
+        # for tools creating new backlog pressure (add_memory, add_system_record);
+        # this one mutates an existing record and creates none.
+        project_id, err = _canonicalize_project_id_arg(project_id)
+        if err:
+            return err
+        if err := validate_project_id(project_id):
+            return err
+        if err := _known_project_gate(project_id):
+            return err
+
+        # (4) Store validation. A valid-but-wrong 'graphiti' is named rather
+        # than silently fanned out — every search result carries a store field,
+        # so a caller updating a record it just found calls this the same way it
+        # calls delete_memory, and a wrong value is actionable.
+        if store not in _VALID_STORES:
+            return {
+                'error': (f'Invalid store {store!r}. Must be one of {sorted(_VALID_STORES)}.'),
+                'error_type': 'ValidationError',
+            }
+        if store != SourceStore.mem0.value:
+            return {
+                'error': (
+                    f'update_memory does not support store={store!r}. In-place '
+                    'amendment is Mem0-only; use update_edge to change a '
+                    'Graphiti edge fact.'
+                ),
+                'error_type': 'ValidationError',
+            }
+
+        # (5-7) Arm validation. ALL of it completes before any dispatch, so a
+        # rejected call cannot have mutated anything — the point the stateful
+        # fake in tests/test_update_memory_tool.py exists to pin.
+        #
+        # Posture copied from update_edge's invalid_at/clear_invalid_at
+        # mutual-exclusivity check: a contradictory or under-specified argument
+        # set is rejected LOUD, naming the offending argument. Nothing is
+        # silently dropped or coerced — a caller must never come away believing
+        # it wrote something it did not.
+        if err := _validate_update_memory_arms(
+            content=content,
+            metadata_patch=metadata_patch,
+            metadata_delete_keys=metadata_delete_keys,
+            metadata_mode=metadata_mode,
+            reason=reason,
+        ):
+            return err
+
+        causation_id, source, _ = _extract_causation(metadata, agent_id)
+        return await memory_service.update_memory(
+            memory_id=memory_id,
+            project_id=project_id,
+            content=content,
+            metadata_patch=metadata_patch,
+            metadata_delete_keys=metadata_delete_keys,
+            metadata_mode=metadata_mode,
+            reason=reason,
+            agent_id=agent_id,
+            session_id=session_id,
+            causation_id=causation_id,
+            _source=source,
+        )
+
+    @mcp.tool()
+    @mcp_tool_errors()
+    async def consolidate_memories(
+        canonical_content: str,
+        topic: str,
+        project_id: str,
+        supersedes: list[str] | None = None,
+        retain: list[str] | None = None,
+        run_id: str | None = None,
+        category: str | None = None,
+        agent_id: str | None = None,
+        session_id: str | None = None,
+        metadata: dict | None = None,
+        ctx: Context | None = None,
+    ) -> dict[str, Any]:
+        """Fold a duplicate cluster into ONE canonical entry. IRREVERSIBLE.
+
+        Replaces the hand-rolled write-then-delete choreography that made
+        consolidation a RATCHET: a canonical write plus unordered deletes
+        with no verification nets +1 entry per failed pass, which is how a
+        cluster ends up containing the consolidator's own prior canonicals.
+        The cure is the ORDERING below plus a closure that is corroborated
+        by a live re-read rather than inferred from "the delete returned ok".
+
+        Ordering is the contract — each step sits where it does because of
+        what its failure would cost:
+
+        (1) Authorize the metadata-patch arm. Unconditional and fail-closed,
+            before any other work, so an unauthorized caller is turned away
+            before it learns anything about its arguments (the order and
+            reason ``update_memory`` uses).
+        (2) Validate every argument, project scope first and then the op's
+            own shape. Pure, zero writes: an argument set that cannot be
+            executed safely is refused while refusing is free.
+        (3) Pre-flight and repoint task-metadata citations across the whole
+            delete set. A refused op has mutated nothing.
+        (4) Write the canonical — BEFORE any destructive step, so a
+            uniqueness violation or a metadata rejection costs zero deletes.
+        (5) Tag the retained peers in place, then, per supersede: read it
+            (for the tombstone), reparent its children onto the canonical,
+            corroborate that, then delete.
+        (6) Re-query deterministically — never `search`, whose top-N cutoff
+            can silently omit the record just written.
+        (7) Tombstone the confirmed-gone set, then narrow the canonical's own
+            ``metadata.supersedes`` to that same set.
+        (8) Report structurally: anything that did not happen is named.
+
+        Step (3) is the same tool-layer gate ``delete_memory`` runs, in two
+        passes over the supersedes: the non-mutating ``scan_only`` pre-flight
+        above the canonical write, then the real repoint below it. The split
+        is what lets the canonical be the repoint target: a consolidation
+        ALWAYS has a concrete survivor, and the canonical satisfies the
+        gate's "the replacement must not be a record this call destroys" rule
+        by construction, being the one record this op creates. So the "you
+        named no survivor" refusal is unreachable here and no
+        dangling-citation escape is offered; the reachable refusal is a scan
+        that could not be completed, which fails closed.
+
+        WHAT "A REFUSED CONSOLIDATION LEAVES THE CORPUS BYTE-IDENTICAL"
+        COVERS, exactly: refusals from steps (1)-(4) — authorization,
+        validation, the ``scan_only`` pre-flight and the canonical write
+        itself. It does NOT extend to a per-id refusal below step (4). The
+        MUTATING repoint pass runs over the whole delete set immediately
+        after the canonical write, before it is known whether any given id's
+        delete can be EARNED, so an id later refused for a non-citation
+        reason (``ChildScanFailed``, ``ReparentIncomplete``, a raised delete,
+        or a survivor) has ALREADY had its live task citations rewritten from
+        it onto the canonical while it is still in the corpus. That is
+        deliberate and it is the recoverable direction — the citation now
+        names a record that exists and states the merged claim, rather than
+        one that may be deleted moments later — but it is a mutation, so a
+        partial run is not a no-op. A test pins the observed behaviour.
+
+        UNDER ``metadata.enforce = True`` (NOT the shipped default), one
+        shape of this op's own flagship case refuses outright: a supersede
+        that is ITSELF the topic's incumbent canonical. The incumbent is
+        still alive when step (4) probes uniqueness — it cannot be otherwise,
+        since nothing destructive may precede the write — so the probe finds
+        it and ``add_memory`` raises ``CanonicalUniquenessViolation`` naming
+        it as ``incumbent_id``, and nothing is deleted. That case is COMMON,
+        not exotic: "a cluster ends up containing the consolidator's own
+        prior canonicals" is the ratchet this op exists to end. Recovery is
+        to demote the incumbent first (``update_memory`` with
+        ``metadata_patch={'canonical': False}``) and re-run, or to leave it
+        out of ``supersedes`` and fold the rest. It is NOT demoted here:
+        every mutation would have to precede the canonical write, breaking
+        the ordering that makes a net-loss impossible. Under the shipped
+        ``enforce=False`` default the write proceeds with a census line and
+        this op's own delete arm then reaps the incumbent, closing the
+        duplicate inside the same call.
+
+        THERE IS NO RESUME ARM, and ``'partial'`` is not a retry signal. This
+        op takes no existing canonical id, so a second call for the same
+        (project, topic) writes a SECOND canonical — censused but ADMITTED
+        under the shipped warn-mode default, which is precisely the
+        +1-per-pass ratchet. A partial result is finished BY HAND: fix what
+        the failure lists name, then ``delete_memory`` per still-listed id
+        (it runs this same citation gate and child guard) and
+        ``update_memory`` for any peer that was not tagged. The envelope
+        carries that procedure in its ``hint`` so the caller who needs it
+        does not have to find this docstring.
+
+        Step (6) is deterministic Qdrant work ONLY: a ``get_memory_by_id``
+        point read per supersede for ``survivors``, and one
+        ``get_memories_by_metadata({'topic': T})`` scroll for the closure
+        listing. ``MemoryService.search`` is never called, and a test pins
+        that negative. A semantic top-k probe would re-assert the ranking
+        premise this whole campaign exists to fix — run live during the
+        original incident, the re-derive query returned only superseded
+        cluster members — and it could silently omit the canonical this call
+        just wrote. Retrievability monitoring is a separate job; a closure
+        proof must not be a ranking guess.
+
+        Args:
+            canonical_content: The consolidated record's text — the single
+                claim the surviving canonical will state.
+            topic: The cluster's topic slug, validated against the ONE
+                namespace shared with ``ProceduralTopicCluster.topic_id``
+                (see ``fused_memory.topic_slug``).
+            project_id: Project scope (required).
+            supersedes: Ids to FOLD AND DELETE. Each is reparented, deleted
+                and then re-read to confirm it is actually gone. LIST EACH ID
+                ONCE: a repeat within either arm is refused by name (both
+                slots), never de-duplicated for you, because a repeat would
+                be deleted twice, claimed twice by the canonical, and counted
+                twice against a ledger that stores it once.
+            retain: Ids to TAG IN PLACE — stamped with the cluster's topic
+                and never deleted. The ratified default arm (gate 3200).
+                They become PEERS of the canonical, not children: they get
+                `topic` only, never `canonical` and never `parent_id`.
+                Tagging preserves the Qdrant point id, so every reference
+                already aimed at a peer stays valid; that id stability is
+                the whole reason to retain rather than fold. Retained ids
+                never appear in the canonical's `metadata.supersedes` —
+                they were not replaced, and saying they were would point
+                readers away from records that are still live and correct.
+            run_id: The reconciliation run PERFORMING this consolidation.
+                Required whenever ``supersedes`` is non-empty: it is stamped
+                as each tombstone's ``deleting_run_id``. Deliberately
+                distinct from the victims' own ``metadata.run_id``, which
+                names the run that WROTE them — conflating the two is what
+                made the original finding unreadable, so a delete that
+                cannot be attributed is refused rather than guessed at.
+            category: Category for the canonical write (optional).
+            agent_id: Which agent is consolidating (optional, auto-derived
+                from MCP context).
+            session_id: Session context (optional, auto-derived).
+            metadata: Extra key-value pairs merged into the canonical's
+                metadata (may carry _causation_id for recon).
+
+        Returns:
+            ``{'status', 'canonical_id', 'canonical_supersedes', 'topic',
+            'deleted', 'failed_deletes', 'retained', 'retain_failures',
+            'reparented', 'reparent_failures', 'survivors',
+            'survivor_check_failed', 'topic_members',
+            'topic_members_truncated', 'topic_members_available',
+            'tombstones_written', 'tombstones_expected', ...}``.
+            ``survivors`` is the load-bearing one: ids whose delete reported
+            success but which STILL RESOLVE on the re-read.
+
+            ``canonical_supersedes`` is what the canonical DURABLY CLAIMS to
+            have replaced, which is not always what was requested. The field
+            is stamped at write time with the requested set — the write must
+            precede every delete — so on a partial run it would name records
+            that are still live and still stating their own claim. Step (7)
+            therefore patches it DOWN to the corroborated-gone set, the same
+            set the tombstones are stamped for, and reports the narrowing
+            under ``supersedes_correction`` (present only when one was
+            needed). If that patch itself fails, the outcome says so and
+            ``canonical_supersedes`` keeps showing the wider set the record is
+            really carrying — the claim in the corpus, never the intent.
+
+            ``survivor_check_failed`` is its third sibling: an id whose
+            corroborating read did not answer was neither observed alive nor
+            proven gone, so it is claimed as neither — it is not tombstoned,
+            and it makes the op ``'partial'``, because corroborated closure
+            is the deliverable. ``topic_members_available`` is ``False``
+            when the closure scroll itself could not be read, which is what
+            keeps an empty listing from being misread as "this topic has no
+            members".
+
+            ``topic_members`` rows are ``{'id', 'canonical'}`` only, so a
+            dumping-ground topic cannot push this envelope past the MCP
+            transport limit; the full record is one ``get_memory_by_id`` away.
+
+            The tombstone counts are reported as a PAIR and deliberately do
+            NOT affect ``status``: a shortfall means the consolidation
+            completed but its audit trail did not land, and ``'partial'``
+            would invite a retry of a COMPLETED merge — re-writing a
+            canonical whose supersedes are already gone, the exact ratchet
+            this op ends.
+
+            ``topic_cluster_seed`` is present only when a topic-cluster store
+            is wired: the outcome (``seeded``/``skipped``/``failed``/
+            ``disabled``) of teaching the write-time topic guard this topic,
+            outside the status rule for the tombstone counts' reason.
+            ``disabled`` covers both the global switch and a topic retired
+            for this project.
+        """
+        agent_id, session_id = _resolve_identity(agent_id, session_id, ctx)
+        # (1) AUTHORIZE before any other work, mirroring `update_memory`'s
+        # ordering and for its stated reason: an unauthorized caller is
+        # turned away before anything is done on its behalf and before it
+        # learns anything about the system.
+        #
+        # UNCONDITIONAL, deliberately — not conditioned on a non-empty
+        # `retain`. The retain arm is not the only metadata patch this op
+        # performs: reparenting stamps `parent_id` on children that are only
+        # DISCOVERED after the canonical exists. A gate that waited for the
+        # first patch would therefore deny mid-transaction, with a canonical
+        # already written and a cluster half-folded.
+        #
+        # `content_amend=False` is load-bearing. This op writes new records
+        # and stamps metadata; it never rewrites an existing record's text.
+        # Requesting an arm it does not use would make the deliberately wider
+        # metadata bar a back door into a silent-rewrite primitive — the one
+        # thing the resolver's two-arm split exists to prevent.
+        decision = resolve_mem0_update_authorization(
+            memory_service,
+            agent_id=agent_id,
+            content_amend=False,
+            metadata_patch=True,
+        )
+        if not decision.allowed:
+            return {
+                'error': decision.error,
+                'error_type': decision.error_type,
+                'agent_id': agent_id,
+            }
+        # (2) VALIDATE: project scope, then the op's own arguments.
+        project_id, err = _canonicalize_project_id_arg(project_id)
+        if err:
+            return err
+        if err := validate_project_id(project_id):
+            return err
+        if err := _known_project_gate(project_id):
+            return err
+        # RETURNED, never raised: `mcp_tool_errors` flattens an exception to
+        # {'error', 'error_type'} and would drop the `hint` that tells the
+        # caller how to fix the arguments.
+        err, supersedes_ids, retain_ids = validate_consolidate_args(
+            canonical_content=canonical_content,
+            topic=topic,
+            supersedes=supersedes,
+            retain=retain,
+            run_id=run_id,
+        )
+        if err:
+            return err
+        # LOAD-BEARING, unlike add_episode's defensive strip: `cleaned_meta` is
+        # the BASE of the canonical's own metadata, so without this the write-time
+        # control flag is written into the one record this IRREVERSIBLE op
+        # creates to outlive the whole cluster it folds. The boundary guard
+        # cannot do this for us — MarkupGuardMiddleware._apply_override
+        # forwards `allow_mcp_markup` UNCHANGED to any tool DECLARING a
+        # `metadata` parameter, by design, so the tool body remains the party
+        # that keeps it out of the corpus.
+        #
+        # Placed immediately before `_extract_causation` because that call is
+        # the single point where the caller's `metadata` becomes persisted
+        # state: stripping here cannot be bypassed by a later edit that adds
+        # another persistence path off `cleaned_meta`.
+        # The uuid-prefix guard forwards allow_uuid_prefix the same way, so it
+        # is stripped here too.
+        metadata = strip_markup_override(metadata)
+        metadata = strip_uuid_prefix_override(metadata)
+        causation_id, source, cleaned_meta = _extract_causation(metadata, agent_id)
+
+        # (3) CITATION PRE-FLIGHT over the whole delete set — the same gate
+        # `delete_memory` runs, in its non-mutating `scan_only` mode, reached
+        # through the same closure (INV-5: a second scanner would drift, and
+        # the drift would be silent because both halves would still "work").
+        #
+        # It runs HERE, above the canonical write, so a set that cannot be
+        # cleared costs nothing at all: no canonical, no repoint, no delete.
+        # Going under the gate instead — calling `MemoryService.delete_memory`
+        # directly — is the failure task 3197 documents: one guarded record
+        # and N unguarded ones, reported as a success.
+        #
+        # `replacement_cache` memoizes only the replacement-existence probe,
+        # and only for this invocation. The citation scan itself stays LIVE
+        # per id on both passes; that read IS the fail-closed guarantee.
+        replacement_cache: dict[tuple[str, str], Any] = {}
+        blocked: list[dict[str, Any]] = []
+        for supersede_id in supersedes_ids:
+            rejection, _ = await _citation_repoint_gate(
+                supersede_id,
+                'mem0',
+                project_id,
+                agent_id,
+                None,
+                scan_only=True,
+                replacement_cache=replacement_cache,
+            )
+            # Collect EVERY blocker rather than refusing at the first. A
+            # consolidation set is a cluster by construction, so refusing one
+            # id at a time would cost N refuse-fix-retry round trips and leave
+            # the caller to re-derive the rest by hand.
+            if (
+                rejection
+                and rejection.get('error_type')
+                != _PREFLIGHT_DEFERRED_CITATION_REFUSAL
+            ):
+                blocked.append(rejection)
+        if blocked:
+            return {
+                'error': (
+                    f'{len(blocked)} of the {len(supersedes_ids)} record(s) this '
+                    'consolidation would delete could not be cleared for live '
+                    'task citations. Nothing was written and nothing was deleted.'
+                ),
+                'error_type': 'ConsolidationCitationGateRejected',
+                'topic': topic,
+                'blocked': blocked,
+                'hint': _CONSOLIDATE_GATE_HINT,
+            }
+
+        # (4)+(5a) THE RETAIN ARM's writes: mint the canonical, tag the
+        # retained peers. The auto-consolidation executor reaches the same
+        # function through `execute_retain_consolidation`, so the two
+        # callers cannot drift.
+        #
+        # A refusal is returned UNCHANGED: every one is decided before any
+        # peer is read or patched, so there is no partial state for this
+        # body to describe.
+        retain_arm = await apply_retain_arm(
+            memory_service,
+            project_id=project_id,
+            topic=topic,
+            canonical_content=canonical_content,
+            retain_ids=retain_ids,
+            category=category,
+            agent_id=agent_id,
+            run_id=run_id,
+            extra_canonical_meta={
+                **(cleaned_meta or {}),
+                'supersedes': list(supersedes_ids),
+            },
+            session_id=session_id,
+            causation_id=causation_id,
+            source=source,
+        )
+        if isinstance(retain_arm, RetainArmRefused):
+            return retain_arm.response
+        canonical_id = retain_arm.canonical_id
+
+        # (3b) The MUTATING repoint pass, now that the replacement EXISTS.
+        # The canonical satisfies the gate's "the replacement must not be a
+        # record this call destroys" rule by construction: it is the one
+        # record this op creates, and it is not in the supersedes set.
+        #
+        # Per id rather than through `_cascade_citation_repoint_pass`, which
+        # is deliberately all-or-nothing: a cascade is ONE intent over a
+        # subtree, so a single unclearable record refuses the whole thing. A
+        # consolidation is N independent folds, and refusing all of them
+        # because one citer could not be rewritten would discard the folds
+        # that are already safe — and re-running to recover them would
+        # re-write the canonical, which is the +1-per-pass ratchet this op
+        # exists to end.
+        citation_repoint: dict[str, Any] = {}
+        citation_blocked: dict[str, dict[str, Any]] = {}
+        for supersede_id in supersedes_ids:
+            rejection, stats = await _citation_repoint_gate(
+                supersede_id,
+                'mem0',
+                project_id,
+                agent_id,
+                canonical_id,
+                replacement_cache=replacement_cache,
+            )
+            if rejection:
+                citation_blocked[supersede_id] = rejection
+                continue
+            if stats:
+                # Same per-id shape as `cascade_citation_repoint`, so a caller
+                # reads one vocabulary across both tools. `outcome` is always
+                # 'repointed' here: it distinguishes a rewrite from a
+                # knowingly-dangled citation, and this op never passes the
+                # dangling override — it always has a replacement.
+                citation_repoint[supersede_id] = {**stats, 'outcome': 'repointed'}
+
+        deleted: list[str] = []
+        failed_deletes: list[dict[str, Any]] = []
+        survivors: list[str] = []
+        reparented: list[dict[str, Any]] = []
+        reparent_failures: list[dict[str, Any]] = []
+        # Pre-delete snapshots, keyed by id. Populated BEFORE each delete and
+        # consumed only for the ids the re-read confirms gone.
+        victims_by_id: dict[str, dict[str, Any]] = {}
+        # The superseded texts, for the topic-guard seed at (7c). Kept apart
+        # from `victims_by_id`, which feeds tombstone rows.
+        superseded_texts: list[str] = []
+        for supersede_id in supersedes_ids:
+            rejection = citation_blocked.get(supersede_id)
+            if rejection:
+                # Its citers could not be rewritten, so deleting it would
+                # strand exactly the pointers the gate protects. ONLY this
+                # id's delete is suppressed — the rest of the cluster still
+                # folds — and it is reported twice on purpose: in
+                # `failed_deletes` (what did not happen, and why) and in
+                # `survivors` (what is still in the corpus).
+                failed_deletes.append({
+                    'id': supersede_id,
+                    'error': rejection.get('error'),
+                    'error_type': rejection.get('error_type'),
+                })
+                continue
+
+            # (5b) READ THE VICTIM WHILE IT STILL EXISTS. A tombstone needs
+            # the record's metadata and created_at, and there is NO read path
+            # to a deleted point id — so this capture cannot be deferred to
+            # the delete's success branch. Same reason `_sweep_stale_mem0_pool`
+            # keeps full member dicts rather than bare ids.
+            #
+            # A supersede that does not resolve here still gets a victim dict
+            # with `metadata=None`: the writer tolerates that, and the id
+            # itself is the field an auditor actually queries by.
+            #
+            # A read that FAILS degrades to the same shape and the delete
+            # still proceeds: this read is tombstone ENRICHMENT, and letting
+            # an enrichment miss veto a fold would trade two audit fields for
+            # the consolidation itself. Unguarded, the propagated TimeoutError
+            # would escape to `@mcp_tool_errors` and flatten the whole
+            # envelope — losing every other id's disposition too.
+            try:
+                victim_record = await memory_service.get_memory_by_id(
+                    project_id=project_id, memory_id=supersede_id
+                )
+            except Exception:
+                logger.warning(
+                    'consolidate_memories: could not read %s before deleting it; '
+                    'its tombstone will carry the id alone, without metadata or '
+                    'created_at',
+                    supersede_id,
+                    exc_info=True,
+                    extra={'project_id': project_id, 'run_id': run_id},
+                )
+                victim_record = None
+            # `created_at` comes out of the PAYLOAD, not off the top level, and
+            # the two are not interchangeable: `get_memory_by_id` returns
+            # {'id', 'content', 'metadata'} where metadata is the FULL
+            # unprocessed Qdrant payload, whereas `get_memories_by_metadata`
+            # returns a flat `created_at` because `scroll_by_metadata` LIFTS
+            # the field and `get_point_by_id` does not. Reading a top-level key
+            # here records None and silently drops one of the tombstone's three
+            # fields — in the very change whose purpose is making a dead id
+            # answerable. Do NOT "simplify" this back to a top-level `.get()`,
+            # and do NOT widen `get_memory_by_id` to lift the field: its return
+            # contract is documented verbatim and depended on elsewhere, so
+            # fixing one caller there would put the change in the wrong layer.
+            # The two recon sweeps are unaffected — they source victims from
+            # the scroll, which lifts it.
+            victim_payload = (victim_record or {}).get('metadata')
+            victim_content = (victim_record or {}).get('content')
+            if isinstance(victim_content, str) and victim_content:
+                superseded_texts.append(victim_content)
+            victims_by_id[supersede_id] = {
+                'id': supersede_id,
+                'metadata': victim_payload,
+                'created_at': (victim_payload or {}).get('created_at'),
+            }
+
+            # (5c) RE-HOME THIS SUPERSEDE'S CHILDREN, THEN delete it. The
+            # order is not a preference: a child re-pointed AFTER its parent
+            # died was an orphan for the interval between, and a crash inside
+            # that interval leaves it one permanently — the child still names
+            # the dead parent, and no read path reaches a deleted point to
+            # learn what it was. Moving the pointer while BOTH ends still
+            # exist is the only sequencing that cannot strand anything.
+            #
+            # DIRECT children only (`list_child_ids`, not
+            # `list_descendant_ids`): re-pointing the top layer preserves the
+            # deeper subtree's internal structure, whereas flattening every
+            # descendant onto the canonical would destroy the hierarchy the
+            # records themselves encode.
+            #
+            # THIS READ FAILS CLOSED, unlike the victim capture above. A
+            # listing that did not ANSWER is not a listing that said "no
+            # children": treating a propagated timeout as an empty scan would
+            # delete the parent and orphan whatever it had, permanently, since
+            # no read path reaches a deleted point to learn what the child
+            # named. The refusal keeps the supersede alive and NAMED, which a
+            # caller can retry; the alternative cannot be undone by anyone.
+            try:
+                scan = await memory_service.list_child_ids(
+                    supersede_id, project_id=project_id
+                )
+            except Exception as exc:
+                failed_deletes.append({
+                    'id': supersede_id,
+                    'error': (
+                        f'refused to delete {supersede_id}: its child listing '
+                        f'could not be read ({exc}), so it cannot be shown to be '
+                        'childless'
+                    ),
+                    'error_type': 'ChildScanFailed',
+                })
+                continue
+
+            # (5c-i) A REFUSAL ALREADY DETERMINED COSTS ZERO MUTATIONS.
+            # `scan.truncated` is known the instant the listing returns, and it
+            # refuses this id's delete unconditionally — so re-pointing the
+            # children we CAN see first buys nothing and costs a real write per
+            # child: each patch moves a child onto the canonical while its
+            # actual parent stays alive and un-deleted, splitting that subtree
+            # across two live parents. Nothing in the envelope would let a
+            # caller tell those moves were pointless, because they are reported
+            # in `reparented` exactly like the ones that earned a delete.
+            # `MemoryService.list_child_ids`' own docstring argues against
+            # precisely this — "reparenting records whose own parent is still
+            # alive — a pointer rewrite nothing asked for".
+            #
+            # Same refusal and same `error_type` as the blocker it replaces
+            # below, and — WHEN TRUNCATION IS THE ONLY BLOCKER — byte-identical
+            # wording. That qualifier is not pedantry. Previously a victim
+            # could be BOTH truncated and stranded, and the joined message
+            # carried both clauses while `reparented`/`reparent_failures`
+            # named the children the loop had moved and failed to move. Those
+            # mutations no longer happen, so the report no longer describes
+            # them: the stranded clause is now unreachable under truncation by
+            # construction. Reporting moves that were never made would be the
+            # overclaim; losing the clause is the point, not a regression.
+            #
+            # "at least" stays load-bearing — the scan was capped, so the count
+            # is a FLOOR, and reporting it bare would read as exhaustive.
+            if scan.truncated:
+                failed_deletes.append({
+                    'id': supersede_id,
+                    'error': (
+                        f'refused to delete {supersede_id}: deleting it would '
+                        'orphan its children — the child listing was truncated '
+                        f'at least {len(scan.ids)} child(ren) in, so the full '
+                        'set could not be seen'
+                    ),
+                    'error_type': 'ReparentIncomplete',
+                })
+                continue
+
+            moved_children: list[str] = []
+            stranded_children: list[str] = []
+            for child_id in scan.ids:
+                # `parent_id` ONLY, and no content: the child's own claim is
+                # not this op's to rewrite, so nothing is re-embedded and no
+                # other metadata is disturbed.
+                #
+                # A RAISE IS THE SAME EVENT AS A RETURNED REJECTION, and is
+                # recorded identically: either way this child was NOT re-homed,
+                # so it strands and refuses ITS PARENT'S delete below. Letting a
+                # backend timeout propagate instead would be strictly worse than
+                # any per-id failure — this loop runs INTERLEAVED with the
+                # deletes, so the raise would escape to `@mcp_tool_errors` and
+                # flatten the envelope, destroying the dispositions of
+                # supersedes that are ALREADY IRREVERSIBLY DELETED and skipping
+                # their tombstone write entirely. Those records would then be
+                # gone with no forward pointer and no tombstone: exactly the
+                # indistinguishable-from-silent-data-loss hole the delete arm's
+                # tombstone contract exists to close.
+                failure = await patch_memory_metadata(
+                    memory_service,
+                    memory_id=child_id,
+                    project_id=project_id,
+                    patch={'parent_id': canonical_id},
+                    agent_id=agent_id,
+                    session_id=session_id,
+                    causation_id=causation_id,
+                    source=source,
+                )
+                if failure:
+                    stranded_children.append(child_id)
+                    reparent_failures.append({
+                        'child_id': child_id,
+                        'from': supersede_id,
+                        'to': canonical_id,
+                        **failure,
+                    })
+                    continue
+                moved_children.append(child_id)
+                reparented.append({
+                    'child_id': child_id,
+                    'from': supersede_id,
+                    'to': canonical_id,
+                })
+
+            # (5d) THE DELETE IS EARNED, NOT ASSUMED. Three distinct ways the
+            # re-homing can fail to be PROVEN complete, and any one of them
+            # refuses this id's delete:
+            #
+            #   a patch was refused        -> a child is knowably still here
+            #   the listing was truncated  -> a set we could not fully SEE is
+            #                                 a set we cannot prove we moved
+            #   the live re-count is > 0   -> every patch said success and a
+            #                                 child stayed put anyway
+            #
+            # The third is why the patch return values cannot be the
+            # evidence: corroborate-after-acting, the same discipline 3197's
+            # cascade applies to its own child deletes. It costs one count
+            # and is paid ONLY when there was something to move — a parent
+            # the scan found childless has nothing that could have failed to
+            # move, and re-counting would re-ask the same question in the
+            # same instant.
+            #
+            # THIS IS THE ONE PLACE THIS OP COULD HAVE BECOME THE CALLER THAT
+            # ROUTES AROUND `ParentHasChildrenError`, AND DELIBERATELY DOES
+            # NOT. Forcing the delete with `cascade=True` would DESTROY the
+            # children this whole path exists to preserve, converting a
+            # reported, recoverable refusal into permanent data loss. The
+            # refusal keeps the supersede alive and NAMED, which a caller can
+            # fix; a cascade could not be undone by anyone.
+            blockers: list[str] = []
+            if stranded_children:
+                blockers.append(
+                    'these children could not be re-homed: '
+                    + ', '.join(stranded_children)
+                )
+            # NOTE: the truncated-listing refusal is NOT here. It is raised at
+            # (5c-i) above, before the reparent loop, because it is knowable
+            # the instant the listing returns and refusing late would have
+            # already paid for mutations it then discards. Its message and
+            # `error_type` are unchanged by that move.
+            if moved_children:
+                # FAILS CLOSED for the same reason, and it is the same
+                # refusal: a corroboration that could not be READ is not a
+                # corroboration. The message says the CHECK failed rather than
+                # naming a child count, because an operator told "N children
+                # still name it" would go looking for children that may not
+                # exist.
+                try:
+                    still_here = await memory_service.count_memories_by_metadata(
+                        project_id=project_id, filters={'parent_id': supersede_id}
+                    )
+                except Exception as exc:
+                    still_here = 0
+                    blockers.append(
+                        'the live re-count that would corroborate the re-homing '
+                        f'could not be read ({exc}), so the move is unproven'
+                    )
+                if still_here:
+                    blockers.append(
+                        f'{still_here} child(ren) still name it as parent after '
+                        'every re-home patch reported success'
+                    )
+            if blockers:
+                # Reported like any other undone delete — in `failed_deletes`
+                # for what did not happen and why, and picked up by the
+                # survivors re-read for what is still in the corpus.
+                failed_deletes.append({
+                    'id': supersede_id,
+                    'error': (
+                        f'refused to delete {supersede_id}: deleting it would '
+                        'orphan its children — ' + '; '.join(blockers)
+                    ),
+                    'error_type': 'ReparentIncomplete',
+                })
+                continue
+
+            try:
+                await memory_service.delete_memory(
+                    memory_id=supersede_id,
+                    store='mem0',
+                    project_id=project_id,
+                    agent_id=agent_id,
+                    session_id=session_id,
+                    # `causation_id` is the RUN that killed it and `_source`
+                    # matches the tombstone's `deleter` verbatim, so the write
+                    # journal row and the tombstone name the same actor and an
+                    # auditor can join them.
+                    causation_id=run_id or causation_id,
+                    _source=_CONSOLIDATE_SOURCE,
+                )
+            except Exception as exc:
+                # `Exception`, deliberately: CancelledError/KeyboardInterrupt/
+                # SystemExit are BaseException subclasses, so a process going
+                # away is never captured here as a per-id disposition. No
+                # hand-copied re-raise tail — @mcp_tool_errors owns that.
+                # CAPTURED, not raised — `@mcp_tool_errors` would flatten the
+                # whole envelope to {'error', 'error_type'} and destroy every
+                # other id's disposition, which is the entire deliverable. One
+                # refusal costs one id: the loop runs on, because the ids that
+                # CAN fold should, and re-running to fold them later would
+                # re-write the canonical — the +1-per-pass ratchet.
+                failed_deletes.append({
+                    'id': supersede_id,
+                    'error': str(exc),
+                    'error_type': type(exc).__name__,
+                })
+                continue
+            deleted.append(supersede_id)
+
+        # (6) CORROBORATE. `survivors` is derived HERE and only here — from a
+        # live point read per supersede, never from what the deletes
+        # reported. Both asymmetric cases follow from that and neither is
+        # expressible any other way:
+        #
+        #   delete said 'deleted', id still resolves -> SURVIVOR. Nothing
+        #       refused, so there is no failure to count; this is the
+        #       silent-fail-soft the ratchet was made of.
+        #   delete RAISED, id no longer resolves     -> not a survivor. The
+        #       failure is real and reported, the survival is not, and
+        #       listing it would send an operator chasing nothing.
+        #
+        # Every supersede is re-read, including the ones whose delete was
+        # never attempted: "we did not try" is a claim about this call, not
+        # about the corpus.
+        #
+        # A read that FAILS is a THIRD outcome, and it gets its own list:
+        # the id was neither observed alive nor proven gone, so putting it in
+        # `survivors` would claim a record is still here on no evidence, and
+        # omitting it entirely would let it read as confirmed gone — which is
+        # the silent-fail-soft in a new costume, since the tombstone set is
+        # derived from exactly that gap.
+        survivor_check_failed: list[dict[str, Any]] = []
+        for supersede_id in supersedes_ids:
+            try:
+                still_there = await memory_service.get_memory_by_id(
+                    project_id=project_id, memory_id=supersede_id
+                )
+            except Exception as exc:
+                survivor_check_failed.append({
+                    'id': supersede_id,
+                    'error': str(exc),
+                    'error_type': type(exc).__name__,
+                })
+                continue
+            if still_there:
+                survivors.append(supersede_id)
+
+        # (6) The topic's closure, read once the fold is done — see
+        # `read_topic_closure` for why the placement matters.
+        closure = await read_topic_closure(
+            memory_service, project_id=project_id, topic=topic, run_id=run_id
+        )
+
+        # (7) TOMBSTONE THE CONFIRMED-GONE SET — `deleted` MINUS `survivors`,
+        # stamped HERE rather than from each delete's success branch as the
+        # two recon sweeps do. Those sweeps satisfy the writer's "only after
+        # the delete is confirmed successful" contract with the best evidence
+        # they hold: the call did not raise. This op holds strictly better
+        # evidence, because the re-read above is already mandatory — so a
+        # tombstone here means CORROBORATED GONE, not "the backend did not
+        # raise".
+        #
+        # That distinction IS the defect this task closes. An id whose delete
+        # reported success but which still resolves is the silent-fail-soft
+        # the ratchet was made of, and tombstoning it would mint a durable
+        # 30-day audit row asserting a record is gone while it is still in
+        # the corpus — manufacturing the exact false attribution the
+        # mechanism exists to prevent.
+        #
+        # NOT `citation_verifier.build_citation_tombstone`: that is a
+        # different object in a different store (task metadata
+        # `x_memory_citation_tombstones`, task 3893), keyed to CITING TASKS
+        # rather than to the deleted memory id, and it does not close this gap.
+        #
+        # MINUS the ids whose corroborating read failed, too: "we could not
+        # check" is not evidence of closure, and a tombstone must mean
+        # CORROBORATED GONE or it means nothing. `tombstones_expected` is
+        # derived from this same set below, so an unverifiable id is never
+        # counted as an owed-but-missing audit row either.
+        unproven = set(survivors) | {f['id'] for f in survivor_check_failed}
+        confirmed_gone = [i for i in deleted if i not in unproven]
+        tombstones_written = 0
+        # `run_id` is a non-blank str whenever `supersedes` was non-empty —
+        # `validate_consolidate_args` refuses the whole op otherwise — and
+        # `confirmed_gone` is a subset of `deleted`, itself a subset of
+        # `supersedes`. So this can only be None if that entry gate is ever
+        # removed. It is restated for the writer (which requires a `str`)
+        # rather than papered over with `run_id or ''`: an empty
+        # `deleting_run_id` would mint tombstones answering "who deleted
+        # this?" with silence, which is the conflation the gate exists to
+        # prevent. A violation therefore SKIPS the write and is disclosed as
+        # a shortfall below — never guessed at, and never able to fail a
+        # consolidation that already completed.
+        deleting_run_id = run_id if isinstance(run_id, str) and run_id.strip() else None
+        if confirmed_gone and deleting_run_id is not None:
+            try:
+                # BATCH form, as both prod sweeps use: one upsert_many, one
+                # commit, one fsync, all-or-nothing. A consolidation set is a
+                # cluster by construction, so it is exactly what that is for.
+                tombstones_written = await record_mem0_deletion_tombstones(
+                    memory_service,
+                    project_id,
+                    [victims_by_id[i] for i in confirmed_gone],
+                    deleter=_CONSOLIDATE_SOURCE,
+                    # The run that KILLED these records, deliberately distinct
+                    # from each victim's own `metadata.run_id` naming the run
+                    # that WROTE it. Required at validation time precisely so
+                    # this call can never be made without it.
+                    deleting_run_id=deleting_run_id,
+                    # The REVERSE pointer (task 3133): the survivor id that
+                    # absorbed them, which is what makes "where did its
+                    # content go?" answerable from the DEAD id alone.
+                    absorbed_by=canonical_id,
+                )
+            except Exception:
+                # Belt and braces, matching both prod call sites. `Exception`
+                # only: a cancellation is a BaseException and must propagate. The writer
+                # is fail-safe by contract, but the audit trail must never be
+                # able to alter — or abort — the consolidation it describes.
+                logger.warning(
+                    'consolidate_memories: tombstone write failed for %d '
+                    'confirmed-gone record(s); the deletes themselves stand '
+                    'and remain journaled',
+                    len(confirmed_gone),
+                    exc_info=True,
+                    extra={'project_id': project_id, 'run_id': run_id},
+                )
+        elif confirmed_gone:
+            # Unreachable while the entry gate stands; loud rather than silent
+            # if it ever does not, because the alternative is a durable audit
+            # row that cannot say which run did the killing.
+            logger.error(
+                'consolidate_memories: %d record(s) confirmed gone but no '
+                'auditable run_id reached the tombstone writer; refusing to '
+                'stamp an empty `deleting_run_id` (reported as a shortfall)',
+                len(confirmed_gone),
+                extra={'project_id': project_id, 'run_id': run_id},
+            )
+        if tombstones_written < len(confirmed_gone):
+            # Visible in the logs as well as in the envelope, matching the
+            # sweeps' degradation style.
+            logger.warning(
+                'consolidate_memories: %d of %d confirmed-gone record(s) were '
+                'tombstoned; the rest are deleted but unattributable from '
+                'their own ids',
+                tombstones_written,
+                len(confirmed_gone),
+                extra={'project_id': project_id, 'run_id': run_id},
+            )
+
+        # (7b) CORRECT THE CANONICAL'S OWN CLAIM. `metadata.supersedes` was
+        # stamped at write time with the REQUESTED set, because the write has
+        # to precede every destructive step — so on a partial run the record
+        # durably claims to have replaced ids that are STILL LIVE and still
+        # stating their own claim. That is exactly the overclaim the retain
+        # arm refuses to make ("listing a retained peer there would tell every
+        # future reader to prefer the canonical over a record that is still
+        # live and correct"), and it is worse here because nothing else in
+        # the system ever repairs the field: no sweep patches it down, so a
+        # stale claim would persist in the corpus pointing readers away from
+        # live records.
+        #
+        # Patched down to the CORROBORATED-GONE set — the same set the
+        # tombstones are stamped for, and for the same reason. An id whose
+        # corroborating read failed is not claimed as superseded either: this
+        # field is a claim about what is GONE, and "we could not check" is not
+        # evidence of that.
+        #
+        # It runs LAST, after the closure is known, and it is the only patch
+        # this op makes to its own canonical. It fires ONLY on a run that is
+        # already `partial` by construction: every supersede missing from
+        # `confirmed_gone` is in `failed_deletes`, `survivors` or
+        # `survivor_check_failed`, each of which is open business. So the
+        # correction can never turn a clean run into a reported one, and its
+        # own failure — disclosed, never swallowed — cannot flip a status that
+        # is already `partial`.
+        canonical_supersedes = list(supersedes_ids)
+        supersedes_correction: dict[str, Any] | None = None
+        if set(confirmed_gone) != set(supersedes_ids):
+            correction = {
+                'from': list(supersedes_ids),
+                'to': list(confirmed_gone),
+            }
+            failure = await patch_memory_metadata(
+                memory_service,
+                memory_id=canonical_id,
+                project_id=project_id,
+                patch={'supersedes': list(confirmed_gone)},
+                agent_id=agent_id,
+                session_id=session_id,
+                causation_id=causation_id,
+                source=source,
+            )
+            if failure:
+                # DISCLOSED, not swallowed: the canonical is still claiming
+                # the wider set, and a caller reading `canonical_supersedes`
+                # must see what the record actually says rather than what this
+                # call wanted it to say.
+                supersedes_correction = {
+                    'outcome': 'failed',
+                    **correction,
+                    **failure,
+                }
+                logger.warning(
+                    'consolidate_memories: could not narrow canonical %s '
+                    'metadata.supersedes from %d to %d id(s); it still claims '
+                    'records that are still live',
+                    canonical_id,
+                    len(supersedes_ids),
+                    len(confirmed_gone),
+                    extra={'project_id': project_id, 'run_id': run_id},
+                )
+            else:
+                canonical_supersedes = list(confirmed_gone)
+                supersedes_correction = {'outcome': 'corrected', **correction}
+
+        # (7c) TEACH THE TOPIC GUARD. Last, once the closure is known, so the
+        # derived hint names a canonical that landed and a failure cannot
+        # strand the fold between its write and its deletes: the tombstone
+        # writer's posture. The seed never raises.
+        topic_cluster_seed: dict[str, Any] | None = None
+        if topic_cluster_store is not None:
+            member_rows = closure.members if isinstance(closure.members, list) else []
+            member_texts = [
+                metadata_row_text(row)
+                for row in member_rows
+                if isinstance(row, dict) and row.get('id') != canonical_id
+            ]
+            topic_cluster_seed = seed_topic_cluster(
+                topic_cluster_store,
+                enabled=(
+                    resolve_topic_cluster_autoseed_enabled(memory_service)
+                    and topic not in resolve_retired_derived_topic_ids(memory_service, project_id)
+                ),
+                texts=[
+                    text
+                    for text in (canonical_content, *superseded_texts, *member_texts)
+                    if isinstance(text, str) and text
+                ],
+                topic=topic,
+                canonical_id=canonical_id,
+                project_id=project_id,
+                category=category,
+                run_id=run_id,
+                source=_CONSOLIDATE_SOURCE,
+            )
+
+        # (8) Anything that did not happen is NAMED, and the status rule that
+        # decides `consolidated` vs `partial` lives in ONE pure place rather
+        # than being re-expressed at each return.
+        return build_consolidation_result(
+            canonical_id=canonical_id,
+            topic=topic,
+            # What the canonical DURABLY CLAIMS to have replaced, after the
+            # correction above — not what this call was asked to fold.
+            canonical_supersedes=canonical_supersedes,
+            supersedes_correction=supersedes_correction,
+            deleted=deleted,
+            failed_deletes=failed_deletes,
+            survivors=survivors,
+            survivor_check_failed=survivor_check_failed,
+            retained=retain_arm.retained,
+            retain_failures=retain_arm.retain_failures,
+            reparented=reparented,
+            reparent_failures=reparent_failures,
+            topic_members=closure.members,
+            topic_members_total=closure.total,
+            topic_members_truncated=closure.truncated,
+            topic_members_available=closure.available,
+            citation_repoint=citation_repoint,
+            tombstones_written=tombstones_written,
+            # What was OWED — the confirmed-gone set, not every supersede.
+            # An id whose delete failed was never owed a tombstone, so
+            # counting it would report a phantom shortfall on a correct run.
+            tombstones_expected=len(confirmed_gone),
+            topic_cluster_seed=topic_cluster_seed,
         )
 
     @mcp.tool()
@@ -2421,6 +7046,73 @@ def create_mcp_server(
             episode_id=episode_id,
             project_id=project_id,
             cascade=cascade,
+            agent_id=agent_id,
+            session_id=session_id,
+            causation_id=causation_id,
+            _source=source,
+        )
+
+    @mcp.tool()
+    @mcp_tool_errors()
+    async def redact_episode_content(
+        episode_uuid: str,
+        new_content: str,
+        project_id: str,
+        agent_id: str | None = None,
+        session_id: str | None = None,
+        metadata: dict | None = None,
+        ctx: Context | None = None,
+    ) -> dict[str, Any]:
+        """Replace one Graphiti episode's raw content in place. NON-destructive.
+
+        The counterpart to delete_episode for an episode whose stored text is
+        corrupted — most concretely, one carrying a leaked serialized
+        tool-call fragment (task 3083). Use this INSTEAD of
+        ``delete_episode(cascade=True)``, which would also destroy the
+        entities and edges exclusively sourced from that episode: those were
+        extracted from the CLEAN portion of the text and are usually valid,
+        so cascading deletes real knowledge to fix appearance.
+
+        Only the ``content`` property is written. EpisodicNodes carry no
+        embedding of their own, so nothing is left stale by an in-place set,
+        and the extracted edges are deliberately untouched.
+
+        Refuses LOUDLY rather than half-succeeding: a blank replacement, a
+        replacement that itself still carries a leaked fragment, or an
+        episode uuid absent from this project's graph all raise.
+
+        Args:
+            episode_uuid: Graphiti episode UUID (must already be identified —
+                this tool does not search for corrupted episodes)
+            new_content: Replacement text. Non-empty, leak-free.
+            project_id: Project scope (required)
+            agent_id: Which agent is redacting (optional, auto-derived from MCP context)
+            session_id: Session context (optional, auto-derived from MCP context)
+            metadata: Optional key-value pairs (may contain _causation_id for recon)
+        """
+        agent_id, session_id = _resolve_identity(agent_id, session_id, ctx)
+        project_id, err = _canonicalize_project_id_arg(project_id)
+        if err:
+            return err
+        if err := validate_project_id(project_id):
+            return err
+        if err := _known_project_gate(project_id):
+            return err
+        if not episode_uuid or not episode_uuid.strip():
+            return {'error': 'episode_uuid is required', 'error_type': 'ValidationError'}
+        if not new_content or not new_content.strip():
+            return {
+                'error': (
+                    'new_content must be non-empty — redaction is '
+                    'content-preserving, not content-erasing'
+                ),
+                'error_type': 'ValidationError',
+            }
+        causation_id, source, _ = _extract_causation(metadata, agent_id)
+        return await memory_service.redact_episode_content(
+            episode_uuid=episode_uuid,
+            new_content=new_content,
+            project_id=project_id,
             agent_id=agent_id,
             session_id=session_id,
             causation_id=causation_id,
@@ -2745,9 +7437,16 @@ def create_mcp_server(
 
         When the same real-world concept exists as two separate Entity nodes (e.g.,
         'Anthropic' and 'Anthropic Inc'), use this tool to merge them. All RELATES_TO
-        edges from the deprecated node are redirected to the surviving node. The
-        deprecated node is then deleted and the surviving node's summary is rebuilt
-        from its (now-combined) edges.
+        edges from the deprecated node are redirected to the surviving node, and its
+        Episodic MENTIONS provenance is relocated onto the survivor as well — an
+        episode already linked to the survivor is left alone rather than linked
+        twice. The deprecated node is then deleted and the surviving node's summary
+        is rebuilt from its (now-combined) edges.
+
+        Every redirected edge and relocated mention carries a
+        `reassigned_from_node_uuid` audit stamp naming the node it left, and the
+        returned audit dict carries the deprecated node's summary TEXT — which the
+        rebuild above cannot reconstruct, since it reads edges only.
 
         This operation is irreversible. Always verify both UUIDs before calling.
 
@@ -2919,6 +7618,152 @@ def create_mcp_server(
 
     @mcp.tool()
     @mcp_tool_errors()
+    async def ensure_entity_node(
+        name: str,
+        project_id: str,
+        summary: str = '',
+        agent_id: str | None = None,
+        session_id: str | None = None,
+        metadata: dict | None = None,
+        ctx: Context | None = None,
+    ) -> dict[str, Any]:
+        """Resolve an Entity node by exact name, MINTING one if none exists.
+
+        The write-time-identity primitive the other entity tools presuppose:
+        ``reassign_edge`` can only re-point an edge onto a node that ALREADY
+        exists, so a dangling referent — a task the graph mentions but has no
+        node for — is unrepairable without this.
+
+        GATED, unlike its four siblings. Minting SPLITS a referent when it lands
+        under the wrong name, and nothing sweeps orphan minted nodes, so the
+        tool ships behind a narrow allowlist of ``agent_id`` prefixes
+        (``entity_mint.allowed_agent_prefixes``, default ``recon-stage-`` and
+        ``curator-``). NOTE the honest caveat: **agent_id is SELF-REPORTED**.
+        This is a misuse deterrent for cooperating callers, NOT a security
+        boundary — a caller that wants to bypass it need only claim a different
+        agent_id. ``entity_mint.enabled=false`` is the operator KILL SWITCH; it
+        denies every caller on the very next call, with no restart.
+
+        NAMES ARE CANONICAL-ONLY in v1. ``'Task 3222'`` is accepted; the
+        variants ``'task #3222'`` / ``'Task: 3222'`` are REFUSED naming the
+        canonical form to retry with, so spellings converge on one node instead
+        of splitting across several. A name that is not task-shaped at all is
+        refused outright — this is not a general junk-node minter. The
+        project-qualified foreign form ``'reify:132'`` is accepted and mints
+        into the WRITING project's graph under that qualified name.
+
+        AMBIGUITY IS REFUSED, NOT RESOLVED. When two or more nodes already carry
+        the name, this returns a structured refusal naming the conflicting
+        uuids and merges NOTHING. The underlying identity primitive has a
+        duplicate-COLLAPSE arm; it is irreversible, and it is deliberately kept
+        unreachable from here — adjudicate duplicates by hand.
+
+        Args:
+            name: The canonical node name, e.g. ``'Task 3222'`` or ``'reify:132'``
+            project_id: Project scope (required)
+            summary: Optional summary for a newly minted node
+            agent_id: Which agent is calling (optional, auto-derived from MCP context)
+            session_id: Session context (optional, auto-derived from MCP context)
+            metadata: Optional key-value pairs (may contain _causation_id for recon)
+
+        Returns:
+            ``{'status': 'minted'|'resolved', 'uuid': ..., 'minted': bool}`` on
+            success.
+
+            EVERY refusal carries ``{'status': 'refused', 'error',
+            'error_type'}`` — the tool-layer ones raised here
+            (``EntityMintToolDisabled`` / ``EntityMintNotAuthorized``,
+            ``EntityMintNonCanonicalName`` / ``EntityMintNonTaskName``,
+            ``EntityMintUnknownTask``) and the service-layer ones raised by
+            ``services/memory_service.py::MemoryService.ensure_entity_node``
+            (``EntityMintLockBusy``, ``EntityMintAmbiguousName``) alike, so
+            ``result.get('status') == 'refused'`` is ONE discriminator that
+            works across both layers rather than KeyError-ing on half of them.
+            Individual refusals add their own detail keys (``agent_id``,
+            ``name``, ``ref``, ``uuids``).
+
+            The exception is the SHARED project-id validation envelope
+            (``error_type='ValidationError'``, from
+            ``_canonicalize_project_id_arg`` / ``validate_project_id`` /
+            ``_known_project_gate``), which every MCP tool returns in one
+            spelling and which this tool deliberately does not re-shape. So
+            ``'error' in result`` remains the universal "did this fail" test;
+            ``status == 'refused'`` is the mint-specific one.
+        """
+        # (1) Identity first — nothing downstream can gate an unresolved agent_id.
+        agent_id, session_id = _resolve_identity(agent_id, session_id, ctx)
+
+        # (2) Authorization immediately next, BEFORE project canonicalization
+        # and before the name is even parsed. Minting is the one entity
+        # primitive that CREATES an identity node, so this gate is the whole
+        # point of the tool: an unauthorized caller is turned away before any
+        # work is done on its behalf, and learns nothing about the validity of
+        # its other arguments. Same ordering rationale `update_memory` and
+        # `add_system_record` record for their own gates — note `update_memory`
+        # has an extra arm-PRESENCE check between identity and authz, which is
+        # specific to its multi-arm shape and has no analogue here.
+        decision = resolve_entity_mint_authorization(memory_service, agent_id=agent_id)
+        if not decision.allowed:
+            return {
+                'status': 'refused',
+                'error': decision.error,
+                'error_type': decision.error_type,
+                'agent_id': agent_id,
+            }
+
+        # (3) `reassign_edge`'s prologue verbatim, INCLUDING `_known_project_gate`
+        # — which is load-bearing here rather than decorative: `_graph_for(group_id)`
+        # creates a graph ON DEMAND, so a typo'd project_id would mint into a
+        # brand-new graph nobody is watching. Of the four existing entity tools
+        # only `reassign_edge` calls this gate; `rename_entity`, `merge_entities`
+        # and `delete_entity` all stop at `validate_project_id`. Wiring it here
+        # is a deliberate correction to that prevailing local pattern, not a
+        # restatement of it — those three can only act on a uuid that already
+        # exists, whereas this one creates.
+        #
+        # NO `_backlog_gate`: that gate is for tools creating new task-backlog
+        # pressure (add_memory, add_system_record). This one touches the
+        # identity graph and creates none — the same reason `update_memory`
+        # omits it.
+        project_id, err = _canonicalize_project_id_arg(project_id)
+        if err:
+            return err
+        if err := validate_project_id(project_id):
+            return err
+        if err := _known_project_gate(project_id):
+            return err
+
+        # (4) The name must be canonical and task-shaped. Returns the parsed
+        # referent so nothing downstream re-parses it.
+        name_decision = validate_mint_name(name)
+        if not name_decision.allowed:
+            return {
+                'status': 'refused',
+                'error': name_decision.error,
+                'error_type': name_decision.error_type,
+                'name': name,
+            }
+
+        # (5) The referent must name a task the live registry actually has —
+        # but ONLY when the registry can be consulted. See
+        # `_verify_mint_referent` for the FOUND / NO_SUCH_TASK /
+        # COULD_NOT_CHECK rule.
+        if err := await _verify_mint_referent(name_decision.referent, project_id):
+            return err
+
+        causation_id, source, _ = _extract_causation(metadata, agent_id)
+        return await memory_service.ensure_entity_node(
+            name=name,
+            project_id=project_id,
+            summary=summary,
+            agent_id=agent_id,
+            session_id=session_id,
+            causation_id=causation_id,
+            _source=source,
+        )
+
+    @mcp.tool()
+    @mcp_tool_errors()
     async def rebuild_entity_summaries(
         project_id: str,
         force: bool = False,
@@ -3006,6 +7851,31 @@ def create_mcp_server(
         ``queue`` is the durable-write-queue subsystem, and conflating it with
         reconciliation state is the exact mis-triage task 2920 fixed.
 
+        The top-level ``task_metadata_capabilities`` lists the task-metadata
+        capabilities this running server's submit guard enforces. Filing
+        recipes probe it (skills/_shared/filing-the-trigger-chain.md §2)
+        because it comes from the running process, not from main.
+
+        A top-level ``markup_residue`` field is present when the markup guard's
+        residue floor is wired (task 4809). A non-zero
+        ``preservation_failures`` counts refused payloads this process could
+        not preserve anywhere; ``spooled_files`` counts the payloads waiting in
+        ``spool_dir`` for an operator.
+
+        When the server runs the startup embedder probe, the top-level
+        ``embedder`` block reports the probed endpoint, and ``config_overlay``
+        the active config overlay's provenance.
+
+        The top-level ``plan_route`` field is the ChatGPT-plan route's cap
+        latch (task 9944): ``state`` (``ok``, ``capped`` or ``unconfigured``),
+        ``proxy_host``, ``capped_since``, ``resets_at``, ``next_probe_at``,
+        ``parked_items`` (globally parked writes, null when the queue cannot
+        be counted),
+        ``judge_fail_opens_since_latch`` and ``escalation_id``. ``capped``
+        means plan-routed work is parked behind the ``plan_route_capped`` L2
+        that ``escalation_id`` names, re-probing at ``next_probe_at``. A capped
+        plan never falls back onto OPENAI_API_KEY.
+
         Args:
             project_id: Get stats for a specific project (optional)
         """
@@ -3065,6 +7935,36 @@ def create_mcp_server(
         ):
             result['reconciliation_halt'] = halt
 
+        # task 3212 (item 5): surface rows the write journal LOST. Deliberately
+        # not fault-only, unlike `degraded` / `failed_stores`: a zero is a
+        # meaningful assertion that nothing was lost, and an absent key would be
+        # indistinguishable from an unwired journal both to an operator and to
+        # leaf eta (task 3213), whose metric reads a dropped search row as
+        # "never asked" — a wrong answer rather than a missing one.
+        #
+        # Top-level rather than under `queue` for the same reason as
+        # `reconciliation_halt` above: `queue` is the durable-write-queue
+        # subsystem, and the write journal is not it. Conflating the two is the
+        # exact mis-triage task 2920 fixed.
+        if write_journal is not None and isinstance(result, dict) and 'error' not in result:
+            result['journal_drops'] = write_journal.journal_drop_stats()
+
+        if isinstance(result, dict) and 'error' not in result:
+            result['task_metadata_capabilities'] = sorted(TASK_METADATA_CAPABILITIES)
+
+        # task 4809 (INV-4): refused payloads the markup guard lost. Top-level
+        # and present-when-wired for the same reasons as `journal_drops`. The
+        # status lists the spool dir, so it runs off the loop like event_dead.
+        if (
+            markup_residue_spool is not None
+            and isinstance(result, dict)
+            and 'error' not in result
+        ):
+            result['markup_residue'] = await asyncio.to_thread(markup_residue_spool.status)
+
+        if embedder_probe is not None and isinstance(result, dict) and 'error' not in result:
+            result.update(embedder_identity_status(memory_service.config, embedder_probe))
+
         return result
 
     # ------------------------------------------------------------------
@@ -3111,6 +8011,21 @@ def create_mcp_server(
 
         * The top-level ``counts`` are the DURABLE WRITE queue — a separate
           subsystem that stays ~0 in steady state.
+        * ``dead_by_operation`` breaks that queue's ``dead`` count down by
+          operation name (always present; ``{}`` when nothing is dead, so you
+          never have to tell "no deaths" from "an older server"). A nonzero
+          entry means writes of that operation have been PERMANENTLY abandoned
+          after their caller was told they were accepted — which operation is
+          dying is the first thing triage needs, and ``counts['dead']`` alone
+          cannot say. This is the health-probe CONFIRMATION; the matching PUSH
+          signal is the ``durable_write_dead_letter`` escalation, which
+          survives cleanup. This counter reads the LIVE queue table, so it
+          returns to zero once ``delete_dead_letters`` sweeps the rows.
+          A ``project_id``-scoped call covers only that project's GRAPHITI
+          group: its Mem0 deaths (``mem0_classify_and_add``) sit in group
+          ``mem0_<project_id>``, so pass THAT as the ``project_id``, or call
+          unscoped, to see them. An alarm naming an operation the scoped
+          probe reports nothing for is that gap, not a contradiction.
         * ``reconciliation_backlog`` (present only when a ``project_id`` is
           supplied and a backlog policy is wired) is the reconciliation EVENT
           backlog = buffered events + event-queue depth + in-flight retries.
@@ -3183,26 +8098,39 @@ def create_mcp_server(
     @mcp.tool()
     @mcp_tool_errors()
     async def get_curator_state() -> dict[str, Any]:
-        """Read-only snapshot of the curator UsageGate's current state.
+        """Read-only snapshot of the curator's operational state: its UsageGate
+        and the load health of its guard registries.
 
-        Returns ``{'paused', 'paused_reason', 'soonest_open_at', 'account_count'}``.
+        Returns ``{'paused', 'paused_reason', 'soonest_open_at', 'account_count',
+        'registries'}``.
         ``paused_reason`` is None when the gate is healthy or unconfigured.
         ``soonest_open_at`` is an ISO 8601 string or None.
         When no gate is wired (curator disabled), returns safe zero-defaults.
 
+        ``registries`` lists each curator guard registry's load state
+        (unconfigured / not_loaded / loaded / failed) with path, entry_count,
+        error and failures, so a guard that failed to load is distinguishable
+        from one that loaded empty. It is empty when no curator has been
+        constructed yet.
+
         The dashboard polls this to surface WHY the curator is paused alongside
         the existing ``capped_now`` indicator.
 
-        Note: the four values are read from the live gate without a lock. During
+        Note: the four gate values are read from the live gate without a lock. During
         a state transition (e.g. ``_on_resume()`` flipping paused → unpaused) the
         snapshot may be momentarily inconsistent; refresh on the next poll.
         """
+        registries = (
+            [h.to_wire() for h in task_interceptor.curator_registry_health()]
+            if task_interceptor is not None else []
+        )
         if curator_usage_gate is None:
             return {
                 'paused': False,
                 'paused_reason': None,
                 'soonest_open_at': None,
                 'account_count': 0,
+                'registries': registries,
             }
         gate = curator_usage_gate
         paused = gate.is_paused
@@ -3214,6 +8142,7 @@ def create_mcp_server(
             'paused_reason': paused_reason,
             'soonest_open_at': soonest_open_at,
             'account_count': gate.account_count,
+            'registries': registries,
         }
 
     @mcp.tool()
@@ -3254,6 +8183,12 @@ def create_mcp_server(
         Dead-lettered items are writes that exhausted all retry attempts.
         This resets them so workers can try again (e.g. after fixing the
         underlying issue).
+
+        Prefer this over ``delete_dead_letters``: a replay that fails again
+        is non-destructive and leaves the row — and its payload — intact for
+        diagnosis.  Note that a permanently-unsatisfiable failure will simply
+        re-fail and re-dead-letter; that outcome is information, not a reason
+        to delete the row.
 
         Note: project_id is NOT canonicalized here (no hyphen/underscore
         normalization) — dead-letter tools are intentionally out of scope
@@ -3357,6 +8292,8 @@ def create_mcp_server(
                     'error': row.get('error'),
                     'timestamp': row.get('created_at'),
                     'attempts': row.get('attempts'),
+                    # Three-valued; see services/durable_queue.py::DurableWriteQueue.get_dead_items
+                    'executed': row.get('executed'),
                 }
                 if truncated:
                     item['payload_truncated'] = True
@@ -3407,9 +8344,30 @@ def create_mcp_server(
     ) -> dict[str, Any]:
         """Permanently delete dead-lettered durable-queue items by id.
 
-        Use this tool for non-retriable errors (e.g. NodeNotFoundError after a
-        graph wipe) where replaying would always fail.  For retriable transient
-        failures use ``replay_dead_letters`` instead.
+        DESTRUCTIVE, and usually the wrong first move.  A dead-lettered row is
+        the only durable record that a write was attempted and failed: it
+        carries the full payload, the error, and the attempt count.  The write
+        journal retains only the first 200 characters of the original params,
+        so deleting the row makes the lost content unrecoverable and destroys
+        the evidence needed to diagnose the cause.
+
+        Delete only once the cause is IDENTIFIED and the item is known to be
+        unrecoverable.  If the cause is not yet understood, leave the row in
+        place and investigate it.  If it is understood and fixed, use
+        ``replay_dead_letters`` instead.
+
+        This docstring previously named "NodeNotFoundError after a graph wipe"
+        as the canonical delete-me case.  That guidance was withdrawn on
+        2026-08-03 (esc-3561-3) because NodeNotFoundError has several causes
+        with opposite remedies: a stale or typo'd uuid, a uuid belonging to a
+        different graph (for FalkorDB, group_id *is* the database), a genuine
+        visibility race, or a code bug in which an operation references its own
+        not-yet-created uuid.  graphiti_core's exception carries only the
+        message string — no uuid attribute, no group_id, no node label — so it
+        cannot tell you which you are looking at.  Acting on the old advice
+        deleted 26 of the 28 known instances of the last cause, which is what
+        made a three-and-a-half-month silent failure look like two isolated
+        rows.
 
         Only rows with ``status='dead'`` that belong to ``project_id`` are
         eligible.  Cross-project ids, non-existent ids, and non-dead-status
@@ -3715,10 +8673,10 @@ def create_mcp_server(
         task tools. Returning a clear error here prevents confusing downstream
         failures inside the taskmaster backend.
 
-        Delegates to :func:`~fused_memory.middleware.task_interceptor._is_ticket_id`
-        so there is a single source of truth for the ticket-id prefix.
+        Delegates to ``shared/src/shared/task_submit.py::is_ticket_id`` so
+        there is a single source of truth for the ticket-id prefix.
         """
-        if _is_ticket_id(value):
+        if is_ticket_id(value):
             return {
                 'error': (
                     f'Ticket-shaped id {value!r} not allowed here; '
@@ -3736,6 +8694,7 @@ def create_mcp_server(
         page_size: int | None = None,
         offset: int = 0,
         statuses: Any = None,
+        fields: Any = None,
     ) -> dict[str, Any]:
         """List all tasks in the project.
 
@@ -3754,6 +8713,16 @@ def create_mcp_server(
                 results to matching tasks via a SQL ``status IN (...)`` predicate.  An
                 empty list (``[]``) is valid and returns no tasks.  A bare string is
                 rejected with a ValidationError.
+            fields: Optional row projection.  None returns full rows, unchanged.  Each
+                entry is a top-level row key or ``metadata.<key>`` (key matching
+                ``[A-Za-z_][A-Za-z0-9_]*``); ``id`` is always returned, and a requested
+                metadata key absent on a task, or a requested row key the store's schema
+                lacks, is omitted.  An invalid entry is a ValidationError carrying
+                ``field`` and ``allowed``.  Composes with ``statuses`` and ``page_size``.
+                The row keys are ``backends/task_projection.py::TASK_ROW_KEYS``; among
+                them ``created_at`` is the filing time and ``created_at_source`` its
+                provenance, a ``shared/src/shared/task_created_at.py::CreatedAtSource``
+                value.
         """
         # Input validation — early-exit before touching the interceptor.
         # Shared with get_statuses so both tools reject identical inputs
@@ -3761,22 +8730,20 @@ def create_mcp_server(
         _paging_error = _validate_paging(page_size, offset)
         if _paging_error is not None:
             return _paging_error
-        if statuses is not None and not isinstance(statuses, list):
-            return {
-                'error': 'statuses must be a list of status strings',
-                'error_type': 'ValidationError',
-            }
-        if statuses is not None and any(not isinstance(s, str) for s in statuses):
-            return {
-                'error': 'statuses must be a list of status strings',
-                'error_type': 'ValidationError',
-            }
+        _statuses_error = _validate_statuses(statuses)
+        if _statuses_error is not None:
+            return _statuses_error
+        _fields_error = _validate_fields(fields)
+        if _fields_error is not None:
+            return _fields_error
 
         _normalized = _normalize_project_root(project_root)
         if isinstance(_normalized, dict):
             return _normalized
         project_root = _normalized
-        result = await task_interceptor.get_tasks(project_root=project_root, tag=tag, statuses=statuses)
+        result = await task_interceptor.get_tasks(
+            project_root=project_root, tag=tag, statuses=statuses, fields=fields,
+        )
         if isinstance(result, dict) and 'error' not in result:
             pid = resolve_project_id(project_root)
             # Shallow copy to avoid mutating a potentially shared/cached interceptor dict.
@@ -4128,15 +9095,16 @@ def create_mcp_server(
             if not sep or not project_id or not task_id or not task_id.isdigit():
                 result[dep] = 'malformed'
                 continue
-            # Normalise project_id via the shared raise-free primitive (task 2267
-            # / seam S1) so 'dark-factory' == 'dark_factory', mirroring
-            # models/scope.py:resolve_project_id. Deliberately NOT the raising
+            # Normalise project_id with the raise-free one rule
+            # shared.project_id.normalize_project_id (as
+            # fused_memory/models/scope.py::resolve_project_id does) so
+            # 'dark-factory' == 'dark_factory'. Deliberately NOT the raising
             # canonicalize_project_id: this tool's contract is sentinel-only
             # (never raise on a semantic problem), and a path-shaped project_id
             # must fall through to the 'unknown_project' sentinel below rather
             # than raise PathShapedProjectIdError. Registry lookup uses the
             # normalised form; result is keyed by the original verbatim dep string.
-            norm_project_id = _to_underscore_canonical(project_id)
+            norm_project_id = normalize_project_id(project_id)
             # Look up project_root in registry
             if norm_project_id not in _kp:
                 result[dep] = 'unknown_project'
@@ -4187,6 +9155,9 @@ def create_mcp_server(
     ) -> dict[str, Any]:
         """Get a single task by ID.
 
+        The response carries ``task_text_fp``, the fingerprint of its
+        description+details: pass it to ``update_task`` as ``expected_text_fp``.
+
         Args:
             id: Task ID (e.g., "15", "15.2")
             project_root: Absolute path to project root
@@ -4200,7 +9171,12 @@ def create_mcp_server(
         if isinstance(result, dict) and 'error' not in result:
             pid = resolve_project_id(project_root)
             # Shallow copy to avoid mutating a potentially shared/cached interceptor dict.
-            result = {**result, 'project_id': pid, 'project_root': project_root}
+            result = {
+                **result,
+                'project_id': pid,
+                'project_root': project_root,
+                TASK_TEXT_FP_KEY: text_fp_of(result),
+            }
             await _log_read(
                 'get_task',
                 project_id=pid,
@@ -4221,6 +9197,10 @@ def create_mcp_server(
         heartbeat_at: str | None = _CLAIMANT_WIRE_UNSET,  # type: ignore[assignment]
         agent_id: str | None = None,
         client_op_id: str | None = None,
+        deferral: dict | None = None,
+        expected_stamped_at: str | None = None,
+        restamp_only: bool = False,
+        release_holder: StrictBool = False,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
         """Update task status. Triggers targeted reconciliation for
@@ -4291,6 +9271,36 @@ def create_mcp_server(
             client_op_id: Optional client-supplied idempotency key (task 2712).
                 A retry with the same key applies once and returns the recorded
                 outcome. Omit for today's behavior.
+            deferral: What ends the hold. REQUIRED to enter ``deferred``, refused
+                with any other status. One of
+                ``{'kind': 'carried_by', 'carrier_task_id': <id>}``,
+                ``{'kind': 'until_condition', 'condition': <text>, 'expires_at': <ISO, optional>}``
+                or ``{'kind': 'held_by_session', 'holder_pid': <your $CLAUDE_PID>,
+                'grace_secs': <600..86400, optional>}``; each may add ``reason``.
+                On a row already ``deferred`` it re-stamps (replaces) the record
+                without a status change. Every successful write echoes the
+                stored record as ``deferral`` (entry, re-stamp) or the removed
+                one as ``deferral_cleared`` (any exit from ``deferred``); no echo
+                means the server predates the gate. Refusals: ``deferral_required``,
+                ``deferral_invalid`` (with ``reason_code``, ``field``, ``value``),
+                ``deferral_changed``. Recipe: docs/task-authoring.md §9
+                "Deferring a task".
+            expected_stamped_at: Compare-and-set, single id only: the write is
+                refused ``deferral_changed`` unless the row's current record has
+                this ``stamped_at``.
+            restamp_only: Guarded re-stamp, single id only, ``status='deferred'``
+                and a ``deferral`` required: refused ``deferral_changed`` unless
+                the row is ``deferred`` now with the record named by
+                ``expected_stamped_at`` (omitted = no record).
+            release_holder: Must be the literal ``true`` for a follow-up holder to go
+                ``done``, ``cancelled`` or ``deferred``; without it that write is refused
+                ``followup_holder_protected`` with the holder's ``held_count``. Releasing the
+                holder releases every held follow-up at once, so it is a human act: each one
+                is promoted by human, with one ``followup_promoted`` event apiece, before
+                targeted reconciliation runs. A promotion failure after the status write is
+                reported in ``post_write_warnings``; passing it again on a holder already at
+                that status releases whatever is still held. Ignored on any other task. See
+                docs/task-authoring.md §3.4.
         """
         agent_id, _ = _resolve_identity(agent_id, None, ctx)
         if err := _reject_if_ticket_id('id', id):
@@ -4319,6 +9329,10 @@ def create_mcp_server(
             reopen_reason=reopen_reason,
             agent_id=agent_id,
             client_op_id=client_op_id,
+            deferral=deferral,
+            expected_stamped_at=expected_stamped_at,
+            restamp_only=restamp_only,
+            release_holder=release_holder,
             **claimant_kwargs,
         )
 
@@ -4393,6 +9407,10 @@ def create_mcp_server(
 
         Callers should follow up with ``resolve_ticket`` to obtain the final
         task_id once the curator has decided (create / drop / combine).
+        When the curator cannot judge it yet, the ticket parks as
+        ``awaiting_curation`` and is curated later. An open ``resolve_ticket``
+        answer means not decided yet: resolve the same ticket again and never
+        re-submit.
 
         ``planning_mode=True`` switches to a synchronous, curator-bypassing
         path for batched human decomposition (e.g., breaking a PRD into ~50
@@ -4406,18 +9424,33 @@ def create_mcp_server(
         "planning_mode": True}`` synchronously — no ticket, no
         ``resolve_ticket`` follow-up needed.
 
-        ``title``/``description``/``details``/``prompt`` carrying a raw MCP
-        envelope fragment are REJECTED outright
-        (error_type=McpEnvelopeMarkupWriteRejected) before the description
-        parser sees them. A harness serialization bug has been leaking tool-call
-        envelope markup into task text, where the parser then derived WRONG
-        values from it silently (one reify task was filed priority=high and
-        stored as medium). Strip the fragment and resubmit, or set
-        metadata={'allow_mcp_markup': True} if you are quoting the markup
-        deliberately (e.g. filing a task ABOUT the leak).
-        :mod:`fused_memory.server.markup_tripwire` holds the authoritative
-        pattern list and the rationale — it is deliberately the only place in
-        the package that enumerates the literals.
+        ``metadata.execution_class`` 'operational' or 'decision' converts the
+        submission into a deterministic pure gate that escalates to a HUMAN at
+        dispatch; the response then carries ``routing_notice`` and the task
+        carries ``metadata.pure_gate_from``, unless the metadata already
+        declares that shape (``task_kind='deterministic'`` +
+        ``always_escalates=True``), in which case nothing is rewritten and
+        neither appears. A docs, comment or rename edit is agent work:
+        ``task_kind='normal'`` + ``metadata.complexity='simple'``.
+
+        Any string argument carrying a raw MCP envelope fragment — not just
+        ``title``/``description``/``details``/``prompt`` — is REJECTED outright
+        (error_type=mcp_markup_detected, or mcp_markup_unrepairable when the
+        residue cannot be parsed) before the description parser sees them. A
+        harness serialization bug has been leaking tool-call envelope markup into
+        task text, where the parser then derived WRONG values from it silently
+        (one reify task was filed priority=high and stored as medium). A
+        mcp_markup_detected rejection carries ``repaired_call``: the COMPLETE
+        argument map with the fragment removed and any parameter the leak
+        swallowed restored — resubmit it verbatim rather than rewording around it.
+        Or set metadata={'allow_mcp_markup': True} if you are quoting the markup
+        deliberately (e.g. filing a task ABOUT the leak). The check runs at the
+        dispatch BOUNDARY, before this tool body is entered, so it covers every
+        tool and every string parameter;
+        :mod:`fused_memory.server.markup_guard` holds the boundary guard
+        pattern list and the rationale; the literals themselves are enumerated
+        once, in :mod:`shared.toolcall_markup`, and nothing in this package
+        spells them.
 
         Args:
             project_root: Absolute path to project root
@@ -4432,8 +9465,17 @@ def create_mcp_server(
                 under project_root that exists and is executable, ``timeout_secs``
                 positive int) and/or ``always_escalates`` (bool) in metadata.
 
+                modules: RETIRED — a submission carrying this key is
+                rejected (error_type='RetiredMetadataKey'); declare scope in
+                ``files``.
+
+                A ``task_kind='normal'`` submission whose declared ``files``
+                are ALL gitignored is flagged (or rejected under
+                FUSED_GITIGNORED_DELIVERABLE_ENFORCE): no commit can deliver
+                it, so it should likely be ``task_kind='deterministic'``.
+
                 allow_mcp_markup (optional): set to ``True`` to bypass the
-                MCP-markup tripwire when the task text quotes envelope markup
+                MCP-markup boundary guard when the task text quotes envelope markup
                 deliberately. Write-time-only — it is stripped before
                 persistence, so it never enters the task metadata vocabulary.
 
@@ -4444,9 +9486,13 @@ def create_mcp_server(
                 the change is a single coherent edit — docs or comments, a
                 rename, a localized behaviour-preserving refactor, a typo/wording
                 fix, a one-spot bug fix — that needs no new abstraction and no
-                cross-module design, and you can name the target file(s). It is
-                fine for a simple task to be high priority or to touch several
-                files/modules, as long as the change is mechanically simple.
+                cross-module design, and you can name the target file(s).
+                Declaring "simple" REQUIRES a non-empty metadata.files naming
+                those files: a fileless simple submission is rejected
+                (error_type='SimpleTaskFilesRequired'), and files=[] does not
+                satisfy it. It is fine for a simple task to be high priority or
+                to touch several files/modules, as long as the change is
+                mechanically simple.
                 When unsure, omit it — the full path is the safe default, and a
                 mis-declared task simply falls back to the architect.
             tag: Tag context (optional)
@@ -4455,12 +9501,37 @@ def create_mcp_server(
                 decomposition sessions where you do not want curator
                 deduplication to recombine sibling tasks.  Persists
                 ``human_decomposed=True`` in task metadata.
-            routing_override_reason: When set (non-empty), the path guards are
-                skipped and the task is filed in the submitting project.  The
-                reason is recorded on task metadata and emitted as a WARNING
-                audit log so a deliberate override is greppable.  Use only
-                when sure the task belongs to the submitting project.  If
-                unsure, escalate rather than risking a mis-filed task.
+            routing_override_reason: A TOP-LEVEL parameter of this tool (NOT a
+                ``metadata`` key — putting it in ``metadata`` has no effect).
+                When set to anything non-blank, ALL path-scope guards are
+                skipped and the task is filed in the submitting project.
+
+                This disables the PROSE advisory AND the FILES-certain HARD
+                REJECT — the check task 2206's anti-bypass tests exist to
+                protect.  It is validated only as "non-blank after stripping":
+                there is no allowlist, no format constraint, and no cross-check
+                of the stated reason against the paths actually claimed.
+
+                EVERY use now files a ``scope_violation`` audit escalation
+                (id prefix ``esc-task-path-guard-override``) in the filing
+                project's queue, recording the reason, the claimed project and
+                the paths that WOULD have been flagged — so reaching for this
+                is visible to an operator rather than silent (task 3123).  The
+                reason is also recorded on task metadata and emitted as a
+                WARNING audit log.
+
+                Legitimate use case, deliberately preserved: the
+                self-referential one, where a task ABOUT the path guard
+                necessarily quotes the very tokens the guard matches.  This is
+                not deprecated.
+
+                Cheaper non-bypassing alternative: supply accurate
+                ``metadata.files`` / ``files_to_modify``.  When those attest
+                work in the filing project, the task-3106
+                attribution gate suppresses the prose advisory on its own, with
+                no bypass and no audit record.  Use only when sure the task
+                belongs to the submitting project; if unsure, escalate rather
+                than risking a mis-filed task.
             task_kind: ``'normal'`` (default) or ``'deterministic'``.
                 Deterministic tasks must have ``before_done`` and/or
                 ``always_escalates=True`` in metadata.  Invariants enforced at
@@ -4479,18 +9550,21 @@ def create_mcp_server(
             return _normalized
         project_root = _normalized
 
-        # MCP-markup tripwire (task 3141 / PRD memory-write-path-convergence §9
-        # leaf o): reject leaked envelope markup FIRST, ahead of every guard
+        # MCP-markup rejection no longer happens here: task 4458 retired this
+        # tool body's in-line gate in favour of the ONE boundary guard
+        # (fused_memory.server.markup_guard), which runs ahead of every guard
         # below and well before the interceptor's description parser — DF 3083
         # showed that parser mis-parses such a fragment SILENTLY (reify task 3210
-        # filed priority=high, stored as medium). All four text fields are
-        # scanned, matching premise_lint_guard's field set at this same boundary.
-        if block := _markup_gate(
-            {'title': title, 'description': description, 'details': details, 'prompt': prompt},
-            agent_id, metadata, project_root,
-        ):
-            return block
+        # filed priority=high, stored as medium). The boundary is strictly WIDER
+        # than the four text fields this gate scanned: it scans every string
+        # argument. Only the override STRIP remains a tool-body responsibility,
+        # because the guard forwards allow_mcp_markup UNCHANGED to a tool that
+        # declares `metadata` — deleting this line would persist a write-time
+        # control flag into the task metadata vocabulary.
+        # The uuid-prefix guard forwards allow_uuid_prefix the same way, so it
+        # is stripped here too.
         metadata = strip_markup_override(metadata)
+        metadata = strip_uuid_prefix_override(metadata)
 
         # Lock-charter guard γ: reject directory strings in metadata.files
         # before forwarding to the interceptor. Covers both the normal curator
@@ -4507,6 +9581,27 @@ def create_mcp_server(
         if _det_err is not None:
             return _det_err
         metadata = inject_task_kind(metadata, task_kind)
+
+        # Retired-key guard (task 4529, plans/metadata-modules-retirement-prd.md
+        # decision 3): a NEW submission must not mint a metadata.modules
+        # carrier. Placed after inject_task_kind, which normalises metadata to a
+        # dict, and before the interceptor's planning_mode branch, so both
+        # creation paths are covered. update_task and commit_planning
+        # deliberately do not call it: existing carriers stay re-writable.
+        # It has no bypass flag (docs/task-authoring.md §8).
+        _retired_err = retired_key_modules_error(metadata)
+        if _retired_err is not None:
+            return _retired_err
+
+        # Simple-task files guard δ (task 4524, plans/module-tagger-retirement-prd.md
+        # decision 2): a complexity='simple' submission must declare
+        # metadata.files. Placed after inject_task_kind and before the
+        # interceptor's planning_mode branch, so both creation paths are
+        # covered; after ε, so a modules carrier is first told to use files.
+        # update_task and commit_planning deliberately do not call it.
+        _simple_err = simple_task_files_error(metadata)
+        if _simple_err is not None:
+            return _simple_err
 
         # model_overrides shape guard ζ (PRD adaptive-model-routing, decision 9):
         # reject a malformed metadata.model_overrides (unknown role name,
@@ -4528,6 +9623,99 @@ def create_mcp_server(
             return _exec_err
         metadata = inject_execution_class(metadata)
 
+        # Recurring-human-gate dedupe guard (task 3588) — refuse to mint a
+        # SECOND open human gate for a subject that already has one.
+        #
+        # WHY HERE. Placed after inject_execution_class and BEFORE
+        # inject_operational_routing so it reads the caller's DECLARED
+        # (execution_class, operational_mode) rather than the normalised
+        # form — that is what makes the predicate correspond to what the
+        # recon agent actually wrote, and what lets the rejection message
+        # explain itself. One placement covers the normal, planning_mode and
+        # every MCP-tool path, because the branch split happens INSIDE
+        # task_interceptor.submit_task below — the same argument the
+        # operational-routing comment records for itself.
+        #
+        # WHY RECON-SCOPED. Enforcement fires only for
+        # agent_id.startswith('recon-stage-'), mirroring execution_class_error's
+        # exemption. That is also why the corpus read below costs nothing on
+        # the general submit_task path: the guard's own cheap gates
+        # (recon-scoped, is-a-gate, has-a-subject) all run before the lambda
+        # is ever awaited, so an exempt caller pays one string startswith.
+        #
+        # statuses=sorted(ACTIVE) pushes the non-terminal filter into the
+        # backend's WHERE status IN (...) rather than fetching every task and
+        # filtering in Python — this runs on a write path. A done/cancelled
+        # carrier deliberately does NOT block: the condition genuinely
+        # recurred after closure, and a fresh gate is the right outcome.
+        #
+        # COST, MEASURED — this read is O(active corpus), NOT O(1). Even
+        # narrowed to ACTIVE it materialises the whole non-terminal corpus to
+        # answer one metadata-key lookup: 1,153 rows / 6,531,198 bytes of
+        # description+details+metadata on this repo's store (counted directly
+        # against .taskmaster/tasks/tasks.db on 2026-09-06), each row passed
+        # through _row_to_task's per-row JSON metadata parse plus a
+        # _fetch_dependencies query, and all of it discarded except the one
+        # match. That is ~1000x the information needed. It is bounded by the
+        # recon gate-FILING rate (not the submit_task rate — see WHY
+        # RECON-SCOPED above) and matches the _check_escalation_idempotency
+        # precedent, so it is not a regression; but a narrower backend read (a
+        # projection of id/status/title/metadata in the spirit of
+        # get_statuses_raw, or a metadata LIKE prefilter) is the right shape if
+        # this ever moves off the gate-filing path. Left as get_tasks here
+        # because every narrower option lives in backend/interceptor files
+        # outside task 3588's charter.
+        #
+        # FAILS OPEN. A raising lookup logs a WARNING and lets the
+        # submission through (see the guard's docstring): failing closed on a
+        # transient blip would block every recon human gate including
+        # genuinely novel ones, while failing open costs at most one
+        # duplicate — the bounded cost this guard is reducing.
+        #
+        # NAMED RESIDUAL 1. This is a CROSS-CYCLE dedupe keyed on committed
+        # task rows. In the non-planning_mode path submit_task returns only
+        # {'ticket': ...} and the row does not exist until the curator
+        # resolves it, so a second submission whose predecessor is still an
+        # unresolved TICKET has nothing to match against. Out of scope by
+        # decision: the measured failure mode is one carrier per CYCLE
+        # (5902 -> 5916 -> 5929 for subject 5879), hours-to-days apart, by
+        # which time the predecessor is a committed row this guard sees.
+        #
+        # NAMED RESIDUAL 2 — RECURRENCE IS NOT RECORDED DETERMINISTICALLY.
+        # A rejection logs a WARNING and returns the error; refreshing the
+        # existing carrier's evidence and bumping metadata.recurrence_count is
+        # left to the agent following the error's `hint`. If it does not
+        # comply the human sees a stale carrier with no sign the condition
+        # recurred for N more cycles — pre-guard, the N duplicate carriers at
+        # least made the recurrence visible. So this bounds the carrier
+        # population but can reduce the signal reaching the operator. Stamping
+        # the carrier from here would need a write callable injected alongside
+        # fetch_tasks plus a failure policy on a rejection path; out of scope
+        # for 3588 and filed as an agent-followup candidate. See the guard's
+        # "What this guard does NOT do" docstring section, which also records
+        # the TOCTOU residual (two CONCURRENT submissions for one subject can
+        # both pass this read).
+        _gate_err = await recurring_gate_guard_error(
+            metadata,
+            agent_id,
+            project_root,
+            fetch_tasks=lambda: task_interceptor.get_tasks(
+                project_root, tag, statuses=sorted(ACTIVE),
+            ),
+        )
+        if _gate_err is not None:
+            return _gate_err
+
+        # One open trigger chain per (project, skill), PRD
+        # plans/completion-driven-triggers-prd.md C2. Before the interceptor's
+        # planning_mode split, so it covers the curator and planning_mode paths;
+        # it fails open (see middleware/trigger_chain_guard.py).
+        _chain_err = await trigger_chain_open_error(
+            metadata, project_root, source=task_interceptor, tag=tag,
+        )
+        if _chain_err is not None:
+            return _chain_err
+
         # Operational-routing boundary coercion (task 2802/β) — the
         # AUTHORITATIVE operational→deterministic coercion, an unbypassable
         # boundary invariant. Maps the declared (execution_class,
@@ -4541,6 +9729,11 @@ def create_mcp_server(
         # the interceptor-side twin re-running on this coerced metadata is a
         # no-op. This deliberately reverses the declaration-only scoping of
         # tasks 2085/2563 (owner-greenlit 2026-07-19).
+        #
+        # pure_gate_from is machine-written, so a caller's copy (metadata
+        # cloned from get_task, say) is dropped here at the outer boundary,
+        # never in the twin, which must keep the stamp written just below.
+        metadata.pop(PURE_GATE_FROM_KEY, None)
         metadata = inject_operational_routing(metadata)
 
         # Premise-lint guard xi (task 2231/W5-xi) — see premise_lint_guard.py.
@@ -4549,6 +9742,19 @@ def create_mcp_server(
         )
         if _premise_err is not None:
             return _premise_err
+
+        # Enumeration liveness gate (task 3056) — see enumeration_guard's
+        # module docstring. Rebinds description/metadata to the cleaned payload.
+        _enumeration = await enumeration_gate_for_filing(
+            agent_id=agent_id,
+            description=description,
+            metadata=metadata,
+            memory_service=memory_service,
+            project_root=project_root,
+        )
+        if _enumeration.rejection is not None:
+            return _enumeration.rejection
+        description, metadata = _enumeration.description, _enumeration.metadata
 
         # Routing-intent lint (task 2563) — declaration-only: a
         # task_kind='normal' submission whose text DECLARES a different
@@ -4583,6 +9789,19 @@ def create_mcp_server(
         if _op_finding is not None:
             _op_warning = operational_suggestion_warning(_op_finding)
 
+        # Gitignored-deliverable lint (task 3611): a task_kind='normal' filing
+        # whose declared files are ALL gitignored can never produce a commit.
+        # One placement covers the curator and planning_mode paths, because
+        # their split happens inside task_interceptor.submit_task.
+        _gitignored_finding = await asyncio.to_thread(
+            gitignored_deliverable_finding,
+            task_kind=task_kind,
+            metadata=metadata,
+            probe=make_gitignore_probe(project_root),
+        )
+        if _gitignored_finding is not None and gitignored_deliverable_enforced():
+            return gitignored_deliverable_reject(_gitignored_finding)
+
         result = await task_interceptor.submit_task(
             project_root=project_root,
             prompt=prompt,
@@ -4608,6 +9827,11 @@ def create_mcp_server(
         # in result`).
         if _op_warning is not None and isinstance(result, dict) and 'error' not in result:
             result.update(_op_warning)
+        if _gitignored_finding is not None and isinstance(result, dict) and 'error' not in result:
+            result.update(gitignored_deliverable_warning(_gitignored_finding))
+            log_gitignored_deliverable_flagged(_gitignored_finding)
+        if _enumeration.stats is not None and interceptor_write_succeeded(result):
+            result['enumeration_liveness'] = _enumeration.stats
         return result
 
     @mcp.tool()
@@ -4617,20 +9841,31 @@ def create_mcp_server(
         project_root: str,
         timeout_seconds: float | None = None,
     ) -> dict[str, Any]:
-        """Phase-2 of two-phase task creation: block until the curator worker decides.
+        """Phase-2 of two-phase task creation: answer a ticket, waiting while it is pending.
 
-        Returns ``{status, task_id?, reason?}`` once the ticket is terminal.
-        If the ticket is already terminal, returns immediately.
+        OPEN statuses — not decided yet. The answer carries ``ticket`` and
+        ``reason``, never ``task_id``, and the ticket is still being curated:
+        call ``resolve_ticket`` again with the SAME ticket and never re-submit.
+        - ``pending`` — queued or in curation. ``reason`` is ``wait_timeout``
+          (the wait expired), ``wait_interrupted`` (woken while still open,
+          e.g. a shutdown) or ``store_unavailable`` (the ticket store was
+          closing).
+        - ``awaiting_curation`` — the curator could not judge it yet, so it is
+          durably parked and retried automatically; ``reason`` says why.
 
-        Status values:
-        - ``created``  — a new task was created; ``task_id`` is the numeric id.
-        - ``combined`` — candidate was folded into an existing task; ``task_id``
-          is the target task's id.
-        - ``failed``   — an error occurred; ``reason`` describes it. Common
-          reasons: ``timeout``, ``server_restart``, ``expired``.
+        TERMINAL statuses — decided; an already-terminal ticket answers at once.
+        - ``created`` — a new task was created; ``task_id`` is its id.
+        - ``combined`` — folded into an existing task; ``task_id`` is that task's id.
+        - ``refused`` — a deterministic guard (cancelled-premise blocklist /
+          recon premise registry) rejected the candidate. NO task was created
+          and NO ``task_id`` key is present. A success, not an error: never
+          retry it and never record a task id for it.
+        - ``cancelled`` — withdrawn by ``cancel_ticket``; no ``task_id`` key.
+        - ``failed`` — no task was created; no ``task_id`` key; ``reason`` says
+          why (e.g. ``server_restart``, ``worker_dead``). With no ticket row to
+          read it is ``unknown_ticket`` or ``ticket_store not configured``.
 
-        Callers that receive ``status=failed, reason=timeout`` should either
-        retry or report an error.
+        The caller rule is ``skills/_shared/ticket-failure-handling.md``.
 
         Args:
             ticket: Ticket id returned by ``submit_task`` (must start with ``tkt_``)
@@ -4639,14 +9874,14 @@ def create_mcp_server(
                 under the MCP 120 s hard limit) so external callers that omit this
                 parameter cannot hang indefinitely on an orphaned ticket.
         """
-        if not _is_ticket_id(ticket):
+        if not is_ticket_id(ticket):
             # Idempotent passthrough: if the caller passed a numeric task id,
             # short-circuit instead of erroring.  This catches agents that
             # blindly use the two-step submit/resolve dance after a
             # ``planning_mode=True`` submit_task that already returned a
             # synchronous ``task_id``.  No store lookup is performed — the
             # contract is that any numeric id is treated as already-resolved.
-            if _looks_like_task_id(ticket):
+            if looks_like_task_id(ticket):
                 return {
                     'status': 'created',
                     'task_id': str(ticket).strip(),
@@ -4691,8 +9926,12 @@ def create_mcp_server(
 
         Args:
             project_root: Absolute path to project root.
-            status: Optional status filter ('pending', 'created', 'failed',
-                'combined'). When None, all statuses are returned.
+            status: Optional status filter ('pending', 'awaiting_curation',
+                'created', 'failed', 'combined', 'refused', 'cancelled').
+                'pending' and 'awaiting_curation' are the open statuses: the
+                ticket is not decided yet. 'refused' means a deterministic
+                guard rejected the candidate and no task was created.
+                When None, all statuses are returned.
             since: Optional ISO-8601 timestamp; only tickets with
                 ``created_at >= since`` are returned. Default: now − 7 days.
             limit: Max rows to return. Clamped to [1, 2000].
@@ -4744,6 +9983,14 @@ def create_mcp_server(
         ``files_to_modify``, ``priority``, ``updated_at``, ``score`` (cosine
         similarity, higher = more similar), and ``status``.
 
+        When the task corpus cannot be searched (an embedder or Qdrant
+        outage), the reply is ``{'results': [], 'degraded': true, 'error':
+        ..., 'error_type': ..., 'billing_exhausted': <a
+        provider_billing.BillingSource value, e.g. 'api_key_credits', or
+        null>}``. That reply means the lookup FAILED, not "nothing similar
+        filed": your duplicate check did not run. What a findings
+        instrument does next is in docs/quality-findings-contract.md §8.
+
         Args:
             project_root: Absolute path to project root.
             query: Free-text query (e.g. a paraphrase of the task you're about to file).
@@ -4771,8 +10018,237 @@ def create_mcp_server(
 
     @mcp.tool()
     @mcp_tool_errors()
+    async def find_tasks_by_metadata(
+        project_root: str,
+        key: str,
+        value: Any = None,
+        statuses: Any = None,
+        limit: int = DEFAULT_LOOKUP_LIMIT,
+        offset: int = 0,
+        tag: str | None = None,
+        include_value: Any = False,
+        include_rows: Any = False,
+    ) -> dict[str, Any]:
+        """Exact lookup of the tasks whose top-level ``metadata[key]`` matches ``value``.
+
+        Searches every status, including ``deferred`` and ``cancelled``, which
+        ``search_tasks`` does not. Semantics: plans/task-metadata-lookup-prd.md.
+
+        Args:
+            project_root: Absolute path to project root.
+            key: One top-level metadata key matching ``[A-Za-z0-9_][A-Za-z0-9_-]*``.
+            value: Omit to match every task carrying ``key`` (even as JSON null).
+                A str or int matches a scalar by equality or a list by
+                membership, type-strictly: 40 does not match "40". bool, float,
+                dict and list values are rejected.
+            statuses: Optional list of task statuses to search within
+                (default: all); an unknown status is a ValidationError.
+            limit: Page size >= 1; values above 100 are clamped to 100 (default 50).
+            offset: Zero-based index into the matches, ordered by task id.
+            tag: Tag context (optional).
+            include_value: True adds ``matched_value``, the whole ``metadata[key]``.
+            include_rows: True adds ``metadata`` (the whole top-level object) and
+                ``dependencies`` (ids ascending, ``[]`` when none); ``description``
+                is never returned.
+
+        Returns ``results`` (``task_id``, ``title``, ``status``, ``priority``,
+        ``updated_at``), ``tasks_with_key`` (how many tasks in the searched
+        statuses carry ``key``), ``pagination`` (page on ``has_more`` with
+        ``offset += returned``), ``malformed_metadata_ids`` when some task's
+        metadata is not a JSON object, and the echoed arguments, ``include_rows``
+        among them. With either opt-in a page fits ``RESULT_BYTE_BUDGET``; a lone
+        over-budget row carries ``truncated_value`` / ``truncated_row`` with its
+        payload elided, so read it with ``get_task``. An ``error`` payload means
+        the lookup failed; it never means "no match".
+        """
+        paging_error = _validate_paging(limit, offset, size_arg='limit')
+        if paging_error is not None:
+            return paging_error
+        statuses_error = _validate_statuses(statuses)
+        if statuses_error is not None:
+            return statuses_error
+        page_size = min(limit, METADATA_LOOKUP_LIMIT_CAP)
+        try:
+            validate_metadata_query(
+                key=key, value=value, statuses=statuses,
+                include_value=include_value, include_rows=include_rows,
+            )
+        except InvalidMetadataLookupError as e:
+            return {'error': str(e), 'error_type': 'ValidationError'}
+        normalized = _normalize_project_root(project_root)
+        if isinstance(normalized, dict):
+            return normalized
+        found = await task_interceptor.find_tasks_by_metadata(
+            normalized, key, value,
+            statuses=statuses, limit=page_size, offset=offset, tag=tag,
+            include_value=include_value, include_rows=include_rows,
+        )
+        results = (
+            _fit_rows_to_budget(found['results'])
+            if include_value or include_rows else found['results']
+        )
+        pid = resolve_project_id(normalized)
+        response: dict[str, Any] = {
+            'project_id': pid,
+            'project_root': normalized,
+            'key': key,
+            'value': value,
+            'statuses': statuses,
+            'include_rows': include_rows,
+            'results': results,
+            'tasks_with_key': found['tasks_with_key'],
+            'pagination': _pagination_meta(
+                total=found['total'], offset=offset, page_size=page_size,
+                returned=len(results),
+            ),
+        }
+        if found['malformed_metadata_ids']:
+            response['malformed_metadata_ids'] = found['malformed_metadata_ids']
+        await _log_read(
+            'find_tasks_by_metadata',
+            project_id=pid,
+            result_summary={
+                'project_id': pid, 'key': key,
+                'total': found['total'], 'returned': len(results),
+            },
+        )
+        return response
+
+    async def _defect_write_reply(
+        project_root: str,
+        task_id: str,
+        event: DeclareEvent | OutcomeEvent,
+        *,
+        operation: Literal['declare_defect', 'record_defect_outcome'],
+        agent_id: str | None,
+        tag: str | None,
+    ) -> dict[str, Any]:
+        reply = await task_interceptor.apply_defect_events(
+            task_id, project_root, [event], operation=operation, agent_id=agent_id, tag=tag,
+        )
+        if reply.get('success') is not True:
+            return reply
+        return {**reply, 'project_id': resolve_project_id(project_root), 'project_root': project_root}
+
+    @mcp.tool()
+    @mcp_tool_errors()
+    async def declare_defect(
+        project_root: str,
+        task_id: str,
+        event: dict[str, Any],
+        tag: str | None = None,
+        agent_id: str | None = None,
+        ctx: Context | None = None,
+    ) -> dict[str, Any]:
+        """Declare a defect on a task, or record a closure, retirement or sighting of one.
+
+        Any filer may call it. ``event`` is the JSON dump of one
+        ``shared.defects`` declare event: ``Declare``, ``DeclareClosure``,
+        ``DeclareRetirement`` or ``Sighting``. It is folded into the task's
+        record for its ref (``metadata.defects``, or
+        ``metadata.defect_test_retirements`` for a retirement) in one write,
+        under the transition rules in ``shared/src/shared/defects.py``.
+
+        Refused, with nothing written: a task in a terminal status
+        (``defect_write_to_terminal_task``); a transition the rules forbid
+        (``defect_transition_refused``); a ``duplicate_of`` or
+        ``superseded_by`` ref that no task declares (``defect_ref_not_live``,
+        see ``lookup_defect_ref``); an event that is not a declare event
+        (``defect_event_invalid``). Each refusal is
+        ``{'success': False, 'error': <code>, 'task_id', ..., 'detail'}``.
+        """
+        agent_id, _ = _resolve_identity(agent_id, None, ctx)
+        if err := _reject_if_ticket_id('task_id', task_id):
+            return err
+        normalized = await asyncio.to_thread(_normalize_project_root, project_root)
+        if isinstance(normalized, dict):
+            return normalized
+        try:
+            parsed = parse_declare_wire(event)
+        except DefectEventInvalid as exc:
+            return exc.to_error_dict(task_id=task_id)
+        return await _defect_write_reply(
+            normalized, task_id, parsed, operation='declare_defect', agent_id=agent_id, tag=tag,
+        )
+
+    @mcp.tool()
+    @mcp_tool_errors()
+    async def record_defect_outcome(
+        project_root: str,
+        task_id: str,
+        ref: str,
+        event: dict[str, Any],
+        tag: str | None = None,
+        agent_id: str | None = None,
+        ctx: Context | None = None,
+    ) -> dict[str, Any]:
+        """Record a proof of, or a ruling on, the defect *ref* declared on a task.
+
+        ``event`` is the JSON dump of one ``shared.defects`` outcome event,
+        ``Proof`` or ``Rule``, and must concern *ref*
+        (``defect_ref_mismatch`` otherwise). Applied in one write under the
+        same rules and refusals as ``declare_defect``.
+
+        Its intended callers are the orchestrator workflow
+        (``SchedulerFacade.dispatch_tool``) and ``scripts/prove_defect.py``
+        (``plans/defect-tests-prd.md`` decision 7); interactive sessions are
+        Leo's trust domain and are not machine-guarded. No dispatched role's
+        ``allowed_tools`` grants it
+        (``orchestrator/tests/test_role_defect_outcome_authority.py``), but
+        that list is a permission allow list, not a denial: a dispatched
+        session that mounts fused-memory can still reach this tool, since no
+        role denies it through ``disallowed_tools`` yet.
+        """
+        agent_id, _ = _resolve_identity(agent_id, None, ctx)
+        if err := _reject_if_ticket_id('task_id', task_id):
+            return err
+        normalized = await asyncio.to_thread(_normalize_project_root, project_root)
+        if isinstance(normalized, dict):
+            return normalized
+        try:
+            parsed = parse_outcome_wire(event, ref=ref)
+        except DefectEventInvalid as exc:
+            return exc.to_error_dict(task_id=task_id)
+        return await _defect_write_reply(
+            normalized, task_id, parsed, operation='record_defect_outcome',
+            agent_id=agent_id, tag=tag,
+        )
+
+    @mcp.tool()
+    @mcp_tool_errors()
+    async def lookup_defect_ref(
+        project_root: str,
+        ref: str,
+        tag: str | None = None,
+    ) -> dict[str, Any]:
+        """The tasks, of any status, whose ``metadata.defects`` declares *ref*.
+
+        A ref is live when it has a carrier; ``declare_defect`` requires a
+        ``duplicate_of`` or ``superseded_by`` ref to be live. Returns ``ref``,
+        ``live``, ``carriers`` (``task_id``, ``task_status``,
+        ``defect_status``) and ``unreadable_task_ids``, the tasks whose
+        defect entries could not be read. A ref outside the grammar is a
+        ``ValidationError`` naming the known prefixes.
+        """
+        normalized = await asyncio.to_thread(_normalize_project_root, project_root)
+        if isinstance(normalized, dict):
+            return normalized
+        try:
+            lookup = await task_interceptor.lookup_defect_ref(normalized, ref, tag=tag)
+        except MalformedDefectRef as e:
+            return {'error': str(e), 'error_type': 'ValidationError'}
+        pid = resolve_project_id(normalized)
+        await _log_read(
+            'lookup_defect_ref',
+            project_id=pid,
+            result_summary={'project_id': pid, 'ref': ref, 'carriers': len(lookup.carriers)},
+        )
+        return {'project_id': pid, 'project_root': normalized, **lookup.as_dict()}
+
+    @mcp.tool()
+    @mcp_tool_errors()
     async def cancel_ticket(ticket_id: str) -> dict[str, Any]:
-        """Cancel a pending curator ticket by its ticket_id.
+        """Cancel a pending or parked (``awaiting_curation``) curator ticket by its ticket_id.
 
         Four outcome shapes (v1 contract):
 
@@ -4801,6 +10277,10 @@ def create_mcp_server(
         project_root: str,
         task_ids: str,
         target_status: str = 'pending',
+        deferral: dict | None = None,
+        agent_id: str | None = None,
+        manifest_root: str | None = None,
+        ctx: Context | None = None,
     ) -> dict[str, Any]:
         """Commit a batch of tasks created via ``submit_task(planning_mode=True)``.
 
@@ -4822,12 +10302,84 @@ def create_mcp_server(
             target_status: ``pending`` to release for scheduling (default),
                 ``deferred`` to leave them parked, or ``cancelled`` to discard
                 the planned batch.  Other status values are rejected.
+            deferral: Required iff ``target_status='deferred'``: what ends the
+                hold, in the ``set_task_status`` ``deferral`` shape. Each id is
+                re-stamped with it (its ``deferred_at`` is kept) and the record
+                is echoed per id as ``deferral``.
+            agent_id: Which agent is committing (optional, auto-derived from
+                MCP context); a re-stamp records it as ``stamped_by``.
+            manifest_root: Absolute path of a git worktree of
+                *project_root*'s repository that holds the batch's PRD family
+                (a PRD not yet on main). Its capability-manifest sidecar is
+                the one stamped. Omitted, the sidecar is searched for in
+                *project_root*.
+
+        RELEASE RULE (``pending``/``cancelled``): only a ``planning`` hold, or a
+        row with no record, is released. Any other hold is refused per id with
+        ``deferral_invalid`` / ``reason_code='not_planning_hold'`` and stays
+        parked; a plain ``set_task_status(status='pending')`` still releases
+        it. Each released id echoes the record it removed as
+        ``deferral_cleared`` (``None`` when there was none).
+
+        A ``pending`` commit stamps ONE shared ``metadata.pending_since``
+        across the whole batch (task 3816, PRD
+        ``plans/scheduler-dispatch-scoring-and-lock-layer-prd.md`` §C1): the
+        flip is one atomic release, so every member reads as having started
+        waiting at the same instant, and intra-batch dispatch order therefore
+        falls through to CPM and then numeric id rather than to millisecond
+        commit sequence. The property is implemented in the interceptor's CSV
+        branch, so it holds for every comma-separated ``set_task_status``
+        caller, not just this tool.
 
         A ``pending`` commit also indexes the batch into the curator corpus
         (best-effort) so ``search_tasks``/dup-detection can see these
         planning_mode tasks immediately, instead of waiting on the one-shot
         empty-corpus backfill. ``deferred``/``cancelled`` commits are never
         indexed — an abandoned or discarded batch must not pollute the corpus.
+
+        DELIVERED-CHECK POLARITY GATE (task 3500). Every batch task's
+        ``metadata.delivered_checks`` is linted against the authoring tree
+        (``main`` of *project_root*, the ref the runtime gate reads) before
+        anything is flipped. The invariant:
+        a sound delivered_check FAILS when it is written and PASSES once its
+        producer lands. A check that is already green gates nothing; a check
+        that can never go green wedges its dependent forever, and at runtime a
+        mis-authored check is indistinguishable from a genuinely undelivered
+        capability. A batch containing any such check is rejected WHOLE with
+        ``error_type='DeliveredCheckPolarityViolation'`` — nothing is flipped —
+        and the payload names each offending check, its diagnosis code
+        (``vacuous_present`` / ``vacuous_absent`` / ``filename_shaped``, plus
+        the ``vacuous_present_self_referential`` and
+        ``vacuous_present_comment_only`` refinements) and the remedy. Repair
+        the descriptor and re-commit; ``shared.delivered_check_polarity`` holds
+        the rules and ``docs/task-authoring.md`` §3.3 the author-facing guide.
+
+        The gate runs ONLY for ``target_status='pending'`` — the one status
+        that releases a task for scheduling, and so the one at which its
+        checks begin gating dependents. A ``cancelled``/``deferred`` commit
+        releases nothing, so gating it would only block cleanup of exactly the
+        mis-authored batch the author is discarding.
+
+        It fails CLOSED on a verdict and OPEN on infrastructure. A check that
+        could not be evaluated at all (no git, root not a repo, unresolvable
+        ref) is neither rejected nor silently passed: it is reported under the
+        ``delivered_check_warnings`` response key, alongside the non-blocking
+        ``absent_overbroad`` warning (an over-broad ``expect=absent`` pattern
+        is genuinely undecidable at authoring time, so it is advisory by
+        design). Each entry is ``{task_id, name, code, severity, message}``.
+        Like ``manifest_stamping``, the key is attached ONLY when non-empty,
+        so a clean batch's response is byte-identical to the pre-gate one.
+
+        A ``pending`` commit also stamps any capability-manifest sidecar the
+        batch names and attaches the ``manifest_stamping`` report, plus
+        ``manifest_stamping_action_required`` when it needs repair; it never
+        blocks the flip. The contract is the
+        ``fused_memory.server.manifest_stamping`` module docstring. A
+        ``manifest_root`` that is not an existing worktree of *project_root*'s
+        repository, or that is the main checkout itself, is refused with
+        ``error_type='ManifestRootRefused'`` and a ``reason_code`` before
+        anything is read or flipped; the rules live in
+        ``fused_memory.server.manifest_root``.
 
         Returns ``{success, results: [{task_id, result: ...}, ...]}`` matching
         the multi-id ``set_task_status`` response shape.
@@ -4859,7 +10411,7 @@ def create_mcp_server(
                 'error_type': 'ValidationError',
             }
         for tid in ids:
-            if _is_ticket_id(tid):
+            if is_ticket_id(tid):
                 return {
                     'error': (
                         f'commit_planning: task_ids must contain numeric task ids, '
@@ -4868,6 +10420,13 @@ def create_mcp_server(
                     ),
                     'error_type': 'ValidationError',
                 }
+
+        accepted_manifest_root: Path | None = None
+        if manifest_root is not None:
+            accepted = await resolve_manifest_root(project_root, manifest_root)
+            if isinstance(accepted, dict):
+                return accepted
+            accepted_manifest_root = accepted
 
         # Lock-charter guard γ: batch-read all tasks concurrently, then
         # scan for directory entries before flipping status.  asyncio.gather
@@ -4883,16 +10442,86 @@ def create_mcp_server(
         tasks_data = await asyncio.gather(
             *[task_interceptor.get_task(tid, project_root) for tid in ids]
         )
+        # Delivered-check POLARITY gate (task 3500). A delivered_check is a
+        # dep-gate: the scheduler withholds a dependent until the producer's
+        # check reports DELIVERED. A check that is already GREEN when it is
+        # written gates nothing (its dependent dispatches as if unguarded);
+        # one that can NEVER go green wedges its dependent forever — and at
+        # runtime that is indistinguishable from a genuinely undelivered
+        # capability, which is what let the measured 5799 -> 5919 wedge sit
+        # unnoticed. The invariant, enforced here: a sound delivered_check
+        # FAILS at the authoring tree and PASSES once its producer lands.
+        #
+        # The reference tree is GATE_REF (main), the tree the runtime gate
+        # reads, and needs no commit-ordering premise: commit_planning runs
+        # BEFORE the batch lands, so main IS the pre-task tree. (That does
+        # not generalize backwards to an already-landed task — see
+        # shared.delivered_check_polarity's module docstring and the
+        # status-aware scripts/audit_delivered_checks.py.)
+        #
+        # Layered INTO the lock-charter loop above deliberately: the tasks
+        # are already fetched, so the lint costs no extra get_task reads, and
+        # running it AFTER the directory_locks check keeps the lock-charter
+        # rejection's precedence — the new gate must never mask the old one.
+        # `lint_delivered_checks` shells out to git and never raises, so it
+        # goes through asyncio.to_thread rather than blocking the MCP event
+        # loop.
+        polarity_warnings: list[dict[str, Any]] = []
         for tid, task in zip(ids, tasks_data, strict=False):
             meta = task.get('metadata') if isinstance(task, dict) else None
             dirs = directory_locks(extract_files(meta))
             if dirs:
                 return lock_charter_error(dirs, task_id=tid)
 
+            # Scoped to `pending`: it is the only target status that releases
+            # a task for scheduling, and so the only one at which its
+            # delivered_checks begin gating dependents. A `cancelled` or
+            # `deferred` commit releases nothing, so gating it would only
+            # block cleanup of exactly the mis-authored batch the author is
+            # discarding.
+            if target_status != 'pending':
+                continue
+            checks = extract_delivered_checks(meta)
+            if not checks:
+                continue
+            findings = await asyncio.to_thread(
+                lint_delivered_checks,
+                checks,
+                files=extract_files(meta),
+                repo_root=project_root,
+                ref=GATE_REF,
+            )
+            if any(f.severity == 'reject' for f in findings):
+                # All-or-nothing, before the flip — mirrors the lock-charter
+                # arm above. The caller is a live agent that can repair the
+                # descriptor and re-commit, which is why this wire point
+                # REJECTS where the capability-manifest stamper (contractually
+                # never-blocking) merely refuses to copy.
+                return polarity_error(findings, task_id=tid)
+            # 'warn' (undecidable at authoring time) and 'errored' (the check
+            # could not be EVALUATED — non-git root, git missing, ref
+            # unresolvable) are reported, never blocking: fail closed on a
+            # VERDICT, fail open on INFRASTRUCTURE. Attached to the response
+            # by the step-14 arm below.
+            polarity_warnings.extend(
+                {
+                    'task_id': tid,
+                    'name': f.check_name,
+                    'code': f.code,
+                    'severity': f.severity,
+                    'message': f.message,
+                }
+                for f in findings
+            )
+
+        agent_id, _ = _resolve_identity(agent_id, None, ctx)
         result = await task_interceptor.set_task_status(
             task_id=','.join(ids),
             status=target_status,
             project_root=project_root,
+            agent_id=agent_id,
+            deferral=deferral,
+            scope=StatusWriteScope.COMMIT_PLANNING,
         )
         if target_status == 'pending':
             # Best-effort/never-raising (see index_committed_tasks docstring) —
@@ -4908,22 +10537,39 @@ def create_mcp_server(
             # Best-effort/never-raising (PRD γ, task 2578) — stamps real
             # task_ids + copies MECHANICAL delivered_checks for any batch
             # task carrying prd_path/prd_task_label metadata. Reuses the
-            # already-fetched tasks_data (no extra reads). Only attaches the
-            # report key when a sidecar actually exists on disk, so a batch
-            # with no capability-manifest involvement gets a byte-identical
-            # legacy response. agent_id is intentionally omitted: unlike most
-            # write tools in this module, commit_planning takes no
-            # agent_id/ctx parameter of its own — the set_task_status call
-            # above this one is likewise un-attributed — so passing None
-            # here is parity with that call, not a missed wiring.
+            # already-fetched tasks_data (no extra reads). Attaches the report
+            # key whenever a batch task carries prd_path (naming any derived
+            # sidecar absent from the root searched under sidecar_not_found),
+            # so a batch with no capability-manifest involvement gets a
+            # byte-identical legacy response.
             manifest_report = await stamp_capability_manifests(
                 project_root=project_root,
                 ids=ids,
                 tasks_data=list(tasks_data),
                 task_interceptor=task_interceptor,
+                agent_id=agent_id,
+                manifest_root=accepted_manifest_root,
             )
             if manifest_report is not None and isinstance(result, dict):
                 result['manifest_stamping'] = manifest_report
+                action_required = stamping_action_required(manifest_report)
+                if action_required:
+                    result['manifest_stamping_action_required'] = action_required
+        # Non-blocking half of the polarity gate (task 3500), attached in the
+        # same CONDITIONAL shape as `manifest_stamping` directly above: only
+        # when non-empty, so a clean batch's response is byte-identical to the
+        # pre-gate one (several tests in test_task_tools.py assert
+        # `result == {'success': True}` exactly).
+        #
+        # Everything reaching this list has ALREADY been decided not to block:
+        # a 'warn' is undecidable at authoring time, and an 'errored' is an
+        # availability failure — git missing, root not a repo, ref
+        # unresolvable. An unevaluable check degrades toward the PRE-GATE
+        # status quo (the task commits; its dependent dispatches ungated),
+        # never toward the wedge this gate exists to prevent — but it is
+        # reported here rather than dropped, so it is never a silent pass.
+        if polarity_warnings and isinstance(result, dict):
+            result['delivered_check_warnings'] = polarity_warnings
         return result
 
     @mcp.tool()
@@ -4944,6 +10590,7 @@ def create_mcp_server(
         dependencies: list[str] | None = None,
         agent_id: str | None = None,
         client_op_id: str | None = None,
+        expected_text_fp: str | None = None,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
         """Update an existing task.
@@ -4951,21 +10598,48 @@ def create_mcp_server(
         Prefer structured fields (``title``, ``description``, ``details``,
         ``priority``, ``status``, ``dependencies``) — agents already have
         the full context needed to set them directly. Each non-None field
-        overwrites the corresponding column.
+        overwrites the corresponding column; only ``details``/``prompt``
+        can APPEND, and only when ``append=True``. ``title``,
+        ``description`` and ``priority`` are REPLACE-ONLY, so combining any
+        of them with ``append=True`` is REJECTED rather than silently
+        overwriting what is already there (task 4039) — to EXTEND one of
+        them, ``get_task`` first, concatenate locally, and send back the
+        COMPLETE new value with ``append`` omitted.
 
         ``prompt`` is legacy: it routes through the LLM-driven Taskmaster
         path which can drift on re-rewrite. It will be removed once the
         sqlite cutover is complete.
 
-        ``title``/``description``/``details``/``prompt`` carrying raw MCP
-        envelope markup are REJECTED outright
-        (error_type=McpEnvelopeMarkupWriteRejected) before the description parser
-        sees them — same guard, same reasoning as ``submit_task``. Strip the
-        leaked fragment and resubmit, or set metadata={'allow_mcp_markup': True}
-        if you are quoting the markup deliberately (which is the case when
-        updating a task ABOUT the leak). See
-        :mod:`fused_memory.server.markup_tripwire` for the authoritative pattern
+        A call that supplies none of ``prompt``, ``metadata``, ``title``,
+        ``description``, ``details``, ``priority`` or ``dependencies`` is
+        REFUSED with ``error_type='NoFieldsToUpdateError'`` and writes nothing
+        (task 4867): it used to bump ``updated_at`` and report success, hiding
+        an argument that was misnamed and dropped. ``append``, ``metadata_mode``
+        and ``tag`` alone do not make a write.
+
+        Any string argument carrying raw MCP envelope markup — not just
+        ``title``/``description``/``details``/``prompt`` — is REJECTED outright
+        (error_type=mcp_markup_detected, or mcp_markup_unrepairable when the
+        residue cannot be parsed) before the description parser sees them — same
+        guard, same reasoning as ``submit_task``. Resubmit the ``repaired_call``
+        a mcp_markup_detected rejection carries (the COMPLETE argument map with
+        the fragment removed and any swallowed parameter restored) verbatim, or
+        set metadata={'allow_mcp_markup': True} if you are quoting the markup
+        deliberately (which is the case when updating a task ABOUT the leak). See
+        :mod:`fused_memory.server.markup_guard` for the authoritative pattern
         list and rationale.
+
+        A write that supplies ``title``/``description``/``details``/``prompt``
+        to an already-planned task (or a recon write whose audit-trail rotation
+        rewrote the description), where the task's ``metadata.plan_text_fp``
+        no longer matches the post-write description+details fingerprint,
+        returns ``amendment_advisory`` {task_id, plan_authored_at,
+        fields_changed, will_replan, plan_text_fp_before, task_text_fp_after}.
+        A running agent does not see the amendment; the task re-plans at its
+        next dispatch. ``will_replan`` is False for a done/cancelled task,
+        because the amendment reaches no work; True assumes the orchestrator's
+        default plan-fingerprint gate and a later dispatch. See
+        docs/task-authoring.md §9.
 
         Args:
             id: Task ID to update
@@ -4976,9 +10650,15 @@ def create_mcp_server(
                 Omitted keys from ``metadata`` are preserved; every supplied key
                 (scalar or list) overwrites wholesale. Use ``metadata_mode`` to
                 change this behavior.  ``allow_mcp_markup=True`` bypasses the
-                MCP-markup tripwire for deliberately quoted markup; it is
+                MCP-markup boundary guard for deliberately quoted markup; it is
                 write-time-only and stripped before the merge, so it is never
-                persisted.
+                persisted. It must be a JSON object: a dict, or a JSON string
+                encoding one. Anything else is refused in every
+                ``metadata_mode`` and nothing is written: unparseable text, or
+                a JSON string encoding a string, number or boolean, returns
+                ``error == 'metadata_not_an_object'``; an array (or a string
+                encoding one) fails argument validation before the tool runs,
+                and ``'null'`` reads as an omitted ``metadata``.
             metadata_mode: Controls how ``metadata`` is merged with the existing
                 blob. One of:
                 - ``'merge'`` (default when omitted) — shallow last-write-wins.
@@ -4986,7 +10666,17 @@ def create_mcp_server(
                 - ``'additive'`` — recursive list union+dedup, scalar/type-collision
                   OLD-wins. Use for list-append callers (dry_run_proposals, etc.).
                 - ``'replace'`` — whole-blob overwrite. Bypasses the corrupt-blob
-                  guard; the sanctioned repair path.
+                  guard; the sanctioned repair path. This is how you RETIRE a
+                  metadata key: read the task, drop the key, send the complete
+                  remainder back. It works on done/merged tasks, but you must
+                  send back the ``done_provenance`` you just read, unchanged —
+                  adding, changing or dropping it is rejected with
+                  ``error == 'done_provenance_via_update_task'``. The same
+                  holds for ``defects`` and ``defect_test_retirements``,
+                  refused with ``error == 'defect_records_via_update_task'``:
+                  after creation only ``declare_defect`` and
+                  ``record_defect_outcome`` write them, and every other mode
+                  refuses either key outright, echo included.
             append: DEPRECATED shim. ``True`` → ``'additive'``. A bare
                 ``append=False`` (no ``metadata_mode``) on a metadata write is
                 now **rejected** by the backend — it used to silently whole-blob
@@ -5000,13 +10690,31 @@ def create_mcp_server(
                 affect the details path, so callers that need details-append
                 must still pass ``append=True``; a bare ``append=False`` with NO
                 metadata is still fine (a details-only replace is not rejected).
+                Aiming ``append=True`` at a column that CANNOT append —
+                ``title``/``description``/``priority`` — is **rejected** by the
+                backend (single-sourced, same as the task-2180 guard above) and
+                surfaces as ``error_type='AppendUnsupportedFieldError'`` naming
+                the offending field(s). It used to be accepted silently and
+                OVERWRITE the column, destroying authored prose in four
+                recorded live repros (task 4039).
             tag: Tag context (optional)
-            title: New title (overwrites)
-            description: New description (overwrites)
+            title: REPLACE-ONLY. New title (overwrites). Passing it together
+                with ``append=True`` is REJECTED — see ``append`` above.
+            description: REPLACE-ONLY. New description (overwrites — it does
+                NOT append, and never has). Passing it together with
+                ``append=True`` is REJECTED (task 4039). To EXTEND a
+                description: ``get_task`` to read the current text,
+                concatenate locally, then resend the COMPLETE new description
+                with ``append`` omitted.
             details: New details (overwrites, or appends when ``append=True``)
-            priority: New priority (e.g. "high"/"medium"/"low")
+            priority: REPLACE-ONLY. New priority (e.g. "high"/"medium"/"low").
+                Passing it together with ``append=True`` is REJECTED — see
+                ``append`` above.
             status: New status (e.g. "pending"/"in-progress"/"done")
-            dependencies: Replacement list of dependency task ids (top-level only)
+            dependencies: Replacement list of dependency task ids (top-level only).
+                Each entry must exist (one already stored is exempt), must
+                not be the task itself, and must not close a local cycle (the
+                same ``DependencyCycle`` refusal as ``add_dependency``).
             agent_id: Which agent is writing (optional, auto-derived from MCP
                 context). Resolved here for uniform caller-identity attribution
                 across the task write path (task 2175/rho1b); status= writes
@@ -5017,6 +10725,18 @@ def create_mcp_server(
             client_op_id: Optional client-supplied idempotency key (task 2712).
                 A retry with the same key applies once and returns the recorded
                 outcome. Omit for today's behavior.
+            expected_text_fp: The ``task_text_fp`` from the ``get_task`` read
+                taken immediately before composing this write (task 4650).
+                REQUIRED for a recon-stage write that replaces ``description``,
+                or ``details``/``prompt`` without ``append=True``; without it
+                that write is rejected with ``ReconTaskTextBaseRequired``.
+                Optional for every other caller, and honoured whenever
+                supplied. A mismatch returns ``TaskTextBaseStale``: the text
+                changed since your read, so re-read, recompose against the
+                returned text and resend with the fresh token. A recon-stage
+                text write's response carries ``text_verified``: True only when
+                a fresh read under the write lock shows the stored field equal
+                to the written text or, under ``append=True``, ending with it.
         """
         agent_id, _ = _resolve_identity(agent_id, None, ctx)
         if err := _reject_if_ticket_id('id', id):
@@ -5026,15 +10746,15 @@ def create_mcp_server(
             return _normalized
         project_root = _normalized
 
-        # MCP-markup tripwire (task 3141 / PRD leaf o): see the matching
-        # submit_task call site above. Same four fields, same reason — they all
-        # reach the description parser DF 3083 proved mis-parses silently.
-        if block := _markup_gate(
-            {'title': title, 'description': description, 'details': details, 'prompt': prompt},
-            agent_id, metadata, project_root,
-        ):
-            return block
+        # MCP-markup rejection no longer happens here: task 4458 retired this
+        # tool body's in-line gate in favour of the ONE boundary guard — see the
+        # matching submit_task call site above. Same reason as there: the text
+        # reaches the description parser DF 3083 proved mis-parses silently. Only
+        # the override STRIP remains a tool-body responsibility.
+        # The uuid-prefix guard forwards allow_uuid_prefix the same way, so it
+        # is stripped here too.
         metadata = strip_markup_override(metadata)
+        metadata = strip_uuid_prefix_override(metadata)
 
         _dirs = directory_locks(extract_files(metadata))
         if _dirs:
@@ -5046,9 +10766,24 @@ def create_mcp_server(
         if _mo_err is not None:
             return _mo_err
 
+        # Enumeration liveness gate (task 3056), update half: see the matching
+        # submit_task call site and enumeration_guard's module docstring.
+        _enumeration = await enumeration_gate_for_update(
+            agent_id=agent_id,
+            description=description,
+            metadata=metadata,
+            memory_service=memory_service,
+            project_root=project_root,
+            metadata_mode=metadata_mode,
+            append=append,
+        )
+        if _enumeration.rejection is not None:
+            return _enumeration.rejection
+        description, metadata = _enumeration.description, _enumeration.metadata
+
         if isinstance(metadata, dict):
             metadata = json.dumps(metadata)
-        return await task_interceptor.update_task(
+        result = await task_interceptor.update_task(
             task_id=id,
             project_root=project_root,
             prompt=prompt,
@@ -5064,7 +10799,11 @@ def create_mcp_server(
             dependencies=dependencies,
             agent_id=agent_id,
             client_op_id=client_op_id,
+            expected_text_fp=expected_text_fp,
         )
+        if _enumeration.stats is not None and interceptor_write_succeeded(result):
+            result['enumeration_liveness'] = _enumeration.stats
+        return result
 
     @mcp.tool()
     @mcp_tool_errors()
@@ -5153,6 +10892,13 @@ def create_mcp_server(
         raise ``TaskmasterError`` and surface as
         ``{'error': 'TASKMASTER_TOOL_ERROR: …', 'error_type': 'TaskmasterError'}``.
 
+        A bare-integer edge that would close a dependency cycle is refused, with
+        nothing written. The walk runs over the local ``dependencies`` table at
+        every status, and the reply carries ``{'error': 'dependency_cycle',
+        'error_type': 'DependencyCycle', 'cycle': [A, B, …, A], 'hint': …}``:
+        remove one of the named edges. Qualified ``project:id`` deps are not
+        walked.
+
         Args:
             id: Task ID that will depend on another
             depends_on: Task ID that becomes a dependency.  Either a bare integer
@@ -5193,8 +10939,14 @@ def create_mcp_server(
 
         ``depends_on`` accepts two forms:
 
-        - **Bare integer** (e.g. ``"5"``): issues an unconditional ``DELETE``
-          from the integer ``dependencies`` table — the original behavior.
+        - **Bare integer** (e.g. ``"5"``): deletes the edge from the integer
+          ``dependencies`` table. One exception: removing a held follow-up's
+          holder edge is a human promotion (``by='human'``,
+          ``ref='remove_dependency'``) that also promotes the task's held
+          dependencies; the result then carries ``promoted`` (the promoted ids),
+          and a registered promotion guard can refuse it with error
+          ``followup_promotion_deferred``, nothing written. See
+          docs/task-authoring.md §3.4.
         - **Qualified** (e.g. ``"dark_factory:13"``): removes the canonical
           entry from the dependent task's ``metadata.external_deps`` list.
           ``'-'`` in the project_id is normalised to ``'_'``.  Idempotent —
@@ -5243,36 +10995,10 @@ def create_mcp_server(
     # test_set_task_status_done_does_not_clear_override_row pins both:
     #   (1) delegation wiring — task_interceptor.set_task_status.assert_called_once()
     #   (2) cross-store separation — override row survives the status transition.
+    #
+    # These tools emit no memory write of any kind (task 3853, esc-3834-1 ruling);
+    # rationale and lock: tests/test_scheduler_overrides_tools.py::test_override_write_tools_emit_no_memory_write.
     # ------------------------------------------------------------------
-
-    async def _emit_override_audit(
-        project_root: str,
-        tool_name: str,
-        task_id: str | None,
-        content: str,
-        metadata: dict,
-    ) -> None:
-        """Best-effort audit write — awaited inline; failures are logged but never propagated.
-
-        Mirrors the _log_read pattern at tools.py:272 — audit failures log
-        a warning but never fail the user-visible tool response.
-        """
-        try:
-            pid = resolve_project_id(project_root)
-            await memory_service.add_memory(
-                content=content,
-                category='decisions_and_rationale',
-                project_id=pid,
-                agent_id='scheduler-overrides',
-                metadata=metadata,
-            )
-        except Exception as audit_exc:
-            logger.warning(
-                'override audit emit failed (tool=%s task_id=%s): %s',
-                tool_name,
-                task_id,
-                audit_exc,
-            )
 
     @mcp.tool()
     @mcp_tool_errors()
@@ -5394,8 +11120,8 @@ def create_mcp_server(
                         """
                         INSERT INTO overrides
                             (project_root, task_id, boost_tier, pinned, pin_order,
-                             reserve_now, ttl_until, created_at, updated_at)
-                        VALUES (?, ?, ?, COALESCE(?, 0), ?, COALESCE(?, 0), ?, ?, ?)
+                             reserve_now, ttl_until, created_at, updated_at, source)
+                        VALUES (?, ?, ?, COALESCE(?, 0), ?, COALESCE(?, 0), ?, ?, ?, ?)
                         ON CONFLICT(project_root, task_id) DO UPDATE SET
                             boost_tier  = COALESCE(?, boost_tier),
                             pinned      = COALESCE(?, pinned),
@@ -5403,7 +11129,8 @@ def create_mcp_server(
                                                ELSE COALESCE(?, pin_order) END,
                             reserve_now = COALESCE(?, reserve_now),
                             ttl_until   = COALESCE(?, ttl_until),
-                            updated_at  = ?
+                            updated_at  = ?,
+                            source      = ?
                         """,
                         (
                             # INSERT values
@@ -5416,6 +11143,7 @@ def create_mcp_server(
                             ttl_until_iso,
                             now_iso,
                             now_iso,
+                            _OPERATOR_SOURCE,
                             # UPDATE SET values
                             boost_tier,
                             pinned_int,
@@ -5424,6 +11152,7 @@ def create_mcp_server(
                             reserve_now_int,
                             ttl_until_iso,
                             now_iso,
+                            _OPERATOR_SOURCE,
                         ),
                     )
                     await db.execute('COMMIT')
@@ -5437,31 +11166,6 @@ def create_mcp_server(
         if collision_response is not None:
             return collision_response
 
-        # Build changed_fields for audit (use original ttl_secs, not derived absolute).
-        changed_fields: dict[str, Any] = {}
-        if boost_tier is not None:
-            changed_fields['boost_tier'] = boost_tier
-        if pinned is not None:
-            changed_fields['pinned'] = pinned
-        if pin_order is not None:
-            # Intentionally the post-auto-assignment value — if pinned=True was
-            # supplied without an explicit pin_order, this records the integer
-            # that was actually written to the DB (auto-MAX+1 logic above).
-            # Contrast with ttl_secs below, which is intentionally the raw
-            # caller-supplied input rather than the derived ttl_until ISO string.
-            changed_fields['pin_order'] = pin_order
-        if reserve_now is not None:
-            changed_fields['reserve_now'] = reserve_now
-        if ttl_secs is not None:
-            changed_fields['ttl_secs'] = ttl_secs
-
-        await _emit_override_audit(
-            project_root,
-            'set_task_priority_override',
-            task_id,
-            f'Set priority override for task {task_id}: {changed_fields}',
-            {'task_id': task_id, 'fields': changed_fields},
-        )
         return {'success': True, 'task_id': task_id}
 
     @mcp.tool()
@@ -5533,14 +11237,6 @@ def create_mcp_server(
         finally:
             await db.close()
 
-        label = 'all' if field is None else field
-        await _emit_override_audit(
-            project_root,
-            'clear_task_priority_override',
-            task_id,
-            f'Cleared {label} priority override(s) for task {task_id}',
-            {'task_id': task_id, 'field': field},
-        )
         return {'success': True, 'task_id': task_id, 'field': field}
 
     @mcp.tool()
@@ -5637,13 +11333,6 @@ def create_mcp_server(
         finally:
             await db.close()
 
-        await _emit_override_audit(
-            project_root,
-            'reorder_pin_queue',
-            None,
-            f'Reordered pin queue: {ordered_task_ids}',
-            {'ordered_task_ids': list(ordered_task_ids)},
-        )
         return {'success': True}
 
     @mcp.tool()
@@ -5653,14 +11342,17 @@ def create_mcp_server(
     ) -> dict[str, Any]:
         """Return the current pinned-task queue in ascending pin_order.
 
-        Read-only.  Does NOT emit an audit add_memory call.
+        Read-only.
 
         Args:
             project_root: Absolute path to project root.
 
         Returns:
             ``{'pin_queue': [{'task_id': ..., 'boost_tier': ..., 'pinned': ...,
-            'pin_order': ..., 'reserve_now': ..., 'ttl_until': ...}, ...]}``
+            'pin_order': ..., 'reserve_now': ..., 'ttl_until': ...,
+            'source': ...}, ...]}`` where ``source`` is ``'operator'`` or
+            ``'starvation_watchdog'`` (a watchdog auto-pin, which carries a
+            ``ttl_until``).
         """
         _normalized = _normalize_project_root(project_root)
         if isinstance(_normalized, dict):
@@ -5669,7 +11361,8 @@ def create_mcp_server(
         db = await _open_overrides_db(project_root)
         try:
             cursor = await db.execute(
-                'SELECT task_id, boost_tier, pinned, pin_order, reserve_now, ttl_until '
+                'SELECT task_id, boost_tier, pinned, pin_order, reserve_now, '
+                'ttl_until, source '
                 'FROM overrides '
                 'WHERE project_root=? AND pinned=1 '
                 'ORDER BY pin_order ASC',
@@ -5684,6 +11377,7 @@ def create_mcp_server(
                     'pin_order': r[3],
                     'reserve_now': bool(r[4]),
                     'ttl_until': r[5],
+                    'source': r[6],
                 }
                 for r in rows
             ]
@@ -5708,15 +11402,15 @@ def create_mcp_server(
             project_root: Absolute path to project root.
 
         Returns:
-            Snapshot dict with keys: skip_counts, parks, effective_priorities,
-            pin_queue, overrides, current_holders, snapshot_at.
-            Returns the empty skeleton when no snapshot file exists yet.
+            Every SchedulerStateSnapshot field. ``snapshot_at`` is
+            null when no orchestrator has written a snapshot yet.
         """
         _normalized = _normalize_project_root(project_root)
         if isinstance(_normalized, dict):
             return _normalized
         project_root = _normalized
-        return await asyncio.to_thread(read_scheduler_state, Path(project_root))
+        snapshot = await asyncio.to_thread(read_scheduler_state, Path(project_root))
+        return snapshot.to_json()
 
     @mcp.tool()
     @mcp_tool_errors()

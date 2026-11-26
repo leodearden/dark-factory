@@ -5,6 +5,7 @@ Tests here cover:
   - Cross-tier preemption (higher-priority park SHADOWS lower-priority overlap)
   - Park-stack invariants INV-1 through INV-7
   - prune_owners(predicate) owner-state GC
+  - the pin reservation rank band (task 6040)
 
 Existing ModuleLockTable / hierarchical locking / conflicts tests remain in
 test_scheduler.py alongside TestModuleLockTable / TestHierarchicalLocking.
@@ -12,10 +13,25 @@ test_scheduler.py alongside TestModuleLockTable / TestHierarchicalLocking.
 
 from __future__ import annotations
 
+import logging
+import subprocess
+import sys
+from datetime import UTC, datetime, timedelta
+
 import pytest
 
-from orchestrator.config import OrchestratorConfig
-from orchestrator.scheduler import ModuleLockTable
+from orchestrator.config import PRIORITY_RANK, OrchestratorConfig
+from orchestrator.lock_table import ModuleLockTable
+from orchestrator.pin_reservation import (
+    Blocker,
+    BlockerKind,
+    PinOrder,
+    ReservationSource,
+    park_rank,
+)
+
+#: Fixed park-install instant for the park-age tests (task 3823 / PRD task η).
+PARK_T0 = datetime(2026, 8, 1, 0, 0, 0, tzinfo=UTC)
 
 
 def _lt(lock_depth: int = 2) -> ModuleLockTable:
@@ -73,6 +89,127 @@ class TestInstallParksApi:
             lt.install_parks('A', ['backend'], deadline=9999.0)  # type: ignore[call-arg]
 
 
+def _stack(lt: ModuleLockTable, module: str) -> list[tuple[str, int]]:
+    """``module``'s park stack as bottom->top ``(owner, rank)`` pairs."""
+    return [(e['owner'], e['rank']) for e in lt.snapshot_park_stacks().get(module, [])]
+
+
+class TestInstallParksIsIdempotentPerOwner:
+    """An owner already parked on a key is never pushed onto it again (task 5308)."""
+
+    def test_reinstall_on_a_key_the_owner_tops_pushes_nothing(self):
+        lt = _lt()
+        lt.install_parks('T', ['m1'], 'high')
+        installed, shadowed = lt.install_parks('T', ['m1'], 'high')
+        assert installed == [], 're-install on an owned top must install nothing'
+        assert shadowed == []
+        assert _stack(lt, 'm1') == [('T', PRIORITY_RANK['high'])], (
+            're-install on an owned top must leave exactly one T entry'
+        )
+
+    def test_reinstall_by_a_buried_owner_pushes_no_second_entry(self):
+        lt = _lt()
+        lt.install_parks('T', ['m1'], 'low')
+        lt.install_parks('H', ['m1'], 'high')
+        installed, _ = lt.install_parks('T', ['m1'], 'low')
+        assert installed == [], 'a buried owner re-installing must install nothing'
+        assert _stack(lt, 'm1') == [
+            ('T', PRIORITY_RANK['low']),
+            ('H', PRIORITY_RANK['high']),
+        ], 'a buried owner re-installing must not gain a second entry'
+        lt.clear_parks_for('H')
+        assert _stack(lt, 'm1') == [('T', PRIORITY_RANK['low'])], (
+            'clearing H must restore T as the sole top'
+        )
+        assert not lt.try_acquire('X', ['m1']), 'the restored T park must still block X'
+
+    def test_two_paths_normalizing_to_one_key_push_once(self):
+        lt = _lt(lock_depth=2)
+        installed, _ = lt.install_parks('T', ['pkg/a/x.py', 'pkg/a/y.py'], 'high')
+        assert installed == ['pkg/a'], 'one call with two same-key paths installs the key once'
+        assert _stack(lt, 'pkg/a') == [('T', PRIORITY_RANK['high'])], (
+            'one call with two same-key paths must push one entry'
+        )
+
+    def test_a_lower_tier_reinstall_never_downgrades_the_owner(self):
+        lt = _lt()
+        lt.install_parks('T', ['m1'], 'critical')
+        installed, _ = lt.install_parks('T', ['m1'], 'high')
+        assert installed == [], 'a lower-tier re-install by the owner installs nothing'
+        assert _stack(lt, 'm1') == [('T', PRIORITY_RANK['critical'])], (
+            'the owner must keep its single critical-rank entry'
+        )
+        competitor_installed, _ = lt.install_parks('U', ['m1'], 'critical')
+        assert competitor_installed == [], 'a same-tier competitor that T precedes must not shadow T'
+        assert _stack(lt, 'm1')[-1] == ('T', PRIORITY_RANK['critical']), (
+            'T must stay the active top on m1'
+        )
+
+    def test_a_higher_tier_reinstall_reranks_the_owners_top_in_place(self):
+        lt = _lt()
+        lt.install_parks('L', ['m1'], 'low')
+        lt.install_parks('T', ['m1'], 'medium')
+        installed, shadowed = lt.install_parks('T', ['m1'], 'critical')
+        assert installed == ['m1'], 'a rank upgrade reports the re-ranked key'
+        assert shadowed == [], 'L was already beneath T, so nothing is newly shadowed'
+        assert _stack(lt, 'm1') == [
+            ('L', PRIORITY_RANK['low']),
+            ('T', PRIORITY_RANK['critical']),
+        ], 'the upgrade replaces the medium entry rather than adding a second one'
+        competitor_installed, _ = lt.install_parks('C', ['m1'], 'high')
+        assert competitor_installed == [], 'a high competitor must not shadow the upgraded T'
+
+    def test_a_higher_tier_reinstall_lifts_a_buried_owner_over_a_lower_top(self):
+        lt = _lt()
+        lt.install_parks('T', ['m1'], 'low')
+        lt.install_parks('H', ['m1'], 'high')
+        installed, shadowed = lt.install_parks('T', ['m1'], 'critical')
+        assert installed == ['m1'], 'a lifted owner reports the key'
+        assert shadowed == [('H', ['m1'])], 'the lifted owner now shadows H'
+        assert _stack(lt, 'm1') == [
+            ('H', PRIORITY_RANK['high']),
+            ('T', PRIORITY_RANK['critical']),
+        ], 'T leaves its buried low slot and tops the stack at critical'
+        assert lt.clear_parks_for('T') == [('H', ['m1'])], 'clearing T restores H'
+
+    def test_a_blocked_rank_upgrade_keeps_the_owners_entry(self):
+        lt = _lt()
+        lt.install_parks('T', ['m1'], 'low')
+        lt.install_parks('H', ['m1'], 'critical')
+        installed, _ = lt.install_parks('T', ['m1'], 'critical')
+        assert installed == [], 'a same-tier top blocks the upgrade (INV-3)'
+        assert _stack(lt, 'm1') == [
+            ('T', PRIORITY_RANK['low']),
+            ('H', PRIORITY_RANK['critical']),
+        ], 'a blocked upgrade leaves T its buried low entry'
+
+
+class TestUnparkedModules:
+    """``unparked_modules`` — the completion rule's remainder (task 5308)."""
+
+    def test_normalizes_deduplicates_and_sorts(self):
+        lt = _lt(lock_depth=2)
+        assert lt.unparked_modules('T', ['b/x/1.py', 'a/y/2.py', 'b/x/3.py']) == ['a/y', 'b/x']
+
+    def test_subtracts_keys_the_owner_parks_at_any_level(self):
+        lt = _lt()
+        lt.install_parks('T', ['m1'], 'low')
+        lt.install_parks('T', ['m2'], 'low')
+        lt.install_parks('H', ['m2'], 'high')
+        assert _stack(lt, 'm2')[-1][0] == 'H', 'premise: T is buried under H on m2'
+        assert lt.unparked_modules('T', ['m1', 'm2', 'm3']) == ['m3']
+
+    def test_another_owners_parks_do_not_count(self):
+        lt = _lt()
+        lt.install_parks('H', ['m1'], 'high')
+        assert lt.unparked_modules('T', ['m1']) == ['m1']
+
+    def test_empty_input_and_empty_modules_yield_nothing(self):
+        lt = _lt()
+        assert lt.unparked_modules('T', []) == []
+        assert lt.unparked_modules('T', ['', 'm1']) == ['m1']
+
+
 class TestInstallParksPreemption:
     """Cross-tier preemption: higher-priority park SHADOWS lower-priority overlap."""
 
@@ -89,8 +226,10 @@ class TestInstallParksPreemption:
         assert lt.has_parks('L')  # L is retained in the shadow stack (INV-5)
         # H's park on m1 means L cannot acquire m1 while H is on top (INV-2).
         assert not lt.try_acquire('L', ['m1'])
-        # L's park on m2 remains — H cannot acquire m2.
-        assert not lt.try_acquire('H', ['m2'])
+        # L's park on m2 remains: a parkless task cannot acquire m2, while H
+        # outranks it and passes it (task 7799, INV-8).
+        assert not lt.try_acquire('X', ['m2'])
+        assert lt.park_owners_blocking('H', ['m2']) == []
         # After H completes (clear), L is RESTORED as the active top on m1 (INV-4).
         lt.clear_parks_for('H')
         assert lt.try_acquire('L', ['m1'])
@@ -195,7 +334,7 @@ class TestParkStackInvariants:
         assert lt.try_acquire('H', ['m1']), 'Active-top H must be able to acquire its module'
 
     def test_inv3_same_tier_blocks_install_no_push(self):
-        """INV-3: same-priority existing top BLOCKS a new install (no push, no shadow)."""
+        """INV-3: a same-tier existing top that precedes the installer (A before B) BLOCKS it (no push, no shadow)."""
         lt = _lt()
         lt.install_parks('A', ['m1'], 'medium')
         installed, shadowed = lt.install_parks('B', ['m1'], 'medium')
@@ -535,3 +674,691 @@ class TestForceClear:
         modules, restored = lt.force_clear('nobody')
         assert modules == []
         assert restored == []
+
+
+# ===========================================================================
+# Park age: injectable wall clock + the age reader (task 3823 / PRD task η)
+# ===========================================================================
+#
+# C7 refuses backfill through a park older than backfill_max_park_age_secs.
+# Today `_park_install_at` is stamped with a bare `datetime.now(UTC)`
+# (scheduler.py:998) — uninjected, so no test can drive a park to a chosen
+# age without poking a private dict.  These tests assert the seam.
+
+
+class TestParkInstallClock:
+    """``ModuleLockTable`` stamps park installs from an injectable wall clock."""
+
+    def test_injected_wall_clock_stamps_installed_at(self):
+        lt = ModuleLockTable(
+            OrchestratorConfig(max_per_module=1),
+            wall_time_source=lambda: PARK_T0,
+        )
+
+        lt.install_parks('P', ['m1'], priority='medium')
+
+        assert lt.snapshot_parks()['P']['installed_at'] == PARK_T0.isoformat()
+
+    def test_default_wall_clock_still_stamps_a_parseable_iso_utc_string(self):
+        """No injection -> the real clock, and the stamp stays round-trippable."""
+        lt = _lt()
+
+        lt.install_parks('P', ['m1'], priority='medium')
+
+        stamp = lt.snapshot_parks()['P']['installed_at']
+        parsed = datetime.fromisoformat(stamp)
+        assert parsed.tzinfo is not None, f'stamp must be tz-aware; got {stamp!r}'
+        assert parsed.utcoffset() == timedelta(0), (
+            f'stamp must be UTC; got {stamp!r}'
+        )
+
+    def test_scheduler_passes_its_own_wall_clock_down_to_the_lock_table(self):
+        """Scheduler-level tests must be able to control park age end-to-end.
+
+        The Scheduler already injects its wall clock into ``_emit_lock_event``;
+        park stamps must share that same epoch, or an age computed against
+        ``Scheduler._wall_now()`` would be measured across two unrelated clocks.
+        """
+        from orchestrator.scheduler import Scheduler
+
+        scheduler = Scheduler(
+            OrchestratorConfig(max_per_module=1),
+            wall_time_source=lambda: PARK_T0,
+        )
+
+        scheduler.lock_table.install_parks('P', ['m1'], priority='medium')
+
+        assert scheduler.lock_table.snapshot_parks()['P']['installed_at'] == (
+            PARK_T0.isoformat()
+        )
+
+    def test_second_install_does_not_refresh_the_stamp(self):
+        """``setdefault`` semantics are load-bearing, not incidental.
+
+        C7's ``park_age(p)`` means the owner's TOTAL wait.  A stamp refreshed
+        on every re-install would reset the age each time the owner re-parked,
+        so an indefinitely-starving park would read as permanently fresh and
+        keep admitting backfillers through it — the precise failure the age
+        cutoff exists to stop.
+        """
+        clock = {'now': PARK_T0}
+        lt = ModuleLockTable(
+            OrchestratorConfig(max_per_module=1),
+            wall_time_source=lambda: clock['now'],
+        )
+        lt.install_parks('P', ['m1'], priority='medium')
+
+        clock['now'] = PARK_T0 + timedelta(seconds=900)
+        lt.install_parks('P', ['m2'], priority='medium')
+
+        assert lt.snapshot_parks()['P']['installed_at'] == PARK_T0.isoformat()
+
+
+class TestParkAgeSecs:
+    """``park_age_secs(owner, *, now)`` — the READ that gates admission.
+
+    ``None`` means "age unknown => the caller must REFUSE".  This is
+    deliberately the OPPOSITE of the dashboard's ``_park_age_seconds``
+    (dashboard/src/dashboard/data/scheduler.py:297-328), which fails soft to
+    0 for display.  A soft 0 here would make an unreadable park look brand
+    new and ADMIT a backfill through it — fail-soft in the unsafe direction.
+    """
+
+    def test_age_is_now_minus_install(self):
+        lt = ModuleLockTable(
+            OrchestratorConfig(max_per_module=1),
+            wall_time_source=lambda: PARK_T0,
+        )
+        lt.install_parks('P', ['m1'], priority='medium')
+
+        age = lt.park_age_secs('P', now=PARK_T0 + timedelta(seconds=900))
+
+        assert age == pytest.approx(900.0)
+
+    def test_unknown_owner_is_none_not_zero(self):
+        lt = _lt()
+
+        assert lt.park_age_secs('never-parked', now=PARK_T0) is None
+
+    def test_unparseable_stamp_is_none_and_warns(self, caplog):
+        lt = _lt()
+        lt.install_parks('P', ['m1'], priority='medium')
+        lt._park_install_at['P'] = 'not-a-timestamp'
+
+        with caplog.at_level(logging.WARNING):
+            age = lt.park_age_secs('P', now=PARK_T0)
+
+        assert age is None, (
+            'an unreadable stamp must refuse, not read as a fresh park'
+        )
+        assert any('P' in record.getMessage() for record in caplog.records), (
+            'the warning must name the owner whose stamp could not be parsed; '
+            f'got {[r.getMessage() for r in caplog.records]}'
+        )
+
+    def test_future_stamp_clamps_to_zero(self):
+        """Clock skew must not read as a NEGATIVE age.
+
+        A negative age would sail under any ``age > max_park_age_secs`` cutoff,
+        so an NTP step backwards would silently re-open admission through
+        arbitrarily old parks.
+        """
+        lt = ModuleLockTable(
+            OrchestratorConfig(max_per_module=1),
+            wall_time_source=lambda: PARK_T0 + timedelta(seconds=600),
+        )
+        lt.install_parks('P', ['m1'], priority='medium')
+
+        assert lt.park_age_secs('P', now=PARK_T0) == 0.0
+
+    def test_age_measures_total_wait_across_reinstalls(self):
+        """The age tracks the FIRST install, matching ``setdefault``."""
+        clock = {'now': PARK_T0}
+        lt = ModuleLockTable(
+            OrchestratorConfig(max_per_module=1),
+            wall_time_source=lambda: clock['now'],
+        )
+        lt.install_parks('P', ['m1'], priority='medium')
+        clock['now'] = PARK_T0 + timedelta(seconds=300)
+        lt.install_parks('P', ['m2'], priority='medium')
+
+        age = lt.park_age_secs('P', now=PARK_T0 + timedelta(seconds=900))
+
+        assert age == pytest.approx(900.0), (
+            'age must run from the FIRST install (total wait), not the latest'
+        )
+
+
+# ===========================================================================
+# The two primitives backfill admission needs (task 3823 / PRD task η, C7)
+# ===========================================================================
+
+
+class TestParkOwnersBlocking:
+    """``park_owners_blocking(task_id, modules)`` — WHO would refuse this request.
+
+    ``_is_parked_blocks`` answers only bool, one module at a time, and names
+    nobody; admission has to know which park owners it would be borrowing
+    from.  The accessor must reuse the SAME rank-aware rule ``try_acquire``
+    enforces (INV-5) — a second, subtly different rule would admit through
+    parks the lock layer then refuses, producing churn with no dispatch.
+    """
+
+    def test_conflicting_park_names_its_owner(self):
+        lt = _lt()
+        lt.install_parks('P', ['m1'], priority='medium')
+
+        assert lt.park_owners_blocking('C', ['m1']) == ['P']
+
+    def test_non_conflicting_park_is_not_a_backfill_target(self):
+        """C7's ``c.modules ∩ M ≠ ∅`` clause: no intersection, no target."""
+        lt = _lt()
+        lt.install_parks('P', ['other'], priority='medium')
+
+        assert lt.park_owners_blocking('C', ['m1']) == []
+
+    def test_buried_park_never_appears(self):
+        """Only active tops block, so only active tops can be lent (INV-2)."""
+        lt = _lt()
+        lt.install_parks('L', ['m1'], priority='low')
+        lt.install_parks('T', ['m1'], priority='high')  # shadows L
+
+        assert lt.park_owners_blocking('C', ['m1']) == ['T']
+
+    def test_requesters_own_park_never_appears(self):
+        lt = _lt()
+        lt.install_parks('P', ['m1'], priority='medium')
+
+        assert lt.park_owners_blocking('P', ['m1']) == []
+
+    def test_preemptable_foreign_top_never_appears(self):
+        """A foreign top the requester outranks does not block, so is no target.
+
+        R holds a high-priority park on a/b/c while F holds a low-priority park
+        on the parent a/b.  ``_is_parked_blocks`` lets R through (its own
+        dominant conflicting rank is strictly lower), so the accessor must
+        agree — otherwise admission would invent a lender for a request that
+        was never blocked.
+        """
+        lt = _lt(lock_depth=3)
+        lt.install_parks('F', ['a/b'], priority='low')
+        lt.install_parks('R', ['a/b/c'], priority='high')
+
+        assert lt.park_owners_blocking('R', ['a/b/c']) == []
+
+    def test_hierarchical_conflict_is_detected(self):
+        lt = _lt(lock_depth=3)
+        lt.install_parks('P', ['a/b'], priority='medium')
+
+        assert lt.park_owners_blocking('C', ['a/b/c']) == ['P']
+
+    def test_two_blocking_owners_both_returned_sorted(self):
+        """Admission is a conjunction over ALL of them, so it must see all."""
+        lt = _lt()
+        lt.install_parks('P2', ['m2'], priority='medium')
+        lt.install_parks('P1', ['m1'], priority='medium')
+
+        assert lt.park_owners_blocking('C', ['m1', 'm2']) == ['P1', 'P2']
+
+    def test_two_owners_blocking_ONE_requested_module_are_both_returned(self):
+        """Two parks on sibling CHILDREN of one requested parent.
+
+        The per-module answer is not one owner: ``a/b/x`` and ``a/b/y`` each
+        conflict with a request for ``a/b``, so both owners block it.  A
+        first-match rule would name only one, and the ``admitted_parks`` set
+        built from that name is then handed to ``try_acquire`` — which
+        re-checks EVERY park and refuses on the owner nobody named.
+
+        That failure is silent: admission certifies, pays for the whole
+        prediction pipeline, and the second acquire fails every tick, so
+        backfill is simply impossible in this topology with no signal saying
+        so.  Hence both halves are asserted here — the naming AND the acquire
+        it is supposed to enable.
+        """
+        lt = _lt(lock_depth=3)
+        lt.install_parks('o1', ['a/b/x'], priority='medium')
+        lt.install_parks('o2', ['a/b/y'], priority='medium')
+
+        assert lt.park_owners_blocking('c', ['a/b']) == ['o1', 'o2']
+
+        # Naming one is not enough — the other still refuses (this is the
+        # observable consequence a first-match rule would produce).
+        assert lt.try_acquire('c', ['a/b'], admitted_parks=frozenset({'o1'})) is False
+        assert 'c' not in lt._held
+        # Naming both is what the accessor now makes possible.
+        assert lt.try_acquire(
+            'c', ['a/b'], admitted_parks=frozenset({'o1', 'o2'})
+        ) is True
+        assert lt._held['c'] == {'a/b'}
+
+
+class TestBlockingHolders:
+    """``blocking_holders(modules, *, exclude_task)`` — which modules are still
+    held, and by whom.  Feeds ``_provable_assembly_delay``: a parked owner's
+    wait is only provable through the holders that are actually blocking it.
+    """
+
+    def test_all_free_is_an_empty_mapping(self):
+        lt = _lt()
+
+        assert lt.blocking_holders(['m1', 'm2'], exclude_task='P') == {}
+
+    def test_held_module_maps_to_its_holder(self):
+        lt = _lt()
+        lt.try_acquire('H', ['m1'])
+
+        assert lt.blocking_holders(['m1'], exclude_task='P') == {'m1': ['H']}
+
+    def test_excluded_task_is_not_its_own_blocker(self):
+        lt = _lt()
+        lt.try_acquire('P', ['m1'])
+
+        assert lt.blocking_holders(['m1'], exclude_task='P') == {}
+
+    def test_limit_is_honoured_not_just_presence(self):
+        """``max_per_module=2`` with ONE holder is not blocked.
+
+        Reusing ``_limit_for`` rather than "is anyone holding it" matters:
+        a module with headroom is free for the parked owner to take, so it
+        contributes no delay to lend.
+        """
+        lt = ModuleLockTable(OrchestratorConfig(max_per_module=2, lock_depth=2))
+        lt.try_acquire('H1', ['m1'])
+
+        assert lt.blocking_holders(['m1'], exclude_task='P') == {}
+
+        lt.try_acquire('H2', ['m1'])
+        assert lt.blocking_holders(['m1'], exclude_task='P') == {'m1': ['H1', 'H2']}
+
+    def test_hierarchical_hold_blocks_the_child_request(self):
+        lt = _lt(lock_depth=3)
+        lt.try_acquire('H', ['a/b'])
+
+        assert lt.blocking_holders(['a/b/c'], exclude_task='P') == {'a/b/c': ['H']}
+
+
+class TestTryAcquireAdmittedParks:
+    """``try_acquire(..., admitted_parks=...)`` bypasses the PARK gate only.
+
+    The held-lock ``_holders_counted_against >= _limit_for`` gate is untouched and
+    evaluated on live state at call time.  That is the whole safety property
+    of C7 (INV-3): the scoring-time view is advisory, and ``try_acquire``
+    under the lock remains the acting basis.
+    """
+
+    def test_default_behaviour_is_unchanged(self):
+        lt = _lt()
+        lt.install_parks('P', ['m1'], priority='medium')
+
+        assert lt.try_acquire('C', ['m1']) is False
+
+    def test_admitted_park_lets_the_request_through(self):
+        lt = _lt()
+        lt.install_parks('P', ['m1'], priority='medium')
+
+        assert lt.try_acquire('C', ['m1'], admitted_parks=frozenset({'P'})) is True
+        assert lt._held['C'] == {'m1'}
+
+    def test_admitted_acquire_does_not_disturb_the_park(self):
+        """Backfill BORROWS a gap; it does not evict.
+
+        PRD §7 rejects preemption of a held lock, and this is the mirror-image
+        discipline for parks: after an admitted acquire the park must be
+        present, un-shadowed and at its original rank, so the owner's claim is
+        exactly as strong as before.
+        """
+        lt = _lt()
+        lt.install_parks('P', ['m1'], priority='medium')
+        before = lt.snapshot_park_stacks()
+
+        lt.try_acquire('C', ['m1'], admitted_parks=frozenset({'P'}))
+
+        assert lt.snapshot_park_stacks() == before
+        assert lt.snapshot_parks()['P']['modules'] == ['m1']
+
+    def test_a_real_holder_still_refuses(self):
+        """INV-3: the limit gate is untouched and remains the acting basis."""
+        lt = _lt()
+        lt.install_parks('P', ['m1'], priority='medium')
+        lt.try_acquire('H', ['m1'], admitted_parks=frozenset({'P'}))
+
+        assert lt.try_acquire('C', ['m1'], admitted_parks=frozenset({'P'})) is False
+        assert 'C' not in lt._held
+
+    def test_admitting_one_owner_does_not_admit_another(self):
+        """Admission is per-owner; a second blocking park still refuses."""
+        lt = _lt()
+        lt.install_parks('P', ['m1'], priority='medium')
+        lt.install_parks('Q', ['m2'], priority='medium')
+
+        assert lt.try_acquire(
+            'C', ['m1', 'm2'], admitted_parks=frozenset({'P'})
+        ) is False
+
+    def test_lock_expansion_still_refuses_a_foreign_park(self):
+        """Plan-refinement lock EXPANSION is not a backfill path.
+
+        C7 anchors on the dispatch scan.  An in-flight task widening its lock
+        set has no admission decision behind it — no predicted-hold check, no
+        safety factor, no park-age cutoff — so it must keep refusing parks
+        unconditionally, with no bypass of any name available to it.
+
+        Stated behaviourally rather than by asserting on
+        ``try_acquire_additional``'s parameter names: renaming the kwarg would
+        leave a name assertion green with the bypass fully present, and a
+        harmless ``**kwargs`` refactor would fail it while nothing changed.
+        """
+        # Positive control FIRST, on its own table: with m2 free the expansion
+        # succeeds, so the refusal below is attributable to the park and not
+        # to a setup that could never have expanded at all.
+        control = _lt()
+        assert control.try_acquire('C', ['m1'])
+        assert control.try_acquire_additional('C', ['m2']) is True
+        assert control._held['C'] == {'m1', 'm2'}
+
+        lt = _lt()
+        assert lt.try_acquire('C', ['m1']), 'C must hold an adjacent module first'
+        lt.install_parks('P', ['m2'], priority='medium')
+
+        assert lt.try_acquire_additional('C', ['m2']) is False
+        assert lt._held['C'] == {'m1'}, (
+            'the expansion was refused but something was acquired anyway — '
+            'try_acquire_additional must refuse before mutating _held'
+        )
+
+
+# ===========================================================================
+# Pin reservations (task 6040) — the pin rank band on the ordinary park stacks
+# ===========================================================================
+
+
+class TestPinReservationRank:
+    """A pin reservation is a park-stack entry at a rank above every tier.
+
+    Pin order is encoded in the rank, so "a pin outranks every fairness park"
+    and "among pins, pin_order decides" are both properties of the lock table
+    itself — INV-1 shadowing and task 1865's LIFO restore do the rest, and
+    the held-lock gate is never involved.
+    """
+
+    def test_the_pin_band_sits_above_critical_and_is_monotone_in_pin_order(self):
+        ranks = [PinOrder(n).rank for n in (0, 1, 2, 50)]
+        assert ranks == sorted(ranks), 'a lower pin_order must be a better (lower) rank'
+        assert len(set(ranks)) == len(ranks), 'distinct pin orders must not tie'
+        assert max(ranks) < PRIORITY_RANK['critical'], 'every pin rank must beat critical'
+        assert park_rank(PinOrder(3)) == PinOrder(3).rank
+        assert park_rank('high') == PRIORITY_RANK['high']
+
+    def test_a_pin_shadows_a_critical_fairness_park_and_restores_it(self):
+        lt = _lt()
+        lt.install_parks('C', ['w.py'], 'critical')
+
+        installed, shadowed = lt.install_parks('P', ['w.py'], PinOrder(1))
+
+        assert installed == ['w.py']
+        assert shadowed == [('C', ['w.py'])]
+        assert [e['owner'] for e in lt.snapshot_park_stacks()['w.py']] == ['C', 'P']
+        assert lt.clear_parks_for('P') == [('C', ['w.py'])]
+        assert [e['owner'] for e in lt.snapshot_park_stacks()['w.py']] == ['C'], (
+            'clearing the pin must make the critical park the top again'
+        )
+
+    def test_a_lower_pin_order_shadows_a_higher_one(self):
+        lt = _lt()
+        lt.install_parks('P2', ['w.py'], PinOrder(2))
+
+        installed, shadowed = lt.install_parks('P1', ['w.py'], PinOrder(1))
+
+        assert installed == ['w.py']
+        assert shadowed == [('P2', ['w.py'])]
+
+    def test_a_higher_pin_order_is_blocked_by_a_lower_one(self):
+        lt = _lt()
+        lt.install_parks('P1', ['w.py'], PinOrder(1))
+
+        installed, shadowed = lt.install_parks('P2', ['w.py'], PinOrder(2))
+
+        assert installed == [], 'P1 tops w.py at a better rank, so P2 must not install'
+        assert shadowed == []
+
+    def test_a_held_lock_is_never_preempted_by_a_pin(self):
+        lt = _lt()
+        assert lt.try_acquire('H', ['w.py'])
+        lt.install_parks('P', ['w.py'], PinOrder(1))
+
+        assert lt.try_acquire('P', ['w.py']) is False, 'the holder must still refuse P'
+        assert lt.snapshot_holders()['w.py'] == 'H'
+
+        lt.release('H')
+        assert lt.try_acquire('Z', ['w.py']) is False, "P's reservation must refuse Z"
+        assert lt.try_acquire('P', ['w.py']) is True
+
+    def test_a_pin_reservation_stacks_above_the_owners_own_fairness_entry(self):
+        lt = _lt()
+        lt.install_parks('P', ['w.py'], 'high')
+
+        assert lt.unparked_modules('P', ['w.py', 'x.py']) == ['x.py'], (
+            'without a priority the 5308 remainder never re-ranks'
+        )
+        assert lt.unparked_modules('P', ['w.py', 'x.py'], priority='critical') == ['x.py'], (
+            'a tier completion never re-ranks either'
+        )
+        assert lt.unparked_modules('P', ['w.py', 'x.py'], priority=PinOrder(1)) == [
+            'w.py', 'x.py',
+        ], 'a high entry does not cover a pin reservation'
+
+        installed, shadowed = lt.install_parks('P', ['w.py'], PinOrder(1))
+
+        assert (installed, shadowed) == (['w.py'], []), 'P never reports shadowing itself'
+        assert _stack(lt, 'w.py') == [
+            ('P', PRIORITY_RANK['high']),
+            ('P', PinOrder(1).rank),
+        ], "the pin entry must sit above P's own fairness entry, which stays"
+        assert lt.unparked_modules('P', ['w.py'], priority=PinOrder(1)) == []
+        assert lt.unparked_modules('P', ['w.py']) == [], (
+            'fairness completion counts the pin entry as coverage'
+        )
+
+    def test_a_better_pin_order_replaces_the_owners_worse_pin_entry(self):
+        lt = _lt()
+        lt.install_parks('P', ['w.py'], 'high')
+        lt.install_parks('P', ['w.py'], PinOrder(3))
+
+        installed, _ = lt.install_parks('P', ['w.py'], PinOrder(1))
+
+        assert installed == ['w.py']
+        assert _stack(lt, 'w.py') == [
+            ('P', PRIORITY_RANK['high']),
+            ('P', PinOrder(1).rank),
+        ], 'one pin entry per owner per stack, at the better order'
+
+    def test_pruning_pin_entries_keeps_the_owners_fairness_parks(self):
+        lt = _lt()
+        lt.install_parks('L', ['w.py'], 'low')
+        lt.install_parks('P', ['w.py', 'x.py'], 'high')  # shadows L on w
+        lt.install_parks('P', ['w.py', 'x.py', 'y.py'], PinOrder(1))
+
+        evicted, restored = lt.prune_owners(
+            lambda owner: owner == 'P', source=ReservationSource.PIN
+        )
+
+        assert evicted == ['P']
+        assert restored == [('P', ['w.py', 'x.py'])], (
+            "P's own fairness entries are the active tops again"
+        )
+        assert _stack(lt, 'w.py') == [('L', PRIORITY_RANK['low']), ('P', PRIORITY_RANK['high'])]
+        assert _stack(lt, 'y.py') == [], 'a pin-only key is cleared'
+        assert lt.snapshot_pin_reservations() == {}
+        assert lt.reservation_source('P') is ReservationSource.FAIRNESS
+
+    def test_a_pin_scoped_prune_never_asks_about_fairness_only_owners(self):
+        lt = _lt()
+        lt.install_parks('F', ['w.py'], 'critical')
+        asked: list[str] = []
+
+        evicted, restored = lt.prune_owners(
+            lambda owner: asked.append(owner) or True, source=ReservationSource.PIN
+        )
+
+        assert (asked, evicted, restored) == ([], [], [])
+        assert _stack(lt, 'w.py') == [('F', PRIORITY_RANK['critical'])]
+
+    def test_reservation_source_is_derived_from_the_rank(self):
+        lt = _lt()
+        lt.install_parks('P', ['w.py'], PinOrder(1))
+        lt.install_parks('F', ['x.py'], 'critical')
+
+        assert lt.reservation_source('P') is ReservationSource.PIN
+        assert lt.reservation_source('F') is ReservationSource.FAIRNESS
+        assert lt.reservation_source('nobody') is ReservationSource.FAIRNESS
+
+    def test_reservation_source_can_be_scoped_to_modules(self):
+        lt = _lt()
+        lt.install_parks('P', ['w.py'], 'high')
+        lt.install_parks('P', ['x.py'], PinOrder(1))
+
+        assert lt.reservation_source('P') is ReservationSource.PIN
+        assert lt.reservation_source('P', ['w.py']) is ReservationSource.FAIRNESS
+        assert lt.reservation_source('P', ['w.py', 'x.py']) is ReservationSource.PIN
+
+    def test_snapshot_pin_reservations_lists_only_pin_ranked_owners(self):
+        lt = ModuleLockTable(
+            OrchestratorConfig(max_per_module=1, lock_depth=2),
+            wall_time_source=lambda: PARK_T0,
+        )
+        lt.install_parks('P', ['x.py', 'w.py'], PinOrder(1))
+        lt.install_parks('F', ['y.py'], 'critical')
+
+        assert lt.snapshot_pin_reservations() == {
+            'P': {'modules': ['w.py', 'x.py'], 'installed_at': PARK_T0.isoformat()},
+        }
+
+    def test_blockers_names_holders_and_active_foreign_parks(self):
+        lt = _lt()
+        assert lt.try_acquire('H', ['w.py'])
+        lt.install_parks('L', ['x.py'], 'low')
+        lt.install_parks('Q', ['x.py'], 'high')  # shadows L
+        lt.install_parks('P', ['y.py'], 'medium')
+
+        blockers = lt.blockers('P', ['y.py', 'x.py', 'w.py'])
+
+        assert blockers == [
+            Blocker('w.py', 'H', BlockerKind.HELD),
+            Blocker('x.py', 'Q', BlockerKind.PARKED),
+        ], 'a buried owner and the requester itself must never be named'
+        assert blockers[0].as_payload() == {'module': 'w.py', 'owner': 'H', 'kind': 'held'}
+
+    def test_blockers_agree_with_the_acquire_gate(self):
+        lt = _lt()
+        assert lt.try_acquire('H', ['w.py'])
+        lt.install_parks('Q', ['x.py'], 'high')
+
+        assert lt.blockers('P', ['w.py', 'x.py']) != []
+        assert lt.try_acquire('P', ['w.py', 'x.py']) is False
+
+        lt.release('H')
+        lt.clear_parks_for('Q')
+
+        assert lt.blockers('P', ['w.py', 'x.py']) == []
+        assert lt.try_acquire('P', ['w.py', 'x.py']) is True
+
+
+class TestTopParkRank:
+    """``top_park_rank``: the strongest rank among the stack tops an owner holds (task 6328)."""
+
+    def test_an_owner_without_parks_has_no_rank(self):
+        assert _lt().top_park_rank('nobody') is None
+
+    def test_a_critical_top_reads_the_critical_rank(self):
+        lt = _lt()
+        lt.install_parks('A', ['x.py', 'z.py'], 'critical')
+
+        assert lt.top_park_rank('A') == PRIORITY_RANK['critical']
+
+    def test_a_shadowed_entry_does_not_count_even_when_stronger(self):
+        lt = _lt()
+        lt.install_parks('M', ['w.py'], 'medium')
+        lt.install_parks('M', ['x.py'], PinOrder(5))
+        lt.install_parks('P', ['x.py'], PinOrder(1))  # buries M's pin entry
+
+        assert lt.top_park_rank('M') == PRIORITY_RANK['medium'], (
+            'only an active top gates a requester (INV-2)'
+        )
+
+    def test_an_owner_buried_on_every_key_has_no_rank(self):
+        lt = _lt()
+        lt.install_parks('B', ['x.py'], 'low')
+        lt.install_parks('A', ['x.py'], 'critical')
+
+        assert lt.top_park_rank('B') is None
+
+    def test_a_pin_top_beside_a_fairness_top_reads_the_pin_rank(self):
+        lt = _lt()
+        lt.install_parks('P', ['w.py'], 'high')
+        lt.install_parks('P', ['x.py'], PinOrder(1))
+
+        assert lt.top_park_rank('P') == PinOrder(1).rank
+
+    def test_the_read_mutates_nothing(self):
+        lt = _lt()
+        lt.install_parks('M', ['w.py', 'x.py'], 'medium')
+        lt.install_parks('A', ['x.py'], 'critical')
+        before = lt.snapshot_park_stacks()
+
+        lt.top_park_rank('M')
+        lt.top_park_rank('A')
+        lt.top_park_rank('nobody')
+
+        assert lt.snapshot_park_stacks() == before
+
+
+class TestRelease:
+    """``release`` returns the modules it freed, as ``release_subset`` does."""
+
+    def test_release_returns_the_freed_modules_sorted(self):
+        lt = _lt()
+        assert lt.try_acquire('T', ['b', 'a'])
+
+        assert lt.release('T') == ['a', 'b']
+        assert not lt.is_held('T')
+
+    def test_release_of_a_task_holding_nothing_returns_empty(self):
+        assert _lt().release('nobody') == []
+
+
+class TestWithdrawAcquire:
+    """``withdraw_acquire`` undoes a ``try_acquire`` whose dispatch never happened (task 11430)."""
+
+    def test_a_keyless_acquire_is_withdrawn(self):
+        lt = _lt()
+        assert lt.try_acquire('G', [])
+        assert lt.is_held('G')
+
+        assert lt.withdraw_acquire('G') == []
+        assert not lt.is_held('G')
+
+    def test_a_keyed_acquire_is_withdrawn_and_its_keys_are_free_again(self):
+        lt = _lt()
+        assert lt.try_acquire('T', ['b', 'a'])
+
+        assert lt.withdraw_acquire('T') == ['a', 'b']
+        assert not lt.is_held('T')
+        assert lt.try_acquire('U', ['a'])
+
+    def test_withdrawing_for_a_task_holding_nothing_returns_empty(self):
+        assert _lt().withdraw_acquire('nobody') == []
+
+
+class TestModuleBoundary:
+    """The lock table is its own module: it loads no scheduler, and the
+    scheduler does not re-export it."""
+
+    def test_importing_the_lock_table_loads_no_scheduler(self):
+        probe = 'import sys, orchestrator.lock_table; print("orchestrator.scheduler" in sys.modules)'
+        out = subprocess.run([sys.executable, '-c', probe], capture_output=True, text=True, check=True)
+        assert out.stdout.strip() == 'False'
+
+    def test_scheduler_does_not_re_export_the_lock_table(self):
+        import orchestrator.scheduler
+
+        assert 'ModuleLockTable' not in orchestrator.scheduler.__all__

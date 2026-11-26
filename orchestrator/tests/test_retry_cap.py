@@ -110,6 +110,77 @@ class TestIsTransientApiRequeue:
         cls = classify_agent_failure(result)
         assert is_transient_api_requeue(f'Planning failed: {cls.summary}') is True
 
+    # --- Task 3315 (PRD contract C2 / INV-1): FIELD-FIRST routing ----------
+    # The parametrizations above are unchanged and become the legacy-reason
+    # fallback coverage; these pin the structured field as the primary route.
+
+    @pytest.mark.parametrize('status', [500, 503, 529, 599])
+    def test_field_alone_routes_transient(self, status: int):
+        """The reason carries NO ``agent API error: HTTP <n>`` marker, so the
+        regex CANNOT be what routes this — only the structured field can."""
+        assert is_transient_api_requeue(
+            'implementer produced zero output', api_error_status=status,
+        ) is True
+
+    @pytest.mark.parametrize('status', [400, 401, 404, 429, None])
+    def test_non_5xx_field_with_marker_free_reason_is_false(self, status):
+        """4xx keeps its carve-outs (429's deliberate non-transient policy
+        survives the rewrite), and a ``None`` field is never evidence — the
+        absence of a structured status is not a server error."""
+        assert is_transient_api_requeue(
+            'implementer produced zero output', api_error_status=status,
+        ) is False
+
+    def test_legacy_marker_only_still_routes(self):
+        """A reason produced BEFORE the sibling PRD tasks γ/η/θ move each
+        phase onto the field still routes transient with no kwarg at all —
+        the fallback, and the old positional call shape, both stay live."""
+        assert is_transient_api_requeue(
+            'Planning failed: agent API error: HTTP 503',
+        ) is True
+
+    def test_inv5_single_source_5xx_predicate(self, monkeypatch):
+        """INV-5 BEHAVIOURALLY: the predicate must DELEGATE the band decision
+        to ``shared.cli_invoke.is_server_error_status`` rather than re-encode
+        ``500 <= n <= 599`` inline.
+
+        Redefining the canonical band to "only 418 is a server error" must
+        flip BOTH routes.  A hand-rolled inline comparison would ignore the
+        substitution and keep answering on the real band, so this fails for
+        exactly the regression it names — unlike a module-attribute identity
+        assertion, which an inline re-encode would happily pass.
+        """
+        import orchestrator.scheduler as sched
+
+        monkeypatch.setattr(sched, 'is_server_error_status', lambda s: s == 418)
+
+        # Field route follows the substituted band...
+        assert sched.is_transient_api_requeue('x', api_error_status=418) is True
+        assert sched.is_transient_api_requeue('x', api_error_status=500) is False
+        # ...and so does the legacy marker route.
+        assert sched.is_transient_api_requeue('agent API error: HTTP 418') is True
+        assert sched.is_transient_api_requeue('agent API error: HTTP 500') is False
+
+    # --- Conflicting evidence: POSITIVE-ONLY field, OR semantics ----------
+    # The field is checked FIRST but can only ever say "transient" — a
+    # non-5xx/None status is "no evidence", not an authoritative False.  Pin
+    # the disagreement both ways so the chosen rule cannot drift silently
+    # once tasks γ/η/θ start composing reasons from an earlier phase.
+
+    def test_non_5xx_field_does_not_veto_legacy_marker(self):
+        """field=400 + a ``HTTP 503`` marker resolves TRANSIENT: route 1
+        falls THROUGH on non-5xx rather than vetoing route 2."""
+        assert is_transient_api_requeue(
+            'Planning failed: agent API error: HTTP 503', api_error_status=400,
+        ) is True
+
+    def test_5xx_field_wins_without_any_marker(self):
+        """field=503 + a marker-free reason resolves TRANSIENT: route 1 needs
+        no cooperation from the prose."""
+        assert is_transient_api_requeue(
+            'implementer produced zero output', api_error_status=503,
+        ) is True
+
 
 # --- Counter mechanics --------------------------------------------------------
 
@@ -212,6 +283,77 @@ class TestRecordRequeueNonCounting:
         assert 't1' not in scheduler._requeue_counts
         assert 't1' not in scheduler._transient_requeue_counts
         assert len(scheduler.requeue_history('t1')) == 1
+
+
+class TestRecordRequeueFieldFirstRouting:
+    """Task 3315 (PRD contract C2): ``record_requeue`` routes to the transient
+    bucket on the STRUCTURED ``api_error_status`` field.
+
+    Every reason string in this class is deliberately MARKER-FREE, so the
+    ``agent API error: HTTP <n>`` regex is deleted from the assertion path
+    entirely — the field alone drives the bucket decision.  That is the PRD's
+    stated signal for this task.
+    """
+
+    _MARKER_FREE = 'implementer produced zero output'
+
+    def _record(self, scheduler: Scheduler, **kwargs) -> int:
+        return scheduler.record_requeue(
+            't1',
+            phase='execute',
+            reason=self._MARKER_FREE,
+            detail='d',
+            run_id='r',
+            cost_usd=1.0,
+            **kwargs,
+        )
+
+    def test_field_alone_lands_in_transient_bucket(self, scheduler: Scheduler):
+        count = self._record(scheduler, api_error_status=529)
+
+        assert count == 0  # genuine count untouched
+        assert 't1' not in scheduler._requeue_counts
+        assert scheduler._transient_requeue_counts['t1'] == 1
+        assert scheduler.transient_requeue_count('t1') == 1
+        assert len(scheduler._requeue_history['t1']) == 1
+
+    @pytest.mark.parametrize('status', [429, 404, 401])
+    def test_non_5xx_field_routes_genuine(self, scheduler: Scheduler, status: int):
+        """A 4xx is not a provider-side failure — it keeps counting against
+        the genuine cap (the 429 carve-out included)."""
+        count = self._record(scheduler, api_error_status=status)
+
+        assert count == 1
+        assert scheduler._requeue_counts['t1'] == 1
+        assert 't1' not in scheduler._transient_requeue_counts
+
+    def test_absent_field_falls_back_to_legacy_marker_regex(self, scheduler: Scheduler):
+        """No kwarg at all: the legacy marker in the reason still routes
+        transient end-to-end at the record_requeue seam."""
+        count = scheduler.record_requeue(
+            't1',
+            phase='plan',
+            reason='Planning failed: agent API error: HTTP 529',
+            detail='d',
+            run_id='r',
+            cost_usd=1.0,
+        )
+
+        assert count == 0
+        assert 't1' not in scheduler._requeue_counts
+        assert scheduler._transient_requeue_counts['t1'] == 1
+
+    def test_non_counting_route_still_wins_over_5xx_field(self, scheduler: Scheduler):
+        """Route 1 (task 2988) is decided FIRST and keeps winning: a
+        non-counting requeue that ALSO carries a 529 is history-only.  Extends
+        ``test_non_counting_overrides_transient_classification`` from the
+        marker regex to the new structured field."""
+        count = self._record(scheduler, counts_against_cap=False, api_error_status=529)
+
+        assert count == 0
+        assert 't1' not in scheduler._requeue_counts
+        assert 't1' not in scheduler._transient_requeue_counts
+        assert len(scheduler._requeue_history['t1']) == 1
 
 
 class TestCounter:
@@ -473,7 +615,19 @@ def _build_report(outcome, *, cost_usd: float = 5.0, steward_cost_usd: float = 2
     )
 
 
-def _build_529_report(outcome, *, cost_usd: float = 5.0, steward_cost_usd: float = 2.5):
+def _build_529_report(
+    outcome,
+    *,
+    cost_usd: float = 5.0,
+    steward_cost_usd: float = 2.5,
+    block_reason: str = 'Planning failed: agent API error: HTTP 529',
+    block_phase: str = 'plan',
+    api_error_status: int | None = None,
+):
+    """A 529-flavoured report.  Defaults carry the 5xx evidence in the LEGACY
+    marker prose; ``_build_field_only_529_report`` flips it to the structured
+    field instead.  Both shapes share this one construction site so the pair
+    of tests that contrast them cannot drift apart."""
     from orchestrator.harness import TaskReport
 
     return TaskReport(
@@ -482,9 +636,27 @@ def _build_529_report(outcome, *, cost_usd: float = 5.0, steward_cost_usd: float
         outcome=outcome,
         cost_usd=cost_usd,
         steward_cost_usd=steward_cost_usd,
-        block_reason='Planning failed: agent API error: HTTP 529',
+        block_reason=block_reason,
         block_detail='transient provider overload',
-        block_phase='plan',
+        block_phase=block_phase,
+        api_error_status=api_error_status,
+    )
+
+
+def _build_field_only_529_report(outcome, **kwargs):
+    """Task 3315: a REQUEUED report whose ONLY 5xx evidence is the structured
+    ``api_error_status`` field — ``block_reason`` is deliberately MARKER-FREE,
+    so the legacy ``agent API error: HTTP <n>`` regex cannot classify it.
+
+    A thin delegator, NOT a second builder: it overrides exactly the three
+    fields that differ, so there is nothing here to fall out of sync with
+    ``_build_529_report``."""
+    return _build_529_report(
+        outcome,
+        block_reason='implementer produced zero output',
+        block_phase='execute',
+        api_error_status=529,
+        **kwargs,
     )
 
 
@@ -722,3 +894,79 @@ class TestHarnessDualCeiling:
         assert call is not None
         # genuine_exhausted=True takes priority; cap must be requeue_cap (3), not transient (2)
         assert call.kwargs.get('cap') == 3
+
+
+class TestHarnessThreadsApiErrorStatus:
+    """Task 3315 (PRD contract C2): the whole chain — ``TerminalReport ->
+    TaskReport -> record_requeue -> is_transient_api_requeue ->
+    _transient_requeue_counts`` — driven through the real ``_apply_retry_cap``
+    with a real Scheduler, on a report whose reason carries NO marker.
+    """
+
+    def _make(self, tmp_path):
+        cfg = OrchestratorConfig(
+            project_root=tmp_path,
+            max_per_module=1,
+            requeue_cap=3,
+            transient_requeue_cap=2,
+        )
+        return _make_harness(cfg)
+
+    @pytest.mark.asyncio
+    async def test_field_only_report_lands_in_transient_bucket(self, tmp_path):
+        from orchestrator.workflow import WorkflowOutcome
+
+        harness = self._make(tmp_path)
+        trigger = AsyncMock()
+        harness.scheduler.trigger_retry_cap_exhausted = trigger  # type: ignore[method-assign]
+
+        requeued = await harness._apply_retry_cap(
+            't1', _build_field_only_529_report(WorkflowOutcome.REQUEUED), True,
+        )
+
+        assert requeued is True
+        assert trigger.await_count == 0
+        assert 't1' not in harness.scheduler._requeue_counts
+        assert harness.scheduler._transient_requeue_counts['t1'] == 1
+
+    @pytest.mark.asyncio
+    async def test_field_only_report_fires_transient_ceiling_not_genuine(self, tmp_path):
+        """The second such requeue trips the TRANSIENT ceiling (cap=2), not
+        the genuine one (cap=3) — proving the field alone drove the bucket."""
+        from orchestrator.workflow import WorkflowOutcome
+
+        harness = self._make(tmp_path)
+        trigger = AsyncMock()
+        harness.scheduler.trigger_retry_cap_exhausted = trigger  # type: ignore[method-assign]
+
+        await harness._apply_retry_cap(
+            't1', _build_field_only_529_report(WorkflowOutcome.REQUEUED), True,
+        )
+        assert trigger.await_count == 0
+
+        r2 = await harness._apply_retry_cap(
+            't1', _build_field_only_529_report(WorkflowOutcome.REQUEUED), True,
+        )
+
+        assert r2 is False
+        assert trigger.await_count == 1
+        call = trigger.await_args
+        assert call is not None
+        assert call.kwargs.get('cap') == 2
+
+    @pytest.mark.asyncio
+    async def test_marker_free_report_without_field_stays_genuine(self, tmp_path):
+        """Control case isolating the field as the causal signal: the SAME
+        marker-free reason with ``api_error_status=None`` counts genuine."""
+        from orchestrator.workflow import WorkflowOutcome
+
+        harness = self._make(tmp_path)
+        harness.scheduler.trigger_retry_cap_exhausted = AsyncMock()  # type: ignore[method-assign]
+
+        report = _build_field_only_529_report(WorkflowOutcome.REQUEUED)
+        report.api_error_status = None
+
+        await harness._apply_retry_cap('t1', report, True)
+
+        assert harness.scheduler._requeue_counts['t1'] == 1
+        assert 't1' not in harness.scheduler._transient_requeue_counts

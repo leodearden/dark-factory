@@ -2,6 +2,11 @@
 
 Replaces the in-memory QueueService with crash-safe persistence, retry with
 exponential backoff, dead-lettering, and per-group worker pools.
+
+A failure an injected :class:`ParkPolicy` names (one that clears only when a
+human acts, such as exhausted provider credits) PARKS its write instead of
+dead-lettering it: the row waits at status ``parked`` and is re-probed, and the
+first parked write that lands releases every other.
 """
 
 from __future__ import annotations
@@ -12,12 +17,30 @@ import json
 import logging
 import random
 import time
-from collections.abc import Callable, Coroutine, Iterable
+from collections.abc import Callable, Coroutine, Iterable, Iterator, Sequence
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from enum import StrEnum
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 import aiosqlite
-from shared.async_sqlite_base import apply_full_durability_pragmas, connect_daemon
+from shared.async_sqlite_base import (
+    AtomicConnection,
+    CheckpointResult,
+    apply_full_durability_pragmas,
+    connect_daemon,
+)
+from shared.sqlite_column_migration import add_column_if_missing
+
+from fused_memory.services.queued_writes import (
+    QueueCallback,
+    QueueDecodeError,
+    QueuedWrite,
+    check_callback_pairing,
+    decode_queue_callback,
+    decode_queued_write,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -33,10 +56,43 @@ _DELETE_DEAD_BATCH_SIZE = 500
 # Name-based matching avoids a hard dependency on graphiti_core from this
 # generic SQLite write-queue component. Keep in sync with
 # config.schema.QueueConfig.transient_error_names' default.
+#
+# THE NOT-FOUND FAMILY IS DELIBERATELY ABSENT (task 3585, esc-3561-3).
+# 'NodeNotFoundError' / 'EdgeNotFoundError' / 'EdgesNotFoundError' were added
+# here by task 1936 on the hypothesis of a "node-visibility race". Task 3585
+# removed all three on two independent lines of evidence, which do NOT age the
+# same way — keep them distinct:
+#
+#   * Empirical, and topology-independent — PERMANENT: across all 28 recorded
+#     add_episode calls there were 304 execution attempts and 0 successes; one
+#     was retried 55 times across replays and never converged. A visibility
+#     race converges. 1936's own motivating incident (dead-letter id 8533) was
+#     in fact the self-referential add_episode uuid bug that task 3561 fixes —
+#     not a race at all. EdgesNotFoundError additionally has zero raise sites
+#     anywhere in graphiti_core, so it could never have matched.
+#
+#   * Topology-dependent, AND THIS HALF EXPIRES: graphiti_core's by-uuid
+#     lookups pass routing_='r', which can land on a lagging follower only on
+#     a CLUSTERED, read-routed backend. We run a single FalkorDB container
+#     with no replicas, and every Graphiti write for a group_id serialises
+#     under MemoryService's per-group identity lock, so that window is
+#     ~nil here.
+#
+# REINSTATEMENT CONDITION. If Graphiti ever moves to a clustered or
+# read-routed backend, the second argument lapses and an extended budget for
+# the not-found family becomes defensible again — re-derive it from the
+# empirical half rather than restoring the names by reflex. The removal is a
+# judgement about the CURRENT deployment, not a fact settled for all time.
+#
+# ABSENT HERE MEANS "NOT EXTENDED", NOT "FAIL FAST" — and the empirical half
+# above argues the stronger claim. Dropping these names only returns them to
+# the plain max_attempts (5) ceiling, so a permanently-unsatisfiable write
+# still spends five backend round-trips plus exponential backoff proving what
+# attempt 1 already showed. 3585 deliberately changed only WHICH errors get
+# the extended budget. Nothing makes such a write terminal before its budget
+# runs out. Task 3586's payload-identity rule did until task 6369 removed it:
+# after task 3561 no producer's payload carried the uuid its write creates.
 DEFAULT_TRANSIENT_ERROR_NAMES = frozenset({
-    'NodeNotFoundError',
-    'EdgeNotFoundError',
-    'EdgesNotFoundError',
     'TimeoutError',
     'ConnectionError',
     'ConnectionResetError',
@@ -59,7 +115,12 @@ CREATE TABLE IF NOT EXISTS write_queue (
     next_retry_at REAL  NOT NULL DEFAULT 0,
     created_at  REAL    NOT NULL,
     completed_at REAL,
-    error       TEXT
+    error       TEXT,
+    -- executed (task 4116): did a backend write for this item land, in any
+    -- attempt; domain on DurableWriteQueue.get_dead_items. Bare NULLable and
+    -- LAST on purpose: ALTER can only append (see QueueItem), and a DEFAULT
+    -- would backfill legacy rows with a false "never landed".
+    executed    INTEGER
 );
 """
 
@@ -74,10 +135,13 @@ CREATE INDEX IF NOT EXISTS idx_wq_status_group
 class QueueItem:
     """Lightweight representation of a row."""
 
+    # Order must match write_queue's column order: __init__ unpacks a
+    # `SELECT *` row positionally, so a mismatch shifts every field silently.
+    # TestExecutedColumnSchema pins the two together.
     __slots__ = (
         'id', 'group_id', 'operation', 'payload', 'callback_type',
         'status', 'attempts', 'max_attempts', 'next_retry_at',
-        'created_at', 'completed_at', 'error',
+        'created_at', 'completed_at', 'error', 'executed',
     )
 
     def __init__(self, row: aiosqlite.Row | tuple):
@@ -85,25 +149,147 @@ class QueueItem:
             self.id, self.group_id, self.operation, self.payload,
             self.callback_type, self.status, self.attempts, self.max_attempts,
             self.next_retry_at, self.created_at, self.completed_at, self.error,
+            self.executed,
         ) = row
-
-    def parsed_payload(self) -> dict[str, Any]:
-        return json.loads(self.payload)
 
 
 # -- Queue --------------------------------------------------------------------
 
-CallbackFn = Callable[[str, Any, dict[str, Any]], Coroutine[Any, Any, None]]
+class FailureClass(StrEnum):
+    """Which retry budget a failed attempt draws on; logged as ``[<value>]``."""
+
+    PERMANENT = 'permanent'
+    TRANSIENT = 'transient'
+    NORMAL = 'normal'
+    PARKED = 'parked'
+
+
+# (value, backend result) -> None. Receives the same value object the executor did.
+CallbackFn = Callable[[QueuedWrite, Any], Coroutine[Any, Any, None]]
+
+# (write_op_id, terminal_status, error) -> None. Invoked once per item when it
+# reaches a TERMINAL state ('completed' or 'dead'), never on an intermediate
+# retry. An injected callback rather than a WriteJournal reference: the queue
+# imports its value vocabulary (queued_writes, a leaf) and nothing else of
+# fused-memory's.
+TerminalHookFn = Callable[[str, str, str | None], Coroutine[Any, Any, None]]
+
+
+@dataclass(frozen=True)
+class DeadLetterEvent:
+    """Everything an operator alarm needs about one permanently-abandoned write.
+
+    A frozen dataclass rather than positional hook arguments: the event has
+    eight fields with no natural order, and a consumer that had to remember
+    which position held ``operation`` versus ``group_id`` would be a meaningful
+    string in disguise (structured data, not positional convention). Frozen
+    because the hook runs after the item's state is already committed — there
+    is nothing a consumer could usefully mutate, and a mutation would only
+    diverge the alarm from the row it describes.
+
+    ``attempts`` is the COMMITTED count (the value now on the row), not the
+    pre-increment count the claimed item carried, so it matches both the
+    ``write_queue`` row and the dead-letter WARN line.
+
+    ``post_execute`` is the structured form of ``POST_EXECUTE_DEAD_PREFIX``:
+    True means the backend write LANDED and only the post-execute work kept
+    failing, so a blind replay DUPLICATES it. The prefix is still applied to
+    ``error`` — nothing about the journal contract changes — but a consumer
+    branching on remediation should read this flag rather than re-parse it.
+
+    ``operation`` is the row's raw string, which an undecodable row may not
+    hold as a ``QueueOperation``. ``value`` is the decoded write, or ``None``
+    when the row's payload could not be decoded; ``raw_payload`` is the row's
+    payload text either way, and the only content such a row has.
+    """
+
+    item_id: int
+    group_id: str
+    operation: str
+    attempts: int
+    error: str | None
+    write_op_id: str | None
+    value: QueuedWrite | None
+    raw_payload: str
+    post_execute: bool
+
+
+# (event) -> None. Invoked once per item that reaches 'dead', and never on
+# 'completed' or an intermediate retry. Injected exactly as ``on_terminal`` is.
+DeadLetterHookFn = Callable[[DeadLetterEvent], Coroutine[Any, Any, None]]
+
+@dataclass(frozen=True)
+class ParkedWriteEvent:
+    """One write the ``park_policy`` parked instead of retrying it to death.
+
+    ``attempts`` is the row's count, which parking leaves unchanged.
+    """
+
+    item_id: int
+    group_id: str
+    operation: str
+    attempts: int
+    reason: str
+    exc: BaseException
+
+
+@dataclass(frozen=True)
+class ParkDecision:
+    """Why a failure parks its row, and when parked rows next re-probe.
+
+    ``retry_at`` is an epoch time; None keeps the queue's own horizon.
+    """
+
+    reason: str
+    retry_at: float | None = None
+
+
+class ParkPolicy(Protocol):
+    """Names the failures that clear only when a human acts, so they PARK.
+
+    A parked row never dead-letters. It is re-probed at the decision's
+    ``retry_at`` when the policy names one, else every
+    ``retry_max_delay_seconds``, and a parked row that completes unparks
+    every other. Both hooks run after the commit and outside the semaphore,
+    and a raising hook is logged and swallowed, as ``on_dead_letter`` is.
+    """
+
+    def park_decision(self, exc: BaseException) -> ParkDecision | None: ...
+
+    async def on_parked(self, event: ParkedWriteEvent) -> None: ...
+
+    async def on_cleared(self) -> None: ...
+
+
+# Prefix applied to the reported error when an item dead-letters after a
+# backend write for it LANDED, in this attempt or an earlier one — i.e. the
+# registered callback (or the completion commit) is what kept failing, not the
+# backend write. 'dead' alone means only "the queue exhausted its attempts"; it
+# does NOT imply the write never happened, and blind-replaying such an item
+# DUPLICATES it. Reported so the two cases are separable in whatever the hook
+# writes them to. The fact itself is the row's `executed` column, reported by
+# DurableWriteQueue.get_dead_items.
+POST_EXECUTE_DEAD_PREFIX = (
+    'post-execute failure (the backend write LANDED; do not blind-replay): '
+)
+
+#: The rows the queue still owes a write: a worker claims each once its
+#: ``next_retry_at`` is due.
+CLAIMABLE_STATUSES: tuple[str, ...] = ('pending', 'retry', 'parked')
+_CLAIMABLE_SQL = 'status IN ({})'.format(', '.join(f"'{s}'" for s in CLAIMABLE_STATUSES))
 
 
 class DurableWriteQueue:
-    """SQLite WAL-backed write queue with per-group workers and global semaphore."""
+    """SQLite WAL-backed write queue with per-group workers and global semaphore.
+
+    Every time the queue stamps on a row or compares against one is read from *clock*.
+    """
 
     def __init__(
         self,
         *,
         data_dir: str | Path,
-        execute_write: Callable[..., Coroutine[Any, Any, Any]],
+        execute_write: Callable[[QueuedWrite], Coroutine[Any, Any, Any]],
         workers_per_group: int = 3,
         semaphore_limit: int = 20,
         max_attempts: int = 5,
@@ -112,9 +298,17 @@ class DurableWriteQueue:
         write_timeout_seconds: float = 120.0,
         transient_max_attempts: int | None = None,
         transient_error_names: Iterable[str] | None = None,
+        on_terminal: TerminalHookFn | None = None,
+        on_dead_letter: DeadLetterHookFn | None = None,
+        park_policy: ParkPolicy | None = None,
+        clock: Callable[[], float] = time.time,
     ):
         self._data_dir = Path(data_dir)
+        self._clock = clock
         self._execute_write = execute_write
+        self._on_terminal = on_terminal
+        self._on_dead_letter = on_dead_letter
+        self._park_policy = park_policy
         self._workers_per_group = workers_per_group
         self._max_attempts = max_attempts
         self._retry_base_seconds = retry_base_seconds
@@ -130,11 +324,13 @@ class DurableWriteQueue:
         )
 
         self._semaphore = asyncio.Semaphore(semaphore_limit)
-        self._db: aiosqlite.Connection | None = None
-        self._callbacks: dict[str, CallbackFn] = {}
+        self._access: AtomicConnection | None = None
+        self._callbacks: dict[QueueCallback, CallbackFn] = {}
         self._group_events: dict[str, asyncio.Event] = {}
         self._group_locks: dict[str, asyncio.Lock] = {}
         self._worker_tasks: dict[str, list[asyncio.Task]] = {}
+        # item id -> (group_id, instant the item was handed to execute_write)
+        self._executing_started_at: dict[int, tuple[str, datetime]] = {}
         self._closed = False
 
     # -- lifecycle ------------------------------------------------------------
@@ -142,17 +338,34 @@ class DurableWriteQueue:
     async def initialize(self) -> None:
         self._data_dir.mkdir(parents=True, exist_ok=True)
         db_path = self._data_dir / 'write_queue.db'
-        self._db = await connect_daemon(str(db_path))
-        self._db.row_factory = aiosqlite.Row
-        await apply_full_durability_pragmas(self._db, busy_timeout_ms=5000)
-        await self._db.execute(_CREATE_TABLE)
-        await self._db.execute(_CREATE_INDEX)
-        await self._db.commit()
+        conn = await connect_daemon(str(db_path))
+        conn.row_factory = aiosqlite.Row
+        await apply_full_durability_pragmas(conn, busy_timeout_ms=5000)
+        self._access = AtomicConnection(conn)
+        # Table, then in-place migrate, then indexes — matching ticket_store's
+        # ordering, so a migration-added column is present before any index
+        # that might reference it.
+        async with self._access.write() as db:
+            await db.execute(_CREATE_TABLE)
+        await self._migrate()
+        async with self._access.write() as db:
+            await db.execute(_CREATE_INDEX)
         # Recover any items left in_flight from a previous crash
         await self._recover_in_flight()
         # Spin up workers for groups that have pending work
         await self._start_workers_for_pending_groups()
         logger.info('DurableWriteQueue initialized at %s', db_path)
+
+    async def _migrate(self) -> None:
+        """Add columns that post-date a DB's creation.
+
+        Additive-only, with no ``PRAGMA user_version`` ladder, per the rule in
+        ``shared/src/shared/sqlite_column_migration.py``.
+        """
+        async with self._require_access().write() as db:
+            added = await add_column_if_missing(db, 'write_queue', 'executed', 'INTEGER')
+        if added:
+            logger.info('DurableWriteQueue: migrated write_queue — added executed column')
 
     async def close(self) -> None:
         self._closed = True
@@ -165,84 +378,82 @@ class DurableWriteQueue:
         if all_tasks:
             await asyncio.gather(*all_tasks, return_exceptions=True)
         self._worker_tasks.clear()
-        if self._db:
-            # Final TRUNCATE checkpoint so the next open sees an empty WAL.
-            with contextlib.suppress(Exception):
-                await self._db.execute('PRAGMA wal_checkpoint(TRUNCATE)')
-            await self._db.close()
-            self._db = None
+        # Workers first: one cancelled inside a write unit rolls that unit
+        # back, so a half-claimed item stays pending, and one cancelled
+        # mid-execute leaves its item in_flight for _recover_in_flight.
+        if self._access is not None:
+            await self._access.close()
+            self._access = None
         logger.info('DurableWriteQueue closed')
 
-    async def checkpoint(self) -> tuple[int, int, int]:
-        """``PRAGMA wal_checkpoint(TRUNCATE)`` → ``(busy, log, checkpointed)``.
-        Called by the periodic loop in ``server/main.py``."""
-        if self._db is None:
-            return (-1, -1, -1)
-        cursor = await self._db.execute('PRAGMA wal_checkpoint(TRUNCATE)')
-        row = await cursor.fetchone()
-        if row is None:
-            return (-1, -1, -1)
-        return int(row[0]), int(row[1]), int(row[2])
+    def _require_access(self) -> AtomicConnection:
+        if self._access is None:
+            raise RuntimeError('DurableWriteQueue not initialized — call initialize() first')
+        return self._access
+
+    async def checkpoint(self) -> CheckpointResult:
+        return await AtomicConnection.checkpoint_or_unavailable(self._access)
 
     # -- callbacks ------------------------------------------------------------
 
-    def register_callback(self, name: str, fn: CallbackFn) -> None:
-        self._callbacks[name] = fn
+    def register_callback(self, callback: QueueCallback, fn: CallbackFn) -> None:
+        self._callbacks[callback] = fn
 
     # -- enqueue --------------------------------------------------------------
 
     async def enqueue(
-        self,
-        group_id: str,
-        operation: str,
-        payload: dict[str, Any],
-        callback_type: str | None = None,
+        self, value: QueuedWrite, *, callback: QueueCallback | None = None,
     ) -> int:
-        """Persist a write item and signal workers. Returns item id."""
-        assert self._db is not None
-        now = time.time()
-        cursor = await self._db.execute(
-            'INSERT INTO write_queue '
-            '(group_id, operation, payload, callback_type, status, attempts, '
-            ' max_attempts, next_retry_at, created_at) '
-            'VALUES (?, ?, ?, ?, ?, 0, ?, 0, ?)',
-            (group_id, operation, json.dumps(payload), callback_type,
-             'pending', self._max_attempts, now),
-        )
-        await self._db.commit()
-        item_id = cursor.lastrowid
+        """Persist *value* under its envelope's group and signal workers. Returns item id.
+
+        Raises :class:`TypeError`, persisting nothing, when *callback* cannot take *value*.
+        """
+        if callback is not None:
+            check_callback_pairing(value, callback)
+        group_id = value.envelope.group_id
+        now = self._clock()
+        async with self._require_access().write() as db:
+            cursor = await db.execute(
+                # `executed` = 0 is a RECORDED negative, distinct from a legacy
+                # row's NULL (unknown); see get_dead_items.
+                'INSERT INTO write_queue '
+                '(group_id, operation, payload, callback_type, status, attempts, '
+                ' max_attempts, next_retry_at, created_at, executed) '
+                'VALUES (?, ?, ?, ?, ?, 0, ?, 0, ?, 0)',
+                (group_id, value.operation.value, value.to_json(),
+                 callback.value if callback is not None else None,
+                 'pending', self._max_attempts, now),
+            )
+            item_id = cursor.lastrowid
         self._ensure_workers(group_id)
         self._signal_group(group_id)
         return item_id  # type: ignore[return-value]
 
     async def enqueue_batch(
-        self, items: list[dict[str, Any]]
+        self, values: Sequence[tuple[QueuedWrite, QueueCallback | None]]
     ) -> list[int]:
-        """Bulk insert in a single transaction. Each dict needs group_id,
-        operation, payload, and optionally callback_type."""
-        assert self._db is not None
-        now = time.time()
+        """Bulk insert ``(value, callback)`` pairs in ONE write unit: a failure anywhere persists no row."""
+        for value, callback in values:
+            if callback is not None:
+                check_callback_pairing(value, callback)
+        now = self._clock()
         ids: list[int] = []
         groups_seen: set[str] = set()
-        await self._db.execute('BEGIN')
-        try:
-            for item in items:
-                cursor = await self._db.execute(
+        async with self._require_access().write() as db:
+            for value, callback in values:
+                group_id = value.envelope.group_id
+                cursor = await db.execute(
+                    # Explicit `executed = 0` for the same reason as enqueue().
                     'INSERT INTO write_queue '
                     '(group_id, operation, payload, callback_type, status, attempts, '
-                    ' max_attempts, next_retry_at, created_at) '
-                    'VALUES (?, ?, ?, ?, ?, 0, ?, 0, ?)',
-                    (item['group_id'], item['operation'],
-                     json.dumps(item['payload']),
-                     item.get('callback_type'),
+                    ' max_attempts, next_retry_at, created_at, executed) '
+                    'VALUES (?, ?, ?, ?, ?, 0, ?, 0, ?, 0)',
+                    (group_id, value.operation.value, value.to_json(),
+                     callback.value if callback is not None else None,
                      'pending', self._max_attempts, now),
                 )
                 ids.append(cursor.lastrowid)  # type: ignore[arg-type]
-                groups_seen.add(item['group_id'])
-            await self._db.commit()
-        except Exception:
-            await self._db.rollback()
-            raise
+                groups_seen.add(group_id)
         for g in groups_seen:
             self._ensure_workers(g)
             self._signal_group(g)
@@ -291,26 +502,24 @@ class DurableWriteQueue:
 
         Uses a per-group asyncio.Lock so only one worker claims at a time.
         """
-        assert self._db is not None
         lock = self._group_locks[group_id]
         async with lock:
-            now = time.time()
-            cursor = await self._db.execute(
-                "SELECT * FROM write_queue "
-                "WHERE group_id = ? AND status IN ('pending', 'retry') "
-                "  AND next_retry_at <= ? "
-                "ORDER BY id ASC LIMIT 1",
-                (group_id, now),
-            )
-            row = await cursor.fetchone()
-            if row is None:
-                return None
-            item = QueueItem(tuple(row))
-            await self._db.execute(
-                "UPDATE write_queue SET status = 'in_flight' WHERE id = ?",
-                (item.id,),
-            )
-            await self._db.commit()
+            now = self._clock()
+            async with self._require_access().write() as db:
+                rows = list(await db.execute_fetchall(
+                    "SELECT * FROM write_queue "
+                    f'WHERE group_id = ? AND {_CLAIMABLE_SQL} '
+                    "  AND next_retry_at <= ? "
+                    "ORDER BY id ASC LIMIT 1",
+                    (group_id, now),
+                ))
+                if not rows:
+                    return None
+                item = QueueItem(tuple(rows[0]))
+                await db.execute(
+                    "UPDATE write_queue SET status = 'in_flight' WHERE id = ?",
+                    (item.id,),
+                )
             return item
 
     async def _process_item(self, item: QueueItem) -> None:
@@ -318,30 +527,290 @@ class DurableWriteQueue:
 
         Callbacks run *before* marking completed so that a callback
         failure triggers retry instead of being silently lost.
+
+        The post-commit hooks, by contrast, run AFTER the queue's own commit
+        and OUTSIDE the semaphore: ``_notify_terminal`` (the durable write-back
+        onto the ``write_ops`` row) and then, for a dead item only,
+        ``_notify_dead_letter`` (the operator alarm). A parked item is not
+        terminal; it reaches ``_notify_parked`` alone. A parked item that
+        lands reaches ``_release_parked``, which frees every other parked
+        row. All of them share the same discipline: none can send a settled
+        item back through ``_handle_failure``.
         """
+        terminal: tuple[str, str | None] | None = None
+        parked: ParkedWriteEvent | None = None
+        landed_after_park = False
+        value: QueuedWrite | None = None
+        write_op_id: str | None = None
+        # Seeded from the row, since an earlier attempt may already have
+        # landed. A NULL (unknown) row seeds False: the prefix asserts a
+        # landing, so it needs positive evidence.
+        executed = bool(item.executed)
         async with self._semaphore:
             try:
-                result = await asyncio.wait_for(
-                    self._execute_write(item.operation, item.parsed_payload()),
-                    timeout=self._write_timeout_seconds,
+                # Inside the try, so an undecodable row reaches _handle_failure
+                # as a QueueDecodeError. The payload first: a row whose callback
+                # alone is bad still hands its write_op_id to _notify_terminal.
+                value = decode_queued_write(
+                    item.operation, item.payload, group_id=item.group_id, row_id=item.id,
                 )
-                # Fire callback before marking completed — failure retries item
-                if item.callback_type and item.callback_type in self._callbacks:
-                    await self._callbacks[item.callback_type](
-                        item.callback_type, result, item.parsed_payload()
+                write_op_id = value.envelope.write_op_id
+                callback = decode_queue_callback(
+                    item.callback_type, value, row_id=item.id, raw_payload=item.payload,
+                )
+                with self._executing(item):
+                    result = await asyncio.wait_for(
+                        self._execute_write(value),
+                        timeout=self._write_timeout_seconds,
                     )
+                # The backend write LANDED. Anything that fails below is a
+                # post-execute failure, which is a materially different fact
+                # for anyone deciding whether a dead item is safe to replay.
+                # Made durable BEFORE the callback, because the callback is
+                # what can fail and schedule a retry.
+                executed = True
+                await self._mark_executed(item)
+                # Fire callback before marking completed — failure retries item.
+                if callback is not None and callback in self._callbacks:
+                    await self._callbacks[callback](value, result)
                 await self._mark_completed(item)
+                terminal = ('completed', None)
+                landed_after_park = item.status == 'parked'
             except Exception as exc:
-                await self._handle_failure(item, exc)
+                decision = self._park_decision(exc, executed=executed)
+                if decision is None:
+                    terminal = await self._handle_failure(item, exc, executed=executed)
+                else:
+                    parked = await self._park(item, exc, decision)
+
+        if parked is not None:
+            await self._notify_parked(parked)
+        if landed_after_park:
+            await self._release_parked(item)
+        if terminal is not None:
+            status, error = terminal
+            if status == 'dead' and executed:
+                error = f'{POST_EXECUTE_DEAD_PREFIX}{error}'
+            await self._notify_terminal(item.id, write_op_id, status, error)
+            if status == 'dead':
+                # AFTER the journal write-back, deliberately: the durable audit
+                # trail must land before the best-effort alarm gets a chance to
+                # misbehave.
+                await self._notify_dead_letter(
+                    item, value, write_op_id, error, post_execute=executed
+                )
+
+    @contextlib.contextmanager
+    def _executing(self, item: QueueItem) -> Iterator[None]:
+        self._executing_started_at[item.id] = (item.group_id, datetime.now(UTC))
+        try:
+            yield
+        finally:
+            self._executing_started_at.pop(item.id, None)
+
+    def earliest_executing_start(self, group_id: str) -> datetime | None:
+        """When the earliest backend write still executing for *group_id* was
+        handed to execute_write, or None when none is executing.
+
+        Process-local by design: after a restart ``_recover_in_flight`` sends
+        every interrupted row back to pending, so it re-executes from scratch.
+        Why the reconciliation episode cursor needs this:
+        ``fused_memory/reconciliation/episode_window.py``.
+        """
+        starts = [
+            started_at
+            for item_group, started_at in self._executing_started_at.values()
+            if item_group == group_id
+        ]
+        return min(starts, default=None)
+
+    async def _notify_terminal(
+        self,
+        item_id: int,
+        write_op_id: str | None,
+        status: str,
+        error: str | None,
+    ) -> None:
+        """Report a terminal outcome to the injected ``on_terminal`` hook.
+
+        Deliberately runs after the item's own durable state is committed and
+        outside ``self._semaphore``: the queue's correctness must NEVER depend
+        on the hook succeeding (a raising hook would otherwise flip a landed
+        write back to retry, turning an audit-trail improvement into a
+        correctness regression), and the hook's own work must not hold a slot
+        in a pool shared across every group.
+
+        A raising hook is logged and swallowed. A value with no
+        ``write_op_id`` (``replay_from_store``, ``mem0_classify_and_add``) or a
+        row that could not be decoded is skipped silently: there is nothing to
+        join back to.
+        """
+        if self._on_terminal is None or not write_op_id:
+            return
+        try:
+            await self._on_terminal(write_op_id, status, error)
+        except Exception:
+            logger.warning(
+                'Item %d: on_terminal hook failed for write_op %s (%s)',
+                item_id, write_op_id, status, exc_info=True,
+            )
+
+    async def _mark_executed(self, item: QueueItem) -> None:
+        """Durably record that this item's backend write LANDED — best-effort.
+
+        A failure is logged and swallowed, never raised. Raising would
+        reschedule the item, and the retry would re-execute a write that has
+        already landed: the duplicate this flag exists to prevent. The fact is
+        not lost with it: ``_handle_failure`` records it again in the commit
+        that settles a failed attempt, and only a failed attempt's row is ever
+        read for it. It goes unrecorded only if the process dies before that
+        commit.
+        """
+        if item.executed:
+            return
+        try:
+            async with self._require_access().write() as db:
+                await db.execute(
+                    'UPDATE write_queue SET executed = 1 WHERE id = ?',
+                    (item.id,),
+                )
+        except Exception:
+            logger.warning(
+                'Item %d (%s, group_id=%s): backend write landed but the '
+                'executed flag could not be persisted; continuing without a '
+                'retry — if this attempt fails, its failure commit records it',
+                item.id, item.operation, item.group_id, exc_info=True,
+            )
+
+    async def _notify_dead_letter(
+        self,
+        item: QueueItem,
+        value: QueuedWrite | None,
+        write_op_id: str | None,
+        error: str | None,
+        *,
+        post_execute: bool,
+    ) -> None:
+        """Report a permanently-abandoned write to the ``on_dead_letter`` hook.
+
+        Shares ``_notify_terminal``'s post-commit, outside-the-semaphore
+        discipline for the same two reasons — the queue's correctness must
+        never depend on a hook, and a hook's own work must not hold a slot in a
+        pool shared across every group — and DIVERGES from it on exactly one
+        point, deliberately: there is no ``or not write_op_id`` guard here.
+
+        That guard is right for the journal write-back, which has nothing to
+        join an outcome back to without a key. It is wrong for an alarm, which
+        needs no join key at all — and inheriting it would silently exempt
+        every ``mem0_classify_and_add`` (one per extracted fact per episode)
+        and every ``replay_from_store`` from the only push signal they have.
+        Those deaths currently reach nothing but a WARNING log.
+
+        A raising hook is logged and swallowed. Unlike the journal write-back,
+        a raise here would not merely lose one record: it escapes
+        ``_process_item`` into ``_worker_loop``, which has no handler, so the
+        worker task dies and the group stops draining. A failed alarm must cost
+        the operator a heads-up, never the queue.
+        """
+        if self._on_dead_letter is None:
+            return
+        event = DeadLetterEvent(
+            item_id=item.id,
+            group_id=item.group_id,
+            operation=item.operation,
+            # The committed count: _handle_failure wrote item.attempts + 1.
+            attempts=item.attempts + 1,
+            error=error,
+            write_op_id=write_op_id,
+            value=value,
+            raw_payload=item.payload,
+            # Structured, so the consumer never re-parses POST_EXECUTE_DEAD_PREFIX.
+            post_execute=post_execute,
+        )
+        try:
+            await self._on_dead_letter(event)
+        except Exception:
+            logger.warning(
+                'Item %d (%s, group_id=%s): on_dead_letter hook failed; the '
+                'dead-letter is committed but was NOT escalated',
+                item.id, item.operation, item.group_id, exc_info=True,
+            )
+
+    async def _notify_parked(self, event: ParkedWriteEvent) -> None:
+        """Report a parked write to the policy, never raising into the worker."""
+        if self._park_policy is None:
+            return
+        try:
+            await self._park_policy.on_parked(event)
+        except Exception:
+            logger.warning(
+                'Item %d (%s, group_id=%s): on_parked hook failed; the item is '
+                'parked but the park was NOT reported',
+                event.item_id, event.operation, event.group_id, exc_info=True,
+            )
+
+    async def _release_parked(self, landed: QueueItem) -> None:
+        """Free every parked row now that *landed*, a parked write, has landed.
+
+        Runs after *landed*'s completion is committed and outside
+        ``_process_item``'s handler, so it must not raise: an escape would
+        kill the group's worker, as ``_notify_dead_letter`` explains. A
+        failed release leaves the rows parked until their own probe horizon.
+        The clearing is reported either way, because the landing is what
+        proves the cause is gone.
+        """
+        try:
+            await self._unpark_all(landed)
+            await self._start_workers_for_pending_groups()
+        except Exception:
+            logger.warning(
+                'Item %d (%s, group_id=%s) landed after parking, but releasing '
+                'the other parked rows failed; they stay parked until their '
+                'next probe horizon',
+                landed.id, landed.operation, landed.group_id, exc_info=True,
+            )
+        await self._notify_cleared()
+
+    async def _unpark_all(self, landed: QueueItem) -> None:
+        """Set every parked row pending now that a parked write has landed.
+
+        Only a parked write's success proves the parking cause is gone; any
+        other write may never have touched the refusing provider. The rows keep
+        their attempt counts.
+        """
+        async with self._require_access().write() as db:
+            cursor = await db.execute(
+                "UPDATE write_queue SET status = 'pending', next_retry_at = 0 "
+                "WHERE status = 'parked'"
+            )
+        logger.info(
+            'Item %d (%s, group_id=%s) landed after parking; unparked %d other row(s)',
+            landed.id, landed.operation, landed.group_id, cursor.rowcount or 0,
+        )
+
+    async def _notify_cleared(self) -> None:
+        """Tell the policy a parked write landed, never raising into the worker.
+
+        Parked rows share one probe horizon, so concurrent probes in several
+        groups can each land: the hook must be idempotent.
+        """
+        if self._park_policy is None:
+            return
+        try:
+            await self._park_policy.on_cleared()
+        except Exception:
+            logger.warning(
+                'on_cleared hook failed; a parked write landed but the '
+                'clearing was NOT reported', exc_info=True,
+            )
 
     async def _mark_completed(self, item: QueueItem) -> None:
-        assert self._db is not None
-        await self._db.execute(
-            "UPDATE write_queue SET status = 'completed', completed_at = ?, "
-            "attempts = attempts + 1 WHERE id = ?",
-            (time.time(), item.id),
-        )
-        await self._db.commit()
+        async with self._require_access().write() as db:
+            await db.execute(
+                "UPDATE write_queue SET status = 'completed', completed_at = ?, "
+                "attempts = attempts + 1 WHERE id = ?",
+                (self._clock(), item.id),
+            )
 
     def _is_transient(self, exc: BaseException) -> bool:
         """Whether *exc* (or any class in its MRO) is a known-transient error
@@ -350,59 +819,147 @@ class DurableWriteQueue:
         """
         return any(c.__name__ in self._transient_error_names for c in type(exc).__mro__)
 
-    async def _handle_failure(self, item: QueueItem, exc: Exception) -> None:
-        assert self._db is not None
+    def _classify_failure(self, item: QueueItem, exc: BaseException) -> tuple[FailureClass, int]:
+        """Return (classification, attempts_limit) for *exc* on *item*.
+
+        A row that cannot be decoded is PERMANENT with a limit of 1, decided by
+        the exception's type; a transient error gets ``transient_max_attempts``;
+        anything else is NORMAL with ``item.max_attempts``.
+        """
+        if isinstance(exc, QueueDecodeError):
+            return (FailureClass.PERMANENT, 1)
+        if self._is_transient(exc):
+            return (FailureClass.TRANSIENT, self._transient_max_attempts)
+        return (FailureClass.NORMAL, item.max_attempts)
+
+    def _park_decision(self, exc: Exception, *, executed: bool) -> ParkDecision | None:
+        """How *exc* parks its item, or None to retry or dead-letter it.
+
+        A write that already LANDED never parks: a probe re-runs it, so an
+        unbounded park would duplicate it every period, where the retry path
+        bounds that to ``max_attempts``. An undecodable row never parks either.
+        """
+        if self._park_policy is None or executed or isinstance(exc, QueueDecodeError):
+            return None
+        try:
+            return self._park_policy.park_decision(exc)
+        except Exception:
+            logger.warning('park_policy.park_decision failed; not parking', exc_info=True)
+            return None
+
+    async def _park(
+        self, item: QueueItem, exc: Exception, decision: ParkDecision,
+    ) -> ParkedWriteEvent:
+        """Park *item*, attempts unchanged, and re-arm every parked row to one
+        horizon, so the queue probes about once per worker per period rather
+        than once per parked row. The decision's ``retry_at``, never earlier
+        than now, is that horizon when set.
+
+        The horizon is the deciding failure's, whatever parked each other row:
+        rows parked for different reasons pull each other onto the latest
+        park's horizon, because a row does not record which reason parked it."""
+        reason = decision.reason
+        error_msg = f'parked ({reason}): {type(exc).__name__}: {exc}'
+        now = self._clock()
+        if decision.retry_at is not None:
+            horizon = max(decision.retry_at, now)
+            horizon_source = "the park policy's probe time"
+        else:
+            horizon = now + self._retry_max_delay_seconds
+            horizon_source = 'retry_max_delay_seconds'
+        async with self._require_access().write() as db:
+            await db.execute(
+                "UPDATE write_queue SET status = 'parked', next_retry_at = ?, error = ? "
+                'WHERE id = ?',
+                (horizon, error_msg, item.id),
+            )
+            await db.execute(
+                "UPDATE write_queue SET next_retry_at = ? WHERE status = 'parked'",
+                (horizon,),
+            )
+        logger.info(
+            'Item %d (%s, group_id=%s) parked, re-probe in %.1fs (%s) [%s]: %s',
+            item.id, item.operation, item.group_id, horizon - now, horizon_source,
+            FailureClass.PARKED, error_msg,
+        )
+        return ParkedWriteEvent(
+            item_id=item.id, group_id=item.group_id, operation=item.operation,
+            attempts=item.attempts, reason=reason, exc=exc,
+        )
+
+    async def _handle_failure(
+        self, item: QueueItem, exc: Exception, *, executed: bool
+    ) -> tuple[str, str | None] | None:
+        """Dead-letter or schedule a retry.
+
+        Returns ``('dead', error_msg)`` when the item reached its terminal
+        dead state, or ``None`` when it was merely rescheduled — the caller
+        uses that to decide whether to fire the terminal hook.
+
+        *executed* (a backend write for this item has landed) is recorded in
+        the same commit, because ``_mark_executed`` is best-effort. The CASE
+        only ever sets the flag: an attempt that did not land leaves the
+        column as it was, so a legacy NULL stays unknown.
+        """
         new_attempts = item.attempts + 1
         error_msg = f'{type(exc).__name__}: {exc}'
-        limit = self._transient_max_attempts if self._is_transient(exc) else item.max_attempts
-        if new_attempts >= limit:
-            await self._db.execute(
-                "UPDATE write_queue SET status = 'dead', attempts = ?, error = ? "
-                "WHERE id = ?",
-                (new_attempts, error_msg, item.id),
-            )
-            logger.warning(
-                'Item %d dead-lettered after %d attempts: %s',
-                item.id, new_attempts, error_msg,
-            )
-        else:
-            delay = min(
-                self._retry_base_seconds * (2 ** (new_attempts - 1))
-                + random.uniform(0, self._retry_base_seconds),
-                self._retry_max_delay_seconds,
-            )
-            next_retry = time.time() + delay
-            await self._db.execute(
-                "UPDATE write_queue SET status = 'retry', attempts = ?, "
-                "next_retry_at = ?, error = ? WHERE id = ?",
-                (new_attempts, next_retry, error_msg, item.id),
-            )
-            logger.info(
-                'Item %d retry %d/%d in %.1fs: %s',
-                item.id, new_attempts, limit, delay, error_msg,
-            )
-        await self._db.commit()
+        classification, limit = self._classify_failure(item, exc)
+        died = new_attempts >= limit
+        async with self._require_access().write() as db:
+            if died:
+                await db.execute(
+                    "UPDATE write_queue SET status = 'dead', attempts = ?, error = ?, "
+                    "executed = CASE WHEN ? THEN 1 ELSE executed END WHERE id = ?",
+                    (new_attempts, error_msg, executed, item.id),
+                )
+                # operation / group_id / classification are what a triager needs
+                # first, and the log line is all that survives once the queue row is
+                # deleted — after that, get_dead_items can no longer supply them.
+                # The classification names which retry budget the item exhausted.
+                logger.warning(
+                    'Item %d (%s, group_id=%s) dead-lettered after %d attempts [%s]: %s',
+                    item.id, item.operation, item.group_id, new_attempts,
+                    classification, error_msg,
+                )
+            else:
+                delay = min(
+                    self._retry_base_seconds * (2 ** (new_attempts - 1))
+                    + random.uniform(0, self._retry_base_seconds),
+                    self._retry_max_delay_seconds,
+                )
+                next_retry = self._clock() + delay
+                await db.execute(
+                    "UPDATE write_queue SET status = 'retry', attempts = ?, "
+                    "next_retry_at = ?, error = ?, "
+                    "executed = CASE WHEN ? THEN 1 ELSE executed END WHERE id = ?",
+                    (new_attempts, next_retry, error_msg, executed, item.id),
+                )
+                # Kept symmetrical with the dead-letter line above so a retry storm
+                # is attributable to an operation and a project without a second
+                # lookup.
+                logger.info(
+                    'Item %d (%s, group_id=%s) retry %d/%d in %.1fs [%s]: %s',
+                    item.id, item.operation, item.group_id, new_attempts, limit,
+                    delay, classification, error_msg,
+                )
+        return ('dead', error_msg) if died else None
 
     # -- recovery -------------------------------------------------------------
 
     async def _recover_in_flight(self) -> None:
         """Reset items left in_flight (crashed mid-write) back to pending."""
-        assert self._db is not None
-        cursor = await self._db.execute(
-            "UPDATE write_queue SET status = 'pending' WHERE status = 'in_flight'"
-        )
-        await self._db.commit()
+        async with self._require_access().write() as db:
+            cursor = await db.execute(
+                "UPDATE write_queue SET status = 'pending' WHERE status = 'in_flight'"
+            )
         if cursor.rowcount:
             logger.info('Recovered %d in-flight items to pending', cursor.rowcount)
 
     async def _start_workers_for_pending_groups(self) -> None:
-        """Start workers for any groups that have pending/retry items."""
-        assert self._db is not None
-        cursor = await self._db.execute(
-            "SELECT DISTINCT group_id FROM write_queue "
-            "WHERE status IN ('pending', 'retry')"
+        """Start workers for any groups that have pending/retry/parked items."""
+        rows = await self._require_access().read_all(
+            f'SELECT DISTINCT group_id FROM write_queue WHERE {_CLAIMABLE_SQL}'
         )
-        rows = await cursor.fetchall()
         for row in rows:
             group_id = row[0] if isinstance(row, tuple) else row['group_id']
             self._ensure_workers(group_id)
@@ -411,22 +968,29 @@ class DurableWriteQueue:
     # -- management -----------------------------------------------------------
 
     async def replay_dead(self, group_id: str | None = None) -> int:
-        """Reset dead items to pending for retry. Returns count reset."""
-        assert self._db is not None
-        if group_id:
-            cursor = await self._db.execute(
-                "UPDATE write_queue SET status = 'pending', attempts = 0, "
-                "next_retry_at = 0, error = NULL "
-                "WHERE status = 'dead' AND group_id = ?",
-                (group_id,),
-            )
-        else:
-            cursor = await self._db.execute(
-                "UPDATE write_queue SET status = 'pending', attempts = 0, "
-                "next_retry_at = 0, error = NULL "
-                "WHERE status = 'dead'",
-            )
-        await self._db.commit()
+        """Reset dead items to pending for retry. Returns count reset.
+
+        Resets the retry BUDGET (attempts, next_retry_at) and clears the last
+        error. Deliberately does NOT clear ``executed``: that flag is sticky
+        for the life of the row. "A backend write for this item landed at some
+        point" does not stop being true because an operator pressed replay —
+        and it is exactly the fact that makes a SECOND blind replay dangerous.
+        Read it before replaying; the rule per value is on get_dead_items.
+        """
+        async with self._require_access().write() as db:
+            if group_id:
+                cursor = await db.execute(
+                    "UPDATE write_queue SET status = 'pending', attempts = 0, "
+                    "next_retry_at = 0, error = NULL "
+                    "WHERE status = 'dead' AND group_id = ?",
+                    (group_id,),
+                )
+            else:
+                cursor = await db.execute(
+                    "UPDATE write_queue SET status = 'pending', attempts = 0, "
+                    "next_retry_at = 0, error = NULL "
+                    "WHERE status = 'dead'",
+                )
         count = cursor.rowcount or 0
         if count:
             if group_id:
@@ -437,27 +1001,42 @@ class DurableWriteQueue:
         return count
 
     async def get_stats(self, group_id: str | None = None) -> dict[str, Any]:
-        """Return counts by status and oldest pending age.
+        """Return counts by status, oldest pending age, and dead-by-operation.
+
+        ``dead_by_operation`` maps operation name -> count over ``status='dead'``
+        rows only.  A nonzero entry means writes of that operation have been
+        PERMANENTLY abandoned: the queue exhausted their attempts and gave up,
+        after the caller was already told the write had been accepted.  It is
+        always present, and ``{}`` when nothing is dead — a probe must never
+        have to distinguish "no deaths" from "an older server".
+
+        This counter is the health-probe CONFIRMATION, not the primary alarm.
+        The push signal is the ``durable_write_dead_letter`` escalation
+        (``middleware/dead_letter_escalator.py::emit_dead_letter_escalation``),
+        which survives cleanup; this reads the live ``write_queue`` table, so
+        it returns to zero once :mcp-tool:`delete_dead_letters` sweeps the rows.
+        ``counts['dead']`` is the same population without the attribution, so
+        the two always sum consistently.
 
         Args:
-            group_id: When given, restrict counts and oldest-pending age to
-                rows whose ``group_id`` matches.  Default ``None`` returns
-                unscoped (global) statistics — preserving the behaviour
-                required by :mcp-tool:`get_queue_stats` and the dashboard.
+            group_id: When given, restrict counts, oldest-pending age and the
+                dead-by-operation breakdown to rows whose ``group_id``
+                matches.  Default ``None`` returns unscoped (global)
+                statistics — preserving the behaviour required by
+                :mcp-tool:`get_queue_stats` and the dashboard.
         """
-        assert self._db is not None
+        access = self._require_access()
 
         if group_id is not None:
-            cursor = await self._db.execute(
+            rows = await access.read_all(
                 'SELECT status, COUNT(*) as cnt FROM write_queue '
                 'WHERE group_id = ? GROUP BY status',
                 (group_id,),
             )
         else:
-            cursor = await self._db.execute(
+            rows = await access.read_all(
                 'SELECT status, COUNT(*) as cnt FROM write_queue GROUP BY status'
             )
-        rows = await cursor.fetchall()
         counts = {
             row[0] if isinstance(row, tuple) else row['status']:
             row[1] if isinstance(row, tuple) else row['cnt']
@@ -466,25 +1045,46 @@ class DurableWriteQueue:
 
         oldest_pending_age = None
         if group_id is not None:
-            cursor = await self._db.execute(
-                "SELECT MIN(created_at) FROM write_queue "
-                "WHERE status IN ('pending', 'retry') AND group_id = ?",
+            row = await access.read_one(
+                'SELECT MIN(created_at) FROM write_queue '
+                f'WHERE {_CLAIMABLE_SQL} AND group_id = ?',
                 (group_id,),
             )
         else:
-            cursor = await self._db.execute(
-                "SELECT MIN(created_at) FROM write_queue "
-                "WHERE status IN ('pending', 'retry')"
+            row = await access.read_one(
+                f'SELECT MIN(created_at) FROM write_queue WHERE {_CLAIMABLE_SQL}'
             )
-        row = await cursor.fetchone()
         if row:
             min_created = row[0] if isinstance(row, tuple) else row[0]
             if min_created is not None:
-                oldest_pending_age = time.time() - min_created
+                oldest_pending_age = self._clock() - min_created
+
+        # No new index: idx_wq_status_group is on (status, group_id,
+        # next_retry_at), so both spellings below seek the status='dead'
+        # prefix — and the scoped one seeks (status, group_id). An index is
+        # not free on a live DB; see write_journal.py's idx_wo_created note,
+        # where adding one measured ~47 s of one-time startup DDL.
+        if group_id is not None:
+            rows = await access.read_all(
+                'SELECT operation, COUNT(*) as cnt FROM write_queue '
+                "WHERE status = 'dead' AND group_id = ? GROUP BY operation",
+                (group_id,),
+            )
+        else:
+            rows = await access.read_all(
+                'SELECT operation, COUNT(*) as cnt FROM write_queue '
+                "WHERE status = 'dead' GROUP BY operation"
+            )
+        dead_by_operation = {
+            row[0] if isinstance(row, tuple) else row['operation']:
+            row[1] if isinstance(row, tuple) else row['cnt']
+            for row in rows
+        }
 
         return {
             'counts': counts,
             'oldest_pending_age_seconds': oldest_pending_age,
+            'dead_by_operation': dead_by_operation,
         }
 
     async def delete_dead(
@@ -522,9 +1122,10 @@ class DurableWriteQueue:
         excludes ineligible ids already classified in prior chunks.  Retrying
         with ``ids=remaining`` is therefore safe and non-redundant.
 
-        If the recovery ``COMMIT`` after the error also fails (e.g. disk still
-        full), ``deleted`` and ``not_found`` are set to ``[]`` and ``remaining``
-        covers all input ids, so a full retry is safe.
+        Every chunk runs in ONE write unit, which commits the chunks before the
+        failing one when it exits.  If that commit also fails (e.g. disk still
+        full), the unit rolls back, so ``deleted`` and ``not_found`` are set to
+        ``[]`` and ``remaining`` covers all input ids, and a full retry is safe.
 
         Programmer-bug exceptions (``ProgrammingError``, ``IntegrityError``)
         are NOT caught and propagate to the caller.
@@ -539,62 +1140,56 @@ class DurableWriteQueue:
         if not ids:
             return {'deleted': [], 'not_found': []}
 
-        assert self._db is not None
         deleted: set[int] = set()
         not_found_completed: set[int] = set()
+        failure: dict[str, Any] | None = None
 
-        for i in range(0, len(ids), _DELETE_DEAD_BATCH_SIZE):
-            chunk = ids[i : i + _DELETE_DEAD_BATCH_SIZE]
-            placeholders = ','.join('?' * len(chunk))
-            # Single atomic statement — SELECT + DELETE in one round-trip (SQLite >=3.35).
-            # The WHERE guards (status='dead', group_id=?) are enforced atomically so
-            # a concurrent replay or worker cannot slip a row past the eligibility check
-            # between a separate SELECT and DELETE.
-            try:
-                cursor = await self._db.execute(
-                    f"DELETE FROM write_queue "
-                    f"WHERE id IN ({placeholders}) AND status='dead' AND group_id=? "
-                    f"RETURNING id",
-                    (*chunk, group_id),
-                )
-                rows = await cursor.fetchall()
-            except aiosqlite.OperationalError as exc:
-                # Commit prior-chunk deletions durably before returning.
-                # The commit itself can fail (e.g. disk still full), in which case
-                # we cannot guarantee prior deletions landed — return a conservative
-                # envelope covering all inputs so a full retry is safe.
-                try:
-                    await self._db.commit()
-                except aiosqlite.OperationalError:
-                    logger.exception(
-                        'delete_dead: recovery commit failed after OperationalError;'
-                        ' reporting full input as remaining',
-                    )
-                    return {
-                        'error': str(exc),
-                        'error_type': 'TransientSqliteError',
-                        'retriable': True,
-                        'deleted': [],
-                        'not_found': [],
-                        'remaining': sorted(ids),
+        try:
+            async with self._require_access().write() as db:
+                for i in range(0, len(ids), _DELETE_DEAD_BATCH_SIZE):
+                    chunk = ids[i : i + _DELETE_DEAD_BATCH_SIZE]
+                    placeholders = ','.join('?' * len(chunk))
+                    # Single atomic statement — SELECT + DELETE in one round-trip
+                    # (SQLite >=3.35).  The WHERE guards (status='dead', group_id=?)
+                    # are enforced atomically so a concurrent replay or worker cannot
+                    # slip a row past the eligibility check between a separate SELECT
+                    # and DELETE.
+                    try:
+                        cursor = await db.execute(
+                            f"DELETE FROM write_queue "
+                            f"WHERE id IN ({placeholders}) AND status='dead' AND group_id=? "
+                            f"RETURNING id",
+                            (*chunk, group_id),
+                        )
+                        rows = await cursor.fetchall()
+                    except aiosqlite.OperationalError as exc:
+                        # Leaving the unit cleanly commits the prior chunks.
+                        failure = {
+                            'error': str(exc),
+                            'error_type': 'TransientSqliteError',
+                            'retriable': True,
+                            'deleted': sorted(deleted),
+                            'not_found': sorted(not_found_completed),
+                            'remaining': sorted(ids[i:]),
+                        }
+                        break
+                    chunk_deleted = {
+                        (row[0] if isinstance(row, tuple) else row['id']) for row in rows
                     }
-                return {
-                    'error': str(exc),
-                    'error_type': 'TransientSqliteError',
-                    'retriable': True,
-                    'deleted': sorted(deleted),
-                    'not_found': sorted(not_found_completed),
-                    'remaining': sorted(ids[i:]),
-                }
-            chunk_deleted = {
-                (row[0] if isinstance(row, tuple) else row['id']) for row in rows
-            }
-            deleted |= chunk_deleted
-            # Subtract `deleted` at point-of-update so the invariant holds
-            # throughout the loop — any future early-return path is safe.
-            not_found_completed |= (set(chunk) - chunk_deleted) - deleted
-
-        await self._db.commit()
+                    deleted |= chunk_deleted
+                    # Subtract `deleted` at point-of-update so the invariant holds
+                    # throughout the loop — any future early-return path is safe.
+                    not_found_completed |= (set(chunk) - chunk_deleted) - deleted
+        except aiosqlite.OperationalError:
+            if failure is None:
+                raise
+            logger.exception(
+                'delete_dead: recovery commit failed after OperationalError;'
+                ' reporting full input as remaining',
+            )
+            return {**failure, 'deleted': [], 'not_found': [], 'remaining': sorted(ids)}
+        if failure is not None:
+            return failure
 
         return {
             'deleted': sorted(deleted),
@@ -609,12 +1204,29 @@ class DurableWriteQueue:
     ) -> list[dict[str, Any]]:
         """Return dead-lettered items, newest-first.
 
+        Each item carries ``executed``, the fact a replay decision turns on,
+        over a THREE-valued domain:
+
+        * ``True`` — a backend write for this item landed; replaying it
+          DUPLICATES that write.
+        * ``False`` — the queue recorded that no backend write landed, so the
+          item is safe to replay.
+        * ``None`` — unknown: the row predates the column (task 4116). Check
+          ``backend_ops`` (joined on the payload's ``_write_op_id``) before
+          replaying. POST_EXECUTE_DEAD_PREFIX on the error reported to
+          ``on_terminal`` can confirm a landing (``error`` here never carries
+          it), but its absence proves nothing: before 4116 the prefix was
+          recomputed per attempt and was lost whenever a landed item retried.
+
+        ``None`` is FALSY, so ``if not row['executed']`` is the wrong test —
+        it reads "unknown" as "safe". Only an explicit ``is False`` licenses a
+        replay.
+
         Args:
             group_id: Optional filter by group_id.
             limit: Optional maximum number of items to return.  When *None*
                 all dead items are returned (backward-compatible default).
         """
-        assert self._db is not None
         if group_id:
             sql = (
                 "SELECT * FROM write_queue WHERE status = 'dead' AND group_id = ?"
@@ -629,8 +1241,7 @@ class DurableWriteQueue:
             sql += ' LIMIT ?'
             params = (*params, limit)
 
-        cursor = await self._db.execute(sql, params)
-        rows = await cursor.fetchall()
+        rows = await self._require_access().read_all(sql, params)
         results = []
         for row in rows:
             item = QueueItem(tuple(row))
@@ -638,9 +1249,18 @@ class DurableWriteQueue:
                 'id': item.id,
                 'group_id': item.group_id,
                 'operation': item.operation,
-                'payload': item.parsed_payload(),
+                'payload': _payload_for_display(item.payload),
                 'attempts': item.attempts,
                 'error': item.error,
                 'created_at': item.created_at,
+                'executed': None if item.executed is None else bool(item.executed),
             })
         return results
+
+
+def _payload_for_display(payload: str) -> Any:
+    """A dead row's payload as JSON when it parses, else its raw text, so one corrupt row cannot fail the listing."""
+    try:
+        return json.loads(payload)
+    except ValueError:
+        return payload

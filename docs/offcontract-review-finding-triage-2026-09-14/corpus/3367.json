@@ -1,0 +1,45 @@
+{
+  "role": "reviewer_comprehensive",
+  "schema_version": 1,
+  "session_id": "",
+  "emitted_at": "2026-08-01T01:37:03.348939+00:00",
+  "verdict": {
+    "reviewer": "reviewer_comprehensive",
+    "verdict": "ISSUES_FOUND",
+    "issues": [
+      {
+        "severity": "medium",
+        "category": "correctness",
+        "file": "orchestrator/src/orchestrator/verify.py",
+        "line": 4460,
+        "title": "Env-recovery gate checks `attempt.test.rc != 0` but not that the TEST leg is the ENV_TRANSIENT source",
+        "description": "The comment block states THE RULE as \"this recovery exists for the TEST leg's shared-venv mutation ... It therefore fires only when the TEST leg is the failing one\", but `attempt.test.rc != 0` only establishes that the test leg failed *somehow*, not that it is the leg that classified ENV_TRANSIENT. `category` comes from `_worst_category` over ALL failing legs, and ENV_TRANSIENT (severity_rank=9) outranks TEST_FAILURE (10) and UNKNOWN_TEST_FAILURE (11).\n\nFailure scenario: a branch with a genuine test regression is verified in a cold worktree whose pyright interpreter is mis-resolved. test rc=1 (real assertion failure), type rc=1 (phantom reportMissingImports). `_summarize_checks` returns ENV_TRANSIENT; the new gate passes; a full serial re-run of the test suite fires (the 1320.9s cost this task exists to eliminate) under the `'vanished xdist/pip'` warning that misdescribes the failure \u2014 the exact waste and the exact mislabel the change set out to remove, just in a different rc shape. The retry then cannot change the verdict either, because the TYPE leg is untouched and still dominates `_worst_category`.\n\nI reproduced the classification directly:\n  _summarize_checks(1, <pytest FAILED text>, False, 'uv run pytest tests/', 0, '', False, 'ruff check', 1, <phantom pyright text>, False, 'cd fused-memory && npx pyright')\n  -> (False, FailureCategory.ENV_TRANSIENT, ...)\n\nSuggested fix: gate on the test leg's OWN classification rather than its rc, e.g. `classify_failure(_tool_for_cmd(attempt.test.cmd), attempt.test.rc, attempt.test.output, attempt.test.timed_out) == FailureCategory.ENV_TRANSIENT`. That expresses THE RULE exactly, subsumes the rc check (rc==0 classifies PASSED), and stays correct as further ToolKind-independent ENV_TRANSIENT producers are added."
+      },
+      {
+        "severity": "medium",
+        "category": "correctness",
+        "file": "orchestrator/src/orchestrator/verify_classify.py",
+        "line": 583,
+        "title": "A TYPE-leg ENV_TRANSIENT now outranks and masks a co-occurring genuine TEST_FAILURE",
+        "description": "Making the mis-resolved-interpreter signature a tool-blind guard-3 producer means a TYPE leg can now set the whole-verification category to ENV_TRANSIENT. Because ENV_TRANSIENT (severity_rank=9) beats TEST_FAILURE (10) in `_worst_category`, a run where the type leg is phantom-red AND the test leg is genuinely red reports `env_transient`.\n\nDownstream consequence (merge_queue.py:3040): `INFRA_TRANSIENT_CATEGORIES` routes this to `MergeOutcome('blocked', TRANSIENT_INFRA_REASON_PREFIX ...)` \u2014 explicitly \"no steward, no branch-blaming\". So a real branch regression is held as an infra_issue and never enters a fix loop. Not a false green (the branch does not land), but it is a misattribution that costs a human escalation plus the retry budget.\n\nThis differs from the two pre-existing ENV_TRANSIENT producers the docstring groups it with: a broken `_merge-verify` worktree and restart collateral are tree-wide, so masking every other leg's verdict is correct. A mis-resolved *pyright interpreter* leaves the test leg fully valid, so its verdict is real signal that should not be swallowed.\n\nThere is in-repo precedent for the guard: the bare-xdist worker-crash reclassification in `run_verification` requires `lint_rc == 0 and type_rc == 0` precisely so \"a genuine, co-occurring lint/type regression would [not] be silently diverted onto the infra-retry path\". The mirror-image guard is missing here. Consider requiring that no other leg produced a branch-attributable category before letting the interpreter signature win, or giving this shape its own category ranked below TEST_FAILURE."
+      },
+      {
+        "severity": "low",
+        "category": "legibility",
+        "file": "orchestrator/src/orchestrator/verify.py",
+        "line": 4308,
+        "title": "The loud mis-resolution ERROR fires on timed-out checks, over-claiming the root cause",
+        "description": "The new site is gated on `rc != 0` only, so it also fires when `timed_out_flag` is True. In that case `classify_failure` guard 2 correctly returns INFRA_TIMEOUT (the wall clock is the root cause), while the log states categorically \"This is an ENVIRONMENT mis-resolution, NOT a branch defect\" and points at a fix surface that will not help. A pyright leg killed mid-stream after emitting partial phantom output hits this. Given the whole point of the line is legibility, adding `and not timed_out_flag` (or softening the wording when timed out) keeps the one loud statement aligned with the category actually assigned."
+      },
+      {
+        "severity": "low",
+        "category": "documentation",
+        "file": "orchestrator/src/orchestrator/verify_classify.py",
+        "line": 350,
+        "title": "DISCRIMINATOR CONTRACT over-claims what the `pytest` sentinel proves",
+        "description": "The docstring says losing the sentinel \"proves the interpreter is wrong rather than the dependency set\", and the accompanying test `test_many_distinct_modules_without_the_sentinel_is_not_environmental` reasons that a branch \"never loses `pytest`\". That is not quite true: a branch that deletes or mis-edits its `[dependency-groups] dev` block produces an environment that legitimately lacks pytest *and* every other dev/third-party package \u2014 byte-identical output to the incident signature. `uv sync` succeeds, pyright reports pytest plus dozens of unresolved modules, and both conditions hold. Per the section's own framing this is the dangerous direction (a false positive excusing a branch defect as environmental); the merge lane caps the damage at a mislabelled infra hold rather than a false green, but the claim should be tempered to the accurate one \u2014 the sentinel distinguishes \"wrong interpreter or wholesale-lost dependency set\" from \"one or two undeclared imports\" \u2014 and the residual noted alongside the module's existing accepted-gap notes."
+      }
+    ],
+    "summary": "The config half of this change is solid and well-guarded: the four missing `[tool.pyright] venvPath/venv` pins (shared, escalation, orchestrator, fused-memory) complete a set that root, dashboard, cockpit and sampler already had, the pins resolve to this worktree's own `.venv` (verified), and the two new guards in `tests/scripts/test_fallback_verify_config.py` \u2014 the fleet-chain walk using the production `_AND_CLAUSE_SPLIT_RE`/`_cd_clause_target` helpers, and the workspace-wide invariant discovered from `[tool.uv.workspace].members` \u2014 are non-vacuous and pass. The `pytest` sentinel is sound for every fleet member since all of them set `include = [\"src\", \"tests\"]`. All 368 tests across the three touched verify suites pass, plus both new pin guards.\\n\\nThe classifier half has a leg-attribution gap. Adding a tool-blind ENV_TRANSIENT producer that a TYPE leg can trip means the category no longer implies which leg failed \u2014 the diff documents this precisely and retires the old corollary, but then under-enforces the replacement. (1) The new gate `attempt.test.rc != 0` establishes only that the test leg failed, not that it is the ENV_TRANSIENT source; with a genuine test failure alongside a phantom type leg the gate still passes and fires a full serial test re-run under the misleading \"vanished xdist/pip\" warning \u2014 the same waste and mislabel this task exists to remove. (2) More consequentially, ENV_TRANSIENT (severity_rank 9) outranks TEST_FAILURE (10) in `_worst_category`, so that same shape reports `env_transient` and merge_queue routes it to an explicitly non-branch-blaming infra hold \u2014 a real regression that never reaches the steward. I confirmed the classification empirically. The repo already guards the mirror-image case (the bare-xdist reclassification requires `lint_rc == 0 and type_rc == 0`); the same discipline is missing here. Two lower-severity items: the loud ERROR also fires on timed-out checks where INFRA_TIMEOUT is the real category, and the sentinel docstring over-claims that a missing `pytest` proves the interpreter (not the dependency set) is wrong \u2014 a branch that drops its dev-dependency group produces an identical signature."
+  }
+}

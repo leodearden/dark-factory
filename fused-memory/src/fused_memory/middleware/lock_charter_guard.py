@@ -16,13 +16,29 @@ The α/γ shared predicate is a *pure string* classification — no filesystem
 stat, no model call (C-P3).  C-P3 determinism means the Python
 implementation here and reify's Bash ``_is_file_path`` in
 ``scripts/lock-charter-guard.sh`` (reify task 4676, status=done) are
-equivalent *by construction*: same allowlist, same strip/segment/ext
-algorithm.
+equivalent *by construction*: same extension allowlist, same extension-less
+filename allowlist, same strip/segment/ext algorithm.
 
-The drift-guard test in ``tests/test_lock_charter_guard.py`` pins
-``sorted(CODE_EXTENSIONS)`` to the shared α/γ canonical vector printed by
-``lock-charter-guard.sh --list-extensions``, so divergence is caught at CI
-time.
+The drift guards in ``tests/test_lock_charter_guard.py`` pin both vectors to
+canonical literals and to ``shared.locking``'s copy.  Agreement with reify's
+``lock-charter-guard.sh`` is checked OFF the merge gate: the nightly
+``scripts/check_lock_charter_drift.py`` reports a divergence and files one
+heal task for it (task 11623; ``OPERATIONS.md`` section 9a).
+
+STATUS — cross-repo agreement on the extension-less vector (#3248)
+-------------------------------------------------------------------
+``EXTENSIONLESS_FILENAMES`` (below) is NOT a dark_factory-only lead, and this
+paragraph exists because #3248 was planned on the opposite assumption.  reify
+got there FIRST: ``scripts/lock-charter-guard.sh`` already carries the same
+8-name vector inside its bash ``_is_file_path`` and exposes it via
+``--list-extensionless`` (reify #5890).  Measured 2026-08-09 on the live
+script — the two vectors are identical, and ``classify hooks/project-checks``
+returns ACCEPT, not REJECT.  So this change CONVERGED the seam rather than
+opening one; no reify follow-up is owed.
+
+Comparing ``--list-extensions`` alone, an EXTENSION vector, would be blind to
+this frozenset, so the nightly check compares ``--list-extensionless`` too, and
+three-way α/γ/bash agreement is checked rather than merely asserted in prose.
 
 Extension allowlist rationale (reify PRD §11 Q2):
 - PRD-explicit: rs ri toml cpp c h hpp md json yaml yml lock py sh ts tsx js txt step stl
@@ -36,9 +52,25 @@ Extension allowlist rationale (reify PRD §11 Q2):
   gitmodules golden grammar icns ico jq jsonl log manifest npmrc python-version
   template timer typed
 
+Extension-LESS filename rationale (dark_factory #3248):
+- The extension allowlist above can never reach a final segment with no dot at
+  all — there is no token to look up — so every extension-less tracked FILE
+  (``LICENSE``, ``Dockerfile``, ``hooks/pre-commit``, ``hooks/project-checks``)
+  classified as a DIRECTORY.  Two distinct faults followed: γ rejected such a
+  declaration outright with a LockCharterViolation, and α — silently — stripped
+  it, so a task declaring ONLY such paths got an empty charter and fell through
+  to a per-task ``task-<id>`` synthetic lock that conflicts with nothing.
+- Fixed with a SECOND enumerated frozenset rather than a general rule, for the
+  same reason the extension list stays enumerated: "an extension-less segment
+  naming an executable is a file" is not evaluable as pure string (C-P3) and
+  would re-admit real directories.
+- Vector measured by ``git ls-files -s`` over both repos; submodule gitlinks
+  (mode 160000) deliberately excluded.  Full evidence and the admission rule
+  are on the ``EXTENSIONLESS_FILENAMES`` definition below.
+
 ## Predicate canonical location
 
-The α/γ shared predicate (``CODE_EXTENSIONS``, ``is_file_path``,
+The α/γ shared predicate (``FILE_EXTENSIONS``, ``is_file_path``,
 ``directory_locks``) is canonical in ``shared.locking`` so that
 ``orchestrator.scheduler`` (α) can import it without a
 ``fused_memory`` → ``orchestrator`` cross-package edge (no-cross-package-edge
@@ -54,59 +86,49 @@ tests:
 
 - ``tests/test_lock_charter_guard.py::test_extension_drift_guard``
   (pins this copy against ``_CANONICAL_EXTENSIONS``)
-- ``shared/tests/test_locking.py::TestCodeExtensionsDriftGuard``
+- ``shared/tests/test_locking.py::TestFileExtensionsDriftGuard``
   (pins the ``shared.locking`` copy against the same canonical vector)
 """
 
 from __future__ import annotations
 
-import json
-import logging
 from typing import Any
 
-from shared.task_metadata import parse_metadata
-
-logger = logging.getLogger(__name__)
-
-# SchemaWarning codes (shared.task_metadata) that mean the WHOLE metadata
-# value was discarded — parse_metadata could not produce any dict at all.
-# Only these are loud here; 'unknown_key'/'invalid_field'/'invalid_submodel'
-# etc. are expected on legitimate curator-internal metadata and belong to
-# the write boundary (W3-β), not this read-path guard.
-_DISCARD_CODES = frozenset({'unparseable_json', 'not_an_object'})
+from fused_memory.middleware.deterministic_task_guard import DETERMINISTIC_ROUTING_HINT
+from fused_memory.middleware.metadata_dict import raw_metadata_dict
 
 # ---------------------------------------------------------------------------
-# Canonical extension allowlist — kept in sync with shared.locking.CODE_EXTENSIONS.
+# Canonical extension allowlist — kept in sync with shared.locking.FILE_EXTENSIONS.
 # Drift guard: tests/test_lock_charter_guard.py::test_extension_drift_guard
 #
-# NAMING — read the contract, not the name.  Despite being called CODE_EXTENSIONS
-# this is NOT a code-file allowlist.  It is the set of recognised FILE-EXTENSION
-# TOKENS whose presence after the last dot of a path's final segment is evidence
-# that the segment names a FILE rather than a DIRECTORY — which is all any caller
+# NAMING — the contract.  This is the set of recognised FILE-EXTENSION TOKENS
+# whose presence after the last dot of a path's final segment is evidence that
+# the segment names a FILE rather than a DIRECTORY — which is all any caller
 # (is_file_path, directory_locks, strip_directory_locks,
-# module_charter.derive_modules) relies on.  Its non-code members are therefore
-# correct and load-bearing: png svg ico icns log lock diff golden manifest timer
-# typed service template example python-version gitignore gitkeep gitmodules
-# gitattributes npmrc envrc conf.
-# Judge a candidate addition by "does a real tracked file end in this?", NEVER by
-# "is this code?".  That misreading of the name is exactly what let the list sit
-# at a 22-extension undercount until #3117.  Renaming to FILE_EXTENSIONS is the
-# right long-term fix but spans shared/__init__.py, shared/tests/test_public_api.py,
-# orchestrator.module_charter, fused_memory server/tools.py + task_interceptor.py
-# and reify's own copy — all outside #3117's lock charter, so it is deferred to a
-# dedicated follow-up rather than done half-way here.
+# module_charter.derive_modules) relies on.  It is NOT a code-file allowlist, so
+# its non-code members are correct and load-bearing: png svg ico icns log lock
+# diff golden manifest timer typed service template example python-version
+# gitignore gitkeep gitmodules gitattributes npmrc envrc conf.
+# ADMISSION RULE: judge a candidate addition by "does a real tracked file end in
+# this?", NEVER by "is this code?".  Reading this list's former, CODE_-prefixed
+# name as if it meant "code" is exactly what let it sit at a 22-extension
+# undercount until #3117 — the history this rule exists to prevent repeating,
+# and the reason the name now says FILE.
+# Renamed to FILE_EXTENSIONS by #3248, the dedicated follow-up #3117 deferred
+# that rename to.
 # ---------------------------------------------------------------------------
 
 __all__ = [
-    'CODE_EXTENSIONS',
+    'EXTENSIONLESS_FILENAMES',
+    'FILE_EXTENSIONS',
     'is_file_path',
     'directory_locks',
     'extract_files',
     'lock_charter_error',
 ]
 
-CODE_EXTENSIONS: frozenset[str] = frozenset({
-    'c', 'cc', 'cjs', 'conf', 'cpp', 'css', 'cts', 'cxx',
+FILE_EXTENSIONS: frozenset[str] = frozenset({
+    'c', 'cc', 'cjs', 'conf', 'cpp', 'css', 'csv', 'cts', 'cxx',
     'diff', 'envrc', 'example', 'example-systemd-config',
     'gcode', 'gitattributes', 'gitignore', 'gitkeep', 'gitmodules', 'golden', 'grammar',
     'h', 'hh', 'hpp', 'html',
@@ -116,8 +138,78 @@ CODE_EXTENSIONS: frozenset[str] = frozenset({
     'manifest', 'md', 'mjs', 'mts',
     'npmrc', 'png', 'py', 'python-version',
     'ri', 'rs', 'scss', 'service', 'sh', 'step', 'stl', 'svg',
-    'template', 'timer', 'toml', 'ts', 'tsx', 'txt', 'typed',
+    'template', 'timer', 'tombstones', 'toml', 'ts', 'tsv', 'tsx', 'txt', 'typed',
     'yaml', 'yml',
+})
+
+# ---------------------------------------------------------------------------
+# Canonical extension-LESS filename allowlist (dark_factory #3248).
+#
+# CONTRACT: recognised final-segment NAMES that carry no extension at all yet
+# denote a FILE.  FILE_EXTENSIONS above can never reach these — there is no dot,
+# so there is no token to look up — which is why they need a second enumerated
+# vector rather than another entry in the first.  Matched against the final
+# segment BEFORE the "no dot ⇒ directory" reject in is_file_path.
+#
+# EVIDENCE: `git ls-files -s` over BOTH repos, re-measured 2026-08-09 (identical
+# to the 2026-07-31 measurement) — every tracked path whose final segment
+# contains no '.'.  dark-factory contributes Dockerfile LICENSE pre-commit
+# pre-merge-commit project-checks; reify adds cargo cargo-audit-orphans
+# reference-transaction, and sccache (scripts/canon-bin/guard/sccache, reify
+# task 10232, measured on reify main 2026-11-23).  Union = the 9 below.
+#
+# GITLINK EXCLUSION — load-bearing, and a deliberate decision rather than an
+# accident of the sweep: `git ls-files -s` entries with mode 160000 are submodule
+# mount points (`graphiti`, `mem0` in dark-factory).  They are extension-less and
+# would otherwise qualify, but admitting them would let a task declare an ENTIRE
+# VENDORED SUBMODULE as its lock charter — strictly worse than the bug being
+# fixed.  They stay DIRECTORIES.  The corpus sweeps assert this filter is doing
+# real work rather than passing vacuously.
+#
+# CASE-SENSITIVITY: exact tracked spelling only.  `LICENSE` matches; `license`
+# and `License` do not.  Same rule as the (lowercase) extension allowlist: a
+# tracked file whose case differs is a naming problem, not an allowlist gap.
+#
+# ADMISSION RULE, as for FILE_EXTENSIONS: judge a candidate by "is this a real
+# tracked file?", never by "does it look like a file?".  The list must stay
+# ENUMERATED — a general rule such as "an extension-less segment naming an
+# executable is a file" cannot be evaluated as pure string (C-P3) and would
+# re-admit directories.
+#
+# CROSS-PROJECT SCOPE — the limitation this enumeration knowingly accepts, and
+# the reason the admission rule above is stricter than it looks.  Members are
+# matched as BARE FINAL SEGMENTS and several are generic: `cargo`, `Dockerfile`,
+# `LICENSE`, `pre-commit`.  The collision checks that bound this risk
+# (test_no_canonical_extensionless_name_is_also_a_directory on the gate, and
+# scripts/check_lock_charter_drift.py::check_extensionless nightly) sweep only
+# the dark-factory and reify checkouts — but this predicate governs lock charters
+# for EVERY project the orchestrator targets.  In a third project containing
+# `tools/cargo/` or `docker/Dockerfile/` as a real DIRECTORY, that directory now
+# classifies as a FILE: directory_locks stops rejecting it and derive_modules
+# RETAINS it, yielding a prefix lock over the entire subtree (modules_conflict
+# is prefix-based) — the reify-3468 over-wide-charter failure the strip exists
+# to prevent, and now with NO INFO diagnostic, because nothing was stripped.
+# Admitting a generic basename is therefore a CROSS-PROJECT COMMITMENT, not a
+# local one: weigh a candidate against every targeted repo, not only the two
+# that are actually swept.
+#
+# Drift guard (this γ copy): fused-memory/tests/test_lock_charter_guard.py::test_extensionless_drift_guard
+# Drift guard (shared copy in shared/locking.py): shared/tests/test_locking.py::TestExtensionlessFilenamesDriftGuard
+# Self-audit (both copies): test_every_tracked_extensionless_file_is_allowlisted
+#   sweeps both repos' tracked corpora, so a newly tracked extension-less file
+#   surfaces as a red test rather than as another LockCharterViolation incident.
+# ---------------------------------------------------------------------------
+
+EXTENSIONLESS_FILENAMES: frozenset[str] = frozenset({
+    'Dockerfile',
+    'LICENSE',
+    'cargo',
+    'cargo-audit-orphans',
+    'pre-commit',
+    'pre-merge-commit',
+    'project-checks',
+    'reference-transaction',
+    'sccache',
 })
 
 
@@ -131,10 +223,18 @@ def is_file_path(path: str) -> bool:
     1. Strip ALL trailing ``/`` from *path*.
     2. Final segment = substring after last ``/``.
        Empty segment (path was all slashes) → directory → return False.
-    3. If the segment contains no ``.`` → extension-less → return False.
-    4. ext = substring after the last ``.`` in the segment.
-       Return ``ext in CODE_EXTENSIONS`` (case-sensitive, matching α's
+    3. If the segment is in ``EXTENSIONLESS_FILENAMES`` → file → return True.
+       Checked BEFORE the no-dot reject below, because these names carry no
+       extension and would otherwise be rejected at step 4 (dark_factory #3248).
+    4. If the segment contains no ``.`` → extension-less → return False.
+    5. ext = substring after the last ``.`` in the segment.
+       Return ``ext in FILE_EXTENSIONS`` (case-sensitive, matching α's
        ``[ "$ext" = "$e" ]`` against a lowercase allowlist).
+
+    C-P3 is PRESERVED by step 3: it is a set membership test on a string, so
+    the predicate remains pure string — no stat, no filesystem access, no model
+    call.  A ghost path that is not on disk still classifies deterministically,
+    exactly as before.
     """
     # Strip all trailing slashes.
     p = path
@@ -147,6 +247,11 @@ def is_file_path(path: str) -> bool:
     # Empty segment → path was all slashes → directory.
     if not seg:
         return False
+
+    # Recognised extension-less FILE name → file.  Must precede the no-dot
+    # reject below, which would otherwise swallow every one of these.
+    if seg in EXTENSIONLESS_FILENAMES:
+        return True
 
     # No dot in segment → extension-less → treat as directory (REJECT).
     if '.' not in seg:
@@ -166,7 +271,7 @@ def is_file_path(path: str) -> bool:
     #                  rule: that rule would make '.worktrees' (the whole
     #                  worktree pool) declarable as a lock charter.
     # 'f.PY' → ext='PY' — not in (lowercase) allowlist → False.  Correct.
-    return ext in CODE_EXTENSIONS
+    return ext in FILE_EXTENSIONS
 
 
 # ---------------------------------------------------------------------------
@@ -212,56 +317,86 @@ def extract_files(metadata: str | dict[str, Any] | None) -> list[str]:
         across module boundaries.
 
     Rules:
-    - ``None`` → []
-    - ``dict`` → use directly
-    - ``str`` → ``json.loads``; on failure or non-dict result → []
+    - *metadata* resolves to a dict through
+      :func:`fused_memory.middleware.metadata_dict.raw_metadata_dict`, so
+      absent metadata is empty and unreadable metadata is empty and logged.
     - If the resolved dict has no ``files`` key → []
     - If ``files`` is not a list → []
     - Return only the string entries of the list.
-
-    The ``str`` branch delegates its malformed-input policy to
-    :func:`shared.task_metadata.parse_metadata` (``direction='read'``) and
-    emits a ``task_metadata.schema_warning`` WARNING when *metadata* cannot
-    be resolved to a JSON object at all (unparseable JSON / non-object) — I4:
-    this replaces a silent ``[]`` coercion. The dict-path extraction below is
-    untouched, so mixed-type-list filtering and non-list-``files`` behaviour
-    are unchanged.
     """
-    if metadata is None:
-        return []
-
-    parsed: dict[str, Any] | None = None
-    if isinstance(metadata, dict):
-        parsed = metadata
-    elif isinstance(metadata, str) and not metadata:
-        # Empty string is benign-absent, not a discard — mirrors the
-        # pre-collapse `isinstance(raw, str) and raw` guard.
-        return []
-    elif isinstance(metadata, str):
-        _, warnings = parse_metadata(metadata, direction='read')
-        discard = [w for w in warnings if w.code in _DISCARD_CODES]
-        if discard:
-            reason = '; '.join(w.message for w in discard) or 'unrecognised shape'
-            logger.warning(
-                'task_metadata.schema_warning source=lock_charter_guard.extract_files '
-                'error=%s (type=%s); metadata discarded',
-                reason,
-                type(metadata).__name__,
-            )
-            return []
-        # parse_metadata already confirmed this parses to a JSON object —
-        # reparse independently for the raw dict (see docstring above: never
-        # model_dump()).
-        parsed = json.loads(metadata)
-
-    if parsed is None:
-        return []
-
+    parsed = raw_metadata_dict(metadata, source='lock_charter_guard.extract_files')
     files = parsed.get('files')
     if not isinstance(files, list):
         return []
 
     return [f for f in files if isinstance(f, str)]
+
+
+def _allowlist_lockstep(vector: str, reify_var: str, test_vector: str) -> str:
+    """Name every home of the allowlist *vector*, which must all change together."""
+    return (
+        f'{vector} in BOTH shared/src/shared/locking.py and '
+        'fused-memory/src/fused_memory/middleware/lock_charter_guard.py, '
+        f'AND to reify scripts/lock-charter-guard.sh {reify_var} (all three '
+        'must agree — the nightly scripts/check_lock_charter_drift.py reports '
+        f'a mismatch and files the heal task), plus the {test_vector} vector '
+        'in both test copies.'
+    )
+
+
+_DIRECTORY_HINT = (
+    'Replace each directory with the specific file paths it contains, '
+    'or use files=[] (the defer-to-architect value) to leave scope '
+    'unspecified. Directory strings in metadata.files are rejected '
+    'because they create over-wide lock charters that block unrelated '
+    'work in the same directory. '
+    'Note: extension matching is case-sensitive against a lowercase '
+    'allowlist (e.g. "README.MD" or "config.YAML" is classified as a '
+    'directory — use lowercase extensions like "README.md" instead). '
+    'If the offending path has NO extension at all, "replace it with '
+    'the files it contains" may be unfollowable because it IS a file '
+    '(e.g. "hooks/project-checks"): an extension-less final segment '
+    'counts as a file only when its exact name is listed in '
+    'EXTENSIONLESS_FILENAMES. If it is a genuinely new extension-less '
+    'tracked file, add its name to '
+    + _allowlist_lockstep(
+        'EXTENSIONLESS_FILENAMES', '_EXTLESS', '_CANONICAL_EXTENSIONLESS',
+    )
+)
+
+
+def _has_unrecognised_extension(path: str) -> bool:
+    """True iff *path* is not slash-terminated and its final segment's extension is unlisted in any case."""
+    segment = path.rsplit('/', 1)[-1]
+    return (
+        not path.endswith('/')
+        and '.' in segment
+        and segment.rsplit('.', 1)[1].lower() not in FILE_EXTENSIONS
+    )
+
+
+def _unrecognised_extension_error(paths: list[str]) -> str:
+    path_list = ', '.join(repr(p) for p in paths)
+    return (
+        f' {path_list} may instead be a FILE whose extension is not on the '
+        'allowlist; if it is gitignored, files=[] will not help, because a '
+        "task_kind='normal' task cannot deliver a gitignored file — file such "
+        "work as task_kind='deterministic' (see hint)."
+    )
+
+
+def _unrecognised_extension_hint(paths: list[str]) -> str:
+    path_list = ', '.join(repr(p) for p in paths)
+    return (
+        f' {path_list} may be a FILE whose extension is not on the '
+        'FILE_EXTENSIONS allowlist. A gitignored file can never be committed, '
+        "so a task_kind='normal' task cannot deliver it, and files=[] only "
+        f'hands the same failure to the architect. {DETERMINISTIC_ROUTING_HINT} '
+        'Whatever the task_kind, leave a gitignored path out of '
+        'metadata.files: this check classifies it as a directory either way. '
+        'If it is instead a TRACKED file, add its extension to '
+        + _allowlist_lockstep('FILE_EXTENSIONS', '_EXTS', '_CANONICAL_EXTENSIONS')
+    )
 
 
 def lock_charter_error(
@@ -271,7 +406,8 @@ def lock_charter_error(
     """Return a structured LockCharterViolation error dict.
 
     Shape mirrors ``_done_gate_error`` / ``PathGuardVerdict.to_error_dict``
-    so MCP callers handle it uniformly.
+    so MCP callers handle it uniformly.  ``unrecognised_extension_paths``
+    lists the rejected paths whose extension is unlisted in any case, i.e. may be files.
 
     Args:
         directories: The offending directory-like path strings.
@@ -280,23 +416,21 @@ def lock_charter_error(
     """
     task_clause = f' (task {task_id})' if task_id else ''
     dir_list = ', '.join(repr(d) for d in directories)
+    unrecognised = [d for d in directories if _has_unrecognised_extension(d)]
+    error = (
+        f'metadata.files contains directory declarations{task_clause}: '
+        f'{dir_list}. '
+        f'Declare individual file paths (e.g. "src/foo.py") or use '
+        f'files=[] to defer scope to the architect.'
+    )
+    hint = _DIRECTORY_HINT
+    if unrecognised:
+        error += _unrecognised_extension_error(unrecognised)
+        hint += _unrecognised_extension_hint(unrecognised)
     return {
-        'error': (
-            f'metadata.files contains directory declarations{task_clause}: '
-            f'{dir_list}. '
-            f'Declare individual file paths (e.g. "src/foo.py") or use '
-            f'files=[] to defer scope to the architect.'
-        ),
+        'error': error,
         'error_type': 'LockCharterViolation',
         'directory_paths': directories,
-        'hint': (
-            'Replace each directory with the specific file paths it contains, '
-            'or use files=[] (the defer-to-architect value) to leave scope '
-            'unspecified. Directory strings in metadata.files are rejected '
-            'because they create over-wide lock charters that block unrelated '
-            'work in the same directory. '
-            'Note: extension matching is case-sensitive against a lowercase '
-            'allowlist (e.g. "README.MD" or "config.YAML" is classified as a '
-            'directory — use lowercase extensions like "README.md" instead).'
-        ),
+        'unrecognised_extension_paths': unrecognised,
+        'hint': hint,
     }

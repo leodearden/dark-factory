@@ -7,13 +7,13 @@ pipeline (δ conflict-graph + ε frontier + ζ aging + η bounce + θ breaker
 the DEFAULT footprint detector.
 
 Fake/instrumented runners only:
-  - rebase_onto_main stubbed (AsyncMock)
+  - rebase_onto_main stubbed at the git_ops constructor port
   - run_scoped_verification + shutil.disk_usage mocked
   - no real ssh/build/merge-to-main
 
 Integration delta over upstream unit suites
 -------------------------------------------
-The upstream unit suites hand-seed ``_suffix_conflict_graph`` directly.
+The upstream unit suites hand-seed ``suffix_conflict_graph`` directly.
 This suite drives ``recompute_suffix_conflict_graph()`` against REAL git
 branches with the DEFAULT footprint detector so the real graph flows into
 aging / bounce / frontier.  Scenario 9 replaces the MagicMock worker
@@ -29,7 +29,7 @@ and a real landing drives the resume path.
       against the tip of the frozen prefix (base-chain integrity via
       check_frozen_prefix_invariant).
   I3. Reorder touches only the unfrozen suffix — recompute_suffix_conflict_graph
-      updates only _lane_buffers; _inflight order and base_sha are unchanged.
+      updates only the lane buffers; _inflight order and base_sha are unchanged.
   I4. Liveness / no-starvation — an item in a clique eventually becomes head
       of clique and is picked; disjoint items bypass a blocked clique.
 
@@ -59,16 +59,19 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 from typing import Literal
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock, PropertyMock, patch
 
 import pytest
+from _merge_lane_fakes import lane_scene_config
 from escalation.queue import EscalationQueue
 
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.event_store import EventStore
 from orchestrator.git_ops import GitOps, MergeResult, _run
 from orchestrator.harness import Harness
-from orchestrator.merge_queue import (
+from orchestrator.merge_lane.intake_buffers import MergeIntake
+from orchestrator.merge_lane.types import QueuedBranch
+from orchestrator.merge_lane.worker import (
     MERGE_BOUNCE_CAP,
     NEEDS_REBASE_REASON_PREFIX,
     DecidedItem,
@@ -80,15 +83,14 @@ from orchestrator.merge_queue import (
     RealMergeItem,
     SpeculativeItem,
     SpeculativeMergeWorker,
-    SuffixConflictGraph,
 )
-from orchestrator.merge_types import QueuedBranch
 from orchestrator.run_store import RunStore
+from orchestrator.suffix_graph import SuffixConflictGraph
 from orchestrator.verify_runner import HostLease
 
 # ── Module-level sentinel ─────────────────────────────────────────────────────
 
-_SENTINEL_VERIFY_TASK = object()  # noqa: PD901
+_SENTINEL_VERIFY_TASK = object()
 """Sentinel for verify_task in pure unit tests.
 
 frozen_prefix() checks ``e.verify_task is not None`` only, so any non-None
@@ -145,7 +147,7 @@ def git_ops(git_config: GitConfig, git_repo: Path) -> GitOps:
 
 @pytest.fixture
 def config(git_repo: Path, git_config: GitConfig) -> OrchestratorConfig:
-    return OrchestratorConfig(project_root=git_repo, git=git_config)
+    return lane_scene_config(git_repo, git_config)
 
 
 # ── Request / item / entry builders ──────────────────────────────────────────
@@ -188,6 +190,65 @@ def _make_req(
 def _make_worker(git_ops: GitOps) -> SpeculativeMergeWorker:
     """Build a bare SpeculativeMergeWorker for unit tests (no harness wiring)."""
     return SpeculativeMergeWorker(git_ops, asyncio.Queue())
+
+
+class _StubRebaseGitOps:
+    """The real GitOps with ``rebase_onto_main`` stubbed to a fixed verdict.
+
+    Injected through ``SpeculativeMergeWorker``'s existing ``git_ops``
+    constructor argument (PRD task beta's port) rather than assigned over the
+    built worker.  ``rebase_onto_main`` is the single git call
+    ``bounce_conflicting_suffix_items`` makes to probe a needs-rebase item, so
+    stubbing it at the port decides clean-rebase (``clean=True``) vs
+    real-conflict (``clean=False``) for the whole bounce path while every other
+    git operation (``get_main_sha``, ``merge_tree_conflicts``,
+    ``get_changed_files`` -- the REAL recompute probes this suite exists to
+    drive) still reaches the real repo.
+
+    ``rebase_calls`` is the public recorder: one ``(worktree, onto)`` pair per
+    call, in call order.
+    """
+
+    def __init__(self, inner: GitOps, *, clean: bool) -> None:
+        self.inner = inner
+        self.clean = clean
+        self.rebase_calls: list[tuple[Path, str | None]] = []
+
+    def __getattr__(self, name: str):  # type: ignore[no-untyped-def]
+        return getattr(self.inner, name)
+
+    async def rebase_onto_main(self, worktree: Path, onto: str | None = None) -> bool:
+        self.rebase_calls.append((worktree, onto))
+        return self.clean
+
+
+def _make_rebase_stubbed_worker(
+    git_ops: GitOps, *, clean: bool,
+) -> tuple[SpeculativeMergeWorker, _StubRebaseGitOps]:
+    """Return (worker, stub) with the rebase probe injected at the git_ops port."""
+    stub = _StubRebaseGitOps(git_ops, clean=clean)
+    return SpeculativeMergeWorker(stub, asyncio.Queue()), stub  # type: ignore[arg-type]
+
+
+# ── Public observation surfaces ───────────────────────────────────────────────
+
+
+def _suffix_graph(worker: SpeculativeMergeWorker) -> dict:
+    """The suffix conflict graph as ``snapshot()`` publishes it."""
+    return worker.snapshot()['suffix_conflict_graph']
+
+
+def _edges(graph: dict, key: str) -> set[frozenset[str]]:
+    """A snapshot graph's *key* edge list as comparable unordered pairs."""
+    return {frozenset(edge) for edge in graph[key]}
+
+
+def _awaiting_verify_ids(worker: SpeculativeMergeWorker) -> list[str]:
+    """Task ids holding a verify slot, per ``snapshot()``."""
+    return [
+        e['task_id'] for e in worker.snapshot()['entries']
+        if e['state'] == 'awaiting_verify'
+    ]
 
 
 def _make_fake_item(
@@ -245,6 +306,11 @@ def _make_inflight_entry(
     )
 
 
+def _seed_inflight(worker: SpeculativeMergeWorker, *entries: InflightEntry) -> None:
+    """Admit *entries* to the lane's in-flight region, oldest first."""
+    worker._inflight.extend(entries)
+
+
 # ── Branch / commit helpers ───────────────────────────────────────────────────
 
 
@@ -285,23 +351,26 @@ async def _create_frozen_tip_commit(
 # ── Harness factory + real-worker attachment (for scenario 9) ─────────────────
 
 
-def _make_harness(tmp_path: Path) -> tuple[Harness, MagicMock]:
+def _make_harness(tmp_path: Path) -> tuple[Harness, EscalationQueue]:
     """Harness with a real Scheduler + EscalationQueue and a spy RunStore.
 
     Mirrors test_harness_no_landings_breaker._make_harness.
-    Returns (harness, mock_run_store).
+    Returns (harness, escalation_queue) — the queue is the test's own handle on
+    what the breaker files, read back through EscalationQueue's public API.
     """
     config = OrchestratorConfig(project_root=tmp_path)
     harness = Harness(config)
-    mock_run_store = MagicMock(spec=RunStore)
-    harness._run_store = mock_run_store
+    harness._run_store = MagicMock(spec=RunStore)
     harness._run_id = 'run-integration-0001'
     harness.event_store = EventStore(tmp_path / 'events.db', 'run-integration-0001')
-    harness._escalation_queue = EscalationQueue(tmp_path / 'escalations')
-    return harness, mock_run_store
+    escalation_queue = EscalationQueue(tmp_path / 'escalations')
+    harness._escalation_queue = escalation_queue
+    return harness, escalation_queue
 
 
-def _attach_real_worker(harness: Harness, git_ops: GitOps) -> SpeculativeMergeWorker:
+def _attach_real_worker(
+    harness: Harness, git_ops: GitOps, escalation_queue: EscalationQueue,
+) -> SpeculativeMergeWorker:
     """Attach a REAL SpeculativeMergeWorker to the harness as harness._merge_worker.
 
     Integration delta over the upstream θ test (which used a MagicMock worker):
@@ -313,10 +382,18 @@ def _attach_real_worker(harness: Harness, git_ops: GitOps) -> SpeculativeMergeWo
     worker = SpeculativeMergeWorker(
         git_ops,
         asyncio.Queue(),
-        escalation_queue=harness._escalation_queue,
+        escalation_queue=escalation_queue,
     )
     harness._merge_worker = worker
     return worker
+
+
+def _pending_breaker_escalations(escalation_queue: EscalationQueue) -> list:
+    """Pending INFO escalations filed by the no-landings breaker."""
+    return [
+        e for e in escalation_queue.get_by_task(_BREAKER_SENTINEL, status='pending')
+        if e.agent_role == _BREAKER_ROLE
+    ]
 
 
 def _small_breaker(window: int = 3, floor: int = 1000) -> NoLandingsCircuitBreaker:
@@ -374,21 +451,14 @@ class TestTwoLayerInvariants:
             config=config, git_repo=git_repo,
         )
         entry_a = _make_inflight_entry(item_a, verifying=True)
-        worker._inflight.append(entry_a)
+        _seed_inflight(worker, entry_a)
 
         # Suffix req — different rid, not in frozen prefix.
         req_b = _make_req('task-b', 'task/task-b', config, git_repo)
-        worker._lane_buffers['normal'].append(req_b)
+        worker._intake.buffer_owned_request(req_b)
 
-        # Build a valid graph: textual_edges ⊆ footprint_edges;
-        # conflicts_with_main ⊆ nodes.
-        edge_pair = frozenset({req_b.request_id, 'some-other-rid'})
-        worker._suffix_conflict_graph = SuffixConflictGraph(
-            nodes=(req_b.request_id,),
-            textual_edges=frozenset(),      # empty ⊆ any set
-            footprint_edges=frozenset({edge_pair}),
-            conflicts_with_main=frozenset({req_b.request_id}),
-        )
+        # The tracker's own recompute builds the graph over that suffix.
+        await worker._intake.recompute_suffix_conflict_graph()
 
         violations = worker.two_layer_invariants(main_sha)
 
@@ -403,28 +473,54 @@ class TestTwoLayerInvariants:
         git_repo: Path,
     ) -> None:
         """(a) A broken base-chain in the frozen prefix produces a violation str
-        naming the offending request_id.
+        naming the offending SUCCESSOR's request_id.
         """
         worker = _make_worker(git_ops)
         main_sha = 'main-sha-001'
 
-        # Frozen entry whose base_sha does NOT match main_sha → chain broken.
+        # The successor's base is not its predecessor's merge commit → broken.
         _, item_a = _make_fake_item(
-            'task-a', base_sha='wrong-sha', merge_commit='merge-sha-a',
+            'task-a', base_sha=main_sha, merge_commit='merge-sha-a',
             config=config, git_repo=git_repo,
         )
-        entry_a = _make_inflight_entry(item_a, verifying=True)
-        worker._inflight.append(entry_a)
+        _, item_b = _make_fake_item(
+            'task-b', base_sha='wrong-sha', merge_commit='merge-sha-b',
+            config=config, git_repo=git_repo,
+        )
+        _seed_inflight(
+            worker, _make_inflight_entry(item_a, verifying=True), _make_inflight_entry(item_b),
+        )
 
         violations = worker.two_layer_invariants(main_sha)
 
         assert violations, 'Expected a violation for broken base-chain but got []'
-        # At least one violation must name the offending rid.
         joined = ' '.join(violations)
-        assert item_a.request.request_id in joined, (
-            f'Expected offending rid {item_a.request.request_id!r} in violations '
+        assert item_b.request.request_id in joined, (
+            f'Expected offending rid {item_b.request.request_id!r} in violations '
             f'but got: {violations!r}'
         )
+        assert item_a.request.request_id not in joined, (
+            f'the head is intact and must not be named, got: {violations!r}'
+        )
+
+    async def test_lone_head_on_a_foreign_base_is_intact(
+        self,
+        git_ops: GitOps,
+        config: OrchestratorConfig,
+        git_repo: Path,
+    ) -> None:
+        """A lone head whose base is not current main, and not a recorded dead
+        commit, is INV-3 intact (task 5302): main moving under an in-flight
+        verify is not a violation.
+        """
+        worker = _make_worker(git_ops)
+        _, item_a = _make_fake_item(
+            'task-a', base_sha='wrong-sha', merge_commit='merge-sha-a',
+            config=config, git_repo=git_repo,
+        )
+        _seed_inflight(worker, _make_inflight_entry(item_a, verifying=True))
+
+        assert worker.two_layer_invariants('main-sha-001') == []
 
     async def test_violation_b_frozen_suffix_overlap_detected(
         self,
@@ -451,7 +547,7 @@ class TestTwoLayerInvariants:
         worker._inflight.append(entry_a)
 
         # ALSO put req_a in the suffix — this violates frozen∩suffix disjointness.
-        worker._lane_buffers['normal'].append(req_a)
+        worker._intake.buffer_owned_request(req_a)
 
         violations = worker.two_layer_invariants(main_sha)
 
@@ -478,18 +574,21 @@ class TestTwoLayerInvariants:
                           request_id='rid-x')
         req_y = _make_req('task-y', 'task/task-y', config, git_repo,
                           request_id='rid-y')
-        worker._lane_buffers['normal'].extend([req_x, req_y])
+        worker._intake.replace_lane('normal', [req_x, req_y])
 
         # textual edge {rid-x, rid-y} NOT in footprint_edges → contract violated.
+        # The tracker never builds such a graph, so the intake is made to report one.
         extra_edge = frozenset({'rid-x', 'rid-y'})
-        worker._suffix_conflict_graph = SuffixConflictGraph(
+        corrupt = SuffixConflictGraph(
             nodes=('rid-x', 'rid-y'),
             textual_edges=frozenset({extra_edge}),   # NOT a subset of footprint_edges
             footprint_edges=frozenset(),              # empty → textual edge is spurious
             conflicts_with_main=frozenset(),
         )
-
-        violations = worker.two_layer_invariants(main_sha)
+        with patch.object(
+            MergeIntake, 'suffix_conflict_graph', new_callable=PropertyMock, return_value=corrupt,
+        ):
+            violations = worker.two_layer_invariants(main_sha)
 
         assert violations, (
             'Expected a textual⊈footprint violation but got []'
@@ -514,17 +613,20 @@ class TestTwoLayerInvariants:
 
         req_x = _make_req('task-x', 'task/task-x', config, git_repo,
                           request_id='rid-x')
-        worker._lane_buffers['normal'].append(req_x)
+        worker._intake.buffer_owned_request(req_x)
 
         # 'rid-ghost' is in conflicts_with_main but NOT in nodes → inconsistency.
-        worker._suffix_conflict_graph = SuffixConflictGraph(
+        # The tracker never builds such a graph, so the intake is made to report one.
+        corrupt = SuffixConflictGraph(
             nodes=('rid-x',),
             textual_edges=frozenset(),
             footprint_edges=frozenset(),
             conflicts_with_main=frozenset({'rid-ghost'}),
         )
-
-        violations = worker.two_layer_invariants(main_sha)
+        with patch.object(
+            MergeIntake, 'suffix_conflict_graph', new_callable=PropertyMock, return_value=corrupt,
+        ):
+            violations = worker.two_layer_invariants(main_sha)
 
         assert violations, (
             'Expected a conflicts_with_main⊄nodes violation but got []'
@@ -642,13 +744,13 @@ class TestTwoLayerInvariants:
         # Drive recompute so the worker resolves + caches the real main SHA.
         # (No suffix reqs → EMPTY_SUFFIX_CONFLICT_GRAPH; that's fine —
         #  the §5.3 check is on the frozen prefix only.)
-        await worker.recompute_suffix_conflict_graph()
+        await worker._intake.recompute_suffix_conflict_graph()
 
-        # Verify the precondition: _newest_frozen_commit() ≠ real main M0.
-        newest = worker._newest_frozen_commit()
-        assert newest is not None, '_newest_frozen_commit() must return M1 for this test'
+        # Verify the precondition: the published frozen tip ≠ real main M0.
+        newest = worker.snapshot()['frozen_prefix']['tip_merge_commit']
+        assert newest is not None, 'the frozen tip must be M1 for this test'
         assert newest != m0, (
-            f'precondition: _newest_frozen_commit() must ≠ M0 but got {newest!r} == {m0!r}'
+            f'precondition: the frozen tip must ≠ M0 but got {newest!r} == {m0!r}'
         )
 
         # (a) Direct call with the REAL main SHA must be healthy.
@@ -684,7 +786,7 @@ class TestTwoLayerInvariants:
 class TestScenario1And8:
     """§9 scenario 1 + 8: REAL branches, REAL recompute, DEFAULT detector.
 
-    Integration delta: the upstream unit suites hand-seed _suffix_conflict_graph;
+    Integration delta: the upstream unit suites hand-seed suffix_conflict_graph;
     this class drives recompute_suffix_conflict_graph() against REAL git branches
     so the real graph flows into bounce and the textual⇒overlap contract is
     verified end-to-end.
@@ -695,8 +797,8 @@ class TestScenario1And8:
       textual_edges ⊆ footprint_edges holds.
 
     Scenario 1 (textual conflict bounces disk-free):
-      The conflicting suffix item is diverted via _bounce_conflicting_suffix_items()
-      BEFORE any verify slot: _verifier_queue is empty and no _merge-* worktree
+      The conflicting suffix item is diverted via bounce_conflicting_suffix_items()
+      BEFORE any verify slot: nothing awaits verify and no _merge-* worktree
       directory was created.
 
     RED until the suite lands (the recompute / bounce composition has no known
@@ -709,8 +811,14 @@ class TestScenario1And8:
         git_repo: Path,
         config: OrchestratorConfig,
         git_ops: GitOps,
+        *,
+        clean_rebase: bool = False,
     ) -> tuple[SpeculativeMergeWorker, MergeRequest, MergeRequest, str]:
         """Create two conflicting branches + a frozen-tip InflightEntry.
+
+        The worker's rebase probe is stubbed at the git_ops ctor port with
+        *clean_rebase* as its verdict (default False = real conflict), so the
+        bounce path never forks a real rebase.
 
         Returns (worker, req_a, req_b, frozen_tip_sha) where:
           req_a — older (merge_first_enqueued_at=100.0), edits shared.txt line2→BRANCH-A
@@ -737,8 +845,8 @@ class TestScenario1And8:
             git_repo, 'task/branch-b', 'shared.txt', 'line1\nBRANCH-B-LINE2\nline3\n',
         )
 
-        # 3. Build worker.
-        worker = _make_worker(git_ops)
+        # 3. Build worker (rebase probe stubbed at the port).
+        worker, _stub = _make_rebase_stubbed_worker(git_ops, clean=clean_rebase)
 
         # 4. Populate frozen prefix with the frozen-tip commit as merge_commit.
         #    base_sha = main_sha at initial commit (any real SHA — the chain
@@ -765,7 +873,7 @@ class TestScenario1And8:
             'branch-b', 'branch-b', config, git_repo,
             merge_first_enqueued_at=300.0,
         )
-        worker._lane_buffers['normal'].extend([req_a, req_b])
+        worker._intake.replace_lane('normal', [req_a, req_b])
 
         return worker, req_a, req_b, frozen_tip_sha
 
@@ -782,26 +890,27 @@ class TestScenario1And8:
             git_repo, config, git_ops,
         )
 
-        await worker.recompute_suffix_conflict_graph()
+        await worker._intake.recompute_suffix_conflict_graph()
 
-        graph = worker._suffix_conflict_graph
+        graph = _suffix_graph(worker)
+        textual = _edges(graph, 'textual_edges')
+        footprint = _edges(graph, 'footprint_edges')
         edge = frozenset({req_a.request_id, req_b.request_id})
 
         # Both branches edit shared.txt → footprint overlap.
-        assert edge in graph.footprint_edges, (
-            f'Expected footprint edge {{A,B}} but footprint_edges={graph.footprint_edges!r}'
+        assert edge in footprint, (
+            f'Expected footprint edge {{A,B}} but footprint_edges={footprint!r}'
         )
 
         # Both branches edit the SAME LINE → textual conflict.
-        assert edge in graph.textual_edges, (
-            f'Expected textual edge {{A,B}} but textual_edges={graph.textual_edges!r}'
+        assert edge in textual, (
+            f'Expected textual edge {{A,B}} but textual_edges={textual!r}'
         )
 
         # Contract: textual_edges ⊆ footprint_edges.
-        assert graph.textual_edges <= graph.footprint_edges, (
+        assert textual <= footprint, (
             f'textual_edges ⊄ footprint_edges! '
-            f'textual_edges={graph.textual_edges!r}, '
-            f'footprint_edges={graph.footprint_edges!r}'
+            f'textual_edges={textual!r}, footprint_edges={footprint!r}'
         )
 
     async def test_scenario_8_conflicts_with_main_flagged(
@@ -817,15 +926,15 @@ class TestScenario1And8:
             git_repo, config, git_ops,
         )
 
-        await worker.recompute_suffix_conflict_graph()
+        await worker._intake.recompute_suffix_conflict_graph()
 
-        graph = worker._suffix_conflict_graph
+        conflicts_with_main = set(_suffix_graph(worker)['conflicts_with_main'])
 
         # At least one (likely both) suffix items conflict with the frozen tip.
-        conflicting = {req_a.request_id, req_b.request_id} & graph.conflicts_with_main
+        conflicting = {req_a.request_id, req_b.request_id} & conflicts_with_main
         assert conflicting, (
             f'Expected at least one suffix item in conflicts_with_main but got '
-            f'conflicts_with_main={graph.conflicts_with_main!r}.  '
+            f'conflicts_with_main={conflicts_with_main!r}.  '
             f'frozen_prefix_tip should be the frozen-tip SHA; both suffix branches '
             f'edit the same line of shared.txt as the frozen tip.'
         )
@@ -838,8 +947,8 @@ class TestScenario1And8:
     ) -> None:
         """Scenario 1: the conflicting item is bounced BEFORE any verify slot.
 
-        After _bounce_conflicting_suffix_items() (with rebase_onto_main stubbed):
-          - _verifier_queue is empty (qsize == 0): no verify slot consumed.
+        After bounce_conflicting_suffix_items() (rebase probe stubbed at the port):
+          - no entry awaits verify: no verify slot consumed.
           - No _merge-* worktree directory was created under git_repo.
           - The conflicting req(s) are either re-queued (rebase=True) or
             resolved 'blocked' with NEEDS_REBASE_REASON_PREFIX (rebase=False).
@@ -848,21 +957,20 @@ class TestScenario1And8:
             git_repo, config, git_ops,
         )
 
-        await worker.recompute_suffix_conflict_graph()
+        intake = worker._intake
+        await intake.recompute_suffix_conflict_graph()
 
-        graph = worker._suffix_conflict_graph
-        conflicting_rids = {req_a.request_id, req_b.request_id} & graph.conflicts_with_main
+        conflicts_with_main = set(_suffix_graph(worker)['conflicts_with_main'])
+        conflicting_rids = {req_a.request_id, req_b.request_id} & conflicts_with_main
         assert conflicting_rids, 'precondition: at least one item must be in conflicts_with_main'
 
-        # Stub rebase → False: real conflict → item removed, future 'blocked'.
-        worker._git_ops.rebase_onto_main = AsyncMock(return_value=False)  # type: ignore[method-assign]
+        await intake.bounce_conflicting_suffix_items()
 
-        await worker._bounce_conflicting_suffix_items()
-
-        # SCENARIO 1 assertion A: _verifier_queue is empty — no verify slot consumed.
-        assert worker._verifier_queue.qsize() == 0, (
-            f'Expected _verifier_queue empty (no verify slot) but qsize='
-            f'{worker._verifier_queue.qsize()}'
+        # SCENARIO 1 assertion A: nothing awaits verify — no verify slot consumed.
+        awaiting = _awaiting_verify_ids(worker)
+        assert awaiting == [], (
+            f'Expected no verify slot consumed by the bounce but snapshot() shows '
+            f'{awaiting!r} awaiting verify'
         )
 
         # SCENARIO 1 assertion B: no _merge-* worktree created.
@@ -914,7 +1022,7 @@ class TestScenario1And8:
             git_repo, config, git_ops,
         )
 
-        await worker.recompute_suffix_conflict_graph()
+        await worker._intake.recompute_suffix_conflict_graph()
 
         # Get the actual main SHA for the invariant check.
         _, main_sha_raw, _ = await _run(['git', 'rev-parse', 'main'], cwd=git_repo)
@@ -936,15 +1044,15 @@ class TestScenario2CleanRebaseRequeues:
 
     Seed a frozen-tip entry + a suffix req flagged in conflicts_with_main;
     stub rebase_onto_main → True (clean rebase onto frozen tip).  Call
-    _bounce_conflicting_suffix_items().
+    bounce_conflicting_suffix_items().
 
     Assertions:
       - rebase_onto_main awaited once with onto=frozen_tip_sha
-      - req REMAINS in _lane_buffers['normal'] (re-queued, work preserved)
+      - req REMAINS in the normal lane buffer (re-queued, work preserved)
       - req.result is NOT done (no agent dispatched)
       - req.merge_first_enqueued_at unchanged (== 9999.0)
-      - _bounce_registry.count(branch) == 1
-      - _suffix_conflict_signature invalidated to None
+      - bounce_registry.count(branch) == 1
+      - suffix_conflict_signature invalidated to None
       - a needs_rebase log line emitted
 
     Integration delta: the graph is REAL (recomputed via recompute_suffix_conflict_graph
@@ -976,8 +1084,8 @@ class TestScenario2CleanRebaseRequeues:
             'line1\nSUFFIX-LINE2\nline3\n',
         )
 
-        # 3. Build worker with frozen entry.
-        worker = _make_worker(git_ops)
+        # 3. Build worker with frozen entry; a clean rebase verdict at the port.
+        worker, rebase_stub = _make_rebase_stubbed_worker(git_ops, clean=True)
         _, main_sha_raw, _ = await _run(['git', 'rev-parse', 'main'], cwd=git_repo)
         main_sha = main_sha_raw.strip()
 
@@ -993,41 +1101,38 @@ class TestScenario2CleanRebaseRequeues:
             'suffix-branch', 'suffix-branch', config, git_repo,
             merge_first_enqueued_at=9999.0,
         )
-        worker._lane_buffers['normal'].append(req)
+        intake = worker._intake
+        intake.buffer_owned_request(req)
 
         # 5. Recompute the real graph; the suffix branch conflicts with the frozen tip.
-        await worker.recompute_suffix_conflict_graph()
+        await intake.recompute_suffix_conflict_graph()
 
-        assert req.request_id in worker._suffix_conflict_graph.conflicts_with_main, (
+        assert req.request_id in _suffix_graph(worker)['conflicts_with_main'], (
             'precondition: req must be in conflicts_with_main after recompute; '
             'suffix branch edits the same line as the frozen tip'
         )
 
         # Store the debounce signature so we can assert it's cleared later.
-        assert worker._suffix_conflict_signature is not None, (
+        assert intake.suffix_conflict_signature is not None, (
             'precondition: debounce signature must be set after a successful recompute'
         )
 
-        # 6. Stub rebase → True (clean rebase — no actual git op).
-        worker._git_ops.rebase_onto_main = AsyncMock(return_value=True)  # type: ignore[method-assign]
-
         with caplog.at_level(logging.INFO):
-            await worker._bounce_conflicting_suffix_items()
+            await intake.bounce_conflicting_suffix_items()
 
-        # Assert: rebase_onto_main called with onto=frozen_tip_sha.
-        worker._git_ops.rebase_onto_main.assert_awaited_once()
-        call_kwargs = worker._git_ops.rebase_onto_main.call_args
-        onto_arg = call_kwargs.kwargs.get('onto') or (
-            call_kwargs.args[1] if len(call_kwargs.args) >= 2 else None
+        # Assert: rebase_onto_main called once, with onto=frozen_tip_sha.
+        assert len(rebase_stub.rebase_calls) == 1, (
+            f'Expected exactly one rebase probe but got {rebase_stub.rebase_calls!r}'
         )
+        _, onto_arg = rebase_stub.rebase_calls[0]
         assert onto_arg == frozen_tip_sha, (
             f'Expected rebase_onto_main called with onto={frozen_tip_sha!r} '
             f'but got {onto_arg!r}'
         )
 
         # Assert: req REMAINS in lane buffer (re-queued, work preserved).
-        assert req in worker._lane_buffers['normal'], (
-            'Expected req to remain in lane buffer after a clean rebase (re-queue)'
+        assert req.request_id in worker.unfrozen_suffix(), (
+            'Expected req to remain in the unfrozen suffix after a clean rebase (re-queue)'
         )
 
         # Assert: future NOT done (no agent dispatched).
@@ -1043,14 +1148,14 @@ class TestScenario2CleanRebaseRequeues:
 
         # Assert: bounce registry incremented to 1.
         branch = req.branch.bare_id
-        assert worker._bounce_registry.count(branch) == 1, (
+        assert intake.bounce_registry.count(branch) == 1, (
             f'Expected bounce registry count for branch {branch!r} to be 1 '
             f'after one clean rebase bounce'
         )
 
-        # Assert: _suffix_conflict_signature invalidated to None.
-        assert worker._suffix_conflict_signature is None, (
-            'Expected _suffix_conflict_signature to be None after a bounce '
+        # Assert: suffix_conflict_signature invalidated to None.
+        assert intake.suffix_conflict_signature is None, (
+            'Expected suffix_conflict_signature to be None after a bounce '
             '(so next recompute re-probes reality)'
         )
 
@@ -1083,7 +1188,7 @@ class TestScenario3RealConflictCapped:
         - rebase_onto_main was awaited (conflict probed)
 
       CASE B — bounce count already at MERGE_BOUNCE_CAP:
-        - Next bounce escalates WITHOUT attempting a rebase (spy not awaited)
+        - Next bounce escalates WITHOUT attempting a rebase (no probe recorded)
         - req removed from lane buffer
         - req.result 'blocked' with NEEDS_REBASE_REASON_PREFIX
         (1688 thrash-signature backstop: a flapping conflict cannot become an
@@ -1100,8 +1205,12 @@ class TestScenario3RealConflictCapped:
         git_repo: Path,
         config: OrchestratorConfig,
         git_ops: GitOps,
-    ) -> tuple[SpeculativeMergeWorker, MergeRequest, str]:
-        """Return (worker, conflicting_req, frozen_tip_sha) with a real graph."""
+    ) -> tuple[SpeculativeMergeWorker, MergeRequest, str, _StubRebaseGitOps]:
+        """Return (worker, conflicting_req, frozen_tip_sha, rebase_stub).
+
+        The graph is real; the rebase probe is stubbed at the git_ops port with
+        a real-conflict verdict.
+        """
         frozen_tip_sha = await _create_branch_editing(
             git_repo, 'task/frozen-tip-s3', 'shared.txt',
             'line1\nFROZEN-LINE2-S3\nline3\n',
@@ -1111,7 +1220,7 @@ class TestScenario3RealConflictCapped:
             'line1\nCONFLICT-LINE2\nline3\n',
         )
 
-        worker = _make_worker(git_ops)
+        worker, rebase_stub = _make_rebase_stubbed_worker(git_ops, clean=False)
         _, main_sha_raw, _ = await _run(['git', 'rev-parse', 'main'], cwd=git_repo)
         main_sha = main_sha_raw.strip()
 
@@ -1123,14 +1232,15 @@ class TestScenario3RealConflictCapped:
         worker._inflight.append(entry_frozen)
 
         req = _make_req('conflict-branch', 'conflict-branch', config, git_repo)
-        worker._lane_buffers['normal'].append(req)
+        intake = worker._intake
+        intake.buffer_owned_request(req)
 
-        await worker.recompute_suffix_conflict_graph()
+        await intake.recompute_suffix_conflict_graph()
 
-        assert req.request_id in worker._suffix_conflict_graph.conflicts_with_main, (
+        assert req.request_id in _suffix_graph(worker)['conflicts_with_main'], (
             'precondition: req must be in conflicts_with_main after real recompute'
         )
-        return worker, req, frozen_tip_sha
+        return worker, req, frozen_tip_sha, rebase_stub
 
     async def test_case_a_real_conflict_blocks_req(
         self,
@@ -1139,19 +1249,21 @@ class TestScenario3RealConflictCapped:
         git_repo: Path,
     ) -> None:
         """CASE A: rebase → False (real conflict) → req removed, 'blocked' escalated."""
-        worker, req, _ = await self._setup_conflict_worker(git_repo, config, git_ops)
+        worker, req, _, rebase_stub = await self._setup_conflict_worker(
+            git_repo, config, git_ops,
+        )
 
-        # Stub rebase → False (real conflict, under cap).
-        worker._git_ops.rebase_onto_main = AsyncMock(return_value=False)  # type: ignore[method-assign]
-
-        await worker._bounce_conflicting_suffix_items()
+        await worker._intake.bounce_conflicting_suffix_items()
 
         # rebase_onto_main was called (conflict probed, not short-circuited by cap).
-        worker._git_ops.rebase_onto_main.assert_awaited_once()
+        assert len(rebase_stub.rebase_calls) == 1, (
+            f'Expected exactly one rebase probe under the cap but got '
+            f'{rebase_stub.rebase_calls!r}'
+        )
 
         # req removed from lane buffer.
-        assert req not in worker._lane_buffers['normal'], (
-            'Expected req to be removed from lane buffer after a real conflict'
+        assert req.request_id not in worker.unfrozen_suffix(), (
+            'Expected req to leave the unfrozen suffix after a real conflict'
         )
 
         # req.result 'blocked' with NEEDS_REBASE_REASON_PREFIX.
@@ -1172,29 +1284,31 @@ class TestScenario3RealConflictCapped:
         """CASE B: bounce count at cap → escalate WITHOUT rebase (1688 thrash backstop).
 
         Pre-seed registry to MERGE_BOUNCE_CAP for the branch.  The next
-        _bounce_conflicting_suffix_items() call must NOT attempt rebase_onto_main,
+        bounce_conflicting_suffix_items() call must NOT attempt rebase_onto_main,
         remove the req, and resolve it 'blocked' with NEEDS_REBASE_REASON_PREFIX.
         """
-        worker, req, _ = await self._setup_conflict_worker(git_repo, config, git_ops)
+        worker, req, _, rebase_stub = await self._setup_conflict_worker(
+            git_repo, config, git_ops,
+        )
         branch = req.branch.bare_id
 
         # Pre-seed registry to MERGE_BOUNCE_CAP.
         for _ in range(MERGE_BOUNCE_CAP):
-            worker._bounce_registry.record_bounce(branch)
-        assert worker._bounce_registry.count(branch) == MERGE_BOUNCE_CAP
+            intake = worker._intake
+            intake.bounce_registry.record_bounce(branch)
+        assert intake.bounce_registry.count(branch) == MERGE_BOUNCE_CAP
 
-        # Spy on rebase — it must NOT be called when cap is exceeded.
-        rebase_spy = AsyncMock(return_value=False)
-        worker._git_ops.rebase_onto_main = rebase_spy  # type: ignore[method-assign]
-
-        await worker._bounce_conflicting_suffix_items()
+        await intake.bounce_conflicting_suffix_items()
 
         # rebase NOT called (cap short-circuit — 1688 thrash-signature backstop).
-        rebase_spy.assert_not_awaited()
+        assert rebase_stub.rebase_calls == [], (
+            f'Expected no rebase probe once the bounce cap is reached but got '
+            f'{rebase_stub.rebase_calls!r}'
+        )
 
         # req removed from lane buffer.
-        assert req not in worker._lane_buffers['normal'], (
-            'Expected req removed from lane buffer when bounce cap exceeded'
+        assert req.request_id not in worker.unfrozen_suffix(), (
+            'Expected req to leave the unfrozen suffix when bounce cap exceeded'
         )
 
         # req.result 'blocked' with NEEDS_REBASE_REASON_PREFIX.
@@ -1216,22 +1330,24 @@ class TestScenario3RealConflictCapped:
         """Per-branch bounce count climbs monotonically until cap reached.
 
         Drive N = MERGE_BOUNCE_CAP cycles.  Each cycle: re-seed graph,
-        stub rebase → False, call _bounce_conflicting_suffix_items().
+        call bounce_conflicting_suffix_items() against a real-conflict port.
         After each cycle (under cap), the req is removed and the registry
         resets (cleared on escalation) — we verify the count was incremented
         before clearing by checking the blocking outcome.
         """
-        worker, req, _ = await self._setup_conflict_worker(git_repo, config, git_ops)
+        worker, req, _, _stub = await self._setup_conflict_worker(
+            git_repo, config, git_ops,
+        )
         branch = req.branch.bare_id
 
         # CASE A check: one real conflict → blocked, registry cleared.
-        worker._git_ops.rebase_onto_main = AsyncMock(return_value=False)  # type: ignore[method-assign]
-        await worker._bounce_conflicting_suffix_items()
+        intake = worker._intake
+        await intake.bounce_conflicting_suffix_items()
 
         assert req.result.done()
         assert req.result.result().status == 'blocked'
         # Registry is cleared after a real-conflict escalation.
-        assert worker._bounce_registry.count(branch) == 0, (
+        assert intake.bounce_registry.count(branch) == 0, (
             'Expected registry cleared after real-conflict escalation'
         )
 
@@ -1251,7 +1367,7 @@ class TestScenario4And5AgingAndDisjointBypass:
       B: edits shared.txt → footprint-clique member with A; older (mfea=100.0)
       C: edits disjoint.txt → disjoint from both A and B
 
-    Expected _pop_next_pickable() sequence:
+    Expected pop_next_pickable() sequence:
       Pick 1: C (disjoint bypass — vacuously minimal despite C being in FIFO position 2)
       Pick 2: B (aging: B.mfea=100.0 < A.mfea=300.0 → B is clique-minimal)
       Pick 3: A (only item remaining)
@@ -1270,7 +1386,7 @@ class TestScenario4And5AgingAndDisjointBypass:
     ) -> tuple[SpeculativeMergeWorker, MergeRequest, MergeRequest, MergeRequest, str]:
         """Return (worker, req_a, req_b, req_c, main_sha).
 
-        Creates real branches; populates _lane_buffers in FIFO order [A, C, B];
+        Creates real branches; populates the lane buffers in FIFO order [A, C, B];
         adds a frozen entry so the test also validates two_layer_invariants.
         """
         # Create branches off main.
@@ -1307,7 +1423,7 @@ class TestScenario4And5AgingAndDisjointBypass:
         req_a = _make_req('aging-a', 'aging-a', config, git_repo, merge_first_enqueued_at=300.0)
         req_c = _make_req('disjoint-c', 'disjoint-c', config, git_repo, merge_first_enqueued_at=200.0)
         req_b = _make_req('aging-b', 'aging-b', config, git_repo, merge_first_enqueued_at=100.0)
-        worker._lane_buffers['normal'].extend([req_a, req_c, req_b])
+        worker._intake.replace_lane('normal', [req_a, req_c, req_b])
 
         return worker, req_a, req_b, req_c, main_sha
 
@@ -1322,23 +1438,23 @@ class TestScenario4And5AgingAndDisjointBypass:
             git_repo, config, git_ops,
         )
 
-        await worker.recompute_suffix_conflict_graph()
+        await worker._intake.recompute_suffix_conflict_graph()
 
-        graph = worker._suffix_conflict_graph
+        footprint = _edges(_suffix_graph(worker), 'footprint_edges')
         edge_ab = frozenset({req_a.request_id, req_b.request_id})
 
-        assert edge_ab in graph.footprint_edges, (
+        assert edge_ab in footprint, (
             f'Expected footprint edge {{A,B}} — both edit shared.txt. '
-            f'footprint_edges={graph.footprint_edges!r}'
+            f'footprint_edges={footprint!r}'
         )
 
         # C is disjoint from A and B.
         edge_ac = frozenset({req_a.request_id, req_c.request_id})
         edge_bc = frozenset({req_b.request_id, req_c.request_id})
-        assert edge_ac not in graph.footprint_edges, (
+        assert edge_ac not in footprint, (
             'C edits disjoint.txt only — should not overlap with A (shared.txt)'
         )
-        assert edge_bc not in graph.footprint_edges, (
+        assert edge_bc not in footprint, (
             'C edits disjoint.txt only — should not overlap with B (shared.txt)'
         )
 
@@ -1351,22 +1467,23 @@ class TestScenario4And5AgingAndDisjointBypass:
         """Scenario 4: B (mfea=100.0) is picked before A (mfea=300.0) despite A being FIFO-head.
 
         After removing C (disjoint), buf=[A, B]:
-          _pop_next_pickable() must return B (older clique-minimal via the real graph).
+          pop_next_pickable() must return B (older clique-minimal via the real graph).
         """
         worker, req_a, req_b, req_c, main_sha = await self._setup_aging_and_disjoint(
             git_repo, config, git_ops,
         )
 
-        await worker.recompute_suffix_conflict_graph()
+        intake = worker._intake
+        await intake.recompute_suffix_conflict_graph()
 
         # Invariant holds before picks.
         violations = worker.two_layer_invariants(main_sha)
         assert violations == [], f'two_layer_invariants before picks: {violations!r}'
 
         # Remove C from buffer to isolate scenario 4 (aging within the clique).
-        worker._lane_buffers['normal'].remove(req_c)
+        intake.remove_buffered({req_c.request_id})
 
-        picked = worker._pop_next_pickable()
+        picked = intake.pop_next_pickable()
         assert picked is req_b, (
             f'Expected B (older, mfea=100.0) to be picked via clique-scoped aging '
             f'but got {picked!r}. A (mfea=300.0) should be skipped because B is '
@@ -1374,7 +1491,7 @@ class TestScenario4And5AgingAndDisjointBypass:
         )
 
         # After picking B, A should be next (only item remaining).
-        picked2 = worker._pop_next_pickable()
+        picked2 = intake.pop_next_pickable()
         assert picked2 is req_a, (
             f'Expected A to be picked after B is gone but got {picked2!r}'
         )
@@ -1400,14 +1517,15 @@ class TestScenario4And5AgingAndDisjointBypass:
             git_repo, config, git_ops,
         )
 
-        await worker.recompute_suffix_conflict_graph()
+        intake = worker._intake
+        await intake.recompute_suffix_conflict_graph()
 
         # Invariant holds before any pick.
         violations = worker.two_layer_invariants(main_sha)
         assert violations == [], f'two_layer_invariants before picks: {violations!r}'
 
         # Pick 1: C should bypass blocked A (FIFO position 0) and older B.
-        picked1 = worker._pop_next_pickable()
+        picked1 = intake.pop_next_pickable()
         assert picked1 is req_c, (
             f'Expected C (disjoint) to bypass A (blocked by older clique-peer B) '
             f'but got {picked1!r}. FIFO buf was [A(300.0), C(200.0), B(100.0)]; '
@@ -1416,14 +1534,14 @@ class TestScenario4And5AgingAndDisjointBypass:
         )
 
         # Pick 2: B (older clique-minimal) beats A.
-        picked2 = worker._pop_next_pickable()
+        picked2 = intake.pop_next_pickable()
         assert picked2 is req_b, (
             f'Expected B (mfea=100.0, older clique-minimal) to be picked next '
             f'but got {picked2!r}'
         )
 
         # Pick 3: A last.
-        picked3 = worker._pop_next_pickable()
+        picked3 = intake.pop_next_pickable()
         assert picked3 is req_a, (
             f'Expected A to be picked last but got {picked3!r}'
         )
@@ -1442,7 +1560,7 @@ class TestScenario6FrontierImmutableUnderReorder:
     """§9 scenario 6: verify frontier immutable under suffix reorder.
 
     Place in-flight verifying entries D, E (frozen, chained base→merge_commit)
-    and unfrozen suffix reqs F, G in _lane_buffers.
+    and unfrozen suffix reqs F, G in the lane buffers.
 
     Steps:
       1. Capture D/E base_sha, frozen_prefix(), frozen_prefix_tip(main).
@@ -1526,14 +1644,14 @@ class TestScenario6FrontierImmutableUnderReorder:
         # Suffix reqs: F then G (FIFO: F is head).
         req_f = _make_req('suffix-f', 'suffix-f', config, git_repo, merge_first_enqueued_at=100.0)
         req_g = _make_req('suffix-g', 'disjoint-c', config, git_repo, merge_first_enqueued_at=200.0)
-        worker._lane_buffers['normal'].extend([req_f, req_g])
+        intake = worker._intake
+        intake.replace_lane('normal', [req_f, req_g])
 
         # 3. Capture pre-reorder state.
         pre_frozen_prefix = worker.frozen_prefix()
         pre_frozen_tip = worker.frozen_prefix_tip(main_sha)
         pre_d_base_sha = item_d.base_sha
         pre_e_base_sha = item_e.base_sha
-        pre_inflight_ids = tuple(e.item.request.request_id for e in worker._inflight)
 
         # Verify two_layer_invariants == [] BEFORE reorder.
         violations_before = worker.two_layer_invariants(main_sha)
@@ -1542,14 +1660,11 @@ class TestScenario6FrontierImmutableUnderReorder:
         )
 
         # 4. Reorder suffix (G before F) then recompute.
-        # Simulate reorder: swap F and G in the lane buffer.
-        worker._lane_buffers['normal'].remove(req_g)
-        worker._lane_buffers['normal'].appendleft(req_g)
+        # Simulate reorder: swap F and G in the lane buffer. The suffix order
+        # is part of the debounce signature, so recompute runs.
+        intake.replace_lane('normal', [req_g, req_f])
 
-        # Invalidate signature so recompute runs.
-        worker._suffix_conflict_signature = None
-
-        await worker.recompute_suffix_conflict_graph()
+        await intake.recompute_suffix_conflict_graph()
 
         # 5. Assert: frozen prefix unchanged.
 
@@ -1561,14 +1676,9 @@ class TestScenario6FrontierImmutableUnderReorder:
             f'E base_sha mutated by reorder: {item_e.base_sha!r} != {pre_e_base_sha!r}'
         )
 
-        # (b) _inflight order/identity unchanged.
-        post_inflight_ids = tuple(e.item.request.request_id for e in worker._inflight)
-        assert post_inflight_ids == pre_inflight_ids, (
-            f'_inflight order changed after reorder: '
-            f'before={pre_inflight_ids!r}, after={post_inflight_ids!r}'
-        )
-
-        # (c) frozen_prefix() and frozen_prefix_tip unchanged.
+        # (b) frozen_prefix() and frozen_prefix_tip unchanged — this is also the
+        # in-flight order/identity statement, since frozen_prefix() IS the
+        # verifying head of _inflight in deque order.
         assert worker.frozen_prefix() == pre_frozen_prefix, (
             f'frozen_prefix() changed after suffix reorder: '
             f'before={pre_frozen_prefix!r}, after={worker.frozen_prefix()!r}'
@@ -1579,27 +1689,27 @@ class TestScenario6FrontierImmutableUnderReorder:
         )
 
         # (d) suffix graph reflects NEW order (G before F) and excludes frozen rids.
-        graph = worker._suffix_conflict_graph
+        nodes = _suffix_graph(worker)['nodes']
         frozen_rids = set(worker.frozen_prefix())
 
         # Frozen rids must not appear in graph nodes.
         for frid in frozen_rids:
-            assert frid not in graph.nodes, (
+            assert frid not in nodes, (
                 f'Frozen rid {frid!r} appears in suffix graph nodes after reorder — '
                 f'violates frozen/suffix partition'
             )
 
         # Both F and G must be in graph nodes (they are the unfrozen suffix).
-        assert req_f.request_id in graph.nodes, (
-            f'req_f not in suffix graph nodes: nodes={graph.nodes!r}'
+        assert req_f.request_id in nodes, (
+            f'req_f not in suffix graph nodes: nodes={nodes!r}'
         )
-        assert req_g.request_id in graph.nodes, (
-            f'req_g not in suffix graph nodes: nodes={graph.nodes!r}'
+        assert req_g.request_id in nodes, (
+            f'req_g not in suffix graph nodes: nodes={nodes!r}'
         )
 
         # G should come before F in nodes (reflecting the reordered buffer).
-        assert graph.nodes.index(req_g.request_id) < graph.nodes.index(req_f.request_id), (
-            f'Expected G before F in graph.nodes after reorder, got: {graph.nodes!r}'
+        assert nodes.index(req_g.request_id) < nodes.index(req_f.request_id), (
+            f'Expected G before F in graph nodes after reorder, got: {nodes!r}'
         )
 
         # (e) two_layer_invariants == [] AFTER reorder.
@@ -1655,7 +1765,7 @@ class TestScenario9CircuitBreaker:
             config=config,
             result=asyncio.get_running_loop().create_future(),
         )
-        worker._lane_buffers['normal'].append(req)
+        worker._intake.buffer_owned_request(req)
 
         disk_iter = _make_falling_disk_iter(start=200_000, drop=10_000)
         with patch('shutil.disk_usage') as mock_du:
@@ -1673,9 +1783,9 @@ class TestScenario9CircuitBreaker:
         not from a MagicMock stub.  floor=10_000_000 > disk values (180k–200k)
         so the disk-pressure gate (last_free < floor) is satisfied.
         """
-        harness, _rs = _make_harness(tmp_path)
+        harness, escalation_queue = _make_harness(tmp_path)
         harness._no_landings_breaker = _small_breaker(window=3, floor=10_000_000)
-        worker = _attach_real_worker(harness, git_ops)
+        worker = _attach_real_worker(harness, git_ops, escalation_queue)
 
         # landings_total starts at 0 and stays flat (no record_landing calls).
         assert worker.snapshot()['metrics']['landings_total'] == 0
@@ -1695,20 +1805,13 @@ class TestScenario9CircuitBreaker:
 
         floor=10_000_000 so disk-pressure gate is satisfied at trip time.
         """
-        harness, _rs = _make_harness(tmp_path)
+        harness, escalation_queue = _make_harness(tmp_path)
         harness._no_landings_breaker = _small_breaker(window=3, floor=10_000_000)
-        worker = _attach_real_worker(harness, git_ops)
+        worker = _attach_real_worker(harness, git_ops, escalation_queue)
 
         await self._drive_to_trip(harness, worker, config, git_repo, window=3)
 
-        assert harness._escalation_queue is not None
-        pending = [
-            e
-            for e in harness._escalation_queue.get_by_task(
-                _BREAKER_SENTINEL, status='pending'
-            )
-            if e.agent_role == _BREAKER_ROLE
-        ]
+        pending = _pending_breaker_escalations(escalation_queue)
         assert len(pending) == 1, (
             f'Expected 1 pending breaker INFO escalation, got {len(pending)}'
         )
@@ -1730,24 +1833,18 @@ class TestScenario9CircuitBreaker:
         snapshot() — here the real ι counter drives the resume.
         floor=10_000_000 so disk-pressure gate is satisfied at trip time.
         """
-        harness, _rs = _make_harness(tmp_path)
+        harness, escalation_queue = _make_harness(tmp_path)
         harness._no_landings_breaker = _small_breaker(window=3, floor=10_000_000)
-        worker = _attach_real_worker(harness, git_ops)
+        worker = _attach_real_worker(harness, git_ops, escalation_queue)
 
         # Trip the breaker.
         await self._drive_to_trip(harness, worker, config, git_repo, window=3)
         assert harness.scheduler.is_paused, 'precondition: scheduler must be paused'
 
         # Confirm escalation was filed.
-        assert harness._escalation_queue is not None
-        before_pending = [
-            e
-            for e in harness._escalation_queue.get_by_task(
-                _BREAKER_SENTINEL, status='pending'
-            )
-            if e.agent_role == _BREAKER_ROLE
-        ]
-        assert before_pending, 'precondition: INFO escalation must be filed'
+        assert _pending_breaker_escalations(escalation_queue), (
+            'precondition: INFO escalation must be filed'
+        )
 
         # Drive a REAL landing via the ι counter (integration delta).
         # The breaker's resume condition: landings_total > landings_at_trip.
@@ -1766,13 +1863,7 @@ class TestScenario9CircuitBreaker:
         )
 
         # Breaker INFO escalation resolved.
-        after_pending = [
-            e
-            for e in harness._escalation_queue.get_by_task(
-                _BREAKER_SENTINEL, status='pending'
-            )
-            if e.agent_role == _BREAKER_ROLE
-        ]
+        after_pending = _pending_breaker_escalations(escalation_queue)
         assert not after_pending, (
             f'Expected 0 pending breaker INFO escalations after resume via real '
             f'landing, got {len(after_pending)}'
@@ -1788,9 +1879,9 @@ class TestScenario9CircuitBreaker:
         do not trigger disk-recovery resume — only a clean landing would resume,
         and landings_total stays flat here.
         """
-        harness, _rs = _make_harness(tmp_path)
+        harness, escalation_queue = _make_harness(tmp_path)
         harness._no_landings_breaker = _small_breaker(window=3, floor=500_000)
-        worker = _attach_real_worker(harness, git_ops)
+        worker = _attach_real_worker(harness, git_ops, escalation_queue)
 
         # Trip then run 3 more passes.
         await self._drive_to_trip(harness, worker, config, git_repo, window=3)
@@ -1802,20 +1893,13 @@ class TestScenario9CircuitBreaker:
             for _ in range(3):
                 await harness._run_no_landings_breaker_pass()
 
-        assert harness._escalation_queue is not None
-        all_pending = [
-            e
-            for e in harness._escalation_queue.get_by_task(
-                _BREAKER_SENTINEL, status='pending'
-            )
-            if e.agent_role == _BREAKER_ROLE
-        ]
+        all_pending = _pending_breaker_escalations(escalation_queue)
         assert len(all_pending) == 1, (
             f'Expected exactly 1 breaker INFO escalation (dedup), got {len(all_pending)}'
         )
 
 
-# ── DEFECT 2 (task 2357) RED: land-time refresh of _last_known_main_sha ──────
+# ── DEFECT 2 (task 2357) RED: land-time refresh of last_known_main_sha ──────
 
 
 async def _make_merged_item(
@@ -1893,7 +1977,7 @@ async def _make_branch_with_file(
 @pytest.mark.asyncio
 class TestFinalizeInflightRefreshesLastKnownMainSha:
     """A clean land through ``_finalize_inflight`` must refresh
-    ``worker._last_known_main_sha`` to the newly-landed commit, so
+    ``worker._intake.last_known_main_sha`` to the newly-landed commit, so
     ``snapshot()['two_layer_invariants']`` never lags a land that happens
     while the merger is otherwise idle (task 2357 DEFECT 2).
 
@@ -1905,9 +1989,10 @@ class TestFinalizeInflightRefreshesLastKnownMainSha:
     async def test_land_refreshes_last_known_main_sha(
         self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
     ) -> None:
-        """A clean land must update worker._last_known_main_sha to the new tip."""
+        """A clean land must update intake.last_known_main_sha to the new tip."""
         worker = _make_worker(git_ops)
-        worker._last_known_main_sha = 'OLD_STALE'
+        intake = worker._intake
+        intake.note_main_sha('OLD_STALE')
 
         _, item = await _make_merged_item(
             git_ops, config, 'task/land-refresh', 'land_refresh.py', 'x = 1\n',
@@ -1924,10 +2009,10 @@ class TestFinalizeInflightRefreshesLastKnownMainSha:
         assert advanced is True, 'expected a clean PASS land to advance main'
         real_main = await git_ops.get_main_sha()
         assert item.merge_result.merge_commit is not None
-        assert worker._last_known_main_sha == real_main == item.merge_result.merge_commit, (
-            f'expected _last_known_main_sha to be refreshed to the newly-landed '
+        assert intake.last_known_main_sha == real_main == item.merge_result.merge_commit, (
+            f'expected last_known_main_sha to be refreshed to the newly-landed '
             f'commit {item.merge_result.merge_commit!r}, got '
-            f'{worker._last_known_main_sha!r} (real main={real_main!r}) — '
+            f'{intake.last_known_main_sha!r} (real main={real_main!r}) — '
             f'the DEFECT 2 land refresh is not wired into _finalize_inflight yet'
         )
 
@@ -1942,7 +2027,7 @@ class TestFinalizeInflightRefreshesLastKnownMainSha:
         test_snapshot_uses_real_main_not_frozen_tip's surface).
         """
         worker = _make_worker(git_ops)
-        worker._last_known_main_sha = 'OLD_STALE'
+        worker._intake.note_main_sha('OLD_STALE')
 
         _, item = await _make_merged_item(
             git_ops, config, 'task/land-refresh-2', 'land_refresh_2.py', 'x = 1\n',

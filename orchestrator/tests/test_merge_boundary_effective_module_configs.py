@@ -1,0 +1,1381 @@
+"""The γ user-observable signal: a red in an UNTOUCHED module is suppressible
+at the real merge boundary (``merge_queue.run_post_merge_verify``).
+
+Flake-ledger PRD §8.2 / task 3787 (γ). This module drives the production
+chokepoint every merge verify flows through, not a helper in isolation.
+
+THE BUG γ CLOSES (§3.1). Under ``merge_verify_breadth='full'`` a merge-role
+verify EXECUTES every registered module — ``run_scoped_verification`` expanded
+the set from the registry internally. But that expansion rebound a LOCAL that
+never propagated out, so ``LocalRunner._module_configs`` — the set the
+merge-flake suppression gate maps failing node-ids against — was still the
+TASK's own modules. A red naming ``beta/tests/test_b.py::test_b`` on an
+alpha-only task therefore mapped to no given subproject,
+``_group_node_ids_by_subproject`` returned ``None``, and the gate answered
+"unconfirmable" -> merge stays red. The gate was inverted exactly where it
+mattered: the more clearly unrelated the failure, the less able it was to say
+so. ``EventType.merge_flake_suppressed`` has a lifetime count of 0 because of
+it.
+
+γ resolves the effective set ONCE at the merge-request boundary and hands the
+identical set to the local runner, the wire spec (and hence the remote's
+reconstruction of it) and the suppression gate — by construction, not by
+asserting that two sites agree (INV-5).
+
+INV-4 (storm-escape-required) is pinned END-TO-END here rather than assumed:
+``apply_merge_flake_suppression`` is the sole production suppression path and
+unconditionally bumps the streak, so the newly-firing suppressions ride the
+EXISTING escape. γ changes the gate's INPUT, not its plumbing — this module
+makes that non-regressable.
+
+Harness provenance: ``_make_config``/``_make_git_ops``/``_make_req`` are
+cross-imported from ``test_merge_queue_main_health`` (the pattern
+``test_verify_scope_inversion_boundary`` already uses for this same
+chokepoint), and ``_materialize``/``_module_config``/``_FakeEventStore``/
+``_FakeEscalationQueue`` from ``test_verify_merge_flake_suppression`` — the
+on-disk node-id -> subproject probe is ``Path.exists``-based, so the merge
+worktree holds REAL files.  ``NINE_PREFIXES`` is cross-imported from
+``test_merge_queue_store`` (task 5063), which owns its single definition, so
+this suite and the journal suite cannot disagree about the registry shape.
+"""
+
+from __future__ import annotations
+
+import asyncio
+from pathlib import Path
+from typing import Any, Literal
+from unittest.mock import AsyncMock, patch
+
+import pytest
+from _merge_lane_fakes import FakeVerifier, VerifyScript
+from _verify_cache_fixtures import TEST_CODE
+from test_merge_queue_main_health import _make_config, _make_git_ops, _make_req
+from test_merge_queue_store import NINE_PREFIXES
+from test_verify_merge_flake_suppression import (
+    _FakeEscalationQueue,
+    _FakeEventStore,
+    _materialize,
+    _module_config,
+)
+
+from orchestrator import flake_recorder, verify, verify_plan
+from orchestrator.config import ModuleConfig, OrchestratorConfig
+from orchestrator.event_store import EventType
+from orchestrator.merge_lane.gates import PostMergePyrightResult, _run_unscoped_typechecks
+from orchestrator.merge_lane.post_merge_verify import (
+    merge_boundary_module_configs,
+    placeholder_local_runner,
+    run_post_merge_verify,
+)
+from orchestrator.merge_lane.queue_store import MergeQueueStore, reconstruct_merge_request
+from orchestrator.merge_lane.types import QueuedBranch
+from orchestrator.merge_lane.worker import MergeOutcome, MergeRequest
+from orchestrator.verify import VerifyResult
+from orchestrator.verify_cache.registry import Registry
+from orchestrator.verify_cache.replay import CacheAccess
+from orchestrator.verify_cmd import parse_config_command
+from orchestrator.verify_evidence import UnitOutcome, UnitTier, VerifyUnit, module_leg_name
+from orchestrator.verify_plan import PlannedRun, ScopeKind, VerifyPlan
+from orchestrator.verify_runner import build_merge_verify_spec
+
+_MERGE_SHA = 'd' * 40
+
+# Real files in the merge worktree — `_group_node_ids_by_subproject` probes
+# `(worktree / prefix / relpath).exists()` and `(worktree / relpath).exists()`,
+# so a node-id can only map if its file is genuinely on disk.
+_ALPHA_TEST = 'alpha/tests/test_a.py'
+_BETA_TEST = 'beta/tests/test_b.py'
+# In NO registered module, but PRESENT on disk — so the control below fails on
+# "not a registered module", not on "file missing".
+_DELTA_TEST = 'delta/tests/test_d.py'
+
+_BETA_FAILING_ID = f'{_BETA_TEST}::test_b'
+_DELTA_FAILING_ID = f'{_DELTA_TEST}::test_d'
+
+
+def _failing_scoped_result(node_id: str) -> VerifyResult:
+    """A merge-verify red naming exactly one failing test, in the
+    ``FAILED <nodeid>`` shape ``_extract_failing_test_ids`` recovers.
+    """
+    return VerifyResult(
+        passed=False,
+        test_output=f'FAILED {node_id}\n',
+        lint_output='',
+        type_output='',
+        summary='Failures: tests failed',
+        category='test_failure',
+        cause_hint='AssertionError: boom',
+        failing_leg_categories=['test_failure'],
+    )
+
+
+def _passing_result() -> VerifyResult:
+    return VerifyResult(
+        passed=True, test_output='', lint_output='', type_output='',
+        summary='All checks passed',
+    )
+
+
+def _failing_rerun_result() -> VerifyResult:
+    """The isolated re-run itself failing — a GENUINE red, not a load flake."""
+    return VerifyResult(
+        passed=False, test_output='FAILED again\n', lint_output='', type_output='',
+        summary='Failures: tests failed', category='test_failure',
+    )
+
+
+@pytest.fixture(autouse=True)
+def _reset_suppression_streak():
+    """The INV-4 streak is a module global; reset it around every test here so
+    a threshold assertion measures THIS test's suppressions only.
+
+    It lives on ``flake_recorder`` after task ε.  Poking ``verify`` instead would
+    not fail — it would CREATE a new attribute there and quietly stop resetting the
+    real counter, leaving every test in this file order-dependent on the ones
+    before it.
+    """
+    flake_recorder._merge_flake_suppression_streak = 0
+    yield
+    flake_recorder._merge_flake_suppression_streak = 0
+
+
+async def _drive_merge_boundary(
+    tmp_path: Path,
+    *,
+    task_id: str,
+    breadth: Literal['scoped', 'full'],
+    registry: dict[str, ModuleConfig],
+    touched: list[ModuleConfig],
+    failing_node_id: str = _BETA_FAILING_ID,
+    isolated_rerun_passes: bool = True,
+    event_store=None,
+    escalation_queue=None,
+) -> MergeOutcome | None:
+    """Drive the REAL ``run_post_merge_verify`` — the single funnel every
+    production merge verify flows through.
+
+    The scoped verify and the post-scoped pyright gate both come from the
+    INJECTED verify port (``verifier=``), which is also what makes this
+    independent of the autouse ``_mock_merge_queue_verification`` conftest stub:
+      * ``run_scoped`` -> a failing VerifyResult naming *failing_node_id*;
+      * ``run_unscoped_typechecks`` -> ``FakeVerifier``'s clean
+        ``PostMergePyrightResult``, so the pyright gate never decides the
+        outcome here.
+    One patch remains, and it is not a lane module:
+      * ``orchestrator.verify.run_verification`` -> the isolated re-run engine
+        ``_merge_gate_isolated_rerun`` calls, passing or failing per
+        *isolated_rerun_passes*.
+
+    Returns the boundary's own return value: ``None`` means the merge LANDS.
+    """
+    config = _make_config(tmp_path, merge_verify_breadth=breadth)
+    config._module_configs = dict(registry)
+
+    git_ops = _make_git_ops(tmp_path)
+
+    task_wt = tmp_path / f'task-wt-{task_id}'
+    task_wt.mkdir(parents=True, exist_ok=True)
+    merge_wt = tmp_path / f'merge-wt-{task_id}'
+    merge_wt.mkdir(parents=True, exist_ok=True)
+    _materialize(merge_wt, _ALPHA_TEST, _BETA_TEST, _DELTA_TEST)
+
+    req = _make_req(task_id, task_wt, config)
+    req.module_configs = list(touched)
+
+    rerun = _passing_result() if isolated_rerun_passes else _failing_rerun_result()
+
+    with patch.object(verify, 'run_verification', new=AsyncMock(return_value=rerun)):
+        return await run_post_merge_verify(
+            git_ops, req, merge_wt,
+            timeouts={},
+            enospc_retries={},
+            max_timeouts=3,
+            max_enospc=1,
+            event_store=event_store,
+            escalation_queue=escalation_queue,
+            merge_sha=_MERGE_SHA,
+            verifier=FakeVerifier(VerifyScript(result=_failing_scoped_result(failing_node_id))),
+        )
+
+
+#: Bound on (c2)'s drive-until-the-storm-fires loop.  Comfortably above the
+#: shipped streak threshold (flake_recorder), which this file deliberately does
+#: not read: the contract under test is "one escalation, then reset".
+_STORM_DRIVE_CAP = 50
+
+
+def _suppression_events(store: _FakeEventStore) -> list[tuple]:
+    return [e for e in store.emits if e[0] is EventType.merge_flake_suppressed]
+
+
+class TestUntouchedModuleRedIsSuppressibleAtTheMergeBoundary:
+    """A red in a REGISTERED-but-untouched module, re-run green in isolation,
+    is suppressed — and the merge lands.
+
+    The task touched ONLY alpha (``req.module_configs == [mc_alpha]``); the
+    registry holds alpha AND beta; the red names a beta test. Under
+    ``breadth='full'`` the merge verify was already EXECUTING beta's suite, so
+    the gate must be able to reason about beta's failures too.
+    """
+
+    @staticmethod
+    def _two_module_registry() -> tuple[ModuleConfig, ModuleConfig, dict[str, ModuleConfig]]:
+        mc_alpha, mc_beta = _module_config('alpha'), _module_config('beta')
+        return mc_alpha, mc_beta, {'alpha': mc_alpha, 'beta': mc_beta}
+
+    # -- (a) the merge LANDS ---------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_merge_lands_when_untouched_module_red_passes_isolated_rerun(
+        self, tmp_path: Path,
+    ):
+        """(a) Outcome is None — the merge lands.
+
+        Today this is a blocked MergeOutcome: the gate receives only
+        [mc_alpha], so ``beta/tests/test_b.py::test_b`` maps to no given
+        subproject and the verdict collapses to 'unconfirmable' -> None ->
+        merge stays red.
+        """
+        mc_alpha, _mc_beta, registry = self._two_module_registry()
+
+        outcome = await _drive_merge_boundary(
+            tmp_path, task_id='a1', breadth='full',
+            registry=registry, touched=[mc_alpha],
+        )
+
+        assert outcome is None, (
+            f'expected the confirmed flake to be suppressed and the merge to '
+            f'LAND; got {outcome!r}'
+        )
+
+    # -- (b) the measured-floor signal ----------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_emits_exactly_one_merge_flake_suppressed_fact(self, tmp_path: Path):
+        """(b) The INV-2 structured fact whose lifetime count is 0 today —
+        emitted exactly once, naming the node-ids examined and the merge SHA.
+        """
+        mc_alpha, _mc_beta, registry = self._two_module_registry()
+        store = _FakeEventStore()
+
+        outcome = await _drive_merge_boundary(
+            tmp_path, task_id='b1', breadth='full',
+            registry=registry, touched=[mc_alpha], event_store=store,
+        )
+
+        assert outcome is None
+        events = _suppression_events(store)
+        assert len(events) == 1, (
+            f'expected exactly one merge_flake_suppressed fact; got {len(events)}'
+        )
+        _event_type, _task_id, data = events[0]
+        assert data['node_ids'] == [_BETA_FAILING_ID]
+        assert data['merge_sha'] == _MERGE_SHA
+
+    # -- (c) INV-4: the storm escape is ridden, not bypassed -------------------
+
+    @pytest.mark.asyncio
+    async def test_one_suppression_advances_the_storm_streak_by_exactly_one(
+        self, tmp_path: Path,
+    ):
+        """(c1) The suppression bumps the INV-4 streak — the fail-soft path is
+        not escape-less."""
+        mc_alpha, _mc_beta, registry = self._two_module_registry()
+        store, queue = _FakeEventStore(), _FakeEscalationQueue()
+
+        outcome = await _drive_merge_boundary(
+            tmp_path, task_id='c1', breadth='full',
+            registry=registry, touched=[mc_alpha],
+            event_store=store, escalation_queue=queue,
+        )
+
+        assert outcome is None
+        assert len(_suppression_events(store)) == 1, (
+            'a confirmed suppression at the merge boundary is what advances '
+            'the storm streak, and it happened exactly once'
+        )
+        assert queue.submitted == [], (
+            'one suppression is below the threshold — the storm escalation '
+            'fires only when the streak reaches it (c2)'
+        )
+
+    @pytest.mark.asyncio
+    async def test_threshold_suppressions_file_one_l2_storm_escalation_and_reset(
+        self, tmp_path: Path,
+    ):
+        """(c2) Repeating the SAME scenario files exactly ONE born-at-L2 storm
+        escalation and then RESETS the window — end-to-end from the merge
+        boundary, not from a direct call to the bump helper.
+
+        Driven until the storm fires rather than a fixed number of times: the
+        threshold is a ``flake_recorder`` internal, and the contract this test
+        owns is "one escalation, then the window reopens", not what the number
+        is.  ``_STORM_DRIVE_CAP`` bounds the loop so a threshold that never
+        fires is a fast RED instead of a hang.
+        """
+        mc_alpha, _mc_beta, registry = self._two_module_registry()
+        queue = _FakeEscalationQueue(open_l2=None)
+
+        drives = 0
+        while not queue.submitted:
+            assert drives < _STORM_DRIVE_CAP, (
+                f'no storm escalation after {drives} consecutive suppressions'
+            )
+            outcome = await _drive_merge_boundary(
+                tmp_path, task_id=f'c2-{drives}', breadth='full',
+                registry=registry, touched=[mc_alpha], escalation_queue=queue,
+            )
+            assert outcome is None, f'suppression {drives} did not land the merge'
+            drives += 1
+
+        assert len(queue.submitted) == 1, (
+            f'expected exactly ONE storm escalation at the threshold; '
+            f'got {len(queue.submitted)}'
+        )
+        esc = queue.submitted[0]
+        assert esc.task_id == 'merge-flake-suppression-storm'
+        assert esc.severity == 'critical'
+        assert esc.level == 2
+
+        # The window RESET: the streak is back at zero, so the very next
+        # suppression files nothing — a counter that kept growing would file a
+        # second escalation here.
+        outcome = await _drive_merge_boundary(
+            tmp_path, task_id='c2-after', breadth='full',
+            registry=registry, touched=[mc_alpha], escalation_queue=queue,
+        )
+        assert outcome is None
+        assert len(queue.submitted) == 1, (
+            'the window must reset so the counter cannot grow unbounded'
+        )
+
+
+class TestMergeBoundarySuppressionControls:
+    """Each of these must stay EXACTLY as it is today — γ widens the MAPPABLE
+    set, it does not weaken the fail-closed gate.
+    """
+
+    @staticmethod
+    def _two_module_registry() -> tuple[ModuleConfig, ModuleConfig, dict[str, ModuleConfig]]:
+        mc_alpha, mc_beta = _module_config('alpha'), _module_config('beta')
+        return mc_alpha, mc_beta, {'alpha': mc_alpha, 'beta': mc_beta}
+
+    # -- (i) breadth='scoped': byte-identical legacy ---------------------------
+
+    @pytest.mark.asyncio
+    async def test_scoped_breadth_still_blocks_and_suppresses_nothing(
+        self, tmp_path: Path,
+    ):
+        """(i) At the shipped default the merge verify never widened past the
+        task's modules, so the gate has no business reasoning about beta — the
+        merge stays blocked and no suppression fact is emitted.
+
+        ``_suppression_events`` is what carries the streak claim in all four
+        of these controls: the emit and the INV-4 streak bump sit under ONE
+        ``if suppressed:`` branch in
+        ``orchestrator/flake_recorder.py::record_merge_flake_suppression``, so
+        an absent fact means an untouched streak.  The escalation queue cannot
+        carry it — a storm escalation fires only at the streak THRESHOLD, so a
+        regression that bumped by exactly one would still leave ``submitted``
+        empty.
+        """
+        mc_alpha, _mc_beta, registry = self._two_module_registry()
+        store, queue = _FakeEventStore(), _FakeEscalationQueue()
+
+        outcome = await _drive_merge_boundary(
+            tmp_path, task_id='i1', breadth='scoped',
+            registry=registry, touched=[mc_alpha], event_store=store,
+            escalation_queue=queue,
+        )
+
+        assert isinstance(outcome, MergeOutcome)
+        assert outcome.status == 'blocked'
+        assert _suppression_events(store) == []
+        assert queue.submitted == [], 'a blocked merge files no escalation at all'
+
+    # -- (ii) empty registry: safe degrade ------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_full_breadth_empty_registry_suppresses_nothing(self, tmp_path: Path):
+        """(ii) breadth='full' with an EMPTY registry resolves to the passed set
+        — never suppress against a set that was never resolved."""
+        mc_alpha, _mc_beta, _registry = self._two_module_registry()
+        store, queue = _FakeEventStore(), _FakeEscalationQueue()
+
+        outcome = await _drive_merge_boundary(
+            tmp_path, task_id='ii1', breadth='full',
+            registry={}, touched=[mc_alpha], event_store=store,
+            escalation_queue=queue,
+        )
+
+        assert isinstance(outcome, MergeOutcome)
+        assert outcome.status == 'blocked'
+        assert _suppression_events(store) == []
+        assert queue.submitted == [], 'a blocked merge files no escalation at all'
+
+    # -- (iii) a red in NO registered module: still fail-closed ---------------
+
+    @pytest.mark.asyncio
+    async def test_red_in_unregistered_module_still_blocks(self, tmp_path: Path):
+        """(iii) The red names a file that is on disk but under NO registered
+        module. γ widens the mappable set; it does not make the gate guess.
+        """
+        mc_alpha, _mc_beta, registry = self._two_module_registry()
+        store, queue = _FakeEventStore(), _FakeEscalationQueue()
+
+        outcome = await _drive_merge_boundary(
+            tmp_path, task_id='iii1', breadth='full',
+            registry=registry, touched=[mc_alpha],
+            failing_node_id=_DELTA_FAILING_ID,
+            event_store=store, escalation_queue=queue,
+        )
+
+        assert isinstance(outcome, MergeOutcome)
+        assert outcome.status == 'blocked'
+        assert _suppression_events(store) == []
+        assert queue.submitted == [], 'a blocked merge files no escalation at all'
+
+    # -- (iv) a GENUINE red in an untouched module: never suppressed ----------
+
+    @pytest.mark.asyncio
+    async def test_genuine_red_in_untouched_module_is_not_suppressed(
+        self, tmp_path: Path,
+    ):
+        """(iv) Same widened mapping, but the isolated re-run STILL FAILS — the
+        failure is real, so it must block. This is the control that separates
+        "the gate can now SEE untouched modules" from "the gate now waves them
+        through".
+        """
+        mc_alpha, _mc_beta, registry = self._two_module_registry()
+        store, queue = _FakeEventStore(), _FakeEscalationQueue()
+
+        outcome = await _drive_merge_boundary(
+            tmp_path, task_id='iv1', breadth='full',
+            registry=registry, touched=[mc_alpha],
+            isolated_rerun_passes=False,
+            event_store=store, escalation_queue=queue,
+        )
+
+        assert isinstance(outcome, MergeOutcome)
+        assert outcome.status == 'blocked'
+        assert _suppression_events(store) == []
+        assert queue.submitted == [], 'a blocked merge files no escalation at all'
+
+
+# ---------------------------------------------------------------------------
+# step-7: wire parity — the SPEC leg gets the same effective set, so
+# local ≡ remote BY CONSTRUCTION (PRD §8.2 ordering invariant, INV-5)
+# ---------------------------------------------------------------------------
+
+_GLOBAL_TEST_COMMAND = 'uv run pytest tests/'
+_GLOBAL_TYPECHECK_COMMAND = 'uv run pyright src/'
+
+
+async def _capture_boundary_consumers(
+    tmp_path: Path,
+    *,
+    task_id: str,
+    breadth: Literal['scoped', 'full'],
+    registry: dict[str, ModuleConfig],
+    touched: list[ModuleConfig],
+    global_commands: bool = False,
+) -> dict:
+    """Drive ``run_post_merge_verify`` and capture what each consumer of the
+    module set actually RECEIVED.
+
+    The LOCAL set comes off the injected verify port and the WIRE set off a
+    spy that wraps (and delegates to) the real ``build_merge_verify_spec`` at
+    its ``merge_queue`` lookup site — the boundary resolves that name there
+    when it constructs the pool — so both captured values are the genuine
+    arguments, not a re-derivation.
+
+    ``global_commands=True`` additionally gives the config LIVE global
+    commands, which is what makes INV-1's zero-module ``global_verify_command``
+    fallback observable at all (see the empty-set class below).
+
+    Returns ``{'spec_arg', 'spec', 'verified', 'config', 'merge_wt'}``.
+    """
+    from orchestrator.merge_lane import post_merge_verify as post_merge_verify_module
+
+    config = _make_config(tmp_path, merge_verify_breadth=breadth)
+    config._module_configs = dict(registry)
+    if global_commands:
+        # INV-1 (task 2883): build_merge_verify_spec only sources
+        # `global_verify_command` when the LIVE config actually has global
+        # commands to source, so the zero-module fallback is unobservable
+        # without these — the assertion would pass vacuously on None.
+        config.test_command = _GLOBAL_TEST_COMMAND
+        config.type_check_command = _GLOBAL_TYPECHECK_COMMAND
+
+    git_ops = _make_git_ops(tmp_path)
+
+    task_wt = tmp_path / f'task-wt-{task_id}'
+    task_wt.mkdir(parents=True, exist_ok=True)
+    merge_wt = tmp_path / f'merge-wt-{task_id}'
+    merge_wt.mkdir(parents=True, exist_ok=True)
+    _materialize(merge_wt, _ALPHA_TEST, _BETA_TEST, _DELTA_TEST)
+
+    req = _make_req(task_id, task_wt, config)
+    req.module_configs = list(touched)
+
+    # The LOCAL consumer's module set is read off `FakeVerifier.verify_calls`:
+    # the set `run_scoped` was handed is the very list `LocalRunner` was
+    # constructed with (verify_runner.py::LocalRunner.run_merge_verify), so the
+    # observation needs no constructor spy.  The WIRE spec's set has no port —
+    # `build_merge_verify_spec` is a module function — so that one stays spied.
+    verifier = FakeVerifier()
+    captured: dict = {'config': config, 'merge_wt': merge_wt}
+
+    real_build = post_merge_verify_module.build_merge_verify_spec
+
+    def _spy_build(cfg, module_configs, task_files):
+        captured['spec_arg'] = list(module_configs)
+        spec = real_build(cfg, module_configs, task_files)
+        captured['spec'] = spec
+        return spec
+
+    with patch('orchestrator.merge_lane.post_merge_verify.build_merge_verify_spec', new=_spy_build):
+        await run_post_merge_verify(
+            git_ops, req, merge_wt,
+            timeouts={}, enospc_retries={},
+            max_timeouts=3, max_enospc=1,
+            merge_sha=_MERGE_SHA,
+            verifier=verifier,
+        )
+
+    captured['verified'] = [list(call.module_configs) for call in verifier.verify_calls]
+    return captured
+
+
+def _prefixes(module_configs) -> list[str]:
+    return [mc.prefix for mc in module_configs]
+
+
+class TestMergeBoundaryShipsOneEffectiveSetToBothConsumers:
+    """The local runner and the wire spec receive the IDENTICAL module set.
+
+    This is the §8.2 ordering invariant asserted AT THE BOUNDARY rather than
+    as two independent expectations: the property under test is not "both
+    happen to equal the registry", it is "both came from one resolution", so
+    the decisive assertion is that the two captured sets are EQUAL TO EACH
+    OTHER. The remote reconstructs its module set from ``spec.verify_commands``
+    (verify_runner ``_module_config_from_command``), so projecting the spec
+    from the same effective set is what makes local ≡ remote by construction.
+    """
+
+    @staticmethod
+    def _three_module_registry():
+        mc_a = _module_config('alpha')
+        mc_b = _module_config('beta')
+        mc_g = _module_config('gamma')
+        return mc_a, mc_b, mc_g, {'alpha': mc_a, 'beta': mc_b, 'gamma': mc_g}
+
+    # -- (a) both consumers, one set ------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_spec_and_local_runner_receive_the_same_effective_set(
+        self, tmp_path: Path,
+    ):
+        """(a) Both captured sets are the whole registry in registry order, and
+        EQUAL to each other. Today the LocalRunner arg is already correct
+        (step-6) but the spec arg is still [mc_alpha] -> RED."""
+        mc_a, _mc_b, _mc_g, registry = self._three_module_registry()
+
+        captured = await _capture_boundary_consumers(
+            tmp_path, task_id='w1', breadth='full',
+            registry=registry, touched=[mc_a],
+        )
+
+        assert captured['verified'], 'the verify port was never asked'
+        local_set = captured['verified'][0]
+        spec_set = captured['spec_arg']
+
+        assert _prefixes(local_set) == ['alpha', 'beta', 'gamma']
+        assert _prefixes(spec_set) == ['alpha', 'beta', 'gamma']
+        # THE property: one resolution reached both consumers.
+        assert _prefixes(spec_set) == _prefixes(local_set), (
+            'the wire spec and the local runner must receive the identical set '
+            'BY CONSTRUCTION, not by two sites independently agreeing'
+        )
+
+    # -- (b) the spec projection ----------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_spec_projection_covers_every_effective_module(self, tmp_path: Path):
+        """(b) The spec's own projected commands follow the effective set —
+        both the per-module verify_commands and the unscoped typecheck gate."""
+        mc_a, _mc_b, _mc_g, registry = self._three_module_registry()
+
+        captured = await _capture_boundary_consumers(
+            tmp_path, task_id='w2', breadth='full',
+            registry=registry, touched=[mc_a],
+        )
+        spec = captured['spec']
+        effective = captured['spec_arg']
+
+        assert [vc.prefix for vc in spec.verify_commands] == _prefixes(effective)
+        expected_unscoped = [
+            mc.prefix for mc in effective if mc.type_check_command is not None
+        ]
+        assert [vc.prefix for vc in spec.unscoped_typecheck.commands] == expected_unscoped
+        assert expected_unscoped == ['alpha', 'beta', 'gamma'], (
+            'the fixture must give every module a type_check_command, else this '
+            'assertion is vacuous'
+        )
+
+    # -- (c) the remote reconstruction leg ------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_remote_reconstruction_yields_the_same_module_set(
+        self, tmp_path: Path,
+    ):
+        """(c) Feed the spec the boundary ACTUALLY built through the remote
+        entry point and assert the module set it reconstructs matches the
+        local runner's — i.e. the remote merge gate now maps node-ids against
+        the same modules the local gate does.
+
+        Compared by PREFIX and command strings, never by object identity: the
+        remote set is reconstructed through the wire codec, so identity is
+        meaningless across it.
+        """
+        from orchestrator import verify_runner
+
+        mc_a, _mc_b, _mc_g, registry = self._three_module_registry()
+
+        captured = await _capture_boundary_consumers(
+            tmp_path, task_id='w3', breadth='full',
+            registry=registry, touched=[mc_a],
+        )
+        local_set = captured['verified'][0]
+
+        remote_scoped = AsyncMock(return_value=_passing_result())
+        remote_unscoped = AsyncMock(return_value=PostMergePyrightResult())
+        await verify_runner.run_merge_verify_on_worktree(
+            captured['merge_wt'], captured['config'], captured['spec'],
+            merge_sha=_MERGE_SHA,
+            run_scoped=remote_scoped,
+            run_unscoped=remote_unscoped,
+        )
+
+        assert remote_scoped.await_args is not None
+        reconstructed = remote_scoped.await_args.args[2]
+        assert _prefixes(reconstructed) == _prefixes(local_set), (
+            f'remote reconstructed {_prefixes(reconstructed)!r} but the local '
+            f'runner got {_prefixes(local_set)!r} — the two gates would map '
+            f'node-ids against different module sets'
+        )
+        assert [mc.test_command for mc in reconstructed] == [
+            mc.test_command for mc in local_set
+        ]
+
+    # -- CONTROLS --------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_scoped_breadth_spec_carries_the_passed_set_unchanged(
+        self, tmp_path: Path,
+    ):
+        """Legacy byte-identical: at the shipped default the spec still carries
+        only the task's own modules."""
+        mc_a, _mc_b, _mc_g, registry = self._three_module_registry()
+
+        captured = await _capture_boundary_consumers(
+            tmp_path, task_id='w4', breadth='scoped',
+            registry=registry, touched=[mc_a],
+        )
+
+        assert _prefixes(captured['spec_arg']) == ['alpha']
+        assert _prefixes(captured['verified'][0]) == ['alpha']
+
+    @pytest.mark.asyncio
+    async def test_full_breadth_empty_registry_spec_carries_the_passed_set(
+        self, tmp_path: Path,
+    ):
+        """Safe degrade: an empty registry resolves to the passed set, so the
+        spec is unchanged from today — never an empty projection."""
+        mc_a, _mc_b, _mc_g, _registry = self._three_module_registry()
+
+        captured = await _capture_boundary_consumers(
+            tmp_path, task_id='w5', breadth='full',
+            registry={}, touched=[mc_a],
+        )
+
+        assert _prefixes(captured['spec_arg']) == ['alpha']
+        assert _prefixes(captured['verified'][0]) == ['alpha']
+
+
+# ---------------------------------------------------------------------------
+# amendment (reviewer suggestion 1): the ZERO-MODULE task keeps today's gate
+# ---------------------------------------------------------------------------
+
+
+class TestMergeBoundaryLeavesTheZeroModuleTaskAlone:
+    """An EMPTY ``req.module_configs`` is NOT widened, even at breadth='full'
+    with a populated registry.
+
+    ``WorkflowRunner._resolve_module_configs`` returns ``[]`` whenever the task
+    has no assigned modules — docs-only and root-file tasks — and this repo's
+    live config sets ``merge_verify_breadth: "full"`` over 9 registered
+    modules, so this is a LIVE path, not a corner case. Widening ``[]`` to the
+    registry would silently replace such a task's whole gate: the wire spec
+    would flip from INV-1's global-command fallback (task 2883) to per-module
+    commands with ``global_verify_command=None``, the scoped leg would leave
+    ``_derive_fallback_runs`` for a per-module full-suite fan-out, and
+    ``_run_unscoped_typechecks`` would cover every registered module.
+
+    γ's mandate is to make the suppression gate map node-ids against the set
+    that ACTUALLY RAN — not to change what runs. So the boundary mirrors
+    ``run_scoped_verification``'s own ``if module_configs:`` guard and this
+    class pins that: the widening applies exactly where it applied before,
+    and the zero-module task is left where it already was.
+    """
+
+    @staticmethod
+    def _three_module_registry():
+        mc_a = _module_config('alpha')
+        mc_b = _module_config('beta')
+        mc_g = _module_config('gamma')
+        return mc_a, mc_b, mc_g, {'alpha': mc_a, 'beta': mc_b, 'gamma': mc_g}
+
+    @pytest.mark.asyncio
+    async def test_empty_passed_set_reaches_both_consumers_unwidened(
+        self, tmp_path: Path,
+    ):
+        """breadth='full' + POPULATED registry + no assigned modules: both the
+        spec leg and the local runner still receive the empty set."""
+        _mc_a, _mc_b, _mc_g, registry = self._three_module_registry()
+
+        captured = await _capture_boundary_consumers(
+            tmp_path, task_id='z1', breadth='full',
+            registry=registry, touched=[],
+        )
+
+        assert captured['spec_arg'] == [], (
+            f"the spec leg must not be widened for a zero-module task; got "
+            f"{_prefixes(captured['spec_arg'])!r}"
+        )
+        assert captured['verified'], 'the verify port was never asked'
+        assert captured['verified'][0] == [], (
+            f"the local runner must not be widened either; got "
+            f"{_prefixes(captured['verified'][0])!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_zero_module_spec_still_sources_the_global_verify_command(
+        self, tmp_path: Path,
+    ):
+        """INV-1 preserved with a POPULATED registry — the case the original
+        comment block reasoned about only for an EMPTY registry.
+
+        The spec ships zero per-module commands and the live globals instead,
+        exactly as before γ, so the remote reconstructs the same global gate.
+        """
+        _mc_a, _mc_b, _mc_g, registry = self._three_module_registry()
+
+        captured = await _capture_boundary_consumers(
+            tmp_path, task_id='z2', breadth='full',
+            registry=registry, touched=[], global_commands=True,
+        )
+        spec = captured['spec']
+
+        assert spec.verify_commands == ()
+        assert spec.unscoped_typecheck.commands == ()
+        assert spec.global_verify_command is not None, (
+            'a zero-module spec must carry the live global gate (INV-1, task '
+            '2883), not an empty projection'
+        )
+        assert spec.global_verify_command.test_command == _GLOBAL_TEST_COMMAND
+
+    @pytest.mark.asyncio
+    async def test_non_empty_passed_set_still_widens_at_the_same_breadth(
+        self, tmp_path: Path,
+    ):
+        """The CONTROL that keeps the guard narrow: same config, same registry,
+        one assigned module -> γ's widening still fires on both legs (and the
+        global fallback is correctly NOT sourced). Without this, a guard that
+        disabled the widening outright would pass the two tests above."""
+        mc_a, _mc_b, _mc_g, registry = self._three_module_registry()
+
+        captured = await _capture_boundary_consumers(
+            tmp_path, task_id='z3', breadth='full',
+            registry=registry, touched=[mc_a], global_commands=True,
+        )
+
+        assert _prefixes(captured['spec_arg']) == ['alpha', 'beta', 'gamma']
+        assert _prefixes(captured['verified'][0]) == ['alpha', 'beta', 'gamma']
+        assert captured['spec'].global_verify_command is None
+
+
+class TestMergeBoundaryModuleConfigsWrapper:
+    """``merge_queue.merge_boundary_module_configs`` — the guard, and nothing
+    but the guard.
+
+    INV-5: the wrapper must DELEGATE the expansion to the one shared
+    ``verify_plan.effective_merge_module_configs`` rather than reimplement it,
+    since a second copy of that expression is exactly the drift PRD §8.2
+    exists to remove. Pinned with a spy that returns a value neither the
+    registry nor the passed set could produce.
+    """
+
+    @staticmethod
+    def _config(tmp_path: Path):
+        config = _make_config(tmp_path, merge_verify_breadth='full')
+        config._module_configs = {'alpha': _module_config('alpha')}
+        return config
+
+    def test_non_empty_passed_set_delegates_to_the_shared_helper(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        from orchestrator.merge_lane import post_merge_verify as post_merge_verify_module
+
+        config = self._config(tmp_path)
+        passed = [_module_config('beta')]
+        sentinel = [_module_config('sentinel')]
+        calls: list[tuple] = []
+
+        def _spy(cfg, module_configs):
+            calls.append((cfg, list(module_configs)))
+            return list(sentinel)
+
+        monkeypatch.setattr(
+            post_merge_verify_module, 'effective_merge_module_configs', _spy,
+        )
+
+        result = post_merge_verify_module.merge_boundary_module_configs(config, passed)
+
+        assert _prefixes(result) == ['sentinel']
+        assert len(calls) == 1
+        assert calls[0][0] is config
+        assert _prefixes(calls[0][1]) == ['beta']
+
+    def test_empty_passed_set_never_consults_the_helper_at_all(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        """Identity, and not even a call: the guard is the boundary's own
+        policy, so the breadth helper's contract stays untouched (its other
+        caller, verify.py's force_workspace branch, still widens an empty
+        passed set exactly as it did before γ)."""
+        from orchestrator.merge_lane import post_merge_verify as post_merge_verify_module
+
+        config = self._config(tmp_path)
+        calls: list[tuple] = []
+
+        def _spy(cfg, module_configs):
+            calls.append((cfg, list(module_configs)))
+            return [_module_config('sentinel')]
+
+        monkeypatch.setattr(
+            post_merge_verify_module, 'effective_merge_module_configs', _spy,
+        )
+
+        passed: list[ModuleConfig] = []
+        result = post_merge_verify_module.merge_boundary_module_configs(config, passed)
+
+        assert result is passed
+        assert calls == []
+
+
+# ---------------------------------------------------------------------------
+# task-5063 — a restart-rehydrated merge request must verify as WIDE as the
+# original it was rehydrated from.
+#
+# reconstruct_merge_request used to hardcode ``module_configs=[]`` on the
+# belief (stated in its docstring) that "[] means all configured modules" and
+# that this "errs on the side of verifying more than the original, never
+# less".  Both claims were FALSE: the class directly above pins that
+# ``merge_boundary_module_configs`` deliberately NEVER widens an empty set,
+# so the empty set routes to ``verify_plan._derive_fallback_runs`` and the
+# recovered merge is verified FILE-SCOPED — narrower than its original, and
+# silently so (a file-scoped verify runs, and passes fast).
+#
+# These assert on the RESOLVED module set and the PLANNED runs rather than on
+# "verify ran", because "verify ran" is exactly what stayed true through the
+# defect.
+# ---------------------------------------------------------------------------
+
+
+def _merge_plan_full_suite_prefixes(
+    config: OrchestratorConfig,
+    module_configs: list[ModuleConfig],
+    files: list[str],
+) -> list[str]:
+    """The module prefixes a merge-role verify would run FULL_SUITE for.
+
+    Drives the real chain — the merge boundary's effective set, then
+    ``verify_plan.derive_verify_plan`` at ``role='merge'`` — so the assertion
+    lands on the planned runs rather than on an intermediate.
+
+    *files* must contain a ``.py``/``.rs`` path or ``derive_verify_plan``
+    short-circuits to TRIVIAL before any module branch is reached.
+    ``worktree_reader`` can be a constant ``None``: the FULL_SUITE branch
+    (``_derive_full_suite_runs``) never consults file contents.
+    """
+    effective = merge_boundary_module_configs(config, module_configs)
+    plan = verify_plan.derive_verify_plan(
+        files, effective, config, lambda _f: None, role='merge',
+    )
+    return sorted({
+        run.module_prefix
+        for run in plan.runs
+        if run.scope_kind is verify_plan.ScopeKind.FULL_SUITE
+    })
+
+
+class TestRehydratedRequestVerifiesAsWideAsItsOriginal:
+    """A merge request recovered from the journal plans the SAME merge-role
+    module set its original would have.
+
+    The ORIGINAL request is the oracle, so what is pinned is the invariant
+    ("never narrower than its original") rather than a transcribed literal
+    that rots when the registry fixture changes.  An oracle alone could pass
+    vacuously if the oracle itself regressed to empty — which is precisely the
+    failure mode under test — so each test also pins the concrete expected set
+    as a non-vacuity guard.
+    """
+
+    # Must carry a .py path — see _merge_plan_full_suite_prefixes.
+    _TASK_FILES = ['orchestrator/src/orchestrator/merge_queue_store.py']
+
+    @staticmethod
+    def _nine_module_registry() -> dict[str, ModuleConfig]:
+        """dark_factory's live nine-module registry shape.
+
+        Follows the file's existing ``_N_module_registry`` staticmethod idiom.
+        The prefix list itself is cross-imported from
+        ``test_merge_queue_store.NINE_PREFIXES`` — its single definition — so
+        the two task-5063 suites cannot silently disagree about what "the whole
+        registry" means.
+        """
+        return {prefix: _module_config(prefix) for prefix in NINE_PREFIXES}
+
+    @staticmethod
+    def _config(tmp_path: Path, breadth: Literal['scoped', 'full']) -> OrchestratorConfig:
+        config = _make_config(tmp_path, merge_verify_breadth=breadth)
+        config._module_configs = (
+            TestRehydratedRequestVerifiesAsWideAsItsOriginal._nine_module_registry()
+        )
+        return config
+
+    @staticmethod
+    def _original(
+        tmp_path: Path,
+        config: OrchestratorConfig,
+        *,
+        module_configs: list[ModuleConfig],
+        task_files: list[str],
+    ) -> MergeRequest:
+        """A live MergeRequest, built inline.
+
+        Deliberately not aliased from ``test_merge_queue_store._make_req``:
+        this module already imports a DIFFERENT ``_make_req`` (from
+        ``test_merge_queue_main_health``), so a second import under that name
+        would shadow it.
+        """
+        worktree = tmp_path / 'wt'
+        worktree.mkdir(exist_ok=True)
+        return MergeRequest(
+            task_id='5063',
+            branch=QueuedBranch.parse('5063', config.git.branch_prefix),
+            worktree=worktree,
+            pre_rebased=False,
+            task_files=task_files,
+            module_configs=module_configs,
+            config=config,
+            result=asyncio.get_running_loop().create_future(),
+        )
+
+    @staticmethod
+    def _rehydrate(
+        tmp_path: Path, config: OrchestratorConfig, original: MergeRequest,
+    ) -> MergeRequest:
+        """Round-trip *original* through the real journal and back."""
+        store = MergeQueueStore(tmp_path / 'merge_queue.json')
+        store.record(original)
+        [persisted] = store.load()
+        return reconstruct_merge_request(persisted, config)
+
+    @pytest.mark.asyncio
+    async def test_rehydrated_request_plans_the_same_full_suite_set_as_its_original(
+        self, tmp_path: Path,
+    ) -> None:
+        """breadth='full': the recovered request's FULL_SUITE set EQUALS the
+        original's — and both are the whole nine-module registry."""
+        config = self._config(tmp_path, 'full')
+        registry = config.module_configs_or_empty
+        original = self._original(
+            tmp_path, config,
+            module_configs=[registry['orchestrator']],
+            task_files=self._TASK_FILES,
+        )
+        rehydrated = self._rehydrate(tmp_path, config, original)
+
+        original_plan = _merge_plan_full_suite_prefixes(
+            config, original.module_configs, self._TASK_FILES,
+        )
+        rehydrated_plan = _merge_plan_full_suite_prefixes(
+            config, rehydrated.module_configs, self._TASK_FILES,
+        )
+
+        assert rehydrated_plan == original_plan, (
+            f'a rehydrated request must never verify NARROWER than the '
+            f'original it was rehydrated from; original planned FULL_SUITE '
+            f'for {original_plan!r}, rehydrated for {rehydrated_plan!r}'
+        )
+        # Non-vacuity: an oracle that itself regressed to empty must not make
+        # the equality above pass trivially.
+        assert original_plan == sorted(NINE_PREFIXES)
+
+    @pytest.mark.asyncio
+    async def test_rehydrated_request_under_scoped_breadth_keeps_the_tasks_own_modules(
+        self, tmp_path: Path,
+    ) -> None:
+        """breadth='scoped': the recovered request keeps the task's OWN
+        modules, which under this breadth is what the boundary passes through
+        unchanged."""
+        config = self._config(tmp_path, 'scoped')
+        registry = config.module_configs_or_empty
+        original = self._original(
+            tmp_path, config,
+            module_configs=[registry['orchestrator']],
+            task_files=self._TASK_FILES,
+        )
+        rehydrated = self._rehydrate(tmp_path, config, original)
+
+        original_effective = _prefixes(
+            merge_boundary_module_configs(config, original.module_configs)
+        )
+        rehydrated_effective = _prefixes(
+            merge_boundary_module_configs(config, rehydrated.module_configs)
+        )
+
+        assert rehydrated_effective == original_effective, (
+            f'original resolved to {original_effective!r}, '
+            f'rehydrated to {rehydrated_effective!r}'
+        )
+        assert original_effective == ['orchestrator']
+
+    @pytest.mark.asyncio
+    async def test_zero_module_task_still_reconstructs_empty_and_takes_the_global_fallback(
+        self, tmp_path: Path,
+    ) -> None:
+        """CONTROL — the MUST-PRESERVE, and what distinguishes this fix from
+        unconditionally widening ``[]`` at the boundary.
+
+        GREEN today and must STAY green.  A task that genuinely has no
+        assigned modules reconstructs to ``[]``, the boundary leaves it ``[]``
+        (task 3787 γ's deliberate no-widen guard), and the plan takes
+        ``_derive_fallback_runs`` — no registered module's FULL_SUITE run —
+        even though the SAME nine-module registry is configured and breadth is
+        'full'. The one FULL_SUITE run is the global fallback's own test floor
+        (tasks 8714/7041): a source-only diff at merge role runs the configured
+        test_command whole.
+        """
+        config = self._config(tmp_path, 'full')
+        original = self._original(
+            tmp_path, config, module_configs=[], task_files=self._TASK_FILES,
+        )
+        rehydrated = self._rehydrate(tmp_path, config, original)
+
+        assert rehydrated.module_configs == [], (
+            f'a genuinely zero-module task must NOT be widened by the fix; '
+            f'got {_prefixes(rehydrated.module_configs)!r}'
+        )
+        assert merge_boundary_module_configs(config, rehydrated.module_configs) == []
+        assert _merge_plan_full_suite_prefixes(
+            config, rehydrated.module_configs, self._TASK_FILES,
+        ) == ['__fallback__'], 'the zero-module task must still take the global-fallback path'
+
+
+# ---------------------------------------------------------------------------
+# task 5653: the local merge gate joins the verify-result cache, and only it
+# ---------------------------------------------------------------------------
+
+
+class _CapturingVerifier(FakeVerifier):
+    """A ``FakeVerifier`` whose scoped verify passes and also keeps every call's options."""
+
+    def __init__(self, verify_cache: CacheAccess | None = None) -> None:
+        super().__init__(VerifyScript(result=_passing_result()), verify_cache=verify_cache)
+        self.scoped_options: list[dict[str, Any]] = []
+
+    async def run_scoped(
+        self, worktree: Path, config: Any, module_configs: list[Any], task_files: list[str] | None = None,
+        **options: Any,
+    ) -> VerifyResult:
+        self.scoped_options.append(options)
+        return await super().run_scoped(worktree, config, module_configs, task_files, **options)
+
+
+class TestMergeBoundaryJoinsTheVerifyCache:
+    @staticmethod
+    def _req(tmp_path: Path) -> tuple[MergeRequest, Path]:
+        config = _make_config(tmp_path, merge_verify_breadth='full').model_copy(
+            update={'verify_cold_preprovision_command': ''},
+        )
+        mc_a = _module_config('alpha')
+        task_wt = tmp_path / 'task-wt-c1'
+        task_wt.mkdir(parents=True, exist_ok=True)
+        merge_wt = tmp_path / 'merge-wt-c1'
+        merge_wt.mkdir(parents=True, exist_ok=True)
+        req = _make_req('c1', task_wt, config)
+        req.module_configs = [mc_a]
+        return req, merge_wt
+
+    @staticmethod
+    async def _drive(
+        tmp_path: Path, req: MergeRequest, merge_wt: Path, verifier: _CapturingVerifier,
+        *, history_leg_command: str | None = None,
+    ) -> MergeOutcome | None:
+        return await run_post_merge_verify(
+            _make_git_ops(tmp_path), req, merge_wt,
+            timeouts={}, enospc_retries={}, max_timeouts=3, max_enospc=1,
+            merge_sha=_MERGE_SHA, verifier=verifier, history_leg_command=history_leg_command,
+        )
+
+    @staticmethod
+    def _access(tmp_path: Path) -> CacheAccess:
+        return CacheAccess(registry=Registry(tmp_path / 'verify_cache.db'), orchestrator_code=TEST_CODE)
+
+    @pytest.mark.asyncio
+    async def test_the_local_gate_verifies_through_the_access_its_verifier_holds(self, tmp_path: Path):
+        req, merge_wt = self._req(tmp_path)
+        access = self._access(tmp_path)
+        verifier = _CapturingVerifier(verify_cache=access)
+
+        assert await self._drive(tmp_path, req, merge_wt, verifier) is None
+
+        (options,) = verifier.scoped_options
+        assert options['verify_cache'] is access
+
+    @pytest.mark.asyncio
+    async def test_a_verifier_holding_no_access_keeps_the_local_gate_outside_the_cache(self, tmp_path: Path):
+        req, merge_wt = self._req(tmp_path)
+        verifier = _CapturingVerifier()
+
+        assert await self._drive(tmp_path, req, merge_wt, verifier) is None
+
+        assert verifier.scoped_options
+        assert [options for options in verifier.scoped_options if options.get('verify_cache') is not None] == []
+
+    @pytest.mark.asyncio
+    async def test_the_history_leg_stays_outside_the_cache(self, tmp_path: Path):
+        req, merge_wt = self._req(tmp_path)
+        verifier = _CapturingVerifier(verify_cache=self._access(tmp_path))
+
+        assert await self._drive(tmp_path, req, merge_wt, verifier, history_leg_command='true') is None
+
+        assert [options for options in verifier.scoped_options if options.get('verify_cache') is not None] == []
+
+    @pytest.mark.asyncio
+    async def test_the_placeholder_runner_stays_outside_the_cache(self, tmp_path: Path):
+        req, merge_wt = self._req(tmp_path)
+        verifier = _CapturingVerifier(verify_cache=self._access(tmp_path))
+        runner = placeholder_local_runner(merge_wt, req, verifier)
+
+        await runner.run_merge_verify(_MERGE_SHA, build_merge_verify_spec(req.config, req.module_configs, None))
+
+        (options,) = verifier.scoped_options
+        assert 'verify_cache' in options
+        assert options['verify_cache'] is None
+
+
+# ---------------------------------------------------------------------------
+# task 5653 (absorbs 5294): the unscoped type-check gate consults what the
+# scoped leg ran instead of giving LocalRunner a second module set (INV-5)
+# ---------------------------------------------------------------------------
+
+
+def _marking_module(prefix: str, marker: Path, *, type_cmd: str | None = None) -> ModuleConfig:
+    """A module whose type check appends *prefix* to *marker*, a file outside the worktree."""
+    return ModuleConfig(
+        prefix=prefix,
+        test_command=None,
+        lint_command=None,
+        type_check_command=type_cmd or f'echo {prefix} >> {marker}',
+    )
+
+
+def _type_unit(prefix: str, outcome: UnitOutcome) -> VerifyUnit:
+    return VerifyUnit(
+        unit=module_leg_name(prefix, 'type'), tier=UnitTier.MODULE, key=None, outcome=outcome,
+    )
+
+
+def _scoped(plan_runs: list[PlannedRun], units: tuple[VerifyUnit, ...] | None) -> VerifyResult:
+    return VerifyResult(
+        passed=True, test_output='', lint_output='', type_output='', summary='ok',
+        plan=VerifyPlan(runs=tuple(plan_runs)).to_dict(), units=units,
+    )
+
+
+def _full_breadth_runs(modules: list[ModuleConfig], config: OrchestratorConfig) -> list[PlannedRun]:
+    """The runs a breadth-'full' merge verify plans for *modules*."""
+    assert config.merge_verify_breadth == 'full'
+    return list(verify_plan.derive_verify_plan(
+        [f'{modules[0].prefix}/mod.py'], modules, config, lambda _path: None, 'merge',
+    ).runs)
+
+
+def _file_scoped_pyright(mc: ModuleConfig) -> PlannedRun:
+    assert mc.type_check_command is not None
+    return PlannedRun(
+        mc.prefix, parse_config_command(mc.type_check_command), ScopeKind.FILE_SCOPED,
+        'pyright: touched files only', (f'{mc.prefix}/mod.py',),
+    )
+
+
+class TestUnscopedTypecheckConsultsWhatTheScopedLegRan:
+    """At breadth 'full', a module whose scoped verify already ran (or replayed) a
+    green FULL_SUITE pyright is not type-checked a second time. Breadth 'scoped'
+    stays byte-identical, and a timeout still fails the pre-advance gate closed."""
+
+    @pytest.fixture
+    def scene(self, tmp_path: Path) -> tuple[Path, Path, list[ModuleConfig]]:
+        worktree = tmp_path / 'merge-wt'
+        worktree.mkdir()
+        marker = tmp_path / 'typechecked'
+        modules = [_marking_module(p, marker) for p in ('alpha', 'beta', 'gamma')]
+        return worktree, marker, modules
+
+    @staticmethod
+    def _config(tmp_path: Path, breadth: Literal['scoped', 'full'], **timeouts: float) -> OrchestratorConfig:
+        return _make_config(tmp_path, merge_verify_breadth=breadth).model_copy(
+            update={'verify_cold_preprovision_command': '', **timeouts},
+        )
+
+    @classmethod
+    def _covered_plan(cls, tmp_path: Path, modules: list[ModuleConfig]) -> list[PlannedRun]:
+        alpha, beta, _gamma = modules
+        return _full_breadth_runs([alpha, beta], cls._config(tmp_path, 'full'))
+
+    @classmethod
+    def _alpha_ran_beta_replayed(cls, tmp_path: Path, modules: list[ModuleConfig]) -> VerifyResult:
+        return _scoped(
+            cls._covered_plan(tmp_path, modules),
+            (_type_unit('alpha', UnitOutcome.RAN_GREEN), _type_unit('beta', UnitOutcome.CACHE_HIT)),
+        )
+
+    @staticmethod
+    def _typechecked(marker: Path) -> list[str]:
+        return sorted(marker.read_text().split()) if marker.exists() else []
+
+    @staticmethod
+    async def _gate(
+        worktree: Path, config: OrchestratorConfig, modules: list[ModuleConfig], executed: VerifyResult | None,
+    ) -> PostMergePyrightResult:
+        return await _run_unscoped_typechecks(
+            worktree, config, modules, block_on_timeout=True, executed=executed,
+        )
+
+    @pytest.mark.asyncio
+    async def test_full_breadth_type_checks_only_the_module_the_scoped_leg_did_not_cover(self, tmp_path: Path, scene):
+        worktree, marker, modules = scene
+
+        result = await self._gate(
+            worktree, self._config(tmp_path, 'full'), modules, self._alpha_ran_beta_replayed(tmp_path, modules),
+        )
+
+        assert self._typechecked(marker) == ['gamma']
+        assert not result.broken
+
+    @pytest.mark.asyncio
+    async def test_scoped_breadth_type_checks_every_module_as_today(self, tmp_path: Path, scene):
+        worktree, marker, modules = scene
+
+        result = await self._gate(
+            worktree, self._config(tmp_path, 'scoped'), modules, self._alpha_ran_beta_replayed(tmp_path, modules),
+        )
+
+        assert self._typechecked(marker) == ['alpha', 'beta', 'gamma']
+        assert not result.broken
+
+    @pytest.mark.asyncio
+    async def test_no_executed_record_type_checks_every_module(self, tmp_path: Path, scene):
+        worktree, marker, modules = scene
+
+        await self._gate(worktree, self._config(tmp_path, 'full'), modules, None)
+
+        assert self._typechecked(marker) == ['alpha', 'beta', 'gamma']
+
+    @pytest.mark.asyncio
+    async def test_a_file_scoped_pyright_run_is_not_coverage(self, tmp_path: Path, scene):
+        worktree, marker, modules = scene
+        alpha, beta, _gamma = modules
+        executed = _scoped(
+            [_file_scoped_pyright(alpha), *_full_breadth_runs([beta], self._config(tmp_path, 'full'))],
+            (_type_unit('alpha', UnitOutcome.RAN_GREEN), _type_unit('beta', UnitOutcome.CACHE_HIT)),
+        )
+
+        await self._gate(worktree, self._config(tmp_path, 'full'), modules, executed)
+
+        assert self._typechecked(marker) == ['alpha', 'gamma']
+
+    @pytest.mark.asyncio
+    async def test_a_red_type_unit_is_not_coverage(self, tmp_path: Path, scene):
+        worktree, marker, modules = scene
+        executed = _scoped(
+            self._covered_plan(tmp_path, modules),
+            (_type_unit('alpha', UnitOutcome.RAN_RED), _type_unit('beta', UnitOutcome.CACHE_HIT)),
+        )
+
+        await self._gate(worktree, self._config(tmp_path, 'full'), modules, executed)
+
+        assert self._typechecked(marker) == ['alpha', 'gamma']
+
+    @pytest.mark.asyncio
+    async def test_a_type_unit_missing_from_recorded_units_is_not_coverage(self, tmp_path: Path, scene):
+        worktree, marker, modules = scene
+        executed = _scoped(self._covered_plan(tmp_path, modules), (_type_unit('beta', UnitOutcome.CACHE_HIT),))
+
+        await self._gate(worktree, self._config(tmp_path, 'full'), modules, executed)
+
+        assert self._typechecked(marker) == ['alpha', 'gamma']
+
+    @pytest.mark.asyncio
+    async def test_without_units_the_plan_alone_decides(self, tmp_path: Path, scene):
+        worktree, marker, modules = scene
+        executed = _scoped(self._covered_plan(tmp_path, modules), None)
+
+        await self._gate(worktree, self._config(tmp_path, 'full'), modules, executed)
+
+        assert self._typechecked(marker) == ['gamma']
+
+    @pytest.mark.asyncio
+    async def test_an_uncovered_module_that_times_out_still_fails_the_gate_closed(self, tmp_path: Path, scene):
+        worktree, marker, modules = scene
+        alpha, beta, _gamma = modules
+        hanging_gamma = _marking_module('gamma', marker, type_cmd='sleep 60')
+        config = self._config(
+            tmp_path, 'full',
+            verify_command_timeout_secs=1.0,
+            verify_cold_command_timeout_secs=1.0,
+            merge_verify_cold_command_timeout_secs=1.0,
+        )
+
+        result = await self._gate(
+            worktree, config, [alpha, beta, hanging_gamma], self._alpha_ran_beta_replayed(tmp_path, modules),
+        )
+
+        assert self._typechecked(marker) == []
+        assert result.timed_out_subprojects == ['gamma']
+        assert result.failing_subprojects == ['gamma']
+        assert result.broken
+
+    def test_the_plan_reader_counts_only_green_capable_full_suite_pyright_runs_with_a_command(self, tmp_path: Path, scene):
+        _worktree, _marker, modules = scene
+        alpha, beta, gamma = modules
+        type_cmd = parse_config_command('pyright')
+        plan = VerifyPlan(runs=(
+            *self._covered_plan(tmp_path, modules),
+            _file_scoped_pyright(gamma),
+            PlannedRun('delta', None, ScopeKind.SKIPPED, 'pyright: no type_check_command configured'),
+            PlannedRun('epsilon', None, ScopeKind.FULL_SUITE, 'pyright: no command, though full suite'),
+            PlannedRun('zeta', parse_config_command('ruff check'), ScopeKind.FULL_SUITE, 'lint: full suite'),
+            PlannedRun('__fallback__', type_cmd, ScopeKind.FULL_SUITE, 'pyright: fallback full suite'),
+            PlannedRun('', None, ScopeKind.TRIVIAL, 'No source files changed — verify trivially passes'),
+        )).to_dict()
+
+        assert verify_plan.full_suite_type_check_modules(plan) == frozenset({alpha.prefix, beta.prefix})
+        assert verify_plan.full_suite_type_check_modules(
+            VerifyPlan(runs=tuple(self._covered_plan(tmp_path, modules))).to_dict(),
+        ) == frozenset({'alpha', 'beta'})
+        assert verify_plan.full_suite_type_check_modules(None) == frozenset()

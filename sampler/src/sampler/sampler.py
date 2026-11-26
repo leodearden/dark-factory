@@ -1,77 +1,177 @@
-"""Per-tick orchestration for the load sampler.
+"""One load-sampler tick: collect the groups that are due, then admit and write them.
 
-``run_tick`` is the pure core — it takes an already-opened ``LoadSampleStore``
-and pre-collected metric dicts.  All I/O is done before calling it, so it is
-fully unit-testable.
+``collect_tick`` gives each group an outcome: not yet due, collected (its
+samples and the state its next collection starts from), or failed. It hands
+each collector the state the last written tick persisted, and it is the one
+degrade handler: a collector that raises writes no rows, never a fabricated
+0.0, and the other groups are still collected.
 
-Tick responsibilities
----------------------
-1. Write 6 PSI metrics with NULL window columns (kernel-windowed, no re-window).
-2. For each of 3 non-PSI metrics: compute the trailing window from the DB, then
-   write the row with window_mean + window_max populated.
-3. Call cleanup_old to enforce the 24-hour retention policy.
-
-Note: maybe_vacuum is NOT called here — it is called from ``__main__.main()``
-after run_tick completes, to keep concerns separated.
+``run_tick`` admits each collected group against its own ``MetricGroup``. A
+group carrying any key it does not admit is dropped for the tick with an ERROR
+naming the group and the keys. The admitted rows and every attempted group's
+record go to ONE ``LoadSampleStore.write_tick`` transaction, so a group's
+state never commits without the rows computed from it, nor they without it.
+Vacuum is ``sampler.__main__``'s.
 """
 
 from __future__ import annotations
 
-from sampler.store import LoadSampleStore
+import json
+import logging
+from collections.abc import Iterable, Mapping
+from dataclasses import dataclass, field
+from enum import Enum
+from types import MappingProxyType
 
-__all__ = ['run_tick']
+from sampler.metrics import Collected, MetricGroup, SampleKey, Samples
+from sampler.store import GroupRecord, LoadSampleStore, stamp_is_due
 
-# PSI metric names that carry NULL windows (kernel-windowed already)
-_PSI_METRICS = frozenset([
-    'psi_cpu_some_avg10',
-    'psi_cpu_full_avg10',
-    'psi_mem_some_avg10',
-    'psi_mem_full_avg10',
-    'psi_io_some_avg10',
-    'psi_io_full_avg10',
-])
+__all__ = ['Failed', 'LogThrottle', 'Outcome', 'Skipped', 'collect_tick', 'run_tick']
 
-# Non-PSI metric names that carry trailing window_mean/window_max
-_PROCESS_METRICS = frozenset([
-    'occt_queue_depth',
-    'verify_concurrency',
-    'verify_rss_total_bytes',
-])
+logger = logging.getLogger(__name__)
+
+# A failing collector logs its traceback at most once per exception class in
+# this long; every tick line still names the failure.
+_FAILURE_LOG_INTERVAL_SECONDS = 3600
+
+
+class Skipped(Enum):
+    """A group that wrote nothing this tick, without having failed."""
+
+    NOT_DUE = 'not-due'
+    DROPPED = 'dropped'
+
+
+@dataclass(frozen=True)
+class LogThrottle:
+    """When each failure kind last had its traceback logged.
+
+    It is persisted in the group's record, because every tick is a process of
+    its own and an in-memory throttle would forget on the next tick.
+    """
+
+    logged_at: Mapping[str, int] = field(default_factory=lambda: MappingProxyType({}))
+
+    def should_log(self, kind: str, now: int) -> bool:
+        return stamp_is_due(self.logged_at.get(kind), now, _FAILURE_LOG_INTERVAL_SECONDS)
+
+    def logged(self, kind: str, now: int) -> LogThrottle:
+        return LogThrottle(MappingProxyType({**self.logged_at, kind: now}))
+
+    def to_json(self) -> str:
+        return json.dumps(dict(self.logged_at), sort_keys=True)
+
+    @classmethod
+    def from_json(cls, text: str | None) -> LogThrottle:
+        """The throttle *text* encodes; absent or unreadable text is an empty throttle."""
+        try:
+            decoded = json.loads(text) if text is not None else {}
+        except ValueError:
+            return cls()
+        if not isinstance(decoded, dict) or not all(
+            isinstance(stamp, int) and not isinstance(stamp, bool) for stamp in decoded.values()
+        ):
+            return cls()
+        return cls(MappingProxyType(decoded))
+
+
+@dataclass(frozen=True)
+class Failed:
+    """A collector that raised ``kind``; ``log_throttle`` is the throttle to persist, if changed."""
+
+    kind: str
+    log_throttle: LogThrottle | None = None
+
+
+Outcome = Collected | Failed | Skipped
+
+
+def collect_tick(
+    store: LoadSampleStore, now: int, groups: Iterable[MetricGroup]
+) -> dict[MetricGroup, Outcome]:
+    """Each of *groups*' outcome at *now*: not due, collected, or failed.
+
+    Every group's record is read once, up front.
+    """
+    groups = tuple(groups)
+    records = store.read_group_records([group.name for group in groups])
+    return {group: _collect(group, records[group.name], now) for group in groups}
+
+
+def _collect(group: MetricGroup, record: GroupRecord, now: int) -> Outcome:
+    if group.due_seconds is not None and not stamp_is_due(
+        record.attempted_at, now, group.due_seconds
+    ):
+        return Skipped.NOT_DUE
+    try:
+        return group.collect(now, record.state)
+    except Exception as exc:
+        return _failed(group, exc, LogThrottle.from_json(record.log_throttle), now)
+
+
+def _failed(group: MetricGroup, exc: Exception, throttle: LogThrottle, now: int) -> Failed:
+    kind = type(exc).__name__
+    if not throttle.should_log(kind, now):
+        return Failed(kind)
+    logger.error(
+        'Failed to collect %s metrics (%s); writing the other groups only, and logging '
+        'this kind of failure again in %d s at the earliest',
+        group.name, kind, _FAILURE_LOG_INTERVAL_SECONDS, exc_info=exc,
+    )
+    return Failed(kind, throttle.logged(kind, now))
 
 
 def run_tick(
     store: LoadSampleStore,
     now: int,
-    *,
-    psi: dict[str, float],
-    process_metrics: dict[str, float],
-) -> None:
-    """Write one tick's worth of samples to the store.
+    outcomes: Mapping[MetricGroup, Outcome],
+) -> dict[MetricGroup, Outcome]:
+    """Write one tick of *outcomes*, and return each group's disposition.
 
-    Args:
-        store:           Open LoadSampleStore instance.
-        now:             Unix timestamp for this tick (integer seconds).
-        psi:             Dict of 6 PSI avg10 values keyed as psi_*_avg10.
-        process_metrics: Dict of 3 non-PSI values (occt_queue_depth,
-                         verify_concurrency, verify_rss_total_bytes).
+    A collected group with an unadmitted key becomes ``Skipped.DROPPED``. Every
+    attempted group — collected, dropped or failed — has its attempt stamped;
+    only an admitted group's state is persisted, so a dropped or failed group's
+    next collection spans the whole interval since its last written one.
     """
-    # Guard against unexpected/misspelled metric keys that would silently
-    # persist without matching any consumer.  Subset checks (<=) rather than
-    # equality allow partial dicts when a collection group degrades to {} on
-    # error (see __main__.py degrade-and-continue handling).
-    assert set(psi) <= _PSI_METRICS, f'unexpected PSI keys: {set(psi) - _PSI_METRICS}'
-    assert set(process_metrics) <= _PROCESS_METRICS, (
-        f'unexpected process metric keys: {set(process_metrics) - _PROCESS_METRICS}'
+    dispositions = {group: _admit(group, outcome) for group, outcome in outcomes.items()}
+    written = {g: d.samples for g, d in dispositions.items() if isinstance(d, Collected)}
+    store.write_tick(
+        now,
+        unwindowed=_merge(s for g, s in written.items() if not g.windowed),
+        windowed=_merge(s for g, s in written.items() if g.windowed),
+        records={
+            group.name: record
+            for group, disposition in dispositions.items()
+            if (record := _record(disposition, now)) is not None
+        },
     )
-
-    # 1. Write PSI rows (NULL windows — PSI is already kernel-windowed)
-    for metric, value in psi.items():
-        store.insert_sample(now, metric, value, window_mean=None, window_max=None)
-
-    # 2. Write non-PSI rows with DB-backed trailing windows
-    for metric, value in process_metrics.items():
-        window_mean, window_max = store.trailing_window(metric, value)
-        store.insert_sample(now, metric, value, window_mean=window_mean, window_max=window_max)
-
-    # 3. Enforce 24-hour retention (delete-by-age, cheap + index-backed)
     store.cleanup_old(now)
+    return dispositions
+
+
+def _admit(group: MetricGroup, outcome: Outcome) -> Outcome:
+    if not isinstance(outcome, Collected):
+        return outcome
+    unadmitted = sorted(key.label() for key in outcome.samples if not group.admits(key))
+    if unadmitted:
+        logger.error(
+            'dropping the %s group this tick: unadmitted keys %s', group.name, unadmitted
+        )
+        return Skipped.DROPPED
+    return outcome
+
+
+def _record(disposition: Outcome, now: int) -> GroupRecord | None:
+    match disposition:
+        case Skipped.NOT_DUE:
+            return None
+        case Collected(state=state):
+            return GroupRecord(attempted_at=now, state=state)
+        case Failed(log_throttle=throttle) if throttle is not None:
+            return GroupRecord(attempted_at=now, log_throttle=throttle.to_json())
+        case _:
+            return GroupRecord(attempted_at=now)
+
+
+def _merge(groups: Iterable[Samples]) -> dict[SampleKey, float]:
+    return {key: value for samples in groups for key, value in samples.items()}

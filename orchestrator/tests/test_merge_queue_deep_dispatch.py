@@ -1,0 +1,2627 @@
+"""Deep merge-ahead γ — deep-tip verify dispatch + the chain policy (tasks 3185, 8528).
+
+PRD: ``plans/deep-merge-ahead-prd.md`` task γ (Phase 2 vertical slice).
+Capability sidecar: ``plans/deep-merge-ahead-prd.capability-manifest.yaml``.
+
+γ is the FIRST production caller of β's ``build_chain`` (task 3184).  It adds
+the dispatch-side half of deep merge-ahead: a slot-2 gate that builds a chain,
+redirects the verify onto the chain TIP, and records a pass/fail into the chain
+policy (task 8528: ``merge_lane/chain_policy.py``, which replaced γ's halving
+state machine).  It deliberately does NOT land anything — δ (task 3186) owns the
+in-order prefix CAS walk.  See this module's step-17 class for the soundness
+fence that keeps a tip verdict out of ``_finalize_inflight``'s CAS advance.
+
+Step → coverage map:
+  task 8528   — the pure depth policy is test_merge_lane_chain_policy.py;
+                here, its worker seam, boundary rows 7 and 8 and seeding
+  step-11 RED — ``_deep_chain_placement`` gate + kill-switch zero-cost proof
+  step-13 RED — the bounded ``build_chain`` call (timeout, empty, truncated)
+  step-15 RED — the dispatch REDIRECT (verify ``chain.tip`` in ``chain.lane``)
+  step-17 RED — the NON-ADOPTION invariant (γ's soundness fence)
+  step-19 RED — integration: a red chain's members verify alone, un-chained
+                byte-identity, ``chain_items >= 1`` everywhere, conservation
+
+Harness notes (see plan pre-1):
+  * ``orchestrator/pyproject.toml`` does NOT set ``asyncio_mode`` → pytest-asyncio
+    runs STRICT, so ``@pytest.mark.asyncio`` is required on async test classes.
+  * That same config turns "marked with @pytest.mark.asyncio but not an async
+    function" into an ERROR — never put a sync ``test_*`` inside a marked class.
+    Sync tests live in their OWN unmarked class.
+  * Any class doing real-git worktree/merge work carries
+    ``@pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)`` because a merge chain
+    plus worktree creation is slow.
+  * ``orchestrator/tests/`` has no ``__init__.py``, so flat helpers are imported
+    by bare module name.
+"""
+
+from __future__ import annotations
+
+import asyncio
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+from _merge_deep_scene import (
+    _add_recording_seed_to_repo,
+    _CapturingEventStore,
+    _count_spec_lane_acquires,
+    _create_branch_editing,
+    _ephemeral_merge_wt,
+    _fail_verify_result,
+    _fake_pass_runner,
+    _local_lease,
+    _make_config,
+    _make_git_ops,
+    _make_item,
+    _make_req,
+    _merge_commit_off_main,
+    _placed_facts,
+    _rev_parse,
+    _setup_repo,
+    _shared_txt_with,
+    _spy_chain_lane_release,
+    _spy_post_merge_verify,
+    _StubRemoteAllocator,
+    _verify_row,
+    _worktree_names,
+)
+from _merge_deep_scene import git_repo as git_repo
+from _merge_lane_census import queued_in_lane, queued_request_ids
+from _merge_lane_fakes import FakeVerifier, fails
+from _orch_helpers import VERIFY_CLI_PER_TEST_TIMEOUT, wait_responsive
+from test_merge_queue_deep_reservation import _landed_task_files as _reservation_landed
+from test_merge_queue_deep_reservation import _request as _reservation_request
+from test_merge_queue_deep_reservation import _running as _running_lane
+from test_merge_queue_deep_reservation import _scene as _reservation_scene
+
+from orchestrator.config import DepthRow, MergeDeepConfig, OrchestratorConfig
+from orchestrator.event_store import EventStore, EventType
+from orchestrator.git_ops import GitOps, _run
+from orchestrator.merge_lane import liveness as merge_liveness
+from orchestrator.merge_lane import worker as merge_queue
+from orchestrator.merge_lane.chain_policy import TipVerdict, per_item_pass_estimate, seed_from_rows
+from orchestrator.merge_lane.types import (
+    NO_DEEP_PLACEMENT,
+    ChainResult,
+    MergeOutcome,
+    RealMergeItem,
+)
+from orchestrator.merge_lane.worker import SpeculativeMergeWorker
+from orchestrator.merge_verify_facts import ChainDepthBasis, ChainDepthReason
+
+# ── worker helpers ───────────────────────────────────────────────────────────
+
+
+def _make_worker(git_ops: GitOps) -> SpeculativeMergeWorker:
+    """Build a bare SpeculativeMergeWorker for unit tests (no harness wiring)."""
+    return SpeculativeMergeWorker(git_ops, asyncio.Queue())
+
+
+def _seed_frontier(worker: SpeculativeMergeWorker, frontier: int) -> None:
+    """Stub *frontier* frozen entries that set ``_verify_frontier_depth()`` and are built on nothing.
+
+    Dispatch reads each frozen entry's ``item``, ``gate`` and ``chain`` for
+    the bases a new item may stack on; ``None`` for all three contributes no
+    base commit.
+    """
+    worker._frozen_inflight_entries = (  # type: ignore[assignment,method-assign]
+        lambda: [SimpleNamespace(item=None, gate=None, chain=None) for _ in range(frontier)]
+    )
+
+
+def _asked(reason: ChainDepthReason | None) -> ChainDepthReason:
+    """*reason*, which must exist: a guard declined before the policy was asked."""
+    assert reason is not None, 'a guard declined before the deep policy was asked'
+    return reason
+
+
+def _seed_window(
+    worker: SpeculativeMergeWorker, db_dir: Path, verdicts, *, extra_rows=(),
+) -> EventStore:
+    """Attach a real event store holding one sized k=1 ``merge_verify`` row per
+    verdict, oldest first, then *extra_rows*, and seed the worker's policy from it."""
+    store = EventStore(db_dir / 'events.db', run_id='seed-run')
+    rows = [_verify_row(passed, merge_sha=f'seed{n}') for n, passed in enumerate(verdicts)]
+    for n, row in enumerate([*rows, *extra_rows]):
+        store.emit(EventType.merge_verify, task_id=f'seed{n}', data=row)
+    worker._event_store = store
+    worker.seed_chain_policy()
+    return store
+
+
+def _owns_merge_worktree(worker: SpeculativeMergeWorker, wt: Path) -> bool:
+    """Whether ``snapshot()`` still reports *wt* on the merge-worktree ledger.
+
+    ``owned_merge_worktrees`` is that ledger's public view: the resolved path
+    strings ``_touch_owned_merge_worktrees`` heartbeats.
+    """
+    return str(wt.resolve()) in worker.snapshot()['owned_merge_worktrees']
+
+
+class TestMayChain:
+    """``may_chain(speculative=, frontier_depth=)``: the D5 eligibility rule.
+
+    ``plans/merge-lane-policy-prd.md`` D5: a dispatch may chain when its item
+    is speculative, or when nothing else is in the verify frontier.  Reached
+    as a module attribute so a missing symbol fails this class alone.
+    """
+
+    @pytest.mark.parametrize(
+        ('speculative', 'frontier_depth', 'expected'),
+        [
+            (True, 0, True),
+            (True, 3, True),
+            (True, None, True),
+            (False, 0, True),
+            (False, 1, False),
+            (False, 2, False),
+            (False, None, False),
+        ],
+        ids=[
+            'speculative-alone',
+            'speculative-beside-three',
+            'speculative-unknown-depth',
+            'head-alone-in-the-frontier',
+            'head-beside-one',
+            'head-beside-two',
+            'head-unknown-depth-never-licensed',
+        ],
+    )
+    def test_the_d5_rule(
+        self, speculative: bool, frontier_depth: int | None, expected: bool,
+    ) -> None:
+        assert merge_queue.may_chain(
+            speculative=speculative, frontier_depth=frontier_depth,
+        ) is expected
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# step-11: RED — the deep GATE, and the kill-switch byte-identity guarding it
+#
+# `_deep_chain_placement(item)` is the deep policy hook: the deep twin of
+# `_probe_verify_placement` (merge_queue.py:11988), structured identically —
+# an eligibility guard (PRD D5's `may_chain`), then a HOISTED zero-cost
+# kill-switch guard, then the pure policy, then (step-14) the bounded git work.
+#
+# Everything below asserts a NEGATIVE — the gate declines — so each test also
+# proves the decline COSTS NOTHING: no `build_chain`, no `_spec-` lane, and,
+# on the two guards that precede it, not even the O(n) `chain_snapshot()`
+# scan. "No cost, not merely no effect" is the byte-identity claim the PRD
+# makes for the shipped `chain_cap=0` default, and it is only checkable by
+# spying the work that must NOT happen.
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def _spy_build_chain(
+    monkeypatch,
+    result: ChainResult | None = None,
+    *,
+    passthrough: bool = False,
+) -> list[dict]:
+    """Replace ``orchestrator.merge_lane.worker.build_chain`` with a recorder.
+
+    Returns the list of recorded call kwargs (``{'git_ops', 'queue_snapshot',
+    'head_merge_commit', 'cap', 'target_depth', 'verify_is_local'}``) — step-11
+    asserts it stays EMPTY on every declining path; step-13 reads its contents.
+
+    *result* defaults to a ZERO-LINK :class:`ChainResult`, which per its
+    docstring never holds a lane — so a stubbed call can never leak one, and
+    these gate tests stay valid once step-14 lands the real build.
+
+    ``passthrough=True`` records the arguments and then delegates to the REAL
+    builder, so one test can pin both the call contract and the built chain
+    without the two drifting apart.
+    """
+    calls: list[dict] = []
+    real = merge_queue.build_chain
+
+    async def _recording(
+        git_ops, queue_snapshot, head_merge_commit, *, cap, target_depth,
+        verify_is_local: bool = True,
+    ):
+        calls.append({
+            'git_ops': git_ops,
+            'queue_snapshot': tuple(queue_snapshot),
+            'head_merge_commit': head_merge_commit,
+            'cap': cap,
+            'target_depth': target_depth,
+            'verify_is_local': verify_is_local,
+        })
+        if passthrough:
+            return await real(
+                git_ops, queue_snapshot, head_merge_commit,
+                cap=cap, target_depth=target_depth, verify_is_local=verify_is_local,
+            )
+        return result if result is not None else ChainResult(links=[], tip=head_merge_commit)
+
+    monkeypatch.setattr('orchestrator.merge_lane.worker.build_chain', _recording)
+    return calls
+
+
+def _spy_chain_snapshot(worker: SpeculativeMergeWorker, monkeypatch) -> list[int]:
+    """Wrap ``worker.chain_snapshot`` with a call recorder; return the record list.
+
+    ``chain_snapshot()`` is an O(n) walk of every lane buffer, so it is the
+    cheapest observable proof that a guard short-circuited BEFORE the scan
+    rather than after it — the difference between the kill switch costing
+    nothing and merely doing nothing.
+    """
+    seen: list[int] = []
+    original = worker.chain_snapshot
+
+    def _recording():
+        out = original()
+        seen.append(len(out))
+        return out
+
+    monkeypatch.setattr(worker, 'chain_snapshot', _recording)
+    return seen
+
+
+@pytest.mark.asyncio
+class TestDeepChainPlacementGate:
+    """`_deep_chain_placement` declines — and costs nothing while declining."""
+
+    async def _fixture(
+        self, git_repo: Path, monkeypatch, *, chain_cap: int, queued: int,
+    ) -> tuple[SpeculativeMergeWorker, RealMergeItem, OrchestratorConfig, list[dict], list[str], list[int]]:
+        """Build worker + a slot-2 item + *queued* buffered requests, all spied.
+
+        Returns ``(worker, item, config, build_chain_calls, spec_lane_acquires,
+        chain_snapshot_calls)``.  No real merge commit is needed: every
+        step-11 path declines before touching git, and a test that reached git
+        with this fake SHA would fail loudly rather than silently pass.
+        """
+        git_ops = _make_git_ops(git_repo)
+        config = _make_config(git_repo, chain_cap=chain_cap)
+        worker = _make_worker(git_ops)
+        worker._intake.replace_lane('normal', [
+            _make_req(str(200 + i), str(200 + i), config, git_repo)
+            for i in range(queued)
+        ])
+        item = _make_item(
+            _make_req('101', '101', config, git_repo), 'beef' * 10, git_repo,
+        )
+        return (
+            worker, item, config,
+            _spy_build_chain(monkeypatch),
+            _count_spec_lane_acquires(git_ops, monkeypatch),
+            _spy_chain_snapshot(worker, monkeypatch),
+        )
+
+    async def test_cap_zero_kill_switch_costs_nothing(self, git_repo, monkeypatch):
+        """cap=0 (the shipped default) declines without ANY work, deep queue or not.
+
+        The hoisted guard must sit BEFORE the ``chain_snapshot()`` scan, so
+        under stock config a speculative dispatch pays literally nothing for
+        the feature being compiled in.
+        """
+        worker, item, _cfg, built, lanes, scans = await self._fixture(
+            git_repo, monkeypatch, chain_cap=0, queued=5,
+        )
+
+        assert await worker._deep_chain_placement(item) == NO_DEEP_PLACEMENT
+        assert built == []
+        assert lanes == []
+        assert scans == [], 'cap=0 must short-circuit BEFORE the O(n) queue scan'
+
+    async def _head_fixture(
+        self, git_repo: Path, monkeypatch,
+    ) -> tuple[SpeculativeMergeWorker, RealMergeItem, list[dict], list[str], list[int]]:
+        """A chain_cap=6 worker, five buffered requests and a NON-speculative head, all spied."""
+        git_ops = _make_git_ops(git_repo)
+        config = _make_config(git_repo, chain_cap=6)
+        worker = _make_worker(git_ops)
+        worker._intake.replace_lane('normal', [
+            _make_req(str(300 + i), str(300 + i), config, git_repo) for i in range(5)
+        ])
+        head_item = _make_item(
+            _make_req('101', '101', config, git_repo), 'beef' * 10, git_repo,
+            speculative=False,
+        )
+        return (
+            worker, head_item,
+            _spy_build_chain(monkeypatch),
+            _count_spec_lane_acquires(git_ops, monkeypatch),
+            _spy_chain_snapshot(worker, monkeypatch),
+        )
+
+    @pytest.mark.parametrize('frontier_depth', [1, None], ids=['beside-an-entry', 'unknown'])
+    async def test_non_speculative_item_not_alone_in_the_frontier_is_not_chained(
+        self, git_repo, monkeypatch, frontier_depth,
+    ):
+        """A head with another entry in the verify frontier declines before the scan (PRD D5).
+
+        The head is merged onto REAL main; anything landing ahead of it would
+        leave a chain built on it stale.  An unknown depth (a direct caller)
+        is treated the same way.
+        """
+        worker, head_item, built, lanes, scans = await self._head_fixture(git_repo, monkeypatch)
+
+        assert await worker._deep_chain_placement(
+            head_item, frontier_depth=frontier_depth,
+        ) == NO_DEEP_PLACEMENT
+        assert built == []
+        assert lanes == []
+        assert scans == [], 'the guard 1 decline must precede the queue scan too'
+
+    async def test_non_speculative_item_alone_in_the_frontier_reaches_the_chain_build(
+        self, git_repo, monkeypatch,
+    ):
+        """A head alone in the verify frontier reaches the build, seeded at its own commit (PRD D5)."""
+        worker, head_item, built, _lanes, scans = await self._head_fixture(git_repo, monkeypatch)
+
+        await worker._deep_chain_placement(head_item, frontier_depth=0)
+
+        assert len(built) == 1, 'a head alone in the frontier must reach build_chain'
+        assert built[0]['head_merge_commit'] == head_item.merge_result.merge_commit
+        assert (built[0]['cap'], built[0]['target_depth']) == (5, 5)
+        assert scans == [5]
+
+    async def test_queue_shorter_than_two_declines(self, git_repo, monkeypatch):
+        """An empty unfrozen suffix means ``queue_len == 1`` — nothing to chain ONTO.
+
+        Distinct from the kill switch: here the gate is ENABLED, so the scan
+        legitimately runs and it is the pure ``queue >= 2`` policy gate that
+        declines.  Asserting the scan DID happen is what stops this test from
+        passing for the wrong reason (an over-eager cap guard).
+        """
+        worker, item, _cfg, built, lanes, scans = await self._fixture(
+            git_repo, monkeypatch, chain_cap=6, queued=0,
+        )
+
+        placement = await worker._deep_chain_placement(item)
+        assert placement.chain is None
+        assert _asked(placement.depth_reason).queue_depth == 1, 'the policy was asked'
+        assert built == []
+        assert lanes == []
+        assert scans, 'an enabled cap must reach the queue scan before declining'
+
+    async def test_a_depth_of_one_runs_no_chain_code(self, tmp_path, git_repo, monkeypatch):
+        """A round the policy sizes at one item is today's path, and says why.
+
+        A failing window meets no row of ``[(0.5, 6)]``, so the gate builds
+        nothing and acquires no lane, and the reason still rides out.
+        """
+        worker, item, config, built, lanes, _scans = await self._fixture(
+            git_repo, monkeypatch, chain_cap=6, queued=5,
+        )
+        config.merge_deep.depth_table = [DepthRow(0.5, 6)]
+        _seed_window(worker, tmp_path, [False, False, False])
+
+        placement = await worker._deep_chain_placement(item)
+
+        assert placement.chain is None
+        assert built == []
+        assert lanes == [], 'a depth of one must not acquire a chain-build lane'
+        reason = _asked(placement.depth_reason)
+        assert reason.basis is ChainDepthBasis.PASS_ESTIMATE
+        assert (reason.pass_estimate, reason.row) == (0.0, None)
+
+    async def test_the_policy_counts_the_dispatching_item(self, git_repo, monkeypatch):
+        """``queue_depth`` is 1-INDEXED: 5 buffered requests behind the dispatcher give 6.
+
+        An empty window takes the first table row, and the build is sized from
+        it in links beyond the dispatching item.
+        """
+        worker, item, _cfg, built, _lanes, _scans = await self._fixture(
+            git_repo, monkeypatch, chain_cap=6, queued=5,
+        )
+
+        reason = _asked((await worker._deep_chain_placement(item)).depth_reason)
+
+        assert reason.queue_depth == 6, 'the dispatcher is chain item #1'
+        assert (reason.basis, reason.row) == (ChainDepthBasis.NO_ESTIMATE, (0.0, 6))
+        assert (built[0]['cap'], built[0]['target_depth']) == (5, 5)
+
+    async def test_cap_is_read_live_off_the_item_config(self, git_repo, monkeypatch):
+        """PRD decision 7: flipping the knob flips the gate with no worker rebuild.
+
+        ``chain_cap`` is green-tier hot-reloadable, and ``_set_leaf`` mutates
+        the held :class:`MergeDeepConfig` IN PLACE (config.py:1011-1017), so
+        the gate must re-read ``item.request.config.merge_deep.chain_cap`` on
+        every call rather than cache it at construction.  Same worker, same
+        item, same config OBJECT across both calls — only the leaf changes.
+        """
+        worker, item, config, built, _lanes, scans = await self._fixture(
+            git_repo, monkeypatch, chain_cap=0, queued=5,
+        )
+
+        assert (await worker._deep_chain_placement(item)).chain is None
+        assert scans == [] and built == []
+
+        config.merge_deep.chain_cap = 6  # operator hot-reloads the knob ON
+        await worker._deep_chain_placement(item)
+
+        assert scans, 'the flipped-on cap must be observed on the very next call'
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# step-13: RED — the BOUNDED build
+#
+# β made bounding γ's obligation in build_chain's own docstring (:6212-6224):
+# one lane acquisition plus up to `depth` sequential `git merge` subprocesses,
+# with NO internal deadline BY DESIGN — "the honest bound belongs to the policy
+# layer". These tests pin that bound, and pin that every degenerate outcome of
+# the build (deadline, empty, truncated) degrades to a path that leaks nothing.
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def _lane_states(git_ops: GitOps) -> list:
+    """Return the ``_spec-`` pool's lane states (``[]`` when there is no pool)."""
+    pool = git_ops.spec_warm_lane_pool
+    return [] if pool is None else list(pool._lanes.values())
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)
+class TestDeepChainPlacementBuild:
+    """The gate's build: exact call contract, the deadline, and the leak-free exits."""
+
+    async def _fixture(
+        self, git_repo: Path, *, chain_cap: int, queued: list[tuple[str, str, str]],
+    ) -> tuple[GitOps, SpeculativeMergeWorker, RealMergeItem, str, OrchestratorConfig]:
+        """Build a repo + worker + slot-2 item sitting on a REAL merge commit.
+
+        *queued* is ``[(task_id, filename, content), ...]`` — each becomes a
+        real branch AND a buffered request, in that order.
+        """
+        git_ops = _make_git_ops(git_repo)
+        config = _make_config(git_repo, chain_cap=chain_cap)
+        await _create_branch_editing(git_repo, 'task/101', 'a.txt', 'edit-101\n')
+        for task_id, filename, content in queued:
+            await _create_branch_editing(git_repo, f'task/{task_id}', filename, content)
+        head = await _merge_commit_off_main(git_repo, 'task/101', '101')
+        worker = _make_worker(git_ops)
+        worker._intake.replace_lane('normal', [
+            _make_req(task_id, task_id, config, git_repo) for task_id, _, _ in queued
+        ])
+        item = _make_item(_make_req('101', '101', config, git_repo), head, git_repo)
+        return git_ops, worker, item, head, config
+
+    async def test_build_chain_is_called_with_the_exact_contract(
+        self, git_repo: Path, monkeypatch,
+    ):
+        """The four arguments, and the UNIT CONVERSION between the two depth spaces.
+
+        ``choose_depth`` counts ITEMS IN THE CHAIN (the dispatching item is
+        #1); ``build_chain`` counts ADDITIONAL LINKS BEYOND the base it is
+        handed.  The gate is the seam between those units, so it must pass
+        ``d - 1`` — an off-by-one here silently builds one item too many
+        (over-running the chosen depth) or one too few.
+
+        ``head_merge_commit`` is the DISPATCHING ITEM's merge commit, not
+        ``frozen_prefix_tip``: the chain must be a contiguous continuation of
+        the queue through this item, and seeding it at the frozen tip would
+        skip the very item being dispatched — a hole that breaks the in-order
+        prefix property δ's CAS walk depends on.
+        """
+        git_ops, worker, item, head, _cfg = await self._fixture(
+            git_repo, chain_cap=6,
+            queued=[('102', 'b.txt', 'edit-102\n'), ('103', 'c.txt', 'edit-103\n')],
+        )
+        built = _spy_build_chain(monkeypatch, passthrough=True)
+        expected_snapshot = worker.chain_snapshot()
+        main_sha = await _rev_parse(git_repo, 'main')
+
+        res = (await worker._deep_chain_placement(item)).chain
+
+        assert len(built) == 1
+        call = built[0]
+        assert call['git_ops'] is git_ops
+        assert call['queue_snapshot'] == expected_snapshot
+        assert call['head_merge_commit'] == head == item.merge_result.merge_commit
+        assert call['head_merge_commit'] != worker.frozen_prefix_tip(main_sha)
+        # queue depth 1 + 2 = 3 under the row (0.0, 6) -> d = 3 (items).
+        assert call['cap'] == 2, 'd - 1: chain_cap bounds nothing'
+        assert call['target_depth'] == 2, 'd - 1: extra links beyond the dispatching item'
+        assert res is not None
+        await merge_liveness.release_chain_build_lane(
+            git_ops, res.lane, warm=res.lane_warm,
+        )
+
+    async def test_clean_chain_returns_two_links_in_one_lane(
+        self, git_repo: Path, monkeypatch,
+    ):
+        """A clean 3-item fixture builds a real 2-link chain holding exactly ONE lane."""
+        from orchestrator.warm_lane_pool import LaneState
+
+        git_ops, worker, item, head, _cfg = await self._fixture(
+            git_repo, chain_cap=6,
+            queued=[('102', 'b.txt', 'edit-102\n'), ('103', 'c.txt', 'edit-103\n')],
+        )
+        before = await _worktree_names(git_ops)
+        lanes = _count_spec_lane_acquires(git_ops, monkeypatch)
+
+        res = (await worker._deep_chain_placement(item)).chain
+
+        assert res is not None
+        assert [tid for tid, _ in res.links] == ['102', '103']
+        assert res.tip == res.links[-1][1]
+        assert res.truncated_at is None
+        # The tip is a REAL descendant of the dispatching item's merge commit,
+        # which is what makes one verify on it authorise the whole prefix.
+        code, _, _ = await _run(
+            ['git', 'merge-base', '--is-ancestor', head, res.tip], cwd=git_repo,
+        )
+        assert code == 0
+        assert res.tip != head
+
+        assert len(lanes) == 1, 'exactly ONE lane acquisition for the whole chain'
+        assert await _worktree_names(git_ops) - before == {'_spec-0'}
+        assert res.lane == git_ops.worktree_base / '_spec-0'
+        assert _lane_states(git_ops) == [LaneState.ASSIGNED], 'result HOLDS its lane'
+
+        await merge_liveness.release_chain_build_lane(
+            git_ops, res.lane, warm=res.lane_warm,
+        )
+
+    async def test_build_is_wrapped_in_a_deadline_and_leaks_no_lane(
+        self, git_repo: Path, monkeypatch, caplog,
+    ):
+        """A build that overruns ``merge_deep.chain_build_timeout_secs`` degrades to today's path.
+
+        The REAL ``build_chain`` runs here (only the per-item merge is stalled),
+        so the deadline genuinely cancels it mid-merge and its own
+        ``except BaseException`` arm (merge_queue.py:6350-6355) is what returns
+        the lane.  Stubbing the builder wholesale would prove only that a stub
+        does not leak.
+        """
+        import logging
+
+        from orchestrator.warm_lane_pool import LaneState
+
+        git_ops, worker, item, _head, _cfg = await self._fixture(
+            git_repo, chain_cap=6,
+            queued=[('102', 'b.txt', 'edit-102\n'), ('103', 'c.txt', 'edit-103\n')],
+        )
+        # 2.0s, not a tighter value: the deadline starts at the `async with`,
+        # so it also covers acquire_chain_build_lane's reset+clean+CoW seed.
+        # Too tight and the cancel lands INSIDE the acquisition under parallel
+        # load, testing a different path than the one this test names.
+        reached: list[str] = []
+
+        async def _stalled_merge(_lane, branch):
+            reached.append(branch)
+            await asyncio.sleep(60)
+
+        monkeypatch.setattr(git_ops, 'merge_branch_into_worktree', _stalled_merge)
+
+        # The knob is read live off the dispatching request: a reload that
+        # changes it governs the NEXT dispatch, and the WARNING names it.
+        for secs in (2.0, 3.0):
+            item.request.config.merge_deep.chain_build_timeout_secs = secs
+            caplog.clear()
+            with caplog.at_level(logging.WARNING):
+                assert (await worker._deep_chain_placement(item)).chain is None
+            assert f'exceeded {secs:.0f}s' in caplog.text
+            assert reached, 'the stall must be reached, so the cancel lands in the merge loop'
+            assert _lane_states(git_ops) == [LaneState.FREE], 'deadline must not strand a lane'
+
+    async def test_a_none_merge_commit_declines_before_any_build(
+        self, git_repo: Path, monkeypatch,
+    ):
+        """The ``base is None`` guard: decline, never assert, never seed a chain.
+
+        ``RealMergeItem.merge_result.merge_commit`` is Optional, and a chain
+        seeded at a ``None`` base would be a chain with no anchor.  Unreachable
+        in practice (a RealMergeItem only exists for a SUCCESSFUL merge), which
+        is exactly why it needs a test: nothing else would notice if the guard
+        were deleted and the OPTIONAL deep path started crashing the dispatch
+        hot path on a shape the type system permits.
+        """
+        import dataclasses
+
+        from orchestrator.warm_lane_pool import LaneState
+
+        git_ops, worker, item, _head, _cfg = await self._fixture(
+            git_repo, chain_cap=6,
+            queued=[('102', 'b.txt', 'edit-102\n'), ('103', 'c.txt', 'edit-103\n')],
+        )
+        item.merge_result = dataclasses.replace(item.merge_result, merge_commit=None)
+        built = _spy_build_chain(monkeypatch)
+
+        assert (await worker._deep_chain_placement(item)).chain is None
+        assert built == [], 'declined BEFORE the build, not after'
+        assert _lane_states(git_ops) == [LaneState.FREE], 'and without a lane'
+
+    async def test_a_raising_builder_fails_open_and_leaks_no_lane(
+        self, git_repo: Path, monkeypatch, caplog,
+    ):
+        """A bug in the OPTIONAL deep path must never crash the dispatch hot path.
+
+        The generic ``except Exception`` arm's contract, and the sibling of the
+        deadline test above: a non-``TimeoutError`` blowing out of
+        ``build_chain`` degrades to today's adjacent verify (``None``) rather
+        than propagating into ``VerifyDispatcher.dispatch``.  Loud, not silent — a
+        ``logger.exception`` is required, since a silent fail-soft is what the
+        no-silent-fail-soft design invariant forbids.
+
+        Deliberately paired with the CANCEL test directly below: this arm must
+        swallow an ordinary ``Exception`` and that one must NOT swallow a
+        ``BaseException``.  The two together pin the split.
+        """
+        import logging
+
+        from orchestrator.warm_lane_pool import LaneState
+
+        git_ops, worker, item, _head, _cfg = await self._fixture(
+            git_repo, chain_cap=6,
+            queued=[('102', 'b.txt', 'edit-102\n'), ('103', 'c.txt', 'edit-103\n')],
+        )
+
+        async def _exploding(*_a, **_kw):
+            raise RuntimeError('builder bug')
+
+        monkeypatch.setattr('orchestrator.merge_lane.worker.build_chain', _exploding)
+
+        with caplog.at_level(logging.ERROR, logger='orchestrator.merge_lane'):
+            assert (await worker._deep_chain_placement(item)).chain is None
+
+        assert _lane_states(git_ops) == [LaneState.FREE], 'no lane stranded'
+        blown = [r for r in caplog.records if 'deep chain build failed' in r.message]
+        assert len(blown) == 1, 'the fail-open must be LOUD, not silent'
+        assert blown[0].exc_info is not None, 'logger.exception, not logger.error'
+
+    async def test_the_queue_snapshot_is_walked_once_on_the_firing_path(
+        self, git_repo: Path, monkeypatch,
+    ):
+        """``chain_snapshot()`` is O(n) — the firing path must pay for it ONCE.
+
+        Guard 2b is deliberately placed BEFORE the snapshot so a suppressed
+        task pays no walk at all; taking two walks when the gate DOES fire
+        would contradict that same cost discipline.  The bound-once snapshot is
+        also what makes "``queue_len`` and ``build_chain``'s argument describe
+        the same queue" true structurally rather than by luck.
+        """
+        git_ops, worker, item, _head, _cfg = await self._fixture(
+            git_repo, chain_cap=6,
+            queued=[('102', 'b.txt', 'edit-102\n'), ('103', 'c.txt', 'edit-103\n')],
+        )
+        walks = _spy_chain_snapshot(worker, monkeypatch)
+        built = _spy_build_chain(monkeypatch, passthrough=True)
+
+        res = (await worker._deep_chain_placement(item)).chain
+
+        assert walks == [2], f'expected exactly one O(n) walk, got {walks}'
+        assert [r.task_id for r in built[0]['queue_snapshot']] == ['102', '103'], (
+            'the reused snapshot is the one build_chain was handed'
+        )
+        assert worker.chain_snapshot() == (), (
+            'the built links are reserved for the tip verify (task 7720), so a '
+            'later snapshot no longer offers them'
+        )
+        assert res is not None
+        await merge_liveness.release_chain_build_lane(
+            git_ops, res.lane, warm=res.lane_warm,
+        )
+
+    async def test_a_firing_build_stamps_its_wall_clock_cost(
+        self, git_repo: Path, monkeypatch,
+    ):
+        """``build_ms`` is stamped so the per-round DISPATCH STALL is measurable.
+
+        The build is awaited INLINE on ``_verifier_loop``'s dispatch path, so
+        for its whole duration no head can be finalized or landed and nothing
+        else can dispatch.  ``merge_deep.chain_build_timeout_secs`` bounds that stall but
+        does not remove it, and the PRD's whole justification is throughput —
+        so the cost has to reach telemetry (as ``chain_build_ms``) before ζ
+        raises the cap.  Stamped by the CALLER, not by ``build_chain``, so it
+        covers lane acquisition and the timeout wrapper too.
+        """
+        git_ops, worker, item, _head, _cfg = await self._fixture(
+            git_repo, chain_cap=6,
+            queued=[('102', 'b.txt', 'edit-102\n'), ('103', 'c.txt', 'edit-103\n')],
+        )
+
+        res = (await worker._deep_chain_placement(item)).chain
+
+        assert res is not None
+        assert isinstance(res.build_ms, int), 'stamped, not left None, on a real build'
+        assert res.build_ms >= 0
+        await merge_liveness.release_chain_build_lane(
+            git_ops, res.lane, warm=res.lane_warm,
+        )
+
+    async def test_external_cancellation_propagates_and_leaks_no_lane(
+        self, git_repo: Path, monkeypatch, caplog,
+    ):
+        """REVIEW FIX 2: a cancel from OUTSIDE must not be absorbed into ``None``.
+
+        ``asyncio.timeout`` converts its OWN expiry into ``TimeoutError``
+        (3.11+), so a ``CancelledError`` that escapes the context manager can
+        ONLY be an external cancellation of the verifier-loop task.  Catching
+        it alongside ``TimeoutError`` CONSUMES the cancel request: the coroutine
+        returns ``None`` and ``VerifyDispatcher.dispatch`` runs on as if nothing happened
+        — breaking the "CancelledError is never absorbed" invariant
+        ``_verifier_loop`` states.
+
+        The REAL ``build_chain`` runs (only the per-item merge is stalled, on
+        an Event so it can never return on its own), which is what makes the
+        lane assertions real: its own ``except BaseException`` arm is what
+        returns the lane on the cancellation path.
+        """
+        import logging
+
+        from orchestrator.warm_lane_pool import LaneState
+
+        git_ops, worker, item, _head, _cfg = await self._fixture(
+            git_repo, chain_cap=6,
+            queued=[('102', 'b.txt', 'edit-102\n'), ('103', 'c.txt', 'edit-103\n')],
+        )
+        entered = asyncio.Event()
+        never = asyncio.Event()
+
+        async def _stalled_merge(_lane, _branch):
+            entered.set()
+            await never.wait()
+
+        monkeypatch.setattr(git_ops, 'merge_branch_into_worktree', _stalled_merge)
+        caplog.set_level(logging.WARNING, logger='orchestrator.merge_lane')
+
+        task = asyncio.ensure_future(worker._deep_chain_placement(item))
+        # Wait on the stub's own signal, never a sleep: the cancel has to land
+        # INSIDE the build, and a timed guess races the lane acquisition.
+        await asyncio.wait_for(entered.wait(), timeout=60)
+        task.cancel()
+        await asyncio.wait([task])
+
+        assert task.cancelled() is True, (
+            'the cancel must be HONOURED, not absorbed — absorbing it shows up '
+            'as an ordinary None return, which is why "no exception" is not '
+            'the assertion here'
+        )
+        assert not [
+            r for r in caplog.records
+            if 'exceeded' in r.message or 'falling back to the adjacent' in r.message
+        ], (
+            'a cancel is not a deadline overrun — logging the timeout WARNING '
+            'sends an operator hunting a wedged lane that does not exist'
+        )
+        assert _lane_states(git_ops) == [LaneState.FREE], 'no stranded lane'
+        assert worker.worktree_ledger_violations(grace_secs=0.0) == []
+        assert worker.speculation_accounting_violations() == []
+
+    async def test_cancelling_the_enclosing_dispatch_stops_the_dispatch(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        """REVIEW FIX 2, where the real hazard lives: the ENCLOSING task.
+
+        ``_deep_chain_placement`` is awaited inline by ``VerifyDispatcher.dispatch``, which
+        the verifier loop runs as a task.  If the cancel is swallowed down in
+        the placement, ``VerifyDispatcher.dispatch`` sails on past it and
+        ``ensure_future(self._verify_dispatch.run_inflight_verify(...))`` launches a whole
+        verify for a dispatch that was cancelled — so the observable is not
+        just "the exception vanished" but "work happened after the cancel".
+        """
+        repo = await _fresh_repo(tmp_path, 'cancel-dispatch')
+        scene = await _make_deep_scene(
+            repo, chain_cap=6, script=[True], monkeypatch=monkeypatch,
+        )
+        entered = asyncio.Event()
+        never = asyncio.Event()
+
+        async def _blocking_build(*_a, **_kw):
+            entered.set()
+            await never.wait()
+            raise AssertionError('unreachable: the build must not return on its own')
+
+        monkeypatch.setattr('orchestrator.merge_lane.worker.build_chain', _blocking_build)
+        item = _make_item(
+            _make_req('101', '101', scene.config, repo), scene.head,
+            _ephemeral_merge_wt(scene.git_ops, 'cancel-dispatch'),
+        )
+
+        task = asyncio.ensure_future(scene.worker.verify_dispatch.dispatch(item))
+        await asyncio.wait_for(entered.wait(), timeout=60)
+        task.cancel()
+        await asyncio.wait([task])
+
+        assert task.cancelled() is True, 'the dispatch must not survive its cancel'
+        assert scene.calls == [], (
+            'a cancelled dispatch must never go on to launch a verify'
+        )
+
+    async def test_zero_link_result_declines_without_double_releasing(
+        self, git_repo: Path, monkeypatch,
+    ):
+        """An empty ChainResult -> None, and the caller must NOT release.
+
+        A zero-link result never holds a lane (``lane is None``,
+        ``lane_warm is False`` — ChainResult "Lane ownership"), because
+        ``build_chain`` already released it on that path.  A caller that
+        released again would return a FREE lane to the pool a second time.
+        """
+        released: list = []
+        monkeypatch.setattr(
+            'orchestrator.merge_lane.worker.release_chain_build_lane',
+            lambda git_ops, lane, *, warm: released.append((lane, warm)),
+        )
+        git_ops, worker, item, _head, _cfg = await self._fixture(
+            git_repo, chain_cap=6,
+            queued=[('102', 'b.txt', 'edit-102\n'), ('103', 'c.txt', 'edit-103\n')],
+        )
+        # A first-item conflict is the realistic way to get a zero-link result.
+        assert item.merge_result.merge_commit is not None
+        built = _spy_build_chain(monkeypatch, ChainResult(
+            links=[], tip=item.merge_result.merge_commit,
+            truncated_at='102', truncated_reason='conflict',
+        ))
+        assert (await worker._deep_chain_placement(item)).chain is None
+        assert len(built) == 1, 'the gate must have BUILT — otherwise this passes vacuously'
+        assert released == [], 'an empty result holds no lane — releasing would double-free'
+
+    async def test_truncated_short_of_target_still_returns_the_chain(
+        self, git_repo: Path, monkeypatch,
+    ):
+        """A short chain is still useful, and β's decision-4 purity survives its caller.
+
+        ``104`` conflicts with ``102`` on the same line, so a 3-target build
+        truncates after 2 links.  The gate must return that ChainResult rather
+        than discard the work — and the truncated item must have NO outcome
+        rendered for it: it may conflict only with an *unlanded* predecessor,
+        and takes its normal sequential path later.
+        """
+        git_ops, worker, item, _head, _cfg = await self._fixture(
+            git_repo, chain_cap=6,
+            queued=[
+                ('102', 'shared.txt', _shared_txt_with(1, 'from-102')),
+                ('103', 'c.txt', 'edit-103\n'),
+                ('104', 'shared.txt', _shared_txt_with(1, 'from-104')),
+            ],
+        )
+        built = _spy_build_chain(monkeypatch, passthrough=True)
+        conflicts: list[str] = []
+        monkeypatch.setattr(worker, '_note_conflict_detected', conflicts.append)
+        store = _CapturingEventStore()
+        worker._event_store = store
+        queued_reqs = list(worker._intake.buffered('normal'))
+
+        res = (await worker._deep_chain_placement(item)).chain
+
+        assert built[0]['target_depth'] == 3, 'queue_len 4 -> d 4 -> 3 extra links'
+        assert res is not None, 'a short chain is useful — do not discard it'
+        assert [tid for tid, _ in res.links] == ['102', '103']
+        assert res.truncated_at == '104'
+        assert res.truncated_reason == 'conflict'
+
+        # PRD decision 4: NO outcome for the truncated item, end to end.
+        assert conflicts == []
+        assert store.events_of(EventType.merge_attempt) == []
+        assert all(not r.result.done() for r in queued_reqs)
+        assert queued_in_lane(worker) == [r.task_id for r in queued_reqs], 'queue untouched'
+        # ORDER above, IDENTITY here.  A request object silently replaced by a
+        # fresh one carrying the same task id — what this module's coalesce /
+        # duplicate-submission machinery can produce — reads identical on task
+        # ids; request_id is minted per object, so it does not.
+        assert queued_request_ids(worker) == [r.request_id for r in queued_reqs], (
+            'the same request OBJECTS, not fresh ones wearing their task ids'
+        )
+
+        await merge_liveness.release_chain_build_lane(
+            git_ops, res.lane, warm=res.lane_warm,
+        )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# step-15: RED — the dispatch REDIRECT itself.
+#
+# THE genuinely novel capability of γ. Task 2359's variable-depth probe only
+# ever RELABELLED a dispatch's depth/base attribution — its own docstring
+# calls that the "KNOWN PHASE-1 LIMITATION", because the verify still
+# exercised the dispatching item's own (shallow) tree. These tests pin the
+# thing that closes it: `_run_inflight_verify(item, lease, chain=<ChainResult>)`
+# verifies the CHAIN TIP, inside the CHAIN LANE, and neither the item's own
+# merge commit nor its own merge worktree is exercised at all.
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+# NOTE ON HOW THE WARM-SWAP BYPASS IS OBSERVED (no reach-back patch).
+#
+# The obvious spy — ``monkeypatch.setattr('orchestrator.merge_lane.worker.
+# _acquire_warm_verify_worktree', ...)`` — is a merge_queue reach-back patch,
+# frozen by test_merge_queue_reachback_patch_guard.py.  Repointing it at the
+# DEFINING module (``orchestrator.merge_lane.liveness``) would not work either:
+# ``_run_inflight_verify`` resolves the name through merge_queue's own module
+# global, so a merge_liveness patch sits off the resolution path and any
+# "was not called" assertion would pass VACUOUSLY — exactly the failure mode
+# that guard exists to prevent.
+#
+# So the bypass is observed through the warm-swap block's REAL, externally
+# visible effects instead, which is a stronger test anyway:
+#   * ``git_ops.acquire_spec_lane`` — what _acquire_warm_verify_worktree calls
+#     for a speculative item with the lane pool on (merge_liveness.py:715-731).
+#     Spied on the GitOps INSTANCE via ``_count_spec_lane_acquires``, which is
+#     not a module reach-back at all.
+#   * ``worker.verify_dispatch.verify_attempts()`` — staged and committed INSIDE that
+#     block, and the driver of the periodic cold-verify safety valve.
+
+
+_NON_ADOPTING_ARMS = [
+    pytest.param(False, None, id='tip-fail'),
+    pytest.param(True, RuntimeError('verify infra exploded'), id='chain-arm-error'),
+]
+"""The two arms that keep γ's REQUEUED recipe verbatim under δ (task 3186).
+
+``(passed, raises)``.  The error arm passes ``passed=True`` deliberately — the
+verdict it would have produced is irrelevant, because the exception preempts it;
+what the arm proves is that an infra error is not a tip verdict at all.
+"""
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)
+class TestRunInflightVerifyChainRedirect:
+    """`_run_inflight_verify(..., chain=...)` verifies the TIP, in the LANE."""
+
+    async def _fixture(
+        self, git_repo: Path, *, chain_cap: int = 6, frontier: int = 0,
+    ):
+        """Build worker + slot-2 item + a REAL 2-link chain, ready to dispatch.
+
+        Returns ``(git_ops, worker, item, chain, head, facts)``, *facts* being
+        the dispatch facts a real dispatch passes beside the chain.  *frontier*
+        seeds ``_verify_frontier_depth()`` so the ``chain_items`` arithmetic is
+        exercised with a non-zero frontier rather than only at the origin.
+        """
+        git_ops = _make_git_ops(git_repo, size=2)
+        config = _make_config(git_repo, chain_cap=chain_cap)
+        await _create_branch_editing(git_repo, 'task/101', 'a.txt', 'edit-101\n')
+        for tid, fn in (('102', 'b.txt'), ('103', 'c.txt')):
+            await _create_branch_editing(git_repo, f'task/{tid}', fn, f'edit-{tid}\n')
+        head = await _merge_commit_off_main(git_repo, 'task/101', '101')
+        worker = _make_worker(git_ops)
+        worker._intake.replace_lane('normal', [
+            _make_req(tid, tid, config, git_repo) for tid in ('102', '103')
+        ])
+        _seed_frontier(worker, frontier)
+        item = _make_item(
+            _make_req('101', '101', config, git_repo), head,
+            _ephemeral_merge_wt(git_ops, 'redirect'),
+        )
+        placement = await worker._deep_chain_placement(item)
+        chain = placement.chain
+        assert chain is not None and len(chain.links) == 2, 'fixture must build a chain'
+        return git_ops, worker, item, chain, head, _placed_facts(placement)
+
+    async def test_verifies_the_chain_tip_inside_the_chain_lane(
+        self, git_repo: Path, monkeypatch,
+    ):
+        """The redirect: ``merge_sha`` is ``chain.tip``, worktree is ``chain.lane``.
+
+        And — the half that makes it a REDIRECT rather than a relabel —
+        NEITHER the item's own merge commit NOR its own merge worktree is
+        handed to the verify.
+        """
+        git_ops, worker, item, chain, head, _facts = await self._fixture(git_repo)
+        posted = _spy_post_merge_verify(monkeypatch)
+
+        await worker.verify_dispatch.run_inflight_verify(item, _local_lease(), chain=chain)
+
+        assert len(posted) == 1
+        assert posted[0]['merge_sha'] == chain.tip
+        assert posted[0]['merge_wt'] == chain.lane
+        assert posted[0]['merge_sha'] != head == item.merge_result.merge_commit
+        assert posted[0]['merge_wt'] != item.merge_wt
+
+    async def test_warm_swap_is_bypassed_on_the_chain_arm(
+        self, git_repo: Path, monkeypatch,
+    ):
+        """The lane already holds the tip — a second acquisition would be wrong.
+
+        It would take a DIFFERENT lane, re-check-out a DIFFERENT commit, and
+        could resolve to the serial ``_merge-verify`` lane that
+        ``acquire_chain_build_lane`` explicitly refuses (DF-3071).
+
+        Observed through the block's real effects rather than a spy on the
+        function itself — see the note above ``_local_lease``.  This is a
+        LOCAL lease deliberately: ``lease.is_local`` is what selects the block,
+        so a remote lease would skip it for an unrelated reason and make the
+        assertion vacuous.
+        """
+        git_ops, worker, item, chain, _head, _facts = await self._fixture(git_repo)
+        # Installed AFTER the build, so the chain's own single acquisition is
+        # excluded and this list counts only what the VERIFY would take.
+        lanes = _count_spec_lane_acquires(git_ops, monkeypatch)
+        _spy_post_merge_verify(monkeypatch)
+        before = worker.verify_dispatch.verify_attempts()
+
+        await worker.verify_dispatch.run_inflight_verify(item, _local_lease(), chain=chain)
+
+        assert lanes == [], 'chain arm must not acquire a second verify lane'
+        assert worker.verify_dispatch.verify_attempts() == before, (
+            'the attempt counter is staged INSIDE the warm-swap block, so a '
+            'bypassed block must leave the cold-verify safety valve untouched'
+        )
+
+    async def test_chain_items_counts_the_actually_built_depth(
+        self, git_repo: Path, monkeypatch,
+    ):
+        """``chain_items == 1 + len(chain.links)`` — what actually ran.
+
+        A 6-target that only built 2 links must emit 3, never 7: the field is a
+        fact about the tree that ran, not about the target that was asked for.
+
+        The arm COMPUTES the value rather than ACCUMULATING onto the caller's
+        — which is why a deliberately wrong ``chain_items=99`` is passed here
+        and 3 is still required.  That is what makes the emitted unit
+        frontier-independent by construction, so it cannot silently regress if
+        ``VerifyDispatcher.dispatch``'s own derivation ever changes again.
+        """
+        _git_ops, worker, item, chain, _head, _facts = await self._fixture(git_repo, frontier=1)
+        posted = _spy_post_merge_verify(monkeypatch)
+
+        await worker.verify_dispatch.run_inflight_verify(
+            item, _local_lease(), chain=chain, chain_items=99,  # deliberately wrong
+        )
+
+        assert posted[0]['chain_items'] == 3 == 1 + len(chain.links)
+
+    @pytest.mark.parametrize(
+        'verdict', ['pass', 'fail', 'raise'], ids=['tip-pass', 'tip-fail', 'verify-raises'],
+    )
+    async def test_lane_is_released_exactly_once_on_every_exit(
+        self, git_repo: Path, monkeypatch, verdict: str,
+    ):
+        """Tip pass, tip fail and an exception all return the lane — once.
+
+        PRD ι conservation: the pool lane is FREE afterwards and BOTH resource
+        audits are clean.  A double release would hand a FREE lane back to the
+        pool twice; a missed one strands a `_spec-` slot for the process's life.
+        """
+        from orchestrator.warm_lane_pool import LaneState
+
+        git_ops, worker, item, chain, _head, _facts = await self._fixture(git_repo)
+        _spy_post_merge_verify(
+            monkeypatch,
+            outcome=_fail_verify_result() if verdict == 'fail' else None,
+            raises=RuntimeError('verify exploded') if verdict == 'raise' else None,
+        )
+        released = _spy_chain_lane_release(monkeypatch)
+        assert _lane_states(git_ops) == [LaneState.ASSIGNED, LaneState.FREE]
+
+        await worker.verify_dispatch.run_inflight_verify(item, _local_lease(), chain=chain)
+
+        assert released == [(chain.lane, chain.lane_warm)], 'exactly one release'
+        assert _lane_states(git_ops) == [LaneState.FREE, LaneState.FREE]
+        assert worker.worktree_ledger_violations(grace_secs=0.0) == []
+        assert worker.speculation_accounting_violations() == []
+
+    @pytest.mark.parametrize(
+        ('seeded', 'outcome', 'estimate'),
+        [
+            (False, None, 0.5 ** (1 / 2)),
+            (True, _fail_verify_result(), 0.5 ** (1 / 2)),
+            (True, MergeOutcome('blocked', reason='low disk', verify_skipped=True), 1.0),
+        ],
+        ids=['tip-pass', 'tip-fail', 'low-disk-skip'],
+    )
+    async def test_the_tip_verdict_folds_the_built_depth_exactly_once(
+        self, tmp_path: Path, git_repo: Path, monkeypatch, seeded: bool, outcome, estimate,
+    ):
+        """The policy folds a tip verdict over the BUILT chain, once.
+
+        The window starts with one lone verdict of the opposite sign, so a
+        3-item tip leaves a pass rate of 1/2 over a mean depth of 2: one item
+        folded for the chain would give 0.5, and the chain folded twice 0.8405
+        (green) or 0.6247 (red).  A verify the disk guard skipped ran nothing,
+        so it is no verdict about the code and the window keeps its one pass.
+        Read off the reason of the next dispatch of a task the chain did not
+        cover, since a red tip's members are not sized by the policy.
+        """
+        _git_ops, worker, item, chain, _head, facts = await self._fixture(git_repo)
+        _seed_window(worker, tmp_path, [seeded])
+        _spy_post_merge_verify(monkeypatch, outcome=outcome)
+
+        await worker.verify_dispatch.run_inflight_verify(
+            item, _local_lease(), chain=chain, dispatch_facts=facts,
+        )
+
+        _spy_build_chain(monkeypatch)
+        probe = _make_item(
+            _make_req('104', '104', item.request.config, git_repo), 'beef' * 10, git_repo,
+        )
+        reason = _asked((await worker._deep_chain_placement(probe)).depth_reason)
+        assert reason.basis is ChainDepthBasis.PASS_ESTIMATE
+        assert reason.pass_estimate == pytest.approx(estimate)
+
+    async def test_an_infra_error_folds_nothing_into_the_policy(
+        self, git_repo: Path, monkeypatch,
+    ):
+        """An infra error is NOT a tip verdict, and NOT the item's fault either.
+
+        Folding a RuntimeError would move the policy on infra noise — the
+        first claim.  REVIEW FIX 3 adds the other half.  The verify ran
+        against ``chain.tip`` — a CUMULATIVE tree containing this item PLUS
+        every chained successor's content — so an error raised out of it is no
+        more attributable to this item than a tip PASS is: it defers.
+        """
+        from orchestrator.merge_lane.types import InflightStatus
+        from orchestrator.warm_lane_pool import LaneState
+
+        _git_ops, worker, item, chain, _head, facts = await self._fixture(git_repo)
+        store = _CapturingEventStore()
+        worker._event_store = store
+        _spy_post_merge_verify(monkeypatch, raises=RuntimeError('verify exploded'))
+        released = _spy_chain_lane_release(monkeypatch)
+
+        res = await worker.verify_dispatch.run_inflight_verify(
+            item, _local_lease(), chain=chain, dispatch_facts=facts,
+        )
+
+        # PRESERVED: an infra error is not a tip verdict.
+        _spy_build_chain(monkeypatch)
+        probe = _make_item(
+            _make_req('104', '104', item.request.config, git_repo), 'beef' * 10, git_repo,
+        )
+        reason = _asked((await worker._deep_chain_placement(probe)).depth_reason)
+        assert reason.basis is ChainDepthBasis.NO_ESTIMATE
+        # NEW: it is not a resolution either — it is a defer.
+        assert not item.request.result.done(), (
+            'a chain-arm error must not resolve the dispatching item: the tree '
+            'that blew up was not its own'
+        )
+        assert res.status is InflightStatus.REQUEUED
+        assert res.outcome is None, 'a defer renders no MergeOutcome at all'
+        assert worker._queue.qsize() == 1
+        assert worker._queue.get_nowait() is item.request
+        # ...and therefore never feeds workflow.py's consecutive_merge_thrash
+        # ladder, the same boundary row the pass/fail arms already honour.
+        assert store.events_of(EventType.merge_attempt) == []
+        # The lane release lives in the `finally`, so this already holds —
+        # asserted so the new early return cannot regress it.
+        assert released == [(chain.lane, chain.lane_warm)], 'exactly one release'
+        assert _lane_states(_git_ops) == [LaneState.FREE, LaneState.FREE]
+        assert worker.worktree_ledger_violations(grace_secs=0.0) == []
+        assert worker.speculation_accounting_violations() == []
+
+    async def test_a_chain_arm_error_suppresses_the_next_chain_for_that_task(
+        self, git_repo: Path, monkeypatch,
+    ):
+        """THE LOOP GUARD: a requeue that rebuilt the same chain would spin.
+
+        The requeue above sends the item straight back for re-dispatch.  If the
+        next dispatch built the SAME chain and hit the SAME error, nothing would
+        ever converge — so after a chain-arm error the next placement for that
+        task declines, and the re-dispatch verifies the item's OWN subset tree,
+        which is the tree whose verdict is actually attributable to it.
+
+        Declines at ZERO cost: no ``build_chain`` call at all.
+        """
+        _git_ops, worker, item, chain, _head, _facts = await self._fixture(git_repo)
+        _spy_post_merge_verify(monkeypatch, raises=RuntimeError('verify exploded'))
+
+        await worker.verify_dispatch.run_inflight_verify(item, _local_lease(), chain=chain)
+
+        built = _spy_build_chain(monkeypatch, passthrough=True)
+        assert (await worker._deep_chain_placement(item)).chain is None
+        assert built == [], 'a suppressed task must not pay for a build at all'
+
+    async def test_a_returned_verify_does_not_clear_the_mark(
+        self, git_repo: Path, monkeypatch,
+    ):
+        """The mark outlives the un-chained verify's return (task 10723).
+
+        A returned result is not yet applied: the head-failure cascade can
+        still void it and re-dispatch the request, which must then verify
+        un-chained again.  The mark clears only when the task's verdict is
+        applied, which test_merge_queue_deep_unchained_mark.py drives through
+        a live lane.
+        """
+        _git_ops, worker, item, chain, _head, _facts = await self._fixture(git_repo)
+        _spy_post_merge_verify(monkeypatch, raises=RuntimeError('verify exploded'))
+        await worker.verify_dispatch.run_inflight_verify(item, _local_lease(), chain=chain)
+
+        posted = _spy_post_merge_verify(monkeypatch, outcome=None)
+        res = await worker.verify_dispatch.run_inflight_verify(item, _local_lease())
+        assert len(posted) == 1, 'the ordinary arm ran'
+        if res.merge_wt is not None:
+            await worker._release_or_cleanup(res.merge_wt, spec_warm=res.spec_warm)
+
+        built = _spy_build_chain(monkeypatch, passthrough=True)
+        assert (await worker._deep_chain_placement(item)).chain is None
+        assert built == [], 'a returned verify is no applied verdict'
+
+    async def test_the_ping_pong_terminates_after_exactly_one_deferred_round(
+        self, git_repo: Path, monkeypatch,
+    ):
+        """An unbounded defer is its own wedge — drive the whole walk for real.
+
+        The earlier shape of this test SEEDED the accumulated state
+        (``_chain_verify_errors = {task: 1}`` plus a monkeypatched
+        ``MAX_CHAIN_VERIFY_ERRORS``) and asserted only that the cap branch ran
+        given a pre-set counter.  That proved nothing about whether the system
+        could ever REACH the cap — and it could not: suppression forces the
+        very next dispatch to ``chain is None``, so the count could never
+        exceed 1 and the cap branch was unreachable dead code.  The counter and
+        its cap are gone; the honest contract is one-shot suppression whose
+        backstop is the pre-existing blocked resolution.
+
+        So drive it organically instead — two consecutive raising verifies,
+        no seeding, no monkeypatched constants — and assert the whole walk:
+        round 1 defers and suppresses, round 2 is un-chained and TERMINATES.
+        """
+        from orchestrator.merge_lane.types import InflightStatus
+
+        _git_ops, worker, item, chain, _head, _facts = await self._fixture(git_repo)
+
+        # ── ROUND 1: chained, raises → defer + suppress (no resolution). ──
+        _spy_post_merge_verify(monkeypatch, raises=RuntimeError('boom 1'))
+        first = await worker.verify_dispatch.run_inflight_verify(item, _local_lease(), chain=chain)
+
+        assert first.status is InflightStatus.REQUEUED
+        assert not item.request.result.done()
+        assert worker._queue.get_nowait() is item.request
+
+        # ── The re-dispatch DECLINES to chain, at zero build cost. ──
+        built = _spy_build_chain(monkeypatch, passthrough=True)
+        assert (await worker._deep_chain_placement(item)).chain is None
+        assert built == [], 'a suppressed task pays for no build'
+
+        # ── ROUND 2: un-chained, raises too → today's terminal resolution. ──
+        _spy_post_merge_verify(monkeypatch, raises=RuntimeError('boom 2'))
+        second = await worker.verify_dispatch.run_inflight_verify(item, _local_lease())
+
+        assert item.request.result.done(), (
+            'the un-chained round is the backstop: its verify ran against the '
+            "item's OWN tree, so its error IS attributable and must resolve"
+        )
+        outcome = item.request.result.result()
+        assert outcome.status == 'blocked'
+        assert outcome.reason.startswith('Verification error:')
+        assert second.status is not InflightStatus.REQUEUED
+        assert second.outcome is outcome
+        assert worker._queue.qsize() == 0, 'the terminal round does not requeue'
+        # The mark this walk leaves clears when that blocked verdict is
+        # applied (task 10723), which this direct drive stops short of:
+        # test_merge_queue_deep_unchained_mark.py::TestBAChainArmErrorStillTerminates
+        # drives the same walk through a live lane to the resubmission that
+        # chains again.
+
+    async def test_a_red_tip_holds_every_member_off_chains_until_its_verdict_is_applied(
+        self, git_repo: Path, monkeypatch,
+    ):
+        """A red tip names no culprit, so no member chains again before its verdict is applied.
+
+        Before task 10617 only the owner was held back: the links stayed at
+        the front of the buffer and the next dispatch chained them again, so
+        one bad request could redden chain after chain without ever being
+        verified on its own.  Walked here member by member:
+
+          * after the red tip, neither the owner's nor any link's next dispatch
+            builds a chain, and no member is offered as a link;
+          * the head-failure cascade cancels a member's own verify before it
+            renders anything, so that member stays off every chain;
+          * a member whose own verify RETURNS stays off too (task 10723): the
+            cascade can still void that result, and only an applied verdict
+            clears the mark (test_merge_queue_deep_unchained_mark.py);
+          * and a request whose outcome is decided is never chained, though
+            ``merge_cancel`` leaves it buffered until the merger pops it.
+
+        The members' own dispatches use fresh requests for the same tasks: the
+        rule is per task, and the buffered requests stay where they are.
+        """
+        git_ops, worker, item, chain, head, _facts = await self._fixture(git_repo)
+        config = item.request.config
+        _spy_post_merge_verify(monkeypatch, outcome=_fail_verify_result())
+        await worker.verify_dispatch.run_inflight_verify(item, _local_lease(), chain=chain)
+
+        built = _spy_build_chain(monkeypatch, passthrough=True)
+        cancelled_tid, verified_tid = (tid for tid, _mc in chain.links)
+        members = {
+            tid: _make_item(
+                _make_req(tid, tid, config, git_repo), head,
+                _ephemeral_merge_wt(git_ops, f'alone-{tid}'),
+            )
+            for tid in (cancelled_tid, verified_tid)
+        }
+        for member in (item, *members.values()):
+            assert await worker._deep_chain_placement(member) == NO_DEEP_PLACEMENT
+        assert built == [], 'a member of the red chain pays for no build'
+        assert worker.chain_snapshot() == (), 'and none is offered as a link'
+
+        started = asyncio.Event()
+
+        async def _verify_until_cancelled(*_args, **_kwargs):
+            started.set()
+            await asyncio.Event().wait()
+
+        monkeypatch.setattr(
+            'orchestrator.merge_lane.verify_dispatch.run_post_merge_verify', _verify_until_cancelled,
+        )
+        in_flight = asyncio.ensure_future(
+            worker.verify_dispatch.run_inflight_verify(members[cancelled_tid], _local_lease()),
+        )
+        await started.wait()
+        in_flight.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await in_flight
+        assert worker.chain_snapshot() == (), 'a cancelled verify is no verdict'
+
+        _spy_post_merge_verify(monkeypatch, outcome=None)
+        await worker.verify_dispatch.run_inflight_verify(members[verified_tid], _local_lease())
+        assert worker.chain_snapshot() == (), 'a returned verify is no applied verdict'
+
+        unmarked = _make_req('104', '104', config, git_repo, lane='high')
+        worker._intake.replace_lane('high', [unmarked])
+        assert worker.chain_snapshot() == (unmarked,)
+        unmarked.result.cancel()
+        assert worker.chain_snapshot() == (), 'a decided request is never chained'
+
+    async def test_a_marked_members_solo_verdict_does_not_feed_the_pass_estimate(
+        self, git_repo: Path, monkeypatch,
+    ):
+        """The policy did not size a marked member's verify, so its verdict
+        stays out of the window, as its ``merge_verify`` row stays out of the
+        start-up seed (test_merge_lane_chain_policy.py)."""
+        _git_ops, worker, item, chain, _head, facts = await self._fixture(git_repo)
+        _spy_post_merge_verify(monkeypatch, outcome=_fail_verify_result())
+        await worker.verify_dispatch.run_inflight_verify(
+            item, _local_lease(), chain=chain, dispatch_facts=facts,
+        )
+
+        placement = await worker._deep_chain_placement(item)
+        assert placement == NO_DEEP_PLACEMENT
+        _spy_post_merge_verify(monkeypatch, outcome=None)
+        res = await worker.verify_dispatch.run_inflight_verify(
+            item, _local_lease(), dispatch_facts=_placed_facts(placement),
+        )
+        if res.merge_wt is not None:
+            await worker._release_or_cleanup(res.merge_wt, spec_warm=res.spec_warm)
+
+        probe = _make_item(
+            _make_req('104', '104', item.request.config, git_repo), 'beef' * 10, git_repo,
+        )
+        reason = _asked((await worker._deep_chain_placement(probe)).depth_reason)
+        assert reason.pass_estimate == 0.0, 'the red 3-chain alone, not the solo pass'
+
+    async def test_lane_is_released_exactly_once_on_a_dispose_exit(
+        self, git_repo: Path, monkeypatch,
+    ):
+        """The DROPPED abort disposes FIRST — the ``finally``'s latch absorbs the rest.
+
+        The parametrized release test above covers only the three exits that
+        run the verify to completion (pass / fail / raise).  This is the OTHER
+        shape, and the one the latch actually exists for: the abort branches
+        call ``_dispose_verify_worktree()``, which on the chain arm ALREADY
+        routes the lane back through ``release_chain_build_lane`` — so the
+        ``finally``'s unconditional release is a SECOND call on an
+        already-FREE lane.  Exactly one must reach the pool; a second real
+        release would hand a free lane back twice.
+        """
+        from orchestrator.merge_lane.types import InflightStatus
+        from orchestrator.warm_lane_pool import LaneState
+
+        git_ops, worker, item, chain, _head, _facts = await self._fixture(git_repo)
+        released = _spy_chain_lane_release(monkeypatch)
+        monkeypatch.setattr(type(worker.verify_dispatch), 'VERIFY_ABANDON_POLL_SECS', 0.01)
+
+        async def _slow_verify(_git_ops, _req, _merge_wt, **_kw):
+            await asyncio.sleep(30)
+
+        monkeypatch.setattr(
+            'orchestrator.merge_lane.verify_dispatch.run_post_merge_verify', _slow_verify,
+        )
+        # The sole waiter gives up: this is what _request_abandoned reads.
+        item.request.result.cancel()
+
+        res = await worker.verify_dispatch.run_inflight_verify(item, _local_lease(), chain=chain)
+
+        assert res.status is InflightStatus.DROPPED
+        assert len(released) == 1, (
+            'the dispose released it; the finally must be a latched no-op'
+        )
+        assert released[0] == (chain.lane, chain.lane_warm)
+        assert _lane_states(git_ops) == [LaneState.FREE, LaneState.FREE]
+        assert worker.worktree_ledger_violations(grace_secs=0.0) == []
+        assert worker.speculation_accounting_violations() == []
+
+    async def test_the_unchained_set_starts_empty_on_a_fresh_worker(
+        self, git_repo: Path,
+    ):
+        """The state exists and is empty at construction (no stale mark)."""
+        git_ops = _make_git_ops(git_repo, size=2)
+        worker = _make_worker(git_ops)
+
+        assert worker._next_dispatch_unchained == set()
+
+    async def test_chain_none_with_a_raising_verify_is_byte_identical_to_today(
+        self, git_repo: Path, monkeypatch,
+    ):
+        """NEGATIVE CONTROL — the always-on fence.
+
+        The head path and the shipped ``chain_cap=0`` default must not observe
+        REVIEW FIX 3 at all: a raising verify with no chain still resolves the
+        request terminally as ``blocked``, exactly as before γ.  Pairs with
+        ``test_chain_none_is_byte_identical_to_todays_path`` on the pass path.
+        """
+        from orchestrator.merge_lane.types import InflightStatus
+
+        git_ops, worker, item, chain, _head, _facts = await self._fixture(git_repo)
+        await merge_liveness.release_chain_build_lane(
+            git_ops, chain.lane, warm=chain.lane_warm,
+        )
+        _spy_post_merge_verify(monkeypatch, raises=RuntimeError('verify exploded'))
+
+        res = await worker.verify_dispatch.run_inflight_verify(item, _local_lease())
+
+        assert item.request.result.done(), 'no chain: the ordinary terminal path'
+        outcome = item.request.result.result()
+        assert outcome.status == 'blocked'
+        assert outcome.reason.startswith('Verification error:')
+        assert res.outcome is outcome
+        assert res.status is not InflightStatus.REQUEUED
+        assert worker._queue.qsize() == 0, 'no requeue on the ordinary arm'
+        assert worker._next_dispatch_unchained == set(), (
+            'the ordinary arm must not leave an un-chained mark behind — and '
+            'this terminal exit clears one even if some earlier round set it'
+        )
+
+    async def _ephemeral_scene(self, git_repo: Path, monkeypatch, **verify_kw):
+        """Drive the chain arm with a REGISTERED ephemeral worktree.
+
+        Returns ``(worker, ephemeral, cleaned, res)`` where *cleaned* records
+        the ``cleanup_merge_worktree`` calls this method made.
+        """
+        git_ops, worker, item, chain, _head, _facts = await self._fixture(git_repo)
+        ephemeral = _ephemeral_merge_wt(git_ops, 'deadbeef')
+        item.merge_wt = ephemeral
+        worker._register_owned_merge_worktree(ephemeral)
+        _spy_post_merge_verify(monkeypatch, **verify_kw)
+        cleaned: list[Path] = []
+        monkeypatch.setattr(
+            git_ops, 'cleanup_merge_worktree',
+            lambda wt: cleaned.append(wt) or asyncio.sleep(0),
+        )
+
+        res = await worker.verify_dispatch.run_inflight_verify(item, _local_lease(), chain=chain)
+        return worker, ephemeral, cleaned, res
+
+    @pytest.mark.parametrize(('passed', 'raises'), _NON_ADOPTING_ARMS)
+    async def test_item_ephemeral_worktree_is_disposed_not_stranded(
+        self, git_repo: Path, monkeypatch, passed: bool, raises,
+    ):
+        """The item's own merge worktree is unused on these arms — clean it.
+
+        The verify runs in the chain lane, so the ephemeral ``_merge-<uuid>``
+        the item was merged in is dead weight on every exit that re-queues.
+        Leaving it registered pins its mtime forever via the heartbeat; leaving
+        it on disk UNregistered trips the I6 worktree-ledger audit once it ages
+        past the grace window.
+
+        Parametrized by δ (task 3186), which moved this drop out of the top of
+        the try and into the ``finally``, and carved the ADOPTING tip-pass exit
+        out of it — see the sibling test directly below.
+        """
+        worker, ephemeral, cleaned, _res = await self._ephemeral_scene(
+            git_repo, monkeypatch,
+            outcome=None if passed else _fail_verify_result(), raises=raises,
+        )
+
+        assert not _owns_merge_worktree(worker, ephemeral)
+        assert cleaned == [ephemeral]
+
+    async def test_adopting_tip_pass_hands_the_ephemeral_worktree_onward(
+        self, git_repo: Path, monkeypatch,
+    ):
+        """δ (task 3186): a green tip keeps the worktree ALIVE for the walk.
+
+        ``_finalize_inflight``'s PASS arm asserts a non-None ``merge_wt`` and
+        threads it into ``advance_main``, then disposes of it through
+        ``_release_or_cleanup`` — the same handoff the ``chain=None`` path
+        already makes.  So on the one exit that LANDS, this method must not
+        drop the tree, and must not hand back ``chain.lane`` in its place (that
+        lane is already back in the pool; merge_types.py:1458-1464).
+        """
+        worker, ephemeral, cleaned, res = await self._ephemeral_scene(
+            git_repo, monkeypatch, outcome=None,
+        )
+
+        assert cleaned == [], 'the adopting exit hands the tree to the finalize half'
+        assert _owns_merge_worktree(worker, ephemeral), (
+            'still REGISTERED, so the heartbeat keeps it alive and the I6 '
+            'ledger stays consistent until the finalize half disposes of it'
+        )
+        assert res.merge_wt == ephemeral
+        assert res.spec_warm is False, 'an ephemeral worktree is not a warm lane'
+
+    async def test_chain_none_is_byte_identical_to_todays_path(
+        self, git_repo: Path, monkeypatch,
+    ):
+        """Every existing caller (``chain=None``) is untouched.
+
+        The REAL warm-swap runs (no stub), the item's OWN merge commit is what
+        gets verified, ``chain_items`` is the default 1, nothing is released as
+        a chain lane, and ``merge_wt`` is still handed back to
+        ``_finalize_inflight`` for disposal at its chokepoint.
+        """
+        git_ops, worker, item, chain, head, _facts = await self._fixture(git_repo)
+        await merge_liveness.release_chain_build_lane(
+            git_ops, chain.lane, warm=chain.lane_warm,
+        )
+        lanes = _count_spec_lane_acquires(git_ops, monkeypatch)
+        posted = _spy_post_merge_verify(monkeypatch)
+        released = _spy_chain_lane_release(monkeypatch)
+        before = worker.verify_dispatch.verify_attempts()
+
+        res = await worker.verify_dispatch.run_inflight_verify(item, _local_lease())
+
+        assert lanes == [item.merge_result.merge_commit], (
+            'the ordinary path still routes a speculative LOCAL verify through '
+            'the warm-swap block into a _spec- lane'
+        )
+        assert worker.verify_dispatch.verify_attempts() == before + 1
+        assert posted[0]['merge_sha'] == head == item.merge_result.merge_commit
+        assert posted[0]['chain_items'] == 1, 'default: a one-item tree'
+        assert released == [], 'no chain, nothing to release'
+        assert res.merge_wt is not None and res.spec_warm is True, (
+            'the ordinary pass path still hands the verified worktree (and its '
+            'warmth) to _finalize_inflight rather than disposing of it here'
+        )
+        await worker._release_or_cleanup(res.merge_wt, spec_warm=res.spec_warm)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# step-17: RED — the NON-ADOPTION invariant, NARROWED by δ (task 3186).
+#
+# THE rule this whole task is fenced by: a tip verdict proves the CUMULATIVE
+# tree, never the dispatching item's own SUBSET tree.
+#
+# The rule is SYMMETRIC, and γ enforced BOTH halves by requeuing on both arms.
+# δ licenses exactly ONE of them: the tip's tree is a verified SUPERSET of
+# every prefix member, so a GREEN tip does license landing the whole prefix —
+# and δ's in-order CAS walk over `chain.links` is where that happens
+# (test_merge_queue_deep_landing.py).  Nothing else moved.  A tip FAIL still
+# proves only that the cumulative tree is red, never WHICH member broke it, and
+# a chain-arm EXCEPTION proves nothing about anyone at all — so those two arms
+# keep γ's recipe verbatim and are what this class now pins
+# (merge_queue.py:18623 states the asymmetry in as many words).
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)
+class TestDeepTipVerifyNeverAdopts:
+    """The two arms that STAY non-adopting under δ: tip fail, and tip error.
+
+    Narrowed by δ (task 3186), which took over the PASS arm — see the banner
+    above.  ``ARM`` below is the parametrize vocabulary these tests share.
+    """
+
+    async def _fixture(
+        self, git_repo: Path, monkeypatch, *, passed: bool, raises=None,
+    ):
+        """Drive one deep tip verify to *passed* (or *raises*) and return the scene.
+
+        Returns ``(git_ops, worker, item, chain, res, store, queued_reqs)``.
+        ``advance_main`` is spied (not stubbed to fail) so a violation shows up
+        as a recorded call rather than as an unrelated exception.  Note this is
+        still meaningful on the PASS arm under δ: δ's walk lives in the
+        FINALIZE half, so ``_run_inflight_verify`` alone must still reach no
+        CAS advance on any arm.
+        """
+        git_ops = _make_git_ops(git_repo, size=2)
+        config = _make_config(git_repo, chain_cap=6)
+        await _create_branch_editing(git_repo, 'task/101', 'a.txt', 'edit-101\n')
+        for tid, fn in (('102', 'b.txt'), ('103', 'c.txt')):
+            await _create_branch_editing(git_repo, f'task/{tid}', fn, f'edit-{tid}\n')
+        head = await _merge_commit_off_main(git_repo, 'task/101', '101')
+        worker = _make_worker(git_ops)
+        queued_reqs = [_make_req(tid, tid, config, git_repo) for tid in ('102', '103')]
+        worker._intake.replace_lane('normal', queued_reqs)
+        store = _CapturingEventStore()
+        worker._event_store = store
+        item = _make_item(
+            _make_req('101', '101', config, git_repo), head,
+            _ephemeral_merge_wt(git_ops, 'nonadopt'),
+        )
+        placement = await worker._deep_chain_placement(item)
+        chain = placement.chain
+        assert chain is not None and len(chain.links) == 2
+
+        advances: list = []
+        monkeypatch.setattr(
+            git_ops, 'advance_main',
+            lambda *a, **k: advances.append((a, k)) or asyncio.sleep(0),
+        )
+        _spy_post_merge_verify(
+            monkeypatch, outcome=None if passed else _fail_verify_result(),
+            raises=raises,
+        )
+        main_before = await _rev_parse(git_repo, 'main')
+
+        res = await worker.verify_dispatch.run_inflight_verify(
+            item, _local_lease(), chain=chain, dispatch_facts=_placed_facts(placement),
+        )
+
+        assert advances == [], 'a tip verdict must never reach advance_main'
+        assert await _rev_parse(git_repo, 'main') == main_before
+        return git_ops, worker, item, chain, res, store, queued_reqs
+
+    @pytest.mark.parametrize(('passed', 'raises'), _NON_ADOPTING_ARMS)
+    async def test_requeues_instead_of_resolving_on_the_non_adopting_arms(
+        self, git_repo: Path, monkeypatch, passed: bool, raises,
+    ):
+        """REQUEUED sentinel + the request genuinely back on ``_queue``.
+
+        A requeue is a DEFER, not a resolution: the Future stays PENDING and
+        the waiter receives the outcome of the RE-dispatch.  The three effects
+        must all fire, which is why this goes through ``_requeue_request`` (the
+        chokepoint enforced by
+        test_merge_queue_lifecycle_registry.py::TestRequeueRecipeHasASingleChokepoint)
+        rather than a bare ``_queue.put_nowait``.
+
+        δ (task 3186) took the PASS arm — see
+        test_merge_queue_deep_landing.py::TestTipPassAdoptionSignal for the
+        adopting exit's own contract.
+
+        A red tip names no culprit among its links either, so it withholds
+        every link from the next chain (task 10617); an infra error says
+        nothing about the links and leaves them chainable.
+        """
+        from orchestrator.merge_lane.types import InflightStatus
+
+        _git_ops, worker, item, _chain, res, _store, queued = await self._fixture(
+            git_repo, monkeypatch, passed=passed, raises=raises,
+        )
+
+        assert res.status == InflightStatus.REQUEUED
+        assert res.outcome is None, 'a defer renders no MergeOutcome at all'
+        assert res.merge_wt is None, 'the chain arm disposes its own worktrees'
+        assert not item.request.result.done(), 'a requeue is a defer, not a resolution'
+        assert queued_request_ids(worker) == [
+            *(r.request_id for r in queued), item.request.request_id,
+        ], 'the very request, requeued once, behind the still-buffered links'
+        still_chainable = () if raises is None else tuple(queued)
+        assert worker.chain_snapshot() == still_chainable
+
+    @pytest.mark.parametrize(('passed', 'raises'), _NON_ADOPTING_ARMS)
+    async def test_emits_no_merge_attempt_and_no_blocked_outcome(
+        self, git_repo: Path, monkeypatch, passed: bool, raises,
+    ):
+        """Deep fails never feed workflow.py's ``consecutive_merge_thrash`` ladder.
+
+        That ladder means "the SAME mechanical merge failure repeated", and it
+        is fed by `merge_attempt` events and blocked `MergeOutcome`s.  A deep
+        tip fail is neither — it is a defer — so two consecutive ones must
+        leave the ladder's inputs completely untouched.  This is the same
+        false-positive-escalation class ``build_chain``'s own decision-4
+        purity comment guards against upstream.
+        """
+        _git_ops, _worker, item, _chain, res, store, _q = await self._fixture(
+            git_repo, monkeypatch, passed=passed, raises=raises,
+        )
+
+        assert store.events_of(EventType.merge_attempt) == []
+        assert res.outcome is None
+        assert not item.request.result.done()
+
+    async def test_tip_fail_marks_the_members_and_leaves_the_queue_intact(
+        self, git_repo: Path, monkeypatch,
+    ):
+        """PRD boundary row "Tip fail leaves queue intact": zero landings.
+
+        The chained items were merged only inside the scratch lane, so after a
+        red tip they are still buffered, in the same order, with no outcome and
+        no conflict rendered for any of them — build_chain's decision-4 purity
+        surviving all the way through its first real caller.
+        """
+        _git_ops, worker, item, _chain, _res, store, queued = await self._fixture(
+            git_repo, monkeypatch, passed=False,
+        )
+
+        # snapshot() reports the lane buffer AND the undrained outer queue, both
+        # `queued`, so the red tip this arm REQUEUED is visible at the tail — a
+        # fact the lane buffer alone could not report. The chained members are
+        # still there, still in order, ahead of it.
+        assert queued_in_lane(worker) == [*(r.task_id for r in queued), '101'], (
+            'same items, same order, with the requeued tip behind them'
+        )
+        # ORDER above, IDENTITY here: request_id is minted per ``MergeRequest``
+        # object, so this also says the tip at the tail is the very request
+        # that was requeued rather than a fresh one for task 101.
+        assert queued_request_ids(worker) == [
+            *(r.request_id for r in queued), item.request.request_id,
+        ], 'the same request OBJECTS, not fresh ones wearing their task ids'
+        assert all(not r.result.done() for r in queued)
+        assert store.events_of(EventType.merge_attempt) == []
+        assert worker.chain_snapshot() == (), (
+            'every link of the red chain verifies un-chained before it may be '
+            'chained again, so none is offered as a link'
+        )
+        assert await worker._deep_chain_placement(item) == NO_DEEP_PLACEMENT, (
+            'and neither does the owner chain again'
+        )
+
+    async def test_tip_pass_feeds_the_window_a_pass_and_leaves_its_owner_unmarked(
+        self, git_repo: Path, monkeypatch,
+    ):
+        """A green tip feeds the window a pass, and the policy still sizes its
+        owner's next dispatch.
+
+        Kept on the PASS arm after δ narrowed this class, because it is a claim
+        about the POLICY FEED, not about adoption: the fixture's own
+        ``advances == []`` assertion still holds — ``_run_inflight_verify``
+        reaches no CAS advance on any arm, δ included.
+        """
+        _git_ops, worker, item, _chain, res, _store, queued = await self._fixture(
+            git_repo, monkeypatch, passed=True,
+        )
+
+        assert res.status is None, 'the adopting pass'
+        assert queued_in_lane(worker) == [r.task_id for r in queued]
+        assert queued_request_ids(worker) == [r.request_id for r in queued], (
+            'the same request OBJECTS, not fresh ones wearing their task ids'
+        )
+        _spy_build_chain(monkeypatch)
+        reason = _asked((await worker._deep_chain_placement(item)).depth_reason)
+        assert reason.pass_estimate == 1.0
+
+    @pytest.mark.parametrize(('passed', 'raises'), _NON_ADOPTING_ARMS)
+    async def test_finalize_disposes_the_entry_without_a_phantom_head(
+        self, git_repo: Path, monkeypatch, passed: bool, raises,
+    ):
+        """``_finalize_inflight`` returns False and strands no finalize head.
+
+        The REQUEUED sentinel is checked ABOVE the VERIFYING -> FINALIZING hop
+        precisely so a requeued item is never recorded as finalizing; a
+        phantom head there wedges the whole queue behind an entry that will
+        never complete.
+        """
+        from orchestrator.merge_lane.types import InflightEntry
+
+        _git_ops, worker, item, chain, res, _store, _q = await self._fixture(
+            git_repo, monkeypatch, passed=passed, raises=raises,
+        )
+        done: asyncio.Future = asyncio.get_running_loop().create_future()
+        done.set_result(res)
+        entry = InflightEntry(
+            item=item, lease=_local_lease(), verify_task=done,  # type: ignore[arg-type]
+            merge_wt=item.merge_wt, was_speculative=True, chain=chain,
+        )
+
+        assert await worker._finalize_inflight(entry) is False
+        assert worker._finalizing_head_entry() is None
+        assert not item.request.result.done()
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# step-19: RED — the task's USER-OBSERVABLE SIGNAL, as one integration class.
+#
+# Everything above pins a seam in isolation. This class is the only place the
+# seams are driven the way production drives them — `VerifyDispatcher.dispatch` →
+# `_deep_chain_placement` → `_run_inflight_verify` → the chain policy → the
+# NEXT round's `_deep_chain_placement` — because γ's whole thesis is a
+# multi-ROUND property: a tip verdict changes what the next dispatch builds.
+# A per-seam unit test can never see that, and the capability sidecar's
+# "manual/integration signal" for `deep-tip-dispatch-and-halving-state-machine`
+# is exactly this.
+#
+# Four properties, one per PRD row:
+#   (a) no member of a red chain is chained again; others chain at table depth
+#   (b) a marked member's un-chained round is byte-identical to a `chain_cap=0` dispatch
+#   (c) EVERY merge_verify carries an int `chain_items >= 1` (η1's reader)
+#   (d) conservation: no permit, worktree or `_spec-` lane left behind
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+_DEEP_QUEUE = ('102', '103', '104', '105', '106')
+"""Five chainable followers → ``queue_len`` 6, so ``cap=6`` binds, not the queue.
+
+Deliberately >= cap: with a shorter queue ``min(queue_len, cap)`` would be the
+QUEUE's length and the walk assertions below would be pinning the fixture
+rather than the policy.
+"""
+
+
+async def _fresh_repo(tmp_path: Path, name: str) -> Path:
+    """Build a second independent fixture repo beside ``git_repo``'s.
+
+    The un-chained byte-identity test needs two runs of the SAME fixture at
+    different ``chain_cap`` values, and a single repo cannot host both (the
+    branch names collide and the first run's worktree pool is already warm).
+    """
+    repo = tmp_path / name
+    repo.mkdir()
+    await _setup_repo(repo)
+    await _add_recording_seed_to_repo(repo)
+    return repo
+
+
+class _DeepScene:
+    """One repo + worker + queue, driven round after round by :meth:`round_`."""
+
+    def __init__(self, git_ops, config, worker, item_head, repo, store) -> None:
+        self.git_ops = git_ops
+        self.config = config
+        self.worker = worker
+        self.head = item_head
+        self.repo = repo
+        self.store = store
+        self.calls: list[dict] = []
+        self.posted: list[dict] = []
+        self.built: list[dict] = []
+        self.released: list[tuple] = []
+        self.lanes: list[str] = []
+        self._round_no = 0
+    @property
+    def depths(self) -> list[int | None]:
+        """The depth ACTUALLY dispatched each round, ``None`` for "no chain".
+
+        Read off the ``ChainResult`` handed to ``_run_inflight_verify`` — the
+        one place the built depth is a fact rather than an intention, since
+        ``build_chain`` truncates.
+        """
+        return [
+            None if c['chain'] is None else 1 + len(c['chain'].links)
+            for c in self.calls
+        ]
+
+    async def round_(
+        self, *, tag: str, cohort: int = 0, speculative: bool = True,
+    ) -> dict:
+        """Drive ONE full dispatch round through ``VerifyDispatcher.dispatch``.
+
+        *cohort* picks the dispatching owner, task ``{cohort+1}01`` (see
+        :func:`_cohort_task_ids`).  *speculative* picks its slot, as for
+        :func:`_make_item`: the default is the slot-2 item, and
+        ``speculative=False`` the head, based on REAL main, since a stale
+        base would fire ``VerifyDispatcher.dispatch``'s staleness re-merge and leave no
+        later round chaining.  Returns the recorded ``_run_inflight_verify``
+        kwargs for the round (plus ``'result'``), after :meth:`release_round`.
+        """
+        self._round_no += 1
+        owner = _cohort_task_ids(cohort)[0]
+        req = _make_req(owner, owner, self.config, self.repo)
+        merge_wt = _ephemeral_merge_wt(self.git_ops, f'{tag}-r{self._round_no}')
+        item = (
+            _make_item(req, self.head, merge_wt) if speculative
+            else _make_item(
+                req, self.head, merge_wt,
+                speculative=False, base_sha=await _rev_parse(self.repo, 'main'),
+            )
+        )
+        entry = await self.worker.verify_dispatch.dispatch(item)
+        assert entry is not None, 'dispatch must not decline: a host is free'
+        assert entry.verify_task is not None
+        await entry.verify_task
+
+        rec = self.calls[-1]
+        rec['item'] = item
+        rec['round'] = self._round_no
+        await self.release_round(entry)
+        return rec
+
+    async def release_round(self, entry) -> None:
+        """Hand back what the round that just verified *entry* holds.
+
+        The host lease, the chain reservation a passing tip keeps for finalize
+        (task 7720), and any worktree the ordinary (non-chain) arm hands to
+        ``_finalize_inflight``.  The scene stops short of finalize (γ lands
+        nothing), so the next round starts from the same resource state —
+        which is what makes the ROUND SEQUENCE, and not a slowly-leaking
+        fixture, the thing under test.
+        """
+        worker = self.worker
+        if entry.lease is not None:
+            await worker._host_allocator.release(entry.lease)
+        worker._chain_reservations.release(entry.item.request.request_id)
+        vr = self.calls[-1]['result']
+        if vr.merge_wt is not None:
+            await worker._release_or_cleanup(vr.merge_wt, spec_warm=vr.spec_warm)
+
+
+def _cohort_task_ids(cohort: int) -> tuple[str, ...]:
+    """Cohort *cohort*'s owner, then its five followers: ``{cohort+1}01..06``.
+
+    Cohort 0 is task 101 over ``_DEEP_QUEUE``.  A red tip sends its owner and
+    every link to an un-chained verify first, so a walk that must chain again
+    after one dispatches a fresh cohort, whose members no red chain touched.
+    """
+    return tuple(f'{cohort + 1}{n:02d}' for n in range(1, 7))
+
+
+async def _make_deep_scene(
+    repo: Path, *, chain_cap: int, script: list[bool] | None, monkeypatch,
+    allocator=None, frontier: int = 0, cohorts: int = 1,
+) -> _DeepScene:
+    """Build a scene whose verify oracle returns *script* verdicts in order.
+
+    *cohorts* buffers the followers of that many cohorts, in cohort order
+    (:func:`_cohort_task_ids`).
+
+    *script* is one bool per round (``True`` == the verify passed), or ``None``
+    to install no oracle at all and let the REAL ``run_post_merge_verify``
+    run — which is what drives the true ``merge_verify`` emission site.  When
+    *allocator* is given it is installed on the worker BEFORE first use, so
+    ``_ensure_host_allocator``'s cache check (merge_queue.py:10288) short-
+    circuits and the real one is never built.
+
+    *frontier* seeds ``_verify_frontier_depth()`` — a pure ``len()`` over
+    ``_frozen_inflight_entries()`` — with that many opaque sentinels, using the
+    idiom already at test_merge_queue_depth_telemetry.py:477-482
+    (``_worker_with_frontier`` + ``_sentinel_entry``) and at this module's
+    ``TestRunInflightVerifyChainRedirect._fixture``.  It has to be STUBBED
+    rather than driven: ``VerifyDispatcher.dispatch`` never appends to ``_inflight`` (the
+    only ``self._inflight.append`` is ``_inflight_append``, merge_queue.py:15693,
+    which only the MERGER loop calls), so a scene driven purely through
+    ``VerifyDispatcher.dispatch`` has a structurally empty frontier and every
+    ``frontier + 1`` arithmetic is observationally identical to a flat ``1``.
+    """
+    git_ops = _make_git_ops(repo, size=2)
+    config = _make_config(repo, chain_cap=chain_cap)
+    await _create_branch_editing(repo, 'task/101', 'a.txt', 'edit-101\n')
+    for tid in (*_DEEP_QUEUE, *(t for c in range(1, cohorts) for t in _cohort_task_ids(c))):
+        await _create_branch_editing(repo, f'task/{tid}', f'f{tid}.txt', f'edit-{tid}\n')
+    head = await _merge_commit_off_main(repo, 'task/101', '101')
+    store = _CapturingEventStore()
+    worker = _make_worker(git_ops)
+    worker._event_store = store
+    worker._intake.replace_lane('normal', [
+        _make_req(tid, tid, config, repo)
+        for c in range(cohorts) for tid in _cohort_task_ids(c)[1:]
+    ])
+    if allocator is not None:
+        worker._host_allocator = allocator
+    if frontier:
+        _seed_frontier(worker, frontier)
+    scene = _DeepScene(git_ops, config, worker, head, repo, store)
+
+    # ── the round recorder, installed ONCE ───────────────────────────────────
+    # Once, not per round: re-wrapping `worker.verify_dispatch.run_inflight_verify` each round
+    # would capture the PREVIOUS round's recorder as `real` and nest the
+    # wrappers one deeper every round.
+    real_verify = worker.verify_dispatch.run_inflight_verify
+
+    async def _recording(_item, _lease, **kwargs):
+        rec = dict(kwargs)
+        rec['lease_is_local'] = _lease.is_local
+        scene.calls.append(rec)
+        rec['result'] = await real_verify(_item, _lease, **kwargs)
+        return rec['result']
+
+    monkeypatch.setattr(worker.verify_dispatch, 'run_inflight_verify', _recording)
+    scene.built = _spy_build_chain(monkeypatch, passthrough=True)
+    scene.released = _spy_chain_lane_release(monkeypatch)
+    scene.lanes = _count_spec_lane_acquires(git_ops, monkeypatch)
+
+    if script is not None:
+        verdicts = list(script)
+
+        async def _oracle(_git_ops, _req, merge_wt, **kwargs):
+            scene.posted.append({'merge_wt': merge_wt, **kwargs})
+            passed = verdicts.pop(0) if verdicts else True
+            return None if passed else MergeOutcome('blocked', reason='Verification failed: red')
+
+        monkeypatch.setattr(
+            'orchestrator.merge_lane.verify_dispatch.run_post_merge_verify', _oracle,
+        )
+    return scene
+
+
+def _set_depth(config: OrchestratorConfig, depth: int) -> None:
+    """Reload the deep knobs in place: chains up to *depth* items, or off at 0."""
+    config.merge_deep.chain_cap = depth
+    if depth >= 2:
+        config.merge_deep.depth_table = [DepthRow(0.0, depth)]
+
+
+def _round_transcript(scene: _DeepScene, idx: int) -> dict:
+    """Normalise ONE round into a repo-independent, comparable transcript.
+
+    Absolute paths and SHAs differ between two fixture repos, so the
+    comparison is made on the FACTS instead: was a chain handed down, what
+    depth/base/chain_items were labelled, was the item's OWN merge commit the
+    thing verified, and which pool lane did the verify run in.
+    """
+    rec = scene.calls[idx]
+    posted = scene.posted[idx]
+    item = rec['item']
+    return {
+        'chain': rec['chain'],
+        'chain_items': rec['chain_items'],
+        'depth': rec['depth'],
+        'probe_base': rec['probe_base'],
+        'verified_the_items_own_merge_commit':
+            posted['merge_sha'] == item.merge_result.merge_commit,
+        'verify_worktree_name': Path(posted['merge_wt']).name,
+        'speculative': posted.get('speculative'),
+        'result_status': rec['result'].status,
+        'result_has_worktree': rec['result'].merge_wt is not None,
+    }
+
+
+def _canary_says_deep(data: dict) -> bool:
+    """The SHIPPED deep-verify classifier, transcribed verbatim.
+
+    Copied character for character from ``scripts/merge-deep-canary-predicate.sh:84``
+    (η1's ``deep = [... if isinstance(d.get("chain_items"), int) and
+    d["chain_items"] >= 2]``) rather than restated in the assertion's own
+    words.  A restatement would drift the moment the emitter's unit changed —
+    which is exactly the emitter/reader units mismatch this transcription
+    exists to fence.  ζ's "first ``chain_items >= 2`` verify observed" deploy
+    signal and η1's deep-fail-rate DENOMINATOR are both this expression, so if
+    it disagrees with the emitter the canary is silently measuring nothing.
+    """
+    return isinstance(data.get('chain_items'), int) and data['chain_items'] >= 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)
+class TestDeepDispatchRoundsIntegration:
+    """γ end to end: successive rounds, a scripted oracle, real git."""
+
+    async def test_no_member_of_a_red_chain_is_chained_again(
+        self, git_repo: Path, monkeypatch,
+    ):
+        """A red tip isolates its members and costs the lane no depth (task 10617).
+
+        Round 1 chains all six items and fails, so all six are marked.  Round
+        2, the owner again, verifies alone and the policy is not asked.  Rounds
+        3 and 4 dispatch fresh cohorts, which chain at the table's depth, and
+        no member of an earlier red chain is ever offered as a link.
+        """
+        scene = await _make_deep_scene(
+            git_repo, chain_cap=6, script=[False, True, False, True],
+            monkeypatch=monkeypatch, cohorts=3,
+        )
+
+        for cohort in (0, 0, 1, 2):
+            await scene.round_(tag='walk', cohort=cohort)
+
+        assert scene.depths == [6, None, 6, 6]
+        reasons = [rec['dispatch_facts'].chain_depth_reason for rec in scene.calls]
+        assert [None if r is None else r.basis for r in reasons] == [
+            ChainDepthBasis.NO_ESTIMATE, None,
+            ChainDepthBasis.PASS_ESTIMATE, ChainDepthBasis.PASS_ESTIMATE,
+        ]
+        red_members: set[str] = set()
+        for rec in scene.calls:
+            chain = rec['chain']
+            links = [] if chain is None else [tid for tid, _mc in chain.links]
+            assert red_members.isdisjoint(links), (
+                f'a member of an earlier red chain was chained again: {links!r}'
+            )
+            if chain is not None and rec['result'].status is not None:
+                red_members |= {rec['item'].request.task_id, *links}
+        assert len(red_members) == 12, 'both red chains marked all six of their items'
+
+    @pytest.mark.parametrize('owner', ['speculative', 'head'])
+    @pytest.mark.parametrize('locality', ['remote', 'local'])
+    async def test_the_chain_lane_follows_the_verify_hosts_locality(
+        self, tmp_path: Path, monkeypatch, locality: str, owner: str,
+    ):
+        """A remote lease's chain builds in an ephemeral ``_merge-*``; a local one in ``_spec-``.
+
+        Both chain owners reach the builder through the one
+        ``_deep_chain_placement`` call in ``VerifyDispatcher.dispatch``: the speculative
+        slot-2 item, and the head alone in the verify frontier (PRD D5).
+        """
+        from orchestrator.verify_runner import HostLease
+        from orchestrator.warm_lane_pool import LaneState
+
+        repo = await _fresh_repo(tmp_path, f'{locality}-{owner}')
+        allocator = (
+            _StubRemoteAllocator(HostLease(
+                name='laptop', runner=_fake_pass_runner(), is_local=False,
+            ))
+            if locality == 'remote' else None
+        )
+        scene = await _make_deep_scene(
+            repo, chain_cap=6, script=[True], monkeypatch=monkeypatch,
+            allocator=allocator,
+        )
+
+        await scene.round_(tag=locality, speculative=owner == 'speculative')
+
+        chain = scene.calls[-1]['chain']
+        assert chain is not None and chain.links, 'the round must chain'
+        assert chain.lane is not None
+        assert scene.posted[-1]['merge_wt'] == chain.lane, 'the tip verified in the chain lane'
+        assert scene.built[-1]['verify_is_local'] is (locality == 'local')
+        if locality == 'remote':
+            assert scene.lanes == [], 'a remote verify claims no _spec- lane'
+            assert chain.lane.name.startswith('_merge-')
+            assert chain.lane_warm is False
+            assert not chain.lane.exists(), 'the ephemeral chain lane is torn down'
+        else:
+            assert chain.lane.name.startswith('_spec-')
+            assert scene.lanes == [scene.built[-1]['head_merge_commit']]
+        assert all(state is LaneState.FREE for state in _lane_states(scene.git_ops))
+
+    async def test_an_unchained_round_is_byte_identical_to_a_cap_zero_dispatch(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        """(b) An un-chained round IS today's adjacent verify — not a mimic of it.
+
+        Byte-identity here is BY CONSTRUCTION: a marked task's dispatch builds
+        no chain, so no chain code executes at all.  This test is the fence
+        around that construction — it compares the owner's un-chained round
+        after two red tips of a ``chain_cap=6`` walk against the first round
+        of the same fixture at ``chain_cap=0`` (the kill switch) and requires
+        the two dispatches to agree on every observable.
+        """
+        deep_repo = await _fresh_repo(tmp_path, 'deep')
+        flat_repo = await _fresh_repo(tmp_path, 'flat')
+        deep = await _make_deep_scene(
+            deep_repo, chain_cap=6, script=[False, False, True],
+            monkeypatch=monkeypatch, cohorts=2,
+        )
+        for cohort in (0, 1):
+            await deep.round_(tag='red', cohort=cohort)
+        # Snapshot BEFORE the un-chained round, not after it: rounds 1-2
+        # chained and each took a lane, so a post-hoc count cannot tell the
+        # un-chained round's own work from theirs.
+        n_built_before = len(deep.built)
+        n_lanes_before = len(deep.lanes)
+        n_released_before = len(deep.released)
+        await deep.round_(tag='alone', cohort=0)
+
+        flat = await _make_deep_scene(
+            flat_repo, chain_cap=0, script=[True], monkeypatch=monkeypatch,
+        )
+        await flat.round_(tag='flat')
+
+        assert deep.depths == [6, 6, None], 'round 3 must be the un-chained round'
+        assert _round_transcript(deep, 2) == _round_transcript(flat, 0)
+        # ...and the un-chained round did no chain work of any kind.
+        assert len(deep.built) == n_built_before, 'zero build_chain calls'
+        assert len(deep.released) == n_released_before, 'no lane to release'
+        assert flat.built == [], 'cap=0 never reaches the builder either'
+        # The warm-swap block ran on BOTH — one _spec- acquisition for the
+        # item's own merge commit, which is what "today's adjacent verify"
+        # means observably (see this module's note on how the bypass is seen).
+        assert len(deep.lanes) == n_lanes_before + 1
+        assert deep.lanes[-1] == deep.calls[2]['item'].merge_result.merge_commit
+        assert flat.lanes == [flat.calls[0]['item'].merge_result.merge_commit]
+
+    @pytest.mark.parametrize('frontier', [0, 2], ids=['frontier-0', 'frontier-2'])
+    async def test_every_merge_verify_carries_chain_items(
+        self, tmp_path: Path, monkeypatch, frontier: int,
+    ):
+        """(c) η1's reader can see a deep verify at all.
+
+        ``scripts/merge-deep-canary-predicate.sh:84`` counts merge verifies
+        with ``chain_items >= 2``; today it always reports 0 because no such
+        event exists.  This drives the REAL emission site
+        (``VerifyRunnerPool.dispatch``) over a mixed run — a slot-1 head
+        verify, a deep tip verify, a shallower tip verify and a one-item
+        verify — and requires the field present, integral and truthful on all
+        of them.
+
+        Parameterised over the verify frontier.  The three speculative rounds
+        expect the SAME list at both: ``chain_items`` is in CHAIN-ITEM units
+        and is deliberately frontier-INDEPENDENT, so a frontier-derived emitter
+        would produce ``[8, 5, 3]`` at ``frontier=2`` and fail here.  The head
+        round is where the frontier DOES matter, by policy: PRD D5 chains a
+        head only when it is alone in the frontier (boundary row 9).
+        """
+        from orchestrator.verify_runner import HostLease
+
+        repo = await _fresh_repo(tmp_path, f'events{frontier}')
+        lease = HostLease(
+            name='laptop', runner=_fake_pass_runner(), is_local=False,
+        )
+        scene = await _make_deep_scene(
+            repo, chain_cap=6, script=None, monkeypatch=monkeypatch,
+            allocator=_StubRemoteAllocator(lease), frontier=frontier,
+        )
+
+        # slot 1 (the head): PRD D5 chains it only when it is alone in the verify
+        # frontier, so it is deep at frontier-0 and a flat 1 at frontier-2.
+        #
+        # base_sha is REAL MAIN, deliberately: a slot-1 item is merged onto
+        # main, and a stale base would fire VerifyDispatcher.dispatch's Mechanism-2
+        # staleness re-merge, which raises `VerifyDispatcher.chain_invalidated` and makes every
+        # LATER speculative round re-merge as `chain_invalidated` — arriving at
+        # _deep_chain_placement non-speculative, so no round after this one
+        # would chain at all and the whole scene would go quietly vacuous.
+        head_item = _make_item(
+            _make_req('101', '101', scene.config, repo), scene.head,
+            _ephemeral_merge_wt(scene.git_ops, 'ev-head'), speculative=False,
+            base_sha=await _rev_parse(repo, 'main'),
+        )
+        entry = await scene.worker.verify_dispatch.dispatch(head_item)
+        assert entry is not None and entry.verify_task is not None
+        await entry.verify_task
+        # A chained head's links go back too, or the speculative rounds find none.
+        await scene.release_round(entry)
+
+        # slot 2: deep (6) → shallower (3) → one item (no chain).  The fake
+        # runner always passes, so set the depth by the table and the switch,
+        # as an operator reload would — this test is about the EVENT, not the
+        # policy (that is test (a)).
+        for depth, tag in ((6, 'ev-deep'), (3, 'ev-shallower'), (0, 'ev-off')):
+            _set_depth(scene.config, depth)
+            await scene.round_(tag=tag)
+
+        events = scene.store.events_of(EventType.merge_verify)
+        assert len(events) == 4, 'one merge_verify per dispatched round'
+        for ev in events:
+            assert isinstance(ev['data'].get('chain_items'), int)
+            assert not isinstance(ev['data']['chain_items'], bool)
+            assert ev['data']['chain_items'] >= 1
+
+        head_event, *speculative_events = events
+        assert head_event['data']['speculative'] is False
+        # Boundary row 9: alone in the frontier, the head chains at
+        # min(queue_len, cap) = min(1 + len(_DEEP_QUEUE), 6) = 6.
+        assert head_event['data']['chain_items'] == (6 if frontier == 0 else 1)
+        assert [e['data']['chain_items'] for e in speculative_events] == [6, 3, 1]
+        deep_events = [e for e in speculative_events if e['data']['chain_items'] >= 2]
+        assert len(deep_events) == 2, 'η1 must be able to SEE a deep verify'
+
+    async def test_non_chain_speculative_dispatch_emits_one_at_any_frontier(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        """REVIEW FIX 1: the SHIPPED default (``chain_cap=0``) emits a flat 1.
+
+        The coverage hole this closes: no test anywhere combined "non-chain
+        speculative dispatch" with "a non-empty verify frontier" AND the real
+        ``VerifyRunnerPool.dispatch`` emission.  ``_make_deep_scene`` never
+        populated ``_inflight`` (so its frontier was structurally 0 and
+        ``frontier + 1`` was indistinguishable from ``1``), while the only
+        non-empty-frontier tests stub ``_run_inflight_verify`` out and never
+        reach the emitter at all.
+
+        ``chain_items`` is in CHAIN-ITEM units: the dispatching item is chain
+        item #1 and a dispatch that built no chain contributes exactly that
+        one item.  The frozen-prefix height it used to (wrongly) fold in is
+        still carried, unchanged, by the separate always-present ``depth``.
+        """
+        from orchestrator.verify_runner import HostLease
+
+        repo = await _fresh_repo(tmp_path, 'flat-frontier')
+        lease = HostLease(
+            name='laptop', runner=_fake_pass_runner(), is_local=False,
+        )
+        scene = await _make_deep_scene(
+            repo, chain_cap=0, script=None, monkeypatch=monkeypatch,
+            allocator=_StubRemoteAllocator(lease), frontier=2,
+        )
+
+        await scene.round_(tag='flat-frontier')
+
+        assert scene.built == [], 'cap=0 is the kill switch: no chain was built'
+        assert scene.calls[0]['chain'] is None
+        events = scene.store.events_of(EventType.merge_verify)
+        assert len(events) == 1
+        data = events[0]['data']
+        assert data['chain_items'] == 1, (
+            'a speculative dispatch with no chain verifies exactly one item, '
+            'no matter how many other verifies are in flight ahead of it'
+        )
+        # The frontier height is not LOST — it moved to the field that owns it.
+        assert data['depth'] == 2, 'the frozen-prefix height still rides `depth`'
+        assert data['chain_depth_reason'] is None, 'the kill switch never asks the policy'
+
+    async def test_the_shipped_canary_classifier_fires_only_on_deep_rounds(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        """REVIEW FIX 1: agreement with η1's own expression, not a restatement.
+
+        Applies ``scripts/merge-deep-canary-predicate.sh:84``'s classifier
+        verbatim (see ``_canary_says_deep``) to a mixed run and requires it
+        True for the genuine deep rounds and False for the head, adjacent and
+        floor rounds.  A frontier-derived ``chain_items`` would make the
+        adjacent round at ``frontier >= 1`` classify as "deep", inflating η1's
+        deep-fail-rate denominator with rounds that chained nothing and firing
+        ζ's "first deep verify observed" signal on day one under the shipped
+        ``chain_cap=0``.
+        """
+        from orchestrator.verify_runner import HostLease
+
+        repo = await _fresh_repo(tmp_path, 'canary')
+        lease = HostLease(
+            name='laptop', runner=_fake_pass_runner(), is_local=False,
+        )
+        scene = await _make_deep_scene(
+            repo, chain_cap=6, script=None, monkeypatch=monkeypatch,
+            allocator=_StubRemoteAllocator(lease), frontier=2,
+        )
+
+        # slot 1 (head, non-speculative) — see the sibling test for why
+        # base_sha must be REAL MAIN here.
+        head_item = _make_item(
+            _make_req('101', '101', scene.config, repo), scene.head,
+            _ephemeral_merge_wt(scene.git_ops, 'can-head'), speculative=False,
+            base_sha=await _rev_parse(repo, 'main'),
+        )
+        entry = await scene.worker.verify_dispatch.dispatch(head_item)
+        assert entry is not None and entry.verify_task is not None
+        await entry.verify_task
+        await scene.worker._host_allocator.release(entry.lease)
+        _vr = scene.calls[-1]['result']
+        if _vr.merge_wt is not None:
+            await scene.worker._release_or_cleanup(
+                _vr.merge_wt, spec_warm=_vr.spec_warm,
+            )
+
+        for depth, tag in ((6, 'can-deep'), (3, 'can-shallower'), (0, 'can-off')):
+            _set_depth(scene.config, depth)
+            await scene.round_(tag=tag)
+
+        events = scene.store.events_of(EventType.merge_verify)
+        assert len(events) == 4
+        verdicts = [_canary_says_deep(e['data']) for e in events]
+        assert verdicts == [False, True, True, False], (
+            'head=False, deep(6)=True, shallower(3)=True, off(adjacent)=False'
+        )
+        # The nullable companion must agree with the SAME classifier, event for
+        # event: `chain_build_ms` is the per-round DISPATCH STALL, so a
+        # non-None on a round that chained nothing would attribute a build cost
+        # to a build that never happened, and a None on a deep round would hide
+        # the stall η1 reads it for.  Asserted against `verdicts` rather than
+        # re-derived, so the two fields cannot drift apart.
+        stalls = [e['data']['chain_build_ms'] for e in events]
+        assert [v is not None for v in stalls] == verdicts, (
+            'chain_build_ms is non-None exactly on the chain_items >= 2 rounds'
+        )
+        assert all(isinstance(v, int) and v >= 0 for v in stalls if v is not None)
+
+    async def test_a_deep_round_is_frontier_independent_on_the_chain_arm(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        """REVIEW FIX 1: a 2-link chain at frontier 2 emits 3, never 5.
+
+        The chain arm COMPUTES ``1 + len(chain.links)`` rather than
+        accumulating onto whatever the caller passed, so the emitted unit is a
+        fact about the verified tree — the dispatching item plus the links that
+        were actually built — and carries no frontier contribution at all.
+        """
+        from orchestrator.verify_runner import HostLease
+
+        repo = await _fresh_repo(tmp_path, 'deep-frontier')
+        lease = HostLease(
+            name='laptop', runner=_fake_pass_runner(), is_local=False,
+        )
+        scene = await _make_deep_scene(
+            repo, chain_cap=3, script=None, monkeypatch=monkeypatch,
+            allocator=_StubRemoteAllocator(lease), frontier=2,
+        )
+
+        await scene.round_(tag='deep-frontier')
+
+        chain = scene.calls[0]['chain']
+        assert chain is not None and len(chain.links) == 2, 'fixture must chain'
+        events = scene.store.events_of(EventType.merge_verify)
+        assert len(events) == 1
+        assert events[0]['data']['chain_items'] == 3 == 1 + len(chain.links)
+        assert _canary_says_deep(events[0]['data']) is True
+
+    async def test_conservation_holds_across_the_whole_run(
+        self, git_repo: Path, monkeypatch,
+    ):
+        """(d) PRD ι: nothing leaks over a full mixed run.
+
+        Speculation permits, the worktree ledger and the ``_spec-`` pool are
+        the three resources γ touches, and a chain that acquires a lane per
+        round is exactly the shape that strands one.
+        """
+        from orchestrator.warm_lane_pool import LaneState
+
+        scene = await _make_deep_scene(
+            git_repo, chain_cap=6, script=[False, True, False, True],
+            monkeypatch=monkeypatch, cohorts=3,
+        )
+
+        for cohort in (0, 0, 1, 2):
+            await scene.round_(tag='conserve', cohort=cohort)
+
+        assert scene.worker.speculation_accounting_violations() == []
+        assert scene.worker.worktree_ledger_violations(grace_secs=0.0) == []
+        assert all(s is LaneState.FREE for s in _lane_states(scene.git_ops)), \
+            'every chain lane went back to the pool'
+        assert scene.depths == [6, None, 6, 6], 'red, its owner alone, red, green'
+        assert len(scene.released) == 3, 'released once per round that chained'
+
+    async def test_chain_cap_is_a_switch_not_a_bound(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        """``chain_cap=1`` turns chains on; the depth table sizes them.
+
+        Under the shipped table an empty window takes the first row, (0.992, 12),
+        so five buffered requests chain behind the dispatcher: six items.
+        """
+        from orchestrator.verify_runner import HostLease
+
+        repo = await _fresh_repo(tmp_path, 'switch')
+        lease = HostLease(name='laptop', runner=_fake_pass_runner(), is_local=False)
+        scene = await _make_deep_scene(
+            repo, chain_cap=1, script=None, monkeypatch=monkeypatch,
+            allocator=_StubRemoteAllocator(lease),
+        )
+
+        await scene.round_(tag='switch')
+
+        (event,) = scene.store.events_of(EventType.merge_verify)
+        assert event['data']['chain_items'] == 6
+        assert event['data']['chain_task_ids'] == ['101', *_DEEP_QUEUE]
+        reason = event['data']['chain_depth_reason']
+        assert (reason['basis'], reason['row'], reason['queue_depth']) == (
+            'no_estimate', [0.992, 12], 6,
+        )
+
+
+_SHIPPED_DEPTH_TABLE = MergeDeepConfig().depth_table
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)
+class TestPolicyRow8PassEstimateCrossesATableRow:
+    """merge-lane-policy boundary row 8: a falling pass estimate moves the depth row.
+
+    Not test_merge_queue_deep_integration_gate.py's deep-merge-ahead row 8.
+    """
+
+    async def _seeded_scene(self, tmp_path: Path, monkeypatch, *, chain_cap: int, script):
+        """A scene under the shipped table, its window seeded with 29 passes then
+        1 fail, the head alone in the lane so every round verifies one item."""
+        repo = await _fresh_repo(tmp_path, f'row8-{chain_cap}')
+        scene = await _make_deep_scene(
+            repo, chain_cap=chain_cap, script=script, monkeypatch=monkeypatch, cohorts=0,
+        )
+        scene.config.merge_deep.depth_table = list(_SHIPPED_DEPTH_TABLE)
+        _seed_window(scene.worker, tmp_path, [True] * 29 + [False])
+        return scene
+
+    async def test_a_k1_fail_drops_the_estimate_below_the_first_row(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        scene = await self._seeded_scene(
+            tmp_path, monkeypatch, chain_cap=6, script=[False, True],
+        )
+
+        for _ in range(2):
+            await scene.round_(tag='row8')
+
+        assert scene.depths == [None, None], 'the head is alone: k=1 both rounds'
+        first, second = (rec['dispatch_facts'].chain_depth_reason for rec in scene.calls)
+        assert (first.basis, first.row) == (ChainDepthBasis.PASS_ESTIMATE, (0.959, 6))
+        assert first.pass_estimate == pytest.approx(29 / 30)
+        assert second.row == (0.876, 4)
+        assert second.pass_estimate == pytest.approx(28 / 30)
+
+    async def test_the_kill_switch_ignores_the_seeded_window(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        scene = await self._seeded_scene(
+            tmp_path, monkeypatch, chain_cap=0, script=[True],
+        )
+
+        rec = await scene.round_(tag='row8-off')
+
+        assert rec['chain'] is None
+        assert rec['dispatch_facts'].chain_depth_reason is None
+
+
+@pytest.mark.asyncio
+class TestChainPolicySeeding:
+    """``seed_chain_policy()`` reads the newest ``merge_verify`` rows of every run."""
+
+    async def _reason_after_seeding(self, tmp_path: Path, git_repo: Path, rows):
+        git_ops = _make_git_ops(git_repo)
+        config = _make_config(git_repo, chain_cap=6)
+        writer = EventStore(tmp_path / 'events.db', run_id='earlier-run')
+        for n, row in enumerate(rows):
+            writer.emit(EventType.merge_verify, task_id=f'r{n}', data=row)
+        worker = _make_worker(git_ops)
+        worker._event_store = EventStore(tmp_path / 'events.db', run_id='this-run')
+        worker.seed_chain_policy()
+        item = _make_item(_make_req('101', '101', config, git_repo), 'beef' * 10, git_repo)
+        return _asked((await worker._deep_chain_placement(item)).depth_reason)
+
+    async def test_rows_of_an_earlier_run_seed_the_window(self, tmp_path, git_repo):
+        reason = await self._reason_after_seeding(tmp_path, git_repo, [
+            _verify_row(True, merge_sha='a'), _verify_row(False, merge_sha='b'),
+        ])
+
+        assert reason.basis is ChainDepthBasis.PASS_ESTIMATE
+        assert reason.pass_estimate == 0.5
+
+    async def test_unsized_rounds_and_earlier_attempts_are_skipped(
+        self, tmp_path, git_repo,
+    ):
+        reason = await self._reason_after_seeding(tmp_path, git_repo, [
+            _verify_row(True, merge_sha='sized'),
+            _verify_row(False, merge_sha='unasked', basis=None),
+            _verify_row(False, merge_sha='retried', attempt=0),
+            _verify_row(True, merge_sha='retried', attempt=1),
+        ])
+
+        assert reason.pass_estimate == 1.0, 'only the sized row and the last attempt count'
+
+    async def test_no_event_store_leaves_the_window_empty(self, git_repo):
+        worker = _make_worker(_make_git_ops(git_repo))
+        worker.seed_chain_policy()
+        config = _make_config(git_repo, chain_cap=6)
+        item = _make_item(_make_req('101', '101', config, git_repo), 'beef' * 10, git_repo)
+
+        reason = _asked((await worker._deep_chain_placement(item)).depth_reason)
+
+        assert reason.basis is ChainDepthBasis.NO_ESTIMATE
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# merge-lane-policy boundary row 7: a failed chain marks its members
+# (plans/merge-lane-policy-prd.md D6, tasks 10617 and 8528), on a live lane.
+# Not test_merge_queue_deep_integration_gate.py's deep-merge-ahead row 7.
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def _row7_deep() -> MergeDeepConfig:
+    return MergeDeepConfig(
+        chain_cap=6, chain_build_timeout_secs=300, depth_table=[DepthRow(0.0, 4)],
+    )
+
+
+def _verify_rows(scene) -> list[dict]:
+    return [
+        event['data'] for event in scene.events.fetch_events_by_type(EventType.merge_verify)
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)
+class TestPolicyRow7ARedChainMarksItsMembers:
+    """A red 4-chain marks all four: each next verifies alone, the passers
+    land, the red one is blocked alone with its findings, and the lane chains
+    again at table depth afterwards."""
+
+    async def test_each_member_verifies_alone_and_the_lane_chains_again(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        scene = _reservation_scene(tmp_path, monkeypatch, merge_deep=_row7_deep())
+        reqs = {name: await _reservation_request(scene, name) for name in 'ABCDEFGHI'}
+        verifier = FakeVerifier(
+            scripts={'C': fails(category='test', summary='C breaks test_c')},
+            sequence=[fails(category='test', summary='the 4-chain is red')],
+        )
+
+        async with _running_lane(
+            scene, verifier=verifier, remotes=[], speculation_depth=2,
+        ) as run:
+            run.put(*(reqs[name] for name in 'ABCD'))
+            outcomes = {
+                name: await wait_responsive(reqs[name].result, label=f'{name} outcome')
+                for name in 'ABCD'
+            }
+            run.put(*(reqs[name] for name in 'EFGHI'))
+            later = {
+                name: await wait_responsive(reqs[name].result, label=f'{name} outcome')
+                for name in 'EFGHI'
+            }
+
+        rows = _verify_rows(scene)
+        assert (rows[0]['chain_task_ids'], rows[0]['passed']) == (['A', 'B', 'C', 'D'], False)
+        assert rows[0]['chain_depth_reason']['basis'] == 'no_estimate'
+
+        again = next(i for i, row in enumerate(rows) if row['chain_task_ids'][0] == 'E')
+        member_rows = rows[1:again]
+        assert {tuple(row['chain_task_ids']) for row in member_rows} == {
+            ('A',), ('B',), ('C',), ('D',),
+        }, 'each member of the red chain verifies alone'
+        assert all(row['chain_depth_reason'] is None for row in member_rows), (
+            "the policy does not size a marked member's verify"
+        )
+        assert {name: o.status for name, o in outcomes.items()} == {
+            'A': 'done', 'B': 'done', 'C': 'blocked', 'D': 'done',
+        }
+        assert 'C breaks test_c' in outcomes['C'].reason + outcomes['C'].failure_cause_hint
+
+        assert rows[again]['chain_task_ids'] == ['E', 'F', 'G', 'H'], 'the table depth, 4'
+        reason = rows[again]['chain_depth_reason']
+        assert (reason['basis'], reason['row'], reason['queue_depth']) == (
+            'pass_estimate', [0.0, 4], 5,
+        )
+        window = seed_from_rows(rows[:again]).recent
+        assert window == (TipVerdict(4, False),), (
+            "the red chain alone: no member's solo verdict would seed the window"
+        )
+        assert reason['pass_estimate'] == per_item_pass_estimate(window), (
+            'and the live window held the same verdicts'
+        )
+        assert {o.status for o in later.values()} == {'done'}
+        landed = await _reservation_landed(scene)
+        assert sorted(landed[:3]) == ['A', 'B', 'D']
+        assert landed[3:] == ['E', 'F', 'G', 'H', 'I']

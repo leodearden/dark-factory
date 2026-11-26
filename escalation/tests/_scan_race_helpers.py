@@ -1,0 +1,144 @@
+"""Shared test helpers for the unlocked-scan race that task 5111 hardens.
+
+Lives here rather than in either suite because ``test_queue.py`` and
+``test_sweep.py`` exercise the SAME helper
+(``escalation.queue.read_escalation_for_scan``) on the SAME 'vanished'
+channel, from opposite sides.  Two byte-identical copies of the interposition
+— which is what existed before — drift the moment one side needs it to handle
+a keyword-only argument or a ``Path`` subclass, and only one suite notices.
+
+Not a ``conftest.py`` fixture: the interposition takes arguments (which file
+is doomed, and where it goes), so a plain factory is the honest shape;
+``escalation/tests`` is on ``sys.path`` under pytest's default prepend import
+mode, so a flat import works from both suites.
+
+:func:`concurrently_pruned_rmtree` covers the sibling prune-side race (task
+6662): a dated subdir vanishing between ``archive.prune_archive``'s scan and
+its own rmtree.  ``test_archive.py`` uses it directly, ``test_sweep.py``
+through ``run_startup_sweep``.
+"""
+
+from __future__ import annotations
+
+import os
+import shutil
+from collections.abc import Callable
+from pathlib import Path
+from typing import Any
+
+
+def relocating_read_text(doomed: Path, dest_dir: Path) -> Callable[..., str]:
+    """Interpose ``Path.read_text`` to really relocate *doomed* mid-scan.
+
+    Not a mocked exception: the file is genuinely ``os.replace``d into
+    *dest_dir* and the original ``read_text`` is then called through, so the
+    ``FileNotFoundError`` comes from the filesystem exactly as it does when a
+    concurrent ``resolve()`` — or a second startup sweep during a fleet
+    redeploy — moves a record between the glob and the read.  Neither actor
+    holds a lock over that window: ``sweep._relocate_terminal`` takes the
+    per-id lock only around the move itself.
+
+    The ``doomed.exists()`` guard makes the interposition fire exactly once,
+    so a caller that re-reads the same path afterwards is not relocated twice.
+
+    Usage::
+
+        with patch.object(Path, 'read_text', relocating_read_text(doomed, dest)):
+            ...
+    """
+    original = Path.read_text
+
+    def flaky(self: Path, *args: Any, **kwargs: Any) -> str:
+        if self == doomed and doomed.exists():
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            os.replace(str(doomed), str(dest_dir / doomed.name))
+        return original(self, *args, **kwargs)
+
+    return flaky
+
+
+def deleting_read_text(doomed: Path) -> Callable[..., str]:
+    """Interpose ``Path.read_text`` to really delete *doomed* mid-read.
+
+    The deletion counterpart to :func:`relocating_read_text`: the record is
+    genuinely gone rather than moved, so the re-locate/retry in
+    ``queue.py::EscalationQueue.get`` and ``queue.py::EscalationQueue.get_by_task``
+    has nothing to find and must give up cleanly.  The ``doomed.exists()``
+    guard makes it fire exactly once, so the retry's re-read reaches the real
+    ``FileNotFoundError`` rather than a second unlink.
+    """
+    original = Path.read_text
+
+    def flaky(self: Path, *args: Any, **kwargs: Any) -> str:
+        if self == doomed and doomed.exists():
+            doomed.unlink()
+        return original(self, *args, **kwargs)
+
+    return flaky
+
+
+def unreadable_read_text(doomed: Path) -> Callable[..., str]:
+    """Interpose ``Path.read_text`` to fail *doomed* with ``PermissionError``.
+
+    The counterpart to :func:`relocating_read_text`, and the reason both live
+    here: the two exercise the channels the fix exists to keep DISTINGUISHABLE
+    — a file that vanished (benign, DEBUG) versus one that is still on disk and
+    genuinely unreadable (operator-actionable, WARNING).  Unlike the relocating
+    factory this one leaves the file exactly where it was, which is the whole
+    distinction; ``EACCES`` stands in for the family (a bad umask, EIO, an
+    exhausted fd table).
+    """
+    original = Path.read_text
+
+    def flaky(self: Path, *args: Any, **kwargs: Any) -> str:
+        if self == doomed:
+            # Left on disk, unlike the relocation case.
+            raise PermissionError(13, 'Permission denied', str(doomed))
+        return original(self, *args, **kwargs)
+
+    return flaky
+
+
+def pruning_read_text(doomed: Path) -> Callable[..., str]:
+    """Interpose ``Path.read_text`` to ``rmtree`` *doomed*'s containing dir.
+
+    Models ``archive.prune_archive``, which drops a whole dated subdir at
+    once — the actor that can invalidate an archive path between
+    ``sweep._build_archive_index``'s rglob and the read of an indexed copy.
+    ``run_startup_sweep`` runs prune as pass 3 of its own sequence, so the
+    concurrent runner is a second orchestrator's startup sweep during a fleet
+    redeploy, when several restart together.
+    """
+    original = Path.read_text
+
+    def flaky(self: Path, *args: Any, **kwargs: Any) -> str:
+        if self == doomed and doomed.exists():
+            shutil.rmtree(doomed.parent)
+        return original(self, *args, **kwargs)
+
+    return flaky
+
+
+def concurrently_pruned_rmtree(doomed: Path) -> Callable[..., None]:
+    """Interpose ``shutil.rmtree`` so a concurrent prune removes *doomed* first.
+
+    Models a second startup sweep's pass 3, or a manual
+    ``python -m escalation.archive``, removing the same dated subdir between
+    ``archive.prune_archive``'s scan and its rmtree.  The subdir is really
+    removed with the original rmtree, which is then called through, so the
+    caller's own ``FileNotFoundError`` comes from the filesystem.  The
+    ``doomed.exists()`` guard makes the concurrent removal fire once.
+
+    Usage::
+
+        with patch.object(shutil, 'rmtree', concurrently_pruned_rmtree(doomed)):
+            ...
+    """
+    original = shutil.rmtree
+
+    def racing(path: Any, *args: Any, **kwargs: Any) -> None:
+        if Path(path) == doomed and doomed.exists():
+            original(doomed)
+        return original(path, *args, **kwargs)
+
+    return racing

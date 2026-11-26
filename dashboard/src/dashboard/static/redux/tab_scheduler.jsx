@@ -15,7 +15,7 @@ const { Segmented, ProjectChips, timeago, fmtDateTime } = window.DF_SHELL;
 const { SchedulerHeatmap, cellStateFor } = window.DF_SCHED_HEATMAP;
 const { SchedulerDrawer } = window.DF_SCHED_DRAWER;
 // Shared helpers loaded by scheduler_utils.jsx (must come before this script).
-const { fmtAge, totalEvents, avgWaitSeconds, labelFor } = window.DF_SCHED_UTILS;
+const { fmtAge, totalEvents, avgWaitSeconds, labelFor, isLockHolder, holdersLabel } = window.DF_SCHED_UTILS;
 
 const D = window.DF_DATA;
 
@@ -133,6 +133,14 @@ function ActivePinsStrip({ pinQueue, rows, onReorder, onUnpin }) {
   );
 }
 
+// The priority a park-stack entry was installed at, as the orchestrator names
+// it. An orchestrator still running pre-6144 code names nothing, so its raw
+// rank is shown instead of an empty label.
+function parkEntryLabel(entry) {
+  if (entry.source === 'pin') return `pin #${entry.pin_order}`;
+  return entry.tier ?? `rank ${entry.rank}`;
+}
+
 // ── Park Stacks section ──
 // Rendered in the Modules sub-tab below ModulesView.
 // For each module with a non-empty park_stack, shows the full LIFO stack
@@ -195,7 +203,7 @@ function ParkStacksSection({ modules, rows, onEvict }) {
                       T-{entry.owner}
                     </span>
                     <span style={{ color: 'var(--fg-3)', fontSize: 10 }}>
-                      tier {entry.rank}
+                      {parkEntryLabel(entry)}
                     </span>
                     {ageStr && (
                       <span style={{ color: 'var(--fg-3)', fontSize: 10 }}>{ageStr}</span>
@@ -267,10 +275,10 @@ function ModulesView({ modules, rows, eventsMap }) {
         const waiters = (rows || []).filter(r =>
           (!m.project || r.project === m.project) &&
           (r.lock_set || []).includes(m.path) &&
-          m.holder !== r.task_id
+          !isLockHolder(m, r.task_id, r.project)
         );
         // The holder task_id is project-scoped; pair it with `holder_project`
-        // (set by the server when `current_holders` is non-empty) so the
+        // (set by the server whenever the module has a holder) so the
         // joined row lookup hits the correct project's row.
         const holderProject = m.holder_project || m.project || '';
         const holder = m.holder ? rowByCompositeKey[`${holderProject}/${m.holder}`] : null;
@@ -301,7 +309,10 @@ function ModulesView({ modules, rows, eventsMap }) {
             {m.holder ? (
               <div style={{ fontSize: 11, marginBottom: 8, padding: '6px 8px', background: 'var(--bg-2)', borderRadius: 4 }}>
                 <span style={{ color: 'var(--fg-3)' }}>held by </span>
-                <span className="mono" style={{ color: 'var(--accent)' }}>T-{m.holder}</span>
+                <span className="mono" style={{ color: 'var(--accent)' }}>{holdersLabel(m.holders)}</span>
+                {m.at_holder_limit === false && (
+                  <span style={{ color: 'var(--fg-3)', fontSize: 10, marginLeft: 8 }}>below its holder limit</span>
+                )}
                 {holderAge && (
                   <span style={{ color: 'var(--fg-3)', fontSize: 10, marginLeft: 8 }}>({holderAge})</span>
                 )}
@@ -362,8 +373,22 @@ function SchedulerTab() {
     snapshot_at = null,
     offline = false,
     offline_projects = [],
+    // Budget expired before these projects were read: their state is UNKNOWN,
+    // nothing was proven unreachable.  Deliberately separate from `offline`
+    // (see redux_api.shape_scheduler) — reading one as the other sends an
+    // operator to restart a healthy fused-memory.
+    degraded = false,
+    degraded_projects = [],
     paused = false,
     paused_projects = [],
+    // Recovery/strand sweep events (PRD task-escalation-state-graph D2/S6),
+    // shaped by redux_api.shape_scheduler.  `recovery_events` is the flat row
+    // list (each row already tagged with `project`); `recovery_event_counts`
+    // is {project: n}.  A project with 0 ANSWERED and had no sweeps; a project
+    // MISSING from the counts map is offline (see the offline banner below),
+    // never quiet — the two must not read the same.
+    recovery_events = [],
+    recovery_event_counts = {},
   } = sched;
 
   // Sub-tab: 'tasks' or 'modules'
@@ -402,9 +427,19 @@ function SchedulerTab() {
   const effectiveSelected = chipSelected !== null ? chipSelected : chipOptions;
 
   // Filter rows by chip selection (explicit: row visible iff !r.project or selection includes r.project)
-  const visibleRows = effectiveSelected.length === chipOptions.length || chipOptions.length === 0
-    ? rows
-    : rows.filter(r => !r.project || effectiveSelected.includes(r.project));
+  //
+  // Memoised so the array IDENTITY is stable between renders that changed
+  // nothing relevant — SchedulerHeatmap is a React.memo component, and an
+  // inline .filter() would hand it a fresh array on every one of App's 1 Hz
+  // clock ticks, defeating the memo entirely.  `chipOptions` is itself
+  // memoised and `chipSelected` is state, so `effectiveSelected` is
+  // referentially stable between ticks and this memo holds.
+  const visibleRows = stUseMemo(
+    () => (effectiveSelected.length === chipOptions.length || chipOptions.length === 0
+      ? rows
+      : rows.filter(r => !r.project || effectiveSelected.includes(r.project))),
+    [rows, effectiveSelected, chipOptions]
+  );
 
   // Filter modules by chip selection — same strict per-project predicate as visibleRows.
   // A module is visible iff:
@@ -414,9 +449,14 @@ function SchedulerTab() {
   // holder_project == project whenever a holder exists, making it redundant.
   // cellStateFor already returns 'not-in-set' for cross-project cells, so no genuine
   // cross-project conflict is hidden by this strictness.
-  const visibleModules = effectiveSelected.length === chipOptions.length || chipOptions.length === 0
-    ? modules
-    : modules.filter(m => !m.project || effectiveSelected.includes(m.project));
+  // Memoised for the same reason as visibleRows above; the predicate moves
+  // inside the callback verbatim.
+  const visibleModules = stUseMemo(
+    () => (effectiveSelected.length === chipOptions.length || chipOptions.length === 0
+      ? modules
+      : modules.filter(m => !m.project || effectiveSelected.includes(m.project))),
+    [modules, effectiveSelected, chipOptions]
+  );
 
   // ── Override submit ──
   const handleSubmitOverride = stUseCallback(async (body) => {
@@ -533,6 +573,21 @@ function SchedulerTab() {
 
   const snapshotLabel = snapshot_at ? `snapshot ${fmtDateTime(snapshot_at)}` : 'no snapshot';
 
+  // Recovery-sweep totals — read straight off the shaped payload.  Never
+  // re-derived by re-filtering events_by_task on the client: those sparklines
+  // are already narrowed to task_skipped, so a client-side derivation would
+  // always report zero sweeps no matter how many the sweep actually emitted.
+  const recoveryTotal = recovery_events.length;
+  const recoveryByType = recovery_events.reduce((acc, e) => {
+    const k = e.event_type || 'unknown';
+    acc[k] = (acc[k] || 0) + 1;
+    return acc;
+  }, {});
+  const recoveryHint = [
+    Object.entries(recovery_event_counts).map(([p, n]) => `${p}: ${n}`).join(', '),
+    Object.entries(recoveryByType).map(([t, n]) => `${t} ×${n}`).join(', '),
+  ].filter(Boolean).join(' — ');
+
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 12, height: '100%', position: 'relative' }}>
 
@@ -541,6 +596,20 @@ function SchedulerTab() {
         <div className="badge bad" style={{ padding: '6px 12px', fontSize: 11 }}>
           ⚠ Scheduler offline
           {offline_projects.length > 0 && `: ${offline_projects.join(', ')}`}
+        </div>
+      )}
+
+      {/* Degraded banner — composes with the offline banner rather than
+           replacing it: one project can be offline while a different one
+           times out.  The copy must never claim an outage; nothing was proven
+           unreachable, the handler simply ran out of budget.  Hence a distinct
+           glyph and `badge warn` rather than the offline banner's `badge bad`.
+           Same tone as the Tasks tab's 'degraded' notice kind
+           (tasks_offline_banner.js). */}
+      {degraded && (
+        <div className="badge warn" style={{ padding: '6px 12px', fontSize: 11 }}>
+          ◐ Scheduler state unknown (budget)
+          {degraded_projects.length > 0 && `: ${degraded_projects.join(', ')}`}
         </div>
       )}
 
@@ -567,6 +636,16 @@ function SchedulerTab() {
           </div>
         );
       })()}
+
+      {/* Recovery-sweep count — a count surface only, no new panel.  Sits
+           beside the existing event surfaces so a sweep that vetoed, left, or
+           converted a strand is visible at all; before this the dashboard
+           requested only task_skipped and every sweep row landed invisibly. */}
+      {recoveryTotal > 0 && (
+        <div className="badge info" style={{ padding: '6px 12px', fontSize: 11 }} title={recoveryHint}>
+          ⟳ {recoveryTotal} recovery sweep event{recoveryTotal !== 1 ? 's' : ''}
+        </div>
+      )}
 
       {/* Active-Pins strip */}
       <div className="panel" style={{ padding: '8px 12px' }}>

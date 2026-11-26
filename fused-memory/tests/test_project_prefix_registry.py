@@ -5,11 +5,14 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.middleware.project_prefix_registry import (
     DARK_FACTORY_ROOT,
     ProjectPrefixRegistry,
 )
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 
 def _mkproj(parent: Path, name: str, dirs: list[str]) -> Path:
@@ -348,7 +351,14 @@ class TestProjectForPathAbsolute:
         assert registry.project_for_path('/anything/x.py') is None
 
     def test_relative_path_behaviour_unchanged(self, registry):
-        """Explicit regression block: the RELATIVE regime is byte-identical."""
+        """Regression block: task 3109's ABSOLUTE work left these unchanged.
+
+        Scoped to 3109 on purpose — it does NOT claim the relative regime is
+        untouched in general. Task 4156 added lexical normalisation there, and
+        every assertion below survives it unchanged (none of these spellings
+        carries a '..' segment or a redundant separator). See
+        TestRelativePathNormalisation for what 4156 did change.
+        """
         assert registry.project_for_path('orchestrator/foo.py') == 'dark_factory'
         assert registry.project_for_path('crates') == 'reify'
         assert registry.project_for_path('./orchestrator/x') == 'dark_factory'
@@ -513,6 +523,113 @@ class TestAbsolutePathNormalisation:
 
 
 # ---------------------------------------------------------------------------
+# Relative-path NORMALISATION (task 4156).
+#
+# The sibling of TestAbsolutePathNormalisation above, for the OTHER regime.
+# The relative prefix scan compares just as lexically as the absolute one, so
+# unnormalised spellings defeat it in the SAME two directions: a '..' segment
+# produces a FALSE ownership ('orchestrator/../elsewhere/x.py' matched the
+# prefix 'orchestrator/' by bare startswith and was claimed for dark_factory),
+# and the mirrored case produces a MISSED one ('foo/../orchestrator/x.py' IS
+# orchestrator/x.py but matched nothing).  The absolute regime already fixed
+# both with os.path.normpath at :417; this regime now makes the identical
+# call, so the two read as symmetric rather than merely both-patched — still
+# purely lexical, no symlink resolution, no stat, no CWD.
+# ---------------------------------------------------------------------------
+
+
+class TestRelativePathNormalisation:
+    @pytest.fixture
+    def registry(self, tmp_path):
+        a = _mkproj(tmp_path, 'reify', ['crates'])
+        b = _mkproj(tmp_path, 'dark-factory', ['fused-memory', 'orchestrator', 'docs'])
+        return ProjectPrefixRegistry.from_roots([str(a), str(b)])
+
+    def test_parent_segment_does_not_produce_false_ownership(self, registry):
+        """A '..' segment that escapes a registered prefix must not be claimed.
+
+        Each escaped path is asserted against its already-correct CONTROL
+        spelling, so the test states the EQUIVALENCE ('orchestrator/../x' is
+        the same file as 'x') rather than merely the negation.
+        """
+        assert registry.project_for_path('somewhere-else/x.py') is None  # control
+        assert registry.project_for_path('orchestrator/../somewhere-else/x.py') is None
+
+        assert registry.project_for_path('elsewhere/y.py') is None  # control
+        assert registry.project_for_path('./orchestrator/../elsewhere/y.py') is None
+
+        # Normalises to '.', which is under no registered prefix.
+        assert registry.project_for_path('orchestrator/..') is None
+
+        # Escapes past the notional base entirely — normalises to '../...'.
+        assert registry.project_for_path('orchestrator/../../elsewhere/x.py') is None
+
+    def test_parent_segment_does_not_misattribute_across_projects(self, registry):
+        """'orchestrator/../crates/foo.rs' is a REIFY file, not a dark-factory one.
+
+        The relative twin of test_parent_segment_does_not_produce_false_ownership
+        in TestAbsolutePathNormalisation: without normalisation this matched the
+        prefix 'orchestrator/' by bare startswith and hard-rejected a
+        legitimately-local file — a FALSE rejection, the one failure direction
+        the module docstrings promise never happens.
+        """
+        escaped = 'orchestrator/../crates/foo.rs'
+        assert registry.project_for_path(escaped) == 'reify'
+        assert registry.project_for_path(escaped) != 'dark_factory'
+
+    def test_parent_segment_back_into_a_prefix_resolves_owner(self, registry):
+        """The mirrored MISS: 'foo/../orchestrator/x.py' IS orchestrator/x.py.
+
+        Symmetric normalisation necessarily closes both directions, so the fix
+        also creates rejections that previously did not fire. Pinned explicitly
+        so the widened-rejection behaviour is a recorded decision rather than an
+        unnoticed side effect — the analogue of the duplicate-separator miss
+        test_duplicate_separators_still_resolve_owner closed for the absolute
+        regime.
+        """
+        assert registry.project_for_path('foo/../orchestrator/x.py') == 'dark_factory'
+        assert registry.project_for_path('orchestrator/x.py') == 'dark_factory'  # control
+
+    def test_known_unhandled_spellings_fail_open(self, registry):
+        """Documented residue: a LEADING '..' stays UNOWNED by design.
+
+        The relative regime is given no base directory, so '../foo/x.py' is
+        genuinely unresolvable — leaving it unowned is a missed rejection, never
+        a false one, the same fail-open direction _owner_for_absolute_path
+        documents. Pinned so the gap stays visible to the next reader rather
+        than implied covered by the docstrings.
+
+        This block is also the regression guard on HOW the normalisation is
+        implemented: it fails if a future implementer reaches for
+        Path.resolve()/os.path.realpath, resolves against the process CWD, or
+        strips leading '..' segments — each of which would make ownership depend
+        on where the interceptor happens to be running.
+        """
+        assert registry.project_for_path('../dark-factory/orchestrator/x.py') is None
+        assert registry.project_for_path('../crates/x.rs') is None
+        assert registry.project_for_path('..') is None
+        # Normalises to '..' — the residue is about the RESULT, not the spelling.
+        assert registry.project_for_path('a/../..') is None
+
+    def test_redundant_separators_still_resolve_owner(self, registry):
+        """Symmetry with the absolute regime, pinned so the two cannot drift."""
+        assert registry.project_for_path('orchestrator//x.py') == 'dark_factory'
+        assert registry.project_for_path('orchestrator/./x.py') == 'dark_factory'
+
+    def test_default_registry_normalises_relative_parent_segments(self):
+        """The same shapes on the built-in single-project registry.
+
+        Single-project deployments (no known_project_roots configured) reach
+        project_for_path through default(), so they must not keep the defect.
+        """
+        registry = ProjectPrefixRegistry.default()
+        assert registry.project_for_path(
+            'orchestrator/../somewhere-else/x.py') is None
+        assert registry.project_for_path(
+            './orchestrator/../elsewhere/y.py') is None
+
+
+# ---------------------------------------------------------------------------
 # Edge: non-existent root does not crash
 # ---------------------------------------------------------------------------
 
@@ -583,3 +700,80 @@ class TestDefaultRegistry:
         assert mod.DARK_FACTORY_PROJECT_ID == 'dark_factory'
         assert mod.DARK_FACTORY_ROOT == '/home/leo/src/dark-factory'
         assert mod.DARK_FACTORY_PATH_PREFIXES == self._EXPECTED_PREFIXES
+
+
+# ---------------------------------------------------------------------------
+# attributed_owner — filer-first attribution of relative paths (task 7515).
+#
+# The global prefix table drops colliding prefixes and is snapshotted at build
+# time, so a filer's own top-level dir can classify unowned (collision) or as
+# another project's (stale snapshot). attributed_owner consults the FILING
+# project's root on disk first.
+# ---------------------------------------------------------------------------
+
+
+class TestAttributedOwner:
+    @pytest.fixture
+    def collision_registry(self, tmp_path):
+        roots = [
+            _mkproj(tmp_path, 'stream-touch', ['crates', 'sessions']),
+            _mkproj(tmp_path, 'reify', ['crates']),
+            _mkproj(tmp_path, 'mission-control', ['sessions']),
+            _mkproj(tmp_path, 'dark-factory', ['orchestrator']),
+        ]
+        return ProjectPrefixRegistry.from_roots([str(r) for r in roots])
+
+    @pytest.fixture
+    def stale_registry(self, tmp_path):
+        filer = _mkproj(tmp_path, 'stream-touch', ['crates'])
+        foreign = _mkproj(tmp_path, 'mission-control', ['sessions'])
+        registry = ProjectPrefixRegistry.from_roots([str(filer), str(foreign)])
+        (filer / 'sessions').mkdir()
+        return registry
+
+    def test_collision_dropped_dir_attributes_to_filer(self, collision_registry):
+        r = collision_registry
+        assert r.project_for_path('crates/touch-session/src/plan.rs') is None
+        assert r.project_for_path('sessions/plans/lp-starter-v1.toml') is None
+        assert r.attributed_owner(
+            'crates/touch-session/src/plan.rs', 'stream_touch') == 'stream_touch'
+        assert r.attributed_owner(
+            'sessions/plans/lp-starter-v1.toml', 'stream_touch') == 'stream_touch'
+
+    def test_filer_without_the_dir_sees_the_table_verdict(self, collision_registry):
+        assert collision_registry.attributed_owner('crates/x.rs', 'dark_factory') is None
+
+    def test_dir_grown_after_build_attributes_to_filer(self, stale_registry):
+        path = 'sessions/plans/lp-starter-v1.toml'
+        assert stale_registry.project_for_path(path) == 'mission_control'
+        assert stale_registry.attributed_owner(path, 'stream_touch') == 'stream_touch'
+
+    def test_dir_only_another_project_has_stays_foreign(self, collision_registry):
+        assert collision_registry.attributed_owner(
+            'orchestrator/src/x.py', 'stream_touch') == 'dark_factory'
+
+    def test_generic_dirs_and_top_level_files_stay_neutral(self, collision_registry):
+        filer_root = Path(collision_registry.root_for_project('stream_touch') or '')
+        (filer_root / 'docs').mkdir()
+        (filer_root / 'README.md').write_text('hi')
+        assert collision_registry.attributed_owner('docs/x.md', 'stream_touch') is None
+        assert collision_registry.attributed_owner('README.md', 'stream_touch') is None
+
+    def test_spellings_share_project_for_path_normalisation(self, collision_registry):
+        r = collision_registry
+        assert r.attributed_owner('./sessions/x.toml', 'stream_touch') == 'stream_touch'
+        assert r.attributed_owner('foo/../sessions/x.toml', 'stream_touch') == 'stream_touch'
+        assert r.attributed_owner('../sessions/x.toml', 'stream_touch') is None
+        assert r.attributed_owner('', 'stream_touch') is None
+
+    def test_absolute_paths_stay_root_authoritative(self, collision_registry):
+        r = collision_registry
+        mc_root = r.root_for_project('mission_control')
+        filer_root = r.root_for_project('stream_touch')
+        assert r.attributed_owner(f'{mc_root}/sessions/x.md', 'stream_touch') == 'mission_control'
+        assert r.attributed_owner(f'{filer_root}/sessions/x.md', 'stream_touch') == 'stream_touch'
+
+    def test_unregistered_filer_falls_back_to_the_table(self, stale_registry):
+        path = 'sessions/x.toml'
+        assert stale_registry.project_for_path(path) == 'mission_control'
+        assert stale_registry.attributed_owner(path, 'outsider') == 'mission_control'

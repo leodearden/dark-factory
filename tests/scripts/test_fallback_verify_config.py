@@ -29,11 +29,21 @@ in ``test_orchestrator_restart_config_drift.py``.
 """
 
 import pathlib
+import posixpath
 import re
+import shlex
+import sys
+import tomllib
+from typing import NamedTuple
 
+import pytest
+import verify_command_invariants as vci
 import yaml
-
 from orchestrator.config import ModuleConfig, _discover_module_configs
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+from verify_budget_census_records import ORCHESTRATOR_BUDGET_CENSUS
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 REPO_ROOT = pathlib.Path(__file__).parents[2]
 DF_CONFIG_PATH = REPO_ROOT / "dark-factory-orchestrator.yaml"
@@ -82,6 +92,77 @@ def _fleet_test_command() -> str:
     return yaml.safe_load(DF_CONFIG_PATH.read_text(encoding="utf-8"))["test_command"]
 
 
+def _fleet_type_check_command() -> str:
+    return yaml.safe_load(DF_CONFIG_PATH.read_text(encoding="utf-8"))["type_check_command"]
+
+
+def _fleet_lint_command() -> str:
+    return yaml.safe_load(DF_CONFIG_PATH.read_text(encoding="utf-8"))["lint_command"]
+
+
+def _pyproject_at(rel_dir: str) -> dict:
+    """Parse the ``pyproject.toml`` of the repo-relative directory *rel_dir*."""
+    path = REPO_ROOT / rel_dir / "pyproject.toml"
+    assert path.is_file(), (
+        f"no pyproject.toml at {rel_dir}/ (task 3367) — the interpreter-pin "
+        "invariant cannot be evaluated for a directory with no pyright config"
+    )
+    return tomllib.loads(path.read_text(encoding="utf-8"))
+
+
+def _workspace_member_dirs() -> list[str]:
+    """Every ``[tool.uv.workspace].members`` entry, discovered at runtime.
+
+    Lifted (task 3397) from what was originally
+    ``TestWorkspacePyrightInterpreterPinned._workspace_member_dirs`` (task
+    3367) to module level, so the fleet TYPE/LINT coverage invariants below
+    discover workspace members from the exact same runtime source as the
+    interpreter-pin invariant rather than a second, independently-maintained
+    list that could silently drift from it. The class method now delegates
+    here.
+    """
+    root = _pyproject_at(".")
+    members = root.get("tool", {}).get("uv", {}).get("workspace", {}).get("members")
+    assert members, (
+        "root pyproject.toml declares no [tool.uv.workspace].members (task "
+        "3367) — the workspace-wide interpreter-pin invariant cannot discover "
+        "its subjects and would pass vacuously"
+    )
+    return list(members)
+
+
+def _assert_pyright_pins_worktree_venv(rel_dir: str, pyright: dict, why: str) -> None:
+    """Assert *rel_dir*'s ``[tool.pyright]`` table pins the worktree-root ``.venv``.
+
+    Shared by both interpreter-pin invariants below (task 3367): the narrow
+    fleet-chain guard and the general every-workspace-member guard assert the
+    SAME property, and must not drift apart.
+    """
+    for key in ("venvPath", "venv"):
+        assert key in pyright, (
+            f"{rel_dir}/pyproject.toml [tool.pyright] does not declare {key!r} "
+            f"(task 3367, esc-3359-1). {why} Without an explicit venvPath/venv "
+            "pin, pyright resolves its Python interpreter from the ambient "
+            "VIRTUAL_ENV/PATH — which verify._target_subprocess_env deliberately "
+            "strips — so in a cold merge worktree it type-checks against an "
+            "environment holding none of the workspace's third-party packages "
+            "and emits hundreds of phantom 'could not be resolved' "
+            "(reportMissingImports) errors, false-reddening TYPE on a branch "
+            "with no defect (509+ errors on a DOCS-ONLY diff in esc-3359-1)"
+        )
+    resolved = (REPO_ROOT / rel_dir / pyright["venvPath"] / pyright["venv"]).resolve()
+    expected = (REPO_ROOT / ".venv").resolve()
+    assert resolved == expected, (
+        f"{rel_dir}/pyproject.toml [tool.pyright] pins venvPath="
+        f"{pyright['venvPath']!r} venv={pyright['venv']!r}, which resolves to "
+        f"{resolved} — not this worktree's own root .venv at {expected} (task "
+        "3367, esc-3359-1). The pin is resolved by pyright RELATIVE TO THE "
+        "CONFIG FILE'S OWN DIRECTORY, which is what makes it correct per-worktree; "
+        "a pin that resolves anywhere else reintroduces cross-worktree "
+        "interpreter leakage"
+    )
+
+
 def _discover_per_module_configs() -> dict[str, ModuleConfig]:
     """Every discovered module config (ANY depth) that defines a ``test_command``.
 
@@ -122,6 +203,65 @@ def _discover_per_module_configs() -> dict[str, ModuleConfig]:
 
 def _pytest_segments(cmd: str) -> list[str]:
     return [seg for seg in cmd.split("&&") if "pytest" in seg]
+
+
+#: Shell tokens that end one simple command. ``(`` and ``)`` also open and
+#: close a subshell, whose ``cd`` does not leak past it.
+_SHELL_CLAUSE_ENDS = frozenset({'&&', '||', ';', '|', '(', ')'})
+
+
+def _shell_clauses(cmd: str) -> list[tuple[list[str], str | None]]:
+    """*cmd* as ``(clause tokens, the operator that ended the clause)`` pairs, in order.
+
+    The last clause's operator is ``None``.
+    """
+    lexer = shlex.shlex(cmd, posix=True, punctuation_chars=True)
+    lexer.whitespace_split = True
+    clauses: list[tuple[list[str], str | None]] = []
+    clause: list[str] = []
+    for token in lexer:
+        if token in _SHELL_CLAUSE_ENDS:
+            clauses.append((clause, token))
+            clause = []
+        else:
+            clause.append(token)
+    clauses.append((clause, None))
+    return clauses
+
+
+def _fleet_pytest_suite_names(cmd: str) -> set[str]:
+    """Every test-suite directory the fleet TEST chain runs, keyed as MEASURED_FLEET_SEGMENT_SECS is.
+
+    A suite run from inside a member (``cd <member> && uv run pytest tests/``)
+    is keyed by that member's directory; one run from the repo root by its
+    normalised repo-relative target path (``tests/scripts``).
+
+    Walks the shell clauses, tracking cwd through ``cd`` clauses and keeping a
+    subshell's ``cd`` inside it (the cockpit clause is a presence-guarded
+    subshell). Each pytest clause's targets come from the shared
+    ``vci.positional_targets`` given ``vci.PYTEST_VALUE_FLAGS``, so flags before
+    or between targets, value-taking flags and a missing ``--timeout`` do not
+    change the result. A value-taking flag missing from that set would donate
+    its value as a phantom suite, which the partition guard reports as
+    UNACCOUNTED.
+    :func:`test_fleet_pytest_suite_names_reads_each_chain_shape` pins the shapes.
+    """
+    cwds = ['.']
+    suites: set[str] = set()
+    for clause, ended_by in _shell_clauses(cmd):
+        if len(clause) == 2 and clause[0] == 'cd':
+            cwds[-1] = posixpath.normpath(posixpath.join(cwds[-1], clause[1]))
+        elif vci.PYTEST in clause:
+            targets = vci.positional_targets(
+                shlex.join(clause), vci.PYTEST, value_flags=vci.PYTEST_VALUE_FLAGS
+            )
+            cwd = cwds[-1]
+            suites.update(cwd if cwd != '.' else posixpath.normpath(t) for t in targets)
+        if ended_by == '(':
+            cwds.append(cwds[-1])
+        elif ended_by == ')':
+            cwds.pop()
+    return suites
 
 
 def test_fallback_verify_runs_tests_scripts() -> None:
@@ -348,63 +488,456 @@ def test_per_module_merge_verify_raises_per_test_timeout() -> None:
             )
 
 
+#: Shell operators that end one `uv run` invocation and begin another. A
+#: pairing is only self-defeating WITHIN a single clause, so the scan resets
+#: at each of these rather than pooling flags across an `&&`-chain (every
+#: subproject's lint_command chains a `python3 .../check_*.py` sibling gate).
+_CHAIN_OPERATOR_TOKENS = frozenset({"&&", "||", ";", "|"})
+
+#: The two spellings uv accepts for a value-taking long flag. The sibling
+#: parser in ``test_skills_module_config_decision.py`` (``_pytest_collected_dirs``)
+#: already handles ``--directory`` this way; mirrored here for BOTH flags so a
+#: future ``--project=X --directory=X`` cannot slip past the guard.
+_UV_VALUE_FLAGS = ("--project", "--directory")
+
+
+def _uv_same_value_flag_pairings(cmd: str, *, label: str) -> list[str]:
+    """Every value ``V`` for which one clause of *cmd* passes BOTH flags as ``V``.
+
+    Returns the offending values (usually at most one per clause). A clause
+    that sets only one of the two, or sets them to DIFFERENT values, is not
+    reported: ``--project shared --directory scripts`` means "run from
+    ``scripts/`` against ``shared``'s project", which is a genuinely different
+    and legitimate instruction, not the self-defeating same-value pairing.
+    """
+    try:
+        tokens = shlex.split(cmd)
+    except ValueError as exc:
+        raise AssertionError(
+            f"{label} is not shell-parseable ({exc.__class__.__name__}: {exc}); "
+            f"command: {cmd!r}.\nFIX: repair that config. Skipping an unparseable "
+            f"command would silently defeat this guard — an unquoted config would "
+            f"be indistinguishable from a clean one."
+        ) from exc
+
+    pairings: list[str] = []
+    seen: dict[str, str] = {}
+
+    def _end_clause() -> None:
+        project, directory = seen.get("--project"), seen.get("--directory")
+        if project is not None and project == directory:
+            pairings.append(project)
+        seen.clear()
+
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        if token in _CHAIN_OPERATOR_TOKENS:
+            _end_clause()
+        else:
+            for flag in _UV_VALUE_FLAGS:
+                if token == flag and index + 1 < len(tokens):
+                    seen[flag] = tokens[index + 1]
+                    index += 1
+                    break
+                if token.startswith(f"{flag}="):
+                    seen[flag] = token[len(flag) + 1 :]
+                    break
+        index += 1
+    _end_clause()
+    return pairings
+
+
+def test_per_module_verify_commands_never_pair_project_with_directory() -> None:
+    """No module verify command may pass ``--project V`` and ``--directory V`` together.
+
+    Task 3830. The pairing is SELF-DEFEATING, not merely redundant: uv applies
+    ``--directory V`` FIRST (the process cwd becomes ``V/``) and only then
+    resolves ``--project V`` — against that NEW cwd — so it looks for ``V/V``,
+    which does not exist. uv 0.11.6 emits::
+
+        warning: Project directory `shared` does not exist. This will become an
+        error in a future release.
+
+    It is a warning today and the command still runs, which is exactly what
+    makes it worth guarding: nothing goes red until the uv release that
+    promotes it to an error, at which point EVERY module verify command breaks
+    simultaneously — and the repo root sets ``merge_verify_breadth: "full"``,
+    so that is a repo-wide merge outage rather than one subproject's problem.
+
+    The set of configs is DISCOVERED (``_discover_per_module_configs`` ->
+    the production walk), so a newly-added subproject is auto-covered at any
+    depth with no edit here. All three command slots are checked, because the
+    defect is per-command, not per-module. No exclusions frozenset: task 3830
+    fixed all 21 sites at once, leaving nothing to carve out.
+    """
+    discovered = _discover_per_module_configs()
+
+    # Same discovery floor as the timeout guard above: if a known config stops
+    # resolving, the loop below would vacuously pass on a shrunken set.
+    missing = KNOWN_PER_MODULE_CONFIG_NAMES - set(discovered)
+    assert not missing, (
+        "dynamic discovery (config._discover_module_configs, filtered to "
+        f"configs defining a test_command) failed to resolve known per-module "
+        f"config(s) {sorted(missing)} (task 3830) — discovery has regressed; "
+        f"discovered: {sorted(discovered)}"
+    )
+
+    offenders: list[str] = []
+    for prefix, module_config in sorted(discovered.items()):
+        for slot in ("test_command", "lint_command", "type_check_command"):
+            cmd = getattr(module_config, slot)
+            if cmd is None:
+                continue
+            label = f"{prefix}/orchestrator.yaml::{slot}"
+            for value in _uv_same_value_flag_pairings(cmd, label=label):
+                offenders.append(f"  {label} pairs --project {value} with --directory {value}")
+
+    assert not offenders, (
+        f"{len(offenders)} module verify command(s) pair `--project V` with "
+        "`--directory V` for the same V (task 3830):\n"
+        + "\n".join(offenders)
+        + "\n\nWHY THIS IS WRONG: uv applies `--directory V` first (cwd becomes "
+        "V/), then resolves `--project V` against that NEW cwd — looking for "
+        "V/V, which does not exist. uv 0.11.6 warns 'This will become an error "
+        "in a future release'; when it does, every one of these breaks at once, "
+        "and the repo root's merge_verify_breadth: \"full\" makes that a "
+        "repo-wide merge outage.\n\n"
+        "FIX: delete the `--project V ` token and KEEP `--directory V`. The "
+        "in-repo worked examples of an unpaired command are "
+        "scripts/orchestrator.yaml and tests/scripts/orchestrator.yaml.\n\n"
+        "Do NOT 'fix' this the other way by deleting `--directory` instead: cwd "
+        "is load-bearing. pyright resolves `[tool.pyright]` from its cwd, and "
+        "each module's own table carries a `venvPath`/`venv` interpreter pin "
+        "that is resolved RELATIVE TO THAT FILE'S DIRECTORY (plus, for "
+        "orchestrator, module-specific extraPaths). Moving cwd to the repo root "
+        "silently substitutes the ROOT pyright config for the module's own — "
+        "which type-checks green against the wrong settings, the false-GREEN "
+        "direction (its own comment records 'measured 496 phantom "
+        "reportMissingImports here, 0 with this pin')."
+    )
+
+
+# Task 4902 RE-MEASUREMENT of the `orchestrator` fleet segment, in seconds.
+# HISTORICAL since task 3496: no longer the source of MEASURED_FLEET_SEGMENT_SECS
+# (task 3353's census superseded it); kept because
+# plans/fleet-verify-budget-history.md and test_module_verify_budgets.py cite it
+# by name as 4902's record.
+#
+# WHY THIS EXISTS: the table below was frozen at a task-3062 single run from
+# 2026-07-31. On 2026-08-20 commit 685f558728 landed
+# `verify_admission_pytest_n: "8"`, capping orchestrator's xdist fanout, and
+# the segment's cost stepped up ~2.6x. Nothing re-measured it, because nothing
+# in this file CAN — see the SCOPE paragraph on
+# ``test_fallback_verify_budget_clears_the_measured_fleet_chain_floor`` below.
+# So it was re-measured by hand, once, and the result recorded here.
+#
+# CORPUS: `.worktrees/*/.task/verify/*.orchestrator.summary.json` — 246 files
+# across 1354 worktrees at the time of the mine (2026-08-28, main 07eebf1c26),
+# yielding 244 records carrying a `test`-label command with both a numeric
+# `duration_secs` and a `started_at`.
+#
+# SELECTION (both filters are load-bearing):
+#   FULL-SUITE only. Of the 244 test-leg records, 110 target the bare `tests/`
+#     directory and 134 are file-scoped rescopes listing explicit
+#     orchestrator/tests/*.py paths. A rescope's duration measures one diff's
+#     blast radius, not a fleet segment; folding them in drags the median down
+#     by an order of magnitude. The discriminator is the positional pytest
+#     target: tokens after the last `pytest` that are non-flag, non-`k=v` and
+#     non-numeric, kept only when that list is exactly ['tests/'].
+#   GREEN only (rc == 0 and not timed_out). The table records honest green wall
+#     clock: a timed-out run contributes its 3600s ceiling instead of its true
+#     cost, and a red run may abort early — biases in opposite directions.
+#
+# REGIME SPLIT at started_at >= 2026-08-21T00:00:00Z (the day after 685f558728):
+#   pre-cap  green: n=70, 2026-07-07..2026-08-20, min 218.62  p50  691.40  max 1783.83, 0 of 70 over 1800s
+#   post-cap green: n=28, 2026-08-22..2026-08-28, min 864.83  p50 1765.95  max 3310.50, 14 of 28 over 1800s
+# The 2.6x step in the median straddles the cap and is confirmed on the
+# unfiltered arm too (all full-suite: before n=79 p50 698.04, after n=31
+# p50 1803.40 with one 3600.65s timeout). This task does NOT reopen its
+# attribution — tasks 3589 and 4456 own the -n cap and its memory ground.
+#
+# PERCENTILE CONVENTIONS, stated so the next re-measurement is a repeat rather
+# than a re-derivation: p50 is ``statistics.median`` (n is even, so it is the
+# mean of the two central observations and is NOT itself an observed run);
+# p90 is the lower order statistic ``sorted[floor(0.90 * n) - 1]`` =
+# ``sorted[24]`` of 28, which IS an observed run; max is the observed maximum.
+POST_CAP_ORCHESTRATOR_GREEN_SECS = {
+    'p50': 1765.95,
+    'p90': 2552.09,
+    'max': 3310.50,
+}
+
+# Sample size behind POST_CAP_ORCHESTRATOR_GREEN_SECS, kept next to it so the
+# percentiles and the n that produced them cannot drift apart.
+POST_CAP_ORCHESTRATOR_GREEN_N = 28
+
 # Measured per-segment wall-clock of the FALLBACK fleet chain, in seconds.
 #
-# PROVENANCE: task 3062, .task/verify/attempt-2.__fallback__.{summary.json,
-# test.log}; run started 2026-07-31T02:00:48Z under `nice -n 15 ionice -c2 -n7`;
-# surfaced as escalation esc-3062-3. These are LOGGED durations, not estimates.
+# PROVENANCE — this table spans several measurement epochs. Do not read it as
+# one run.
 #
-# `tests/scripts` uses the LOWEST of four independent measurements (105-127s),
-# and `dashboard`, `sampler` and `cockpit` are OMITTED ENTIRELY — the run timed
-# out at 1800.66s before dashboard even started, so no figure exists for them.
-# The sum is therefore a hard measured LOWER BOUND on the chain's cost: the real
-# green-path chain is strictly more expensive than this, never less.
+#   shared / escalation / fused-memory / tests/scripts — task 3062,
+#     .task/verify/attempt-2.__fallback__.{summary.json,test.log}; run started
+#     2026-07-31T02:00:48Z under `nice -n 15 ionice -c2 -n7`; surfaced as
+#     escalation esc-3062-3. One logged run each, except `tests/scripts`, which
+#     uses the LOWEST of four independent measurements (105-127s).
+#
+#   orchestrator — DERIVED, not copied: ORCHESTRATOR_BUDGET_CENSUS.p50 to 2 dp,
+#     from task 3353's census record at
+#     tests/scripts/verify_budget_census_records.py::ORCHESTRATOR_BUDGET_CENSUS.
+#     It is IMPORTED because that is a non-test helper; a guard must not import
+#     a sibling guard (the convention module_budget_family.py states). That
+#     record is the single home of the figure's window, regime scoping,
+#     percentiles and census_command; re-measuring means replacing it, and
+#     this row and its provenance follow. Superseded
+#     predecessors: task 4902's 1765.95 (n=28, 2026-08-28;
+#     POST_CAP_ORCHESTRATOR_GREEN_SECS above) and task 3062's 1366.23 (one run,
+#     2026-07-31). Independent corroboration of the 2026-09-14 census: the M1a
+#     PRE arm in plans/verify-admission-task-slots-gate.md
+#     (verify_admission_task_slots=1) reports a clean p50 of 3233s, n=14.
+#
+#   scripts/tests — task 3384, 2026-08-01: one standalone local run (1184
+#     passed in ~113s, "lowest of local runs"), recorded in commit 7249f40f14,
+#     which added the suite to the chain; no summary was persisted. The
+#     combined-clause figures recorded for task 3460 (288.65s / 411.87s /
+#     494.20s) are NOT used: that clause runs `tests/scripts/` and
+#     `scripts/tests/` together, and `tests/scripts` already has its own row, so
+#     a combined figure would double-count it.
+#
+#   tests/repo_guards — task 5654, 2026-11-13: two back-to-back runs of the
+#     verbatim segment once every moved guard was in (1033 tests), 106.32s and
+#     106.70s wall at loadavg 43.05 -> 49.63; the lower is kept, as for
+#     tests/scripts. Re-measure whenever guards move in or out.
+#
+# KNOWN-STALE ROWS, deliberately not re-measured here. Two 2026-07-31 rows are
+# stale in OPPOSITE directions: `shared` UNDER-states (task 5131 measured +48%
+# collection growth; re-measure ticket tkt_0RTA9W8FEYMNAC7RQ4Y0QR857R) and
+# `escalation` OVER-states (task 5408 moved it to xdist: 49.63s vs 123.29s
+# serial). 5131's own 296.88 is the WORST run of a different command under
+# contention (test_module_verify_budgets.py::MEASURED_MODULE_SUITE_WORST_SECS)
+# and does not belong in a table of representative green runs. The sum still
+# reads as a lower bound on the median chain, because the omitted suites'
+# 5408-measured cost (dashboard 95.07 + cockpit 16.78) exceeds escalation's
+# overstatement (73.66). Those measured figures are the SMALLER ones, so they
+# are the conservative choice for a lower-bound argument; the repo-root yaml's
+# budget sizing uses the larger serial-era estimates (~190, ~44), conservative
+# in the opposite direction.
+#
+# WHAT THE SUM IS, PRECISELY. The suites in UNMEASURED_FLEET_SEGMENTS are
+# OMITTED ENTIRELY — task 3062's run timed out at 1800.66s before dashboard even
+# started, so no figure exists for them. So sum() is a lower bound on the MEDIAN
+# green chain cost over the measured subset of the chain's suites, each a
+# representative green run.
+#
+# It is NOT a bound on an individual run, and the earlier wording here ("the
+# real green-path chain is strictly more expensive than this, never less") was
+# wrong to imply otherwise — task 3062 itself logged 1366.23s and 1157.62s for
+# the same segment on the same day, and the 2026-09-14 census shows green
+# full-suite orchestrator runs in its regime reaching p90 3684.59s and max
+# 4626.17s against a p50 of 3274.92s. Individual runs land on both sides of
+# this sum; the median chain does not.
+#
+# HISTORY — task 4902's finding against the 3600s ceiling of 2026-08, the false
+# infra_timeout it recorded, the 2026-09-12 raise, and task 3496's finding that
+# a revert to 3600 is refused by the floor guard below — is in
+# plans/fleet-verify-budget-history.md. The guards here compare recorded
+# constants and read no `.task/verify/*.summary.json` corpus at test time: that
+# corpus is pruned with its worktrees.
+#
+# Neither task 4902 nor task 3496 changes any budget, the -n cap, or
+# orchestrator/orchestrator.yaml — they only record the measurements those
+# decisions need.
 MEASURED_FLEET_SEGMENT_SECS = {
     'shared': 120.21,
     'escalation': 123.29,
-    'orchestrator': 1366.23,
+    'orchestrator': round(ORCHESTRATOR_BUDGET_CENSUS.p50, 2),
     'fused-memory': 123.87,
     'tests/scripts': 105.0,
+    'scripts/tests': 113.0,
+    'client-feed': 2.67,
+    'tests/repo_guards': 106.32,
 }
+
+
+class _SegmentProvenance(NamedTuple):
+    """Where one MEASURED_FLEET_SEGMENT_SECS figure came from."""
+
+    measured_at: str      # ISO YYYY-MM-DD
+    sample_size: int      # number of runs actually observed
+    task_id: str
+    corpus: str
+
+
+# Task 4902. The measurement table above spans several epochs, and a bare
+# {name: float} mapping cannot say which entry belongs to which. This records
+# each figure's age and sample so the next reader — and the next re-measurement
+# — can see at a glance what is being replaced, without archaeology.
+#
+# Read the sample sizes literally. Four of these are n=1: a single logged run
+# each, which is exactly why a single later regime change (commit 685f558728's
+# `pytest -n 8` cap) invalidated the table wholesale and nothing noticed for
+# eight days. `tests/scripts` is n=4 because the comment above records it as
+# the lowest of four independent measurements. Only `orchestrator` rests on a
+# real sample: task 4902 first mined one, and task 3353's census replaced it.
+#
+# This makes the table DATED, not CURRENT. Nothing here re-measures anything —
+# see the SCOPE paragraph on the floor guard below.
+MEASURED_FLEET_SEGMENT_PROVENANCE: dict[str, _SegmentProvenance] = {
+    'shared': _SegmentProvenance(
+        '2026-07-31', 1, '3062', '.task/verify/attempt-2.__fallback__.summary.json'),
+    'escalation': _SegmentProvenance(
+        '2026-07-31', 1, '3062', '.task/verify/attempt-2.__fallback__.summary.json'),
+    'orchestrator': _SegmentProvenance(
+        ORCHESTRATOR_BUDGET_CENSUS.measured_at, ORCHESTRATOR_BUDGET_CENSUS.n, '3353',
+        'verify-summary corpus read by ORCHESTRATOR_BUDGET_CENSUS.census_command'),
+    'fused-memory': _SegmentProvenance(
+        '2026-07-31', 1, '3062', '.task/verify/attempt-2.__fallback__.summary.json'),
+    'tests/scripts': _SegmentProvenance(
+        '2026-07-31', 4, '3062', '.task/verify/attempt-2.__fallback__.summary.json'),
+    'scripts/tests': _SegmentProvenance(
+        '2026-08-01', 1, '3384',
+        'standalone local run recorded in commit 7249f40f14 (no persisted summary)'),
+    'client-feed': _SegmentProvenance(
+        '2026-10-15', 3, '6966',
+        'standalone local runs recorded in the task 6966 commit message'),
+    'tests/repo_guards': _SegmentProvenance(
+        '2026-11-13', 2, '5654',
+        'standalone local runs recorded beside MEASURED_FLEET_SEGMENT_SECS'),
+}
+
+# The suites the chain runs that have NO figure in MEASURED_FLEET_SEGMENT_SECS:
+# task 3062 attempt-2 timed out at 1800.66s before dashboard started, so none
+# of these was ever reached, and dark-factory-orchestrator.yaml's budget
+# derivation costs them by ESTIMATE instead. This is the machine-checkable form
+# of the "OMITTED ENTIRELY" sentence in the table's WHAT THE SUM IS comment.
+UNMEASURED_FLEET_SEGMENTS = frozenset({'dashboard', 'sampler', 'cockpit'})
 
 
 def _verify_budgets() -> dict:
     return yaml.safe_load(DF_CONFIG_PATH.read_text(encoding='utf-8'))
 
 
+def test_every_measured_fleet_segment_carries_dated_provenance() -> None:
+    """Every segment figure must have a provenance record, and vice versa.
+
+    Task 4902. ``MEASURED_FLEET_SEGMENT_SECS`` and
+    ``MEASURED_FLEET_SEGMENT_PROVENANCE`` are two structures describing one
+    table, so they can drift: a segment added or removed in one and not the
+    other leaves either an un-ageable figure or a provenance record for a
+    segment that no longer exists. This guard is that referential integrity
+    check and nothing more.
+
+    SCOPE, stated because an earlier version of this file overreached. The
+    dates, sample sizes and percentiles recorded beside the table are durable
+    by virtue of being committed constants with comments; asserting a literal
+    against another literal in the same file adds no regression detection over
+    version control, so this file no longer does it. In particular there is no
+    guard that the table is CURRENT — that would have to read the
+    ``.task/verify/*.summary.json`` corpus at test time, which is pruned with
+    its worktrees and would therefore be non-deterministic and eventually
+    vacuous. Re-measurement is a human act (see the PROVENANCE comment above);
+    this test proves only that the table's bookkeeping is self-consistent.
+    """
+    assert set(MEASURED_FLEET_SEGMENT_PROVENANCE) == set(MEASURED_FLEET_SEGMENT_SECS), (
+        'MEASURED_FLEET_SEGMENT_PROVENANCE keys '
+        f'{sorted(MEASURED_FLEET_SEGMENT_PROVENANCE)} do not match '
+        f'MEASURED_FLEET_SEGMENT_SECS keys {sorted(MEASURED_FLEET_SEGMENT_SECS)} '
+        f'(missing provenance: {sorted(set(MEASURED_FLEET_SEGMENT_SECS) - set(MEASURED_FLEET_SEGMENT_PROVENANCE))}; '
+        f'orphaned provenance: {sorted(set(MEASURED_FLEET_SEGMENT_PROVENANCE) - set(MEASURED_FLEET_SEGMENT_SECS))}). '
+        'Every segment figure must carry its date and sample, or the table goes '
+        'back to being un-ageable — the defect task 4902 was filed to fix.'
+    )
+
+
+def test_orchestrator_fleet_row_derives_from_the_shared_census_record() -> None:
+    """The orchestrator row and its provenance follow task 3353's census record.
+
+    Task 6172. The record lives once, at
+    ``tests/scripts/verify_budget_census_records.py::ORCHESTRATOR_BUDGET_CENSUS``,
+    and ``verify_budget_census_records.py::RULED_BUDGET_CENSUS``, which the
+    budget gate reads, holds the same object. A re-literalised row here would
+    agree with it today and drift from it at the next re-measure.
+    """
+    home = 'tests/scripts/verify_budget_census_records.py::ORCHESTRATOR_BUDGET_CENSUS'
+    provenance = MEASURED_FLEET_SEGMENT_PROVENANCE['orchestrator']
+
+    assert MEASURED_FLEET_SEGMENT_SECS['orchestrator'] == round(ORCHESTRATOR_BUDGET_CENSUS.p50, 2), (
+        f"MEASURED_FLEET_SEGMENT_SECS['orchestrator'] is not {home}.p50 to 2 dp "
+        '(task 6172). The row is DERIVED from that record, never copied'
+    )
+    assert provenance.measured_at == ORCHESTRATOR_BUDGET_CENSUS.measured_at, (
+        f"MEASURED_FLEET_SEGMENT_PROVENANCE['orchestrator'].measured_at is not "
+        f'{home}.measured_at (task 6172). The provenance is DERIVED from that '
+        'record, never copied'
+    )
+    assert provenance.sample_size == ORCHESTRATOR_BUDGET_CENSUS.n, (
+        f"MEASURED_FLEET_SEGMENT_PROVENANCE['orchestrator'].sample_size is not "
+        f'{home}.n (task 6172). The provenance is DERIVED from that record, '
+        'never copied'
+    )
+
+
 def test_fallback_verify_budget_clears_the_measured_fleet_chain_floor() -> None:
     """The warm per-command budget must exceed the MEASURED fleet-chain floor.
 
     Task 3350. ``verify_command_timeout_secs`` is a PER-COMMAND budget and the
-    fleet chain is ONE shell command, so this single ceiling bounds all seven
-    suites together. It was set to 1800s under the comment "Full warm verify
-    here is ~2 min" — false by roughly an order of magnitude.
+    fleet chain is ONE shell command, so this single ceiling bounds every suite
+    together — nine directories in eight ``&&`` segments, since
+    ``tests/scripts/`` and ``scripts/tests/`` share the final clause. It was set
+    to 1800s under the comment "Full warm verify here is ~2 min" — false by
+    roughly an order of magnitude.
 
-    A ceiling below a five-of-seven-segment measured floor cannot be cleared by
-    a healthy run, so it does not surface hangs; it manufactures ``infra_timeout``
-    on the honest green path. That is what task 3062 attempt-2 hit at 1800.66s.
+    A ceiling below the measured-subset floor cannot be cleared by a healthy
+    run, so it does not surface hangs; it manufactures ``infra_timeout`` on the
+    honest green path. That is what task 3062 attempt-2 hit at 1800.66s.
 
     This asserts against the measured floor rather than pinning the chosen
     value, deliberately. Pinning a number would re-encode a constant with no
     stated basis — the exact failure mode of the "~2 min" comment this test
     exists to replace. A floor derived from logged per-suite durations cannot be
-    wrong in the direction that matters: three segments are excluded, so it is
-    provably a lower bound on the chain's real cost.
+    wrong in the direction that matters: the suites in
+    ``UNMEASURED_FLEET_SEGMENTS`` are excluded, so it is provably a lower bound
+    on the chain's real cost.
 
     SCOPE — what this guard does NOT do. It is a floor-REGRESSION guard: it
     fails if someone lowers ``verify_command_timeout_secs`` back below the
-    measured 1838.60s lower bound. It is NOT a suite-growth detector, and
-    nothing here re-measures anything. ``MEASURED_FLEET_SEGMENT_SECS`` is a
-    frozen literal asserted against a config value; if the orchestrator segment
-    doubles to 2700s tomorrow, the table still reads 1366.23, the floor still
-    reads 1838.60, and this test passes green while the budget is once again
-    provably below the honest green path. Genuine growth detection would have to
-    come from RE-MEASUREMENT — an operator runbook step, or a check against
-    durations recorded by a recent verify run — not from a hardcoded table
-    asserting against itself. Stating that plainly is the point: task 3350
-    exists because a justification nobody re-checked was left standing until it
-    was off by an order of magnitude, and a guard that overstates its own reach
-    is the same defect wearing a test's clothes.
+    measured floor. It is NOT a suite-growth detector, and nothing here
+    re-measures anything. ``MEASURED_FLEET_SEGMENT_SECS`` holds recorded figures
+    asserted against a config value: its orchestrator row follows the census
+    record it is derived from, and that record moves only when a human
+    re-measures. Since task 3496 the table's MEMBERSHIP (not
+    its durations) is pinned against the shipped chain by
+    ``test_measured_fleet_table_partitions_the_chain_it_measures``, which is why
+    the counts in the failure message below are derived rather than
+    re-hardcoded — "FIVE of seven" is the literal that drifted.
+
+    That limitation is no longer hypothetical. This paragraph used to warn: "if
+    the orchestrator segment doubles to 2700s tomorrow, the table still reads
+    1366.23, the floor still reads 1838.60, and this test passes green while the
+    budget is once again provably below the honest green path." That is what
+    happened. Commit 685f558728 (2026-08-20) capped the orchestrator fanout at
+    ``pytest -n 8``; its median green full-suite cost went from 691.40s to
+    1765.95s; the table stayed at 1366.23 and this test stayed green throughout,
+    for eight days, until task 4902 re-measured the segment BY HAND on
+    2026-08-28. The prediction was correct in kind and roughly correct in
+    magnitude, and the guard did not fire.
+
+    So the disclaimer stands, with one thing added and nothing softened.
+    Genuine growth detection still has to come from RE-MEASUREMENT — an operator
+    runbook step, or a check against durations recorded by a recent verify run —
+    not from a hardcoded table asserting against itself, and 4902 built no such
+    detector. What 4902 did add is age: every entry now carries dated provenance
+    (``MEASURED_FLEET_SEGMENT_PROVENANCE``), so the next reader can see which
+    epoch a figure came from without archaeology; and it removed the second
+    copy of these figures rather than policing it, so there is no republished
+    copy left to drift out of step — they live once, here, and
+    dark-factory-orchestrator.yaml's budget comment now points at them instead
+    of restating them. Neither makes the table measure itself. Stating that
+    plainly is the point: task 3350 exists because a justification nobody
+    re-checked was left standing until it was off by an order of magnitude,
+    and a guard that overstates its own reach is the same defect wearing a
+    test's clothes.
     """
     budgets = _verify_budgets()
     warm = budgets['verify_command_timeout_secs']
@@ -413,27 +946,127 @@ def test_fallback_verify_budget_clears_the_measured_fleet_chain_floor() -> None:
     assert warm > floor, (
         f'dark-factory-orchestrator.yaml verify_command_timeout_secs={warm} is '
         f'below the measured fleet-chain floor of {floor:.2f}s — short by '
-        f'{floor - warm:.2f}s (task 3350). That floor sums only FIVE of seven '
-        f'logged segments ({", ".join(sorted(MEASURED_FLEET_SEGMENT_SECS))}); '
-        'dashboard, sampler and cockpit are excluded entirely because task 3062 '
-        'attempt-2 timed out at 1800.66s before dashboard even started. A '
-        'per-command ceiling below a five-of-seven floor surfaces no hangs — it '
-        'manufactures infra_timeout on the honest green path. Raise the budget, '
-        'or split the chain and re-measure this table.'
+        f'{floor - warm:.2f}s (task 3350). That floor sums only '
+        f'{len(MEASURED_FLEET_SEGMENT_SECS)} of the '
+        f'{len(_fleet_pytest_suite_names(_fleet_test_command()))} suites the '
+        f'chain runs ({", ".join(sorted(MEASURED_FLEET_SEGMENT_SECS))}); '
+        f'{", ".join(sorted(UNMEASURED_FLEET_SEGMENTS))} are excluded entirely '
+        'because task 3062 attempt-2 timed out at 1800.66s before dashboard even '
+        'started. A per-command ceiling below even this partial floor surfaces '
+        'no hangs — it manufactures infra_timeout on the honest green path. '
+        'Raise the budget, or split the chain and re-measure this table.'
     )
 
     # Internal coherence: a cold run does strictly MORE work than a warm one —
-    # the same chain PLUS verify_cold_preprovision_command (uv sync
-    # --all-packages) — so a warm ceiling above the cold one is incoherent by
-    # construction, regardless of what either value is.
+    # the same chain PLUS verify_cold_preprovision_command (`uv sync
+    # --all-packages && npm ci …`; task 4538 added the npm clause that installs
+    # the pinned pyright the TYPE chain resolves) — so a warm ceiling above the
+    # cold one is incoherent by construction, regardless of either value.
     cold = budgets['verify_cold_command_timeout_secs']
     assert warm <= cold, (
         f'verify_command_timeout_secs={warm} exceeds '
         f'verify_cold_command_timeout_secs={cold} (task 3350). A cold verify runs '
-        'the same command chain plus the uv sync --all-packages preprovision, so '
-        'it is strictly more expensive; a warm budget above the cold one is '
-        'incoherent by construction'
+        'the same command chain plus the verify_cold_preprovision_command '
+        'preprovision (uv sync + npm ci), so it is strictly more expensive; a '
+        'warm budget above the cold one is incoherent by construction'
     )
+
+
+def test_measured_fleet_table_partitions_the_chain_it_measures() -> None:
+    """Every suite the fleet TEST chain runs is either measured or named as unmeasured.
+
+    Task 3496. The TEST-chain twin of
+    ``TestFleetTypeCheckCoversEveryWorkspaceMember.test_type_chain_table_matches_the_chain_it_measures``,
+    asserting a PARTITION rather than equality because the TEST chain carries
+    suites that are deliberately unmeasured. A suite added to the chain in
+    neither bucket silently UNDER-counts the floor asserted by
+    ``test_fallback_verify_budget_clears_the_measured_fleet_chain_floor``; a
+    suite still listed after leaving the chain silently OVER-counts it.
+
+    This is a MEMBERSHIP-drift check, not the duration-growth detector that
+    test's SCOPE paragraph disclaims; the TYPE-chain pair above coexists the
+    same way.
+    """
+    chain = _fleet_pytest_suite_names(_fleet_test_command())
+    assert 'orchestrator' in chain, (
+        'the fleet test_command parse resolved no orchestrator suite (task 3496) '
+        f'— resolved {sorted(chain)}; the raw-command regexes no longer match the '
+        'chain, and this partition invariant would pass vacuously'
+    )
+
+    measured = set(MEASURED_FLEET_SEGMENT_SECS)
+    assert measured.isdisjoint(UNMEASURED_FLEET_SEGMENTS), (
+        f'{sorted(measured & UNMEASURED_FLEET_SEGMENTS)} are listed both in '
+        'MEASURED_FLEET_SEGMENT_SECS and in UNMEASURED_FLEET_SEGMENTS (task '
+        '3496) — a suite is either measured or estimated, not both'
+    )
+
+    accounted = measured | UNMEASURED_FLEET_SEGMENTS
+    assert accounted == chain, (
+        'MEASURED_FLEET_SEGMENT_SECS | UNMEASURED_FLEET_SEGMENTS does not '
+        f'partition the fleet test_command suites {sorted(chain)} (task 3496). '
+        f'UNACCOUNTED (in the chain, in neither bucket — the floor silently '
+        f'UNDER-counts): {sorted(chain - accounted)}. ORPHANED (in a bucket, no '
+        f'longer in the chain — the floor silently OVER-counts): '
+        f'{sorted(accounted - chain)}. Measure an unaccounted suite and add it to '
+        'MEASURED_FLEET_SEGMENT_SECS and MEASURED_FLEET_SEGMENT_PROVENANCE, or, '
+        'if it genuinely cannot be measured, list it in '
+        'UNMEASURED_FLEET_SEGMENTS; drop an orphan from whichever bucket holds it. '
+        'If an UNACCOUNTED name is not a directory, or every real suite shows as '
+        'ORPHANED, suspect the parse rather than the tables: '
+        '_fleet_pytest_suite_names, whose shapes '
+        'test_fleet_pytest_suite_names_reads_each_chain_shape pins.'
+    )
+
+
+@pytest.mark.parametrize(
+    ('cmd', 'expected'),
+    [
+        pytest.param(
+            'cd shared && uv run pytest tests/ --timeout=300 && cd ../orchestrator '
+            '&& uv run pytest tests/ --timeout=300 && cd .. && ( [ -d cockpit ] '
+            '|| exit 0; cd cockpit && uv run pytest tests/ --timeout=300 ) && uv run '
+            '--project shared pytest tests/scripts/ scripts/tests/ --timeout=300',
+            {'shared', 'orchestrator', 'cockpit', 'tests/scripts', 'scripts/tests'},
+            id='shipped-shape-subshell-cd-does-not-leak',
+        ),
+        pytest.param(
+            'uv run --project shared pytest fused-memory/tests/ --timeout=300',
+            {'fused-memory/tests'},
+            id='hyphenated-root-target',
+        ),
+        pytest.param(
+            'uv run --project shared pytest -q --tb=short tests/scripts/ scripts/tests/',
+            {'tests/scripts', 'scripts/tests'},
+            id='flags-before-targets-and-no-timeout',
+        ),
+        pytest.param(
+            "cd orchestrator && uv run pytest -n 4 --dist loadgroup -m 'not smoke' "
+            'tests/ --timeout 300',
+            {'orchestrator'},
+            id='value-taking-flags',
+        ),
+        pytest.param(
+            'uv run --project shared pytest tests/scripts/ --junitxml out.xml '
+            '--color yes --log-level INFO',
+            {'tests/scripts'},
+            id='root-clause-value-flags-from-the-shared-set',
+        ),
+        pytest.param(
+            'cd shared && uv run ruff check . && uv run pytest tests/',
+            {'shared'},
+            id='non-pytest-clause-ignored',
+        ),
+    ],
+)
+def test_fleet_pytest_suite_names_reads_each_chain_shape(cmd: str, expected: set[str]) -> None:
+    """The suite parser behind the partition guard reads every chain shape it may meet.
+
+    Task 3496 amendment. Pinned on synthetic chains so a parse regression fails
+    HERE, naming the parser, instead of surfacing in the partition guard as
+    suites "missing" from tables that are correct.
+    """
+    assert _fleet_pytest_suite_names(cmd) == expected
 
 
 def test_nested_module_configs_are_covered_by_the_per_test_timeout_guard() -> None:
@@ -486,3 +1119,739 @@ def test_nested_module_configs_are_covered_by_the_per_test_timeout_guard() -> No
         f'discovery failed to resolve known per-module config(s) {sorted(missing)} '
         f'(task 3350); discovered: {sorted(discovered)}'
     )
+
+
+def _pyright_clause_cwds(cmd: str) -> list[str]:
+    """Return, in order, the normalised cwd of each bare-pyright clause in *cmd*.
+
+    Thin delegation to ``verify_command_invariants.pyright_clause_cwds`` (task
+    4108), which is where the walk itself now lives. The shared parser uses the
+    same PRODUCTION helpers ``verify._AND_CLAUSE_SPLIT_RE`` /
+    ``verify._cd_clause_target`` that ``verify._scope_fallback_tool_to_subproject``
+    (task 3022) itself uses to read this exact command — so this helper still
+    cannot drift from how the scoper interprets the chain.
+
+    A "bare" pyright clause mentions ``pyright`` and is not already wrapped in
+    ``uv run --project`` (interpreter-pinned by uv itself, not by
+    ``[tool.pyright]``, so it is excluded from the result). That exclusion is the
+    shared parser's ``skip_uv_project`` DEFAULT, which is what keeps this call
+    site byte-identical in behaviour across the extraction; the CONTRIBUTING.md
+    mirror added by task 4108 passes ``skip_uv_project=False`` because it asks
+    the other question — which directories the command type-checks, rather than
+    which clauses are pinned by ``[tool.pyright]``.
+
+    Originally inlined in ``TestRootTypeCheckCommandPyrightInterpreterPinned``'s
+    own test method (task 3367), extracted to this module (task 3397) so that
+    test and the fleet TYPE-chain coverage invariant below walk the chain
+    identically and cannot drift apart — the same "must not drift apart"
+    convention ``_assert_pyright_pins_worktree_venv`` already states. Task 4108
+    widened that scope one level: the walk moved to
+    ``tests/scripts/verify_command_invariants.py``, the module task 3745 created
+    to hold shared command parsing precisely so a THIRD caller could not become a
+    third copy ("IMPORT ME, DO NOT COPY ME ... add a PARAMETER here rather than a
+    variant there").
+    """
+    return vci.pyright_clause_cwds(cmd)
+
+
+class TestRootTypeCheckCommandPyrightInterpreterPinned:
+    """Every bare-``pyright`` clause of the fleet chain must be interpreter-pinned.
+
+    Task 3367 / esc-3359-1 — the DOCS-ONLY-DIFF guard.
+
+    A docs-only diff contains zero ``.py`` files, so ``verify._build_fallback_config``
+    returns ``None`` and the RAW ``type_check_command`` from
+    ``dark-factory-orchestrator.yaml`` runs verbatim — none of the
+    ``_scope_fallback_tool_to_subproject`` rescoping (tasks 2355/3022) applies.
+    Its outcome then depends on exactly one property: whether every directory the
+    chain ``cd``s into pins pyright's interpreter at that worktree's own ``.venv``.
+
+    If a clause does not, pyright falls back to ambient VIRTUAL_ENV/PATH resolution
+    — and ``verify._target_subprocess_env`` deliberately strips both — so a cold
+    merge worktree type-checks against an interpreter holding none of the
+    workspace's third-party packages. Measured under exactly that scrubbed env:
+    fused-memory 514 errors, orchestrator 496, all phantom reportMissingImports;
+    0 in both once the pin is present.
+    """
+
+    def test_every_bare_pyright_clause_runs_in_an_interpreter_pinned_dir(self) -> None:
+        cmd = _fleet_type_check_command()
+        checked = _pyright_clause_cwds(cmd)
+
+        for cwd in checked:
+            pyproject = _pyproject_at(cwd)
+            pyright = pyproject.get("tool", {}).get("pyright")
+            assert pyright is not None, (
+                f"fleet type_check_command runs a bare pyright clause in {cwd!r}, "
+                "whose pyproject.toml has no [tool.pyright] table at all (task "
+                "3367, esc-3359-1) — so pyright resolves its interpreter from "
+                "ambient VIRTUAL_ENV/PATH, which verify._target_subprocess_env "
+                "strips"
+            )
+            _assert_pyright_pins_worktree_venv(
+                cwd,
+                pyright,
+                why=(
+                    "It is the cwd of a bare-pyright clause in fleet "
+                    "type_check_command, which a DOCS-ONLY diff runs verbatim "
+                    "(no .py files -> _build_fallback_config returns None -> no "
+                    "rescoping)."
+                ),
+            )
+
+        # Non-vacuity: if the chain's shape changes such that no bare-pyright
+        # clause is found, this guard must fail loudly rather than pass on an
+        # empty set.
+        assert checked, (
+            "no bare (non-`uv run --project`) pyright clause was found in "
+            f"dark-factory-orchestrator.yaml type_check_command (task 3367, "
+            f"esc-3359-1) — this interpreter-pin guard would pass vacuously. "
+            f"Either the chain no longer runs pyright, or its shape changed such "
+            f"that the &&-clause walk no longer resolves its cwds; got: {cmd!r}"
+        )
+
+
+# Floor for the workspace-wide interpreter-pin invariant below: proof that
+# runtime discovery from the root pyproject's ``[tool.uv.workspace].members``
+# still resolves the members that actually carry pyright configs. NOT the
+# authoritative list — same convention as KNOWN_PER_MODULE_CONFIG_NAMES above,
+# so a newly-added workspace member is auto-covered with no edit here.
+#
+# Task 3397: extended from 4 to all 7 members — shared, escalation,
+# orchestrator, fused-memory (pre-existing) plus dashboard, sampler, cockpit,
+# which the task-3397 fan-out confirmed all declare a
+# ``[tool.pyright] venvPath=".." venv=".venv"`` table too.
+KNOWN_PYRIGHT_PINNED_MEMBERS = frozenset(
+    {
+        "shared",
+        "escalation",
+        "orchestrator",
+        "fused-memory",
+        "dashboard",
+        "sampler",
+        "cockpit",
+    }
+)
+
+
+class TestWorkspacePyrightInterpreterPinned:
+    """EVERY uv-workspace member declaring ``[tool.pyright]`` must pin the worktree venv.
+
+    Task 3367 / esc-3359-1 — the generalisation of the fleet-chain guard above.
+
+    Before task 3397, ``TestRootTypeCheckCommandPyrightInterpreterPinned``
+    covered only the 3 directories ``type_check_command`` happened to ``cd``
+    into, leaving the hole one config edit away from reopening: ``shared`` and
+    ``escalation`` were type-checked only through their own
+    ``<sub>/orchestrator.yaml`` ``uv run --directory X pyright``
+    commands, where uv (not ``[tool.pyright]``) supplies the interpreter, and
+    ``sampler``/``cockpit``/``dashboard`` weren't in the fleet chain at all.
+    Task 3397 extended the fleet chain to all 7 workspace members, so today
+    both guards cover the same set in practice.
+
+    This class survives that as more than a near-duplicate: it is
+    CHAIN-INDEPENDENT. It checks every workspace member that declares a
+    ``[tool.pyright]`` table AT ALL — via the fleet chain, a per-module
+    ``orchestrator.yaml``, or a developer running ``npx pyright`` directly in
+    that directory — rather than deriving coverage from walking one
+    particular command string. A future rewrite of ``type_check_command``
+    (e.g. back down to a subset, or into a different shape entirely) would
+    silently narrow ``TestRootTypeCheckCommandPyrightInterpreterPinned``'s
+    coverage without this class noticing, because this class does not read
+    ``type_check_command`` at all.
+
+    Members are DISCOVERED at runtime from the root ``pyproject.toml``'s
+    ``[tool.uv.workspace].members``, so a newly-added subproject is covered on
+    day one rather than escaping a hardcoded list.
+    """
+
+    def _workspace_member_dirs(self) -> list[str]:
+        return _workspace_member_dirs()
+
+    def test_every_workspace_member_pyright_config_pins_the_worktree_venv(self) -> None:
+        # The root pyproject is checked too: it is the mirror the members' ".."
+        # pins resolve to, spelled ``venvPath = "."`` from its own directory.
+        checked: set[str] = set()
+        for rel_dir in [".", *self._workspace_member_dirs()]:
+            # cockpit is presence-guarded elsewhere in this file (it landed on
+            # main after some guards were scoped); skip any member directory that
+            # is genuinely absent rather than failing on a stale members list.
+            if not (REPO_ROOT / rel_dir / "pyproject.toml").is_file():
+                continue
+            pyright = _pyproject_at(rel_dir).get("tool", {}).get("pyright")
+            if pyright is None:
+                # A member that never runs pyright has no interpreter to pin.
+                continue
+            _assert_pyright_pins_worktree_venv(
+                rel_dir,
+                pyright,
+                why=(
+                    f"{rel_dir!r} is a uv-workspace member that declares a "
+                    "[tool.pyright] table, so pyright can be invoked there — by "
+                    "the fleet chain, by its own orchestrator.yaml, or by a "
+                    "developer — and every such invocation must resolve THIS "
+                    "worktree's own .venv."
+                ),
+            )
+            checked.add(rel_dir)
+
+        assert checked, (
+            "no workspace member with a [tool.pyright] table was discovered "
+            "(task 3367, esc-3359-1) — this invariant would pass vacuously"
+        )
+        missing = KNOWN_PYRIGHT_PINNED_MEMBERS - checked
+        assert not missing, (
+            f"runtime discovery from [tool.uv.workspace].members failed to resolve "
+            f"known pyright-configured member(s) {sorted(missing)} (task 3367); "
+            f"checked: {sorted(checked)}. Either a member was dropped from the "
+            f"workspace, or its [tool.pyright] table was removed — both need an "
+            f"explicit decision, not a silently shrinking guard"
+        )
+
+
+# Floor for the fleet-chain coverage invariants below (TYPE here; the LINT
+# coverage invariant reuses the same frozenset — task 3397, named for what it
+# is: the workspace members every fleet chain must cover, not just TYPE's).
+# NOT the authoritative list.
+#
+# UNLIKE KNOWN_PER_MODULE_CONFIG_NAMES / KNOWN_PYRIGHT_PINNED_MEMBERS above,
+# this floor is NOT proof that runtime discovery from
+# ``[tool.uv.workspace].members`` still resolves these members: the sets it
+# is subtracted from below (``walked`` / ``targets``) are parsed from the
+# CONFIG COMMAND strings themselves (``type_check_command`` /
+# ``lint_command``), not from ``_workspace_member_dirs()``. Removing an entry
+# from the root pyproject's members list would therefore NOT fail either
+# guard below on its own. What this floor DOES catch: the fleet TYPE/LINT
+# chain STRINGS silently shrinking — a ``cd``/``npx pyright`` pair, or a
+# ruff/magicmock target, dropped from the yaml. A newly-added workspace
+# member is still auto-covered with no edit here, because the per-member
+# loops just above each of these assertions discover members from
+# ``_workspace_member_dirs()`` at runtime.
+KNOWN_FLEET_MEMBERS = frozenset(
+    {"cockpit", "dashboard", "escalation", "fused-memory", "orchestrator", "sampler", "shared"}
+)
+
+
+# Measured per-member wall-clock of the fleet TYPE chain
+# (dark-factory-orchestrator.yaml type_check_command), in seconds.
+#
+# PROVENANCE: task 3397, measured 2026-08-02 in a synced worktree (`env -u
+# VIRTUAL_ENV uv sync --all-packages`), each member run standalone as
+# `env -u VIRTUAL_ENV bash -c "cd <member> && npx pyright"` — mirrors what
+# verify._target_subprocess_env strips. All seven: exit 0, "0 errors". The
+# full 7-clause chain also ran end-to-end as one command: exit 0, 576s
+# wall-clock — a dated snapshot, not a self-maintaining invariant (same
+# honesty as MEASURED_FLEET_SEGMENT_SECS above).
+MEASURED_FLEET_TYPE_SEGMENT_SECS = {
+    "fused-memory": 113,
+    "orchestrator": 220,
+    "dashboard": 51,
+    "shared": 64,
+    "escalation": 42,
+    "sampler": 11,
+    "cockpit": 17,
+    "client-feed": 5,
+}
+
+
+class TestFleetTypeCheckCoversEveryWorkspaceMember:
+    """The fleet TYPE chain must ``cd`` into and pyright-check every workspace member.
+
+    Task 3397. ``type_check_command`` is, like ``test_command`` above, the
+    FALLBACK chain: ``verify._build_fallback_config`` returns ``None`` for a
+    zero-``.py``-file diff, so a docs-only or cross-cutting diff runs this
+    chain verbatim with no ``_scope_fallback_tool_to_subproject`` rescoping.
+    Before task 3397 the chain covered only 3 of 7
+    ``[tool.uv.workspace].members`` (fused-memory, orchestrator, dashboard),
+    so shared, escalation, sampler and cockpit were never type-checked at
+    this gating layer — the same defect class task 2361/2368 closed for
+    ``test_command``.
+    """
+
+    def test_every_present_workspace_member_is_type_checked(self) -> None:
+        walked = set(_pyright_clause_cwds(_fleet_type_check_command()))
+
+        for member in _workspace_member_dirs():
+            if not (REPO_ROOT / member / "pyproject.toml").is_file():
+                # Mirrors the presence tolerance in
+                # TestWorkspacePyrightInterpreterPinned: a member genuinely
+                # absent from this checkout is skipped rather than failed.
+                continue
+            assert member in walked, (
+                f"fleet type_check_command does not cd into and pyright-check "
+                f"workspace member {member!r} (task 3397) — a docs-only or "
+                "cross-cutting diff (zero .py files touched) runs this chain "
+                f"verbatim with no rescoping, so {member!r} would never be "
+                f"type-checked at the gating layer; walked: {sorted(walked)}"
+            )
+
+        assert walked, (
+            "the fleet type_check_command &&-walk resolved no cwds at all "
+            "(task 3397) — this coverage invariant would pass vacuously"
+        )
+        missing = KNOWN_FLEET_MEMBERS - walked
+        assert not missing, (
+            f"fleet type_check_command is missing known workspace member(s) "
+            f"{sorted(missing)} (task 3397) — either a member was dropped from "
+            "the chain, or it was rewritten into a form the &&-walk cannot "
+            "follow (e.g. a subshell-guarded clause, which "
+            "verify._scope_fallback_tool_to_subproject's own cwd tracker also "
+            f"cannot follow); walked: {sorted(walked)}"
+        )
+
+    def test_measured_type_chain_floor_clears_the_verify_budget(self) -> None:
+        """The warm per-command budget must exceed the MEASURED TYPE-chain floor.
+
+        Task 3397. ``verify_command_timeout_secs`` is a PER-COMMAND budget, and
+        TEST/LINT/TYPE are three SEPARATE commands dispatched concurrently in
+        one ``asyncio.gather`` (verify.py:3745-3768, 4201-4207) — each bounded
+        by its own copy of the same ceiling. Extending the TYPE chain from 3 to
+        7 members therefore adds nothing to the TEST floor asserted by
+        ``test_fallback_verify_budget_clears_the_measured_fleet_chain_floor``
+        above; this is TYPE's own equivalent guard, over its own table.
+
+        SCOPE — what this guard does NOT do, mirroring that same test's own
+        scope note. It is a floor-REGRESSION guard: it fails if someone lowers
+        ``verify_command_timeout_secs`` back below the measured 518s lower
+        bound. It is NOT a suite-growth detector, and nothing here re-measures
+        anything. ``MEASURED_FLEET_TYPE_SEGMENT_SECS`` is a frozen literal
+        asserted against a config value; if a member's pyright run doubles
+        tomorrow, the table still reads its 2026-08-02 figure, the floor still
+        reads 518, and this test stays green while the budget is once again
+        unmeasured against the honest green path. Genuine growth detection
+        would have to come from RE-MEASUREMENT, not from a hardcoded table
+        asserting against itself.
+        """
+        budgets = _verify_budgets()
+        warm = budgets["verify_command_timeout_secs"]
+        cold = budgets["verify_cold_command_timeout_secs"]
+        floor = sum(MEASURED_FLEET_TYPE_SEGMENT_SECS.values())
+
+        assert warm > floor, (
+            f"dark-factory-orchestrator.yaml verify_command_timeout_secs={warm} "
+            f"is below the measured fleet TYPE-chain floor of {floor}s (task "
+            "3397) — a per-command ceiling below the honest green path "
+            "manufactures infra_timeout rather than surfacing hangs. Raise the "
+            "budget, or re-measure this table."
+        )
+        # Internal coherence, mirrors test_fallback_verify_budget_clears_the_
+        # measured_fleet_chain_floor's own cold/warm assertion: a cold verify
+        # does strictly MORE work than a warm one, so a warm ceiling above the
+        # cold one is incoherent regardless of what either value is.
+        assert warm <= cold, (
+            f"verify_command_timeout_secs={warm} exceeds "
+            f"verify_cold_command_timeout_secs={cold} (task 3397). A cold "
+            "verify runs the same chains plus the "
+            "verify_cold_preprovision_command preprovision (uv sync + npm ci), "
+            "so it is strictly more expensive; a warm budget above the cold one "
+            "is incoherent by construction"
+        )
+
+    def test_type_chain_table_matches_the_chain_it_measures(self) -> None:
+        """MEASURED_FLEET_TYPE_SEGMENT_SECS must describe exactly the shipped chain.
+
+        Task 3397. Guards against the table silently drifting from the actual
+        ``type_check_command`` — a member added to the chain without adding its
+        measured seconds would silently UNDER-count the floor asserted by
+        ``test_measured_type_chain_floor_clears_the_verify_budget`` above; a
+        member removed from the chain while its stale figure lingers would
+        silently OVER-count it.
+        """
+        walked = set(_pyright_clause_cwds(_fleet_type_check_command()))
+        assert set(MEASURED_FLEET_TYPE_SEGMENT_SECS) == walked, (
+            f"MEASURED_FLEET_TYPE_SEGMENT_SECS keys "
+            f"{sorted(MEASURED_FLEET_TYPE_SEGMENT_SECS)} do not match the fleet "
+            f"type_check_command chain it is meant to cost (task 3397); walked: "
+            f"{sorted(walked)}. Update the table to match whenever the chain "
+            "changes."
+        )
+
+
+# The ruff keyword, aliased from the shared module rather than restated as a
+# literal — the convention the four sibling guards already follow, so
+# ``"ruff check"`` is single-sourced across all five consumers.
+_RUFF_KEYWORD = vci.RUFF
+
+
+def _lint_leg_targets(cmd: str, marker: str) -> list[str]:
+    """Return the positional targets of *cmd*'s ``&&``-leg identified by *marker*.
+
+    DELEGATES to ``tests/scripts/verify_command_invariants.py`` (task 3883).
+    This helper was the FIFTH hand-maintained copy of that module's parsing
+    trio, and — awkwardly — the copy whose prose the other guards had been
+    citing as canonical. The "compare whole path TOKENS, never substring-match
+    the raw command" contract, together with its measured ``'shared' in cmd``
+    counterexample, now lives at
+    ``tests/scripts/verify_command_invariants.py::positional_targets``; read it
+    there.
+
+    *cmd* is the fleet ``lint_command``, an ``&&``-chain of two legs: a ``ruff
+    check <targets...>`` leg and a ``check_bare_magicmock_config.py
+    <targets...>`` sibling-checker leg. *marker* selects which leg — pass
+    ``_RUFF_KEYWORD`` or ``"check_bare_magicmock_config.py"``.
+
+    NO CWD WALK IS NEEDED HERE, unlike the TYPE chain above: this command has
+    no ``cd`` clauses at all, every target being an explicit repo-root-relative
+    path, so the production ``_AND_CLAUSE_SPLIT_RE``/``_cd_clause_target``
+    cwd-tracking walk does not apply. That remains this helper's own fact, and
+    is why plain segment selection is sufficient.
+
+    TRIMMING TO THE POST-ANCHOR TAIL is what keeps the callers' ``assert
+    targets`` non-vacuity guard live. A whole-leg tokenisation always contains
+    the command's own tokens (``uv``, ``run``, ``ruff`` / ``python3``,
+    ``<script>.py``), so that guard could never fire empty even if every
+    positional target were deleted.
+
+    ``path_anchor=True`` for BOTH markers: the magicmock checker is invoked by
+    PATH (``fused-memory/scripts/check_bare_magicmock_config.py``), and the flag
+    is safe for the ruff leg too because it only ADDS candidate positions and no
+    token before ``check`` in ``uv run ruff check ...`` ends in ``/check``. One
+    call shape therefore serves both markers, with no marker→policy table inside
+    a helper whose whole purpose is to stop being a decision point.
+
+    NO ``value_flags``: this helper filtered nothing at all before the
+    migration, so the empty default — byte-for-byte the naive ``-``-prefix
+    filter, pinned by
+    ``test_verify_command_invariants.py::test_positional_targets_with_no_value_flags_is_the_naive_dash_prefix_filter``
+    — is the closest-preserving choice, and matches the two ``value_flags``-free
+    siblings.
+
+    WHAT THAT COSTS, recorded here rather than papered over in the shared
+    module, whose phantom census
+    (``tests/scripts/verify_command_invariants.py::positional_targets``) names
+    this guard for it. A space-separated flag VALUE is admitted as a phantom
+    target, and both call sites below assert every target EXISTS on disk — so an
+    unrecognised value-taking flag added to the fleet ``lint_command`` would go
+    red naming its value as a missing path. Accepted deliberately: the exposure
+    is identical to ``test_root_lint_covers_nonmember_py.py::_ruff_targets``'s,
+    the live command carries no such flag, and inventing a set here would be a
+    behaviour change smuggled into a migration whose whole claim is that it
+    makes none. The moment one appears, borrow
+    ``test_contributing_lint_command_drift.py``'s ``_RUFF_FLAGS_TAKING_A_VALUE``
+    rather than re-deriving one.
+
+    ``required_segment`` also upgrades a no-match from a silent ``[]`` to a loud
+    exactly-one assertion: a marker that stops matching now names itself instead
+    of degrading into the callers' generic "would pass vacuously" message.
+
+    THE LABEL IS THREADED INTO BOTH CALLS, from one local rather than two
+    literals so the two cannot drift apart. There are TWO ways to fail here —
+    segment selection (no leg matches *marker*) and anchor location (a leg
+    matches, but names no such checker token) — and only the first is
+    ``required_segment``'s. Labelling just that one would leave the anchor
+    failure, which is precisely what
+    ``test_lint_leg_targets_anchors_on_a_whole_path_component_not_a_suffix``
+    exercises, degrading into ``_where``'s bare ``repr(segment)`` fallback.
+    """
+    label = "the fleet lint_command (task 3397)"
+    return vci.positional_targets(
+        vci.required_segment(cmd, marker, label=label),
+        marker,
+        path_anchor=True,
+        label=label,
+    )
+
+
+def test_lint_leg_targets_reads_flag_values_as_flags_not_paths() -> None:
+    """A ``-``-prefixed token is a FLAG, never a lint target.
+
+    Concretely load-bearing rather than tidy. Both call sites below assert
+    ``(REPO_ROOT / target).exists()`` over every returned target, so a flag
+    admitted as a target goes red with "names '--fix', which does not exist
+    under <repo root>" on a lint_command that broke nothing — the same
+    misleading diagnosis ``test_contributing_lint_command_drift.py``'s
+    ``_RUFF_FLAGS_TAKING_A_VALUE`` was introduced to prevent at the sibling
+    boundary.
+
+    MEASURED RED before task 3883: the hand-rolled helper returned every token
+    after the marker window with no filter at all, i.e.
+    ``["--fix", "alpha", "beta.py"]``.
+    """
+    cmd = (
+        "uv run ruff check --fix alpha beta.py && "
+        "python3 fused-memory/scripts/check_bare_magicmock_config.py shared/tests"
+    )
+    assert _lint_leg_targets(cmd, _RUFF_KEYWORD) == ["alpha", "beta.py"]
+
+
+def test_lint_leg_targets_anchors_on_a_whole_path_component_not_a_suffix() -> None:
+    """``x_check_bare_magicmock_config.py`` is a DIFFERENT file, not this one.
+
+    MEASURED RED before task 3883: the hand-rolled helper's raw ``str.endswith``
+    fallback matched that unrelated filename and returned ``["a", "b"]`` —
+    another script's arguments silently reported as the magicmock checker's
+    targets, which the caller then asserts must exist on disk. Matching a whole
+    path COMPONENT rejects the near-miss while still matching the live
+    ``fused-memory/scripts/check_bare_magicmock_config.py`` token.
+
+    ISOLATING WHICH ASSERTION FIRES is what makes this a pin rather than a
+    tautology. ``_lint_leg_targets`` raises ``AssertionError`` from two
+    independent places — ``required_segment``'s exactly-one-segment check and
+    ``anchor_split``'s anchor-presence check — so a bare ``pytest.raises``
+    around the helper alone would go green on either and pin nothing about
+    anchoring. Establishing that segment SELECTION succeeds first
+    (``required_segment`` matches on substring, so the near-miss leg IS the
+    selected one) leaves the anchor check as the only remaining source, for the
+    direct call below AND for the end-to-end one after it. Same shape as
+    ``test_verify_command_invariants.py::test_positional_targets_default_still_rejects_a_path_spelled_anchor``.
+
+    No ``match=``: assertion wording is not pinned anywhere in this family, so
+    the diagnostics stay free to be reworded.
+    """
+    cmd = "python3 scripts/x_check_bare_magicmock_config.py a b"
+    marker = "check_bare_magicmock_config.py"
+    segment = vci.required_segment(cmd, marker)
+    assert segment == cmd
+    with pytest.raises(AssertionError):
+        vci.positional_targets(segment, marker, path_anchor=True)
+    # End-to-end through the helper actually under test, so ``path_anchor=True``
+    # stays load-bearing HERE rather than merely restated by the line above.
+    with pytest.raises(AssertionError):
+        _lint_leg_targets(cmd, marker)
+
+
+class TestFleetLintCoversEveryWorkspaceMember:
+    """The fleet LINT chain must ruff-check every workspace member.
+
+    Task 3397. ``lint_command`` is, like ``test_command``/``type_check_command``
+    above, the FALLBACK chain: ``verify._build_fallback_config`` returns
+    ``None`` for a zero-``.py``-file diff, so a docs-only or cross-cutting
+    diff runs this chain verbatim with no
+    ``_scope_fallback_tool_to_subproject`` rescoping. Before task 3397 the
+    ``ruff check`` leg covered only 5 of 7 ``[tool.uv.workspace].members``
+    (sampler and cockpit were absent), so a docs-only or cross-cutting diff
+    never ruff-checked either at the gating layer.
+    """
+
+    def test_every_present_workspace_member_is_ruff_checked(self) -> None:
+        cmd = _fleet_lint_command()
+        targets = _lint_leg_targets(cmd, _RUFF_KEYWORD)
+
+        for member in _workspace_member_dirs():
+            if not (REPO_ROOT / member / "pyproject.toml").is_file():
+                # Mirrors the presence tolerance used throughout this file: a
+                # member genuinely absent from this checkout is skipped
+                # rather than failed.
+                continue
+            assert member in targets, (
+                f"fleet lint_command's ruff-check leg does not target "
+                f"workspace member {member!r} (task 3397) — a docs-only or "
+                "cross-cutting diff (zero .py files touched) runs this chain "
+                f"verbatim with no rescoping, so {member!r} would never be "
+                f"ruff-checked at the gating layer; targets: {targets}"
+            )
+
+        assert targets, (
+            "the fleet lint_command's ruff-check leg had no positional "
+            "targets at all (task 3397) — this coverage invariant would pass "
+            "vacuously"
+        )
+        missing = KNOWN_FLEET_MEMBERS - set(targets)
+        assert not missing, (
+            f"fleet lint_command's ruff-check leg is missing known workspace "
+            f"member(s) {sorted(missing)} (task 3397); targets: {targets}"
+        )
+
+        # A typo'd or stale target (e.g. "sampler/test", "cocpit") is invisible
+        # to the two assertions above — they only catch a KNOWN member being
+        # MISSING, not a bogus EXTRA one — yet it would make `ruff check` exit
+        # non-zero on every fallback/merge-queue verify. Catch it here instead
+        # of at the gating layer.
+        for target in targets:
+            assert (REPO_ROOT / target).exists(), (
+                f"fleet lint_command's ruff-check leg names {target!r}, which "
+                f"does not exist under {REPO_ROOT} (task 3397) — this would "
+                "make `ruff check` exit non-zero on every fallback/merge-queue "
+                f"verify; targets: {targets}"
+            )
+
+    def test_every_present_workspace_member_tests_dir_is_magicmock_checked(self) -> None:
+        cmd = _fleet_lint_command()
+        targets = _lint_leg_targets(cmd, "check_bare_magicmock_config.py")
+
+        for member in _workspace_member_dirs():
+            if not (REPO_ROOT / member / "tests").is_dir():
+                # check_bare_magicmock_config.py takes directories; naming one
+                # that doesn't exist would make this leg exit non-zero, so a
+                # member with no tests/ dir is skipped rather than failed.
+                continue
+            tests_dir = f"{member}/tests"
+            assert tests_dir in targets, (
+                f"fleet lint_command's check_bare_magicmock_config.py leg "
+                f"does not target {tests_dir!r} (task 3397) — a docs-only or "
+                "cross-cutting diff (zero .py files touched) runs this chain "
+                f"verbatim with no rescoping, so {tests_dir!r} would never be "
+                f"checked for bare MagicMock config at the gating layer; "
+                f"targets: {targets}"
+            )
+
+        assert targets, (
+            "the fleet lint_command's check_bare_magicmock_config.py leg had "
+            "no positional targets at all (task 3397) — this coverage "
+            "invariant would pass vacuously"
+        )
+
+        # Same typo-blind-spot rationale as the ruff-leg assertion above: a
+        # bogus extra target (not merely a missing known one) would make this
+        # leg exit non-zero on every fallback/merge-queue verify.
+        for target in targets:
+            assert (REPO_ROOT / target).exists(), (
+                f"fleet lint_command's check_bare_magicmock_config.py leg "
+                f"names {target!r}, which does not exist under {REPO_ROOT} "
+                "(task 3397) — this would make the script exit non-zero on "
+                f"every fallback/merge-queue verify; targets: {targets}"
+            )
+
+
+# ---------------------------------------------------------------------------
+# Pyright scope parity: members importing a scripts/-only module (task 3931)
+# ---------------------------------------------------------------------------
+
+# Floor for the discovery below. NOT the authoritative list — the importing
+# members are DISCOVERED at runtime by scanning member sources, so a NEW
+# member that starts importing a ``scripts/``-only module is covered on day
+# one. This floor only proves the scan still resolves the member we know
+# imports one (``orchestrator/tests/test_run_vllm_eval.py`` imports
+# ``run_vllm_eval``), so a scan that silently stops matching anything fails
+# loudly instead of passing vacuously.
+KNOWN_SCRIPTS_IMPORTING_MEMBERS = frozenset({"orchestrator"})
+
+
+def _scripts_only_module_stems() -> set[str]:
+    """Top-level module names importable ONLY from repo-root ``scripts/``.
+
+    ``scripts/*.py`` stems, minus (a) non-identifier stems (``wait-for-port``
+    et al. are runnable files, never importable modules), (b) stdlib names,
+    and (c) any stem that is ALSO a top-level module/package under a workspace
+    member's ``src/`` or at the repo root — those resolve for pyright through
+    an existing ``extraPaths`` entry and say nothing about ``scripts/``.
+    """
+    stems = {p.stem for p in (REPO_ROOT / "scripts").glob("*.py") if p.stem.isidentifier()}
+    resolvable_elsewhere: set[str] = {p.stem for p in REPO_ROOT.glob("*.py")}
+    for member in _workspace_member_dirs():
+        src = REPO_ROOT / member / "src"
+        if not src.is_dir():
+            continue
+        resolvable_elsewhere |= {
+            child.stem if child.suffix == ".py" else child.name for child in src.iterdir()
+        }
+    return stems - set(sys.stdlib_module_names) - resolvable_elsewhere
+
+
+def _members_importing_scripts_only_modules() -> dict[str, set[str]]:
+    """Map each workspace member to the ``scripts/``-only modules its own files import."""
+    stems = _scripts_only_module_stems()
+    assert stems, (
+        "no repo-root scripts/ module is importable-only-from-scripts (task "
+        "3931) — this scope-parity invariant would pass vacuously"
+    )
+    pattern = re.compile(
+        r"^[ \t]*(?:import|from)[ \t]+(" + "|".join(sorted(map(re.escape, stems))) + r")\b",
+        re.MULTILINE,
+    )
+    found: dict[str, set[str]] = {}
+    for member in _workspace_member_dirs():
+        member_dir = REPO_ROOT / member
+        if not member_dir.is_dir():
+            # Presence tolerance, per TestWorkspacePyrightInterpreterPinned: a
+            # member genuinely absent from this checkout is skipped, not failed.
+            continue
+        for path in member_dir.rglob("*.py"):
+            if ".venv" in path.parts:
+                continue
+            try:
+                text = path.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError):
+                continue
+            for match in pattern.finditer(text):
+                found.setdefault(member, set()).add(match.group(1))
+    return found
+
+
+def _assert_pyright_resolves_scripts(rel_dir: str, pyright: dict, why: str) -> None:
+    """Assert *rel_dir*'s ``[tool.pyright] extraPaths`` resolves repo-root ``scripts/``.
+
+    Modelled on ``_assert_pyright_pins_worktree_venv`` above (task 3367): one
+    shared assertion carrying the caller's context through ``why=``, so the
+    per-member invariant here and the module-local guard in
+    ``orchestrator/tests/test_run_vllm_eval.py`` state the same property and
+    cannot drift apart.
+
+    Asserted by RESOLUTION, never by string equality: ``../scripts`` and any
+    other spelling landing on the same directory both pass.
+    """
+    extra_paths = pyright.get("extraPaths")
+    assert extra_paths, (
+        f"{rel_dir}/pyproject.toml [tool.pyright] declares no extraPaths (task "
+        f"3931). {why}"
+    )
+    scripts_dir = (REPO_ROOT / "scripts").resolve()
+    resolved = [(REPO_ROOT / rel_dir / entry).resolve() for entry in extra_paths]
+    assert scripts_dir in resolved, (
+        f"{rel_dir}/pyproject.toml [tool.pyright] extraPaths {list(extra_paths)!r} "
+        f"contains no entry resolving to {scripts_dir} (task 3931, esc-3805-1 "
+        f"2026-08-09 / esc-3805-6 2026-08-12). {why} The root pyproject.toml's "
+        "extraPaths DOES list 'scripts', so ROOT-scoped pyright resolves the "
+        "import and reports real errors that PACKAGE-scoped pyright cannot see "
+        "— MEASURED at 1.1.408 with hotfix 27ac22a6a6 reverse-applied: 14 "
+        "reportArgumentType errors root-scoped, 0 package-scoped. verify's "
+        "FILE_SCOPED fallback runs pyright from the worktree ROOT while "
+        "pre-commit (hooks/project-checks) and the fleet chain run it "
+        "PACKAGE-scoped, so without this entry the two gates disagree about "
+        f"whether the same file type-checks; resolved: {[str(p) for p in resolved]}"
+    )
+
+
+class TestMembersImportingScriptsResolveScriptsOnTheirPyrightPath:
+    """A member importing a ``scripts/``-only module must resolve ``scripts/`` itself.
+
+    Task 3931 — the CHAIN-INDEPENDENT generalisation of the module-local guard
+    in ``orchestrator/tests/test_run_vllm_eval.py``, in the same spirit as
+    ``TestWorkspacePyrightInterpreterPinned`` generalising the fleet-chain
+    interpreter pin: that guard names one module in one package, this one holds
+    for every workspace member, discovered at runtime.
+
+    The property: if a member's OWN sources import a top-level module that
+    exists only under repo-root ``scripts/``, then package-scoped pyright must
+    be able to resolve it — otherwise the imported names degrade to ``Unknown``
+    and every defect involving them goes unreported in that scope, while the
+    root-scoped verify gate (whose config lists ``scripts``) still reports
+    them. That asymmetry IS esc-3805-1/esc-3805-6.
+
+    Presence-tolerant and MEMBERSHIP-only (never list equality — the rule stated at
+    tests/scripts/test_scripts_module_config.py::test_root_pyright_extrapaths_resolves_scripts_imports),
+    so an unrelated extraPaths addition does not false-red this guard.
+    """
+
+    def test_members_importing_scripts_modules_resolve_scripts(self) -> None:
+        importing = _members_importing_scripts_only_modules()
+        assert importing, (
+            "no workspace member was found importing a repo-root scripts/-only "
+            "module (task 3931) — either the scan stopped matching (an import "
+            "spelling it cannot see) or the import genuinely went away; both "
+            "need an explicit decision, not a silently vacuous guard"
+        )
+        missing = KNOWN_SCRIPTS_IMPORTING_MEMBERS - set(importing)
+        assert not missing, (
+            f"runtime discovery failed to resolve known scripts/-importing "
+            f"member(s) {sorted(missing)} (task 3931); discovered: "
+            f"{ {k: sorted(v) for k, v in importing.items()} }"
+        )
+
+        for member, modules in sorted(importing.items()):
+            if not (REPO_ROOT / member / "pyproject.toml").is_file():
+                continue
+            pyright = _pyproject_at(member).get("tool", {}).get("pyright")
+            if pyright is None:
+                # A member that never runs pyright has no search path to widen.
+                continue
+            _assert_pyright_resolves_scripts(
+                member,
+                pyright,
+                why=(
+                    f"{member!r} imports {sorted(modules)!r}, which exist(s) "
+                    "ONLY under repo-root scripts/, so package-scoped pyright "
+                    "can resolve the import only via an extraPaths entry "
+                    "pointing there."
+                ),
+            )

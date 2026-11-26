@@ -76,6 +76,9 @@ import sys
 from datetime import UTC, datetime
 from typing import Any
 
+from fused_memory.backends.mem0_client import (
+    MEM0_MANAGED_METADATA_KEYS as _MEM0_MANAGED_METADATA_KEYS,
+)
 from fused_memory.maintenance.project_selection import select_projects
 from fused_memory.maintenance.rehome_scope_tag import (
     CGL_ETA_REHOME_KIND,
@@ -83,6 +86,7 @@ from fused_memory.maintenance.rehome_scope_tag import (
     scope_tag_for,
 )
 from fused_memory.models.scope import Scope
+from fused_memory.utils.store_mutation_preflight import assert_store_mutation_allowed
 
 logger = logging.getLogger('tag_cgl_eta_rehome_scope')
 
@@ -220,22 +224,16 @@ def build_tag_report(
 # ---------------------------------------------------------------------------
 # mem0-owned metadata keys
 # ---------------------------------------------------------------------------
-
-# Keys mem0's AsyncMemory._update_memory (site-packages/mem0/memory/main.py,
-# ~line 2449) never trusts from a forwarded metadata dict: 'data'/'hash'/
-# 'created_at'/'updated_at' are unconditionally recomputed from the update
-# call's own arguments and the existing stored point, and 'user_id'/
-# 'agent_id'/'run_id'/'actor_id'/'role' are restored from the *currently
-# stored* payload (unconditionally for 'actor_id'; whenever absent from what
-# was forwarded for the rest). Forwarding stale copies of these currently
-# works only because mem0 keeps overwriting/re-deriving them -- an implicit
-# coupling to mem0 internals. Stripping them here makes the intent explicit:
-# preserve only this record's CUSTOM provenance keys (kind/src_project/
-# dst_project/src_entity/dst_entity/source_migration/...).
-_MEM0_MANAGED_METADATA_KEYS = frozenset({
-    'data', 'hash', 'created_at', 'updated_at',
-    'user_id', 'agent_id', 'run_id', 'actor_id', 'role',
-})
+#
+# The mem0-managed key set moved to its decided home in
+# fused_memory.backends.mem0_client (PRD D12 / task 3055 §6, extracted by
+# task 3195), where the full rationale lives beside Mem0Backend.update. This
+# script defined it first; task 3195 landed the extraction and task 3088
+# imports rather than re-extracting it, so there is exactly one copy repo-wide
+# (INV-5). The module-local private spelling is retained as an ALIAS to that
+# single object -- never a second copy. The import sits in the module-level
+# import block above; the alias is still an attribute of this module, so
+# `_mod._MEM0_MANAGED_METADATA_KEYS` in the tests keeps resolving.
 
 
 # ---------------------------------------------------------------------------
@@ -301,7 +299,7 @@ async def apply_tags(
                     decision['id'], decision['new_content'], scope,
                     metadata=provenance_metadata,
                 )
-            except Exception as exc:  # noqa: BLE001 -- best-effort, mirrors apply_prune
+            except Exception as exc:  # best-effort, mirrors apply_prune
                 logger.warning(
                     'tag_cgl_eta_rehome_scope: failed to update memory %s '
                     '(project %s): %s',
@@ -351,8 +349,8 @@ async def run(
     generated_at = datetime.now(UTC).isoformat()
 
     if known_projects_map is None:
-        from fused_memory.config.schema import FusedMemoryConfig as _FMC  # noqa: PLC0415
-        from fused_memory.models.scope import build_known_projects_map  # noqa: PLC0415
+        from fused_memory.config.schema import FusedMemoryConfig as _FMC
+        from fused_memory.models.scope import build_known_projects_map
         cfg = _FMC()
         known_projects_map = build_known_projects_map(
             cfg.taskmaster.project_root if cfg.taskmaster else '',
@@ -383,6 +381,38 @@ async def run(
             file=sys.stderr,
         )
         return abort_payload
+
+    # Fail-CLOSED capability preflight, one probe per run, BEFORE the scan.
+    #
+    # Placement satisfies BOTH halves of the rule in
+    # ``fused_memory.utils.store_mutation_preflight`` -- before the first
+    # mutation AND before the scan -- and is the same siting
+    # ``cleanup_count_snapshots`` uses:
+    #   * BELOW the unknown---project-id abort above, which mutates nothing and
+    #     must keep failing with its own clearer message rather than an
+    #     unrelated store-capability refusal for anyone diagnosing a typo'd
+    #     flag from a sandbox;
+    #   * ABOVE the ``scroll_by_metadata`` loop below, so a run that was never
+    #     going to be allowed to mutate does not first pay for a full
+    #     multi-project scroll of up to --scan-limit records per project.
+    # This block runs at most once per run, so the one-probe-per-run property
+    # holds. It is deliberately NOT at the ``if args.apply:`` gate further
+    # down (that sits downstream of the entire scan) and NOT inside
+    # ``apply_tags``: that helper's per-record ``except Exception`` swallows
+    # ``RuntimeError``, which ``StoreMutationUnavailable`` subclasses, so a
+    # probe inside it would be downgraded into N warnings while the updates
+    # proceeded.
+    if args.apply:
+        assert_store_mutation_allowed(
+            operation='tag_cgl_eta_rehome_scope --apply',
+            logger=logger,
+            extra_detail=(
+                'each tag would rewrite a record and then fail to record the '
+                'change, leaving the rehome pool half-tagged and its provenance '
+                'metadata unreconstructable. No record was tagged and nothing was '
+                'mutated.'
+            ),
+        )
 
     # Scan + classify every selected project.
     decisions_by_project: dict[str, list[dict[str, Any]]] = {}
@@ -423,6 +453,9 @@ async def run(
     # Apply or dry-run.
     applied_ids: set[str] = set()
     if args.apply:
+        # The capability preflight for this branch already ran above, before
+        # the scan -- see the comment at the top of the scan section. Nothing
+        # re-probes here: one probe per run.
         applied_ids = await apply_tags(memory, decisions_by_project, records_by_project)
 
     report = build_tag_report(
@@ -505,21 +538,16 @@ def main() -> int:
     args = parser.parse_args()
 
     if args.config:
-        import os  # noqa: PLC0415
+        import os
         os.environ['CONFIG_PATH'] = str(args.config)
 
     async def _run_live() -> int:
-        from fused_memory.config.schema import FusedMemoryConfig  # noqa: PLC0415
-        from fused_memory.services.memory_service import MemoryService  # noqa: PLC0415
+        from fused_memory.config.schema import FusedMemoryConfig
+        from fused_memory.maintenance._utils import maintenance_service
 
         config = FusedMemoryConfig()
-        memory = MemoryService(config)
-        await memory.initialize()
-        try:
+        async with maintenance_service(config=config) as (_, memory):
             report = await run(args, memory=memory)
-        finally:
-            if hasattr(memory, 'close'):
-                await memory.close()
         return 1 if report.get('aborted') else 0
 
     return asyncio.run(_run_live())

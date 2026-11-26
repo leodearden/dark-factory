@@ -1,64 +1,38 @@
 /* Escalation Analytics tab — Origin / Lifespan / Workflow lifecycle panels.
  *
- * No JS test runner in this project (see scheduler_drawer.jsx comment).
- * Wiring contracts are verified via Python source-assertion tests in
+ * No JS test runner for .jsx in this project (see scheduler_drawer.jsx
+ * comment) — but the pure decisions lifted OUT of this file are covered
+ * by `node --test` under dashboard/tests/js/. Wiring contracts are
+ * verified via Python tests in
  * dashboard/tests/test_tab_escalation_analytics.py.
  *
  * Load order: tabs.jsx → tab_escalation_analytics.jsx → app.jsx
  * Export:     window.DF_TABS.EscalationAnalyticsTab  (additive mutation of
  *             the object created by tabs.jsx; app.jsx destructures it last)
  */
-const { useState: uS, useEffect: uE } = React;
 const DF = window.DF_DATA;
 const { ProjectGroup, Segmented, fmtUptime, fmtDateTime, taskId } = window.DF_SHELL;
 const C = window.DF_CHARTS;
+const { pinningBadgeState } = window.DF_PINS_RECOVERY;
+// The Datum wrapper. Module scope, no fallback — see the CANONICAL note in
+// datum.js's header.
+const { plainDatum } = window.DF_DATUM;
+// The corpus' class split and views — read only through their one client
+// reader, escalation_views.js.
+const {
+  resolutionSegments, corpusAgeCaption, openInHistoryOver, windowedEscPerDone,
+} = window.DF_ESCALATION_VIEWS;
+// Regime markers placed on a date-label axis, drawn by charts.jsx::MarkedChart.
+const { dateLabelMarks } = window.DF_CHART_MARKS;
+// The persisted UI-preference hooks — persisted_state.js.
+const { createPersistedHooks } = window.DF_PERSISTED_STATE;
+const { usePersistedState, useOpenSet } = createPersistedHooks(React);
+
+// Every number this tab renders arrives on one endpoint, and the path is the
+// lookup key into DF_DATA.__receipt (data.js keys one receipt per polled
+// endpoint by its URL with the query stripped).
+const EP_ANALYTICS = '/api/v2/dashboard/escalation-analytics';
 const { LifecycleFlowDiagram } = window.DF_ESC_FLOW || {};
-
-// ── Local helpers (tab_escalations.jsx-compatible copies; not exported from
-//    any namespace) ──
-
-function useOpenSet(ids, defaultOpen = true, storageKey = null) {
-  const [openMap, setOpenMap] = uS(() => {
-    let stored = {};
-    if (storageKey) {
-      try { stored = JSON.parse(localStorage.getItem(storageKey) || '{}') || {}; } catch (e) {}
-    }
-    const init = {};
-    for (const id of ids) init[id] = id in stored ? !!stored[id] : defaultOpen;
-    return init;
-  });
-  // Backfill ids that arrive after mount (per_project starts [] and is
-  // populated by the first poll, so groups would otherwise render collapsed).
-  const idsKey = ids.join('\0');
-  uE(() => {
-    setOpenMap(m => {
-      let patch = null;
-      for (const id of ids) {
-        if (!(id in m)) { if (!patch) patch = {}; patch[id] = defaultOpen; }
-      }
-      return patch ? { ...m, ...patch } : m;
-    });
-  }, [idsKey]); // eslint-disable-line react-hooks/exhaustive-deps
-  uE(() => {
-    if (storageKey) {
-      try { localStorage.setItem(storageKey, JSON.stringify(openMap)); } catch (e) {}
-    }
-  }, [storageKey, openMap]);
-  const toggle = id => setOpenMap(m => ({ ...m, [id]: !m[id] }));
-  const setAll = v => setOpenMap(Object.fromEntries(ids.map(id => [id, v])));
-  return [openMap, toggle, setAll];
-}
-
-function usePersistedState(storageKey, defaultValue) {
-  const [v, setV] = uS(() => {
-    try {
-      const raw = localStorage.getItem(storageKey);
-      return raw === null ? defaultValue : JSON.parse(raw);
-    } catch (e) { return defaultValue; }
-  });
-  uE(() => { try { localStorage.setItem(storageKey, JSON.stringify(v)); } catch (e) {} }, [storageKey, v]);
-  return [v, setV];
-}
 
 // ── Window slicing ──
 //
@@ -137,55 +111,6 @@ function sliceWeeklyByWindow(weeklyObj, generatedAt, win) {
   return out;
 }
 
-// ── Regime-marker overlay ──
-//
-// charts.jsx's primitives (LineChart/StackedAreaChart) plot points at evenly
-// spaced x (index-based) with fixed padding padL=38/padR=12, and have no
-// vertical-marker support — charts.jsx is not modified (see design
-// decisions). RegimeMarkers renders vertical lines + labels as an
-// absolutely-positioned overlay keyed off the same `labels` array the chart
-// itself renders, so the two line up regardless of the chart's
-// ResizeObserver-driven width.
-const _CHART_PAD_L = 38, _CHART_PAD_R = 12;
-
-function RegimeMarkers({ labels, markers }) {
-  if (!markers || markers.length === 0 || !labels || labels.length < 2) return null;
-  const n = labels.length;
-  return (
-    <div style={{ position: 'absolute', inset: 0, pointerEvents: 'none' }}>
-      {markers.map((m, i) => {
-        const idx = labels.indexOf(m.date);
-        if (idx === -1) return null;
-        const frac = idx / (n - 1);
-        const left = `calc(${_CHART_PAD_L}px + ${frac} * (100% - ${_CHART_PAD_L + _CHART_PAD_R}px))`;
-        return (
-          <div key={i} style={{ position: 'absolute', left, top: 0, bottom: 20 }}>
-            <div style={{ height: '100%', borderLeft: '1px dashed var(--fg-3)' }} />
-            <span style={{
-              position: 'absolute', top: 0, left: 3, fontSize: 9, color: 'var(--fg-3)',
-              whiteSpace: 'nowrap', transform: 'translateY(-2px)',
-            }}>{m.label}</span>
-          </div>
-        );
-      })}
-    </div>
-  );
-}
-
-// TimeChart wraps a chart primitive with the RegimeMarkers overlay. Every
-// time-axis chart in the panels below (Origin's filings StackedAreaChart,
-// the Lifespan ECDF, Workflow's churn/esc-per-done LineCharts) renders
-// through this wrapper so regime markers appear consistently everywhere
-// without charts.jsx itself needing marker support.
-function TimeChart({ labels, markers, children }) {
-  return (
-    <div style={{ position: 'relative' }}>
-      {children}
-      <RegimeMarkers labels={labels} markers={markers} />
-    </div>
-  );
-}
-
 // ── Origin panel ──
 //
 // Top-N-by-source filings/day (long tail folded into an 'other' stack) + a
@@ -197,6 +122,16 @@ const _TOP_N_SOURCES = 6;
 const _CATEGORY_COLORS = [
   C.PALETTE.accent, C.PALETTE.ok, C.PALETTE.warn, C.PALETTE.info, C.PALETTE.accent2, C.PALETTE.bad,
 ];
+
+// One colour per resolution class. The classes drawn are the payload's, so a
+// class added server-side renders before it has a colour here — in the
+// neutral one.
+const _RESOLUTION_CLASS_COLORS = {
+  benign: C.PALETTE.ok,
+  actionable: C.PALETTE.bad,
+  'moot-terminal-subject': C.PALETTE.accent2,
+  'stale-strand': C.PALETTE.warn,
+};
 
 function OriginPanel({ origin, win, generatedAt, regimeMarkers }) {
   const daily = sliceDailyByWindow(origin.daily_by_source, generatedAt, win);
@@ -232,7 +167,7 @@ function OriginPanel({ origin, win, generatedAt, regimeMarkers }) {
   // source with a high rate but tiny volume sorts below a high-volume,
   // slightly-less-benign source, which is the more actionable ordering for
   // "where should triage attention go".
-  const rows = [...(origin.sources || [])].sort((a, b) => b.benign - a.benign);
+  const rows = [...(origin.sources || [])].sort((a, b) => b.classes.benign - a.classes.benign);
 
   return (
     <div style={{ marginBottom: 18 }}>
@@ -240,16 +175,16 @@ function OriginPanel({ origin, win, generatedAt, regimeMarkers }) {
         Origin — filings by source
       </div>
       {stacks.length > 0 && (
-        <TimeChart labels={dates} markers={regimeMarkers}>
-          <C.StackedAreaChart stacks={stacks} labels={dates} formatX={fmtDateTime} />
-        </TimeChart>
+        <C.MarkedChart marks={dateLabelMarks(dates, regimeMarkers)}>
+          <C.StackedAreaChart stacks={stacks} labels={dates} countAxis formatX={fmtDateTime} />
+        </C.MarkedChart>
       )}
       <table className="tbl" style={{ marginTop: 10 }}>
         <thead>
           <tr>
             <th>Source</th>
             <th className="num">Filings</th>
-            <th>Benign / actionable</th>
+            <th>Resolution classes</th>
             <th>Stamped / inferred</th>
             <th>Trend</th>
             <th></th>
@@ -257,16 +192,18 @@ function OriginPanel({ origin, win, generatedAt, regimeMarkers }) {
         </thead>
         <tbody>
           {rows.map(s => {
-            const benignPct = Math.round((s.benign_rate || 0) * 100);
             const stampedPct = Math.round((s.stamped_share || 0) * 100);
             return (
               <tr key={s.source}>
                 <td>{s.source}</td>
                 <td className="num mono">{s.filings}</td>
                 <td>
-                  <div style={{ display: 'flex', height: 6, width: 90, background: 'var(--bg-2)', borderRadius: 3, overflow: 'hidden' }}>
-                    <div style={{ width: `${benignPct}%`, background: C.PALETTE.ok }} title={`benign ${s.benign}`} />
-                    <div style={{ width: `${100 - benignPct}%`, background: C.PALETTE.bad }} title={`actionable ${s.actionable}`} />
+                  <div style={{ display: 'flex', height: 6, width: 90, background: 'var(--bg-2)', borderRadius: 3, overflow: 'hidden' }}
+                    title={`${Math.round((s.benign_rate || 0) * 100)}% benign of ${s.classified} classified`}>
+                    {resolutionSegments(s.classes).map(seg => (
+                      <div key={seg.cls} style={{ width: `${seg.share * 100}%`, background: _RESOLUTION_CLASS_COLORS[seg.cls] || C.PALETTE.fg3 }}
+                        title={`${seg.cls} ${seg.n}`} />
+                    ))}
                   </div>
                 </td>
                 <td className="mono" style={{ fontSize: 10, color: 'var(--fg-3)' }}>{stampedPct}% / {100 - stampedPct}%</td>
@@ -288,9 +225,15 @@ function OriginPanel({ origin, win, generatedAt, regimeMarkers }) {
 // vertical 6h freshness marker, an open-items list ranked by pending age,
 // and a render-when-present filed→triaged→resolved segment block (2555
 // forward-compat).
-const _RESOLVER_TIERS = ['human', 'cascade', 'auto-watcher', 'steward', 'reaper-sweep', 'unknown', 'other-auto'];
+// Mirrors escalation/src/escalation/classify.py::RESOLVER_TIERS, in its order
+// (dashboard/tests/test_resolver_tier_vocabulary_mirror.py checks it).
+const _RESOLVER_TIERS = ['human-ruled', 'attended-seat', 'cascade', 'auto-watcher', 'steward', 'reaper-sweep', 'unknown', 'other-auto'];
+// Outside C.PALETTE: no PALETTE hue clears the adjacent-pair CVD and
+// normal-vision checks against both neighbours, human-ruled and cascade.
+const _ATTENDED_SEAT_COLOR = 'oklch(0.62 0.14 60)';
 const _TIER_COLORS = {
-  human: C.PALETTE.ok,
+  'human-ruled': C.PALETTE.ok,
+  'attended-seat': _ATTENDED_SEAT_COLOR,
   cascade: C.PALETTE.accent,
   'auto-watcher': C.PALETTE.info,
   steward: C.PALETTE.accent2,
@@ -300,7 +243,7 @@ const _TIER_COLORS = {
 };
 
 // Any resolver tier the backend emits that isn't in the whitelist above
-// (e.g. a future addition to escalation.classify.classify_resolver_tier, or
+// (e.g. a future addition to escalation.classify.resolver_tier, or
 // a parse anomaly) folds into 'other-auto' rather than being dropped.
 // LifespanPanel's ECDF and WorkflowPanel's 100%-normalized stack both
 // iterate _RESOLVER_TIERS only — an un-folded unknown tier would silently
@@ -324,8 +267,8 @@ function LifespanPanel({ lifespan, win, generatedAt }) {
   const gridLabels = grid.map(fmtUptime);
 
   // Vertical 6h (21600s) freshness marker — the grid index whose threshold
-  // lands nearest 21600, rendered via the same overlay technique as
-  // RegimeMarkers/TimeChart (a synthetic single-marker array).
+  // lands nearest 21600, drawn by the same overlay as the regime markers (a
+  // synthetic single-marker array).
   const BREACH_SECS = 21600;
   let breachIdx = 0;
   for (let i = 1; i < grid.length; i++) {
@@ -364,7 +307,8 @@ function LifespanPanel({ lifespan, win, generatedAt }) {
             <C.StatTile
               key={level}
               label={`L${level} resolution time`}
-              value={fmtUptime(pct.p50)}
+              datum={plainDatum(pct.p50, EP_ANALYTICS)}
+              format={fmtUptime}
               hint={`p50 · p90 ${fmtUptime(pct.p90)}`}
             />
           );
@@ -372,7 +316,8 @@ function LifespanPanel({ lifespan, win, generatedAt }) {
         {lifespan.l1_to_l2_promotion && lifespan.l1_to_l2_promotion.count > 0 && (
           <C.StatTile
             label="L1→L2 promotion"
-            value={fmtUptime(lifespan.l1_to_l2_promotion.p50_secs)}
+            datum={plainDatum(lifespan.l1_to_l2_promotion.p50_secs, EP_ANALYTICS)}
+            format={fmtUptime}
             hint={`p50 · p90 ${fmtUptime(lifespan.l1_to_l2_promotion.p90_secs)}`}
           />
         )}
@@ -382,9 +327,9 @@ function LifespanPanel({ lifespan, win, generatedAt }) {
           <div style={{ fontSize: 10, color: 'var(--fg-3)', marginBottom: 4 }}>
             Resolution-time ECDF by resolver tier (log-x; dashed line = 6h freshness)
           </div>
-          <TimeChart labels={gridLabels} markers={breachMarker}>
+          <C.MarkedChart marks={dateLabelMarks(gridLabels, breachMarker)}>
             <C.LineChart series={series} labels={gridLabels} formatY={v => `${Math.round(v * 100)}%`} formatX={v => v} />
-          </TimeChart>
+          </C.MarkedChart>
         </>
       )}
       {lifespan.samples_downsampled && (
@@ -411,6 +356,23 @@ function LifespanPanel({ lifespan, win, generatedAt }) {
                 <td className="num mono">
                   {fmtUptime(item.age_secs)}
                   {item.breach_6h && <span className="badge bad" style={{ marginLeft: 6, fontSize: 9 }}>6h+</span>}
+                  {/* Truthiness, deliberately: the backend OMITS pins_recovery
+                      when the annotation is unknown (that project's escalation
+                      MCP was unreadable, or the record carried none), so this
+                      draws nothing for both false and undefined. There is no
+                      negated arm — "does not pin" over an unclassified record
+                      would be a claim nobody made. That decision, and the
+                      tooltip it builds, live in pins_recovery.js (shared with
+                      the escalations tab's StatTile) and are covered by
+                      dashboard/tests/js/pins_recovery.test.mjs. */}
+                  {(() => {
+                    const pb = pinningBadgeState(item);
+                    return pb && (
+                      <span className={pb.cls} style={{ marginLeft: 6, fontSize: 9 }} title={pb.title}>
+                        {pb.label}
+                      </span>
+                    );
+                  })()}
                 </td>
               </tr>
             ))}
@@ -434,7 +396,7 @@ function LifespanPanel({ lifespan, win, generatedAt }) {
 // an action-mix donut, churn/throughput time charts, and a reserved mount
 // seam for ζ's lifecycle-flow diagram (depends on δ).
 
-function WorkflowPanel({ workflow, win, generatedAt, regimeMarkers }) {
+function WorkflowPanel({ project, workflow, terminal, win, generatedAt, regimeMarkers }) {
   const tierWeekly = sliceWeeklyByWindow(workflow.tier_weekly, generatedAt, win);
   const weeks = Object.keys(tierWeekly).sort();
   const weekTotals = weeks.map(w => Object.values(tierWeekly[w] || {}).reduce((s, n) => s + n, 0));
@@ -475,11 +437,18 @@ function WorkflowPanel({ workflow, win, generatedAt, regimeMarkers }) {
   const churnDates = Object.keys(churnDaily).sort();
 
   const escPerDoneDaily = sliceRowsByWindow(workflow.esc_per_done_daily || [], generatedAt, win, row => row.date);
-  // charts.jsx's LineChart has no null/gap support (not modified — see design
-  // decisions), so a null ratio (done == 0 that day) is OMITTED rather than
-  // plotted as a misleading zero.
-  const epdRows = escPerDoneDaily.filter(row => row.ratio != null);
-  const epdDates = epdRows.map(row => row.date);
+  // A null ratio means done == 0 that day (no task completed), or that the
+  // project's runs.db could not be read (workflow.done_counts_read false), so
+  // escalations per done is undefined rather than zero. It is passed straight
+  // through as a hole, and LineChart breaks the line across it (task 3489). These rows used
+  // to be FILTERED OUT, which dropped the day from this label row too — that
+  // compacted the x-axis and silently redated every surviving sample, the exact
+  // hazard spark_path.js's header calls out.
+  const epdDates = escPerDoneDaily.map(row => row.date);
+  // A window with no ratio draws no line, so the chart's caption says why.
+  const escPerDone = windowedEscPerDone([
+    { project, doneCountsRead: workflow.done_counts_read, rows: escPerDoneDaily },
+  ]);
 
   const flowDaily = sliceRowsByWindow(workflow.flow_daily || [], generatedAt, win, row => row.date);
 
@@ -496,31 +465,37 @@ function WorkflowPanel({ workflow, win, generatedAt, regimeMarkers }) {
       )}
       <div style={{ display: 'flex', gap: 16, flexWrap: 'wrap', alignItems: 'center', marginBottom: 10 }}>
         {donutData.length > 0 && (
-          <C.Donut data={donutData} centerLabel="actions" centerValue={totalActions} />
+          <>
+            <C.Donut data={donutData} centerLabel="actions" centerValue={totalActions} />
+            <span style={{ fontSize: 10, color: 'var(--fg-3)' }}>of {terminal} terminal</span>
+          </>
         )}
       </div>
       {churnDates.length > 0 && (
         <>
           <div style={{ fontSize: 10, color: 'var(--fg-3)', marginBottom: 4 }}>Churn — same-task re-filings within 24h</div>
-          <TimeChart labels={churnDates} markers={regimeMarkers}>
+          <C.MarkedChart marks={dateLabelMarks(churnDates, regimeMarkers)}>
             <C.LineChart
               series={[{ key: 'churn', color: C.PALETTE.bad, values: churnDates.map(d => churnDaily[d] || 0) }]}
               labels={churnDates}
+              countAxis
               formatX={fmtDateTime}
             />
-          </TimeChart>
+          </C.MarkedChart>
         </>
       )}
       {epdDates.length > 0 && (
         <>
-          <div style={{ fontSize: 10, color: 'var(--fg-3)', margin: '10px 0 4px' }}>Escalations filed per task done</div>
-          <TimeChart labels={epdDates} markers={regimeMarkers}>
+          <div style={{ fontSize: 10, color: 'var(--fg-3)', margin: '10px 0 4px' }}>
+            Escalations filed per task done{escPerDone.ratio === null && ` — ${escPerDone.absentReason}`}
+          </div>
+          <C.MarkedChart marks={dateLabelMarks(epdDates, regimeMarkers)}>
             <C.LineChart
-              series={[{ key: 'ratio', color: C.PALETTE.accent, values: epdRows.map(row => row.ratio) }]}
+              series={[{ key: 'ratio', color: C.PALETTE.accent, values: escPerDoneDaily.map(row => row.ratio) }]}
               labels={epdDates}
               formatX={fmtDateTime}
             />
-          </TimeChart>
+          </C.MarkedChart>
         </>
       )}
       {/* ζ lifecycle flow diagram / mini-Sankey — origin → level → tier →
@@ -545,7 +520,7 @@ function EscalationAnalyticsTab({ projectFilter }) {
 
   const [openMap, toggle] = useOpenSet(projectIds, true, 'df.open.escanalytics');
   const [win, setWin] = usePersistedState('df.escanalytics.window', '28d');
-  // Shared across every project's date-axis charts via TimeChart (Origin's
+  // Shared across every project's date-axis charts via MarkedChart (Origin's
   // filings chart, Workflow's churn/esc-per-done charts) — regime markers
   // are a single cross-project timeline, not per-project data. Lifespan's
   // only chart is the threshold-axis ECDF, so it doesn't consume these.
@@ -559,6 +534,9 @@ function EscalationAnalyticsTab({ projectFilter }) {
           value={win}
           onChange={setWin}
         />
+        <span style={{ fontSize: 10, color: 'var(--fg-3)' }} title="When the escalation queues were last walked">
+          {corpusAgeCaption(openInHistoryOver(DF, null), Date.now())}
+        </span>
         {analytics.parse_failures > 0 && (
           <span className="badge warn" title="Escalation archive records that failed to parse (skipped, not silently dropped)">
             ⚠ {analytics.parse_failures} parse failure{analytics.parse_failures !== 1 ? 's' : ''}
@@ -585,7 +563,9 @@ function EscalationAnalyticsTab({ projectFilter }) {
               generatedAt={analytics.generated_at}
             />
             <WorkflowPanel
+              project={p.project}
               workflow={p.workflow}
+              terminal={p.terminal}
               win={win}
               generatedAt={analytics.generated_at}
               regimeMarkers={regimeMarkers}

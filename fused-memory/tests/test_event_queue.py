@@ -3,25 +3,144 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import pathlib
+import threading
+import time
 import uuid
+from concurrent.futures import Future
 from datetime import UTC, datetime
 from unittest.mock import AsyncMock
 
 import aiosqlite
 import pytest
 import pytest_asyncio
+from _dead_letter_helpers import (
+    hold_fifo,
+    journaled_events,
+    journaled_ids,
+    overflowed_queue,
+    parked_queue,
+    record_dead_letter_writes,
+    seed_dead_letters,
+)
 
 from fused_memory.models.reconciliation import (
     EventSource,
     EventType,
     ReconciliationEvent,
 )
+from fused_memory.reconciliation.dead_letter_writer import DeadLetterWriter
 from fused_memory.reconciliation.event_buffer import EventBuffer
 from fused_memory.reconciliation.event_journal import EventJournal
 from fused_memory.reconciliation.event_queue import EventQueue, _iter_lines_reversed
+
+
+async def _wait_for(
+    get_current,
+    predicate,
+    *,
+    timeout: float,
+    description: str,
+):
+    """Poll ``get_current()`` until ``predicate`` accepts its value, or the deadline lapses.
+
+    New waits for a real-EventBuffer drainer commit use ``_signal_after_commits``,
+    which has no deadline to race; this poll and its ``_wait_for_buffer_size`` /
+    ``_wait_for_drained`` wrappers remain only for their existing call sites.
+
+    Load-tolerant alternative to gating a drainer handoff on
+    ``asyncio.wait_for(queue._queue.join(), timeout=<small>)``: that pattern
+    ties the pass/fail line to how fast a (possibly starved, under full-suite
+    xdist load) event loop happened to schedule the drainer, not to whether
+    the drainer actually did its job. Polling the observable outcome keeps the
+    guard meaningful — it still fails loudly if the drainer never catches up
+    within the (generous) outer deadline — without being sensitive to
+    scheduling jitter.
+
+    ``get_current`` may be sync or async (an awaitable return value is
+    awaited automatically) — e.g. ``queue.stats`` or
+    ``lambda: buffer.get_buffer_stats(project_id)``. Asserts (naming
+    ``description``, ``timeout``, and the last observed value) rather than
+    returning silently if the deadline lapses, so a future reader can tell
+    "the drainer never ran" from "the drainer produced the wrong value".
+    """
+    async def _read():
+        value = get_current()
+        if asyncio.iscoroutine(value):
+            value = await value
+        return value
+
+    deadline = time.monotonic() + timeout
+    value = await _read()
+    while not predicate(value) and time.monotonic() < deadline:
+        await asyncio.sleep(0.01)
+        value = await _read()
+    assert predicate(value), (
+        f'{description}: not satisfied within {timeout}s (last observed: {value!r})'
+    )
+    return value
+
+
+async def _wait_for_buffer_size(
+    buffer: EventBuffer, project_id: str, expected: int, *, timeout: float = 10.0,
+) -> dict:
+    """Poll get_buffer_stats until size reaches expected, or the deadline lapses.
+
+    Thin wrapper over ``_wait_for`` — see its docstring for the load-tolerance
+    rationale.
+    """
+    return await _wait_for(
+        lambda: buffer.get_buffer_stats(project_id),
+        lambda stats: stats['size'] >= expected,
+        timeout=timeout,
+        description=f"buffer size for project {project_id!r} reaching {expected}",
+    )
+
+
+async def _wait_for_drained(queue, expected: int, *, timeout: float = 10.0) -> dict:
+    """Poll until the drainer has committed ``expected`` events and the queue is empty.
+
+    Gates on the queue's OWN accounting rather than on buffer rows because
+    ``_events_committed += 1`` and the ``finally: task_done()`` that follows it are
+    separated by no await point (event_queue.py::_commit_with_retry / _drain_loop) —
+    so observing ``events_committed == expected`` guarantees ``queue.join()`` is already
+    satisfied, and a subsequent ``close()`` never consults ``shutdown_flush_seconds``.
+    Thin wrapper over ``_wait_for``; see its docstring for the load-tolerance rationale.
+    """
+    return await _wait_for(
+        queue.stats,
+        lambda s: s['events_committed'] >= expected and s['queue_depth'] == 0,
+        timeout=timeout,
+        description=f'drainer committing {expected} event(s) and emptying the queue',
+    )
+
+
+def _signal_after_commits(buffer: EventBuffer, count: int) -> asyncio.Event:
+    """Wrap ``buffer.push`` so the returned Event is set once ``count`` pushes have returned.
+
+    The Event is set inside the drainer's own push call, so its synchronous post-push
+    bookkeeping (journal mark_processed, events_committed, task_done) has already run
+    when a waiter resumes. That relies on no await point after push in
+    fused-memory/src/fused_memory/reconciliation/event_queue.py::EventQueue._commit_with_retry
+    / _drain_loop. Await ``.wait()`` bare; pytest-timeout bounds a drainer that never
+    commits.
+    """
+    committed = asyncio.Event()
+    inner_push = buffer.push
+    commits = 0
+
+    async def push(event: ReconciliationEvent) -> None:
+        nonlocal commits
+        await inner_push(event)
+        commits += 1
+        if commits == count:
+            committed.set()
+
+    buffer.push = push
+    return committed
 
 
 def _make_event(
@@ -71,9 +190,11 @@ async def test_enqueue_persists_to_buffer(queue, real_buffer):
     """Enqueued events eventually land in SQLite."""
     for _ in range(5):
         assert queue.enqueue(_make_event()) is True
-    # Wait for drainer to catch up.
-    await asyncio.wait_for(queue._queue.join(), timeout=1.0)
-    stats = await real_buffer.get_buffer_stats('test-project')
+    # Wait for drainer to catch up. Polls the outcome (buffer size) under a
+    # generous outer deadline rather than gating on how fast a (possibly
+    # starved, under full-suite xdist load) event loop scheduled the drainer
+    # — see _wait_for_buffer_size.
+    stats = await _wait_for_buffer_size(real_buffer, 'test-project', 5)
     assert stats['size'] == 5
 
 
@@ -81,7 +202,6 @@ async def test_enqueue_persists_to_buffer(queue, real_buffer):
 @pytest.mark.xdist_group('event_queue_enqueue_timing')
 async def test_enqueue_returns_immediately(queue):
     """enqueue is synchronous and non-blocking."""
-    import time
     # Pre-create events so model construction doesn't inflate the timing.
     events = [_make_event() for _ in range(100)]
     t0 = time.perf_counter()
@@ -154,6 +274,7 @@ async def test_drainer_recovers_after_transient_failure(tmp_path, real_buffer):
         return await original_push(event)
 
     real_buffer.push = flaky_push
+    committed = _signal_after_commits(real_buffer, 5)
 
     q = EventQueue(
         real_buffer,
@@ -167,7 +288,7 @@ async def test_drainer_recovers_after_transient_failure(tmp_path, real_buffer):
     try:
         for _ in range(5):
             q.enqueue(_make_event())
-        await asyncio.wait_for(q._queue.join(), timeout=2.0)
+        await committed.wait()
         stats = await real_buffer.get_buffer_stats('test-project')
         # All 5 eventually landed; push() was called >= 5 + 3 retries = 8 times.
         assert stats['size'] == 5
@@ -194,9 +315,17 @@ async def test_non_retriable_error_goes_to_dead_letter(tmp_path):
     try:
         for _ in range(3):
             q.enqueue(_make_event())
-        await asyncio.wait_for(q._queue.join(), timeout=1.0)
+        # Poll the outcome (dead_letters count) rather than gating on how
+        # fast a (possibly starved, under full-suite xdist load) event loop
+        # scheduled the drainer — see _wait_for.
+        stats = await _wait_for(
+            q.stats,
+            lambda stats: stats['dead_letters'] >= 3,
+            timeout=5.0,
+            description='dead_letters reaching 3',
+        )
         # All 3 should have been dead-lettered after a single failed push.
-        assert q.stats()['dead_letters'] == 3
+        assert stats['dead_letters'] == 3
         lines = dl.read_text().strip().splitlines()
         assert len(lines) == 3
         for line in lines:
@@ -242,6 +371,8 @@ async def test_overflow_writes_to_dead_letter(tmp_path):
         overflowed = sum(1 for r in results if r is False)
         assert overflowed >= 3, f'expected >=3 overflow, got {overflowed}'
         assert q.stats()['overflow_drops'] == overflowed
+        # enqueue hands overflow records to the writer thread without waiting.
+        await q.flush_dead_letters()
         # Dead-letter file contains overflow records.
         lines = dl.read_text().strip().splitlines()
         assert len(lines) == overflowed
@@ -258,8 +389,85 @@ async def test_overflow_writes_to_dead_letter(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_graceful_shutdown_flushes_within_window(tmp_path, real_buffer):
-    """Bounded flush drains everything when drainer can keep up."""
+@pytest.mark.parametrize('shutdown_flush_seconds', [2.0, 0.0])
+async def test_shutdown_after_drain_leaves_no_dead_letters(
+    tmp_path, real_buffer, shutdown_flush_seconds,
+):
+    """close() dead-letters nothing when the queue is already drained,
+    regardless of shutdown_flush_seconds.
+
+    The drain is awaited on the queue's own accounting (_wait_for_drained)
+    BEFORE close() runs, so close() only ever performs a no-op flush here —
+    shutdown_flush_seconds is never consulted; see _wait_for_drained's
+    docstring for why that gate is airtight. Parametrized over 2.0 (the
+    file's dominant convention) and 0.0 to prove the outcome is independent
+    of the window rather than merely tolerant of a generous one:
+
+    0.0 is not merely "small" — on CPython, asyncio.wait_for with timeout<=0
+    does ensure_future(coro) then checks fut.done(), which is False for a
+    freshly created coroutine, so it raises TimeoutError WITHOUT EVER READING
+    THE CLOCK. The window is therefore "already expired" as a matter of
+    logic, not of timing, so this test carries no wall-clock dependency in
+    either direction.
+
+    test_graceful_shutdown_close_drains_in_flight_events (below) covers the
+    complementary case: close() actually draining events that are still in
+    flight when it is called.
+    """
+    q = EventQueue(
+        real_buffer,
+        dead_letter_path=tmp_path / 'dl.jsonl',
+        maxsize=100,
+        retry_initial_seconds=0.01,
+        retry_max_seconds=0.1,
+        shutdown_flush_seconds=shutdown_flush_seconds,
+    )
+    await q.start()
+    for _ in range(50):
+        q.enqueue(_make_event())
+    await _wait_for_drained(q, 50)
+    await q.close()
+    # All events landed; no dead-letter residue.
+    stats = await real_buffer.get_buffer_stats('test-project')
+    assert stats['size'] == 50
+    dl_path = tmp_path / 'dl.jsonl'
+    assert not dl_path.exists() or dl_path.read_text() == ''
+
+
+@pytest.mark.asyncio
+async def test_graceful_shutdown_close_drains_in_flight_events(tmp_path, real_buffer):
+    """close()'s own bounded flush drains events still in flight when called.
+
+    test_shutdown_after_drain_leaves_no_dead_letters (above) gates the drain
+    with _wait_for_drained before calling close(), so by the time close()
+    runs the queue is already empty and its
+    ``asyncio.wait_for(self._queue.join(), timeout=self._shutdown_flush)``
+    only ever performs a no-op flush. This test exercises the success branch
+    that leaves uncovered: close() called against a genuinely NON-EMPTY
+    queue, which must still drain everything and dead-letter nothing.
+
+    Gates the buffer's push on an ``asyncio.Event`` (not a sleep) so the
+    overlap between "close() is awaiting queue.join()" and "events are still
+    being committed" is deterministic rather than timing-dependent:
+    ``push_started`` confirms the drainer has retrieved the first event and
+    is blocked inside push() *before* close() is even invoked, and asyncio's
+    FIFO ``call_soon`` scheduling guarantees ``close()``'s
+    ``wait_for(queue.join())`` call runs — and suspends, since all 5 events
+    are still unfinished — before the gate-release wakes the drainer. So
+    close() is proven to observe a genuinely non-empty queue, not one that
+    merely happened to drain first.
+    """
+    push_started = asyncio.Event()
+    gate = asyncio.Event()
+    original_push = real_buffer.push
+
+    async def gated_push(event):
+        push_started.set()
+        await gate.wait()
+        return await original_push(event)
+
+    real_buffer.push = gated_push
+
     q = EventQueue(
         real_buffer,
         dead_letter_path=tmp_path / 'dl.jsonl',
@@ -269,14 +477,62 @@ async def test_graceful_shutdown_flushes_within_window(tmp_path, real_buffer):
         shutdown_flush_seconds=5.0,
     )
     await q.start()
-    for _ in range(50):
+    for _ in range(5):
         q.enqueue(_make_event())
-    await q.close()
-    # All events landed; no dead-letter residue.
+    # Wait for the drainer to pick up the first event and block inside
+    # push() — guarantees all 5 events are still unfinished when close() is
+    # invoked below.
+    await push_started.wait()
+    close_task = asyncio.create_task(q.close())
+    # close_task's first step was scheduled above, before gate.set() below
+    # schedules the drainer's resume — FIFO call_soon ordering means close()
+    # has already entered (and suspended in) wait_for(queue.join()) against
+    # a non-empty queue by the time the drainer wakes up and starts
+    # committing.
+    gate.set()
+    await close_task
+
     stats = await real_buffer.get_buffer_stats('test-project')
-    assert stats['size'] == 50
+    assert stats['size'] == 5
     dl_path = tmp_path / 'dl.jsonl'
     assert not dl_path.exists() or dl_path.read_text() == ''
+
+
+@pytest.mark.asyncio
+async def test_wait_for_drained_fails_loudly_when_drainer_stalls(tmp_path):
+    """_wait_for_drained must assert (not return silently) when the drainer
+    never catches up — pins the "fail loudly" contract _wait_for's docstring
+    states, so a future rewrite of the gate can't silently swallow a genuine
+    stall. None of the happy-path tests in this file would catch that
+    regression on their own: they only ever exercise _wait_for /
+    _wait_for_drained where the predicate becomes true before the deadline,
+    so a silent-return rewrite would leave every one of them green.
+    """
+    buf = AsyncMock()
+
+    # Drainer blocks forever — events_committed can never reach the target.
+    async def blocking_push(event):
+        await asyncio.sleep(1000)
+
+    buf.push = blocking_push
+
+    q = EventQueue(
+        buf,
+        dead_letter_path=tmp_path / 'dl.jsonl',
+        maxsize=100,
+        retry_initial_seconds=0.01,
+        retry_max_seconds=0.05,
+        shutdown_flush_seconds=0.05,
+    )
+    await q.start()
+    try:
+        for _ in range(5):
+            q.enqueue(_make_event())
+        with pytest.raises(AssertionError):
+            await _wait_for_drained(q, 5, timeout=0.5)
+    finally:
+        # Close without waiting for the blocked push.
+        await q.close()
 
 
 @pytest.mark.asyncio
@@ -327,6 +583,7 @@ async def test_enqueue_after_close_diverts_to_dead_letter(tmp_path, real_buffer)
     await q.start()
     await q.close()
     assert q.enqueue(_make_event()) is False
+    await q.flush_dead_letters()
     dl = tmp_path / 'dl.jsonl'
     assert dl.exists()
     record = json.loads(dl.read_text().strip().splitlines()[0])
@@ -347,6 +604,7 @@ async def test_stats_surface_has_expected_keys(queue):
         'events_committed',
         'overflow_drops',
         'dead_letters',
+        'dead_letters_pending',
         'retry_in_flight',
         'drainer_running',
     }
@@ -360,8 +618,15 @@ async def test_stats_tracks_commits(queue, real_buffer):
     assert queue.stats()['events_committed'] == 0
     assert queue.stats()['last_commit_ts'] is None
     queue.enqueue(_make_event())
-    await asyncio.wait_for(queue._queue.join(), timeout=1.0)
-    stats = queue.stats()
+    # Poll the outcome (events_committed) rather than gating on how fast a
+    # (possibly starved, under full-suite xdist load) event loop scheduled
+    # the drainer — see _wait_for.
+    stats = await _wait_for(
+        queue.stats,
+        lambda stats: stats['events_committed'] >= 1,
+        timeout=5.0,
+        description='events_committed reaching 1',
+    )
     assert stats['events_committed'] == 1
     assert stats['last_commit_ts'] is not None
 
@@ -374,8 +639,13 @@ async def test_drain_for_test_drains_enqueued_events(real_buffer, tmp_path):
     """_drain_for_test() waits until every enqueued event has been processed.
 
     Constructs an EventQueue wired to a real SQLite buffer, enqueues 5 events,
-    then awaits q._drain_for_test(timeout=1.0).  After the call returns the
-    buffer must contain exactly 5 committed events (stats['size'] == 5).
+    then awaits q._drain_for_test() (its default timeout).  After the call
+    returns the buffer must contain exactly 5 committed events
+    (stats['size'] == 5).
+
+    Relies on _drain_for_test's default 5.0s ceiling, which keeps the guard
+    tolerant of a starved event loop under full-suite xdist load while still
+    failing loudly if the drainer genuinely never runs.
     """
     q = EventQueue(
         real_buffer,
@@ -389,13 +659,44 @@ async def test_drain_for_test_drains_enqueued_events(real_buffer, tmp_path):
     try:
         for _ in range(5):
             q.enqueue(_make_event())
-        await q._drain_for_test(timeout=1.0)
+        await q._drain_for_test()
         stats = await real_buffer.get_buffer_stats('test-project')
         assert stats['size'] == 5, (
             f"Expected 5 events in buffer after _drain_for_test, got {stats['size']}"
         )
     finally:
         await q.close()
+
+
+@pytest.mark.asyncio
+async def test_signal_after_commits_counts_only_returned_pushes(real_buffer):
+    """The drainer-commit tests await this signal bare, so it must never fire
+    before ``count`` pushes have returned with their rows committed."""
+    calls: list[int] = []
+    set_when_inner_push_returned: list[bool] = []
+    original_push = real_buffer.push
+
+    async def fails_first(event):
+        calls.append(1)
+        if len(calls) == 1:
+            raise aiosqlite.OperationalError('transient lock')
+        await original_push(event)
+        set_when_inner_push_returned.append(committed.is_set())
+
+    real_buffer.push = fails_first
+    committed = _signal_after_commits(real_buffer, 2)
+
+    with pytest.raises(aiosqlite.OperationalError):
+        await real_buffer.push(_make_event())
+    assert not committed.is_set()
+
+    await real_buffer.push(_make_event())
+    assert not committed.is_set()
+
+    await real_buffer.push(_make_event())
+    assert committed.is_set()
+    assert set_when_inner_push_returned == [False, False]
+    assert (await real_buffer.get_buffer_stats('test-project'))['size'] == 2
 
 
 # ── Rotation ────────────────────────────────────────────────────────────
@@ -550,7 +851,7 @@ async def test_rotation_keep_zero_purges_orphan_rotations(tmp_path):
     )
     await q.start()
     try:
-        # Enqueue enough events to trigger at least one _rotate_dead_letter call.
+        # Enqueue enough events to trigger at least one rotation.
         for _ in range(10):
             q.enqueue(_make_event())
         await q._drain_for_test(timeout=5.0)
@@ -558,12 +859,13 @@ async def test_rotation_keep_zero_purges_orphan_rotations(tmp_path):
         # Rotation must have fired at least once.  With max_bytes=200 and
         # each dead-letter record being ~300 bytes, the first write fills the
         # file past the cap, so every subsequent write triggers a rotation.
-        # _dead_letters >= 2 is therefore a direct witness that
-        # _rotate_dead_letter ran (the 2nd dead letter can only be written
-        # after rotation cleared the file).
-        assert q._dead_letters >= 2, (
+        # A dead_letters count >= 2 is therefore a direct witness that a
+        # rotation ran (the 2nd dead letter can only be written after
+        # rotation cleared the file).
+        dead_letters = q.stats()['dead_letters']
+        assert dead_letters >= 2, (
             f'expected at least 2 dead letters (and thus at least one rotation), '
-            f'got {q._dead_letters}'
+            f'got {dead_letters}'
         )
 
         # All orphan siblings must have been purged.
@@ -636,159 +938,96 @@ async def test_rotation_purges_orphan_rotations(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_read_dead_letters_basic_keys(tmp_path):
+async def test_seed_dead_letters_writes_the_writers_record_shape(tmp_path):
+    """seed_dead_letters, which reader and replay tests use instead of the
+    drainer, writes the same keys and value types as EventQueue's own writer,
+    and the same event. A writer-side change therefore fails here rather than
+    leaving every seeded reader test green."""
+    written = tmp_path / 'written.jsonl'
+    seeded = tmp_path / 'seeded.jsonl'
+    q = EventQueue(AsyncMock(), dead_letter_path=written, maxsize=1)
+    try:
+        kept, overflowed = _make_event(), _make_event()
+        assert q.enqueue(kept) is True
+        assert q.enqueue(overflowed) is False
+        await q.flush_dead_letters()
+        [real] = [json.loads(line) for line in written.read_text().splitlines()]
+    finally:
+        await q.close()
+    seed_dead_letters(seeded, [overflowed])
+    [seed] = [json.loads(line) for line in seeded.read_text().splitlines()]
+
+    assert {k: type(v) for k, v in seed.items()} == {k: type(v) for k, v in real.items()}
+    assert seed['event'] == real['event']
+
+
+def test_read_dead_letters_basic_keys(tmp_path):
     """read_dead_letters returns parsed records with required keys."""
-    buf = AsyncMock()
-    buf.push = AsyncMock(side_effect=ValueError('non-retriable'))
     dl = tmp_path / 'dl.jsonl'
+    seed_dead_letters(dl, [_make_event()])
+    q = EventQueue(AsyncMock(), dead_letter_path=dl)
 
-    q = EventQueue(
-        buf,
-        dead_letter_path=dl,
-        maxsize=100,
-        retry_initial_seconds=0.01,
-        retry_max_seconds=0.05,
-        shutdown_flush_seconds=2.0,
-    )
-    await q.start()
-    try:
-        q.enqueue(_make_event())
-        await asyncio.wait_for(q._queue.join(), timeout=2.0)
-
-        records = q.read_dead_letters()
-        assert len(records) == 1
-        rec = records[0]
-        assert 'event' in rec
-        assert 'reason' in rec
-        assert 'attempts' in rec
-        assert 'failed_at' in rec
-        assert rec['reason'] == 'non_retriable'
-        assert rec['attempts'] == 1
-    finally:
-        await q.close()
+    records = q.read_dead_letters()
+    assert len(records) == 1
+    rec = records[0]
+    assert 'event' in rec
+    assert 'reason' in rec
+    assert 'attempts' in rec
+    assert 'failed_at' in rec
+    assert rec['reason'] == 'non_retriable'
+    assert rec['attempts'] == 1
 
 
-@pytest.mark.asyncio
-async def test_read_dead_letters_limit(tmp_path):
+def test_read_dead_letters_limit(tmp_path):
     """read_dead_letters(limit=N) returns at most N records, newest-first."""
-    buf = AsyncMock()
-    buf.push = AsyncMock(side_effect=ValueError('non-retriable'))
     dl = tmp_path / 'dl.jsonl'
+    events = [_make_event() for _ in range(5)]
+    seed_dead_letters(dl, events)
+    q = EventQueue(AsyncMock(), dead_letter_path=dl)
 
-    q = EventQueue(
-        buf,
-        dead_letter_path=dl,
-        maxsize=100,
-        retry_initial_seconds=0.01,
-        retry_max_seconds=0.05,
-        shutdown_flush_seconds=2.0,
-    )
-    await q.start()
-    try:
-        for _ in range(5):
-            q.enqueue(_make_event())
-        await asyncio.wait_for(q._queue.join(), timeout=2.0)
-
-        limited = q.read_dead_letters(limit=2)
-        assert len(limited) == 2
-        # Newest-first: the last 2 written records should be returned first.
-        all_records = q.read_dead_letters()
-        assert len(all_records) == 5
-        assert limited == all_records[:2]
-    finally:
-        await q.close()
+    limited = q.read_dead_letters(limit=2)
+    assert [r['event']['id'] for r in limited] == [e.id for e in reversed(events)][:2]
 
 
-@pytest.mark.asyncio
-async def test_read_dead_letters_project_id_filter(tmp_path):
+def test_read_dead_letters_project_id_filter(tmp_path):
     """read_dead_letters(project_id=X) returns only records matching that project."""
-    buf = AsyncMock()
-    buf.push = AsyncMock(side_effect=ValueError('non-retriable'))
     dl = tmp_path / 'dl.jsonl'
-
-    q = EventQueue(
-        buf,
-        dead_letter_path=dl,
-        maxsize=100,
-        retry_initial_seconds=0.01,
-        retry_max_seconds=0.05,
-        shutdown_flush_seconds=2.0,
+    seed_dead_letters(
+        dl,
+        [_make_event(project_id='proj-a') for _ in range(3)]
+        + [_make_event(project_id='proj-b') for _ in range(2)],
     )
-    await q.start()
-    try:
-        for _ in range(3):
-            q.enqueue(_make_event(project_id='proj-a'))
-        for _ in range(2):
-            q.enqueue(_make_event(project_id='proj-b'))
-        await asyncio.wait_for(q._queue.join(), timeout=2.0)
+    q = EventQueue(AsyncMock(), dead_letter_path=dl)
 
-        proj_a_records = q.read_dead_letters(project_id='proj-a')
-        assert len(proj_a_records) == 3
-        assert all(r['event']['project_id'] == 'proj-a' for r in proj_a_records)
+    proj_a_records = q.read_dead_letters(project_id='proj-a')
+    assert len(proj_a_records) == 3
+    assert all(r['event']['project_id'] == 'proj-a' for r in proj_a_records)
 
-        proj_b_records = q.read_dead_letters(project_id='proj-b')
-        assert len(proj_b_records) == 2
-        assert all(r['event']['project_id'] == 'proj-b' for r in proj_b_records)
-    finally:
-        await q.close()
+    proj_b_records = q.read_dead_letters(project_id='proj-b')
+    assert len(proj_b_records) == 2
+    assert all(r['event']['project_id'] == 'proj-b' for r in proj_b_records)
 
 
-@pytest.mark.asyncio
-async def test_read_dead_letters_after_rotation(tmp_path):
+def test_read_dead_letters_after_rotation(tmp_path):
     """After rotation, read_dead_letters merges current + rotated files newest-first."""
-    buf = AsyncMock()
-    buf.push = AsyncMock(side_effect=ValueError('non-retriable'))
     dl = tmp_path / 'dl.jsonl'
+    rotated = [_make_event() for _ in range(2)]
+    current = [_make_event()]
+    seed_dead_letters(tmp_path / 'dl.jsonl.1', rotated)
+    seed_dead_letters(dl, current)
+    q = EventQueue(AsyncMock(), dead_letter_path=dl, keep_rotations=2)
 
-    q = EventQueue(
-        buf,
-        dead_letter_path=dl,
-        maxsize=100,
-        retry_initial_seconds=0.01,
-        retry_max_seconds=0.05,
-        shutdown_flush_seconds=2.0,
-        max_bytes=500,
-        keep_rotations=2,
+    all_records = q.read_dead_letters()
+    assert [r['event']['id'] for r in all_records] == (
+        [e.id for e in reversed(current)] + [e.id for e in reversed(rotated)]
     )
-    await q.start()
-    try:
-        # 3 events: events 1+2 fill the pre-rotation file, event 3 goes to fresh file.
-        for _ in range(3):
-            q.enqueue(_make_event())
-        await asyncio.wait_for(q._queue.join(), timeout=2.0)
-
-        # Rotation should have happened; .jsonl has event3, .jsonl.1 has events1+2.
-        assert (tmp_path / 'dl.jsonl.1').exists(), 'Rotation must have occurred'
-
-        all_records = q.read_dead_letters()
-        assert len(all_records) == 3, (
-            f'Must return records from current + rotated file; got {len(all_records)}'
-        )
-    finally:
-        await q.close()
 
 
-@pytest.mark.asyncio
-async def test_read_dead_letters_tolerates_malformed_line(tmp_path):
+def test_read_dead_letters_tolerates_malformed_line(tmp_path):
     """A malformed JSON line is skipped; no exception is raised."""
-    buf = AsyncMock()
-    buf.push = AsyncMock(side_effect=ValueError('non-retriable'))
     dl = tmp_path / 'dl.jsonl'
-
-    q = EventQueue(
-        buf,
-        dead_letter_path=dl,
-        maxsize=100,
-        retry_initial_seconds=0.01,
-        retry_max_seconds=0.05,
-        shutdown_flush_seconds=2.0,
-    )
-    await q.start()
-    try:
-        q.enqueue(_make_event())
-        await asyncio.wait_for(q._queue.join(), timeout=2.0)
-    finally:
-        await q.close()
+    seed_dead_letters(dl, [_make_event()])
+    q = EventQueue(AsyncMock(), dead_letter_path=dl)
 
     # Inject a malformed line into the JSONL file.
     with dl.open('a', encoding='utf-8') as fh:
@@ -799,37 +1038,14 @@ async def test_read_dead_letters_tolerates_malformed_line(tmp_path):
     assert len(records) == 1
 
 
-@pytest.mark.asyncio
-async def test_read_dead_letters_streams_without_loading_whole_files(tmp_path, monkeypatch):
+def test_read_dead_letters_streams_without_loading_whole_files(tmp_path, monkeypatch):
     """Streaming implementation never calls read_text; older rotation files not opened when limit satisfied."""
-    buf = AsyncMock()
-    buf.push = AsyncMock(side_effect=ValueError('non-retriable'))
     dl = tmp_path / 'dl.jsonl'
-
-    q = EventQueue(
-        buf,
-        dead_letter_path=dl,
-        maxsize=1000,
-        retry_initial_seconds=0.01,
-        retry_max_seconds=0.05,
-        shutdown_flush_seconds=2.0,
-        max_bytes=500,
-        keep_rotations=2,
-    )
-    await q.start()
-    try:
-        for _ in range(10):
-            q.enqueue(_make_event())
-        await asyncio.wait_for(q._queue.join(), timeout=5.0)
-    finally:
-        await q.close()
-
-    # Precondition: both dl.jsonl and dl.jsonl.1 must exist so the test
-    # exercises the short-circuit optimization across rotation files.
-    assert dl.exists(), 'dl.jsonl must exist (precondition)'
-    assert (tmp_path / 'dl.jsonl.1').exists(), (
-        'dl.jsonl.1 must exist after rotation (precondition)'
-    )
+    # Both dl.jsonl and dl.jsonl.1 hold records, so the test exercises the
+    # short-circuit optimization across rotation files.
+    seed_dead_letters(tmp_path / 'dl.jsonl.1', [_make_event() for _ in range(3)])
+    seed_dead_letters(dl, [_make_event() for _ in range(3)])
+    q = EventQueue(AsyncMock(), dead_letter_path=dl, keep_rotations=2)
 
     # Track every path opened by read_dead_letters.
     opened_paths: list[str] = []
@@ -870,8 +1086,7 @@ async def test_read_dead_letters_streams_without_loading_whole_files(tmp_path, m
     )
 
 
-@pytest.mark.asyncio
-async def test_read_dead_letters_tolerates_oserror(tmp_path, monkeypatch, caplog):
+def test_read_dead_letters_tolerates_oserror(tmp_path, monkeypatch, caplog):
     """read_dead_letters never raises when a dead-letter file cannot be opened.
 
     The OSError handler inside `read_dead_letters` catches OSError raised by
@@ -882,27 +1097,9 @@ async def test_read_dead_letters_tolerates_oserror(tmp_path, monkeypatch, caplog
     The monkeypatch is selective: only the dead-letter path's open() raises;
     all other Path.open calls (SQLite fixtures, etc.) use the real open.
     """
-    buf = AsyncMock()
-    buf.push = AsyncMock(side_effect=ValueError('non-retriable'))
     dl = tmp_path / 'dl.jsonl'
-
-    q = EventQueue(
-        buf,
-        dead_letter_path=dl,
-        maxsize=100,
-        retry_initial_seconds=0.01,
-        retry_max_seconds=0.05,
-        shutdown_flush_seconds=2.0,
-    )
-    await q.start()
-    try:
-        q.enqueue(_make_event())
-        await asyncio.wait_for(q._queue.join(), timeout=2.0)
-    finally:
-        await q.close()
-
-    # Confirm the dead-letter file was actually written.
-    assert dl.exists(), 'dead-letter file must exist before patching open'
+    seed_dead_letters(dl, [_make_event()])
+    q = EventQueue(AsyncMock(), dead_letter_path=dl)
 
     # Patch Path.open selectively: only fail when opening the dead-letter path.
     _original_open = pathlib.Path.open
@@ -1027,58 +1224,26 @@ def test_count_dead_letters_returns_zero_when_file_missing(tmp_path):
     assert q.count_dead_letters(project_id='proj-x') == 0
 
 
-@pytest.mark.asyncio
-async def test_count_dead_letters_matches_read_dead_letters_no_filter(tmp_path):
+def test_count_dead_letters_matches_read_dead_letters_no_filter(tmp_path):
     """count_dead_letters() == len(read_dead_letters()) when no filter is given."""
-    buf = AsyncMock()
-    buf.push = AsyncMock(side_effect=ValueError('non-retriable'))
     dl = tmp_path / 'dl.jsonl'
-
-    q = EventQueue(
-        buf,
-        dead_letter_path=dl,
-        maxsize=100,
-        retry_initial_seconds=0.01,
-        retry_max_seconds=0.05,
-        shutdown_flush_seconds=2.0,
-    )
-    await q.start()
-    try:
-        for _ in range(5):
-            q.enqueue(_make_event())
-        await asyncio.wait_for(q._queue.join(), timeout=2.0)
-    finally:
-        await q.close()
+    seed_dead_letters(dl, [_make_event() for _ in range(5)])
+    q = EventQueue(AsyncMock(), dead_letter_path=dl)
 
     all_records = q.read_dead_letters()
     assert len(all_records) == 5, f'Expected 5 dead-lettered records, got {len(all_records)}'
     assert q.count_dead_letters() == len(all_records) == 5
 
 
-@pytest.mark.asyncio
-async def test_count_dead_letters_matches_read_dead_letters_project_id_filter(tmp_path):
+def test_count_dead_letters_matches_read_dead_letters_project_id_filter(tmp_path):
     """count_dead_letters(project_id=X) == len(read_dead_letters(project_id=X))."""
-    buf = AsyncMock()
-    buf.push = AsyncMock(side_effect=ValueError('non-retriable'))
     dl = tmp_path / 'dl.jsonl'
-
-    q = EventQueue(
-        buf,
-        dead_letter_path=dl,
-        maxsize=100,
-        retry_initial_seconds=0.01,
-        retry_max_seconds=0.05,
-        shutdown_flush_seconds=2.0,
+    seed_dead_letters(
+        dl,
+        [_make_event(project_id='proj-a') for _ in range(3)]
+        + [_make_event(project_id='proj-b') for _ in range(2)],
     )
-    await q.start()
-    try:
-        for _ in range(3):
-            q.enqueue(_make_event(project_id='proj-a'))
-        for _ in range(2):
-            q.enqueue(_make_event(project_id='proj-b'))
-        await asyncio.wait_for(q._queue.join(), timeout=2.0)
-    finally:
-        await q.close()
+    q = EventQueue(AsyncMock(), dead_letter_path=dl)
 
     proj_a_records = q.read_dead_letters(project_id='proj-a')
     assert len(proj_a_records) == 3
@@ -1089,34 +1254,12 @@ async def test_count_dead_letters_matches_read_dead_letters_project_id_filter(tm
     assert q.count_dead_letters(project_id='proj-b') == len(proj_b_records) == 2
 
 
-@pytest.mark.asyncio
-async def test_count_dead_letters_spans_rotated_files(tmp_path):
+def test_count_dead_letters_spans_rotated_files(tmp_path):
     """count_dead_letters spans current + rotated files; equals len(read_dead_letters())."""
-    buf = AsyncMock()
-    buf.push = AsyncMock(side_effect=ValueError('non-retriable'))
     dl = tmp_path / 'dl.jsonl'
-
-    q = EventQueue(
-        buf,
-        dead_letter_path=dl,
-        maxsize=100,
-        retry_initial_seconds=0.01,
-        retry_max_seconds=0.05,
-        shutdown_flush_seconds=2.0,
-        max_bytes=500,
-        keep_rotations=2,
-    )
-    await q.start()
-    try:
-        # 3 events trigger rotation: events 1+2 fill the pre-rotation file,
-        # event 3 lands in the fresh file (mirrors test_read_dead_letters_after_rotation).
-        for _ in range(3):
-            q.enqueue(_make_event())
-        await asyncio.wait_for(q._queue.join(), timeout=2.0)
-    finally:
-        await q.close()
-
-    assert (tmp_path / 'dl.jsonl.1').exists(), 'Rotation must have occurred'
+    seed_dead_letters(tmp_path / 'dl.jsonl.1', [_make_event() for _ in range(2)])
+    seed_dead_letters(dl, [_make_event()])
+    q = EventQueue(AsyncMock(), dead_letter_path=dl, keep_rotations=2)
 
     all_records = q.read_dead_letters()
     assert len(all_records) == 3, (
@@ -1125,8 +1268,7 @@ async def test_count_dead_letters_spans_rotated_files(tmp_path):
     assert q.count_dead_letters() == len(all_records) == 3
 
 
-@pytest.mark.asyncio
-async def test_count_dead_letters_diverges_from_read_dead_letters_on_malformed_line(
+def test_count_dead_letters_diverges_from_read_dead_letters_on_malformed_line(
     tmp_path, caplog
 ):
     """count_dead_letters hot-path counts malformed lines; read_dead_letters skips them.
@@ -1143,28 +1285,10 @@ async def test_count_dead_letters_diverges_from_read_dead_letters_on_malformed_l
     If a future change "fixes" the hot-path to skip malformed lines (or removes the
     skip in read_dead_letters), this test fails and pinpoints the regression.
     """
-    buf = AsyncMock()
-    buf.push = AsyncMock(side_effect=ValueError('non-retriable'))
     dl = tmp_path / 'dl.jsonl'
+    seed_dead_letters(dl, [_make_event(project_id='proj-x') for _ in range(2)])
+    q = EventQueue(AsyncMock(), dead_letter_path=dl)
 
-    q = EventQueue(
-        buf,
-        dead_letter_path=dl,
-        maxsize=100,
-        retry_initial_seconds=0.01,
-        retry_max_seconds=0.05,
-        shutdown_flush_seconds=2.0,
-    )
-    await q.start()
-    try:
-        for _ in range(2):
-            q.enqueue(_make_event(project_id='proj-x'))
-        await asyncio.wait_for(q._queue.join(), timeout=2.0)
-    finally:
-        await q.close()
-
-    # Inject a malformed line AFTER close so the drainer cannot overwrite it.
-    # Same pattern as test_read_dead_letters_tolerates_malformed_line.
     with dl.open('a', encoding='utf-8') as fh:
         fh.write('not-json-at-all\n')
 
@@ -1338,6 +1462,7 @@ async def test_drainer_marks_processed_on_commit(real_buffer, tmp_path):
     removed — the in-memory queue is a pure dispatch cache over the durable row.
     """
     ej_path = tmp_path / 'ej.db'
+    committed = _signal_after_commits(real_buffer, 1)
     q = EventQueue(
         real_buffer,
         dead_letter_path=tmp_path / 'dl.jsonl',
@@ -1351,16 +1476,12 @@ async def test_drainer_marks_processed_on_commit(real_buffer, tmp_path):
     try:
         event = _make_event()
         assert q.enqueue(event) is True
-        await asyncio.wait_for(q._queue.join(), timeout=2.0)
+        await committed.wait()
         # Committed to the buffer.
         stats = await real_buffer.get_buffer_stats('test-project')
         assert stats['size'] == 1
         # Journal row removed (drainer marked it processed after the push).
-        journal = EventJournal(ej_path)
-        try:
-            assert journal.load_unprocessed() == []
-        finally:
-            journal.close()
+        assert journaled_events(ej_path) == {}
     finally:
         await q.close()
 
@@ -1370,8 +1491,14 @@ async def test_drainer_marks_processed_on_dead_letter(tmp_path):
     """When the drainer dead-letters a non-retriable event, its journal row is
     removed too — durability is handed off to the dead-letter JSONL file.
     """
+    push_failed = asyncio.Event()
+
+    def fail(event):
+        push_failed.set()
+        raise ValueError('schema mismatch')
+
     buf = AsyncMock()
-    buf.push = AsyncMock(side_effect=ValueError('schema mismatch'))
+    buf.push = AsyncMock(side_effect=fail)
     ej_path = tmp_path / 'ej.db'
     dl = tmp_path / 'dl.jsonl'
     q = EventQueue(
@@ -1387,18 +1514,15 @@ async def test_drainer_marks_processed_on_dead_letter(tmp_path):
     try:
         event = _make_event()
         assert q.enqueue(event) is True
-        await asyncio.wait_for(q._queue.join(), timeout=2.0)
+        await push_failed.wait()
+        await q.flush_dead_letters()
         # Dead-lettered (non-retriable push error).
         assert q.stats()['dead_letters'] == 1
         lines = dl.read_text().strip().splitlines()
         assert len(lines) == 1
         assert json.loads(lines[0])['reason'] == 'non_retriable'
         # Journal row removed — durability handed off to the dead-letter file.
-        journal = EventJournal(ej_path)
-        try:
-            assert journal.load_unprocessed() == []
-        finally:
-            journal.close()
+        assert journaled_events(ej_path) == {}
     finally:
         await q.close()
 
@@ -1431,6 +1555,7 @@ async def test_startup_recovery_after_kill9(real_buffer, tmp_path):
 
     # queue2: fresh EventQueue over the SAME buffer + journal_path. start()
     # must recover() the unprocessed row and re-enqueue it for the drainer.
+    committed = _signal_after_commits(real_buffer, 1)
     queue2 = EventQueue(
         real_buffer,
         dead_letter_path=tmp_path / 'dl.jsonl',
@@ -1442,15 +1567,11 @@ async def test_startup_recovery_after_kill9(real_buffer, tmp_path):
     )
     await queue2.start()
     try:
-        await asyncio.wait_for(queue2._queue.join(), timeout=2.0)
+        await committed.wait()
         # (1) present after restart.
         assert (await real_buffer.get_buffer_stats('test-project'))['size'] == 1
         # (2) processed after restart — journal drained.
-        journal = EventJournal(ej_path)
-        try:
-            assert journal.load_unprocessed() == []
-        finally:
-            journal.close()
+        assert journaled_events(ej_path) == {}
     finally:
         await queue2.close()
 
@@ -1459,97 +1580,359 @@ async def test_startup_recovery_after_kill9(real_buffer, tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_replay_dead_letters_reenqueues_and_clears(real_buffer, tmp_path):
-    """replay_dead_letters re-enqueues dead-lettered events (drainer commits
-    them), clears them from the file, and a second call finds nothing to replay.
+async def test_replay_dead_letters_reenqueues_and_clears(tmp_path):
+    """replay_dead_letters puts every dead-lettered event back in the queue
+    unchanged (journaled, observed with the drainer parked so the state is
+    settled rather than raced), clears them from the file, and a second call
+    finds nothing to replay.
+
+    The drainer's commit of re-enqueued events is covered by
+    fused-memory/tests/test_event_queue.py::test_drainer_marks_processed_on_commit.
     """
     dl = tmp_path / 'dl.jsonl'
-    q = EventQueue(
-        real_buffer,
-        dead_letter_path=dl,
-        journal_path=tmp_path / 'ej.db',
-        maxsize=100,
-        retry_initial_seconds=0.01,
-        retry_max_seconds=0.1,
-        shutdown_flush_seconds=2.0,
-    )
-    await q.start()
-    try:
-        for _ in range(3):
-            q._write_dead_letter(_make_event(), reason='non_retriable', attempts=1)
+    ej = tmp_path / 'ej.db'
+    async with parked_queue(dl, ej) as q:
+        seeded = [_make_event() for _ in range(3)]
+        seed_dead_letters(dl, seeded)
         assert len(dl.read_text().strip().splitlines()) == 3
 
         counts = q.replay_dead_letters()
         assert counts == {'replayed': 3, 'failed': 0}
-        # Drainer commits the replayed events to the buffer.
-        await asyncio.wait_for(q._queue.join(), timeout=2.0)
-        assert (await real_buffer.get_buffer_stats('test-project'))['size'] == 3
+        assert journaled_events(ej) == {e.id: e for e in seeded}
         # File no longer holds the replayed records.
         assert (dl.read_text().strip() if dl.exists() else '') == ''
         # Second call → nothing to replay (no re-replay).
         assert q.replay_dead_letters() == {'replayed': 0, 'failed': 0}
-    finally:
-        await q.close()
 
 
 @pytest.mark.asyncio
-async def test_replay_dead_letters_filters_by_project_id(real_buffer, tmp_path):
+async def test_replay_dead_letters_filters_by_project_id(tmp_path):
     """With project_id set, only matching records are replayed; non-matching
     records remain in the dead-letter file."""
     dl = tmp_path / 'dl.jsonl'
-    q = EventQueue(
-        real_buffer,
-        dead_letter_path=dl,
-        journal_path=tmp_path / 'ej.db',
-        maxsize=100,
-        retry_initial_seconds=0.01,
-        retry_max_seconds=0.1,
-        shutdown_flush_seconds=2.0,
-    )
-    await q.start()
-    try:
-        for _ in range(2):
-            q._write_dead_letter(_make_event(project_id='proj-a'), reason='non_retriable', attempts=1)
-        for _ in range(3):
-            q._write_dead_letter(_make_event(project_id='proj-b'), reason='non_retriable', attempts=1)
+    ej = tmp_path / 'ej.db'
+    async with parked_queue(dl, ej) as q:
+        proj_a = [_make_event(project_id='proj-a') for _ in range(2)]
+        seed_dead_letters(dl, proj_a)
+        seed_dead_letters(dl, [_make_event(project_id='proj-b') for _ in range(3)])
 
         counts = q.replay_dead_letters(project_id='proj-a')
         assert counts == {'replayed': 2, 'failed': 0}
-        await asyncio.wait_for(q._queue.join(), timeout=2.0)
-        assert (await real_buffer.get_buffer_stats('proj-a'))['size'] == 2
+        assert journaled_events(ej) == {e.id: e for e in proj_a}
         # Non-matching proj-b records are preserved in the file.
         remaining = q.read_dead_letters()
         assert len(remaining) == 3
         assert all(r['event']['project_id'] == 'proj-b' for r in remaining)
-    finally:
-        await q.close()
 
 
 @pytest.mark.asyncio
-async def test_replay_dead_letters_preserves_unparseable(real_buffer, tmp_path):
+async def test_replay_dead_letters_preserves_unparseable(tmp_path):
     """A malformed/unparseable dead-letter line counts toward `failed` and is
     preserved (loud-over-silent — never silently dropped)."""
     dl = tmp_path / 'dl.jsonl'
-    q = EventQueue(
-        real_buffer,
-        dead_letter_path=dl,
-        journal_path=tmp_path / 'ej.db',
-        maxsize=100,
-        retry_initial_seconds=0.01,
-        retry_max_seconds=0.1,
-        shutdown_flush_seconds=2.0,
-    )
-    await q.start()
-    try:
-        q._write_dead_letter(_make_event(), reason='non_retriable', attempts=1)
+    ej = tmp_path / 'ej.db'
+    async with parked_queue(dl, ej) as q:
+        good = _make_event()
+        seed_dead_letters(dl, [good])
         with dl.open('a', encoding='utf-8') as fh:
             fh.write('{not valid json\n')
 
         counts = q.replay_dead_letters()
         assert counts == {'replayed': 1, 'failed': 1}
-        await asyncio.wait_for(q._queue.join(), timeout=2.0)
+        assert journaled_events(ej) == {good.id: good}
         # The malformed line survives; the good record was replayed out.
-        assert dl.exists()
-        assert '{not valid json' in dl.read_text()
+        assert dl.read_text().splitlines() == ['{not valid json']
+
+
+# ── Off-loop dead-letter hand-off (task 6085) ──────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_enqueue_overflow_returns_before_dead_letter_append_lands(tmp_path):
+    """An overflowing enqueue hands its record to the writer thread and returns
+    while the append is still held open, so the loop never waits on that I/O.
+    """
+    held = hold_fifo(tmp_path / 'dl.jsonl')
+    e1, e2 = _make_event(), _make_event()
+    async with overflowed_queue(held.path, e1, e2) as q:
+        assert not held.reader_opened.is_set(), (
+            'enqueue() only returned after the FIFO reader opened: the '
+            'dead-letter append ran on the event-loop thread'
+        )
+        assert q.stats()['dead_letters_pending'] == 1
+
+        held.release.set()
+        await q.flush_dead_letters()
+
+        records = held.records()
+        assert [(r['reason'], r['event']['id']) for r in records] == [('overflow_drop', e2.id)]
+        assert q.stats()['dead_letters'] == 1
+        assert q.stats()['dead_letters_pending'] == 0
+
+
+@pytest.mark.asyncio
+async def test_overflow_journal_row_survives_until_its_dead_letter_is_written(tmp_path):
+    """The overflowed event's journal row is released only once its record is
+    on disk, so a kill -9 while the append is pending cannot lose it."""
+    held = hold_fifo(tmp_path / 'dl.jsonl')
+    ej = tmp_path / 'ej.db'
+    e1, e2 = _make_event(), _make_event()
+    async with overflowed_queue(held.path, e1, e2, journal_path=ej) as q:
+        assert e2.id in journaled_ids(ej)
+
+        held.release.set()
+        await q.flush_dead_letters()
+
+        assert [r['event']['id'] for r in held.records()] == [e2.id]
+        journaled = journaled_ids(ej)
+        assert e1.id in journaled
+        assert e2.id not in journaled
+
+
+@pytest.mark.asyncio
+async def test_close_of_a_never_started_queue_closes_its_journal(tmp_path):
+    """close() releases the journal's connection even if start() never ran.
+
+    SQLite deletes a WAL database's ``-wal`` file when its last connection
+    closes, so a surviving ``-wal`` file means the queue still holds one.
+    """
+    ej = tmp_path / 'ej.db'
+    q = EventQueue(AsyncMock(), dead_letter_path=tmp_path / 'dl.jsonl', journal_path=ej)
+    assert q.enqueue(_make_event()) is True
+    assert (tmp_path / 'ej.db-wal').exists()
+
+    await q.close()
+
+    assert not (tmp_path / 'ej.db-wal').exists()
+
+
+@pytest.mark.asyncio
+async def test_failed_dead_letter_write_keeps_the_journal_row(tmp_path):
+    """A dead-letter write that fails leaves the event's journal row for
+    recover() to redeliver, rather than silently losing the event."""
+    (tmp_path / 'blocker').write_text('a regular file, not a directory')
+    ej = tmp_path / 'ej.db'
+    e1, e2 = _make_event(), _make_event()
+    async with overflowed_queue(tmp_path / 'blocker' / 'dl.jsonl', e1, e2, journal_path=ej) as q:
+        await q.flush_dead_letters()
+
+        assert e2.id in journaled_ids(ej)
+        assert q.stats()['dead_letters'] == 0
+
+
+@pytest.mark.asyncio
+async def test_close_leaves_every_handed_off_record_on_disk_and_its_row_released(
+    tmp_path, caplog,
+):
+    """After close(), every record handed to the dead-letter writer is on
+    disk with its journal row released; only the event the drainer held when
+    close() cancelled it may remain journaled.
+
+    Only set relations and counts are asserted: which event the drainer holds
+    when close() cancels it depends on scheduling. Every assertion message
+    names each event's store, the queue's stats() and its WARNING+ log
+    records, so a red under load shows which branch failed.
+    """
+    caplog.set_level(logging.WARNING, logger='fused_memory.reconciliation')
+    buf = AsyncMock()
+
+    async def blocking_push(event):
+        await asyncio.sleep(1000)
+
+    buf.push = blocking_push
+    dl = tmp_path / 'dl.jsonl'
+    ej = tmp_path / 'ej.db'
+    q = EventQueue(
+        buf,
+        dead_letter_path=dl,
+        journal_path=ej,
+        maxsize=2,
+        shutdown_flush_seconds=0.05,
+    )
+    await q.start()
+    events = [_make_event() for _ in range(6)]
+    for event in events:
+        q.enqueue(event)
+    await q.close()
+
+    stats = q.stats()
+    logs = [(r.name, r.levelname, r.getMessage()) for r in caplog.records]
+    lines = dl.read_text(encoding='utf-8').splitlines() if dl.exists() else []
+    records = []
+    for line in lines:
+        try:
+            records.append(json.loads(line))
+        except json.JSONDecodeError as exc:
+            raise AssertionError(
+                f'unparseable dead-letter line {line!r} stats={stats} logs={logs}',
+            ) from exc
+    dead_lettered = {r['event']['id'] for r in records}
+    journaled = journaled_ids(ej)
+    placement = {
+        index: sorted(
+            store
+            for store, ids in (('dead_letter', dead_lettered), ('journal', journaled))
+            if event.id in ids
+        )
+        for index, event in enumerate(events)
+    }
+    evidence = f'placement={placement} stats={stats} logs={logs}'
+
+    assert all(len(stores) == 1 for stores in placement.values()), evidence
+    assert dead_lettered | journaled == {e.id for e in events}, evidence
+    assert len(journaled) <= 1, evidence
+    assert len(records) == len(dead_lettered), evidence
+    assert stats['dead_letters_pending'] == 0, evidence
+    assert stats['dead_letters'] == len(records), evidence
+    overflow_records = sum(r['reason'] == 'overflow_drop' for r in records)
+    assert overflow_records == stats['overflow_drops'] > 0, evidence
+    assert {r['reason'] for r in records} <= {'overflow_drop', 'shutdown_timeout'}, evidence
+
+
+@pytest.mark.asyncio
+async def test_flush_dead_letters_returns_only_after_the_journal_row_release_is_scheduled(
+    monkeypatch, tmp_path,
+):
+    """flush_dead_letters(), and so close(), must not return before a written
+    record's journal-row release has been queued on the loop.
+
+    This race lets a dead-lettered event stay journaled (the
+    test_close_leaves_every_handed_off_record_on_disk_and_its_row_released
+    flake). The writer thread's first hop onto the loop is parked to hold
+    that ordering open.
+    """
+    loop = asyncio.get_running_loop()
+    loop_thread = threading.get_ident()
+    real_hop = loop.call_soon_threadsafe
+    hop_parked = asyncio.Event()
+    unpark = threading.Event()
+    parked = False
+
+    def park_first_off_loop_hop(callback, *args, **kwargs):
+        nonlocal parked
+        if threading.get_ident() != loop_thread and not parked:
+            parked = True
+            real_hop(hop_parked.set)
+            unpark.wait()
+        return real_hop(callback, *args, **kwargs)
+
+    monkeypatch.setattr(loop, 'call_soon_threadsafe', park_first_off_loop_hop)
+    held = hold_fifo(tmp_path / 'dl.jsonl')
+    ej = tmp_path / 'ej.db'
+    q = EventQueue(AsyncMock(), dead_letter_path=held.path, journal_path=ej, maxsize=1)
+    try:
+        e1, e2 = _make_event(), _make_event()
+        assert q.enqueue(e1) is True
+        assert q.enqueue(e2) is False
+        held.release.set()
+        await hop_parked.wait()
+
+        flush = asyncio.ensure_future(q.flush_dead_letters())
+        # Without the ordering guarantee, flush completes within three loop iterations.
+        for _ in range(10):
+            await asyncio.sleep(0)
+        assert not flush.done(), (
+            'flush_dead_letters() returned before the writer thread queued the '
+            'journal-row release'
+        )
+
+        unpark.set()
+        await flush
+        journaled = journaled_ids(ej)
+        assert e2.id not in journaled
+        assert e1.id in journaled
+    finally:
+        unpark.set()
+        await q.close()
+
+
+@pytest.mark.asyncio
+async def test_flush_dead_letters_releases_the_row_of_a_write_that_finished_before_the_flush(
+    monkeypatch, tmp_path,
+):
+    """A record already on disk when flush_dead_letters() is called still has
+    its journal-row release run before the flush returns.
+
+    Blocking on the write's future holds the loop thread, so the release the
+    writer thread queued on the loop has not run when the flush starts.
+    """
+    writes = record_dead_letter_writes(monkeypatch)
+    ej = tmp_path / 'ej.db'
+    e1, e2 = _make_event(), _make_event()
+    async with overflowed_queue(tmp_path / 'dl.jsonl', e1, e2, journal_path=ej) as q:
+        [written] = writes
+        assert written.result(timeout=5) is True
+
+        await q.flush_dead_letters()
+
+        journaled = journaled_ids(ej)
+        assert e2.id not in journaled
+        assert e1.id in journaled
+
+
+@pytest.mark.asyncio
+async def test_close_releases_the_row_of_a_write_that_finished_before_close(
+    monkeypatch, tmp_path,
+):
+    """close() runs the journal-row release of a record already on disk before
+    it closes the journal, so recover() cannot redeliver a dead-lettered event."""
+    writes = record_dead_letter_writes(monkeypatch)
+    ej = tmp_path / 'ej.db'
+    e1, e2 = _make_event(), _make_event()
+    async with overflowed_queue(tmp_path / 'dl.jsonl', e1, e2, journal_path=ej):
+        [written] = writes
+        assert written.result(timeout=5) is True
+
+    assert journaled_ids(ej) == {e1.id}
+
+
+@pytest.mark.asyncio
+async def test_a_cancelled_flush_leaves_no_error_on_the_loop_when_its_write_settles(tmp_path):
+    """Cancelling flush_dead_letters() while a write is pending leaves nothing
+    for the loop's exception handler once that write settles, and a later
+    flush still releases the written record's journal row."""
+    loop = asyncio.get_running_loop()
+    contexts: list[dict] = []
+    previous_handler = loop.get_exception_handler()
+    loop.set_exception_handler(lambda _loop, context: contexts.append(context))
+    held = hold_fifo(tmp_path / 'dl.jsonl')
+    ej = tmp_path / 'ej.db'
+    q = EventQueue(AsyncMock(), dead_letter_path=held.path, journal_path=ej, maxsize=1)
+    try:
+        e1, e2 = _make_event(), _make_event()
+        assert q.enqueue(e1) is True
+        assert q.enqueue(e2) is False
+        flush = asyncio.ensure_future(q.flush_dead_letters())
+        await asyncio.sleep(0)
+        flush.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await flush
+
+        held.release.set()
+        held.records()
+        await q.flush_dead_letters()
+
+        assert contexts == []
+        assert e2.id not in journaled_ids(ej)
+    finally:
+        held.release.set()
+        await q.close()
+        loop.set_exception_handler(previous_handler)
+
+
+@pytest.mark.asyncio
+async def test_flush_dead_letters_is_cancelled_when_the_writers_flush_future_is(
+    monkeypatch, tmp_path,
+):
+    """A cancelled writer future cancels the flush awaiting it, as
+    asyncio.wrap_future would, rather than leaving that flush to hang."""
+    q = EventQueue(AsyncMock(), dead_letter_path=tmp_path / 'dl.jsonl')
+    try:
+        cancelled: Future[None] = Future()
+        cancelled.cancel()
+        with monkeypatch.context() as patched:
+            patched.setattr(DeadLetterWriter, 'flushed', lambda _writer: cancelled)
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(q.flush_dead_letters(), timeout=5)
     finally:
         await q.close()

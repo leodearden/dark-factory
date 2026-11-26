@@ -18,13 +18,20 @@ fixtures from ``test_task_write_agent_id.py`` and live further down this file.
 
 from __future__ import annotations
 
-import threading
-from unittest.mock import AsyncMock
+import inspect
+import json
+import logging
+import subprocess
+from datetime import UTC, datetime, timedelta
+from unittest.mock import AsyncMock, patch
 
 import pytest
 import pytest_asyncio
+from _census_helpers import census_lines
+from _fm_helpers import LoopFreedomProbe, as_async_run_git
 from shared.task_metadata import _BLESSED_METADATA_KEYS, parse_metadata
 
+import fused_memory.services.live_workflow_detector as detector_module
 from fused_memory.middleware import recon_write_policy
 from fused_memory.middleware.task_interceptor import TaskInterceptor
 from fused_memory.reconciliation.event_buffer import EventBuffer
@@ -105,8 +112,14 @@ class TestVerdict:
 # ---------------------------------------------------------------------------
 
 
-def _check(op: str, **overrides) -> recon_write_policy.Verdict:
-    """Call check() with sensible defaults; override any kwarg via overrides."""
+async def _check(op: str, **overrides) -> recon_write_policy.Verdict:
+    """Call check() with sensible defaults; override any kwarg via overrides.
+
+    Async since task 3778: Gate 2's ``is_workflow_live_for_task`` is a
+    coroutine function (its three git probes moved onto ``shared.git_async``),
+    so ``check`` is natively async and every caller awaits it. The gate
+    verdicts themselves are unchanged — only the calling convention is.
+    """
     kwargs = {
         'task_id': '1',
         'project_root': '/p',
@@ -116,7 +129,67 @@ def _check(op: str, **overrides) -> recon_write_policy.Verdict:
         'snapshot_token': None,
     }
     kwargs.update(overrides)
-    return recon_write_policy.check(op, **kwargs)
+    return await recon_write_policy.check(op, **kwargs)
+
+
+def _async_detector(result: bool):
+    """Async stand-in for the now-coroutine ``is_workflow_live_for_task``.
+
+    Replaces the ``lambda *a, **k: <bool>`` fakes this suite used while the
+    detector was synchronous. A sync fake would still be *called* by check(),
+    but awaiting its bool return would raise — so every seam must be async.
+    """
+    async def _fake(*args, **kwargs):
+        return result
+
+    return _fake
+
+
+def _capturing_async_detector(captured: dict, result: bool = False):
+    """Kwarg-capturing async ``is_workflow_live_for_task`` spy returning *result*."""
+    async def _spy(*args, **kwargs):
+        captured['args'] = args
+        captured['kwargs'] = kwargs
+        return result
+
+    return _spy
+
+
+# ---------------------------------------------------------------------------
+# check() async surface (task 3778)
+# ---------------------------------------------------------------------------
+
+
+class TestCheckIsNativelyAsync:
+    """check() is a coroutine function, and the seams it consumes are too.
+
+    Task 3778 moved the live-workflow detector's three git probes off blocking
+    `subprocess.run` and onto `shared.git_async.run_git`, which made
+    `is_workflow_live_for_task` a coroutine function. check() awaits it, so
+    check() is a coroutine function as well — and the `asyncio.to_thread` hop
+    task_interceptor used to wrap it in becomes both unnecessary and wrong (it
+    would hand a coroutine object, never a Verdict, back to the caller).
+
+    This class pins the SURFACE. The verdict-level behavior is pinned, gate by
+    gate, by the classes below — every one of which kept its assertions
+    byte-for-byte across the conversion.
+    """
+
+    def test_check_is_a_coroutine_function(self):
+        assert inspect.iscoroutinefunction(recon_write_policy.check)
+
+    def test_detector_seam_is_a_coroutine_function(self):
+        """The module-level `is_workflow_live_for_task` binding check() calls —
+        the same name six test files monkeypatch — is itself async, so a sync
+        fake patched over it would be a fake of a contract that no longer
+        exists."""
+        assert inspect.iscoroutinefunction(recon_write_policy.is_workflow_live_for_task)
+
+    def test_corroboration_verdict_stays_synchronous(self):
+        """_corroboration_verdict does blocking DISK I/O, not git — it stays a
+        plain function and check() offloads it via asyncio.to_thread. Making it
+        async would misrepresent it as non-blocking."""
+        assert not inspect.iscoroutinefunction(recon_write_policy._corroboration_verdict)
 
 
 # ---------------------------------------------------------------------------
@@ -125,65 +198,67 @@ def _check(op: str, **overrides) -> recon_write_policy.Verdict:
 
 
 class TestCheckGate1Terminal:
-    def test_update_task_on_done_task_rejects(self):
-        verdict = _check('update_task', live_status='done')
+    pytestmark = pytest.mark.asyncio
+
+    async def test_update_task_on_done_task_rejects(self):
+        verdict = await _check('update_task', live_status='done')
         assert verdict.is_rejection is True
         assert verdict.error_type == 'ReconTerminalWriteRejected'
 
-    def test_update_task_on_cancelled_task_rejects(self):
-        verdict = _check('update_task', live_status='cancelled')
+    async def test_update_task_on_cancelled_task_rejects(self):
+        verdict = await _check('update_task', live_status='cancelled')
         assert verdict.is_rejection is True
         assert verdict.error_type == 'ReconTerminalWriteRejected'
 
-    def test_update_task_on_in_progress_task_is_ok(self):
-        verdict = _check('update_task', live_status='in-progress')
+    async def test_update_task_on_in_progress_task_is_ok(self):
+        verdict = await _check('update_task', live_status='in-progress')
         assert verdict.is_rejection is False
 
-    def test_set_task_status_op_is_not_scoped_by_gate_1(self):
+    async def test_set_task_status_op_is_not_scoped_by_gate_1(self):
         """Gate 1 is update_task-only: a set_task_status call against a done
         task must never surface ReconTerminalWriteRejected."""
-        verdict = _check('set_task_status', target_status='pending', live_status='done')
+        verdict = await _check('set_task_status', target_status='pending', live_status='done')
         assert verdict.error_type != 'ReconTerminalWriteRejected'
 
-    def test_terminal_rejection_on_done_populates_corrective_path(self):
+    async def test_terminal_rejection_on_done_populates_corrective_path(self):
         """Bound to the source-of-truth TERMINAL_CORRECTIVE_PATH constant
         (rather than a repeated literal) so an accidental change to its
         value is caught here. The sibling cancelled-task test below keeps
         one explicit literal pin to lock the on-the-wire value."""
-        verdict = _check('update_task', live_status='done')
+        verdict = await _check('update_task', live_status='done')
         assert verdict.corrective_path == recon_write_policy.TERMINAL_CORRECTIVE_PATH
         assert (
             verdict.to_error_dict()['corrective_path']
             == recon_write_policy.TERMINAL_CORRECTIVE_PATH
         )
 
-    def test_terminal_rejection_on_cancelled_populates_corrective_path(self):
-        verdict = _check('update_task', live_status='cancelled')
+    async def test_terminal_rejection_on_cancelled_populates_corrective_path(self):
+        verdict = await _check('update_task', live_status='cancelled')
         assert verdict.corrective_path == 'set_task_status_done_provenance_repair'
         assert (
             verdict.to_error_dict()['corrective_path']
             == 'set_task_status_done_provenance_repair'
         )
 
-    def test_other_gate_rejections_leave_corrective_path_empty(self, monkeypatch):
+    async def test_other_gate_rejections_leave_corrective_path_empty(self, monkeypatch):
         """Scoping: corrective_path is a Gate-1-only redirect to the
         same-status done_provenance repair seam. Neither a Gate-2
         live-workflow rejection nor a Gate-3 stale-snapshot rejection is
         served by that seam, so both must leave corrective_path == ''."""
         monkeypatch.setattr(
-            recon_write_policy, 'is_workflow_live_for_task', lambda *a, **k: True,
+            recon_write_policy, 'is_workflow_live_for_task', _async_detector(True),
         )
-        gate2_verdict = _check('set_task_status', live_status='in-progress')
+        gate2_verdict = await _check('set_task_status', live_status='in-progress')
         assert gate2_verdict.error_type == 'ReconLiveWorkflowWriteRejected'
         assert gate2_verdict.corrective_path == ''
 
-        gate3_verdict = _check(
+        gate3_verdict = await _check(
             'update_task', live_status='in-progress', snapshot_token='pending',
         )
         assert gate3_verdict.error_type == 'ReconStaleSnapshotRejected'
         assert gate3_verdict.corrective_path == ''
 
-    def test_terminal_hint_routes_to_set_task_status_done_provenance_repair(self):
+    async def test_terminal_hint_routes_to_set_task_status_done_provenance_repair(self):
         """The Gate 1 hint must route metadata/done_provenance corrections
         to the sanctioned same-status set_task_status(..., 'done',
         done_provenance=...) repair seam. Asserted on positive semantic
@@ -194,11 +269,11 @@ class TestCheckGate1Terminal:
         set_task_status with a reopen_reason") never mentioned
         done_provenance at all, so the 'done_provenance' substring check
         alone already fails against a regression back to it."""
-        hint = _check('update_task', live_status='done').hint
+        hint = (await _check('update_task', live_status='done')).hint
         assert 'set_task_status' in hint
         assert 'done_provenance' in hint
 
-    def test_terminal_hint_states_content_fields_have_no_recon_corrective_path(self):
+    async def test_terminal_hint_states_content_fields_have_no_recon_corrective_path(self):
         """The Gate 1 hint must be honest that the done_provenance repair seam
         is the ONLY recon-stage correction on a terminal task — load-bearing
         string content fields (details/description/title) have NO recon-stage
@@ -210,36 +285,36 @@ class TestCheckGate1Terminal:
         workaround task. This fails against the old over-promising hint (which
         claimed the seam could 'correct done_provenance or other metadata' and
         mentioned neither 'details' nor 'workaround')."""
-        hint = _check('update_task', live_status='done').hint
+        hint = (await _check('update_task', live_status='done')).hint
         assert 'details' in hint
         assert 'workaround' in hint
 
-    def test_annotation_clear_exempts_done_task_from_gate_1(self):
-        verdict = _check('update_task', live_status='done', is_annotation_clear=True)
+    async def test_annotation_clear_exempts_done_task_from_gate_1(self):
+        verdict = await _check('update_task', live_status='done', is_annotation_clear=True)
         assert verdict.is_rejection is False
         assert verdict.error_type != 'ReconTerminalWriteRejected'
 
-    def test_annotation_clear_exempts_cancelled_task_from_gate_1(self):
-        verdict = _check('update_task', live_status='cancelled', is_annotation_clear=True)
+    async def test_annotation_clear_exempts_cancelled_task_from_gate_1(self):
+        verdict = await _check('update_task', live_status='cancelled', is_annotation_clear=True)
         assert verdict.is_rejection is False
         assert verdict.error_type != 'ReconTerminalWriteRejected'
 
-    def test_annotation_clear_false_still_rejects(self):
-        verdict = _check('update_task', live_status='done', is_annotation_clear=False)
+    async def test_annotation_clear_false_still_rejects(self):
+        verdict = await _check('update_task', live_status='done', is_annotation_clear=False)
         assert verdict.is_rejection is True
         assert verdict.error_type == 'ReconTerminalWriteRejected'
 
-    def test_annotation_clear_omitted_defaults_false_still_rejects(self):
+    async def test_annotation_clear_omitted_defaults_false_still_rejects(self):
         """Backward compatibility: existing callers that never pass
         is_annotation_clear must see unchanged Gate 1 behavior."""
-        verdict = _check('update_task', live_status='done')
+        verdict = await _check('update_task', live_status='done')
         assert verdict.is_rejection is True
         assert verdict.error_type == 'ReconTerminalWriteRejected'
 
-    def test_annotation_clear_still_subject_to_gate_3_stale_snapshot(self):
+    async def test_annotation_clear_still_subject_to_gate_3_stale_snapshot(self):
         """The exemption bypasses Gate 1 only — Gate 3 (stale snapshot)
         still composes and fires on a clear write carrying a stale token."""
-        verdict = _check(
+        verdict = await _check(
             'update_task',
             live_status='done',
             is_annotation_clear=True,
@@ -248,8 +323,8 @@ class TestCheckGate1Terminal:
         assert verdict.is_rejection is True
         assert verdict.error_type == 'ReconStaleSnapshotRejected'
 
-    def test_annotation_clear_on_non_terminal_task_is_unaffected(self):
-        verdict = _check(
+    async def test_annotation_clear_on_non_terminal_task_is_unaffected(self):
+        verdict = await _check(
             'update_task', live_status='in-progress', is_annotation_clear=False,
         )
         assert verdict.is_rejection is False
@@ -261,48 +336,434 @@ class TestCheckGate1Terminal:
 
 
 class TestCheckGate2LiveWorkflow:
-    def test_set_task_status_with_live_workflow_rejects(self, monkeypatch):
+    pytestmark = pytest.mark.asyncio
+
+    async def test_set_task_status_with_live_workflow_rejects(self, monkeypatch):
         monkeypatch.setattr(
-            recon_write_policy, 'is_workflow_live_for_task', lambda *a, **k: True,
+            recon_write_policy, 'is_workflow_live_for_task', _async_detector(True),
         )
-        verdict = _check('set_task_status', live_status='in-progress')
+        verdict = await _check('set_task_status', live_status='in-progress')
         assert verdict.is_rejection is True
         assert verdict.error_type == 'ReconLiveWorkflowWriteRejected'
 
-    def test_set_task_status_without_live_workflow_is_ok(self, monkeypatch):
+    async def test_set_task_status_without_live_workflow_is_ok(self, monkeypatch):
         monkeypatch.setattr(
-            recon_write_policy, 'is_workflow_live_for_task', lambda *a, **k: False,
+            recon_write_policy, 'is_workflow_live_for_task', _async_detector(False),
         )
-        verdict = _check('set_task_status', live_status='in-progress')
+        verdict = await _check('set_task_status', live_status='in-progress')
         assert verdict.is_rejection is False
 
-    def test_update_task_op_is_not_scoped_by_gate_2(self, monkeypatch):
+    async def test_update_task_op_is_not_scoped_by_gate_2(self, monkeypatch):
         """Gate 2 is set_task_status-only: update_task must not surface
         ReconLiveWorkflowWriteRejected even when the detector reports live."""
         monkeypatch.setattr(
-            recon_write_policy, 'is_workflow_live_for_task', lambda *a, **k: True,
+            recon_write_policy, 'is_workflow_live_for_task', _async_detector(True),
         )
-        verdict = _check('update_task', live_status='in-progress')
+        verdict = await _check('update_task', live_status='in-progress')
         assert verdict.error_type != 'ReconLiveWorkflowWriteRejected'
 
-    def test_gate_2_forwards_live_status_as_status_kwarg(self, monkeypatch):
+    async def test_gate_2_forwards_live_status_as_status_kwarg(self, monkeypatch):
         """is_workflow_live_for_task must receive the caller's live_status as
         its `status` kwarg so it can suppress the project-wide
         orchestrator_live signal for done/cancelled/deferred tasks (see
         live_workflow_detector.ORCH_LIVE_INELIGIBLE_STATUSES) — otherwise a
         live orchestrator elsewhere in the project would falsely flag a
         terminal/deferred task's set_task_status write as gate-2-live."""
-        captured = {}
-
-        def _spy(*args, **kwargs):
-            captured['args'] = args
-            captured['kwargs'] = kwargs
-            return False
-
-        monkeypatch.setattr(recon_write_policy, 'is_workflow_live_for_task', _spy)
-        _check('set_task_status', task_id='7', live_status='deferred')
+        captured: dict = {}
+        monkeypatch.setattr(
+            recon_write_policy,
+            'is_workflow_live_for_task',
+            _capturing_async_detector(captured),
+        )
+        await _check('set_task_status', task_id='7', live_status='deferred')
 
         assert captured['kwargs'].get('status') == 'deferred'
+
+    # -- task_metadata forwarding (task 3751) --------------------------------
+    #
+    # Gate 2 forwarded ONLY `status`, never `task_kind`, so no task_kind-scoped
+    # detector rule was ever reachable here — including task 2067's rule 2. The
+    # new `task_metadata` kwarg lets check() derive both `task_kind` and
+    # `pure_gate` (via is_pure_gate_metadata) and forward them, which is what
+    # makes rule 5 — and hence the fix for task 3845's 3-cycle stall — reachable
+    # at the one gate where the bare orchestrator lock actually blocks a write.
+
+    @staticmethod
+    def _capture_detector_kwargs(monkeypatch) -> dict:
+        """Install a kwarg-capturing is_workflow_live_for_task spy returning False."""
+        captured: dict = {}
+        monkeypatch.setattr(
+            recon_write_policy,
+            'is_workflow_live_for_task',
+            _capturing_async_detector(captured),
+        )
+        return captured
+
+    async def test_gate_2_forwards_pure_gate_shape_from_task_metadata(self, monkeypatch):
+        """THE FIX — a pending deterministic PURE GATE's metadata yields
+        task_kind='deterministic' and pure_gate=True at the detector.
+
+        This is dark_factory task 3845's real metadata (verified first-hand):
+        `always_escalates=True` with NO `before_done`. The incidental
+        `operational_mode`/`execution_class` labels are deliberately NOT what the
+        classification keys on — see is_pure_gate_metadata.
+        """
+        captured = self._capture_detector_kwargs(monkeypatch)
+        await _check(
+            'set_task_status',
+            task_id='3845',
+            live_status='pending',
+            task_metadata={
+                'task_kind': 'deterministic',
+                'always_escalates': True,
+                'operational_mode': 'gate',
+                'execution_class': 'operational',
+            },
+        )
+
+        assert captured['kwargs'].get('status') == 'pending'
+        assert captured['kwargs'].get('task_kind') == 'deterministic'
+        assert captured['kwargs'].get('pure_gate') is True
+
+    async def test_gate_2_before_done_metadata_is_not_a_pure_gate(self, monkeypatch):
+        """NARROWING — a deterministic task WITH `before_done` forwards
+        pure_gate=False, so rule 5 stays inert and the orchestrator lock keeps
+        protecting it from a recon race while it may be mid-deploy."""
+        captured = self._capture_detector_kwargs(monkeypatch)
+        await _check(
+            'set_task_status',
+            task_id='7',
+            live_status='pending',
+            task_metadata={
+                'task_kind': 'deterministic',
+                'always_escalates': True,
+                'before_done': {'kind': 'predicate'},
+            },
+        )
+
+        assert captured['kwargs'].get('task_kind') == 'deterministic'
+        assert captured['kwargs'].get('pure_gate') is False
+
+    async def test_gate_2_forwards_normal_task_kind(self, monkeypatch):
+        """An ordinary task forwards its task_kind with pure_gate=False."""
+        captured = self._capture_detector_kwargs(monkeypatch)
+        await _check(
+            'set_task_status',
+            task_id='7',
+            live_status='pending',
+            task_metadata={'task_kind': 'normal'},
+        )
+
+        assert captured['kwargs'].get('task_kind') == 'normal'
+        assert captured['kwargs'].get('pure_gate') is False
+
+    async def test_gate_2_without_task_metadata_forwards_none_and_false(self, monkeypatch):
+        """BACKWARD COMPATIBILITY — omitting task_metadata reproduces today's
+        behavior exactly: task_kind=None, pure_gate=False. Every caller that
+        does not pass the new kwarg is unaffected."""
+        captured = self._capture_detector_kwargs(monkeypatch)
+        await _check('set_task_status', task_id='7', live_status='pending')
+
+        assert captured['kwargs'].get('task_kind') is None
+        assert captured['kwargs'].get('pure_gate') is False
+
+    async def test_gate_2_coerces_json_string_task_metadata(self, monkeypatch):
+        """A JSON-object-string metadata blob is resolved through
+        metadata_dict.raw_metadata_dict, the shared wire rule."""
+        captured = self._capture_detector_kwargs(monkeypatch)
+        await _check(
+            'set_task_status',
+            task_id='3845',
+            live_status='pending',
+            task_metadata='{"task_kind": "deterministic", "always_escalates": true}',
+        )
+
+        assert captured['kwargs'].get('task_kind') == 'deterministic'
+        assert captured['kwargs'].get('pure_gate') is True
+
+    @pytest.mark.parametrize(
+        'task_metadata',
+        ['not json', 42, '[]', None, ['a'], ''],
+        ids=['invalid-json', 'int', 'json-list', 'none', 'list', 'empty-str'],
+    )
+    async def test_gate_2_malformed_task_metadata_fails_safe_toward_live(
+        self, monkeypatch, task_metadata
+    ):
+        """FAIL-SAFE — anything that is not a dict / JSON-object string degrades
+        to task_kind=None, pure_gate=False without raising, so an unparseable
+        metadata blob leaves the task live rather than suppressing its signal."""
+        captured = self._capture_detector_kwargs(monkeypatch)
+        verdict = await _check(
+            'set_task_status',
+            task_id='7',
+            live_status='pending',
+            task_metadata=task_metadata,
+        )
+
+        assert captured['kwargs'].get('task_kind') is None
+        assert captured['kwargs'].get('pure_gate') is False
+        assert verdict.is_rejection is False
+
+    @pytest.mark.parametrize(
+        ('task_metadata', 'expected_census_count'),
+        [('not json', 1), (42, 1), ('[]', 1), (['a'], 1), (None, 0), ('', 0)],
+        ids=['invalid-json', 'int', 'json-list', 'list', 'none', 'empty-str'],
+    )
+    async def test_gate_2_logs_unreadable_task_metadata_once_and_absent_never(
+        self, monkeypatch, caplog, task_metadata, expected_census_count
+    ):
+        """Unreadable task_metadata still fails safe toward live, and is
+        logged once under source=recon_write_policy.check; absent metadata
+        is not logged."""
+        captured = self._capture_detector_kwargs(monkeypatch)
+        with caplog.at_level(logging.WARNING):
+            await _check(
+                'set_task_status',
+                task_id='7',
+                live_status='pending',
+                task_metadata=task_metadata,
+            )
+
+        assert captured['kwargs'].get('task_kind') is None
+        assert captured['kwargs'].get('pure_gate') is False
+        assert len(census_lines(caplog, 'recon_write_policy.check')) == expected_census_count
+
+
+# ---------------------------------------------------------------------------
+# Gate 2: per-task corroboration forwarding (task 2964)
+# ---------------------------------------------------------------------------
+#
+# Three consumers compute liveness from the SAME detector, and before this task
+# they fed it DIFFERENT inputs. `render_live_workflow_section` (task 2963)
+# passes `corroborated`; Gate 2 did not. For an IN-PROGRESS task killed by a
+# fleet redeploy the worktree registration lingers and the restarted
+# orchestrator re-acquires the project-wide lock, so `worktree_registered or
+# orchestrator_live` is True with no `recent_commit`: the renderer downgrades
+# that to indeterminate and drops the task, while Gate 2 still saw is_live=True
+# and rejected the recon-stage re-pend write. That is the task 599/600
+# divergence (know_live task 600, run dbfa3df8-0d7d-40e6-bc4a-bc30cce38228,
+# 2026-08-06) — Gate 2 rejected for 5 consecutive cycles while the renderer no
+# longer considered task 599 live.
+#
+# `corroboration_for_task` reads TOP-LEVEL `claimant_run_id`/`heartbeat_at`,
+# which `task_metadata` structurally cannot supply, so check() takes a separate
+# `task_snapshot` kwarg alongside (never replacing) `task_metadata`.
+
+
+def _heartbeat(delta: timedelta) -> str:
+    """ISO heartbeat stamped `delta` relative to now (negative = in the past)."""
+    return (datetime.now(UTC) + delta).isoformat()
+
+
+# Stale/fresh relative to shared.task_claimant.DEFAULT_CLAIMANT_HEARTBEAT_TTL
+# (10 minutes). Both margins are wide enough that real-clock drift during the test
+# can never flip the verdict, which is why check() needs no `now` seam.
+_STALE_HEARTBEAT = timedelta(minutes=-30)
+_FRESH_HEARTBEAT = timedelta(seconds=-5)
+
+
+class TestGate2CorroborationForwarding:
+    """check() derives a corroboration verdict from `task_snapshot` (task 2964).
+
+    Pins the four properties the fix rests on:
+      * an in-progress task with a STALE heartbeat and no other per-task signal
+        forwards `corroborated=False` — the one input that changes behavior;
+      * a FRESH heartbeat forwards True, so a genuinely live pipeline is never
+        raced;
+      * every non-in-progress status forwards None, leaving the detector gate
+        byte-for-byte inert (the detector fires only on `corroborated is False`);
+      * every error path — an omitted kwarg, a non-Mapping snapshot, a raising
+        assembler — also forwards None, i.e. fails safe TOWARD live so the
+        write keeps being rejected.
+    """
+    pytestmark = pytest.mark.asyncio
+
+
+    @staticmethod
+    def _capture_detector_kwargs(monkeypatch) -> dict:
+        """Install a kwarg-capturing is_workflow_live_for_task spy returning False."""
+        captured: dict = {}
+        monkeypatch.setattr(
+            recon_write_policy,
+            'is_workflow_live_for_task',
+            _capturing_async_detector(captured),
+        )
+        return captured
+
+    @staticmethod
+    def _snapshot(heartbeat: timedelta | None, **overrides) -> dict:
+        """A task 599-shaped in-progress snapshot with a durable claimant.
+
+        A killed workflow's `claimant_run_id` PERSISTS — it is the heartbeat
+        freshness, not the claimant's presence, that distinguishes a live
+        pipeline from a stranded one.
+        """
+        task = {
+            'id': '599',
+            'status': 'in-progress',
+            'title': 'T',
+            'claimant_run_id': 'run-599',
+            'metadata': {},
+        }
+        if heartbeat is not None:
+            task['heartbeat_at'] = _heartbeat(heartbeat)
+        task.update(overrides)
+        return task
+
+    async def test_stale_heartbeat_in_progress_forwards_corroborated_false(
+        self, monkeypatch, tmp_path,
+    ):
+        """THE FIX — the killed-but-lingering shape forwards corroborated=False.
+
+        `tmp_path` has no data/orchestrator/{orchestrator.lock,
+        scheduler_state.json}, so both hoisted reads degrade to their empty/None
+        forms and no corroborating signal can fire: no fresh claimant, no
+        scheduler holder/park, no post-restart routing decision.
+        """
+        captured = self._capture_detector_kwargs(monkeypatch)
+        await _check(
+            'set_task_status',
+            task_id='599',
+            project_root=str(tmp_path),
+            live_status='in-progress',
+            task_snapshot=self._snapshot(_STALE_HEARTBEAT),
+        )
+
+        assert captured['kwargs'].get('corroborated') is False
+
+    async def test_fresh_heartbeat_in_progress_forwards_corroborated_true(
+        self, monkeypatch, tmp_path,
+    ):
+        """DIFFERENTIAL — a live claimant corroborates, so the gate stays inert
+        and a genuinely running pipeline is still protected from a recon race."""
+        captured = self._capture_detector_kwargs(monkeypatch)
+        await _check(
+            'set_task_status',
+            task_id='599',
+            project_root=str(tmp_path),
+            live_status='in-progress',
+            task_snapshot=self._snapshot(_FRESH_HEARTBEAT),
+        )
+
+        assert captured['kwargs'].get('corroborated') is True
+
+    @pytest.mark.parametrize(
+        'live_status',
+        ['pending', 'blocked', 'deferred', 'done', 'cancelled', 'review'],
+    )
+    async def test_non_in_progress_status_forwards_corroborated_none(
+        self, monkeypatch, tmp_path, live_status,
+    ):
+        """SCOPE — the gate is in-progress-only, mirroring
+        `render_live_workflow_section`'s `task.get('status') == 'in-progress'`
+        guard. Every other status forwards None, so the detector gate cannot
+        fire and this task changes nothing for them."""
+        captured = self._capture_detector_kwargs(monkeypatch)
+        await _check(
+            'set_task_status',
+            task_id='599',
+            project_root=str(tmp_path),
+            live_status=live_status,
+            task_snapshot=self._snapshot(_STALE_HEARTBEAT, status=live_status),
+        )
+
+        assert captured['kwargs'].get('corroborated') is None
+
+    async def test_omitted_task_snapshot_forwards_corroborated_none(
+        self, monkeypatch, tmp_path,
+    ):
+        """BACKWARD COMPATIBILITY — the kwarg is optional. Every existing caller
+        that does not pass it gets byte-for-byte today's detector inputs."""
+        captured = self._capture_detector_kwargs(monkeypatch)
+        await _check(
+            'set_task_status',
+            task_id='599',
+            project_root=str(tmp_path),
+            live_status='in-progress',
+        )
+
+        assert captured['kwargs'].get('corroborated') is None
+
+    @pytest.mark.parametrize(
+        'task_snapshot',
+        ['not a task', 42, ['599'], None, ''],
+        ids=['str', 'int', 'list', 'none', 'empty-str'],
+    )
+    async def test_non_mapping_task_snapshot_fails_safe_toward_live(
+        self, monkeypatch, tmp_path, task_snapshot,
+    ):
+        """FAIL-SAFE — a non-Mapping snapshot degrades to None without raising,
+        so the write keeps being rejected rather than slipping through."""
+        captured = self._capture_detector_kwargs(monkeypatch)
+        verdict = await _check(
+            'set_task_status',
+            task_id='599',
+            project_root=str(tmp_path),
+            live_status='in-progress',
+            task_snapshot=task_snapshot,
+        )
+
+        assert captured['kwargs'].get('corroborated') is None
+        assert verdict.is_rejection is False
+
+    async def test_raising_assembler_fails_safe_toward_live(self, monkeypatch, tmp_path):
+        """FAIL-SAFE — an exception anywhere in the corroboration assembly is
+        swallowed to None; check() never propagates it to the write path."""
+        captured = self._capture_detector_kwargs(monkeypatch)
+
+        def _boom(*args, **kwargs):
+            raise RuntimeError('corroboration exploded')
+
+        monkeypatch.setattr(recon_write_policy, 'corroboration_for_task', _boom)
+
+        verdict = await _check(
+            'set_task_status',
+            task_id='599',
+            project_root=str(tmp_path),
+            live_status='in-progress',
+            task_snapshot=self._snapshot(_STALE_HEARTBEAT),
+        )
+
+        assert captured['kwargs'].get('corroborated') is None
+        assert verdict.is_rejection is False
+
+    async def test_task_metadata_forwarding_is_unchanged_alongside_task_snapshot(
+        self, monkeypatch, tmp_path,
+    ):
+        """NON-REGRESSION — `task_snapshot` is purely additive. Task 3751's
+        `status`/`task_kind`/`pure_gate` derivation from `task_metadata` is
+        untouched when both kwargs are supplied."""
+        captured = self._capture_detector_kwargs(monkeypatch)
+        metadata = {'task_kind': 'deterministic', 'always_escalates': True}
+        await _check(
+            'set_task_status',
+            task_id='599',
+            project_root=str(tmp_path),
+            live_status='in-progress',
+            task_metadata=metadata,
+            task_snapshot=self._snapshot(_STALE_HEARTBEAT, metadata=metadata),
+        )
+
+        assert captured['kwargs'].get('status') == 'in-progress'
+        assert captured['kwargs'].get('task_kind') == 'deterministic'
+        assert captured['kwargs'].get('pure_gate') is True
+        assert captured['kwargs'].get('corroborated') is False
+
+    async def test_corroboration_is_not_computed_for_update_task(
+        self, monkeypatch, tmp_path,
+    ):
+        """SCOPE — Gate 2 is `set_task_status`-only, so `update_task` never
+        reaches the detector at all and pays nothing for the new kwarg."""
+        captured = self._capture_detector_kwargs(monkeypatch)
+        await _check(
+            'update_task',
+            task_id='599',
+            project_root=str(tmp_path),
+            live_status='in-progress',
+            task_snapshot=self._snapshot(_STALE_HEARTBEAT),
+        )
+
+        assert 'kwargs' not in captured
 
 
 # ---------------------------------------------------------------------------
@@ -311,30 +772,32 @@ class TestCheckGate2LiveWorkflow:
 
 
 class TestCheckGate3StaleSnapshot:
-    def test_stale_snapshot_rejects(self):
-        verdict = _check(
+    pytestmark = pytest.mark.asyncio
+
+    async def test_stale_snapshot_rejects(self):
+        verdict = await _check(
             'update_task', live_status='in-progress', snapshot_token='pending',
         )
         assert verdict.is_rejection is True
         assert verdict.error_type == 'ReconStaleSnapshotRejected'
 
-    def test_fresh_snapshot_matching_live_status_is_ok(self):
-        verdict = _check(
+    async def test_fresh_snapshot_matching_live_status_is_ok(self):
+        verdict = await _check(
             'update_task', live_status='in-progress', snapshot_token='in-progress',
         )
         assert verdict.is_rejection is False
 
-    def test_no_snapshot_token_skips_gate(self):
-        verdict = _check(
+    async def test_no_snapshot_token_skips_gate(self):
+        verdict = await _check(
             'update_task', live_status='in-progress', snapshot_token=None,
         )
         assert verdict.is_rejection is False
 
-    def test_terminal_gate_takes_precedence_over_stale_snapshot(self):
+    async def test_terminal_gate_takes_precedence_over_stale_snapshot(self):
         """Gate 1 (terminal) is checked before gate 3 (stale snapshot): a
         done task with a stale snapshot reports the more fundamental
         ReconTerminalWriteRejected, not ReconStaleSnapshotRejected."""
-        verdict = _check(
+        verdict = await _check(
             'update_task', live_status='done', snapshot_token='pending',
         )
         assert verdict.error_type == 'ReconTerminalWriteRejected'
@@ -347,7 +810,9 @@ class TestCheckGate3StaleSnapshot:
 
 
 class TestCorrectivePathSeamIsReachable:
-    def test_set_task_status_done_provenance_repair_on_done_task_is_not_gated(
+    pytestmark = pytest.mark.asyncio
+
+    async def test_set_task_status_done_provenance_repair_on_done_task_is_not_gated(
         self, monkeypatch,
     ):
         """Locks the invariant the Gate 1 redirect depends on: a recon-stage
@@ -362,10 +827,10 @@ class TestCorrectivePathSeamIsReachable:
         Guards against a future Gate-2 tightening silently breaking the
         advertised corrective seam."""
         monkeypatch.setattr(
-            recon_write_policy, 'is_workflow_live_for_task', lambda *a, **k: False,
+            recon_write_policy, 'is_workflow_live_for_task', _async_detector(False),
         )
 
-        verdict = _check(
+        verdict = await _check(
             'set_task_status',
             target_status='done',
             live_status='done',
@@ -423,6 +888,13 @@ class TestExtractSnapshotToken:
 
     def test_extract_from_dict_with_empty_string_value_is_none(self):
         assert recon_write_policy.extract_snapshot_token({'snapshot_status': ''}) is None
+
+    @pytest.mark.parametrize('metadata', ['{not json', 42], ids=repr)
+    def test_unreadable_metadata_is_none_and_logs_one_census_line(self, metadata, caplog):
+        with caplog.at_level(logging.WARNING):
+            assert recon_write_policy.extract_snapshot_token(metadata) is None
+        source = 'recon_write_policy.extract_snapshot_token'
+        assert len(census_lines(caplog, source)) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -866,7 +1338,7 @@ class TestIsTerminalAnnotationExempt:
         ) is False
 
     def test_add_plus_causation_id_via_json_string_metadata_is_true(self):
-        """JSON-string metadata (the _coerce_metadata_dict string-coercion
+        """JSON-string metadata (the raw_metadata_dict string-coercion
         path recon-stage writes can also arrive via) carrying an x_ key plus
         _causation_id must still be exempt — _annotation_content_keys strips
         tracing co-keys from the already-parsed dict, after string
@@ -875,6 +1347,14 @@ class TestIsTerminalAnnotationExempt:
         assert recon_write_policy.is_terminal_annotation_exempt(
             {'metadata': '{"x_foo": 1, "_causation_id": "run-1"}'},
         ) is True
+
+    def test_unreadable_metadata_is_false_and_logs_one_census_line(self, caplog):
+        with caplog.at_level(logging.WARNING):
+            assert recon_write_policy.is_terminal_annotation_exempt(
+                {'metadata': '{not json'},
+            ) is False
+        source = 'recon_write_policy.terminal_annotation_merge'
+        assert len(census_lines(caplog, source)) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -1235,7 +1715,7 @@ class TestInterceptorSetTaskStatusLiveWorkflowBoundary:
     ):
         """Default taskmaster.get_task fixture returns status='pending'."""
         monkeypatch.setattr(
-            recon_write_policy, 'is_workflow_live_for_task', lambda *a, **k: True,
+            recon_write_policy, 'is_workflow_live_for_task', _async_detector(True),
         )
 
         result = await interceptor.set_task_status(
@@ -1250,12 +1730,852 @@ class TestInterceptorSetTaskStatusLiveWorkflowBoundary:
         """Recon-scoping negative: a non-recon-stage agent_id is never gated
         even when the detector reports a live workflow."""
         monkeypatch.setattr(
-            recon_write_policy, 'is_workflow_live_for_task', lambda *a, **k: True,
+            recon_write_policy, 'is_workflow_live_for_task', _async_detector(True),
         )
 
         await interceptor.set_task_status('1', 'in-progress', '/project', agent_id=None)
 
         taskmaster.set_task_status.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
+# set_task_status forwards the task's metadata into check() (task 3751)
+# ---------------------------------------------------------------------------
+
+
+# dark_factory task 3845's real, verified-first-hand task shape: a PENDING
+# `always_escalates` deterministic gate with NO `before_done` key at all. Its
+# whole DeterministicRunner run is "file one born-at-L2 escalation, stamp
+# gate_escalated_at, set blocked" — no script, no systemd, no git_ops — so it
+# never acquires a worktree or branch and the bare project-wide orchestrator
+# lock is never task-specific evidence for it. Before this task, Gate 2
+# forwarded only `status`, so the lock alone rejected every recon-stage status
+# write for it: 3845 stalled 3+ consecutive reconciliation cycles that way.
+_GATE_TASK_3845 = {
+    'id': '3845',
+    'status': 'pending',
+    'title': 'Human gate: consolidate duplicate observations cluster',
+    'metadata': {
+        'task_kind': 'deterministic',
+        'execution_class': 'operational',
+        'operational_mode': 'gate',
+        'always_escalates': True,
+    },
+}
+
+
+class TestInterceptorSetTaskStatusForwardsTaskMetadata:
+    @staticmethod
+    def _spy_check(monkeypatch) -> dict:
+        """Wrap the REAL recon_write_policy.check with a kwarg-capturing spy.
+
+        Same idiom as test_set_task_status_always_passes_snapshot_token_none —
+        the real gate still runs, so the captured kwargs are exactly what the
+        production path passed.
+        """
+        captured: dict = {}
+        real_check = recon_write_policy.check
+
+        async def _spy(op, **kwargs):
+            captured['op'] = op
+            captured.update(kwargs)
+            return await real_check(op, **kwargs)
+
+        monkeypatch.setattr(recon_write_policy, 'check', _spy)
+        return captured
+
+    @staticmethod
+    def _spy_detector(monkeypatch) -> dict:
+        """Install a kwarg-capturing is_workflow_live_for_task spy returning False."""
+        captured: dict = {}
+        monkeypatch.setattr(
+            recon_write_policy,
+            'is_workflow_live_for_task',
+            _capturing_async_detector(captured),
+        )
+        return captured
+
+    @pytest.mark.asyncio
+    async def test_pure_gate_metadata_reaches_the_detector(
+        self, interceptor, taskmaster, monkeypatch,
+    ):
+        """THE PLUMBING — the task's metadata reaches check(), which derives
+        task_kind='deterministic' and pure_gate=True for it.
+
+        The metadata is sourced from the `before` dict the interceptor already
+        read under its write lock, so it is guaranteed consistent with the
+        `live_status` passed alongside it.
+        """
+        taskmaster.get_task = AsyncMock(return_value=_GATE_TASK_3845)
+        check_kwargs = self._spy_check(monkeypatch)
+        detector_kwargs = self._spy_detector(monkeypatch)
+
+        await interceptor.set_task_status(
+            '3845', 'cancelled', '/project', agent_id=AGENT_ID,
+        )
+
+        assert check_kwargs.get('task_metadata') == _GATE_TASK_3845['metadata']
+        assert detector_kwargs['kwargs'].get('status') == 'pending'
+        assert detector_kwargs['kwargs'].get('task_kind') == 'deterministic'
+        assert detector_kwargs['kwargs'].get('pure_gate') is True
+
+    @pytest.mark.asyncio
+    async def test_pure_gate_write_is_not_rejected_under_a_live_orchestrator(
+        self, interceptor, taskmaster, monkeypatch,
+    ):
+        """END-TO-END NON-REJECTION — the exact rejection that stalled 3845.
+
+        The REAL is_workflow_live_for_task / detect_live_workflow run; only the
+        project-wide orchestrator lock is forced live. The git subprocesses
+        against the non-existent '/project' root fail safe to
+        no-worktree / no-commit, so the ONLY signal that could reject this
+        write is the bare orchestrator lock — which rule 5 now drops.
+        """
+        from fused_memory.services import live_workflow_detector
+
+        taskmaster.get_task = AsyncMock(return_value=_GATE_TASK_3845)
+        monkeypatch.setattr(
+            live_workflow_detector, 'is_orchestrator_live_for', lambda *a, **k: True,
+        )
+
+        result = await interceptor.set_task_status(
+            '3845', 'cancelled', '/project', agent_id=AGENT_ID,
+        )
+
+        assert result.get('error_type') != 'ReconLiveWorkflowWriteRejected'
+        taskmaster.set_task_status.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_before_done_deterministic_task_is_still_rejected(
+        self, interceptor, taskmaster, monkeypatch,
+    ):
+        """NEGATIVE CONTROL — the narrowing holds at the real boundary.
+
+        A pending deterministic task WITH `before_done` may be mid-deploy
+        inside DeterministicRunner (Harness._run_deterministic_slot never flips
+        it to 'in-progress', and a blocking script run leaves no git evidence),
+        so recon must still not race it.
+        """
+        from fused_memory.services import live_workflow_detector
+
+        taskmaster.get_task = AsyncMock(return_value={
+            **_GATE_TASK_3845,
+            'metadata': {
+                'task_kind': 'deterministic',
+                'always_escalates': True,
+                'before_done': {'kind': 'predicate', 'script': 'x.sh'},
+            },
+        })
+        monkeypatch.setattr(
+            live_workflow_detector, 'is_orchestrator_live_for', lambda *a, **k: True,
+        )
+
+        result = await interceptor.set_task_status(
+            '3845', 'cancelled', '/project', agent_id=AGENT_ID,
+        )
+
+        assert result.get('error_type') == 'ReconLiveWorkflowWriteRejected'
+        taskmaster.set_task_status.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_task_without_metadata_key_routes_through_unchanged(
+        self, interceptor, taskmaster, monkeypatch,
+    ):
+        """BACKWARD COMPATIBILITY — a task dict with no `metadata` key at all
+        forwards None and degrades to today's exact detector inputs."""
+        taskmaster.get_task = AsyncMock(
+            return_value={'id': '1', 'status': 'pending', 'title': 'T'},
+        )
+        check_kwargs = self._spy_check(monkeypatch)
+        detector_kwargs = self._spy_detector(monkeypatch)
+
+        await interceptor.set_task_status(
+            '1', 'in-progress', '/project', agent_id=AGENT_ID,
+        )
+
+        assert check_kwargs.get('task_metadata') is None
+        assert detector_kwargs['kwargs'].get('task_kind') is None
+        assert detector_kwargs['kwargs'].get('pure_gate') is False
+        taskmaster.set_task_status.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
+# set_task_status forwards the `before` snapshot into check() (task 2964)
+# ---------------------------------------------------------------------------
+
+
+class TestGate2CorroborationInterceptorPlumbing:
+    """The interceptor forwards its `before` snapshot as check()'s `task_snapshot`.
+
+    End-to-end counterpart of TestGate2CorroborationForwarding: the plumbing
+    plus the task 599/600 regression itself, driven against the REAL detector
+    and REAL on-disk `orchestrator.lock` / `scheduler_state.json` fixtures —
+    the same fixtures test_stages.py's TestRenderLiveWorkflowSectionCorroboration
+    Gate uses for the renderer, so the two consumers' verdicts are directly
+    comparable. That comparability IS the invariant under test.
+
+    The repro shape: an in-progress task killed by a fleet redeploy. Its git
+    worktree registration lingers (worktree_registered=True) and the restarted
+    orchestrator re-acquired the project-wide lock (orchestrator_live=True),
+    but the branch tip is 48h old (recent_commit=False) and the claimant's
+    heartbeat is 30 minutes stale. Stage 2 guard-rejected task 599's re-pend
+    write for 5 consecutive cycles that way (run
+    dbfa3df8-0d7d-40e6-bc4a-bc30cce38228, 2026-08-06) while the post-2963
+    renderer had already stopped listing it as live.
+    """
+
+    _TASK_ID = '599'
+    _BRANCH = 'task/599'
+
+    # ----- on-disk fixtures (mirrors test_stages.py's corroboration gate) -----
+
+    @staticmethod
+    def _write_lock(tmp_path, started) -> None:
+        """`PID <N> started <ISO>` — the orchestrator restart boundary.
+
+        orchestrator_started_at only parses the `started` token, so the PID
+        need not be alive; is_orchestrator_live_for is monkeypatched separately.
+        """
+        lock_dir = tmp_path / 'data' / 'orchestrator'
+        lock_dir.mkdir(parents=True, exist_ok=True)
+        (lock_dir / 'orchestrator.lock').write_text(
+            f'PID 12345 started {started.isoformat()}\n', encoding='utf-8',
+        )
+
+    @staticmethod
+    def _write_scheduler_state(tmp_path, *, parks=None, current_holders=None) -> None:
+        state_dir = tmp_path / 'data' / 'orchestrator'
+        state_dir.mkdir(parents=True, exist_ok=True)
+        (state_dir / 'scheduler_state.json').write_text(
+            json.dumps({'parks': parks or {}, 'current_holders': current_holders or {}}),
+            encoding='utf-8',
+        )
+
+    @classmethod
+    def _git_side_effect(cls, *, commit_age: timedelta):
+        """worktree_registered=True, non-bare branch, tip aged *commit_age*.
+
+        rev-list returns 3 so rule 4 (bare branch) can never interfere; the
+        `git log` tip timestamp decides recent_commit against the detector's
+        6h recency window.
+        """
+        tip_ts = (datetime.now(UTC) - commit_age).isoformat()
+
+        def side_effect(args, **kwargs):
+            if '--porcelain' in args:
+                return subprocess.CompletedProcess(
+                    args=args, returncode=0,
+                    stdout=(
+                        'worktree /project\nHEAD abc1234\nbranch refs/heads/main\n\n'
+                        f'worktree /project-599\nHEAD def5678\n'
+                        f'branch refs/heads/{cls._BRANCH}\n\n'
+                    ),
+                    stderr='',
+                )
+            if 'rev-list' in args:
+                return subprocess.CompletedProcess(
+                    args=args, returncode=0, stdout='3', stderr='',
+                )
+            return subprocess.CompletedProcess(
+                args=args, returncode=0, stdout=tip_ts, stderr='',
+            )
+
+        return side_effect
+
+    @classmethod
+    def _task(cls, heartbeat: timedelta, **overrides) -> dict:
+        """The killed-workflow task dict: durable claimant, aged heartbeat."""
+        task = {
+            'id': cls._TASK_ID,
+            'status': 'in-progress',
+            'title': 'Stranded in-progress task',
+            'claimant_run_id': 'run-dbfa3df8',
+            'heartbeat_at': _heartbeat(-heartbeat),
+            'metadata': {'task_kind': 'normal'},
+        }
+        task.update(overrides)
+        return task
+
+    @staticmethod
+    def _spy_check(monkeypatch) -> dict:
+        """Wrap the REAL check() with a kwarg-capturing spy (same idiom as
+        TestInterceptorSetTaskStatusForwardsTaskMetadata)."""
+        captured: dict = {}
+        real_check = recon_write_policy.check
+
+        async def _spy(op, **kwargs):
+            captured['op'] = op
+            captured.update(kwargs)
+            return await real_check(op, **kwargs)
+
+        monkeypatch.setattr(recon_write_policy, 'check', _spy)
+        return captured
+
+    @staticmethod
+    def _spy_detector(monkeypatch) -> dict:
+        """Install a kwarg-capturing is_workflow_live_for_task spy returning False."""
+        captured: dict = {}
+        monkeypatch.setattr(
+            recon_write_policy,
+            'is_workflow_live_for_task',
+            _capturing_async_detector(captured),
+        )
+        return captured
+
+    @staticmethod
+    def _force_orchestrator_live(monkeypatch) -> None:
+        from fused_memory.services import live_workflow_detector
+
+        monkeypatch.setattr(
+            live_workflow_detector, 'is_orchestrator_live_for', lambda *a, **k: True,
+        )
+
+    @pytest.mark.asyncio
+    async def test_before_snapshot_reaches_check_and_yields_corroborated_false(
+        self, interceptor, taskmaster, monkeypatch, tmp_path,
+    ):
+        """THE PLUMBING — `task_snapshot` IS the `before` dict, and the stale
+        heartbeat on it makes check() derive corroborated=False."""
+        task = self._task(timedelta(minutes=30))
+        taskmaster.get_task = AsyncMock(return_value=task)
+        check_kwargs = self._spy_check(monkeypatch)
+        detector_kwargs = self._spy_detector(monkeypatch)
+
+        await interceptor.set_task_status(
+            self._TASK_ID, 'pending', str(tmp_path), agent_id=AGENT_ID,
+        )
+
+        assert check_kwargs.get('task_snapshot') is task
+        assert detector_kwargs['kwargs'].get('corroborated') is False
+        # NON-REGRESSION — task 3751's task_metadata forwarding is untouched.
+        assert check_kwargs.get('task_metadata') == task['metadata']
+
+    @pytest.mark.asyncio
+    async def test_stranded_in_progress_repend_is_no_longer_rejected(
+        self, interceptor, taskmaster, monkeypatch, tmp_path,
+    ):
+        """THE REGRESSION (task 599/600) — the re-pend write now lands.
+
+        REAL is_workflow_live_for_task / detect_live_workflow; only the
+        project-wide lock is forced live. Worktree registered + orchestrator
+        lock + no recent commit + no corroborating per-task signal is exactly
+        what the renderer downgrades to indeterminate, so Gate 2 must now agree
+        and let the write through.
+        """
+        self._write_lock(tmp_path, datetime.now(UTC) - timedelta(hours=1))
+        self._write_scheduler_state(tmp_path)
+        taskmaster.get_task = AsyncMock(return_value=self._task(timedelta(minutes=30)))
+        self._force_orchestrator_live(monkeypatch)
+
+        with patch.object(detector_module, 'run_git', side_effect=as_async_run_git(
+            self._git_side_effect(commit_age=timedelta(hours=48)),
+        )):
+            result = await interceptor.set_task_status(
+                self._TASK_ID, 'pending', str(tmp_path), agent_id=AGENT_ID,
+            )
+
+        assert result.get('error_type') != 'ReconLiveWorkflowWriteRejected'
+        taskmaster.set_task_status.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_fresh_heartbeat_is_still_rejected(
+        self, interceptor, taskmaster, monkeypatch, tmp_path,
+    ):
+        """DIFFERENTIAL — a genuinely live pipeline is never raced. The ONLY
+        difference from the case above is heartbeat freshness."""
+        self._write_lock(tmp_path, datetime.now(UTC) - timedelta(hours=1))
+        self._write_scheduler_state(tmp_path)
+        taskmaster.get_task = AsyncMock(return_value=self._task(timedelta(seconds=5)))
+        self._force_orchestrator_live(monkeypatch)
+
+        with patch.object(detector_module, 'run_git', side_effect=as_async_run_git(
+            self._git_side_effect(commit_age=timedelta(hours=48)),
+        )):
+            result = await interceptor.set_task_status(
+                self._TASK_ID, 'pending', str(tmp_path), agent_id=AGENT_ID,
+            )
+
+        assert result.get('error_type') == 'ReconLiveWorkflowWriteRejected'
+        taskmaster.set_task_status.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_scheduler_holder_corroborates_and_is_still_rejected(
+        self, interceptor, taskmaster, monkeypatch, tmp_path,
+    ):
+        """DIFFERENTIAL — the scheduler-holder signal corroborates on its own,
+        even with a stale heartbeat. `current_holders` is reset by an
+        orchestrator restart, so a surviving entry is fresh evidence."""
+        self._write_lock(tmp_path, datetime.now(UTC) - timedelta(hours=1))
+        self._write_scheduler_state(
+            tmp_path, current_holders={'implementer': self._TASK_ID},
+        )
+        taskmaster.get_task = AsyncMock(return_value=self._task(timedelta(minutes=30)))
+        self._force_orchestrator_live(monkeypatch)
+
+        with patch.object(detector_module, 'run_git', side_effect=as_async_run_git(
+            self._git_side_effect(commit_age=timedelta(hours=48)),
+        )):
+            result = await interceptor.set_task_status(
+                self._TASK_ID, 'pending', str(tmp_path), agent_id=AGENT_ID,
+            )
+
+        assert result.get('error_type') == 'ReconLiveWorkflowWriteRejected'
+        taskmaster.set_task_status.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_recent_commit_exempts_the_task_and_is_still_rejected(
+        self, interceptor, taskmaster, monkeypatch, tmp_path,
+    ):
+        """DIFFERENTIAL — `recent_commit` is genuine per-task work evidence and
+        is EXEMPT from the corroboration gate, so a stale heartbeat cannot
+        downgrade a task that is visibly committing. Pins the detector's
+        exemption through this path."""
+        self._write_lock(tmp_path, datetime.now(UTC) - timedelta(hours=1))
+        self._write_scheduler_state(tmp_path)
+        taskmaster.get_task = AsyncMock(return_value=self._task(timedelta(minutes=30)))
+        self._force_orchestrator_live(monkeypatch)
+
+        with patch.object(detector_module, 'run_git', side_effect=as_async_run_git(
+            self._git_side_effect(commit_age=timedelta(minutes=5)),
+        )):
+            result = await interceptor.set_task_status(
+                self._TASK_ID, 'pending', str(tmp_path), agent_id=AGENT_ID,
+            )
+
+        assert result.get('error_type') == 'ReconLiveWorkflowWriteRejected'
+        taskmaster.set_task_status.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# Gate 2: forwarding task_kind is behavior-preserving (task 3751 amendment)
+# ---------------------------------------------------------------------------
+
+
+def _worktree_porcelain_registering(branch: str) -> str:
+    """Minimal `git worktree list --porcelain` output that registers *branch*."""
+    return f'worktree /tmp/wt\nHEAD abc1234\nbranch refs/heads/{branch}\n\n'
+
+
+class TestGate2TaskKindForwardingIsBehaviorPreserving:
+    """Pins what forwarding `task_kind` into Gate 2 does — and does NOT — change.
+
+    Task 3751 started passing the task's `task_kind` to the detector from this
+    gate, which had previously forwarded only `status`. That makes rule 2
+    (blocked + deterministic, task 2067) reachable here for the first time.
+    It is NOT, however, a widening of the class of tasks a recon-stage agent may
+    write status to. Two facts, each pinned below, are why:
+
+    1. Rule 3 (blocked + normal/absent + no git evidence, task 2409) was ALREADY
+       reachable at this gate. Its task_kind clause is
+       `task_kind in (None, NORMAL_TASK_KIND)`, and the omitted kwarg defaulted
+       to None — so a blocked task with no worktree and no recent commit was
+       already exempt from the bare orchestrator lock here, before any metadata
+       was plumbed through.
+    2. Rule 2's only behavioral delta over rule 3 is that it is unconditional on
+       the git signals — it also fires when a worktree/recent commit exists. But
+       Gate 2 consumes only `is_workflow_live_for_task`, i.e.
+       `is_live = worktree_registered or recent_commit or orchestrator_live`, so
+       in exactly that case `is_live` stays True on the per-task evidence and
+       the write is still rejected. Rule 2 zeroes `orchestrator_live`, which
+       Gate 2 never reads on its own.
+
+    Net: the entire Gate-2 behavior change in task 3751 comes from `pure_gate`
+    (rule 5), pinned by TestInterceptorSetTaskStatusForwardsTaskMetadata above.
+    These tests exist so that claim in check()'s docstring is backed rather than
+    asserted, and so a future reader can see the no-widening argument fail loudly
+    if a detector rule changes underneath it.
+    """
+
+    @staticmethod
+    def _force_orchestrator_live(monkeypatch) -> None:
+        """Force the project-wide lock live; leave the REAL detector in place."""
+        from fused_memory.services import live_workflow_detector
+
+        monkeypatch.setattr(
+            live_workflow_detector, 'is_orchestrator_live_for', lambda *a, **k: True,
+        )
+
+    @pytest.mark.asyncio
+    async def test_blocked_deterministic_bare_write_is_not_rejected(
+        self, interceptor, taskmaster, monkeypatch,
+    ):
+        """RULE 2 at Gate 2 — a blocked deterministic task with no git evidence.
+
+        The git subprocesses against the non-existent '/project' root fail safe
+        to no-worktree / no-commit, so the bare orchestrator lock is the only
+        signal in play and it is dropped. (Rule 3 produced this same verdict
+        before task_kind was forwarded — see
+        test_blocked_bare_write_was_already_allowed_before_task_kind_forwarding.)
+        """
+        taskmaster.get_task = AsyncMock(return_value={
+            'id': '2067', 'status': 'blocked', 'title': 'T',
+            'metadata': {'task_kind': 'deterministic'},
+        })
+        self._force_orchestrator_live(monkeypatch)
+
+        result = await interceptor.set_task_status(
+            '2067', 'cancelled', '/project', agent_id=AGENT_ID,
+        )
+
+        assert result.get('error_type') != 'ReconLiveWorkflowWriteRejected'
+        taskmaster.set_task_status.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_blocked_normal_bare_write_is_not_rejected(
+        self, interceptor, taskmaster, monkeypatch,
+    ):
+        """RULE 3 at Gate 2 — a blocked NORMAL task with no git evidence.
+
+        Unchanged by the plumbing: `task_kind='normal'` and the previous
+        implicit None both satisfy rule 3's `task_kind in (None,
+        NORMAL_TASK_KIND)` clause.
+        """
+        taskmaster.get_task = AsyncMock(return_value={
+            'id': '2409', 'status': 'blocked', 'title': 'T',
+            'metadata': {'task_kind': 'normal'},
+        })
+        self._force_orchestrator_live(monkeypatch)
+
+        result = await interceptor.set_task_status(
+            '2409', 'cancelled', '/project', agent_id=AGENT_ID,
+        )
+
+        assert result.get('error_type') != 'ReconLiveWorkflowWriteRejected'
+        taskmaster.set_task_status.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_blocked_bare_write_was_already_allowed_before_task_kind_forwarding(
+        self, interceptor, taskmaster, monkeypatch,
+    ):
+        """THE NO-WIDENING BASELINE — reproduces the pre-task-3751 Gate-2 inputs.
+
+        A task dict with no `metadata` key forwards `task_metadata=None`, from
+        which check() derives `task_kind=None` — byte-for-byte the detector
+        inputs Gate 2 used before task 3751 plumbed metadata through. It is
+        already NOT rejected, which is what shows the blocked-bare allowance
+        this gate now grants a `task_kind='normal'` task is pre-existing rule-3
+        behavior and not something the plumbing introduced.
+        """
+        taskmaster.get_task = AsyncMock(
+            return_value={'id': '2335', 'status': 'blocked', 'title': 'T'},
+        )
+        self._force_orchestrator_live(monkeypatch)
+
+        result = await interceptor.set_task_status(
+            '2335', 'cancelled', '/project', agent_id=AGENT_ID,
+        )
+
+        assert result.get('error_type') != 'ReconLiveWorkflowWriteRejected'
+        taskmaster.set_task_status.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_blocked_deterministic_with_registered_worktree_is_still_rejected(
+        self, interceptor, taskmaster, monkeypatch,
+    ):
+        """THE NO-WIDENING PIN — the one input combination whose
+        `orchestrator_live` verdict rule 2 actually changes at this gate.
+
+        With a LIVE worktree registered for the task's branch, forwarding
+        `task_kind='deterministic'` makes rule 2 fire and zero
+        `orchestrator_live` (rule 3 would not have fired — it is guarded on the
+        git signals). Gate 2's verdict is nevertheless UNCHANGED, because
+        `is_live` ORs in `worktree_registered`. If this ever starts passing the
+        write through, the no-widening argument in check()'s docstring has
+        broken and must be re-derived.
+        """
+        taskmaster.get_task = AsyncMock(return_value={
+            'id': '2067', 'status': 'blocked', 'title': 'T',
+            'metadata': {'task_kind': 'deterministic'},
+        })
+        self._force_orchestrator_live(monkeypatch)
+
+        def _git(args, **kwargs):
+            return subprocess.CompletedProcess(
+                args=args, returncode=0,
+                stdout=_worktree_porcelain_registering('task/2067'), stderr='',
+            )
+
+        with patch.object(detector_module, 'run_git', side_effect=as_async_run_git(_git)):
+            result = await interceptor.set_task_status(
+                '2067', 'cancelled', '/project', agent_id=AGENT_ID,
+            )
+
+        assert result.get('error_type') == 'ReconLiveWorkflowWriteRejected'
+        taskmaster.set_task_status.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_non_blocked_normal_task_is_still_rejected(
+        self, interceptor, taskmaster, monkeypatch,
+    ):
+        """SCOPE PIN — rules 2 and 3 are blocked-only, so an ordinary
+        in-progress task under the bare lock is still protected from a
+        recon-stage status write. The plumbing does not make the lock
+        universally ignorable.
+
+        The task carries a FRESH claimant heartbeat (task 2964). Before that
+        task, this fixture had no claimant at all and the rejection rested on
+        the bare lock alone; that shape is now exactly what the in-progress
+        corroboration gate downgrades — an uncorroborated in-progress task is
+        the killed-by-fleet-redeploy case, and Gate 2 must agree with the
+        renderer and let the write through. A genuinely dispatched in-progress
+        task always has a claimant_run_id and a heartbeat the orchestrator
+        keeps fresh, so this is the realistic shape for what the pin is
+        actually about: that task_kind rules 2/3 do not reach a non-blocked
+        task. The uncorroborated counterpart is pinned by
+        TestGate2CorroborationInterceptorPlumbing.
+        """
+        taskmaster.get_task = AsyncMock(return_value={
+            'id': '999', 'status': 'in-progress', 'title': 'T',
+            'claimant_run_id': 'run-999',
+            'heartbeat_at': _heartbeat(_FRESH_HEARTBEAT),
+            'metadata': {'task_kind': 'normal'},
+        })
+        self._force_orchestrator_live(monkeypatch)
+
+        result = await interceptor.set_task_status(
+            '999', 'cancelled', '/project', agent_id=AGENT_ID,
+        )
+
+        assert result.get('error_type') == 'ReconLiveWorkflowWriteRejected'
+        taskmaster.set_task_status.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# Gate 2: a pending task awaiting an unmet dependency (detector rule 6, task 8330)
+# ---------------------------------------------------------------------------
+
+
+def _task_8162(**overrides) -> dict:
+    """reify task 8162's shape: pending, normal, unclaimed, awaiting local dep 9739."""
+    task = {
+        'id': '8162',
+        'status': 'pending',
+        'title': 'T',
+        'claimant_run_id': None,
+        'heartbeat_at': None,
+        'dependencies': [9739],
+        'metadata': {'task_kind': 'normal'},
+    }
+    task.update(overrides)
+    return task
+
+
+class TestGate2PendingAwaitingDependency:
+    """The bare project lock no longer rejects a recon-stage status write for an
+    unclaimed pending normal task whose local dependency is positively unmet: the
+    scheduler will not dispatch it, so there is no pipeline to race.
+
+    Real detector, lock forced live, git against the non-existent '/project'
+    (fails safe to no worktree and no commit) unless patched.
+    """
+
+    @staticmethod
+    def _force_orchestrator_live(monkeypatch) -> None:
+        from fused_memory.services import live_workflow_detector
+
+        monkeypatch.setattr(
+            live_workflow_detector, 'is_orchestrator_live_for', lambda *a, **k: True,
+        )
+
+    @staticmethod
+    def _arrange(taskmaster, monkeypatch, task: dict, dependency_statuses) -> None:
+        taskmaster.get_task = AsyncMock(return_value=task)
+        if isinstance(dependency_statuses, Exception):
+            taskmaster.get_statuses_raw = AsyncMock(side_effect=dependency_statuses)
+        else:
+            taskmaster.get_statuses_raw = AsyncMock(return_value=dependency_statuses)
+        TestGate2PendingAwaitingDependency._force_orchestrator_live(monkeypatch)
+
+    @staticmethod
+    async def _cancel(interceptor) -> dict:
+        return await interceptor.set_task_status('8162', 'cancelled', '/project', agent_id=AGENT_ID)
+
+    @pytest.mark.asyncio
+    async def test_unclaimed_pending_task_awaiting_dependency_is_writable(
+        self, interceptor, taskmaster, monkeypatch,
+    ):
+        self._arrange(taskmaster, monkeypatch, _task_8162(), {'9739': 'pending'})
+
+        result = await self._cancel(interceptor)
+
+        assert result.get('error_type') != 'ReconLiveWorkflowWriteRejected'
+        taskmaster.set_task_status.assert_awaited_once()
+        taskmaster.get_statuses_raw.assert_awaited_once_with('/project', tag=None, ids=['9739'])
+
+    @pytest.mark.parametrize(
+        ('dependencies', 'statuses'),
+        [
+            ([9739], {'9739': 'done'}),
+            ([9739, 9740], {'9739': 'done', '9740': 'cancelled'}),
+        ],
+        ids=['one_done', 'done_and_cancelled'],
+    )
+    @pytest.mark.asyncio
+    async def test_satisfied_dependencies_keep_the_lock(
+        self, interceptor, taskmaster, monkeypatch, dependencies, statuses,
+    ):
+        self._arrange(taskmaster, monkeypatch, _task_8162(dependencies=dependencies), statuses)
+
+        result = await self._cancel(interceptor)
+
+        assert result.get('error_type') == 'ReconLiveWorkflowWriteRejected'
+        taskmaster.set_task_status.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_registered_worktree_keeps_the_task_live(
+        self, interceptor, taskmaster, monkeypatch,
+    ):
+        self._arrange(taskmaster, monkeypatch, _task_8162(), {'9739': 'pending'})
+
+        def _git(args, **kwargs):
+            return subprocess.CompletedProcess(
+                args=args, returncode=0,
+                stdout=_worktree_porcelain_registering('task/8162'), stderr='',
+            )
+
+        with patch.object(detector_module, 'run_git', side_effect=as_async_run_git(_git)):
+            result = await self._cancel(interceptor)
+
+        assert result.get('error_type') == 'ReconLiveWorkflowWriteRejected'
+        taskmaster.set_task_status.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_claimant_with_fresh_heartbeat_keeps_the_lock(
+        self, interceptor, taskmaster, monkeypatch,
+    ):
+        task = _task_8162(claimant_run_id='run-8162', heartbeat_at=_heartbeat(_FRESH_HEARTBEAT))
+        self._arrange(taskmaster, monkeypatch, task, {'9739': 'pending'})
+
+        result = await self._cancel(interceptor)
+
+        assert result.get('error_type') == 'ReconLiveWorkflowWriteRejected'
+        taskmaster.set_task_status.assert_not_awaited()
+
+    @pytest.mark.parametrize(
+        'dependency_statuses',
+        [RuntimeError('status read failed'), {'9739': 'merge-deferred'}],
+        ids=['read_raises', 'merge_deferred'],
+    )
+    @pytest.mark.asyncio
+    async def test_no_positive_evidence_keeps_the_lock(
+        self, interceptor, taskmaster, monkeypatch, dependency_statuses,
+    ):
+        self._arrange(taskmaster, monkeypatch, _task_8162(), dependency_statuses)
+
+        result = await self._cancel(interceptor)
+
+        assert result.get('error_type') == 'ReconLiveWorkflowWriteRejected'
+        taskmaster.set_task_status.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_dispatch_eligible_task_keeps_the_lock_without_a_read(
+        self, interceptor, taskmaster, monkeypatch,
+    ):
+        self._arrange(taskmaster, monkeypatch, _task_8162(dependencies=[]), {'9739': 'pending'})
+
+        result = await self._cancel(interceptor)
+
+        assert result.get('error_type') == 'ReconLiveWorkflowWriteRejected'
+        taskmaster.set_task_status.assert_not_awaited()
+        taskmaster.get_statuses_raw.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_deterministic_task_outside_rule_5_keeps_the_lock(
+        self, interceptor, taskmaster, monkeypatch,
+    ):
+        task = _task_8162(metadata={'task_kind': 'deterministic'})
+        self._arrange(taskmaster, monkeypatch, task, {'9739': 'pending'})
+
+        result = await self._cancel(interceptor)
+
+        assert result.get('error_type') == 'ReconLiveWorkflowWriteRejected'
+        taskmaster.set_task_status.assert_not_awaited()
+
+    @pytest.mark.parametrize(
+        ('statuses_kwargs', 'rejected'),
+        [({'dependency_statuses': {'9739': 'pending'}}, False), ({}, True)],
+        ids=['statuses_given', 'statuses_omitted'],
+    )
+    @pytest.mark.asyncio
+    async def test_check_drops_the_lock_only_with_dependency_statuses(
+        self, monkeypatch, statuses_kwargs, rejected,
+    ):
+        self._force_orchestrator_live(monkeypatch)
+
+        verdict = await _check(
+            'set_task_status',
+            task_id='8162',
+            project_root='/project',
+            target_status='cancelled',
+            live_status='pending',
+            task_metadata={'task_kind': 'normal'},
+            task_snapshot=_task_8162(),
+            **statuses_kwargs,
+        )
+
+        assert verdict.is_rejection is rejected
+        assert (verdict.error_type == 'ReconLiveWorkflowWriteRejected') is rejected
+
+
+class _FakeStatusReader:
+    """A DependencyStatusReader recording each read and answering with *result*."""
+
+    def __init__(self, result: dict[str, str] | Exception):
+        self.result = result
+        self.calls: list[tuple[str, str | None, list[str] | None]] = []
+
+    async def get_statuses_raw(
+        self, project_root: str, tag: str | None = None, ids: list[str] | None = None,
+    ) -> dict[str, str]:
+        self.calls.append((project_root, tag, ids))
+        if isinstance(self.result, Exception):
+            raise self.result
+        return self.result
+
+
+class TestReadDependencyStatuses:
+    """read_dependency_statuses: one batch read of a task's dependency statuses,
+    returning None (rule 6 inert) whenever there is nothing to read or the read fails."""
+
+    @pytest.mark.parametrize(
+        'snapshot',
+        [_task_8162(dependencies=[]), None, 'x'],
+        ids=['no_dependencies', 'none', 'str'],
+    )
+    @pytest.mark.asyncio
+    async def test_nothing_to_read_returns_none_without_reading(self, snapshot):
+        reader = _FakeStatusReader({'9739': 'pending'})
+
+        result = await recon_write_policy.read_dependency_statuses(
+            reader, snapshot, project_root='/p', tag=None,
+        )
+
+        assert result is None
+        assert reader.calls == []
+
+    @pytest.mark.asyncio
+    async def test_read_result_is_returned_unchanged(self):
+        reader = _FakeStatusReader({'9739': 'pending'})
+
+        result = await recon_write_policy.read_dependency_statuses(
+            reader, _task_8162(), project_root='/p', tag='master',
+        )
+
+        assert result == {'9739': 'pending'}
+        assert reader.calls == [('/p', 'master', ['9739'])]
+
+    @pytest.mark.asyncio
+    async def test_raising_read_returns_none_and_warns(self, caplog):
+        reader = _FakeStatusReader(RuntimeError('db locked'))
+
+        with caplog.at_level(logging.WARNING, logger=recon_write_policy.__name__):
+            result = await recon_write_policy.read_dependency_statuses(
+                reader, _task_8162(), project_root='/p', tag=None,
+            )
+
+        assert result is None
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert any('8162' in r.getMessage() for r in warnings)
 
 
 # ---------------------------------------------------------------------------
@@ -1265,30 +2585,93 @@ class TestInterceptorSetTaskStatusLiveWorkflowBoundary:
 
 class TestInterceptorSetTaskStatusReconCheckOffload:
     @pytest.mark.asyncio
-    async def test_recon_check_runs_off_the_event_loop_thread(
+    async def test_recon_check_does_not_block_the_event_loop(
         self, interceptor, taskmaster, monkeypatch,
     ):
-        """is_workflow_live_for_task shells out to git synchronously; the
-        recon-stage check() call in _apply_status_transition must be
-        dispatched via asyncio.to_thread so those blocking subprocess calls
-        never run on the event-loop thread while _write_lock is held —
-        otherwise they would block the loop and stall every other write to
-        the project for as long as git takes."""
-        seen_threads = []
+        """The recon-stage check() call in _apply_status_transition must not
+        block the event loop while _write_lock is held.
 
-        def _spy(*args, **kwargs):
-            seen_threads.append(threading.current_thread())
+        REPLACES test_recon_check_runs_off_the_event_loop_thread, which asserted
+        the `asyncio.to_thread` hop BY NAME (`current_thread() is not
+        main_thread()`). Task 3778 made the gate natively non-blocking — its git
+        probes await `shared.git_async.run_git` instead of shelling out with a
+        blocking `subprocess.run` — so the offload is intrinsic and the hop is
+        gone. What actually matters is unchanged and is what this asserts
+        directly: while the gate is suspended inside the detector, the event
+        loop stays free to serve every other write to the project — asserted
+        with a loop-turn oracle rather than a wall-clock tick floor (task 5920).
+        """
+        probe = LoopFreedomProbe()
+
+        async def _suspending_detector(*args, **kwargs):
+            await probe.suspend()
             return False
 
-        monkeypatch.setattr(recon_write_policy, 'is_workflow_live_for_task', _spy)
+        monkeypatch.setattr(
+            recon_write_policy, 'is_workflow_live_for_task', _suspending_detector,
+        )
 
         await interceptor.set_task_status(
             '1', 'in-progress', '/project', agent_id=AGENT_ID,
         )
 
-        assert len(seen_threads) == 1
-        assert seen_threads[0] is not threading.main_thread()
+        probe.assert_loop_stayed_free()
         taskmaster.set_task_status.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_corroboration_disk_reads_do_not_block_the_event_loop(
+        self, interceptor, taskmaster, monkeypatch, tmp_path,
+    ):
+        """_corroboration_verdict's two blocking on-disk reads
+        (scheduler_state.json, orchestrator.lock) must stay OFF the loop.
+
+        They used to ride the `asyncio.to_thread` hop task_interceptor wrapped
+        the whole of check() in. That hop is gone, so check() must offload them
+        itself — otherwise removing it would have quietly moved two synchronous
+        file reads per recon status write ONTO the event loop, which is the
+        very defect this task exists to fix.
+
+        Each stubbed read blocks on a LoopFreedomProbe, which reads False if
+        the read ran on the loop's thread, or ran elsewhere while the loop's
+        thread waited on it (task 5920, replacing a wall-clock tick floor). The
+        verdict is recorded, not asserted inside the read, because
+        _corroboration_verdict swallows every exception its reads raise.
+        """
+        probe = LoopFreedomProbe()
+        reads: list[str] = []
+
+        def _blocking_read(name):
+            def _read(*args, **kwargs):
+                reads.append(name)
+                probe.block()
+                return None
+            return _read
+
+        monkeypatch.setattr(
+            recon_write_policy, 'read_scheduler_state', _blocking_read('read_scheduler_state'),
+        )
+        monkeypatch.setattr(
+            recon_write_policy,
+            'orchestrator_started_at',
+            _blocking_read('orchestrator_started_at'),
+        )
+        monkeypatch.setattr(
+            recon_write_policy, 'is_workflow_live_for_task', _async_detector(False),
+        )
+        taskmaster.get_task = AsyncMock(return_value={
+            'id': '599',
+            'status': 'in-progress',
+            'title': 'T',
+            'claimant_run_id': 'run-599',
+            'heartbeat_at': _heartbeat(_STALE_HEARTBEAT),
+        })
+
+        await interceptor.set_task_status(
+            '599', 'pending', str(tmp_path), agent_id=AGENT_ID,
+        )
+
+        assert sorted(reads) == ['orchestrator_started_at', 'read_scheduler_state']
+        probe.assert_loop_stayed_free()
 
     @pytest.mark.asyncio
     async def test_set_task_status_always_passes_snapshot_token_none(
@@ -1303,14 +2686,14 @@ class TestInterceptorSetTaskStatusReconCheckOffload:
         captured = {}
         real_check = recon_write_policy.check
 
-        def _spy(op, **kwargs):
+        async def _spy(op, **kwargs):
             captured['op'] = op
             captured.update(kwargs)
-            return real_check(op, **kwargs)
+            return await real_check(op, **kwargs)
 
         monkeypatch.setattr(recon_write_policy, 'check', _spy)
         monkeypatch.setattr(
-            recon_write_policy, 'is_workflow_live_for_task', lambda *a, **k: False,
+            recon_write_policy, 'is_workflow_live_for_task', _async_detector(False),
         )
 
         await interceptor.set_task_status(
@@ -1320,6 +2703,150 @@ class TestInterceptorSetTaskStatusReconCheckOffload:
         assert captured.get('op') == 'set_task_status'
         assert captured.get('snapshot_token') is None
         taskmaster.set_task_status.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
+# BOTH interceptor call sites await check() directly (task 3778)
+# ---------------------------------------------------------------------------
+
+
+class TestBothInterceptorCallSitesAwaitCheck:
+    """The two `recon_write_policy.check` call sites are now symmetric.
+
+    Before this task they were NOT: `_apply_status_transition` dispatched
+    check() through `asyncio.to_thread` (:993) while `update_task` called it
+    INLINE (:4484) — a latent defect one Gate-2 widening away from firing,
+    since an inline call would have run Gate 2's blocking git I/O on the event
+    loop under the write lock. Making check() natively async collapses both to
+    a plain `await`, so the asymmetry cannot come back.
+
+    Gate 2 stays scoped to `op == 'set_task_status'`: this is a latency and
+    latent-defect fix, NOT a widening of the guard. `test_update_task_never_
+    reaches_the_detector` pins that at the boundary.
+    """
+
+    @staticmethod
+    def _spy_check(monkeypatch) -> list[dict]:
+        """Record every check() invocation, still running the REAL gate."""
+        calls: list[dict] = []
+        real_check = recon_write_policy.check
+
+        async def _spy(op, **kwargs):
+            calls.append({'op': op, **kwargs})
+            return await real_check(op, **kwargs)
+
+        monkeypatch.setattr(recon_write_policy, 'check', _spy)
+        return calls
+
+    @pytest.mark.asyncio
+    async def test_set_task_status_awaits_check(
+        self, interceptor, taskmaster, monkeypatch,
+    ):
+        """A coroutine-function check() is awaited, not thread-dispatched.
+
+        `asyncio.to_thread(check, ...)` would return a coroutine OBJECT from
+        the worker thread, and `verdict.is_rejection` on it would raise
+        AttributeError — so a surviving to_thread hop cannot pass this.
+        """
+        calls = self._spy_check(monkeypatch)
+        monkeypatch.setattr(
+            recon_write_policy, 'is_workflow_live_for_task', _async_detector(True),
+        )
+
+        result = await interceptor.set_task_status(
+            '1', 'in-progress', '/project', agent_id=AGENT_ID,
+        )
+
+        assert [c['op'] for c in calls] == ['set_task_status']
+        assert result.get('error_type') == 'ReconLiveWorkflowWriteRejected'
+        taskmaster.set_task_status.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_update_task_awaits_check(self, interceptor, taskmaster, monkeypatch):
+        """THE LATENT SIBLING — update_task's inline call becomes an await.
+
+        Left un-awaited it would evaluate `.is_rejection` on a coroutine
+        object: never a rejection, and a `coroutine was never awaited`
+        RuntimeWarning — i.e. Gate 1 and Gate 3 would silently stop rejecting
+        on this path.
+        """
+        calls = self._spy_check(monkeypatch)
+        taskmaster.get_task = AsyncMock(
+            return_value={'id': '1', 'status': 'done', 'title': 'T'},
+        )
+
+        result = await interceptor.update_task(
+            '1', '/project', title='x', agent_id=AGENT_ID,
+        )
+
+        assert [c['op'] for c in calls] == ['update_task']
+        assert result.get('error_type') == 'ReconTerminalWriteRejected'
+        taskmaster.update_task.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_update_task_call_site_passes_no_task_snapshot(
+        self, interceptor, taskmaster, monkeypatch,
+    ):
+        """ARGUMENT TUPLES PRESERVED — `task_snapshot` stays set_task_status-only.
+
+        Gate 2 never fires for update_task, so passing it there would buy that
+        path two pointless disk reads. Pinned so the conversion cannot quietly
+        normalise the two call sites' kwargs into one shape.
+        """
+        calls = self._spy_check(monkeypatch)
+        taskmaster.get_task = AsyncMock(
+            return_value={'id': '1', 'status': 'in-progress', 'title': 'T'},
+        )
+
+        await interceptor.update_task('1', '/project', title='x', agent_id=AGENT_ID)
+
+        assert calls[0].get('task_snapshot') is None
+        assert calls[0].get('target_status') is None
+
+    @pytest.mark.asyncio
+    async def test_update_task_never_reaches_the_detector(
+        self, interceptor, taskmaster, monkeypatch,
+    ):
+        """SCOPE — Gate 2 remains `set_task_status`-only after the conversion."""
+        captured: dict = {}
+        monkeypatch.setattr(
+            recon_write_policy,
+            'is_workflow_live_for_task',
+            _capturing_async_detector(captured, result=True),
+        )
+        taskmaster.get_task = AsyncMock(
+            return_value={'id': '1', 'status': 'in-progress', 'title': 'T'},
+        )
+
+        await interceptor.update_task('1', '/project', title='x', agent_id=AGENT_ID)
+
+        assert captured == {}
+        taskmaster.update_task.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_update_task_check_does_not_block_the_event_loop(
+        self, interceptor, taskmaster, monkeypatch,
+    ):
+        """The update_task call site leaves the loop free while check() is
+        suspended — the property it GAINED when it stopped calling check
+        inline (task 3778). Asserted with a loop-turn oracle rather than a
+        wall-clock tick floor (task 5920)."""
+        probe = LoopFreedomProbe()
+        real_check = recon_write_policy.check
+
+        async def _suspending_check(op, **kwargs):
+            await probe.suspend()
+            return await real_check(op, **kwargs)
+
+        monkeypatch.setattr(recon_write_policy, 'check', _suspending_check)
+        taskmaster.get_task = AsyncMock(
+            return_value={'id': '1', 'status': 'in-progress', 'title': 'T'},
+        )
+
+        await interceptor.update_task('1', '/project', title='x', agent_id=AGENT_ID)
+
+        probe.assert_loop_stayed_free()
+        taskmaster.update_task.assert_awaited_once()
 
 
 # ---------------------------------------------------------------------------

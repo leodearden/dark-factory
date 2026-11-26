@@ -22,9 +22,29 @@ from unittest.mock import AsyncMock, patch
 
 from shared.cli_invoke import AgentResult
 from shared.config_models import AccountConfig, UsageCapConfig
-from shared.usage_gate import ScopeCap, UsageGate
+from shared.usage_gate import ProbeSpawnError, ScopeCap, UsageGate
 
 SCOPE = 'claude-fable-5'
+
+
+def spawn_fault(binary = 'claude'):
+    """A ``ProbeSpawnError`` shaped exactly like the observed incident.
+
+    Task 4512. The wrapped cause is the ``FileNotFoundError`` that
+    ``asyncio.create_subprocess_exec`` raises for an unresolvable binary --
+    reproduced verbatim rather than approximated, because the whole point of
+    ``ProbeSpawnError`` is that this specific errno used to be swallowed into
+    a ``False`` verdict indistinguishable from "still capped".
+
+    Lives here rather than in each suite: ``test_probe_loop.py`` and
+    ``test_auth_failed.py`` both exercise the same
+    ``_note_probe_spawn_failure`` / ``probe_infra_fault`` accounting surface,
+    and byte-identical copies would drift the moment the ``ProbeSpawnError``
+    constructor signature changes (task 4512 review).
+    """
+    return ProbeSpawnError(
+        binary, FileNotFoundError(2, 'No such file or directory', binary),
+    )
 
 
 def make_gate(account_names: list[str], *, cost_store=None, **cfg) -> UsageGate:
@@ -91,13 +111,10 @@ class scripted_invoke:
 def cap_result(stderr: str, output: str = 'partial') -> AgentResult:
     """A capped AgentResult carrying a cap-hit stderr pattern.
 
-    ``success=True`` mirrors ``test_cap_retry.py::test_real_gate_failover``'s
-    ``capped`` fixture: cap detection happens via ``slot.detect_cap_hit``,
-    which builds its OWN synthetic ``success=False`` result internally
-    (``UsageGate.detect_cap_hit``), so the raw result's ``success`` value is
-    irrelevant to cap classification here.
+    ``success=False`` because a genuine cap reaches ``invoke_with_cap_retry`` as
+    a failed turn; only failed results are offered to ``slot.detect_cap_hit``.
     """
-    return AgentResult(success=True, output=output, stderr=stderr, cost_usd=0.5)
+    return AgentResult(success=False, output=output, stderr=stderr, cost_usd=0.5)
 
 
 def ok_result(output: str = 'complete') -> AgentResult:

@@ -55,6 +55,27 @@ Usage
   # Apply: reopen task 1175 (with persistence verification) and annotate
   # every other flagged task's metadata.x_provenance_audit.
   python scripts/correct_found_on_main_backlog.py --project-root /path/to/project --apply
+
+WHY THIS SCRIPT PREFLIGHTS ITS TARGET (a decision, task 4319)
+-------------------------------------------------------------
+:func:`_run` refuses, before it constructs a backend, unless ``--project-root``
+names a checkout whose ``.taskmaster/tasks/tasks.db`` ALREADY exists and holds
+tasks.  A task worktree has none, and merely reaching ``get_tasks`` would
+create one empty and report zero corrections -- indistinguishable from a
+backlog with nothing to correct.
+
+See ``fused_memory/utils/target_store_preflight.py::assert_task_store_populated``
+for the mechanism, the probe-vs-existence argument, the prior art and the
+placement rules -- that module is the single normative copy, and this note
+deliberately does not restate it.
+
+The in-repo evidence that tasks.db needs no SECOND, mem0-shaped preflight is
+this file's own, which is why it is recorded here and not only there:
+:func:`_apply_reopen`'s docstring notes that task 2649's
+``sqlite_task_backend.py::SqliteTaskBackend.set_status_and_stamp_audit`` writes
+the status flip and both audit trails in a SINGLE call where "every one of them
+commits or rolls back together" -- so there is no torn write here to guard.
+
 """
 
 from __future__ import annotations
@@ -67,6 +88,8 @@ import sys
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
+
+from fused_memory.utils.target_store_preflight import assert_task_store_populated
 
 logger = logging.getLogger('correct_found_on_main_backlog')
 
@@ -278,7 +301,7 @@ async def apply_corrections(
                     # correction still gets a chance to apply.
                     summary['reopen_failed'].append(correction.task_id)
                     summary['errors'] += 1
-        except Exception as exc:  # noqa: BLE001 - per-op isolation, mirrors
+        except Exception as exc:  # per-op isolation, mirrors
             # apply_audit_annotations: one correction's backend failure
             # must never abort the batch. Logged loudly, counted as an
             # error, and the loop continues to the next correction.
@@ -455,7 +478,9 @@ async def _run(args: argparse.Namespace) -> int:
         level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s',
     )
 
-    import os  # noqa: PLC0415
+    assert_task_store_populated(args.project_root, operation='correct_found_on_main_backlog')
+
+    import os
 
     # Sibling import: audit_found_on_main_provenance.py lives alongside this
     # script in fused-memory/scripts/, which is sys.path[0] when this file
@@ -463,10 +488,10 @@ async def _run(args: argparse.Namespace) -> int:
     # Deferred to runtime (never a module-level import) so the test suite
     # can importlib-load this module in isolation without the scripts/ dir
     # on sys.path — see test_correct_found_on_main_backlog.py's _load_module.
-    from audit_found_on_main_provenance import GitFacts, build_audit_report  # noqa: PLC0415
+    from audit_found_on_main_provenance import GitFacts, build_audit_report
 
-    from fused_memory.backends.sqlite_task_backend import SqliteTaskBackend  # noqa: PLC0415
-    from fused_memory.config.schema import FusedMemoryConfig  # noqa: PLC0415
+    from fused_memory.backends.sqlite_task_backend import SqliteTaskBackend
+    from fused_memory.config.schema import FusedMemoryConfig
 
     if args.config:
         os.environ['CONFIG_PATH'] = str(args.config)

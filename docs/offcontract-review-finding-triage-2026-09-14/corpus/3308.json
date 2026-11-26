@@ -1,0 +1,40 @@
+{
+  "role": "reviewer_comprehensive",
+  "schema_version": 1,
+  "session_id": "",
+  "emitted_at": "2026-07-31T22:15:55.680864+00:00",
+  "verdict": {
+    "reviewer": "reviewer_comprehensive",
+    "verdict": "ISSUES_FOUND",
+    "issues": [
+      {
+        "severity": "moderate",
+        "category": "contract-drift",
+        "file": "plans/dashboard-availability-prd.md",
+        "line": 195,
+        "title": "Implementation deliberately supersedes two normative PRD Contract rows, but the PRD still states the old ones",
+        "description": "scripts/dashboard-watchdog.py names plans/dashboard-availability-prd.md \u00a7Contract as 'the real contract' (module docstring, and the service file's comment block repeats it: 'contract  plans/dashboard-availability-prd.md \u00a7Contract  <- the real one'). Two rows of that contract are now contradicted by the code, with good reasons, but the document is unchanged:\n\n1. \u00a7Contract 'Escalation dedup | at most one open L2 per ceiling episode'. The implementation deliberately keys the dedup on `last_escalation_epoch` over the rolling RATE_WINDOW_SECS instead, because a flapping dashboard ends an episode with one healthy probe while the restart window survives it (file_ceiling_escalation docstring, scripts/dashboard-watchdog.py:615-627; regression pinned by test_flapping_dashboard_files_one_l2_per_rate_window). This is the right call, but 'per episode' and 'per rolling window' are materially different guarantees for a steward reading the contract.\n2. Invariant I4, 'no further restarts until an operator intervenes'. tick() deliberately ends the episode on a successful probe instead (scripts/dashboard-watchdog.py:704-736), and the code argues at length why the literal reading is wrong.\n\nThe module docstring explains why the PRD was not edited, but that explanation is scoped to open question 2 ('shell or Python?') \u2014 an open question, not a normative contract row. Leaving the superseded rows unannotated is the same contract-in-prose failure mode (INV-1) this rewrite exists to retire: the next reader who consults the named contract gets an answer the code no longer honours. The PRD already carries a precedent for the fix \u2014 the amendment note appended below the decomposition table ('Note on alpha's corrected signal (amended 2026-07-31, watcher-df, on Leo's sign-off of esc-3304-2)') corrects row alpha's signal in exactly this shape.\n\nSuggested fix: append an equivalent amendment note (or edit the two rows in place with a dated note) recording that the dedup is keyed on the rolling RATE_WINDOW_SECS rather than the episode, and that I4's episode ends on a successful probe rather than only on operator intervention.",
+        "blocking": false
+      },
+      {
+        "severity": "minor",
+        "category": "test-coverage",
+        "file": "scripts/dashboard-watchdog.py",
+        "line": 146,
+        "title": "ESCALATION_QUEUE_DIR duplicates dark-factory-orchestrator.yaml's escalation.queue_dir with no pin, unlike PROBE_URL's port",
+        "description": "ESCALATION_QUEUE_DIR defaults to REPO_DIR/data/escalations, which duplicates the configured escalation.queue_dir ('data/escalations', dark-factory-orchestrator.yaml:178; model default at orchestrator/src/orchestrator/config.py:1102). The two agree today, and nothing keeps them agreeing.\n\nIf queue_dir is ever changed in config, the watchdog keeps writing its born-at-L2 records into a directory the escalation server and dashboard no longer read: the ceiling trips, the watchdog goes permanently quiet, and the escalation is invisible \u2014 precisely the 'quiet at the ceiling with nobody told: the worst of both behaviours' outcome file_ceiling_escalation's docstring says it exists to prevent, and it is undetectable from the journal alone.\n\nThe test suite already uses exactly the right idiom for this class of coupling: test_b6_probe_port_matches_the_dashboard_units_listen_port pins PROBE_URL's port against the dashboard unit's --port, with a docstring making the same argument. An equivalent pin of ESCALATION_QUEUE_DIR against the config's escalation.queue_dir (resolved relative to project_root) would close the gap. Note this test would have to live in a lane that can read the YAML \u2014 tests/scripts/ already reads unit files by path, so a plain text/YAML read there is consistent with the existing B6 tests.",
+        "blocking": false
+      },
+      {
+        "severity": "trivial",
+        "category": "stale-reference",
+        "file": "scripts/dashboard-watchdog.py",
+        "line": 148,
+        "title": "Comment cites dark-factory-orchestrator.yaml:116 for escalation.queue_dir; the key is at line 178",
+        "description": "The ESCALATION_QUEUE_DIR comment reads 'the same directory dark-factory-orchestrator.yaml:116 configures as escalation.queue_dir'. escalation.queue_dir is at line 178 of that file; line 116 is unrelated. Line-number references into a frequently-edited config drift silently \u2014 dropping the ':116' and naming only the key (as the surrounding comments do for other cross-file references) keeps the pointer correct.",
+        "blocking": false
+      }
+    ],
+    "summary": "Strong change overall. I verified it end to end rather than reading it: both new suites pass (88 tests in the scripts lane, 4 in the dashboard lane), ruff is clean on all three new files, and the silent-fallthrough gate (65 tests) passes with the module in its scope. Both test files are collected by real verify lanes (tests/scripts/ via the shared lane, dashboard/tests/ via the dashboard lane, which does declare escalation as a workspace dependency), the escalation console script and its argparse boundary exist as claimed, the dashboard's /api/health shallow handler exists immediately above /healthz, and the probe port matches the dashboard unit's --port.\\n\\nI hunted specifically for state-machine defects and found none I could confirm: the FAIL_STREAK/MAX_RESTARTS accounting is correct at both boundaries, the rolling prune keeps a rarely-misbehaving service from ever tripping the ceiling, recovery deliberately preserves the restart window (so crash/recover/crash cannot earn a fresh allowance), the streak does not bank while the ceiling is open, and every fail-soft swallow fails toward not actuating. _normalise_state's bool-exclusion and negative-epoch handling are right, and save_state's mkstemp-sibling + os.replace is a genuine atomic rename. The test suite is unusually good \u2014 no source-text or docstring meta-tests, every assertion is behavioural, per-tick fresh module loads honestly model the oneshot contract, and the flap regression test (one L2 per rolling window, not per episode) is a real bug caught by a real test. Test isolation is clean: I checked programmatically that no test touching tick()/save_state runs without a tmp state path.\\n\\nThe three findings are all documentation/coupling, none of them runtime defects. The one worth acting on before landing is the first: the code deliberately supersedes two normative rows of the PRD Contract it names as 'the real contract' (escalation dedup keyed on the rolling window rather than the episode, and I4's episode ending on a successful probe rather than on operator intervention), with sound reasoning recorded in the code but nothing recorded in the document \u2014 and the PRD already has an amendment-note convention for exactly this. The other two are a missing config pin for ESCALATION_QUEUE_DIR (same idiom as the port pin already in the suite) and a stale line-number reference in a new comment."
+  }
+}

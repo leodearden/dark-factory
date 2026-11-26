@@ -57,5 +57,45 @@
         "path": "/home/leo/src/dark-factory/data/escalations/archive/2026-06-15/esc-1753-9.json"
       }
     ]
+  },
+  "context": {
+    "task": {
+      "title": "Dashboard Memory panel: show fused-memory uptime",
+      "description": "Show fused-memory server uptime in the dashboard Memory section. Depends on the \u03b2 task adding `uptime_seconds`/`started_at` to `get_status`.\n\nImplementation:\n- `get_memory_status()` (dashboard/src/dashboard/data/memory.py) already returns the get_status dict whole \u2014 ensure `uptime_seconds`/`started_at` pass through.\n- `shape_memory()` (dashboard/src/dashboard/data/redux_api.py) \u2014 thread the fields into `MEMORY_STATUS` as `uptime_seconds` / `started_at`.\n- Render a compact duration (\"up 3d 7h\") in the Memory tab (`MemoryTab`, static/redux/tabs.jsx) and the overview health block (static/redux/tab_overview.jsx). Show \"\u2014\" when fused-memory is offline (existing `MEMORY_STATUS.offline` path) or the field is absent. `started_at` may be a hover/title. Frontend formats; reuse a duration helper if one exists (PRD Open question 1).\n\nPRD: plans/dashboard-orch-update-and-fm-uptime-prd.md task \u03b3\nCapability manifest: plans/dashboard-orch-update-and-fm-uptime.capability-manifest.md\n\nUser-observable signal: The Memory tab / overview health block shows \"fused-memory up <Nd Nh>\" derived from uptime_seconds; \"\u2014\" when fused-memory is unreachable.\nConsumer: dashboard operator (Memory tab + overview health block).\nModules touched: dashboard\nDepends on: \u03b2 (get_status uptime fields).",
+      "test_strategy": "",
+      "details": "",
+      "authored": false,
+      "id": "1753",
+      "record_source": {
+        "path": ".taskmaster/tasks/tasks.db",
+        "tag": "master",
+        "read_at": "2026-09-11",
+        "updated_at": "2026-06-15T07:47:36.564Z",
+        "updated_after_merge": false,
+        "run_time_title_matches": true
+      }
+    },
+    "changed_files": [
+      "dashboard/src/dashboard/data/redux_api.py",
+      "dashboard/src/dashboard/static/redux/index.html",
+      "dashboard/src/dashboard/static/redux/shell.jsx",
+      "dashboard/src/dashboard/static/redux/tab_overview.jsx",
+      "dashboard/src/dashboard/static/redux/tabs.jsx",
+      "dashboard/tests/test_redux_api.py"
+    ],
+    "base_sha": "909245e1d598b78744da5a1181025814eeb727b8",
+    "branch_sha": "d53cd62b68fdeddf4ac0f872183ad2a0a772c93e",
+    "base_sha_reason": null,
+    "plan": null,
+    "plan_reason": "no plan.json survives for this task. Absent: .worktrees/.task-meta/<id>/plan.json; data/orchestrator/agent-transcripts/<id>/; data/orchestrator/landed_outbox.json entry. Wider hunt (escalations archive, fleet sessions, branch commit messages, branch tree, fused-memory) found nothing for this task; runs.db plan_salvaged/plan_revalidated events for this task hold only counts (steps=9, changed_files_count=8); the one ~/.claude/projects transcript for worktree 1753 is a dry-run investigator run after a 529 planning failure, not a plan",
+    "verification": {
+      "merge_sha": "e916503ed85f2c0e8ca182dab04b7dc8e8f03824",
+      "merge_base_sha": "909245e1d598b78744da5a1181025814eeb727b8",
+      "diff_reproduces_from": "git diff 909245e1d5 e916503ed8",
+      "diff_reproduces": true,
+      "merge_tree_equals_merge_commit_tree": true,
+      "changed_files_match_diff_headers": true,
+      "verified_at": "2026-09-11"
+    }
   }
 }

@@ -5,45 +5,39 @@ sys.path pollution — mirrors the pattern in test_audit_duplicate_tasks.py.
 """
 from __future__ import annotations
 
-import importlib.util
+import errno
 import json
+import logging
+import sys
 import types
 from datetime import datetime
 from pathlib import Path
 
 import pytest
+from _fm_helpers import load_script_module
+from _store_mutation_preflight_contract import (
+    SENTINEL,
+    deny,
+    fail_closed_records,
+    neutralise_fixture,
+)
+from shared.testing_streams import StdoutWithAFailingFlush
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+from fused_memory.config.schema import WriteTriageProjectCalibration
+from fused_memory.utils.store_mutation_preflight import StoreMutationUnavailable
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'audit_duplicate_memories.py'
 
 
-def _load_module() -> types.ModuleType:
-    """Load audit_duplicate_memories.py from its file path.
-
-    The module is registered in sys.modules under its name so that
-    @dataclass and other reflection-based decorators work correctly
-    (they call sys.modules.get(cls.__module__)).
-    """
-    import sys  # noqa: PLC0415
-
-    mod_name = 'audit_duplicate_memories'
-    spec = importlib.util.spec_from_file_location(mod_name, SCRIPT_PATH)
-    if spec is None or spec.loader is None:
-        raise ImportError(f'Cannot load {SCRIPT_PATH}')
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[mod_name] = module  # required for @dataclass __module__ lookup
-    try:
-        spec.loader.exec_module(module)  # type: ignore[union-attr]
-    except Exception:
-        sys.modules.pop(mod_name, None)
-        raise
-    return module
-
-
-_mod = _load_module()
+_mod = load_script_module(SCRIPT_PATH, mod_name='audit_duplicate_memories')
 cluster_memories_by_pairs = _mod.cluster_memories_by_pairs
 ann_pairs_from_neighbors = _mod.ann_pairs_from_neighbors
 ann_scores_for_pairs = _mod.ann_scores_for_pairs
 _ANN_DISCLOSURE_KEYS = _mod._ANN_DISCLOSURE_KEYS
+_ANN_QUERY_DISCLOSURE_KEYS = _mod._ANN_QUERY_DISCLOSURE_KEYS
 find_near_duplicate_memory_groups = _mod.find_near_duplicate_memory_groups
 pick_survivor = _mod.pick_survivor
 build_sweep_plan = _mod.build_sweep_plan
@@ -53,10 +47,11 @@ _MAX_LEXICAL_RATIO_MEMBERS = _mod._MAX_LEXICAL_RATIO_MEMBERS
 partition_topic_carveout = _mod.partition_topic_carveout
 fetch_procedural_memories = _mod.fetch_procedural_memories
 fetch_memories = _mod.fetch_memories
-_ALL_CATEGORIES = _mod._ALL_CATEGORIES
+_ALL_CATEGORIES = _mod.ALL_CATEGORIES
 extract_liveness_snapshot_fact = _mod.extract_liveness_snapshot_fact
 _classify_liveness_snapshot = _mod._classify_liveness_snapshot
 liveness_snapshot_subject_task_ids = _mod.liveness_snapshot_subject_task_ids
+liveness_snapshot_subject_facts = _mod.liveness_snapshot_subject_facts
 find_liveness_snapshot_recurrences = _mod.find_liveness_snapshot_recurrences
 _LIVENESS_DISCLOSURE_KEYS = _mod._LIVENESS_DISCLOSURE_KEYS
 # Bound here, off the module, so the regex-budget class below can delegate to
@@ -65,9 +60,11 @@ _LIVENESS_DISCLOSURE_KEYS = _mod._LIVENESS_DISCLOSURE_KEYS
 # make these aliases stale.
 POINT_IN_TIME_CHECK_RE = _mod.POINT_IN_TIME_CHECK_RE
 LIVE_TASK_STATUS_RE = _mod.LIVE_TASK_STATUS_RE
+TASK_REF_RE = _mod.TASK_REF_RE
 _LIVE_FIELD_NAMES = _mod._LIVE_FIELD_NAMES
 apply_deletions = _mod.apply_deletions
 resolve_ann_threshold = _mod.resolve_ann_threshold
+categories_without_own_cutoff = _mod.categories_without_own_cutoff
 fetch_ann_neighbors = _mod.fetch_ann_neighbors
 compute_cluster_metrics = _mod.compute_cluster_metrics
 build_metric_series = _mod.build_metric_series
@@ -76,8 +73,19 @@ _EVAL_ID = _mod._EVAL_ID
 _GLOBAL_SCOPE = _mod._GLOBAL_SCOPE
 emit_metrics_artifact = _mod.emit_metrics_artifact
 details_artifact_path = _mod.details_artifact_path
-_build_parser = _mod._build_parser
+_build_parser = _mod.build_parser
 _run = _mod._run
+
+
+_neutralise = neutralise_fixture(
+    _mod,
+    note="""``_run(args)`` with ``--apply`` runs the preflight before it constructs
+    a MemoryService (task 4127). This suite is deliberately MOCK-unit
+    (``_FakeMemoryService``, no live Qdrant).
+    ``TestApplyStoreMutationPreflight`` re-rigs this per test -- to refuse, to
+    record, or to pass -- so the guard's own behaviour is still pinned
+    explicitly rather than assumed away.""",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -217,7 +225,7 @@ class TestFindNearDuplicateMemoryGroupsDeterminism:
         assert [m['id'] for m in memories] == original_order
 
     def test_result_is_deterministic_regardless_of_input_order(self):
-        import random  # noqa: PLC0415
+        import random
 
         memories = [
             _memory('m1', _VENV_GOTCHA_A),
@@ -446,6 +454,39 @@ class TestPickSurvivorCanonicalFlag:
         assert [m['id'] for m in losers] == ['m1']
 
 
+class TestPickSurvivorStrictCanonicalMarker:
+    """Only the bool True claims canonical (canonical_marker.py::is_canonical)."""
+
+    @pytest.mark.parametrize('malformed', ['true', 1])
+    def test_bool_true_canonical_beats_older_malformed_marker(self, malformed):
+        group = [
+            _memory(
+                'm1', _VENV_GOTCHA_A, created_at='2026-07-01T00:00:00+00:00',
+                metadata={'canonical': malformed},
+            ),
+            _memory(
+                'm2', _VENV_GOTCHA_B, created_at='2026-07-13T00:00:00+00:00',
+                metadata={'canonical': True},
+            ),
+        ]
+        survivor, losers = pick_survivor(group)
+        assert survivor['id'] == 'm2'
+        assert [m['id'] for m in losers] == ['m1']
+
+    @pytest.mark.parametrize('malformed', ['true', 1])
+    def test_malformed_marker_alone_does_not_outrank_age(self, malformed):
+        group = [
+            _memory('m1', _VENV_GOTCHA_A, created_at='2026-07-01T00:00:00+00:00'),
+            _memory(
+                'm2', _VENV_GOTCHA_B, created_at='2026-07-13T00:00:00+00:00',
+                metadata={'canonical': malformed},
+            ),
+        ]
+        survivor, losers = pick_survivor(group)
+        assert survivor['id'] == 'm1'
+        assert [m['id'] for m in losers] == ['m2']
+
+
 class TestPickSurvivorOldestByCreatedAt:
     """With no canonical flag, the oldest by created_at wins."""
 
@@ -640,7 +681,7 @@ class TestFetchProceduralMemoriesCallShape:
     """scroll_by_metadata is called with the category filter and scan_limit."""
 
     async def test_called_with_category_filter_and_scan_limit(self):
-        from unittest.mock import AsyncMock, MagicMock  # noqa: PLC0415
+        from unittest.mock import AsyncMock, MagicMock
 
         memory = MagicMock()
         memory.mem0 = MagicMock()
@@ -660,7 +701,7 @@ class TestFetchProceduralMemoriesNormalization:
     """Raw records are normalized to {'id','content','created_at','metadata'}."""
 
     async def test_content_extracted_from_memory_key(self):
-        from unittest.mock import AsyncMock, MagicMock  # noqa: PLC0415
+        from unittest.mock import AsyncMock, MagicMock
 
         raw = [_raw_record(
             'm1', '2026-07-12T00:00:00+00:00',
@@ -681,7 +722,7 @@ class TestFetchProceduralMemoriesNormalization:
         }]
 
     async def test_content_extracted_from_data_key(self):
-        from unittest.mock import AsyncMock, MagicMock  # noqa: PLC0415
+        from unittest.mock import AsyncMock, MagicMock
 
         raw = [_raw_record('m2', None, {'data': 'gotcha text v2'})]
         memory = MagicMock()
@@ -700,7 +741,7 @@ class TestFetchProceduralMemoriesNormalization:
         # metadata.get('data')); 'memory' is a search-result-layer key
         # (MemoryResult.content) that can appear stale on a scroll payload.
         # When both are present on the same payload, 'data' must win.
-        from unittest.mock import AsyncMock, MagicMock  # noqa: PLC0415
+        from unittest.mock import AsyncMock, MagicMock
 
         raw = [_raw_record(
             'm5', '2026-07-12T00:00:00+00:00',
@@ -724,7 +765,7 @@ class TestFetchProceduralMemoriesSafeDegradation:
     """A record with no extractable content normalizes to content=''."""
 
     async def test_no_extractable_content_degrades_to_empty_string(self):
-        from unittest.mock import AsyncMock, MagicMock  # noqa: PLC0415
+        from unittest.mock import AsyncMock, MagicMock
 
         raw = [_raw_record('m3', '2026-07-12T00:00:00+00:00', {'unrelated_field': 'x'})]
         memory = MagicMock()
@@ -741,7 +782,7 @@ class TestFetchProceduralMemoriesEmptyScan:
     """An empty/[] scan returns []."""
 
     async def test_empty_scan_returns_empty_list(self):
-        from unittest.mock import AsyncMock, MagicMock  # noqa: PLC0415
+        from unittest.mock import AsyncMock, MagicMock
 
         memory = MagicMock()
         memory.mem0 = MagicMock()
@@ -763,7 +804,7 @@ class TestFetchToSweepPlanIntegration:
     sweep a silent no-op in production."""
 
     async def test_fetched_records_cluster_and_report(self):
-        from unittest.mock import AsyncMock, MagicMock  # noqa: PLC0415
+        from unittest.mock import AsyncMock, MagicMock
 
         # scroll_by_metadata-shaped raw records: category lives inside the
         # payload ('metadata'), NOT at the top level — the shape the real
@@ -796,7 +837,7 @@ class TestFetchToSweepPlanIntegration:
         assert set(plan['delete_candidates']) == {'m2', 'm3'}
 
     async def test_fetched_unextractable_content_not_deleted(self):
-        from unittest.mock import AsyncMock, MagicMock  # noqa: PLC0415
+        from unittest.mock import AsyncMock, MagicMock
 
         # Two records whose content cannot be extracted degrade to '' and must
         # not cluster with each other (or be marked for deletion).
@@ -830,7 +871,7 @@ class TestApplyDeletionsDryRun:
     """dry_run=True performs no delete_memory calls and returns zero counts."""
 
     async def test_dry_run_no_calls_zero_counts(self):
-        from unittest.mock import AsyncMock, MagicMock  # noqa: PLC0415
+        from unittest.mock import AsyncMock, MagicMock
 
         memory = MagicMock()
         memory.delete_memory = AsyncMock(return_value={'status': 'deleted'})
@@ -847,7 +888,7 @@ class TestApplyDeletionsApply:
     """dry_run=False deletes each candidate once with the expected kwargs."""
 
     async def test_delete_memory_called_once_per_candidate(self):
-        from unittest.mock import AsyncMock, MagicMock  # noqa: PLC0415
+        from unittest.mock import AsyncMock, MagicMock
 
         memory = MagicMock()
         memory.delete_memory = AsyncMock(return_value={'status': 'deleted'})
@@ -859,7 +900,7 @@ class TestApplyDeletionsApply:
         assert result == {'deleted': 3, 'delete_errors': 0}
 
     async def test_delete_memory_called_with_expected_kwargs(self):
-        from unittest.mock import AsyncMock, MagicMock  # noqa: PLC0415
+        from unittest.mock import AsyncMock, MagicMock
 
         memory = MagicMock()
         memory.delete_memory = AsyncMock(return_value={'status': 'deleted'})
@@ -877,7 +918,7 @@ class TestApplyDeletionsPartialFailure:
     """A raising delete_memory call does not abort the remaining deletes."""
 
     async def test_partial_failure_counted_others_proceed(self):
-        from unittest.mock import AsyncMock, MagicMock  # noqa: PLC0415
+        from unittest.mock import AsyncMock, MagicMock
 
         async def _side_effect(memory_id, **kwargs):
             if memory_id == 'bad':
@@ -1080,6 +1121,124 @@ class TestAnnPairsFromNeighbors:
         assert memories == snapshot
 
 
+class TestAnnPairsPerCategoryThreshold:
+    """A hit is gated by the cutoff measured for ITS OWN category (task 3357).
+
+    ``resolve_ann_threshold`` now hands back ``{category: cutoff}``, because
+    one pooled cutoff derived on a corpus that is overwhelmingly
+    procedural_knowledge is not evidence for the other two categories. The
+    Qdrant push-down stays a scalar MIN so no candidate any category wants is
+    lost at the DB layer; THIS pure function does the authoritative filtering,
+    which is what makes the decision unit-testable without a live Qdrant.
+    """
+
+    def _memories(self, categories: list[str]) -> list[dict]:
+        out = []
+        for i, category in enumerate(categories):
+            m = _memory(f'm{i}', f'content {i}', category=category)
+            m['vector'] = [0.1 * i, 0.2]
+            out.append(m)
+        return out
+
+    def test_same_score_is_kept_under_a_loose_cutoff_and_dropped_under_a_tight_one(self):
+        """One score, two categories, two verdicts — the whole point.
+
+        0.89 is a real paraphrase pair in a category cut at 0.85 and mere
+        formulaic similarity in one cut at 0.95. A single pooled number
+        cannot express both.
+        """
+        memories = self._memories([_PK, _PK, _OS, _OS])
+        neighbors = {'m0': [_hit('m1', 0.89)], 'm2': [_hit('m3', 0.89)]}
+
+        pairs, disclosure = ann_pairs_from_neighbors(
+            memories, neighbors, {_PK: 0.85, _OS: 0.95},
+        )
+
+        assert pairs == [(0, 1)], 'the tightly-cut category must form no pair'
+        assert disclosure['below_threshold_dropped'] == 1
+
+    def test_category_absent_from_the_mapping_contributes_no_pairs(self):
+        """An UNCALIBRATED category is disabled, not silently cut at zero."""
+        memories = self._memories([_PK, _PK, _OS, _OS])
+        neighbors = {'m0': [_hit('m1', 0.99)], 'm2': [_hit('m3', 0.99)]}
+
+        pairs, disclosure = ann_pairs_from_neighbors(memories, neighbors, {_PK: 0.85})
+
+        assert pairs == [(0, 1)]
+        assert disclosure['uncalibrated_category_dropped'] == 1
+        assert disclosure['below_threshold_dropped'] == 0, (
+            'a hit in a disabled category was never eligible — counting it as '
+            'threshold attrition would misreport WHY the recall was lost'
+        )
+
+    def test_record_with_no_category_is_disabled_not_defaulted(self):
+        memories = self._memories([_PK, _PK])
+        memories[0]['category'] = None
+        neighbors = {'m0': [_hit('m1', 0.99)]}
+
+        pairs, disclosure = ann_pairs_from_neighbors(memories, neighbors, {_PK: 0.85})
+
+        assert pairs == []
+        assert disclosure['uncalibrated_category_dropped'] == 1
+
+    def test_below_the_categorys_own_cutoff_is_still_threshold_attrition(self):
+        memories = self._memories([_OS, _OS])
+        neighbors = {'m0': [_hit('m1', 0.90)]}
+
+        pairs, disclosure = ann_pairs_from_neighbors(memories, neighbors, {_OS: 0.95})
+
+        assert pairs == []
+        assert disclosure['below_threshold_dropped'] == 1
+        assert disclosure['uncalibrated_category_dropped'] == 0
+
+    def test_a_zero_cutoff_in_the_mapping_is_honoured_not_read_as_absent(self):
+        """0.0 is a MEASURED cutoff; absence is the only spelling of absent.
+
+        A `if not cutoff` screen instead of `if cutoff is None` would silently
+        disable a category the calibration actually measured, and count its
+        hits as uncalibrated — a wrong reason for a wrong outcome.
+        """
+        memories = self._memories([_PK, _PK])
+        neighbors = {'m0': [_hit('m1', 0.0)]}
+
+        pairs, disclosure = ann_pairs_from_neighbors(memories, neighbors, {_PK: 0.0})
+
+        assert pairs == [(0, 1)], 'a hit exactly at the cutoff is INCLUSIVE'
+        assert disclosure['uncalibrated_category_dropped'] == 0, (
+            'a measured 0.0 must not read as "this category has no cutoff"'
+        )
+        assert disclosure['below_threshold_dropped'] == 0
+
+    def test_scalar_threshold_behaves_exactly_as_before(self):
+        """Every pre-3357 caller and test keeps its meaning."""
+        memories = self._memories([_PK, _PK, _OS, _OS])
+        neighbors = {'m0': [_hit('m1', 0.89)], 'm2': [_hit('m3', 0.89)]}
+
+        pairs, disclosure = ann_pairs_from_neighbors(memories, neighbors, 0.85)
+
+        assert pairs == [(0, 1), (2, 3)], 'a scalar cutoff gates every category'
+        assert disclosure['uncalibrated_category_dropped'] == 0
+
+    def test_new_counter_is_always_present_and_zero_filled(self):
+        """A missing key is indistinguishable from "not measured"."""
+        pairs, disclosure = ann_pairs_from_neighbors([], {}, threshold=0.9)
+        assert pairs == []
+        assert set(disclosure) == set(_ANN_DISCLOSURE_KEYS)
+        assert 'uncalibrated_category_dropped' in _ANN_DISCLOSURE_KEYS
+        assert all(v == 0 for v in disclosure.values())
+
+    def test_remains_pure(self):
+        """No I/O, no mutation — the per-category decision stays testable."""
+        memories = self._memories([_PK, _OS])
+        snapshot = [dict(m) for m in memories]
+        mapping = {_PK: 0.85}
+
+        ann_pairs_from_neighbors(memories, {'m0': [_hit('m1', 0.99)]}, mapping)
+
+        assert memories == snapshot
+        assert mapping == {_PK: 0.85}, 'the cutoff mapping must not be mutated'
+
+
 # ===========================================================================
 # The user-observable signal: the ANN path catches a paraphrase the lexical
 # path structurally cannot (task 3210)
@@ -1166,7 +1325,7 @@ def _calibrated_ann_threshold() -> float:
     and it is the single home for that number — the detector reads the same
     one. Re-deriving or hardcoding it here would let the two drift apart.
     """
-    import yaml  # noqa: PLC0415
+    import yaml
 
     config_path = Path(__file__).parent.parent / 'config' / 'config.yaml'
     data = yaml.safe_load(config_path.read_text())
@@ -1193,7 +1352,7 @@ class TestAnnPathCatchesParaphraseLexicalPathMisses:
         If someone edits either fixture record, this fails loudly instead of
         letting the recorded cosine silently describe different text.
         """
-        import difflib  # noqa: PLC0415
+        import difflib
 
         a, b = _load_fixture_pair()
         live_raw = difflib.SequenceMatcher(None, a['content'], b['content']).ratio()
@@ -1482,7 +1641,7 @@ _OS = 'observations_and_summaries'
 
 def _scroll_mock(by_category: dict[str, list[dict]]):
     """AsyncMock scroll_by_metadata dispatching on the filter's category."""
-    from unittest.mock import AsyncMock  # noqa: PLC0415
+    from unittest.mock import AsyncMock
 
     async def _scroll(scope, filters, limit=1000, **kwargs):
         return list(by_category.get(filters.get('category'), []))
@@ -1500,7 +1659,7 @@ class TestFetchMemoriesAllCategories:
     """
 
     async def test_one_scroll_per_category_with_vectors_forwarded(self):
-        from unittest.mock import MagicMock  # noqa: PLC0415
+        from unittest.mock import MagicMock
 
         memory = MagicMock()
         memory.mem0 = MagicMock()
@@ -1521,7 +1680,7 @@ class TestFetchMemoriesAllCategories:
         assert seen == [_PK, _PN, _OS]
 
     async def test_default_categories_are_the_three_mem0_categories(self):
-        from unittest.mock import MagicMock  # noqa: PLC0415
+        from unittest.mock import MagicMock
 
         memory = MagicMock()
         memory.mem0 = MagicMock()
@@ -1536,7 +1695,7 @@ class TestFetchMemoriesAllCategories:
         assert set(_ALL_CATEGORIES) == {_PK, _PN, _OS}
 
     async def test_merges_records_and_lifts_category_and_vector(self):
-        from unittest.mock import MagicMock  # noqa: PLC0415
+        from unittest.mock import MagicMock
 
         memory = MagicMock()
         memory.mem0 = MagicMock()
@@ -1564,7 +1723,7 @@ class TestFetchMemoriesAllCategories:
 
     async def test_per_category_truncation_is_counted_separately(self):
         """A cap firing on ONE category must not be reported as a clean scan."""
-        from unittest.mock import MagicMock  # noqa: PLC0415
+        from unittest.mock import MagicMock
 
         memory = MagicMock()
         memory.mem0 = MagicMock()
@@ -1585,7 +1744,7 @@ class TestFetchMemoriesAllCategories:
 
     async def test_fetch_procedural_memories_alias_still_single_category(self):
         """The 3136-scheduled path keeps working byte-for-byte."""
-        from unittest.mock import MagicMock  # noqa: PLC0415
+        from unittest.mock import MagicMock
 
         memory = MagicMock()
         memory.mem0 = MagicMock()
@@ -1855,23 +2014,27 @@ class TestBuildSweepPlanTopicCarveout:
         assert set(carved['member_ids']) == {'m1', 'm2'}
         assert carved['topic'] == 'venv'
 
-    def test_differing_topics_still_yield_delete_candidates(self):
+    def test_differing_topics_are_reported_but_no_member_is_deletable(self):
         memories = [
             _topic_memory('m1', _VENV_GOTCHA_A, 'venv'),
             _topic_memory('m2', _VENV_GOTCHA_B, 'rustfmt'),
         ]
         plan = build_sweep_plan(memories, threshold=_THRESHOLD)
         assert plan['clusters_total'] == 1
-        assert len(plan['delete_candidates']) == 1
+        (group,) = plan['near_duplicate_groups']
+        assert set(group['member_ids']) == {'m1', 'm2'}
+        assert plan['delete_candidates'] == []
+        assert group['survivor_id'] == 'm1'
+        assert group['retained_members'] == [{'id': 'm2', 'reason': 'topic_stamped'}]
         assert plan['topic_carveout_clusters'] == 0
 
-    def test_partially_missing_topic_still_yields_delete_candidates(self):
+    def test_partially_missing_topic_makes_only_the_unstamped_member_deletable(self):
         memories = [
             _topic_memory('m1', _VENV_GOTCHA_A, 'venv'),
             _topic_memory('m2', _VENV_GOTCHA_B, None),
         ]
         plan = build_sweep_plan(memories, threshold=_THRESHOLD)
-        assert len(plan['delete_candidates']) == 1
+        assert plan['delete_candidates'] == ['m2']
         assert plan['topic_carveout_clusters'] == 0
 
     def test_carveout_applies_to_all_three_categories(self):
@@ -1976,6 +2139,99 @@ class TestRestrictDeleteCandidatesForApply:
 
     def test_empty_input(self):
         assert restrict_delete_candidates_for_apply([]) == ([], [])
+
+
+class TestApplyGateUnevidencedCategory:
+    """A category gated by a cutoff measured elsewhere may not DELETE (3357).
+
+    This closes the harm the task names: `--apply` deleting
+    observations_and_summaries records that are formulaically similar but
+    semantically distinct. Their cluster is still REPORTED — the dry-run
+    report is the right place for a lower-confidence signal — but the
+    irreversible path narrows to categories whose cutoff is evidenced on
+    their own labeled pairs.
+    """
+
+    def test_an_ann_clique_in_an_unevidenced_category_is_withheld(self):
+        groups = [_grp(['a', 'b'], ['b'], ann_clique=True, category=_OS)]
+
+        actionable, withheld = restrict_delete_candidates_for_apply(
+            groups, unevidenced_categories={_OS},
+        )
+
+        assert actionable == [], (
+            'a clique proves the pairs cleared A cutoff — not that the cutoff '
+            'was ever measured for THIS category'
+        )
+        assert len(withheld) == 1
+        assert withheld[0]['reason'] == 'ann_cutoff_not_evidenced_for_category'
+        assert withheld[0]['withheld_ids'] == ['b']
+        assert withheld[0]['category'] == _OS
+        assert withheld[0]['member_ids'] == ['a', 'b']
+
+    def test_an_ann_clique_in_a_calibrated_category_is_still_actionable(self):
+        """No regression to task 3210's coverage where evidence exists."""
+        groups = [_grp(['a', 'b'], ['b'], ann_clique=True, category=_PK)]
+
+        actionable, withheld = restrict_delete_candidates_for_apply(
+            groups, unevidenced_categories={_OS},
+        )
+
+        assert actionable == ['b']
+        assert withheld == []
+
+    def test_a_lexically_spanning_cluster_is_actionable_regardless(self):
+        """Lexical evidence never depended on the ANN cutoff at all."""
+        groups = [_grp(['a', 'b'], ['b'], lexical_spanning=True, category=_OS)]
+
+        actionable, withheld = restrict_delete_candidates_for_apply(
+            groups, unevidenced_categories={_OS},
+        )
+
+        assert actionable == ['b']
+        assert withheld == []
+
+    def test_an_ann_chain_in_an_unevidenced_category_reports_the_chain_reason(self):
+        """The pre-existing, stricter refusal still wins — it is not masked."""
+        groups = [_grp(['a', 'b', 'c'], ['b', 'c'], category=_OS)]
+
+        _actionable, withheld = restrict_delete_candidates_for_apply(
+            groups, unevidenced_categories={_OS},
+        )
+
+        assert withheld[0]['reason'] == (
+            'ann_chained_without_lexical_span_or_ann_clique'
+        )
+
+    def test_default_is_no_unevidenced_category(self):
+        """Every pre-3357 caller keeps its exact behaviour."""
+        groups = [_grp(['a', 'b'], ['b'], ann_clique=True, category=_OS)]
+        assert restrict_delete_candidates_for_apply(groups) == (['b'], [])
+
+    def test_the_report_still_lists_every_cluster(self):
+        """Only the irreversible path narrows; detection coverage is unchanged."""
+        memories = [
+            _memory('m1', 'alpha one', created_at='2026-01-01T00:00:00+00:00',
+                    category=_OS),
+            _memory('m2', 'beta two', created_at='2026-01-02T00:00:00+00:00',
+                    category=_OS),
+        ]
+
+        plan = build_sweep_plan(
+            memories, threshold=0.99, categories=(_OS,),
+            ann_pairs=[(0, 1)], ann_scores={(0, 1): 0.95}, ann_threshold=0.9,
+            ann_threshold_by_category={_OS: 0.9},
+            unevidenced_categories={_OS},
+        )
+
+        assert plan['clusters_total'] == 1
+        assert plan['delete_candidates'] == ['m2'], (
+            'the dry-run report still shows what the detectors found'
+        )
+        assert plan['apply_delete_candidates'] == [], 'but --apply may not act'
+        assert plan['apply_withheld_groups'][0]['reason'] == (
+            'ann_cutoff_not_evidenced_for_category'
+        )
 
 
 class TestBuildSweepPlanApplyGateFlags:
@@ -2086,7 +2342,7 @@ class TestLexicalMaxRatioReuseAndBound:
 
     def test_reported_ratio_matches_an_exhaustive_recomputation(self):
         """The prefilter + seeded maximum must not change the answer."""
-        import difflib  # noqa: PLC0415
+        import difflib
 
         memories = [
             _memory('m1', _VENV_GOTCHA_A, created_at='2026-01-01T00:00:00+00:00'),
@@ -2153,75 +2409,384 @@ class TestLexicalMaxRatioReuseAndBound:
 # Calibrated ANN threshold resolution + the Qdrant query shape (task 3210)
 # ===========================================================================
 
-def _config_double(t_high):
-    """MemoryService double whose config carries a write_triage.t_high."""
-    from unittest.mock import MagicMock  # noqa: PLC0415
+_UNSET = object()
+
+_SWEPT_CATEGORIES = (
+    'procedural_knowledge',
+    'observations_and_summaries',
+    'preferences_and_norms',
+)
+
+
+def _config_double(t_high, t_high_by_category=_UNSET):
+    """MemoryService double whose config carries the write_triage cutoffs.
+
+    ``t_high_by_category`` is left UNSET by default on purpose: an unspecced
+    MagicMock auto-generates a child Mock for that attribute, which is exactly
+    the junk leaf the resolver's isinstance guard has to reject. Every test
+    that does not name a map therefore also exercises that rejection.
+    """
+    from unittest.mock import MagicMock
 
     service = MagicMock()
     service.config.write_triage.t_high = t_high
+    if t_high_by_category is not _UNSET:
+        service.config.write_triage.t_high_by_category = t_high_by_category
     return service
 
 
 class TestResolveAnnThreshold:
     """The cutoff is READ from the committed calibration output, never invented.
 
-    config.write_triage.t_high is a derived order statistic of a measured
-    similarity distribution (provenance: the calibration report). This script
-    must not carry its own copy or its own fallback — an uncalibrated
-    stand-in would be exactly the invented threshold G6 forbids.
+    ``config.write_triage.t_high`` and ``t_high_by_category`` are derived order
+    statistics of measured similarity distributions (provenance: the
+    calibration report). This script must not carry its own copy or its own
+    fallback — an uncalibrated stand-in would be exactly the invented
+    threshold G6 forbids.
+
+    Task 3357 makes the resolution PER CATEGORY, in strict priority:
+    ``--ann-threshold`` override → ``t_high_by_category[cat]`` → the pooled
+    ``t_high`` as a DISCLOSED fallback → absent (that category disabled).
     """
 
-    def test_reads_t_high_from_config(self):
+    def test_reads_t_high_from_config_for_every_category(self):
         """Point the config at a distinctive value and get that value back.
 
         Asserting a DISTINCT value (not the real 0.8868...) is the point: it
         proves the number came from config rather than from a literal that
-        happens to match.
+        happens to match. With no per-category map, every swept category runs
+        on the POOLED number — which is the status quo this task exists to
+        make visible, so it is counted rather than assumed.
         """
-        resolved, disclosure = resolve_ann_threshold(_config_double(0.4242424242))
-        assert resolved == 0.4242424242
+        resolved, disclosure = resolve_ann_threshold(
+            _config_double(0.4242424242, None), categories=_SWEPT_CATEGORIES,
+        )
+        assert resolved == dict.fromkeys(_SWEPT_CATEGORIES, 0.4242424242)
+        assert disclosure['ann_disabled_uncalibrated'] == 0
+        assert disclosure['ann_pooled_fallback_categories'] == 3, (
+            'a category running on a cutoff measured elsewhere must be a '
+            'counted number, not an invisible assumption'
+        )
+
+    def test_per_category_cutoff_wins_over_pooled(self):
+        """A calibrated category uses ITS number; the rest fall back, counted."""
+        resolved, disclosure = resolve_ann_threshold(
+            _config_double(
+                0.4242424242, {'observations_and_summaries': 0.9393939393},
+            ),
+            categories=_SWEPT_CATEGORIES,
+        )
+        assert resolved['observations_and_summaries'] == 0.9393939393
+        assert resolved['procedural_knowledge'] == 0.4242424242
+        assert resolved['preferences_and_norms'] == 0.4242424242
+        assert disclosure['ann_pooled_fallback_categories'] == 2
         assert disclosure['ann_disabled_uncalibrated'] == 0
 
-    def test_explicit_override_wins(self):
-        resolved, _ = resolve_ann_threshold(_config_double(0.4242424242), override=0.77)
-        assert resolved == 0.77
+    def test_override_wins_for_every_category(self):
+        """The operator override outranks even a populated per-category map."""
+        resolved, disclosure = resolve_ann_threshold(
+            _config_double(
+                0.4242424242, {'observations_and_summaries': 0.9393939393},
+            ),
+            override=0.77,
+            categories=_SWEPT_CATEGORIES,
+        )
+        assert resolved == dict.fromkeys(_SWEPT_CATEGORIES, 0.77)
+        assert disclosure['ann_disabled_uncalibrated'] == 0
+        assert disclosure['ann_pooled_fallback_categories'] == 0, (
+            'an explicit operator number is not a pooled fallback'
+        )
 
     def test_override_wins_even_when_uncalibrated(self):
         """An operator override rescues an uncalibrated deployment."""
-        resolved, disclosure = resolve_ann_threshold(_config_double(None), override=0.77)
-        assert resolved == 0.77
+        resolved, disclosure = resolve_ann_threshold(
+            _config_double(None, None), override=0.77,
+            categories=_SWEPT_CATEGORIES,
+        )
+        assert resolved == dict.fromkeys(_SWEPT_CATEGORIES, 0.77)
         assert disclosure['ann_disabled_uncalibrated'] == 0
 
     def test_uncalibrated_disables_ann_and_counts_it(self, caplog):
-        """No t_high and no override: DISABLE the path, log ERROR, count it.
+        """No cutoff anywhere and no override: DISABLE, log ERROR, count it.
 
         Never substitute a plausible-looking number — a wrong cutoff would
         silently mis-cluster the corpus, and under --apply that means wrong
         deletions. Disabled-and-counted is the loud degradation.
         """
-        import logging  # noqa: PLC0415
+        import logging
 
         with caplog.at_level(logging.ERROR, logger='audit_duplicate_memories'):
-            resolved, disclosure = resolve_ann_threshold(_config_double(None))
+            resolved, disclosure = resolve_ann_threshold(
+                _config_double(None, None), categories=_SWEPT_CATEGORIES,
+            )
 
-        assert resolved is None, 'must not fabricate a threshold'
-        assert disclosure['ann_disabled_uncalibrated'] == 1
+        assert resolved == {}, (
+            'must not fabricate a threshold; an empty mapping is how the '
+            'caller detects "disable the whole ANN path"'
+        )
+        assert disclosure['ann_disabled_uncalibrated'] == 3
         assert any(r.levelno >= logging.ERROR for r in caplog.records), (
             'an uncalibrated ANN path must be loud, not silent'
+        )
+
+    def test_the_swept_categories_are_the_default(self):
+        """An omitting caller must sweep every category, never none.
+
+        An empty DEFAULT would return ({}, {both counters: 0}) — the ANN path
+        fully disabled, with a zeroed disclosure and no ERROR, which is the
+        silently missing detector this module forbids. It also has to agree
+        with build_sweep_plan's default for the same argument.
+        """
+        import inspect
+
+        service = _config_double(0.4242424242, None)
+        resolved, disclosure = resolve_ann_threshold(service)
+
+        assert set(resolved) == set(_ALL_CATEGORIES), (
+            'omitting `categories` must resolve for the whole sweep'
+        )
+        assert disclosure['ann_pooled_fallback_categories'] == len(_ALL_CATEGORIES)
+        assert (
+            inspect.signature(resolve_ann_threshold).parameters['categories'].default
+            is inspect.signature(build_sweep_plan).parameters['categories'].default
+        ), 'the two defaults must not drift apart'
+
+    def test_an_explicitly_empty_sweep_still_resolves_nothing(self):
+        """Asking for nothing is a caller's choice; defaulting to it was not."""
+        resolved, disclosure = resolve_ann_threshold(
+            _config_double(0.4242424242, None), categories=(),
+        )
+        assert resolved == {}
+        assert disclosure == {
+            'ann_disabled_uncalibrated': 0, 'ann_pooled_fallback_categories': 0,
+        }
+
+    def test_category_with_no_cutoff_is_absent_not_guessed(self, caplog):
+        """A partially-calibrated config disables ONLY the uncovered category.
+
+        The pooled t_high is absent here, so the one category with its own
+        measured cutoff still runs and the other is simply not in the mapping
+        — never a guessed stand-in, and never silently blended in.
+        """
+        import logging
+
+        with caplog.at_level(logging.ERROR, logger='audit_duplicate_memories'):
+            resolved, disclosure = resolve_ann_threshold(
+                _config_double(None, {'procedural_knowledge': 0.8888}),
+                categories=('procedural_knowledge', 'observations_and_summaries'),
+            )
+
+        assert resolved == {'procedural_knowledge': 0.8888}
+        assert 'observations_and_summaries' not in resolved
+        assert disclosure['ann_disabled_uncalibrated'] == 1
+        assert disclosure['ann_pooled_fallback_categories'] == 0
+        errors = ' '.join(
+            r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR
+        )
+        assert 'observations_and_summaries' in errors, (
+            'a disabled category must be named, not just tallied — the same '
+            'contract the pooled fallback already keeps'
+        )
+        assert 'procedural_knowledge' not in errors, (
+            'a category with its own measured cutoff is not disabled'
+        )
+
+    def test_pooled_fallback_is_warned_by_name(self, caplog):
+        """The weaker evidence is named in the log, not just tallied."""
+        import logging
+
+        with caplog.at_level(logging.WARNING, logger='audit_duplicate_memories'):
+            resolve_ann_threshold(
+                _config_double(0.42, {'procedural_knowledge': 0.88}),
+                categories=_SWEPT_CATEGORIES,
+            )
+
+        warned = ' '.join(
+            r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING
+        )
+        assert 'observations_and_summaries' in warned
+        assert 'preferences_and_norms' in warned
+        assert 'procedural_knowledge' not in warned, (
+            'a category with its own measured cutoff is not a fallback'
         )
 
     def test_non_numeric_t_high_is_treated_as_uncalibrated(self):
         """A Mock/str/bool leaf must not be accepted as a threshold."""
         for bad in ('0.9', True, object()):
-            resolved, disclosure = resolve_ann_threshold(_config_double(bad))
-            assert resolved is None, f'{bad!r} must not resolve as a threshold'
-            assert disclosure['ann_disabled_uncalibrated'] == 1
+            resolved, disclosure = resolve_ann_threshold(
+                _config_double(bad, None), categories=_SWEPT_CATEGORIES,
+            )
+            assert resolved == {}, f'{bad!r} must not resolve as a threshold'
+            assert disclosure['ann_disabled_uncalibrated'] == 3
+
+    def test_non_numeric_map_values_are_rejected(self):
+        """The isinstance guard applies to map VALUES, not just the pooled leaf.
+
+        A junk per-category value must not gate a sweep; the category falls
+        through to the pooled fallback exactly as if it were absent.
+        """
+        for bad in ('0.9', True, object(), None):
+            resolved, disclosure = resolve_ann_threshold(
+                _config_double(0.4242424242, {'procedural_knowledge': bad}),
+                categories=('procedural_knowledge',),
+            )
+            assert resolved == {'procedural_knowledge': 0.4242424242}, (
+                f'{bad!r} must not resolve as a per-category threshold'
+            )
+            assert disclosure['ann_pooled_fallback_categories'] == 1
+
+    def test_unspecced_mock_map_is_rejected(self):
+        """An auto-generated Mock attribute is not a calibration map."""
+        resolved, disclosure = resolve_ann_threshold(
+            _config_double(0.4242424242), categories=('procedural_knowledge',),
+        )
+        assert resolved == {'procedural_knowledge': 0.4242424242}
+        assert disclosure['ann_pooled_fallback_categories'] == 1
+
+    def test_non_mapping_map_is_survived(self):
+        """A scalar where a map belongs degrades to pooled, it does not raise."""
+        resolved, _ = resolve_ann_threshold(
+            _config_double(0.4242424242, 0.99), categories=('procedural_knowledge',),
+        )
+        assert resolved == {'procedural_knowledge': 0.4242424242}
 
     def test_missing_config_hops_are_survived(self):
         """A config without write_triage at all degrades, it does not raise."""
-        resolved, disclosure = resolve_ann_threshold(object())
-        assert resolved is None
-        assert disclosure['ann_disabled_uncalibrated'] == 1
+        resolved, disclosure = resolve_ann_threshold(
+            object(), categories=_SWEPT_CATEGORIES,
+        )
+        assert resolved == {}
+        assert disclosure['ann_disabled_uncalibrated'] == 3
+
+    def test_both_disclosure_keys_are_always_present(self):
+        """Neither counter may be missing — absent reads as "not measured"."""
+        cases = (
+            (_config_double(0.42, None), None),
+            (_config_double(0.42, {'procedural_knowledge': 0.9}), None),
+            (_config_double(None, None), None),
+            (_config_double(None, None), 0.77),
+            (object(), None),
+        )
+        for service, override in cases:
+            _resolved, disclosure = resolve_ann_threshold(
+                service, override, categories=_SWEPT_CATEGORIES,
+            )
+            assert disclosure.keys() >= {
+                'ann_disabled_uncalibrated', 'ann_pooled_fallback_categories',
+            }
+            assert all(isinstance(v, int) for v in disclosure.values())
+
+
+class TestCategoriesWithoutOwnCutoff:
+    """An operator ``--ann-threshold`` is a RECALL KNOB, never evidence.
+
+    ``resolve_ann_threshold``'s priority-1 branch applies one operator number
+    to EVERY category, so under an override no category is gated by a cutoff
+    measured on its own labeled pairs — including a category that has one in
+    ``t_high_by_category``, whose measured number the override displaced. The
+    two consumers of ``_write_triage_cutoffs`` must agree about what actually
+    gated the sweep, so the evidence predicate has to see the override too.
+    """
+
+    def test_an_override_leaves_every_category_unevidenced(self):
+        """Even a category with its own measured cutoff: the override displaced it."""
+        unevidenced = categories_without_own_cutoff(
+            _config_double(0.42, {_PK: 0.9, _OS: 0.88}),
+            _SWEPT_CATEGORIES,
+            override=0.5,
+        )
+
+        assert unevidenced == frozenset(_SWEPT_CATEGORIES), (
+            'an operator number is weaker evidence than the pooled cutoff, '
+            'which is already fenced — nothing it gates may be deleted'
+        )
+
+    def test_the_predicate_agrees_with_what_actually_gated_the_sweep(self):
+        """The two readers of the same config must not tell different stories."""
+        service = _config_double(0.42, {_PK: 0.9})
+        override = 0.5
+
+        resolved, _disclosure = resolve_ann_threshold(
+            service, override, categories=_SWEPT_CATEGORIES,
+        )
+        unevidenced = categories_without_own_cutoff(
+            service, _SWEPT_CATEGORIES, override=override,
+        )
+
+        assert resolved == dict.fromkeys(_SWEPT_CATEGORIES, 0.5)
+        assert unevidenced == frozenset(resolved), (
+            'every category the override gated is a category no calibration '
+            'measured — the gate and the predicate read one config'
+        )
+
+    def test_a_non_override_leaves_the_config_only_behaviour_intact(self):
+        """None/bool/Mock is not an override there, so it must not fence here.
+
+        ``resolve_ann_threshold`` screens the override through
+        ``_calibrated_float``; a value that fails that screen falls through to
+        the config. Widening this predicate to a bare ``is not None`` would
+        fence every category on a value that never gated anything.
+        """
+        from unittest.mock import MagicMock
+
+        for not_an_override in (None, True, False, MagicMock().unspecced_attr):
+            unevidenced = categories_without_own_cutoff(
+                _config_double(0.42, {_PK: 0.9}),
+                _SWEPT_CATEGORIES,
+                override=not_an_override,
+            )
+
+            assert unevidenced == frozenset({_OS, _PN}), (
+                f'{not_an_override!r} is not an override for the resolver, so '
+                f'it must not be one for the predicate either'
+            )
+
+    def test_the_default_is_still_config_only(self):
+        """Called without an override, the pre-existing behaviour is unchanged."""
+        assert categories_without_own_cutoff(
+            _config_double(0.42, {_PK: 0.9}), _SWEPT_CATEGORIES,
+        ) == frozenset({_OS, _PN})
+
+    def test_a_junk_map_value_is_unevidenced_exactly_as_the_resolver_reads_it(self):
+        """The `_calibrated_float` screen must apply to map VALUES here too.
+
+        The resolver already refuses a bool / string / Mock leaf and falls the
+        category back to the pooled cutoff. If this predicate accepted the
+        same junk as a cutoff, the category would be gated by the pooled
+        number yet REPORTED as evidenced — and therefore eligible for --apply
+        deletion. That is the two readers of one config disagreeing, which is
+        the whole reason `_write_triage_cutoffs` is a single function.
+        """
+        from unittest.mock import MagicMock
+
+        for junk in ('0.9', True, False, object(), None, MagicMock().unspecced_attr):
+            service = _config_double(0.42, {_PK: junk})
+
+            unevidenced = categories_without_own_cutoff(service, _SWEPT_CATEGORIES)
+            resolved, disclosure = resolve_ann_threshold(
+                service, categories=_SWEPT_CATEGORIES,
+            )
+
+            assert unevidenced == frozenset(_SWEPT_CATEGORIES), (
+                f'{junk!r} is not a measured cutoff, so {_PK} is un-evidenced'
+            )
+            assert resolved[_PK] == 0.42 and disclosure[
+                'ann_pooled_fallback_categories'
+            ] == 3, f'{junk!r}: the resolver must agree it fell back'
+
+    def test_a_measured_zero_cutoff_is_evidence_like_any_other_number(self):
+        """0.0 is a number the calibration could derive, not a missing one.
+
+        A `not cutoff` screen anywhere in this pair would read it as absent
+        and fence a category that actually has its own measurement.
+        """
+        service = _config_double(0.42, {_PK: 0.0})
+
+        assert categories_without_own_cutoff(service, _SWEPT_CATEGORIES) == frozenset(
+            {_OS, _PN},
+        )
+        resolved, _ = resolve_ann_threshold(service, categories=_SWEPT_CATEGORIES)
+        assert resolved[_PK] == 0.0
 
 
 @pytest.mark.asyncio
@@ -2229,7 +2794,7 @@ class TestFetchAnnNeighbors:
     """query_points once per record, using the record's OWN stored vector."""
 
     def _memory_service(self, query_points):
-        from unittest.mock import AsyncMock, MagicMock  # noqa: PLC0415
+        from unittest.mock import AsyncMock, MagicMock
 
         client = MagicMock()
         client.query_points = query_points
@@ -2239,7 +2804,7 @@ class TestFetchAnnNeighbors:
         return service, client
 
     def _points(self, hits):
-        from unittest.mock import MagicMock  # noqa: PLC0415
+        from unittest.mock import MagicMock
 
         result = MagicMock()
         result.points = [
@@ -2248,7 +2813,7 @@ class TestFetchAnnNeighbors:
         return result
 
     async def test_queries_once_per_record_with_its_own_vector(self):
-        from unittest.mock import AsyncMock  # noqa: PLC0415
+        from unittest.mock import AsyncMock
 
         query_points = AsyncMock(return_value=self._points([]))
         service, _client = self._memory_service(query_points)
@@ -2273,7 +2838,7 @@ class TestFetchAnnNeighbors:
         assert first['with_payload'] is False
 
     async def test_self_hit_is_dropped(self):
-        from unittest.mock import AsyncMock  # noqa: PLC0415
+        from unittest.mock import AsyncMock
 
         query_points = AsyncMock(return_value=self._points([('a', 1.0), ('b', 0.93)]))
         service, _client = self._memory_service(query_points)
@@ -2286,7 +2851,7 @@ class TestFetchAnnNeighbors:
         assert neighbors['a'] == [{'id': 'b', 'score': 0.93}]
 
     async def test_vectorless_record_is_not_queried(self):
-        from unittest.mock import AsyncMock  # noqa: PLC0415
+        from unittest.mock import AsyncMock
 
         query_points = AsyncMock(return_value=self._points([]))
         service, _client = self._memory_service(query_points)
@@ -2300,7 +2865,7 @@ class TestFetchAnnNeighbors:
 
     async def test_per_record_failure_is_counted_and_does_not_abort(self):
         """One bad record must not lose the whole sweep."""
-        from unittest.mock import AsyncMock  # noqa: PLC0415
+        from unittest.mock import AsyncMock
 
         async def _side_effect(**kwargs):
             if kwargs['query'] == [0.1]:
@@ -2320,7 +2885,7 @@ class TestFetchAnnNeighbors:
         assert neighbors['b'] == [{'id': 'c', 'score': 0.95}], 'the sweep continued'
 
     async def test_empty_records_makes_no_queries(self):
-        from unittest.mock import AsyncMock  # noqa: PLC0415
+        from unittest.mock import AsyncMock
 
         query_points = AsyncMock(return_value=self._points([]))
         service, _client = self._memory_service(query_points)
@@ -2346,7 +2911,7 @@ class TestFetchAnnNeighborsCategoryFilter:
     """
 
     def _service(self, query_points):
-        from unittest.mock import AsyncMock, MagicMock  # noqa: PLC0415
+        from unittest.mock import AsyncMock, MagicMock
 
         client = MagicMock()
         client.query_points = query_points
@@ -2359,9 +2924,9 @@ class TestFetchAnnNeighborsCategoryFilter:
         return types.SimpleNamespace(points=[])
 
     async def test_the_records_category_becomes_a_payload_equality_filter(self):
-        from unittest.mock import AsyncMock  # noqa: PLC0415
+        from unittest.mock import AsyncMock
 
-        from qdrant_client.http import models as qmodels  # noqa: PLC0415
+        from qdrant_client.http import models as qmodels
 
         query_points = AsyncMock(return_value=self._empty())
         records = [{'id': 'a', 'vector': [0.1], 'category': _PK}]
@@ -2378,7 +2943,7 @@ class TestFetchAnnNeighborsCategoryFilter:
         ), 'same Filter/FieldCondition/MatchValue shape scroll_by_metadata builds'
 
     async def test_each_record_is_filtered_to_its_own_category(self):
-        from unittest.mock import AsyncMock  # noqa: PLC0415
+        from unittest.mock import AsyncMock
 
         query_points = AsyncMock(return_value=self._empty())
         records = [
@@ -2399,7 +2964,7 @@ class TestFetchAnnNeighborsCategoryFilter:
 
     async def test_a_categoryless_record_is_queried_unfiltered(self):
         """It cannot be clustered at all, so the query shape is unchanged."""
-        from unittest.mock import AsyncMock  # noqa: PLC0415
+        from unittest.mock import AsyncMock
 
         query_points = AsyncMock(return_value=self._empty())
         records = [{'id': 'a', 'vector': [0.1]}]
@@ -2413,11 +2978,129 @@ class TestFetchAnnNeighborsCategoryFilter:
 
 
 @pytest.mark.asyncio
+class TestFetchAnnNeighborsSkipsUncalibratedCategories:
+    """A query whose every hit is pre-doomed is cost, not recall.
+
+    ``ann_pairs_from_neighbors`` discards every hit on a record whose category
+    has no cutoff. Issuing those queries at all spends a whole set of Qdrant
+    round-trips on results that can never form a pair — so they are skipped,
+    and the skip is COUNTED rather than silently absorbed.
+    """
+
+    def _service(self, query_points):
+        from unittest.mock import AsyncMock, MagicMock
+
+        client = MagicMock()
+        client.query_points = query_points
+        service = MagicMock()
+        service.config.mem0.collection_prefix = 'mem0'
+        service.mem0._get_async_qdrant = AsyncMock(return_value=client)
+        return service
+
+    def _records(self):
+        return [
+            {'id': 'a', 'vector': [0.1], 'category': _PK},
+            {'id': 'b', 'vector': [0.2], 'category': _OS},
+            {'id': 'c', 'vector': [0.3]},
+        ]
+
+    async def _fetch(self, query_points, **kwargs):
+        return await fetch_ann_neighbors(
+            self._service(query_points), 'dark_factory', self._records(),
+            top_k=5, score_threshold=0.88, **kwargs,
+        )
+
+    async def test_only_calibrated_categories_are_queried(self):
+        from unittest.mock import AsyncMock
+
+        query_points = AsyncMock(return_value=types.SimpleNamespace(points=[]))
+
+        _neighbors, disclosure = await self._fetch(
+            query_points, cutoff_by_category={_PK: 0.9},
+        )
+
+        assert query_points.await_count == 1, 'two doomed queries must not be issued'
+        assert query_points.await_args_list[0].kwargs['query'] == [0.1]
+        assert disclosure['ann_query_skipped_uncalibrated'] == 2, (
+            'the categoryless record is uncalibrated by the same rule'
+        )
+
+    async def test_the_skip_is_disclosed_and_the_counter_is_always_present(self):
+        from unittest.mock import AsyncMock
+
+        query_points = AsyncMock(return_value=types.SimpleNamespace(points=[]))
+
+        for mapping in (None, {_PK: 0.9, _OS: 0.9}, {_PK: 0.9}):
+            _neighbors, disclosure = await self._fetch(
+                query_points, cutoff_by_category=mapping,
+            )
+            assert set(disclosure) == set(_ANN_QUERY_DISCLOSURE_KEYS), (
+                'an absent counter is indistinguishable from "not measured"'
+            )
+            assert all(isinstance(v, int) for v in disclosure.values())
+
+    async def test_no_mapping_keeps_the_pre_3357_behaviour(self):
+        from unittest.mock import AsyncMock
+
+        query_points = AsyncMock(return_value=types.SimpleNamespace(points=[]))
+
+        _neighbors, disclosure = await self._fetch(query_points)
+
+        assert query_points.await_count == 3, 'every record with a vector is queried'
+        assert disclosure['ann_query_skipped_uncalibrated'] == 0
+
+    async def test_a_fully_calibrated_sweep_skips_nothing(self):
+        from unittest.mock import AsyncMock
+
+        query_points = AsyncMock(return_value=types.SimpleNamespace(points=[]))
+
+        _neighbors, disclosure = await self._fetch(
+            query_points, cutoff_by_category={_PK: 0.9, _OS: 0.9},
+        )
+
+        assert query_points.await_count == 2, 'only the categoryless record is doomed'
+        assert disclosure['ann_query_skipped_uncalibrated'] == 1
+
+    async def test_a_skipped_record_forms_no_pair_either_way(self):
+        """The optimization removes cost, never a candidate.
+
+        Whatever the skipped record would have returned, the pair filter was
+        always going to discard it — so the pairs are identical with and
+        without the skip, and only the attribution of the loss moves.
+        """
+        from unittest.mock import AsyncMock
+
+        memories = [
+            {'id': 'a', 'vector': [0.1], 'category': _PK},
+            {'id': 'b', 'vector': [0.2], 'category': _OS},
+        ]
+        cutoffs = {_PK: 0.9}
+        unqueried = AsyncMock(return_value=types.SimpleNamespace(points=[]))
+        service = self._service(unqueried)
+
+        skipped_neighbors, skip_disclosure = await fetch_ann_neighbors(
+            service, 'dark_factory', memories, top_k=5, score_threshold=0.9,
+            cutoff_by_category=cutoffs,
+        )
+        # What the OLD path would have handed the pair filter: b queried, and
+        # its (ineligible) hit returned.
+        queried_neighbors = {**skipped_neighbors, 'b': [_hit('a', 0.99)]}
+
+        assert ann_pairs_from_neighbors(memories, skipped_neighbors, cutoffs)[0] == (
+            ann_pairs_from_neighbors(memories, queried_neighbors, cutoffs)[0]
+        ), 'skipping a doomed query must not change which pairs form'
+        assert skip_disclosure['ann_query_skipped_uncalibrated'] == 1
+        assert ann_pairs_from_neighbors(memories, queried_neighbors, cutoffs)[1][
+            'uncalibrated_category_dropped'
+        ] == 1, 'the loss the skip now accounts for, measured the old way'
+
+
+@pytest.mark.asyncio
 class TestFetchAnnNeighborsConcurrency:
     """Queries fan out under a bound — never one blocking round-trip at a time."""
 
     def _service(self, query_points):
-        from unittest.mock import AsyncMock, MagicMock  # noqa: PLC0415
+        from unittest.mock import AsyncMock, MagicMock
 
         client = MagicMock()
         client.query_points = query_points
@@ -2427,8 +3110,8 @@ class TestFetchAnnNeighborsConcurrency:
         return service
 
     async def test_in_flight_queries_are_concurrent_and_capped(self):
-        import asyncio  # noqa: PLC0415
-        from unittest.mock import AsyncMock  # noqa: PLC0415
+        import asyncio
+        from unittest.mock import AsyncMock
 
         in_flight = 0
         peak = 0
@@ -2455,8 +3138,8 @@ class TestFetchAnnNeighborsConcurrency:
 
     async def test_results_are_keyed_in_input_order_despite_the_fan_out(self):
         """Two identical runs must serialise identically."""
-        import asyncio  # noqa: PLC0415
-        from unittest.mock import AsyncMock  # noqa: PLC0415
+        import asyncio
+        from unittest.mock import AsyncMock
 
         async def _side_effect(**kwargs):
             # Later records finish FIRST, so insertion order cannot be
@@ -2476,7 +3159,7 @@ class TestFetchAnnNeighborsConcurrency:
 
     async def test_one_failure_is_counted_without_losing_the_rest(self):
         """Per-record error accounting survives the fan-out."""
-        from unittest.mock import AsyncMock  # noqa: PLC0415
+        from unittest.mock import AsyncMock
 
         async def _side_effect(**kwargs):
             if kwargs['query'] == [1.0]:
@@ -2780,6 +3463,20 @@ class TestComputeClusterMetricsConsolidationNetDelta:
         _metrics, details = compute_cluster_metrics(records, {_PK: _plan_slice()}, {})
         assert details['categories'][_PK]['consolidation_events'][0]['absorbed'] == 0
 
+    @pytest.mark.parametrize('malformed', ['true', 1])
+    def test_malformed_canonical_marker_is_not_a_consolidation_event(self, malformed):
+        records = {
+            _PK: [
+                _dated('c', 'x', '2026-01-01T00:00:00+00:00',
+                       metadata={'topic': 'venv', 'canonical': malformed}),
+                _dated('after', 'y', '2026-01-02T00:00:00+00:00', metadata={'topic': 'venv'}),
+            ],
+        }
+        metrics, details = compute_cluster_metrics(records, {_PK: _plan_slice()}, {})
+
+        assert details['categories'][_PK]['consolidation_events'] == []
+        assert _by_id(metrics)[f'consolidation_net_delta.{_PK}'].n == 0
+
     def test_untopiced_event_uses_its_cluster_as_the_peer_set(self):
         records = {
             _PK: [
@@ -2935,7 +3632,7 @@ class TestBuildMetricSeries:
         return compute_cluster_metrics(records, plans, {})[0]
 
     def test_series_shape_and_corpus_counts(self):
-        from shared.memory_eval_metrics import validate_metric_series  # noqa: PLC0415
+        from shared.memory_eval_metrics import validate_metric_series
 
         series = build_metric_series(
             'dark_factory', self._metrics(),
@@ -2961,7 +3658,7 @@ class TestBuildMetricSeries:
         assert all(i.rsplit('.', 1)[-1] in (*_ALL_CATEGORIES, _GLOBAL_SCOPE) for i in ids)
 
     def test_run_stamp_defaults_to_the_shared_helper(self, monkeypatch):
-        from shared.memory_eval_metrics import RUN_STAMP_ENV_VAR  # noqa: PLC0415
+        from shared.memory_eval_metrics import RUN_STAMP_ENV_VAR
 
         monkeypatch.setenv(RUN_STAMP_ENV_VAR, '20260101T010101Z')
         series = build_metric_series('dark_factory', self._metrics(), corpus_counts={_PK: 2})
@@ -2969,7 +3666,7 @@ class TestBuildMetricSeries:
 
     def test_malformed_metric_raises_metric_schema_error_at_build_time(self):
         """M1: rejected in the runner that computed it, not by the reader."""
-        from shared.memory_eval_metrics import MetricSchemaError  # noqa: PLC0415
+        from shared.memory_eval_metrics import MetricSchemaError
 
         malformed = {
             'metric_id': f'clustered_member_share.{_PK}',
@@ -2984,7 +3681,7 @@ class TestBuildMetricSeries:
 
     def test_duplicate_metric_id_raises_metric_schema_error(self):
         """A duplicate would make one of the two invisible to the baseline join."""
-        from shared.memory_eval_metrics import MetricSchemaError  # noqa: PLC0415
+        from shared.memory_eval_metrics import MetricSchemaError
 
         one = {'metric_id': 'dup.all', 'kind': 'scalar', 'value': 1.0, 'n': 1}
         with pytest.raises(MetricSchemaError):
@@ -2992,7 +3689,7 @@ class TestBuildMetricSeries:
 
     def test_missing_direction_on_a_count_raises(self):
         """The exact test is two-sided; without a direction an improvement alarms."""
-        from shared.memory_eval_metrics import MetricSchemaError  # noqa: PLC0415
+        from shared.memory_eval_metrics import MetricSchemaError
 
         with pytest.raises(MetricSchemaError):
             build_metric_series(
@@ -3002,7 +3699,7 @@ class TestBuildMetricSeries:
             )
 
     def test_computed_metrics_round_trip_through_the_schema(self):
-        from shared.memory_eval_metrics import (  # noqa: PLC0415
+        from shared.memory_eval_metrics import (
             parse_metric_series,
             serialize_metric_series,
         )
@@ -3048,7 +3745,7 @@ class TestEmitMetricsArtifact:
 
     def test_written_metrics_round_trip_through_the_shared_loader(self, tmp_path):
         """The artifact is read by a process that never imports this script."""
-        from shared.memory_eval_metrics import load_metric_series  # noqa: PLC0415
+        from shared.memory_eval_metrics import load_metric_series
 
         series = _series()
         metrics_path, _report, _details = emit_metrics_artifact(
@@ -3069,7 +3766,7 @@ class TestEmitMetricsArtifact:
         assert det_path.name == details_artifact_path(_STAMP)
 
     def test_run_stamp_env_var_pins_the_filenames(self, tmp_path, monkeypatch):
-        from shared.memory_eval_metrics import RUN_STAMP_ENV_VAR, run_stamp  # noqa: PLC0415
+        from shared.memory_eval_metrics import RUN_STAMP_ENV_VAR, run_stamp
 
         monkeypatch.setenv(RUN_STAMP_ENV_VAR, '20260101T000000Z')
         stamp = run_stamp()
@@ -3087,7 +3784,7 @@ class TestEmitMetricsArtifact:
         the limits evaluator like a run whose metrics file went missing —
         strictly worse than the run never having written anything.
         """
-        from shared.memory_eval_metrics import MetricSchemaError  # noqa: PLC0415
+        from shared.memory_eval_metrics import MetricSchemaError
 
         malformed = {
             'schema_version': 1,
@@ -3122,7 +3819,7 @@ class TestEmitMetricsArtifact:
         is logged and re-raised rather than leaving a dangling details_path
         silently behind a successful-looking run.
         """
-        import logging  # noqa: PLC0415
+        import logging
 
         artifact_dir = tmp_path / _EVAL_ID
         artifact_dir.mkdir(parents=True)
@@ -3232,7 +3929,7 @@ class TestRepeatedCategoryDoesNotDoubleIngest:
     """
 
     async def test_fetch_memories_skips_an_already_scanned_category(self):
-        from unittest.mock import MagicMock  # noqa: PLC0415
+        from unittest.mock import MagicMock
 
         memory = MagicMock()
         memory.mem0 = MagicMock()
@@ -3286,11 +3983,25 @@ class TestRepeatedCategoryDoesNotDoubleIngest:
 
 # --- _run wiring doubles -----------------------------------------------------
 
-def _fake_config(t_high: float | None = 0.9):
-    return types.SimpleNamespace(
-        write_triage=types.SimpleNamespace(t_high=t_high),
+def _fake_config(t_high: float | None = 0.9,
+                 t_high_by_category: dict[str, float] | None = None,
+                 project_calibrations: dict[str, dict[str, float]] | None = None):
+    """*project_calibrations* maps project -> cutoffs; None omits the section."""
+    config = types.SimpleNamespace(
+        write_triage=types.SimpleNamespace(
+            t_high=t_high, t_high_by_category=t_high_by_category,
+        ),
         mem0=types.SimpleNamespace(collection_prefix='mem0'),
     )
+    if project_calibrations is not None:
+        config.write_triage_project_calibrations = {
+            project: WriteTriageProjectCalibration(
+                calibration_report_path=f'calibration/{project}.json',
+                t_high_by_category=cutoffs,
+            )
+            for project, cutoffs in project_calibrations.items()
+        }
+    return config
 
 
 class _FakeQdrant:
@@ -3348,14 +4059,19 @@ class _FakeMemoryService:
 
 
 def _install_run_doubles(monkeypatch, raw_by_category, *, t_high: float | None = 0.9,
-                         ann_hits: dict[tuple, list[tuple]] | None = None):
-    import fused_memory.config.schema as schema_mod  # noqa: PLC0415
-    import fused_memory.services.memory_service as service_mod  # noqa: PLC0415
+                         t_high_by_category: dict[str, float] | None = None,
+                         ann_hits: dict[tuple, list[tuple]] | None = None,
+                         project_calibrations: dict[str, dict[str, float]] | None = None):
+    import fused_memory.config.schema as schema_mod
+    import fused_memory.services.memory_service as service_mod
 
     _FakeMemoryService.instances = []
     _FakeMemoryService.raw_by_category = raw_by_category
     _FakeMemoryService.ann_hits = ann_hits or {}
-    monkeypatch.setattr(schema_mod, 'FusedMemoryConfig', lambda: _fake_config(t_high))
+    monkeypatch.setattr(
+        schema_mod, 'FusedMemoryConfig',
+        lambda: _fake_config(t_high, t_high_by_category, project_calibrations),
+    )
     monkeypatch.setattr(service_mod, 'MemoryService', _FakeMemoryService)
     return _FakeMemoryService
 
@@ -3442,6 +4158,95 @@ class TestRunApplyGuards:
         assert service.deleted == []
 
 
+class _UnopenableFakeMemoryService(_FakeMemoryService):
+    """A store whose open fails the way ``MemoryService.initialize`` measurably
+    does when it cannot create ``config.queue.data_dir``."""
+
+    async def initialize(self):
+        raise PermissionError(errno.EACCES, 'Permission denied', '/unwritable/queue-data')
+
+
+def _abort_messages(caplog) -> list[str]:
+    return [
+        r.getMessage() for r in caplog.records
+        if r.levelno >= logging.ERROR and r.getMessage().startswith('ABORT:')
+    ]
+
+
+@pytest.mark.asyncio
+class TestStdoutAndStoreFailuresStopBeforeAnySideEffect:
+    """A failure that is not stdout's is attributed at its seam, and a stdout
+    failure surfaces before the metrics artifact and before any --apply delete.
+
+    The stdout JSON plan is task 3136's report contract and it is printed
+    BEFORE every side effect, so a reader-closed or full stdout must stop the
+    run there. A block-buffered short plan used to fail only at interpreter
+    shutdown, after irreversible deletions whose report was lost.
+    """
+
+    _CLUSTER = {_PK: [
+        _raw('m1', _VENV_GOTCHA_A, '2026-01-01T00:00:00+00:00'),
+        _raw('m2', _VENV_GOTCHA_B, '2026-01-02T00:00:00+00:00'),
+    ]}
+
+    def _apply_args(self, metrics_root: Path):
+        return _build_parser().parse_args([
+            '--project-id', 'p', '--apply', '--threshold', '0.75',
+            '--metrics-root', str(metrics_root),
+        ])
+
+    async def test_a_store_that_cannot_be_opened(self, monkeypatch, tmp_path, caplog):
+        import fused_memory.services.memory_service as service_mod
+
+        _install_run_doubles(monkeypatch, self._CLUSTER)
+        monkeypatch.setattr(service_mod, 'MemoryService', _UnopenableFakeMemoryService)
+
+        with caplog.at_level(logging.ERROR, logger='audit_duplicate_memories'):
+            rc = await _run(self._apply_args(tmp_path))
+
+        assert rc == _mod.EXIT_RUN_FAILED == 1
+        aborts = _abort_messages(caplog)
+        assert len(aborts) == 1
+        assert 'store' in aborts[0]
+        assert 'stdout' not in aborts[0]
+        assert _FakeMemoryService.instances[-1].closed
+        assert not list(tmp_path.rglob('metrics-*.json'))
+
+    async def test_an_unwritable_metrics_root_deletes_nothing(
+        self, monkeypatch, tmp_path, caplog,
+    ):
+        _install_run_doubles(monkeypatch, self._CLUSTER)
+        blocker = tmp_path / 'not-a-dir'
+        blocker.write_text('x')
+        metrics_root = blocker / 'metrics'
+
+        with caplog.at_level(logging.ERROR, logger='audit_duplicate_memories'):
+            rc = await _run(self._apply_args(metrics_root))
+
+        assert rc == _mod.EXIT_RUN_FAILED
+        aborts = _abort_messages(caplog)
+        assert len(aborts) == 1
+        assert str(metrics_root) in aborts[0]
+        assert _FakeMemoryService.instances[-1].deleted == []
+
+    @pytest.mark.parametrize('exc', [
+        BrokenPipeError(errno.EPIPE, 'Broken pipe'),
+        OSError(errno.ENOSPC, 'No space left on device'),
+    ], ids=['closed-reader', 'full-disk'])
+    async def test_a_deferred_stdout_failure_stops_before_metrics_and_deletes(
+        self, monkeypatch, tmp_path, exc,
+    ):
+        _install_run_doubles(monkeypatch, self._CLUSTER)
+        metrics_root = tmp_path / 'metrics'
+
+        with monkeypatch.context() as scoped, pytest.raises(type(exc)):
+            scoped.setattr(sys, 'stdout', StdoutWithAFailingFlush(exc))
+            await _run(self._apply_args(metrics_root))
+
+        assert _FakeMemoryService.instances[-1].deleted == []
+        assert not list(metrics_root.rglob('metrics-*.json'))
+
+
 @pytest.mark.asyncio
 class TestRunApplyAnnOnlyClusters:
     """End-to-end: what --apply does with deletions the ANN path alone produced.
@@ -3455,13 +4260,188 @@ class TestRunApplyAnnOnlyClusters:
     _MID = '2026-01-02T00:00:00+00:00'
     _NEW = '2026-01-03T00:00:00+00:00'
 
-    async def _invoke(self, monkeypatch, raw, ann_hits, tmp_path, *argv):
-        _install_run_doubles(monkeypatch, raw, ann_hits=ann_hits)
+    async def _invoke(self, monkeypatch, raw, ann_hits, tmp_path, *argv,
+                      t_high_by_category=None, project_id='p',
+                      project_calibrations=None):
+        _install_run_doubles(
+            monkeypatch, raw, ann_hits=ann_hits,
+            t_high_by_category=t_high_by_category,
+            project_calibrations=project_calibrations,
+        )
         args = _build_parser().parse_args([
-            '--project-id', 'p', '--metrics-root', str(tmp_path), '--apply',
+            '--project-id', project_id, '--metrics-root', str(tmp_path), '--apply',
             '--threshold', '0.99', *argv,
         ])
         return await _run(args), _FakeMemoryService.instances[-1]
+
+    async def _clique_raw(self, category):
+        return {category: [
+            _raw('m1', 'alpha one', self._OLD, category=category,
+                 vector=[1.0, 0.0]),
+            _raw('m2', 'beta two', self._MID, category=category,
+                 vector=[0.0, 1.0]),
+        ]}
+
+    _CLIQUE_HITS = {(1.0, 0.0): [('m2', 0.95)], (0.0, 1.0): [('m1', 0.95)]}
+
+    async def test_a_clique_in_a_pooled_fallback_category_is_reported_not_deleted(
+        self, monkeypatch, tmp_path, capsys,
+    ):
+        """The task's named harm, end to end.
+
+        observations_and_summaries has no cutoff of its own, so this clique
+        cleared a number measured on a different population. Formulaic
+        session recaps look alike; deletion is irreversible. Report it,
+        withhold it.
+        """
+        rc, service = await self._invoke(
+            monkeypatch, await self._clique_raw(_OS), self._CLIQUE_HITS, tmp_path,
+            t_high_by_category={_PK: 0.9},
+        )
+        plan = json.loads(capsys.readouterr().out)
+
+        assert rc == 1, (
+            'the pre-existing guard: --apply with nothing applicable aborts '
+            'loudly rather than silently deleting nothing'
+        )
+        assert plan['clusters_total'] == 1, 'still detected and reported'
+        assert plan['delete_candidates'] == ['m2']
+        assert service.deleted == [], 'an un-evidenced cutoff may not delete'
+        assert plan['apply_withheld_groups'][0]['reason'] == (
+            'ann_cutoff_not_evidenced_for_category'
+        )
+
+    async def test_the_runs_own_project_cutoff_evidences_the_category(
+        self, monkeypatch, tmp_path, capsys,
+    ):
+        """Task 5547: the dark_factory corpus measured this category's cutoff."""
+        rc, service = await self._invoke(
+            monkeypatch, await self._clique_raw(_OS), self._CLIQUE_HITS, tmp_path,
+            project_id='dark_factory', project_calibrations={'dark_factory': {_OS: 0.9}},
+        )
+        capsys.readouterr()
+
+        assert rc == 0
+        assert service.deleted == ['m2']
+
+    async def test_another_projects_cutoff_does_not_evidence_this_run(
+        self, monkeypatch, tmp_path, capsys,
+    ):
+        rc, service = await self._invoke(
+            monkeypatch, await self._clique_raw(_OS), self._CLIQUE_HITS, tmp_path,
+            project_id='dark_factory', project_calibrations={'other_project': {_OS: 0.9}},
+        )
+        plan = json.loads(capsys.readouterr().out)
+
+        assert service.deleted == []
+        assert plan['apply_withheld_groups'][0]['reason'] == (
+            'ann_cutoff_not_evidenced_for_category'
+        )
+        assert rc == 1
+
+    async def test_the_same_clique_in_a_calibrated_category_still_deletes(
+        self, monkeypatch, tmp_path, capsys,
+    ):
+        """Same shape, evidenced cutoff — 3210's coverage is not reverted."""
+        rc, service = await self._invoke(
+            monkeypatch, await self._clique_raw(_PK), self._CLIQUE_HITS, tmp_path,
+            t_high_by_category={_PK: 0.9},
+        )
+        capsys.readouterr()
+
+        assert rc == 0
+        assert service.deleted == ['m2']
+
+    async def test_an_operator_override_forfeits_the_categorys_own_evidence(
+        self, monkeypatch, tmp_path, capsys,
+    ):
+        """Same calibrated fixture, same clique — but --ann-threshold gated it.
+
+        ``--ann-threshold 0.5`` displaces ``t_high_by_category[_PK]`` for every
+        category, so this clique cleared 0.5 — a number no calibration ever
+        measured, and weaker evidence than the pooled cutoff that is already
+        fenced. Report it, withhold it.
+        """
+        rc, service = await self._invoke(
+            monkeypatch, await self._clique_raw(_PK), self._CLIQUE_HITS, tmp_path,
+            '--ann-threshold', '0.5',
+            t_high_by_category={_PK: 0.9},
+        )
+        plan = json.loads(capsys.readouterr().out)
+
+        assert plan['clusters_total'] == 1, 'still detected and reported'
+        assert plan['delete_candidates'] == ['m2'], 'the report never narrows'
+        assert service.deleted == [], (
+            'an operator recall knob is not per-category evidence'
+        )
+        assert plan['apply_withheld_groups'][0]['reason'] == (
+            'ann_cutoff_not_evidenced_for_category'
+        )
+        assert rc == 1, 'the pre-existing nothing-applicable guard aborts loudly'
+
+    async def test_deletion_happens_only_in_the_evidenced_category(
+        self, monkeypatch, tmp_path, capsys,
+    ):
+        """Two identical cliques, one corpus, ONE of them evidenced.
+
+        The per-group category check is otherwise only ever exercised on a
+        single-category sweep, where "fence everything" and "fence the
+        un-evidenced group" are indistinguishable. Here they are not: the
+        procedural_knowledge clique deletes and the observations_and_summaries
+        one is withheld, in the same run.
+        """
+        raw = {
+            _PK: [
+                _raw('p1', 'alpha one', self._OLD, category=_PK, vector=[1.0, 0.0]),
+                _raw('p2', 'beta two', self._MID, category=_PK, vector=[0.0, 1.0]),
+            ],
+            _OS: [
+                _raw('o1', 'gamma three', self._OLD, category=_OS, vector=[0.5, 0.5]),
+                _raw('o2', 'delta four', self._MID, category=_OS, vector=[0.6, 0.4]),
+            ],
+        }
+        ann_hits = {
+            (1.0, 0.0): [('p2', 0.95)], (0.0, 1.0): [('p1', 0.95)],
+            (0.5, 0.5): [('o2', 0.95)], (0.6, 0.4): [('o1', 0.95)],
+        }
+        rc, service = await self._invoke(
+            monkeypatch, raw, ann_hits, tmp_path,
+            '--categories', _PK, _OS,
+            t_high_by_category={_PK: 0.9},
+        )
+        plan = json.loads(capsys.readouterr().out)
+
+        assert plan['clusters_total'] == 2, 'both cliques are detected and reported'
+        assert sorted(plan['delete_candidates']) == ['o2', 'p2'], (
+            'the report never narrows — only the irreversible path does'
+        )
+        assert service.deleted == ['p2'], (
+            'only the category whose cutoff was measured on its own pairs'
+        )
+        withheld = plan['apply_withheld_groups']
+        assert [g['category'] for g in withheld] == [_OS]
+        assert withheld[0]['withheld_ids'] == ['o2']
+        assert withheld[0]['reason'] == 'ann_cutoff_not_evidenced_for_category'
+        assert rc == 0, 'something applicable remained, so the sweep succeeds'
+
+    async def test_a_lexical_span_still_applies_under_an_override(
+        self, monkeypatch, tmp_path,
+    ):
+        """Lexical evidence never depended on the ANN cutoff, overridden or not."""
+        raw = {_PK: [
+            _raw('m1', _VENV_GOTCHA_A, self._OLD, vector=[1.0, 0.0]),
+            _raw('m2', _VENV_GOTCHA_B, self._MID, vector=[0.9, 0.1]),
+        ]}
+        ann_hits = {(1.0, 0.0): [('m2', 0.95)], (0.9, 0.1): [('m1', 0.95)]}
+
+        rc, service = await self._invoke(
+            monkeypatch, raw, ann_hits, tmp_path,
+            '--threshold', '0.75', '--ann-threshold', '0.5',
+            t_high_by_category={_PK: 0.9},
+        )
+
+        assert rc == 0
+        assert service.deleted == ['m2']
 
     async def test_an_ann_only_clique_deletes_its_losers_and_keeps_the_survivor(
         self, monkeypatch, tmp_path, capsys,
@@ -3475,7 +4455,10 @@ class TestRunApplyAnnOnlyClusters:
             (1.0, 0.0): [('m2', 0.95)],
             (0.0, 1.0): [('m1', 0.95)],
         }
-        rc, service = await self._invoke(monkeypatch, raw, ann_hits, tmp_path)
+        rc, service = await self._invoke(
+            monkeypatch, raw, ann_hits, tmp_path,
+            t_high_by_category={_PK: 0.9},
+        )
         plan = json.loads(capsys.readouterr().out)
 
         assert plan['near_duplicate_groups'][0]['found_by'] == ['ann'], (
@@ -3503,12 +4486,20 @@ class TestRunApplyAnnOnlyClusters:
             (0.0, 1.0, 0.0): [('m1', 0.95), ('m3', 0.95)],
             (0.0, 0.0, 1.0): [('m2', 0.95)],
         }
-        rc, service = await self._invoke(monkeypatch, raw, ann_hits, tmp_path)
+        # EVIDENCED category: without its own cutoff the un-evidenced-category
+        # gate would withhold this cluster too, and the test would pass even
+        # if the chained-cluster guard it exists for regressed entirely.
+        rc, service = await self._invoke(
+            monkeypatch, raw, ann_hits, tmp_path, t_high_by_category={_PK: 0.9},
+        )
         plan = json.loads(capsys.readouterr().out)
 
         assert set(plan['near_duplicate_groups'][0]['member_ids']) == {'m1', 'm2', 'm3'}
         assert plan['delete_candidates'] == ['m2', 'm3'], 'still reported'
         assert plan['apply_withheld_clusters'] == 1
+        assert plan['apply_withheld_groups'][0]['reason'] == (
+            'ann_chained_without_lexical_span_or_ann_clique'
+        ), 'withheld for TRANSITIVITY, not for a missing per-category cutoff'
         assert service.deleted == [], 'the chain never reaches delete_memory'
         assert rc == 1, 'nothing applicable remains, so the empty-plan guard holds'
 
@@ -3526,7 +4517,10 @@ class TestRunApplyAnnOnlyClusters:
             (0.0, 1.0, 0.0): [('m1', 0.95), ('m3', 0.93)],
             (0.0, 0.0, 1.0): [('m1', 0.94), ('m2', 0.93)],
         }
-        rc, service = await self._invoke(monkeypatch, raw, ann_hits, tmp_path)
+        rc, service = await self._invoke(
+            monkeypatch, raw, ann_hits, tmp_path,
+            t_high_by_category={_PK: 0.9},
+        )
 
         assert rc == 0
         assert service.deleted == ['m2', 'm3']
@@ -3544,13 +4538,18 @@ class TestRunApplyAnnOnlyClusters:
         ]}
         # a2 <-> b1: the single cross-cluster ANN pair.
         ann_hits = {(0.9, 0.1): [('b1', 0.95)], (0.0, 1.0): [('a2', 0.95)]}
+        # EVIDENCED, so the withholding can only be the merge guard's doing.
         rc, service = await self._invoke(
             monkeypatch, raw, ann_hits, tmp_path, '--threshold', '0.75',
+            t_high_by_category={_PK: 0.9},
         )
         plan = json.loads(capsys.readouterr().out)
 
         assert len(plan['near_duplicate_groups']) == 1, 'ANN merged the two halves'
         assert plan['apply_withheld_clusters'] == 1
+        assert plan['apply_withheld_groups'][0]['reason'] == (
+            'ann_chained_without_lexical_span_or_ann_clique'
+        ), 'the merge is not lexically spanning and is not an ANN clique'
         assert service.deleted == [], (
             'a lexical pair inside the merge does not corroborate the merge'
         )
@@ -3635,8 +4634,103 @@ class TestRunWiring:
             'no cutoff means no ANN query — never a guessed one'
         )
         assert plan['ann_threshold'] is None
-        assert plan['ann_disclosure']['ann_disabled_uncalibrated'] == 1
+        assert plan['ann_disclosure']['ann_disabled_uncalibrated'] == len(
+            _ALL_CATEGORIES,
+        ), 'the counter is now per swept category — every one of them is disabled'
+        assert plan['ann_disclosure']['ann_pooled_fallback_categories'] == 0
+        assert plan['ann_threshold_by_category'] == {}, (
+            'an empty map is how the report says "no category is calibrated" '
+            '— never a null that could read as "not measured"'
+        )
         assert plan['clusters_total'] == 1, 'the lexical path still ran'
+
+    async def test_min_of_the_per_category_cutoffs_is_pushed_down_to_qdrant(
+        self, monkeypatch, tmp_path,
+    ):
+        """The DB-layer floor cannot drop a candidate any category would take.
+
+        Every per-category cutoff is >= the min, so filtering at the min in
+        Qdrant is provably lossless; the authoritative per-category decision
+        happens afterwards in the pure ann_pairs_from_neighbors.
+        """
+        _install_run_doubles(
+            monkeypatch, {_PK: [_raw('m1', 'x')]},
+            t_high=0.9, t_high_by_category={_PK: 0.95, _OS: 0.8},
+        )
+        await _run(await self._parse(tmp_path))
+        qdrant = _FakeMemoryService.instances[-1].mem0._qdrant
+
+        assert qdrant.calls, 'a record with a vector must be queried'
+        assert all(c['score_threshold'] == 0.8 for c in qdrant.calls), (
+            'the push-down is the MIN of {0.95, 0.8, 0.9 pooled fallback}'
+        )
+
+    async def test_the_mapping_not_the_floor_reaches_the_pure_filter(
+        self, monkeypatch, tmp_path,
+    ):
+        """ann_pairs_from_neighbors must see per-category cutoffs, not the min.
+
+        If the floor reached it instead, every category would silently be
+        gated at the loosest cutoff any other category earned — exactly the
+        cross-category borrowing this task exists to end.
+        """
+        captured = {}
+        real = _mod.ann_pairs_from_neighbors
+
+        def _spy(memories, neighbors, threshold, **kwargs):
+            captured['threshold'] = threshold
+            return real(memories, neighbors, threshold, **kwargs)
+
+        monkeypatch.setattr(_mod, 'ann_pairs_from_neighbors', _spy)
+        _install_run_doubles(
+            monkeypatch, {_PK: [_raw('m1', 'x')]},
+            t_high=0.9, t_high_by_category={_PK: 0.95},
+        )
+        await _run(await self._parse(tmp_path))
+
+        assert captured['threshold'] == {_PK: 0.95, _OS: 0.9, _PN: 0.9}
+
+    async def test_partial_calibration_still_runs_the_ann_path(
+        self, monkeypatch, tmp_path, capsys,
+    ):
+        """One calibrated category is enough — the path is not all-or-nothing.
+
+        The uncalibrated categories are absent from the mapping and counted,
+        so their recall loss is legible instead of being papered over with a
+        borrowed number.
+        """
+        _install_run_doubles(
+            monkeypatch, {_PK: [_raw('m1', 'x')]},
+            t_high=None, t_high_by_category={_PK: 0.9},
+        )
+        await _run(await self._parse(tmp_path))
+        plan = json.loads(capsys.readouterr().out)
+        service = _FakeMemoryService.instances[-1]
+
+        assert service.mem0._qdrant.calls, 'the calibrated category must be queried'
+        assert all(c['with_vectors'] is True for c in service.mem0.scroll_calls), (
+            'at least one resolved category means the vectors are needed'
+        )
+        assert plan['ann_threshold'] == 0.9
+        assert plan['ann_disclosure']['ann_disabled_uncalibrated'] == 2
+
+    async def test_plan_echoes_the_per_category_cutoffs(
+        self, monkeypatch, tmp_path, capsys,
+    ):
+        """A report reader must see WHICH number gated WHICH category."""
+        _install_run_doubles(
+            monkeypatch, {_PK: [_raw('m1', 'x')]},
+            t_high=0.9, t_high_by_category={_PK: 0.95},
+        )
+        await _run(await self._parse(tmp_path))
+        plan = json.loads(capsys.readouterr().out)
+
+        assert plan['ann_threshold_by_category'] == {_PK: 0.95, _OS: 0.9, _PN: 0.9}
+        assert plan['ann_threshold'] == 0.9, (
+            'the scalar stays the Qdrant push-down floor, unchanged in meaning '
+            'for every pre-3357 consumer of the report'
+        )
+        assert plan['ann_disclosure']['ann_pooled_fallback_categories'] == 2
 
     async def test_plan_json_is_printed_to_stdout(self, monkeypatch, tmp_path, capsys):
         """3136 consumes stdout; the report contract is unchanged."""
@@ -3649,7 +4743,7 @@ class TestRunWiring:
     async def test_metrics_artifact_is_emitted_under_metrics_root(
         self, monkeypatch, tmp_path,
     ):
-        from shared.memory_eval_metrics import (  # noqa: PLC0415
+        from shared.memory_eval_metrics import (
             RUN_STAMP_ENV_VAR,
             load_metric_series,
         )
@@ -3666,9 +4760,57 @@ class TestRunWiring:
         ids = {m.metric_id for m in series.metrics}
         assert f'near_duplicate_clusters.{_PK}' in ids
         for key in (*_ANN_DISCLOSURE_KEYS, *_PLAN_DISCLOSURE_KEYS,
-                    'ann_query_errors', 'ann_disabled_uncalibrated'):
+                    'ann_query_errors', 'ann_disabled_uncalibrated',
+                    'ann_pooled_fallback_categories', 'apply_withheld_clusters'):
             assert f'{key}.{_GLOBAL_SCOPE}' in ids, f'{key} must be disclosed'
         assert f'scan_truncated.{_PK}' in ids
+
+    async def test_the_apply_withheld_gate_becomes_a_metric_series(
+        self, monkeypatch, tmp_path, capsys,
+    ):
+        """A cluster the apply gate withholds must be alarmable, not reported only.
+
+        The plan JSON already carries ``apply_withheld_clusters``, but the plan
+        is not the artifact the eval programme reads — only the metrics series
+        is. Without this metric, a growing share of ``--apply`` coverage
+        silently withheld by the evidence gate would be un-alarmable recall
+        loss.
+        """
+        from shared.memory_eval_metrics import (
+            RUN_STAMP_ENV_VAR,
+            load_metric_series,
+        )
+
+        monkeypatch.setenv(RUN_STAMP_ENV_VAR, _STAMP)
+        raw = {_OS: [
+            _raw('m1', 'alpha one', '2026-01-01T00:00:00+00:00', category=_OS,
+                 vector=[1.0, 0.0]),
+            _raw('m2', 'beta two', '2026-01-02T00:00:00+00:00', category=_OS,
+                 vector=[0.0, 1.0]),
+        ]}
+        ann_hits = {(1.0, 0.0): [('m2', 0.95)], (0.0, 1.0): [('m1', 0.95)]}
+        _install_run_doubles(
+            monkeypatch, raw, ann_hits=ann_hits, t_high_by_category={_PK: 0.9},
+        )
+
+        rc = await _run(await self._parse(tmp_path, '--threshold', '0.99'))
+        plan = json.loads(capsys.readouterr().out)
+
+        assert rc == 0, 'a dry run (no --apply) returns cleanly'
+        assert plan['apply_withheld_clusters'] == 1, (
+            'observations_and_summaries has no cutoff of its own, so this '
+            'clique runs on the pooled fallback and is withheld'
+        )
+
+        series = load_metric_series(tmp_path / _EVAL_ID / f'metrics-{_STAMP}.json')
+        by_id = _by_id(series.metrics)
+        metric_id = f'apply_withheld_clusters.{_GLOBAL_SCOPE}'
+        assert metric_id in by_id, 'the gate must be alarmable, not just reported'
+
+        metric = by_id[metric_id]
+        assert metric.value == 1.0
+        assert metric.kind == 'count'
+        assert metric.direction == 'higher_is_worse'
 
     async def test_no_metrics_writes_nothing(self, monkeypatch, tmp_path):
         _install_run_doubles(monkeypatch, {_PK: [_raw('m1', 'x')]})
@@ -3679,6 +4821,22 @@ class TestRunWiring:
         _install_run_doubles(monkeypatch, {_PK: [_raw('m1', 'x')]})
         await _run(await self._parse(tmp_path))
         assert _FakeMemoryService.instances[-1].closed is True
+
+    async def test_the_printed_plan_carries_each_categorys_scan_coverage(
+        self, monkeypatch, tmp_path, capsys,
+    ):
+        """Task 3136's report reads coverage off stdout, not off the metrics."""
+        _install_run_doubles(
+            monkeypatch, {_PK: [_raw('m1', _VENV_GOTCHA_A), _raw('m2', _DISTRACTOR)]},
+        )
+        await _run(await self._parse(
+            tmp_path, '--categories', _PK, '--scan-limit', '2',
+        ))
+        plan = json.loads(capsys.readouterr().out)
+
+        assert plan['scan_coverage'] == {
+            _PK: {'scanned': 2, 'truncated': 1, 'scan_limit': 2},
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -3926,6 +5084,98 @@ class TestExtractLivenessSnapshotFact:
         ) is None
 
 
+# The exact pair the task measured live: identical framing and identical
+# readable `claimant_run_id=`/`heartbeat_at=` pairs, differing only in a
+# status value neither the quoted nor the bare branch can read whole (an
+# unterminated quote). Verbatim from the task's reproduction.
+_UNREADABLE_STATUS_IN_PROGRESS = (
+    'Liveness check performed 2026-08-11: '
+    'status="in progress claimant_run_id=null heartbeat_at=null'
+)
+_UNREADABLE_STATUS_DONE = (
+    'Liveness check performed 2026-08-11: '
+    'status="done, unclosed claimant_run_id=null heartbeat_at=null'
+)
+
+
+class TestLivenessSnapshotUnfieldedVerdictIsPerField:
+    """An unreadable field is a WHOLE-RECORD loss, never a key from survivors.
+
+    `_classify_liveness_snapshot` built its key from whatever fields happened
+    to parse and silently dropped the rest: `pairs` accumulated across every
+    match in the content, and `if not pairs: return True, None` only fired
+    when NO field parsed at all. One unreadable field beside a readable
+    sibling therefore produced a KEY, not a loss -- built from the survivors
+    only, so it groups records that assert DIFFERENT facts. Under `--apply` a
+    false cluster like that is an irreversible delete (the same guarantee
+    `extract_liveness_snapshot_fact`'s own docstring already claims). The
+    verdict must be per-field instead: any recognised field whose value
+    cannot be read whole makes the WHOLE record `(True, None)`, exactly like
+    the no-fields-at-all case already does.
+    """
+
+    def test_two_different_unreadable_statuses_do_not_share_a_key(self):
+        """The measured bug: an in-progress and a done snapshot, one key.
+
+        Measured on base: both classify as
+        `(True, 'claimant_run_id=null|heartbeat_at=null')` -- the SAME
+        partial key for two records asserting opposite statuses.
+        """
+        key_a = _classify_liveness_snapshot(_UNREADABLE_STATUS_IN_PROGRESS)
+        key_b = _classify_liveness_snapshot(_UNREADABLE_STATUS_DONE)
+
+        assert key_a == (True, None)
+        assert key_b == (True, None)
+
+        assert extract_liveness_snapshot_fact(
+            _memory('a', _UNREADABLE_STATUS_IN_PROGRESS, category=_OS),
+        ) is None, 'the extractor is a thin projection of the classifier'
+
+    @pytest.mark.parametrize('value', [
+        '"in progress',  # unterminated quote
+        '(unknown)',  # value starts outside the bare class
+        '"a|b"',  # `|` is the key's own pair delimiter
+    ])
+    def test_an_unreadable_value_beside_a_readable_sibling_is_a_whole_record_loss(
+        self, value,
+    ):
+        """A single unreadable field must poison the whole key, not just itself."""
+        content = (
+            'Point-in-time liveness check performed 2026-07-24 on task 94: '
+            f'status={value} claimant_run_id=null'
+        )
+
+        assert _classify_liveness_snapshot(content) == (True, None)
+
+    def test_a_value_that_cleans_to_nothing_is_a_whole_record_loss(self):
+        """A second, distinct route to the same defect -- survives step-2.
+
+        `.rstrip('./:+-')` can reduce a BARE value the pattern DID read (so
+        `quoted`/`bare` are never both `None`, and no unreadable-value
+        verdict ever fires) to the empty string, and the `if cleaned:` guard
+        then silently drops that field while a readable sibling still
+        contributes -- the same partial-key defect, reached without the
+        value ever being unreadable. A field the author WROTE but whose
+        value the reader cannot recover is exactly the case
+        `liveness_snapshot_unfielded` exists to make visible, not silently
+        fold into a key built from the survivors.
+        """
+        content = (
+            'Point-in-time liveness check performed 2026-07-24 on task 94: '
+            'status=--- claimant_run_id=null'
+        )
+        assert _classify_liveness_snapshot(content) == (True, None)
+
+        other = (
+            'Point-in-time liveness check performed 2026-07-24 on task 94: '
+            'status=... claimant_run_id=null'
+        )
+        assert _classify_liveness_snapshot(other) == (True, None), (
+            'a second value that also rstrips to empty must not fabricate '
+            'the same survivors-only key as the one above'
+        )
+
+
 class TestLivenessClassifierIsSingleCopy:
     """One classifier, two callers -- so the extractor's tests test production.
 
@@ -4009,6 +5259,29 @@ class TestLivenessSnapshotSubjectTaskIds:
             _memory('6b245659', _LIVENESS_SNAPSHOT_94_JUL24, category=_OS),
         ) == {'94'}
 
+    def test_slash_form_content_ref_alone_still_groups_a_snapshot(self):
+        """A record whose only task reference is the slash form (task 3403).
+
+        'task/94' is the orchestrator's own branch-name convention and the
+        spelling the real corpus reaches for when a snapshot is about a
+        branch or worktree; before task 3403 widened the shared TASK_REF_RE
+        grammar it was not a reference at all, so such a record had NO
+        subject and was silently ungroupable. MEASURED set() before the
+        widening.
+
+        This is the report-only path (a recurrence report, never a delete
+        candidate), so the widening buys recall here at no risk to the
+        corpus -- which is the recall this task was filed for.
+        """
+        assert liveness_snapshot_subject_task_ids(
+            _memory(
+                'm',
+                'Liveness check performed at 2026-07-24T10:00Z: task/94 '
+                'reports status=in-progress.',
+                category=_OS,
+            ),
+        ) == {'94'}
+
     def test_no_metadata_id_and_no_content_ref_is_empty(self):
         assert liveness_snapshot_subject_task_ids(
             _memory('m', 'a note that names no task at all'),
@@ -4058,6 +5331,444 @@ def _liveness_corpus() -> list[dict]:
 def _span_days(earlier: str, later: str) -> float:
     return (datetime.fromisoformat(later).timestamp()
             - datetime.fromisoformat(earlier).timestamp()) / 86400.0
+
+
+# A core_fact that CANNOT be produced by clause scoping, seeded in place of the
+# real one so the unconditional seed cannot supply the very answer the
+# assertion is checking for. `liveness_snapshot_subject_facts` seeds every
+# subject with `core_fact` and only THEN adds the clause-derived key, and on
+# these four records the two COINCIDE -- so asserting against the real fact
+# cannot tell "the clause derived it" from "the clause derived nothing and the
+# seed supplied it". Seeding a sentinel splits them: the sentinel is the seed's
+# contribution, and `_CORE_FACT_STRANDED` can only have come from a clause.
+#
+# It names ONE field TWICE on purpose. A clause-scoped key is only ADDED for a
+# record whose whole-record key is divergent -- a coherent record gains nothing
+# from clause scoping but a weaker, punctuation-sensitive key -- so a sentinel
+# that named each field once would close that gate and make every assertion
+# below read `{sentinel}` no matter what the clauses say. The values are
+# unforgeable for a second reason too: `<` and `>` are outside
+# `_LIVE_FIELD_SCAN_RE`'s bare value class, so no content can produce them.
+#
+# It also names the SAME THREE field names -- `claimant_run_id`,
+# `heartbeat_at`, `status` -- as every real record it is seeded against.
+# `liveness_snapshot_subject_facts`'s field-vocabulary gate only ADDS a
+# clause-derived key when the clause names the SAME field-NAME set as the
+# seeded core_fact, so a sentinel with a narrower vocabulary (`status` alone,
+# say) would close that second gate regardless of what the real record's
+# clauses say, and every assertion below would silently degrade to
+# `{sentinel}` for a FIXTURE reason rather than the behaviour these classes
+# claim to measure.
+_SENTINEL_CORE_FACT = (
+    'claimant_run_id=<sentinel>|heartbeat_at=<sentinel>|'
+    'status=<sentinel-one>|status=<sentinel-two>'
+)
+
+
+class TestLivenessSnapshotSubjectFacts:
+    """WHAT each subject is asserted to be -- measured on the FOUR REAL RECORDS.
+
+    The task's own acceptance bar: the rescope is only worth shipping if the
+    detector still fires on the corpus that motivated it. The clause technique
+    returned the EMPTY SET on all four of these records before task 3403
+    narrowed the clause splitter's dot (now `task_filter.WIDE_CLAUSE_BOUNDARY_RE`)
+    and widened `TASK_REF_RE`'s separator, so "it works now" is a measurement,
+    not an inference -- and this class is where that measurement lives. If a
+    later edit to either shared regex re-breaks the association, this fails
+    before the group-level tests do, naming the subject and the fact rather
+    than an absent group.
+
+    That last guarantee is only REAL because these tests seed
+    `_SENTINEL_CORE_FACT` rather than `_CORE_FACT_STRANDED`. Asserting against
+    the real fact made this class VACUOUS with respect to the very thing it
+    claims to pin: because the seed is unconditional and coincides with the
+    clause-derived key here, `{_CORE_FACT_STRANDED}` is the result whether the
+    clause scope did all the work or none of it. Measured, not reasoned:
+    monkeypatching `TASK_REF_RE` to a never-matching pattern -- exactly the
+    pre-3403 breakage this class exists to catch -- left the original
+    assertions GREEN. With the sentinel seeded, that same inert regex yields
+    `{_SENTINEL_CORE_FACT}` and the tests fail naming the subject and the
+    missing fact.
+
+    The guarantee is the CLASS's, not each test's, and the two mutants divide
+    unevenly -- also measured. An inert `TASK_REF_RE` is killed by both tests.
+    An inert `WIDE_CLAUSE_BOUNDARY_RE` (one that never splits) is killed only by the
+    multi-task test: with a single-subject record the whole content IS that
+    subject's clause, so not splitting is indistinguishable from splitting
+    correctly and nothing is there to detect. That is why the multi-task
+    record carries the load here and must not be reduced to a single subject.
+
+    The seeded sentinel is DIVERGENT (it names `status` twice), which is what
+    opens the gate on the clause scan at all. These four records are coherent,
+    so in production they key on the whole-record union alone and their two
+    groups come from that key, exactly as before the rescope -- what is
+    measured here is that the clause TECHNIQUE resolves subject -> fact on
+    this real content, which is what the divergent path depends on.
+    """
+
+    def test_a_single_task_snapshot_keys_its_one_subject(self):
+        by_id = {r['id']: r for r in _liveness_corpus()}
+
+        assert liveness_snapshot_subject_facts(
+            by_id['6b245659'], _SENTINEL_CORE_FACT,
+        ) == {'94': {_SENTINEL_CORE_FACT, _CORE_FACT_STRANDED}}
+        assert liveness_snapshot_subject_facts(
+            by_id['08aa0017'], _SENTINEL_CORE_FACT,
+        ) == {'96': {_SENTINEL_CORE_FACT, _CORE_FACT_STRANDED}}
+
+    def test_the_multi_task_reverification_keys_each_subject_from_its_own_clause(self):
+        """1eef7df7: task 94 in clause 0, task 96 four clauses later.
+
+        Both land on the stranded fact from their OWN clause -- which is what
+        keeps `test_exactly_the_two_real_groups` green through the rescope.
+
+        Subject 99 is pinned here as the NEGATIVE, in the same sentinel style:
+        it names no clause carrying a readable assignment, so it comes back
+        with the seed and nothing else. That contrast is what proves 94's and
+        96's facts were clause-DERIVED rather than seeded -- all three subjects
+        share one record and one seed, and only the two with real clause
+        evidence gain a second key. The fallback's own three shapes stay
+        `TestLivenessSubjectFactsFallback`.
+        """
+        record = {r['id']: r for r in _liveness_corpus()}['1eef7df7']
+
+        facts = liveness_snapshot_subject_facts(record, _SENTINEL_CORE_FACT)
+
+        assert facts['94'] == {_SENTINEL_CORE_FACT, _CORE_FACT_STRANDED}
+        assert facts['96'] == {_SENTINEL_CORE_FACT, _CORE_FACT_STRANDED}
+        assert facts['99'] == {_SENTINEL_CORE_FACT}
+
+    def test_the_record_is_not_mutated(self):
+        record = {r['id']: r for r in _liveness_corpus()}['1eef7df7']
+        before = json.dumps(record, sort_keys=True, default=str)
+
+        liveness_snapshot_subject_facts(record, _CORE_FACT_STRANDED)
+
+        assert json.dumps(record, sort_keys=True, default=str) == before
+
+
+class TestLivenessSubjectFactsFallback:
+    """A subject with NO clause-scoped evidence keys on the WHOLE-RECORD union.
+
+    EVERY subject keys on *core_fact* -- always, unconditionally -- and clause
+    scoping ADDS a second key beside it when the subject's clauses carried
+    readable assignments. The three shapes below are the cases where nothing
+    is added, so the set stays the one-element `{core_fact}` this class
+    asserts: a ref that exists only in metadata, a prose ref in a clause
+    carrying no readable assignment, and a clause boundary landing inside a
+    quoted value.
+
+    An empty-set-only fallback is NOT sufficient on its own: a subject whose
+    clause names only SOME of the record's fields keys on a partial fact
+    instead, silently vacating the whole-record bucket it shared -- a shape
+    an empty-set test never reaches. `TestLivenessSubjectFactsIsAdditive` pins
+    that non-empty-but-incomplete half.
+
+    Because every pre-rescope bucket membership therefore survives, nothing is
+    lost and no new `_LIVENESS_DISCLOSURE_KEYS` counter is warranted -- pinned
+    below, so a later edit that starts dropping these subjects has to change
+    a disclosure contract rather than quietly shrink the report.
+    """
+
+    def test_a_metadata_only_subject_falls_back_to_the_record_key(self):
+        """`related_task_ids` names 777; the content never mentions it.
+
+        No clause can be scoped to a subject the prose does not name, so 777
+        has no clause-level evidence by construction. It is still a subject --
+        `liveness_snapshot_subject_task_ids` resolves it -- so it must still be
+        keyed, and the only honest key is what the record as a whole asserts.
+        """
+        record = _memory(
+            'meta-only', _LIVENESS_SNAPSHOT_94_JUL24, category=_OS,
+            metadata={'task_id': '94', 'related_task_ids': ['777']},
+        )
+
+        facts = liveness_snapshot_subject_facts(record, _SENTINEL_CORE_FACT)
+
+        assert set(facts) == {'94', '777'}, (
+            'the metadata-only subject is keyed, not dropped'
+        )
+        assert facts['94'] == {_SENTINEL_CORE_FACT, _CORE_FACT_STRANDED}, (
+            'the prose subject gains a key from its own clause'
+        )
+        assert facts['777'] == {_SENTINEL_CORE_FACT}, (
+            'the metadata-only one gains nothing and keeps the record key alone'
+        )
+
+    def test_a_prose_subject_whose_clause_asserts_nothing_falls_back(self):
+        """The REAL 1eef7df7: clause 6 names task 99 with no assignment.
+
+        Task 99 is the record's own `metadata.task_id` and appears in prose
+        ("whoever resolves task 99's commit-vs-discard decision"), but that
+        clause carries no `<field>=<value>` at all. The fallback restores
+        exactly today's key for it -- and, because 99 has no second record
+        anywhere in the corpus, it stays the singleton
+        `test_singleton_subject_and_non_snapshot_are_absent` already pins. The
+        fallback must not resurrect it as a false group.
+        """
+        record = {r['id']: r for r in _liveness_corpus()}['1eef7df7']
+
+        facts = liveness_snapshot_subject_facts(record, _SENTINEL_CORE_FACT)
+
+        assert facts['99'] == {_SENTINEL_CORE_FACT}, (
+            'keyed on the whole-record union, exactly as before the rescope'
+        )
+        assert facts['94'] == {_SENTINEL_CORE_FACT, _CORE_FACT_STRANDED}, (
+            'and its clause-bearing sibling in the SAME record does gain one -- '
+            'so 99 fell back, it was not the whole scan coming back empty'
+        )
+
+        groups, _ = find_liveness_snapshot_recurrences(_liveness_corpus())
+
+        assert '99' not in [g['subject_task_id'] for g in groups], (
+            'still a singleton -- the fallback restores recall, not a group'
+        )
+
+    def test_a_clause_split_inside_a_quoted_value_falls_back(self):
+        """`status="done. now"` -- the boundary lands mid-value.
+
+        `WIDE_CLAUSE_BOUNDARY_RE` is a regex over prose, not a parser, so a `.` inside
+        a quoted value splits the clause and leaves task 94's half holding an
+        unterminated `status="done` that `_readable_field_pairs` declines to
+        read. The RECORD-level classifier sees the value whole and keys fine,
+        asserted first so the fixture is known to reach the fallback for the
+        stated reason rather than by failing to classify at all.
+        """
+        content = (
+            'Point-in-time liveness check performed 2026-07-24 on task 94: '
+            'status="done. now", claimant_run_id=null, heartbeat_at=null'
+        )
+        record = _memory('quoted-split', content, category=_OS,
+                         metadata={'task_id': '94'})
+        record_key = extract_liveness_snapshot_fact(record)
+
+        assert record_key == 'claimant_run_id=null|heartbeat_at=null|status=done. now', (
+            'the record-level read is whole -- only the CLAUSE is truncated'
+        )
+        assert liveness_snapshot_subject_facts(record, _SENTINEL_CORE_FACT) == {
+            '94': {_SENTINEL_CORE_FACT},
+        }, 'the subject falls back rather than vanishing from the report'
+
+    def test_the_fallback_adds_no_disclosure_counter(self):
+        """Nothing is lost, so nothing is disclosed as lost.
+
+        The counter set is a contract with the metrics layer; a fallback that
+        reproduces today's key byte-for-byte is not a loss and must not grow
+        it.
+        """
+        _groups, disclosure = find_liveness_snapshot_recurrences(_liveness_corpus())
+
+        assert set(disclosure) == set(_LIVENESS_DISCLOSURE_KEYS)
+        assert set(disclosure.values()) == {0}
+
+
+# ONE clause carrying all three fields, and the SAME fact spread across two
+# clauses -- the ordinary shape, not an exotic one: `\n` is a clause boundary
+# too, so any snapshot naming its task on one line and listing fields on the
+# following lines splits exactly like this. Both records produce the IDENTICAL
+# whole-record key, so they grouped before the rescope.
+_LIVENESS_94_ONE_CLAUSE = (
+    'Point-in-time liveness check performed 2026-07-24 on task 94: get_task '
+    'reports status="in-progress" but claimant_run_id=null and '
+    'heartbeat_at=null.'
+)
+_LIVENESS_94_SPLIT_CLAUSES = (
+    'Point-in-time liveness check performed 2026-07-26 on task 94: get_task '
+    'reports status="in-progress". Separately, claimant_run_id=null and '
+    'heartbeat_at=null were observed for it.'
+)
+
+
+class TestLivenessSubjectFactsIsAdditive:
+    """*core_fact* is among a subject's keys ALWAYS -- the monotonicity proof.
+
+    Clause scoping is only safe on this report-only path if it can add
+    groupings and never take one away. `TestLivenessSubjectFactsFallback`
+    covers the case where a subject's clauses assert NOTHING; this class
+    covers the strictly harder one they do not reach -- clause evidence that
+    is non-empty but INCOMPLETE.
+
+    This is the failure mode the unconditional seed closes: record B below
+    names task 94 in its first clause and puts the other two fields in a
+    second clause naming no task, so keying the subject on the partial
+    `status=in-progress` ALONE would match nothing, vacating the whole-record
+    bucket it shares with A and making `find_liveness_snapshot_recurrences`
+    return `[]` with an ALL-ZERO disclosure -- the outcome the unconditional
+    seed prevents, pinned below. A fallback that fires only on the empty set
+    cannot catch that; a non-empty-but-incomplete set wins outright.
+
+    The invariant that closes it: every subject buckets under *core_fact*
+    unconditionally, with the clause-scoped fact ADDED beside it. Every bucket
+    membership that existed before the rescope therefore still exists, which is
+    what makes "clause scoping can only ADD recall" a true statement about the
+    mechanism rather than an aspiration about the common case.
+
+    A record whose union key is COHERENT, like both of these, is now given no
+    clause-scoped key at all -- a second guard on the same invariant, and the
+    one that keeps grouping from turning on where the author put a full stop.
+    A clause key earns a bucket of its own only by naming the record's FULL
+    field vocabulary; a PARTIAL one is dropped everywhere, DIVERGENT record
+    included, and the divergent-record test below pins what survives that
+    drop -- the seed is never swapped out, so its subject keeps the
+    whole-record bucket it would have had anyway.
+    """
+
+    def _pair(self) -> list[dict]:
+        return [
+            _dated('A', _LIVENESS_94_ONE_CLAUSE, _TS_94_JUL24,
+                   category=_OS, metadata={'task_id': '94'}),
+            _dated('B', _LIVENESS_94_SPLIT_CLAUSES, _TS_REVERIFY,
+                   category=_OS, metadata={'task_id': '94'}),
+        ]
+
+    def test_an_incomplete_clause_still_keeps_the_whole_record_grouping(self):
+        """Asserted in link order, so a failure says WHICH link broke."""
+        a, b = self._pair()
+
+        # PREMISE: these two DID group before the rescope -- one record key.
+        assert extract_liveness_snapshot_fact(a) == _CORE_FACT_STRANDED
+        assert extract_liveness_snapshot_fact(b) == _CORE_FACT_STRANDED, (
+            'the record-level read is whole for both -- only B is SPLIT across '
+            'clauses, which is a clause-scoping question, not a reading one'
+        )
+
+        # The projection: the record key, and for B no weaker key beside it.
+        assert liveness_snapshot_subject_facts(a, _CORE_FACT_STRANDED) == {
+            '94': {_CORE_FACT_STRANDED},
+        }
+        assert liveness_snapshot_subject_facts(b, _CORE_FACT_STRANDED) == {
+            '94': {_CORE_FACT_STRANDED},
+        }, (
+            'B says the SAME coherent thing as A, split over two clauses -- '
+            'keying it on `status=in-progress` as well would make grouping '
+            'turn on the full stop, and swapping it in would drop the group'
+        )
+
+        # And therefore the group survives the rescope.
+        groups, disclosure = find_liveness_snapshot_recurrences(self._pair())
+
+        assert [(g['subject_task_id'], g['core_fact'], g['member_ids'])
+                for g in groups] == [
+            ('94', _CORE_FACT_STRANDED, ['A', 'B']),
+        ], 'exactly the group that existed before clause scoping'
+        assert set(disclosure.values()) == {0}, (
+            'a vacated bucket moves no counter, which is why the regression was '
+            'invisible -- the group itself is the only observable'
+        )
+
+    def test_a_divergent_records_incomplete_clause_earns_no_bucket_of_its_own(self):
+        """An INCOMPLETE clause earns no bucket; the seed is never swapped out.
+
+        Task 94's clause here names only `status`; task 96's names all three.
+        The union is a chimera, so clause scoping engages -- but 94's clause
+        names a strict SUBSET of the record's field vocabulary, so it earns no
+        clause key of its own (`TestLivenessClauseFragmentFalseGroup` pins the
+        harm this prevents). The invariant this class exists for still holds:
+        the seed is never SWAPPED OUT -- 94 keeps the whole-record union it
+        shares with any other record asserting the same chimera.
+        """
+        record = _memory('divergent-partial', _LIVENESS_DIVERGENT_PARTIAL_94,
+                         category=_OS, metadata={'task_id': '94'})
+
+        assert extract_liveness_snapshot_fact(record) == _CORE_FACT_DIVERGENT
+
+        assert liveness_snapshot_subject_facts(record, _CORE_FACT_DIVERGENT) == {
+            '94': {_CORE_FACT_DIVERGENT},
+            '96': {_CORE_FACT_DIVERGENT, _CORE_FACT_DONE},
+        }, (
+            "94's incomplete clause earns no bucket of its own, but its seed "
+            '-- the whole-record union -- is never swapped out; '
+            "96's clause names the record's full field vocabulary and keeps "
+            'its clause key beside the seed'
+        )
+
+
+# A record whose whole-record key names `status` TWICE -- the chimera that
+# matches no single-task snapshot, and the only shape given a clause-scoped
+# key. The partial variant assigns task 94 one field and task 96 all three, so
+# 94's clause key is a strict subset of the union.
+_LIVENESS_DIVERGENT_94_96 = (
+    'Point-in-time liveness check performed 2026-07-26 on task 94: '
+    'status="in-progress", claimant_run_id=null, heartbeat_at=null. '
+    'Separately on task 96: status="done", claimant_run_id=null, '
+    'heartbeat_at=null.'
+)
+_LIVENESS_DIVERGENT_PARTIAL_94 = (
+    'Point-in-time liveness check performed 2026-07-26 on task 94: '
+    'status="in-progress". Separately on task 96: status="done", '
+    'claimant_run_id=null, heartbeat_at=null.'
+)
+_CORE_FACT_DIVERGENT = (
+    'claimant_run_id=null|heartbeat_at=null|status=done|status=in-progress'
+)
+_CORE_FACT_DONE = 'claimant_run_id=null|heartbeat_at=null|status=done'
+
+# A record whose WHOLE-record key is exactly the one field `status`. Used to
+# show that a clause-scoped key naming only a STRICT SUBSET of its own
+# record's fields must not join this record's bucket -- a collision the
+# whole-record key would never have produced, because it names only that one
+# field to begin with.
+_LIVENESS_WEAK_WHOLE_94 = ('Point-in-time liveness check performed 2026-07-26 '
+                           'on task 94: status="in-progress".')
+
+
+class TestLivenessOneSubjectOneGroupPerMemberSet:
+    """Dual keying never reports one subject TWICE over the same members.
+
+    `liveness_snapshot_recurrences` is an ARMED `higher_is_worse` count, so a
+    structural doubling on a whole content shape is a false accretion signal,
+    not a cosmetic one -- and a duplicate row in the details table for the
+    human reading it. Only a DIVERGENT record is given two keys at all, so
+    this is where the collapse is exercised; the richer key wins it, which is
+    always the whole-record one, so the survivor is the group that predates
+    clause scoping.
+    """
+
+    def _divergent(self, record_id: str, created_at: str) -> dict:
+        return _dated(record_id, _LIVENESS_DIVERGENT_94_96, created_at,
+                      category=_OS, metadata={'task_id': '94'})
+
+    def test_identical_divergent_records_report_one_group_per_subject(self):
+        """Four buckets, two findings: each subject is keyed twice over the
+        SAME two members, so half the buckets are the same finding restated.
+        """
+        corpus = [self._divergent('D1', _TS_94_JUL24),
+                  self._divergent('D2', _TS_REVERIFY)]
+
+        groups, disclosure = find_liveness_snapshot_recurrences(corpus)
+
+        assert [(g['subject_task_id'], g['core_fact'], g['member_ids'])
+                for g in groups] == [
+            ('94', _CORE_FACT_DIVERGENT, ['D1', 'D2']),
+            ('96', _CORE_FACT_DIVERGENT, ['D1', 'D2']),
+        ], 'one group per subject -- not one per (subject, key)'
+        assert set(disclosure.values()) == {0}
+
+    def test_two_groups_for_one_subject_come_back_in_a_stable_order(self):
+        """The sort tie dual keying still reaches, once the members DIFFER.
+
+        Adding a single-task snapshot of task 94 grows the clause-scoped
+        bucket to three members while the chimera bucket keeps two, so both
+        survive the collapse. They share category, subject and first member
+        id, and only `core_fact` discriminates them -- without that tiebreak
+        their order falls out of dict insertion, breaking the Returns
+        contract's promise that two identical runs serialise byte-identically.
+        """
+        corpus = [
+            self._divergent('D1', _TS_94_JUL24),
+            self._divergent('D2', _TS_REVERIFY),
+            _dated('E', _LIVENESS_SNAPSHOT_94_JUL24, _TS_96_JUL24,
+                   category=_OS, metadata={'task_id': '94'}),
+        ]
+
+        groups, _ = find_liveness_snapshot_recurrences(corpus)
+
+        assert [(g['subject_task_id'], g['core_fact'], g['member_ids'])
+                for g in groups] == [
+            ('94', _CORE_FACT_DIVERGENT, ['D1', 'D2']),
+            ('94', _CORE_FACT_STRANDED, ['D1', 'D2', 'E']),
+            ('96', _CORE_FACT_DIVERGENT, ['D1', 'D2']),
+        ], 'sorted by core_fact ascending once category/subject/first-id tie'
 
 
 class TestFindLivenessSnapshotRecurrences:
@@ -4150,46 +5861,69 @@ class TestFindLivenessSnapshotRecurrences:
 
         assert groups == []
 
-    def test_divergent_per_task_statuses_do_not_group(self):
-        """The KNOWN LIMITATION of the whole-record key, pinned not hidden.
+    def test_divergent_per_task_statuses_group_per_subject(self):
+        """The whole-record limitation, CLOSED: each subject keys on its own clause.
 
-        The core fact is built ONCE PER RECORD by unioning every assignment in
-        its content, then attributed to every subject the record names. When a
-        multi-task re-verification reports DIFFERENT values per task, that
-        merged key matches neither single-task snapshot and both stay
-        singletons.
+        The core fact is no longer built once per record and attributed to
+        every subject it names. `find_liveness_snapshot_recurrences` splits the
+        content into clauses with `task_filter.WIDE_CLAUSE_BOUNDARY_RE`, reads the
+        task refs and the `<field>=<value>` assignments of each clause
+        separately, and keys every subject on the union of the clauses that
+        NAME it -- the same idiom `task_filter.find_conflicting_task_status_ids`
+        uses. A multi-task re-verification reporting DIVERGENT values per task
+        therefore joins each subject's own group instead of matching neither.
 
-        The real motivating record (1eef7df7) reports identical values for
-        both its subjects, so the detector fires on the corpus that motivated
-        it. Per-subject clause scoping was tried and rejected on evidence:
-        `_CLAUSE_SPLIT_RE` splits on `.`, shattering filenames mid-sentence,
-        and the real content writes `task/94`, which `TASK_REF_RE` does not
-        match -- it yields the EMPTY SET on all four real records. This is a
-        RECALL gap in a report-only path, never a wrong delete.
+        This was genuinely inert when the detector was written: the clause
+        splitter split on EVERY `.`, shattering filenames mid-sentence, and the real
+        content writes `task/94`, which `TASK_REF_RE` did not match -- together
+        they yielded the EMPTY SET on all four real records. Task 3403 fixed
+        both regexes at the source, and this task re-MEASURED the technique
+        against those same four records (see
+        `TestLivenessSnapshotSubjectFacts`) rather than assuming it now returns
+        non-empty.
+
+        The record-level key is untouched: `extract_liveness_snapshot_fact`
+        still returns ONE merged key per record, asserted below, so the
+        per-subject fact is a genuinely new projection rather than a change to
+        an existing one.
         """
+        # All THREE live fields in EACH per-task clause. Two fields per clause
+        # would key subject 94 at `claimant_run_id=null|status=in-progress`,
+        # which still matches no single-task snapshot -- the divergence would
+        # go unreported for a reason that has nothing to do with clause
+        # scoping, and the test would pass under the OLD implementation too.
         divergent = (
             'Point-in-time liveness check performed 2026-07-26 on task 94: '
-            'status="in-progress", claimant_run_id=null. Separately on task '
-            '96: status="done", claimant_run_id=null.'
+            'status="in-progress", claimant_run_id=null, heartbeat_at=null. '
+            'Separately on task 96: status="done", claimant_run_id=null, '
+            'heartbeat_at=null.'
+        )
+        done_96 = (
+            'Point-in-time liveness check performed 2026-07-24 on task 96: '
+            'status="done", claimant_run_id=null, heartbeat_at=null.'
         )
         corpus = [
-            _dated('6b245659', _LIVENESS_SNAPSHOT_94_JUL24, _TS_94_JUL24,
+            _dated('a94', _LIVENESS_SNAPSHOT_94_JUL24, _TS_94_JUL24,
                    category=_OS, metadata={'task_id': '94'}),
+            _dated('b96', done_96, _TS_96_JUL24,
+                   category=_OS, metadata={'task_id': '96'}),
             _dated('divergent', divergent, _TS_REVERIFY,
                    category=_OS, metadata={'task_id': '99'}),
         ]
 
         groups, disclosure = find_liveness_snapshot_recurrences(corpus)
 
-        assert extract_liveness_snapshot_fact(corpus[1]) == (
-            'claimant_run_id=null|status=done|status=in-progress'
-        ), 'one merged key per record, carrying BOTH statuses'
-        assert groups == [], (
-            'the merged key matches neither single-task snapshot, so the '
-            'recurrence goes unreported -- a recall gap, not a bad delete'
-        )
+        assert extract_liveness_snapshot_fact(corpus[2]) == (
+            'claimant_run_id=null|heartbeat_at=null|status=done|status=in-progress'
+        ), 'the RECORD-level key is still one merged key carrying BOTH statuses'
+        assert [(g['subject_task_id'], g['core_fact'], g['member_ids'])
+                for g in groups] == [
+            ('94', _CORE_FACT_STRANDED, ['a94', 'divergent']),
+            ('96', 'claimant_run_id=null|heartbeat_at=null|status=done',
+             ['b96', 'divergent']),
+        ], 'each subject joins the group its OWN clause asserts'
         assert set(disclosure.values()) == {0}, (
-            'and it is NOT a counted loss: both records classified fine'
+            'and nothing is disclosed as lost: every record classified fine'
         )
 
 
@@ -4300,6 +6034,178 @@ class TestFindLivenessSnapshotRecurrencesDisclosure:
         assert set(disclosure.values()) == {0}
 
 
+class TestLivenessPartialKeyFalseGroup:
+    """The actual harm, pinned at the level `--apply` acts on.
+
+    `TestLivenessSnapshotUnfieldedVerdictIsPerField` is a unit-level guard on
+    the classifier; this class exercises `find_liveness_snapshot_recurrences`
+    instead, because the concrete damage this task exists to prevent is a
+    false RECURRENCE GROUP over two records asserting different facts -- and
+    a group is exactly what `--apply` would delete.
+    """
+
+    def test_two_records_with_different_unreadable_statuses_form_no_group(self):
+        """On the base commit these two records DO group -- an in-progress
+        snapshot merged with a done one, sharing the survivors-only key
+        `claimant_run_id=null|heartbeat_at=null`. The loss is now visible on
+        a counter instead of forming a silent, irreversible-under-`--apply`
+        false cluster.
+        """
+        corpus = [
+            _dated('ip', _UNREADABLE_STATUS_IN_PROGRESS, _TS_94_JUL24,
+                   category=_OS, metadata={'task_id': '94'}),
+            _dated('done', _UNREADABLE_STATUS_DONE, _TS_REVERIFY,
+                   category=_OS, metadata={'task_id': '94'}),
+        ]
+
+        groups, disclosure = find_liveness_snapshot_recurrences(corpus)
+
+        assert groups == [], (
+            'an in-progress snapshot and a done one must never group'
+        )
+        assert disclosure == dict.fromkeys(_LIVENESS_DISCLOSURE_KEYS, 0) | {
+            'liveness_snapshot_unfielded': 2,
+        }
+
+    # Recall bound -- the real motivating corpus must keep every key and
+    # count no loss -- is already pinned in full and not re-asserted here:
+    # TestExtractLivenessSnapshotFact.test_all_three_real_snapshots_yield_the_same_key
+    # (the three keys collapse to `_CORE_FACT_STRANDED`),
+    # TestFindLivenessSnapshotRecurrences.test_exactly_the_two_real_groups
+    # (the exact two groups) and TestFindLivenessSnapshotRecurrencesDisclosure
+    # .test_clean_run_zero_fills_every_key (an all-zero disclosure).
+
+    def test_a_quoted_value_containing_a_field_name_is_not_a_loss(self):
+        """The precision guard a naive mention-count fix would fail.
+
+        The inner `claimant_run_id=` sits inside the span already consumed
+        as `status`'s quoted value, so it is a readable value -- not a
+        second, unread mention of a sibling field.
+        """
+        content = (
+            'Point-in-time liveness check performed 2026-07-24 on task 94: '
+            'status="foo claimant_run_id=bar"'
+        )
+
+        key = extract_liveness_snapshot_fact(_memory('x', content, category=_OS))
+
+        assert key == 'status=foo claimant_run_id=bar'
+
+    def test_a_non_assignment_status_can_still_false_group(self):
+        """KNOWN LIMITATION, pinned not hidden -- the same discipline
+        `test_divergent_per_task_statuses_group_per_subject` used for the
+        whole-record-key limitation that task 3891 went on to close.
+
+        This task's fix closes the ASSIGNMENT-form route to a survivors-only
+        key: a `<field>=` written but whose value could not be read. It does
+        not close every route to one. A status spelled `status:` (colon, not
+        `=`) carries no `<field>=` token at all, so `_LIVE_FIELD_SCAN_RE`
+        never matches it there -- it is invisible to the scan rather than an
+        unread mention of it, and the record still keys on whatever OTHER
+        fields parse. Two records asserting opposite statuses through this
+        spelling therefore still share one key and still form one group,
+        pre-existing and unchanged by this task.
+        """
+        done = (
+            'Liveness check performed 2026-08-11 on task 94: status: done, '
+            'claimant_run_id=null, heartbeat_at=null.'
+        )
+        in_progress = (
+            'Liveness check performed 2026-08-11 on task 94: status: '
+            'in-progress, claimant_run_id=null, heartbeat_at=null.'
+        )
+        done_key = _classify_liveness_snapshot(done)
+        in_progress_key = _classify_liveness_snapshot(in_progress)
+
+        assert done_key == in_progress_key, (
+            'the pre-existing gap this task does not close'
+        )
+        assert done_key != (True, None), 'both sides still classify -- no loss'
+
+        corpus = [
+            _dated('done', done, _TS_94_JUL24,
+                   category=_OS, metadata={'task_id': '94'}),
+            _dated('ip', in_progress, _TS_REVERIFY,
+                   category=_OS, metadata={'task_id': '94'}),
+        ]
+        groups, disclosure = find_liveness_snapshot_recurrences(corpus)
+
+        assert [(g['subject_task_id'], g['member_ids']) for g in groups] == [
+            ('94', ['done', 'ip']),
+        ], 'still forms a group -- closing it is out of scope for this task'
+        assert set(disclosure.values()) == {0}, 'and not a counted loss either'
+
+
+class TestLivenessClauseFragmentFalseGroup:
+    """A clause-scoped key built from a FRAGMENT of its record must never
+    manufacture a group the whole-record key could not have produced.
+
+    A clause key naming a STRICT SUBSET of the fields its own record was
+    recognised to speak about is the same "key built from a fragment of what
+    the record asserts" that `_classify_liveness_snapshot`'s survivors-only
+    refusal already forbids at the record level -- just reached through
+    clause scoping instead of an unread field. `liveness_snapshot_recurrences`
+    is an ARMED `higher_is_worse` count, so a false group here is a false
+    accretion signal, not a cosmetic one.
+    """
+
+    def test_a_fragment_clause_key_never_joins_an_unrelated_whole_record_bucket(self):
+        # (a) PREMISE, asserted first: the weak-whole record classifies for
+        # the reason this test needs it to, not because it failed to
+        # classify at all.
+        assert _classify_liveness_snapshot(_LIVENESS_WEAK_WHOLE_94) == (
+            True, 'status=in-progress',
+        ), 'the fixture must reach the collision by classifying cleanly'
+
+        # (b) PREMISE: task 94's clause in the divergent-partial record
+        # earns no clause-derived key of its own (the full projection,
+        # including 96's surviving clause key beside the seed, is pinned by
+        # TestLivenessSubjectFactsIsAdditive::
+        # test_a_divergent_records_incomplete_clause_earns_no_bucket_of_its_own
+        # -- not re-asserted here). Checking it here too means the corpus
+        # below can only produce (c)'s harm through the unconditional seed,
+        # never a surviving clause key.
+        record = _memory('divergent-partial', _LIVENESS_DIVERGENT_PARTIAL_94,
+                         category=_OS, metadata={'task_id': '94'})
+
+        subject_facts = liveness_snapshot_subject_facts(record, _CORE_FACT_DIVERGENT)
+        assert subject_facts['94'] == {_CORE_FACT_DIVERGENT}, (
+            "94's clause names only `status`, a strict subset of the "
+            "record's {claimant_run_id, heartbeat_at, status} vocabulary, "
+            'so it must earn no clause key of its own'
+        )
+
+        # (c) THE HARM, at the level the ARMED metric counts. D is the
+        # divergent-partial record; W's WHOLE-record key is exactly the one
+        # field `status=in-progress`. D's own RECORD-level vocabulary is
+        # three fields wide -- claimant_run_id, heartbeat_at, status -- but
+        # that width comes entirely from what D says about task 96; D's own
+        # clause about 94 says only `status`, the same one field W's whole
+        # record says. Pre-fix, D's clause key for 94 joined W's
+        # whole-record bucket anyway, because the gate compares against
+        # D's RECORD-level vocabulary, not what is complete for subject 94
+        # specifically (see liveness_snapshot_subject_facts's docstring for
+        # that trade-off).
+        corpus = [
+            _dated('D', _LIVENESS_DIVERGENT_PARTIAL_94, _TS_94_JUL24,
+                   category=_OS, metadata={'task_id': '94'}),
+            _dated('W', _LIVENESS_WEAK_WHOLE_94, _TS_REVERIFY,
+                   category=_OS, metadata={'task_id': '94'}),
+        ]
+
+        groups, disclosure = find_liveness_snapshot_recurrences(corpus)
+
+        assert groups == [], (
+            "a subject named in a clause that omits two of its record's "
+            'three fields must not join an unrelated record whose whole '
+            'assertion is that one field'
+        )
+        assert set(disclosure.values()) == {0}, (
+            'the gate drops an ADDED key while the unconditional seed '
+            'stays, so nothing is vacated and no counter moves'
+        )
+
+
 # The plan keys that existed before task 3098. Pinned so an additive change
 # stays additive: no pre-existing key may be dropped or renamed.
 _PRE_3098_PLAN_KEYS = frozenset({
@@ -4315,6 +6221,16 @@ _LIVENESS_PLAN_KEYS = frozenset({
     'liveness_snapshot_recurrence_clusters',
     'liveness_snapshot_disclosure',
 })
+
+# Task 3357: the cutoff that authoritatively gated each category, echoed
+# beside the scalar Qdrant floor so a report reader can tell which number
+# gated which category. Kept as its own manifest so the plan's key growth
+# stays attributable to the task that caused it.
+_PER_CATEGORY_PLAN_KEYS = frozenset({'ann_threshold_by_category'})
+
+# Task 3136: the retention counts, child counts and scan coverage the weekly
+# duplicate-cluster report reads beside the clusters.
+_REPORT_FEED_PLAN_KEYS = frozenset({'retained_carveout', 'child_counts', 'scan_coverage'})
 
 
 class TestBuildSweepPlanLivenessRecurrences:
@@ -4358,9 +6274,9 @@ class TestBuildSweepPlanLivenessRecurrences:
         seen: list[list[dict]] = []
         real = _mod.restrict_delete_candidates_for_apply
 
-        def _spy(groups):
+        def _spy(groups, *args, **kwargs):
             seen.append(groups)
-            return real(groups)
+            return real(groups, *args, **kwargs)
 
         monkeypatch.setattr(_mod, 'restrict_delete_candidates_for_apply', _spy)
         build_sweep_plan(_liveness_corpus())
@@ -4382,7 +6298,13 @@ class TestBuildSweepPlanLivenessRecurrences:
             threshold=_THRESHOLD,
         )
 
-        assert set(plan) == _PRE_3098_PLAN_KEYS | _LIVENESS_PLAN_KEYS
+        assert set(plan) == (
+            _PRE_3098_PLAN_KEYS | _LIVENESS_PLAN_KEYS | _PER_CATEGORY_PLAN_KEYS
+            | _REPORT_FEED_PLAN_KEYS
+        )
+        assert plan['ann_threshold_by_category'] == {}, (
+            'a caller that ran no ANN path reports an empty map, not a null'
+        )
         assert plan['clusters_total'] == 1, 'the lexical path is unaffected'
         assert plan['delete_candidates'] == (
             plan['near_duplicate_groups'][0]['delete_candidate_ids']
@@ -4491,7 +6413,7 @@ class TestLivenessRecurrenceMetrics:
         )
 
     def test_series_still_validates_and_metrics_stay_sorted(self):
-        from shared.memory_eval_metrics import validate_metric_series  # noqa: PLC0415
+        from shared.memory_eval_metrics import validate_metric_series
 
         records, plans = self._fixture()
         metrics, _details = compute_cluster_metrics(records, plans, {})
@@ -4504,6 +6426,74 @@ class TestLivenessRecurrenceMetrics:
             corpus_counts={c: len(v) for c, v in records.items()},
             run_stamp='20260731T000000Z',
         ))
+
+
+class TestLivenessRecurrenceMetricsUnderDualKeying:
+    """A corpus that has not changed must not read higher because one
+    subject is now keyed twice over the same members.
+
+    Every fixture in `TestLivenessRecurrenceMetrics` runs the REAL corpus,
+    whose four records are COHERENT -- the divergence gate never opens,
+    dual keying is never exercised, and nothing at the metrics layer guards
+    the number `liveness_snapshot_recurrences` actually reports. This class
+    arms that guarantee: the count is GROUPS PER SUBJECT, not buckets per
+    (subject, key), at the layer the regression alarm actually reads --
+    not just at the detector level
+    (`TestLivenessOneSubjectOneGroupPerMemberSet`).
+    """
+
+    def _fixture(self):
+        # Same shape TestLivenessOneSubjectOneGroupPerMemberSet._divergent
+        # builds, so the detector-level and metrics-level pins exercise one
+        # corpus: two identical divergent records, D1/D2, over subjects
+        # 94 and 96 -- four buckets that collapse to two groups.
+        corpus = [
+            _dated('D1', _LIVENESS_DIVERGENT_94_96, _TS_94_JUL24,
+                   category=_OS, metadata={'task_id': '94'}),
+            _dated('D2', _LIVENESS_DIVERGENT_94_96, _TS_REVERIFY,
+                   category=_OS, metadata={'task_id': '94'}),
+        ]
+        plan = build_sweep_plan(corpus)
+        records = {_OS: corpus, _PK: []}
+        return plan, records, split_plan_by_category(plan, (_OS, _PK))
+
+    def test_plan_level_cluster_count_is_collapsed_too(self):
+        plan, _records, _plans = self._fixture()
+
+        assert plan['liveness_snapshot_recurrence_clusters'] == 2, (
+            'four buckets, two findings -- the plan-level count is '
+            'collapsed too, not just the detector return'
+        )
+
+    def test_the_armed_metric_reads_two_not_four(self):
+        _plan, records, plans = self._fixture()
+
+        metrics, _details = compute_cluster_metrics(records, plans, {})
+        metric = _by_id(metrics)[f'liveness_snapshot_recurrences.{_OS}']
+
+        assert metric.kind == 'count', (
+            "the docstring's ARMED claim, checked here rather than only "
+            'asserted in prose'
+        )
+        assert metric.direction == 'higher_is_worse'
+        assert metric.value == 2.0, (
+            'one subject keyed twice over the SAME two members must read '
+            'as ONE group, not two'
+        )
+        assert metric.n == 2, 'n is the exposure: the category corpus size'
+
+    def test_details_table_has_no_duplicate_row(self):
+        _plan, records, plans = self._fixture()
+
+        _metrics, details = compute_cluster_metrics(records, plans, {})
+        table = details['categories'][_OS]['liveness_snapshot_recurrences']
+
+        assert len(table) == 2, 'no duplicate row for the human reader'
+        assert len({(row['subject_task_id'], tuple(row['member_ids']))
+                    for row in table}) == 2, (
+            'two distinct (subject, member_ids) pairs -- the other half of '
+            'the harm a structural doubling would cause'
+        )
 
 
 def _liveness_raw_corpus() -> dict[str, list[dict]]:
@@ -4550,7 +6540,7 @@ class TestRunLivenessRecurrenceWiring:
     async def test_metric_series_carries_the_count_and_both_disclosures(
         self, monkeypatch, tmp_path,
     ):
-        from shared.memory_eval_metrics import (  # noqa: PLC0415
+        from shared.memory_eval_metrics import (
             RUN_STAMP_ENV_VAR,
             load_metric_series,
         )
@@ -4648,22 +6638,32 @@ _LONG_PROSE_NO_MARKER = (
 
 
 class _CountingPattern:
-    """A delegating stand-in for a compiled pattern that counts `.search`.
+    """A delegating stand-in for a compiled pattern that counts consults.
 
     Delegates to the real pattern rather than stubbing it, so behaviour is
     unchanged and the class below measures COST, not semantics. It exposes
-    `search` and nothing else on purpose: if the implementation ever reaches
-    for `.match`/`.findall`/`.finditer` on this pattern, the AttributeError
+    `search` and `findall` and nothing else on purpose: if the implementation
+    ever reaches for `.match`/`.finditer` on this pattern, the AttributeError
     surfaces that here instead of letting an uncounted consult pass as free.
+
+    `findall` records the STRING it was handed rather than a bare tally,
+    because the budget that matters for `TASK_REF_RE` is per-argument: one
+    whole-content pass plus N per-clause ones is the intended shape, and a
+    tally alone cannot tell that from two whole-content passes.
     """
 
     def __init__(self, pattern):
         self._pattern = pattern
         self.searches = 0
+        self.findall_args: list[str] = []
 
     def search(self, string, *args, **kwargs):
         self.searches += 1
         return self._pattern.search(string, *args, **kwargs)
+
+    def findall(self, string, *args, **kwargs):
+        self.findall_args.append(string)
+        return self._pattern.findall(string, *args, **kwargs)
 
 
 class TestLivenessDetectorRegexBudget:
@@ -4727,9 +6727,9 @@ class TestLivenessDetectorRegexBudget:
         """The load-bearing case for choosing the BROADER prefilter.
 
         This is the one record class that matches `LIVE_TASK_STATUS_RE` (via
-        the "actively driven by" paraphrase) but NOT
-        `_LIVE_FIELD_ASSIGNMENT_RE`. Prefiltering on the narrower assignment
-        pattern would read as one consult here too, while silently driving
+        the "actively driven by" paraphrase) but produces no match at all
+        against `_LIVE_FIELD_SCAN_RE`. Prefiltering on the narrower scan pattern
+        would read as one consult here too, while silently driving
         `liveness_snapshot_unfielded` to a permanent zero — turning a counted
         loss back into an invisible one.
         """
@@ -4789,6 +6789,58 @@ class TestLivenessDetectorRegexBudget:
         ]
         assert disclosure == dict.fromkeys(_LIVENESS_DISCLOSURE_KEYS, 0)
 
+    def test_the_subject_set_is_read_off_the_content_exactly_once(
+        self, monkeypatch,
+    ):
+        """`TASK_REF_RE` sees the WHOLE content once per record, never twice.
+
+        `find_liveness_snapshot_recurrences` needs the subject set for the
+        untasked disclosure and `liveness_snapshot_subject_facts` needs the
+        same set to key on. Deriving it in both places ran this pattern over
+        the full content a second time per record -- on top of the per-clause
+        reads -- in a module that budgets regex consults per record, so the
+        set is threaded through instead. Pinned by ARGUMENT, not by total: a
+        per-clause consult must never be mistaken for the whole-content one.
+        """
+        counter = _CountingPattern(TASK_REF_RE)
+        monkeypatch.setattr(_mod, 'TASK_REF_RE', counter)
+
+        find_liveness_snapshot_recurrences([
+            _dated('6b245659', _LIVENESS_SNAPSHOT_94_JUL24, _TS_94_JUL24,
+                   category=_OS, metadata={'task_id': '94'}),
+        ])
+
+        assert counter.findall_args == [_LIVENESS_SNAPSHOT_94_JUL24], (
+            'one whole-content pass, and a COHERENT record never reaches the '
+            'clause scan at all'
+        )
+
+    def test_a_divergent_record_reads_the_content_once_then_its_clauses(
+        self, monkeypatch,
+    ):
+        """The gate open, the budget unchanged: the extra reads are CLAUSES.
+
+        The sibling above cannot see this, because a coherent record skips the
+        clause scan entirely -- so without this test "threaded, not
+        re-derived" would be pinned only on the path that does no clause work.
+        """
+        counter = _CountingPattern(TASK_REF_RE)
+        monkeypatch.setattr(_mod, 'TASK_REF_RE', counter)
+
+        find_liveness_snapshot_recurrences([
+            _dated('D', _LIVENESS_DIVERGENT_94_96, _TS_REVERIFY,
+                   category=_OS, metadata={'task_id': '94'}),
+        ])
+
+        assert counter.findall_args.count(_LIVENESS_DIVERGENT_94_96) == 1, (
+            'still ONE whole-content pass with the clause scan running'
+        )
+        assert all(arg in _LIVENESS_DIVERGENT_94_96
+                   for arg in counter.findall_args[1:]), (
+            'every other consult is a clause of that content, not another '
+            'pass over the whole of it'
+        )
+
     def test_the_public_extractor_keeps_its_single_arg_contract(self, consults):
         """Still one argument, still None/key — and free on a marker-free record."""
         no_marker = _memory('prose', _LONG_PROSE_NO_MARKER, category=_OS)
@@ -4823,3 +6875,221 @@ class TestLivenessDetectorRegexBudget:
             ('96', ['08aa0017', '1eef7df7']),
         ]
         assert disclosure == dict.fromkeys(_LIVENESS_DISCLOSURE_KEYS, 0)
+
+
+@pytest.mark.asyncio
+class TestApplyStoreMutationPreflight:
+    """``--apply`` refuses to START when this process cannot write mem0's store.
+
+    Ported from ``test_sweep_toolcall_xml_leak.TestRunApplyStoreMutationPreflight``
+    (task 3686), which is the in-repo precedent for this contract.
+
+    ``apply_deletions`` wraps each ``delete_memory`` in a per-record
+    ``except Exception`` and increments ``delete_errors``, so in a write-denied
+    environment it would produce N logged errors and N already-destroyed
+    Qdrant points -- mem0's ``_delete_memory`` removes the point BEFORE writing
+    its SQLite history. This module's own docstring warns that "under --apply
+    every non-survivor of that chain is an irreversible delete"; the guard is
+    what makes that warning enforceable rather than advisory.
+    """
+
+    def _raw(self) -> dict:
+        """A real two-member cluster, so ``--apply`` has work to refuse."""
+        return {_PK: [
+            _raw('m1', _VENV_GOTCHA_A, '2026-01-01T00:00:00+00:00'),
+            _raw('m2', _VENV_GOTCHA_B, '2026-01-02T00:00:00+00:00'),
+        ]}
+
+    async def test_apply_never_even_opens_a_client_when_the_store_is_unwritable(
+        self, monkeypatch, tmp_path,
+    ):
+        """The strongest available zero-mutation proof for this script: it
+        cannot delete because it never constructs a MemoryService at all.
+
+        The guard sits ahead of both the config load and the service
+        construction, so a refused --apply also never reaches the
+        ``finally: await memory.close()`` teardown of a service that was never
+        initialized.
+        """
+        deny(_mod, monkeypatch)
+        _install_run_doubles(monkeypatch, self._raw())
+        args = _build_parser().parse_args([
+            '--project-id', 'p', '--apply', '--threshold', '0.75',
+            '--metrics-root', str(tmp_path),
+        ])
+
+        with pytest.raises(
+            StoreMutationUnavailable, match=SENTINEL
+        ):
+            await _run(args)
+
+        assert _FakeMemoryService.instances == [], (
+            'no MemoryService may be constructed once the preflight has refused'
+        )
+
+    async def test_the_guard_sits_before_the_scan_and_the_ann_fan_out(
+        self, monkeypatch, tmp_path,
+    ):
+        """It aborts without a single Qdrant read: neither ``fetch_memories``'
+        per-category scroll (with_vectors=True) nor ``fetch_ann_neighbors``'
+        per-record query fan-out is paid for."""
+        deny(_mod, monkeypatch)
+        _install_run_doubles(monkeypatch, self._raw())
+        called: list[str] = []
+        monkeypatch.setattr(
+            _mod, 'fetch_memories',
+            lambda *a, **kw: called.append('fetch_memories'),
+        )
+        monkeypatch.setattr(
+            _mod, 'fetch_ann_neighbors',
+            lambda *a, **kw: called.append('fetch_ann_neighbors'),
+        )
+        args = _build_parser().parse_args([
+            '--project-id', 'p', '--apply', '--threshold', '0.75',
+            '--metrics-root', str(tmp_path),
+        ])
+
+        with pytest.raises(StoreMutationUnavailable):
+            await _run(args)
+
+        assert called == [], 'the scan must not run once the preflight has refused'
+
+    async def test_a_dry_run_is_never_gated_on_write_capability(
+        self, monkeypatch, tmp_path,
+    ):
+        """A read-only run mutates nothing, so it must not require the ability
+        to mutate -- the audit report stays obtainable from anywhere."""
+        deny(_mod, monkeypatch)
+        _install_run_doubles(monkeypatch, self._raw())
+        args = _build_parser().parse_args([
+            '--project-id', 'p', '--threshold', '0.75',
+            '--metrics-root', str(tmp_path),
+        ])
+
+        rc = await _run(args)
+
+        assert rc == 0
+        assert _FakeMemoryService.instances[-1].deleted == []
+
+    async def test_apply_is_unchanged_when_the_preflight_passes(
+        self, monkeypatch, tmp_path,
+    ):
+        """Happy path: a writable environment deletes exactly as before."""
+        _install_run_doubles(monkeypatch, self._raw())
+        args = _build_parser().parse_args([
+            '--project-id', 'p', '--apply', '--threshold', '0.75',
+            '--metrics-root', str(tmp_path),
+        ])
+
+        rc = await _run(args)
+
+        assert rc == 0
+        assert _FakeMemoryService.instances[-1].deleted == ['m2'], 'the oldest survives'
+
+    async def test_the_probe_names_the_operation_being_gated(
+        self, monkeypatch, tmp_path,
+    ):
+        """The refusal has to be attributable in a log, so the operation string
+        identifies this script and its mutating mode."""
+        calls: list[dict] = []
+        monkeypatch.setattr(
+            _mod, 'assert_store_mutation_allowed', lambda **kw: calls.append(kw)
+        )
+        _install_run_doubles(monkeypatch, self._raw())
+        args = _build_parser().parse_args([
+            '--project-id', 'p', '--apply', '--threshold', '0.75',
+            '--metrics-root', str(tmp_path),
+        ])
+
+        await _run(args)
+
+        assert len(calls) == 1, 'probed ONCE per run, not once per delete candidate'
+        assert 'audit_duplicate_memories' in calls[0]['operation']
+        assert '--apply' in calls[0]['operation']
+
+    async def test_the_refusal_raises_and_is_never_confusable_with_the_report_shaped_one(
+        self, monkeypatch, tmp_path,
+    ):
+        """``_apply_refusal_reason`` already refuses ``--apply`` on
+        empty-scan/truncation grounds -- but it returns an integer through the
+        NORMAL path, a handled outcome an operator can reasonably read past.
+
+        A write-capability denial is categorically different: proceeding would
+        leave a half-completed, unrecoverable store mutation. So it RAISES
+        rather than degrading into any of this script's ordinary integer
+        returns.
+
+        Rigged with an EMPTY scan -- the exact condition that drives
+        ``_apply_refusal_reason`` to return 1 -- to prove the write-capability
+        refusal wins over, rather than collapsing into, the report-shaped one.
+
+        Scoped to ``_run``: that the raise also survives the trip out through
+        ``main`` is a separate claim, tested in
+        ``TestApplyStoreMutationPreflightThroughMain``.
+        """
+        deny(_mod, monkeypatch)
+        _install_run_doubles(monkeypatch, {})
+        args = _build_parser().parse_args([
+            '--project-id', 'p', '--apply',
+            '--metrics-root', str(tmp_path),
+        ])
+
+        with pytest.raises(StoreMutationUnavailable):
+            await _run(args)
+
+        assert _FakeMemoryService.instances == []
+
+
+class TestApplyStoreMutationPreflightThroughMain:
+    """The refusal must survive the trip out through ``main``, not just ``_run``.
+
+    Deliberately a separate, un-``asyncio``-marked class: ``main`` is sync and
+    calls ``asyncio.run`` itself, so it cannot be driven from inside a running
+    loop. Sibling suites (``purge``, ``sweep``, ``prune``) drive ``main`` the
+    same way.
+    """
+
+    def test_the_refusal_escapes_main_and_is_never_a_report_shaped_return(
+        self, monkeypatch, tmp_path, caplog,
+    ):
+        """``main`` is ``asyncio.run(_run(args))`` with no try/except, and
+        ``_run``'s ordinary outcomes are the integers ``0``/``1`` -- including
+        the ``1`` ``_apply_refusal_reason`` returns for an empty scan.
+
+        So the write-capability refusal must propagate all the way out and exit
+        the interpreter non-zero via an uncaught traceback, never collapsing
+        into either integer on the way. Rigged with the EMPTY scan that drives
+        the report-shaped refusal, so the two are in direct competition.
+
+        ``asyncio.run`` is replaced only to keep the real one reachable; the
+        coroutine really is ``_run(args)`` as ``main`` built it, argv parsing
+        included.
+        """
+        import asyncio
+        import sys
+
+        deny(_mod, monkeypatch)
+        _install_run_doubles(monkeypatch, {})
+        monkeypatch.setattr(sys, 'argv', [
+            'audit_duplicate_memories.py', '--project-id', 'p', '--apply',
+            '--metrics-root', str(tmp_path),
+        ])
+        real_asyncio_run = asyncio.run
+        monkeypatch.setattr(
+            _mod.asyncio, 'run', lambda coro, *_a, **_kw: real_asyncio_run(coro),
+        )
+
+        with caplog.at_level('ERROR'), pytest.raises(
+            StoreMutationUnavailable, match=SENTINEL
+        ):
+            _mod.main()
+
+        (record,) = fail_closed_records(caplog, 'audit_duplicate_memories')
+        assert SENTINEL in record.getMessage(), (
+            'nothing else explains this traceback -- the guard site must log '
+            'the fail-closed diagnosis before raising; got: '
+            f'{[rec.getMessage() for rec in caplog.records]}'
+        )
+        assert _FakeMemoryService.instances == [], (
+            'the refusal must precede the client, even driven through main'
+        )

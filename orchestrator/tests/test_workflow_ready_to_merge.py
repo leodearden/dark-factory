@@ -19,18 +19,25 @@ unworkable spec), carrying the failed predicate + its measured values.
 from __future__ import annotations
 
 import asyncio
+import logging
+import subprocess
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, cast
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from _orch_helpers import pydantic_spec
+from _git_fixtures import seed_repo
+from _orch_helpers import git_env_with_ceiling, pydantic_spec
+from shared.task_transitions import outcome_allows_status
 
+from orchestrator.agents.review_briefing import ReviewBriefing
 from orchestrator.artifacts import TaskArtifacts
-from orchestrator.config import OrchestratorConfig
+from orchestrator.config import GitConfig, OrchestratorConfig
+from orchestrator.delivered_checks import DeliveredChecksBlock
 from orchestrator.event_store import EventStore, EventType
+from orchestrator.git_ops import GitOps
 from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
 
 _TASK_ID = '50'
@@ -125,6 +132,7 @@ def _make(
     config.project_root = tmp_path / 'proj'
     config.git.branch_prefix = 'task/'
     config.module_configs_or_empty = {}
+    config.review.reviewer_briefing = ReviewBriefing.DIFF_ONLY
 
     scheduler = MagicMock()
     scheduler.set_task_status = AsyncMock(side_effect=set_task_status_side_effect)
@@ -139,11 +147,17 @@ def _make(
             return tip_is_ancestor_of_main
         return False
 
+    known_shas = {sha for sha in (_TIP, main_sha, tip) if sha is not None}
+
+    async def _commits_named(tokens: list[str]) -> dict[str, str]:
+        return {token: token for token in tokens if token in known_shas}
+
     git_ops = MagicMock()
     git_ops.get_main_sha = AsyncMock(return_value=main_sha)
     git_ops.resolve_branch_sha = AsyncMock(return_value=tip)
     git_ops.is_ancestor = AsyncMock(side_effect=_is_ancestor)
     git_ops.get_head_tree_hash = AsyncMock(return_value=tree_hash)
+    git_ops.commits_named = AsyncMock(side_effect=_commits_named)
 
     wf = TaskWorkflow(
         assignment=assignment,
@@ -194,6 +208,13 @@ def _make(
     )
 
 
+async def _report(f: _Fixture, commit: str, evidence: str = 'ev') -> _Fixture:
+    """Write a ready-to-merge report citing *commit* and run the handler on it."""
+    f.artifacts.write_ready_to_merge(commit=commit, evidence=evidence)
+    f.outcome = await f.wf._handle_ready_to_merge_report()
+    return f
+
+
 # ---------------------------------------------------------------------------
 # C-1 — the happy path: clean FF + verify PASSED + review PASS
 # ---------------------------------------------------------------------------
@@ -204,12 +225,10 @@ class TestReadyToMergeHappyPath:
     """A genuine merge-landing desync enqueues a deterministic merge."""
 
     async def _run(self, tmp_path: Path, **kw) -> _Fixture:
-        f = _make(tmp_path=tmp_path, **kw)
-        f.artifacts.write_ready_to_merge(
-            commit=_TIP, evidence='clean FF of main; verify PASSED; review PASS',
+        return await _report(
+            _make(tmp_path=tmp_path, **kw), _TIP,
+            evidence='clean FF of main; verify PASSED; review PASS',
         )
-        f.outcome = await f.wf._handle_ready_to_merge_report()
-        return f
 
     async def test_enqueues_exactly_one_merge_request(self, tmp_path: Path):
         f = await self._run(tmp_path)
@@ -286,27 +305,32 @@ class TestReadyToMergeHappyPath:
         f.mark_blocked.assert_not_awaited()  # still no human escalation
         assert f.merge_queue.qsize() == 1
 
+    @pytest.mark.parametrize(('old_status', 'observed'), [
+        ('done', WorkflowOutcome.DONE),
+        ('cancelled', WorkflowOutcome.CANCELLED),
+    ])
     async def test_terminal_exit_rejection_is_accepted_not_forced(
-        self, tmp_path: Path,
+        self, tmp_path: Path, old_status: str, observed: WorkflowOutcome,
     ):
         """The benign already-terminal race: the merge callback or the
-        found_on_main backstop beat us to mark_done.
+        found_on_main backstop beat us to mark_done, or the task was cancelled.
 
-        That row is CORRECT — the work landed.  Dragging it back to 'blocked'
-        would undo a legitimate done, so the rejection must be swallowed, not
-        retried and not re-forced through ``update_task``.
+        That row is CORRECT.  Dragging it back to 'blocked' would undo it, so
+        the rejection must not be retried or re-forced through
+        ``update_task``, and the exit reports the terminal it observed.
         """
         from orchestrator.scheduler import TerminalExitRejection
 
         f = await self._run(
             tmp_path,
             set_task_status_side_effect=TerminalExitRejection(
-                task_id=_TASK_ID, old_status='done',
+                task_id=_TASK_ID, old_status=old_status,
                 target_status='blocked', raw='terminal_exit_rejected',
             ),
         )
 
-        assert f.outcome == WorkflowOutcome.BLOCKED
+        assert f.outcome == observed
+        assert outcome_allows_status(f.outcome, old_status)
         assert f.merge_queue.qsize() == 1  # the merge still went out
         f.scheduler.set_task_status.assert_awaited_once()  # no retry
         assert f.status_forcing_updates() == []  # and no forced re-write
@@ -529,6 +553,133 @@ class TestReadyToMergeMalformedArtifact:
 
 
 # ---------------------------------------------------------------------------
+# Cited-commit resolution against real git: an abbreviated hex SHA names the
+# tip; a ref name, an unknown prefix or an unanswerable git does not
+# ---------------------------------------------------------------------------
+
+
+def _git_out(repo: Path, *args: str) -> str:
+    return subprocess.run(
+        ['git', *args], cwd=repo, env=git_env_with_ceiling(repo),
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+
+
+@dataclass(frozen=True)
+class _TwoCommitRepo:
+    path: Path
+    tip: str
+    other: str
+
+
+@pytest.fixture
+def two_commit_repo(tmp_path: Path) -> _TwoCommitRepo:
+    repo = seed_repo(tmp_path / 'repo')
+    _git_out(repo, 'commit', '--allow-empty', '-m', 'tip')
+    return _TwoCommitRepo(
+        path=repo,
+        tip=_git_out(repo, 'rev-parse', 'HEAD'),
+        other=_git_out(repo, 'rev-parse', 'HEAD~1'),
+    )
+
+
+@pytest.mark.asyncio
+class TestReadyToMergeAbbreviatedCitation:
+    """The cited commit is resolved by git before it is compared to the tip.
+
+    Only the resolution step runs against real git; every other predicate keeps
+    the file's mocked GitOps, wired so the branch tip is the repo's HEAD.
+    """
+
+    async def _run(
+        self, tmp_path: Path, repo: _TwoCommitRepo, citation: str,
+        *, git_root: Path | None = None,
+    ) -> _Fixture:
+        f = _make(tmp_path=tmp_path, tip=repo.tip, verified_tip=repo.tip)
+        f.git_ops.commits_named = GitOps(
+            GitConfig(), git_root or repo.path,
+        ).commits_named
+        return await _report(f, citation)
+
+    def _cited_commit_reject(self, f: _Fixture, reason: str) -> dict:
+        """The ``measured`` facts of the one ``cited_commit`` reject event,
+        which must carry *reason*."""
+        assert f.outcome == WorkflowOutcome.BLOCKED
+        assert f.merge_queue.qsize() == 0
+        rows = f.event_store.fetch_events_by_type_all_runs(
+            EventType.architect_desync_merge, task_id=_TASK_ID,
+        )
+        assert len(rows) == 1
+        data = rows[0].get('data') or {}
+        assert data['decision'] == 'rejected'
+        assert data['predicate'] == 'cited_commit'
+        assert data['measured']['reason'] == reason
+        return data['measured']
+
+    @pytest.mark.parametrize(
+        'cite', [lambda sha: sha[:10], lambda sha: sha[:10].upper()],
+        ids=['lowercase', 'uppercase'],
+    )
+    async def test_abbreviated_tip_sha_is_accepted(
+        self, tmp_path: Path, two_commit_repo: _TwoCommitRepo, cite,
+    ):
+        repo = two_commit_repo
+        f = await self._run(tmp_path, repo, cite(repo.tip))
+
+        assert f.merge_queue.qsize() == 1
+        assert f.merge_queue.get_nowait().snapshot_tip == repo.tip
+        f.mark_blocked.assert_not_awaited()
+
+    async def test_abbreviation_of_another_commit_is_rejected(
+        self, tmp_path: Path, two_commit_repo: _TwoCommitRepo,
+    ):
+        repo = two_commit_repo
+        f = await self._run(tmp_path, repo, repo.other[:10])
+
+        measured = self._cited_commit_reject(f, 'other_commit')
+        assert measured['resolved'] == repo.other
+
+    async def test_ref_name_is_rejected_although_it_names_the_tip(
+        self, tmp_path: Path, two_commit_repo: _TwoCommitRepo,
+    ):
+        """A ref always equals the current tip, so it corroborates nothing."""
+        assert _git_out(two_commit_repo.path, 'rev-parse', 'HEAD') == two_commit_repo.tip
+        f = await self._run(tmp_path, two_commit_repo, 'HEAD')
+
+        measured = self._cited_commit_reject(f, 'not_a_sha')
+        assert 'resolved' not in measured
+        assert 'ref names are refused' in f.mark_blocked.await_args.args[0]
+
+    async def test_prefix_shorter_than_git_default_abbreviation_is_rejected(
+        self, tmp_path: Path, two_commit_repo: _TwoCommitRepo,
+    ):
+        f = await self._run(tmp_path, two_commit_repo, two_commit_repo.tip[:6])
+
+        self._cited_commit_reject(f, 'not_a_sha')
+
+    async def test_unresolvable_hex_prefix_is_rejected(
+        self, tmp_path: Path, two_commit_repo: _TwoCommitRepo,
+    ):
+        f = await self._run(tmp_path, two_commit_repo, 'deadbeef0')
+
+        measured = self._cited_commit_reject(f, 'no_unique_commit')
+        assert 'resolved' in measured
+        assert measured['resolved'] is None
+        assert 'missing or ambiguous' in f.mark_blocked.await_args.args[0]
+
+    async def test_git_failure_is_a_reject_carrying_the_error(
+        self, tmp_path: Path, two_commit_repo: _TwoCommitRepo,
+    ):
+        plain = tmp_path / 'plain'
+        plain.mkdir()
+        f = await self._run(
+            tmp_path, two_commit_repo, two_commit_repo.tip[:10], git_root=plain,
+        )
+
+        assert self._cited_commit_reject(f, 'git_error')['git_error']
+
+
+# ---------------------------------------------------------------------------
 # C-4 — idempotency: a re-invoked architect must not double-enqueue
 # ---------------------------------------------------------------------------
 
@@ -644,7 +795,7 @@ class TestOnArchitectMergeDone:
     _fire = staticmethod(_fire_merge_done)
 
     async def test_success_marks_done_via_found_on_main(self, tmp_path: Path):
-        from orchestrator.merge_types import MergeOutcome
+        from orchestrator.merge_lane.types import MergeOutcome
 
         f = await self._fire(
             tmp_path, MergeOutcome(status='done', merge_sha=_LANDED),
@@ -661,7 +812,7 @@ class TestOnArchitectMergeDone:
     async def test_durable_failure_leaves_task_blocked(
         self, tmp_path: Path, status: str,
     ):
-        from orchestrator.merge_types import MergeOutcome
+        from orchestrator.merge_lane.types import MergeOutcome
 
         f = await self._fire(tmp_path, MergeOutcome(status=cast(Any, status)))
 
@@ -680,7 +831,7 @@ class TestOnArchitectMergeDone:
     ):
         """A superseded/already-merged outcome is not a failure — no L2, no
         failure event; the branch and lane are preserved by omission."""
-        from orchestrator.merge_types import MergeOutcome
+        from orchestrator.merge_lane.types import MergeOutcome
 
         f = await self._fire(tmp_path, MergeOutcome(status=cast(Any, status)))
 
@@ -697,7 +848,7 @@ class TestOnArchitectMergeDone:
     ):
         """Loud over silent: a status in neither classification set must not
         silently no-op into a stranded task with no operator signal."""
-        from orchestrator.merge_types import MergeOutcome
+        from orchestrator.merge_lane.types import MergeOutcome
 
         f = await self._fire(
             tmp_path, MergeOutcome(status='brand_new_status'),  # type: ignore[arg-type]
@@ -715,7 +866,7 @@ class TestOnArchitectMergeDone:
         """found_on_main provenance needs a landed SHA — a 'done' with none is
         an unusable signal, so degrade to the reconciler backstop rather than
         writing bogus provenance."""
-        from orchestrator.merge_types import MergeOutcome
+        from orchestrator.merge_lane.types import MergeOutcome
 
         f = await self._fire(tmp_path, MergeOutcome(status='done'))
 
@@ -766,7 +917,7 @@ class TestArchitectMergeDurableFailureEscalates:
     async def test_durable_failure_files_a_born_at_l2(
         self, tmp_path: Path, status: str,
     ):
-        from orchestrator.merge_types import MergeOutcome
+        from orchestrator.merge_lane.types import MergeOutcome
 
         q = _FakeEscalationQueue()
         f = await self._fire(
@@ -789,7 +940,7 @@ class TestArchitectMergeDurableFailureEscalates:
         """'Loud' for an unclassified outcome means an escalation too — the
         shared DURABLE_MERGE_FAILURE_STATUSES docstring promises exactly this
         of BOTH submit paths."""
-        from orchestrator.merge_types import MergeOutcome
+        from orchestrator.merge_lane.types import MergeOutcome
 
         q = _FakeEscalationQueue()
         await self._fire(
@@ -804,7 +955,7 @@ class TestArchitectMergeDurableFailureEscalates:
     async def test_success_or_transient_files_nothing(
         self, tmp_path: Path, status: str,
     ):
-        from orchestrator.merge_types import MergeOutcome
+        from orchestrator.merge_lane.types import MergeOutcome
 
         q = _FakeEscalationQueue()
         await self._fire(
@@ -815,7 +966,7 @@ class TestArchitectMergeDurableFailureEscalates:
         assert q.submitted == []
 
     async def test_second_durable_failure_is_deduped(self, tmp_path: Path):
-        from orchestrator.merge_types import MergeOutcome
+        from orchestrator.merge_lane.types import MergeOutcome
 
         q = _FakeEscalationQueue()
         f = _make(tmp_path=tmp_path)
@@ -830,7 +981,7 @@ class TestArchitectMergeDurableFailureEscalates:
     async def test_missing_queue_does_not_raise(self, tmp_path: Path):
         """Fail-safe: a done-callback must never propagate a bookkeeping error.
         The structured failure event is still emitted."""
-        from orchestrator.merge_types import MergeOutcome
+        from orchestrator.merge_lane.types import MergeOutcome
 
         f = await self._fire(tmp_path, MergeOutcome(status='error'))
 
@@ -840,7 +991,7 @@ class TestArchitectMergeDurableFailureEscalates:
         assert (rows[0].get('data') or {})['decision'] == 'merge_failed'
 
     async def test_submit_failure_is_swallowed(self, tmp_path: Path):
-        from orchestrator.merge_types import MergeOutcome
+        from orchestrator.merge_lane.types import MergeOutcome
 
         q = _FakeEscalationQueue()
         q.submit = MagicMock(side_effect=RuntimeError('disk full'))  # type: ignore[method-assign]
@@ -952,7 +1103,7 @@ class TestHandlerNeverAdvancesMain:
     ):
         """The submitted request's future is wired to the terminal callback —
         without this the FAST done flip would never fire."""
-        from orchestrator.merge_types import MergeOutcome
+        from orchestrator.merge_lane.types import MergeOutcome
 
         f = _make(tmp_path=tmp_path)
         f.artifacts.write_ready_to_merge(commit=_TIP, evidence='ev')
@@ -985,7 +1136,7 @@ class TestReadyToMergeDispatch:
 
     async def _drive(
         self, tmp_path: Path, *, site: str, with_already_done: bool,
-    ) -> tuple[AsyncMock, AsyncMock, WorkflowOutcome]:
+    ) -> tuple[AsyncMock, AsyncMock, WorkflowOutcome | None]:
         """Drive the REAL dispatch site with exit artifacts a stub agent wrote.
 
         Both handlers are stubbed, so what is observed is purely which branch
@@ -1075,3 +1226,242 @@ class TestReadyToMergeDispatch:
         assert outcome == WorkflowOutcome.BLOCKED
         f.wf._execute_iterations.assert_not_called()
         assert f.merge_queue.empty()
+
+
+# ---------------------------------------------------------------------------
+# TestOnArchitectMergeDoneDeliveredChecksGuard (task 3057 — step-9 RED /
+# step-10 GREEN)
+#
+# Seam 6 of eleven — and the decisive evidence for guarding ALL of them rather
+# than point-fixing. This found_on_main stamp was added on 2026-07-30 by task
+# 3031, i.e. a BRAND-NEW unguarded seam that appeared while task 3057 sat
+# queued. This defect class's "fixed-then-recurred" signature, reproducing in
+# real time.
+# ---------------------------------------------------------------------------
+
+_MD_GATE_TARGET = 'orchestrator.workflow.gate_mark_done_on_delivered_checks'
+_MD_DC_CHECK = {
+    'name': 'cap-x', 'kind': 'grep', 'pattern': 'SomePattern', 'expect': 'present',
+}
+
+
+async def _fire_merge_done_armed(
+    tmp_path: Path, outcome: Any, *, metadata: dict | None = None,
+    enabled: bool = True, escalation_queue: object = None,
+) -> _Fixture:
+    """``_fire_merge_done`` plus a live ``delivered_checks`` config.
+
+    Reuses this module's existing driver shape verbatim rather than building a
+    parallel fixture; only the metadata and the config knobs the guard must
+    forward are added.
+    """
+    from orchestrator.config import DeliveredChecksConfig
+
+    f = _make(
+        tmp_path=tmp_path,
+        metadata=(
+            {'delivered_checks': [_MD_DC_CHECK]} if metadata is None else metadata
+        ),
+    )
+    if escalation_queue is not None:
+        f.wf.escalation_queue = escalation_queue  # type: ignore[assignment]
+    f.wf.config.delivered_checks = DeliveredChecksConfig(
+        enabled=enabled, check_timeout_secs=7.5,
+    )
+    await f.wf._on_architect_merge_done(outcome, tip=_TIP, evidence='ev')
+    return f
+
+
+def _failure_events(f: _Fixture) -> list[dict]:
+    rows = f.event_store.fetch_events_by_type_all_runs(
+        EventType.architect_desync_merge, task_id=_TASK_ID,
+    )
+    return [r for r in rows if (r.get('data') or {}).get('decision') == 'merge_failed']
+
+
+@pytest.mark.asyncio
+class TestOnArchitectMergeDoneDeliveredChecksGuard:
+    """The delivered-capability guard on the architect-desync done flip.
+
+    A landed merge sha proves main advanced — never that THIS task's declared
+    capability rode along. On a block the method degrades to the reconciler
+    exactly like its existing success-without-a-sha arm: this method ALREADY
+    has a precedent for "we could land but cannot write honest provenance, so
+    degrade rather than stamp a bogus one".
+    """
+
+    _fire = staticmethod(_fire_merge_done_armed)
+
+    def _done(self) -> Any:
+        from orchestrator.merge_lane.types import MergeOutcome
+
+        return MergeOutcome(status='done', merge_sha=_LANDED)
+
+    # --- row 1: hollow-done regression / FAILED ---------------------------
+
+    async def test_failed_block_withholds_the_flip_without_raising(
+        self, tmp_path: Path, caplog,
+    ):
+        """No stamp; returns NORMALLY (this is a fire-and-forget callback
+        whose caller only logs on exception, so a raise would be
+        indistinguishable from an infrastructure fault); task left blocked for
+        the reconciler backstop, which this method's own docstring already
+        designates as the degradation path."""
+        guard = AsyncMock(return_value=DeliveredChecksBlock(
+            reason='failed', main_sha='m' * 40, failed_check=_MD_DC_CHECK,
+        ))
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.workflow'), \
+                patch(_MD_GATE_TARGET, guard):
+            f = await self._fire(tmp_path, self._done())
+
+        f.scheduler.mark_done.assert_not_awaited()
+        blob = '\n'.join(r.getMessage() for r in caplog.records)
+        assert _TASK_ID in blob
+        assert 'failed' in blob
+
+    # --- row 2: all_delivered -> byte-identical flip -----------------------
+
+    async def test_all_delivered_flips_exactly_as_today(self, tmp_path: Path):
+        guard = AsyncMock(return_value=None)
+
+        with patch(_MD_GATE_TARGET, guard):
+            f = await self._fire(tmp_path, self._done())
+
+        f.scheduler.mark_done.assert_awaited_once()
+        call = f.scheduler.mark_done.await_args
+        assert call.args[0] == _TASK_ID
+        assert call.kwargs['kind'] == 'found_on_main'
+        assert call.kwargs['sha'] == _LANDED
+        assert call.kwargs['note'].startswith('architect-desync merge landed')
+
+    # --- row 3: no delivered_checks -> unchanged, but still DELEGATED -----
+
+    async def test_check_less_task_delegates_and_flips(self, tmp_path: Path):
+        guard = AsyncMock(return_value=None)
+
+        with patch(_MD_GATE_TARGET, guard):
+            f = await self._fire(tmp_path, self._done(), metadata={})
+
+        f.scheduler.mark_done.assert_awaited_once()
+        guard.assert_awaited_once()
+        assert guard.await_args is not None
+        assert guard.await_args.args[1] == f.wf.task['metadata']
+
+    # --- rows 4 & 5: fail-safe blocks must NOT be misrouted into the L2 ----
+
+    @pytest.mark.parametrize('reason', ['errored', 'main_sha_unresolved'])
+    async def test_fail_safe_blocks_withhold_without_filing_the_l2(
+        self, tmp_path: Path, reason: str,
+    ):
+        """A capability withholding is NOT a durable merge failure — the merge
+        genuinely landed. Misrouting it into ``_file_architect_merge_failed``
+        would both misclassify the condition and erode a load-bearing L2 that
+        operators must keep trusting."""
+        escalations = _FakeEscalationQueue()
+        guard = AsyncMock(return_value=DeliveredChecksBlock(
+            reason=reason,  # type: ignore[arg-type]
+        ))
+
+        with patch(_MD_GATE_TARGET, guard):
+            f = await self._fire(
+                tmp_path, self._done(), escalation_queue=escalations,
+            )
+
+        f.scheduler.mark_done.assert_not_awaited()
+        assert _failure_events(f) == []
+        assert escalations.submitted == []
+
+    # --- row 6: kill switch is FORWARDED, never re-implemented -------------
+
+    async def test_kill_switch_is_forwarded_not_short_circuited(
+        self, tmp_path: Path,
+    ):
+        guard = AsyncMock(return_value=None)
+
+        with patch(_MD_GATE_TARGET, guard):
+            f = await self._fire(tmp_path, self._done(), enabled=False)
+
+        f.scheduler.mark_done.assert_awaited_once()
+        assert guard.await_args is not None
+        assert guard.await_args.kwargs['enabled'] is False
+
+    async def test_kill_switch_with_real_helper_flips_as_today(
+        self, tmp_path: Path,
+    ):
+        f = await self._fire(tmp_path, self._done(), enabled=False)
+
+        f.scheduler.mark_done.assert_awaited_once()
+
+    # --- ordering: only the landed-success arm pays for check work ---------
+
+    async def test_success_without_a_sha_never_reaches_the_guard(
+        self, tmp_path: Path,
+    ):
+        from orchestrator.merge_lane.types import MergeOutcome
+
+        guard = AsyncMock(return_value=None)
+
+        with patch(_MD_GATE_TARGET, guard):
+            f = await self._fire(tmp_path, MergeOutcome(status='done'))
+
+        guard.assert_not_awaited()
+        f.scheduler.mark_done.assert_not_awaited()
+
+    @pytest.mark.parametrize('status', ['already_merged', 'superseded'])
+    async def test_transient_statuses_never_reach_the_guard(
+        self, tmp_path: Path, status: str,
+    ):
+        from orchestrator.merge_lane.types import MergeOutcome
+
+        guard = AsyncMock(return_value=None)
+
+        with patch(_MD_GATE_TARGET, guard):
+            f = await self._fire(tmp_path, MergeOutcome(status=cast(Any, status)))
+
+        guard.assert_not_awaited()
+        assert _failure_events(f) == []
+
+    @pytest.mark.parametrize('status', ['conflict', 'brand_new_status'])
+    async def test_failure_arms_are_untouched_by_the_guard(
+        self, tmp_path: Path, status: str,
+    ):
+        """The durable-failure and UNCLASSIFIED arms must keep their existing
+        structured failure event and born-at-L2 path exactly as today — this
+        pins that the guard did not perturb the load-bearing L2."""
+        from orchestrator.merge_lane.types import MergeOutcome
+
+        guard = AsyncMock(return_value=None)
+
+        with patch(_MD_GATE_TARGET, guard):
+            f = await self._fire(tmp_path, MergeOutcome(status=cast(Any, status)))
+
+        guard.assert_not_awaited()
+        f.scheduler.mark_done.assert_not_awaited()
+        assert len(_failure_events(f)) == 1
+
+    # --- the existing mark_done except-guard must survive ------------------
+
+    async def test_mark_done_raising_still_degrades_not_crashes(
+        self, tmp_path: Path,
+    ):
+        """With the guard passing and ``mark_done`` raising, the existing
+        WARNING-and-degrade behaviour is unchanged."""
+        from orchestrator.merge_lane.types import MergeOutcome
+
+        f = _make(tmp_path=tmp_path, metadata={'delivered_checks': [_MD_DC_CHECK]})
+        from orchestrator.config import DeliveredChecksConfig
+
+        f.wf.config.delivered_checks = DeliveredChecksConfig(
+            enabled=True, check_timeout_secs=7.5,
+        )
+        f.scheduler.mark_done = AsyncMock(side_effect=RuntimeError('boom'))
+        guard = AsyncMock(return_value=None)
+
+        with patch(_MD_GATE_TARGET, guard):
+            await f.wf._on_architect_merge_done(
+                MergeOutcome(status='done', merge_sha=_LANDED),
+                tip=_TIP, evidence='ev',
+            )
+
+        f.scheduler.mark_done.assert_awaited_once()

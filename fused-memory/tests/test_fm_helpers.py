@@ -1,11 +1,19 @@
-"""Tests for the submit_and_resolve helper in _fm_helpers.py."""
+"""Tests for the helpers in _fm_helpers.py."""
 
+import asyncio
+import concurrent.futures
 import json
+import sys
+import types
 from unittest.mock import AsyncMock, MagicMock
 
-import httpx
 import pytest
-from _fm_helpers import submit_and_resolve
+from _fm_helpers import (
+    _LOADED_SCRIPT_MODULE_NAMES,
+    LoopFreedomProbe,
+    load_script_module,
+    submit_and_resolve,
+)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -468,385 +476,372 @@ class TestAssertIdTitlePairing:
 
 
 # ---------------------------------------------------------------------------
-# Tests for shared Qdrant test scaffolding (task 2277)
+# Tests for the shared LoopFreedomProbe oracle (task 5920)
 # ---------------------------------------------------------------------------
-# De-duplicates the _qdrant_available()/QDRANT_URL/skip-marker scaffolding that
-# was previously copy-pasted verbatim in test_recon_dedup_premise.py and
-# test_mem0_qdrant_integration.py (flagged by esc-2221-26). No real Qdrant is
-# used here — qdrant_client.QdrantClient is monkeypatched throughout.
 
-class TestQdrantHelpers:
-    """Unit tests for QDRANT_URL, _qdrant_available(), and qdrant_skipif()."""
-
-    def test_qdrant_url_constant(self):
-        """QDRANT_URL matches the local-Qdrant default both integration files used."""
-        from _fm_helpers import QDRANT_URL
-
-        assert QDRANT_URL == 'http://localhost:6333'
-
-    def test_qdrant_available_true_when_client_ok(self, monkeypatch):
-        """_qdrant_available() returns True when construction, get_collections, and close all succeed."""
-        from _fm_helpers import _qdrant_available
-
-        fake_client = MagicMock()
-        fake_client.get_collections.return_value = None
-        fake_client.close.return_value = None
-        monkeypatch.setattr('qdrant_client.QdrantClient', MagicMock(return_value=fake_client))
-
-        assert _qdrant_available() is True
-        fake_client.get_collections.assert_called_once()
-        fake_client.close.assert_called_once()
-
-    def test_qdrant_available_false_when_get_collections_raises(self, monkeypatch):
-        """_qdrant_available() returns False (never raises) when get_collections() raises."""
-        from _fm_helpers import _qdrant_available
-
-        fake_client = MagicMock()
-        fake_client.get_collections.side_effect = Exception('boom')
-        monkeypatch.setattr('qdrant_client.QdrantClient', MagicMock(return_value=fake_client))
-
-        assert _qdrant_available() is False
-
-    def test_qdrant_available_false_when_construct_raises(self, monkeypatch):
-        """_qdrant_available() returns False (never raises) when QdrantClient(...) itself raises."""
-        from _fm_helpers import _qdrant_available
-
-        def _boom(*args, **kwargs):
-            raise Exception('connection refused')
-
-        monkeypatch.setattr('qdrant_client.QdrantClient', _boom)
-
-        assert _qdrant_available() is False
-
-    def test_qdrant_skipif_default_reason(self):
-        """qdrant_skipif() returns a pytest.mark.skipif marker with a non-empty default reason."""
-        from _fm_helpers import qdrant_skipif
-
-        m = qdrant_skipif()
-
-        assert m.name == 'skipif'
-        assert isinstance(m.kwargs['reason'], str) and m.kwargs['reason']
-
-    def test_qdrant_skipif_custom_reason(self):
-        """qdrant_skipif(reason=...) propagates a caller-supplied reason string."""
-        from _fm_helpers import qdrant_skipif
-
-        assert qdrant_skipif(reason='x').kwargs['reason'] == 'x'
-
-    def test_qdrant_skipif_condition_tracks_probe(self, monkeypatch):
-        """qdrant_skipif()'s skip condition is `not _qdrant_available()`, evaluated at call time.
-
-        Pins the behaviour-preserving contract: the marker must track whatever
-        _qdrant_available() currently reports, not a value cached at import time.
-        """
-        import _fm_helpers
-
-        monkeypatch.setattr(_fm_helpers, '_qdrant_available', lambda: False)
-        assert _fm_helpers.qdrant_skipif().args[0] is True
-
-        monkeypatch.setattr(_fm_helpers, '_qdrant_available', lambda: True)
-        assert _fm_helpers.qdrant_skipif().args[0] is False
+#: Only a held loop ever reaches the ceiling, so shortening it cannot turn a
+#: False verdict True; it only keeps the held-loop cases fast.
+_HELD_LOOP_CEILING_SECONDS = 0.01
 
 
-# ---------------------------------------------------------------------------
-# Tests for the shared poll_until() helper (task 2377)
-# ---------------------------------------------------------------------------
-# Converts fixed "sleep(N) then assert background work is done" sites (fragile
-# under host CPU oversubscription) into a bounded poll on the same
-# post-condition. These tests pin the contract using ONLY predicate-call-count
-# assertions and raise assertions — never wall-clock-elapsed assertions — so
-# this suite stays load-independent and does not reintroduce the very
-# fragility class poll_until exists to remove.
+def _drive_without_yielding_to_loop(coro) -> None:
+    with pytest.raises(StopIteration):
+        while True:
+            coro.send(None)
 
-class TestPollUntil:
-    """Unit tests for the shared poll_until(predicate, *, timeout, interval, message) helper."""
+
+def _run_on_a_worker_while_the_loop_thread_waits(fn, *args) -> None:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        pool.submit(fn, *args).result()
+
+
+class TestLoopFreedomProbe:
+    """Unit tests for LoopFreedomProbe.suspend() / .block() / .observations / .assert_loop_stayed_free()."""
 
     @pytest.mark.asyncio
-    async def test_already_true_sync_predicate_returns_after_one_call(self):
-        """An already-true sync predicate returns immediately after exactly 1 call (check-before-sleep)."""
-        from _fm_helpers import poll_until
+    async def test_a_free_loop_reads_true(self):
+        probe = LoopFreedomProbe()
 
-        calls = 0
+        await probe.suspend()
 
-        def predicate():
-            nonlocal calls
-            calls += 1
-            return True
-
-        result = await poll_until(predicate, timeout=5.0)
-
-        assert result is True
-        assert calls == 1, f'expected exactly 1 call, got {calls}'
+        assert probe.observations == (True,)
+        probe.assert_loop_stayed_free()
 
     @pytest.mark.asyncio
-    async def test_sync_predicate_flips_true_on_nth_call(self):
-        """A sync predicate that flips true on the Nth call returns after exactly N calls.
+    async def test_a_call_site_that_resumes_the_coroutine_itself_reads_false(self):
+        probe = LoopFreedomProbe()
 
-        Proves check-before-sleep and that polling stops as soon as the
-        post-condition holds, rather than over-polling or racing ahead.
-        """
-        from _fm_helpers import poll_until
+        _drive_without_yielding_to_loop(probe.suspend())
 
-        calls = 0
-        n = 4
-
-        def predicate():
-            nonlocal calls
-            calls += 1
-            return calls >= n
-
-        result = await poll_until(predicate, timeout=5.0, interval=0.001)
-
-        assert result is True
-        assert calls == n, f'expected exactly {n} calls, got {calls}'
+        assert probe.observations == (False,)
 
     @pytest.mark.asyncio
-    async def test_async_predicate_is_awaited_and_flips_true_on_nth_call(self):
-        """An async/coroutine predicate is awaited and behaves identically to the sync case.
+    async def test_a_call_site_waiting_on_another_threads_loop_reads_false(self):
+        probe = LoopFreedomProbe(ceiling_seconds=_HELD_LOOP_CEILING_SECONDS)
 
-        If poll_until failed to await the coroutine, the (always-truthy)
-        coroutine object itself would satisfy the truthiness check on the
-        first call and `calls` would remain 0 — so this also proves the
-        coroutine body actually ran.
-        """
-        from _fm_helpers import poll_until
+        _run_on_a_worker_while_the_loop_thread_waits(asyncio.run, probe.suspend())
 
-        calls = 0
-        n = 3
-
-        async def predicate():
-            nonlocal calls
-            calls += 1
-            return calls >= n
-
-        result = await poll_until(predicate, timeout=5.0, interval=0.001)
-
-        assert result is True
-        assert calls == n, f'expected exactly {n} calls, got {calls}'
+        assert probe.observations == (False,)
 
     @pytest.mark.asyncio
-    async def test_return_value_is_truthy_predicate_result_verbatim(self):
-        """poll_until returns the predicate's truthy result verbatim, not coerced to True.
+    async def test_a_call_site_awaiting_another_threads_loop_reads_true(self):
+        probe = LoopFreedomProbe()
 
-        Lets callers chain on the returned value (e.g. a stats dict) instead
-        of re-fetching state after the poll succeeds.
-        """
-        from _fm_helpers import poll_until
+        await asyncio.to_thread(asyncio.run, probe.suspend())
 
-        payload = {'done': True, 'value': 42}
-
-        def predicate():
-            return payload
-
-        result = await poll_until(predicate, timeout=5.0)
-
-        assert result is payload, f'expected the exact object {payload!r}, got {result!r}'
+        assert probe.observations == (True,)
 
     @pytest.mark.asyncio
-    async def test_never_true_predicate_raises_assertion_error_at_deadline(self):
-        """A never-true predicate raises AssertionError once the deadline passes.
+    async def test_a_blocking_call_offloaded_from_the_loop_reads_true(self):
+        probe = LoopFreedomProbe()
 
-        Uses a tiny timeout and asserts only the raise (never elapsed time) —
-        a slow host makes this test slower, never falsely passing or failing.
-        """
-        from _fm_helpers import poll_until
+        await asyncio.to_thread(probe.block)
 
-        with pytest.raises(AssertionError):
-            await poll_until(lambda: False, timeout=0.05, interval=0.01)
+        assert probe.observations == (True,)
 
     @pytest.mark.asyncio
-    async def test_caller_message_appears_in_raised_assertion_error(self):
-        """A caller-supplied `message` appears verbatim in the raised AssertionError."""
-        from _fm_helpers import poll_until
+    async def test_a_blocking_call_on_the_loop_thread_reads_false(self):
+        probe = LoopFreedomProbe()
 
-        with pytest.raises(AssertionError, match='custom diagnostic xyz'):
-            await poll_until(
-                lambda: False, timeout=0.05, interval=0.01, message='custom diagnostic xyz',
-            )
+        probe.block()
+
+        assert probe.observations == (False,)
 
     @pytest.mark.asyncio
-    async def test_default_message_names_the_timeout(self):
-        """When message=None, the default AssertionError message names the timeout value."""
-        from _fm_helpers import poll_until
+    async def test_a_blocking_call_the_loop_thread_waits_on_reads_false(self):
+        probe = LoopFreedomProbe(ceiling_seconds=_HELD_LOOP_CEILING_SECONDS)
 
-        with pytest.raises(AssertionError, match='0.05'):
-            await poll_until(lambda: False, timeout=0.05, interval=0.01)
+        _run_on_a_worker_while_the_loop_thread_waits(probe.block)
+
+        assert probe.observations == (False,)
+
+    @pytest.mark.asyncio
+    async def test_assert_loop_stayed_free_rejects_an_unreached_probe(self):
+        probe = LoopFreedomProbe()
+
+        with pytest.raises(AssertionError, match='never reached'):
+            probe.assert_loop_stayed_free()
+
+    @pytest.mark.asyncio
+    async def test_assert_loop_stayed_free_rejects_a_held_loop(self):
+        probe = LoopFreedomProbe()
+        _drive_without_yielding_to_loop(probe.suspend())
+
+        with pytest.raises(AssertionError, match='held'):
+            probe.assert_loop_stayed_free()
+
+    @pytest.mark.asyncio
+    async def test_each_suspension_is_recorded(self):
+        probe = LoopFreedomProbe()
+
+        await probe.suspend()
+        await probe.suspend()
+
+        assert probe.observations == (True, True)
 
 
 # ---------------------------------------------------------------------------
-# Tests for the shared ensure_fresh_collection() helper (task 2773, item 3)
+# Tests for the shared load_script_module() loader (task 3738)
 # ---------------------------------------------------------------------------
-# Idempotent + 409-tolerant collection (re)creation, used by the qdrant
-# integration fixture. No real Qdrant is used here — the client is a
-# MagicMock and qdrant_client.http.exceptions.UnexpectedResponse is
-# constructed directly — so this suite runs in the default merge-verify lane
-# even though its one live consumer (the qdrant fixture) is integration-only.
-# Assertions are on call counts and ordering only, never on live Qdrant.
+# load_script_module imports a script that is NOT a package member and NOT on
+# PYTHONPATH (anything under `scripts/`) by file path, so its pure functions
+# can be tested without sys.path pollution. It was hoisted out of
+# test_sweep_toolcall_xml_leak.py and test_toolcall_xml_leak_sweep_artifacts.py,
+# which carried two independent copies of it.
+#
+# The REUSE guard is the reason the more-robust of those two copies was the one
+# promoted, and it is precisely the behaviour nothing pinned: both sweep modules
+# register the SAME sys.modules key, so an unconditional second load would
+# re-execute the 965-line script and silently replace the first module object,
+# leaving two live module objects whose identity depends on collection order.
+# That guard is currently exercised only INCIDENTALLY, as a side effect of
+# collection order across those two modules — drop it and both still pass. These
+# tests make it load-bearing directly.
+#
+# Everything here drives throwaway tmp_path scripts, never a real repo script,
+# so no case depends on the content of anything under scripts/.
+#
+# load_script_module is imported at module level (with submit_and_resolve),
+# deliberately NOT lazily per-test the way the 8df8 section above does it:
+# every test in this section needs it, so seven copies of one import line bought
+# nothing.
 
-class TestEnsureFreshCollection:
-    """Unit tests for ensure_fresh_collection(client, collection_name, *, size, distance)."""
+@pytest.fixture
+def registered_module_names():
+    """Yield a registrar for sys.modules keys a test is about to create.
 
-    def test_creates_once_when_absent(self):
-        """collection_exists()->False: create_collection called exactly once, no delete."""
-        from _fm_helpers import ensure_fresh_collection
+    Every registered key is popped afterwards, pass or fail, so a test that
+    loads a throwaway tmp_path script cannot leak a module object into sibling
+    tests (or shadow a real module for the rest of the session).
 
-        client = MagicMock()
-        client.collection_exists.return_value = False
+    The helper's own record of which keys it installed is cleared for the same
+    keys, so a tmp_path name cannot arrive at a sibling test already marked as
+    helper-owned and quietly disarm the shadowing guard there.
+    """
+    names: list[str] = []
+    yield names.append
+    for name in names:
+        sys.modules.pop(name, None)
+        _LOADED_SCRIPT_MODULE_NAMES.discard(name)
 
-        ensure_fresh_collection(client, 'c', size=8)
 
-        client.create_collection.assert_called_once()
-        client.delete_collection.assert_not_called()
+class TestLoadScriptModule:
+    """Unit tests for load_script_module(script_path, mod_name=None)."""
 
-    def test_deletes_then_recreates_when_present(self):
-        """collection_exists()->True: delete_collection precedes create_collection."""
-        from _fm_helpers import ensure_fresh_collection
+    def test_module_level_names_are_reachable_on_the_returned_module(
+        self, tmp_path, registered_module_names
+    ):
+        """The whole point: a by-path script's constants and functions come back
+        as ordinary attributes of the returned module."""
+        script = tmp_path / 'probe_script.py'
+        script.write_text('VALUE = 41\n\n\ndef bump(n):\n    return n + 1\n')
+        registered_module_names('probe_script')
 
-        client = MagicMock()
-        client.collection_exists.return_value = True
+        mod = load_script_module(script)
 
-        ensure_fresh_collection(client, 'c', size=8)
+        assert mod.VALUE == 41
+        assert mod.bump(41) == 42
 
-        names = [c[0] for c in client.method_calls]
-        assert names == ['collection_exists', 'delete_collection', 'create_collection']
+    def test_registers_under_the_explicit_mod_name(
+        self, tmp_path, registered_module_names
+    ):
+        """An explicit mod_name is the sys.modules key — this is what lets two
+        test modules deliberately SHARE one key for the same script."""
+        script = tmp_path / 'stem_is_ignored.py'
+        script.write_text("ORIGIN = 'explicit'\n")
+        registered_module_names('chosen_key')
 
-    def test_conflict_on_create_triggers_single_delete_and_retry(self):
-        """A 409 on the first create_collection triggers exactly one delete then a second create.
+        mod = load_script_module(script, mod_name='chosen_key')
 
-        Models the swallowed-teardown stale-collection case the helper exists
-        to self-heal: the collection was reported absent but a concurrent /
-        prior run left it behind, so the create 409-conflicts; the helper
-        deletes and recreates rather than propagating the conflict.
+        assert sys.modules['chosen_key'] is mod
+        assert 'stem_is_ignored' not in sys.modules
+
+    def test_registers_under_the_file_stem_when_mod_name_is_omitted(
+        self, tmp_path, registered_module_names
+    ):
+        """mod_name defaults to the file stem."""
+        script = tmp_path / 'defaults_to_stem.py'
+        script.write_text("ORIGIN = 'stem'\n")
+        registered_module_names('defaults_to_stem')
+
+        mod = load_script_module(script)
+
+        assert sys.modules['defaults_to_stem'] is mod
+
+    def test_a_second_load_of_the_same_file_reuses_the_module_object(
+        self, tmp_path, registered_module_names
+    ):
+        """REUSE — the guard this loader exists for.
+
+        The second call must return the IDENTICAL object without re-executing
+        the file. Asserted by mutating the first module and looking for the
+        mutation afterwards: a re-execution would hand back a freshly built
+        module object with no SENTINEL on it, so `is`-identity plus the
+        surviving attribute together rule out both replacement and re-exec.
         """
-        from _fm_helpers import ensure_fresh_collection
-        from qdrant_client.http.exceptions import UnexpectedResponse
+        script = tmp_path / 'reused_script.py'
+        script.write_text('VALUE = 1\n')
+        registered_module_names('reused_script')
 
-        client = MagicMock()
-        client.collection_exists.return_value = False
-        client.create_collection.side_effect = [
-            UnexpectedResponse(409, 'Conflict', b'{}', httpx.Headers()),
-            None,
-        ]
+        first = load_script_module(script)
+        first.SENTINEL = 'set-by-first-caller'  # type: ignore[attr-defined]
 
-        # Must not raise — the 409 is tolerated.
-        ensure_fresh_collection(client, 'c', size=8)
+        second = load_script_module(script)
 
-        assert client.create_collection.call_count == 2
-        assert client.delete_collection.call_count == 1
-        names = [c[0] for c in client.method_calls]
-        assert names == [
-            'collection_exists',
-            'create_collection',
-            'delete_collection',
-            'create_collection',
-        ]
+        assert second is first
+        assert second.SENTINEL == 'set-by-first-caller'
 
-    def test_non_conflict_create_error_propagates(self):
-        """A non-409 UnexpectedResponse (e.g. 500) propagates — fail loud, no retry."""
-        from _fm_helpers import ensure_fresh_collection
-        from qdrant_client.http.exceptions import UnexpectedResponse
+    def test_reuse_survives_a_non_normalised_path_to_the_same_file(
+        self, tmp_path, registered_module_names
+    ):
+        """The guard compares RESOLVED paths, so an unnormalised spelling of the
+        same file still reuses.
 
-        client = MagicMock()
-        client.collection_exists.return_value = False
-        client.create_collection.side_effect = UnexpectedResponse(500, 'err', b'{}', httpx.Headers())
-
-        with pytest.raises(UnexpectedResponse):
-            ensure_fresh_collection(client, 'c', size=8)
-
-        client.delete_collection.assert_not_called()
-        assert client.create_collection.call_count == 1
-
-
-# ---------------------------------------------------------------------------
-# Tests for the shared collection_vector_size() helper (task 2773, item 4)
-# ---------------------------------------------------------------------------
-# Race-safe read of a collection's vector dimension: under `-n auto` load a
-# just-created collection's get_collection() can transiently 404 (or the HTTP
-# layer can raise ResponseHandlingException) before it is durably visible, so
-# a single naive read flakes. The helper wraps the read in poll_until so the
-# transient window is a bounded retry, while a non-404 error (e.g. a genuine
-# 500) is re-raised immediately — fail loud. No real Qdrant is used here: the
-# client is a MagicMock and get_collection is scripted. Following
-# TestPollUntil's discipline, cases assert only on call counts and raises,
-# never on elapsed wall-clock, so the suite stays load-independent.
-
-class TestCollectionVectorSize:
-    """Unit tests for async collection_vector_size(client, collection, *, timeout, interval)."""
-
-    @staticmethod
-    def _info(size: int):
-        """A fake get_collection() return value exposing .config.params.vectors."""
-        from qdrant_client.models import Distance, VectorParams
-
-        info = MagicMock()
-        info.config.params.vectors = VectorParams(size=size, distance=Distance.COSINE)
-        return info
-
-    @pytest.mark.asyncio
-    async def test_returns_size_after_one_call_when_readable(self):
-        """A readable collection returns its vector size after exactly 1 get_collection call."""
-        from _fm_helpers import collection_vector_size
-
-        client = MagicMock()
-        client.get_collection.return_value = self._info(8)
-
-        size = await collection_vector_size(client, 'c', timeout=5.0, interval=0.001)
-
-        assert size == 8
-        assert client.get_collection.call_count == 1
-
-    @pytest.mark.asyncio
-    async def test_tolerates_transient_404_then_returns(self):
-        """Two transient 404s then a readable collection: returns 8 after exactly 3 calls.
-
-        Proves the transient-404 window is a bounded retry, not a single naive
-        read — the call count is deterministic (scripted side_effect), so this
-        assertion is load-independent.
+        Callers build these paths with `Path(__file__).parent.parent / ...`, so
+        the second caller's spelling need not be string-equal to the first's.
+        An implementation comparing the cached ``__file__`` as a raw string
+        would re-execute here.
         """
-        from _fm_helpers import collection_vector_size
-        from qdrant_client.http.exceptions import UnexpectedResponse
+        subdir = tmp_path / 'subdir'
+        subdir.mkdir()
+        script = tmp_path / 'roundabout_script.py'
+        script.write_text('VALUE = 1\n')
+        registered_module_names('roundabout_script')
 
-        client = MagicMock()
-        client.get_collection.side_effect = [
-            UnexpectedResponse(404, 'Not Found', b'{}', httpx.Headers()),
-            UnexpectedResponse(404, 'Not Found', b'{}', httpx.Headers()),
-            self._info(8),
-        ]
+        first = load_script_module(script)
+        first.SENTINEL = 'set-by-first-caller'  # type: ignore[attr-defined]
 
-        size = await collection_vector_size(client, 'c', timeout=5.0, interval=0.001)
+        second = load_script_module(subdir / '..' / 'roundabout_script.py')
 
-        assert size == 8
-        assert client.get_collection.call_count == 3
+        assert second is first
+        assert second.SENTINEL == 'set-by-first-caller'
 
-    @pytest.mark.asyncio
-    async def test_persistent_404_raises_assertion_error(self):
-        """A get_collection that always 404s raises AssertionError once the deadline passes.
+    def test_a_different_file_under_a_used_mod_name_is_not_reused(
+        self, tmp_path, registered_module_names
+    ):
+        """The guard keys on the FILE, not on the name.
 
-        Uses a tiny timeout and asserts only the raise and that the probe ran
-        at least once (never elapsed wall-clock or an exact poll count) — a
-        slow host makes this slower, never falsely passing or failing.
+        Reusing on a name match alone would hand the second caller the first
+        script's module — silently serving the wrong code under the right key.
+
+        Replacement is allowed here because the helper installed that key
+        itself; the shadowing test below covers the case where it did not.
         """
-        from _fm_helpers import collection_vector_size
-        from qdrant_client.http.exceptions import UnexpectedResponse
+        first_script = tmp_path / 'first_source.py'
+        first_script.write_text("ORIGIN = 'first'\n")
+        second_script = tmp_path / 'second_source.py'
+        second_script.write_text("ORIGIN = 'second'\n")
+        registered_module_names('shared_key')
 
-        client = MagicMock()
-        client.get_collection.side_effect = UnexpectedResponse(404, 'Not Found', b'{}', httpx.Headers())
+        first = load_script_module(first_script, mod_name='shared_key')
+        assert first.ORIGIN == 'first'
 
-        with pytest.raises(AssertionError):
-            await collection_vector_size(client, 'c', timeout=0.05, interval=0.01)
+        second = load_script_module(second_script, mod_name='shared_key')
 
-        assert client.get_collection.call_count >= 1
+        assert second is not first
+        assert second.ORIGIN == 'second'
+        assert sys.modules['shared_key'] is second
 
-    @pytest.mark.asyncio
-    async def test_non_404_error_propagates_immediately(self):
-        """A non-404 UnexpectedResponse (e.g. 500) propagates on the first probe — fail loud."""
-        from _fm_helpers import collection_vector_size
-        from qdrant_client.http.exceptions import UnexpectedResponse
+    def test_an_exception_during_exec_propagates_and_leaves_no_partial_entry(
+        self, tmp_path, registered_module_names
+    ):
+        """A script that blows up mid-exec must not leave its half-built module
+        registered.
 
-        client = MagicMock()
-        client.get_collection.side_effect = UnexpectedResponse(500, 'err', b'{}', httpx.Headers())
+        The module is inserted into sys.modules BEFORE exec_module (so the
+        script can import itself), which means the failure path has to undo
+        that. Otherwise the next caller's reuse check would find the cached
+        entry, match its __file__, and return a module whose top level never
+        finished running — a partially-initialised module served as a good one.
+        """
+        script = tmp_path / 'exploding_script.py'
+        script.write_text("LOADED_SO_FAR = 1\nraise RuntimeError('boom during exec')\n")
+        registered_module_names('exploding_script')
 
-        with pytest.raises(UnexpectedResponse):
-            await collection_vector_size(client, 'c', timeout=5.0, interval=0.001)
+        with pytest.raises(RuntimeError, match='boom during exec'):
+            load_script_module(script)
 
-        assert client.get_collection.call_count == 1
+        assert 'exploding_script' not in sys.modules
+
+    def test_a_module_the_helper_did_not_install_is_never_shadowed(
+        self, tmp_path, registered_module_names
+    ):
+        """A key some OTHER importer owns must raise, not be overwritten.
+
+        mod_name defaults to the file stem, and `scripts/` is full of names
+        that are also ordinary module names (config.py, utils.py, types.py).
+        Silently replacing `sys.modules['config']` with a script would persist
+        for the rest of the pytest process and surface as an unrelated test
+        failing far away, so the helper refuses and says which name collided.
+        """
+        script = tmp_path / 'shadow_target.py'
+        script.write_text("ORIGIN = 'the script'\n")
+        registered_module_names('shadow_target')
+        pre_existing = types.ModuleType('shadow_target')
+        pre_existing.__file__ = str(tmp_path / 'somewhere_else.py')
+        pre_existing.ORIGIN = 'the real module'  # type: ignore[attr-defined]
+        sys.modules['shadow_target'] = pre_existing
+
+        with pytest.raises(ImportError, match='refusing to shadow'):
+            load_script_module(script)
+
+        assert sys.modules['shadow_target'] is pre_existing
+        assert sys.modules['shadow_target'].ORIGIN == 'the real module'
+
+    def test_a_foreign_module_without_a_file_attribute_is_also_not_shadowed(
+        self, tmp_path, registered_module_names
+    ):
+        """Namespace packages and C/builtin modules have no usable __file__.
+
+        The reuse check reads __file__ to decide whether the cached entry IS
+        this script; a None there must fall through to the ownership guard
+        rather than to a replacement.
+        """
+        script = tmp_path / 'fileless_target.py'
+        script.write_text("ORIGIN = 'the script'\n")
+        registered_module_names('fileless_target')
+        pre_existing = types.ModuleType('fileless_target')
+        sys.modules['fileless_target'] = pre_existing
+
+        with pytest.raises(ImportError, match='refusing to shadow'):
+            load_script_module(script, mod_name='fileless_target')
+
+        assert sys.modules['fileless_target'] is pre_existing
+
+    def test_ownership_lapses_when_a_load_fails_mid_exec(
+        self, tmp_path, registered_module_names
+    ):
+        """A failed load leaves nothing installed, so it must leave no claim.
+
+        Otherwise the helper would still consider the name its own, and a
+        genuine `import <name>` landing in between would be replaced by the
+        next by-path load — the exact shadowing the guard exists to stop,
+        reachable through a failed load.
+        """
+        exploding = tmp_path / 'lapsed_key.py'
+        exploding.write_text("raise RuntimeError('boom during exec')\n")
+        script = tmp_path / 'later_script.py'
+        script.write_text("ORIGIN = 'the script'\n")
+        registered_module_names('lapsed_key')
+
+        with pytest.raises(RuntimeError, match='boom during exec'):
+            load_script_module(exploding)
+
+        pre_existing = types.ModuleType('lapsed_key')
+        pre_existing.__file__ = str(tmp_path / 'a_real_module.py')
+        sys.modules['lapsed_key'] = pre_existing
+
+        with pytest.raises(ImportError, match='refusing to shadow'):
+            load_script_module(script, mod_name='lapsed_key')
+
+        assert sys.modules['lapsed_key'] is pre_existing
+
+    def test_a_path_with_no_importable_loader_raises_import_error(self, tmp_path):
+        """The helper's only explicit error contract.
+
+        spec_from_file_location returns None when no loader claims the suffix,
+        and the helper must turn that into a named ImportError rather than an
+        AttributeError on None further down.
+        """
+        with pytest.raises(ImportError, match='Cannot load'):
+            load_script_module(tmp_path / 'not_a_module.txt')

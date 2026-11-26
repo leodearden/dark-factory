@@ -18,7 +18,7 @@ freshness snapshot (a keyed Mem0 memory this module itself owns — see
 finding's primary (usually foreign) subject task, and compares
 ``(status, updatedAt, description-fingerprint)``.  When all three are
 unchanged, the finding is skipped from re-derivation and a lightweight
-'still blocked, no change' marker is written instead; otherwise the finding
+'no change' marker is written instead; otherwise the finding
 is kept for full re-investigation and the snapshot is (re)written to record
 the subject's current state.
 
@@ -69,14 +69,13 @@ mechanisms together, not the cap in isolation.
 Mirrors :meth:`ReconciliationHarness._reconcile_status_correction` /
 ``_delete_status_correction_memories``'s read-compare-supersede,
 add-then-delete pool-cap pattern, and reuses
-:func:`fused_memory.reconciliation.flag_dedup._content_fingerprint` for a
+:func:`fused_memory.reconciliation.flag_identity.content_fingerprint` for a
 deterministic description fingerprint (avoids storing full description text
 in the snapshot payload).
 
-This module has no imports from ``harness`` or ``stages/`` (other than the
-pure ``flag_dedup`` fingerprint helper) — callers inject ``memory_service``,
-``taskmaster``, and a ``resolve_project_root`` callable, keeping it
-decoupled and unit-testable without a real harness.
+This module has no imports from ``harness`` or ``stages/`` — callers inject
+``memory_service``, ``taskmaster``, and a ``resolve_project_root`` callable,
+keeping it decoupled and unit-testable without a real harness.
 """
 
 from __future__ import annotations
@@ -86,7 +85,7 @@ from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, NamedTuple
 
-from fused_memory.reconciliation.flag_dedup import _content_fingerprint
+from fused_memory.reconciliation.flag_identity import content_fingerprint
 
 if TYPE_CHECKING:
     from fused_memory.backends.task_backend_protocol import TaskBackendProtocol
@@ -233,12 +232,12 @@ def build_scope_snapshot_metadata(
     ``'dark_factory:2405'``) + ``flag_type=flag_key`` — the pair
     :func:`precheck_scope_correction_freshness` queries back on the next
     cycle via ``get_memories_by_metadata``.  ``subject_description_fingerprint``
-    reuses :func:`fused_memory.reconciliation.flag_dedup._content_fingerprint`
+    reuses :func:`fused_memory.reconciliation.flag_identity.content_fingerprint`
     (deterministic SHA-256 of the normalized description) rather than storing
     the full description text.
 
     ``no_change`` is only included (as ``True``) when explicitly requested —
-    set on the lightweight 'still blocked, no change' marker written when a
+    set on the lightweight 'no change' marker written when a
     finding is skipped; omitted (not merely ``False``) on a snapshot
     recording a first-sight or changed subject.  ``skip_streak`` (always
     included, default 0) is the number of CONSECUTIVE freshness-confirmed
@@ -256,7 +255,7 @@ def build_scope_snapshot_metadata(
         'subject_task_id': subject_task_id,
         'subject_status': status,
         'subject_updated_at': updated_at,
-        'subject_description_fingerprint': _content_fingerprint(description or ''),
+        'subject_description_fingerprint': content_fingerprint(description or ''),
         'run_id': run_id,
         'snapshot_at': snapshot_at,
         'skip_streak': skip_streak,
@@ -264,6 +263,11 @@ def build_scope_snapshot_metadata(
     if no_change:
         metadata['no_change'] = True
     return metadata
+
+
+def _subject_referents(subject_project_id: str, subject_task_id: str) -> list[dict[str, str]]:
+    """The declared-referents entry naming the subject task a snapshot or marker is about."""
+    return [{'kind': 'task', 'id': subject_task_id, 'project_id': subject_project_id}]
 
 
 def _extract_task_fields(resp: Any) -> tuple[str | None, str | None, str | None, dict]:
@@ -297,7 +301,7 @@ def snapshot_is_fresh(snapshot_metadata: dict[str, Any], live_task: Any) -> bool
 
     Requires ALL THREE of live ``status``, ``updatedAt``, and the
     content-fingerprint of ``description`` (via
-    :func:`fused_memory.reconciliation.flag_dedup._content_fingerprint`) to
+    :func:`fused_memory.reconciliation.flag_identity.content_fingerprint`) to
     equal the snapshot's ``subject_status``, ``subject_updated_at``, and
     ``subject_description_fingerprint`` respectively.  ``updatedAt`` is the
     load-bearing signal — sqlite_task_backend always advances it on any
@@ -320,7 +324,7 @@ def snapshot_is_fresh(snapshot_metadata: dict[str, Any], live_task: Any) -> bool
         return False
     if updated_at != snapshot_metadata['subject_updated_at']:
         return False
-    return _content_fingerprint(description or '') == snapshot_metadata['subject_description_fingerprint']
+    return content_fingerprint(description or '') == snapshot_metadata['subject_description_fingerprint']
 
 
 async def _pool_cap_scope_snapshots(
@@ -428,7 +432,7 @@ async def precheck_scope_correction_freshness(
     subject's live state.  When unchanged since the snapshot (see
     :func:`snapshot_is_fresh`) AND the pair's consecutive-skip streak is
     still under *max_consecutive_skips*, the finding is skipped and a
-    lightweight 'still blocked, no change' marker is written (recording the
+    lightweight 'no change' marker is written (recording the
     bumped streak); otherwise — first sight, the subject changed, OR the
     streak just reached *max_consecutive_skips* — the finding is kept and
     the snapshot is (re)written to record the subject's current state with
@@ -541,7 +545,7 @@ async def precheck_scope_correction_freshness(
                     if new_skip_streak < max_consecutive_skips:
                         # Unchanged since the last snapshot, and still under
                         # the consecutive-skip cap: skip re-derivation and
-                        # write a lightweight 'still blocked, no change'
+                        # write a lightweight 'no change'
                         # marker instead, recording the bumped streak.
                         no_change_metadata = build_scope_snapshot_metadata(
                             task_ref=task_ref, flag_key=flag_key,
@@ -554,12 +558,16 @@ async def precheck_scope_correction_freshness(
                         await memory_service.add_memory(
                             content=(
                                 f'Scope-correction freshness check for {task_ref} '
-                                f'(flag_type={flag_key!r}): still blocked, no change.'
+                                f'(flag_type={flag_key!r}): subject unchanged since '
+                                'the last snapshot.'
                             ),
                             category='observations_and_summaries',
                             project_id=project_id,
                             metadata=no_change_metadata,
                             _source=SCOPE_FRESHNESS_SOURCE,
+                            declared_referents=_subject_referents(
+                                subject_project_id, subject_task_id,
+                            ),
                         )
                         await _pool_cap_scope_snapshots(
                             memory_service, prior_memories, project_id, task_ref,
@@ -616,6 +624,7 @@ async def precheck_scope_correction_freshness(
                     project_id=project_id,
                     metadata=fresh_metadata,
                     _source=SCOPE_FRESHNESS_SOURCE,
+                    declared_referents=_subject_referents(subject_project_id, subject_task_id),
                 )
                 await _pool_cap_scope_snapshots(memory_service, prior_memories, project_id, task_ref)
                 to_reinvestigate.append(finding)

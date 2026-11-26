@@ -31,6 +31,8 @@ import pytest
 from orchestrator.config import OrchestratorConfig
 from orchestrator.routing import PlanShape, RoleDefaults, RouteInputs, resolve_route
 
+pytestmark = pytest.mark.usefixtures("code_default_config")
+
 # Every role _invoke can dispatch today (task epsilon boundary test 3) -- the
 # 11 full-name config-addressable roles (task alpha) plus one representative
 # reviewer* variant, proving the reviewer-prefix collapse holds through the
@@ -60,16 +62,6 @@ _SENTINEL_ROLE_DEFAULTS = RoleDefaults(
 )
 
 
-@pytest.fixture(autouse=True)
-def _isolated_config_env(monkeypatch, tmp_path):
-    """Every OrchestratorConfig() built in this module reads ONLY the
-    package's shipped defaults.yaml -- no stray project config.yaml, no
-    ambient ORCH_CONFIG_PATH. Mirrors test_routing.py's per-test convention.
-    """
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv('ORCH_CONFIG_PATH', '')
-
-
 def _config_key(role_name: str) -> str:
     """Reviewer* collapse, reconstructed independently of
     ``orchestrator.routing._config_key`` -- see this module's docstring:
@@ -93,10 +85,12 @@ def _expected_from_config(cfg: OrchestratorConfig, role_name: str) -> tuple[str,
     )
 
 
-def _inputs_for(role_name: str, *, plan_shape: PlanShape | None = None) -> RouteInputs:
+def _inputs_for(
+    role_name: str, *, plan_shape: PlanShape | None = None, task_id: str = '1',
+) -> RouteInputs:
     return RouteInputs(
         role_name=role_name,
-        task_id='1',
+        task_id=task_id,
         task_metadata={},
         plan_shape=plan_shape,
         routing_tier=0,
@@ -165,3 +159,28 @@ class TestRustHeuristicRuleParity:
 
         assert decision.model == cfg.models.architect
         assert decision.source_layer != 'policy_rule'
+
+
+class TestStockTableIgnoresTaskId:
+    """Invariant 3, extended: the shipped table carries no split, so the
+    task id never changes a decision."""
+
+    @pytest.mark.parametrize('role_name', ['implementer', 'debugger', 'architect'])
+    @pytest.mark.parametrize(
+        'plan_shape',
+        [
+            None,
+            PlanShape(5, ('a',)),
+            PlanShape(5, ('a', 'b', 'c')),
+            PlanShape(12, ('a',)),
+        ],
+    )
+    def test_decision_is_the_same_for_every_task_id(self, role_name, plan_shape):
+        cfg = OrchestratorConfig()
+
+        decisions = {
+            resolve_route(_inputs_for(role_name, plan_shape=plan_shape, task_id=str(i)), cfg)
+            for i in range(1, 201)
+        }
+
+        assert len(decisions) == 1

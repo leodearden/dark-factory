@@ -25,17 +25,17 @@ const { aggregateFlow, layoutFlow } = layout;
 // n == 1"). Marginals verified there and re-derived in the plan:
 //   origin  {implementer: 3, architect: 2}
 //   level   {0: 2, 1: 1, 2: 2}
-//   tier    {reaper-sweep: 1, human: 3, auto-watcher: 1}
+//   tier    {reaper-sweep: 1, 'human-ruled': 3, auto-watcher: 1}
 //   class   {benign: 2, actionable: 3}
 // Dates are arbitrary/inert here — aggregateFlow is window-agnostic and sums
 // purely over (source, level, tier, class); the multi-day-sum test below
 // exercises that explicitly with two dates for one identical key.
 const GOLDEN_FLOW_ROWS = [
   { date: '2026-01-01', source: 'implementer', level: 0, tier: 'reaper-sweep', class: 'benign', n: 1 },
-  { date: '2026-01-02', source: 'implementer', level: 0, tier: 'human', class: 'actionable', n: 1 },
+  { date: '2026-01-02', source: 'implementer', level: 0, tier: 'human-ruled', class: 'actionable', n: 1 },
   { date: '2026-01-03', source: 'architect', level: 1, tier: 'auto-watcher', class: 'benign', n: 1 },
-  { date: '2026-01-04', source: 'architect', level: 2, tier: 'human', class: 'actionable', n: 1 },
-  { date: '2026-01-05', source: 'implementer', level: 2, tier: 'human', class: 'actionable', n: 1 },
+  { date: '2026-01-04', source: 'architect', level: 2, tier: 'human-ruled', class: 'actionable', n: 1 },
+  { date: '2026-01-05', source: 'implementer', level: 2, tier: 'human-ruled', class: 'actionable', n: 1 },
 ];
 
 function countsById(nodes) {
@@ -74,7 +74,7 @@ test('aggregateFlow: golden fixture — level column node counts match verified 
 
 test('aggregateFlow: golden fixture — tier column node counts match verified marginals', () => {
   const model = aggregateFlow(GOLDEN_FLOW_ROWS);
-  assert.deepEqual(countsById(model.columns[2]), { 'reaper-sweep': 1, human: 3, 'auto-watcher': 1 });
+  assert.deepEqual(countsById(model.columns[2]), { 'reaper-sweep': 1, 'human-ruled': 3, 'auto-watcher': 1 });
 });
 
 test('aggregateFlow: golden fixture — class column node counts match verified marginals', () => {
@@ -101,9 +101,9 @@ test('aggregateFlow: golden fixture — level->tier ribbon counts match verified
   const model = aggregateFlow(GOLDEN_FLOW_ROWS);
   assert.deepEqual(linksByCol(model.links, 1), {
     '0|reaper-sweep': 1,
-    '0|human': 1,
+    '0|human-ruled': 1,
     '1|auto-watcher': 1,
-    '2|human': 2,
+    '2|human-ruled': 2,
   });
 });
 
@@ -111,7 +111,7 @@ test('aggregateFlow: golden fixture — tier->class ribbon counts match verified
   const model = aggregateFlow(GOLDEN_FLOW_ROWS);
   assert.deepEqual(linksByCol(model.links, 2), {
     'reaper-sweep|benign': 1,
-    'human|actionable': 3,
+    'human-ruled|actionable': 3,
     'auto-watcher|benign': 1,
   });
 });
@@ -147,6 +147,16 @@ test('aggregateFlow: interior-node conservation — tier nodes balance incoming 
   }
 });
 
+test('aggregateFlow: tier nodes follow the record-tier vocabulary order (classify.py::RESOLVER_TIERS)', () => {
+  const rows = [
+    { date: '2026-04-01', source: 'implementer', level: 2, tier: 'cascade', class: 'actionable', n: 1 },
+    { date: '2026-04-01', source: 'implementer', level: 2, tier: 'attended-seat', class: 'actionable', n: 1 },
+    { date: '2026-04-01', source: 'implementer', level: 2, tier: 'human-ruled', class: 'actionable', n: 1 },
+  ];
+  const model = aggregateFlow(rows);
+  assert.deepEqual(model.columns[2].map(n => n.id), ['human-ruled', 'attended-seat', 'cascade']);
+});
+
 // ---------------------------------------------------------------------------
 // aggregateFlow — multi-day sum: rows sharing (source,level,tier,class) but
 // differing only in `date` collapse into a single summed link/node (proves
@@ -156,18 +166,18 @@ test('aggregateFlow: interior-node conservation — tier nodes balance incoming 
 
 test('aggregateFlow: rows on different dates with identical (source,level,tier,class) collapse into one summed link', () => {
   const rows = [
-    { date: '2026-02-01', source: 'implementer', level: 0, tier: 'human', class: 'actionable', n: 1 },
-    { date: '2026-02-02', source: 'implementer', level: 0, tier: 'human', class: 'actionable', n: 1 },
+    { date: '2026-02-01', source: 'implementer', level: 0, tier: 'human-ruled', class: 'actionable', n: 1 },
+    { date: '2026-02-02', source: 'implementer', level: 0, tier: 'human-ruled', class: 'actionable', n: 1 },
   ];
   const model = aggregateFlow(rows);
   assert.equal(model.total, 2);
   assert.deepEqual(countsById(model.columns[0]), { implementer: 2 });
   assert.deepEqual(countsById(model.columns[1]), { '0': 2 });
-  assert.deepEqual(countsById(model.columns[2]), { human: 2 });
+  assert.deepEqual(countsById(model.columns[2]), { 'human-ruled': 2 });
   assert.deepEqual(countsById(model.columns[3]), { actionable: 2 });
   assert.deepEqual(linksByCol(model.links, 0), { 'implementer|0': 2 });
-  assert.deepEqual(linksByCol(model.links, 1), { '0|human': 2 });
-  assert.deepEqual(linksByCol(model.links, 2), { 'human|actionable': 2 });
+  assert.deepEqual(linksByCol(model.links, 1), { '0|human-ruled': 2 });
+  assert.deepEqual(linksByCol(model.links, 2), { 'human-ruled|actionable': 2 });
 });
 
 // ---------------------------------------------------------------------------
@@ -178,10 +188,10 @@ test('aggregateFlow: rows on different dates with identical (source,level,tier,c
 
 test('aggregateFlow: top-N source fold — excess sources fold into "other", links remap, totals conserved', () => {
   const rows = [
-    { date: '2026-03-01', source: 'a', level: 0, tier: 'human', class: 'actionable', n: 5 },
-    { date: '2026-03-01', source: 'b', level: 0, tier: 'human', class: 'actionable', n: 4 },
-    { date: '2026-03-01', source: 'c', level: 0, tier: 'human', class: 'actionable', n: 3 },
-    { date: '2026-03-01', source: 'd', level: 0, tier: 'human', class: 'actionable', n: 2 },
+    { date: '2026-03-01', source: 'a', level: 0, tier: 'human-ruled', class: 'actionable', n: 5 },
+    { date: '2026-03-01', source: 'b', level: 0, tier: 'human-ruled', class: 'actionable', n: 4 },
+    { date: '2026-03-01', source: 'c', level: 0, tier: 'human-ruled', class: 'actionable', n: 3 },
+    { date: '2026-03-01', source: 'd', level: 0, tier: 'human-ruled', class: 'actionable', n: 2 },
   ];
   const model = aggregateFlow(rows, { topNSources: 2 });
 

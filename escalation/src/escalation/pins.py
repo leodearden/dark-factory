@@ -1,0 +1,559 @@
+"""THE shared severity-aware escalation-pin classifier (task 3533).
+
+PRD ``plans/task-escalation-state-graph-prd.md`` D3; spec
+``docs/task-escalation-state-spec.md`` S6/E7.
+
+This module is the SINGLE shared pin predicate (INV-5): every
+recovery/redispatch veto site asks ``classify_pins`` whether a task's open
+escalations pin it, instead of re-deriving ``bool(open_escalations)`` locally
+and disagreeing with its neighbours.  It answers two different questions over
+one classification — :attr:`PinReport.pins` (the recovery/redispatch veto) and
+:attr:`PinReport.vetoes_done_flip` (the deliberately-more-conservative
+MARK_DONE veto) — so no consumer has to hand-roll "is this record non-info".
+
+PURE by construction: no I/O, no store binding, no mutation of its inputs.
+The CALLER binds the read to the task's OWNING orchestrator's escalation store
+(spec S6 store-correctness contract, esc-3163 lesson) and passes the rows in.
+
+Three record classes:
+  ``non_pinning``     an ``info``-severity record — never pins, at any level.
+  ``queue_handoff``   a live, supervised handoff — PINS.  Covers L1/L2 (queue-
+                      backed, consumed by the auto-watcher / a human), a live-
+                      filer L0, and every fail-safe fallthrough.
+  ``dead_l0``         an L0 whose FILING incarnation is dead — the handoff has
+                      no consumer left, so it does NOT pin recovery (conversion
+                      proceeds per spec S4) but DOES still veto a done-flip.
+
+...plus a distinguishable THIRD state, ``store_unavailable``: the escalation
+store could not be READ, which is never collapsed into "no records" because a
+false ``[]`` would route a genuinely-pinned strand into the plain revert
+branch (esc-3163).  See :func:`classify_pins` for the full contract.
+
+The precedence chain, evaluated top to bottom (spec S6; the numbered version
+with its rationale lives above :func:`_classify_record`):
+
+  1. ``severity == 'info'``                -> ``NON_PINNING``
+  2. ``severity`` not in ``KNOWN_SEVERITIES`` -> ``QUEUE_HANDOFF`` (fail-safe)
+  3. ``level != 0``                        -> ``QUEUE_HANDOFF``
+  3b. ``severity`` in ``BORN_AT_L2_SEVERITIES`` at ``level == 0``
+                                           -> ``QUEUE_HANDOFF`` (fail-safe:
+                                              contradictory state)
+  4. ``level == 0``                        -> filing-incarnation liveness
+                                              (``DEAD_L0`` only when the filer
+                                              is PROVABLY dead)
+
+Task 3533 delivered the types + classifier + tests; task 3541 (eta) rewired
+every veto site onto them — ``task_ground_truth._shape`` and its report-shaped
+adapters, the harness reconcile sweeps, the scheduler's stranded-blocked
+redispatch, the deterministic-recon dedup and the orphan-L0 reaper, the
+orchestrator half composed in ``orchestrator/recovery_pins.py``.  The
+structured ``escalation_store_unavailable`` emission is task beta (3535).
+"""
+
+from __future__ import annotations
+
+import enum
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Protocol
+
+from escalation.models import BORN_AT_L2_SEVERITIES, KNOWN_SEVERITIES, normalised_severity
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
+
+__all__ = [
+    'HUMAN_PARKED_MIN_LEVEL',
+    'ClusterPinRecord',
+    'PinClass',
+    'PinRecord',
+    'PinReport',
+    'classify_pins',
+    'is_queue_handoff',
+    'needs_human',
+    'pinned_only_by_human_parked',
+]
+
+#: The escalation level at which a record is in front of a HUMAN (L2) — read
+#: by :func:`pinned_only_by_human_parked` and :func:`needs_human`.
+HUMAN_PARKED_MIN_LEVEL: int = 2
+
+
+class PinClass(enum.StrEnum):
+    """The closed vocabulary of pin classes a record can fall into.
+
+    Genuine ``str`` members (mirrors ``shared.task_statuses.TaskStatus`` /
+    ``orchestrator.task_ground_truth.RecoveryAction``) so equality against a
+    plain string holds without an explicit ``.value``.
+    """
+
+    DEAD_L0 = 'dead_l0'
+    QUEUE_HANDOFF = 'queue_handoff'
+    NON_PINNING = 'non_pinning'
+
+
+class PinRecord(Protocol):
+    """The minimal record surface :func:`classify_pins` reads.
+
+    A STRUCTURAL protocol so BOTH ``escalation.models.Escalation`` (the
+    server-side consumer) and ``orchestrator.task_ground_truth.EscalationRef``
+    (the resolver-side consumers) satisfy it without ``escalation`` importing
+    ``orchestrator`` — that import direction is a layering inversion
+    (``orchestrator`` already depends on ``escalation``; ``escalation`` reaches
+    for ``orchestrator`` only lazily, inside ``server.py`` function bodies).
+
+    ``filing_claimant_run_id`` semantics are documented once, on
+    :func:`classify_pins` (normative source: spec
+    ``docs/task-escalation-state-spec.md`` S6).
+
+    The four members are declared READ-ONLY (property form rather than plain
+    ``id: str`` attributes) because a protocol attribute is writable-invariant:
+    a plain-attribute protocol rejects FROZEN dataclasses, and
+    ``EscalationRef`` — the resolver-side record type this classifier exists to
+    serve — is ``@dataclass(frozen=True)``.  Read-only members accept both
+    frozen and mutable implementations, which is exactly the pairing here
+    (``EscalationRef`` frozen, ``Escalation`` mutable).  The classifier only
+    ever reads, so nothing is given up.
+    """
+
+    @property
+    def id(self) -> str: ...
+
+    @property
+    def level(self) -> int: ...
+
+    @property
+    def severity(self) -> str: ...
+
+    @property
+    def filing_claimant_run_id(self) -> str | None: ...
+
+
+class ClusterPinRecord(PinRecord, Protocol):
+    """A :class:`PinRecord` that also names the ids its cluster holds, read only by :func:`pinned_only_by_human_parked`."""
+
+    @property
+    def members(self) -> Sequence[str]: ...
+
+
+@dataclass(frozen=True)
+class PinReport:
+    """The classification of one task's open escalations (a frozen snapshot).
+
+    Buckets carry escalation IDs rather than the records themselves, so the
+    report stays a comparable, directly-serialisable value object that drops
+    straight into a structured ``recovery_vetoed`` / ``recovery_left``
+    emission; a caller that needs timestamps or ages already holds the records
+    it passed in.  Tuples (not lists) so the frozen dataclass is genuinely
+    immutable and no shared consumer can mutate a bucket in place.
+    """
+
+    dead_l0: tuple[str, ...]
+    queue_handoff: tuple[str, ...]
+    non_pinning: tuple[str, ...]
+    store_unavailable: bool = False
+    task_id: str = ''
+
+    @property
+    def pins(self) -> bool:
+        """The recovery/redispatch veto: is this task pinned by an escalation?
+
+        True iff a live handoff pins it, or the store could not be read.  A
+        ``dead_l0`` deliberately does NOT pin — its handoff has no consumer
+        left, so conversion proceeds (spec S4 / PRD boundary row 7).
+        """
+        return bool(self.store_unavailable or self.queue_handoff)
+
+    @property
+    def vetoes_done_flip(self) -> bool:
+        """The MARK_DONE veto — deliberately more conservative than :attr:`pins`.
+
+        True for ANY non-info open record (PRD D3: "any non-info open record
+        still vetoes MARK_DONE" — phantom-done protection is the half of the
+        veto that was always right), so a ``dead_l0`` blocks a done-flip while
+        not blocking a conversion.  Also true when the store was unavailable.
+        """
+        return bool(self.store_unavailable or self.queue_handoff or self.dead_l0)
+
+
+# ---------------------------------------------------------------------------
+# THE precedence chain (spec docs/task-escalation-state-spec.md S6).
+# ONE documented ordering, evaluated top to bottom.  Each link is deliberate;
+# re-ordering them changes dispositions, so change them only with the spec.
+#
+#   1. severity == 'info'                -> NON_PINNING
+#      An info record never pins, at any level, under any liveness.
+#   2. severity not in KNOWN_SEVERITIES  -> QUEUE_HANDOFF   (fail-safe pin)
+#      Missing / blank / out-of-vocabulary severity "fails safe to pinning
+#      (treated as a handoff), never to conversion".  Deliberately ABOVE the
+#      level/L0 links, so an unknown-severity DEAD L0 still pins.
+#   3. level != 0                        -> QUEUE_HANDOFF
+#      L1/L2 are queue-backed handoffs with supervised consumers; written
+#      `!= 0` (not `>= 1`) so a corrupt/out-of-range level fails safe too.
+#   3b. level == 0 AND severity in BORN_AT_L2_SEVERITIES -> QUEUE_HANDOFF
+#      Same spirit as link 3's `!= 0`: a critical/urgent record is BORN at L2
+#      and routed straight to a human, so one sitting at L0 is contradictory
+#      state and must not reach the conversion-eligible branch below.
+#   4. level == 0, L0-legal non-info severity -> filing-incarnation liveness:
+#        no incarnation live at all         -> DEAD_L0
+#        live, and both identities known and DIFFERENT -> DEAD_L0
+#        live, and identities MATCH         -> QUEUE_HANDOFF
+#        live, either identity unknown      -> QUEUE_HANDOFF (fail-safe pin)
+#      "unknown" here means None, blank, OR not in compose_claimant_run_id
+#      shape — see `_norm_id`: a format mismatch is not PROOF of a dead filer.
+# ---------------------------------------------------------------------------
+
+
+#: The labelled tail every ``shared.task_claimant.compose_claimant_run_id``
+#: value ends with (``{run_id}/{session_id}/pid={owner_pid}``).  Its presence
+#: is a cheap SHAPE check, not a parse — see :func:`_norm_id`.
+_COMPOSED_ID_MARKER = '/pid='
+
+
+def _norm_id(value: str | None) -> str | None:
+    """Normalise a claimant identity to a COMPARABLE string, or ``None``.
+
+    ``None`` means "unknown", which link 4 fails safe to pinning.  Two things
+    collapse to unknown:
+
+    * ``None`` or blank-after-strip — there is nothing to compare.
+    * a value that is not in ``compose_claimant_run_id`` shape (no ``/pid=``
+      marker).  Comparing a composed identity against a bare ``session_id``
+      would ALWAYS mismatch, converting a genuinely LIVE filer's L0 to
+      ``DEAD_L0`` — the unsafe direction.  The in-repo liveness resolver
+      (``orchestrator.task_ground_truth.TaskGroundTruth._resolve_live_claimant``)
+      was normalised by task 3563 and now emits only composed identities or
+      ``None``: its DB source yields the composed identity, its plan.lock
+      source yields a composed identity when the lock records a run_id and
+      ``None`` (unknown) otherwise, and its in-memory source yields ``None``.
+      Its plan.lock leg reads the ``.task-meta`` root the lock's writer
+      targets (task 4028), so a real orchestrator run CAN reach it and emit a
+      composed identity from that source.  Since task 3541 a production
+      caller DOES pass a live identity: the orphan-L0 reaper compares a
+      record's filing identity against the live task row's DB
+      ``claimant_run_id`` stamp, so this guard is on a hot path rather than
+      latent.
+      It stays load-bearing DEFENCE IN DEPTH beyond that — legacy
+      plan.lock files already on disk, harness-less workflows (whose DB stamp
+      is itself partial), and any future producer can still hand this module a
+      non-composed identity.  A format mismatch is not PROOF that the filer is
+      dead, and this module may only convert on proof.
+
+    A SHAPE check, never a parse: the value is compared WHOLE and never
+    decomposed (a differing ``pid=`` suffix is a different incarnation).
+    """
+    if value is None:
+        return None
+    stripped = value.strip()
+    if not stripped or _COMPOSED_ID_MARKER not in stripped:
+        return None
+    return stripped
+
+
+def _classify_record(
+    record: PinRecord,
+    *,
+    live_claimant: bool,
+    live_claimant_id: str | None,
+) -> PinClass:
+    """Map one open escalation to its :class:`PinClass` (see the chain above)."""
+    sev = normalised_severity(record.severity)
+
+    # Link 1 — spec S6: an info record is an ANNOTATION, not a handoff.  Task
+    # 3976 let `escalation.server.promote_to_l2`'s inherited max(member
+    # severities) default mint a fresh L2 at severity='info'; since task 5222
+    # that default is REFUSED for an all-info cluster, but an explicit
+    # severity='info' promote (and `EscalationQueue.park()` of an already-open
+    # L0/L1) still produce info L2s, and this link decides each of them
+    # NON_PINNING — see TestInfoAtL2Coupling in escalation/tests/test_pins.py
+    # (task 4402).
+    if sev == 'info':
+        return PinClass.NON_PINNING
+
+    # Link 2 — spec S6: an unknown severity "fails safe to pinning (treated as
+    # a handoff), never to conversion".  This link sits ABOVE links 3/4 on
+    # purpose: the "never to conversion" clause is only meaningful if the
+    # fail-safe is evaluated before the L0 branch that produces the
+    # convertible DEAD_L0 class, so an unknown-severity dead L0 STILL pins.
+    if sev not in KNOWN_SEVERITIES:
+        return PinClass.QUEUE_HANDOFF
+
+    # Link 3 — spec S6: L1/L2 are QUEUE-BACKED handoffs whose consumers (the
+    # auto-watcher, a human) are supervised and outlive any one workflow
+    # incarnation, so they pin regardless of liveness.  Written `!= 0` rather
+    # than `>= 1` on purpose: a corrupt / out-of-range / negative level then
+    # also fails safe to pinning instead of falling into the conversion-
+    # eligible L0 branch below.
+    if record.level != 0:
+        return PinClass.QUEUE_HANDOFF
+
+    # Link 3b — a BORN_AT_L2 severity (critical/urgent) at level 0 is
+    # CONTRADICTORY state: such records are created directly at L2 and routed
+    # straight to a human, which is why every in-repo producer stamps
+    # `level=2` alongside them and why `needs_human` treats a born-at-L2
+    # severity as needing a human at any level.
+    # Fail it safe to pinning for exactly the reason link 3 is written `!= 0`
+    # — a human-routed record must never fall into the conversion-eligible
+    # branch below on the strength of a level field that contradicts it.
+    if sev in BORN_AT_L2_SEVERITIES:
+        return PinClass.QUEUE_HANDOFF
+
+    # Link 4 — the filing-incarnation rule (spec S6): an L0 is a live handoff
+    # ONLY while the incarnation that FILED it lives.  Liveness is judged
+    # against that filer, never against "some workflow for this task is alive".
+    if not live_claimant:
+        # No incarnation is live at all, so the filing one is necessarily dead
+        # — identity-independent.  This branch alone covers the 2026-08-02
+        # strand shape (7 of 9 tasks pinned by their own dead-steward L0).
+        return PinClass.DEAD_L0
+
+    filed_by = _norm_id(record.filing_claimant_run_id)
+    live_id = _norm_id(live_claimant_id)
+    if filed_by is not None and live_id is not None and filed_by != live_id:
+        # A claimant is live, but it is NOT the one that filed this record:
+        # "a newer incarnation never keeps a prior incarnation's unconsumed L0
+        # alive" (spec S6).  Exact-string comparison — `shared.task_claimant`
+        # ships a composer and deliberately no parser, so a differing `pid=`
+        # suffix is a DIFFERENT incarnation.
+        return PinClass.DEAD_L0
+
+    # Either the identities MATCH (a genuinely live handoff) or one of them is
+    # unknown.  On unknown, the classifier may only convert when it can PROVE
+    # the filing incarnation is dead — it cannot, so it fails safe to pinning.
+    return PinClass.QUEUE_HANDOFF
+
+
+def classify_pins(
+    task_id: str,
+    records: Sequence[PinRecord] | None,
+    *,
+    live_claimant: bool,
+    live_claimant_id: str | None = None,
+) -> PinReport:
+    """Classify *records* — the task's OPEN escalations — into pin classes.
+
+    :param task_id: echoed onto the report for structured-emission attribution.
+        Records are NOT filtered against it — the caller owns the read scope.
+    :param records: the task's open escalations, in store order, or ``None``
+        when the store could not be READ (see the store-correctness contract
+        below).  An empty sequence means "read succeeded, no open records" and
+        is a genuinely different answer.
+    :param live_claimant: whether ANY incarnation currently holds the task.
+    :param live_claimant_id: the live incarnation's ``claimant_run_id``, when
+        the caller can resolve it.  Needed to tell "the filer is still live"
+        from "a DIFFERENT incarnation is live" — the single task-level boolean
+        cannot express that distinction, and it is exactly the case the
+        dead-L0 rule exists for.  ``None`` (or an unknown filing identity on
+        the record) fails safe to pinning.
+
+        PRECONDITION: it must be a full
+        ``shared.task_claimant.compose_claimant_run_id`` string
+        (``{run_id}/{session_id}/pid={owner_pid}``) — the same form
+        ``PinRecord.filing_claimant_run_id`` carries.  A bare ``session_id``
+        or any other shape is NOT a valid substitute; it is detected by the
+        ``/pid=`` shape check in :func:`_norm_id` and treated as UNKNOWN
+        (fail-safe to pinning) rather than silently mismatching every
+        composed filing identity and converting live L0s.
+
+    NORMATIVE (spec ``docs/task-escalation-state-spec.md`` S6 — this docstring
+    is the single in-code statement of it; other sites cross-reference here).
+    ``PinRecord.filing_claimant_run_id`` is the identity of the incarnation
+    that FILED the record, in ``compose_claimant_run_id`` format.  Liveness is
+    judged against THAT incarnation, never against "some workflow for this
+    task is alive": a newer live incarnation never keeps a prior incarnation's
+    unconsumed L0 alive.  ``None`` means "filing identity unknown" — legacy
+    records, and producers that do not stamp it — which fails safe to
+    PINNING, because the classifier may only convert an L0 when it can PROVE
+    the filing incarnation is dead.  The identity is stored and compared
+    verbatim, never parsed.  As of task 3550 the stamping producers are
+    ``orchestrator.workflow.TaskWorkflow``, ``orchestrator.harness.Harness``,
+    and the ``escalate_blocker``/``escalate_info`` chokepoint in
+    ``escalation.server`` (via its injected ``task_claimant_lookup``).  Still
+    NOT stamping: ``escalation.submit``'s detached CLI (a systemd OnFailure
+    entry point with no orchestrator run_id and no session, so it structurally
+    cannot, and which hardcodes ``level=2``),
+    ``orchestrator.deterministic_runner`` (all six sites ``level=2`` /
+    ``severity='critical'``),
+    ``orchestrator/src/orchestrator/merge_lane/worker.py::_file_main_health_escalation``
+    (level 1, no per-task incarnation; pinned by
+    ``orchestrator/tests/test_merge_queue_main_health_deferred.py::_assert_pins_only_as_queue_handoff``)
+    and the other level-1/2-only filers — where link 3 makes the identity
+    moot.  The L0 ``severity='info'`` filers (e.g.
+    ``orchestrator.merge_lane.skew_tripwire``, the ``_AMENDMENT_TRUNCATION``/
+    ``_ROOT_CAUSE_OVERFOLD`` anchors in ``escalation.server``) do not stamp either, but they are moot
+    via link 1, not link 3.
+
+    The one non-stamping L0 ``'blocking'`` producer,
+    ``fused-memory/src/fused_memory/reconciliation/harness.py::ReconciliationHarness._escalate``,
+    files against synthetic ``recon-<run_id>`` task ids on the reconciliation
+    queue, which no task-scoped pin read binds to.
+
+    See the precedence chain above :func:`_classify_record` for the rules, and
+    :class:`PinReport` for the buckets and the two derived predicates.
+
+    STORE-CORRECTNESS CONTRACT (spec ``docs/task-escalation-state-spec.md``
+    S6; esc-3163 lesson).  Two obligations, both on the CALLER:
+
+    1. Bind the read to the task's OWNING orchestrator's escalation store —
+       never the reconciliation store, never "whichever queue is handy".
+       esc-3163 was a wrong-store read that reported no open escalations for a
+       task that had them.
+    2. Pass ``records=None`` when that read could not be performed or failed.
+       Never substitute ``[]``: a false "no records" routes a genuinely-pinned
+       strand into the plain revert branch.  This is why the third state is a
+       field on the returned report rather than an exception — the collapse is
+       structurally impossible, and every consumer inherits one fail-safe
+       disposition instead of writing its own try/except.
+
+    The caller-side pattern this generalises already exists at
+    ``orchestrator/src/orchestrator/scheduler.py`` (the stranded-blocked
+    redispatch sweep's ``escalation_queue is None => never flip`` guard):
+    without the queue a sweep cannot verify "no open escalation", so it must
+    not act.  ``store_unavailable`` makes that guard expressible in the shared
+    predicate; task beta (3535) wires the structured
+    ``recovery_left(reason=escalation_store_unavailable)`` emission to these
+    same semantics rather than re-deriving them.
+    """
+    if records is None:
+        return PinReport((), (), (), store_unavailable=True, task_id=task_id)
+
+    buckets: dict[PinClass, list[str]] = {
+        PinClass.DEAD_L0: [],
+        PinClass.QUEUE_HANDOFF: [],
+        PinClass.NON_PINNING: [],
+    }
+    for record in records:
+        pin_class = _classify_record(
+            record, live_claimant=live_claimant, live_claimant_id=live_claimant_id,
+        )
+        buckets[pin_class].append(record.id)
+
+    return PinReport(
+        tuple(buckets[PinClass.DEAD_L0]),
+        tuple(buckets[PinClass.QUEUE_HANDOFF]),
+        tuple(buckets[PinClass.NON_PINNING]),
+        task_id=task_id,
+    )
+
+
+def pinned_only_by_human_parked(
+    report: PinReport,
+    records: Sequence[ClusterPinRecord] | None,
+    *,
+    holder_candidates: Sequence[ClusterPinRecord] = (),
+) -> bool:
+    """Is everything that PINS this task already in front of a human?
+
+    **This docstring is the canonical statement of the predicate; other sites
+    point here.**  True iff the read succeeded, something pins the task, and
+    every record in the ``queue_handoff`` bucket — the bucket
+    :attr:`PinReport.pins` reads — is either itself at
+    ``level >= HUMAN_PARKED_MIN_LEVEL``, or a level-1 record that such a
+    human-level handoff names in its ``members``.  The L1 an L2 was promoted
+    from stays open, and still pins, until the L2's cascade closes it, yet a
+    human already holds it.  The holder may be among *records* — the caller's
+    read scope — or among *holder_candidates*, OPEN records from outside that
+    read: ``escalation/src/escalation/server.py::promote_to_l2`` mints a
+    cluster L2 under ONE task id, so the L2 holding this task's L1 may be
+    filed under another (task 7716).  A candidate only holds members: it never
+    pins this task, and it counts only as a human-level queue handoff
+    (:func:`is_queue_handoff`).  Candidates are never classified into
+    *report*, so passing the whole pending queue is safe.
+
+    *report* is what :func:`classify_pins` returned for these same *records*,
+    taken rather than recomputed so a caller that already classified them does
+    not classify twice; the info, unknown-severity, dead-L0 and
+    store-unavailable rules are therefore the chain's own, and an info L2 —
+    no handoff — holds nothing.  Records that do not pin (see
+    :attr:`PinReport.pins`) cannot spoil the answer, and a store that could not
+    be read never counts as parked.
+
+    Every uncertain input answers False — no records, an unreadable store, an
+    L1 no human-level handoff holds, a level that is missing or
+    not an int (never coerced: ``'3'``, ``2.9`` and ``True`` are not levels,
+    and a held member must be a genuine int ``1``), ``members`` that are not a
+    list or tuple of str (never coerced, and a bare string is never
+    substring-matched), a handoff id the records do not carry — because a
+    false True silences an alarm for a genuinely stranded task, while a false
+    False costs one quick triage.
+
+    The bar is the LEVEL, not ``severity in BORN_AT_L2_SEVERITIES``: ``level``
+    records the promotion to a human, whereas a critical/urgent record still at
+    level 0 is the contradictory state link 3b fails safe to pinning, not proof
+    that anyone human holds the task.
+
+    Pure: no I/O, and no argument is mutated.
+    """
+    if report.store_unavailable or records is None or not report.queue_handoff:
+        return False
+    parked = _human_parked_ids(report.queue_handoff, records, holder_candidates)
+    return set(report.queue_handoff) <= parked
+
+
+def _human_parked_ids(
+    handoff_ids: Sequence[str],
+    records: Sequence[ClusterPinRecord],
+    holder_candidates: Sequence[ClusterPinRecord],
+) -> frozenset[str]:
+    by_id = {record.id: record for record in records}
+    handoffs = [by_id[esc_id] for esc_id in handoff_ids if esc_id in by_id]
+    holders = [record for record in handoffs if _is_human_level(record.level)]
+    outside_holders = [
+        candidate
+        for candidate in holder_candidates
+        if _is_human_level(candidate.level) and is_queue_handoff(candidate)
+    ]
+    held = frozenset(
+        member for holder in holders + outside_holders for member in _member_ids(holder)
+    )
+    held_l1s = [record for record in handoffs if record.id in held and _is_l1(record.level)]
+    return frozenset(record.id for record in holders + held_l1s)
+
+
+def is_queue_handoff(record: PinRecord) -> bool:
+    """Does this ONE open record gate a live run?
+
+    True iff the shared chain classifies *record* as ``QUEUE_HANDOFF``.
+    ``live_claimant=True`` with no live id makes an L0 fail safe to a handoff,
+    so in practice only info never gates.  Consumer: :func:`needs_human`
+    (task 5222 / PRD gamma).
+    """
+    return bool(classify_pins('', [record], live_claimant=True).queue_handoff)
+
+
+def needs_human(record: PinRecord) -> bool:
+    """Can only a human dispose of this ONE record — no steward applies?
+
+    True for a born-at-L2 severity (``critical``/``urgent``, routed straight
+    to a human; matched exactly, not normalised) at any level, or for a
+    ``level >= HUMAN_PARKED_MIN_LEVEL`` record that :func:`is_queue_handoff`
+    calls a handoff (PRD ``plans/info-l0-disposition-router-prd.md`` D3),
+    so an info L2 never needs one and an unknown severity fails safe to
+    needing one.  Consumers:
+    ``orchestrator/src/orchestrator/workflow.py::_is_gating_escalation``
+    together with the entry and tail checks of
+    ``TaskWorkflow._wait_for_resolution``, and
+    ``orchestrator/src/orchestrator/recovery_pins.py::records_pin_blocked_recovery``
+    (task 6145).
+    """
+    return record.severity in BORN_AT_L2_SEVERITIES or (
+        record.level >= HUMAN_PARKED_MIN_LEVEL and is_queue_handoff(record)
+    )
+
+
+def _is_human_level(level: object) -> bool:
+    return (
+        isinstance(level, int)
+        and not isinstance(level, bool)
+        and level >= HUMAN_PARKED_MIN_LEVEL
+    )
+
+
+def _is_l1(level: object) -> bool:
+    return isinstance(level, int) and not isinstance(level, bool) and level == 1
+
+
+def _member_ids(record: ClusterPinRecord) -> frozenset[str]:
+    members: object = record.members
+    if not isinstance(members, (list, tuple)):
+        return frozenset()
+    return frozenset(member for member in members if isinstance(member, str))

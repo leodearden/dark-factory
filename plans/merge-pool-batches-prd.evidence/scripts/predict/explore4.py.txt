@@ -1,0 +1,23 @@
+import json,collections
+E=sorted((json.loads(l) for l in open('/tmp/gate-10069/predict/events.jsonl')),key=lambda e:e['id'])
+bytask=collections.defaultdict(list)
+for e in E:
+    if e['et'] in('merge_verify','merge_finalized','merge_attempt','merge_queued','speculative_discard','merge_verify_cancelled','merge_blocked','phase_enter','task_started'): bytask[e['task']].append(e)
+k=0
+for t,ev in bytask.items():
+    lane=[e for e in ev if e['et'] not in('phase_enter','task_started')]
+    for i,e in enumerate(lane):
+        if e['et']=='merge_verify' and (e['d'].get('chain_items') or 1)==1 and not e['d']['passed'] and e['ts']>='2026-10-20':
+            if i+2<len(lane) and lane[i+1]['et']=='merge_attempt' and lane[i+1]['d'].get('outcome')=='verify_failed' and lane[i+1]['d'].get('disposition') is None and lane[i+2]['et']=='merge_queued':
+                k+=1
+                if k in (1,2,8,15,22,29):
+                    print('-----',t)
+                    for f in lane[max(0,i-2):i+8]:
+                        d={kk:v for kk,v in f['d'].items() if kk in('passed','chain_items','outcome','disposition','state','reason','request_id','attempt','base_relation','speculative','depth','merge_sha','red_units','runner')}
+                        if 'reason' in d and d['reason']: d['reason']=d['reason'][:60]
+                        if 'merge_sha' in d and d['merge_sha']: d['merge_sha']=d['merge_sha'][:8]
+                        print('  ',f['id'],f['ts'][5:19],f['et'],json.dumps(d))
+                    # phases between
+                    ph=[(p['ts'][5:19],p['et'],p['phase'],p['d'].get('phase')) for p in ev if p['et'] in('phase_enter','task_started') and e['ts']<=p['ts']<=lane[min(i+7,len(lane)-1)]['ts']]
+                    print('   phases:',ph[:6])
+print(k)

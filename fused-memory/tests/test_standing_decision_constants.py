@@ -10,6 +10,8 @@ vocabularies that β/γ/δ/ε/ζ consume. No introspection/docstring meta-tests.
 
 from __future__ import annotations
 
+import pytest
+
 from fused_memory.reconciliation import standing_decision_constants as sdc
 
 
@@ -70,3 +72,66 @@ def test_expiry_reason_vocabulary_and_members():
         sdc.EXPIRY_REASON_OPERATOR,
     ):
         assert reason in sdc.EXPIRY_REASONS
+
+
+def test_suppression_streak_record_kind_is_distinct_and_not_a_marker_kind():
+    """The streak's ledger record kind is pinned and DISTINCT from the decision
+    row's kind (a collision would make the streak upsert overwrite the decision
+    row itself), and it is not a per-task marker kind, so gc()'s terminal-task
+    DELETE arm never touches it and only the expires_at arm reaps it."""
+    from fused_memory.reconciliation.recon_ledger import MARKER_KINDS
+
+    assert (
+        sdc.RECORD_KIND_ENTITY_SUPPRESSION_STREAK
+        == 'entity_standing_decision_suppression_streak'
+    )
+    assert (
+        sdc.RECORD_KIND_ENTITY_SUPPRESSION_STREAK
+        != sdc.RECORD_KIND_ENTITY_STANDING_DECISION
+    )
+    assert sdc.RECORD_KIND_ENTITY_SUPPRESSION_STREAK not in MARKER_KINDS
+
+
+def test_suppression_streak_threshold_is_three_cycles():
+    """K is an int >= 2 (a one-cycle "streak" would measure a burst, which the
+    per-cycle escape already owns, rather than persistence) and is decided at
+    3, matching ζ's GROWTH_SWEEP_FAILURE_STREAK_THRESHOLD (PRD Open Question
+    4)."""
+    assert isinstance(sdc.SUPPRESSION_STREAK_THRESHOLD_CYCLES, int)
+    assert not isinstance(sdc.SUPPRESSION_STREAK_THRESHOLD_CYCLES, bool)
+    assert sdc.SUPPRESSION_STREAK_THRESHOLD_CYCLES >= 2
+    assert sdc.SUPPRESSION_STREAK_THRESHOLD_CYCLES == 3
+
+
+@pytest.mark.parametrize('key', [sdc.STREAK_PAYLOAD_KEY, sdc.STREAK_WINDOW_PAYLOAD_KEY])
+def test_streak_payload_keys_are_non_empty_strings(key):
+    """That no two keys on a streak row collide is shown by the row's round
+    trip in test_recon_ledger.py."""
+    assert isinstance(key, str)
+    assert key
+
+
+def test_streak_volume_threshold_is_the_per_cycle_n():
+    """The PRD's single N governs both "more than N flags in one cycle" and
+    "across a streak of cycles", so the streak's volume threshold is the
+    per-cycle threshold, a non-bool int."""
+    assert isinstance(sdc.SUPPRESSION_STREAK_VOLUME_THRESHOLD, int)
+    assert not isinstance(sdc.SUPPRESSION_STREAK_VOLUME_THRESHOLD, bool)
+    assert (
+        sdc.SUPPRESSION_STREAK_VOLUME_THRESHOLD
+        == sdc.SUPPRESSION_STORM_THRESHOLD_PER_CYCLE
+    )
+
+
+def test_a_decision_working_as_intended_never_trips_the_streak_escape():
+    """A decision that works suppresses its re-derived complaint about once per
+    cycle, indefinitely (PRD §Goal): Hook A drops the flag only after Stage 1
+    has emitted it. The streak escape sums the last K cycles, so that steady
+    state totals K·1. If K ever exceeded N, every healthy decision would page
+    the storm escape once its streak reached K, which is the review-round-1
+    defect this invariant keeps closed when either number is tuned."""
+    steady_state_flags_per_cycle = 1
+    assert (
+        sdc.SUPPRESSION_STREAK_THRESHOLD_CYCLES * steady_state_flags_per_cycle
+        <= sdc.SUPPRESSION_STREAK_VOLUME_THRESHOLD
+    )

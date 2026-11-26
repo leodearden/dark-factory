@@ -39,6 +39,8 @@ import logging
 import sys
 from typing import Any
 
+from fused_memory.utils.store_mutation_preflight import assert_store_mutation_allowed
+
 logger = logging.getLogger('clear_false_dep_invalidations')
 
 # Six dependency-edge UUIDs that were falsely invalidated by the upstream
@@ -76,6 +78,27 @@ async def repair(
         A JSON-serialisable report dict with keys:
         ``project``, ``dry_run``, ``edges_total``, ``cleared``, ``edges``.
     """
+    # Fail-CLOSED capability preflight, one probe per run, BEFORE the scan.
+    #
+    # Hoisted ABOVE the loop deliberately. ``StoreMutationUnavailable``
+    # subclasses ``RuntimeError``, so a probe at the in-loop ``if apply:`` gate
+    # below would be caught by that iteration's ``except Exception`` and
+    # downgraded into six ``{'status': 'error'}`` rows -- while ``update_edge``
+    # was attempted six times anyway, against a store whose history this
+    # process cannot write. Probing here, outside the swallowing handler, turns
+    # a run-wide environment denial into a run-wide refusal instead of six
+    # irreversible half-writes plus six log lines.
+    if apply:
+        assert_store_mutation_allowed(
+            operation='clear_false_dependency_invalidations --apply',
+            logger=logger,
+            extra_detail=(
+                'each clearing would save the edge and then fail to record it, '
+                'leaving the repair half-applied and untracked. No edge was '
+                'updated and nothing was mutated.'
+            ),
+        )
+
     edges_report: list[dict[str, Any]] = []
     cleared = 0
 
@@ -120,18 +143,16 @@ async def _run(args: argparse.Namespace) -> int:
         level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s',
     )
 
-    import os  # noqa: PLC0415
+    import os
 
-    from fused_memory.config.schema import FusedMemoryConfig  # noqa: PLC0415
-    from fused_memory.services.memory_service import MemoryService  # noqa: PLC0415
+    from fused_memory.config.schema import FusedMemoryConfig
+    from fused_memory.maintenance._utils import maintenance_service
 
     if args.config:
         os.environ['CONFIG_PATH'] = str(args.config)
 
     config = FusedMemoryConfig()
-    memory = MemoryService(config)
-    await memory.initialize()
-    try:
+    async with maintenance_service(config=config) as (_, memory):
         report = await repair(memory, project_id=args.project, apply=args.apply)
         print(json.dumps(report, indent=2, default=str))
 
@@ -150,9 +171,6 @@ async def _run(args: argparse.Namespace) -> int:
                 )
                 return 1
         return 0
-    finally:
-        if hasattr(memory, 'close'):
-            await memory.close()
 
 
 def main() -> int:

@@ -1,27 +1,55 @@
-"""Non-fixture test helpers for fused-memory tests.
+"""Shared test helpers for fused-memory tests, imported by name.
 
 Lives outside conftest.py to avoid the `sys.modules['conftest']` collision
 that arises when root-level pytest loads multiple subprojects' conftests in
 the same process.  Each subproject exports its helpers under a unique
 module name so test files can `from _fm_helpers import X` without
 colliding with sibling subprojects' helpers.
+
+An opt-in fixture defined here applies only to the modules that import it
+by name (see `lease_dir_fixture`).
+
+Five siblings follow the same convention, each owning one seam: `_fm_polling`
+(wait barriers), `_fm_qdrant_live` and `_fm_falkor_live` (live-backend
+scaffolding), `_fm_git_repos` (real-git builders) and `_fm_httpx_leaks`
+(leaked httpx client reaping).
 """
 
 import asyncio
 import contextlib
 import functools
+import importlib.util
 import inspect
 import json
+import pathlib
 import re
-from collections.abc import Callable
+import sqlite3
+import subprocess
+import sys
+import threading
+import types
+from collections.abc import Iterator
 from dataclasses import dataclass, field
-from typing import Any
+from datetime import datetime, timedelta
+from typing import TYPE_CHECKING, Any
 from unittest.mock import AsyncMock, MagicMock
 
 import httpx
 import pytest
 from openai import RateLimitError
 from pydantic import BaseModel
+from shared.project_layout import tasks_db
+
+from fused_memory.backends.graphiti_client import (
+    INCOMPLETE_KINDS,
+    PagedRead,
+    ReadCompleteness,
+)
+from fused_memory.backends.llm_token_usage import measure_llm_tokens
+from fused_memory.services.durable_queue import DurableWriteQueue
+
+if TYPE_CHECKING:
+    from fused_memory.services.memory_service import MemoryService
 
 # Constants for the process lifetime — lifted out of pydantic_spec (task 1426)
 # to avoid re-computing BaseModel reflection on every call.
@@ -126,13 +154,18 @@ class MockEdge:
 
     fact: str
     uuid: str = ''
-    source_node: MockNode | None = None
-    target_node: MockNode | None = None
     source_node_uuid: str = ''
     target_node_uuid: str = ''
     episodes: list[str] = field(default_factory=list)
     valid_at: Any = None
     invalid_at: Any = None
+    # graphiti_core's EntityEdge carries `expired_at` (graphiti_core/edges.py).
+    # A restored edge keeps it with `invalid_at` cleared; the double carries it so
+    # tests can express that signature (task 4714).
+    expired_at: Any = None
+    created_at: Any = None
+    # EntityEdge.group_id: the graph partition the edge is stored under (= project_id).
+    group_id: str | None = None
 
 
 @dataclass
@@ -146,11 +179,21 @@ class MockAddEpisodeResult:
     'nodes' mirrors AddEpisodeResults.nodes (graphiti_core/graphiti.py:111) —
     the entity nodes this episode touched — consumed by the post-write
     node-dedup sweep (MemoryService._dedup_episode_nodes).
+
+    'episode' mirrors AddEpisodeResults.episode — the EpisodicNode that
+    graphiti_core actually minted and persisted (task 3561). It is the ONLY
+    place the real episode uuid is observable: the uuid the caller passes in
+    means "LOAD this existing episode", never "create under this uuid", so
+    MemoryService._execute_graphiti_write reads registration identity off
+    ``result.episode.uuid``. Defaults to None so the ~10 pre-existing users of
+    this dataclass are unaffected; tests that care about episode identity set
+    it to e.g. ``SimpleNamespace(uuid='real-uuid')``.
     """
 
     entity_edges: list[MockEdge] = field(default_factory=list)
     edges: list[MockEdge] = field(default_factory=list)
     nodes: list[MockNode] = field(default_factory=list)
+    episode: Any = None
 
     def __post_init__(self) -> None:
         if self.edges == [] and self.entity_edges:
@@ -271,6 +314,87 @@ def extract_params(call_args: Any) -> dict:
     if len(call_args.args) > 1:
         return call_args.args[1]
     return call_args.kwargs.get('params', {})
+
+
+# ---------------------------------------------------------------------------
+# PagedRead test doubles (task 4386)
+# ---------------------------------------------------------------------------
+#
+# The paginated whole-graph reads (`enumerate_all_valid_edges`,
+# `enumerate_entity_nodes`) return `(collection, PagedRead)`, and the
+# consumers wired in task 4386 project that PagedRead's completeness into
+# their own per-cycle stats.  Every stub of one of those methods therefore has
+# to supply a second tuple element, across five test modules in two
+# directories — so the doubles live here rather than being hand-rolled per
+# site, where they would be unreadable and would drift.
+#
+# `rows` is deliberately always empty: these stand in for the SECOND tuple
+# element only.  The collection a consumer actually iterates is the stub's
+# FIRST element, while `rows_seen`/`expected_rows` are what a consumer
+# projects into stats — so the two must be settable independently.
+# ---------------------------------------------------------------------------
+
+
+def complete_paged_read(
+    *, rows_seen: int = 0, expected_rows: int | None = None
+) -> PagedRead:
+    """A PagedRead reporting a PROVEN-complete enumeration.
+
+    `expected_rows` defaults to `rows_seen`, which is what a healthy read
+    looks like: the census and the pages agree.  Pass it explicitly only to
+    build a shape the real backend would not produce.
+    """
+    return PagedRead(
+        rows=[],
+        complete=True,
+        rows_seen=rows_seen,
+        expected_rows=rows_seen if expected_rows is None else expected_rows,
+        reason=None,
+        incomplete_kind=None,
+    )
+
+
+def incomplete_paged_read(
+    kind: str,
+    *,
+    rows_seen: int = 0,
+    expected_rows: int | None = None,
+    reason: str | None = None,
+) -> PagedRead:
+    """A PagedRead reporting an INCOMPLETE enumeration of the given kind.
+
+    `kind` is validated against `INCOMPLETE_KINDS` rather than
+    taken on trust: a typo'd kind string matches no policy branch, so it would
+    quietly behave like a complete read and the test would pass for the wrong
+    reason.
+
+    `reason` defaults to a diagnostic string naming the kind and both counts,
+    mirroring the real backend's shape closely enough that an assertion on the
+    reason reaching an operator-facing message is meaningful.
+    """
+    assert kind in INCOMPLETE_KINDS, (
+        f'unknown incomplete_kind {kind!r}; expected one of '
+        f'{sorted(INCOMPLETE_KINDS)}'
+    )
+    if reason is None:
+        reason = (
+            f'test double: enumeration reported incomplete '
+            f'(incomplete_kind={kind}) with rows_seen={rows_seen} '
+            f'expected_rows={expected_rows}'
+        )
+    return PagedRead(
+        rows=[],
+        complete=False,
+        rows_seen=rows_seen,
+        expected_rows=expected_rows,
+        reason=reason,
+        incomplete_kind=kind,
+    )
+
+
+#: The verdict for a proven-complete read, for the StaleSummaryResult fields a
+#: test does not care about (task 4914).
+COMPLETE_READ = ReadCompleteness(complete=True, incomplete_kind=None)
 
 
 # ---------------------------------------------------------------------------
@@ -529,245 +653,250 @@ async def submit_and_resolve(
     )
 
 
+#: The documented-safe MCP tool-response size, in serialised chars. Derived in
+#: test_get_statuses_pagination.py::test_auto_page_limit_fits_documented_safe_envelope
+#: (see also server/tools.py::_STATUSES_AUTO_PAGE_LIMIT).
+MCP_SAFE_RESPONSE_CHARS = 62_000
+
+
 # ---------------------------------------------------------------------------
-# Shared Qdrant test scaffolding (task 2277)
+# Topic-guard note fixtures (task 3054)
 # ---------------------------------------------------------------------------
-#
-# De-duplicates the _qdrant_available()/QDRANT_URL/skip-marker trio that was
-# previously copy-pasted verbatim in test_recon_dedup_premise.py and
-# test_mem0_qdrant_integration.py (flagged by esc-2221-26).
+# One note drives both the pure-matcher assertions in test_config_schema.py
+# and the whole-tool assertions in server/test_add_memory_near_duplicate_gate.py,
+# so an edit to it moves both suites and neither silently tests a stale note.
 # ---------------------------------------------------------------------------
 
-QDRANT_URL = 'http://localhost:6333'
+STRADDLING_WRITE_FIXTURE = (
+    'Warm-lane reseed gotcha: when a task is dispatched into a recycled warm '
+    'lane, the in-worktree .task/plan.json can be a DANGLING absolute symlink '
+    'whose target worktrees/.task-meta/<lane>/plan.json was never written or '
+    'was scrubbed. The architect then sees no plan and may wrongly call '
+    'report_task_already_done instead of replanning.'
+)
+
+MERGE_BASE_NEGATIVE_CONTROL_NOTE = (
+    'Use git merge-base --is-ancestor <sha> <branch> to test whether a '
+    'commit is an ancestor of a branch tip before cherry-picking.'
+)
 
 
-def _qdrant_available() -> bool:
-    """Probe whether a Qdrant instance is reachable at QDRANT_URL.
+# ---------------------------------------------------------------------------
+# Shared xdist worker-id resolver
+# ---------------------------------------------------------------------------
 
-    Imports QdrantClient lazily (rather than at module scope) so that
-    importing this module — which conftest.py does every test session —
-    never pulls in qdrant_client, and so tests can deterministically patch
-    ``qdrant_client.QdrantClient``.
-    """
-    from qdrant_client import QdrantClient
+def resolve_xdist_worker_id(request_or_session: pytest.FixtureRequest | pytest.Session) -> str:
+    """Return this worker's id ('gw0', 'gw1', …) or 'master' — without the xdist PLUGIN.
 
-    try:
-        client = QdrantClient(url=QDRANT_URL, timeout=2)
-    except Exception:
-        return False
+    Backs the session-scoped ``worker_id`` fixture in ``tests/conftest.py``,
+    which exists because ``worker_id`` was otherwise supplied *solely* by
+    pytest-xdist (``xdist/plugin.py``).  The offline-deep lane's serial confirm
+    re-run appends ``-p no:xdist -o addopts=`` (see
+    ``orchestrator/src/orchestrator/verify_cmd.py``), and ``-p no:xdist``
+    unregisters the plugin along with its FIXTURES — not just its ``-n`` /
+    ``--dist`` CLI options.  Every test requesting ``worker_id`` therefore
+    ERRORED at setup with ``fixture 'worker_id' not found`` in that re-run, and
+    a developer typing ``pytest -p no:xdist`` locally hit the same wall.
 
-    try:
-        client.get_collections()
-        return True
-    except Exception:
-        return False
-    finally:
-        with contextlib.suppress(Exception):
-            client.close()
+    It DELEGATES to xdist's own ``get_xdist_worker_id`` rather than
+    reimplementing its three lines of ``workerinput`` logic.  A conftest
+    fixture SHADOWS a same-named plugin fixture, so the shim takes over
+    ``worker_id`` for every fused-memory test — including healthy
+    ``-n auto --dist loadgroup`` runs, where per-worker isolation is the whole
+    point.  Any semantic drift from xdist would silently collapse worker
+    namespaces and cause the cross-worker collisions those suffixes exist to
+    prevent; delegating makes such drift structurally impossible, which is what
+    makes the shadowing provably safe.
 
+    The import is function-local and deliberate: ``-p no:xdist`` unregisters the
+    PLUGIN but leaves the MODULE importable, so delegation works in exactly the
+    case that is otherwise broken.
 
-def qdrant_skipif(reason: str = 'Qdrant not reachable'):
-    """Return a ``pytest.mark.skipif`` marker gated on `_qdrant_available()`.
-
-    A factory rather than a module-level marker constant: _fm_helpers is
-    imported by conftest.py on every test session, so evaluating the probe at
-    import time would run it even for test sessions that never touch Qdrant.
-    Calling this from a module's ``pytestmark`` instead defers the probe to
-    that module's own collection time — identical timing to each file's
-    previous local copy.
-    """
-    return pytest.mark.skipif(not _qdrant_available(), reason=reason)
-
-
-def ensure_fresh_collection(
-    client: Any,
-    collection_name: str,
-    *,
-    size: int,
-    distance: Any = None,
-) -> None:
-    """Idempotently (re)create *collection_name* as an empty size-*size* collection.
-
-    Replaces the fragile ``delete_collection(suppressed) + create_collection``
-    pair each integration fixture rolled by hand. Under ``-n auto`` xdist load,
-    a prior run's teardown can be swallowed (or a concurrent worker can win the
-    create race), leaving a stale collection behind that ``collection_exists()``
-    may still report absent — so a naive create then 409-conflicts and fails the
-    next run. This helper self-heals that case: if the create raises a 409
-    ``UnexpectedResponse`` it deletes the stale collection and creates once more.
-    Any other ``UnexpectedResponse`` (e.g. a genuine 500) is re-raised — fail
-    loud, no retry.
-
-    Imports ``VectorParams``/``Distance``/``UnexpectedResponse`` lazily inside
-    the body, mirroring ``_qdrant_available``'s convention (see its docstring):
-    conftest.py imports this module every test session, so a module-scope
-    qdrant import would pull qdrant_client into every session and break tests
-    that monkeypatch ``qdrant_client.QdrantClient``.
+    There is deliberately no ``except ImportError: return 'master'`` fallback.
+    pytest-xdist is a declared dev dependency here and this project's addopts
+    hardcode ``-n auto``, so a venv genuinely missing the module is broken
+    rather than a supported configuration — and quietly collapsing every worker
+    onto one shared 'master' namespace there would reintroduce precisely the
+    collisions above, as flaky live-service tests instead of a clear error.
 
     Args:
-        client: A ``qdrant_client.QdrantClient`` (or test double) exposing
-            ``collection_exists`` / ``delete_collection`` / ``create_collection``.
-        collection_name: The collection to (re)create.
-        size: Vector dimensionality for the new collection.
-        distance: Optional ``qdrant_client.models.Distance``; defaults to
-            ``Distance.COSINE`` when None.
+        request_or_session: a pytest ``request`` or ``session`` object — the
+            same parameter xdist's own function takes.
     """
-    from qdrant_client.http.exceptions import UnexpectedResponse
-    from qdrant_client.models import Distance, VectorParams
+    from xdist.plugin import get_xdist_worker_id
 
-    vectors_config = VectorParams(size=size, distance=distance or Distance.COSINE)
+    return get_xdist_worker_id(request_or_session)
 
-    if client.collection_exists(collection_name):
-        client.delete_collection(collection_name)
-    try:
-        client.create_collection(
-            collection_name=collection_name, vectors_config=vectors_config,
+
+# ---------------------------------------------------------------------------
+# Shared durable-queue retry-budget factory (task 4847)
+# ---------------------------------------------------------------------------
+
+def make_retry_budget_queue(tmp_path, execute, **overrides) -> DurableWriteQueue:
+    """A DurableWriteQueue with plain budget 5, extended transient budget 12,
+    sub-second backoff, and no ``transient_error_names=`` override, so the
+    shipped DEFAULT_TRANSIENT_ERROR_NAMES decides which budget applies.
+
+    The single definition that keeps task 3585's and task 3586's attempt
+    counts comparable. *overrides* replace any constructor keyword.
+    """
+    # Annotated: without it pyright joins the heterogeneous literal values into
+    # a single narrow type and rejects the ** unpacking below.
+    kwargs: dict[str, Any] = dict(
+        data_dir=tmp_path / 'queue',
+        execute_write=execute,
+        workers_per_group=1,
+        semaphore_limit=5,
+        max_attempts=5,
+        retry_base_seconds=0.01,
+        retry_max_delay_seconds=0.05,
+        write_timeout_seconds=2.0,
+        transient_max_attempts=12,
+    )
+    kwargs.update(overrides)
+    return DurableWriteQueue(**kwargs)
+
+
+# ---------------------------------------------------------------------------
+# Shared LoopFreedomProbe loop-freedom oracle (task 5920)
+# ---------------------------------------------------------------------------
+
+#: Loop turns LoopFreedomProbe.suspend() yields before recording a held loop.
+#: One turn suffices on a free loop, because the marker is queued ahead of the
+#: stub's own resumption; the slack only absorbs a future reordering of
+#: asyncio's ready queue. It counts loop turns, never seconds.
+LOOP_FREEDOM_TURN_BUDGET = 10
+
+#: Seconds an off-loop-thread caller waits for the captured loop to run its
+#: marker. A CEILING, not a floor: a free loop answers within microseconds, so
+#: only a held loop reaches it, and it bounds how long that failure takes.
+LOOP_FREEDOM_CEILING_SECONDS = 30.0
+
+
+class LoopFreedomProbe:
+    """Did the test's event loop stay free while the code under test was paused?
+
+    Construct it inside the test coroutine (it captures the running loop and
+    its thread). A stubbed await point calls ``await probe.suspend()``; a
+    stubbed blocking call calls ``probe.block()``. Then call
+    :meth:`assert_loop_stayed_free`. Each call queues a marker on the captured
+    loop and records True iff the marker ran:
+
+    * ``suspend()`` on the captured loop yields a bounded number of loop turns,
+      so a call site that resumes the coroutine itself reads False.
+    * ``block()``, or ``suspend()`` on another thread's loop, waits for the
+      marker up to a ceiling, so a call site that holds the loop's thread while
+      that work runs elsewhere reads False. ``block()`` on the loop's own
+      thread reads False at once, because it is the holder.
+
+    Every verdict is deterministic and none hangs. It replaces a FLOOR on ticker
+    wake-ups inside a wall-clock window, which reds under host/GIL contention
+    (task 5920; the same defect
+    ``orchestrator/tests/test_verify_ruff_config_boundary.py::TestProbeDoesNotBlockTheEventLoop``
+    fixed for task 4520 / esc-4520-6).
+    """
+
+    def __init__(self, *, ceiling_seconds: float = LOOP_FREEDOM_CEILING_SECONDS) -> None:
+        self._loop = asyncio.get_running_loop()
+        self._loop_thread = threading.get_ident()
+        self._ceiling_seconds = ceiling_seconds
+        self._observations: list[bool] = []
+
+    @property
+    def observations(self) -> tuple[bool, ...]:
+        return tuple(self._observations)
+
+    async def suspend(self) -> None:
+        if asyncio.get_running_loop() is not self._loop:
+            self.block()
+            return
+
+        marker_ran = False
+
+        def _mark() -> None:
+            nonlocal marker_ran
+            marker_ran = True
+
+        self._loop.call_soon_threadsafe(_mark)
+        for _ in range(LOOP_FREEDOM_TURN_BUDGET):
+            if marker_ran:
+                break
+            await asyncio.sleep(0)
+        self._observations.append(marker_ran)
+
+    def block(self) -> None:
+        if threading.get_ident() == self._loop_thread:
+            self._observations.append(False)
+            return
+
+        loop_answered = threading.Event()
+        self._loop.call_soon_threadsafe(loop_answered.set)
+        self._observations.append(loop_answered.wait(self._ceiling_seconds))
+
+    def assert_loop_stayed_free(self) -> None:
+        assert self._observations, 'LoopFreedomProbe: the probe was never reached by a stubbed call'
+        assert all(self._observations), (
+            'LoopFreedomProbe: the event loop was held while the code under test '
+            f'was paused (observations={self.observations})'
         )
-    except UnexpectedResponse as exc:
-        if getattr(exc, 'status_code', None) != 409:
-            raise
-        # Stale collection survived a swallowed teardown / lost create race:
-        # delete it and create once more rather than propagating the conflict.
-        client.delete_collection(collection_name)
-        client.create_collection(
-            collection_name=collection_name, vectors_config=vectors_config,
-        )
 
 
 # ---------------------------------------------------------------------------
-# Shared poll_until() helper (task 2377)
-# ---------------------------------------------------------------------------
-#
-# Generalizes the local poll-then-assert precedents in test_durable_queue.py
-# (_poll_until_dead and the inline deadline loop) into a single shared
-# helper. Converts fixed "sleep(N) then assert background work is done"
-# sites — fragile under host CPU oversubscription, since the hardcoded
-# window may elapse before the background drainer/worker/watchdog is even
-# scheduled — into a bounded poll on the same post-condition. A genuinely
-# stuck background task still surfaces as a clear AssertionError once the
-# (generous) deadline passes.
+# Claimant-less tasks.db builder
 # ---------------------------------------------------------------------------
 
-async def poll_until(
-    predicate: Callable[[], Any],
-    *,
-    timeout: float = 10.0,
-    interval: float = 0.02,
-    message: str | None = None,
-) -> Any:
-    """Poll *predicate* until it is truthy, returning its truthy result verbatim.
+def make_db_without_claimant_columns(db_path: pathlib.Path, *, status: str = 'pending') -> None:
+    """Create a tasks.db in the v1 shape but stamped ``user_version = 2`` (columns absent).
 
-    *predicate* may be a plain sync callable or an async/coroutine function —
-    either way it is called with no arguments on each iteration; if the
-    result is awaitable (``inspect.isawaitable``), it is awaited before the
-    truthiness check. This lets callers poll on state that itself requires an
-    await (e.g. ``lambda: queue.get_stats()``).
+    Simulates a connection whose claimant columns never got ALTERed in —
+    e.g. a routine orchestrator restart racing ahead of the fused-memory
+    deploy that ships this migration. Opening it runs only the v2->v3
+    candidate_key step (the v1->v2 claimant ALTER is gated on ``version < 2``
+    and is skipped for an already-v2 DB), so the claimant columns stay
+    absent, exercising set_task_status's fail-safe (WARNING, no error) path.
 
-    Checks *before* sleeping, so an already-true predicate returns on the
-    first call with no sleep at all. Uses the asyncio event-loop monotonic
-    clock (mirrors the ``_poll_until_dead`` precedent in
-    test_durable_queue.py) rather than wall-clock/perf_counter, to avoid the
-    same class of timing fragility this helper exists to remove.
-
-    Args:
-        predicate: Zero-arg sync or async callable evaluated each iteration.
-        timeout: Seconds to keep polling before giving up. Defaults to 10s —
-            generous enough to absorb host CPU oversubscription while still
-            catching a genuinely-stuck post-condition.
-        interval: Seconds to sleep between polls. Defaults to 0.02s.
-        message: Custom AssertionError message on timeout. When None, a
-            default message naming *timeout* is used.
-
-    Returns:
-        The predicate's truthy result, returned verbatim (not coerced to
-        ``True``) so callers can chain on it (e.g. a stats dict).
-
-    Raises:
-        AssertionError: *predicate* never became truthy within *timeout*
-            seconds — signals a genuinely-stuck background task, the same
-            failure class the fixed-sleep asserts this helper replaces used
-            to (accidentally) surface.
+    ``status`` seeds the single row's status column (default ``'pending'``,
+    matching every pre-existing caller); pass e.g. ``'done'`` to exercise
+    the fail-safe path on an already-terminal row.
     """
-    loop = asyncio.get_running_loop()
-    deadline = loop.time() + timeout
-    while True:
-        result = predicate()
-        if inspect.isawaitable(result):
-            result = await result
-        if result:
-            return result
-        if loop.time() >= deadline:
-            raise AssertionError(message or f'poll_until: condition not met within {timeout}s')
-        await asyncio.sleep(interval)
-
-
-async def collection_vector_size(
-    client: Any,
-    collection: str,
-    *,
-    timeout: float = 15.0,
-    interval: float = 0.05,
-) -> int:
-    """Read *collection*'s vector dimension, tolerating the transient-404 read race.
-
-    Under ``-n auto`` xdist load a collection created moments earlier can
-    transiently 404 (or the HTTP layer can raise ``ResponseHandlingException``)
-    before it is durably readable, so a single naive ``get_collection`` flakes.
-    This wraps the read in the shared :func:`poll_until` engine so the
-    transient window becomes a bounded retry: a 404 ``UnexpectedResponse`` or a
-    ``ResponseHandlingException`` maps to "keep polling", while any other
-    ``UnexpectedResponse`` (e.g. a genuine 500) is re-raised immediately —
-    fail loud, no retry. A collection that never becomes readable surfaces as
-    the usual :func:`poll_until` ``AssertionError`` at the deadline.
-
-    Imports the qdrant symbols lazily inside the body, mirroring
-    :func:`_qdrant_available` / :func:`ensure_fresh_collection` (see their
-    docstrings) so importing this module never pulls in qdrant_client.
-
-    Args:
-        client: A ``qdrant_client.QdrantClient`` (or test double) exposing
-            ``get_collection``.
-        collection: The collection to read.
-        timeout: Seconds to keep retrying the transient-404 window before
-            raising. Defaults to 15s — generous enough to absorb host CPU
-            oversubscription while still catching a genuinely-missing collection.
-        interval: Seconds to sleep between probes. Defaults to 0.05s.
-
-    Returns:
-        The collection's single-vector dimensionality.
-
-    Raises:
-        AssertionError: the collection never became readable within *timeout*.
-        qdrant_client.http.exceptions.UnexpectedResponse: a non-404 server
-            error on the read (surfaced immediately, not retried).
-    """
-    from qdrant_client.http.exceptions import (
-        ResponseHandlingException,
-        UnexpectedResponse,
+    import sqlite3
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(db_path))
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS tasks (
+            tag           TEXT NOT NULL DEFAULT 'master',
+            id            INTEGER NOT NULL,
+            title         TEXT NOT NULL,
+            description   TEXT,
+            details       TEXT,
+            test_strategy TEXT,
+            status        TEXT NOT NULL,
+            priority      TEXT,
+            metadata      TEXT,
+            updated_at    TEXT NOT NULL,
+            PRIMARY KEY (tag, id)
+        );
+        CREATE INDEX IF NOT EXISTS ix_tasks_status ON tasks (tag, status);
+        CREATE TABLE IF NOT EXISTS dependencies (
+            tag        TEXT NOT NULL DEFAULT 'master',
+            task_id    INTEGER NOT NULL,
+            depends_on INTEGER NOT NULL,
+            PRIMARY KEY (tag, task_id, depends_on)
+        );
+        CREATE TABLE IF NOT EXISTS id_counters (
+            tag    TEXT NOT NULL DEFAULT 'master',
+            max_id INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (tag)
+        );
+    """)
+    conn.execute(
+        "INSERT INTO tasks (tag, id, title, status, updated_at) "
+        "VALUES ('master', 1, 'stranded-shape task', ?, '2026-01-01T00:00:00.000Z')",
+        (status,),
     )
-    from qdrant_client.models import VectorParams
-
-    def _probe():
-        try:
-            return client.get_collection(collection)
-        except UnexpectedResponse as exc:
-            if getattr(exc, 'status_code', None) == 404:
-                return None  # transient: not yet durably visible — keep polling
-            raise  # genuine server error — fail loud, no retry
-        except ResponseHandlingException:
-            return None  # transient HTTP-layer hiccup — keep polling
-
-    info = await poll_until(
-        _probe,
-        timeout=timeout,
-        interval=interval,
-        message=f'collection {collection!r} not readable within {timeout}s',
-    )
-    vectors = info.config.params.vectors
-    assert isinstance(vectors, VectorParams), (
-        f'collection {collection!r} vectors config is not a single VectorParams: {vectors!r}'
-    )
-    return vectors.size
+    conn.execute("PRAGMA user_version = 2")
+    conn.commit()
+    conn.close()
 
 
 # ---------------------------------------------------------------------------
@@ -782,39 +911,6 @@ async def collection_vector_size(
 # ---------------------------------------------------------------------------
 
 
-def _init_git_repo(path) -> str:
-    """Create a minimal git repo at path with one commit; return full SHA.
-
-    Shared by test_task_interceptor.py and test_status_authority_gate.py: a
-    ``done_provenance={'kind': 'merged', 'commit': ...}`` write needs a real
-    ``main`` branch for the interceptor's ``_verify_commit_on_main`` ancestor
-    backstop (``git merge-base --is-ancestor <sha> main``) to resolve against.
-    """
-    import subprocess
-
-    subprocess.run(['git', 'init', '-q', '-b', 'main', str(path)], check=True)
-    subprocess.run(
-        ['git', '-C', str(path), 'config', 'user.email', 't@e.example'],
-        check=True,
-    )
-    subprocess.run(
-        ['git', '-C', str(path), 'config', 'user.name', 'T'],
-        check=True,
-    )
-    (path / 'seed.txt').write_text('seed\n')
-    subprocess.run(['git', '-C', str(path), 'add', '-A'], check=True)
-    subprocess.run(
-        ['git', '-C', str(path), 'commit', '-q', '-m', 'seed'],
-        check=True,
-    )
-    return subprocess.run(
-        ['git', '-C', str(path), 'rev-parse', 'HEAD'],
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout.strip()
-
-
 def _make_rate_limit_error(
     message: str = 'Rate limit exceeded.',
     code: str = 'insufficient_quota',
@@ -824,6 +920,122 @@ def _make_rate_limit_error(
     response = httpx.Response(429, request=request)
     body = {'message': message, 'type': 'insufficient_quota', 'param': None, 'code': code}
     return RateLimitError(message, response=response, body=body)
+
+
+def make_insufficient_quota_error(
+    message: str = (
+        'You have no credits remaining. Please add credits to your account to continue.'
+    ),
+    *,
+    with_code: bool = True,
+    code: str = 'insufficient_quota',
+    error_type: str | None = 'insufficient_quota',
+) -> RateLimitError:
+    """Build the 2026-11-19 incident's openai.RateLimitError: credits exhausted.
+
+    ``with_code=False`` drops ``code`` and keeps only ``type`` — the shape
+    syslog carried during the incident. ``code='credit_balance_exhausted'``
+    is the live deployment's shape: its 429 body carries that code with type
+    ``insufficient_quota``. ``error_type=None`` drops ``type`` so ``code``
+    alone carries the signal.
+    """
+    request = httpx.Request('POST', 'https://api.openai.com/v1/embeddings')
+    response = httpx.Response(429, request=request)
+    body: dict[str, Any] = {'message': message, 'param': None}
+    if error_type is not None:
+        body['type'] = error_type
+    if with_code:
+        body['code'] = code
+    return RateLimitError(message, response=response, body=body)
+
+
+PLAN_PROXY_TEST_URL = 'http://127.0.0.1:8317/v1'
+
+
+def make_usage_limit_reached_error(
+    message: str = 'The usage limit has been reached for this ChatGPT plan.',
+    *,
+    base_url: str = PLAN_PROXY_TEST_URL,
+) -> RateLimitError:
+    """Build the openai.RateLimitError a capped ChatGPT plan proxy answers with.
+
+    The request goes to *base_url*'s ``/responses``, and the 429 body names
+    ``usage_limit_reached`` under both ``type`` and ``code``.
+    """
+    request = httpx.Request('POST', f'{base_url.rstrip("/")}/responses')
+    response = httpx.Response(429, request=request)
+    body = {'type': 'usage_limit_reached', 'code': 'usage_limit_reached', 'message': message}
+    return RateLimitError(message, response=response, body=body)
+
+
+def make_transient_rate_limit_error() -> RateLimitError:
+    """Build a real openai.RateLimitError for a transient too-many-requests 429."""
+    message = 'Rate limit reached for requests'
+    request = httpx.Request('POST', 'https://api.openai.com/v1/embeddings')
+    response = httpx.Response(429, request=request)
+    body = {'message': message, 'type': 'requests', 'param': None, 'code': 'rate_limit_exceeded'}
+    return RateLimitError(message, response=response, body=body)
+
+
+def mock_memory_backends(svc: 'MemoryService') -> 'MemoryService':
+    """Stub Graphiti/Mem0 on *svc* so tests never hit real FalkorDB/Qdrant.
+
+    The shared definition of a mocked MemoryService for suites that run a
+    real DurableWriteQueue against it: a backend that grows a new method is
+    taught about here once. Callers override individual stubs (for example
+    ``svc.mem0.add.side_effect``) after calling it.
+    """
+    svc.graphiti = MagicMock()
+    svc.graphiti.initialize = AsyncMock()
+    svc.graphiti.add_episode = AsyncMock(return_value=None)
+    svc.graphiti.close = AsyncMock()
+    svc.graphiti._require_client = MagicMock()
+    # A bare MagicMock probe yields an AsyncMock usage that the real WriteJournal
+    # rejects, dropping the graphiti backend_ops row; this one measures nothing.
+    svc.graphiti.token_probe = lambda: measure_llm_tokens(None)
+
+    svc.mem0 = MagicMock()
+    svc.mem0.search = AsyncMock(return_value={'results': []})
+    svc.mem0.add = AsyncMock(return_value={'results': [{'id': 'mem0-1'}]})
+    svc.mem0.get_all = AsyncMock(return_value={'results': []})
+    svc.mem0.delete = AsyncMock(return_value={'message': 'deleted'})
+    svc.mem0.close = AsyncMock()
+    return svc
+
+
+def mock_search_backends(svc: 'MemoryService') -> 'MemoryService':
+    """Stub every backend read ``MemoryService.search`` awaits, each answering empty.
+
+    The shared definition of a MemoryService driven through its public
+    ``search`` seam: a read the search path grows is taught about here once.
+    Callers seed the hits under test (for example ``svc.mem0.search``) after
+    calling it.
+    """
+    svc.graphiti = MagicMock()
+    svc.graphiti.search = AsyncMock(return_value=[])
+    svc.graphiti.search_nodes = AsyncMock(return_value=[])
+    svc.graphiti.get_node_names_by_uuids = AsyncMock(return_value={})
+    install_identity_mocks(svc.graphiti)
+
+    svc.mem0 = MagicMock()
+    svc.mem0.search = AsyncMock(return_value={'results': []})
+    svc.mem0.scroll_by_metadata = AsyncMock(return_value=[])
+    return svc
+
+
+def wrap_like_graphiti(inner: BaseException) -> Exception:
+    """Re-raise *inner* the way graphiti_core's OpenAI clients wrap a 429.
+
+    graphiti_core/llm_client/openai_base_client.py does
+    ``raise RateLimitError from e``, so the returned exception carries the
+    structured provider fields only on ``__cause__``.
+    """
+    from graphiti_core.llm_client.errors import RateLimitError as GraphitiRateLimitError
+
+    try:
+        raise GraphitiRateLimitError from inner
+    except GraphitiRateLimitError as wrapped:
+        return wrapped
 
 
 # ---------------------------------------------------------------------------
@@ -888,3 +1100,402 @@ async def reap_leaked_ticket_workers() -> int:
         if task.done():
             reaped += 1
     return reaped
+
+
+# ---------------------------------------------------------------------------
+# Non-package script loading — the single loader for every test module that
+# imports a script by file path. Task 3738 hoisted it here out of two
+# independent copies; task 3895 migrated the 42 further copies that had
+# accumulated since, and tests/test_script_loader_routing_guard.py holds that
+# population at zero.
+# ---------------------------------------------------------------------------
+
+# sys.modules keys this helper itself installed. Only these may be REPLACED by
+# a later load of a different file under the same key -- see the shadowing
+# guard in load_script_module().
+_LOADED_SCRIPT_MODULE_NAMES: set[str] = set()
+
+
+def load_script_module(
+    script_path: pathlib.Path, mod_name: str | None = None
+) -> types.ModuleType:
+    """Load a non-package script (e.g. under ``scripts/``) by file path.
+
+    ``scripts/`` is not a package and its modules are not on ``PYTHONPATH``,
+    so this is how a script's pure functions get imported into a test without
+    ``sys.path`` pollution. *mod_name* defaults to the file stem and is the
+    key the module is registered under in ``sys.modules``.
+
+    An already-loaded module for the SAME file is reused rather than
+    re-executed: two independent test modules loading the same script under
+    the same *mod_name* would otherwise make the second load silently
+    replace the first module object in ``sys.modules`` -- two live module
+    objects whose identity depends on collection order. Harmless while only
+    pure functions are used, but a latent hazard the moment anything holds
+    module state.
+
+    A ``sys.modules`` entry this helper did NOT install is never replaced:
+    that raises ``ImportError`` instead. The stem default makes accidental
+    collisions easy to write (``scripts/config.py``, ``scripts/utils.py``,
+    ``scripts/types.py`` are ordinary script names), and a silent replacement
+    persists for the rest of the pytest process, so the damage would surface
+    as an unrelated test failing far away. Deliberate key SHARING -- two test
+    modules loading the same script, or a test loading a different file under
+    a key this helper owns -- is unaffected.
+    """
+    name = mod_name or script_path.stem
+    cached = sys.modules.get(name)
+    cached_file = getattr(cached, '__file__', None)
+    if cached is not None and cached_file is not None and (
+        pathlib.Path(cached_file).resolve() == script_path.resolve()
+    ):
+        return cached
+    if cached is not None and name not in _LOADED_SCRIPT_MODULE_NAMES:
+        raise ImportError(
+            f'refusing to shadow already-imported module {name!r} '
+            f'(from {cached_file!r}) with {script_path}; '
+            'pass an explicit mod_name that does not collide'
+        )
+    spec = importlib.util.spec_from_file_location(name, script_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f'Cannot load {script_path}')
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    _LOADED_SCRIPT_MODULE_NAMES.add(name)
+    try:
+        spec.loader.exec_module(module)  # type: ignore[union-attr]
+    except Exception:
+        # The failed load left nothing installed under *name*, so ownership
+        # lapses with it: a later real import of that name must be protected
+        # by the guard above rather than treated as this helper's to replace.
+        sys.modules.pop(name, None)
+        _LOADED_SCRIPT_MODULE_NAMES.discard(name)
+        raise
+    return module
+
+
+def make_populated_task_store(project_root: pathlib.Path) -> pathlib.Path:
+    """Create the tasks.db *project_root* resolves to, holding one task row.
+
+    This is the shape ``target_store_preflight``'s guard reads -- a ``tasks``
+    table with at least one row -- NOT the backend schema. The suites using it
+    patch ``SqliteTaskBackend`` out, so the guard is the only reader of the
+    file; agreement with the real backend is pinned once, in
+    tests/test_target_store_preflight.py.
+    """
+    db = tasks_db(project_root)
+    db.parent.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(db)
+    try:
+        connection.execute('CREATE TABLE tasks (id INTEGER PRIMARY KEY)')
+        connection.execute('INSERT INTO tasks (id) VALUES (1)')
+        connection.commit()
+    finally:
+        connection.close()
+    return db
+
+
+def make_zero_byte_task_store(project_root: pathlib.Path) -> pathlib.Path:
+    """Create the tasks.db *project_root* resolves to as an EMPTY file.
+
+    The residue shape ``target_store_preflight``'s guard must refuse, and the
+    counterpart of :func:`make_populated_task_store`.
+    """
+    db = tasks_db(project_root)
+    db.parent.mkdir(parents=True)
+    db.touch()
+    return db
+
+
+_CLEANUP_TEST_COLLECTIONS_SCRIPT = (
+    pathlib.Path(__file__).parent.parent / 'scripts' / 'cleanup_test_collections.py'
+)
+
+
+@functools.cache
+def _lease_dir_env() -> str:
+    """The env var name, read from the reaper that defines it.
+
+    Read rather than spelled out here so a rename of the constant cannot
+    leave `lease_dir_fixture` setting a variable nothing consults any more —
+    which would look exactly like isolation while every test fell through to
+    the real machine-global directory.
+
+    Loaded lazily and cached, because conftest.py and most test modules
+    import this module and an eager load would charge every pytest session.
+    Only the resulting STRING is kept: the modules that import the fixture
+    load the reaper through their own loaders, and holding a second reference
+    to a module object they may replace is a hazard with nothing to buy it.
+    """
+    return load_script_module(_CLEANUP_TEST_COLLECTIONS_SCRIPT).LEASE_DIR_ENV
+
+
+def isolated_lease_dir(monkeypatch, directory: pathlib.Path) -> pathlib.Path:
+    """Point the reaper's lease directory at *directory*, through *monkeypatch*.
+
+    The one mechanism behind `lease_dir_fixture` and
+    `lease_isolated_monkeypatch`.  *directory* is not created, for the reason
+    `lease_dir_fixture` gives.
+    """
+    monkeypatch.setenv(_lease_dir_env(), str(directory))
+    return directory
+
+
+@contextlib.contextmanager
+def lease_isolated_monkeypatch(
+    reaper: types.ModuleType, lease_directory: pathlib.Path,
+) -> Iterator[tuple[pytest.MonkeyPatch, list[pathlib.Path]]]:
+    """A `pytest.MonkeyPatch.context()` for a recording made at module scope.
+
+    A module-scoped fixture is set up BEFORE the autouse `lease_dir` fixture,
+    so a recorder that opened a bare context would lease the machine-global
+    directory the live cron reads.  This one yields its monkeypatch with the
+    lease directory already isolated to *lease_directory*, together with a
+    list that gains the directory every `reaper.hold_lease` inside the
+    context resolved, so a recording can carry where its leases really went
+    rather than only that it asked.
+
+    *reaper* is the module the code under test resolves, passed in for the
+    reason `_lease_dir_env` keeps no module reference of its own.
+    """
+    held_in: list[pathlib.Path] = []
+    hold_lease = reaper.hold_lease
+
+    def _observed_hold_lease(*args, directory=None, **kwargs):
+        held_in.append(reaper.lease_dir() if directory is None else pathlib.Path(directory))
+        return hold_lease(*args, directory=directory, **kwargs)
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        isolated_lease_dir(monkeypatch, lease_directory)
+        monkeypatch.setattr(reaper, 'hold_lease', _observed_hold_lease)
+        yield monkeypatch, held_in
+
+
+@pytest.fixture(autouse=True, name='lease_dir')
+def lease_dir_fixture(tmp_path, monkeypatch):
+    """Point ``DF_EPHEMERAL_COLLECTION_LEASE_DIR`` at a per-test directory.
+
+    A hard isolation boundary, not a convenience.  The lease directory
+    ``cleanup_test_collections.lease_dir()`` returns by default is a
+    HARDCODED machine-global absolute path (that is the property the guard's
+    correctness rests on — see the design note on that function), and it is
+    the very directory the live 6-hourly cron reads.  A test that wrote a
+    lease into it would hold a real sweep off this host; a test that reaped
+    it would unlink the lease of a live bake-off running in another checkout.
+
+    Autouse, and applied to EVERY test in an importing module rather than
+    only its lease tests, for exactly that reason: a test that forgets to
+    request the isolation must not be able to fall through silently to the
+    real directory.  Tests that need the path can still request this fixture
+    by name; the directory is not created here, because a lease-dir-absent
+    case is one of the behaviours under test.
+
+    Activation is by import, per module
+    (``from _fm_helpers import lease_dir_fixture as lease_dir_fixture``), and NEVER
+    from conftest.py: an autouse fixture there would apply to every test in
+    the package, redirecting the ``-m integration`` lane away from the
+    directory the live cron reads and silently disabling the guard task 4775
+    built.  The attribute is ``lease_dir_fixture`` while the fixture NAME
+    stays ``lease_dir`` because a module-level ``lease_dir`` binding would be
+    shadowed by every ``def test_x(self, lease_dir)`` parameter, which ruff
+    reports as F811 once per test.
+    """
+    return isolated_lease_dir(monkeypatch, tmp_path / 'ephemeral-collection-leases')
+
+
+def as_async_run_git(side_effect):
+    """Adapt a `subprocess.run` side_effect to a `shared.git_async.run_git` fake.
+
+    Task 3778 moved the detector's three git probes off blocking
+    `subprocess.run` and onto the async `run_git` helper, which invalidated the
+    `patch('subprocess.run', ...)` seam this suite was built on. Rather than
+    hand-rewrite ~90 canned git responses, every existing side_effect is passed
+    through this one adapter, so the *responses* stay byte-for-byte what they
+    were and only the seam changes.
+
+    It faithfully reproduces `run_git`'s contract, which differs from
+    `subprocess.run`'s in exactly two ways that matter here:
+
+    - stdout/stderr are `.strip()`ed by `run_git` itself, so the adapter strips
+      too (a fake that did not would let a test pass against behaviour the real
+      helper cannot produce).
+    - a TIMEOUT is RETURNED as `timed_out=True` with a non-zero returncode, not
+      raised. `subprocess.run` raises `TimeoutExpired`, so any side_effect that
+      raises it is converted here. Every other exception (notably `OSError`)
+      propagates, because `run_git` propagates it too.
+
+    Accepts the two shapes `unittest.mock` accepts for `side_effect`: a
+    callable, or an exception instance/class to raise.
+    """
+    from shared.git_async import TIMEOUT_RETURNCODE, GitResult
+
+    def _timed_out(timeout) -> GitResult:
+        return GitResult(
+            returncode=TIMEOUT_RETURNCODE,
+            stdout='',
+            stderr=f'timed out after {timeout}s',
+            timed_out=True,
+        )
+
+    async def fake_run_git(cmd, cwd=None, *, input_text=None, timeout=None):
+        # mock's own semantics: a bare exception instance/class means "raise".
+        if isinstance(side_effect, BaseException) or (
+            isinstance(side_effect, type) and issubclass(side_effect, BaseException)
+        ):
+            if isinstance(side_effect, subprocess.TimeoutExpired) or (
+                side_effect is subprocess.TimeoutExpired
+            ):
+                return _timed_out(timeout)
+            raise side_effect
+
+        try:
+            completed = side_effect(list(cmd), timeout=timeout)
+        except subprocess.TimeoutExpired:
+            return _timed_out(timeout)
+
+        return GitResult(
+            returncode=completed.returncode,
+            stdout=(completed.stdout or '').strip(),
+            stderr=(completed.stderr or '').strip(),
+        )
+
+    return fake_run_git
+# ---------------------------------------------------------------------------
+# Cross-run citation repair fixtures (task 3065)
+#
+# Shared by BOTH tests/reconciliation/test_citation_repair.py and
+# tests/server/test_recon_report_citation_repair.py — one definition here rather
+# than a copy in each module, so the journal shape the repair path reads and the
+# lookup verdicts it branches on cannot drift between the two suites.
+# ---------------------------------------------------------------------------
+
+
+async def build_journal_with_closed_run(
+    tmp_path: Any,
+    *,
+    run_id: str,
+    project_id: str = 'reify',
+    status: str = 'completed',
+    stage: str = 'memory_consolidator',
+    findings: list[dict[str, Any]],
+    extra_stage_reports: dict[str, Any] | None = None,
+):
+    """Open a real ``ReconciliationJournal`` holding one run with ``findings``.
+
+    A REAL journal on a tmp_path SQLite file, not a fake: the repair path's whole
+    reason to exist is that a closed run's findings live only in the journal's
+    ``runs.stage_reports`` blob, so a test that stubbed the round-trip would stop
+    exercising the one thing under test (``StageReport`` parse on read,
+    ``model_dump(mode='json')`` re-serialize on write).
+
+    ``findings`` becomes ``stage_reports[stage].items_flagged``.
+    ``extra_stage_reports`` is merged in verbatim AFTER that entry, so a caller
+    can seed a second real stage or a raw non-``StageReport`` entry
+    (``{'_error': {...}}``) to prove the stage scan tolerates it.
+
+    Returns the OPEN journal — the caller closes it (``await journal.close()``).
+    """
+    from datetime import UTC, datetime
+
+    from fused_memory.models.reconciliation import (
+        ReconciliationRun,
+        RunStatus,
+        RunType,
+        StageId,
+        StageReport,
+    )
+    from fused_memory.reconciliation.journal import ReconciliationJournal
+
+    journal = ReconciliationJournal(pathlib.Path(tmp_path))
+    await journal.initialize()
+    now = datetime.now(UTC)
+    # ``status``/``stage`` stay plain ``str`` in the signature so a caller writes
+    # the same literal the journal row holds; coerced here because the model
+    # fields are StrEnums (pydantic would coerce anyway — this just makes the
+    # conversion visible to the type checker rather than implicit).
+    await journal.start_run(
+        ReconciliationRun(
+            id=run_id,
+            project_id=project_id,
+            run_type=RunType.full,
+            trigger_reason='test',
+            started_at=now,
+            completed_at=None if status == 'running' else now,
+            status=RunStatus(status),
+        )
+    )
+    reports: dict[str, Any] = {
+        stage: StageReport(
+            stage=StageId(stage),
+            started_at=now,
+            completed_at=now,
+            items_flagged=findings,
+        )
+    }
+    reports.update(extra_stage_reports or {})
+    await journal.update_run_stage_reports(run_id, reports)
+    return journal
+
+
+class FakeMemoryLookup:
+    """Async ``get_memory_by_id`` stub with an explicit per-id verdict.
+
+    The map's value decides the branch, so a test states which of the THREE
+    outcomes it means without any implicit default:
+
+    - ``dict``      -> the memory resolves (live);
+    - ``None``      -> genuinely absent (the only verdict that licenses a repair);
+    - ``Exception`` -> the backend RAISED (unknown, never "absent").
+
+    An id missing from the map resolves to ``None``, matching the real service's
+    not-found return. ``calls`` records every ``(project_id, memory_id)`` in
+    order, so a test can assert a gate fired BEFORE any lookup was attempted.
+
+    Deliberately exposes NO ``get_memory``: ``citation_repair`` reads the
+    replacement's fingerprint off the raw Qdrant payload this returns, not
+    through ``MemoryService.get_memory`` (for why, see
+    ``fused_memory/reconciliation/citation_repair.py::_fingerprint_from_record``).
+    A test that needs to pin that non-call subclasses this and adds a
+    recording ``get_memory``.
+    """
+
+    def __init__(self, memories: dict[str, Any] | None = None):
+        self.memories: dict[str, Any] = dict(memories or {})
+        self.calls: list[tuple[str, str]] = []
+
+    async def get_memory_by_id(self, project_id: str, memory_id: str) -> Any:
+        self.calls.append((project_id, memory_id))
+        verdict = self.memories.get(memory_id)
+        if isinstance(verdict, BaseException):
+            raise verdict
+        return verdict
+
+
+async def seed_resolved_ticket(
+    store: Any,
+    db_path: pathlib.Path,
+    project_id: str,
+    *,
+    status: str,
+    latency_s: float,
+    resolved_at: datetime,
+    reason: str | None = None,
+) -> str:
+    """Submit and resolve one ticket, then pin its age and resolve latency.
+
+    The ticket goes through ``TicketStore``'s public writers, which both stamp
+    the wall clock; the timestamps are then rewritten through an independent
+    connection to *db_path*, treating the db file as the fixture.
+    """
+    import aiosqlite
+
+    ticket_id = await store.submit(project_id, '{}')
+    await store.mark_resolved(ticket_id, status=status, task_id='1', reason=reason)
+    created_at = resolved_at - timedelta(seconds=latency_s)
+    async with aiosqlite.connect(str(db_path), timeout=5) as db:
+        await db.execute(
+            'UPDATE tickets SET created_at = ?, resolved_at = ? WHERE ticket_id = ?',
+            (created_at.isoformat(), resolved_at.isoformat(), ticket_id),
+        )
+        await db.commit()
+    return ticket_id

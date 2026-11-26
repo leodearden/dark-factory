@@ -76,7 +76,7 @@ emergency hotfix) it's fine to edit directly:
 This is a `uv` workspace (`pyproject.toml`); the current members are:
 
 ```
-cockpit, dashboard, escalation, fused-memory, orchestrator, sampler, shared
+client-feed, cockpit, dashboard, escalation, fused-memory, orchestrator, sampler, shared
 ```
 
 **`<pkg>/src/<pkg>/` double-nesting.** Every package follows this
@@ -101,14 +101,121 @@ Other top-level dirs:
   `<prd-stem>.capability-manifest.yaml` sidecar — schema in
   `shared/src/shared/capability_manifest.py`). This is the durable record;
   `plans/` is not.
-- **`docs/legibility/`** — `design-invariants.md` (INV-1..INV-5, gates
+- **`docs/legibility/`** — `design-invariants.md` (gates
   `/prd` decompose and `/review` phase 2 — see §6) plus its calibration
   fixtures and the confusion-codebook incident taxonomy.
 - **`dashboard/`** — web UI for task/escalation state.
 - **`scripts/`** — operator and CI helper scripts (systemd unit templates,
   watchdog, host setup).
-- **`hooks/`** — git hooks (`pre-commit`, `pre-merge-commit`, see §4-§5),
-  install via `hooks/setup.sh`.
+- **`hooks/`** — git hooks (`pre-commit`, `pre-merge-commit`,
+  `reference-transaction`, see §4-§5), install via `hooks/setup.sh`.
+
+**Where repo-wide gates live.** There are two homes, chosen by what the gate
+reads. `tests/repo_guards/` hosts every guard whose subject is the committed
+tree outside its own module: the whole-first-party-tree *source* gates, and the
+drift checks and parity pins that read a sibling tree. A workspace member's
+verify-cache key covers only that member, its closure and root-level blobs
+(`orchestrator/src/orchestrator/verify_cache/keys.py::unit_input_paths`), so
+such a guard inside a member suite could pass on a stale cached result. The
+module config declares `verify_cache: never` instead, so every merge gate runs
+it in full; `tests/scripts/test_repo_guards_module_placement.py` pins this
+placement from outside the module. At task role a leg runs only its own
+family, so a diff confined to one member does not run these gates
+(`docs/task-role-pytest-floor.md`).
+
+Every gate there that walks the Python tree takes the session-scoped
+`first_party_tree` fixture (`tests/repo_guards/conftest.py`), which parses
+`tests/repo_guards/silent_fallthrough_scan.py::SCOPE_ROOTS` once per session,
+at collection time (`tests/repo_guards/session_prebuild.py`). A new gate over
+that tree takes the fixture instead of growing a private parse;
+`tests/repo_guards/test_tree_scan_sharing.py::TestNoRegrownWholeTreeParse`
+ratchets this. The module's `test_command` is serial, with no `-n auto`: every
+xdist worker collects every item and would pay the parse, whose CPU and
+resident-memory cost `silent_fallthrough_scan.py::parse_first_party_tree`'s
+docstring measures. `tests/scripts/` hosts the repo-level sweeps that bring
+their own reader — config, doc, systemd-unit and toolchain parity, and
+`tests/scripts/test_atomic_write_regrowth.py`, whose `_SRC_TREES` is not
+`SCOPE_ROOTS`. Like `tests/repo_guards/`, it belongs to no workspace member.
+
+These gates presume a full dark-factory checkout, and nothing runs them any
+other way. So they **hard-fail, never skip**, when a tree they scan is absent:
+`iter_first_party_files` raises `ScopeRootsMissingError` naming every missing
+root (pinned by
+`tests/repo_guards/test_tree_scan_sharing.py::TestEveryScopeRootIsRequired`),
+and in the other direction
+`tests/repo_guards/test_auth_failed_parser_ownership.py::TestSingleResetsParserOwnership::test_shared_tree_spans_every_production_src_root`
+reds when a new `<pkg>/src` is missing from `SCOPE_ROOTS`. A skip is a green
+run over less code — the silent fallthrough the flagship gate exists to catch
+— so do not add one.
+
+An allowlist keyed on a sibling's `(path, qualname)` goes red when you rename
+an allowlisted function in `orchestrator/` or `fused-memory/`. That follows
+from the keying, not the placement: relocating the gate would move the red,
+not remove it. The gate's failure message names the allowlist to edit.
+Reversing this placement means updating this paragraph together with the
+enumerator's required-root check.
+
+<!-- line-pin-policy:begin
+     The repo's decision on bare `file.py:NNN` citations (esc-3815-7).
+     Mirrored in CLAUDE.md and pinned by
+     tests/scripts/test_line_pin_policy.py — that guard asserts these
+     markers still delimit non-empty prose and that nothing enforces the
+     convention mechanically. It deliberately asserts nothing about the
+     WORDING below, so this paragraph can be rewritten freely. -->
+
+**Cite code by symbol, not by line number.** The blessed form for a
+cross-file reference in a source comment or docstring is
+`path/to/module.py::symbol`. It is greppable and it survives edits above
+the site; a bare `module.py:1234` does neither.
+
+**The existing bare pins are tolerated drift, not debt.** Measured for
+esc-3815-7 (2026-08-24): **428 bare `file.py:NNN` pins** across the four
+`src` trees, 1842 repo-wide in `.py`. A 49-pin hand-adjudicated sample put
+**~80% of them wrong** (Wilson 95% CI 66–89%) with a median time-to-rot of
+about **six days**, and two of eight blame-traced pins were wrong at the
+commit that authored them. A task proposing to sweep them — repo-wide or
+over some subset — is correctly closable as won't-fix, and so is an
+escalation re-reporting the population.
+
+A repo-wide sweep was considered and declined for four reasons.
+**No realised harm has ever been found**: a search of 9,579 agent
+transcripts, 5,629 escalation records and full `git log --all` bodies
+returns zero cases of a wrong pin misleading a reader, against a
+same-method control that returns 25 for `git stash`. Wrong pins are
+useless rather than deceptive — 0% cite past end-of-file, ~32% land on a
+blank line, import or comment, and nearly all sit beside a symbol name the
+reader greps in seconds. **The repair is mostly not mechanical**: only 78
+of the 428 can be rewritten by script, and 143 name no symbol at all —
+they describe a behaviour, so a sweep would either drop information or
+invent it. **The diff conflicts with most in-flight work**: 476 files
+carry a pin, and 58% of the branches active in a given three-day window
+touch one — the objection §3 records for `ruff format`, with a worse
+ratio. And **a one-off sweep buys about a week** before the six-day rot
+half-life catches up.
+
+**The rule, scoped deliberately to the change in front of you:** cite by
+symbol in prose *this change introduces or edits*. Don't de-number a file
+you are merely passing through. An unscoped sweep is the expensive gate
+that gets routed around rather than applied — the same reasoning
+`skills/prd/references/author-mode.md` gives for session-scoping the
+identical rule over PRD prose, which
+`skills/prd/references/decompose-mode.md` states for `delivered_check`s.
+This paragraph extends both to source comments and docstrings.
+
+**Nothing enforces this mechanically, by choice.** A write-time guard was
+designed and costed (diff-scoped, zero violations on today's corpus) and
+declined: with zero measured harm it does not earn its ~700 lines, and the
+one prior attempt at a class-level citation guard (task 4240) burned
+$35.97 over 18 `recovery_vetoed` events without landing. Where a line
+number *is* load-bearing — a gate key, or guard prose an assertion pins —
+it gets fixed structurally instead; see task 1910's re-key of
+`tests/repo_guards/silent_fallthrough_allowlist.py` to
+`(relpath, qualname, content_hash)`, which notes that keys "omit `lineno`
+entirely".
+
+Reversing this decision means updating this section, `CLAUDE.md` and
+`tests/scripts/test_line_pin_policy.py` together.
+<!-- line-pin-policy:end -->
 
 ---
 
@@ -130,19 +237,166 @@ Other top-level dirs:
   ```
   `dark-factory-orchestrator.yaml`'s `test_command` fans this out across
   every subproject in its own venv (`shared`, `escalation`, `orchestrator`,
-  `fused-memory`, `dashboard`, `sampler`, optionally `cockpit`) — a bare
+  `fused-memory`, `dashboard`, `sampler`, `client-feed`, optionally `cockpit`) — a bare
   repo-root `pytest` instead collects everything into one process against
   only the root `pyproject.toml`, which is slower and less isolated. Mirror
   the fan-out when running the full suite yourself.
-- **Lint**: `uv run ruff check shared escalation fused-memory orchestrator dashboard`
+<!-- pytest-timeout-mirror:begin
+     Mirrors [tool.pytest.ini_options].timeout, which every pyproject.toml in
+     the repo declares at the same value. Pinned by
+     tests/scripts/test_pytest_per_test_timeout_policy.py — change the configs
+     and this paragraph goes red until it is updated to match. -->
+  Every pytest config caps a single test at `420` seconds of WALL CLOCK (not CPU
+  time), a value DERIVED FROM MEASUREMENT rather than picked — see
+  `plans/pytest-per-test-timeout-measurement-2026-09-17.md` for the corpus and
+  the arithmetic, and `shared/pyproject.toml` for why the cap exists at all.
+  All nine configs carry it, the repo root included, so a bare root-bound
+  `pytest` is no longer uncapped: pytest reads exactly ONE inifile — the
+  rootdir's — and never merges across `pyproject.toml` files, so a member's
+  setting does nothing for a run rooted elsewhere. Opt a slow test up with
+  `@pytest.mark.timeout(N)`, but note that the marker OVERRIDES the budget in
+  both directions rather than raising a floor under it, so an `N` below the
+  value silently TIGHTENS the run — `orchestrator/tests/_orch_helpers.py`'s
+  constant block is the single home of that reasoning.
+  One caveat with teeth, because it decides what the MERGE GATE enforces: every
+  verify leg passes `--timeout=300` on its CLI, and a CLI `--timeout` overrides
+  the ini. So verify currently runs TIGHTER than a bare local or agent `pytest`
+  — an unmarked test taking 310 seconds passes locally and reds the gate, and
+  the test the value is now derived from (45.48s) runs at only ~6.6x headroom
+  under verify's 300, short of the 8x the measurement demands. Aligning that
+  yaml knob is outside the scope that set these configs and is filed as residue 2 of
+  `plans/pytest-per-test-timeout-measurement-2026-09-17.md`.
+<!-- pytest-timeout-mirror:end -->
+<!-- lint-command-mirror:begin
+     Mirrors the `ruff check` leg of `lint_command` in
+     dark-factory-orchestrator.yaml. Pinned by
+     tests/scripts/test_contributing_lint_command_drift.py — widen the yaml
+     head and this line goes red until it is updated to match. -->
+- **Lint**: `uv run ruff check shared escalation fused-memory orchestrator dashboard sampler cockpit client-feed conftest.py df_pytest_isolation.py skills`
+<!-- lint-command-mirror:end -->
+  That bullet mirrors the `ruff check` leg only; `lint_command` chains one
+  more leg the merge gate also runs —
+  `fused-memory/scripts/check_bare_magicmock_config.py` over each package's
+  `tests/`, where a directory scan covers `test_*.py`, `conftest.py` and
+  `_*.py` helper modules — so see `lint_command` in
+  `dark-factory-orchestrator.yaml` for the full chain. Despite its legacy
+  filename that script now carries **four
+  independent test-quality rules** — two about mock-spec discipline, one
+  about wait deadlines and one about timing dependence, neither of the last
+  two a mock rule at all. The first three each have their own suppression
+  code, and all three take the form `# noqa: <code> — <reason>` on the
+  **preceding** non-blank line; the reason is mandatory and an inline
+  trailing comment is deliberately not honored. The fourth is escaped by a
+  marker instead:
+  - `bare-magicmock` — a config-named variable (`config`, `cfg`, `*_config`,
+    `*_cfg`) assigned an unspecced `MagicMock()`. Remedy: the
+    `mock_orch_config` fixture or `MagicMock(spec_set=pydantic_spec(...))`.
+  - `bare-dataclass-double` — an unspecced `MagicMock` shaped like a
+    registered stdlib dataclass (`VerifyResult` today), flagged in **any**
+    syntactic position including `return MagicMock(...)`. Remedy:
+    `fake_verify_result(...)` (from
+    `orchestrator/tests/_verify_result_doubles.py`) or
+    `MagicMock(spec=VerifyResult)`.
+    This rule has **no baseline** and is hot for every scanned file — the
+    transitional debt list was retired once its 95 grandfathered sites were
+    migrated (task 4354), so the per-site `# noqa: bare-dataclass-double —
+    <reason>` pragma above is its only suppression.
+  - `wall-clock-deadline` — a **load-bearing** synchronisation point awaited on
+    a wall-clock deadline: a `MergeRequest.result` future (`req.result`) or a
+    zero-argument `.wait()` barrier on any receiver, reached either through a
+    bare `asyncio.wait_for(...)` or carrying a raw numeric literal bound
+    (`timeout=`, `max_wall_s=`, or `asyncio.wait_for`'s positional timeout).
+    The same deadline written two more ways is flagged too: an
+    `asyncio.timeout(...)`/`asyncio.timeout_at(...)` block wrapping a poll or
+    a load-bearing await, and an async poll loop whose comparison reads a
+    wall clock directly (`loop.time() < deadline`,
+    `deadline - time.monotonic() > 0` and the like); a clock read held in a
+    variable and compared later is not seen yet.
+    Remedy: `wait_responsive(...)` with a descriptive `label=` — or, for a
+    poll, `poll_responsive(predicate, ...)` from
+    `orchestrator/tests/_poll_responsive.py` — and a bound
+    derived from `MERGE_RESULT_TIMEOUT` rather than a written number — a
+    deadline expiry on such a wait fails a test whose awaited event did
+    happen. Both legs are pure **shape**: no receiver name, no class list
+    and no budget threshold decides which sites are scanned, and the teardown
+    join in `stop_merge_worker` (`orchestrator/tests/_merge_worker_drive.py`)
+    is exempt structurally (a bare `ast.Name` target).
+    `wait_responsive` and `MERGE_RESULT_TIMEOUT` live in
+    `orchestrator/tests/_orch_helpers.py`, and like `poll_responsive` are
+    importable only under `orchestrator/tests`, so in any other package the
+    per-site `# noqa: wall-clock-deadline — <reason>` is the remedy. See the
+    script's Rule C docstring. Pre-existing debt, across five packages, is
+    grandfathered in the script's `_WALL_CLOCK_DEADLINE_DEBT` baseline —
+    **shrink-only** and opt-out, so a new offending file fails the gate by
+    default. It is an **exact budget** rather than a bare list: a listed file is
+    silent only at EXACTLY its recorded count. Above it the checker reports the
+    overrun; below it the checker reports the slack, naming the one-line edit,
+    in the owning package's own `lint_command`. So a number must be lowered in
+    the same change that removes a site, and is never raised.
+  - `timing-dependence` — a test whose verdict moves with host load: a real
+    `time.sleep`/`asyncio.sleep`, an assert comparing a real elapsed time with
+    a written number, or a numeric literal bound to a wall-clock deadline
+    (`timeout=` on any call but a constructor or a pytest mark,
+    `asyncio.wait_for`'s positional timeout, `asyncio.timeout`'s delay, or a
+    real clock read plus a literal). A literal sleep of 60 s or more, or
+    `inf`, simulates a hang and is not a site. It has **no `# noqa` code**:
+    its only escape is `@pytest.mark.timing(reason=...)` with a non-blank
+    literal reason, on any enclosing def or class, a class-body `pytestmark`
+    or the module `pytestmark`, and only when a deadline is itself the
+    behaviour under test. A `@virtual_clock_test` span covers every kind but
+    a real-thread `time.sleep`. Rule C has precedence: a wait Rule C reports
+    is not also reported here. Remedy: wait on the event the code under test
+    signals; to advance time, take the `fake_clock` fixture
+    (`shared.pytest_fake_clock.fake_clock`, bound in every scanned package's
+    conftest) or run the scenario on `shared.testing_virtual_clock`; bound a
+    real child process by its own time with
+    `shared.testing_own_time.run_on_own_time` / `wait_on_own_time`.
+    Pre-existing debt is grandfathered in the same shrink-only, exact-budget
+    shape, in `fused-memory/scripts/_timing_dependence_debt.py`.
+- **Formatting**: this repo runs `ruff check` only. **`ruff format` is not part
+  of the toolchain** and is not enforced anywhere — not in `hooks/pre-commit`,
+  not in any `orchestrator.yaml` `lint_command`, not in verify. There is no CI.
+
+  As of task 3441, 1125 of 1357 first-party package `.py` files (83%) are not
+  `ruff format`-clean. **That is the expected steady state, not debt.** A task
+  proposing to "fix formatting" over some subset of files is correctly closable
+  as won't-fix. A repo-wide sweep was considered and declined for three
+  reasons: it reverses the deliberate `ignore = ["E501"]` that every package
+  sets, which tolerates long lines on purpose while the formatter exists to
+  rewrap them; a 1125-file diff conflicts with every in-flight branch in a repo
+  whose normal mode is many concurrent agent branches against a
+  continuously-draining merge queue; and it rewrites the blame history that
+  this repo's incident forensics and reconciliation lean on.
+
+  The `[tool.ruff.format]` block in each package's `pyproject.toml` is **style
+  config, not a gate**. It is retained so that an ad-hoc or editor-on-save
+  `ruff format` produces a single-quoted, repo-consistent diff — measured
+  ~4.5x smaller than the same run under ruff's own defaults.
+
+  Reversing this decision means updating this section, `CLAUDE.md` and
+  `tests/scripts/test_ruff_format_policy.py` together.
 - **Type-check** (pyright, run from each configured package directory so it
-  picks up that package's `[tool.pyright]` block):
+  picks up that package's `[tool.pyright]` block) — the same eight workspace
+  members the merge gate checks:
+  <!-- type-check-command-mirror:begin
+       Mirrors the package DIRECTORIES walked by `type_check_command` in
+       dark-factory-orchestrator.yaml. The RUNNER deliberately differs —
+       `uv run pyright` here, `npx pyright` there — and both resolve the
+       same pinned version (see below). Pinned by
+       tests/scripts/test_contributing_type_check_command_drift.py: widen
+       the yaml chain and this block goes red until it is updated to
+       match. -->
   ```bash
-  cd fused-memory && uv run pyright   # also: orchestrator, dashboard
+  cd fused-memory && uv run pyright && cd ../orchestrator && uv run pyright && cd ../dashboard && uv run pyright && cd ../shared && uv run pyright && cd ../escalation && uv run pyright && cd ../sampler && uv run pyright && cd ../cockpit && uv run pyright && cd ../client-feed && uv run pyright
   ```
-  `dark-factory-orchestrator.yaml`'s `type_check_command` runs the same
-  three packages via `npx pyright` (needs Node 22+) — either invocation
-  works.
+  <!-- type-check-command-mirror:end -->
+  `dark-factory-orchestrator.yaml`'s `type_check_command` runs the same eight
+  workspace members via `npx pyright` (needs Node 22+) — either invocation
+  works, and both resolve the SAME pyright version: `uv run pyright` resolves
+  the pyright-python wheel `uv.lock` pins, `npx pyright` resolves the repo-root
+  `package.json` pin that `npm ci` installs into `node_modules/`. Run `npm ci`
+  once locally, or a bare `npx pyright` fetches whatever is current instead.
+  `tests/scripts/test_pyright_version_pin.py` holds the two lanes together.
 
 Treat `dark-factory-orchestrator.yaml`'s `test_command` / `lint_command` /
 `type_check_command` as the source of truth if these drift.
@@ -158,8 +412,62 @@ branch, before any merge submission:
    and `escalation` are imported by most of the others, so a change there
    should trigger a broader run).
 2. `uv run ruff check <touched packages>`.
-3. `uv run pyright` in each touched, pyright-configured package
-   (`fused-memory`, `orchestrator`, `dashboard`).
+3. `uv run pyright` in each touched, pyright-configured package — any of the
+   eight workspace members the §3 **Type-check** command walks.
+
+**Defect fixes** start from a test that fails without the fix, for a human
+committing directly as much as for an agent. The rule's one home is
+`orchestrator/src/orchestrator/agents/roles.py::DEFECT_TEST_RULE`, the text the
+factory's fixing agents are given. The excerpt below is rendered
+from it and kept equal to it by `tests/scripts/test_defect_rule_mirror.py`.
+
+<!-- defect-test-rule-mirror:begin  rendered from orchestrator/src/orchestrator/agents/roles.py::DEFECT_TEST_RULE; pinned by tests/scripts/test_defect_rule_mirror.py -->
+```text
+## Fixing a defect
+
+A defect is wrong runtime behaviour. A defect fix starts from a test that fails
+without the fix and passes with it: write that test first and watch it fail.
+In a pytest project, when the defect is declared, mark that test
+`@pytest.mark.defect("<ref>")` with the defect's ref. A test carrying
+`@pytest.mark.defect` is a defect's reproducing test.
+
+Never weaken a failing test (loosen or delete an assertion, skip it, mark it
+xfail, or delete the test) without stating in the commit message why the test,
+not the code, was wrong.
+```
+<!-- defect-test-rule-mirror:end -->
+
+The inline-suppression ratchet guard,
+`scripts/tests/test_inline_suppression_ratchet.py`, runs with the suite. A
+malformed disposition marker turns it red now. A new `type: ignore`, `noqa`
+or similar suppression with no disposition marker turns it red only once the
+operator has seeded `scripts/inline_suppression_baseline.json` (step κ1 of
+`plans/inv12-exceptions-owned-or-ratified-prd.md`). Until then that check
+skips and its skip reason says so, so a green suite does not yet mean your
+suppressions were checked.
+
+The merge-lane quality ratchet, `orchestrator/tests/test_merge_lane_ratchet.py`,
+also runs with the suite. Lowering a merge-lane measure is the point; it
+regenerates `orchestrator/tests/merge_lane_ratchet_baseline.json` in the same
+commit (`python scripts/merge_lane_metrics.py --write-baseline <that path>`).
+A raise is never silent: add `--authorize-raise <task-id> --reason "<why>"`,
+which records it as ONE NEW FILE under
+`orchestrator/tests/merge_lane_ratchet_raises/`. The pre-commit auditor
+`scripts/check_staged_ratchet_raise.py` refuses a commit whose raises its own new
+entry files do not cover, and one that modifies, deletes or renames a recorded
+entry. A new entry's task id must be one the branch works on -- the id in its
+name (`task/<id>`, `carry/<id>`, or a name ending `-<id>`) or one an earlier commit
+on the branch cites (`fix(<id>): ...` or `task <id>`) -- and its reason may not
+be blank; the commit being made cannot cite itself. The baseline itself merges through a structured 3-way driver (installed
+by `scripts/setup-host.sh` step 9), so two branches moving different code no
+longer conflict on it. A rebase or a clean merge skips pre-commit, so
+`hooks/reference-transaction` runs `scripts/check_ratchet_advance.py` on every
+move of `main`, the merge worker's `git update-ref` included: it refuses a move
+whose baseline rises over the merge base's beyond what the entry files the move
+adds cover. The merge lane reports that refusal as "CAS retry limit
+exhausted", with the `ratchet advance gate:` lines in the orchestrator log
+(task 6892 tracks classifying it); the remedy is to record the raise on the
+branch, against main's baseline, with the flags above.
 
 Do this **before** `merge_request`/`/merge-queue`, not after — a red
 post-merge verify blocks or reverts the merge, which is more expensive than
@@ -169,16 +477,33 @@ catching it locally.
 (installed via `hooks/setup.sh`, which points `core.hooksPath` at `hooks/`):
 it strips any staged `.task/` files (see §8), then on `main` runs `ruff
 check`, the asyncmock/bare-MagicMock style checks on staged test files, and
-**pyright up to 3×** (once per touched package under `PYRIGHT_PACKAGES`, or
-across all three if the change touches a shared dependency like `shared` or
-`escalation`). This can comfortably exceed two minutes — give commit
-commands a timeout of at least `300000`ms (or run detached via `setsid` and
-poll) rather than letting a default 2-minute timeout kill it mid-hook.
+**the merge gate's own checks for what the commit stages** (task 8531, via
+`scripts/hook_module_checks.py`). Each registered module that a staged `.py`
+maps to runs its `lint_command` and `type_check_command` verbatim. A staged
+`.py` under `shared` or `escalation` runs the type check of every module. A
+staged repo-root `.py` (`conftest.py`, `df_pytest_isolation.py`), which no
+module can own, runs the hook's own `root:type` unit, pyright over those files
+(`scripts/hook_module_checks.py::root_units`); a root module other than
+`conftest.py` also runs every module's type check, like `shared`/`escalation`. A
+staged file under `plans/`, `docs/` or `review/`, or a `*.yaml`/`*.json`/`*.md`
+outside a workspace package, runs the `scripts/merge_screen.yaml` screen. A
+commit that maps to none of these prints `pre-commit: merge-gate checks
+skipped (no staged file maps to a module or the screen) in Ns` and finishes
+in seconds. A commit that runs a module type check can take minutes. Give it
+a timeout of at least `300000`ms, or run it detached via `setsid` and poll,
+rather than letting a default 2-minute timeout kill it mid-hook; the skip
+case needs no bumped timeout.
 Never `--no-verify` this hook to skip pyright/ruff on a code change; the
 two narrow documented exceptions are the *pre-merge-commit* emergency
 bypass (§5) and a **docs-only** commit landing under index-lock contention
 in the machine-operated main checkout (see `OPERATIONS.md` §"Working in
 the main checkout").
+
+These gates are the **floor**. The **bar** is `docs/code-quality.md` — the
+single normative definition of code quality (quality as the cost and risk of
+the next change, fourteen named heuristics, and the comment and test
+stances). Reviewers cite its heuristics by name; a change can pass every gate
+above and still be correctly rejected against it.
 
 ---
 
@@ -233,11 +558,10 @@ Every PRD authored or decomposed through `/prd` runs a fixed gate sequence
   boundary-test sketch) vs. a bare vertical slice.
 - **G6** premise validity — numeric bounds, exactness claims, and rejection
   assertions must be substantiated, not guessed.
-- **G7** design invariants — re-checked against
-  `docs/legibility/design-invariants.md` (**INV-1..INV-5**:
-  `contracts-machine-checked`, `structured-facts-at-failure`,
-  `corroborate-before-acting`, `storm-escape-required`,
-  `no-lockstep-duplication`). An unresolved, unwaived hit blocks the batch;
+- **G7** design invariants — every task in a batch is re-checked against the
+  named, checkable invariants in `docs/legibility/design-invariants.md` (the
+  single normative list; slugs are stable ids, so read it rather than a copy).
+  An unresolved, unwaived hit blocks the batch;
   a deliberate exception is a `G7 waiver: <slug> — <rationale>` line in the
   PRD plus `metadata.g7_waivers` on the filed task.
 - **Capability manifest** — mechanizes G3/G6 per leaf task, committed
@@ -246,10 +570,12 @@ Every PRD authored or decomposed through `/prd` runs a fixed gate sequence
   oversight, produce a complete, coherent, good design?"
 
 `design-invariants.md` also gates `/review` phase 2's cross-module audit —
-it's the single normative copy of the five invariants; don't restate them
-elsewhere. If you're hand-writing a task (not going through `/prd`) for a
-nontrivial design change, walk it against the same checklist yourself
-before filing.
+it's the single normative copy; don't restate them elsewhere (a restatement
+here went stale once already — task 3802, and
+`tests/repo_guards/test_design_invariants_consistency.py` now fails if a copy
+comes back; citing one invariant by name is still fine). If you're hand-writing a task (not going through
+`/prd`) for a nontrivial design change, walk it against the same checklist
+yourself before filing.
 
 ---
 
@@ -302,6 +628,13 @@ chore: <housekeeping>
   promotion process.
 - **Don't `--no-verify` the pre-commit hook** to skip ruff/pyright — if it's
   genuinely too slow, raise the timeout instead (§4).
+- **Don't file a cleanup task — or an escalation — for a stale
+  `file.py:NNN` citation** in a comment or docstring. It is tolerated drift
+  (§2): ~80% of the 428 existing pins are already wrong and none has ever
+  been shown to mislead a reader. Fix a pin in prose you are already
+  editing; leave the rest. Twenty tasks, $141.77 and 31 escalations (14 of
+  them human-facing) have gone into this class one file at a time, against
+  a population that grows about 20x faster than the lane clears it.
 - **Don't use a bare task number as a branch slug**, or reuse a
   blocked/in-flight task's id for unrelated work — either can corrupt that
   task's merge bookkeeping (non-numeric `task/<slug>` branches are the

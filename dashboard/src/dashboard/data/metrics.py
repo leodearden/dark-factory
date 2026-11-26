@@ -1,15 +1,15 @@
 """Periodic metrics-snapshot collection and chart queries.
 
 Records sparse-history signals (orchestrator running count, fused-memory
-store sizes, write queue depth, reconciliation state, merge queue active
+store sizes, write queue depth, reconciliation state, live merge-queue
 depth) into a dedicated SQLite database so they can be rendered as time
 series even though the underlying sources are point-in-time only.
 
-Sampling cadence and downsampling rules match
-``dashboard/data/burndown.py`` so both files retain at most 90 days of
-history (10-minute raw, hourly after 7 days). The collector runs on a
-sibling lifespan task in ``app.py``; route handlers read via the shared
-``DbPool`` (read-only).
+Sampling cadence matches ``dashboard/data/burndown.py`` (10-minute raw
+rows); both databases share one retention policy,
+dashboard/src/dashboard/data/retention.py::apply_retention (hourly after 7
+days, nothing after 90). The collector runs on a sibling lifespan task in
+``app.py``; route handlers read via the shared ``DbPool`` (read-only).
 """
 
 from __future__ import annotations
@@ -29,20 +29,27 @@ from dashboard.data.cap_history import (
     compute_overlap_ms,
     read_cap_intervals,
 )
-from dashboard.data.mcp_fanout import first_success
+from dashboard.data.mcp_fanout import (
+    PreformattedFanoutError,
+    describe_exc,
+    fanout_label,
+    first_success,
+)
 from dashboard.data.memory import (
+    enclosing_deadline,
     get_curator_state,
     get_memory_status,
     get_queue_stats,
     mcp_tool_call,
 )
-from dashboard.data.merge_queue import active_queued_merges
+from dashboard.data.merge_queue import fetch_live_merge_queues
 from dashboard.data.orchestrator import (
     _read_project_root_from_config,
     _resolve_project_root,
     find_running_orchestrators,
 )
 from dashboard.data.reconciliation import get_buffer_stats, get_burst_state, partition_burst_state
+from dashboard.data.retention import apply_retention
 from dashboard.data.stats_utils import percentile
 from dashboard.data.utils import resolve_now, safe_gather_result
 
@@ -51,7 +58,8 @@ logger = logging.getLogger(__name__)
 # 5s ceiling on any individual fused-memory HTTP call so a hung MCP cannot
 # extend the 10-minute sampling cycle.  Note: this is per-(root, url) call,
 # not per-loop — worst-case latency for the pending-count accumulation loop
-# scales as N_roots × M_urls × 5s if all URLs hang for every root.
+# scales as N_roots × M_urls × enclosing_deadline(5s) if all URLs hang for
+# every root.
 _HTTP_SAMPLER_TIMEOUT_SECONDS = 5.0
 # Default per-(root, url) page size for list_tickets; saturation triggers a WARNING.
 _LIST_TICKETS_LIMIT = 2000
@@ -80,21 +88,21 @@ async def fan_out_list_tickets(
     If any per-root count saturates at *limit* the server may have clipped the
     real depth — a WARNING is logged so it surfaces in operator logs.
 
-    Per-(url, root) network/decode errors are swallowed at DEBUG level; timeouts
-    surface at WARNING so slow fused-memory instances are visible to operators.
-    Unexpected exception types are logged at WARNING level so programming bugs
-    don't silently vanish into the fan-out loop.
+    Per-(url, root) failures — network, decode, and timeout alike — are
+    reported ONCE, by ``first_success``, under its transition-only WARNING
+    policy (first failure of a streak at WARNING, repeats at DEBUG). Each is
+    normalized to a ``ValueError`` whose message carries the real cause plus
+    the project root, so that single line is diagnostic. The DEBUG ``exc_info``
+    logs here are the traceback detail behind it, not a second report; only the
+    unexpected-exception branch still logs at WARNING itself, because it fires
+    only on a programming bug.
     """
     # Resolve limit at call time so monkeypatching _LIST_TICKETS_LIMIT in tests
     # takes effect without needing to pass an explicit kwarg.
     effective_limit = limit if limit is not None else _LIST_TICKETS_LIMIT
-    seen_roots: set[str] = set()
-    all_roots: list[str] = []
-    for root in [config.project_root, *config.known_project_roots]:
-        key = str(root)
-        if key not in seen_roots:
-            seen_roots.add(key)
-            all_roots.append(key)
+    per_url_deadline = enclosing_deadline(timeout)
+    all_roots = [str(root) for root in config.all_project_roots]
+    labels = config.project_labels
 
     async def _fan_out_one_root(root_str: str) -> tuple[int, list[dict]]:
         """Query list_tickets for *root_str* across all configured URLs.
@@ -114,8 +122,14 @@ async def fan_out_list_tickets(
                         url,
                         'list_tickets',
                         {'project_root': root_str, 'status': 'pending', 'limit': effective_limit},
+                        # Per-HTTP-request budget: bounds connect/read/write AND
+                        # pool acquisition on the shared client, which otherwise
+                        # ran to mcp_tool_call's 10s default regardless of the
+                        # sampler's own deadline. The enclosing wait_for stays,
+                        # at a larger bound — see memory.py::enclosing_deadline.
+                        timeout=timeout,
                     ),
-                    timeout=timeout,
+                    timeout=per_url_deadline,
                 )
                 count = result.get('count', 0) or 0
                 if count >= effective_limit:
@@ -133,40 +147,57 @@ async def fan_out_list_tickets(
                     {**r, 'project_id': project_id} for r in result.get('tickets', [])
                 ]
                 return count, root_tickets
+            # The sentinel ValueErrors below carry the REAL cause in their
+            # message (task 3871): first_success logs one WARNING per failing
+            # URL from that message, so a bare ValueError('http') produced a
+            # content-free "list_tickets failed for <url>: http" line naming no
+            # cause at all. Reporting is left to first_success — logging a
+            # WARNING here too gave one failure two identical-level lines.
             except TimeoutError:
-                logger.warning(
-                    'list_tickets timed out for project_root=%s url=%s after %.1fs',
-                    root_str,
-                    url,
-                    timeout,
-                )
-                raise ValueError('timeout') from None
-            except (httpx.HTTPError, ValueError):
+                # Plain ValueError, deliberately: this message carries no
+                # pre-rendered type, so first_success's single 'ValueError: '
+                # prefix is correct rather than doubled. The two branches
+                # below DO pre-render, hence PreformattedFanoutError there.
+                raise ValueError(
+                    f'timed out after {per_url_deadline:.1f}s (project_root={root_str})'
+                ) from None
+            except (httpx.HTTPError, ValueError) as exc:
+                # DEBUG (not WARNING) and exc_info: this is the traceback
+                # detail behind first_success's operator-facing line, not a
+                # second report of the same failure.
                 logger.debug(
                     'list_tickets failed for %s / %s',
                     url,
                     root_str,
                     exc_info=True,
                 )
-                raise ValueError('http') from None
-            except Exception:
+                raise PreformattedFanoutError(
+                    f'{describe_exc(exc)} (project_root={root_str})'
+                ) from None
+            except Exception as exc:
                 # Also catches a buggy/older MCP server returning a non-dict
                 # (list/None) for list_tickets: result.get(...) above raises
                 # AttributeError, which must be caught HERE (inside the try)
                 # so it is normalized to ValueError and first_success falls
                 # through to the next URL instead of the whole root aborting.
+                #
+                # This branch KEEPS its WARNING (unlike the two above) because
+                # it only fires on a programming bug, where the traceback is
+                # the point and must not be demoted to DEBUG.
                 logger.warning(
                     'list_tickets unexpected error for %s / %s',
                     url,
                     root_str,
                     exc_info=True,
                 )
-                raise ValueError('unexpected') from None
+                raise PreformattedFanoutError(
+                    f'unexpected {describe_exc(exc)} (project_root={root_str})'
+                ) from None
 
         return await first_success(
             config.fused_memory_urls,
             _call,
-            log_label='list_tickets',
+            log_label=fanout_label('list_tickets', root_str, labels),
             offline_result=lambda errs: (0, []),
         )
 
@@ -204,6 +235,7 @@ CREATE TABLE IF NOT EXISTS memory_snapshots (
     mem0_memories   INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_mem_snap_pid_ts ON memory_snapshots(project_id, ts);
+CREATE INDEX IF NOT EXISTS idx_mem_snap_ts ON memory_snapshots(ts);
 
 CREATE TABLE IF NOT EXISTS queue_snapshots (
     ts      TEXT PRIMARY KEY,
@@ -233,6 +265,24 @@ CREATE TABLE IF NOT EXISTS curator_snapshots (
     p50_active_ms INTEGER,
     p90_active_ms INTEGER,
     p99_active_ms INTEGER
+);
+
+-- Count of tickets a deterministic curator guard REFUSED (cancelled-premise
+-- blocklist / recon premise registry) in the trailing hour. A refusal
+-- discards a candidate permanently and creates nothing, so an over-broad
+-- guard entry can eat real reconciliation output indefinitely; this is the
+-- counted signal that makes a refusal-rate spike visible without grepping
+-- logs. NULL means "not sampled" (no tickets.db connection), which is
+-- distinct from 0 = "sampled, none refused".
+--
+-- Deliberately a sibling table rather than a column on curator_snapshots:
+-- this schema is applied with CREATE TABLE IF NOT EXISTS only (no ALTER
+-- migration hook), so a new column would never materialise on an existing
+-- metrics.db and its INSERT would then fail — silently killing the whole
+-- curator sampler row. A new table is the migration-free way to extend.
+CREATE TABLE IF NOT EXISTS curator_refusal_snapshots (
+    ts            TEXT PRIMARY KEY,
+    refused_count INTEGER
 );
 """
 
@@ -327,7 +377,7 @@ async def _sample_curator(
 
     Args:
         http_client: Shared AsyncClient for MCP HTTP calls.
-        config: Dashboard configuration (fused_memory_urls, known_project_roots).
+        config: Dashboard configuration (fused_memory_urls, all_project_roots).
         tickets_db: Read-only aiosqlite connection to tickets.db. If None,
             ticket latency fields are all None and only pending/capped are set.
         runs_dbs: Per-project runs.db connections for cap-event lookup.
@@ -337,9 +387,12 @@ async def _sample_curator(
 
     Returns:
         Always returns a dict with keys: pending_total, capped_now,
-        p50_active_ms, p90_active_ms, p99_active_ms. Individual sub-errors
-        are swallowed and treated as 0/None — the function never propagates
-        a top-level exception to the caller.
+        p50_active_ms, p90_active_ms, p99_active_ms, refused_last_hour.
+        Individual sub-errors are swallowed and treated as 0/None — the
+        function never propagates a top-level exception to the caller.
+        ``refused_last_hour`` is None when the ticket window was not sampled
+        at all (no tickets_db, or the query failed), which is deliberately
+        distinct from 0 ("sampled, nothing refused").
     """
     effective_now = resolve_now(now)
 
@@ -400,15 +453,38 @@ async def _sample_curator(
     p50: int | None = None
     p90: int | None = None
     p99: int | None = None
+    refused_last_hour: int | None = None
     if tickets_db is not None:
         cutoff = (effective_now - timedelta(hours=1)).isoformat()
         try:
+            # This IN-list is the terminal-status allowlist and must track the
+            # resolve_ticket status vocabulary. 'refused' is terminal too: a
+            # deterministic guard rejected the candidate and no task was
+            # created — that work still cost curator latency, so it belongs in
+            # the centiles. Omitting a status here silently erases it from the
+            # metric rather than failing loudly.
             async with tickets_db.execute(
-                'SELECT created_at, resolved_at FROM tickets '
-                "WHERE resolved_at >= ? AND status IN ('created', 'combined', 'cancelled', 'failed')",
+                'SELECT created_at, resolved_at, status FROM tickets '
+                'WHERE resolved_at >= ? AND status IN '
+                "('created', 'combined', 'cancelled', 'failed', 'refused')",
                 (cutoff,),
             ) as cur:
                 ticket_rows = await cur.fetchall()
+
+            # 4b. Refusal count — the counted signal for deterministic guard
+            # refusals. A refusal creates NOTHING and is never escalated (the
+            # janitor sweep covers failures only, deliberately), so without a
+            # count an over-broad blocklist/premise entry could silently eat
+            # real reconciliation output forever with only a logger.info to
+            # show for it. Counted before the created/resolved parsing below
+            # so a malformed timestamp cannot suppress the count.
+            refused_last_hour = sum(1 for row in ticket_rows if row[2] == 'refused')
+            if refused_last_hour:
+                logger.info(
+                    'curator sampler: %d ticket(s) refused by a deterministic guard '
+                    'in the last hour (no task was created for any of them)',
+                    refused_last_hour,
+                )
 
             # 5. Per-ticket active_ms with cap subtraction.
             active_ms_list: list[float] = []
@@ -443,6 +519,7 @@ async def _sample_curator(
         'p50_active_ms': p50,
         'p90_active_ms': p90,
         'p99_active_ms': p99,
+        'refused_last_hour': refused_last_hour,
     }
 
 
@@ -489,11 +566,19 @@ async def collect_metrics_snapshot(
         with contextlib.suppress(Exception):
             await conn.rollback()
 
-    # Memory (HTTP via fused-memory MCP — wrap in wait_for as belt-and-braces).
+    # Memory (HTTP via fused-memory MCP). Bounded at BOTH layers, and the
+    # outer wait_for is not redundant with the inner budget: the budget below
+    # is PER HTTP REQUEST (it also bounds pool acquisition), whereas
+    # get_memory_status fans out SEQUENTIALLY over N fused_memory_urls until
+    # one succeeds — and each cold URL costs a three-post handshake. So the
+    # budget bounds each URL and wait_for bounds the aggregate; without the
+    # outer bound a total outage would cost roughly N x 3 x the budget.
     try:
         status = await asyncio.wait_for(
-            get_memory_status(http_client, config),
-            timeout=_HTTP_SAMPLER_TIMEOUT_SECONDS,
+            get_memory_status(
+                http_client, config, timeout=_HTTP_SAMPLER_TIMEOUT_SECONDS,
+            ),
+            timeout=enclosing_deadline(_HTTP_SAMPLER_TIMEOUT_SECONDS),
         )
         pairs, _queue_inline = _split_status(status)
         for pid, payload in pairs:
@@ -509,10 +594,16 @@ async def collect_metrics_snapshot(
             await conn.rollback()
 
     # Write queue (HTTP, separate call; tolerate either source failing).
+    # Same two-layer bound as the memory sampler above, and here the outer
+    # wait_for matters even more: get_queue_stats visits ALL N
+    # fused_memory_urls (it sums across them rather than short-circuiting),
+    # so the per-call budget alone would scale with N.
     try:
         qstats = await asyncio.wait_for(
-            get_queue_stats(http_client, config),
-            timeout=_HTTP_SAMPLER_TIMEOUT_SECONDS,
+            get_queue_stats(
+                http_client, config, timeout=_HTTP_SAMPLER_TIMEOUT_SECONDS,
+            ),
+            timeout=enclosing_deadline(_HTTP_SAMPLER_TIMEOUT_SECONDS),
         )
         pending, retry, dead = _split_queue_stats(qstats)
         await conn.execute(
@@ -541,17 +632,24 @@ async def collect_metrics_snapshot(
         with contextlib.suppress(Exception):
             await conn.rollback()
 
-    # Merge queue (per-project active count from runs.db events).
+    # Merge queue: the live get_merge_queue probe the "In queue now" tile
+    # reads, so this table is that datum's history. Only a reachable probe is
+    # a measurement; an unreachable or unprobed project writes no row (PRD
+    # dashboard-one-datum-one-path, decisions 5 and 11).
     try:
-        for pid, db in merge_dbs:
-            try:
-                merges = await active_queued_merges(db)
-            except Exception:
-                logger.debug('merge sampler failed for %s', pid, exc_info=True)
+        live_map = await fetch_live_merge_queues(http_client, config.escalation_urls)
+        labels = config.project_labels
+        for pid, _db in merge_dbs:
+            live = live_map.get(labels.of(pid))
+            if live is None or not live.get('reachable'):
+                logger.debug(
+                    'merge sampler: no live queue reading for %s: %s',
+                    pid, 'no probe' if live is None else live.get('error'),
+                )
                 continue
             await conn.execute(
                 'INSERT INTO merge_snapshots (ts, project_id, active_count) VALUES (?, ?, ?)',
-                (now, pid, len(merges)),
+                (now, pid, len(live['entries'])),
             )
         await conn.commit()
     except Exception:
@@ -583,6 +681,14 @@ async def collect_metrics_snapshot(
             ),
         )
         await conn.commit()
+        # Refusal count lands in its own row+commit so a write error here can
+        # never roll back the centiles row above (and vice versa).
+        await conn.execute(
+            'INSERT OR REPLACE INTO curator_refusal_snapshots (ts, refused_count) '
+            'VALUES (?, ?)',
+            (now, curator['refused_last_hour']),
+        )
+        await conn.commit()
     except Exception:
         logger.warning('curator sampler failed', exc_info=True)
         with contextlib.suppress(Exception):
@@ -590,56 +696,34 @@ async def collect_metrics_snapshot(
 
 
 # ---------------------------------------------------------------------------
-# Downsampling — same policy as burndown (raw 10min, hourly after 7d, drop 90d).
+# Downsampling — dashboard/src/dashboard/data/retention.py::apply_retention.
 # ---------------------------------------------------------------------------
 
 
-_DOWNSAMPLE_TABLES = (
-    ('orchestrator_snapshots', 'project_id'),
-    ('memory_snapshots', 'project_id'),
-    ('queue_snapshots', None),
-    ('recon_snapshots', None),
-    ('merge_snapshots', 'project_id'),
-    ('curator_snapshots', None),
+_DOWNSAMPLE_TABLES: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ('orchestrator_snapshots', ('project_id',)),
+    ('memory_snapshots', ('project_id',)),
+    ('queue_snapshots', ()),
+    ('recon_snapshots', ()),
+    ('merge_snapshots', ('project_id',)),
+    ('curator_snapshots', ()),
+    ('curator_refusal_snapshots', ()),
 )
 
 
-async def downsample_metrics(conn: aiosqlite.Connection) -> None:
-    """Compact old metrics rows: hourly after 7 days, drop after 90 days.
+async def downsample_metrics(
+    conn: aiosqlite.Connection, *, now: datetime | None = None,
+) -> None:
+    """Compact old metrics rows in one transaction.
 
-    For per-project tables, partition key is (project_id, hour); for
-    system-wide tables, partition key is just hour.
+    Rows older than 7 days keep one row per (project_id, hour) in per-project
+    tables and one per hour in system-wide ones; rows older than 90 days are
+    dropped. The policy lives in
+    dashboard/src/dashboard/data/retention.py::apply_retention.
     """
-    now = datetime.now(UTC)  # clock-exempt: single-capture retention cutoff
-    cutoff_7d = (now - timedelta(days=7)).isoformat()
-    cutoff_90d = (now - timedelta(days=90)).isoformat()
-
-    for table, pid_col in _DOWNSAMPLE_TABLES:
-        rowid_col = 'id' if pid_col is not None else 'rowid'
-        partition = (
-            f"{pid_col}, strftime('%%Y-%%m-%%dT%%H', ts)"
-            if pid_col is not None
-            else "strftime('%%Y-%%m-%%dT%%H', ts)"
-        )
-        await conn.execute(
-            f"""
-            DELETE FROM {table}
-            WHERE ts < ?
-              AND {rowid_col} NOT IN (
-                  SELECT {rowid_col} FROM (
-                      SELECT {rowid_col}, ROW_NUMBER() OVER (
-                          PARTITION BY {partition}
-                          ORDER BY ts DESC
-                      ) AS rn
-                      FROM {table}
-                      WHERE ts < ?
-                  )
-                  WHERE rn = 1
-              )
-            """,
-            (cutoff_7d, cutoff_7d),
-        )
-        await conn.execute(f'DELETE FROM {table} WHERE ts < ?', (cutoff_90d,))
+    now = resolve_now(now)
+    for table, partition_by in _DOWNSAMPLE_TABLES:
+        await apply_retention(conn, table, now=now, partition_by=partition_by)
     await conn.commit()
 
 
@@ -739,10 +823,13 @@ async def get_memory_24h_ago(
     but only if it falls within ±2 hours of the target. Projects whose
     only available rows are far from the 24h mark are absent from the
     result so the UI renders ``—`` rather than a misleading zero delta.
+    The read is bounded to that tolerance window, so its cost does not
+    grow with table history.
     """
     if db is None:
         return {}
-    target = (resolve_now(now) - timedelta(hours=24)).isoformat()
+    target = (resolve_now(now) - timedelta(hours=24)).astimezone(UTC)
+    margin = timedelta(seconds=_24H_TOLERANCE_SECONDS + 1)
     try:
         async with db.execute(
             """
@@ -754,9 +841,16 @@ async def get_memory_24h_ago(
                            ORDER BY ABS(strftime('%s', ts) - strftime('%s', ?)) ASC
                        ) AS rn
                 FROM memory_snapshots
+                WHERE ts >= ? AND ts <= ?
             ) WHERE rn = 1 AND d <= ?
             """,
-            (target, target, _24H_TOLERANCE_SECONDS),
+            (
+                target.isoformat(),
+                target.isoformat(),
+                (target - margin).isoformat(),
+                (target + margin).isoformat(),
+                _24H_TOLERANCE_SECONDS,
+            ),
         ) as cur:
             rows = await cur.fetchall()
     except Exception:
@@ -851,6 +945,45 @@ async def get_curator_sparks(
         'p90': _coerce_series([(r[0], r[3]) for r in rows]),
         'p99': _coerce_series([(r[0], r[4]) for r in rows]),
     }
+
+
+async def get_curator_refusal_spark(
+    db: aiosqlite.Connection | None,
+    *,
+    days: int = 1,
+    now: datetime | None = None,
+) -> dict[str, list]:
+    """Return the trailing-hour deterministic-refusal count over time.
+
+    One ChartData series ({labels, values}) of ``refused_count`` — how many
+    candidates a deterministic curator guard (cancelled-premise blocklist /
+    recon premise registry) refused in the hour before each 10-minute sample.
+    A ``None`` value marks a sample where the ticket window was not read at
+    all, which is distinct from 0 ("read it, nothing was refused").
+
+    Deliberately a separate reader rather than a fifth key on
+    :func:`get_curator_sparks`: that function's 4-key {pending, p50, p90, p99}
+    shape is the established contract consumed by ``shape_curator``, and a
+    refusal count is a different unit (a raw count, not a latency centile or
+    queue depth) sampled over a different window (trailing hour, not
+    point-in-time).
+
+    Returns the empty series when *db* is None or when no rows exist.
+    """
+    if db is None:
+        return dict(_EMPTY_SERIES)
+    since = (resolve_now(now) - timedelta(days=days)).isoformat()
+    try:
+        async with db.execute(
+            'SELECT ts, refused_count FROM curator_refusal_snapshots '
+            'WHERE ts >= ? ORDER BY ts',
+            (since,),
+        ) as cur:
+            rows = await cur.fetchall()
+    except Exception:
+        logger.debug('curator refusal spark query failed', exc_info=True)
+        return dict(_EMPTY_SERIES)
+    return _coerce_series([(r[0], r[1]) for r in rows])
 
 
 async def get_merge_active_series(

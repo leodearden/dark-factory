@@ -5,34 +5,122 @@ import contextlib
 import functools
 import importlib.util
 import inspect
+import json
 import logging
 import re
 import time
 import uuid
 from collections import Counter
-from collections.abc import Mapping, Sequence
+from collections.abc import Awaitable, Iterable, Mapping, Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any, NamedTuple, TypedDict, cast
+from typing import Any, TypedDict, TypeVar
 from urllib.parse import urlparse
 
+import httpx
+from falkordb.asyncio import FalkorDB
 from graphiti_core import Graphiti
+from graphiti_core.cross_encoder.client import CrossEncoderClient
 from graphiti_core.cross_encoder.openai_reranker_client import OpenAIRerankerClient
 from graphiti_core.driver.driver import GraphDriver
 from graphiti_core.driver.falkordb_driver import FalkorDriver
 from graphiti_core.edges import EntityEdge
-from graphiti_core.embedder import OpenAIEmbedder
+from graphiti_core.embedder import EmbedderClient, OpenAIEmbedder
 from graphiti_core.embedder.openai import OpenAIEmbedderConfig
 from graphiti_core.errors import EdgeNotFoundError
 from graphiti_core.errors import NodeNotFoundError as GraphitiCoreNodeNotFoundError
+from graphiti_core.helpers import validate_group_ids
 from graphiti_core.llm_client import OpenAIClient
+from graphiti_core.llm_client.client import LLMClient
 from graphiti_core.llm_client.config import LLMConfig as GraphitiLLMConfig
 from graphiti_core.nodes import EpisodeType, EpisodicNode
+from openai import AsyncOpenAI
 
+from fused_memory.backends.episode_toolcall_leak_scan import (
+    EpisodeToolcallLeakScan,
+    read_episode_toolcall_leaks,
+)
+from fused_memory.backends.exact_episode_window import ExactEpisodeWindowGraphiti
+from fused_memory.backends.falkor_edge_search import FalkorEdgeSearch
+from fused_memory.backends.falkor_entity_edges import bind_entity_endpoints
+from fused_memory.backends.falkor_fulltext import build_query
+from fused_memory.backends.falkor_graph_operations import FalkorGraphOperations
+from fused_memory.backends.falkor_indices import (
+    IndexHeaderShapeError,
+    IndexProvisionResult,
+    IndexRecordShapeError,
+    IndexSpec,
+    await_index_catalog_settled,
+    expected_index_set,
+    normalize_index_records,
+    plan_index_statements,
+    read_index_records,
+    vector_drop_statement,
+    vector_index_properties,
+)
+from fused_memory.backends.falkor_server_settings import (
+    FalkorServerSettings,
+    read_falkor_server_settings,
+    warn_on_shortfalls,
+)
+from fused_memory.backends.falkor_string_bounds import exact_string_upper_bound
+from fused_memory.backends.graph_access import (
+    STORE,
+    FalkorGraphAccess,
+    GraphAccess,
+    OpBoundReader,
+    paged_ro_query,
+)
+from fused_memory.backends.llm_clients import (
+    ForceJsonObjectOpenAIGenericClient,
+    TokenRecordingOpenAIGenericClient,
+)
+from fused_memory.backends.llm_token_usage import (
+    AttributingTokenUsageTracker,
+    TokenMeasurement,
+    measure_llm_tokens,
+)
+from fused_memory.backends.paged_read import (
+    DEFAULT_READ_PAGE_SIZE as _DEFAULT_READ_PAGE_SIZE,
+)
+from fused_memory.backends.paged_read import (
+    INCOMPLETE_CENSUS_UNAVAILABLE as INCOMPLETE_CENSUS_UNAVAILABLE,  # re-export; home is paged_read
+)
+from fused_memory.backends.paged_read import (
+    INCOMPLETE_KINDS,
+    INCOMPLETE_STRUCTURAL_KINDS,
+    PagedRead,
+)
+from fused_memory.backends.paged_read import (
+    INCOMPLETE_PAGE_CAP as INCOMPLETE_PAGE_CAP,  # re-export; home is paged_read
+)
+from fused_memory.backends.paged_read import (
+    INCOMPLETE_SHORT_READ as INCOMPLETE_SHORT_READ,  # re-export; home is paged_read
+)
+from fused_memory.backends.paged_read import (
+    INCOMPLETE_STRUCTURAL_REFUSAL as INCOMPLETE_STRUCTURAL_REFUSAL,  # re-export; home is paged_read
+)
+from fused_memory.backends.paged_read import (
+    MAX_READ_PAGES as _MAX_READ_PAGES,  # noqa: F401 - re-export; home is paged_read  # debt: task 9363
+)
+from fused_memory.backends.paged_read import RESULTSET_SIZE as _RESULTSET_SIZE
+from fused_memory.backends.paged_read import (
+    census_count as _census_count,  # noqa: F401 - re-export; home is paged_read  # debt: task 9363
+)
+from fused_memory.backends.recent_episodes import read_recent_group_episodes
+from fused_memory.backends.relates_to_schema import ACTIVE_EDGE_PREDICATE, active_edge_filter
+from fused_memory.backends.sdk_client_lifecycle import close_wrapped_sdk_clients
+from fused_memory.backends.timeout_budget import await_within
+from fused_memory.config.env_precedence import warn_if_ambient_base_url_is_overridden
 from fused_memory.config.schema import FusedMemoryConfig, OpenAIProviderConfig
+from fused_memory.models.scope import configured_known_projects_map
 from fused_memory.utils.async_utils import gather_or_raise
+from fused_memory.utils.toolcall_xml_leak import has_toolcall_xml_leak
 from fused_memory.utils.validation import canonicalize_project_id
 
 logger = logging.getLogger(__name__)
+
+_T = TypeVar('_T')
 
 
 _MIN_OPENAI_VERSION: tuple[int, ...] = (1, 91, 0)
@@ -120,6 +208,140 @@ def check_openai_responses_api() -> None:
     )
 
 
+def build_llm_client(
+    cfg: FusedMemoryConfig, *, http_client: httpx.AsyncClient | None = None,
+) -> LLMClient | None:
+    """Construct the graphiti LLM client from unified config, or None.
+
+    Returns None when the configured provider block is absent or carries no
+    api_key — the same "run without an LLM" posture ``initialize()`` has always
+    had.
+
+    Deliberately module-level and public: this is the DRIVER-FREE construction
+    seam. Callers that need an LLM client for a single arm (e.g. an evaluation
+    harness building one client per candidate model) must not have to call
+    ``GraphitiBackend.initialize()`` to get one — that would construct a
+    ``_MultiTenantFalkorDriver``, and ``FalkorDriver.__init__`` fire-and-forgets
+    ``build_indices_and_constraints()``, creating indices on a real graph. That
+    is a binding project hazard (docs/prds/falkordb-index-provisioning.md), and
+    a seam that makes it structurally unreachable is a far stronger guarantee
+    than a monkeypatch at every call site.
+
+    ``cfg.llm.client_class`` selects among the OpenAI-shaped clients only; the
+    anthropic branch is unaffected by it.
+
+    Every returned client carries an ``AttributingTokenUsageTracker``, installed
+    here once rather than per arm, so ``measure_llm_tokens`` can attribute its
+    spend on whichever arm is configured.
+
+    ``http_client``, when given, carries every request of an OpenAI-shaped arm
+    (the plan route's gated client, task 9944); the anthropic arm ignores it.
+    """
+    llm_client = _construct_llm_client(cfg, http_client=http_client)
+    if llm_client is not None:
+        llm_client.token_tracker = AttributingTokenUsageTracker()
+    return llm_client
+
+
+def build_embedder(cfg: FusedMemoryConfig) -> OpenAIEmbedder | None:
+    """Construct the graphiti embedder from unified config, or None.
+
+    Returns None when the openai provider block is absent or carries no
+    api_key. Module-level and public for the reason ``build_llm_client`` is: a
+    per-arm caller builds its embedder without constructing a driver.
+    """
+    provider = cfg.embedder.providers.openai
+    if cfg.embedder.provider != 'openai' or provider is None or not provider.api_key:
+        return None
+    embedder = OpenAIEmbedder(
+        config=OpenAIEmbedderConfig(
+            api_key=provider.api_key,
+            embedding_model=cfg.embedder.model,
+            base_url=provider.api_url,
+            embedding_dim=cfg.embedder.dimensions,
+        )
+    )
+    logger.info(f'Graphiti embedder: {cfg.embedder.provider}/{cfg.embedder.model}')
+    return embedder
+
+
+def _construct_llm_client(
+    cfg: FusedMemoryConfig, *, http_client: httpx.AsyncClient | None,
+) -> LLMClient | None:
+    # LLMConfig rejects this at load; a config mutated afterwards is not re-validated.
+    if cfg.llm.structured_output_mode != 'auto' and cfg.llm.client_class != 'openai_generic':
+        logger.warning(
+            f'llm.structured_output_mode={cfg.llm.structured_output_mode!r} is IGNORED: '
+            f'it applies only to llm.client_class="openai_generic", and client_class is '
+            f'{cfg.llm.client_class!r} (provider={cfg.llm.provider!r}). The client being '
+            'built will use its stock structured-output behaviour.'
+        )
+
+    if cfg.llm.provider == 'openai' and cfg.llm.providers.openai:
+        api_key = cfg.llm.providers.openai.api_key
+        if api_key:
+            warn_if_ambient_base_url_is_overridden(
+                cfg.llm.providers.openai.api_url, context='graphiti LLM',
+            )
+            llm_config = GraphitiLLMConfig(
+                api_key=api_key,
+                model=cfg.llm.model,
+                small_model=cfg.llm.model,
+                temperature=cfg.llm.temperature or 0.0,
+                max_tokens=cfg.llm.max_tokens,
+                base_url=cfg.llm.providers.openai.api_url,
+            )
+            sdk_client = (
+                AsyncOpenAI(api_key=api_key, base_url=llm_config.base_url, http_client=http_client)
+                if http_client is not None else None
+            )
+            llm_client: LLMClient
+            # max_tokens= below is load-bearing on both arms, not redundant with llm_config: see
+            # fused-memory/tests/test_local_endpoint_base_url_integration.py::TestGraphitiLLMPathReachesConfiguredEndpoint::test_configured_max_tokens_reaches_the_wire
+            if cfg.llm.client_class == 'openai_generic':
+                generic_cls: type[TokenRecordingOpenAIGenericClient] = (
+                    ForceJsonObjectOpenAIGenericClient
+                    if cfg.llm.structured_output_mode == 'json_object'
+                    else TokenRecordingOpenAIGenericClient
+                )
+                llm_client = generic_cls(
+                    config=llm_config, client=sdk_client, max_tokens=cfg.llm.max_tokens,
+                )
+            else:
+                check_openai_responses_api()
+                llm_client = OpenAIClient(
+                    config=llm_config, client=sdk_client, max_tokens=cfg.llm.max_tokens,
+                )
+            route = ' via the plan route' if http_client is not None else ''
+            logger.info(
+                f'Graphiti LLM: {cfg.llm.provider}/{cfg.llm.model}{route} '
+                f'({type(llm_client).__name__}, max_tokens={cfg.llm.max_tokens})'
+            )
+            return llm_client
+    elif cfg.llm.provider == 'anthropic' and cfg.llm.providers.anthropic:
+        api_key = cfg.llm.providers.anthropic.api_key
+        if api_key:
+            try:
+                from graphiti_core.llm_client.anthropic_client import AnthropicClient
+
+                llm_config = GraphitiLLMConfig(
+                    api_key=api_key,
+                    model=cfg.llm.model,
+                    temperature=cfg.llm.temperature or 0.0,
+                    max_tokens=cfg.llm.max_tokens,
+                )
+                llm_client = AnthropicClient(config=llm_config)
+                logger.info(
+                    f'Graphiti LLM: {cfg.llm.provider}/{cfg.llm.model} '
+                    f'(max_tokens={cfg.llm.max_tokens})'
+                )
+                return llm_client
+            except ImportError:
+                logger.warning('Anthropic client not available for Graphiti')
+
+    return None
+
+
 def _canonicalize_group_args(func):
     """Canonicalize bound ``group_id``/``group_ids`` arguments at method entry.
 
@@ -127,7 +349,7 @@ def _canonicalize_group_args(func):
     GraphitiBackend method taking a project group_id/group_ids must
     canonicalize those ARGUMENTS via α's ``canonicalize_project_id`` before
     the method body runs, so the FalkorDB graph KEY (``_driver_for`` /
-    ``_graph_for``), the node/edge ``group_id`` PROPERTY (graphiti_core's
+    ``graph_access.graph``), the node/edge ``group_id`` PROPERTY (graphiti_core's
     ``client.add_episode``), and any direct-Cypher ``$group_id`` FILTER
     always agree (RCA §4).
 
@@ -185,8 +407,9 @@ def _canonicalize_group_args(func):
 class EdgeDict(TypedDict):
     """Normalised edge dict returned by GraphitiBackend._edge_dict.
 
-    Consumed by get_valid_edges_for_node, get_all_valid_edges,
-    _canonical_facts, and rebuild_entity_from_edges.
+    Consumed by get_all_valid_edges, _canonical_facts, and
+    rebuild_entity_from_edges.  get_valid_edges_for_node returns the dated
+    subtype, DatedEdgeDict.
     """
 
     uuid: str
@@ -194,23 +417,66 @@ class EdgeDict(TypedDict):
     name: str
 
 
-class StaleSummaryResult(NamedTuple):
+class DatedEdgeDict(EdgeDict):
+    """An EdgeDict with the edge's stored ISO-8601 validity window.
+
+    ``valid_at`` / ``invalid_at`` are returned verbatim as FalkorDB holds them,
+    ``None`` when the property is NULL.
+    """
+
+    valid_at: str | None
+    invalid_at: str | None
+
+
+class EdgeWithEndpoints(TypedDict):
+    """A RELATES_TO edge with its endpoint names, as get_edges_by_uuids returns it.
+
+    ``active`` is ``ACTIVE_EDGE_PREDICATE`` evaluated on the edge.
+    """
+
+    uuid: str
+    fact: str
+    source_name: str
+    target_name: str
+    episodes: list[str]
+    active: bool
+
+
+@dataclass(frozen=True, kw_only=True)
+class StaleSummaryResult:
     """Structured return type for detect_stale_with_edges.
 
-    Use named attribute access — the canonical idiom after Task 438/465:
+    - ``stale`` — list of stale entity dicts (each has uuid, name, summary, etc.)
+    - ``all_edges`` — dict[uuid, list[EdgeDict]] of valid edges for every scanned entity
+    - ``total_count`` — total number of entity nodes scanned
+    - ``entities_completeness`` / ``edges_completeness`` — the verdict of the
+      node read and of the edge read.  The two reads are independent, so a
+      partial edge corpus says nothing about the node corpus, and vice versa.
 
-    - ``result.stale`` — list of stale entity dicts (each has uuid, name, summary, etc.)
-    - ``result.all_edges`` — dict[uuid, list[EdgeDict]] of valid edges for every scanned entity
-    - ``result.total_count`` — total number of entity nodes scanned
-
-    Because StaleSummaryResult is a NamedTuple (a tuple subclass), positional
-    unpacking still works at runtime, but named access is the preferred idiom
-    across the codebase.
+    Keyword-only because the two verdicts share a type, so a positional
+    swap would be silent.
     """
 
     stale: list[dict]
     all_edges: dict[str, list[EdgeDict]]
     total_count: int
+    entities_completeness: 'ReadCompleteness'
+    edges_completeness: 'ReadCompleteness'
+
+
+@dataclass(frozen=True, kw_only=True)
+class StaleProbeResult:
+    """Structured return type for detect_stale_dry_run.
+
+    ``stale`` and ``total_count`` mean what they mean on StaleSummaryResult;
+    ``entities_completeness`` is the verdict of the node read.  There is no
+    edge verdict: the probe reads edges per node with
+    ``get_valid_edges_for_node``, never as a whole-graph read.
+    """
+
+    stale: list[dict]
+    total_count: int
+    entities_completeness: 'ReadCompleteness'
 
 
 class NodeNotFoundError(Exception):
@@ -226,22 +492,427 @@ class ActiveEdgesError(Exception):
 
 
 class AmbiguousEntityError(Exception):
-    """Raised when multiple entity nodes share the same name.
+    """Raised when multiple entity nodes share the same name in one graph.
+
+    ONE condition, two callers who differ in what they do about it:
+    - a READ that cannot answer (``resolve_entity_by_name``: which of these
+      did you mean?), and
+    - a WRITE that REFUSES to collapse (``ensure_entity_node`` under
+      ``merge_duplicates=False``: collapsing them is irreversible and is
+      deliberately not a side effect of a repair — adjudicate the duplicates
+      by hand).
 
     The error message includes all matching UUIDs so the caller can
-    disambiguate and call refresh_entity_summary with a specific UUID.
+    disambiguate and call refresh_entity_summary with a specific UUID. The
+    same facts are also carried as STRUCTURED fields — ``.name``,
+    ``.group_id``, ``.uuids`` — so a consumer can name the duplicate-name
+    group without an ad-hoc parse of the message.
+
+    THEY ARE REQUIRED KEYWORD ARGUMENTS, NOT DEFAULTED ONES. A structured
+    field present at one raise site and empty at another is not an invariant
+    a consumer can key off, and this one HAS a consumer that keys off it:
+    ``MemoryService._repair_edge_findings`` composes its whole refusal record
+    out of these three. Permissive defaults would let a future raise site —
+    or any construction from a bare message — book a structurally valid
+    ``'unrepairable'`` reading ``Repair target '' names a duplicate-name
+    group in '': []``: a record that passes every check while carrying no
+    evidence at all, which is the silent degradation INV-4 exists to prevent.
+    Requiring them costs nothing (both raise sites already pass all three)
+    and turns the invariant from documented into enforced.
+
+    ``uuids`` is stored as a tuple: the error is the EVIDENCE for a refusal
+    and must not be mutable.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        name: str,
+        group_id: str,
+        uuids: Iterable[str],
+    ) -> None:
+        super().__init__(message)
+        self.name = name
+        self.group_id = group_id
+        self.uuids = tuple(uuids)
+
+
+class IncompleteEnumerationError(Exception):
+    """Raised when a whole-graph enumeration was STRUCTURALLY incomplete.
+
+    Not "the read failed" — the read was never validly performed.  Either it
+    refused to start (``INCOMPLETE_STRUCTURAL_REFUSAL``: zero queries issued,
+    so the emptiness is fabricated rather than observed) or it ran out of page
+    budget mid-corpus (``INCOMPLETE_PAGE_CAP``: the rows are a PREFIX in
+    ``ORDER BY`` order, not a sample).
+
+    WHY THIS RAISES INSTEAD OF RETURNING THE COLLECTION, which is what made
+    the original defect corrupting rather than merely under-reporting: a
+    caller cannot tell a fabricated empty from a genuinely empty graph, and
+    the consumer downstream is a WRITE.  ``MemoryService.rebuild_entity_summaries``
+    -> ``_rebuild_one`` -> ``all_edges.get(uuid, [])`` -> ``rebuild_entity_from_edges``
+    computes ``'\\n'.join([]) == ''`` and ``update_node_summary`` persists it,
+    blanking a real summary with the *absence of evidence* that the read was
+    never performed.  The ``force=True`` path is the sharpest vector: it does
+    not consult staleness at all, so it writes to every entity returned.
+
+    Deliberately an ``Exception``, never a ``BaseException``: both
+    reconciliation sweeps catch ``Exception`` while re-raising
+    ``CancelledError``/``KeyboardInterrupt``/``SystemExit``, so subclassing
+    ``BaseException`` would escape their handlers and turn a handled per-cycle
+    error into an outage.
+
+    Empirical incompleteness (``INCOMPLETE_CENSUS_UNAVAILABLE``,
+    ``INCOMPLETE_SHORT_READ``) does NOT raise — see the shims for why.
     """
 
 
-def _as_sortable_utc(created_at: datetime | None) -> datetime:
+# Page/census pairs for the paginated whole-graph reads. Each pair shares an
+# IDENTICAL MATCH/WHERE so the two numbers describe the same population and
+# are therefore directly comparable.
+#
+# The ORDER BY must be a TOTAL order over ROWS, not merely over the entity or
+# edge: the undirected edge pattern yields two rows per edge, so `e.uuid`
+# alone would leave that pair free to reshuffle across a page boundary — and a
+# reshuffle at a boundary drops rows permanently and silently.
+_ALL_VALID_EDGES_MATCH = (
+    'MATCH (n:Entity)-[e:RELATES_TO]-() '
+    f'WHERE {ACTIVE_EDGE_PREDICATE} '
+)
+_VALID_EDGE_ROWS_PAGE_TAIL = (
+    'RETURN n.uuid, e.uuid, e.fact, e.name '
+    'ORDER BY e.uuid, n.uuid '
+    'SKIP {skip} LIMIT {limit}'
+)
+_ALL_VALID_EDGES_PAGE_TEMPLATE = _ALL_VALID_EDGES_MATCH + _VALID_EDGE_ROWS_PAGE_TAIL
+_ALL_VALID_EDGES_CENSUS = _ALL_VALID_EDGES_MATCH + 'RETURN count(*)'
+
+# The same population narrowed to facts containing a BOUND substring.
+_VALID_EDGES_MENTIONING_MATCH = (
+    _ALL_VALID_EDGES_MATCH + 'AND e.fact CONTAINS $substring '
+)
+_VALID_EDGES_MENTIONING_PAGE_TEMPLATE = (
+    _VALID_EDGES_MENTIONING_MATCH + _VALID_EDGE_ROWS_PAGE_TAIL
+)
+_VALID_EDGES_MENTIONING_CENSUS = _VALID_EDGES_MENTIONING_MATCH + 'RETURN count(*)'
+
+# Entity nodes. Here `n.uuid` alone IS a total order — one row per node, and
+# node uuids are unique — unlike the edge case above.
+_ENTITY_NODES_MATCH = 'MATCH (n:Entity) '
+_ENTITY_NODES_PAGE_TEMPLATE = (
+    _ENTITY_NODES_MATCH
+    + 'RETURN n.uuid, n.name, n.summary '
+    'ORDER BY n.uuid '
+    'SKIP {skip} LIMIT {limit}'
+)
+_ENTITY_NODES_CENSUS = _ENTITY_NODES_MATCH + 'RETURN count(*)'
+
+# Embedded entity nodes, for the stale-embedding read (task 4869). `n.uuid` is
+# total for the reason above. The page cut happens in WITH, before RETURN
+# projects the vector, so each page sorts node refs and materialises only
+# page_size vectors rather than carrying every matched vector through the sort.
+_EMBEDDED_ENTITY_NODES_MATCH = 'MATCH (n:Entity) WHERE n.name_embedding IS NOT NULL '
+_EMBEDDED_ENTITY_NODES_PAGE_TEMPLATE = (
+    _EMBEDDED_ENTITY_NODES_MATCH
+    + 'WITH n ORDER BY n.uuid SKIP {skip} LIMIT {limit} '
+    'RETURN n.uuid, n.name, n.name_embedding'
+)
+_EMBEDDED_ENTITY_NODES_CENSUS = _EMBEDDED_ENTITY_NODES_MATCH + 'RETURN count(*)'
+
+# Embedded edges, for the stale-embedding read (task 4869), with the same late
+# vector projection. Here `e.uuid` alone IS total, unlike _ALL_VALID_EDGES: the
+# DIRECTED pattern yields exactly one row per edge, and RELATES_TO uuids are
+# unique graph-wide (tasks 2207/2210, the invariant get_all_valid_edges' dedup
+# rests on). No invalid_at filter: superseded edges still need re-embedding.
+_EMBEDDED_EDGES_MATCH = (
+    'MATCH (n)-[e:RELATES_TO]->(m) WHERE e.fact_embedding IS NOT NULL '
+)
+_EMBEDDED_EDGES_PAGE_TEMPLATE = (
+    _EMBEDDED_EDGES_MATCH
+    + 'WITH e ORDER BY e.uuid SKIP {skip} LIMIT {limit} '
+    'RETURN e.uuid, e.name, e.fact_embedding'
+)
+_EMBEDDED_EDGES_CENSUS = _EMBEDDED_EDGES_MATCH + 'RETURN count(*)'
+
+# Edges whose valid_at falls in a window (task 4869). `e.uuid` is total for the
+# directed-pattern reason given at _EMBEDDED_EDGES_MATCH. No vector here, so the
+# plain RETURN-then-ORDER shape suffices. The upper bound goes through
+# exact_string_upper_bound because FalkorDB's RANGE index over-returns on a
+# string `<=` (task 7543).
+_EDGES_IN_VALID_AT_WINDOW_MATCH = (
+    'MATCH ()-[e:RELATES_TO]->() '
+    'WHERE e.valid_at >= $start AND '
+    + exact_string_upper_bound('e.valid_at', 'end', inclusive=True)
+    + ' '
+)
+_EDGES_IN_VALID_AT_WINDOW_PAGE_TEMPLATE = (
+    _EDGES_IN_VALID_AT_WINDOW_MATCH
+    + 'RETURN e.uuid, e.fact, e.name, e.valid_at, e.invalid_at '
+    'ORDER BY e.uuid '
+    'SKIP {skip} LIMIT {limit}'
+)
+_EDGES_IN_VALID_AT_WINDOW_CENSUS = _EDGES_IN_VALID_AT_WINDOW_MATCH + 'RETURN count(*)'
+
+# Ids starting with a uuid prefix, for services/id_resolver.py (task 5323).
+# `$prefix`/`$upper` are bound, never interpolated. The half-open range
+# [$prefix, $upper) lets FalkorDB use the uuid RANGE index; STARTS WITH is
+# load-bearing, because that index can over-return on a string `<` (see
+# plans/falkordb-resultset-cap-audit.md, section 'String < / <= on
+# RANGE-indexed properties (task 7543)'). No invalid_at filter: a superseded
+# edge's uuid is still an id a prefix can cite. The edge pattern is DIRECTED
+# for the one-row-per-edge reason given at _EMBEDDED_EDGES_MATCH.
+_ENTITY_UUID_PREFIX_MATCH = (
+    'MATCH (n:Entity) '
+    'WHERE n.uuid >= $prefix AND n.uuid < $upper AND n.uuid STARTS WITH $prefix '
+)
+_ENTITY_UUID_PREFIX_PAGE_TEMPLATE = (
+    _ENTITY_UUID_PREFIX_MATCH
+    + 'RETURN n.uuid, n.name ORDER BY n.uuid SKIP {skip} LIMIT {limit}'
+)
+_ENTITY_UUID_PREFIX_CENSUS = _ENTITY_UUID_PREFIX_MATCH + 'RETURN count(*)'
+
+_EDGE_UUID_PREFIX_MATCH = (
+    'MATCH ()-[e:RELATES_TO]->() '
+    'WHERE e.uuid >= $prefix AND e.uuid < $upper AND e.uuid STARTS WITH $prefix '
+)
+_EDGE_UUID_PREFIX_PAGE_TEMPLATE = (
+    _EDGE_UUID_PREFIX_MATCH
+    + 'RETURN e.uuid, e.fact ORDER BY e.uuid SKIP {skip} LIMIT {limit}'
+)
+_EDGE_UUID_PREFIX_CENSUS = _EDGE_UUID_PREFIX_MATCH + 'RETURN count(*)'
+
+
+@dataclass(frozen=True)
+class ReadCompleteness:
+    """The completeness pair a consumer reports for one whole-graph read.
+
+    A PagedRead without ``rows``, which would hold the corpus a second time,
+    and without ``reason``, which is an unstable diagnostic.  Gate on
+    ``.complete is True``.
+    """
+
+    complete: bool
+    incomplete_kind: str | None
+
+    def __post_init__(self) -> None:
+        if (self.incomplete_kind is None) != self.complete:
+            raise ValueError(
+                'ReadCompleteness: incomplete_kind must be None exactly when '
+                f'complete is True, got complete={self.complete!r} '
+                f'incomplete_kind={self.incomplete_kind!r}'
+            )
+        if self.incomplete_kind is not None and self.incomplete_kind not in INCOMPLETE_KINDS:
+            raise ValueError(
+                f'ReadCompleteness: unknown incomplete_kind={self.incomplete_kind!r}; '
+                f'expected one of {sorted(INCOMPLETE_KINDS)}'
+            )
+
+    @classmethod
+    def of(cls, paged: PagedRead) -> 'ReadCompleteness':
+        return cls(complete=paged.complete, incomplete_kind=paged.incomplete_kind)
+
+    @staticmethod
+    def result_keys(
+        prefix: str, verdict: 'ReadCompleteness | None'
+    ) -> dict[str, bool | str | None]:
+        """``<prefix>_complete`` and ``<prefix>_incomplete_kind`` for a result dict.
+
+        A None verdict means the read was not issued, and maps both keys to None.
+        """
+        if verdict is None:
+            return {f'{prefix}_complete': None, f'{prefix}_incomplete_kind': None}
+        return {
+            f'{prefix}_complete': verdict.complete,
+            f'{prefix}_incomplete_kind': verdict.incomplete_kind,
+        }
+
+
+def apply_incompleteness_policy(
+    paged: PagedRead,
+    *,
+    method: str,
+    group_id: str,
+    returned_count: int,
+    noun: str,
+    consequence: str,
+    log: logging.Logger = logger,
+) -> None:
+    """Apply the SPLIT incompleteness policy to an enumeration's PagedRead.
+
+    ONE implementation, shared by every caller of ``paged_ro_query`` that
+    returns a plain collection (the two task-4340 back-compat shims and the
+    task-4869 reads) AND by every consumer that calls an ``enumerate_*``
+    method directly, because the policy is a single decision and not a
+    per-method opinion: copies drift, and the drift would be silent in exactly
+    the direction that matters — a caller that forgot to raise takes a
+    fabricated empty for an answer and the write-back path blanks summaries
+    with it.
+
+    THE SEAM DID NOT MOVE.  This function was once described here as the
+    single seam that the follow-up ticket tkt_0RSJP8CH1M9GAAJTABV8FZB4AH
+    (wire the completeness signal through to consumers) would have to move
+    when the policy migrated to the consumer.  Task 4386 discharged that
+    ticket, and the policy was SHARED rather than migrated: it was promoted
+    to public and is applied UNCHANGED by each whole-graph consumer, at its
+    own call site or through a checked read (``read_entity_nodes_checked``,
+    ``read_all_valid_edges_checked``).  The consumers are listed in one place,
+    the "Consumers now act on it" section of
+    plans/falkordb-resultset-cap-audit.md.  Migrating would
+    have meant one hand-written copy of the raise/warn decision per consumer
+    — exactly the drift the paragraph above names, at consumer scale, and
+    silent in the corrupting direction.  What moved to the consumers is the
+    REPORTING of the signal, not the DECISION about it; the ``log``
+    parameter below exists for the same reason, so a
+    sweep's warning surfaces with the rest of its cycle's diagnostics without
+    the policy itself being duplicated.
+
+    PUBLIC because ``enumerate_*`` never raises: a consumer that switches to
+    one for the completeness signal must re-apply this policy itself, or it
+    silently drops the fail-closed structural guard the shims provide and
+    hands a fabricated-empty corpus onward as a clean read.  Calling this from
+    each consumer keeps the raise/warn split a single implementation instead
+    of one hand-written copy per consumer — which is the drift the paragraph
+    above warns about, at consumer scale.
+
+      STRUCTURAL (``INCOMPLETE_STRUCTURAL_KINDS``) -> raise
+      ``IncompleteEnumerationError``.  Deterministic, non-transient, and
+      unreachable at the shipped defaults, so a raise here cannot flap.
+
+      EMPIRICAL (census unavailable, or a short read) -> WARN naming the
+      numbers and return what was fetched.  Transient-capable on a graph
+      under continuous write; raising would take the live rebuild down for
+      something that self-heals next cycle.
+
+    Args:
+        paged: The PagedRead the enumeration returned.
+        method: Calling method's name, for the message an operator reads.
+        group_id: Graph the read targeted.
+        returned_count: Size of the collection the caller would return.
+        noun: What ``returned_count`` counts, e.g. ``'entities'``/``'nodes'``.
+        consequence: Method-specific clause naming what must NOT be done with
+            a structurally incomplete result, appended to the raise message.
+        log: Logger for the EMPIRICAL warning.  Defaults to this module's
+            logger, so the shims are unaffected; a reconciliation sweep passes
+            its own injected logger so the one message about a truncated
+            corpus surfaces alongside the rest of that cycle's diagnostics
+            rather than detached under the backend module.
+
+    Raises:
+        IncompleteEnumerationError: ``paged`` is structurally incomplete.
+    """
+    if paged.incomplete_kind in INCOMPLETE_STRUCTURAL_KINDS:
+        raise IncompleteEnumerationError(
+            f'{method}(group_id={group_id!r}): the enumeration was '
+            f'structurally incomplete '
+            f'(incomplete_kind={paged.incomplete_kind!r}), so the '
+            f'{returned_count} {noun} it would have returned are not an '
+            f'answer and {consequence}. {paged.reason}'
+        )
+    if not paged.complete:
+        log.warning(
+            '%s(group_id=%r): enumeration INCOMPLETE — returning %d rows as '
+            '%d %s, but %s. rows_seen=%s expected_rows=%s',
+            method, group_id, paged.rows_seen, returned_count, noun,
+            paged.reason, paged.rows_seen, paged.expected_rows,
+        )
+
+
+async def read_entity_nodes_checked(
+    backend: 'GraphitiBackend', *, group_id: str, log: logging.Logger = logger
+) -> tuple[list[dict], ReadCompleteness]:
+    """Every entity node, with the policy applied and the read's verdict returned.
+
+    The one place ``enumerate_entity_nodes`` is wired to
+    ``apply_incompleteness_policy``; ``list_entity_nodes`` is this without the
+    verdict.  ``log`` receives the EMPIRICAL warning.
+
+    Raises:
+        IncompleteEnumerationError: The read was structurally incomplete.
+    """
+    nodes, paged = await backend.enumerate_entity_nodes(group_id=group_id)
+    apply_incompleteness_policy(
+        paged,
+        method='enumerate_entity_nodes',
+        group_id=group_id,
+        returned_count=len(nodes),
+        noun='nodes',
+        consequence='must not drive a staleness verdict or a summary rewrite',
+        log=log,
+    )
+    return nodes, ReadCompleteness.of(paged)
+
+
+async def read_all_valid_edges_checked(
+    backend: 'GraphitiBackend', *, group_id: str, log: logging.Logger = logger
+) -> tuple[dict[str, list[EdgeDict]], ReadCompleteness]:
+    """Every valid edge by entity uuid, with the policy applied and the read's verdict returned.
+
+    The one place ``enumerate_all_valid_edges`` is wired to
+    ``apply_incompleteness_policy``; ``get_all_valid_edges`` is this without
+    the verdict.  ``log`` receives the EMPIRICAL warning.
+
+    Raises:
+        IncompleteEnumerationError: The read was structurally incomplete.
+    """
+    grouped, paged = await backend.enumerate_all_valid_edges(group_id=group_id)
+    apply_incompleteness_policy(
+        paged,
+        method='enumerate_all_valid_edges',
+        group_id=group_id,
+        returned_count=len(grouped),
+        noun='entities',
+        consequence='must not be written back',
+        log=log,
+    )
+    return grouped, ReadCompleteness.of(paged)
+
+
+def _first_row_per_uuid(rows: list[list], *, reader: str) -> list[list]:
+    """Keep the first row for each column-0 uuid, in order.
+
+    Paging introduces duplicates a single query never could.  Each page is a
+    separate query against a graph under concurrent write, so a row inserted
+    with a uuid sorting BEFORE the current offset shifts every later row up by
+    one, and the next page's SKIP re-returns the previous page's last row.  A
+    consumer of an unpaginated read was entitled to assume a uuid never
+    repeats; every paged reader restores that guarantee here.  Rows dropped
+    are counted at DEBUG under ``reader``, the calling method's name.
+    """
+    seen: set = set()
+    unique: list[list] = []
+    for row in rows:
+        if row[0] in seen:
+            continue
+        seen.add(row[0])
+        unique.append(row)
+    if len(unique) < len(rows):
+        logger.debug(
+            '%s: %d row(s) repeated a uuid already seen, most likely re-emitted '
+            'across a SKIP/LIMIT boundary by a concurrent insert; kept the '
+            'first-seen row for each',
+            reader, len(rows) - len(unique),
+        )
+    return unique
+
+
+def _embedding_dim(raw) -> int:
+    """Dimension of a raw vector property, parsed from its ``<v1, v2, ...>`` text.
+
+    FalkorDB's ``size()`` does not work on Vectorf32, so the dimension is
+    counted client-side.
+    """
+    if isinstance(raw, bytes):
+        raw = raw.decode('utf-8', errors='replace')
+    return len(str(raw).strip('<>').split(', '))
+
+
+def _as_sortable_utc(created_at: datetime) -> datetime:
     """Coerce an episode's created_at to a tz-aware UTC datetime for sorting.
 
     Naive (tzinfo-less) datetimes are assumed to already be UTC rather than
-    raising on naive-vs-aware comparison; None sorts as the minimum possible
-    value (oldest/unknown), landing last in a descending sort.
+    raising on naive-vs-aware comparison.
     """
-    if created_at is None:
-        return datetime.min.replace(tzinfo=UTC)
     if created_at.tzinfo is None:
         return created_at.replace(tzinfo=UTC)
     return created_at.astimezone(UTC)
@@ -259,7 +930,7 @@ def _normalize_fact_for_grouping(fact: str | None) -> str:
 
 
 class _MultiTenantFalkorDriver(FalkorDriver):
-    """FalkorDriver that suppresses auto-indexing.
+    """FalkorDriver that suppresses auto-indexing and hardens fulltext queries.
 
     Upstream ``__init__`` schedules ``build_indices_and_constraints()``
     against ``_database`` as a fire-and-forget task.  In multi-tenant
@@ -268,18 +939,233 @@ class _MultiTenantFalkorDriver(FalkorDriver):
     CREATE INDEX commands from saturating FalkorDB's single-threaded
     execution.
 
+    ``build_fulltext_query`` is overridden (task 3334) because upstream's
+    assembly emits operands RediSearch cannot parse, which dead-lettered the
+    ``add_episode`` write path — dead-letter 9950, plus an identical 2026-04-02
+    occurrence.  See :mod:`fused_memory.backends.falkor_fulltext` for the root
+    cause and the empirical validation.
+
     ``clone()`` is overridden to return another ``_MultiTenantFalkorDriver``
-    so cloned per-graph drivers also suppress auto-indexing.
+    so cloned per-graph drivers also suppress auto-indexing — and, since task
+    3334, so they inherit the fulltext hardening too.  That matters more than it
+    looks: every per-group driver handed out by ``_driver_for()`` /
+    ``_client_for()`` comes from ``clone()``, including the one behind
+    ``get_relevant_nodes``' per-node dedup query on the ``add_episode`` write
+    path, which is exactly where 9950 originated.  If ``clone()`` ever returns a
+    plain ``FalkorDriver`` again, the hardening silently stops applying
+    everywhere that matters while the unit tests still pass.
+
+    ``search_interface`` is set (task 6238) so graphiti's edge search runs
+    Cypher FalkorDB can plan over the provisioned indices; see
+    :mod:`fused_memory.backends.falkor_edge_search`.  It is a class attribute, so
+    every ``clone()`` carries it on both the read and the write path.
+
+    ``graph_operations_interface`` is set (task 7714) so graphiti's edge
+    get-by-uuid(s) runs Cypher FalkorDB can plan; see
+    :mod:`fused_memory.backends.falkor_graph_operations`.  It is a class
+    attribute, so every ``clone()`` carries it.
     """
+
+    search_interface = FalkorEdgeSearch()
+    graph_operations_interface = FalkorGraphOperations()
+
+    def __init__(
+        self,
+        *,
+        host: str = 'localhost',
+        port: int = 6379,
+        password: str | None = None,
+        socket_timeout: float | None = None,
+        falkor_db: FalkorDB | None = None,
+        database: str = 'default_db',
+    ):
+        if falkor_db is None:
+            falkor_db = FalkorDB(
+                host=host, port=port, password=password, socket_timeout=socket_timeout,
+            )
+        super().__init__(falkor_db=falkor_db, database=database)
 
     async def build_indices_and_constraints(self, delete_existing=False):
         pass
 
-    def clone(self, database: str) -> 'GraphDriver':
+    def build_fulltext_query(
+        self,
+        query: str,
+        group_ids: list[str] | None = None,
+        max_query_length: int = 128,
+    ) -> str:
+        """Assemble a RediSearch fulltext query that the parser will accept.
+
+        Upstream's version emits operands RediSearch cannot parse, which
+        dead-lettered the ``add_episode`` write path (dead-letter 9950, plus an
+        identical 2026-04-02 occurrence).  The reported error —
+        ``Syntax error at offset N near <word>`` — names the token *preceding*
+        the fault, so it reads as a reserved-word collision; it is not one.  See
+        :mod:`fused_memory.backends.falkor_fulltext` for the full root cause.
+
+        CHANGED vs upstream (both only ever *remove* unparseable operands, so
+        recall for every query that already worked is unchanged):
+
+        * tokens containing no alphanumeric character are dropped — they are
+          reduced to nothing by RediSearch's own tokenizer, which leaves the
+          ``|`` union operator with no right-hand operand;
+        * an empty term list short-circuits to ``''`` instead of emitting the
+          equally-unparseable empty operand group ``()``;
+        * ``\\``, ``"`` and ``-`` are escaped inside the ``(@group_id:"...")``
+          filter — upstream's comment claims bare quoting handles hyphens, which
+          was measured false against a live FalkorDB.
+
+        PRESERVED from upstream, deliberately:
+
+        * ``validate_group_ids`` is still called first, so graphiti's fail-fast
+          on invalid group_ids is not silently lost;
+        * ``self.sanitize()`` still does the character-class stripping — only
+          term assembly is replaced, so the rules stay upstream's;
+        * ``STOPWORDS`` is imported rather than re-declared;
+        * the over-length word-count arithmetic, quirks included;
+        * ``''`` as the "no query" sentinel, which every fulltext caller in
+          ``graphiti_core.search.search_utils`` already short-circuits on.
+        """
+        validate_group_ids(group_ids)
+        return build_query(self.sanitize(query), group_ids, max_query_length)
+
+    def clone(self, database: str) -> '_MultiTenantFalkorDriver':
         if database == self._database:
             return self
         cloned = _MultiTenantFalkorDriver(falkor_db=self.client, database=database)
         return cloned
+
+
+# The one copy of the ``uuid=`` contract that ``GraphitiBackend.add_episode``
+# carries to its caller — interpolated into BOTH failure messages that seam
+# emits (the content-discard warning and the translated not-found), and pointed
+# at, not restated, by that method's docstring. Verified against graphiti_core
+# 0.28.2, ``graphiti_core/graphiti.py::Graphiti.add_episode``.
+_UUID_MEANS_LOAD = (
+    "A non-None uuid= selects graphiti_core's LOAD branch "
+    '(EpisodicNode.get_by_uuid), so it can only name an episode that ALREADY '
+    'exists, never one to create under that id. To create a NEW episode pass '
+    'uuid=None and read the minted uuid off result.episode.uuid.'
+)
+
+
+# The one copy of the survivor-ranking rule, shared by BOTH ranking methods —
+# ``find_duplicate_entity_nodes`` (exact name) and
+# ``find_entity_nodes_by_name_substring`` (substring). Module-level for the same
+# reason ``_UUID_MEANS_LOAD`` above is: it is a contract several sites inside the
+# class must express identically, and a constant is the only way to say so once.
+#
+# INVARIANT: the two methods must order IDENTICALLY. Each feeds a destructive
+# merge that keeps rows[0] and folds every other row into it, so a divergence
+# silently leaves the two paths keeping different survivors. Copying this clause
+# instead of sharing it is precisely the drift that produced task 4986's loss
+# mode 3 (``expired_at`` added to one SET list and not its twin), and that task
+# 5264 reproduced when it cloned the then-current MENTIONS-blind ranking into a
+# second method. A test importing these constants can enforce the invariant; two
+# docstrings promising each other cannot. The ordering itself is defined once, by
+# _PROVENANCE_RANK_KEYS below: the Cypher ORDER BY and the Python _survivor_first
+# are both renderings of it. The default test run checks the Python sort against
+# openCypher's ORDER BY semantics; only `-m integration` runs
+# tests/test_write_time_identity.py::TestEnumerateRankedEntityNodesLiveFalkorDB,
+# which checks the two agree on a real server.
+_PROVENANCE_RANK_CLAUSE = (
+    f'OPTIONAL MATCH (n)-[e:RELATES_TO]-() WHERE {ACTIVE_EDGE_PREDICATE} '
+    'WITH n, count(DISTINCT e) AS edge_count '
+    'OPTIONAL MATCH (:Episodic)-[m:MENTIONS]->(n) '
+    'WITH n, edge_count, count(DISTINCT m) AS mentions_count '
+)
+
+
+@dataclass(frozen=True)
+class _RankKey:
+    """One survivor-ordering key: the expression ORDER BY sorts on, and the
+    row-dict key the same value comes back under."""
+
+    cypher: str
+    column: str
+    descending: bool
+
+
+# The ordering the clause above exists to make possible. Kept adjacent to it so
+# the projection and the sort key cannot be updated apart.
+_PROVENANCE_RANK_KEYS = (
+    _RankKey('provenance_rank', 'provenance_rank', descending=True),
+    _RankKey('n.created_at', 'created_at', descending=False),
+    _RankKey('n.uuid', 'uuid', descending=False),
+)
+_PROVENANCE_RANK_ORDER = 'ORDER BY ' + ', '.join(
+    f'{key.cypher} {"DESC" if key.descending else "ASC"}' for key in _PROVENANCE_RANK_KEYS
+)
+
+
+class SurvivorRankTypeError(TypeError):
+    """A survivor-rank column whose non-NULL values mix types Python cannot
+    order against each other, although Cypher's ORDER BY would.
+
+    ``column`` and ``value_types`` (sorted type names) are required keyword
+    arguments, carried as fields for the reason ``AmbiguousEntityError``
+    carries its own.
+    """
+
+    def __init__(self, *, column: str, value_types: Iterable[str]) -> None:
+        self.column = column
+        self.value_types = tuple(sorted(value_types))
+        super().__init__(
+            f'cannot rank rows survivor-first by {column!r}: its non-NULL values '
+            f'mix the types {list(self.value_types)}'
+        )
+
+
+def _survivor_first(rows: list[dict]) -> list[dict]:
+    """Return *rows* in ``_PROVENANCE_RANK_ORDER``'s order, survivor first.
+
+    One stable pass per key, least significant first. NULL sorts as the
+    largest value, openCypher's rule and FalkorDB's (measured 2026-10-12): last
+    under ASC, first under DESC.
+
+    Raises:
+        SurvivorRankTypeError: a key column mixes non-NULL value types.
+    """
+    ordered = list(rows)
+    for key in reversed(_PROVENANCE_RANK_KEYS):
+        try:
+            ordered.sort(
+                key=lambda row, column=key.column: (row[column] is None, row[column]),
+                reverse=key.descending,
+            )
+        except TypeError as exc:
+            raise SurvivorRankTypeError(
+                column=key.column,
+                value_types={
+                    type(row[key.column]).__name__
+                    for row in ordered
+                    if row[key.column] is not None
+                },
+            ) from exc
+    return ordered
+
+
+# Same-group entity nodes with their provenance rank, for the task-family census
+# (task 5662). The page is cut over non-aggregated `n` in total uuid order, and
+# only then is the rank aggregated, per page.
+_RANKED_ENTITY_NODES_MATCH = 'MATCH (n:Entity) WHERE n.group_id = $group_id '
+_RANKED_ENTITY_NODES_PAGE_TEMPLATE = (
+    _RANKED_ENTITY_NODES_MATCH
+    + 'WITH n ORDER BY n.uuid SKIP {skip} LIMIT {limit} '
+    + _PROVENANCE_RANK_CLAUSE
+    + 'RETURN n.uuid, n.name, n.created_at, edge_count, mentions_count, '
+    'edge_count + mentions_count AS provenance_rank'
+)
+_RANKED_ENTITY_NODES_CENSUS = _RANKED_ENTITY_NODES_MATCH + 'RETURN count(*)'
+
+
+def _derive_registered_graph_ids(config: FusedMemoryConfig) -> frozenset[str]:
+    """The provisioning scope: the ids of models/scope.py::configured_known_projects_map.
+
+    Derived here, by the same rule, because GraphitiBackend is built inside
+    MemoryService before server/main.py's registry snapshot exists.
+    """
+    return frozenset(configured_known_projects_map(config.taskmaster))
 
 
 class GraphitiBackend:
@@ -288,21 +1174,141 @@ class GraphitiBackend:
     FalkorDB is multi-tenant: each project's data lives in its own graph
     (named after the project_id / group_id).  The driver is cloned per-request
     so every operation targets the correct graph.
+
+    TIMEOUT POSTURE.  Every budgeted read and write follows the rule stated in
+    ``backends/timeout_budget.py``.  Raw Cypher is budgeted by the
+    ``GraphHandle`` that :attr:`graph_access` resolves
+    (``backends/graph_access.py``), and graph listings by its
+    ``GraphAccess.list_graphs``; graphiti_core calls go through
+    :meth:`_timed_read` / :meth:`_timed_write`.  The one exception is index
+    provisioning (``_ensure_indices``, ``provision_registered_graphs``): it
+    runs on its own ``_index_provision_timeout`` budget and never raises, per
+    docs/prds/falkordb-index-provisioning.md D4-D6.
     """
 
-    def __init__(self, config: FusedMemoryConfig):
+    def __init__(
+        self,
+        config: FusedMemoryConfig,
+        *,
+        registered_graph_ids: Iterable[str] | None = None,
+    ):
         self.config = config
+        self._registered_graph_ids: frozenset[str] = (
+            _derive_registered_graph_ids(config)
+            if registered_graph_ids is None
+            else frozenset(canonicalize_project_id(g) for g in registered_graph_ids)
+        )
         self.client: Graphiti | None = None
         self._driver: FalkorDriver | None = None
+        self._graph_access: GraphAccess | None = None
         self._read_timeout: float = config.queue.backend_read_timeout_seconds
         self._write_timeout: float = config.queue.backend_write_timeout_seconds
+        # First-write provisioning runs INSIDE the triggering write's own budget
+        # (the durable queue's whole-write wait_for), so it gets the read budget:
+        # spending the write budget there would let a hung index read time out
+        # the very write it must never fail.
+        self._index_provision_timeout: float = self._read_timeout
         self._indexed_graphs: set[str] = set()
         self._cloned_drivers: dict[str, GraphDriver] = {}
         self._identity_locks: dict[str, asyncio.Lock] = {}
+        # Guards ensure_indices' read-diff-write critical section, one Lock per
+        # graph.  Deliberately SEPARATE from _identity_locks: asyncio.Lock is not
+        # reentrant, and γ's first-write choke point provisions from a write
+        # path that may already hold _identity_lock_for(group_id) —
+        # reusing that lock would deadlock rather than serialize.
+        self._index_provision_locks: dict[str, asyncio.Lock] = {}
         self._llm_client = None
         self._embedder = None
         self._cross_encoder = None
         self._group_clients: dict[str, Graphiti] = {}
+
+    @classmethod
+    def with_driver(
+        cls,
+        config: FusedMemoryConfig,
+        driver: FalkorDriver,
+        *,
+        registered_graph_ids: Iterable[str],
+        llm_client: LLMClient | None = None,
+        embedder: EmbedderClient | None = None,
+        cross_encoder: CrossEncoderClient | None = None,
+        graph_access: GraphAccess | None = None,
+    ) -> 'GraphitiBackend':
+        """A backend over *driver* and the given sub-clients, wired without ``initialize()``.
+
+        No provisioning sweep, identity scan or server-settings read runs, and no
+        base ``client`` is built: methods that need one raise until it is assigned.
+        The registry is required because the derived one names real project graphs.
+        The backend takes ownership: ``close()`` releases the driver and sub-clients.
+
+        An injected *graph_access* serves every raw Cypher call until ``close()``;
+        graphiti_core calls still run over *driver*.
+        """
+        backend = cls(config, registered_graph_ids=registered_graph_ids)
+        backend._attach(
+            driver,
+            llm_client=llm_client,
+            embedder=embedder,
+            cross_encoder=cross_encoder,
+            graph_access=graph_access,
+        )
+        return backend
+
+    def _attach(
+        self,
+        driver: FalkorDriver,
+        *,
+        llm_client: LLMClient | None,
+        embedder: EmbedderClient | None,
+        cross_encoder: CrossEncoderClient | None,
+        graph_access: GraphAccess | None,
+    ) -> None:
+        self._driver = driver
+        self._graph_access = graph_access
+        self._llm_client = llm_client
+        self._embedder = embedder
+        self._cross_encoder = cross_encoder
+
+    @property
+    def graph_access(self) -> GraphAccess:
+        """The provider every raw Cypher call resolves its graph through.
+
+        The injected one, else a budgeted view over the CURRENT driver, so the
+        driver stays the one owner of the connection.
+        """
+        if self._graph_access is not None:
+            return self._graph_access
+        return FalkorGraphAccess(
+            self._require_driver(),
+            read_budget_s=self._read_timeout,
+            write_budget_s=self._write_timeout,
+        )
+
+    @property
+    def registered_graph_ids(self) -> frozenset[str]:
+        """The graphs this backend provisions — PRD D5, docs/prds/falkordb-index-provisioning.md."""
+        return self._registered_graph_ids
+
+    def token_probe(self) -> contextlib.AbstractAsyncContextManager[TokenMeasurement]:
+        """Measure the LLM tokens the calling asyncio context spends inside the window.
+
+        ``_llm_client`` is shared by ``self.client`` and every ``_client_for``
+        clone, which is why attribution is by context, never by tracker delta
+        or ``reset()``.
+        """
+        return measure_llm_tokens(self._llm_client)
+
+    async def _timed_read(self, awaitable: Awaitable[_T], op: str) -> _T:
+        """``await_within`` under this backend's READ budget."""
+        return await await_within(
+            awaitable, store=STORE, op=op, budget_s=self._read_timeout,
+        )
+
+    async def _timed_write(self, awaitable: Awaitable[_T], op: str) -> _T:
+        """``await_within`` under this backend's WRITE budget."""
+        return await await_within(
+            awaitable, store=STORE, op=op, budget_s=self._write_timeout,
+        )
 
     # --- Per-request driver routing ---
 
@@ -329,9 +1335,9 @@ class GraphitiBackend:
         graphiti.py:889-890) — since that condition is never true for a
         per-group client, the shared-driver mutation race that misroutes
         concurrent cross-group writes is structurally unreachable here.
-        The llm_client/embedder/cross_encoder sub-clients are shared (hoisted
-        in ``initialize()``) across every per-group client and the base
-        ``self.client``.
+        The llm_client/embedder/cross_encoder sub-clients are shared (attached
+        by ``initialize()`` or ``with_driver()``) across every per-group client
+        and the base ``self.client``.
 
         ``_group_clients`` is unbounded and never evicted, mirroring
         ``_cloned_drivers``/``_identity_locks`` above — safe because
@@ -358,11 +1364,14 @@ class GraphitiBackend:
         ``graphiti_max_coroutines`` (each call's own internal fan-out) — by
         default 3 × 5 = 15 concurrent OpenAI calls at most, unchanged by
         this per-group cache.
+
+        Per-group clients are ``ExactEpisodeWindowGraphiti`` so add_episode's
+        previous-episode read is exact (task 7543).
         """
         cached = self._group_clients.get(group_id)
         if cached is not None:
             return cached
-        client = Graphiti(
+        client = ExactEpisodeWindowGraphiti(
             graph_driver=self._driver_for(group_id),
             llm_client=self._llm_client,
             embedder=self._embedder,
@@ -371,11 +1380,6 @@ class GraphitiBackend:
         )
         self._group_clients[group_id] = client
         return client
-
-    def _graph_for(self, group_id: str) -> Any:
-        """Return the FalkorGraph object for *group_id* (for direct Cypher)."""
-        driver = self._require_driver()
-        return driver._get_graph(group_id)
 
     @_canonicalize_group_args
     def _identity_lock_for(self, group_id: str) -> asyncio.Lock:
@@ -404,87 +1408,142 @@ class GraphitiBackend:
             self._identity_locks[group_id] = lock
         return lock
 
+    def _index_provision_lock_for(self, group_id: str) -> asyncio.Lock:
+        """Return the per-graph index-provisioning lock, creating it lazily.
+
+        Same shape as :meth:`_identity_lock_for`, over the separate
+        ``_index_provision_locks`` registry (see ``__init__`` for why sharing the
+        identity lock would deadlock).  Undecorated: callers pass canonical ids.
+        """
+        lock = self._index_provision_locks.get(group_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._index_provision_locks[group_id] = lock
+        return lock
+
     def _require_driver(self) -> FalkorDriver:
         if self._driver is None:
             raise RuntimeError('GraphitiBackend not initialized — call initialize() first')
         return self._driver
 
-    def _require_falkor_client(self) -> Any:
-        """Return the FalkorDB client from the underlying driver."""
-        driver = self._require_driver()
-        return cast(Any, driver).client
+    async def read_server_settings(self) -> FalkorServerSettings:
+        """Read the live TIMEOUT and appendonly settings; read-only, and a failed read is reported, not raised."""
+        client = getattr(self._driver, 'client', None)
+        return await read_falkor_server_settings(
+            client,
+            expected_graph_timeout_ms=self.config.graphiti.falkordb.expected_graph_timeout_ms,
+        )
 
     async def _ensure_indices(self, group_id: str) -> None:
-        """Build indices on *group_id*'s graph if not already done this session."""
+        """Provision *group_id*'s indices if it is registered and not yet cached.
+
+        γ's single entry for both call sites, the startup sweep and the first
+        write, and it NEVER raises: a provisioning failure must fail neither the
+        write that triggered it nor the rest of the sweep.
+
+        * A graph is cached once :meth:`_ensure_indices_locked` RETURNS, even with
+          per-statement ``failed`` entries: those are already WARNING-logged, and
+          δ's drift detector owns a persistent gap.
+        * When it RAISES or times out, it is logged and left uncached, so the next
+          write or sweep retries.
+        * The lock hold is bounded by the provisioning budget (see ``__init__``).
+        * No OPERATIONAL barrier (INV-7).
+
+        See docs/prds/falkordb-index-provisioning.md D4-D6.
+        """
+        if group_id not in self._registered_graph_ids:
+            return
         if group_id in self._indexed_graphs:
             return
-        driver = self._driver_for(group_id)
-        await driver.build_indices_and_constraints()
-        self._indexed_graphs.add(group_id)
-        logger.debug('Ensured indices on graph %r', group_id)
+        async with self._index_provision_lock_for(group_id):
+            # INV-3: _indexed_graphs is an in-process snapshot cache.  It can only
+            # skip redundant WORK, never cause a wrong ACTION: provisioning
+            # re-reads list_indices() (ground truth) and diffs before creating.
+            if group_id in self._indexed_graphs:
+                return
+            try:
+                await asyncio.wait_for(
+                    self._ensure_indices_locked(group_id),
+                    timeout=self._index_provision_timeout,
+                )
+            except Exception as exc:
+                logger.warning(
+                    'Index provisioning on graph %r did not complete (%s: %s); left '
+                    'uncached, so the next write or restart retries it',
+                    group_id, type(exc).__name__, exc, exc_info=True,
+                )
+                return
+            self._indexed_graphs.add(group_id)
 
-    async def initialize(self, *, skip_maintenance: bool = False) -> None:
+    async def provision_registered_graphs(self) -> None:
+        """Provision every registered graph that already exists — PRD D6's startup half.
+
+        The scope is the registry, not a graph name (D5): the RAW listing is
+        intersected with :attr:`registered_graph_ids`, so probe, test and scratch
+        graphs are skipped by construction.  A registered graph with no key yet
+        is left to its first write.  Safe to call at any time (idempotent, and
+        cached per process).  A listing failure propagates; a failure on one
+        graph does not (see :meth:`_ensure_indices`).
+
+        The WHOLE sweep shares one provisioning budget, so a hung FalkorDB
+        delays ``initialize()`` by at most that budget rather than by one budget
+        per registered graph.  Graphs the sweep did not reach stay uncached and
+        are provisioned by their first write.
+        """
+        try:
+            await asyncio.wait_for(
+                self._provision_existing_registered_graphs(),
+                timeout=self._index_provision_timeout,
+            )
+        except TimeoutError:
+            logger.warning(
+                'Index provisioning sweep exceeded its %ss budget; registered graphs '
+                'it did not reach are left to their first write',
+                self._index_provision_timeout,
+            )
+
+    async def _provision_existing_registered_graphs(self) -> None:
+        for graph_name in await self._existing_registered_graphs():
+            await self._ensure_indices(graph_name)
+
+    async def _existing_registered_graphs(self) -> list[str]:
+        """The graphs startup maintenance owns: registered ones the server has (D5)."""
+        return sorted(set(await self.graph_access.list_graphs()) & self._registered_graph_ids)
+
+    async def initialize(
+        self,
+        *,
+        skip_maintenance: bool = False,
+        llm_client: LLMClient | None = None,
+        embedder: EmbedderClient | None = None,
+    ) -> None:
         """Create FalkorDriver + Graphiti client from unified config.
 
         skip_maintenance: when True, skip both startup maintenance blocks
-        (the index-build loop and the W6-ε startup identity scan, which
-        REPAIRS dup-uuid edges — a write). Default False preserves current
-        behavior. Intended for lean, read-only callers (e.g. the ζ
-        migrate_cross_graph_leak.py dry-run/census) that need a
+        (the registered-graph index provisioning sweep and the W6-ε startup
+        identity scan, which REPAIRS dup-uuid edges — a write). Default False
+        preserves current behavior. Intended for lean, read-only callers (e.g.
+        the ζ migrate_cross_graph_leak.py dry-run/census) that need a
         driver/client-wired backend without mutating on init or contending
         with a running service's maintenance sweep.
+
+        llm_client, embedder: when given, used instead of
+        ``build_llm_client(cfg)`` and ``build_embedder(cfg)`` respectively, so a
+        per-arm caller (e.g. the arm-runner harness) can wrap the client the
+        builder built before this backend shares it. The backend takes
+        ownership of an injected client: ``close()`` releases it.
         """
         cfg = self.config
 
         # --- LLM client ---
-        llm_client = None
-        if cfg.llm.provider == 'openai' and cfg.llm.providers.openai:
-            api_key = cfg.llm.providers.openai.api_key
-            if api_key:
-                check_openai_responses_api()
-                llm_config = GraphitiLLMConfig(
-                    api_key=api_key,
-                    model=cfg.llm.model,
-                    small_model=cfg.llm.model,
-                    temperature=cfg.llm.temperature or 0.0,
-                    max_tokens=cfg.llm.max_tokens,
-                )
-                llm_client = OpenAIClient(config=llm_config)
-                logger.info(f'Graphiti LLM: {cfg.llm.provider}/{cfg.llm.model}')
-        elif cfg.llm.provider == 'anthropic' and cfg.llm.providers.anthropic:
-            api_key = cfg.llm.providers.anthropic.api_key
-            if api_key:
-                try:
-                    from graphiti_core.llm_client.anthropic_client import AnthropicClient
-
-                    llm_config = GraphitiLLMConfig(
-                        api_key=api_key,
-                        model=cfg.llm.model,
-                        temperature=cfg.llm.temperature or 0.0,
-                        max_tokens=cfg.llm.max_tokens,
-                    )
-                    llm_client = AnthropicClient(config=llm_config)
-                    logger.info(f'Graphiti LLM: {cfg.llm.provider}/{cfg.llm.model}')
-                except ImportError:
-                    logger.warning('Anthropic client not available for Graphiti')
+        llm_client = llm_client if llm_client is not None else build_llm_client(cfg)
 
         # --- Embedder ---
-        embedder_client = None
-        if cfg.embedder.provider == 'openai' and cfg.embedder.providers.openai:
-            api_key = cfg.embedder.providers.openai.api_key
-            if api_key:
-                embedder_config = OpenAIEmbedderConfig(
-                    api_key=api_key,
-                    embedding_model=cfg.embedder.model,
-                    base_url=cfg.embedder.providers.openai.api_url,
-                    embedding_dim=cfg.embedder.dimensions,
-                )
-                embedder_client = OpenAIEmbedder(config=embedder_config)
-                logger.info(f'Graphiti embedder: {cfg.embedder.provider}/{cfg.embedder.model}')
+        embedder_client = embedder if embedder is not None else build_embedder(cfg)
 
         # --- FalkorDB driver ---
         # The driver is created with a placeholder database.  Actual graph
-        # selection happens per-request via _driver_for() / _graph_for().
+        # selection happens per-request via _driver_for() / graph_access.graph().
         falkor_cfg = cfg.graphiti.falkordb
         if falkor_cfg.database is not None:
             logger.warning(
@@ -496,14 +1555,12 @@ class GraphitiBackend:
         host = parsed.hostname or 'localhost'
         port = parsed.port or 6379
 
-        self._driver = _MultiTenantFalkorDriver(
+        driver = _MultiTenantFalkorDriver(
             host=host,
             port=port,
             password=falkor_cfg.password,
+            socket_timeout=falkor_cfg.socket_timeout_seconds,
         )
-
-        self._llm_client = llm_client
-        self._embedder = embedder_client
 
         # --- Cross-encoder (reranker) ---
         # Shared across the base client and every per-group client (see
@@ -530,23 +1587,29 @@ class GraphitiBackend:
                 api_key=reranker_provider.api_key,
                 base_url=reranker_provider.api_url,
             )
-        self._cross_encoder = OpenAIRerankerClient(config=reranker_config)
+        cross_encoder = OpenAIRerankerClient(config=reranker_config)
 
+        self._attach(
+            driver,
+            llm_client=llm_client,
+            embedder=embedder_client,
+            cross_encoder=cross_encoder,
+            graph_access=None,
+        )
         self.client = Graphiti(
-            graph_driver=self._driver,
-            llm_client=self._llm_client,
-            embedder=self._embedder,
-            cross_encoder=self._cross_encoder,
+            graph_driver=driver,
+            llm_client=llm_client,
+            embedder=embedder_client,
+            cross_encoder=cross_encoder,
             max_coroutines=cfg.queue.graphiti_max_coroutines,
         )
 
-        # Build indices on all existing project graphs (lazy set avoids repeats).
+        warn_on_shortfalls(await self.read_server_settings())
+
+        # Provision the registered project graphs that already exist (PRD D6).
         if not skip_maintenance:
             try:
-                existing = await self._require_falkor_client().list_graphs()
-                for graph_name in existing:
-                    if graph_name != 'default_db' and not graph_name.endswith('_db'):
-                        await self._ensure_indices(graph_name)
+                await self.provision_registered_graphs()
             except Exception:
                 logger.warning('Could not enumerate existing graphs for index setup', exc_info=True)
 
@@ -578,25 +1641,71 @@ class GraphitiBackend:
         entity_types: dict | None = None,
         uuid: str | None = None,
         temporal_context: str | None = None,
+        unverified_claim: bool = False,
     ) -> Any:
-        """Add an episode to Graphiti and return the result."""
+        """Add an episode to Graphiti and return the result.
+
+        ``unverified_claim`` (task 3142) prefixes ``source_description`` with
+        ``'[unverified_claim] '``, exactly as ``temporal_context`` prefixes it
+        with ``'[temporal:X] '``. It is applied OUTERMOST so the caveat is the
+        first thing a reader of the episodic node sees, and so the two prefixes
+        compose rather than overwrite. This is the only channel that reaches
+        the persisted episode: the harm being labelled is the EDGES extracted
+        from it, not the tool response.
+
+        ``uuid`` means LOAD, never create-with-this-id — the contract stated
+        once at ``graphiti_client.py::_UUID_MEANS_LOAD``, which is what both
+        failure messages below carry. See
+        ``services/memory_service.py::MemoryService._execute_graphiti_write``,
+        the only production caller, for why the minted identity is load-bearing.
+        A legitimate load-an-existing-episode call passes ``content=''``: any
+        non-empty ``content`` alongside a resolving ``uuid`` is discarded
+        upstream in favour of the stored episode body, and warns here.
+
+        Raises:
+            NodeNotFoundError: the module-local one, when a non-None ``uuid``
+                does not resolve. Chained from graphiti_core's own, whose
+                message names only the caller's own input.
+        """
+        await self._ensure_indices(group_id)
         client = self._client_for(group_id)
         ref_time = reference_time or datetime.now(UTC)
+        if uuid is not None and content:
+            logger.warning(
+                f'add_episode called with both uuid={uuid} and content in group '
+                f'{group_id}: the content will NOT be stored — the '
+                f'already-stored episode body wins. {_UUID_MEANS_LOAD}'
+            )
         if temporal_context is not None:
             source_description = f'[temporal:{temporal_context}] {source_description}'
-        return await asyncio.wait_for(
-            client.add_episode(
-                name=name,
-                episode_body=content,
-                source=source,
-                group_id=group_id,
-                source_description=source_description,
-                reference_time=ref_time,
-                entity_types=entity_types,
-                uuid=uuid,
-            ),
-            timeout=self._write_timeout,
-        )
+        if unverified_claim:
+            source_description = f'[unverified_claim] {source_description}'
+        try:
+            return await self._timed_write(
+                client.add_episode(
+                    name=name,
+                    episode_body=content,
+                    source=source,
+                    group_id=group_id,
+                    source_description=source_description,
+                    reference_time=ref_time,
+                    entity_types=entity_types,
+                    uuid=uuid,
+                ),
+                'add_episode',
+            )
+        except GraphitiCoreNodeNotFoundError as exc:
+            # Translate only a not-found provably about the caller's own uuid —
+            # graphiti_core raises the same class from entity/edge resolution
+            # after the episode loaded fine. The proof CONSTRUCTS the genuine
+            # upstream exception instead of parsing its text, so an upstream
+            # reword fails open rather than mislabelling.
+            if uuid is None or str(exc) != str(GraphitiCoreNodeNotFoundError(uuid)):
+                raise
+            raise NodeNotFoundError(
+                f'Episodic node not found in group {group_id}: {uuid} — '
+                f'{_UUID_MEANS_LOAD}'
+            ) from exc
 
     @_canonicalize_group_args
     async def search(
@@ -606,24 +1715,21 @@ class GraphitiBackend:
         num_results: int = 10,
         center_node_uuid: str | None = None,
     ) -> list[Any]:
-        """Search for entity edges (facts)."""
+        """Search for active entity edges (facts) only, so a retired edge never takes a leg or fused slot."""
         client = self._require_client()
         gids = group_ids or []
         driver = self._driver_for(gids[0]) if gids else None
-        try:
-            return await asyncio.wait_for(
-                client.search(
-                    query=query,
-                    group_ids=gids,
-                    num_results=num_results,
-                    center_node_uuid=center_node_uuid,
-                    driver=driver,
-                ),
-                timeout=self._read_timeout,
-            )
-        except TimeoutError:
-            logger.warning(f'Graphiti search timed out after {self._read_timeout}s')
-            return []
+        return await self._timed_read(
+            client.search(
+                query=query,
+                group_ids=gids,
+                num_results=num_results,
+                center_node_uuid=center_node_uuid,
+                search_filter=active_edge_filter(),
+                driver=driver,
+            ),
+            'search',
+        )
 
     @_canonicalize_group_args
     async def search_nodes(
@@ -638,20 +1744,16 @@ class GraphitiBackend:
 
         gids = group_ids or []
         driver = self._driver_for(gids[0]) if gids else None
-        try:
-            results = await asyncio.wait_for(
-                client.search_(
-                    query=query,
-                    config=NODE_HYBRID_SEARCH_RRF,
-                    group_ids=gids,
-                    driver=driver,
-                ),
-                timeout=self._read_timeout,
-            )
-            return (results.nodes or [])[:max_nodes]
-        except TimeoutError:
-            logger.warning(f'Graphiti search_nodes timed out after {self._read_timeout}s')
-            return []
+        results = await self._timed_read(
+            client.search_(
+                query=query,
+                config=NODE_HYBRID_SEARCH_RRF,
+                group_ids=gids,
+                driver=driver,
+            ),
+            'search_nodes',
+        )
+        return (results.nodes or [])[:max_nodes]
 
     @_canonicalize_group_args
     async def retrieve_episodes(
@@ -660,71 +1762,57 @@ class GraphitiBackend:
         last_n: int = 10,
         reference_time: datetime | None = None,
     ) -> list[Any]:
-        """Retrieve recent episodes by group, ordered by created_at (most recent first) and truncated to last_n.
+        """Return the group's last_n most recent episodes, newest created_at first, ties by uuid descending.
 
-        EpisodicNode.get_by_group_ids truncates via ``ORDER BY uuid DESC LIMIT``,
-        which is unrelated to recency, so we fetch the group's full episode set
-        (limit=None) and sort/truncate by created_at ourselves.
+        Raises:
+            ValueError: last_n is outside 1 <= last_n < ``_RESULTSET_SIZE``.
+            TimeoutError: The read overran its budget (class TIMEOUT POSTURE).
+                MemoryConsolidator then marks 'episodes' a degraded fetch
+                source, and get_episodes answers an error, not an empty list.
+
+        Why the read is neither keyset-paged nor a full scan:
+        plans/falkordb-resultset-cap-audit.md, the ``retrieve_episodes`` entry.
         """
-        driver = self._driver_for(group_ids[0]) if group_ids else self._require_driver()
-        try:
-            # Tradeoff: limit=None fetches the group's ENTIRE episode set on every
-            # call (no Cypher LIMIT), then we sort/truncate in Python. This is what
-            # makes the created_at ordering correct given that get_by_group_ids'
-            # own ORDER BY uuid DESC LIMIT truncates on the wrong key before we'd
-            # ever see the data. Acceptable today because episode reads are a cold
-            # path and per-project episode counts are bounded (reconciliation GC;
-            # last_n is separately capped at 1000 in tools.py). If per-group episode
-            # volume grows large, revisit with a created_at-indexed Cypher query
-            # (``ORDER BY e.created_at DESC LIMIT $limit``) to push the bound into
-            # the DB instead of transferring+sorting the full set here.
-            episodes = await asyncio.wait_for(
-                EpisodicNode.get_by_group_ids(
-                    driver, group_ids, limit=None
-                ),
-                timeout=self._read_timeout,
+        if not 1 <= last_n < _RESULTSET_SIZE:
+            raise ValueError(
+                f'retrieve_episodes: last_n={last_n} must satisfy 1 <= last_n < '
+                f'{_RESULTSET_SIZE} (the assumed FalkorDB RESULTSET_SIZE); at or '
+                f'above it the server truncates this unpaged read silently'
             )
-            episodes = sorted(
-                episodes or [],
-                # Secondary key (uuid) makes this a total order: get_by_group_ids
-                # truncates via ORDER BY uuid DESC, so without a tie-breaker,
-                # episodes sharing created_at (batch/rapid co-ingestion, or
-                # reduced-precision storage) fall back to that upstream order,
-                # which is not guaranteed reproducible across executions and can
-                # read as non-monotonic to a strict-descending observer.
-                key=lambda ep: (
-                    _as_sortable_utc(getattr(ep, 'created_at', None)),
-                    getattr(ep, 'uuid', None) or '',
-                ),
-                reverse=True,
-            )
-            return episodes[:last_n]
-        except TimeoutError:
-            logger.warning(f'Graphiti retrieve_episodes timed out after {self._read_timeout}s')
+        if not group_ids:
             return []
+        episodes = await read_recent_group_episodes(
+            OpBoundReader(self.graph_access.graph(group_ids[0]), op='retrieve_episodes'),
+            group_ids,
+            last_n,
+        )
+        return sorted(
+            episodes,
+            key=lambda ep: (_as_sortable_utc(ep.created_at), ep.uuid),
+            reverse=True,
+        )
 
     @_canonicalize_group_args
     async def get_episode_by_uuid(self, episode_uuid: str, *, group_id: str) -> EpisodicNode | None:
-        """Fetch an episode node by UUID.
+        """Fetch an episode node by UUID, or None when it does not exist.
 
         Mirrors remove_episode's driver-selection + EpisodicNode.get_by_uuid
-        call, but is fail-safe rather than propagating: a missing episode
-        (graphiti_core's NodeNotFoundError) or a timeout (matching
-        retrieve_episodes' timeout handling) both return None instead of
-        raising, since callers (e.g. the reconciliation promotion-time
-        batch-plan gate, task 2033) treat "can't determine content" as a
-        graceful fallback rather than a hard failure.
+        call.  Only a genuine miss (graphiti_core's NodeNotFoundError) returns
+        None.
+
+        Raises:
+            TimeoutError: The read overran its budget (class TIMEOUT POSTURE),
+                so a timeout is never mistaken for a missing episode.  The
+                promotion-time batch-plan gate
+                (``reconciliation/targeted.py::_should_withhold_batch_promotion``,
+                task 2033) fails open on it, as it does on None.
         """
         driver = self._driver_for(group_id)
         try:
-            return await asyncio.wait_for(
-                EpisodicNode.get_by_uuid(driver, episode_uuid),
-                timeout=self._read_timeout,
+            return await self._timed_read(
+                EpisodicNode.get_by_uuid(driver, episode_uuid), 'get_episode_by_uuid',
             )
         except GraphitiCoreNodeNotFoundError:
-            return None
-        except TimeoutError:
-            logger.warning(f'Graphiti get_episode_by_uuid timed out after {self._read_timeout}s')
             return None
 
     @_canonicalize_group_args
@@ -732,10 +1820,125 @@ class GraphitiBackend:
         """Delete an episode by UUID."""
         driver = self._driver_for(group_id)
         node = await EpisodicNode.get_by_uuid(driver, episode_uuid)
-        await asyncio.wait_for(
-            node.delete(driver),
-            timeout=self._write_timeout,
+        await self._timed_write(node.delete(driver), 'remove_episode')
+
+    @_canonicalize_group_args
+    async def redact_episode_content(
+        self, episode_uuid: str, *, group_id: str, new_content: str,
+    ) -> dict[str, Any]:
+        """Replace ONE EpisodicNode's ``content`` in place, preserving everything else.
+
+        The remediation primitive for an episode whose raw text carries a
+        leaked serialized tool-call fragment (task 3083). Three design
+        commitments, each of which is why this method exists at all rather
+        than the caller reaching for an existing one:
+
+        1. **Redact, never cascade-delete.** ``delete_episode(cascade=True)``
+           would destroy the entities and edges exclusively sourced from this
+           episode — for the known residual
+           ``d12b0eb4-f027-4d0c-a26c-096ccd0e75c2`` that includes
+           demonstrably-VALID collateral such as edge ``ea4072dc``. Deleting
+           real knowledge to fix appearance is strictly worse than the leak.
+           So this issues exactly one scoped ``SET e.content`` and no removal
+           of any kind.
+        2. **No vector is invalidated.** EpisodicNodes carry no embedding
+           property of their own (graphiti_core's episode save query writes
+           none), so unlike the Mem0 sweep — which must delete and re-add so
+           the repaired text is re-embedded — an in-place content SET here
+           leaves nothing stale behind.
+        3. **The extracted edges are deliberately left untouched.** They were
+           extracted from the CLEAN portion of the text, before the harness
+           truncated it; the fragment contributed no facts. Rewriting them
+           would be a second mutation with no evidence behind it.
+
+        Both the before-read and the write are scoped by ``uuid`` AND
+        ``group_id``, so a uuid belonging to another project's graph can
+        neither be read nor redacted through this call.
+
+        Discovery of which episodes carry a leak is :meth:`scan_episode_toolcall_leaks`.
+
+        Args:
+            episode_uuid: UUID of the EpisodicNode to redact.
+            group_id: Project graph to target.
+            new_content: Replacement text. Must be non-empty and must not
+                itself carry a leak per the shared detector.
+
+        Returns:
+            ``{uuid, group_id, old_content, new_content}`` so the caller can
+            audit exactly what was neutralised.
+
+        Raises:
+            ValueError: if *new_content* is blank, or still carries a leaked
+                tool-call fragment (a redaction that re-introduces the
+                fragment is not a redaction).
+            NodeNotFoundError: if no Episodic node with that UUID exists in
+                *group_id* — a typo can never be mistaken for a success.
+            RuntimeError: if the backend is not initialized.
+        """
+        if not new_content or not new_content.strip():
+            raise ValueError(
+                'redact_episode_content requires non-empty new_content — '
+                'redaction is content-preserving, not content-erasing'
+            )
+        if has_toolcall_xml_leak(new_content):
+            raise ValueError(
+                'redact_episode_content refuses new_content that still carries a '
+                'leaked tool-call XML fragment (a redaction that re-introduces '
+                'the leak is not a redaction)'
+            )
+
+        graph = self.graph_access.graph(group_id)
+        result = await graph.ro_query(
+            'MATCH (e:Episodic {uuid: $uuid, group_id: $group_id}) '
+            'RETURN e.content',
+            {'uuid': episode_uuid, 'group_id': group_id},
+            op='redact_episode_content.read',
         )
+        if not result.result_set:
+            raise NodeNotFoundError(
+                f'Episodic node not found in group {group_id}: {episode_uuid}'
+            )
+        old_content = result.result_set[0][0] or ''
+
+        await graph.query(
+            'MATCH (e:Episodic {uuid: $uuid, group_id: $group_id}) '
+            'SET e.content = $content',
+            {'uuid': episode_uuid, 'group_id': group_id, 'content': new_content},
+            op='redact_episode_content.write',
+        )
+        logger.info(
+            'redact_episode_content: episode=%s group=%s old_len=%d new_len=%d',
+            episode_uuid, group_id, len(old_content), len(new_content),
+        )
+        return {
+            'uuid': episode_uuid,
+            'group_id': group_id,
+            'old_content': old_content,
+            'new_content': new_content,
+        }
+
+    @_canonicalize_group_args
+    async def scan_episode_toolcall_leaks(
+        self, *, group_id: str, page_size: int = _DEFAULT_READ_PAGE_SIZE,
+    ) -> EpisodeToolcallLeakScan:
+        """Find which of *group_id*'s episodes carry a leaked tool-call fragment.
+
+        Raises:
+            IncompleteEnumerationError: if the candidate read was structurally refused or capped.
+            TimeoutError: if a read outlasts its budget.
+        """
+        scan = await read_episode_toolcall_leaks(
+            self.graph_access.graph(group_id), group_id=group_id, page_size=page_size,
+        )
+        apply_incompleteness_policy(
+            scan.candidates,
+            method='scan_episode_toolcall_leaks',
+            group_id=group_id,
+            returned_count=len(scan.leaks),
+            noun='leaked episodes',
+            consequence='are not an incidence rate and must not drive a redaction sweep',
+        )
+        return scan
 
     @_canonicalize_group_args
     async def remove_edge(self, edge_uuid: str, *, group_id: str) -> None:
@@ -746,10 +1949,7 @@ class GraphitiBackend:
         except EdgeNotFoundError:
             logger.info(f'Edge {edge_uuid} not found (already deleted or episode-cascaded)')
             return
-        await asyncio.wait_for(
-            edge.delete(driver),
-            timeout=self._write_timeout,
-        )
+        await self._timed_write(edge.delete(driver), 'remove_edge')
 
     @_canonicalize_group_args
     async def update_edge(
@@ -757,27 +1957,28 @@ class GraphitiBackend:
         invalid_at: datetime | None = None,
         clear_invalid_at: bool = False,
     ) -> dict[str, Any]:
-        """Update an existing edge's fact text and/or invalidate it.
+        """Update an existing edge's fact text and/or its ``invalid_at``.
 
         At least one of ``fact``, ``invalid_at``, or ``clear_invalid_at`` must
-        be provided. When ``fact`` is set, the edge's fact text is replaced and
-        its embedding is regenerated. When ``invalid_at`` is set, the edge is
-        marked superseded as of that timestamp (no re-embedding needed). Both
-        may be combined.
+        be provided; each dimension has its own write:
 
-        When ``clear_invalid_at=True``, the edge's ``invalid_at`` field is
-        reset to ``None``, restoring it to an active (non-superseded) state.
-        This takes precedence over ``invalid_at`` if both are supplied.
-        Compatible with ``fact`` (update text and un-supersede in one call).
-        Because graphiti's FalkorDB map-based ``edge.save()`` (``MERGE ... SET
-        e = $edge_data``) does not reliably clear a null-valued property, the
-        clear is force-persisted by an explicit direct-Cypher
-        ``SET e.invalid_at = NULL`` write, issued after ``edge.save()`` and
-        before the endpoint summary refresh below (so the restored edge is
-        counted valid by that refresh's ``WHERE e.invalid_at IS NULL`` filter).
+        - ``fact`` replaces the fact text through graphiti's full-map
+          ``edge.save`` with a regenerated embedding.
+        - ``invalid_at`` / ``clear_invalid_at`` is one targeted
+          ``SET e.invalid_at`` write that touches no other property;
+          ``clear_invalid_at`` wins when both are given.
 
-        After saving, both source and target entity node summaries are rebuilt
-        from their current valid edges so they stay consistent.
+        A call carrying both ``fact`` and an invalidity change is two
+        independent writes, not one transaction: if the invalidity write
+        fails, the new fact is already stored.
+
+        graphiti's ``get_by_uuid`` projection omits ``fact_embedding``, so a
+        full-map save without a regenerated embedding would write
+        ``vecf32(null)``.  ``tests/test_graphiti_update_edge.py`` pins this.
+
+        Both writes land before the endpoint summaries are rebuilt, so a
+        restored edge is counted by the refresh's ``WHERE e.invalid_at IS NULL``
+        filter.
         """
         if fact is None and invalid_at is None and not clear_invalid_at:
             raise ValueError('update_edge requires fact, invalid_at, or clear_invalid_at to be set')
@@ -785,25 +1986,11 @@ class GraphitiBackend:
         edge = await EntityEdge.get_by_uuid(driver, edge_uuid)
         if fact is not None:
             edge.fact = fact
-            embedder = self._require_client().embedder
-            await edge.generate_embedding(embedder)
-        if invalid_at is not None:
-            edge.invalid_at = invalid_at
-        if clear_invalid_at:
-            edge.invalid_at = None
-        await asyncio.wait_for(edge.save(driver), timeout=self._write_timeout)
-
-        if clear_invalid_at:
-            # edge.save()'s map-based SET does not reliably clear a
-            # null-valued property on FalkorDB — force it deterministically.
-            graph = self._graph_for(group_id)
-            await asyncio.wait_for(
-                graph.query(
-                    'MATCH ()-[e:RELATES_TO {uuid: $uuid}]->() '
-                    'SET e.invalid_at = NULL',
-                    {'uuid': edge_uuid},
-                ),
-                timeout=self._write_timeout,
+            await edge.generate_embedding(self._require_client().embedder)
+            await self._timed_write(edge.save(driver), 'update_edge.save')
+        if clear_invalid_at or invalid_at is not None:
+            await self._write_edge_invalid_at(
+                edge_uuid, None if clear_invalid_at else invalid_at, group_id=group_id,
             )
 
         # Deterministically refresh both endpoint entity summaries so they
@@ -824,6 +2011,19 @@ class GraphitiBackend:
             'fact': edge.fact,
             'refreshed_nodes': refreshed,
         }
+
+    async def _write_edge_invalid_at(
+        self, edge_uuid: str, invalid_at: datetime | None, *, group_id: str,
+    ) -> None:
+        """Set one RELATES_TO edge's ``invalid_at``, or remove it for ``None``; nothing else changes."""
+        await self.graph_access.graph(group_id).query(
+            'MATCH ()-[e:RELATES_TO {uuid: $uuid}]->() SET e.invalid_at = $invalid_at',
+            {
+                'uuid': edge_uuid,
+                'invalid_at': None if invalid_at is None else invalid_at.isoformat(),
+            },
+            op='update_edge.invalid_at',
+        )
 
     @_canonicalize_group_args
     async def reassign_edge(
@@ -849,11 +2049,13 @@ class GraphitiBackend:
         Losslessly PRESERVED (copied by direct ``old.<prop>`` reference, which
         also preserves the vecf32 ``fact_embedding`` type): the edge ``uuid``,
         ``name``, ``fact``, ``fact_embedding``, ``valid_at``, ``invalid_at``,
-        ``expired_at``, ``created_at``, ``group_id``, and ``episodes``. The
-        UNCHANGED endpoint is pinned from the matched TOPOLOGY node (never the
-        unreliable ``old.<end>_node_uuid`` property, which ``redirect_node_edges``
-        can leave absent). ``new.reassigned_from_node_uuid`` records the prior
-        endpoint uuid for audit.
+        ``expired_at``, ``created_at``, ``group_id``, ``episodes``, and
+        ``superseded_edge_uuid`` (a merge-lineage stamp, carried unchanged and
+        never minted here). The UNCHANGED endpoint is pinned from the matched
+        TOPOLOGY node (never the unreliable ``old.<end>_node_uuid`` property,
+        which ``redirect_node_edges`` can leave absent).
+        ``new.reassigned_from_node_uuid`` records the endpoint this move left and
+        is overwritten on each move, as ``redirect_node_edges`` does.
 
         A no-op guard returns ``moved=False`` without issuing any write when
         ``new_endpoint_uuid`` already equals the endpoint being moved (making
@@ -887,17 +2089,20 @@ class GraphitiBackend:
             raise ValueError(
                 f"reassign_edge: which_end must be 'source' or 'target', got {which_end!r}"
             )
-        graph = self._graph_for(group_id)
+        graph = self.graph_access.graph(group_id)
         # Read the edge's TRUE endpoints from TOPOLOGY, not the
         # e.source_node_uuid/e.target_node_uuid PROPERTIES: redirect_node_edges
         # sets only the moved side's property and leaves the other absent/NULL,
         # and graphiti_core itself derives endpoints from topology (project
-        # memory 41edcf81). The directed MATCH resolves source vs target
-        # unambiguously.
+        # memory 41edcf81). startNode/endNode fix source vs target; binding
+        # them rather than anchoring on labelled endpoints lets FalkorDB seek
+        # the edge index, see
+        # fused_memory/backends/falkor_entity_edges.py::bind_entity_endpoints.
         topo = await graph.ro_query(
-            'MATCH (s:Entity)-[e:RELATES_TO {uuid: $edge_uuid}]->(t:Entity) '
-            'RETURN s.uuid, t.uuid',
+            bind_entity_endpoints('MATCH ()-[e:RELATES_TO {uuid: $edge_uuid}]->()')
+            + ' RETURN n.uuid, m.uuid',
             {'edge_uuid': edge_uuid},
+            op='reassign_edge',
         )
         if not topo.result_set:
             raise EdgeNotFoundError(f'RELATES_TO edge not found: {edge_uuid}')
@@ -921,6 +2126,7 @@ class GraphitiBackend:
         node_check = await graph.ro_query(
             'MATCH (n:Entity {uuid: $new_endpoint_uuid}) RETURN n.uuid',
             {'new_endpoint_uuid': new_endpoint_uuid},
+            op='reassign_edge',
         )
         if not node_check.result_set:
             raise NodeNotFoundError(f'Entity node not found: {new_endpoint_uuid}')
@@ -962,6 +2168,7 @@ class GraphitiBackend:
                     'MATCH (new_src:Entity {uuid: $new_endpoint_uuid}) '
                     'CREATE (new_src)-[new:RELATES_TO]->(target) '
                     'SET new.uuid = old.uuid, '
+                    '    new.superseded_edge_uuid = old.superseded_edge_uuid, '
                     '    new.name = old.name, '
                     '    new.fact = old.fact, '
                     '    new.fact_embedding = old.fact_embedding, '
@@ -982,6 +2189,7 @@ class GraphitiBackend:
                     'MATCH (new_tgt:Entity {uuid: $new_endpoint_uuid}) '
                     'CREATE (source)-[new:RELATES_TO]->(new_tgt) '
                     'SET new.uuid = old.uuid, '
+                    '    new.superseded_edge_uuid = old.superseded_edge_uuid, '
                     '    new.name = old.name, '
                     '    new.fact = old.fact, '
                     '    new.fact_embedding = old.fact_embedding, '
@@ -1003,6 +2211,7 @@ class GraphitiBackend:
                     'new_endpoint_uuid': new_endpoint_uuid,
                     'old_endpoint_uuid': old_endpoint_uuid,
                 },
+                op='reassign_edge',
             )
 
         # Best-effort refresh of the two AFFECTED endpoint summaries: the OLD
@@ -1051,17 +2260,17 @@ class GraphitiBackend:
         """
         client = self._require_client()
         if not group_ids:
-            await asyncio.wait_for(
+            await self._timed_write(
                 client.build_communities(group_ids=group_ids, driver=None),
-                timeout=self._write_timeout,
+                'build_communities',
             )
             return
         for group_id in group_ids:
-            await asyncio.wait_for(
+            await self._timed_write(
                 client.build_communities(
                     group_ids=[group_id], driver=self._driver_for(group_id)
                 ),
-                timeout=self._write_timeout,
+                'build_communities',
             )
 
     @_canonicalize_group_args
@@ -1073,23 +2282,23 @@ class GraphitiBackend:
         FalkorDB's ``size()`` does not work on Vectorf32 properties, so we
         return all nodes with embeddings and filter client-side by parsing the
         raw vector text representation (``<v1, v2, ...>``).
+
+        PAGINATED (task 4869) through ``paged_ro_query``, because the embedded
+        population exceeds the server's result-set cap; incompleteness follows
+        the shared ``apply_incompleteness_policy``.  Measured counts are in
+        plans/falkordb-resultset-cap-audit.md.
+
+        Raises:
+            IncompleteEnumerationError: The read was structurally incomplete.
         """
-        graph = self._graph_for(group_id)
-        cypher = (
-            'MATCH (n:Entity) '
-            'WHERE n.name_embedding IS NOT NULL '
-            'RETURN n.uuid, n.name, n.name_embedding'
+        return await self._query_stale_embeddings(
+            expected_dim,
+            group_id=group_id,
+            page_template=_EMBEDDED_ENTITY_NODES_PAGE_TEMPLATE,
+            census_cypher=_EMBEDDED_ENTITY_NODES_CENSUS,
+            method='query_stale_node_embeddings',
+            noun='stale node embeddings',
         )
-        result = await graph.ro_query(cypher)
-        stale: list[tuple[str, str, int]] = []
-        for row in result.result_set or []:
-            raw = row[2]
-            if isinstance(raw, bytes):
-                raw = raw.decode('utf-8', errors='replace')
-            dim = len(str(raw).strip('<>').split(', '))
-            if dim != expected_dim:
-                stale.append((row[0], row[1], dim))
-        return stale
 
     @_canonicalize_group_args
     async def query_stale_edge_embeddings(
@@ -1097,24 +2306,128 @@ class GraphitiBackend:
     ) -> list[tuple[str, str, int]]:
         """Return (uuid, name, dim) for RELATES_TO edges whose embedding dim != expected_dim.
 
-        See ``query_stale_node_embeddings`` for why client-side filtering is needed.
+        See ``query_stale_node_embeddings`` for why client-side filtering is
+        needed, and for the pagination (task 4869) this read shares.
+
+        Raises:
+            IncompleteEnumerationError: The read was structurally incomplete.
         """
-        graph = self._graph_for(group_id)
-        cypher = (
-            'MATCH (n)-[e:RELATES_TO]->(m) '
-            'WHERE e.fact_embedding IS NOT NULL '
-            'RETURN e.uuid, e.name, e.fact_embedding'
+        return await self._query_stale_embeddings(
+            expected_dim,
+            group_id=group_id,
+            page_template=_EMBEDDED_EDGES_PAGE_TEMPLATE,
+            census_cypher=_EMBEDDED_EDGES_CENSUS,
+            method='query_stale_edge_embeddings',
+            noun='stale edge embeddings',
         )
-        result = await graph.ro_query(cypher)
-        stale: list[tuple[str, str, int]] = []
-        for row in result.result_set or []:
-            raw = row[2]
-            if isinstance(raw, bytes):
-                raw = raw.decode('utf-8', errors='replace')
-            dim = len(str(raw).strip('<>').split(', '))
-            if dim != expected_dim:
-                stale.append((row[0], row[1], dim))
+
+    async def _query_stale_embeddings(
+        self,
+        expected_dim: int,
+        *,
+        group_id: str,
+        page_template: str,
+        census_cypher: str,
+        method: str,
+        noun: str,
+    ) -> list[tuple[str, str, int]]:
+        """Page (uuid, name, vector) rows; return those whose dim != expected_dim.
+
+        The one body of the two stale-embedding reads, which differ only in the
+        population paged (``page_template``/``census_cypher``, as for
+        ``paged_ro_query``) and the ``method``/``noun`` they report under.
+        """
+        graph = self.graph_access.graph(group_id)
+        paged = await paged_ro_query(graph, page_template, census_cypher, op=method)
+        stale = [
+            (row[0], row[1], dim)
+            for row in _first_row_per_uuid(paged.rows, reader=method)
+            if (dim := _embedding_dim(row[2])) != expected_dim
+        ]
+        apply_incompleteness_policy(
+            paged,
+            method=method,
+            group_id=group_id,
+            returned_count=len(stale),
+            noun=noun,
+            consequence=(
+                'must not be taken as the full stale set, because a reindex '
+                'driven by it would look finished when it is not'
+            ),
+        )
         return stale
+
+    @_canonicalize_group_args
+    async def entity_uuids_with_prefix(
+        self, prefix: str, *, group_id: str
+    ) -> list[tuple[str, str]]:
+        """Return (uuid, name) for every Entity node whose uuid starts with *prefix*.
+
+        Read by ``services/id_resolver.py::IdResolver`` to classify a uuid
+        prefix; paginated, and a structurally incomplete read raises
+        ``IncompleteEnumerationError`` rather than returning a short list.
+        """
+        return await self._uuids_with_prefix(
+            prefix,
+            group_id=group_id,
+            page_template=_ENTITY_UUID_PREFIX_PAGE_TEMPLATE,
+            census_cypher=_ENTITY_UUID_PREFIX_CENSUS,
+            method='entity_uuids_with_prefix',
+            noun='entity nodes',
+        )
+
+    @_canonicalize_group_args
+    async def edge_uuids_with_prefix(
+        self, prefix: str, *, group_id: str
+    ) -> list[tuple[str, str]]:
+        """Return (uuid, fact) for every RELATES_TO edge whose uuid starts with *prefix*.
+
+        The edge counterpart of ``entity_uuids_with_prefix``, read by the same
+        ``services/id_resolver.py::IdResolver``.
+        """
+        return await self._uuids_with_prefix(
+            prefix,
+            group_id=group_id,
+            page_template=_EDGE_UUID_PREFIX_PAGE_TEMPLATE,
+            census_cypher=_EDGE_UUID_PREFIX_CENSUS,
+            method='edge_uuids_with_prefix',
+            noun='edges',
+        )
+
+    async def _uuids_with_prefix(
+        self,
+        prefix: str,
+        *,
+        group_id: str,
+        page_template: str,
+        census_cypher: str,
+        method: str,
+        noun: str,
+    ) -> list[tuple[str, str]]:
+        """Page (uuid, label) rows matching *prefix*; the one body of the two prefix reads."""
+        if not prefix:
+            raise ValueError(f'{method} needs a non-empty prefix')
+        upper = prefix[:-1] + chr(ord(prefix[-1]) + 1)
+        graph = self.graph_access.graph(group_id)
+        paged = await paged_ro_query(
+            graph, page_template, census_cypher, params={'prefix': prefix, 'upper': upper},
+            op=method,
+        )
+        matches = [
+            (row[0], row[1] or '')
+            for row in _first_row_per_uuid(paged.rows, reader=method)
+        ]
+        apply_incompleteness_policy(
+            paged,
+            method=method,
+            group_id=group_id,
+            returned_count=len(matches),
+            noun=noun,
+            consequence=(
+                f'must not be read as the full set of ids starting with {prefix!r}'
+            ),
+        )
+        return matches
 
     @_canonicalize_group_args
     async def query_edges_by_time_range(
@@ -1124,6 +2437,12 @@ class GraphitiBackend:
 
         Uses ro_query since no writes are performed.
 
+        PAGINATED (task 4869) through ``paged_ro_query``, because a window
+        spanning more edges than the server's result-set cap was silently
+        truncated; incompleteness follows the shared
+        ``apply_incompleteness_policy``.  See
+        plans/falkordb-resultset-cap-audit.md.
+
         Args:
             start: ISO 8601 string for the lower bound (inclusive).
             end: ISO 8601 string for the upper bound (inclusive).
@@ -1131,15 +2450,20 @@ class GraphitiBackend:
 
         Returns:
             List of dicts with keys: uuid, fact, name, valid_at, invalid_at.
+
+        Raises:
+            IncompleteEnumerationError: The read was structurally incomplete.
         """
-        graph = self._graph_for(group_id)
-        cypher = (
-            'MATCH ()-[e:RELATES_TO]->() '
-            'WHERE e.valid_at >= $start AND e.valid_at <= $end '
-            'RETURN e.uuid, e.fact, e.name, e.valid_at, e.invalid_at'
+        graph = self.graph_access.graph(group_id)
+        params = {'start': start, 'end': end}
+        paged = await paged_ro_query(
+            graph,
+            _EDGES_IN_VALID_AT_WINDOW_PAGE_TEMPLATE,
+            _EDGES_IN_VALID_AT_WINDOW_CENSUS,
+            params=params,
+            op='query_edges_by_time_range',
         )
-        result = await graph.ro_query(cypher, {'start': start, 'end': end})
-        return [
+        edges = [
             {
                 'uuid': row[0],
                 'fact': row[1],
@@ -1147,15 +2471,26 @@ class GraphitiBackend:
                 'valid_at': row[3],
                 'invalid_at': row[4],
             }
-            for row in (result.result_set or [])
+            for row in _first_row_per_uuid(paged.rows, reader='query_edges_by_time_range')
         ]
+        apply_incompleteness_policy(
+            paged,
+            method='query_edges_by_time_range',
+            group_id=group_id,
+            returned_count=len(edges),
+            noun='edges',
+            consequence=f'must not be treated as every edge in [{start}, {end}]',
+        )
+        return edges
 
     @_canonicalize_group_args
-    async def get_valid_edges_for_node(self, node_uuid: str, *, group_id: str) -> list[EdgeDict]:
+    async def get_valid_edges_for_node(
+        self, node_uuid: str, *, group_id: str,
+    ) -> list[DatedEdgeDict]:
         """Return all currently-valid RELATES_TO edges for an Entity node.
 
-        Matches the node as either source or target (undirected) and filters
-        edges where invalid_at IS NULL (i.e. not yet invalidated).
+        Matches the node as either source or target (undirected) and excludes
+        retired edges per ``ACTIVE_EDGE_PREDICATE`` (``invalid_at`` set).
 
         Deduplicates in Python, keyed on e.uuid. RELATES_TO edge uuids are
         unique graph-wide (task 2207 W6-delta stopped minting copied uuids in
@@ -1169,17 +2504,17 @@ class GraphitiBackend:
             group_id: Project graph to query.
 
         Returns:
-            List of dicts with keys: uuid, fact, name.
+            List of DatedEdgeDicts with keys: uuid, fact, name, valid_at, invalid_at.
         """
-        graph = self._graph_for(group_id)
+        graph = self.graph_access.graph(group_id)
         cypher = (
             'MATCH (n:Entity {uuid: $uuid})-[e:RELATES_TO]-() '
-            'WHERE e.invalid_at IS NULL '
-            'RETURN e.uuid, e.fact, e.name'
+            f'WHERE {ACTIVE_EDGE_PREDICATE} '
+            'RETURN e.uuid, e.fact, e.name, e.valid_at, e.invalid_at'
         )
-        result = await graph.ro_query(cypher, {'uuid': node_uuid})
-        seen: dict[str, EdgeDict] = {}
-        edges: list[EdgeDict] = []
+        result = await graph.ro_query(cypher, {'uuid': node_uuid}, op='get_valid_edges_for_node')
+        seen: dict[str, DatedEdgeDict] = {}
+        edges: list[DatedEdgeDict] = []
         for row in (result.result_set or []):
             edge_uuid = row[0]
             if edge_uuid in seen:
@@ -1189,7 +2524,7 @@ class GraphitiBackend:
                 # genuinely-distinct edges sharing a uuid would silently
                 # collapse to the first-seen row. Surface it at debug level
                 # rather than failing silently.
-                dup = self._edge_dict(row[0], row[1], row[2])
+                dup = self._dated_edge_dict(*row[:5])
                 prior = seen[edge_uuid]
                 if dup['fact'] != prior['fact'] or dup['name'] != prior['name']:
                     logger.debug(
@@ -1200,17 +2535,126 @@ class GraphitiBackend:
                         edge_uuid, prior['fact'], prior['name'], dup['fact'], dup['name'],
                     )
                 continue
-            edge = self._edge_dict(row[0], row[1], row[2])
+            edge = self._dated_edge_dict(*row[:5])
             seen[edge_uuid] = edge
             edges.append(edge)
         return edges
 
     @_canonicalize_group_args
+    async def count_foreign_relationships(
+        self, node_uuid: str, *, group_id: str, episode_uuid: str = ''
+    ) -> int:
+        """Count every relationship a DETACH DELETE of *node_uuid* would destroy.
+
+        WHAT IT ANSWERS, contrasted with its neighbour above.
+        :meth:`get_valid_edges_for_node` answers "does this node still carry
+        LIVE FACTS?" — it is typed to ``RELATES_TO`` and filtered to
+        ``ACTIVE_EDGE_PREDICATE``.  This one answers a different question:
+        "would deleting this node DESTROY ANYTHING?"  It is therefore
+        deliberately UNTYPED and UNFILTERED, because
+        :meth:`delete_entity_node` issues a bare
+        ``MATCH (n:Entity {uuid: $uuid}) DETACH DELETE n`` that removes EVERY
+        relationship — invalidated ``RELATES_TO`` temporal history and
+        Episodic ``MENTIONS`` included.  A guard authorising a destructive
+        operation must test exactly what that operation destroys, and every
+        other count/edge query in this module is typed to ``RELATES_TO``, so
+        none of them can.
+
+        WHY ``MENTIONS`` MATTERS.  An Entity's provenance links from Episodic
+        nodes are real, load-bearing graph content — ``maintenance/
+        cross_graph_move.py`` recreates ``(ep:Episodic)-[e:MENTIONS]->(n:Entity)``
+        links precisely because losing them loses provenance — and they are
+        wholly invisible to every ``RELATES_TO``-typed query in this file.
+
+        WHY THE ``episode_uuid`` EXCLUSION IS NARROW AND OPTIONAL.  It exists so
+        the single caller (``MemoryService._cleanup_emptied_nodes``) can ask "is
+        this node attached to anything OTHER than the write currently in
+        flight?".  graphiti_core's extraction mints a mis-resolved node AND its
+        ``MENTIONS`` link from the same episodic node in the same
+        ``add_episode``, so a strict zero-degree predicate would never fire on
+        the very phantom that cleanup exists to remove.  Excluding only THIS
+        episode's own ``MENTIONS`` is what actually encodes "minted by this very
+        episode": any invalidated ``RELATES_TO``, or any ``MENTIONS`` from a
+        DIFFERENT episode, proves pre-existing history and still counts.
+        It defaults to ``''``, which applies no exclusion at all and makes the
+        primitive strictly conservative — the fail-closed default.
+
+        THE SELF-LOOP NOTE.  An A->A relationship double-matches the undirected
+        pattern and is intentionally NOT deduped, which is the OPPOSITE choice
+        from :meth:`get_valid_edges_for_node`'s uuid-keyed dedup.  The asymmetry
+        is correct because the two values are consumed differently: that one's
+        list is enumerated, while this one is consumed only as ``== 0``.
+        Over-counting can therefore only ever REFUSE a delete, which is the safe
+        direction; under-counting would authorise one.
+
+        READ-ONLY, and must stay so — it runs on ``ro_query``.  A guard that can
+        write is a guard that can cause the damage it exists to prevent.
+
+        THE ONLY ZERO THIS RETURNS IS ONE THE SERVER ACTUALLY SAID.
+        ``count(r)`` is an UNGROUPED aggregate — it carries no grouping key —
+        so against a real server it yields exactly one row whether or not the
+        ``MATCH`` found anything, and a node with no relationships at all comes
+        back as a readable ``0``.  ``int(rows[0][0])`` is therefore the ONLY
+        zero path, and no legitimate call can reach an empty or ``None``
+        ``result_set`` at all.
+
+        Every OTHER response shape RAISES, and the arms are deliberately
+        symmetric: an empty ``result_set``, an absent one, and a row that is
+        present but unreadable are all equally uninterpretable, so none of them
+        may be quietly degraded into the single value that AUTHORISES a
+        deletion.  An earlier revision returned ``0`` for the two empty arms;
+        that was the one fail-OPEN branch in a guard whose entire purpose is to
+        prevent irreversible loss of a real entity's temporal history, and the
+        asymmetry with the raising arm was unmotivated.  Raising costs nothing
+        on every real path, because no real path gets here.  The caller wraps
+        this in a per-candidate ``try``/``except``, so a raise becomes a logged
+        skip — a refusal to delete.
+
+        Args:
+            node_uuid: UUID of the Entity node whose degree to measure.
+            group_id: Project graph to query.
+            episode_uuid: UUID of the episode whose write is in flight, whose
+                own ``MENTIONS`` link is excluded from the count. ``''`` (the
+                default) excludes nothing.
+
+        Returns:
+            The number of relationships of any type and any validity attached
+            to the node, minus this episode's own ``MENTIONS`` link.
+
+        Raises:
+            RuntimeError: if the backend is not initialized, or if the query
+                came back with no readable row — see above; that is a broken
+                response, never a node with no relationships.
+            IndexError/TypeError/ValueError: if the row is present but its
+                first column cannot be read as an int.
+        """
+        graph = self.graph_access.graph(group_id)
+        cypher = 'MATCH (n:Entity {uuid: $uuid})-[r]-(m) '
+        params: dict[str, Any] = {'uuid': node_uuid}
+        if episode_uuid:
+            cypher += "WHERE NOT (type(r) = 'MENTIONS' AND m.uuid = $episode_uuid) "
+            params['episode_uuid'] = episode_uuid
+        cypher += 'RETURN count(r)'
+        result = await graph.ro_query(cypher, params, op='count_foreign_relationships')
+        rows = result.result_set or []
+        if not rows:
+            # NOT a node with no relationships — that comes back as a readable
+            # `0` row. This is a response nobody can interpret, and reading it
+            # as `0` would authorise a DETACH DELETE on the strength of it.
+            raise RuntimeError(
+                'count_foreign_relationships: empty result_set for node '
+                f'{node_uuid!r} in group {group_id!r}; count(r) is an ungrouped '
+                'aggregate and always yields one row, so this is a broken '
+                'response, not a zero-degree node'
+            )
+        return int(rows[0][0])
+
+    @_canonicalize_group_args
     async def get_connected_entity_uuids(self, uuid: str, *, group_id: str) -> list[str]:
         """Return distinct UUID strings of entities connected to the given node via valid edges.
 
-        Queries all RELATES_TO edges where invalid_at IS NULL and excludes the
-        node itself (self-loops excluded via ``m.uuid <> $uuid``).
+        Queries all active RELATES_TO edges (``ACTIVE_EDGE_PREDICATE``) and
+        excludes the node itself (self-loops excluded via ``m.uuid <> $uuid``).
 
         Collects neighbours BEFORE deletion so the caller can refresh their
         summaries after the target node is removed (edges vanish with DETACH DELETE).
@@ -1225,21 +2669,136 @@ class GraphitiBackend:
         Raises:
             RuntimeError: if the backend is not initialized.
         """
-        graph = self._graph_for(group_id)
+        graph = self.graph_access.graph(group_id)
         cypher = (
             'MATCH (n:Entity {uuid: $uuid})-[e:RELATES_TO]-(m:Entity) '
-            'WHERE e.invalid_at IS NULL AND m.uuid <> $uuid '
+            f'WHERE {ACTIVE_EDGE_PREDICATE} AND m.uuid <> $uuid '
             'RETURN DISTINCT m.uuid'
         )
-        result = await graph.ro_query(cypher, {'uuid': uuid})
+        result = await graph.ro_query(cypher, {'uuid': uuid}, op='get_connected_entity_uuids')
         return [row[0] for row in (result.result_set or [])]
+
+    @_canonicalize_group_args
+    async def enumerate_all_valid_edges(
+        self, *, group_id: str, page_size: int = _DEFAULT_READ_PAGE_SIZE
+    ) -> tuple[dict[str, list[EdgeDict]], PagedRead]:
+        """Paginated variant of get_all_valid_edges that also reports completeness.
+
+        Same grouping and dedup semantics as get_all_valid_edges (which is a
+        thin shim over this method); the difference is that the completeness
+        of the underlying enumeration is returned as a first-class value
+        instead of only reaching a log line.
+
+        Args:
+            group_id: Project graph to query.
+            page_size: Rows per page. Must stay strictly below the server's
+                result-set cap — see paged_ro_query.
+
+        Returns:
+            (grouped, paged) where *grouped* is the same dict
+            get_all_valid_edges returns and *paged* is the PagedRead carrying
+            ``complete``/``rows_seen``/``expected_rows``/``reason``.
+        """
+        graph = self.graph_access.graph(group_id)
+        paged = await paged_ro_query(
+            graph,
+            _ALL_VALID_EDGES_PAGE_TEMPLATE,
+            _ALL_VALID_EDGES_CENSUS,
+            page_size=page_size,
+            op='enumerate_all_valid_edges',
+        )
+        return self._group_valid_edge_rows(
+            paged.rows, reader='enumerate_all_valid_edges'
+        ), paged
+
+    @_canonicalize_group_args
+    async def enumerate_valid_edges_mentioning(
+        self,
+        substring: str,
+        *,
+        group_id: str,
+        page_size: int = _DEFAULT_READ_PAGE_SIZE,
+    ) -> tuple[dict[str, list[EdgeDict]], PagedRead]:
+        """``enumerate_all_valid_edges`` narrowed to facts containing *substring*.
+
+        A task-agnostic candidate-NARROWING primitive, in the sense of
+        ``find_entity_nodes_by_name_substring``: it returns a SUPERSET (a
+        digit needle also matches '14201' or a date), and the CALLER applies
+        its precise membership test. The needle is bound as ``$substring``,
+        never interpolated.
+
+        Paged rather than single-shot, unlike that sibling: an unselective
+        needle can exceed the server's row cap, and the shared ``ORDER BY``
+        is the total row order paging needs. Measured row counts live in
+        plans/falkordb-resultset-cap-audit.md.
+
+        Like ``enumerate_all_valid_edges`` it NEVER raises on incompleteness;
+        it reports it, and applying ``apply_incompleteness_policy`` is the
+        caller's job.
+
+        Raises:
+            ValueError: *substring* is empty. An empty CONTAINS matches every
+                edge, silently turning the narrowed read into a full one.
+        """
+        if not substring:
+            raise ValueError(
+                'enumerate_valid_edges_mentioning needs a non-empty substring: '
+                f'an empty one matches every valid edge (got {substring!r})'
+            )
+        graph = self.graph_access.graph(group_id)
+        paged = await paged_ro_query(
+            graph,
+            _VALID_EDGES_MENTIONING_PAGE_TEMPLATE,
+            _VALID_EDGES_MENTIONING_CENSUS,
+            params={'substring': substring},
+            page_size=page_size,
+            op='enumerate_valid_edges_mentioning',
+        )
+        return self._group_valid_edge_rows(
+            paged.rows, reader='enumerate_valid_edges_mentioning'
+        ), paged
+
+    def _group_valid_edge_rows(
+        self, rows: list[list], *, reader: str
+    ) -> dict[str, list[EdgeDict]]:
+        """Group (n.uuid, e.uuid, fact, name) rows by entity, deduped on the pair.
+
+        The dedup map is built ONCE across every page, never per page: the
+        same (n.uuid, e.uuid) pair can straddle a page boundary, and a
+        per-page map would let the repeat through and double-count the edge.
+        See ``get_all_valid_edges`` for why the pair is the right key.
+        """
+        seen: dict[tuple[str, str], EdgeDict] = {}
+        grouped: dict[str, list[EdgeDict]] = {}
+        for row in rows:
+            entity_uuid, edge_uuid = row[0], row[1]
+            key = (entity_uuid, edge_uuid)
+            if key in seen:
+                # Diagnostic only: see get_valid_edges_for_node — the same
+                # uuid-uniqueness invariant underpins this dedup key.
+                dup = self._edge_dict(row[1], row[2], row[3])
+                prior = seen[key]
+                if dup['fact'] != prior['fact'] or dup['name'] != prior['name']:
+                    logger.debug(
+                        '%s: (entity, edge) pair %s seen again '
+                        'with differing fact/name (kept fact=%r name=%r, saw '
+                        'fact=%r name=%r) — uuid-uniqueness invariant may be '
+                        'violated; keeping first-seen row',
+                        reader, key, prior['fact'], prior['name'],
+                        dup['fact'], dup['name'],
+                    )
+                continue
+            edge = self._edge_dict(row[1], row[2], row[3])
+            seen[key] = edge
+            grouped.setdefault(entity_uuid, []).append(edge)
+        return grouped
 
     @_canonicalize_group_args
     async def get_all_valid_edges(self, *, group_id: str) -> dict[str, list[EdgeDict]]:
         """Return all currently-valid RELATES_TO edges grouped by entity UUID.
 
-        Bulk variant of get_valid_edges_for_node that issues a single Cypher query
-        instead of O(N) per-entity round-trips.  The undirected MATCH pattern causes
+        Bulk variant of get_valid_edges_for_node that pages through the whole
+        graph instead of O(N) per-entity round-trips.  The undirected MATCH pattern causes
         each directed edge to appear under both its source and target entity: for a
         directed A→B edge, traversal matches it from A's side (row: A.uuid, e.uuid)
         and from B's side (row: B.uuid, e.uuid) — two genuinely distinct rows because
@@ -1257,6 +2816,25 @@ class GraphitiBackend:
 
         Uses ro_query since no writes are performed.
 
+        PAGINATED (task 4340).  This read is NOT a single query: FalkorDB
+        truncates every result set at a server-wide RESULTSET_SIZE ceiling,
+        silently, and this query exceeded it by roughly 2x on the live corpus
+        — about HALF the valid-edge population was invisible to every caller,
+        with no error and no marker.  Do not "simplify" it back to one query.
+        The measured row counts, the paging cost, and the per-query audit that
+        found this live in plans/falkordb-resultset-cap-audit.md (the single
+        place they are recorded, so a re-measurement is a one-file edit); the
+        ORDER BY and completeness rules that make paging safe are in
+        paged_ro_query.
+
+        This is read_all_valid_edges_checked without the verdict.
+        Incompleteness is handled by the shared apply_incompleteness_policy:
+        STRUCTURAL kinds raise IncompleteEnumerationError, EMPIRICAL ones warn
+        and return what was fetched.  See that helper for the policy and
+        IncompleteEnumerationError for why a structural non-read must not be
+        handed back as a collection.  enumerate_all_valid_edges returns the
+        same completeness signal as a value and never raises.
+
         Args:
             group_id: Project graph to query.
 
@@ -1266,39 +2844,18 @@ class GraphitiBackend:
             Each directed edge appears under both its source and target entity UUID
             (double-attribution from the undirected MATCH pattern).
 
+        Raises:
+            IncompleteEnumerationError: The underlying enumeration was
+                structurally incomplete — see the policy above.
+
         Note:
             Using a directed pattern (n:Entity)-[e:RELATES_TO]->() would give
-            single-appearance semantics per edge if ever needed.
+            single-appearance semantics per edge if ever needed.  It would also
+            roughly halve the row count — but pagination would still be
+            required, because 12506 distinct edges exceeds the cap on its own.
+            Halving buys margin, not correctness.
         """
-        graph = self._graph_for(group_id)
-        cypher = (
-            'MATCH (n:Entity)-[e:RELATES_TO]-() '
-            'WHERE e.invalid_at IS NULL '
-            'RETURN n.uuid, e.uuid, e.fact, e.name'
-        )
-        result = await graph.ro_query(cypher)
-        seen: dict[tuple[str, str], EdgeDict] = {}
-        grouped: dict[str, list[EdgeDict]] = {}
-        for row in (result.result_set or []):
-            entity_uuid, edge_uuid = row[0], row[1]
-            key = (entity_uuid, edge_uuid)
-            if key in seen:
-                # Diagnostic only: see get_valid_edges_for_node — the same
-                # uuid-uniqueness invariant underpins this method's dedup key.
-                dup = self._edge_dict(row[1], row[2], row[3])
-                prior = seen[key]
-                if dup['fact'] != prior['fact'] or dup['name'] != prior['name']:
-                    logger.debug(
-                        'get_all_valid_edges: (entity, edge) pair %s seen again '
-                        'with differing fact/name (kept fact=%r name=%r, saw '
-                        'fact=%r name=%r) — uuid-uniqueness invariant may be '
-                        'violated; keeping first-seen row',
-                        key, prior['fact'], prior['name'], dup['fact'], dup['name'],
-                    )
-                continue
-            edge = self._edge_dict(row[1], row[2], row[3])
-            seen[key] = edge
-            grouped.setdefault(entity_uuid, []).append(edge)
+        grouped, _ = await read_all_valid_edges_checked(self, group_id=group_id)
         return grouped
 
     @_canonicalize_group_args
@@ -1320,14 +2877,14 @@ class GraphitiBackend:
             return 0
         logger.info('Deleting %d edge(s)', len(uuids))
         logger.debug('Edge UUIDs to delete: %s', uuids)
-        graph = self._graph_for(group_id)
+        graph = self.graph_access.graph(group_id)
         # Pre-count: how many of the requested UUIDs actually exist as edges
         count_cypher = (
             'MATCH ()-[e:RELATES_TO]->() '
             'WHERE e.uuid IN $uuids '
             'RETURN count(e) AS found'
         )
-        count_result = await graph.query(count_cypher, {'uuids': uuids})
+        count_result = await graph.query(count_cypher, {'uuids': uuids}, op='bulk_remove_edges')
         found = int(count_result.result_set[0][0]) if count_result.result_set else 0
         # Delete the edges
         delete_cypher = (
@@ -1335,7 +2892,7 @@ class GraphitiBackend:
             'WHERE e.uuid IN $uuids '
             'DELETE e'
         )
-        await graph.query(delete_cypher, {'uuids': uuids})
+        await graph.query(delete_cypher, {'uuids': uuids}, op='bulk_remove_edges')
         return found
 
     @_canonicalize_group_args
@@ -1355,8 +2912,8 @@ class GraphitiBackend:
         ``resolve_extracted_edges`` fast-path can catch, since those only
         see the edges before they converge onto the same node pair.
 
-        Queries the node's currently-valid (``invalid_at IS NULL``)
-        incident edges (undirected, so directed and reverse-directed exact
+        Queries the node's active (``ACTIVE_EDGE_PREDICATE``) incident
+        edges (undirected, so directed and reverse-directed exact
         duplicates both collapse), delegates grouping + survivor selection
         to ``_duplicate_edge_uuids``, and deletes any non-survivor uuids via
         ``bulk_remove_edges``.
@@ -1373,13 +2930,13 @@ class GraphitiBackend:
         Raises:
             RuntimeError: if the backend is not initialized.
         """
-        graph = self._graph_for(group_id)
+        graph = self.graph_access.graph(group_id)
         cypher = (
             'MATCH (n:Entity {uuid: $uuid})-[e:RELATES_TO]-(m:Entity) '
-            'WHERE e.invalid_at IS NULL '
+            f'WHERE {ACTIVE_EDGE_PREDICATE} '
             'RETURN m.uuid, e.uuid, e.fact, e.valid_at'
         )
-        result = await graph.ro_query(cypher, {'uuid': node_uuid})
+        result = await graph.ro_query(cypher, {'uuid': node_uuid}, op='dedup_valid_edges_for_node')
         duplicate_uuids = self._duplicate_edge_uuids(result.result_set or [])
         if not duplicate_uuids:
             return 0
@@ -1412,6 +2969,39 @@ class GraphitiBackend:
         old.uuid would silently coalesce any pre-existing dup-uuid edges
         instead of redirecting each one individually (task 2207 W6-δ).
 
+        Losslessly PRESERVED on a redirected edge (copied by direct
+        ``old.<prop>`` reference, which also preserves the vecf32
+        ``fact_embedding`` type): ``name``, ``fact``, ``fact_embedding``,
+        ``valid_at``, ``invalid_at``, ``expired_at``, ``created_at``,
+        ``group_id`` and ``episodes`` — a set ``reassign_edge``, this method's
+        single-edge sibling, also preserves, which is the reason that set is
+        stated here rather than left to be diffed. The edge ``uuid`` is the ONE
+        exception, and deliberately so: it is re-minted fresh per redirect for
+        the dup-uuid reason above, with the original recorded as
+        ``superseded_edge_uuid``, overwriting any stamp the edge already
+        carried. ``reassign_edge`` keeps the uuid, so it carries that stamp
+        unchanged instead.
+
+        ``expired_at`` is load-bearing and its loss was silent (task 4986):
+        ``expired_at`` SET with ``invalid_at`` NULL is the restore hooks'
+        deliberately-restored signature — the hooks clear ``invalid_at`` and
+        never ``expired_at`` — so dropping it re-exposes a restored edge to
+        false supersession. It is written adjacent to ``invalid_at`` in both
+        SET lists, matching ``reassign_edge``, because that adjacency is what
+        makes the next omission visible by inspection; the omission this
+        closes was exactly ``expired_at`` reaching one list and not its twin.
+
+        ``new.reassigned_from_node_uuid`` records WHICH node the endpoint
+        left, the endpoint-relocation audit stamp alongside
+        ``superseded_edge_uuid``'s "which edge this replaced". It reuses
+        ``reassign_edge``'s property name rather than minting a merge-specific
+        one, so merge relocations are visible to the audits already written
+        against that spelling. A merge relocation also mints a fresh uuid and
+        stamps ``superseded_edge_uuid``; a uuid-preserving ``reassign_edge``
+        never mints a stamp, but carries an existing one. So an unstamped edge
+        was never re-minted by a merge, while a stamp names the merge that last
+        re-minted the edge's uuid, not necessarily the edge's last relocation.
+
         This trades a single bulk statement per direction for one query per
         edge (N+1 round-trips) — the deliberate cost of the ID(old) keying
         above. Entity merges are rare and touch modest-degree nodes in
@@ -1438,13 +3028,14 @@ class GraphitiBackend:
             after each per-edge query completes successfully, so they
             reflect edges actually redirected rather than merely enumerated.
         """
-        graph = self._graph_for(group_id)
+        graph = self.graph_access.graph(group_id)
 
         # Phase 1: Delete inter-node edges (edges between the two merging nodes)
         count_inter = await graph.query(
             'MATCH (dep:Entity {uuid: $dep_uuid})-[e:RELATES_TO]-(sur:Entity {uuid: $sur_uuid}) '
             'RETURN count(e) AS cnt',
             {'dep_uuid': deprecated_uuid, 'sur_uuid': surviving_uuid},
+            op='redirect_node_edges',
         )
         inter_node_deleted = (
             int(count_inter.result_set[0][0]) if count_inter.result_set else 0
@@ -1453,6 +3044,7 @@ class GraphitiBackend:
             'MATCH (dep:Entity {uuid: $dep_uuid})-[e:RELATES_TO]-(sur:Entity {uuid: $sur_uuid}) '
             'DELETE e',
             {'dep_uuid': deprecated_uuid, 'sur_uuid': surviving_uuid},
+            op='redirect_node_edges',
         )
 
         # Phase 2: Redirect outgoing edges (deprecated → target). Enumerate
@@ -1464,6 +3056,7 @@ class GraphitiBackend:
             'MATCH (dep:Entity {uuid: $dep_uuid})-[old:RELATES_TO]->() '
             'RETURN ID(old) AS eid',
             {'dep_uuid': deprecated_uuid},
+            op='redirect_node_edges',
         )
         out_eids = [row[0] for row in (out_enum.result_set or [])]
         outgoing_redirected = 0
@@ -1481,9 +3074,11 @@ class GraphitiBackend:
                 '    new.fact_embedding = old.fact_embedding, '
                 '    new.valid_at = old.valid_at, '
                 '    new.invalid_at = old.invalid_at, '
+                '    new.expired_at = old.expired_at, '
                 '    new.created_at = old.created_at, '
                 '    new.group_id = old.group_id, '
                 '    new.episodes = old.episodes, '
+                '    new.reassigned_from_node_uuid = $dep_uuid, '
                 '    new.source_node_uuid = $sur_uuid '
                 'DELETE old',
                 {
@@ -1492,6 +3087,7 @@ class GraphitiBackend:
                     'eid': eid,
                     'new_uuid': new_uuid,
                 },
+                op='redirect_node_edges',
             )
             outgoing_redirected += 1
 
@@ -1504,6 +3100,7 @@ class GraphitiBackend:
             'MATCH (source)-[old:RELATES_TO]->(dep:Entity {uuid: $dep_uuid}) '
             'RETURN ID(old) AS eid',
             {'dep_uuid': deprecated_uuid},
+            op='redirect_node_edges',
         )
         in_eids = [row[0] for row in (in_enum.result_set or [])]
         incoming_redirected = 0
@@ -1521,9 +3118,11 @@ class GraphitiBackend:
                 '    new.fact_embedding = old.fact_embedding, '
                 '    new.valid_at = old.valid_at, '
                 '    new.invalid_at = old.invalid_at, '
+                '    new.expired_at = old.expired_at, '
                 '    new.created_at = old.created_at, '
                 '    new.group_id = old.group_id, '
                 '    new.episodes = old.episodes, '
+                '    new.reassigned_from_node_uuid = $dep_uuid, '
                 '    new.target_node_uuid = $sur_uuid '
                 'DELETE old',
                 {
@@ -1532,6 +3131,7 @@ class GraphitiBackend:
                     'eid': eid,
                     'new_uuid': new_uuid,
                 },
+                op='redirect_node_edges',
             )
             incoming_redirected += 1
 
@@ -1545,6 +3145,115 @@ class GraphitiBackend:
             'incoming_redirected': incoming_redirected,
             'inter_node_deleted': inter_node_deleted,
         }
+
+    @_canonicalize_group_args
+    async def redirect_node_mentions(
+        self, deprecated_uuid: str, surviving_uuid: str, *, group_id: str
+    ) -> dict:
+        """Relocate Episodic MENTIONS provenance from one Entity onto another.
+
+        The MENTIONS sibling of :meth:`redirect_node_edges`: same merge-time
+        endpoint move, different relationship type. That one is RELATES_TO-typed
+        in all three of its phases, and :meth:`delete_entity_node` then issues a
+        bare DETACH DELETE that destroys EVERY remaining link — so without this
+        method a merge silently destroyed the loser's episode provenance
+        (task 4986 loss mode 1).
+
+        Only INCOMING links exist to consider: MENTIONS is always
+        Episodic->Entity, so unlike ``redirect_node_edges`` there is no
+        outgoing direction and no inter-node phase.
+
+        AN ALREADY-LINKED EPISODE IS SKIPPED, NOT MOVED AND NOT DELETED. Moving
+        it would give the survivor two links for one episode; deleting it would
+        make this a destructive primitive rather than a relocation. Provenance
+        is the (episode, entity) PAIR, not the link object — when the survivor
+        already carries that episode, nothing is lost by leaving the loser's
+        redundant copy for the CALLER's delete to remove. Leaving the deletion
+        to the caller is also what makes a re-run after a partial failure
+        converge: already-moved links are on the survivor and are simply not
+        seen again, and the remaining ones move. The skip is COUNTED rather than
+        silent, so a merge log records the difference between "two links moved"
+        and "two links moved, one was redundant".
+
+        Enumerated by the stable internal ``ID(m)``, never ``m.uuid``, for the
+        same reason ``redirect_node_edges`` enumerates by ``ID(old)``: a uuid may
+        already be duplicated and so cannot target a single link. The
+        existence probe runs INSIDE the loop, which is what makes two links
+        from the SAME episode collapse to one — hoisted above the loop it
+        would read "not linked" once and move both.
+
+        Unlike the RELATES_TO redirect, the link ``uuid`` is PRESERVED rather
+        than re-minted: that one mints a fresh uuid4 to repair a graph-wide
+        per-edge uuid uniqueness invariant, and nothing folds MENTIONS links by
+        uuid, so preserving it keeps the episode-link identity stable across a
+        merge. ``uuid``, ``group_id`` and ``created_at`` are the COMPLETE
+        property set — graphiti_core's ``EPISODIC_EDGE_SAVE`` writes only those
+        three, and MENTIONS carries no embedding — the same three copied by
+        ``maintenance/cross_graph_move.py``, which documents why.
+
+        Runs in no transaction and is safe to retry from the top after a crash
+        partway through, for the convergence reason above. Counters are
+        incremented only after each write completes, so they reflect work done
+        rather than work enumerated.
+
+        Args:
+            deprecated_uuid: UUID of the entity node losing its MENTIONS links.
+            surviving_uuid: UUID of the entity node that absorbs them.
+            group_id: Project graph to target.
+
+        Returns:
+            Dict with keys: ``redirected`` (links moved onto the survivor) and
+            ``already_linked`` (links left in place because the survivor
+            already carried that episode).
+        """
+        graph = self.graph_access.graph(group_id)
+
+        enumerated = await graph.ro_query(
+            'MATCH (ep:Episodic)-[m:MENTIONS]->(dep:Entity {uuid: $dep_uuid}) '
+            'RETURN ID(m) AS eid, ep.uuid AS episode_uuid',
+            {'dep_uuid': deprecated_uuid},
+            op='redirect_node_mentions',
+        )
+        links = [(row[0], row[1]) for row in (enumerated.result_set or [])]
+
+        redirected = 0
+        already_linked = 0
+        for eid, episode_uuid in links:
+            existing = await graph.ro_query(
+                'MATCH (ep:Episodic {uuid: $episode_uuid})-[m:MENTIONS]->'
+                '(sur:Entity {uuid: $sur_uuid}) '
+                'RETURN m.uuid LIMIT 1',
+                {'episode_uuid': episode_uuid, 'sur_uuid': surviving_uuid},
+                op='redirect_node_mentions',
+            )
+            if existing.result_set:
+                already_linked += 1
+                continue
+
+            await graph.query(
+                'MATCH (ep:Episodic)-[old:MENTIONS]->(dep:Entity {uuid: $dep_uuid}) '
+                'WHERE ID(old) = $eid '
+                'MATCH (sur:Entity {uuid: $sur_uuid}) '
+                'CREATE (ep)-[new:MENTIONS]->(sur) '
+                'SET new.uuid = old.uuid, '
+                '    new.group_id = old.group_id, '
+                '    new.created_at = old.created_at, '
+                '    new.reassigned_from_node_uuid = $dep_uuid '
+                'DELETE old',
+                {
+                    'dep_uuid': deprecated_uuid,
+                    'sur_uuid': surviving_uuid,
+                    'eid': eid,
+                },
+                op='redirect_node_mentions',
+            )
+            redirected += 1
+
+        logger.info(
+            'redirect_node_mentions: dep=%s sur=%s redirected=%d already_linked=%d',
+            deprecated_uuid, surviving_uuid, redirected, already_linked,
+        )
+        return {'redirected': redirected, 'already_linked': already_linked}
 
     async def _repair_duplicate_edge_uuids(self, group_id: str) -> int:
         """One-shot idempotent repair: re-mint fresh uuids on legacy dup-uuid
@@ -1599,13 +3308,18 @@ class GraphitiBackend:
         `old_uuid` lost the race, which is acceptable for an audit-only
         property.
 
+        Deleted-graph note: detection is read over GRAPH.RO_QUERY, so a graph
+        deleted after the startup scan listed it is refused rather than
+        recreated empty. Pinned by
+        fused-memory/tests/test_startup_identity_scan.py::TestRepairDuplicateEdgeUuidsLiveFalkorDB::test_repair_on_a_graph_deleted_after_listing_leaves_it_deleted.
+
         Args:
             group_id: Project graph to repair.
 
         Returns:
             Count of edges re-minted (0 on a clean graph — no-op).
         """
-        graph = self._graph_for(group_id)
+        graph = self.graph_access.graph(group_id)
         detect_cypher = (
             'MATCH ()-[e:RELATES_TO]->() '
             'WITH e.uuid AS u, count(*) AS c, collect(ID(e)) AS eids '
@@ -1613,7 +3327,7 @@ class GraphitiBackend:
             'RETURN u, eids'
         )
         start = time.monotonic()
-        detect_result = await graph.query(detect_cypher)
+        detect_result = await graph.ro_query(detect_cypher, op='_repair_duplicate_edge_uuids')
         dup_groups = detect_result.result_set or []
         repaired = 0
         for old_uuid, eids in dup_groups:
@@ -1624,6 +3338,7 @@ class GraphitiBackend:
                     'WHERE ID(e) = $eid '
                     'SET e.uuid = $new_uuid, e.superseded_edge_uuid = $old_uuid',
                     {'eid': eid, 'new_uuid': new_uuid, 'old_uuid': old_uuid},
+                    op='_repair_duplicate_edge_uuids',
                 )
                 repaired += 1
         elapsed_ms = (time.monotonic() - start) * 1000
@@ -1648,17 +3363,53 @@ class GraphitiBackend:
 
         Orchestrates the full merge workflow:
         1. Validate both nodes exist via get_node_text (raises NodeNotFoundError if
-           either is missing).
+           either is missing), keeping the deprecated node's SUMMARY.
         2. Redirect all RELATES_TO edges from deprecated to surviving via
            redirect_node_edges.
-        3. Delete the deprecated node via delete_entity_node.
-        4. Collapse any parallel duplicate edges left on the surviving node via
+        3. Relocate Episodic MENTIONS provenance onto the survivor via
+           redirect_node_mentions.
+        4. Census what the delete is about to destroy that step 2/3 did not
+           relocate, via count_foreign_relationships (best-effort).
+        5. Delete the deprecated node via delete_entity_node.
+        6. Collapse any parallel duplicate edges left on the surviving node via
            dedup_valid_edges_for_node (task 2118 — redirect_node_edges mints a
            fresh uuid per redirected edge, but the survivor may already hold
            an equivalent (neighbor, fact, valid_at) edge, so this
            uuid-agnostic pass is still required to collapse those parallel
            duplicates).
-        5. Rebuild the surviving node's summary via refresh_entity_summary.
+        7. Rebuild the surviving node's summary via refresh_entity_summary.
+
+        STEP 3 MUST PRECEDE STEP 5. ``delete_entity_node`` issues a bare
+        ``MATCH (n:Entity {uuid: $uuid}) DETACH DELETE n``, which destroys EVERY
+        remaining relationship — so a MENTIONS relocation ordered after it has
+        nothing left to move, and the loser's episode provenance is simply gone
+        (task 4986 loss mode 1). The same ordering is why step 4's census is
+        taken before the delete: afterwards there is nothing left to count.
+
+        STEP 4 IS AN AUDIT DATUM, NEVER A GATE. By the time it runs, steps 2 and
+        3 are already committed and irreversible, so a raise must not propagate
+        — that would abort a half-applied merge on the strength of a failed
+        OBSERVATION. A failed census records ``None``, which keeps "could not
+        measure" distinct from "measured zero", the same distinction
+        ``count_foreign_relationships`` itself refuses to blur.
+
+        THE DEPRECATED NODE'S SUMMARY IS KEPT (task 4986 loss mode 5). Step 7
+        rebuilds the survivor's summary from EDGES only, so any of the loser's
+        summary text that no edge backs is unrecoverable once the node is gone.
+        The value is already in hand from step 1's existence check; returning it
+        rather than discarding it is the whole fix.
+
+        ONE STRUCTURED RECORD PER MERGE, AND IT IS THE RETURNED OBJECT. The INFO
+        line is ``json.dumps`` of the very dict returned below — not a payload
+        assembled beside it, which would be a second copy of the same facts and
+        would drift the first time a key was added to one of them. JSON rather
+        than a ``key=value`` line because the payload carries the loser's full
+        summary: arbitrary prose with quotes, newlines and non-ASCII that a
+        reader should not need an ad-hoc parser to recover.
+        ``MemoryService.merge_entities`` already persists this same dict as the
+        write journal's ``result_summary``, so the durable record and the
+        operator-visible one carry identical fields and cannot disagree — the
+        merge's provenance is recoverable from either surface.
 
         Args:
             deprecated_uuid: UUID of the entity node to be deleted.
@@ -1666,22 +3417,59 @@ class GraphitiBackend:
 
         Returns:
             Audit dict with keys: surviving_uuid, surviving_name, deprecated_uuid,
-            deprecated_name, edges_redirected (sub-dict with redirect counts),
-            duplicate_edges_removed (count collapsed post-redirect),
-            surviving_summary (dict with old/new summary and edge_count).
+            deprecated_name, deprecated_summary (the loser's summary text, which
+            nothing else preserves), edges_redirected (sub-dict with RELATES_TO
+            redirect counts), mentions_redirected (sub-dict with the MENTIONS
+            relocated/already-linked counts), residual_relationships_destroyed
+            (what the DETACH DELETE destroyed that was not relocated, or None if
+            the census could not be taken), duplicate_edges_removed (count
+            collapsed post-redirect), surviving_summary (dict with old/new
+            summary and edge_count).
 
         Raises:
             NodeNotFoundError: if either UUID does not exist.
             RuntimeError: if the backend is not initialized.
         """
-        # Validate both nodes exist and capture their names
-        dep_name, _ = await self.get_node_text(deprecated_uuid, group_id=group_id)
+        # Validate both nodes exist and capture their names. The deprecated
+        # node's SUMMARY is kept, not discarded: refresh_entity_summary rebuilds
+        # the survivor's summary from EDGES only, so any of the loser's summary
+        # text no edge backs is unrecoverable once the node is gone.
+        dep_name, dep_summary = await self.get_node_text(deprecated_uuid, group_id=group_id)
         sur_name, _ = await self.get_node_text(surviving_uuid, group_id=group_id)
 
         # Redirect edges
         edges_redirected = await self.redirect_node_edges(
             deprecated_uuid, surviving_uuid, group_id=group_id,
         )
+
+        # Relocate Episodic MENTIONS provenance. MUST precede the delete:
+        # delete_entity_node's DETACH DELETE destroys every remaining link, so
+        # a relocation ordered after it would have nothing left to move.
+        mentions_redirected = await self.redirect_node_mentions(
+            deprecated_uuid, surviving_uuid, group_id=group_id,
+        )
+
+        # What this DETACH DELETE is about to destroy that was NOT relocated.
+        # Best-effort and never a gate: both relocations above are already
+        # committed and irreversible, so a failed OBSERVATION must not abort a
+        # half-applied merge. None keeps "could not measure" distinct from
+        # "measured zero" — the distinction count_foreign_relationships itself
+        # refuses to blur.
+        try:
+            residual = await self.count_foreign_relationships(
+                deprecated_uuid, group_id=group_id,
+            )
+        except Exception:
+            # Deliberately NOT prefixed 'merge_entities: ' — that prefix
+            # identifies the one structured JSON record per merge emitted
+            # below, and a diagnostic sharing it would break any auditor that
+            # greps the prefix and parses the remainder.
+            logger.warning(
+                'merge_entities residual census failed for dep=%s '
+                '(merge continues; relocations already committed)',
+                deprecated_uuid, exc_info=True,
+            )
+            residual = None
 
         # Delete the deprecated node
         await self.delete_entity_node(deprecated_uuid, group_id=group_id)
@@ -1694,17 +3482,15 @@ class GraphitiBackend:
         # Rebuild the surviving node's summary
         refresh_result = await self.refresh_entity_summary(surviving_uuid, group_id=group_id)
 
-        logger.info(
-            'merge_entities: dep=%s (%r) sur=%s (%r) redirected=%s duplicate_edges_removed=%d',
-            deprecated_uuid, dep_name, surviving_uuid, sur_name, edges_redirected,
-            duplicate_edges_removed,
-        )
-        return {
+        audit = {
             'surviving_uuid': surviving_uuid,
             'surviving_name': sur_name,
             'deprecated_uuid': deprecated_uuid,
             'deprecated_name': dep_name,
+            'deprecated_summary': dep_summary,
             'edges_redirected': edges_redirected,
+            'mentions_redirected': mentions_redirected,
+            'residual_relationships_destroyed': residual,
             'duplicate_edges_removed': duplicate_edges_removed,
             'surviving_summary': {
                 'before': refresh_result.get('old_summary', ''),
@@ -1712,6 +3498,8 @@ class GraphitiBackend:
                 'edge_count': refresh_result.get('edge_count', 0),
             },
         }
+        logger.info('merge_entities: %s', json.dumps(audit, sort_keys=True, default=str))
+        return audit
 
     @_canonicalize_group_args
     async def delete_entity(
@@ -1775,7 +3563,7 @@ class GraphitiBackend:
             try:
                 await self.refresh_entity_summary(nbr, group_id=group_id)
                 refreshed.append(nbr)
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 logger.warning(
                     'delete_entity: refresh_entity_summary failed for nbr=%s '
                     '(deleted node uuid=%s): %s',
@@ -1813,17 +3601,19 @@ class GraphitiBackend:
             NodeNotFoundError: if no node with that UUID exists.
             RuntimeError: if the backend is not initialized.
         """
-        graph = self._graph_for(group_id)
+        graph = self.graph_access.graph(group_id)
         # Pre-check: verify node exists before deleting (read-only)
         check_result = await graph.ro_query(
             'MATCH (n:Entity {uuid: $uuid}) RETURN n.name, n.summary',
             {'uuid': uuid},
+            op='delete_entity_node',
         )
         if not check_result.result_set:
             raise NodeNotFoundError(f'Entity node not found: {uuid}')
         await graph.query(
             'MATCH (n:Entity {uuid: $uuid}) DETACH DELETE n',
             {'uuid': uuid},
+            op='delete_entity_node',
         )
         logger.info('delete_entity_node: deleted node=%s', uuid)
 
@@ -1836,16 +3626,41 @@ class GraphitiBackend:
         Raises:
             NodeNotFoundError: if no node with that UUID exists.
         """
-        graph = self._graph_for(group_id)
+        graph = self.graph_access.graph(group_id)
         cypher = (
             'MATCH (n:Entity {uuid: $uuid}) '
             'RETURN n.name, n.summary'
         )
-        result = await graph.ro_query(cypher, {'uuid': uuid})
+        result = await graph.ro_query(cypher, {'uuid': uuid}, op='get_node_text')
         if not result.result_set:
             raise NodeNotFoundError(f'Entity node not found: {uuid}')
         row = result.result_set[0]
         return (row[0], row[1] or '')
+
+    @_canonicalize_group_args
+    async def get_node_names_by_uuids(
+        self, uuids: Sequence[str], *, group_id: str,
+    ) -> dict[str, str]:
+        """Name the Entity nodes among *uuids* in one indexed read (``Entity(uuid)`` range index).
+
+        It names the endpoints of a batch of graph hits. A node that is absent
+        or has no name is omitted: it has no name to give. Like
+        get_edges_by_uuids, it applies no ``n.group_id`` predicate, so an
+        edge's endpoint is named as stored.
+        """
+        wanted = list(dict.fromkeys(uuids))
+        if not wanted:
+            return {}
+        result = await self.graph_access.graph(group_id).ro_query(
+            'MATCH (n:Entity) WHERE n.uuid IN $uuids RETURN n.uuid, n.name',
+            {'uuids': wanted},
+            op='get_node_names_by_uuids',
+        )
+        names: dict[str, str] = {}
+        for node_uuid, name in result.result_set or []:
+            if isinstance(name, str) and name:
+                names.setdefault(node_uuid, name)
+        return names
 
     @_canonicalize_group_args
     async def resolve_entity_by_name(self, name: str, *, group_id: str) -> str:
@@ -1866,16 +3681,19 @@ class GraphitiBackend:
                 with all matching UUIDs listed in the error message.
             RuntimeError: if the backend is not initialized.
         """
-        graph = self._graph_for(group_id)
+        graph = self.graph_access.graph(group_id)
         cypher = 'MATCH (n:Entity {name: $name}) RETURN n.uuid, n.name'
-        result = await graph.ro_query(cypher, {'name': name})
+        result = await graph.ro_query(cypher, {'name': name}, op='resolve_entity_by_name')
         rows = result.result_set
         if not rows:
             raise NodeNotFoundError(f'No entity found with name: {name!r}')
         if len(rows) > 1:
             uuids = [row[0] for row in rows]
             raise AmbiguousEntityError(
-                f'Multiple entities found with name {name!r}: {uuids}'
+                f'Multiple entities found with name {name!r}: {uuids}',
+                name=name,
+                group_id=group_id,
+                uuids=uuids,
             )
         return rows[0][0]
 
@@ -1889,7 +3707,7 @@ class GraphitiBackend:
         treat an empty result as "fall back to fuzzy search" and pick nodes[0] on a hit.
 
         Scoped by an explicit `n.group_id = $group_id` property predicate (2026-07-06
-        amendment), not just the graph key selected via _graph_for — task-2115's active
+        amendment), not just the graph key selected via graph_access — task-2115's active
         cross-graph leak can plant a misrouted foreign node (group_id property of
         ANOTHER project) physically inside this graph key, and this predicate keeps
         such a clone from ever surfacing here.
@@ -1907,12 +3725,12 @@ class GraphitiBackend:
         Raises:
             RuntimeError: if the backend is not initialized.
         """
-        graph = self._graph_for(group_id)
+        graph = self.graph_access.graph(group_id)
         cypher = (
             'MATCH (n:Entity {name: $name}) WHERE n.group_id = $group_id '
             'RETURN n.uuid, n.name, n.summary, labels(n)'
         )
-        result = await graph.ro_query(cypher, {'name': name, 'group_id': group_id})
+        result = await graph.ro_query(cypher, {'name': name, 'group_id': group_id}, op='get_nodes_by_exact_name')
         return [
             {
                 'uuid': row[0],
@@ -1932,12 +3750,37 @@ class GraphitiBackend:
         but scoped to surfacing exact-name DUPLICATES for the post-write
         node-dedup sweep (MemoryService._dedup_episode_nodes) rather than
         resolving a single canonical node. Results are ordered
-        canonical-first — most valid edges, then oldest created_at, then
-        uuid — so callers can treat matches[0] as the merge survivor and
+        canonical-first — highest provenance_rank, then oldest created_at,
+        then uuid — so callers can treat matches[0] as the merge survivor and
         matches[1:] as the deprecated duplicates to fold into it.
 
+        WHY MENTIONS BELONG IN THE RANK (task 4986). matches[0] is the node
+        that SURVIVES and matches[1:] are DELETED, so a node this ordering
+        demotes loses its Episodic provenance with it. Ranking on valid
+        RELATES_TO alone therefore destroyed episode links the survivor never
+        had — measured in 12 of 50 live duplicate groups on 2026-08-31.
+        ``provenance_rank`` = ``edge_count`` + ``mentions_count`` is what the
+        ordering now keys on, and it is RETURNED rather than left for callers
+        to re-derive, so the key that ORDERED the list is the key a caller can
+        READ.
+
+        ``edge_count`` DELIBERATELY KEEPS ITS PRE-4986 MEANING — valid
+        RELATES_TO only — because two consumers read it for something other
+        than ranking. ``reconciliation/degenerate_task_node_sweep.py`` deletes
+        a placeholder node on ``int(match['edge_count']) == 0``, so folding
+        MENTIONS in would silently change WHICH nodes that sweep destroys;
+        ``maintenance/task_family_census.py`` reports it per variant in an
+        operator-facing line that would silently start counting episodes.
+        MENTIONS therefore enters ONLY through the two new keys.
+
+        The ranking clause and its ORDER BY come from the module-level
+        ``_PROVENANCE_RANK_CLAUSE`` / ``_PROVENANCE_RANK_ORDER``, shared with
+        ``find_entity_nodes_by_name_substring`` so the two survivor-ranking
+        methods cannot drift apart; see those constants for why that is an
+        invariant rather than a convenience.
+
         Scoped by an explicit `n.group_id = $group_id` property predicate (2026-07-06
-        amendment), not just the graph key selected via _graph_for — task-2115's active
+        amendment), not just the graph key selected via graph_access — task-2115's active
         cross-graph leak can plant a misrouted foreign node (group_id property of
         ANOTHER project) physically inside this graph key, and this predicate keeps
         such a clone from ever being treated as a duplicate to collapse.
@@ -1949,31 +3792,154 @@ class GraphitiBackend:
             group_id: Project graph to query.
 
         Returns:
-            List of dicts with keys: uuid, created_at, edge_count — ordered
-            canonical (survivor) first. Empty list when no entity matches;
-            a single-element list when the name is unique (no duplicate).
+            List of dicts with keys: uuid, created_at, edge_count (valid
+            RELATES_TO only), mentions_count, provenance_rank (their sum, and
+            the key the ordering uses) — ordered canonical (survivor) first.
+            Empty list when no entity matches; a single-element list when the
+            name is unique (no duplicate).
 
         Raises:
             RuntimeError: if the backend is not initialized.
         """
-        graph = self._graph_for(group_id)
+        graph = self.graph_access.graph(group_id)
         cypher = (
             'MATCH (n:Entity {name: $name}) '
             'WHERE n.group_id = $group_id '
-            'OPTIONAL MATCH (n)-[e:RELATES_TO]-() WHERE e.invalid_at IS NULL '
-            'WITH n, count(DISTINCT e) AS edge_count '
-            'RETURN n.uuid, n.created_at, edge_count '
-            'ORDER BY edge_count DESC, n.created_at ASC, n.uuid ASC'
+            + _PROVENANCE_RANK_CLAUSE
+            + 'RETURN n.uuid, n.created_at, edge_count, mentions_count, '
+              'edge_count + mentions_count AS provenance_rank '
+            + _PROVENANCE_RANK_ORDER
         )
-        result = await graph.ro_query(cypher, {'name': name, 'group_id': group_id})
+        result = await graph.ro_query(cypher, {'name': name, 'group_id': group_id}, op='find_duplicate_entity_nodes')
         return [
             {
                 'uuid': row[0],
                 'created_at': row[1],
                 'edge_count': row[2],
+                'mentions_count': row[3],
+                'provenance_rank': row[4],
             }
             for row in (result.result_set or [])
         ]
+
+    @_canonicalize_group_args
+    async def find_entity_nodes_by_name_substring(
+        self, substring: str, *, group_id: str
+    ) -> list[dict]:
+        """Return every Entity node whose name CONTAINS *substring*, canonical-ordered.
+
+        The substring-match sibling of find_duplicate_entity_nodes above: same
+        group-scoped shape, same valid-edge count, same survivor-first ordering
+        — only the name predicate differs, from exact equality to CONTAINS, and
+        the node's name joins the returned columns.
+
+        "Same survivor-first ordering" is TRUE BY CONSTRUCTION, not by
+        resemblance: both methods build their ranking from the module-level
+        ``_PROVENANCE_RANK_CLAUSE`` and ``_PROVENANCE_RANK_ORDER``, so the two
+        cannot drift apart. It was not always so — this method was first
+        written with a COPY of the sibling's clause, and that copy is how a
+        MENTIONS-blind survivor rank survived into a second, newer merge path
+        (task 4986). Sharing the objects is what makes the claim enforceable
+        rather than aspirational.
+
+        ``provenance_rank`` (``edge_count`` + ``mentions_count``) is what orders
+        the rows, because rows[0] SURVIVES a collapse and rows[1:] are deleted
+        — so ranking on valid edges alone destroyed the episode provenance of
+        any node that was episode-rich but edge-poor. ``edge_count`` keeps its
+        RELATES_TO-only meaning; see the sibling's docstring for the two
+        consumers that require the split.
+
+        The write-path consequence is the point: ``MemoryService.
+        _normalize_task_node_names`` reads only ``uuid`` and ``name`` and relies
+        entirely on this row ORDER to pick ``members[0]`` as the survivor, so it
+        now keeps the episode-richer node with no service-layer change at all.
+
+        A deliberately TASK-AGNOSTIC candidate-NARROWING primitive. It knows
+        nothing about task labels or any other vocabulary: it hands back a
+        superset and the CALLER applies its own precise membership test. The
+        sole caller today, MemoryService._normalize_task_node_names, probes with
+        a task's verbatim digits to reach 'Task 605', 'task 605', 'tasks 605'
+        and 'task #605' in one query, then filters the candidates through
+        utils/task_naming.canonicalize_task_node_name — which is what keeps
+        'Task 6051', 'Task 1605' and the foreign 'reify:605' out. Expressing
+        that membership rule as a Cypher predicate instead would put a second
+        copy of the label vocabulary inside a query string, where it can be
+        neither tested nor kept in step with utils/canonical_labels.py.
+
+        Digits make a good probe for a second reason: they are case-free, so
+        one CONTAINS match reaches every capitalization without needing
+        case-insensitive Cypher. Callers should nevertheless supply a SELECTIVE
+        substring — this is an un-indexed scan of the graph's Entity nodes, and
+        an unselective one both costs more and risks the row cap below.
+
+        Scoped by an explicit `n.group_id = $group_id` property predicate, for
+        the same reason find_duplicate_entity_nodes carries one (2026-07-06
+        amendment): task-2115's cross-graph leak can plant a node whose
+        group_id property names ANOTHER project physically inside this graph
+        key, and a caller collapsing duplicates must never see it.
+
+        Single un-paginated ro_query rather than paged_ro_query, which needs a
+        total `ORDER BY n.uuid` for stable SKIP/LIMIT paging and so cannot
+        carry the survivor-first ordering that makes rows[0] meaningful. A
+        selective substring returns a handful of rows, so paging would buy
+        nothing. Truncation at the server's row cap is still conceivable for an
+        unselective substring, and it is WARNED rather than swallowed: a
+        silently short view would leave a caller's collapse incomplete with
+        nothing in the logs to explain it.
+
+        Uses ro_query since no writes are performed.
+
+        Args:
+            substring: Case-SENSITIVE substring to match against n.name.
+            group_id: Project graph to query.
+
+        Returns:
+            List of dicts with keys: uuid, name, created_at, edge_count (valid
+            RELATES_TO only), mentions_count, provenance_rank (their sum, and
+            the key the ordering uses) — ordered canonical (survivor) first,
+            exactly as find_duplicate_entity_nodes orders its matches, from the
+            shared constants above. Empty list when nothing matches.
+
+        Raises:
+            RuntimeError: if the backend is not initialized.
+        """
+        graph = self.graph_access.graph(group_id)
+        cypher = (
+            'MATCH (n:Entity) '
+            'WHERE n.group_id = $group_id AND n.name CONTAINS $substring '
+            + _PROVENANCE_RANK_CLAUSE
+            + 'RETURN n.uuid, n.name, n.created_at, edge_count, mentions_count, '
+              'edge_count + mentions_count AS provenance_rank '
+            + _PROVENANCE_RANK_ORDER
+        )
+        start = time.monotonic()
+        result = await graph.ro_query(
+            cypher, {'substring': substring, 'group_id': group_id}, op='find_entity_nodes_by_name_substring'
+        )
+        elapsed_ms = (time.monotonic() - start) * 1000
+        rows = [
+            {
+                'uuid': row[0],
+                'name': row[1],
+                'created_at': row[2],
+                'edge_count': row[3],
+                'mentions_count': row[4],
+                'provenance_rank': row[5],
+            }
+            for row in (result.result_set or [])
+        ]
+        logger.debug(
+            'name-substring scan for %r in graph %r took %.1fms (%d row(s))',
+            substring, group_id, elapsed_ms, len(rows),
+        )
+        if len(rows) >= _RESULTSET_SIZE:
+            logger.warning(
+                'name-substring scan for %r in graph %r returned %d rows, at or above '
+                'the server result-set cap of %d — the result is probably TRUNCATED and '
+                'any family built from it incomplete. Use a more selective substring.',
+                substring, group_id, len(rows), _RESULTSET_SIZE,
+            )
+        return rows
 
     async def _scan_duplicate_entity_names(self, group_id: str) -> list[tuple[str, int]]:
         """Detect exact-name duplicate Entity nodes in *group_id*'s graph — B5 dup-node alarm.
@@ -2003,7 +3969,7 @@ class GraphitiBackend:
             List of (name, count) tuples for every duplicated name (count > 1).
             Empty list when the graph has no exact-name duplicates.
         """
-        graph = self._graph_for(group_id)
+        graph = self.graph_access.graph(group_id)
         cypher = (
             'MATCH (n:Entity) WHERE n.group_id = $group_id '
             'WITH n.name AS name, count(*) AS cnt '
@@ -2011,7 +3977,7 @@ class GraphitiBackend:
             'RETURN name, cnt'
         )
         start = time.monotonic()
-        result = await graph.ro_query(cypher, {'group_id': group_id})
+        result = await graph.ro_query(cypher, {'group_id': group_id}, op='_scan_duplicate_entity_names')
         elapsed_ms = (time.monotonic() - start) * 1000
         duplicates = [(row[0], row[1]) for row in (result.result_set or [])]
         logger.debug(
@@ -2030,9 +3996,10 @@ class GraphitiBackend:
     async def _run_startup_identity_scan(self) -> dict:
         """Startup identity-integrity sweep — per-graph orchestrator (W6-ε).
 
-        Enumerates every project graph via list_graphs() and, for each, runs
+        Enumerates every registered graph that exists and, for each, runs
         both the dup-NODE alarm (_scan_duplicate_entity_names) and the
-        dup-uuid-EDGE repair (_repair_duplicate_edge_uuids). Each graph is
+        dup-uuid-EDGE repair (_repair_duplicate_edge_uuids). The scope rule's
+        home is docs/prds/falkordb-index-provisioning.md D5. Each graph is
         processed best-effort: a failure on one graph is caught and logged,
         never aborting the sweep over the rest — mirrors the initialize()
         index-setup loop idiom (graphiti_client.py:378-385, try/except
@@ -2062,7 +4029,7 @@ class GraphitiBackend:
             - elapsed_ms: wall-clock duration of the full sweep (all graphs),
               in milliseconds.
         """
-        graphs = await self.list_graphs()
+        graphs = await self._existing_registered_graphs()
         stats: dict[str, int | float] = {
             'graphs_scanned': 0, 'dup_name_groups': 0, 'edges_repaired': 0,
         }
@@ -2101,7 +4068,8 @@ class GraphitiBackend:
           nodes, it never creates one.
         - 1 match: returns that node's uuid directly (pure resolve, no writes).
         - >=2 matches: collapses duplicates via find_duplicate_entity_nodes
-          (already survivor-first: edge_count DESC, created_at ASC, uuid ASC)
+          (already survivor-first: provenance_rank DESC, created_at ASC,
+          uuid ASC, where provenance_rank is edge_count + mentions_count)
           and merge_entities, folding every non-canonical duplicate into the
           survivor. Returns the survivor's uuid.
 
@@ -2134,6 +4102,221 @@ class GraphitiBackend:
             await self.merge_entities(dup['uuid'], survivor['uuid'], group_id=group_id)
         return survivor['uuid']
 
+    async def _resolve_without_collapsing(self, name: str, *, group_id: str) -> str | None:
+        """Exact-name resolve that REFUSES a duplicate-name group instead of collapsing it.
+
+        The orthogonal sibling of :meth:`_resolve_or_create_entity`, carrying
+        that method's exact contracts so ``ensure_entity_node`` can fork the
+        resolve half alone:
+        - Same lock contract: callers MUST hold ``_identity_lock_for(group_id)``;
+          this method performs no locking of its own.
+        - Same ``str | None`` return: 0 matches -> None (the caller mints),
+          1 match -> that node's uuid.
+        - >=2 matches -> raise ``AmbiguousEntityError`` with the structured
+          ``.name``/``.group_id``/``.uuids`` fields populated. Nothing is merged,
+          nothing is written.
+
+        WHY THE COLLAPSE IS UNREACHABLE HERE. A merge is irreversible: it folds
+        one node's edges into another and destroys the distinction. That is only
+        ever a DELIBERATE act — Ratified Decision 1 of the memory-identity
+        programme — never a side effect of some other operation that happened to
+        find two nodes. The PRD's S1 scope amendment
+        (``plans/fm-memory-identity-prd.md``) licenses the collapse on exactly
+        one path, the episode-write dedup, which reaches
+        ``_resolve_or_create_entity`` directly; every other caller must refuse
+        the >=2 arm with a structured refusal rather than merge. This method is
+        how they do it.
+
+        Args:
+            name: Exact name of the Entity to resolve.
+            group_id: Project graph to target.
+
+        Returns:
+            The uuid of the one Entity node with this name in *group_id*'s
+            graph, or None if none existed.
+
+        Raises:
+            AmbiguousEntityError: if two or more nodes share this name.
+        """
+        nodes = await self.get_nodes_by_exact_name(name, group_id=group_id)
+        if not nodes:
+            return None
+        if len(nodes) == 1:
+            return nodes[0]['uuid']
+        uuids = [node['uuid'] for node in nodes]
+        raise AmbiguousEntityError(
+            f'Multiple entities found with name {name!r}: {uuids}',
+            name=name,
+            group_id=group_id,
+            uuids=uuids,
+        )
+
+    @_canonicalize_group_args
+    async def ensure_entity_node(
+        self,
+        name: str,
+        *,
+        group_id: str,
+        summary: str = '',
+        merge_duplicates: bool = True,
+    ) -> str:
+        """Resolve an Entity node by exact name, MINTING one if none exists.
+
+        The resolve-or-MINT sibling of :meth:`_resolve_or_create_entity`, whose
+        documented 0-match behaviour is a no-op ("node minting stays
+        graphiti_core's job"). That contract is deliberately left intact —
+        callers like ``_dedup_episode_nodes`` depend on a stray extracted name
+        never becoming a permanent node — so the mint lives here instead, and
+        only on that method's None branch. The resolve/collapse half is
+        delegated to it unchanged, so both primitives share one identity rule.
+
+        Exists for names graphiti_core will never mint on its own. The
+        motivating case (task 3335) is a cross-project task reference
+        ``<project_id>:<task_number>``: LLM extraction is exactly what discards
+        the qualifier and collapses the reference onto a bare ``Task N`` node,
+        so waiting for extraction to produce the qualified node is waiting for
+        the bug not to happen.
+
+        LOCK CONTRACT (inherited from ``_resolve_or_create_entity``): callers
+        MUST hold ``_identity_lock_for(group_id)``. This method performs no
+        locking of its own, and a concurrent same-group writer between the
+        resolve and the mint would produce exactly the duplicate-name pair the
+        identity gate exists to prevent.
+
+        Idempotent: once the node exists, every later call for the same
+        (name, group_id) takes the resolve path and mints nothing.
+
+        The mint half is :meth:`_mint_entity_node`; see it for the minted
+        property set.
+
+        Args:
+            name: Exact name of the Entity to resolve or mint.
+            group_id: Project graph to target.
+            summary: Summary property for a newly minted node. Ignored on the
+                resolve path — an existing node's summary is never overwritten.
+            merge_duplicates: whether a duplicate-name group may be COLLAPSED
+                to resolve this name. The three arms are 0 -> mint,
+                1 -> resolve, and >=2 -> collapse-and-return-the-survivor when
+                True (the default) or refuse when False. The default
+                reproduces this method's historical behaviour verbatim, so no
+                existing caller changes and Seam S1's episode-write dedup path
+                keeps the collapse the PRD licenses for it. Pass False from any
+                other caller: a merge is irreversible and is only ever a
+                deliberate act, never a side effect (Ratified Decision 1).
+
+                The one current False caller is
+                ``services/memory_service.py::MemoryService._repair_edge_findings``
+                (the referent repair pass, which catches the refusal and books
+                the finding ``'unrepairable'`` rather than ``'failed'`` — the
+                backend did not fail, it declined).
+                ``MemoryService.ensure_entity_node`` does not call this method;
+                it mints through :meth:`_mint_entity_node` after its own
+                pre-read.
+
+                Seam S1 is absent from that list BY CONSTRUCTION, not by
+                omission: it calls ``_resolve_or_create_entity`` directly and
+                never reaches this method at all.
+
+        Returns:
+            The UUID of the single canonical Entity node with this name in
+            *group_id*'s graph — resolved, collapsed-to, or newly minted.
+
+        Raises:
+            RuntimeError: if the backend is not initialized.
+            AmbiguousEntityError: if ``merge_duplicates`` is False and two or
+                more nodes share this name. Carries the conflicting uuids as
+                structured data, so the caller can name the duplicate group.
+        """
+        await self._ensure_indices(group_id)
+        # Only the RESOLVE half forks — the two resolvers share one `str | None`
+        # contract, so the short-circuit below and the whole mint/embedding block
+        # stay a single unforked site.
+        resolve = (
+            self._resolve_or_create_entity if merge_duplicates
+            else self._resolve_without_collapsing
+        )
+        resolved = await resolve(name, group_id=group_id)
+        if resolved is not None:
+            return resolved
+        return await self._mint_entity_node(name, group_id=group_id, summary=summary)
+
+    @_canonicalize_group_args
+    async def _mint_entity_node(self, name: str, *, group_id: str, summary: str = '') -> str:
+        """CREATE one :Entity node unconditionally, then best-effort embed its name.
+
+        LOCK CONTRACT AND PRECONDITION: the caller MUST hold
+        ``_identity_lock_for(group_id)`` AND must have seen zero exact-name
+        matches for (name, group_id) under that same hold. This method does no
+        locking and no read of its own, so calling it without that observation
+        creates exactly the duplicate-name pair the identity gate exists to
+        prevent. Its two callers establish it differently:
+        ``GraphitiBackend.ensure_entity_node`` after its resolver returns None,
+        and ``services/memory_service.py::MemoryService.ensure_entity_node``
+        after its guard-2 pre-read returns ``[]``.
+
+        Provisions indices first (PRD D6, ``docs/prds/falkordb-index-provisioning.md``):
+        a registered graph is provisioned before its first write.
+
+        The minted property set mirrors graphiti_core's own FalkorDB
+        ``get_entity_node_save_query`` minus ``name_embedding``, which that
+        query wraps in ``vecf32()`` and which this repo writes separately via
+        ``update_node_embedding``. ``created_at`` is written as
+        ``datetime.now(UTC).isoformat()`` — byte-identical to what
+        graphiti_core produces, since FalkorDB has no datetime type and
+        ``FalkorDriver.convert_datetimes_to_strings`` stores ``isoformat()``.
+        That matters because ``find_duplicate_entity_nodes`` orders survivors
+        DB-side on the stored string (``ORDER BY ... n.created_at ASC``), a
+        lexicographic compare that is chronologically correct only for
+        same-format, same-offset ISO strings; ``helpers.parse_db_date`` reads
+        the value back with ``datetime.fromisoformat``.
+
+        Args:
+            name: Exact name of the Entity to mint.
+            group_id: Project graph to target.
+            summary: Summary property for the new node.
+
+        Returns:
+            The UUID of the newly minted node.
+
+        Raises:
+            RuntimeError: if the backend is not initialized.
+        """
+        await self._ensure_indices(group_id)
+        node_uuid = str(uuid.uuid4())
+        graph = self.graph_access.graph(group_id)
+        await graph.query(
+            'CREATE (n:Entity {uuid: $uuid, name: $name, group_id: $group_id, '
+            'summary: $summary, created_at: $created_at})',
+            {
+                'uuid': node_uuid,
+                'name': name,
+                'group_id': group_id,
+                'summary': summary,
+                'created_at': datetime.now(UTC).isoformat(),
+            },
+            op='_mint_entity_node',
+        )
+        logger.info(
+            '_mint_entity_node: minted node=%s name=%r group_id=%s',
+            node_uuid, name, group_id,
+        )
+        try:
+            embedding = await self._require_client().embedder.create(name)
+            await self.update_node_embedding(node_uuid, embedding, group_id=group_id)
+        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+            raise
+        except Exception:
+            # Best-effort, mirroring rename_entity_node: the node itself (the
+            # primary result, which keeps exact-name Cypher lookups correct)
+            # already exists; a missing embedding only affects fuzzy hybrid
+            # node search.
+            logger.warning(
+                '_mint_entity_node: failed to generate name_embedding for '
+                'node=%s name=%r; the node was still minted',
+                node_uuid, name, exc_info=True,
+            )
+        return node_uuid
+
     @staticmethod
     def _edge_dict(uuid: str, fact: str | None, name: str | None) -> EdgeDict:
         """Build a normalised edge dict, coercing NULL fact/name to empty string.
@@ -2158,6 +4341,18 @@ class GraphitiBackend:
             'fact': fact if fact is not None else '',
             'name': name if name is not None else '',
         }
+
+    @classmethod
+    def _dated_edge_dict(
+        cls,
+        uuid: str,
+        fact: str | None,
+        name: str | None,
+        valid_at: str | None,
+        invalid_at: str | None,
+    ) -> DatedEdgeDict:
+        """An _edge_dict carrying the stored validity window verbatim."""
+        return {**cls._edge_dict(uuid, fact, name), 'valid_at': valid_at, 'invalid_at': invalid_at}
 
     @staticmethod
     def _duplicate_edge_uuids(rows: Sequence[Sequence[Any]]) -> list[str]:
@@ -2287,7 +4482,7 @@ class GraphitiBackend:
         """Regenerate an Entity node's summary from its currently-valid edges.
 
         Fetches the node's current name and summary, queries all valid
-        (non-invalidated) RELATES_TO edges, deduplicates their facts
+        RELATES_TO edges (``ACTIVE_EDGE_PREDICATE``), deduplicates their facts
         (preserving order), joins them with newlines, and writes the result
         back to the node's summary property.
 
@@ -2450,6 +4645,91 @@ class GraphitiBackend:
         }
 
     @_canonicalize_group_args
+    async def enumerate_entity_nodes(
+        self, *, group_id: str, page_size: int = _DEFAULT_READ_PAGE_SIZE
+    ) -> tuple[list[dict], PagedRead]:
+        """Paginated variant of list_entity_nodes that also reports completeness.
+
+        Same rows and same NULL coercions as list_entity_nodes (which is a thin
+        shim over this method); the difference is that the completeness of the
+        underlying enumeration is returned as a first-class value instead of
+        only reaching a log line.
+
+        Args:
+            group_id: Project graph to query.
+            page_size: Rows per page. Must stay strictly below the server's
+                result-set cap — see paged_ro_query.
+
+        Rows are deduplicated on ``n.uuid`` across ALL pages — see
+        ``_first_row_per_uuid`` for why paging makes that necessary where a
+        single query never did.
+
+        Returns:
+            (nodes, paged) where *nodes* is the same list list_entity_nodes
+            returns and *paged* is the PagedRead carrying
+            ``complete``/``rows_seen``/``expected_rows``/``reason``.  Note that
+            ``paged.rows_seen`` counts ROWS FETCHED, so it can exceed
+            ``len(nodes)`` when a boundary row was re-emitted.
+        """
+        graph = self.graph_access.graph(group_id)
+        paged = await paged_ro_query(
+            graph,
+            _ENTITY_NODES_PAGE_TEMPLATE,
+            _ENTITY_NODES_CENSUS,
+            page_size=page_size,
+            op='enumerate_entity_nodes',
+        )
+        # The consumers downstream rely on the dedup: detect_stale_with_edges
+        # reports one stale entry per element and uses len(entities) as its
+        # total_count denominator, and rebuild_entity_summaries would schedule
+        # two concurrent writers for a repeated node.
+        nodes = [
+            {'uuid': row[0], 'name': row[1] or '', 'summary': row[2] or ''}
+            for row in _first_row_per_uuid(paged.rows, reader='enumerate_entity_nodes')
+        ]
+        return nodes, paged
+
+    @_canonicalize_group_args
+    async def enumerate_ranked_entity_nodes(
+        self, *, group_id: str, page_size: int = _DEFAULT_READ_PAGE_SIZE
+    ) -> tuple[list[dict], PagedRead]:
+        """Every same-group Entity node with its provenance rank, survivor-first.
+
+        Rows carry find_entity_nodes_by_name_substring's six keys (edge_count
+        counts valid RELATES_TO only) and are ordered exactly as that method and
+        find_duplicate_entity_nodes order theirs, so any partition of the rows
+        keeps survivor order. Scoped by the `n.group_id` property for the
+        task-2115 reason find_duplicate_entity_nodes gives. A separate method
+        rather than a widened enumerate_entity_nodes: task 5264, decision 7.
+
+        Returns:
+            (rows, paged), *paged* being the read's PagedRead.
+        """
+        graph = self.graph_access.graph(group_id)
+        paged = await paged_ro_query(
+            graph,
+            _RANKED_ENTITY_NODES_PAGE_TEMPLATE,
+            _RANKED_ENTITY_NODES_CENSUS,
+            params={'group_id': group_id},
+            page_size=page_size,
+            op='enumerate_ranked_entity_nodes',
+        )
+        rows = [
+            {
+                'uuid': row[0],
+                'name': row[1],
+                'created_at': row[2],
+                'edge_count': row[3],
+                'mentions_count': row[4],
+                'provenance_rank': row[5],
+            }
+            for row in _first_row_per_uuid(
+                paged.rows, reader='enumerate_ranked_entity_nodes'
+            )
+        ]
+        return _survivor_first(rows), paged
+
+    @_canonicalize_group_args
     async def list_entity_nodes(self, *, group_id: str) -> list[dict]:
         """Return all Entity nodes (uuid, name, summary) for a given group_id.
 
@@ -2457,57 +4737,95 @@ class GraphitiBackend:
         group_id filter is needed in the Cypher itself.  Uses ro_query since
         no writes are performed.
 
+        PAGINATED (task 4340).  This read was truncated at the same server-wide
+        RESULTSET_SIZE ceiling as get_all_valid_edges — measured counts in
+        plans/falkordb-resultset-cap-audit.md.
+
+        Why a node read was in scope for an edge-cap task: see §History in
+        plans/falkordb-resultset-cap-audit.md.
+
+        This is read_entity_nodes_checked without the verdict, so
+        incompleteness is handled by the shared apply_incompleteness_policy;
+        see that helper.  enumerate_entity_nodes returns the signal as a value
+        and never raises.
+
         Args:
             group_id: Project graph to query.
 
         Returns:
             List of dicts with keys: uuid, name, summary (summary defaults to
             empty string when the node property is NULL).
+
+        Raises:
+            IncompleteEnumerationError: The underlying enumeration was
+                structurally incomplete.
         """
-        graph = self._graph_for(group_id)
-        cypher = 'MATCH (n:Entity) RETURN n.uuid, n.name, n.summary'
-        result = await graph.ro_query(cypher)
-        return [
-            {
-                'uuid': row[0],
-                'name': row[1] or '',
-                'summary': row[2] or '',
-            }
-            for row in (result.result_set or [])
-        ]
+        nodes, _ = await read_entity_nodes_checked(self, group_id=group_id)
+        return nodes
 
     @_canonicalize_group_args
     async def detect_stale_with_edges(
-        self, *, group_id: str
+        self, *, group_id: str, log: logging.Logger = logger
     ) -> StaleSummaryResult:
         """Detect stale summaries and return a StaleSummaryResult.
 
         Shared by detect_stale_summaries (public API) and MemoryService.rebuild_entity_summaries
         to avoid a duplicate bulk edge fetch when both are needed.
 
+        Both reads below are paginated (task 4340).  Before that they were
+        INDEPENDENTLY truncated at the server's 10000-row result-set cap, and
+        the compounding is what made the defect corrupting: an entity that
+        survived the node cut could still lose every edge to the edge cut,
+        yielding a bogus "stale, zero valid facts" verdict that
+        rebuild_entity_from_edges then wrote back into n.summary.
+
+        ``total_count`` is fixed by construction as a side effect: it is
+        ``len(entities)``, and so was a silently-capped denominator (10000 on
+        any graph above the cap) that made every rate computed against it
+        wrong.  With pagination it is the true node count.
+
+        Each read is a checked read (``read_entity_nodes_checked``,
+        ``read_all_valid_edges_checked``), so a STRUCTURALLY incomplete read
+        raises ``IncompleteEnumerationError`` before a single verdict is
+        formed.  A fabricated ``{}`` edge corpus would otherwise make every
+        non-empty summary look stale, and ``rebuild_entity_from_edges`` would
+        write ``''`` back over it.  The node read is checked before the edge
+        read is issued.  An EMPIRICALLY incomplete read warns and proceeds,
+        and its verdict is returned.
+
         Args:
             group_id: Project graph to query.
+            log: Logger for either read's EMPIRICAL warning, so a caller's
+                rebuild reports its short read beside its own log lines.
 
         Returns:
-            StaleSummaryResult with fields:
-              .stale       - list of stale entity dicts
-              .all_edges   - dict[uuid, list[EdgeDict]] of valid edges for all entities
-              .total_count - total number of entity nodes scanned
+            StaleSummaryResult, carrying the node read's and the edge read's
+            ReadCompleteness alongside the verdicts.
         """
-        entities = await self.list_entity_nodes(group_id=group_id)
-        all_edges = await self.get_all_valid_edges(group_id=group_id)
+        entities, entities_completeness = await read_entity_nodes_checked(
+            self, group_id=group_id, log=log
+        )
+        all_edges, edges_completeness = await read_all_valid_edges_checked(
+            self, group_id=group_id, log=log
+        )
         stale: list[dict] = []
         for entity in entities:
             edges = all_edges.get(entity['uuid'], [])
             entry = self._build_stale_entry(entity, edges)
             if entry is not None:
                 stale.append(entry)
-        return StaleSummaryResult(stale=stale, all_edges=all_edges, total_count=len(entities))
+        return StaleSummaryResult(
+            stale=stale,
+            all_edges=all_edges,
+            total_count=len(entities),
+            entities_completeness=entities_completeness,
+            edges_completeness=edges_completeness,
+        )
 
     @_canonicalize_group_args
     async def detect_stale_dry_run(
-        self, *, group_id: str, max_concurrency: int = 10
-    ) -> tuple[list[dict], int]:
+        self, *, group_id: str, max_concurrency: int = 10, log: logging.Logger = logger
+    ) -> StaleProbeResult:
         """Detect stale summaries using per-entity edge fetching (dry_run variant).
 
         Memory-cheaper alternative to ``detect_stale_with_edges`` for use
@@ -2527,23 +4845,35 @@ class GraphitiBackend:
           the existing empty-summary semantics, adding a Pareto improvement for graphs
           with many empty-summary entities).
 
+        The node read is a checked read (``read_entity_nodes_checked``), as in
+        ``detect_stale_with_edges``.
+
         Args:
             group_id: Project graph to query.
             max_concurrency: Maximum number of concurrent ``get_valid_edges_for_node``
                 requests in flight at once.  Defaults to 10.  Raise or lower to tune
                 the trade-off between latency and DB connection pressure.
+            log: Logger for every warning the probe emits (the node read's
+                EMPIRICAL warning and each failed ``get_valid_edges_for_node``),
+                so a caller's rebuild reports them beside its own log lines.
 
         Returns:
-            Tuple of (stale_list, total_count) where stale_list contains the same
-            per-entity dict schema as ``detect_stale_with_edges``
-            (uuid, name, summary, duplicate_count, stale_line_count, valid_fact_count,
-            summary_line_count) and total_count is len(all entities).  Order of entries
-            in stale_list matches the order returned by ``list_entity_nodes``.
+            StaleProbeResult.  ``stale`` carries the same per-entity dict schema
+            as ``detect_stale_with_edges`` (uuid, name, summary, duplicate_count,
+            stale_line_count, valid_fact_count, summary_line_count), in the order
+            ``enumerate_entity_nodes`` returned the entities; ``total_count`` is
+            len(all entities); ``entities_completeness`` is the node read's verdict.
+
+        Raises:
+            IncompleteEnumerationError: The node read was STRUCTURALLY
+                incomplete.  Raised before any edge is fetched.
         """
         if max_concurrency < 1:
             raise ValueError(f'max_concurrency must be >= 1, got {max_concurrency}')
 
-        entities = await self.list_entity_nodes(group_id=group_id)
+        entities, entities_completeness = await read_entity_nodes_checked(
+            self, group_id=group_id, log=log
+        )
 
         # Separate entities: empty-summary ones are cheap-skipped without any I/O.
         fetch_entities = [e for e in entities if e['summary']]
@@ -2563,7 +4893,7 @@ class GraphitiBackend:
         gather_results = await gather_or_raise(
             (_fetch_one(e) for e in fetch_entities),
             label='detect_stale_dry_run: get_valid_edges_for_node failed',
-            logger=logger,
+            logger=log,
         )
 
         stale: list[dict] = []
@@ -2572,7 +4902,11 @@ class GraphitiBackend:
             if entry is not None:
                 stale.append(entry)
 
-        return (stale, len(entities))
+        return StaleProbeResult(
+            stale=stale,
+            total_count=len(entities),
+            entities_completeness=entities_completeness,
+        )
 
     @_canonicalize_group_args
     async def detect_stale_summaries(self, *, group_id: str) -> list[dict]:
@@ -2667,12 +5001,12 @@ class GraphitiBackend:
             summary: New summary text (may be empty string to clear).
             group_id: Project graph to query.
         """
-        graph = self._graph_for(group_id)
+        graph = self.graph_access.graph(group_id)
         cypher = (
             'MATCH (n:Entity {uuid: $uuid}) '
             'SET n.summary = $summary'
         )
-        await graph.query(cypher, {'uuid': uuid, 'summary': summary})
+        await graph.query(cypher, {'uuid': uuid, 'summary': summary}, op='update_node_summary')
 
     @_canonicalize_group_args
     async def update_node_name(self, uuid: str, name: str, *, group_id: str) -> None:
@@ -2683,12 +5017,12 @@ class GraphitiBackend:
             name: New name text.
             group_id: Project graph to query.
         """
-        graph = self._graph_for(group_id)
+        graph = self.graph_access.graph(group_id)
         cypher = (
             'MATCH (n:Entity {uuid: $uuid}) '
             'SET n.name = $name'
         )
-        await graph.query(cypher, {'uuid': uuid, 'name': name})
+        await graph.query(cypher, {'uuid': uuid, 'name': name}, op='update_node_name')
 
     @_canonicalize_group_args
     async def get_edge_text(self, uuid: str, *, group_id: str) -> tuple[str, str]:
@@ -2699,16 +5033,45 @@ class GraphitiBackend:
         Raises:
             EdgeNotFoundError: if no edge with that UUID exists.
         """
-        graph = self._graph_for(group_id)
+        graph = self.graph_access.graph(group_id)
         cypher = (
             'MATCH ()-[e:RELATES_TO {uuid: $uuid}]->() '
             'RETURN e.name, e.fact'
         )
-        result = await graph.ro_query(cypher, {'uuid': uuid})
+        result = await graph.ro_query(cypher, {'uuid': uuid}, op='get_edge_text')
         if not result.result_set:
             raise EdgeNotFoundError(f'RELATES_TO edge not found: {uuid}')
         row = result.result_set[0]
         return (row[0] or '', row[1] or '')
+
+    @_canonicalize_group_args
+    async def get_edges_by_uuids(
+        self, uuids: Sequence[str], *, group_id: str,
+    ) -> list[EdgeWithEndpoints]:
+        """The surviving RELATES_TO edges among *uuids*, in input order, one per uuid.
+
+        The survivor read for services/overreach_shadow.py: by the time the
+        identity lock is released, _dedup_episode_edges may have deleted a
+        duplicate edge and the node passes may have renamed an endpoint, so
+        the write's own result is stale. Retired edges are returned too,
+        marked by ``active``.
+        """
+        if not uuids:
+            return []
+        result = await self.graph_access.graph(group_id).ro_query(
+            'MATCH (a)-[e:RELATES_TO]->(b) WHERE e.uuid IN $uuids '
+            f'RETURN e.uuid, e.fact, a.name, b.name, e.episodes, {ACTIVE_EDGE_PREDICATE}',
+            {'uuids': list(uuids)},
+            op='get_edges_by_uuids',
+        )
+        by_uuid: dict[str, EdgeWithEndpoints] = {}
+        for edge_uuid, fact, source_name, target_name, episodes, active in result.result_set:
+            by_uuid.setdefault(edge_uuid, EdgeWithEndpoints(
+                uuid=edge_uuid, fact=fact or '', source_name=source_name or '',
+                target_name=target_name or '', episodes=list(episodes or []),
+                active=bool(active),
+            ))
+        return [by_uuid[wanted] for wanted in dict.fromkeys(uuids) if wanted in by_uuid]
 
     @_canonicalize_group_args
     async def get_edge_invalid_at(self, uuid: str, *, group_id: str) -> Any:
@@ -2724,12 +5087,12 @@ class GraphitiBackend:
         Raises:
             EdgeNotFoundError: if no edge with that UUID exists.
         """
-        graph = self._graph_for(group_id)
+        graph = self.graph_access.graph(group_id)
         cypher = (
             'MATCH ()-[e:RELATES_TO {uuid: $uuid}]->() '
             'RETURN e.invalid_at'
         )
-        result = await graph.ro_query(cypher, {'uuid': uuid})
+        result = await graph.ro_query(cypher, {'uuid': uuid}, op='get_edge_invalid_at')
         if not result.result_set:
             raise EdgeNotFoundError(f'RELATES_TO edge not found: {uuid}')
         return result.result_set[0][0]
@@ -2737,22 +5100,22 @@ class GraphitiBackend:
     @_canonicalize_group_args
     async def update_node_embedding(self, uuid: str, embedding: list[float], *, group_id: str) -> None:
         """Update the name_embedding vector for an Entity node using vecf32()."""
-        graph = self._graph_for(group_id)
+        graph = self.graph_access.graph(group_id)
         cypher = (
             'MATCH (n:Entity {uuid: $uuid}) '
             'SET n.name_embedding = vecf32($embedding)'
         )
-        await graph.query(cypher, {'uuid': uuid, 'embedding': embedding})
+        await graph.query(cypher, {'uuid': uuid, 'embedding': embedding}, op='update_node_embedding')
 
     @_canonicalize_group_args
     async def update_edge_embedding(self, uuid: str, embedding: list[float], *, group_id: str) -> None:
         """Update the fact_embedding vector for a RELATES_TO edge using vecf32()."""
-        graph = self._graph_for(group_id)
+        graph = self.graph_access.graph(group_id)
         cypher = (
             'MATCH ()-[e:RELATES_TO {uuid: $uuid}]->() '
             'SET e.fact_embedding = vecf32($embedding)'
         )
-        await graph.query(cypher, {'uuid': uuid, 'embedding': embedding})
+        await graph.query(cypher, {'uuid': uuid, 'embedding': embedding}, op='update_edge_embedding')
 
     @_canonicalize_group_args
     async def list_indices(self, *, group_id: str) -> list[dict]:
@@ -2760,7 +5123,52 @@ class GraphitiBackend:
 
         Uses ro_query since no writes are performed.
 
-        Each record is a dict with keys: label, field, type, entity_type.
+        Each record is a dict with keys: label, field, type, entity_type, status.
+
+        Columns are resolved BY NAME from ``result.header``, not positionally.
+        The measured live header (2026-08-06, task 3706) is 9 two-tuples::
+
+            [label, properties, types, options, language, stopwords,
+             entitytype, status, info]
+
+        This method previously bound ``entity_type`` to ``row[3]`` — the
+        ``options`` column, an ``OrderedDict`` like ``{'uuid': {}}`` — instead of
+        ``entitytype`` (``row[6]``, the string ``'NODE'``/``'RELATIONSHIP'``).
+        The fix is by-name resolution rather than a corrected index: switching to
+        ``row[6]`` would repair today's symptom while leaving the same silent
+        degradation armed for the next FalkorDB column reorder.
+
+        The record build is delegated to
+        ``fused_memory.backends.falkor_indices.index_records_from_rows`` rather
+        than hand-rolled here, so every reader of ``CALL db.indexes()`` shares
+        one column map and one by-name resolution instead of re-forking the
+        build-names / check-missing / ``.index()`` sequence — re-forking is how
+        the positional read survived.
+        ``tests/_fm_falkor_live.await_index_operational`` resolves its
+        ``status`` column through the same ``resolve_header_positions`` helper.
+
+        A missing required column — or a header entry that is not a
+        ``(type, name)`` pair — raises ``IndexHeaderShapeError`` (a ``ValueError``
+        subclass, preserving this method's historical contract) rather than
+        returning a record with a silently-wrong or absent value.
+
+        ``status`` is the READINESS column — ``'OPERATIONAL'`` once an index is
+        serving, a build-progress string until then — and is what
+        :meth:`drop_vector_indices` settles on before it acts.  It is REQUIRED
+        like the rest, so a header without it makes this method raise for EVERY
+        consumer, not only the drop path: ``ensure_indices`` and the
+        reconciliation harness's index-health check read no ``status``, yet they
+        lose their index read too.  That coupling is accepted: requiring the
+        column for some callers only would put a per-caller flag on the by-name
+        resolution this method keeps in one place.
+
+        Note the returned ``type`` value is the ``types`` COLUMN — a dict of
+        property -> list of index-type strings, e.g. ``{'uuid': ['RANGE']}`` —
+        NOT a scalar.  ``fused_memory.backends.falkor_indices.normalize_index_record``
+        models that shape, as does ``falkor_indices.vector_index_properties``,
+        through which ``drop_vector_indices`` consumes it PER PROPERTY.  Reading
+        it as a scalar is exactly the defect task 3769 fixed; see that method's
+        docstring.
 
         Note on the CALL db.indexes() procedure and the read-only path:
         ``CALL db.indexes()`` is the *only* stored-procedure call sent on the
@@ -2773,52 +5181,438 @@ class GraphitiBackend:
         The live verification is pinned in
         ``fused-memory/tests/test_list_indices_integration.py``
         (Task 530 / esc-486-49).  If a future FalkorDB upgrade rejects
-        ``CALL`` on the RO path, revert this call to ``graph.query(...)``
-        (the write-capable command) and update the integration test to pin
-        the new behavior.
+        ``CALL`` on the RO path, revert the call in
+        ``falkor_indices.read_index_records`` to ``graph.query(...)`` (the
+        write-capable command) and update the integration test to pin the new
+        behavior.
         """
-        graph = self._graph_for(group_id)
-        # CALL db.indexes() is a read-only procedure; FalkorDB accepts it via
-        # GRAPH.RO_QUERY (verified via test_list_indices_integration.py).
-        result = await graph.ro_query('CALL db.indexes()')
-        indices = []
-        for row in (result.result_set or []):
-            indices.append({
-                'label': row[0],
-                'field': row[1],
-                'type': row[2],
-                'entity_type': row[3],
-            })
-        return indices
+        return await read_index_records(
+            OpBoundReader(self.graph_access.graph(group_id), op='list_indices'),
+        )
+
+    @_canonicalize_group_args
+    async def ensure_indices(self, *, group_id: str) -> IndexProvisionResult:
+        """Provision *group_id*'s graph up to the expected index set. Task 3707 (β).
+
+        Diff-then-create, never create-and-hope: the expected set
+        (``falkor_indices.expected_index_set``, derived from what graphiti itself
+        emits) is differenced against what the graph ACTUALLY carries
+        (``list_indices`` projected through ``normalize_index_records``), and only
+        the gap is written.
+
+        Contract
+        --------
+        * **Idempotent.**  A fully-provisioned graph is not written to at all —
+          the plan is empty, so no statement is issued.  Idempotence is
+          structural; it does NOT rest on FalkorDB tolerating a re-create (D2).
+        * **Never raises on a per-statement failure.**  A rejected statement is
+          recorded in ``failed`` with its error text and logged at WARNING, and
+          the remaining statements are still issued.  This is the whole point:
+          the loop it replaces lets one rejection take down everything after it,
+          and ``falkordb_driver.py``'s ``execute_query`` swallows the error so
+          nothing in the logs says so.
+        * **Absorbing a per-statement failure is the ONLY absorb.**  Everything
+          else fails CLOSED and propagates — see ``Raises`` below.  In particular
+          an unreachable driver raises rather than reading as "zero indices".  A
+          graph that does not exist yet DOES carry zero indices and is provisioned
+          from scratch — measured, the CREATE statements auto-create the key, so
+          this is self-healing.  Absence is decided STRUCTURALLY
+          (``group_id not in await self.graph_access.list_graphs()``), never by matching
+          FalkorDB's error wording (D2).
+        * **Serialized per graph.**  The read-diff-write section runs under a
+          per-``group_id`` ``asyncio.Lock`` (``_index_provision_locks``, an
+          in-process registry separate from ``_identity_locks``; see ``__init__``
+          for why reusing the identity lock would deadlock).  Without it two
+          concurrent calls for one graph both observe the same pre-write ``actual``
+          and both issue the whole plan, so the loser collects ~30
+          ``Attribute '...' is already indexed`` rejections into ``failed`` —
+          indistinguishable from a genuine provisioning failure, and exactly the
+          signal task δ's drift detector keys on.  γ's first-write choke point is
+          the concurrent case by construction.
+          RESIDUAL, deliberately not solved here: the lock is per PROCESS.  Two
+          fused-memory processes provisioning one graph still produce that
+          signature, and a caller seeing a ``failed`` list that is entirely
+          ``already indexed`` errors should re-read before concluding drift.
+        * **RANGE indices are issued PER-PROPERTY**, never as upstream's composite
+          form — measured: the composite is rejected wholesale with
+          ``Attribute 'uuid' is already indexed`` when any listed property already
+          exists, losing all 4 (``Entity``) or all 7 (``RELATES_TO``) silently.
+          FULLTEXT is issued byte-verbatim, a form measured to succeed against
+          that same trap state.  See ``falkor_indices.plan_index_statements``.
+
+        LOAD-BEARING (INV-6): a spec in ``created`` means its ``CREATE`` was
+        ACCEPTED, **not** that the index is serving.  ``CREATE`` returns in
+        0.5-2.0 ms while the index reaches ``OPERATIONAL`` up to 594.5 ms later.
+        This method deliberately adds NO barrier and issues exactly one
+        ``CALL db.indexes()`` (the diff read) — establishing that an index is
+        serving is task ε's canary, and the wait belongs in test fixtures
+        (``tests/_fm_falkor_live.await_index_operational``), never here.
+
+        Decorated with ``@_canonicalize_group_args`` for correctness, not hygiene:
+        the writes resolve a FalkorDB graph KEY through ``graph_access``, and the
+        inner ``list_indices`` call being decorated does not cover that — the diff
+        read and the writes resolve the key independently (PRD seam S4).
+
+        Measured live 2026-08-09 against uuid-suffixed scratch graphs (pinned in
+        ``tests/test_ensure_indices_integration.py``):
+
+        * Trap state (an ``Entity(uuid)`` + ``RELATES_TO(uuid)`` range index) →
+          24 per-property RANGE + 4 verbatim FULLTEXT = 28 statements, 0 failures,
+          all 11 previously-lost range fields restored.
+        * Virgin graph → 26 + 4 = 30 statements, ``len(created) == 38 ==
+          expected_total``.  Statement and spec counts differ because the 4
+          fulltext statements cover 12 specs between them — hence per-SPEC
+          accounting.
+        * Round-trip afterwards: ``normalize_index_records(list_indices(g)) ==
+          expected_index_set()`` exactly, which is what makes ``already_present ==
+          expected_total`` reachable on the idempotent re-run (measured: 0
+          statements issued).
+
+        Args:
+            group_id: The project/graph id to provision.
+
+        Returns:
+            An :class:`~fused_memory.backends.falkor_indices.IndexProvisionResult`
+            recording what was created, what was already there, what failed, and
+            the statements actually issued.
+
+        Raises:
+            PathShapedProjectIdError: *group_id* is path-shaped — raised by
+                ``@_canonicalize_group_args`` before any DB call.
+            IndexHeaderShapeError: ``CALL db.indexes()`` came back with columns α
+                cannot resolve by name (FalkorDB changed its result shape).  α
+                fails closed on purpose and β must NOT re-read that as "absent":
+                provisioning against an index state that was never determined is
+                the silent-fail-soft class this PRD removes (INV-4).
+            IndexRecordShapeError: a record projected to the wrong shape — same
+                fail-closed rationale.
+            UnparsedIndexStatementError: ``expected_index_set()`` could not parse
+                a statement graphiti emitted, i.e. an upgrade changed the
+                index-statement syntax.  Loud by design: a silently-shrunk
+                expected set under-reports what is missing.
+            ValueError: ``plan_index_statements`` was handed a spec whose shape it
+                refuses to guess a statement for.
+            Exception: whatever the driver raises when it is unreachable, from
+                either the diff read or the ``list_graphs()`` existence probe.
+
+            All five are DELIBERATE fail-closed raises, distinct from the
+            per-statement failures absorbed into ``failed``.  A caller wiring this
+            into a write path (task γ) must guard for them; a caller that treats
+            "it returned" as "indices exist" is reading the contract wrong either
+            way — see the INV-6 note above.
+        """
+        # See the "Serialized per graph" contract bullet: the diff read and the
+        # writes it plans must not interleave with another call for this graph.
+        async with self._index_provision_lock_for(group_id):
+            return await self._ensure_indices_locked(group_id)
+
+    async def _ensure_indices_locked(self, group_id: str) -> IndexProvisionResult:
+        """``ensure_indices``' body, run under that graph's provisioning lock.
+
+        Split out rather than inlined under ``async with`` so the critical section
+        is named: everything here is read-diff-write and MUST NOT be called
+        without the lock held.  *group_id* is already canonical — the caller is
+        decorated, this is not.
+        """
+        try:
+            records = await self.list_indices(group_id=group_id)
+        except (IndexHeaderShapeError, IndexRecordShapeError):
+            # α fails CLOSED when FalkorDB's result shape is not what it can
+            # project.  That must never be absorbed by the absent-graph branch
+            # below: a shape error on a graph missing from list_graphs() (a raced
+            # first write, a concurrently-deleted scratch key) would otherwise be
+            # read as `actual = set()` and issue the whole plan against a graph
+            # whose real index state was never determined (INV-4).  Re-raised
+            # ahead of the broad handler, which is scoped to "the key does not
+            # exist yet" and nothing else.
+            raise
+        except Exception:
+            # A graph KEY that has never been written does not exist yet, and
+            # `CALL db.indexes()` against it fails.  MEASURED 2026-08-09, the
+            # error is `redis.exceptions.ResponseError: Invalid graph operation
+            # on empty key` -- recorded here for the next reader, but deliberately
+            # NOT depended on.  D2: no correctness property may rest on FalkorDB's
+            # error WORDING; that is the same class of load-bearing sentinel that
+            # made the composite rejection invisible in the first place.
+            #
+            # The decision is made STRUCTURALLY instead, which also keeps the
+            # unreachable-driver raise for free: an
+            # unreachable driver makes list_graphs() raise too, so the original
+            # error propagates rather than being misread as "zero indices" --
+            # which would issue every statement against a graph that may already
+            # be fully provisioned.
+            #
+            # The provider's UNFILTERED listing is used, not
+            # GraphitiBackend.list_graphs(), which filters `default_db` / `*_db`
+            # and would misclassify those names as absent.
+            if group_id in await self.graph_access.list_graphs():
+                raise
+            records = []
+
+        # Normalized OUTSIDE the try on purpose: normalize_index_records raises
+        # IndexRecordShapeError, another of α's fail-closed errors, and inside the
+        # try it would be caught by the broad handler and silently become
+        # `actual = set()` on any graph that happens not to be in list_graphs().
+        actual = normalize_index_records(records)
+
+        expected = expected_index_set()
+        missing = expected - actual
+        already_present = len(expected & actual)
+
+        graph = self.graph_access.graph(group_id)
+        created: list[IndexSpec] = []
+        failed: list[tuple[IndexSpec, str]] = []
+        statements: list[str] = []
+
+        for statement, specs in plan_index_statements(missing):
+            statements.append(statement)
+            try:
+                await graph.query(statement, op='_ensure_indices_locked')
+            except Exception as exc:  # absorbed by contract, see docstring
+                failed.extend((spec, str(exc)) for spec in specs)
+                # Emitted HERE rather than reconstructed from `failed` afterwards
+                # because `failed` is keyed by IndexSpec, and a fulltext spec's
+                # statement is upstream's verbatim string, which cannot be derived
+                # back from the spec.  Both facts are in scope only inside the
+                # loop (D7: the absorb must never be silent).
+                logger.warning(
+                    'Index provisioning statement failed on graph %r: %s | statement: %s',
+                    group_id, exc, statement,
+                )
+            else:
+                created.extend(specs)
+
+        result = IndexProvisionResult(
+            created=tuple(created),
+            already_present=already_present,
+            failed=tuple(failed),
+            expected_total=len(expected),
+            statements=tuple(statements),
+        )
+
+        # Nothing is logged when nothing changed: a no-op must never emit a line
+        # an operator would read as "provisioned" (INV-2).  That false-positive is
+        # exactly what the DEBUG line deleted from _ensure_indices was.
+        if result.changed:
+            logger.info(
+                'Provisioned indices on graph %r: created=%d already_present=%d '
+                'failed=%d expected_total=%d',
+                group_id, len(result.created), result.already_present,
+                len(result.failed), result.expected_total,
+            )
+        return result
 
     @_canonicalize_group_args
     async def drop_index(self, label: str, field: str, *, group_id: str) -> None:
-        """Drop an index on the given label and field (FalkorDB syntax)."""
-        graph = self._graph_for(group_id)
+        """Drop a RANGE index on the given label and field (FalkorDB syntax).
+
+        RANGE ONLY — measured, the old-style ``DROP INDEX ON :label(field)`` form
+        this issues fails with ``no such index`` against a live VECTOR index.  A
+        VECTOR index must go through :meth:`drop_vector_index`; see
+        :meth:`drop_vector_indices` for the measurement and why it matters.
+        """
+        graph = self.graph_access.graph(group_id)
         cypher = f'DROP INDEX ON :{label}({field})'
-        await graph.query(cypher)
+        await graph.query(cypher, op='drop_index')
 
     @_canonicalize_group_args
-    async def drop_vector_indices(self, *, group_id: str) -> list[dict]:
-        """Drop all VECTOR-type indices in the graph.
+    async def drop_vector_index(
+        self, label: str, field: str, *, entity_type: str, group_id: str,
+    ) -> None:
+        """Drop ONE VECTOR index, on the given label/property/entity type.
 
-        Calls list_indices() to find indices with type == 'VECTOR', then calls
-        drop_index() for each.  Returns a list of {'label': ..., 'field': ...}
-        dicts for each dropped index.
+        The VECTOR-specific sibling of :meth:`drop_index`, which is RANGE-only.
+        The statement shape comes from
+        :func:`fused_memory.backends.falkor_indices.vector_drop_statement`, which
+        raises on an unrecognised ``entity_type`` rather than guessing; see
+        :meth:`drop_vector_indices` for the measurements behind both.
+
+        Args:
+            label: Node label or relationship type carrying the index.
+            field: A SINGLE property name (not a list).
+            entity_type: ``'NODE'`` or ``'RELATIONSHIP'``.  KEYWORD-ONLY: it is
+                load-bearing (measured, the NODE statement against a RELATIONSHIP
+                vector index fails with ``no such index``) and it is a plain
+                ``str`` just like *field*, so a positional swap would type-check.
+                The argument order matches ``vector_drop_statement`` exactly —
+                ``(label, field)`` positional, ``entity_type`` by keyword — so
+                neither call site has to re-order to reach the other.
+            group_id: The graph to act on.
         """
-        indices = await self.list_indices(group_id=group_id)
+        graph = self.graph_access.graph(group_id)
+        await graph.query(vector_drop_statement(label, field, entity_type=entity_type), op='drop_vector_index')
+
+    @_canonicalize_group_args
+    async def drop_vector_indices(
+        self, *, group_id: str, settle_timeout_s: float = 30.0,
+    ) -> list[dict]:
+        """Drop every VECTOR index in the graph, one property at a time.
+
+        Calls :meth:`list_indices`, asks
+        :func:`fused_memory.backends.falkor_indices.vector_index_properties`
+        which properties of each record carry a VECTOR index, and issues one
+        :meth:`drop_vector_index` per (label, property).
+
+        Until task 3769 this was a PERMANENT NO-OP with THREE distinct defects,
+        each of which alone would have been enough to break it:
+
+        1. The predicate was ``entry.get('type') == 'VECTOR'``, comparing the
+           ``types`` COLUMN — a dict of property -> list of type strings, e.g.
+           ``{'name_embedding': ['VECTOR']}`` — against a bare string.  Never
+           true, so nothing was ever dropped.
+        2. It passed ``entry['field']`` — a LIST of properties, because FalkorDB
+           MERGES every index on a label into one record — where a per-property
+           string is required.  A list renders as ``ON (n.['name_embedding'])``.
+        3. It routed through :meth:`drop_index`, whose old-style
+           ``DROP INDEX ON :label(field)`` form targets RANGE indices ONLY.
+           MEASURED 2026-08-16: it fails against a live VECTOR index with
+           ``ERR Unable to drop index on :Entity(emb): no such index.``  So
+           repairing (1) and (2) alone would have converted a silent no-op into a
+           drop path that RAISES on the first vector index — a worse regression
+           than the bug, since ``reindex(drop_indices=True)`` would go from
+           quietly doing nothing to failing outright.
+
+        The measured-WORKING replacements, synthesized by
+        :func:`fused_memory.backends.falkor_indices.vector_drop_statement`, are
+        ``DROP VECTOR INDEX FOR (n:Label) ON (n.prop)`` for nodes and
+        ``DROP VECTOR INDEX FOR ()-[e:Label]-() ON (e.prop)`` for relationships
+        (``Indices deleted: 1`` each).  ``entity_type`` selects between them and
+        is load-bearing, not cosmetic: measured, the node form against a
+        RELATIONSHIP vector index also fails with ``no such index``.
+
+        The ``logger.info`` line below was therefore a measured-FALSE report: it
+        emitted "Dropped 0 VECTOR index(es)" on graphs that demonstrably had
+        vector indices.  An operator reading an old log line must not treat that
+        0 as evidence of an index-free graph.
+
+        Per-statement failures are NOT absorbed — deliberately the inverse of
+        :meth:`ensure_indices`, which tolerates them because a partial provision
+        beats none.  The sole caller (``maintenance/reindex.py``) drops indices
+        immediately BEFORE re-embedding, so a partial drop reported as success
+        would leave stale fixed-dimension indices behind while the operator
+        believes the rebuild was clean — the same silent fail-soft this method's
+        defect was.
+
+        Propagating is not the same as saying nothing, though.  A mid-loop failure
+        leaves the graph GENUINELY half-dropped, and neither the exception nor
+        ``ReindexManager.reindex_and_replay`` reports which indices are already
+        gone: ``indices_dropped`` is never assigned because this never returns, and
+        the local list dies with the frame.  So the partial list is logged at ERROR
+        before the re-raise — structured facts at failure, so the operator
+        recovering from it knows what already changed.  The propagate-don't-absorb
+        contract is unchanged.
+
+        THE REBUILD WINDOW, and why the catalog is SETTLED before it is READ
+        (task 4777).  MEASURED against FalkorDB module v41800: ``DROP VECTOR
+        INDEX`` against a label whose merged index carries SURVIVING fields is
+        not an in-place catalog mutation.  FalkorDB builds a REPLACEMENT index,
+        and until that build finishes one ``CALL db.indexes()`` returns BOTH the
+        new ``['name']`` row at ``'[Indexing] N/M: UNDER CONSTRUCTION'`` AND the
+        stale ``['name_embedding','name']`` row at ``'OPERATIONAL'``, still
+        advertising the VECTOR property that is already gone.  Not a read-path
+        artifact — ``RO_QUERY`` and ``QUERY`` agree at every instant.  The window
+        is ~4 ms on a 1-node graph and 0.21-0.75 s at 50k nodes; the live pin and
+        the full measurements are
+        ``tests/test_drop_vector_indices_integration.py::TestDropRebuildWindow``.
+
+        THE EXPOSURE that closed.  A SINGLE call was already safe: it read once,
+        before any drop.  But a SECOND call — or any retry — landing in the
+        window read the stale row, re-issued ``DROP VECTOR INDEX``, and got
+        ``'Unable to drop index on :Entity(name_embedding): no such index.'``
+        back, which this method deliberately does not absorb, so it propagated
+        after the ``'after dropping 0 index(es)'`` ERROR line.
+
+        THE SHAPE OF THE FIX: the barrier is on the READ, not on the DROP.
+        Settling BEFORE the read — rather than settling before RETURNING, the
+        other option weighed — protects the call that needs protecting no matter
+        WHO opened the window: a previous run killed between its drop and its
+        settle, a different fused-memory process, or a concurrent
+        :meth:`ensure_indices` build.  A post-drop settle only helps a
+        well-behaved successor inside the same process, and buys the sole caller
+        nothing anyway: ``reindex_and_replay`` re-embeds immediately after the
+        drop and never re-reads the catalog.  Framing it as a barrier on the READ
+        is also what leaves everything below literally untouched — the drop loop,
+        the ``{'label', 'field'}`` return shape, the ERROR-log-then-re-raise
+        partial-drop reporting and the propagate-don't-absorb contract are all
+        unchanged.  Only the trustworthiness of the read that feeds the loop
+        changes.
+
+        WHY NOT treat ``'no such index'`` as an already-satisfied no-op.  It
+        would be a load-bearing sentinel on FalkorDB's error WORDING, which D2
+        forbids repo-wide, and it would silently swallow the OTHER measured
+        producer of that identical string: the NODE drop statement issued against
+        a RELATIONSHIP vector index (see
+        :func:`~fused_memory.backends.falkor_indices.vector_drop_statement`) —
+        a drop that removes nothing while reporting success, i.e. the exact
+        silent fail-soft this method's contract exists to prevent.  The two
+        cannot be told apart from the string.
+
+        WHY :meth:`ensure_indices` IS DELIBERATELY NOT BARRIERED.  INV-6 makes
+        its no-wait behaviour a documented contract, and a stale diff read there
+        costs at worst an "already indexed" rejection it absorbs into ``failed``
+        by design.  A stale read HERE produces a hard propagating failure and, in
+        the other direction, a silent under-drop.  This barrier is scoped to the
+        DROP path.
+
+        Args:
+            group_id: The graph to act on.
+            settle_timeout_s: How long to wait for the index catalog to settle
+                before refusing to act.  The 30 s default comes from the same
+                measurement as
+                ``tests/test_drop_vector_indices_integration.py::_BULK_BARRIER_S``
+                — FalkorDB's initial HNSW build and its post-drop rebuild under
+                contention — and costs nothing on a settled graph, which pays one
+                catalog read and no wait.  Widen it for a graph large enough that
+                an in-flight index build can outlast it.
+
+        Returns:
+            One ``{'label': ..., 'field': ...}`` dict per dropped index, with
+            ``field`` a single property STRING.  The shape is deliberately
+            unchanged: ``reindex.py``'s docstring documents it and
+            ``test_returns_list_of_dropped_indices`` asserts exact dict equality,
+            and ``label`` already disambiguates Entity from RELATES_TO.
+
+        Raises:
+            IndexCatalogUnsettledError: The index catalog did not settle within
+                *settle_timeout_s*, and nothing was dropped.  Fail closed: this
+                never drops against an index state that was never determined,
+                the silent-fail-soft class ``ensure_indices`` refuses for
+                provisioning (INV-4); the exception class says why.
+            Exception: Whatever a failing DROP statement raised, re-raised
+                unchanged after the partial-``dropped`` ERROR line.
+        """
+        indices = await await_index_catalog_settled(
+            functools.partial(self.list_indices, group_id=group_id),
+            graph_name=group_id,
+            timeout_s=settle_timeout_s,
+        )
         dropped: list[dict] = []
-        for entry in indices:
-            if entry.get('type') == 'VECTOR':
-                await self.drop_index(entry['label'], entry['field'], group_id=group_id)
-                dropped.append({'label': entry['label'], 'field': entry['field']})
+        try:
+            for record in indices:
+                for prop in vector_index_properties(record):
+                    await self.drop_vector_index(
+                        record['label'],
+                        prop,
+                        entity_type=record['entity_type'],
+                        group_id=group_id,
+                    )
+                    dropped.append({'label': record['label'], 'field': prop})
+        except Exception:
+            # The exception names the drop that FAILED; only this names the ones
+            # that already SUCCEEDED.  Without it the graph is half-dropped and
+            # nothing on the wire or in the logs says which half.
+            logger.error(
+                'drop_vector_indices failed on graph %r after dropping %d '
+                'index(es) — those are already gone, the rest remain: %r',
+                group_id, len(dropped), dropped,
+            )
+            raise
         logger.info(f'Dropped {len(dropped)} VECTOR index(es)')
         return dropped
 
     async def list_graphs(self) -> list[str]:
         """Enumerate non-empty FalkorDB graphs (excluding default_db)."""
-        client = self._require_falkor_client()
-        all_graphs = await client.list_graphs()
+        all_graphs = await self.graph_access.list_graphs()
         return [g for g in all_graphs if g != 'default_db' and not g.endswith('_db')]
 
     async def node_count(self, graph_name: str) -> int:
@@ -2826,12 +5620,12 @@ class GraphitiBackend:
 
         Uses ro_query since no writes are performed.
         """
-        graph: Any = self._graph_for(graph_name)
-        result = await graph.ro_query('MATCH (n) RETURN count(n) as count')
+        graph = self.graph_access.graph(graph_name)
+        result = await graph.ro_query('MATCH (n) RETURN count(n) as count', op='node_count')
         return result.result_set[0][0] if result.result_set else 0
 
     async def close(self) -> None:
-        """Shut down the driver."""
+        """Shut down the drivers, then release the SDK clients every Graphiti holds."""
         for cloned in self._cloned_drivers.values():
             with contextlib.suppress(Exception):
                 await cloned.close()
@@ -2839,13 +5633,29 @@ class GraphitiBackend:
         if self._driver is not None:
             with contextlib.suppress(Exception):
                 await self._driver.close()
+        await close_wrapped_sdk_clients(self._sdk_client_wrappers())
         self.client = None
         self._driver = None
+        self._graph_access = None
         # Per-group clients each hold a driver that aliases an entry already
-        # closed above via the _cloned_drivers loop (or self._driver itself) —
-        # drop the references only; do NOT call .close() per-client, which
-        # would double-close the single shared FalkorDB connection.
+        # closed above via the _cloned_drivers loop (or self._driver itself), so
+        # Graphiti.close() is never called: it would double-close the single
+        # shared FalkorDB connection. Their SDK sub-clients were released above.
         self._group_clients.clear()
         self._llm_client = None
         self._embedder = None
         self._cross_encoder = None
+
+    def _sdk_client_wrappers(self) -> list[object | None]:
+        """The backend's sub-clients, then those of every Graphiti it holds.
+
+        ``Graphiti.__init__`` mints its own client for any sub-client passed as
+        None, so the shared three alone would miss those.
+        """
+        graphitis = [g for g in (self.client, *self._group_clients.values()) if g is not None]
+        return [
+            self._llm_client,
+            self._embedder,
+            self._cross_encoder,
+            *(sub for g in graphitis for sub in (g.llm_client, g.embedder, g.cross_encoder)),
+        ]

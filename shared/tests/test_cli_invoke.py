@@ -4,10 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import fcntl
+import hashlib
 import itertools
 import json
 import logging
 import os
+import sys
+import tempfile
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
@@ -15,29 +19,44 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _transcript_fixtures import assistant_record, bash_launch, bg_launch_result
 
+from shared.cap_markers import REAL_CLI_CAP_HIT_MESSAGES
 from shared.cli_invoke import (
     _CAP_HIT_COOLDOWN_SECS,
     _MAX_CAP_COOLDOWN_SECS,
+    BUDGET_EXHAUSTED_SUBTYPE,
     CAP_HIT_RESUME_PROMPT,
     AgentFailureKind,
     AgentResult,
+    SubprocessResult,
+    TranscriptWatch,
     _cpu_priority_prefix,
-    _parse_claude_output,
-    _run_subprocess,
-    _SubprocessResult,
+    _materialize_stdin,
     _to_token_count,
     build_failure_message,
     classify_agent_failure,
+    classify_cap_kill,
     count_transcript_turns,
+    detect_transcript_model_id,
     invoke_claude_agent,
     invoke_with_cap_retry,
     is_timed_out_with_progress,
     is_zero_output_timeout,
+    parse_claude_output,
     read_transcript_records,
+    run_cli_subprocess,
+    transcript_model_id_for_session,
 )
+from shared.cost_store import CapReason
 from shared.invocation_outcome import classify_invocation
 from shared.testing import make_gate_mock
+from shared.testing_resume_rejection import measured_resume_rejection
+from shared.testing_stdin import (
+    STDIN_DIGEST_STUB,
+    STDIN_STARVATION_STUB,
+    make_starving_exec,
+)
 
 
 class TestToTokenCount:
@@ -66,6 +85,15 @@ def _make_result(**overrides: Any) -> AgentResult:
     return AgentResult(**defaults)
 
 
+def _make_cap_result(**overrides: Any) -> AgentResult:
+    """A genuine cap: the CLI reports it as a failed turn carrying the banner."""
+    defaults: dict[str, Any] = {
+        'success': False, 'output': REAL_CLI_CAP_HIT_MESSAGES[0],
+    }
+    defaults.update(overrides)
+    return _make_result(**defaults)
+
+
 class TestAgentResultAccountNameField:
 
     def test_account_name_field_defaults_empty(self):
@@ -85,8 +113,8 @@ class TestAgentResultTimedOutField:
 class TestSubprocessResultTimedOutField:
 
     def test_subprocess_result_has_timed_out_field_defaults_false(self):
-        """_SubprocessResult has timed_out field that defaults to False."""
-        result = _SubprocessResult(stdout='', stderr='', returncode=0, duration_ms=0)
+        """SubprocessResult has timed_out field that defaults to False."""
+        result = SubprocessResult(stdout='', stderr='', returncode=0, duration_ms=0)
         assert result.timed_out is False
 
 
@@ -152,7 +180,7 @@ class TestAccountNameThreading:
             patch(
                 'shared.cli_invoke.invoke_claude_agent',
                 new_callable=AsyncMock,
-                return_value=result,
+                side_effect=[_make_cap_result(), result],
             ),
             patch('shared.cli_invoke.asyncio') as mock_asyncio,
         ):
@@ -197,7 +225,7 @@ class TestCapHitBackoff:
             patch(
                 'shared.cli_invoke.invoke_claude_agent',
                 new_callable=AsyncMock,
-                return_value=result,
+                side_effect=[_make_cap_result(), result],
             ) as mock_invoke,
             patch('shared.cli_invoke.asyncio') as mock_asyncio,
         ):
@@ -248,7 +276,7 @@ class TestCapHitBackoff:
             patch(
                 'shared.cli_invoke.invoke_claude_agent',
                 new_callable=AsyncMock,
-                return_value=result,
+                side_effect=[_make_cap_result()] * 2 + [result],
             ),
             patch('shared.cli_invoke.asyncio') as mock_asyncio,
         ):
@@ -277,7 +305,7 @@ class TestCapHitBackoff:
             patch(
                 'shared.cli_invoke.invoke_claude_agent',
                 new_callable=AsyncMock,
-                return_value=result,
+                side_effect=[_make_cap_result()] * 3 + [result],
             ),
             patch('shared.cli_invoke.asyncio') as mock_asyncio,
         ):
@@ -310,7 +338,7 @@ class TestCapHitBackoff:
             patch(
                 'shared.cli_invoke.invoke_claude_agent',
                 new_callable=AsyncMock,
-                return_value=result,
+                side_effect=[_make_cap_result()] * num_hits + [result],
             ),
             patch('shared.cli_invoke.asyncio') as mock_asyncio,
         ):
@@ -373,42 +401,6 @@ class TestInvokeWithCapRetryCostStore:
         assert 'started_at' in call_kwargs
         assert 'completed_at' in call_kwargs
 
-    async def test_save_account_event_on_cap_hit(self):
-        """save_account_event is awaited with cap_hit on cap detection."""
-        gate = make_gate_mock(
-            account_count=2,
-            before_invoke=AsyncMock(side_effect=['token-a', 'token-b']),
-            detect_cap_hit=MagicMock(side_effect=[True, False]),
-            active_account_name='acct-b',
-        )
-
-        cost_store = MagicMock()
-        cost_store.save_invocation = AsyncMock()
-        cost_store.save_account_event = AsyncMock()
-
-        result = _make_result()
-
-        with (
-            patch(
-                'shared.cli_invoke.invoke_claude_agent',
-                new_callable=AsyncMock,
-                return_value=result,
-            ),
-            patch('shared.cli_invoke.asyncio') as mock_asyncio,
-        ):
-            mock_asyncio.sleep = AsyncMock()
-            await invoke_with_cap_retry(
-                gate, 'test-label',
-                cost_store=cost_store, run_id='run-1', project_id='proj-1',
-                prompt='hi',
-            )
-
-        cost_store.save_account_event.assert_awaited_once()
-        call_kwargs = cost_store.save_account_event.call_args.kwargs
-        assert call_kwargs['event_type'] == 'cap_hit'
-        assert call_kwargs['details'] == 'test-label'
-        assert 'created_at' in call_kwargs
-
     async def test_no_error_when_cost_store_none(self):
         """No CostStore-related errors when cost_store=None (default)."""
         gate = make_gate_mock(
@@ -454,41 +446,6 @@ class TestInvokeWithCapRetryCostStore:
         assert got.success is True
         assert 'Failed to save invocation cost' in caplog.text
 
-    async def test_save_account_event_error_swallowed(self, caplog):
-        """save_account_event failure is logged but retry still happens."""
-        gate = make_gate_mock(
-            account_count=2,
-            before_invoke=AsyncMock(side_effect=['token-a', 'token-b']),
-            detect_cap_hit=MagicMock(side_effect=[True, False]),
-            active_account_name='acct-b',
-        )
-
-        cost_store = MagicMock()
-        cost_store.save_invocation = AsyncMock()
-        cost_store.save_account_event = AsyncMock(side_effect=RuntimeError('db error'))
-
-        result = _make_result()
-
-        with (
-            patch(
-                'shared.cli_invoke.invoke_claude_agent',
-                new_callable=AsyncMock,
-                return_value=result,
-            ),
-            patch('shared.cli_invoke.asyncio') as mock_asyncio,
-        ):
-            mock_asyncio.sleep = AsyncMock()
-            with caplog.at_level(logging.WARNING):
-                got = await invoke_with_cap_retry(
-                    gate, 'test-label',
-                    cost_store=cost_store, prompt='hi',
-                )
-
-        assert got.success is True
-        assert 'Failed to save cap_hit event' in caplog.text
-        # save_invocation still called on the successful retry
-        cost_store.save_invocation.assert_awaited_once()
-
     async def test_capped_false_on_successful_invocation(self):
         """capped=False on save_invocation even after prior cap hits."""
         gate = make_gate_mock(
@@ -533,7 +490,7 @@ class TestCapHitResume:
             active_account_name='acct-b',
         )
 
-        capped_result = _make_result(session_id='sess-123')
+        capped_result = _make_cap_result(session_id='sess-123')
         ok_result = _make_result()
 
         with (
@@ -561,7 +518,7 @@ class TestCapHitResume:
             active_account_name='acct-b',
         )
 
-        capped_result = _make_result(session_id='')
+        capped_result = _make_cap_result(session_id='')
         ok_result = _make_result()
 
         with (
@@ -580,7 +537,7 @@ class TestCapHitResume:
             assert second_call.kwargs.get('prompt') == 'do stuff'
 
     async def test_resume_failure_falls_back_to_fresh(self):
-        """Resume returns success=False (not cap hit) → retry with original prompt."""
+        """The CLI rejects the re-armed resume → retry with original prompt."""
         gate = make_gate_mock(
             account_count=2,
             before_invoke=AsyncMock(side_effect=['token-a', 'token-b', 'token-a']),
@@ -588,8 +545,8 @@ class TestCapHitResume:
             active_account_name='acct-b',
         )
 
-        capped_result = _make_result(session_id='sess-123')
-        failed_resume = _make_result(success=False, output='resume error')
+        capped_result = _make_cap_result(session_id='sess-123')
+        failed_resume = measured_resume_rejection('sess-123')
         ok_result = _make_result()
 
         with (
@@ -622,8 +579,8 @@ class TestCapHitResume:
             active_account_name='next',
         )
 
-        r1 = _make_result(session_id='sess-1')
-        r2 = _make_result(session_id='sess-2')
+        r1 = _make_cap_result(session_id='sess-1')
+        r2 = _make_cap_result(session_id='sess-2')
         r3 = _make_result()
 
         with (
@@ -649,7 +606,7 @@ class TestCapHitResume:
             assert mock_invoke.call_args_list[2].kwargs.get('prompt') == CAP_HIT_RESUME_PROMPT
 
     async def test_fresh_fallback_regenerates_session_id(self):
-        """Failed resume → fresh fallback hands the CLI a NEW pre-allocated UUID.
+        """Rejected resume → fresh fallback hands the CLI a NEW pre-allocated UUID.
 
         Regression for reify-3604: the resume attempt may already have committed
         the caller's pre-allocated UUID to disk, so reusing it on the fresh
@@ -664,9 +621,7 @@ class TestCapHitResume:
             active_account_name='acct',
         )
 
-        # cost_usd defaults to 0.5 in _make_result, so the failure does not trip
-        # the zero-cost heuristic — it routes through the resume-fallback branch.
-        failed_resume = _make_result(success=False, output='resume error')
+        failed_resume = measured_resume_rejection('sess-orig')
         ok_result = _make_result()
 
         with (
@@ -695,6 +650,179 @@ class TestCapHitResume:
         assert new_sid and new_sid != 'sess-orig'
         assert str(uuid.UUID(new_sid)) == new_sid
 
+
+@pytest.mark.asyncio
+class TestResumeFallbackCounter:
+    """``AgentResult.resume_fallbacks`` counts armed-then-rejected resumes.
+
+    The population this makes visible: ``invoke_with_cap_retry`` armed
+    ``--resume``, the CLI rejected the session before any model turn, and the
+    loop retried fresh.  Without the count nothing records that a resume — and
+    with it the whole prior transcript — was lost.  ``shared`` has no event store, so the count
+    rides out on the result as the carrier the orchestrator reads (step-22)
+    without ``shared`` acquiring an event-store dependency.
+
+    THE PREDICATE, EXACTLY: every resumed attempt this loop made that the CLI
+    then rejected (``is_resume_rejected``) — the caller's ``resume_session_id``
+    AND any resume the loop re-armed itself off a capped attempt.  It is therefore not the answer to
+    "did the resume the ORCHESTRATOR adopted survive?"; the orchestrator gates
+    its ``session_resume_failed(stage='cli')`` emit on its own armed session id
+    for that.  ``resume_fallback_session_ids`` names which sessions were lost,
+    because after ``_reset_for_fresh_retry`` the ids are otherwise unrecoverable.
+
+    THE LOAD-BEARING SUBTLETY: the retry loop rebinds ``result`` on every pass,
+    so a counter stamped onto the DISCARDED first result is lost by
+    construction.  Only a loop-local counter stamped at the single return point
+    survives — which is exactly what the ``got is ok_result`` assertions below
+    pin: the object handed back is the LAST result, not the failed one.
+    """
+
+    async def test_single_resume_fallback_counted(self):
+        """One armed-then-rejected resume → the RETURNED result carries 1.
+
+        Caller-initiated resume (the pooled-warm-lane shape): the first
+        invocation carries the caller's ``resume_session_id``, the CLI rejects
+        it, and the loop retries fresh and succeeds.
+        """
+        gate = make_gate_mock(
+            account_count=1,
+            before_invoke=AsyncMock(side_effect=['token-a', 'token-a']),
+            detect_cap_hit=MagicMock(return_value=False),
+            active_account_name='acct',
+        )
+        failed_resume = measured_resume_rejection('sess-lost')
+        ok_result = _make_result()
+
+        with (
+            patch(
+                'shared.cli_invoke.invoke_claude_agent',
+                new_callable=AsyncMock,
+                side_effect=[failed_resume, ok_result],
+            ) as mock_invoke,
+            patch('shared.cli_invoke.asyncio.sleep', new_callable=AsyncMock),
+        ):
+            got = await invoke_with_cap_retry(
+                gate, 'test-label',
+                prompt='do stuff',
+                resume_session_id='sess-lost',
+            )
+
+        assert mock_invoke.call_count == 2
+        assert got is ok_result, (
+            'the loop rebinds result on each pass — the counter must be stamped '
+            'on the final returned object, not on the discarded failed resume'
+        )
+        assert got.resume_fallbacks == 1
+        assert got.resume_fallback_session_ids == ('sess-lost',)
+
+    async def test_two_resume_fallbacks_counted(self):
+        """Two armed-then-rejected resumes across a cap re-arm → the count reaches 2.
+
+        Realistic FOUR-call shape: caller resume rejected (fallback 1) → fresh
+        retry hits a cap that carries a session id → the loop re-arms
+        ``--resume`` itself → that resume is rejected too (fallback 2) → fresh
+        retry succeeds.  Proves the counter accumulates rather than latching at one.
+
+        Also the row that pins the counter's REAL predicate: increment 2 comes
+        from a resume the LOOP re-armed, not one the caller asked for — which
+        is why the orchestrator's ``stage='cli'`` emit gates on its own armed
+        session id instead of on a non-zero count.
+        """
+        gate = make_gate_mock(
+            account_count=2,
+            before_invoke=AsyncMock(side_effect=['t-a', 't-b', 't-a', 't-b']),
+            detect_cap_hit=MagicMock(side_effect=[False, True, False, False]),
+            active_account_name='acct-b',
+        )
+        failed_resume_1 = measured_resume_rejection('sess-lost')
+        capped = _make_cap_result(session_id='sess-capped')
+        failed_resume_2 = measured_resume_rejection('sess-capped')
+        ok_result = _make_result()
+
+        with (
+            patch(
+                'shared.cli_invoke.invoke_claude_agent',
+                new_callable=AsyncMock,
+                side_effect=[failed_resume_1, capped, failed_resume_2, ok_result],
+            ) as mock_invoke,
+            patch('shared.cli_invoke.asyncio.sleep', new_callable=AsyncMock),
+        ):
+            got = await invoke_with_cap_retry(
+                gate, 'test-label',
+                prompt='do stuff',
+                resume_session_id='sess-lost',
+            )
+
+        assert mock_invoke.call_count == 4
+        # Call 1 armed the caller's resume; call 3 armed the cap-hit re-resume.
+        assert mock_invoke.call_args_list[0].kwargs.get('resume_session_id') == 'sess-lost'
+        assert mock_invoke.call_args_list[2].kwargs.get('resume_session_id') == 'sess-capped'
+        assert got is ok_result
+        assert got.resume_fallbacks == 2
+        # …and the carrier NAMES both lost sessions, oldest first.  The count
+        # alone cannot: _reset_for_fresh_retry regenerates the pre-allocated
+        # session_id and the cap re-arm replaced the armed id, so neither the
+        # caller's id nor got.session_id identifies what was dropped.
+        assert got.resume_fallback_session_ids == ('sess-lost', 'sess-capped')
+
+    async def test_no_resume_leaves_counter_zero(self):
+        """A plain invocation with no ``--resume`` leaves the default 0.
+
+        Every existing caller must see an unchanged result shape: the field is
+        additive, and a non-resumed invocation can never have lost a resume.
+
+        Asserting ``== 0`` alone would pin the dataclass DEFAULT and stay green
+        with the whole feature deleted, so the row asserts the behaviour that
+        can actually break: exactly ONE call, carrying no ``resume_session_id``
+        — i.e. the loop never armed (and so never lost) a resume of its own.
+        """
+        gate = make_gate_mock(detect_cap_hit=MagicMock(return_value=False))
+        ok_result = _make_result()
+
+        with patch(
+            'shared.cli_invoke.invoke_claude_agent',
+            new_callable=AsyncMock,
+            return_value=ok_result,
+        ) as mock_invoke:
+            got = await invoke_with_cap_retry(gate, 'test-label', prompt='do stuff')
+
+        assert got is ok_result
+        assert mock_invoke.call_count == 1, 'no fresh retry should have happened'
+        assert not mock_invoke.call_args_list[0].kwargs.get('resume_session_id')
+        assert got.resume_fallbacks == 0
+        assert got.resume_fallback_session_ids == ()
+
+    async def test_successful_resume_reports_zero(self):
+        """Scope check: the counter counts FALLBACKS taken, not resumes armed.
+
+        A resumed invocation that SUCCEEDS took no fallback, so nothing was
+        lost and the count stays 0 — the orchestrator must not emit a
+        ``session_resume_failed`` event for a resume that worked.
+
+        Same teeth as the row above: the resume is provably ARMED (call 1
+        carries ``resume_session_id``) and provably NOT retried
+        (``call_count == 1``), so a spurious increment or a lost stamp is
+        detectable rather than masked by the field's default.
+        """
+        gate = make_gate_mock(detect_cap_hit=MagicMock(return_value=False))
+        ok_result = _make_result()
+
+        with patch(
+            'shared.cli_invoke.invoke_claude_agent',
+            new_callable=AsyncMock,
+            return_value=ok_result,
+        ) as mock_invoke:
+            got = await invoke_with_cap_retry(
+                gate, 'test-label', prompt='do stuff', resume_session_id='sess-ok',
+            )
+
+        assert got is ok_result
+        assert mock_invoke.call_count == 1, (
+            'the resume succeeded — no fresh fallback invocation should exist'
+        )
+        assert mock_invoke.call_args_list[0].kwargs.get('resume_session_id') == 'sess-ok'
+        assert got.resume_fallbacks == 0
+        assert got.resume_fallback_session_ids == ()
 
 @pytest.mark.asyncio
 class TestResumeDiscardProgressTimeout:
@@ -799,12 +927,12 @@ class TestCallerInitiatedResume:
     When the orchestrator resumes a crashed agent, it now passes the real task
     prompt + resume_session_id to invoke_with_cap_retry.  cli_invoke must
     substitute CRASH_RECOVERY_RESUME_PROMPT for the first subprocess call and
-    restore the real task prompt on any non-cap resume failure fallback.
+    restore the real task prompt on the fresh fallback after a rejected resume.
     """
 
     async def test_caller_resume_substitutes_continuation_prompt_and_restores_real_prompt_on_fresh_fallback(self):
         """cli_invoke swaps in CRASH_RECOVERY_RESUME_PROMPT then restores real prompt on fallback."""
-        from shared.cli_invoke import CRASH_RECOVERY_RESUME_PROMPT  # noqa: PLC0415
+        from shared.cli_invoke import CRASH_RECOVERY_RESUME_PROMPT
 
         gate = make_gate_mock(
             account_count=1,
@@ -813,7 +941,7 @@ class TestCallerInitiatedResume:
             active_account_name='acct',
         )
 
-        failed_resume = _make_result(success=False, output='resume error')
+        failed_resume = measured_resume_rejection('sess-xyz')
         ok_result = _make_result()
 
         with patch(
@@ -845,7 +973,7 @@ class TestCallerInitiatedResume:
 
 
 def _make_subprocess_result(stdout='', stderr='', returncode=0, duration_ms=100):
-    return _SubprocessResult(
+    return SubprocessResult(
         stdout=stdout, stderr=stderr,
         returncode=returncode, duration_ms=duration_ms,
     )
@@ -903,13 +1031,29 @@ class TestLargePayloadHandling:
         assert not Path(file_path).exists(), 'Temp system prompt file was not cleaned up'
 
     async def test_prompt_sent_via_stdin_not_args(self, tmp_path):
-        """User prompt is piped via stdin, not passed as a CLI argument."""
+        """User prompt is delivered on stdin, not passed as a CLI argument."""
         captured_cmd = []
         captured_kwargs = {}
+        # Read the payload INSIDE the fake: run_cli_subprocess closes the parent's
+        # handle the moment create_subprocess_exec returns (that close is what
+        # gives the child its EOF), so it is unreadable by the time the
+        # assertions below run.
+        stdin_seen: dict = {}
 
         async def fake_exec(*args, **kwargs):
             captured_cmd.extend(args)
             captured_kwargs.update(kwargs)
+            stdin_arg = kwargs.get('stdin')
+            stdin_seen['is_pipe'] = stdin_arg == asyncio.subprocess.PIPE
+            # `is not None` is what narrows for the type checker; hasattr alone
+            # leaves the None arm live on kwargs.get()'s `Any | None`.
+            if stdin_arg is not None and hasattr(stdin_arg, 'read'):
+                stdin_seen['is_file'] = True
+                stdin_seen['pos'] = stdin_arg.tell()
+                stdin_arg.seek(0)
+                stdin_seen['payload'] = stdin_arg.read()
+            else:
+                stdin_seen['is_file'] = False
             proc = MagicMock()
             proc.communicate = AsyncMock(return_value=(
                 _successful_json_output().encode(),
@@ -935,8 +1079,18 @@ class TestLargePayloadHandling:
                 f'Prompt text found in cmd arg: {arg!r}'
             )
 
-        # stdin must be PIPE (for piping prompt data)
-        assert captured_kwargs.get('stdin') == asyncio.subprocess.PIPE
+        # stdin is a pre-materialized file object, NOT a PIPE (task 3147): the
+        # payload must already be readable by the kernel at execve, so a
+        # stalled event loop cannot cost the child its prompt.
+        assert not stdin_seen['is_pipe'], (
+            'stdin is a bare PIPE — the prompt would be written by the event '
+            'loop after execve, reopening the task-3147 starvation race'
+        )
+        assert stdin_seen['is_file'], (
+            f'stdin is not a readable file object: {captured_kwargs.get("stdin")!r}'
+        )
+        assert stdin_seen['pos'] == 0, 'pre-materialized stdin is not rewound to 0'
+        assert stdin_seen['payload'] == prompt_text.encode()
 
     async def test_temp_files_cleaned_up_on_error(self, tmp_path):
         """Temp files are cleaned up even when subprocess raises."""
@@ -972,14 +1126,21 @@ class TestLargePayloadHandling:
         MAX_ARG_STRLEN = 131072  # 128KB, Linux per-argument limit
 
         captured_cmd = []
-        captured_communicate_input = []
+        # Read the pre-materialized stdin INSIDE the fake — run_cli_subprocess
+        # closes the parent's handle as soon as create_subprocess_exec returns.
+        captured_stdin_payload = []
 
         async def fake_exec(*args, **kwargs):
             captured_cmd.extend(args)
+            stdin_arg = kwargs.get('stdin')
+            assert stdin_arg is not None and hasattr(stdin_arg, 'read'), (
+                f'expected a pre-materialized stdin file object, got {stdin_arg!r}'
+            )
+            stdin_arg.seek(0)
+            captured_stdin_payload.append(stdin_arg.read())
             proc = MagicMock()
 
             async def fake_communicate(input=None):
-                captured_communicate_input.append(input)
                 return (_successful_json_output().encode(), b'')
 
             proc.communicate = fake_communicate
@@ -1005,16 +1166,33 @@ class TestLargePayloadHandling:
                 f'CLI arg exceeds MAX_ARG_STRLEN ({len(str(arg).encode())} bytes): {str(arg)[:100]}...'
             )
 
-        # The large prompt should arrive via stdin, not args
-        assert len(captured_communicate_input) == 1
-        assert captured_communicate_input[0] == large_prompt.encode()
+        # The large prompt should arrive via stdin, not args.  260 KB is
+        # load-bearing: it is >4x the 65536-byte default pipe capacity, so this
+        # also proves the task-3147 pre-materialization is not silently
+        # capacity-bounded the way a pre-filled os.pipe() fix would be.
+        assert len(captured_stdin_payload) == 1
+        assert captured_stdin_payload[0] == large_prompt.encode()
 
-    async def test_resume_skips_system_prompt_file(self, tmp_path):
-        """When resuming a session, --system-prompt-file is not used."""
+    async def test_resume_still_passes_system_prompt_file(self, tmp_path):
+        """When resuming a session, --system-prompt-file is STILL used (task 3983).
+
+        The system prompt is a process-invocation parameter the session does not
+        carry, so a resumed invocation that omitted it ran under the stock Claude
+        Code prompt with no role charter.  The resume path therefore writes the
+        prompt to a temp file just like the fresh path — and that new temp file
+        must be swept by the same cleanup the fresh path relies on.
+        """
         captured_cmd = []
+        captured_sysprompt = []
 
         async def fake_exec(*args, **kwargs):
             captured_cmd.extend(args)
+            # Read the sysprompt file HERE — spawn time is the only moment it is
+            # guaranteed to exist; _invoke_claude's `finally` unlinks it as soon
+            # as the call returns.
+            if '--system-prompt-file' in args:
+                idx = args.index('--system-prompt-file')
+                captured_sysprompt.append(Path(args[idx + 1]).read_text())
             proc = MagicMock()
             proc.communicate = AsyncMock(return_value=(
                 _successful_json_output().encode(),
@@ -1029,14 +1207,75 @@ class TestLargePayloadHandling:
         with patch('shared.cli_invoke.asyncio.create_subprocess_exec', side_effect=fake_exec):
             await invoke_claude_agent(
                 prompt='continue',
-                system_prompt='ignored on resume',
+                system_prompt='You are a resumed role agent.',
                 cwd=tmp_path,
                 resume_session_id='sess-abc',
             )
 
         assert '--resume' in captured_cmd
-        assert '--system-prompt-file' not in captured_cmd
+        assert '--system-prompt-file' in captured_cmd
+        # The inline form must still never appear (ARG_MAX).
         assert '--system-prompt' not in captured_cmd
+        assert captured_sysprompt == ['You are a resumed role agent.']
+
+        # The newly-created resume temp file is swept by the existing cleanup.
+        idx = captured_cmd.index('--system-prompt-file')
+        file_path = captured_cmd[idx + 1]
+        assert not Path(file_path).exists(), 'Temp system prompt file was not cleaned up'
+
+    async def test_resume_carries_the_current_system_prompt(self, tmp_path):
+        """A resume runs under the CURRENT system prompt, not the original one.
+
+        This is the one caller-visible SEMANTIC consequence of task 3983, and it
+        only shows up when the two invocations differ: charter A opens the
+        session, charter B resumes it, and B is what reaches the process.  The
+        prompt is a process-invocation parameter the session does not carry, so
+        there is nothing to replay — whatever the resuming caller passes NOW is
+        the charter in force.
+
+        That matters because real call sites re-resolve the prompt at resume
+        time rather than passing a constant: `workflow._resolve_role_system_prompt(
+        role, model)` is a model-keyed PromptArtifactStore lookup, and recon
+        Stage 2 builds its prompt from `project_id`.  A crash-recovery resume
+        that re-resolves to a different model therefore legitimately swaps the
+        charter mid-transcript.  `build_claude_argv` documents this as the
+        intended semantics; this test holds it.
+        """
+        captured_sysprompts: list[str] = []
+
+        async def fake_exec(*args, **kwargs):
+            # Read at spawn time — the only moment the temp file exists, since
+            # _invoke_claude's `finally` unlinks it as soon as the call returns.
+            idx = args.index('--system-prompt-file')
+            captured_sysprompts.append(Path(args[idx + 1]).read_text())
+            proc = MagicMock()
+            proc.communicate = AsyncMock(return_value=(
+                _successful_json_output().encode(),
+                b'',
+            ))
+            proc.returncode = 0
+            proc.terminate = MagicMock()
+            proc.kill = MagicMock()
+            proc.wait = AsyncMock()
+            return proc
+
+        with patch('shared.cli_invoke.asyncio.create_subprocess_exec', side_effect=fake_exec):
+            await invoke_claude_agent(
+                prompt='start',
+                system_prompt='charter A',
+                cwd=tmp_path,
+                session_id='sess-abc',
+            )
+            await invoke_claude_agent(
+                prompt='continue',
+                system_prompt='charter B',
+                cwd=tmp_path,
+                resume_session_id='sess-abc',
+            )
+
+        assert captured_sysprompts == ['charter A', 'charter B'], (
+            'the resumed process must receive the prompt supplied at RESUME time'
+        )
 
 
 # ── session_id preallocation (crash-recovery resume) ──────────────────
@@ -1646,18 +1885,18 @@ class TestVllmBridgeActivation:
         mock_instance.start.assert_awaited_once()
         # stop() was called by the finally clause despite the start failure
         mock_instance.stop.assert_awaited_once()
-        # subprocess was never reached (start raised before _run_subprocess)
+        # subprocess was never reached (start raised before run_cli_subprocess)
         assert not captured_kwargs
 
 
-# ── _run_subprocess timed_out flag ─────────────────────────────────────────
+# ── run_cli_subprocess timed_out flag ─────────────────────────────────────────
 
 
 @pytest.mark.asyncio
 class TestRunSubprocessTimedOut:
 
     async def test_run_subprocess_sets_timed_out_on_sigkill_branch(self, tmp_path):
-        """_run_subprocess sets timed_out=True on the SIGTERM+SIGKILL branch."""
+        """run_cli_subprocess sets timed_out=True on the SIGTERM+SIGKILL branch."""
         proc = MagicMock()
         # Both communicate() calls raise TimeoutError → SIGTERM+SIGKILL path
         proc.communicate = AsyncMock(side_effect=TimeoutError)
@@ -1674,8 +1913,10 @@ class TestRunSubprocessTimedOut:
             patch('shared.cli_invoke.asyncio.create_subprocess_exec', side_effect=fake_exec),
             patch('shared.cli_invoke.terminate_process_group', new_callable=AsyncMock),
         ):
-            result = await _run_subprocess(
-                ['fake'], cwd=tmp_path, env={}, model='opus', timeout_seconds=0.1,
+            result = await run_cli_subprocess(
+                ['fake'], cwd=tmp_path, env={},
+                backend='claude', model='opus', timeout_seconds=0.1,
+                transcript=TranscriptWatch(),
             )
 
         assert result.timed_out is True
@@ -1683,7 +1924,7 @@ class TestRunSubprocessTimedOut:
         assert 'SIGTERM+SIGKILL' in result.stderr
 
     async def test_run_subprocess_sets_timed_out_on_sigterm_grace_branch(self, tmp_path):
-        """_run_subprocess sets timed_out=True on the SIGTERM-grace branch."""
+        """run_cli_subprocess sets timed_out=True on the SIGTERM-grace branch."""
         valid_json = json.dumps({
             'result': 'ok',
             'subtype': 'success',
@@ -1695,7 +1936,7 @@ class TestRunSubprocessTimedOut:
 
         call_count = 0
 
-        async def communicate_side_effect(input=None):  # noqa: A002
+        async def communicate_side_effect(input=None):
             nonlocal call_count
             call_count += 1
             if call_count == 1:
@@ -1714,8 +1955,10 @@ class TestRunSubprocessTimedOut:
             return proc
 
         with patch('shared.cli_invoke.asyncio.create_subprocess_exec', side_effect=fake_exec):
-            result = await _run_subprocess(
-                ['fake'], cwd=tmp_path, env={}, model='opus', timeout_seconds=0.1,
+            result = await run_cli_subprocess(
+                ['fake'], cwd=tmp_path, env={},
+                backend='claude', model='opus', timeout_seconds=0.1,
+                transcript=TranscriptWatch(),
             )
 
         assert result.timed_out is True
@@ -1756,9 +1999,10 @@ class TestRunSubprocessTimedOut:
             patch('shared.cli_invoke.asyncio.create_subprocess_exec', side_effect=fake_exec),
             patch('shared.cli_invoke.terminate_process_group', new_callable=AsyncMock),
         ):
-            result = await _run_subprocess(
-                ['fake'], cwd=tmp_path, env={}, model='opus', timeout_seconds=0.1,
-                session_id=sid, config_dir=cfg_dir,
+            result = await run_cli_subprocess(
+                ['fake'], cwd=tmp_path, env={},
+                backend='claude', model='opus', timeout_seconds=0.1,
+                transcript=TranscriptWatch(session_id=sid, config_dir=cfg_dir),
             )
 
         assert result.timed_out is True
@@ -1781,16 +2025,17 @@ class TestRunSubprocessTimedOut:
             patch('shared.cli_invoke.asyncio.create_subprocess_exec', side_effect=fake_exec),
             patch('shared.cli_invoke.terminate_process_group', new_callable=AsyncMock),
         ):
-            result = await _run_subprocess(
-                ['fake'], cwd=tmp_path, env={}, model='opus', timeout_seconds=0.1,
-                session_id=None, config_dir=tmp_path,
+            result = await run_cli_subprocess(
+                ['fake'], cwd=tmp_path, env={},
+                backend='claude', model='opus', timeout_seconds=0.1,
+                transcript=TranscriptWatch(session_id=None, config_dir=tmp_path),
             )
 
         assert result.timed_out is True
         assert result.transcript_turns is None
 
 
-# ── _parse_claude_output timed_out propagation ───────────────────────────────
+# ── parse_claude_output timed_out propagation ───────────────────────────────
 
 _CLAUDE_VALID_JSON_STDOUT = json.dumps({
     'result': 'ok',
@@ -1816,10 +2061,10 @@ class TestParseClaudeOutputPropagatesTimedOut:
         ids=['empty_stdout', 'json_decode_error', 'normal_parse'],
     )
     def test_propagates_timed_out(self, stdout, stderr, returncode, input_timed_out):
-        """_parse_claude_output propagates timed_out from the subprocess result."""
-        sub = _SubprocessResult(stdout=stdout, stderr=stderr, returncode=returncode,
+        """parse_claude_output propagates timed_out from the subprocess result."""
+        sub = SubprocessResult(stdout=stdout, stderr=stderr, returncode=returncode,
                                 duration_ms=100, timed_out=input_timed_out)
-        agent = _parse_claude_output(sub)
+        agent = parse_claude_output(sub)
         assert agent.timed_out is input_timed_out
 
     def test_empty_output_preserves_duration_ms(self):
@@ -1827,11 +2072,11 @@ class TestParseClaudeOutputPropagatesTimedOut:
         must forward its real duration to AgentResult so downstream heuristics
         can distinguish a true zero-cost instant exit from a long timeout.
         """
-        sub = _SubprocessResult(
+        sub = SubprocessResult(
             stdout='', stderr='terminated', returncode=-15,
             duration_ms=240_003, timed_out=True,
         )
-        agent = _parse_claude_output(sub)
+        agent = parse_claude_output(sub)
         assert agent.subtype == 'error_empty_output'
         assert agent.timed_out is True
         assert agent.duration_ms == 240_003
@@ -1848,11 +2093,11 @@ class TestParseClaudeOutputDistinctTimeoutSubtype:
 
     def test_timed_out_with_progress_gets_distinct_subtype(self):
         """timed_out=True + transcript_turns>0 → error_timeout_killed_with_progress."""
-        sub = _SubprocessResult(
+        sub = SubprocessResult(
             stdout='', stderr='terminated', returncode=-15,
             duration_ms=1_200_000, timed_out=True, transcript_turns=13,
         )
-        agent = _parse_claude_output(sub)
+        agent = parse_claude_output(sub)
         assert agent.subtype == 'error_timeout_killed_with_progress'
         assert agent.success is False
         assert agent.timed_out is True
@@ -1860,11 +2105,11 @@ class TestParseClaudeOutputDistinctTimeoutSubtype:
 
     def test_timed_out_zero_turns_keeps_empty_output_subtype(self):
         """timed_out=True + transcript_turns==0 → stays error_empty_output (wedge)."""
-        sub = _SubprocessResult(
+        sub = SubprocessResult(
             stdout='', stderr='terminated', returncode=-15,
             duration_ms=300_000, timed_out=True, transcript_turns=0,
         )
-        agent = _parse_claude_output(sub)
+        agent = parse_claude_output(sub)
         assert agent.subtype == 'error_empty_output'
         assert agent.success is False
         assert agent.timed_out is True
@@ -1872,11 +2117,11 @@ class TestParseClaudeOutputDistinctTimeoutSubtype:
 
     def test_timed_out_none_turns_keeps_empty_output_subtype(self):
         """timed_out=True + transcript_turns=None (unreadable) → stays error_empty_output."""
-        sub = _SubprocessResult(
+        sub = SubprocessResult(
             stdout='', stderr='terminated', returncode=-15,
             duration_ms=300_000, timed_out=True, transcript_turns=None,
         )
-        agent = _parse_claude_output(sub)
+        agent = parse_claude_output(sub)
         assert agent.subtype == 'error_empty_output'
         assert agent.success is False
         assert agent.timed_out is True
@@ -1888,11 +2133,11 @@ class TestParseClaudeOutputDistinctTimeoutSubtype:
         reserved for an actual wall-clock TIMEOUT kill, not any progress
         reading in isolation.
         """
-        sub = _SubprocessResult(
+        sub = SubprocessResult(
             stdout='', stderr='', returncode=1,
             duration_ms=100, timed_out=False, transcript_turns=5,
         )
-        agent = _parse_claude_output(sub)
+        agent = parse_claude_output(sub)
         assert agent.subtype == 'error_empty_output'
         assert agent.success is False
 
@@ -1901,16 +2146,16 @@ class TestParseClaudeOutputDistinctTimeoutSubtype:
 
 
 class TestTranscriptTurnsFieldAndPropagation:
-    """Tests for transcript_turns field on _SubprocessResult + AgentResult,
-    and propagation through _parse_claude_output on all three return paths.
+    """Tests for transcript_turns field on SubprocessResult + AgentResult,
+    and propagation through parse_claude_output on all three return paths.
 
     transcript_turns defaults to None and is propagated from the subprocess
-    result to the AgentResult on every code path in _parse_claude_output.
+    result to the AgentResult on every code path in parse_claude_output.
     """
 
     def test_subprocess_result_defaults_transcript_turns_none(self):
-        """_SubprocessResult.transcript_turns defaults to None."""
-        r = _SubprocessResult(stdout='', stderr='', returncode=0, duration_ms=10)
+        """SubprocessResult.transcript_turns defaults to None."""
+        r = SubprocessResult(stdout='', stderr='', returncode=0, duration_ms=10)
         assert r.transcript_turns is None
 
     def test_agent_result_defaults_transcript_turns_none(self):
@@ -1919,7 +2164,7 @@ class TestTranscriptTurnsFieldAndPropagation:
         assert r.transcript_turns is None
 
     def test_propagation_empty_stdout_path(self):
-        """Empty stdout path: _SubprocessResult(transcript_turns=7) → AgentResult.transcript_turns==7.
+        """Empty stdout path: SubprocessResult(transcript_turns=7) → AgentResult.transcript_turns==7.
 
         subtype is 'error_timeout_killed_with_progress' (not
         'error_empty_output') because timed_out=True with transcript_turns=7
@@ -1927,39 +2172,39 @@ class TestTranscriptTurnsFieldAndPropagation:
         #3) — see TestParseClaudeOutputDistinctTimeoutSubtype for the
         dedicated coverage of this branch.
         """
-        sub = _SubprocessResult(
+        sub = SubprocessResult(
             stdout='', stderr='', returncode=1,
             duration_ms=100, timed_out=True, transcript_turns=7,
         )
-        agent = _parse_claude_output(sub)
+        agent = parse_claude_output(sub)
         assert agent.subtype == 'error_timeout_killed_with_progress'
         assert agent.transcript_turns == 7
 
     def test_propagation_json_decode_error_path(self):
         """JSON decode error path: transcript_turns=4 → AgentResult.transcript_turns==4."""
-        sub = _SubprocessResult(
+        sub = SubprocessResult(
             stdout='not json at all', stderr='', returncode=1,
             duration_ms=100, timed_out=True, transcript_turns=4,
         )
-        agent = _parse_claude_output(sub)
+        agent = parse_claude_output(sub)
         assert agent.subtype == 'text_output'
         assert agent.transcript_turns == 4
 
     def test_propagation_valid_json_path(self):
         """Valid JSON parsed path: transcript_turns=2 → AgentResult.transcript_turns==2."""
-        sub = _SubprocessResult(
+        sub = SubprocessResult(
             stdout=_CLAUDE_VALID_JSON_STDOUT, stderr='', returncode=0,
             duration_ms=100, transcript_turns=2,
         )
-        agent = _parse_claude_output(sub)
+        agent = parse_claude_output(sub)
         assert agent.transcript_turns == 2
 
     def test_propagation_default_none(self):
         """Default (transcript_turns not set) → AgentResult.transcript_turns is None."""
-        sub = _SubprocessResult(
+        sub = SubprocessResult(
             stdout='', stderr='', returncode=1, duration_ms=100,
         )
-        agent = _parse_claude_output(sub)
+        agent = parse_claude_output(sub)
         assert agent.transcript_turns is None
 
 
@@ -1986,9 +2231,9 @@ class TestParseClaudeOutputSchemaSalvage:
             'structured_output': {'action': 'drop', 'justification': 'dup'},
             'result': 'boom',
         })
-        sub = _SubprocessResult(stdout=stdout, stderr='', returncode=1,
+        sub = SubprocessResult(stdout=stdout, stderr='', returncode=1,
                                 duration_ms=500, timed_out=False)
-        agent = _parse_claude_output(sub)
+        agent = parse_claude_output(sub)
         assert agent.success is True
         assert agent.schema_salvaged is True
         assert agent.structured_output == {
@@ -2006,17 +2251,17 @@ class TestParseClaudeOutputSchemaSalvage:
             'num_turns': 1,
             'result': 'just an error',
         })
-        sub = _SubprocessResult(stdout=stdout, stderr='', returncode=1,
+        sub = SubprocessResult(stdout=stdout, stderr='', returncode=1,
                                 duration_ms=100, timed_out=False)
-        agent = _parse_claude_output(sub)
+        agent = parse_claude_output(sub)
         assert agent.success is False
         assert agent.schema_salvaged is False
 
     def test_clean_success_sets_schema_salvaged_false(self):
         stdout = _CLAUDE_VALID_JSON_STDOUT
-        sub = _SubprocessResult(stdout=stdout, stderr='', returncode=0,
+        sub = SubprocessResult(stdout=stdout, stderr='', returncode=0,
                                 duration_ms=100, timed_out=False)
-        agent = _parse_claude_output(sub)
+        agent = parse_claude_output(sub)
         assert agent.success is True
         assert agent.schema_salvaged is False
 
@@ -2031,9 +2276,9 @@ class TestParseClaudeOutputSchemaSalvage:
             'structured_output': 'not-a-dict',
             'result': 'err',
         })
-        sub = _SubprocessResult(stdout=stdout, stderr='', returncode=1,
+        sub = SubprocessResult(stdout=stdout, stderr='', returncode=1,
                                 duration_ms=100, timed_out=False)
-        agent = _parse_claude_output(sub)
+        agent = parse_claude_output(sub)
         assert agent.success is False
         assert agent.schema_salvaged is False
 
@@ -2056,7 +2301,7 @@ class TestAgentResultApiErrorStatusField:
 
 
 class TestParseClaudeOutputApiErrorStatus:
-    """_parse_claude_output populates api_error_status when present in CLI JSON."""
+    """parse_claude_output populates api_error_status when present in CLI JSON."""
 
     def test_populated_when_present(self):
         """api_error_status passes through from CLI JSON."""
@@ -2069,31 +2314,31 @@ class TestParseClaudeOutputApiErrorStatus:
             'api_error_status': 403,
             'result': 'Your organization does not have access to Claude',
         })
-        sub = _SubprocessResult(stdout=stdout, stderr='', returncode=1,
+        sub = SubprocessResult(stdout=stdout, stderr='', returncode=1,
                                 duration_ms=100, timed_out=False)
-        agent = _parse_claude_output(sub)
+        agent = parse_claude_output(sub)
         assert agent.api_error_status == 403
         assert agent.success is False
 
     def test_none_when_absent(self):
         """api_error_status is None when CLI JSON omits the field."""
-        sub = _SubprocessResult(stdout=_CLAUDE_VALID_JSON_STDOUT, stderr='',
+        sub = SubprocessResult(stdout=_CLAUDE_VALID_JSON_STDOUT, stderr='',
                                 returncode=0, duration_ms=100, timed_out=False)
-        agent = _parse_claude_output(sub)
+        agent = parse_claude_output(sub)
         assert agent.api_error_status is None
 
     def test_none_on_empty_output(self):
         """api_error_status is None for the empty-output early return."""
-        sub = _SubprocessResult(stdout='', stderr='', returncode=1,
+        sub = SubprocessResult(stdout='', stderr='', returncode=1,
                                 duration_ms=10, timed_out=False)
-        agent = _parse_claude_output(sub)
+        agent = parse_claude_output(sub)
         assert agent.api_error_status is None
 
     def test_none_on_json_decode_error(self):
         """api_error_status is None for the text-output fallback path."""
-        sub = _SubprocessResult(stdout='not json', stderr='', returncode=0,
+        sub = SubprocessResult(stdout='not json', stderr='', returncode=0,
                                 duration_ms=10, timed_out=False)
-        agent = _parse_claude_output(sub)
+        agent = parse_claude_output(sub)
         assert agent.api_error_status is None
 
 
@@ -2106,80 +2351,78 @@ class TestClaudeCallerPropagatesTimedOut:
 
     async def test_claude_caller_propagates_timed_out(self, tmp_path):
         """invoke_claude_agent returns AgentResult with timed_out=True when subprocess timed out."""
-        timed_result = _SubprocessResult(stdout='', stderr='timeout', returncode=1,
+        timed_result = SubprocessResult(stdout='', stderr='timeout', returncode=1,
                                          duration_ms=100, timed_out=True)
-        with patch('shared.cli_invoke._run_subprocess',
-                   new_callable=AsyncMock, return_value=timed_result):
-            agent = await invoke_claude_agent(
-                prompt='hello', system_prompt='sys', cwd=tmp_path,
-                model='claude-sonnet-4-5', timeout_seconds=30.0,
-            )
+        agent = await invoke_claude_agent(
+            prompt='hello', system_prompt='sys', cwd=tmp_path,
+            model='claude-sonnet-4-5', timeout_seconds=30.0,
+            runner=AsyncMock(return_value=timed_result),
+        )
         assert agent.timed_out is True
 
 
 class TestInvokeClaudeAgentForwardsStartupGraceSecs:
-    """invoke_claude_agent must forward startup_grace_secs down to _run_subprocess."""
+    """invoke_claude_agent must forward startup_grace_secs down to run_cli_subprocess."""
 
     async def test_invoke_claude_agent_forwards_startup_grace_secs(self, tmp_path):
-        """startup_grace_secs passed to invoke_claude_agent reaches _run_subprocess.
+        """startup_grace_secs passed to invoke_claude_agent reaches run_cli_subprocess.
 
         Fails today: invoke_claude_agent has no startup_grace_secs param → TypeError.
-        After step-10 it is forwarded via _invoke_claude to _run_subprocess.
+        After step-10 it is forwarded via _invoke_claude to run_cli_subprocess.
         """
         captured: dict = {}
-        minimal_result = _SubprocessResult(
+        minimal_result = SubprocessResult(
             stdout='', stderr='', returncode=0, duration_ms=0,
         )
 
-        async def capturing_run_subprocess(*args, **kwargs):
+        async def capturing_run_subprocess(cmd, cwd, env, **kwargs):
             captured.update(kwargs)
-            # positional args: cmd, cwd, env, model, timeout_seconds
             return minimal_result
 
-        with patch('shared.cli_invoke._run_subprocess', side_effect=capturing_run_subprocess):
-            await invoke_claude_agent(
-                prompt='x', system_prompt='s', cwd=tmp_path,
-                startup_grace_secs=33.0,
-            )
+        await invoke_claude_agent(
+            prompt='x', system_prompt='s', cwd=tmp_path,
+            startup_grace_secs=33.0,
+            runner=capturing_run_subprocess,
+        )
 
-        assert captured.get('startup_grace_secs') == 33.0, (
-            f'startup_grace_secs not forwarded to _run_subprocess; captured={captured!r}'
+        assert captured['transcript'].startup_grace_secs == 33.0, (
+            f'startup_grace_secs not forwarded to run_cli_subprocess; captured={captured!r}'
         )
 
 
 class TestInvokeClaudeAgentForwardsProgressExtensionParams:
-    """invoke_claude_agent must forward working_idle_secs/absolute_cap_secs to _run_subprocess.
+    """invoke_claude_agent must forward working_idle_secs/absolute_cap_secs to run_cli_subprocess.
 
     Task 2360 step-3 RED: fails until invoke_claude_agent (and _invoke_claude)
-    grow these params and thread them through to _run_subprocess (step-4 GREEN).
+    grow these params and thread them through to run_cli_subprocess (step-4 GREEN).
     """
 
     async def test_invoke_claude_agent_forwards_working_idle_secs_and_absolute_cap_secs(self, tmp_path):
-        """working_idle_secs/absolute_cap_secs passed to invoke_claude_agent reach _run_subprocess.
+        """working_idle_secs/absolute_cap_secs passed to invoke_claude_agent reach run_cli_subprocess.
 
         Fails today: invoke_claude_agent has no such params → TypeError.
         """
         captured: dict = {}
-        minimal_result = _SubprocessResult(
+        minimal_result = SubprocessResult(
             stdout='', stderr='', returncode=0, duration_ms=0,
         )
 
-        async def capturing_run_subprocess(*args, **kwargs):
+        async def capturing_run_subprocess(cmd, cwd, env, **kwargs):
             captured.update(kwargs)
             return minimal_result
 
-        with patch('shared.cli_invoke._run_subprocess', side_effect=capturing_run_subprocess):
-            await invoke_claude_agent(
-                prompt='x', system_prompt='s', cwd=tmp_path,
-                working_idle_secs=1800.0,
-                absolute_cap_secs=7200.0,
-            )
-
-        assert captured.get('working_idle_secs') == 1800.0, (
-            f'working_idle_secs not forwarded to _run_subprocess; captured={captured!r}'
+        await invoke_claude_agent(
+            prompt='x', system_prompt='s', cwd=tmp_path,
+            working_idle_secs=1800.0,
+            absolute_cap_secs=7200.0,
+            runner=capturing_run_subprocess,
         )
-        assert captured.get('absolute_cap_secs') == 7200.0, (
-            f'absolute_cap_secs not forwarded to _run_subprocess; captured={captured!r}'
+
+        assert captured['transcript'].working_idle_secs == 1800.0, (
+            f'working_idle_secs not forwarded to run_cli_subprocess; captured={captured!r}'
+        )
+        assert captured['transcript'].absolute_cap_secs == 7200.0, (
+            f'absolute_cap_secs not forwarded to run_cli_subprocess; captured={captured!r}'
         )
 
 
@@ -2327,40 +2570,36 @@ class TestHeuristicCapGating:
         mock_asyncio.sleep.assert_not_called()
         assert got.success is False
 
-    async def test_heuristic_cap_false_falls_through_to_resume_fallback(self):
-        """cap_marked=False + resume_session_id → resume-fallback retries fresh, no sleep.
+    async def test_unattributed_heuristic_cap_on_a_resume_is_returned(self):
+        """cap_marked=False + resume_session_id → the attempt is returned, no retry, no sleep.
 
-        This exercises the secondary path: heuristic fires but _handle_cap_detected
-        returns False (token unresolvable), so the code falls through to the
-        resume-session fallback (line ~372) which pops resume_session_id and
-        retries from scratch — exactly one fresh retry, zero sleeps.
+        The heuristic fires but _handle_cap_detected returns False (token
+        unresolvable), so the attempt is treated as a normal failure.  It took
+        a turn and carries no rejection marker, so it is not a resume rejection
+        (task 5579): it is the terminal attempt, exactly as for a fresh call.
         """
         gate = _make_gate(before_invoke_tokens=['token-a', 'token-b'])
 
-        # First call: heuristic-triggering failure with a prior resume_session_id
         heuristic_result = _make_result(success=False, cost_usd=0, turns=1, duration_ms=100)
-        ok_result = _make_result(success=True, cost_usd=0.5)
 
         with (
             patch(
                 'shared.cli_invoke.invoke_claude_agent',
                 new_callable=AsyncMock,
-                side_effect=[heuristic_result, ok_result],
+                return_value=heuristic_result,
             ) as mock_invoke,
             patch('shared.cli_invoke.asyncio') as mock_asyncio,
         ):
             mock_asyncio.sleep = AsyncMock()
-            # Simulate a prior pattern-match cap hit that left resume_session_id set
             got = await invoke_with_cap_retry(
                 gate, 'test-label',
                 prompt='hi', resume_session_id='sess-123',
             )
 
-        assert got.success is True
-        # Two calls: first (heuristic+resume-fallback triggers retry), second succeeds
-        assert mock_invoke.call_count == 2
-        # No cap-hit cooldown sleep — resume-fallback retries immediately
+        mock_invoke.assert_called_once()
         mock_asyncio.sleep.assert_not_called()
+        assert got.success is False
+        assert got.resume_fallbacks == 0
 
     async def test_heuristic_cap_exponential_backoff_on_consecutive_hits(self):
         """Two consecutive heuristic-True hits produce exponentially increasing cooldowns.
@@ -2445,6 +2684,44 @@ class TestInvokeWithCapRetryOutcomeRouting:
             'classify_invocation so CliLocalError precedence applies'
         )
 
+    async def test_unresolvable_resume_session_not_treated_as_cap(self):
+        """An unresolvable ``--resume`` must not mark a HEALTHY account CAPPED.
+
+        Exactly the reify-3604 shape, third instance (after the ``ServerError``
+        escape of 2026-07-29): a zero-cost, <=1-turn, sub-5s failure the CLI
+        produced entirely LOCALLY — it resolves the session id against the
+        on-disk transcript store and exits before contacting the API, so a usage
+        cap can never be the cause.  Without a positive non-cap attribution the
+        heuristic net takes its ``else`` branch and reports a SYNTHETIC cap hit,
+        churning the account pool through compounding cooldowns for an error the
+        API never saw.
+
+        A genuine rejection exits in about 1s, inside the net's 5000 ms window
+        (re-measured on CLI 2.1.314, task 5579).  The stderr string and its
+        placement were first measured against Claude Code CLI 2.1.236 on
+        2026-08-19.
+        """
+        gate = make_gate_mock(detect_cap_hit=MagicMock(return_value=False))
+        gate._handle_cap_detected = MagicMock(return_value=True)
+        result = _make_result(
+            success=False, cost_usd=0, turns=1, duration_ms=400,
+            stderr=(
+                'No conversation found with session ID: '
+                '4aed993b-20c0-4b91-a8dd-60180e7db2e0'
+            ),
+        )
+        with (
+            patch('shared.cli_invoke.invoke_claude_agent', new_callable=AsyncMock,
+                  return_value=result) as mock_invoke,
+            patch('shared.cli_invoke.asyncio.sleep', new_callable=AsyncMock) as mock_sleep,
+        ):
+            got = await invoke_with_cap_retry(gate, 'lbl', prompt='hi')
+
+        mock_invoke.assert_awaited_once()
+        gate._handle_cap_detected.assert_not_called()
+        mock_sleep.assert_not_awaited()
+        assert got is result
+
     async def test_auth_failure_401_403_routes_via_outcome(self):
         """A 401/403 result routes to _handle_auth_failure + failover,
         without sleeping (i.e. not counted as a cap hit).
@@ -2511,17 +2788,17 @@ class TestInvokeWithCapRetryOutcomeRouting:
         )
 
 
-# ── _run_subprocess process-group fix ────────────────────────────────────────
+# ── run_cli_subprocess process-group fix ────────────────────────────────────────
 
 
 @pytest.mark.asyncio
 class TestRunSubprocessProcessGroup:
-    """_run_subprocess must spawn subprocesses in their own process group."""
+    """run_cli_subprocess must spawn subprocesses in their own process group."""
 
     async def test_run_subprocess_passes_start_new_session_true(self, tmp_path):
         """create_subprocess_exec is called with start_new_session=True.
 
-        Failing test — _run_subprocess does not pass that kwarg yet.
+        Failing test — run_cli_subprocess does not pass that kwarg yet.
         """
         captured_kwargs: dict = {}
 
@@ -2536,7 +2813,11 @@ class TestRunSubprocessProcessGroup:
             return proc
 
         with patch('shared.cli_invoke.asyncio.create_subprocess_exec', side_effect=fake_exec):
-            await _run_subprocess(['echo', 'hi'], tmp_path, env={}, model='test')
+            await run_cli_subprocess(
+                ['echo', 'hi'], tmp_path, env={},
+                backend='claude', model='test',
+                transcript=TranscriptWatch(),
+            )
 
         assert captured_kwargs.get('start_new_session') is True
 
@@ -2740,6 +3021,71 @@ class TestClassifyAgentFailureOutcomeProjection:
         assert cls.kind is AgentFailureKind.TIMED_OUT
 
 
+class TestBudgetExhaustedSubtype:
+    """The CLI wire value every package compares a budget abort against."""
+
+    def test_is_the_claude_cli_wire_value(self):
+        assert BUDGET_EXHAUSTED_SUBTYPE == 'error_max_budget_usd'
+
+
+class TestClassifyAgentFailureBudget:
+    """A run ended by the CLI's own ``--max-budget-usd`` ceiling classifies
+    BUDGET, ranked like MAX_TURNS: below the wall-clock rule, above every
+    status heuristic, because a budget abort proves the API accepted the
+    request and billed real tokens."""
+
+    def test_kind_value_is_the_census_token(self):
+        assert AgentFailureKind.BUDGET == 'budget'
+
+    def test_budget_abort_classifies_budget(self):
+        result = AgentResult(
+            success=False, output='', subtype=BUDGET_EXHAUSTED_SUBTYPE,
+            turns=40, cost_usd=5.01,
+        )
+        cls = classify_agent_failure(result)
+        assert cls.kind is AgentFailureKind.BUDGET
+        assert '5.01' in cls.summary
+        assert '40' in cls.summary
+        assert not cls.summary.startswith('agent API error: HTTP')
+        assert 'no specific failure signal' not in cls.summary
+
+    def test_success_still_short_circuits(self):
+        result = AgentResult(
+            success=True, output='done', subtype=BUDGET_EXHAUSTED_SUBTYPE,
+            turns=40, cost_usd=5.01,
+        )
+        assert classify_agent_failure(result).kind is AgentFailureKind.SUCCESS
+
+    def test_timed_out_outranks_budget(self):
+        result = AgentResult(
+            success=False, output='', subtype=BUDGET_EXHAUSTED_SUBTYPE,
+            timed_out=True, duration_ms=600_000, transcript_turns=0,
+        )
+        assert classify_agent_failure(result).kind is AgentFailureKind.TIMED_OUT
+
+    def test_budget_outranks_404_model_not_found(self):
+        result = AgentResult(
+            success=False, output='', subtype=BUDGET_EXHAUSTED_SUBTYPE,
+            cost_usd=1.0, api_error_status=404,
+        )
+        assert classify_agent_failure(result).kind is AgentFailureKind.BUDGET
+
+    @pytest.mark.parametrize('status', [401, 429])
+    def test_budget_outranks_non_5xx_api_error_status(self, status):
+        result = AgentResult(
+            success=False, output='', subtype=BUDGET_EXHAUSTED_SUBTYPE,
+            cost_usd=1.0, api_error_status=status,
+        )
+        assert classify_agent_failure(result).kind is AgentFailureKind.BUDGET
+
+    def test_agrees_with_classify_cap_kill(self):
+        result = AgentResult(
+            success=False, output='', subtype=BUDGET_EXHAUSTED_SUBTYPE, cost_usd=1.0,
+        )
+        assert classify_cap_kill(result, budget_usd=None, max_turns=None) is CapReason.BUDGET
+        assert classify_agent_failure(result).kind is AgentFailureKind.BUDGET
+
+
 class TestBuildFailureMessage:
     """Tests for the build_failure_message formatting helper."""
 
@@ -2793,7 +3139,7 @@ class TestCapWaitPeriodicLog:
         gate = self._exact_hit_gate(hits=1)
 
         with (
-            patch(_PERIODIC_INVOKE_PATCH, new_callable=AsyncMock, return_value=_make_result()),
+            patch(_PERIODIC_INVOKE_PATCH, new_callable=AsyncMock, side_effect=[_make_cap_result()] + [_make_result()]),
             patch(_PERIODIC_SLEEP_PATCH, new_callable=AsyncMock),
             patch('shared.cli_invoke.time.monotonic', return_value=0.0),
             caplog.at_level(logging.WARNING, logger='shared.cli_invoke'),
@@ -2815,7 +3161,7 @@ class TestCapWaitPeriodicLog:
         label = 'task-99-architect'
 
         with (
-            patch(_PERIODIC_INVOKE_PATCH, new_callable=AsyncMock, return_value=_make_result()),
+            patch(_PERIODIC_INVOKE_PATCH, new_callable=AsyncMock, side_effect=[_make_cap_result()] + [_make_result()]),
             patch(_PERIODIC_SLEEP_PATCH, new_callable=AsyncMock),
             patch('shared.cli_invoke.time.monotonic', return_value=0.0),
             caplog.at_level(logging.WARNING, logger='shared.cli_invoke'),
@@ -2832,7 +3178,7 @@ class TestCapWaitPeriodicLog:
         gate = self._exact_hit_gate(hits=1, soonest_resets_at=reset_dt)
 
         with (
-            patch(_PERIODIC_INVOKE_PATCH, new_callable=AsyncMock, return_value=_make_result()),
+            patch(_PERIODIC_INVOKE_PATCH, new_callable=AsyncMock, side_effect=[_make_cap_result()] + [_make_result()]),
             patch(_PERIODIC_SLEEP_PATCH, new_callable=AsyncMock),
             patch('shared.cli_invoke.time.monotonic', return_value=0.0),
             caplog.at_level(logging.WARNING, logger='shared.cli_invoke'),
@@ -2848,7 +3194,7 @@ class TestCapWaitPeriodicLog:
         gate = self._exact_hit_gate(hits=1, soonest_resets_at=None)
 
         with (
-            patch(_PERIODIC_INVOKE_PATCH, new_callable=AsyncMock, return_value=_make_result()),
+            patch(_PERIODIC_INVOKE_PATCH, new_callable=AsyncMock, side_effect=[_make_cap_result()] + [_make_result()]),
             patch(_PERIODIC_SLEEP_PATCH, new_callable=AsyncMock),
             patch('shared.cli_invoke.time.monotonic', return_value=0.0),
             caplog.at_level(logging.WARNING, logger='shared.cli_invoke'),
@@ -2864,7 +3210,7 @@ class TestCapWaitPeriodicLog:
         gate = self._exact_hit_gate(hits=3)
 
         with (
-            patch(_PERIODIC_INVOKE_PATCH, new_callable=AsyncMock, return_value=_make_result()),
+            patch(_PERIODIC_INVOKE_PATCH, new_callable=AsyncMock, side_effect=[_make_cap_result()] * 3 + [_make_result()]),
             patch(_PERIODIC_SLEEP_PATCH, new_callable=AsyncMock),
             # All monotonic calls return 0.0 — time never advances, throttle stays active
             patch('shared.cli_invoke.time.monotonic', return_value=0.0),
@@ -2892,7 +3238,7 @@ class TestCapWaitPeriodicLog:
         )
 
         with (
-            patch(_PERIODIC_INVOKE_PATCH, new_callable=AsyncMock, return_value=_make_result()),
+            patch(_PERIODIC_INVOKE_PATCH, new_callable=AsyncMock, side_effect=[_make_cap_result()] * 3 + [_make_result()]),
             patch(_PERIODIC_SLEEP_PATCH, new_callable=AsyncMock),
             patch('shared.cli_invoke.time.monotonic', side_effect=monotonic_vals),
             caplog.at_level(logging.WARNING, logger='shared.cli_invoke'),
@@ -2910,10 +3256,10 @@ class TestCapWaitPeriodicLog:
 #
 # CLI 2.1.168 delivers --json-schema structured output through a synthetic tool
 # named ``StructuredOutput``.  A ``disallowed_tools=['*']`` wildcard (used by the
-# pure-classifier curator/recon callers) now also denies that tool, so every
-# structured answer is permission-denied → error_max_structured_output_retries.
-# ``_invoke_claude`` must expand the ``'*'`` (only when an ``output_schema`` is
-# set) into an explicit deny-list of real built-ins that OMITS StructuredOutput.
+# pure-classifier curator/recon callers) would also deny that tool, so every
+# structured answer would be permission-denied → error_max_structured_output_retries.
+# When an ``output_schema`` is set, the ``'*'`` is replaced by ``--tools ''``,
+# the registry filter that leaves only StructuredOutput.
 
 
 def _capture_cmd_exec(captured_cmd):
@@ -2950,8 +3296,8 @@ def _disallowed_segment(cmd):
 
 @pytest.mark.asyncio
 class TestSchemaToolNotDisallowed:
-    """The ``'*'`` deny wildcard must be expanded (excluding StructuredOutput)
-    only when an output schema is requested; otherwise it is preserved verbatim.
+    """With an output schema, the ``'*'`` deny wildcard becomes ``--tools ''``;
+    without one, it is preserved verbatim.
     """
 
     _SCHEMA = {
@@ -2961,7 +3307,7 @@ class TestSchemaToolNotDisallowed:
         'additionalProperties': False,
     }
 
-    async def test_wildcard_with_schema_expands_excluding_structuredoutput(self, tmp_path):
+    async def test_wildcard_with_schema_emits_empty_tools_registry(self, tmp_path):
         captured_cmd = []
         with patch('shared.cli_invoke.asyncio.create_subprocess_exec',
                    side_effect=_capture_cmd_exec(captured_cmd)):
@@ -2969,16 +3315,32 @@ class TestSchemaToolNotDisallowed:
                 prompt='hi', system_prompt='sys', cwd=tmp_path,
                 disallowed_tools=['*'], output_schema=self._SCHEMA,
             )
-        seg = _disallowed_segment(captured_cmd)
-        # Real built-ins are denied explicitly...
-        assert 'Bash' in seg
-        assert 'Glob' in seg
-        # ...but the wildcard and the schema tool are NOT in the deny-list,
-        # and StructuredOutput must not appear anywhere on the command line.
-        assert '*' not in seg
+        assert captured_cmd[captured_cmd.index('--tools') + 1] == ''
+        assert '--disallowed-tools' not in captured_cmd
+        assert '*' not in captured_cmd
         assert 'StructuredOutput' not in captured_cmd
-        # --json-schema is still rendered.
         assert '--json-schema' in captured_cmd
+
+    async def test_available_tools_is_forwarded_as_the_registry_filter(self, tmp_path):
+        captured_cmd = []
+        with patch('shared.cli_invoke.asyncio.create_subprocess_exec',
+                   side_effect=_capture_cmd_exec(captured_cmd)):
+            await invoke_claude_agent(
+                prompt='hi', system_prompt='sys', cwd=tmp_path,
+                available_tools=['Read', 'Grep', 'Glob'], output_schema=self._SCHEMA,
+            )
+        assert captured_cmd[captured_cmd.index('--tools') + 1] == 'Read,Grep,Glob'
+        assert '--json-schema' in captured_cmd
+
+    async def test_setting_sources_is_forwarded(self, tmp_path):
+        captured_cmd = []
+        with patch('shared.cli_invoke.asyncio.create_subprocess_exec',
+                   side_effect=_capture_cmd_exec(captured_cmd)):
+            await invoke_claude_agent(
+                prompt='hi', system_prompt='sys', cwd=tmp_path,
+                available_tools=['Read'], output_schema=self._SCHEMA, setting_sources=[],
+            )
+        assert captured_cmd[captured_cmd.index('--setting-sources') + 1] == ''
 
     async def test_wildcard_without_schema_is_preserved(self, tmp_path):
         """judge.py case: ['*'] with no output_schema must keep blocking all tools."""
@@ -3030,7 +3392,7 @@ class TestSchemaToolDenied:
             {'tool_name': 'StructuredOutput',
              'tool_input': {'action': 'drop', 'justification': 'x'}},
         ])
-        parsed = _parse_claude_output(result)
+        parsed = parse_claude_output(result)
         assert parsed.success is False  # explicitly NOT salvaged to success
         assert parsed.schema_tool_denied is True
 
@@ -3038,19 +3400,19 @@ class TestSchemaToolDenied:
         result = self._denied_result([
             {'tool_name': 'Bash', 'tool_input': {'command': 'ls'}},
         ])
-        parsed = _parse_claude_output(result)
+        parsed = parse_claude_output(result)
         assert parsed.success is False
         assert parsed.schema_tool_denied is False
 
 
-# ── _run_subprocess proc_tree capture on timeout ──────────────────────────────
+# ── run_cli_subprocess proc_tree capture on timeout ──────────────────────────────
 
 
 @pytest.mark.asyncio
 class TestRunSubprocessProcTree:
-    """_run_subprocess captures a process-group snapshot in proc_tree on timeout.
+    """run_cli_subprocess captures a process-group snapshot in proc_tree on timeout.
 
-    Fails RED because _SubprocessResult has no proc_tree field and
+    Fails RED because SubprocessResult has no proc_tree field and
     snapshot_process_group is not yet called in the timeout handler.
     """
 
@@ -3058,21 +3420,19 @@ class TestRunSubprocessProcTree:
     async def test_proc_tree_populated_on_real_timeout(self, tmp_path):
         """A real hanging child's process group is snapshotted in proc_tree on timeout.
 
-        Drives _run_subprocess with 'sleep 30' and a short timeout_seconds.
+        Drives run_cli_subprocess with 'sleep 30' and a short timeout_seconds.
         Asserts result.timed_out=True AND result.proc_tree is non-empty and
         references the sleep child (by comm name 'sleep' appearing in the snapshot).
         """
-        result = await _run_subprocess(
-            ['sleep', '30'],
-            cwd=tmp_path,
-            env=dict(os.environ),
-            model='opus',
-            timeout_seconds=0.3,
+        result = await run_cli_subprocess(
+            ['sleep', '30'], cwd=tmp_path, env=dict(os.environ),
+            backend='claude', model='opus', timeout_seconds=0.3,
+            transcript=TranscriptWatch(),
         )
         assert result.timed_out is True
         # proc_tree must exist as a field and be non-empty
         assert result.proc_tree, (
-            f'Expected non-empty proc_tree in _SubprocessResult, got: {result.proc_tree!r}'
+            f'Expected non-empty proc_tree in SubprocessResult, got: {result.proc_tree!r}'
         )
         # The snapshot should reference the sleep child
         assert 'sleep' in result.proc_tree, (
@@ -3080,13 +3440,13 @@ class TestRunSubprocessProcTree:
         )
 
 
-# ── _parse_claude_output proc_tree propagation ────────────────────────────────
+# ── parse_claude_output proc_tree propagation ────────────────────────────────
 
 
 class TestParseClaudeOutputProcTree:
-    """_parse_claude_output propagates proc_tree from _SubprocessResult onto AgentResult.
+    """parse_claude_output propagates proc_tree from SubprocessResult onto AgentResult.
 
-    Fails RED because neither _SubprocessResult nor AgentResult has a proc_tree
+    Fails RED because neither SubprocessResult nor AgentResult has a proc_tree
     field yet.
     """
 
@@ -3096,22 +3456,22 @@ class TestParseClaudeOutputProcTree:
         (_CLAUDE_VALID_JSON_STDOUT, 0),
     ], ids=['empty_stdout', 'json_decode_error', 'normal_parse'])
     def test_proc_tree_propagated_on_all_parse_paths(self, stdout, returncode):
-        """proc_tree is copied to AgentResult on every _parse_claude_output return path."""
+        """proc_tree is copied to AgentResult on every parse_claude_output return path."""
         tree = 'snapshot_process_group(55555): 1 process(es) in group:\n  pid=55555 ppid=1 state=S wchan=hrtimer_nanosleep comm=sleep\n'
-        sub = _SubprocessResult(
+        sub = SubprocessResult(
             stdout=stdout, stderr='', returncode=returncode,
             duration_ms=100, timed_out=True, proc_tree=tree,
         )
-        agent = _parse_claude_output(sub)
+        agent = parse_claude_output(sub)
         assert agent.proc_tree == tree, (
             f'Expected proc_tree to be propagated, got: {agent.proc_tree!r}'
         )
 
     def test_proc_tree_defaults_empty_when_not_set(self):
-        """proc_tree is empty string by default (no proc_tree on _SubprocessResult)."""
-        sub = _SubprocessResult(stdout='', stderr='', returncode=1,
+        """proc_tree is empty string by default (no proc_tree on SubprocessResult)."""
+        sub = SubprocessResult(stdout='', stderr='', returncode=1,
                                 duration_ms=10, timed_out=False)
-        agent = _parse_claude_output(sub)
+        agent = parse_claude_output(sub)
         assert agent.proc_tree == ''
 
 
@@ -3352,10 +3712,10 @@ class TestCpuPriorityPrefix:
 
 @pytest.mark.asyncio
 class TestRunSubprocessCpuPriorityPrefix:
-    """Integration: _run_subprocess prepends nice prefix when DF_AGENT_CPU_NICE is set."""
+    """Integration: run_cli_subprocess prepends nice prefix when DF_AGENT_CPU_NICE is set."""
 
     async def test_nice_prefix_prepended_to_argv(self, tmp_path):
-        """_run_subprocess spawns ['nice', '-n', '10', 'claude', '--x'] when DF_AGENT_CPU_NICE='10'."""
+        """run_cli_subprocess spawns ['nice', '-n', '10', 'claude', '--x'] when DF_AGENT_CPU_NICE='10'."""
         captured_args = []
         captured_kwargs: dict = {}
 
@@ -3371,8 +3731,10 @@ class TestRunSubprocessCpuPriorityPrefix:
             return proc
 
         with patch('shared.cli_invoke.asyncio.create_subprocess_exec', side_effect=fake_exec):
-            await _run_subprocess(
-                ['claude', '--x'], tmp_path, env={'DF_AGENT_CPU_NICE': '10'}, model='test',
+            await run_cli_subprocess(
+                ['claude', '--x'], tmp_path, env={'DF_AGENT_CPU_NICE': '10'},
+                backend='claude', model='test',
+                transcript=TranscriptWatch(),
             )
 
         assert captured_args[:3] == ['nice', '-n', '10'], f'Expected nice prefix; got {captured_args[:3]}'
@@ -3384,7 +3746,7 @@ class TestRunSubprocessCpuPriorityPrefix:
         )
 
     async def test_no_prefix_without_df_agent_cpu_nice(self, tmp_path):
-        """_run_subprocess spawns ['claude', '--x'] exactly when env has no DF_AGENT_CPU_NICE."""
+        """run_cli_subprocess spawns ['claude', '--x'] exactly when env has no DF_AGENT_CPU_NICE."""
         captured_args = []
 
         async def fake_exec(*args, **kwargs):
@@ -3398,8 +3760,10 @@ class TestRunSubprocessCpuPriorityPrefix:
             return proc
 
         with patch('shared.cli_invoke.asyncio.create_subprocess_exec', side_effect=fake_exec):
-            await _run_subprocess(
-                ['claude', '--x'], tmp_path, env={}, model='test',
+            await run_cli_subprocess(
+                ['claude', '--x'], tmp_path, env={},
+                backend='claude', model='test',
+                transcript=TranscriptWatch(),
             )
 
         assert captured_args == ['claude', '--x'], f'Expected bare argv; got {captured_args}'
@@ -3407,10 +3771,10 @@ class TestRunSubprocessCpuPriorityPrefix:
 
 @pytest.mark.asyncio
 class TestRunSubprocessCpuGovernPrefix:
-    """Integration: _run_subprocess prepends govern prefix when DF_AGENT_CPU_GOVERN is set."""
+    """Integration: run_cli_subprocess prepends govern prefix when DF_AGENT_CPU_GOVERN is set."""
 
     async def test_govern_prefix_prepended_to_argv(self, tmp_path):
-        """_run_subprocess spawns [<exec>, '--role', 'task', '--', 'claude', '--x'] with govern env."""
+        """run_cli_subprocess spawns [<exec>, '--role', 'task', '--', 'claude', '--x'] with govern env."""
         exec_file = tmp_path / 'cpu-governed-exec.sh'
         exec_file.write_text('#!/bin/sh\nexec "$@"\n')
         exec_file.chmod(0o755)
@@ -3430,11 +3794,10 @@ class TestRunSubprocessCpuGovernPrefix:
             return proc
 
         with patch('shared.cli_invoke.asyncio.create_subprocess_exec', side_effect=fake_exec):
-            await _run_subprocess(
-                ['claude', '--x'],
-                tmp_path,
-                env={'DF_AGENT_CPU_GOVERN': str(exec_file)},
-                model='test',
+            await run_cli_subprocess(
+                ['claude', '--x'], tmp_path, env={'DF_AGENT_CPU_GOVERN': str(exec_file)},
+                backend='claude', model='test',
+                transcript=TranscriptWatch(),
             )
 
         assert captured_args[:4] == [str(exec_file), '--role', 'task', '--'], (
@@ -3466,11 +3829,10 @@ class TestRunSubprocessCpuGovernPrefix:
             return proc
 
         with patch('shared.cli_invoke.asyncio.create_subprocess_exec', side_effect=fake_exec):
-            await _run_subprocess(
-                ['claude', '--x'],
-                tmp_path,
-                env={'DF_AGENT_CPU_GOVERN': str(exec_file), 'DF_AGENT_CPU_NICE': '10'},
-                model='test',
+            await run_cli_subprocess(
+                ['claude', '--x'], tmp_path, env={'DF_AGENT_CPU_GOVERN': str(exec_file), 'DF_AGENT_CPU_NICE': '10'},
+                backend='claude', model='test',
+                transcript=TranscriptWatch(),
             )
 
         expected_prefix = [str(exec_file), '--role', 'task', '--', 'nice', '-n', '10']
@@ -3484,7 +3846,7 @@ class TestRunSubprocessCpuGovernPrefix:
         assert 'DF_AGENT_CPU_NICE' not in child_env
 
     async def test_no_prefix_without_govern_or_nice(self, tmp_path):
-        """_run_subprocess spawns ['claude', '--x'] exactly when no DF_* keys set (regression guard)."""
+        """run_cli_subprocess spawns ['claude', '--x'] exactly when no DF_* keys set (regression guard)."""
         captured_args = []
 
         async def fake_exec(*args, **kwargs):
@@ -3498,8 +3860,10 @@ class TestRunSubprocessCpuGovernPrefix:
             return proc
 
         with patch('shared.cli_invoke.asyncio.create_subprocess_exec', side_effect=fake_exec):
-            await _run_subprocess(
-                ['claude', '--x'], tmp_path, env={}, model='test',
+            await run_cli_subprocess(
+                ['claude', '--x'], tmp_path, env={},
+                backend='claude', model='test',
+                transcript=TranscriptWatch(),
             )
 
         assert captured_args == ['claude', '--x'], f'Expected bare argv; got {captured_args}'
@@ -3561,6 +3925,55 @@ class TestCpuGovernPrefix:
         env = {'DF_AGENT_CPU_GOVERN': '/tmp/nonexistent-govern.sh'}
         _cpu_govern_prefix(env)
         assert 'DF_AGENT_CPU_GOVERN' not in env
+
+
+class TestClaudeBinaryResolution:
+    """Unit tests for claude_binary_spec() / resolve_claude_binary() in cli_invoke.
+
+    These exist because of the 2026-08-13→08-18 outage: ``build_claude_argv``
+    emitted the bare PATH name ``claude`` as argv[0], the fused-memory systemd
+    unit pinned no ``Environment=PATH=``, and the inherited user-manager PATH
+    lacked ``~/.local/bin`` — so every curator LLM call raised
+    ``FileNotFoundError`` for 80+ hours with no diagnostic naming the binary.
+    """
+
+    def test_spec_defaults_to_bare_claude_when_env_unset(self, monkeypatch):
+        """CLAUDE_BINARY unset → the historical bare name 'claude'."""
+        from shared.cli_invoke import claude_binary_spec
+        monkeypatch.delenv('CLAUDE_BINARY', raising=False)
+        assert claude_binary_spec() == 'claude'
+
+    def test_spec_returns_env_override(self, monkeypatch):
+        """CLAUDE_BINARY set → that value verbatim (the operator escape hatch)."""
+        from shared.cli_invoke import claude_binary_spec
+        monkeypatch.setenv('CLAUDE_BINARY', '/opt/claude/bin/claude')
+        assert claude_binary_spec() == '/opt/claude/bin/claude'
+
+    def test_spec_ignores_empty_env_value(self, monkeypatch):
+        """CLAUDE_BINARY='' is treated as unset, not as an empty argv[0]."""
+        from shared.cli_invoke import claude_binary_spec
+        monkeypatch.setenv('CLAUDE_BINARY', '')
+        assert claude_binary_spec() == 'claude'
+
+    def test_resolve_returns_absolute_path_for_real_executable(self, monkeypatch, tmp_path):
+        """CLAUDE_BINARY pointing at an executable file → its absolute path."""
+        from shared.cli_invoke import resolve_claude_binary
+        exec_file = tmp_path / 'claude'
+        exec_file.write_text('#!/bin/sh\nexit 0\n')
+        exec_file.chmod(0o755)
+        monkeypatch.setenv('CLAUDE_BINARY', str(exec_file))
+        assert resolve_claude_binary() == str(exec_file)
+
+    def test_resolve_returns_none_for_missing_path_without_raising(self, monkeypatch, tmp_path):
+        """An unresolvable spec yields None — never an exception.
+
+        Every spawn path (and several test suites that never run the CLI)
+        reaches this helper, so raising here would break callers that only
+        wanted to assemble an argv.
+        """
+        from shared.cli_invoke import resolve_claude_binary
+        monkeypatch.setenv('CLAUDE_BINARY', str(tmp_path / 'no-such-claude'))
+        assert resolve_claude_binary() is None
 
 
 # ── Transcript readers ────────────────────────────────────────────────────────
@@ -3690,9 +4103,27 @@ class TestReadTranscriptRecords:
 
 # ── Two-regime liveness watchdog tests ──────────────────────────────────────
 
+def _kill_decision_clock():
+    """snapshot_process_group side_effect recording time.monotonic() per call.
+
+    run_cli_subprocess calls snapshot_process_group as the first statement of
+    its TimeoutError handler, right after the watchdog decides to kill, so
+    each recorded time is a kill decision and excludes post-kill teardown.
+    """
+    import time as _time
+
+    decided_at: list[float] = []
+
+    def _side_effect(pgid):
+        decided_at.append(_time.monotonic())
+        return f'snapshot_process_group({pgid}): stubbed'
+
+    return _side_effect, decided_at
+
+
 @pytest.mark.asyncio
 class TestRunSubprocessWatchdog:
-    """Two-regime liveness watchdog tests for _run_subprocess.
+    """Two-regime liveness watchdog tests for run_cli_subprocess.
 
     These tests verify that the new watchdog param ``startup_grace_secs``
     enables a fast pre-turn-1 kill when a zero-turn startup wedge is detected,
@@ -3710,7 +4141,7 @@ class TestRunSubprocessWatchdog:
         """Return (proc, call_count_ref) where communicate hangs on call 1, raises TimeoutError on call 2."""
         call_count = [0]
 
-        async def communicate_side_effect(input=None):  # noqa: A002
+        async def communicate_side_effect(input=None):
             call_count[0] += 1
             if call_count[0] == 1:
                 # Hang until the watchdog cancels comm_task — CancelledError is raised here.
@@ -3731,8 +4162,9 @@ class TestRunSubprocessWatchdog:
         """Startup wedge (0 turns) is killed at startup_grace_secs, not the 12s ceiling.
 
         With startup_grace_secs=0.05 and timeout_seconds=12.0, the watchdog
-        should detect 0 turns after ~0.05s and kill fast.  Wall-clock must be
-        well under the 12s ceiling, proving the kill happened at the grace bound.
+        should detect 0 turns after ~0.05s and kill fast.  The kill decision
+        time must be well under the 12s ceiling, proving the kill happened at
+        the grace bound.
         """
         import time as _time
 
@@ -3742,6 +4174,7 @@ class TestRunSubprocessWatchdog:
 
         proc, _ = self._make_hanging_proc()
         terminate_pg_mock = AsyncMock()
+        snapshot_side_effect, decided_at = _kill_decision_clock()
 
         async def fake_exec(*args, **kwargs):
             return proc
@@ -3749,30 +4182,24 @@ class TestRunSubprocessWatchdog:
         with (
             patch('shared.cli_invoke.asyncio.create_subprocess_exec', side_effect=fake_exec),
             patch('shared.cli_invoke.terminate_process_group', terminate_pg_mock),
+            patch('shared.cli_invoke.snapshot_process_group', side_effect=snapshot_side_effect),
             patch('shared.cli_invoke.count_transcript_turns', return_value=0),
         ):
             t0 = _time.monotonic()
-            result = await _run_subprocess(
-                ['fake'], cwd=tmp_path, env={}, model='opus',
-                timeout_seconds=12.0, startup_grace_secs=0.05,
-                session_id=sid, config_dir=cfg_dir,
+            result = await run_cli_subprocess(
+                ['fake'], cwd=tmp_path, env={},
+                backend='claude', model='opus', timeout_seconds=12.0,
+                transcript=TranscriptWatch(session_id=sid, config_dir=cfg_dir, startup_grace_secs=0.05),
             )
-            wall = _time.monotonic() - t0
 
         assert result.timed_out is True, 'Expected timed_out=True for startup wedge kill'
         terminate_pg_mock.assert_called_once()
-        # Discriminates the correct ~0.05s-grace kill from the WRONG 12.0s ceiling
-        # (widened from 5.0s — task 2723). The wedge kill itself fires near the grace
-        # bound (see the "Startup wedge detected" log); wall additionally captures
-        # real post-kill teardown — an UNMOCKED snapshot_process_group /proc walk,
-        # comm_task cancellation/await, the second (SIGTERM-window) communicate()
-        # call, and event-loop scheduling — which under parallel verify/host load has
-        # been observed to drift to ~3.3s. 7.0s keeps full discriminating power
-        # against the 12.0s wrong ceiling while comfortably tolerating that teardown
-        # latency — same load-drift de-flake shape as the sibling absolute-cap-vs-
-        # idle-bound and UNREADABLE-DEGRADE tests in this class (commits
-        # f1aae9678e, fda97df621af).
-        assert wall < 7.0, f'Expected fast kill (<7s), got {wall:.3f}s — wedge not killed at grace bound'
+        assert len(decided_at) == 1, f'Expected exactly one kill decision, got {len(decided_at)}'
+        # The bounds time the kill decision, not the teardown after it, so 6.0s
+        # separates the ~0.05s grace kill from the wrong 12.0s ceiling under any load.
+        decision = decided_at[0] - t0
+        assert decision >= 0.05, f'Expected wedge kill at the 0.05s grace bound, killed too early at {decision:.3f}s'
+        assert decision < 6.0, f'Expected wedge kill at the ~0.05s grace bound, not the 12.0s ceiling ({decision:.3f}s)'
 
     async def test_none_transcript_degrades_to_ceiling_not_grace(self, tmp_path):
         """B7 conservative degrade: unreadable/absent transcript (None) must NOT trigger
@@ -3804,10 +4231,10 @@ class TestRunSubprocessWatchdog:
             patch('shared.cli_invoke.count_transcript_turns', return_value=None),
         ):
             t0 = _time.monotonic()
-            result = await _run_subprocess(
-                ['fake'], cwd=tmp_path, env={}, model='opus',
-                timeout_seconds=0.3, startup_grace_secs=0.05,
-                session_id=sid, config_dir=cfg_dir,
+            result = await run_cli_subprocess(
+                ['fake'], cwd=tmp_path, env={},
+                backend='claude', model='opus', timeout_seconds=0.3,
+                transcript=TranscriptWatch(session_id=sid, config_dir=cfg_dir, startup_grace_secs=0.05),
             )
             wall = _time.monotonic() - t0
 
@@ -3822,7 +4249,7 @@ class TestRunSubprocessWatchdog:
     async def test_working_regime_survives_grace_killed_at_ceiling(self, tmp_path):
         """B6 long-synchronous-tool survival: ≥1 turn seen → no fast kill at grace, only ceiling.
 
-        A proc that has made progress (count_transcript_turns=5) must NOT be killed
+        A proc that has made progress (5 assistant turns on disk) must NOT be killed
         at the startup_grace_secs bound.  Liveness is proven (seen_turn=True); the
         working regime applies and only the absolute ceiling triggers the kill.
         Wall-clock must be >= ~0.25s (past the 0.05s grace) and result.transcript_turns==5.
@@ -3831,7 +4258,7 @@ class TestRunSubprocessWatchdog:
 
         sid = str(uuid.uuid4())
         cfg_dir = tmp_path / 'cfg'
-        cfg_dir.mkdir()
+        _write_model_transcript(cfg_dir, sid, [{'type': 'assistant'}] * 5)
 
         proc, _ = self._make_hanging_proc()
         terminate_pg_mock = AsyncMock()
@@ -3842,13 +4269,12 @@ class TestRunSubprocessWatchdog:
         with (
             patch('shared.cli_invoke.asyncio.create_subprocess_exec', side_effect=fake_exec),
             patch('shared.cli_invoke.terminate_process_group', terminate_pg_mock),
-            patch('shared.cli_invoke.count_transcript_turns', return_value=5),
         ):
             t0 = _time.monotonic()
-            result = await _run_subprocess(
-                ['fake'], cwd=tmp_path, env={}, model='opus',
-                timeout_seconds=0.3, startup_grace_secs=0.05,
-                session_id=sid, config_dir=cfg_dir,
+            result = await run_cli_subprocess(
+                ['fake'], cwd=tmp_path, env={},
+                backend='claude', model='opus', timeout_seconds=0.3,
+                transcript=TranscriptWatch(session_id=sid, config_dir=cfg_dir, startup_grace_secs=0.05),
             )
             wall = _time.monotonic() - t0
 
@@ -3898,10 +4324,10 @@ class TestRunSubprocessWatchdog:
             patch('shared.cli_invoke.count_transcript_turns', side_effect=counting_count_turns),
             patch('shared.cli_invoke._WATCHDOG_POLL_SECS', 0.05),
         ):
-            result = await _run_subprocess(
-                ['fake'], cwd=tmp_path, env={}, model='opus',
-                timeout_seconds=0.4, startup_grace_secs=0.05,
-                session_id=sid, config_dir=cfg_dir,
+            result = await run_cli_subprocess(
+                ['fake'], cwd=tmp_path, env={},
+                backend='claude', model='opus', timeout_seconds=0.4,
+                transcript=TranscriptWatch(session_id=sid, config_dir=cfg_dir, startup_grace_secs=0.05),
             )
 
         assert result.timed_out is True, 'Expected timed_out=True (killed at ceiling)'
@@ -3935,13 +4361,13 @@ class TestRunSubprocessWatchdog:
             patch('shared.cli_invoke.count_transcript_turns', return_value=None),
             patch('shared.cli_invoke._WATCHDOG_POLL_SECS', 0.05),
         ):
-            task = asyncio.ensure_future(_run_subprocess(
-                ['fake'], cwd=tmp_path, env={}, model='opus',
+            task = asyncio.ensure_future(run_cli_subprocess(
+                ['fake'], cwd=tmp_path, env={},
                 # Large ceiling so the watchdog doesn't fire before the cancel
-                timeout_seconds=5.0, startup_grace_secs=2.0,
-                session_id=sid, config_dir=cfg_dir,
+                backend='claude', model='opus', timeout_seconds=5.0,
+                transcript=TranscriptWatch(session_id=sid, config_dir=cfg_dir, startup_grace_secs=2.0),
             ))
-            # Yield to let _run_subprocess start and enter asyncio.wait in the
+            # Yield to let run_cli_subprocess start and enter asyncio.wait in the
             # watchdog poll loop.  A single sleep(0) is sufficient because
             # fake_exec is an awaitable that returns without yielding, so the
             # task runs straight through to the first asyncio.wait suspension.
@@ -3954,8 +4380,11 @@ class TestRunSubprocessWatchdog:
         terminate_pg_mock.assert_called_once()
 
 
+_EXTENSION_READS_VALVE_SECS = 2.0
+
+
 class TestRunSubprocessWorkingRegimeProgressExtension:
-    """Working-regime progress-extension tests for _run_subprocess (task 2360).
+    """Working-regime progress-extension tests for run_cli_subprocess (task 2360).
 
     When BOTH ``working_idle_secs`` and ``absolute_cap_secs`` are set, the
     WORKING regime (post-turn-1) extends past the flat ``timeout_seconds``
@@ -3973,16 +4402,41 @@ class TestRunSubprocessWorkingRegimeProgressExtension:
 
     Fails today: the WORKING regime currently runs to a flat ``timeout_seconds``
     wall regardless of ``working_idle_secs``/``absolute_cap_secs`` (accepted
-    since step-4 but not yet consulted by ``_run_subprocess``), and
+    since step-4 but not yet consulted by ``run_cli_subprocess``), and
     ``_WATCHDOG_WORKING_POLL_SECS`` does not exist yet.
     """
 
-    @staticmethod
-    def _make_delayed_success_proc(delay_secs, stdout_bytes):
-        """proc whose communicate() sleeps *delay_secs* then returns *stdout_bytes* once."""
+    _HELD_READ = 1
+    _WITNESS_READS = _HELD_READ + 2
 
-        async def communicate_side_effect(input=None):  # noqa: A002
+    @staticmethod
+    def _make_delayed_success_proc(
+        delay_secs, stdout_bytes, *, reads_observed, min_reads,
+        working_idle_secs, absolute_cap_secs,
+    ):
+        """proc whose communicate() returns *stdout_bytes* once, after at least
+        *delay_secs* AND once *min_reads* transcript reads have started (bounded
+        by _EXTENSION_READS_VALVE_SECS).  The fixed lifetime alone let a starved
+        loop break at ``comm_task in done`` before any read — see the READS GATE
+        note at
+        shared/tests/test_cli_invoke_transcript_offloop.py::_make_delayed_success_proc.
+
+        Refuses extension bounds the valve could reach, so a valve trip ends as a
+        normal exit reported by the reads witness, never as an idle- or cap-kill.
+        """
+        import time as _time
+
+        assert delay_secs + _EXTENSION_READS_VALVE_SECS < min(working_idle_secs, absolute_cap_secs), (
+            f'delay_secs={delay_secs} + valve={_EXTENSION_READS_VALVE_SECS} must stay under '
+            f'working_idle_secs={working_idle_secs} and absolute_cap_secs={absolute_cap_secs}, '
+            f'or a valve trip is reported as a kill instead of by the reads witness'
+        )
+
+        async def communicate_side_effect(input=None):
             await asyncio.sleep(delay_secs)
+            deadline = _time.monotonic() + _EXTENSION_READS_VALVE_SECS
+            while len(reads_observed) < min_reads and _time.monotonic() < deadline:
+                await asyncio.sleep(0.005)
             return (stdout_bytes, b'')
 
         proc = MagicMock()
@@ -4001,7 +4455,7 @@ class TestRunSubprocessWorkingRegimeProgressExtension:
         """
         call_count = [0]
 
-        async def communicate_side_effect(input=None):  # noqa: A002
+        async def communicate_side_effect(input=None):
             call_count[0] += 1
             if call_count[0] == 1:
                 await asyncio.Event().wait()
@@ -4047,6 +4501,38 @@ class TestRunSubprocessWorkingRegimeProgressExtension:
 
         return _side_effect
 
+    @classmethod
+    def _recorded_with_held_read(cls, turns_side_effect, reads, *, held_secs):
+        """count_transcript_turns side_effect appending each read's index to *reads*
+        as it STARTS, holding read ``_HELD_READ`` for *held_secs*, then delegating.
+
+        The read runs on the asyncio.to_thread worker, so the hold blocks no loop
+        yet guarantees the kill checks after the held read run at least
+        *held_secs* after it started.  *reads* is appended on the worker thread
+        and read on the loop thread; at most one read is in flight, so this is safe.
+        """
+        import time as _time
+
+        def _side_effect(config_dir, session_id):
+            index = len(reads)
+            reads.append(index)
+            if index == cls._HELD_READ:
+                _time.sleep(held_secs)
+            return turns_side_effect(config_dir, session_id)
+
+        return _side_effect
+
+    @classmethod
+    def _assert_extension_exercised_past_ceiling(cls, reads):
+        """Witness for a run recorded with ``_recorded_with_held_read``."""
+        assert len(reads) >= cls._WITNESS_READS, (
+            f'Expected >= {cls._WITNESS_READS} transcript reads, got {len(reads)}: '
+            f'read 0 latches seen_turn, read {cls._HELD_READ} is the extension poll held '
+            f'past the old ceiling, and read {cls._HELD_READ + 1} starts only after the '
+            f'kill checks that followed it let the run live. Fewer reads means the run '
+            f'exited without the working-regime extension being exercised past the ceiling.'
+        )
+
     async def test_productive_run_survives_ceiling_and_completes_normally(self, tmp_path):
         """(a) PRODUCTIVE-SURVIVES-CEILING: transcript turns keep growing across the
         old timeout_seconds ceiling; the process eventually completes normally with
@@ -4063,23 +4549,31 @@ class TestRunSubprocessWorkingRegimeProgressExtension:
             'result': 'ok', 'subtype': 'success', 'cost_usd': 0.02,
             'duration_ms': 300, 'num_turns': 8, 'session_id': sid,
         }).encode()
-        proc = self._make_delayed_success_proc(0.3, valid_json)
+        old_ceiling = 0.1
+        working_idle_secs, absolute_cap_secs = 3.0, 5.0
+        reads: list[int] = []
+        proc = self._make_delayed_success_proc(
+            0.3, valid_json, reads_observed=reads, min_reads=self._WITNESS_READS,
+            working_idle_secs=working_idle_secs, absolute_cap_secs=absolute_cap_secs,
+        )
+        turns = self._recorded_with_held_read(
+            self._always_growing_turns(), reads, held_secs=old_ceiling,
+        )
 
         async def fake_exec(*args, **kwargs):
             return proc
 
         with (
             patch('shared.cli_invoke.asyncio.create_subprocess_exec', side_effect=fake_exec),
-            patch('shared.cli_invoke.count_transcript_turns', side_effect=self._always_growing_turns()),
+            patch('shared.cli_invoke.count_transcript_turns', side_effect=turns),
             patch('shared.cli_invoke._WATCHDOG_POLL_SECS', 0.02),
             patch('shared.cli_invoke._WATCHDOG_WORKING_POLL_SECS', 0.02),
         ):
             t0 = _time.monotonic()
-            result = await _run_subprocess(
-                ['fake'], cwd=tmp_path, env={}, model='opus',
-                timeout_seconds=0.1, startup_grace_secs=0.02,
-                session_id=sid, config_dir=cfg_dir,
-                working_idle_secs=1.0, absolute_cap_secs=5.0,
+            result = await run_cli_subprocess(
+                ['fake'], cwd=tmp_path, env={},
+                backend='claude', model='opus', timeout_seconds=old_ceiling,
+                transcript=TranscriptWatch(session_id=sid, config_dir=cfg_dir, startup_grace_secs=0.02, working_idle_secs=working_idle_secs, absolute_cap_secs=absolute_cap_secs),
             )
             wall = _time.monotonic() - t0
 
@@ -4087,10 +4581,13 @@ class TestRunSubprocessWorkingRegimeProgressExtension:
             'Expected the productive run to survive the old 0.1s ceiling and complete '
             'normally — continuous transcript growth must extend the working regime.'
         )
+        self._assert_extension_exercised_past_ceiling(reads)
         assert result.duration_ms >= 100, (
             f'Expected duration_ms >= old ceiling (100ms), got {result.duration_ms}'
         )
-        assert wall < 2.0, f'Expected normal completion well under the 5s cap, got {wall:.3f}s'
+        assert wall < 2.0, (
+            f'Expected normal completion well under the {absolute_cap_secs}s cap, got {wall:.3f}s'
+        )
 
     async def test_idle_kill_fires_after_progress_stops_not_at_old_ceiling(self, tmp_path):
         """(b) IDLE-KILL: transcript turns grow then go static.  Kill fires after
@@ -4106,6 +4603,7 @@ class TestRunSubprocessWorkingRegimeProgressExtension:
 
         proc, _ = self._make_hanging_proc()
         terminate_pg_mock = AsyncMock()
+        snapshot_side_effect, decided_at = _kill_decision_clock()
 
         async def fake_exec(*args, **kwargs):
             return proc
@@ -4113,39 +4611,32 @@ class TestRunSubprocessWorkingRegimeProgressExtension:
         with (
             patch('shared.cli_invoke.asyncio.create_subprocess_exec', side_effect=fake_exec),
             patch('shared.cli_invoke.terminate_process_group', terminate_pg_mock),
+            patch('shared.cli_invoke.snapshot_process_group', side_effect=snapshot_side_effect),
             patch('shared.cli_invoke.count_transcript_turns', side_effect=self._grow_then_plateau_turns(3)),
             patch('shared.cli_invoke._WATCHDOG_POLL_SECS', 0.02),
             patch('shared.cli_invoke._WATCHDOG_WORKING_POLL_SECS', 0.02),
         ):
             t0 = _time.monotonic()
-            result = await _run_subprocess(
-                ['fake'], cwd=tmp_path, env={}, model='opus',
-                timeout_seconds=0.05, startup_grace_secs=0.02,
-                session_id=sid, config_dir=cfg_dir,
-                working_idle_secs=0.3, absolute_cap_secs=10.0,
+            result = await run_cli_subprocess(
+                ['fake'], cwd=tmp_path, env={},
+                backend='claude', model='opus', timeout_seconds=0.05,
+                transcript=TranscriptWatch(session_id=sid, config_dir=cfg_dir, startup_grace_secs=0.02, working_idle_secs=0.3, absolute_cap_secs=20.0),
             )
-            wall = _time.monotonic() - t0
 
         assert result.timed_out is True
         terminate_pg_mock.assert_called_once()
-        # idle_bound = max(0.3, 0.05) = 0.3s of no-progress, on top of the ~0.06s
-        # growth phase → kill at ~0.36s.  Well past the old 0.05s ceiling (proves
-        # it wasn't killed there) and well under the 10s absolute cap (proves it
-        # wasn't killed there either; widened from 5.0s — task 2723).
-        assert wall >= 0.2, (
+        assert len(decided_at) == 1, f'Expected exactly one kill decision, got {len(decided_at)}'
+        # idle_bound = max(0.3, 0.05) = 0.3s of no progress after the ~0.06s growth
+        # phase → kill at ~0.36s.  The bounds time the kill decision, not the
+        # teardown after it, so they separate it from the old 0.05s ceiling and
+        # from the wrong 20.0s absolute cap under any load.
+        decision = decided_at[0] - t0
+        assert decision >= 0.2, (
             f'Expected idle-kill at ~0.36s (after progress stalls), '
-            f'killed too early at {wall:.3f}s — looks like the old ceiling fired'
+            f'killed too early at {decision:.3f}s — looks like the old ceiling fired'
         )
-        # Discriminates the correct ~0.36s idle-kill from the WRONG 10.0s absolute
-        # cap. wall additionally captures real post-kill teardown (unmocked
-        # snapshot_process_group /proc walk, comm_task cancellation/await, the
-        # second communicate() call, event-loop scheduling), observed to drift to
-        # ~2.5s under heavy host load. 5.0s keeps full discriminating power against
-        # the 10.0s wrong ceiling while tolerating that teardown latency — same
-        # load-drift de-flake shape as the sibling tests in this class (commits
-        # f1aae9678e, fda97df621af, and the grace-not-ceiling fix in this task).
-        assert wall < 5.0, (
-            f'Expected idle-kill well under the 10s absolute cap, got {wall:.3f}s'
+        assert decision < 10.0, (
+            f'Expected idle-kill at ~0.36s, not at the 20.0s absolute cap ({decision:.3f}s)'
         )
 
     async def test_b6_long_synchronous_tool_call_survives_between_ceiling_and_idle_bound(self, tmp_path):
@@ -4165,31 +4656,40 @@ class TestRunSubprocessWorkingRegimeProgressExtension:
             'result': 'ok', 'subtype': 'success', 'cost_usd': 0.01,
             'duration_ms': 200, 'num_turns': 1, 'session_id': sid,
         }).encode()
-        proc = self._make_delayed_success_proc(0.2, valid_json)
+        old_ceiling = 0.05
+        working_idle_secs, absolute_cap_secs = 3.0, 5.0
+        reads: list[int] = []
+        proc = self._make_delayed_success_proc(
+            0.2, valid_json, reads_observed=reads, min_reads=self._WITNESS_READS,
+            working_idle_secs=working_idle_secs, absolute_cap_secs=absolute_cap_secs,
+        )
+        turns = self._recorded_with_held_read(
+            self._flat_turns(1), reads, held_secs=old_ceiling,
+        )
 
         async def fake_exec(*args, **kwargs):
             return proc
 
         with (
             patch('shared.cli_invoke.asyncio.create_subprocess_exec', side_effect=fake_exec),
-            patch('shared.cli_invoke.count_transcript_turns', side_effect=self._flat_turns(1)),
+            patch('shared.cli_invoke.count_transcript_turns', side_effect=turns),
             patch('shared.cli_invoke._WATCHDOG_POLL_SECS', 0.02),
             patch('shared.cli_invoke._WATCHDOG_WORKING_POLL_SECS', 0.02),
         ):
             t0 = _time.monotonic()
-            result = await _run_subprocess(
-                ['fake'], cwd=tmp_path, env={}, model='opus',
-                timeout_seconds=0.05, startup_grace_secs=0.02,
-                session_id=sid, config_dir=cfg_dir,
-                working_idle_secs=0.5, absolute_cap_secs=5.0,
+            result = await run_cli_subprocess(
+                ['fake'], cwd=tmp_path, env={},
+                backend='claude', model='opus', timeout_seconds=old_ceiling,
+                transcript=TranscriptWatch(session_id=sid, config_dir=cfg_dir, startup_grace_secs=0.02, working_idle_secs=working_idle_secs, absolute_cap_secs=absolute_cap_secs),
             )
             wall = _time.monotonic() - t0
 
         assert result.timed_out is False, (
-            'A single long synchronous tool call (flat turn count) between the old '
-            '0.05s ceiling and the 0.5s idle bound must survive, not be false-killed '
-            'at the old ceiling (B6 safety).'
+            f'A single long synchronous tool call (flat turn count) between the old '
+            f'{old_ceiling}s ceiling and the {working_idle_secs}s idle bound must survive, '
+            f'not be false-killed at the old ceiling (B6 safety).'
         )
+        self._assert_extension_exercised_past_ceiling(reads)
         assert result.duration_ms >= 50, (
             f'Expected duration_ms >= old ceiling (50ms), got {result.duration_ms}'
         )
@@ -4209,6 +4709,7 @@ class TestRunSubprocessWorkingRegimeProgressExtension:
 
         proc, _ = self._make_hanging_proc()
         terminate_pg_mock = AsyncMock()
+        snapshot_side_effect, decided_at = _kill_decision_clock()
 
         async def fake_exec(*args, **kwargs):
             return proc
@@ -4216,34 +4717,29 @@ class TestRunSubprocessWorkingRegimeProgressExtension:
         with (
             patch('shared.cli_invoke.asyncio.create_subprocess_exec', side_effect=fake_exec),
             patch('shared.cli_invoke.terminate_process_group', terminate_pg_mock),
+            patch('shared.cli_invoke.snapshot_process_group', side_effect=snapshot_side_effect),
             patch('shared.cli_invoke.count_transcript_turns', side_effect=self._always_growing_turns()),
             patch('shared.cli_invoke._WATCHDOG_POLL_SECS', 0.02),
             patch('shared.cli_invoke._WATCHDOG_WORKING_POLL_SECS', 0.02),
         ):
             t0 = _time.monotonic()
-            result = await _run_subprocess(
-                ['fake'], cwd=tmp_path, env={}, model='opus',
-                timeout_seconds=0.05, startup_grace_secs=0.02,
-                session_id=sid, config_dir=cfg_dir,
-                working_idle_secs=10.0, absolute_cap_secs=0.3,
+            result = await run_cli_subprocess(
+                ['fake'], cwd=tmp_path, env={},
+                backend='claude', model='opus', timeout_seconds=0.05,
+                transcript=TranscriptWatch(session_id=sid, config_dir=cfg_dir, startup_grace_secs=0.02, working_idle_secs=10.0, absolute_cap_secs=0.3),
             )
-            wall = _time.monotonic() - t0
 
         assert result.timed_out is True
         terminate_pg_mock.assert_called_once()
+        assert len(decided_at) == 1, f'Expected exactly one kill decision, got {len(decided_at)}'
         # absolute_cap_secs=0.3 « idle_bound=max(10.0, 0.05)=10.0 — only the cap can fire.
-        assert wall >= 0.2, f'Expected cap-kill at ~0.3s, killed too early at {wall:.3f}s'
-        # Discriminates the correct ~0.3s cap-kill from the WRONG 10.0s idle bound. The
-        # cap-kill itself fires at ~0.3s (see the "Working-regime absolute cap reached"
-        # log); wall additionally captures the post-kill teardown (an UNMOCKED
-        # snapshot_process_group /proc walk + comm_task cancellation + event-loop
-        # scheduling), which under parallel verify/host load has been observed to drift
-        # to ~2.0s (task 2723). 4.0s keeps full discriminating power against the 10.0s
-        # wrong ceiling while tolerating that teardown latency — mirrors the same
-        # load-drift de-flake applied to the sibling UNREADABLE-DEGRADE test (e) below
-        # (commit fda97df621af), widened further here since 2.0s of observed drift
-        # already ate the old idle_bound=2.0s/wall<1.5s margin outright.
-        assert wall < 4.0, f'Expected cap-kill at ~0.3s, not at the 10.0s idle bound ({wall:.3f}s)'
+        # The bounds time the kill decision, not the teardown after it, so 4.0s
+        # separates the ~0.3s cap from the wrong 10.0s idle bound under any load.
+        decision = decided_at[0] - t0
+        assert decision >= 0.2, f'Expected cap-kill at ~0.3s, killed too early at {decision:.3f}s'
+        assert decision < 4.0, (
+            f'Expected cap-kill at ~0.3s, not at the 10.0s idle bound ({decision:.3f}s)'
+        )
 
     async def test_unreadable_transcript_degrades_to_old_ceiling_even_with_extension_params_set(self, tmp_path):
         """(e) UNREADABLE-DEGRADE: count_transcript_turns always returns None (B7
@@ -4261,6 +4757,7 @@ class TestRunSubprocessWorkingRegimeProgressExtension:
 
         proc, _ = self._make_hanging_proc()
         terminate_pg_mock = AsyncMock()
+        snapshot_side_effect, decided_at = _kill_decision_clock()
 
         async def fake_exec(*args, **kwargs):
             return proc
@@ -4268,31 +4765,31 @@ class TestRunSubprocessWorkingRegimeProgressExtension:
         with (
             patch('shared.cli_invoke.asyncio.create_subprocess_exec', side_effect=fake_exec),
             patch('shared.cli_invoke.terminate_process_group', terminate_pg_mock),
+            patch('shared.cli_invoke.snapshot_process_group', side_effect=snapshot_side_effect),
             patch('shared.cli_invoke.count_transcript_turns', return_value=None),
             patch('shared.cli_invoke._WATCHDOG_POLL_SECS', 0.02),
         ):
             t0 = _time.monotonic()
-            result = await _run_subprocess(
-                ['fake'], cwd=tmp_path, env={}, model='opus',
-                timeout_seconds=0.2, startup_grace_secs=0.02,
-                session_id=sid, config_dir=cfg_dir,
-                working_idle_secs=5.0, absolute_cap_secs=10.0,
+            result = await run_cli_subprocess(
+                ['fake'], cwd=tmp_path, env={},
+                backend='claude', model='opus', timeout_seconds=0.2,
+                transcript=TranscriptWatch(session_id=sid, config_dir=cfg_dir, startup_grace_secs=0.02, working_idle_secs=5.0, absolute_cap_secs=10.0),
             )
-            wall = _time.monotonic() - t0
 
         assert result.timed_out is True
         assert result.transcript_turns is None
         terminate_pg_mock.assert_called_once()
-        # Discriminates the correct ~0.2s ceiling from the WRONG extended ceilings
-        # (working_idle_secs=5.0 / absolute_cap_secs=10.0). The kill itself fires at
-        # 0.2s (see the "Absolute ceiling reached after 0.2s — killing" log); the only
-        # thing wall measures beyond that is real-ish subprocess teardown + event-loop
-        # scheduling, which under parallel verify load can drift to ~1.3s. The bound
-        # only needs to sit comfortably below the nearest wrong ceiling (5.0s), so 3.0s
-        # keeps full discriminating power while tolerating teardown latency under load.
-        assert wall < 3.0, (
+        assert len(decided_at) == 1, f'Expected exactly one kill decision, got {len(decided_at)}'
+        # The bounds time the kill decision, not the teardown after it, so 3.0s
+        # separates the 0.2s ceiling from the wrong extended ceilings (5.0s idle /
+        # 10.0s cap) under any load.
+        decision = decided_at[0] - t0
+        assert decision >= 0.2, (
+            f'Expected kill at the old 0.2s ceiling, killed too early at {decision:.3f}s'
+        )
+        assert decision < 3.0, (
             f'Expected kill at the old ~0.2s ceiling (extension never engages on an '
-            f'unreadable transcript), got {wall:.3f}s — looks like the huge idle/cap '
+            f'unreadable transcript), got {decision:.3f}s — looks like the huge idle/cap '
             f'params (5.0s idle / 10.0s cap) leaked into the degrade path'
         )
 
@@ -4468,10 +4965,11 @@ class TestBackendForwarding:
     async def test_claude_default_shape_unchanged_and_no_backend_kwarg_with_gate(self):
         """Gated-path variant: invoke_claude_agent still gets no `backend` kwarg.
 
-        The forwarding guard (:895-896) sits once, before the no-gate/gate
-        branch, so it should cover both dispatch sites. This confirms the
-        gated cap-retry call site (:928) — not just the no-gate fast path
-        (:907) — actually honors it, and pins the gated call shape (adds
+        The forwarding guard (``if invoke_fn is not None:`` followed by
+        ``invoke_kwargs.setdefault('backend', backend)``) sits once, before
+        the no-gate/gate branch, so it should cover both dispatch sites. This
+        confirms the gated cap-retry call site — not just the no-gate fast
+        path — actually honors it, and pins the gated call shape (adds
         `oauth_token` from the leased slot) so a future change can't silently
         smuggle `backend` in alongside it.
         """
@@ -4504,3 +5002,1269 @@ class TestBackendForwarding:
             'oauth_token': 'tok',
             'config_dir': None,
         }, f'invoke_claude_agent call shape changed unexpectedly (gated path): {call_kwargs}'
+
+
+# ── INV-4: the unreadable-transcript storm escape, wiring half (task 4003) ────
+
+_ESCAPE_NEEDLE = 'Transcript UNREADABLE'
+
+# One transcript read made to outlive the fake child, so the starvation the
+# class's poll-count preconditions depend on is reproduced on any host.
+_STARVATION_STALL_SECS = 0.5
+
+# How long the fake child waits for its poll-count barrier before giving up and
+# exiting anyway. ORDERING INVARIANT, stated here and nowhere else: well under
+# the 30s startup_grace_secs/absolute_cap_secs these tests pass, so a valve trip
+# can never manufacture a spurious escape record or kill, and far under the 300s
+# pytest timeout. 10s is ~7x this harness's measured worst case (~0.25s per poll
+# under 40-way contention x the 6 polls the largest required_reads needs).
+_CHILD_RELEASE_TIMEOUT_SECS = 10.0
+
+
+def _escape_records(caplog):
+    """The storm-escape WARNINGs emitted during a driven watchdog run.
+
+    The WARNING is the product here: `note_unreadable_transcript` deliberately
+    keeps no process-wide counter (nothing in production read one), so the log
+    record IS the observable and the assertion is made on it directly.
+    """
+    return [
+        r for r in caplog.records
+        if r.levelno >= logging.WARNING and _ESCAPE_NEEDLE in r.getMessage()
+    ]
+
+
+@pytest.mark.asyncio
+class TestUnreadableTranscriptEscapeWiring:
+    """The watchdog loop must surface an unreadable transcript, once, past grace.
+
+    The unit half (test_transcript_unreadable_escape.py) pins the helper. This
+    pins that the loop actually calls it, gated on the SAME wall-clock grace the
+    startup kill uses, latched to one record per crossing, and only for roles
+    configured to have a transcript.
+
+    The escape must not change any kill decision — "NEVER kill on None" stays
+    exactly as it is. It only makes the degrade observable.
+
+    DETERMINISM.  The fake child exits on a poll-count handshake, not a timer:
+    it blocks until the watchdog has read the transcript `required_reads` times,
+    which each test states at its own call site as the precondition its
+    `call_count` assertion consumes. The wait is valve-bounded, so a watchdog
+    that stops polling fails that assertion instead of hanging the suite. The
+    scope-bound test is the exception: nothing can ever hand its barrier a read,
+    so it asserts ZERO reads over a valve-bounded lifetime, which is what keeps
+    that assertion falsifiable rather than a no-op.
+
+    The child used to live a fixed 0.25s while the watchdog polled at 5ms, which
+    made every poll count a race: measured 33-46 polls standalone, but 4/480
+    failures under 40-way process contention with counts down to 1 and 5. That
+    is the defect, and it is not re-derivable from the code that replaced it.
+    Widening the lifetime was the rejected alternative — it buys a bigger
+    constant on the same race, and this file's sibling wall-clock bound has been
+    widened four times already. The post-fix soak that settled it is recorded on
+    task 5112 rather than restated here, where it would read as a live guarantee
+    long after the harness moved on.
+    """
+
+    @staticmethod
+    def _proc(release: asyncio.Event, release_timeout_secs: float):
+        """A process that stays pending until the watchdog has polled enough times.
+
+        The child exits on `release`, which `_drive`'s read wrapper sets once
+        `required_reads` polls have happened — not on a timer, so no amount of
+        host contention can decide how many polls a test observes.
+
+        The wait is bounded, and the TimeoutError SUPPRESSED rather than raised:
+        a barrier that never opens must leave the child exiting NORMALLY, so
+        `run_cli_subprocess` takes its normal-exit path and the surviving failure is
+        the caller's poll-count assertion rather than a spurious `timed_out=True`
+        routed through the kill block.
+        """
+        payload = json.dumps({
+            'result': 'ok',
+            'subtype': 'success',
+            'cost_usd': 0.01,
+            'duration_ms': 100,
+            'num_turns': 1,
+            'session_id': 'sess-escape',
+        }).encode()
+
+        async def _communicate(input=None):
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(release.wait(), timeout=release_timeout_secs)
+            return (payload, b'')
+
+        proc = MagicMock()
+        proc.communicate = AsyncMock(side_effect=_communicate)
+        proc.terminate = MagicMock()
+        proc.kill = MagicMock()
+        proc.wait = AsyncMock()
+        proc.returncode = 0
+        proc.pid = 4003
+        return proc
+
+    async def _drive(
+        self,
+        tmp_path,
+        *,
+        turns_side_effect,
+        required_reads: int,
+        config_dir,
+        session_id,
+        startup_grace_secs=0.0,
+        working_idle_secs=None,
+        absolute_cap_secs=None,
+        release_timeout_secs: float = _CHILD_RELEASE_TIMEOUT_SECS,
+    ):
+        """Run the watchdog loop at millisecond cadence with a patched transcript read.
+
+        `required_reads` is the caller's stated precondition: the fake child stays
+        pending until the watchdog has polled the transcript that many times, or
+        until the valve fires. A run that can never produce a read is bounded by
+        `release_timeout_secs` alone — pre-setting the barrier instead would end
+        the run before the first poll body ever executes, which silently makes
+        any `call_count` assertion over it unfalsifiable.
+        """
+        assert required_reads >= 1, 'a pre-opened barrier makes call_count unfalsifiable'
+        loop = asyncio.get_running_loop()
+        release = asyncio.Event()
+        proc = self._proc(release, release_timeout_secs)
+
+        reads = itertools.count(1)
+
+        def counted_read(*args, **kwargs):
+            value = turns_side_effect(*args, **kwargs)
+            # The read is dispatched through `asyncio.to_thread`, so this runs on
+            # a worker thread and must not touch the Event directly. Re-releasing
+            # on later reads is idempotent.
+            if next(reads) >= required_reads:
+                loop.call_soon_threadsafe(release.set)
+            return value
+
+        async def fake_exec(*args, **kwargs):
+            return proc
+
+        with (
+            patch('shared.cli_invoke.asyncio.create_subprocess_exec', side_effect=fake_exec),
+            patch('shared.cli_invoke._WATCHDOG_POLL_SECS', 0.005),
+            patch('shared.cli_invoke._WATCHDOG_WORKING_POLL_SECS', 0.005),
+            patch('shared.cli_invoke._WATCHDOG_MIN_POLL_SECS', 0.001),
+            patch(
+                'shared.cli_invoke.count_transcript_turns',
+                side_effect=counted_read,
+            ) as mock_turns,
+        ):
+            result = await run_cli_subprocess(
+                ['fake'], cwd=tmp_path, env={},
+                backend='claude', model='opus', timeout_seconds=30.0,
+                transcript=TranscriptWatch(session_id=session_id, config_dir=config_dir, startup_grace_secs=startup_grace_secs, working_idle_secs=working_idle_secs, absolute_cap_secs=absolute_cap_secs),
+            )
+
+        # The process exited normally — no kill decision was taken, which is the
+        # invariant the escape must not disturb.
+        assert result.timed_out is False, 'the escape must not change the kill decision'
+        return mock_turns
+
+    async def test_a_slow_read_cannot_starve_the_poll_count(self, tmp_path, caplog):
+        """One slow transcript read must not decide how many polls a test gets.
+
+        Every behavioural test below states a `call_count >= N` precondition, and
+        those preconditions used to be a RACE: the fake child lived a fixed
+        wall-clock span while `_drive` polls at millisecond cadence, so the count
+        was settled by how many times a contended loop got round the watchdog.
+        Measured in the low tail of 480 runs under 40-way process contention:
+        poll counts of 1, 1, 1 and 5 — `call_count == 1` being exactly the value
+        esc-5216-5 reported from the field.
+
+        The mechanism at that tail is ONE read outliving the whole child, so a
+        sleep inside the side_effect reproduces it deterministically instead of
+        probabilistically: the read is dispatched through `asyncio.to_thread`, so
+        the sleep stalls the loop's await exactly the way executor-queue
+        saturation does, with no host load required. Same principle the
+        stdin-starvation block below already states for its own gap injection —
+        the failure is not "load" per se, it is the gap, so the test injects
+        exactly the gap.
+        """
+        import time as _time
+
+        reads = itertools.count(1)
+
+        def _stalling_read(*a, **k):
+            if next(reads) == 1:
+                _time.sleep(_STARVATION_STALL_SECS)
+            return None
+
+        with caplog.at_level(logging.WARNING, logger='shared.cli_invoke'):
+            mock_turns = await self._drive(
+                tmp_path,
+                turns_side_effect=_stalling_read,
+                required_reads=3,
+                config_dir=tmp_path / 'cfg',
+                session_id='sid',
+                startup_grace_secs=30.0,
+            )
+
+        assert mock_turns.call_count >= 3, (
+            f'a read slower than the child must not decide how many polls this '
+            f'class gets: the child has to stay pending until the watchdog has '
+            f'actually polled, not until a timer expires; got '
+            f'{mock_turns.call_count}'
+        )
+
+    async def test_an_unreachable_read_count_releases_the_child_instead_of_hanging(
+        self, tmp_path, caplog
+    ):
+        """An unreachable `required_reads` must fail the assertion, not hang the suite.
+
+        The handshake is only safe if a watchdog that stops polling still ends
+        the run. shared/pyproject.toml's timeout block records what the
+        alternative costs: a pytest-timeout breach under
+        `timeout_method = "signal"` with `--max-worker-restart=0` degrades into
+        the "shifting victim" false red, failing whatever unrelated test was on
+        the killed xdist worker. A barrier that can hang converts a clean
+        per-test red into that, so the valve is what keeps the failure
+        attributable to the test that actually broke.
+
+        The barrier here provably cannot open: a readable transcript latches
+        `seen_turn` on the first read and the progress extension is off, so the
+        loop never reads again — one read, forever short of the count demanded.
+
+        Both assertions are deliberately loose. The property under test is that
+        the run ENDED with the barrier still shut; the exact poll count and the
+        exact wall clock are scheduling artefacts, and pinning either would put
+        this test back on the race the rest of the class exists to remove.
+        """
+        import time as _time
+
+        unreachable_reads = 5
+
+        started = _time.monotonic()
+        with caplog.at_level(logging.WARNING, logger='shared.cli_invoke'):
+            mock_turns = await self._drive(
+                tmp_path,
+                turns_side_effect=lambda *a, **k: 1,
+                required_reads=unreachable_reads,
+                release_timeout_secs=0.05,
+                config_dir=tmp_path / 'cfg',
+                session_id='sid',
+                startup_grace_secs=30.0,
+            )
+        elapsed = _time.monotonic() - started
+
+        assert elapsed < 30.0, (
+            f'an unsatisfiable barrier must be released by the valve, not waited '
+            f'out at the 300s pytest timeout; the run took {elapsed:.2f}s'
+        )
+        assert mock_turns.call_count < unreachable_reads, (
+            f'the valve must release the child WITHOUT the barrier being '
+            f'satisfied, so the surviving failure is the caller\'s own poll-count '
+            f'assertion; got {mock_turns.call_count} of the {unreachable_reads} '
+            f'polls demanded'
+        )
+
+    async def test_escape_fires_once_when_transcript_never_readable(self, tmp_path, caplog):
+        """A transcript still unreadable past grace fires the escape exactly once.
+
+        This is the test that would have fired on 2026-07-18. Every poll of every
+        recon stage read None for three weeks and nothing said so.
+
+        ONCE, not once per poll: a wedged invocation polls its transcript for the
+        whole of a long run, and one WARNING per poll would bury the very signal
+        this exists to raise. The caller owns that latch.
+        """
+        with caplog.at_level(logging.WARNING, logger='shared.cli_invoke'):
+            mock_turns = await self._drive(
+                tmp_path,
+                turns_side_effect=lambda *a, **k: None,
+                required_reads=3,
+                config_dir=tmp_path / 'cfg',
+                session_id='sid',
+                startup_grace_secs=0.0,
+            )
+
+        assert mock_turns.call_count >= 3, (
+            f'harness must produce several polls for "once" to mean anything; '
+            f'got {mock_turns.call_count}'
+        )
+        records = _escape_records(caplog)
+        assert len(records) == 1, (
+            f'an always-unreadable transcript must fire exactly one escape over '
+            f'{mock_turns.call_count} polls; got {[r.getMessage() for r in records]}'
+        )
+
+    async def test_no_escape_inside_grace(self, tmp_path, caplog):
+        """An unreadable transcript INSIDE the grace window is silent.
+
+        The gate is wall-clock, and this is the regime it exists to protect: the
+        session JSONL does not exist until the CLI writes its first record, and a
+        recon stage spawns with fused-memory + escalation MCP servers to
+        initialise first. A poll-count gate of 3 would fire ~15s after spawn and
+        so emit this WARNING once on every healthy invocation.
+        """
+        with caplog.at_level(logging.WARNING, logger='shared.cli_invoke'):
+            mock_turns = await self._drive(
+                tmp_path,
+                turns_side_effect=lambda *a, **k: None,
+                required_reads=3,
+                config_dir=tmp_path / 'cfg',
+                session_id='sid',
+                # The driven run is over in milliseconds; nothing may fire inside 30s.
+                startup_grace_secs=30.0,
+            )
+
+        assert mock_turns.call_count >= 3, (
+            f'harness must actually poll for this to mean anything; '
+            f'got {mock_turns.call_count}'
+        )
+        records = _escape_records(caplog)
+        assert not records, (
+            f'no escape may fire inside grace over {mock_turns.call_count} polls; '
+            f'got {[r.getMessage() for r in records]}'
+        )
+
+    async def test_no_escape_when_transcript_readable(self, tmp_path, caplog):
+        """A readable transcript never fires the escape, even with grace at zero."""
+        with caplog.at_level(logging.WARNING, logger='shared.cli_invoke'):
+            mock_turns = await self._drive(
+                tmp_path,
+                turns_side_effect=lambda *a, **k: 1,
+                required_reads=1,
+                config_dir=tmp_path / 'cfg',
+                session_id='sid',
+                startup_grace_secs=0.0,
+            )
+
+        assert mock_turns.call_count >= 1, (
+            f'a run that never read the transcript proves nothing about the escape; '
+            f'got {mock_turns.call_count} polls'
+        )
+        records = _escape_records(caplog)
+        assert not records, (
+            f'a readable transcript must not fire; got {[r.getMessage() for r in records]}'
+        )
+
+    async def test_latch_clears_on_a_readable_read(self, tmp_path, caplog):
+        """A relapse after a readable read is a NEW crossing and fires again.
+
+        Alternates None/1 with the progress extension engaged, so ``seen_turn``
+        latches on the first readable poll and the loop keeps reading every poll
+        via the extension branch (without the extension it would short-circuit
+        all further reads and the alternation would be untestable). The idle and
+        absolute bounds are far beyond this run's length, so no kill is in play.
+        """
+        alternating = itertools.cycle([None, 1])
+        with caplog.at_level(logging.WARNING, logger='shared.cli_invoke'):
+            mock_turns = await self._drive(
+                tmp_path,
+                turns_side_effect=lambda *a, **k: next(alternating),
+                required_reads=6,
+                config_dir=tmp_path / 'cfg',
+                session_id='sid',
+                startup_grace_secs=0.0,
+                working_idle_secs=30.0,
+                absolute_cap_secs=30.0,
+            )
+
+        assert mock_turns.call_count >= 6, (
+            f'need several alternations for this to mean anything; '
+            f'got {mock_turns.call_count} polls'
+        )
+        records = _escape_records(caplog)
+        assert len(records) >= 2, (
+            f'each relapse after a readable read is a new crossing; got '
+            f'{[r.getMessage() for r in records]} over {mock_turns.call_count} polls'
+        )
+
+    async def test_no_escape_without_config_dir_or_session_id(self, tmp_path, caplog):
+        """A role with no transcript configured is out of scope and never fires.
+
+        The watchdog never reads a transcript for such a role, so its Nones mean
+        nothing — counting them would be noise, not signal. This is the scope
+        bound from the amendment.
+
+        The child's lifetime here is bounded by the valve rather than by the
+        handshake: a run that can never read has nothing to hand the barrier, so
+        pre-setting it would end the run before the first poll body and take this
+        assertion's power with it.
+        """
+        for config_dir, session_id in (
+            (None, 'sid'),
+            (tmp_path / 'cfg', None),
+            (None, None),
+        ):
+            caplog.clear()
+            with caplog.at_level(logging.WARNING, logger='shared.cli_invoke'):
+                mock_turns = await self._drive(
+                    tmp_path,
+                    turns_side_effect=lambda *a, **k: None,
+                    required_reads=1,
+                    release_timeout_secs=0.25,
+                    config_dir=config_dir,
+                    session_id=session_id,
+                    startup_grace_secs=0.0,
+                )
+
+            assert mock_turns.call_count == 0, (
+                f'no transcript read is expected for config_dir={config_dir!r} '
+                f'session_id={session_id!r}; got {mock_turns.call_count} calls'
+            )
+            records = _escape_records(caplog)
+            assert not records, (
+                f'must not fire for config_dir={config_dir!r} session_id={session_id!r}; '
+                f'got {[r.getMessage() for r in records]}'
+            )
+
+
+# ── stdin-starvation race (task 3147 / esc-3118-1) ───────────────────────────
+#
+# The confirmed root cause of the pre-turn `CLI_INPUT_REJECTED` burst: the
+# spawn path handed the child a bare PIPE and left the prompt bytes to be
+# written by the EVENT LOOP after `execve`.  The claude CLI gives up on an
+# empty stdin after ~3s and exits on argument validation, so any event-loop
+# stall >= that deadline in the window between exec and the parent's write
+# silently loses the run (turns=0, cost=0, timed_out=False).
+#
+# These tests reproduce that gap deterministically rather than probabilistically
+# (see the module's design note in cli_invoke._materialize_stdin): the failure
+# is not "load" per se, it is ">=3s of wall clock between child exec and the
+# parent's stdin write", so the tests inject exactly that gap.
+
+# The stubs and the loop-starving exec fake live in shared.testing_stdin —
+# ONE definition, importable from either package's suite.  Their stderr is
+# coupled to CLI_INPUT_REQUIRED_MARKERS by an import-time check in that module.
+
+
+@pytest.mark.asyncio
+class TestStdinStarvationRace:
+    """The prompt reaches the child even when the parent's loop stalls after spawn."""
+
+    @pytest.mark.timeout(30)
+    async def test_prompt_delivered_when_event_loop_starved_after_spawn(self, tmp_path):
+        """A 1.0s post-spawn loop stall must not cost the child its prompt.
+
+        RED before task 3147: the payload was written by the loop via
+        ``communicate(input=...)``, so the stalled parent missed the stub's
+        deadline and the child exited on argument validation with empty stdout.
+        """
+        stub = tmp_path / 'stub_cli.py'
+        stub.write_text(STDIN_STARVATION_STUB)
+
+        payload = b'X' * 4242
+
+        with patch(
+            'shared.cli_invoke.asyncio.create_subprocess_exec',
+            side_effect=make_starving_exec(1.0),
+        ):
+            result = await run_cli_subprocess(
+                [sys.executable, str(stub)], tmp_path, env={},
+                backend='claude', model='stub', timeout_seconds=20.0, stdin_data=payload,
+                transcript=TranscriptWatch(),
+            )
+
+        assert result.returncode == 0, (
+            f'stub CLI rejected the invocation; stderr={result.stderr!r}'
+        )
+        # The child received the WHOLE payload, not a truncated prefix.
+        assert result.stdout.strip() == f'GOT:{len(payload)}'
+        # Neither production marker line may appear.
+        assert 'no stdin data received' not in result.stderr
+        assert 'Input must be provided' not in result.stderr
+
+    @pytest.mark.timeout(60)
+    async def test_concurrent_starved_spawns_each_receive_their_own_payload(self, tmp_path):
+        """8 concurrent spawns under ONE starved loop each get their own payload.
+
+        This is the "under load" coverage: genuine concurrency, used to prove
+        payload ISOLATION rather than to trigger the timing race (which the
+        injected loop block already makes deterministic).
+
+        RED against two plausible-but-wrong implementations:
+          * a pre-filled ``os.pipe()`` fix — every payload here exceeds the
+            65536-byte default pipe capacity, so ``os.write`` would block the
+            parent before spawn with no reader attached and deadlock until this
+            test's timeout;
+          * any shared or module-level scratch buffer — the payloads have
+            distinct lengths AND distinct content, and each result is matched
+            back to its own invocation by digest.
+        """
+        stub = tmp_path / 'digest_cli.py'
+        stub.write_text(STDIN_DIGEST_STUB)
+
+        # Distinct length AND distinct fill byte; every one >65536.
+        payloads = [bytes([65 + i]) * (70_000 + i * 1_000) for i in range(8)]
+
+        with patch(
+            'shared.cli_invoke.asyncio.create_subprocess_exec',
+            side_effect=make_starving_exec(0.5),
+        ):
+            results = await asyncio.gather(*[
+                run_cli_subprocess(
+                    [sys.executable, str(stub)], tmp_path, env={},
+                    backend='claude', model=f'stub-{i}', timeout_seconds=40.0, stdin_data=payload,
+                    transcript=TranscriptWatch(),
+                )
+                for i, payload in enumerate(payloads)
+            ])
+
+        for i, (payload, result) in enumerate(zip(payloads, results, strict=True)):
+            expected = f'GOT:{len(payload)}:{hashlib.sha256(payload).hexdigest()[:16]}'
+            assert result.returncode == 0, (
+                f'spawn {i} rejected the invocation; stderr={result.stderr!r}'
+            )
+            assert result.stdout.strip() == expected, (
+                f'spawn {i} received the wrong payload — expected {expected}, '
+                f'got {result.stdout.strip()!r} (cross-wired or truncated)'
+            )
+
+    @pytest.mark.timeout(30)
+    async def test_stdin_survives_govern_and_nice_wrapper_chain(self, tmp_path):
+        """The pre-materialized payload survives the govern → nice → CLI exec chain.
+
+        The cpu-govern wrapper was named as a suspect for the original race and
+        was REFUTED as its cause (it is inert in the live deployment:
+        ``cpu_governance.exec_path`` is unset, so ``_cpu_govern_prefix`` emits
+        nothing).  But it remains a live risk to the FIX: ``cpu-governed-exec.sh``
+        execs ``systemd-run --user --scope``, and an exec chain that re-opened or
+        redirected fd 0 would silently destroy the pre-materialized payload.
+
+        The DF_AGENT_* pop assertions are kept alongside so the govern/nice env
+        contract stays pinned next to the stdin one.
+        """
+        stub = tmp_path / 'stub_cli.py'
+        stub.write_text(STDIN_STARVATION_STUB)
+
+        govern = tmp_path / 'cpu-governed-exec.sh'
+        govern.write_text('#!/bin/sh\n# consume the `--role <role> --` contract, then exec in place\nshift 3\nexec "$@"\n')
+        govern.chmod(0o755)
+
+        payload = b'Z' * 4242
+        captured_args: list = []
+        captured_kwargs: dict = {}
+        starving = make_starving_exec(1.0)
+
+        async def capturing_starving_exec(*args, **kwargs):
+            captured_args.extend(args)
+            captured_kwargs.update(kwargs)
+            return await starving(*args, **kwargs)
+
+        env = {
+            'DF_AGENT_CPU_GOVERN': str(govern),
+            'DF_AGENT_CPU_NICE': '10',
+            # `nice` is resolved by /bin/sh from the child's PATH.
+            'PATH': os.environ.get('PATH', ''),
+        }
+
+        with patch(
+            'shared.cli_invoke.asyncio.create_subprocess_exec',
+            side_effect=capturing_starving_exec,
+        ):
+            result = await run_cli_subprocess(
+                [sys.executable, str(stub)], tmp_path, env=env,
+                backend='claude', model='stub', timeout_seconds=20.0, stdin_data=payload,
+                transcript=TranscriptWatch(),
+            )
+
+        # The wrapper chain really was in play (govern outermost, nice inner).
+        assert captured_args[:7] == [
+            str(govern), '--role', 'task', '--', 'nice', '-n', '10',
+        ], f'expected govern-outermost nice-inner prefix; got {captured_args[:7]}'
+
+        assert result.returncode == 0, (
+            f'stub CLI rejected the invocation through the wrapper chain; '
+            f'stderr={result.stderr!r}'
+        )
+        assert result.stdout.strip() == f'GOT:{len(payload)}'
+        assert 'no stdin data received' not in result.stderr
+
+        # Both DF_* keys stripped from the child env.
+        child_env = captured_kwargs.get('env', {})
+        assert 'DF_AGENT_CPU_GOVERN' not in child_env
+        assert 'DF_AGENT_CPU_NICE' not in child_env
+
+    async def test_none_stdin_data_still_inherits_stdin(self, tmp_path):
+        """stdin_data=None must still spawn with stdin=None (inherited).
+
+        Pins the contract run_cli_subprocess's own docstring states — "``None``
+        leaves stdin inherited from the parent".  Without it, a
+        refactor that unconditionally materialized (handing the child an EMPTY
+        temp file) would hand every stdin_data=None caller instant EOF on fd 0
+        instead of the parent's own stdin, and nothing here would notice:
+        test_proc_tree_populated_on_real_timeout spawns a real `sleep 30`,
+        which neither reads stdin nor cares what it is.
+        """
+        captured_kwargs: dict = {}
+
+        async def fake_exec(*args, **kwargs):
+            captured_kwargs.update(kwargs)
+            proc = MagicMock()
+            proc.communicate = AsyncMock(return_value=(b'', b''))
+            proc.returncode = 0
+            proc.terminate = MagicMock()
+            proc.kill = MagicMock()
+            proc.wait = AsyncMock()
+            return proc
+
+        with patch('shared.cli_invoke.asyncio.create_subprocess_exec', side_effect=fake_exec):
+            await run_cli_subprocess(
+                ['true'], tmp_path, env={},
+                backend='claude', model='stub', timeout_seconds=20.0, stdin_data=None,
+                transcript=TranscriptWatch(),
+            )
+
+        assert 'stdin' in captured_kwargs
+        assert captured_kwargs['stdin'] is None, (
+            f'stdin_data=None must inherit stdin; got {captured_kwargs["stdin"]!r}'
+        )
+
+
+class TestMaterializeStdin:
+    """The helper's two deliberate, load-bearing promises (task 3147).
+
+    Both are asserted in ``_materialize_stdin``'s docstring and neither was
+    otherwise executed by any test, so a refactor could have quietly dropped
+    either one with the whole suite still green.
+    """
+
+    def test_write_failure_propagates_and_closes_the_file(self):
+        """An OSError mid-write escapes, with the fd already closed.
+
+        "Raises rather than falling back to ``stdin=PIPE``" is grounded in the
+        ``no-silent-fail-soft`` design invariant: an ``except OSError: return
+        None`` fallback would reinstate the bare PIPE — and therefore the exact
+        task-3147 race — in precisely the degraded conditions (disk pressure,
+        exhausted fds) where the event loop is most likely to be stalled.
+
+        The fd-leak half is asserted on the REAL file object's ``.closed``
+        rather than by counting ``/proc/self/fd`` entries: it is the same fact,
+        stated directly, and immune to an unrelated fd opened by pytest between
+        the two counts.
+        """
+  # SIM115: the whole point is a handle that outlives the `with` —
+        # it must still be inspectable (`.closed`) after the call under test.
+        real = tempfile.TemporaryFile()  # noqa: SIM115
+        try:
+            proxy = MagicMock(wraps=real)
+            proxy.write.side_effect = OSError(28, 'No space left on device')
+
+            with (
+                patch('shared.cli_invoke.tempfile.TemporaryFile', return_value=proxy),
+                pytest.raises(OSError),
+            ):
+                _materialize_stdin(b'payload')
+
+            proxy.close.assert_called_once()
+            assert real.closed, (
+                '_materialize_stdin leaked the fd on the write-failure path'
+            )
+        finally:
+            if not real.closed:
+                real.close()
+
+    def test_tempfile_creation_failure_propagates(self):
+        """Fd exhaustion at creation raises too — no fallback arm anywhere."""
+        with (
+            patch(
+                'shared.cli_invoke.tempfile.TemporaryFile',
+                side_effect=OSError(24, 'Too many open files'),
+            ),
+            pytest.raises(OSError),
+        ):
+            _materialize_stdin(b'payload')
+
+    def test_child_receives_a_read_only_unlinked_fd(self):
+        """The fd handed to the child is O_RDONLY, unlinked, and at offset 0.
+
+        ``tempfile.TemporaryFile()`` opens ``O_RDWR``, and fd 0 is inherited by
+        the child's whole subtree (bwrap, the systemd-run scope, nice, the CLI,
+        and every tool the agent spawns).  The pipe this replaced gave the child
+        a read-only end, so the narrowing keeps that capability unchanged.
+        """
+        f = _materialize_stdin(b'payload')
+        try:
+            accmode = fcntl.fcntl(f.fileno(), fcntl.F_GETFL) & os.O_ACCMODE
+            assert accmode == os.O_RDONLY, (
+                f'child stdin is writable (accmode={accmode}); the agent subtree '
+                f'can write to its own prompt'
+            )
+            # Still O_TMPFILE-unlinked: no name in the filesystem namespace.
+            assert os.readlink(f'/proc/self/fd/{f.fileno()}').endswith('(deleted)')
+            assert f.tell() == 0
+            assert f.read() == b'payload'
+        finally:
+            f.close()
+
+    def test_read_only_narrowing_is_best_effort(self, caplog):
+        """A failed narrowing degrades to the read-write fd, loudly.
+
+        The narrowing is defense-in-depth; the race-closing invariant (payload
+        resident in the kernel before execve) holds either way.  So a host
+        where ``/proc`` is unavailable must still spawn — it must NOT lose every
+        agent — and it must say so rather than degrade silently.
+        """
+        with (
+            caplog.at_level(logging.WARNING),
+            patch('shared.cli_invoke.open', side_effect=OSError(2, 'No such file')),
+        ):
+            f = _materialize_stdin(b'payload')
+        try:
+            assert f.tell() == 0, 'fallback handle is not rewound'
+            assert f.read() == b'payload', 'fallback handle lost the payload'
+        finally:
+            f.close()
+
+        assert any(
+            'read-only fd' in r.message for r in caplog.records
+        ), f'narrowing was skipped silently; records={[r.message for r in caplog.records]}'
+
+
+# ── Exact model id from the transcript (task 4826) ──────────────────────────
+
+class TestDetectTranscriptModelId:
+    """``detect_transcript_model_id(records)`` — the pure model-id detector.
+
+    Answers "which model actually served this run?" from already-parsed
+    transcript records, so it is unit-testable with no filesystem and can be
+    called from the normal-exit seam that has already read them.
+    """
+
+    def test_reads_the_nested_message_model(self):
+        """The real CLI shape nests it under ``record['message']['model']``."""
+        records = [
+            {'type': 'user', 'message': {'role': 'user'}},
+            {'type': 'assistant', 'message': {'model': 'claude-opus-5'}},
+        ]
+        assert detect_transcript_model_id(records) == 'claude-opus-5'
+
+    def test_reads_the_flat_model(self):
+        """A flat ``record['model']`` is accepted too, mirroring _content_blocks."""
+        records = [{'type': 'assistant', 'model': 'claude-sonnet-5'}]
+        assert detect_transcript_model_id(records) == 'claude-sonnet-5'
+
+    def test_nested_wins_over_flat(self):
+        records = [
+            {
+                'type': 'assistant',
+                'model': 'claude-sonnet-5',
+                'message': {'model': 'claude-opus-5'},
+            },
+        ]
+        assert detect_transcript_model_id(records) == 'claude-opus-5'
+
+    def test_returns_the_last_of_several_differing_ids(self):
+        """A run that fails over or is downgraded mid-flight ends on the model
+        that actually produced the final output — that is the one to attribute."""
+        records = [
+            {'type': 'assistant', 'message': {'model': 'claude-opus-5'}},
+            {'type': 'user', 'message': {'role': 'user'}},
+            {'type': 'assistant', 'message': {'model': 'claude-sonnet-5'}},
+        ]
+        assert detect_transcript_model_id(records) == 'claude-sonnet-5'
+
+    def test_skips_the_synthetic_sentinel(self):
+        """``<synthetic>`` is not a model — the nearest real id is returned."""
+        records = [
+            {'type': 'assistant', 'message': {'model': 'claude-opus-5'}},
+            {'type': 'assistant', 'message': {'model': '<synthetic>'}},
+        ]
+        assert detect_transcript_model_id(records) == 'claude-opus-5'
+
+    def test_synthetic_only_returns_none(self):
+        """The observed stub-transcript shape: no real id was ever served."""
+        records = [
+            {'type': 'assistant', 'message': {'model': '<synthetic>'}},
+            {'type': 'assistant', 'message': {'model': '<synthetic>'}},
+        ]
+        assert detect_transcript_model_id(records) is None
+
+    def test_empty_records_return_none(self):
+        assert detect_transcript_model_id([]) is None
+
+    def test_no_assistant_records_return_none(self):
+        records = [
+            {'type': 'user', 'message': {'model': 'claude-opus-5'}},
+            {'type': 'system', 'model': 'claude-opus-5'},
+        ]
+        assert detect_transcript_model_id(records) is None
+
+    def test_non_dict_record_is_skipped_not_raised(self):
+        records = [
+            'not a dict',
+            None,
+            42,
+            {'type': 'assistant', 'message': {'model': 'claude-opus-5'}},
+        ]
+        assert detect_transcript_model_id(records) == 'claude-opus-5'
+
+    def test_non_string_and_empty_values_are_skipped(self):
+        records = [
+            {'type': 'assistant', 'message': {'model': 'claude-opus-5'}},
+            {'type': 'assistant', 'message': {'model': ''}},
+            {'type': 'assistant', 'message': {'model': 123}},
+            {'type': 'assistant', 'message': {'model': None}},
+        ]
+        assert detect_transcript_model_id(records) == 'claude-opus-5'
+
+    def test_assistant_record_without_a_model_is_skipped(self):
+        records = [
+            {'type': 'assistant', 'message': {'model': 'claude-opus-5'}},
+            {'type': 'assistant', 'message': {'role': 'assistant'}},
+            {'type': 'assistant'},
+        ]
+        assert detect_transcript_model_id(records) == 'claude-opus-5'
+
+
+class TestTranscriptModelIdForSession:
+    """``transcript_model_id_for_session(config_dir, session_id)`` — the wrapper.
+
+    Mirrors ``ended_awaiting_background_for_session``: delegate to
+    ``read_transcript_records``, fail safe to None, never raise.
+    """
+
+    def _write_transcript(self, base: Path, session_id: str, lines: list[str]) -> Path:
+        slug_dir = base / 'projects' / 'myproject'
+        slug_dir.mkdir(parents=True, exist_ok=True)
+        transcript = slug_dir / f'{session_id}.jsonl'
+        transcript.write_text('\n'.join(lines) + '\n')
+        return transcript
+
+    def test_finds_the_id_on_disk(self, tmp_path):
+        sid = 'sess-model-001'
+        self._write_transcript(
+            tmp_path,
+            sid,
+            [
+                json.dumps({'type': 'system', 'content': 'init'}),
+                json.dumps({'type': 'assistant', 'message': {'model': 'claude-opus-5'}}),
+            ],
+        )
+        assert transcript_model_id_for_session(tmp_path, sid) == 'claude-opus-5'
+
+    def test_absent_transcript_returns_none(self, tmp_path):
+        (tmp_path / 'projects' / 'myproject').mkdir(parents=True, exist_ok=True)
+        assert transcript_model_id_for_session(tmp_path, 'sess-absent') is None
+
+    def test_truncated_trailing_line_is_tolerated(self, tmp_path):
+        """A SIGKILL-truncated final line must not lose the id already recorded."""
+        sid = 'sess-model-002'
+        self._write_transcript(
+            tmp_path,
+            sid,
+            [
+                json.dumps({'type': 'assistant', 'message': {'model': 'claude-sonnet-5'}}),
+                '{"type": "assistant", "message": {"model": "claude-op',  # truncated
+            ],
+        )
+        assert transcript_model_id_for_session(tmp_path, sid) == 'claude-sonnet-5'
+
+    def test_transcript_with_no_model_returns_none(self, tmp_path):
+        sid = 'sess-model-003'
+        self._write_transcript(
+            tmp_path,
+            sid,
+            [json.dumps({'type': 'user', 'content': 'hi'})],
+        )
+        assert transcript_model_id_for_session(tmp_path, sid) is None
+
+
+# ── model_id threaded from transcript onto AgentResult (task 4826) ──────────
+
+
+def _write_model_transcript(config_dir: Path, session_id: str, records: list[dict]) -> None:
+    slug_dir = config_dir / 'projects' / 'slug-model'
+    slug_dir.mkdir(parents=True, exist_ok=True)
+    (slug_dir / f'{session_id}.jsonl').write_text(
+        '\n'.join(json.dumps(r) for r in records) + '\n'
+    )
+
+
+def _normal_exit_proc(stdout: bytes = _CLAUDE_VALID_JSON_STDOUT.encode()) -> MagicMock:
+    proc = MagicMock()
+    proc.communicate = AsyncMock(return_value=(stdout, b''))
+    proc.terminate = MagicMock()
+    proc.kill = MagicMock()
+    proc.wait = AsyncMock()
+    proc.returncode = 0
+    proc.pid = 12345
+    return proc
+
+
+def _sigkill_proc() -> MagicMock:
+    proc = MagicMock()
+    proc.communicate = AsyncMock(side_effect=TimeoutError)
+    proc.terminate = MagicMock()
+    proc.kill = MagicMock()
+    proc.wait = AsyncMock()
+    proc.returncode = None
+    proc.pid = 12345
+    return proc
+
+
+# Two assistant turns served by a real model, the second of which launches a
+# background Bash command the CLI confirms and nothing reaps — so ONE transcript
+# yields all three normal-exit signals at once: transcript_turns == 2,
+# ended_awaiting_background is True, model_id == 'claude-opus-5'.
+_MODEL_AND_ABANDONED_LAUNCH_RECORDS = [
+    {'type': 'user', 'message': {'role': 'user', 'content': 'go'}},
+    assistant_record(
+        [{'type': 'text', 'text': 'kick off the long build'}], model='claude-opus-5'
+    ),
+    assistant_record([bash_launch(command='./long-build.sh')], model='claude-opus-5'),
+    bg_launch_result(),
+]
+
+
+class TestModelIdFieldDefaults:
+    def test_subprocess_result_defaults_model_id_none(self):
+        r = SubprocessResult(stdout='', stderr='', returncode=0, duration_ms=10)
+        assert r.model_id is None
+
+    def test_agent_result_defaults_model_id_none(self):
+        r = AgentResult(success=True, output='ok')
+        assert r.model_id is None
+
+
+class TestParseClaudeOutputPropagatesModelId:
+    """``model_id`` reaches AgentResult on EVERY ``parse_claude_output`` branch.
+
+    The empty-output branch matters most: a cap-killed or timed-out run
+    frequently lands there, and that is exactly the run whose served model a
+    saturation analysis needs to attribute.
+    """
+
+    @pytest.mark.parametrize(
+        'stdout,returncode,timed_out',
+        [
+            ('', -15, True),
+            ('not valid json', 1, False),
+            (_CLAUDE_VALID_JSON_STDOUT, 0, False),
+        ],
+        ids=['empty_stdout', 'json_decode_error', 'normal_parse'],
+    )
+    def test_model_id_propagates(self, stdout, returncode, timed_out):
+        sub = SubprocessResult(
+            stdout=stdout, stderr='', returncode=returncode, duration_ms=100,
+            timed_out=timed_out, model_id='claude-sonnet-5',
+        )
+        assert parse_claude_output(sub).model_id == 'claude-sonnet-5'
+
+    @pytest.mark.parametrize(
+        'stdout,returncode',
+        [('', 1), ('not valid json', 1), (_CLAUDE_VALID_JSON_STDOUT, 0)],
+        ids=['empty_stdout', 'json_decode_error', 'normal_parse'],
+    )
+    def test_model_id_defaults_to_none(self, stdout, returncode):
+        sub = SubprocessResult(stdout=stdout, stderr='', returncode=returncode, duration_ms=100)
+        assert parse_claude_output(sub).model_id is None
+
+    def test_model_id_is_not_the_caller_alias(self):
+        """The exact served id is carried verbatim; it is never back-filled
+        from the caller-supplied lineage alias the envelope knows nothing of."""
+        sub = SubprocessResult(
+            stdout=_CLAUDE_VALID_JSON_STDOUT, stderr='', returncode=0, duration_ms=100,
+            model_id='claude-opus-5',
+        )
+        agent = parse_claude_output(sub)
+        assert agent.model_id == 'claude-opus-5'
+        assert agent.model_id != 'opus'
+
+
+@pytest.mark.asyncio
+class TestRunSubprocessStampsModelId:
+    """``run_cli_subprocess`` derives ``model_id`` from the on-disk transcript.
+
+    The normal-exit read count is NOT asserted here: the single-read property
+    for this seam is owned by
+    ``test_cli_invoke_transcript_offloop.py::TestNormalExitReadOffLoop``.
+    """
+
+    async def test_normal_exit_stamps_model_id_alongside_existing_signals(self, tmp_path):
+        sid = str(uuid.uuid4())
+        cfg_dir = tmp_path / 'cfg'
+        _write_model_transcript(cfg_dir, sid, _MODEL_AND_ABANDONED_LAUNCH_RECORDS)
+
+        with patch(
+            'shared.cli_invoke.asyncio.create_subprocess_exec',
+            AsyncMock(return_value=_normal_exit_proc()),
+        ):
+            result = await run_cli_subprocess(
+                ['fake'], cwd=tmp_path, env={},
+                backend='claude', model='opus', timeout_seconds=5.0,
+                transcript=TranscriptWatch(session_id=sid, config_dir=cfg_dir),
+            )
+
+        assert result.timed_out is False
+        assert result.model_id == 'claude-opus-5'
+        assert result.transcript_turns == 2
+        assert result.ended_awaiting_background is True
+
+    async def test_normal_exit_model_id_none_without_config_dir(self, tmp_path):
+        with patch(
+            'shared.cli_invoke.asyncio.create_subprocess_exec',
+            AsyncMock(return_value=_normal_exit_proc()),
+        ):
+            result = await run_cli_subprocess(
+                ['fake'], cwd=tmp_path, env={},
+                backend='claude', model='opus', timeout_seconds=5.0,
+                transcript=TranscriptWatch(session_id=str(uuid.uuid4()), config_dir=None),
+            )
+
+        assert result.model_id is None
+        assert result.transcript_turns is None
+        assert result.ended_awaiting_background is False
+
+    async def test_normal_exit_model_id_none_without_session_id(self, tmp_path):
+        cfg_dir = tmp_path / 'cfg'
+        cfg_dir.mkdir()
+        with patch(
+            'shared.cli_invoke.asyncio.create_subprocess_exec',
+            AsyncMock(return_value=_normal_exit_proc()),
+        ):
+            result = await run_cli_subprocess(
+                ['fake'], cwd=tmp_path, env={},
+                backend='claude', model='opus', timeout_seconds=5.0,
+                transcript=TranscriptWatch(session_id=None, config_dir=cfg_dir),
+            )
+
+        assert result.model_id is None
+        assert result.transcript_turns is None
+        assert result.ended_awaiting_background is False
+
+    async def test_normal_exit_model_id_none_when_transcript_missing(self, tmp_path):
+        cfg_dir = tmp_path / 'cfg'
+        (cfg_dir / 'projects' / 'slug-model').mkdir(parents=True)
+        with patch(
+            'shared.cli_invoke.asyncio.create_subprocess_exec',
+            AsyncMock(return_value=_normal_exit_proc()),
+        ):
+            result = await run_cli_subprocess(
+                ['fake'], cwd=tmp_path, env={},
+                backend='claude', model='opus', timeout_seconds=5.0,
+                transcript=TranscriptWatch(session_id=str(uuid.uuid4()), config_dir=cfg_dir),
+            )
+
+        assert result.model_id is None
+        assert result.transcript_turns is None
+        assert result.ended_awaiting_background is False
+
+    async def test_normal_exit_model_id_none_when_transcript_has_no_model(self, tmp_path):
+        """A transcript with turns but no model field leaves model_id None
+        while transcript_turns is still counted."""
+        sid = str(uuid.uuid4())
+        cfg_dir = tmp_path / 'cfg'
+        _write_model_transcript(
+            cfg_dir, sid,
+            [{'type': 'assistant', 'content': 'turn 1'}, {'type': 'assistant', 'content': 'turn 2'}],
+        )
+        with patch(
+            'shared.cli_invoke.asyncio.create_subprocess_exec',
+            AsyncMock(return_value=_normal_exit_proc()),
+        ):
+            result = await run_cli_subprocess(
+                ['fake'], cwd=tmp_path, env={},
+                backend='claude', model='opus', timeout_seconds=5.0,
+                transcript=TranscriptWatch(session_id=sid, config_dir=cfg_dir),
+            )
+
+        assert result.model_id is None
+        assert result.transcript_turns == 2
+        assert result.ended_awaiting_background is False
+
+    async def test_timeout_path_stamps_model_id_without_disturbing_turns(self, tmp_path):
+        sid = str(uuid.uuid4())
+        cfg_dir = tmp_path / 'cfg'
+        _write_model_transcript(
+            cfg_dir, sid,
+            [
+                {'type': 'system', 'content': 'init'},
+                {'type': 'assistant', 'message': {'model': 'claude-sonnet-5'}},
+                {'type': 'user', 'content': 'reply'},
+                {'type': 'assistant', 'message': {'model': 'claude-sonnet-5'}},
+                {'type': 'assistant', 'message': {'model': '<synthetic>'}},
+            ],
+        )
+
+        with (
+            patch(
+                'shared.cli_invoke.asyncio.create_subprocess_exec',
+                AsyncMock(return_value=_sigkill_proc()),
+            ),
+            patch('shared.cli_invoke.terminate_process_group', new_callable=AsyncMock),
+        ):
+            result = await run_cli_subprocess(
+                ['fake'], cwd=tmp_path, env={},
+                backend='claude', model='opus', timeout_seconds=0.1,
+                transcript=TranscriptWatch(session_id=sid, config_dir=cfg_dir),
+            )
+
+        assert result.timed_out is True
+        assert result.model_id == 'claude-sonnet-5'
+        assert result.transcript_turns == 3
+
+    async def test_timeout_path_model_id_none_without_session_id(self, tmp_path):
+        with (
+            patch(
+                'shared.cli_invoke.asyncio.create_subprocess_exec',
+                AsyncMock(return_value=_sigkill_proc()),
+            ),
+            patch('shared.cli_invoke.terminate_process_group', new_callable=AsyncMock),
+        ):
+            result = await run_cli_subprocess(
+                ['fake'], cwd=tmp_path, env={},
+                backend='claude', model='opus', timeout_seconds=0.1,
+                transcript=TranscriptWatch(session_id=None, config_dir=tmp_path),
+            )
+
+        assert result.timed_out is True
+        assert result.model_id is None
+        assert result.transcript_turns is None
+
+    async def test_model_id_survives_parse_on_timeout_path(self, tmp_path):
+        """End-to-end: a SIGKILLed run lands on the empty-output parse branch
+        and still carries the served model id to AgentResult."""
+        sid = str(uuid.uuid4())
+        cfg_dir = tmp_path / 'cfg'
+        _write_model_transcript(
+            cfg_dir, sid, [{'type': 'assistant', 'message': {'model': 'claude-opus-5'}}],
+        )
+
+        with (
+            patch(
+                'shared.cli_invoke.asyncio.create_subprocess_exec',
+                AsyncMock(return_value=_sigkill_proc()),
+            ),
+            patch('shared.cli_invoke.terminate_process_group', new_callable=AsyncMock),
+        ):
+            sub = await run_cli_subprocess(
+                ['fake'], cwd=tmp_path, env={},
+                backend='claude', model='opus', timeout_seconds=0.1,
+                transcript=TranscriptWatch(session_id=sid, config_dir=cfg_dir),
+            )
+
+        agent = parse_claude_output(sub)
+        assert agent.subtype == 'error_timeout_killed_with_progress'
+        assert agent.model_id == 'claude-opus-5'
+
+
+# ── classify_cap_kill: was this run ended by a configured ceiling? (task 4826) ─
+
+
+def _cap_result(**overrides: Any) -> AgentResult:
+    fields: dict[str, Any] = {'success': False, 'output': ''}
+    fields.update(overrides)
+    return AgentResult(**fields)
+
+
+class TestClassifyCapKill:
+    """``classify_cap_kill(result, *, budget_usd, max_turns, backend)`` names
+    which configured ceiling ended a run — ``'budget'`` | ``'turns'`` — or None.
+
+    The CLI subtype is authoritative; the numeric comparison is only a
+    fallback for a FAILED claude run whose subtype is inconclusive.
+    """
+
+    @pytest.mark.parametrize(
+        'subtype,expected',
+        [('error_max_budget_usd', CapReason.BUDGET), ('error_max_turns', CapReason.TURNS)],
+    )
+    def test_returns_the_cap_reason_vocabulary(self, subtype, expected):
+        reason = classify_cap_kill(_cap_result(subtype=subtype), budget_usd=5.0, max_turns=50)
+        assert reason is expected
+
+    @pytest.mark.parametrize('backend', ['codex', 'gemini', 'pi'])
+    def test_non_claude_failed_run_past_both_ceilings_is_not_a_cap_kill(self, backend):
+        """codex/gemini/pi enforce neither ceiling, so no ceiling ended a run of
+        theirs however far its (estimated) cost or turn count went past one."""
+        result = _cap_result(subtype='', cost_usd=9.0, turns=80)
+        assert classify_cap_kill(result, budget_usd=5.0, max_turns=50, backend=backend) is None
+
+    def test_claude_is_the_default_backend(self):
+        result = _cap_result(subtype='', cost_usd=9.0, turns=3)
+        assert classify_cap_kill(result, budget_usd=5.0, max_turns=50) == CapReason.BUDGET
+
+    def test_budget_subtype_is_budget(self):
+        result = _cap_result(subtype='error_max_budget_usd', cost_usd=5.01)
+        assert classify_cap_kill(result, budget_usd=5.0, max_turns=100) == 'budget'
+
+    def test_turns_subtype_is_turns(self):
+        result = _cap_result(subtype='error_max_turns', turns=100)
+        assert classify_cap_kill(result, budget_usd=5.0, max_turns=100) == 'turns'
+
+    def test_budget_subtype_holds_with_no_ceilings_known(self):
+        result = _cap_result(subtype='error_max_budget_usd')
+        assert classify_cap_kill(result, budget_usd=None, max_turns=None) == 'budget'
+
+    def test_turns_subtype_holds_with_no_ceilings_known(self):
+        result = _cap_result(subtype='error_max_turns')
+        assert classify_cap_kill(result, budget_usd=None, max_turns=None) == 'turns'
+
+    def test_budget_subtype_outranks_contradicting_arithmetic(self):
+        """Cost far under the budget and turns AT the turn ceiling: the
+        subtype still says budget, and the subtype wins."""
+        result = _cap_result(subtype='error_max_budget_usd', cost_usd=0.10, turns=50)
+        assert classify_cap_kill(result, budget_usd=5.0, max_turns=50) == 'budget'
+
+    def test_turns_subtype_outranks_contradicting_arithmetic(self):
+        """Cost OVER the budget, which the fallback would call 'budget': the
+        subtype says turns, and the subtype wins."""
+        result = _cap_result(subtype='error_max_turns', cost_usd=9.0, turns=3)
+        assert classify_cap_kill(result, budget_usd=5.0, max_turns=50) == 'turns'
+
+    def test_turns_subtype_counts_even_when_schema_salvaged(self):
+        """A schema-salvaged run is reported success=True, but the CLI still
+        ended it at the turn ceiling — the subtype is not gated on success."""
+        result = _cap_result(
+            success=True, subtype='error_max_turns', schema_salvaged=True, turns=50,
+        )
+        assert classify_cap_kill(result, budget_usd=5.0, max_turns=50) == 'turns'
+
+    def test_successful_run_at_both_ceilings_is_not_a_cap_kill(self):
+        """The false-positive guard: a healthy run that spends its full budget
+        and uses every turn finished on its own terms."""
+        result = _cap_result(success=True, subtype='success', cost_usd=5.0, turns=50)
+        assert classify_cap_kill(result, budget_usd=5.0, max_turns=50) is None
+
+    def test_successful_run_over_both_ceilings_is_not_a_cap_kill(self):
+        result = _cap_result(success=True, subtype='success', cost_usd=7.5, turns=80)
+        assert classify_cap_kill(result, budget_usd=5.0, max_turns=50) is None
+
+    def test_plain_failure_under_ceilings_is_not_a_cap_kill(self):
+        result = _cap_result(subtype='error_during_execution', cost_usd=0.4, turns=3)
+        assert classify_cap_kill(result, budget_usd=5.0, max_turns=50) is None
+
+    def test_failed_run_over_budget_with_inconclusive_subtype_is_budget(self):
+        result = _cap_result(subtype='error_during_execution', cost_usd=5.2, turns=3)
+        assert classify_cap_kill(result, budget_usd=5.0, max_turns=50) == 'budget'
+
+    def test_failed_run_over_turns_with_inconclusive_subtype_is_turns(self):
+        result = _cap_result(subtype='', cost_usd=0.4, turns=51)
+        assert classify_cap_kill(result, budget_usd=5.0, max_turns=50) == 'turns'
+
+    def test_budget_wins_when_both_fallbacks_fire(self):
+        """Documented precedence: when a failed run is over BOTH ceilings with
+        an inconclusive subtype, the budget ceiling is reported."""
+        result = _cap_result(subtype='error_during_execution', cost_usd=6.0, turns=60)
+        assert classify_cap_kill(result, budget_usd=5.0, max_turns=50) == 'budget'
+
+    def test_exact_budget_equality_is_a_hit(self):
+        result = _cap_result(subtype='error_during_execution', cost_usd=5.0, turns=3)
+        assert classify_cap_kill(result, budget_usd=5.0, max_turns=50) == 'budget'
+
+    def test_exact_turns_equality_is_a_hit(self):
+        result = _cap_result(subtype='error_during_execution', cost_usd=0.4, turns=50)
+        assert classify_cap_kill(result, budget_usd=5.0, max_turns=50) == 'turns'
+
+    def test_none_budget_disables_the_budget_fallback(self):
+        result = _cap_result(subtype='error_during_execution', cost_usd=1_000.0, turns=3)
+        assert classify_cap_kill(result, budget_usd=None, max_turns=50) is None
+
+    def test_none_budget_falls_through_to_the_turns_fallback(self):
+        result = _cap_result(subtype='error_during_execution', cost_usd=1_000.0, turns=50)
+        assert classify_cap_kill(result, budget_usd=None, max_turns=50) == 'turns'
+
+    def test_none_max_turns_disables_the_turns_fallback(self):
+        result = _cap_result(subtype='error_during_execution', cost_usd=0.4, turns=10_000)
+        assert classify_cap_kill(result, budget_usd=5.0, max_turns=None) is None
+
+    def test_both_ceilings_none_never_raises(self):
+        result = _cap_result(subtype='error_during_execution', cost_usd=1_000.0, turns=10_000)
+        assert classify_cap_kill(result, budget_usd=None, max_turns=None) is None

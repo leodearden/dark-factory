@@ -1,110 +1,118 @@
-"""Write-time containment tripwire for leaked MCP envelope markup (task 3141).
+"""Escalation filers for leaked MCP envelope markup (tasks 3141, 4458).
 
 A recurring harness serialization bug leaks raw MCP envelope fragments — the
 closing/opening tags of the tool-call wire format — into the *payload* of
 fused-memory writes. Two observed vectors: memory ``content`` arriving with a
-``</content>``/``</invoke>`` tail (permanent specimens now sitting in the mem0
-and Graphiti corpora), and task text arriving with a ``<parameter name=``
+``\x3c/content>``/``\x3c/invoke>`` tail (permanent specimens now sitting in the mem0
+and Graphiti corpora), and task text arriving with a ``\x3cparameter name=``
 fragment that the interceptor's description parser then mis-parses *silently*
-(reify task 3210 was filed ``priority=high`` and stored as ``medium``).
+(reify task 3210 was filed ``priority=high`` and stored as ``medium``). See the
+"Sentinel-literal hazard" section of ``shared/src/shared/toolcall_markup.py``
+— the owner of this escaping convention — for why.
 
-This module is the CONTAINMENT half of that story (PRD
-``docs/prds/memory-write-path-convergence.md`` §9 leaf ο, contract C3): it
-REJECTS such a write at the boundary, loudly and with the matched pattern
-named, so no further specimen enters the corpus and no parser gets the chance
-to derive a wrong value from the fragment. Root cause, the Qdrant payload
-text-match read tool, and the retroactive corpus sweep belong to **DF task
-3083** and are deliberately out of scope here.
+WHAT THIS MODULE IS NOW
+-----------------------
+Task 3141 put the containment in a WRITE-TIME tripwire: a pattern matcher
+(``find_markup_pattern`` / ``find_markup_violation``), a rejection-block builder
+(``build_markup_block``) and a burst counter (``MarkupStormCounter``), called
+from a ``_markup_gate`` closure at four tool bodies in ``server/tools.py``.
 
-:data:`MCP_MARKUP_PATTERNS` is the SINGLE write-time pattern list (INV-5) —
-every one of the four MCP write boundaries (``add_memory``, ``add_episode``,
-``submit_task``, ``update_task``) rejects against exactly this tuple, and
-nothing else in the package enumerates these literals.
+Task 4458 moved the containment to the DISPATCH BOUNDARY
+(:mod:`fused_memory.server.markup_guard`, wrapping ``ToolManager.call_tool``
+with the shared :class:`shared.mcp_markup_middleware.MarkupGuardMiddleware`),
+which covers every tool rather than four, and repairs a swallowed parameter
+before pydantic ever sees the call. The four in-line gates were retired, and
+those four symbols went with them: keeping a second, fully working markup
+mechanism alive behind its own tests is precisely the standing invitation to
+re-introduce a duplicate implementation that INV-5 forbids. Their behavioural
+coverage now lives in ``tests/server/test_markup_tripwire_gate.py``, which pins
+that an UNGUARDED server no longer refuses a leaked write while a guarded one
+does.
 
-Calibration vs. the retrospective scanner
------------------------------------------
-``scripts/scan_task_toolcall_leaks.py`` (task 2939) detects the *same* leak
-retrospectively, but with a deliberately DIFFERENT and much narrower matcher
-(its ``LEAK_TAIL`` regex — see that module's docstring for the discriminator
-and the evidence behind it; it is not restated here). The two are calibrated in
-opposite directions on purpose, because the cost of each error mode is
-inverted:
+What remains here is what the boundary guard's escalation sink CALLS, plus the
+re-exports ``server/tools.py`` still imports:
 
-* There, a false positive sends a human off to inspect a task that never
-  leaked, so precision is bought with a discriminated regex.
-* Here, a false positive is a *recoverable* rejection that carries its own
-  remediation and an explicit override (``metadata={'allow_mcp_markup': True}``)
-  — one retry clears it. A false NEGATIVE, by contrast, is another permanent
-  corpus specimen that DF 3083 has to hunt down by eye.
+* :func:`emit_markup_storm_escalation` — one deduped record per burst (INV-4).
+* :func:`emit_markup_residue_escalation` — one record per residue record of
+  either kind, deliberately NOT deduped, holding that caller's payload
+  verbatim (INV-7).
+* ``_MARKUP_STORM_THRESHOLD`` / ``_MARKUP_STORM_WINDOW_SECONDS`` — the ONE
+  source for the tuning, read by the guard when it builds the middleware.
+* ``MARKUP_OVERRIDE_KEY``, ``markup_override_requested``,
+  ``strip_markup_override``, ``MCP_MARKUP_PATTERNS`` — RE-EXPORTS from
+  :mod:`shared.toolcall_markup`, which OWNS the literal enumeration and the
+  override lifecycle (INV-5, task 3688/3689). Nothing in this package spells
+  those literals, and the write-time/read-time predicate calibration is
+  documented there rather than restated here.
 
-So this write-time check matches bare, case-sensitive literal substrings and
-accepts the resulting over-reporting. If you are tempted to "fix" one of the
-two pattern sets to match the other: don't — they are answering different
-questions.
-
-Structure mirrors the sibling :mod:`fused_memory.server.near_duplicate_guard`:
-module-level constants plus pure synchronous functions that do no I/O and never
-raise on empty/``None`` input, so callers can hand raw handler arguments
-straight through.
+Root cause, the Qdrant payload text-match read tool, and the retroactive corpus
+sweep belong to **DF task 3083**, which is DONE and CLOSED to appends — report
+a recurrence against its successor ``plans/toolcall-markup-containment-prd.md``.
 """
 
 from __future__ import annotations
 
-import json
+import ast
 import logging
-import time
-from collections import deque
-from collections.abc import Callable, Mapping
-from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
-if TYPE_CHECKING:
-    from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
+from shared.markup_residue_custody import residue_prose
+from shared.mcp_markup_middleware import (
+    MARKUP_RECURRENCE_ROUTING,
+    residue_header_lines,
+)
 
-# Defensive import of the optional ``escalation`` workspace package, mirroring
-# middleware/candidate_key_escalation.py: when it is missing (minimal CI envs,
-# deployments that have not installed it) the storm escalation becomes a logged
-# no-op. This module sits on the MCP write path, so it must never make a write
-# fail — the rejection is already decided by the time escalation is attempted.
-try:
-    from escalation.models import Escalation  # type: ignore[import-untyped]
-    from escalation.queue import EscalationQueue  # type: ignore[import-untyped,no-redef]
-    HAS_ESCALATION = True
-except ImportError:  # pragma: no cover — exercised only in minimal envs
-    HAS_ESCALATION = False
+# markup_override_requested / strip_markup_override are RE-EXPORTS, not local
+# callers: server/tools.py imports both from this module (the write-path guards
+# call them, this module only defines the flag they key on). The noqa is the
+# re-export marker — deleting either import as "unused" would break tools.py.
+from shared.toolcall_markup import (  # noqa: F401
+    MARKUP_OVERRIDE_KEY,
+    MCP_MARKUP_PATTERNS,
+    markup_override_requested,
+    strip_markup_override,
+)
+
+from fused_memory.middleware._folded_escalation import file_folded_escalation
 
 logger = logging.getLogger(__name__)
 
-# Raw MCP envelope fragments that must never appear inside a write payload.
+# MCP_MARKUP_PATTERNS — imported above, NOT spelled here.
 #
-# Matched as bare, CASE-SENSITIVE substrings (see the module docstring for why
-# this deliberately over-reports relative to scripts/scan_task_toolcall_leaks.py).
-# This is the single write-time source of truth (INV-5); the same-file drift
-# guard in tests/server/test_markup_tripwire.py must be updated alongside it.
-MCP_MARKUP_PATTERNS: tuple[str, ...] = ('</content>', '<parameter name=', '</invoke>')
+# The enumeration is owned by shared.toolcall_markup (INV-5). It used to be
+# written out in this module while the read-time prefilter list was written out
+# in fused_memory/utils/toolcall_xml_leak.py, each documented as the single
+# source of truth; they drifted, which is the defect task 3688 repairs.
+#
+# The matcher OVER it (find_markup_pattern / find_markup_violation) was deleted
+# in task 4458 with the write-time gate it served; shared.toolcall_markup.detect
+# is the live generalisation, and it is what the boundary guard calls. The
+# constant stays re-exported here for the same-file drift guard in
+# tests/server/test_markup_tripwire.py, which pins its value and order from this
+# import site.
 
-# Write-time-only control flag that bypasses the tripwire for markup a caller is
-# quoting DELIBERATELY (DF 3083's own task description quotes all three literals
-# in prose, so without this the very sibling this leaf exists to feed could not
-# be updated). Only a literal boolean ``True`` enables it, and it is stripped
-# from metadata before persistence at every boundary — mirroring the established
-# ``allow_near_duplicate`` lifecycle in ``server/tools.py``. An accidental
-# harness serialization leak never sets an explicit flag; an author can.
-MARKUP_OVERRIDE_KEY = 'allow_mcp_markup'
-
-# Surfaced in the rejection dict, the four tool docstrings and
-# FUSED_MEMORY_INSTRUCTIONS so the remediation and the escalation pointer are
-# discoverable at the point of rejection, not just in documentation the writer
-# may never have read (mirrors near_duplicate_guard._NEAR_DUPLICATE_HINT).
-_MARKUP_HINT = (
-    'This write carries raw MCP envelope markup (see matched_pattern/field), '
-    'which indicates the caller serialized part of its own tool-call envelope '
-    'into the payload. Strip the leaked envelope fragment and resubmit. Do NOT '
-    'work around this by rewording the payload around the fragment: DF task '
-    '3083 owns the root cause and the retroactive corpus sweep, so report a '
-    'recurrence there. If the markup is quoted deliberately (e.g. documenting '
-    "the leak itself), override with metadata={'" + MARKUP_OVERRIDE_KEY + "': True}."
-)
+# MARKUP_OVERRIDE_KEY, markup_override_requested, strip_markup_override —
+# imported above, NOT defined here.
+#
+# The enumeration moved to shared.toolcall_markup under task 3688; task 3689
+# moved its OVERRIDE LIFECYCLE after it, for the same reason — the middleware
+# sits in the base layer, which may not import fused_memory, and a second
+# implementation of "is this deliberate?" is exactly the lockstep-duplication
+# defect (INV-5) the enumeration move repaired.
+#
+# Since task 4458 there is only ONE guard that bounces a caller for envelope
+# markup (shared.mcp_markup_middleware, at the dispatch boundary), and it is
+# what honours the override. server/tools.py still imports strip_markup_override
+# from HERE, because the middleware forwards the flag UNCHANGED to any tool
+# declaring `metadata`: the tool body remains the party that keeps a write-time
+# control flag out of the corpus.
+#
+# What none of that changed: the semantics are byte-for-byte the ones this
+# module has always had — fail-closed on a literal boolean True only,
+# dict-or-JSON-string tolerant, never raising, and stripped NON-mutatingly in
+# the caller's own shape before dispatch.
+# shared/tests/test_toolcall_markup_override.py pins both the semantics and
+# this re-export.
 
 # Storm thresholds are plain module constants rather than FusedMemoryConfig
 # fields, following the _PLACEHOLDER_DROP_STORM_* precedent (harness.py:200-215):
@@ -113,282 +121,131 @@ _MARKUP_HINT = (
 _MARKUP_STORM_THRESHOLD = 3
 _MARKUP_STORM_WINDOW_SECONDS = 3600.0
 
-# Fired only on a BURST. The wording matters: the alarm-worthy conclusion is
-# that the upstream serialization leak is ACTIVE, not that this tripwire has
-# started misfiring — an operator who reads it the second way would disable the
-# containment and let specimens back into the corpus.
-_MARKUP_STORM_HINT = (
-    'Multiple MCP-envelope-markup writes were rejected in a short window: the '
-    'upstream serialization leak is ACTIVE right now. This is not a sign the '
-    'tripwire is misfiring — do NOT disable it. DF task 3083 owns the root '
-    'cause and the retroactive corpus sweep; attach the offending agent_id, '
-    'field and matched_pattern there.'
-)
-
-# Escalation wiring, copied shape-for-shape from
-# middleware/candidate_key_escalation.py. _ANCHOR_TASK_ID is a stable per-project
-# anchor (not a real task id) so the resulting ids form one greppable
-# ``esc-markup-tripwire-N`` series and the dedup check has something to key on.
-_QUEUE_DIRNAME: str = 'data/escalations'
+# Escalation wiring. _ANCHOR_TASK_ID is a stable per-project anchor (not a real
+# task id) so the resulting ids form one greppable ``esc-markup-tripwire-N``
+# series and the dedup check has something to key on. Anchors must be unique
+# across filers — see the ``middleware/_folded_escalation`` module docstring.
 _ANCHOR_TASK_ID: str = 'markup-tripwire'
 _AGENT_ROLE: str = 'fused-memory/markup-tripwire'
 _CATEGORY: str = 'mcp_markup_write_storm'
 
+# RESIDUE wiring — a different record KIND on the same queue, so it gets its own
+# anchor (an ``esc-markup-residue-N`` series) rather than sharing either the
+# tripwire's or the boundary guard's storm anchor. A storm record summarises a
+# burst and is deduped; a residue record HOLDS a caller's payload and is not.
+# The category/level/summary/suggested_action are the middleware's OWN
+# (``_ESCALATION_CATEGORY`` = 'mcp_markup_residue', ``_ESCALATION_OWNER`` =
+# 'l2-escalation-watcher', ``_ESCALATION_LEVEL`` = 2), read off the record rather
+# than re-authored here; these are fallbacks for a record that omits them.
+# The detail's outcome line, spelled ONCE: `emit_markup_storm_escalation`
+# writes it and `_recorded_outcome` reads it back off an already-open record to
+# tell an operator when a burst folded into a record naming a different
+# outcome. Two spellings would make that comparison silently always-differ.
+_DETAIL_OUTCOME_KEY: str = 'outcome='
 
-def find_markup_pattern(text: object) -> str | None:
-    """Return the first :data:`MCP_MARKUP_PATTERNS` literal occurring in *text*.
+_RESIDUE_ANCHOR_TASK_ID: str = 'markup-residue'
+_RESIDUE_AGENT_ROLE: str = 'fused-memory/markup-guard'
+_RESIDUE_CATEGORY: str = 'mcp_markup_residue'
+_RESIDUE_LEVEL: int = 2
 
-    "First" is by POSITION IN THE TEXT, not by position in the pattern tuple:
-    when several patterns are present the earliest one is reported, so the
-    caller is told where the leaked envelope actually starts rather than
-    whichever literal happens to be listed first.
 
-    Matching is case-sensitive — the harness emits lowercase tags, and
-    case-folding would only widen the guard onto prose that shouts a tag name.
+def _recorded_outcome(escalation: Any) -> str | None:
+    """The outcome an ALREADY-OPEN storm record was filed with, or ``None``.
 
-    Pure and synchronous. *text* is expected to be a handler argument's value
-    (``str``) but anything else — ``None``, an absent optional field, a dict —
-    returns ``None`` without raising, so call sites need no pre-validation.
+    Read back off that record's own ``outcome=`` detail line — the very line
+    :func:`emit_markup_storm_escalation` writes — because the anchor dedup is
+    outcome-AGNOSTIC and an operator has to be told when a burst folded into a
+    record that names a different outcome.
+
+    ``None`` for a record that names none, which covers both a degenerate storm
+    and a record filed by another producer squatting the shared anchor. NEVER
+    raises: it feeds a log line on a path whose only job is to return an id.
     """
-    if not text or not isinstance(text, str):
+    detail = getattr(escalation, 'detail', None)
+    if not isinstance(detail, str):
         return None
-    best_index = -1
-    best_pattern: str | None = None
-    for pattern in MCP_MARKUP_PATTERNS:
-        index = text.find(pattern)
-        if index == -1:
+    for line in detail.splitlines():
+        if not line.startswith(_DETAIL_OUTCOME_KEY):
             continue
-        if best_index == -1 or index < best_index:
-            best_index = index
-            best_pattern = pattern
-    return best_pattern
-
-
-def find_markup_violation(fields: Mapping[str, object]) -> tuple[str, str] | None:
-    """Return ``(field_name, matched_pattern)`` for the first violating field.
-
-    *fields* maps a caller-facing field name (``'content'``, ``'description'``,
-    …) to its raw value. Fields are checked in dict INSERTION ORDER, so a call
-    site controls which field is named when several are dirty. Returns ``None``
-    when every field is clean, empty, ``None`` or non-``str``.
-
-    Typed ``Mapping[str, object]`` rather than ``dict[str, object]``: this
-    function only READS the map, and ``dict`` is invariant in its value type, so
-    a ``dict`` annotation would reject an ordinary homogeneous call site such as
-    ``{'title': a, 'description': b}`` (inferred ``dict[str, str]``). ``Mapping``
-    is covariant in the value type and accepts every dict a caller can build.
-
-    Pure and synchronous; never raises (an empty map is simply not a violation).
-    """
-    for field_name, value in fields.items():
-        pattern = find_markup_pattern(value)
-        if pattern is not None:
-            return field_name, pattern
-    return None
-
-
-def _as_metadata_dict(metadata: object) -> dict[str, Any] | None:
-    """Best-effort read of *metadata* as a dict, else ``None``.
-
-    ``submit_task``/``update_task`` accept metadata as an object OR a JSON
-    string, so both shapes are understood. Anything unparseable — malformed
-    JSON, a non-dict JSON payload, a wrong type entirely — yields ``None``
-    without raising: validating metadata is not this module's job, and a write
-    must never fail because the override helper choked on a field it does not
-    own.
-    """
-    if isinstance(metadata, dict):
-        return metadata
-    if isinstance(metadata, str):
         try:
-            parsed = json.loads(metadata)
-        except (ValueError, TypeError):
+            value = ast.literal_eval(line[len(_DETAIL_OUTCOME_KEY):].strip())
+        except (ValueError, SyntaxError):
             return None
-        if isinstance(parsed, dict):
-            return parsed
+        return value if isinstance(value, str) and value else None
     return None
-
-
-def markup_override_requested(metadata: object) -> bool:
-    """Return True iff *metadata* carries an explicit :data:`MARKUP_OVERRIDE_KEY` opt-in.
-
-    Fail-closed: ONLY a literal boolean ``True`` counts, mirroring add_memory's
-    ``metadata.get('allow_near_duplicate') is True`` check (``tools.py``:1199).
-    A truthy-but-not-``True`` value (``'yes'``, ``1``) is far more likely to be
-    unrelated data than a considered decision to write raw MCP envelope markup
-    into the corpus — and the failure mode being contained, an accidental
-    serialization leak, never sets an explicit flag at all.
-
-    Never raises, for any input.
-    """
-    parsed = _as_metadata_dict(metadata)
-    if parsed is None:
-        return False
-    return parsed.get(MARKUP_OVERRIDE_KEY) is True
-
-
-def strip_markup_override(metadata: Any) -> Any:
-    """Return *metadata* without :data:`MARKUP_OVERRIDE_KEY`, in the same shape.
-
-    The override is a write-time-only control flag: it must never be persisted
-    into stored memory metadata or the task metadata vocabulary. Returning the
-    shape it was given (dict in / dict out, JSON string in / JSON string out)
-    lets a call site substitute the result inline before forwarding downstream.
-
-    NON-mutating — the caller's own dict is left intact, since the handler may
-    still need the original and quietly mutating caller-owned metadata is
-    action-at-a-distance this guard should not introduce. (This is the one
-    deliberate divergence from ``allow_near_duplicate``'s in-place
-    ``cleaned_meta.pop`` at ``tools.py``:1266, which operates on a dict it has
-    already copied.)
-
-    Unparseable input passes straight through unchanged, never raising.
-    """
-    if isinstance(metadata, dict):
-        if MARKUP_OVERRIDE_KEY not in metadata:
-            return metadata
-        return {k: v for k, v in metadata.items() if k != MARKUP_OVERRIDE_KEY}
-    if isinstance(metadata, str):
-        parsed = _as_metadata_dict(metadata)
-        if parsed is None or MARKUP_OVERRIDE_KEY not in parsed:
-            return metadata
-        return json.dumps({k: v for k, v in parsed.items() if k != MARKUP_OVERRIDE_KEY})
-    return metadata
-
-
-def build_markup_block(
-    agent_id: str | None,
-    field: str,
-    pattern: str,
-    text: str,
-    *,
-    storm: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    """Build the structured rejection dict returned by the four write tools.
-
-    Mirrors :func:`near_duplicate_guard.build_near_duplicate_block`'s flat
-    ``error``/``error_type``/``agent_id``/``content_excerpt``/``hint`` shape so
-    both guards' agent-facing diagnostics stay uniform, and adds *field* and
-    *matched_pattern* — the write has already been refused, so this dict is the
-    only machine-readable account of WHICH pattern tripped and WHERE (INV-1).
-
-    *storm* is folded in only when a rejection burst actually fired: the
-    ``'storm'`` key is OMITTED entirely otherwise, rather than set to ``None``, so
-    its presence is an unambiguous signal (INV-4).
-    """
-    block: dict[str, Any] = {
-        'error': 'mcp_markup_write_blocked',
-        'error_type': 'McpEnvelopeMarkupWriteRejected',
-        'agent_id': agent_id,
-        'field': field,
-        'matched_pattern': pattern,
-        'content_excerpt': text[:200],
-        'hint': _MARKUP_HINT,
-    }
-    if storm is not None:
-        block['storm'] = storm
-    return block
-
-
-class MarkupStormCounter:
-    """Rolling-window burst detector over markup rejections (INV-4).
-
-    One bounced write is routine; a BURST means the upstream serialization leak
-    is actively running, which is the condition worth escalating rather than
-    merely logging. Reproduces the established storm-counter body from
-    ``reconciliation/harness.py::_record_placeholder_finding_drop`` — append
-    ``(now, project)``, prune to the window, count, compare to the threshold,
-    then rate-limit to one fire per window, and report the DISTINCT project
-    labels seen in the window — using bulk_reset_guard's guard-side
-    injectable-clock convention (``time_provider`` stored as ``self._now``) so
-    the 3600s window can be tested by advancing a fake clock instead of
-    sleeping.
-
-    The per-project dimension is load-bearing, not decoration: one server
-    instance serves every known project, so a window that mixed two projects
-    into a bare count would let the caller attribute the whole burst to
-    whichever write happened to cross the threshold — and file the escalation
-    into that project's queue while the actually-leaking project got nothing.
-
-    State is PROCESS-LOCAL and resets on restart, like every other in-process
-    storm counter in this codebase: the counter exists to catch a live burst, not
-    to keep durable statistics. It is also per-instance, and ``server/tools.py``
-    instantiates one per ``create_mcp_server`` call rather than as a module
-    global, so no state bleeds between servers (or between tests).
-
-    Not thread-safe by construction; the MCP tool handlers that call it run on a
-    single event loop and ``record`` never awaits.
-    """
-
-    def __init__(
-        self,
-        threshold: int = _MARKUP_STORM_THRESHOLD,
-        window_seconds: float = _MARKUP_STORM_WINDOW_SECONDS,
-        time_provider: Callable[[], float] = time.time,
-    ) -> None:
-        self._threshold = threshold
-        self._window_seconds = window_seconds
-        self._now = time_provider
-        self._events: deque[tuple[float, str | None]] = deque()
-        self._last_fire_ts: float | None = None
-
-    def record(self, project: str | None = None) -> dict[str, Any] | None:
-        """Record one rejection; return a storm summary iff a burst just fired.
-
-        *project* is the label the rejection belongs to — the resolved
-        ``project_root``, or ``None`` when the boundary could not resolve one
-        (``add_memory``/``add_episode`` take a ``project_id``, which for a project
-        absent from the known-projects registry maps to no root at all).
-
-        Returns ``None`` when the count within the window is below the threshold,
-        AND when the threshold is met but a previous fire is still inside the
-        window (the rate limit — without it, a leak emitting hundreds of writes
-        would escalate hundreds of times for one incident).
-
-        Otherwise stamps the rate-limit timestamp and returns a JSON-serializable
-        summary with ``count``, ``threshold``, ``window_seconds``, ``hint`` and
-        ``projects`` — the sorted DISTINCT non-``None`` labels seen in the window,
-        so the caller can attribute the burst (and escalate to every project it
-        touched) instead of blaming whichever write crossed the threshold.
-        """
-        now = self._now()
-
-        # Append, then prune. The window is half-open: an event aged exactly
-        # window_seconds is already out.
-        self._events.append((now, project))
-        cutoff = now - self._window_seconds
-        while self._events and self._events[0][0] <= cutoff:
-            self._events.popleft()
-
-        count = len(self._events)
-        if count < self._threshold:
-            return None
-
-        # Threshold crossed — apply the per-window rate limit.
-        if self._last_fire_ts is not None and (now - self._last_fire_ts) < self._window_seconds:
-            return None
-
-        self._last_fire_ts = now
-        return {
-            'count': count,
-            'threshold': self._threshold,
-            'window_seconds': self._window_seconds,
-            # Unlabelled events still count toward the burst, but there is
-            # nothing to escalate them against, so they are simply not named.
-            'projects': sorted({p for _, p in self._events if p is not None}),
-            'hint': _MARKUP_STORM_HINT,
-        }
 
 
 def emit_markup_storm_escalation(
     project_root: str | None,
     storm: dict[str, Any],
+    *,
+    anchor_task_id: str = _ANCHOR_TASK_ID,
 ) -> str | None:
     """File an ``mcp_markup_write_storm`` escalation for a rejection burst (INV-4).
 
     Returns the escalation id — freshly filed, or the id of an already-open
     escalation for this project (dedup) — or ``None`` when filing is impossible
     or fails.
+
+    *storm* is the record its ONE live producer sends —
+    :meth:`shared.mcp_markup_middleware.MarkupGuardMiddleware._record_storm` via
+    :mod:`fused_memory.server.markup_guard`'s sink — and the keys read off it
+    are ``count``, ``threshold``, ``window_seconds``, ``outcome``, and the
+    attribution that producer now supplies: ``crossing_agent_id``,
+    ``crossing_subject_task_id``, ``crossing_subject_agent_role`` (the ONE call
+    that crossed the threshold) and ``callers`` (every distinct caller seen in
+    the window). Every one is read defensively, because degenerate and legacy
+    shapes (``{}``, ``{'count': 9}``) reach this filer from tests and older
+    callers and must still produce a routable record.
+
+    The attribution is why the remedy below no longer leads with a grep. It
+    used to be the ONLY route to the caller, and it is not one a triager can
+    always take: a per-agent stdio server's stderr is consumed by the spawning
+    CLI and never reaches journald, and ``journald --user`` retention on this
+    host is roughly 72h while measured storm records were read at 6-7 days old.
+    The grep survives as corroboration — do not delete its tokens, which
+    ``test_the_record_points_at_log_lines_that_actually_exist`` pins.
+
+    ``count`` is ALREADY this project's own number: the producer keys one
+    ``StormCounter`` per ``(project, outcome)`` pair, so a window can only ever
+    hold one project's events. Do not re-add a "the count may span other
+    projects" hedge — that was true of the per-SERVER ``MarkupStormCounter``
+    task 4458 retired, and restating it now tells the triager to discount a
+    number that is exactly reproducible from their own journal.
+
+    OUTCOME FIDELITY, for the same reason. That same keying means this filer
+    serves ALL THREE of the middleware's outcomes — ``repaired``, ``rejected``,
+    ``unrepairable`` — so it must never hardcode one. It did hardcode
+    ``rejected`` until task 4505, which meant a burst of REPAIRS (calls that all
+    SUCCEEDED) was filed as N rejections that never happened. A record naming an
+    outcome the burst did not have states a number the triager cannot reproduce
+    from their own journal, which is the same defect as stating a count the
+    burst did not have. A storm carrying no readable outcome gets a NEUTRAL word
+    — never ``rejected``, never the literal ``'None'``: absent is not zero, and
+    it is not a rejection either.
+
+    That rule binds EVERY operator-facing field on the record — ``summary``,
+    ``detail`` AND ``suggested_action`` — not just the sentence carrying the
+    number. ``suggested_action`` is no afterthought: ``escalation.server`` lists
+    it in ``_COMPACT_ESCALATION_FIELDS`` beside ``summary`` and carries both
+    into ``_COMPACT_PENDING_FIELDS``, while ``detail`` is dropped BY NAME as the
+    unbounded free-text field, so a compact consumer that never sees the detail
+    still reads it. Task 4505 fixed the summary first and left two
+    rejection-framed sentences behind in the other two fields; a fourth sentence
+    added here must not repeat that.
+
+    The grep tokens those sentences name must also be ones an emitter actually
+    writes. They pointed at ``markup_tripwire_storm``, whose only occurrence in
+    the repo was the instruction prescribing it — a triager who followed it
+    found zero lines, indistinguishable from "the leak stopped". The live tokens
+    are ``markup_guard_storm`` — logged by
+    :meth:`shared.mcp_markup_middleware.MarkupGuardMiddleware._record_storm`,
+    again by :mod:`fused_memory.server.markup_guard`'s escalation sink, and
+    again here when a burst is suppressed — and the per-call
+    ``markup guard: <outcome> tool=... agent_id=... project=...`` line the same
+    middleware writes beside it. Keep them STATIC — never interpolate the
+    resolved outcome into a suggested grep, for the reason the detail's
+    ``count=`` key is static.
 
     NEVER raises. This is called from an MCP write path whose rejection has
     already been decided, so escalation is purely additive: every failure mode
@@ -402,107 +259,283 @@ def emit_markup_storm_escalation(
     The anchor dedup matters beyond the counter's own per-window rate limit: a
     leak running for hours would otherwise file one escalation per window, so
     those collapse into the single open record until an operator resolves it.
+
+    That dedup is deliberately outcome-AGNOSTIC — one open record per running
+    leak, not one per outcome — so a later burst of a DIFFERENT outcome folds
+    into a record naming the FIRST outcome observed. Left implicit that is the
+    outcome-fidelity defect above wearing a second hat: the surviving record
+    would name an outcome while a more serious burst (``unrepairable`` loses
+    caller data) went unnamed. Two things keep it honest instead. The record
+    SAYS the outcome and count are the first burst's rather than a running
+    total, and a fold whose outcome DIFFERS is logged here at ERROR carrying
+    the ``markup_guard_storm`` token the record's own remedy tells the triager
+    to grep — so the burst the queue does not name is still findable beside the
+    guard's own per-burst line. Do not make the summary's outcome sound like a
+    running tally, and do not downgrade that ERROR: the queue is not the only
+    channel precisely because it holds one record.
+
+    *anchor_task_id* selects WHICH anchor that dedup keys on, and is threaded
+    through both the lookup and the filing so a caller can never file under one
+    anchor while deduping against another. It exists because the default anchor
+    is SHARED: the L1 escalation watcher files its own cluster records under
+    ``markup-tripwire`` and squats it — measured, the tripwire filed nothing
+    2026-08-16..2026-08-19 while 41 rejections occurred, all 17 records at
+    dedupe_count 0 — so a filer deduping against a squatted anchor is suppressed
+    indefinitely, which is silence an operator reads as calm.
+
+    This is a PARAMETERISATION of the one filer, not licence to write a second
+    one (INV-5). The default is unchanged, so every existing caller behaves
+    identically.
     """
-    if project_root is None:
-        logger.debug(
-            'markup_tripwire: no project_root resolved; storm %r will not be escalated',
-            storm,
-        )
-        return None
-    if not HAS_ESCALATION:
-        logger.debug(
-            'markup_tripwire: escalation package unavailable; storm %r in '
-            'project_root=%r will not be escalated',
-            storm, project_root,
-        )
-        return None
-
-    try:
-        queue = EscalationQueue(Path(project_root) / _QUEUE_DIRNAME)
-    except Exception:
-        logger.exception(
-            'markup_tripwire: failed to open the escalation queue for '
-            'project_root=%r; storm %r not escalated',
-            project_root, storm,
-        )
-        return None
-
-    # Best-effort dedup: a read failure falls THROUGH to filing rather than
-    # bailing out — losing duplicate-suppression is strictly better than losing
-    # the alarm for an actively running leak.
-    try:
-        existing = queue.get_by_task(_ANCHOR_TASK_ID, status='pending')
-    except Exception:
-        logger.exception(
-            'markup_tripwire: failed to check for an existing open escalation '
-            'for project_root=%r; proceeding to file a new one',
-            project_root,
-        )
-        existing = []
-    if existing:
-        logger.info(
-            'markup_tripwire: %s already open for project_root=%r (storm %r now); '
-            'not filing a duplicate',
-            existing[0].id, project_root, storm,
-        )
-        return existing[0].id
-
     count = storm.get('count')
     window_seconds = storm.get('window_seconds')
+    # isinstance-guarded rather than truthy-cast, for the reason the middleware
+    # guards its own identity fields: a caller that sent a non-string has not
+    # named an outcome, and str(None) would put the literal 'None' into an
+    # operator-facing sentence as though it had been measured.
+    #
+    # Resolved BEFORE the dedup check, not beside the detail it feeds: the
+    # suppression path below has to name the outcome of the burst it is
+    # dropping, and cannot do that from a variable bound after it returns.
+    outcome = storm.get('outcome')
+    outcome = outcome if isinstance(outcome, str) and outcome else None
+
+    def _on_fold(existing: Any) -> None:
+        """Log the fold, comparing this burst's outcome with the open record's."""
+        open_outcome = _recorded_outcome(existing)
+        if open_outcome == outcome:
+            logger.info(
+                'markup_tripwire: %s already open for project_root=%r (storm %r now); '
+                'not filing a duplicate',
+                existing.id, project_root, storm,
+            )
+        else:
+            # ERROR, not info: the queue is about to say nothing at all about
+            # THIS outcome (see the docstring's dedup paragraph), so this line
+            # is the operator's only record of it beyond the guard's own
+            # per-burst line — and it carries the same 'markup_guard_storm'
+            # token, so one grep finds the folded burst next to the named one.
+            logger.error(
+                'markup_tripwire: markup_guard_storm SUPPRESSED — %s is already open '
+                'for project_root=%r naming outcome=%r, so this %r burst of %r '
+                'write(s) in %rs gets no record of its own; resolve that escalation '
+                'to let the next burst file. storm=%r',
+                existing.id, project_root, open_outcome, outcome, count,
+                window_seconds, storm,
+            )
+
+    # Conditional, because the sentence it feeds points AT the outcome line:
+    # with no outcome measured that line reads `outcome=None`, and telling the
+    # triager it "names what the guard did" points them at a value that names
+    # nothing — the same claim-you-cannot-reproduce defect, one field over.
+    outcome_sentence = (
+        'the outcome line above names what the guard did with them'
+        if outcome else
+        'no outcome was recorded with this burst, so the outcome line above '
+        "names none — the guard's own per-call log lines name it"
+    )
     detail = '\n'.join([
         f'project_root={project_root!r}',
-        f'rejected_writes_in_window={count!r}',
+        # MarkupGuardMiddleware._record_storm keys one StormCounter per
+        # (project, outcome) pair, so this window holds ONE project's
+        # events for ONE outcome: the count below is this project_root's own
+        # contribution, and an operator can reproduce it by grepping this
+        # project's own `markup guard: <outcome> tool=... project=...` lines.
+        # It was not always so — task 4505 removed a `projects_in_window=` line
+        # and a comment hedging that the count "may span more than this
+        # project_root", both left over from the per-SERVER MarkupStormCounter
+        # task 4458 retired. That pooling is what filed esc-markup-tripwire-6
+        # into reify's queue stating 3, for a window reify contributed 1 to.
+        f'{_DETAIL_OUTCOME_KEY}{outcome!r}',
+        # The key is outcome-NEUTRAL, STATIC, and spelled the way the SIBLING
+        # filer for this same record kind spells it — `_markup_storm_detail` in
+        # orchestrator/mcp/plan_tools.py emits count/threshold/window_seconds/
+        # outcome. Neutral because this filer serves all three of the
+        # middleware's outcomes and a key naming one of them contradicts its own
+        # content on the other two; static — never interpolated into
+        # `repaired_writes_in_window=` — because grepping one field across every
+        # record is the property an operator relies on, and that property dies
+        # just as fast if the two filers make an operator grep two keys for the
+        # same number.
+        f'count={count!r}',
         f'threshold={storm.get("threshold")!r}',
         f'window_seconds={window_seconds!r}',
-        # The window is shared across every project this server serves, so the
-        # count above may span more than this project_root. Naming them all
-        # keeps the record honest and points at the co-affected queues.
-        f'projects_in_window={storm.get("projects")!r}',
+        # WHO leaked, which is what makes the remedy below dischargeable
+        # without a journal. `crossing_*` names the ONE call that crossed the
+        # threshold; `callers` names every distinct caller seen in the window —
+        # two different questions, because on a shared server like this one a
+        # burst can be several agents at once and a record naming only whoever
+        # tripped the wire would be confidently misattributed.
+        #
+        # `.get`, like every line above: the docstring commits this filer to
+        # the degenerate and legacy shapes (`{}`, `{'count': 9}`) that reach it
+        # from tests and older callers, and those must still file.
+        #
+        # BELOW the outcome line, never above it, and every one `!r`. These
+        # carry caller-supplied strings, and `_recorded_outcome` scans this
+        # body for the FIRST line starting with `outcome=` — so an unescaped
+        # newline here could inject a spoofed one and silently disable the
+        # fold-mismatch warning that is an operator's only sign a later burst
+        # folded into a record naming a different outcome.
+        f'crossing_agent_id={storm.get("crossing_agent_id")!r}',
+        f'crossing_subject_task_id={storm.get("crossing_subject_task_id")!r}',
+        f'crossing_subject_agent_role={storm.get("crossing_subject_agent_role")!r}',
+        f'callers={storm.get("callers")!r}',
         '',
-        'The fused-memory MCP write tripwire (task 3141) rejected multiple '
-        'writes carrying raw MCP envelope markup within one rolling window. A '
+        'The fused-memory MCP write guard (tasks 3141, 4458) flagged multiple '
+        'writes carrying raw MCP envelope markup within one rolling window; '
+        f'{outcome_sentence}. A '
         'burst means the upstream harness serialization leak is ACTIVE right '
-        'now, not that the tripwire is misfiring — do NOT disable it, or '
+        'now, not that the guard is misfiring — do NOT disable it, or '
         'further specimens will land permanently in the corpus.',
         '',
-        'DF task 3083 owns the root cause, the Qdrant payload text-match read '
-        'tool and the retroactive corpus sweep. Attach the agent_id, field and '
-        'matched_pattern from the rejection responses (grep the server logs for '
-        "'markup_tripwire_storm') to 3083.",
+        # The dedup that keeps this to ONE open record is outcome-agnostic, so
+        # the record has to say so itself: an operator reading it must not take
+        # the outcome and count for a running tally of everything since. The
+        # folded bursts are not lost — each is logged as its own
+        # markup_guard_storm ERROR line, and a fold naming a DIFFERENT outcome
+        # is logged again by this filer when it suppresses it.
+        'This is the ONE open record for this project until an operator '
+        'resolves it: later bursts fold into it and file nothing of their own, '
+        'so the outcome and the count above describe the FIRST burst observed '
+        'and are not a running total. Every burst, folded or not, is logged by '
+        "the guard as its own 'markup_guard_storm' line — that is where a "
+        'later burst with a different outcome is visible.',
+        '',
+        'DF task 3083 delivered the root cause and the Qdrant payload '
+        'text-match read tool, but nothing reads what is attached there, and '
+        'its metadata is APPEND-ONLY: a key '
+        'can be added or overwritten, but none can be removed or renamed, '
+        'because deletion needs metadata_mode=replace and any faithful replace '
+        'payload carries done_provenance, which the write-authority floor '
+        'refuses. Its successor PRD owns the live blast-radius, '
+        'deterministic-repair and retro-sweep work in its open leaves. '
+        "Attach the agent_id, tool, param and matched pattern from the guard's "
+        "own log lines — grep 'markup_guard_storm' for this burst and 'markup "
+        "guard:' for each individual call — when you "
+        f'{MARKUP_RECURRENCE_ROUTING}.',
     ])
 
-    try:
-        esc = Escalation(  # type: ignore[possibly-unbound]
-            id=queue.make_id(_ANCHOR_TASK_ID),
-            task_id=_ANCHOR_TASK_ID,
-            agent_role=_AGENT_ROLE,
-            severity='blocking',
-            category=_CATEGORY,
-            summary=(
-                f'{count} MCP write(s) rejected for leaked envelope markup in '
-                f'{window_seconds}s — serialization leak active (see DF 3083)'
-            ),
-            detail=detail,
-            suggested_action=(
-                'identify the leaking caller from the rejection logs and report '
-                'it on DF task 3083'
-            ),
-            level=1,
-        )
-        esc_id = queue.submit(esc)
-    except Exception:
-        # A queue I/O failure must not propagate: the write has already been
-        # rejected, and the ERROR log at the call site has already recorded the
-        # burst. The operator simply loses the queued heads-up.
-        logger.exception(
-            'markup_tripwire: failed to submit storm escalation for '
-            'project_root=%r (storm %r)',
-            project_root, storm,
-        )
-        return None
-
-    logger.warning(
-        'markup_tripwire: queued %s for project_root=%r (storm %r)',
-        esc_id, project_root, storm,
+    return file_folded_escalation(
+        project_root,
+        anchor_task_id=anchor_task_id,
+        agent_role=_AGENT_ROLE,
+        category=_CATEGORY,
+        severity='blocking',
+        # The summary is the ONLY field a compact consumer is projected
+        # besides suggested_action (see the docstring's compact-tier note),
+        # so it has to answer how many, of what, and for whom on its own.
+        summary=(
+            f'{count} MCP write(s) {outcome or "flagged"} for leaked '
+            f'envelope markup in this project in {window_seconds}s '
+            '(the FIRST burst observed; later bursts of any outcome fold '
+            'into this record until it is resolved) — serialization leak '
+            'active (see plans/toolcall-markup-containment-prd.md)'
+        ),
+        detail=detail,
+        # Compact-projected BESIDE the summary, so the outcome-fidelity
+        # rule and the live-grep-token rule both bind here — the docstring
+        # states both once. STATIC, never interpolated with the resolved
+        # outcome: an operator-facing hint whose text varies with the data
+        # cannot be grepped without already knowing the answer, and an
+        # unmeasured outcome would render `markup guard: None`.
+        suggested_action=(
+            'read the caller off this record: the detail names '
+            'crossing_agent_id, crossing_subject_task_id and '
+            'crossing_subject_agent_role for the call that crossed the '
+            'threshold, and callers for every distinct caller seen in the '
+            f'window — then {MARKUP_RECURRENCE_ROUTING}. The guard also logs each '
+            "event (grep 'markup_guard_storm' for the burst and 'markup "
+            "guard:' for the individual calls), but treat that as OPTIONAL "
+            'corroboration: a per-agent stdio server\'s stderr is consumed '
+            'by the spawning CLI and never reaches journald at all, and '
+            'journald --user retention on this host is roughly 72h while '
+            'these records are routinely read days later'
+        ),
+        logger=logger,
+        log_label='markup_tripwire',
+        context=f'storm {storm!r}',
+        level=1,
+        on_fold=_on_fold,
     )
-    return esc_id
+
+
+def emit_markup_residue_escalation(
+    project_root: str | None,
+    record: dict[str, Any],
+    *,
+    anchor_task_id: str = _RESIDUE_ANCHOR_TASK_ID,
+) -> str | None:
+    """Preserve the payload of ONE residue record, of either kind (INV-7, B5).
+
+    Returns the filed escalation id, or ``None`` when filing is impossible or
+    fails. The id is what makes the caller-facing refusal HONEST: the shared
+    middleware folds it into the response as ``escalation_id`` beside a hint
+    that says "your full payload is preserved verbatim in the escalation named
+    above". Returning ``None`` there leaves that sentence pointing at a record
+    that does not exist — and per the boundary specimen table, unrepairable is
+    the COMMON outcome for the real corpus shapes, not an edge case.
+
+    A TRANSLATOR, not a second escalation vocabulary (INV-5). The middleware
+    already emits an escalation-SHAPED record — ``category``, ``level``,
+    ``summary``, ``suggested_action``, plus the flat ``tool``/``field``/
+    ``matched_pattern``/``raw_value`` fields and the header fields
+    ``residue_header_lines`` renders — because
+    the record has to survive being routed to whichever queue a host server
+    happens to own. This function moves those fields onto an
+    :class:`escalation.models.Escalation` and writes it; it authors no prose of
+    its own beyond the detail layout.
+
+    DELIBERATELY NOT DEDUPED, which is the one place it diverges from
+    :func:`emit_markup_storm_escalation`. That filer collapses a running leak
+    into one open record because every burst summary says the same thing. Here
+    each record holds a DIFFERENT caller's payload, so folding two together
+    would destroy one of them. Volume during a burst is what the storm record is for: it
+    summarises the incident once, while these hold the individual payloads.
+
+    NEVER raises, for the same reason as its sibling: the refusal is already
+    decided by the time this runs, so every failure mode degrades to ``None``
+    plus a log line rather than changing the call's outcome.
+    """
+    raw_value = record.get('raw_value')
+    prose = residue_prose(record)
+    detail = '\n'.join([
+        *residue_header_lines(record),
+        f'tool={record.get("tool")!r}',
+        f'field={record.get("field")!r}',
+        f'matched_pattern={record.get("matched_pattern")!r}',
+        f'owner={record.get("owner")!r}',
+        '',
+        prose.outcome,
+        '',
+        prose.custody,
+        '',
+        'Recover the payload below for the caller if it is still needed, then '
+        'chase the harness serialization leak that produced it and '
+        f'{MARKUP_RECURRENCE_ROUTING}.',
+        '',
+        'raw_value (VERBATIM, the caller\'s own bytes):',
+        str(raw_value),
+    ])
+
+    return file_folded_escalation(
+        project_root,
+        anchor_task_id=anchor_task_id,
+        agent_role=_RESIDUE_AGENT_ROLE,
+        category=str(record.get('category') or _RESIDUE_CATEGORY),
+        severity='blocking',
+        summary=str(
+            record.get('summary')
+            or f'MCP envelope markup residue from {record.get("tool")}'
+        ),
+        detail=detail,
+        suggested_action=str(record.get('suggested_action') or ''),
+        logger=logger,
+        log_label='markup_tripwire',
+        context=(
+            f'the {record.get("error_type")!r} residue of {record.get("tool")}.'
+            f'{record.get("field")} ({len(raw_value or "")} chars)'
+        ),
+        level=int(record.get('level') or _RESIDUE_LEVEL),
+        dedupe=False,
+    )

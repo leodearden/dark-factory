@@ -10,20 +10,148 @@ All other escalations start at L0 (level=0) and are promoted by handlers.
 
 L2 cluster fields (default-empty; L0/L1 are unaffected):
   members:    list of member L1 escalation ids forming this cluster
-  root_cause: exact-string dedup key for pending-L2 lookup
+  member_folded_at:
+              member id -> ISO time a fold appended it (`queue.add_members_to_l2`);
+              members present at creation are absent and joined at `timestamp`
+  root_cause: dedup key for pending-L2 lookup, matched on its CANONICAL form
+              (`escalation.canonical.canonical_root_cause`; task 3998), so
+              near-duplicates differing only in case/whitespace/punctuation fold.
+              Stored and displayed VERBATIM — the canonical form is a
+              compare-time value and is never persisted.
   options:    proposed resolution options (e.g. ['A: rollback', 'B: fix forward'])
 
 Structured-evidence field (default-empty; task 2558):
   evidence:   list of EvidenceEntry {observation, measured_at, ref} raw
               OBSERVATIONS backing the escalation (not causal diagnoses)
+
+Pause-detector trip facts (default None; task 4686):
+  ewa_rate_trip / park_stop_trip:
+              EwaRateTripFacts / ParkStopTripFacts carried by the escalation
+              a non-halting pause detector files instead of halting
+
+Human-gate payload (default None; task 6390):
+  review_due: ReviewDueState of a `review_due` record, the trigger chain's
+              human gate (PRD completion-driven-triggers C4)
+
+Cancel-with-children facts (default None; task 8142):
+  cancel_children / children / superseded_by:
+              child rows, the disposition map and the superseders, as the
+              JSON shared/src/shared/cancel_dispositions.py serializes them
+
+Incoming-framing amendments (default-empty; task 3997):
+  amendments: append-only list of Amendment entries -- the framing
+              (root_cause/summary/detail/options) a fold carried in, preserved
+              instead of discarded.  NEVER overwrites the record's own fields
+              above: the original human-facing framing stays immutable.
+  amendments_truncated:
+              count of oldest entries shed to the
+              `escalation/src/escalation/amendments.py::MAX_AMENDMENTS` cap;
+              a durable structured fact so the loss is assertable from the
+              record rather than only by log-scrape.
+  amendments_chars_elided:
+              the BYTE-side counterpart: count of characters dropped by the
+              per-field caps in `escalation/src/escalation/amendments.py`
+              (`MAX_AMENDMENT_LINE_CHARS` / `MAX_AMENDMENT_DETAIL_CHARS` /
+              `MAX_AMENDMENT_OPTIONS`).  An
+              entry count alone bounds nothing when one field is unbounded free
+              text, so the two counters together are what make the list's size
+              envelope assertable from the record.
+  APPEND-AND-TRIM POLICY:
+  `escalation/src/escalation/amendments.py::append_amendment_capped`, the
+  single home every writer of these three fields goes through.
+
+Over-fold evidence (default-empty; task 3998):
+  root_cause_variants:
+              the DISTINCT PRE-CANONICAL root_cause spellings that have folded
+              into this L2, the record's own spelling seeded first.
+              Canonicalising the match makes more promotes fold BY DESIGN, so
+              its failure mode is OVER-folding — distinct causes silently merged
+              under one canonical key — and this set is that failure's only
+              observable signature.  NOT derivable from `amendments`, which
+              sheds its oldest at the cap and would therefore under-report
+              precisely during the runaway the count exists to catch.
+  root_cause_variants_truncated:
+              count of oldest spellings shed to the
+              `queue._MAX_ROOT_CAUSE_VARIANTS` cap.  The TRUE distinct count is
+              `len(root_cause_variants) + root_cause_variants_truncated`, so the
+              loss stays assertable from the record rather than only by
+              log-scrape.
+  SOLE WRITER: `queue.add_members_to_l2` (also the sole trimmer).
+
+Dedupe-provenance bound (default-0; task 4885):
+  dedupe_children_truncated:
+              count of oldest NON-HEAD child ids shed to the
+              `queue._MAX_DEDUPE_CHILDREN` cap.  The TRUE provenance total is
+              `len(dedupe_children) + dedupe_children_truncated`, so the loss
+              stays assertable from the record rather than only by log-scrape.
+              `dedupe_count` is the load-bearing RECURRENCE SIGNAL and is NOT
+              capped — `dedupe_children` is provenance only, and the cap
+              deliberately separates the two.
+  SOLE WRITER: `queue.attach_dedupe_child` (also the sole trimmer).
+
+Filing-identity field (default-None; task 3533, populated by task 3550):
+  filing_claimant_run_id:
+              the FILING incarnation's claimant id in
+              `shared.task_claimant.compose_claimant_run_id` format;
+              None = unknown.  STAMPED BY: `orchestrator.workflow.TaskWorkflow`,
+              `orchestrator.harness.Harness`, and the
+              `escalate_blocker`/`escalate_info` chokepoint in
+              `escalation.server`.  For the producers that do NOT stamp it —
+              and why each one's records are (or are not) moot — see the
+              inventory on `escalation.pins.classify_pins`; do not restate or
+              summarise it here, and in particular do not assume the
+              non-stamping set is level-1/2-only.  Semantics and the fail-safe rule are stated
+              once on `escalation.pins.classify_pins` (normative source:
+              spec docs/task-escalation-state-spec.md S6) — do not restate
+              them here.
+
+Declared-dependency marker (default-empty; task 4377):
+  pin_declared_by:
+              WHAT outside the escalation store relies on this record
+              staying OPEN — a deviation notice, an operator gate
+              (e.g. 'task-3546-second-deviation-notice') — NOT who stamped
+              it.  A non-empty list is the marker.
+  pin_declared_reason:
+              free-text WHY.  Not itself a marker: a reason with no
+              declarer blocks nothing.
+
+  WHY THIS EXISTS.  An OPEN escalation record is a PRESERVATION MECHANISM
+  for its subject task: `orchestrator/task_ground_truth.py::_RECOVERY` has
+  no row for the pinned shape (IN_PROGRESS, no live claimant, exists
+  off-main, has_open_escalation=True), so it falls through to
+  `RecoveryAction.LEAVE` and the row survives.  CLOSING the record flips
+  that boolean and the same shape recovers to REVERT_TO_PENDING — so a
+  close is a state-changing act on the subject task even under
+  `action='close_only'`, and even a `resume`/`restart`/`abandon` spends
+  the preservation just as completely.  Before this marker nothing at
+  resolve time could tell that a record was deliberately relied upon: on
+  2026-08-08 an L2 cascade close of the homogeneous 11-member cluster
+  esc-3237-5 dismissed esc-3371-2, the only pin preserving mu-gate
+  validation specimen task 3371, and the specimen is permanently gone.
+
+  NOT `escalation.pins.classify_pins`.  That module answers "does this
+  ALREADY-OPEN record veto recovery?" from an automatic severity/level
+  policy — classification AT RECOVERY TIME, and it protects nothing from
+  being CLOSED.  This marker is protection AT RESOLUTION TIME, driven by
+  an explicit declaration; the two are deliberately separate seams.
+
+  SOLE WRITER: `queue.declare_pin`.  Enforcement:
+  `escalation/declared_pins.py::blocking_pin_declarations` consulted by
+  `escalation/server.py::resolve_issue`.
 """
 
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
-from typing import TypedDict
+from typing import TYPE_CHECKING, Literal, NotRequired, TypedDict
+
+if TYPE_CHECKING:
+    from shared.task_metadata import TriggerChainSkill
+
+logger = logging.getLogger(__name__)
 
 
 class TrainState(TypedDict):
@@ -38,6 +166,109 @@ class TrainState(TypedDict):
     order: int            # this task's position in the train (0-based)
     parked_members: list[str]  # sibling task_ids at merge-deferred, excluding self
     failing_member: str   # this task's id (the one that triggered BLOCKED)
+
+
+SidecarOnMain = Literal['declares', 'does_not_declare', 'unverified']
+
+
+class CheckSidecarSite(TypedDict):
+    """The owner's capability-manifest sidecar, as read at main when the escalation was filed."""
+
+    path: str  # shared.capability_manifest.sidecar_path(owner's metadata.prd_path), repo-relative
+    on_main: SidecarOnMain
+
+
+class DeliveredCheckOwner(TypedDict):
+    """Who declares a failing delivered check, and where (`dependency_capability`, task 7514).
+
+    `task_id` is the DEPENDENCY whose metadata.delivered_checks carries `check_name`;
+    the record's own task_id is the blocked dependent, which is only ever re-pended.
+    `sidecar` is None when the owner has no prd_path.
+    """
+
+    task_id: str
+    check_name: str
+    sidecar: CheckSidecarSite | None
+
+
+class IndexHealthState(TypedDict):
+    """FalkorDB index-provisioning drift context for `recon_missing_index` (task 3709).
+
+    Shape mirrors the record produced by
+    fused_memory.reconciliation.index_health.summarize_index_health(), projected
+    by the drift detector (PRD δ, D8 + D11).
+
+    The drifted graph and the missing specs are carried as FIRST-CLASS FIELDS so
+    no consumer parses `summary`/`detail` prose to recover a fact the emitter
+    already had in a variable (INV-2).
+
+    Index specs are stored as JSON LISTS, never tuples: a tuple deserialises
+    back as a list, so storing tuples would make the on-disk record fail to
+    round-trip identically and break equality for any payload comparison.
+
+    TypedDict at runtime is a plain dict; existing from_dict / to_dict /
+    asdict() paths are unaffected — round-trip fidelity is unchanged.
+    """
+
+    group_id: str                  # the graph whose index state drifted
+    missing: list[list[str]]       # expected-but-absent specs, sorted
+    unexpected: list[list[str]]    # present-but-unexpected specs (reported, never acted on)
+    expected_total: int            # size of the expected set this was diffed against
+
+
+class ReviewDueState(TypedDict):
+    """The human gate of a trigger chain, as filed (PRD
+    plans/completion-driven-triggers-prd.md C4).
+
+    `skill` is the BARE skill name; renderers add the slash. `launched_from`
+    is this record's own id. `verdict` is the completion gate's
+    predicate_verdict, None in the interim form or when the read failed.
+    """
+
+    skill: TriggerChainSkill
+    project_id: str
+    project_root: str
+    run_id: str
+    human_gate_task_id: str
+    completion_gate_task_id: str | None
+    verdict: dict[str, object] | None
+    fired_at: str
+    launched_from: str
+
+
+class EwaRateTripFacts(TypedDict):
+    """The EWA submission-rate detector's facts at the moment it tripped.
+
+    Carried as FIRST-CLASS FIELDS so no consumer scrapes prose for a fact the
+    detector already had in a variable (INV-2;
+    plans/scheduler-pause-halt-retirement-prd.md §6 invariant 5).
+
+    TypedDict at runtime is a plain dict; existing from_dict / to_dict /
+    asdict() paths are unaffected — round-trip fidelity is unchanged.
+    """
+
+    ewa: float                 # the EWA of submissions per done that tripped
+    threshold: float           # the configured trip threshold
+    ratio: float               # this step's submissions / max(dones, 1)
+    window_secs: float         # the digest window the ratio was measured over
+    dones_in_window: int       # tasks that reached done in that window
+    submissions_in_step: int   # tasks submitted in that step
+
+
+class ParkStopTripFacts(TypedDict):
+    """The park-stop detector's facts at the moment it tripped.
+
+    Carried as FIRST-CLASS FIELDS so no consumer scrapes prose for a fact the
+    detector already had in a variable (INV-2;
+    plans/scheduler-pause-halt-retirement-prd.md §6 invariant 5).
+
+    TypedDict at runtime is a plain dict; existing from_dict / to_dict /
+    asdict() paths are unaffected — round-trip fidelity is unchanged.
+    """
+
+    blocked_in_window: int     # tasks that transitioned to blocked in the window
+    window_secs: float         # the sliding window those transitions were counted in
+    threshold: int             # the configured trip threshold
 
 
 class EvidenceEntry(TypedDict):
@@ -60,14 +291,231 @@ class EvidenceEntry(TypedDict):
     ref: str           # ref/context this was measured against, e.g. "rerun#2" or "HEAD=abc123"
 
 
+class Amendment(TypedDict):
+    """Framing a fold carried IN, appended rather than discarded (task 3997).
+
+    When `promote_to_l2` folds a new promote into an existing pending L2, the
+    incoming root_cause/evidence/options/summary used to be dropped on the floor
+    (measured: 336,875 characters lost).  Each such fold now appends one of these
+    to `Escalation.amendments`.  An explicit `queue.EscalationQueue.amend`
+    (task 4886) appends one too, with no fold behind it; the two sources are
+    distinguishable by `agent_role`.  The record's OWN framing is never
+    overwritten — both the original and every incoming reframing survive, which
+    is the point.
+
+    `detail` holds `promote_to_l2`'s ``evidence`` ARGUMENT — the same argument the
+    create path writes into the record's own `detail` — so a reader can diff an
+    amendment against the record like-for-like.  It is deliberately NOT called
+    `evidence`: `Escalation.evidence` is the semantically different structured
+    EvidenceEntry list (task 2558), and two different things called `evidence` on
+    one record would be a legibility trap.
+
+    `root_cause` is the PRE-canonical incoming value, which is what makes an
+    over-folding root-cause canonicaliser detectable after the fact.
+
+    `timestamp` is stamped by the queue at write time, never author-supplied —
+    the write chokepoint owns its clock (mirroring `stamp_triage`/`triaged_at`),
+    so a caller cannot backdate an amendment.
+
+    Every free-text field is stored ELIDED to the amendments module's per-field
+    caps, with an in-band marker naming what was dropped
+    (`escalation/src/escalation/amendments.py::_build_amendment`), and
+    `options` is capped in length.  A field ending in that marker is the HEAD of
+    what was submitted, not all of it; the record-level `amendments_chars_elided`
+    holds the running character total.
+
+    Shape mirrors the EvidenceEntry / TrainState TypedDicts.  TypedDict at
+    runtime is a plain dict; existing from_dict / to_dict / asdict() paths are
+    unaffected — round-trip fidelity is unchanged.  Stored verbatim with no
+    shape validation, so a partial entry is accepted rather than rejected.
+    """
+
+    timestamp: str        # ISO, stamped by queue.add_members_to_l2 at write time
+    agent_role: str       # the session that submitted this framing
+    root_cause: str       # the PRE-canonical incoming root cause
+    summary: str          # incoming one-line hypothesis
+    detail: str           # incoming `evidence` argument (see docstring on the name)
+    options: list[str]    # incoming proposed resolution options
+
+
+class LateResolution(TypedDict):
+    """A substantive resolution that arrived AFTER an automated sweep had already
+    dismissed the record — captured rather than dropped on the floor (task 4495).
+
+    THE RACE.  The W9-δ steward auto-dismiss (`orchestrator.steward` ->
+    `_dismiss_capped_l0`) closes a capped L0 with `resolved_by='auto-dismissed'`.
+    A `resolve_issue` call already in flight from the killed agent session can
+    land microseconds later, on a record that is now terminal.  `queue.resolve()`
+    correctly refuses to re-close it (its status check is an atomic check-and-set
+    inside `escalation_id_lock`) — but it used to also DISCARD the incoming text,
+    so the steward's actual finding was destroyed and the record kept the
+    `resolution_class='benign'` the automated dismissal derived (esc-3902-1).
+
+    Each such late arrival now appends one of these instead.  The record's OWN
+    terminal state — `status` / `resolution` / `resolved_at` / `resolved_by` — is
+    NEVER overwritten: by the time the late call arrives, downstream waiters have
+    already consumed that state and the workflow has resumed, so flipping it
+    would rewrite history that was already acted on.  Append-only preservation
+    mirrors the `Amendment` precedent above exactly.
+
+    `timestamp` is stamped by the queue at write time, never author-supplied —
+    the write chokepoint owns its clock (mirroring `Amendment` / `stamp_triage`)
+    so a caller cannot backdate a capture.
+
+    `prior_resolution_class` records the stamp this capture SUPERSEDED (the
+    derived `'benign'`), so the correction `queue.resolve()` may apply destroys
+    nothing and the original derivation stays auditable.  None when no
+    correction was made.
+
+    `resolution` is stored ELIDED to the queue's per-entry cap with an in-band
+    marker naming what was dropped (`queue._build_late_resolution`); a field
+    ending in that marker is the HEAD of what was submitted, not all of it, and
+    the record-level `late_resolutions_chars_elided` holds the running total.
+
+    `dismiss` is the only fact recorded about what the late caller WANTED, and
+    deliberately so: the finer C1 action (`resume` / `restart` / `park` / ...)
+    is not a `queue.resolve()` argument at all — `server.resolve_issue` stamps
+    it onto the record BEFORE calling, a path an already-terminal record never
+    takes — so a key for it could only ever hold None.  A field that structurally
+    cannot be populated states a fact the entry does not hold; the coarse
+    dismiss/resolve intent that `resolve()` genuinely receives is kept instead.
+
+    `ruled_by_human` is the late caller's assertion that a human ruled, kept
+    here because the record's own flag is terminal state and is not moved.
+    Entries captured before the key existed lack it.
+
+    Shape mirrors the Amendment / EvidenceEntry / TrainState TypedDicts.
+    TypedDict at runtime is a plain dict; existing from_dict / to_dict /
+    asdict() paths are unaffected — round-trip fidelity is unchanged.  Stored
+    verbatim with no shape validation, so a partial entry is accepted rather
+    than rejected.
+    """
+
+    timestamp: str                        # ISO, stamped by queue.resolve() at write time
+    resolution: str                       # the incoming free text that would have been lost
+    resolved_by: str | None               # the incoming resolver attribution
+    dismiss: bool                         # whether the incoming call asked to dismiss
+    prior_resolution_class: str | None    # the stamp this capture superseded, or None
+    ruled_by_human: NotRequired[bool | None]  # the incoming human-ruling assertion
+
+
+# The instruction `escalate_blocker` appends to its response, telling the FILER
+# what to do next.  NO CODE READS IT — the only consumer is the agent reading
+# the tool result — so the string itself is the whole contract: it is quoted
+# verbatim, as plain prose, by `orchestrator.agents.roles.ESCALATION_LADDER_CORE`
+# (role prompts cannot be f-strings) and by `escalate_blocker`'s tool docstring.
+# A rename would therefore silently decouple the instruction from the response
+# it describes, raising no import error anywhere; these names exist so the
+# prompt's copy can be pinned against the emission site from across the package
+# boundary (orchestrator/tests/test_roles_escalation_ladder.py).
+#
+# NOT `escalation.server.RESOLVE_ACTIONS`, the handler-side `resolve_issue`
+# disposition (resume/restart/park/abandon/close_only).  That is an orthogonal
+# vocabulary which merely shares a key name; the two must not be merged.
+ACTION_TERMINATE_CLEANLY: str = 'terminate_cleanly'   # persistence was observed
+ACTION_KEEP_DRIVING: str = 'keep_driving'             # persistence is unconfirmed
+FILER_ACTIONS: tuple[str, ...] = (ACTION_TERMINATE_CLEANLY, ACTION_KEEP_DRIVING)
+
+
+# The `status` a filing carries when the write was ACCEPTED but a post-write
+# re-read could not confirm it landed, and the `persist_check` verdict that
+# says why.  Emitted by `escalation.queue.observed_submit_response`.
+#
+# Unlike FILER_ACTIONS above, CODE reads this status, and across a module
+# boundary: `escalate_blocker` compares it to choose which action to append.
+# So a rename at the emission site would leave the comparison matching nothing
+# and hand an agent `terminate_cleanly` on a filing that never landed — the
+# exact defect the status exists to prevent — while raising no import error
+# anywhere.  Naming it is what makes the emit and the compare the same object.
+STATUS_ACCEPTED_UNPERSISTED: str = 'accepted_unpersisted'
+
+# `absent`: nothing for that id is on disk at all.  `unreadable`: a read was
+# attempted and failed, or a file IS on disk that yields no record (a torn or
+# corrupt write) — either way the record's state is unknown rather than known
+# to be missing.  The distinction is for the operator debugging the outage; it
+# never changes what the filer should do.
+PERSIST_CHECK_ABSENT: str = 'absent'
+PERSIST_CHECK_UNREADABLE: str = 'unreadable'
+PERSIST_CHECKS: tuple[str, ...] = (PERSIST_CHECK_ABSENT, PERSIST_CHECK_UNREADABLE)
+
+
 # Severities that cause an escalation to be created directly at L2,
 # bypassing the auto-watcher and routing straight to a human.
 BORN_AT_L2_SEVERITIES: frozenset[str] = frozenset({'critical', 'urgent'})
+
+# The harness sentinel role namespace: only a role in it may file at a
+# BORN_AT_L2_SEVERITIES severity (resolves PRD Open question 2, C4/D3).
+#   harness-*      → harness-stranded-blocked-reaper, harness-reconcile,
+#                    harness-orphan-reaper (harness.py)
+#   orchestrator-* → orchestrator-scheduler, orchestrator-watcher-supervisor
+#                    (the watcher-outage L2 named in the user-observable signal)
+# Verified against orchestrator/src/orchestrator/agents/roles.py: NO LLM agent
+# role (architect, implementer, debugger, merger, steward, deep_reviewer,
+# reviewer_comprehensive, judge, simple_task) uses either prefix.
+# A prefix check is forward-compatible: new harness sentinels are auto-exempt.
+HARNESS_SENTINEL_ROLE_PREFIXES: tuple[str, ...] = ('harness-', 'orchestrator-')
 
 # All valid severity values accepted by the MCP tools (escalate_blocker /
 # escalate_info).  Used to validate caller input and return a clear error
 # rather than silently misrouting escalations.
 KNOWN_SEVERITIES: frozenset[str] = frozenset({'info', 'blocking'}) | BORN_AT_L2_SEVERITIES
+
+
+def normalised_severity(severity: str | None) -> str:
+    """The form every severity classifier compares against KNOWN_SEVERITIES.
+
+    Case- and whitespace-insensitive.  A null reads as ``''`` because an
+    ``Escalation`` rehydrated from JSON on disk can carry a null ``severity``
+    despite the ``str`` annotation.
+    """
+    return str(severity or '').strip().lower()
+
+# Urgency ordering over KNOWN_SEVERITIES, used by every severity FOLD in the
+# system (dedupe-child promotion, L2 member inheritance, the L2 update-path
+# floor).  Alphabetical comparison is wrong ('blocking' < 'info'), so the rank
+# is explicit.
+#
+# TOTAL over KNOWN_SEVERITIES by contract: adding a severity to the vocabulary
+# without adding it here is a bug, not a silent rank-0 — TestSeverityRank
+# (escalation/tests/test_models.py) fails on the gap.  The BORN_AT_L2
+# severities (critical/urgent) outrank 'blocking', which is what lets a
+# born-at-L2 child promote a lower-severity parent.
+#
+# The ordering mirrors the repo's only other canonical escalation-severity
+# ranking — cockpit/src/cockpit/priority.py's _ESCALATION_SEVERITIES and its
+# severity_weights (urgent 6.0 > critical 5.0 > blocking 2.5 > info 0.25) — so
+# the two are traceably one decision rather than two guesses that can drift.
+SEVERITY_RANK: dict[str, int] = {'info': 0, 'blocking': 1, 'critical': 2, 'urgent': 3}
+
+
+def max_severity(a: str, b: str) -> str:
+    """Return the higher-urgency severity string between *a* and *b*.
+
+    Fail-soft on unknown input: an unrecognised severity is WARNed about and
+    treated as rank 0 (info-level) rather than raising, so malformed input can
+    never crash a fold nor cause an unexpected upward promotion.  The ``>=``
+    tie-break on *a* makes equal-rank comparisons — including unknown-vs-unknown
+    — deterministic rather than arbitrary.
+    """
+    for val in (a, b):
+        if val not in SEVERITY_RANK:
+            logger.warning(
+                'max_severity: unrecognised severity %r — treating as info-level '
+                '(rank 0). Known values: %s',
+                val,
+                ', '.join(SEVERITY_RANK),
+            )
+    return a if SEVERITY_RANK.get(a, 0) >= SEVERITY_RANK.get(b, 0) else b
+
+# Ladder levels an AGENT-side MCP filing (escalate_blocker) may be born at.
+# 0 = agent→steward, 1 = steward re-escalation→escalation-watcher-auto.
+# Level 2 is deliberately excluded: agents must not self-mint an L2 that
+# bypasses the auto-watcher and pages a human.  The legitimate routes to L2
+# are a born-at-L2 *severity* filed by a harness sentinel role (see
+# BORN_AT_L2_SEVERITIES and the agent-role downgrade in server.py) or the
+# promote_to_l2 handler tool.  This mirrors the existing policy that
+# downgrades an agent-filed critical/urgent to 'blocking'.
+AGENT_FILABLE_LEVELS: frozenset[int] = frozenset({0, 1})
 
 # Legal values for Escalation.resolution_class (escalation-lifecycle-dashboard-prd.md
 # Seam 1).  Used to validate the resolve/dismiss chokepoint's optional
@@ -81,7 +529,40 @@ KNOWN_SEVERITIES: frozenset[str] = frozenset({'info', 'blocking'}) | BORN_AT_L2_
 # dashboard's effective_benign/_origin_block/_workflow_block count it as
 # classified+stamped but bucket it into neither, preserving the evidence the
 # old 'benign' mis-label destroyed.
-RESOLUTION_CLASSES: frozenset[str] = frozenset({'benign', 'actionable', 'moot-terminal-subject'})
+#
+# 'stale-strand' (task 3172) is the DISTINCT, non-benign stamp
+# EscalationQueue.dismiss_all_pending writes for a level-0 escalation that had
+# already been pending for >= strand_age_secs when the orchestrator restarted
+# and swept it.  Like 'moot-terminal-subject' it is deliberately neither
+# 'benign' nor 'actionable' so a strand stays auditable after the sweep that
+# closed it.  It EXTENDS this vocabulary rather than forking a second
+# classification scheme (task 3172: coordinate, do not fork).
+#
+# The origin incident is what this member exists to make legible: esc-5189-7
+# had been pending 20h58m with a workflow parked on it, while esc-5685-1 had
+# been pending ~90s — a genuine strand and an ordinary restart artifact.  The
+# old single 'benign' stamp made the two records indistinguishable, so the
+# only durable trace of a 20h strand read as routine restart noise.
+#
+# 'addressed', 'observation-consumed', 'converted' and 'status-info' are the
+# info-L0 disposition classes (plans/info-l0-disposition-router-prd.md D14):
+# 'addressed' means a reviewer verified the note fixed; 'observation-consumed'
+# means a pure observation was closed at exit; 'converted' means a
+# curator-created task now carries the work; 'status-info' means a mechanical
+# notice was closed per class, with an aggregate L1.  Like
+# 'moot-terminal-subject' they are deliberately neither 'benign' nor
+# 'actionable'.  The decision vocabulary lives in
+# escalation/src/escalation/disposition.py.
+#
+# NOTE_TO_FILE_CLASS is stamped only by escalate_info(note_to_file=True), filed
+# resolved at filing; like 'moot-terminal-subject' it is neither benign nor
+# actionable.  Rationale: plans/plan-deviation-recording-prd.md D2.
+NOTE_TO_FILE_CLASS: str = 'note-to-file'
+RESOLUTION_CLASSES: frozenset[str] = frozenset({
+    'benign', 'actionable', 'moot-terminal-subject', 'stale-strand',
+    'addressed', 'observation-consumed', 'converted', 'status-info',
+    NOTE_TO_FILE_CLASS,
+})
 
 
 @dataclass
@@ -90,9 +571,7 @@ class Escalation:
     task_id: str
     agent_role: str
     severity: str  # "blocking" | "info" | "critical" | "urgent"
-    category: str  # scope_violation, design_concern, cleanup_needed,
-    # dependency_discovered, risk_identified, infra_issue,
-    # reconciliation_stale_human_operator, reconciliation_stale_gate_backlog
+    category: str  # a registered escalation.categories.EscalationCategory value — enforced at queue submit, never on rehydration
     summary: str  # one-line
     detail: str = ''  # full context
     suggested_action: str = ''  # expand_scope, create_followup_task, abort_task, etc.
@@ -108,11 +587,39 @@ class Escalation:
     dedupe_count: int = 0  # number of duplicate submissions folded into this parent
     dedupe_children: list[str] = field(default_factory=list)  # ids of folded duplicates
     dedupe_fingerprint: str | None = None  # content fingerprint for A7a/A7b recon dedup
+    # Count of oldest NON-HEAD child ids shed to the `queue._MAX_DEDUPE_CHILDREN`
+    # cap.  The TRUE provenance total is `len(dedupe_children) +
+    # dedupe_children_truncated`, so the loss stays assertable FROM THE RECORD
+    # and is never log-only (INV-8), exactly as for amendments_truncated and
+    # root_cause_variants_truncated below.
+    #
+    # `dedupe_count` is NOT affected by the cap and must never be: it is the
+    # load-bearing recurrence signal (a recon-watcher drain sorts the
+    # longest-rotting gates by it, and `sweep._pick_richer` ranks on it), while
+    # `dedupe_children` is provenance only.  The cap separates the two on
+    # purpose — the SIGNAL is uncapped, the PROVENANCE is bounded.
+    #
+    # Retention is HEAD-PRESERVING rather than the pure oldest-shed used above:
+    # unlike `amendments`, this list has no external anchor for the fold's
+    # origin, so the first `queue._MAX_DEDUPE_CHILDREN_HEAD` ids are kept and
+    # the oldest NON-head ones are shed.
+    #
+    # SOLE WRITER / sole trimmer: `queue.attach_dedupe_child`.  Zero migration by
+    # the same from_dict __dataclass_fields__ filter as every field below:
+    # legacy JSON without the key deserialises to 0, to_dict's asdict()
+    # serialises it for free, and queue.submit / submit_resolved /
+    # _atomic_write / resolve / park / stamp_triage need NO change (they are
+    # field-agnostic passthroughs or RMW-on-hydrated-record).
+    dedupe_children_truncated: int = 0
     # L2 cluster fields — empty defaults keep L0/L1 escalations bit-identical on disk.
     # Old JSON files (pre-L2) deserialise correctly via from_dict's __dataclass_fields__
     # filter: absent keys map to the dataclass defaults without any migration required.
     members: list[str] = field(default_factory=list)  # member L1 escalation ids (cluster composition)
-    root_cause: str = ''  # root-cause hypothesis; exact-string dedup key for pending-L2 lookup
+    # Member id -> ISO time a promote_to_l2 fold appended it.  Members present
+    # at creation are absent: they joined at `timestamp`.  SOLE WRITER:
+    # `queue.add_members_to_l2`.  Zero migration via the from_dict filter.
+    member_folded_at: dict[str, str] = field(default_factory=dict)
+    root_cause: str = ''  # root-cause hypothesis; dedup key for pending-L2 lookup, matched on its CANONICAL form (task 3998) but stored verbatim
     options: list[str] = field(default_factory=list)  # proposed resolution options ['A: ...', 'B: ...']
     # Structured raw-OBSERVATION entries backing this escalation (task 2558).
     # Each is a {observation, measured_at, ref} dict recording a measurement
@@ -126,15 +633,45 @@ class Escalation:
     # None for all non-train escalations; legacy JSON (pre-field) deserialises to None
     # via the from_dict __dataclass_fields__ filter — no migration required.
     train_state: TrainState | None = None
+    # PRD δ (task 3709) — FalkorDB index-provisioning drift context for
+    # `recon_missing_index` escalations filed by the reconciliation harness's
+    # index drift detector.  None for every other escalation kind; legacy JSON
+    # (pre-field) deserialises to None via the from_dict __dataclass_fields__
+    # filter — zero migration, same pattern as members / train_state above.
+    # to_dict's asdict() serialises it for free, and submit / submit_resolved /
+    # _atomic_write / resolve / park / stamp_triage are field-agnostic
+    # passthroughs that need no change.
+    index_health: IndexHealthState | None = None
+    # Task 7514 — the dependency that declares the failing delivered check, for
+    # `dependency_capability` escalations filed by the harness.  None for every
+    # other escalation kind; legacy JSON (pre-field) deserialises to None via the
+    # from_dict __dataclass_fields__ filter — zero migration, same pattern as
+    # train_state / index_health above.
+    delivered_check_owner: DeliveredCheckOwner | None = None
+    # Born-at-L2 human-gate payload, filed only by orchestrator/src/orchestrator/
+    # deterministic_runner.py::build_gate_escalation_fields; zero migration via the from_dict filter.
+    review_due: ReviewDueState | None = None
     # C1 action chosen at resolve_issue time (resume/restart/park/abandon/close_only).
     # None for records resolved before α1 or for L2 cascade members (β derives theirs
     # from the parent via resolved_by='l2-cascade:<id>' attribution).
     resolution_action: str | None = None
+    # Set only at resolve time by EscalationQueue.resolve, and only with
+    # resolution_action='restart': the next dispatch re-cuts the task fresh off main.
+    recut: bool = False
     # Benign/actionable classification stamp (escalation-lifecycle-dashboard-prd.md
     # Seam 1).  Written ONLY at a terminal-write chokepoint — queue.resolve() or
     # queue.submit_resolved() — never author-supplied at filing time.  None means
     # unstamped — readers fall back to the effective_benign() proxy (see
     # escalation.classify).
+    #
+    # queue.resolve() may also CORRECT an already-written stamp, in exactly one
+    # case: when it captures a late resolution (see `late_resolutions` below) on
+    # a record whose stamp is the DERIVED `'benign'` an automated dismissal
+    # produced, it re-stamps `'actionable'` (or the incoming explicit class) and
+    # preserves the superseded value in the entry's `prior_resolution_class`.
+    # An `'actionable'` or `'moot-terminal-subject'` stamp is never overwritten.
+    # The "written only at a terminal-write chokepoint" invariant still holds —
+    # the correction happens INSIDE resolve(), under the same per-id lock.
     resolution_class: str | None = None
     # Triage-ack annotation (NOT a resolution) — lets escalation-watcher-auto
     # rotations skip re-deriving the disposition of a still-pending L1/L2 item
@@ -157,6 +694,204 @@ class Escalation:
     # legacy JSON without this key deserialises to [] via the from_dict
     # __dataclass_fields__ filter below — no migration required.
     granted_files: list[str] = field(default_factory=list)
+    # The FILING incarnation's claimant identity (task 3533) — semantics are
+    # documented once on `escalation.pins.classify_pins` (see the module
+    # docstring's field summary above). Zero migration, same pattern as
+    # members / evidence / train_state / the triage quad / granted_files
+    # above: legacy JSON without this key deserialises to None via the
+    # from_dict __dataclass_fields__ filter below, to_dict's asdict()
+    # serialises it automatically, and queue.submit / submit_resolved /
+    # _atomic_write / resolve / park / stamp_triage need NO change (they are
+    # field-agnostic passthroughs or RMW-on-hydrated-record).
+    # Stamped by TaskWorkflow, Harness, and the escalate_blocker/escalate_info
+    # chokepoint (task 3550); None on legacy rows and from non-stamping
+    # producers such as submit.py's detached CLI.
+    filing_claimant_run_id: str | None = None
+    # Preserved incoming framing (task 3997).  APPEND-ONLY: an amendment NEVER
+    # overwrites this record's own root_cause / detail / options / summary — the
+    # original human-facing framing is immutable and every incoming reframing is
+    # kept alongside it.  Every writer appends through
+    # `escalation/src/escalation/amendments.py::append_amendment_capped`, the
+    # single home of the append-and-trim policy (it sheds the OLDEST past
+    # `MAX_AMENDMENTS` there, counting each drop in amendments_truncated).  Zero migration, same pattern
+    # as members / evidence / train_state / the triage quad / granted_files /
+    # filing_claimant_run_id above: legacy JSON without these keys deserialises
+    # to the defaults via the from_dict __dataclass_fields__ filter below,
+    # to_dict's asdict() serialises them automatically, and queue.submit /
+    # submit_resolved / _atomic_write / resolve / park / stamp_triage need NO
+    # change (they are field-agnostic passthroughs or RMW-on-hydrated-record).
+    amendments: list[Amendment] = field(default_factory=list)
+    amendments_truncated: int = 0
+    # BYTE-side counterpart of amendments_truncated: characters dropped by the
+    # per-field caps that make the list's size (not merely its length) bounded.
+    # Same zero-migration story as the two fields above.
+    amendments_chars_elided: int = 0
+    # Preserved LATE resolution text (task 4495, esc-3902-1).  APPEND-ONLY: a
+    # capture NEVER overwrites this record's own `status` / `resolution` /
+    # `resolved_at` / `resolved_by` — the terminal state downstream waiters have
+    # already consumed is immutable, and every substantive resolution that
+    # arrived after an automated sweep closed the record is kept alongside it.
+    # See the `LateResolution` TypedDict above for the race this closes.
+    # `queue.resolve()`'s already-terminal branch is the SOLE writer and also
+    # the sole trimmer (it sheds the OLDEST past `queue._MAX_LATE_RESOLUTIONS`,
+    # counting each drop in late_resolutions_truncated).  Zero migration, same
+    # pattern as members / evidence / train_state / the triage quad /
+    # granted_files / filing_claimant_run_id / amendments above: legacy JSON
+    # without these keys deserialises to the defaults via the from_dict
+    # __dataclass_fields__ filter below, to_dict's asdict() serialises them
+    # automatically, and queue.submit / submit_resolved / _atomic_write /
+    # resolve / park / stamp_triage need NO change (they are field-agnostic
+    # passthroughs or RMW-on-hydrated-record).
+    late_resolutions: list[LateResolution] = field(default_factory=list)
+    late_resolutions_truncated: int = 0
+    # BYTE-side counterpart of late_resolutions_truncated: characters dropped by
+    # the per-entry cap that makes the list's SIZE (not merely its length)
+    # bounded.  Exactly mirrors the amendments_truncated / amendments_chars_elided
+    # pair above, and has the same zero-migration story as the two fields above.
+    late_resolutions_chars_elided: int = 0
+    # The DISTINCT PRE-CANONICAL root_cause spellings that have folded into this
+    # L2 (task 3998), the record's own spelling seeded first.  Canonicalising the
+    # root-cause match makes MORE promotes fold BY DESIGN, so its failure mode is
+    # OVER-folding — distinct causes silently merged under one canonical key —
+    # and the set of mutually-distinct spellings one cluster has been addressed
+    # by is that failure's only observable signature.
+    #
+    # NOT DERIVABLE FROM `amendments`, which is why this is a field and not a
+    # scan: that list sheds its OLDEST entries at
+    # `escalation/src/escalation/amendments.py::MAX_AMENDMENTS` and elides each
+    # field at `MAX_AMENDMENT_LINE_CHARS` there, so a derived count would
+    # silently plateau and then UNDER-report precisely during the runaway the
+    # count exists to catch — reintroducing the silent suppression it is meant to
+    # close.
+    #
+    # The count that matters is `len(root_cause_variants) +
+    # root_cause_variants_truncated`, so the loss at the cap stays assertable
+    # FROM THE RECORD and is never log-only (INV-8).  `queue.add_members_to_l2`
+    # is the SOLE writer and sole trimmer (oldest-shed past
+    # `queue._MAX_ROOT_CAUSE_VARIANTS`, each drop counted), exactly as for
+    # `amendments`.  Zero migration by the same from_dict __dataclass_fields__
+    # filter as every field above.
+    root_cause_variants: list[str] = field(default_factory=list)
+    root_cause_variants_truncated: int = 0
+    # The evidence commit whose landing this filing could NOT attribute — the
+    # `verdict.probe['citation']` of the rejected landing-evidence verdict
+    # (task 4499).  Written at FILING time by
+    # `orchestrator.merge_lane.landing_evidence::file_unattributed_landing_escalation`,
+    # and read back AFTER the record has been resolved as the identity half of
+    # the `(task_id, category, citation_sha)` triple that suppresses an
+    # identical refile.  That read-after-resolve is the whole point: the reject
+    # condition is ABSORBING (main only moves forward, so lines that stopped
+    # surviving stay gone), so once the auto-watcher closes the L1 the
+    # pending-only `has_open_l1` guard goes False and the very next tick refiles
+    # the same finding — a close-then-refile ping-pong. Matching on the citation
+    # makes "this exact evidence was already adjudicated" answerable from the
+    # archived resolution.
+    #
+    # `None` means NO EVIDENCE IDENTITY — a `no_citation` reject, or any
+    # non-provenance escalation — and NEVER suppresses anything: the lookup
+    # short-circuits on a falsy key, so an absent identity always files.
+    #
+    # `refiles_suppressed` is that suppression's INV-4 storm counter: how many
+    # identical refiles this record's resolution has absorbed.  It keeps the
+    # suppression a durable STRUCTURED fact rather than log-only (INV-2), the
+    # same role `dedupe_count` plays for the fold path.  Deliberately
+    # UNTHRESHOLDED — escalating on repeated suppression would recreate the
+    # storm the suppression exists to stop.
+    #
+    # Zero migration, same pattern as members / evidence / train_state / the
+    # triage quad / granted_files / filing_claimant_run_id / amendments /
+    # root_cause_variants above: legacy JSON without these keys deserialises to
+    # the defaults via the from_dict __dataclass_fields__ filter below,
+    # to_dict's asdict() serialises them automatically, and queue.submit /
+    # submit_resolved / _atomic_write / resolve / park / stamp_triage need NO
+    # change (they are field-agnostic passthroughs or RMW-on-hydrated-record).
+    # Deliberately NOT added to `_COMPACT_ESCALATION_FIELDS` (server.py) —
+    # machine-internal filing bookkeeping, not triage-facing.
+    citation_sha: str | None = None
+    refiles_suppressed: int = 0
+    # DECLARED-DEPENDENCY MARKER (task 4377) — what makes a load-bearing record
+    # refusable at resolve time.  See the module docstring's field summary for
+    # the load-bearing semantics; the enforcement seam is
+    # `escalation/declared_pins.py::blocking_pin_declarations`, consulted by
+    # `escalation/server.py::resolve_issue` as a pre-flight over the target AND
+    # every cascade member.
+    #
+    # `pin_declared_by` names WHAT outside the escalation store relies on this
+    # record staying OPEN — a deviation notice, an operator gate
+    # (`'task-3546-second-deviation-notice'`, `'esc-3914-1'`) — NOT who stamped
+    # it.  That asymmetry is deliberate and is why the `declare_pin` MCP tool
+    # does not overwrite this from `X-Escalation-Identity` the way
+    # `resolved_by` / `triaged_by` are overwritten: those are WHO-acted
+    # attributions, this is what a closer must go read before spending the pin.
+    # A non-empty list is the marker; `pin_declared_reason` is the free-text
+    # why and is NOT itself a marker (a reason without a declarer blocks
+    # nothing).
+    #
+    # SOLE WRITER: `queue.declare_pin` (append-order, de-duplicating, blanks
+    # dropped).  Zero migration, same pattern as members / evidence /
+    # train_state / the triage quad / granted_files / filing_claimant_run_id /
+    # amendments / root_cause_variants above: legacy JSON without these keys
+    # deserialises to []/'' via the from_dict __dataclass_fields__ filter
+    # below, the empty defaults keep every existing record bit-identical on
+    # disk, to_dict's asdict() serialises them for free, and queue.submit /
+    # submit_resolved / _atomic_write / resolve / park / stamp_triage need NO
+    # change (they are field-agnostic passthroughs or RMW-on-hydrated-record).
+    pin_declared_by: list[str] = field(default_factory=list)
+    pin_declared_reason: str = ''
+    # SUBJECT PROJECT (task 4951) — which project this record is ABOUT, on a
+    # queue shared across every project the factory operates: a structured
+    # fact instead of a `detail` line readers must parse back out (INV-2).
+    # `None` means UNSTAMPED — a legacy record, or a producer that does not
+    # set it — never "no project", so a reader must fall back rather than
+    # conclude anything from it.  The field-first reader is
+    # `fused_memory/reconciliation/orphaned_recon_escalation_sweep.py::escalation_project_id`.
+    # Zero migration by the same from_dict __dataclass_fields__ filter as
+    # every field above.  Deliberately NOT added to
+    # `_COMPACT_ESCALATION_FIELDS` (server.py) — its readers load full records;
+    # the reasoning (task 5776, won't-fix) is recorded beside that tuple.
+    project_id: str | None = None
+    # NOTE TO FILE (plans/plan-deviation-recording-prd.md D2) — a filer-declared
+    # record that requests nothing: never pending (EscalationQueue.submit), and
+    # filed by EscalationQueue.submit_resolved.  Every resolution-class stamp
+    # site refuses this flag without NOTE_TO_FILE_CLASS, and that class without
+    # this flag, via note_to_file_class_conflict.  Zero migration via the
+    # from_dict filter.
+    note_to_file: bool = False
+    # Trip facts from the EWA-rate detector (task 4687) and the park-stop
+    # detector (task 4688) when they escalate instead of halting.  None for
+    # every other escalation; zero migration via the from_dict
+    # __dataclass_fields__ filter.
+    ewa_rate_trip: EwaRateTripFacts | None = None
+    park_stop_trip: ParkStopTripFacts | None = None
+    # Cancel-with-children facts as plain JSON (contract:
+    # shared/src/shared/cancel_dispositions.py). Writers: the residue record (γ)
+    # and the abandon persistence (δ). cancel_children holds rows_to_json
+    # output, one ChildRow each; children holds the disposition map as
+    # children_to_json writes it. Validation is at the δ boundary, not here.
+    # None for every other escalation; zero migration via the from_dict
+    # __dataclass_fields__ filter.
+    cancel_children: list[dict] | None = None
+    children: dict[str, dict] | None = None
+    superseded_by: list[int] | None = None
+    # The executor's policy-class claim (task 8422). Sole writer:
+    # queue.claim_policy_class. The fields survive resolution, so a closed
+    # record still names the class it was closed under. Zero migration via the
+    # from_dict filter.
+    policy_class: str | None = None
+    claimed_at: str | None = None
+    claimed_by: str | None = None
+    # The resolver's human-ruling assertion (plans/instruments-honesty-prd.md
+    # decision 9). None = not asserted, which is every legacy record; True = a
+    # human ruled on this record or its sitting docket item. Written only at
+    # the resolve chokepoint. Zero migration via the from_dict filter.
+    ruled_by_human: bool | None = None
+    # The merge-halt release marker (task 3876). Sole writer:
+    # queue.release_merge_halt. A record carrying halt_released_at never
+    # re-owns a merge-queue halt:
+    # orchestrator/src/orchestrator/merge_halt_rehydration.py::rehydrate_merge_halt
+    # skips it. Zero migration via the from_dict filter.
+    halt_released_at: str | None = None
+    halt_release_note: str = ''
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -171,3 +906,69 @@ class Escalation:
     @classmethod
     def from_json(cls, text: str) -> Escalation:
         return cls.from_dict(json.loads(text))
+
+
+_L2_CASCADE_RESOLVER_PREFIX = 'l2-cascade:'
+
+
+def cascade_resolved_by(parent_id: str) -> str:
+    """The ``resolved_by`` an L2's cascade stamps on each member it closes."""
+    return f'{_L2_CASCADE_RESOLVER_PREFIX}{parent_id}'
+
+
+def cascade_parent_id(resolved_by: object) -> str | None:
+    """The parent L2 id a ``cascade_resolved_by`` attribution names, else None."""
+    if not isinstance(resolved_by, str):
+        return None
+    if not resolved_by.startswith(_L2_CASCADE_RESOLVER_PREFIX):
+        return None
+    return resolved_by.removeprefix(_L2_CASCADE_RESOLVER_PREFIX) or None
+
+
+EVAL_LANE_CONTAINMENT_RESOLVER = 'escalation-eval-lane-containment'
+PRE_SUBMIT_CHECK_RESOLVER = 'escalation-mcp-pre-submit-check'
+_FILING_RESOLVERS = frozenset({EVAL_LANE_CONTAINMENT_RESOLVER, PRE_SUBMIT_CHECK_RESOLVER})
+
+
+def closed_at_filing(escalation: Escalation) -> bool:
+    """Was *escalation* closed as it was filed — a note to file, or the server's eval-lane containment or terminal-task auto-close — so that no one ruled on it?"""
+    return (
+        escalation.note_to_file
+        or escalation.resolution_class == NOTE_TO_FILE_CLASS
+        or escalation.resolved_by in _FILING_RESOLVERS
+    )
+
+
+def recut_action_conflict(resolution_action: str | None, recut: bool) -> str | None:
+    """Why *recut* cannot qualify *resolution_action*, else None."""
+    if not recut or resolution_action == 'restart':
+        return None
+    return f"recut=True applies only to action='restart'; got action={resolution_action!r}"
+
+
+# The wire code of every refusal for a close that states no resolution_class.
+RESOLUTION_CLASS_REQUIRED_CODE: str = 'resolution_class_required'
+# Ladder levels whose close must carry a resolution_class
+# (plans/instruments-honesty-prd.md decision 8).
+CLASS_REQUIRED_LEVELS: frozenset[int] = frozenset({2})
+
+
+def resolution_class_missing(escalation: Escalation, stamped_class: str | None) -> str | None:
+    """Why *escalation* cannot close with *stamped_class*, a missing class, else None."""
+    if stamped_class is not None or escalation.level not in CLASS_REQUIRED_LEVELS:
+        return None
+    return (
+        f'escalation {escalation.id}: a level {escalation.level} close must state its '
+        'resolution_class; the record is unchanged'
+    )
+
+
+def note_to_file_class_conflict(escalation: Escalation, resolution_class: str | None) -> str | None:
+    """Why *escalation* cannot carry *resolution_class* under the note-to-file pairing, else None."""
+    if escalation.note_to_file == (resolution_class == NOTE_TO_FILE_CLASS):
+        return None
+    return (
+        f'escalation {escalation.id}: note_to_file={escalation.note_to_file} with '
+        f'resolution_class={resolution_class!r}; {NOTE_TO_FILE_CLASS!r} is stamped on a '
+        'note_to_file record and on nothing else'
+    )

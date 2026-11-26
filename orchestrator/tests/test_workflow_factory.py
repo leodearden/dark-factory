@@ -8,10 +8,10 @@ across production dispatch (``harness.py``) and eval dispatch
 MANDATORY ``TaskWorkflow`` constructor parameter is either acquired by both
 call sites automatically or breaks BOTH at once — never drifts silently.
 
-The grep-guard tripwire (added in a later step) mechanises that invariant by
-source inspection: exactly one production-source file may construct
-``TaskWorkflow(`` and both dispatch sites must route through
-``build_workflow(``.
+The grep-guard tripwire mechanises that invariant by source inspection: both
+dispatch sites must route through ``build_workflow(`` (here), and exactly one
+production-source file may construct ``TaskWorkflow(``
+(test_taskworkflow_construction_point_guard.py).
 """
 
 from __future__ import annotations
@@ -57,6 +57,7 @@ def test_build_workflow_forwards_params():
     initial_plan: Any = object()
     usage_gate: Any = object()
     escalation_queue: Any = object()
+    resume_outcome_sink: Any = object()
 
     wf = build_workflow(
         assignment=assignment,
@@ -70,6 +71,7 @@ def test_build_workflow_forwards_params():
         initial_plan=initial_plan,
         event_store=event_store,
         cost_store=cost_store,
+        resume_outcome_sink=resume_outcome_sink,
     )
 
     assert isinstance(wf, TaskWorkflow)
@@ -86,6 +88,7 @@ def test_build_workflow_forwards_params():
     assert wf.initial_plan is initial_plan
     assert wf.usage_gate is usage_gate
     assert wf.escalation_queue is escalation_queue
+    assert wf.resume_outcome_sink is resume_outcome_sink
 
 
 # Every ``build_workflow`` parameter, in ``TaskWorkflow.__init__`` order. The
@@ -100,6 +103,8 @@ _BUILD_WORKFLOW_PARAMS = (
     'escalation_queue', 'escalation_event', 'usage_gate', 'initial_plan',
     'steward_factory', 'merge_queue', 'merge_worker', 'merge_inflight_registry',
     'event_store', 'cost_store', 'cancel_event', 'resume_session_id', 'run_id',
+    'resume_outcome_sink', 'task_verify', 'task_priority', 'verify_cache',
+    'stack_target',
 )
 
 
@@ -141,16 +146,12 @@ def test_build_workflow_forwards_every_param_by_keyword():
 #
 # The single-construction-point invariant is enforced by source inspection, not
 # behaviour: (a) exactly one production-source file may construct ``TaskWorkflow(``
-# and (b) both dispatch sites must route through ``build_workflow(``. Together
-# these encode "one construction point + both sites route through it" — precisely
-# what makes a new required factory arg break BOTH constructions at once rather
-# than drift silently. Scoped to orchestrator/src/orchestrator/ because ~70 test
-# modules legitimately construct TaskWorkflow directly and would false-fail a
-# repo-wide guard.
+# (test_taskworkflow_construction_point_guard.py::test_single_taskworkflow_construction_point)
+# and (b) both dispatch sites must route through ``build_workflow(`` (below).
+# Together these encode "one construction point + both sites route through it" —
+# precisely what makes a new required factory arg break BOTH constructions at
+# once rather than drift silently.
 
-# ``TaskWorkflow(`` not preceded by a word char or dot — a construction call,
-# not ``build_workflow`` / ``class TaskWorkflow:`` / an attribute access.
-_CONSTRUCT_RE = re.compile(r"(?<![\w.])TaskWorkflow\(")
 # ``build_workflow(`` not preceded by a word char or dot — the factory call, not
 # a ``_build_workflow`` lookalike.
 _FACTORY_CALL_RE = re.compile(r"(?<![\w.])build_workflow\(")
@@ -164,25 +165,6 @@ def _orchestrator_src_root() -> Path:
     path-independent and always scans the checkout it is run against.
     """
     return Path(orchestrator.__file__).resolve().parent
-
-
-def test_single_taskworkflow_construction_point():
-    """Only ``workflow.py`` may construct ``TaskWorkflow(`` in production source."""
-    src_root = _orchestrator_src_root()
-    offenders: set[str] = set()
-    for path in src_root.rglob('*.py'):
-        text = path.read_text(encoding='utf-8', errors='ignore')
-        for line in text.splitlines():
-            code = line.split('#', 1)[0]  # drop trailing comment
-            if _CONSTRUCT_RE.search(code):
-                offenders.add(path.relative_to(src_root).as_posix())
-                break
-    assert offenders == {'workflow.py'}, (
-        'Direct TaskWorkflow(...) construction is only permitted in workflow.py '
-        '(the build_workflow() factory body, the single construction point). '
-        f'Offending files: {sorted(offenders)}. Route construction through '
-        'build_workflow().'
-    )
 
 
 def test_both_dispatch_sites_route_through_factory():

@@ -1,0 +1,12 @@
+{
+  "task_id": "9123",
+  "reason": "Enumeration, not new private access: task 9123 step-13 moved the merge-pool helpers (merge_pool, clean_unscoped_gate) into orchestrator/tests/_verify_cache_fixtures.py so test_verify_runner_cache.py and test_verify_cache_remote_view.py share one copy (heuristic 11). Importing verify_runner makes that file lane-importing, so its one private read already on main (full_suite_plan's verify_plan._derive_full_suite_runs) now counts, while test_verify_runner_cache.py (0 reads) leaves the cluster. The public verify_plan.derive_verify_plan reaches full-suite runs only for role='merge', and test_verify_cache_replay.py calls full_suite_plan for the task role, so no public route replaces it.",
+  "measures": [
+    {
+      "measure": "total:private_reads",
+      "key": "<cluster>",
+      "baseline": 6124,
+      "current": 6125
+    }
+  ]
+}

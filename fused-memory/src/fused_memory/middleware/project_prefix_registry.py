@@ -6,11 +6,14 @@ reify-scoped work landing in dark-factory).  This registry generalises the
 prefix list to a per-project map, built once at process start from the
 configured ``known_project_roots``.
 
-Each prefix appears in at most one project: prefixes that show up under
-multiple known roots are dropped on both sides so the guard stays
-deterministic and false-positive-free at the cost of a few false negatives
-on shared directory names (which would have produced ambiguous routing
-suggestions anyway).
+Each prefix appears in at most one project of the GLOBAL table: prefixes that
+show up under multiple known roots are dropped on both sides so the
+filer-agnostic lookups stay deterministic and false-positive-free at the cost
+of a few false negatives on shared directory names (which would have produced
+ambiguous routing suggestions anyway).  The filing project's own top-level
+dirs are still honoured for its own paths: the path-scope guard attributes
+through :meth:`ProjectPrefixRegistry.attributed_owner`, which consults the
+filer's root on disk before the table (task 7515).
 """
 
 from __future__ import annotations
@@ -21,7 +24,10 @@ from dataclasses import dataclass, field
 from functools import cached_property
 from pathlib import Path
 
-from fused_memory.models.scope import resolve_project_id_for_root
+from fused_memory.models.scope import (
+    is_phantom_project_root,
+    resolve_project_id_for_root,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -88,6 +94,42 @@ DARK_FACTORY_PATH_PREFIXES: tuple[str, ...] = (
 )
 
 
+def _is_source_dir(root: Path, entry: str) -> bool:
+    """True when *entry* names a top-level source directory of *root*.
+
+    The one definition of "a project's own top-level dir", shared by prefix
+    discovery and :meth:`ProjectPrefixRegistry.attributed_owner`: non-empty,
+    not hidden, not in `_GENERIC_DIRS`, and a directory on disk now.
+    """
+    if not entry or entry.startswith('.') or entry in _GENERIC_DIRS:
+        return False
+    return os.path.isdir(root / entry)
+
+
+def _normalise_candidate(file_path: str | None) -> str:
+    """Return *file_path* in the spelling the ownership lookups compare.
+
+    Strips whitespace and a leading ``'./'``, expands ``'~'``/``'~/'`` via
+    ``$HOME`` (env only, no NSS lookup), and normalises a RELATIVE result
+    lexically with ``os.path.normpath``.  An absolute result is returned for
+    :meth:`ProjectPrefixRegistry._owner_for_absolute_path`, which normalises
+    it itself.  Returns ``''`` for an empty candidate.  No filesystem access.
+    """
+    path = (file_path or '').strip()
+    if path.startswith('./'):
+        path = path[2:]
+    if not path:
+        return ''
+    if path == '~' or path.startswith('~/'):
+        # Falls through unchanged when $HOME is unset or not absolute.
+        expanded = os.path.expanduser(path)
+        if expanded.startswith('/'):
+            path = expanded
+    if path.startswith('/'):
+        return path
+    return os.path.normpath(path)
+
+
 def _candidate_prefixes_for_root(root: Path) -> list[str]:
     """Return prefix-form names of top-level source dirs under *root*.
 
@@ -99,9 +141,11 @@ def _candidate_prefixes_for_root(root: Path) -> list[str]:
     Hyphenated names get an underscore alias (mirrors the original guard
     listing both ``fused-memory/`` and ``fused_memory/``).
     """
-    if not root.is_dir():
+    if is_phantom_project_root(root):
         logger.warning(
-            'project_prefix_registry: project_root %s is not a directory; skipping',
+            'project_prefix_registry: project_root %s is not a directory; '
+            'registering its project with no prefixes (phantom roots are '
+            'admitted, see fused_memory.models.scope::build_known_projects_map)',
             root,
         )
         return []
@@ -117,11 +161,7 @@ def _candidate_prefixes_for_root(root: Path) -> list[str]:
         return []
 
     for entry in entries:
-        if entry.startswith('.'):
-            continue
-        if entry in _GENERIC_DIRS:
-            continue
-        if not (root / entry).is_dir():
+        if not _is_source_dir(root, entry):
             continue
         prefix = f'{entry}/'
         if prefix not in seen:
@@ -237,7 +277,12 @@ class ProjectPrefixRegistry:
         return tuple(sorted(self.prefix_to_project))
 
     def project_for_prefix(self, prefix: str) -> str | None:
-        """Return the owning project_id for *prefix*, or None if unknown."""
+        """Return the build-time table's owner for *prefix*, or None if unknown.
+
+        A filer-agnostic table probe for tests and diagnostics only. It skips
+        the filer-first rule, so attribution goes through
+        :meth:`attributed_owner` instead.
+        """
         return self.prefix_to_project.get(prefix)
 
     def project_for_path(self, file_path: str | None) -> str | None:
@@ -282,28 +327,42 @@ class ProjectPrefixRegistry:
         component there). When more than one registered prefix matches, the
         LONGEST one wins.
 
-        A leading ``'./'`` is stripped before matching. Returns ``None`` for
-        an empty/falsy *file_path*.
+        A leading ``'./'`` is stripped, then — task 4156 — the candidate is
+        normalised LEXICALLY with ``os.path.normpath``, by the SAME call and
+        for the SAME reason the ABSOLUTE regime uses (see
+        :meth:`_owner_for_absolute_path`): the scan below compares just as
+        lexically, so an unnormalised spelling defeats it in both directions.
+        ``'orchestrator/../crates/foo.rs'`` would match the prefix
+        ``'orchestrator/'`` by bare ``startswith`` and produce a FALSE
+        ownership of a file that is not under ``orchestrator/`` at all, while
+        ``'foo/../orchestrator/x.py'`` would match nothing and silently disarm
+        the guard.  Still NO filesystem access — ``normpath`` is a string
+        operation, so ownership neither resolves symlinks nor depends on the
+        file existing yet, and deliberately NOT ``abspath``/``realpath``/
+        ``Path.resolve()``, which would splice in the process CWD and make the
+        verdict depend on where the interceptor happens to be running.
 
-        This is the CERTAIN/structured counterpart to the heuristic prose
-        scanners in :mod:`fused_memory.middleware.path_scope_guard` — used by
-        ``check_files_for_scope`` to classify concrete ``metadata.files``
-        entries (task 2206) and by ``all_files_foreign_owner`` for the
-        cross-repo tagger (task 3004). Both spellings of the same logical file
-        now classify identically (task 3109).
+        A candidate that normalises to a leading ``'..'`` (or to ``'.'``) is
+        UNOWNED by design: this regime is given no base directory to resolve it
+        against, so ``'../other-repo/x.py'`` is genuinely unclassifiable. That
+        fails OPEN — a missed rejection, never a false one — matching the
+        residue documented at :meth:`_owner_for_absolute_path`. Returns
+        ``None`` for an empty/falsy *file_path*.
+
+        This is the FILER-AGNOSTIC table/root lookup: it never consults which
+        project is filing.  The path-scope guard in
+        :mod:`fused_memory.middleware.path_scope_guard` classifies concrete
+        ``metadata.files`` entries and prose prefixes through
+        :meth:`attributed_owner` instead, which falls back to this method.
+        Both spellings of the same logical file classify identically (task
+        3109).
         """
-        path = (file_path or '').strip()
-        if path.startswith('./'):
-            path = path[2:]
+        return self._owner_for_normalised(_normalise_candidate(file_path))
+
+    def _owner_for_normalised(self, path: str) -> str | None:
+        """:meth:`project_for_path` for a path already put through `_normalise_candidate`."""
         if not path:
             return None
-
-        if path == '~' or path.startswith('~/'):
-            # Env-only expansion (no NSS/passwd lookup, so no I/O); falls
-            # through unchanged when $HOME is unset or not absolute.
-            expanded = os.path.expanduser(path)
-            if expanded.startswith('/'):
-                path = expanded
 
         if path.startswith('/'):
             # ABSOLUTE regime (task 3109): resolved against known project
@@ -311,9 +370,11 @@ class ProjectPrefixRegistry:
             # regimes are disjoint by construction — a registered prefix is
             # always a top-level dir name, so it can never lead an absolute
             # path, and roots are always absolute, so they can never match a
-            # relative candidate. This early return is therefore a
-            # short-circuit, not a semantic change for relative input, which
-            # keeps the prefix scan below byte-identical.
+            # relative candidate. That disjointness is what made ADDING this
+            # early return in 3109 a pure short-circuit, leaving the relative
+            # verdicts of the day untouched — a fact about that change, not a
+            # standing claim about the scan below, which has since grown its
+            # own normalisation (task 4156). This is a regime selector.
             return self._owner_for_absolute_path(path)
 
         best_prefix = ''
@@ -324,6 +385,25 @@ class ProjectPrefixRegistry:
                 best_prefix = prefix
                 best_owner = owner
         return best_owner
+
+    def attributed_owner(
+        self, file_path: str | None, filing_project: str,
+    ) -> str | None:
+        """Return the owner of *file_path* as filed by *filing_project*.
+
+        A RELATIVE path whose leading component is a top-level source dir
+        (:func:`_is_source_dir`) under the filing project's root on disk right
+        now belongs to the filer, whatever the build-time, collision-pruned
+        table says; anything else falls back to :meth:`project_for_path`.
+        This is the single attribution entry point for the path-scope guard.
+        """
+        path = _normalise_candidate(file_path)
+        filer_root = self.project_to_root.get(filing_project)
+        if filer_root and path and not path.startswith('/'):
+            leading = path.split('/', 1)[0]
+            if _is_source_dir(Path(filer_root), leading):
+                return filing_project
+        return self._owner_for_normalised(path)
 
     @cached_property
     def _roots_longest_first(self) -> tuple[tuple[str, str], ...]:

@@ -1,0 +1,17 @@
+{
+  "arm_id": "granite-embedding-english-r2",
+  "arm_role": "candidate",
+  "axis": "embedding",
+  "code_sha": "8bb8c8893b0f58957753954ab0338d47f4b609b9",
+  "corpus_sha": "1eb3ed883afb5396fcba47a240e41f4b501d5b678789c48541325eb7c811b287",
+  "incomplete": false,
+  "measured_at": "2026-10-09T09:54:21.007359Z",
+  "metric": {
+    "kind": "scalar",
+    "metric_id": "query-embed-latency-p95",
+    "n": 500,
+    "value": 30.112157110124826
+  },
+  "preregistration_sha": "be4a44d6243b58a3293d66eb73f0ba56fa206efd",
+  "schema_version": 1
+}

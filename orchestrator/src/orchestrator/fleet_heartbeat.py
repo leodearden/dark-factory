@@ -2,7 +2,8 @@
 orchestrator fleet-redeploy PRD).
 
 Every orchestrator unit writes a tiny JSON heartbeat to a fleet-common
-directory, keyed by its own ``ORCH_UNIT``, on each run-loop tick.  This
+directory, keyed by its own ``ORCH_UNIT``, from the harness's merge-heartbeat
+background service (task 5344).  This
 module owns the on-disk contract (directory resolution, payload shape, and
 the atomic writer) so producer (``Harness._write_merge_heartbeat``, this
 task) and future readers — γ (the drain gate) and ε (``--report``'s
@@ -17,9 +18,11 @@ from __future__ import annotations
 
 import json
 import os
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
+
+from shared import safe_io
 
 # Fleet-common heartbeat directory default.  Matches the stdlib watchdog's
 # hardcoded REPO_DIR (scripts/orchestrator-watchdog.py:70) so this producer
@@ -27,10 +30,6 @@ from typing import Any
 # run with WorkingDirectory=/home/leo/src/dark-factory regardless of their
 # own (possibly foreign) config.project_root.
 DEFAULT_FLEET_DIR = Path('/home/leo/src/dark-factory/data/fleet')
-
-# Deterministic fallback filename stem for an empty/unresolved unit, so a
-# heartbeat is never written to a file literally named ``.json``.
-_UNKNOWN_UNIT_STEM = 'unknown-unit'
 
 
 def resolve_fleet_dir(env: Mapping[str, str] | None = None) -> Path:
@@ -55,13 +54,26 @@ def build_heartbeat_payload(
     depth: int,
     queue_empty: bool,
     ts_epoch: float,
+    *,
+    drain: Mapping[str, Any] | None,
+    verifies_in_flight: Sequence[Mapping[str, Any]],
+    deployed_sha: Mapping[str, Any] | None,
 ) -> dict[str, Any]:
     """Build the on-disk heartbeat payload.
 
-    Returns a dict with exactly the five fields ``{unit, merge_idle, depth,
-    queue_empty, ts_epoch}`` in that key order, with values passed through
-    unchanged (no coercion) — this is the single definition of the on-disk
-    contract shared with the future readers (γ drain gate, ε ``--report``).
+    Returns a dict with exactly the eight fields ``{unit, merge_idle, depth,
+    queue_empty, ts_epoch, drain, verifies_in_flight, deployed_sha}`` in that
+    key order, with values passed through unchanged (no coercion) — this is
+    the single definition of the on-disk contract shared with the readers
+    (``scripts/drain_check.py``, the watchdog's ``--report``).
+
+    ``drain`` and ``verifies_in_flight`` are the restart-drain additions
+    (task 5371): the acknowledgement of this unit's drain request (``None``
+    when there is none) and the merge verifies in flight.  ``deployed_sha``
+    (task 6565) is ``orchestrator.deployed_sha.DeployedSha.to_wire()`` for the
+    code this unit runs, or ``None`` when it could not be read.  All three are
+    keyword-only and required so no producer can omit them; the drain shapes
+    are defined in ``orchestrator.fleet_drain``.
     """
     return {
         'unit': unit,
@@ -69,26 +81,102 @@ def build_heartbeat_payload(
         'depth': depth,
         'queue_empty': queue_empty,
         'ts_epoch': ts_epoch,
+        'drain': None if drain is None else dict(drain),
+        'verifies_in_flight': [dict(v) for v in verifies_in_flight],
+        'deployed_sha': None if deployed_sha is None else dict(deployed_sha),
     }
+
+
+def is_bare_unit_name(unit: str) -> bool:
+    """True iff *unit* is non-blank and a single path component.
+
+    The one rule for a unit name interpolated into a file name in the fleet
+    directory (``<unit>.json`` here, ``<unit>.drain.json`` in
+    ``orchestrator.fleet_drain``): a separator, a ``..`` or an absolute path
+    would escape the directory.
+    """
+    return (
+        bool(unit.strip())
+        and unit not in {os.curdir, os.pardir}
+        and unit == Path(unit).name
+        and (os.altsep is None or os.altsep not in unit)
+    )
 
 
 def write_heartbeat(fleet_dir: Path, unit: str, payload: Mapping[str, Any]) -> Path:
     """Atomically write *payload* to ``<fleet_dir>/<unit>.json``.
 
-    Mirrors ``Scheduler._write_state_snapshot_raw`` (scheduler.py:4749):
-    creates missing parent directories, writes to a ``.json.tmp`` sibling,
-    then ``os.replace``s it into place so concurrent readers (γ, ε) never
-    observe a partial write. An empty/unresolved ``unit`` falls back to a
-    deterministic ``unknown-unit.json`` filename rather than a file
-    literally named ``.json``.
+    Delegates to :func:`shared.safe_io.atomic_write_text` (task 3223), which
+    creates missing parent directories and does the tmp + ``os.replace`` dance
+    so concurrent readers (γ, ε) never observe a partial write.
+
+    ``unit`` must be a non-blank, single path component: it is the heartbeat's
+    identity, its only link back to the writer, and it is interpolated straight
+    into the destination path.  Anything else raises :class:`ValueError` BEFORE
+    any filesystem work, so a writer that reached this point without a usable
+    unit name creates nothing at all — not even the parent directory (task
+    3951).  Two rejections, one rule:
+
+    * BLANK (empty or whitespace-only).  This used to fall back to a
+      deterministic ``unknown-unit.json``; nothing ever read that file
+      (``scripts/drain_check.py`` addresses heartbeats by name via
+      ``heartbeat_path(fleet_dir, unit)`` and never enumerates the directory),
+      so the fallback bought no consumer anything while turning a real
+      misconfiguration into a plausible-looking file in a machine-global,
+      cross-project directory.  A whitespace-only unit is REJECTED, never
+      ``.strip()``ed into a "fixed" name: silently repairing a malformed unit
+      name is the same silent corruption this guard exists to end.
+    * NOT A BARE FILENAME (contains a separator, or is ``.``/``..``).  The same
+      defect one degree worse.  ``fleet_dir / f'{unit}.json'`` is plain
+      interpolation, so a ``..`` component walks out of the fleet directory and
+      an ABSOLUTE unit discards *fleet_dir* altogether (``Path.__truediv__``
+      keeps only the absolute right operand): a unit of ``/abs/unit`` writes
+      ``/abs/unit.json``.  Unit names arrive from the ambient environment, so
+      this is reachable by misconfiguration, not just by malice.  Rejecting
+      makes the returned path provably inside *fleet_dir*.
+
+    Both messages are CALLER-NEUTRAL, and deliberately name no environment
+    variable.  This module is the shared on-disk contract for every producer
+    and reader (γ drain gate, ε ``--report``), and is kept dependency-free of
+    ``Harness``; HOW a caller resolves its unit — ``ORCH_UNIT`` today, config or
+    argv for the next producer — is the caller's business, so a hardcoded
+    "set ORCH_UNIT" hint would point a future producer at the wrong knob.  The
+    caller-specific remediation belongs at the call site's own log line.
+
+    ``mode`` is deliberately left at the helper's umask default rather than
+    narrowed: these heartbeats are read by other processes. Exceptions
+    propagate — this site has no fail-open boundary.  The sole production
+    caller, ``Harness._write_merge_heartbeat``, has its own ``except
+    Exception`` (a heartbeat write must never stop the run loop), so in
+    production this raise surfaces as a logged WARNING rather than a crash —
+    while the corruption is prevented either way.
 
     Returns the final on-disk ``Path``.
     """
     fleet_dir = Path(fleet_dir)
-    fleet_dir.mkdir(parents=True, exist_ok=True)
-    stem = unit if unit else _UNKNOWN_UNIT_STEM
-    path = fleet_dir / f'{stem}.json'
-    tmp_path = path.with_suffix('.json.tmp')
-    tmp_path.write_text(json.dumps(payload), encoding='utf-8')
-    os.replace(tmp_path, path)
+    if not unit or not unit.strip():
+        raise ValueError(
+            f'refusing to write a heartbeat with a blank unit name (unit={unit!r}) '
+            f'into {fleet_dir}. The unit name is the heartbeat\'s identity and its '
+            'only link back to the writer, so the caller must resolve a real, '
+            'non-blank one (e.g. "orchestrator-dark-factory.service") before '
+            'calling. Writing anyway would put an unattributable file in a '
+            'machine-global, cross-project fleet directory.'
+        )
+    if not is_bare_unit_name(unit):
+        raise ValueError(
+            f'refusing to write a heartbeat with a unit name that is not a single '
+            f'path component (unit={unit!r}) into {fleet_dir}. The name is '
+            'interpolated straight into <fleet_dir>/<unit>.json, so a separator, a '
+            '".." traversal or an absolute path escapes the fleet directory and '
+            'writes an arbitrary file. The caller must resolve a bare unit name '
+            '(e.g. "orchestrator-dark-factory.service") before calling.'
+        )
+    path = fleet_dir / f'{unit}.json'
+    safe_io.atomic_write_text(
+        path,
+        json.dumps(payload),
+        encoding='utf-8',
+        mkdir=True,
+    )
     return path

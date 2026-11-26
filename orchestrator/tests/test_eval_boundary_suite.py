@@ -1,6 +1,6 @@
-"""Phase-1 eval↔production integration gate — boundary suite B1–B9 (+ capstone).
+"""Phase-1 eval↔production integration gate — boundary suite B1–B11 (+ capstone).
 
-PRD eval-framework-revival §ι, Contract H, Boundary-test sketch B1–B9.
+PRD eval-framework-revival §ι, Contract H, Boundary-test sketch B1–B10.
 
 This is the "C-as-integration-gate" for the eval-framework-revival PRD: the
 two-way eval↔production seam test proving that the mechanisms delivered by the
@@ -16,6 +16,7 @@ REAL composed eval code paths against one refreshed fixture:
   - ``workflow._spawn_dry_run_unblock`` disabled early-return               (D4)
   - ``workflow.build_workflow`` single construction point               (α/P2)
   - ``metrics.compute_composite`` contract-agnostic scoring            (P4/B8)
+  - ``build_eval_orch_config`` ``strict_mcp_config`` vs the tracked ``.mcp.json`` (B10)
 
 Each B# faces BOTH sides of its seam: the production default AND the eval-side
 divergence, so the test proves the profile actually flips the behaviour rather
@@ -32,6 +33,8 @@ B# → mechanism map
   B7  no unblock spawn    ``_spawn_dry_run_unblock`` spawns 0 tasks with ``unblock_auto`` off
   B8  contract-agnostic   ``quality_from_review_artifact`` scores legacy == envelope shape
   B9  no claimant spam    a real eval ``Scheduler`` heartbeat logs zero warnings
+  B10 mcp isolation       eval config turns ``strict_mcp_config`` on against the live servers ``.mcp.json`` declares
+  B11 zero-write cell     one real eval cell leaves the production queue dir, runs.db, transcript archive and task store unchanged; its transcripts land under ``eval_worktree_root``
 
 Why this suite is deterministic and CI-runnable (design decision)
 -----------------------------------------------------------------
@@ -54,7 +57,7 @@ session and the eval fixtures + their ``evals/<id>`` branches / pre-task
 commits checked out::
 
     # From the repo root, one contender over one fixture. The eval runner's
-    # __main__ routes to orchestrator.cli:eval_cmd; select the task + config
+    # __main__ routes to orchestrator.evals.cli:eval_cmd; select the task + config
     # and (optionally) point memory writes at a RecordingMemorySink so the
     # intended writes are captured instead of dropped at the null sentinel:
     cd orchestrator
@@ -76,27 +79,40 @@ via ``run_eval`` only when you want to capture the writes. See
 from __future__ import annotations
 
 import asyncio
+import copy
+import json
 import logging
 import subprocess
 from collections.abc import Callable, Coroutine
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
+from _briefing_helpers import MEMORY_TRANSPORT
+from _workflow_helpers import ENC, PLAN, AgentStub, _init_repo
+from shared.cli_invoke import AgentResult
+from shared.project_layout import (
+    agent_transcripts_dir,
+    escalation_queue_dir,
+    runs_db,
+    tasks_db,
+)
+from shared.task_submit import SubmitFailed
+from shared.transcript_archive import resolve_archive_root
 from test_scheduler_dispatch_literal_tripwire import _dispatch_tool_literals
 from test_workflow_factory import (
-    _CONSTRUCT_RE,
     _FACTORY_CALL_RE,
     _orchestrator_src_root,
 )
 
-from orchestrator.config import OrchestratorConfig, load_config
+from orchestrator.config import OrchestratorConfig, SandboxConfig, load_config
 from orchestrator.evals import judge as _judge
 from orchestrator.evals import profile as _profile
+from orchestrator.evals import runner as _runner
 from orchestrator.evals import snapshots as _snapshots
 from orchestrator.evals.configs import EvalConfig
-from orchestrator.evals.profile import EVAL_PROFILE
+from orchestrator.evals.profile import EVAL_PROFILE, resolved_eval_profile
 from orchestrator.evals.runner import (
     RecordingMemorySink,
     _build_eval_scheduler,
@@ -104,8 +120,10 @@ from orchestrator.evals.runner import (
     _StubMcpSession,
     build_eval_orch_config,
 )
+from orchestrator.fm_retry import FM_NULL_SENTINEL_URL
 from orchestrator.mcp import verdict_tools as _verdict_tools
-from orchestrator.workflow import TaskWorkflow
+from orchestrator.verify import VerifyResult
+from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
 
 # The non-routable null sentinel EVAL_PROFILE pins fused_memory.url to, and the
 # production endpoint an un-isolated eval run would otherwise write into.
@@ -184,7 +202,7 @@ def committed_diff_fixture(tmp_path: Path) -> tuple[Path, str]:
 
 def _fake_invoke_agent(
     captured_prompts: list[str],
-) -> Callable[..., Coroutine[Any, Any, SimpleNamespace]]:
+) -> Callable[..., Coroutine[Any, Any, AgentResult]]:
     """Return an ``invoke_agent`` replacement that records prompts.
 
     Monkeypatch the returned coroutine over ``judge.invoke_agent`` (or
@@ -194,21 +212,25 @@ def _fake_invoke_agent(
     reads).  No real agent runs, so B4 grades the real committed diff for free.
     """
 
-    async def _fake(**kwargs: Any) -> SimpleNamespace:
+    async def _fake(**kwargs: Any) -> AgentResult:
         captured_prompts.append(str(kwargs.get('prompt', '')))
-        return SimpleNamespace(
+        return AgentResult(
+            success=True,
             structured_output={
                 'winner': 'A',
                 'confidence': 0.9,
                 'reasoning': 'canned boundary-suite verdict',
             },
             output='{"winner": "A", "confidence": 0.9, "reasoning": "r"}',
+            cost_usd=0.0,
         )
 
     return _fake
 
 
-def _load_default_config(tmp_path: Path) -> OrchestratorConfig:
+def _load_default_config(
+    tmp_path: Path, project_root: Path | None = None,
+) -> OrchestratorConfig:
     """Load a deterministic pure-code-default config via the REAL ``load_config()``.
 
     B1 (and the capstone) must face the production config-LOAD entry point,
@@ -221,12 +243,13 @@ def _load_default_config(tmp_path: Path) -> OrchestratorConfig:
     ``ORCH_CONFIG_PATH`` at an ABSENT file, and ``load_config`` raises
     ``ConfigRequiredError`` on a missing config file (see ``config.load_config``)
     rather than falling through to defaults. Instead we write a minimal config
-    setting only ``project_root``; ``load_config`` layers it over the
-    package-bundled ``defaults.yaml``, so every profile leaf resolves to its
-    pure code default — through the real production entry point.
+    setting only ``project_root`` (*project_root*, else *tmp_path*);
+    ``load_config`` layers it over the package-bundled ``defaults.yaml``, so
+    every profile leaf resolves to its pure code default — through the real
+    production entry point.
     """
     cfg_path = tmp_path / 'orchestrator.yaml'
-    cfg_path.write_text(f'project_root: {tmp_path}\n')
+    cfg_path.write_text(f'project_root: {project_root or tmp_path}\n')
     return load_config(cfg_path)
 
 
@@ -243,9 +266,12 @@ def test_b1_eval_profile_divergence_parity_and_tripwire(
     constructs ``OrchestratorConfig`` directly). Two halves:
 
     (1) Parity — the divergence report's key set equals ``set(EVAL_PROFILE)``
-        and every eval-side value equals the documented profile value (incl.
-        the D8 ``fused_memory.url`` null sentinel); each base-side value
-        genuinely differs, so no leaf is a vacuous no-op.
+        and every eval-side value equals the documented profile value resolved
+        for this base (incl. the D8 ``fused_memory.url`` null sentinel); each
+        base-side value genuinely differs, so no leaf is a vacuous no-op. The
+        report lists ``transcript_archive.root``, and its eval value lies under
+        ``eval_worktree_root(base.project_root)`` (S1 boundary row 27), an
+        oracle independent of the resolver.
     (2) Tripwire — a leaked non-profile field (``max_amendment_rounds``, which
         ``EVAL_PROFILE`` never touches) makes the report NAME the offender and
         its key set no longer equal ``set(EVAL_PROFILE)`` — the RED signal B1
@@ -253,8 +279,8 @@ def test_b1_eval_profile_divergence_parity_and_tripwire(
 
     Exactness holds by construction: ``apply_eval_profile`` is a
     ``model_copy(update=)`` that changes exactly the profile leaves, and β
-    proves all 6 differ from their code defaults, so the divergence is
-    precisely the 6 documented keys — never more (a leak) or fewer (a no-op).
+    proves all 8 differ from their code defaults, so the divergence is
+    precisely the 8 documented keys — never more (a leak) or fewer (a no-op).
     """
     base = _load_default_config(tmp_path)
 
@@ -262,7 +288,7 @@ def test_b1_eval_profile_divergence_parity_and_tripwire(
 
     # (1) Parity: exact key-set match against the documented profile.
     assert set(divergence) == set(EVAL_PROFILE)
-    for leaf, expected_eval in EVAL_PROFILE.items():
+    for leaf, expected_eval in resolved_eval_profile(base).items():
         base_value, eval_value = divergence[leaf]
         assert eval_value == expected_eval, (
             f'{leaf}: eval-side {eval_value!r} != documented {expected_eval!r}'
@@ -270,6 +296,11 @@ def test_b1_eval_profile_divergence_parity_and_tripwire(
         assert base_value != expected_eval, (
             f'{leaf}: base already equals its profile value — vacuous divergence'
         )
+    assert 'transcript_archive.root' in divergence
+    _base_root, eval_root = divergence['transcript_archive.root']
+    assert Path(eval_root).is_relative_to(
+        _snapshots.eval_worktree_root(base.project_root),
+    )
 
     # (2) Tripwire: an undocumented leak trips the parity check and is named.
     # eval_profile_divergence computes apply_eval_profile(base) vs base, so we
@@ -380,10 +411,11 @@ def test_b8_quality_from_review_artifact_contract_agnostic() -> None:
 
 # ── B2: factory single construction point (P2) ─────────────────────────────
 
-# The single-construction-point scanner — the ``_CONSTRUCT_RE`` /
-# ``_FACTORY_CALL_RE`` regexes and ``_orchestrator_src_root`` — is IMPORTED from
-# test_workflow_factory (the ONE authoritative scanner for the P2 grep-guard
-# invariant), so a fix there propagates here instead of drifting from a copy.
+# The tree-wide "only workflow.py constructs TaskWorkflow(" sweep is
+# test_taskworkflow_construction_point_guard.py::test_single_taskworkflow_construction_point,
+# the ONE static sweep for P2.  The dispatch-site regex ``_FACTORY_CALL_RE`` and
+# ``_orchestrator_src_root`` are IMPORTED from test_workflow_factory so a fix
+# there propagates here instead of drifting from a copy.
 
 
 def test_b2_factory_single_construction_point(
@@ -400,9 +432,10 @@ def test_b2_factory_single_construction_point(
         a new required ``TaskWorkflow`` param breaks the single construction
         point, hence BOTH dispatch sites (harness.py + evals/runner.py, which
         both route through ``build_workflow``) at once.
-    (2) Static: ``workflow.py`` is the ONLY production-source file constructing
-        ``TaskWorkflow(``, and both dispatch sites contain a ``build_workflow(``
-        call — proving there is no third bypass site.
+    (2) Static: both dispatch sites contain a ``build_workflow(`` call.  That
+        ``workflow.py`` is the ONLY production-source file constructing
+        ``TaskWorkflow(``, so there is no third bypass site, is proven by
+        test_taskworkflow_construction_point_guard.py::test_single_taskworkflow_construction_point.
     """
     from orchestrator import workflow as workflow_mod
     from orchestrator.workflow import build_workflow
@@ -423,21 +456,8 @@ def test_b2_factory_single_construction_point(
             mcp=object(),  # type: ignore[arg-type]
         )
 
-    # (2) Static single-point (compose the existing grep-guard invariant).
+    # (2) Static: both dispatch sites route through the factory.
     src_root = _orchestrator_src_root()
-    offenders: set[str] = set()
-    for path in src_root.rglob('*.py'):
-        text = path.read_text(encoding='utf-8', errors='ignore')
-        for line in text.splitlines():
-            code = line.split('#', 1)[0]  # drop trailing comment
-            if _CONSTRUCT_RE.search(code):
-                offenders.add(path.relative_to(src_root).as_posix())
-                break
-    assert offenders == {'workflow.py'}, (
-        f'Direct TaskWorkflow(...) construction is only permitted in workflow.py; '
-        f'offending files: {sorted(offenders)}'
-    )
-
     for rel in ('harness.py', 'evals/runner.py'):
         source = (src_root / rel).read_text(encoding='utf-8')
         assert _FACTORY_CALL_RE.search(source), (
@@ -757,6 +777,189 @@ async def test_b9_set_task_claimant_heartbeat_no_warning(
     )
 
 
+# ── B10: eval agent MCP isolation (task 4757) ──────────────────────────────
+
+
+def test_b10_eval_agent_mcp_isolation_two_way(tmp_path: Path) -> None:
+    """B10 — eval agents are strictly MCP-scoped; production agents are not.
+
+    The premise: the tracked ``.mcp.json`` every eval worktree carries really
+    declares the live ``escalation`` and ``fused-memory`` servers, which the CLI
+    merges into any agent not run with ``--strict-mcp-config``. The two sides:
+    the deployed ``load_config()`` leaves ``strict_mcp_config`` off, and
+    ``build_eval_orch_config`` turns it on for the ``TaskWorkflow._invoke`` path.
+    What each eval spawn site then hands the argv builder is pinned in
+    ``test_eval_mcp_isolation.py``, which drives the real call sites.
+    """
+    ambient = json.loads(
+        (_orchestrator_src_root().parents[2] / '.mcp.json').read_text(),
+    )['mcpServers']
+    assert {'escalation', 'fused-memory'} <= set(ambient), (
+        f'tracked .mcp.json changed shape ({sorted(ambient)}); re-derive the '
+        'eval MCP isolation guard against the new ambient servers'
+    )
+
+    base = _load_default_config(tmp_path)
+    assert base.strict_mcp_config is False
+
+    cfg = EvalConfig(name='t', backend='claude', model='sonnet', effort='high')
+    task = {'id': 't', 'project_root': str(tmp_path)}
+    assert build_eval_orch_config(cfg, task, base).strict_mcp_config is True
+
+
+# ── B11: zero-write eval cell (S1 λ1, C11) ─────────────────────────────────
+
+
+class _TranscriptWritingAgents(AgentStub):
+    """``AgentStub`` whose every session first leaves its transcript where the CLI would.
+
+    The file goes at ``<config_dir>/projects/<ENC>/<session_id>.jsonl``, built
+    from the session id ``_invoke`` forwards, so the producer hook has a real
+    transcript to archive and the row proves where it put it.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.session_ids: list[str] = []
+
+    async def invoke_agent(
+        self, prompt: str, system_prompt: str, cwd: Path, **kwargs: Any,
+    ) -> AgentResult:
+        config_dir = Path(getattr(kwargs['config_dir'], 'path', kwargs['config_dir']))
+        session_id = kwargs['session_id']
+        transcript = config_dir / 'projects' / ENC / f'{session_id}.jsonl'
+        transcript.parent.mkdir(parents=True, exist_ok=True)
+        transcript.write_bytes(b'{"type":"assistant"}\n')
+        self.session_ids.append(session_id)
+        return await super().invoke_agent(prompt, system_prompt, cwd, **kwargs)
+
+
+def _store_snapshot(store: Path) -> dict[str, bytes | None]:
+    """Every entry of *store* mapped to its bytes (``None`` for a directory).
+
+    A directory store is walked whole. A file store also covers the siblings
+    sharing its name as a prefix (sqlite's ``-wal`` / ``-journal``), so a
+    write landing beside the seeded bytes still shows.
+    """
+    base, entries = (
+        (store, store.rglob('*')) if store.is_dir()
+        else (store.parent, store.parent.glob(f'{store.name}*'))
+    )
+    return {
+        str(entry.relative_to(base)): entry.read_bytes() if entry.is_file() else None
+        for entry in sorted(entries)
+    }
+
+
+@pytest.mark.asyncio
+async def test_b11_eval_cell_writes_no_production_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """B11 — one real eval cell writes nothing to the project's production stores.
+
+    S1 boundary row 27 (λ1's half; plans/review-all-s1-one-escalation-filing-entry-point-prd.md
+    C11). The cell is built along ``_run_workflow_cell``'s own path —
+    ``build_eval_orch_config`` → ``create_eval_worktree`` → ``_cell_workflow`` —
+    and run to DONE with agents that each write a real transcript. Afterwards
+    the four production stores (escalation queue dir, ``runs.db``, transcript
+    archive, task store) are byte- and listing-identical to their seeds; the
+    workflow holds no queue, event store or cost store; a task write is refused
+    by the eval stub session; every curator post's base url is the null
+    sentinel, as is every memory recall the cell's briefings attempt; and
+    every transcript was archived under ``eval_worktree_root``.
+    """
+    proj = tmp_path / 'proj'
+    _init_repo(proj)
+    pre_task_commit = _git(['rev-parse', 'HEAD'], cwd=proj)
+
+    stores = {
+        'escalation_queue': escalation_queue_dir(proj),
+        'runs_db': runs_db(proj),
+        'transcript_archive': agent_transcripts_dir(proj),
+        'task_store': tasks_db(proj),
+    }
+    seeds = {
+        escalation_queue_dir(proj) / 'seed.json': b'{"seed": "queue"}',
+        runs_db(proj): b'seed runs.db',
+        agent_transcripts_dir(proj) / 'seed' / 'seed.jsonl': b'{"seed": "transcript"}',
+        tasks_db(proj): b'seed tasks.db',
+    }
+    for path, payload in seeds.items():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(payload)
+    before = {name: _store_snapshot(path) for name, path in stores.items()}
+
+    base = _load_default_config(tmp_path, project_root=proj).model_copy(
+        update={'sandbox': SandboxConfig(enabled=False)},
+    )
+    task = {
+        'id': 'df_task_9845',
+        'name': 'b11 zero-write cell',
+        'project_root': str(proj),
+        'pre_task_commit': pre_task_commit,
+        'modules': ['lib'],
+        'judge_after_each_iteration': False,
+        'task_definition': {'title': PLAN['title'], 'description': PLAN['analysis']},
+    }
+    orch_config = build_eval_orch_config(
+        EvalConfig(name='t', backend='claude', model='sonnet', effort='high'),
+        task, base,
+    )
+
+    # The briefing's memory recall gets the refused connection the dead null
+    # sentinel gives; every other McpSession round-trip still meets the
+    # autouse forbid_live_mcp guard.
+    memory_recall = AsyncMock(side_effect=ConnectionRefusedError(111, 'Connection refused'))
+    monkeypatch.setattr(MEMORY_TRANSPORT, memory_recall)
+    agents = _TranscriptWritingAgents()
+    monkeypatch.setattr('orchestrator.workflow.invoke_agent', agents.invoke_agent)
+    task_gate = AsyncMock(return_value=VerifyResult(
+        passed=True, test_output='OK', lint_output='',
+        type_output='', summary='All checks passed',
+    ))
+
+    worktree, _ = await _snapshots.create_eval_worktree(
+        proj, task['id'], task['pre_task_commit'],
+    )
+    plan = {**copy.deepcopy(PLAN), 'task_id': task['id']}
+    workflow = _runner._cell_workflow(
+        task, orch_config, worktree, plan, replay_framed=False, usage_gate=None,
+        task_gate=task_gate,
+    )
+    report = await workflow.run()
+    assert report.outcome == WorkflowOutcome.DONE
+    assert agents.session_ids, 'no agent ran — the row would pass vacuously'
+
+    after = {name: _store_snapshot(path) for name, path in stores.items()}
+    for name in stores:
+        assert after[name] == before[name], f'the eval cell wrote to production {name}'
+
+    assert workflow.escalation_queue is None
+    assert workflow.event_store is None
+    assert workflow.cost_store is None
+
+    outcome = await workflow.scheduler.submit_task(
+        {'title': 'b11 probe', 'description': 'd'},
+    )
+    assert isinstance(outcome, SubmitFailed)
+    assert 'EvalStubRefusal' in outcome.reason
+
+    assert workflow.mcp is not None
+    assert workflow.mcp.url == FM_NULL_SENTINEL_URL
+    recall_urls = {call.args[0] for call in memory_recall.call_args_list}
+    assert recall_urls == {f'{FM_NULL_SENTINEL_URL}/mcp'}, recall_urls
+
+    archive_root = resolve_archive_root(
+        orch_config.project_root, orch_config.transcript_archive.root,
+    )
+    assert archive_root.is_relative_to(_snapshots.eval_worktree_root(proj))
+    assert not archive_root.is_relative_to(proj)
+    for session_id in agents.session_ids:
+        assert list(archive_root.rglob(f'{session_id}.jsonl')), (
+            f'session {session_id} was not archived under {archive_root}'
+        )
+
+
 # ── Capstone: one refreshed fixture through the composed eval framework ─────
 
 
@@ -792,7 +995,7 @@ def test_capstone_one_fixture_through_eval_framework(tmp_path: Path) -> None:
     # B1 — the base's documented divergence surface is exactly EVAL_PROFILE.
     divergence = _profile.eval_profile_divergence(base)
     assert set(divergence) == set(EVAL_PROFILE)
-    for leaf, expected_eval in EVAL_PROFILE.items():
+    for leaf, expected_eval in resolved_eval_profile(base).items():
         _base_value, eval_value = divergence[leaf]
         assert eval_value == expected_eval
 

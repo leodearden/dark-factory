@@ -36,8 +36,8 @@ from unittest.mock import MagicMock
 import pytest
 
 from orchestrator.git_ops import GitOps
-from orchestrator.landed_outbox import LandedOutbox, LandedRow
-from orchestrator.merge_queue import SpeculativeMergeWorker
+from orchestrator.merge_lane.landed_outbox import LandedOutbox, LandedRow
+from orchestrator.merge_lane.worker import SpeculativeMergeWorker
 
 # ---------------------------------------------------------------------------
 # step-1 — record() + lookup() round-trip across a simulated restart
@@ -189,7 +189,7 @@ class TestLandedOutboxFsyncDurability:
             captured_modes.append(os_module.fstat(fd).st_mode)
             real_fsync(fd)
 
-        monkeypatch.setattr('orchestrator.landed_outbox.os.fsync', _spy_fsync)
+        monkeypatch.setattr('shared.safe_io.os.fsync', _spy_fsync)
 
         path = tmp_path / 'data' / 'orchestrator' / 'landed_outbox.json'
         outbox = LandedOutbox(path)
@@ -224,7 +224,7 @@ def _restore_merge_provenance_binding():
     (not at module scope) so this fixture itself does not exist — and thus
     cannot break collection — until step-10 defines MergeProvenance.
     """
-    from orchestrator.landed_outbox import MergeProvenance
+    from orchestrator.merge_lane.landed_outbox import MergeProvenance
 
     original = MergeProvenance._outbox
     yield
@@ -237,7 +237,7 @@ class TestMergeProvenanceFacade:
     def test_lookup_with_nothing_bound_returns_none(
         self, _restore_merge_provenance_binding: None,
     ) -> None:
-        from orchestrator.landed_outbox import MergeProvenance
+        from orchestrator.merge_lane.landed_outbox import MergeProvenance
 
         MergeProvenance._outbox = None  # explicit: nothing bound
         assert MergeProvenance.lookup('42') is None
@@ -245,7 +245,7 @@ class TestMergeProvenanceFacade:
     def test_lookup_routes_to_bound_outbox(
         self, tmp_path: Path, _restore_merge_provenance_binding: None,
     ) -> None:
-        from orchestrator.landed_outbox import MergeProvenance
+        from orchestrator.merge_lane.landed_outbox import MergeProvenance
 
         outbox = LandedOutbox(tmp_path / 'landed_outbox.json')
         row = LandedRow(task_id='42', branch_tip_sha='a', advanced_sha='b', landed_at=1.0)
@@ -270,7 +270,7 @@ class TestMergeProvenanceConsume:
     def test_consume_prunes_bound_outbox_durably(
         self, tmp_path: Path, _restore_merge_provenance_binding: None,
     ) -> None:
-        from orchestrator.landed_outbox import MergeProvenance
+        from orchestrator.merge_lane.landed_outbox import MergeProvenance
 
         path = tmp_path / 'landed_outbox.json'
         outbox = LandedOutbox(path)
@@ -290,7 +290,7 @@ class TestMergeProvenanceConsume:
     def test_consume_with_nothing_bound_is_noop(
         self, _restore_merge_provenance_binding: None,
     ) -> None:
-        from orchestrator.landed_outbox import MergeProvenance
+        from orchestrator.merge_lane.landed_outbox import MergeProvenance
 
         MergeProvenance._outbox = None  # explicit: nothing bound
         # Fail-safe: must not raise (mirrors lookup's unbound contract).
@@ -299,7 +299,7 @@ class TestMergeProvenanceConsume:
     def test_consume_absent_id_is_idempotent_noop(
         self, tmp_path: Path, _restore_merge_provenance_binding: None,
     ) -> None:
-        from orchestrator.landed_outbox import MergeProvenance
+        from orchestrator.merge_lane.landed_outbox import MergeProvenance
 
         outbox = LandedOutbox(tmp_path / 'landed_outbox.json')
         MergeProvenance.bind(outbox)
@@ -321,7 +321,7 @@ class TestSpeculativeMergeWorkerHoldsLandedOutbox:
     def test_worker_holds_and_binds_landed_outbox(
         self, tmp_path: Path, _restore_merge_provenance_binding: None,
     ) -> None:
-        from orchestrator.landed_outbox import MergeProvenance
+        from orchestrator.merge_lane.landed_outbox import MergeProvenance
 
         git_ops = MagicMock(spec=GitOps)
         git_ops.project_root = tmp_path
@@ -434,7 +434,7 @@ class TestLandedOutboxFailOpenBranches:
         def _boom(*_args: object, **_kwargs: object) -> None:
             raise OSError('disk full simulated failure')
 
-        monkeypatch.setattr('orchestrator.landed_outbox.os.replace', _boom)
+        monkeypatch.setattr('shared.safe_io.os.replace', _boom)
 
         outbox.record(row)  # must not raise, despite the durable flush failing
 
@@ -454,7 +454,7 @@ class TestLandedOutboxFailOpenBranches:
         def _boom(*_args: object, **_kwargs: object) -> None:
             raise OSError('disk full simulated failure')
 
-        monkeypatch.setattr('orchestrator.landed_outbox.os.replace', _boom)
+        monkeypatch.setattr('shared.safe_io.os.replace', _boom)
 
         outbox.record(LandedRow(task_id='1', branch_tip_sha='a', advanced_sha='b', landed_at=1.0))
         outbox.record(LandedRow(task_id='2', branch_tip_sha='c', advanced_sha='d', landed_at=2.0))
@@ -474,16 +474,101 @@ class TestLandedOutboxTmpFileCleanup:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         path = tmp_path / 'landed_outbox.json'
-        tmp_sibling = path.with_suffix('.json.tmp')
         outbox = LandedOutbox(path)
 
         def _boom(*_args: object, **_kwargs: object) -> None:
             raise OSError('disk full simulated failure')
 
-        monkeypatch.setattr('orchestrator.landed_outbox.os.replace', _boom)
+        monkeypatch.setattr('shared.safe_io.os.replace', _boom)
 
         outbox.record(LandedRow(task_id='1', branch_tip_sha='a', advanced_sha='b', landed_at=1.0))
 
-        assert not tmp_sibling.exists(), (
-            f'Expected no orphaned tmp file after a failed save; found {tmp_sibling}'
+        # Asserts NO residue at all rather than the absence of one specific
+        # name: since task 3223 the temp is uniquely named per writer, so
+        # checking only for a '<dest>.json.tmp' sibling would pass vacuously.
+        leftovers = sorted(q.name for q in tmp_path.iterdir())
+        assert leftovers == [], (
+            f'Expected no orphaned temp file after a failed save; found {leftovers}'
         )
+
+
+class TestDelegatesToSharedAtomicWriter:
+    """``_save_raw`` delegates to ``shared.safe_io.atomic_write_text``.
+
+    Task 3223 consolidated the repo's tmp+rename writers into ``shared.safe_io``.
+    This is the only fsyncing site and the highest-risk one: WA-1's durability
+    guarantee lives in the argument list now, and ``mode`` must stay at the
+    umask default because this file is read by other processes.
+    """
+
+    def test_delegates_with_preserved_semantics(self, tmp_path: Path) -> None:
+        """One delegated call carrying fsync=True, mkdir=True, utf-8, mode=None."""
+        import shared.safe_io as _safe_io
+
+        calls = []
+        real = _safe_io.atomic_write_text
+
+        def recorder(path, text, **kwargs):
+            calls.append((path, text, kwargs))
+            return real(path, text, **kwargs)
+
+        outbox = LandedOutbox(tmp_path / 'data' / 'landed_outbox.json')
+        row = LandedRow(task_id='42', branch_tip_sha='aaa', advanced_sha='bbb', landed_at=1.0)
+
+        _safe_io.atomic_write_text = recorder
+        try:
+            outbox.record(row)
+        finally:
+            _safe_io.atomic_write_text = real
+
+        assert len(calls) == 1, f'expected exactly one delegated call, got {calls}'
+        _path, text, kwargs = calls[0]
+        assert json.loads(text)['42']['branch_tip_sha'] == 'aaa'
+        assert kwargs.get('fsync') is True, 'WA-1 durability: this site MUST fsync'
+        assert kwargs.get('mkdir') is True, 'this site created its parent dir'
+        assert kwargs.get('encoding') == 'utf-8'
+        assert kwargs.get('mode') is None, (
+            'umask default, NOT 0o600 — this file is read by other processes '
+            'and must not be silently narrowed'
+        )
+
+    def test_on_disk_mode_matches_write_text_reference(self, tmp_path: Path) -> None:
+        """The written file keeps the umask-derived mode, compared to a live reference."""
+        reference = tmp_path / 'reference.json'
+        reference.write_text('ref', encoding='utf-8')
+
+        outbox = LandedOutbox(tmp_path / 'landed_outbox.json')
+        outbox.record(
+            LandedRow(task_id='42', branch_tip_sha='a', advanced_sha='b', landed_at=1.0)
+        )
+
+        written = tmp_path / 'landed_outbox.json'
+        assert written.stat().st_mode & 0o777 == reference.stat().st_mode & 0o777
+
+    def test_fail_open_boundary_is_unchanged(self, tmp_path: Path, caplog) -> None:
+        """A delegated OSError increments save_failures, logs ERROR, escapes nothing."""
+        import logging
+
+        import shared.safe_io as _safe_io
+
+        outbox = LandedOutbox(tmp_path / 'landed_outbox.json')
+        real = _safe_io.atomic_write_text
+
+        def exploding(*_a, **_kw):
+            raise OSError('disk full')
+
+        _safe_io.atomic_write_text = exploding
+        try:
+            with caplog.at_level(logging.ERROR):
+                # Must NOT raise — the fail-open contract: a lost-durability
+                # event must never block the merge pipeline.
+                outbox.record(
+                    LandedRow(task_id='42', branch_tip_sha='a', advanced_sha='b', landed_at=1.0)
+                )
+        finally:
+            _safe_io.atomic_write_text = real
+
+        assert outbox.save_failures == 1
+        errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+        assert len(errors) == 1, f'expected exactly one ERROR, got {caplog.records}'
+        assert 'disk full' in errors[0].getMessage()

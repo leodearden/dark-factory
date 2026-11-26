@@ -3,14 +3,20 @@
 
 Walks ``~/.claude/projects/<enc>`` (or an injected ``projects_root``, so
 tests never touch the real ``~/.claude`` tree — mirrors
-``session_registry.fleet_root(root=)``) for a project whose agents span
+``fleet_files.fleet_root(root=)``) for a project whose agents span
 many encoded cwd directories: a project's config lists **cwd prefixes**
 (``docs/legibility/legibility.yaml``'s ``cwd_prefixes``), and membership is
 resolved from each session's REAL ``cwd`` (read from a transcript line) via
 path-component semantics, never a raw string-prefix match on the encoded
-dir name — the ``~/.claude/projects`` encoding is lossy (``/`` and ``.``
-both map to ``-``), so a sibling project sharing the same literal prefix
-(e.g. ``dark-factory-cockpit``) would otherwise be over-included.
+dir name — the ``~/.claude/projects`` encoding is lossy (``/``, ``.`` and
+``_`` all map to ``-``), so a sibling project sharing the same literal
+prefix (e.g. ``dark-factory-cockpit``) would otherwise be over-included.
+
+Each encoded dir holds session transcripts ``<sid>.jsonl`` and, per session,
+Claude Code sub-agent transcripts ``<sid>/subagents/agent-<id>.jsonl`` and
+``<sid>/subagents/workflows/wf_<id>/agent-<id>.jsonl``; all are enumerated, as
+the archive's recursive walk already does, and each is its own session
+(:class:`TranscriptIdentity`).
 
 Task β of the confusion-reduction PRD (plans/confusion-reduction-prd.md
 §5.2, contract §7.4). Self-contained — does not import task α's
@@ -19,26 +25,42 @@ Task β of the confusion-reduction PRD (plans/confusion-reduction-prd.md
 from __future__ import annotations
 
 import argparse
-import gzip
 import json
+import logging
 import sys
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+logger = logging.getLogger('legibility.inventory')
+
 
 def encode_cwd(cwd: str) -> str:
-    """Mirror ``session_registry.transcript_path_for_cwd``'s encoding.
+    """Mirror ``session_records.encode_cwd``'s encoding of Claude Code's dir naming.
 
-    Both ``/`` and ``.`` map to ``-`` — this is the same best-effort
-    mirror of Claude Code's own ``~/.claude/projects/<enc>`` naming, kept
-    in lockstep with the canonical implementation,
-    ``orchestrator.session_registry.transcript_path_for_cwd`` (named, not
-    line-cited, so this docstring doesn't drift as that file evolves).
+    ``/``, ``.`` AND ``_`` all map to ``-``; ``-`` passes through and CASE
+    IS PRESERVED (the encoder does not lowercase). Validated against 738
+    real (encoded-dir, decoded-cwd) pairs sampled from a live
+    ``~/.claude/projects`` tree, over which the only non-alphanumeric
+    characters appearing in any cwd were ``- . / _`` — so the rule is
+    complete over the observed domain, and unverified outside it.
+
+    This is a hand-written mirror of the canonical implementation,
+    ``orchestrator.session_records.encode_cwd`` (named, not line-cited, so
+    this docstring doesn't drift as that file evolves). It is duplicated
+    rather than imported because this module is deliberately self-contained
+    — its ``__main__`` bootstrap puts only ``scripts/`` on ``sys.path``, so
+    a module-scope orchestrator import would break the standalone nightly
+    invocation. The "kept in lockstep" claim is therefore not left to
+    goodwill: ``scripts/tests/test_legibility_inventory.py``'s
+    ``TestEncoderLockstep`` mechanically asserts this function, the
+    canonical, and every other in-repo copy agree row-for-row with real
+    on-disk dir names. Task 3272 added it after the ``_`` rule was found
+    missing from all four copies at once.
     """
-    return cwd.replace('/', '-').replace('.', '-')
+    return cwd.replace('/', '-').replace('.', '-').replace('_', '-')
 
 
 def iter_project_dirs(projects_root: Path | str, cwd_prefixes: Sequence[str]) -> Iterator[Path]:
@@ -78,82 +100,250 @@ def is_member(cwd: str, cwd_prefixes: Sequence[str]) -> bool:
     return any(cwd_path.is_relative_to(Path(prefix)) for prefix in cwd_prefixes)
 
 
-def _iter_json_lines(path: Path) -> Iterator[dict[str, Any]]:
+UNREADABLE_FILE_ERRORS = (UnicodeDecodeError,)
+"""Exception types an unreadable transcript can raise that are NOT ``OSError``.
+
+With the archive stored plain (task 3618) exactly ONE such shape remains:
+``UnicodeDecodeError``. It is reachable on any transcript, since the reader
+opens under strict ``encoding='utf-8'``, and being a ``ValueError`` subclass
+it escapes an ``except OSError``-only handler entirely — so it still needs
+normalizing even though the gzip container shapes are gone.
+
+Exported deliberately: ``digest.load_transcript`` catches on THIS name rather
+than a copy, so the two readers cannot drift apart at that boundary.
+"""
+
+
+def as_unreadable_file_error(exc: BaseException) -> OSError:
+    """Normalize an unreadable-transcript exception to one ``OSError``.
+
+    THE single answer to "which exceptions mean this transcript cannot be
+    read, and what does that read as to a caller". Both transcript readers —
+    :func:`iter_json_lines` and its slurping sibling ``digest.load_transcript``
+    — funnel through here, so the normalization is structurally shared rather
+    than copy-pasted and test-pinned in sync (reviewer_comprehensive
+    /duplication, task 3214 amendment pass).
+
+    Why normalization is needed at all: with the archive stored plain (task
+    3618) an unreadable transcript surfaces as exactly ONE shape that is not
+    already an ``OSError``::
+
+        undecodable byte  -> UnicodeDecodeError   (a ValueError, not an OSError)
+
+    That shape is reachable on any transcript, because the reader opens under
+    strict ``encoding='utf-8'`` and the archived fleet transcripts these
+    readers walk are live runtime state — a flipped byte in a file a killed
+    unit left behind is an expected shape, not a theoretical one. Being a
+    ``ValueError`` subclass it escapes an ``except OSError``-only handler
+    entirely, so left un-normalized it escapes every consumer's degrade path
+    and aborts a whole-archive walk over one bad file. Everything else an
+    unreadable file raises (a missing path, a permission failure, a read
+    error) already IS an ``OSError`` and only needs passing through.
+
+    The gzip container shapes this function once also normalized — bad magic,
+    a truncated stream, a corrupt body — are gone with the ``.gz`` archive
+    itself; the readers no longer open gzip, so they can no longer raise them.
+
+    ``OSError`` is the normalized type because it is what ``sampling``,
+    ``check_transcript_persistence`` and the cross-package
+    ``memory_eval_transcript_corpus`` extractor already code against. The
+    original message is preserved in the text, so a coverage report can still
+    tell an undecodable transcript from a merely missing or unopenable one —
+    the decode shape gets its own wording rather than a generic label, which
+    would misdirect an operator reading a disclosed reason.
+
+    Total and idempotent: an exception that is ALREADY an ``OSError`` is
+    returned unchanged rather than double-wrapped, so a caller can hand it
+    anything it caught without first classifying it.
+    """
+    if isinstance(exc, OSError):
+        return exc
+    if isinstance(exc, UnicodeDecodeError):
+        return OSError(f'undecodable transcript bytes: {exc}')
+    return OSError(f'unreadable transcript: {exc}')
+
+
+def iter_json_lines(path: Path) -> Iterator[dict[str, Any]]:
     """Yield parsed dict records from a JSONL file, skipping blank/malformed lines.
 
-    Transparently reads gzip-compressed transcripts: a ``*.jsonl.gz`` path
-    (the archived fleet-transcript format written by
-    ``shared.transcript_archive``) is opened via ``gzip.open(..., 'rt')``,
-    while a plain path keeps the exact ``open(path, encoding='utf-8')`` call
-    for byte-parity. Either way the strip/skip-blank/``json.loads``/
-    dict-check body is identical, so :func:`_session_cwd_and_date` and its
-    callers (incl. ``sampling._score_and_find_first_turn``) become gz-aware
-    with no further change.
+    **The** low-level streaming transcript reader — public, and deliberately
+    so: cross-package consumers exist (``memory_eval_transcript_corpus.py``
+    in ``fused-memory/scripts/`` mines the archived fleet transcripts through
+    it), and a consumer reaching for an underscore name across a package
+    boundary is how a second copy of this function gets written instead.
+
+    Streaming rather than slurping is the point of this one: callers walk
+    thousands of multi-MB archived transcripts, so memory stays bounded by
+    the largest single record. ``digest.load_transcript`` is the slurping
+    sibling for the single-file case, with a byte-identical parse contract.
 
     Mirrors ``digest.load_transcript``'s graceful-degrade contract: a
     transcript is written fire-and-forget and can have a truncated or
     corrupt trailing line, which must not abort the whole read. Raises
-    ``OSError`` if *path* cannot be opened or decompressed at all —
-    ``gzip.BadGzipFile`` (a corrupt ``.gz``) is an ``OSError`` subclass, so
-    the caller's existing ``except OSError`` degrade path already covers it.
+    ``OSError`` if *path* cannot be read at all.
+
+    That split is a contract, not an implementation detail: a corrupt LINE
+    degrades silently, an unreadable FILE raises. Callers that report
+    coverage rely on it to count unreadable files without inflating the
+    count with truncated trailing lines.
+
+    Making that ``OSError`` promise true takes explicit normalization: the
+    decode shape is a ``ValueError`` subclass, not an ``OSError``.
+    :func:`as_unreadable_file_error` is the
+    single place that says which ones and why, and ``digest.load_transcript``
+    funnels through the same helper, so the two readers are interchangeable
+    at this boundary by construction rather than by matching copies.
+
+    Note the decode shape is normalized at the FILE level, not degraded at
+    the line level: a bad byte aborts the underlying text-IO read, so there
+    is no well-formed "rest of the file" left to keep yielding. Counting the
+    file once as unreadable is the honest report; silently substituting
+    replacement characters would let corrupt bytes enter the corpus as
+    plausible-looking data.
     """
-    if str(path).endswith('.gz'):
-        f = gzip.open(path, 'rt', encoding='utf-8')
-    else:
-        f = open(path, encoding='utf-8')
-    with f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                record = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if isinstance(record, dict):
-                yield record
+    with open(path, encoding='utf-8') as f:
+        # The wrap covers only the read iteration — decoding
+        # happens lazily HERE, per chunk, not at open() — while the
+        # JSONDecodeError skip stays inside the loop, so the file-level vs
+        # line-level split above is preserved. The catch tuple is the shared
+        # UNREADABLE_FILE_ERRORS rather than a local literal, deliberately:
+        # `except Exception` would swallow errors from the caller's
+        # consumption of this generator, and a local tuple would be a second
+        # answer that could drift from digest.load_transcript's.
+        try:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(record, dict):
+                    yield record
+        except UNREADABLE_FILE_ERRORS as exc:
+            raise as_unreadable_file_error(exc) from exc
 
 
-def _session_cwd_and_date(path: Path) -> tuple[str | None, date | None]:
-    """Single-pass read of *path*, returning ``(cwd, date)`` together.
+SUBAGENTS_DIR = 'subagents'
+"""The per-session directory Claude Code files sub-agent transcripts under."""
 
-    :func:`session_cwd` and :func:`_first_timestamp_date` each scan *path*
-    independently for their own first-occurrence value, so
-    :func:`enumerate_sessions` calling both on every candidate session read
-    the same transcript twice (reviewer_comprehensive/performance, task
-    2573 amendment pass #2). This helper collects both facts in ONE pass —
-    each still only takes its own first occurrence, so the values returned
-    are identical to calling ``session_cwd(path)`` and
-    ``_first_timestamp_date(path)`` separately — stopping as soon as both
-    have been found. Degrades to ``(None, None)`` on an unreadable path,
-    matching both functions' individual degrade-to-None contracts.
+
+@dataclass(frozen=True)
+class TranscriptIdentity:
+    """Which session a transcript IS, as ledger rows, digests and coding records name it.
+
+    A session transcript is keyed on its ``sessionId``. A Claude Code
+    sub-agent transcript carries its PARENT's ``sessionId`` plus its own
+    ``agentId``, so it is keyed ``<parent sid>/subagents/agent-<agentId>`` and
+    names the parent in :attr:`parent_session` rather than inside a string a
+    consumer would parse. That key is an Agent-tool sub-agent's path under the
+    encoded dir; a Workflow-tool sub-agent, filed deeper under
+    ``subagents/workflows/wf_<id>/``, gets the same key shape, because none of
+    its records names the workflow and an ``agentId`` is unique within its
+    session.
+    """
+
+    session_id: str
+    agent_id: str | None = None
+
+    @property
+    def key(self) -> str:
+        if self.agent_id is None:
+            return self.session_id
+        return f'{self.session_id}/{SUBAGENTS_DIR}/agent-{self.agent_id}'
+
+    @property
+    def parent_session(self) -> str | None:
+        return self.session_id if self.agent_id is not None else None
+
+
+def transcript_identity(record: Mapping[str, Any]) -> TranscriptIdentity | None:
+    """The identity *record* declares, or ``None`` when it carries no non-empty ``sessionId``."""
+    session_id = record.get('sessionId')
+    if not isinstance(session_id, str) or not session_id:
+        return None
+    agent_id = record.get('agentId')
+    return TranscriptIdentity(
+        session_id=session_id,
+        agent_id=agent_id if isinstance(agent_id, str) and agent_id else None,
+    )
+
+
+def first_transcript_identity(records: Iterable[Mapping[str, Any]]) -> TranscriptIdentity | None:
+    """A transcript's identity: that of its first ``sessionId``-bearing record.
+
+    An ``agentId`` on that record marks a sub-agent transcript, whose
+    ``sessionId`` is its parent's.
+    """
+    for record in records:
+        identity = transcript_identity(record)
+        if identity is not None:
+            return identity
+    return None
+
+
+def transcript_encoded_dir(path: Path) -> str:
+    """The encoded cwd dir a transcript is filed under.
+
+    ``<enc>/<sid>.jsonl`` is filed under its parent dir. A sub-agent
+    transcript sits somewhere beneath ``<enc>/<sid>/subagents/`` (directly,
+    or under ``workflows/wf_<id>/``) and is filed under the dir two above its
+    nearest ``subagents`` ancestor. The same holds beneath the archive's
+    ``<key>/<enc>/...``.
+    """
+    for ancestor in path.parents:
+        if ancestor.name == SUBAGENTS_DIR and len(ancestor.parents) >= 2:
+            return ancestor.parents[1].name
+    return path.parent.name
+
+
+@dataclass(frozen=True)
+class _TranscriptHeader:
+    cwd: str | None = None
+    date: date | None = None
+    identity: TranscriptIdentity | None = None
+
+
+def _record_date(record: Mapping[str, Any]) -> date | None:
+    ts = record.get('timestamp')
+    if not isinstance(ts, str) or not ts:
+        return None
+    try:
+        parsed = datetime.fromisoformat(ts)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC).date()
+
+
+def _read_header(path: Path) -> _TranscriptHeader:
+    """Single-pass read of *path*'s cwd, first-timestamp date and identity.
+
+    Each value is its first occurrence, so the answers equal those of three
+    separate scans; the pass stops once all three are found, which for a
+    live transcript is its first record. An unreadable path degrades to an
+    all-``None`` header.
     """
     cwd: str | None = None
     session_date: date | None = None
+    identity: TranscriptIdentity | None = None
     try:
-        for record in _iter_json_lines(path):
+        for record in iter_json_lines(path):
             if cwd is None:
                 candidate_cwd = record.get('cwd')
                 if isinstance(candidate_cwd, str) and candidate_cwd:
                     cwd = candidate_cwd
-
             if session_date is None:
-                ts = record.get('timestamp')
-                if isinstance(ts, str) and ts:
-                    try:
-                        parsed = datetime.fromisoformat(ts)
-                    except ValueError:
-                        parsed = None
-                    if parsed is not None:
-                        if parsed.tzinfo is None:
-                            parsed = parsed.replace(tzinfo=UTC)
-                        session_date = parsed.astimezone(UTC).date()
-
-            if cwd is not None and session_date is not None:
+                session_date = _record_date(record)
+            if identity is None:
+                identity = transcript_identity(record)
+            if cwd is not None and session_date is not None and identity is not None:
                 break
     except OSError:
-        return None, None
-    return cwd, session_date
+        return _TranscriptHeader()
+    return _TranscriptHeader(cwd=cwd, date=session_date, identity=identity)
 
 
 def session_cwd(path: Path) -> str | None:
@@ -163,24 +353,24 @@ def session_cwd(path: Path) -> str | None:
     ``agent-name``, ``queue-operation``) carry no ``cwd`` at all, and a few
     metadata-only stub sessions carry no ``cwd`` anywhere in the file. Both
     an unreadable path and a cwd-less file degrade to ``None`` rather than
-    raising. Delegates to :func:`_session_cwd_and_date` — a standalone
-    caller wanting only the cwd also pays for that helper's timestamp scan,
-    but this function is no longer on :func:`enumerate_sessions`'s hot path
-    (it calls :func:`_session_cwd_and_date` directly), so that trade only
-    affects callers wanting the cwd in isolation.
+    raising. A thin wrapper over :func:`_read_header`, which
+    :func:`enumerate_sessions` calls directly.
     """
-    cwd, _ = _session_cwd_and_date(path)
-    return cwd
+    return _read_header(path).cwd
 
 
 @dataclass(frozen=True)
 class SessionRecord:
     """One enumerated session transcript.
 
-    ``encoded_dir`` is the containing directory's basename (a
-    ``~/.claude/projects/<enc>`` entry); ``cwd`` is the REAL decoded cwd
+    ``encoded_dir`` is the ``~/.claude/projects/<enc>`` entry the transcript
+    is filed under, which for a sub-agent transcript is not its containing
+    directory (:func:`transcript_encoded_dir`; an archive transcript's is the
+    ``<enc>`` below its archive key, :func:`_archive_enc`); ``cwd`` is the REAL decoded cwd
     read from the transcript (the value :func:`is_member` was checked
-    against), not a re-derivation from ``encoded_dir``.
+    against), not a re-derivation from ``encoded_dir``. ``identity`` is the
+    transcript's :class:`TranscriptIdentity`, ``None`` when no record carries
+    a ``sessionId``.
     """
 
     path: Path
@@ -188,17 +378,7 @@ class SessionRecord:
     cwd: str
     date: date
     size_bytes: int
-
-
-def _first_timestamp_date(path: Path) -> date | None:
-    """Return the UTC date of the first valid ISO-8601 ``timestamp`` line in *path*.
-
-    Returns None when the file is unreadable, has no timestamp line, or
-    every timestamp line is unparseable — callers fall back to file mtime.
-    Delegates to :func:`_session_cwd_and_date`; see its docstring for why.
-    """
-    _, session_date = _session_cwd_and_date(path)
-    return session_date
+    identity: TranscriptIdentity | None = None
 
 
 def resolve_agent_transcript_roots(
@@ -227,15 +407,15 @@ def _build_session_record(
 
     Skips (returns ``None``) a non-existent/unreadable/empty file, a session
     whose real ``cwd`` is not a project member (:func:`is_member`), and a
-    session whose date — first-timestamp (:func:`_session_cwd_and_date`),
+    session whose date — first-timestamp (:func:`_read_header`),
     falling back to file mtime — is rejected by *date_ok* (``date_ok(d)`` is
     ``False``). The *date_ok* predicate is what lets one shared record-builder
     back both the single-date enumerator (``date_ok = d == target_date``) and
     the range enumerator (``date_ok = start <= d <= end``) with no duplicated
     walk. Shared by the ``~/.claude/projects`` loop and the archive-roots loop
     in :func:`_enumerate`: the projects path is behaviorally unchanged (guarded
-    by ``TestEnumerateSessions``), while the archive path passes the encoded
-    worktree dir (``session_path.parent.name``) as *encoded_dir*.
+    by ``TestEnumerateSessions``), while the archive path passes the
+    archive transcript's ``<enc>`` (:func:`_archive_enc`) as *encoded_dir*.
     """
     try:
         st = session_path.stat()
@@ -244,7 +424,8 @@ def _build_session_record(
     if st.st_size == 0:
         return None
 
-    cwd, session_date = _session_cwd_and_date(session_path)
+    header = _read_header(session_path)
+    cwd, session_date = header.cwd, header.date
     if cwd is None or not is_member(cwd, cwd_prefixes):
         return None
 
@@ -267,15 +448,47 @@ def _build_session_record(
         cwd=cwd,
         date=session_date,
         size_bytes=st.st_size,
+        identity=header.identity,
     )
 
 
+RESIDUAL_GZ_GLOB = '*.jsonl.gz'
+"""Glob for the pre-3618 archived form, kept ONLY to count what is invisible."""
+
+
+def count_residual_gz(root: Path | str) -> int:
+    """Count archived ``*.jsonl.gz`` transcripts under *root* — a count, NOT a read.
+
+    Task 3618 dropped gzip from the archive, but the destructive ``--apply``
+    sweep that converts the EXISTING corpus
+    (``scripts/migrate_transcript_archive_gunzip.py``) is deliberately a
+    human-operated step, so between that merge and the operator's run every
+    residual ``.gz`` is simply not enumerated by
+    :func:`_iter_archive_transcripts` — silently absent from the corpus rather
+    than loudly failed. The gap is accepted and documented (OPERATIONS.md §13),
+    but "accepted" must not mean "invisible": its duration is bounded only by
+    someone remembering, which is exactly the shape design-invariant INV-4
+    rejects.
+
+    So the gap announces itself. This is the machine-readable half — a consumer
+    that renders coverage can report it as a field (the memory-eval extractor's
+    ``residual_gz``); :func:`_iter_archive_transcripts` emits the human half as
+    one greppable WARNING. No gzip branch is reintroduced: nothing here opens a
+    file, and once the migration runs this returns 0 and both signals vanish on
+    their own.
+    """
+    root = Path(root)
+    if not root.is_dir():
+        return 0
+    return sum(1 for _ in root.rglob(RESIDUAL_GZ_GLOB))
+
+
 def _iter_archive_transcripts(root: Path) -> Iterator[Path]:
-    """Yield every ``*.jsonl`` / ``*.jsonl.gz`` transcript under *root*, recursively.
+    """Yield every ``*.jsonl`` transcript under *root*, recursively.
 
     The archived fleet-transcript tree (``shared.transcript_archive``) nests
-    transcripts under ``<task_id>/<enc>/<sid>.jsonl.gz`` with an even-deeper
-    ``<sid>/subagents/agent-*.jsonl.gz`` variant, so — unlike the
+    transcripts under ``<task_id>/<enc>/<sid>.jsonl`` with an even-deeper
+    ``<sid>/subagents/agent-*.jsonl`` variant, so — unlike the
     ``~/.claude/projects`` pre-filter (:func:`iter_project_dirs`), whose
     top-level dir names ARE the encoded cwds — the archive is walked
     RECURSIVELY and membership is decided per-file downstream via
@@ -284,30 +497,37 @@ def _iter_archive_transcripts(root: Path) -> Iterator[Path]:
     directory: an absent, not-yet-created archive root is normal (the tree
     is git-ignored and may not exist yet).
 
-    A SINGLE recursive walk (``rglob('*.jsonl*')``) filtered by suffix, not
-    two separate ``rglob`` passes for ``*.jsonl`` and ``*.jsonl.gz`` — the
-    combined glob is a strict superset of both, and the ``endswith`` filter
-    trims it back to exactly the two transcript classes, so the yielded set
-    (and its sort order) is byte-identical to the two-pass form while halving
-    the directory-tree traversal cost (reviewer_comprehensive/performance,
-    task 2730 amendment pass).
+    The archive holds ONE class of transcript (task 3618 dropped the gzipped
+    form), so this is a single ``rglob('*.jsonl')`` with no suffix filter.
+
+    Any residual ``*.jsonl.gz`` is therefore not enumerated AT ALL until the
+    human-operated migration sweep has run. That would be a silent
+    under-report, so it is counted (:func:`count_residual_gz`) and announced
+    once per walk as a greppable WARNING — a count, never a read.
     """
     if not root.is_dir():
         return
-    matches = [
-        p
-        for p in root.rglob('*.jsonl*')
-        if p.name.endswith('.jsonl') or p.name.endswith('.jsonl.gz')
-    ]
-    yield from sorted(matches)
+    residual_gz = count_residual_gz(root)
+    if residual_gz:
+        logger.warning(
+            'inventory: %d residual %s under %s are NOT enumerated — the '
+            'archive corpus under-reports by that many transcripts until '
+            'scripts/migrate_transcript_archive_gunzip.py --apply is run '
+            '(OPERATIONS.md §13). This warning disappears on its own once it '
+            'has been.',
+            residual_gz,
+            RESIDUAL_GZ_GLOB,
+            root,
+        )
+    yield from sorted(root.rglob('*.jsonl'))
 
 
 def _archive_enc(session_path: Path, archive_root: Path) -> str | None:
     """Return the encoded ``<enc>`` cwd dir of an archive transcript, or ``None``.
 
     The archived fleet-transcript tree nests transcripts under
-    ``<task_id>/<enc>/<sid>.jsonl.gz`` (main) and
-    ``<task_id>/<enc>/<sid>/subagents/agent-*.jsonl.gz`` (subagent), so the
+    ``<task_id>/<enc>/<sid>.jsonl`` (main) and
+    ``<task_id>/<enc>/<sid>/subagents/agent-*.jsonl`` (subagent), so the
     encoded cwd directory is ``parts[1]`` of the archive-root-relative path in
     BOTH layouts — NOT ``session_path.parent.name`` (which is ``'subagents'``
     for the subagent variant, and would make the pre-filter drop EVERY subagent
@@ -325,6 +545,17 @@ def _archive_enc(session_path: Path, archive_root: Path) -> str | None:
     return parts[1] if len(parts) >= 2 else None
 
 
+def _iter_project_transcripts(project_dir: Path) -> Iterator[Path]:
+    """Yield a projects-root encoded dir's session transcripts, then its sub-agents'.
+
+    The ``*/subagents/**/agent-*.jsonl`` glob admits Claude Code's Agent-tool
+    and Workflow-tool sub-agent layouts and never a ``.meta.json`` sibling or
+    a workflow's ``journal.jsonl``.
+    """
+    yield from sorted(project_dir.glob('*.jsonl'))
+    yield from sorted(project_dir.glob(f'*/{SUBAGENTS_DIR}/**/agent-*.jsonl'))
+
+
 def _enumerate(
     projects_root: Path | str,
     cwd_prefixes: Sequence[str],
@@ -335,9 +566,10 @@ def _enumerate(
 
     Aggregates across every directory :func:`iter_project_dirs` yields
     (never assumes one dir per project — a project's agents span many
-    encodings). For each ``*.jsonl`` file: skip non-existent/unreadable/
-    empty files, read the session's real ``cwd`` and first-timestamp date
-    together in one pass (:func:`_session_cwd_and_date`) and confirm
+    encodings). For each session transcript and sub-agent transcript
+    (:func:`_iter_project_transcripts`): skip non-existent/unreadable/
+    empty files, read the session's real ``cwd``, first-timestamp date and
+    identity together in one pass (:func:`_read_header`) and confirm
     membership via :func:`is_member`, falling back to file mtime for the
     date when no timestamp is present, and keep only sessions whose date
     satisfies *date_ok* (all via :func:`_build_session_record`).
@@ -345,7 +577,7 @@ def _enumerate(
     *agent_transcript_roots* is an ADDITIONAL, opt-in list of archive roots
     (the ``shared.transcript_archive`` fleet-transcript tree, resolved via
     :func:`resolve_agent_transcript_roots`) walked recursively ALONGSIDE the
-    ``~/.claude/projects`` tree — each ``*.jsonl``/``*.jsonl.gz`` under a
+    ``~/.claude/projects`` tree — each ``*.jsonl`` under a
     root is admitted by the same per-file membership + date filter. A cheap
     encoded-``<enc>`` pre-filter — mirroring :func:`iter_project_dirs`'
     superset pre-filter for the projects tree — skips a proven-foreign
@@ -367,7 +599,7 @@ def _enumerate(
     root = Path(projects_root)
     records: list[SessionRecord] = []
     for project_dir in iter_project_dirs(root, cwd_prefixes):
-        for session_path in sorted(project_dir.glob('*.jsonl')):
+        for session_path in _iter_project_transcripts(project_dir):
             record = _build_session_record(
                 session_path, project_dir.name, cwd_prefixes, date_ok
             )
@@ -457,7 +689,11 @@ def main(argv: Sequence[str]) -> int:
 
     A debug/inspection entry point for inventory.py alone — the full
     inventory->score->sample pipeline's CLI acceptance surface is
-    ``sampling.main`` (task 2573 step-18).
+    ``sampling.main`` (task 2573 step-18). Each ``--agent-transcript-root``
+    adds an archive tree to the walk, so an archived run, a reconciliation
+    run's ``recon-<run_id>`` included, is listable. Each line is
+    tab-separated: path, encoded dir, cwd, date, size, then the
+    :class:`TranscriptIdentity` key and parent session ('' when absent).
     """
     parser = argparse.ArgumentParser(
         description="List legibility sessions matching cwd_prefixes for a given UTC date."
@@ -479,6 +715,16 @@ def main(argv: Sequence[str]) -> int:
         default=None,
         help='UTC date to filter sessions to, YYYY-MM-DD (default: yesterday UTC).',
     )
+    parser.add_argument(
+        '--agent-transcript-root',
+        dest='agent_transcript_roots',
+        action='append',
+        default=[],
+        help=(
+            'An archive root walked recursively alongside the projects root, '
+            'e.g. data/orchestrator/agent-transcripts (repeatable).'
+        ),
+    )
     args = parser.parse_args(argv)
 
     target_date = (
@@ -486,11 +732,19 @@ def main(argv: Sequence[str]) -> int:
         if args.date
         else (datetime.now(UTC) - timedelta(days=1)).date()
     )
-    records = enumerate_sessions(args.projects_root, args.cwd_prefixes, target_date)
+    records = enumerate_sessions(
+        args.projects_root,
+        args.cwd_prefixes,
+        target_date,
+        agent_transcript_roots=args.agent_transcript_roots,
+    )
     for record in records:
+        identity = record.identity
+        key = identity.key if identity is not None else ''
+        parent = (identity.parent_session or '') if identity is not None else ''
         print(
             f'{record.path}\t{record.encoded_dir}\t{record.cwd}\t'
-            f'{record.date}\t{record.size_bytes}'
+            f'{record.date}\t{record.size_bytes}\t{key}\t{parent}'
         )
     return 0
 

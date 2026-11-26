@@ -27,6 +27,24 @@ dependencies = [
     "aiosqlite>=0.20",
     "pyyaml>=6.0",
     "python-dotenv>=1.0",
+    # A GENUINE runtime import, unlike the four above: shared/src/shared/
+    # mcp_markup_middleware.py imports fastmcp at module scope to subclass
+    # Middleware and to type its ToolResult return. Declared in [project]
+    # dependencies rather than the dev group for that reason — a dev-only
+    # declaration would leave `cd shared && npx pyright` reporting
+    # reportMissingImports and would break any consumer importing the module.
+    # The module is deliberately NOT re-exported from shared/__init__, so
+    # `import shared` still does not pull fastmcp. See task 3689.
+    #
+    # >=3.2, NOT the >=2.0 that escalation/ and orchestrator/ declare: this is
+    # the first module in the workspace to depend on a 3.x-only import path.
+    # `fastmcp.tools.base` exists only after tool.py was renamed to base.py,
+    # and `fastmcp.server.middleware.Middleware` did not exist before 2.9 — so
+    # any resolution under 3.2 breaks `import shared.mcp_markup_middleware`
+    # outright rather than degrading. 3.2.2 is what every substrate fact in
+    # that module's docstring was measured against and what uv.lock already
+    # resolves, so the floor now names the API actually validated.
+    "fastmcp>=3.2",
 ]
 
 [project.optional-dependencies]
@@ -39,28 +57,107 @@ dev = [
     "pytest-asyncio>=0.23",
     "pytest-cov>=7.1.0",
     "pytest-timeout>=2.4.0",
+    # For the `scripts` verify leg, NOT for this member's own suite: that leg is
+    # `uv run --project shared pytest tests/scripts/ scripts/tests/ ... -n auto`
+    # (scripts/orchestrator.yaml), so shared is the environment uv resolves the
+    # plugin from. This member's own addopts stays SERIAL deliberately — measured
+    # faster serial, and tests/test_proc_group.py, tests/test_concurrency.py and
+    # tests/test_cli_invoke.py need @pytest.mark.xdist_group pins first (task
+    # 5408; pinned by tests/scripts/test_merge_gate_parallelism_config.py::
+    # RULED_SERIAL_MEMBERS).
+    "pytest-xdist>=3.6.0",
     "ruff>=0.4",
     "aiohttp>=3.9",
 ]
 
 [tool.pytest.ini_options]
-markers = ["integration: live CLI tests requiring OAuth accounts (deselect: -m 'not integration')"]
+markers = [
+    "integration: live CLI tests requiring OAuth accounts (deselect: -m 'not integration')",
+    "defect(ref): this test reproduces the declared defect <ref>; the binding is read statically by shared/src/shared/defect_enumerator.py (plans/defect-tests-prd.md decision 8). Not deselected by default.",
+    "criterion(id): this test evidences acceptance criterion <id> (plans/client-feed-prd.md §7.7). Not deselected by default.",
+    "timing(reason): a deadline, grace period or timeout is the behaviour under test, named by reason=; the timing-dependence lint (fused-memory/scripts/_timing_dependence.py) accepts a real sleep, an elapsed-vs-literal assert or a literal wait deadline only under it. Not deselected by default.",
+]
 addopts = "-m 'not integration'"
 asyncio_mode = "auto"
-# Default per-test timeout. Catches accidental asyncio-sleep hangs (e.g. a
-# misconfigured UsageGate mock whose slot.detect_cap_hit returns a truthy
-# MagicMock, sending invoke_with_cap_retry through 19 real exponential-
-# backoff sleeps). Slow tests can opt out with @pytest.mark.timeout(N).
-# signal method is load-bearing: thread method prints a stack trace but
+filterwarnings = [
+    # Sync def under an @pytest.mark.asyncio mark: mark mismatch (same entry as orchestrator/pyproject.toml).
+    "error:The test .* is marked with '@pytest.mark.asyncio' but it is not an async function:pytest.PytestWarning",
+]
+# Default per-test timeout. THE CANONICAL RATIONALE for this setting across
+# the workspace — orchestrator/, fused-memory/, escalation/ and dashboard/
+# pyproject.toml cite this block rather than restating it.
+#
+# WHAT IT CATCHES: accidental asyncio-sleep hangs (e.g. a misconfigured
+# UsageGate mock whose slot.detect_cap_hit returns a truthy MagicMock, sending
+# invoke_with_cap_retry through 19 real exponential-backoff sleeps), and
+# deadlocked lock implementations. Slow tests can opt out with
+# @pytest.mark.timeout(N).
+# In-band markers (60 < N < verify --timeout) are rejected by
+# tests/test_timeout_marker_inversion_guard.py; see
+# shared/src/shared/testing_timeout_markers.py.
+#
+# WHY A LARGE VALUE AND NOT THE ORIGINAL 60 (2026-09-12). The cap is
+# WALL-CLOCK, not CPU time. On this 32-core host under sustained load (~180 at
+# the time of that change) a perfectly healthy test can exceed 60s from CPU
+# STARVATION alone, without being hung at all. In the thread era the cost of
+# that was not one honest red: under timeout_method = "thread" pytest-timeout
+# answered a breach by os._exit()ing the xdist worker, and
+# --max-worker-restart=0 degraded that into a clean per-test FAILURE whose
+# victim was whatever test happened to be on the dead worker — NOT the starved
+# one. That is the "shifting victim" false-red mechanism from the CPU-contention
+# RCA (memory: project_cpu_contention_test_flakiness_rootcause_2026_07_18).
+# Under signal a starved test reds itself, and an isolated re-run can confirm
+# it as a flake.
+#
+# So the value attacks the TRIGGER. The method is decided in
+# tests/scripts/test_timeout_method_policy.py; which configs keep
+# --max-worker-restart=0 is recorded in
+# tests/scripts/test_xdist_worker_restart_policy.py::RESTART_DISABLED_CONFIGS.
+#
+# 420 IS DERIVED FROM MEASUREMENT. The worst per-test wall clock of an UNMARKED
+# test, across every suite and both inifile-resolution modes under real fleet
+# load, is recorded at
+# shared/src/shared/testing_ceiling_anchors.py::INI_DEFAULT_MEASURED_WORST_SECS;
+# times the 8x headroom factor whose rationale is
+# shared/src/shared/testing_timeout_headroom.py::UNDER_LOAD_HEADROOM_FACTOR,
+# rounded up to a whole minute = 420. Marked tests are excluded by design,
+# including the slower repo-wide scans in
+# fused-memory/tests/test_check_bare_magicmock_config.py, which carry their own
+# mark. The full corpus, the run-to-run spread, the
+# arithmetic and the value's history are in
+# plans/pytest-per-test-timeout-measurement-2026-09-17.md — read that before
+# moving this number, and re-measure rather than re-judging it.
+#
+# The cost is stated plainly — a genuinely hung unmarked test takes 7 minutes
+# to surface. @pytest.mark.timeout(N) remains the escape hatch for any test
+# that wants to surface faster.
+#
+# signal method is load-bearing HERE: thread method prints a stack trace but
 # can't actually interrupt a blocking asyncio.sleep in the main thread.
-timeout = 60
+timeout = 420
 timeout_method = "signal"
 
 [tool.pyright]
 include = ["src", "tests"]
-extraPaths = ["src", "tests"]
+# ".." LAST (mirrors tests/conftest.py's sys.path.append): resolves the repo-root
+# df_pytest_isolation module without letting project dirs shadow their own src/.
+# "tests/cross_suite_helpers" mirrors the insertion tests/conftest.py makes for
+# the helpers tests/repo_guards/ shares (task 5654).
+extraPaths = ["src", "tests", "tests/cross_suite_helpers", ".."]
 pythonVersion = "3.11"
 typeCheckingMode = "basic"
+# Task 3367 / esc-3359-1: pins pyright's interpreter to THIS worktree's own
+# .venv (venvPath is resolved relative to this file's directory, so it can
+# never name another tree's environment). Without it, a bare `cd shared && npx
+# pyright` resolves the interpreter from ambient VIRTUAL_ENV/PATH — which
+# verify._target_subprocess_env deliberately strips — so a cold merge worktree
+# type-checks against an env holding none of the workspace's third-party
+# packages: measured 68 phantom reportMissingImports here, 0 with this pin.
+# Today this member is type-checked via `uv run --project shared ... pyright`,
+# which resolves the SAME root .venv, so the pin changes no current result —
+# it only removes the dependency on ambient resolution.
+venvPath = ".."
+venv = ".venv"
 
 [tool.ruff]
 line-length = 100
@@ -69,6 +166,11 @@ line-length = 100
 select = ["E", "F", "UP", "B", "SIM", "I"]
 ignore = ["E501"]
 
+# NOT an enforced gate — style config only: it shapes an ad-hoc or editor-on-save
+# `ruff format` into a repo-consistent single-quoted diff. Do not delete as unused,
+# do not promote to a gate. Why, and the measurements: CONTRIBUTING.md section 3;
+# both directions guarded by tests/scripts/test_ruff_format_policy.py (task 3441).
 [tool.ruff.format]
 quote-style = "single"
 indent-style = "space"
+docstring-code-format = true

@@ -1,0 +1,102 @@
+# reify's measurement rules for scripts/rust_metrics_snapshot.py --rules, from its
+# /review-all overlay (.claude/skills/review-all/project.md in the reify repo).
+# Regexes are Python `re` syntax in TOML literal strings, so backslashes survive.
+
+# Paths outside the measured domain (generated, vendored, docs, fixtures), matched from the start.
+exclude = '^(tree-sitter-reify/src/|docs/|prj/|examples/|data/|gui/src/editor/reifyParser(\.terms)?\.js$|gui/src-tauri/sandbox/|.*node_modules/|.*\.d\.ts$|gui/src/__tests__/fixtures/)'
+
+# Which files are tests (kind 'tests'), searched anywhere in the path; the rest of the domain is src.
+test = '(^|/)(tests?|__tests__|benches|examples)/|(_tests?|\.test|\.spec)\.(rs|ts|tsx)$|(^|/)tests\.rs$|(^|/)test_[^/]*\.(py|sh)$|(^|/)test_support\.rs$|(^|/)mocks\.rs$'
+
+# Paths lizard must not descend into (it walks directories, not the git domain).
+lizard_excludes = ['*/node_modules/*', './target/*', './tree-sitter-reify/src/*', './docs/*', './prj/*', '*/.claude/*']
+
+# Fix density counts fix-grep'd non-merge commits touching a file since this date.
+fix_density_since = 2026-07-06
+
+# Path -> briefing area, matched from the start of the path; first match wins.
+
+[[area]]
+pattern = '^crates/reify-eval/src/compute_targets/'
+area = 'analysis'
+
+[[area]]
+pattern = '^crates/reify-eval/src/(compute_persist|shell_extract_compute|morph_stage_\w*|engine_compute|modal_ops|dynamics_ops)\.rs$'
+area = 'analysis'
+
+[[area]]
+pattern = '^crates/reify-eval/src/(trajectory_ops)\.rs$'
+area = 'kinematics-and-motion'
+
+[[area]]
+pattern = '^crates/reify-eval/src/(geometry_ops|topology_\w+|primitive_attribute_seed|selector_vocabulary_v2|sweep_classifier|structural_classifier|appearance|kernel_registry|dispatcher|warm_pool|realization_\w+|engine_constraints|relate_solve|tolerance_combine)(\.rs|/)'
+area = 'constraints-and-geometry'
+
+[[area]]
+pattern = '^crates/reify-eval/'
+area = 'language-pipeline'
+
+[[area]]
+pattern = '^crates/reify-stdlib/src/(trajectory/|joints\.rs|mechanism\.rs|loop_closure\w*\.rs|orientation\.rs|snapshot\.rs|flexures/)'
+area = 'kinematics-and-motion'
+
+[[area]]
+pattern = '^crates/reify-stdlib/src/(dynamics/|modal/|fea\.rs|analysis\.rs|loads\.rs|supports\.rs|tensegrity\.rs)'
+area = 'analysis'
+
+[[area]]
+pattern = '^crates/reify-stdlib/'
+area = 'constraints-and-geometry'
+
+[[area]]
+pattern = '^crates/reify-compiler/src/connect\.rs$'
+area = 'assemblies'
+
+[[area]]
+pattern = '^crates/(reify-core|reify-ast|reify-syntax|reify-compiler|reify-ir|reify-expr|reify-builtins|reify-compute-contract|reify-spec-conformance|reify-runtime|reify-test-support)/'
+area = 'language-pipeline'
+
+[[area]]
+pattern = '^tree-sitter-reify/'
+area = 'language-pipeline'
+
+[[area]]
+pattern = '^crates/(reify-constraints|reify-kernel-\w+|reify-geometry)/'
+area = 'constraints-and-geometry'
+
+[[area]]
+pattern = '^crates/(reify-solver-elastic|reify-mesh-morph|reify-shell-extract|reify-fdm|reify-eval-fea-tests)/'
+area = 'analysis'
+
+[[area]]
+pattern = '^crates/reify-gcode/'
+area = 'kinematics-and-motion'
+
+[[area]]
+pattern = '^crates/(reify-cli|reify-lsp|reify-mcp|reify-config|reify-doc|reify-doc-build)/'
+area = 'tooling'
+
+[[area]]
+pattern = '^crates/reify-audit/'
+area = 'reify-audit'
+
+[[area]]
+pattern = '^crates/reify-build-utils/'
+area = 'factory-infra'
+
+[[area]]
+pattern = '^gui/'
+area = 'gui'
+
+[[area]]
+pattern = '^(scripts/|tests/|hooks/|\.cargo/|dark-factory-orchestrator\.yaml)'
+area = 'factory-infra'
+
+# Paths mapped by inference rather than by a briefing statement: briefing defects for /review-briefing.
+[inferred]
+'crates/reify-test-support/' = 'language-pipeline (inferred: compiler/eval test harness; briefing silent)'
+'crates/reify-build-utils/' = 'factory-infra (inferred: native-dep link resolution; briefing silent)'
+'crates/reify-geometry/' = 'constraints-and-geometry (inferred: kernel holder trait; briefing silent)'
+'crates/reify-eval/src/*' = 'sub-crate rules split reify-eval across analysis / kinematics / constraints-and-geometry / language-pipeline by file name'
+'crates/reify-stdlib/src/*' = 'sub-crate rules split reify-stdlib across kinematics / analysis / constraints-and-geometry by file name'
+'crates/reify-compiler/src/connect.rs' = 'assemblies (inferred: connection graph compile; the assemblies area names no crate)'

@@ -17,16 +17,14 @@ import asyncio
 from pathlib import Path
 
 import pytest
+from _merge_lane_fakes import FakeClock, lane_scene_config
 
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, _run
-from orchestrator.merge_queue import (
-    EMPTY_SUFFIX_CONFLICT_GRAPH,
-    MergeRequest,
-    SpeculativeMergeWorker,
-    SuffixConflictGraph,
-)
-from orchestrator.merge_types import QueuedBranch
+from orchestrator.merge_lane import MergeLane
+from orchestrator.merge_lane.types import QueuedBranch
+from orchestrator.merge_lane.worker import MergeRequest, SpeculativeMergeWorker
+from orchestrator.suffix_graph import EMPTY_SUFFIX_CONFLICT_GRAPH, SuffixConflictGraph
 
 # ── fixtures (mirrors test_merge_queue_finalize_head_visibility.py) ────────────
 
@@ -68,7 +66,7 @@ def git_ops(git_config: GitConfig, git_repo: Path) -> GitOps:
 
 @pytest.fixture
 def config(git_repo: Path, git_config: GitConfig) -> OrchestratorConfig:
-    return OrchestratorConfig(project_root=git_repo, git=git_config)
+    return lane_scene_config(git_repo, git_config)
 
 
 def _make_req(
@@ -92,8 +90,31 @@ def _make_req(
 
 
 def _make_worker(git_ops: GitOps) -> SpeculativeMergeWorker:
-    """Build a bare SpeculativeMergeWorker for unit tests (no harness wiring)."""
-    return SpeculativeMergeWorker(git_ops, asyncio.Queue())
+    """Build a bare MergeLane for unit tests (no harness wiring).
+
+    ``snapshot()`` is this file's only observation surface and it stamps
+    every read against the worker's clock, so the clock port is the fake
+    one.  The verify port is left production: nothing here runs a verify,
+    and an unexercised double would assert nothing.
+    """
+    return MergeLane(git_ops, asyncio.Queue(), clock=FakeClock())
+
+
+def _graph(worker: SpeculativeMergeWorker) -> dict:
+    """The worker's suffix conflict graph, read off its public snapshot.
+
+    ``SuffixConflictGraph.to_snapshot_dict`` is the JSON-safe view: ``nodes``
+    is a list in pick order, each edge a sorted 2-element list, and both edge
+    collections and ``conflicts_with_main`` sorted.  ``_edge`` builds an edge
+    in that canonical shape so membership reads the same as it did against
+    the frozensets.
+    """
+    return worker.snapshot()['suffix_conflict_graph']
+
+
+def _edge(req_a: MergeRequest, req_b: MergeRequest) -> list[str]:
+    """The unordered edge between two requests, in the snapshot's shape."""
+    return sorted([req_a.request_id, req_b.request_id])
 
 
 # ── step-01: SuffixConflictGraph dataclass ────────────────────────────────────
@@ -269,7 +290,7 @@ class TestSnapshotSuffixConflictGraphKey:
     """snapshot() must include a 'suffix_conflict_graph' key.
 
     RED until step-04 GREEN adds the key to snapshot() and initialises
-    self._suffix_conflict_graph in __init__.
+    self._intake.suffix_conflict_graph in __init__.
     """
 
     async def test_snapshot_has_suffix_conflict_graph_key(self, git_ops, config, git_repo):
@@ -285,20 +306,6 @@ class TestSnapshotSuffixConflictGraphKey:
         worker = _make_worker(git_ops)
         snap = worker.snapshot()
         assert snap['suffix_conflict_graph'] == EMPTY_SUFFIX_CONFLICT_GRAPH.to_snapshot_dict()
-
-    async def test_snapshot_reflects_stored_graph(self, git_ops, config, git_repo):
-        """snapshot() reflects self._suffix_conflict_graph when set manually."""
-        worker = _make_worker(git_ops)
-        edge = frozenset({'mr-aaa', 'mr-bbb'})
-        custom_graph = SuffixConflictGraph(
-            nodes=('mr-aaa', 'mr-bbb'),
-            textual_edges=frozenset({edge}),
-            footprint_edges=frozenset({edge}),
-            conflicts_with_main=frozenset({'mr-aaa'}),
-        )
-        worker._suffix_conflict_graph = custom_graph
-        snap = worker.snapshot()
-        assert snap['suffix_conflict_graph'] == custom_graph.to_snapshot_dict()
 
     async def test_snapshot_backward_compat_keys_unchanged(self, git_ops, config, git_repo):
         """Pre-existing snapshot keys (depth, entries, head_of_line) are unchanged."""
@@ -348,28 +355,26 @@ class TestRecomputeFootprintEdges:
         req_a = _make_req('task-a', 'branch-a', config, git_repo)
         req_b = _make_req('task-b', 'branch-b', config, git_repo)
         req_c = _make_req('task-c', 'branch-c', config, git_repo)
-        worker._lane_buffers['normal'].append(req_a)
-        worker._lane_buffers['normal'].append(req_b)
-        worker._lane_buffers['normal'].append(req_c)
+        intake = worker._intake
+        intake.buffer_owned_request(req_a)
+        intake.buffer_owned_request(req_b)
+        intake.buffer_owned_request(req_c)
 
-        await worker.recompute_suffix_conflict_graph()
+        await intake.recompute_suffix_conflict_graph()
 
-        g = worker._suffix_conflict_graph
+        g = _graph(worker)
         # A and B share shared.txt — footprint overlap
-        pair_ab = frozenset({req_a.request_id, req_b.request_id})
-        assert pair_ab in g.footprint_edges
+        assert _edge(req_a, req_b) in g['footprint_edges']
         # A and C, B and C do NOT share files
-        pair_ac = frozenset({req_a.request_id, req_c.request_id})
-        pair_bc = frozenset({req_b.request_id, req_c.request_id})
-        assert pair_ac not in g.footprint_edges
-        assert pair_bc not in g.footprint_edges
+        assert _edge(req_a, req_c) not in g['footprint_edges']
+        assert _edge(req_b, req_c) not in g['footprint_edges']
 
     async def test_empty_suffix_yields_empty_graph(self, git_ops, config, git_repo):
         """Empty suffix → EMPTY_SUFFIX_CONFLICT_GRAPH stored."""
         worker = _make_worker(git_ops)
         # No items in lane buffers
-        await worker.recompute_suffix_conflict_graph()
-        assert worker._suffix_conflict_graph == EMPTY_SUFFIX_CONFLICT_GRAPH
+        await worker._intake.recompute_suffix_conflict_graph()
+        assert _graph(worker) == EMPTY_SUFFIX_CONFLICT_GRAPH.to_snapshot_dict()
 
     async def test_nodes_in_pick_order_high_before_normal(
         self, git_ops, config, git_repo
@@ -395,17 +400,18 @@ class TestRecomputeFootprintEdges:
         req_n2 = _make_req('task-n2', 'branch-n2', config, git_repo)
 
         # high lane first, then normal (FIFO)
-        worker._lane_buffers['high'].append(req_hi)
-        worker._lane_buffers['normal'].append(req_n1)
-        worker._lane_buffers['normal'].append(req_n2)
+        intake = worker._intake
+        intake.buffer_owned_request(req_hi)
+        intake.buffer_owned_request(req_n1)
+        intake.buffer_owned_request(req_n2)
 
-        await worker.recompute_suffix_conflict_graph()
+        await intake.recompute_suffix_conflict_graph()
 
-        g = worker._suffix_conflict_graph
+        g = _graph(worker)
         # high must precede normal
-        hi_idx = g.nodes.index(req_hi.request_id)
-        n1_idx = g.nodes.index(req_n1.request_id)
-        n2_idx = g.nodes.index(req_n2.request_id)
+        hi_idx = g['nodes'].index(req_hi.request_id)
+        n1_idx = g['nodes'].index(req_n1.request_id)
+        n2_idx = g['nodes'].index(req_n2.request_id)
         assert hi_idx < n1_idx < n2_idx
 
 
@@ -439,14 +445,14 @@ class TestTextualEdgesSubsetOfFootprint:
         worker = _make_worker(git_ops)
         req_x = _make_req('task-x', 'branch-x', config, git_repo)
         req_y = _make_req('task-y', 'branch-y', config, git_repo)
-        worker._lane_buffers['normal'].append(req_x)
-        worker._lane_buffers['normal'].append(req_y)
+        intake = worker._intake
+        intake.buffer_owned_request(req_x)
+        intake.buffer_owned_request(req_y)
 
-        await worker.recompute_suffix_conflict_graph()
-        g = worker._suffix_conflict_graph
+        await intake.recompute_suffix_conflict_graph()
+        g = _graph(worker)
 
-        pair_xy = frozenset({req_x.request_id, req_y.request_id})
-        assert pair_xy in g.textual_edges
+        assert _edge(req_x, req_y) in g['textual_edges']
 
     async def test_different_line_edit_no_textual_edge(
         self, git_ops, config, git_repo
@@ -483,17 +489,17 @@ class TestTextualEdgesSubsetOfFootprint:
         worker = _make_worker(git_ops)
         req_c = _make_req('task-c', 'branch-c', config, git_repo)
         req_d = _make_req('task-d', 'branch-d', config, git_repo)
-        worker._lane_buffers['normal'].append(req_c)
-        worker._lane_buffers['normal'].append(req_d)
+        intake = worker._intake
+        intake.buffer_owned_request(req_c)
+        intake.buffer_owned_request(req_d)
 
-        await worker.recompute_suffix_conflict_graph()
-        g = worker._suffix_conflict_graph
+        await intake.recompute_suffix_conflict_graph()
+        g = _graph(worker)
 
-        pair_cd = frozenset({req_c.request_id, req_d.request_id})
         # footprint overlap (same file)
-        assert pair_cd in g.footprint_edges
+        assert _edge(req_c, req_d) in g['footprint_edges']
         # but NOT a textual conflict (different lines → clean merge)
-        assert pair_cd not in g.textual_edges
+        assert _edge(req_c, req_d) not in g['textual_edges']
 
     async def test_textual_edges_subset_of_footprint_edges(
         self, git_ops, config, git_repo
@@ -515,14 +521,15 @@ class TestTextualEdgesSubsetOfFootprint:
         worker = _make_worker(git_ops)
         req_x = _make_req('t-inv-x', 'br-inv-x', config, git_repo)
         req_y = _make_req('t-inv-y', 'br-inv-y', config, git_repo)
-        worker._lane_buffers['normal'].append(req_x)
-        worker._lane_buffers['normal'].append(req_y)
+        intake = worker._intake
+        intake.buffer_owned_request(req_x)
+        intake.buffer_owned_request(req_y)
 
-        await worker.recompute_suffix_conflict_graph()
-        g = worker._suffix_conflict_graph
+        await intake.recompute_suffix_conflict_graph()
+        g = _graph(worker)
 
         # Every textual edge must also be a footprint edge
-        assert g.textual_edges <= g.footprint_edges
+        assert all(edge in g['footprint_edges'] for edge in g['textual_edges'])
 
 
 # ── step-09: conflicts_with_main (δ user-signal) ─────────────────────────────
@@ -566,14 +573,15 @@ class TestConflictsWithMain:
         worker = _make_worker(git_ops)
         req_x = _make_req('task-cx', 'conflict-x', config, git_repo)
         req_y = _make_req('task-cy', 'clean-y', config, git_repo)
-        worker._lane_buffers['normal'].append(req_x)
-        worker._lane_buffers['normal'].append(req_y)
+        intake = worker._intake
+        intake.buffer_owned_request(req_x)
+        intake.buffer_owned_request(req_y)
 
-        await worker.recompute_suffix_conflict_graph()
-        g = worker._suffix_conflict_graph
+        await intake.recompute_suffix_conflict_graph()
+        g = _graph(worker)
 
-        assert req_x.request_id in g.conflicts_with_main
-        assert req_y.request_id not in g.conflicts_with_main
+        assert req_x.request_id in g['conflicts_with_main']
+        assert req_y.request_id not in g['conflicts_with_main']
 
     async def test_conflicts_with_main_in_snapshot(
         self, git_ops, config, git_repo
@@ -594,9 +602,10 @@ class TestConflictsWithMain:
 
         worker = _make_worker(git_ops)
         req_x = _make_req('task-cx2', 'cx2', config, git_repo)
-        worker._lane_buffers['normal'].append(req_x)
+        intake = worker._intake
+        intake.buffer_owned_request(req_x)
 
-        await worker.recompute_suffix_conflict_graph()
+        await intake.recompute_suffix_conflict_graph()
         snap = worker.snapshot()
         assert req_x.request_id in snap['suffix_conflict_graph']['conflicts_with_main']
 
@@ -623,7 +632,8 @@ class TestRecomputeDebounce:
 
         worker = _make_worker(git_ops)
         req = _make_req('task-deb', 'branch-deb', config, git_repo)
-        worker._lane_buffers['normal'].append(req)
+        intake = worker._intake
+        intake.buffer_owned_request(req)
 
         call_count = 0
         original_probe = git_ops.merge_tree_conflicts
@@ -635,11 +645,11 @@ class TestRecomputeDebounce:
 
         git_ops.merge_tree_conflicts = counting_probe
 
-        await worker.recompute_suffix_conflict_graph()
+        await intake.recompute_suffix_conflict_graph()
         first_count = call_count
 
         # Same suffix, same main → no-op
-        await worker.recompute_suffix_conflict_graph()
+        await intake.recompute_suffix_conflict_graph()
         assert call_count == first_count, (
             f"Debounce failed: call_count went from {first_count} to {call_count}"
         )
@@ -662,7 +672,8 @@ class TestRecomputeDebounce:
 
         worker = _make_worker(git_ops)
         req1 = _make_req('task-deb2', 'branch-deb2', config, git_repo)
-        worker._lane_buffers['normal'].append(req1)
+        intake = worker._intake
+        intake.buffer_owned_request(req1)
 
         call_count = 0
         original_probe = git_ops.merge_tree_conflicts
@@ -674,14 +685,14 @@ class TestRecomputeDebounce:
 
         git_ops.merge_tree_conflicts = counting_probe
 
-        await worker.recompute_suffix_conflict_graph()
+        await intake.recompute_suffix_conflict_graph()
         first_count = call_count
 
         # Add a second request → new suffix → must recompute
         req2 = _make_req('task-deb3', 'branch-deb3', config, git_repo)
-        worker._lane_buffers['normal'].append(req2)
+        intake.buffer_owned_request(req2)
 
-        await worker.recompute_suffix_conflict_graph()
+        await intake.recompute_suffix_conflict_graph()
         assert call_count > first_count, (
             "Expected recompute after new request but probe count unchanged"
         )
@@ -715,8 +726,8 @@ class TestAcquireNextRequestHook:
         result = await worker._acquire_next_request()
         assert result is req
         # After returning, the graph must have the request_id as a node
-        g = worker._suffix_conflict_graph
-        assert req.request_id in g.nodes
+        g = _graph(worker)
+        assert req.request_id in g['nodes']
 
 
 # ── step-15: fail-open error handling ─────────────────────────────────────────
@@ -748,8 +759,9 @@ class TestRecomputeFailOpen:
         worker = _make_worker(git_ops)
         req_a = _make_req('task-fo-a', 'fo-a', config, git_repo)
         req_b = _make_req('task-fo-b', 'fo-b', config, git_repo)
-        worker._lane_buffers['normal'].append(req_a)
-        worker._lane_buffers['normal'].append(req_b)
+        intake = worker._intake
+        intake.buffer_owned_request(req_a)
+        intake.buffer_owned_request(req_b)
 
         async def boom(*args, **kwargs):
             raise RuntimeError('simulated probe failure')
@@ -757,12 +769,11 @@ class TestRecomputeFailOpen:
         git_ops.merge_tree_conflicts = boom
 
         # Must NOT raise
-        await worker.recompute_suffix_conflict_graph()
-        g = worker._suffix_conflict_graph
+        await intake.recompute_suffix_conflict_graph()
+        g = _graph(worker)
 
         # Pair should be conservatively marked as textual edge (fail-open)
-        pair_ab = frozenset({req_a.request_id, req_b.request_id})
-        assert pair_ab in g.textual_edges
+        assert _edge(req_a, req_b) in g['textual_edges']
 
     async def test_probe_error_conservative_conflicts_with_main(
         self, git_ops, config, git_repo
@@ -776,17 +787,18 @@ class TestRecomputeFailOpen:
 
         worker = _make_worker(git_ops)
         req_c = _make_req('task-fo-c', 'fo-c', config, git_repo)
-        worker._lane_buffers['normal'].append(req_c)
+        intake = worker._intake
+        intake.buffer_owned_request(req_c)
 
         async def boom(*args, **kwargs):
             raise RuntimeError('simulated main-probe failure')
 
         git_ops.merge_tree_conflicts = boom
 
-        await worker.recompute_suffix_conflict_graph()
-        g = worker._suffix_conflict_graph
+        await intake.recompute_suffix_conflict_graph()
+        g = _graph(worker)
         # Conservatively in conflicts_with_main
-        assert req_c.request_id in g.conflicts_with_main
+        assert req_c.request_id in g['conflicts_with_main']
 
     async def test_missing_ref_skipped_without_raising(
         self, git_ops, config, git_repo
@@ -796,14 +808,22 @@ class TestRecomputeFailOpen:
         # Create a req for a branch that doesn't exist (deleted or never pushed)
         req_gone = _make_req('task-gone', 'branch-that-does-not-exist', config, git_repo)
         req_gone_2 = _make_req('task-gone-2', 'branch-that-does-not-exist-2', config, git_repo)
-        worker._lane_buffers['normal'].append(req_gone)
-        worker._lane_buffers['normal'].append(req_gone_2)
+        intake = worker._intake
+        intake.buffer_owned_request(req_gone)
+        intake.buffer_owned_request(req_gone_2)
 
         # Must NOT raise
-        await worker.recompute_suffix_conflict_graph()
-        # Graph should be produced (empty or with empty edges)
-        g = worker._suffix_conflict_graph
-        assert isinstance(g, SuffixConflictGraph)
+        await intake.recompute_suffix_conflict_graph()
+        # Both items stay in the graph as nodes, but with every probe
+        # SKIPPED — no edge, no vs-main marker.  That is what distinguishes a
+        # missing ref from the two fail-open arms above, which mark
+        # conservatively when a probe RAISES.
+        assert _graph(worker) == {
+            'nodes': [req_gone.request_id, req_gone_2.request_id],
+            'textual_edges': [],
+            'footprint_edges': [],
+            'conflicts_with_main': [],
+        }
 
 
 # ── step-17: regression test for masked transient-error bug ──────────────────
@@ -844,7 +864,8 @@ class TestRecomputeTransientErrorGatesSignature:
 
         worker = _make_worker(git_ops)
         req = _make_req('task-transient', 'transient-err', config, git_repo)
-        worker._lane_buffers['normal'].append(req)
+        intake = worker._intake
+        intake.buffer_owned_request(req)
 
         # Counting spy: wraps the REAL merge_tree_conflicts so it still succeeds;
         # we just want to observe how many times it is called.
@@ -866,7 +887,7 @@ class TestRecomputeTransientErrorGatesSignature:
         git_ops.get_changed_files = failing_changed_files
 
         # First call: must NOT raise
-        await worker.recompute_suffix_conflict_graph()
+        await intake.recompute_suffix_conflict_graph()
 
         # The vs-main probe must have run (resolve_branch_sha succeeded → valid head)
         assert call_count >= 1, (
@@ -874,22 +895,12 @@ class TestRecomputeTransientErrorGatesSignature:
             '(vs-main probe) but got zero calls'
         )
 
-        # CRITICAL: signature must NOT be cached when a probe error occurred.
-        # A transient error leaves the signature un-stored so the next tick
-        # re-probes instead of serving a degraded/incomplete graph behind the
-        # debounce.
-        assert worker._suffix_conflict_signature is None, (
-            'Expected _suffix_conflict_signature to be None after a '
-            'get_changed_files failure (transient error must not be cached), '
-            f'but got {worker._suffix_conflict_signature!r}'
-        )
-
         count_after_first = call_count
 
         # Second call with same suffix + same main_sha (neither changed).
         # The signature was NOT cached, so the debounce MUST NOT short-circuit;
         # re-probing is required.
-        await worker.recompute_suffix_conflict_graph()
+        await intake.recompute_suffix_conflict_graph()
 
         assert call_count > count_after_first, (
             f'Expected re-probe on second call (transient error leaves signature '

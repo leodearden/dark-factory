@@ -1,36 +1,23 @@
-// Module-contract tests for data.js — the real-data poll loader for the Dark
-// Factory dashboard (window.DF_DATA, the 3s setInterval poll loop, and —
-// this task — a per-endpoint in-flight guard, error backoff, and jitter on
-// top of it). Run via `node --test` (see dashboard/tests/test_graph_layout_js.py
-// for the pytest wrapper that surfaces this suite in CI — it globs
-// **/*.test.mjs under dashboard/tests/js/, so this new file needs no new
-// wrapper).
+// data.js's poll loop: the module contract and auto-start, startPolling, the
+// per-endpoint in-flight guard, error backoff, jitter, the per-cycle
+// df-data-refresh dispatch, and slowness pacing. The rest of data.js's surface
+// has its own data_*.test.mjs suite per feature. Run via `node --test`;
+// dashboard/tests/test_graph_layout_js.py globs it.
 //
-// data.js has no package.json in the repo, so it resolves as CommonJS
-// (`module.exports = <object>`), same as the other redux/*.js modules.
-//
-// Unlike those siblings, a static ESM `import` of data.js is not an option
-// here, not even for the module-contract check: data.js assigns
-// `window.DF_DATA = {...}` at module scope, and an ESM `import` statement's
-// target module body runs BEFORE the importing file's own body — so
-// `globalThis.window` would still be unset when data.js's top level runs,
-// throwing `ReferenceError: window is not defined`. Every test in this file
-// therefore goes through the `loadDataJs()` helper below, which shims
-// `globalThis.window` FIRST and only then loads the module via
-// `createRequire(import.meta.url)` (mirrors runtime_format.test.mjs:33-45).
-//
-// data.js's module scope also unconditionally called `refreshDFData()` and
-// `setInterval(...)`. Under node, with no shim at all, that would throw
-// before even reaching the interval; but even with window/fetch shimmed it
-// would fire real (stubbed) fetches and leave a live timer holding the
-// process open — hanging `node --test`. loadDataJs() defends against that
-// unconditionally (see its comment below) so this suite can safely run
-// against pre-seam data.js too, which is what step-1's RED depends on.
+// Every test loads data.js through _data_loader.mjs::loadDataJs, which records
+// why a static import is not an option and how auto-start stays inert here.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { createRequire } from 'node:module';
 
-const MODULE_SPECIFIER = '../../src/dashboard/static/redux/data.js';
+import { loadDataJs, drain, quietly } from './_data_loader.mjs';
+import {
+  COSTS_PATH,
+  CURATOR_PATH,
+  EXPECTED_ENDPOINT_COUNT,
+  TASKS_PATH,
+  TERMINAL_PROJECT,
+} from './_data_fixtures.mjs';
+
 const EXPECTED_FUNCTION_NAMES = [
   'endpointsFor',
   'applyKey',
@@ -40,90 +27,42 @@ const EXPECTED_FUNCTION_NAMES = [
   'startPolling',
   'createPollState',
   'pollKey',
+  'datumFor',
+  'requestOnDemand',
+  'onDemandView',
+  'onDemandDatum',
+  'pollSetFor',
+  'scopePollingToTab',
 ];
 
 // Full DF_DATA key set (data.js:41-127) — initialised so the first render
 // before fetch completes cannot crash any component reading DF_DATA.*.
 const EXPECTED_DF_DATA_KEYS = [
   'PROJECTS', 'AGENTS', 'ORCHESTRATORS', 'ORCHESTRATORS_SPARK',
-  'ACTIVE_TASKS', 'TASKS_OFFLINE', 'TASKS_OFFLINE_PROJECTS', 'DONE_COUNTS',
-  'PERFORMANCE', 'MEMORY_STATUS', 'MEMORY_TIMESERIES', 'MEMORY_OPS_BREAKDOWN',
+  'TASKS_OFFLINE', 'TASKS_OFFLINE_PROJECTS',
+  'TASKS_DEGRADED_PROJECTS', 'TASKS_PROJECT_COUNT', 'TASKS_SNAPSHOT',
+  'INVARIANTS',
+  'PERFORMANCE', 'PERFORMANCE_LISTING', 'MEMORY_STATUS', 'MEMORY_OPS',
   'RECON_STATE', 'MERGE_QUEUE', 'COSTS', 'BURNDOWN', 'BURNDOWN_BY_PROJECT',
   'CURATOR_STATE', 'ESCALATIONS', 'ESCALATION_ANALYTICS', 'SCHEDULER',
+  'MEMORY_EVALS',
+  // Per-endpoint staleness, published by refreshOne (task 4884, #4791).
+  // Nested under DF_DATA alongside __loaded rather than added as a second
+  // global, and seeded here for the same reason every domain key is: the
+  // first render happens before any fetch resolves, and a consumer reading
+  // DF_DATA.__stale[path] must not have to guard the container itself.
+  '__stale',
+  // Per-endpoint receipts, published by refreshOne on the SUCCESS path only
+  // (task 5588). Where __stale records ATTEMPT history, this records the
+  // PROVENANCE of the values now sitting in DF_DATA — which is exactly why it
+  // must NOT advance on a failure: that is what makes a wedged endpoint's
+  // tiles keep ageing on screen instead of resetting to "just received".
+  '__receipt',
 ];
 
-// Loads data.js fresh against a shimmed browser-ish global. Installs
-// `globalThis.window` (a bare object recording dispatched events) and a
-// counting `globalThis.fetch` BEFORE requiring, then busts the require
-// cache so each call re-executes data.js's module body from scratch — the
-// module body only runs once per require otherwise, which would leave later
-// callers seeing a stale `window.DF_DATA` / stale flow-control singleton
-// from a previous test's shim (mirrors runtime_format.test.mjs:33-49).
-//
-// Deliberately does NOT set `globalThis.document`: index.html loads data.js
-// as a classic script where `document` always exists, but every test in
-// this file runs under node, so the auto-start guard must see no `document`
-// and stay inert, exactly like the real non-browser (node --test)
-// environment.
-//
-// Also wraps `globalThis.setInterval` for the duration of the require and
-// clears any interval it captures before returning. This is defensive
-// rather than load-bearing for the seamed implementation (which gates
-// auto-start on `document` and never calls setInterval here at all), but it
-// means step-1's RED run — against pre-seam data.js, which calls
-// setInterval unconditionally — cannot hang node --test: the interval is
-// recorded (so the "no live timer" assertion still fails honestly) and then
-// cleared immediately, regardless of what the caller asserts.
-function loadDataJs({ fetchStub } = {}) {
-  const events = [];
-  const fetchCalls = [];
-  const intervalCalls = [];
-  const win = { dispatchEvent: ev => events.push(ev) };
-  globalThis.window = win;
-  globalThis.fetch = (url, init) => {
-    fetchCalls.push({ url, init });
-    if (fetchStub) return fetchStub(url, init);
-    return Promise.resolve({ ok: true, json: async () => ({}) });
-  };
-
-  const require = createRequire(import.meta.url);
-  const resolved = require.resolve(MODULE_SPECIFIER);
-  delete require.cache[resolved];
-
-  const originalSetInterval = globalThis.setInterval;
-  globalThis.setInterval = (...args) => {
-    const handle = originalSetInterval(...args);
-    intervalCalls.push(handle);
-    return handle;
-  };
-
-  let api;
-  try {
-    api = require(MODULE_SPECIFIER);
-  } finally {
-    globalThis.setInterval = originalSetInterval;
-    for (const handle of intervalCalls) clearInterval(handle);
-  }
-
-  return { api, window: win, events, fetchCalls, intervalCalls };
-}
-
-// Resolves after the entire pending microtask queue has drained (node
-// always fully drains microtasks before running the next macrotask/
-// immediate), regardless of how many .then()/await hops a chain needs — so
-// awaiting this once after a pollTick() call is enough to let every
-// non-held endpoint's fetch -> resp.json() -> applyKey chain run to
-// completion before the next tick fires.
-function drain() {
-  return new Promise(resolve => setImmediate(resolve));
-}
-
-// Pure, state-free — reused below so the test fixtures assert against
-// data.js's own key derivation rather than a hand-copied duplicate of the
-// `url.split('?')[0]` rule (see pollKey's doc comment in data.js). Safe to
-// grab once at file scope: loadDataJs()'s window/fetch shim is fully
-// re-installed by every test's own loadDataJs() call, so this throwaway
-// load leaves nothing behind that a later test could observe.
+// Reused below so the test fixtures assert against data.js's own key
+// derivation rather than a hand-copied duplicate of the `url.split('?')[0]`
+// rule (see pollKey's doc comment in data.js).
 const { pollKey } = loadDataJs().api;
 
 // The endpoint the motivating incident hung on (measured 108s response) —
@@ -320,7 +259,11 @@ test('production fallbacks: refreshDFData with no explicit state/deps uses globa
   const firstCycle = api.refreshDFData(undefined, { jitterMaxMs: 0 });
   await drain();
 
-  assert.equal(fetchCalls.length, 13, 'the default fetchImpl fallback must reach globalThis.fetch for all 13 endpoints');
+  assert.equal(
+    fetchCalls.length,
+    EXPECTED_ENDPOINT_COUNT,
+    `the default fetchImpl fallback must reach globalThis.fetch for all ${EXPECTED_ENDPOINT_COUNT} endpoints`,
+  );
   for (const { init } of fetchCalls) {
     assert.equal(init.credentials, 'same-origin', 'the default fetchImpl fallback must still pass credentials: same-origin');
   }
@@ -328,13 +271,13 @@ test('production fallbacks: refreshDFData with no explicit state/deps uses globa
   // Second cycle, fired while the first is still held open, ALSO with no
   // explicit `state`: if the o.state || DF_POLL_STATE fallback were broken
   // or DF_POLL_STATE were shadowed/undefined, this would see fresh
-  // (non-in-flight) state and re-fetch all 13 endpoints again.
+  // (non-in-flight) state and re-fetch every endpoint again.
   const secondCycle = api.refreshDFData(undefined, { jitterMaxMs: 0 });
   await drain();
   assert.equal(
     fetchCalls.length,
-    13,
-    'a second cycle sharing the DF_POLL_STATE singleton must skip all 13 still-in-flight endpoints, not re-fetch them',
+    EXPECTED_ENDPOINT_COUNT,
+    'a second cycle sharing the DF_POLL_STATE singleton must skip every still-in-flight endpoint, not re-fetch them',
   );
 
   releaseAll();
@@ -348,17 +291,21 @@ test('production fallbacks: refreshDFData with no explicit state/deps uses globa
 // poll interval, so an unguarded loader stacks ~36 concurrent requests for
 // that one endpoint by the time it finally answers. This drives four tick
 // fires while memory-graphs is held open and asserts it never exceeds 1
-// concurrent fetch, while the other 12 endpoints are completely unaffected
+// concurrent fetch, while every other endpoint is completely unaffected
 // (proving the guard is per-endpoint, not whole-cycle — a whole-cycle guard
-// would starve all 13 endpoints on any single slow one).
+// would starve all of them on any single slow one).
 // ---------------------------------------------------------------------------
 
-test('per-endpoint in-flight guard: a slow endpoint never exceeds concurrency 1, and does not block the other 12 endpoints (regression)', async () => {
+test('per-endpoint in-flight guard: a slow endpoint never exceeds concurrency 1, and does not block the other endpoints (regression)', async () => {
   const { fetchImpl, maxConcurrent, callCount, releaseSlow } = makeConcurrencyFetch(SLOW_ENDPOINT_PATH);
   const { api } = loadDataJs({ fetchStub: fetchImpl });
 
   const allPaths = Object.keys(api.endpointsFor('24h')).map(url => pollKey(url));
-  assert.equal(allPaths.length, 13, 'expected 13 endpoints (sanity check on the endpointsFor fixture)');
+  assert.equal(
+    allPaths.length,
+    EXPECTED_ENDPOINT_COUNT,
+    `expected ${EXPECTED_ENDPOINT_COUNT} endpoints (sanity check on the endpointsFor fixture)`,
+  );
   assert.ok(allPaths.includes(SLOW_ENDPOINT_PATH), 'fixture must include the memory-graphs endpoint');
   const fastPaths = allPaths.filter(p => p !== SLOW_ENDPOINT_PATH);
 
@@ -740,8 +687,8 @@ test('error backoff: refreshDFData(win) (chip change) bypasses backoff only for 
 });
 
 // ---------------------------------------------------------------------------
-// Jitter — spreads the 13 endpoint fetches across part of the 3s interval
-// instead of every tick firing all 13 at once (task 185's lesson: 13
+// Jitter — spreads the endpoint fetches across part of the 3s interval
+// instead of every tick firing all of them at once (task 185's lesson: 13
 // simultaneous requests hammering a single aiosqlite worker thread). Driven
 // by a recording `sleep` dep (captures every requested delay, resolves
 // immediately unless a test deliberately holds it open) and a deterministic
@@ -757,7 +704,7 @@ test('error backoff: refreshDFData(win) (chip change) bypasses backoff only for 
 const EXPECTED_JITTER_MAX_MS = 1500;
 const EXPECTED_POLL_INTERVAL_MS = 3000;
 
-test('jitter: every endpoint awaits a pre-fetch delay in [0, JITTER_MAX_MS), and the 13 delays are not all identical', async () => {
+test('jitter: every endpoint awaits a pre-fetch delay in [0, JITTER_MAX_MS), and the delays are not all identical', async () => {
   // Sanity check on the fixture itself: the jitter cap must stay below the
   // poll interval, so a jittered start can never structurally slip past the
   // next tick.
@@ -774,10 +721,10 @@ test('jitter: every endpoint awaits a pre-fetch delay in [0, JITTER_MAX_MS), and
   const deps = {
     fetchImpl,
     now: () => 0,
-    // 13 distinct fractions in [0, 1) — deterministic, and spread enough
-    // that flooring against JITTER_MAX_MS cannot coincidentally collapse
-    // them all to the same integer delay.
-    random: () => (callIndex++ % 13) / 13,
+    // One distinct fraction in [0, 1) per endpoint — deterministic, and
+    // spread enough that flooring against JITTER_MAX_MS cannot
+    // coincidentally collapse them all to the same integer delay.
+    random: () => (callIndex++ % EXPECTED_ENDPOINT_COUNT) / EXPECTED_ENDPOINT_COUNT,
     sleep: ms => { sleepCalls.push(ms); return Promise.resolve(); },
   };
 
@@ -786,7 +733,11 @@ test('jitter: every endpoint awaits a pre-fetch delay in [0, JITTER_MAX_MS), and
   // exercises data.js's own internal default rather than a test override.
   await api.refreshDFData(undefined, { state: api.createPollState(), deps });
 
-  assert.equal(sleepCalls.length, 13, 'every one of the 13 endpoints must await a jitter sleep');
+  assert.equal(
+    sleepCalls.length,
+    EXPECTED_ENDPOINT_COUNT,
+    `every one of the ${EXPECTED_ENDPOINT_COUNT} endpoints must await a jitter sleep`,
+  );
   for (const ms of sleepCalls) {
     assert.ok(
       ms >= 0 && ms < EXPECTED_JITTER_MAX_MS,
@@ -795,7 +746,7 @@ test('jitter: every endpoint awaits a pre-fetch delay in [0, JITTER_MAX_MS), and
   }
   assert.ok(
     new Set(sleepCalls).size > 1,
-    'the 13 jitter delays must not all be identical — the fan-out must be genuinely spread',
+    'the jitter delays must not all be identical — the fan-out must be genuinely spread',
   );
 });
 
@@ -864,106 +815,13 @@ test('jitter: passing jitterMaxMs: 0 issues no sleep at all', async () => {
 });
 
 // ---------------------------------------------------------------------------
-// Preserved-behaviour contract — pins the things the task explicitly says
-// NOT to break: __DF_PAUSE, keep-prior-values-on-failure, applyKey
-// reference stability, the per-cycle df-data-refresh dispatch (including a
-// cycle where every endpoint got skipped), and the ?window= URL shape with
-// its path-keyed flow-control state. A later refactor cannot quietly drop
-// any of these without one of the tests below going red.
+// Preserved-behaviour contract — pins the per-cycle df-data-refresh dispatch
+// (including a cycle where every endpoint got skipped) and the ?window= URL
+// shape with its path-keyed flow-control state. A later refactor cannot
+// quietly drop either without one of the tests below going red. The
+// keep-prior-on-failure and applyKey reference-stability halves are in
+// data_apply.test.mjs; __DF_PAUSE has its own file, data_pause.test.mjs.
 // ---------------------------------------------------------------------------
-
-test('preserved behaviour: window.__DF_PAUSE = true stops pollTick from fetching; false resumes on the next tick', async () => {
-  const callCount = new Map();
-  const fetchImpl = url => {
-    const path = pollKey(url);
-    callCount.set(path, (callCount.get(path) || 0) + 1);
-    return Promise.resolve({ ok: true, json: async () => ({}) });
-  };
-  const { api, window: win } = loadDataJs({ fetchStub: fetchImpl });
-  const opts = { state: api.createPollState(), deps: { fetchImpl }, jitterMaxMs: 0 };
-
-  win.__DF_PAUSE = true;
-  api.pollTick(opts);
-  await drain();
-  assert.equal(callCount.size, 0, 'pollTick must issue zero fetches while __DF_PAUSE is true');
-
-  win.__DF_PAUSE = false;
-  api.pollTick(opts);
-  await drain();
-  assert.equal(
-    callCount.get(FLAKY_ENDPOINT_PATH),
-    1,
-    'pollTick must resume fetching once __DF_PAUSE is set back to false, on the very next tick',
-  );
-});
-
-test('preserved behaviour: a thrown fetch error keeps the prior DF_DATA value and still warns', async () => {
-  const { api, window: win } = loadDataJs();
-  win.DF_DATA.CURATOR_STATE = { marker: 'prior-throw' };
-
-  const originalWarn = console.warn;
-  const warnCalls = [];
-  console.warn = (...args) => warnCalls.push(args);
-  try {
-    const state = api.createPollState();
-    const deps = { fetchImpl: () => Promise.reject(new Error('boom')), now: () => 0 };
-    await api.refreshOne(FLAKY_ENDPOINT_PATH, ['CURATOR_STATE'], state, deps);
-  } finally {
-    console.warn = originalWarn;
-  }
-
-  assert.deepEqual(
-    win.DF_DATA.CURATOR_STATE,
-    { marker: 'prior-throw' },
-    'a thrown fetch error must leave the prior DF_DATA value untouched rather than blanking it',
-  );
-  assert.ok(
-    warnCalls.some(args => args[0] === 'DF_DATA fetch failed'),
-    'a thrown fetch error must still emit the console.warn',
-  );
-});
-
-test('preserved behaviour: a non-ok (503) response also keeps the prior DF_DATA value intact', async () => {
-  const { api, window: win } = loadDataJs();
-  win.DF_DATA.CURATOR_STATE = { marker: 'prior-503' };
-
-  const state = api.createPollState();
-  const deps = { fetchImpl: () => Promise.resolve({ ok: false, status: 503, json: async () => ({}) }), now: () => 0 };
-  await api.refreshOne(FLAKY_ENDPOINT_PATH, ['CURATOR_STATE'], state, deps);
-
-  assert.deepEqual(
-    win.DF_DATA.CURATOR_STATE,
-    { marker: 'prior-503' },
-    'a non-ok response must leave the prior DF_DATA value untouched rather than blanking it',
-  );
-});
-
-test('preserved behaviour: applyKey mutates PROJECTS/AGENTS in place, replaces other keys by reference, and ignores undefined/null', () => {
-  const { api, window: win } = loadDataJs();
-
-  const projectsRef = win.DF_DATA.PROJECTS;
-  const agentsRef = win.DF_DATA.AGENTS;
-  api.applyKey('PROJECTS', [{ id: 'p1' }]);
-  api.applyKey('AGENTS', [{ id: 'a1' }]);
-  assert.equal(
-    win.DF_DATA.PROJECTS,
-    projectsRef,
-    'PROJECTS must stay the same array reference — shell.jsx captures it at module load',
-  );
-  assert.equal(win.DF_DATA.AGENTS, agentsRef, 'AGENTS must stay the same array reference');
-  assert.deepEqual(win.DF_DATA.PROJECTS, [{ id: 'p1' }], 'PROJECTS content must still be updated (in place)');
-  assert.deepEqual(win.DF_DATA.AGENTS, [{ id: 'a1' }], 'AGENTS content must still be updated (in place)');
-
-  const newCosts = { summary: { total: 42 } };
-  api.applyKey('COSTS', newCosts);
-  assert.equal(win.DF_DATA.COSTS, newCosts, 'non-stable keys must be replaced by reference');
-
-  const priorScheduler = win.DF_DATA.SCHEDULER;
-  api.applyKey('SCHEDULER', undefined);
-  assert.equal(win.DF_DATA.SCHEDULER, priorScheduler, 'undefined values must be ignored');
-  api.applyKey('SCHEDULER', null);
-  assert.equal(win.DF_DATA.SCHEDULER, priorScheduler, 'null values must be ignored');
-});
 
 test('preserved behaviour: df-data-refresh dispatches exactly once per cycle, including a cycle where every endpoint is skipped', async () => {
   const alwaysFail = () => Promise.reject(new Error('boom'));
@@ -975,7 +833,7 @@ test('preserved behaviour: df-data-refresh dispatches exactly once per cycle, in
   const deps = { fetchImpl: alwaysFail, now: () => t, random: () => 0, sleep: () => Promise.resolve() };
   const opts = { state, deps, jitterMaxMs: 0 };
 
-  // Cycle 1: every one of the 13 endpoints fails and backs off.
+  // Cycle 1: every endpoint fails and backs off.
   await api.refreshDFData(undefined, opts);
   assert.equal(countDfEvents(), 1, 'cycle 1 (all endpoints failing) must still dispatch exactly one df-data-refresh event');
 
@@ -1030,4 +888,407 @@ test("preserved behaviour: refreshDFData(win) updates the ?window= param on the 
       `the flow-control state for ${path} must be the SAME object across a chip change (path-keyed, not reset)`,
     );
   }
+});
+
+// ---------------------------------------------------------------------------
+// Slowness pacing (task 5823)
+//
+// A slow-but-successful endpoint is paced by its own measured service time.
+// The rule and its threshold live beside data.js::slownessPacingHoldMs.
+// ---------------------------------------------------------------------------
+
+const SCHEDULER_PATH = '/api/v2/dashboard/scheduler';
+const ESCALATIONS_PATH = '/api/v2/dashboard/escalations';
+const SIMULATED_MINUTE_MS = 60_000;
+const EXPECTED_MAX_POLL_DUTY_CYCLE = 0.5;
+// The failure-backoff ceiling the schedule test above already pins.
+const EXPECTED_BACKOFF_MAX_MS = 60000;
+
+// A virtual event loop: every sleep and every response resolves at a virtual
+// instant, and each endpoint answers after its configured service time; a path
+// in `failingPaths` rejects its fetch after that time instead. The
+// no-op timer pair keeps refreshOne's 30s deadline from arming a real timer,
+// so no deadline ever fires here: a test that needs one to fire belongs in
+// data_attempt_deadline.test.mjs, on its makeVirtualEndpoint.
+function makeVirtualServer(serviceMsByPath, { failingPaths = [] } = {}) {
+  let clock = 0;
+  const timers = [];
+  const calls = new Map();
+  const urls = [];
+  const serviceMs = { ...serviceMsByPath };
+  const failing = new Set(failingPaths);
+
+  const after = ms => new Promise(resolve => { timers.push({ at: clock + ms, fire: resolve }); });
+
+  function fetchImpl(url) {
+    const path = pollKey(url);
+    calls.set(path, (calls.get(path) || 0) + 1);
+    urls.push(url);
+    return after(serviceMs[path] ?? 0).then(() => {
+      if (failing.has(path)) throw new Error(`virtual server: ${path} is down`);
+      return { ok: true, json: async () => ({}) };
+    });
+  }
+
+  async function advanceTo(target) {
+    for (;;) {
+      timers.sort((a, b) => a.at - b.at);
+      if (timers.length === 0 || timers[0].at > target) break;
+      const next = timers.shift();
+      clock = next.at;
+      next.fire();
+      await drain();
+    }
+    clock = target;
+  }
+
+  return {
+    deps: {
+      fetchImpl,
+      now: () => clock,
+      sleep: after,
+      random: () => 0,
+      setTimeoutImpl: () => 0,
+      clearTimeoutImpl: () => {},
+    },
+    serviceMs,
+    urls,
+    count: path => calls.get(path) || 0,
+    advanceTo,
+  };
+}
+
+async function runTicks(api, server, opts, firstTickAt, tickCount) {
+  for (let i = 0; i < tickCount; i += 1) {
+    await server.advanceTo(firstTickAt + i * EXPECTED_POLL_INTERVAL_MS);
+    api.pollTick(opts);
+    await drain();
+  }
+  await server.advanceTo(firstTickAt + tickCount * EXPECTED_POLL_INTERVAL_MS);
+}
+
+test('pacing: a slow-but-successful endpoint is not asked again until twice its service time after the request started', async () => {
+  const server = makeVirtualServer({ [TASKS_PATH]: 3900 });
+  const { api, window: win } = loadDataJs({ fetchStub: server.deps.fetchImpl });
+  const opts = { state: api.createPollState(), deps: server.deps, jitterMaxMs: 0 };
+
+  api.pollTick(opts);
+  await drain();
+  await server.advanceTo(3900);
+  assert.equal(win.DF_DATA.__stale[TASKS_PATH].failures, 0, 'a slow answer is a success, not a failure');
+
+  await server.advanceTo(7799);
+  api.pollTick(opts);
+  await drain();
+  assert.equal(server.count(TASKS_PATH), 1, 'asked again before twice its 3900ms service time had passed');
+
+  await server.advanceTo(7800);
+  api.pollTick(opts);
+  await drain();
+  assert.equal(server.count(TASKS_PATH), 2, 'still held once twice its service time had passed');
+});
+
+test('pacing: replaying the three endpoints measured 2026-09-23, each is held at or under the duty-cycle cap - fewer requests per minute than the in-flight guard alone admits', async () => {
+  const measuredServiceMs = { [TASKS_PATH]: 3886, [SCHEDULER_PATH]: 2297, [ESCALATIONS_PATH]: 2120 };
+  // What the in-flight guard alone admits in a minute of 3s ticks: /tasks
+  // lands between ticks, so it is re-issued every 2nd tick; the other two are
+  // under 3000ms, so every tick.
+  const unpacedRequestsPerMinute = { [TASKS_PATH]: 10, [SCHEDULER_PATH]: 20, [ESCALATIONS_PATH]: 20 };
+  const tickCount = SIMULATED_MINUTE_MS / EXPECTED_POLL_INTERVAL_MS;
+  const server = makeVirtualServer(measuredServiceMs);
+  const { api } = loadDataJs({ fetchStub: server.deps.fetchImpl });
+  const opts = { state: api.createPollState(), deps: server.deps, jitterMaxMs: 0 };
+
+  await runTicks(api, server, opts, 0, tickCount);
+
+  for (const [path, serviceMs] of Object.entries(measuredServiceMs)) {
+    const requests = server.count(path);
+    assert.ok(
+      requests < unpacedRequestsPerMinute[path],
+      `${path}: ${requests} requests in a minute, not fewer than the unpaced ${unpacedRequestsPerMinute[path]}`,
+    );
+    const dutyCycle = requests * serviceMs / SIMULATED_MINUTE_MS;
+    assert.ok(
+      dutyCycle <= EXPECTED_MAX_POLL_DUTY_CYCLE,
+      `${path}: busy ${dutyCycle.toFixed(3)} of the minute, over the ${EXPECTED_MAX_POLL_DUTY_CYCLE} cap`,
+    );
+  }
+  const fastPaths = Object.keys(api.endpointsFor('24h')).map(pollKey).filter(p => !(p in measuredServiceMs));
+  for (const path of fastPaths) {
+    assert.equal(server.count(path), tickCount, `${path} is fast and must be fetched on every tick`);
+  }
+});
+
+test('pacing: a fast endpoint is untouched - even when jitter starts its request late in the tick', async () => {
+  const tickCount = SIMULATED_MINUTE_MS / EXPECTED_POLL_INTERVAL_MS;
+  const server = makeVirtualServer({ [SCHEDULER_PATH]: 1400 });
+  const { api } = loadDataJs({ fetchStub: server.deps.fetchImpl });
+  const opts = { state: api.createPollState(), deps: { ...server.deps, random: () => 0.9 } };
+
+  await runTicks(api, server, opts, 0, tickCount);
+
+  const paths = Object.keys(api.endpointsFor('24h')).map(pollKey);
+  assert.equal(paths.length, EXPECTED_ENDPOINT_COUNT);
+  for (const path of paths) {
+    assert.equal(server.count(path), tickCount, `${path} was paced, though its own service time is under the threshold`);
+  }
+});
+
+test('pacing: relaxes back as the endpoint speeds up', async () => {
+  const server = makeVirtualServer({ [TASKS_PATH]: 3900 });
+  const { api } = loadDataJs({ fetchStub: server.deps.fetchImpl });
+  const opts = { state: api.createPollState(), deps: server.deps, jitterMaxMs: 0 };
+
+  await runTicks(api, server, opts, 0, 9);
+  assert.equal(server.count(TASKS_PATH), 3, 'a 3900ms endpoint is asked once per 9s, not every 6s');
+
+  server.serviceMs[TASKS_PATH] = 100;
+  await runTicks(api, server, opts, 27_000, 11);
+  assert.equal(server.count(TASKS_PATH), 3 + 11, 'a fast answer must restore the full cadence on the very next tick');
+});
+
+test('pacing: a chip change still forces a paced WINDOWED endpoint, only the windowed ones, and the forced answer paces the timer path by its own measurement', async () => {
+  const server = makeVirtualServer({ [COSTS_PATH]: 4000, [CURATOR_PATH]: 4000 });
+  const { api } = loadDataJs({ fetchStub: server.deps.fetchImpl });
+  const opts = { state: api.createPollState(), deps: server.deps, jitterMaxMs: 0 };
+
+  api.pollTick(opts);
+  await drain();
+  await server.advanceTo(5000);
+  api.pollTick(opts);
+  await drain();
+  assert.equal(server.count(COSTS_PATH), 1, 'precondition: costs is paced');
+  assert.equal(server.count(CURATOR_PATH), 1, 'precondition: curator is paced');
+
+  const chip = api.refreshDFData('7d', opts);
+  await drain();
+  assert.equal(server.count(COSTS_PATH), 2, 'the chip change must bypass pacing on a windowed endpoint');
+  assert.ok(server.urls.includes(`${COSTS_PATH}?window=7d`), 'the forced request must carry the new window');
+  assert.equal(server.count(CURATOR_PATH), 1, 'the chip has no bearing on curator, so its pacing must hold');
+
+  await server.advanceTo(9000);
+  await chip;
+
+  await server.advanceTo(12_999);
+  api.pollTick(opts);
+  await drain();
+  assert.equal(server.count(COSTS_PATH), 2, 'the forced 4000ms answer, started at 5000, must pace the timer path');
+
+  await server.advanceTo(13_000);
+  api.pollTick(opts);
+  await drain();
+  assert.equal(server.count(COSTS_PATH), 3);
+});
+
+test('pacing: requestOnDemand is never paced - a user action is not a poll loop, even handed a poll cadence in its deps', async () => {
+  const server = makeVirtualServer({ [TASKS_PATH]: 4000 });
+  const { api, window: win } = loadDataJs({ fetchStub: server.deps.fetchImpl });
+  const state = api.createPollState();
+  const deps = { ...server.deps, pollIntervalMs: EXPECTED_POLL_INTERVAL_MS };
+
+  const first = api.requestOnDemand('terminal', TERMINAL_PROJECT, { state, deps });
+  await drain();
+  await server.advanceTo(4000);
+  assert.equal(await first, api.REFRESH_OUTCOMES.applied);
+  assert.deepEqual(Object.values(win.DF_DATA.__receipt).map(r => r.pacingHoldMs), [0], 'an on-demand success imposed a hold');
+
+  const second = api.requestOnDemand('terminal', TERMINAL_PROJECT, { state, deps });
+  await drain();
+  await server.advanceTo(8000);
+  assert.equal(await second, api.REFRESH_OUTCOMES.applied, 'a user re-request of a slow listing must be fetched, not skipped');
+  assert.equal(server.count(TASKS_PATH), 2);
+});
+
+test('pacing: a service time inflated by a wall-clock jump can never hold an endpoint beyond BACKOFF_MAX_MS after its request started', async () => {
+  // A laptop suspended mid-request: the answer lands ten hours "later" by
+  // Date.now(), still a success, so no staleness banner would ever explain
+  // an unbounded hold.
+  const jumpedServiceMs = 36_000_000;
+  const server = makeVirtualServer({ [CURATOR_PATH]: jumpedServiceMs });
+  const { api, window: win } = loadDataJs({ fetchStub: server.deps.fetchImpl });
+  const opts = { state: api.createPollState(), deps: server.deps, jitterMaxMs: 0 };
+
+  api.pollTick(opts);
+  await drain();
+  await server.advanceTo(jumpedServiceMs);
+  assert.equal(win.DF_DATA.__stale[CURATOR_PATH].failures, 0, 'nothing would warn the operator of this hold');
+
+  // The cap runs from the request's start, so a late answer lands already past
+  // it: the very next tick asks again. A cap anchored at arrival would still
+  // be holding here.
+  await server.advanceTo(jumpedServiceMs + EXPECTED_POLL_INTERVAL_MS);
+  api.pollTick(opts);
+  await drain();
+  assert.equal(server.count(CURATOR_PATH), 2, `held off past ${EXPECTED_BACKOFF_MAX_MS}ms after its request started`);
+});
+
+test('pacing: each success publishes the hold it imposed on its receipt — paced, capped and unpaced', async () => {
+  const server = makeVirtualServer({ [TASKS_PATH]: 3900 });
+  const { api, window: win } = loadDataJs({ fetchStub: server.deps.fetchImpl });
+  const opts = { state: api.createPollState(), deps: server.deps, jitterMaxMs: 0 };
+
+  api.pollTick(opts);
+  await drain();
+  await server.advanceTo(3900);
+  assert.equal(win.DF_DATA.__receipt[TASKS_PATH].pacingHoldMs, 7800, 'a 3900ms answer holds twice its service time');
+  assert.equal(win.DF_DATA.__receipt[CURATOR_PATH].pacingHoldMs, 0, 'a fast answer in the same cycle published a hold');
+
+  const jumpedServiceMs = 36_000_000;
+  const jumped = makeVirtualServer({ [CURATOR_PATH]: jumpedServiceMs });
+  const { api: jumpedApi, window: jumpedWin } = loadDataJs({ fetchStub: jumped.deps.fetchImpl });
+  jumpedApi.pollTick({ state: jumpedApi.createPollState(), deps: jumped.deps, jitterMaxMs: 0 });
+  await drain();
+  await jumped.advanceTo(jumpedServiceMs);
+  assert.equal(
+    jumpedWin.DF_DATA.__receipt[CURATOR_PATH].pacingHoldMs,
+    EXPECTED_BACKOFF_MAX_MS,
+    'the published hold is not the capped one the poll loop imposed',
+  );
+});
+
+// Advances the virtual clock to `t`, firing a poll tick when `t` lands on one.
+async function advanceAndTick(api, server, opts, t) {
+  await server.advanceTo(t);
+  if (t % EXPECTED_POLL_INTERVAL_MS !== 0) return;
+  api.pollTick(opts);
+  await drain();
+}
+
+test("pacing: a slow-but-healthy endpoint's plain tile never badges between landings, and badges once it stops answering past its paced bound", async () => {
+  // The bound datum.js::plainDatum gives an unpaced receipt, restated rather
+  // than imported so this pins the composed data.js -> datum.js behaviour.
+  const EXPECTED_PLAIN_BOUND_MS = 12_000;
+  const SAMPLE_MS = 250;
+  const HEALTHY_FOR_MS = 120_000;
+  // /tasks as measured 2026-09-23, then the band that badged before task 5832.
+  for (const serviceMs of [3886, 6000, 8500]) {
+    const server = makeVirtualServer({ [CURATOR_PATH]: serviceMs });
+    const { api, window: win } = loadDataJs({ fetchStub: server.deps.fetchImpl });
+    const opts = { state: api.createPollState(), deps: { ...server.deps, random: () => 0.99 } };
+    const { plainDatum, datumView } = win.DF_DATUM;
+    const tile = now => datumView(plainDatum(1, CURATOR_PATH, win.DF_DATA.__receipt), { now }).age;
+
+    let t = 0;
+    for (; t <= HEALTHY_FOR_MS; t += SAMPLE_MS) {
+      await advanceAndTick(api, server, opts, t);
+      if (!win.DF_DATA.__receipt[CURATOR_PATH]) continue;
+      const age = tile(t);
+      assert.equal(age, null, `${serviceMs}ms endpoint: its healthy tile badged '${age}' at t=${t}`);
+    }
+
+    // A hung request never aborts here (makeVirtualServer arms no deadline), so
+    // the in-flight guard skips every later tick. The request already in flight
+    // keeps its old service time, so let it land before reading the receipt.
+    server.serviceMs[CURATOR_PATH] = Infinity;
+    const inFlightLandedBy = t + serviceMs + EXPECTED_JITTER_MAX_MS + EXPECTED_POLL_INTERVAL_MS;
+    for (; t <= inFlightLandedBy; t += SAMPLE_MS) await advanceAndTick(api, server, opts, t);
+
+    const last = win.DF_DATA.__receipt[CURATOR_PATH];
+    assert.ok(last.pacingHoldMs > 0, `${serviceMs}ms endpoint: its last receipt published no pacing hold (${last.pacingHoldMs})`);
+    const overdueAt = last.receivedAt + EXPECTED_PLAIN_BOUND_MS + last.pacingHoldMs + 1000;
+    for (; t < overdueAt; t += SAMPLE_MS) await advanceAndTick(api, server, opts, t);
+    await server.advanceTo(overdueAt);
+
+    assert.equal(win.DF_DATA.__receipt[CURATOR_PATH].receivedAt, last.receivedAt, `${serviceMs}ms endpoint: delivered after it stopped`);
+    assert.ok(tile(overdueAt), `${serviceMs}ms endpoint: silent ${overdueAt - last.receivedAt}ms and its tile did not badge`);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// A chip change that finds a windowed endpoint in flight (task 5833). The
+// in-flight guard refuses the forced attempt, and the hold the old-window
+// answer then arms must not delay the chosen window past the next tick.
+// ---------------------------------------------------------------------------
+
+async function pollAt(api, server, opts, at) {
+  await server.advanceTo(at);
+  api.pollTick(opts);
+  await drain();
+}
+
+test('chip change in flight: the pacing hold the superseded answer arms does not delay the chosen window past the next tick, and the deferred force is spent once', async () => {
+  const server = makeVirtualServer({ [COSTS_PATH]: 4000 });
+  const { api } = loadDataJs({ fetchStub: server.deps.fetchImpl });
+  const opts = { state: api.createPollState(), deps: server.deps, jitterMaxMs: 0 };
+  const costsUrls = () => server.urls.filter(u => pollKey(u) === COSTS_PATH);
+
+  await pollAt(api, server, opts, 0);
+  await server.advanceTo(1000);
+  const chip = api.refreshDFData('7d', opts);
+  await drain();
+  assert.equal(server.count(COSTS_PATH), 1, 'precondition: the chip found costs in flight');
+
+  await pollAt(api, server, opts, 3000);
+  await server.advanceTo(4000);
+  await chip;
+
+  await pollAt(api, server, opts, 6000);
+  assert.equal(
+    server.count(COSTS_PATH),
+    2,
+    'the tick after the superseded answer landed must ask for the chosen window, not wait out the hold that answer armed',
+  );
+  assert.equal(costsUrls().at(-1), `${COSTS_PATH}?window=7d`);
+
+  await pollAt(api, server, opts, 9000);
+  await pollAt(api, server, opts, 12_000);
+  assert.equal(
+    server.count(COSTS_PATH),
+    2,
+    'the deferred force is spent by the attempt it forced: the timer path honours that answer\'s own pacing again',
+  );
+
+  await pollAt(api, server, opts, 15_000);
+  assert.equal(server.count(COSTS_PATH), 3);
+});
+
+test('chip change in flight: a chip change back to the window in flight defers no force - that answer is current, so its pacing hold stands', async () => {
+  const server = makeVirtualServer({ [COSTS_PATH]: 4000 });
+  const { api } = loadDataJs({ fetchStub: server.deps.fetchImpl });
+  const opts = { state: api.createPollState(), deps: server.deps, jitterMaxMs: 0 };
+  const costsUrls = () => server.urls.filter(u => pollKey(u) === COSTS_PATH);
+
+  await pollAt(api, server, opts, 0);
+  await server.advanceTo(1000);
+  const away = api.refreshDFData('7d', opts);
+  await drain();
+  await server.advanceTo(2000);
+  const back = api.refreshDFData('24h', opts);
+  await drain();
+  assert.equal(server.count(COSTS_PATH), 1, 'precondition: both chips found costs in flight');
+
+  await server.advanceTo(4000);
+  await Promise.all([away, back]);
+
+  await pollAt(api, server, opts, 6000);
+  assert.equal(server.count(COSTS_PATH), 1, 'the answer in flight was for the chosen window, so the pacing hold it armed must stand');
+
+  await pollAt(api, server, opts, 9000);
+  assert.deepEqual(costsUrls(), [`${COSTS_PATH}?window=24h`, `${COSTS_PATH}?window=24h`]);
+});
+
+test('chip change in flight: the failure backoff the superseded answer arms is waived once for the chosen window, without escalating', async () => {
+  const server = makeVirtualServer({ [COSTS_PATH]: 1000 }, { failingPaths: [COSTS_PATH] });
+  const { api, window: win } = loadDataJs({ fetchStub: server.deps.fetchImpl });
+  const opts = { state: api.createPollState(), deps: server.deps, jitterMaxMs: 0 };
+  const costsUrls = () => server.urls.filter(u => pollKey(u) === COSTS_PATH);
+  const costsFailures = () => win.DF_DATA.__stale[COSTS_PATH].failures;
+
+  await quietly(async () => {
+    await pollAt(api, server, opts, 0);
+    const chip = api.refreshDFData('7d', opts);
+    await drain();
+    await server.advanceTo(1000);
+    await chip;
+    assert.equal(costsFailures(), 1, 'the superseded answer still counts as a failure');
+
+    await pollAt(api, server, opts, 3000);
+    assert.deepEqual(costsUrls(), [`${COSTS_PATH}?window=24h`, `${COSTS_PATH}?window=7d`]);
+    await server.advanceTo(4000);
+    assert.equal(costsFailures(), 1, 'a deferred chip attempt that fails must not escalate the timer path\'s backoff');
+
+    await pollAt(api, server, opts, 6000);
+    await server.advanceTo(7000);
+    assert.equal(costsFailures(), 2, 'the deferred force is spent: the next ordinary attempt\'s failure escalates again');
+  });
 });

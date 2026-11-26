@@ -1,28 +1,38 @@
-"""Tests for CLI helpers."""
+"""Tests for the `orchestrator run` command and its shutdown helpers."""
 
 import asyncio
+import contextlib
 import io
 import logging
-import subprocess
 import threading
 import time
 import traceback as traceback_module
-from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from _cancel_immune import ignore_cancels_until
 from _orch_helpers import pydantic_spec
 from click.testing import CliRunner
 
 import orchestrator.cli as cli_module
+import orchestrator.cli_config as cli_config
 from orchestrator.cli import (
     SHUTDOWN_WATCHDOG_TIMEOUT_SECS,
+    TEARDOWN_WATCHDOG_TIMEOUT_SECS,
     _force_exit_after_delay,
     _make_cancel_handler,
     _parse_duration,
     main,
 )
 from orchestrator.config import OrchestratorConfig
+
+
+@pytest.fixture(autouse=True)
+def spawn_temp_sweep(monkeypatch) -> MagicMock:
+    """No test in this module may sweep the real /tmp through the ``run`` command."""
+    sweep = MagicMock(return_value=0)
+    monkeypatch.setattr(cli_module, 'sweep_orphaned_spawn_temp_files', sweep, raising=True)
+    return sweep
 
 
 class TestParseDuration:
@@ -139,17 +149,37 @@ class TestForceExitWatchdog:
 
         The subprocess-level counterpart (`test_shutdown_watchdog_force_exits_on_thread_leak`
         in test_shutdown.py) pins the opposite — fires when a non-daemon thread is leaked.
+
+        Structural fix (same class as test_disarm_prevents_force_exit below):
+        this previously armed with timeout_secs=2.0 and used a fixed
+        ``time.sleep(0.2)`` as a "10x margin" before checking ``calls == []``.
+        No fixed margin is safe under full-suite xdist load — the main thread's
+        wakeup from ``sleep(0.2)`` can itself be delayed by scheduler noise, and
+        if that delay pushes the check past the 2.0s deadline the watchdog has
+        legitimately fired by the time ``calls`` is read (same failure shape as
+        test_disarm_prevents_force_exit's observed ``calls == [137]``). Arming
+        with an effectively-unbounded timeout_secs instead makes the deadline
+        unreachable within the test's lifetime, so ``thread.join(timeout=...)``
+        can be used as the "has not fired yet" probe without racing a wall-clock
+        deadline: no matter how delayed the join itself is in landing,
+        ``is_alive()`` cannot go False before 3600s have elapsed.
         """
         calls: list[int] = []
 
         def stub(code: int) -> None:
             calls.append(code)
 
-        handle = _force_exit_after_delay(timeout_secs=2.0, _exit=stub)
+        handle = _force_exit_after_delay(timeout_secs=3600.0, _exit=stub)
 
-        # Sleep well within the timeout — 0.2s is 10x margin under any scheduler load.
-        time.sleep(0.2)
-
+        # "Has not fired yet" probe: join blocks for up to 0.2s or until the
+        # watchdog thread exits, whichever comes first. Unlike a free-standing
+        # sleep, there is no deadline here for scheduler noise to run past —
+        # timeout_secs is unreachable within the test's lifetime, so is_alive()
+        # cannot go False regardless of how delayed the join is in landing.
+        handle.thread.join(timeout=0.2)
+        assert handle.thread.is_alive(), (
+            'watchdog thread exited before its timeout elapsed — fired early?'
+        )
         assert calls == [], (
             f'watchdog fired before timeout elapsed (clean-exit window): {calls}'
         )
@@ -162,24 +192,57 @@ class TestForceExitWatchdog:
         )
 
     def test_disarm_prevents_force_exit(self):
-        """Calling disarm() before timeout prevents os._exit from being called."""
+        """Calling disarm() before timeout prevents os._exit from being called.
+
+        Structural fix (same class as done tasks 1836/1851/2320/2840/2921/2959/
+        3491): the watchdog thread blocks on ``threading.Event.wait(timeout_secs)``
+        and ``disarm()`` calls ``_event.set()``, which wakes the thread and makes
+        it return WITHOUT ever calling ``_exit_fn`` — regardless of how large
+        timeout_secs is, and regardless of whether the event is set before or
+        after the thread reaches ``.wait()`` (Event is stateful, not an
+        edge-triggered signal, so ordering can't be missed). The correctness
+        condition is only "does disarm() land before timeout_secs elapses" — a
+        small timeout_secs (previously 0.2s) instead raced the main thread's next
+        bytecode (the disarm() call) against the watchdog's internal deadline;
+        under full-suite xdist load that arm→disarm gap can exceed hundreds of ms
+        and the watchdog fires before disarm() lands (observed: `calls == [137]`
+        on a saturated worker). Using an effectively-unbounded timeout_secs makes
+        that gap structurally impossible to exceed rather than merely widening a
+        still-tight window, and removes the need for a compensating sleep.
+
+        Synchronisation note (load-bearing, keep this ordering): ``calls`` is
+        mutated by the watchdog thread and read by the main thread, so it is
+        only meaningfully observable after a happens-before edge between the
+        two. ``thread.join()`` is that edge. The join below is therefore NOT
+        cleanup — it MUST run, and its ``is_alive()`` check MUST be asserted,
+        BEFORE the ``calls == []`` assertion. Checking `calls` first would be
+        vacuous: right after `disarm()` the watchdog thread has had no chance
+        to run at all, so `calls` reads `[]` regardless of whether the
+        production guard (`cli.py`'s `fired = not _event.wait(timeout_secs)`)
+        is correct or inverted, letting a real regression go undetected. The
+        join timeout is deliberately generous (30.0s, not the usual 1.0s used
+        for pure cleanup joins elsewhere in this file): once `disarm()` sets
+        the Event the thread wakes in microseconds on the happy path, so the
+        bound is free there, but on a saturated xdist worker a tight bound
+        could itself manufacture a spurious `is_alive()` failure — exactly the
+        load-sensitive flake class this task removes. Do not reorder or
+        shrink this without re-deriving both properties.
+        """
         calls: list[int] = []
 
         def stub(code: int) -> None:
             calls.append(code)
 
-        # Use 0.2s timeout and a 2.0s wait to give ample margin under CI load;
-        # disarm() sets the event immediately so the watchdog thread returns
-        # without calling os._exit even if the scheduler is delayed.
-        handle = _force_exit_after_delay(timeout_secs=0.2, _exit=stub)
+        handle = _force_exit_after_delay(timeout_secs=3600.0, _exit=stub)
         handle.disarm()
-        time.sleep(2.0)
 
-        assert calls == [], f'expected no calls, got {calls}'
-        handle.thread.join(timeout=1.0)
+        # Synchronisation point FIRST: join before making any claim about
+        # `calls`, which the watchdog thread mutates (see docstring above).
+        handle.thread.join(timeout=30.0)
         assert not handle.thread.is_alive(), (
             'watchdog thread did not exit after disarm'
         )
+        assert calls == [], f'expected no calls, got {calls}'
 
     def test_diagnostic_dump_lists_live_threads(self):
         """When the watchdog fires, it writes a diagnostic dump to the stream."""
@@ -462,6 +525,144 @@ class TestForceExitWatchdog:
         )
 
 
+_HANG_GUARD_SECS = 10.0
+
+
+def _shutdown_watchdog_threads() -> set[threading.Thread]:
+    return {t for t in threading.enumerate() if t.name == 'shutdown-watchdog'}
+
+
+class TestRunWithBoundedTeardown:
+    """asyncio.run()'s own teardown waits, unbounded, on every task left when
+    the main coroutine ends; _run_with_bounded_teardown bounds that wait."""
+
+    @pytest.mark.timing(reason='the teardown watchdog deadline is the behaviour under test')
+    @pytest.mark.parametrize('ending', ['returns', 'raises_cancelled'])
+    def test_a_leftover_task_that_ignores_its_cancel_is_force_exited(self, ending, capsys):
+        box: dict = {}
+        exits: list[int] = []
+        guard_fired = threading.Event()
+
+        async def main():
+            box['loop'] = asyncio.get_running_loop()
+            box['release'] = asyncio.Event()
+            box['leftover'] = asyncio.create_task(
+                ignore_cancels_until(box['release']), name='immune-leftover',
+            )
+            await asyncio.sleep(0)
+            if ending == 'raises_cancelled':
+                raise asyncio.CancelledError()
+            return 'report'
+
+        def release() -> None:
+            with contextlib.suppress(RuntimeError):
+                box['loop'].call_soon_threadsafe(box['release'].set)
+
+        def exit_stub(code: int) -> None:
+            exits.append(code)
+            release()
+
+        def on_guard() -> None:
+            guard_fired.set()
+            release()
+
+        guard = threading.Timer(_HANG_GUARD_SECS, on_guard)
+        guard.start()
+        try:
+            if ending == 'raises_cancelled':
+                with pytest.raises(asyncio.CancelledError):
+                    cli_module._run_with_bounded_teardown(
+                        main, teardown_secs=0.2, _exit=exit_stub,
+                    )
+            else:
+                result = cli_module._run_with_bounded_teardown(
+                    main, teardown_secs=0.2, _exit=exit_stub,
+                )
+                assert result == 'report'
+        finally:
+            guard.cancel()
+
+        assert exits == [137]
+        assert not guard_fired.is_set(), 'the hang guard, not the watchdog, ended the teardown'
+        assert "asyncio.run()'s teardown" in capsys.readouterr().err
+
+    def test_the_watchdog_is_not_armed_while_main_runs(self):
+        before = _shutdown_watchdog_threads()
+        armed_during_main: list[set[threading.Thread]] = []
+
+        async def main():
+            await asyncio.sleep(0)
+            armed_during_main.append(_shutdown_watchdog_threads() - before)
+            return 'report'
+
+        result = cli_module._run_with_bounded_teardown(
+            main, teardown_secs=3600, _exit=lambda _code: None,
+        )
+
+        assert result == 'report'
+        assert armed_during_main == [set()], 'the teardown watchdog was armed before main ended'
+
+    def test_the_tasks_left_for_the_teardown_are_named(self, caplog):
+        caplog.set_level(logging.WARNING, logger='orchestrator.cli')
+        leftovers: list[asyncio.Task] = []
+
+        async def main():
+            leftovers.append(asyncio.create_task(asyncio.sleep(3600), name='late-leftover'))
+            return 'report'
+
+        cli_module._run_with_bounded_teardown(main, teardown_secs=3600, _exit=lambda _code: None)
+
+        assert [r.getMessage() for r in caplog.records if 'late-leftover' in r.getMessage()], (
+            'a task left for the teardown must be named before the teardown waits on it'
+        )
+
+    def test_nothing_is_logged_when_no_task_is_left(self, caplog):
+        caplog.set_level(logging.WARNING, logger='orchestrator.cli')
+
+        async def main():
+            return 'report'
+
+        cli_module._run_with_bounded_teardown(main, teardown_secs=3600, _exit=lambda _code: None)
+
+        assert [r for r in caplog.records if r.name == 'orchestrator.cli'] == []
+
+    @pytest.mark.timing(reason='the teardown watchdog deadline is the behaviour under test')
+    def test_a_clean_teardown_disarms_the_watchdog(self):
+        exits: list[int] = []
+        leftovers: list[asyncio.Task] = []
+
+        async def main():
+            leftovers.append(asyncio.create_task(asyncio.sleep(3600)))
+            return 'report'
+
+        before = _shutdown_watchdog_threads()
+        result = cli_module._run_with_bounded_teardown(
+            main, teardown_secs=_HANG_GUARD_SECS / 2, _exit=exits.append,
+        )
+        for thread in _shutdown_watchdog_threads() - before:
+            thread.join(timeout=_HANG_GUARD_SECS)
+
+        assert result == 'report'
+        assert exits == [], 'the teardown watchdog stayed armed after asyncio.run returned'
+
+
+def _wire_run_with_fake_harness(monkeypatch, fake_report=None, *, force_exit=None, harness_run=None):
+    """Wire mocks so the real _main coroutine runs and calls harness.run once.
+
+    *harness_run* stands in for ``harness.run``, by default an AsyncMock
+    returning *fake_report*. *force_exit* stands in for
+    ``_force_exit_after_delay``, by default a stub that spawns no watchdog thread.
+    """
+    monkeypatch.setattr(cli_module, '_force_exit_after_delay', force_exit or (lambda *a, **k: MagicMock()))
+    fake_config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
+    monkeypatch.setattr(cli_config, 'load_config', lambda _path: fake_config)
+
+    fake_harness = MagicMock()
+    fake_harness.run = AsyncMock(return_value=fake_report) if harness_run is None else harness_run
+    monkeypatch.setattr('orchestrator.harness.Harness', lambda config, **_: fake_harness)
+    return fake_harness
+
+
 class TestRunUntilIdleFlag:
     """The --until-idle flag must thread through to harness.run(until_idle=...).
 
@@ -469,27 +670,11 @@ class TestRunUntilIdleFlag:
     legacy exit-on-drain (until_idle=True).
     """
 
-    def _setup(self, monkeypatch, fake_report):
-        """Wire mocks so the real _main coroutine runs and calls harness.run once."""
-        # Stub the watchdog so no real daemon timer thread is spawned.
-        monkeypatch.setattr(
-            cli_module, '_force_exit_after_delay', lambda *a, **k: MagicMock()
-        )
-        fake_config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
-        monkeypatch.setattr(cli_module, 'load_config', lambda _path: fake_config)
-
-        fake_harness = MagicMock()
-        # AsyncMock so `await harness.run(...)` inside the real _main resolves.
-        from unittest.mock import AsyncMock
-        fake_harness.run = AsyncMock(return_value=fake_report)
-        monkeypatch.setattr('orchestrator.harness.Harness', lambda config: fake_harness)
-        return fake_harness
-
     def test_flag_threads_until_idle_true(self, monkeypatch):
         fake_report = MagicMock()
         fake_report.blocked = 0
         fake_report.summary.return_value = 'ok'
-        fake_harness = self._setup(monkeypatch, fake_report)
+        fake_harness = _wire_run_with_fake_harness(monkeypatch, fake_report)
 
         result = CliRunner().invoke(
             main, ['run', '--config', '/dev/null', '--until-idle']
@@ -505,7 +690,7 @@ class TestRunUntilIdleFlag:
         fake_report = MagicMock()
         fake_report.blocked = 0
         fake_report.summary.return_value = 'ok'
-        fake_harness = self._setup(monkeypatch, fake_report)
+        fake_harness = _wire_run_with_fake_harness(monkeypatch, fake_report)
 
         result = CliRunner().invoke(main, ['run', '--config', '/dev/null'])
 
@@ -514,6 +699,69 @@ class TestRunUntilIdleFlag:
             f'default run must pass until_idle=False (run forever); '
             f'kwargs={fake_harness.run.call_args.kwargs!r}'
         )
+
+
+class TestRunAppliesProjectSliceWeight:
+    """`orchestrator run`, every unit's ExecStart, is the one caller that opts
+    into startup step 1c1i (docs/cgroup-slice-topology.md §Slice weight)."""
+
+    def test_run_requests_the_project_slice_weight(self, monkeypatch):
+        fake_report = MagicMock()
+        fake_report.blocked = 0
+        fake_report.summary.return_value = 'ok'
+        fake_harness = _wire_run_with_fake_harness(monkeypatch, fake_report)
+
+        result = CliRunner().invoke(main, ['run', '--config', '/dev/null'])
+
+        assert result.exit_code == 0, result.output
+        assert fake_harness.run.call_args.kwargs.get('apply_project_slice_weight') is True, (
+            f'run must pass apply_project_slice_weight=True; '
+            f'kwargs={fake_harness.run.call_args.kwargs!r}'
+        )
+
+
+class TestRunSweepsOrphanedSpawnTempFiles:
+    """run() sweeps orphaned agent-spawn temp files once, before building the Harness,
+    and a failing sweep never blocks startup."""
+
+    @staticmethod
+    def _report() -> MagicMock:
+        report = MagicMock()
+        report.blocked = 0
+        report.summary.return_value = 'ok'
+        return report
+
+    def test_sweeps_once_before_the_harness_is_built(self, monkeypatch, spawn_temp_sweep):
+        fake_harness = _wire_run_with_fake_harness(monkeypatch, self._report())
+        events: list[str] = []
+        spawn_temp_sweep.side_effect = lambda *a, **k: events.append('sweep') or 0
+
+        def _recording_harness(config, **_):
+            events.append('harness')
+            return fake_harness
+
+        monkeypatch.setattr('orchestrator.harness.Harness', _recording_harness)
+
+        result = CliRunner().invoke(main, ['run', '--config', '/dev/null'])
+
+        assert result.exit_code == 0, result.output
+        assert events.index('sweep') < events.index('harness'), events
+        spawn_temp_sweep.assert_called_once()
+
+    def test_a_failing_sweep_does_not_block_startup(self, monkeypatch, spawn_temp_sweep, caplog):
+        fake_harness = _wire_run_with_fake_harness(monkeypatch, self._report())
+        spawn_temp_sweep.side_effect = RuntimeError('boom')
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.cli'):
+            result = CliRunner().invoke(main, ['run', '--config', '/dev/null'])
+
+        assert result.exit_code == 0, result.output
+        fake_harness.run.assert_awaited()
+        warnings = [
+            r.getMessage() for r in caplog.records
+            if r.name == 'orchestrator.cli' and r.levelno == logging.WARNING
+        ]
+        assert any('spawn temp files' in m for m in warnings), warnings
 
 
 class TestRunArmsWatchdog:
@@ -576,7 +824,7 @@ class TestRunArmsWatchdog:
 
         # Fake config so load_config doesn't need a real file
         fake_config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
-        monkeypatch.setattr(cli_module, 'load_config', lambda _path: fake_config)
+        monkeypatch.setattr(cli_config, 'load_config', lambda _path: fake_config)
 
         # Fake Harness so we don't need a real one
         fake_harness = MagicMock()
@@ -585,7 +833,7 @@ class TestRunArmsWatchdog:
         fake_report.summary.return_value = 'all done'
         fake_harness.run = MagicMock()
 
-        monkeypatch.setattr('orchestrator.harness.Harness', lambda config: fake_harness)
+        monkeypatch.setattr('orchestrator.harness.Harness', lambda config, **_: fake_harness)
 
         # asyncio.run returns fake_report (bypasses _main entirely).
         # Close the coroutine to avoid "coroutine was never awaited" warnings.
@@ -620,10 +868,10 @@ class TestRunArmsWatchdog:
         monkeypatch.setattr(cli_module, '_force_exit_after_delay', fake_force_exit)
 
         fake_config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
-        monkeypatch.setattr(cli_module, 'load_config', lambda _path: fake_config)
+        monkeypatch.setattr(cli_config, 'load_config', lambda _path: fake_config)
 
         fake_harness = MagicMock()
-        monkeypatch.setattr('orchestrator.harness.Harness', lambda config: fake_harness)
+        monkeypatch.setattr('orchestrator.harness.Harness', lambda config, **_: fake_harness)
 
         # asyncio.run raises CancelledError to simulate SIGTERM path.
         # Close the coroutine to avoid "coroutine was never awaited" warnings.
@@ -664,13 +912,13 @@ class TestRunArmsWatchdog:
         monkeypatch.setattr(cli_module, '_force_exit_after_delay', fake_force_exit)
 
         fake_config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
-        monkeypatch.setattr(cli_module, 'load_config', lambda _path: fake_config)
+        monkeypatch.setattr(cli_config, 'load_config', lambda _path: fake_config)
 
         fake_harness = MagicMock()
         fake_report = MagicMock()
         fake_report.blocked = 0
         fake_report.summary.return_value = 'all done'
-        monkeypatch.setattr('orchestrator.harness.Harness', lambda config: fake_harness)
+        monkeypatch.setattr('orchestrator.harness.Harness', lambda config, **_: fake_harness)
 
         # Capture what 'armed_with' is while asyncio.run is "executing".
         armed_during_asyncio_run: list = []
@@ -724,13 +972,13 @@ class TestRunArmsWatchdog:
         monkeypatch.setattr(cli_module.click, 'echo', recording_echo)
 
         fake_config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
-        monkeypatch.setattr(cli_module, 'load_config', lambda _path: fake_config)
+        monkeypatch.setattr(cli_config, 'load_config', lambda _path: fake_config)
 
         fake_harness = MagicMock()
         fake_report = MagicMock()
         fake_report.blocked = 0
         fake_report.summary.return_value = 'all done'
-        monkeypatch.setattr('orchestrator.harness.Harness', lambda config: fake_harness)
+        monkeypatch.setattr('orchestrator.harness.Harness', lambda config, **_: fake_harness)
 
         def fake_asyncio_run(coro):
             coro.close()
@@ -779,13 +1027,13 @@ class TestRunArmsWatchdog:
         monkeypatch.setattr(cli_module, '_force_exit_after_delay', fake_force_exit)
 
         fake_config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
-        monkeypatch.setattr(cli_module, 'load_config', lambda _path: fake_config)
+        monkeypatch.setattr(cli_config, 'load_config', lambda _path: fake_config)
 
         fake_harness = MagicMock()
         fake_report = MagicMock()
         fake_report.blocked = 3  # non-zero forces the sys.exit(1) branch
         fake_report.summary.return_value = 'blocked'
-        monkeypatch.setattr('orchestrator.harness.Harness', lambda config: fake_harness)
+        monkeypatch.setattr('orchestrator.harness.Harness', lambda config, **_: fake_harness)
 
         def fake_asyncio_run(coro):
             coro.close()
@@ -811,1661 +1059,112 @@ class TestRunArmsWatchdog:
         )
 
 
-# ---------------------------------------------------------------------------
-# Step-7: `orchestrator verify-merge` integration tests (parity + cleanup + errors)
-# ---------------------------------------------------------------------------
-
-
-def _setup_verify_repo(tmp_path: Path):
-    """Init a minimal git repo with a mod/test_x.py file, return (repo, head_sha)."""
-    repo = tmp_path / 'repo'
-    repo.mkdir()
-    p = str(repo)
-    subprocess.run(['git', 'init', '-b', 'main', p], check=True, capture_output=True)
-    subprocess.run(['git', '-C', p, 'config', 'user.name', 'Test User'],
-                   check=True, capture_output=True)
-    subprocess.run(['git', '-C', p, 'config', 'user.email', 'test@example.com'],
-                   check=True, capture_output=True)
-    mod_dir = repo / 'mod'
-    mod_dir.mkdir()
-    (mod_dir / 'test_x.py').write_text('# placeholder\n')
-    subprocess.run(['git', '-C', p, 'add', '.'], check=True, capture_output=True)
-    subprocess.run(['git', '-C', p, 'commit', '-m', 'initial commit'],
-                   check=True, capture_output=True)
-    result = subprocess.run(['git', '-C', p, 'rev-parse', 'HEAD'],
-                            check=True, capture_output=True, text=True)
-    head_sha = result.stdout.strip()
-    return repo, head_sha
-
-
-@pytest.mark.parametrize('test_command,expect_pass', [('true', True), ('false', False)])
-def test_verify_merge_cli_wrapper_transparency(tmp_path, monkeypatch, test_command, expect_pass):
-    """CLI verify-merge is a transparent wrapper: JSON round-trip is lossless and exit code is clean.
-
-    Both the local baseline and the CLI call run_merge_verify_on_worktree on the same
-    SHA with the same spec, so the test validates that the CLI scaffolding (config load,
-    spec parse, worktree create/cleanup, JSON serialise) adds no observable difference.
-    It does *not* validate parity against the merge-queue dispatch path directly.
-
-    SYNC test (asyncio_mode=auto): the local result is computed via asyncio.run()
-    before invoking CliRunner so we never nest event loops.
-    """
-    from orchestrator.git_ops import GitOps
-    from orchestrator.verify_runner import (
-        MergeVerifySpec,
-        UnscopedTypecheckSpec,
-        VerifyCommand,
-        result_from_json,
-        run_merge_verify_on_worktree,
-        spec_to_json,
-    )
-
-    repo, head_sha = _setup_verify_repo(tmp_path)
-    config = OrchestratorConfig(project_root=repo)
-    monkeypatch.setattr(cli_module, 'load_config', lambda _: config)
-
-    # A dummy config file just to satisfy click.Path(exists=True)
-    cfg_file = tmp_path / 'dummy.yaml'
-    cfg_file.write_text('')
-
-    spec = MergeVerifySpec(
-        verify_commands=(VerifyCommand('mod', test_command=test_command),),
-        unscoped_typecheck=UnscopedTypecheckSpec(
-            commands=(VerifyCommand('mod', type_check_command='true'),),
-            block_on_timeout=True,
-        ),
-        task_files=('mod/test_x.py',),
-        verify_env={},
-        cold_timeout_secs=300.0,
-    )
-
-    # Compute local result in-process (SYNC: use asyncio.run to avoid nested loop)
-    async def _local_run():
-        git_ops = GitOps(config.git, repo)
-        wt, _ = await git_ops._create_merge_worktree(base_sha=head_sha)
-        try:
-            return await run_merge_verify_on_worktree(wt, config, spec)
-        finally:
-            await git_ops.cleanup_merge_worktree(wt)
-
-    local = asyncio.run(_local_run())
-
-    # Invoke CLI
-    r = CliRunner().invoke(main, [
-        'verify-merge',
-        '--sha', head_sha,
-        '--spec', spec_to_json(spec),
-        '--config', str(cfg_file),
-    ])
-
-    assert r.exit_code == 0, (
-        f'expected exit_code 0, got {r.exit_code}; output={r.output!r}'
-    )
-    cli_result = result_from_json(r.output)
-    assert cli_result == local, (
-        f'CLI result != local result: cli={cli_result!r}, local={local!r}'
-    )
-    assert local.passed is expect_pass
-
-
-def test_verify_merge_cleanup(tmp_path, monkeypatch):
-    """verify-merge must not leak _merge-* worktrees after the run completes."""
-    from orchestrator.verify_runner import (
-        MergeVerifySpec,
-        UnscopedTypecheckSpec,
-        VerifyCommand,
-        spec_to_json,
-    )
-
-    repo, head_sha = _setup_verify_repo(tmp_path)
-    config = OrchestratorConfig(project_root=repo)
-    monkeypatch.setattr(cli_module, 'load_config', lambda _: config)
-
-    cfg_file = tmp_path / 'dummy.yaml'
-    cfg_file.write_text('')
-
-    spec = MergeVerifySpec(
-        verify_commands=(VerifyCommand('mod', test_command='true'),),
-        unscoped_typecheck=UnscopedTypecheckSpec(
-            commands=(VerifyCommand('mod', type_check_command='true'),),
-            block_on_timeout=True,
-        ),
-        task_files=('mod/test_x.py',),
-        verify_env={},
-        cold_timeout_secs=300.0,
-    )
-
-    r = CliRunner().invoke(main, [
-        'verify-merge',
-        '--sha', head_sha,
-        '--spec', spec_to_json(spec),
-        '--config', str(cfg_file),
-    ])
-    assert r.exit_code == 0, f'expected exit_code 0, got {r.exit_code}; output={r.output!r}'
-
-    # No _merge-* directories should remain under .worktrees
-    worktrees_dir = repo / '.worktrees'
-    leaked = (
-        any(p.name.startswith('_merge-') for p in worktrees_dir.iterdir())
-        if worktrees_dir.exists()
-        else False
-    )
-    assert not leaked, f'leaked worktree under {worktrees_dir}'
-
-    # git worktree list must not show any _merge-* entry
-    wt_list = subprocess.run(
-        ['git', '-C', str(repo), 'worktree', 'list', '--porcelain'],
-        check=True, capture_output=True, text=True,
-    ).stdout
-    assert '_merge-' not in wt_list, f'git worktree list shows leaked entry:\n{wt_list}'
-
-
-@pytest.mark.parametrize('bad_case', ['malformed_spec', 'absent_sha'])
-def test_verify_merge_clean_error_contract(tmp_path, monkeypatch, bad_case):
-    """Bad requests never emit a non-verdict to stdout and always exit non-zero.
-
-    Case A (malformed --spec): JSON parse error → graceful non-zero, empty stdout.
-    Case B (absent SHA): non-existent commit → graceful non-zero, empty stdout.
-    Both cases must have a concise message on stderr and no uncaught traceback.
-    """
-    from orchestrator.verify_runner import (
-        MergeVerifySpec,
-        UnscopedTypecheckSpec,
-        VerifyCommand,
-        result_from_json,
-        spec_to_json,
-    )
-
-    repo, head_sha = _setup_verify_repo(tmp_path)
-    config = OrchestratorConfig(project_root=repo)
-    monkeypatch.setattr(cli_module, 'load_config', lambda _: config)
-
-    cfg_file = tmp_path / 'dummy.yaml'
-    cfg_file.write_text('')
-
-    good_spec = MergeVerifySpec(
-        verify_commands=(VerifyCommand('mod', test_command='true'),),
-        unscoped_typecheck=UnscopedTypecheckSpec(
-            commands=(VerifyCommand('mod', type_check_command='true'),),
-            block_on_timeout=True,
-        ),
-        task_files=('mod/test_x.py',),
-        verify_env={},
-        cold_timeout_secs=300.0,
-    )
-
-    if bad_case == 'malformed_spec':
-        invoke_args = [
-            'verify-merge',
-            '--sha', head_sha,
-            '--spec', 'not valid json',
-            '--config', str(cfg_file),
-        ]
-    else:  # absent_sha
-        invoke_args = [
-            'verify-merge',
-            '--sha', '0' * 40,
-            '--spec', spec_to_json(good_spec),
-            '--config', str(cfg_file),
-        ]
-
-    r = CliRunner().invoke(main, invoke_args)
-
-    # Must exit non-zero
-    assert r.exit_code != 0, (
-        f'expected non-zero exit_code for {bad_case}, got {r.exit_code}'
-    )
-    # stdout must not contain a parseable VerifyResult
-    # (click 8.3.2: r.output mixes stdout+stderr; use result_from_json to prove
-    # no valid verdict was emitted)
-    with pytest.raises((ValueError, TypeError)):
-        result_from_json(r.output)
-    # No uncaught traceback — exception must be SystemExit (or None)
-    assert r.exception is None or isinstance(r.exception, SystemExit), (
-        f'expected SystemExit or None, got {type(r.exception).__name__}: {r.exception}'
-    )
-    # A concise error message on stderr
-    assert r.stderr.strip() != '', (
-        f'expected non-empty stderr for {bad_case!r}'
-    )
-
-
-# ---------------------------------------------------------------------------
-# Task 1699 step-7 — verify-merge subcommand wiring: acquire_host_verify_worktree
-# ---------------------------------------------------------------------------
-
-
-def test_verify_merge_uses_acquire_host_verify_worktree(tmp_path, monkeypatch):
-    """verify-merge must call acquire_host_verify_worktree, NOT _create_merge_worktree.
-
-    Step-7 (RED): the subcommand currently calls _create_merge_worktree;
-    _create_merge_worktree.assert_not_called() fails until step-8 swaps it.
-    """
-    from unittest.mock import AsyncMock, MagicMock
-
-    sha = 'abc1234567890abc1234567890abc1234567890ab'
-    fake_wt = tmp_path / '_merge-verify'
-    fake_wt.mkdir()
-
-    # --- Build mock GitOps instance ---
-    fake_worktree_base = tmp_path / '.worktrees'
-    fake_worktree_base.mkdir()
-    mock_git_ops = MagicMock()
-    mock_git_ops.worktree_base = fake_worktree_base
-    # Knob is ON below, so the CLI span references the shared lane lock
-    # (lane_lock_path(persistent_merge_worktree_path)) in both the pre-flight
-    # contention gate and _run()'s build-scoped hold (task 2830). Point it at a
-    # real path so acquire_merge_verify_flock can open the lock file (mirrors the
-    # sibling knob-ON pins test_verify_merge_holds_lane_lock_during_warm_run /
-    # test_verify_merge_lane_actor_contention_emits_distinguished_result).
-    mock_git_ops.persistent_merge_worktree_path = fake_worktree_base / '_merge-verify'
-    mock_git_ops.acquire_host_verify_worktree = AsyncMock(return_value=fake_wt)
-    mock_git_ops.cleanup_merge_worktree = AsyncMock(return_value=None)
-    # _create_merge_worktree is a spy: return a valid 2-tuple so the old code
-    # path doesn't crash today, but we assert it's NOT called after step-8.
-    mock_git_ops._create_merge_worktree = AsyncMock(return_value=(fake_wt, sha))
-
-    # Patch GitOps class so instantiation returns our mock
-    monkeypatch.setattr('orchestrator.git_ops.GitOps', MagicMock(return_value=mock_git_ops))
-
-    # --- Config with persistent_merge_worktree=True ---
-    from orchestrator.config import GitConfig, OrchestratorConfig
-    git_cfg = GitConfig(persistent_merge_worktree=True)
-    fake_config = OrchestratorConfig(project_root=tmp_path, git=git_cfg)
-    monkeypatch.setattr(cli_module, 'load_config', lambda _: fake_config)
-
-    # --- Patch verify_runner helpers ---
-    known_json = '{"passed": true, "results": []}'
-    monkeypatch.setattr(
-        'orchestrator.verify_runner.spec_from_json',
-        lambda s: MagicMock(),
-    )
-    monkeypatch.setattr(
-        'orchestrator.verify_runner.run_merge_verify_on_worktree',
-        AsyncMock(return_value=MagicMock()),
-    )
-    monkeypatch.setattr(
-        'orchestrator.verify_runner.result_to_json',
-        lambda r: known_json,
-    )
-
-    # --- Dummy config file to satisfy click.Path(exists=True) ---
-    cfg_file = tmp_path / 'config.yaml'
-    cfg_file.write_text('')
-
-    r = CliRunner().invoke(main, [
-        'verify-merge',
-        '--sha', sha,
-        '--spec', '{}',
-        '--config', str(cfg_file),
-    ])
-
-    assert r.exit_code == 0, (
-        f'expected exit_code 0, got {r.exit_code}; output={r.output!r}'
-    )
-    assert known_json in r.output, (
-        f'stdout must contain the known JSON; got: {r.output!r}'
-    )
-
-    # Core assertion: acquire_host_verify_worktree called; _create_merge_worktree NOT
-    mock_git_ops.acquire_host_verify_worktree.assert_awaited_once_with(sha)
-    mock_git_ops._create_merge_worktree.assert_not_called()
-
-
-# ---------------------------------------------------------------------------
-# Task 1732 step-9 — verify-merge --request-id pgid lifecycle + back-compat
-# ---------------------------------------------------------------------------
-
-
-def test_verify_merge_request_id_pgid_lifecycle(tmp_path, monkeypatch):
-    """verify-merge --request-id writes pgid file during run, removes it on exit.
-
-    Injects start_own_process_group as a spy; mocks all IO so no real git/build
-    work happens. Checks file existence mid-run via the mocked
-    run_merge_verify_on_worktree coroutine.
-    """
-    from unittest.mock import AsyncMock, MagicMock
-
-    from orchestrator.verify_cancel import pgid_file
-
-    FAKE_PGID = 77777
-    FAKE_REQUEST_ID = 'test-req-1732'
-    known_json = '{"passed": true, "results": []}'
-
-    # worktree_base that GitOps would compute
-    fake_worktree_base = tmp_path / '.worktrees'
-
-    # --- Mock GitOps ---
-    fake_wt = tmp_path / '_merge-verify'
-    fake_wt.mkdir()
-    mock_git_ops = MagicMock()
-    mock_git_ops.worktree_base = fake_worktree_base
-    mock_git_ops.acquire_host_verify_worktree = AsyncMock(return_value=fake_wt)
-    mock_git_ops.cleanup_merge_worktree = AsyncMock(return_value=None)
-    monkeypatch.setattr('orchestrator.git_ops.GitOps', MagicMock(return_value=mock_git_ops))
-
-    # --- Mock config ---
-    from orchestrator.config import OrchestratorConfig
-    fake_config = OrchestratorConfig(project_root=tmp_path)
-    monkeypatch.setattr(cli_module, 'load_config', lambda _: fake_config)
-
-    # --- Spy on start_own_process_group ---
-    sopg_calls = []
-
-    def fake_sopg():
-        sopg_calls.append(True)
-        return FAKE_PGID
-
-    monkeypatch.setattr(cli_module, 'start_own_process_group', fake_sopg)
-
-    # --- Prevent the real stdin watchdog thread (task 2308 gamma) from
-    # arming: unmocked, it reads this test process's own real fd 0 (not a
-    # simulated ssh channel), which the pgid-lifecycle assertions below don't
-    # exercise -- same isolation used by the watchdog-spawn tests further
-    # down this file.
-    monkeypatch.setattr(cli_module, 'start_stdin_watchdog', lambda pgid, *a, **kw: MagicMock())
-
-    # --- Mock verify_runner helpers; capture pgid file existence mid-run ---
-    pgf = pgid_file(fake_worktree_base, FAKE_REQUEST_ID)
-    file_existed_mid_run = []
-
-    async def fake_run_merge_verify(wt, cfg, spec, merge_sha=None):
-        file_existed_mid_run.append(pgf.exists())
-        result = MagicMock()
-        return result
-
-    monkeypatch.setattr('orchestrator.verify_runner.spec_from_json', lambda s: MagicMock())
-    monkeypatch.setattr('orchestrator.verify_runner.run_merge_verify_on_worktree', fake_run_merge_verify)
-    monkeypatch.setattr('orchestrator.verify_runner.result_to_json', lambda r: known_json)
-
-    cfg_file = tmp_path / 'config.yaml'
-    cfg_file.write_text('')
-
-    sha = 'abc1234567890abc1234567890abc1234567890ab'
-    r = CliRunner().invoke(main, [
-        'verify-merge',
-        '--sha', sha,
-        '--spec', '{}',
-        '--config', str(cfg_file),
-        '--request-id', FAKE_REQUEST_ID,
-    ])
-
-    assert r.exit_code == 0, f'expected exit_code 0, got {r.exit_code}; output={r.output!r}'
-    assert known_json in r.output
-
-    # start_own_process_group must have been called once
-    assert len(sopg_calls) == 1, 'start_own_process_group must be called once with --request-id'
-
-    # pgid file must have existed during the run
-    assert file_existed_mid_run == [True], (
-        f'pgid file was not present mid-run; file_existed_mid_run={file_existed_mid_run!r}'
-    )
-
-    # pgid file must be removed after normal exit
-    assert not pgf.exists(), f'pgid file must be removed on normal exit; still present at {pgf}'
-
-
-def test_verify_merge_no_request_id_back_compat(tmp_path, monkeypatch):
-    """Without --request-id, start_own_process_group is NOT called and no pgid file created.
-
-    Verifies today's exact behavior is unchanged (back-compat).
-    """
-    from unittest.mock import AsyncMock, MagicMock
-
-    # --- Mock GitOps ---
-    fake_wt = tmp_path / '_merge-verify'
-    fake_wt.mkdir()
-    mock_git_ops = MagicMock()
-    mock_git_ops.acquire_host_verify_worktree = AsyncMock(return_value=fake_wt)
-    mock_git_ops.cleanup_merge_worktree = AsyncMock(return_value=None)
-    monkeypatch.setattr('orchestrator.git_ops.GitOps', MagicMock(return_value=mock_git_ops))
-
-    # --- Mock config ---
-    from orchestrator.config import OrchestratorConfig
-    fake_config = OrchestratorConfig(project_root=tmp_path)
-    monkeypatch.setattr(cli_module, 'load_config', lambda _: fake_config)
-
-    # --- Spy on start_own_process_group to ensure it is NOT called ---
-    sopg_calls = []
-
-    def fake_sopg():
-        sopg_calls.append(True)
-        return 99999
-
-    monkeypatch.setattr(cli_module, 'start_own_process_group', fake_sopg)
-
-    # --- Mock verify_runner helpers ---
-    known_json = '{"passed": false, "results": []}'
-    monkeypatch.setattr('orchestrator.verify_runner.spec_from_json', lambda s: MagicMock())
-    monkeypatch.setattr(
-        'orchestrator.verify_runner.run_merge_verify_on_worktree',
-        AsyncMock(return_value=MagicMock()),
-    )
-    monkeypatch.setattr('orchestrator.verify_runner.result_to_json', lambda r: known_json)
-
-    cfg_file = tmp_path / 'config.yaml'
-    cfg_file.write_text('')
-
-    sha = 'abc1234567890abc1234567890abc1234567890ab'
-    r = CliRunner().invoke(main, [
-        'verify-merge',
-        '--sha', sha,
-        '--spec', '{}',
-        '--config', str(cfg_file),
-    ])
-
-    assert r.exit_code == 0, f'expected exit_code 0, got {r.exit_code}; output={r.output!r}'
-
-    # start_own_process_group must NOT have been called (no --request-id)
-    assert sopg_calls == [], (
-        'start_own_process_group must NOT be called without --request-id'
-    )
-
-    # No .merge_verify_pgids directory should have been created
-    from orchestrator.verify_cancel import PGID_DIR_NAME
-    pgid_dir_path = tmp_path / '.worktrees' / PGID_DIR_NAME
-    assert not pgid_dir_path.exists(), (
-        f'.merge_verify_pgids directory created without --request-id: {pgid_dir_path}'
-    )
-
-
-# ---------------------------------------------------------------------------
-# Task 2306 step-9 — verify-merge flock guard: knob-on warm path + knob-off
-# back-compat regression guard.
-# ---------------------------------------------------------------------------
-
-
-def test_verify_merge_flock_held_during_warm_run_and_released_after(tmp_path, monkeypatch):
-    """Knob ON: the merge-verify flock is held for the whole warm verify span.
-
-    Inside the mocked run_merge_verify_on_worktree coroutine, a fresh
-    os.open + fcntl.flock(LOCK_EX|LOCK_NB) on merge_verify_lock_path(worktree_base)
-    must raise BlockingIOError (the CLI holds the lock), and
-    read_lock_holder_pgid(worktree_base) must return a positive int. After the
-    CLI returns, the holder-pgid file must be gone and the lock must be
-    re-acquirable (released).
-    """
-    import fcntl
-    import os as os_module
-    from unittest.mock import AsyncMock, MagicMock
-
-    from orchestrator.verify_cancel import (
-        acquire_merge_verify_flock,
-        merge_verify_lock_path,
-        read_lock_holder_pgid,
-        release_merge_verify_flock,
-    )
-
-    known_json = '{"passed": true, "results": []}'
-    fake_worktree_base = tmp_path / '.worktrees'
-    fake_worktree_base.mkdir()
-
-    # --- Mock GitOps ---
-    fake_wt = tmp_path / '_merge-verify'
-    fake_wt.mkdir()
-    mock_git_ops = MagicMock()
-    mock_git_ops.worktree_base = fake_worktree_base
-    # task 2830: a REAL persistent_merge_worktree_path so the CLI's lane_lock_path()
-    # computes a real file (else it TypeErrors on the MagicMock). The compat old lock
-    # is still held mid-run, so this test's old-lock probe assertions stay valid.
-    mock_git_ops.persistent_merge_worktree_path = fake_worktree_base / '_merge-verify'
-    mock_git_ops.acquire_host_verify_worktree = AsyncMock(return_value=fake_wt)
-    mock_git_ops.cleanup_merge_worktree = AsyncMock(return_value=None)
-    monkeypatch.setattr('orchestrator.git_ops.GitOps', MagicMock(return_value=mock_git_ops))
-
-    # --- Mock config: knob ON ---
-    from orchestrator.config import GitConfig, OrchestratorConfig
-    git_cfg = GitConfig(persistent_merge_worktree=True)
-    fake_config = OrchestratorConfig(project_root=tmp_path, git=git_cfg)
-    monkeypatch.setattr(cli_module, 'load_config', lambda _: fake_config)
-
-    # --- Mock verify_runner helpers; assert flock/holder state mid-run ---
-    mid_run = {}
-
-    async def fake_run_merge_verify(wt, cfg, spec, merge_sha=None):
-        lock_path = merge_verify_lock_path(fake_worktree_base)
-        probe_fd = os_module.open(lock_path, os_module.O_RDWR | os_module.O_CREAT)
-        try:
-            fcntl.flock(probe_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            mid_run['lock_held'] = False
-            fcntl.flock(probe_fd, fcntl.LOCK_UN)
-        except BlockingIOError:
-            mid_run['lock_held'] = True
-        finally:
-            os_module.close(probe_fd)
-        mid_run['holder_pgid'] = read_lock_holder_pgid(fake_worktree_base)
-        return MagicMock()
-
-    monkeypatch.setattr('orchestrator.verify_runner.spec_from_json', lambda s: MagicMock())
-    monkeypatch.setattr('orchestrator.verify_runner.run_merge_verify_on_worktree', fake_run_merge_verify)
-    monkeypatch.setattr('orchestrator.verify_runner.result_to_json', lambda r: known_json)
-
-    cfg_file = tmp_path / 'config.yaml'
-    cfg_file.write_text('')
-
-    sha = 'abc1234567890abc1234567890abc1234567890ab'
-    r = CliRunner().invoke(main, [
-        'verify-merge',
-        '--sha', sha,
-        '--spec', '{}',
-        '--config', str(cfg_file),
-    ])
-
-    assert r.exit_code == 0, f'expected exit_code 0, got {r.exit_code}; output={r.output!r}'
-    assert known_json in r.output
-
-    assert mid_run.get('lock_held') is True, (
-        f'merge-verify flock was not held during the warm run: {mid_run!r}'
-    )
-    assert isinstance(mid_run.get('holder_pgid'), int), (
-        f'holder pgid was not recorded mid-run: {mid_run!r}'
-    )
-    assert mid_run['holder_pgid'] > 0
-
-    mock_git_ops.acquire_host_verify_worktree.assert_awaited_once_with(sha)
-
-    # After the CLI returns: holder-pgid file gone, lock re-acquirable.
-    assert read_lock_holder_pgid(fake_worktree_base) is None, (
-        'holder-pgid file must be removed after the CLI returns'
-    )
-    fd = acquire_merge_verify_flock(merge_verify_lock_path(fake_worktree_base), timeout_secs=1.0)
-    assert fd is not None, 'lock must be re-acquirable after the CLI releases it'
-    release_merge_verify_flock(fd)
-
-
-def test_verify_merge_knob_off_no_flock_back_compat(tmp_path, monkeypatch):
-    """Knob OFF: no lock is taken and no holder-pgid file is created (back-compat)."""
-    from unittest.mock import AsyncMock, MagicMock
-
-    from orchestrator.verify_cancel import (
-        lane_lock_path,
-        merge_verify_lock_path,
-        read_lock_holder_pgid,
-    )
-
-    known_json = '{"passed": true, "results": []}'
-    fake_worktree_base = tmp_path / '.worktrees'
-    fake_worktree_base.mkdir()
-
-    # --- Mock GitOps ---
-    fake_wt = tmp_path / '_merge-verify'
-    fake_wt.mkdir()
-    mock_git_ops = MagicMock()
-    mock_git_ops.worktree_base = fake_worktree_base
-    mock_git_ops.persistent_merge_worktree_path = fake_worktree_base / '_merge-verify'
-    mock_git_ops.acquire_host_verify_worktree = AsyncMock(return_value=fake_wt)
-    mock_git_ops.cleanup_merge_worktree = AsyncMock(return_value=None)
-    monkeypatch.setattr('orchestrator.git_ops.GitOps', MagicMock(return_value=mock_git_ops))
-
-    # --- Mock config: knob OFF ---
-    from orchestrator.config import GitConfig, OrchestratorConfig
-    git_cfg = GitConfig(persistent_merge_worktree=False)
-    fake_config = OrchestratorConfig(project_root=tmp_path, git=git_cfg)
-    monkeypatch.setattr(cli_module, 'load_config', lambda _: fake_config)
-
-    monkeypatch.setattr('orchestrator.verify_runner.spec_from_json', lambda s: MagicMock())
-    monkeypatch.setattr(
-        'orchestrator.verify_runner.run_merge_verify_on_worktree',
-        AsyncMock(return_value=MagicMock()),
-    )
-    monkeypatch.setattr('orchestrator.verify_runner.result_to_json', lambda r: known_json)
-
-    cfg_file = tmp_path / 'config.yaml'
-    cfg_file.write_text('')
-
-    sha = 'abc1234567890abc1234567890abc1234567890ab'
-    r = CliRunner().invoke(main, [
-        'verify-merge',
-        '--sha', sha,
-        '--spec', '{}',
-        '--config', str(cfg_file),
-    ])
-
-    assert r.exit_code == 0, f'expected exit_code 0, got {r.exit_code}; output={r.output!r}'
-    assert known_json in r.output
-
-    mock_git_ops.acquire_host_verify_worktree.assert_awaited_once_with(sha)
-    assert read_lock_holder_pgid(fake_worktree_base) is None, (
-        'no holder-pgid file should be created when the knob is off'
-    )
-    assert not merge_verify_lock_path(fake_worktree_base).exists(), (
-        'no .merge_verify.lock file should be created when the knob is off'
-    )
-    assert not lane_lock_path(mock_git_ops.persistent_merge_worktree_path).exists(), (
-        'no shared <lane_dir>.lock (_merge-verify.lock) should be created when '
-        'the knob is off (task 2830)'
-    )
-
-
-# ---------------------------------------------------------------------------
-# Task 2306 step-11 — verify-merge flock guard: bounded-wait contention
-# outcome (distinguished VerifyResult, no ephemeral fallback).
-# ---------------------------------------------------------------------------
-
-
-def test_verify_merge_flock_contention_emits_distinguished_result(tmp_path, monkeypatch):
-    """Knob ON + lock already held: bounded wait times out -> distinguished result.
-
-    verify-merge must NOT call acquire_host_verify_worktree / _create_merge_worktree
-    (no tree mutation, no ephemeral fallback). It must instead emit a passed=False
-    VerifyResult with category == FLOCK_CONTENTION_CATEGORY and a `contention` dict
-    naming the pre-recorded holder pgid and this process's own pgid as waiter, and
-    exit 0 (a non-zero exit would make RemoteRunner treat this as RunnerUnavailable
-    and beta would never see the discriminant).
-    """
-    import fcntl
-    import os as os_module
-    from unittest.mock import AsyncMock, MagicMock
-
-    from orchestrator.verify_cancel import merge_verify_lock_path, write_lock_holder_pgid
-    from orchestrator.verify_runner import FLOCK_CONTENTION_CATEGORY, result_from_json
-
-    fake_worktree_base = tmp_path / '.worktrees'
-    fake_worktree_base.mkdir()
-
-    # --- Pre-record a holder pgid and pre-acquire the flock (simulates another
-    # verify-merge invocation already holding the persistent worktree lock). ---
-    write_lock_holder_pgid(fake_worktree_base, 9191)
-    lock_path = merge_verify_lock_path(fake_worktree_base)
-    held_fd = os_module.open(lock_path, os_module.O_RDWR | os_module.O_CREAT)
-    fcntl.flock(held_fd, fcntl.LOCK_EX)
-    try:
-        # --- Mock GitOps ---
-        fake_wt = tmp_path / '_merge-verify'
-        fake_wt.mkdir()
-        mock_git_ops = MagicMock()
-        mock_git_ops.worktree_base = fake_worktree_base
-        # task 2830: a REAL persistent_merge_worktree_path so the CLI's lane acquire
-        # computes a real path. The lane lock is NOT pre-held here (only the old lock
-        # is), so the CLI acquires the lane lock, then times out on the compat old
-        # lock — surfacing holder 9191 without clobbering it (holder written only
-        # after both locks held), keeping this test's assertions valid.
-        mock_git_ops.persistent_merge_worktree_path = fake_worktree_base / '_merge-verify'
-        mock_git_ops.acquire_host_verify_worktree = AsyncMock(return_value=fake_wt)
-        mock_git_ops.cleanup_merge_worktree = AsyncMock(return_value=None)
-        mock_git_ops._create_merge_worktree = AsyncMock(return_value=(fake_wt, 'sha'))
-        monkeypatch.setattr('orchestrator.git_ops.GitOps', MagicMock(return_value=mock_git_ops))
-
-        # --- Config: knob ON ---
-        from orchestrator.config import GitConfig, OrchestratorConfig
-        git_cfg = GitConfig(persistent_merge_worktree=True)
-        fake_config = OrchestratorConfig(project_root=tmp_path, git=git_cfg)
-        monkeypatch.setattr(cli_module, 'load_config', lambda _: fake_config)
-
-        # --- Bounded wait: keep the test fast ---
-        monkeypatch.setattr(cli_module, 'MERGE_VERIFY_FLOCK_WAIT_SECS', 0.3)
-
-        # --- spec_from_json / run_merge_verify_on_worktree mocked defensively;
-        # neither should be reached on the contention path. result_to_json is
-        # left UNMOCKED — the test needs the real codec to verify the
-        # distinguished payload round-trips losslessly on stdout. ---
-        monkeypatch.setattr('orchestrator.verify_runner.spec_from_json', lambda s: MagicMock())
-        monkeypatch.setattr(
-            'orchestrator.verify_runner.run_merge_verify_on_worktree',
-            AsyncMock(return_value=MagicMock()),
-        )
-
-        cfg_file = tmp_path / 'config.yaml'
-        cfg_file.write_text('')
-
-        sha = 'abc1234567890abc1234567890abc1234567890ab'
-        r = CliRunner().invoke(main, [
-            'verify-merge',
-            '--sha', sha,
-            '--spec', '{}',
-            '--config', str(cfg_file),
-        ])
-    finally:
-        fcntl.flock(held_fd, fcntl.LOCK_UN)
-        os_module.close(held_fd)
-
-    assert r.exit_code == 0, (
-        f'contention must exit 0 (the only delivery channel for the discriminant); '
-        f'got {r.exit_code}; output={r.output!r}'
-    )
-
-    result = result_from_json(r.output)
-    assert result.passed is False
-    assert result.category == FLOCK_CONTENTION_CATEGORY
-    assert result.contention is not None
-    assert isinstance(result.contention['host'], str) and result.contention['host'], (
-        f'contention.host must be a non-empty str: {result.contention!r}'
-    )
-    assert result.contention['holder_pgid'] == 9191
-    assert result.contention['waiter_pgid'] == os_module.getpgrp()
-
-    mock_git_ops.acquire_host_verify_worktree.assert_not_awaited()
-    mock_git_ops._create_merge_worktree.assert_not_called()
-
-
-# ---------------------------------------------------------------------------
-# Task 2830 — converge the laptop verify-merge CLI span onto the SHARED lane
-# lock (lane_lock_path(persistent_merge_worktree_path) = <worktree_base>/
-# _merge-verify.lock), finishing DF 2685 for the remote host. These two pins
-# fail against current main (the CLI holds only .merge_verify.lock and ignores
-# the lane lock); they go green once step-2 dual-locks the CLI span.
-# ---------------------------------------------------------------------------
-
-
-def test_verify_merge_holds_lane_lock_during_warm_run(tmp_path, monkeypatch):
-    """Knob ON: the SHARED lane lock is held for the whole warm verify span (task 2830).
-
-    Converges the laptop CLI span onto
-    ``lane_lock_path(persistent_merge_worktree_path)`` = ``<worktree_base>/
-    _merge-verify.lock`` — the SAME lock ``GitOps.merge_verify_lease`` and reify's
-    seed/thin/gc take (task 2685) — so a laptop lane actor is mutually excluded from
-    a live laptop verify. Inside the mocked run_merge_verify_on_worktree coroutine, a
-    fresh os.open + fcntl.flock(LOCK_EX|LOCK_NB) on that lane lock must raise
-    BlockingIOError (the CLI holds it) and read_lock_holder_pgid(worktree_base) must
-    return a positive int. After the CLI returns, the holder-pgid file must be gone and
-    the lane lock re-acquirable (released).
-    """
-    import fcntl
-    import os as os_module
-    from unittest.mock import AsyncMock, MagicMock
-
-    from orchestrator.verify_cancel import (
-        acquire_merge_verify_flock,
-        lane_lock_path,
-        read_lock_holder_pgid,
-        release_merge_verify_flock,
-    )
-
-    known_json = '{"passed": true, "results": []}'
-    fake_worktree_base = tmp_path / '.worktrees'
-    fake_worktree_base.mkdir()
-
-    # --- Mock GitOps: real worktree_base AND a REAL persistent_merge_worktree_path
-    # so lane_lock_path() resolves to <worktree_base>/_merge-verify.lock. ---
-    fake_wt = tmp_path / '_merge-verify'
-    fake_wt.mkdir()
-    mock_git_ops = MagicMock()
-    mock_git_ops.worktree_base = fake_worktree_base
-    mock_git_ops.persistent_merge_worktree_path = fake_worktree_base / '_merge-verify'
-    mock_git_ops.acquire_host_verify_worktree = AsyncMock(return_value=fake_wt)
-    mock_git_ops.cleanup_merge_worktree = AsyncMock(return_value=None)
-    monkeypatch.setattr('orchestrator.git_ops.GitOps', MagicMock(return_value=mock_git_ops))
-
-    # --- Mock config: knob ON ---
-    from orchestrator.config import GitConfig, OrchestratorConfig
-    git_cfg = GitConfig(persistent_merge_worktree=True)
-    fake_config = OrchestratorConfig(project_root=tmp_path, git=git_cfg)
-    monkeypatch.setattr(cli_module, 'load_config', lambda _: fake_config)
-
-    # --- Mock verify_runner helpers; assert lane-lock/holder state mid-run ---
-    mid_run = {}
-
-    async def fake_run_merge_verify(wt, cfg, spec, merge_sha=None):
-        lock_path = lane_lock_path(mock_git_ops.persistent_merge_worktree_path)
-        probe_fd = os_module.open(lock_path, os_module.O_RDWR | os_module.O_CREAT)
-        try:
-            fcntl.flock(probe_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            mid_run['lock_held'] = False
-            fcntl.flock(probe_fd, fcntl.LOCK_UN)
-        except BlockingIOError:
-            mid_run['lock_held'] = True
-        finally:
-            os_module.close(probe_fd)
-        mid_run['holder_pgid'] = read_lock_holder_pgid(fake_worktree_base)
-        return MagicMock()
-
-    monkeypatch.setattr('orchestrator.verify_runner.spec_from_json', lambda s: MagicMock())
-    monkeypatch.setattr('orchestrator.verify_runner.run_merge_verify_on_worktree', fake_run_merge_verify)
-    monkeypatch.setattr('orchestrator.verify_runner.result_to_json', lambda r: known_json)
-
-    cfg_file = tmp_path / 'config.yaml'
-    cfg_file.write_text('')
-
-    sha = 'abc1234567890abc1234567890abc1234567890ab'
-    r = CliRunner().invoke(main, [
-        'verify-merge',
-        '--sha', sha,
-        '--spec', '{}',
-        '--config', str(cfg_file),
-    ])
-
-    assert r.exit_code == 0, f'expected exit_code 0, got {r.exit_code}; output={r.output!r}'
-    assert known_json in r.output
-
-    assert mid_run.get('lock_held') is True, (
-        f'shared lane lock was not held during the warm run: {mid_run!r}'
-    )
-    assert isinstance(mid_run.get('holder_pgid'), int), (
-        f'holder pgid was not recorded mid-run: {mid_run!r}'
-    )
-    assert mid_run['holder_pgid'] > 0
-
-    mock_git_ops.acquire_host_verify_worktree.assert_awaited_once_with(sha)
-
-    # After the CLI returns: holder-pgid file gone, lane lock re-acquirable.
-    assert read_lock_holder_pgid(fake_worktree_base) is None, (
-        'holder-pgid file must be removed after the CLI returns'
-    )
-    fd = acquire_merge_verify_flock(
-        lane_lock_path(mock_git_ops.persistent_merge_worktree_path), timeout_secs=1.0
-    )
-    assert fd is not None, 'lane lock must be re-acquirable after the CLI releases it'
-    release_merge_verify_flock(fd)
-
-
-def test_verify_merge_lane_actor_contention_emits_distinguished_result(tmp_path, monkeypatch):
-    """Knob ON + a laptop lane actor holds <lane_dir>.lock -> distinguished result (task 2830).
-
-    Simulates a laptop reseed/thin/gc holding the SHARED lane lock
-    (``lane_lock_path(persistent_merge_worktree_path)`` = ``<worktree_base>/
-    _merge-verify.lock``) and having recorded its pgid. The CLI's bounded wait on the
-    lane lock must time out and emit the distinguished contention result (passed=False,
-    category == FLOCK_CONTENTION_CATEGORY, naming holder 9292 and this process's own
-    pgid as waiter) at exit 0, WITHOUT ever touching the tree
-    (acquire_host_verify_worktree not awaited).
-    """
-    import fcntl
-    import os as os_module
-    from unittest.mock import AsyncMock, MagicMock
-
-    from orchestrator.verify_cancel import lane_lock_path, write_lock_holder_pgid
-    from orchestrator.verify_runner import FLOCK_CONTENTION_CATEGORY, result_from_json
-
-    fake_worktree_base = tmp_path / '.worktrees'
-    fake_worktree_base.mkdir()
-
-    # --- Pre-record a holder pgid and pre-acquire the LANE lock (simulates a laptop
-    # lane actor — reseed/thin/gc — holding <lane_dir>.lock). ---
-    write_lock_holder_pgid(fake_worktree_base, 9292)
-    persistent_merge_worktree_path = fake_worktree_base / '_merge-verify'
-    lane_lock = lane_lock_path(persistent_merge_worktree_path)
-    held_fd = os_module.open(lane_lock, os_module.O_RDWR | os_module.O_CREAT)
-    fcntl.flock(held_fd, fcntl.LOCK_EX)
-    try:
-        # --- Mock GitOps ---
-        fake_wt = tmp_path / '_merge-verify'
-        fake_wt.mkdir()
-        mock_git_ops = MagicMock()
-        mock_git_ops.worktree_base = fake_worktree_base
-        mock_git_ops.persistent_merge_worktree_path = persistent_merge_worktree_path
-        mock_git_ops.acquire_host_verify_worktree = AsyncMock(return_value=fake_wt)
-        mock_git_ops.cleanup_merge_worktree = AsyncMock(return_value=None)
-        mock_git_ops._create_merge_worktree = AsyncMock(return_value=(fake_wt, 'sha'))
-        monkeypatch.setattr('orchestrator.git_ops.GitOps', MagicMock(return_value=mock_git_ops))
-
-        # --- Config: knob ON ---
-        from orchestrator.config import GitConfig, OrchestratorConfig
-        git_cfg = GitConfig(persistent_merge_worktree=True)
-        fake_config = OrchestratorConfig(project_root=tmp_path, git=git_cfg)
-        monkeypatch.setattr(cli_module, 'load_config', lambda _: fake_config)
-
-        # --- Bounded wait: keep the test fast ---
-        monkeypatch.setattr(cli_module, 'MERGE_VERIFY_FLOCK_WAIT_SECS', 0.3)
-
-        # --- run_merge_verify_on_worktree mocked defensively; it must NOT be reached
-        # on the contention path. result_to_json is left UNMOCKED so the real codec
-        # round-trips the distinguished payload on stdout. ---
-        monkeypatch.setattr('orchestrator.verify_runner.spec_from_json', lambda s: MagicMock())
-        monkeypatch.setattr(
-            'orchestrator.verify_runner.run_merge_verify_on_worktree',
-            AsyncMock(return_value=MagicMock()),
-        )
-
-        cfg_file = tmp_path / 'config.yaml'
-        cfg_file.write_text('')
-
-        sha = 'abc1234567890abc1234567890abc1234567890ab'
-        r = CliRunner().invoke(main, [
-            'verify-merge',
-            '--sha', sha,
-            '--spec', '{}',
-            '--config', str(cfg_file),
-        ])
-    finally:
-        fcntl.flock(held_fd, fcntl.LOCK_UN)
-        os_module.close(held_fd)
-
-    assert r.exit_code == 0, (
-        f'contention must exit 0 (the only delivery channel for the discriminant); '
-        f'got {r.exit_code}; output={r.output!r}'
-    )
-
-    result = result_from_json(r.output)
-    assert result.passed is False
-    assert result.category == FLOCK_CONTENTION_CATEGORY
-    assert result.contention is not None
-    assert isinstance(result.contention['host'], str) and result.contention['host'], (
-        f'contention.host must be a non-empty str: {result.contention!r}'
-    )
-    assert result.contention['holder_pgid'] == 9292
-    assert result.contention['waiter_pgid'] == os_module.getpgrp()
-
-    mock_git_ops.acquire_host_verify_worktree.assert_not_awaited()
-
-
-def test_verify_merge_also_holds_old_compat_lock_during_warm_run(tmp_path, monkeypatch):
-    """Knob ON: the OLD .merge_verify.lock co-lock is ALSO held for the whole span (task 2830).
-
-    Rollout back-compat guard (green-on-arrival after step-2). The converged CLI span
-    RETAINS the divergent ``.merge_verify.lock`` (``merge_verify_lock_path(worktree_base)``)
-    as a transitional rollout CO-lock, held across the WHOLE verify span, so an
-    in-flight OLD verify-merge — one holding ONLY that lock, before checkout-sync ships
-    the lane-lock code — stays mutually excluded during rollout. This pins the HOLD side
-    of the compat arm, deliberately distinct from
-    ``test_verify_merge_flock_contention_emits_distinguished_result`` (which exercises
-    the compat-arm WAITER side). It regresses the moment the compat acquire is dropped
-    from the dual-lock.
-
-    Folds in the lane-lock probe too (as the plan permits) to assert the FULL dual-hold
-    in a single mid-build run: with the split lane-lock lifetime (esc-2830-1) the lane
-    lock is re-acquired for the build's duration inside ``_run()``, so while
-    ``run_merge_verify_on_worktree`` runs BOTH the OLD compat lock (held across the
-    whole span) AND the SHARED lane lock (held build-scoped) are exclusive.
-    """
-    import fcntl
-    import os as os_module
-    from unittest.mock import AsyncMock, MagicMock
-
-    from orchestrator.verify_cancel import (
-        acquire_merge_verify_flock,
-        lane_lock_path,
-        merge_verify_lock_path,
-        read_lock_holder_pgid,
-        release_merge_verify_flock,
-    )
-
-    known_json = '{"passed": true, "results": []}'
-    fake_worktree_base = tmp_path / '.worktrees'
-    fake_worktree_base.mkdir()
-
-    # --- Mock GitOps: real worktree_base AND a REAL persistent_merge_worktree_path
-    # so both lock paths resolve to real files under worktree_base. ---
-    fake_wt = tmp_path / '_merge-verify'
-    fake_wt.mkdir()
-    mock_git_ops = MagicMock()
-    mock_git_ops.worktree_base = fake_worktree_base
-    mock_git_ops.persistent_merge_worktree_path = fake_worktree_base / '_merge-verify'
-    mock_git_ops.acquire_host_verify_worktree = AsyncMock(return_value=fake_wt)
-    mock_git_ops.cleanup_merge_worktree = AsyncMock(return_value=None)
-    monkeypatch.setattr('orchestrator.git_ops.GitOps', MagicMock(return_value=mock_git_ops))
-
-    # --- Mock config: knob ON ---
-    from orchestrator.config import GitConfig, OrchestratorConfig
-    git_cfg = GitConfig(persistent_merge_worktree=True)
-    fake_config = OrchestratorConfig(project_root=tmp_path, git=git_cfg)
-    monkeypatch.setattr(cli_module, 'load_config', lambda _: fake_config)
-
-    # --- Mock verify_runner helpers; probe BOTH locks mid-run ---
-    mid_run = {}
-
-    def _probe_locked(lock_path):
-        """True iff an independent LOCK_EX|LOCK_NB on lock_path is denied (held)."""
-        probe_fd = os_module.open(lock_path, os_module.O_RDWR | os_module.O_CREAT)
-        try:
-            fcntl.flock(probe_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            fcntl.flock(probe_fd, fcntl.LOCK_UN)
-            return False
-        except BlockingIOError:
-            return True
-        finally:
-            os_module.close(probe_fd)
-
-    async def fake_run_merge_verify(wt, cfg, spec, merge_sha=None):
-        # NEW pin: the OLD .merge_verify.lock compat co-lock is held mid-run.
-        mid_run['old_lock_held'] = _probe_locked(merge_verify_lock_path(fake_worktree_base))
-        # Folded-in full dual-hold: the SHARED lane lock is held mid-build too.
-        mid_run['lane_lock_held'] = _probe_locked(
-            lane_lock_path(mock_git_ops.persistent_merge_worktree_path)
-        )
-        mid_run['holder_pgid'] = read_lock_holder_pgid(fake_worktree_base)
-        return MagicMock()
-
-    monkeypatch.setattr('orchestrator.verify_runner.spec_from_json', lambda s: MagicMock())
-    monkeypatch.setattr('orchestrator.verify_runner.run_merge_verify_on_worktree', fake_run_merge_verify)
-    monkeypatch.setattr('orchestrator.verify_runner.result_to_json', lambda r: known_json)
-
-    cfg_file = tmp_path / 'config.yaml'
-    cfg_file.write_text('')
-
-    sha = 'abc1234567890abc1234567890abc1234567890ab'
-    r = CliRunner().invoke(main, [
-        'verify-merge',
-        '--sha', sha,
-        '--spec', '{}',
-        '--config', str(cfg_file),
-    ])
-
-    assert r.exit_code == 0, f'expected exit_code 0, got {r.exit_code}; output={r.output!r}'
-    assert known_json in r.output
-
-    assert mid_run.get('old_lock_held') is True, (
-        f'OLD .merge_verify.lock compat co-lock was not held during the warm run '
-        f'(an in-flight OLD verify-merge would NOT be excluded during rollout): {mid_run!r}'
-    )
-    assert mid_run.get('lane_lock_held') is True, (
-        f'shared lane lock was not held during the warm run (full dual-hold): {mid_run!r}'
-    )
-    assert isinstance(mid_run.get('holder_pgid'), int), (
-        f'holder pgid was not recorded mid-run: {mid_run!r}'
-    )
-    assert mid_run['holder_pgid'] > 0
-
-    mock_git_ops.acquire_host_verify_worktree.assert_awaited_once_with(sha)
-
-    # After the CLI returns: holder-pgid file gone, OLD compat lock re-acquirable (released).
-    assert read_lock_holder_pgid(fake_worktree_base) is None, (
-        'holder-pgid file must be removed after the CLI returns'
-    )
-    fd = acquire_merge_verify_flock(
-        merge_verify_lock_path(fake_worktree_base), timeout_secs=1.0
-    )
-    assert fd is not None, 'OLD compat lock must be re-acquirable after the CLI releases it'
-    release_merge_verify_flock(fd)
-
-
-def test_verify_merge_build_lane_acquire_fails_open(tmp_path, monkeypatch):
-    """Knob ON: the in-_run() BUILD lane re-acquire failing OPEN still completes (task 2830).
-
-    Pins the deliberate fail-OPEN arm of the split lane-lock lifetime (esc-2830-1,
-    mirroring ``GitOps.merge_verify_lease``): after the pre-flight gate passes and
-    releases the lane lock, ``_run()`` re-acquires the lane lock for the build only.
-    If THAT acquire times out (``build_lane_fd`` is None), the build proceeds WITHOUT
-    the lane lock and WITHOUT writing the shared holder-pgid — it does NOT raise, does
-    NOT emit a contention result, and leaves NO holder-pgid file behind. (A live lane
-    actor is already excluded by the pre-flight gate + the compat co-lock held across
-    the whole span, so proceeding unrecorded is safe.)
-
-    Forces ONLY the in-_run() lane acquire to fail (return None) by failing the SECOND
-    lane-lock acquire while leaving the pre-flight gate's FIRST lane acquire and the
-    compat acquire (a DIFFERENT path) untouched. Regresses the moment fail-open turns
-    into fail-closed (raise / contention result) or the build starts writing a holder
-    on the no-lock path.
-    """
-    import fcntl
-    import os as os_module
-    from unittest.mock import AsyncMock, MagicMock
-
-    from orchestrator.verify_cancel import (
-        acquire_merge_verify_flock,
-        lane_lock_path,
-        merge_verify_lock_path,
-        read_lock_holder_pgid,
-        release_merge_verify_flock,
-    )
-
-    known_json = '{"passed": true, "results": []}'
-    fake_worktree_base = tmp_path / '.worktrees'
-    fake_worktree_base.mkdir()
-
-    # --- Mock GitOps: real worktree_base AND a REAL persistent_merge_worktree_path
-    # so lane_lock_path() resolves to <worktree_base>/_merge-verify.lock. ---
-    fake_wt = tmp_path / '_merge-verify'
-    fake_wt.mkdir()
-    mock_git_ops = MagicMock()
-    mock_git_ops.worktree_base = fake_worktree_base
-    mock_git_ops.persistent_merge_worktree_path = fake_worktree_base / '_merge-verify'
-    mock_git_ops.acquire_host_verify_worktree = AsyncMock(return_value=fake_wt)
-    mock_git_ops.cleanup_merge_worktree = AsyncMock(return_value=None)
-    monkeypatch.setattr('orchestrator.git_ops.GitOps', MagicMock(return_value=mock_git_ops))
-
-    # --- Mock config: knob ON ---
-    from orchestrator.config import GitConfig, OrchestratorConfig
-    git_cfg = GitConfig(persistent_merge_worktree=True)
-    fake_config = OrchestratorConfig(project_root=tmp_path, git=git_cfg)
-    monkeypatch.setattr(cli_module, 'load_config', lambda _: fake_config)
-
-    # --- Force ONLY the in-_run() BUILD lane acquire to fail open (return None). ---
-    # The knob-on span acquires the LANE lock twice: (1) at the pre-flight gate (must
-    # succeed so the gate passes), then (2) inside _run() for the build (the acquire
-    # under test). The compat acquire targets a DIFFERENT path and always succeeds.
-    # Fail the 2nd lane-lock acquire onward, leaving the gate + compat acquires real.
-    real_acquire = cli_module.acquire_merge_verify_flock
-    lane_lock = lane_lock_path(mock_git_ops.persistent_merge_worktree_path)
-    lane_calls = {'n': 0}
-
-    def fake_acquire(lock_path, timeout_secs):
-        if lock_path == lane_lock:
-            lane_calls['n'] += 1
-            if lane_calls['n'] >= 2:
-                return None  # the BUILD re-acquire times out -> fail OPEN
-        return real_acquire(lock_path, timeout_secs)
-
-    monkeypatch.setattr(cli_module, 'acquire_merge_verify_flock', fake_acquire)
-
-    # --- Probe holder + lane-lock state mid-build. ---
-    mid_run = {}
-
-    def _probe_locked(lp):
-        """True iff an independent LOCK_EX|LOCK_NB on lp is denied (held)."""
-        probe_fd = os_module.open(lp, os_module.O_RDWR | os_module.O_CREAT)
-        try:
-            fcntl.flock(probe_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            fcntl.flock(probe_fd, fcntl.LOCK_UN)
-            return False
-        except BlockingIOError:
-            return True
-        finally:
-            os_module.close(probe_fd)
-
-    async def fake_run_merge_verify(wt, cfg, spec, merge_sha=None):
-        mid_run['reached'] = True
-        # Fail-open: the build holds NO lane lock and wrote NO holder-pgid.
-        mid_run['lane_lock_held'] = _probe_locked(lane_lock)
-        mid_run['holder_pgid'] = read_lock_holder_pgid(fake_worktree_base)
-        return MagicMock()
-
-    monkeypatch.setattr('orchestrator.verify_runner.spec_from_json', lambda s: MagicMock())
-    monkeypatch.setattr('orchestrator.verify_runner.run_merge_verify_on_worktree', fake_run_merge_verify)
-    monkeypatch.setattr('orchestrator.verify_runner.result_to_json', lambda r: known_json)
-
-    cfg_file = tmp_path / 'config.yaml'
-    cfg_file.write_text('')
-
-    sha = 'abc1234567890abc1234567890abc1234567890ab'
-    r = CliRunner().invoke(main, [
-        'verify-merge',
-        '--sha', sha,
-        '--spec', '{}',
-        '--config', str(cfg_file),
-    ])
-
-    # Fail-OPEN contract: the verify still completes normally (exit 0, result echoed).
-    assert r.exit_code == 0, f'fail-open must exit 0; got {r.exit_code}; output={r.output!r}'
-    assert known_json in r.output, (
-        f'the build result must still be echoed on the fail-open path: {r.output!r}'
-    )
-    assert 'Error:' not in r.output, f'fail-open must NOT raise: {r.output!r}'
-
-    # The BUILD lane re-acquire was genuinely exercised and forced to None (>=2 acquires).
-    assert lane_calls['n'] >= 2, (
-        f'the in-_run build lane re-acquire was not reached: {lane_calls!r}'
-    )
-    # The build proceeded despite no lane lock, and recorded NO holder mid-run.
-    assert mid_run.get('reached') is True, 'run_merge_verify_on_worktree must still run'
-    assert mid_run.get('lane_lock_held') is False, (
-        f'fail-open: the build must hold NO lane lock: {mid_run!r}'
-    )
-    assert mid_run.get('holder_pgid') is None, (
-        f'fail-open: no shared holder-pgid may be written on the no-lock build path: {mid_run!r}'
-    )
-
-    mock_git_ops.acquire_host_verify_worktree.assert_awaited_once_with(sha)
-
-    # After the CLI returns: no holder-pgid file, both locks free (compat released,
-    # lane never held during the build).
-    assert read_lock_holder_pgid(fake_worktree_base) is None, (
-        'no holder-pgid file may exist after a fail-open run'
-    )
-    fd_lane = acquire_merge_verify_flock(lane_lock, timeout_secs=1.0)
-    assert fd_lane is not None, 'lane lock must be free after a fail-open run'
-    release_merge_verify_flock(fd_lane)
-    fd_compat = acquire_merge_verify_flock(
-        merge_verify_lock_path(fake_worktree_base), timeout_secs=1.0
-    )
-    assert fd_compat is not None, 'compat lock must be released after the CLI returns'
-    release_merge_verify_flock(fd_compat)
-
-
-# ---------------------------------------------------------------------------
-# Task 1732 step-11 — cancel-verify subcommand (CliRunner)
-# ---------------------------------------------------------------------------
-
-
-def test_cancel_verify_unknown_id_exits_0(tmp_path, monkeypatch):
-    """(a) Unknown request id (no pgid file present) -> exit 0 (idempotent)."""
-    from unittest.mock import MagicMock
-
-    from orchestrator.config import OrchestratorConfig
-
-    # Minimal config: project_root -> tmp_path (worktree_base = tmp_path/.worktrees)
-    fake_config = OrchestratorConfig(project_root=tmp_path)
-    monkeypatch.setattr(cli_module, 'load_config', lambda _: fake_config)
-
-    # GitOps mock returning a worktree_base that has no pgid file
-    fake_worktree_base = tmp_path / '.worktrees'
-    mock_git_ops = MagicMock()
-    mock_git_ops.worktree_base = fake_worktree_base
-    monkeypatch.setattr('orchestrator.git_ops.GitOps', MagicMock(return_value=mock_git_ops))
-
-    cfg_file = tmp_path / 'config.yaml'
-    cfg_file.write_text('')
-
-    r = CliRunner().invoke(main, [
-        'cancel-verify',
-        '--request-id', 'nonexistent-req',
-        '--config', str(cfg_file),
-    ])
-    assert r.exit_code == 0, (
-        f'expected exit_code 0 for unknown id, got {r.exit_code}; output={r.output!r}'
-    )
-
-
-def test_cancel_verify_rc_wiring(tmp_path, monkeypatch):
-    """(b) cancel_request spy: CLI passes pgid_file path and exits with exactly that rc."""
-    from unittest.mock import MagicMock
-
-    from orchestrator.config import OrchestratorConfig
-    from orchestrator.verify_cancel import pgid_file
-
-    FAKE_REQUEST_ID = 'wiring-test-req'
-    EXPECTED_RC = 42  # unusual value to prove propagation
-
-    fake_worktree_base = tmp_path / '.worktrees'
-    expected_path = pgid_file(fake_worktree_base, FAKE_REQUEST_ID)
-
-    cancel_calls = []
-
-    def fake_cancel_request(path, **kwargs):
-        cancel_calls.append(path)
-        return EXPECTED_RC
-
-    monkeypatch.setattr(cli_module, 'cancel_request', fake_cancel_request)
-
-    fake_config = OrchestratorConfig(project_root=tmp_path)
-    monkeypatch.setattr(cli_module, 'load_config', lambda _: fake_config)
-
-    mock_git_ops = MagicMock()
-    mock_git_ops.worktree_base = fake_worktree_base
-    monkeypatch.setattr('orchestrator.git_ops.GitOps', MagicMock(return_value=mock_git_ops))
-
-    cfg_file = tmp_path / 'config.yaml'
-    cfg_file.write_text('')
-
-    r = CliRunner().invoke(main, [
-        'cancel-verify',
-        '--request-id', FAKE_REQUEST_ID,
-        '--config', str(cfg_file),
-    ])
-
-    # RC propagated correctly
-    assert r.exit_code == EXPECTED_RC, (
-        f'expected exit_code {EXPECTED_RC}, got {r.exit_code}; output={r.output!r}'
-    )
-    # Path derivation: cancel_request was called with the right pgid_file path
-    assert len(cancel_calls) == 1, f'cancel_request called {len(cancel_calls)} times'
-    assert cancel_calls[0] == expected_path, (
-        f'cancel_request called with wrong path: {cancel_calls[0]} != {expected_path}'
-    )
-
-
-def test_cancel_verify_real_impl_dead_pgid(tmp_path, monkeypatch):
-    """(c) Real pgid file with a dead pgid -> exit 0, file removed."""
-    from unittest.mock import MagicMock
-
-    from orchestrator.config import OrchestratorConfig
-    from orchestrator.verify_cancel import pgid_file, write_pgid_file
-
-    FAKE_REQUEST_ID = 'dead-pgid-req'
-    # Use pid 1 (init) as the "dead" pgid — we can't kill it, but with a dead
-    # process we instead use a non-existent high pid that raises ProcessLookupError.
-    # We'll write a nonsense high pid that definitely doesn't exist.
-    NONEXISTENT_PID = 2 ** 22  # well above /proc/sys/kernel/pid_max on most systems
-
-    fake_worktree_base = tmp_path / '.worktrees'
-    pgf = pgid_file(fake_worktree_base, FAKE_REQUEST_ID)
-    write_pgid_file(pgf, NONEXISTENT_PID)
-
-    fake_config = OrchestratorConfig(project_root=tmp_path)
-    monkeypatch.setattr(cli_module, 'load_config', lambda _: fake_config)
-
-    mock_git_ops = MagicMock()
-    mock_git_ops.worktree_base = fake_worktree_base
-    monkeypatch.setattr('orchestrator.git_ops.GitOps', MagicMock(return_value=mock_git_ops))
-
-    cfg_file = tmp_path / 'config.yaml'
-    cfg_file.write_text('')
-
-    r = CliRunner().invoke(main, [
-        'cancel-verify',
-        '--request-id', FAKE_REQUEST_ID,
-        '--config', str(cfg_file),
-    ])
-
-    assert r.exit_code == 0, (
-        f'expected exit_code 0 for dead pgid, got {r.exit_code}; output={r.output!r}'
-    )
-    assert not pgf.exists(), f'pgid file must be removed after successful cancel; still at {pgf}'
-
-
-# ---------------------------------------------------------------------------
-# Task 1732 step-13 (part 2) — end-to-end: real subprocess cancel capstone
-# ---------------------------------------------------------------------------
-
-
-def _wait_for_file_cli(path: 'Path', timeout: float = 10.0, interval: float = 0.1) -> bool:
-    """Poll until *path* exists or *timeout* expires. Return True if found."""
-    import time
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if path.exists():
-            return True
-        time.sleep(interval)
-    return False
-
-
-def _wait_pgid_gone(pgid: int, *, timeout: float = 20.0, interval: float = 0.1) -> None:
-    """Poll until process group *pgid* has no live members, else raise.
-
-    SIGKILL delivery and reaping are asynchronous: a one-shot os.killpg
-    immediately after child.wait() can observe a not-yet-reaped group member
-    (a lingering zombie, or a killed descendant that reparented to init)
-    even though the group is guaranteed to empty eventually. This asserts
-    the real contract -- eventual group death -- via a bounded poll on a
-    monotonic deadline instead of a synchronous one-shot check.
-
-    Mirrors the EPERM-vs-ESRCH errno discrimination formerly inlined in
-    test_verify_merge_cancel_end_to_end.
-    """
-    import errno
-    import os
-    import time
-
-    deadline = time.monotonic() + timeout
-    while True:
-        try:
-            os.killpg(pgid, 0)
-        except (ProcessLookupError, OSError) as exc:
-            if hasattr(exc, 'errno') and exc.errno == errno.EPERM:
-                raise AssertionError(f'pgid group {pgid}: got EPERM (unexpected)') from exc
-            return  # ESRCH → group is gone — expected
-        if time.monotonic() >= deadline:
-            raise AssertionError(f'verify-merge pgid group {pgid} still alive after cancel-verify')
-        time.sleep(interval)
-
-
-# NOTE (task 2350): widened from 30s -- fixed real-time deadlines starve
-# under heavy shared-host xdist contention even though the underlying
-# subprocess-cancel behavior is correct (timing flake, not a bug).
-# NOTE (task 2770): widened 90s -> 120s -- _wait_pgid_gone's poll-for-drain
-# (up to 20s, landed via task 2733) can still push total wall time past 90s
-# under extreme load even though the underlying cancel behavior is correct.
-@pytest.mark.timeout(120)
-def test_verify_merge_cancel_end_to_end(tmp_path, monkeypatch):
-    """End-to-end: real subprocess 'verify-merge --request-id X' is killed by cancel-verify.
-
-    Spawns a real 'orchestrator verify-merge --request-id X' subprocess with a
-    long-running sleep spec.  Polls for the pgid file that verify-merge writes
-    after os.setsid().  Calls 'cancel-verify --request-id X' via CliRunner
-    (in-process, monkeypatched load_config).  Asserts:
-
-    * cancel-verify exits 0
-    * pgid file is removed by cancel_request
-    * verify-merge subprocess exits within seconds (SIGKILL delivered)
-    * the recorded pgid group is gone (os.killpg raises ESRCH) after wait()
-    """
-    import os
-    import subprocess as subprocess_mod
-    import sys
-
-    from orchestrator.config import OrchestratorConfig
-    from orchestrator.git_ops import GitOps
-    from orchestrator.verify_cancel import pgid_file
-    from orchestrator.verify_runner import (
-        MergeVerifySpec,
-        UnscopedTypecheckSpec,
-        VerifyCommand,
-        spec_to_json,
-    )
-
-    # --- Set up a real git repo ---
-    repo, head_sha = _setup_verify_repo(tmp_path)
-
-    # --- Write minimal config YAML (project_root -> repo) ---
-    cfg_file = tmp_path / 'config.yaml'
-    cfg_file.write_text(f'project_root: {repo}\n')
-
-    # --- Spec with a long-running sleep test command ---
-    spec = MergeVerifySpec(
-        verify_commands=(VerifyCommand('mod', test_command='sleep 300'),),
-        unscoped_typecheck=UnscopedTypecheckSpec(
-            commands=(VerifyCommand('mod', type_check_command='true'),),
-            block_on_timeout=True,
-        ),
-        task_files=('mod/test_x.py',),
-        verify_env={},
-        cold_timeout_secs=300.0,
-    )
-
-    REQUEST_ID = 'e2e-cancel-test'
-
-    # --- Derive the expected pgid file path (same derivation as verify-merge uses) ---
-    config_obj = OrchestratorConfig(project_root=repo)
-    _git_ops = GitOps(config_obj.git, repo)
-    pgf = pgid_file(_git_ops.worktree_base, REQUEST_ID)
-
-    # --- Spawn verify-merge as a real subprocess ---
-    # Set PYTHONPATH so the subprocess imports from the worktree's src (not the
-    # editable-install main-checkout), ensuring it uses the task-branch code.
-    worktree_src = str(Path(__file__).parent.parent / 'src')
-    env = dict(os.environ)
-    existing_pp = env.get('PYTHONPATH', '')
-    env['PYTHONPATH'] = f'{worktree_src}:{existing_pp}' if existing_pp else worktree_src
-    # Remove ORCH_PROJECT_ROOT so it does not override the YAML's project_root.
-    # The _isolate_orch_config autouse fixture sets ORCH_PROJECT_ROOT=<pytest
-    # tmp_path>, and pydantic-settings env_settings has higher priority than
-    # yaml_settings.  Without this removal the subprocess would use the pytest
-    # tmp_path as project_root instead of the test's git repo, causing git
-    # worktree operations to fail with "not a git repository".
-    env.pop('ORCH_PROJECT_ROOT', None)
-
-    child = subprocess_mod.Popen(
-        [sys.executable, '-c', 'from orchestrator.cli import main; main()',
-         'verify-merge',
-         '--sha', head_sha,
-         '--spec', spec_to_json(spec),
-         '--config', str(cfg_file),
-         '--request-id', REQUEST_ID],
-        env=env,
-        stdout=subprocess_mod.PIPE,
-        stderr=subprocess_mod.PIPE,
-    )
-
-    pgid_val = None
-    try:
-        # --- Poll for the pgid file (written before asyncio.run) ---
-        if not _wait_for_file_cli(pgf, timeout=30):
-            _debug_stdout, _debug_stderr = child.communicate(timeout=10) if child.poll() is not None else (b'', b'')
-            pytest.fail(
-                f'verify-merge did not write pgid file within 30s '
-                f'(subprocess poll={child.poll()!r})\n'
-                f'STDOUT: {_debug_stdout.decode()[:2000]!r}\n'
-                f'STDERR: {_debug_stderr.decode()[:2000]!r}'
+class TestRunBoundsAsyncioTeardown:
+    """``run`` bounds asyncio.run()'s teardown, and disarms that watchdog before the
+    report echo, so the echo is never covered by a kill timer."""
+
+    def _invoke(self, monkeypatch, harness_run: AsyncMock):
+        events: list[tuple] = []
+
+        def fake_force_exit(timeout_secs, exit_code=137, **kwargs):
+            events.append(('arm', timeout_secs))
+            return cli_module.WatchdogHandle(
+                disarm=lambda: events.append(('disarm', timeout_secs)),
+                thread=MagicMock(spec=threading.Thread),
             )
 
-        # Save pgid BEFORE cancel-verify removes the file
-        pgid_val = int(pgf.read_text().strip())
+        original_echo = cli_module.click.echo
 
-        # --- Cancel via CliRunner (in-process, monkeypatched load_config) ---
-        monkeypatch.setattr(cli_module, 'load_config', lambda _: config_obj)
-        r = CliRunner().invoke(main, [
-            'cancel-verify',
-            '--request-id', REQUEST_ID,
-            '--config', str(cfg_file),
-        ])
+        def recording_echo(msg=None, **kwargs):
+            events.append(('echo', msg))
+            return original_echo(msg, **kwargs)
 
-        assert r.exit_code == 0, (
-            f'cancel-verify expected exit 0, got {r.exit_code}; '
-            f'output={r.output!r}'
+        monkeypatch.setattr(cli_module.click, 'echo', recording_echo)
+
+        async def recording_run(*args, **kwargs):
+            events.append(('harness.run',))
+            return await harness_run(*args, **kwargs)
+
+        _wire_run_with_fake_harness(monkeypatch, force_exit=fake_force_exit, harness_run=recording_run)
+        result = CliRunner().invoke(main, ['run', '--config', '/dev/null'])
+        return result, events
+
+    def test_the_teardown_watchdog_is_disarmed_before_the_report_echo(self, monkeypatch):
+        report = MagicMock(blocked=0)
+        report.summary.return_value = 'ok'
+
+        result, events = self._invoke(monkeypatch, AsyncMock(return_value=report))
+
+        assert result.exit_code == 0, result.output
+        assert [e for e in events if e[0] != 'echo' or e == ('echo', 'ok')] == [
+            ('harness.run',),
+            ('arm', TEARDOWN_WATCHDOG_TIMEOUT_SECS),
+            ('disarm', TEARDOWN_WATCHDOG_TIMEOUT_SECS),
+            ('echo', 'ok'),
+            ('arm', SHUTDOWN_WATCHDOG_TIMEOUT_SECS),
+        ]
+
+    def test_the_sigterm_path_bounds_the_teardown_too(self, monkeypatch):
+        result, events = self._invoke(
+            monkeypatch, AsyncMock(side_effect=asyncio.CancelledError()),
         )
-        assert not pgf.exists(), (
-            'pgid file must be removed by cancel-verify on success'
-        )
 
-        # --- verify-merge subprocess must exit within seconds ---
-        try:
-            child.wait(timeout=20)
-        except subprocess_mod.TimeoutExpired:
-            pytest.fail(
-                'verify-merge subprocess did not exit within 20s after cancel-verify'
-            )
-
-        # --- Process group must eventually be gone after the subprocess is
-        # reaped. Bounded poll (not a one-shot check) -- see _wait_pgid_gone
-        # docstring: SIGKILL delivery + reaping is asynchronous. ---
-        _wait_pgid_gone(pgid_val, timeout=20)
-    finally:
-        if child.poll() is None:
-            child.kill()
-            child.wait(timeout=5)
+        assert result.exit_code == 130, result.output
+        assert [e for e in events if e[0] != 'echo'] == [
+            ('harness.run',),
+            ('arm', TEARDOWN_WATCHDOG_TIMEOUT_SECS),
+            ('disarm', TEARDOWN_WATCHDOG_TIMEOUT_SECS),
+            ('arm', SHUTDOWN_WATCHDOG_TIMEOUT_SECS),
+        ]
 
 
-# ---------------------------------------------------------------------------
-# Task 2733 step-1/2 — _wait_pgid_gone: bounded poll-for-ESRCH helper (leg c)
-# ---------------------------------------------------------------------------
-#
-# De-flakes the pgid-liveness assertion above: SIGKILL delivery + reaping is
-# asynchronous, so a one-shot os.killpg(pgid, 0) immediately after child.wait()
-# can observe a not-yet-reaped group member.  _wait_pgid_gone asserts the real
-# contract (eventual group death) via a bounded poll instead.
+class TestRunCapturesTheDeployedSha:
+    """Task 6565 D1: ``run`` brackets the harness import and injects the sha."""
 
+    def _invoke(self, monkeypatch, *, enabled_runners):
+        monkeypatch.setattr(cli_module, '_force_exit_after_delay', lambda *a, **k: MagicMock())
+        fake_config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
+        fake_config.enabled_verify_runners = enabled_runners
+        monkeypatch.setattr(cli_config, 'load_config', lambda _path: fake_config)
+        fake_report = MagicMock(blocked=0)
+        fake_report.summary.return_value = 'ok'
+        received: dict[str, object] = {}
 
-def test_wait_pgid_gone_returns_for_dead_group():
-    """A pgid with no live processes (ESRCH) returns without raising.
+        def fake_harness(config, **kwargs):
+            received.update(kwargs)
+            harness = MagicMock()
+            harness.run = AsyncMock(return_value=fake_report)
+            return harness
 
-    Uses the same well-above-pid_max idiom as NONEXISTENT_PID above: no
-    process/group can plausibly exist at this pgid, so os.killpg(pgid, 0)
-    inside _wait_pgid_gone raises ProcessLookupError/ESRCH on the first poll
-    and the helper returns cleanly.
-    """
-    NONEXISTENT_PID = 2 ** 22  # well above /proc/sys/kernel/pid_max on most systems
+        monkeypatch.setattr('orchestrator.harness.Harness', fake_harness)
+        result = CliRunner().invoke(cli_module.main, ['run', '--config', '/dev/null'])
+        return result, received
 
-    _wait_pgid_gone(NONEXISTENT_PID, timeout=1.0, interval=0.05)
+    def test_harness_receives_the_checkout_head(self, monkeypatch):
+        from orchestrator.deployed_sha import DeployedSha, checkout_head, resolve_code_checkout
 
+        result, received = self._invoke(monkeypatch, enabled_runners=[])
 
-def test_wait_pgid_gone_raises_for_live_group():
-    """A still-live process group causes _wait_pgid_gone to raise after the deadline."""
-    import sys
+        assert result.exit_code == 0, result.output
+        deployed = received['deployed_sha']
+        assert isinstance(deployed, DeployedSha)
+        checkout = resolve_code_checkout()
+        assert checkout is not None
+        assert deployed.sha == checkout_head(checkout)
 
-    child = subprocess.Popen(
-        [sys.executable, '-c', 'import time; time.sleep(30)'],
-        start_new_session=True,
-    )
-    try:
-        with pytest.raises(AssertionError, match='still alive'):
-            _wait_pgid_gone(child.pid, timeout=1.0, interval=0.05)
-    finally:
-        child.kill()
-        child.wait(timeout=5)
+    def test_unreadable_sha_with_an_enabled_remote_runner_refuses_to_start(self, monkeypatch):
+        monkeypatch.setattr('orchestrator.deployed_sha.resolve_code_checkout', lambda: None)
 
+        result, received = self._invoke(monkeypatch, enabled_runners=[MagicMock()])
 
-# ---------------------------------------------------------------------------
-# Task 2308 step-11 — verify-merge watchdog wiring: start_stdin_watchdog spawn
-# ---------------------------------------------------------------------------
+        assert result.exit_code == 1
+        assert 'remote verify runner is enabled' in result.output
+        assert received == {}
 
+    def test_unreadable_sha_without_remote_runners_starts_with_none(self, monkeypatch):
+        monkeypatch.setattr('orchestrator.deployed_sha.resolve_code_checkout', lambda: None)
 
-def test_verify_merge_spawns_watchdog_when_request_id_set(tmp_path, monkeypatch):
-    """--request-id set: verify-merge spawns the stdin watchdog with the pgid.
+        result, received = self._invoke(monkeypatch, enabled_runners=[])
 
-    Mirrors task 1732's pgid-lifecycle scaffolding (mocked GitOps/config/
-    verify_runner helpers, no real git/build work). Spies on
-    start_own_process_group (known pgid) and monkeypatches
-    orchestrator.cli.start_stdin_watchdog to a recorder. Asserts the
-    recorder is called exactly once with the SAME pgid written to the
-    pgid file.
-    """
-    from unittest.mock import AsyncMock, MagicMock
-
-    FAKE_PGID = 55555
-    FAKE_REQUEST_ID = 'test-req-2308'
-    known_json = '{"passed": true, "results": []}'
-
-    fake_worktree_base = tmp_path / '.worktrees'
-
-    # --- Mock GitOps ---
-    fake_wt = tmp_path / '_merge-verify'
-    fake_wt.mkdir()
-    mock_git_ops = MagicMock()
-    mock_git_ops.worktree_base = fake_worktree_base
-    mock_git_ops.acquire_host_verify_worktree = AsyncMock(return_value=fake_wt)
-    mock_git_ops.cleanup_merge_worktree = AsyncMock(return_value=None)
-    monkeypatch.setattr('orchestrator.git_ops.GitOps', MagicMock(return_value=mock_git_ops))
-
-    # --- Mock config ---
-    from orchestrator.config import OrchestratorConfig
-    fake_config = OrchestratorConfig(project_root=tmp_path)
-    monkeypatch.setattr(cli_module, 'load_config', lambda _: fake_config)
-
-    # --- Spy on start_own_process_group (known pgid) ---
-    monkeypatch.setattr(cli_module, 'start_own_process_group', lambda: FAKE_PGID)
-
-    # --- Recorder for start_stdin_watchdog ---
-    watchdog_calls = []
-
-    def fake_start_stdin_watchdog(pgid, *args, **kwargs):
-        watchdog_calls.append(pgid)
-        return MagicMock()
-
-    monkeypatch.setattr(cli_module, 'start_stdin_watchdog', fake_start_stdin_watchdog)
-
-    # --- Mock verify_runner helpers ---
-    monkeypatch.setattr('orchestrator.verify_runner.spec_from_json', lambda s: MagicMock())
-    monkeypatch.setattr(
-        'orchestrator.verify_runner.run_merge_verify_on_worktree',
-        AsyncMock(return_value=MagicMock()),
-    )
-    monkeypatch.setattr('orchestrator.verify_runner.result_to_json', lambda r: known_json)
-
-    cfg_file = tmp_path / 'config.yaml'
-    cfg_file.write_text('')
-
-    sha = 'abc1234567890abc1234567890abc1234567890ab'
-    r = CliRunner().invoke(main, [
-        'verify-merge',
-        '--sha', sha,
-        '--spec', '{}',
-        '--config', str(cfg_file),
-        '--request-id', FAKE_REQUEST_ID,
-    ])
-
-    assert r.exit_code == 0, f'expected exit_code 0, got {r.exit_code}; output={r.output!r}'
-    assert watchdog_calls == [FAKE_PGID], (
-        f'start_stdin_watchdog must be called exactly once with pgid={FAKE_PGID}; '
-        f'got {watchdog_calls!r}'
-    )
-
-
-def test_verify_merge_no_watchdog_when_request_id_absent(tmp_path, monkeypatch):
-    """Without --request-id, start_stdin_watchdog is NOT spawned (back-compat)."""
-    from unittest.mock import AsyncMock, MagicMock
-
-    # --- Mock GitOps ---
-    fake_wt = tmp_path / '_merge-verify'
-    fake_wt.mkdir()
-    mock_git_ops = MagicMock()
-    mock_git_ops.acquire_host_verify_worktree = AsyncMock(return_value=fake_wt)
-    mock_git_ops.cleanup_merge_worktree = AsyncMock(return_value=None)
-    monkeypatch.setattr('orchestrator.git_ops.GitOps', MagicMock(return_value=mock_git_ops))
-
-    # --- Mock config ---
-    from orchestrator.config import OrchestratorConfig
-    fake_config = OrchestratorConfig(project_root=tmp_path)
-    monkeypatch.setattr(cli_module, 'load_config', lambda _: fake_config)
-
-    # --- Recorder for start_stdin_watchdog ---
-    watchdog_calls = []
-
-    def fake_start_stdin_watchdog(pgid, *args, **kwargs):
-        watchdog_calls.append(pgid)
-        return MagicMock()
-
-    monkeypatch.setattr(cli_module, 'start_stdin_watchdog', fake_start_stdin_watchdog)
-
-    # --- Mock verify_runner helpers ---
-    known_json = '{"passed": false, "results": []}'
-    monkeypatch.setattr('orchestrator.verify_runner.spec_from_json', lambda s: MagicMock())
-    monkeypatch.setattr(
-        'orchestrator.verify_runner.run_merge_verify_on_worktree',
-        AsyncMock(return_value=MagicMock()),
-    )
-    monkeypatch.setattr('orchestrator.verify_runner.result_to_json', lambda r: known_json)
-
-    cfg_file = tmp_path / 'config.yaml'
-    cfg_file.write_text('')
-
-    sha = 'abc1234567890abc1234567890abc1234567890ab'
-    r = CliRunner().invoke(main, [
-        'verify-merge',
-        '--sha', sha,
-        '--spec', '{}',
-        '--config', str(cfg_file),
-    ])
-
-    assert r.exit_code == 0, f'expected exit_code 0, got {r.exit_code}; output={r.output!r}'
-    assert watchdog_calls == [], (
-        f'start_stdin_watchdog must NOT be called without --request-id; got {watchdog_calls!r}'
-    )
+        assert result.exit_code == 0, result.output
+        assert received == {'deployed_sha': None}

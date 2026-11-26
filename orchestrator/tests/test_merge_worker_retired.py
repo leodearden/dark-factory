@@ -1,79 +1,108 @@
-"""Guard tests for MQ-refactor task ν: MergeWorker retirement (R7b).
+"""The serial ``MergeWorker`` is gone -- from production and from the tests.
 
-The legacy serial ``MergeWorker`` is retired from the production
-``orchestrator.merge_queue`` package.  Its behavior is preserved verbatim as
-a test-local reference fixture (``orchestrator/tests/_serial_merge_worker.py``)
-so the ~89 existing constructions across the test suite keep exercising the
-same serial-specific surface (``_dequeue``/``_process``/``_do_merge``/
-``_urgent`` CAS re-enqueue) without being rewritten against
-``SpeculativeMergeWorker``.
-
-Two guards bracket the mechanical relocation:
-
-  test_serial_reference_fixture_available   — the fixture module exists and
-      shape-matches the historical ``MergeWorker`` (step-1 RED / step-2 GREEN).
-  test_merge_worker_absent_from_production   — the class is actually gone
-      from the production module, not just duplicated (step-4 RED / step-5
-      GREEN).
+MQ-refactor task ν (R7b) removed the serial worker from
+``orchestrator.merge_lane.worker`` but kept a frozen copy of it under
+``orchestrator/tests`` so the tests built on it kept running. Task 5034 (PRD
+``plans/merge-lane-quality-prd.md`` task δ, decision 4) discarded that copy and
+re-homed the behaviours those tests checked onto the production lane,
+``orchestrator.merge_lane.MergeLane``, driven through the fakes in
+``_merge_lane_fakes.py``. A fallback that is never exercised is not a fallback
+(INV-10), so neither half may come back.
 """
 
 from __future__ import annotations
 
-import asyncio
-from unittest.mock import MagicMock
+import ast
+from pathlib import Path
 
-import orchestrator.merge_queue as mq
+import pytest
+from _tree_scan import (
+    ORCHESTRATOR_SRC_DIR,
+    TESTS_DIR,
+    TREE_PASS_XDIST_GROUP,
+    ParsedModule,
+    TreeAnalysis,
+    TreePass,
+    python_files,
+)
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+import orchestrator.merge_lane as merge_lane
+import orchestrator.merge_lane.worker as mq
+
+# The family mark and shared group: shared/src/shared/whole_tree_guard_family.py::WHOLE_TREE_SCAN_TEST_TIMEOUT, _tree_scan.py.
+pytestmark = [
+    pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT),
+    pytest.mark.xdist_group(TREE_PASS_XDIST_GROUP),
+]
+
+_RETIRED_CLASS = 'MergeWorker'
+_TESTS_DIR = TESTS_DIR
+_SRC_DIR = ORCHESTRATOR_SRC_DIR
+
+#: Anti-vacuity floors, one per swept tree (630 test files and 155 source
+#: files today): a sweep that silently reads nothing must fail rather than
+#: report a clean tree.
+_MIN_EXPECTED_FILES = {_TESTS_DIR: 400, _SRC_DIR: 100}
 
 
-def test_serial_reference_fixture_available() -> None:
-    """The relocated serial reference is importable and shape-compatible.
+def _defines_retired_class(source: str) -> bool:
+    """Whether *source* defines a class named ``MergeWorker`` at any depth.
 
-    Asserts the test-local ``_serial_merge_worker.MergeWorker``:
-      - is importable by bare module name (flat orchestrator/tests/ convention)
-      - subclasses ``orchestrator.merge_queue._WipHaltMixin``
-      - constructs with the historical signature
-        ``MergeWorker(git_ops, queue, event_store=None)``
-      - exposes the serial-worker surface the ported tests rely on
-      - carries the historical MAX_POST_MERGE_VERIFY_* class constants
+    A mention in a comment or docstring is not a definition.
     """
-    from _serial_merge_worker import MergeWorker
+    return _defines_retired_class_in(ast.parse(source))
 
-    assert issubclass(MergeWorker, mq._WipHaltMixin), (
-        'MergeWorker must still inherit the shared halt-state-machine mixin'
+
+def _defines_retired_class_in(tree: ast.Module) -> bool:
+    return any(
+        isinstance(node, ast.ClassDef) and node.name == _RETIRED_CLASS
+        for node in ast.walk(tree)
     )
 
-    git_ops = MagicMock()
-    worker = MergeWorker(git_ops, asyncio.Queue(), event_store=None)
 
-    for attr in ('_dequeue', '_process', '_do_merge', '_urgent', '_queue'):
-        assert hasattr(worker, attr), (
-            f'MergeWorker fixture is missing serial-worker surface: {attr!r}'
-        )
-
-    assert MergeWorker.MAX_POST_MERGE_VERIFY_TIMEOUTS == 2
-    assert MergeWorker.MAX_POST_MERGE_VERIFY_ENOSPC_RETRIES == 1
+def _retired_class_defined(module: ParsedModule) -> bool:
+    """:func:`_defines_retired_class` over *module*, parsing it only if it can name the class."""
+    return module.may_name(_RETIRED_CLASS) and _defines_retired_class_in(module.tree)
 
 
-def test_merge_worker_absent_from_production() -> None:
-    """The serial class is gone from production — moved, not vanished.
+ANALYSIS = TreeAnalysis(
+    name=Path(__file__).stem,
+    files=lambda: python_files(_TESTS_DIR, _SRC_DIR),
+    extract=_retired_class_defined,
+)
+TREE_ANALYSES = (ANALYSIS,)
 
-    Structural runtime invariant (not a docstring/annotation meta-test):
-    grep showing no MergeWorker class in orchestrator/src is the task's
-    headline user-observable signal; this guard turns it into a durable
-    regression barrier against re-introduction.
-    """
-    assert not hasattr(mq, 'MergeWorker'), (
-        'MergeWorker must be removed from the production orchestrator.merge_queue '
-        'module — the serial reference now lives only in tests/_serial_merge_worker.py'
+
+def test_the_lane_facade_exports_the_production_worker() -> None:
+    assert merge_lane.MergeLane is mq.SpeculativeMergeWorker
+
+
+def test_detector_sees_a_definition_and_not_a_mention() -> None:
+    assert _defines_retired_class('class Outer:\n    class MergeWorker:\n        pass\n')
+    assert not _defines_retired_class(
+        '"""Once there was a class MergeWorker here."""\n'
+        '# class MergeWorker(_WipHaltMixin): was its header\n'
+        'class SpeculativeMergeWorker:\n    pass\n'
     )
 
-    import _serial_merge_worker
 
-    assert _serial_merge_worker.MergeWorker is not None, (
-        'the serial reference must still exist as a test-local fixture — '
-        'it moved, it did not vanish'
+def test_sweep_sees_a_compatibility_spelling_the_parser_normalizes(tmp_path: Path) -> None:
+    """``class ＭergeWorker`` defines ``MergeWorker``, so the sweep must not skip the file unparsed."""
+    path = tmp_path / 'copy.py'
+    path.write_text('class ＭergeWorker:\n    pass\n', encoding='utf-8')
+
+    assert _retired_class_defined(ParsedModule(path))
+
+
+def test_no_copy_of_the_serial_worker_anywhere(tree_pass: TreePass) -> None:
+    defines_retired_class = tree_pass.facts(ANALYSIS)
+    for root, floor in _MIN_EXPECTED_FILES.items():
+        swept = [path for path in defines_retired_class if path.is_relative_to(root)]
+        assert len(swept) >= floor, f'swept only {len(swept)} files under {root}'
+    copies = [path.as_posix() for path, defines in defines_retired_class.items() if defines]
+    assert copies == [], (
+        f'a serial MergeWorker is defined again in {copies}. Drive the '
+        'production lane instead: make_lane / merge_through_lane in '
+        '_merge_lane_fakes.py.'
     )
-
-    # Smoke: harness.py must still import cleanly after the union/import
-    # simplification (TYPE_CHECKING import, annotation, casts, docstring).
-    import orchestrator.harness  # noqa: F401

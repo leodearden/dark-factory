@@ -26,11 +26,14 @@ git_ops.py/warm_lane_pool.py only if end-to-end composition surfaces a defect.
 from __future__ import annotations
 
 import asyncio
+import shutil
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _git_fixtures import seed_repo
+from _seed_script_stubs import seed_default_warm_base
 
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import (
@@ -41,8 +44,10 @@ from orchestrator.git_ops import (
     _run,
 )
 from orchestrator.harness import Harness, TaskReport
-from orchestrator.merge_queue import _classify_branch_presence
+from orchestrator.lane_lifecycle import LANE_STATE_DIRNAME
+from orchestrator.merge_lane.worker import _classify_branch_presence
 from orchestrator.scheduler import TaskAssignment
+from orchestrator.slot_lease import SlotLease
 from orchestrator.warm_lane_pool import LaneState
 from orchestrator.workflow import WorkflowOutcome
 
@@ -51,37 +56,11 @@ from orchestrator.workflow import WorkflowOutcome
 # ---------------------------------------------------------------------------
 
 
-async def _init_repo(repo: Path) -> None:
-    await _run(['git', 'init', '-b', 'main'], cwd=repo)
-    await _run(['git', 'config', 'user.email', 'test@test.com'], cwd=repo)
-    await _run(['git', 'config', 'user.name', 'Test'], cwd=repo)
-    (repo / 'README.md').write_text('# Test\n')
-    await _run(['git', 'add', '-A'], cwd=repo)
-    await _run(['git', 'commit', '-m', 'Initial commit'], cwd=repo)
-
-
 @pytest.fixture
 def ig_git_repo(tmp_path: Path) -> Path:
     """Temporary git repo with an initial commit for integration-gate tests."""
-    repo = tmp_path / 'repo'
-    repo.mkdir()
-    asyncio.run(_init_repo(repo))
-    # Task 2061: pre-create the DEFAULT derived warm-lane base
-    # (<repo>/.worktrees/_merge-verify/target, non-empty) so the
-    # acquire_warm_lane pre-acquire base-health gate sees WarmBaseHealth.OK
-    # for this file's tests, which exercise OTHER acquire_warm_lane/
-    # create_worktree behavior (recycle/exhausted/fault/disk-pressure/omega)
-    # via stub scripts that ignore the base path entirely — mirrors the same
-    # fix in test_warm_lane_pool.py's wl_git_repo fixture.
-    default_base = repo / '.worktrees' / '_merge-verify' / 'target'
-    default_base.mkdir(parents=True, exist_ok=True)
-    (default_base / '.keep').write_text('warm base sentinel\n')
-    # Task 2099: mark pool storage present so the NEW mount-presence guard on
-    # prune_worktrees/_run_warm_lane_gc_reclaim/acquire create-once does not
-    # false-trip in this file's tests, which simulate an already-running
-    # warm-lane host (disk pressure / recycle / exhaustion presuppose prior
-    # lane usage) — an orthogonal concern to whether the mount is present.
-    (repo / '.worktrees' / '.pool-root').touch()
+    repo = seed_repo(tmp_path / 'repo')
+    seed_default_warm_base(repo)
     return repo
 
 
@@ -326,7 +305,7 @@ async def _run_synthetic_hard_cancel_slot(
             modules=[],
         )
         sem = asyncio.Semaphore(1)
-        return await harness._run_slot(assignment, sem)
+        return await harness._run_slot(assignment, SlotLease(assignment.task_id, harness.scheduler, sem))
 
 
 # ===========================================================================
@@ -450,6 +429,49 @@ class TestThinRecycle:
             f'found {cold_b}'
         )
 
+    async def test_recycle_runs_no_rmtree_on_the_event_loop_thread(
+        self, ig_git_repo: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A recycle deletes its prior target/ without blocking the loop (task 7366)."""
+        await _add_all_warm_lane_scripts(ig_git_repo)
+        config = _make_config()
+        git_ops = GitOps(config, ig_git_repo, warm_lane_pool_size=1)
+
+        info_a = await git_ops.create_worktree('A')
+        assert isinstance(info_a, WorktreeInfo)
+        lane_path = info_a.path
+        bloat = lane_path / 'target' / 'bloat.bin'
+        deps = lane_path / 'target' / 'deps'
+        deps.mkdir(parents=True, exist_ok=True)
+        bloat.write_bytes(b'\xde\xad\xbe\xef' * 64)
+        for index in range(5):
+            (deps / f'lib{index}.rlib').write_bytes(b'\x00' * 32)
+        assert git_ops.warm_lane_pool is not None
+        await git_ops.warm_lane_pool.release(lane_path)
+
+        real_rmtree = shutil.rmtree
+        on_loop: list[Path] = []
+
+        def recorder(path: Any, *args: Any, **kwargs: Any) -> None:
+            try:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                pass
+            else:
+                on_loop.append(Path(path))
+            real_rmtree(path, *args, **kwargs)
+
+        monkeypatch.setattr(shutil, 'rmtree', recorder)
+        info_b = await git_ops.create_worktree('B')
+
+        assert isinstance(info_b, WorktreeInfo)
+        assert info_b.path == lane_path
+        assert not bloat.exists()
+        assert on_loop == [], (
+            'the event loop thread ran a recursive delete during a warm-lane '
+            f'recycle (task 7366): {[str(p) for p in on_loop]}'
+        )
+
 
 # ===========================================================================
 # Step-3 / Step-4: Behavior 2 — pool bounded → REQUEUE + ZERO cold worktrees (β)
@@ -540,13 +562,13 @@ class TestPoolBoundedExhausted:
         # .lane-state is the W11-gamma durable lifecycle-record directory —
         # an expected metadata band (not a worktree, cold or otherwise),
         # written as a side effect of the successful acquire above.
-        lane_state_dirname = git_ops._lane_lifecycle.state_dir.name
         non_pool_dirs = [
             d for d in dirs
-            if not d.startswith('_lane-') and d not in ('_merge-verify', lane_state_dirname)
+            if not d.startswith('_lane-')
+            and d not in ('_merge-verify', LANE_STATE_DIRNAME)
         ]
         assert non_pool_dirs == [], (
-            f'Only _lane-*, _merge-verify, and {lane_state_dirname} dirs expected; '
+            f'Only _lane-*, _merge-verify, and {LANE_STATE_DIRNAME} dirs expected; '
             f'found extra dirs (cold worktrees?): {non_pool_dirs}'
         )
 
@@ -1408,8 +1430,8 @@ class TestOmegaLiveRequeueReuseGate:
       is 0-beyond-main, so α's _branch_has_commits_beyond_main deletes it, and
       merge_to_main → resolve_queued_branch_ref hits unknown_branch.
 
-    With the step-4 fix (_reuse_warm_lane calls rebind_branch_to_head after
-    rebase_onto_main):
+    With the step-4 fix (_reuse_warm_lane leaves the lane attached, with
+    refs/heads/task/<id> equal to the lane HEAD):
       Phase 0 — create_worktree(id); write .task/plan.json {"task_id": id}
                  (forces disk-backstop reuse route 2); commit WIP (n>0 beyond
                  main); advance main so pre-detach tip falls to 0-beyond-main.

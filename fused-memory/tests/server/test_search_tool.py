@@ -8,12 +8,17 @@ step-15 (RED) / step-16 (GREEN):
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock
+import asyncio
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _graphiti_fake import FakeGraphitiClient
 
+from fused_memory.backends.mem0_client import Mem0Backend
+from fused_memory.models.enums import SourceStore
+from fused_memory.models.memory import MemoryResult
 from fused_memory.server.tools import create_mcp_server
-from fused_memory.services.memory_service import SearchResults
+from fused_memory.services.memory_service import MemoryService, SearchResults
 
 _PROJECT_ID = 'dark_factory'
 
@@ -150,3 +155,398 @@ class TestSearchToolDegradedSurfacing:
         assert 'degraded' not in result, (
             f"'degraded' must NOT appear when search returns a plain list, got result={result!r}."
         )
+
+
+# ---------------------------------------------------------------------------
+# Task 3129 (leaf δ) — grouped reads at the MCP `search` boundary
+#
+# step-13 (RED) / step-14 (GREEN): child records fold into their parent's
+# grouped document, and the fault-only degrade channel keeps working.
+# ---------------------------------------------------------------------------
+
+_CANONICAL_ID = '11111111-1111-4111-8111-111111111111'
+_AMEND_IDS = (
+    '22222222-2222-4222-8222-222222222221',
+    '22222222-2222-4222-8222-222222222222',
+)
+_SIGHT_IDS = (
+    '33333333-3333-4333-8333-333333333331',
+    '33333333-3333-4333-8333-333333333332',
+    '33333333-3333-4333-8333-333333333333',
+)
+
+
+def _hit(memory_id: str, content: str, score: float, metadata: dict) -> MemoryResult:
+    return MemoryResult(
+        id=memory_id,
+        content=content,
+        source_store=SourceStore.mem0,
+        relevance_score=score,
+        metadata=metadata,
+    )
+
+
+def _service_with_a_parented_canonical(**search_kwargs) -> AsyncMock:
+    """A service whose search returns a canonical PLUS its 2+3 child records."""
+    hits = [_hit(_CANONICAL_ID, 'the canonical claim', 0.9, {'kind': 'canonical'})]
+    hits += [
+        _hit(amend_id, 'a correction', 0.8, {'parent_id': _CANONICAL_ID, 'kind': 'amendment'})
+        for amend_id in _AMEND_IDS
+    ]
+    hits += [
+        _hit(sight_id, 'seen again', 0.7, {'parent_id': _CANONICAL_ID, 'kind': 'sighting'})
+        for sight_id in _SIGHT_IDS
+    ]
+    rows = [
+        {
+            'id': amend_id,
+            'created_at': f'2026-08-0{index + 1}T00:00:00+00:00',
+            'metadata': {'data': 'a correction', 'parent_id': _CANONICAL_ID, 'kind': 'amendment'},
+        }
+        for index, amend_id in enumerate(_AMEND_IDS)
+    ]
+
+    def _count(*, project_id: str, filters: dict):
+        if filters.get('parent_id') != _CANONICAL_ID:
+            return 0
+        return {'sighting': 3, 'amendment': 2}.get(filters.get('kind', ''), 5)
+
+    def _scroll(*, project_id: str, filters: dict, limit: int = 1000):
+        return rows[:limit]
+
+    service = AsyncMock()
+    service.search = AsyncMock(return_value=SearchResults(hits, **search_kwargs))
+    service.count_memories_by_metadata = AsyncMock(side_effect=_count)
+    service.get_memories_by_metadata = AsyncMock(side_effect=_scroll)
+    return service
+
+
+class TestSearchToolGroupedReads:
+    """The leaf's SIGNAL at the MCP boundary: one grouped hit, no loose children."""
+
+    @pytest.mark.asyncio
+    async def test_children_fold_into_one_grouped_canonical_hit(self):
+        """6 raw hits (1 canonical + 2 amendments + 3 sightings) → 1 grouped result."""
+        mock_service = _service_with_a_parented_canonical()
+        server = create_mcp_server(mock_service)
+
+        result = await server._tool_manager.call_tool(
+            'search',
+            {'query': 'test query', 'project_id': _PROJECT_ID},
+        )
+
+        assert 'error' not in result, f'Unexpected error: {result!r}'
+        results = result['results']
+        assert [r['id'] for r in results] == [_CANONICAL_ID], (
+            'Child records must not appear as separate top-level hits — the '
+            f'esc-5541 shape. Got {[r["id"] for r in results]!r}. '
+            'RED: the search tool does not group yet.'
+        )
+        grouped = results[0]['grouped']
+        assert len(grouped['amendments']) == 2, f'Expected 2 digests, got {grouped!r}'
+        assert grouped['sighting_count'] == 3, f'Expected sighting_count 3, got {grouped!r}'
+
+    @pytest.mark.asyncio
+    async def test_grouping_does_not_clobber_the_degraded_channel(self):
+        """Fault-only degrade keys must survive the grouping transform (task 1812)."""
+        mock_service = _service_with_a_parented_canonical(
+            degraded=True,
+            failed_stores=['graphiti'],
+            failure_diagnostics=[{'store': 'graphiti', 'error_type': 'TimeoutError'}],
+        )
+        server = create_mcp_server(mock_service)
+
+        result = await server._tool_manager.call_tool(
+            'search',
+            {'query': 'test query', 'project_id': _PROJECT_ID},
+        )
+
+        assert result.get('degraded') is True, (
+            'SearchResults.degraded does NOT survive a list transform — the tool '
+            f'must read it BEFORE grouping. Got {result!r}'
+        )
+        assert result.get('failed_stores') == ['graphiti']
+        assert result.get('failed_store_diagnostics') == [
+            {'store': 'graphiti', 'error_type': 'TimeoutError'}
+        ]
+        assert [r['id'] for r in result['results']] == [_CANONICAL_ID]
+
+    @pytest.mark.asyncio
+    async def test_childless_results_are_byte_identical_to_today(self):
+        """Zero-child corpus (today's fleet): no grouped key anywhere."""
+        mock_service = AsyncMock()
+        plain = _hit('44444444-4444-4444-8444-444444444444', 'a plain memory', 0.5, {})
+        mock_service.search = AsyncMock(return_value=SearchResults([plain]))
+        mock_service.count_memories_by_metadata = AsyncMock(return_value=0)
+        server = create_mcp_server(mock_service)
+
+        result = await server._tool_manager.call_tool(
+            'search',
+            {'query': 'test query', 'project_id': _PROJECT_ID},
+        )
+
+        assert result['results'] == [plain.model_dump()], (
+            f'A childless result must dump exactly as today, got {result["results"]!r}'
+        )
+        assert mock_service.get_memories_by_metadata.await_count == 0, (
+            'The zero-child common path must issue no scroll'
+        )
+
+    @pytest.mark.asyncio
+    async def test_child_read_fault_is_marked_children_unavailable_on_the_hit(self):
+        """A faulted child read is CONTAINED by build_grouped_document, so the hit
+        survives carrying the explicit unavailability marker — never a silent
+        "no children" and never an error dict.
+
+        This is the fault the grouping layer handles ITSELF; the tool-level
+        fallback is exercised separately below, because nothing here reaches it.
+        """
+        mock_service = AsyncMock()
+        plain = _hit('44444444-4444-4444-8444-444444444444', 'a plain memory', 0.5, {})
+        mock_service.search = AsyncMock(return_value=SearchResults([plain]))
+        mock_service.count_memories_by_metadata = AsyncMock(
+            side_effect=TimeoutError('qdrant down')
+        )
+        server = create_mcp_server(mock_service)
+
+        result = await server._tool_manager.call_tool(
+            'search',
+            {'query': 'test query', 'project_id': _PROJECT_ID},
+        )
+
+        assert 'error' not in result, (
+            f'A grouping fault must not convert a working search into an error, got {result!r}'
+        )
+        assert [r['id'] for r in result['results']] == [plain.id]
+        assert result['results'][0]['grouped'] == {
+            'children_unavailable': True,
+            'error_type': 'TimeoutError',
+        }, (
+            'A faulted child read must be reported LOUDLY on the hit rather than '
+            f'collapsed into a silent "no children", got {result["results"][0]!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_grouping_exception_degrades_to_the_ungrouped_list(self, monkeypatch):
+        """The tool-level fallback: if grouping itself RAISES, the search still answers.
+
+        Reaching this branch requires the grouping layer's own containment to
+        fail, so it is forced here by monkeypatching the module-global the tool
+        calls — the belt-and-braces path is otherwise untestable, and untested
+        belt-and-braces is just an untested branch.
+        """
+        mock_service = AsyncMock()
+        plain = _hit('44444444-4444-4444-8444-444444444444', 'a plain memory', 0.5, {})
+        mock_service.search = AsyncMock(return_value=SearchResults([plain]))
+        mock_service.count_memories_by_metadata = AsyncMock(return_value=0)
+
+        async def _boom(*args, **kwargs):
+            raise RuntimeError('grouping exploded')
+
+        monkeypatch.setattr('fused_memory.server.tools.group_search_results', _boom)
+        server = create_mcp_server(mock_service)
+
+        result = await server._tool_manager.call_tool(
+            'search',
+            {'query': 'test query', 'project_id': _PROJECT_ID},
+        )
+
+        assert 'error' not in result, (
+            f'A raising grouping layer must not break a working search, got {result!r}'
+        )
+        assert result['results'] == [plain.model_dump()], (
+            'The fallback must be the PLAIN ungrouped list — exactly what the tool '
+            f'returned before grouping existed, got {result["results"]!r}'
+        )
+
+
+class TestSearchToolBackendReadTimeoutSurfacing:
+    """A mem0 BACKEND read timeout must reach the `search` MCP caller as a degradation.
+
+    Spans the seam the mocked tests above cannot: every existing test in this
+    file stubs `service.search` itself, so it asserts the MCP boundary's
+    MAPPING of an already-degraded SearchResults.  The defect this class guards
+    lived entirely BELOW that — `Mem0Backend.search` swallowed `TimeoutError`
+    into `{}`, `_search_mem0` read `.get('results', [])` -> `[]`, and no
+    exception ever reached `MemoryService.search`'s per-task handler.  So the
+    real `Mem0Backend` object must be in the path or the test is green before
+    the fix and could never have caught it.
+
+    INV-11 `no-silent-fail-soft`: a log is not a return value.  The swallow
+    logged a WARNING and returned a value indistinguishable from a genuinely
+    empty store — which is exactly the asymmetry the CONTRAST test below pins
+    from the other side.
+    """
+
+    @staticmethod
+    def _service(mock_config, instance_search):
+        """Real MemoryService over a REAL Mem0Backend whose mem0 instance is mocked.
+
+        Only `_get_instance` is patched — the swallow under test lives in
+        `Mem0Backend.search` itself, between that call and the service.
+        """
+        service = MemoryService(mock_config)
+        backend = Mem0Backend(mock_config)
+        backend._read_timeout = 0.05
+        instance = MagicMock()
+        instance.search = instance_search
+        service.mem0 = backend
+        # Graphiti is never selected (stores=['mem0']), but stub it so a wiring
+        # slip surfaces as a failed assertion rather than a real connection.
+        service.graphiti = MagicMock()
+        service.graphiti.search = AsyncMock(return_value=[])
+        service.graphiti.search_nodes = AsyncMock(return_value=[])
+        return service, patch.object(backend, '_get_instance', AsyncMock(return_value=instance))
+
+    @pytest.mark.asyncio
+    async def test_backend_read_timeout_surfaces_as_degraded(self, mock_config):
+        """An inner mem0 read timeout -> degraded=True, failed_stores=['mem0'],
+        and a diagnostic naming the inner variant.
+
+        `reason == 'exception'` is the INNER-vs-OUTER discriminator: an inner
+        backend read timeout arrives via `MemoryService.search`'s per-task
+        `except Exception` arm, whereas the OUTER `search_timeout_seconds`
+        fan-out deadline produces `reason == 'timeout'`.  Both carry
+        `error_type == 'TimeoutError'`, so `reason` is the only thing that
+        tells them apart.
+        """
+        service, patcher = self._service(
+            mock_config, AsyncMock(side_effect=TimeoutError('too slow'))
+        )
+        server = create_mcp_server(service)
+
+        with patcher:
+            result = await server._tool_manager.call_tool(
+                'search',
+                {'query': 'q', 'project_id': _PROJECT_ID, 'stores': ['mem0']},
+            )
+
+        assert result.get('degraded') is True, (
+            f"a swallowed backend read timeout left the response CLEAN; expected "
+            f"degraded=True, got result={result!r}"
+        )
+        assert result.get('failed_stores') == ['mem0'], (
+            f"expected failed_stores == ['mem0'], got {result.get('failed_stores')!r}"
+        )
+        diagnostics = result.get('failed_store_diagnostics')
+        assert diagnostics, f'expected a non-empty failed_store_diagnostics, got {diagnostics!r}'
+        assert len(diagnostics) == 1, f'expected exactly one diagnostic, got {diagnostics!r}'
+        diag = diagnostics[0]
+        assert diag.get('store') == 'mem0', f'got {diag!r}'
+        assert diag.get('error_type') == 'TimeoutError', f'got {diag!r}'
+        assert diag.get('reason') == 'exception', (
+            "inner backend read timeout must arrive via the per-task exception arm "
+            f"(reason='exception'), not the outer fan-out deadline; got {diag!r}"
+        )
+        assert 'timed out' in (diag.get('error') or ''), (
+            "the diagnostic's error text must name the read timeout — asyncio.wait_for's "
+            f"own TimeoutError stringifies EMPTY; got {diag!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_genuinely_empty_store_stays_clean(self, mock_config):
+        """CONTRAST: a store that promptly returns no results stays CLEAN.
+
+        The other half of the acceptance — an empty store and a timed-out store
+        must remain DISTINGUISHABLE.  Asserting the fault path alone would
+        leave fault-only loudness unpinned, so this is the test that fails if
+        the fix ever makes the clean path noisy.  Green both before and after.
+        """
+        service, patcher = self._service(
+            mock_config, AsyncMock(return_value={'results': []})
+        )
+        server = create_mcp_server(service)
+
+        with patcher:
+            result = await server._tool_manager.call_tool(
+                'search',
+                {'query': 'q', 'project_id': _PROJECT_ID, 'stores': ['mem0']},
+            )
+
+        assert result.get('results') == [], f'expected no results, got {result!r}'
+        for key in ('degraded', 'failed_stores', 'failed_store_diagnostics'):
+            assert key not in result, (
+                f"{key!r} must NOT appear on a genuinely-empty (non-degraded) "
+                f'response, got result={result!r}'
+            )
+
+
+class _HangingSearchGraphitiClient(FakeGraphitiClient):
+    """A graphiti_core stand-in whose ``search`` never returns — a slow upstream."""
+
+    async def search(self, **kwargs):
+        await asyncio.Event().wait()
+
+
+class TestSearchToolGraphitiReadTimeoutSurfacing:
+    """A GRAPHITI backend read timeout must reach the `search` MCP caller as a degradation.
+
+    The Graphiti twin of TestSearchToolBackendReadTimeoutSurfacing (task 5699).
+    `GraphitiBackend.search` swallowed its own `TimeoutError` into `[]`, so the
+    real backend has to be in the path: a `TimeoutError` side_effect stubbed
+    onto `service.graphiti.search` would be green before the fix.  The backend
+    read budget is set through the public config seam, below the YAML outer
+    `search_timeout_seconds`, so the inner budget is the one that fires.
+    """
+
+    @staticmethod
+    def _service(mock_config, make_backend_over_fake_graphiti, fake):
+        mock_config.queue.backend_read_timeout_seconds = 0.05
+        service = MemoryService(mock_config)
+        service.graphiti = make_backend_over_fake_graphiti(mock_config, fake)
+        # Mem0 is never selected (stores=['graphiti']), but stub it so a wiring
+        # slip surfaces as a failed assertion rather than a real Qdrant call.
+        service.mem0 = MagicMock()
+        service.mem0.search = AsyncMock(return_value={'results': []})
+        return service
+
+    @staticmethod
+    async def _search_graphiti(service):
+        return await create_mcp_server(service)._tool_manager.call_tool(
+            'search',
+            {'query': 'q', 'project_id': _PROJECT_ID, 'stores': ['graphiti']},
+        )
+
+    @pytest.mark.asyncio
+    async def test_backend_read_timeout_surfaces_as_degraded(
+        self, mock_config, make_backend_over_fake_graphiti,
+    ):
+        """An inner Graphiti read timeout -> degraded=True, failed_stores=['graphiti'],
+        and one diagnostic whose `reason == 'exception'` marks the INNER budget."""
+        service = self._service(
+            mock_config, make_backend_over_fake_graphiti, _HangingSearchGraphitiClient(),
+        )
+
+        result = await self._search_graphiti(service)
+
+        assert result.get('degraded') is True, (
+            f'a swallowed Graphiti read timeout left the response CLEAN; got {result!r}'
+        )
+        assert result.get('failed_stores') == ['graphiti'], f'got {result!r}'
+        diagnostics = result.get('failed_store_diagnostics')
+        assert diagnostics and len(diagnostics) == 1, f'got {diagnostics!r}'
+        diag = diagnostics[0]
+        assert diag.get('store') == 'graphiti', f'got {diag!r}'
+        assert diag.get('error_type') == 'TimeoutError', f'got {diag!r}'
+        assert diag.get('reason') == 'exception', (
+            'the inner backend read timeout must arrive via the per-task exception '
+            f"arm (reason='exception'), not the outer fan-out deadline; got {diag!r}"
+        )
+        assert 'Graphiti search timed out' in (diag.get('error') or ''), f'got {diag!r}'
+
+    @pytest.mark.asyncio
+    async def test_genuinely_empty_store_stays_clean(
+        self, mock_config, make_backend_over_fake_graphiti,
+    ):
+        """CONTRAST: a Graphiti store with no edges answers promptly and stays CLEAN."""
+        service = self._service(
+            mock_config, make_backend_over_fake_graphiti, FakeGraphitiClient(),
+        )
+
+        result = await self._search_graphiti(service)
+
+        assert result.get('results') == [], f'expected no results, got {result!r}'
+        for key in ('degraded', 'failed_stores', 'failed_store_diagnostics'):
+            assert key not in result, (
+                f'{key!r} must NOT appear on a genuinely-empty response, got {result!r}'
+            )

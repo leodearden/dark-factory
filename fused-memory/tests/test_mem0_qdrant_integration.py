@@ -10,10 +10,11 @@ Skip automatically when Qdrant is not reachable.
 from __future__ import annotations
 
 import contextlib
+import uuid
 from typing import cast
 
 import pytest
-from _fm_helpers import QDRANT_URL, ensure_fresh_collection, qdrant_skipif
+from _fm_qdrant_live import QDRANT_URL, ensure_fresh_collection, qdrant_skipif
 from qdrant_client import QdrantClient
 from qdrant_client.models import Distance
 
@@ -93,6 +94,76 @@ class TestPointStructCompat:
         # Vector unchanged
         assert result[0].vector is not None
         assert len(result[0].vector) == VECTOR_DIM
+
+
+class TestPayloadPrimitivesPreserveIdentity:
+    """Live round-trip: all three payload primitives preserve id + created_at.
+
+    Task 3088's metadata-only arms exist so tagging a record does NOT re-embed
+    or perturb its identity. Asserted here against a REAL Qdrant, because the
+    unit tests can only prove which client method was called, not that the
+    server actually leaves the point id and created_at alone.
+    """
+
+    CREATED_AT = '2026-01-01T00:00:00+00:00'
+
+    def _seed(self, qdrant: QdrantClient, test_collection: str):
+        from qdrant_client.models import PointStruct
+
+        qdrant.upsert(
+            collection_name=test_collection,
+            points=[PointStruct(id=1, vector=[0.1] * VECTOR_DIM, payload={
+                'data': 'original', 'created_at': self.CREATED_AT,
+                'kind': 'canonical', 'src_project': 'reify',
+            })],
+        )
+
+    def _payload(self, qdrant: QdrantClient, test_collection: str) -> dict:
+        result = qdrant.retrieve(test_collection, ids=[1], with_payload=True)
+        assert len(result) == 1, f'point id not preserved: {result!r}'
+        assert result[0].id == 1
+        return cast(dict, result[0].payload)
+
+    def test_set_payload_merges_and_preserves_created_at(
+        self, qdrant: QdrantClient, test_collection: str,
+    ):
+        self._seed(qdrant, test_collection)
+        qdrant.set_payload(
+            collection_name=test_collection, payload={'topic': 'cluster-a'}, points=[1],
+        )
+        payload = self._payload(qdrant, test_collection)
+        assert payload['topic'] == 'cluster-a'
+        assert payload['created_at'] == self.CREATED_AT
+        # A genuine storage-layer partial merge: unlisted keys survive.
+        assert payload['kind'] == 'canonical'
+        assert payload['src_project'] == 'reify'
+
+    def test_delete_payload_removes_only_named_keys(
+        self, qdrant: QdrantClient, test_collection: str,
+    ):
+        self._seed(qdrant, test_collection)
+        qdrant.delete_payload(collection_name=test_collection, keys=['kind'], points=[1])
+        payload = self._payload(qdrant, test_collection)
+        assert 'kind' not in payload
+        assert payload['created_at'] == self.CREATED_AT
+        assert payload['src_project'] == 'reify'
+
+    def test_overwrite_payload_replaces_whole_payload(
+        self, qdrant: QdrantClient, test_collection: str,
+    ):
+        self._seed(qdrant, test_collection)
+        # overwrite_payload replaces the WHOLE payload -- created_at survives
+        # only because it is re-attached, which is exactly why the service's
+        # replace arm must read-modify-write rather than write blind.
+        qdrant.overwrite_payload(
+            collection_name=test_collection,
+            payload={'data': 'original', 'created_at': self.CREATED_AT, 'topic': 'cluster-b'},
+            points=[1],
+        )
+        payload = self._payload(qdrant, test_collection)
+        assert payload['created_at'] == self.CREATED_AT
+        assert payload['topic'] == 'cluster-b'
+        assert 'kind' not in payload, 'overwrite must not silently retain dropped keys'
 
 
 class TestMem0VectorStoreUpdate:
@@ -185,3 +256,28 @@ class TestMem0VectorStoreUpdate:
         assert len(result[0].vector) == VECTOR_DIM
         assert result[0].payload is not None
         assert result[0].payload['v'] == '2'
+
+
+class TestUuidPointIdCasing:
+    """``reconciliation/citation_verifier.py::make_memory_resolver`` keys its
+    memo on the lowercase rendering of an ``is_full_uuid`` id. That is sound
+    only because Qdrant resolves a canonical UUID point id case-insensitively,
+    a store property no mock can pin."""
+
+    def test_canonical_uuid_point_id_resolves_in_any_casing(
+        self, qdrant: QdrantClient, test_collection: str,
+    ):
+        from qdrant_client.models import PointStruct
+
+        pid = str(uuid.uuid4())
+        qdrant.upsert(
+            collection_name=test_collection,
+            points=[PointStruct(id=pid, vector=[0.1] * VECTOR_DIM, payload={'data': 'x'})],
+        )
+        mixed = ''.join(c.upper() if i % 2 else c for i, c in enumerate(pid))
+
+        for spelling in (pid, pid.upper(), mixed):
+            records = qdrant.retrieve(
+                test_collection, ids=[spelling], with_payload=True, with_vectors=False,
+            )
+            assert [str(r.id) for r in records] == [pid], spelling

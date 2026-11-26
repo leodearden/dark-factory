@@ -1,0 +1,978 @@
+# Tool-call markup containment — blanket guard, deterministic repair, retro-sweep
+
+**Status:** active · 2026-08-05 · approach **B + H** (contracts + two-way boundary tests)
+
+**Successor to:** DF **3083** (done, merged `7899eef17b` — root cause, `scan_memory_content`, Mem0 corpus sweep) and DF **3141** (done, merged `da94baf14a` — the write-time tripwire at four fused-memory boundaries). Both succeeded at what they scoped. This PRD owns what neither did: the **blast radius outside fused-memory**, the **deterministic repair** of the corruption, and the **retro-sweep of the stores that were never guarded**.
+
+**Excluded by operator decision (2026-08-05):** model routing changes. The corruption is ~17× more frequent on `opus` than `sonnet`, but re-routing architect-class roles is not part of this PRD.
+
+---
+
+## 1. Goal (G1 consumer + user-observable surface)
+
+> **Every MCP tool call carrying leaked tool-call envelope markup is detected at a single blanket guard, deterministically repaired against the tool's own schema, and either bounced back to the caller with the repaired call in hand or forwarded with a loud structured fact — and the records already corrupted are repaired in place, atomically.**
+
+Named consumers, one per mechanism (G1):
+
+| Mechanism | Consumer |
+|---|---|
+| `shared.toolcall_markup` (detector + repairer + schema validator) | `MarkupGuardMiddleware` (β), the retro-sweep (δ), plan-tools lazy write-back (ε) |
+| `MarkupGuardMiddleware` | the four FastMCP servers registered in γ |
+| repair-and-reject error payload | the calling agent — it re-issues the repaired call |
+| repair-and-forward + `markup_repaired` fact | the operator (journal/structured fact) and the filed escalation/verdict record |
+| residue escalation | the L2 escalation-watcher (existing consumer, `escalation/data/escalations`) |
+| retro-sweep script | the operator, run once against terminal state |
+| plan-tools lazy write-back | architects and reviewers reading `plan.json` |
+
+User-observable surface: a `submit_task` whose description carries a mis-closed `</description>` is rejected with an error **containing the fully repaired call including the recovered `priority`**, instead of today's bare "strip the fragment and resubmit"; an `escalate_info` with the same defect **lands with its `suggested_action` intact** instead of being lost; and `add_design_decision` stops writing corrupted rationales into `plan.json`.
+
+---
+
+## 2. Background — evidence (why this PRD exists)
+
+Root-caused 2026-08-05 from esc-markup-tripwire-3. Measurements are reproducible from the archived agent transcripts (`data/orchestrator/agent-transcripts/` — ~4,400 `.jsonl.gz` across ~609 task dirs, 468 MB, as of 2026-08-05; the tree grows live, so re-running against a later snapshot will yield slightly larger counts).
+
+Collection predicate for the corpus, stated exactly so the numbers below are reproducible: a `tool_use` record's string-valued parameter matching `\x3c/invoke>\s*$` **or** `\x3c/[A-Za-z_]\w*>\s*\x3cparameter\s+name="[^"]+">`.
+
+### 2.1 The mechanism — one defect, not two
+
+The model emits a parameter's **closing** tag in the wrong dialect — `</description>`, `</content>`, `</rationale>` (echoing the parameter *name*) instead of `</parameter>` — and frequently continues the remaining parameters in that same wrong dialect. The harness parser does not find its expected closer, **over-consumes** to the next available terminator (a later well-formed `</parameter>`, else `</invoke>`), dumps everything into the current parameter's value, and **silently drops every parameter in between**.
+
+Four specimens with the parsed input visible:
+
+| Call | Value tail (as parsed) | Keys received | Dropped |
+|---|---|---|---|
+| `submit_task` 07-30T16:47Z | `…direction.</description>\n<priority>medium</priority>\n<agent_id>…</agent_id>\n<metadata">{…}</metadata">\n</invoke>` | `project_root, title, description` | **priority, agent_id, metadata** |
+| `submit_task` 08-04T12:13Z | `…automatically).</description>\n<parameter name="priority">low` | no `priority` | **priority** (intended `low`) |
+| `add_memory` 08-04T16:58Z | `…by design.</content>\n</invoke>` | all | none (`content` was last) |
+| `update_memory` 08-02T21:26Z | `…scoped).</parameter>\n<parameter name="agent_id">escalation-watcher-l2` | no `agent_id` | **agent_id** — boundary is **ungated**, so it landed |
+
+Specimen 1's `<metadata">` is a literal dialect blend — the model interpolating between `<parameter name="X">` and `<X>`.
+
+### 2.2 The "second mechanism" was a pattern-coverage artifact
+
+`MCP_MARKUP_PATTERNS = ('</content>', '<parameter name=', '</invoke>')` and `find_markup_pattern` reports the **earliest-position** match. A mis-closed `content` reports its own tag; a mis-closed `description`/`details` cannot, because `</description>` is not in the list — so the guard reports whatever follows: `<parameter name=` on partial drift, `</invoke>` on total drift. `PREFILTER_NEEDLES` in `fused_memory/utils/toolcall_xml_leak.py` *does* list all four closers while `MCP_MARKUP_PATTERNS` lists one; that divergence is what made the diagnostic ambiguous. **INV-5 hit — this PRD consolidates them.**
+
+**The SAME defect class, one layer down — found and closed 2026-08-25 (task 4696).** Consolidating the two lists left a *fixed* six-literal union, and `detect()` scanned only that. Meanwhile `repair()` was already **parameter-aware**: it matches any `\x3c/NAME>` and qualifies a candidate iff `NAME` is the parameter being repaired, is in the invoked tool's `schema_params`, or is `parameter`. So plan-tools' own parameter names — `rationale`, `how`, `decision`, `what` — were **structurally invisible to the detector while being fully repairable by the repairer**. Every gate asked the detector first, so the repairer never got the chance. That is exactly this section's narrative repeated at the next layer: a coverage artifact of an enumeration, mistaken for the absence of damage. The fix adds one named predicate, `detect_for(value, param, schema_params)`, over the *same* single enumeration — no second list (INV-5) — and points all five gates plus `repair()`'s own internal prefix check at it.
+
+### 2.3 Blast radius — fused-memory is 29% of it
+
+334 corrupted calls / 128,066 tool calls = **0.26%**. The guard covers only the fused-memory column:
+
+| Server | Corrupted calls | Guarded today |
+|---|---|---|
+| orchestrator/plan-tools | 198 (59.3%) | **no** |
+| fused-memory | 96 (28.7%) | 4 of 6 write tools |
+| orchestrator/verdict-tools | 19 (5.7%) | **no** |
+| escalation | 18 (5.4%) | **no** |
+| Claude Code builtins (`Agent`, `Edit`) | 3 (0.9%) | out of scope — not our servers |
+
+Top victims: `add_design_decision.rationale` (109), `add_memory.content` (90), `add_design_decision.decision` (33), `add_reuse_item.how` (33), `submit_review_verdict.summary` (19), `escalate_info.detail` (17). Within fused-memory, `update_memory` and `add_system_record` are write tools with **no gate at all**.
+
+### 2.4 Landed damage at the ungated boundaries
+
+Re-measured 2026-08-05 **split by sweep lane**, because §5 D4 routes the two lanes to different tasks. The first pass reported a combined "21 of 296 plan.json / 87 strings", which was right in total but wrong in attribution — nearly all of it is live, not terminal:
+
+| Lane | Owner | Files with corruption | Corrupted strings |
+|---|---|---|---|
+| `.worktrees-orphaned/**/.task/plan.json` (terminal) | **δ** (eager sweep) | 1 of 15 | 2 |
+| `.worktrees/**/.task/plan.json` (live) | **ε** (lazy write-back) | 22 of 270 | 91 |
+| `data/escalations/**` | **δ** (eager sweep) | 52 of 3,386 | 53 |
+
+Consequences for the decomposition: δ's *plan* work is nearly a no-op — its real payload is the escalation corpus — while **ε carries essentially all the plan.json damage**. This strengthens D4 rather than undermining it: the corruption sits precisely where a global rewrite would have had to contend with running tasks. Escalation counts drift upward as escalations are written live (51 → 52 across a few hours); treat ~50 as the figure and re-measure at sweep time.
+
+Corrupted strings include cases where `rationale` was absorbed into `decision`, so the design rationale a future architect reads is another field's text. Retained plans are a survivor sample; most worktrees are deleted post-merge, so the historical total is larger.
+
+**δ's sweep was RUN on 2026-08-19 — and had never been run before.** The script landed with task 3691 on
+2026-08-15, but its `--apply` was never invoked against production data: a dry-run on 2026-08-19 still offered
+repairs on records archived as far back as **2026-07-20**. The applied run reports `2800 files scanned · 214 strings
+detected · **29 repaired** across 27 files · 0 write failures · 0 did-not-converge`, and the verifying second run
+reports **0 repairable** — δ's own acceptance invariant. **84 strings remain permanently unrepairable** and were
+deliberately left alone; 101 more are prose quoting the sentinels (documents *about* this leak, including the plans
+of 3083, 3141, 3689 and 3697) and are correctly untouched. That ~2× documentation-vs-damage split is why the
+collection predicate must be applied *on top of* the unrepairable verdict — a bare `detect()` census roughly doubles
+the number. Per operator decision the sweep is **not** put on a timer: γ is the door-closing fix, and a recurring
+cleanup would only make an open door survivable.
+
+**Two corpora §2.4 did not enumerate, both measured 2026-08-19.** (1) `.worktrees/.task-meta/*/plan.json` — the
+durable store the live lanes symlink into — holds 1,436 plans, 61 carrying residue, of which 33 belong to lanes that
+no longer exist. Neither sweep lane reaches those: δ globs `.worktrees-orphaned/*/.task/plan.json` and exactly **one**
+orphaned lane exists. Accepted as a transient irrelevance by operator decision — dead lanes are not read. (2) Live
+plans carry **19 hard-damage strings across 16 tasks**; three of those tasks (3382, 4081 pending; 3133 blocked) are
+plans an implementer will read *next*, and ε repairs them only on the next plan-tools read.
+
+**Re-measured 2026-08-25 over `.worktrees/.task-meta/*/plan.json` (task 4696), and the corpus had GROWN.** Predicate: a closing tag whose name is a plan-tools parameter, or an invoke closer, or a parameter-open token, over `design_decisions` / `reuse` / `steps` / `prerequisites`.
+
+| | 2026-08-17 | 2026-08-25 |
+|---|---|---|
+| plans scanned | 1,553 | **1,564** |
+| plans with corruption | 78 | **79** (5.1%) |
+| corrupted entries | 429 | **444** |
+| entries the fixed literal set catches | 225 | **232** |
+| entries INVISIBLE to it | 204 | **212** (48%) |
+
+Tag census: `\x3c/rationale>` 296 · `\x3c/invoke>` 223 · `\x3c/how>` 129 · `\x3cparameter name=` 35 · `\x3c/decision>` 13 · `\x3c/content>` 7 · `\x3c/description>` 3 · `\x3c/what>` 1 · `\x3c/detail>` 1. Daily counts 08-15…08-25: 4, 5, 4, 2, 2, 2, 2, 1, 1, 3, 4 — **four corrupted on the day of measurement**.
+
+**The growth between the two readings is the finding, and it is stronger than either reading alone.** A single census cannot distinguish a live write path from a cleared backlog. Two censuses eight days apart, both rising, can: this is a write path that was still open, not residue from a closed one. **Of the 212 invisible strings, 212/212 (100%) are caught by the SELF-NAME closer alone** — the closer of the field's own holder key — and the cross-field residual is **empty**. That measurement is what licenses the middleware boundary to pass only `param` and not await a schema round-trip (D10).
+
+**§2.4's "accepted as a transient irrelevance — dead lanes are not read" note is SUPERSEDED for the live half of that corpus.** It was written when `.worktrees/.task-meta/` looked like an orphan graveyard. It is not: the meta-root **is** what live lanes symlink into, so a corrupted plan there is a plan a running task reads. The live half is repaired by ε's lazy read-back on the next plan-tools read (D4, no fleet quiesce, atomic under C3); the dead half is no longer ignored either — δ's sweep gains a `meta-plans` lane whose existing live-lane guard confines it to dead lanes by construction. The two mechanisms **partition** that corpus rather than racing over it.
+
+**Sweep hazard pinned for δ:** `docs/task-recovery-2026-05-13/worktree-inventory.json` is git-tracked, legitimately contains predicate matches, and is replicated into every worktree — a loose glob hits it ~47 times. A sloppy sweep would rewrite committed evidence.
+
+### 2.5 Containment *where installed* works — which is why the gap is the story
+
+Exhaustive scan: 21,064 Mem0 records, 41 legacy specimens, newest `2026-07-30T05:07:34Z` — **21 minutes before 3141 merged** (`da94baf14a`, 07-30 05:28:07Z). Zero new specimens in six days. The tripwire is not the problem; its *coverage* is.
+
+**Recurrence log** (live specimens observed after this PRD was written). Entries at a *gated* boundary are blocked writes — the gate holding, not landed damage. Entries at an *ungated* boundary are landed damage, and are the direct evidence for γ. A third class, *ungated + lazy read-repair* (plan-tools' boundary today), is **also landed damage at write time** — the inbound argument is ungated, so the corrupt value lands on disk — but unlike the ungated fused-memory/escalation boundaries it does not stay corrupt silently: a *subsequent* plan-tools read repairs it and writes the repaired document back, and discloses the repair on that later call's response. Damage now, convergence later, disclosure later still; see the 2026-08-16 entries below:
+
+| Observed | Boundary | Reported `matched_pattern` | Outcome |
+|---|---|---|---|
+| 2026-08-15 (task 4156, esc-4156-1) | `add_memory.content` (`procedural_knowledge`) | closing `content` tag | Rejected `McpEnvelopeMarkupWriteRejected`; immediate retry of the same semantic content landed clean (`bf93699b-35ac-4d98-a90b-55a56e5bd0d5`, `stores_written=['mem0']`). Nothing persisted corrupt. |
+| 2026-08-17 (task 4193, esc-4193-2) | `add_memory.content` (`procedural_knowledge`) — **gated** | closing `content` tag | Rejected `McpEnvelopeMarkupWriteRejected`; storm block fired at **3/3** in a 3600s window (`esc-markup-tripwire-12`). Immediate resubmission of equivalent content landed clean (`5047308d-d83b-4c31-b90b-68fe025b2664`, `stores_written=['mem0']`). Nothing persisted corrupt. |
+| 2026-08-17 (task 4193, **esc-4193-2 itself**) | `escalate_info.detail` — **ungated** | none — there is no gate at this boundary to report one | **Landed damage.** The filing that reported the row above was corrupted by the same defect. `detail` over-consumed its own closing position and absorbed both following parameters; the stored record carries `suggested_action=""` and `evidence=[]`. Confirmed by reading the record back via `get_escalation`. |
+| 2026-08-20 (task 3886, esc-3886-1) | `add_memory.content` — **gated** | closing `content` tag | Rejected `McpEnvelopeMarkupWriteRejected`; the leaked fragment was the closing `content` tag followed by the next parameter's opening tag for `category`, serialised into the tail of `content`. Immediate resubmission of the identical prose with `category` passed as a proper parameter landed clean (`7c1b0952-2813-4fbc-b6bd-3a309bb3d29f`, `stores_written=['mem0']`). Nothing persisted corrupt. **Contrast with 08-17:** the `escalate_info.detail` boundary that reported this one did NOT absorb the same failure — esc-3886-1's stored record carries a populated `suggested_action` and a 2-entry `evidence` list (confirmed by reading the record back). Same ungated boundary, same act, no landed damage — consistent with §2.5's "transient for that call pair" reading rather than a payload property. |
+
+The 08-17 pair is the sharpest evidence in this document for the coverage thesis, because both halves occurred in the **same act**: the gated `add_memory.content` boundary blocked the corrupt write and the clean resubmission landed, while the ungated `escalate_info.detail` boundary silently absorbed the identical failure shape *in the very filing that reported it* — dropping exactly the parameter §2.6 already ranks among the most-lost (`escalate_info.suggested_action` ×13). The filing agent could not have noticed: it never reads its own record back. Two consequences worth carrying into γ. First, this specimen would have been caught had the boundary been gated — its dialect is the well-formed `</parameter>` closer followed by the next parameter's opening tag, and that opening-tag literal is already in `MCP_MARKUP_PATTERNS` (§2.2). Second, it is landed damage now sitting in `data/escalations/**`, i.e. δ's sweep lane, which is one more specimen than the ~50 §2.4 measured. Neither number needs editing — §2.4 already says to re-measure at sweep time.
+
+The 08-15 entry is consistent with §2.1: `add_memory.content` remains the single most-hit fused-memory parameter (90 of 96), the leak was **transient for that call pair** rather than a property of the payload text, and the gated boundary behaved exactly as designed. It is evidence for the *coverage* thesis, not against the tripwire — the ungated boundaries in §2.3 would have absorbed the same specimen silently.
+
+**Recurrence log continued (2026-08-16 → 2026-08-20).** This backlog of accumulated recurrence datapoints is consolidated here in a single append so the log stays current through 2026-08-20. Reading note: the two tables below are grouped by source record — the order each sweep landed in this document — not sorted by observed date. The 2026-08-16 table immediately below is positioned after the original log's 2026-08-20 row (esc-3886-1, above) even though 08-16 is the earlier calendar date; the second 2026-08-20 table further below adds two more specimens from a separate, later escalation. Check each row's own Observed column rather than assuming date order across tables.
+
+Datapoints swept from task 4107's info-note **esc-4107-1** (filed 2026-08-16 by 4107's architect, resolved the same day by 4107's steward, per the note's own suggested action — *"fold into plans/toolcall-markup-containment-prd.md as a recurrence datapoint; no action needed on task 4107"*):
+
+| Observed | Boundary | Reported `matched_pattern` | Outcome |
+|---|---|---|---|
+| 2026-08-16 (task 4107 architect planning session, esc-4107-1) | `add_design_decision.rationale` (plan-tools) — **ungated + lazy read-repair** | the invoke closer (misclose: the `rationale` closing tag) | Three consecutive calls, each landing its corrupt `rationale` on disk unguarded, then repaired by the *next* call's `_read_plan_repaired` and disclosed on **that** later response under `markup_repairs` (outcome "repaired", collection `design_decisions`, index 0/1/2 — the index advancing across calls is the lag itself: call N reports the repair of call N−1's record). **The write lands corrupt and is repaired lazily**, not clean-on-arrival. |
+| 2026-08-16 (task 4107 architect planning session, esc-4107-1) | `add_memory.content` (fused-memory) — **gated** | closing `content` tag | Rejected `McpEnvelopeMarkupWriteRejected`; a verbatim resubmit landed clean (memory `62a1d125-65c1-404f-8642-3fdc0e201e5b`, `stores_written=['mem0']`). Nothing persisted corrupt. |
+
+Four recurrences total, in one session (note filed 2026-08-16T04:48:24Z, resolved 2026-08-16T13:49:05Z by claude-task-4107-steward; observations at HEAD=`14da8a8023`). The note records two observations of its own, both carried forward here: the leak is not confined to one server or one param name — it followed the same caller across servers inside a single session — and the two servers handle it inconsistently (plan-tools accepts the corrupt write and repairs it on a later read, reporting the repair on that later response; fused-memory rejects up front, so the write is lost until resubmitted), which a caller cannot predict.
+
+The two 2026-08-19 recurrences the task spec attributed to esc-4107-1 cannot be traced to that record: esc-4107-1 was filed *and* resolved entirely on 2026-08-16, and contains no 08-19 observation. What the archive holds for 2026-08-19 is two storm-tripwire firings — esc-markup-tripwire-18 (18:39:03Z) and -20 (20:00:43Z), each an aggregate rejected-write counter ("3 MCP writes rejected in 3600s") — each promoted to its own L2 cluster record by the escalation-watcher (esc-markup-tripwire-19 and -21 respectively, whose sole `members` entry is the firing it wraps, not an independent occurrence). All four records carry an empty `evidence` list and are attributed to no task. They corroborate the leak being live on 08-19, but are a different observation class — an aggregate counter and its cluster-promotion wrapper, not a per-boundary specimen — and are named as such here rather than tabled as two esc-4107-1 specimens.
+
+The pre-existing 2026-08-20 row above (task 3886, esc-3886-1) already satisfies this backlog's 08-20 datapoint.
+
+**Significance.** Three of the four 08-16 hits landed at a boundary outside fused-memory — plan-tools' `add_design_decision` — inside the same session as the fused-memory hit. That is direct live evidence the defect is caller-side and server-agnostic, not a fused-memory phenomenon: the §2.3 blast-radius thesis. These three are the *ungated + lazy read-repair* class named in the preamble above, and the mechanism is visible in code, not just behaviour: `_create_plan` carries an explicit comment (`orchestrator/src/orchestrator/mcp/plan_tools.py`) that guarding inbound arguments is "the write-time middleware's job" — and that middleware is registered nowhere yet (verified below). `_add_design_decision` calls `_read_plan_repaired` *first*, repairing whatever is already on disk, then appends the caller's new, **unrepaired** `rationale` and writes it — exactly the lag esc-4107-1 records (the `markup_repairs` disclosure arriving on a later call's response, not the offending one), and exactly the residue §2.4 measures as **19 hard-damage strings across 16 tasks** in live plans that "ε repairs only on the next plan-tools read".
+
+That divergence from fused-memory's reject-and-lose behaviour is the pre-γ status quo, not a newly discovered gap: §4 C2 already declares both fused-memory and plan-tools `REJECT_WITH_REPAIR`, and §9's γ2 (plan-tools, task 4457) together with γ3 (fused-memory, task 4458) are the registration leaves that make that declaration true everywhere. (esc-4107-1's own resolution — written 2026-08-16, before the 2026-08-19 three-way γ split recorded in §9 — attributed this registration work to a single task 3690; that task is now γ1, scoped to escalation/verdict-tools only, so the plan-tools/fused-memory registration it described now belongs to γ2/γ3.) Verified at HEAD by 4107's steward (esc-4107-1 resolution, paragraph 2): grepping `MarkupGuardMiddleware` / `add_middleware` across `orchestrator/src`, `escalation/src`, `fused-memory/src` and `shared/src` returns only the class definition in `shared/src/shared/mcp_markup_middleware.py` plus a docstring cross-reference in `shared/src/shared/toolcall_markup.py` — the middleware is registered on no server yet. A future reader must not re-file the inconsistent-handling observation as a fresh gap; γ2/γ3 already own it.
+
+**Additional 2026-08-20 material**, filed by the L2 escalation-watcher resolving esc-markup-tripwire-23 — Specimen 2 from its 2026-08-20T10:38 amendment, Specimen 3 from the escalation's resolution (2026-08-20T15:11:24Z, after the amendment):
+
+| Observed | Boundary | Reported `matched_pattern` | Outcome |
+|---|---|---|---|
+| 2026-08-20T10:36 (task 3886, review-fix planning session) — **Specimen 2** | `add_memory.content` — **gated** | closing `content` tag | Rejected `McpEnvelopeMarkupWriteRejected` (field=`content`, matched pattern = the closing `content` tag, per the amendment). **Two** `add_memory` calls issued in a **single parallel tool-call block** both leaked identically at the same boundary — same fragment dialect as esc-3886-1's row above (the closing `content` tag followed by the next parameter's opening tag, serialised into `content`'s tail). Both legs re-emitted clean after reordering so `content` was the **last** parameter; nothing persisted corrupt (mem0 writes `9e0184ac...`/`f3541b8e...`, truncated prefixes as given by the source amendment). |
+| 2026-08-20 (produced live while the escalation-watcher filed task 4296's follow-up ticket, resolving esc-markup-tripwire-23) — **Specimen 3** | `submit_task.description` — **gated** | the parameter opening tag | Rejected `McpEnvelopeMarkupWriteRejected`. Emission order was `project_root` / `title` / `description` / `priority` / `metadata` — `description` absorbed the following `priority` parameter's opening tag. The retry changed only the parameter order (`description` emitted **last**), kept the prose byte-identical, and landed clean; that write is what created this task's (4296's) ticket. |
+
+**Open hypothesis (not implemented or tested — documentation only): parameter order.** Two specimens above now anchor this directly. **Specimen 2**: both legs of one parallel `add_memory` batch failed together at the same boundary, and both landed clean once `content` was moved to last. **Specimen 3**: a reject-to-clean flip driven only by parameter position, with byte-identical prose — the sharpest single datapoint here, since it holds the payload constant and varies only order. A per-call transient predicts neither observation; both point toward a positional / per-serialization defect rather than a payload property.
+
+This bears on the 2026-08-20 esc-3886-1 row above, whose own conclusion is "consistent with §2.5's transient-for-that-call-pair reading rather than a payload property" — flagged here as a tension between rows rather than resolved; esc-3886-1's own recorded conclusion is left as-is. B4/§2.1's "already last, nothing dropped" observation is consistent with this reading, but it is a single retrospective row and is not the load-bearing evidence; Specimens 2 and 3 above are.
+
+Still correlational and small (n=2 in one turn; n=1 reject plus n=1 clean retry): the retry-luck confound is real — this PRD records several immediate-retry-landed-clean cases — so Specimen 3 alone does not distinguish position from retry-luck. The controlled experiment that would: compare FIRST-attempt leak rates across parameter positions, holding prose constant. Noted here as a candidate follow-up investigation, not a conclusion; no code or test changes accompany this note, and the controlled experiment itself is out of this documentation-only task's file scope — tracked separately as task 4558 ("Controlled experiment: does MCP tool-call parameter order affect envelope-markup leak rate?", filed 2026-08-20, priority low) — which is now `deferred`, coalesced into task **4896**
+along with the findings that produced the block below; the experiment itself remains undone.
+
+**Recurrence log continued (2026-08-20 → 2026-08-26) — three storm records, ONE class, callers identified.** Same
+reading note as above: this block is appended at the end of the log and its Observed dates overlap the tables before it.
+It is recorded here because the escalation store lives under `data/`, which is gitignored (`.gitignore` line 9, `/data/`),
+so the material below otherwise survives only in machine-local files; this document is version-controlled, which is the
+point of moving it here.
+
+Three `infra_issue` storm L2s — `esc-markup-tripwire-25` (wrapping `-24`), `esc-plan-tools-markup-storm-2` (wrapping
+`-1`) and `esc-markup-guard-2` (wrapping `-1`) — each carried the same instruction, *"needs the leaking caller identified
+from server logs"*, and each sat open because **a storm record cannot answer that question about itself** (see the
+instrumentation gap below). A dedicated investigation on 2026-08-25 identified all three callers; the operator ruled the
+three one class on 2026-08-27 and directed the identifications be folded here before the records are closed as one.
+
+| Storm record | Fired | Boundary / param | Caller(s) identified | How identified |
+|---|---|---|---|---|
+| `esc-markup-tripwire-25` | 2026-08-20T21:20:21Z | fused-memory `add_memory.content`; pattern = the closing `content` tag | **THREE DIFFERENT agents** — `claude-interactive-esc-3999-2` (20:28:19Z), `claude-interactive` (20:36:25Z), `claude-task-3966-architect` (21:20:21Z, the threshold-crosser, which leaked twice more at 21:20:35Z and 21:20:53Z) | Transcript corpus (`data/orchestrator/agent-transcripts/3966/…/50e7e601-….jsonl`) — the threshold-crosser's own tool result carries the storm payload verbatim (`count=3, threshold=3, window_seconds=3600`). journald had already expired. |
+| `esc-plan-tools-markup-storm-2` | 2026-08-21T16:53:02Z | plan-tools `add_design_decision.rationale`; pattern = the invoke closer, misclose = the `rationale` closing tag | **ONE agent looping** — the task-3127 architect, three rejections in 28 seconds (16:52:34.261Z / 16:52:50.302Z / 16:53:02.047Z), re-emitting the *same* design decision with reworded prose and re-leaking each time. The retry loop manufactured the storm. | Transcript corpus (`…/3127/…/f1bdca05-….jsonl`); see the by-construction note below for why the record's own instruction could not have found it. Storm payload records `outcome=rejected, project=null`. |
+| `esc-markup-guard-2` | 2026-08-25T00:21:56Z | fused-memory `add_memory.content`; pattern and misclose both = the closing `content` tag, `recovered_params=['category']` | **ONE agent** — `claude-task-3643-architect`, all three (01:21:40 / 01:21:45 / 01:21:56 BST) | journald — the only one of the three still inside the retention window when it was read |
+
+**The three "sites" are three escalation ANCHORS, not three code sites.** `markup_guard.py::_STORM_ANCHOR_TASK_ID` is
+`'markup-guard'`, and it is passed as `anchor_task_id` into
+`fused_memory/server/markup_tripwire.py::emit_markup_storm_escalation`, whose own default is
+`_ANCHOR_TASK_ID = 'markup-tripwire'` — same function, same file, same server, same process, two anchor strings.
+plan-tools is a genuinely separate server (a per-agent stdio subprocess,
+`orchestrator/src/orchestrator/mcp/markup_sink.py`), but it shares the same detector and the same middleware
+(`shared/src/shared/mcp_markup_middleware.py`, `shared/src/shared/toolcall_markup.py`). **One mechanism, three anchors.**
+A future reader must not read the anchor count as a site count, and must not treat "fixing this site" as fixing a third
+of anything — which is precisely what all three records' options lists invited.
+
+**Naming the agent does not name a bug; the premise the three records share is mis-framed.** Census over the
+fused-memory boundary, 2026-08-22 08:34 → 2026-08-25 13:15 BST: **57 detections across 34 DISTINCT `agent_id`s, max 6
+for any one**. Roles span architect / implementer / steward / recon-stage-\* / interactive; projects span dark_factory,
+reify and autopilot_video; params are `add_memory.content` (53), `submit_task.description` (3), `update_memory.reason`
+(1). The mechanism is identical throughout — §2.1's model-side dialect error (D7), surfacing at whichever *guarded*
+boundary an agent happens to hit. `esc-markup-tripwire-25`'s own window contains three unrelated agents doing the same
+thing inside 52 minutes; there was never a single leaking caller there to find.
+
+**Storm census across the whole retained journal — and the census itself decays.** Re-measured 2026-08-27 16:20 BST
+over `journalctl --user -u fused-memory.service`: **4 distinct storm events, 3 of them reify** (2026-08-24 23:30:40,
+2026-08-25 01:05:54, 2026-08-26 07:06:10 BST) and **one dark_factory** (2026-08-25 01:21:56 BST — the
+`esc-markup-guard-2` row above). Eight log lines, two per event: `shared.mcp_markup_middleware` and
+`fused_memory.server.markup_guard` each log the same storm. Zero `markup_tripwire_storm` lines survive at all. The
+2026-08-25 investigation read **5 storms, 4 of them reify** off a journal whose floor was two hours earlier; one reify
+storm has rolled off since. Both readings say the same thing, which is the point: **most storms in the retained window
+are reify's**, and a leak that reproduces under another project's orchestrator against the same shared middleware is not
+a dark_factory caller bug. That is the 34-agent census's conclusion reached a second way, and it is the load-bearing
+reason the three records are one class. Do not treat either count as durable — re-measure, and expect it to shrink.
+
+**A corollary the same census makes concrete: per-anchor dedup fragments the alarm three ways.** The dark_factory storm
+of 2026-08-25 01:21:56 filed `esc-markup-guard-1` **while `esc-markup-tripwire-24`/`-25` were already pending for the
+same project, at the same server, from the same function** — because `get_by_task` is keyed on the anchor, and the
+anchor had been renamed. One mechanism firing at a renamed anchor gets a fresh record and a fresh L2 cluster; that is
+how one defect became three L2s in the first place.
+
+**🪤 `esc-plan-tools-markup-storm-2`'s own instruction cannot be followed — by construction, not by neglect.**
+"Identify the leaking caller from server logs" returns nothing for a plan-tools storm, **ever**: plan-tools runs as a
+per-agent stdio subprocess whose stderr the CLI agent consumes, so its rejections never reach journald at all —
+**0 such lines since 2026-08-22, against 35 real plan-tools rejections in the transcript corpus over the same span**.
+Anyone following that instruction would correctly conclude "no evidence" and be wrong. That is a defect in the record's
+premise, and it is why the record sat open from 2026-08-21.
+
+**⚠️ `esc-markup-guard-2` exists in BOTH dark_factory and reify, as different records with independent id sequences.**
+dark_factory's is the 2026-08-25T00:21:56Z storm tabled above (`pending` at ruling time). reify's was filed from its own
+2026-08-24T22:30:40Z burst and was already `dismissed`; reify's sequence at that anchor runs to `esc-markup-guard-6`.
+The same collision holds for `esc-markup-tripwire-N`, `esc-plan-tools-markup-storm-N`, `esc-markup-residue-1` and
+`esc-mcp-markup-residue-1`. Escalation ids are **per-project**, and `get_escalation` resolves against whichever queue it
+is pointed at — so anyone acting on a bare markup escalation id risks operating on the wrong project's record. Always
+pair the id with its project.
+
+**journald retention is ~3 days, so any storm investigation has a ~72 h window.** Measured 2026-08-27: one boot, oldest
+`--user` entry **2026-08-24 18:22:08 BST** — it read 2026-08-24 15:16:58 BST a few hours earlier the same day, and
+2026-08-22 08:34 two days before that. The floor advances continuously; it is a rolling window, not a boot boundary.
+Both the 08-20 and 08-21 storms had outlived their logs by the time anyone read them, and only the 08-25 one was still
+journald-recoverable. The fallback is `data/orchestrator/agent-transcripts/`, which is itself retention-bounded (§11
+open question 4) and gitignored.
+
+**The instrumentation gap is the real finding, and it is why all three sat open for days.** Four parts:
+1. **The storm record captures no caller.** `emit_markup_storm_escalation` / `storm_detail` render only count /
+   threshold / window / project. All three L2s were **unanswerable from the record alone**; the per-caller data existed
+   only in a log line the record never quotes.
+2. **journald retention** (above) — the evidence for two of the three had already expired when they were read.
+3. **plan-tools rejections never reach journald** (above), so for that anchor the gap is permanent, not a retention
+   accident.
+4. **`_identity` reads only the `agent_id` / `project_root` / `project_id` *arguments*.** No plan-tools, verdict-tools
+   or escalation tool declares any of them, so those boundaries structurally log `agent_id=None project=None`.
+
+   *Minimal fix for 1 (and 3): `_record_storm` already computes a per-identity tally for the window — thread it into the
+   storm dict so `storm_detail` renders "callers in window". One change makes every future storm record self-answering
+   and removes the dependence on a log stream that, for plan-tools, does not exist.* Not a prerequisite for closing the
+   three records; tracked separately.
+
+**A pending storm record SUPPRESSES the next storm at its own anchor.** `emit_markup_storm_escalation` dedups on
+`queue.get_by_task(anchor_task_id, status='pending')`, so an open record at that anchor means the next burst files
+nothing — logged as `info` when the outcomes match and as an `ERROR` naming the suppression when they differ, the latter
+carrying the code's own hint: *"…gets no record of its own; resolve that escalation to let the next burst file."*
+Measured 2026-08-27 over the retained journal: **zero `SUPPRESSED` lines**, and zero `markup_tripwire_storm` lines for
+them to suppress — so within the window we can still see, the effect was latent here rather than realised. It is nonetheless real, it is per-anchor (which, given "one mechanism, three anchors" above, means each of the
+three was muting its own third of the alarm), and it is an independent reason to close storm records promptly instead of
+parking them for a ruling. A parked storm record is a muted alarm.
+
+**A recovered residue payload — the richest known specimen, and the first showing the leak crossing a CALL boundary.**
+From `esc-markup-residue-1` (dark_factory, `mcp_markup_residue`, filed 2026-08-26T15:31:41Z, refused at the fused-memory
+`markup-guard` boundary as **unrepairable**, since `dismissed`). Storm records carry counts but no payload; a residue
+record carries the payload, and this one is the fullest we hold — 9,347 payload chars, sha256 `ebbbd9af07698fee…`.
+The verbatim bytes are preserved machine-locally at `data/escalations/recovered/esc-markup-residue-1.payload.md`
+(**untracked** — `data/` is gitignored); read them from that file rather than reproducing them. The refused call was
+`submit_task`, field `description`, matched pattern = the closing `description` tag; the guard logged
+`agent_id=None project='/home/leo/src/dark-factory'`, attempted no repair, and wrote nothing.
+
+Shape of the absorbed tail, described rather than quoted. After the mis-closed `description` closer the value continues
+with, in order: (1) a well-formed `priority` element whose value is `low`; (2) a **malformed** `metadata` opening tag —
+carrying a stray double-quote inside the tag itself — whose value is an empty JSON object and whose closer is
+well-formed; (3) a **second** `metadata` element, this one well-formed and populated with 523 characters; (4) an
+`agent_id` element whose value is `claude-task-3128-implementer`; (5) the invoke closer; and then (6) **the opening of a
+SECOND, DIFFERENT tool call** — an invoke naming `mcp__fused-memory__search`, its `query` parameter's opening tag, and
+111 characters of that parameter's value, at which point the absorbed text ends.
+
+Two observations a fix must explain:
+
+- **(a) `metadata` was emitted twice, the first malformed.** That duplication — not the mis-closed `description` — may
+  be where serialization actually went wrong: a first attempt emitting a broken opening tag and an empty value, then a
+  correct re-emission of the same parameter. §2.1's Specimen 1 carries the identical stray-quote `metadata` blend, so
+  this is the second independent sighting of that shape; note the difference, though — in Specimen 1 *both* the opening
+  and the closing `metadata` tags carry the stray quote, whereas here only the opening does.
+- **(b) The mechanism spans CALL boundaries, not merely field boundaries.** Two adjacent tool calls were concatenated
+  into one argument. Every specimen in §2.1 stops at the invoke closer; this one runs *past* it into the next call.
+  §2.1's "over-consumes to the next available terminator" therefore understates the reach — the terminator search can
+  miss the invoke closer too, and nothing guarantees the over-consumption stops at the end of the call that produced it.
+
+Consequence for repair (§2.6, C1): `repair()` strips a trailing invoke closer and then requires the remainder to parse
+as pseudo-parameters with **zero leftover**. A tail carrying a second call's opening tags cannot satisfy that, so this
+specimen is correctly `unrepairable` and the guard refused rather than guessed — C2's never-guess branch and D5 behaving
+exactly as designed. It is a concrete, fully-preserved member of the ambiguous class §2.6 sizes at 26/334 (61/504 in the
+committed corpus), and a good candidate to add to α's fixture corpus as an `unrepairable` expectation with a
+**cross-call tail** — a shape that corpus does not currently carry.
+
+**The leak blinds the very instrumentation that would name its caller.** `_identity` reads the `agent_id` argument, and
+here `agent_id` was one of the parameters the leak absorbed — so the guard logged `agent_id=None` while the caller's own
+id, `claude-task-3128-implementer`, sat inside the preserved payload. The worse the leak, the less the record can say
+about who produced it. That is instrumentation gap 4 above with a mechanism attached, not merely an undeclared argument.
+
+**Sibling recovered payloads, also untracked.** Three more sit in the same directory, all recovered 2026-08-27 by the
+same L2 rotation's READ+RECOVER pass and none of them resolved by it:
+`esc-mcp-markup-residue-1.payload.md`, `esc-plan-tools-markup-residue-5.payload.md` and
+`esc-verdict-tools-markup-residue-1.payload.md`, alongside `markup_guard_residue-loglines-2026-08-27.log`. They are
+machine-local only; anything in them that matters must be folded into this document to survive.
+
+**Recurrence log continued (2026-08-21 → 2026-08-22) — FOUR bursts at the γ2 plan-tools boundary, in the
+`reify` project.** Same reading note as above: this block is appended at the end of the log and its Observed dates
+overlap the tables before it; it covers the 2026-08-21T21:07Z → 2026-08-22T22:50Z range only. Sourced from eight
+archived escalation records — `esc-plan-tools-markup-storm-1` … `-8` (alternating L1 burst alarm / L2 promotion, two
+per burst) plus `esc-plan-tools-markup-residue-1` — under
+`/home/leo/src/reify/data/escalations/archive/2026-08-22/`. It is recorded here for the same reason as the block
+above: the escalation store lives under `data/`, which is gitignored, so this material otherwise survives only in
+machine-local files, and this document is version-controlled. **That reason has since become the ONLY reason: measured
+2026-09-22, retention has pruned that archive directory — its oldest surviving day is now 2026-08-23 — so this
+transcription is the last copy of the eight records.** A reader auditing the table below against the cited path will
+therefore find it ABSENT, which is expiry, not a wrong citation; `docs/mcp-toolcall-xml-leak.md` records the same
+measurement where it cites `-residue-1`. Ownership is **γ2 / task 4457** (§9) — the leaf that
+registered this guard.
+
+**⚠️ ID COLLISION — escalation ids are per-project and these two are different records.** The table in §2.5 above
+already carries a **dark-factory** `esc-plan-tools-markup-storm-2`, fired 2026-08-21T16:53:02Z (the task-3127
+architect retry loop). The `esc-plan-tools-markup-storm-2` below is a **reify** record fired 2026-08-21T21:08:07Z.
+Neither is renumbered and they are not merged; every row below is labelled with its project.
+
+| Burst | L1 fired (`reify`) | L2 promotion | Gap since previous burst | Residue |
+|---|---|---|---|---|
+| **1** | `esc-plan-tools-markup-storm-1`, 2026-08-21T21:07:17Z | `-storm-2`, 21:08:07Z | — (first ever, see below) | **ONE** — `esc-plan-tools-markup-residue-1`, 21:17:56Z: `add_design_decision.decision` absorbed the entire serialization of the following `rationale` parameter, boundary not determinable, so the guard refused outright and preserved the raw payload (reify task 5711). **Later recovered** — the caller re-emitted cleanly with `rationale` present, verified against the lane's `plan.json`; nothing corrupt ever reached disk. |
+| **2** | `-storm-3`, 2026-08-22T20:11:07Z | `-storm-4`, 20:12:47Z | 23h | none — all repairable |
+| **3** | `-storm-5`, 2026-08-22T21:23:05Z | `-storm-6`, 21:23:46Z | 70min | none — all repairable |
+| **4** | `-storm-7`, 2026-08-22T22:49:35Z | `-storm-8`, 22:50:32Z | 86min | none — all repairable |
+
+Every one of the four L1 records carries the **identical** measurement block: `count=3`, `threshold=3`,
+`window_seconds=3600.0`, `outcome='rejected'`, `project=None`. The cadence — **23h, then 70min, then 86min**, as
+computed in `-storm-8`'s own resolution — is the genuinely new datum: `-storm-8` reads it as having "settled into a
+roughly HOURLY sustained condition rather than a series of discrete incidents".
+
+Three qualifiers from the source resolutions, all load-bearing; dropping any of them overstates the data.
+
+**(i) These are the plan-tools guard's FIRST-EVER firings.** `-storm-1`/`-storm-2`'s shared resolution records the
+2026-08-21 rejections as the boundary guard's first since it went live 2026-08-20 — corroborated independently here:
+`git log -S "mcp.add_middleware" -- orchestrator/src/orchestrator/mcp/plan_tools.py` returns exactly one commit,
+`37eed69c97` (2026-08-20, *"feat(4457): register MarkupGuardMiddleware on the plan-tools server"*). So this is not a
+newly-worsening leak; it is a previously-invisible one becoming visible the moment γ2 landed, which is the §2.5 thesis
+restated at a fourth boundary.
+
+**(ii) The counts are FLOORS, not rates.** A *repairable* rejection leaves **no queue artifact** — only unrepairable
+ones are guaranteed to leave a residue record — so the true rejection count is strictly higher than anything countable
+from this corpus. Each burst is known to be ≥3 because 3 is the alarm threshold, not because 3 is the measurement. Do
+not read a rate off this table.
+
+**(iii) Containment WORKED; this series is evidence the guard functions, not that it fails.** Across all four bursts
+exactly **one** payload was ever unrepairable, and even that one was recovered. Every other rejected call was retried
+clean. `-storm-8`'s resolution states the consequence plainly: *"CONTAINMENT MUST STAY ARMED … disabling the guard is
+what would let specimens land permanently in fleet `plan.json` files."* The mechanism is the one §2.1 describes —
+model/harness-side over-consumption past a mis-closed tag, where parameter N's value swallows parameter N+1's entire
+serialization and N+1 is silently dropped — and is not fixable at the fleet layer.
+
+**Recurrence log continued (2026-11-21) — one unrepairable specimen at the gated fused-memory boundary, `reify`.**
+`esc-markup-residue-11` (reify queue, 2026-11-21T23:16:01Z): an `update_task.metadata` call whose payload was a
+verbatim copy of reify task 3787's own metadata (`dry_run_proposals`, `done_provenance`, `retry_ledger`, …) carried
+envelope markup inside a dry-run proposal's text; the residue was not parseable, so the guard refused the call and
+preserved the raw payload on the record. Same blindness as above: the owner reads `l2-escalation-watcher` but
+`agent_id` was None. **Nothing was lost** — 3787 reached `done` (`found_on_main` `3fd685c47f`) by another write at
+23:19Z, and the refused value duplicated content already on the task; `markup_residue.spooled_files` and
+`preservation_failures` were both 0. Closed by the reify L2 watcher on Leo's ruling of 2026-11-22. The gate held;
+this is a floor-count datum for the gated boundary, not landed damage.
+
+### 2.6 The corruption is deterministically repairable
+
+Replaying all 334 specimens through a schema-validated repairer: **308 repair cleanly (92.2%), recovering 194 dropped parameters**; 26 (7.8%) are ambiguous (doubly-corrupted calls) and must escalate. Recovered parameters are exactly the silently-lost ones: `add_memory.category` ×70, `add_memory.project_id` ×32, `add_design_decision.rationale` ×25, `add_memory.agent_id` ×18, `escalate_info.suggested_action` ×13, `submit_review_verdict.issues` ×10, `submit_task.priority` ×5.
+
+This measurement is the reason repair is deterministic rather than LLM-mediated (§5 D2).
+
+---
+
+## 3. Sketch of approach
+
+One module in `shared/`, one middleware, four registrations, two sweeps.
+
+```
+shared/src/shared/toolcall_markup.py
+  ├─ detect(value)            -> MarkupHit | None       (single pattern source, INV-5)
+  ├─ repair(value, param, schema_params, supplied)
+  │                           -> Repair(clean_value, recovered:{name:value}) | Unrepairable
+  └─ FIXTURES: 504 real specimens committed as the regression pin
+
+shared/src/shared/mcp_markup_middleware.py
+  MarkupGuardMiddleware(policy: RepairPolicy, exempt_tools: frozenset)
+    on_call_tool:  detect -> repair -> validate -> {reject-with-repair | forward-repair}
+                   -> structured fact + storm counter (INV-2, INV-4)
+
+registered on:  fused-memory tools.py:1038 · plan_tools.py:596
+                verdict_tools.py:172 · escalation/server.py:307
+```
+
+Repair is applied only when it **validates**: every recovered name is a real parameter of *that* tool (read from `context.fastmcp_context.fastmcp.get_tool(name).parameters`), no recovered name collides with an already-supplied argument, and the absorbed tail parses with zero leftover. Validation failure ⇒ never guess (§4 C2).
+
+---
+
+## 4. Contracts (H)
+
+### C1 — Detection and repair contract (`shared.toolcall_markup`)
+
+**Single source of truth.** This module owns the envelope-literal enumeration. `fused_memory.server.markup_tripwire.MCP_MARKUP_PATTERNS` and `fused_memory.utils.toolcall_xml_leak.PREFILTER_NEEDLES` are re-exports of it or are deleted; no third site enumerates the literals (INV-5). The write-time/read-time calibration split documented in those modules is preserved as two *named predicates over one literal set*, not two literal sets.
+
+```python
+class Repair(NamedTuple):
+    clean_value: str              # the caller's intended text, tail removed
+    recovered: dict[str, str]     # dropped params, name -> value
+    pattern: str                  # the matched envelope literal
+    misclose: str                 # the wrong closing tag, e.g. '</description>'
+
+def detect(value: object) -> str | None: ...
+def repair(value: str, param: str, schema_params: Collection[str],
+           supplied: Collection[str]) -> Repair | None: ...
+```
+
+**Repair algorithm (normative).** Scan candidate mis-close positions left-to-right. A candidate `</X>` qualifies iff `X == param` or `X ∈ schema_params`. For each candidate, parse the remaining tail as a sequence of pseudo-parameters (`<name>value</name>`, `<parameter name="name">value</parameter>`, or a final **unterminated** `<name>value` running to end-of-string — the parser consumed that closer as its terminator), stripping a trailing `</invoke>`. Accept the **earliest** candidate for which: the tail parses with zero leftover text, every recovered name ∈ `schema_params`, and no recovered name ∈ `supplied`. Otherwise return `None` (unrepairable).
+
+**Invariants.**
+- `repair` is pure, synchronous, and never raises for any input.
+- `clean_value` is always a **prefix** of the input — the repairer never invents or reorders caller text.
+- `recovered` values are verbatim substrings of the input — the repairer never synthesises a value.
+- Determinism: identical input ⇒ identical output. Pinned by the committed 504-record corpus (see §9 α on why that is not the survey's 334).
+
+### C2 — Boundary policy contract (`MarkupGuardMiddleware`)
+
+Policy is a **declared enum passed at registration**, never inferred from the tool name and never prose (INV-1):
+
+| Policy | Servers | Behaviour on a validating repair |
+|---|---|---|
+| `REJECT_WITH_REPAIR` | fused-memory, plan-tools | Reject. The error dict carries `repaired_call` — the complete corrected argument map — so the retry is mechanical and correct. The caller stays the author of its own arguments. |
+| `FORWARD_REPAIR` | verdict-tools, escalation | Forward the repaired arguments to the tool. Emit `markup_repaired` and attach a warning to the tool response. Chosen because a lost `submit_review_verdict` strands a review gate and a lost `escalate_info` strands a task (INV-6/INV-7). |
+
+**Unrepairable input is never guessed, under either policy:** reject, and file an escalation carrying the **full raw payload** so nothing is discarded even if the caller never retries. That escalation names its owner and carries the standing L2 age bound (INV-7).
+
+**Override.** `metadata.allow_mcp_markup is True` bypasses the guard for deliberately-quoted markup, preserving today's `markup_tripwire` semantics, and is stripped before the call proceeds.
+
+**Exemptions.** A declared `exempt_tools` frozenset passed at registration — tools whose arguments legitimately contain envelope literals (`scan_memory_content` needles, the sweep tools). Declared at the registration site, machine-checked, not discovered by failure (INV-1).
+
+**Storm escape.** Repair is a fail-soft path, so it carries the rate/streak escalation (INV-4). The existing `MarkupStormCounter` generalises; counts are per `(project, policy_outcome)` so a burst of *repairs* is as visible as a burst of *rejections*.
+
+**Structured facts (INV-2).** Every outcome emits `markup_detected` with `tool`, `param`, `pattern`, `misclose`, `outcome ∈ {repaired, rejected, unrepairable}`, `recovered_params: [names]`, `agent_id`, `project`. No consumer re-derives any of this by log-scraping.
+
+### C3 — Sweep contract
+
+Every rewrite is **atomic**: repair into a temp file in the same directory, verify the result parses (`json.load`), then `os.replace` onto the target. A verification failure leaves the original untouched and reports the path. `--apply` is opt-in; dry-run emitting a full diff is the default.
+
+**Scope split (operator decision, §5 D3):** terminal state is swept now; live worktree plans are repaired lazily on next plan-tools read, under the same atomic contract.
+
+---
+
+## 5. Resolved design decisions
+
+- **D1 — Blanket middleware, not per-boundary call sites.** A `FastMCP.Middleware` in `shared/` registered on all four servers, rather than promoting today's `_markup_gate` and calling it at ~15 boundaries. Per-boundary enumeration is precisely how 11 boundaries ended up unguarded; the middleware covers every tool and every string parameter, including tools added later. The four in-line `_markup_gate` call sites in `fused-memory/server/tools.py` are **retired** in favour of it — one mechanism, not two (INV-5). Cost accepted: first use of FastMCP middleware in this repo.
+
+- **D2 — Deterministic repair, not an LLM repair session.** Considered and rejected. The corruption is a rigid grammar; a schema-validated deterministic repairer fixes 92.2% of the real corpus and recovers 194 dropped parameters (§2.6). Schema validation — recovered names must be real parameters of the invoked tool — is the corroboration that makes repair safe (INV-3), and an LLM cannot perform it. An LLM repairer would also be the same model class that emitted the malformed markup, would sit in the write path, and could plausibly *invent* a `priority` — the silent-wrong-value failure 3083 exists to stop. Deterministic behaviour is pinned by a committed fixture corpus (INV-1); an LLM's is not.
+
+- **D3 — Two-tier boundary policy by retry cost, not a uniform rule.** Where retry is cheap the caller re-issues the repaired call; where a lost write strands the pipeline the middleware forwards the repair. Both tiers preserve all information. The earlier "strip the fragment and accept" option is rejected as lossy now that repair is available.
+
+- **D4 — Terminal state swept eagerly, live plans lazily.** 245 of 296 `plan.json` files are live worktree state read by in-flight tasks; a global rewrite would need a fleet quiesce. Orphaned plans and the 51 escalation records have no live reader and are swept immediately. Live plans are repaired on next plan-tools read with write-back, so the fix arrives without a downtime window and without racing a running task.
+
+- **D5 — `clean_value` is a prefix; `recovered` values are verbatim substrings.** The repairer is forbidden from synthesising text. This is what distinguishes recovery from fabrication and is directly testable.
+
+- **D6 — Claude Code builtin tools are out of scope.** `Agent` (2) and `Edit` (1, itself a false positive — the test fixture in `test_toolcall_xml_leak.py`) are not our servers. The middleware cannot reach them; the upstream report (θ) is the only lever.
+
+- **D8 — plan-tools COMPOSES the middleware with ε's read-time repair; neither skips nor supersedes.** *(γ2, task 4457)* The three options were enumerated as γ2 requires. **Skip** fails: ε cannot reject, cannot see inbound arguments, cannot recover a swallowed REQUIRED parameter, and `_create_plan` is deliberately unhooked from it — while plan-tools owns **52 of the 95** unrepairable specimens. **Supersede** fails on POPULATION: ε's is damage *already landed* in stored `plan.json` (19 hard-damage strings across 16 tasks, three still live — 3382 and 4081 pending, 3133 blocked), none of which the middleware repairs, because it only ever sees what an agent is sending *now*. **Compose** holds: different layers over different populations — inbound arguments at the FastMCP request layer versus stored state at read time inside the tool body. INV-5 forbids a second *enumeration* of the literals and there is none (both delegate every accept/refuse decision to `shared.toolcall_markup`); D1 forbids per-boundary *call sites* in place of a blanket middleware, and ε is a different layer, not a per-boundary call site. Two consequences are pinned by test rather than left to inference: under `REJECT_WITH_REPAIR` no middleware-repaired value ever reaches storage, so ε can never re-report the same damage as a second fact; and a rejected call short-circuits the tool body, so pre-existing stored damage is **deferred** to the next accepted call, never lost.
+
+- **D9 — Residue escalations are filed under a NON-TASK anchor, never under the leaking task's id.** *(γ2, task 4457 — binding on every registration site, γ1 and γ3 included.)* The middleware declares residue at `level=2` (INV-7: the L2 watcher is its owner), and in this repo a *pending* `level>=2` escalation carrying a live task id is a stop-the-line event for that task: `workflow._is_gating_escalation` gates on `level >= 2`, `_check_escalations` looks records up by task id alone, and `_wait_for_resolution` raises `_StewardReescalated`, which `run()` turns into `_mark_blocked`. Filing residue under the live id would therefore convert **one** leaked tool call — a ~0.27% harness serialization defect — into a human-gated task halt, and would contradict the refusal hint the same guard ships, which tells the caller to resend from its own copy and carry on. The anchor changes only *where* the record is filed: level, owner and category stay the middleware's, so it still reaches the L2 watcher, and the subject task rides in the summary and detail. This matches `markup_tripwire`'s existing `markup-tripwire` anchor. A registration site that genuinely wants to halt the caller's task must say so at the filing site and pin it with a test — it is never the default.
+
+- **D10 — One parameter-aware predicate over the one enumeration; the middleware deliberately passes `param` only.** *(task 4696.)* `detect_for(value, param, schema_params=())` is the fourth named predicate over `ENVELOPE_LITERALS`, widened by closers built from the existing `closer_for()` — no literal is enumerated a second time (INV-5). `detect()` keeps its exact contract as the blanket, param-free predicate for callers with no parameter in hand (bare list items, prose scans). All five gates move to it: the middleware's `_first_markup_argument`, ε's `_carries_markup` and `_repair_one_field`, δ's `_repair_dict`, and the pairing scanner's envelope verdict — plus `repair()`'s own prefix-clean accept condition, which could otherwise accept a `clean_value` still carrying an EARLIER self-name mis-close *and* silently swallow the prose stranded between the two.
+
+  **The middleware passes `param` and NOT `schema_params`, deliberately.** Resolving the schema there costs an awaited `get_tool` on the 99.7% clean path; the parameter name is already the loop variable and costs nothing. The measured basis is the 212/212 above: every real invisible specimen is a self-name mis-close and the cross-field population is empty. The **one accepted residual** is stated rather than hidden — a mis-close whose closer names a *different* parameter of the same tool still passes that boundary. It is pinned by a negative control test, and δ's sweep (which *does* have the object's keys in hand for free) reports it. ε is likewise fully schema-aware, because its declared field table already carries `schema_params`; the asymmetry is a recorded cost decision, not a divergence.
+
+  **Disposition of the 444 landed entries, ruled here.** *Live* meta-roots → ε's lazy read-back, atomically, on next read (D4). *Dead* meta-roots → δ's new `meta-plans` lane, whose pre-existing `live-lane-present` refusal makes it structurally unable to race a running task. *Unrepairable* entries → **flagged, never guessed, never edited**. The worked example is task 4525's plan: 9 `design_decisions`, exactly 4 affected (indices 1, 4, 5, 6). Entry[1]'s `rationale` ends with its own closer, then an invoke closer, then a re-opened `parameter` tag naming `rationale` again — and `repair()` returns `None` for it, so the string is left byte-identical and reported `unrepairable`. Note what the "fabricated sibling" actually is: entry[1]'s keys are exactly `['decision', 'rationale']`, so the tail is a re-declaration of the **same** parameter *inside one string*, not a sibling key. There is nothing to delete and nothing to preserve separately — the existing code already flags it correctly, and no new policy for the ambiguous class is needed.
+
+  **D10a — WIDENING DETECTION MUST NOT WIDEN TRUNCATION: the quotation guard.** *(task 4696, added at review.)* D10 widens five gates by *name*, but `repair()` accepts an **empty tail** — a candidate closer sitting at end-of-string parses to `{}` and still returns `clean_value = value[:candidate.start()]`. Composed, those two facts made any prose that legitimately *ends* by quoting a sibling's tag pair a silent **truncation**, reported as `repaired` with `recovered_names` empty: text destroyed, nothing recovered, nothing surfaced. It reproduced end-to-end on both widened consumers — ε (`rationale` ending in a `decision` closer, then persisted atomically by `_read_plan_repaired`) and δ, whose widening is by *every sibling key* of the containing object, a far wider vocabulary than any tool's real parameter list, under an `--apply` lane targeting ~1124 dead meta-roots. This is not a hypothetical class in a repo whose plans and escalation records discuss this very markup — the present document quotes these tags throughout.
+
+  The discriminator is **evidence, not breadth**: an empty tail means there is no absorbed argument, so the "repair" is pure text loss. `repair()` therefore refuses a candidate whose tail is empty, whose name `!= param`, and whose closer is not one of the fixed `ENVELOPE_LITERALS`. Scoping matters in all three directions. **Self-name closers stay repairable** (boundary row B4) — that is the entire 212/212 population D10 was built for. **The fixed literal set stays repairable** — it tripped the blanket `detect()` long before this task, and re-litigating its calibration is section 7 out-of-scope. **Genuine cross-field leaks stay repairable** — they carry a non-empty tail, parse, and are recovered exactly as before. Only the quotation shape changes verdict, from `repaired` to a refusal, which leaves the value **byte-identical** and routes it to the human queue instead (ε `unrepairable` → ε's all-refusals branch declines the write-back; δ `refused` with `quoted_only` residue → the document comes back by *identity*, so no file is rewritten).
+
+  The fix lives at the shared `repair()` chokepoint rather than at each call site, so both widened consumers inherit it and neither grows a second policy layer (INV-5, and δ's decision 7). The rejected alternative was narrowing the gates back to `record.field` only: it also closes the loss, but it blinds detection to a real cross-field leak, whereas this keeps the leak *seen* and merely declines to guess at it. Pinned by negative controls in all three suites.
+
+  **The other half of the same guard is an ACCEPTED truncation, and it is asymmetric.** *(Recorded by task 5283, A11 — the reviewer's point was that an accepted trade-off with no test and no docstring is indistinguishable from an accident.)* A value ending in its OWN closer is still cut at that tag with nothing recovered, and ε persists the shorter string through `_read_plan_repaired`. That is deliberate: it is the entire 212/212 population, and the emitted fact's `misclose` NAMES the deleted span, so the cut is reversible from the record rather than silent. The sibling-closer shape is refused and left byte-identical instead. The discriminator is the one D10a already states — evidence, not breadth — and it is worth spelling out why the same empty tail is read differently on the two consumers: ε repairs a value it received as a NAMED PARAMETER of a known tool, so the field's own closer is evidence about that parameter, whereas δ's `_repair_dict` qualifies candidates against every sibling KEY of the containing object — a far wider vocabulary, in which the same shape is likelier quotation than leak. Pinned end to end in `orchestrator/tests/test_plan_tools_markup_self_name.py`, truncation and refusal side by side — the whole self-name dialect, from the prefilter that could not see it to the truncation it accepts, lives in that one module.
+
+  **Detection (the periodic check) reuses δ rather than adding a sixth script**, which would have had to enumerate the literals again — but it answers the operator's two questions through **two different channels**, and this bullet used to conflate them. *(Corrected by task 5283, A4.)* `sweep_toolcall_markup.py --lane meta-plans` is dry-run by default. **"Is there DEAD-LANE WORK PENDING?"** is the EXIT CODE — `EXIT_CLEAN=0` / `EXIT_REPAIRABLE_REMAINS=1`, with `skipped` deliberately never feeding it, so a file the sweep refuses to WRITE can never redden the status. **"Is it STILL HAPPENING?"** is `strings_detected` plus the new `skipped_with_markup` counter, read off the report. The old claim that one non-zero exit answered both was **structurally false**: `run_sweep` applied `resolve_write_target` BEFORE `repair_document`, so a plan under a LIVE lane was counted in `skipped` and never scanned at all — and new corruption is by definition written by a RUNNING task into a LIVE lane, i.e. exactly the population this check claims to watch. **Detection now runs BEFORE the write gate** (the reviewer's option (a)): every loaded target is scanned, then the gates decide what may be written, so a live-lane file is *seen and reported* and still never *written*. The exit-code contract is unchanged by the fix, because `exit_code()` never read `skipped` in the first place.
+
+  **Expected operational effect, stated up front:** widening the gate converts ~1–5 silent writes/day fleet-wide into loud `REJECT_WITH_REPAIR` bounces carrying `repaired_call`. The storm counter is per plan-tools subprocess at 3/3600s and esc-4107-1 records three leaks inside one architect session, so **storm escalations will become more frequent**. That is INV-4 behaving correctly and is not stop-the-line: D9 files residue and storm records under a non-task anchor, so a leaking task is never halted by its own leak.
+
+- **D11 — ONE PATTERN PER EVENT: every publication of `matched_pattern` derives from the same `(value, param, schema_params)` triple.** *(task 5283, A1/A6.)* D10 widened the GATES but left `repair()` deriving `Repair.pattern` from the blanket, param-free `detect`, so one leak reached the wire with TWO answers: the fact stream naming the head of the leak and the caller's payload naming a fixed literal that merely trails it — the diagnostic defect §2.2 exists to close, one layer in.
+
+  **MEASURED, not inferred.** Specimen: prose, the absorbing parameter's own closer, then a canonical opener naming the swallowed sibling, with `param='how'` and `schema=('what','where','how')`:
+
+  | predicate | answer | offset |
+  |---|---|---|
+  | `detect(value)` | `<parameter name=` | 39 |
+  | `detect_for(value, param, schema)` | the `how` closer | 33 |
+
+  The in-file claim that a blanket `detect` at the accept site "would change no observable value" was measured FALSE for exactly this shape: where a fixed literal is present the `misclose` fallback never fires, so the two predicates are free to disagree, and they do. Only the pure self-name case — where `detect` returns `None` and the fallback fires — made them coincide, which is why it was the only case pinned.
+
+  **The resolution is at the SOURCE, not a reconciliation of three publishers.** `repair()` derives `Repair.pattern` from `detect_for(value, param, schema)`; `_handle_markup` rebinds its own `pattern` from the same expression once the schema is resolved (free — it sits past the 99.7% clean-path gate, beside an awaited round-trip); and ε's `_repair_one_field` publishes its already-computed gate pattern on BOTH arms. The three sites now agree BY CONSTRUCTION rather than by convention, and `Repair.pattern` keeps a single meaning: *the earliest needle by text position over `ENVELOPE_LITERALS` widened by the param's own closer and the tool's schema closers, falling back to the validated `misclose`*. `detect_for` is a strict superset of `detect`'s needle set and reports earliest-first, so this can only ever name an earlier-or-equal literal — i.e. the HEAD of the leak, which is what §2.2 asked for. The `misclose` fallback is untouched.
+
+- **D12 — The deliberate-quoting hatch is DECLARED, uniformly, through one shared decorator.** *(task 5283, workstream B.)* `_OVERRIDE_SENTENCE` tells a bounced caller to resubmit with `metadata={'allow_mcp_markup': True}`, but plan-tools and verdict-tools advertised `additionalProperties: false` over exactly their declared parameters and declared no `metadata` at all. The remediation worked only because `claude` CLI 2.1.250 transmits the undeclared argument anyway — measured 2026-08-28 through a transparent stdio JSON-RPC tee proxy (task 4817 / esc-4817-1; memory records `4012ec18-55c0-4a7c-9806-04d2d397f868` and `decb3e1b-05af-4761-9e08-486fa08044c0`). That is a property of one client build, not a contract: a stricter client is entitled to refuse to send it, leaving a bounced caller with a hint it cannot act on.
+
+  **UNIFORM over every registered tool of both servers** (16 + 4), not narrowed to the prose-bearing ones: the guard scans every string argument of every tool, so any tool on these servers can be the one that bounces a caller.
+
+  **A decorator rather than twenty signature edits.** `accepts_markup_override` (`shared/src/shared/markup_override_param.py`, moved out of the middleware module by task 5055) appends the keyword-only parameter to the wrapped tool's `__signature__`. Twenty copies of a declaration no tool body reads is the lock-step duplication INV-5 exists to end, and it would leave twenty places for a future tool to be born without it. It also gives `strip_markup_override` ONE load-bearing call site: the decorator consumes the map, so no tool body can persist the flag — "never written" is structural, not a promise repeated at each registration site — and a caller's non-flag residue is reported there as a warning naming the leftover KEYS only.
+
+  **Substrate, measured (fastmcp 3.2.2 / CPython 3.13.9), because §6 has been wrong about this library before:** FastMCP builds `inputSchema` from `__signature__`, so a `tools/list` round-trip advertises `"metadata": {"anyOf": [{"additionalProperties": true, "type": "object"}, {"type": "null"}], "default": null}` with the tool's own `required` and its `additionalProperties: false` both preserved; calls with and without the argument both succeed; and an `async def` tool needs the async wrapper branch or FastMCP receives an un-awaited coroutine.
+
+  **The RIPPLE, stated so it is not rediscovered as a bug.** The middleware resolves `schema_params` from the LIVE tool schema, so `metadata` joined the repair vocabulary: `repair()` now qualifies a `metadata` closer as a mis-close candidate and can recover a tail into it. It stays contained on both tiers, pinned by negative controls. Under REJECT_WITH_REPAIR nothing is written and the tail comes back in `repaired_call`; resubmitting that map verbatim is bounced a second time by pydantic, naming `metadata`, because the recovered slice is a `str` against an object-or-null parameter — `_coerce_recovered`'s unchanged-on-doubt rule producing a legible declared-type error rather than a retyped value. Under FORWARD_REPAIR the untypable name is DROPPED rather than forwarded into a doomed call, preserved verbatim in the residue channel, and reported to the caller under `unrecovered_params`; the persisted verdict envelope carries neither key nor value. ε's own repair vocabulary is untouched — `_PlanField.schema_params` is derived from the MODULE-LEVEL impls, not the registered wrappers.
+
+  **The parameter DESCRIBES ITSELF, because declaring it closed one diagnostic.** *(Amended after review.)* An undescribed `metadata: object|null` on twenty agent-facing tools invites the wrong call — on `create_plan` or a verdict tool it reads as somewhere to attach metadata to what the tool writes — and a caller who believes that has its map dropped by `_consume_override` with the only report going to a server log it cannot read. Before the declaration, pydantic bounced that caller: a bad response, but a response. So the declaration carries a pydantic `Field(description=...)`, spelled from `MARKUP_OVERRIDE_KEY` so the schema and `_OVERRIDE_SENTENCE` cannot name different flags, stating both what the map is for and that nothing in it is persisted. Measured (fastmcp 3.2.2): an `Annotated[..., Field(description=...)]` annotation survives the `__signature__` route and lands as that property's `description`. Handing the leftover key NAMES back to the caller was considered and rejected: raising re-creates exactly the bounce this decision removed below, and widening a tool's RESULT to carry a guard diagnostic would rewrite the structured-content contract of all twenty. The mistake is forestalled in the contract instead of reported after the fact.
+
+  **A pre-existing sharp edge is REMOVED:** the flag sent alongside any other metadata key used to yield a raw pydantic `Unexpected keyword argument` on these twenty tools. Checked that nothing depended on that shape before relying on it. The escalation surface (`escalate_info`, `escalate_blocker`) still declares no `metadata` and keeps the DROP branch, so `_OVERRIDE_SENTENCE`'s promise stays true there.
+
+- **D13 — A residue record names its caller uniformly, states what its custody proves, and reports a swallowed override.** *(task 5055.)* Four gaps, each measured in the code before this decision.
+
+  **Host attribution fills only the axes the arguments left `None`.** The middleware reads its caller off the call's own arguments, and no plan-tools or verdict-tools tool, nor `stamp_triage` or `resolve_issue`, declares one, so their records named nobody. `shared/src/shared/mcp_markup_middleware.py::HostAttribution` is an optional provider each host injects with what it knows: plan-tools its new `--caller-role` launch flag, verdict-tools its verdict role, the escalation server the connection's `X-Escalation-Identity` header (attribution only, never a gate). The arguments always win, and a provider that raises falls back to argument-only attribution without changing the call's outcome. fused-memory wires none, because its memory tools declare `agent_id` themselves. The flag is optional because an orchestrator still running an older launcher spawns the new server without it.
+
+  **One rendering of the caller.** `residue_header_lines` renders the caller keys `subject_task_id`, `subject_agent_role`, `agent_id` and `project` (`RESIDUE_CALLER_KEYS`), then `override_swallowed`, the one header key that describes the leak rather than the caller, as `key=repr` lines, an absent key as `None`. Every residue kind carries `override_swallowed` as a bool. The orchestrator sink, the escalation server and `markup_tripwire` all call it. Three hand-spelled renderings are how plan-tools records came to omit the role.
+
+  **The custody claim is the caveat, not "the only surviving copy".** All three filers told the reader that the residue was the only surviving copy, while the refusal told the caller to resend from its own copy. In the field, 3 of 3 checked genuine-leak residues had been resent within about a minute, and the content of esc-plan-tools-markup-residue-10 was already in plan.json. So a refused record now states `MARKUP_REFUSAL_CUSTODY_CAVEAT`: the call wrote nothing and its caller was told to resend; whether it did is not known; look at the destination for a later write before recovering, because recovering a resent payload writes a duplicate. The unrecovered-parameter kind states `MARKUP_UNRECOVERED_PARAM_CUSTODY_CAVEAT` instead, through the same constant at every sink that files it: nothing bounced that caller, the drop was reported only in the forwarded result's metadata, and no resend is coming, so the record is the only copy the boundary holds. Residue is still never deduped, for the real reason: each record holds a different caller's payload.
+
+  **A swallowed override is reported, never honoured.** The leak swallows every parameter after the leaking one, so a `metadata` override sent after it arrives inside the leaked value. `shared/src/shared/toolcall_markup.py::swallowed_markup_override` finds it there. It is evidence of a real leak, because a genuine quotation never makes the harness over-consume, so it is not honoured. Nor does it come back to be honoured later: the swallowed `metadata` is restored WITHOUT the flag, on both tiers, so a bounce's `repaired_call` resubmitted verbatim, as its hint prescribes, is guarded like any other call. The strip applies to any recovered `metadata`, because `repair()` recovers only names the caller did not supply (B9), so it never depends on `swallowed_markup_override`'s non-validating scan, and on a repaired call `override_swallowed` reports either source: that scan, or the validated recovery. The refusal and reject payloads and the residue record carry `override_swallowed`, and the hint gives the one structural escape: send `metadata` as the first argument, ahead of the string that carries the markup. The override sentence and the parameter's own schema description say the same.
+
+  **Not decided here.** Moving plan-tools or fused-memory to FORWARD_REPAIR would change D3's tiers. The fused-memory tier is `plans/uuid-prefix-resolution-prd.md` open question 3, reserved to a separate operator decision.
+
+- **D7 — The upstream defect is not fixable here.** The originating error is model-side (wrong closing-tag dialect); the *amplification* — silently over-consuming and dropping parameters instead of raising a parse error — is the harness parser's. Neither is in this repo. Everything in this PRD is containment, recovery and repair.
+
+---
+
+## 6. Pre-conditions / substrate (G3 — verified live 2026-08-05)
+
+| Assumed capability | Verification | Result |
+|---|---|---|
+| `fastmcp.server.middleware.Middleware` with `on_call_tool` | `uv run python -c "import fastmcp; from fastmcp.server.middleware import Middleware"` | ✅ fastmcp **3.2.2**, `on_call_tool` present |
+| `FastMCP.add_middleware` | `hasattr(FastMCP,'add_middleware')` | ⚠️ **True for the STANDALONE `fastmcp` class ONLY.** Re-probed 2026-08-19: `fused-memory/server/tools.py:17` imports `mcp.server.fastmcp.FastMCP` — the MCP SDK's *bundled* class — where `add_middleware` and `get_tool` are both **False**. This row was verified against one class and applied to four sites. See γ3. |
+| Middleware sees tool name + arguments | live probe, `context.message.name` / `.arguments` | ✅ `demo`, `{'content':…,'category':'orig'}` |
+| Middleware can read the tool's parameter schema | live probe, `context.fastmcp_context.fastmcp.get_tool(n).parameters['properties']` | ✅ `['category','content','project_id']` — **the validation substrate is real** |
+| Mutated arguments reach the tool | live probe, set `arguments['category']='REPAIRED'` | ✅ tool returned `ok:…|REPAIRED|None` — **forward-repair is implementable** |
+| `dark-factory-shared` importable from all three packages | `pyproject.toml` workspace dep + live imports | ✅ fused-memory, orchestrator, escalation all import `shared.*` today |
+| The four registration sites | grep `FastMCP(` | ⚠️ Sites exist, but a **name match does not distinguish the two FastMCP classes**, which is how the row above passed green for a site lacking the capability. Anchors are also stale — re-measured on `f15a796313`: `tools.py:1060`, `plan_tools.py:1553`, `verdict_tools.py:172`, `escalation/server.py:649`. Re-grep; they move. |
+| `EscalationQueue` for residue escalations | already used by `markup_tripwire.emit_markup_storm_escalation` | ✅ |
+| 334-specimen corpus extractable | `data/orchestrator/agent-transcripts/**/*.jsonl.gz` | ✅ 334 collected, 308 repair, 26 escalate |
+
+**No middleware is registered anywhere in this repo today** — the substrate exists and is proven by probe, but the integration is novel. Recorded as the PRD's principal implementation risk, not as an unverified assumption.
+
+---
+
+## 7. Out of scope
+
+- **Model routing** — excluded by operator decision. For the record, the correlation measured 2026-08-05 over the same task set: **320 of 325 resolvable corruptions were `opus`, 5 were `sonnet`**, against a baseline of 3,277 opus / 853 sonnet invocations — a per-invocation rate of **9.8% vs 0.59%, ≈17×**. By role: architect 239/839 (28.5%), implementer 54/1033 (5.2%), reviewer 19/1231 (1.5%) — confounded, since architects are the heavy plan-tools users. Revisit separately if incidence rises.
+- **Claude Code builtin tools** (`Agent`, `Edit`, `Write`) — not our servers (D6).
+- **Fixing the harness parser** — outside this repo (D7). θ produces the report only.
+- **The Mem0/Graphiti corpus sweep** — done by 3083; §2.5 confirms it holds.
+- **Re-litigating the write-time/read-time calibration split** between `markup_tripwire` and `toolcall_xml_leak` — C1 preserves both predicates over one literal set.
+
+---
+
+## 8. Cross-PRD / seam ownership (G4)
+
+| Other PRD / task | Direction | Seam mechanism | Owner | Status |
+|---|---|---|---|---|
+| `docs/prds/memory-write-path-convergence.md` §9 leaf ο | this PRD supersedes | the write-time tripwire at four fused-memory boundaries | **this PRD** (retires the in-line gates for the middleware) | ι files the paired edit |
+| `docs/prds/memory-write-path-convergence.md` §8 row "XML-leak cure" | re-point | row currently reads "DF 3083 (pending)"; 3083 is `done` | **this PRD** | ι files the paired edit |
+| DF 3083 (done, `7899eef17b`) | consumes | `toolcall_xml_leak` detector, `scan_memory_content` | 3083 (terminal) — this PRD re-exports its literals from `shared` | C1 |
+| DF 3141 (done, `da94baf14a`) | consumes | `markup_tripwire`, `MarkupStormCounter` | 3141 (terminal) — generalised here | C2 |
+| `plans/uuid-prefix-resolution-prd.md` leaf γ (DF 4643) | generalises | the fused-memory shim (`install_markup_guard`, retired by `8ccffde1b3`) became one guard chain, `fused-memory/src/fused_memory/server/boundary_guards.py::boundary_guard_chain`, able to consume `RepairPolicy.FORWARD_REPAIR`. The markup member is now `fused-memory/src/fused_memory/server/markup_guard.py::build_markup_guard`. Its tier (REJECT_WITH_REPAIR) and its outermost place in the chain are unchanged. Whether that tier should change is that PRD's open question 3, deliberately out of scope | **`plans/uuid-prefix-resolution-prd.md`** (leaf γ, DF 4643) | DF 4643 (done, `28787ba3bc`) |
+| `docs/legibility/design-invariants.md` | consumes | INV-1/2/3/4/5/7 gate this batch | that doc (normative) | G7 walk in §9 |
+
+No reciprocal-ownership ambiguity: 3083 and 3141 are both terminal, so this PRD takes the territory uncontested. ι makes that explicit in the owning PRD rather than leaving it inferred.
+
+---
+
+## 9. Decomposition plan (one bullet per task; signals are the G2 gate)
+
+> **`execution_class` on the docs-only leaves (ζ, η, θ, ι) — do NOT "correct" this to `operational`.**
+> The valid vocabulary is `EXECUTION_CLASSES = ('code_tdd', 'operational', 'decision')`
+> (`fused_memory/reconciliation/recon_self_model.py:238`). These four leaves edit files in the
+> repo, so `code_tdd` is correct even though their deliverable is documentation.
+> `operational_routing_guard._maybe_coerce` (`:127`) silently rewrites any task with
+> `execution_class ∈ {operational, decision}` to `task_kind='deterministic'` +
+> `always_escalates=true` — a docs task filed that way **escalates to a human instead of
+> editing the documentation**, and the `submit_task` response does not show the rewrite.
+> This PRD's first decompose (2026-08-05) hit exactly that and corrected all four in place.
+> Original annotation here was an invented `docs` value — inert, but it invited the harmful repair.
+
+**α — `shared.toolcall_markup`: detector, deterministic repairer, committed fixture corpus.** *(intermediate — unlocks β, δ, ε, ζ, θ)*
+Modules: `shared/src/shared/toolcall_markup.py`, `shared/tests/`, `shared/tests/fixtures/toolcall_markup_corpus.jsonl`.
+Implements C1. Extracts the real specimens from the archived transcripts into a committed corpus (tool, param, supplied keys, raw value) and pins the repairer against it.
+*Two numbers, both correct — do not reconcile them by editing one.* **334 / 308 / 26** is the **2026-08-05 survey**, measured over that window's transcripts (§2.3, §2.6, §5 D2, §6, and the G6 note below all quote it). **504 records, 444 repaired / 60 unrepairable** is the **committed corpus** at `shared/tests/fixtures/toolcall_markup_corpus.jsonl` as extraction actually landed it — re-derived from that file 2026-08-15 (task 4022), and 443/61 until task **4502** moved exactly one record repaired-ward on 2026-08-28 (addendum below). Where this document states a present-tense fact about the committed file (§4 C1 determinism, §10 B13, §11 open question 3) it uses the 504 figures; where it reports what the survey found, it keeps 334.
+*Unlocks:* β (the middleware imports `detect`/`repair`), δ, ε.
+
+> **Addendum 2026-08-28 (task 4502) — two rulings on α's envelope-literal blind spots.**
+>
+> **FINDING 1 — the name-echoing closer enumeration gap (esc-4457-1, routed here by task 4457): EXPLICIT NON-GOAL.**
+> `ENVELOPE_LITERALS` stays exactly six members — the `description`, `parameter`,
+> `details` and `content` closers, the canonical opener prefix, and the invoke
+> closer, all canonical-dialect or generic-name. **No name-echoing literal is
+> added.** Two reasons, both structural rather than preferential. §7 already puts
+> re-litigating the write-time/read-time calibration split out of scope and freezes
+> both derived tuples' value AND order — the read-time tuple is zipped `strict=True`
+> against Qdrant filter clauses in `fused-memory/tests/test_mem0_client.py`, so its
+> order is load-bearing. And INV-5 forbids a second enumeration: every name-echoing
+> needle is DERIVED by `closer_for()`, which is the one place a closing tag is
+> spelled.
+>
+> The blind spot esc-4457-1 measured on 2026-08-19 at base `450a92ba64` was
+> subsequently **CLOSED IN CODE by task 4696's `detect_for()`**, which widens the
+> scan with `closer_for(param)` plus the caller's `schema_params`, enumerates no new
+> literal, is a strict superset of `detect()`, and is already wired at the C2
+> boundary. So there is nothing left to enumerate.
+>
+> **The one surviving residual is DECLARED, not overlooked:** `mcp_markup_middleware`
+> deliberately does NOT pass `schema_params` at its `detect_for` call site, leaving a
+> **cross-field misclose ungated**. That omission is argued in place at the call site
+> and pinned by a negative-control test (`TestSelfNameCloserIsSeenAtTheBoundary`).
+> Task 4502 does not reopen it — doing so would re-litigate a landed decision rather
+> than close a blind spot. Named here explicitly so it stays greppable instead of
+> being rediscovered a third time.
+>
+> **FINDING 2 — `repair()` returning `None` on leak-quoting reports (agent-followup-3643): REPAIRED, not exempted.**
+> *Mechanism.* Boundary row B5's guard was a bare-substring refusal — any closing tag
+> anywhere in a recovered item's value. Its own stated rule is narrower ("the value is
+> itself doubly corrupted, so its boundary is a guess"), and 4502 restored the
+> implementation to that rule as an **alternative-boundary test**: an inner closer
+> blocks recovery iff **(i)** it names the item itself, **either dialect's** closer
+> for it — the name-echoing closer **and** the canonical `parameter`, the latter
+> regardless of which dialect the item's *opener* used — or `invoke`; or **(ii)**
+> reading it as this item's terminator also yields a valid parse of the remainder.
+> Otherwise it is quoted prose and recovery proceeds. No allowlist, no record-shape
+> detector, no per-tool carve-out — a narrowing toward the documented contract, not a
+> new exception.
+>
+> *Amended (esc-4502-3), and the amendment is load-bearing.* Condition (i) first
+> shipped as "the item's **opener-dialect** closer (`parameter`)", implemented as
+> `inner_name in (name, closer_name)`. Those two entries coincide only in the
+> canonical dialect: for an **echo**-dialect item `closer_name` IS the item's own
+> name, so the tuple collapsed to one entry and `parameter` fell out of the block set.
+> Measured consequence — a value opening echo-dialect for `agent_id` and closing with
+> the canonical `parameter` closer recovered `agent_id` as `'claude-interactive'` plus
+> that closer plus a whole trailing next-tool-call paragraph, reported as
+> `outcome=repaired` and, under FORWARD_REPAIR, written straight into the tool's
+> arguments. The mirror pairing (canonical opener / echo closer) was refused
+> throughout; the gap existed precisely because one pairing was pinned by a negative
+> control and its mirror was not. `parameter` is therefore listed **categorically**,
+> because `_parse_body` treats it as a *universal* terminator — a property of the
+> parser, not of the opener — and the dialects demonstrably blend. Negative control
+> (d) in `TestQuotedReportIsRepairable` pins the mirror; unlike controls (a)–(c) it is
+> not a both-ways control, and fails without this amendment.
+>
+> *Widened 2026-09-19 (task 5620) — B5 IS THREE BLOCKERS, NOT TWO.* Everything above
+> was correct when taken and both of its conditions still hold verbatim; what changed
+> is the rule's REACH, so it is rewritten rather than deleted. 4502 narrowed B5 off a
+> bare substring refusal but reasoned only about inner CLOSERS — this entry, the
+> implementation and its negative controls alike — so the OPENER half of the same
+> class stayed open. `_inner_markup_blocks` (renamed from `_inner_closer_blocks`,
+> whose name had stopped describing its rule) iterated over closers alone, so a well-formed
+> sibling parameter opener inside a recovered value was invisible to it: glued into
+> that value verbatim while the parameter it named was silently NOT recovered, which
+> is the no-silent-partial-repair failure of committed-corpus record 25 reached
+> through an opener instead of a closer. Measured across 4502 (`b88919ad25^` vs
+> `1b9fedeb97`), such a value went from `None` to a recovery — a regression 4502
+> introduced by omission. **As of 5620 a recovered item's value is blocked by ANY OF
+> THREE things:** **(i)** an inner closer naming the item itself in either dialect, or
+> `invoke`; **(ii)** a well-formed parameter OPENER in either dialect, anywhere in the
+> value; or **(iii)** an inner closer whose reading as this item's terminator also
+> yields a valid parse of the remainder. In code the original numbering is KEPT and
+> the opener clause is named as (i)'s mirror, so the many "condition (ii)" references
+> across docstrings and tests keep meaning the alternative-boundary probe.
+>
+> *Why the opener rule is stated categorically, and why not the probe.* Running the
+> ambiguity probe from each inner OPENER's position was the alternative, and it was
+> prototyped and rejected on measurement: it leaves the reported shape recovering,
+> because that shape's sibling text carries a trailing unrelated closing tag and the
+> probe's depth-1 bound then reads the remainder as "does not parse". It fixes only
+> sibling openers whose text carries no closing tag — a strict subset of the defect.
+> The opener rule refuses every measured variant instead, and costs one bounded regex
+> search at the prefilter's own level rather than up to `_MAX_CANDIDATES` extra probes
+> inside loops whose comment requires added work to be O(1) in the input length. Both
+> dialects are listed for the reason `parameter` is listed categorically above:
+> `_parse_body` tries the canonical opener first and falls back to the name-echoing
+> one, so both are shapes it would have opened a sibling item on — a property of the
+> parser, not of the opener.
+>
+> *Blast radius, re-measured at 5620.* The 504-record committed corpus stays
+> **444/60** and **no record changes outcome**; both `esc-3514` specimens, 4502's own
+> positive control (whose quoted literal is a CLOSER, not an opener) and the sweep
+> suite stay green. Negative controls (g) and (h) in `TestQuotedReportIsRepairable`
+> pin the canonical and name-echoing openers; like (d) they are not both-ways
+> controls. The pin that used to assert a RECOVERY of a sibling-opener shape,
+> `test_the_ambiguity_probe_does_not_recurse_and_that_is_VISIBLE`, is INVERTED in the
+> same task — its specimen differs from control (g) in one cell, both regressed
+> identically at 4502, and no rule can block one and spare the other.
+>
+> *Two residuals 5620 DECLARED rather than closed.* (1) A recovered value carrying a
+> sibling opener and NO closing tag anywhere is still swallowed — identically before
+> and after 4502, so not a 4502 regression. It never reaches the rule, because
+> `_parse_body`'s cheap prefilter only fires on a closing-tag sequence; closing it
+> means moving the test up beside that prefilter, which rewrites the sweep's
+> documented unterminated-inner-opener convergence case. **Task 5639** (filed as
+> `tkt_0RTT9N7HAZ2WP6DF3YNXAKHSX4`); negative control
+> `test_a_sibling_opener_with_NO_closing_tag_is_NOT_refused_TODAY` pins the residue,
+> so 5639 landing fails loudly here instead of silently contradicting this
+> paragraph. Closed by task 5639: that pin is replaced by
+> `test_the_opener_verdict_does_not_depend_on_a_closing_tag`; see below.
+> (2) The widened rule leaves `_parse_body`'s depth-1 probe short-circuit
+> unreachable by construction (instrumented: 1 execution before, 0 after). It is
+> documented in place and kept, because deleting it removes a recursion bound 4502
+> landed deliberately. **Task 5640** (filed as `tkt_0RTT9N05CHRSHN2MSCHNXX4A8D`).
+> Closed by task 5638 (5640 was a duplicate filing of the same work); see below.
+> Named here so both stay greppable instead of being rediscovered as
+> inconsistencies — by TASK id, because a `tkt_…` is a transient submit_task
+> receipt: the first of these two resolved to status `combined` ("already pending in
+> the pool"), so following it alone lands a reader on a dropped duplicate rather
+> than on the open work.
+>
+> *Collapsed 2026-10-08 (task 5638) — the alternative-boundary condition is a local
+> item-boundary test, and the depth-1 probe is gone.* In 5620's numbering, (iii) now
+> reads: reading the inner closer as this item's terminator leaves the parser at an
+> **item boundary** — only whitespace follows, or an item opener does. The parser and
+> the rule share one opening step and nothing re-parses, so no recursion bound is
+> needed. Not blank-only, because residual (2)'s short-circuit was measured REACHABLE,
+> not unreachable by construction: a canonical opener head whose quoted name runs
+> across the item's own closer opens an item right after an inner closer, unseen by
+> the opener mirror, and with a closing tag in the spanned sibling's value the
+> short-circuit fired and the tail was recovered. A blank-only condition would also
+> have newly recovered the sibling specimen whose spanned parse completes, with every
+> suite green. Both are now refused, pinned by the two `alternative_boundary` controls
+> in `TestQuotedReportIsRepairable`. The old *start* parameter's no-slice contract now
+> lives on `_at_item_boundary`'s position argument, because the probe was its only
+> caller. *Blast radius, re-measured at 5638:* the corpus stays **444/60** with no
+> record changing outcome; both `esc-3514` specimen pins stay green (escalation markup
+> suites 74 passed), as do the shared markup suites (539 passed, 1 skipped), the sweep
+> suite and the plan-tools markup suites (244 passed).
+>
+> *Made uniform 2026-10-09 (task 5639) — the opener rule is an accept-time condition,
+> and it no longer depends on a closer.* 5620's opener clause sat inside the per-item
+> B5 function, behind `_parse_body`'s closing-tag prefilter, so its verdict flipped on
+> whether an UNRELATED quoted closer was present: on 5620's code every row of
+> `test_the_opener_verdict_does_not_depend_on_a_closing_tag` (which replaces the
+> residual (1) pin) got opposite answers in its two closer cells. The rule now lives
+> in `repair()` beside B8, as B8's value-side mirror, and applies to every recovered
+> value whether or not it carries a closer. The canonical opener stays categorical;
+> the name-echoing opener now blocks only when it names a schema parameter. That
+> narrowing is measured: applying 5620's broad both-dialect rule uniformly moved 3
+> committed-corpus records repaired → unrepairable, all placeholder false positives
+> (`\x3cname>` in `toolu_011GM1rYsnpdmE26YX3sjPpg`, `\x3cunknown>` in
+> `toolu_01JMhsqu24iuKFH9RuYxSTd2`, `\x3ctitle>` in `toolu_01QrpSawmZ3qASDFFoEH6SQK`),
+> while the shipped variant moves none. A non-schema echo tag names nothing B8 would
+> let `repair()` recover. The prefilter line is untouched, so its clean-path contract
+> is unchanged. The per-item function reasons only about inner closers again and is
+> renamed back to `_inner_closer_blocks`. In the sweep, the unterminated-inner-opener
+> nested leak now refuses in round one; a recovered value that QUOTES a closer is the
+> shape that still reaches round two. *Blast radius, re-measured at 5639:* the corpus
+> stays **444/60** with no record changing outcome; the shared markup suites (535
+> passed), both `esc-3514` specimen pins with the registration specimens (74 passed),
+> the sweep suite (94 passed) and the plan-tools markup suites (244 passed) are green.
+>
+> *The invariant that did NOT move.* `clean_value` stays envelope-free, stated against
+> `detect_for`. That is C1's post-condition on the value the repairer **rewrote**, and
+> it is non-negotiable: the C2 middleware forwards it as the repaired argument.
+>
+> *The invariant that was narrowed, and what replaced it.* A RECOVERED value is
+> verbatim caller text under D5 and may legitimately quote a literal — a faithful
+> report of a markup leak quotes the leak. `TestNoStillPoisonedValueEverEscapes`
+> therefore reads "no value trips `detect` **unaccounted for**" rather than "no value
+> trips `detect`": anything still tripping must be a recovered parameter, never the
+> absorbing one, and must be named in a new `quoted_markup_params` field published on
+> the `markup_detected` fact (a tenth key) and on **both** policy payloads. Per INV-2
+> and the repo's loud-over-silent-degradation norm the quoting is made countable
+> rather than silent, and a caller retrying an offered `repaired_call` can see why it
+> still carries a literal and reach for the existing `allow_mcp_markup` override.
+>
+> *Blast radius, measured.* The 504-record committed corpus moves **443/61 → 444/60**.
+> **Exactly one record changed**: `toolu_01XbCz5NFCA6pCvmseyqFgvy`
+> (`mcp__escalation__escalate_info` / `detail`), which is the same underlying leaked
+> call as the two `esc-3514` specimens — so the entire known population of this shape
+> is one call and its two filings. All 444 accepted `clean_value`s still carry no
+> qualifying closer (re-verified, not retyped).
+>
+> *The non-obvious part, recorded so it is not re-derived the hard way.* A **naive
+> narrowing — the ambiguity probe alone, or qualifying inner closers only on schema
+> membership — also flips corpus record 25** (`mcp__plan-tools__add_design_decision` /
+> `decision`). That value opens canonically for `rationale`, closes with the
+> name-echoing `rationale` closer, and is followed by an invoke closer plus the head
+> of a whole NEXT invoke block. The probe does not catch it, because the residue does
+> not itself parse as pseudo-parameters — so the naive rule would accept it and
+> **silently swallow the next tool call's fragment into the recovered `rationale`**,
+> the no-silent-partial-repair failure this module exists to prevent and strictly
+> worse than the `None` it returns today. **Condition (i) is what prevents it**, and
+> it is safe to state categorically because an item's own closing tag inside its own
+> value is a cross-dialect mis-close by definition, never prose about itself.
+>
+> **Follow-on 2026-09-04 (task 4502, same task, later iteration) — the COUNTABILITY
+> half silently no-opped, and every test was green.** The narrowing above shipped
+> correct: the characters land. `quoted_markup_params` did not. It was computed from
+> the **post-coercion** recovered map, while the parameter the carve-out exists for —
+> `escalate_info.evidence`, declared `list[dict[str, Any]] | None` — is decoded to a
+> `list` by `_coerce_recovered` and skipped by the census's `str`-only scan. Measured
+> against the real escalation server with the one record above:
+> `recovered_params=['evidence','suggested_action']` and `quoted_markup_params=[]` —
+> **empty for the entire measured population**. Fixed by taking the census ONCE from
+> the **verbatim** (pre-coercion) map, which is the caller's own text under D5, and
+> threading it to all three publication sites; the same replay now reports
+> `quoted_markup_params=['evidence']`.
+>
+> *Why nothing failed, which is the reusable part.* Every unit pin exercised only
+> **string-typed** parameters, where the pre- and post-coercion values are the same
+> object; and the corpus replay's synthetic tools declare **every** parameter
+> `str | None`, so no test in the suite ever reached `_coerce_recovered`'s decode
+> branch. The anti-vacuity guard (`test_the_carve_out_is_REACHED_by_this_corpus`)
+> passed throughout. **A schema-directed mechanism needs at least one pin driven
+> through a REAL declared type**, and the real-server replay is where it belongs —
+> here, `escalation/tests/test_markup_middleware_registration.py`'s
+> `TestTheQuotedMarkupCensusAgainstTheREALSchema`. That pin ended up at BOTH
+> levels rather than only there, and saying so is the accurate version of this
+> paragraph: `shared/tests/test_mcp_markup_middleware.py`'s
+> `TestQuotedMarkupIsSurfacedForANonStringParameter` drives the same shape through
+> the `escalate_info_typed` toy, which carries that declared type verbatim —
+> measured, moving the census below the coercion fails five tests there. The
+> real-server class stays load-bearing for a different reason than "nowhere else
+> can host it": the toy is a hand-kept **copy**, so the real-server class is the
+> one that fails when the original drifts away from the copy. The FINDING 2 ruling
+> above is unchanged.
+*Evidence:* each corpus record carries its **expected outcome** (`repaired` with the expected recovered-parameter names, or `unrepairable`), committed alongside the specimens; replay asserts the repairer matches every committed expectation, that replay is byte-identical across two runs, and that D5 holds for every repaired case (`clean_value` is a prefix of the input; every recovered value is a verbatim substring).
+*G6 note — deliberately not a bare threshold.* The reference implementation scores **308 repaired / 26 unrepairable (92.2%)**, and that is the basis for expecting a high rate; but the signal is agreement-with-committed-expectations, not a literal count. A correct implementation that repairs *more* of the 26 ambiguous cases must update the expectation file in the same commit — which is a reviewable improvement, not a RED test. Pinning the literal 308 would make a better repairer look like a regression.
+
+**β — `MarkupGuardMiddleware`: policy enum, structured facts, storm escape.** *(intermediate — unlocks γ)* · depends: α
+Modules: `shared/src/shared/mcp_markup_middleware.py`, `shared/tests/`.
+Implements C2: `RepairPolicy.{REJECT_WITH_REPAIR,FORWARD_REPAIR}`, `exempt_tools`, `allow_mcp_markup` override, `markup_detected` structured fact, generalised storm counter keyed `(project, outcome)`.
+*Unlocks:* γ (registration on the four servers).
+*Evidence:* against an in-process `FastMCP` harness, a corrupted call under each policy produces the contracted outcome; a burst of repairs fires the storm escalation (INV-4).
+
+**γ — SPLIT THREE WAYS 2026-08-19 (operator decision).** The single γ leaf declared all four servers and was
+therefore **never dispatched once** — `data/orchestrator/runs.db` carries zero events of any type for task 3690
+across four months, because the task required simultaneous module locks on the two hottest files in the repo
+(61 pending/in-progress tasks declare `fused-memory/server/tools.py`, 26 declare `escalation/server.py`). Two
+further reasons to split rather than re-pin: plan-tools acquired a *second* mechanism after decompose (ε, task
+3692) and needs an explicit D1 ruling, and fused-memory turns out not to support the middleware at all (§6).
+Nothing about the contracts changed — only the packaging.
+
+**γ1 — Register on the escalation and verdict-tools servers (the `FORWARD_REPAIR` pair).** *(leaf, task 3690)* · depends: β
+Modules: `escalation/src/escalation/server.py`, `orchestrator/src/orchestrator/mcp/verdict_tools.py`.
+Absorbs task **4180** (cancelled into it): same escalation-server slice, and its "reject vs stamp vs recover vs log"
+design question is already answered by C2 (`FORWARD_REPAIR` *is* its option (c)). Carries 4180's one non-obvious
+finding — `escalate_info.evidence` is **list-typed** while `Repair.recovered` is `dict[str, str]` and the middleware
+applies it as a bare `arguments.update` with no coercion, a case B3's str-typed specimen never exercises.
+*Signal:* a live `escalate_info` with a mis-closed `detail` **lands with `suggested_action` populated and `evidence`
+restored as a list**, and emits `markup_repaired` — where the identical call today lands with both silently at their
+defaults. This is where the *silent* damage actually is: a swallowed **required** parameter raises loudly in pydantic,
+a swallowed **optional** one just takes its default, and `escalate_info` requires only its first four.
+
+**γ2 — Register on plan-tools, and rule on the overlap with ε.** *(leaf, task 4457)* · depends: β
+Modules: `orchestrator/src/orchestrator/mcp/plan_tools.py`.
+ε (3692) landed `_with_markup_repairs` in this same file: **read-time** lazy repair of stored `plan.json` with
+write-back, which cannot reject, memoizes refusals per process, and whose `plan_markup_repaired` log line has **no
+sink** and whose `markup_repairs` fact has **no consumer**. `_create_plan` is deliberately unhooked with a comment
+delegating inbound arguments to this middleware. Complementary in principle — but D1/INV-5 requires the ruling be
+made, tested, and written down, not left implicit.
+*Signal:* as the original γ's `submit_task` row (B1/B2), on a plan-tools write tool.
+*RULED 2026-08-19 (task 4457) — **COMPOSE**, recorded as D8 in §5.* The registration site is
+`create_server` in `orchestrator/src/orchestrator/mcp/plan_tools.py`: `REJECT_WITH_REPAIR` with an
+explicitly empty `exempt_tools`, both declared at the site (INV-1), plus a real `escalation_sink`
+filing residue and storm records to the project's `EscalationQueue` — without it, this server's 52
+unrepairable specimens would go from *corrupt but present* to *silently absent*, while the
+middleware's own hint promises the payload is preserved in the escalation it names. `fact_sink`
+is deliberately left unwired and the site records why. Residue is filed under a **non-task anchor**
+so preserving a payload never halts the run that produced it — recorded as D9 in §5, and binding on
+γ1 and γ3 as well.
+
+**γ3 — Adapt the guard to fused-memory's bundled FastMCP; cover the two ungated write tools; only then retire the in-line gates.** *(leaf, task 4458)* · depends: β
+Modules: `fused-memory/src/fused_memory/server/tools.py`, `fused-memory/src/fused_memory/server/main.py`.
+Choose between migrating to standalone `fastmcp` and adapting through the existing `_safe_call_tool` chokepoint in
+`server/main.py` (an in-repo precedent for a single interception point on this server). New coverage: `add_system_record`
+(`:3102`) and `update_memory` (`:4316`), both ungated, both Mem0 writers, both optional-tailed.
+⚠️ **The in-line gates are retired only after the replacement is live and demonstrated.** This is the one boundary whose
+containment provably works — Mem0 is frozen at 40 legacy specimens since **2026-07-30**, Graphiti at 14 since
+**2026-07-29** (both re-measured 2026-08-19; Graphiti had never been scanned before, as `scan_memory_content` is
+Mem0/Qdrant-only). Retiring early would open the only door that is currently shut.
+
+**δ — Retro-sweep of terminal state, atomic.** *(leaf)* · depends: α
+Modules: `scripts/sweep_toolcall_markup.py`, `scripts/tests/`.
+Implements C3 over `.worktrees-orphaned/**/.task/plan.json` and `data/escalations/**`. Dry-run default; `--apply` writes temp → verify-parse → `os.replace` (D4, operator's atomicity requirement).
+*Signal:* `--apply` repairs the 51 escalation records and the orphaned plans; a second run reports **0 remaining**; every rewritten file still parses as JSON and its byte-diff is confined to the corrupted strings.
+
+**ε — plan-tools lazy write-back for live plans.** *(leaf)* · depends: α
+Modules: `orchestrator/src/orchestrator/mcp/plan_tools.py`, `orchestrator/tests/`.
+On `plan.json` read, if a field is corrupted, repair and write back under C3's atomic contract, emitting a structured fact. No fleet quiesce (D4).
+*Signal:* opening a corrupted live plan through plan-tools returns the repaired `rationale`, and the file on disk is repaired atomically — a concurrent reader sees either the old or the new file, never a partial one.
+
+**ζ — Correct `docs/mcp-toolcall-xml-leak.md` §1.** *(leaf)* · depends: α · `execution_class: code_tdd`
+3083's §1 states the parser "terminates a string argument **early**" at a quoted closing tag. The specimens show the opposite direction — over-consumption at the *closing position*. Only over-consumption explains the observed signature (fragment **inside** the value **plus** siblings missing), and the stated direction changes the guidance to authors.
+*Signal:* the doc states the over-consumption direction, carries the four specimen shapes from §2.1 and the §2.3 blast-radius table, and points at `shared.toolcall_markup` as the single literal source.
+
+**η — Retire the non-canonical evidence-log metadata convention.** *(leaf)* · `execution_class: code_tdd`
+Migrate task 3083's `markup_tripwire_rejections_20260730` / `_burst3` to Tier-C `x_`-prefixed keys per `docs/task-authoring.md`, and document `allow_mcp_markup: True` as the correct move for writes that quote the literals — the convention currently manufactures both schema warnings and tripwire rejections, and is self-perpetuating because it is documented inside 3083's own details.
+*Signal:* touching task 3083 emits **zero** `task_metadata.schema_warning … code=unknown_key` lines in the fused-memory journal. Baseline measured 2026-08-05 over the journal window 2026-07-01→08-05: **43 such lines** (22 for `…_20260730`, 21 for `…_20260730_burst3`). The escalation record's "17" was a narrower window; 43 is the figure this signal is measured against.
+
+**θ — Upstream harness bug report.** *(leaf)* · depends: α · `execution_class: code_tdd`
+A specimen-backed write-up of the parser defect: the four shapes, the over-consumption behaviour, the silent parameter drop, the 0.26% incidence, and the 92.2% deterministic repairability that demonstrates the format is unambiguous enough for the parser to have errored instead.
+*Signal:* a committed report at `docs/upstream/toolcall-parser-overconsumption.md`, self-contained enough to file without this repo as context.
+
+**ι — Paired edit to the owning PRD (G4 bookkeeping).** *(leaf)* · depends: γ · `execution_class: code_tdd`
+Re-point `docs/prds/memory-write-path-convergence.md` §8's "XML-leak cure" row from "DF 3083 (pending)" to this PRD, and mark §9 leaf ο's in-line tripwire as superseded by the middleware.
+*Signal:* the owning PRD's §8 table names this PRD as owner and no longer describes 3083 as pending.
+
+### DAG
+
+```
+α ──┬── β ──┬── γ1 ──┐
+    │        ├── γ2 ──┼── ι
+    │        └── γ3 ──┘
+    ├── δ
+    ├── ε
+    ├── ζ
+    └── θ
+η (independent)
+```
+
+### G7 walk (`docs/legibility/design-invariants.md`)
+
+| Invariant | Disposition |
+|---|---|
+| `contracts-machine-checked` (INV-1) | Policy is a registration-time enum and `exempt_tools` a declared frozenset — not prose, not tool-name heuristics. ✅ |
+| `structured-facts-at-failure` (INV-2) | `markup_detected` carries tool/param/pattern/misclose/outcome/recovered_params; no consumer log-scrapes. ✅ |
+| `corroborate-before-acting` (INV-3) | Repair is applied only after schema validation against the invoked tool's live parameter set. ✅ |
+| `storm-escape-required` (INV-4) | Repair is fail-soft ⇒ storm counter keyed `(project, outcome)`, so a burst of repairs escalates like a burst of rejections. ✅ |
+| `no-lockstep-duplication` (INV-5) | One literal set in `shared`; the current `MCP_MARKUP_PATTERNS` / `PREFILTER_NEEDLES` divergence is the defect being fixed; the four in-line gates are retired rather than duplicated. ✅ |
+| `status-matches-liveness` (INV-6) | Motivates `FORWARD_REPAIR`: a lost verdict/escalation strands a task in a claimed state. ✅ |
+| `holds-owned-and-bounded` (INV-7) | Residue escalations carry the raw payload, a named owner and the standing L2 age bound. ✅ |
+
+No waivers required.
+
+---
+
+## 10. Boundary-test sketch (H) — two-way, producer and consumer sides
+
+| # | Scenario | Preconditions | Postconditions |
+|---|---|---|---|
+| B1 | Partial drift, cheap-retry tier | `submit_task` description ends `…</description>\n<parameter name="priority">low`; policy `REJECT_WITH_REPAIR` | Rejected; error carries `repaired_call` with `description` = prefix only and `priority: "low"`; nothing written; `markup_detected outcome=rejected recovered_params=[priority]` |
+| B2 | Total drift, cheap-retry tier | `submit_task` tail `</description>\n<priority>medium</priority>\n<agent_id>x</agent_id>\n<metadata">{…}</metadata">\n</invoke>` | Rejected; `repaired_call` recovers all three of `priority`, `agent_id`, `metadata` |
+| B3 | Strand-risk tier forwards | `escalate_info` detail ends `…</suggested_action">\n</invoke>`; policy `FORWARD_REPAIR` | Escalation **is filed**; `suggested_action` populated from the recovered value; response carries a repair warning; `markup_detected outcome=repaired` |
+| B4 | Last-parameter case, nothing dropped | `add_memory` content ends `…</content>\n</invoke>` | `clean_value` = prefix; `recovered` empty; tier policy applied |
+| B5 | Unrepairable residue never guesses | doubly-corrupted `add_reuse_item.how` (one of the 26) | Rejected under **both** policies; escalation filed carrying the **full raw payload**; no partial write |
+| B6 | Deliberate quote passes | content quotes `<parameter name=` with `metadata.allow_mcp_markup=True` | Call proceeds unmodified; override stripped before dispatch; no fact emitted |
+| B7 | Exempt tool passes | `scan_memory_content(needles=['</content>'])` | Call proceeds unmodified; guard skipped by declared exemption |
+| B8 | Schema validation rejects a bad recovery | tail parses but a recovered name is not a parameter of that tool | Treated as unrepairable (B5 path) — never forwarded |
+| B9 | Collision is not overwritten | tail recovers `agent_id` but `agent_id` was already supplied | Treated as unrepairable — the middleware never overwrites a caller-supplied argument |
+| B10 | Storm escape fires | 3 repairs within the window on one project | Storm escalation filed once, naming outcome `repaired` |
+| B11 | Sweep atomicity | δ interrupted between temp-write and replace | Target file unchanged and still parses; no partial JSON |
+| B12 | Lazy write-back under concurrency | ε repairs a live plan while a task reads it | Reader observes either the old or the repaired file, never a partial one |
+| B13 | Corpus determinism | replay all 504 specimens twice | Byte-identical results both runs; every outcome matches the committed per-specimen expectation (reference: 444 repaired / 60 unrepairable) |
+| B14 | REQUIRED absorbed parameter is recoverable | `add_memory.content` absorbs the REQUIRED `project_id`, which is then absent from the call; both tiers | `on_call_tool` runs before pydantic validation, so the repair is reached: `REJECT_WITH_REPAIR` bounces with `repaired_call.project_id` and `error_type=mcp_markup_detected` (NOT a missing-required-field error) and nothing is written; `FORWARD_REPAIR` executes the tool bound to a required argument that was never on the wire |
+| B15 | The ordering's one precondition | the same call with `strict_input_validation=True` | Middleware never runs; caller gets `Input validation error`; NO `markup_detected` fact and NO storm count — every required-parameter leak is silently unrepairable. Registration (γ) must not enable it |
+
+---
+
+## 11. Open questions (tactical, implementation-time)
+
+1. **Middleware ordering.** If a server later adds a second middleware, does the markup guard run first? **Suggested resolution:** register it first and assert its position in a test. Decide during γ.
+   *Partly settled (task 4022, empirically, fastmcp 3.2.2).* The FRAMEWORK-ordering half is no longer open: `on_call_tool` runs strictly BEFORE pydantic argument validation, so a REQUIRED absorbed parameter is recoverable — boundary rows B14/B15, with the one precondition that `strict_input_validation` stays off. This item's actual question — ordering relative to a SECOND middleware, if one is ever added — is untouched by that and remains for γ.
+2. **`add_system_record` / `update_memory` policy tier.** Both are fused-memory writes, so they inherit `REJECT_WITH_REPAIR`; `add_system_record` is recon-stage-only and may not retry. **Suggested resolution:** start with the server default, revisit if the storm counter shows rejections there. Decide during γ.
+3. **Fixture corpus size in-repo.** 504 raw values include long text; the committed corpus may be large. **Suggested resolution:** store truncated-but-sufficient values (tail + 200 chars of lead-in) if size is a problem, keeping the 60 unrepairable cases verbatim. Decide during α.
+   *Settled (task 4022 landed the corpus; re-confirmed at task 4502).* The committed file is 494,420 bytes with the truncation rule applied — large but not a problem, and re-scoring it in place through the extractor's own `load_corpus`/`write_corpus` yields a one-line diff. **Closed.**
+4. **Retention of the archived transcripts.** The corpus is extracted from `agent-transcripts/`, which is retention-bounded. **Suggested resolution:** the committed corpus is the durable artifact; no dependency on the archive after α.

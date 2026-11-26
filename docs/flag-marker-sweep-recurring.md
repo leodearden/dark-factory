@@ -6,10 +6,540 @@
 complete, tested, deterministic drain of dead-weight `stage1_flag_marker`
 records — orphan / taskless / stale / terminal-task predicates, plus
 targeted `--delete-ids` correction. Task 2596 shipped the script but never
-wired it into anything that actually runs it, so the backlog only grew
-(reconfirmed at 42 records before this task). Task 2693 wires the existing
-script into an automated, recurring systemd-timer drain so the backlog
-stays non-growing without any human running it by hand.
+wired it into anything that actually runs it, so the backlog only grew —
+**historically**, to the 42 records measured in the pre-2853, pre-2966
+world that task 2693 was filed against. Task 2693 wires the existing script
+into an automated, recurring systemd-timer drain so the backlog stays
+non-growing without any human running it by hand.
+
+Both marker pools now have an unconditional in-cycle collector of their own
+(see "Scope" below), so this nightly timer is a scheduled **adjunct** to
+one of them rather than the sole collector for anything, and its normal
+result is zero deletions. A zero is not self-certifying, though — see
+"Reading the output" for how to tell "there was nothing" from "saw
+nothing".
+
+### Scope: which pool this timer actually drains (tasks 3897, 3923)
+
+> **This section is the single home for the task-3897/3923 rationale and its
+> measurements.** The sweep script's module docstring, its `--fail-on-blind-spot`
+> help text, `scripts/fused-memory-flag-marker-check.sh`'s header and the
+> `TestFlagForStage2IsNeverDeleted` docstring all carry a one-line summary
+> and point here rather than restating the numbers — these are point-in-time
+> measurements of live data, and five drifting copies would leave a reader
+> unable to tell which is current. Update the counts here, not there.
+
+This timer's scope is the **legacy `source`-tagged pool** —
+`{'source': 'stage1_flag_marker'}` — and nothing else. Dated census, as
+re-measured on **2026-08-17** (task 3923; the 2026-08-09 figures from task
+3897 are shown for trend):
+
+| project | `{source: stage1_flag_marker}` | `{kind: stage1_flag_marker}` | `{flag_for_stage2: True}` |
+|---|---:|---:|---:|
+| `dark_factory` | 0 | 0 | 60 (was 65 on 08-08, 61 on 08-09) |
+| `reify` | 0 | 0 | 27 (was 80 on 08-09) |
+| `know_live` | 0 | 1 | not probed |
+
+Re-measured **2026-10-30** (task 6241): `source` = 0 in all 11 registered
+projects and `kind` = 0 everywhere probed, `know_live` included; see
+[The in-cycle collector applies the same arm](#the-in-cycle-collector-applies-the-same-arm-task-6241).
+
+The `source` filter — the one `--check`'s verdict actually reads — matches
+**0 records in all three projects probed**, now including `know_live`, which
+neither task 3897 nor the task-2902 watch had probed. So the nightly run is
+a no-op by construction and `backlog_verdict(0, N)` holds for every
+non-negative ceiling. The single `know_live` record matching `kind` only is
+marker `a5732b3b`, owned by open task **3915** — do not hand-delete it (see
+the RCA's Marker Lifecycle policy); it is invisible to `total_source` and so
+cannot move the verdict either way.
+
+Those predicates are deliberately **retained, not retired**: they are
+still the script's delete-set contract, still reachable via `--delete-ids`,
+still the only collector for dead weight the in-cycle 14-day age GC never
+reaches (orphan, taskless or terminal-task markers that are younger than 14
+days or undated, and any id named in `--delete-ids`), and the blind-spot
+cross-check below is *defined* as the comparison between that `source`
+enumeration and the adjacent population.
+
+It is **not** the collector for the live Stage-1 → Stage-2 relay pool
+(`{'flag_for_stage2': True}`, 60 records in `dark_factory` and 27 in
+`reify` as of 2026-08-17). Both are draining correctly across the
+measurements above while new markers are minted per run — a rolling window,
+not a backlog trending to zero. That pool is drained in-cycle by
+`_sweep_stale_mem0_flag_for_stage2_markers` (task 2966,
+`fused-memory/src/fused_memory/reconciliation/stages/task_knowledge_sync.py`),
+which runs unconditionally per-project every reconciliation cycle and
+age-GCs on a rolling 14-day window. Those records are **not** uncollected,
+and this script deliberately counts them without ever deleting them — see
+"Why the relay pool is censused, never deleted" below.
+
+**Nor is this timer the only collector for the `source` pool it *does*
+target.** That pool is also drained in-cycle by
+`_sweep_stale_mem0_flag_markers` (task 2853), in the same
+`task_knowledge_sync.py` module and via the same shared
+`_sweep_stale_mem0_pool` helper as the 2966 relay collector above. It is
+called unconditionally every reconciliation cycle and age-GCs at 14 days.
+It enumerates **both** spellings of the pool, `{'source': 'stage1_flag_marker'}`
+and `{'kind': 'stage1_flag_marker'}`, unioned by id
+(`_STAGE1_FLAG_MARKER_MEM0_ENUM_FILTER_VARIANTS`, task 3915), and passes
+`pool_kind=` so that a record declaring a foreign `kind` is withheld — see
+[The in-cycle collector applies the same arm](#the-in-cycle-collector-applies-the-same-arm-task-6241).
+That is a strictly wider enumeration than this script's: a `kind`-only legacy
+record (task 3915's `know_live` class) is enumerated in-cycle, but neither
+this script's `source` scroll nor its `cross_check` census ever counts it.
+Project coverage does not separate the two collectors: since task 2917 this
+timer also loops over every registered project (see "Schedule", and "When
+coverage is not fleet-wide" for when the registry degrades). They differ in
+cadence — every reconciliation cycle versus nightly at 03:30 — and in what
+they enumerate. Records whose `created_at` is missing or unparseable
+are skipped by that helper's fail-safe KEEP-on-uncertainty filter, so they
+persist by design rather than by neglect. So **both** pools have an
+automatic in-cycle collector, and this timer is a scheduled adjunct to one
+of them. Reading this document without that fact is what produced task
+3498's premise that the script might be redundant; the answer is below.
+
+### Why the relay pool is censused, never deleted
+
+The cross-check counts the `flag_for_stage2` pool and stops there. It never
+enumerates it, never runs a predicate over it, and never adds it to the
+delete set — a boundary enforced by `TestFlagForStage2IsNeverDeleted` in
+`fused-memory/tests/test_sweep_orphan_flag_markers.py`. Three reasons were
+originally given, two of them measured on 2026-08-09. Item 2 has since been
+closed by task 4435 (on the two gaps it named — see the note under it) and no
+longer carries any weight; the ruling stands on items 1 and 3, each
+independently sufficient:
+
+1. **23 of the 61 live records carry no usable `task_id`**, so the script's
+   existing `find_taskless_markers` predicate would delete all 23 on the
+   very next nightly `--apply` run. They are live Stage-1 → Stage-2 relay
+   markers, not dead weight — and the nightly timer's `--terminal-drain`
+   would additionally reap markers citing already-done tasks.
+2. **CLOSED by task 4435 — the script now has both of the two things this
+   item named.** *Originally:* the script had neither the
+   `is_protected_mirror_record` check nor the
+   `record_mem0_deletion_tombstones` write that the shared in-cycle
+   `_sweep_stale_mem0_pool` applies, which mattered because `flag_for_stage2`
+   is an LLM-supplied key any writer can stamp on any record —
+   `mem0_tombstone.py`'s module docstring names this exact filter as its
+   motivating over-breadth case. Task 4435 closed that parity gap:
+   `delete_orphan_markers` now enforces the mirror guard at the delete choke
+   point (so every current and future caller inherits it, and it overrides
+   `--delete-ids`) and tombstones its confirmed deletes in one batched
+   ledger transaction. The gap was closed while still LATENT — the measured
+   population of `cycle_summary`/`ledger_stamp` records in this pool was 0
+   both when the risk was recorded (2026-08-09) and when it was fixed — so
+   no record was ever actually lost to it. **This item no longer supports
+   the censused-never-deleted ruling, which now rests on items 1 and 3
+   alone; each is independently sufficient.** It is kept rather than deleted
+   so the item numbering the surrounding prose refers to stays stable, and
+   so a reader can see the gap existed and was closed rather than wondering
+   whether it was ever considered.
+
+   `_sweep_stale_mem0_pool` applies a THIRD protected-record predicate,
+   `is_protected_audit_record` / `PROTECTED_AUDIT_KINDS` (task 4375), which
+   withholds deliberately-permanent audit records such as
+   `kind='cadence_check'` — the guard added after an age-only rule destroyed
+   40 of them in `autopilot_video`. Task 5286 ported it to the script,
+   together with a primary arm of the script's own; the decision is recorded
+   in [Protected-record guards](#protected-record-guards-denylist-plus-a-primary-arm-task-5286).
+   That does not reopen this item, whose subject was the mirror guard and the
+   tombstone write.
+3. **The pool is already drained correctly** by task 2966's in-cycle
+   collector, on a rolling 14-day window. A second collector here would race
+   a correct one, producing duplicate deletes and duplicate tombstones for
+   the same records.
+
+Whether those records should *ultimately* be deleted is a separate question,
+now adjudicable because the sweep can finally see them. Making them visible
+is this script's job; deleting them is not.
+
+### Protected-record guards: denylist plus a primary arm (task 5286)
+
+Every record the sweep withholds is classified by
+`fused-memory/scripts/sweep_orphan_flag_markers.py::protection_reason`, in
+this order. Each skip's WARNING names its reason, and the JSON report's
+`protected_skipped_reasons` maps each skipped id to it:
+
+1. `cycle_summary_mirror` — `mem0_tombstone.is_protected_mirror_record`
+   (tasks 3041/4435).
+2. `protected_audit_kind` — `mem0_tombstone.is_protected_audit_record`, the
+   `PROTECTED_AUDIT_KINDS` denylist (task 4375).
+3. `foreign_kind` — the script's PRIMARY arm: a `kind` that is present and
+   is not `stage1_flag_marker`.
+
+**Decision:** the denylist PLUS a named primary arm, the foreign-kind arm.
+
+**Why a primary arm is needed.** The denylist protects only the kinds
+someone registered, and in this script that is not enough:
+
+- `find_orphan_markers` (`kind != MARKER_KIND`) nominates any foreign-kind
+  record IMMEDIATELY, at any age and in every mode, so an unregistered audit
+  kind would be reached on the first run.
+- `--terminal-drain` walks into the denylist's residual intersection by
+  design: it deletes markers *because* their task went terminal.
+
+**Why not the terminal-closure gate.** `mem0_tombstone` names the
+terminal-task-closure gate as the primary defence, but `--terminal-drain` is
+its inverse. That gate also guards only the `flag_for_stage2` collector; this
+pool's in-cycle collector, `_sweep_stale_mem0_flag_markers`, is age-based with
+no closure gate, and since task 6241 applies this same foreign-kind arm (see
+[below](#the-in-cycle-collector-applies-the-same-arm-task-6241)).
+
+**Why the foreign-kind arm.** The legacy pool's shape is exactly "kind absent
+or `stage1_flag_marker`", so a declared different kind is positive evidence
+that the record belongs to another pool, and an unregistered audit kind is
+protected without anyone editing a list. The arm ignores task status, so it
+behaves identically with and without `--terminal-drain`. Since task 6241 the
+in-cycle collector withholds the same records, so a foreign-kind record in
+this pool is drained by neither collector; that cost is accepted
+[below](#the-in-cycle-collector-applies-the-same-arm-task-6241).
+
+**Why the denylist is kept.** Correct attribution — an audit record is
+reported as `protected_audit_kind`, never as merely `foreign_kind` — and
+parity with the in-cycle collector, so a future narrowing of the primary arm
+cannot silently drop audit protection.
+
+**The accepted residual.** An audit record that carries NO `kind` is
+protected by neither arm, the same as in-cycle.
+
+**The arm is absolute.** Like the mirror guard, it is enforced at the delete
+choke point and overrides `--delete-ids` (`targeted_correction_ids` still
+shows the refused request). The remedy for a record that genuinely must go is
+the individually authorised fused-memory MCP `delete_memory` tool. Every
+protected record also floors the residual backlog; see
+[`structural_floor`](#structural_floor-which-part-of-the-backlog-can-never-be-drained).
+
+### The in-cycle collector applies the same arm (task 6241)
+
+**Decision:** `_sweep_stale_mem0_flag_markers` withholds foreign-kind records
+too. The rule has one home,
+`fused-memory/src/fused_memory/reconciliation/mem0_tombstone.py::is_foreign_kind_record`,
+called by this script's `protection_reason`, by the in-cycle skeleton
+`_sweep_stale_mem0_pool` through its opt-in `pool_kind` argument, and by the
+`flag_for_stage2` collector's task-less arm (`_TasklessRetirement.permits`,
+task 4995). In-cycle it is checked after the mirror and audit guards and
+before the age test, the same order as `protection_reason`, so an audit record
+is still reported as an audit record. The `flag_for_stage2` collector does not
+pass `pool_kind`: its filter is wide by design, its kinds are a free-form long
+tail, and its primary arm is the terminal-closure gate.
+
+**Census, 2026-10-30**, through the fused-memory MCP
+`count_memories_by_metadata` / `get_memories_by_metadata` against the live
+service, while planning task 6241:
+
+- `{'source': 'stage1_flag_marker'}`: 0 records in all 11 registered
+  projects — `dark_factory`, `reify`, `autopilot_video`, `know_live`,
+  `solar_challenge`, `solar_challenge_platform`, `pump_web_ui`,
+  `scoping_intake`, `stream_touch`, `autotrade` and `mission_control`.
+- `{'kind': 'stage1_flag_marker'}`: 0 in `dark_factory`, `reify`,
+  `autopilot_video` and `know_live` (marker `a5732b3b` has been drained).
+- Positive controls were non-zero — `dark_factory` `{flag_for_stage2: True}`
+  = 1, `autopilot_video` `{kind: cadence_check}` = 2 — so the zeros are not a
+  blind probe.
+
+No live record in this pool declares a foreign kind, so the decision changes
+the outcome for none.
+
+**The create path is closed.** `MemoryService.add_memory` and
+`MemoryService.add_system_record` both call
+`fused-memory/src/fused_memory/reconciliation/flag_record_contract.py::enforce_flag_record_write_contract`,
+which refuses `source='stage1_flag_marker'` with any other non-`None` `kind`
+for every agent, not only `recon-stage-*`. The only residual writer is
+`update_memory`'s metadata patch, which that module's docstring places outside
+the contract.
+
+**Why keep rather than delete.**
+
+- Reconciliation's posture: uncertain means keep, and bounded recoverable
+  growth outranks permanent loss.
+- A structurally opt-in primary arm. `PROTECTED_AUDIT_KINDS` is
+  denylist-by-omission, the failure mode behind the 40 lost `cadence_check`
+  records, and this was the only marker collector without an opt-in arm: an
+  unregistered audit kind carrying `source='stage1_flag_marker'` would have
+  been age-deleted after 14 days, silently and irreversibly.
+- One pool definition. The manual and in-cycle collectors now agree that the
+  pool is "kind absent or `stage1_flag_marker`".
+
+**The accepted consequence.** A foreign-kind record in this pool is drained by
+neither collector. It:
+
+- permanently floors `structural_floor`, which already classifies it as
+  undrainable;
+- defeats the in-cycle count short-circuit for its project, costing one scroll
+  per cycle;
+- emits one WARNING per sweep naming its kind, so it cannot accumulate
+  silently.
+
+The remedy is the fused-memory MCP `delete_memory` tool for a dead record, or
+registering a genuinely permanent audit kind in `PROTECTED_AUDIT_KINDS`.
+
+## Reading the output: `0 swept` is not automatically a clean bill
+
+Because the enumeration filter above matches nothing, the nightly run
+prints `orphan_count: 0` every night, and `--check`'s `backlog_verdict(0,
+N)` holds unconditionally. Neither is evidence of health on its own: both
+are counts taken against a pool the filter cannot see.
+
+Task 3897 makes that legible. Every run now emits a `cross_check` block in
+its JSON report:
+
+```json
+"cross_check": {
+  "source_total": 0,
+  "flag_for_stage2_total": 60,
+  "blind_spot": true,
+  "probe_failed": false
+}
+```
+
+- **`blind_spot: true`** — this sweep matched 0 records while a non-empty
+  adjacent `flag_for_stage2` population exists. Read `orphan_count: 0` as
+  "saw nothing", not "there was nothing". A matching WARNING naming both
+  counts is logged, so it also lands in
+  `journalctl --user -u fused-memory-flag-marker-sweep.service`.
+- **`blind_spot: false` with both totals 0** — a genuine no-op.
+- **`probe_failed: true`** (with `flag_for_stage2_total: null`) — the census
+  probe itself failed; `blind_spot` is then always `false`, because an
+  unobserved population is never reported as an observed blind spot. The
+  sweep is unaffected: the probe is count-only and can never alter the
+  delete set or abort a run.
+
+### `structural_floor`: which part of the backlog can never be drained
+
+A `--check --max-backlog N` violation renders as a plain `rc=1` whether it is
+transient (a drain clears it) or permanent (nothing ever will). Task 4436
+makes that distinction machine-readable. Every run emits:
+
+```json
+"structural_floor": {
+  "undated_kept_count": 1,
+  "undrainable_count": 2,
+  "undrainable_ids": ["u1", "m1"],
+  "max_backlog": 0,
+  "gate_unsatisfiable": true,
+  "gate_evaluated": true
+}
+```
+
+The floor is **the undated-and-undrained members UNION the protected ones** —
+NOT the raw `undated_kept_count`. The two arms differ in kind, and so do
+their remedies:
+
+- **Undated and undrained.** `find_stale_markers` fail-safe keeps a
+  missing/unparseable `created_at` at every `--max-age-days` including `0`,
+  so no age cutoff reaches these — but `--delete-ids` and `--terminal-drain`
+  still can. This arm is therefore **relative to the invocation**: a
+  `--check` without `--terminal-drain` counts terminal-referenced undated
+  markers as floor, which is the honest answer to "can THIS command's gate
+  ever pass". The logged remedy names the missing flag.
+- **Protected.** `cycle_summary` mirrors and `ledger_stamp` records (tasks
+  3041/4435), `PROTECTED_AUDIT_KINDS` audit records (task 4375) and
+  foreign-kind records (task 5286) are refused unconditionally at the delete
+  choke point, overriding even `--delete-ids`. This arm is **absolute**: no flag of this
+  script drains it, so the remedy is the fused-memory MCP `delete_memory`
+  tool or a corrected `source` enumeration.
+
+`undated_kept_count` is repeated inside the block so the raw count and the
+true floor read side by side, because the two can differ in **both**
+directions:
+
+- an undated marker that is also a kind-orphan is deleted this run, so it
+  counts toward `undated_kept_count` and floors **nothing**;
+- a fully dated protected mirror contributes `0` to `undated_kept_count` and
+  floors the backlog **permanently**.
+
+Before task 4436 the WARNING was keyed on the raw count, so the first case
+told operators to raise `--max-backlog` when the true floor was 0.
+
+- **`gate_unsatisfiable: true`** — `undrainable_count > max_backlog`: no
+  re-run of this sweep can ever clear this gate. Computed on every run
+  against the effective `--max-backlog` (default `0`), so a nightly
+  `--apply --terminal-drain` records the fact in its journal JSON too.
+- **`gate_evaluated`** — mirrors `--check`, and is the discriminator between
+  the two things `gate_unsatisfiable` can mean. `true`: a gate really ran
+  and can never pass. `false`: no gate was configured, and this is what the
+  *default* ceiling would have done — the nightly service's shape, which is
+  why `gate_unsatisfiable: true` there is not a failing check. Without this
+  field the block would mix an evaluated verdict with a hypothetical one and
+  give a consumer no way to tell them apart. The matching ERROR is logged
+  only when `gate_evaluated` is `true`, so the nightly service gains no
+  spurious ERROR line for a gate it never runs.
+
+**Clearing the floor is NECESSARY, not sufficient.** `--check` resolves its
+verdict through `_resolve_check_exit_code`, which compares
+`after.total_source` on an `--apply` run and falls back to
+`before.total_source` otherwise — and
+`scripts/fused-memory-flag-marker-check.sh` hardcodes `--check` with no
+`--apply`, so **its** verdict compares the whole enumerated residual rather
+than the floor. Concretely: 10 enumerated members with a floor of 1 under
+`--check --max-backlog 0` reports `gate_unsatisfiable: true`, but raising
+the ceiling to 1 still exits 1, because the comparand is 10. Raise the
+ceiling to at least `undrainable_count` to make the gate *satisfiable at
+all*; raise it to the resolved residual to make *this* run pass. Both
+figures are in the emitted JSON (`structural_floor.undrainable_count` and
+`before.total_source` / `after.total_source`), and the ERROR names them.
+- **The exit code is unchanged by design.** `rc` is the sweep's own, and the
+  orchestrator's `before_done` path renders any `rc != 0` identically as a
+  predicate violation, so a distinct code would buy separability nowhere it
+  is consumed (the same ruling already adjudicated for the blind spot, in
+  `scripts/fused-memory-flag-marker-check.sh`'s header). A consumer that
+  needs to tell a permanent floor from a transient backlog reads
+  `structural_floor.gate_unsatisfiable`, exactly as it reads
+  `cross_check.blind_spot`.
+
+The floor is defined over the sweep's KEEP-sets rather than over an
+enumerated list of sources, so when task 5286 added the audit and
+foreign-kind arms to the protected set, this floor widened automatically.
+
+**An observed blind spot fails `--check` BY DEFAULT (task 3923).** A verdict
+rendered from an enumeration that matched nothing must not read as a pass,
+so `--check` exits 1 on `blind_spot: true` with no flag required.
+`--fail-on-blind-spot` remains accepted as an explicit affirmation of that
+default. `--no-fail-on-blind-spot` is the escape hatch: it returns `--check`
+to a plain backlog verdict, for an ad-hoc census where you want the residual
+count without the vacuity veto. The opt-out relaxes **only** the vacuity
+check — a residual backlog over `--max-backlog` still exits 1. A failed
+census probe never trips the escalation in either mode, so a transient
+Qdrant blip cannot flap the verdict.
+
+**Both spellings require `--check`.** They resolve an exit code only through
+the `--check` verdict path, so on their own either would silently no-op —
+exiting 0 even on an observed blind spot, a gate that cannot fail. The sweep
+rejects the combination at parse time (exit 2) rather than honouring it.
+`scripts/fused-memory-flag-marker-check.sh` already hardcodes `--check` in
+its `exec` line. The nightly `--apply --terminal-drain` service passes
+neither spelling and is unaffected — the armed default is resolved *after*
+that validation precisely so the service keeps parsing cleanly.
+
+## Decision (task 3923): the `--check` gate is retired
+
+**Task 2902 — the esc-2866-1 O2 watch — was the only task ever wired to
+`scripts/fused-memory-flag-marker-check.sh` as a `before_done.script`
+predicate.** It was a one-shot *dated* milestone (`2026-07-29T12:00Z`), not
+a recurring gate: it fired, exited 0, and is `status=done` with
+`done_provenance.kind=deterministic-milestone`. A scan of the live task
+store found no other `before_done` wiring of the wrapper anywhere in the
+project (sixteen other tasks mention the sweep in metadata; all carry
+`before_done: null`). **The gate has zero consumers.**
+
+Three options were considered for the watch task, and two are refuted by the
+measurements above, not merely declined:
+
+- **(a) Retire it — chosen.** Already true de facto in the task store; the
+  work was to make the retirement stick.
+- **(b) Rewire it live with `--fail-on-blind-spot` — rejected.** Keeping a
+  *live recurring* gate and arming it would fail forever and train operators
+  to ignore it. It is also moot: there is no live gate to rewire.
+- **(c) Re-point the gate at a population that varies and is meant to trend
+  to zero — refuted; no such population exists.** Per the census table
+  above: the `source` filter is 0 in every project probed, and `kind` is 0
+  except for the single `know_live` record (`a5732b3b`, open task 3915) —
+  which `total_source` cannot see, so it cannot move the verdict either. The
+  only varying population, `{flag_for_stage2: True}`, is a healthy rolling
+  window drained in-cycle by task 2966 while new markers are minted per run
+  — legitimately never zero, so a `--max-backlog 0` gate on it would fail
+  forever. The DELETE path must never be pointed at it either (see "Why the
+  relay pool is censused, never deleted").
+
+**Why arming the default is not option (b).** Arming a verdict path with
+*zero consumers* means nothing fails forever, because nothing runs it. Its
+only effect is that anyone re-wiring this gate in six months gets a loud
+failure on day one instead of a silent pass forever. Recording the
+retirement in prose alone would have been a prompt-level fix, and this
+subsystem's own RCA (`plans/reify-flag-marker-backlog-rca-2026-07-22.md`
+§3) records that 8 prior prompt-level fixes failed here while every fix that
+held was deterministic — hence a code-level guard rather than a comment. A
+gate that reads as passing from a census that saw nothing is exactly the
+silent fail-soft the repo's loud-over-silent-degradation and
+no-silent-fail-soft invariants forbid.
+
+**If you trip it — the remediation path.** An rc=1 citing
+`cross_check.blind_spot` is not a backlog finding; it says the gate is
+keyed on a filter that sees nothing, so **fix the `source`/`kind`
+enumeration to match how markers are actually tagged (or drop the gate, as
+here) before wiring anything on it** — with `source` structurally 0 and
+`flag_for_stage2` legitimately never empty, that failure is permanent until
+the enumeration is corrected. Silencing it with `--no-fail-on-blind-spot`
+restores exactly the vacuous pass this change exists to eliminate: that
+flag is **census-only, never a gate configuration**.
+
+Whether `sweep_orphan_flag_markers.py` should survive at all was **task
+3498**'s call, answered immediately below; this decision answers its stated
+precondition ("check for live consumers of the `--check` gate before
+removing anything") with: there are none, and 2902 was the only one there
+ever was.
+
+## Decision (task 3498): the script survives as a census instrument
+
+**Verdict: (a) KEEP.** `fused-memory/scripts/sweep_orphan_flag_markers.py`
+stays — but on materially different grounds than the question assumed.
+
+**The drain-side argument for keeping it does not hold.** Task 3498 was
+filed on the premise that the in-cycle drains cover the bulk predicates
+while the script still owns a targeted surface the drains do not reach:
+`--delete-ids` and `--terminal-drain`. That premise is false. Both consume
+`members` — the `{'source': 'stage1_flag_marker'}`-filtered scroll — exactly
+as `find_orphan_markers`, `find_taskless_markers`, `find_stale_markers` and
+`find_terminal_task_markers` do; `--delete-ids` is an *intersection* with
+that scroll (`targeted = [m for m in members if m['id'] in delete_ids]`),
+not an independent path around it. Against a filter measuring 0 in every
+project probed, the entire delete side is a structural no-op. Those
+capabilities are uncovered by the in-cycle drains *and* unreachable — which
+is not a retention argument.
+
+**What is load-bearing is the census.** Task 3897's `cross_check` block and
+`enumeration_blind_spot` are the only instrument in this subsystem that
+renders `orphan_count: 0` legible as "saw nothing" rather than "there was
+nothing", and task 3923 armed `--check` to exit 1 on an observed blind
+spot. Retiring the script would delete the sole detector for the exact
+blind spot the two preceding tasks were spent building. The census has a
+bound: `cross_check` compares the `source` count against the
+`flag_for_stage2` relay pool and never counts the `kind`-only spelling, so
+only the in-cycle collector enumerates that cohort. The cohort measured 0 in
+every project probed by the task-6241 census, and its create path is closed
+by `enforce_flag_record_write_contract` (see
+[The in-cycle collector applies the same arm](#the-in-cycle-collector-applies-the-same-arm-task-6241)).
+That bound narrows what the census proves without reversing the verdict, and
+it strengthens the drain-side conclusion above: the in-cycle drain already
+sees a superset of what the script's delete side sees.
+
+**(b) "narrow it to the targeted predicates" is foreclosed, not
+re-decided.** Task 3897 work item (c) already adjudicated those predicates
+as MEASURED-ZERO, RETAINED, for the reasons recorded under "Scope" above. A
+sibling task's landed ruling was not task 3498's to reopen.
+
+**(c) retire is refused.** The task-3923 finding above retires the *gate* —
+it does not retire the *script*. The census role has no consumer-count
+objection to answer, and the nightly timer is enabled and firing.
+
+**The price of retention, paid by task 3498.** The read-only counterpart
+`scripts/fused-memory-flag-marker-check.sh` had zero tests when this task
+was planned (task 4591 has since added its uv-resolution tests), and its header
+claim — "this performs NO deletions ... so resolve/resume re-runs are
+harmless" — was unenforced prose. The wrapper passes caller args straight
+through and `--check --apply` parses fine (verified: `apply=True
+check=True`), so the "read-only" wrapper was a live deletion vector into a
+`delete_orphan_markers` path that, at the time, lacked the
+`is_protected_mirror_record` guard and the tombstone write the in-cycle
+collector applies. The wrapper now refuses `--apply` with its own exit code
+3, and the sweep's parser sets `allow_abbrev=False`, so no shorter spelling
+reaches `apply=True` (under argparse's default, `--a`, `--ap`, `--app` and
+`--appl` all did). `scripts/tests/test_flag_marker_check_wrapper.py` pins
+the refusal and `fused-memory/tests/test_sweep_orphan_flag_markers_cli.py`
+pins the parser. This follows the
+standing norm from the RCA's §3
+(`plans/reify-flag-marker-backlog-rca-2026-07-22.md`): in this subsystem 8
+prompt-level fixes failed while every fix that held was deterministic.
+
+**What that closes — and what it does not.** The guard covers the check
+wrapper only, so the hazard is narrowed to one entry point rather than
+removed. `scripts/fused-memory-flag-marker-sweep.sh` still execs the same
+script with `--apply --terminal-drain` unconditionally, every night, under
+the systemd timer, so "the wrapper now refuses `--apply`" closes the ad-hoc
+operator vector, not the nightly one. What bounds the nightly path is task
+**4435** (filed by task 3498), which routed `delete_orphan_markers` through
+the same mirror guard and tombstone write the in-cycle collector applies —
+see item 2 under "Why the relay pool is censused, never deleted".
 
 ## Install / enable
 
@@ -47,37 +577,164 @@ the repo's `.env` and needs:
 - `OPENAI_API_KEY` — for embeddings.
 - FalkorDB and Qdrant reachable (`FALKORDB_URI`, default
   `redis://localhost:6379`).
+- `DASHBOARD_KNOWN_PROJECT_ROOTS` — the comma-separated project-root registry
+  the per-project loop is derived from (task 2917). It is **not** in the repo
+  `.env` and **not** in the systemd user manager's own environment: it exists
+  only as an `Environment=` line inside the installed
+  `~/.config/systemd/user/fused-memory.service` unit. The wrapper therefore
+  imports it from that live unit (`systemctl --user show
+  fused-memory.service -p Environment`) and exports it before resolving the
+  list. Reading it back off the same unit the fused-memory server itself runs
+  under makes drift structurally impossible — there is one declaration of the
+  fleet's roots, not a second host-specific copy in a committed unit file that
+  rots the first time a project is added. Same technique and source as
+  `skills/factory-init/scripts/find_escalation_port.py:57-63`. When it cannot
+  be resolved the sweep narrows to `dark_factory` alone and **says so loudly**
+  (a `WARNING:` line naming both the fallback and the cause), at exit 0 —
+  the degradation is persistent, and a non-zero exit would park the `.timer`
+  in `failed` state forever, the same footgun described under
+  "Why no `--check` in the recurring service".
 
 This mirrors the runbook lesson from
 `fused-memory/scripts/cgl_eta_auto_apply.sh`: a fused-memory maintenance
 action must run under the service env, not a bare shell, or the census
 silently narrows.
 
+The unit also pins `Environment=PATH=` (task 2917). `Persistent=true`
+catch-up runs fire at boot, before the login session pushes the user PATH
+into the systemd user manager, and `uv` lives in `$HOME/.local/bin` — absent
+from that minimal boot PATH. OBSERVED 2026-08-18 09:02:44: `exec: uv: not
+found` / `status=127`. The wrapper additionally resolves `uv` to an absolute
+path itself, so a stale installed unit that predates the `Environment=PATH=`
+line is still covered.
+
 ## Schedule
 
 Nightly at 03:30 local time (`scripts/fused-memory-flag-marker-sweep.timer`,
 `Persistent=true` so a missed night catches up on next boot/login). Each run
-drains via:
+loops over **every registered project** (task 2917), one invocation each:
 
 ```
-sweep_orphan_flag_markers.py --apply --terminal-drain
+for project_id in $(sweep_orphan_flag_markers.py --list-known-projects); do
+    sweep_orphan_flag_markers.py --apply --terminal-drain --project-id "$project_id"
+done
 ```
+
+Before this the wrapper `exec`d the sweep exactly once with no `--project-id`,
+riding the parser's own `dark_factory` default while the per-project census it
+printed read as if the whole fleet had been drained.
+`FLAG_MARKER_SWEEP_PROJECT_IDS` (whitespace-separated) overrides the resolved
+list — mirroring the existing `FLAG_MARKER_SWEEP_CMD` / `REPO` override
+convention. `exec` is deliberately dropped and the loop does not `set -e` out
+on the first failure: one project failing must not silently truncate the
+fleet, so each failure is named on stderr with its exit code, the remaining
+projects are still attempted, and the wrapper exits non-zero overall.
+
+### `--terminal-drain` is deliberately PRIMARY-PROJECT-ONLY
+
+`--terminal-drain` is requested uniformly by the loop, but it only ever takes
+effect for the **primary** project — the one whose taskmaster root this
+process is configured with (`config.taskmaster.project_root`). Every other
+registered project is swept **age-only**. The guard is
+`_resolve_terminal_task_ids` in `fused-memory/scripts/sweep_orphan_flag_markers.py`,
+which returns an empty set (and logs a WARNING naming both project_ids) when
+the project being swept is not the primary one. `main()` then logs the
+EFFECTIVE per-project mode, so the journal reports coverage rather than
+intent.
+
+That line names the REASON, not just the outcome, because an empty terminal-id
+set is reached four different ways and they are four different operational
+states: `--terminal-drain` not requested, the primary-project guard narrowing
+a sibling, an unconfigured/failed task backend, and a primary project that
+genuinely has zero terminal tasks. `_resolve_terminal_task_ids` therefore
+returns `(ids, mode)` and `_effective_mode_label` renders each distinctly —
+notably `terminal-drain (0 terminal task ids)` for the authoritative zero, so
+a nightly whose task store failed to open no longer reads like a healthy one.
+
+Why: the sweep resolves terminal task ids from exactly one task store, and
+`run()` matches markers against that set by **plain string membership**. Task
+ids are small integers, so a sibling project's marker whose `task_id` merely
+collides with a terminal `dark_factory` id is the common case, not the corner
+one (measured ~96% collision on the live registry) — and the delete is
+unrecoverable, because mem0's `_delete_memory` removes the Qdrant point
+*before* writing its SQLite history.
+
+The alternative — resolve each project's terminal ids from **its own** task
+store — is mechanically possible (`SqliteTaskBackend.get_statuses` accepts an
+arbitrary root) and was **rejected-for-now, not refuted** (task 2917,
+esc-2917-3). Per-project scoping preserves the existing cross-project
+contract; the alternative *extends* it, arming deletions in projects whose
+task store this process does not own. Declining to extend a contract needs no
+broader authority; extending one does. The damage asymmetry settles it: the
+guard mis-firing costs a lingering marker that the age predicate drains
+anyway; its absence mis-firing costs records that survive nowhere.
+
+### When coverage is not fleet-wide
+
+`--list-known-projects` reports its own coverage on a predicate that is
+**not** emptiness. `build_known_projects_map` seeds its candidates with the
+primary root *before* extending with the env roots, so an unset
+`DASHBOARD_KNOWN_PROJECT_ROOTS` yields a one-entry map, never an empty one —
+an `if not known_projects` check is unreachable in exactly the degradation it
+looks like it guards. Three cases are distinguished:
+
+- **a named root that is not a directory on this host** — a typo, or a
+  moved/unmounted checkout. The builder *admits* such a root under a
+  basename-derived project_id deliberately, and WARNs at build time (task
+  5286; `fused-memory/src/fused_memory/models/scope.py::build_known_projects_map`'s
+  docstring records why). The nightly still sweeps that phantom project,
+  which enumerates 0, deletes 0 and exits 0 — a silent green — so the report
+  names it individually.
+- **a named root whose resolved path is absent from the map** — its
+  project_id was claimed first by a root listed earlier (`first-wins`, with
+  the primary root seeded first), so that checkout is never swept. Named
+  individually.
+- **the env var is unset** — the map is primary-only, so coverage is
+  single-project and the census is not fleet-wide. Reported, but *not* a hard
+  failure: a legitimately single-project install would otherwise
+  warn-as-error forever.
+
+The predicate compares each env-named root's **resolved path** against the
+map's values — the very strings the builder stored. Not root counts: the live
+registry lists the primary root too and the builder drops it as a duplicate
+id, so a count comparison would cry degradation on every healthy run (a path
+comparison is duplicate-proof, since the repeated primary root resolves to a
+path that *is* in the map). And not resolved **ids**, which was the original
+implementation and could not fire for either cause it named: a nonexistent
+root is admitted under an id that IS in the map, and a first-wins collision
+leaves the dropped root's id in the map as the winner's. `_known_projects_map`
+returns the whole `{project_id: project_root}` map for this reason — one
+derivation, read by both consumers (`--list-known-projects` prints
+`sorted(...)` of the keys), with no second manifest read per root.
 
 ## Why no `--check` in the recurring service
 
-The sweep's own docstring/WARNING (see `run()`'s `undated_kept_count`) notes
-that markers with a missing or unparseable `created_at` can never be
-drained by `find_stale_markers`, at any age cutoff — this sets a residual
-floor on the backlog. A recurring `--check --max-backlog 0` service would
-therefore enter systemd `failed` state on every run, forever, whenever any
-undated marker exists — a self-inflicted perpetual-failure footgun. Dropping
-`--check` from the recurring service lets each nightly drain exit 0 on a
-normal run.
+Part of the enumerated population can never be drained by any invocation of
+this sweep — see [`structural_floor`](#structural_floor-which-part-of-the-backlog-can-never-be-drained)
+above. A recurring `--check --max-backlog 0` service would therefore enter
+systemd `failed` state on every run, forever, whenever that floor is nonzero
+— a self-inflicted perpetual-failure footgun. Dropping `--check` from the
+recurring service lets each nightly drain exit 0 on a normal run.
+
+Since task 4436 this is a **checked constraint rather than an unenforced
+caveat**: the nightly run still computes and reports the floor and what a
+hypothetical default-ceiling gate would have done (marked
+`gate_evaluated: false`, so it is never mistaken for a failing check), and an
+invocation that *does* pass `--check` with a ceiling below the floor is told
+so with an ERROR naming the floor, the ceiling and the per-arm remedy,
+instead of failing indistinguishably from a transient over-backlog. Note the
+floor is not equal to `undated_kept_count`, which is why keying a gate on
+that count was itself a footgun — and that clearing the floor is necessary
+but not sufficient for a gate to pass, which is why the ERROR names the
+resolved residual as well.
 
 ## Backstop for residual backlog
 
-Persistent or undrainable residual (chiefly the undated-marker floor above)
-is already surfaced by the existing reconciliation Stage-1/2 re-flag net —
+"Undrainable residual" means precisely `structural_floor.undrainable_count`
+above — the undated-and-undrained members plus the protected ones — not the
+raw `undated_kept_count`, and not a backlog that is merely large. Persistent
+or undrainable residual is already surfaced by the existing reconciliation
+Stage-1/2 re-flag net —
 the very mechanism that filed tasks 2596 and 2693. No new escalation glue
 was added for this. A future enhancement could add a 2663-2666-style
 delayed-predicate born-at-L2 tripwire (e.g. "N days after this task lands,
@@ -95,9 +752,11 @@ venv are actually live, so enabling the timer and running the first drain is
 one reproducible, committed action — it just has to be run post-merge, on
 the host, by an operator. The tests added by this task
 (`scripts/tests/test_flag_marker_sweep_wrapper.py`,
-`scripts/tests/test_install_flag_marker_sweep_timer.py`) assert the wiring
-behavior via fakes (a fake sweep-command recorder, a fake `systemctl`); they
-do not and cannot assert the live drain outcome.
+`scripts/tests/test_install_flag_marker_sweep_timer.py`) and by tasks 4591
+and 3498 (`scripts/tests/test_flag_marker_check_wrapper.py`, covering the read-only
+check wrapper) assert the wiring behavior via fakes (a fake sweep-command
+recorder, a fake `uv`, a fake `systemctl`); they do not and cannot assert
+the live drain outcome.
 
 ## Verifying the drain worked
 
@@ -110,8 +769,30 @@ mcp__fused-memory__count_memories_by_metadata(
 )
 ```
 
-A residual count near the undated-marker floor (see above) is expected and
-healthy; a count that isn't shrinking at all across multiple nightly runs
+A residual count near `structural_floor.undrainable_count` (see above) is
+expected and healthy — that is the floor no invocation can reach below; a count that isn't shrinking at all across multiple nightly runs
 means the timer isn't actually firing — check `systemctl --user
 list-timers` and `journalctl --user -u fused-memory-flag-marker-sweep.service`
 on the host.
+
+**Caveat (tasks 3897, 3923): as of 2026-08-17 this probe still returns 0**
+in every project probed, and a 0 here does not distinguish "the drain
+worked" from "the timer never fired" — both render identically against an
+already-empty pool. To confirm the timer is actually firing, check
+`systemctl --user list-timers` and the journal directly rather than
+inferring it from this count. Running the check wrapper is the other way to
+surface it: since task 3923 armed the default, an rc=1 citing a blind spot
+means "saw nothing", which is the honest reading of that 0. To see the adjacent
+relay pool the timer does **not** drain (and must not), probe it
+explicitly:
+
+```python
+mcp__fused-memory__count_memories_by_metadata(
+    project_id="dark_factory", filters={"flag_for_stage2": True},
+)
+```
+
+A non-zero result there is expected and healthy — it is the in-cycle
+collector's rolling 14-day window, not a backlog. Note the boolean `True`
+is load-bearing: Qdrant payload filters are type-sensitive, and the string
+variant `{"flag_for_stage2": "true"}` matches 0.

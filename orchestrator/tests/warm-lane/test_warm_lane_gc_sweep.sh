@@ -57,6 +57,13 @@
 #         tests/infra/test_warm_lane_gc.sh Block R with task 5572: its vehicle
 #         here was the up-front CSV, which is gone, and the boundary matcher now
 #         lives in scripts/lib_live_refs.sh called by gc.sh directly.
+#   Z — REIFY_WARM_LANE_GC_SWEEP_MODE=trash-and-emergency (task 7859): the
+#         trash reaper and the df floor run as in `full`, but gc.sh is exec'd
+#         ONLY when the floor engaged --disk-pressure; a df failure therefore
+#         means no reclaim at all. An unknown value exits 2 before the reaper
+#         runs; `full` and empty mean the default. Z6 drives the REAL gc.sh in
+#         the production shape (no seed script) to prove the mode never needs
+#         one.
 #
 # Driven by orchestrator/tests/test_warm_lane_bash_suite.py (PORTED_TESTS).
 
@@ -74,6 +81,16 @@ DISK_GUARD="$WARM_LANE_SCRIPTS_DIR/warm-lane-disk-guard.sh"
 }
 # shellcheck source=tests/infra/test_helpers.sh
 source "$SCRIPT_DIR/test_helpers.sh"
+
+# The SHIPPED lane-state lib, sourced for ONE value: $LANE_PROTECT_GLOB_FALLBACK
+# (see the BRIDGE-COST SEAM comment above run_sweep). Read from the lib rather
+# than written here as a literal for the same reason as in the sibling gc suite:
+# a literal would be a hand-maintained mirror of PROTECTED_PREFIXES sitting
+# outside TestProtectGlobFallbackDrift's gate and the byte-equality gate this
+# pin relies on, TestProtectGlobFallbackIsAVerbatimRender (both in
+# orchestrator/tests/test_lane_state_lib.py).
+# shellcheck source=orchestrator/scripts/warm-lane/lib_lane_state.sh
+source "$WARM_LANE_SCRIPTS_DIR/lib_lane_state.sh"
 
 echo "=== scripts/warm-lane-gc-sweep.sh hermetic tests (task 4863) ==="
 
@@ -94,10 +111,35 @@ ERR_FILE="$(mktemp /tmp/test-gc-sweep-err-XXXXXX)"
 _TMPDIRS+=("$ERR_FILE")
 
 # ── run_sweep: invoke the sweep script, capture OUT/ERR_OUT/RC ────────────────
+#
+# BRIDGE-COST SEAM (task 3292) — the same seam as the gc suites' shared
+# run_helper; see the long rationale there
+# (tests/warm-lane/lib_warm_lane_gc_harness.sh).
+# Kept as one idiom on purpose so the two files do not drift into two unrelated
+# ones.
+#
+# warm-lane-gc.sh's PROTECT_GLOB default now renders dark-factory's
+# PROTECTED_PREFIXES through a python3 that imports pydantic, once per gc.sh
+# INVOCATION. FOUR cases here drive the REAL gc.sh via --gc-script "$GC_REAL"
+# (G4, G5, and the two U cases) and so would each pay a full render; every other
+# run_sweep either passes a stub --gc-script or exits at the CLI guard, and is
+# unaffected either way. Pinning gc.sh's own already-documented
+# REIFY_WARM_LANE_GC_PROTECT_GLOB short-circuits that render before it runs. The
+# env propagates unchanged through warm-lane-gc-sweep.sh's terminal
+# `exec "$GC_SCRIPT" …` to gc.sh.
+#
+# NO opt-out helper is needed here, unlike the gc suite's
+# run_helper_live_default: NO assert in this file inspects the protect glob. The
+# four real-gc cases are proving the sweep -> gc handoff and the disk-pressure
+# end-to-end path; the stub cases assert gc.sh's ARGV (`reclaim --mount …`),
+# which an environment variable does not appear in. If a future block here does
+# assert what the DEFAULT protects, it must bypass this pin — the gc suite's
+# run_helper_live_default is the pattern to copy.
 run_sweep() {
     local rc=0
     > "$ERR_FILE"
-    OUT="$(bash "$SCRIPT" "$@" 2>"$ERR_FILE")" || rc=$?
+    OUT="$(REIFY_WARM_LANE_GC_PROTECT_GLOB="$LANE_PROTECT_GLOB_FALLBACK" \
+        bash "$SCRIPT" "$@" 2>"$ERR_FILE")" || rc=$?
     ERR_OUT="$(cat "$ERR_FILE")"
     RC=$rc
 }
@@ -619,8 +661,9 @@ kill "$G5_LOCK_PID" 2>/dev/null || true
 _BGPIDS=()  # clear so cleanup doesn't double-kill
 
 # ── G6: non-integer --critical-free-gib → exit 2 + stderr warning ────────────
-# Regression guard for the CRITICAL_FREE_GIB integer-format validation
-# (scripts/warm-lane-gc-sweep.sh: `grep -qE '^[0-9]+$'` guard, ~L139-143). A
+# Regression guard for warm-lane-gc-sweep.sh's CRITICAL_FREE_GIB validation,
+# which admits only a whole value that is a canonical decimal of at most 5
+# digits (0-99999, no leading zeros) and exits 2 on anything else. A
 # dropped or weakened guard (e.g. accepting "2G" or an empty value) would let
 # the sweep silently compare avail_bytes against a bogus/zero floor and never
 # engage --disk-pressure, with nothing to catch it. Mirrors Block A's
@@ -668,6 +711,28 @@ assert "G6c: REIFY_WARM_LANE_GC_SWEEP_CRITICAL_FREE_GIB=abc exits 2" test "$RC" 
 assert "G6c: stderr warns of invalid integer (env-var path)" \
     bash -c 'printf "%s\n" "$1" | grep -qi "valid integer"' _ "$ERR_OUT"
 assert "G6c: gc-script NOT invoked (usage error precedes exec)" \
+    bash -c '[ ! -f "$1" ] || [ ! -s "$1" ]' _ "$G6_GC_LOG"
+
+# G6d-f: leading-zero (octal-misread) and overflowing magnitudes are rejected.
+# 08 would error out of $(( )) leaving the variable unset, 010 would silently
+# mean 8, and 9223372036854775807 would wrap negative on the 1024^3 multiply.
+for G6_BAD in 08 010 9223372036854775807; do
+    GC_LOG="$G6_GC_LOG" run_sweep --mount "$G6_MOUNT" --gc-script "$G6_GC_STUB" --critical-free-gib "$G6_BAD"
+
+    assert "G6d: --critical-free-gib $G6_BAD exits 2" test "$RC" -eq 2
+    assert "G6d: --critical-free-gib $G6_BAD stderr warns of invalid integer" \
+        bash -c 'printf "%s\n" "$1" | grep -qi "valid integer"' _ "$ERR_OUT"
+    assert "G6d: --critical-free-gib $G6_BAD gc-script NOT invoked" \
+        bash -c '[ ! -f "$1" ] || [ ! -s "$1" ]' _ "$G6_GC_LOG"
+done
+
+# G6g: a multi-line value whose first line is valid is rejected too.
+GC_LOG="$G6_GC_LOG" run_sweep --mount "$G6_MOUNT" --gc-script "$G6_GC_STUB" --critical-free-gib $'2\nx'
+
+assert "G6g: multi-line --critical-free-gib exits 2" test "$RC" -eq 2
+assert "G6g: stderr warns of invalid integer" \
+    bash -c 'grep -qi "valid integer" <<<"$1"' _ "$ERR_OUT"
+assert "G6g: gc-script NOT invoked (usage error precedes exec)" \
     bash -c '[ ! -f "$1" ] || [ ! -s "$1" ]' _ "$G6_GC_LOG"
 
 # ── G7: df succeeds (exit 0) but reports unparseable avail bytes ─────────────
@@ -1150,5 +1215,253 @@ assert "U12: no live reference → --extra-protect-glob NOT appended (no spuriou
     bash -c '! grep -q -- "--extra-protect-glob" "$1"' _ "$U11_GC_LOG"
 assert "U13: gc-script still invoked (the lane scan does not abort the sweep)" \
     bash -c '[ -s "$1" ]' _ "$U11_GC_LOG"
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Block Y — the BRIDGE-COST SEAM's own contract (task 3655)
+# ──────────────────────────────────────────────────────────────────────────────
+#
+# WHY THIS BLOCK EXISTS. run_sweep's header (above) states outright that "NO
+# assert in this file inspects the protect glob". So the pin the whole seam
+# exists for — REIFY_WARM_LANE_GC_PROTECT_GLOB short-circuiting gc.sh's python3
+# render — was, until this block, verified by NOTHING. A silently-broken pin
+# would not fail a single assert here; it would only make the suite slower, and
+# task 3298 showed that a wall-clock change on this host is unattributable.
+# Every assertion below is therefore a SET-MEMBERSHIP or a COUNT, never a
+# duration: a wall-clock assert on this host is a flake generator, which is the
+# whole reason task 3655 was filed.
+#
+# THE DISCRIMINATOR. REIFY_WARM_LANE_IACT_PREFIX moves the interactive band in
+# the RENDERED glob — `lane_protect_glob` emits `..._mainsweep-*,_sentinelband-*`
+# with it set, in place of `..._mainsweep-*,_iact-*`. It does NOT and cannot
+# affect $LANE_PROTECT_GLOB_FALLBACK, which is a static literal. So setting the
+# sentinel alongside run_sweep's existing pin splits the two worlds cleanly:
+#
+#   render SHORT-CIRCUITED (correct) -> applied set is the fallback
+#                                       -> `_iact-` protected, `_sentinelband-` NOT
+#   render RAN (pin broken)          -> applied set is the render
+#                                       -> `_sentinelband-` protected, `_iact-` NOT
+#
+# Y2 and Y3 are that pair, read straight off gc.sh's own `skipping protected:`
+# log line. The entries are plain directories, not git worktrees: gc.sh tests
+# the protect glob BEFORE `_is_git_worktree` (warm-lane-gc.sh, Pass-1
+# enumeration), so a bare mkdir is enough to observe the applied set — and
+# nothing is destroyed, so this block is non-destructive as well as hermetic.
+#
+# COST. This block adds NO render: it drives the real gc.sh through run_sweep,
+# whose pin is the very thing under test. Verified by task 3655's execve
+# counters — one full suite run execs `.venv/bin/python3` exactly ONCE, and that
+# one is Block W's direct `bash "$GC_REAL"` (line ~415), which bypasses
+# run_sweep and so pays the render this pin avoids.
+echo ""
+echo "--- Block Y: bridge-cost seam contract (pin short-circuits the render) ---"
+
+Y_ROOT="$(mktemp -d /tmp/test-gc-sweep-y-XXXXXX)"
+_TMPDIRS+=("$Y_ROOT")
+Y_MOUNT="$Y_ROOT/worktrees"
+Y_BASE="$Y_ROOT/base"
+mkdir -p "$Y_MOUNT/_iact-probe" "$Y_MOUNT/_sentinelband-probe" "$Y_BASE/target.gen.1"
+touch "$Y_BASE/target.gen.1.lock"
+ln -sfn "$Y_BASE/target.gen.1" "$Y_BASE/target"
+
+Y_DF_STUB="$Y_ROOT/df_stub.sh"
+_df_stub "$Y_DF_STUB" 107374182400  # 100 GiB avail — no disk-pressure path
+
+# The sentinel rides ALONGSIDE run_sweep's pin, deliberately: this asserts what
+# the PRODUCTION-SHAPED invocation does, not a bespoke one.
+REIFY_WARM_LANE_IACT_PREFIX=_sentinelband- \
+REIFY_WARM_LANE_GC_SWEEP_DF="$Y_DF_STUB" \
+    run_sweep --mount "$Y_MOUNT" --gc-script "$GC_REAL" --critical-free-gib 2
+
+assert "Y1: exit 0 (pinned real-gc sweep)" test "$RC" -eq 0
+assert "Y2: _iact- IS protected — gc.sh applied the PINNED fallback set" \
+    bash -c 'printf "%s\n" "$1" | grep -qF "skipping protected: _iact-probe"' _ "$ERR_OUT"
+assert "Y3: _sentinelband- NOT protected — the python3 render was short-circuited by the pin" \
+    bash -c '! printf "%s\n" "$1" | grep -qF "skipping protected: _sentinelband-probe"' _ "$ERR_OUT"
+
+# ── Y4: the RENDER MULTIPLIER, as a count ─────────────────────────────────────
+# "Renders per suite run" = "renders per gc.sh invocation" x "gc.sh invocations
+# per sweep". Y2/Y3 pin the first factor at ZERO for the pinned path; this pins
+# the second at ONE, so the product stays checkable if either factor moves.
+# Counted through the existing stub-with-call-log idiom (_t_gc_stub -> $GC_LOG),
+# NOT through strace, which needs ptrace permissions the offline/CI lane may not
+# grant.
+Y4_ROOT="$(mktemp -d /tmp/test-gc-sweep-y4-XXXXXX)"
+_TMPDIRS+=("$Y4_ROOT")
+Y4_MOUNT="$Y4_ROOT/worktrees"
+mkdir -p "$Y4_MOUNT/_lane-1/target"
+
+Y4_GC_LOG="$Y4_ROOT/gc_calls.log"
+Y4_GC_STUB="$Y4_ROOT/gc_stub.sh"
+_t_gc_stub "$Y4_GC_STUB"
+
+Y4_DF_STUB="$Y4_ROOT/df_stub.sh"
+_df_stub "$Y4_DF_STUB" 107374182400
+
+GC_LOG="$Y4_GC_LOG" REIFY_WARM_LANE_GC_SWEEP_DF="$Y4_DF_STUB" \
+    run_sweep --mount "$Y4_MOUNT" --gc-script "$Y4_GC_STUB" --critical-free-gib 2
+
+assert "Y4: exactly ONE gc.sh invocation per sweep (the render multiplier, as a count)" \
+    bash -c '[ "$(wc -l < "$1")" -eq 1 ]' _ "$Y4_GC_LOG"
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Block Z — trash-and-emergency mode (task 7859)
+# ──────────────────────────────────────────────────────────────────────────────
+# REIFY_WARM_LANE_GC_SWEEP_MODE is set in the unit's Environment=, never by a
+# flag, so every case passes it as an INLINE prefix to run_sweep, never
+# exported. In trash-and-emergency mode routine Pass-1 reclaim belongs to the
+# orchestrator arm; this sweep keeps only the trash reaper and the ENOSPC valve.
+# Rationale: orchestrator/scripts/warm-lane/README.md "Delta 14".
+echo ""
+echo "--- Block Z: trash-and-emergency mode (task 7859) ---"
+
+Z_ROOT="$(mktemp -d /tmp/test-gc-sweep-z-XXXXXX)"
+_TMPDIRS+=("$Z_ROOT")
+
+# _z_logging_df DFLOG INNER — print a df wrapper that appends one line to DFLOG
+# and then runs INNER, so a case can prove the measurement still happened.
+_z_logging_df() {
+    printf '#!/usr/bin/env bash\necho measured >> %q\nexec %q "$@"\n' "$1" "$2"
+}
+
+# _z_case NAME DF-KIND — a fresh mount holding one dead-PID .reseed-trash entry,
+# a logging gc stub and a logging df of DF-KIND (above | below | fail |
+# garbage). Publishes Z_MOUNT, Z_ENTRY, Z_GC_STUB, Z_GC_LOG, Z_DF, Z_DF_LOG.
+_z_case() {
+    local dir="$Z_ROOT/$1" kind="$2" dead_pid
+    Z_MOUNT="$dir/worktrees"
+    mkdir -p "$Z_MOUNT/.reseed-trash"
+    true &
+    dead_pid=$!
+    wait "$dead_pid" 2>/dev/null || true
+    Z_ENTRY="$Z_MOUNT/.reseed-trash/_lane-1.$dead_pid"
+    mkdir -p "$Z_ENTRY"
+    touch "$Z_ENTRY/stranded-file"
+    Z_GC_STUB="$dir/gc_stub.sh"
+    Z_GC_LOG="$dir/gc_calls.log"
+    _t_gc_stub "$Z_GC_STUB"
+    case "$kind" in
+        above)   _df_stub "$dir/df_inner.sh" 107374182400 ;;  # 100 GiB
+        below)   _df_stub "$dir/df_inner.sh" 1073741824 ;;    # 1 GiB
+        fail)    _df_fail_stub "$dir/df_inner.sh" ;;
+        garbage) _df_garbage_stub "$dir/df_inner.sh" ;;
+    esac
+    Z_DF_LOG="$dir/df_calls.log"
+    Z_DF="$dir/df.sh"
+    _z_logging_df "$Z_DF_LOG" "$dir/df_inner.sh" > "$Z_DF"
+    chmod +x "$Z_DF"
+}
+
+# ── Z1: above the floor ⇒ trash reaped, df measured, gc.sh NOT invoked ────────
+_z_case z1 above
+GC_LOG="$Z_GC_LOG" REIFY_WARM_LANE_GC_SWEEP_DF="$Z_DF" \
+REIFY_WARM_LANE_GC_SWEEP_MODE=trash-and-emergency \
+    run_sweep --mount "$Z_MOUNT" --gc-script "$Z_GC_STUB" --critical-free-gib 2
+
+assert "Z1: exit 0" test "$RC" -eq 0
+assert "Z1: gc-script NOT invoked above the floor (routine reclaim is the orchestrator arm's)" \
+    bash -c '[ ! -s "$1" ]' _ "$Z_GC_LOG"
+assert "Z1: the dead-PID trash entry IS reaped (the reaper still runs)" \
+    bash -c '[ ! -d "$1" ]' _ "$Z_ENTRY"
+assert "Z1: df WAS invoked (the emergency floor is still measured)" \
+    bash -c '[ -s "$1" ]' _ "$Z_DF_LOG"
+assert "Z1: stderr says routine reclaim was not run" \
+    bash -c 'printf "%s\n" "$1" | grep -qiF "not invoked"' _ "$ERR_OUT"
+
+# ── Z2: at or below the floor ⇒ gc.sh invoked with --disk-pressure ────────────
+_z_case z2 below
+GC_LOG="$Z_GC_LOG" REIFY_WARM_LANE_GC_SWEEP_DF="$Z_DF" \
+REIFY_WARM_LANE_GC_SWEEP_MODE=trash-and-emergency \
+    run_sweep --mount "$Z_MOUNT" --gc-script "$Z_GC_STUB" --critical-free-gib 2
+
+assert "Z2: exit 0" test "$RC" -eq 0
+assert "Z2: gc-script invoked as reclaim --mount <dir> --disk-pressure" \
+    bash -c 'grep -qxF -- "reclaim --mount $2 --disk-pressure" "$1"' _ "$Z_GC_LOG" "$Z_MOUNT"
+
+# ── Z3: a df failure, or unparseable df output ⇒ no reclaim at all ────────────
+# Emergency engages only on a positive low-water measurement, exactly as in
+# `full`; here the fallback is nothing rather than plain reclaim.
+for _z3_arm in fail garbage; do
+    _z_case "z3-$_z3_arm" "$_z3_arm"
+    GC_LOG="$Z_GC_LOG" REIFY_WARM_LANE_GC_SWEEP_DF="$Z_DF" \
+    REIFY_WARM_LANE_GC_SWEEP_MODE=trash-and-emergency \
+        run_sweep --mount "$Z_MOUNT" --gc-script "$Z_GC_STUB" --critical-free-gib 2
+
+    case "$_z3_arm" in
+        fail)    _z3_warn="df measurement failed" ;;
+        garbage) _z3_warn="df reported unparseable avail bytes" ;;
+    esac
+    assert "Z3 ($_z3_arm): exit 0" test "$RC" -eq 0
+    assert "Z3 ($_z3_arm): gc-script NOT invoked" \
+        bash -c '[ ! -s "$1" ]' _ "$Z_GC_LOG"
+    assert "Z3 ($_z3_arm): the existing df-fallback warn is still emitted" \
+        bash -c 'printf "%s\n" "$1" | grep -F "WARN" | grep -qF "$2"' _ "$ERR_OUT" "$_z3_warn"
+done
+
+# ── Z4: an unknown mode exits 2 BEFORE the reaper acts ────────────────────────
+_z_case z4 above
+GC_LOG="$Z_GC_LOG" REIFY_WARM_LANE_GC_SWEEP_DF="$Z_DF" \
+REIFY_WARM_LANE_GC_SWEEP_MODE=trash-only \
+    run_sweep --mount "$Z_MOUNT" --gc-script "$Z_GC_STUB" --critical-free-gib 2
+
+assert "Z4: an unknown mode exits 2 (wiring error, like --critical-free-gib's guard)" \
+    test "$RC" -eq 2
+assert "Z4: stderr names REIFY_WARM_LANE_GC_SWEEP_MODE and the bad value" \
+    bash -c 'printf "%s\n" "$1" | grep -F "REIFY_WARM_LANE_GC_SWEEP_MODE" | grep -qF "trash-only"' _ "$ERR_OUT"
+assert "Z4: gc-script NOT invoked" \
+    bash -c '[ ! -s "$1" ]' _ "$Z_GC_LOG"
+assert "Z4: the dead-PID trash entry is NOT reaped (the value is rejected before acting)" \
+    test -d "$Z_ENTRY"
+
+# ── Z5: `full`, explicit or empty, is the default ─────────────────────────────
+for _z5_mode in full ''; do
+    _z_case "z5-${_z5_mode:-empty}" above
+    GC_LOG="$Z_GC_LOG" REIFY_WARM_LANE_GC_SWEEP_DF="$Z_DF" \
+    REIFY_WARM_LANE_GC_SWEEP_MODE="$_z5_mode" \
+        run_sweep --mount "$Z_MOUNT" --gc-script "$Z_GC_STUB" --critical-free-gib 2
+
+    assert "Z5 (mode='$_z5_mode'): exit 0" test "$RC" -eq 0
+    assert "Z5 (mode='$_z5_mode'): plain reclaim --mount <dir> invoked above the floor" \
+        bash -c 'grep -qxF -- "reclaim --mount $2" "$1"' _ "$Z_GC_LOG" "$Z_MOUNT"
+done
+
+# ── Z6: end to end with the REAL gc.sh in the production shape ───────────────
+# No --seed-script reaches gc.sh (the sweep never passes one), the env default is
+# blanked, and dark-factory ships no sibling seed-warm-lane.sh, so a routine
+# reclaim could only preserve. The mode never needs a seed: above the floor gc.sh
+# does not run, below it gc.sh deletes target/ outright.
+assert "Z6: fixture — the sibling default seed-warm-lane.sh really is absent" \
+    bash -c '[ ! -e "$1" ]' _ "$WARM_LANE_SCRIPTS_DIR/seed-warm-lane.sh"
+for _z6_arm in above below; do
+    _z6_root="$Z_ROOT/z6-$_z6_arm"
+    mkdir -p "$_z6_root/worktrees" "$_z6_root/base/target.gen.1"
+    make_repo "$_z6_root/repo"
+    touch "$_z6_root/base/target.gen.1.lock"
+    ln -sfn "$_z6_root/base/target.gen.1" "$_z6_root/base/target"
+    git -C "$_z6_root/repo" worktree add -q "$_z6_root/worktrees/_lane-1"
+    mkdir -p "$_z6_root/worktrees/_lane-1/target"
+    touch "$_z6_root/worktrees/_lane-1/target/DIVERGENT_MARKER"
+    case "$_z6_arm" in
+        above) _df_stub "$_z6_root/df_stub.sh" 107374182400 ;;
+        below) _df_stub "$_z6_root/df_stub.sh" 1073741824 ;;
+    esac
+
+    REIFY_WARM_LANE_GC_SWEEP_DF="$_z6_root/df_stub.sh" \
+    REIFY_WARM_LANE_GC_SEED_SCRIPT='' \
+    REIFY_WARM_LANE_GC_SWEEP_MODE=trash-and-emergency \
+        run_sweep --mount "$_z6_root/worktrees" --gc-script "$GC_REAL" --critical-free-gib 2
+
+    assert "Z6 ($_z6_arm): exit 0" test "$RC" -eq 0
+    if [ "$_z6_arm" = above ]; then
+        assert "Z6 (above): target/ is untouched (divergent marker still present)" \
+            test -f "$_z6_root/worktrees/_lane-1/target/DIVERGENT_MARKER"
+        assert "Z6 (above): gc.sh did not run — stdout carries no reclaim: line" \
+            bash -c '! printf "%s\n" "$1" | grep -q "^reclaim:"' _ "$OUT"
+    else
+        assert "Z6 (below): target/ is deleted outright (the emergency rm needs no seed)" \
+            bash -c '[ ! -e "$1" ]' _ "$_z6_root/worktrees/_lane-1/target"
+        assert "Z6 (below): the summary counts the lane reset (reset=1)" \
+            bash -c 'printf "%s\n" "$1" | grep -qE "^reclaim: reset=1 "' _ "$OUT"
+    fi
+done
 
 test_summary

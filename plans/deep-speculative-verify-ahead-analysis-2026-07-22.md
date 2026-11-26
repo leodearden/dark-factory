@@ -19,6 +19,12 @@ a tail-latency win, not a throughput win. Recommend **not** building deep specul
 for reify now; revisit if reify's sustained arrival rate rises enough that the merge
 queue becomes verify-bound.
 
+**Forward pointer (2026-09-16):** the demand-limited premise that drove this NO-GO was
+retired by the post-path-concurrency arrival regime (see `plans/deep-merge-ahead-prd.md`
+§ Background) and §11.5's corrected mechanism is now implemented and shipped behind
+`merge_deep.chain_cap` — the verdict above is unchanged, and is retained as the verdict
+of record for its own date and premise.
+
 ---
 
 ## 1. Empirical calibration (reify runs.db, trailing 30 days, read-only)
@@ -830,6 +836,20 @@ that reify's queue is shallow and demand-limited, which caps the prize at "modes
 real QoS/CPU gains during backlogs," not "more throughput."
 
 ### 11.5 Correction (2026-07-22): stack-selection / reordering is NOT required
+
+**IMPLEMENTED 2026-09-16 as `plans/deep-merge-ahead-prd.md`; the correction below is
+retained verbatim as the design of record.** §11.5's corrected mechanism — deepen the
+*adjacent* stack, truncate at the first file conflict, verify the built tip, in-order
+CAS-land the prefix — shipped as tasks 3183 (α, the `merge_deep.chain_cap` config knob),
+3184 (β, chain builder), 3185 (γ, deep-tip dispatch + halving), 3186 (δ, prefix landing)
+and 3187 (ι, the two-way boundary/integration gate), behind `merge_deep.chain_cap`
+(default `0`, the kill switch). The observability leaf was the exception: as of
+2026-09-16, ε (3188 — the chain-depth histogram, items-per-verify and deep-fail reader)
+was still **pending**, though `--chains` in `scripts/merge_lane_throughput.py` already
+reports chain landings and observed lengths, so the mechanism is not unobserved.
+§11.5's prediction held: **no stack-selection or reordering controller was built**, and
+the PRD's decisions 1 and 4 *are* §11.5's truncate-at-conflict adjacent build. The
+operator view is OPERATIONS.md §5 "Deep merge-ahead chains".
 
 An earlier draft of this re-verdict (and the §10.4 lever) recommended a **crate-disjoint
 stack-selection controller** — reorder the frozen prefix to pick a mutually-disjoint

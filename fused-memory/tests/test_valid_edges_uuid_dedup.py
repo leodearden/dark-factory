@@ -18,6 +18,26 @@ from _fm_helpers import extract_cypher, extract_params
 
 _LOGGER_NAME = 'fused_memory.backends.graphiti_client'
 
+
+def page_cypher(ro_query_mock) -> str:
+    """Return the SKIP/LIMIT page query from a paginated read's recorded calls.
+
+    get_all_valid_edges is paginated (task 4340), so it issues a single-row
+    ``count(*)`` census probe followed by N page queries. ``call_args`` is only
+    the LAST call, which makes it the wrong thing to assert the read's shape
+    against; find the page query explicitly instead.
+    """
+    pages = [
+        extract_cypher(c)
+        for c in ro_query_mock.call_args_list
+        if 'SKIP' in extract_cypher(c)
+    ]
+    assert pages, (
+        'no SKIP/LIMIT page query was issued — the read is not paginated: '
+        f'{[extract_cypher(c) for c in ro_query_mock.call_args_list]}'
+    )
+    return pages[0]
+
 # ---------------------------------------------------------------------------
 # step-1: GraphitiBackend.get_valid_edges_for_node
 # ---------------------------------------------------------------------------
@@ -46,7 +66,7 @@ class TestGetValidEdgesForNodeUuidDedup:
     async def test_self_loop_collapsed_by_uuid(self, mock_config, make_backend, make_graph_mock):
         """A self-loop's duplicate rows (same e.uuid) collapse to exactly one edge."""
         backend = make_backend(mock_config)
-        graph = make_graph_mock(ro_rows=[['e1', 'f', 'n'], ['e1', 'f', 'n']])
+        graph = make_graph_mock(ro_rows=[['e1', 'f', 'n', None, None], ['e1', 'f', 'n', None, None]])
         backend._driver._get_graph = MagicMock(return_value=graph)
         result = await backend.get_valid_edges_for_node('u', group_id='test')
         assert len(result) == 1
@@ -56,7 +76,7 @@ class TestGetValidEdgesForNodeUuidDedup:
     async def test_distinct_uuid_edges_all_returned(self, mock_config, make_backend, make_graph_mock):
         """Rows with distinct e.uuid values are not over-collapsed."""
         backend = make_backend(mock_config)
-        graph = make_graph_mock(ro_rows=[['e1', 'f1', 'n1'], ['e2', 'f2', 'n2']])
+        graph = make_graph_mock(ro_rows=[['e1', 'f1', 'n1', None, None], ['e2', 'f2', 'n2', None, None]])
         backend._driver._get_graph = MagicMock(return_value=graph)
         result = await backend.get_valid_edges_for_node('u', group_id='test')
         assert len(result) == 2
@@ -66,7 +86,7 @@ class TestGetValidEdgesForNodeUuidDedup:
     async def test_null_fact_name_coerced(self, mock_config, make_backend, make_graph_mock):
         """NULL fact/name properties coerce to empty string via _edge_dict."""
         backend = make_backend(mock_config)
-        graph = make_graph_mock(ro_rows=[['e1', None, None]])
+        graph = make_graph_mock(ro_rows=[['e1', None, None, None, None]])
         backend._driver._get_graph = MagicMock(return_value=graph)
         result = await backend.get_valid_edges_for_node('u', group_id='test')
         assert result[0]['fact'] == ''
@@ -85,11 +105,17 @@ class TestGetValidEdgesForNodeUuidDedup:
         out in review: dedup must not silently undercount without a trace.
         """
         backend = make_backend(mock_config)
-        graph = make_graph_mock(ro_rows=[['e1', 'first-fact', 'first-name'], ['e1', 'second-fact', 'second-name']])
+        graph = make_graph_mock(ro_rows=[
+            ['e1', 'first-fact', 'first-name', None, None],
+            ['e1', 'second-fact', 'second-name', None, None],
+        ])
         backend._driver._get_graph = MagicMock(return_value=graph)
         with caplog.at_level(logging.DEBUG, logger=_LOGGER_NAME):
             result = await backend.get_valid_edges_for_node('u', group_id='test')
-        assert result == [{'uuid': 'e1', 'fact': 'first-fact', 'name': 'first-name'}]
+        assert result == [{
+            'uuid': 'e1', 'fact': 'first-fact', 'name': 'first-name',
+            'valid_at': None, 'invalid_at': None,
+        }]
         assert any('e1' in record.getMessage() for record in caplog.records)
 
     @pytest.mark.asyncio
@@ -98,11 +124,14 @@ class TestGetValidEdgesForNodeUuidDedup:
     ):
         """The ordinary self-loop double-match (identical rows) stays silent — no false-positive diagnostic."""
         backend = make_backend(mock_config)
-        graph = make_graph_mock(ro_rows=[['e1', 'f', 'n'], ['e1', 'f', 'n']])
+        graph = make_graph_mock(ro_rows=[['e1', 'f', 'n', None, None], ['e1', 'f', 'n', None, None]])
         backend._driver._get_graph = MagicMock(return_value=graph)
         with caplog.at_level(logging.DEBUG, logger=_LOGGER_NAME):
             await backend.get_valid_edges_for_node('u', group_id='test')
-        assert caplog.records == []
+        # Scoped to the dedup diagnostic this test is actually about. A bare
+        # `caplog.records == []` also doubled as an accidental "this module
+        # never logs anything" pin, which is not what it was written to test.
+        assert not [r for r in caplog.records if 'e1' in r.getMessage()]
 
 
 # ---------------------------------------------------------------------------
@@ -120,11 +149,14 @@ class TestGetAllValidEdgesUuidDedup:
         graph = make_graph_mock(ro_rows=[])
         backend._driver._get_graph = MagicMock(return_value=graph)
         await backend.get_all_valid_edges(group_id='test')
-        cypher = extract_cypher(graph.ro_query.call_args)
+        cypher = page_cypher(graph.ro_query)
         assert 'WITH DISTINCT' not in cypher
         assert 'RELATES_TO' in cypher
         assert 'invalid_at IS NULL' in cypher
-        graph.ro_query.assert_awaited_once()
+        # The read is paginated (task 4340): one census probe plus N pages, so
+        # "exactly one query" is no longer the shape. The load-bearing half of
+        # that original assertion — this stays on the read-only path — is kept.
+        assert graph.ro_query.await_count >= 1
         graph.query.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -188,4 +220,9 @@ class TestGetAllValidEdgesUuidDedup:
         backend._driver._get_graph = MagicMock(return_value=graph)
         with caplog.at_level(logging.DEBUG, logger=_LOGGER_NAME):
             await backend.get_all_valid_edges(group_id='test')
-        assert caplog.records == []
+        # Scoped to the dedup diagnostic this test is actually about — see the
+        # get_valid_edges_for_node twin above.
+        assert not [
+            r for r in caplog.records
+            if 'e1' in r.getMessage() or "('A', 'e1')" in r.getMessage()
+        ]

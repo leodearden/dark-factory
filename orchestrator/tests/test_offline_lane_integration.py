@@ -1,9 +1,10 @@
-"""Integration gate for the offline deep-test lane (task 1955, ζ).
+"""Integration gate for the offline deep-test lane (task 1955, ζ; red path, task 6861).
 
-Stands up the REAL trigger→worker→warm-worktree→failure-handling chain
-end-to-end and runs PRD §8 boundary scenarios B1-B8 for
-``offline-deep-test-lane-worker.md``.  No production module is touched by
-this task — every scenario below asserts already-landed behaviour from:
+Stands up the REAL trigger→worker→warm-worktree→red-path chain end-to-end and
+runs PRD §8 boundary scenarios B1-B8 for ``offline-deep-test-lane-worker.md``.
+Since task 6861, B4-B7 and the usage-dump row assert the red path of
+``plans/offline-lane-red-path-prd.md`` (its §6 scenarios in brackets below)
+through the same chain:
 
 * β1 (task 1951) — ``Harness._offline_lane_notifiee`` / ``_note_merge_all`` /
   ``_note_offline_lane`` fan-out (``harness.py``).
@@ -13,27 +14,39 @@ this task — every scenario below asserts already-landed behaviour from:
   prune exemption).
 * β2 (task 1953) — ``OfflineLaneWorker`` (``offline_lane.py``): the
   coalescing ``run()`` loop, the always-from-head ``_run_once`` snapshot,
-  and the injectable ``suite_runner`` / ``confirmation_runner`` seams.
-* β3 (task 1954) — ``OfflineLaneWorker._handle_red_run`` (confirmation,
-  fingerprinting, dedup'd fix-task file/update, L0/L2 escalation staging).
+  and the injectable detect seams.
+* δ2 (task 6861) — each pass is ``offline_lane_pass.py::run_pass`` (detect,
+  confirm, the engine), and ``offline_lane_episodes.py::LaneEngine`` decides
+  what a red pass holds, files or escalates.
 
-STRATEGY — injected-seam integration harness: the real reify-side heavy
-suite run (Part A, cross-project, not yet on reify ``main``) is faked ONLY
-at the ``suite_runner`` / ``confirmation_runner`` boundary — every other
-component in the chain (the git repo, ``GitOps``, ``Harness`` fan-out,
-``OfflineLaneWorker``, ``EscalationQueue``) is real.  See the task's
-``.task/plan.json`` analysis for the full rationale.
+STRATEGY — B1-B3 inject the numeric ``suite_runner`` seam.  The red-path rows
+inject nothing at the run boundary: each commits a fixture command to main (a
+real pytest project whose ``test_target`` reads its verdict from a control
+directory, or a stub ``scripts/run-offline-deep.sh``) and the worker's default
+seams run it in the real ``_offline-deep`` worktree.  What a red-path row fakes
+is the task store (``_lane_episode_fakes.py::FakeLedgerClient``, the seam
+``chronic_flake.py::SchedulerChronicFlakeTaskClient`` fills in production) and
+the clock (the worker's ``now``, so passes are spaced without sleeping); the
+escalation queue is real.
 
-Scenario map (PRD §8):
+Scenario map (PRD §8; red-path §6 scenarios in brackets):
 
   B1 - advance triggers a from-head run
   B2 - coalescing under a burst of advances
   B3 - never-a-gate (C7): prompt return, fail-open, no halt/gate
-  B4 - confirmed red files a normal fix task + L0 info escalation
-  B5 - dedup: a same-set recurrence updates rather than duplicates
-  B6 - flake filtered: fail-then-pass on confirmation is not a red
-  B7 - stall promotes to a born-at-L2 escalate_blocker
+  B4 - a confirmed red is held at one counted pass; a reproduction 30 minutes
+       later files exactly one task [3, 4]
+  B5 - a persistent red under an open task files no second task and raises
+       one escalation at 24 h; a covered test green then red again files
+       nothing [13, 14]
+  B6 - a red the narrowed confirm clears ends its episode, files nothing [6]
+  B7 - a cancelled covering task: one escalation at 24 h; once it is resolved
+       the next red is held and a second spaced red files a task naming the
+       prior [13, 15]
   B8 - target/worktree ISOLATION (offline-deep path != merge-verify path)
+  usage dump - a numeric confirm that prints verify.sh's usage is
+       unconfirmable on two spaced passes: one command-level task, naming no
+       test [8]
 
 OUT OF SCOPE:
 
@@ -44,37 +57,151 @@ OUT OF SCOPE:
 
 from __future__ import annotations
 
+import ast
 import asyncio
-import contextlib
+import inspect
 import logging
+import os
+from dataclasses import dataclass
 from pathlib import Path
-from typing import cast
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from _orch_helpers import pydantic_spec
+from _git_fixtures import SEED_REPO_MAX_GIT_SPAWNS, seed_repo
+from _lane_episode_fakes import Clock, FakeLedgerClient
+from _offline_lane_drive import await_lane_passes
+from _orch_helpers import (
+    MEASURED_SPAWN_LATENCY_SECS,
+    VERIFY_CLI_PER_TEST_TIMEOUT,
+    env_resolving_running_interpreter,
+    required_timeout_secs,
+)
+from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 
-from orchestrator.config import GitConfig, OrchestratorConfig
+from orchestrator.config import FusedMemoryConfig, GitConfig, LaneCommand, OrchestratorConfig
+from orchestrator.flake_ledger import (
+    FlakeCallSite,
+    FlakeVerdict,
+    ledger_db_path,
+    read_occurrences,
+)
 from orchestrator.git_ops import GitOps, _run
 from orchestrator.harness import Harness
 from orchestrator.offline_lane import OfflineLaneWorker
+from orchestrator.offline_lane_episode_state import (
+    CommandRecord,
+    Episode,
+    EpisodeStore,
+    unconfirmable_node,
+)
+from orchestrator.offline_lane_escalations import UNLANDED_RED_CATEGORY, sentinel_task_id
+from orchestrator.offline_lane_records import LEGACY_NUMERIC_COMMAND
+from orchestrator.offline_lane_runs import RUN_OFFLINE_DEEP_SCRIPT
 
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Shared end-to-end scaffolding (prerequisite P1)
+# Timeout bounds (task 4030) — named constants for the bounded waits below,
+# replacing six near-identical inline 30.0 literals (the duplication that let
+# a single false citation drift into three near-verbatim docstring copies).
+# Modeled on the repo's own constant-plus-derivation-comment convention:
+# _orch_helpers.py's CANCEL_SCOPE_BARRIER_TIMEOUT / CANCEL_SCOPE_PURE_UNIT_TIMEOUT
+# and test_lane_lock_leak_guard.py's _FOREIGN_HOLDER_* block. The full floor
+# (task 3451's measured spawn latency) / ceiling (the effective per-test pytest-timeout)
+# derivation lives in `_run_lane`'s docstring below; the executable pins are
+# `test_lane_bounds_clear_the_measured_floor_and_the_global_ceiling` and
+# `test_every_composing_caller_carries_a_timeout_override`.
 # ---------------------------------------------------------------------------
 
+# Bound for a single `_run_lane` pass / `_ControllableSuiteRunner.wait_entered`
+# call. See `_run_lane`'s docstring for the full derivation.
+_LANE_PASS_BOUND_SECS = 30.0
 
-async def _setup_repo(repo: Path) -> None:
-    """Create a real git repo with an initial commit (mirrors test_git_ops.py)."""
-    await _run(['git', 'init', '-b', 'main'], cwd=repo)
-    await _run(['git', 'config', 'user.email', 'test@test.com'], cwd=repo)
-    await _run(['git', 'config', 'user.name', 'Test'], cwd=repo)
-    (repo / 'README.md').write_text('# Test\n')
-    await _run(['git', 'add', '-A'], cwd=repo)
-    await _run(['git', 'commit', '-m', 'Initial commit'], cwd=repo)
+# Bound for `_assert_never_a_gate`'s `_note_offline_lane` promptness check.
+_NOTE_OFFLINE_LANE_BOUND_SECS = 0.5
+
+# Bound for `_assert_never_a_gate`'s `_note_merge_all` promptness check.
+_NOTE_MERGE_ALL_BOUND_SECS = 15.0
+
+# task 3836's own fraction, reused rather than re-derived: the CEILING a
+# marker-less test's worst-case bounded-wait budget must stay under, as a
+# fraction of the effective per-test pytest-timeout. The remaining 40% is
+# headroom for real-git fixture setup/teardown sharing the same per-test
+# budget (pytest-timeout times the whole `pytest_runtest_protocol`, not just
+# the call phase, whenever `func_only` is unset -- true everywhere in this
+# repo). See `test_lane_bounds_clear_the_measured_floor_and_the_global_ceiling`
+# for the full derivation.
+_MARKERLESS_CEILING_FRACTION = 0.6
+
+# The measured worst-case count of subprocess spawns inside a single lane
+# pass -- the multiplier `_LANE_PASS_BOUND_SECS`'s floor check is sized
+# against. The shared worst case lives in the SIBLING infra module, whose
+# `test_a_warm_infra_red_pass_is_the_lane_pass_floor_multiplier` measures it
+# over a warm infra red pass; this module's
+# `test_lane_bounds_clear_the_measured_floor_and_the_global_ceiling` pins this
+# copy to that one by equality. It prices the pass alone, not a whole
+# `_run_lane` window: B3's window also holds the caller's own
+# `_assert_never_a_gate` work, which this floor does not cover.
+_SPAWNS_PER_LANE_PASS_WORST_CASE = 6
+
+# Task 4203 — the multiplicands `_orch_helpers.py::required_timeout_secs` prices at
+# `MEASURED_SPAWN_LATENCY_SECS` per spawn. The `repo` fixture is one seed_repo
+# call, priced at its worst case (a cold template); measured where seed_repo
+# lives, as `_git_fixtures.py::SEED_REPO_MAX_GIT_SPAWNS`.
+_SPAWNS_PER_REPO_FIXTURE = SEED_REPO_MAX_GIT_SPAWNS
+
+# Task 4203 — the other multiplicand of `required_timeout_secs`. MEASURED,
+# not hand-counted (see `test_out_of_bound_spawn_counts_are_measured_not_asserted`):
+# `_drive_advance` costs `get_main_sha` (1) plus `_advance_main`'s `add` /
+# `commit` / `rev-parse` (3) = 4. This is NOT the naive "5" a reading of
+# `_note_merge_all`'s production source would suggest (`harness.py:10377`
+# unconditionally calls `get_merge_diff_files`, a real `git diff` spawn in
+# production) — under THIS module's `harness` fixture, `h.git_ops
+# .get_merge_diff_files` is replaced wholesale with an
+# `AsyncMock(return_value=([], None))`, so that leg never reaches a
+# subprocess at all here. `_maybe_pipeline_landing_tripwire` (also reached
+# from `_note_merge_all`) is confirmed to no-op whenever
+# `config.git.load_bearing_oracle_cmd` is falsy (`harness.py:10438-10444`),
+# which it is here (the `git_config` fixture never sets it).
+_SPAWNS_PER_DRIVE_ADVANCE = 4
+
+# Task 4203 (reviewer amendment) — the THIRD multiplicand, needed only by
+# `test_b3_never_a_gate`'s `out_of_bound_spawns` row. MEASURED, not
+# hand-counted (see `test_out_of_bound_spawn_counts_are_measured_not_asserted`):
+# `_assert_never_a_gate` performs one `git_ops.get_main_sha()` (1) plus TWO
+# `_advance_main` rounds (3 each: `add` / `commit` / `rev-parse`) = 7 — NOT
+# `_SPAWNS_PER_DRIVE_ADVANCE` (4), because it drives an extra `_advance_main`
+# beyond a single `_drive_advance`'s shape, and NOT 8 (2x
+# `_SPAWNS_PER_DRIVE_ADVANCE`) either, since only ONE `get_main_sha` is
+# fetched up front (the second round reuses its own returned head as the new
+# base). Both `_note_merge_all` calls inside it contribute zero spawns here,
+# same stub as `_SPAWNS_PER_DRIVE_ADVANCE`'s. An earlier hand approximation
+# priced this whole function as "one _drive_advance-equivalent round" (4),
+# undercounting the true value by 3 — exactly the drift a measuring test
+# exists to catch.
+_SPAWNS_PER_ASSERT_NEVER_A_GATE = 7
+
+# Task 6861 — the fourth multiplicand: a red-path row commits its fixture
+# command to main before its first pass. MEASURED, not hand-counted (see
+# `test_out_of_bound_spawn_counts_are_measured_not_asserted`): `_commit_files`
+# spawns one `add` and one `commit`.
+_SPAWNS_PER_FIXTURE_COMMIT = 2
+
+# Task 11153 — MEASURED by `test_out_of_bound_spawn_counts_are_measured_not_asserted`: a warm
+# pass's `get_main_sha`, `worktree list`, `reset --hard` and `clean -xfd`, plus its detect and
+# narrowed-confirm sub-runs (the cold pass's `worktree add` path is 5). `required_timeout_secs`
+# prices each sub-run, an inner pytest session, at the git-spawn MEASURED_SPAWN_LATENCY_SECS too;
+# no separate sub-run price is pinned. The evidence that this still covers a pass is task 11153's
+# runs starved to a 5% CPU quota: B4's call phase took 77.37s against the 131.88s modelled, and
+# B5's six passes took 271.91s against 320.28s.
+_SPAWNS_PER_RED_PATH_PASS = 6
+
+
+# ---------------------------------------------------------------------------
+# Shared end-to-end scaffolding (prerequisite P1)
+# ---------------------------------------------------------------------------
 
 
 async def _advance_main(repo: Path, message: str = 'advance') -> str:
@@ -110,10 +237,7 @@ def git_config() -> GitConfig:
 @pytest.fixture
 def repo(tmp_path: Path) -> Path:
     """A real tmp git repo (initial commit only) — never a MagicMock git_ops."""
-    repo_path = tmp_path / 'repo'
-    repo_path.mkdir()
-    asyncio.run(_setup_repo(repo_path))
-    return repo_path
+    return seed_repo(tmp_path / 'repo')
 
 
 @pytest.fixture
@@ -149,53 +273,43 @@ def harness(git_config: GitConfig, git_ops: GitOps, mock_orch_config) -> Harness
     return h
 
 
+# The project id a red pass's flake-ledger rows are written under.
+_PROJECT_ID = 'offline_lane_integration'
+
+
 def _build_worker(
     git_ops: GitOps,
     tmp_path: Path,
     *,
     suite_runner=None,
-    confirmation_runner=None,
     task_client=None,
     escalation_queue: EscalationQueue | None = None,
-    git_overrides: dict | None = None,
+    now=None,
+    git_overrides: dict[str, Any] | None = None,
 ) -> OfflineLaneWorker:
-    """Build a real OfflineLaneWorker wired for the integration harness.
+    """Build a real OfflineLaneWorker over the shared tmp-repo GitOps.
 
-    The ONLY injection point is the reify-subprocess boundary
-    (``suite_runner`` / ``confirmation_runner``) — everything else is real:
-    *git_ops* is the shared real tmp-repo GitOps (see the ``git_ops``
-    fixture) so the worker's head snapshots / worktree resets land in the
-    SAME repo :func:`_advance_main` commits to; *escalation_queue* defaults
-    to a real :class:`EscalationQueue` (never a MagicMock) so B4/B5/B7 can
-    assert against real on-disk escalation records; *task_client* defaults
-    to a fake ``OfflineLaneTaskClient`` (a bare ``AsyncMock`` — its
-    ``submit_fix_task`` / ``append_suspect_range`` / ``get_status``
-    children auto-vivify as awaitable ``AsyncMock``s, per the β3 unit-test
-    convention in ``test_offline_lane.py``) with ``get_status`` pre-set to
-    the steady in-flight ``'in-progress'`` state and ``submit_fix_task``
-    pre-set to return a stable ``'fix-task-1'`` id (B4/B5/B7 only ever have
-    one fingerprint open at a time, so one stable id suffices).
+    *git_ops* is the ``git_ops`` fixture, so the worker's head snapshots and
+    worktree resets land in the SAME repo :func:`_advance_main` commits to.
+    Every seam left ``None`` is the worker's own default: B1-B3 pass only a
+    numeric ``suite_runner``; a red-path row (:func:`_red_lane`) passes the
+    fake task store, a real escalation queue and the clock it spaces passes
+    with, and leaves every run seam at its default. The config is real, with a
+    declared project id, so a red pass's flake-ledger write succeeds.
     """
-    config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
-    config.project_root = git_ops.project_root
-    config.git = GitConfig(**(git_overrides or {}))
-
-    if task_client is None:
-        task_client = AsyncMock()
-        task_client.get_status = AsyncMock(return_value='in-progress')
-        task_client.submit_fix_task = AsyncMock(return_value='fix-task-1')
-
-    if escalation_queue is None:
-        escalation_queue = EscalationQueue(tmp_path / 'escalations')
-
+    config = OrchestratorConfig(
+        project_root=git_ops.project_root,
+        git=GitConfig(**(git_overrides or {})),
+        fused_memory=FusedMemoryConfig(project_id=_PROJECT_ID),
+    )
     return OfflineLaneWorker(
         git_ops,
         config,
         lock_path=tmp_path / 'offline_lane.lock',
         suite_runner=suite_runner,
-        confirmation_runner=confirmation_runner,
         task_client=task_client,
         escalation_queue=escalation_queue,
+        now=now,
     )
 
 
@@ -229,60 +343,66 @@ async def _drive_advance(
     return base_sha, head_sha
 
 
-async def _run_lane(
-    worker: OfflineLaneWorker, expected_passes: int, *, timeout: float = 5.0,
-) -> None:
-    """Drive worker.run() as a real background task until *expected_passes*
-    full passes (``_run_once`` calls) have COMPLETED, then cancel the loop
-    task.
-
-    Wraps ``worker._run_once`` itself — NOT ``suite_runner`` alone — with a
-    call counter, so ``done`` is only set once a pass, INCLUDING any
-    ``_handle_red_run`` confirmation/fix-task/escalation work it triggers,
-    has fully returned. Counting at the ``suite_runner`` boundary instead
-    would race the red path: every seam this harness injects (a bare
-    ``async def ...: return ...``, or an ``AsyncMock``) happens not to
-    yield to the event loop, so today ``_handle_red_run`` always finishes
-    before the loop next suspends at ``_wake.wait()`` — but that is an
-    accident of the fakes, not a guarantee, and cancelling right after
-    ``suite_runner`` returns would race ``_handle_red_run`` mid-flight the
-    moment a seam awaits real I/O. Restores the original ``_run_once`` in
-    the ``finally`` block so repeated calls (``_drive_reds`` drives 2-3
-    passes per scenario) never nest counting wrappers.
+async def _run_lane(worker: OfflineLaneWorker, expected_passes: int) -> None:
+    """``_offline_lane_drive.py::await_lane_passes``, bounded at
+    ``_LANE_PASS_BOUND_SECS`` (read at call time).
 
     Modeled on ``test_offline_lane.py``'s
     ``test_loop_coalesces_to_exactly_one_rerun`` cancel-after-N pattern,
     generalized from a fixed N=1 to an arbitrary pass count (B1's single
     pass via :func:`_run_one_lane_pass`; B2's held-pass-plus-one-coalesced-
-    rerun burst uses N=2). Requires ``worker._dirty`` (or the wake event) to
-    already be set by a prior trigger, exactly as production wiring would
-    leave it.
+    rerun burst uses N=2).
+
+    The bound is 30.0, not a tight one: the clock starts with the drive, so
+    it also covers the real-git test-body work the caller does between entering the held pass and releasing it
+    (each :func:`_drive_advance` costs `_SPAWNS_PER_DRIVE_ADVANCE` subprocess
+    spawns — MEASURED, not hand-counted, by
+    `test_out_of_bound_spawn_counts_are_measured_not_asserted`) — not just
+    the lane pass(es) themselves. Task 3451
+    measured worst-case single subprocess spawn latency at 4.71s on this
+    host under load; a caller can easily need several spawns inside this
+    window. Same load-sensitive full-suite-flake class as
+    1335/1836/2819/3451/3491 (task 3832). FLOOR (task 3451): worst-case
+    happy-path subprocess spawn latency measured at 4.71s (n=3:
+    2.13/3.10/4.71, load-per-core 6.6) — this, not task 3491, is the genuine
+    precedent for ``_LANE_PASS_BOUND_SECS``. CEILING: the effective per-test
+    pytest-timeout (`_orch_helpers.py::PYPROJECT_DEFAULT_TIMEOUT` under a
+    bare run, `_orch_helpers.py::VERIFY_CLI_PER_TEST_TIMEOUT` under verify;
+    ``timeout_method = "signal"``, ``--max-worker-restart=0``). Task 3491 is
+    precedent AGAINST a bound near that ceiling, not for one: it REJECTED a
+    30s ceiling for
+    this exact collision and landed ``asyncio.wait_for(..., timeout=5)``
+    instead (``test_usage_gate.py``:328,790) — its scope was exclusively
+    ``test_usage_gate.py``; it never touched any offline-lane module. Both
+    halves are pinned executably by
+    ``test_lane_bounds_clear_the_measured_floor_and_the_global_ceiling``
+    below. Widening THIS bound alone can never make a broken
+    staging pass — it only lengthens how long a genuinely broken SINGLE pass
+    takes to fail. That safety property does not compose for free: a caller
+    that adds further bounded waits to this one (``test_b3_never_a_gate``)
+    can approach or exceed the effective per-test timeout before this
+    function's own ``wait_for`` ever fires —
+    trading a clean, well-located ``TimeoutError`` here for pytest-timeout's
+    blunter whole-test timeout failure instead (task 3832 review; see
+    ``orchestrator/pyproject.toml``'s ``timeout``/``timeout_method``
+    comment). Such callers carry their own ``@pytest.mark.timeout``
+    override, a rule ``test_every_composing_caller_carries_a_timeout_override``
+    enforces rather than merely describes. This bound covers only B1-B3's
+    injected-seam passes; a red-path pass runs real sub-runs and is awaited
+    unbounded through :func:`await_lane_passes`.
+
+    The 30.0 value rests on task 3451's measurement above, not on the
+    retracted task 3491 claim — narrowing it would re-introduce the flake
+    commits 289ae708bb / 80ae271a34 fixed. The gap this task (4030) closed
+    was composition coverage (the override rule the preceding paragraph
+    describes), not the bound value itself.
     """
-    inner_run_once = worker._run_once
-    done = asyncio.Event()
-    count = {'n': 0}
-
-    async def _counting_run_once():
-        result = await inner_run_once()
-        count['n'] += 1
-        if count['n'] >= expected_passes:
-            done.set()
-        return result
-
-    worker._run_once = _counting_run_once
-    task = asyncio.create_task(worker.run())
-    try:
-        await asyncio.wait_for(done.wait(), timeout=timeout)
-    finally:
-        task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await task
-        worker._run_once = inner_run_once
+    await asyncio.wait_for(await_lane_passes(worker, expected_passes), timeout=_LANE_PASS_BOUND_SECS)
 
 
-async def _run_one_lane_pass(worker: OfflineLaneWorker, *, timeout: float = 5.0) -> None:
-    """Drive worker.run() as a real background task for exactly one pass (B1)."""
-    await _run_lane(worker, 1, timeout=timeout)
+async def _run_one_lane_pass(worker: OfflineLaneWorker) -> None:
+    """Drive worker.run() as a real background task for exactly one bounded pass (B1)."""
+    await _run_lane(worker, 1)
 
 
 class _ControllableSuiteRunner:
@@ -312,8 +432,20 @@ class _ControllableSuiteRunner:
         """Release the held first call."""
         self._hold.set()
 
-    async def wait_entered(self, timeout: float = 5.0) -> None:
-        """Block until the held first call has actually started (is in-flight)."""
+    async def wait_entered(self, timeout: float = _LANE_PASS_BOUND_SECS) -> None:
+        """Block until the held first call has actually started (is in-flight).
+
+        ``timeout`` defaults to 30.0 for the same reason as ``_run_lane``'s
+        bound above (see that function's docstring for the full FLOOR/
+        CEILING derivation): the ``_run_lane`` task created just before this
+        call races the SAME clock, and this call is entered only after
+        ``OfflineLaneWorker._run_once`` has already done its own real-git
+        work (``get_main_sha`` plus a persistent-worktree reset — 3-5
+        subprocess spawns) — a tighter bound here would fire before
+        ``_run_lane``'s ever could. Same safety property: widening can never
+        make a broken staging pass, it only lengthens how long a genuinely
+        wedged runner takes to fail.
+        """
         await asyncio.wait_for(self._entered.wait(), timeout=timeout)
 
 
@@ -323,6 +455,7 @@ async def _assert_never_a_gate(
     runner: _ControllableSuiteRunner,
     repo: Path,
     git_ops: GitOps,
+    escalation_queue: EscalationQueue,
 ) -> None:
     """Assert the never-a-gate invariant (C7) while a lane run is held in-flight.
 
@@ -331,10 +464,15 @@ async def _assert_never_a_gate(
     returns, so the bounded ``wait_for`` below proves the synchronous
     on_merge_landed fan-out never blocks on it.
 
-    (1)+(2) ``harness._note_merge_all`` — the exact ``on_merge_landed``
-    callback ``SpeculativeMergeWorker`` invokes (``harness.py:4979``) —
-    must return promptly and must set ``worker._dirty`` (arming a
-    coalesced re-run).
+    (1)+(2) ``harness._note_offline_lane`` — the synchronous notifiee call
+    ``_note_merge_all`` (the exact ``on_merge_landed`` callback
+    ``SpeculativeMergeWorker`` invokes, ``harness.py:4979``) awaits AHEAD of
+    its diff fetch — must return promptly. ``_note_merge_all`` itself is
+    then exercised immediately after, at a loose 15.0s bound (well outside
+    the flake band, but still catching a genuine block), with ``_dirty``
+    explicitly reset just before so the ``worker._dirty`` assertion below
+    re-proves ITS OWN fan-out sets it, not merely the ``_note_offline_lane``
+    call above (task 3832 review).
     (3) A raising notifiee is fail-open: ``_note_offline_lane``'s own
     try/except (``harness.py:5072-5079``) swallows it — the SAME shape
     ``SpeculativeMergeWorker`` independently wraps this exact call in
@@ -348,14 +486,49 @@ async def _assert_never_a_gate(
 
     base_sha = await git_ops.get_main_sha()
     head_sha = await _advance_main(repo)
+    # Bounded at 0.5s (task 3832 assessment, NOT the _run_lane flake class):
+    # this window covers only ``harness._note_offline_lane`` ->
+    # ``worker.on_post_merge`` (harness.py:9333-9349, offline_lane.py:352-
+    # 366), a bare enqueue-and-return (sets ``_dirty`` + an event, no
+    # subprocess spawn) — exactly the documented "MUST enqueue-and-return
+    # promptly ... rather than perform the deep-test run inline" contract
+    # (harness.py:9342-9348). This is a genuine promptness assertion (proves
+    # the synchronous on_merge_landed fan-out never blocks on the in-flight
+    # run); widening it would weaken what it's testing.
+    #
+    # ``_note_merge_all`` is called separately, right after, at a much
+    # looser 15.0s bound rather than left fully unbounded (task 3832
+    # review): unlike ``_note_offline_lane`` alone, it unconditionally runs
+    # ``git_ops.get_merge_diff_files`` (a real ``git diff`` subprocess spawn)
+    # once ``_note_offline_lane`` returns, so bounding IT at 0.5s would sit
+    # in the same load-sensitive flake class this task (3832) exists to
+    # remove (task 3451 measured 4.71s worst-case single-spawn latency under
+    # load). 15.0s sits comfortably outside that flake band (>3x the
+    # measured worst-case single spawn) while still catching a genuine block
+    # in the production ``on_merge_landed`` callback this call IS
+    # (harness.py:4979) — restoring promptness coverage of the real
+    # callback that narrowing the FIRST bound to ``_note_offline_lane``
+    # alone would otherwise drop entirely. The resulting double-invoke of
+    # ``on_post_merge`` is safe — it is idempotent (sets ``_dirty = True``
+    # and an already-set ``asyncio.Event``) — so the assertions below still
+    # exercise the full fan-out unchanged. ``_dirty`` is explicitly reset
+    # just before this call so the assertion below re-proves
+    # ``_note_merge_all``'s OWN fan-out sets it, rather than passing
+    # vacuously on the strength of the ``_note_offline_lane`` call above.
     await asyncio.wait_for(
-        harness._note_merge_all('task-2', base_sha, head_sha), timeout=0.5,
+        harness._note_offline_lane('task-2', base_sha, head_sha),
+        timeout=_NOTE_OFFLINE_LANE_BOUND_SECS,
+    )
+    worker._dirty = False
+    await asyncio.wait_for(
+        harness._note_merge_all('task-2', base_sha, head_sha),
+        timeout=_NOTE_MERGE_ALL_BOUND_SECS,
     )
     assert worker._dirty is True, (
         'a landed advance during an in-flight run must arm a coalesced re-run'
     )
     assert harness.get_merge_halt_status() == {'wired': False}
-    assert cast(EscalationQueue, worker.escalation_queue).get_pending() == []
+    assert escalation_queue.get_pending() == []
 
     async def _raising_notifiee(task_id: str, base: str, head: str) -> None:
         await worker.on_post_merge(task_id, base, head)
@@ -376,97 +549,185 @@ async def _assert_never_a_gate(
         'task-3', base2, head2, prefetched_diff=[],
     )
     assert harness.get_merge_halt_status() == {'wired': False}
-    assert cast(EscalationQueue, worker.escalation_queue).get_pending() == []
+    assert escalation_queue.get_pending() == []
 
 
-def _inject_red(worker: OfflineLaneWorker, failing_ids: list[str]) -> None:
-    """Wire *worker* to simulate one confirmed-red suite pass (B4/B5/B7).
+# ---------------------------------------------------------------------------
+# The red-path rows' fixture command (task 6861)
+# ---------------------------------------------------------------------------
 
-    ``suite_runner`` reports a normal FAILED pass (``rc=1``);
-    ``confirmation_runner`` confirms the SAME *failing_ids* still fail in
-    isolation — a genuine break, never the B6 flake case (see
-    :func:`_inject_flake`). This is the ONLY point this integration harness
-    fakes the reify-subprocess boundary for a red pass; everything
-    downstream (fingerprinting, dedup, fix-task file/update, escalation
-    staging) is the real ``OfflineLaneWorker._handle_red_run`` chain.
+_FIXTURE_DIR = 'lane'
+_TARGET = 'tests/test_lane.py::test_target'
+_FIXTURE_COMMAND = LaneCommand(name='lane-fixture', command='pytest -q tests', cwd=_FIXTURE_DIR)
+_FIXTURE_GIT: dict[str, Any] = {
+    'offline_lane_legacy_numeric_enabled': False,
+    'offline_lane_commands': [_FIXTURE_COMMAND],
+}
+
+# Above every red-path row's @pytest.mark.timeout (at most 360s). At the 120s default the poll
+# backstop could arm an unbounded red-path pass itself, so a broken merge-landed trigger would
+# pass slowly instead of failing at the marker.
+_POLL_BACKSTOP_OUT_OF_REACH_SECS = 3600.0
+
+# `test_target`'s verdict is the word in `<control>/test_target`: `red`,
+# `green`, or `flaky` (red on the pass's first run, green after it: the
+# marker it leaves is untracked, so the next worktree reset removes it).
+_FIXTURE_TESTS = '''\
+import pathlib
+
+_CONTROL = pathlib.Path({control!r})
+_HERE = pathlib.Path(__file__).parent
+
+
+def _red(name):
+    verdict = (_CONTROL / name).read_text().strip()
+    if verdict == 'flaky':
+        mark = _HERE / f'.{{name}}.ran'
+        first = not mark.exists()
+        mark.touch()
+        return first
+    return verdict == 'red'
+
+
+def test_target():
+    assert not _red('test_target'), 'the control directory says red'
+
+
+def test_steady():
+    pass
+'''
+
+_FIXTURE_PYPROJECT = '[tool.pytest.ini_options]\naddopts = "-p no:cacheprovider"\n'
+
+# A stub of reify's numeric runner: detection fails naming no test; the
+# confirm (`--confirm-failed`) prints verify.sh's usage dump and exits 64.
+_NUMERIC_USAGE_STUB = '''\
+#!/bin/sh
+case " $* " in
+  *" --confirm-failed "*) cat "$(dirname "$0")/verify-usage.txt"; exit 64 ;;
+esac
+echo 'offline-deep: 1 failed'
+exit 1
+'''
+
+
+@pytest.fixture
+def pytest_on_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The fixture command runs ``pytest`` by name, as a lane command does."""
+    monkeypatch.setenv('PATH', env_resolving_running_interpreter(os.environ)['PATH'])
+
+
+async def _commit_files(repo: Path, files: dict[str, str]) -> None:
+    """Write *files* (repo-relative path -> text) and commit them to main; a ``.sh`` file is executable."""
+    for relative, text in files.items():
+        path = repo / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+        if path.suffix == '.sh':
+            path.chmod(0o755)
+    await _run(['git', 'add', *files], cwd=repo)
+    await _run(['git', 'commit', '-m', 'add the lane fixture'], cwd=repo)
+
+
+@dataclass(frozen=True)
+class _RedLane:
+    """A worker running one fixture command, and the task store, queue and clock it files through."""
+
+    harness: Harness
+    project_root: Path
+    worker: OfflineLaneWorker
+    client: FakeLedgerClient
+    queue: EscalationQueue
+    clock: Clock
+    command: str
+    control: Path
+
+    def record(self) -> CommandRecord:
+        return EpisodeStore(self.project_root, clock=self.clock).load(self.command)
+
+    def episode(self, node: str = _TARGET) -> Episode:
+        return self.record().episodes[node]
+
+    def ledger_observations(self) -> list[tuple[str, str, str, str]]:
+        """Each flake-ledger row as ``(test_id, verdict, call_site, project_id)``."""
+        rows = read_occurrences(ledger_db_path(self.project_root))
+        return [(r.test_id, r.verdict, r.call_site, r.project_id) for r in rows]
+
+    def unlanded(self) -> list[Escalation]:
+        """The pending D11 records on the command's sentinel id."""
+        sentinel = sentinel_task_id(self.command)
+        return [
+            escalation for escalation in self.queue.get_pending()
+            if escalation.task_id == sentinel and escalation.category == UNLANDED_RED_CATEGORY
+        ]
+
+
+def _red_lane(
+    harness: Harness, git_ops: GitOps, tmp_path: Path, *, command: str, git_overrides: dict[str, Any],
+) -> _RedLane:
+    """A red-path lane only the merge-landed trigger can arm: its poll backstop never fires within a test."""
+    clock = Clock()
+    client = FakeLedgerClient([])
+    queue = EscalationQueue(tmp_path / 'escalations')
+    worker = _build_worker(
+        git_ops, tmp_path, task_client=client, escalation_queue=queue, now=clock,
+        git_overrides={'offline_lane_poll_interval_secs': _POLL_BACKSTOP_OUT_OF_REACH_SECS, **git_overrides},
+    )
+    _wire_lane(harness, worker)
+    control = tmp_path / 'control'
+    control.mkdir()
+    return _RedLane(harness, git_ops.project_root, worker, client, queue, clock, command, control)
+
+
+async def _pytest_fixture_lane(harness: Harness, git_ops: GitOps, tmp_path: Path) -> _RedLane:
+    """A lane whose one command is a real pytest project on main, its ``test_target`` steered by the control dir."""
+    lane = _red_lane(harness, git_ops, tmp_path, command=_FIXTURE_COMMAND.name, git_overrides=_FIXTURE_GIT)
+    await _commit_files(git_ops.project_root, {
+        f'{_FIXTURE_DIR}/pyproject.toml': _FIXTURE_PYPROJECT,
+        f'{_FIXTURE_DIR}/tests/test_lane.py': _FIXTURE_TESTS.format(control=str(lane.control)),
+    })
+    return lane
+
+
+@dataclass(frozen=True)
+class _PassBlocks:
+    """One pass's id and the outcome and effect blocks its run record keeps."""
+
+    pass_id: str
+    outcome: dict[str, Any] | None
+    effect: dict[str, Any]
+
+
+async def _drive_lane_pass(lane: _RedLane, target: str | None = None, *, minutes: float = 30) -> _PassBlocks:
+    """One lane pass *minutes* after the last, with ``test_target`` set to *target*; returns its pass blocks.
+
+    The pass is a real advance and the real on_merge_landed fan-out
+    (:func:`_drive_advance`) followed by one full ``run()`` pass awaited to
+    completion with no wall-clock deadline (:func:`await_lane_passes`), so a
+    caller carries its own ``@pytest.mark.timeout`` sized for its passes
+    (enforced by ``test_every_composing_caller_carries_a_timeout_override``).
     """
-
-    async def _suite_runner(wt: Path, head: str, threads: int) -> tuple[int, str]:
-        return (1, 'FAILED (injected)')
-
-    async def _confirmation_runner(wt: Path, head: str) -> list[str]:
-        return list(failing_ids)
-
-    worker.suite_runner = _suite_runner
-    worker.confirmation_runner = _confirmation_runner
-
-
-def _inject_flake(worker: OfflineLaneWorker) -> None:
-    """Wire *worker* to simulate a flake: fails once, but confirms clean (B6).
-
-    ``suite_runner`` reports a normal FAILED pass (``rc=1``); the isolated
-    confirmation re-run finds NOTHING still failing (empty list) —
-    intermittent nondeterminism, never the genuine break :func:`_inject_red`
-    simulates.
-    """
-
-    async def _suite_runner(wt: Path, head: str, threads: int) -> tuple[int, str]:
-        return (1, 'FAILED (injected, flake)')
-
-    async def _confirmation_runner(wt: Path, head: str) -> list[str]:
-        return []
-
-    worker.suite_runner = _suite_runner
-    worker.confirmation_runner = _confirmation_runner
+    if target is not None:
+        (lane.control / 'test_target').write_text(target)
+    lane.clock.advance(minutes=minutes)
+    await _drive_advance(lane.harness, lane.project_root)
+    await await_lane_passes(lane.worker, 1)
+    pass_id = lane.record().last_pass_id
+    assert pass_id is not None, 'the engine records every pass it observes'
+    record = lane.worker.records.load_pass(lane.command, pass_id)
+    assert record is not None and record.effect is not None, 'run_pass writes the effect last'
+    return _PassBlocks(record.pass_id, record.outcome, record.effect)
 
 
-def _submitted_fix_task_arguments(task_client) -> dict:
-    """Assert ``submit_fix_task`` was awaited exactly once; return its sole argument block."""
-    task_client.submit_fix_task.assert_awaited_once()
-    return task_client.submit_fix_task.await_args.args[0]
-
-
-def _l0_info_escalations(escalation_queue: EscalationQueue, task_id: str) -> list:
-    """Pending L0 (agent→steward) info escalations filed for *task_id*."""
-    return escalation_queue.get_by_task(task_id, status='pending', level=0)
-
-
-def _l2_blocker_escalations(escalation_queue: EscalationQueue, task_id: str) -> list:
-    """Pending L2 (born-at-L2) blocker escalations filed for *task_id*."""
-    return escalation_queue.get_by_task(task_id, status='pending', level=2)
-
-
-async def _drive_reds(
-    harness: Harness, repo: Path, worker: OfflineLaneWorker, failing_ids: list[str], n: int,
-) -> None:
-    """Drive *n* same-failing-set confirmed-red advances through the real chain.
-
-    Injects the SAME confirmed break once (:func:`_inject_red`) then, for
-    *n* iterations, drives a real advance + the real on_merge_landed fan-out
-    (:func:`_drive_advance`, mirroring B1-B4) followed by one full pass
-    (:func:`_run_one_lane_pass`) — the same-fingerprint repeat-red sequence
-    B5's dedup and B7's stall-promotion scenarios both need.
-    """
-    _inject_red(worker, failing_ids)
-    for _ in range(n):
-        await _drive_advance(harness, repo)
-        await _run_one_lane_pass(worker)
-
-
-def _terminal_status_task_client(status: str) -> AsyncMock:
-    """A fake ``OfflineLaneTaskClient`` whose open fix task already reports a
-    terminal non-done *status* (B7 arm 2 — ``'cancelled'`` / ``'deferred'``).
-
-    :meth:`OfflineLaneWorker._maybe_promote_blocker` promotes on this arm
-    immediately, regardless of the configured advance-count threshold.
-    ``submit_fix_task`` / ``append_suspect_range`` behave as the
-    ``_build_worker`` default (see its docstring) — only ``get_status``
-    diverges.
-    """
-    task_client = AsyncMock()
-    task_client.get_status = AsyncMock(return_value=status)
-    task_client.submit_fix_task = AsyncMock(return_value='fix-task-1')
-    return task_client
+def _confirmed(*, reproduced=(), cleared=(), inconclusive=()) -> dict[str, Any]:
+    """A narrowed confirm's outcome block, as the pass record keeps it."""
+    return {
+        'arm': 'confirmed',
+        'mode': 'narrowed',
+        'reproduced': list(reproduced),
+        'cleared': list(cleared),
+        'inconclusive': list(inconclusive),
+    }
 
 
 def _materialized_worktree_names(worktree_base: Path) -> set[str]:
@@ -480,6 +741,759 @@ def _materialized_worktree_names(worktree_base: Path) -> set[str]:
     if not worktree_base.exists():
         return set()
     return {p.name for p in worktree_base.iterdir()}
+
+
+# ---------------------------------------------------------------------------
+# Timeout-bound invariants (task 4030)
+# ---------------------------------------------------------------------------
+
+# Helper names whose presence in a test's OWN source means that test drives
+# bounded waits its own body does not spell out. Widened by task 4203's
+# review remediation from "drives at least one `_run_lane`-bounded pass" to
+# that broader membership rule: `_run_lane` / `_run_one_lane_pass` each
+# compose `_LANE_PASS_BOUND_SECS`-bounded passes, `_drive_lane_pass` /
+# `await_lane_passes` drive passes with no deadline of their own whose real
+# work a marker must still cover, and `_assert_never_a_gate` composes its own `_NOTE_OFFLINE_LANE_BOUND_SECS` +
+# `_NOTE_MERGE_ALL_BOUND_SECS` pair (0.5 + 15.0 = 15.5s) without any lane
+# pass at all. Used by `_lane_pass_composing_callers` below to DISCOVER the
+# set of tests `test_every_composing_caller_carries_a_timeout_override` must
+# classify, rather than relying solely on a hand-maintained table a new test
+# can silently fall outside of.
+#
+# `_assert_never_a_gate`'s absence from this set was a real hole, not a
+# hypothetical one: task 4203's own
+# `test_out_of_bound_spawn_counts_are_measured_not_asserted` reaches 15.5s of
+# bounded waits through that helper and NOTHING else, so the pre-remediation
+# net never discovered it and it ran marker-less under the then-60s pyproject
+# default while requiring more than twice that.
+_LANE_PASS_COMPOSING_HELPER_NAMES = frozenset(
+    {
+        '_run_lane', '_run_one_lane_pass', '_drive_lane_pass', 'await_lane_passes',
+        '_assert_never_a_gate',
+    },
+)
+
+
+def _lane_pass_composing_callers(module_globals: dict) -> set[str]:
+    """Names of module-level `test_*` functions whose OWN source calls one of
+    `_LANE_PASS_COMPOSING_HELPER_NAMES` at least once.
+
+    AST-based rather than a text/regex scan, so a PROSE mention of a helper
+    name (this module's own docstrings name every member of the set in
+    backticks) can never register as a false positive the way a file-wide
+    regex could —
+    only an actual `ast.Call` node naming the helper does. Deliberately does
+    not resolve call arguments (e.g. whether a `_run_lane(...,
+    expected_passes=N)` call's N is 1) — this is a coverage NET, not a
+    worst-case calculator: it exists only to guarantee every test that
+    touches these helpers is explicitly classified below, into either
+    `worst_case_secs` or `single_pass_exempt`, so a newly added composing
+    test can no longer silently land in neither.
+    """
+    callers: set[str] = set()
+    for name, obj in module_globals.items():
+        if not name.startswith('test_') or not inspect.isfunction(obj):
+            continue
+        tree = ast.parse(inspect.getsource(obj))
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id in _LANE_PASS_COMPOSING_HELPER_NAMES
+            ):
+                callers.add(name)
+                break
+    return callers
+
+
+def test_every_composing_caller_carries_a_timeout_override() -> None:
+    """Every test that composes bounded waits PAST a single `_run_lane` pass,
+    or drives unbounded red-path passes, must carry its own
+    `@pytest.mark.timeout` override wide enough to cover its own worst case —
+    otherwise it can silently collide with the effective per-test timeout.
+
+    Makes WORK item 2's open re-verification question ("does EVERY chaining
+    caller carry such an override?") executable rather than prose, in two
+    layers. COVERAGE: `_lane_pass_composing_callers` discovers every test
+    whose own source calls any member of `_LANE_PASS_COMPOSING_HELPER_NAMES`
+    at all — deliberately named there and not re-spelled here, so widening
+    that set (as task 4203's remediation did, adding `_assert_never_a_gate`)
+    cannot leave a stale hand-typed list behind in this docstring or in the
+    `undeclared` assertion message below; every discovered name must
+    appear in EITHER `worst_case_secs` below OR `single_pass_exempt` — so a
+    test added tomorrow that calls e.g. `_drive_lane_pass` three times without a
+    `@pytest.mark.timeout` marker fails this test immediately instead of
+    silently passing because nobody added a row for it. VALUE: for every
+    `worst_case_secs` entry, its marker must exist and its value must
+    actually clear the REQUIRED timeout (task 4203's `required_timeout_secs`
+    model) — the bounded-wait sum plus its out-of-bound real-git spawn
+    allowance, not the bounded sum alone.
+
+    `worst_case_secs` maps each composing test FUNCTION OBJECT — never a
+    string, so a rename breaks this test loudly instead of silently dropping
+    a row — to its worst-case bounded-wait sum, expressed in terms of this
+    module's named timeout constants (never bare literals).
+
+    `out_of_bound_spawns` (task 4203) maps the SAME function objects to their
+    counted real-git subprocess spawns that happen OUTSIDE any bounded wait
+    — the other multiplicand `required_timeout_secs` prices at
+    `MEASURED_SPAWN_LATENCY_SECS` per spawn, expressed in this module's
+    `_SPAWNS_PER_REPO_FIXTURE` / `_SPAWNS_PER_DRIVE_ADVANCE` constants, never
+    bare literals. Every function classified in `worst_case_secs` must also
+    appear here (enforced by a key-set equality assertion below) — a row
+    added to one table without its counterpart in the other would silently
+    size the requirement wrong.
+
+    `single_pass_exempt` holds tests that call a composing helper but are
+    proven to never exceed a single `_LANE_PASS_BOUND_SECS`-bounded pass —
+    the marker-less budget
+    `test_lane_bounds_clear_the_measured_floor_and_the_global_ceiling` pins.
+    ``test_b2_coalesces_burst_of_advances_to_one_rerun`` is the one member
+    whose two bounded waits race: it starts `_run_lane(expected_passes=2)` via
+    `asyncio.create_task` and then awaits `runner.wait_entered()`, both on the
+    SAME wall clock (max, not sum). b1 and
+    ``test_a_pass_that_raises_fails_its_drive_with_its_own_exception`` each
+    drive exactly one `_run_one_lane_pass` call.
+
+    Correlation between a marker and a SPECIFIC test's value is done via
+    `fn.pytestmark` introspection — pytest's own applied-marker list for a
+    given test function — rather than the coarse `_TIMEOUT_MARKER_RE` text
+    scan `test_lane_lock_leak_guard.py`'s sibling invariant
+    (`test_no_foreign_holder_consumer_opts_out_of_the_global_timeout`) uses.
+    That invariant only needs to know whether ANY `@pytest.mark.timeout`
+    appears ANYWHERE in a file, so a deliberately coarse regex is an
+    acceptable, cheap check for it. This invariant is finer-grained: it must
+    correlate a marker to a SPECIFIC test and compare its VALUE against that
+    test's own computed worst case. `fn.pytestmark` gives that directly, with
+    no false positives from this module's own prose mentions of the marker.
+    Where two `@pytest.mark.timeout` markers are stacked on one test,
+    `markers[0]` (not `markers[-1]`) is used — verified against the
+    installed pytest/pytest-timeout: ``Item.get_closest_marker('timeout')``
+    resolves to the FIRST-applied mark (the decorator closest to `def`),
+    since `store_mark` appends each newly-applied decorator's mark to the
+    END of the existing list and decorators apply bottom-up.
+    """
+    worst_case_secs = {
+        test_b4_a_confirmed_red_is_held_then_a_spaced_reproduction_files_one_task: 0.0,
+        test_b5_a_persistent_red_under_an_open_task_files_once_and_escalates_once: 0.0,
+        test_b6_a_red_the_narrowed_confirm_clears_ends_its_episode_and_files_nothing: 0.0,
+        test_b7_a_cancelled_task_escalates_once_and_after_resolution_a_new_task_names_it: 0.0,
+        test_verify_usage_dump_on_two_spaced_passes_files_one_command_level_task: 0.0,
+        test_a_red_path_pass_outlasting_the_lane_pass_bound_still_completes: 0.0,
+        test_b3_never_a_gate: (
+            _LANE_PASS_BOUND_SECS
+            + _NOTE_OFFLINE_LANE_BOUND_SECS
+            + _NOTE_MERGE_ALL_BOUND_SECS
+        ),
+        # Task 4203 (review remediation) — the only row whose bounded waits
+        # come entirely from `_assert_never_a_gate`: this test composes no
+        # `_run_lane` pass at all, so there is no `_LANE_PASS_BOUND_SECS`
+        # term. Discovered by the net only once `_assert_never_a_gate`
+        # joined `_LANE_PASS_COMPOSING_HELPER_NAMES`.
+        test_out_of_bound_spawn_counts_are_measured_not_asserted: (
+            _NOTE_OFFLINE_LANE_BOUND_SECS + _NOTE_MERGE_ALL_BOUND_SECS
+        ),
+    }
+    # Task 4203 — the other multiplicand `required_timeout_secs` needs per
+    # composing test: its counted out-of-bound real-git spawns (never the
+    # spawns of a `_run_lane`-bounded pass, B1-B3 only, which occur INSIDE
+    # its 30s window and are already carried by worst_case_secs above). Each
+    # red-path row (task 6861) pays the repo fixture, one fixture commit and,
+    # per `_drive_lane_pass` call, one `_drive_advance` plus one unbounded
+    # pass (`_SPAWNS_PER_RED_PATH_PASS`, task 11153). b3 drives one direct
+    # `_drive_advance` plus `_assert_never_a_gate`'s own unbounded
+    # advance-and-notify work — MEASURED (reviewer amendment, task 4203) at
+    # `_SPAWNS_PER_ASSERT_NEVER_A_GATE` = 7, not the earlier hand
+    # approximation of one `_drive_advance`-equivalent round (4), which
+    # undercounted by 3 (see that constant's comment for the breakdown).
+    red_path_pass = _SPAWNS_PER_DRIVE_ADVANCE + _SPAWNS_PER_RED_PATH_PASS
+    one_pass_row = _SPAWNS_PER_REPO_FIXTURE + _SPAWNS_PER_FIXTURE_COMMIT + red_path_pass
+    two_pass_row = _SPAWNS_PER_REPO_FIXTURE + _SPAWNS_PER_FIXTURE_COMMIT + 2 * red_path_pass
+    six_pass_row = _SPAWNS_PER_REPO_FIXTURE + _SPAWNS_PER_FIXTURE_COMMIT + 6 * red_path_pass
+    out_of_bound_spawns = {
+        test_b4_a_confirmed_red_is_held_then_a_spaced_reproduction_files_one_task: two_pass_row,
+        test_b5_a_persistent_red_under_an_open_task_files_once_and_escalates_once: six_pass_row,
+        test_b6_a_red_the_narrowed_confirm_clears_ends_its_episode_and_files_nothing: two_pass_row,
+        test_b7_a_cancelled_task_escalates_once_and_after_resolution_a_new_task_names_it: six_pass_row,
+        test_verify_usage_dump_on_two_spaced_passes_files_one_command_level_task: two_pass_row,
+        test_a_red_path_pass_outlasting_the_lane_pass_bound_still_completes: one_pass_row,
+        test_b3_never_a_gate: (
+            _SPAWNS_PER_REPO_FIXTURE
+            + _SPAWNS_PER_DRIVE_ADVANCE
+            + _SPAWNS_PER_ASSERT_NEVER_A_GATE
+        ),
+        # Task 4203 (review remediation) — the ONLY row in either table that
+        # pays `_SPAWNS_PER_REPO_FIXTURE` TWICE: once for the `repo` fixture
+        # every test in this module transitively pulls, and once more for the
+        # fresh repo this test seeds on a clean tmp_path to measure
+        # `_SPAWNS_PER_FIXTURE_COMMIT` on, priced at the same seed maximum. Its
+        # `_ControllableSuiteRunner` / `_build_worker` / `_wire_lane` setup
+        # contributes nothing further — measured to be spawn-free inside
+        # that test, not assumed. Task 11153's red-path measurement adds a
+        # second fixture commit, two `_drive_advance` rounds and two passes.
+        test_out_of_bound_spawn_counts_are_measured_not_asserted: (
+            2 * _SPAWNS_PER_REPO_FIXTURE
+            + _SPAWNS_PER_FIXTURE_COMMIT
+            + _SPAWNS_PER_DRIVE_ADVANCE
+            + _SPAWNS_PER_ASSERT_NEVER_A_GATE
+            + _SPAWNS_PER_FIXTURE_COMMIT
+            + 2 * _SPAWNS_PER_DRIVE_ADVANCE
+            + 2 * _SPAWNS_PER_RED_PATH_PASS
+        ),
+    }
+    assert set(worst_case_secs) == set(out_of_bound_spawns), (
+        f'worst_case_secs and out_of_bound_spawns must classify exactly the '
+        f'same composing tests — '
+        f'{sorted(fn.__name__ for fn in set(worst_case_secs) ^ set(out_of_bound_spawns))} '
+        f'appear in only one of the two tables, so a row added to one table '
+        f'silently omits half of the required_timeout_secs inputs for that '
+        f'test.'
+    )
+    single_pass_exempt = {
+        test_a_pass_that_raises_fails_its_drive_with_its_own_exception,
+        test_b1_advance_triggers_from_head_run,
+        test_b2_coalesces_burst_of_advances_to_one_rerun,
+    }
+
+    discovered = _lane_pass_composing_callers(globals())
+    classified = {fn.__name__ for fn in worst_case_secs} | {
+        fn.__name__ for fn in single_pass_exempt
+    }
+    undeclared = discovered - classified
+    assert not undeclared, (
+        f'{sorted(undeclared)} call a bounded-wait-composing helper '
+        f'({" / ".join(sorted(_LANE_PASS_COMPOSING_HELPER_NAMES))}) but are '
+        f'classified in neither '
+        f'worst_case_secs (composes past a single pass; needs its own '
+        f'@pytest.mark.timeout override) nor single_pass_exempt (proven to '
+        f'never exceed one bounded pass), in '
+        f'test_every_composing_caller_carries_a_timeout_override. This is '
+        f'exactly the drift this test exists to catch — classify it as one '
+        f'or the other.'
+    )
+
+    for fn, worst_case in worst_case_secs.items():
+        out_of_bound = out_of_bound_spawns[fn]
+        required = required_timeout_secs(worst_case, out_of_bound)
+        spawn_allowance = out_of_bound * MEASURED_SPAWN_LATENCY_SECS
+        markers = [m for m in getattr(fn, 'pytestmark', []) if m.name == 'timeout']
+        assert markers, (
+            f'{fn.__name__} composes bounded waits to a worst case of '
+            f'{worst_case}s plus {out_of_bound} out-of-bound real-git spawns '
+            f'({out_of_bound} x {MEASURED_SPAWN_LATENCY_SECS}s = '
+            f'{spawn_allowance}s) — required = {required}s — but carries no '
+            f'@pytest.mark.timeout override. Without one it inherits the '
+            f'effective per-test timeout (the CLI --timeout under verify, else '
+            f'the pyproject default), a budget this module neither sets nor '
+            f'checks against its worst case. Were that budget ever below '
+            f'{required}s, pytest-timeout would fail the test before its own '
+            f'condition does. Add @pytest.mark.timeout(N) with '
+            f'N >= {required} ({worst_case}s bounded + {out_of_bound} spawns '
+            f'x {MEASURED_SPAWN_LATENCY_SECS}s).'
+        )
+        value = markers[0].args[0] if markers[0].args else markers[0].kwargs.get('timeout')
+        assert value is not None, (
+            f'{fn.__name__} carries @pytest.mark.timeout(...) but no timeout '
+            f'value could be extracted from it (args={markers[0].args!r}, '
+            f'kwargs={markers[0].kwargs!r}) — cannot verify it clears the '
+            f'{required}s required timeout.'
+        )
+        assert value >= required, (
+            f'{fn.__name__} carries @pytest.mark.timeout({value}) but the '
+            f'required timeout is {required}s — {worst_case}s bounded-wait '
+            f'sum + {out_of_bound} out-of-bound real-git spawns x '
+            f'{MEASURED_SPAWN_LATENCY_SECS}s = {spawn_allowance}s — the '
+            f'override does not actually clear what it exists to cover: it '
+            f'fires before that worst case completes, so pytest-timeout fails '
+            f'the test before its own condition does.'
+        )
+
+
+def test_lane_bounds_clear_the_measured_floor_and_the_global_ceiling(pytestconfig) -> None:
+    """`_LANE_PASS_BOUND_SECS` must clear a MEASURED floor and stay under a
+    stated fraction of the effective per-test CEILING — the two-sided
+    contract task 3836 landed for the sibling foreign-holder constants
+    (``test_lane_lock_leak_guard.py``'s
+    `test_foreign_holder_bounds_clear_measured_spawn_latency` +
+    `test_foreign_holder_bounds_stay_clear_of_the_global_pytest_timeout`),
+    adapted here for this module's own lane-pass bound.
+
+    FLOOR — `_LANE_PASS_BOUND_SECS` must be at least
+    `_SPAWNS_PER_LANE_PASS_WORST_CASE`x `MEASURED_SPAWN_LATENCY_SECS` (task
+    3451's measured worst-case happy-path subprocess spawn latency: n=3,
+    2.13/3.10/4.71s, load-per-core 6.6). The multiplier is MEASURED, not
+    guessed: it is the worst-case count of subprocess spawns inside a single
+    lane pass, and that worst case lives in the SIBLING infra module
+    (``test_offline_lane_infra_integration.py``), whose
+    `test_a_warm_infra_red_pass_is_the_lane_pass_floor_multiplier` measures
+    a warm infra red pass spawn by spawn. In this module
+    `_LANE_PASS_BOUND_SECS` bounds only B1-B3's `_run_lane` windows, whose
+    passes spawn fewer (the numeric `suite_runner` seam there is a bare
+    injected callable, never a real subprocess); its red-path passes run
+    real sub-runs and are awaited unbounded through `await_lane_passes`.
+    The floor prices ONE LANE PASS, not every window: B3 holds its pass in
+    flight while `_assert_never_a_gate` runs its own
+    `_SPAWNS_PER_ASSERT_NEVER_A_GATE` git spawns and its
+    `_NOTE_OFFLINE_LANE_BOUND_SECS` + `_NOTE_MERGE_ALL_BOUND_SECS` of
+    bounded waits inside that same window, and this floor does not cover
+    them. The floor is still asserted here, AND both the
+    bound and this multiplier are additionally checked for equality against
+    the infra module's own copies immediately below — the floor/ceiling
+    relation alone permits any value in [6x measured spawn latency, 0.6x
+    effective timeout] for EACH module independently, so only the explicit
+    equality check actually prevents the two modules' `_LANE_PASS_BOUND_SECS`
+    from silently diverging within that shared range.
+
+    CEILING — the marker-less worst case (one `_LANE_PASS_BOUND_SECS`, since
+    steps 2/4 of task 4030 covered every test that composes past a single
+    pass — a premise `test_every_composing_caller_carries_a_timeout_override`
+    makes executable rather than prose-only, named here the same way
+    `test_no_foreign_holder_consumer_opts_out_of_the_global_timeout` backs
+    its own sibling ceiling invariant) must stay at or under
+    `_MARKERLESS_CEILING_FRACTION` (0.6, task 3836's own fraction) of the
+    EFFECTIVE per-test timeout, resolved via `_effective_per_test_timeout`
+    (imported function-locally from `test_lane_lock_leak_guard` — never
+    duplicated or re-derived from a bare `tomllib` read; that module is task
+    3836's and already correct, and importing it inherits its correctness).
+    Why 60%, made concrete rather than left abstract: pytest-timeout 2.4.0
+    installs its timer in `pytest_runtest_protocol` whenever `func_only` is
+    False (the default; `timeout_func_only` is not set anywhere in this
+    repo), so the per-test budget covers FIXTURE SETUP AND TEARDOWN, not just the
+    call phase. Every test in both offline-lane modules transitively pulls
+    the `repo` fixture, whose `seed_repo` call costs up to `_SPAWNS_PER_REPO_FIXTURE`
+    git spawns (a cold template build plus the copy's index refresh), and each
+    `_drive_advance` costs `_SPAWNS_PER_DRIVE_ADVANCE` more (`get_main_sha`,
+    `add`, `commit`, `rev-parse` — NOT `_note_merge_all`'s `git diff`, which
+    this module's `harness` fixture stubs to an `AsyncMock` and so never
+    reaches a subprocess; see `_SPAWNS_PER_DRIVE_ADVANCE`'s own comment and
+    `test_out_of_bound_spawn_counts_are_measured_not_asserted`) — the 40% of
+    the effective per-test timeout the 0.6 fraction holds back is what pays
+    for that out-of-bound work.
+
+    When no timeout is in effect at all, this either fails loudly (this
+    module's own `orchestrator/pyproject.toml` is the governing inifile —
+    genuine drift, the premise these bounds are sized against no longer
+    holds) or skips, naming the governing inifile (an invocation artifact,
+    e.g. a root-bound run).
+    """
+    from test_lane_lock_leak_guard import _effective_per_test_timeout
+
+    floor = _SPAWNS_PER_LANE_PASS_WORST_CASE * MEASURED_SPAWN_LATENCY_SECS
+    assert floor <= _LANE_PASS_BOUND_SECS, (
+        f'_LANE_PASS_BOUND_SECS ({_LANE_PASS_BOUND_SECS}) must clear '
+        f'{_SPAWNS_PER_LANE_PASS_WORST_CASE}x the measured worst-case happy-path '
+        f'subprocess spawn latency ({MEASURED_SPAWN_LATENCY_SECS}s, task 3451: n=3 '
+        f'2.13/3.10/4.71, load-per-core 6.6) = {floor}s. The '
+        f'{_SPAWNS_PER_LANE_PASS_WORST_CASE}-spawn multiplier is the measured worst-case '
+        f'count of subprocess spawns inside a single lane pass, a warm infra red pass, '
+        f'measured by test_offline_lane_infra_integration.py::'
+        f'test_a_warm_infra_red_pass_is_the_lane_pass_floor_multiplier.'
+    )
+
+    from test_offline_lane_infra_integration import (
+        _LANE_PASS_BOUND_SECS as _infra_lane_pass_bound_secs,
+    )
+    from test_offline_lane_infra_integration import (
+        _SPAWNS_PER_ASSERT_INFRA_NEVER_A_GATE as _infra_spawns_per_assert_never_a_gate,
+    )
+    from test_offline_lane_infra_integration import (
+        _SPAWNS_PER_DRIVE_ADVANCE as _infra_spawns_per_drive_advance,
+    )
+    from test_offline_lane_infra_integration import (
+        _SPAWNS_PER_FIXTURE_COMMIT as _infra_spawns_per_fixture_commit,
+    )
+    from test_offline_lane_infra_integration import (
+        _SPAWNS_PER_LANE_PASS_WORST_CASE as _infra_spawns_per_lane_pass_worst_case,
+    )
+
+    assert _infra_lane_pass_bound_secs == _LANE_PASS_BOUND_SECS, (
+        f"this module's _LANE_PASS_BOUND_SECS ({_LANE_PASS_BOUND_SECS}) has drifted "
+        f"from test_offline_lane_infra_integration.py's copy "
+        f'({_infra_lane_pass_bound_secs}) — each module independently permits any '
+        f'value in [{floor}, {_MARKERLESS_CEILING_FRACTION} * effective_timeout], so '
+        f'only this explicit cross-module equality check catches the two silently '
+        f'diverging within that shared range.'
+    )
+    # Task 10732 — the floor multiplier itself: the infra module measures it
+    # over a warm infra red pass, and this module's copy is pinned to it here.
+    assert _infra_spawns_per_lane_pass_worst_case == _SPAWNS_PER_LANE_PASS_WORST_CASE, (
+        f"this module's _SPAWNS_PER_LANE_PASS_WORST_CASE ({_SPAWNS_PER_LANE_PASS_WORST_CASE}) "
+        f"has drifted from test_offline_lane_infra_integration.py's copy "
+        f'({_infra_spawns_per_lane_pass_worst_case}), which that module measures in its '
+        f'test_a_warm_infra_red_pass_is_the_lane_pass_floor_multiplier — so a real divergence '
+        f"here means this module's floor multiplier is a stale hand count."
+    )
+
+    # Task 4203 — the same anti-drift rationale applies verbatim to the
+    # _drive_advance multiplicand: each module independently measures its own
+    # copy (test_out_of_bound_spawn_counts_are_measured_not_asserted), so only
+    # an explicit equality check catches the two silently diverging.
+    assert _infra_spawns_per_drive_advance == _SPAWNS_PER_DRIVE_ADVANCE, (
+        f"this module's _SPAWNS_PER_DRIVE_ADVANCE ({_SPAWNS_PER_DRIVE_ADVANCE}) has "
+        f"drifted from test_offline_lane_infra_integration.py's copy "
+        f'({_infra_spawns_per_drive_advance}) — both modules share byte-identical '
+        f'_drive_advance bodies and harness fixture stubs, so a real divergence here '
+        f"means one module's measurement (or fixture) has silently changed."
+    )
+    # Task 6861 — the same anti-drift rationale, for the fixture commit both
+    # modules' red-path rows pay once.
+    assert _infra_spawns_per_fixture_commit == _SPAWNS_PER_FIXTURE_COMMIT, (
+        f"this module's _SPAWNS_PER_FIXTURE_COMMIT ({_SPAWNS_PER_FIXTURE_COMMIT}) has "
+        f"drifted from test_offline_lane_infra_integration.py's copy "
+        f'({_infra_spawns_per_fixture_commit}) — both modules commit their fixture '
+        f"with one add and one commit, so a real divergence here means one module's "
+        f'measurement (or helper) has silently changed.'
+    )
+    # Reviewer amendment (task 4203) — same anti-drift rationale, for the third
+    # multiplicand test_b3_never_a_gate / test_ib2_infra_run_in_flight_never_gates_merge
+    # each need beyond their own _drive_advance call.
+    assert _infra_spawns_per_assert_never_a_gate == _SPAWNS_PER_ASSERT_NEVER_A_GATE, (
+        f"this module's _SPAWNS_PER_ASSERT_NEVER_A_GATE ({_SPAWNS_PER_ASSERT_NEVER_A_GATE}) "
+        f"has drifted from test_offline_lane_infra_integration.py's copy, "
+        f'_SPAWNS_PER_ASSERT_INFRA_NEVER_A_GATE ({_infra_spawns_per_assert_never_a_gate}) — '
+        f'both modules share byte-identical _assert_never_a_gate / _assert_infra_never_a_gate '
+        f"bodies and harness fixture stubs, so a real divergence here means one module's "
+        f'measurement (or fixture) has silently changed.'
+    )
+
+    global_timeout = _effective_per_test_timeout(pytestconfig)
+    if global_timeout is None:
+        orchestrator_pyproject = Path(__file__).resolve().parents[1] / 'pyproject.toml'
+        governing_inifile = pytestconfig.inipath
+        if governing_inifile is not None and governing_inifile.resolve() == orchestrator_pyproject:
+            pytest.fail(
+                f'{governing_inifile} is the governing inifile for this run, yet no '
+                f'per-test timeout is in effect (checked --timeout, PYTEST_TIMEOUT, and '
+                f'[tool.pytest.ini_options].timeout) — this is a genuine regression: the '
+                f'pytest-timeout / os._exit() premise _LANE_PASS_BOUND_SECS is sized '
+                f'against no longer holds. Either restore the timeout key or re-derive '
+                f'this bound without it.'
+            )
+        pytest.skip(
+            f'no per-test timeout is in effect under the governing inifile '
+            f'{governing_inifile!r} — this is not {orchestrator_pyproject}, so this is '
+            f'an invocation artifact (e.g. a root-bound run), not drift; the '
+            f'pytest-timeout ceiling this invariant checks does not apply to this run'
+        )
+
+    ceiling = _MARKERLESS_CEILING_FRACTION * global_timeout
+    assert ceiling >= _LANE_PASS_BOUND_SECS, (
+        f'_LANE_PASS_BOUND_SECS ({_LANE_PASS_BOUND_SECS}s) exceeds '
+        f'{_MARKERLESS_CEILING_FRACTION * 100:.0f}% of the effective per-test timeout '
+        f'({global_timeout}s, resolved from {pytestconfig.inipath}) = {ceiling}s. Every '
+        f'test composing past a single _run_lane pass carries its own '
+        f'@pytest.mark.timeout override (enforced by '
+        f'test_every_composing_caller_carries_a_timeout_override), so this bounds ONLY '
+        f"the marker-less budget — a single _run_lane pass. The remaining "
+        f'{(1 - _MARKERLESS_CEILING_FRACTION) * 100:.0f}% is headroom for the real-git '
+        f"fixture work (the repo fixture's seed_repo, and each _drive_advance) that "
+        f'shares the same per-test budget, since pytest-timeout installs its timer in '
+        f'pytest_runtest_protocol (func_only=False, unset in this repo) and so times '
+        f'fixture setup/teardown too, not just the call phase.'
+    )
+
+    # Task 4203 — reconcile the retained 0.6 fraction (marker-less budget)
+    # against the additive `required_timeout_secs` model this task adopts
+    # for @pytest.mark.timeout OVERRIDES. The two models are not applied to
+    # the same population: an override is a number this suite CHOOSES, so
+    # `required_timeout_secs` prices it at every out-of-bound spawn's
+    # worst-case latency; the marker-less budget is the ambient effective
+    # per-test timeout (`_orch_helpers.py::PYPROJECT_DEFAULT_TIMEOUT` under a bare run,
+    # `_orch_helpers.py::VERIFY_CLI_PER_TEST_TIMEOUT` under verify), which
+    # this suite cannot move, so it keeps the 0.6 fraction as a cheaper proxy
+    # instead. When that default was 60s (tasks 4030/4203), gating the
+    # marker-less population additively was unsatisfiable: b1/b4/b6 (this
+    # module) and ib1/ib3/ib5 (the sibling infra module) each do the repo
+    # fixture plus at least one _drive_advance = _SPAWNS_PER_REPO_FIXTURE +
+    # _SPAWNS_PER_DRIVE_ADVANCE = 10 spawns = 47.1s of out-of-bound work
+    # against the 24s the 0.6 fraction then left — precisely task 4030's "10
+    # of the 15 tests exceed the 60s global" observation. Pricing every spawn
+    # at the worst-case SINGLE-spawn 4.71s is a sound upper bound for sizing a
+    # number this suite chooses (an override) and an unsound hard gate for one
+    # it cannot move (the ambient budget) — no observed run actually pays that
+    # price on every spawn.
+    #
+    # What IS pinnable, and is asserted here executably rather than left as
+    # prose: the 40% the 0.6 fraction holds back at the effective timeout
+    # must cover at least the repo fixture's own out-of-bound spawns (every
+    # test in both modules transitively pays this cost, marker-less or not),
+    # priced by the SAME additive model. This is the fixture-only baseline
+    # both models agree on.
+    fixture_only_required = required_timeout_secs(0.0, _SPAWNS_PER_REPO_FIXTURE)
+    marker_less_headroom = (1 - _MARKERLESS_CEILING_FRACTION) * global_timeout
+    assert marker_less_headroom >= fixture_only_required, (
+        f'the {(1 - _MARKERLESS_CEILING_FRACTION) * 100:.0f}% of the effective per-test '
+        f'timeout ({global_timeout}s) the {_MARKERLESS_CEILING_FRACTION} fraction holds '
+        f'back as marker-less headroom = {marker_less_headroom}s, but the repo fixture '
+        f'alone already requires {fixture_only_required}s '
+        f'(_SPAWNS_PER_REPO_FIXTURE={_SPAWNS_PER_REPO_FIXTURE} spawns x '
+        f'{MEASURED_SPAWN_LATENCY_SECS}s) under the additive model this task adopts for '
+        f'@pytest.mark.timeout overrides. The 0.6 fraction is deliberately kept (not '
+        f'replaced by the additive model) for the marker-less population, since a '
+        f"marker-less test's timeout is the ambient effective per-test timeout "
+        f'({global_timeout}s for this run), which this suite cannot widen — but '
+        f'that choice is only sound while this fixture-only floor holds; a failure here '
+        f'means MEASURED_SPAWN_LATENCY_SECS has been re-measured upward enough that even '
+        f'the cheapest marker-less test (fixture only, zero _drive_advance calls) no '
+        f'longer fits, and the 0.6 fraction itself needs re-deriving.'
+    )
+
+
+@pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)  # task 4203 review remediation: its whole
+# bounded term is _assert_never_a_gate's _NOTE_OFFLINE_LANE_BOUND_SECS +
+# _NOTE_MERGE_ALL_BOUND_SECS = 15.5s; its two red-path passes are awaited unbounded. Out-of-bound
+# term = 47 spawns: 2 x _SPAWNS_PER_REPO_FIXTURE (6 each: the repo fixture AND the fresh repo
+# measured against below -- the only doubled fixture term in either module), plus
+# 2 x _SPAWNS_PER_FIXTURE_COMMIT (2), 3 x _SPAWNS_PER_DRIVE_ADVANCE (4),
+# _SPAWNS_PER_ASSERT_NEVER_A_GATE (7) and 2 x _SPAWNS_PER_RED_PATH_PASS (6);
+# 47 x MEASURED_SPAWN_LATENCY_SECS = 221.37s, required = 236.87s. The verify budget
+# clears that requirement, and the value is ENFORCED by this test's row in
+# test_every_composing_caller_carries_a_timeout_override, which fails if the marker ever
+# drops below required.
+@pytest.mark.usefixtures('pytest_on_path')
+@pytest.mark.asyncio
+async def test_out_of_bound_spawn_counts_are_measured_not_asserted(
+    harness: Harness, git_ops: GitOps, repo: Path, tmp_path: Path,
+) -> None:
+    """`_SPAWNS_PER_DRIVE_ADVANCE` / `_SPAWNS_PER_FIXTURE_COMMIT` /
+    `_SPAWNS_PER_RED_PATH_PASS` are multiplicands `required_timeout_secs` (task 4203) prices at
+    `MEASURED_SPAWN_LATENCY_SECS` per spawn — this test MEASURES them by
+    counting real git subprocess spawns, rather than trusting a
+    hand-maintained comment. (`_SPAWNS_PER_REPO_FIXTURE` is measured where
+    `seed_repo` lives, by
+    `test_git_fixtures.py::test_seed_repo_max_git_spawns_is_the_costliest_seed_path`.)
+    That distinction is not academic: the two
+    landed comments this task corrects (`test_lane_bounds_...`'s and
+    `_run_lane`'s) had already drifted from each other AND from the truth,
+    which is exactly the failure mode a measuring test — instead of a third
+    hand count — closes off.
+
+    REVIEWER AMENDMENT (task 4203) also measures `_SPAWNS_PER_ASSERT_NEVER_A_GATE`
+    — the third multiplicand `test_b3_never_a_gate`'s `out_of_bound_spawns` row
+    needs beyond its own single `_drive_advance` call. An earlier hand
+    approximation treated the whole of `_assert_never_a_gate` as "one
+    `_drive_advance`-equivalent round" (4 spawns); measured under the SAME
+    counting wrapper, it is actually 7.
+
+    Deliberately calls `_assert_never_a_gate` WITHOUT first driving it through
+    `test_b3_never_a_gate`'s full held-in-flight `_run_lane` scaffolding:
+    `_assert_never_a_gate` accepts a `runner` argument but never reads it in
+    its own body (the parameter only documents an already-satisfied
+    precondition of its real caller) — its git-spawn count is therefore
+    unaffected by whether a pass is actually held in flight. Composing a real
+    pass here would only add a further `_LANE_PASS_BOUND_SECS` of bounded wait
+    plus its in-window spawns, for zero additional measurement value.
+
+    (An earlier revision justified that choice differently — a real pass
+    "would also wrongly register THIS test in `_lane_pass_composing_callers`'
+    AST net, forcing it into `worst_case_secs` and a `@pytest.mark.timeout`
+    override it does not need". That reasoning inverted once the reviewer
+    amendment added the `_assert_never_a_gate` measurement: THAT helper is
+    itself in `_LANE_PASS_COMPOSING_HELPER_NAMES`, so this test is already in
+    the net, already classified in `worst_case_secs`, and does need the
+    override it now carries. The decision survives on the reason above; only
+    its justification changed.)
+
+    SEAM VERIFICATION (must hold before a single monkeypatch target can be
+    trusted to observe every spawn): this module does ``from
+    orchestrator.git_ops import GitOps, _run`` at the top of the file. That
+    `import` statement copies a REFERENCE to the `_run` function object into
+    this module's own globals — a name distinct from ``orchestrator.git_ops
+    ._run``, the attribute a `unittest.mock.patch` target string resolves
+    against. `_advance_main` / `_commit_files` (defined in THIS module) call
+    the bare name `_run`, which Python resolves through THIS module's own
+    globals at call time — so patching only ``'orchestrator.git_ops._run'``
+    silently misses them (confirmed directly: doing so undercounts
+    `_drive_advance` at 1 spawn instead of 4). `GitOps.get_main_sha`, by
+    contrast, calls `_run` via ``orchestrator.git_ops``'s OWN globals, so it
+    is only ever observed by patching ``'orchestrator.git_ops._run'``. Both
+    targets are patched below with the same counting wrapper so neither leg
+    is silently missed.
+
+    THIRD LEG, MEASURED RATHER THAN ASSUMED: in PRODUCTION, `_note_merge_all`
+    (`harness.py:10377`) unconditionally calls
+    ``self.git_ops.get_merge_diff_files(...)`` — a real ``git diff`` spawn.
+    But the `harness` fixture above replaces ``h.git_ops.get_merge_diff_files``
+    wholesale with an ``AsyncMock(return_value=([], None))``, so under THIS
+    integration harness that leg reaches neither `_run` nor any subprocess at
+    all — it is a pure in-memory stub. (`_maybe_pipeline_landing_tripwire`,
+    also reached from `_note_merge_all` after the diff fetch, is confirmed
+    separately to no-op whenever ``config.git.load_bearing_oracle_cmd`` is
+    falsy — `harness.py:10438-10444` — and the `git_config` fixture never
+    sets it.) So `_drive_advance`'s measured spawn count is 4 — `get_main_sha`
+    plus `_advance_main`'s `add`/`commit`/`rev-parse` — not 5: not because
+    `get_main_sha` is uncounted (it IS, unlike the superseded `_run_lane`
+    docstring's "3+"), but because the diff fetch contributes zero spawns
+    under this harness's stub, unlike the superseded `test_lane_bounds_...`
+    docstring's assumption that it is real. If a future change to the
+    `harness` fixture ever makes `get_merge_diff_files` real again, THIS
+    assertion fails with the call list attached, rather than the sizing
+    model silently mispricing every composing test that calls
+    `_drive_advance` (directly or via `_drive_lane_pass`).
+
+    CARRIES `@pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)` — it is NOT marker-less. An earlier
+    revision of this paragraph claimed this test had "zero bounded waits" and
+    the same real-git shape the marker-less B1 test carries unmarked.
+    The reviewer amendment that added the `_assert_never_a_gate` measurement
+    above falsified BOTH clauses: that helper composes 15.5s of bounded waits
+    (`_NOTE_OFFLINE_LANE_BOUND_SECS` + `_NOTE_MERGE_ALL_BOUND_SECS`), and at
+    47 out-of-bound spawns this test does ~4.7x the real-git work of a
+    B1 test (10: the `repo` fixture plus one `_drive_advance`).
+    `required_timeout_secs` puts the requirement at 236.87s. See the marker
+    comment above for the worked derivation; the value is enforced by
+    `test_every_composing_caller_carries_a_timeout_override`'s row for this
+    test, not by this prose.
+    """
+    import orchestrator.git_ops as git_ops_mod
+
+    calls: list[list[str]] = []
+    orig_run = git_ops_mod._run
+
+    async def _counting_run(*args, **kwargs):
+        cmd = args[0] if args else kwargs.get('cmd')
+        assert cmd is not None, '_run must be called with a cmd list, positional or keyword'
+        calls.append(list(cmd))
+        return await orig_run(*args, **kwargs)
+
+    with patch('orchestrator.git_ops._run', side_effect=_counting_run), \
+         patch(f'{__name__}._run', side_effect=_counting_run):
+        await _drive_advance(harness, repo)
+
+    assert len(calls) == _SPAWNS_PER_DRIVE_ADVANCE, (
+        f'_drive_advance spawned {len(calls)} real git subprocess(es) '
+        f'({calls}), not the pinned _SPAWNS_PER_DRIVE_ADVANCE = '
+        f'{_SPAWNS_PER_DRIVE_ADVANCE}. This count is a multiplicand of '
+        f'required_timeout_secs (the @pytest.mark.timeout override sizing '
+        f'model) — a drift here silently mis-prices every composing test '
+        f'that calls _drive_advance, directly or via _drive_lane_pass.'
+    )
+
+    fresh_repo = seed_repo(tmp_path / 'fresh_repo_for_spawn_count')
+    calls.clear()
+    with patch('orchestrator.git_ops._run', side_effect=_counting_run), \
+         patch(f'{__name__}._run', side_effect=_counting_run):
+        await _commit_files(fresh_repo, {'fixture.txt': 'fixture\n'})
+
+    assert len(calls) == _SPAWNS_PER_FIXTURE_COMMIT, (
+        f'_commit_files spawned {len(calls)} real git subprocess(es) '
+        f'({calls}), not the pinned _SPAWNS_PER_FIXTURE_COMMIT = '
+        f'{_SPAWNS_PER_FIXTURE_COMMIT}. This count is a multiplicand of '
+        f'required_timeout_secs — every red-path row commits its fixture '
+        f'command once, so a drift here mis-prices each of them.'
+    )
+
+    # Reviewer amendment (task 4203) — measure `_assert_never_a_gate` itself.
+    # `runner` is required by its signature but never read in its body (see
+    # this test's docstring), so a bare, never-driven instance is enough —
+    # no held-in-flight `_run_lane` pass is composed here.
+    #
+    # The lane wiring itself is MEASURED to be spawn-free rather than assumed
+    # (task 4203 review remediation): this test's own `out_of_bound_spawns`
+    # row prices exactly 2x`_SPAWNS_PER_REPO_FIXTURE` +
+    # `_SPAWNS_PER_DRIVE_ADVANCE` + `_SPAWNS_PER_ASSERT_NEVER_A_GATE`, so a
+    # constructor or wiring call that quietly spawned git would inflate this
+    # test's real footprint past the timeout its own guard row sizes for it.
+    calls.clear()
+    with patch('orchestrator.git_ops._run', side_effect=_counting_run), \
+         patch(f'{__name__}._run', side_effect=_counting_run):
+        runner = _ControllableSuiteRunner()
+        queue = EscalationQueue(tmp_path / 'escalations')
+        worker = _build_worker(git_ops, tmp_path, suite_runner=runner, escalation_queue=queue)
+        _wire_lane(harness, worker)
+
+    assert calls == [], (
+        f'constructing _ControllableSuiteRunner / _build_worker / _wire_lane '
+        f'spawned {len(calls)} real git subprocess(es) ({calls}), but this '
+        f"test's out_of_bound_spawns row in "
+        f'test_every_composing_caller_carries_a_timeout_override prices the '
+        f'lane wiring at zero. Pin the measured count in a named constant '
+        f'and add it to that row rather than letting it be absorbed '
+        f'silently — an unpriced spawn under-sizes this test\'s own '
+        f'@pytest.mark.timeout override.'
+    )
+
+    with patch('orchestrator.git_ops._run', side_effect=_counting_run), \
+         patch(f'{__name__}._run', side_effect=_counting_run):
+        await _assert_never_a_gate(harness, worker, runner, repo, git_ops, queue)
+
+    assert len(calls) == _SPAWNS_PER_ASSERT_NEVER_A_GATE, (
+        f'_assert_never_a_gate spawned {len(calls)} real git subprocess(es) '
+        f'({calls}), not the pinned _SPAWNS_PER_ASSERT_NEVER_A_GATE = '
+        f'{_SPAWNS_PER_ASSERT_NEVER_A_GATE}. This count is the second '
+        f'out_of_bound_spawns multiplicand test_b3_never_a_gate needs beyond '
+        f'its own _drive_advance call — a drift here mis-prices that test '
+        f"(and the infra module's mirror, "
+        f'test_ib2_infra_run_in_flight_never_gates_merge).'
+    )
+
+    # Task 11153 — measure one WARM red-path pass, the multiplicand every
+    # red-path row's unbounded passes are priced by. The cold pass and the
+    # warm pass's arming run outside the counter; its sub-runs are read off
+    # the pass record.
+    lane = await _pytest_fixture_lane(harness, git_ops, tmp_path)
+    await _drive_lane_pass(lane, 'red')
+    (lane.control / 'test_target').write_text('red')
+    lane.clock.advance(minutes=30)
+    await _drive_advance(harness, lane.project_root)
+
+    calls.clear()
+    with patch('orchestrator.git_ops._run', side_effect=_counting_run), \
+         patch(f'{__name__}._run', side_effect=_counting_run):
+        await await_lane_passes(lane.worker, 1)
+
+    pass_id = lane.record().last_pass_id
+    assert pass_id is not None, 'the engine records every pass it observes'
+    record = lane.worker.records.load_pass(lane.command, pass_id)
+    assert record is not None, f'pass {pass_id} has no readable record'
+    sub_runs = sum(run is not None for run in (record.detect, record.confirm))
+    assert len(calls) + sub_runs == _SPAWNS_PER_RED_PATH_PASS, (
+        f'a warm red-path pass spawned {len(calls)} real git subprocess(es) '
+        f'({calls}) plus {sub_runs} sub-run(s), not the pinned '
+        f'_SPAWNS_PER_RED_PATH_PASS = {_SPAWNS_PER_RED_PATH_PASS}. This count '
+        f'prices every red-path row\'s unbounded passes in '
+        f'required_timeout_secs — a drift here mis-prices each of them.'
+    )
+
+
+# ---------------------------------------------------------------------------
+# Lane drive harness — a pass that raises fails its drive with its own exception
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_a_pass_that_raises_fails_its_drive_with_its_own_exception(harness, git_ops, repo, tmp_path):
+    """A pass that raises surfaces at once with its own exception, never as a
+    drive timeout nor as a retry after ``run()``'s fail-open backoff."""
+
+    async def _raising_suite_runner(wt, head, threads):
+        raise RuntimeError('detect seam raised')
+
+    worker = _build_worker(git_ops, tmp_path, suite_runner=_raising_suite_runner)
+    _wire_lane(harness, worker)
+    await _drive_advance(harness, repo)
+
+    with pytest.raises(RuntimeError, match='detect seam raised'):
+        await _run_one_lane_pass(worker)
+
+
+# One red-path pass, awaited unbounded: 6 + 2 + (4 + 6) = 18 spawns x 4.71s = 84.78s,
+# enforced by this test's rows in test_every_composing_caller_carries_a_timeout_override.
+@pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)
+@pytest.mark.usefixtures('pytest_on_path')
+@pytest.mark.asyncio
+async def test_a_red_path_pass_outlasting_the_lane_pass_bound_still_completes(
+    harness, git_ops, repo, tmp_path, monkeypatch,
+):
+    """A red-path pass runs real sub-runs whose wall time scales with host
+    load, so its drive is not held to ``_LANE_PASS_BOUND_SECS``: shrinking the
+    bound below any real pass stands in for load stretching a pass past it."""
+    lane = await _pytest_fixture_lane(harness, git_ops, tmp_path)
+    monkeypatch.setattr(f'{__name__}._LANE_PASS_BOUND_SECS', 0.001)
+
+    first = await _drive_lane_pass(lane, 'red')
+
+    assert first.outcome == _confirmed(reproduced=[_TARGET])
+    assert first.effect['tasks_filed'] == []
 
 
 # ---------------------------------------------------------------------------
@@ -552,6 +1566,15 @@ async def test_b2_coalesces_burst_of_advances_to_one_rerun(harness, git_ops, rep
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)  # task 4030: NOT a _drive_lane_pass chainer,
+# which is why the task-3832 review's marker sweep missed it -- but it composes anyway: a 30s
+# _run_lane bound raced concurrently by wait_entered (max, not sum), then
+# _assert_never_a_gate's 0.5 + 15.0 SEQUENTIALLY after it = 45.5s bounded, on top of
+# unbounded real-git spawns: the repo seed (_SPAWNS_PER_REPO_FIXTURE=6), one _drive_advance (4),
+# and _assert_never_a_gate's own get_main_sha + two _advance_main rounds
+# (_SPAWNS_PER_ASSERT_NEVER_A_GATE=7, task 4203 reviewer amendment -- MEASURED, supersedes an
+# earlier "two _drive_advance/_advance_main rounds" approximation) = 17 spawns x 4.71s =
+# 80.07s, required = 125.57s, comfortably under this marker.
 @pytest.mark.asyncio
 async def test_b3_never_a_gate(harness, git_ops, repo, tmp_path):
     """B3 (PRD §8, C7) — a merge-landed notification while the lane is
@@ -561,173 +1584,191 @@ async def test_b3_never_a_gate(harness, git_ops, repo, tmp_path):
     files an escalation (the only halt/gate-adjacent side-effect reachable
     from this call path)."""
     runner = _ControllableSuiteRunner()
-    worker = _build_worker(git_ops, tmp_path, suite_runner=runner)
+    queue = EscalationQueue(tmp_path / 'escalations')
+    worker = _build_worker(git_ops, tmp_path, suite_runner=runner, escalation_queue=queue)
     _wire_lane(harness, worker)
 
     await _drive_advance(harness, repo)
     lane_task = asyncio.create_task(_run_lane(worker, expected_passes=1))
     await runner.wait_entered()
 
-    await _assert_never_a_gate(harness, worker, runner, repo, git_ops)
+    await _assert_never_a_gate(harness, worker, runner, repo, git_ops, queue)
 
     runner.release()
     await lane_task
 
 
 # ---------------------------------------------------------------------------
-# B4 — confirmed red files a normal fix task + L0 info escalation
+# B4 — a confirmed red is held, then a spaced reproduction files one task
 # ---------------------------------------------------------------------------
 
 
+# Two red-path passes, awaited unbounded: 6 + 2 + 2 x (4 + 6) = 28 spawns x 4.71s = 131.88s,
+# enforced by this test's rows in test_every_composing_caller_carries_a_timeout_override.
+@pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)
+@pytest.mark.usefixtures('pytest_on_path')
 @pytest.mark.asyncio
-async def test_b4_confirmed_red_files_fix_task_and_info_escalation(harness, git_ops, repo, tmp_path):
-    """B4 (PRD §8) — a confirmed-red run files a NORMAL pending fix task
-    (never the b3_gate red-main fix-forward path) plus a non-blocking L0
-    info escalation, leaving the merge queue itself completely untouched."""
-    from orchestrator.workflow import compute_failing_test_set_fingerprint
+async def test_b4_a_confirmed_red_is_held_then_a_spaced_reproduction_files_one_task(
+    harness, git_ops, repo, tmp_path,
+):
+    """B4 (red-path §6 scenarios 3 and 4) — a test that fails detection and the
+    narrowed confirm files nothing on its first pass and holds one counted
+    pass.  Reproduced on a pass 30 minutes later, it files exactly one NORMAL
+    task, committed out of planning, whose id the episode and that pass's
+    effect both carry; the digest shows both passes.  Filing raises no
+    escalation and leaves the merge queue untouched."""
+    lane = await _pytest_fixture_lane(harness, git_ops, tmp_path)
 
-    failing_ids = ['t::b', 't::a']
-    worker = _build_worker(git_ops, tmp_path)
-    _inject_red(worker, failing_ids)
-    _wire_lane(harness, worker)
+    first = await _drive_lane_pass(lane, 'red')
 
-    _, head_sha = await _drive_advance(harness, repo)
-    await _run_one_lane_pass(worker)
+    reproduction = (_TARGET, FlakeVerdict.fails_in_isolation, FlakeCallSite.offline_lane, _PROJECT_ID)
+    assert first.outcome == _confirmed(reproduced=[_TARGET])
+    assert first.effect['tasks_filed'] == []
+    assert lane.client.submitted == []
+    assert lane.episode().counted_passes == (first.pass_id,)
+    assert lane.ledger_observations() == [reproduction]
 
-    arguments = _submitted_fix_task_arguments(worker.task_client)
-    assert arguments['status'] == 'pending'
+    second = await _drive_lane_pass(lane, 'red')
+
+    assert lane.ledger_observations() == [reproduction] * 2
+    (arguments,) = lane.client.submitted
+    episode = lane.episode()
+    assert episode.covering_task_id is not None
+    assert episode.planning_committed
+    assert second.effect['tasks_filed'] == [episode.covering_task_id]
+    task, error = await lane.client.get_task(episode.covering_task_id)
+    assert error is None and task is not None and task['status'] == 'pending'
+    for counted in (first, second):
+        assert f'pass {counted.pass_id} detect' in arguments['details']
     assert arguments['metadata']['merge_lane'] == 'normal', (
-        'a confirmed-red fix task must route through the standard '
-        'TDD→PR→merge gate, never the b3_gate red-main fix-forward path'
+        'a lane fix task routes through the standard TDD→PR→merge gate, never '
+        'the b3_gate red-main fix-forward path'
     )
-    assert arguments['metadata']['failing_tests'] == sorted(failing_ids)
-    assert arguments['metadata']['suspect_ranges'] == [head_sha], (
-        'no prior green run is recorded yet, so the suspect range is just the head'
-    )
-
-    fp = compute_failing_test_set_fingerprint(failing_ids)
-    task_id = worker.open_fix_tasks[fp]
-    escalations = _l0_info_escalations(cast(EscalationQueue, worker.escalation_queue), task_id)
-    assert len(escalations) == 1
-    assert escalations[0].severity == 'info'
-    assert escalations[0].agent_role == 'orchestrator-offline-lane'
-
-    # The merge queue itself is left completely untouched by the red path.
+    assert lane.queue.get_pending() == []
     assert harness.get_merge_halt_status() == {'wired': False}
 
 
 # ---------------------------------------------------------------------------
-# B5 — dedup: a same-set recurrence updates rather than duplicates
+# B5 — a persistent red under an open task: one task, one escalation at 24 h
 # ---------------------------------------------------------------------------
 
 
+# Six red-path passes, awaited unbounded: 6 + 2 + 6 x (4 + 6) = 68 spawns x 4.71s = 320.28s,
+# so 360 (the next multiple of the 60s grid), enforced by this test's rows in
+# test_every_composing_caller_carries_a_timeout_override.
+@pytest.mark.timeout(360)
+@pytest.mark.usefixtures('pytest_on_path')
 @pytest.mark.asyncio
-async def test_b5_same_set_recurrence_updates_not_duplicates(harness, git_ops, repo, tmp_path):
-    """B5 (PRD §8) — a SECOND red advance with the SAME failing-test set
-    updates the existing fix task (appends a suspect range) rather than
-    filing a duplicate task or raising a second escalation."""
-    from orchestrator.workflow import compute_failing_test_set_fingerprint
+async def test_b5_a_persistent_red_under_an_open_task_files_once_and_escalates_once(
+    harness, git_ops, repo, tmp_path,
+):
+    """B5 (red-path §6 scenarios 13 and 14) — once a task covers the test, the
+    test going green and then red twice files nothing new (14), and staying
+    red files no second task: no escalation 12 hours after filing, exactly one
+    level-1 record on the command's sentinel id once a counted pass lands 24
+    hours after filing, and none after that (13)."""
+    lane = await _pytest_fixture_lane(harness, git_ops, tmp_path)
+    await _drive_lane_pass(lane, 'red')
+    await _drive_lane_pass(lane, 'red')
+    task_id = lane.episode().covering_task_id
+    assert task_id is not None
 
-    failing_ids = ['t::a', 't::b']
-    worker = _build_worker(git_ops, tmp_path)
-    _wire_lane(harness, worker)
+    green = await _drive_lane_pass(lane, 'green')
+    await _drive_lane_pass(lane, 'red')
+    await _drive_lane_pass(lane, 'red', minutes=11 * 60)
 
-    await _drive_reds(harness, repo, worker, failing_ids, 2)
+    assert [(ended['node'], ended['reason']) for ended in green.effect['episodes_ended']] == [
+        (_TARGET, 'passed'),
+    ]
+    assert len(lane.client.submitted) == 1
+    assert lane.episode().covering_task_id == task_id
+    assert lane.unlanded() == []
 
-    cast(AsyncMock, worker.task_client).submit_fix_task.assert_awaited_once()
-    cast(AsyncMock, worker.task_client).append_suspect_range.assert_awaited_once()
+    await _drive_lane_pass(lane, 'red', minutes=12 * 60)
 
-    fp = compute_failing_test_set_fingerprint(failing_ids)
-    task_id = worker.open_fix_tasks[fp]
-    escalations = _l0_info_escalations(cast(EscalationQueue, worker.escalation_queue), task_id)
-    assert len(escalations) == 1, (
-        'a same-set recurrence must not raise a second L0 escalation'
-    )
+    (record,) = lane.unlanded()
+    assert task_id in record.summary
+    assert (record.level, record.severity, record.agent_role) == (1, 'blocking', 'orchestrator-offline-lane')
+    assert lane.episode().escalation_id == record.id
 
+    await _drive_lane_pass(lane, 'red')
 
-# ---------------------------------------------------------------------------
-# B6 — flake filtered: fail-then-pass on confirmation is not a red
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_b6_flake_filtered_by_confirmation_rerun(harness, git_ops, repo, tmp_path):
-    """B6 (PRD §8) — a run that fails, then passes on the isolated
-    confirmation re-run, is intermittent nondeterminism, never a genuine
-    break: no fix task and no escalation are ever raised."""
-    worker = _build_worker(git_ops, tmp_path)
-    _wire_lane(harness, worker)
-    _inject_flake(worker)
-
-    await _drive_advance(harness, repo)
-    await _run_one_lane_pass(worker)
-
-    # Intermittent-nondeterminism handling is proven behaviorally below
-    # (no fix task, no open fingerprint, no escalation) rather than by log
-    # text.
-    cast(AsyncMock, worker.task_client).submit_fix_task.assert_not_awaited()
-    assert worker.open_fix_tasks == {}
-    assert cast(EscalationQueue, worker.escalation_queue).get_pending() == []
-
-
-# ---------------------------------------------------------------------------
-# B7 — stall promotes to a born-at-L2 escalate_blocker
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_b7_stall_promotes_to_blocker(harness, git_ops, repo, tmp_path):
-    """B7 (PRD §8, C4) — a fix task that stalls promotes the L0 info signal
-    to a real, born-at-L2 escalate_blocker via either arm: the confirmed-red
-    advance count reaching the configured threshold (arm 1), or the fix task
-    itself landing in a terminal non-done status (arm 2, cancelled/deferred).
-    Promotion is idempotent per fingerprint and never touches the merge
-    queue."""
-    from orchestrator.workflow import compute_failing_test_set_fingerprint
-
-    # Arm 1 — N-advances: the confirmed-red count reaches the (small,
-    # explicitly configured) threshold.
-    failing_a = ['t::stall_a']
-    worker_a = _build_worker(
-        git_ops, tmp_path / 'arm1',
-        git_overrides={'offline_lane_red_advances_before_blocker': 2},
-    )
-    _wire_lane(harness, worker_a)
-    await _drive_reds(harness, repo, worker_a, failing_a, 2)
-
-    fp_a = compute_failing_test_set_fingerprint(failing_a)
-    task_a = worker_a.open_fix_tasks[fp_a]
-    blockers_a = _l2_blocker_escalations(cast(EscalationQueue, worker_a.escalation_queue), task_a)
-    assert len(blockers_a) == 1
-    assert blockers_a[0].severity == 'critical'
-    assert blockers_a[0].agent_role == 'orchestrator-offline-lane'
-
-    # A further same-set red must not re-promote (idempotent per fingerprint).
-    await _drive_reds(harness, repo, worker_a, failing_a, 1)
-    assert len(_l2_blocker_escalations(cast(EscalationQueue, worker_a.escalation_queue), task_a)) == 1
+    assert lane.unlanded() == [record]
+    assert len(lane.client.submitted) == 1
     assert harness.get_merge_halt_status() == {'wired': False}
 
-    # Arm 2 — terminal non-done status: promotes immediately regardless of
-    # the count (threshold set deliberately high so arm 1 cannot explain it).
-    failing_b = ['t::stall_b']
-    worker_b = _build_worker(
-        git_ops, tmp_path / 'arm2',
-        task_client=_terminal_status_task_client('cancelled'),
-        git_overrides={'offline_lane_red_advances_before_blocker': 100},
-    )
-    _wire_lane(harness, worker_b)
-    await _drive_reds(harness, repo, worker_b, failing_b, 2)
 
-    fp_b = compute_failing_test_set_fingerprint(failing_b)
-    task_b = worker_b.open_fix_tasks[fp_b]
-    blockers_b = _l2_blocker_escalations(cast(EscalationQueue, worker_b.escalation_queue), task_b)
-    assert len(blockers_b) == 1, (
-        'a terminal non-done fix-task status must promote immediately, '
-        'regardless of the configured advance-count threshold'
-    )
+# ---------------------------------------------------------------------------
+# B6 — a red the narrowed confirm clears ends its episode and files nothing
+# ---------------------------------------------------------------------------
 
-    await _drive_reds(harness, repo, worker_b, failing_b, 1)
-    assert len(_l2_blocker_escalations(cast(EscalationQueue, worker_b.escalation_queue), task_b)) == 1
+
+# Two red-path passes; the same 131.88s requirement as B4.
+@pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)
+@pytest.mark.usefixtures('pytest_on_path')
+@pytest.mark.asyncio
+async def test_b6_a_red_the_narrowed_confirm_clears_ends_its_episode_and_files_nothing(
+    harness, git_ops, repo, tmp_path,
+):
+    """B6 (red-path §6 scenario 6) — a held test that fails detection and then
+    passes the narrowed confirm is cleared: its episode ends and no fix task
+    or escalation is raised."""
+    lane = await _pytest_fixture_lane(harness, git_ops, tmp_path)
+    await _drive_lane_pass(lane, 'red')
+
+    flaked = await _drive_lane_pass(lane, 'flaky')
+
+    assert flaked.outcome == _confirmed(cleared=[_TARGET])
+    assert [(ended['node'], ended['reason']) for ended in flaked.effect['episodes_ended']] == [
+        (_TARGET, 'cleared'),
+    ]
+    assert not lane.episode().live
+    assert lane.client.submitted == []
+    assert lane.queue.get_pending() == []
+
+
+# ---------------------------------------------------------------------------
+# B7 — a cancelled covering task: one escalation, then a refile once resolved
+# ---------------------------------------------------------------------------
+
+
+# Six red-path passes; the same 320.28s requirement as B5.
+@pytest.mark.timeout(360)
+@pytest.mark.usefixtures('pytest_on_path')
+@pytest.mark.asyncio
+async def test_b7_a_cancelled_task_escalates_once_and_after_resolution_a_new_task_names_it(
+    harness, git_ops, repo, tmp_path,
+):
+    """B7 (red-path §6 scenarios 13 and 15) — the test stays red after its
+    covering task is cancelled: no refile, one escalation once a counted pass
+    lands 24 hours after filing.  Once that escalation is resolved the next
+    red starts a new episode held at one pass, and a second spaced red files
+    a new task naming the cancelled one."""
+    lane = await _pytest_fixture_lane(harness, git_ops, tmp_path)
+    await _drive_lane_pass(lane, 'red')
+    await _drive_lane_pass(lane, 'red')
+    cancelled = lane.episode().covering_task_id
+    assert cancelled is not None
+    lane.client.set_status(cancelled, 'cancelled')
+
+    await _drive_lane_pass(lane, 'red', minutes=12 * 60)
+    assert lane.unlanded() == []
+    await _drive_lane_pass(lane, 'red', minutes=12 * 60)
+
+    (record,) = lane.unlanded()
+    assert cancelled in record.summary
+    assert len(lane.client.submitted) == 1
+    lane.queue.resolve(record.id, 'seen; refile when it persists', resolved_by='operator')
+
+    held = await _drive_lane_pass(lane, 'red')
+    refiled = await _drive_lane_pass(lane, 'red')
+
+    assert held.effect['episodes_started'] == [_TARGET]
+    assert held.effect['tasks_filed'] == []
+    assert len(lane.client.submitted) == 2
+    assert refiled.effect['tasks_filed'] == [lane.episode().covering_task_id]
+    assert lane.client.submitted[-1]['metadata']['x_offline_lane']['prior_task_ids'] == [cancelled]
+    assert lane.unlanded() == []
     assert harness.get_merge_halt_status() == {'wired': False}
 
 
@@ -778,7 +1819,7 @@ async def test_b8_offline_deep_worktree_isolated_from_merge_lane(git_ops, repo):
 
 
 # ---------------------------------------------------------------------------
-# Incident reproduction (task 5308) — a verify.sh usage dump files NOTHING
+# Incident reproduction (task 5308) — a verify.sh usage dump names no test
 # ---------------------------------------------------------------------------
 
 
@@ -787,7 +1828,7 @@ async def test_b8_offline_deep_worktree_isolated_from_merge_lane(git_ops, repo):
 # em-dash ``verify.sh: ERROR — <msg>`` banner followed by the full usage()
 # block (bare ``Usage:``/``Options:`` section headers + invocation/option
 # lines). run-offline-deep.sh merges stderr into stdout, so this whole blob
-# reaches the numeric confirmation seam's parser.
+# reaches the numeric confirm.
 _VERIFY_USAGE_DUMP = (
     "verify.sh: ERROR — unknown argument '--test-threads=1'\n"
     "\n"
@@ -803,42 +1844,39 @@ _VERIFY_USAGE_DUMP = (
 )
 
 
+# Two red-path passes; the same 131.88s requirement as B4 (the stub commit is the fixture
+# commit).
+@pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)
 @pytest.mark.asyncio
-async def test_verify_usage_dump_confirmation_files_no_task_or_escalation(git_ops, tmp_path):
-    """Incident reproduction (task 5308; reify:5264) — when the DEFAULT numeric
-    confirmation seam ingests a reify verify.sh usage/help/error dump (stderr
-    merged into stdout), the full red path files ZERO fix tasks and ZERO
-    escalations, never one fake fix task built from usage lines.
+async def test_verify_usage_dump_on_two_spaced_passes_files_one_command_level_task(
+    harness, git_ops, repo, tmp_path,
+):
+    """Incident reproduction (task 5308; reify:5264), as red-path §6 scenario 8 —
+    the numeric leg's DEFAULT seams run a committed ``run-offline-deep.sh``
+    stub whose confirm prints reify verify.sh's usage dump and exits 64.  Each
+    pass is unconfirmable for the usage text, so no usage line ever becomes a
+    test id: the command's pseudo-test is the only episode, and the second
+    spaced pass files one command-level task saying why.  No escalation."""
+    await _commit_files(repo, {
+        RUN_OFFLINE_DEEP_SCRIPT: _NUMERIC_USAGE_STUB,
+        'scripts/verify-usage.txt': _VERIFY_USAGE_DUMP,
+    })
+    lane = _red_lane(harness, git_ops, tmp_path, command=LEGACY_NUMERIC_COMMAND, git_overrides={})
 
-    Unlike B4 (which injects a fake confirmation_runner), this leaves the
-    numeric confirmation seam at its DEFAULT so the REAL
-    ``_default_confirmation_run`` parser runs end-to-end — the reify-subprocess
-    boundary is faked one level deeper, at ``create_subprocess_exec``, which is
-    patched to emit the usage dump with returncode 64. Everything downstream of
-    the parse (the empty-``confirmed`` guard, fingerprinting, fix-task filing,
-    escalation staging) is the real ``_handle_red_run`` chain, driven directly
-    (the confirmed-list → ``_handle_red_run`` corruption flow's entry point).
+    first = await _drive_lane_pass(lane)
+    second = await _drive_lane_pass(lane)
 
-    RED pre-fix: the seam's inline comprehension turns every non-blank usage
-    line into a confirmed test ID, filing a fix task + an L0 info escalation.
-    """
-    worker = _build_worker(git_ops, tmp_path)  # DEFAULT confirmation seam, real queue + spy client
-    head = await git_ops.get_main_sha()
-    wt_path = git_ops.persistent_offline_deep_worktree_path
-
-    mock_proc = AsyncMock()
-    mock_proc.communicate = AsyncMock(return_value=(_VERIFY_USAGE_DUMP.encode(), b''))
-    mock_proc.returncode = 64
-
-    with patch(
-        'orchestrator.offline_lane.asyncio.create_subprocess_exec',
-        return_value=mock_proc,
-    ):
-        await worker._handle_red_run(wt_path, head)
-
-    # Zero fix tasks filed, zero fingerprints opened.
-    cast(AsyncMock, worker.task_client).submit_fix_task.assert_not_awaited()
-    assert worker.open_fix_tasks == {}
-    # Zero escalations of ANY kind reached the real queue (no
-    # orchestrator-offline-lane info escalation either).
-    assert cast(EscalationQueue, worker.escalation_queue).get_pending() == []
+    usage_text = {
+        'arm': 'unconfirmable',
+        'reason': 'usage_text',
+        'detail': "verify.sh: ERROR — unknown argument '--test-threads=1'",
+    }
+    assert first.outcome == second.outcome == usage_text
+    pseudo_test = unconfirmable_node(LEGACY_NUMERIC_COMMAND)
+    assert list(lane.record().episodes) == [pseudo_test]
+    (arguments,) = lane.client.submitted
+    assert arguments['metadata']['x_offline_lane']['nodes'] == [pseudo_test]
+    assert 'exits non-zero with no reproducible failing test' in arguments['title']
+    assert 'usage_text' in arguments['description']
+    assert second.effect['tasks_filed'] == [lane.episode(pseudo_test).covering_task_id]
+    assert lane.queue.get_pending() == []

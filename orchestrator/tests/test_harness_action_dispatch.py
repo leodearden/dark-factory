@@ -20,9 +20,12 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _orch_helpers import wire_scheduler_liveness_mock
 from escalation.action_effects import ACTION_EFFECTS, ANY, WORKFLOW_NONE, TaskEffect
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
+from escalation.server import create_server
+from fastmcp.tools.function_tool import FunctionTool
 
 from orchestrator.harness import Harness
 
@@ -43,9 +46,20 @@ def harness(tmp_path: Path, mock_orch_config) -> Harness:
 
     # Replace scheduler with async mocks (same as test_cascade_unblock.py)
     h.scheduler = MagicMock()
+    # Task 3540: is_actively_held auto-mocks TRUTHY on a bare MagicMock,
+    # so every row would read as having a live claimant and every
+    # resume flip would be silently skipped. Wire the real accessors.
+    wire_scheduler_liveness_mock(h.scheduler)
     h.scheduler.get_status = AsyncMock(return_value='blocked')
     h.scheduler.set_task_status = AsyncMock()
-    h.scheduler.get_task = AsyncMock(return_value={'id': 'task', 'metadata': {}})
+    # Task 3540: the row must carry 'status' too, and it must AGREE with
+    # get_status above. _cascade_unblock_member re-reads the row immediately
+    # before the write and re-applies the status/liveness gate to THAT
+    # snapshot (INV-3), so a row that omits 'status' describes a task that
+    # cannot exist and reads as "left the re-pendable statuses" -> no write.
+    h.scheduler.get_task = AsyncMock(
+        return_value={'id': 'task', 'status': 'blocked', 'metadata': {}}
+    )
     h.scheduler.update_task = AsyncMock(return_value=True)
 
     # _merge_worker stays None — unhalt branch skipped in all tests here
@@ -62,6 +76,7 @@ def _make_esc(
     resolved_by: str = 'steward',
     level: int = 1,
     resolution_action: str | None = None,
+    worktree: str | None = None,
 ) -> Escalation:
     return Escalation(
         id=f'esc-{task_id}-1',
@@ -74,6 +89,7 @@ def _make_esc(
         status=status,
         resolved_by=resolved_by,
         resolution_action=resolution_action,
+        worktree=worktree,
     )
 
 
@@ -221,8 +237,18 @@ class TestDispatchLegacyPaths:
             'Wake event must be set synchronously even when flip is suppressed'
         )
 
-    async def test_legacy_resolve_level0_no_flip(self, harness: Harness):
-        """Legacy resolve at level 0 → no flip (level gate preserved)."""
+    async def test_legacy_resolve_level0_orphan_flips(self, harness: Harness):
+        """Legacy resolve at level 0, ORPHANED → flips.
+
+        Re-anchored by task 3540 (PRD D8, spec E9). This previously codified
+        the `level >= 1` floor ("no flip at level 0"), whose premise was that
+        every L0 has a live workflow waiting on the synchronous `event.set()`.
+        That is false for a workflow that died between filing its escalation
+        and exiting: its `_escalation_events` entry is already popped, so the
+        wake set nothing and the floor then dropped the re-pend in silence.
+        Liveness, not level, is the discriminator — the live-workflow half is
+        `test_legacy_resolve_level0_active_workflow_no_flip` below.
+        """
         task_id = 'task-6'
         esc = _make_esc(
             task_id=task_id,
@@ -232,21 +258,58 @@ class TestDispatchLegacyPaths:
             level=0,
         )
         harness.scheduler.get_status = AsyncMock(return_value='blocked')
+        harness._escalation_events.pop(task_id, None)  # orphan: no live workflow
+
+        harness._on_escalation_resolved(esc)
+        await asyncio.gather(*list(harness._background_tasks))
+
+        harness.scheduler.set_task_status.assert_awaited_once_with(  # type: ignore[attr-defined]
+            task_id, 'pending',
+        )
+
+    async def test_legacy_resolve_level0_active_workflow_no_flip(
+        self, harness: Harness
+    ):
+        """The preserved half of the old level-0 floor.
+
+        A LIVE L0 workflow still owns its own re-pend and must not be raced —
+        and it is still woken synchronously. This is the twin of
+        `test_legacy_resolve_active_workflow_no_flip` above at level 0, which
+        is what makes the level gate's removal safe rather than merely wider.
+        """
+        task_id = 'task-6-live'
+        esc = _make_esc(
+            task_id=task_id,
+            resolution_action=None,
+            status='resolved',
+            resolved_by='steward',
+            level=0,
+        )
+        harness._escalation_events[task_id] = asyncio.Event()
+        harness.scheduler.get_status = AsyncMock(return_value='blocked')
 
         harness._on_escalation_resolved(esc)
         await asyncio.gather(*list(harness._background_tasks))
 
         harness.scheduler.set_task_status.assert_not_awaited()  # type: ignore[attr-defined]
+        assert harness._escalation_events[task_id].is_set(), (
+            'Wake event must be set synchronously even when the flip is suppressed'
+        )
 
 
 # ---------------------------------------------------------------------------
-# Pair B — resume level>=1 generalization (D7)
-# Step-3: RED until the resume gate is changed from level==1 to level>=1
+# Pair B — the resume gate.  D7 widened it from level==1 to level>=1; task
+# 3540 (PRD plans/task-escalation-state-graph-prd.md D8, spec E9) removed the
+# level floor entirely and replaced it with claimant liveness.
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
 class TestResumeLevelGate:
-    """B7 — D7: resume gate must be level>=1, not level==1."""
+    """B7: the resume gate keys on LIVENESS, at every escalation level.
+
+    Retains its original name because it is still the cell that owns the
+    gate's contract — what changed is the discriminator, not the subject.
+    """
 
     async def test_born_at_l2_resume_flips_blocked(self, harness: Harness):
         """(a) Born-at-L2 (level=2, resolution_action='resume', direct resolve,
@@ -274,10 +337,16 @@ class TestResumeLevelGate:
             task_id, 'pending',
         )
 
-    async def test_level0_resume_no_flip(self, harness: Harness):
-        """(b) level=0 direct resume still does NOT flip — level floor preserved.
+    async def test_level0_resume_orphan_flips(self, harness: Harness):
+        """(b) level=0 direct resume, ORPHANED → flips.
 
-        After step-4 changes gate to level>=1, level==0 is still excluded.
+        Re-anchored by task 3540 (PRD D8, spec E9): the level floor this cell
+        used to preserve is gone, replaced by claimant liveness. The same
+        re-anchor applied to the legacy-mapping twin in
+        `TestDispatchLegacyPaths.test_legacy_resolve_level0_orphan_flips`; here
+        the action is EXPLICIT (`resolution_action='resume'`) rather than
+        derived, so the two together show the widening is a property of the
+        resume EFFECT, not of how the action string was arrived at.
         """
         task_id = 'task-l0'
         esc = _make_esc(
@@ -288,11 +357,14 @@ class TestResumeLevelGate:
             level=0,
         )
         harness.scheduler.get_status = AsyncMock(return_value='blocked')
+        harness._escalation_events.pop(task_id, None)  # orphan: no live workflow
 
         harness._on_escalation_resolved(esc)
         await asyncio.gather(*list(harness._background_tasks))
 
-        harness.scheduler.set_task_status.assert_not_awaited()  # type: ignore[attr-defined]
+        harness.scheduler.set_task_status.assert_awaited_once_with(  # type: ignore[attr-defined]
+            task_id, 'pending',
+        )
 
     async def test_cascade_member_parent_resume_action_flips(self, harness: Harness):
         """(c) Cascade member (level=1, resolved_by='l2-cascade:<id>') whose
@@ -636,7 +708,7 @@ class TestDispatchTeardownNoKill:
         harness.is_workflow_active = MagicMock(return_value=False)
         queue.set_resolve_callback(harness._on_escalation_resolved)
 
-        queue.resolve(l2.id, 'legacy dismiss', dismiss=True)
+        queue.resolve(l2.id, 'legacy dismiss', dismiss=True, resolution_class='benign')
         await asyncio.gather(*list(harness._background_tasks))
 
         # Legacy L2 dismissed → close_only → no status write
@@ -777,8 +849,84 @@ class TestTeardownKillSequence:
         harness._on_escalation_resolved(esc)
         await asyncio.gather(*list(harness._background_tasks))
 
-        # hard_cancel must be called because the slot never cleared
-        harness.hard_cancel_workflow.assert_called_once_with(task_id)  # type: ignore[attr-defined]
+        # hard_cancel must be called because the slot never cleared.
+        # task 3172: the call now also attributes itself (see
+        # TestTeardownHardCancelIsAttributed below), so match on the task_id
+        # positionally and let the reason kwarg ride along.
+        harness.hard_cancel_workflow.assert_called_once()  # type: ignore[attr-defined]
+        assert harness.hard_cancel_workflow.call_args.args[0] == task_id  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+class TestTeardownHardCancelIsAttributed:
+    """Escalation-action teardown names ITSELF when it hard-cancels (task 3172).
+
+    Without this, a teardown-cancelled slot's synthetic TaskReport falls into
+    the ``cancelled_unattributed`` residue bucket and is indistinguishable in
+    runs.db from a shutdown drain — the same flattening this task removes on
+    the escalation-sweep side.  The reason carries the ACTION so restart, park
+    and abandon stay separable.
+    """
+
+    def _make_wedged_harness(self, harness: Harness) -> None:
+        """Slot never clears → the poll budget exhausts → hard cancel fires."""
+        harness.scheduler.get_status = AsyncMock(return_value='blocked')
+        harness.scheduler.set_task_status = AsyncMock()
+        harness.cancel_workflow = MagicMock(return_value=True)
+        harness.hard_cancel_workflow = MagicMock(return_value=True)
+        harness.is_workflow_active = MagicMock(return_value=True)
+        harness.config.terminal_status_hard_cancel_polls = 2
+
+    async def test_restart_teardown_attributes_the_action(self, harness: Harness):
+        self._make_wedged_harness(harness)
+        task_id = 'task-attributed-restart'
+        esc = _make_esc(
+            task_id=task_id,
+            resolution_action='restart',
+            status='resolved',
+            resolved_by='interactive',
+            level=1,
+        )
+
+        harness._on_escalation_resolved(esc)
+        await asyncio.gather(*list(harness._background_tasks))
+
+        harness.hard_cancel_workflow.assert_called_once()  # type: ignore[attr-defined]
+        kwargs = harness.hard_cancel_workflow.call_args.kwargs  # type: ignore[attr-defined]
+        assert kwargs.get('reason') == 'action_teardown:restart', (
+            f'restart teardown must attribute itself; got {kwargs.get("reason")!r}'
+        )
+
+    async def test_park_teardown_attributes_the_action(self, harness: Harness):
+        """Park is the case an INFERRED cause would get wrong.
+
+        Park writes target_status='blocked', so ``_should_stamp`` is False and
+        it leaves NO ``_action_teardown_tasks`` marker behind (harness.py's
+        ``_should_stamp = target_status != 'blocked'``).  A reason reverse-
+        inferred from that marker would silently mislabel every park; a stamped
+        reason is correct by construction.
+        """
+        self._make_wedged_harness(harness)
+        task_id = 'task-attributed-park'
+        esc = _make_esc(
+            task_id=task_id,
+            resolution_action='park',
+            status='pending',
+            resolved_by='interactive',
+            level=2,
+        )
+
+        harness._on_escalation_resolved(esc)
+        await asyncio.gather(*list(harness._background_tasks))
+
+        # Precondition: park really does leave no teardown marker.
+        assert task_id not in harness._action_teardown_tasks
+
+        harness.hard_cancel_workflow.assert_called_once()  # type: ignore[attr-defined]
+        kwargs = harness.hard_cancel_workflow.call_args.kwargs  # type: ignore[attr-defined]
+        assert kwargs.get('reason') == 'action_teardown:park', (
+            f'park teardown must attribute itself; got {kwargs.get("reason")!r}'
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1085,8 +1233,14 @@ class TestActionEffectsTableCoupling:
             level=1,
         )
         harness.scheduler.get_status = AsyncMock(return_value='blocked')
+        # 'status' must be present and AGREE with get_status above — task
+        # 3540's corroborating read (INV-3) re-applies the status/liveness gate
+        # to this snapshot immediately before the write, so a row omitting
+        # 'status' reads as "left the re-pendable statuses" and no flip lands.
         harness.scheduler.get_task = AsyncMock(
-            return_value={'id': task_id, 'metadata': {}},  # no infra_hold
+            return_value={  # no infra_hold
+                'id': task_id, 'status': 'blocked', 'metadata': {},
+            },
         )
         harness._escalation_events.pop(task_id, None)  # ensure orphan (no active workflow)
 
@@ -1181,7 +1335,7 @@ class TestRestartClearsMergeRetryPending:
         manager.attach_mock(harness.scheduler.update_task, 'update_task')  # type: ignore[arg-type]
         manager.attach_mock(harness.scheduler.set_task_status, 'set_task_status')  # type: ignore[arg-type]
 
-        await harness._action_teardown_and_set_status('task-1', 'pending', 'restart')
+        await harness._action_teardown_and_set_status('task-1', 'pending', 'restart', escalation_id='esc-task-1-1')
 
         replaced = _replace_metadata_calls(harness.scheduler.update_task)  # type: ignore[arg-type]
         assert len(replaced) == 1, (
@@ -1213,7 +1367,7 @@ class TestRestartClearsMergeRetryPending:
         )
         harness.is_workflow_active = MagicMock(return_value=False)
 
-        await harness._action_teardown_and_set_status('task-1', 'pending', 'restart')
+        await harness._action_teardown_and_set_status('task-1', 'pending', 'restart', escalation_id='esc-task-1-1')
 
         harness.scheduler.update_task.assert_not_awaited()  # type: ignore[attr-defined]
         harness.scheduler.set_task_status.assert_awaited_once_with(  # type: ignore[attr-defined]
@@ -1233,7 +1387,7 @@ class TestRestartClearsMergeRetryPending:
         )
         harness.is_workflow_active = MagicMock(return_value=False)
 
-        await harness._action_teardown_and_set_status('task-1', 'cancelled', 'abandon')
+        await harness._action_teardown_and_set_status('task-1', 'cancelled', 'abandon', escalation_id='esc-task-1-1')
 
         assert _replace_metadata_calls(harness.scheduler.update_task) == [], (  # type: ignore[arg-type]
             'abandon must make no stamp-clearing write'
@@ -1272,7 +1426,7 @@ class TestRestartClearsMergeRetryPending:
         harness.is_workflow_active = MagicMock(side_effect=lambda _tid: not cancelled)
         harness.config.terminal_status_hard_cancel_polls = 3
 
-        await harness._action_teardown_and_set_status('task-1', 'pending', 'restart')
+        await harness._action_teardown_and_set_status('task-1', 'pending', 'restart', escalation_id='esc-task-1-1')
 
         harness.cancel_workflow.assert_called_once_with('task-1')  # type: ignore[attr-defined]
         replaced = _replace_metadata_calls(harness.scheduler.update_task)  # type: ignore[arg-type]
@@ -1301,7 +1455,7 @@ class TestRestartClearsMergeRetryPending:
         harness.is_workflow_active = MagicMock(return_value=False)
 
         with caplog.at_level(logging.WARNING, logger='orchestrator.harness'):
-            await harness._action_teardown_and_set_status('task-1', 'pending', 'restart')
+            await harness._action_teardown_and_set_status('task-1', 'pending', 'restart', escalation_id='esc-task-1-1')
 
         harness.scheduler.update_task.assert_not_awaited()  # type: ignore[attr-defined]
         assert any(
@@ -1330,7 +1484,7 @@ class TestRestartClearsMergeRetryPending:
         harness.is_workflow_active = MagicMock(return_value=False)
 
         with caplog.at_level(logging.INFO, logger='orchestrator.harness'):
-            await harness._action_teardown_and_set_status('task-1', 'pending', 'restart')
+            await harness._action_teardown_and_set_status('task-1', 'pending', 'restart', escalation_id='esc-task-1-1')
 
         messages = [r.getMessage() for r in caplog.records]
         assert any('was rejected (update_task returned False)' in m for m in messages), (
@@ -1359,8 +1513,125 @@ class TestRestartClearsMergeRetryPending:
         harness.scheduler.update_task = AsyncMock(side_effect=RuntimeError('mcp down'))
         harness.is_workflow_active = MagicMock(return_value=False)
 
-        await harness._action_teardown_and_set_status('task-1', 'pending', 'restart')
+        await harness._action_teardown_and_set_status('task-1', 'pending', 'restart', escalation_id='esc-task-1-1')
 
         harness.scheduler.set_task_status.assert_awaited_once_with(  # type: ignore[attr-defined]
             'task-1', 'pending',
         )
+
+
+# ---------------------------------------------------------------------------
+# Task 3096 — an eval-lane record (shared/src/shared/eval_lane.py) is inert:
+# no workflow wake, no cascade, no task-status write, whatever the action.
+# ---------------------------------------------------------------------------
+
+_EVAL_WORKTREE = '/home/leo/src/dark-factory-eval-worktrees/shadow_5383_01JCELL/run-c2fbbe84'
+_PRODUCTION_WORKTREE = '/home/leo/src/dark-factory/.worktrees/5383'
+
+_EVAL_LANE_RECORDS = pytest.mark.parametrize(
+    ('task_id', 'worktree'),
+    [('5383', _EVAL_WORKTREE), ('df_task_2430_adv_plan', None)],
+)
+
+
+def _assert_no_task_effect(harness: Harness) -> None:
+    harness.scheduler.set_task_status.assert_not_awaited()  # type: ignore[attr-defined]
+    harness.scheduler.get_status.assert_not_awaited()  # type: ignore[attr-defined]
+    harness.scheduler.get_task.assert_not_awaited()  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+class TestEvalLaneResolutionIsInert:
+    @_EVAL_LANE_RECORDS
+    @pytest.mark.parametrize(
+        'resolution_action', [None, 'resume', 'abandon', 'close_only'],
+    )
+    async def test_no_status_effect_without_a_live_workflow(
+        self, harness: Harness, task_id: str, worktree: str | None,
+        resolution_action: str | None,
+    ):
+        esc = _make_esc(
+            task_id=task_id, worktree=worktree,
+            resolution_action=resolution_action, status='resolved',
+        )
+
+        harness._on_escalation_resolved(esc)
+        await asyncio.gather(*list(harness._background_tasks))
+
+        _assert_no_task_effect(harness)
+
+    @_EVAL_LANE_RECORDS
+    @pytest.mark.parametrize('status', ['resolved', 'dismissed'])
+    async def test_live_workflow_is_not_woken(
+        self, harness: Harness, task_id: str, worktree: str | None, status: str,
+    ):
+        event = asyncio.Event()
+        harness._escalation_events[task_id] = event
+
+        harness._on_escalation_resolved(
+            _make_esc(task_id=task_id, worktree=worktree, status=status),
+        )
+
+        assert not event.is_set()
+
+    @_EVAL_LANE_RECORDS
+    async def test_merge_halt_owner_is_still_unhalted(
+        self, harness: Harness, task_id: str, worktree: str | None,
+    ):
+        esc = _make_esc(task_id=task_id, worktree=worktree, status='resolved')
+        merge_worker = MagicMock()
+        merge_worker.is_halt_owner = MagicMock(side_effect=lambda esc_id: esc_id == esc.id)
+        harness._merge_worker = merge_worker
+
+        harness._on_escalation_resolved(esc)
+
+        merge_worker.unhalt_wip.assert_called_once_with()
+
+    async def test_same_id_from_production_worktree_still_wakes(self, harness: Harness):
+        event = asyncio.Event()
+        harness._escalation_events['5383'] = event
+
+        harness._on_escalation_resolved(
+            _make_esc(task_id='5383', worktree=_PRODUCTION_WORKTREE),
+        )
+
+        assert event.is_set()
+
+    async def test_same_id_from_production_worktree_still_repends(self, harness: Harness):
+        harness._on_escalation_resolved(
+            _make_esc(task_id='5383', worktree=_PRODUCTION_WORKTREE),
+        )
+        await asyncio.gather(*list(harness._background_tasks))
+
+        harness.scheduler.set_task_status.assert_awaited_once_with(  # type: ignore[attr-defined]
+            '5383', 'pending',
+        )
+
+    async def test_contained_filing_through_the_real_server_is_inert(
+        self, harness: Harness, tmp_path: Path,
+    ):
+        queue = EscalationQueue(tmp_path / 'esc')
+        harness._escalation_queue = queue
+        queue.set_resolve_callback(harness._on_escalation_resolved)
+        server = create_server(queue, startup_sweep=False)
+        event = asyncio.Event()
+        harness._escalation_events['5383'] = event
+
+        tool = await server.get_tool('escalate_blocker')
+        assert isinstance(tool, FunctionTool)
+        result = await tool.fn(
+            task_id='5383',
+            worktree=_EVAL_WORKTREE,
+            agent_role='implementer',
+            category='design_concern',
+            summary='refusing seeded wrong step',
+        )
+
+        assert result['status'] == 'resolved', result
+        record = queue.get(result['id'])
+        assert record is not None
+        assert harness._resolve_escalation_action(record) == 'close_only'
+        assert not event.is_set()
+        await asyncio.gather(*list(harness._background_tasks))
+        harness.scheduler.set_task_status.assert_not_awaited()  # type: ignore[attr-defined]
+        harness.scheduler.get_task.assert_not_awaited()  # type: ignore[attr-defined]

@@ -146,14 +146,29 @@ tasks:
       the parameter rather than widening an existing literal. PRD §6 states "with_vectors
       not yet passed — delta adds it", which is correct as written. The only with_vectors
       literal in the module is with_vectors=False inside get_point_by_id (client.retrieve,
-      mem0_client.py:454), a different call site that delta does not touch'
+      mem0_client.py:454), a different call site that delta does not touch. CHECK
+      TIGHTENED (task 3364): the superseded {kind: grep, pattern: ''with_vectors: bool''}
+      was FILE-scoped and so could not tell those two call sites apart; it is replaced
+      by a method-scoped AST check asserting that scroll_by_metadata specifically
+      declares AND forwards with_vectors. Why a grep cannot do this, and why each
+      conjunct is load-bearing, is argued in scripts/check_method_param_wiring.py''s
+      module docstring — do not restate it here'
     verdict: PASS
     delivered_check:
-      kind: grep
-      pattern: 'with_vectors: bool'
-      paths:
+      kind: script
+      script: scripts/check_method_param_wiring.py
+      args:
+      - --file
       - fused-memory/src/fused_memory/backends/mem0_client.py
-      expect: present
+      - --function
+      - scroll_by_metadata
+      - --param
+      - with_vectors
+      - --annotation
+      - bool
+      - --forwards-to
+      - scroll
+      timeout_secs: 60
   - name: ann-candidate-generation
     binding: capability→producer — query_points ANN retrieval feeding the EXISTING
       union-find (audit_duplicate_memories.py:113-153), precedent task_curator.py:1890
@@ -333,17 +348,14 @@ tasks:
       paths:
       - fused-memory/src/fused_memory/server/tools.py
       expect: present
-  - name: briefing-threads-caller-identity
-    binding: capability→consumer (wired) — the briefing assembler's mcp_call already
-      holds agent_id = claude-task-{id}-{role} (orchestrator/src/orchestrator/agents/briefing.py);
-      zeta's edit is purely additive per PRD §8's sequence note with 3131/iota-vocab
-    verdict: PASS
-    delivered_check:
-      kind: grep
-      pattern: caller_(agent|task)_id
-      paths:
-      - orchestrator/src/orchestrator/agents/briefing.py
-      expect: present
+  # 2026-08-30 (D12-A, gate esc-3212-3, Leo-ruled): removed the stale
+  # `briefing-threads-caller-identity` descriptor here — task 3212's live
+  # metadata.delivered_checks no longer carries it (that capability moved to
+  # task 3659 per the 2026-08-05 memory-briefing-and-fusion amendment). Hand-edited,
+  # not regenerated: commit_planning only copies sidecar -> task one way, so
+  # re-decomposing this PRD would RE-STAMP this stale check back onto 3212
+  # against a file it is now forbidden to touch. Do not "fix" this class of
+  # drift via regeneration.
   - name: writer-instructions-name-caller-params
     binding: INV-5 — _MEMORY_INSTRUCTIONS (orchestrator/src/orchestrator/agents/roles.py:218)
       documents passing the caller params, and a pinning assertion ties that prose
@@ -486,3 +498,5 @@ tasks:
       kind: manual
       reason: disclosure field naming is implementation-chosen; pinned by theta's
         committed mini-fixture round-trip plus an all-unparseable-input case
+signal_leaves:
+- epsilon

@@ -65,7 +65,7 @@ for cfg in $CONFIGS; do
     LOG="/var/tmp/dark-factory-evals/matrix-$cfg-$(date +%Y%m%d-%H%M%S).log"
 
     echo "[$(date +%H:%M:%S)] LAUNCH $cfg → $LOG (port $PORT)"
-    if echo "$B200_CONFIGS" | grep -qw "$cfg"; then
+    if [[ " $B200_CONFIGS " == *" $cfg "* ]]; then  # exact membership in B200_CONFIGS
         # B200 configs: retry for GPU_RETRY_MIN, then fall back to 2×H200
         $PYTHON $LAUNCHER \
             --config "$cfg" \

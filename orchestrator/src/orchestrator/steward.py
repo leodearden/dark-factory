@@ -1,30 +1,44 @@
-"""Per-task persistent steward — autonomous escalation handler.
+"""Per-task steward — autonomous escalation handler.
 
-The steward maintains a single Claude session across all escalations for a task,
-accumulating context via ``--resume``.  It handles both blocking escalations
-(code fixes) and review suggestion triage (create tasks / write conventions /
-dismiss).
+``steward_session_mode`` decides what one escalation's session inherits from the
+last.  Under the default ``fresh_per_l0`` every handling starts a new Claude
+session with the full briefing plus a digest of the L0s this steward already
+concluded and a count of the sessions that already ran on this L0 without
+concluding it (both rendered by ``orchestrator/agents/steward_digest.py``);
+under ``resume`` one session is carried across escalations via ``--resume``.
+Both share the cap-hit resume within one L0.  The steward handles both blocking
+escalations (code fixes) and review suggestion triage (create tasks / write
+conventions / dismiss).
 
 Lifecycle:
 - Started lazily on first escalation (not at workflow start).
-- Each escalation either resumes the existing session or creates a fresh one.
+- Each handling starts a fresh session (``fresh_per_l0``) or resumes the carried
+  one (``resume``).
 - Budget-capped at $12 lifetime; auto-re-escalates to level-1 on exhaustion.
 - Each escalation gets up to steward_max_attempts total attempts (default 1) before re-escalating to level-1.
 - **Every give-up path dismisses its own L0 before publishing an outcome**
   (task 3170) — via ``_auto_escalate_to_human`` when it files an L1, via
-  ``_dismiss_capped_l0`` when it deliberately does not (the wip-gated,
-  task-2060 resume-plan branches).  No pending L0 survives a steward give-up.
-- A capped escalation is TERMINAL for this steward: ``_mark_capped`` records
-  it and ``_handle_escalation`` becomes a no-op for that id.
+  ``_give_up_with_wip`` → ``_dismiss_capped_l0`` when it deliberately does not
+  (the wip-gated, task-2060 resume-plan branches).  No pending L0 survives a
+  steward give-up.  That dismissal is OBSERVED, not fire-and-forget (task
+  4495): ``EscalationQueue.resolve`` is an atomic check-and-set, so a
+  ``resolve_issue`` still in flight from the killed agent session can win it —
+  and ``_give_up_with_wip`` then publishes ``StewardResolved`` rather than
+  misreporting a genuine resolution as a benign interruption.
+- A capped escalation is TERMINAL for this TASK until the guard TTL elapses:
+  ``_mark_capped`` records it durably and ``_handle_escalation`` becomes a
+  no-op for that id, for this steward AND for any steward a later redeploy
+  builds for the same task.
 - Stopped by the workflow after task completion + grace period.
 
 The give-up contract is load-bearing for BOTH workflow waiters, which is why
 it lives here rather than in either consumer.  ``_mark_blocked`` →
 ``_await_steward_completion`` reads the published outcome off the in-process
-channel; ``run()``'s ESCALATED branch → ``_wait_for_resolution`` is
-escalation-queue-only and is woken ONLY by the dismissal (``resolve`` →
-``_resolve_callback`` → ``harness._on_escalation_resolved`` →
-``_escalation_events[task_id].set()``).  A new early return that publishes
+channel, where every outcome is tagged with the escalation it is about
+(``PublishedStewardOutcome``); ``run()``'s ESCALATED branch →
+``_wait_for_resolution`` is escalation-queue-only and is woken ONLY by the
+dismissal (``resolve`` → ``_resolve_callback`` →
+``harness._on_escalation_resolved`` → ``_escalation_events[task_id].set()``).  A new early return that publishes
 without dismissing is therefore invisible to the second waiter — it parks the
 workflow forever while this steward re-handles the record at loop speed, which
 is exactly what task 2248 shipped.
@@ -36,27 +50,35 @@ import asyncio
 import contextlib
 import json
 import logging
-from dataclasses import dataclass
+from collections.abc import MutableMapping, MutableSet
+from dataclasses import dataclass, replace
+from datetime import timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from escalation.classify import closed_by_non_sweep_resolver
 from shared.cli_invoke import (
     AllAccountsCappedException,
     invoke_with_cap_retry,
     is_timed_out_with_progress,
 )
 from shared.proc_group import terminate_process_group
+from shared.process_cost import next_resume_prior
 
 from orchestrator.agents.invoke import invoke_agent
 from orchestrator.agents.roles import STEWARD
-from orchestrator.event_store import EventStore, EventType
+from orchestrator.agents.steward_digest import EarlierAttempts, HandledL0
+from orchestrator.event_store import EventStore, EventType, cli_resume_failed_data
+from orchestrator.guard_state import PersistentMap, PersistentSet, guard_path
 from orchestrator.routing import RoleDefaults
 from orchestrator.routing_dispatch import resolve_and_record_route
 from orchestrator.workflow_types import (
+    PublishedStewardOutcome,
     StewardBudgetExhausted,
     StewardInterrupted,
     StewardReescalatedL1,
     StewardResolved,
+    WorkflowState,
     classify_failure,
 )
 
@@ -67,11 +89,11 @@ if TYPE_CHECKING:
     from escalation.queue import EscalationQueue
     from shared.config_dir import TaskConfigDir
     from shared.cost_store import CostStore
+    from shared.usage_gate import UsageGate
 
     from orchestrator.agents.briefing import BriefingAssembler
     from orchestrator.config import OrchestratorConfig
     from orchestrator.mcp_lifecycle import McpLifecycle
-    from orchestrator.usage_gate import UsageGate
     from orchestrator.workflow_types import StewardOutcome
 
 logger = logging.getLogger(__name__)
@@ -89,6 +111,13 @@ _MAX_CAP_RETRIES = 16
 # new typed exception per case.  Independent of ``steward_max_attempts``,
 # which guards a single escalation; this guards the loop itself.
 _MAX_LOOP_ERRORS = 3
+
+
+# How long a steward's give-up is remembered across restarts.  An upper bound
+# on the subject, not a tuning dial: seven days is the realistic lifetime of one
+# escalation record, and the state must not outlive it.  Past the TTL the
+# record is uncapped again and its ladder is full.
+_STEWARD_GUARD_TTL = timedelta(days=7)
 
 
 @dataclass
@@ -113,7 +142,7 @@ class StewardMetrics:
 
 
 class TaskSteward:
-    """Per-task persistent steward — handles escalations via a resumable session."""
+    """Per-task steward — handles each escalation in the session ``steward_session_mode`` selects."""
 
     def __init__(
         self,
@@ -142,23 +171,64 @@ class TaskSteward:
         self.cost_store = cost_store
 
         self._session_id: str | None = None
+        self._session_reported_total_usd: float | None = None
         self._stopped = False
         self._task: asyncio.Task | None = None
-        self._retry_counts: dict[str, int] = {}
-        self._timeout_counts: dict[str, int] = {}
-        self._empty_output_counts: dict[str, int] = {}
-        # Escalations this steward has permanently given up on — TERMINAL for
-        # THIS steward, never re-handled (task 3170, fix B).  Before this
-        # existed nothing recorded that a cap had already fired, so ANY early
-        # return from _handle_escalation left the record pending,
-        # _next_escalation re-returned it from a synchronous read, and
-        # _run_loop re-handled it at loop speed with no sleep and no state
-        # change (1,183,854 identical log lines in 20.5h on reify 5189, each
-        # iteration also awaiting a `git rev-list` subprocess via the wip
-        # probe).  Populated by _mark_capped at every cap-fire early return
-        # and honoured at three sites: _handle_escalation's early return,
-        # _next_escalation's filter, and the watcher's --exclude-id argv.
-        self._capped_escalations: set[str] = set()
+        # The four guards below are restart-durable and TTL-bounded (task
+        # 5352), keyed by (TASK, escalation id): one file per task under
+        # <project_root>/data/orchestrator/guards/<guard>/<task_id>.json, so a
+        # fleet redeploy no longer hands a record that already exhausted its
+        # ladder a fresh full budget, and a redeployed steward for the SAME
+        # task reads the same file.  A project_root that cannot be resolved
+        # yields the in-memory mode — the pre-5352 behaviour — with no branch
+        # at any consumption site.
+        #
+        # The per-task scoping is load-bearing, not tidiness.  Both places
+        # that ENUMERATE rather than test membership read the whole set, so a
+        # file shared by every steward in the process made
+        # _log_capped_idle_once warn with a count and a list of escalations
+        # belonging to OTHER tasks — falsifying task 3170's incident signal,
+        # whose success condition is silence — and made
+        # _watch_for_escalation's argv grow with a week of fleet-wide cap
+        # history.  A task id as a filename component follows
+        # orchestrator/src/orchestrator/cli.py::_write_task_file, so there is
+        # no new sanitisation contract here.
+        self._retry_counts: MutableMapping[str, int] = PersistentMap(
+            guard_path(config.project_root, 'steward_retry_counts', f'{task_id}.json'),
+            ttl=_STEWARD_GUARD_TTL,
+        )
+        self._timeout_counts: MutableMapping[str, int] = PersistentMap(
+            guard_path(config.project_root, 'steward_timeout_counts', f'{task_id}.json'),
+            ttl=_STEWARD_GUARD_TTL,
+        )
+        self._empty_output_counts: MutableMapping[str, int] = PersistentMap(
+            guard_path(
+                config.project_root, 'steward_empty_output_counts', f'{task_id}.json',
+            ),
+            ttl=_STEWARD_GUARD_TTL,
+        )
+        # Paid-for pre-triage outcome per escalation id (task 5821): every
+        # re-handle of the same L0 (timeout / empty-output re-queue) would
+        # otherwise pay for triage again.  Holds the fallback (original)
+        # escalation too when triage ran and produced no usable verdict.
+        self._pretriaged: dict[str, Escalation] = {}
+        # Escalations a steward has permanently given up on — TERMINAL for this
+        # TASK, never re-handled (task 3170, fix B).  Before this existed
+        # nothing recorded that a cap had already fired, so ANY early return
+        # from _handle_escalation left the record pending, _next_escalation
+        # re-returned it from a synchronous read, and _run_loop re-handled it at
+        # loop speed with no sleep and no state change (1,183,854 identical log
+        # lines in 20.5h on reify 5189, each iteration also awaiting a
+        # `git rev-list` subprocess via the wip probe).  Populated by
+        # _mark_capped at every cap-fire early return and honoured at three
+        # sites: _handle_escalation's early return, _next_escalation's filter,
+        # and the watcher's --exclude-id argv.
+        self._capped_escalations: MutableSet[str] = PersistentSet(
+            guard_path(
+                config.project_root, 'steward_capped_escalations', f'{task_id}.json',
+            ),
+            ttl=_STEWARD_GUARD_TTL,
+        )
         # Loud-ONCE guard for the capped-only idle state (see
         # _log_capped_idle_once).  Reset whenever a non-capped escalation is
         # handled, so a later relapse into the idle state logs again.
@@ -171,8 +241,10 @@ class TaskSteward:
         # for stewards built without that wiring (most of this module's
         # unit tests, and any other caller) — _publish_outcome is a no-op
         # and the wip-gated guards below default to wip=False in that case.
-        self._outcome_channel: asyncio.Queue | None = None
+        self._outcome_channel: asyncio.Queue[PublishedStewardOutcome] | None = None
         self._wip_probe: Callable[[], Awaitable[bool]] | None = None
+        # The L0s this instance concluded, oldest first.
+        self._handled: tuple[HandledL0, ...] = ()
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -185,10 +257,14 @@ class TaskSteward:
         )
         logger.info(f'Steward started for task {self.task_id}')
 
-    def set_outcome_channel(self, channel: asyncio.Queue) -> None:
+    def set_outcome_channel(
+        self, channel: asyncio.Queue[PublishedStewardOutcome],
+    ) -> None:
         """Register the in-process channel :meth:`_handle_escalation` publishes on.
 
-        Wired by :meth:`TaskWorkflow._ensure_steward_started`.  Left unset
+        Every publication is a :class:`PublishedStewardOutcome` tagged with the
+        escalation it is about.  Wired by
+        :meth:`TaskWorkflow._ensure_steward_started`.  Left unset
         (``None``) by every caller that does not need the typed outcome —
         :meth:`_publish_outcome` is then a no-op.
         """
@@ -204,8 +280,13 @@ class TaskSteward:
         """
         self._wip_probe = probe
 
-    def _publish_outcome(self, outcome: StewardOutcome) -> None:
-        """Put *outcome* on the registered channel; no-op when none is set.
+    def _publish_outcome(self, escalation: Escalation, outcome: StewardOutcome) -> None:
+        """Record *escalation*'s conclusion and put *outcome*, tagged with its id, on the channel.
+
+        Publication reaches the instance's handled-L0 record (``_handled``, the
+        digest a fresh session is briefed with) and the workflow channel.  The
+        record is kept whether or not a channel is set; the channel put is a
+        no-op when none is.
 
         Synchronous (``put_nowait``, not ``await queue.put``) so it is safe
         to call from both async call sites (``_handle_escalation``) and sync
@@ -213,8 +294,47 @@ class TaskSteward:
         unbounded by construction here, so ``put_nowait`` never raises
         ``QueueFull``.
         """
+        self._handled = (
+            *self._handled, HandledL0(escalation.id, escalation.category, outcome),
+        )
         if self._outcome_channel is not None:
-            self._outcome_channel.put_nowait(outcome)
+            self._outcome_channel.put_nowait(
+                PublishedStewardOutcome(escalation.id, outcome),
+            )
+
+    def _carries_session_across_l0s(self) -> bool:
+        """The one membership rule of the ``steward_session_mode`` axis.
+
+        Read at use time, so a hot reload applies from the next handling.
+        """
+        return self.config.steward_session_mode == 'resume'
+
+    def _briefing_digest(self) -> tuple[HandledL0, ...]:
+        """The concluded L0s a full briefing carries: ``self._handled`` under ``fresh_per_l0``.
+
+        Under ``resume`` it is ``()`` on every full briefing, including the ones
+        built for a session that holds no history (the first L0, the L0 after an
+        empty-output drop, a fresh retry after a rejected resume). That keeps the
+        resume arm byte-identical to the pre-5819 steward, which is what makes it
+        the shadow-eval comparison arm (task 5820).
+        """
+        return () if self._carries_session_across_l0s() else self._handled
+
+    def _earlier_attempts(self, escalation_id: str) -> EarlierAttempts:
+        """The sessions that already ran on *escalation_id* without concluding it, for a full briefing.
+
+        Read off the per-escalation guard counters under ``fresh_per_l0``, so a
+        re-handle after a timeout kill, a left-pending attempt or an empty
+        output knows it is not the first.  Under ``resume`` it is always empty,
+        for the same byte parity as :meth:`_briefing_digest`.
+        """
+        if self._carries_session_across_l0s():
+            return EarlierAttempts()
+        return EarlierAttempts(
+            timed_out=self._timeout_counts.get(escalation_id, 0),
+            left_pending=self._retry_counts.get(escalation_id, 0),
+            no_output=self._empty_output_counts.get(escalation_id, 0),
+        )
 
     async def stop(self) -> None:
         """Cancel the steward loop and cleanup."""
@@ -247,10 +367,11 @@ class TaskSteward:
         - ``_loop_error_count``: an unconditional backstop on the generic
           ``except Exception`` path so any other persistent failure (MCP
           unreachable, etc.) is bounded.
-        - ``_capped_escalations`` (task 3170): an escalation this steward has
-          given up on is TERMINAL for it, so ``_next_escalation`` filters it
-          out and this loop falls into its 1s backoff instead of re-handling
-          it forever.  Entry into that idle state is announced once via
+        - ``_capped_escalations`` (task 3170): an escalation a steward has
+          given up on is TERMINAL for the task — durably, so a redeploy does
+          not re-adopt it (task 5352) — so ``_next_escalation`` filters it out
+          and this loop falls into its 1s backoff instead of re-handling it
+          forever.  Entry into that idle state is announced once via
           ``_log_capped_idle_once`` — the flag is cleared below whenever a
           live escalation is handled.
         """
@@ -430,20 +551,22 @@ class TaskSteward:
     # ------------------------------------------------------------------
 
     async def _handle_escalation(self, escalation: Escalation) -> None:
-        """Handle a single escalation via the persistent session.
+        """Handle a single escalation: fresh session or carried one, per ``steward_session_mode``.
 
         **Every give-up path below dismisses its own L0 before publishing an
         outcome** (task 3170) — ``_auto_escalate_to_human`` does it as part of
         filing the L1, and the two wip-gated branches (which deliberately file
         no L1, per task-2060 resume-plan semantics) do it via
-        ``_dismiss_capped_l0``.  No pending L0 may survive a give-up: the
+        ``_give_up_with_wip``, THE single converged body behind both of them.
+        No pending L0 may survive a give-up: the
         ``run()``-ESCALATED waiter never reads the outcome channel, so a
         publish-without-dismiss is invisible to it and strands the workflow.
         Any NEW early return added here inherits that obligation.
 
-        A capped escalation is TERMINAL for this steward (task 3170, fix B):
-        once any guard below has fired, ``_mark_capped`` records the id and
-        this method becomes a no-op for it.  The early return sits ABOVE the
+        A capped escalation is TERMINAL for this task (task 3170, fix B;
+        made durable by task 5352): once any guard below has fired,
+        ``_mark_capped`` records the id and this method becomes a no-op for
+        it, in this steward and in any steward a later redeploy builds.  The early return sits ABOVE the
         "handling escalation" info log deliberately — a capped record must
         produce no further log lines at all, which is the O(1)-not-O(10^6)
         signal that distinguishes a healthy idle steward from the spin this
@@ -477,15 +600,7 @@ class TaskSteward:
             self._stopped = True
             return
 
-        # Guard: lifetime budget exhausted
-        if self.metrics.total_cost_usd >= self.config.steward_lifetime_budget:
-            self._auto_escalate_to_human(
-                escalation, 'Steward lifetime budget exhausted '
-                f'(${self.metrics.total_cost_usd:.2f} / '
-                f'${self.config.steward_lifetime_budget:.2f})',
-                outcome=StewardBudgetExhausted(),
-            )
-            self._mark_capped(escalation.id)
+        if self._give_up_if_lifetime_budget_spent(escalation):
             return
 
         # Guard: per-escalation retry limit
@@ -498,15 +613,15 @@ class TaskSteward:
                 # must resume the plan, not be triaged as "steward failed" via
                 # an L1.  Skip _auto_escalate_to_human entirely — but still
                 # dismiss the L0 first, per the converged give-up contract
-                # (task 3170; see this method's docstring).  Dismiss-THEN-
-                # publish: the dismissal wakes the run()-ESCALATED waiter via
-                # the resolve callback, the publish hands the typed outcome to
-                # the _mark_blocked waiter.  Both downstream dismissal sites
-                # (_mark_blocked's loop, _await_steward_completion's override)
-                # remain as idempotent backstops — EscalationQueue.resolve is a
-                # documented no-op on a non-pending record.
-                self._dismiss_capped_l0(escalation, 'attempt_cap')
-                self._publish_outcome(outcome)
+                # (task 3170).  _give_up_with_wip owns dismiss-THEN-publish and
+                # the task-4495 race branch; it is THE single body behind both
+                # wip-gated guards, so the drift this comment used to only warn
+                # about is now structurally impossible.  Both downstream
+                # dismissal sites (_mark_blocked's loop,
+                # _await_steward_completion's override) remain as idempotent
+                # backstops — EscalationQueue.resolve is a documented no-op on
+                # a non-pending record.
+                self._give_up_with_wip(escalation, outcome)
             else:
                 self._auto_escalate_to_human(
                     escalation,
@@ -525,10 +640,10 @@ class TaskSteward:
             outcome = StewardInterrupted(reason='timeout', wip_commits_present=wip)
             if wip:
                 # Same converged give-up contract as the attempt-cap branch
-                # above (task 3170): dismiss THEN publish, so neither wip
-                # branch can drift from the other.
-                self._dismiss_capped_l0(escalation, 'timeout')
-                self._publish_outcome(outcome)
+                # above (task 3170), now literally the same code: both call
+                # _give_up_with_wip, which reads the reason off the outcome, so
+                # neither wip branch CAN drift from the other.
+                self._give_up_with_wip(escalation, outcome)
             else:
                 self._auto_escalate_to_human(
                     escalation,
@@ -563,6 +678,13 @@ class TaskSteward:
                     f'{len(suggestions)} suggestions'
                 )
                 escalation = await self._pre_triage_suggestions(escalation)
+                # The CLI checks --max-budget-usd only between turns, so a
+                # triage can overshoot the headroom its own guard left.
+                if self._give_up_if_lifetime_budget_spent(escalation):
+                    return
+
+        if not self._carries_session_across_l0s():
+            self._drop_session()
 
         # Prompt: initial (full briefing) vs continuation (just the escalation)
         is_initial = self._session_id is None
@@ -578,6 +700,8 @@ class TaskSteward:
                 escalation=escalation.to_dict(),
                 pending_escalations=pending_dicts,
                 worktree=self.worktree,
+                handled=self._briefing_digest(),
+                earlier_attempts=self._earlier_attempts(escalation.id),
             )
         else:
             prompt = await self.briefing.build_steward_continuation_prompt(
@@ -590,9 +714,9 @@ class TaskSteward:
         escalation_url = f'http://{esc_cfg.host}:{esc_cfg.port}/mcp'
         mcp_config = self.mcp.mcp_config_json(escalation_url=escalation_url)
 
-        # Per-invocation budget: capped by lifetime remaining
-        remaining = self.config.steward_lifetime_budget - self.metrics.total_cost_usd
-        per_invocation = min(self.config.budgets.steward, remaining)
+        per_invocation = min(
+            self.config.budgets.steward, self._remaining_lifetime_budget(),
+        )
 
         # Invoke with session persistence and cap-hit recovery
         result = await self._invoke_with_session(
@@ -619,7 +743,7 @@ class TaskSteward:
         if self.event_store:
             self.event_store.emit(
                 EventType.invocation_end,
-                task_id=self.task_id, phase='escalated', role='steward',
+                task_id=self.task_id, phase=WorkflowState.ESCALATED.value, role='steward',
                 cost_usd=result.cost_usd, duration_ms=result.duration_ms,
                 data={
                     'turns': result.turns, 'success': result.success,
@@ -628,12 +752,29 @@ class TaskSteward:
                     'retry_count': retry_count,
                     'account_name': result.account_name,
                     'timed_out': is_timeout,
+                    # Sibling of the workflow._invoke emitter (task 3639): keep
+                    # the two agent-invocation row shapes symmetric so one
+                    # runs.db query covers both roles.  Emitted unconditionally,
+                    # False included, so the false-positive rate has a
+                    # denominator.
+                    'ended_awaiting_background': result.ended_awaiting_background,
+                    'retry_aborted': result.retry_aborted,
+                    'cost_basis': result.cost_basis.value,
+                    'cost_delta_clamped': result.cost_delta_clamped,
                 },
             )
 
+        # A declined retry means the escalation stopped being pending during
+        # the run, so the returned attempt is no verdict on it: neither
+        # recovery carve-out below applies.
+        if result.retry_aborted:
+            logger.info(
+                f'Steward for task {self.task_id}: retry cancelled — '
+                f'{escalation.id} is no longer pending'
+            )
         # Timeout-kill: treat as recoverable — do NOT consume retry budget.
         # The escalation remains pending so the run loop re-queues it naturally.
-        if is_timeout:
+        elif is_timeout:
             self.metrics.timeouts_recovered += 1
             self._timeout_counts[escalation.id] = (
                 self._timeout_counts.get(escalation.id, 0) + 1
@@ -647,8 +788,7 @@ class TaskSteward:
                 f'{self.config.steward_max_timeouts_per_escalation})'
             )
             return
-
-        if _is_empty_output(result):
+        elif _is_empty_output(result):
             self.metrics.empty_outputs_recovered += 1
             self._empty_output_counts[escalation.id] = (
                 self._empty_output_counts.get(escalation.id, 0) + 1
@@ -659,7 +799,7 @@ class TaskSteward:
             # session id so the next attempt rebuilds a fresh initial prompt at the
             # current cwd instead of repeating the same instant failure.
             cleared = self._session_id is not None
-            self._session_id = None
+            self._drop_session()
             logger.warning(
                 f'Steward for task {self.task_id}: invocation produced no output '
                 f'(empty stdout) — retry_count NOT incremented '
@@ -694,7 +834,9 @@ class TaskSteward:
                 or result.output
                 or escalation.summary
             )
-            self._publish_outcome(StewardResolved(resolution_text=resolution_text))
+            self._publish_outcome(
+                escalation, StewardResolved(resolution_text=resolution_text),
+            )
 
     # ------------------------------------------------------------------
     # Session-aware invocation with cap-hit recovery
@@ -722,9 +864,10 @@ class TaskSteward:
         exceeding it by an unbounded multiple of the cap-retry count.
 
         Kwargs are forwarded verbatim to :func:`invoke_agent` — including the
-        ``backend`` kwarg ``invoke_with_cap_retry`` injects for custom
-        ``invoke_fn`` callers (cli_invoke.py:1079-1086), whose disposition is
-        unchanged by this shim.
+        ``backend`` kwarg that ``invoke_with_cap_retry`` (shared/cli_invoke.py)
+        forwards into the dispatched call only when a custom ``invoke_fn`` is
+        supplied — see its multi-backend reconnect block — whose disposition
+        is unchanged by this shim.
         """
         self.metrics.subprocess_attempts += 1
         return await invoke_agent(**kwargs)
@@ -737,28 +880,44 @@ class TaskSteward:
         per_invocation_budget: float,
         escalation: Escalation,
     ):
-        """Invoke the steward agent, resuming the session if one exists.
+        """Invoke the steward agent, resuming the carried session if there is one.
 
         Delegates the account-failover cap-retry loop (usage-gate slot
         management, cap-hit detection, the zero-output wedge guard, 401/403
         auth routing) to the shared ``invoke_with_cap_retry``.  This method
         does only session-id bookkeeping: it forwards ``self._session_id``
         as ``resume_session_id`` when a prior session exists, and captures
-        the result's ``session_id`` for the next call.
+        the result's ``session_id`` for the next call.  A fresh session
+        replaces ``_session_id`` only after the CLI provably rejected the
+        armed resume, and that replacement is reported
+        (``_note_rejected_resume``).
 
-        The steward is always a LIVE continuation, never a crash-recovery
+        Under ``fresh_per_l0`` ``_handle_escalation`` has already dropped the
+        session, so nothing is carried in and the only resume left is the
+        shared loop's cap-hit resume within this L0; under ``resume`` the
+        session carried from the previous L0 is resumed.
+
+        A steward resume is always a LIVE continuation, never a crash-recovery
         resume: ``prompt`` (built by ``_handle_escalation``) carries the new
         escalation's content, which the resumed session has not seen yet.
         This passes ``resume_delivers_prompt=True`` so the shared loop
         delivers that real prompt to the agent on resume, instead of its
         crash-recovery placeholder ('continue').
 
-        On an unresumable cap hit (no session_id survives the capped call),
-        the shared loop calls back into ``rebuild_prompt`` below to rebuild
-        the full initial prompt with freshly-gathered pending escalations —
-        context is lost across account switches.
+        Before every re-dispatch the shared loop awaits ``rebuild_prompt``
+        below.  It re-reads *escalation* from the queue and declines (None)
+        once that record is no longer pending, so a retry never re-runs
+        finished work.  Otherwise it rebuilds the full initial prompt from
+        the LIVE record and freshly-gathered pending escalations; a fresh
+        retry sends it, a resumed one keeps its own continuation.  The
+        handled copy's ``detail``/``summary`` are laid over the live record
+        because pre-triage replaces exactly those two fields on a copy it
+        never persists.
         """
-        async def rebuild_prompt(session_lost: bool) -> str:
+        async def rebuild_prompt() -> str | None:
+            live = self.escalation_queue.get(escalation.id)
+            if live is None or live.status != 'pending':
+                return None
             pending_dicts = [
                 e.to_dict()
                 for e in self.escalation_queue.get_by_task(
@@ -767,9 +926,13 @@ class TaskSteward:
             ]
             return await self.briefing.build_steward_initial_prompt(
                 task=self.task,
-                escalation=escalation.to_dict(),
+                escalation=replace(
+                    live, detail=escalation.detail, summary=escalation.summary,
+                ).to_dict(),
                 pending_escalations=pending_dicts,
                 worktree=self.worktree,
+                handled=self._briefing_digest(),
+                earlier_attempts=self._earlier_attempts(escalation.id),
             )
 
         # Route resolution (task η): resolve model/effort/max_turns through the
@@ -795,6 +958,7 @@ class TaskSteward:
             event_store=self.event_store,
             cost_store=self.cost_store,
             applied_budget_usd=per_invocation_budget,
+            phase=WorkflowState.ESCALATED,
         )
         kwargs: dict = dict(
             prompt=prompt,
@@ -810,22 +974,13 @@ class TaskSteward:
         )
         if self._session_id is not None:
             kwargs['resume_session_id'] = self._session_id
+            if self._session_reported_total_usd is not None:
+                kwargs['resume_prior_total_cost_usd'] = self._session_reported_total_usd
+        armed = kwargs.get('resume_session_id')
 
-        # NOTE (reviewer_comprehensive, task W4-eta amendment): the `backend`
-        # kwarg below only feeds invoke_with_cap_retry's own
-        # classify_invocation / detect_cap_hit calls — it is never forwarded
-        # into `invoke_kwargs` before `invoke_fn` (invoke_agent) is called,
-        # so invoke_agent always runs with its own default (backend='claude')
-        # regardless of this value. This matches every other
-        # invoke_with_cap_retry caller (workflow._invoke,
-        # _pre_triage_suggestions below), and is a no-op today because the
-        # steward only ever runs backend='claude' in practice. If
-        # `config.backends.steward` is ever set to a non-claude backend, the
-        # steward would silently keep invoking Claude. The real fix
-        # (forwarding `backend` into `invoke_kwargs` inside
-        # shared/cli_invoke.py before it calls `invoke_fn`) touches a file
-        # outside this task's locked scope (steward.py / test_steward.py
-        # only) — left for a follow-up task rather than fixed here.
+        # `backend` below reaches invoke_agent: invoke_with_cap_retry forwards
+        # it into invoke_kwargs only when a custom invoke_fn is supplied, and
+        # invoke_fn=_invoke_agent_counted below is exactly that case.
         result = await invoke_with_cap_retry(
             self.usage_gate,
             f'Steward for task {self.task_id}',
@@ -855,10 +1010,52 @@ class TaskSteward:
             **kwargs,
         )
 
-        if result.session_id:
-            self._session_id = result.session_id
+        self._note_rejected_resume(armed, result)
+        self._adopt_session(result)
 
         return result
+
+    def _note_rejected_resume(self, armed: str | None, result) -> None:
+        """Report that the CLI rejected the steward's own armed resume.
+
+        No resume-outcome-sink call: a steward resume is a live continuation,
+        never an adopted crash-recovery resume, so it must not feed the INV-4
+        storm streak.
+        """
+        data = cli_resume_failed_data(
+            armed_session_id=armed,
+            role=STEWARD.name,
+            fallbacks=result.resume_fallbacks,
+            dropped_session_ids=result.resume_fallback_session_ids,
+        )
+        if data is None:
+            return
+        logger.warning(
+            'Steward for task %s: the CLI rejected resume of session %s before '
+            'any model turn — adopting fresh session %s',
+            self.task_id, data['session_id'], result.session_id,
+        )
+        if self.event_store:
+            self.event_store.emit(
+                EventType.session_resume_failed, task_id=self.task_id, data=data,
+            )
+
+    def _adopt_session(self, result) -> None:
+        """Resume *result*'s session next time, carrying its reported total as the prior."""
+        if not result.session_id:
+            return
+        self._session_reported_total_usd = next_resume_prior(
+            armed_session_id=self._session_id,
+            armed_prior_usd=self._session_reported_total_usd,
+            result_session_id=result.session_id,
+            result_reported_total_usd=result.reported_total_cost_usd,
+        )
+        self._session_id = result.session_id
+
+    def _drop_session(self) -> None:
+        """Start the next invocation fresh: forget the session and its prior total together."""
+        self._session_id = None
+        self._session_reported_total_usd = None
 
     # ------------------------------------------------------------------
     # Pre-triage for large suggestion sets
@@ -871,8 +1068,15 @@ class TaskSteward:
 
         Returns the escalation with its detail field replaced by pre-triaged
         markdown.  If triage fails, returns the original escalation unchanged
-        so the steward falls back to inline triage.
+        so the steward falls back to inline triage.  Also falls back (without
+        invoking) when the remaining lifetime budget cannot cover the triage
+        budget with headroom left for the main invocation.  The outcome of a
+        triage that actually ran is cached per escalation id.
         """
+        cached = self._pretriaged.get(escalation.id)
+        if cached is not None:
+            return cached
+
         from orchestrator.agents.triage import (
             TRIAGE,
             build_triage_prompt,
@@ -881,46 +1085,6 @@ class TaskSteward:
         )
         from orchestrator.artifacts import TaskArtifacts
         from orchestrator.workflow import _inject_verdict_tools_mcp
-
-        suggestions = json.loads(_strip_hash_prefix(escalation.detail))
-        prompt = build_triage_prompt(suggestions, self.task)
-
-        meta_root = TaskArtifacts.meta_root_for(self.worktree.parent, self.worktree.name)
-        if not meta_root.is_dir():
-            # TaskWorkflow._setup normally creates this (via artifacts.init())
-            # for this exact worktree before any steward is ever constructed
-            # against it. If it's still missing here, the verdict-tools
-            # server spawned below (same --meta-root) would silently no-op
-            # its write_verdict call, and read_verdict() further down would
-            # return None indistinguishably from a genuine triage failure —
-            # log distinctly and create it so a misconfigured meta-root is
-            # diagnosable instead of masquerading as an ordinary fallback.
-            logger.warning(
-                'Steward for task %s: pre-triage meta-root %s did not '
-                'exist — creating it now. This should already have been '
-                'created by workflow setup; a missing root here means '
-                'pre-triage would otherwise silently and permanently '
-                'degrade to inline triage.',
-                self.task_id, meta_root,
-            )
-            meta_root.mkdir(parents=True, exist_ok=True)
-        artifacts = TaskArtifacts(self.worktree, meta_root)
-        artifacts.clear_verdict('triage')  # I-FRESH: never consume a stale verdict
-
-        # Base the injected config on the steward's own fused-memory wiring
-        # (not a from-scratch skeleton) so the 'orchestrator' family TRIAGE
-        # declares — and the get_tasks/search dedup step its system prompt
-        # instructs the agent to run — is explicitly wired here, rather than
-        # relying on the ambient project_root/.mcp.json merge that cli_invoke
-        # performs (--mcp-config without --strict-mcp-config). That merge
-        # happens to supply fused-memory today, but it's an accident of cwd
-        # and merge behavior neither of which this method controls; building
-        # from self.mcp.mcp_config_json() makes the wiring match the role
-        # declaration directly. No escalation_url: TRIAGE grants no
-        # escalation tools.
-        mcp_config = _inject_verdict_tools_mcp(
-            self.mcp.mcp_config_json(), self.worktree, TRIAGE,
-        )
 
         # Route resolution (task η): the inner triage invoke resolves
         # model/effort/budget/max_turns through the shared resolver + emits a
@@ -946,7 +1110,60 @@ class TaskSteward:
             in_memory_task=self.task,
             event_store=self.event_store,
             cost_store=self.cost_store,
+            phase=WorkflowState.ESCALATED,
         )
+        remaining = self._remaining_lifetime_budget()
+        if remaining <= decision.budget_usd:
+            # Strict, so a triage that stays within its cap leaves a positive
+            # remainder for the main invocation's --max-budget-usd.
+            logger.warning(
+                'Steward for task %s: pre-triage skipped — remaining lifetime '
+                'budget $%.2f does not cover triage budget $%.2f, falling '
+                'back to inline triage',
+                self.task_id, remaining, decision.budget_usd,
+            )
+            return escalation
+
+        suggestions = json.loads(_strip_hash_prefix(escalation.detail))
+        prompt = build_triage_prompt(suggestions, self.task)
+
+        artifacts = TaskArtifacts.for_task(self.worktree, self.task_id)
+        for root in (artifacts.lane_root, artifacts.task_root):
+            if root.is_dir():
+                continue
+            # TaskWorkflow._setup normally creates both roots (via
+            # artifacts.init()) for this exact dispatch before any steward is
+            # ever constructed against it. If one is still missing here, the
+            # verdict-tools server spawned below (same roots) would silently
+            # no-op its write_verdict call, and read_verdict() further down
+            # would return None indistinguishably from a genuine triage
+            # failure — log distinctly and create it so a misconfigured root
+            # is diagnosable instead of masquerading as an ordinary fallback.
+            logger.warning(
+                'Steward for task %s: pre-triage artifact root %s did not '
+                'exist — creating it now. This should already have been '
+                'created by workflow setup; a missing root here means '
+                'pre-triage would otherwise silently and permanently '
+                'degrade to inline triage.',
+                self.task_id, root,
+            )
+            root.mkdir(parents=True, exist_ok=True)
+        artifacts.clear_verdict('triage')  # I-FRESH: never consume a stale verdict
+
+        # Base the injected config on the steward's own fused-memory wiring
+        # (not a from-scratch skeleton) so the 'orchestrator' family TRIAGE
+        # declares — and the get_tasks/search dedup step its system prompt
+        # instructs the agent to run — is explicitly wired here, rather than
+        # relying on the ambient .mcp.json merge that cli_invoke performs
+        # from cwd (--mcp-config without --strict-mcp-config), which this
+        # method does not control. Building from self.mcp.mcp_config_json()
+        # makes the wiring match the role declaration directly. No
+        # escalation_url: TRIAGE grants no escalation tools.
+        mcp_config = _inject_verdict_tools_mcp(
+            self.mcp.mcp_config_json(), self.worktree, TRIAGE,
+            task_root=artifacts.task_root,
+        )
+
         try:
             result = await invoke_with_cap_retry(
                 self.usage_gate,
@@ -957,7 +1174,7 @@ class TaskSteward:
                 invoke_fn=self._invoke_agent_counted,
                 prompt=prompt,
                 system_prompt=TRIAGE.system_prompt,
-                cwd=self.config.project_root,
+                cwd=self.worktree,
                 model=decision.model,
                 max_turns=decision.max_turns,
                 max_budget_usd=decision.budget_usd,
@@ -1002,6 +1219,7 @@ class TaskSteward:
                 f'Steward for task {self.task_id}: pre-triage failed, '
                 f'falling back to inline triage'
             )
+            self._pretriaged[escalation.id] = escalation
             return escalation
 
         new_detail = format_pretriaged_detail(
@@ -1011,7 +1229,7 @@ class TaskSteward:
         # Return a modified copy — don't mutate the queue's version
         from escalation.models import Escalation as EscModel
 
-        return EscModel(
+        pretriaged = EscModel(
             **{
                 **escalation.to_dict(),
                 'detail': new_detail,
@@ -1022,6 +1240,8 @@ class TaskSteward:
                 ),
             },
         )
+        self._pretriaged[escalation.id] = pretriaged
+        return pretriaged
 
     # ------------------------------------------------------------------
     # Give-up without an L1 hand-off (task-2060 resume-plan branches)
@@ -1055,13 +1275,31 @@ class TaskSteward:
         Called from EVERY cap-fire early return in :meth:`_handle_escalation`
         — not just the two wip-gated branches — so the busy-loop shape is
         unreachable from any future early return added there (task 3170,
-        fix B).  ``_capped_escalations`` is deliberately per-steward, not
-        persisted: it means "terminal for THIS steward", and a fresh steward
-        for the same task is entitled to try again.
+        fix B).
+
+        ``_capped_escalations`` is PERSISTED (task 5352), reversing what this
+        docstring used to claim.  "Terminal for THIS steward" meant a fresh
+        steward for the same task was entitled to try again — and since the
+        fleet redeploys every ~8-15h, a permanently unhandleable escalation
+        was re-adopted and its ladder re-burnt on that cadence, indefinitely.
+        The give-up is now terminal for the TASK, which is exactly what the
+        state is keyed by: one file per task, so a redeployed steward for the
+        same task reads it and a steward for any other task cannot.
+
+        Three things bound that.  The key is (task, ESCALATION id), so a
+        genuinely new record always finds a full budget and only the
+        byte-identical one that already exhausted the ladder is remembered.
+        The file is per-task, so the two sites that ENUMERATE this set —
+        :meth:`_log_capped_idle_once` and :meth:`_watch_for_escalation`'s
+        ``--exclude-id`` argv — see this task's ids and nothing else.  And the
+        record expires after ``_STEWARD_GUARD_TTL``, so even that memory does
+        not outlive its subject.
         """
         self._capped_escalations.add(escalation_id)
 
-    def _dismiss_capped_l0(self, escalation: Escalation, reason: str) -> None:
+    def _dismiss_capped_l0(
+        self, escalation: Escalation, reason: str,
+    ) -> Escalation | None:
         """Dismiss *escalation* on a give-up that files no L1 (task 3170).
 
         The wip-gated cap branches deliberately skip
@@ -1078,8 +1316,20 @@ class TaskSteward:
         harness wires to ``_escalation_events[task_id].set()`` — the ONLY
         signal that wakes ``TaskWorkflow._wait_for_resolution`` on the
         ``run()``-ESCALATED path.
+
+        Returns what ``resolve()`` returned: the record AS STORED after the
+        call, or ``None`` when the id is unknown.  The dismissal is therefore
+        OBSERVED, not fire-and-forget (task 4495) — ``resolve()``'s status
+        check is an atomic check-and-set inside ``escalation_id_lock``, so a
+        ``resolve_issue`` already in flight from the killed agent session can
+        win it and leave the returned record carrying the AGENT's close
+        (``'resolved'``, or ``'dismissed'`` for an ``abandon``) rather than this
+        steward's.  :meth:`_give_up_with_wip` is the sole caller and owns that
+        branch (see :func:`_dismissal_was_overtaken`), including the give-up
+        WARNING, which used to live here and moved out because it is FALSE on
+        the lost-race path.
         """
-        self.escalation_queue.resolve(
+        stored = self.escalation_queue.resolve(
             escalation.id,
             f'Auto-dismissed: steward interrupted ({reason}) with WIP present '
             f'— resuming plan, not escalating',
@@ -1089,16 +1339,114 @@ class TaskSteward:
 
         # Same cleanup as _auto_escalate_to_human: cap-fire paths skip the
         # success-path cleanup, so the dicts would otherwise retain stale
-        # entries for this escalation id.
+        # entries for this escalation id.  Unconditional — the counters are
+        # this steward's own bookkeeping and the give-up is terminal for it
+        # regardless of which side won the race above.
         self._retry_counts.pop(escalation.id, None)
         self._timeout_counts.pop(escalation.id, None)
         self._empty_output_counts.pop(escalation.id, None)
 
+        return stored
+
+    def _remaining_lifetime_budget(self) -> float:
+        return self.config.steward_lifetime_budget - self.metrics.total_cost_usd
+
+    def _give_up_if_lifetime_budget_spent(self, escalation: Escalation) -> bool:
+        """Re-escalate *escalation* to L1 once the lifetime budget is spent.
+
+        Returns whether it gave up; the caller must then return at once.
+        """
+        if self._remaining_lifetime_budget() > 0:
+            return False
+        self._auto_escalate_to_human(
+            escalation, 'Steward lifetime budget exhausted '
+            f'(${self.metrics.total_cost_usd:.2f} / '
+            f'${self.config.steward_lifetime_budget:.2f})',
+            outcome=StewardBudgetExhausted(),
+        )
+        self._mark_capped(escalation.id)
+        return True
+
+    def _give_up_with_wip(
+        self, escalation: Escalation, outcome: StewardInterrupted,
+    ) -> None:
+        """The wip-gated give-up, converged: dismiss, OBSERVE, then publish.
+
+        THE single body behind both wip-gated cap branches in
+        :meth:`_handle_escalation` (the attempt cap and the timeout-kill cap),
+        whose comments have long warned that neither may drift from the other.
+        They previously shared only a two-line call sequence, which is exactly
+        how far apart two copies can drift before anything notices.  *reason*
+        is read off ``outcome.reason`` rather than passed separately so the
+        dismissal text and the published outcome cannot disagree about WHY the
+        steward gave up.
+
+        Dismiss-THEN-publish is preserved verbatim: the dismissal wakes the
+        ``run()``-ESCALATED waiter via the resolve callback, the publish hands
+        the typed outcome to the ``_mark_blocked`` waiter.
+
+        THE RACE (task 4495, esc-3902-1).  A ``resolve_issue`` already in
+        flight from the killed agent session can land between the steward's
+        early return and this call — the wip probe alone is a ``git rev-list``
+        subprocess, so the window is tens to hundreds of ms wide.
+        ``EscalationQueue.resolve`` is already a correct atomic check-and-set,
+        so exactly one side wins and the dismissal is correctly a no-op when it
+        loses; what was wrong was that nothing LOOKED.  A lost race therefore
+        published ``StewardInterrupted`` — telling the workflow to resume the
+        plan because the steward was cut short — for a record an agent session
+        had in fact just closed, and logged that it had dismissed an L0 it had
+        not.
+
+        Prevention cannot close this: the steward cannot observe a tool call
+        that has left the agent process but has not yet reached the escalation
+        server.  Reporting truthfully can, and does.
+
+        WHICH side won is read off the RETURNED RECORD by
+        :func:`_dismissal_was_overtaken` — any terminal record not attributed to
+        an automated sweep is one this steward did not close, covering the
+        winner's ``'resolved'`` and ``'dismissed'`` outcomes alike (an
+        ``abandon``/``close_only`` ``resolve_issue`` wins the same check-and-set
+        and would otherwise be misreported as a steward interruption, telling
+        the workflow to resume a plan an agent deliberately abandoned).
+
+        Reading the record rather than ``resolve()``'s ``ResolveOutcome``
+        out-param is load-bearing for the existing suite: ``test_steward.py``
+        drives a ``MagicMock`` queue whose ``resolve()`` returns a bare
+        ``MagicMock``, which the predicate's status membership test rejects, so
+        every one of those tests keeps today's behaviour unchanged.
+        ``test_steward_dismiss_race.py`` pins that as a behaviour of this
+        steward, not of ``unittest.mock``.
+
+        ``StewardMetrics`` is deliberately untouched on the race-lost path:
+        this steward did not resolve the escalation — it lost to the agent
+        session it had already given up on — so counting it as a handled
+        escalation would overstate what the steward did.
+        """
+        stored = self._dismiss_capped_l0(escalation, outcome.reason)
+
+        if stored is not None and _dismissal_was_overtaken(stored):
+            logger.warning(
+                f'Steward for task {self.task_id}: gave up on {escalation.id} '
+                f'({outcome.reason}) with WIP present, but an in-flight resolve '
+                f'had ALREADY closed the record (status={stored.status!r}, '
+                f'resolved_by={stored.resolved_by!r}) — the dismissal was an '
+                f'atomic no-op; publishing that resolution instead of a '
+                f'resume-plan interruption'
+            )
+            self._publish_outcome(
+                escalation,
+                StewardResolved(
+                    resolution_text=stored.resolution or escalation.summary,
+                ),
+            )
+            return
+
         logger.warning(
             f'Steward for task {self.task_id}: gave up on {escalation.id} '
-            f'({reason}) with WIP present — dismissed the L0 and published a '
-            f'resume-plan interruption (no L1 filed)'
+            f'({outcome.reason}) with WIP present — dismissed the L0 and '
+            f'published a resume-plan interruption (no L1 filed)'
         )
+        self._publish_outcome(escalation, outcome)
 
     # ------------------------------------------------------------------
     # Auto-escalation to level-1 (human)
@@ -1123,7 +1471,7 @@ class TaskSteward:
         reesc = EscModel(
             id=self.escalation_queue.make_id(self.task_id),
             task_id=self.task_id,
-            agent_role='steward',
+            agent_role=STEWARD.name,
             severity=escalation.severity,
             category=escalation.category,
             summary=f'Steward re-escalation: {reason}',
@@ -1157,6 +1505,7 @@ class TaskSteward:
             f'to level 1: {reason}'
         )
         self._publish_outcome(
+            escalation,
             outcome if outcome is not None else StewardReescalatedL1(esc_id=reesc.id),
         )
 
@@ -1188,6 +1537,37 @@ class TaskSteward:
                 logger.warning(
                     f'Failed to patch steward metadata on {escalation_id}: {e}'
                 )
+
+
+def _dismissal_was_overtaken(stored: Escalation) -> bool:
+    """Did something OTHER than an automated dismissal close *stored* first?
+
+    The question :meth:`TaskSteward._give_up_with_wip` has to answer about the
+    record ``EscalationQueue.resolve`` handed back: did MY dismissal apply, or
+    did an in-flight ``resolve_issue`` from the killed agent session win the
+    atomic check-and-set?  The steward always dismisses with
+    ``resolved_by='auto-dismissed'``, so a terminal record attributed to
+    anything outside the ``'reaper-sweep'`` tier is one this steward did not
+    close — whichever terminal state the winner produced.
+
+    BOTH terminal states count.  A winning ``resolve_issue`` lands
+    ``'resolved'`` for ``resume``/``restart`` but ``'dismissed'`` for the
+    dismissing actions (``abandon`` / ``close_only``, ``server._DISMISS_ACTIONS``),
+    and the steward's own call was an atomic no-op either way — reading only
+    ``'resolved'`` would report a deliberate agent abandon as a steward
+    interruption and tell the workflow to resume the plan for it, the same
+    class of misreport task 4495 exists to fix, one door over.
+
+    ANOTHER automated sweep winning (``harness-orphan-reaper`` et al.) is
+    deliberately NOT a lost race: it closed the record the same way this
+    steward was about to, carrying no agent finding to publish.
+
+    The rule lives in ``escalation/classify.py::closed_by_non_sweep_resolver``,
+    which keeps the sweep-tier membership single-sited (INV-5) and is
+    MagicMock-safe for the ``test_steward.py`` cases whose mock queue returns
+    a bare ``MagicMock`` from ``resolve()``.
+    """
+    return closed_by_non_sweep_resolver(stored)
 
 
 def _strip_hash_prefix(detail: str) -> str:
@@ -1232,6 +1612,15 @@ def _is_timeout_kill(result) -> bool:
     return has_marker and 'timeout' in stderr
 
 
+# Subtypes sharing the instant-empty-stdout shape, and therefore the "no real
+# work was done, so don't consume retry budget" treatment.
+# error_cli_input_rejected (task 3143 / esc-3118-1) joins the generic subtype
+# rather than being handled separately: the agent was never asked anything at
+# all, which is a strictly STRONGER claim to the carve-out than the generic
+# case has.
+_EMPTY_OUTPUT_SUBTYPES = frozenset({'error_empty_output', 'error_cli_input_rejected'})
+
+
 def _is_empty_output(result) -> bool:
     """Return True when *result* represents an instant-empty-stdout subprocess failure.
 
@@ -1243,17 +1632,27 @@ def _is_empty_output(result) -> bool:
     was done, so this attempt should NOT consume retry budget (mirrors the
     ``_is_timeout_kill`` carve-out).
 
+    ``error_cli_input_rejected`` (task 3143) is accepted on the same terms: the
+    CLI rejected the invocation on argument validation BEFORE any model turn —
+    zero cost, no work done, and the agent was never even asked the question —
+    so it must not consume retry budget either.  Note ``invoke_with_cap_retry``
+    has already spent its own one-shot fresh retry by the time a rejection
+    reaches here, so the steward's bounded counter
+    (``steward_max_empty_outputs_per_escalation``) is the outer bound, not the
+    only one.
+
     Note: a SIGTERM/SIGKILL-killed productive run (e.g. reify-4415: 43 assistant
     turns over 1198s) can ALSO produce subtype='error_empty_output' because the
     CLI emits its JSON only at exit.  ``is_timed_out_with_progress`` (keyed on
     transcript_turns) distinguishes that case — those runs DID do real work and
-    must NOT be treated as instant empty-output failures.
+    must NOT be treated as instant empty-output failures.  The carve-out applies
+    to every subtype in ``_EMPTY_OUTPUT_SUBTYPES``, not just the generic one.
     """
-    if result.timed_out and result.transcript_turns is None and result.subtype == 'error_empty_output':
+    if result.timed_out and result.transcript_turns is None and result.subtype in _EMPTY_OUTPUT_SUBTYPES:
         logger.debug(
             '_is_empty_output: timed_out=True but transcript_turns=None '
             '(transcript could not be located for session %r) — '
             'conservative empty-output classification may misidentify a productive run',
             getattr(result, 'session_id', ''),
         )
-    return result.subtype == 'error_empty_output' and not is_timed_out_with_progress(result)
+    return result.subtype in _EMPTY_OUTPUT_SUBTYPES and not is_timed_out_with_progress(result)

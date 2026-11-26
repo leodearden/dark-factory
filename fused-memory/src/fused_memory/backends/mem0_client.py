@@ -2,25 +2,283 @@
 
 import asyncio
 import logging
-from typing import Any
+from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Sequence
+from contextlib import aclosing
+from typing import Any, TypeVar
 
 from mem0 import AsyncMemory
+from qdrant_client import QdrantClient
 
+from fused_memory.backends.timeout_budget import await_within, socket_timeout_outlasting
+from fused_memory.config.env_precedence import warn_if_ambient_base_url_is_overridden
 from fused_memory.config.schema import FusedMemoryConfig
 from fused_memory.models.scope import Scope
+from fused_memory.utils.mem0_content_keys import MEM0_TEXT_KEY, mem0_payload_text
+from fused_memory.utils.toolcall_xml_leak import PREFILTER_NEEDLES, find_toolcall_xml_leak
 
 logger = logging.getLogger(__name__)
 
+#: Return type of whatever a timed call is awaiting — see Mem0Backend._timed_read.
+_T = TypeVar('_T')
+
+# How much of a matching record's text to echo back in a scan hit.
+_EXCERPT_LEN = 240
+
+
+#: A scan verdict: the fragments of *text* that make it a match (empty: no match).
+_ScanVerdict = Callable[[str], list[str]]
+
+
+def _leak_verdict(text: str) -> list[str]:
+    return [hit.fragment for hit in find_toolcall_xml_leak(text)]
+
+
+def _needle_verdict_for(needles: Sequence[str]) -> _ScanVerdict:
+    """The distinct *needles* that occur in a text, case-sensitively, in caller order."""
+    distinct = tuple(dict.fromkeys(needles))
+
+    def present(text: str) -> list[str]:
+        return [needle for needle in distinct if needle in text]
+
+    return present
+
+
+def _excerpt_around(text: str, fragments: Sequence[str]) -> str:
+    """At most ``_EXCERPT_LEN`` chars of *text*, centred where its earliest *fragments* hit begins.
+
+    A ``…`` marks each side the window elides, so a window never reads as the whole text.
+    """
+    anchor = min(text.find(fragment) for fragment in fragments)
+    begin = max(0, min(anchor - _EXCERPT_LEN // 2, len(text) - _EXCERPT_LEN))
+    end = begin + _EXCERPT_LEN
+    return ('…' if begin else '') + text[begin:end] + ('…' if end < len(text) else '')
+
+
+#: Default cap on how many pages a single full-enumeration scroll may walk.
+#: A pager with no budget loops forever if Qdrant keeps handing back a live
+#: ``next_offset``, so the budget travels with the loop.  THE single home for
+#: this number: ``scripts/census_memory_metadata.DEFAULT_MAX_PAGES`` aliases
+#: it rather than restating 200 (INV-5).
+DEFAULT_SCROLL_MAX_PAGES = 200
+
+
+class ScrollPageBudgetExhausted(RuntimeError):
+    """A paged scroll consumed *max_pages* with ``next_offset`` still live.
+
+    The stream is TRUNCATED, so the pager raises rather than ending short —
+    a caller that folded a short stream into counters would under-report with
+    no error surface (INV-11 no-silent-fail-soft).
+
+    ``scripts/census_memory_metadata.CensusScanIncomplete`` is a module-level
+    ALIAS of this class (not a subclass): the census's ``except
+    CensusScanIncomplete`` must catch exactly what the backend raises.
+    """
+
+
+class ScrollPointBudgetExhausted(RuntimeError):
+    """A paged scroll consumed a caller-supplied *max_points* cap.
+
+    Raised, not returned short, for the same reason as its sibling: the
+    primitive never truncates silently (INV-11 no-silent-fail-soft).  A caller
+    that wants a quiet capped read converts this into its own flag; a caller
+    that does not pass ``max_points`` can never see it.
+
+    Deliberately a STANDALONE sibling of :class:`ScrollPageBudgetExhausted` —
+    neither is a subclass of the other.  They are different events and the
+    split is what lets the CALLER choose the posture per event:
+
+    * *max_points* is a cap the caller explicitly asked for, so being stopped
+      by it is an expected outcome that a caller may reasonably fold into a
+      ``truncated`` flag (:meth:`Mem0Backend.scan_payload_text` does exactly
+      this, keeping the flag-and-WARNING posture it had before its walk moved
+      onto the shared pager).
+    * *max_pages* is a safety backstop nobody asked for, so exhausting it is
+      an error that should keep propagating even in a caller that tolerates
+      the first — reporting a backstop truncation as if the caller had asked
+      for it would hand a sweep a plausible-looking undercount.
+
+    An inheritance link in either direction would collapse that choice back
+    into one, and would additionally change what
+    ``scripts/census_memory_metadata``'s ``except CensusScanIncomplete``
+    (an alias of the page-budget class) catches — for a cap the census does
+    not pass.
+    """
+
+
+def is_missing_collection_error(exc: BaseException) -> bool:
+    """True iff *exc* is Qdrant's "that collection doesn't exist" 404.
+
+    A collection that was never provisioned holds no memories, so the honest
+    answer for a read against it is an EMPTY RESULT — semantically the same 0
+    / ``[]`` that ``task_curator.corpus_count``/``search_corpus`` return for an
+    absent collection, and distinct from a failure to read.
+
+    Everything else returns False and MUST keep propagating to the caller's
+    error path: a non-404 ``UnexpectedResponse`` (a real backend failure), a
+    generic exception, and above all a ``TimeoutError`` — rendering a
+    transient failure as "no data" is precisely the silent fail-soft the
+    no-silent-fail invariant bans.  Matching is therefore narrow by
+    construction (404 AND the message), so a 404 raised about some other
+    Qdrant resource can never be read as an empty collection.
+
+    :meth:`Mem0Backend._timed_collection_read` is the degrade-and-disclose
+    home for the Scope-addressed metadata reads; any other caller that
+    degrades on this predicate should likewise log the missing collection.
+    """
+    from qdrant_client.http.exceptions import UnexpectedResponse
+
+    if not isinstance(exc, UnexpectedResponse) or exc.status_code != 404:
+        return False
+    content = exc.content
+    if isinstance(content, bytes | bytearray):
+        content = content.decode('utf-8', errors='replace')
+    text = str(content).lower()
+    # BOTH tokens, never the phrase alone: Qdrant words several other not-found
+    # errors identically ("Snapshot `x` doesn't exist!", alias/shard variants),
+    # and only the COLLECTION one means "zero memories".  Requiring 'collection'
+    # is what makes the narrowness the docstring promises actually hold.
+    # Verified against a live Qdrant scroll on an absent collection:
+    # {"status":{"error":"Not found: Collection `x` doesn't exist!"}}.
+    return "doesn't exist" in text and 'collection' in text
+
+
+# ---------------------------------------------------------------------------
+# mem0-owned metadata keys
+# ---------------------------------------------------------------------------
+
+#: Keys mem0's ``AsyncMemory._update_memory``
+#: (site-packages/mem0/memory/main.py, ~line 2449) never trusts from a
+#: forwarded metadata dict: ``data``/``hash``/``created_at``/``updated_at``
+#: are unconditionally recomputed from the update call's own arguments and
+#: the existing stored point, and
+#: ``user_id``/``agent_id``/``run_id``/``actor_id``/``role`` are restored
+#: from the *currently stored* payload (unconditionally for ``actor_id``;
+#: whenever absent from what was forwarded for the rest).  Forwarding stale
+#: copies of these works only because mem0 keeps overwriting/re-deriving
+#: them -- an implicit coupling to mem0 internals.  Stripping them makes
+#: the intent explicit: preserve only a record's CUSTOM provenance keys.
+#:
+#: DEFENSIVE NOTE (PRD D12 / task 3055 §6, extracted here by task 3195):
+#: this module is the DECIDED HOME for this set.  ``memory_metadata.py``,
+#: ``scripts/tag_cgl_eta_rehome_scope.py`` (which defined it first) and the
+#: in-place ``update_memory`` tool (task 3088, via
+#: :func:`split_managed_metadata` below and ``server/tools.py``) bind this
+#: same object rather than rebuilding it; task 3195 landed first and task
+#: 3088 imports rather than re-extracts.  Never two copies (INV-5) -- a
+#: second definition that drifts from this one is exactly the failure D12
+#: exists to prevent, and is asserted against by object identity in
+#: ``tests/test_memory_metadata.py::TestKeyLayers``.
+MEM0_MANAGED_METADATA_KEYS = frozenset({
+    'data', 'hash', 'created_at', 'updated_at',
+    'user_id', 'agent_id', 'run_id', 'actor_id', 'role',
+})
+
+
+# Payload keys FUSED-MEMORY owns, which a caller-supplied metadata delta must
+# not be able to destroy by omission. Distinct from the mem0-owned set above:
+# mem0 recomputes-or-restores its own keys, so losing one of those is
+# self-healing, whereas nothing restores these.
+#
+# 'category': Mem0Backend.search pushes it down to Qdrant as a payload filter
+# (`filters = {'category': categories[0]}`), and every record carries it —
+# MemoryService.add_memory and add_system_record both stamp
+# meta['category'] = resolved_category.value before the write. A record that
+# loses the key is therefore permanently invisible to every category-scoped
+# search, with no error and no other symptom: the point still exists, still
+# has its content, and still answers a direct get. That silence is what makes
+# the key worth protecting rather than merely documenting.
+#
+# Protected is not frozen: an explicit metadata_patch={'category': ...} still
+# overrides the carried-through value, so deliberate re-categorization works.
+# Registering a new key here makes update_memory's replace mode carry it
+# through; it lives beside the mem0-owned set so a reader asking "which
+# payload keys are protected from a caller-supplied delta?" finds both answers
+# in one place (INV-5).
+_FUSED_MEMORY_OWNED_METADATA_KEYS = frozenset({'category'})
+
+
+def split_managed_metadata(
+    payload: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Partition a stored Qdrant payload into (mem0-owned, custom) subsets.
+
+    Unknown keys land in the CUSTOM subset: anything mem0 does not
+    recompute-or-restore is provenance the caller is responsible for
+    preserving, so the fail-safe direction for an unrecognised key is
+    "preserve it", not "drop it".
+
+    Both returned dicts are fresh shallow copies -- callers mutate the custom
+    subset in place (the metadata merge/delete arms) and must not disturb the
+    payload they read.
+    """
+    managed: dict[str, Any] = {}
+    custom: dict[str, Any] = {}
+    for key, value in payload.items():
+        if key in MEM0_MANAGED_METADATA_KEYS:
+            managed[key] = value
+        else:
+            custom[key] = value
+    return managed, custom
+
+
+# mem0's MemoryConfig.history_db_path value for a private, per-instance SQLite
+# history DB (SQLiteManager's own default).
+_MEM0_IN_MEMORY_HISTORY_DB = ':memory:'
+
+
+def build_vector_store_client(qdrant_url: str, *, read_budget_s: float, write_budget_s: float) -> QdrantClient:
+    """The sync Qdrant client mem0's vector stores run on, its socket timeout outlasting both the read and the write budget."""
+    return QdrantClient(url=qdrant_url, timeout=socket_timeout_outlasting(read_budget_s, write_budget_s))
+
 
 class Mem0Backend:
-    """Lazily creates AsyncMemory instances keyed by project_id."""
+    """Lazily creates AsyncMemory instances keyed by project_id.
+
+    TIMEOUT POSTURE, uniform across this class (task 5265), in two halves.
+
+    PROPAGATION.  EVERY read and write here surfaces a timeout as
+    ``TimeoutError`` and never degrades it into a falsy return — the semantic
+    mem0-instance reads (``search``, ``get_all``, ``get``) alongside the
+    deterministic direct-to-Qdrant ones (``count_by_metadata``,
+    ``scroll_by_metadata``, ``get_point_by_id``, the payload writes).  INV-11
+    ``no-silent-fail-soft``: a log is not a return value, and a timed-out read
+    that returns ``{}`` / ``None`` is indistinguishable from a genuinely empty
+    store or a genuine not-found.
+
+    ATTRIBUTABILITY.  Every one of those timeouts NAMES itself — the operation
+    and the budget it blew.  ``asyncio.wait_for``'s own ``TimeoutError``
+    stringifies EMPTY, so a bare one reaches an operator's log, and
+    ``MemoryService._store_failure_diagnostics['error']``, as no text at all.
+    Propagating a fault while discarding the one detail that attributes it is
+    only half a fix, so both halves are enforced in one place: every timed
+    call on this class goes through :meth:`_timed_read` / :meth:`_timed_write`
+    to ``backends/timeout_budget.py::await_within``, the single home of the
+    message format.  mem0's instance construction (its collection listing and
+    payload-index creates) runs off the event loop under the write budget as
+    ``create_instance``, and the Qdrant client mem0's vector store uses is this
+    backend's own, built by :func:`build_vector_store_client` from the very
+    budgets :meth:`_timed_read` / :meth:`_timed_write` apply, so a
+    slow mem0 leg fails on its named budget
+    (tests/test_mem0_vector_store_client.py).  The one exception left: the
+    direct async client's socket timeout is still the read budget, so its
+    calls can still fail unattributed: its writes, and :meth:`list_projects`'
+    untimed listing (gap (2) of task 8196; see :meth:`_ensure_collection`).
+
+    This paragraph is the CANONICAL statement of the rule, and a method's own
+    ``Raises:`` line adds only the consequence specific to IT — so there is one
+    copy of the rule to keep accurate rather than one per method.  Several
+    methods predating task 5265 do still restate their own propagation inline;
+    that is tolerated drift, not licence to add more.
+    """
 
     def __init__(self, config: FusedMemoryConfig):
         self.config = config
         self._instances: dict[str, AsyncMemory] = {}
+        self._instance_creations: dict[str, asyncio.Task[AsyncMemory]] = {}
         self._read_timeout: float = config.queue.backend_read_timeout_seconds
         self._write_timeout: float = config.queue.backend_write_timeout_seconds
         self._async_qdrant_client = None  # Lazy async client for count/list ops
+        self._vector_store_client: QdrantClient | None = None
 
     def _build_config_dict(self, collection_name: str) -> dict[str, Any]:
         """Build a Mem0 config dict from the unified config."""
@@ -32,12 +290,34 @@ class Mem0Backend:
                 'config': {
                     'url': cfg.mem0.qdrant_url,
                     'collection_name': collection_name,
+                    # The width the collection is created at. The embedder
+                    # below deliberately gets no width key, so mem0 never
+                    # sends `dimensions` (plans/local-embedder-cutover-prd.md
+                    # §6 C3). mem0 would CREATE the collection at this width,
+                    # but never does: _ensure_collection has already created
+                    # it from the same cfg.embedder.dimensions.
+                    #
+                    # OPERATOR HAZARD on an EXISTING deployment: a collection
+                    # keeps the width it was created at. _ensure_collection's
+                    # exists-check skips it, and so does mem0's
+                    # QdrantDB.create_col, so every upsert at a new width
+                    # fails at runtime. Changing embedder.dimensions requires
+                    # recreating and re-embedding the Qdrant collection; it is
+                    # not a live-migratable knob.
+                    'embedding_model_dims': cfg.embedder.dimensions,
                 },
             },
         }
 
         # LLM
         if cfg.llm.provider == 'openai' and cfg.llm.providers.openai:
+            # See the openai_base_url comment below: config now wins over the
+            # ambient env fallback, which is an egress change for a gateway
+            # deployment that set only OPENAI_BASE_URL. Report it, don't
+            # redirect silently.
+            warn_if_ambient_base_url_is_overridden(
+                cfg.llm.providers.openai.api_url, context='mem0 LLM',
+            )
             config_dict['llm'] = {
                 'provider': 'openai',
                 'config': {
@@ -45,6 +325,15 @@ class Mem0Backend:
                     'temperature': cfg.llm.temperature or 0.1,
                     'max_tokens': cfg.llm.max_tokens,
                     'api_key': cfg.llm.providers.openai.api_key,
+                    # Make config authoritative over the ambient
+                    # OPENAI_BASE_URL / OPENAI_API_BASE env fallback that
+                    # mem0/llms/openai.py would otherwise apply. The default
+                    # resolves to https://api.openai.com/v1, so this is
+                    # byte-identical for anyone not setting those vars.
+                    # OpenAIConfig-only — do NOT add it to the anthropic
+                    # branch below, which would TypeError out of mem0's
+                    # factory.
+                    'openai_base_url': cfg.llm.providers.openai.api_url,
                 },
             }
         elif cfg.llm.provider == 'anthropic' and cfg.llm.providers.anthropic:
@@ -60,26 +349,128 @@ class Mem0Backend:
 
         # Embedder
         if cfg.embedder.provider == 'openai' and cfg.embedder.providers.openai:
+            warn_if_ambient_base_url_is_overridden(
+                cfg.embedder.providers.openai.api_url, context='mem0 embedder',
+            )
+            embedder_config: dict[str, Any] = {
+                'model': cfg.embedder.model,
+                'api_key': cfg.embedder.providers.openai.api_key,
+                # Read from the EMBEDDER provider block, not the llm one, so
+                # the two endpoints stay independent.
+                'openai_base_url': cfg.embedder.providers.openai.api_url,
+            }
             config_dict['embedder'] = {
                 'provider': 'openai',
-                'config': {
-                    'model': cfg.embedder.model,
-                    'api_key': cfg.embedder.providers.openai.api_key,
-                },
+                'config': embedder_config,
             }
+
+        # Emitted ONLY when persistence is off: omitting the key keeps the
+        # shipped config byte-identical, and mem0 resolves its own shared
+        # $MEM0_DIR/history.db.
+        if not cfg.mem0.persist_history:
+            config_dict['history_db_path'] = _MEM0_IN_MEMORY_HISTORY_DB
 
         return config_dict
 
     async def _get_instance(self, scope: Scope) -> AsyncMemory:
-        """Lazily create and cache an AsyncMemory instance for a project."""
+        """Lazily create and cache an AsyncMemory instance for a project.
+
+        Concurrent first calls for a project await ONE shared creation, so its
+        failure reaches all of them at once and the next call starts afresh.
+        The creation is shielded: a cancelled caller does not cancel it for
+        the others.
+        """
         project_id = scope.project_id
-        if project_id not in self._instances:
-            collection_name = scope.mem0_collection_name(self.config.mem0.collection_prefix)
-            config_dict = self._build_config_dict(collection_name)
-            instance = AsyncMemory.from_config(config_dict)
-            self._instances[project_id] = instance
-            logger.info(f'Mem0 instance created for project {project_id} (collection: {collection_name})')
-        return self._instances[project_id]
+        instance = self._instances.get(project_id)
+        if instance is not None:
+            return instance
+        creation = self._instance_creations.get(project_id)
+        if creation is None:
+            creation = asyncio.create_task(self._create_instance(scope))
+            self._instance_creations[project_id] = creation
+            creation.add_done_callback(lambda _: self._instance_creations.pop(project_id))
+        return await asyncio.shield(creation)
+
+    async def _create_instance(self, scope: Scope) -> AsyncMemory:
+        """Build and cache *scope*'s instance; start afresh if :meth:`close` closed its client meanwhile.
+
+        mem0 swallows a failed payload-index create, so an instance built on a
+        client closed mid-build is returned as if whole and would fail every call.
+        """
+        collection_name = scope.mem0_collection_name(self.config.mem0.collection_prefix)
+        config_dict = self._build_config_dict(collection_name)
+        await self._ensure_collection(collection_name)
+        client = self._get_vector_store_client()
+        config_dict['vector_store']['config']['client'] = client
+        instance = await self._timed_write(asyncio.to_thread(AsyncMemory.from_config, config_dict), 'create_instance')
+        if client is not self._vector_store_client:
+            return await self._create_instance(scope)
+        self._instances[scope.project_id] = instance
+        logger.info(f'Mem0 instance created for project {scope.project_id} (collection: {collection_name})')
+        return instance
+
+    async def _ensure_collection(self, collection_name: str) -> None:
+        """Create the collection if absent, under this backend's own budgets (tests/test_mem0_collection_provisioning.py).
+
+        Gap, owned by task 8196: the direct async client's socket timeout is
+        ``int(read budget)``, so a create slower than that fails as an
+        unattributed ``ResponseHandlingException`` before the write budget.
+        """
+        from qdrant_client.http import models as qmodels
+        from qdrant_client.http.exceptions import UnexpectedResponse
+
+        client = await self._get_async_qdrant()
+        if await self._timed_read(client.collection_exists(collection_name), 'collection_exists'):
+            return
+        try:
+            await self._timed_write(
+                client.create_collection(
+                    collection_name=collection_name,
+                    vectors_config=qmodels.VectorParams(
+                        size=self.config.embedder.dimensions,
+                        distance=qmodels.Distance.COSINE,
+                    ),
+                ),
+                'create_collection',
+            )
+        except UnexpectedResponse as exc:
+            # 409: another creator won between the exists check and the create.
+            if exc.status_code != 409:
+                raise
+
+    async def _timed_read(self, awaitable: Awaitable[_T], op: str) -> _T:
+        """``await_within`` under this backend's READ budget."""
+        return await await_within(
+            awaitable, store='Mem0', op=op, budget_s=self._read_timeout,
+        )
+
+    async def _timed_write(self, awaitable: Awaitable[_T], op: str) -> _T:
+        """``await_within`` under this backend's WRITE budget."""
+        return await await_within(
+            awaitable, store='Mem0', op=op, budget_s=self._write_timeout,
+        )
+
+    async def _timed_collection_read(
+        self, awaitable: Awaitable[_T], op: str, collection_name: str, *, if_absent: _T,
+    ) -> _T:
+        """:meth:`_timed_read`, reading a provably-absent collection as *if_absent*.
+
+        Only :func:`is_missing_collection_error` degrades: it returns
+        *if_absent* and logs the collection at INFO.  A timeout and every other
+        failure propagate per the class TIMEOUT POSTURE.
+        """
+        try:
+            return await self._timed_read(awaitable, op)
+        except Exception as exc:
+            if not is_missing_collection_error(exc):
+                raise
+            logger.info(
+                'Mem0 %s: collection %s does not exist; reading it as empty',
+                op,
+                collection_name,
+                extra={'collection': collection_name},
+            )
+            return if_absent
 
     async def add(
         self,
@@ -99,7 +490,7 @@ class Mem0Backend:
         ``{'results': []}`` with no error.
         """
         instance = await self._get_instance(scope)
-        return await asyncio.wait_for(
+        return await self._timed_write(
             instance.add(
                 messages=content,
                 user_id=scope.mem0_user_id,
@@ -108,7 +499,7 @@ class Mem0Backend:
                 metadata=metadata,
                 infer=False,
             ),
-            timeout=self._write_timeout,
+            'add',
         )
 
     async def add_system_record(
@@ -140,7 +531,7 @@ class Mem0Backend:
         similarity-based dedup this method exists to be exempt from.
         """
         instance = await self._get_instance(scope)
-        return await asyncio.wait_for(
+        return await self._timed_write(
             instance.add(
                 messages=content,
                 user_id=scope.mem0_user_id,
@@ -149,7 +540,7 @@ class Mem0Backend:
                 metadata=metadata,
                 infer=False,
             ),
-            timeout=self._write_timeout,
+            'add_system_record',
         )
 
     async def search(
@@ -174,6 +565,15 @@ class Mem0Backend:
                 higher-similarity memories belonging to other categories.
                 Single-category → ``{'category': 'name'}`` (equality).
                 Multi-category → ``{'category': {'in': [...]}}`` (OR match).
+
+        Raises:
+            TimeoutError: Per the class-wide timeout posture.  The consequence
+                specific to THIS read: it used to return ``{}``, which
+                ``MemoryService._search_mem0`` turned into ``[]`` without ever
+                raising, so ``MemoryService.search``'s per-task
+                ``except Exception`` never ran and the ``search`` MCP response
+                was a bare ``{'results': []}`` — byte-identical to a genuinely
+                empty store.
         """
         instance = await self._get_instance(scope)
         # Build Qdrant payload filter for category scoping.
@@ -186,54 +586,72 @@ class Mem0Backend:
             filters = {'category': categories[0]}
         elif categories and len(categories) > 1:
             filters = {'category': {'in': list(categories)}}
-        try:
-            return await asyncio.wait_for(
-                instance.search(
-                    query=query,
-                    user_id=scope.mem0_user_id,
-                    agent_id=None,
-                    run_id=None,
-                    limit=limit,
-                    filters=filters,
-                ),
-                timeout=self._read_timeout,
-            )
-        except TimeoutError:
-            logger.warning(f'Mem0 search timed out after {self._read_timeout}s')
-            return {}
+        return await self._timed_read(
+            instance.search(
+                query=query,
+                user_id=scope.mem0_user_id,
+                agent_id=None,
+                run_id=None,
+                limit=limit,
+                filters=filters,
+            ),
+            'search',
+        )
 
     async def get_all(
         self,
         scope: Scope,
         limit: int = 100,
     ) -> dict[str, Any]:
-        """Get all memories for a scope."""
+        """Get all memories for a scope.
+
+        Raises:
+            TimeoutError: Per the class-wide timeout posture.  The consequence
+                specific to THIS read: both consumers already act on a raised
+                exception and were only ever starved of one, so under the old
+                ``{}`` neither could see the fault —
+                ``MemoryConsolidator.assemble_payload`` now marks mem0 a
+                degraded fetch source, and ``MemoryService.replay_from_store``
+                stops reporting a false "0 queued".
+        """
         instance = await self._get_instance(scope)
-        try:
-            return await asyncio.wait_for(
-                instance.get_all(
-                    user_id=scope.mem0_user_id,
-                    agent_id=scope.agent_id,
-                    run_id=scope.session_id,
-                    limit=limit,
-                ),
-                timeout=self._read_timeout,
-            )
-        except TimeoutError:
-            logger.warning(f'Mem0 get_all timed out after {self._read_timeout}s')
-            return {}
+        return await self._timed_read(
+            instance.get_all(
+                user_id=scope.mem0_user_id,
+                agent_id=scope.agent_id,
+                run_id=scope.session_id,
+                limit=limit,
+            ),
+            'get_all',
+        )
 
     async def get(self, memory_id: str, scope: Scope) -> dict[str, Any] | None:
-        """Get a single memory by ID."""
+        """Get a single memory by ID, or ``None`` when it genuinely does not exist.
+
+        THE FALSE-ABSENCE CHAIN, stated once for the whole tree.  Four other
+        sites discuss this timeout (``MemoryService.get_memory``, and the three
+        tests that pin the chain); they point HERE rather than re-deriving it,
+        so there is one copy to keep accurate.  Under the swallow, ``None``
+        reached ``MemoryService.get_memory`` as a genuine miss and became
+        ``MemoryNotFoundError``, which ``ReconReportState.cite_memory`` renders
+        as ``memory_not_found`` — a FALSE ABSENCE written into a durable
+        reconciliation report, indistinguishable by a later reader from a real
+        one.  It stopped there, and not by luck:
+        ``repair_memory_citation(reason='memory_not_found')`` does DELETE a
+        citation on that signal, but only after independently re-reading the
+        victim through ``get_memory_by_id`` (a propagating Qdrant read),
+        answering ``citation_not_dangling`` when the memory still resolves and
+        a verification error when that read itself raises — INV-3, corroborate
+        before acting.  So the harm this fixes is the false absence in the
+        record, and the bound on it is one gate in another module.
+
+        Raises:
+            TimeoutError: Per the class-wide timeout posture.  The consequence
+                specific to THIS read is the chain above: a timeout must never
+                be reported as "this memory does not exist".
+        """
         instance = await self._get_instance(scope)
-        try:
-            return await asyncio.wait_for(
-                instance.get(memory_id),
-                timeout=self._read_timeout,
-            )
-        except TimeoutError:
-            logger.warning(f'Mem0 get timed out after {self._read_timeout}s')
-            return None
+        return await self._timed_read(instance.get(memory_id), 'get')
 
     async def update(
         self,
@@ -256,18 +674,115 @@ class Mem0Backend:
         as ``metadata=``.
         """
         instance = await self._get_instance(scope)
-        return await asyncio.wait_for(
+        return await self._timed_write(
             instance.update(memory_id, data, metadata=metadata),
-            timeout=self._write_timeout,
+            'update',
+        )
+
+    async def set_payload(
+        self,
+        memory_id: str,
+        payload: dict[str, Any],
+        scope: Scope,
+    ) -> None:
+        """Partial-merge *payload* into a point's stored payload. No re-embed.
+
+        Straight to Qdrant's ``set_payload`` — a genuine storage-layer partial
+        merge, so pre-existing keys not named in *payload* survive and no
+        read-modify-write is needed to compute the result. Deliberately bypasses
+        mem0's ``AsyncMemory.update`` (see :meth:`update`), which would re-embed
+        the content, rewrite ``updated_at`` and append a mem0 history row for
+        what may be a purely cosmetic tag.
+
+        A write timeout PROPAGATES (raises ``TimeoutError``) rather than being
+        swallowed into a falsy return — the posture of every read and write on
+        this class. A caller must never mistake an unreachable Qdrant for a
+        completed write (no-silent-fail invariant).
+
+        NOTE: Qdrant answers ``acknowledged``/``completed`` for an UNKNOWN point
+        id — a no-op, not an error. Callers must confirm the point exists (see
+        :meth:`get_point_by_id`) before treating a return here as proof that
+        anything was written.
+        """
+        collection_name = scope.mem0_collection_name(self.config.mem0.collection_prefix)
+        client = await self._get_async_qdrant()
+        await self._timed_write(
+            client.set_payload(
+                collection_name=collection_name,
+                payload=payload,
+                points=[memory_id],
+            ),
+            'set_payload',
+        )
+
+    async def delete_payload(
+        self,
+        memory_id: str,
+        keys: list[str],
+        scope: Scope,
+    ) -> None:
+        """Remove exactly *keys* from a point's stored payload. No re-embed.
+
+        Straight to Qdrant's ``delete_payload``; keys not named are untouched.
+        Same bypass rationale, same propagating-timeout posture and the same
+        unknown-point-id caveat as :meth:`set_payload`.
+        """
+        collection_name = scope.mem0_collection_name(self.config.mem0.collection_prefix)
+        client = await self._get_async_qdrant()
+        await self._timed_write(
+            client.delete_payload(
+                collection_name=collection_name,
+                keys=keys,
+                points=[memory_id],
+            ),
+            'delete_payload',
+        )
+
+    async def overwrite_payload(
+        self,
+        memory_id: str,
+        payload: dict[str, Any],
+        scope: Scope,
+    ) -> None:
+        """Replace a point's ENTIRE stored payload with *payload*. No re-embed.
+
+        Straight to Qdrant's ``overwrite_payload``. Unlike :meth:`set_payload`
+        this is NOT a merge: every key absent from *payload* is destroyed. In
+        particular the mem0-owned keys (``_MEM0_MANAGED_METADATA_KEYS``) must be
+        read back and re-attached by the caller, or the point becomes unreadable
+        by mem0's own ``get``/``search``.
+
+        Same bypass rationale, same propagating-timeout posture and the same
+        unknown-point-id caveat as :meth:`set_payload`.
+        """
+        collection_name = scope.mem0_collection_name(self.config.mem0.collection_prefix)
+        client = await self._get_async_qdrant()
+        await self._timed_write(
+            client.overwrite_payload(
+                collection_name=collection_name,
+                payload=payload,
+                points=[memory_id],
+            ),
+            'overwrite_payload',
         )
 
     async def delete(self, memory_id: str, scope: Scope) -> dict[str, Any]:
         """Delete a memory."""
         instance = await self._get_instance(scope)
-        return await asyncio.wait_for(
+        return await self._timed_write(
             instance.delete(memory_id),
-            timeout=self._write_timeout,
+            'delete',
         )
+
+    def _get_vector_store_client(self) -> QdrantClient:
+        """Get or create the sync Qdrant client every mem0 instance's vector store shares."""
+        if self._vector_store_client is None:
+            self._vector_store_client = build_vector_store_client(
+                self.config.mem0.qdrant_url,
+                read_budget_s=self._read_timeout,
+                write_budget_s=self._write_timeout,
+            )
+        return self._vector_store_client
 
     async def _get_async_qdrant(self):
         """Get or create a shared async Qdrant client for lightweight ops."""
@@ -284,14 +799,129 @@ class Mem0Backend:
         """Count memories using native async Qdrant count API."""
         collection_name = scope.mem0_collection_name(self.config.mem0.collection_prefix)
         client = await self._get_async_qdrant()
-        result = await asyncio.wait_for(
+        result = await self._timed_read(
             client.count(
                 collection_name=collection_name,
                 exact=True,
             ),
-            timeout=self._read_timeout,
+            'count',
         )
         return result.count
+
+    def _build_payload_filter(
+        self,
+        filters: dict[str, Any] | None,
+        *,
+        text_needles: Sequence[str] | None = None,
+    ):
+        """Build the Qdrant payload ``Filter`` for a key→value equality dict.
+
+        THE single construction site for this filter (INV-5).  Every
+        metadata-addressed Qdrant read in this class routes through here:
+        :meth:`count_by_metadata`, :meth:`scroll_by_metadata`,
+        :meth:`scroll_all_by_metadata` and :meth:`scan_payload_text`.
+
+        The last of those is why the builder carries a second, OPTIONAL arm.
+        :meth:`scan_payload_text` narrows by metadata exactly as the other
+        three do (``must``) but ALSO pushes a literal substring prefilter down
+        to Qdrant (``should``, one ``MatchText`` per needle).  It built that
+        combined filter inline until task 3682, which left the "one
+        construction site" claim true of three reads and quietly false of the
+        fourth — the one whose whole job is measuring a true incidence rate.
+
+        This is a correctness requirement, not tidiness.  The metadata census
+        (``scripts/census_memory_metadata.py``) reconciles its SCROLL against
+        :meth:`count_by_metadata`'s COUNT to decide ``coverage.complete``.  If
+        the two filter constructions ever drifted, that reconciliation would
+        silently compare two *different* point sets and still report complete
+        coverage — a no-silent-fail violation with no error surface.  The
+        sharing is pinned by an equality assertion at each entry point in
+        ``tests/test_mem0_client.py::TestMem0BackendPayloadFilterSingleHome``.
+
+        Args:
+            filters: Dict of key→value equality filters, AND-ed into ``must``.
+                Mem0 stores ``add_memory(metadata=...)`` fields as top-level
+                keys on the Qdrant payload, so ``{'source': 'X'}`` matches
+                against ``payload.source == 'X'``.  May be empty/``None`` only
+                when *text_needles* is non-empty.
+            text_needles: Optional literal substrings, OR-ed into ``should`` as
+                one ``FieldCondition(key='data', match=MatchText(...))`` each,
+                in the given order.  On an UN-INDEXED payload field
+                ``MatchText`` is a literal case-sensitive substring match; see
+                :meth:`scan_payload_text` for why that is an optimisation only
+                and never the authoritative verdict.
+
+        Returns:
+            A ``qdrant_client.http.models.Filter``.  ``must`` holds one
+            ``FieldCondition``/``MatchValue`` per *filters* item in
+            dict-insertion order; ``should`` holds one
+            ``FieldCondition``/``MatchText`` per needle in the given order.
+
+            An arm with no members is OMITTED (``None``), never emitted as
+            ``[]``.  Not cosmetic: an empty ``should`` is a no-op server-side
+            (measured on qdrant 1.17.1 — ``Filter(must=[c])`` and
+            ``Filter(must=[c], should=[])`` return the same count), but the two
+            are UNEQUAL under pydantic structural equality.  The anti-drift
+            assertions that pin this single home compare the filter one entry
+            point hands Qdrant against another's with ``==``, so an emitted
+            empty arm would make the sharing unprovable at that entry point.
+
+        Raises:
+            ValueError: If BOTH arms would be empty — an unfiltered ``Filter``
+                selects the WHOLE collection, which is a bug at every caller.
+                A ``should``-only filter is fine: it still selects a proper
+                subset, so needles-with-no-filters is a legitimate call.
+                Callers validate first with their own message naming the right
+                unfiltered alternative (``count()`` / ``get_all()``); this
+                guard is the backstop so the shared builder can never become
+                the hole that lets one through.
+        """
+        if not filters and not text_needles:
+            raise ValueError(
+                '_build_payload_filter requires at least one filter or text needle; '
+                'an empty filter would select every point in the collection',
+            )
+        from qdrant_client.http import models as qmodels
+
+        must: list[qmodels.Condition] = [
+            qmodels.FieldCondition(key=k, match=qmodels.MatchValue(value=v))
+            for k, v in (filters or {}).items()
+        ]
+        should: list[qmodels.Condition] = [
+            qmodels.FieldCondition(key=MEM0_TEXT_KEY, match=qmodels.MatchText(text=needle))
+            for needle in (text_needles or ())
+        ]
+        # `or None` on BOTH arms — the omit-an-unused-arm rule, stated once.
+        return qmodels.Filter(must=must or None, should=should or None)
+
+    def _normalise_point(self, point: Any, *, with_vectors: bool) -> dict[str, Any]:
+        """Normalise one raw Qdrant point into the standard record dict.
+
+        THE single home for this shape (INV-5), shared by the list-returning
+        :meth:`scroll_by_metadata` and the streaming
+        :meth:`scroll_all_by_metadata` so the two APIs cannot drift in what a
+        record looks like — a caller migrating between them must see
+        byte-identical dicts.
+
+        Returns ``{'id', 'created_at', 'metadata'}`` where ``created_at`` is
+        the raw string from the payload (or ``None`` if absent) and
+        ``metadata`` is the full payload dict.  When *with_vectors* is True
+        the record additionally carries ``'vector'``; that key is absent
+        entirely when False.
+        """
+        payload: dict[str, Any] = dict(point.payload) if point.payload else {}
+        record: dict[str, Any] = {
+            'id': point.id,
+            'created_at': payload.get('created_at'),
+            'metadata': payload,
+        }
+        if with_vectors:
+            # getattr-with-default, not point.vector: Qdrant can return a
+            # point carrying no vector at all.  Degrade to None so the
+            # caller can count it as a disclosure — raising here would
+            # discard an entire otherwise-good scan over one bad point.
+            record['vector'] = getattr(point, 'vector', None)
+        return record
 
     async def count_by_metadata(
         self,
@@ -310,31 +940,30 @@ class Mem0Backend:
         Qdrant payload, so ``filters={'source': 'X', 'flag_id': 'Y'}`` matches
         against ``payload.source == 'X' AND payload.flag_id == 'Y'``.
 
-        Returns the exact match count.  Empty ``filters`` is rejected (would
-        otherwise count every memory in the collection — almost certainly a
-        bug at the caller).
+        Returns the exact match count; an unprovisioned collection reads as 0
+        (see :meth:`_timed_collection_read`).  Empty ``filters`` is rejected
+        (would otherwise count every memory in the collection — almost
+        certainly a bug at the caller).
         """
+        from qdrant_client.http import models as qmodels
+
         if not filters:
             raise ValueError(
                 'count_by_metadata requires at least one filter; '
                 'use count() to count all memories in the collection',
             )
-        from qdrant_client.http import models as qmodels  # noqa: PLC0415
-
         collection_name = scope.mem0_collection_name(self.config.mem0.collection_prefix)
         client = await self._get_async_qdrant()
-        must: list[qmodels.Condition] = [
-            qmodels.FieldCondition(key=k, match=qmodels.MatchValue(value=v))
-            for k, v in filters.items()
-        ]
-        qdrant_filter = qmodels.Filter(must=must)
-        result = await asyncio.wait_for(
+        qdrant_filter = self._build_payload_filter(filters)
+        result = await self._timed_collection_read(
             client.count(
                 collection_name=collection_name,
                 count_filter=qdrant_filter,
                 exact=True,
             ),
-            timeout=self._read_timeout,
+            'count_by_metadata',
+            collection_name,
+            if_absent=qmodels.CountResult(count=0),
         )
         return result.count
 
@@ -386,7 +1015,8 @@ class Mem0Backend:
             returned that point without one.  A vector-less point is still
             returned (degraded, not dropped) so the caller can count and
             report it rather than losing it silently; the ``'vector'`` key is
-            absent entirely when *with_vectors* is False.
+            absent entirely when *with_vectors* is False.  An unprovisioned
+            collection reads as ``[]`` (see :meth:`_timed_collection_read`).
 
         Raises:
             ValueError: If *filters* is empty.
@@ -400,16 +1030,10 @@ class Mem0Backend:
                 'scroll_by_metadata requires at least one filter; '
                 'use get_all() to retrieve all memories in the collection',
             )
-        from qdrant_client.http import models as qmodels  # noqa: PLC0415
-
         collection_name = scope.mem0_collection_name(self.config.mem0.collection_prefix)
         client = await self._get_async_qdrant()
-        must: list[qmodels.Condition] = [
-            qmodels.FieldCondition(key=k, match=qmodels.MatchValue(value=v))
-            for k, v in filters.items()
-        ]
-        qdrant_filter = qmodels.Filter(must=must)
-        points, _next_offset = await asyncio.wait_for(
+        qdrant_filter = self._build_payload_filter(filters)
+        points, _next_offset = await self._timed_collection_read(
             client.scroll(
                 collection_name=collection_name,
                 scroll_filter=qdrant_filter,
@@ -417,24 +1041,12 @@ class Mem0Backend:
                 with_vectors=with_vectors,
                 limit=limit,
             ),
-            timeout=self._read_timeout,
+            'scroll_by_metadata',
+            collection_name,
+            if_absent=([], None),
         )
 
-        result = []
-        for point in points:
-            payload: dict[str, Any] = dict(point.payload) if point.payload else {}
-            record: dict[str, Any] = {
-                'id': point.id,
-                'created_at': payload.get('created_at'),
-                'metadata': payload,
-            }
-            if with_vectors:
-                # getattr-with-default, not point.vector: Qdrant can return a
-                # point carrying no vector at all.  Degrade to None so the
-                # caller can count it as a disclosure — raising here would
-                # discard an entire otherwise-good scan over one bad point.
-                record['vector'] = getattr(point, 'vector', None)
-            result.append(record)
+        result = [self._normalise_point(point, with_vectors=with_vectors) for point in points]
 
         if len(points) == limit:
             logger.warning(
@@ -448,6 +1060,583 @@ class Mem0Backend:
 
         return result
 
+    async def scan_payload_text(
+        self,
+        scope: Scope,
+        needles: list[str] | None = None,
+        *,
+        filters: dict[str, Any] | None = None,
+        exhaustive: bool = False,
+        page_size: int = 256,
+        limit: int | None = None,
+        max_pages: int = DEFAULT_SCROLL_MAX_PAGES,
+    ) -> dict[str, Any]:
+        """Literal substring scan over Qdrant payload TEXT (leaked tool-call XML by default).
+
+        (a) THIS IS NOT SEMANTIC SEARCH AND NOT METADATA EQUALITY. It is the
+        gap that made the corpus unsweepable: :meth:`search` ranks by
+        embedding similarity, and a leaked serialized tool-call fragment
+        carries almost no semantic signal, so it is unfindable that way (a
+        live 2026-07-26 probe returned zero). :meth:`count_by_metadata` /
+        :meth:`scroll_by_metadata` match payload KEYS by equality, which
+        cannot see inside the memory text at all. This method walks the
+        records and judges their text.
+
+        (b) PREFILTER. Unless *exhaustive*, one
+        ``FieldCondition(key='data', match=MatchText(text=needle))`` per
+        needle is OR-combined via ``Filter(should=[...])`` and pushed to
+        Qdrant. On an UN-INDEXED payload field, ``MatchText`` performs a
+        literal, case-sensitive, order-preserving SUBSTRING match — measured
+        on qdrant 1.17.1 over 19,321 points at ~70-90 ms for an exact count.
+
+        (c) THE PREFILTER IS AN OPTIMISATION ONLY. Every walked record is
+        judged in Python, and that is the authoritative verdict: the caller's
+        *needles*, when given, as a literal, case-sensitive substring match;
+        otherwise :func:`find_toolcall_xml_leak`. The verdict can only discard
+        records the prefilter returned, never recover ones it skipped, so a
+        prefiltered scan is exact only while the prefilter selects a SUPERSET
+        of the verdict's matches. That rests on un-indexed-field FALLBACK
+        semantics: creating a text payload index on ``data`` would SILENTLY
+        flip ``MatchText`` to tokenized word-matching.
+
+        For the DEFAULT SENTINELS that flip is safe: tokenized matching is
+        strictly MORE permissive for them (a record containing a literal
+        serialized opening tag necessarily contains its constituent word
+        tokens), so the superset holds and only speed degrades. For CUSTOM
+        *needles* it is NOT safe: a needle that is not a whole token, such as
+        the mid-word ``'econciliatio'``, is a literal substring but no token
+        match, so an indexed prefilter would silently skip records the verdict
+        would report. A prefiltered custom-needle scan is therefore exact only
+        under un-indexed substring semantics; ``exhaustive=True`` is the
+        index-independent path. The prefilter also reads only the ``data``
+        key, so prefiltered mode finds text stored there alone; *exhaustive*
+        mode also sees the ``memory``/``content`` fallbacks.
+        ``tests/test_mem0_client.py::TestMem0BackendScanPayloadTextIntegration``
+        is the tripwire that fails loudly if those semantics change, but it
+        runs against its own test collection and cannot see an index created
+        on a production one.
+
+        (d) ``exhaustive=True`` skips the prefilter entirely and walks the
+        whole collection; it changes nothing else. Use it when the answer must
+        not depend on prefilter semantics at all — notably when establishing
+        the TRUE incidence rate, so that claim rests on nothing but the
+        Python verdict.
+
+        (e) BOTH MODES PAGINATE, and the walk is DELEGATED to
+        :meth:`scroll_collection_pages` rather than re-implemented here — one
+        home for the offset/next_offset loop, the per-page read bound and the
+        page budget. The caller-supplied *limit* rides on that pager's
+        ``max_points``, so the cap is pushed down into each page request
+        instead of being layered on top with a ``break``: a capped scan
+        therefore costs no look-ahead round-trip to discover there is more.
+        :meth:`scroll_by_metadata`'s single-shot ``limit=1000`` cap is
+        deliberately not reused: a silently-capped scan would report a
+        plausible-looking undercount, which is the same silent-wrong-value
+        class this scan exists to measure.
+
+        The two exhaustion postures below are DELIBERATE and caller-chosen,
+        not an inconsistency to be tidied away. The pager RAISES on both
+        budgets so the primitive can never truncate silently (INV-2); this
+        method then catches :class:`ScrollPointBudgetExhausted` and reports it
+        as ``truncated=True`` + a WARNING, while
+        :class:`ScrollPageBudgetExhausted` propagates. Being stopped by a
+        *limit* the caller passed is an expected outcome; being stopped by the
+        safety backstop is not, and reporting the latter as if the caller had
+        asked for it would hand a sweep a plausible-looking undercount. That
+        asymmetry is exactly what invites a well-meaning "unify these two
+        paths" fix, which is why it is written down at both sites.
+
+        Args:
+            scope: Project/agent/session scope (selects the collection).
+            needles: Literal substrings that are both the prefilter and the
+                verdict: a walked record matches when it contains one. ``None``
+                or empty defaults to
+                :data:`~fused_memory.utils.toolcall_xml_leak.PREFILTER_NEEDLES`
+                for the prefilter and the leak detector for the verdict —
+                never to "no needles", which would scan for nothing and report
+                a clean corpus. *exhaustive* skips only their prefilter use.
+                No needle may be the empty string.
+            filters: Optional key→value payload equality filters, AND-ed in
+                via ``must`` exactly as :meth:`count_by_metadata` builds them,
+                to narrow the scan (e.g. ``{'category': ...}``). Applies in
+                both modes.
+            exhaustive: Skip the prefilter and walk every point.
+            page_size: Points per scroll request.
+            limit: Maximum number of points to WALK. Must be strictly positive
+                when given. When the walk stops early, ``truncated`` is True
+                and a WARNING is logged — the truncation is never silent.
+            max_pages: Page budget for the underlying walk, forwarded to
+                :meth:`scroll_collection_pages`. Unlike *limit*, exhausting it
+                RAISES (see below).
+
+        Raises:
+            ValueError: If *limit* is non-positive. A ``limit`` of 0 would make
+                every scroll page request 0 points, so the walk would return
+                ``{'matches': [], 'scanned': 0, 'truncated': False}`` — a
+                result INDISTINGUISHABLE from a genuinely clean corpus, and one
+                that a caller's exit-code predicate reads as a complete,
+                successful sweep. Rejecting it is the same no-silent-wrong-value
+                rule that makes a scan timeout propagate rather than collapse
+                into an empty list. Also if any needle is ``''``: the empty
+                string is a substring of every text, so one stray ``''`` would
+                turn a needle hunt into an echo of the whole walked population.
+
+        Returns:
+            ``{'matches': [...], 'scanned': int, 'truncated': bool,
+            'collection': str}`` where each match is ``{'id', 'created_at',
+            'matched_fragments', 'excerpt', 'metadata'}``. ``scanned`` counts
+            every point walked, including non-matching ones, so it is a correct
+            denominator for an incidence rate. ``excerpt`` is at most
+            ``_EXCERPT_LEN`` characters of the text, centred where its earliest
+            matched fragment begins, with ``…`` on each elided side; a tail
+            leak or a needle deep in a record is therefore visible in it.
+
+            ``collection`` is the Qdrant collection this call actually
+            scrolled — the same name passed to every ``client.scroll`` below,
+            not a re-derivation. It is reported because a scan result is a
+            MEASUREMENT of a collection, and a measurement that does not
+            identify what it measured cannot be audited later: the
+            authoritative 21,089-point 2026-08-05 incidence sweep committed
+            two reports whose ``collection`` field was blank precisely because
+            this key was absent and its caller's ``.get(..., '')`` default
+            filled the hole silently (task 3243).
+
+        Raises:
+            TimeoutError: If any scroll page exceeds the read timeout —
+                PROPAGATED (never swallowed into an empty result), matching
+                count_by_metadata/scroll_by_metadata/get_point_by_id. A
+                timed-out scan must never be mistaken for a clean corpus.
+            ScrollPageBudgetExhausted: If *max_pages* is consumed with more
+                pages still available. PROPAGATED rather than folded into
+                ``truncated``, which is deliberate: *limit* is a cap the
+                caller asked for, so being stopped by it is a normal capped
+                result, but the page budget is a safety backstop nobody asked
+                for. Reporting a backstop truncation as if the caller had
+                requested it would hand a sweep a plausible-looking undercount
+                carrying a flag it was not told to expect.
+
+                The numbers plainly, re-measured against live Qdrant on
+                2026-08-27 (exact per-collection counts, not the older
+                single-collection reading): at the default ``page_size=256``
+                and ``max_pages=200`` the ceiling is 51,200 points walked.
+                The BINDING collection is ``fused_reify`` at 33,163 points —
+                1.54x headroom, i.e. one exhaustive sweep of it already
+                consumes 65% of the budget. ``fused_dark_factory``, the sweep
+                script's default scope, is 25,635 (2.0x). So the backstop is
+                still not reachable today, but the margin is roughly HALF
+                what the stale ~19,321-point/2.6x figure implied, and a
+                further ~1.5x growth of the largest collection reaches it.
+                (The prefiltered mode bounds only MATCHING points, so it is
+                the ``exhaustive=True`` walk that meets this ceiling first.)
+
+                *max_pages* is the escape hatch for when the corpus outgrows
+                it, but it is a PYTHON-API-level override ONLY: it is not
+                exposed by
+                ``services/memory_service.py::MemoryService.scan_memory_content``,
+                by the ``scan_memory_content`` MCP tool
+                (``server/tools.py::scan_memory_content``), or by
+                ``scripts/sweep_toolcall_xml_leak.py``, which has no
+                ``--max-pages`` flag. The operational sweep therefore always
+                runs at the default ceiling; raising it there is a plumbing
+                change to those three surfaces, not a flag an operator can
+                pass today.
+        """
+        if limit is not None and limit <= 0:
+            raise ValueError(
+                f'scan_payload_text limit must be strictly positive, got {limit}; a '
+                'non-positive limit walks zero points and would report an empty '
+                'result as a clean corpus'
+            )
+        if needles and '' in needles:
+            raise ValueError(
+                f"scan_payload_text needles must not contain '', got {needles!r}; the "
+                'empty string is a substring of every text, so it would report every '
+                'walked record as a match'
+            )
+
+        collection_name = scope.mem0_collection_name(self.config.mem0.collection_prefix)
+
+        # Built at the shared home so an exhaustive scan and the count it is
+        # divided by cannot select different point sets (INV-5).  The call is
+        # GUARDED rather than unconditional: with neither arm populated
+        # (exhaustive, no filters) the builder correctly refuses to make a
+        # whole-collection Filter, but a whole-collection walk is exactly what
+        # this mode wants — expressed as scroll_filter=None, not as an
+        # unfiltered Filter.
+        needle_arm = None if exhaustive else list(needles or PREFILTER_NEEDLES)
+        verdict = _needle_verdict_for(needles) if needles else _leak_verdict
+        scroll_filter = (
+            self._build_payload_filter(filters, text_needles=needle_arm)
+            if (filters or needle_arm)
+            else None
+        )
+
+        matches: list[dict[str, Any]] = []
+        scanned = 0
+        truncated = False
+        try:
+            # The caller's `limit` rides on the pager's points cap, so the walk
+            # itself has ONE home.  There is deliberately no `break` — the cap
+            # is expressed as max_points so the pager can shrink each request
+            # rather than being stopped from out here.
+            #
+            # `aclosing` rather than a bare `async for` because `async for`
+            # closes the generator only when the ITERATION ends or raises: a
+            # failure in the LOOP BODY below (a malformed payload reaching the
+            # verdict) or a cancellation would otherwise leave the pager
+            # suspended mid-walk for the event loop's async-generator hooks to
+            # finalise at some later, unpredictable point.  This makes the
+            # close deterministic on EVERY exit path.
+            async with aclosing(
+                self.scroll_collection_pages(
+                    collection_name,
+                    scroll_filter=scroll_filter,
+                    page_size=page_size,
+                    max_pages=max_pages,
+                    max_points=limit,
+                    with_vectors=False,
+                )
+            ) as pages:
+                async for point in pages:
+                    scanned += 1
+                    payload: dict[str, Any] = dict(point.payload) if point.payload else {}
+                    text = mem0_payload_text(payload)
+                    fragments = verdict(text)
+                    if not fragments:
+                        continue
+                    matches.append({
+                        'id': point.id,
+                        'created_at': payload.get('created_at'),
+                        'matched_fragments': fragments,
+                        'excerpt': _excerpt_around(text, fragments),
+                        'metadata': payload,
+                    })
+        except ScrollPointBudgetExhausted:
+            # THIS caller's posture, chosen here rather than at the primitive:
+            # being stopped by a limit the caller itself passed is an expected
+            # outcome, so it is disclosed as a flag + WARNING instead of an
+            # error.  The clause names exactly ONE exception: a broad except
+            # would fold a timed-out or page-budget-exhausted walk into a
+            # clean-looking capped result.  `scanned` is exact — the pager
+            # raises only after the cap-th point has been yielded and consumed.
+            truncated = True
+            logger.warning(
+                'Mem0 scan_payload_text stopped at limit=%d (collection=%s, '
+                'exhaustive=%s) with more pages available — results are '
+                'TRUNCATED and any incidence rate derived from them is an '
+                'undercount. Re-run without --limit for the true rate.',
+                limit,
+                collection_name,
+                exhaustive,
+            )
+
+        return {
+            'matches': matches,
+            'scanned': scanned,
+            'truncated': truncated,
+            # The name actually scrolled above, reported rather than re-derived
+            # by the caller — see the Returns: note.
+            'collection': collection_name,
+        }
+
+    async def scroll_collection_pages(
+        self,
+        collection_name: str,
+        *,
+        scroll_filter: Any = None,
+        page_size: int = 1000,
+        max_pages: int = DEFAULT_SCROLL_MAX_PAGES,
+        max_points: int | None = None,
+        with_vectors: bool = False,
+        with_payload: bool = True,
+    ) -> AsyncGenerator[Any, None]:
+        """Yield every Qdrant point in *collection_name*, paging on ``next_offset``.
+
+        THE single home for the offset/next_offset walk (INV-5).  Every
+        paging caller sits on top of it: :meth:`scroll_all_by_metadata`
+        (Scope+filter-addressed, normalised records — what
+        ``scripts/census_memory_metadata.py`` drives),
+        ``scripts/consolidate_namespace_families.merge_collection`` (raw
+        points, no filter — which enters at THIS layer) and
+        :meth:`scan_payload_text` (a bounded substring scan).
+
+        *max_points* exists precisely so that last one does not need a second
+        copy of the walk.  It stops after N POINTS rather than N pages, and
+        expressing that as a caller-side ``break`` would both duplicate the
+        loop and cost a look-ahead round-trip; owning the cap here makes it
+        free.
+
+        The two budgets are DELIBERATELY distinct events with distinct
+        exceptions, so the CALLER chooses the posture rather than this
+        primitive imposing one.  Both raise here — the pager never truncates
+        silently (INV-2) — but :meth:`scan_payload_text` catches only
+        :class:`ScrollPointBudgetExhausted`, converting the cap it asked for
+        into a ``truncated`` flag while letting the backstop propagate.  Do
+        not "unify" the two exceptions or make one inherit from the other:
+        that asymmetry is the whole mechanism, and collapsing it would also
+        change what ``census_memory_metadata``'s ``except CensusScanIncomplete``
+        (an alias of the page-budget class) catches.
+
+        Deliberately collection-name-addressed rather than
+        :class:`~fused_memory.models.scope.Scope`-addressed, and
+        filter-OPTIONAL, because consolidate_namespace_families scrolls
+        LEGACY mis-named collections (``fused_dark-factory``, ``reify_reify``,
+        ``autopilot_video_autopilot_video``) that a Scope structurally cannot
+        produce, with no filter at all.  Raw points are yielded, not
+        normalised records, because its ``merge_collection`` reads
+        ``point.id``/``point.vector``/``point.payload`` to rebuild
+        ``PointStruct``s.
+
+        Points are yielded one at a time (never accumulated) so a caller
+        folding them into counters holds one page in memory regardless of
+        collection size.
+
+        Args:
+            collection_name: The Qdrant collection, passed through VERBATIM.
+            scroll_filter: Optional pre-built payload ``Filter`` (see
+                :meth:`_build_payload_filter`).  ``None`` scrolls the whole
+                collection — safe here, unlike at the metadata-addressed APIs,
+                because the caller named the collection explicitly.
+            page_size: Points requested per page (Qdrant ``limit``).
+            max_pages: Page budget; exhausting it raises rather than
+                truncating.
+            max_points: Optional cap on how many points to WALK.  Must be
+                strictly positive when given (see Raises).  ``None`` (the
+                default) is inert — the walk is bounded only by *max_pages* —
+                so every caller that does not opt in is structurally unable to
+                see :class:`ScrollPointBudgetExhausted`.
+
+                The cap is pushed down into the per-page request (each page
+                asks for ``min(page_size, remaining)``), so a capped walk
+                never over-fetches and never pays a look-ahead round-trip to
+                discover there is more.  A caller layering its own cap on top
+                with ``break`` could not have that: it learns "there is more"
+                only by pulling a point past the cap.
+            with_vectors: Fetch each point's stored vector.  Costs bandwidth,
+                so it is opt-in.
+            with_payload: Fetch each point's payload.  ``False`` is an
+                ids-only walk, how id enumeration keeps its data access
+                minimal; it exists for ``services/id_resolver.py`` (PRD C2's
+                single substrate extension).
+
+        Yields:
+            Raw Qdrant point objects, in page order.  Annotated
+            ``AsyncGenerator`` rather than ``AsyncIterator`` on purpose: the
+            narrower type carries ``aclose()``, so a caller that may abandon
+            the walk part-way (a raise from ITS loop body, a cancellation) can
+            wrap it in :func:`contextlib.aclosing` and close it deterministically
+            instead of leaving it suspended for the event loop's
+            async-generator hooks.  :meth:`scan_payload_text` does exactly that.
+
+        Raises:
+            ValueError: If *max_points* is given and non-positive — raised on
+                the first iteration, before any scroll is awaited.  A cap of 0
+                shrinks every page request to zero points, so a walk ending on
+                a ``None`` offset would yield nothing and raise nothing, which
+                is indistinguishable from a genuinely empty collection; a
+                negative cap would additionally send a negative ``limit`` down
+                to the client.  :meth:`scan_payload_text` validates its own
+                *limit* first with a message naming that parameter; this guard
+                is the backstop, so the shared pager can never become the hole
+                that lets one through.
+            ScrollPointBudgetExhausted: If *max_points* is consumed while
+                ``next_offset`` is still live.  Deliberately a DISTINCT event
+                from the page budget below, and checked FIRST when a single
+                page exhausts both: being stopped by the cap the caller itself
+                set is an expected outcome, and attributing it to an internal
+                safety limit would misreport it.  Reaching the cap exactly as
+                the stream ends is NOT this event — nothing was left behind,
+                so nothing is raised.
+            ScrollPageBudgetExhausted: If *max_pages* is consumed while
+                ``next_offset`` is still live — the stream is truncated, so it
+                raises instead of ending short.
+            TimeoutError: If a single page request exceeds ``_read_timeout``.
+                PROPAGATED, never swallowed into an empty stream — same
+                posture as :meth:`count_by_metadata` /
+                :meth:`scroll_by_metadata` / :meth:`get_point_by_id`, so a
+                timed-out read is never mistaken for an empty collection.
+        """
+        if max_points is not None and max_points <= 0:
+            raise ValueError(
+                f'scroll_collection_pages max_points must be strictly positive, got '
+                f'{max_points}; a non-positive cap shrinks every page request to zero '
+                'points, so a walk that ends on a None offset yields nothing and raises '
+                'nothing — a result indistinguishable from a genuinely empty collection. '
+                'Same no-silent-wrong-value rule as scan_payload_text\'s limit guard, '
+                'kept here so the shared pager can never become the hole that lets one '
+                'through.'
+            )
+
+        def _point_budget_exhausted(next_offset: Any) -> ScrollPointBudgetExhausted:
+            """Build the points-cap error — ONE home for a message raised twice.
+
+            The cap is checked at two sites (per-yield and post-page) and a
+            copied f-string could drift between them.  A ``None`` offset here
+            is NOT a contradiction and must not read as one: it means the
+            server returned MORE points than the shrunk request asked for, so
+            points were still dropped.
+            """
+            cause = (
+                f'with next_offset={next_offset!r} still live'
+                if next_offset is not None
+                else 'because the server returned more points than the request asked for'
+            )
+            return ScrollPointBudgetExhausted(
+                f'scroll of collection={collection_name!r} exhausted its point budget '
+                f'of {max_points} {cause} — the scan is truncated. Raise max_points to '
+                'walk further.',
+            )
+
+        client = await self._get_async_qdrant()
+        offset: Any = None
+        pages = 0
+        yielded = 0
+        while True:
+            # Ask for only what is still wanted, so a capped walk never
+            # over-fetches and never needs a look-ahead page to discover it
+            # has more.
+            page_limit = page_size if max_points is None else min(page_size, max_points - yielded)
+            # Bound each PAGE, not the whole scan: a per-scan bound would
+            # abort a long-but-healthy multi-page enumeration.
+            points, next_offset = await self._timed_read(
+                client.scroll(
+                    collection_name=collection_name,
+                    scroll_filter=scroll_filter,
+                    with_payload=with_payload,
+                    with_vectors=with_vectors,
+                    limit=page_limit,
+                    offset=offset,
+                ),
+                'scroll_collection_pages',
+            )
+            pages += 1
+            for point in points:
+                # Enforced per-YIELD, not per-page: a server that ignores the
+                # shrunk page_limit still cannot walk the caller past its cap.
+                if max_points is not None and yielded >= max_points:
+                    raise _point_budget_exhausted(next_offset)
+                yield point
+                yielded += 1
+
+            # A clean end is checked FIRST: reaching the cap exactly as the
+            # stream runs out left nothing behind, so it is not a truncation.
+            if next_offset is None:
+                return
+            # The caller's own cap outranks the safety backstop when one page
+            # exhausts both — it is the expected outcome, not an internal limit.
+            if max_points is not None and yielded >= max_points:
+                raise _point_budget_exhausted(next_offset)
+            if pages >= max_pages:
+                raise ScrollPageBudgetExhausted(
+                    f'scroll of collection={collection_name!r} exhausted its page budget '
+                    f'after {pages} page(s) of {page_size} with next_offset={next_offset!r} '
+                    f'still live — the scan is truncated. Raise max_pages or page_size.',
+                )
+            offset = next_offset
+
+    def scroll_all_by_metadata(
+        self,
+        scope: Scope,
+        filters: dict[str, Any],
+        *,
+        page_size: int = 1000,
+        max_pages: int = DEFAULT_SCROLL_MAX_PAGES,
+        with_vectors: bool = False,
+    ) -> AsyncIterator[dict[str, Any]]:
+        """Stream EVERY memory matching *filters*, paging until the match set is exhausted.
+
+        The intended primitive for full-enumeration callers.  Same addressing
+        as :meth:`scroll_by_metadata` (Scope + non-empty equality filters) and
+        the same per-record shape — both normalise through
+        :meth:`_normalise_point` — but this one walks Qdrant's
+        ``next_offset`` to completion instead of returning a single capped
+        page.
+
+        There is deliberately NO ``limit`` and NO truncation warning here:
+        this API does not truncate.  Enumeration is exhaustive, and if the
+        collection is so large that the page budget runs out it RAISES
+        (:class:`ScrollPageBudgetExhausted`) rather than quietly returning a
+        short stream.  ``scroll_by_metadata`` is untouched and keeps its
+        one-shot capped-list semantics for callers that genuinely want a
+        bounded read (``scripts/audit_duplicate_memories.py``).
+
+        Records are yielded one at a time, so a caller folding them into
+        counters (``scripts/census_memory_metadata.py``) holds one page in
+        memory regardless of corpus size.
+
+        Args:
+            scope: Project/agent/session scope — resolves the collection
+                exactly as :meth:`scroll_by_metadata` does.
+            filters: Non-empty dict of key→value equality filters, built into
+                a payload filter by the shared :meth:`_build_payload_filter`
+                so this scroll and :meth:`count_by_metadata` provably select
+                the same points.
+            page_size: Points fetched per Qdrant round-trip.
+            max_pages: Page budget for the whole enumeration.
+            with_vectors: Lift each point's stored vector onto its record.
+
+        Yields:
+            ``{'id', 'created_at', 'metadata'}`` dicts (plus ``'vector'`` when
+            *with_vectors*) — identical in shape to
+            :meth:`scroll_by_metadata`'s list elements.
+
+        Argument validation is EAGER: the ``ValueError`` (and any error from
+        resolving the collection or building the payload filter) raises when
+        this method is CALLED, matching the coroutine sibling
+        :meth:`scroll_by_metadata`, so a caller that builds the stream and
+        then conditionally never iterates it still gets the error. Only the
+        paging is deferred — this is a plain ``def`` returning
+        :meth:`_scroll_all_records`, because an ``async def`` containing
+        ``yield`` would be an async-generator function whose body, guard
+        included, does not run until the first ``__anext__``.
+
+        Raises:
+            ValueError: If *filters* is empty — at CALL time.
+            ScrollPageBudgetExhausted: If the enumeration is truncated by the
+                page budget.
+            TimeoutError: If a single page exceeds the read timeout —
+                propagated, never swallowed into an empty stream.
+        """
+        if not filters:
+            raise ValueError(
+                'scroll_all_by_metadata requires at least one filter; '
+                'use get_all() to retrieve all memories in the collection',
+            )
+        collection_name = scope.mem0_collection_name(self.config.mem0.collection_prefix)
+        scroll_filter = self._build_payload_filter(filters)
+        return self._scroll_all_records(
+            collection_name,
+            scroll_filter,
+            page_size=page_size,
+            max_pages=max_pages,
+            with_vectors=with_vectors,
+        )
+
+    async def _scroll_all_records(
+        self,
+        collection_name: str,
+        scroll_filter: Any,
+        *,
+        page_size: int,
+        max_pages: int,
+        with_vectors: bool,
+    ) -> AsyncIterator[dict[str, Any]]:
+        """Lazy paging half of :meth:`scroll_all_by_metadata`.
+
+        Assumes PRE-VALIDATED arguments — the public method is the sole entry
+        point and owns the empty-filters guard, the collection resolution and
+        the payload-filter build. See it for the streaming, budget and
+        timeout contracts.
+        """
+        async for point in self.scroll_collection_pages(
+            collection_name,
+            scroll_filter=scroll_filter,
+            page_size=page_size,
+            max_pages=max_pages,
+            with_vectors=with_vectors,
+        ):
+            yield self._normalise_point(point, with_vectors=with_vectors)
+
     async def get_point_by_id(self, memory_id: str, scope: Scope) -> dict[str, Any] | None:
         """Direct Qdrant point-fetch by id (non-semantic) → raw payload dict, or None.
 
@@ -456,12 +1645,19 @@ class Mem0Backend:
         dict — bypassing both semantic ranking (``search``) and metadata-equality
         filtering (``count_by_metadata`` / ``scroll_by_metadata``).
 
-        Unlike :meth:`get` (mem0 ``AsyncMemory.get``, which swallows a read
-        timeout into ``None``), a Qdrant read-timeout is PROPAGATED (raises
-        ``TimeoutError``), never swallowed — mirroring ``count_by_metadata`` /
-        ``scroll_by_metadata`` so a timed-out read is never mistaken for a
-        genuine not-found (no-silent-fail invariant). That timeout-distinguishing
-        behaviour is the whole reason this bypasses ``get``.
+        Timeout posture is the class-wide one, and since task 5265 it is no
+        longer anything that distinguishes this method from :meth:`get`.
+
+        What DOES distinguish them, and the reason this bypasses ``get``, is
+        the SHAPE of what comes back: this returns the full RAW Qdrant payload
+        with every key at one level, whereas ``get`` returns mem0's PROCESSED
+        record, which lifts ``promoted_payload_keys`` (``user_id``,
+        ``agent_id``, ``run_id``, ``actor_id``, ``role``) to the record's top
+        level and excludes them from ``metadata``.  A caller that needs a
+        promoted key alongside the custom payload keys at one level wants this
+        method; a caller that wants mem0's normalisations (notably
+        ``created_at`` through ``_normalize_iso_timestamp_to_utc``) wants
+        ``get``.
 
         Returns the point's full raw payload dict, or ``None`` when the point is
         absent (empty ``retrieve`` result). A single-id ``retrieve`` returning
@@ -471,14 +1667,14 @@ class Mem0Backend:
         """
         collection_name = scope.mem0_collection_name(self.config.mem0.collection_prefix)
         client = await self._get_async_qdrant()
-        records = await asyncio.wait_for(
+        records = await self._timed_read(
             client.retrieve(
                 collection_name=collection_name,
                 ids=[memory_id],
                 with_payload=True,
                 with_vectors=False,
             ),
-            timeout=self._read_timeout,
+            'get_point_by_id',
         )
         if not records:
             return None
@@ -493,15 +1689,73 @@ class Mem0Backend:
             )
         return dict(records[0].payload or {})
 
+    async def get_points_by_ids(
+        self, memory_ids: Sequence[str], scope: Scope,
+    ) -> dict[str, dict[str, Any]]:
+        """Several points' raw payloads in ONE ``retrieve``: ``{id: payload}``, absent ids omitted.
+
+        The batched sibling of :meth:`get_point_by_id`, with the same payload
+        shape and timeout posture; no ids is no read.
+        """
+        if not memory_ids:
+            return {}
+        collection_name = scope.mem0_collection_name(self.config.mem0.collection_prefix)
+        client = await self._get_async_qdrant()
+        records = await self._timed_read(
+            client.retrieve(
+                collection_name=collection_name,
+                ids=list(memory_ids),
+                with_payload=True,
+                with_vectors=False,
+            ),
+            'get_points_by_ids',
+        )
+        return {str(record.id): dict(record.payload or {}) for record in records}
+
+    async def cosine_to_points(
+        self, query: str, memory_ids: Sequence[str], scope: Scope,
+    ) -> dict[str, float]:
+        """The cosine of *query* to each listed point: ``{id: cosine}``, absent ids omitted.
+
+        On the same scale as :meth:`search`'s scores (``store_score``): the
+        query is embedded by the project's own mem0 embedder exactly as mem0
+        search embeds it, and scored by the same Qdrant cosine.  No ids is no
+        embedding; an unprovisioned collection reads as no scores.
+        """
+        from qdrant_client.http import models as qmodels
+
+        if not memory_ids:
+            return {}
+        instance = await self._get_instance(scope)
+        vector = await self._timed_read(
+            asyncio.to_thread(instance.embedding_model.embed, query, 'search'),
+            'cosine_to_points',
+        )
+        collection_name = scope.mem0_collection_name(self.config.mem0.collection_prefix)
+        client = await self._get_async_qdrant()
+        response = await self._timed_collection_read(
+            client.query_points(
+                collection_name=collection_name,
+                query=vector,
+                query_filter=qmodels.Filter(must=[qmodels.HasIdCondition(has_id=list(memory_ids))]),
+                limit=len(memory_ids),
+                with_payload=False,
+                with_vectors=False,
+            ),
+            'cosine_to_points',
+            collection_name,
+            if_absent=qmodels.QueryResponse(points=[]),
+        )
+        return {str(point.id): float(point.score) for point in response.points}
+
     async def close(self) -> None:
-        """Close all cached AsyncMemory instances and release their connections."""
+        """Drop the cached AsyncMemory instances and close the two Qdrant clients this backend owns."""
         import contextlib
-        for instance in self._instances.values():
-            with contextlib.suppress(Exception):
-                client = getattr(getattr(instance, 'vector_store', None), 'client', None)
-                if client is not None and hasattr(client, 'close'):
-                    await client.close()
         self._instances.clear()
+        if self._vector_store_client is not None:
+            with contextlib.suppress(Exception):
+                self._vector_store_client.close()
+            self._vector_store_client = None
         if self._async_qdrant_client is not None:
             with contextlib.suppress(Exception):
                 await self._async_qdrant_client.close()

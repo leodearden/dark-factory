@@ -89,7 +89,14 @@ def harness(tmp_path: Path, mock_orch_config) -> Harness:
     wire_scheduler_liveness_mock(h.scheduler)
     h.scheduler.get_status = AsyncMock(return_value='blocked')
     h.scheduler.set_task_status = AsyncMock()
-    h.scheduler.get_task = AsyncMock(return_value={'id': '42', 'metadata': {}})
+    # Task 3540: the row must carry 'status' too, and it must AGREE with
+    # get_status above. _cascade_unblock_member re-reads the row immediately
+    # before the write and re-applies the status/liveness gate to THAT
+    # snapshot (INV-3), so a row that omits 'status' describes a task that
+    # cannot exist and reads as "left the re-pendable statuses" -> no write.
+    h.scheduler.get_task = AsyncMock(
+        return_value={'id': '42', 'status': 'blocked', 'metadata': {}}
+    )
     h.scheduler.update_task = AsyncMock(return_value=True)
     h._escalation_queue = None
     return h
@@ -100,7 +107,7 @@ def git_repo(tmp_path: Path) -> Path:
     """A bare-minimum git repo with an initial commit (mirrors test_workflow_e2e.py)."""
     repo = tmp_path / 'repo'
     repo.mkdir()
-    asyncio.run(_init_repo(repo))
+    _init_repo(repo)
     return repo
 
 
@@ -165,9 +172,10 @@ def make_escalation_server(tmp_path: Path, *, status_lookup=None):
     ('critical', 2, True),   # born-at-L2 at level 2 (B1/B2 primary)
     ('critical', 0, True),   # born-at-L2 severity disjunct at level 0
     ('urgent', 1, True),     # born-at-L2 severity disjunct at level 1
-    # Level≥2 catch-all (D4) — any pending L2 is stop-the-line
+    # Level≥2 (D4) — a pending L2 is stop-the-line only when escalation.pins
+    # classifies it a queue handoff, so info never gates (info-l0-router D3)
     ('blocking', 2, True),   # level≥2 disjunct
-    ('info', 2, True),       # even 'info' at level 2 gates
+    ('info', 2, False),      # info at level 2 never gates
     # B3 — stale plain L1 must NOT gate a fresh run
     ('blocking', 1, False),  # [B3] blocking/L1 → False
     # Plain blocking L0 — primary gate
@@ -193,16 +201,34 @@ def test_b1_b2_b3_predicate(severity: str, level: int, expected: bool):
 @pytest.mark.asyncio
 class TestWorkflowGatesB1B2:
     """Gate-in-context tests: born-at-L2 stops the workflow at MERGE-entry (B1)
-    and post-implementer (B2).  Asserts WorkflowOutcome.ESCALATED and that the
-    gate does not consume the pending escalation record."""
+    and post-implementer (B2), and the gate does not consume the pending
+    escalation record.
 
+    The B1 gate's DISPOSITION changed in task 3536 (γ₁, PRD
+    ``plans/task-escalation-state-graph-prd.md`` boundary #2): it used to
+    ``return WorkflowOutcome.ESCALATED`` with no steward and no task-status
+    write, which left the row ``in-progress`` with a nulled claimant once the
+    harness slot exited (spec E1 strand).  It now enters the same bounded
+    ESCALATED machinery every other phase uses; a born-at-L2 record trips
+    ``_wait_for_resolution``'s stop-the-line short-circuit immediately, so the
+    outcome is BLOCKED with the row written before the return.  What gates
+    is unchanged for blocking and critical records — ``_is_gating_escalation``
+    was narrowed only for info in task 5222 (an info L2 never gates) — and B2
+    still returns ESCALATED because that gate sits on the
+    execute/verify/review path, which has always routed through ``run()``'s
+    own ESCALATED branch.
+    """
+
+    @pytest.mark.parametrize('severity', ['critical', 'blocking'])
     async def test_b1_merge_entry_gate(
-        self, config, git_ops, task_assignment, monkeypatch, tmp_path,
+        self, config, git_ops, task_assignment, monkeypatch, tmp_path, severity,
     ):
-        """[B1] Born-at-L2 (critical/level=2) pending at MERGE entry → ESCALATED;
-        escalation stays pending (gate does not consume)."""
+        """[B1] A non-info L2 pending at MERGE entry → BLOCKED (row written
+        before the return) with a reason naming the L2 and no steward
+        (boundary row #8 of the info-l0-disposition-router PRD); escalation
+        stays pending (gate does not consume)."""
         stub = AgentStub()
-        workflow, _, queue = _build_workflow_with_escalation(
+        workflow, scheduler, queue = _build_workflow_with_escalation(
             config, git_ops, task_assignment, stub, tmp_path,
         )
 
@@ -211,31 +237,47 @@ class TestWorkflowGatesB1B2:
         # File the born-at-L2 escalation inside the stubbed verify/review phase
         # so it is pending at MERGE entry but absent during _execute_iterations.
         task_id = task_assignment.task_id
+        esc_id = queue.make_id(task_id)
 
         async def _exec_and_escalate():
             queue.submit(Escalation(
-                id=queue.make_id(task_id),
+                id=esc_id,
                 task_id=task_id,
                 agent_role='implementer',
-                severity='critical',
+                severity=severity,
                 category='risk_identified',
-                summary='Critical risk filed before MERGE (born at L2)',
+                summary=f'{severity} L2 filed before MERGE',
                 level=2,
             ))
             return WorkflowOutcome.DONE
 
         workflow._execute_verify_review_loop = _exec_and_escalate  # type: ignore[method-assign]
 
-        outcome = (await workflow.run()).outcome
+        # The born-at-L2 short-circuit fires BEFORE _wait_for_resolution's wait
+        # loop, so no steward window is ever ridden; the guard is here so a
+        # regression that DOES wait fails loudly instead of hanging CI on this
+        # module's stock (unshrunk) timeouts.steward.
+        report = await asyncio.wait_for(workflow.run(), 60)
+        outcome = report.outcome
 
-        assert outcome == WorkflowOutcome.ESCALATED, (
-            f'MERGE-entry gate must return ESCALATED; got {outcome}'
+        assert outcome == WorkflowOutcome.BLOCKED, (
+            f'MERGE-entry gate must park the row via _mark_blocked; got {outcome}'
         )
-        # Gate does not consume — escalation stays pending.
+        assert report.reason == f'Gated by open L2 {esc_id}; no steward applicable'
+        # The row is written BEFORE the terminal return (spec S1) — the half
+        # of the strand shape the old bare-ESCALATED bail never did.
+        assert scheduler.statuses.get(task_id, [])[-1:] == ['blocked'], (
+            f'expected the row parked blocked before the return; got '
+            f'{scheduler.statuses.get(task_id)}'
+        )
+        # Gate does not consume — escalation stays pending.  _mark_blocked's
+        # straggler cleanup dismisses level-0 records only, so the human's L2
+        # survives the park untouched.
         still_pending = queue.get_by_task(task_id, status='pending', level=2)
         assert len(still_pending) == 1, (
             f'Pending L2 must survive the gate (not consumed); got {still_pending}'
         )
+        assert still_pending[0].severity == severity
 
     async def test_b2_post_implementer_gate(
         self, config, git_ops, task_assignment, monkeypatch, tmp_path,
@@ -273,7 +315,7 @@ class TestWorkflowGatesB1B2:
         workflow.artifacts.stamp_plan_provenance(workflow.session_id)
 
         monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub.invoke_agent)
-        await _init_repo(wt)
+        _init_repo(wt)
         workflow.config.inter_iteration_rebase = False
 
         outcome = await workflow._execute_iterations()
@@ -819,7 +861,7 @@ class TestReblockGuardB11B12:
         set_status_calls: list = []
         original_set = harness.scheduler.set_task_status
 
-        async def spy_set(task_id, status, **kw):  # noqa: F841
+        async def spy_set(task_id, status, **kw):
             set_status_calls.append(status)
             await original_set(task_id, status, **kw)
 
@@ -888,7 +930,7 @@ class TestReblockGuardB11B12:
         set_status_calls: list = []
         original_set = harness.scheduler.set_task_status
 
-        async def spy_set(task_id, status, **kw):  # noqa: F841
+        async def spy_set(task_id, status, **kw):
             set_status_calls.append(status)
             await original_set(task_id, status, **kw)
 

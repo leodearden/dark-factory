@@ -1,0 +1,123 @@
+prd: docs/prds/memory-briefing-and-fusion.md
+schema_version: 1
+tasks:
+- label: α
+  task_id: 3658
+  title: RRF cross-store merge in MemoryService.search
+  capabilities:
+  - name: primary-precedence-sort-removed
+    binding: rejection-style — the (is_primary, -score) sort key no longer exists
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: is_primary, -r\.relevance_score
+      paths:
+      - fused-memory/src/fused_memory/services/
+      expect: absent
+  - name: graphiti-synthesized-score-removed
+    binding: rejection-style — the 1.0 - 0.05*rank synthesis is gone
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: 1\.0 - \(i \* 0\.05\)
+      paths:
+      - fused-memory/src/fused_memory/services/
+      expect: absent
+  - name: rrf-constant-and-store-rank-emitted
+    binding: capability→producer (wired) — RRF_K module constant + metadata.store_rank
+      on every result
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: RRF_K
+      paths:
+      - fused-memory/src/fused_memory/services/
+      expect: present
+  - name: mem0-needle-in-merged-top5
+    binding: boundary test 1 — seeded two-store collection, fails on main, passes
+      with α
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: ranking quality is a seeded-collection test property, not a grep
+- label: β
+  task_id: 3659
+  title: 'Briefing rescope: scoped task-derived queries, distilled render, loud degradation'
+  capabilities:
+  - name: templates-single-home-in-shared
+    binding: capability→producer (wired) — shared/src/shared/briefing_queries.py imported
+      by briefing.py
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: briefing_queries
+      paths:
+      - orchestrator/src/orchestrator/agents/
+      - shared/src/shared/
+      expect: present
+  - name: retired-queries-gone
+    binding: rejection-style — the retired query strings no longer appear in orchestrator
+      source
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: project overview architecture goals|recent decisions and rationale
+      paths:
+      - orchestrator/src/
+      expect: absent
+  - name: conventions-query-store-scoped
+    binding: capability→producer (wired) — templates carry stores=[mem0] + categories
+      incl. preferences_and_norms
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: preferences_and_norms
+      paths:
+      - shared/src/shared/briefing_queries.py
+      expect: present
+  - name: caller-identity-threaded-from-briefing
+    binding: capability→producer 3212 upstream (server params), dep β→3212 wired;
+      check moved here from 3212
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: caller_(agent|task)_id
+      paths:
+      - orchestrator/src/orchestrator/agents/briefing.py
+      expect: present
+  - name: loud-degradation-with-storm-escape
+    binding: INV-2/INV-4 — in-block notice + per-failure warning + consecutive-total-failure
+      streak error
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: failure-path behavior is asserted by β's injection tests, not a grep
+- label: γ
+  task_id: 3660
+  title: E1 registry re-key per briefing template + probe refresh + 3211 gate
+  capabilities:
+  - name: per-template-briefing-topics
+    binding: capability→producer (wired) — three new topic slugs in the registry fixture
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: briefing-conventions-generic
+      paths:
+      - fused-memory/tests/fixtures/memory_eval_topic_registry.json
+      expect: present
+  - name: phrasings-pinned-to-shared-templates
+    binding: capability→producer (wired) — pinning test imports shared.briefing_queries
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: briefing_queries
+      paths:
+      - fused-memory/tests/
+      expect: present
+  - name: 3211-gated-on-rekey
+    binding: DAG-direction — add_dependency 3211→γ wired at decompose; verified via
+      get_task
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: dependency edge lives in the task store, not the repo

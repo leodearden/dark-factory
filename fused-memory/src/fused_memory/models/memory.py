@@ -1,10 +1,17 @@
 """Response and result models for the fused memory system."""
 
+from collections.abc import Mapping, Sequence
 from enum import StrEnum
+from typing import Any, TypedDict
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
-from fused_memory.models.enums import MemoryCategory, QueryType, SourceStore
+from fused_memory.models.enums import (
+    ClassificationFallback,
+    MemoryCategory,
+    QueryType,
+    SourceStore,
+)
 
 
 class EpisodeStatus(StrEnum):
@@ -22,6 +29,8 @@ class ClassificationResult(BaseModel):
     secondary: MemoryCategory | None = None
     confidence: float = Field(ge=0.0, le=1.0)
     reasoning: str = ''
+    # None: primary is a real classification. A member names why primary is a default.
+    fallback: ClassificationFallback | None = None
 
 
 class MemoryResult(BaseModel):
@@ -36,19 +45,113 @@ class MemoryResult(BaseModel):
     temporal: dict | None = None  # {valid_at, invalid_at}
     entities: list[str] = Field(default_factory=list)
     metadata: dict = Field(default_factory=dict)
-    # Mem0 server-stamped write time, passed through verbatim from the Mem0 search result.
-    # Typically an offset-aware ISO-8601 string (e.g. "2026-05-15T10:00:00+00:00"), but the
-    # UTC offset is not guaranteed — Mem0 may stamp in any offset or return a non-UTC value.
-    # None when the key is absent in the Mem0 response or for Graphiti-sourced results.
+    # When the record entered its store. Mem0 hits: the server-stamped write time, passed
+    # through verbatim — typically offset-aware ISO-8601 (e.g. "2026-05-15T10:00:00+00:00"),
+    # but the UTC offset is not guaranteed. Graphiti hits: EntityEdge.created_at, the edge's
+    # BIRTH, not its last edit. None when the store supplies no stamp.
     created_at: str | None = None
+    # Writer identity and the project scope the record is STORED under; None when the store
+    # recorded none. project_id is read off the record, never copied from the query, and is
+    # not metadata['project_id']: that key is a writer-supplied ORIGIN tag, one of
+    # server/grouped_read.py::ORIGIN_PROJECT_TAG_KEYS. The two are never merged.
+    agent_id: str | None = None
+    task_id: str | None = None
+    project_id: str | None = None
+    # COMPUTED RETRIEVAL STATE, not stored metadata: never round-trips to a store, and is
+    # never read back off a payload. True means this result was PROMOTED into the returned
+    # window by the topic pin (services/topic_anchor.py, task 3111) rather than by its own
+    # rank, so `relevance_score` is not meaningful for it. Always present in model_dump()
+    # so consumers can read it unconditionally.
+    topic_anchored: bool = False
+
+
+class HitAttribution(TypedDict):
+    """The MemoryResult kwargs naming who wrote a hit, for which task, under which scope."""
+
+    agent_id: str | None
+    task_id: str | None
+    project_id: str | None
+
+
+def _non_empty_str(value: object) -> str | None:
+    return value if isinstance(value, str) and value else None
+
+
+def _stored_task_id(value: object) -> str | None:
+    if isinstance(value, int) and not isinstance(value, bool):
+        return str(value)
+    return _non_empty_str(value)
+
+
+def mem0_hit_attribution(managed: Mapping[str, Any], custom: Mapping[str, Any]) -> HitAttribution:
+    """Attribution of a mem0 record: ``managed`` is mem0's processed search item or the managed half from backends/mem0_client.py::split_managed_metadata.
+
+    project_id inverts models/scope.py::Scope.mem0_user_id, which stores the project id verbatim as user_id.
+    """
+    return HitAttribution(
+        agent_id=_non_empty_str(managed.get('agent_id')),
+        task_id=_stored_task_id(custom.get('task_id')),
+        project_id=_non_empty_str(managed.get('user_id')),
+    )
+
+
+def graphiti_hit_attribution(group_id: object) -> HitAttribution:
+    """Attribution of a Graphiti edge from its ``group_id`` partition; the graph stores no writer.
+
+    project_id inverts models/scope.py::Scope.graphiti_group_id, which partitions by the project id verbatim.
+    """
+    return HitAttribution(agent_id=None, task_id=None, project_id=_non_empty_str(group_id))
 
 
 class AddEpisodeResponse(BaseModel):
     """Response from add_episode."""
 
-    episode_id: str | None = None
+    # A CORRELATION id for the queued write — explicitly NOT a Graphiti episode
+    # uuid (task 3561). add_episode returns synchronously at ENQUEUE time, so no
+    # node exists yet; the real uuid is minted by graphiti_core when the queued
+    # write executes, and _execute_graphiti_write logs the two together.
+    #
+    # The 'corr_' prefix is a LEGIBILITY aid, not an enforced guard — nothing
+    # validates or rejects it. It makes the value self-describing in logs and
+    # in error messages: a caller who copies it into delete_episode reads
+    # `corr_...` back in the resulting NodeNotFoundError and can see at a
+    # glance that it passed a correlation id where an episode uuid was needed.
+    # The failure is loud either way — remove_episode's first statement is
+    # EpisodicNode.get_by_uuid (backends/graphiti_client.py::GraphitiBackend.remove_episode),
+    # which raises for ANY unresolvable uuid, prefixed or bare — so the bare
+    # uuid4 this field used to return failed identically, just without saying
+    # why. The prefix changes an opaque failure into a self-explaining one; it
+    # does not change a silent one into a loud one.
+    #
+    # The field NAME stays `episode_id`: the key is on the wire in the
+    # add_episode MCP tool's returned dict (server/tools.py returns
+    # `result.model_dump()`), and in the write-journal `result_summary` shape
+    # written by services/write_journal.py::WriteJournal.log_write_op and read
+    # by reconciliation/journal.py, so renaming it is a breaking change. The
+    # description below is a Field(...) rather than a comment for the source
+    # reader's benefit only: that tool is annotated `-> dict[str, Any]`, so
+    # this model's JSON schema is NOT published to MCP clients. The
+    # caller-visible channel for the demotion is the `message` string
+    # add_episode returns (services/memory_service.py::MemoryService.add_episode).
+    episode_id: str | None = Field(
+        default=None,
+        description=(
+            'Correlation id for the queued write (prefixed "corr_"), NOT a '
+            'Graphiti episode uuid. The episode node does not exist until the '
+            'queued write executes, so this value is not resolvable via '
+            'delete_episode or any other uuid-keyed operation.'
+        ),
+    )
     status: EpisodeStatus
     message: str = ''
+
+
+class Mem0WriteState(StrEnum):
+    """Whether an add_memory write's Mem0 leg landed, is queued for retry, or did not land."""
+
+    LANDED = 'landed'
+    PENDING_RETRY = 'pending_retry'
+    NOT_LANDED = 'not_landed'
 
 
 class AddMemoryResponse(BaseModel):
@@ -56,8 +159,87 @@ class AddMemoryResponse(BaseModel):
 
     memory_ids: list[str] = Field(default_factory=list)
     stores_written: list[SourceStore] = Field(default_factory=list)
+    # Stores whose leg is durably enqueued and lands asynchronously via the
+    # queue; disjoint from stores_written.
+    stores_queued: list[SourceStore] = Field(default_factory=list)
+    # Stores whose leg hit a transient provider error and is durably queued for
+    # server-side retry; disjoint from stores_written, ids assigned when it lands.
+    stores_pending_retry: list[SourceStore] = Field(default_factory=list)
     category: MemoryCategory | None = None
     message: str = ''
+    # Set when category was not supplied and the classifier returned a default
+    # rather than a classification.
+    classification_fallback: ClassificationFallback | None = None
+
+    @model_validator(mode='after')
+    def _each_store_has_one_outcome(self) -> 'AddMemoryResponse':
+        """A store is reported in at most one of the written / queued / pending-retry lists."""
+        outcome_lists = {
+            'stores_written': self.stores_written,
+            'stores_queued': self.stores_queued,
+            'stores_pending_retry': self.stores_pending_retry,
+        }
+        for store in SourceStore:
+            reported_in = [name for name, stores in outcome_lists.items() if store in stores]
+            if len(reported_in) > 1:
+                raise ValueError(
+                    f'store {store.value!r} is reported in more than one outcome list: '
+                    f'{", ".join(reported_in)}'
+                )
+        return self
+
+    @property
+    def mem0_write_state(self) -> Mem0WriteState:
+        """The one reading of whether this write's Mem0 leg landed; every consumer of memory_ids routes through it."""
+        if self.memory_ids:
+            return Mem0WriteState.LANDED
+        if SourceStore.mem0 in self.stores_pending_retry:
+            return Mem0WriteState.PENDING_RETRY
+        return Mem0WriteState.NOT_LANDED
+
+
+def render_add_memory_message(
+    *,
+    stores_written: Sequence[SourceStore],
+    stores_queued: Sequence[SourceStore] = (),
+    stores_pending_retry: Sequence[SourceStore] = (),
+    graphiti_error: str | None = None,
+    mem0_error: str | None = None,
+    mem0_empty_result: str | None = None,
+    mem0_pending_retry: str | None = None,
+    classification_fallback: ClassificationFallback | None = None,
+) -> str:
+    """The one renderer of add_memory's ``message``; no code should parse its output.
+
+    Each failed store's error text is carried verbatim until task 9839 moves
+    its source to ``AddMemoryResponse.store_errors``.
+    """
+    outcomes = [
+        (label, stores)
+        for label, stores in (
+            ('written to', stores_written),
+            ('queued for', stores_queued),
+            ('pending retry for', stores_pending_retry),
+        )
+        if stores
+    ]
+    if outcomes:
+        msg = 'Memory ' + '; '.join(
+            f'{label} {[s.value for s in stores]}' for label, stores in outcomes
+        )
+    else:
+        msg = 'Memory not written to any store'
+    if graphiti_error:
+        msg += f' [graphiti_error: {graphiti_error}]'
+    if mem0_error:
+        msg += f' [mem0_error: {mem0_error}]'
+    if mem0_empty_result:
+        msg += f' [{mem0_empty_result}]'
+    if mem0_pending_retry:
+        msg += f' [mem0_pending_retry: {mem0_pending_retry}]'
+    if classification_fallback is not None:
+        msg += f' [classification_fallback: {classification_fallback.value}]'
+    return msg
 
 
 class ReadRouteResult(BaseModel):

@@ -25,5 +25,29 @@
       "description": "If any write_all() call fails with an error, the ? operator returns early. The BufWriter/File will still be dropped (closing the fd), but the caller won't know the fd was closed on error vs success, making cleanup logic error-prone.",
       "mutation_type": "leaked_resource"
     }
-  ]
+  ],
+  "context": {
+    "task": {
+      "title": "Export binary STL to a caller-supplied file descriptor",
+      "description": "`crates/reify-runtime/src/mesh_export.rs` can only write a `Mesh` to a filesystem path via `export_stl`, so the streaming path has to spool a temp file and read it back before sending it to a client. Add `export_stl_to_fd(mesh: &Mesh, fd: i32) -> Result<usize>` that writes the same binary STL payload \u2014 80-byte header, little-endian u32 triangle count, then 50 bytes per triangle \u2014 directly to an already-open descriptor and returns the number of bytes written. The descriptor belongs to the caller for its whole lifetime: the caller opens it, keeps using it after the export returns (to write further framing on the same socket, for example), and closes it when done. Document that ownership contract on the function, and keep the byte-for-byte payload identical to what `export_stl` produces for the same mesh.",
+      "test_strategy": "Unit-test in `reify-runtime` against a real descriptor (a `pipe()` end or a `tempfile`): export a small two-triangle mesh, assert the returned count equals `84 + 50 * triangles` and that the bytes read back parse as binary STL with the expected triangle count, then assert the caller can still write to and close the same descriptor itself once the export has returned. Compare the payload against `export_stl` output for the same mesh. `cargo test -p reify-runtime`.",
+      "details": "",
+      "authored": true,
+      "id": null,
+      "record_source": {
+        "kind": "authored",
+        "authored_at": "2026-09-11",
+        "method": "reconstructed from the diff and the annotation description by an opus agent; states intent without naming the planted defect"
+      }
+    },
+    "changed_files": [
+      "crates/reify-runtime/src/mesh_export.rs"
+    ],
+    "base_sha": null,
+    "branch_sha": null,
+    "base_sha_reason": "Unrecoverable -- crates/reify-runtime/src/mesh_export.rs never existed in reify's history. `git log --all --diff-filter=A -- '**/mesh_export.rs'` (and `--follow` on the same pattern) return zero commits across every branch/ref in the repository. Directory listings of crates/reify-runtime/src at the corpus-cutoff commit (7cc4491f, 2026-04-07T16:34:57+01:00) show only commitment.rs, concurrent.rs, concurrent_eval.rs, lib.rs, priority_promotion.rs, warm_pool.rs -- no mesh/STL export module. `git grep` on that same tree for the diff's central symbols finds no `fn export_stl`, no `BufWriter` usage anywhere in the codebase, and the only occurrence of the string 'export_stl' at all is an unrelated test function name (crates/reify-mcp/tests/write_tools_tests.rs::export_stl_returns_success), which exercises a different (MCP write-tool) code path, not a `pub fn export_stl(mesh: &Mesh, path: &Path)` in a runtime crate. No candidate commits exist to test against; the diff targets a module that was never written.",
+    "plan": null,
+    "plan_reason": "hand-authored fixture: no orchestrator run produced it, so no plan ever existed",
+    "verification": null
+  }
 }

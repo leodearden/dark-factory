@@ -16,32 +16,52 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _git_fixtures import RepoSeed, seed_repo
 from _orch_helpers import pydantic_spec, wire_scheduler_liveness_mock
+from escalation.models import Escalation
 from escalation.queue import EscalationQueue
+from shared.cli_invoke import PromptBuilder
+from shared.config_dir import CONFIG_DIR_PREFIX, TaskConfigDir
+from shared.locking import normalize_lock
+from shared.task_submit import SubmitFailed, SubmitOutcome
 
 from orchestrator.agents.invoke import AgentResult
+from orchestrator.agents.review_briefing import ReviewBriefing, ReviewSubject
 from orchestrator.artifacts import TaskArtifacts
-from orchestrator.config import OrchestratorConfig
+from orchestrator.config import GitConfig, OrchestratorConfig
+from orchestrator.escalation_rulings import Ruling
 from orchestrator.git_ops import GitOps, _run
 from orchestrator.harness import Harness
-from orchestrator.landed_outbox import LandedOutbox, LandedRow, MergeProvenance
+from orchestrator.lock_table import UncontestedAcquisition
 from orchestrator.mcp.verdict_tools import (
     _envelope as _verdict_envelope,
 )
 from orchestrator.mcp.verdict_tools import (
     _submit_review_verdict,
 )
-from orchestrator.scheduler import TaskAssignment
+from orchestrator.merge_lane import MergeLane
+from orchestrator.merge_lane.landed_outbox import LandedOutbox, LandedRow, MergeProvenance
+from orchestrator.module_charter import sanitize_files_for_persist
+from orchestrator.pin_reservation import Blocker, BlockerKind
+from orchestrator.review_lineage import RetiredReview
+from orchestrator.scheduler import (
+    BlastRadiusResult,
+    TaskAssignment,
+    _reject_contradictory_metadata_mode,
+)
 from orchestrator.verify import VerifyResult
 from orchestrator.workflow import TaskWorkflow
-from orchestrator.workflow_types import StewardResolved
+from orchestrator.workflow_types import PublishedStewardOutcome, StewardResolved
+
+if TYPE_CHECKING:
+    from orchestrator.branch_stack import StackTarget
 
 
 class FakeMcp:
@@ -71,17 +91,29 @@ class FakeScheduler:
         self.heartbeats: dict[str, str | None] = {}
         # Scope-reconciliation choke point (task 2505): every call's
         # (current, needed, persist_files) is recorded here so tests can
-        # assert on what was persisted, and blast_radius_result configures
-        # the return value (default True == lock acquired successfully;
-        # tests force False to simulate a sibling lock conflict).
+        # assert on what was persisted, and blast_radius_result is the
+        # BlastRadiusResult every call reports (default: applied).
         self.blast_radius_calls: list[tuple[list[str], list[str], list[str] | None]] = []
-        self.blast_radius_result: bool = True
+        self.blast_radius_result = BlastRadiusResult(applied=True)
+        # Live-slot widen (task 3090): each key in contested_modules comes back
+        # contested by the mapped holder; every other key not yet in
+        # uncontested_held is acquired, and a held key is skipped, as
+        # lock_table.py::ModuleLockTable.acquire_uncontested does. Calls are
+        # recorded as (task_id, modules, reason); status is never written.
+        self.contested_modules: dict[str, str] = {}
+        self.uncontested_held: set[str] = set()
+        self.acquire_uncontested_calls: list[tuple[str, list[str], str]] = []
         # Scope-grant direct metadata.files persist seam (task 2505, step-18):
         # every update_task(task_id, metadata) call is recorded here so the
         # same-module scope-grant persist path (which writes metadata.files
         # directly, bypassing handle_blast_radius_expansion) can be asserted.
         # Purely additive — the existing no-op `return True` is preserved.
         self.update_task_calls: list[tuple[str, str | dict]] = []
+        # Tasks a Table-B action teardown owns, modelling
+        # scheduler.py::Scheduler.blocked_writes_suppressed: their 'blocked'
+        # writes are absorbed, every other write lands.
+        self.blocked_write_suppressed_ids: set[str] = set()
+        self.submit_task_calls: list[tuple[dict, float]] = []
 
     async def set_task_status(
         self,
@@ -93,6 +125,8 @@ class FakeScheduler:
         claimant_run_id: str | None = None,
         heartbeat_at: str | None = None,
     ) -> None:
+        if status == 'blocked' and self.blocked_writes_suppressed(task_id):
+            return
         self.statuses.setdefault(task_id, []).append(status)
         if done_provenance is not None:
             self.provenance[task_id] = done_provenance
@@ -138,9 +172,33 @@ class FakeScheduler:
         /,
         *,
         persist_files: list[str] | None = None,
-    ) -> bool:
+    ) -> BlastRadiusResult:
+        """Report ``blast_radius_result``, writing the row the way
+        scheduler.py::Scheduler.handle_blast_radius_expansion does: a conflict
+        re-pends it, unless the result carries the error that write died of."""
         self.blast_radius_calls.append((current, needed, persist_files))
-        return self.blast_radius_result
+        result = self.blast_radius_result
+        if not result.applied and result.repend_error is None:
+            await self.set_task_status(task_id, 'pending')
+        return result
+
+    async def acquire_uncontested(
+        self, task_id: str, modules: list[str], /, *, reason: str,
+    ) -> UncontestedAcquisition:
+        self.acquire_uncontested_calls.append((task_id, list(modules), reason))
+        acquired = tuple(
+            m for m in modules
+            if m not in self.contested_modules and m not in self.uncontested_held
+        )
+        self.uncontested_held.update(acquired)
+        return UncontestedAcquisition(
+            acquired=acquired,
+            contested=tuple(
+                Blocker(m, self.contested_modules[m], BlockerKind.HELD)
+                for m in modules
+                if m in self.contested_modules
+            ),
+        )
 
     async def get_status(self, task_id: str) -> str | None:
         history = self.statuses.get(task_id)
@@ -173,6 +231,11 @@ class FakeScheduler:
     ) -> dict:
         return {}
 
+    async def submit_task(self, arguments: dict, *, timeout: float = 30) -> SubmitOutcome:
+        """Record the call; the fake files nothing, so it never claims a SubmittedTask."""
+        self.submit_task_calls.append((arguments, timeout))
+        return SubmitFailed('FakeScheduler files nothing')
+
     def release(self, task_id: str) -> None:
         pass
 
@@ -188,6 +251,248 @@ class FakeScheduler:
     def clear_merge_phase(self, tid: str) -> None:
         pass
 
+    def blocked_writes_suppressed(self, task_id: str, /) -> bool:
+        return task_id in self.blocked_write_suppressed_ids
+
+
+def _merge_values_additive(old: object, new: object) -> object:
+    """Port of fused-memory's ``_merge_values`` (sqlite_task_backend.py:3264).
+
+    Kept byte-for-byte faithful to the production rules so the fake's
+    ``'additive'`` mode cannot pin behaviour production does not have:
+
+    * both lists — concatenate then dedupe hashable items in stable
+      old-then-new order; fall back to plain concatenation if any item is
+      unhashable;
+    * both dicts — recurse over the union of keys, pass through keys present on
+      only one side;
+    * anything else (scalar collision, type mismatch) — **OLD wins**.
+    """
+    if isinstance(old, list) and isinstance(new, list):
+        combined = old + new
+        try:
+            seen: set = set()
+            deduped: list = []
+            for item in combined:
+                if item not in seen:
+                    seen.add(item)
+                    deduped.append(item)
+            return deduped
+        except TypeError:
+            return combined
+    if isinstance(old, dict) and isinstance(new, dict):
+        merged: dict = {}
+        for key in old.keys() | new.keys():
+            if key in old and key in new:
+                merged[key] = _merge_values_additive(old[key], new[key])
+            elif key in old:
+                merged[key] = old[key]
+            else:
+                merged[key] = new[key]
+        return merged
+    return old
+
+
+class FakeMetadataBackend:
+    """Merge-faithful ``metadata`` backend for workflow tests (task 3579).
+
+    Unlike ``FakeScheduler`` — whose ``update_task`` records call arguments and
+    persists nothing — this fake keeps a real ``blob`` and models BOTH:
+
+    - fused-memory's #1827 ``metadata_mode`` contract, with the same precedence
+      ``scheduler.py::Scheduler.update_task`` resolves:
+      ``metadata_mode`` > ``append=True`` -> ``'additive'`` > ``'merge'``, with
+      the same ONE carve-out — ``metadata_mode='merge'`` alongside a truthy
+      ``append`` is **rejected** as a contradiction rather than silently
+      letting 'merge' win and shallow-clobber nested keys (task 3890); the other
+      combinations are honored, ``('replace', True)`` -> ``'replace'`` and
+      ``('additive', True)`` -> ``'additive'``.  That carve-out is not restated
+      here — ``update_task`` below calls production's own
+      ``scheduler.py::_reject_contradictory_metadata_mode``, so it cannot drift.
+      It models the same per-mode semantics
+      ``sqlite_task_backend.py::_merge_metadata`` implements — ``'merge'``
+      shallow last-write-wins (supplied keys overwrite wholesale, omitted keys
+      preserved), ``'replace'`` whole-blob overwrite, ``'additive'`` recursive
+      list union+dedup / dict-recursive / scalar OLD-wins (see
+      ``_merge_values_additive`` above).  An unrecognised mode raises rather
+      than silently degrading to ``'merge'`` — the backend validates against
+      ``_METADATA_MODES`` too.
+    - the scheduler-side ``metadata.files`` persist that
+      ``scheduler.py::Scheduler.handle_blast_radius_expansion(persist_files=...)``
+      performs via ``scheduler.py::Scheduler._persist_files_metadata``, whose
+      ``merged = {**fresh_md, 'files': honest}`` (where
+      ``honest = sanitize_files_for_persist(files)``) is reached from BOTH the
+      successful-refinement branch and the lock-conflict/requeue branch
+      (task 2868) of ``handle_blast_radius_expansion``.  The only non-persist
+      path is the no-op early return when the depth-normalised module set is
+      unchanged, modelled here too.
+
+    NOT modelled: the corrupt-existing-blob guard (``'merge'``/``'additive'``
+    raise ``TaskmasterError`` rather than clobber a non-dict blob), the legacy
+    ``memory_hints`` shape normalisation, and the lock-table/``set_task_status``
+    side-effects of the requeue branch — no workflow test drives any of them,
+    and the blob here is always a dict.
+
+    It exists so tests can assert on BACKEND STATE rather than merely on call
+    arguments — a whole-blob write that reverts a freshly-persisted
+    ``metadata.files`` is invisible to a call-argument assertion but obvious in
+    ``self.blob``.
+
+    ``update_task`` accepts *metadata* both positionally and as the ``metadata=``
+    keyword on purpose: workflow stamps call it either way, and a signature
+    mismatch would raise ``TypeError`` inside a caller's blanket
+    ``except Exception``, silently leaving the blob untouched.
+
+    Opt-in: wire it into a test's existing ``MagicMock()`` scheduler with
+    ``wire_metadata_backend`` below.  ``FakeScheduler`` is deliberately NOT
+    changed — it has ~20 importers and ``test_workflow_dry_run_hook.py`` pins
+    that passing ``metadata_mode`` to it raises ``TypeError``.
+    """
+
+    def __init__(self, initial: dict | None = None, *, lock_depth: int = 2):
+        self.blob: dict = dict(initial or {})
+        self.update_task_calls: list[dict] = []
+        self.blast_radius_calls: list[tuple[list[str], list[str], list[str] | None]] = []
+        self.blast_radius_result = BlastRadiusResult(applied=True)
+        # Matches the fixtures' config.lock_depth; only used to model
+        # handle_blast_radius_expansion's no-op early return.
+        self.lock_depth = lock_depth
+
+    async def update_task(
+        self,
+        task_id: str,
+        metadata: str | dict | None = None,
+        *,
+        append: bool = False,
+        metadata_mode: str | None = None,
+    ) -> bool:
+        # Call PRODUCTION's contradictory-pair guard (task 3890) rather than
+        # restating its condition here: a hand-copied mirror drifts the moment
+        # the production rule is narrowed or widened, leaving this fake silently
+        # over-permissive again — the very
+        # test-infrastructure-lies-about-production failure this whole guard
+        # exists to close.  Delegating makes the fake mirror production BY
+        # CONSTRUCTION.  Called BEFORE recording the call or touching self.blob:
+        # a refused write must leave backend state untouched and must not read
+        # back as "a write happened", matching the production guard, which
+        # refuses before anything reaches the wire.
+        _reject_contradictory_metadata_mode(metadata_mode, append)
+        self.update_task_calls.append({
+            'task_id': task_id,
+            'metadata': metadata,
+            'append': append,
+            'metadata_mode': metadata_mode,
+        })
+        payload = json.loads(metadata) if isinstance(metadata, str) else (metadata or {})
+        # Mirror Scheduler.update_task's precedence exactly — modulo the
+        # merge + truthy-append cell rejected by the shared guard above.
+        if metadata_mode is not None:
+            effective = metadata_mode
+        elif append:
+            effective = 'additive'
+        else:
+            effective = 'merge'
+
+        if effective == 'merge':
+            self.blob = {**self.blob, **payload}
+        elif effective == 'replace':
+            self.blob = dict(payload)
+        elif effective == 'additive':
+            merged = _merge_values_additive(self.blob, payload)
+            assert isinstance(merged, dict)
+            self.blob = merged
+        else:
+            raise ValueError(f'unsupported metadata_mode: {effective!r}')
+        return True
+
+    async def handle_blast_radius_expansion(
+        self,
+        task_id: str,
+        current: list[str],
+        needed: list[str],
+        /,
+        *,
+        persist_files: list[str] | None = None,
+    ) -> BlastRadiusResult:
+        self.blast_radius_calls.append((current, needed, persist_files))
+        depth = self.lock_depth
+        if {normalize_lock(m, depth) for m in current} == {
+            normalize_lock(m, depth) for m in needed
+        }:
+            # No-op early return (scheduler.py:6935): nothing acquired, nothing
+            # released, nothing persisted.
+            return BlastRadiusResult(applied=True)
+        # Production persists metadata.files on BOTH the grant and the
+        # lock-conflict/requeue branch — only the RETURN differs.  Gating the
+        # persist on blast_radius_result would model the deny path wrongly.
+        if persist_files is not None:
+            self.blob = {
+                **self.blob,
+                'files': sanitize_files_for_persist(persist_files),
+            }
+        return self.blast_radius_result
+
+    async def get_task(self, task_id: str) -> dict:
+        return {'id': task_id, 'metadata': dict(self.blob)}
+
+
+def wire_metadata_backend(
+    scheduler: MagicMock,
+    backend: FakeMetadataBackend,
+    *,
+    seed: dict,
+    grants: bool,
+) -> tuple[AsyncMock, AsyncMock]:
+    """Route a ``MagicMock`` scheduler's metadata methods through *backend*.
+
+    Keeps the MagicMock (so every other auto-mocked attribute such as
+    ``set_task_status`` still works) but rebinds ``update_task`` /
+    ``handle_blast_radius_expansion`` / ``get_task`` to *backend*, wrapped in
+    ``AsyncMock`` side-effects so call-argument assertions keep working
+    alongside blob assertions.
+
+    *seed* is the dispatch-time ``task['metadata']`` the workflow starts with in
+    memory; the backend's blob is seeded from it (any value already on the blob
+    wins) so backend and in-memory start consistent, as production does at
+    dispatch time.  *grants* is ``blast_radius_result.applied``.
+
+    Returns ``(handle_blast_radius_expansion, update_task)`` so a fixture can
+    expose the same AsyncMocks it exposes in the un-wired case.
+    """
+    backend.blob = {**dict(seed), **backend.blob}
+    backend.blast_radius_result = BlastRadiusResult(applied=grants)
+    handle_blast_radius_expansion = AsyncMock(
+        side_effect=backend.handle_blast_radius_expansion,
+    )
+    update_task = AsyncMock(side_effect=backend.update_task)
+    scheduler.handle_blast_radius_expansion = handle_blast_radius_expansion
+    scheduler.update_task = update_task
+    scheduler.get_task = AsyncMock(side_effect=backend.get_task)
+    return handle_blast_radius_expansion, update_task
+
+
+def fixed_prompt(text: str) -> PromptBuilder:
+    """A ``TaskWorkflow._invoke`` prompt builder that always returns *text*."""
+
+    async def build_prompt() -> str:
+        return text
+
+    return build_prompt
+
+
+def invoke_stub_awaiting_builder(result: AgentResult) -> AsyncMock:
+    """An ``_invoke`` double that awaits its prompt builder, then returns *result*.
+
+    For tests that replace ``_invoke`` wholesale yet assert on the briefing
+    call the builder makes.
+    """
+
+    async def invoke(_role, build_prompt: PromptBuilder, *_args, **_kwargs) -> AgentResult:
+        await build_prompt()
+        return result
+
+    return AsyncMock(side_effect=invoke)
+
 
 class FakeBriefing:
     """BriefingAssembler that returns canned prompts."""
@@ -196,33 +501,56 @@ class FakeBriefing:
         self, task: dict, worktree=None, context: str | None = None,
         *, include_prior_proposals: bool = False,
         committed_work: list[dict] | None = None,
+        rulings: Sequence[Ruling] = (),
+        retired_reviews: Sequence[RetiredReview] = (),
     ) -> str:
         return f'Plan task: {task.get("title", "")}'
 
     async def build_plan_completion_prompt(
         self, task: dict, partial_plan: dict, worktree=None,
         context: str | None = None,
+        *, rulings: Sequence[Ruling] = (),
     ) -> str:
         return f'Complete partial plan: {task.get("title", "")}'
 
     async def build_implementer_prompt(
-        self, plan: dict, iteration_log: list, context: str | None = None,
+        self, plan: dict, context: str | None = None,
         rebase_notice: dict | None = None, task_id: str | None = None,
         wip_notice: list[dict] | None = None,
+        *, rulings: Sequence[Ruling] = (),
+        scope_drift=None,
     ) -> str:
         return 'Implement the plan'
 
     async def build_debugger_prompt(
         self, failures: str, plan: dict, context: str | None = None,
         task_id: str | None = None,
+        *, attempt_context=None, scope_drift=None,
+        rulings: Sequence[Ruling] = (),
     ) -> str:
         return f'Fix: {failures[:100]}'
 
     async def build_reviewer_prompt(
         self, reviewer_type: str, diff: str, context: str | None = None,
-        amendment_suggestions: list[dict] | None = None,
+        *, amendment_suggestions: list[dict] | None = None,
+        task: dict | None = None,
+        open_info_notes: Sequence[Escalation] | None = None,
+        rulings: Sequence[Ruling] = (),
     ) -> str:
+        # `amendment_suggestions` is keyword-only in both the Protocol and
+        # the production method; it was positional-or-keyword here, which is
+        # drift neither ruff nor pyright reports — only a call through this
+        # fake would have caught it.
         return f'Review ({reviewer_type}): {diff[:100]}'
+
+    async def build_context_complete_reviewer_prompt(
+        self, reviewer_type: str, subject: ReviewSubject, context: str | None = None,
+        *, amendment_suggestions: list[dict] | None = None,
+        open_info_notes: Sequence[Escalation] | None = None,
+        rulings: Sequence[Ruling] = (),
+    ) -> str:
+        first_path = subject.change.files[0].path if subject.change.files else ''
+        return f'Review-d2 ({reviewer_type}): {first_path}'
 
     async def build_completion_judge_prompt(
         self,
@@ -234,9 +562,7 @@ class FakeBriefing:
     ) -> str:
         return f'Judge task {task_id}: plan has {len(plan.get("steps", []))} steps'
 
-    async def build_merger_prompt(
-        self, conflicts: str, task_intent: str, context: str | None = None
-    ) -> str:
+    async def build_merger_prompt(self, conflicts: str, task_intent: str) -> str:
         return f'Merge: {conflicts[:100]}'
 
     async def build_resume_prompt(
@@ -246,18 +572,28 @@ class FakeBriefing:
         escalation_summary: str,
         resolution: str,
         worktree=None,
+        *, scope_drift=None,
     ) -> str:
         return f'Resume: {resolution[:100]}'
 
+    async def build_scope_drift_followup_prompt(
+        self, plan: dict, scope_drift, task_id: str | None = None,
+    ) -> str:
+        return 'Settle the contested scope request'
+
     async def build_amender_prompt(
-        self, plan: dict, iteration_log: list, suggestions: list, locked_modules: list,
+        self, plan: dict, suggestions: list, locked_modules: list,
         context: str | None = None, task_id: str | None = None,
+        *, rulings: Sequence[Ruling] = (),
+        scope_drift=None,
     ) -> str:
         return 'Amend the plan'
 
     async def build_revalidation_prompt(
         self, task: dict, existing_plan: dict, changed_files: list,
-        worktree=None, context: str | None = None,
+        worktree=None, context: str | None = None, *, text_drift=None,
+        integrity_refusal=None, rulings: Sequence[Ruling] = (),
+        retired_reviews: Sequence[RetiredReview] = (),
     ) -> str:
         return f'Revalidate: {task.get("title", "")}'
 
@@ -267,8 +603,20 @@ class FakeBriefing:
     ) -> str:
         return f'Tighten plan for: {task.get("title", "")}'
 
+    async def build_plan_schema_repair_prompt(
+        self, task: dict, context: str | None = None,
+    ) -> str:
+        return f'Repair plan schema: {task.get("title", "")}'
+
+    async def build_replan_prompt(
+        self, task: dict, review_feedback: str, context: str | None = None,
+        *, rulings: Sequence[Ruling] = (),
+    ) -> str:
+        return f'Replan: {review_feedback[:100]}'
+
     async def build_simple_task_prompt(
         self, task: dict, worktree=None, context: str | None = None,
+        *, rulings: Sequence[Ruling] = (),
     ) -> str:
         return f'Simple task: {task.get("title", "")}'
 
@@ -281,7 +629,7 @@ def _make_resolving_steward(queue: EscalationQueue, task_id: str) -> type:
     """
 
     class _FakeSteward:
-        def __init__(self, wt_path, cfg_dir):  # noqa: ARG002
+        def __init__(self, wt_path, cfg_dir):
             self._outcome_channel = None
             self._wip_probe = None
 
@@ -298,10 +646,11 @@ def _make_resolving_steward(queue: EscalationQueue, task_id: str) -> type:
                 queue.resolve(
                     esc.id, 'Resolved by FakeSteward', resolved_by='fake-steward',
                 )
-            if self._outcome_channel is not None:
-                self._outcome_channel.put_nowait(
-                    StewardResolved(resolution_text='Resolved by FakeSteward'),
-                )
+                if self._outcome_channel is not None:
+                    self._outcome_channel.put_nowait(PublishedStewardOutcome(
+                        esc.id,
+                        StewardResolved(resolution_text='Resolved by FakeSteward'),
+                    ))
 
         async def stop(self) -> None:
             pass
@@ -320,7 +669,7 @@ def _make_status_setting_steward(
     """
 
     class _FakeSteward:
-        def __init__(self, wt_path, cfg_dir):  # noqa: ARG002
+        def __init__(self, wt_path, cfg_dir):
             self._outcome_channel = None
             self._wip_probe = None
 
@@ -336,9 +685,10 @@ def _make_status_setting_steward(
                 queue.resolve(esc.id, 'Resolved', resolved_by='fake-steward')
             await scheduler.set_task_status(task_id, final_status)
             if self._outcome_channel is not None:
-                self._outcome_channel.put_nowait(
-                    StewardResolved(resolution_text='Resolved'),
-                )
+                for esc in pending:
+                    self._outcome_channel.put_nowait(PublishedStewardOutcome(
+                        esc.id, StewardResolved(resolution_text='Resolved'),
+                    ))
 
         async def stop(self) -> None:
             pass
@@ -370,7 +720,16 @@ def _make(
     task_id: str = '50',
     branch_on_main: bool = True,
     main_sha: str = 'mainsha123',
+    landing_citation: str | None = 'citationsha123',
+    landing_effect_present: bool = True,
 ) -> _Fixture:
+    """A workflow wired to git stubs for the already-merged recovery guards.
+
+    ``landing_citation`` / ``landing_effect_present`` answer the landing
+    evidence a recovery guard's fallback arm validates before stamping
+    (task 4704): the commit on main citing this task, and whether its effect
+    survives.  The defaults describe a genuine, attributable landing.
+    """
     assignment = MagicMock()
     assignment.task_id = task_id
     assignment.task = {'id': task_id, 'title': 'T', 'description': 'd'}
@@ -385,6 +744,9 @@ def _make(
     config.lock_depth = 2
     config.steward_completion_timeout = 300.0
     config.project_root = project_root
+    config.git.branch_prefix = 'task/'
+    config.git.main_branch = 'main'
+    config.review.reviewer_briefing = ReviewBriefing.DIFF_ONLY
 
     set_task_status = AsyncMock()
     scheduler = MagicMock()
@@ -408,7 +770,18 @@ def _make(
     get_main_sha = AsyncMock(return_value=main_sha)
     git_ops = MagicMock()
     git_ops.is_ancestor = is_ancestor
+
+    async def _is_ancestor_checked(ancestor: str, descendant: str) -> bool:
+        return await git_ops.is_ancestor(ancestor, descendant)
+    git_ops.is_ancestor_checked = _is_ancestor_checked
     git_ops.get_main_sha = get_main_sha
+    git_ops.resolve_branch_sha = AsyncMock(return_value=None)
+    git_ops.has_uncommitted_work = AsyncMock(return_value=False)
+    git_ops.own_delta_cut = AsyncMock(return_value=None)
+    git_ops.find_task_citation_commit = AsyncMock(return_value=landing_citation)
+    git_ops.commit_effect_present_in_main = AsyncMock(
+        return_value=landing_effect_present,
+    )
 
     wf = TaskWorkflow(
         assignment=assignment,
@@ -518,13 +891,11 @@ def _build_harness(config: OrchestratorConfig) -> Harness:
     return harness
 
 
-async def _init_git_repo(repo: Path) -> None:
-    await _run(['git', 'init', '-b', 'main'], cwd=repo)
-    await _run(['git', 'config', 'user.email', 'test@test.com'], cwd=repo)
-    await _run(['git', 'config', 'user.name', 'Test'], cwd=repo)
-    (repo / 'README.md').write_text('# Test\n')
-    await _run(['git', 'add', '-A'], cwd=repo)
-    await _run(['git', 'commit', '-m', 'init'], cwd=repo)
+GIT_REPO_SEED = RepoSeed(files=(('README.md', '# Test\n'),), message='init')
+
+
+def _init_git_repo(repo: Path) -> None:
+    seed_repo(repo, GIT_REPO_SEED)
 
 
 # ---------------------------------------------------------------------------
@@ -535,16 +906,32 @@ async def _init_git_repo(repo: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
+def agent_side_artifacts(cwd: Path) -> TaskArtifacts:
+    """The artifacts an agent-side MCP server dispatched into *cwd* writes.
+
+    Mirrors ``TaskWorkflow._artifact_roots``: the task root when the workflow
+    created one for the lane's task (a dual-root dispatch), else the lane root
+    alone (an external worktree, or a lane no workflow has set up).
+    """
+    lane = TaskArtifacts.meta_root_for(cwd.parent, cwd.name)
+    task_id = TaskArtifacts.read_lane_task_id(lane)
+    if task_id is not None:
+        task_root = TaskArtifacts.task_root_for(cwd.parent, task_id)
+        if task_root.is_dir():
+            return TaskArtifacts(cwd, lane, task_root)
+    return TaskArtifacts(cwd, lane)
+
+
 @pytest.fixture(autouse=True)
 def _derive_meta_root_like_production(monkeypatch):
-    """Mirror ε1 (task 2258) meta_root derivation in the agent-side doubles.
+    """Mirror production's root derivation (ε1 task 2258, task 3155) in the
+    agent-side doubles.
 
     In production the workflow's ``self.artifacts`` is constructed with the
-    derived sibling ``.task-meta/<name>`` root
-    (``TaskArtifacts(worktree, _meta_root_for_worktree(worktree))``) and the
-    real ``plan_tools.py`` MCP writer is launched with the *same* ``--meta-root``
-    — so every reader/writer for a worktree resolves through one consistent
-    ``meta_root``.
+    lane and task roots of ``TaskWorkflow._artifact_roots`` and the real
+    ``plan_tools.py`` MCP writer is launched with the *same* ``--meta-root`` /
+    ``--task-root`` — so every reader/writer for a dispatch resolves through
+    one consistent pair of roots.
 
     These e2e doubles (``AgentStub._architect`` / ``_implementer`` and ~50
     other call sites) bypass the real ``plan_tools.py`` subprocess and emulate
@@ -556,32 +943,36 @@ def _derive_meta_root_like_production(monkeypatch):
     — so ``get_pending_steps()`` never observes completion and the task blocks
     with "Execution iterations exhausted".
 
-    Rather than thread the derived root through every call site, patch the
-    constructor to default ``meta_root`` to the same sibling root production
-    derives whenever it is omitted. Explicit ``meta_root`` args (the workflow's
-    own and ``plan_tools.py``'s) are untouched.
+    Rather than thread the derived roots through every call site, patch the
+    constructor to default BOTH roots to the ones production derives
+    (``agent_side_artifacts``) whenever ``meta_root`` is omitted. Explicit
+    roots (the workflow's own and ``plan_tools.py``'s) are untouched.
     """
     orig_init = TaskArtifacts.__init__
 
-    def _init(self, worktree, meta_root=None):
+    def _init(self, worktree, meta_root=None, task_root=None):
         if meta_root is None:
-            meta_root = TaskArtifacts.meta_root_for(worktree.parent, worktree.name)
-        orig_init(self, worktree, meta_root)
+            derived = agent_side_artifacts(worktree)
+            meta_root, task_root = derived.lane_root, derived.task_root
+        orig_init(self, worktree, meta_root, task_root)
 
     monkeypatch.setattr(TaskArtifacts, '__init__', _init)
 
 
-async def _init_repo(repo: Path):
-    await _run(['git', 'init', '-b', 'main'], cwd=repo)
-    await _run(['git', 'config', 'user.email', 'test@test.com'], cwd=repo)
-    await _run(['git', 'config', 'user.name', 'Test'], cwd=repo)
-    # Seed with a simple Python file so the repo isn't empty
-    (repo / 'lib.py').write_text('def greet(name: str) -> str:\n    return f"Hello, {name}"\n')
-    (repo / 'test_lib.py').write_text(
-        'from lib import greet\n\ndef test_greet():\n    assert greet("world") == "Hello, world"\n'
-    )
-    await _run(['git', 'add', '-A'], cwd=repo)
-    await _run(['git', 'commit', '-m', 'Initial commit'], cwd=repo)
+E2E_REPO_SEED = RepoSeed(
+    files=(
+        ('lib.py', 'def greet(name: str) -> str:\n    return f"Hello, {name}"\n'),
+        (
+            'test_lib.py',
+            'from lib import greet\n\ndef test_greet():\n    assert greet("world") == "Hello, world"\n',
+        ),
+    ),
+    message='Initial commit',
+)
+
+
+def _init_repo(repo: Path) -> None:
+    seed_repo(repo, E2E_REPO_SEED)
 
 
 PLAN = {
@@ -639,6 +1030,7 @@ class AgentStub:
         self.calls: list[str] = []
         # Last env_overrides seen per role — set by invoke_agent before dispatch.
         self.env_overrides_by_role: dict[str, dict[str, str] | None] = {}
+        self.sandbox_extras_by_role: dict[str, list[str] | None] = {}
         self._impl_iteration = 0
         # Sequence of verify results to return (pops from front)
         self._verify_results = list(verify_results or [VerifyResult(
@@ -679,11 +1071,13 @@ class AgentStub:
         working_idle_secs: float | None = None,
         absolute_cap_secs: float | None = None,
         prices: dict[str, Any] | None = None,
+        strict_mcp_config: bool = False,
     ) -> AgentResult:
         """Determine role from system_prompt content, perform side effects."""
         role = self._detect_role(system_prompt)
         self.calls.append(role)
         self.env_overrides_by_role[role] = env_overrides
+        self.sandbox_extras_by_role[role] = sandbox_extras
 
         if role == 'architect':
             return await self._architect(cwd)
@@ -702,19 +1096,16 @@ class AgentStub:
                 # where the reviewer payload's 'reviewer' field diverges
                 # from the role would otherwise pass silently here even
                 # though the real tool would reject it (reviewer_comprehensive
-                # amendment, task 2484). Written to the .task-meta META_ROOT
-                # the workflow's self.artifacts reads from — NOT
-                # TaskArtifacts(cwd) (the legacy .task root), or the write
-                # would land where _run_reviewer never reads. Same root
-                # pattern as the _architect stub below.
-                rev_artifacts = TaskArtifacts(
-                    cwd, TaskArtifacts.meta_root_for(cwd.parent, cwd.name)
-                )
+                # amendment, task 2484). Written through the same roots the
+                # real verdict-tools server gets (agent_side_artifacts), or
+                # the write would land where _run_reviewer never reads.
+                rev_artifacts = agent_side_artifacts(cwd)
                 so = result.structured_output
                 _submit_review_verdict(
                     rev_artifacts, role, session_id or 'sid',
                     so.get('reviewer'), so.get('verdict'),
                     so.get('issues'), so.get('summary'),
+                    note_dispositions=so.get('note_dispositions'),
                 )
             return result
         elif role == 'merger':
@@ -745,29 +1136,24 @@ class AgentStub:
         return 'unknown'
 
     async def _architect(self, cwd: Path) -> AgentResult:
-        """Write plan.json to the task's meta_root.
+        """Write plan.json where the real plan-tools server would.
 
-        The workflow constructs its TaskArtifacts with the relocated
-        ``.task-meta`` sibling root (task 2258 W11-ε1) and reads plan.json from
-        there — NOT the legacy ``<worktree>/.task``. The real agent-side
-        plan-tools MCP writes to the same root via ``--meta-root``; this stub
-        must mirror that or the workflow sees "no plan.json produced".
+        The workflow reads plan.json from its task root (task 3155), and the
+        real agent-side plan-tools MCP writes there via ``--meta-root`` /
+        ``--task-root``; this stub must mirror that or the workflow sees
+        "no plan.json produced".
         """
-        artifacts = TaskArtifacts(
-            cwd, TaskArtifacts.meta_root_for(cwd.parent, cwd.name)
-        )
-        artifacts.root.mkdir(parents=True, exist_ok=True)
+        plan_path = agent_side_artifacts(cwd).artifact_path('plan.json')
+        plan_path.parent.mkdir(parents=True, exist_ok=True)
         plan = dict(PLAN)
         plan['_schema_version'] = 1
-        (artifacts.root / 'plan.json').write_text(json.dumps(plan, indent=2) + '\n')
+        plan_path.write_text(json.dumps(plan, indent=2) + '\n')
         return AgentResult(success=True, output='Plan created', cost_usd=0.50)
 
     async def _implementer(self, cwd: Path) -> AgentResult:
         """Create code files and update plan.json step statuses."""
         self._impl_iteration += 1
-        artifacts = TaskArtifacts(
-            cwd, TaskArtifacts.meta_root_for(cwd.parent, cwd.name)
-        )
+        artifacts = agent_side_artifacts(cwd)
         pending = artifacts.get_pending_steps()
 
         if not pending:
@@ -843,11 +1229,9 @@ class AgentStub:
         verdict-tools artifact (``verdicts/judge.json``) ONLY — the legacy
         ``result.structured_output`` read is gone. So for a real verdict
         dict this stub must mirror the agent-side submit_completion_verdict
-        tool call by routing through the actual ``_submit_completion_verdict``
-        implementation, writing to the ``.task-meta`` META_ROOT the
-        workflow's ``self.artifacts`` reads from (NOT ``TaskArtifacts(cwd)``,
-        the legacy ``.task`` root) — same root pattern as the reviewer/
-        architect stubs above. ``structured_output`` is retained belt-and-
+        tool call, writing through ``agent_side_artifacts`` to the root the
+        workflow's ``self.artifacts`` reads from — same root pattern as the
+        reviewer/architect stubs above. ``structured_output`` is retained belt-and-
         braces but is no longer consulted by the workflow. The envelope is
         written directly (``_envelope`` + ``write_verdict``) rather than
         through ``_submit_completion_verdict`` so a deliberately malformed
@@ -875,9 +1259,7 @@ class AgentStub:
         if verdict is None:
             return AgentResult(success=True, output='', structured_output=None, cost_usd=0.05)
 
-        judge_artifacts = TaskArtifacts(
-            cwd, TaskArtifacts.meta_root_for(cwd.parent, cwd.name)
-        )
+        judge_artifacts = agent_side_artifacts(cwd)
         judge_artifacts.write_verdict(
             'judge', _verdict_envelope('judge', session_id, verdict)
         )
@@ -902,11 +1284,9 @@ def _build_workflow(
     agent_stub: AgentStub,
 ) -> tuple[TaskWorkflow, FakeScheduler]:
     """Wire up a TaskWorkflow with all fakes injected."""
-    from _serial_merge_worker import MergeWorker
-
     scheduler = FakeScheduler()
     merge_queue: asyncio.Queue = asyncio.Queue()
-    worker = MergeWorker(git_ops, merge_queue)
+    worker = MergeLane(git_ops, merge_queue)
     # Start merge worker — cleaned up when event loop tears down after test
     asyncio.create_task(worker.run(), name='test-merge-worker')
     workflow = TaskWorkflow(
@@ -929,22 +1309,25 @@ def _build_workflow_with_escalation(
     tmp_path: Path,
     *,
     spawn_merge_worker: bool = True,
+    steward_factory: type | None = None,
+    queue: EscalationQueue | None = None,
+    stack_target: StackTarget | None = None,
 ) -> tuple[TaskWorkflow, FakeScheduler, EscalationQueue]:
     """Wire up a TaskWorkflow with an EscalationQueue attached.
 
-    When ``spawn_merge_worker=False``, skips the MergeWorker/asyncio.create_task
+    When ``spawn_merge_worker=False``, skips the MergeLane/asyncio.create_task
     setup — use for tests that exercise _mark_blocked directly and never enqueue
     merge work; omitting create_task avoids the 'Task was destroyed but it is
-    pending!' warning in pytest teardown.
+    pending!' warning in pytest teardown.  ``queue`` lets a caller submit
+    records, and build a steward that closes over the queue, before the
+    workflow exists; ``steward_factory`` and ``stack_target`` go to the public
+    constructor arguments of the same names.
     """
-    from _serial_merge_worker import MergeWorker
-
     scheduler = FakeScheduler()
-    queue_dir = tmp_path / 'escalation_queue'
-    queue = EscalationQueue(queue_dir)
+    queue = queue if queue is not None else EscalationQueue(tmp_path / 'escalation_queue')
     merge_queue: asyncio.Queue = asyncio.Queue()
     if spawn_merge_worker:
-        worker = MergeWorker(git_ops, merge_queue)
+        worker = MergeLane(git_ops, merge_queue)
         asyncio.create_task(worker.run(), name='test-merge-worker')
     else:
         worker = None
@@ -958,8 +1341,287 @@ def _build_workflow_with_escalation(
         escalation_queue=queue,
         merge_queue=merge_queue,
         merge_worker=worker,
+        steward_factory=steward_factory,
+        stack_target=stack_target,
     )
     return workflow, scheduler, queue
+
+
+# ---------------------------------------------------------------------------
+# Transcript-archival test harness (task 4384): promoted out of three
+# divergent copies — test_transcript_archive_producer_hook.py (α),
+# test_transcript_archive_backstop.py (β) and
+# test_transcript_archival_boundary_gate.py (the ε B+H gate, which had ported
+# the fixtures from the first two). A change to the workflow constructor
+# signature or the archive layout now has exactly one place to land instead
+# of three.
+#
+# _config_dir/_write_transcript/_archived take ``task_id`` as an explicit,
+# non-defaulted parameter (backstop.py's original shape) rather than
+# defaulting it — a shared helper module cannot correctly default it to a
+# value that differs per consuming file (backstop.py's task id is '2786',
+# boundary_gate.py's is '42').
+# ---------------------------------------------------------------------------
+
+# NAMING (why only `_make_workflow` was renamed on promotion). The bare
+# `_make_workflow` had an explicit in-file retirement precedent — Group B's
+# header 500 lines above records that the warm-lane factory was renamed off
+# it — so re-introducing it here would have contradicted this module's own
+# documented decision, hence `_make_transcript_workflow`.
+#
+# `_config` and `_make_git_ops` collide by NAME too (measured under
+# orchestrator/tests/ on 2026-09-05: 11 other modules define a local
+# `_config(`, 17 define a local `_make_git_ops(`, several with mutually
+# incompatible signatures — e.g. test_offline_lane.py returns a MagicMock,
+# test_merge_queue_build_chain.py takes `(repo, *, pool, size)`), and they are
+# kept bare deliberately, not by oversight:
+#   - No collision is REACHABLE. Every import of this module is explicit by
+#     name; there are zero `from _workflow_helpers import *` in the tests dir
+#     (measured 2026-09-05), so a consumer that defines its own `_config`
+#     simply never imports ours. A shadowing bug would require a file to do
+#     both, which the Group E identity test would then catch.
+#   - Neither name carries a retirement precedent, so renaming them buys
+#     consistency of style, not safety, at the cost of churn across three
+#     consumer suites in a behaviour-preserving diff.
+# If a future consumer ever needs both, rename then — `_make_transcript_git_ops`
+# / `_transcript_config` are the names to use.
+
+# The encoded-project dir the fake transcript is laid down under (the
+# hyphen-encoded form Claude Code's config layout uses for a project path).
+# The literal is arbitrary: the archiver mirrors whatever directory name it
+# finds under `projects/`, so nothing production-side depends on this value
+# and no test pins it — the suites use it symbolically on both sides.
+ENC = '-home-leo-projX'
+
+
+def _config(git_repo: Path, **overrides) -> OrchestratorConfig:
+    """Build an OrchestratorConfig rooted at *git_repo* for a transcript-archival probe."""
+    kwargs: dict[str, Any] = dict(
+        project_root=git_repo,
+        max_concurrent_tasks=1,
+        git=GitConfig(
+            main_branch='main',
+            branch_prefix='task/',
+            remote='origin',
+            worktree_dir='.worktrees',
+        ),
+    )
+    kwargs.update(overrides)
+    return OrchestratorConfig(**kwargs)
+
+
+def _make_git_ops(git_repo: Path, **kwargs) -> GitOps:
+    """Build a GitOps rooted at *git_repo*; ``**kwargs`` pass through to
+    ``__init__`` (notably ``transcript_archive=...``, which arms the β
+    teardown backstop — omitting it leaves the backstop inert)."""
+    return GitOps(
+        GitConfig(
+            main_branch='main',
+            branch_prefix='task/',
+            remote='origin',
+            worktree_dir='.worktrees',
+        ),
+        git_repo,
+        **kwargs,
+    )
+
+
+async def _make_transcript_workflow(config, git_ops, task_assignment):
+    """Build a probe TaskWorkflow over a REAL worktree, with ``_config_dir``
+    set manually (driving ``_invoke`` directly skips ``run()``'s setup where
+    ``_config_dir`` is normally created).
+
+    Named ``_make_transcript_workflow`` rather than the bare ``_make_workflow``
+    for the same reason Group B's ``_make_warmlane_workflow`` was: that bare
+    name is reused across the tests dir with different signatures (42
+    module-local definitions measured under orchestrator/tests/), so a shared
+    symbol carrying it is a shadowing hazard at every call site.
+    """
+    wt_info = await git_ops.create_worktree(task_assignment.task_id)
+    cwd = wt_info.path
+    workflow = TaskWorkflow(
+        assignment=task_assignment,
+        config=config,
+        git_ops=git_ops,
+        scheduler=FakeScheduler(),  # type: ignore[arg-type]
+        briefing=FakeBriefing(),  # type: ignore[arg-type]
+        mcp=FakeMcp(),  # type: ignore[arg-type]
+    )
+    workflow.artifacts = None
+    workflow._config_dir = TaskConfigDir(task_assignment.task_id, base_dir=cwd / '.task')
+    return workflow, cwd
+
+
+TRANSCRIPT_REPO_SEED = RepoSeed(
+    files=(('lib.py', 'def greet(name): return name\n'),), message='Initial commit',
+)
+
+
+def _init_transcript_repo(repo: Path) -> None:
+    """Seed a real, committed git repo for the transcript-archival suites.
+
+    A THIRD seeder beside the two already in this module, deliberately not a
+    merge of them: ``_init_git_repo`` seeds README.md, and ``_init_repo``
+    seeds lib.py PLUS test_lib.py with a working ``greet`` implementation (and
+    is imported by test_workflow_e2e.py). This one seeds only lib.py with a
+    trivial ``greet`` stub. Reusing either existing name would silently hand
+    the transcript suites the wrong repo contents — a failure that surfaces as
+    a confusing assertion error far from its cause, not an ImportError.
+
+    Each of the three names is backed by its own ``RepoSeed``, built by
+    ``_git_fixtures.py::build_repo``.
+    """
+    seed_repo(repo, TRANSCRIPT_REPO_SEED)
+
+
+def _config_dir(worktree: Path, task_id: str) -> Path:
+    """The on-disk per-task Claude config dir the β backstop reconstructs:
+    ``<worktree>/.task/<CONFIG_DIR_PREFIX><task_id>``.
+
+    The leaf name is composed from ``shared.config_dir.CONFIG_DIR_PREFIX`` —
+    the same single source of truth ``TaskConfigDir.__init__`` uses — rather
+    than from a hand-written ``claude-config-`` literal, so a rename of the
+    template cannot leave this harness silently pointing at a directory
+    production no longer writes. (git_ops.py's teardown backstop reconstructs
+    the same path with its own literal; that copy is production's problem, not
+    this module's, and is out of scope here.)
+
+    Deliberately a PURE path composition rather than
+    ``TaskConfigDir(task_id, base_dir=worktree / '.task').path``: that
+    constructor has side effects — it ``mkdir(parents=True)``s the directory
+    and symlinks ~/.claude settings into it — and rows here call this helper to
+    name a path that must NOT exist (e.g. boundary_gate's assertion that
+    ``cleanup_worktree`` removed the config dir), which a constructing helper
+    would resurrect. The cross-check against the real constructor is made
+    once, in test_workflow_helpers.py's Group E smoke test.
+    """
+    return worktree / '.task' / f'{CONFIG_DIR_PREFIX}{task_id}'
+
+
+def _write_transcript(worktree: Path, task_id: str, sid: str, data: bytes) -> Path:
+    """Lay down an un-archived transcript at
+    ``<config_dir>/projects/<ENC>/<sid>.jsonl`` and return its path."""
+    p = _config_dir(worktree, task_id) / 'projects' / ENC / f'{sid}.jsonl'
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_bytes(data)
+    return p
+
+
+def _archive_root(git_repo: Path) -> Path:
+    """The durable archive root the producer composes
+    (``config.project_root / transcript_archive.root``) — OUTSIDE the worktree.
+
+    Promoted out of test_transcript_archival_boundary_gate.py so this literal
+    and ``_archived``'s prefix are one expression again: before promotion
+    boundary_gate defined ``_archived`` as ``_archive_root(...) / ...``, and
+    lifting only ``_archived`` had split them into two independent copies. That
+    split is not benign — the gate's negative rows
+    (``assert not _archived(...).exists()``, and the ``.archive-tmp`` debris
+    rglobs) pass trivially against ANY wrong path, so a drift between the two
+    would degrade them to vacuous passes rather than failures.
+
+    NOT routed through here: the ``assert_called_once_with(archive_root=...)``
+    rows in the α/β suites, which spell the composition out by hand on purpose.
+    Those are independent oracles for what PRODUCTION passes; sharing this
+    helper with them would turn a real cross-check into a comparison of the
+    test harness with itself.
+    """
+    return git_repo / 'data' / 'orchestrator' / 'agent-transcripts'
+
+
+def _archived(git_repo: Path, task_id: str, sid: str) -> Path:
+    """The durable plain-.jsonl mirror the archiver should produce for *sid*."""
+    return _archive_root(git_repo) / task_id / ENC / f'{sid}.jsonl'
+
+
+# ---------------------------------------------------------------------------
+# Lock-module path construction (shared: the same premise is asserted by
+# test_workflow_status_on_resume.py and test_workflow_metadata_files_reconcile.py)
+# ---------------------------------------------------------------------------
+
+
+def _unguarded_sibling_pair(lock_depth: int) -> tuple[str, str]:
+    """The raw path construction behind `same_module_siblings`, WITHOUT its guard.
+
+    Split out so the sub-1 boundary test can demonstrate the silent failure the
+    guard prevents by driving the REAL construction, not a copy of it.  A copy
+    would keep asserting today's shape if this scheme ever changed (different
+    prefix, absolute paths, a suffix other than ``e.py``/``f.py``) and the
+    demonstration would drift SILENTLY — the empty-set assertions hold for any
+    empty-prefix pair, so nothing would go red.
+
+    ``range`` is empty at every rejected depth (0 and below), so the package
+    prefix there is ``''`` and the pair is ``/e.py`` / ``/f.py``.
+    """
+    package = '/'.join(f'p{i}' for i in range(lock_depth))
+    return f'{package}/e.py', f'{package}/f.py'
+
+
+def same_module_siblings(lock_depth: int) -> tuple[str, str]:
+    """Two DISTINCT file paths guaranteed to share a module at *lock_depth*.
+
+    ``shared.locking.normalize_lock`` truncates a path to its first ``depth``
+    components, so two files share a lock module iff those components agree.
+    A fixed literal like ``a/b/c/d/{e,f}.py`` satisfies that only while
+    ``lock_depth <= 4``: at a deeper setting the two paths normalize to
+    themselves and become DIFFERENT modules, making the "same-module widen"
+    premise unsatisfiable.
+
+    That is not hypothetical — it is why these tests went red on main when
+    ``dark-factory-orchestrator.yaml`` moved ``lock_depth`` 4 -> 12 (commit
+    094d634465, deliberately making module locks file-granular). The autouse
+    ``_isolate_orch_config`` fixture in conftest.py pins ``ORCH_CONFIG_PATH``
+    at the LIVE operational config, so ``config.lock_depth`` here is the real
+    deployed value by design, not a code default.
+
+    Deriving the package prefix FROM ``lock_depth`` keeps the premise true BY
+    CONSTRUCTION at any depth, so these stay tests of same-module widen
+    behaviour instead of silently becoming tests of the knob's current value.
+
+    The same-module/different-file state itself stays LIVE at every depth, so
+    this constructor is not life support for a dead branch (task 3866 answered
+    that question explicitly): the code under test is depth-GENERIC — it reads
+    ``config.lock_depth`` and ships in the orchestrator package, whose bundled
+    ``defaults.yaml`` still declares 4 over a pydantic Field default of 2, and
+    ``lock_depth: 12`` is one project's operational override — while even at 12
+    any path deeper than ``lock_depth`` still collapses onto its truncated
+    prefix.
+
+    Raises ``ValueError`` below ``lock_depth == 1``, the one input where the
+    by-construction guarantee breaks SILENTLY rather than loudly.  MEASURED,
+    not assumed: at depth 0 the package prefix is empty, so the pair is
+    ``/e.py`` / ``/f.py``; ``normalize_lock`` truncates to ``parts[:0]`` and
+    both normalize to ``''``, which ``files_to_modules`` then DROPS — the
+    module list is ``[]``, not two modules.  That is worse than an outright
+    wrong answer, because the usual precondition
+    ``files_to_modules([f1]) == files_to_modules([f1, f2])`` degenerates to
+    ``[] == []`` and PASSES VACUOUSLY while the workflow under test holds no
+    module lock at all.  ``OrchestratorConfig.lock_depth`` carries no ``ge=1``
+    constraint, so a caller forwarding ``config.lock_depth`` really can reach
+    this; failing loudly beats handing back a pair whose preconditions are
+    satisfied by emptiness.
+
+    CONTRACT TEST — ``TestSameModuleSiblings`` in ``test_workflow_helpers.py``
+    (this module's own smoke-test suite) pins every guarantee above across
+    depths [1, 2, 3, 4, 12, 20] plus the sub-1 boundary, driving that boundary
+    case through ``_unguarded_sibling_pair`` so its silent-failure
+    demonstration cannot drift from the construction below.  It previously lived
+    in the consumer suite ``test_workflow_status_on_resume.py`` — task 3866
+    held no lock on this file, so it left the class behind as a scope-only
+    remedy; task 3903 relocated it here once that file was in scope.  If you
+    move the test again, update this paragraph, and if you change the
+    contract, that class is what will tell you.
+    """
+    if lock_depth < 1:
+        raise ValueError(
+            f'same_module_siblings requires lock_depth >= 1; got {lock_depth}. '
+            'At depth < 1 the shared package prefix is empty, so both paths '
+            "normalize to '' and files_to_modules DROPS them entirely — the "
+            'module list is [], not two modules. The callers\' same-module '
+            'precondition would then pass VACUOUSLY on two empty sets while '
+            'the workflow under test holds no module lock at all.'
+        )
+    return _unguarded_sibling_pair(lock_depth)
 
 
 # ---------------------------------------------------------------------------

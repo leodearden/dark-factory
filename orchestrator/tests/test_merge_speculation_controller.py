@@ -1,11 +1,13 @@
-"""Unit tests for orchestrator.merge_speculation_controller (task MQ-refactor
+"""Unit tests for orchestrator.merge_lane.speculation_controller (task MQ-refactor
 theta / 1993).
 
 Steps covered:
   step-1  RED   — SpeculationController initial state + is_idle/take_prefetched/
                   base_for/snapshot
   step-2  GREEN — implement SpeculationController skeleton
-  step-3  RED   — on_dequeue ATTACH/FALLBACK four-condition rule
+  step-3  RED   — on_dequeue: attach to the pending base while its predecessor
+                  is in flight, with the held or a free permit, else fall
+                  back to main
   step-4  GREEN — implement on_dequeue
   step-5  RED   — look-ahead + transfer lifecycle
   step-6  GREEN — implement acquire_for_lookahead/on_lookahead_found/
@@ -13,11 +15,11 @@ Steps covered:
   step-7  RED   — release paths + double-release tolerance
   step-8  GREEN — implement on_abort/on_shutdown
 
-This module intentionally imports orchestrator.merge_speculation_controller
+This module intentionally imports orchestrator.merge_lane.speculation_controller
 LOCALLY inside each test (mirrors test_merge_request_ledger.py's convention)
 so a not-yet-implemented symbol never breaks collection of the rest of the
-file during the RED steps. It imports only orchestrator.merge_types (NOT
-orchestrator.merge_queue) at module scope — SpeculationController has no
+file during the RED steps. It imports only orchestrator.merge_lane.types (NOT
+orchestrator.merge_lane.worker) at module scope — SpeculationController has no
 git/GitOps dependency at all (pure data-structure unit tests), same rationale
 as test_merge_request_ledger.py.
 """
@@ -25,12 +27,19 @@ as test_merge_request_ledger.py.
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 
 import pytest
 
 from orchestrator.config import OrchestratorConfig
-from orchestrator.merge_types import MergeOutcome, MergeRequest, QueuedBranch
+from orchestrator.merge_lane.speculation_controller import (
+    LiveTip,
+    PermitLedger,
+    SpeculationController,
+    fresh_dequeue_offer,
+)
+from orchestrator.merge_lane.types import MergeOutcome, MergeRequest, QueuedBranch
 
 # ---------------------------------------------------------------------------
 # Helpers (per-file duplication convention — see test_merge_request_ledger.py)
@@ -67,12 +76,12 @@ def _make_pending_request(task_id: str = 'pred') -> MergeRequest:
 class TestSpeculationControllerInitialState:
     """SpeculationController initial state (task 1993 step-1).
 
-    RED until step-2 GREEN adds orchestrator.merge_speculation_controller.
+    RED until step-2 GREEN adds orchestrator.merge_lane.speculation_controller.
     """
 
     @pytest.mark.parametrize('depth', [1, 2])
     async def test_initial_state_is_idle_and_empty(self, depth: int) -> None:
-        from orchestrator.merge_speculation_controller import (
+        from orchestrator.merge_lane.speculation_controller import (
             PermitLedger,
             SpeculationController,
         )
@@ -92,7 +101,7 @@ class TestSpeculationControllerInitialState:
     async def test_take_prefetched_returns_none_when_empty_and_stays_idle(
         self, depth: int,
     ) -> None:
-        from orchestrator.merge_speculation_controller import (
+        from orchestrator.merge_lane.speculation_controller import (
             PermitLedger,
             SpeculationController,
         )
@@ -108,7 +117,7 @@ class TestSpeculationControllerInitialState:
     async def test_base_for_returns_actual_main_when_spec_base_is_none(
         self, depth: int,
     ) -> None:
-        from orchestrator.merge_speculation_controller import (
+        from orchestrator.merge_lane.speculation_controller import (
             PermitLedger,
             SpeculationController,
         )
@@ -123,7 +132,7 @@ class TestSpeculationControllerInitialState:
     async def test_snapshot_has_exactly_the_expected_keys_and_initial_values(
         self, depth: int,
     ) -> None:
-        from orchestrator.merge_speculation_controller import (
+        from orchestrator.merge_lane.speculation_controller import (
             PermitLedger,
             SpeculationController,
         )
@@ -153,15 +162,16 @@ class TestSpeculationControllerInitialState:
 
 
 # ---------------------------------------------------------------------------
-# step-3 RED / step-4 GREEN: on_dequeue ATTACH/FALLBACK four-condition rule
+# step-3 RED / step-4 GREEN: on_dequeue attaches to the pending base while its
+# predecessor is in flight, with the held or a free permit, else falls back to main
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
 class TestOnDequeueAttachFallback:
-    """SpeculationController.on_dequeue ATTACH/FALLBACK rule (task 1993 step-3).
-
-    RED until step-4 GREEN implements on_dequeue.
+    """SpeculationController.on_dequeue attaches to the pending base while its
+    predecessor is in flight, with the held or a free permit, else falls back
+    to main (task 1993 step-3; the free permit since task 10851).
     """
 
     async def _seeded_controller(self, depth: int = 1):
@@ -173,7 +183,7 @@ class TestOnDequeueAttachFallback:
         on_lookahead_pending does). Seeding this way keeps this test's only
         RED dependency on the not-yet-implemented `on_dequeue` itself.
         """
-        from orchestrator.merge_speculation_controller import (
+        from orchestrator.merge_lane.speculation_controller import (
             PermitLedger,
             SpeculationController,
         )
@@ -187,25 +197,46 @@ class TestOnDequeueAttachFallback:
         controller.pending_predecessor = pred
         return controller, ledger, pred
 
-    async def test_attach_when_all_four_conditions_hold(self) -> None:
-        controller, ledger, _pred = await self._seeded_controller()
+    async def test_attach_to_a_pending_base_whose_predecessor_is_in_flight(self) -> None:
+        controller, ledger, pred = await self._seeded_controller()
         new_req = _make_pending_request('new')
 
-        result = controller.on_dequeue(new_req)
+        result = controller.on_dequeue(new_req, live_tip=None)
 
-        assert result == 'PRED_SHA'
+        assert result is not None
+        assert result.sha == 'PRED_SHA'
+        assert result.owner is pred
         assert controller.spec_base == 'PRED_SHA'
         assert controller.held_by_merger == 1
         assert ledger.slot_available == 0  # unchanged — permit retained/transferred
         assert controller.pending_spec_base is None
         assert controller.pending_predecessor is None
 
+    async def test_a_pending_base_with_an_in_flight_predecessor_takes_a_free_slot_when_no_permit_is_held(
+        self,
+    ) -> None:
+        controller = await _controller_holding()
+        assert controller.on_transfer() is not None
+        pred = _make_pending_request('pred')
+        controller.on_lookahead_pending('p', pred)
+        before = controller.snapshot()
+
+        result = controller.on_dequeue(_make_pending_request('new'), live_tip=None)
+
+        assert result is not None
+        assert result.sha == 'p'
+        assert result.owner is pred
+        after = controller.snapshot()
+        assert after['spec_base'] == 'p'
+        assert after['held_by_merger'] == 1
+        assert after['slot_available'] == before['slot_available'] - 1
+
     async def test_fallback_when_pending_spec_base_is_none(self) -> None:
         controller, ledger, _pred = await self._seeded_controller()
-        controller.pending_spec_base = None  # break condition (a)
+        controller.pending_spec_base = None  # no pending base
         new_req = _make_pending_request('new')
 
-        result = controller.on_dequeue(new_req)
+        result = controller.on_dequeue(new_req, live_tip=None)
 
         assert result is None
         assert controller.spec_base is None
@@ -214,12 +245,14 @@ class TestOnDequeueAttachFallback:
         assert controller.held_by_merger == 0
         assert ledger.slot_available == 1  # released
 
-    async def test_fallback_when_not_held(self) -> None:
+    async def test_fallback_when_no_permit_is_held_and_no_slot_is_free(self) -> None:
         controller, ledger, _pred = await self._seeded_controller()
-        controller._permit = None  # break condition (b)
+        # The merger holds no permit, and the depth-1 ledger's only slot stays
+        # taken, so no free slot exists.
+        assert controller.on_transfer() is not None
         new_req = _make_pending_request('new')
 
-        result = controller.on_dequeue(new_req)
+        result = controller.on_dequeue(new_req, live_tip=None)
 
         assert result is None
         assert controller.spec_base is None
@@ -230,10 +263,10 @@ class TestOnDequeueAttachFallback:
 
     async def test_fallback_when_pending_predecessor_is_none(self) -> None:
         controller, ledger, _pred = await self._seeded_controller()
-        controller.pending_predecessor = None  # break condition (c)
+        controller.pending_predecessor = None  # no pending predecessor
         new_req = _make_pending_request('new')
 
-        result = controller.on_dequeue(new_req)
+        result = controller.on_dequeue(new_req, live_tip=None)
 
         assert result is None
         assert controller.spec_base is None
@@ -244,10 +277,10 @@ class TestOnDequeueAttachFallback:
 
     async def test_fallback_when_predecessor_already_done(self) -> None:
         controller, ledger, pred = await self._seeded_controller()
-        pred.result.set_result(MergeOutcome('done'))  # break condition (d)
+        pred.result.set_result(MergeOutcome('done'))  # the predecessor resolved
         new_req = _make_pending_request('new')
 
-        result = controller.on_dequeue(new_req)
+        result = controller.on_dequeue(new_req, live_tip=None)
 
         assert result is None
         assert controller.spec_base is None
@@ -273,7 +306,7 @@ class TestLookaheadAndTransferLifecycle:
     """
 
     async def test_acquire_for_lookahead_decrements_slot_and_sets_held(self) -> None:
-        from orchestrator.merge_speculation_controller import (
+        from orchestrator.merge_lane.speculation_controller import (
             PermitLedger,
             SpeculationController,
         )
@@ -290,7 +323,7 @@ class TestLookaheadAndTransferLifecycle:
     async def test_on_lookahead_found_sets_prefetched_and_spec_base_without_releasing(
         self,
     ) -> None:
-        from orchestrator.merge_speculation_controller import (
+        from orchestrator.merge_lane.speculation_controller import (
             PermitLedger,
             SpeculationController,
         )
@@ -310,7 +343,7 @@ class TestLookaheadAndTransferLifecycle:
         assert controller.is_idle() is False
 
     async def test_on_lookahead_pending_retains_permit_for_late_arrival(self) -> None:
-        from orchestrator.merge_speculation_controller import (
+        from orchestrator.merge_lane.speculation_controller import (
             PermitLedger,
             SpeculationController,
         )
@@ -330,7 +363,7 @@ class TestLookaheadAndTransferLifecycle:
         assert controller.is_idle() is False
 
     async def test_on_transfer_clears_held_without_releasing_slot(self) -> None:
-        from orchestrator.merge_speculation_controller import (
+        from orchestrator.merge_lane.speculation_controller import (
             PermitLedger,
             SpeculationController,
         )
@@ -360,7 +393,7 @@ class TestLookaheadAndTransferLifecycle:
         revparse-fail/drop/branch-presence-guard) where the loop `continue`s
         with no subsequent look-ahead call.
         """
-        from orchestrator.merge_speculation_controller import (
+        from orchestrator.merge_lane.speculation_controller import (
             PermitLedger,
             SpeculationController,
         )
@@ -391,7 +424,7 @@ class TestLookaheadAndTransferLifecycle:
         look-ahead ever runs to clean up); after the main-success transfer,
         spec_base is deliberately left for the look-ahead to handle.
         """
-        from orchestrator.merge_speculation_controller import (
+        from orchestrator.merge_lane.speculation_controller import (
             PermitLedger,
             SpeculationController,
         )
@@ -424,7 +457,7 @@ class TestLookaheadAndTransferLifecycle:
         it is never released by the merger side; only the (unexercised here)
         verifier drain would restore it to depth.
         """
-        from orchestrator.merge_speculation_controller import (
+        from orchestrator.merge_lane.speculation_controller import (
             PermitLedger,
             SpeculationController,
         )
@@ -460,7 +493,7 @@ class TestReleasePathsAndDoubleReleaseTolerance:
     """
 
     async def test_on_abort_releases_when_held(self) -> None:
-        from orchestrator.merge_speculation_controller import (
+        from orchestrator.merge_lane.speculation_controller import (
             PermitLedger,
             SpeculationController,
         )
@@ -484,7 +517,7 @@ class TestReleasePathsAndDoubleReleaseTolerance:
         clears spec_base as a pure state-cleanup, just without touching the
         semaphore.
         """
-        from orchestrator.merge_speculation_controller import (
+        from orchestrator.merge_lane.speculation_controller import (
             PermitLedger,
             SpeculationController,
         )
@@ -502,7 +535,7 @@ class TestReleasePathsAndDoubleReleaseTolerance:
         assert controller.held_by_merger == 0
 
     async def test_on_shutdown_releases_and_clears_all_fields_when_held(self) -> None:
-        from orchestrator.merge_speculation_controller import (
+        from orchestrator.merge_lane.speculation_controller import (
             PermitLedger,
             SpeculationController,
         )
@@ -530,7 +563,7 @@ class TestReleasePathsAndDoubleReleaseTolerance:
         assert controller.is_idle() is True
 
     async def test_on_shutdown_is_idempotent_when_already_idle(self) -> None:
-        from orchestrator.merge_speculation_controller import (
+        from orchestrator.merge_lane.speculation_controller import (
             PermitLedger,
             SpeculationController,
         )
@@ -566,7 +599,7 @@ class TestReleasePathsAndDoubleReleaseTolerance:
         is documented-tolerated, not a bug in this controller (see module
         docstring's "Plain-Semaphore double-release tolerance").
         """
-        from orchestrator.merge_speculation_controller import (
+        from orchestrator.merge_lane.speculation_controller import (
             PermitLedger,
             SpeculationController,
         )
@@ -617,7 +650,7 @@ class TestSpeculationControllerLedgerRouting:
     """
 
     def _make_ledger_and_controller(self, depth: int):
-        from orchestrator.merge_speculation_controller import (
+        from orchestrator.merge_lane.speculation_controller import (
             PermitLedger,
             SpeculationController,
         )
@@ -743,7 +776,7 @@ class TestSpeculationControllerLedgerRouting:
         # FALLBACK releases the held permit.
         new_req = _make_pending_request('new')
 
-        controller.on_dequeue(new_req)
+        controller.on_dequeue(new_req, live_tip=None)
 
         assert controller.held_by_merger == 0
         assert ledger.live == frozenset()
@@ -756,3 +789,475 @@ class TestSpeculationControllerLedgerRouting:
         await controller.acquire_for_lookahead()
 
         assert controller.snapshot()['slot_available'] == ledger.slot_available
+
+
+# ---------------------------------------------------------------------------
+# can_coalesce: the retro-coalescing gate (merge-train-coalesce-gate)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestCanCoalesceGate:
+    """``SpeculationController.can_coalesce`` — the gate that replaced
+    ``is_idle()`` at ``merge_queue.py::SpeculativeMergeWorker._merger_loop``'s
+    retro-coalescing call site.
+
+    Regression context: ``is_idle()`` additionally required ``spec_base is
+    None``, and ``_merger_loop`` ends EVERY successful merge with a look-ahead
+    that leaves ``spec_base`` (queue non-empty) or ``pending_spec_base`` (queue
+    dry) set.  ``take_prefetched()`` clears ``prefetched`` but not
+    ``spec_base``, and ``on_dequeue()`` — the only other clearer on the success
+    path — is skipped exactly when a prefetched item was in hand.  So
+    ``is_idle()`` was permanently False while merges kept SUCCEEDING, and the
+    coalescer was reachable only after a merge that produced no merge commit
+    (``on_abort``/``on_transfer_terminal``) or on a worker's sterile first
+    iteration.  Every assertion below states the gate in terms of healthy
+    operation; none of them permits a failed merge as the opener.
+    """
+
+    def _make_ledger_and_controller(self, depth: int):
+        from orchestrator.merge_lane.speculation_controller import (
+            PermitLedger,
+            SpeculationController,
+        )
+
+        ledger = PermitLedger(asyncio.Semaphore(depth), depth)
+        controller = SpeculationController(ledger=ledger, depth=depth)
+        return ledger, controller
+
+    async def test_fresh_controller_is_coalesce_eligible(self) -> None:
+        _, controller = self._make_ledger_and_controller(1)
+
+        assert controller.can_coalesce() is True
+
+    async def test_consumed_prefetch_is_coalesce_eligible_despite_stale_spec_base(
+        self,
+    ) -> None:
+        """THE defect pin.  Replay the merger loop's healthy steady state: a
+        successful merge, a look-ahead that found the next item, then that item
+        being consumed at the top of the following iteration.  ``spec_base``
+        survives (it is the base the consumed item merges against) — and the
+        gate must NOT read that as work in progress.
+
+        The paired ``is_idle()`` assertion is what makes this test fail against
+        the pre-fix behaviour: the old gate saw exactly this state and shut.
+        """
+        _, controller = self._make_ledger_and_controller(1)
+        await controller.acquire_for_lookahead()
+        next_req = _make_pending_request('next')
+        controller.on_lookahead_found(next_req, 'PRED_MERGE_SHA')
+
+        assert controller.take_prefetched() is next_req
+
+        assert controller.spec_base == 'PRED_MERGE_SHA'
+        assert controller.can_coalesce() is True
+        # The condition the old gate tested — and why it never opened.
+        assert controller.is_idle() is False
+
+    async def test_prefetched_item_still_in_hand_is_not_coalesce_eligible(
+        self,
+    ) -> None:
+        """A look-ahead item that has been popped out of the lane buffers but
+        not yet consumed as the loop's ``req`` is invisible to the candidate
+        scan and not yet armed on the request-liveness ledger.  No train may
+        form while it is merely in hand.
+        """
+        _, controller = self._make_ledger_and_controller(1)
+        await controller.acquire_for_lookahead()
+        controller.on_lookahead_found(_make_pending_request('next'), 'SHA')
+
+        assert controller.can_coalesce() is False
+
+    async def test_armed_late_arrival_attach_is_not_coalesce_eligible(self) -> None:
+        """``on_lookahead_pending`` arms a task-1862 ATTACH: the very next
+        dequeue may attach to the predecessor's merge commit.  Gate stays shut
+        while that predecessor is genuinely in flight.
+        """
+        _, controller = self._make_ledger_and_controller(1)
+        await controller.acquire_for_lookahead()
+        predecessor = _make_pending_request('pred')
+        controller.on_lookahead_pending('PRED_MERGE_SHA', predecessor)
+
+        assert predecessor.result.done() is False
+        assert controller.can_coalesce() is False
+
+    async def test_drained_predecessor_reopens_the_gate(self) -> None:
+        """The drained-predecessor relaxation, mirroring ``on_dequeue``'s
+        condition (d): once the predecessor's result Future is done,
+        ``on_dequeue`` would take the FALLBACK branch anyway, so the pending
+        state is vestigial and must not keep the gate shut.
+
+        Note the predecessor drains with a SUCCESSFUL outcome — the gate opens
+        on a healthy merge completing, not on one failing.
+        """
+        _, controller = self._make_ledger_and_controller(1)
+        await controller.acquire_for_lookahead()
+        predecessor = _make_pending_request('pred')
+        controller.on_lookahead_pending('PRED_MERGE_SHA', predecessor)
+        assert controller.can_coalesce() is False
+
+        predecessor.result.set_result(MergeOutcome('done'))
+
+        assert controller.can_coalesce() is True
+
+    async def test_pending_base_without_a_predecessor_is_not_coalesce_eligible(
+        self,
+    ) -> None:
+        """Defensive: ``pending_spec_base`` set with no ``pending_predecessor``
+        is an inconsistent state the controller never produces on its own
+        (the pair is set/cleared in lockstep).  Read it as "attach armed,
+        liveness unknown" and keep the gate shut rather than guessing.
+        """
+        _, controller = self._make_ledger_and_controller(1)
+        controller.pending_spec_base = 'PRED_MERGE_SHA'
+        controller.pending_predecessor = None
+
+        assert controller.can_coalesce() is False
+
+    async def test_gate_opens_every_iteration_of_an_all_successful_run(self) -> None:
+        """The regression this task exists to prevent: NO merge in the
+        sequence fails, and the gate must still be open at each iteration's
+        coalesce point.
+
+        Replays four back-to-back healthy iterations of ``_merger_loop`` with a
+        non-empty queue — merge succeeds, ``on_transfer``, look-ahead finds the
+        next item, next iteration consumes it — and asserts the gate is open
+        every time.  ``on_abort``/``on_transfer_terminal`` (the merge-produced-
+        no-commit paths that were the ONLY openers before the fix) are never
+        called.
+        """
+        ledger, controller = self._make_ledger_and_controller(1)
+        # Iteration 1: sterile start — the one case that used to work.
+        assert controller.can_coalesce() is True
+
+        for i in range(4):
+            # merge succeeded → hand the item to the verifier
+            transferred = controller.on_transfer()
+            if transferred is not None:
+                # Stand in for the verifier draining the speculative item and
+                # releasing its permit — without this the depth-1 slot is never
+                # returned and the look-ahead below blocks forever.
+                ledger.release(transferred)
+            # → look-ahead, queue non-empty
+            await controller.acquire_for_lookahead()
+            controller.on_lookahead_found(
+                _make_pending_request(f'next{i}'), f'MERGE_SHA_{i}',
+            )
+            # → next iteration consumes the prefetched item
+            assert controller.take_prefetched() is not None
+            assert controller.can_coalesce() is True, (
+                f'gate shut at iteration {i + 2} of an all-successful run '
+                f'(spec_base={controller.spec_base!r}) — the coalescer is '
+                f'reachable only when merges FAIL'
+            )
+            assert controller.is_idle() is False
+
+
+# ---------------------------------------------------------------------------
+# task 8524: the merger is re-anchored when a base it holds dies
+# (plans/merge-lane-policy-prd.md D2)
+# ---------------------------------------------------------------------------
+
+
+async def _controller_holding(depth: int = 2) -> SpeculationController:
+    controller = SpeculationController(PermitLedger(asyncio.Semaphore(depth), depth), depth)
+    await controller.acquire_for_lookahead()
+    return controller
+
+
+async def _state_a() -> SpeculationController:
+    """A look-ahead found the next request stacked on 'sha-dead'."""
+    controller = await _controller_holding()
+    controller.on_lookahead_found(_make_pending_request('next'), 'sha-dead')
+    return controller
+
+
+async def _state_b() -> SpeculationController:
+    """The merger took the prefetched request and is mid-iteration."""
+    controller = await _state_a()
+    assert controller.take_prefetched() is not None
+    return controller
+
+
+async def _pending_state() -> SpeculationController:
+    """Nothing pickable yet; a late ATTACH onto 'sha-dead' is armed."""
+    controller = await _controller_holding()
+    controller.on_lookahead_pending('sha-dead', _make_pending_request('pred'))
+    return controller
+
+
+_State = Callable[[], Awaitable[SpeculationController]]
+
+
+def _tip() -> LiveTip:
+    """The live frontier tip 't', owned by the in-flight request 'tip-owner'."""
+    return LiveTip('t', _make_pending_request('tip-owner'))
+
+
+@pytest.mark.asyncio
+class TestOnBaseInvalidated:
+    """``on_base_invalidated(dead_sha, live_tip)`` re-points or lets go; it
+    never acquires (task 8524)."""
+
+    @pytest.mark.parametrize('state', [_state_a, _state_b, _pending_state])
+    async def test_holds_base_names_only_the_held_commit(self, state: _State) -> None:
+        controller = await state()
+
+        assert controller.holds_base(' sha-dead ')
+        assert not controller.holds_base('sha-other')
+        assert not controller.holds_base('')
+
+    async def test_state_a_re_points_onto_the_live_tip(self) -> None:
+        controller = await _state_a()
+        before = controller.snapshot()
+
+        controller.on_base_invalidated('sha-dead', _tip())
+
+        after = controller.snapshot()
+        assert after['spec_base'] == 't'
+        assert after['held_by_merger'] == 1
+        assert after['slot_available'] == before['slot_available']
+
+    async def test_state_a_falls_back_with_no_live_tip(self) -> None:
+        controller = await _state_a()
+        before = controller.snapshot()
+
+        controller.on_base_invalidated('sha-dead', None)
+
+        after = controller.snapshot()
+        assert after['spec_base'] is None
+        assert after['held_by_merger'] == 0
+        assert after['slot_available'] == before['slot_available'] + 1
+        assert after['prefetched_task_id'] == 'next'
+
+    async def test_mid_iteration_with_no_live_tip_leaves_base_and_permit(self) -> None:
+        controller = await _state_b()
+        before = controller.snapshot()
+
+        controller.on_base_invalidated('sha-dead', None)
+
+        assert controller.snapshot() == before
+        assert before['spec_base'] == 'sha-dead'
+        assert before['held_by_merger'] == 1
+
+    async def test_mid_iteration_re_points_onto_the_live_tip(self) -> None:
+        controller = await _state_b()
+
+        controller.on_base_invalidated('sha-dead', _tip())
+
+        assert controller.snapshot()['spec_base'] == 't'
+        assert controller.snapshot()['held_by_merger'] == 1
+
+    async def test_pending_attach_re_points_onto_the_live_tip_and_its_owner(self) -> None:
+        controller = await _pending_state()
+        before = controller.snapshot()
+
+        controller.on_base_invalidated('sha-dead', _tip())
+
+        after = controller.snapshot()
+        assert after['pending_spec_base'] == 't'
+        assert after['pending_predecessor_task_id'] == 'tip-owner'
+        assert after['held_by_merger'] == 1
+        assert after['slot_available'] == before['slot_available']
+
+    async def test_pending_attach_is_dropped_with_no_live_tip(self) -> None:
+        controller = await _pending_state()
+        before = controller.snapshot()
+
+        controller.on_base_invalidated('sha-dead', None)
+
+        after = controller.snapshot()
+        assert after['pending_spec_base'] is None
+        assert after['pending_predecessor_task_id'] is None
+        assert after['held_by_merger'] == 0
+        assert after['slot_available'] == before['slot_available'] + 1
+
+    async def test_the_next_dequeue_after_a_dropped_attach_releases_nothing(self) -> None:
+        controller = await _pending_state()
+        controller.on_base_invalidated('sha-dead', None)
+        before = controller.snapshot()
+
+        assert controller.on_dequeue(_make_pending_request('late'), live_tip=None) is None
+
+        assert controller.snapshot()['slot_available'] == before['slot_available']
+        assert controller.snapshot()['held_by_merger'] == 0
+
+    @pytest.mark.parametrize('state', [_state_a, _state_b, _pending_state])
+    async def test_an_unrelated_sha_changes_nothing(self, state: _State) -> None:
+        controller = await state()
+        before = controller.snapshot()
+
+        controller.on_base_invalidated('sha-other', None)
+        controller.on_base_invalidated('sha-other', _tip())
+
+        assert controller.snapshot() == before
+
+    @pytest.mark.parametrize('state', [_state_a, _pending_state])
+    async def test_a_repeat_call_releases_nothing_more(self, state: _State) -> None:
+        controller = await state()
+        controller.on_base_invalidated('sha-dead', None)
+        once = controller.snapshot()
+
+        controller.on_base_invalidated('sha-dead', None)
+
+        assert controller.snapshot() == once
+
+    @pytest.mark.parametrize('state', [_state_a, _state_b, _pending_state])
+    @pytest.mark.parametrize('has_tip', [True, False])
+    async def test_never_acquires(self, state: _State, has_tip: bool) -> None:
+        controller = await state()
+        before = controller.snapshot()['slot_available']
+        live_tip = _tip() if has_tip else None
+
+        controller.on_base_invalidated('sha-dead', live_tip)
+        controller.on_base_invalidated('sha-dead', live_tip)
+
+        assert controller.snapshot()['slot_available'] >= before
+
+
+# ---------------------------------------------------------------------------
+# task 10851: a fresh dequeue stacks on the live frontier tip the worker passes
+# ---------------------------------------------------------------------------
+
+
+def _fresh_controller(depth: int = 2) -> SpeculationController:
+    return SpeculationController(PermitLedger(asyncio.Semaphore(depth), depth), depth)
+
+
+async def _pending_on(sha: str, predecessor: MergeRequest) -> SpeculationController:
+    """A permit held and a late ATTACH onto *sha* armed, owned by *predecessor*."""
+    controller = await _controller_holding()
+    controller.on_lookahead_pending(sha, predecessor)
+    return controller
+
+
+@pytest.mark.asyncio
+class TestOnDequeueStacksOnTheLiveTip:
+    """``on_dequeue(req, live_tip=...)`` attaches to the pending base, else
+    stacks on the live tip, with the held or a free permit; it never waits."""
+
+    async def test_a_free_slot_is_taken_to_stack_on_the_live_tip(self) -> None:
+        controller = _fresh_controller()
+        tip = _tip()
+        before = controller.snapshot()
+
+        result = controller.on_dequeue(_make_pending_request('fresh'), live_tip=tip)
+
+        assert result is not None
+        assert result.sha == 't'
+        assert result.owner is tip.owner
+        after = controller.snapshot()
+        assert after['spec_base'] == 't'
+        assert after['held_by_merger'] == 1
+        assert after['slot_available'] == before['slot_available'] - 1
+
+    async def test_the_held_permit_is_kept_when_the_pending_predecessor_resolved(self) -> None:
+        predecessor = _make_pending_request('pred')
+        controller = await _pending_on('p', predecessor)
+        predecessor.result.set_result(MergeOutcome('done'))
+        before = controller.snapshot()
+
+        result = controller.on_dequeue(_make_pending_request('fresh'), live_tip=_tip())
+
+        assert result is not None
+        assert result.sha == 't'
+        after = controller.snapshot()
+        assert after['spec_base'] == 't'
+        assert after['held_by_merger'] == 1
+        assert after['slot_available'] == before['slot_available']
+
+    async def test_with_no_free_slot_it_merges_on_main(self) -> None:
+        ledger = PermitLedger(asyncio.Semaphore(1), 1)
+        await ledger.acquire()
+        controller = SpeculationController(ledger, 1)
+        before = controller.snapshot()
+
+        assert controller.on_dequeue(_make_pending_request('fresh'), live_tip=_tip()) is None
+
+        after = controller.snapshot()
+        assert after['spec_base'] is None
+        assert after['held_by_merger'] == 0
+        assert after['slot_available'] == before['slot_available']
+
+    async def test_a_live_tip_whose_owner_resolved_is_not_stacked_on(self) -> None:
+        controller = _fresh_controller()
+        tip = _tip()
+        tip.owner.result.set_result(MergeOutcome('done'))
+        before = controller.snapshot()
+
+        assert controller.on_dequeue(_make_pending_request('fresh'), live_tip=tip) is None
+
+        after = controller.snapshot()
+        assert after['spec_base'] is None
+        assert after['held_by_merger'] == 0
+        assert after['slot_available'] == before['slot_available']
+
+    async def test_a_pending_base_with_an_in_flight_predecessor_beats_the_live_tip(
+        self,
+    ) -> None:
+        predecessor = _make_pending_request('pred')
+        controller = await _pending_on('p', predecessor)
+
+        result = controller.on_dequeue(_make_pending_request('fresh'), live_tip=_tip())
+
+        assert result is not None
+        assert result.sha == 'p'
+        assert result.owner is predecessor
+        assert controller.snapshot()['spec_base'] == 'p'
+
+    async def test_a_fresh_arrival_after_an_attach_that_built_nothing_stacks_on_the_head(
+        self,
+    ) -> None:
+        """Y attaches to H's commit and ends terminal; X, dequeued next, still
+        stacks on H while H is in flight."""
+        head = _make_pending_request('H')
+        live_head = LiveTip('h', head)
+        controller = await _pending_on('h', head)
+
+        attached = controller.on_dequeue(_make_pending_request('Y'), live_tip=live_head)
+        assert attached is not None
+        assert attached.sha == 'h'
+        assert controller.on_transfer_terminal() is not None
+
+        result = controller.on_dequeue(_make_pending_request('X'), live_tip=live_head)
+
+        assert result is not None
+        assert result.sha == 'h'
+        assert controller.snapshot()['held_by_merger'] == 1
+
+
+# ---------------------------------------------------------------------------
+# task 10851: the base the worker offers a fresh dequeue
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestFreshDequeueOffer:
+    """``fresh_dequeue_offer(newest_build, dead, frozen_tip)`` offers the
+    merger's newest build awaiting dispatch, else the frozen-prefix tip, and
+    nothing while that build's commit is empty or dead."""
+
+    async def test_with_no_build_awaiting_dispatch_the_frozen_tip_is_offered(self) -> None:
+        frozen = _tip()
+
+        assert fresh_dequeue_offer(None, frozenset(), frozen) is frozen
+
+    async def test_with_no_build_and_no_live_frozen_tip_nothing_is_offered(self) -> None:
+        assert fresh_dequeue_offer(None, frozenset(), None) is None
+
+    async def test_a_live_build_is_offered_ahead_of_the_frozen_tip(self) -> None:
+        build = LiveTip('m', _make_pending_request('M'))
+
+        assert fresh_dequeue_offer(build, frozenset({'older-dead'}), _tip()) is build
+
+    async def test_a_dead_build_offers_nothing_though_the_frozen_tip_is_live(self) -> None:
+        build = LiveTip('m', _make_pending_request('M'))
+
+        assert fresh_dequeue_offer(build, frozenset({'m'}), _tip()) is None
+
+    async def test_a_build_with_no_commit_offers_nothing_though_the_frozen_tip_is_live(
+        self,
+    ) -> None:
+        build = LiveTip('', _make_pending_request('M'))
+
+        assert fresh_dequeue_offer(build, frozenset(), _tip()) is None

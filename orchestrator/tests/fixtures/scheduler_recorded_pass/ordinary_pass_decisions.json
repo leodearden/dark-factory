@@ -1,0 +1,284 @@
+{
+ "overrides": {
+  "9012": {
+   "boost_tier": "high",
+   "pin_order": null,
+   "pinned": false,
+   "reserve_now": false,
+   "source": "operator",
+   "ttl_until": null
+  },
+  "9013": {
+   "boost_tier": null,
+   "pin_order": 1,
+   "pinned": true,
+   "reserve_now": false,
+   "source": "operator",
+   "ttl_until": null
+  }
+ },
+ "passes": [
+  {
+   "assignment": {
+    "modules": [
+     "task-9013"
+    ],
+    "task_id": "9013"
+   },
+   "callbacks": [],
+   "events": [
+    {
+     "data": {
+      "ages_secs": {},
+      "escalation_ids": {
+       "dead_l0": [],
+       "non_pinning": [],
+       "queue_handoff": []
+      },
+      "reason": "escalation_store_unavailable",
+      "shape": "unknown|unknown|unknown|unknown|-",
+      "site": "scheduler_blocked_redispatch",
+      "store_unavailable": true,
+      "streak": 1,
+      "task_id": null
+     },
+     "task_id": null,
+     "type": "recovery_left"
+    },
+    {
+     "data": {
+      "detail": {
+       "dep_id": "9003",
+       "kind": "grep",
+       "main_sha": "b778eca4a05aa6c3fa0d5bfb56bde89df460e668",
+       "name": "missing"
+      },
+      "ticks": 1
+     },
+     "task_id": "9004",
+     "type": "delivered_check_gate_held"
+    },
+    {
+     "data": {
+      "modules": [
+       "task-9013"
+      ],
+      "priority": "medium"
+     },
+     "task_id": "9013",
+     "type": "lock_acquired"
+    }
+   ],
+   "writes": []
+  },
+  {
+   "assignment": {
+    "modules": [
+     "task-4737"
+    ],
+    "task_id": "4737"
+   },
+   "callbacks": [
+    {
+     "callback": "on_external_dep_block",
+     "category": "dependency_discovered",
+     "summary": "EXTERNAL_DEP_UNRESOLVED: task 9006 \u2014 dep 'elsewhere:1' unresolvable for 2 ticks (status='unknown_task')",
+     "task_id": "9006"
+    },
+    {
+     "callback": "on_delivered_check_block",
+     "category": "dependency_capability",
+     "summary": "DEP_CAPABILITY_NOT_DELIVERED: task 9004 \u2014 dep 9003 done but check 'missing' fails on main@b778eca4a05a",
+     "task_id": "9004"
+    }
+   ],
+   "events": [
+    {
+     "data": {
+      "modules": [
+       "task-4737"
+      ],
+      "priority": "critical"
+     },
+     "task_id": "4737",
+     "type": "lock_acquired"
+    }
+   ],
+   "writes": []
+  },
+  {
+   "assignment": {
+    "modules": [
+     "task-6659"
+    ],
+    "task_id": "6659"
+   },
+   "callbacks": [],
+   "events": [
+    {
+     "data": {
+      "detail": {
+       "dep_id": "9003",
+       "kind": "grep",
+       "main_sha": "b778eca4a05aa6c3fa0d5bfb56bde89df460e668",
+       "name": "missing"
+      },
+      "ticks": 1
+     },
+     "task_id": "9004",
+     "type": "delivered_check_gate_held"
+    },
+    {
+     "data": {
+      "modules": [
+       "task-6659"
+      ],
+      "priority": "critical"
+     },
+     "task_id": "6659",
+     "type": "lock_acquired"
+    }
+   ],
+   "writes": []
+  },
+  {
+   "assignment": {
+    "modules": [
+     "task-9002"
+    ],
+    "task_id": "9002"
+   },
+   "callbacks": [
+    {
+     "callback": "on_external_dep_block",
+     "category": "dependency_discovered",
+     "summary": "EXTERNAL_DEP_UNRESOLVED: task 9006 \u2014 dep 'elsewhere:1' unresolvable for 2 ticks (status='unknown_task')",
+     "task_id": "9006"
+    },
+    {
+     "callback": "on_delivered_check_block",
+     "category": "dependency_capability",
+     "summary": "DEP_CAPABILITY_NOT_DELIVERED: task 9004 \u2014 dep 9003 done but check 'missing' fails on main@b778eca4a05a",
+     "task_id": "9004"
+    }
+   ],
+   "events": [
+    {
+     "data": {
+      "modules": [
+       "task-9002"
+      ],
+      "priority": "critical"
+     },
+     "task_id": "9002",
+     "type": "lock_acquired"
+    }
+   ],
+   "writes": []
+  }
+ ],
+ "task_priority": {
+  "9001": {
+   "base_tier": null,
+   "pin_order": null,
+   "pinned": false,
+   "tier": null
+  },
+  "9002": {
+   "base_tier": "critical",
+   "pin_order": null,
+   "pinned": false,
+   "tier": "critical"
+  },
+  "9003": {
+   "base_tier": null,
+   "pin_order": null,
+   "pinned": false,
+   "tier": null
+  },
+  "9004": {
+   "base_tier": "critical",
+   "pin_order": null,
+   "pinned": false,
+   "tier": "critical"
+  },
+  "9005": {
+   "base_tier": "high",
+   "pin_order": null,
+   "pinned": false,
+   "tier": "high"
+  },
+  "9006": {
+   "base_tier": "critical",
+   "pin_order": null,
+   "pinned": false,
+   "tier": "critical"
+  },
+  "9007": {
+   "base_tier": "high",
+   "pin_order": null,
+   "pinned": false,
+   "tier": "high"
+  },
+  "9008": {
+   "base_tier": null,
+   "pin_order": null,
+   "pinned": false,
+   "tier": null
+  },
+  "9009": {
+   "base_tier": "high",
+   "pin_order": null,
+   "pinned": false,
+   "tier": "high"
+  },
+  "9010": {
+   "base_tier": "high",
+   "pin_order": null,
+   "pinned": false,
+   "tier": "high"
+  },
+  "9011": {
+   "base_tier": "high",
+   "pin_order": null,
+   "pinned": false,
+   "tier": "high"
+  },
+  "9012": {
+   "base_tier": "high",
+   "pin_order": null,
+   "pinned": false,
+   "tier": "high"
+  },
+  "9013": {
+   "base_tier": "medium",
+   "pin_order": 1,
+   "pinned": true,
+   "tier": "pinned"
+  },
+  "9015": {
+   "base_tier": "low",
+   "pin_order": null,
+   "pinned": false,
+   "tier": "low"
+  },
+  "9016": {
+   "base_tier": "medium",
+   "pin_order": null,
+   "pinned": false,
+   "tier": "medium"
+  },
+  "9017": {
+   "base_tier": null,
+   "pin_order": null,
+   "pinned": false,
+   "tier": null
+  },
+  "9018": {
+   "base_tier": "low",
+   "pin_order": null,
+   "pinned": false,
+   "tier": "low"
+  }
+ }
+}

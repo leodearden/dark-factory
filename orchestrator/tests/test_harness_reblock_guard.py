@@ -26,8 +26,9 @@ from _orch_helpers import HermeticMcpSession, _init_harness_state_for_test
 import orchestrator.harness as harness_module
 from orchestrator.config import OrchestratorConfig
 from orchestrator.harness import Harness
-from orchestrator.merge_queue import InFlightMergeRegistry
+from orchestrator.merge_lane.worker import InFlightMergeRegistry
 from orchestrator.scheduler import Scheduler, TaskAssignment
+from orchestrator.slot_lease import SlotLease
 from orchestrator.workflow import WorkflowOutcome
 
 
@@ -64,6 +65,8 @@ def _make_harness(config: OrchestratorConfig, scheduler: Scheduler) -> Harness:
     harness._merge_queue = asyncio.Queue()
     harness._merge_worker = None
     harness._merge_inflight_registry = InFlightMergeRegistry()
+    harness._task_verify_dispatcher = MagicMock()
+    harness._verify_cache = MagicMock()
     harness.event_store = None
     harness.cost_store = None
     harness._run_id = 'run-test'
@@ -120,7 +123,7 @@ class TestSlotSetupFailureReblockGuard:
         )
         sem = asyncio.Semaphore(1)
 
-        result = await harness._run_slot(assignment, sem)
+        result = await harness._run_slot(assignment, SlotLease(assignment.task_id, harness.scheduler, sem))
 
         # _run_slot returns a synthetic BLOCKED report on unhandled slot exception.
         assert result is not None
@@ -166,7 +169,7 @@ class TestSlotSetupFailureReblockGuard:
         )
         sem = asyncio.Semaphore(1)
 
-        result = await harness._run_slot(assignment, sem)
+        result = await harness._run_slot(assignment, SlotLease(assignment.task_id, harness.scheduler, sem))
 
         # _run_slot returns a synthetic CANCELLED report on hard-cancel.
         assert result is not None

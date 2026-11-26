@@ -14,6 +14,7 @@ from typing import cast
 
 import pytest
 import yaml
+from _code_default_hatch import require_code_default_config
 from click.testing import CliRunner
 from pydantic import ValidationError
 from shared.cli_invoke import AgentResult
@@ -30,8 +31,10 @@ from orchestrator.config import (
     UnblockAutoConfig,
     apply_reload,
 )
+from orchestrator.evals.reviewer_trial.variants import VARIANT_FABLE51_SOLO
 from orchestrator.routing import (
     DEFAULT_ALLOWED_MODELS,
+    DEFAULT_PROBE_BUDGET_USD,
     FABLE_CANDIDATE_MODEL,
     ProbeReport,
     probe_models,
@@ -39,46 +42,36 @@ from orchestrator.routing import (
 )
 
 
+@pytest.mark.usefixtures("code_default_config")
 class TestRoutingConfigDefaults:
     """RoutingConfig is attached to OrchestratorConfig with the routing.py
     allowlist default (mirrors the ModelsConfig/PsiAdmissionConfig submodel
     pattern, config.py:141/473)."""
 
-    def test_default_allowed_models_attached_on_orchestrator_config(
-        self, monkeypatch, tmp_path
-    ):
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+    def test_default_allowed_models_attached_on_orchestrator_config(self):
         cfg = OrchestratorConfig()
         assert isinstance(cfg.routing, RoutingConfig)
         assert cfg.routing.allowed_models == list(DEFAULT_ALLOWED_MODELS)
 
 
+@pytest.mark.usefixtures("code_default_config")
 class TestAllowlistFailFastValidation:
     """A configured model string outside routing.allowed_models must raise a
     structured, field-named pydantic.ValidationError at load (mirrors
     _validate_steward_timeout_invariant, config.py:2633)."""
 
-    def test_model_outside_allowlist_raises_naming_field_and_value(
-        self, monkeypatch, tmp_path
-    ):
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+    def test_model_outside_allowlist_raises_naming_field_and_value(self):
         with pytest.raises(ValidationError) as exc_info:
             OrchestratorConfig(models=ModelsConfig(architect='sonnett'))
         message = str(exc_info.value)
         assert 'architect' in message
         assert 'sonnett' in message
 
-    def test_all_in_allowlist_config_constructs_ok(self, monkeypatch, tmp_path):
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+    def test_all_in_allowlist_config_constructs_ok(self):
         cfg = OrchestratorConfig(models=ModelsConfig(architect='haiku'))
         assert cfg.models.architect == 'haiku'
 
-    def test_unblock_auto_model_outside_allowlist_raises(self, monkeypatch, tmp_path):
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+    def test_unblock_auto_model_outside_allowlist_raises(self):
         with pytest.raises(ValidationError) as exc_info:
             OrchestratorConfig(unblock_auto=UnblockAutoConfig(model='bogus-model-9'))
         message = str(exc_info.value)
@@ -86,16 +79,13 @@ class TestAllowlistFailFastValidation:
         assert 'bogus-model-9' in message
 
 
+@pytest.mark.usefixtures("code_default_config")
 class TestNonClaudeBackendScopeBoundary:
     """The allowlist validator is SCOPED to claude-backend roles: a role
     running on a non-claude backend (the harness-backend axis) must never be
     rejected against the claude-centric allowlist."""
 
-    def test_non_claude_backend_model_is_not_checked_against_allowlist(
-        self, monkeypatch, tmp_path
-    ):
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+    def test_non_claude_backend_model_is_not_checked_against_allowlist(self):
         cfg = OrchestratorConfig(
             backends=BackendsConfig(reviewer='gemini'),
             models=ModelsConfig(reviewer='gemini-2.5-pro'),
@@ -116,12 +106,11 @@ class TestRoutingAllowlistReloadDisposition:
             f'missing from RELOADABLE_FIELDS'
         )
 
-    def test_widening_allowlist_applies(self, monkeypatch, tmp_path):
+    @pytest.mark.usefixtures("code_default_config")
+    def test_widening_allowlist_applies(self):
         """A reload that WIDENS routing.allowed_models (adds back a model
         already in use) applies cleanly: reloaded=True, the leaf lands in
         applied, live is updated in place."""
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         # module_tagger defaults to 'haiku' (task 2540 flip); pin it to an
         # already-allowed model in `live` so this config -- whose allowlist
         # deliberately omits 'haiku' before the widening reload -- is valid.
@@ -141,9 +130,8 @@ class TestRoutingAllowlistReloadDisposition:
         }
         assert live.routing.allowed_models == ['haiku', 'sonnet', 'opus']
 
-    def test_tightening_allowlist_below_in_use_model_rolls_back(
-        self, monkeypatch, tmp_path
-    ):
+    @pytest.mark.usefixtures("code_default_config")
+    def test_tightening_allowlist_below_in_use_model_rolls_back(self):
         """I5 hybrid-invariant rollback for the NEW cross-field invariant
         (_validate_models_in_allowlist), mirroring
         TestApplyReloadHybridRollback in test_config.py.
@@ -157,8 +145,6 @@ class TestRoutingAllowlistReloadDisposition:
         unit level via the injectable `allowlist` param, exactly like the
         steward-timeout precedent.
         """
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         # live is valid on its own: architect='opus' is in ['haiku','sonnet','opus'].
         live = OrchestratorConfig(
             models=ModelsConfig(architect='opus'),
@@ -192,9 +178,8 @@ class TestRoutingAllowlistReloadDisposition:
         assert live.routing.allowed_models == ['haiku', 'sonnet', 'opus']
         assert live.models.architect == 'opus'
 
-    def test_typo_in_fresh_config_fails_closed_before_apply_reload_is_reached(
-        self, monkeypatch, tmp_path
-    ):
+    @pytest.mark.usefixtures("code_default_config")
+    def test_typo_in_fresh_config_fails_closed_before_apply_reload_is_reached(self):
         """The 'typo'd model reload returns a structured error naming the
         field' user-observable signal (PRD boundary-test-11 shape).
 
@@ -211,8 +196,6 @@ class TestRoutingAllowlistReloadDisposition:
         the {reloaded: False, error: ...} shape via a bare try/except; that
         wrapping is exercised by that module's own tests, not re-tested here.
         """
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         with pytest.raises(ValidationError) as exc_info:
             OrchestratorConfig(models=ModelsConfig(architect='sonnett'))
         assert 'architect' in str(exc_info.value)
@@ -260,10 +243,10 @@ class _ScriptedProbeCli:
 
 class TestProbeModelsTargetSet:
     """The probe's default target model set is dedup(allowed_models +
-    [claude-fable-5]), order-preserving -- fable is probed even though it is
-    NOT admitted to the runtime allowlist (task beta is the G3 gate that
-    produces the fable-availability data task xi's admission gate later
-    consumes; see this task's plan design_decisions)."""
+    [FABLE_CANDIDATE_MODEL]), order-preserving -- so the fable candidate is
+    exercised even where a config has not admitted it, and exactly once
+    where a config has. The artifact this produces is the per-(account,
+    model) availability evidence an admission decision consumes."""
 
     def test_default_target_set_is_allowed_models_plus_fable(self):
         accounts = [AccountConfig(name='max-x', oauth_token_env='MAX_X_TOKEN')]
@@ -290,6 +273,64 @@ class TestProbeModelsTargetSet:
 
         assert report.models == ['opus']
         assert {call['model'] for call in cli.calls} == {'opus'}
+
+    def test_fable_candidate_tracks_the_admitted_model_and_is_dispatched(self):
+        """The fable constant must track whatever string admission actually
+        NAMES -- the defect class this task exists to close, since a constant
+        that drifts away from admission silently probes a model nobody is
+        deciding about.
+
+        So the assertion is REFERENTIAL, against the live eval arm the
+        admission ruling dispatches
+        (``orchestrator.evals.reviewer_trial.variants::VARIANT_FABLE51_SOLO``):
+        it survives a future rename of the model string and fails the moment
+        either side moves without the other.
+
+        No verbatim ``== 'claude-fable-5-1'`` pin accompanies it. Against a
+        constant with a single definition such a pin is tautological -- it
+        compares the constant to a copy of its own definition, so it cannot
+        fail on a regression and only fires on a deliberate rename that must
+        edit the test in lockstep anyway. That lockstep edit is precisely how
+        the constant went stale the first time, so the literal would document
+        the drift rather than catch it.
+        """
+        assert VARIANT_FABLE51_SOLO.reviewers[0].model == FABLE_CANDIDATE_MODEL
+
+        accounts = [AccountConfig(name='max-x', oauth_token_env='MAX_X_TOKEN')]
+        cli = _ScriptedProbeCli()
+
+        report = asyncio.run(probe_models(
+            accounts, ['haiku', 'sonnet'],
+            invoke_fn=cli,
+            token_resolver={'MAX_X_TOKEN': 'tok-x'}.get,
+        ))
+
+        assert report.models == ['haiku', 'sonnet', 'claude-fable-5-1']
+        # Genuinely dispatched, not merely listed in report.models.
+        assert 'claude-fable-5-1' in {call['model'] for call in cli.calls}
+
+    def test_config_that_already_admits_the_candidate_gets_no_phantom_row(self):
+        """A config whose allowlist already carries the candidate must be
+        probed for it exactly once -- _dedup_preserve_order collapses the
+        union to a no-op.
+
+        WHY this is asserted: while the constant is stale, this same call
+        yields a FIFTH trailing entry that every account probes as
+        'unavailable', writing a phantom always-red row into the committed
+        artifact -- re-telling the very lie this task exists to stop. The
+        allowlist below is dark-factory's own live one
+        (dark-factory-orchestrator.yaml, routing.allowed_models).
+        """
+        accounts = [AccountConfig(name='max-x', oauth_token_env='MAX_X_TOKEN')]
+        cli = _ScriptedProbeCli()
+
+        report = asyncio.run(probe_models(
+            accounts, ['haiku', 'sonnet', 'opus', 'claude-fable-5-1'],
+            invoke_fn=cli,
+            token_resolver={'MAX_X_TOKEN': 'tok-x'}.get,
+        ))
+
+        assert report.models == ['haiku', 'sonnet', 'opus', 'claude-fable-5-1']
 
 
 class TestProbeModelsStatusMappingAndDispatch:
@@ -343,11 +384,135 @@ class TestProbeModelsStatusMappingAndDispatch:
         assert report.accounts['max-y']['sonnet'] == 'capped'
         assert report.accounts['max-y'][FABLE_CANDIDATE_MODEL] == 'error'
 
-        # accounts (2) x models (haiku, sonnet, claude-fable-5 = 3) == 6.
+        # accounts (2) x models (haiku, sonnet, the fable candidate = 3) == 6.
         assert len(cli.calls) == 6
         for call in cli.calls:
             assert call['model'] in {'haiku', 'sonnet', FABLE_CANDIDATE_MODEL}
             assert call['oauth_token'] in {'tok-x', 'tok-y'}
+
+
+class TestProbeModelsBudgetExhaustion:
+    """A probe turn aborted by the local ``--max-budget-usd`` ceiling records
+    the distinct ``'budget_too_low'`` status, never the generic ``'error'``.
+
+    WHY the budget subtype outranks the catch-all: an
+    ``error_max_budget_usd`` result is positive, structured evidence that
+    the Anthropic API ACCEPTED the request and consumed real tokens --
+    exactly the semantics ``shared/src/shared/usage_gate.py::
+    _probe_hit_local_budget_cap`` already states. So the model string DID
+    resolve for that account and the account was live; only the probe's own
+    ceiling stopped the turn. Letting it fall through to the unclassified
+    catch-all is the defect: a mis-sized budget then masquerades as
+    unavailability and the committed artifact reports a model broken on
+    every account when it is in fact present.
+    """
+
+    def test_budget_abort_is_budget_too_low_and_leaves_the_catch_all_intact(self):
+        accounts = [AccountConfig(name='max-x', oauth_token_env='MAX_X_TOKEN')]
+        overrides: dict[tuple[str, str], AgentResult | BaseException | type[BaseException]] = {
+            ('sonnet', 'tok-x'): AgentResult(
+                success=False, subtype='error_max_budget_usd', output='',
+                turns=1, cost_usd=0.05,
+            ),
+            # Classifies to Failure(kind='unclassified') -- the generic
+            # 'error' branch, asserted in the SAME run so the new budget
+            # branch is shown to narrow nothing.
+            (FABLE_CANDIDATE_MODEL, 'tok-x'): AgentResult(
+                success=False, output='something unexpected went wrong',
+            ),
+        }
+        cli = _ScriptedProbeCli(overrides)
+
+        report = asyncio.run(probe_models(
+            accounts, ['haiku', 'sonnet'],
+            invoke_fn=cli,
+            token_resolver={'MAX_X_TOKEN': 'tok-x'}.get,
+        ))
+
+        assert report.accounts['max-x']['sonnet'] == 'budget_too_low'
+        assert report.accounts['max-x'][FABLE_CANDIDATE_MODEL] == 'error'
+        # Unscripted -> the fake's default success: an ordinary probe is
+        # untouched by the new branch.
+        assert report.accounts['max-x']['haiku'] == 'available'
+
+    def test_budget_abort_outranks_a_cap_like_body(self):
+        """Precedence is evidence-based, not incidental ordering: a result
+        carrying BOTH the budget subtype AND a body that reads like an
+        account-level cap hit still records 'budget_too_low'.
+
+        The local ``--max-budget-usd`` ceiling firing is NOT an account cap
+        -- the distinction ``_probe_hit_local_budget_cap`` draws -- so the
+        structured subtype must outrank every string heuristic below it,
+        including the cap tier.
+        """
+        accounts = [AccountConfig(name='max-x', oauth_token_env='MAX_X_TOKEN')]
+        overrides: dict[tuple[str, str], AgentResult | BaseException | type[BaseException]] = {
+            ('sonnet', 'tok-x'): AgentResult(
+                success=False, subtype='error_max_budget_usd',
+                output="You've hit your usage limit. Your plan resets in 3h.",
+                turns=1, cost_usd=0.05,
+            ),
+        }
+        cli = _ScriptedProbeCli(overrides)
+
+        report = asyncio.run(probe_models(
+            accounts, ['sonnet'],
+            models=['sonnet'],
+            invoke_fn=cli,
+            token_resolver={'MAX_X_TOKEN': 'tok-x'}.get,
+        ))
+
+        assert report.accounts['max-x']['sonnet'] == 'budget_too_low'
+
+
+class TestProbeModelsBudgetForwarding:
+    """The per-invocation budget probe_models forwards as ``max_budget_usd``
+    defaults to the named ``DEFAULT_PROBE_BUDGET_USD`` constant, and an
+    explicit ``budget_usd=`` still overrides it.
+
+    Asserted through what actually REACHES invoke_fn (the fake's recorded
+    calls), never through ``inspect.signature`` -- a declared default that
+    some layer then overwrites would still be a defect, and the forwarded
+    value is the thing the probe's behaviour depends on.
+    """
+
+    def test_default_budget_is_the_named_constant(self):
+        # The single pin of the chosen number. Basis: one turn still pays for
+        # the CLI's own preamble, and one fable turn measures ~$0.15-0.25 that
+        # way, so $1.00 clears the most expensive probed model with ~4x margin
+        # -- and the old $0.05 did not, which is the defect (task 5404).
+        assert DEFAULT_PROBE_BUDGET_USD == 1.0
+
+        accounts = [AccountConfig(name='max-x', oauth_token_env='MAX_X_TOKEN')]
+        cli = _ScriptedProbeCli()
+
+        asyncio.run(probe_models(
+            accounts, ['haiku'],
+            invoke_fn=cli,
+            token_resolver={'MAX_X_TOKEN': 'tok-x'}.get,
+        ))
+
+        assert cli.calls, 'expected at least one probe invocation'
+        for call in cli.calls:
+            assert call['max_budget_usd'] == DEFAULT_PROBE_BUDGET_USD
+            # Pinned in the same loop: this stays a ONE-turn probe, which is
+            # the premise that makes 'budget_too_low' mean "the ceiling is
+            # mis-sized" rather than "the agent ran long".
+            assert call['max_turns'] == 1
+
+    def test_explicit_budget_argument_is_forwarded(self):
+        accounts = [AccountConfig(name='max-x', oauth_token_env='MAX_X_TOKEN')]
+        cli = _ScriptedProbeCli()
+
+        asyncio.run(probe_models(
+            accounts, ['haiku'],
+            invoke_fn=cli,
+            token_resolver={'MAX_X_TOKEN': 'tok-x'}.get,
+            budget_usd=0.25,
+        ))
+
+        assert cli.calls, 'expected at least one probe invocation'
+        assert all(call['max_budget_usd'] == 0.25 for call in cli.calls)
 
 
 class TestProbeModelsMissingToken:
@@ -417,8 +582,8 @@ class TestRenderProbeArtifact:
         for account_name, statuses in report.accounts.items():
             for model, status in statuses.items():
                 assert parsed['accounts'][account_name][model] == status
-            # The G3 gate content task xi consumes: a claude-fable-5 row
-            # present per account.
+            # The evidence an admission decision consumes: a fable-candidate
+            # row present per account.
             assert FABLE_CANDIDATE_MODEL in parsed['accounts'][account_name]
 
     def test_is_pure_and_deterministic(self):
@@ -436,14 +601,10 @@ class TestRenderProbeArtifact:
 # ---------------------------------------------------------------------------
 
 
-def _fake_probe_cli_config(monkeypatch, tmp_path) -> OrchestratorConfig:
-    """A real, hermetically-constructed OrchestratorConfig for the CLI
-    tests below -- ORCH_CONFIG_PATH/cwd are neutralised first (mirrors
-    every other direct-construction test in this module) so this
-    OrchestratorConfig() call can never pick up a stray real config.yaml
-    from the actual environment."""
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+def _fake_probe_cli_config(tmp_path) -> OrchestratorConfig:
+    """A real OrchestratorConfig for the CLI tests below, built from package
+    defaults only."""
+    require_code_default_config()
     # Default RoutingConfig() (haiku/sonnet/opus) -- ModelsConfig's own
     # defaults (e.g. architect='opus') must stay inside routing.allowed_models
     # or OrchestratorConfig's fail-fast allowlist validator (step-2) rejects
@@ -458,40 +619,180 @@ def _fake_probe_cli_config(monkeypatch, tmp_path) -> OrchestratorConfig:
     )
 
 
+def _invoke_probe_models_cli(monkeypatch, tmp_path, report: ProbeReport,
+                             extra_args: list[str] | None = None):
+    """Run `orchestrator probe-models` network-free against a hermetic config,
+    with routing.probe_models stubbed to record every call's arguments and
+    return *report*.
+
+    Returns ``(CliRunner result, recorded calls, artifact path)``. Every
+    probe-models CLI test below drives the command through this one seam, so
+    the stub shape and the argv shape are each spelled exactly once -- a test
+    asserting on what was FORWARDED reads ``calls``, one asserting on what was
+    WRITTEN reads the returned path. The recorded list staying EMPTY is itself
+    the assertion for a parse-time rejection.
+    """
+    fake_config = _fake_probe_cli_config(tmp_path)
+    monkeypatch.setattr('orchestrator.cli_config.load_config', lambda _path: fake_config)
+
+    calls: list[dict] = []
+
+    async def fake_probe_models(accounts, allowed_models, *, models=None, **kwargs):
+        calls.append({
+            'accounts': accounts, 'allowed_models': allowed_models, 'models': models,
+            'budget_usd': kwargs.get('budget_usd'),
+        })
+        return report
+
+    monkeypatch.setattr(routing_module, 'probe_models', fake_probe_models)
+
+    cfg_file = tmp_path / 'config.yaml'
+    cfg_file.write_text('')
+    out_path = tmp_path / 'model-availability.yaml'
+
+    result = CliRunner().invoke(main, [
+        'probe-models',
+        '--config', str(cfg_file),
+        '--output', str(out_path),
+        *(extra_args or []),
+    ])
+    return result, calls, out_path
+
+
+@pytest.mark.usefixtures("code_default_config")
+class TestProbeModelsCliBudgetOption:
+    """`probe-models --budget-usd` is the operator control the probe was
+    missing: the CLI forwarded nothing, so every run silently took
+    probe_models's own default. It must forward the routing constant by
+    default, honour an override, and reject a non-positive ceiling at parse
+    time -- with the new classification, a zero or negative ceiling would
+    make EVERY (account, model) pair abort and record 'budget_too_low',
+    committing an artifact that is uniformly and plausibly wrong.
+    """
+
+    def _run(self, monkeypatch, tmp_path, extra_args: list[str]):
+        result, probe_calls, _ = _invoke_probe_models_cli(
+            monkeypatch, tmp_path,
+            ProbeReport(models=['haiku'], accounts={'max-x': {'haiku': 'available'}}),
+            extra_args,
+        )
+        return result, probe_calls
+
+    def test_default_budget_is_the_routing_constant(self, monkeypatch, tmp_path):
+        result, probe_calls = self._run(monkeypatch, tmp_path, [])
+
+        assert result.exit_code == 0, result.output
+        assert [call['budget_usd'] for call in probe_calls] == [DEFAULT_PROBE_BUDGET_USD]
+
+    def test_budget_option_is_forwarded(self, monkeypatch, tmp_path):
+        result, probe_calls = self._run(monkeypatch, tmp_path, ['--budget-usd', '2.5'])
+
+        assert result.exit_code == 0, result.output
+        assert [call['budget_usd'] for call in probe_calls] == [2.5]
+
+    def test_non_positive_budget_is_rejected_before_probing(self, monkeypatch, tmp_path):
+        result, probe_calls = self._run(monkeypatch, tmp_path, ['--budget-usd', '0'])
+
+        assert result.exit_code != 0
+        assert '--budget-usd' in result.output
+        # A VALUE rejection, not an unknown-option one: click's 'Invalid
+        # value' prefix is what proves the FloatRange constraint fired rather
+        # than the option simply not existing (which is how this same test
+        # would pass vacuously before the option is added).
+        assert 'Invalid value' in result.output
+        assert probe_calls == [], 'a rejected ceiling must never reach probe_models'
+
+
+@pytest.mark.usefixtures("code_default_config")
+class TestProbeModelsCliBudgetAbortWarning:
+    """The half of the defect a parse-time check cannot catch: a POSITIVE but
+    mis-sized ceiling. `--budget-usd 0.05` -- the exact value that caused this
+    bug -- clears FloatRange, so every fable pair records 'budget_too_low' and
+    the command would otherwise print 'Wrote ...' and exit 0. The artifact is
+    honest to whoever opens the YAML; the operator who RAN the probe must not
+    have to open it to learn the run produced no availability evidence.
+    """
+
+    def test_budget_aborts_are_counted_and_warned_on_stderr(self, monkeypatch, tmp_path):
+        result, _, out_path = _invoke_probe_models_cli(
+            monkeypatch, tmp_path,
+            ProbeReport(
+                models=['haiku', FABLE_CANDIDATE_MODEL],
+                accounts={
+                    'max-x': {'haiku': 'available',
+                              FABLE_CANDIDATE_MODEL: 'budget_too_low'},
+                    'max-y': {'haiku': 'available',
+                              FABLE_CANDIDATE_MODEL: 'budget_too_low'},
+                },
+            ),
+            ['--budget-usd', '0.05'],
+        )
+
+        # Partial evidence is still evidence: a run with SOME usable rows
+        # succeeds and keeps its artifact -- the warning is the signal here,
+        # not a failure exit.
+        assert result.exit_code == 0, result.output
+        assert out_path.exists()
+        assert 'WARNING' in result.stderr
+        # The count and the ceiling that produced it, so the remedy needs no
+        # second command to work out.
+        assert '2 of 4' in result.stderr
+        assert '0.05' in result.stderr
+        assert '--budget-usd' in result.stderr
+        # On stderr, so redirecting stdout to a file cannot swallow it.
+        assert 'WARNING' not in result.stdout
+
+    def test_clean_run_warns_about_nothing(self, monkeypatch, tmp_path):
+        result, _, _ = _invoke_probe_models_cli(
+            monkeypatch, tmp_path,
+            ProbeReport(models=['haiku'], accounts={'max-x': {'haiku': 'available'}}),
+        )
+
+        assert result.exit_code == 0, result.output
+        assert result.stderr == '', 'a clean probe must stay quiet on stderr'
+
+    def test_a_wholly_aborted_run_exits_non_zero_and_still_writes_the_artifact(
+            self, monkeypatch, tmp_path):
+        """When EVERY probed pair aborted, the run yielded no availability
+        evidence whatsoever, so exit 0 would be a lie to any script gating on
+        it. The artifact is still written first: 'budget_too_low' rows are
+        honest evidence about the BUDGET, and discarding them would leave the
+        operator with neither the rows nor a way to see what went wrong.
+        """
+        result, _, out_path = _invoke_probe_models_cli(
+            monkeypatch, tmp_path,
+            ProbeReport(
+                models=['haiku', FABLE_CANDIDATE_MODEL],
+                accounts={'max-x': {'haiku': 'budget_too_low',
+                                    FABLE_CANDIDATE_MODEL: 'budget_too_low'}},
+            ),
+            ['--budget-usd', '0.05'],
+        )
+
+        assert result.exit_code != 0
+        assert '2 of 2' in result.stderr
+
+        assert out_path.exists(), 'the artifact must survive the non-zero exit'
+        parsed = yaml.safe_load(out_path.read_text())
+        assert parsed['accounts']['max-x'][FABLE_CANDIDATE_MODEL] == 'budget_too_low'
+
+
+@pytest.mark.usefixtures("code_default_config")
 class TestProbeModelsCli:
     def test_writes_artifact_with_fable_row_and_exits_zero(self, monkeypatch, tmp_path):
-        fake_config = _fake_probe_cli_config(monkeypatch, tmp_path)
-        monkeypatch.setattr('orchestrator.cli.load_config', lambda _path: fake_config)
-
-        scripted_report = ProbeReport(
-            models=['haiku', 'sonnet', FABLE_CANDIDATE_MODEL],
-            accounts={
-                'max-x': {
-                    'haiku': 'available',
-                    'sonnet': 'available',
-                    FABLE_CANDIDATE_MODEL: 'available',
+        result, probe_calls, output_file = _invoke_probe_models_cli(
+            monkeypatch, tmp_path,
+            ProbeReport(
+                models=['haiku', 'sonnet', FABLE_CANDIDATE_MODEL],
+                accounts={
+                    'max-x': {
+                        'haiku': 'available',
+                        'sonnet': 'available',
+                        FABLE_CANDIDATE_MODEL: 'available',
+                    },
                 },
-            },
+            ),
         )
-        probe_calls: list[dict] = []
-
-        async def fake_probe_models(accounts, allowed_models, *, models=None, **kwargs):
-            probe_calls.append({
-                'accounts': accounts, 'allowed_models': allowed_models, 'models': models,
-            })
-            return scripted_report
-
-        monkeypatch.setattr(routing_module, 'probe_models', fake_probe_models)
-
-        cfg_file = tmp_path / 'config.yaml'
-        cfg_file.write_text('')
-        output_file = tmp_path / 'model-availability.yaml'
-
-        result = CliRunner().invoke(main, [
-            'probe-models',
-            '--config', str(cfg_file),
-            '--output', str(output_file),
-        ])
 
         assert result.exit_code == 0, result.output
         assert output_file.exists(), 'expected the artifact file to be written at --output'
@@ -506,27 +807,11 @@ class TestProbeModelsCli:
         assert [a.name for a in probe_calls[0]['accounts']] == ['max-x']
 
     def test_models_option_is_forwarded_to_probe_models(self, monkeypatch, tmp_path):
-        fake_config = _fake_probe_cli_config(monkeypatch, tmp_path)
-        monkeypatch.setattr('orchestrator.cli.load_config', lambda _path: fake_config)
-
-        probe_calls: list[list[str] | None] = []
-
-        async def fake_probe_models(accounts, allowed_models, *, models=None, **kwargs):
-            probe_calls.append(models)
-            return ProbeReport(models=models or [], accounts={})
-
-        monkeypatch.setattr(routing_module, 'probe_models', fake_probe_models)
-
-        cfg_file = tmp_path / 'config.yaml'
-        cfg_file.write_text('')
-        output_file = tmp_path / 'model-availability.yaml'
-
-        result = CliRunner().invoke(main, [
-            'probe-models',
-            '--config', str(cfg_file),
-            '--output', str(output_file),
-            '--models', 'opus,haiku',
-        ])
+        result, probe_calls, _ = _invoke_probe_models_cli(
+            monkeypatch, tmp_path,
+            ProbeReport(models=['opus', 'haiku'], accounts={}),
+            ['--models', 'opus,haiku'],
+        )
 
         assert result.exit_code == 0, result.output
-        assert probe_calls == [['opus', 'haiku']]
+        assert [call['models'] for call in probe_calls] == [['opus', 'haiku']]

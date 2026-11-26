@@ -1,0 +1,24 @@
+[Unit]
+Description=Nightly cross-project return brief: Fable prepare-sitting run, then the deterministic render (task 5376)
+Documentation=file:///home/leo/src/dark-factory/scripts/sitting/return_brief.py
+Documentation=file:///home/leo/src/dark-factory/scripts/sitting/nightly_prepare.py
+Documentation=file:///home/leo/src/dark-factory/OPERATIONS.md
+
+[Service]
+Type=oneshot
+# All logic lives in the committed wrapper, which always exits 0 (OPERATIONS.md §12).
+WorkingDirectory=/home/leo/src/dark-factory
+ExecStart=/home/leo/src/dark-factory/scripts/return-brief.sh
+StandardOutput=journal
+StandardError=journal
+# The fleet's one spelling of the user PATH (see scripts/fused-memory-flag-marker-sweep.service):
+# a boot catch-up run otherwise gets the user manager's minimal PATH, without uv or claude.
+Environment=PATH=/home/leo/.cargo/bin:/home/leo/.local/npm-global/bin:/usr/local/cuda-12.6/bin:/home/leo/.local/bin:/home/leo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin
+# Policy: OPERATIONS.md §12 "Legibility trickle accounts (03:00)".
+UnsetEnvironment=ANTHROPIC_API_KEY
+# The prepare step bounds itself at nightly_prepare.DEFAULT_TIMEOUT_SECS (2700s);
+# the render takes about a minute. A oneshot otherwise has no start timeout at all.
+TimeoutStartSec=3600
+
+[Install]
+WantedBy=timers.target

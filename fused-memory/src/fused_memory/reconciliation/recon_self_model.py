@@ -15,10 +15,12 @@ its rendered sections at a later task (ξ). Those prompts currently import
 nothing from harness.py/flag_dedup.py/recon_ledger.py, so — to stay safely
 importable from the prompt-import path without pulling in aiosqlite
 (recon_ledger's dependency) or other reconciliation internals — this module
-imports ONLY reconciliation.recon_pool_map and
-reconciliation.standing_decision_constants (both pure leaves — see those
-modules' docstrings; standing_decision_constants imports only
-`from __future__ import annotations`, so it pulls no reconciliation
+imports ONLY reconciliation.recon_pool_map,
+reconciliation.standing_decision_constants and
+reconciliation.graphiti_degradation_probe (all pure leaves — see those
+modules' docstrings; standing_decision_constants and
+graphiti_degradation_probe import only
+`from __future__ import annotations`, so they pull no reconciliation
 internals onto the prompt-import path) plus stdlib. Consistency with
 recon_ledger.MARKER_KINDS,
 harness._derive_affected_ids, and flag_dedup's content-fingerprint fallback
@@ -46,9 +48,15 @@ transcription, not yet a verified single source of truth.
 from __future__ import annotations
 
 import re
+from bisect import bisect_left
+from collections.abc import Callable
 from dataclasses import dataclass
 
+from fused_memory.reconciliation.graphiti_degradation_probe import (
+    NEGATIVE_SET_VERDICT,
+)
 from fused_memory.reconciliation.recon_pool_map import (
+    CYCLE_SUMMARY_KIND,
     CYCLE_SUMMARY_STAGE_TO_RECON_POOL,
     STAGE1_CYCLE_SUMMARY_RECON_POOL,
     STAGE2_CYCLE_SUMMARY_RECON_POOL,
@@ -88,6 +96,39 @@ MARKER_KINDS = (
 DELETER_GC = 'gc-on-terminal-or-ttl'
 DELETER_POOL_TRIM = 'cycle-summary-pool-cap-trim-or-ttl'
 DELETER_TTL = 'ttl-expiry'
+
+# The `deleter` audit tags of the ONLY Mem0 delete paths that write a
+# mem0_tombstone ledger row, via mem0_tombstone.record_mem0_deletion_tombstones
+# (the batched/plural writer — see the mem0_tombstone MARKER_LIFECYCLE entry
+# below). There are exactly three production call sites of that writer:
+# summary_pool.enforce_summary_pool_cap, task_knowledge_sync._sweep_stale_mem0_pool
+# (a shared choke point for three delegating GC-sweep callers), and
+# server.tools.consolidate_memories — six deleter tags in total. Named by
+# mechanism, not by file:line: line numbers in this module drift silently
+# (see the design decision on this task), while these tags are stable string
+# constants a reader can grep straight to.
+#
+# Hand-transcribed here, not imported, because this module is import-light by
+# contract (module docstring above: only recon_pool_map and
+# standing_decision_constants) — the six source constants live in
+# task_knowledge_sync, memory_consolidator, and server.tools, all heavy.
+# test_recon_self_model.py cross-checks this tuple against those live
+# constants (imported lazily, inside the test body) so drift between this
+# description and the live code fails a test rather than silently diverging —
+# the same arrangement MARKER_KINDS already has with recon_ledger.MARKER_KINDS.
+MEM0_TOMBSTONE_DELETERS = (
+    'stage1_flag_marker_gc_sweep',
+    'stage2_persistence_marker_gc_sweep',
+    'flag_for_stage2_gc_sweep',
+    'stage1_cycle_summary_trim',
+    'stage2_cycle_summary_trim',
+    'consolidate_memories',
+)
+
+
+def format_mem0_tombstone_deleters() -> str:
+    """MEM0_TOMBSTONE_DELETERS as the backtick-wrapped, comma-separated list the recon prompts render."""
+    return ', '.join(f'`{deleter}`' for deleter in MEM0_TOMBSTONE_DELETERS)
 
 
 @dataclass(frozen=True)
@@ -147,14 +188,32 @@ MARKER_LIFECYCLE: dict[str, MarkerLifecycle] = {
         # flag_for_stage2 row into the ledger — the identical
         # declared-vs-actual gap documented on stage2_persistence_marker
         # below (task 2228 W5-κ, review finding model_drift). The live
-        # collector is the separate Mem0 age-based sweep
-        # task_knowledge_sync._sweep_stale_mem0_flag_for_stage2_markers
+        # collector is the separate Mem0 sweep
+        # stages/task_knowledge_sync.py::_sweep_stale_mem0_flag_for_stage2_markers
         # (task 2966), which — unlike stage2_persistence_marker's sweep —
         # enumerates via the boolean payload filter
         # {'flag_for_stage2': True} rather than a {'source': ...} filter,
-        # since these markers carry no source metadata field. Migrating the
-        # writer onto the ledger — so DELETER_GC becomes true in practice and
-        # not just in eligibility — is a follow-up.
+        # since these markers carry no source metadata field.
+        #
+        # That collector is NO LONGER age-based: retirement is composite and
+        # gated on terminal-task closure (tasks 4375, 4995); that sweep's
+        # docstring owns the rule.
+        #
+        # Second firing site (task 4376), a latency layer applying the same
+        # rule to the one task that just closed:
+        # stages/task_knowledge_sync.py::retire_flag_markers_for_terminal_task,
+        # called from reconciliation/targeted.py::TargetedReconciler._on_task_done.
+        # The per-cycle sweep in TaskKnowledgeSync.run() stays primary.
+        #
+        # The terminal-closure arm NARROWS the declared-vs-actual gap this
+        # comment documents, without closing it: the Mem0 side now applies the
+        # same terminal-task-closure test that
+        # recon_ledger.ReconLedgerStore.gc()'s terminal-referenced DELETE arm
+        # applies to ledger rows, so DELETER_GC is now accurate about the
+        # ELIGIBILITY RULE even though the rows themselves still never reach
+        # the ledger. Migrating the writer onto the ledger — so DELETER_GC
+        # becomes true in mechanism too, not just in rule — remains a
+        # follow-up.
         deleter=DELETER_GC,
     ),
     'stage2_persistence_marker': MarkerLifecycle(
@@ -178,8 +237,8 @@ MARKER_LIFECYCLE: dict[str, MarkerLifecycle] = {
     ),
     'stage1_flag_suppression': MarkerLifecycle(
         writer=(
-            'Operators / remediation hooks, via '
-            'flag_dedup.write_suppression_record'
+            'Operators only, via flag_dedup.write_suppression_record (scripted); '
+            'recon stages are refused at add_memory/add_system_record'
         ),
         deleter=DELETER_TTL,
     ),
@@ -193,10 +252,11 @@ MARKER_LIFECYCLE: dict[str, MarkerLifecycle] = {
     # Not a MARKER_KINDS member — see the superset note above.
     'mem0_tombstone': MarkerLifecycle(
         writer=(
-            'Python, from mem0_tombstone.record_mem0_deletion_tombstone — one '
-            'per CONFIRMED recon-initiated Mem0 delete (both the marker-GC '
-            'sweeps and the cycle_summary pool-cap trim), keyed by the deleted '
-            "record's memory uuid"
+            'Python, from mem0_tombstone.record_mem0_deletion_tombstones — one '
+            'per CONFIRMED delete performed by the sweeps that call it: the '
+            'marker-GC sweeps, the cycle_summary pool-cap trim, and the '
+            'consolidate_memories supersede path (not every recon-initiated '
+            "Mem0 delete), keyed by the deleted record's memory uuid"
         ),
         deleter=DELETER_TTL,
     ),
@@ -257,15 +317,41 @@ MCP_CALL_SIGNATURES: dict[str, str] = {
     ),
     'resolve_ticket': (
         'resolve_ticket(ticket, project_root) -> '
-        "{'status': 'created'|'combined'|'failed', 'task_id'?: ..., 'reason'?: ...}"
+        "{'status': 'created'|'combined'|'failed'|'refused'|'cancelled'"
+        "|'pending'|'awaiting_curation', "
+        "'task_id'?: ..., 'ticket'?: ..., 'reason'?: ...}  "
+        '# refused = a deterministic guard rejected the candidate: NO task was '
+        'created and NO task_id key is present. Terminal and intended; never '
+        'retry it and never record a task id for it. '
+        '# cancelled = terminal, NO task_id. '
+        '# pending / awaiting_curation = OPEN: not decided yet; carries the '
+        'ticket, never a task_id. Do not count it or flag it as a discrepancy; '
+        're-poll the same ticket, never re-submit.'
     ),
     'add_finding': (
         'add_finding(severity, category, flag_type, actionable, description, '
-        "suggested_action, task_id) -> {'finding_id': ...}  "
+        "suggested_action, task_id, supersedes) -> {'finding_id': ...}  "
+        '# supersedes (task-4653) = the finding_id of an earlier finding in '
+        'this run that this one makes historical — file it when your finding '
+        'RESOLVES an earlier claim rather than restating it. The dedup key '
+        'below cannot relate a claim to its resolution (the resolving '
+        'finding carries a different flag_type), so the relation must be '
+        'asserted explicitly or both stay live and a reader acts on the '
+        'first. The target is stamped and stays readable, not retracted. '
         '# actionable is a COMPUTED default (task-2432): when omitted, it '
         "resolves to False if task_id is None or category starts with "
         "'cross_project', else True; an explicit True/False from the caller "
         'is always honored. '
+        "# prefix match, not an allowlist: a NEW 'cross_project'-prefixed "
+        'category that is genuinely actionable must still pass '
+        'actionable=True explicitly, or it silently resolves to False. '
+        '# task-1654 ripple: an actionable=False finding can vanish from '
+        'flagged_items when ALL of its citations trace to same-run '
+        'Stage-1 (memory_consolidator) findings (never when the finding '
+        'itself is Stage 1, and never with zero typed citations or any '
+        'uncovered citation) — pass actionable=True explicitly only in '
+        "that shape (see ReconReportState.add_finding's docstring for "
+        'the full rationale). '
         '# dedup key: cited_tasks is the authoritative dedup key, not this '
         'task_id param — a None / single / comma-joined / foreign top-level '
         'task_id is normalized to the cited-task set (see cite_task below '
@@ -277,9 +363,12 @@ MCP_CALL_SIGNATURES: dict[str, str] = {
         'add_finding.task_id. cite_task also performs an in-run fold '
         '(task-2432): a finding whose top-level task_id is None, equals this '
         'cited task_id, or (if comma-joined) contains it among its parts, '
-        'collapses onto whichever finding first cited this task — so None, '
-        'single, comma-joined, and foreign top-level task_id shapes all '
-        'dedup through this one path once they share a cited task.'
+        'collapses onto whichever finding first cited this task — same-project '
+        'only where that first citer pinned a project, since two projects can '
+        'carry the same task NUMBER (task-4185: cross-project near-collisions '
+        'are kept distinct) — so None, single, comma-joined, and foreign '
+        'top-level task_id shapes all dedup through this one path once they '
+        'share a cited task.'
     ),
     'cite_entity': (
         "cite_entity(finding_id, name) -> {'ok': True}  "
@@ -307,7 +396,11 @@ MCP_CALL_SIGNATURES: dict[str, str] = {
     'get_cycle_summary_presence': (
         'get_cycle_summary_presence(project_id, run_id, stage) -> '
         "{'present': bool, 'ledger_available': bool, 'project_id': ..., "
-        "'run_id': ..., 'stage': ...}"
+        "'run_id': ..., 'stage': ..., 'remediation': bool|None, "
+        "'agent_outcome': str|None, "
+        "'reason': 'present'|'missing'|'stage_not_run'|'expired'|"
+        "'run_unknown'|'ledger_unavailable', 'expected': bool|None, "
+        "'run_lookup_available': bool, 'run_status': str|None}"
     ),
 }
 
@@ -340,37 +433,44 @@ def render_marker_lifecycle_section() -> str:
         '(not Stage 3 remediation, not the LLM) deletes them early.\n\n'
         'Every marker write MUST include `metadata.run_id=<current_run_id>`. '
         '`run_id` is minted fresh per run and is never persisted across cycles: '
-        'the Mem0 marker channel is intentionally single-cycle. Any marker whose '
-        'run_id does not match the current cycle — including one left over from '
-        'a prior cycle whose consumer crashed before processing it — is '
-        'unconditionally swept by Python and never reaches the LLM; it is not '
-        'retried. The `flagged_items` structured-output field is the durable '
-        'delivery channel that survives this sweep — the marker is only a '
-        'same-cycle relay.'
+        'the Mem0 marker channel is intentionally single-cycle. One exception '
+        'concerns delivery, not run_id: a `flag_for_stage2` marker relayed by a '
+        'run whose Stage 2 agent did not complete is carried forward to the next '
+        'Stage 2 until a Stage 2 agent completes. Any other marker whose run_id '
+        'does not match the current cycle is swept by Python and never reaches '
+        'the LLM. The `flagged_items` structured-output field is the durable '
+        'delivery channel that survives this sweep; apart from that '
+        'carry-forward, the marker is only a same-cycle relay.'
     )
 
 
 def render_suppression_schema_section() -> str:
-    """Render the canonical suppression-record schema section, faithful to
-    reconciliation/prompts/stage1.py:498-560."""
+    """Render the suppression-record section spliced into the Stage-1 system
+    prompt (reconciliation/prompts/stage1.py::STAGE1_SYSTEM_PROMPT): suppressions
+    are operator-only recon_ledger rows (task 4863)."""
     return (
-        '## Suppression Schema\n'
-        'Canonical suppression record schema (Mem0, observations_and_summaries '
-        "category) — the producer's contract read by the Stage 1 post-processor:\n"
-        '  - `metadata.kind = "stage1_flag_suppression"`\n'
-        '  - `metadata.task_id = <N>` (str)\n'
-        '  - `metadata.flag_types = [<str>, ...]` (OPTIONAL scoping allowlist)\n'
-        '  - content: `"STAGE 1 FLAG SUPPRESSION task_id=<N>"`\n\n'
-        'Scoped vs. legacy/blanket suppression: a record WITH a non-empty '
-        '`metadata.flag_types` is a scoped record that suppresses ONLY those '
-        '(task_id, flag_type) pairs, leaving other flag_types for the same '
-        'task_id free to surface. A record WITHOUT `flag_types` (absent, None, '
-        'or empty — the legacy shape) is a blanket record that suppresses ALL '
-        'flag_types for that task_id. When both a scoped and a legacy/blanket '
-        'record exist for the same task_id, the blanket record wins (union '
-        'semantics) — a blanket suppression cannot be narrowed by a more '
-        'specific scoped record.'
+        '## Suppression Records\n'
+        'A suppression is a `recon_ledger` row with '
+        '`record_kind = "stage1_flag_suppression"`, keyed by `(task_id, flag_type)`; '
+        'a row with `flag_type = ""` is blanket. Operators write these rows '
+        'out-of-band. No reconciliation stage can create one: `add_memory` and '
+        '`add_system_record` refuse that kind from recon-stage agents. A Mem0 record '
+        'of that kind (an operator audit mirror or a legacy record) has no gate '
+        'effect and is not evidence that a flag is suppressed.\n\n'
+        'Scoped vs. blanket suppression: a scoped row suppresses ONLY its '
+        '(task_id, flag_type) pair, leaving other flag_types for the same task_id '
+        'free to surface. A blanket row suppresses ALL flag_types for that task_id. '
+        'When both a scoped and a blanket row exist for the same task_id, the '
+        'blanket row wins (union semantics) — a blanket suppression cannot be '
+        'narrowed by a more specific scoped row.\n\n'
+        'If a finding you consider settled re-derives every cycle, keep emitting it '
+        'and name its task_id, its flag_type and why you consider it settled in your '
+        'cycle report, so an operator can decide whether to suppress it.'
     )
+
+
+#: Heading of the section below; other prompt sections refer to it by this constant.
+ENTITY_STANDING_DECISIONS_HEADING = '## Entity Standing Decisions'
 
 
 def render_entity_standing_decision_schema_section() -> str:
@@ -395,7 +495,7 @@ def render_entity_standing_decision_schema_section() -> str:
       deterministic filter (γ) and reads never consult mem0 for authority.
     """
     return (
-        '## Entity Standing Decisions\n'
+        f'{ENTITY_STANDING_DECISIONS_HEADING}\n'
         f'The `{RECORD_KIND_ENTITY_STANDING_DECISION}` ledger record is the SOLE '
         'machine-consulted standing-decision form — the durable record that a prior '
         'investigation adjudicated a recurring class of complaint about an entity and '
@@ -418,6 +518,10 @@ def render_entity_standing_decision_schema_section() -> str:
     )
 
 
+#: Heading of the section below; other prompt sections refer to it by this constant.
+INVESTIGATION_OUTCOME_RECORDS_HEADING = '## Investigation Outcome Records'
+
+
 def render_investigation_outcome_section() -> str:
     """Render the STAGE-2-ONLY investigation_outcome section (task 2898 ε,
     PRD plans/stage1-entity-standing-decision-prd.md §ε).
@@ -434,7 +538,7 @@ def render_investigation_outcome_section() -> str:
     design (PRD decision 8).
     """
     return (
-        '## Investigation Outcome Records\n'
+        f'{INVESTIGATION_OUTCOME_RECORDS_HEADING}\n'
         'When you (Stage 2) conclude an investigation of a flagged entity and '
         'determine it is not actionable, write an '
         f'`{MEM0_KIND_INVESTIGATION_OUTCOME}` mem0 record so the conclusion is durable '
@@ -454,7 +558,7 @@ def render_investigation_outcome_section() -> str:
 
 def render_cycle_summary_section() -> str:
     """Render the per-cycle summary metadata convention, faithful to
-    reconciliation/prompts/stage2.py:236-302, interpolating the
+    reconciliation/prompts/stage2.py::STAGE2_SYSTEM_PROMPT, interpolating the
     stage->recon_pool tags from recon_pool_map (task 2140) so the pool tag
     strings stay single-sourced rather than re-hardcoded.
 
@@ -464,10 +568,9 @@ def render_cycle_summary_section() -> str:
     mirror, producing two cycle_summary Mem0 records per run_id (the
     memory_duplicate finding, run f2bb55b4). The section now tells the
     agent that Python owns that write and it must NOT duplicate it. The
-    metadata convention below is retained because it still documents (a)
-    the shape of Python's deterministic mirror and (b) the distinct,
-    legitimately-surviving LLM-authored reconstruction/self-heal write (see
-    stage2.py's "Re-Verify Reconstruction Writes Before Carry-Forward").
+    metadata convention below is retained because it still documents the
+    shape of Python's deterministic mirror. Task 3734 retired the LLM-authored
+    reconstruction write, and the section now forbids it.
     """
     pool_lines = '\n'.join(
         f"  - stage='{stage}' -> recon_pool='{pool}'"
@@ -480,7 +583,10 @@ def render_cycle_summary_section() -> str:
         'this runs unconditionally every cycle. Do NOT author your own per-cycle '
         'summary `add_memory` write on the normal flow: doing so creates a second '
         "cycle_summary record for the same run_id. Python's mirror is tagged with "
-        "metadata={'kind': 'cycle_summary', 'stage': <stage_name>, "
+        # Task 3202 / INV-5: the kind literal is rendered from the shared
+        # CYCLE_SUMMARY_KIND constant, never re-typed, so a rename in
+        # recon_pool_map reaches this prompt instead of stranding it.
+        f"metadata={{'kind': '{CYCLE_SUMMARY_KIND}', 'stage': <stage_name>, "
         "'run_id': <run_id>, 'recon_pool': <recon_pool>, 'record_type': 'ledger_stamp'}. "
         '<run_id> is the exact run_id from the payload context (the same run_id '
         'embedded in the summary content). <recon_pool> is looked up from the '
@@ -500,23 +606,36 @@ def render_cycle_summary_section() -> str:
         'The Mem0 record is a best-effort searchable copy; the AUTHORITATIVE '
         'record is the ReconLedgerStore cycle_summary row — check it with '
         '`get_cycle_summary_presence`, never by looking for the mirror.\n\n'
-        'Any recon-initiated Mem0 deletion now leaves a TOMBSTONE, returned by '
-        "`get_memory_by_id` on its not-found branch as a `'tombstone'` key "
-        'naming the sweep that deleted the record, the run that did it, and the '
-        "victim's metadata. Before reporting a missing memory as silent loss, "
-        'consult it: a tombstone means the record was deliberately reaped by a '
-        'named sweep. Reporting a capped-pool eviction as fleet-wide data loss '
-        'is a real failure mode — it happened (recon gate 165, task 3041).\n\n'
-        "The `record_type` metadata key discriminates cycle_summary writers by "
-        "purpose, not by shape: `'ledger_stamp'` marks Python's deterministic "
-        "code mirror described above; `'narrative'` marks the distinct "
-        'LLM-authored reconstruction/self-heal write (see "Re-Verify '
-        'Reconstruction Writes Before Carry-Forward") that you make when '
-        "repairing a PRIOR run's missing summary — that write is still yours to "
-        'author and is unrelated to the normal-flow write this section '
-        'describes.\n\n'
+        f'Deletes performed by these named sweeps — {format_mem0_tombstone_deleters()} — leave a '
+        "TOMBSTONE, returned by `get_memory_by_id` on its not-found branch as "
+        "a `'tombstone'` key naming the sweep that deleted the record "
+        '(`deleter`), the run that performed the deletion (`deleting_run_id`), '
+        "and the victim's metadata. Before reporting a missing memory as "
+        'silent loss, consult it: a tombstone means the record was '
+        'deliberately reaped by a named sweep. Reporting a capped-pool '
+        'eviction as fleet-wide data loss is a real failure mode — it '
+        'happened (recon gate 165, task 3041).\n\n'
+        'A tombstone proves deliberate deletion; its ABSENCE does NOT prove '
+        'the converse — never treat a missing tombstone as evidence a record '
+        'was not deliberately deleted. Absence is uninformative for two '
+        'reasons: (1) several Mem0 delete paths write no tombstone at all — '
+        'most notably the MCP `delete_memory` tool itself (the path the '
+        "recon stages' own flag-reaping instructions call), plus cascade "
+        'child deletes, the targeted-recon '
+        'completion-echo delete, the harness status-correction delete, and '
+        'the scope-freshness snapshot pool cap; and (2) even a written '
+        'tombstone expires after `mem0_tombstone.MEM0_TOMBSTONE_TTL_DAYS` '
+        'days. Widening tombstone coverage to the paths above is tracked as '
+        'task 4422 — treat this as a point-in-time scope, not a closed '
+        'set.\n\n'
+        "`record_type='ledger_stamp'` marks Python's deterministic code mirror "
+        "described above, and every cycle_summary Mem0 record is Python's. Never "
+        'author one yourself — neither on the normal flow nor to repair a PRIOR '
+        "run's missing summary: a Mem0 write cannot restore the authoritative "
+        'ledger row, so that case is decided under `## Carry-Forward '
+        'Missing-Summary Findings` instead.\n\n'
         'The summary is deterministically findable by a metadata-keyed lookup — '
-        "count_memories_by_metadata(project_id, {'kind': 'cycle_summary', "
+        f"count_memories_by_metadata(project_id=..., filters={{'kind': '{CYCLE_SUMMARY_KIND}', "
         "'run_id': <run_id>, 'stage': <stage_name>}) — which downstream stages "
         'use as a second verification path instead of relying on semantic search '
         'alone. The stage key in this lookup is REQUIRED: both Stage 1 and '
@@ -581,12 +700,42 @@ def render_source_completion_section(*, can_file_tasks: bool) -> str:
     does NOT hold it, and must relay the residual to Stage 2 via
     flag_for_stage2 / flagged_items. Never instruct Stage 1 to call a tool it
     does not hold (loud-over-silent).
+
+    ## Why ``metadata.gate_subject`` is declared here (task 3588)
+
+    This section is the AUTHORITY on how a residual gate is filed, so it is
+    where the gate's dedupe key belongs. Before task 3588 there was no
+    canonical spelling and each filing invented its own: reify carriers used
+    ``stranded_task_id``, dark-factory task 3463 used ``related_task_id``.
+    With no agreed key, no deterministic consumer could join a carrier to its
+    subject — so nothing could tell that a gate had ALREADY been filed for
+    the same thing, and subject 5879 accumulated carriers 5902 -> 5916 ->
+    5929 (5929 even carried ``prior_escalation_tasks=[5916, 5902]`` and filed
+    anyway). ``middleware/recurring_gate_guard.py`` enforces the resulting
+    invariant at the ``submit_task`` boundary; this text is what tells the
+    filing agent the key exists and what happens if it is reused.
     """
     if can_file_tasks:
         residual_clause = (
             'You hold `submit_task` in this stage, so file it yourself: call '
             "`submit_task` declaring `metadata.operational_mode='gate'` "
             "alongside `metadata.execution_class='operational'`."
+        )
+        dedupe_clause = (
+            'A second gate for a `gate_subject` that already has a '
+            'NON-TERMINAL carrier is REJECTED at the `submit_task` boundary — '
+            'a hard rejection invariant, not a lint warning. The rejection '
+            'names the open carrier. When you hit it, AMEND that carrier with '
+            '`update_task` (refresh its evidence, bump '
+            '`metadata.recurrence_count`) instead of filing again; do not work '
+            'around it by rewording the title. Once the carrier is `done` or '
+            '`cancelled` it no longer blocks, so a condition that genuinely '
+            'recurs after closure can be filed afresh. `stranded_task_id` and '
+            '`related_task_id` are accepted as read-side ALIASES so carriers '
+            'already filed under those older, invented spellings are still '
+            'matched. They are read-side only: never use either for a NEW '
+            "filing, and never rewrite an existing carrier's metadata to "
+            'canonicalise it.'
         )
     else:
         residual_clause = (
@@ -595,6 +744,14 @@ def render_source_completion_section(*, can_file_tasks: bool) -> str:
             'residual in this stage. Relay it to Stage 2 via the '
             '`flag_for_stage2` / `flagged_items` channel, so Stage 2 files it '
             "as an `operational` task with `operational_mode='gate'`."
+        )
+        dedupe_clause = (
+            'A second gate for a `gate_subject` that already has a '
+            'NON-TERMINAL carrier is REJECTED when it is filed, so relay the '
+            'subject accurately — and say so in what you relay if you believe '
+            'an existing carrier already covers it. The amend-vs-refile '
+            'decision belongs to the stage that holds the task-write tools; '
+            'this stage does not hold them, so do not prescribe one here.'
         )
     return (
         '## Source-Completion\n'
@@ -613,7 +770,102 @@ def render_source_completion_section(*, can_file_tasks: bool) -> str:
         'File ONLY that residual irreversible judgment call as a task, with '
         "`metadata.execution_class='operational'` and "
         "`metadata.operational_mode='gate'` (the human-gated routing mode, not "
-        "the `'llm'` mode). " + residual_clause
+        "the `'llm'` mode). " + residual_clause + '\n\n'
+        'EVERY gate filing MUST carry `metadata.gate_subject` — the ONE '
+        'canonical spelling for "the task or entity this gate is about". Use '
+        'the task id when the gate is about a task, or the stable '
+        'cluster/topic working key when it is a consolidation gate (the same '
+        'topic slug the "## Consolidation Gate" section already requires — '
+        'that is the natural cluster value, not a second key to invent).\n\n'
+        + dedupe_clause + '\n\n'
+        'The "## Consolidation Gate" section is the AUTHORITY for what that '
+        'gate must contain — its target end state, its topic working key, and '
+        'the closure check that refuses to let it close over a malformed '
+        'cluster. Follow it rather than inventing a shape here; this section '
+        'named no end state at all until task 3112, which is why filed gates '
+        'each invented their own (see '
+        '`reconciliation.consolidation_gate::render_consolidation_gate_section`).'
+    )
+
+
+def render_task_creation_accounting_section() -> str:
+    """Render the Task-Creation Accounting section (tasks 3046, 4873).
+
+    States that ``tasks_created`` is path-agnostic, splits curator folds into
+    ``tasks_combined``, and gives the framework the ``task_created_records``
+    action list it corroborates alongside the code-side creation journal.
+    A plain (non-f) string, so its literal record-shape braces need no
+    doubling inside the f-string ``STAGE2_SYSTEM_PROMPT``.
+    """
+    return (
+        '## Task-Creation Accounting\n'
+        '`tasks_created` is PATH-AGNOSTIC: it counts EVERY task you create '
+        'this cycle, regardless of which surface produced the work — a '
+        'Stage 1 flagged item, the **Proactive Task Sample**, the '
+        '`### Done-Task Completion-Memory Audit`, Cross-Project Routing (a '
+        "task filed into ANOTHER project's `project_root` still counts — it "
+        'is a task you created this cycle), a Source-Completion residual, '
+        'or a predicate-contradiction gate. A creation is never exempt from '
+        'the count because it was a mid-cycle side-quest rather than the '
+        'finding you started from.\n\n'
+        '`tasks_created` counts ONLY `resolve_ticket` status `created`. Status '
+        '`combined` — the curator dropped, combined or idempotently matched '
+        'the candidate, or it collided with an existing candidate key — mints '
+        'no new task id: count it under `tasks_combined`, never under '
+        '`tasks_created`.\n\n'
+        'Confirmation rule: see `## Verifying Task Operations` above for the '
+        'full rule, including its `get_task`-verified fallback for an '
+        'unrecognised status, and its rule that an open status (`pending`, '
+        '`awaiting_curation`) counts toward neither tally. Only the '
+        '`resolve_ticket`-confirmed subset of that rule — `status` `created` '
+        'or `combined` WITH a `task_id` — is machine-countable via the '
+        'action record below; never record on the `submit_task` call '
+        'attempt, and `failed` never counts. A creation you confirm via the '
+        '`get_task` fallback still counts toward your own self-report, but '
+        'has no `task_created_records` entry of its own — so under-reporting '
+        'it is not auto-repaired.\n\n'
+        'Action record: at the moment of each confirmation, append one '
+        "entry to `stats['task_created_records']` (status `combined` included):\n"
+        '  `{"action": "task_created", "task_id": <id>, '
+        '"status": "created"|"combined", "project_id": <project the task '
+        'was filed into>, "source_path": <short label of the surface that '
+        'produced it>}`\n\n'
+        'The framework ALSO journals every curator outcome code-side, against '
+        'the `_causation_id` you put in `submit_task` metadata, so a missed '
+        'record is recovered from the journal — but ONLY when that '
+        '`submit_task` call carried `"_causation_id": <run_id>`. It repairs '
+        '`tasks_created` and `tasks_combined` UPWARD to the journaled outcomes '
+        'plus the records whose task it confirms to EXIST via `get_task` '
+        "against the root of that record's own `project_id` (recording the "
+        'pre-repair value under `tasks_created_reported` / '
+        '`tasks_combined_reported`). A record naming a task that cannot be '
+        'confirmed will NOT raise a counter — record only outcomes you '
+        'actually got, with the `project_id` you actually filed into.'
+    )
+
+
+def render_task_hints_update_accounting_section() -> str:
+    """Render the Task-Hints-Update Accounting section (task 4018).
+
+    Gives ``tasks_hints_updated`` the same action-record ground truth
+    ``tasks_created`` has. A plain (non-f) string, like
+    :func:`render_task_creation_accounting_section`.
+    """
+    return (
+        '## Task-Hints-Update Accounting\n'
+        'After the `get_task` SUPERSET confirmation in `## Verifying Task '
+        'Operations` passes for a `memory_hints` attach, append one entry to '
+        "`stats['task_hints_updated_records']` naming the entries you just "
+        'attached:\n'
+        '  `{"action": "task_hints_updated", "task_id": <id>, '
+        '"project_id": <project the task lives in>, "entities": [...], '
+        '"queries": [...]}`\n\n'
+        'The framework re-reads each recorded task via `get_task` against the '
+        "root of that record's own `project_id` and repairs "
+        '`tasks_hints_updated` UPWARD only for records whose stored '
+        '`memory_hints` really contain every recorded entity and query '
+        '(recording the pre-repair value under `tasks_hints_updated_reported`). '
+        'A record the re-read does not confirm will NOT raise the counter.'
     )
 
 
@@ -645,6 +897,24 @@ def markers_deleted_only_by_gc() -> bool:
     return True
 
 
+def negative_probe_set_does_not_clear_intermittent_fault() -> bool:
+    """Invariant: a negative mixed-store probe set never clears the Graphiti
+    degradation — it supports "0 of N reproduced" and nothing stronger.
+
+    The fault is intermittent and load-dependent, and ``search`` reports
+    ``degraded``/``failed_stores`` only WHEN a store has already failed, so a
+    clean probe yields no evidence of health at all. A negative set is an
+    absence of evidence by construction.
+
+    Guards against run cd53b227, whose Stage 2 promoted ONE negative probe
+    (limit=3) to "did not reproduce" and "no persistent Graphiti problem" —
+    which Stage 3 of the same cycle falsified at limit=8. Raising N does not
+    change this: run 45b9a919 ran three probes, one replaying the exact query
+    and limit that HAD fired, and 0 of 3 reproduced.
+    """
+    return True
+
+
 # --------------------------------------------------------------------------- #
 # premise_lint
 # --------------------------------------------------------------------------- #
@@ -664,31 +934,214 @@ class Violation:
     detail: str
 
 
-# Tempered-dot gap that refuses to cross a negation cue (not/never/n't)
-# OR a clause terminator (./;) between a rule's subject and verb — used in
-# place of a bare `[^.]*` wildcard so:
+# Positions the gaps of the marker rule may not span — the gap between its
+# subject and verb, and between its verb and marker — so that:
 #   (a) a CORRECTLY negated statement (e.g. "Stage 3 remediation does NOT
-#       delete the flag marker") does not match as a false-premise
-#       violation. premise_lint exists to flag FALSE premises; a true
-#       statement of the invariant — even phrased as a negation — is not
-#       one, and matching it anyway would be a false positive that rejects
-#       a correct task description once wired at task ξ.
-#   (b) the gap does not span across unrelated clauses in a multi-clause
-#       field. Without the `.`/`;` exclusion, a benign description like
-#       "Stage 3 processes the flag_for_stage2 marker; GC later deletes
-#       the marker on terminal task" would spuriously match ("Stage 3" ...
-#       "deletes" ... "marker") even though the sentence never asserts the
-#       false premise — the "Stage 3" and "deletes" clauses are unrelated.
-#       Stopping the gap at a clause terminator keeps subject/verb/object
-#       matches confined to a single clause.
-_GAP_NO_NEGATION = r"(?:(?!\bnot\b|\bnever\b|n['’]t\b|[.;]).)*"
+#       delete the flag marker") does not match. premise_lint exists to flag
+#       FALSE premises; a true statement of the invariant, even phrased as a
+#       negation, is not one, and matching it would reject a correct task.
+#   (b) a match stays inside one clause. Without the terminators, "Stage 3
+#       processes the flag_for_stage2 marker; GC later deletes the marker on
+#       terminal task" would match "Stage 3" ... "deletes" ... "marker"
+#       across two unrelated clauses.
+# A newline is a terminator, but one INSIDE a subject or marker name
+# ("Stage\n3", "flag\nmarker") does not end the clause: only gaps are checked.
+# Zero-width, so every stop is found, however close together.
+_GAP_STOP = re.compile(r"(?=\bnot\b|\bnever\b|n['’]t\b|[.;\n])", re.IGNORECASE)
 
-# Module-level rule table for premise_lint: (compiled case-insensitive
-# regex, invariant_name, detail). Each rule encodes one known-false premise
-# from the 2083/2092/2093 false-premise batch, which mis-modeled run_id and
-# stage1_flag_marker lifecycle. Extend this table as new false premises (or
-# new paraphrasings of an existing one) are discovered; premise_lint returns
-# one Violation per matching rule.
+_NON_GC_DELETER = re.compile(r'stage\s*3|remediation|the\s+llm', re.IGNORECASE)
+_DELETION_VERB = re.compile(
+    r'\b(?:deletes?|removes?|clears?|purges?)\b', re.IGNORECASE
+)
+_MARKER_NOUN = re.compile(
+    r'\b(?:flag_for_stage2|flag\s+marker|stage1_flag_marker|marker)\b',
+    re.IGNORECASE,
+)
+
+
+# One pass per pattern, then a gap [a, b) is clean iff a and b fall in the
+# same clause, numbered by the stops before them.
+def _asserts_non_gc_marker_deletion(text: str) -> bool:
+    stops = [stop.start() for stop in _GAP_STOP.finditer(text)]
+
+    def clause_of(position: int) -> int:
+        return bisect_left(stops, position)
+
+    first_deleter_end: dict[int, int] = {}
+    for deleter in _NON_GC_DELETER.finditer(text):
+        first_deleter_end.setdefault(clause_of(deleter.end()), deleter.end())
+    last_marker_start = {
+        clause_of(marker.start()): marker.start()
+        for marker in _MARKER_NOUN.finditer(text)
+    }
+    for verb in _DELETION_VERB.finditer(text):
+        deleter_end = first_deleter_end.get(clause_of(verb.start()))
+        marker_start = last_marker_start.get(clause_of(verb.end()))
+        if (
+            deleter_end is not None
+            and deleter_end <= verb.start()
+            and marker_start is not None
+            and marker_start >= verb.end()
+        ):
+            return True
+    return False
+
+
+# What a clearance claim must be ABOUT for the probe rules below to fire.
+# Without it, an unrelated task reporting "the flaky test did not reproduce"
+# would be rejected under an invariant that says nothing about it.
+_PROBE_SUBJECT = r'(?:graphiti|falkordb|mixed[- ]store|degradation)'
+
+_NOT_REPRODUCED = (
+    r"\b(?:did|does|do|was|were|is|are|has|have|had|could|would)"
+    r"(?:\s+not|n['\u2019]t)\s+(?:be\s+)?reproduc\w*"
+)
+
+# At most a couple of determiners may sit between a negated `reproduce` and
+# the fault it is about. Anything wordier is a DIFFERENT subject wearing the
+# same words — "the stage1 stall bug did not reproduce after the Graphiti
+# degradation was fixed" asserts nothing this invariant forbids.
+_DETERMINER_GAP = r'(?:\s+(?:the|this|that|a|an|any|its|such)){0,2}\s+'
+
+# "<fault> did not reproduce" or "did not reproduce the <fault>": on its own,
+# a truthful report of what a probe saw.
+_NEGATED_REPRODUCTION = re.compile(
+    rf'{_PROBE_SUBJECT}\s+{_NOT_REPRODUCED}'
+    rf'|{_NOT_REPRODUCED}{_DETERMINER_GAP}{_PROBE_SUBJECT}',
+    re.IGNORECASE,
+)
+
+# What turns that report into a CLEARANCE CLAIM when it follows the report in
+# the same clause. A state word says the fault itself is over. A window word
+# widens the negative from one probe to the whole cycle — unless the clause
+# also names a probe's `limit`, which scopes it back to that probe: "did not
+# reproduce this cycle at limit=3" is a per-probe report. Without either,
+# "did not reproduce" is precisely the fine-grained reporting the Stage 2
+# probe protocol asks for, and rejecting it would make the rule reject the
+# protocol's own output.
+_STATE_QUALIFIER = re.compile(
+    r'\b(?:no\s+longer|any\s?more|cleared|clear|resolved|gone|absent|healthy)\b',
+    re.IGNORECASE,
+)
+_WINDOW_QUALIFIER = re.compile(r'\bthis\s+(?:cycle|run)\b', re.IGNORECASE)
+_PROBE_LIMIT = re.compile(r'\blimits?\s*[=:-]?\s*\d', re.IGNORECASE)
+
+# "<fault> no longer reproduces" qualifies itself, and carries no negated
+# auxiliary for _NEGATED_REPRODUCTION to hang on.
+_NO_LONGER_REPRODUCES = re.compile(
+    rf'{_PROBE_SUBJECT}\s+no\s+longer\s+(?:be\s+)?reproduc\w*', re.IGNORECASE
+)
+
+# A clause that also names a POSITIVE sighting is a mixed-outcome report —
+# "did not reproduce at limit=3, but fired at limit=8 this cycle" — and the
+# qualifier there scopes the sighting, not a clearance. Only an un-negated
+# verb counts: "did not reproduce this cycle and did not reproduce last cycle
+# either" is still a clearance claim.
+_SIGHTING_VERB = r'\b(?:reproduc(?:e|es|ed|ing)|fired|fires|recurred|recurs)\b'
+# A zero count negates its verb through its subject instead ("0 of 3 probes
+# reproduced", "none of them fired", "no probe reproduced"). It is the
+# protocol's own permitted wording: read as a sighting, it would wave through
+# any claim it is appended to.
+_ZERO_COUNT_REPORT = (
+    r'\b(?:0|zero|none|no|neither|not\s+(?:a\s+single|one))\b(?:/\d+)?(?:\s+of)?'
+    r'(?:\s+(?:the|these|those|them))?(?:\s+\d+)?'
+    r'(?:\s+(?:[\w-]+\s+)?probes?)?(?:\s+(?:has|have|had))?\s+'
+    + _SIGHTING_VERB
+)
+# Scanned left to right, so a zero count or a negation consumes the verb it
+# governs before the last alternative can read that verb as a sighting.
+_SIGHTING_SCAN = re.compile(
+    rf'{_ZERO_COUNT_REPORT}'
+    rf"|(?:\bnot|n['\u2019]t|\bnever|\bbe|\blonger)\s+{_SIGHTING_VERB}"
+    rf'|(?P<sighting>{_SIGHTING_VERB})',
+    re.IGNORECASE,
+)
+
+# The other shape a clearance claim takes: asserting the fault's absence
+# outright. The scope word must GOVERN the fault noun — "no current Graphiti
+# failure" is a clearance claim, "no current owner for the ... degradation
+# problem" is a statement about ownership — so at most the probe subject may
+# sit between them. The fault must also be named somewhere after the `no`, so
+# the rule fires only on sentences about THIS fault.
+_FAULT_SCOPE = (
+    r'(?:persistent|persisting|ongoing|active|current|systemic|underlying)'
+)
+_FAULT_NOUN = r'\b(?:problem|issue|degradation|fault|defect|failure)s?\b'
+_SCOPED_ABSENCE = re.compile(
+    rf'\bno\s+{_FAULT_SCOPE}\b(?:\s+{_PROBE_SUBJECT})?\s+{_FAULT_NOUN}',
+    re.IGNORECASE,
+)
+_NAMES_THE_FAULT = re.compile(_PROBE_SUBJECT, re.IGNORECASE)
+
+# Both probe rules judge one clause at a time with a fixed number of single
+# passes over it, so a lint stays linear in the length of the text — it runs
+# synchronously on the submit_task path. One pattern that found each candidate
+# claim and then re-scanned the rest of its clause cost time quadratic in the
+# length of a clause with no terminator.
+_CLAUSE_BREAK = re.compile(r'[.;]')
+
+
+def _names_positive_sighting(clause: str) -> bool:
+    return any(match['sighting'] for match in _SIGHTING_SCAN.finditer(clause))
+
+
+def _clause_reports_non_reproduction_as_clearance(clause: str) -> bool:
+    if _names_positive_sighting(clause):
+        return False
+    if _NO_LONGER_REPRODUCES.search(clause):
+        return True
+    # Only the first report needs testing: a qualifier that follows any later
+    # report follows this one too.
+    report = _NEGATED_REPRODUCTION.search(clause)
+    if report is None:
+        return False
+    if _STATE_QUALIFIER.search(clause, report.end()):
+        return True
+    return (
+        _WINDOW_QUALIFIER.search(clause, report.end()) is not None
+        and _PROBE_LIMIT.search(clause) is None
+    )
+
+
+def _clause_asserts_fault_absence(clause: str) -> bool:
+    absence = _SCOPED_ABSENCE.search(clause)
+    return (
+        absence is not None
+        and _NAMES_THE_FAULT.search(clause, absence.start()) is not None
+    )
+
+
+def _reports_non_reproduction_as_clearance(text: str) -> bool:
+    return any(
+        map(_clause_reports_non_reproduction_as_clearance, _CLAUSE_BREAK.split(text))
+    )
+
+
+def _asserts_fault_absence(text: str) -> bool:
+    return any(map(_clause_asserts_fault_absence, _CLAUSE_BREAK.split(text)))
+
+
+# Quotes the verdict the stage prompts show, so a rejected caller is told the
+# exact permitted wording and the two can never disagree.
+_NEGATIVE_PROBE_SET_DETAIL = (
+    'The Graphiti mixed-store degradation is intermittent and load-dependent, '
+    'and `search` reports store failure only WHEN a store has already failed — '
+    'so a clean probe is no evidence of health, and a negative probe set is an '
+    'absence of evidence rather than evidence of absence. Report the count, not '
+    'a verdict: "' + NEGATIVE_SET_VERDICT + '"'
+)
+
+# Module-level rule table for premise_lint: (matcher, invariant_name,
+# detail). A matcher is truthy when its text asserts the premise: a compiled
+# pattern's `search` where a fixed phrasing is enough, or a clause-level
+# predicate where the rest of the clause decides whether a phrase is the
+# claim. Each rule encodes one known-false premise recon has written into a
+# task: the run_id and marker rules come from the 2083/2092/2093 batch, which
+# mis-modeled run_id and the stage1_flag_marker lifecycle; the two probe rules
+# from run cd53b227, which promoted a negative probe set to a clearance claim
+# (task 4644). Extend this table as new false premises (or new paraphrasings
+# of an existing one) are discovered; premise_lint returns one Violation per
+# matching rule.
 #
 # BEST-EFFORT DENYLIST, NOT EXHAUSTIVE VALIDATION: premise_lint is a regex
 # lint over a fixed, small set of known-false phrasings — it does not
@@ -698,13 +1151,13 @@ _GAP_NO_NEGATION = r"(?:(?!\bnot\b|\bnever\b|n['’]t\b|[.;]).)*"
 # matched, not that the description is otherwise correct. Treat a clean
 # lint result accordingly and keep extending this table as new paraphrases
 # surface, rather than over-trusting its coverage.
-_PREMISE_RULES: tuple[tuple[re.Pattern[str], str, str], ...] = (
+_PREMISE_RULES: tuple[tuple[Callable[[str], object], str, str], ...] = (
     (
         re.compile(
             r'run_id\s+(?:persists?|is\s+persist(?:ed|ent)|stable|the\s+same|'
             r'carr(?:y|ies)\s+over)\s+(?:across|between)\s+(?:cycles|runs)',
             re.IGNORECASE,
-        ),
+        ).search,
         'run_id_is_fresh_per_run',
         (
             'run_id is minted fresh per run and is never persisted across '
@@ -717,7 +1170,7 @@ _PREMISE_RULES: tuple[tuple[re.Pattern[str], str, str], ...] = (
             r'reuse\s+(?:the\s+)?run_id\s+from\s+(?:the\s+)?'
             r'(?:previous|prior|last)\s+(?:cycle|run)',
             re.IGNORECASE,
-        ),
+        ).search,
         'run_id_is_fresh_per_run',
         (
             'run_id is minted fresh per run and must never be reused from a '
@@ -726,19 +1179,23 @@ _PREMISE_RULES: tuple[tuple[re.Pattern[str], str, str], ...] = (
         ),
     ),
     (
-        re.compile(
-            r'(?:stage\s*3|remediation|the\s+llm)' + _GAP_NO_NEGATION
-            + r'\b(?:deletes?|removes?|clears?|purges?)\b'
-            + _GAP_NO_NEGATION + r'\b(?:flag_for_stage2|flag\s+marker|'
-            r'stage1_flag_marker|marker)\b',
-            re.IGNORECASE,
-        ),
+        _asserts_non_gc_marker_deletion,
         'markers_deleted_only_by_gc',
         (
             'Per-task markers (stage1_flag_marker, flag_for_stage2, '
             'stage2_persistence_marker) are deleted only by GC on terminal '
             'task (or TTL) — never by Stage 3 remediation or the LLM.'
         ),
+    ),
+    (
+        _reports_non_reproduction_as_clearance,
+        'negative_probe_set_does_not_clear_intermittent_fault',
+        _NEGATIVE_PROBE_SET_DETAIL,
+    ),
+    (
+        _asserts_fault_absence,
+        'negative_probe_set_does_not_clear_intermittent_fault',
+        _NEGATIVE_PROBE_SET_DETAIL,
     ),
 )
 
@@ -752,8 +1209,8 @@ def premise_lint(task_description: str) -> list[Violation]:
     description is otherwise correct.
     """
     violations: list[Violation] = []
-    for pattern, invariant, detail in _PREMISE_RULES:
-        if pattern.search(task_description):
+    for matches, invariant, detail in _PREMISE_RULES:
+        if matches(task_description):
             violations.append(
                 Violation(premise=task_description, invariant=invariant, detail=detail)
             )

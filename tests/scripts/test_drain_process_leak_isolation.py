@@ -1,0 +1,1491 @@
+"""Guard tests: a test's spawn timeout can never leak a process group (task 3798).
+
+Both harnesses that drive ``scripts/restart-all-orchestrators.sh --drain`` from
+pytest used a plain ``subprocess.run(..., timeout=N)``.  On POSIX that timeout
+path ``kill()``s the DIRECT CHILD only.  The drain script forks poll loops that
+survive it, get reparented to ``systemd --user``, and then sit spending their
+grace: 86 concurrent orphans accumulated on 2026-08-06 and 82 more on
+2026-08-07, each holding an ``ORCH_RESTART_FORCE_FIRE_AFTER_SECS`` /
+``ORCH_DRAIN_UNKNOWN_GRACE_SECS`` of ``99999`` seconds — 27.8 HOURS — before
+expiry.
+
+Two independent defects, and this module covers the suite-wide fix for both:
+
+* the spawn is not session-isolated, so the timeout kill cannot reach the group
+  (:func:`df_pytest_isolation.run_in_new_session`); and
+* the grace knobs were hand-typed at a value so large that anything which DOES
+  escape outlives pytest's tmpdir GC — at which point its PATH no longer
+  resolves ``systemctl`` to the test's fake and it restarts REAL units
+  (:func:`df_pytest_isolation.wait_proof_grace_secs`).
+
+Shaped like ``test_deploy_clock_isolation.py``, the module covering this repo's
+sibling suite-wide isolation defence, so the two read as one family: pure
+helpers tested directly, then ``TestGuardIsLiveInThisRun`` for the wiring, then
+a nested-pytest end-to-end failure contract with a non-vacuity control.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import dataclasses
+import os
+import signal
+import subprocess
+import time
+import warnings
+from collections.abc import Callable, Mapping
+from pathlib import Path
+
+import pytest
+from nested_pytest_session import (
+    NESTED_SESSION_TIMEOUT_SECS,
+    arming_conftest,
+    run_nested_pytest,
+)
+from shared.testing_own_time import OwnTimeClock, wait_on_own_time
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+import df_pytest_isolation
+from df_pytest_isolation import (
+    DRAIN_SCRIPT_CMDLINE_MARKER,
+    LEAK_SELF_TERMINATION_CEILING_SECS,
+    LEAK_TOKEN_ENV,
+    WAIT_PROOF_GRACE_FLOOR_SECS,
+    WAIT_PROOF_GRACE_MULTIPLIER,
+    WAIT_PROOF_SPAWN_TIMEOUT_CAP_SECS,
+    fixture_marker,
+    leaked_drain_process_reason,
+    leaked_drain_processes,
+    load_scaled_grace,
+    read_drain_poll_trace,
+    read_leaked_pid,
+    run_in_new_session,
+    run_in_new_session_until,
+    run_in_new_session_while_progressing,
+    wait_pid_gone,
+    wait_proof_grace_secs,
+)
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
+
+# NOT `from df_pytest_isolation import _df_no_leaked_drain_processes`. Importing
+# a FIXTURE into a test module binds it as a module-scoped fixture that SHADOWS
+# the conftest's, so the registration test below would resolve its own import
+# and pass with the conftest wiring deleted — precisely the dead defence it
+# exists to detect. Reach it through the module instead.
+_GUARD_NAME = '_df_no_leaked_drain_processes'
+
+# ---------------------------------------------------------------------------
+# Synthetic leakers.
+#
+# THE PIPE-HOLDING VARIANT LIVES HERE AND ONLY HERE.  Its background child
+# inherits the spawn's stdout/stderr pipe write ends, so a drain run against it
+# after the kill never sees EOF — unbounded, it blocks forever.  That is what
+# makes it the right probe for `run_in_new_session`, which bounds its drain.
+#
+# The tests that drive the REAL spawners — in
+# `scripts/tests/test_restart_all_orchestrators.py` and
+# `tests/scripts/test_orchestrator_watchdog.py` — use a PIPE-CLOSING variant
+# (`>/dev/null 2>&1`) instead, so their assertions depend only on "is the
+# grandchild alive" and not on what a spawner does after its kill.  (Measured
+# while implementing 3798: stock `subprocess.run` would not actually hang on
+# the pipe-holding variant either — its POSIX timeout branch calls
+# `process.wait()`, never a second `communicate()`.  Pipe-closing remains the
+# right choice there because it pins less, not because the alternative hangs.)
+# ---------------------------------------------------------------------------
+
+_PIPE_HOLDING_LEAKER = '''\
+sleep 300 &
+echo $! > "$LEAK_PIDFILE"
+echo MAIN_UP
+sleep 300
+'''
+
+
+def _leaker_script(tmp_path: Path, name: str = 'pipe_holding_leaker.sh') -> Path:
+    """Write a bash script that forks a grandchild outliving its own parent.
+
+    Deliberately NOT named ``restart-all-orchestrators.sh``: the leak guard
+    matches on that basename in ``/proc/<pid>/cmdline``, and these tests reap
+    their own spawns, so borrowing the marker would only muddy a real failure.
+    """
+    script = tmp_path / name
+    script.write_text(_PIPE_HOLDING_LEAKER)
+    return script
+
+
+def _leaker_env(pidfile: Path) -> dict[str, str]:
+    """Child env for a leaker: the real environment plus its pidfile.
+
+    Copied from ``os.environ`` rather than built from scratch, mirroring what
+    both real spawners do — a bare ``{'LEAK_PIDFILE': ...}`` would leave the
+    child without a PATH and exercise a call shape nothing in the repo uses.
+    """
+    env = dict(os.environ)
+    env['LEAK_PIDFILE'] = str(pidfile)
+    return env
+
+
+def _reap(pid: int | None) -> None:
+    """SIGKILL *pid*, ignoring every way it can already be gone.
+
+    Every test that spawns calls this in a ``finally``: a RED that fails its
+    "the grandchild is dead" assertion has, by construction, a live orphan in
+    hand, and a guard test that leaks is worse than no guard test.
+    """
+    if pid is None:
+        return
+    with contextlib.suppress(OSError):
+        os.kill(pid, signal.SIGKILL)
+
+
+class TestRunInNewSession:
+    """The spawn helper kills the whole process group when its timeout fires."""
+
+    def test_a_timeout_kills_the_backgrounded_grandchild_too(self, tmp_path: Path) -> None:
+        """The defect, stated directly.
+
+        ``subprocess.run``'s timeout path calls ``Popen.kill()``, which signals
+        the direct child and nothing else — verified against real processes: the
+        backgrounded grandchild survives. ``start_new_session=True`` plus a
+        ``killpg`` of the captured pgid is what actually reaches it.
+        """
+        pidfile = tmp_path / 'leaked.pid'
+        leaker = _leaker_script(tmp_path)
+        leaked_pid = None
+        try:
+            with pytest.raises(subprocess.TimeoutExpired):
+                run_in_new_session(
+                    ['bash', str(leaker)], env=_leaker_env(pidfile), timeout=2,
+                )
+
+            leaked_pid = read_leaked_pid(pidfile)
+            assert wait_pid_gone(leaked_pid), (
+                f'pid {leaked_pid} — a grandchild backgrounded by the spawned '
+                'script — is STILL ALIVE after the spawn timed out. The timeout '
+                'killed only the direct child, so the poll loop it forked is now '
+                'an orphan reparented to systemd --user, free to spend its grace '
+                'and then issue a real systemctl restart.'
+            )
+        finally:
+            _reap(leaked_pid)
+
+    def test_the_timeout_is_honoured_as_a_wall_clock_bound(self, tmp_path: Path) -> None:
+        """The timeout must be a real bound even against a pipe-HOLDING child.
+
+        The non-obvious half of the fix. A surviving grandchild holds the
+        inherited stdout/stderr pipe write ends, so a drain run against it
+        never sees EOF; unbounded, it blocks forever and the caller's
+        ``timeout=`` stops being a bound at all. Measured: a direct
+        ``communicate()`` after a plain ``kill()`` of such a child does hang.
+
+        The HAPPY path only: the group kill lands, every write end closes at
+        once, and the drain returns in milliseconds — so deleting the drain's
+        own timeout would leave THIS test green. The degraded paths, where the
+        bound is the only thing standing between this suite and pytest-timeout's
+        300s axe, are covered by
+        ``test_the_drain_stays_bounded_when_the_group_kill_does_not_land``
+        below; this one pins that the ordinary case is bounded too.
+
+        15s for a 2s timeout is deliberately loose: this asserts "bounded", not
+        a latency, so it cannot flake under load.
+        """
+        pidfile = tmp_path / 'leaked.pid'
+        leaker = _leaker_script(tmp_path)
+        leaked_pid = None
+        try:
+            started = time.monotonic()
+            with pytest.raises(subprocess.TimeoutExpired):
+                run_in_new_session(
+                    ['bash', str(leaker)], env=_leaker_env(pidfile), timeout=2,
+                )
+            elapsed = time.monotonic() - started
+            # Read (and therefore arm the reap of) the pid BEFORE asserting, so
+            # a failure here still cleans up. `read_leaked_pid` can itself
+            # fail, which is why it must not run inside the `finally`.
+            leaked_pid = read_leaked_pid(pidfile)
+
+            assert elapsed < 15, (
+                f'the spawn took {elapsed:.1f}s to honour a timeout of 2s. The '
+                'post-kill drain is unbounded and is blocking on the pipe the '
+                'surviving grandchild still holds open.'
+            )
+        finally:
+            _reap(leaked_pid)
+
+    @pytest.mark.parametrize('degrade', ['refused', 'killpg_raises'])
+    def test_the_drain_stays_bounded_when_the_group_kill_does_not_land(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, degrade: str,
+    ) -> None:
+        """The two DEGRADED branches of ``_kill_process_group``, which nothing else runs.
+
+        Both fall back to ``p.kill()`` — the direct child only — so the
+        pipe-HOLDING grandchild survives holding the stdout/stderr write ends
+        open, and the post-kill drain never sees EOF. That is the ONLY state in
+        which the drain's own timeout does anything, and it is unreachable
+        through the happy path: a landed group kill closes every write end, so
+        an unbounded drain would return in milliseconds there and look fine.
+
+        Neither branch is reachable in production either — ``pgid = p.pid`` of a
+        freshly spawned child cannot equal this process's pid/ppid/pgrp, and
+        ``killpg`` of a group we just created does not normally fail — which is
+        exactly why they have to be forced. They are the fallbacks the safety
+        machinery deliberately keeps, so they must be the ones under test.
+
+        ``_POST_KILL_DRAIN_SECS`` is patched down to keep this cheap; the
+        assertion is against the PATCHED value, so it still pins "the drain
+        honours the module's bound" and not a hardcoded duration. An unbounded
+        drain does not fail this assertion — it never reaches it, and reports as
+        this test's own pytest-timeout kill instead. Either way it is red.
+        """
+        monkeypatch.setattr(df_pytest_isolation, '_POST_KILL_DRAIN_SECS', 2)
+        if degrade == 'refused':
+            monkeypatch.setattr(
+                df_pytest_isolation, '_unsafe_pgid_reason', lambda pgid: 'forced refusal',
+            )
+        else:
+            def _boom(pgid, sig):
+                raise PermissionError('forced killpg failure')
+            monkeypatch.setattr(os, 'killpg', _boom)
+
+        pidfile = tmp_path / 'leaked.pid'
+        leaker = _leaker_script(tmp_path)
+        leaked_pid = None
+        try:
+            started = time.monotonic()
+            with pytest.raises(subprocess.TimeoutExpired):
+                run_in_new_session(
+                    ['bash', str(leaker)], env=_leaker_env(pidfile), timeout=2,
+                )
+            elapsed = time.monotonic() - started
+            leaked_pid = read_leaked_pid(pidfile)
+
+            drain_cap = df_pytest_isolation._POST_KILL_DRAIN_SECS
+            assert elapsed < 2 + drain_cap + 5, (
+                f'the spawn took {elapsed:.1f}s for a 2s timeout with a '
+                f'{drain_cap}s drain cap, on the {degrade!r} fallback. The '
+                'post-kill drain is not honouring its bound and is blocking on '
+                'the pipe the surviving grandchild still holds open.'
+            )
+            # NON-VACUITY. Without this the test would also pass on a run that
+            # never reached the drain at all — a fallback that quietly stopped
+            # firing, or a grandchild that closed the pipes after all, would
+            # return in milliseconds and look like a pass. On these branches the
+            # drain MUST block for its full cap: the direct child is dead, and
+            # the surviving `sleep` holds the write ends for its whole 300s.
+            assert elapsed >= 2 + drain_cap - 0.5, (
+                f'the spawn returned in {elapsed:.1f}s on the {degrade!r} '
+                f'fallback, i.e. before its 2s timeout plus {drain_cap}s drain '
+                'could both elapse — so the bounded drain this test exists to '
+                'cover was never entered and the assertion above proves nothing.'
+            )
+        finally:
+            # MANDATORY here in a way it is not elsewhere: on these branches the
+            # grandchild survives BY DESIGN, so this test leaks without it.
+            _reap(leaked_pid)
+
+    def test_partial_output_is_attached_to_the_timeout(self, tmp_path: Path) -> None:
+        """``TimeoutExpired.stdout`` still carries what the child managed to print.
+
+        Load-bearing for every existing caller: the three defer/grace tests
+        assert on the script's output from the TIMEOUT path, through ``_decode``
+        / ``_boundary_decode``. A helper that dropped the partial output would
+        turn those into silent vacuous passes.
+        """
+        pidfile = tmp_path / 'leaked.pid'
+        leaker = _leaker_script(tmp_path)
+        leaked_pid = None
+        try:
+            with pytest.raises(subprocess.TimeoutExpired) as exc_info:
+                run_in_new_session(
+                    ['bash', str(leaker)], env=_leaker_env(pidfile), timeout=2,
+                )
+
+            leaked_pid = read_leaked_pid(pidfile)
+            stdout = exc_info.value.stdout
+            assert stdout is not None, 'TimeoutExpired carried no stdout at all'
+            text = stdout.decode(errors='replace') if isinstance(stdout, bytes) else stdout
+            assert 'MAIN_UP' in text, (
+                f'partial stdout was lost on the timeout path; got {text!r}'
+            )
+        finally:
+            _reap(leaked_pid)
+
+    def test_a_normal_exit_returns_a_completed_process(self) -> None:
+        """Non-vacuity control: a drop-in for ``subprocess.run`` on the happy path.
+
+        ~26 existing call sites read ``.returncode`` / ``.stdout`` / ``.stderr``
+        off the return value, so the helper is only substitutable if the
+        untimed-out path is byte-for-byte the same shape.
+        """
+        result = run_in_new_session(
+            ['bash', '-c', 'echo hi; echo boom >&2; exit 3'], timeout=30,
+        )
+
+        assert isinstance(result, subprocess.CompletedProcess)
+        assert result.returncode == 3
+        assert result.stdout == 'hi\n'
+        assert result.stderr == 'boom\n'
+
+    def test_a_suspect_pgid_is_never_signalled(self) -> None:
+        """The defence-in-depth refusal ported from ``shared.proc_group``.
+
+        Not cosmetic. That module's docstring records task 845: a ``killpg``
+        aimed via ``os.getpgid(pid)`` at a RECYCLED pid resolved to the
+        ``systemd --user`` manager's group and killed the user's entire login
+        session. The hazard is especially live here — the orphans this guard
+        exists to kill are themselves reparented to ``systemd --user``.
+
+        Asserts each refusal is non-None, never its wording: the message is
+        triage text, the refusal is the contract.
+        """
+        unsafe = df_pytest_isolation._unsafe_pgid_reason
+
+        for pgid in (-1, 0, 1, os.getpid(), os.getppid(), os.getpgrp()):
+            assert unsafe(pgid) is not None, (
+                f'pgid {pgid} must be refused — signalling it can take out this '
+                'process, its parent, or the whole login session.'
+            )
+
+        forbidden = {0, 1, os.getpid(), os.getppid(), os.getpgrp()}
+        ordinary = next(c for c in range(4_000_000, 4_000_100) if c not in forbidden)
+        assert unsafe(ordinary) is None, (
+            f'pgid {ordinary} is an ordinary unrelated group and must be allowed, '
+            'or the helper degrades to never group-killing anything.'
+        )
+
+
+def _pid_recorded(pidfile: Path) -> Callable[[], bool]:
+    """A condition that holds once the leaker has written its grandchild's pid."""
+    def condition() -> bool:
+        try:
+            return pidfile.read_text().strip().isdigit()
+        except OSError:
+            return False
+    return condition
+
+
+def _never() -> bool:
+    return False
+
+
+class TestRunInNewSessionUntil:
+    """The spawner stops the whole process group once an observed condition holds."""
+
+    def test_it_stops_the_group_as_soon_as_the_condition_holds(self, tmp_path: Path) -> None:
+        """``stopped_on_condition`` is the non-vacuity proof: a stop on the 60s
+        deadline raises ``TimeoutExpired`` instead of returning an outcome."""
+        pidfile = tmp_path / 'leaked.pid'
+        leaker = _leaker_script(tmp_path)
+        leaked_pid = None
+        try:
+            outcome = run_in_new_session_until(
+                ['bash', str(leaker)], condition=_pid_recorded(pidfile),
+                env=_leaker_env(pidfile), timeout=60,
+            )
+            leaked_pid = read_leaked_pid(pidfile)
+
+            assert outcome.stopped_on_condition is True
+            assert wait_pid_gone(leaked_pid), (
+                f'pid {leaked_pid}, a grandchild backgrounded by the spawned '
+                'script, is STILL ALIVE after the condition stopped the spawn: '
+                'the stop reached the direct child only.'
+            )
+        finally:
+            _reap(leaked_pid)
+
+    def test_output_printed_before_the_stop_is_kept(self, tmp_path: Path) -> None:
+        flag = tmp_path / 'ready.flag'
+        env = dict(os.environ)
+        env['FLAG'] = str(flag)
+
+        outcome = run_in_new_session_until(
+            ['bash', '-c', 'echo READY; : > "$FLAG"; sleep 300'],
+            condition=flag.exists, env=env, timeout=60,
+        )
+
+        assert outcome.stopped_on_condition is True
+        assert 'READY' in outcome.completed.stdout
+
+    def test_a_child_that_exits_first_is_reported_as_completed(self) -> None:
+        outcome = run_in_new_session_until(
+            ['bash', '-c', 'echo hi; echo boom >&2; exit 3'], condition=_never, timeout=30,
+        )
+
+        assert outcome.stopped_on_condition is False
+        assert isinstance(outcome.completed, subprocess.CompletedProcess)
+        assert outcome.completed.returncode == 3
+        assert outcome.completed.stdout == 'hi\n'
+        assert outcome.completed.stderr == 'boom\n'
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            outcome.stopped_on_condition = True  # type: ignore[misc]
+
+    def test_the_deadline_still_binds_and_kills_the_group(self, tmp_path: Path) -> None:
+        pidfile = tmp_path / 'leaked.pid'
+        leaker = _leaker_script(tmp_path)
+        leaked_pid = None
+        try:
+            with pytest.raises(subprocess.TimeoutExpired) as exc_info:
+                run_in_new_session_until(
+                    ['bash', str(leaker)], condition=_never,
+                    env=_leaker_env(pidfile), timeout=2,
+                )
+            leaked_pid = read_leaked_pid(pidfile)
+
+            stdout = exc_info.value.stdout
+            text = stdout.decode(errors='replace') if isinstance(stdout, bytes) else stdout
+            assert 'MAIN_UP' in (text or ''), (
+                f'partial stdout was lost on the deadline path; got {text!r}'
+            )
+            assert wait_pid_gone(leaked_pid), (
+                f'pid {leaked_pid} is STILL ALIVE after the deadline fired: the '
+                'deadline path did not stop the whole process group.'
+            )
+        finally:
+            _reap(leaked_pid)
+
+    def test_a_raising_condition_never_leaks_the_group(self, tmp_path: Path) -> None:
+        pidfile = tmp_path / 'leaked.pid'
+        leaker = _leaker_script(tmp_path)
+        pid_recorded = _pid_recorded(pidfile)
+
+        def condition() -> bool:
+            if pid_recorded():
+                raise RuntimeError('condition blew up')
+            return False
+
+        leaked_pid = None
+        try:
+            with pytest.raises(RuntimeError, match='condition blew up'):
+                run_in_new_session_until(
+                    ['bash', str(leaker)], condition=condition,
+                    env=_leaker_env(pidfile), timeout=60,
+                )
+            leaked_pid = read_leaked_pid(pidfile)
+
+            assert wait_pid_gone(leaked_pid), (
+                f'pid {leaked_pid} is STILL ALIVE after the condition raised: an '
+                'exception escaping the poll loop left the process group running.'
+            )
+        finally:
+            _reap(leaked_pid)
+
+
+def _line_count(path: Path) -> Callable[[], int]:
+    """A progress probe: how many lines *path* holds, 0 while it is absent."""
+    def progress() -> int:
+        try:
+            return len(path.read_text().splitlines())
+        except OSError:
+            return 0
+    return progress
+
+
+# Enough reads of a still stall clock that the polls between them outlast a
+# 0.01s stall bound many times over on the wall clock.
+_STILL_CLOCK_READS_BEFORE_RELEASE = 10
+
+
+class TestRunInNewSessionWhileProgressing:
+    """The must-not-hang bound counts only time in which the child made no progress."""
+
+    def test_progress_re_arms_the_stall_bound(self, tmp_path: Path) -> None:
+        ticks = tmp_path / 'ticks'
+        env = dict(os.environ)
+        env['TICKS'] = str(ticks)
+        readings: list[float] = []
+
+        def recorded_own_time(pid: int) -> Callable[[], float]:
+            clock = OwnTimeClock(pid)
+
+            def read() -> float:
+                readings.append(clock())
+                return readings[-1]
+
+            return read
+
+        result = run_in_new_session_while_progressing(
+            ['bash', '-c', 'for i in 1 2 3 4 5 6 7 8; do echo x >> "$TICKS"; sleep 0.5; done; echo DONE'],
+            progress=_line_count(ticks), stall_timeout=3, env=env,
+            stall_clock=recorded_own_time,
+        )
+
+        assert isinstance(result, subprocess.CompletedProcess)
+        assert result.returncode == 0
+        assert result.stdout == 'DONE\n'
+        assert max(readings) >= 3, (
+            f'the child ran {max(readings):.1f}s of its own time, inside its own 3s '
+            'stall bound, so it never needed the bound re-armed and proves nothing '
+            'about progress.'
+        )
+
+    def test_a_stalled_child_is_stopped_with_its_whole_group(self, tmp_path: Path) -> None:
+        pidfile = tmp_path / 'leaked.pid'
+        leaker = _leaker_script(tmp_path)
+        leaked_pid = None
+        try:
+            with pytest.raises(subprocess.TimeoutExpired) as exc_info:
+                run_in_new_session_while_progressing(
+                    ['bash', str(leaker)], progress=_pid_recorded(pidfile),
+                    stall_timeout=2, env=_leaker_env(pidfile), stall_clock=OwnTimeClock,
+                )
+            leaked_pid = read_leaked_pid(pidfile)
+
+            assert exc_info.value.timeout == 2
+            stdout = exc_info.value.stdout
+            text = stdout.decode(errors='replace') if isinstance(stdout, bytes) else stdout
+            assert 'MAIN_UP' in (text or ''), (
+                f'partial stdout was lost on the stall path; got {text!r}'
+            )
+            assert wait_pid_gone(leaked_pid), (
+                f'pid {leaked_pid} is STILL ALIVE after the stall bound fired: the '
+                'stall path did not stop the whole process group.'
+            )
+        finally:
+            _reap(leaked_pid)
+
+    def test_a_raising_progress_probe_never_leaks_the_group(self, tmp_path: Path) -> None:
+        pidfile = tmp_path / 'leaked.pid'
+        leaker = _leaker_script(tmp_path)
+        pid_recorded = _pid_recorded(pidfile)
+
+        def progress() -> bool:
+            if pid_recorded():
+                raise RuntimeError('progress blew up')
+            return False
+
+        leaked_pid = None
+        try:
+            with pytest.raises(RuntimeError, match='progress blew up'):
+                run_in_new_session_while_progressing(
+                    ['bash', str(leaker)], progress=progress,
+                    stall_timeout=60, env=_leaker_env(pidfile), stall_clock=OwnTimeClock,
+                )
+            leaked_pid = read_leaked_pid(pidfile)
+
+            assert wait_pid_gone(leaked_pid), (
+                f'pid {leaked_pid} is STILL ALIVE after the progress probe raised: '
+                'an exception escaping the poll loop left the process group running.'
+            )
+        finally:
+            _reap(leaked_pid)
+
+    def test_a_normal_exit_is_a_completed_process(self) -> None:
+        result = run_in_new_session_while_progressing(
+            ['bash', '-c', 'echo hi; echo boom >&2; exit 3'],
+            progress=lambda: 0, stall_timeout=30, stall_clock=OwnTimeClock,
+        )
+
+        assert isinstance(result, subprocess.CompletedProcess)
+        assert result.returncode == 3
+        assert result.stdout == 'hi\n'
+        assert result.stderr == 'boom\n'
+
+    def test_the_stall_is_read_on_the_clock_made_for_the_spawned_child(
+        self, tmp_path: Path,
+    ) -> None:
+        """The injected clock never moves, and releases the child only on its
+        _STILL_CLOCK_READS_BEFORE_RELEASE-th read. The polls before that already
+        outlast the stall bound on the wall clock, so the child exits on its own
+        only if the bound is read on the injected clock alone. The child prints
+        its pid, which must be the one pid the clock was made for."""
+        go = tmp_path / 'go'
+        env = dict(os.environ)
+        env['GO'] = str(go)
+        clocked_pids: list[int] = []
+
+        def stall_clock(pid: int) -> Callable[[], float]:
+            clocked_pids.append(pid)
+            reads = 0
+
+            def still_clock() -> float:
+                nonlocal reads
+                reads += 1
+                if reads == _STILL_CLOCK_READS_BEFORE_RELEASE:
+                    go.touch()
+                return 0.0
+
+            return still_clock
+
+        result = run_in_new_session_while_progressing(
+            ['bash', '-c', 'echo $$; until [ -e "$GO" ]; do sleep 0.05; done; echo DONE'],
+            progress=lambda: 0, stall_timeout=0.01, env=env, stall_clock=stall_clock,
+        )
+
+        assert isinstance(result, subprocess.CompletedProcess)
+        assert len(clocked_pids) == 1, clocked_pids
+        assert result.returncode == 0
+        assert result.stdout == f'{clocked_pids[0]}\nDONE\n'
+
+    def test_a_raising_stall_clock_never_leaks_the_group(self, tmp_path: Path) -> None:
+        pidfile = tmp_path / 'leaked.pid'
+        leaker = _leaker_script(tmp_path)
+
+        def stall_clock(pid: int) -> Callable[[], float]:
+            wait_on_own_time(pid, _pid_recorded(pidfile), budget=10)
+            raise RuntimeError('stall clock blew up')
+
+        leaked_pid = None
+        try:
+            with pytest.raises(RuntimeError, match='stall clock blew up'):
+                run_in_new_session_while_progressing(
+                    ['bash', str(leaker)], progress=_pid_recorded(pidfile),
+                    stall_timeout=60, env=_leaker_env(pidfile), stall_clock=stall_clock,
+                )
+            leaked_pid = read_leaked_pid(pidfile)
+
+            assert wait_pid_gone(leaked_pid), (
+                f'pid {leaked_pid} is STILL ALIVE after the stall clock raised: '
+                'making the clock outside the guarded region left the process '
+                'group running.'
+            )
+        finally:
+            _reap(leaked_pid)
+
+
+class TestWaitProofGraceSecs:
+    """The grace a wait-proving test hands its script is DERIVED, not typed.
+
+    Three call sites each hard-coded ``99999`` seconds — 27.8 HOURS. Every one
+    was locally reasonable: the tests prove the drain script is still POLLING
+    rather than fail-opening, which they do by letting their own short
+    ``subprocess`` timeout fire first, so the grace only has to be big enough
+    not to expire mid-test. Nothing in the code stated the OTHER side of the
+    constraint — that the same number also bounds how long a LEAKED poller
+    lives — so nothing pushed back on making it enormous.
+
+    These tests pin both sides at once, in one place, so a future editor cannot
+    restore a 27.8h value at any single site without failing a test that
+    explains why.
+    """
+
+    # Endpoints of the reachable wait-proving spawn timeouts: the smallest
+    # load-scaled base and WAIT_PROOF_SPAWN_TIMEOUT_CAP_SECS.
+    # wait_proof_grace_secs is monotone, so these bound every site.
+    REAL_SPAWN_TIMEOUTS = (3, WAIT_PROOF_SPAWN_TIMEOUT_CAP_SECS)
+
+    def test_the_grace_comfortably_exceeds_the_spawn_timeout_that_kills_it(self) -> None:
+        """Too SMALL and the wait-proving tests stop proving anything.
+
+        Each asserts "no restart was recorded before my timeout fired". If the
+        grace expired first the script would force-fire, record the restart,
+        and the assertion would fail — so the margin is what keeps those three
+        tests meaningful rather than flaky.
+        """
+        for spawn_timeout in self.REAL_SPAWN_TIMEOUTS:
+            grace = wait_proof_grace_secs(spawn_timeout)
+            assert grace >= spawn_timeout * WAIT_PROOF_GRACE_MULTIPLIER, (
+                f'grace {grace}s for a {spawn_timeout}s spawn timeout is under '
+                f'the {WAIT_PROOF_GRACE_MULTIPLIER}x floor; the script could '
+                'force-fire before the test observes its defer line.'
+            )
+
+    def test_a_leak_self_terminates_within_the_ceiling(self) -> None:
+        """Too LARGE and anything that escapes outlives its own containment.
+
+        This is the actual fix. A leaked poller holding a 99999s grace is still
+        alive 27.8h later — long after pytest's tmpdir GC has removed the fake
+        ``systemctl`` its PATH points at, so its expiry falls through to
+        ``/usr/bin/systemctl`` and restarts REAL units.
+
+        Asserts only what the FUNCTION derives, never the ceiling constant's own
+        magnitude: comparing one literal in ``df_pytest_isolation`` against
+        another literal here cannot fail except when someone edits it, and would
+        pass just as happily with ``wait_proof_grace_secs`` returning garbage.
+        The ceiling's declarative role is documented at its definition instead.
+        """
+        for spawn_timeout in self.REAL_SPAWN_TIMEOUTS:
+            grace = wait_proof_grace_secs(spawn_timeout)
+            assert grace <= LEAK_SELF_TERMINATION_CEILING_SECS, (
+                f'grace {grace}s for a {spawn_timeout}s spawn timeout exceeds '
+                f'the {LEAK_SELF_TERMINATION_CEILING_SECS}s self-termination '
+                'ceiling — a leak from this call site would outlive its fake '
+                'systemctl and reach the real one.'
+            )
+
+    def test_the_spawn_timeout_cap_is_the_largest_the_ceiling_permits(self) -> None:
+        """``WAIT_PROOF_SPAWN_TIMEOUT_CAP_SECS`` is DERIVED, not chosen.
+
+        A wait-proving spawn timeout that is itself load-scaled needs an upper
+        bound, because the grace derived FROM it must still land inside the
+        self-termination ceiling. That bound is not free to be picked: it is
+        the largest spawn timeout whose derived grace still fits.
+
+        Both halves are asserted, and the MAXIMALITY half is the point. Legal
+        alone would pass for any smaller value too, which is exactly how the
+        constant could later be raised by hand until it silently stopped
+        fitting — freehand grace selection is what let 86 orphan pollers
+        accumulate on 2026-08-06. With maximality pinned, the constant cannot
+        be raised without either failing here or deliberately moving
+        ``LEAK_SELF_TERMINATION_CEILING_SECS`` / the multiplier, which is a
+        visible decision rather than a quiet edit.
+
+        Asserted against the imported constants and the FUNCTION, never
+        against the literals 22/88/90: this tracks the formula, so a change to
+        the multiplier or the ceiling re-derives the answer here instead of
+        leaving a restatement of today's arithmetic behind.
+        """
+        legal = wait_proof_grace_secs(WAIT_PROOF_SPAWN_TIMEOUT_CAP_SECS)
+        assert legal <= LEAK_SELF_TERMINATION_CEILING_SECS, (
+            f'the cap {WAIT_PROOF_SPAWN_TIMEOUT_CAP_SECS}s derives a grace of '
+            f'{legal}s, past the {LEAK_SELF_TERMINATION_CEILING_SECS}s '
+            'self-termination ceiling — a leak from a call site scaled to the '
+            'cap would outlive its fake systemctl and reach the real one.'
+        )
+
+        over = wait_proof_grace_secs(WAIT_PROOF_SPAWN_TIMEOUT_CAP_SECS + 1)
+        assert over > LEAK_SELF_TERMINATION_CEILING_SECS, (
+            f'the cap {WAIT_PROOF_SPAWN_TIMEOUT_CAP_SECS}s is not MAXIMAL: '
+            f'{WAIT_PROOF_SPAWN_TIMEOUT_CAP_SECS + 1}s still derives '
+            f'{over}s, inside the {LEAK_SELF_TERMINATION_CEILING_SECS}s '
+            'ceiling. Either the cap is being left below what the ceiling '
+            'permits, or the ceiling/multiplier moved and the cap was not '
+            're-derived.'
+        )
+
+    def test_a_floor_applies_to_very_short_timeouts(self) -> None:
+        """A tiny timeout must not derive a grace that expires mid-test.
+
+        Purely multiplicative, a 1s timeout would yield a few seconds of grace
+        — comparable to the script's own startup — and the defer line the test
+        is waiting for might never be printed.
+        """
+        for spawn_timeout in (0, 1):
+            grace = wait_proof_grace_secs(spawn_timeout)
+            assert grace >= WAIT_PROOF_GRACE_FLOOR_SECS, (
+                f'wait_proof_grace_secs({spawn_timeout}) returned {grace}s, under '
+                f'the {WAIT_PROOF_GRACE_FLOOR_SECS}s floor — below the wall-clock '
+                'cost of the handful of bash+python3 spawns the script makes '
+                'before it reaches its first defer decision.'
+            )
+
+    def test_it_is_monotonic_and_returns_ints(self) -> None:
+        """``int`` is load-bearing, not tidiness.
+
+        The value is stringified into an env var and compared by bash's integer
+        operators; a float would arrive as ``30.0`` and make ``[ "$x" -gt ... ]``
+        fail outright.
+        """
+        previous = None
+        for spawn_timeout in range(0, 61, 5):
+            grace = wait_proof_grace_secs(spawn_timeout)
+            assert type(grace) is int, (
+                f'wait_proof_grace_secs({spawn_timeout}) returned '
+                f'{grace!r} ({type(grace).__name__}); bash needs an integer.'
+            )
+            if previous is not None:
+                assert grace >= previous, (
+                    f'grace fell from {previous} to {grace} as the spawn timeout '
+                    'rose; a longer-running spawn cannot need LESS grace.'
+                )
+            previous = grace
+
+    def test_the_two_real_call_site_timeouts_derive_the_documented_values(self) -> None:
+        """Pin the numbers the three call sites will actually carry.
+
+        Fixed here rather than invented at the call sites, so the derivation and
+        the values it produces cannot drift apart silently.
+        """
+        assert wait_proof_grace_secs(3) == 30
+        assert wait_proof_grace_secs(20) == 80
+
+
+class TestLoadScaledGrace:
+    """The shared subprocess-budget scaler both test roots resolve through.
+
+    Promoted out of ``tests/scripts/test_spawn_claude.py`` (task 4890) so
+    ``scripts/tests/`` can reach it: the two roots cannot import each other's
+    test modules, and ``df_pytest_isolation`` is the established home for
+    cross-root helpers. The first four cases are that file's own
+    ``test_load_scaled_grace_*`` family, MOVED here rather than mirrored (task
+    4890 amendment). A mirror was the wrong shape: both modules sit in the SAME
+    root, so the cross-root import barrier that justifies duplicating a test
+    never applied, and after the promotion both sets exercised one shared
+    definition -- straight duplication. ``test_spawn_claude.py`` keeps only its
+    WRAPPER-specific tests (``_spawn_run_budget``, ``_wait_for_path_scaled``,
+    ``_set_started_grace``), which use this scaler as an oracle rather than
+    re-deriving its arithmetic. The fifth case pins an ordering property this
+    repo now depends on and the original four never covered.
+
+    Colocated with :class:`TestWaitProofGraceSecs` so every
+    ``df_pytest_isolation`` budget helper -- the derived wait-proving grace,
+    its self-termination ceiling, the spawn-timeout cap and this scaler -- is
+    pinned in ONE module instead of scattered across three.
+
+    ``os.getloadavg``/``os.cpu_count`` are patched on the ``os`` MODULE, not
+    on a per-module alias, so the patch is visible from
+    ``df_pytest_isolation``'s own namespace.
+    """
+
+    def test_an_idle_host_returns_base_exactly_unchanged(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """load-per-core <= 1 floors at base_secs -- no scaling up at all.
+
+        This is the byte-identical-when-unloaded guarantee every call site
+        that adopts this scaler depends on: adopting it can LENGTHEN a budget
+        under contention and can never shorten one or slow an idle run.
+        """
+        monkeypatch.setattr(os, 'getloadavg', lambda: (10.0, 10.0, 10.0))
+        monkeypatch.setattr(os, 'cpu_count', lambda: 32)
+
+        assert load_scaled_grace(3, cap_secs=30) == 3
+
+    def test_it_scales_with_load_per_core(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """ceil(base_secs * loadavg1 / cpu_count) once the host is oversubscribed."""
+        monkeypatch.setattr(os, 'getloadavg', lambda: (64.0, 64.0, 64.0))
+        monkeypatch.setattr(os, 'cpu_count', lambda: 32)
+
+        assert load_scaled_grace(3, cap_secs=30) == 6
+
+    def test_it_clamps_to_the_cap(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A pathological host stays bounded instead of growing without limit."""
+        monkeypatch.setattr(os, 'getloadavg', lambda: (3200.0, 3200.0, 3200.0))
+        monkeypatch.setattr(os, 'cpu_count', lambda: 32)
+
+        assert load_scaled_grace(3, cap_secs=30) == 30
+
+    def test_no_loadavg_on_this_platform_fails_safe_to_base(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Both spellings of "this platform has no loadavg" return base_secs.
+
+        Fail-safe rather than fail-open: an unavailable signal must not turn
+        a budget into something SHORTER than the caller asked for.
+        """
+        def _raise_oserror() -> tuple[float, float, float]:
+            raise OSError('getloadavg not supported on this platform')
+
+        monkeypatch.setattr(os, 'getloadavg', _raise_oserror)
+        assert load_scaled_grace(3, cap_secs=30) == 3
+
+        def _raise_attributeerror() -> tuple[float, float, float]:
+            raise AttributeError('os has no getloadavg on this platform')
+
+        monkeypatch.setattr(os, 'getloadavg', _raise_attributeerror)
+        assert load_scaled_grace(3, cap_secs=30) == 3
+
+    def test_the_floor_beats_the_cap_when_base_exceeds_it(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """base_secs > cap_secs returns base_secs, NOT cap_secs -- and WARNS.
+
+        The ``max(base, min(cap, ...))`` ordering, which the four cases above
+        never reach because each uses base=3 < cap=30. Pinned because callers
+        pass caps DERIVED from an unrelated ceiling (a per-test timeout axe, a
+        leak self-termination bound) rather than caps chosen to sit above every
+        base -- so a cap below a base is a reachable combination, and silently
+        SHORTENING a budget to it is the one behaviour a scaler must never
+        have. Asserted at both an idle and a loaded host, since the clamp is
+        the only term load can move.
+
+        BOTH HALVES MATTER, and the second was added by the task-4890
+        amendment. Safe is not enough: in this regime the ``min`` can never
+        raise the result above the cap and the ``max`` can never lower it
+        below the base, so the budget is INERT at every load and the call site
+        gets none of the load protection adopting this function looks like it
+        bought. Degrading to that silently is what would make a mis-derived cap
+        undiscoverable, so the warning is part of the contract and is asserted
+        here rather than left to a reader's inspection. No current call site is
+        in this regime (3 < 22, 20 < 120), so this is forward-looking.
+        """
+        monkeypatch.setattr(os, 'cpu_count', lambda: 32)
+
+        monkeypatch.setattr(os, 'getloadavg', lambda: (10.0, 10.0, 10.0))
+        with pytest.warns(RuntimeWarning, match='INERT'):
+            assert load_scaled_grace(20, cap_secs=5) == 20
+
+        monkeypatch.setattr(os, 'getloadavg', lambda: (3200.0, 3200.0, 3200.0))
+        with pytest.warns(RuntimeWarning, match='INERT'):
+            assert load_scaled_grace(20, cap_secs=5) == 20
+
+    def test_the_ordinary_cap_above_base_regime_is_silent(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Non-vacuity for the warning above: every real call site is quiet.
+
+        A guard that fired on the normal `cap_secs >= base_secs` shape would
+        be noise every suite learns to ignore, which is the failure mode of a
+        warning nobody scoped. Covers the loaded, clamped and equal-bounds
+        cases, since those are the ones an off-by-one in the comparison would
+        reach first.
+        """
+        monkeypatch.setattr(os, 'cpu_count', lambda: 32)
+        monkeypatch.setattr(os, 'getloadavg', lambda: (3200.0, 3200.0, 3200.0))
+
+        with warnings.catch_warnings():
+            warnings.simplefilter('error')
+            assert load_scaled_grace(3, cap_secs=30) == 30
+            assert load_scaled_grace(20, cap_secs=20) == 20
+
+
+class TestReadDrainPollTrace:
+    """The drain gate's poll ledger has ONE parser, shared by both test roots."""
+
+    UNIT = 'orchestrator-fake-reify.service'
+
+    def test_an_absent_ledger_reads_as_no_polls(self, tmp_path: Path) -> None:
+        """Callers then fail on their own diagnostic, not a bare FileNotFoundError."""
+        assert read_drain_poll_trace(tmp_path / 'never-written.tsv') == []
+
+    def test_records_are_verdict_unit_pairs_in_file_order(self, tmp_path: Path) -> None:
+        ledger = tmp_path / 'trace.tsv'
+        ledger.write_text(f'busy\t{self.UNIT}\nidle\t{self.UNIT}\n')
+
+        assert read_drain_poll_trace(ledger) == [('busy', self.UNIT), ('idle', self.UNIT)]
+
+    def test_complete_only_drops_a_record_still_being_appended(self, tmp_path: Path) -> None:
+        """A reader racing the script must never count a half-written record."""
+        ledger = tmp_path / 'trace.tsv'
+        ledger.write_text(f'busy\t{self.UNIT}\nidl')
+
+        assert read_drain_poll_trace(ledger, complete_only=True) == [('busy', self.UNIT)]
+
+    def test_a_finished_ledger_with_a_torn_record_is_rejected(self, tmp_path: Path) -> None:
+        """Read whole, a torn final record must fail loudly rather than vanish."""
+        ledger = tmp_path / 'trace.tsv'
+        ledger.write_text(f'busy\t{self.UNIT}\nidl')
+
+        with pytest.raises(ValueError):
+            read_drain_poll_trace(ledger, complete_only=False)
+
+    @pytest.mark.parametrize('bad_line', ['busy', f'busy\t{UNIT}\textra'])
+    def test_a_record_without_exactly_two_fields_names_the_line_and_the_ledger(
+        self, tmp_path: Path, bad_line: str,
+    ) -> None:
+        ledger = tmp_path / 'trace.tsv'
+        ledger.write_text(f'idle\t{self.UNIT}\n{bad_line}\n')
+
+        with pytest.raises(ValueError) as exc_info:
+            read_drain_poll_trace(ledger)
+
+        message = str(exc_info.value)
+        assert repr(bad_line) in message
+        assert str(ledger) in message
+
+
+# ---------------------------------------------------------------------------
+# The in-suite guard's pure core.
+#
+# Driven against SYNTHETIC /proc trees under tmp_path, so the scan logic is
+# testable without leaking a single real process.
+# ---------------------------------------------------------------------------
+
+# Built FROM the module's own marker, not from a hardcoded copy of it: that is
+# what makes these tests pin "the scan finds what the module says it looks for"
+# rather than "the scan finds this string I happened to type twice".
+_DRAIN_CMDLINE = (
+    b'bash\x00/repo/scripts/' + DRAIN_SCRIPT_CMDLINE_MARKER.encode() + b'\x00--drain\x00'
+)
+_OTHER_CMDLINE = b'bash\x00/repo/scripts/some-other-script.sh\x00'
+
+
+def _proc_entry(
+    proc_root: Path, pid: int, cmdline: bytes, environ: bytes | None,
+) -> None:
+    """Write one synthetic ``/proc/<pid>`` entry.
+
+    *environ* of ``None`` writes NO environ file at all — the shape of a pid
+    that exited between the directory listing and the read.
+    """
+    entry = proc_root / str(pid)
+    entry.mkdir(parents=True)
+    (entry / 'cmdline').write_bytes(cmdline)
+    if environ is not None:
+        (entry / 'environ').write_bytes(environ)
+
+
+def _environ_with(token: str, *, extra: bytes = b'PATH=/usr/bin\x00') -> bytes:
+    """A NUL-separated environ block carrying *token*, as /proc renders it."""
+    return extra + LEAK_TOKEN_ENV.encode() + b'=' + token.encode() + b'\x00'
+
+
+class TestLeakedDrainProcesses:
+    """Which surviving processes count as THIS session's leak."""
+
+    def test_a_process_matching_both_marker_and_token_is_reported(
+        self, tmp_path: Path,
+    ) -> None:
+        _proc_entry(tmp_path, 4242, _DRAIN_CMDLINE, _environ_with('tok'))
+
+        leaks = leaked_drain_processes('tok', proc_root=tmp_path)
+
+        assert [pid for pid, _ in leaks] == [4242]
+        assert DRAIN_SCRIPT_CMDLINE_MARKER in leaks[0][1]
+
+    def test_the_drain_marker_alone_is_not_enough(self, tmp_path: Path) -> None:
+        """A genuine or concurrent --drain must NEVER fail this suite.
+
+        `merge_verify_breadth: "full"` runs this suite in many worktrees at
+        once, and the main checkout is machine-operated (CLAUDE.md) — the
+        deployed watchdog and the merge coordinator both run --drain for real.
+        A bare `pgrep -f restart-all-orchestrators.sh` would fail those runs
+        spuriously, which is why the token is required as well.
+        """
+        _proc_entry(tmp_path, 11, _DRAIN_CMDLINE, b'PATH=/usr/bin\x00')
+        _proc_entry(tmp_path, 12, _DRAIN_CMDLINE, _environ_with('another-session'))
+
+        assert leaked_drain_processes('tok', proc_root=tmp_path) == []
+
+    def test_a_token_that_merely_prefixes_ours_is_not_a_match(
+        self, tmp_path: Path,
+    ) -> None:
+        """Matched as a whole NUL-delimited assignment, not a substring.
+
+        Without the delimiters, session `tok` would match session `tokZZZ`'s
+        processes and fail a run for another worktree's leak.
+        """
+        _proc_entry(tmp_path, 21, _DRAIN_CMDLINE, _environ_with('tokZZZ'))
+
+        assert leaked_drain_processes('tok', proc_root=tmp_path) == []
+
+    def test_the_token_alone_is_not_enough(self, tmp_path: Path) -> None:
+        """These two directories hold ~90 test files that spawn subprocesses.
+
+        Scanning for "any surviving descendant" rather than the drain script
+        would flake constantly on all of them.
+        """
+        _proc_entry(tmp_path, 31, _OTHER_CMDLINE, _environ_with('tok'))
+
+        assert leaked_drain_processes('tok', proc_root=tmp_path) == []
+
+    def test_a_vanished_pid_does_not_raise(self, tmp_path: Path) -> None:
+        """Scanning /proc races process exit by construction."""
+        _proc_entry(tmp_path, 41, _DRAIN_CMDLINE, None)  # no environ file
+        _proc_entry(tmp_path, 42, _DRAIN_CMDLINE, _environ_with('tok'))
+
+        assert [pid for pid, _ in leaked_drain_processes('tok', proc_root=tmp_path)] == [42]
+
+    def test_non_numeric_proc_entries_are_skipped(self, tmp_path: Path) -> None:
+        """Real /proc holds `self`, `meminfo`, `net`, ... — none of them pids."""
+        (tmp_path / 'meminfo').write_bytes(b'MemTotal: 1 kB\n')
+        (tmp_path / 'self').mkdir()
+        _proc_entry(tmp_path, 51, _DRAIN_CMDLINE, _environ_with('tok'))
+
+        assert [pid for pid, _ in leaked_drain_processes('tok', proc_root=tmp_path)] == [51]
+
+    def test_an_empty_or_missing_token_matches_nothing(self, tmp_path: Path) -> None:
+        """A falsy token must fail CLOSED on the match, never open.
+
+        Treating it as "match everything" would turn the guard into a
+        suite-wide false-positive generator the first time the fixture failed
+        to stamp its token.
+        """
+        _proc_entry(tmp_path, 61, _DRAIN_CMDLINE, _environ_with('tok'))
+
+        assert leaked_drain_processes('', proc_root=tmp_path) == []
+        assert leaked_drain_processes(None, proc_root=tmp_path) == []
+
+    def test_the_real_proc_tree_is_scannable(self) -> None:
+        """The default proc_root works on this box.
+
+        The task's own evidence — every sampled orphan identified by its
+        `PYTEST_CURRENT_TEST` environ value — already proves environ scanning is
+        permitted here; this pins it so a hardened kernel would fail loudly
+        rather than silently reporting all-clear forever.
+        """
+        leaks = leaked_drain_processes('a-token-no-process-can-carry-3798')
+
+        assert isinstance(leaks, list)
+        assert leaks == []
+
+
+class TestLeakedDrainProcessReason:
+    """The failure message has to be actionable on its own."""
+
+    def test_no_leaks_is_not_a_violation(self) -> None:
+        assert leaked_drain_process_reason([]) is None
+
+    def test_it_names_every_pid_its_cmdline_and_the_remedy(self) -> None:
+        """Mirrors deploy_clock_violation_reason's "name the remedy" convention.
+
+        Asserted on the pid, the cmdline and the remedy SYMBOL, never on prose
+        wording — the message is triage text and must stay editable.
+        """
+        reason = leaked_drain_process_reason([
+            (4242, f'bash /repo/scripts/{DRAIN_SCRIPT_CMDLINE_MARKER} --drain'),
+            (4243, f'bash /repo/scripts/{DRAIN_SCRIPT_CMDLINE_MARKER} --drain'),
+        ])
+
+        assert reason is not None
+        assert '4242' in reason and '4243' in reason
+        assert DRAIN_SCRIPT_CMDLINE_MARKER in reason
+        assert '3798' in reason
+        assert 'run_in_new_session' in reason
+
+
+class TestGuardIsLiveInThisRun:
+    """The fixture is WIRED, not merely defined.
+
+    Everything above tests pure functions against synthetic ``/proc`` trees and
+    ``tmp_path`` leakers; all of it would stay green if the fixture were never
+    loaded by any conftest.  This class is the only assertion that the defence
+    is actually armed in the process running it — the difference between a wired
+    defence and a dead one.
+    """
+
+    def test_the_guard_fixture_exists(self) -> None:
+        assert hasattr(df_pytest_isolation, _GUARD_NAME), (
+            f'df_pytest_isolation defines no {_GUARD_NAME}; the pure scan '
+            'helpers above protect nothing on their own.'
+        )
+
+    def test_the_guard_fixture_is_session_scoped_and_autouse(self) -> None:
+        """Both properties pinned STRUCTURALLY, not by inspection of behaviour.
+
+        A function-scoped or non-autouse variant would still import cleanly and
+        keep every test above green while protecting nothing: without
+        ``autouse`` nothing would ever request it, and function scope would both
+        cost a /proc sweep per test across ~90 files times every xdist worker
+        AND miss a leak from a module- or session-scoped fixture, which is
+        exactly where expensive subprocess setup tends to live.
+        """
+        marker = fixture_marker(getattr(df_pytest_isolation, _GUARD_NAME))
+
+        assert marker.scope == 'session', f'scope is {marker.scope!r}, expected session'
+        assert marker.autouse is True, 'the guard must be autouse — nothing requests it'
+
+    def test_the_guard_fixture_is_registered_in_this_run(self, request) -> None:
+        """The conftest's arm call is real WIRING, not a dormant definition.
+
+        pytest only collects fixtures a plugin or conftest registers, which is
+        why each test-root conftest calls ``arm_leaked_drain_process_guard(config)`` from its
+        ``pytest_configure``. Deleting that call breaks nothing visible except
+        this assertion.
+        """
+        try:
+            request.getfixturevalue(_GUARD_NAME)
+        except pytest.FixtureLookupError:
+            pytest.fail(
+                f'{_GUARD_NAME} is not registered for this rootdir. Call '
+                'arm_leaked_drain_process_guard(config) from the test-root '
+                'conftest\'s pytest_configure; without that, this whole suite runs '
+                'with no leaked-drain-process guard.',
+                pytrace=False,
+            )
+
+    def test_the_session_token_is_stamped_into_the_environment(self) -> None:
+        """The token is in ``os.environ`` NOW, which is what makes the guard free.
+
+        Both real spawners build their child env from ``dict(os.environ)``, so a
+        token stamped there tags every descendant with no per-spawner change —
+        the same "the defect class is a spawner that forgets" reasoning as
+        3797's clock redirect. Stamped anywhere else (a fixture argument, an
+        explicit env key at each call site) the next spawner would silently opt
+        out, and `leaked_drain_processes` fails CLOSED on an absent token, so
+        the guard would report all-clear forever.
+        """
+        token = os.environ.get(LEAK_TOKEN_ENV)
+
+        assert token, (
+            f'{LEAK_TOKEN_ENV} is unset in this run, so nothing this suite '
+            'spawns is attributable to it and the guard can never match.'
+        )
+
+
+# ---------------------------------------------------------------------------
+# The guard's FAILURE contract, exercised through a real nested pytest run.
+#
+# Everything above pins the helpers, the marker and the registration; none of it
+# pins what a leak actually DOES to the run. A refactor that warned instead of
+# failing, or moved the check into a fixture nobody requests, would leave every
+# test in this file green while the defence emitted nothing an exit code could
+# carry. Only a nested run can observe "the process exits non-zero even though
+# every test passed", because a fixture cannot fail its own session.
+# ---------------------------------------------------------------------------
+
+# NAMED for the marker and nothing else. The guard matches this basename in
+# /proc/<pid>/cmdline, and a test that reached for the REAL script to earn that
+# match would be executing production fleet-restart code — spawning systemctl
+# against live units — from inside a unit test. This is a throwaway file the
+# test writes into tmp_path that merely happens to share the name.
+_LEAKER_NAME = 'restart-all-orchestrators.sh'
+_LEAKED_PIDFILE_NAME = 'leaked.pid'
+
+# A must-not-hang bound on a condition that normally holds within milliseconds,
+# derived to sit strictly below the outer cap so the nested test's own
+# diagnostic, not a TimeoutExpired, is what surfaces if the premise ever fails.
+_LEAKER_VISIBLE_CEILING_SECS = NESTED_SESSION_TIMEOUT_SECS // 4
+
+# 45s: long enough to still be alive at the nested session's teardown (~2-4s)
+# by a wide margin, short enough that a residue from a BROKEN guard expires on
+# its own rather than sitting on the box. The trailing statement keeps bash
+# from exec-ing the sleep in its own process and taking the marker with it —
+# measured while implementing 3798 (a one-line `sleep` script keeps `bash
+# <path>` as its cmdline on this box), and cheap insurance across bash versions.
+_NESTED_LEAKER = '''\
+sleep 45
+echo unreachable-inside-this-test
+'''
+
+# Models the window between `Popen` returning and /proc showing the drain
+# script, stretched from microseconds to a deterministic second: the SAME pid
+# carries no marker until it execs into the leaker. A stall that models a race,
+# as in scripts/tests/test_restart_all_orchestrators.py::
+# test_a_slow_start_still_defers_before_the_drain_lands — not a remedy.
+_LATE_EXEC_LAUNCHER_NAME = 'late-exec-launcher.sh'
+_LATE_EXEC_LAUNCHER = f'''\
+sleep 1
+exec bash "${{0%/*}}/{_LEAKER_NAME}"
+'''
+
+
+_LEAKING_TEST_BODY = '''\
+    proc = subprocess.Popen(
+        ["bash", str(SCRIPT)],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        start_new_session=True, env=dict(os.environ),
+    )
+    PIDFILE.write_text(str(proc.pid))
+    token = os.environ[LEAK_TOKEN_ENV]
+    deadline = time.monotonic() + VISIBLE_WITHIN_SECS
+    while proc.pid not in {pid for pid, _ in leaked_drain_processes(token)}:
+        assert proc.poll() is None and time.monotonic() < deadline, (
+            f'leaker pid {proc.pid} never became visible to the guard scan '
+            f'(returncode={proc.returncode})'
+        )
+        time.sleep(0.05)
+'''
+
+
+def _nested_test_source(*, leaks: bool, entrypoint: str = _LEAKER_NAME) -> str:
+    """Source for the nested test module — which PASSES either way.
+
+    The spawn mirrors both real spawners: ``dict(os.environ)`` for the child
+    env, which is what hands it the NESTED session's token. That is also what
+    keeps THIS session's guard blind to it — a different token — so the outer
+    run cannot fail on the leak its own test deliberately created. The leaking
+    test does not return until the guard's own scan can see its leaker, because
+    ``Popen`` returning does not mean ``/proc`` shows the new image yet.
+    """
+    return (
+        'import os\n'
+        'import subprocess\n'
+        'import time\n'
+        'from pathlib import Path\n'
+        '\n'
+        # Never the guard fixture itself: see _GUARD_NAME on shadowing.
+        'from df_pytest_isolation import LEAK_TOKEN_ENV, leaked_drain_processes\n'
+        '\n'
+        'HERE = Path(__file__).resolve().parent\n'
+        f'SCRIPT = HERE / {entrypoint!r}\n'
+        f'PIDFILE = HERE / {_LEAKED_PIDFILE_NAME!r}\n'
+        f'VISIBLE_WITHIN_SECS = {_LEAKER_VISIBLE_CEILING_SECS!r}\n'
+        '\n'
+        '\n'
+        'def test_a_forgetful_spawner():\n'
+        '    """PASSES. The damage is the surviving process, not this result."""\n'
+        + (_LEAKING_TEST_BODY if leaks else '    pass\n')
+    )
+
+
+def _nested_run(
+    root: Path,
+    *,
+    leaks: bool,
+    extra_files: Mapping[str, str] | None = None,
+    entrypoint: str = _LEAKER_NAME,
+) -> subprocess.CompletedProcess[str]:
+    """Run a throwaway pytest session wired to the guard, in its own tmp tree.
+
+    *root* is passed in rather than derived so the caller knows the pidfile path
+    BEFORE the run starts, and can therefore reap a leaker even when this call
+    raises. *extra_files* join the nested tree; *entrypoint* names the one the
+    leaking test spawns.
+    """
+    return run_nested_pytest(root, {
+        'conftest.py': arming_conftest(_GUARD_NAME),
+        _LEAKER_NAME: _NESTED_LEAKER,
+        'test_forgetful.py': _nested_test_source(leaks=leaks, entrypoint=entrypoint),
+        **(extra_files or {}),
+    })
+
+
+def _read_pid_file(pidfile: Path) -> int | None:
+    """The pid the nested test recorded, or ``None`` if it never got that far."""
+    try:
+        text = pidfile.read_text().strip()
+    except OSError:
+        return None
+    return int(text) if text.isdigit() else None
+
+
+def _reap_leaker(pid: int | None) -> None:
+    """SIGKILL a nested run's leaker — group and all — after proving it is ours.
+
+    The identity check is not ceremony. ``os.killpg`` aimed at a pid the kernel
+    has already RECYCLED is task 845's failure, where it resolved to the
+    ``systemd --user`` manager's group and killed the user's entire login
+    session (see ``shared/src/shared/proc_group.py``). The nested pytest process
+    has already exited by the time we read its pidfile, so this pid is exactly
+    as stale as that one was. ``_still_the_drain`` re-reads
+    ``/proc/<pid>/cmdline`` right here, so a recycled pid is skipped rather than
+    signalled — the SAME helper the production reaper in
+    ``_df_no_leaked_drain_processes`` uses, so this throwaway cleanup and the
+    one that runs unattended on every suite cannot apply different discipline.
+
+    The GROUP, not just the pid, because the leaker's ``sleep`` is a child: the
+    guard reports only the marker-carrying bash, so killing that alone would
+    leave the sleep orphaned for the rest of its 45s.
+    """
+    if pid is None:
+        return
+    if not df_pytest_isolation._still_the_drain(pid):
+        # Already gone (the guard reaps what it reports), or recycled onto
+        # something we must never signal as a group.
+        return
+    with contextlib.suppress(OSError):
+        os.killpg(pid, signal.SIGKILL)
+    _reap(pid)
+
+
+def _assert_the_leak_failed_the_run(
+    result: subprocess.CompletedProcess[str], pidfile: Path,
+) -> None:
+    """The nested test passed, yet the guard failed the run naming its leaker."""
+    combined = result.stdout + result.stderr
+    leaked_pid = _read_pid_file(pidfile)
+
+    assert result.returncode != 0, (
+        'a run that leaked a drain process exited 0 — the guard is '
+        f'inert. stdout={result.stdout!r}'
+    )
+    assert '1 passed' in combined, (
+        'the nested TEST must still pass, or this proves nothing about '
+        f'a green suite being caught. output={combined!r}'
+    )
+    assert leaked_pid is not None, (
+        f'the nested test recorded no pid in {pidfile}; the harness is '
+        'broken, which says nothing either way about the guard.'
+    )
+    assert str(leaked_pid) in combined, (
+        f'the guard did not name the leaked pid {leaked_pid}. Triage '
+        f'has to be possible from the failure output alone: {combined!r}'
+    )
+    assert 'run_in_new_session' in combined, combined
+
+
+class TestTheGuardFailsTheRunEndToEnd:
+    """A leak must cost the RUN, not merely log something."""
+
+    def test_a_leaked_drain_process_fails_a_session_whose_tests_all_passed(
+        self, tmp_path: Path,
+    ) -> None:
+        root = tmp_path / 'leaking'
+        pidfile = root / _LEAKED_PIDFILE_NAME
+        try:
+            _assert_the_leak_failed_the_run(_nested_run(root, leaks=True), pidfile)
+        finally:
+            _reap_leaker(_read_pid_file(pidfile))
+
+    def test_a_leaker_whose_exec_lands_late_still_fails_the_session(
+        self, tmp_path: Path,
+    ) -> None:
+        """The nested test must not return before the guard's scan can see its leaker.
+
+        The launcher holds the leaker's pid marker-free for a second before it
+        execs into the drain-named script, so a nested test that returns as soon
+        as ``Popen`` does hands the guard a process it correctly cannot match.
+        """
+        root = tmp_path / 'late-exec'
+        pidfile = root / _LEAKED_PIDFILE_NAME
+        try:
+            result = _nested_run(
+                root,
+                leaks=True,
+                extra_files={_LATE_EXEC_LAUNCHER_NAME: _LATE_EXEC_LAUNCHER},
+                entrypoint=_LATE_EXEC_LAUNCHER_NAME,
+            )
+            _assert_the_leak_failed_the_run(result, pidfile)
+        finally:
+            _reap_leaker(_read_pid_file(pidfile))
+
+    def test_the_same_harness_without_the_leak_exits_zero(self, tmp_path: Path) -> None:
+        """Non-vacuity control: the identical nested tree, minus the spawn.
+
+        Without it the failure above could be any nested-harness breakage — a
+        bad ini, an unimportable module, a missing pytest.
+        """
+        result = _nested_run(tmp_path / 'clean', leaks=False)
+
+        assert result.returncode == 0, (
+            f'the control run failed for an unrelated reason: '
+            f'stdout={result.stdout!r} stderr={result.stderr!r}'
+        )
+        assert 'LEAKED' not in result.stdout
+
+
+def _arming_conftest() -> str:
+    """Source for a nested conftest, one directory below the root, that arms the guard.
+
+    It reaches the guard through :func:`df_pytest_isolation.arm_leaked_drain_process_guard`
+    from ``pytest_configure``, the way the subproject conftests do, and binds no
+    fixture by import.
+    """
+    return (
+        'import sys\n'
+        'from pathlib import Path\n'
+        '\n'
+        'sys.path.insert(0, str(Path(__file__).resolve().parents[1]))\n'
+        '\n'
+        'from df_pytest_isolation import arm_leaked_drain_process_guard\n'
+        '\n'
+        '\n'
+        'def pytest_configure(config):\n'
+        '    arm_leaked_drain_process_guard(config)\n'
+    )
+
+
+def _armed_suite(suite: str, *, leaks: bool) -> dict[str, str]:
+    """One test root, *suite*, armed by :func:`_arming_conftest`.
+
+    *suite* must not start with ``test``: pytest loads such a directory's
+    conftest with the initial conftests, and this tree exists to have it
+    discovered mid-collection instead.  It also names the test module, since
+    two suites' modules may not share a basename.
+    """
+    return {
+        f'{suite}/conftest.py': _arming_conftest(),
+        f'{suite}/{_LEAKER_NAME}': _NESTED_LEAKER,
+        f'{suite}/test_forgetful_{suite}.py': _nested_test_source(leaks=leaks),
+    }
+
+
+class TestArmLeakedDrainProcessGuard:
+    """The subproject conftests' wiring arms the guard with no conftest binding.
+
+    A suite named on the command line loads its conftest before configure, as a
+    subproject's own ``pytest tests/`` does. A tree collected whole from the
+    nested root discovers it mid-collection instead, where ``pytest_plugins``
+    is refused.
+    """
+
+    @pytest.mark.parametrize(
+        'targets', [('suite_a',), ()], ids=['loaded-at-startup', 'found-mid-collection'],
+    )
+    def test_a_leak_under_an_armed_suite_fails_the_run(
+        self, tmp_path: Path, targets: tuple[str, ...],
+    ) -> None:
+        root = tmp_path / 'armed'
+        pidfile = root / 'suite_a' / _LEAKED_PIDFILE_NAME
+        try:
+            result = run_nested_pytest(
+                root, _armed_suite('suite_a', leaks=True), targets=targets,
+            )
+            _assert_the_leak_failed_the_run(result, pidfile)
+        finally:
+            _reap_leaker(_read_pid_file(pidfile))
+
+    def test_two_suites_arming_in_one_session_run_clean(self, tmp_path: Path) -> None:
+        """Arming twice is a no-op, not pytest's duplicate-plugin error."""
+        result = run_nested_pytest(tmp_path / 'two-roots', {
+            **_armed_suite('suite_a', leaks=False),
+            **_armed_suite('suite_b', leaks=False),
+        })
+
+        assert result.returncode == 0, (
+            f'stdout={result.stdout!r} stderr={result.stderr!r}'
+        )
+        assert '2 passed' in result.stdout, result.stdout

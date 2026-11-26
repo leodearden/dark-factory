@@ -1,64 +1,59 @@
 """Tests for orchestrator.session_hooks module (Attention Rail T6).
 
 Covers: identity/slug resolution for hook events (env > default, keyed on
-session_id); pure OSC-retitle + display-title helpers; the SessionStart /
-Notification / Stop handlers against a tmp session-registry root; the
-fail-soft main() CLI dispatch; the settings-merge (MERGE-not-clobber)
-function; and a bash-level integration test exercising the real
-skills/spawn/hooks/*.sh entrypoints end-to-end.
+session_id), including CLAUDE_SPAWN_SESSION_ID convergence and
+sessions-by-claude-id pointer keying (task 7489); the pure OSC-retitle and
+display-title helpers; the SessionStart / Notification / Stop handlers
+against a tmp session-registry root, including parent_session_id stamping,
+question capture and the Stop-only self-exit decision (task 7193); and the
+fail-soft main() CLI dispatch.
 """
 
 from __future__ import annotations
 
 import io
-import json
 import logging
 import os
 import re
 import subprocess
-from collections.abc import Mapping
+from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
 
-import pytest  # pyright: ignore[reportMissingImports]
+import pytest
+from _process_tree_fakes import claude_process_tree
+from _session_hook_fixtures import (
+    assert_hook_env_isolated,
+    isolate_hook_env,
+    owner_ppid_env,
+    stdin_json,
+)
 
 from orchestrator import session_hooks as sh
+from orchestrator import session_reaper, session_records
 from orchestrator import session_registry as sr
-
-_REPO_ROOT = Path(__file__).resolve().parents[2]
-_HOOKS_DIR = _REPO_ROOT / 'skills' / 'spawn' / 'hooks'
 
 
 @pytest.fixture(autouse=True)
-def _clear_claude_spawn_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Isolate tests from the REAL process environment (Task 2643).
+def _isolate_hook_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    isolate_hook_env(monkeypatch, tmp_path)
 
-    sh.main(...) reads env=os.environ directly, so a real
-    CLAUDE_SPAWN_SESSION_ID leaking in from a fleet-spawned launching
-    context would make hook_session_slug prefer it over the stdin
-    session_id these tests assert on, writing the registry record at a
-    different slug than the test reads. Clears the CLAUDE_SPAWN_* vars
-    spawn-claude.sh sets (see that script for exactly which ones it
-    splices into a spawned session's real env), including
-    CLAUDE_SPAWN_ROLE/PROJECT/TASK_ID (Task 2940 — an orchestrator-spawned
-    launching context exports these too, and an omission here let the
-    leaked identity resolve to 'implementer:dark_factory#<id>' instead of
-    the clean 'session:dark-factory' default in subprocess-spawning
-    tests), so this file is hermetic regardless of launching context;
-    tests needing a specific value still set it explicitly via an env=
-    mapping or monkeypatch.setenv, unaffected by this fixture running
-    first.
-    """
-    monkeypatch.delenv('CLAUDE_SPAWN_SESSION_ID', raising=False)
-    monkeypatch.delenv('CLAUDE_SPAWN_WM_TITLE', raising=False)
-    monkeypatch.delenv('CLAUDE_SPAWN_RESULT_FILE', raising=False)
-    monkeypatch.delenv('CLAUDE_SPAWN_PARENT_ID', raising=False)
-    monkeypatch.delenv('CLAUDE_SPAWN_LAUNCHER_PID', raising=False)
-    monkeypatch.delenv('CLAUDE_SPAWN_TITLE', raising=False)
-    monkeypatch.delenv('CLAUDE_SPAWN_PROMPT', raising=False)
-    monkeypatch.delenv('CLAUDE_SPAWN_ROLE', raising=False)
-    monkeypatch.delenv('CLAUDE_SPAWN_PROJECT', raising=False)
-    monkeypatch.delenv('CLAUDE_SPAWN_TASK_ID', raising=False)
+
+def test_hook_env_is_isolated_for_this_module(tmp_path: Path) -> None:
+    assert_hook_env_isolated(tmp_path)
+
+
+def test_isolate_hook_env_clears_every_spawn_var_and_pins_the_fleet_root(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv('CLAUDE_SPAWN_SESSION_ID', 'leaked-slug')
+    monkeypatch.setenv('CLAUDE_SPAWN_OWNER_PPID', '1')
+    monkeypatch.setenv('CLAUDE_SPAWN_FUTURE_KNOB', 'x')
+
+    isolate_hook_env(monkeypatch, tmp_path / 'fleet')
+
+    assert_hook_env_isolated(tmp_path / 'fleet')
+    assert not (tmp_path / 'fleet').exists()
 
 
 # ---------------------------------------------------------------------------
@@ -99,13 +94,11 @@ def test_resolve_hook_identity_uses_os_getcwd_when_cwd_absent(
 def test_hook_session_slug_keyed_on_session_id_hand_launched() -> None:
     hook_input = {'session_id': 'abc-123', 'cwd': '/home/leo/src/dark-factory'}
     slug = sh.hook_session_slug(hook_input, env={})
-    # session_id ('abc-123', a str) fills the launcher_pid slot deliberately;
-    # see session_hooks.hook_session_slug's docstring.
-    assert slug == sr.build_session_slug(
+    assert slug == session_records.build_session_slug(
         'session',
         'dark-factory',
         None,
-        'abc-123',  # type: ignore[arg-type]
+        'abc-123',
     )
 
 
@@ -117,11 +110,11 @@ def test_hook_session_slug_keyed_on_session_id_spawned() -> None:
         'CLAUDE_SPAWN_TASK_ID': '2085',
     }
     slug = sh.hook_session_slug(hook_input, env=env)
-    assert slug == sr.build_session_slug(
+    assert slug == session_records.build_session_slug(
         'unblock',
         'df',
         '2085',
-        'abc-123',  # type: ignore[arg-type]
+        'abc-123',
     )
 
 
@@ -144,11 +137,11 @@ def test_hook_session_slug_uses_cwd_fallback_when_absent(
     monkeypatch.chdir(tmp_path)
     hook_input = {'session_id': 'sess-3'}
     slug = sh.hook_session_slug(hook_input, env={})
-    assert slug == sr.build_session_slug(
+    assert slug == session_records.build_session_slug(
         'session',
         tmp_path.name,
         None,
-        'sess-3',  # type: ignore[arg-type]
+        'sess-3',
     )
 
 
@@ -182,11 +175,11 @@ def test_hook_session_slug_falls_back_when_claude_spawn_session_id_absent(
     if spawn_session_id is not None:
         env['CLAUDE_SPAWN_SESSION_ID'] = spawn_session_id
     slug = sh.hook_session_slug(hook_input, env=env)
-    assert slug == sr.build_session_slug(
+    assert slug == session_records.build_session_slug(
         'session',
         'dark-factory',
         None,
-        'abc-123',  # type: ignore[arg-type]
+        'abc-123',
     )
 
 
@@ -194,8 +187,36 @@ def test_hook_session_slug_sanitizes_malformed_claude_spawn_session_id() -> None
     hook_input = {'session_id': 'uuid-x', 'cwd': '/home/leo/src/dark-factory'}
     env = {'CLAUDE_SPAWN_SESSION_ID': 'bad/id#x'}
     slug = sh.hook_session_slug(hook_input, env=env)
-    assert slug == sr.sanitize_slug('bad/id#x')
+    assert slug == session_records.sanitize_slug('bad/id#x')
     assert slug == 'bad-id-x'
+
+
+@pytest.mark.parametrize(
+    ('spawn_session_id', 'expected'),
+    [('.', '-'), ('..', '--'), ('...', '---')],
+)
+def test_hook_session_slug_sanitizes_all_dots_claude_spawn_session_id(
+    spawn_session_id: str,
+    expected: str,
+) -> None:
+    # Task 4112: the live, externally-supplied entry point for the '..' escape.
+    # CLAUDE_SPAWN_SESSION_ID comes from outside the process and
+    # hook_session_slug hands it to sanitize_slug DIRECTLY (deliberately
+    # bypassing build_session_slug to avoid double-prefixing -- see its
+    # docstring). Covering only the registry unit would leave this
+    # attacker-reachable path untested: a future refactor of that bypass could
+    # drop the sanitize call with every registry-level test still green.
+    #
+    # This test owns exactly that routing claim. The downstream containment
+    # property (record_path_for_slug's join stays under sessions_dir) is owned
+    # by test_record_path_for_slug_all_dots_slug_stays_under_sessions_dir in
+    # test_session_registry.py, together with its non-vacuity counterfactual --
+    # asserting it here too would drag a registry-layer invariant across the
+    # module boundary and break two files for one change.
+    hook_input = {'session_id': 'uuid-x', 'cwd': '/home/leo/src/dark-factory'}
+    env = {'CLAUDE_SPAWN_SESSION_ID': spawn_session_id}
+    slug = sh.hook_session_slug(hook_input, env=env)
+    assert slug == expected
 
 
 # ---------------------------------------------------------------------------
@@ -203,29 +224,29 @@ def test_hook_session_slug_sanitizes_malformed_claude_spawn_session_id() -> None
 # ---------------------------------------------------------------------------
 
 
-def _make_hook_record(**overrides: object) -> sr.SessionRecord:
+def _make_hook_record(**overrides: object) -> session_records.SessionRecord:
     """Minimal SessionRecord for hook_display_title's record-title fallback tests."""
     fields: dict = {
         'session_slug': 'session-dark-factory-sess-1',
-        'status': sr.Status.RUNNING,
+        'status': session_records.Status.RUNNING,
         'title': '',
     }
     fields.update(overrides)
-    return sr.SessionRecord(**fields)
+    return session_records.SessionRecord(**fields)
 
 
 def test_osc_retitle_sequence_running_uses_gear_glyph() -> None:
-    seq = sh.osc_retitle_sequence(sr.Status.RUNNING, 'unblock:df#2085')
+    seq = sh.osc_retitle_sequence(session_records.Status.RUNNING, 'unblock:df#2085')
     assert seq == '\033]0;⚙ unblock:df#2085\007'
 
 
 def test_osc_retitle_sequence_awaiting_input_uses_pause_glyph_and_label() -> None:
-    seq = sh.osc_retitle_sequence(sr.Status.AWAITING_INPUT, 'unblock:df#2085')
+    seq = sh.osc_retitle_sequence(session_records.Status.AWAITING_INPUT, 'unblock:df#2085')
     assert seq == '\033]0;⏸ AWAITING unblock:df#2085\007'
 
 
 def test_osc_retitle_sequence_idle_uses_check_glyph() -> None:
-    seq = sh.osc_retitle_sequence(sr.Status.IDLE, 'unblock:df#2085')
+    seq = sh.osc_retitle_sequence(session_records.Status.IDLE, 'unblock:df#2085')
     assert seq == '\033]0;✅ unblock:df#2085\007'
 
 
@@ -272,12 +293,12 @@ def test_run_session_start_hand_launched_creates_new_running_record(tmp_path: Pa
     sh.run_session_start(hook_input, env, root=tmp_path)
 
     slug = sh.hook_session_slug(hook_input, env)
-    record = sr.read_record(slug, root=tmp_path)
-    assert record.status == sr.Status.RUNNING
+    record = session_records.read_record(slug, root=tmp_path)
+    assert record.status == session_records.Status.RUNNING
     assert record.role == 'session'
     assert record.project == 'dark-factory'
     assert record.cwd == '/home/leo/src/dark-factory'
-    assert record.transcript_path == sr.transcript_path_for_cwd('/home/leo/src/dark-factory')
+    assert record.transcript_path == session_records.transcript_path_for_cwd('/home/leo/src/dark-factory')
 
 
 def test_run_session_start_refreshes_existing_record_preserving_fields(tmp_path: Path) -> None:
@@ -287,24 +308,24 @@ def test_run_session_start_refreshes_existing_record_preserving_fields(tmp_path:
     hook_input = {'session_id': 'sess-b', 'cwd': '/home/leo/src/dark-factory'}
     env: dict[str, str] = {}
     slug = sh.hook_session_slug(hook_input, env)
-    existing = sr.SessionRecord(
+    existing = session_records.SessionRecord(
         session_slug=slug,
-        status=sr.Status.LAUNCHING,
+        status=session_records.Status.LAUNCHING,
         role='unblock',
         project='df',
         task_id='2085',
         cwd='/home/leo/src/dark-factory',
         prompt='/unblock 2085',
     )
-    sr.write_record(existing, root=tmp_path)
-    record_path = sr.record_path_for_slug(slug, root=tmp_path)
+    session_records.write_record(existing, root=tmp_path)
+    record_path = session_records.record_path_for_slug(slug, root=tmp_path)
     old_ts = record_path.stat().st_mtime - 10
     os.utime(record_path, (old_ts, old_ts))
 
     sh.run_session_start(hook_input, env, root=tmp_path)
 
-    record = sr.read_record(slug, root=tmp_path)
-    assert record.status == sr.Status.RUNNING
+    record = session_records.read_record(slug, root=tmp_path)
+    assert record.status == session_records.Status.RUNNING
     # Previously-populated fields survive the refresh untouched.
     assert record.role == 'unblock'
     assert record.project == 'df'
@@ -314,6 +335,58 @@ def test_run_session_start_refreshes_existing_record_preserving_fields(tmp_path:
     assert record_path.stat().st_mtime > old_ts
 
 
+def _seed_orphan_swept_record(hook_input: dict[str, str], tmp_path: Path) -> str:
+    slug = sh.hook_session_slug(hook_input, {})
+    session_records.write_record(
+        session_records.SessionRecord(
+            session_slug=slug,
+            status=session_records.Status.EXITED,
+            exit_code=session_reaper.ORPHAN_EXIT_CODE,
+            cwd=hook_input['cwd'],
+        ),
+        root=tmp_path,
+    )
+    return slug
+
+
+def test_run_session_start_clears_orphan_exit_code_when_live_session_resumes(
+    tmp_path: Path,
+) -> None:
+    hook_input = {
+        'session_id': 'sess-b',
+        'cwd': '/home/leo/src/dark-factory',
+        'source': 'compact',
+    }
+    slug = _seed_orphan_swept_record(hook_input, tmp_path)
+
+    sh.run_session_start(hook_input, {}, root=tmp_path)
+
+    record = session_records.read_record(slug, root=tmp_path)
+    assert (record.status, record.exit_code) == (session_records.Status.RUNNING, None)
+
+
+@pytest.mark.parametrize(
+    ('run_hook', 'live_status'),
+    [
+        (sh.run_stop, session_records.Status.IDLE),
+        (sh.run_notification, session_records.Status.AWAITING_INPUT),
+    ],
+    ids=['stop', 'notification'],
+)
+def test_turn_hooks_clear_orphan_exit_code_when_live_session_resumes(
+    tmp_path: Path,
+    run_hook: Callable[..., str],
+    live_status: session_records.Status,
+) -> None:
+    hook_input = {'session_id': 'sess-b', 'cwd': '/home/leo/src/dark-factory'}
+    slug = _seed_orphan_swept_record(hook_input, tmp_path)
+
+    run_hook(hook_input, {}, root=tmp_path)
+
+    record = session_records.read_record(slug, root=tmp_path)
+    assert (record.status, record.exit_code) == (live_status, None)
+
+
 def test_run_session_start_hand_launched_uses_session_leader_as_liveness_pid(
     tmp_path: Path,
 ) -> None:
@@ -321,14 +394,15 @@ def test_run_session_start_hand_launched_uses_session_leader_as_liveness_pid(
     # entrypoint (dead within seconds) -- reap_stale_records' stale_pid rule
     # would then reclaim a long-idle hand-launched session's record even
     # though its terminal is still alive. os.getsid(0) resolves to the
-    # durable POSIX session leader instead (see _hand_launched_liveness_pid).
+    # durable POSIX session leader instead (see
+    # session_ownership_probes.py::EventProbes.hand_launched_liveness_pid).
     hook_input = {'session_id': 'sess-pid', 'cwd': '/home/leo/src/dark-factory'}
     env: dict[str, str] = {}
 
     sh.run_session_start(hook_input, env, root=tmp_path)
 
     slug = sh.hook_session_slug(hook_input, env)
-    record = sr.read_record(slug, root=tmp_path)
+    record = session_records.read_record(slug, root=tmp_path)
     assert record.launcher_pid == os.getsid(0)
 
 
@@ -343,7 +417,7 @@ def test_run_session_start_spawned_still_prefers_explicit_launcher_pid_env(
     sh.run_session_start(hook_input, env, root=tmp_path)
 
     slug = sh.hook_session_slug(hook_input, env)
-    record = sr.read_record(slug, root=tmp_path)
+    record = session_records.read_record(slug, root=tmp_path)
     assert record.launcher_pid == 4242
 
 
@@ -359,8 +433,8 @@ def test_run_session_start_create_path_stamps_parent_session_id(tmp_path: Path) 
     sh.run_session_start(hook_input, env, root=tmp_path)
 
     slug = sh.hook_session_slug(hook_input, env)
-    record = sr.read_record(slug, root=tmp_path)
-    assert record.status == sr.Status.RUNNING
+    record = session_records.read_record(slug, root=tmp_path)
+    assert record.status == session_records.Status.RUNNING
     assert record.parent_session_id == 'unblock-df-2085-4242'
 
 
@@ -370,24 +444,24 @@ def test_run_session_start_refresh_path_stamps_parent_session_id_preserving_fiel
     hook_input = {'session_id': 'sess-p2', 'cwd': '/home/leo/src/dark-factory'}
     env = {'CLAUDE_SPAWN_PARENT_ID': 'unblock-df-2085-4242'}
     slug = sh.hook_session_slug(hook_input, env)
-    existing = sr.SessionRecord(
+    existing = session_records.SessionRecord(
         session_slug=slug,
-        status=sr.Status.LAUNCHING,
+        status=session_records.Status.LAUNCHING,
         role='unblock',
         project='df',
         task_id='2085',
         cwd='/home/leo/src/dark-factory',
         prompt='/unblock 2085',
     )
-    sr.write_record(existing, root=tmp_path)
-    record_path = sr.record_path_for_slug(slug, root=tmp_path)
+    session_records.write_record(existing, root=tmp_path)
+    record_path = session_records.record_path_for_slug(slug, root=tmp_path)
     old_ts = record_path.stat().st_mtime - 10
     os.utime(record_path, (old_ts, old_ts))
 
     sh.run_session_start(hook_input, env, root=tmp_path)
 
-    record = sr.read_record(slug, root=tmp_path)
-    assert record.status == sr.Status.RUNNING
+    record = session_records.read_record(slug, root=tmp_path)
+    assert record.status == session_records.Status.RUNNING
     assert record.parent_session_id == 'unblock-df-2085-4242'
     # Previously-populated fields survive the enrichment write.
     assert record.role == 'unblock'
@@ -406,7 +480,7 @@ def test_run_session_start_no_parent_id_env_leaves_parent_session_id_none(tmp_pa
     sh.run_session_start(hook_input, env, root=tmp_path)
 
     slug = sh.hook_session_slug(hook_input, env)
-    record = sr.read_record(slug, root=tmp_path)
+    record = session_records.read_record(slug, root=tmp_path)
     assert record.parent_session_id is None
 
 
@@ -423,10 +497,10 @@ def test_run_session_start_converges_onto_spawn_claude_launching_record(
     # Code session_id, but CLAUDE_SPAWN_SESSION_ID=S) must advance that SAME
     # record rather than creating a second, uuid-keyed one.
     slug = 'session-cockpit-3215033'
-    result_file = str(sr.record_path_for_slug(slug, root=tmp_path).parent / 'result.md')
-    launching = sr.SessionRecord(
+    result_file = str(session_records.record_path_for_slug(slug, root=tmp_path).parent / 'result.md')
+    launching = session_records.SessionRecord(
         session_slug=slug,
-        status=sr.Status.LAUNCHING,
+        status=session_records.Status.LAUNCHING,
         role='session',
         project='cockpit',
         task_id=None,
@@ -435,15 +509,15 @@ def test_run_session_start_converges_onto_spawn_claude_launching_record(
         launcher_pid=3215033,
         result_file=result_file,
     )
-    sr.write_record(launching, root=tmp_path)
+    session_records.write_record(launching, root=tmp_path)
 
     hook_input = {'session_id': 'uuid-x', 'cwd': '/home/leo/src/dark-factory'}
     env = {'CLAUDE_SPAWN_SESSION_ID': slug}
 
     sh.run_session_start(hook_input, env, root=tmp_path)
 
-    record = sr.read_record(slug, root=tmp_path)
-    assert record.status == sr.Status.RUNNING
+    record = session_records.read_record(slug, root=tmp_path)
+    assert record.status == session_records.Status.RUNNING
     # Rich pre-existing fields survive the convergence refresh untouched.
     assert record.role == 'session'
     assert record.project == 'cockpit'
@@ -451,36 +525,36 @@ def test_run_session_start_converges_onto_spawn_claude_launching_record(
     assert record.launcher_pid == 3215033
     assert record.result_file == result_file
     # No separate uuid-keyed duplicate: exactly one dir in sessions_dir.
-    dirs = list(sr.sessions_dir(root=tmp_path).iterdir())
+    dirs = list(session_records.sessions_dir(root=tmp_path).iterdir())
     assert len(dirs) == 1
     assert dirs[0].name == slug
 
 
 def test_full_lifecycle_converges_on_one_slug_through_exit(tmp_path: Path) -> None:
     slug = 'session-cockpit-3215034'
-    sr.write_record(
-        sr.SessionRecord(session_slug=slug, status=sr.Status.LAUNCHING, launcher_pid=3215034),
+    session_records.write_record(
+        session_records.SessionRecord(session_slug=slug, status=session_records.Status.LAUNCHING, launcher_pid=3215034),
         root=tmp_path,
     )
     hook_input = {'session_id': 'uuid-y', 'cwd': '/home/leo/src/dark-factory'}
     env = {'CLAUDE_SPAWN_SESSION_ID': slug}
 
     sh.run_session_start(hook_input, env, root=tmp_path)
-    assert sr.read_record(slug, root=tmp_path).status == sr.Status.RUNNING
+    assert session_records.read_record(slug, root=tmp_path).status == session_records.Status.RUNNING
 
     sh.run_notification(hook_input, env, root=tmp_path)
-    assert sr.read_record(slug, root=tmp_path).status == sr.Status.AWAITING_INPUT
+    assert session_records.read_record(slug, root=tmp_path).status == session_records.Status.AWAITING_INPUT
 
     sh.run_stop(hook_input, env, root=tmp_path)
-    assert sr.read_record(slug, root=tmp_path).status == sr.Status.IDLE
+    assert session_records.read_record(slug, root=tmp_path).status == session_records.Status.IDLE
 
-    sr.update_status(slug, root=tmp_path, status=sr.Status.EXITED, exit_code=0)
-    final = sr.read_record(slug, root=tmp_path)
-    assert final.status == sr.Status.EXITED
+    session_records.update_status(slug, root=tmp_path, status=session_records.Status.EXITED, exit_code=0)
+    final = session_records.read_record(slug, root=tmp_path)
+    assert final.status == session_records.Status.EXITED
     assert final.exit_code == 0
 
     # One record dir throughout the whole lifecycle -- never a second one.
-    dirs = list(sr.sessions_dir(root=tmp_path).iterdir())
+    dirs = list(session_records.sessions_dir(root=tmp_path).iterdir())
     assert len(dirs) == 1
     assert dirs[0].name == slug
 
@@ -489,449 +563,22 @@ def test_run_notification_and_stop_converge_onto_spawn_claude_slug_not_uuid(
     tmp_path: Path,
 ) -> None:
     slug = 'session-cockpit-3215035'
-    sr.write_record(
-        sr.SessionRecord(session_slug=slug, status=sr.Status.RUNNING, launcher_pid=3215035),
+    session_records.write_record(
+        session_records.SessionRecord(session_slug=slug, status=session_records.Status.RUNNING, launcher_pid=3215035),
         root=tmp_path,
     )
     hook_input = {'session_id': 'uuid-z', 'cwd': '/home/leo/src/dark-factory'}
     env = {'CLAUDE_SPAWN_SESSION_ID': slug}
 
     sh.run_notification(hook_input, env, root=tmp_path)
-    assert sr.read_record(slug, root=tmp_path).status == sr.Status.AWAITING_INPUT
+    assert session_records.read_record(slug, root=tmp_path).status == session_records.Status.AWAITING_INPUT
 
     sh.run_stop(hook_input, env, root=tmp_path)
-    assert sr.read_record(slug, root=tmp_path).status == sr.Status.IDLE
+    assert session_records.read_record(slug, root=tmp_path).status == session_records.Status.IDLE
 
     uuid_slug = sh.hook_session_slug({'session_id': 'uuid-z', 'cwd': hook_input['cwd']}, env={})
     assert uuid_slug != slug
-    assert not sr.record_path_for_slug(uuid_slug, root=tmp_path).exists()
-
-
-# ---------------------------------------------------------------------------
-# Task 2510 step-1: _resolve_wm_window_id resolver (Fleet Cockpit C10 fix)
-# ---------------------------------------------------------------------------
-
-
-def test_resolve_wm_window_id_matches_exact_title() -> None:
-    calls: list[list[str]] = []
-
-    def fake_run(argv: list[str]) -> subprocess.CompletedProcess[str]:
-        calls.append(argv)
-        return subprocess.CompletedProcess(
-            argv, returncode=0, stdout='0x03200007 0 host focus:df#2510 alpha\n'
-        )
-
-    result = sh._resolve_wm_window_id(
-        'focus:df#2510 alpha', run=fake_run, attempts=3, sleep=lambda _s: None
-    )
-
-    assert result == '0x03200007'
-    assert calls == [['wmctrl', '-l']]
-
-
-def test_resolve_wm_window_id_returns_none_when_no_match() -> None:
-    def fake_run(argv: list[str]) -> subprocess.CompletedProcess[str]:
-        return subprocess.CompletedProcess(
-            argv, returncode=0, stdout='0x03200007 0 host some-other-window\n'
-        )
-
-    result = sh._resolve_wm_window_id(
-        'focus:df#2510 alpha', run=fake_run, attempts=1, sleep=lambda _s: None
-    )
-
-    assert result is None
-
-
-def test_resolve_wm_window_id_does_not_match_as_substring() -> None:
-    """A marker that is only a PREFIX of a longer, unrelated window title must
-    not match -- mirrors WmBackend.is_alive's exact-field guard."""
-
-    def fake_run(argv: list[str]) -> subprocess.CompletedProcess[str]:
-        return subprocess.CompletedProcess(
-            argv, returncode=0, stdout='0x03200007 0 host focus:df#2510 alpha extra\n'
-        )
-
-    result = sh._resolve_wm_window_id(
-        'focus:df#2510 alpha', run=fake_run, attempts=1, sleep=lambda _s: None
-    )
-
-    assert result is None
-
-
-def test_resolve_wm_window_id_retries_with_sleep_between_attempts() -> None:
-    calls: list[list[str]] = []
-    sleeps: list[float] = []
-
-    def fake_run(argv: list[str]) -> subprocess.CompletedProcess[str]:
-        calls.append(argv)
-        if len(calls) < 3:
-            return subprocess.CompletedProcess(argv, returncode=1, stdout='')
-        return subprocess.CompletedProcess(
-            argv, returncode=0, stdout='0x03200007 0 host focus:df#2510 alpha\n'
-        )
-
-    result = sh._resolve_wm_window_id(
-        'focus:df#2510 alpha',
-        run=fake_run,
-        attempts=5,
-        sleep=lambda s: sleeps.append(s),
-    )
-
-    assert result == '0x03200007'
-    assert len(calls) == 3
-    assert len(sleeps) == 2  # one sleep between each of the first 3 attempts, none after success
-
-
-def test_resolve_wm_window_id_exhausts_attempts_then_none() -> None:
-    calls: list[list[str]] = []
-
-    def fake_run(argv: list[str]) -> subprocess.CompletedProcess[str]:
-        calls.append(argv)
-        return subprocess.CompletedProcess(argv, returncode=1, stdout='')
-
-    result = sh._resolve_wm_window_id(
-        'focus:df#2510 alpha', run=fake_run, attempts=4, sleep=lambda _s: None
-    )
-
-    assert result is None
-    assert len(calls) == 4
-
-
-def test_resolve_wm_window_id_short_circuits_on_missing_binary_sentinel() -> None:
-    """rc=127 is ``_wmctrl_list``'s sentinel for a missing ``wmctrl`` binary
-    (see its docstring) -- a permanent failure, not the transient
-    window-mapping race the retry loop exists for. It must fail fast on the
-    first probe rather than retrying with sleeps in between."""
-    calls: list[list[str]] = []
-
-    def fake_run(argv: list[str]) -> subprocess.CompletedProcess[str]:
-        calls.append(argv)
-        return subprocess.CompletedProcess(argv, returncode=127, stdout='')
-
-    result = sh._resolve_wm_window_id(
-        'focus:df#2510 alpha', run=fake_run, attempts=5, sleep=lambda _s: None
-    )
-
-    assert result is None
-    assert len(calls) == 1
-
-
-def test_resolve_wm_window_id_run_raising_is_caught_as_none() -> None:
-    def fake_run(argv: list[str]) -> subprocess.CompletedProcess[str]:
-        raise OSError('wmctrl not found')
-
-    result = sh._resolve_wm_window_id(
-        'focus:df#2510 alpha', run=fake_run, attempts=3, sleep=lambda _s: None
-    )
-
-    assert result is None
-
-
-def test_resolve_wm_window_id_only_ever_calls_wmctrl_list() -> None:
-    """Never issues a focus/activate command -- read-only probing only."""
-    calls: list[list[str]] = []
-
-    def fake_run(argv: list[str]) -> subprocess.CompletedProcess[str]:
-        calls.append(argv)
-        return subprocess.CompletedProcess(argv, returncode=1, stdout='')
-
-    sh._resolve_wm_window_id(
-        'focus:df#2510 alpha', run=fake_run, attempts=3, sleep=lambda _s: None
-    )
-
-    assert all(call == ['wmctrl', '-l'] for call in calls)
-
-
-def test_wmctrl_list_missing_binary_returns_rc_127(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A genuinely-missing ``wmctrl`` binary (``FileNotFoundError``) is the
-    permanent-failure sentinel _resolve_wm_window_id short-circuits on."""
-
-    def _fake_run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
-        raise FileNotFoundError('wmctrl not found')
-
-    monkeypatch.setattr(subprocess, 'run', _fake_run)
-
-    result = sh._wmctrl_list(['wmctrl', '-l'])
-
-    assert result.returncode == 127
-
-
-def test_wmctrl_list_timeout_returns_distinct_transient_sentinel(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Reviewer finding: ``_wmctrl_list`` used to map every ``OSError`` /
-    ``SubprocessError`` -- including a ``subprocess.TimeoutExpired`` from a
-    momentarily-hung ``wmctrl`` -- to the same rc=127 sentinel that
-    ``_resolve_wm_window_id`` treats as a permanent missing-binary failure
-    and short-circuits on. A timeout is transient, not permanent, so it must
-    map to a distinct sentinel the retry loop keeps riding out."""
-
-    def _fake_run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
-        raise subprocess.TimeoutExpired(cmd=argv, timeout=sh._WMCTRL_TIMEOUT_SECS)
-
-    monkeypatch.setattr(subprocess, 'run', _fake_run)
-
-    result = sh._wmctrl_list(['wmctrl', '-l'])
-
-    assert result.returncode == 124
-    assert result.returncode != 127
-
-
-def test_resolve_wm_window_id_retries_through_transient_timeout_sentinel() -> None:
-    """rc=124 (the transient-timeout sentinel) must still be retried by the
-    loop, unlike rc=127 which short-circuits immediately -- the two failure
-    modes _wmctrl_list now distinguishes are handled distinctly end-to-end."""
-    calls: list[list[str]] = []
-
-    def fake_run(argv: list[str]) -> subprocess.CompletedProcess[str]:
-        calls.append(argv)
-        if len(calls) < 3:
-            return subprocess.CompletedProcess(argv, returncode=124, stdout='')
-        return subprocess.CompletedProcess(
-            argv, returncode=0, stdout='0x03200007 0 host focus:df#2510 alpha\n'
-        )
-
-    result = sh._resolve_wm_window_id(
-        'focus:df#2510 alpha', run=fake_run, attempts=5, sleep=lambda _s: None
-    )
-
-    assert result == '0x03200007'
-    assert len(calls) == 3
-
-
-# ---------------------------------------------------------------------------
-# Task 2292 step-5: SessionStart best-effort display stamping (Fleet Cockpit C2)
-# ---------------------------------------------------------------------------
-
-
-def test_run_session_start_tmux_env_stamps_tmux_display(tmp_path: Path) -> None:
-    hook_input = {'session_id': 'sess-d1', 'cwd': '/home/leo/src/dark-factory'}
-    env = {'TMUX': '/tmp/tmux-1000/default,123,0', 'TMUX_PANE': '%3'}
-
-    sh.run_session_start(hook_input, env, root=tmp_path)
-
-    slug = sh.hook_session_slug(hook_input, env)
-    record = sr.read_record(slug, root=tmp_path)
-    assert record.display is not None
-    # Assert on the wire value directly -- a StrEnum-vs-str choice can't drift.
-    assert record.display.kind == 'tmux'
-    assert record.display.tmux_target == '%3'
-
-
-def test_run_session_start_windowid_env_stamps_wm_display(tmp_path: Path) -> None:
-    hook_input = {'session_id': 'sess-d2', 'cwd': '/home/leo/src/dark-factory'}
-    env = {'WINDOWID': '0x3200007'}
-
-    sh.run_session_start(hook_input, env, root=tmp_path)
-
-    slug = sh.hook_session_slug(hook_input, env)
-    record = sr.read_record(slug, root=tmp_path)
-    assert record.display is not None
-    assert record.display.kind == 'wm'
-    assert record.display.wm_window_id == '0x3200007'
-    assert record.display.wm_title == 'session:dark-factory'
-
-
-def test_run_session_start_tmux_takes_precedence_over_windowid(tmp_path: Path) -> None:
-    hook_input = {'session_id': 'sess-d3', 'cwd': '/home/leo/src/dark-factory'}
-    env = {
-        'TMUX': '/tmp/tmux-1000/default,123,0',
-        'TMUX_PANE': '%3',
-        'WINDOWID': '0x3200007',
-    }
-
-    sh.run_session_start(hook_input, env, root=tmp_path)
-
-    slug = sh.hook_session_slug(hook_input, env)
-    record = sr.read_record(slug, root=tmp_path)
-    assert record.display is not None
-    assert record.display.kind == 'tmux'
-
-
-def test_run_session_start_no_tmux_or_windowid_leaves_display_none(tmp_path: Path) -> None:
-    hook_input = {'session_id': 'sess-d4', 'cwd': '/home/leo/src/dark-factory'}
-    env: dict[str, str] = {}
-
-    sh.run_session_start(hook_input, env, root=tmp_path)
-
-    slug = sh.hook_session_slug(hook_input, env)
-    record = sr.read_record(slug, root=tmp_path)
-    assert record.display is None
-
-
-def test_run_session_start_display_stamping_applies_on_refresh_path(tmp_path: Path) -> None:
-    hook_input = {'session_id': 'sess-d5', 'cwd': '/home/leo/src/dark-factory'}
-    env = {'WINDOWID': '0x3200007'}
-    slug = sh.hook_session_slug(hook_input, env)
-    existing = sr.SessionRecord(
-        session_slug=slug,
-        status=sr.Status.LAUNCHING,
-        title='unblock:df#2085 routing-mechanism',
-        role='unblock',
-        project='df',
-        task_id='2085',
-        cwd='/home/leo/src/dark-factory',
-        prompt='/unblock 2085',
-    )
-    sr.write_record(existing, root=tmp_path)
-
-    sh.run_session_start(hook_input, env, root=tmp_path)
-
-    record = sr.read_record(slug, root=tmp_path)
-    assert record.status == sr.Status.RUNNING
-    assert record.display is not None
-    assert record.display.kind == 'wm'
-    assert record.display.wm_window_id == '0x3200007'
-    # wm_title resolves from the persisted record title (hook_display_title's
-    # existing precedence), not a freshly-derived role:project fallback.
-    assert record.display.wm_title == 'unblock:df#2085 routing-mechanism'
-    # Previously-populated fields survive.
-    assert record.role == 'unblock'
-    assert record.project == 'df'
-    assert record.task_id == '2085'
-    assert record.prompt == '/unblock 2085'
-
-
-# ---------------------------------------------------------------------------
-# Task 2510 step-3: SessionStart marker-search display stamping (Fleet Cockpit C10 fix)
-# ---------------------------------------------------------------------------
-
-
-def test_run_session_start_marker_title_env_stamps_wm_display_via_resolver(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    hook_input = {'session_id': 'sess-m1', 'cwd': '/home/leo/src/dark-factory'}
-    env = {'CLAUDE_SPAWN_WM_TITLE': 'focus:df#2510 alpha'}
-    monkeypatch.setattr(sh, '_resolve_wm_window_id', lambda title: '0x03200007')
-
-    sh.run_session_start(hook_input, env, root=tmp_path)
-
-    slug = sh.hook_session_slug(hook_input, env)
-    record = sr.read_record(slug, root=tmp_path)
-    assert record.display is not None
-    assert record.display.kind == 'wm'
-    assert record.display.wm_window_id == '0x03200007'
-    assert record.display.wm_title == 'focus:df#2510 alpha'
-
-
-def test_run_session_start_marker_title_resolver_miss_leaves_display_none(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # Best-effort: a resolution miss must be no worse than today -- record.display
-    # stays None, exactly like the no-tmux/no-windowid case.
-    hook_input = {'session_id': 'sess-m2', 'cwd': '/home/leo/src/dark-factory'}
-    env = {'CLAUDE_SPAWN_WM_TITLE': 'focus:df#2510 alpha'}
-    monkeypatch.setattr(sh, '_resolve_wm_window_id', lambda title: None)
-
-    sh.run_session_start(hook_input, env, root=tmp_path)
-
-    slug = sh.hook_session_slug(hook_input, env)
-    record = sr.read_record(slug, root=tmp_path)
-    assert record.display is None
-
-
-def test_run_session_start_windowid_wins_over_marker_title_resolver_not_called(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    hook_input = {'session_id': 'sess-m3', 'cwd': '/home/leo/src/dark-factory'}
-    env = {'WINDOWID': '0x3200007', 'CLAUDE_SPAWN_WM_TITLE': 'focus:df#2510 alpha'}
-
-    def _boom(title: str) -> str | None:
-        raise AssertionError('resolver must not be called when WINDOWID is present')
-
-    monkeypatch.setattr(sh, '_resolve_wm_window_id', _boom)
-
-    sh.run_session_start(hook_input, env, root=tmp_path)
-
-    slug = sh.hook_session_slug(hook_input, env)
-    record = sr.read_record(slug, root=tmp_path)
-    assert record.display is not None
-    assert record.display.kind == 'wm'
-    assert record.display.wm_window_id == '0x3200007'
-
-
-def test_run_session_start_tmux_wins_over_marker_title_resolver_not_called(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    hook_input = {'session_id': 'sess-m4', 'cwd': '/home/leo/src/dark-factory'}
-    env = {
-        'TMUX': '/tmp/tmux-1000/default,123,0',
-        'TMUX_PANE': '%3',
-        'CLAUDE_SPAWN_WM_TITLE': 'focus:df#2510 alpha',
-    }
-
-    def _boom(title: str) -> str | None:
-        raise AssertionError('resolver must not be called when TMUX is present')
-
-    monkeypatch.setattr(sh, '_resolve_wm_window_id', _boom)
-
-    sh.run_session_start(hook_input, env, root=tmp_path)
-
-    slug = sh.hook_session_slug(hook_input, env)
-    record = sr.read_record(slug, root=tmp_path)
-    assert record.display is not None
-    assert record.display.kind == 'tmux'
-
-
-def test_run_session_start_marker_title_stamping_applies_on_refresh_path(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    hook_input = {'session_id': 'sess-m5', 'cwd': '/home/leo/src/dark-factory'}
-    env = {'CLAUDE_SPAWN_WM_TITLE': 'focus:df#2510 alpha'}
-    monkeypatch.setattr(sh, '_resolve_wm_window_id', lambda title: '0x03200007')
-    slug = sh.hook_session_slug(hook_input, env)
-    existing = sr.SessionRecord(
-        session_slug=slug,
-        status=sr.Status.LAUNCHING,
-        title='unblock:df#2085 routing-mechanism',
-        role='unblock',
-        project='df',
-        task_id='2085',
-        cwd='/home/leo/src/dark-factory',
-        prompt='/unblock 2085',
-    )
-    sr.write_record(existing, root=tmp_path)
-
-    sh.run_session_start(hook_input, env, root=tmp_path)
-
-    record = sr.read_record(slug, root=tmp_path)
-    assert record.status == sr.Status.RUNNING
-    assert record.display is not None
-    assert record.display.kind == 'wm'
-    assert record.display.wm_window_id == '0x03200007'
-    assert record.display.wm_title == 'focus:df#2510 alpha'
-    # Previously-populated fields survive.
-    assert record.role == 'unblock'
-    assert record.project == 'df'
-    assert record.task_id == '2085'
-    assert record.prompt == '/unblock 2085'
-
-
-def test_run_session_start_no_marker_title_resolver_never_invoked(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # No TMUX/WINDOWID/CLAUDE_SPAWN_WM_TITLE -> display stays None (matches
-    # test_run_session_start_no_tmux_or_windowid_leaves_display_none) AND the
-    # resolver is never invoked -- no fallback to a churny derived title.
-    hook_input = {'session_id': 'sess-m6', 'cwd': '/home/leo/src/dark-factory'}
-    env: dict[str, str] = {}
-
-    def _boom(title: str) -> str | None:
-        raise AssertionError('resolver must not be called when no marker is set')
-
-    monkeypatch.setattr(sh, '_resolve_wm_window_id', _boom)
-
-    sh.run_session_start(hook_input, env, root=tmp_path)
-
-    slug = sh.hook_session_slug(hook_input, env)
-    record = sr.read_record(slug, root=tmp_path)
-    assert record.display is None
+    assert not session_records.record_path_for_slug(uuid_slug, root=tmp_path).exists()
 
 
 # ---------------------------------------------------------------------------
@@ -955,20 +602,20 @@ def test_run_notification_and_run_stop_flip_status_and_return_osc(
     hook_input = {'session_id': 'sess-c', 'cwd': '/home/leo/src/dark-factory'}
     env: dict[str, str] = {}
     slug = sh.hook_session_slug(hook_input, env)
-    existing = sr.SessionRecord(
+    existing = session_records.SessionRecord(
         session_slug=slug,
-        status=sr.Status.RUNNING,
+        status=session_records.Status.RUNNING,
         role='session',
         project='dark-factory',
         cwd='/home/leo/src/dark-factory',
     )
-    sr.write_record(existing, root=tmp_path)
+    session_records.write_record(existing, root=tmp_path)
     handler = getattr(sh, handler_name)
 
     osc = handler(hook_input, env, root=tmp_path)
 
-    record = sr.read_record(slug, root=tmp_path)
-    assert record.status == sr.Status(expected_status)
+    record = session_records.read_record(slug, root=tmp_path)
+    assert record.status == session_records.Status(expected_status)
     assert osc == f'\033]0;{expected_glyph_prefix} session:dark-factory\007'
 
 
@@ -976,12 +623,12 @@ def test_run_notification_prefers_persisted_record_title(tmp_path: Path) -> None
     hook_input = {'session_id': 'sess-d', 'cwd': '/home/leo/src/dark-factory'}
     env: dict[str, str] = {}
     slug = sh.hook_session_slug(hook_input, env)
-    existing = sr.SessionRecord(
+    existing = session_records.SessionRecord(
         session_slug=slug,
-        status=sr.Status.RUNNING,
+        status=session_records.Status.RUNNING,
         title='unblock:df#2085 routing-mechanism',
     )
-    sr.write_record(existing, root=tmp_path)
+    session_records.write_record(existing, root=tmp_path)
 
     osc = sh.run_notification(hook_input, env, root=tmp_path)
 
@@ -1001,19 +648,19 @@ def test_run_notification_stamps_question_from_message(tmp_path: Path) -> None:
     }
     env: dict[str, str] = {}
     slug = sh.hook_session_slug(hook_input, env)
-    existing = sr.SessionRecord(
+    existing = session_records.SessionRecord(
         session_slug=slug,
-        status=sr.Status.RUNNING,
+        status=session_records.Status.RUNNING,
         role='session',
         project='dark-factory',
         cwd='/home/leo/src/dark-factory',
     )
-    sr.write_record(existing, root=tmp_path)
+    session_records.write_record(existing, root=tmp_path)
 
     sh.run_notification(hook_input, env, root=tmp_path)
 
-    record = sr.read_record(slug, root=tmp_path)
-    assert record.status == sr.Status.AWAITING_INPUT
+    record = session_records.read_record(slug, root=tmp_path)
+    assert record.status == session_records.Status.AWAITING_INPUT
     assert record.question is not None
     assert record.question.text == 'Claude needs your permission to run Bash'
     # asked_at is a non-empty, genuinely parseable ISO-8601 timestamp.
@@ -1031,20 +678,20 @@ def test_run_notification_question_stamp_preserves_other_fields(tmp_path: Path) 
     }
     env: dict[str, str] = {}
     slug = sh.hook_session_slug(hook_input, env)
-    existing = sr.SessionRecord(
+    existing = session_records.SessionRecord(
         session_slug=slug,
-        status=sr.Status.RUNNING,
+        status=session_records.Status.RUNNING,
         title='unblock:df#2085 routing-mechanism',
         role='unblock',
         project='df',
         task_id='2085',
         cwd='/home/leo/src/dark-factory',
     )
-    sr.write_record(existing, root=tmp_path)
+    session_records.write_record(existing, root=tmp_path)
 
     sh.run_notification(hook_input, env, root=tmp_path)
 
-    record = sr.read_record(slug, root=tmp_path)
+    record = session_records.read_record(slug, root=tmp_path)
     assert record.title == 'unblock:df#2085 routing-mechanism'
     assert record.role == 'unblock'
     assert record.project == 'df'
@@ -1069,19 +716,19 @@ def test_run_notification_no_question_when_message_absent_or_blank(
     hook_input = {'session_id': 'sess-q3', 'cwd': '/home/leo/src/dark-factory', **hook_input_extra}
     env: dict[str, str] = {}
     slug = sh.hook_session_slug(hook_input, env)
-    existing = sr.SessionRecord(
+    existing = session_records.SessionRecord(
         session_slug=slug,
-        status=sr.Status.RUNNING,
+        status=session_records.Status.RUNNING,
         role='session',
         project='dark-factory',
         cwd='/home/leo/src/dark-factory',
     )
-    sr.write_record(existing, root=tmp_path)
+    session_records.write_record(existing, root=tmp_path)
 
     osc = sh.run_notification(hook_input, env, root=tmp_path)
 
-    record = sr.read_record(slug, root=tmp_path)
-    assert record.status == sr.Status.AWAITING_INPUT
+    record = session_records.read_record(slug, root=tmp_path)
+    assert record.status == session_records.Status.AWAITING_INPUT
     assert record.question is None
     assert osc == '\033]0;⏸ AWAITING session:dark-factory\007'
 
@@ -1096,19 +743,19 @@ def test_run_stop_does_not_stamp_question_even_with_message(tmp_path: Path) -> N
     }
     env: dict[str, str] = {}
     slug = sh.hook_session_slug(hook_input, env)
-    existing = sr.SessionRecord(
+    existing = session_records.SessionRecord(
         session_slug=slug,
-        status=sr.Status.RUNNING,
+        status=session_records.Status.RUNNING,
         role='session',
         project='dark-factory',
         cwd='/home/leo/src/dark-factory',
     )
-    sr.write_record(existing, root=tmp_path)
+    session_records.write_record(existing, root=tmp_path)
 
     sh.run_stop(hook_input, env, root=tmp_path)
 
-    record = sr.read_record(slug, root=tmp_path)
-    assert record.status == sr.Status.IDLE
+    record = session_records.read_record(slug, root=tmp_path)
+    assert record.status == session_records.Status.IDLE
     assert record.question is None
 
 
@@ -1126,13 +773,13 @@ def test_main_notification_stamps_question_via_stdin(
         'cwd': '/home/leo/src/dark-factory',
         'message': 'Claude needs your permission to run Bash',
     }
-    _stdin_json(monkeypatch, hook_input)
+    stdin_json(monkeypatch, hook_input)
 
     rc = sh.main(['notification'])
 
     assert rc == 0
     slug = sh.hook_session_slug(hook_input, env={})
-    record = sr.read_record(slug, root=tmp_path)
+    record = session_records.read_record(slug, root=tmp_path)
     assert record.question is not None
     assert record.question.text == 'Claude needs your permission to run Bash'
 
@@ -1142,23 +789,19 @@ def test_main_notification_stamps_question_via_stdin(
 # ---------------------------------------------------------------------------
 
 
-def _stdin_json(monkeypatch: pytest.MonkeyPatch, payload: Mapping[str, object]) -> None:
-    monkeypatch.setattr('sys.stdin', io.StringIO(json.dumps(payload)))
-
-
 def test_main_session_start_creates_running_record_and_returns_zero(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
     hook_input = {'session_id': 'sess-main-1', 'cwd': '/home/leo/src/dark-factory'}
-    _stdin_json(monkeypatch, hook_input)
+    stdin_json(monkeypatch, hook_input)
 
     rc = sh.main(['session-start'])
 
     assert rc == 0
     slug = sh.hook_session_slug(hook_input, env={})
-    assert sr.read_record(slug, root=tmp_path).status == sr.Status.RUNNING
+    assert session_records.read_record(slug, root=tmp_path).status == session_records.Status.RUNNING
 
 
 def test_main_notification_writes_osc_to_stdout(
@@ -1168,15 +811,15 @@ def test_main_notification_writes_osc_to_stdout(
 ) -> None:
     monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
     hook_input = {'session_id': 'sess-main-2', 'cwd': '/home/leo/src/dark-factory'}
-    _stdin_json(monkeypatch, hook_input)
+    stdin_json(monkeypatch, hook_input)
 
     rc = sh.main(['notification'])
 
     assert rc == 0
-    expected = sh.osc_retitle_sequence(sr.Status.AWAITING_INPUT, 'session:dark-factory')
+    expected = sh.osc_retitle_sequence(session_records.Status.AWAITING_INPUT, 'session:dark-factory')
     assert capsys.readouterr().out.strip() == expected
     slug = sh.hook_session_slug(hook_input, env={})
-    assert sr.read_record(slug, root=tmp_path).status == sr.Status.AWAITING_INPUT
+    assert session_records.read_record(slug, root=tmp_path).status == session_records.Status.AWAITING_INPUT
 
 
 def test_main_stop_writes_osc_to_stdout(
@@ -1186,15 +829,15 @@ def test_main_stop_writes_osc_to_stdout(
 ) -> None:
     monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
     hook_input = {'session_id': 'sess-main-3', 'cwd': '/home/leo/src/dark-factory'}
-    _stdin_json(monkeypatch, hook_input)
+    stdin_json(monkeypatch, hook_input)
 
     rc = sh.main(['stop'])
 
     assert rc == 0
-    expected = sh.osc_retitle_sequence(sr.Status.IDLE, 'session:dark-factory')
+    expected = sh.osc_retitle_sequence(session_records.Status.IDLE, 'session:dark-factory')
     assert capsys.readouterr().out.strip() == expected
     slug = sh.hook_session_slug(hook_input, env={})
-    assert sr.read_record(slug, root=tmp_path).status == sr.Status.IDLE
+    assert session_records.read_record(slug, root=tmp_path).status == session_records.Status.IDLE
 
 
 def test_main_session_start_fail_soft_on_empty_stdin(
@@ -1223,12 +866,12 @@ def test_main_fail_soft_when_registry_write_raises(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
-    _stdin_json(monkeypatch, {'session_id': 'sess-main-4', 'cwd': '/home/leo/src/dark-factory'})
+    stdin_json(monkeypatch, {'session_id': 'sess-main-4', 'cwd': '/home/leo/src/dark-factory'})
 
     def _boom(*_args: object, **_kwargs: object) -> None:
         raise OSError('disk on fire')
 
-    monkeypatch.setattr(sr, 'write_record', _boom)
+    monkeypatch.setattr(session_records, 'write_record', _boom)
 
     with caplog.at_level(logging.ERROR):
         rc = sh.main(['session-start'])
@@ -1246,444 +889,314 @@ def test_main_session_start_notification_stop_share_one_record(
     monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
     hook_input = {'session_id': 'sess-main-5', 'cwd': '/home/leo/src/dark-factory'}
 
-    _stdin_json(monkeypatch, hook_input)
+    stdin_json(monkeypatch, hook_input)
     assert sh.main(['session-start']) == 0
-    _stdin_json(monkeypatch, hook_input)
+    stdin_json(monkeypatch, hook_input)
     assert sh.main(['notification']) == 0
-    _stdin_json(monkeypatch, hook_input)
+    stdin_json(monkeypatch, hook_input)
     assert sh.main(['stop']) == 0
 
-    session_dirs = list(sr.sessions_dir(root=tmp_path).iterdir())
+    session_dirs = list(session_records.sessions_dir(root=tmp_path).iterdir())
     assert len(session_dirs) == 1
     slug = sh.hook_session_slug(hook_input, env={})
-    assert sr.read_record(slug, root=tmp_path).status == sr.Status.IDLE
-
-
-# ---------------------------------------------------------------------------
-# Step-11: merge_hook_settings (MERGE-not-clobber)
-# ---------------------------------------------------------------------------
-
-
-def _real_settings_snapshot() -> dict:
-    """A settings dict reproducing the real ~/.claude/settings.json's shape."""
-    return {
-        'env': {'SOME_VAR': '1'},
-        'permissions': {'allow': ['Bash(git *)']},
-        'hooks': {
-            'PreToolUse': [
-                {
-                    'matcher': 'Bash',
-                    'hooks': [
-                        {
-                            'type': 'command',
-                            'command': '/home/leo/.claude/hooks/skim-rewrite.sh',
-                            'timeout': 5,
-                        }
-                    ],
-                },
-                {
-                    'matcher': 'EnterWorktree',
-                    'hooks': [
-                        {
-                            'type': 'command',
-                            'command': '/home/leo/.claude/hooks/worktree-hookspath-capture.sh',
-                            'timeout': 10,
-                        }
-                    ],
-                },
-            ],
-            'PostToolUse': [
-                {
-                    'matcher': 'ExitWorktree',
-                    'hooks': [
-                        {
-                            'type': 'command',
-                            'command': '/home/leo/.claude/hooks/worktree-hookspath-restore.sh',
-                            'timeout': 10,
-                        }
-                    ],
-                },
-            ],
-        },
-        'statusLine': {'type': 'command', 'command': 'my-status-line.sh'},
-        'enabledPlugins': ['hookify@claude-plugins-official'],
-    }
-
-
-def test_merge_hook_settings_adds_only_the_three_event_keys(tmp_path: Path) -> None:
-    before = _real_settings_snapshot()
-    script_dir = tmp_path / 'skills' / 'spawn' / 'hooks'
-
-    after = sh.merge_hook_settings(before, script_dir)
-
-    hooks = after['hooks']
-    assert set(hooks) == {'PreToolUse', 'PostToolUse', 'SessionStart', 'Notification', 'Stop'}
-    for event, script_name in (
-        ('SessionStart', 'session-start.sh'),
-        ('Notification', 'notification.sh'),
-        ('Stop', 'stop.sh'),
-    ):
-        entries = hooks[event]
-        assert len(entries) == 1
-        leaf = entries[0]['hooks'][0]
-        assert leaf['type'] == 'command'
-        assert leaf['command'] == str(script_dir / script_name)
-        assert leaf['timeout'] == 10
-
-
-def test_merge_hook_settings_leaves_pretooluse_posttooluse_byte_identical(tmp_path: Path) -> None:
-    before = _real_settings_snapshot()
-    script_dir = tmp_path / 'skills' / 'spawn' / 'hooks'
-
-    after = sh.merge_hook_settings(before, script_dir)
-
-    assert after['hooks']['PreToolUse'] == before['hooks']['PreToolUse']
-    assert after['hooks']['PostToolUse'] == before['hooks']['PostToolUse']
-
-
-def test_merge_hook_settings_leaves_every_other_top_level_key_byte_identical(tmp_path: Path) -> None:
-    before = _real_settings_snapshot()
-    script_dir = tmp_path / 'skills' / 'spawn' / 'hooks'
-
-    after = sh.merge_hook_settings(before, script_dir)
-
-    for key in ('env', 'permissions', 'statusLine', 'enabledPlugins'):
-        assert after[key] == before[key]
-
-
-def test_merge_hook_settings_does_not_mutate_input(tmp_path: Path) -> None:
-    before = _real_settings_snapshot()
-    script_dir = tmp_path / 'skills' / 'spawn' / 'hooks'
-
-    sh.merge_hook_settings(before, script_dir)
-
-    assert before == _real_settings_snapshot()
-
-
-def test_merge_hook_settings_is_idempotent(tmp_path: Path) -> None:
-    before = _real_settings_snapshot()
-    script_dir = tmp_path / 'skills' / 'spawn' / 'hooks'
-
-    once = sh.merge_hook_settings(before, script_dir)
-    twice = sh.merge_hook_settings(once, script_dir)
-
-    assert once == twice
-
-
-def test_merge_hook_settings_creates_hooks_key_when_absent(tmp_path: Path) -> None:
-    before = {'env': {'SOME_VAR': '1'}}
-    script_dir = tmp_path / 'skills' / 'spawn' / 'hooks'
-
-    after = sh.merge_hook_settings(before, script_dir)
-
-    assert set(after['hooks']) == {'SessionStart', 'Notification', 'Stop'}
-    assert after['env'] == before['env']
-
-
-# ---------------------------------------------------------------------------
-# _hooks_script_dir: resolves to the PRIMARY checkout, not a linked worktree
-# ---------------------------------------------------------------------------
-
-
-def _init_primary_checkout_with_hooks(tmp_path: Path) -> Path:
-    """Create a temp git checkout under *tmp_path* with a real hooks trio, committed."""
-    primary = tmp_path / 'primary'
-    primary.mkdir()
-    subprocess.run(['git', 'init', '-q'], cwd=primary, check=True)
-    subprocess.run(['git', 'config', 'user.email', 'test@example.com'], cwd=primary, check=True)
-    subprocess.run(['git', 'config', 'user.name', 'Test'], cwd=primary, check=True)
-    hooks_dir = primary / 'skills' / 'spawn' / 'hooks'
-    hooks_dir.mkdir(parents=True)
-    for script_name in ('session-start.sh', 'notification.sh', 'stop.sh'):
-        (hooks_dir / script_name).write_text('#!/bin/sh\n')
-    (primary / 'README.md').write_text('primary checkout\n')
-    subprocess.run(['git', 'add', '-A'], cwd=primary, check=True)
-    subprocess.run(['git', 'commit', '-q', '-m', 'init'], cwd=primary, check=True)
-    return primary
-
-
-def _init_primary_checkout_with_partial_hooks(tmp_path: Path) -> Path:
-    """Like ``_init_primary_checkout_with_hooks`` but deliberately omits one
-    script, so the resolved candidate dir exists (git succeeds) yet fails the
-    ``all(...is_file())`` completeness guard in ``_hooks_script_dir``."""
-    primary = tmp_path / 'primary'
-    primary.mkdir()
-    subprocess.run(['git', 'init', '-q'], cwd=primary, check=True)
-    subprocess.run(['git', 'config', 'user.email', 'test@example.com'], cwd=primary, check=True)
-    subprocess.run(['git', 'config', 'user.name', 'Test'], cwd=primary, check=True)
-    hooks_dir = primary / 'skills' / 'spawn' / 'hooks'
-    hooks_dir.mkdir(parents=True)
-    # Deliberately omit stop.sh.
-    for script_name in ('session-start.sh', 'notification.sh'):
-        (hooks_dir / script_name).write_text('#!/bin/sh\n')
-    (primary / 'README.md').write_text('primary checkout with partial hooks\n')
-    subprocess.run(['git', 'add', '-A'], cwd=primary, check=True)
-    subprocess.run(['git', 'commit', '-q', '-m', 'init'], cwd=primary, check=True)
-    return primary
-
-
-def _fake_session_hooks_path(root: Path) -> Path:
-    """Mirror the real repo layout (<root>/orchestrator/src/orchestrator/session_hooks.py)."""
-    fake_file = root / 'orchestrator' / 'src' / 'orchestrator' / 'session_hooks.py'
-    fake_file.parent.mkdir(parents=True)
-    fake_file.write_text('# stub for _hooks_script_dir test\n')
-    return fake_file
-
-
-def test_hooks_script_dir_resolves_to_primary_checkout_from_linked_worktree(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    primary = _init_primary_checkout_with_hooks(tmp_path)
-    worktree = tmp_path / 'worktree-2288'
-    subprocess.run(
-        ['git', 'worktree', 'add', '-q', str(worktree), '-b', 'wt-2288'],
-        cwd=primary,
-        check=True,
-    )
-    fake_file = _fake_session_hooks_path(worktree)
-    monkeypatch.setattr(sh, '__file__', str(fake_file))
-
-    resolved = sh._hooks_script_dir()
-
-    assert resolved == (primary / 'skills' / 'spawn' / 'hooks').resolve()
-    assert resolved != fake_file.resolve().parents[3] / 'skills' / 'spawn' / 'hooks'
-
-
-def test_hooks_script_dir_falls_back_when_candidate_missing_a_script(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """git resolves fine and the candidate dir exists, but it is missing one
-    of the three hook scripts -- the ``all(...is_file())`` guard must reject
-    it and fall back to parents[3] rather than returning the incomplete
-    candidate (e.g. an installed/partial checkout where skills/spawn/hooks is
-    stale). Uses a linked worktree, like the resolves-to-primary-checkout
-    test above, so the (rejected) candidate and the fallback are observably
-    different directories -- otherwise a regression that wrongly accepted the
-    incomplete candidate would go unnoticed, since both would resolve to the
-    same path when the fake file lives directly under the primary checkout."""
-    primary = _init_primary_checkout_with_partial_hooks(tmp_path)
-    worktree = tmp_path / 'worktree-partial'
-    subprocess.run(
-        ['git', 'worktree', 'add', '-q', str(worktree), '-b', 'wt-partial'],
-        cwd=primary,
-        check=True,
-    )
-    fake_file = _fake_session_hooks_path(worktree)
-    monkeypatch.setattr(sh, '__file__', str(fake_file))
-
-    resolved = sh._hooks_script_dir()
-
-    assert resolved == fake_file.resolve().parents[3] / 'skills' / 'spawn' / 'hooks'
-    assert resolved != (primary / 'skills' / 'spawn' / 'hooks').resolve()
-
-
-def test_hooks_script_dir_falls_back_to_parents3_when_not_a_git_checkout(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    fake_file = _fake_session_hooks_path(tmp_path)
-    monkeypatch.setattr(sh, '__file__', str(fake_file))
-    # Hermetic regardless of ambient git topology: cap git's upward .git
-    # search at tmp_path so this test's "not a git checkout" premise holds
-    # even if /tmp (or some ancestor) happens to sit inside a real repo.
-    monkeypatch.setenv('GIT_CEILING_DIRECTORIES', str(tmp_path))
-
-    resolved = sh._hooks_script_dir()
-
-    assert resolved == fake_file.resolve().parents[3] / 'skills' / 'spawn' / 'hooks'
-
-
-def test_hooks_script_dir_falls_back_when_git_common_dir_is_empty(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Distinct fallback path from the not-a-git-checkout case above: git
-    itself succeeds (returncode 0) but reports an empty/blank
-    --git-common-dir, which must also degrade to the parents[3] fallback."""
-    fake_file = _fake_session_hooks_path(tmp_path)
-    monkeypatch.setattr(sh, '__file__', str(fake_file))
-
-    def _fake_run(cmd: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
-        return subprocess.CompletedProcess(cmd, returncode=0, stdout='   \n', stderr='')
-
-    monkeypatch.setattr(subprocess, 'run', _fake_run)
-
-    resolved = sh._hooks_script_dir()
-
-    assert resolved == fake_file.resolve().parents[3] / 'skills' / 'spawn' / 'hooks'
-
-
-# ---------------------------------------------------------------------------
-# _run_install: missing-file create, backup-on-existing, atomic JSON write
-# ---------------------------------------------------------------------------
-
-
-def test_run_install_creates_settings_file_when_missing(tmp_path: Path) -> None:
-    settings_path = tmp_path / 'settings.json'
-
-    sh._run_install(settings_path=settings_path)
-
-    assert settings_path.is_file()
-    written = json.loads(settings_path.read_text())
-    assert set(written['hooks']) == {'SessionStart', 'Notification', 'Stop'}
-    assert list(tmp_path.glob('settings.json.*.bak')) == []
-
-
-def test_run_install_backs_up_pre_merge_bytes_when_file_exists(tmp_path: Path) -> None:
-    settings_path = tmp_path / 'settings.json'
-    before = {'env': {'SOME_VAR': '1'}, 'hooks': {'PreToolUse': []}}
-    before_raw = json.dumps(before)
-    settings_path.write_text(before_raw)
-
-    sh._run_install(settings_path=settings_path)
-
-    backups = list(tmp_path.glob('settings.json.*.bak'))
-    assert len(backups) == 1
-    assert backups[0].read_text() == before_raw
-
-    merged = json.loads(settings_path.read_text())
-    assert merged['env'] == before['env']
-    assert set(merged['hooks']) == {'PreToolUse', 'SessionStart', 'Notification', 'Stop'}
-
-
-def test_run_install_result_is_valid_json(tmp_path: Path) -> None:
-    settings_path = tmp_path / 'settings.json'
-    settings_path.write_text(json.dumps({'env': {}}))
-
-    sh._run_install(settings_path=settings_path)
-
-    # json.loads raises on malformed content -- reaching the assertion below
-    # at all is the real assertion here.
-    reloaded = json.loads(settings_path.read_text())
-    assert reloaded['env'] == {}
-
-
-# ---------------------------------------------------------------------------
-# main(['install', ...]): exit-code propagation (install is NOT fail-soft)
-# ---------------------------------------------------------------------------
-
-
-def test_main_install_succeeds_and_returns_zero(tmp_path: Path) -> None:
-    settings_path = tmp_path / 'settings.json'
-
-    rc = sh.main(['install', '--settings-path', str(settings_path)])
-
-    assert rc == 0
-    assert settings_path.is_file()
-
-
-def test_main_install_returns_nonzero_on_failure(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    settings_path = tmp_path / 'settings.json'
-
-    def _boom(*_args: object, **_kwargs: object) -> None:
-        raise OSError('disk on fire')
-
-    monkeypatch.setattr(sh, '_run_install', _boom)
-
-    with caplog.at_level(logging.ERROR):
-        rc = sh.main(['install', '--settings-path', str(settings_path)])
-
-    assert rc == 1
-    assert any(r.levelno >= logging.ERROR for r in caplog.records)
+    assert session_records.read_record(slug, root=tmp_path).status == session_records.Status.IDLE
 
 
 def test_main_session_start_failure_still_returns_zero_not_one(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    # Contrast case for the install-only exit-code change above: the
-    # session-start/notification/stop verbs remain fail-soft (always 0).
+    # Contrast case for
+    # orchestrator/tests/test_session_hooks_install.py::test_main_install_returns_nonzero_on_failure:
+    # the session-start/notification/stop verbs remain fail-soft (always 0).
     monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
-    _stdin_json(monkeypatch, {'session_id': 'sess-rc', 'cwd': '/home/leo/src/dark-factory'})
+    stdin_json(monkeypatch, {'session_id': 'sess-rc', 'cwd': '/home/leo/src/dark-factory'})
 
     def _boom(*_args: object, **_kwargs: object) -> None:
         raise OSError('disk on fire')
 
-    monkeypatch.setattr(sr, 'write_record', _boom)
+    monkeypatch.setattr(session_records, 'write_record', _boom)
 
     assert sh.main(['session-start']) == 0
 
 
 # ---------------------------------------------------------------------------
-# Step-13: bash-level integration test (skills/spawn/hooks/*.sh entrypoints)
+# Task 7193: the self-exit decision is Stop-only
 # ---------------------------------------------------------------------------
 
 
-def _run_hook_script(
-    script_name: str,
-    hook_input: Mapping[str, object],
-    root: Path,
-    *,
-    extra_env: Mapping[str, str] | None = None,
-) -> subprocess.CompletedProcess[bytes]:
-    env = dict(os.environ)
-    env['CLAUDE_FLEET_ROOT'] = str(root)
-    if extra_env:
-        env.update(extra_env)
-    return subprocess.run(
-        [str(_HOOKS_DIR / script_name)],
-        input=json.dumps(hook_input).encode(),
-        env=env,
-        capture_output=True,
-        timeout=30,
-    )
-
-
-def test_session_start_sh_then_notification_sh_flip_status(tmp_path: Path) -> None:
-    # Proves the PYTHONPATH=orchestrator/src wiring, stdin passthrough to
-    # python, and fail-soft exit for the real bash entrypoints end-to-end.
-    hook_input = {'session_id': 'sess-bash-1', 'cwd': '/home/leo/src/dark-factory'}
-
-    start_result = _run_hook_script('session-start.sh', hook_input, tmp_path)
-    assert start_result.returncode == 0
-
-    slug = sh.hook_session_slug(hook_input, env={})
-    record = sr.read_record(slug, root=tmp_path)
-    assert record.status == sr.Status.RUNNING
-
-    notification_result = _run_hook_script('notification.sh', hook_input, tmp_path)
-    assert notification_result.returncode == 0
-
-    record = sr.read_record(slug, root=tmp_path)
-    assert record.status == sr.Status.AWAITING_INPUT
-
-
-# ---------------------------------------------------------------------------
-# Task 2511 step-3: bash-level CLAUDE_SPAWN_SESSION_ID convergence
-# ---------------------------------------------------------------------------
-
-
-def test_session_start_sh_converges_onto_pre_written_launching_record(tmp_path: Path) -> None:
-    # Proves CLAUDE_SPAWN_SESSION_ID propagates through the real .sh -> python
-    # wiring (not just the pure-python run_session_start path exercised
-    # above): a pre-written LAUNCHING record at slug S, keyed the way
-    # spawn-claude.sh's own `launching` write keys it, must advance to
-    # RUNNING via the real session-start.sh entrypoint -- with a DIFFERENT
-    # Claude Code session_id -- when CLAUDE_SPAWN_SESSION_ID=S is in env.
-    slug = 'session-cockpit-3215099'
-    sr.write_record(
-        sr.SessionRecord(session_slug=slug, status=sr.Status.LAUNCHING, launcher_pid=3215099),
+def test_notification_takes_no_self_exit_decision(tmp_path: Path) -> None:
+    slug = 'prd-df-7193-7193250'
+    record_dir = session_records.record_path_for_slug(slug, root=tmp_path).parent
+    session_records.write_record(
+        session_records.SessionRecord(
+            session_slug=slug,
+            status=session_records.Status.RUNNING,
+            self_exit=True,
+            claude_session_id='uuid-owner',
+            claude_owner_pid=7_193_201,
+            launcher_pid=7_193_250,
+        ),
         root=tmp_path,
     )
-    hook_input = {'session_id': 'uuid-bash-convergence', 'cwd': '/home/leo/src/dark-factory'}
+    (record_dir / session_records.RESULT_FILENAME).write_text('outcome: done\n', encoding='utf-8')
+    marker = record_dir / session_records.EXIT_REQUESTED_FILENAME
+    marker.write_text('uuid-owner', encoding='utf-8')
 
-    result = _run_hook_script(
-        'session-start.sh',
-        hook_input,
-        tmp_path,
-        extra_env={'CLAUDE_SPAWN_SESSION_ID': slug},
+    sh.run_notification(
+        {'session_id': 'uuid-owner', 'cwd': str(tmp_path), 'background_tasks': [], 'session_crons': []},
+        owner_ppid_env(slug, 7_193_200),
+        root=tmp_path,
+        process_tree=claude_process_tree(7_193_201, 7_193_200),
     )
 
-    assert result.returncode == 0
-    record = sr.read_record(slug, root=tmp_path)
-    assert record.status == sr.Status.RUNNING
-    # No separate uuid-keyed duplicate.
-    dirs = list(sr.sessions_dir(root=tmp_path).iterdir())
-    assert len(dirs) == 1
-    assert dirs[0].name == slug
+    record = session_records.read_record(slug, root=tmp_path)
+    assert record.status is session_records.Status.AWAITING_INPUT
+    assert record.exit_request is None
+    assert marker.exists()
+
+
+# ---------------------------------------------------------------------------
+# Task 7489: pointer keying -- a session with no CLAUDE_SPAWN_SESSION_ID (a
+# T3-hosted one) reaches its record through sessions-by-claude-id, then
+# sessions-by-pid, before the hand-launched keying.
+# ---------------------------------------------------------------------------
+
+_T3_CWD = '/home/leo/src/dark-factory'
+_T3_SLUG = 'session-dark-factory-7489001'
+_T3_OWNER = 7_489_101
+_NESTED = 7_489_202
+
+
+def _write_t3_record(
+    tmp_path: Path,
+    *,
+    session_id: str,
+    status: session_records.Status = session_records.Status.RUNNING,
+    owner_pid: int = _T3_OWNER,
+) -> None:
+    session_records.write_record(
+        session_records.SessionRecord(
+            session_slug=_T3_SLUG,
+            status=status,
+            title='t3 child',
+            cwd=_T3_CWD,
+            launcher_pid=7_489_900,
+            display=session_records.Display(kind=session_records.DisplayKind.T3.value, t3_thread_id='thread-7489'),
+            claude_session_id=session_id,
+            claude_launch_session_id=session_id,
+            claude_owner_pid=owner_pid,
+        ),
+        root=tmp_path,
+    )
+    session_records.write_claude_session_pointer(session_id, _T3_SLUG, root=tmp_path)
+    session_records.write_session_pointer(owner_pid, _T3_SLUG, root=tmp_path)
+
+
+def _reaped_pid() -> int:
+    child = subprocess.Popen(['true'])
+    child.wait()
+    return child.pid
+
+
+def _hand_slug(session_id: str, tmp_path: Path) -> str:
+    """The hand-launched keying's slug: what the hooks resolve against a registry with no pointers."""
+    return sh.hook_session_slug(
+        _t3_event(session_id),
+        {},
+        root=tmp_path / 'pointerless-fleet',
+        process_tree=claude_process_tree(None),
+    )
+
+
+def _session_slugs(tmp_path: Path) -> set[str]:
+    return {path.name for path in session_records.sessions_dir(root=tmp_path).iterdir()}
+
+
+def _t3_event(session_id: str, **extra: str) -> dict[str, str]:
+    return {'session_id': session_id, 'cwd': _T3_CWD, **extra}
+
+
+@pytest.mark.parametrize(
+    ('handler', 'expected'),
+    [
+        (sh.run_session_start, session_records.Status.RUNNING),
+        (sh.run_notification, session_records.Status.AWAITING_INPUT),
+        (sh.run_stop, session_records.Status.IDLE),
+    ],
+)
+def test_session_id_pointer_resolves_every_event_onto_the_t3_record(
+    tmp_path: Path,
+    handler: Callable[..., object],
+    expected: session_records.Status,
+) -> None:
+    _write_t3_record(tmp_path, session_id='sid-t3', status=session_records.Status.LAUNCHING)
+
+    handler(_t3_event('sid-t3'), {}, root=tmp_path, process_tree=claude_process_tree(_T3_OWNER))
+
+    record = session_records.read_record(_T3_SLUG, root=tmp_path)
+    assert record.status is expected
+    assert record.display is not None and record.display.kind == session_records.DisplayKind.T3.value
+    assert _session_slugs(tmp_path) == {_T3_SLUG}
+
+
+def test_session_start_keeps_the_t3_display_over_an_inherited_tmux_env(tmp_path: Path) -> None:
+    _write_t3_record(tmp_path, session_id='sid-t3')
+
+    sh.run_session_start(
+        _t3_event('sid-t3'),
+        {'TMUX': '/tmp/tmux-1000/default,1,0', 'TMUX_PANE': '%3'},
+        root=tmp_path,
+        process_tree=claude_process_tree(_T3_OWNER),
+    )
+
+    display = session_records.read_record(_T3_SLUG, root=tmp_path).display
+    assert display is not None
+    assert (display.kind, display.t3_thread_id) == (session_records.DisplayKind.T3.value, 'thread-7489')
+
+
+def test_a_session_id_pointer_the_record_no_longer_vouches_for_falls_through(
+    tmp_path: Path,
+) -> None:
+    _write_t3_record(tmp_path, session_id='sid-current')
+    session_records.write_claude_session_pointer('sid-stale', _T3_SLUG, root=tmp_path)
+
+    sh.run_notification(
+        _t3_event('sid-stale'), {}, root=tmp_path, process_tree=claude_process_tree(_T3_OWNER)
+    )
+
+    t3 = session_records.read_record(_T3_SLUG, root=tmp_path)
+    assert (t3.status, t3.claude_session_id) == (session_records.Status.RUNNING, 'sid-current')
+    assert _session_slugs(tmp_path) == {_T3_SLUG, _hand_slug('sid-stale', tmp_path)}
+
+
+@pytest.mark.parametrize('source', ['clear', 'compact'])
+def test_pid_pointer_rebinds_the_t3_record_on_a_remint(tmp_path: Path, source: str) -> None:
+    _write_t3_record(tmp_path, session_id='sid-before')
+
+    sh.run_session_start(
+        _t3_event('sid-after', source=source),
+        {},
+        root=tmp_path,
+        process_tree=claude_process_tree(_T3_OWNER),
+    )
+
+    record = session_records.read_record(_T3_SLUG, root=tmp_path)
+    assert record.claude_session_id == 'sid-after'
+    assert record.claude_launch_session_id == 'sid-before'
+    assert record.claude_owner_pid == _T3_OWNER
+    assert session_records.resolve_session_slug_for_claude_session_id('sid-after', root=tmp_path) == _T3_SLUG
+    assert session_records.resolve_session_slug_for_pid(_T3_OWNER, root=tmp_path) == _T3_SLUG
+    assert _session_slugs(tmp_path) == {_T3_SLUG}
+
+
+@pytest.mark.parametrize('source', ['startup', 'resume'])
+def test_pid_pointer_does_not_rebind_the_t3_record_on_a_plain_session_start(
+    tmp_path: Path,
+    source: str,
+) -> None:
+    _write_t3_record(tmp_path, session_id='sid-before')
+
+    sh.run_session_start(
+        _t3_event('sid-new', source=source),
+        {},
+        root=tmp_path,
+        process_tree=claude_process_tree(_T3_OWNER),
+    )
+
+    assert session_records.read_record(_T3_SLUG, root=tmp_path).claude_session_id == 'sid-before'
+    assert _session_slugs(tmp_path) == {_T3_SLUG, _hand_slug('sid-new', tmp_path)}
+
+
+def test_a_nested_claude_cannot_capture_the_t3_record(tmp_path: Path) -> None:
+    _write_t3_record(tmp_path, session_id='sid-t3')
+    nested = claude_process_tree(_NESTED, _T3_OWNER)
+
+    sh.run_session_start(_t3_event('sid-nested', source='resume'), {}, root=tmp_path, process_tree=nested)
+    sh.run_session_start(_t3_event('sid-nested-2', source='compact'), {}, root=tmp_path, process_tree=nested)
+    sh.run_stop(_t3_event('sid-nested-2'), {}, root=tmp_path, process_tree=nested)
+
+    t3 = session_records.read_record(_T3_SLUG, root=tmp_path)
+    assert (t3.status, t3.claude_session_id, t3.claude_owner_pid) == (
+        session_records.Status.RUNNING,
+        'sid-t3',
+        _T3_OWNER,
+    )
+    assert session_records.resolve_session_slug_for_pid(_T3_OWNER, root=tmp_path) == _T3_SLUG
+    assert _session_slugs(tmp_path) == {_T3_SLUG, _hand_slug('sid-nested', tmp_path)}
+
+
+def test_an_env_slug_binding_writes_a_session_id_pointer(tmp_path: Path) -> None:
+    slug = 'session-cockpit-7489300'
+    session_records.write_record(
+        session_records.SessionRecord(session_slug=slug, status=session_records.Status.LAUNCHING, launcher_pid=7_489_300),
+        root=tmp_path,
+    )
+
+    sh.run_session_start(
+        _t3_event('sid-env'),
+        owner_ppid_env(slug, 7_489_310),
+        root=tmp_path,
+        process_tree=claude_process_tree(7_489_311, 7_489_310),
+    )
+
+    assert session_records.resolve_session_slug_for_claude_session_id('sid-env', root=tmp_path) == slug
+
+
+def test_a_hand_launched_record_carries_its_owner_pid_and_both_pointers(tmp_path: Path) -> None:
+    record = sh.run_session_start(
+        _t3_event('sid-hand'), {}, root=tmp_path, process_tree=claude_process_tree(7_489_401)
+    )
+
+    assert record.session_slug == _hand_slug('sid-hand', tmp_path)
+    assert record.claude_owner_pid == 7_489_401
+    assert session_records.resolve_session_slug_for_pid(7_489_401, root=tmp_path) == record.session_slug
+    assert session_records.resolve_session_slug_for_claude_session_id('sid-hand', root=tmp_path) == record.session_slug
+
+
+def test_a_hand_launched_clear_keeps_the_session_on_its_record(tmp_path: Path) -> None:
+    tree = claude_process_tree(7_489_501)
+    sh.run_session_start(_t3_event('sid-first'), {}, root=tmp_path, process_tree=tree)
+
+    sh.run_session_start(_t3_event('sid-second', source='clear'), {}, root=tmp_path, process_tree=tree)
+    sh.run_stop(_t3_event('sid-second'), {}, root=tmp_path, process_tree=tree)
+
+    record = session_records.read_record(_hand_slug('sid-first', tmp_path), root=tmp_path)
+    assert (record.status, record.claude_session_id) == (session_records.Status.IDLE, 'sid-second')
+    assert _session_slugs(tmp_path) == {_hand_slug('sid-first', tmp_path)}
+
+
+_T3_RESUMED = 7_489_102
+
+
+def test_a_resume_in_a_new_process_reclaims_a_dead_owner_then_rebinds_on_compact(
+    tmp_path: Path,
+) -> None:
+    _write_t3_record(tmp_path, session_id='sid-t3', owner_pid=_reaped_pid())
+    resumed = claude_process_tree(_T3_RESUMED)
+
+    sh.run_session_start(_t3_event('sid-t3', source='resume'), {}, root=tmp_path, process_tree=resumed)
+
+    assert session_records.read_record(_T3_SLUG, root=tmp_path).claude_owner_pid == _T3_RESUMED
+    assert session_records.resolve_session_slug_for_pid(_T3_RESUMED, root=tmp_path) == _T3_SLUG
+
+    sh.run_session_start(_t3_event('sid-compacted', source='compact'), {}, root=tmp_path, process_tree=resumed)
+
+    assert session_records.read_record(_T3_SLUG, root=tmp_path).claude_session_id == 'sid-compacted'
+    assert _session_slugs(tmp_path) == {_T3_SLUG}
+
+
+def test_a_same_session_id_from_a_new_process_leaves_a_live_owner_in_place(
+    tmp_path: Path,
+) -> None:
+    _write_t3_record(tmp_path, session_id='sid-t3', owner_pid=os.getpid())
+
+    sh.run_session_start(
+        _t3_event('sid-t3', source='resume'),
+        {},
+        root=tmp_path,
+        process_tree=claude_process_tree(_T3_RESUMED, os.getpid()),
+    )
+
+    assert session_records.read_record(_T3_SLUG, root=tmp_path).claude_owner_pid == os.getpid()
+    assert session_records.resolve_session_slug_for_pid(_T3_RESUMED, root=tmp_path) is None

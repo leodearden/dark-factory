@@ -1,23 +1,31 @@
 """Tests for config schema Literal type validation."""
 
+import itertools
+import json
 import os
 import re
 import sys
 import unittest.mock
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import yaml
+from _fm_helpers import MERGE_BASE_NEGATIVE_CONTROL_NOTE, STRADDLING_WRITE_FIXTURE
 from pydantic import ValidationError
 from pydantic.fields import FieldInfo
 from pydantic_settings import BaseSettings
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.config.schema import (
+    ConsolidationAutoConfig,
     CuratorConfig,
     EmbedderConfig,
+    EntityMintConfig,
     FusedMemoryConfig,
     GraphitiBackendConfig,
     LLMConfig,
+    Mem0UpdateConfig,
     PathScopeAdjudicatorConfig,
     ProceduralTopicCluster,
     QueueConfig,
@@ -28,8 +36,28 @@ from fused_memory.config.schema import (
     TaskStatusConfig,
     YamlSettingsSource,
 )
-from fused_memory.server.near_duplicate_guard import find_matching_topic_cluster
+from fused_memory.server.mem0_update_authz import (
+    resolve_mem0_update_allowed_prefixes,
+    resolve_mem0_update_sanctioned_uses,
+)
+from fused_memory.server.near_duplicate_guard import (
+    _TOPIC_CLUSTER_DEFAULT_HINT,
+    build_topic_cluster_block,
+    can_share_one_occurrence,
+    find_matching_topic_cluster,
+)
 from fused_memory.services.durable_queue import DEFAULT_TRANSIENT_ERROR_NAMES
+
+# Imported from the LEAF, not from memory_metadata: this test module asserts
+# the config side's behaviour, and pulling the registry here would drag in
+# mem0 and mask the very import-lightness the extraction bought (task 3198).
+from fused_memory.topic_slug import (
+    TOPIC_SLUG_MAX_LEN,
+    TOPIC_SLUG_RE,
+    is_valid_topic_slug,
+)
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 
 class _DummySettings(BaseSettings):
@@ -164,6 +192,132 @@ class TestLLMConfigProvider:
             LLMConfig(provider='cohere')  # type: ignore[arg-type]
 
 
+class TestLLMConfigClientClass:
+    """Tests for LLMConfig.client_class / structured_output_mode Literal validation.
+
+    Both knobs are restart-tier by omission (config/reload.py RELOADABLE_FIELDS
+    carries no ``llm.*`` leaf) and BOTH default to today's behaviour — the task's
+    binding acceptance condition is that the shipped config stays byte-identical.
+    """
+
+    def test_default_client_class_is_openai(self):
+        config = LLMConfig()
+        assert config.client_class == 'openai'
+
+    def test_valid_client_class_openai(self):
+        config = LLMConfig(client_class='openai')
+        assert config.client_class == 'openai'
+
+    def test_valid_client_class_openai_generic(self):
+        config = LLMConfig(client_class='openai_generic')
+        assert config.client_class == 'openai_generic'
+
+    def test_invalid_client_class_ollama_raises_validation_error(self):
+        with pytest.raises(ValidationError):
+            LLMConfig(client_class='ollama')  # type: ignore[arg-type]
+
+    def test_invalid_client_class_empty_raises_validation_error(self):
+        with pytest.raises(ValidationError):
+            LLMConfig(client_class='')  # type: ignore[arg-type]
+
+    def test_default_structured_output_mode_is_auto(self):
+        config = LLMConfig()
+        assert config.structured_output_mode == 'auto'
+
+    def test_valid_structured_output_mode_json_object(self):
+        config = LLMConfig(
+            client_class='openai_generic', structured_output_mode='json_object',
+        )
+        assert config.structured_output_mode == 'json_object'
+
+    def test_invalid_structured_output_mode_raises_validation_error(self):
+        with pytest.raises(ValidationError):
+            LLMConfig(structured_output_mode='json_schema_strict')  # type: ignore[arg-type]
+
+    @pytest.mark.parametrize('client_class', ['openai', None])
+    def test_json_object_without_the_generic_client_is_rejected(self, client_class):
+        """The knob pair must not be settable into a silently-inert state.
+
+        structured_output_mode is read on exactly one arm of build_llm_client.
+        An operator who uncomments it but forgets client_class would otherwise
+        get stock Responses-API behaviour with no warning, no log line and no
+        error — the no-silent-fail-soft failure mode
+        (docs/legibility/design-invariants.md). ``None`` covers omitting
+        client_class entirely, i.e. leaving it at its 'openai' default.
+        """
+        kwargs = {'structured_output_mode': 'json_object'}
+        if client_class is not None:
+            kwargs['client_class'] = client_class
+
+        with pytest.raises(ValidationError) as exc:
+            LLMConfig(**kwargs)  # type: ignore[arg-type]
+
+        message = str(exc.value)
+        assert 'structured_output_mode' in message and 'client_class' in message, (
+            f'the error must name BOTH knobs so the fix is obvious: {message}'
+        )
+
+    def test_auto_mode_is_accepted_on_every_client_class(self):
+        """The default combination stays valid on both arms — the validator
+        must gate the opt-in, not the shipped configuration."""
+        assert LLMConfig(client_class='openai').structured_output_mode == 'auto'
+        assert LLMConfig(client_class='openai_generic').structured_output_mode == 'auto'
+
+    @pytest.mark.parametrize('yaml_name', ['config.yaml', 'config-docker.yaml'])
+    def test_shipped_config_yaml_does_not_opt_in(self, monkeypatch, yaml_name):
+        """The shipped deployment YAMLs must leave BOTH knobs at their defaults.
+
+        Byte-identical guard: uncommenting either knob would change the
+        constructed graphiti LLM client for every existing deployment. The
+        examples in those files are deliberately commented out. Both files are
+        checked — config-docker.yaml is what containerised deployments load, so
+        guarding only config.yaml would leave that half unguarded.
+        """
+        yaml_path = Path(__file__).resolve().parent.parent / 'config' / yaml_name
+        assert yaml_path.is_file(), f'expected {yaml_name} at {yaml_path}'
+        monkeypatch.setenv('CONFIG_PATH', str(yaml_path))
+        cfg = FusedMemoryConfig()
+        assert cfg.llm.client_class == 'openai', (
+            f'fused-memory/config/{yaml_name} must leave llm.client_class at its '
+            "'openai' default — the openai_generic example must stay commented out."
+        )
+        assert cfg.llm.structured_output_mode == 'auto', (
+            f'fused-memory/config/{yaml_name} must leave llm.structured_output_mode '
+            "at its 'auto' default — the json_object example must stay commented out."
+        )
+
+    @pytest.mark.parametrize('yaml_name', ['config.yaml', 'config-docker.yaml'])
+    def test_shipped_config_yaml_llm_api_url_follows_openai_api_url(
+        self, monkeypatch, yaml_name,
+    ):
+        """The llm api_url defaults to OpenAI and follows OPENAI_API_URL.
+
+        The embedder endpoint is deliberately independent of the llm's
+        (plans/local-embedder-cutover-prd.md §6 C3), so its block is only
+        required to exist with a non-empty api_url.
+        """
+        yaml_path = Path(__file__).resolve().parent.parent / 'config' / yaml_name
+        assert yaml_path.is_file(), f'expected {yaml_name} at {yaml_path}'
+        monkeypatch.setenv('CONFIG_PATH', str(yaml_path))
+
+        # Unset so the ${...:default} branch is exercised deterministically,
+        # independent of the developer's environment.
+        monkeypatch.delenv('OPENAI_API_URL', raising=False)
+        cfg = FusedMemoryConfig()
+        assert cfg.llm.providers.openai is not None
+        assert cfg.llm.providers.openai.api_url == 'https://api.openai.com/v1'
+        assert cfg.embedder.providers.openai is not None
+        assert isinstance(cfg.embedder.providers.openai.api_url, str)
+        assert cfg.embedder.providers.openai.api_url, (
+            f'embedder.providers.openai.api_url must be non-empty in {yaml_name}'
+        )
+
+        monkeypatch.setenv('OPENAI_API_URL', 'http://127.0.0.1:1234/v1')
+        cfg2 = FusedMemoryConfig()
+        assert cfg2.llm.providers.openai is not None
+        assert cfg2.llm.providers.openai.api_url == 'http://127.0.0.1:1234/v1'
+
+
 class TestEmbedderConfigProvider:
     """Tests for EmbedderConfig.provider Literal validation."""
 
@@ -243,7 +397,7 @@ class TestFusedMemoryConfigDefaults:
         # Verify unmentioned config sections retain their defaults (not clobbered to null/empty)
         assert config.embedder.provider == 'openai'
         assert config.embedder.model == 'text-embedding-3-small'
-        assert config.server.host == '0.0.0.0'
+        assert config.server.host == '127.0.0.1'
         assert config.graphiti.provider == 'falkordb'
         assert config.mem0.qdrant_url == 'http://localhost:6333'
         assert config.routing.confidence_threshold == 0.7
@@ -599,6 +753,44 @@ class TestReconciliationConfigJudgeInfraMaxConsecutiveFailures:
             ReconciliationConfig(judge_infra_max_consecutive_failures=-1)
 
 
+class TestReconTranscriptArchiveConfig:
+    """The recon transcript-archive leaves (task 3972)."""
+
+    FM_CONFIG_YAML = Path(__file__).resolve().parent.parent / 'config' / 'config.yaml'
+    LEGIBILITY_YAML = (
+        Path(__file__).resolve().parents[2] / 'docs' / 'legibility' / 'legibility.yaml'
+    )
+
+    def test_defaults(self):
+        cfg = ReconciliationConfig()
+        assert cfg.transcript_archive_enabled is True
+        assert cfg.transcript_archive_root == 'data/orchestrator/agent-transcripts'
+
+    def test_default_root_matches_the_shipped_legibility_archive_roots(self):
+        """Recon archives must land where the legibility miner walks; if the
+        two drift, they are written and never mined."""
+        assert self.LEGIBILITY_YAML.is_file(), f'expected {self.LEGIBILITY_YAML}'
+        legibility = yaml.safe_load(self.LEGIBILITY_YAML.read_text())
+
+        assert (
+            ReconciliationConfig().transcript_archive_root
+            in legibility['agent_transcript_roots']
+        )
+
+    def test_shipped_config_yaml_loads_the_leaves(self, monkeypatch):
+        assert self.FM_CONFIG_YAML.is_file(), f'expected {self.FM_CONFIG_YAML}'
+        shipped = yaml.safe_load(self.FM_CONFIG_YAML.read_text())['reconciliation']
+        assert 'transcript_archive_enabled' in shipped
+        assert 'transcript_archive_root' in shipped
+
+        monkeypatch.setenv('CONFIG_PATH', str(self.FM_CONFIG_YAML))
+        cfg = FusedMemoryConfig().reconciliation
+
+        assert isinstance(cfg.transcript_archive_enabled, bool)
+        assert isinstance(cfg.transcript_archive_root, str)
+        assert cfg.transcript_archive_root
+
+
 class TestReconciliationAutoUnhaltAfterCooldown:
     """Tests for auto_unhalt_after_cooldown (task 2920 deliverable c).
 
@@ -696,6 +888,350 @@ class TestReconciliationConfigBulkResetGuardFields:
         assert cfg.bulk_reset_guard_write_failure_backoff_seconds == 120.5
 
 
+def _undocumented_prefixes(section: Mem0UpdateConfig) -> list[str]:
+    """Allowlisted prefixes the Mem0UpdateNotAuthorized refusal would render
+    as undocumented, read through the renderer's own resolvers."""
+    svc = SimpleNamespace(config=SimpleNamespace(mem0_update=section))
+    uses = resolve_mem0_update_sanctioned_uses(svc)
+    bar = {
+        *resolve_mem0_update_allowed_prefixes(svc, 'content_amend'),
+        *resolve_mem0_update_allowed_prefixes(svc, 'metadata_patch'),
+    }
+    return sorted(p for p in bar if p not in uses)
+
+
+class TestMem0UpdateConfig:
+    """Authorization + storm knobs for the in-place update_memory tool (task 3088).
+
+    Shape follows the sibling storm-knob precedent below
+    (TestReconciliationConfigStormKnobs) — the in-repo evidence that storm
+    thresholds belong in config rather than in module constants.
+
+    Deliberately a TOP-LEVEL section rather than nested under
+    ReconciliationConfig: recon Stage 1 is this gate's first sanctioned caller,
+    not its owner, so it starts where ReconciliationConfig's own ownership note
+    points instead of requiring a later migration.
+    """
+
+    # --- fail-safe defaults ---
+
+    def test_default_enabled_is_true(self):
+        """A named kill switch, defaulting ON — the tool ships usable."""
+        assert Mem0UpdateConfig().enabled is True
+
+    def test_default_content_amend_allowlist_is_recon_stage_and_curator(self):
+        """recon-stage- admits every reconciliation stage; curator- admits the
+        interactive consolidation sitting (esc-3524-1 ruling (b), promoted to
+        an all-deployments schema default by ruling 2026-08-12 because
+        skills/curate-fused-memories does not work without the grant)."""
+        assert Mem0UpdateConfig().content_amend_allowed_agent_prefixes == [
+            'recon-stage-', 'curator-',
+        ]
+
+    def test_default_metadata_patch_allowlist_is_recon_stage_curator_and_link_heal(self):
+        """curator- deliberately holds BOTH arms: gate 3200's retain-and-tag
+        stamps retained peers via metadata-only patches, so content_amend alone
+        would be the destructive half without the preserving half. link-heal-
+        holds the metadata arm only (plans/write-triage-link-healing-prd.md H1)."""
+        assert Mem0UpdateConfig().metadata_patch_allowed_agent_prefixes == [
+            'recon-stage-', 'curator-', 'link-heal-',
+        ]
+
+    def test_default_storm_threshold_is_20(self):
+        assert Mem0UpdateConfig().storm_threshold == 20
+
+    def test_default_storm_window_is_3600(self):
+        assert Mem0UpdateConfig().storm_window_seconds == 3600.0
+
+    # --- the two bars are independently configurable ---
+
+    def test_prefix_lists_are_separate_objects(self):
+        """A shared default_factory list would couple the two bars the decision
+        doc deliberately decoupled — widening the metadata-patch bar must not
+        also grant content-amend authority."""
+        cfg = Mem0UpdateConfig()
+        assert cfg.content_amend_allowed_agent_prefixes is not \
+            cfg.metadata_patch_allowed_agent_prefixes
+        cfg.metadata_patch_allowed_agent_prefixes.append('auditor-')
+        assert cfg.content_amend_allowed_agent_prefixes == [
+            'recon-stage-', 'curator-',
+        ], (
+            'widening one list must not mutate the other, got '
+            f'{cfg.content_amend_allowed_agent_prefixes!r}'
+        )
+
+    def test_separate_instances_do_not_share_lists(self):
+        a, b = Mem0UpdateConfig(), Mem0UpdateConfig()
+        a.content_amend_allowed_agent_prefixes.append('x-')
+        assert b.content_amend_allowed_agent_prefixes == ['recon-stage-', 'curator-']
+
+    # --- overrides accepted ---
+
+    def test_overrides_accepted(self):
+        cfg = Mem0UpdateConfig(
+            enabled=False,
+            content_amend_allowed_agent_prefixes=[],
+            metadata_patch_allowed_agent_prefixes=['recon-stage-', 'auditor-'],
+            storm_threshold=5,
+            storm_window_seconds=600.0,
+        )
+        assert cfg.enabled is False
+        assert cfg.content_amend_allowed_agent_prefixes == []
+        assert cfg.metadata_patch_allowed_agent_prefixes == ['recon-stage-', 'auditor-']
+        assert cfg.storm_threshold == 5
+        assert cfg.storm_window_seconds == 600.0
+
+    # --- validation bounds ---
+
+    def test_storm_threshold_zero_rejected(self):
+        with pytest.raises(ValidationError):
+            Mem0UpdateConfig(storm_threshold=0)
+
+    def test_storm_threshold_negative_rejected(self):
+        with pytest.raises(ValidationError):
+            Mem0UpdateConfig(storm_threshold=-1)
+
+    def test_storm_window_zero_rejected(self):
+        with pytest.raises(ValidationError):
+            Mem0UpdateConfig(storm_window_seconds=0)
+
+    def test_storm_window_negative_rejected(self):
+        with pytest.raises(ValidationError):
+            Mem0UpdateConfig(storm_window_seconds=-1.0)
+
+    # --- wired onto FusedMemoryConfig as a top-level section ---
+
+    def test_top_level_field_with_default_factory(self, tmp_path, monkeypatch):
+        """An unconfigured deployment still gets the narrow allowlists.
+
+        CONFIG_PATH is pinned at a missing file because a bare
+        ``FusedMemoryConfig()`` is a BaseSettings that otherwise loads
+        ``config/config.yaml`` from the test cwd — which made this test
+        silently assert on the shipped YAML, not the schema default, and
+        was one of the three 65b011ed8c tripwire casualties."""
+        monkeypatch.setenv('CONFIG_PATH', str(tmp_path / 'missing.yaml'))
+        cfg = FusedMemoryConfig()
+        assert isinstance(cfg.mem0_update, Mem0UpdateConfig)
+        assert cfg.mem0_update.enabled is True
+        assert cfg.mem0_update.content_amend_allowed_agent_prefixes == [
+            'recon-stage-', 'curator-',
+        ]
+
+    def test_field_is_bare_submodel_not_optional(self):
+        """Bare (non-Optional) so config/reload.py's _iter_leaves descends into
+        per-leaf paths — an `X | None` submodel is compared whole and lands as a
+        single restart_required entry (esc-2718-1)."""
+        annotation = FusedMemoryConfig.model_fields['mem0_update'].annotation
+        assert annotation is Mem0UpdateConfig, (
+            f'expected a bare Mem0UpdateConfig annotation, got {annotation!r}'
+        )
+
+    def test_two_configs_do_not_share_the_submodel(self):
+        a, b = FusedMemoryConfig(), FusedMemoryConfig()
+        assert a.mem0_update is not b.mem0_update
+
+    # --- agent_prefix_sanctioned_use: the role each allowlisted prefix declares ---
+
+    def test_default_sanctioned_use_documents_every_default_bar_prefix(self):
+        undocumented = _undocumented_prefixes(Mem0UpdateConfig())
+        assert not undocumented, (
+            f'default-allowlisted prefixes with no sanctioned use: {undocumented!r}'
+        )
+
+    def test_default_sanctioned_use_documents_link_heal(self):
+        """The schema default grants link-heal- on the metadata arm, so its
+        role text ships in the same default."""
+        uses = Mem0UpdateConfig().agent_prefix_sanctioned_use
+        assert isinstance(uses.get('link-heal-'), str)
+        assert uses['link-heal-'].strip()
+
+    def test_sanctioned_use_maps_are_separate_objects(self):
+        a = Mem0UpdateConfig()
+        a.agent_prefix_sanctioned_use['curator-'] = 'MUTATED'
+        a.agent_prefix_sanctioned_use['x-'] = 'ADDED'
+        b = Mem0UpdateConfig()
+        assert b.agent_prefix_sanctioned_use['curator-'] != 'MUTATED'
+        assert 'x-' not in b.agent_prefix_sanctioned_use
+
+    def test_sanctioned_use_override_accepted(self):
+        cfg = Mem0UpdateConfig(
+            agent_prefix_sanctioned_use={'auditor-': 'an audit sitting'},
+        )
+        assert cfg.agent_prefix_sanctioned_use == {'auditor-': 'an audit sitting'}
+
+    @pytest.mark.parametrize('blank', ['', '   '])
+    def test_blank_sanctioned_use_value_rejected_naming_the_prefix(self, blank):
+        with pytest.raises(ValidationError) as exc:
+            Mem0UpdateConfig(
+                agent_prefix_sanctioned_use={
+                    'recon-stage-': 'the reconciliation stages',
+                    'curator-': blank,
+                },
+            )
+        message = str(exc.value)
+        assert 'curator-' in message, message
+        assert 'agent_prefix_sanctioned_use' in message, message
+
+    @pytest.mark.parametrize('blank_key', ['', '  '])
+    def test_blank_sanctioned_use_key_rejected(self, blank_key):
+        with pytest.raises(ValidationError):
+            Mem0UpdateConfig(agent_prefix_sanctioned_use={blank_key: 'x'})
+
+    def test_non_str_sanctioned_use_value_rejected(self):
+        with pytest.raises(ValidationError):
+            Mem0UpdateConfig.model_validate({'agent_prefix_sanctioned_use': {'curator-': 42}})
+
+    def test_every_skill_a_default_sanctioned_use_names_exists(self):
+        """A refusal must never point a caller at a skill that is not there."""
+        repo_root = Path(__file__).resolve().parents[2]
+        uses = Mem0UpdateConfig().agent_prefix_sanctioned_use
+        missing = sorted(
+            (prefix, token)
+            for prefix, use in uses.items()
+            for token in re.findall(r'skills/[a-z0-9-]+', use)
+            if not (repo_root / token / 'SKILL.md').is_file()
+        )
+        assert not missing, f'sanctioned uses naming a missing skill: {missing!r}'
+        assert re.search(r'skills/[a-z0-9-]+', uses['curator-']), (
+            'the curator- entry must name the curation skill it executes, '
+            f'got {uses["curator-"]!r}'
+        )
+
+
+@pytest.mark.parametrize('yaml_name', ['config.yaml', 'config-docker.yaml'])
+class TestShippedConfigDocumentsEveryAllowlistedPrefix:
+    """Documenting a prefix is part of widening either allowlist.
+
+    The shipped configs are where a grant is widened, so each must leave every
+    granted prefix with a sanctioned use the refusal can render.
+    """
+
+    def test_every_allowlisted_prefix_has_a_sanctioned_use(
+        self, monkeypatch, yaml_name,
+    ):
+        yaml_path = Path(__file__).resolve().parent.parent / 'config' / yaml_name
+        assert yaml_path.is_file(), f'expected {yaml_name} at {yaml_path}'
+        monkeypatch.setenv('CONFIG_PATH', str(yaml_path))
+        undocumented = _undocumented_prefixes(FusedMemoryConfig().mem0_update)
+        assert not undocumented, (
+            f'fused-memory/config/{yaml_name} allowlists {undocumented!r} with no '
+            'entry in mem0_update.agent_prefix_sanctioned_use'
+        )
+
+
+class TestEntityMintConfig:
+    """Authorization + storm knobs for the ensure_entity_node MCP tool (task 4932).
+
+    Shape copied from the ``TestMem0UpdateConfig`` trio above — the same
+    kill-switch + self-reported-agent-prefix-allowlist + storm-knob posture,
+    for the same reason: minting a Graphiti Entity node from MCP is a
+    write-time-identity primitive, so it ships behind a narrow allowlist and a
+    kill switch rather than open on the tool surface.
+
+    Deliberately a TOP-LEVEL section rather than nested under
+    ReconciliationConfig or Mem0UpdateConfig: recon Stage 1 and the curator are
+    this gate's first sanctioned CALLERS, not its owners, and the gate is about
+    the graph's identity surface rather than about mem0 in-place updates.
+    """
+
+    # --- fail-safe defaults ---
+
+    def test_default_enabled_is_true(self):
+        """A named kill switch, defaulting ON — the tool ships usable.
+
+        Mirrors ``Mem0UpdateConfig.enabled = True`` exactly: the narrow prefix
+        allowlist is the real bar, and this tool is strictly more careful than
+        merge_entities / delete_entity(force=True) / rename_entity, all already
+        on the MCP surface with no locking at all.
+        """
+        assert EntityMintConfig().enabled is True
+
+    def test_default_allowlist_is_recon_stage_and_curator(self):
+        """Same two prefixes as the mem0_update bars, for the same reasons:
+        recon-stage- admits every reconciliation stage agent, curator- admits
+        the interactive consolidation sitting."""
+        assert EntityMintConfig().allowed_agent_prefixes == [
+            'recon-stage-', 'curator-',
+        ]
+
+    def test_default_lock_timeout_is_5s(self):
+        assert EntityMintConfig().lock_timeout_seconds == 5.0
+
+    def test_default_storm_threshold_is_10(self):
+        assert EntityMintConfig().storm_threshold == 10
+
+    def test_default_storm_window_is_3600(self):
+        assert EntityMintConfig().storm_window_seconds == 3600.0
+
+    def test_separate_instances_do_not_share_lists(self):
+        """A shared default_factory list would let one config's widening leak
+        into every other instance."""
+        a, b = EntityMintConfig(), EntityMintConfig()
+        a.allowed_agent_prefixes.append('x-')
+        assert b.allowed_agent_prefixes == ['recon-stage-', 'curator-']
+
+    # --- overrides accepted ---
+
+    def test_overrides_accepted(self):
+        cfg = EntityMintConfig(
+            enabled=False,
+            allowed_agent_prefixes=['recon-stage-', 'auditor-'],
+            lock_timeout_seconds=0.25,
+            storm_threshold=3,
+            storm_window_seconds=600.0,
+        )
+        assert cfg.enabled is False
+        assert cfg.allowed_agent_prefixes == ['recon-stage-', 'auditor-']
+        assert cfg.lock_timeout_seconds == 0.25
+        assert cfg.storm_threshold == 3
+        assert cfg.storm_window_seconds == 600.0
+
+    # --- validation bounds: all three numeric leaves reject <= 0 ---
+
+    @pytest.mark.parametrize('field', [
+        'lock_timeout_seconds', 'storm_threshold', 'storm_window_seconds',
+    ])
+    @pytest.mark.parametrize('bad', [0, -1])
+    def test_numeric_leaves_reject_non_positive(self, field, bad):
+        with pytest.raises(ValidationError):
+            EntityMintConfig(**{field: bad})
+
+    # --- wired onto FusedMemoryConfig as a top-level section ---
+
+    def test_top_level_field_with_default_factory(self, tmp_path, monkeypatch):
+        """An unconfigured deployment still gets the narrow allowlist.
+
+        CONFIG_PATH is pinned at a missing file because a bare
+        ``FusedMemoryConfig()`` is a BaseSettings that otherwise loads
+        ``config/config.yaml`` from the test cwd — which would silently assert
+        on the shipped YAML rather than the schema default (the 65b011ed8c
+        tripwire casualties)."""
+        monkeypatch.setenv('CONFIG_PATH', str(tmp_path / 'missing.yaml'))
+        cfg = FusedMemoryConfig()
+        assert isinstance(cfg.entity_mint, EntityMintConfig)
+        assert cfg.entity_mint.enabled is True
+        assert cfg.entity_mint.allowed_agent_prefixes == [
+            'recon-stage-', 'curator-',
+        ]
+        assert cfg.entity_mint.lock_timeout_seconds == 5.0
+        assert cfg.entity_mint.storm_threshold == 10
+        assert cfg.entity_mint.storm_window_seconds == 3600.0
+
+    def test_field_is_bare_submodel_not_optional(self):
+        """Bare (non-Optional) so config/reload.py's _iter_leaves descends into
+        per-leaf paths — an `X | None` submodel is compared whole and lands as a
+        single restart_required entry (esc-2718-1), which would cost every leaf
+        here its green-tier hot-reload."""
+        annotation = FusedMemoryConfig.model_fields['entity_mint'].annotation
+        assert annotation is EntityMintConfig, (
+            f'expected a bare EntityMintConfig annotation, got {annotation!r}'
+        )
+
+    def test_two_configs_do_not_share_the_submodel(self):
+        a, b = FusedMemoryConfig(), FusedMemoryConfig()
+        assert a.entity_mint is not b.entity_mint
+
+
 class TestReconciliationConfigStormKnobs:
     """Tests for the dead_owner_shielded suppression-storm knobs (task 1755 / PRD β).
 
@@ -743,82 +1279,328 @@ class TestReconciliationConfigStormKnobs:
             ReconciliationConfig(dead_owner_suppression_storm_window_seconds=-1.0)
 
 
-class TestReconciliationConfigResumeKnobs:
-    """Tests for the interrupted-run resume knobs (task 2717 / PRD σ, rec 13).
+class TestConsolidationAutoConfig:
+    """Deterministic auto-consolidation knobs (task 5237, PRD §7).
 
-    Five new fields on ReconciliationConfig gate the startup adopt-and-resume
-    pass:
-      - resume_after_restart (bool, default True)
-      - resume_freshness_window_seconds (int, gt=0, default 3600)
-      - resume_max_attempts_per_run (int, gt=0, default 2)
-      - resume_failure_storm_threshold (int, gt=0, default 6)
-      - resume_failure_storm_window_seconds (float, gt=0, default 3600.0)
+    Shape copied from the ``TestMem0UpdateConfig`` / ``TestEntityMintConfig``
+    pair above — the same bare-submodel + kill-switch + green-tier posture, for
+    the same reason: auto-consolidation writes to the corpus without a human in
+    the loop, so an operator must be able to stop it and to stage it
+    per-project without a restart.
+
+    A TOP-LEVEL section rather than nested under ReconciliationConfig for the
+    reason that model's own ownership note gives: recon Stage 1 is this
+    machinery's first sanctioned CALLER, not its owner — the proposal tool, the
+    executor and the provenance bar all live on the server side.
     """
 
-    # --- defaults ---
+    # --- fail-safe defaults (PRD §7 / §12 Q1) ---
 
-    def test_default_resume_after_restart_is_true(self):
-        assert ReconciliationConfig().resume_after_restart is True
+    def test_default_enabled_is_false(self):
+        """Ships OFF, unlike its two sibling gates.
 
-    def test_default_resume_freshness_window_is_3600(self):
-        assert ReconciliationConfig().resume_freshness_window_seconds == 3600
+        Mem0UpdateConfig.enabled and EntityMintConfig.enabled both default ON
+        because a narrow self-reported allowlist is the real bar there. Here
+        there is no caller-side bar at all — the machinery consolidates on its
+        own — so the kill switch IS the bar until PRD §11's supervised
+        dry-run cycle has been read by a human.
+        """
+        assert ConsolidationAutoConfig().enabled is False
 
-    def test_default_resume_max_attempts_is_2(self):
-        assert ReconciliationConfig().resume_max_attempts_per_run == 2
+    def test_default_enabled_projects_is_empty(self):
+        """Empty means no project is staged in — the per-project rollout lever
+        (PRD D13, precedent ``summary_rebuild.projects``)."""
+        assert ConsolidationAutoConfig().enabled_projects == []
 
-    def test_default_resume_failure_storm_threshold_is_positive(self):
-        cfg = ReconciliationConfig()
-        assert cfg.resume_failure_storm_threshold == 6
-        assert cfg.resume_failure_storm_threshold > 0
+    def test_default_predicate_version_is_1(self):
+        assert ConsolidationAutoConfig().predicate_version == '1'
 
-    def test_default_resume_failure_storm_window_is_positive(self):
-        cfg = ReconciliationConfig()
-        assert cfg.resume_failure_storm_window_seconds == 3600.0
-        assert cfg.resume_failure_storm_window_seconds > 0
+    def test_default_member_range_is_2_to_20(self):
+        cfg = ConsolidationAutoConfig()
+        assert cfg.member_min == 2
+        assert cfg.member_max == 20
 
-    # --- override accepted ---
+    def test_default_claim_max_chars_is_200(self):
+        assert ConsolidationAutoConfig().claim_max_chars == 200
 
-    def test_resume_after_restart_override_accepted(self):
-        cfg = ReconciliationConfig(resume_after_restart=False)
-        assert cfg.resume_after_restart is False
+    def test_default_per_cycle_caps_are_3(self):
+        cfg = ConsolidationAutoConfig()
+        assert cfg.max_auto_per_cycle == 3
+        assert cfg.max_gate_filings_per_cycle == 3
 
-    def test_resume_freshness_window_override_accepted(self):
-        cfg = ReconciliationConfig(resume_freshness_window_seconds=7200)
-        assert cfg.resume_freshness_window_seconds == 7200
+    def test_default_backlog_multiplier_is_5(self):
+        assert ConsolidationAutoConfig().backlog_multiplier == 5
 
-    def test_resume_max_attempts_override_accepted(self):
-        cfg = ReconciliationConfig(resume_max_attempts_per_run=1)
-        assert cfg.resume_max_attempts_per_run == 1
+    def test_default_refusal_streak_threshold_is_5(self):
+        assert ConsolidationAutoConfig().refusal_streak_threshold == 5
 
-    # --- gt=0 bound: resume_freshness_window_seconds ---
+    def test_default_slug_collision_jaccard_is_0_6(self):
+        assert ConsolidationAutoConfig().slug_collision_jaccard == 0.6
 
-    def test_resume_freshness_window_zero_rejected(self):
+    def test_default_proposal_ttl_hours_is_one_week(self):
+        assert ConsolidationAutoConfig().proposal_ttl_hours == 168
+
+    def test_default_canonical_absent_bonus_is_2(self):
+        """A cluster whose topic has no canonical yet ranks as if twice its
+        size (PRD C4 ranking formula; consolidation_flood_control.rank_and_cap)."""
+        assert ConsolidationAutoConfig().canonical_absent_bonus == 2.0
+
+    def test_default_category_weights_are_the_three_mem0_primaries(self):
+        """PRD §12 Q1 — the three Mem0-primary categories, with
+        observations_and_summaries down-weighted because its corpus is
+        session-recap noise far more often than it is a reusable norm."""
+        assert ConsolidationAutoConfig().category_weights == {
+            'procedural_knowledge': 1.0,
+            'preferences_and_norms': 1.0,
+            'observations_and_summaries': 0.7,
+        }
+
+    # --- PRD D5: no runtime cap on canonical length ---
+
+    def test_no_canonical_max_chars_leaf_exists(self):
+        """PRD D5 — the builder's maximum is ~464 chars at every input at its
+        own cap, so a runtime cap would be unreachable dead code. The bound is
+        a unit-test assertion (tests/test_consolidation_auto.py) instead."""
+        assert 'canonical_max_chars' not in ConsolidationAutoConfig.model_fields
+
+    # --- defaults are per-instance, not shared mutables ---
+
+    def test_separate_instances_do_not_share_the_project_list(self):
+        a, b = ConsolidationAutoConfig(), ConsolidationAutoConfig()
+        a.enabled_projects.append('dark_factory')
+        assert b.enabled_projects == []
+
+    def test_separate_instances_do_not_share_the_weight_map(self):
+        a, b = ConsolidationAutoConfig(), ConsolidationAutoConfig()
+        a.category_weights['procedural_knowledge'] = 0.1
+        assert b.category_weights['procedural_knowledge'] == 1.0
+
+    # --- overrides accepted ---
+
+    def test_overrides_accepted(self):
+        cfg = ConsolidationAutoConfig(
+            enabled=True,
+            enabled_projects=['dark_factory'],
+            predicate_version='2',
+            member_min=3,
+            member_max=8,
+            claim_max_chars=120,
+            max_auto_per_cycle=1,
+            max_gate_filings_per_cycle=0,
+            backlog_multiplier=2,
+            refusal_streak_threshold=3,
+            slug_collision_jaccard=0.8,
+            proposal_ttl_hours=24,
+            category_weights={'procedural_knowledge': 0.5},
+        )
+        assert cfg.enabled is True
+        assert cfg.enabled_projects == ['dark_factory']
+        assert cfg.predicate_version == '2'
+        assert (cfg.member_min, cfg.member_max) == (3, 8)
+        assert cfg.claim_max_chars == 120
+        assert (cfg.max_auto_per_cycle, cfg.max_gate_filings_per_cycle) == (1, 0)
+        assert cfg.backlog_multiplier == 2
+        assert cfg.refusal_streak_threshold == 3
+        assert cfg.slug_collision_jaccard == 0.8
+        assert cfg.proposal_ttl_hours == 24
+        assert cfg.category_weights == {'procedural_knowledge': 0.5}
+
+    # --- validation bounds ---
+
+    def test_member_min_below_one_rejected(self):
         with pytest.raises(ValidationError):
-            ReconciliationConfig(resume_freshness_window_seconds=0)
+            ConsolidationAutoConfig(member_min=0)
 
-    def test_resume_freshness_window_negative_rejected(self):
+    def test_member_max_below_member_min_rejected(self):
+        """Cross-field: an incoherent range would make every proposal refuse
+        on member count with no configuration that could ever satisfy it."""
         with pytest.raises(ValidationError):
-            ReconciliationConfig(resume_freshness_window_seconds=-1)
+            ConsolidationAutoConfig(member_min=10, member_max=4)
 
-    # --- gt=0 bound: resume_max_attempts_per_run ---
+    def test_member_min_equal_to_member_max_accepted(self):
+        cfg = ConsolidationAutoConfig(member_min=4, member_max=4)
+        assert (cfg.member_min, cfg.member_max) == (4, 4)
 
-    def test_resume_max_attempts_zero_rejected(self):
+    def test_slug_collision_jaccard_above_one_rejected(self):
         with pytest.raises(ValidationError):
-            ReconciliationConfig(resume_max_attempts_per_run=0)
+            ConsolidationAutoConfig(slug_collision_jaccard=1.5)
 
-    def test_resume_max_attempts_negative_rejected(self):
+    def test_slug_collision_jaccard_negative_rejected(self):
         with pytest.raises(ValidationError):
-            ReconciliationConfig(resume_max_attempts_per_run=-1)
+            ConsolidationAutoConfig(slug_collision_jaccard=-0.1)
 
-    # --- gt=0 bounds: storm knobs ---
+    def test_slug_collision_jaccard_endpoints_accepted(self):
+        """0.0 (every slug collides) and 1.0 (only an identical token set
+        collides) are both coherent calibration extremes — PRD §12 Q2."""
+        assert ConsolidationAutoConfig(slug_collision_jaccard=0.0).slug_collision_jaccard == 0.0
+        assert ConsolidationAutoConfig(slug_collision_jaccard=1.0).slug_collision_jaccard == 1.0
 
-    def test_resume_failure_storm_threshold_zero_rejected(self):
+    def test_claim_max_chars_zero_rejected(self):
         with pytest.raises(ValidationError):
-            ReconciliationConfig(resume_failure_storm_threshold=0)
+            ConsolidationAutoConfig(claim_max_chars=0)
 
-    def test_resume_failure_storm_window_zero_rejected(self):
+    def test_claim_max_chars_negative_rejected(self):
         with pytest.raises(ValidationError):
-            ReconciliationConfig(resume_failure_storm_window_seconds=0)
+            ConsolidationAutoConfig(claim_max_chars=-1)
+
+    def test_proposal_ttl_hours_zero_rejected(self):
+        with pytest.raises(ValidationError):
+            ConsolidationAutoConfig(proposal_ttl_hours=0)
+
+    def test_proposal_ttl_hours_negative_rejected(self):
+        with pytest.raises(ValidationError):
+            ConsolidationAutoConfig(proposal_ttl_hours=-1)
+
+    def test_canonical_absent_bonus_below_one_rejected(self):
+        """A bonus below 1 would PENALISE a canonical-absent cluster, inverting
+        the policy it exists to express."""
+        with pytest.raises(ValidationError):
+            ConsolidationAutoConfig(canonical_absent_bonus=0.9)
+
+    def test_canonical_absent_bonus_float_override_accepted(self):
+        assert ConsolidationAutoConfig(canonical_absent_bonus=1.5).canonical_absent_bonus == 1.5
+        assert ConsolidationAutoConfig(canonical_absent_bonus=1.0).canonical_absent_bonus == 1.0
+
+    def test_backlog_multiplier_zero_rejected(self):
+        with pytest.raises(ValidationError):
+            ConsolidationAutoConfig(backlog_multiplier=0)
+
+    def test_refusal_streak_threshold_zero_rejected(self):
+        with pytest.raises(ValidationError):
+            ConsolidationAutoConfig(refusal_streak_threshold=0)
+
+    def test_negative_per_cycle_caps_rejected(self):
+        with pytest.raises(ValidationError):
+            ConsolidationAutoConfig(max_auto_per_cycle=-1)
+        with pytest.raises(ValidationError):
+            ConsolidationAutoConfig(max_gate_filings_per_cycle=-1)
+
+    def test_zero_per_cycle_caps_accepted_as_off_switches(self):
+        """0 is a LEGAL value on both caps, not a bounds violation: it is the
+        narrow off switch that stops auto-execution (or gate filing) while
+        leaving the rest of the pipeline observing."""
+        cfg = ConsolidationAutoConfig(max_auto_per_cycle=0, max_gate_filings_per_cycle=0)
+        assert cfg.max_auto_per_cycle == 0
+        assert cfg.max_gate_filings_per_cycle == 0
+
+    # --- the adjudicator's leaves (plans/consolidation-adjudicator-prd.md K7) ---
+
+    def test_adjudicator_leaf_defaults(self):
+        cfg = ConsolidationAutoConfig()
+        assert cfg.max_adjudications_per_cycle == 6
+        assert cfg.adjudicator_model == 'gpt-6.1-sol'
+        assert cfg.adjudicator_reasoning_effort == 'low'
+        assert cfg.adjudicator_timeout_seconds == 60
+        assert cfg.adjudicator_field_chars == 4000
+        assert cfg.adjudicator_member_max == 8
+        assert cfg.outcome_retention_days == 90
+        assert cfg.memo_days == 30
+
+    def test_gate_filing_cap_survives_until_the_executor_stops_reading_it(self):
+        """K7 retires max_gate_filings_per_cycle together with the executor
+        code that reads it (task γ), not in the change that adds the new
+        leaves."""
+        assert 'max_gate_filings_per_cycle' in ConsolidationAutoConfig.model_fields
+
+    @pytest.mark.parametrize(
+        ('leaf', 'value'),
+        [
+            ('max_adjudications_per_cycle', -1),
+            ('adjudicator_timeout_seconds', 0),
+            ('adjudicator_field_chars', 0),
+            ('outcome_retention_days', 0),
+            ('memo_days', 0),
+            ('adjudicator_model', ''),
+            ('adjudicator_reasoning_effort', 'extreme'),
+        ],
+    )
+    def test_adjudicator_leaf_out_of_bounds_rejected(self, leaf, value):
+        with pytest.raises(ValidationError):
+            ConsolidationAutoConfig(**{leaf: value})
+
+    def test_adjudicator_reasoning_effort_none_accepted_for_a_non_reasoning_model(self):
+        cfg = ConsolidationAutoConfig(adjudicator_reasoning_effort=None)
+        assert cfg.adjudicator_reasoning_effort is None
+
+    def test_zero_adjudications_per_cycle_accepted_as_an_off_switch(self):
+        assert ConsolidationAutoConfig(max_adjudications_per_cycle=0).max_adjudications_per_cycle == 0
+
+    def test_adjudicator_member_max_below_member_min_rejected_naming_both(self):
+        with pytest.raises(ValidationError) as excinfo:
+            ConsolidationAutoConfig(member_min=4, adjudicator_member_max=3)
+        message = str(excinfo.value)
+        assert 'member_min (4)' in message
+        assert 'adjudicator_member_max (3)' in message
+
+    def test_adjudicator_member_max_equal_to_member_min_accepted(self):
+        cfg = ConsolidationAutoConfig(member_min=3, adjudicator_member_max=3)
+        assert (cfg.member_min, cfg.adjudicator_member_max) == (3, 3)
+
+    # --- wired onto FusedMemoryConfig as a top-level section ---
+
+    def test_top_level_field_with_default_factory(self, tmp_path, monkeypatch):
+        """An unconfigured deployment still gets the OFF default.
+
+        CONFIG_PATH is pinned at a missing file because a bare
+        ``FusedMemoryConfig()`` is a BaseSettings that otherwise loads
+        ``config/config.yaml`` from the test cwd — which would silently assert
+        on the shipped YAML rather than the schema default.
+        """
+        monkeypatch.setenv('CONFIG_PATH', str(tmp_path / 'missing.yaml'))
+        cfg = FusedMemoryConfig()
+        assert isinstance(cfg.consolidation_auto, ConsolidationAutoConfig)
+        assert cfg.consolidation_auto.enabled is False
+        assert cfg.consolidation_auto.enabled_projects == []
+
+    def test_field_is_bare_submodel_not_optional(self):
+        """Bare (non-Optional) so config/reload.py's _iter_leaves descends into
+        per-leaf paths — an `X | None` submodel is compared whole and lands as a
+        single restart_required entry (esc-2718-1), which would cost `enabled`
+        its green tier, and a restart-only kill switch is no kill switch."""
+        annotation = FusedMemoryConfig.model_fields['consolidation_auto'].annotation
+        assert annotation is ConsolidationAutoConfig, (
+            f'expected a bare ConsolidationAutoConfig annotation, got {annotation!r}'
+        )
+
+    def test_two_configs_do_not_share_the_submodel(self):
+        a, b = FusedMemoryConfig(), FusedMemoryConfig()
+        assert a.consolidation_auto is not b.consolidation_auto
+
+
+class TestReconciliationDeterministicProvenancePrefixes:
+    """PRD C5's caller bar for `deterministic-*` done provenance (task 5237).
+
+    Consumed by task epsilon. Lives on ReconciliationConfig rather than on
+    ConsolidationAutoConfig because the bar governs every deterministic
+    provenance kind, not only auto-consolidation's.
+    """
+
+    def test_default_is_orchestrator_only(self):
+        """The orchestrator sends no agent_id, so tools.py::_resolve_identity
+        falls back to the clientInfo.name the orchestrator advertises
+        (orchestrator/src/orchestrator/mcp_lifecycle.py::ORCHESTRATOR_MCP_IDENTITY,
+        sent by shared/src/shared/mcp_session.py::McpSession.initialize) — the
+        literal 'orchestrator'."""
+        assert ReconciliationConfig().deterministic_provenance_allowed_agent_prefixes == [
+            'orchestrator',
+        ]
+
+    def test_field_is_a_list_of_str(self):
+        annotation = ReconciliationConfig.model_fields[
+            'deterministic_provenance_allowed_agent_prefixes'
+        ].annotation
+        assert annotation == list[str], f'got {annotation!r}'
+
+    def test_empty_list_accepted_as_deny_all(self):
+        """Deny-on-missing is task epsilon's consumer contract, so the
+        deny-every-caller value must be expressible."""
+        cfg = ReconciliationConfig(deterministic_provenance_allowed_agent_prefixes=[])
+        assert cfg.deterministic_provenance_allowed_agent_prefixes == []
+
+    def test_separate_instances_do_not_share_the_list(self):
+        a, b = ReconciliationConfig(), ReconciliationConfig()
+        a.deterministic_provenance_allowed_agent_prefixes.append('cgl-sched-gate')
+        assert b.deterministic_provenance_allowed_agent_prefixes == ['orchestrator']
 
 
 class TestConfigYamlBacklogHardLimitOverrides:
@@ -975,6 +1757,164 @@ class TestPathScopeAdjudicatorConfigBudget:
         )
 
 
+class TestCuratorDegradedStreakThreshold:
+    """The knob behind the class-agnostic degraded-streak alarm (task 4448).
+
+    Distinct from ``zero_output_breaker_threshold``, which counts only ZOT
+    failures and exists to stop burning 180s per hung call. This one counts
+    degraded DECISIONS of any cause and exists to make the outage visible.
+    """
+
+    def test_default_is_five(self):
+        assert CuratorConfig().degraded_streak_threshold == 5, (
+            'N=5 is chosen against the 2026-08-13 to 08-18 outage: 08-15 alone '
+            'saw 38 consecutive degradations, so N=5 would have escalated '
+            'within minutes of that day starting instead of on day five.'
+        )
+
+    def test_rejects_below_one(self):
+        """N=0 would fire on a healthy curator's first non-LLM decision."""
+        with pytest.raises(ValidationError):
+            CuratorConfig(degraded_streak_threshold=0)
+
+
+class TestCuratorEntryCharCaps:
+    """The per-entry char caps, pinned with the measurement that set them.
+
+    Measured 2026-09-18 against the live task DB (n=5574; 1015 pending):
+    description p50 1813 / p90 3906, with 87.6% of all tasks (96.1% of
+    pending) over the old 500-char cap and a mean 1827-char elision among
+    those clipped; details p50 0 / p90 2827, with 18.6% over 1500. The two
+    caps were INVERTED relative to that data — the near-always-populated,
+    roughly twice-longer field carried the 3x tighter cap.
+    """
+
+    def test_description_cap_shows_the_median_task_in_full(self):
+        assert CuratorConfig().entry_description_chars == 2000, (
+            'entry_description_chars must be 2000 — the smallest round cap '
+            'above the measured description p50 of 1813, taking the clipping '
+            'rate from 87.6% to 44.7% (96.1% -> 69.5% for pending tasks). At '
+            'the old 500 the curator saw roughly the first quarter of 96% of '
+            'combine-eligible descriptions and could not tell.'
+        )
+
+    def test_details_cap_is_unchanged(self):
+        assert CuratorConfig().entry_details_chars == 1500
+
+    def test_description_cap_is_not_tighter_than_the_details_cap(self):
+        """The relationship the measurement established, not just the values.
+
+        description is populated on essentially every task and runs about
+        twice as long as details (p50 1813 vs 0), so it earns the LARGER
+        budget. Any future edit that re-inverts these two is re-introducing
+        the defect, whatever the absolute numbers become.
+        """
+        cfg = CuratorConfig()
+        assert cfg.entry_description_chars >= cfg.entry_details_chars, (
+            f'entry_description_chars ({cfg.entry_description_chars}) must not '
+            f'be tighter than entry_details_chars ({cfg.entry_details_chars}): '
+            f'description is the near-always-populated and roughly twice-longer '
+            f'field (measured p50 1813 vs 0).'
+        )
+
+    @pytest.mark.parametrize('value', [0, -1])
+    @pytest.mark.parametrize('field', ['entry_description_chars', 'entry_details_chars'])
+    def test_a_non_positive_entry_cap_is_refused_at_load(self, field, value):
+        """A cap of 0 or less would make every curator prompt build raise in utils/clip_disclosure.py::TruncationFact, so it is refused when the config loads."""
+        with pytest.raises(ValidationError, match=field):
+            CuratorConfig(**{field: value})
+
+
+class TestCuratorPoolCaps:
+    """The stock pool caps and the relationships the task-5397 census derivation set.
+
+    The measured figures live once, in the pool-cap comment block of
+    ``config/schema.py::CuratorConfig``; these tests pin what follows from
+    them and point there rather than restating them.
+    """
+
+    EMBEDDING_FLOOR = 5
+    SIBLINGS_PER_PARENT_P90 = 3
+
+    def test_stock_pool_caps(self):
+        cfg = CuratorConfig()
+        caps = (
+            cfg.pool_module_cap,
+            cfg.pool_embedding_cap,
+            cfg.pool_dependency_cap,
+            cfg.pool_total_cap,
+        )
+        assert caps == (20, 10, 3, 29), (
+            f'module/embedding/dependency/total pool caps are {caps}; the '
+            f'derivation for 20/10/3/29 is the pool-cap block in '
+            f'config/schema.py::CuratorConfig. Move a value only with a new '
+            f'derivation there. pool_total_cap 29 is the pre-5397 reachable '
+            f'maximum: raising it spends prompt tokens and batch fan-in under '
+            f'batch_token_threshold, so restate that trade in the block first.'
+        )
+
+    def test_the_total_cap_binds_when_every_stream_is_full(self):
+        cfg = CuratorConfig()
+        maximal_pool = (
+            1
+            + cfg.pool_module_cap
+            + cfg.pool_embedding_cap
+            + cfg.pool_dependency_cap
+        )
+        assert maximal_pool > cfg.pool_total_cap, (
+            f'A maximal pool is {maximal_pool} entries against pool_total_cap '
+            f'{cfg.pool_total_cap}. _trim_pool is the live budget control; if '
+            f'it becomes unreachable again, the total_cap arm of the '
+            f'PoolWithheld census goes permanently silent.'
+        )
+
+    def test_a_full_module_stream_with_p90_siblings_keeps_the_embedding_floor(self):
+        """_trim_pool cuts siblings only after the module stream, so each sibling of a full pool costs one embedding slot."""
+        cfg = CuratorConfig()
+        siblings = self.SIBLINGS_PER_PARENT_P90
+        embedding_left = cfg.pool_total_cap - 1 - siblings - cfg.pool_module_cap
+        assert embedding_left >= self.EMBEDDING_FLOOR, (
+            f'A full module stream plus the anchor and {siblings} siblings (the '
+            f'per-parent p90 measured for pool_sibling_cap) leaves '
+            f'{embedding_left} embedding slots, below the floor of '
+            f'{self.EMBEDDING_FLOOR}. The embedding stream is the only '
+            f'relevance-ordered stream; see the pool-cap block in '
+            f'config/schema.py::CuratorConfig for why its head must survive.'
+        )
+
+    @pytest.mark.parametrize(
+        ('field', 'value'),
+        [
+            ('pool_module_cap', -1),
+            ('pool_embedding_cap', -1),
+            ('pool_dependency_cap', -1),
+            ('pool_total_cap', 0),
+        ],
+    )
+    def test_a_cap_below_its_floor_is_refused_at_load(self, field, value):
+        """A stream cap of 0 disables that stream; a total cap of 0 would cut the anchor _trim_pool always keeps."""
+        with pytest.raises(ValidationError, match=field):
+            CuratorConfig(**{field: value})
+
+
+class TestCuratorSiblingCap:
+    """The cap on an agent-followup candidate's same-parent sibling stream (task 6227)."""
+
+    def test_a_sibling_is_never_trimmed_at_stock_caps(self):
+        cfg = CuratorConfig()
+        assert 1 + cfg.pool_sibling_cap <= cfg.pool_total_cap, (
+            f'anchor(1) + pool_sibling_cap ({cfg.pool_sibling_cap}) exceeds '
+            f'pool_total_cap ({cfg.pool_total_cap}). _trim_pool cuts siblings '
+            f'only after every other stream except the anchor, so this '
+            f'inequality is what keeps a sibling from ever being cut.'
+        )
+
+    def test_a_negative_sibling_cap_is_refused_at_load(self):
+        """A cap of 0 is legal and disables the stream; a negative one is refused."""
+        with pytest.raises(ValidationError, match='pool_sibling_cap'):
+            CuratorConfig(pool_sibling_cap=-1)
+
+
 class TestCuratorConfigBudgetRaise:
     """Regression guard: TaskCurator per-call budget is a durable flat $2.00 (task 1980).
 
@@ -1039,6 +1979,83 @@ class TestCuratorConfigBudgetRaise:
         )
 
 
+class TestCuratorZotDuplicateSweepConfig:
+    """Task 5491: the post-ZOT duplicate sweep's knobs live on CuratorConfig."""
+
+    def test_defaults(self):
+        cfg = CuratorConfig()
+        assert cfg.zot_duplicate_sweep_enabled is True
+        assert cfg.zot_duplicate_score_threshold == pytest.approx(0.65)
+        assert cfg.zot_duplicate_search_limit == 5
+
+    @pytest.mark.parametrize('threshold', [1.5, -0.1])
+    def test_threshold_is_a_cosine_in_unit_interval(self, threshold):
+        with pytest.raises(ValidationError):
+            CuratorConfig(zot_duplicate_score_threshold=threshold)
+
+    @pytest.mark.parametrize('threshold', [0.0, 1.0])
+    def test_threshold_bounds_are_inclusive(self, threshold):
+        assert CuratorConfig(
+            zot_duplicate_score_threshold=threshold,
+        ).zot_duplicate_score_threshold == threshold
+
+    def test_search_limit_must_be_positive(self):
+        with pytest.raises(ValidationError):
+            CuratorConfig(zot_duplicate_search_limit=0)
+
+
+class TestCurationDeferralConfig:
+    """Task 4503: the knobs behind parking a submission the curator could not judge."""
+
+    def test_defaults(self):
+        from fused_memory.config.schema import TicketJanitorConfig
+
+        cfg = CuratorConfig()
+        assert cfg.deferral_backoff_base_seconds == 60.0
+        assert cfg.deferral_backoff_max_seconds == 1800.0
+        assert TicketJanitorConfig().curation_backlog_escalation_min_attempts == 2
+
+    @pytest.mark.parametrize(
+        'field',
+        ['deferral_backoff_base_seconds', 'deferral_backoff_max_seconds'],
+    )
+    @pytest.mark.parametrize('value', [0.0, -1.0])
+    def test_seconds_must_be_positive(self, field, value):
+        with pytest.raises(ValidationError):
+            CuratorConfig(**{field: value})
+
+    def test_backlog_escalation_needs_at_least_one_attempt(self):
+        from fused_memory.config.schema import TicketJanitorConfig
+
+        with pytest.raises(ValidationError):
+            TicketJanitorConfig(curation_backlog_escalation_min_attempts=0)
+        assert TicketJanitorConfig(
+            curation_backlog_escalation_min_attempts=1,
+        ).curation_backlog_escalation_min_attempts == 1
+
+    def test_backoff_max_below_base_is_rejected_naming_both(self):
+        with pytest.raises(ValidationError) as excinfo:
+            CuratorConfig(deferral_backoff_base_seconds=120.0, deferral_backoff_max_seconds=90.0)
+        message = str(excinfo.value)
+        assert '120' in message
+        assert '90' in message
+
+    def test_backoff_max_equal_to_base_is_accepted(self):
+        cfg = CuratorConfig(deferral_backoff_base_seconds=90.0, deferral_backoff_max_seconds=90.0)
+        assert cfg.deferral_backoff_max_seconds == 90.0
+
+    def test_there_is_no_terminal_deferral_bound(self):
+        assert 'deferral_max_seconds' not in CuratorConfig.model_fields
+
+    def test_none_is_hot_reloadable(self):
+        from fused_memory.config.reload import RELOADABLE_FIELDS
+
+        assert not {
+            leaf for leaf in RELOADABLE_FIELDS
+            if 'deferral' in leaf or 'curation_backlog' in leaf
+        }
+
+
 class TestQueueConfigTransientErrorFields:
     """Task 1936: QueueConfig exposes the error-aware retry budget knobs that
     flow into DurableWriteQueue(transient_max_attempts=..., transient_error_names=...).
@@ -1052,10 +2069,31 @@ class TestQueueConfigTransientErrorFields:
         # get a SHORTER budget than non-transient ones.
         assert cfg.transient_max_attempts >= cfg.max_attempts
 
-    def test_default_transient_error_names_contains_node_not_found(self):
+    def test_default_transient_error_names_excludes_not_found_family(self):
+        """Task 3585: the not-found family is out — esc-3561-3 refuted the
+        visibility-race premise (304 attempts across 28 add_episode calls, 0
+        successes), so these must not get the extended retry budget.
+
+        Both halves matter: the exclusion is what 3585 changed, and the
+        inclusion is what stops a future over-broad prune from quietly gutting
+        the genuinely-transient budget along with it.
+        """
         cfg = QueueConfig()
         assert isinstance(cfg.transient_error_names, list)
-        assert 'NodeNotFoundError' in cfg.transient_error_names
+        for name in ('NodeNotFoundError', 'EdgeNotFoundError', 'EdgesNotFoundError'):
+            assert name not in cfg.transient_error_names, (
+                f'{name} must not be classified transient (task 3585); see '
+                f'DEFAULT_TRANSIENT_ERROR_NAMES in durable_queue.py for the '
+                f'evidence and the reinstatement condition.'
+            )
+        for name in (
+            'TimeoutError', 'ConnectionError', 'ConnectionResetError',
+            'ServerDisconnectedError', 'OperationalError',
+        ):
+            assert name in cfg.transient_error_names, (
+                f'{name} is genuinely transient and must keep the extended '
+                f'budget; 3585 removed only the not-found family.'
+            )
 
     def test_explicit_overrides_round_trip(self):
         cfg = QueueConfig(transient_max_attempts=20, transient_error_names=['X'])
@@ -1070,6 +2108,71 @@ class TestQueueConfigTransientErrorFields:
         denying one of the two lists' errors the extended retry budget.
         """
         assert set(QueueConfig().transient_error_names) == DEFAULT_TRANSIENT_ERROR_NAMES
+
+    def test_deployed_config_transient_retry_policy(self, monkeypatch):
+        """Task 3585: the DEPLOYED config (config.yaml layered over the schema
+        defaults) must obey the transient-retry POLICY — not-found family out,
+        every genuinely-transient name in.
+
+        Deliberately a policy check, not an identity check. config.yaml spells
+        transient_error_names as a literal list (a whole-list ${VAR:default} is
+        not expressible — see the comment there), so the deployed FILE is the
+        operator's tuning surface for it. Asserting
+        ``set(...) == DEFAULT_TRANSIENT_ERROR_NAMES`` would advertise the list
+        as retunable and freeze it in the same breath: an operator adding, say,
+        'OSError' after an incident would turn CI red for a legitimate edit.
+        What must survive an operator edit is the 3585 verdict itself, so the
+        contract asserted here is ``deployed ⊇ shipped default`` and
+        ``deployed ∩ not-found-family == ∅`` — additions allowed, the removal
+        and the genuinely-transient budget both protected. Exact code-side
+        agreement between QueueConfig's default and
+        DEFAULT_TRANSIENT_ERROR_NAMES stays pinned by
+        test_transient_error_names_matches_durable_queue_default above.
+
+        transient_max_attempts is asymmetric on purpose: config.yaml exposes it
+        as ``${QUEUE_TRANSIENT_MAX_ATTEMPTS:12}``, so the ENV VAR is its tuning
+        surface and the literal is only the shipped fallback — which can be
+        pinned exactly, but only once the environment is neutralised. Without
+        the delenv calls this test would inherit the runner's environment and
+        go red for exactly the operator tuning the knob exists to permit; the
+        pydantic-settings env source also sits AHEAD of the YAML source in
+        settings_customise_sources, so a nested QUEUE__* var wins outright.
+        """
+        yaml_path = Path(__file__).resolve().parent.parent / 'config' / 'config.yaml'
+        assert yaml_path.is_file(), f'expected config.yaml at {yaml_path}'
+
+        # Neutralise BOTH tuning surfaces: the ${...} placeholder expanded
+        # inside the YAML, and the nested-env override that precedes it.
+        for var in (
+            'QUEUE_TRANSIENT_MAX_ATTEMPTS',
+            'QUEUE__TRANSIENT_MAX_ATTEMPTS',
+            'QUEUE__TRANSIENT_ERROR_NAMES',
+        ):
+            monkeypatch.delenv(var, raising=False)
+
+        monkeypatch.setenv('CONFIG_PATH', str(yaml_path))
+        cfg = FusedMemoryConfig()
+
+        deployed = set(cfg.queue.transient_error_names)
+        for name in ('NodeNotFoundError', 'EdgeNotFoundError', 'EdgesNotFoundError'):
+            assert name not in deployed, (
+                f'{name} must not be classified transient in the deployed '
+                f'config (task 3585); see DEFAULT_TRANSIENT_ERROR_NAMES in '
+                f'durable_queue.py for the evidence and the reinstatement '
+                f'condition before re-adding it to config.yaml.'
+            )
+        for name in sorted(DEFAULT_TRANSIENT_ERROR_NAMES):
+            assert name in deployed, (
+                f'{name} is in the shipped DEFAULT_TRANSIENT_ERROR_NAMES but '
+                f'missing from the deployed config.yaml list — the deployed '
+                f'policy may ADD names, never silently drop one and deny it '
+                f'the extended retry budget.'
+            )
+        assert cfg.queue.transient_max_attempts == QueueConfig().transient_max_attempts, (
+            "config.yaml's ${QUEUE_TRANSIENT_MAX_ATTEMPTS:...} fallback has "
+            "drifted from QueueConfig's default; retune via the env var, not "
+            "by re-pinning the literal."
+        )
 
     def test_transient_max_attempts_below_max_attempts_rejected(self):
         """A config that would give transient errors a SHORTER budget than
@@ -1256,33 +2359,283 @@ class TestProceduralTopicClusterModel:
             ProceduralTopicCluster(topic_id='t', phrases=['a', 'b'], min_phrase_hits=0)
 
 
+class TestProceduralTopicClusterSufficientPhrases:
+    """``sufficient_phrases``: phrases distinctive enough to qualify a cluster ALONE (task 3054).
+
+    Count-only matching cannot catch a write that straddles several clusters
+    at one hit each -- the reported defect: a single note scored exactly 1
+    distinct phrase in each of three registered clusters and was blocked by
+    none, because hits do not aggregate across clusters and each cluster's
+    remaining phrases are tuned to a different sub-case's vocabulary. An
+    identifier-shaped phrase (a tool name, a private handler name) cannot
+    appear incidentally, so it should qualify its own cluster on its own.
+
+    The field is opt-in and validated as a SUBSET of ``phrases``: a phrase
+    that is not itself matchable would silently match nothing, which is the
+    same silent-no-op failure ``extra='forbid'`` and ``_validate_topic_id_slug``
+    are already on this model to prevent.
+    """
+
+    def test_defaults_to_empty_list(self):
+        cluster = ProceduralTopicCluster(topic_id='t', phrases=['alpha', 'beta'])
+        assert cluster.sufficient_phrases == []
+
+    def test_accepts_a_subset_of_phrases(self):
+        cluster = ProceduralTopicCluster(
+            topic_id='t',
+            phrases=['alpha', 'beta', 'gamma'],
+            sufficient_phrases=['alpha', 'gamma'],
+        )
+        assert cluster.sufficient_phrases == ['alpha', 'gamma']
+
+    def test_accepts_all_phrases_as_sufficient(self):
+        cluster = ProceduralTopicCluster(
+            topic_id='t',
+            phrases=['alpha', 'beta'],
+            sufficient_phrases=['alpha', 'beta'],
+        )
+        assert cluster.sufficient_phrases == ['alpha', 'beta']
+
+    def test_rejects_a_sufficient_phrase_absent_from_phrases(self):
+        """The loud-fail-at-config-load contract.
+
+        A sufficient phrase that is not also a matchable phrase can never
+        fire, so the operator's intent is silently discarded. Fail at load
+        instead, quoting BOTH the offending phrase and the ``topic_id`` so
+        the operator can find the cluster in a long config list.
+        """
+        with pytest.raises(ValidationError) as excinfo:
+            ProceduralTopicCluster(
+                topic_id='some-topic',
+                phrases=['alpha', 'beta'],
+                sufficient_phrases=['delta'],
+            )
+        message = str(excinfo.value)
+        assert repr('delta') in message, 'must quote the offending phrase'
+        assert 'some-topic' in message, 'must name the cluster it belongs to'
+
+    def test_subset_check_is_case_insensitive(self):
+        """Phrase MATCHING is case-insensitive, so a case mismatch is not a real error.
+
+        Rejecting it would be a spurious config-load failure on a cluster
+        that would in fact match exactly as the operator intended.
+        """
+        cluster = ProceduralTopicCluster(
+            topic_id='t',
+            phrases=['Alpha', 'BETA'],
+            sufficient_phrases=['alpha'],
+        )
+        assert cluster.sufficient_phrases == ['alpha']
+
+    def test_still_rejects_unknown_key(self):
+        # The new field must not have been added by loosening extra='forbid'.
+        with pytest.raises(ValidationError):
+            ProceduralTopicCluster(
+                topic_id='t',
+                phrases=['a', 'b'],
+                sufficient_phrase='boom',  # type: ignore[call-arg]
+            )
+
+    def test_still_rejects_min_phrase_hits_below_one(self):
+        # The new validator must not have displaced the existing ge=1 bound.
+        with pytest.raises(ValidationError):
+            ProceduralTopicCluster(
+                topic_id='t',
+                phrases=['a', 'b'],
+                sufficient_phrases=['a'],
+                min_phrase_hits=0,
+            )
+
+
+class TestProceduralTopicClusterTopicIdSlug:
+    """``topic_id`` shares ONE namespace with ``metadata.topic`` (PRD D4, task 3198).
+
+    Before leaf ε, ``topic_id`` was a bare ``str``: an operator could seed a
+    snake_case cluster id that could never equal any validated
+    ``metadata.topic``, so 3135's auto-seed invariant
+    (``cluster.topic_id == canonical.metadata.topic``) was unenforceable and
+    the guard would silently match nothing. The validator makes that a
+    config-LOAD failure instead.
+    """
+
+    @pytest.mark.parametrize(
+        ('bad_id', 'why'),
+        [
+            ('bad_slug', 'snake_case — the shape 98 of 352 live topics have'),
+            ('Bad-Slug', 'uppercase'),
+            ('bad topic-slug', 'embedded space'),
+            ('-lead', 'leading separator'),
+            ('', 'empty'),
+            ('a' * (TOPIC_SLUG_MAX_LEN + 1), 'over the length cap'),
+        ],
+    )
+    def test_rejects_non_slug_topic_id(self, bad_id, why):
+        with pytest.raises(ValidationError) as excinfo:
+            ProceduralTopicCluster(topic_id=bad_id, phrases=['a', 'b'])
+        message = str(excinfo.value)
+        assert repr(bad_id) in message, f'must quote the offending value ({why})'
+        assert TOPIC_SLUG_RE.pattern in message, 'must name the slug rule'
+        assert 'fused_memory.topic_slug' in message, 'must name the rule/home so it is findable'
+
+    def test_over_length_id_is_rejected_by_length_not_by_the_regex(self):
+        """Pins that the validator applies the CAP, not merely the pattern.
+
+        The regex accepts an over-long run of ``a``s, so without this the
+        over-length case above would pass for the wrong reason and deleting
+        the length clause would go unnoticed.
+        """
+        over = 'a' * (TOPIC_SLUG_MAX_LEN + 1)
+        assert TOPIC_SLUG_RE.match(over), 'the regex alone must NOT reject it'
+        with pytest.raises(ValidationError):
+            ProceduralTopicCluster(topic_id=over, phrases=['a', 'b'])
+
+    @pytest.mark.parametrize('good_id', ['some-topic', 't', 'x1-2y'])
+    def test_accepts_conforming_topic_id(self, good_id):
+        """Positive control: the shapes the pre-existing tests already use.
+
+        ``'some-topic'`` and ``'t'`` are the exact ids
+        ``TestProceduralTopicClusterModel`` constructs, so this proves the
+        new validator adds a rejection without regressing any existing case.
+        """
+        assert ProceduralTopicCluster(topic_id=good_id, phrases=['a', 'b']).topic_id == good_id
+
+    def test_default_seeded_clusters_all_survive_the_validator(self):
+        """The shipped default config must still LOAD (PRD §10's hard requirement).
+
+        Constructed via ``ReconciliationConfig()`` rather than by copying
+        the ids, so a future seed that breaks the rule fails here rather
+        than at an operator's config load.
+        """
+        clusters = ReconciliationConfig().procedural_knowledge_topic_guard_clusters
+        assert clusters, 'the seed must not be empty, or this asserts nothing'
+        for cluster in clusters:
+            assert is_valid_topic_slug(cluster.topic_id)
+
+    def test_snake_case_cluster_id_in_yaml_fails_at_config_load(self, tmp_path, monkeypatch):
+        """Operator-facing: the failure lands at LOAD, not silently at match time.
+
+        This is the whole point of validating on the config side. A
+        snake_case ``topic_id`` can never equal a validated
+        ``metadata.topic``, so without this the guard would load cleanly and
+        then match nothing forever — a silent no-op, the failure mode
+        ``extra='forbid'`` is already on this model to prevent.
+        """
+        config_file = tmp_path / 'config.yaml'
+        config_file.write_text(
+            yaml.dump(
+                {
+                    'reconciliation': {
+                        'procedural_knowledge_topic_guard_clusters': [
+                            {'topic_id': 'eval_worktree_plan_tools_missing', 'phrases': ['a', 'b']},
+                        ],
+                    },
+                },
+            ),
+        )
+        monkeypatch.setenv('CONFIG_PATH', str(config_file))
+        with pytest.raises(ValidationError) as excinfo:
+            FusedMemoryConfig()
+        assert 'eval_worktree_plan_tools_missing' in str(excinfo.value)
+
+    def test_conforming_cluster_id_in_yaml_loads(self, tmp_path, monkeypatch):
+        """Positive control for the loader path itself.
+
+        Without it, the failure above could be caused by an unrelated YAML
+        or env-var problem rather than by the slug rule.
+        """
+        config_file = tmp_path / 'config.yaml'
+        config_file.write_text(
+            yaml.dump(
+                {
+                    'reconciliation': {
+                        'procedural_knowledge_topic_guard_clusters': [
+                            {'topic_id': 'eval-worktree-plan-tools-missing', 'phrases': ['a', 'b']},
+                        ],
+                    },
+                },
+            ),
+        )
+        monkeypatch.setenv('CONFIG_PATH', str(config_file))
+        clusters = FusedMemoryConfig().reconciliation.procedural_knowledge_topic_guard_clusters
+        assert [c.topic_id for c in clusters] == ['eval-worktree-plan-tools-missing']
+
+
+def _seeded_cluster(topic_id: str) -> ProceduralTopicCluster:
+    """Look up one seeded cluster from the live default set by topic_id.
+
+    Shared by the per-cluster test classes below, which otherwise each
+    carried a private copy of the same three-line lookup. Deliberately
+    reads the DEFAULT ``ReconciliationConfig()`` rather than calling
+    ``_default_topic_guard_clusters()`` directly, so these tests exercise
+    the same path the server does (default_factory -> validated models).
+    Raises ``StopIteration`` if the topic is not seeded, which is the
+    intended red signal for a missing registration.
+    """
+    clusters = ReconciliationConfig().procedural_knowledge_topic_guard_clusters
+    return next(c for c in clusters if c.topic_id == topic_id)
+
+
 class TestProceduralTopicGuardClustersDefault:
     """ReconciliationConfig seeds all known topic-guard clusters by default.
 
-    Mix of known-contradictory (plan-tools, venv-shadowing, architect
-    report_task_already_done main-reachability) and known-recurring
-    (pytest-xdist, architect plan-revalidation after requeue/lock) topics --
-    see the >=5 count and the per-topic-id assertions below.
+    Mix of known-contradictory (architect report_task_already_done
+    main-reachability, `npx pyright` EACCES) and known-recurring
+    (pytest-xdist, architect plan-revalidation after requeue/lock, `ruff
+    format` not an enforced gate) topics -- see the exact-set assertion
+    below.
+
+    The set is asserted EXACTLY, not as a lower bound. It was a ``>= 6``
+    floor plus per-id ``in`` checks, which could only catch a cluster going
+    MISSING; retiring a cluster is now a normal operation on this seed
+    (two already have been), so the failure this class must catch is a
+    cluster silently coming BACK.
     """
+
+    # The surviving seed, in seed order. `npx-pyright-eacces-agent-sandbox`
+    # (task 3862) was registered prospectively ahead of its still-blocked
+    # human gate 3417, on the same precedent as the two architect clusters
+    # and ruff-format.
+    EXPECTED = (
+        'pytest-xdist-serial-override',
+        'architect-report-task-already-done-main-reachability',
+        'architect-plan-revalidation-requeue-lock',
+        'ruff-format-not-an-enforced-gate',
+        'npx-pyright-eacces-agent-sandbox',
+    )
+
+    # Retired, and pinned as retired. Both carried a hint routing a blocked
+    # writer to a human gate task that is now ``done`` (2841 / 2844), and
+    # both double-counted one concept as two spelling-variant phrases
+    # ('eval-worktree' / 'eval worktree') at min_phrase_hits=2 -- so merely
+    # NAMING the eval worktree in both spellings scored 2 and blocked the
+    # write with no on-topic content in it at all. The matcher-level fix for
+    # that double-count is task 4179; these two do not wait for it.
+    RETIRED = (
+        'eval-worktree-plan-tools-missing',
+        'eval-worktree-venv-shadowing',
+    )
 
     def test_default_seeds_non_empty_clusters(self):
         clusters = ReconciliationConfig().procedural_knowledge_topic_guard_clusters
         assert isinstance(clusters, list)
-        assert len(clusters) >= 5
+        assert len(clusters) == len(self.EXPECTED)
 
-    def test_default_seeds_all_known_topic_ids(self):
+    def test_default_seeds_exactly_the_known_topic_ids(self):
         clusters = ReconciliationConfig().procedural_knowledge_topic_guard_clusters
-        topic_ids = {c.topic_id for c in clusters}
-        assert 'eval-worktree-plan-tools-missing' in topic_ids
-        assert 'eval-worktree-venv-shadowing' in topic_ids
-        assert 'pytest-xdist-serial-override' in topic_ids
-        assert 'architect-report-task-already-done-main-reachability' in topic_ids
-        assert 'architect-plan-revalidation-requeue-lock' in topic_ids
+        assert [c.topic_id for c in clusters] == list(self.EXPECTED)
 
-    def test_pytest_xdist_cluster_hint_points_at_canonical_memory(self):
+    @pytest.mark.parametrize('topic_id', RETIRED)
+    def test_retired_cluster_is_absent(self, topic_id):
+        """A retired cluster must stay retired.
+
+        Asserted per-id (rather than folded into the exact-set test above)
+        so a reinstatement names WHICH cluster came back in the failure
+        line, and so the two retirements cannot be undone by an edit that
+        happens to keep ``len(EXPECTED)`` intact by swapping one id for
+        another.
+        """
         clusters = ReconciliationConfig().procedural_knowledge_topic_guard_clusters
-        cluster = next(c for c in clusters if c.topic_id == 'pytest-xdist-serial-override')
-        assert '8bb3eb15-1133-4e7b-ac1f-5bac10329b51' in cluster.hint
+        assert topic_id not in {c.topic_id for c in clusters}
 
     def test_every_seeded_cluster_is_well_formed(self):
         clusters = ReconciliationConfig().procedural_knowledge_topic_guard_clusters
@@ -1290,6 +2643,222 @@ class TestProceduralTopicGuardClustersDefault:
             assert isinstance(cluster, ProceduralTopicCluster)
             assert cluster.phrases, f'{cluster.topic_id} has empty phrases'
             assert cluster.min_phrase_hits >= 1
+
+    def test_no_two_seeded_phrases_can_share_one_occurrence(self):
+        """The invariant that keeps every cluster's ``min_phrase_hits`` meaningful.
+
+        ``find_matching_topic_cluster`` counts DISTINCT phrases present as
+        substrings, so two phrases that one occurrence can hold (one nesting
+        in the other, or 'ruff format' / 'format-clean' overlapping on a whole
+        word) score two hits from a single construction and defeat
+        ``min_phrase_hits=2``.
+
+        Checked with ``can_share_one_occurrence``, the same definition
+        ``derive_topic_cluster`` enforces on machine-derived clusters.
+        Sibling spelling variants (the retired 'eval-worktree' /
+        'eval worktree' pair) are outside it: task 4179.
+        """
+        for cluster in ReconciliationConfig().procedural_knowledge_topic_guard_clusters:
+            for first, second in itertools.combinations(cluster.phrases, 2):
+                assert not can_share_one_occurrence(first, second), (
+                    f'{cluster.topic_id}: {first!r} and {second!r} can share one '
+                    f'occurrence -- it would score two distinct hits and defeat '
+                    f'min_phrase_hits'
+                )
+
+
+class TestTopicClusterAutoseedEnabledLeaf:
+    """The kill switch for MACHINE-DERIVED topic clusters (task 3135)."""
+
+    def test_defaults_to_true(self):
+        assert ReconciliationConfig().procedural_knowledge_topic_cluster_autoseed_enabled is True
+
+    def test_round_trips_false(self):
+        cfg = ReconciliationConfig(procedural_knowledge_topic_cluster_autoseed_enabled=False)
+        assert cfg.procedural_knowledge_topic_cluster_autoseed_enabled is False
+
+    def test_round_trips_from_a_config_dict(self):
+        cfg = FusedMemoryConfig.model_validate(
+            {'reconciliation': {'procedural_knowledge_topic_cluster_autoseed_enabled': False}}
+        )
+        assert cfg.reconciliation.procedural_knowledge_topic_cluster_autoseed_enabled is False
+
+
+class TestTopicClusterAutoseedRetiredLeaf:
+    """The per-topic kill switch for MACHINE-DERIVED topic clusters (task 3135 review)."""
+
+    def test_defaults_to_nothing_retired(self):
+        assert ReconciliationConfig().procedural_knowledge_topic_cluster_autoseed_retired == {}
+
+    def test_round_trips_from_a_config_dict(self):
+        cfg = FusedMemoryConfig.model_validate(
+            {
+                'reconciliation': {
+                    'procedural_knowledge_topic_cluster_autoseed_retired': {
+                        'dark_factory': ['worktree-stale-base-premise-verification'],
+                    }
+                }
+            }
+        )
+        assert cfg.reconciliation.procedural_knowledge_topic_cluster_autoseed_retired == {
+            'dark_factory': ['worktree-stale-base-premise-verification'],
+        }
+
+    def test_a_non_slug_topic_id_fails_loud_naming_it_and_the_rule(self):
+        with pytest.raises(ValidationError) as excinfo:
+            ReconciliationConfig(
+                procedural_knowledge_topic_cluster_autoseed_retired={
+                    'dark_factory': ['good-slug', 'worktree_stale_base'],
+                }
+            )
+        message = str(excinfo.value)
+        assert 'worktree_stale_base' in message
+        assert 'dark_factory' in message
+        assert 'fused_memory.topic_slug' in message
+
+
+class TestPytestXdistSerialOverrideCluster:
+    """Topic-guard cluster for the pytest-xdist -n0 serial-override workaround
+    (the topic that originally motivated this guard, task 2845; canonical
+    memory 8bb3eb15-1133-4e7b-ac1f-5bac10329b51).
+
+    Unlike its four siblings, this cluster's hint used to carry a SINGLE
+    dead-end instruction -- amend the canonical memory in place -- that is
+    structurally unreachable for the audience that ever sees it:
+    ``update_memory``'s content-amend arm is authz-gated to ``recon-stage-``
+    / ``curator-`` ``agent_id`` prefixes
+    (``Mem0UpdateConfig.content_amend_allowed_agent_prefixes``), and every
+    orchestrator-dispatched task/merge agent is neither. Task 4738 (fix A)
+    replaces that hint with three ratified outcomes the blocked writer can
+    actually act on. The structural fix -- stopping a per-cluster hint from
+    shadowing the guard's escape hatches at all -- is the sibling fix-B task
+    and is deliberately not this class's concern.
+    """
+
+    TOPIC_ID = 'pytest-xdist-serial-override'
+
+    @classmethod
+    def _cluster(cls):
+        return _seeded_cluster(cls.TOPIC_ID)
+
+    def test_rendered_hint_names_all_three_outcomes(self):
+        """The rendered hint -- not the bare cluster field -- must name all three.
+
+        Asserted through ``build_topic_cluster_block`` (not ``cluster.hint``
+        alone), because ``build_topic_cluster_block`` resolves ``cluster.hint
+        or _TOPIC_CLUSTER_DEFAULT_HINT`` -- asserting on the module default here
+        would pass vacuously, since this cluster always sets its own hint.
+        The explicit ``!= _TOPIC_CLUSTER_DEFAULT_HINT`` assertion guards
+        against exactly that vacuous-pass mode, which is how the previous
+        dead-end hint survived four rounds of triage undetected.
+
+        Reviewer (test-quality, task 4738 amendment): renamed from
+        ``..._returned_to_a_non_curator_...`` -- ``build_topic_cluster_block``
+        never reads ``agent_id`` to select the hint, only echoes it into the
+        block, so this was never actually an agent-conditional test; the name
+        no longer claims a discrimination it can't make. ``matched_phrases``
+        is now derived from ``find_matching_topic_cluster`` on the realistic
+        excerpt below (the ``TestNpxPyrightEaccesAgentSandboxCluster``
+        convention), rather than hand-supplied, so the content string is
+        load-bearing rather than decorative.
+
+        Each outcome is pinned by the literal the writer must ACT on, not by
+        surrounding prose (the ``TestNpxPyrightEaccesAgentSandboxCluster``
+        convention): ``allow_near_duplicate`` for the override, ``skip`` +
+        ``curate-fused-memories`` for the sanctioned no-write outcome (the
+        skill name is what makes "skip" a real answer rather than an implied
+        failure -- it names who DOES own consolidation), and
+        ``escalate_blocker`` -- the actual tool name, not just the bare word
+        "escalate" -- for the unsure/contradicts outcome.
+        """
+        content = (
+            'Hit the pytest-xdist -n0 serial-override workaround again: '
+            'fused-memory/pyproject.toml hardcodes --dist loadgroup in addopts.'
+        )
+        match = find_matching_topic_cluster(content, [self._cluster()])
+        assert match is not None, f'must match its own cluster: {content!r}'
+        cluster, matched_phrases = match
+        block = build_topic_cluster_block('claude-merge-3875', content, cluster, matched_phrases)
+        hint = block['hint']
+        assert block['topic_id'] == self.TOPIC_ID
+        assert block['error_type'] == 'ProceduralKnowledgeKnownTopicClusterWriteRejected'
+        assert hint != _TOPIC_CLUSTER_DEFAULT_HINT
+        # Outcome 1: genuinely distinct -> override, open to every agent today.
+        assert 'allow_near_duplicate' in hint
+        # Outcome 2: genuine duplicate -> skip is sanctioned, and consolidation
+        # is attributed to the interactive curation skill, not to this agent.
+        assert 'skip' in hint.lower()
+        assert 'curate-fused-memories' in hint
+        # Outcome 3: unsure / contradicts -> escalate, naming the actual tool.
+        assert 'escalate_blocker' in hint
+
+    def test_rendered_hint_does_not_route_to_a_refused_amend(self):
+        """Pins that the IMPERATIVE is gone, and that the authz reason survives.
+
+        Reviewer (test-quality, task 4738 amendment): this used to also
+        assert ``'update/consolidate canonical memory' not in hint`` -- the
+        exact wording of the phrase that had just been deleted. That pins one
+        2026-08 rephrasing, not the contract: it would stay green even if a
+        future hint reintroduced the same dead-end imperative in different
+        words ('amend the canonical entry in place'). Dropped in favour of
+        the tool-name pin below plus a positive, behavioural pin: the hint
+        must still STATE why the amend arm is refused, so a future edit that
+        quietly reroutes this audience back toward an amend -- without
+        removing that explanation -- is caught too.
+
+        ``update_memory``'s content-amend arm is authz-gated to
+        ``recon-stage-`` / ``curator-`` agent_id prefixes
+        (``Mem0UpdateConfig.content_amend_allowed_agent_prefixes``, esc-3524-1
+        ruling (b) 2026-08-11 + the 2026-08-12 all-deployments schema-default
+        ruling), so routing this audience to call it directly reproduces the
+        exact defect this task fixes.
+
+        Also renamed from ``..._a_non_curator_...``, for the same reason as
+        the sibling test above: ``agent_id`` is inert for hint rendering.
+        """
+        content = 'pytest-xdist -n0 --dist loadgroup workaround again'
+        match = find_matching_topic_cluster(content, [self._cluster()])
+        assert match is not None, f'must match its own cluster: {content!r}'
+        cluster, matched_phrases = match
+        block = build_topic_cluster_block('claude-merge-3875', content, cluster, matched_phrases)
+        hint = block['hint']
+        assert 'update_memory' not in hint
+        assert 'authz-gated' in hint
+        assert 'recon-stage-' in hint
+
+    def test_cluster_phrases_and_threshold_are_unchanged(self):
+        """Characterization: step-2's hint-only edit must not touch the matcher.
+
+        Green from the start -- exists so a hint rewrite cannot silently
+        widen or narrow what this cluster matches on.
+        """
+        cluster = self._cluster()
+        assert cluster.phrases == [
+            'pytest-xdist',
+            '-n0',
+            '--dist loadgroup',
+            'max-worker-restart',
+            '-p no:xdist',
+        ]
+        assert cluster.min_phrase_hits == 2
+        assert cluster.sufficient_phrases == []
+
+    def test_canonical_memory_id_survives_as_a_read_pointer(self):
+        """The canonical memory id stays in the hint, as a READ pointer only.
+
+        Retained (not deleted) so a blocked writer can search
+        8bb3eb15-1133-4e7b-ac1f-5bac10329b51 to decide which of the three
+        outcomes applies -- distinct, duplicate, or contradicts. It must
+        never again be re-attached to an amend instruction this audience
+        cannot execute; that regression is what
+        ``test_rendered_hint_does_not_route_to_a_refused_amend`` pins.
+        Supersedes the former
+        ``test_pytest_xdist_cluster_hint_points_at_canonical_memory`` in
+        ``TestProceduralTopicGuardClustersDefault``, folded in here so this
+        cluster's hint contract is pinned in exactly one place.
+        """
+        cluster = self._cluster()
+        assert '8bb3eb15-1133-4e7b-ac1f-5bac10329b51' in cluster.hint
 
 
 class TestReportTaskAlreadyDoneMainReachabilityCluster:
@@ -1300,13 +2869,10 @@ class TestReportTaskAlreadyDoneMainReachabilityCluster:
     known-contradictory seeds (plan-tools, venv-shadowing) above.
     """
 
+    TOPIC_ID = 'architect-report-task-already-done-main-reachability'
+
     def test_cluster_present_with_expected_phrases_and_hint(self):
-        clusters = ReconciliationConfig().procedural_knowledge_topic_guard_clusters
-        cluster = next(
-            c
-            for c in clusters
-            if c.topic_id == 'architect-report-task-already-done-main-reachability'
-        )
+        cluster = _seeded_cluster(self.TOPIC_ID)
         assert cluster.phrases == [
             'report_task_already_done',
             'main-reachable',
@@ -1317,12 +2883,7 @@ class TestReportTaskAlreadyDoneMainReachabilityCluster:
         assert '3011' in cluster.hint
 
     def test_matches_representative_near_duplicate_note(self):
-        clusters = ReconciliationConfig().procedural_knowledge_topic_guard_clusters
-        cluster = next(
-            c
-            for c in clusters
-            if c.topic_id == 'architect-report-task-already-done-main-reachability'
-        )
+        cluster = _seeded_cluster(self.TOPIC_ID)
         note = (
             'The architect report_task_already_done requires a main-reachable '
             'commit, verified via git merge-base --is-ancestor by '
@@ -1330,23 +2891,14 @@ class TestReportTaskAlreadyDoneMainReachabilityCluster:
         )
         result = find_matching_topic_cluster(note, [cluster])
         assert result is not None
-        assert result[0].topic_id == 'architect-report-task-already-done-main-reachability'
+        assert result[0].topic_id == self.TOPIC_ID
 
     def test_does_not_match_unrelated_merge_base_note(self):
-        clusters = ReconciliationConfig().procedural_knowledge_topic_guard_clusters
-        cluster = next(
-            c
-            for c in clusters
-            if c.topic_id == 'architect-report-task-already-done-main-reachability'
-        )
+        cluster = _seeded_cluster(self.TOPIC_ID)
         # Only 'merge-base --is-ancestor' occurs here (1 distinct hit) -- a
         # plain git-ancestry-check note unrelated to report_task_already_done
         # must NOT reach min_phrase_hits and mis-route to gate 3011.
-        unrelated_note = (
-            'Use git merge-base --is-ancestor <sha> <branch> to test whether a '
-            'commit is an ancestor of a branch tip before cherry-picking.'
-        )
-        assert find_matching_topic_cluster(unrelated_note, [cluster]) is None
+        assert find_matching_topic_cluster(MERGE_BASE_NEGATIVE_CONTROL_NOTE, [cluster]) is None
 
 
 class TestArchitectPlanRevalidationRequeueLockCluster:
@@ -1357,26 +2909,23 @@ class TestArchitectPlanRevalidationRequeueLockCluster:
     lost_plan_reconstruction).
     """
 
+    TOPIC_ID = 'architect-plan-revalidation-requeue-lock'
+
     def test_cluster_present_with_expected_phrases_and_hint(self):
-        clusters = ReconciliationConfig().procedural_knowledge_topic_guard_clusters
-        cluster = next(
-            c for c in clusters if c.topic_id == 'architect-plan-revalidation-requeue-lock'
-        )
+        cluster = _seeded_cluster(self.TOPIC_ID)
         assert cluster.phrases == [
             '.task/plan.json',
             'plan-revalidation',
             'requeue rebase',
             'lost-plan reconstruction',
             'committed TDD steps',
+            'lane reseed',
         ]
         assert cluster.min_phrase_hits == 2
         assert '2973' in cluster.hint
 
     def test_matches_representative_near_duplicate_note(self):
-        clusters = ReconciliationConfig().procedural_knowledge_topic_guard_clusters
-        cluster = next(
-            c for c in clusters if c.topic_id == 'architect-plan-revalidation-requeue-lock'
-        )
+        cluster = _seeded_cluster(self.TOPIC_ID)
         note = (
             'During architect plan-revalidation after a requeue rebase, check '
             'whether .task/plan.json still exists before choosing confirm vs '
@@ -1384,13 +2933,10 @@ class TestArchitectPlanRevalidationRequeueLockCluster:
         )
         result = find_matching_topic_cluster(note, [cluster])
         assert result is not None
-        assert result[0].topic_id == 'architect-plan-revalidation-requeue-lock'
+        assert result[0].topic_id == self.TOPIC_ID
 
     def test_does_not_match_unrelated_plan_tools_note(self):
-        clusters = ReconciliationConfig().procedural_knowledge_topic_guard_clusters
-        cluster = next(
-            c for c in clusters if c.topic_id == 'architect-plan-revalidation-requeue-lock'
-        )
+        cluster = _seeded_cluster(self.TOPIC_ID)
         # A generic plan-tools note (not about revalidation-after-requeue)
         # only hits '.task/plan.json' (1 distinct hit) -- must NOT reach
         # min_phrase_hits and mis-route to gate 2973.
@@ -1400,14 +2946,77 @@ class TestArchitectPlanRevalidationRequeueLockCluster:
         )
         assert find_matching_topic_cluster(unrelated_note, [cluster]) is None
 
-    def test_full_default_cluster_list_resolves_here_not_plan_tools_cluster(self):
-        # eval-worktree-plan-tools-missing is seeded earlier in the default
-        # list and find_matching_topic_cluster returns the FIRST qualifying
-        # cluster, so a plan-revalidation note must not be shadowed by it.
-        # The note below hits only 1 distinct phrase on that earlier cluster
-        # ('plan.json', via '.task/plan.json') -- below its min_phrase_hits
-        # of 2 -- so matching correctly falls through to this cluster's own
-        # >=2 hits ('.task/plan.json', 'plan-revalidation', 'requeue rebase').
+    def test_matches_a_reseed_note_that_names_no_architect_tool(self):
+        """Third sub-case (task 3054): a reseed leaving a dangling .task/plan.json symlink.
+
+        Sibling of the two canonical sub-cases (plan_json_gitignore_wipe,
+        lost_plan_reconstruction) -- same failure for the architect, a
+        different cause: the lane was recycled and the symlink's
+        worktrees/.task-meta target was never written or was scrubbed.
+
+        A reseed note that never mentions report_task_already_done cannot
+        rely on that cluster's sufficient phrases, so 'lane reseed' paired
+        with the plan-facing '.task/plan.json' is what makes it blockable.
+        Matched against the FULL default list to prove it routes here rather
+        than to an earlier cluster.
+        """
+        clusters = ReconciliationConfig().procedural_knowledge_topic_guard_clusters
+        note = (
+            'Warm-lane reseed: the .task/plan.json symlink dangles because '
+            'worktrees/.task-meta/<lane>/plan.json is absent after a lane reseed.'
+        )
+        result = find_matching_topic_cluster(note, clusters)
+        assert result is not None
+        assert result[0].topic_id == self.TOPIC_ID
+
+    def test_does_not_match_a_pure_lane_lifecycle_note(self):
+        """NEGATIVE CONTROL: lane vocabulary alone, with no plan involved, must not block.
+
+        'worktrees/.task-meta' is the standard lane metadata path shared by
+        the warm-lane / session-resume / transcript-archival subsystems, so
+        seeding it beside 'lane reseed' would have let an ordinary note about
+        lane recycling reach min_phrase_hits with no plan mentioned at all --
+        and routed it to gate 2973, whose hint is about lost plans. The
+        sub-case is anchored on '.task/plan.json' instead; this pins that the
+        lane path is NOT a phrase.
+        """
+        clusters = ReconciliationConfig().procedural_knowledge_topic_guard_clusters
+        note = (
+            'After a lane reseed the whole worktrees/.task-meta/<lane>/ directory '
+            'is rewritten by the warm-lane claim path, so anything an operator '
+            'dropped there by hand is gone.'
+        )
+        assert find_matching_topic_cluster(note, clusters) is None
+
+    def test_does_not_match_a_generic_dangling_symlink_note(self):
+        # Why bare 'dangling' was rejected as a phrase: it fires on ordinary
+        # symlink notes that have nothing to do with lane reseeds.
+        clusters = ReconciliationConfig().procedural_knowledge_topic_guard_clusters
+        note = (
+            'A dangling symlink in /usr/local/bin can break a PATH lookup; use '
+            'readlink -f to resolve it.'
+        )
+        assert find_matching_topic_cluster(note, clusters) is None
+
+    def test_bare_reseed_mention_alone_does_not_match(self):
+        # The additive phrases are ordinary phrases, NOT declared sufficient:
+        # one of them alone stays below min_phrase_hits.
+        clusters = ReconciliationConfig().procedural_knowledge_topic_guard_clusters
+        assert find_matching_topic_cluster('A warm-lane reseed happened.', clusters) is None
+
+    def test_full_default_cluster_list_resolves_here_not_another_cluster(self):
+        # find_matching_topic_cluster returns the FIRST qualifying cluster in
+        # seed order, so a plan-revalidation note must reach THIS cluster and
+        # not be shadowed by an earlier one. Historically the shadowing risk
+        # was concrete: eval-worktree-plan-tools-missing was seeded first and
+        # carried bare 'plan.json', which the note below substring-matches
+        # via '.task/plan.json' -- 1 distinct hit, below that cluster's
+        # min_phrase_hits of 2, so it fell through even then. That cluster is
+        # now retired, which removes the risk rather than the need for the
+        # test: this pins that a note reaches its own cluster against the
+        # WHOLE seeded list, not against this cluster in isolation.
+        # The note scores >=2 here ('.task/plan.json', 'plan-revalidation',
+        # 'requeue rebase').
         clusters = ReconciliationConfig().procedural_knowledge_topic_guard_clusters
         note = (
             'During architect plan-revalidation after a requeue rebase, check '
@@ -1417,6 +3026,696 @@ class TestArchitectPlanRevalidationRequeueLockCluster:
         result = find_matching_topic_cluster(note, clusters)
         assert result is not None
         assert result[0].topic_id == 'architect-plan-revalidation-requeue-lock'
+
+
+class TestStraddlingThreeClustersRegression:
+    """The reported task-3054 defect: a write that straddles three clusters at one hit each.
+
+    Hits do NOT aggregate across clusters, and each cluster's remaining
+    phrases are tuned to a DIFFERENT sub-case's vocabulary, so a note
+    scoring exactly one distinct phrase in each of three registered
+    clusters reached no cluster's ``min_phrase_hits`` and was blocked by
+    none -- even though ``report_task_already_done`` is an identifier that
+    unambiguously names cluster 3's topic on its own.
+
+    THE REPORTED SIGNATURE, for the record: against the phrase lists as they
+    stood before this task, :data:`STRADDLING_WRITE_FIXTURE` scored exactly
+    one distinct hit in each of three clusters -- ``plan.json`` in
+    eval-worktree-plan-tools-missing, ``report_task_already_done`` in
+    architect-report-task-already-done-main-reachability, and
+    ``.task/plan.json`` in architect-plan-revalidation-requeue-lock. All
+    three sat below ``min_phrase_hits=2``, which is precisely why nothing
+    fired. (Recorded here rather than asserted: an assertion would need
+    frozen copies of those three phrase lists, which exercise no production
+    code and rot silently as the seed evolves. The outcome test and the two
+    negative controls below all call ``find_matching_topic_cluster``.)
+
+    FIXTURE PROVENANCE: reconstructed from the task-3054 description
+    because reify Mem0 entry 5697ff2f-4f9b-49bb-be89-5643b94802ec now
+    returns ``found=false`` (deleted or consolidated since the 2026-07-25
+    filing), so its verbatim text is unrecoverable.
+    """
+
+    FIXTURE = STRADDLING_WRITE_FIXTURE
+
+    def test_fixture_is_now_blocked_and_routes_to_the_report_task_already_done_gate(self):
+        """OUTCOME: the identifier-shaped phrase now qualifies its cluster alone.
+
+        Routing is unambiguous precisely because sufficiency is per-phrase:
+        ``report_task_already_done`` belongs to exactly one cluster, so the
+        block names one gate task rather than guessing among three.
+        """
+        clusters = ReconciliationConfig().procedural_knowledge_topic_guard_clusters
+        result = find_matching_topic_cluster(self.FIXTURE, clusters)
+        assert result is not None, 'the straddling write must no longer slip through'
+        assert result[0].topic_id == 'architect-report-task-already-done-main-reachability'
+
+    def test_merge_base_note_alone_still_does_not_match(self):
+        """NEGATIVE CONTROL: widening cluster 3 must not promote a generic git command.
+
+        Mirrors ``test_does_not_match_unrelated_merge_base_note`` above, but
+        against the FULL default list -- a plain git-ancestry note must not
+        become blockable just because its cluster gained sufficient phrases.
+        """
+        clusters = ReconciliationConfig().procedural_knowledge_topic_guard_clusters
+        assert find_matching_topic_cluster(MERGE_BASE_NEGATIVE_CONTROL_NOTE, clusters) is None
+
+    def test_main_reachable_alone_still_does_not_match(self):
+        """NEGATIVE CONTROL: 'main-reachable' is too generic to be sufficient."""
+        clusters = ReconciliationConfig().procedural_knowledge_topic_guard_clusters
+        note = (
+            'The merge worker only advances to a main-reachable tip, so a '
+            'branch that has not landed yet is skipped this cycle.'
+        )
+        assert find_matching_topic_cluster(note, clusters) is None
+
+
+class TestRuffFormatNotAnEnforcedGateCluster:
+    """Topic-guard cluster for the "`ruff format` is not an enforced gate;
+    only `ruff check` / pyright gate commits" family (gate task 3342, still
+    blocked -- its ~14-entry cluster awaits a consolidation ruling).
+
+    Unlike every earlier seed, this cluster's corpus spans BOTH
+    ``procedural_knowledge`` (11 entries) and ``preferences_and_norms`` (3
+    entries: 210be257, e8c5eb3f, c565afd0) -- which is why it kept growing
+    uncaught. Phrases are literal substrings drawn verbatim from those
+    entries' stored content (the module convention), so the seed stays
+    auditable against the corpus it was derived from.
+    """
+
+    TOPIC_ID = 'ruff-format-not-an-enforced-gate'
+
+    @classmethod
+    def _cluster(cls):
+        return _seeded_cluster(cls.TOPIC_ID)
+
+    def test_cluster_present_with_expected_phrases_and_hint(self):
+        cluster = self._cluster()
+        assert cluster.phrases == [
+            'ruff format',
+            'ruff check',
+            'enforced gate',
+            'enforced lint gate',
+            'not format-clean',
+        ]
+        assert cluster.min_phrase_hits == 2
+        assert '3342' in cluster.hint
+
+    def test_matches_representative_near_duplicate_note(self):
+        note = (
+            'In dark-factory, `ruff format` is NOT an enforced gate -- only '
+            '`ruff check` and pyright gate commits, so pre-existing format '
+            'drift on main is normal.'
+        )
+        result = find_matching_topic_cluster(note, [self._cluster()])
+        assert result is not None
+        assert result[0].topic_id == 'ruff-format-not-an-enforced-gate'
+
+    @pytest.mark.parametrize(
+        'excerpt',
+        [
+            pytest.param(
+                'In fused-memory, `ruff format` is configured in pyproject.toml '
+                'but is NOT a clean/enforced gate across the existing codebase',
+                id='210be257-fused-memory-2026-07-09',
+            ),
+            pytest.param(
+                'In dark-factory, `ruff format` is NOT a quality gate — the '
+                'declared gates in each orchestrator.yaml are `ruff check` '
+                '(lint_command), `npx pyright` (type_check_command) and pytest '
+                '(test_command).',
+                id='c565afd0-general-dark-factory-2026-08-01',
+            ),
+        ],
+    )
+    def test_matches_the_preferences_and_norms_entries_that_grew_the_cluster(self, excerpt):
+        """The preferences_and_norms half of gate 3342's corpus matches.
+
+        This is task 3435's core claim made executable: these are the writes
+        that grew the cluster UNCAUGHT, because the write-time guard only
+        consults this cluster list for explicit ``category='procedural_knowledge'``
+        writes. Each excerpt is a contiguous verbatim span of the stored
+        content, so the literal-substring convention stays auditable.
+
+        Reviewer (test-proportionality): parametrized by distinct HIT-PROFILE
+        rather than one case per corpus entry. 210be257 is
+        {'ruff format', 'enforced gate'} -- the ONLY entry in all 14 where
+        'enforced gate' is load-bearing (drop that phrase and this entry stops
+        matching), and the only one that matches WITHOUT the anchor pair.
+        c565afd0 is the bare {'ruff format', 'ruff check'} anchor pair, sitting
+        exactly AT min_phrase_hits. e8c5eb3f is dropped as an exact
+        profile-duplicate of c565afd0; it was verified matching out-of-band at
+        derivation time, as the schema.py comment records.
+
+        NOTE: soft-blocking a ``preferences_and_norms`` write additionally
+        requires companion task 3430's category generalization at the CALL
+        SITE (``server/tools.py``). What is pinned here is the CLUSTER's
+        matching power, which is this task's scope and is entirely
+        category-independent -- ``find_matching_topic_cluster`` takes content
+        and clusters, never a category.
+        """
+        result = find_matching_topic_cluster(excerpt, [self._cluster()])
+        assert result is not None, f'preferences_and_norms excerpt must match: {excerpt!r}'
+        assert result[0].topic_id == 'ruff-format-not-an-enforced-gate'
+
+    @pytest.mark.parametrize(
+        'excerpt',
+        [
+            pytest.param(
+                'In dark-factory, `ruff format` is NOT an enforced gate — many '
+                'committed files are not format-clean (e.g. '
+                'tests/scripts/test_dashboard_service_template.py on main had '
+                'implicit-concat and comprehension hunks ruff would rewrite). '
+                'Only `ruff check` and pyright gate commits.',
+                id='4ab1c78f-general-dark-factory-2026-07-31',
+            ),
+            pytest.param(
+                'In dark-factory the enforced lint gate is `ruff check` only — '
+                '`ruff format` is NOT gated.',
+                id='d72c66dc-shared-orchestrator-yaml-2026-07-31',
+            ),
+            pytest.param(
+                'hooks/project-checks (the main-branch-only pre-commit gate) '
+                'invokes `ruff check` but never `ruff format --check`',
+                id='87a4982d-hooks-project-checks-2026-07-16',
+            ),
+        ],
+    )
+    def test_matches_the_procedural_knowledge_entries_in_the_gate_cluster(self, excerpt):
+        """Representative procedural_knowledge entries from gate 3342's corpus.
+
+        These are the 11-entry majority the guard ALREADY covers today, so
+        seeding this cluster bites immediately rather than waiting on task
+        3430. Excerpts are contiguous verbatim spans of the stored content.
+
+        Reviewer (test-proportionality): one case per distinct HIT-PROFILE,
+        not one per corpus entry. 4ab1c78f is the 4-hit maximum and the sole
+        exerciser of 'not format-clean'; d72c66dc carries 'enforced lint gate';
+        87a4982d sits exactly AT the threshold on the 'ruff format' +
+        'ruff check' anchor pair alone, which is what makes 'ruff check'
+        load-bearing for the half of the corpus that says nothing about
+        "gates". Dropped as profile-duplicates: f1e41082 (a strict subset of
+        4ab1c78f's phrases), a598dc3c (== d72c66dc) and 69bd6ae5
+        (== 87a4982d). All 14 entries were verified matching out-of-band at
+        derivation time, as the schema.py comment records; re-deriving them
+        here bought no additional signal.
+        """
+        result = find_matching_topic_cluster(excerpt, [self._cluster()])
+        assert result is not None, f'procedural_knowledge excerpt must match: {excerpt!r}'
+        assert result[0].topic_id == 'ruff-format-not-an-enforced-gate'
+
+    @pytest.mark.parametrize(
+        'note',
+        [
+            pytest.param(
+                'ruff check flagged B008 mutable default argument in the new '
+                'module; fix it before committing.',
+                id='lint-only-note-1-hit',
+            ),
+            pytest.param(
+                'The pre-commit hook runs pyright only for packages with staged '
+                '.py changes.',
+                id='pyright-hook-note-0-hits',
+            ),
+            pytest.param(
+                'I ran ruff format on the file I created so my added lines are '
+                'clean.',
+                id='format-only-note-1-hit',
+            ),
+            pytest.param(
+                'This file is ruff format-clean after my edit.',
+                id='ruff-format-clean-one-construction-1-hit',
+            ),
+        ],
+    )
+    def test_does_not_match_unrelated_lint_or_format_notes(self, note):
+        # Each note reaches at most 1 distinct hit -- below min_phrase_hits --
+        # so an ordinary lint, hook or format observation must NOT be
+        # soft-blocked and mis-routed to gate 3342.
+        assert find_matching_topic_cluster(note, [self._cluster()]) is None
+
+    @pytest.mark.parametrize(
+        'note',
+        [
+            pytest.param(
+                'I ran ruff check and ruff format before committing.',
+                id='both-tools-named-in-passing',
+            ),
+            pytest.param(
+                'Before committing run `ruff check` on touched packages and '
+                '`ruff format` on files you created.',
+                id='ordinary-two-tool-workflow-note',
+            ),
+        ],
+    )
+    def test_known_residual_generic_two_tool_note_matches(self, note):
+        """The ACCEPTED false-positive class, pinned so it stays visible.
+
+        This is NOT a defect and NOT a regression: it is the residual the
+        seed's schema.py comment knowingly accepts. The 'ruff format' +
+        'ruff check' anchor pair reaches min_phrase_hits=2 on its own, so an
+        ordinary note that merely NAMES both tools -- saying nothing about
+        gates -- is soft-blocked and routed to gate 3342.
+
+        It is accepted rather than tuned away because both alternatives are
+        worse. Dropping 'ruff check' would stop the cluster matching the
+        entries that sit on the bare anchor pair (87a4982d, c565afd0, and
+        e8c5eb3f / 69bd6ae5 beside them). Raising min_phrase_hits to 3 is
+        unavailable: no third phrase co-occurs across the corpus, so a 3-hit
+        cluster would MISS most of the 14 real entries and become exactly the
+        silent no-op guard this module treats as strictly worse than a loud
+        one. The block itself is SOFT -- overridable with
+        ``metadata={'allow_near_duplicate': True}`` -- so the cost is one
+        redirect, not a lost write.
+
+        Pinning it here makes the false-positive BOUNDARY executable: a future
+        tuner narrowing the phrase list can tell 'intended residual' from
+        'regression', because removing this behaviour must be a visible,
+        deliberate change to this test rather than a silent widening of the
+        three at-most-1-hit negatives above.
+        """
+        result = find_matching_topic_cluster(note, [self._cluster()])
+        assert result is not None, (
+            f'residual documented in schema.py no longer holds for {note!r} -- if this '
+            f'was deliberate, update the ACCEPTED RESIDUAL comment on the seed too'
+        )
+        assert result[0].topic_id == self.TOPIC_ID
+
+    def test_full_default_cluster_list_resolves_here_not_an_earlier_cluster(self):
+        # This cluster is seeded LAST, and find_matching_topic_cluster returns
+        # the FIRST qualifying cluster, so it can only catch what the five
+        # earlier clusters miss -- it can never shadow them. The converse was
+        # measured, not assumed: all 14 entries of gate 3342's
+        # mem0_entries_to_adjudicate corpus score 0 distinct hits against every
+        # one of the five earlier clusters, so a ruff note falls through
+        # cleanly to here rather than being swallowed upstream.
+        clusters = ReconciliationConfig().procedural_knowledge_topic_guard_clusters
+        note = (
+            'In dark-factory, `ruff format` is NOT an enforced gate -- only '
+            '`ruff check` and pyright gate commits, so pre-existing format '
+            'drift on main is normal.'
+        )
+        result = find_matching_topic_cluster(note, clusters)
+        assert result is not None
+        assert result[0].topic_id == 'ruff-format-not-an-enforced-gate'
+
+
+class TestNpxPyrightEaccesAgentSandboxCluster:
+    """Topic-guard cluster for the "`npx pyright` fails with npm EACCES on
+    /home/leo/.npm/_cacache" family (gate task 3417, still blocked behind
+    3524 -- its 21-entry cluster awaits a consolidation ruling).
+
+    Unlike the earlier seeds, this cluster is internally CONTRADICTORY rather
+    than merely redundant: some members assert root-owned npm-cache files and
+    prescribe a `sudo chown` that is a MEASURED no-op, while others carry the
+    corrected agent-sandbox diagnosis. The phrase set is therefore keyed on
+    the invariant SYMPTOM, not on the adjudicated correct cause, so it catches
+    both readings -- see the derivation comment on the seed in schema.py.
+    """
+
+    TOPIC_ID = 'npx-pyright-eacces-agent-sandbox'
+
+    @classmethod
+    def _cluster(cls):
+        return _seeded_cluster(cls.TOPIC_ID)
+
+    def test_cluster_present_and_routes_to_gate_3417(self):
+        """The registration + hint contract.
+
+        The hint has to carry four things a routed writer needs, because the
+        block is SOFT and the hint is genuinely the only thing they read --
+        ``build_topic_cluster_block`` puts the cluster's ``hint`` in the
+        response and adds no generic remediation text of its own: the gate
+        task to add context to (3417), an explicit warning about the `sudo
+        chown` remedy several members prescribe -- so a writer cannot
+        re-derive the harmful fix from the same symptom -- the task that
+        owns the real fix (3162), and the cross-project escape hatch.
+
+        That last one is pinned because of accepted residual (3): this guard
+        is not project-scoped, so it also blocks other projects' npm-EACCES
+        notes (see ``test_known_residual_cross_project_npm_eacces_note_
+        matches``). For those writers the hint's main instruction --
+        consolidate into the pyright entries -- is actively wrong, so the
+        hint must name the override that lets them through.
+        ``allow_near_duplicate`` is asserted rather than any surrounding
+        prose for the same reason 'sudo chown' is: it is the literal the
+        writer must act on, so it is the stable, behavioural half of the
+        wording.
+
+        Reviewer (test-quality, task 3862): the chown assertion names the
+        REMEDY LITERAL rather than a word from the surrounding prose. An
+        earlier version asserted ``'no-op' in hint.lower()``, which pinned
+        wording, not contract: it broke on any equivalent rephrasing ('a
+        confirmed non-fix', 'does nothing') despite identical behaviour, and
+        it did not even establish what it claimed -- a hint saying 'the
+        sandbox flag is a no-op' would have satisfied it while never
+        mentioning chown. 'sudo chown' is the string the writer must not
+        carry away, so it is both the stabler and the more specific pin.
+
+        The phrase list is deliberately NOT asserted here; it is owned by
+        ``test_cluster_present_with_expected_phrases`` below, so the list is
+        pinned in exactly one place.
+        """
+        cluster = self._cluster()
+        assert cluster.min_phrase_hits == 2
+        assert cluster.sufficient_phrases == []
+        assert '3417' in cluster.hint
+        assert 'sudo chown' in cluster.hint
+        assert '3162' in cluster.hint
+        assert 'allow_near_duplicate' in cluster.hint
+
+    def test_cluster_present_with_expected_phrases(self):
+        cluster = self._cluster()
+        assert cluster.phrases == [
+            'npx pyright',
+            'EACCES',
+            '_cacache',
+            '/home/leo/.npm',
+            '.venv/bin/pyright',
+            'npm_config_cache',
+            'sudo chown -R 1000:1000',
+        ]
+
+    @pytest.mark.parametrize(
+        'excerpt',
+        [
+            pytest.param(
+                'GOTCHA — running the scripts/ type gate (`npx pyright scripts/`, '
+                "scripts/orchestrator.yaml's type_check_command) inside a task "
+                'worktree fails with "npm error Your cache folder contains '
+                'root-owned files, due to a bug in previous versions of npm", and '
+                'npx exits before pyright ever runs. It is NOT a pyright or config '
+                'problem. Fix without touching ~/.npm ownership: `export '
+                'npm_config_cache=/tmp/npm-cache-<taskid>` in the same shell, then '
+                '`npx pyright scripts/`.',
+                id='dfdad23e-at-threshold-2-hits',
+            ),
+            pytest.param(
+                "`npx pyright scripts/` — the repo's real quality gate "
+                '(scripts/orchestrator.yaml:278) — can abort before pyright ever '
+                'runs with `npm error Your cache folder contains root-owned files`, '
+                'because /home/leo/.npm holds root-owned entries. Work around it '
+                'per-invocation with `env npm_config_cache=/tmp/npm-cache-<task> npx '
+                '--yes pyright scripts/`; the permanent fix needs root (`sudo chown '
+                '-R 1000:1000 /home/leo/.npm`).',
+                id='a0c39676-harmful-chown-regression-4-hits',
+            ),
+            pytest.param(
+                'CORRECTION to the several existing entries about `npx pyright` '
+                'failing with npm EACCES on /home/leo/.npm/_cacache: the cause is '
+                'the AGENT SANDBOX, not root-owned cache files, and npm\'s "cache '
+                'folder contains root-owned files ... sudo chown -R 1000:1000 '
+                '/home/leo/.npm" text is npm\'s generic EACCES advice, NOT a '
+                'diagnosis.',
+                id='6a02360d-correct-diagnosis-correction-5-hits',
+            ),
+            pytest.param(
+                'In dark-factory worktrees, `npx pyright` fails with an EACCES npm '
+                'cache error (root-owned files in ~/.npm/_cacache). The supported '
+                'invocation is `uv run pyright` run FROM each package directory '
+                '(e.g. `cd orchestrator && uv run pyright`), which is exactly what '
+                'the pre-commit hook `hooks/project-checks` does.',
+                id='3df6017f-tilde-npm-path-3-hits',
+            ),
+            pytest.param(
+                'Also: `npx pyright` can fail with an npm cache permission error on '
+                '/home/leo/.npm — work around it with '
+                '`npm_config_cache=/tmp/npm-cache-<task> npx pyright`, and filter '
+                'out `^npm notice` lines before piping to `tail` or they swallow '
+                "pyright's own summary line.",
+                id='c9afcce3-secondary-mention-no-eacces-3-hits',
+            ),
+            pytest.param(
+                'Also: `npx pyright` can fail with EACCES on a root-owned ~/.npm '
+                'cache in a sandboxed agent shell; `.venv/bin/pyright` is the same '
+                'version and works.',
+                id='1db61279-venv-binary-no-path-phrase-3-hits',
+            ),
+        ],
+    )
+    def test_matches_the_entries_in_gate_3417s_cluster(self, excerpt):
+        """Representative members of gate 3417's freshly re-scoped corpus.
+
+        Each excerpt is a CONTIGUOUS VERBATIM span of a member's stored
+        content, so the literal-substring convention stays auditable against
+        the corpus the seed was derived from.
+
+        Reviewer (test-proportionality, the task-3435 precedent): one case per
+        distinct HIT-PROFILE, not one per corpus entry -- the 21 members
+        collapse to 14 profiles, all of which were verified matching
+        out-of-band at derivation time, as the schema.py comment records.
+
+        Why these six specifically, all measured:
+        - dfdad23e sits exactly AT min_phrase_hits on
+          {'npx pyright', 'npm_config_cache'} and nothing else. It is the
+          profile that makes BOTH those phrases load-bearing: dropping either
+          one sinks this entry below threshold, and dropping any of the other
+          five sinks nobody. a883f914 is its exact profile-duplicate.
+        - a0c39676 is the harmful chown-REGRESSION entry -- it prescribes the
+          no-op remedy as "the permanent fix". It is the sole member of its
+          profile, and the only chown-prescribing entry that names NEITHER
+          'EACCES' nor '_cacache', so it matches purely on the symptom+remedy
+          vocabulary. This is the case that proves a diagnosis-keyed phrase
+          set would have missed exactly the writes worth catching.
+        - 6a02360d is the correct-diagnosis CORRECTION entry. Together with
+          a0c39676 above it demonstrates the design claim: ONE symptom-keyed
+          phrase set catches both sides of a corpus that contradicts itself.
+          The full entry is the 7-hit maximum (shared with f9c9ea2a); this
+          contiguous opening span scores 5, which is the auditable part.
+        - 3df6017f writes the cache path as `~/.npm/_cacache`, so
+          '/home/leo/.npm' does NOT fire -- it is caught by '_cacache'. Pins
+          that the seed handles both spellings of the same path.
+        - c9afcce3 is a SECONDARY member: the EACCES material is an aside in a
+          note about per-subproject pyright scope, and neither 'EACCES' nor
+          '_cacache' appears literally.
+        - 1db61279 is the sole profile reaching threshold via
+          '.venv/bin/pyright' + 'EACCES' with no path or cache phrase at all.
+        """
+        result = find_matching_topic_cluster(excerpt, [self._cluster()])
+        assert result is not None, f'gate 3417 corpus excerpt must match: {excerpt!r}'
+        assert result[0].topic_id == self.TOPIC_ID
+
+    def test_routes_here_rather_than_to_an_earlier_cluster(self):
+        # Seeded LAST, and find_matching_topic_cluster returns the FIRST
+        # qualifying cluster in a single pass over list order, so this cluster
+        # can only catch what the six earlier ones miss and can never shadow
+        # them. The converse -- that an npx/pyright note is not swallowed
+        # upstream -- is what this pins: the eval-worktree-venv-shadowing
+        # cluster is the plausible upstream catcher (it once carried a bare
+        # 'pyright' phrase, narrowed away precisely for over-matching), so
+        # assert the resolved topic_id, not merely that something matched.
+        clusters = ReconciliationConfig().procedural_knowledge_topic_guard_clusters
+        note = (
+            'In a dark-factory task worktree, `npx pyright <dir>` can fail with '
+            '`npm error code EACCES` against /home/leo/.npm/_cacache. Workaround '
+            'needing no sudo: prefix with a writable cache dir, e.g. '
+            '`npm_config_cache=/tmp/npm-cache-<task> npx pyright <dir>`.'
+        )
+        result = find_matching_topic_cluster(note, clusters)
+        assert result is not None
+        assert result[0].topic_id == self.TOPIC_ID
+
+    @pytest.mark.parametrize(
+        'note',
+        [
+            pytest.param(
+                'To parse-check offline, use the esbuild binary already in the npx '
+                'cache, feeding the file on stdin (the --loader flag only applies '
+                'to stdin input): ESB=$(ls -d '
+                '~/.npm/_npx/*/node_modules/esbuild/bin/esbuild | head -1)',
+                id='f0225474-esbuild-npx-cache-0-hits',
+            ),
+            pytest.param(
+                'Run type checks per package rather than repo-wide: `cd '
+                'fused-memory && uv run pyright`, then the same in orchestrator/ '
+                'and dashboard/. Each package carries its own [tool.pyright] '
+                'block. Plan steps that say `npx pyright` should be executed this '
+                'way instead.',
+                id='per-package-pyright-convention-1-hit',
+            ),
+            pytest.param(
+                'In the docker CI image the build step fails because the mounted '
+                'cache folder contains root-owned files written by an earlier '
+                'container run as root, so the unprivileged build user hits '
+                'EACCES. Fix it in the compose file by chowning the mount to the '
+                'build uid on entry.',
+                id='generic-docker-ci-root-owned-cache-1-hit',
+            ),
+            pytest.param(
+                'orchestrator.agents.write_set.compute_write_set is the single '
+                "source (PRD D11 / INV-5) for an agent's writable paths; its "
+                'contract grants the worktree, /tmp and ~/.cache/uv. Adding a path '
+                'widens the FINAL-WRITABLE-LIST and changes write_set.digest() for '
+                'every invocation.',
+                id='compute-write-set-uv-cache-0-hits',
+            ),
+        ],
+    )
+    def test_does_not_match_unrelated_npm_cache_or_pyright_notes(self, note):
+        """Each note reaches at most 1 distinct hit, so it must NOT be blocked.
+
+        The docker/CI note is the load-bearing one: it is WHY bare
+        'root-owned' and the verbatim npm string 'cache folder contains
+        root-owned files' were both rejected as phrases. Measured -- adding
+        either raises this note to 2 hits, soft-blocking a generic
+        toolchain-cache EACCES observation and mis-routing it to gate 3417.
+        Pinning it here means a future tuner who re-adds those phrases gets a
+        red test rather than a silent widening.
+
+        SCOPE CORRECTION (reviewer, task 3862): this docstring used to claim
+        the docker/CI note "stands in for" the pump-web-ui / know-live entries
+        that memory f9c9ea2a rules a different failure class. It does not, and
+        the claim is retracted. The docker note is OFF-HOST -- it names
+        neither '/home/leo/.npm' nor '_cacache' -- which is exactly why it
+        stays clean here. The real same-class entries run on THIS host and DO
+        name those anchors, so they are blocked today. That exposure is a
+        known accepted residual with its own pinned test, not a negative
+        control: see ``test_known_residual_cross_project_npm_eacces_note_
+        matches`` below and residual (3) on the seed in schema.py.
+        """
+        assert find_matching_topic_cluster(note, [self._cluster()]) is None
+
+    def test_known_residual_excluded_offline_hang_entry_matches(self):
+        """Entry 37743789 matches even though gate 3417 EXCLUDES it. Accepted.
+
+        This is NOT a defect and NOT a regression. 3417 singles 37743789 out
+        as a DISTINCT root cause -- a sandboxed network-fetch hang, fixed with
+        `npx --offline`, not the write-set omission -- so it is deliberately
+        outside the consolidation. It matches anyway (4 hits, measured)
+        because its FIRST symptom is literally the same npm EACCES symptom
+        this cluster is keyed on, and the matcher has no negative-phrase arm
+        to say "except when the note is really about a hang".
+
+        Accepted rather than tuned away because every alternative is worse.
+        No phrase can separate them: the discriminating vocabulary ('--offline',
+        'network fetch') appears only in the EXCLUDED entry, so keying on it
+        would invert the guard. And the cost is small -- the block is SOFT,
+        overridable with metadata={'allow_near_duplicate': True}, and it routes
+        the writer to 3417, whose description documents this very exclusion.
+        So a writer lands on the right reading rather than a lost write.
+
+        Pinned so the boundary is executable: a future tuner narrowing the
+        phrase list can tell 'intended residual' from 'regression'.
+        """
+        excerpt = (
+            'Debugger gotcha (distinct from venv-provisioning races): running the '
+            'orchestrator TYPE gate `npx pyright` MANUALLY through the Claude Code '
+            'Bash sandbox fails/hangs where the merge-verify harness (unsandboxed) '
+            'passes. First symptom is an npm-cache write-permission error ("npm '
+            'error ... please run: sudo chown -R 1000:1000 /home/leo/.npm") because '
+            'the sandbox blocks writes to ~/.npm outside the worktree; retrying '
+            'with a worktree-local cache still HANGS (>7min timeout) because npx '
+            'attempts a network fetch of the pinned pyright build. Workaround that '
+            'resolves cleanly to "0 errors": warm the cache once (`env '
+            'npm_config_cache=<worktree>/.task/npm-cache npx --offline pyright '
+            '--version`).'
+        )
+        result = find_matching_topic_cluster(excerpt, [self._cluster()])
+        assert result is not None, (
+            'residual documented in schema.py no longer holds for the 37743789 '
+            'offline-hang entry -- if this was deliberate, update the ACCEPTED '
+            'RESIDUAL comment on the seed too'
+        )
+        assert result[0].topic_id == self.TOPIC_ID
+
+    @pytest.mark.parametrize(
+        'note',
+        [
+            pytest.param(
+                'In pump-web-ui, `npm ci` under the sandboxed implementer aborts '
+                'with npm error code EACCES on /home/leo/.npm/_cacache/tmp. The '
+                'fix is the per-project root .npmrc '
+                'cache=/tmp/npm-cache-pump-web-ui redirect.',
+                id='pump-web-ui-npm-ci-3-hits',
+            ),
+            pytest.param(
+                'know-live: the sandboxed agent hits EACCES writing '
+                '/home/leo/.npm during the toolchain install; export '
+                'npm_config_cache=/tmp/npm-cache-know-live before any npm '
+                'invocation.',
+                id='know-live-toolchain-redirect-3-hits',
+            ),
+            pytest.param(
+                '`npx tsc` in autopilot-video fails with EACCES on _cacache '
+                'under the sandbox.',
+                id='autopilot-video-npx-tsc-no-pyright-2-hits',
+            ),
+        ],
+    )
+    def test_known_residual_cross_project_npm_eacces_note_matches(self, note):
+        """Other projects' npm-EACCES notes match too. Accepted, not a control.
+
+        This is the WIDEST of the three accepted residuals and the one to read
+        before re-tuning the phrase list. The topic guard runs in add_memory
+        BEFORE the cosine guard and, unlike it, is NOT project-scoped --
+        ``find_matching_topic_cluster(content, clusters)`` takes no project_id
+        while the cosine call below it passes one. So this seed fires for every
+        project the server serves, and '/home/leo/.npm', '_cacache' and
+        'EACCES' are HOST-wide npm vocabulary: every sandbox-enabled project
+        shares /home/leo. The third case carries no pyright involvement at all
+        and still reaches 2 hits.
+
+        Accepted because no narrowing expressible in this schema fixes it --
+        all four candidates were measured over the corpus AND these notes:
+        min_phrase_hits=3 sinks 4 members and still blocks two of these;
+        dropping 'EACCES'+'_cacache' sinks member 3df6017f and still blocks the
+        know-live note; dropping '_cacache' alone closes only the `npx tsc`
+        shape; and dropping 'EACCES'+'/home/leo/.npm' closes all three at zero
+        cost on today's corpus but drops plausible future PARAPHRASES from 3
+        hits to 1 -- gutting the very thing the guard exists to catch -- while
+        still not closing the class (harder shapes reach 2 via
+        '_cacache'+'npm_config_cache'). The real fix is structural and lives
+        outside this file: project-scope the topic guard, or give
+        ProceduralTopicCluster a required-anchor arm.
+
+        Pinned as MATCHING, deliberately, rather than aspirationally asserted
+        clean: the behaviour is live today, and a test asserting the fix we did
+        not make would be a lie that goes red for the wrong reason. If a future
+        change narrows this away, that is a genuine improvement -- update
+        residual (3) on the seed and move these cases into the negative-control
+        test above. The cost is bounded meanwhile: the block is SOFT, and the
+        hint now tells a non-dark-factory writer this is a known false
+        positive, to re-submit with allow_near_duplicate, and that their case
+        belongs to task 3162 rather than gate 3417.
+        """
+        result = find_matching_topic_cluster(note, [self._cluster()])
+        assert result is not None, (
+            'residual (3) documented in schema.py no longer holds for this '
+            'cross-project npm-EACCES note -- if this was deliberate, update '
+            'the ACCEPTED RESIDUAL comment on the seed and move this case to '
+            'test_does_not_match_unrelated_npm_cache_or_pyright_notes'
+        )
+        assert result[0].topic_id == self.TOPIC_ID
+
+    def test_known_residual_pyright_version_pin_note_matches(self):
+        """A pyright version-pin note matches (2 hits). Judged ON-TOPIC.
+
+        Unlike the 37743789 residual above, this one is not a reluctant
+        acceptance -- it is the desired routing. Gate 3417's steward addendum
+        explicitly wants the version-inequivalence detail folded into the
+        canonical entry, because it CORRECTS member 1db61279's claim that
+        `.venv/bin/pyright` "is the same version" as `npx pyright`. It is not.
+        The pre-commit hook pins pyright-python at 1.1.408 while the verify
+        lane's unpinned `npx pyright` resolved 1.1.411 (member 604ed99f).
+
+        So a writer recording that correction SHOULD be routed to 3417 rather
+        than opening a 22nd standalone entry -- which is exactly what the soft
+        block does. Pinned so it is not mistaken for a false positive and
+        tuned away.
+        """
+        note = (
+            'Version note: /home/leo/src/dark-factory/.venv/bin/pyright is pinned '
+            'at 1.1.408 (pyright-python) while `npx pyright` resolves the unpinned '
+            'latest, 1.1.411 as of 2026-08-06. They are NOT the same version, so a '
+            'claim that the venv binary is "the same version" is wrong.'
+        )
+        result = find_matching_topic_cluster(note, [self._cluster()])
+        assert result is not None, (
+            'residual documented in schema.py no longer holds for the pyright '
+            'version-pin note -- if this was deliberate, update the ACCEPTED '
+            'RESIDUAL comment on the seed too'
+        )
+        assert result[0].topic_id == self.TOPIC_ID
 
 
 class TestWriteTriageConfig:
@@ -1444,7 +3743,7 @@ class TestWriteTriageConfig:
         # code. The invariant that actually matters is that the schema ships
         # no a-priori number, so any value the server reads had to come from
         # a calibration run.
-        from fused_memory.config.schema import WriteTriageConfig  # noqa: PLC0415
+        from fused_memory.config.schema import WriteTriageConfig
 
         value = getattr(WriteTriageConfig(), field)
         assert value is None, (
@@ -1468,14 +3767,14 @@ class TestWriteTriageConfig:
     @pytest.mark.parametrize('field', ['t_high', 't_low'])
     @pytest.mark.parametrize('value', [0.0, 0.5, 1.0])
     def test_thresholds_accept_the_cosine_unit_range(self, field, value):
-        from fused_memory.config.schema import WriteTriageConfig  # noqa: PLC0415
+        from fused_memory.config.schema import WriteTriageConfig
 
         assert getattr(WriteTriageConfig(**{field: value}), field) == value
 
     @pytest.mark.parametrize('field', ['t_high', 't_low'])
     @pytest.mark.parametrize('value', [-0.1, 1.1, 42.0])
     def test_thresholds_reject_out_of_range_values(self, field, value):
-        from fused_memory.config.schema import WriteTriageConfig  # noqa: PLC0415
+        from fused_memory.config.schema import WriteTriageConfig
 
         with pytest.raises(ValidationError):
             WriteTriageConfig(**{field: value})
@@ -1489,9 +3788,817 @@ class TestWriteTriageConfig:
         calibration script's config write need a server restart instead of
         a hot reload.
         """
-        from fused_memory.config.schema import WriteTriageConfig  # noqa: PLC0415
+        from fused_memory.config.schema import WriteTriageConfig
 
         annotation = FusedMemoryConfig.model_fields['write_triage'].annotation
         assert isinstance(annotation, type) and issubclass(annotation, WriteTriageConfig), (
             f'write_triage must be annotated as a bare submodel, got {annotation!r}'
         )
+
+    # -- per-category cutoffs (task 3357) -----------------------------------
+
+    def test_t_high_by_category_defaults_to_none(self):
+        """None means NO category is calibrated — the same fail-open posture.
+
+        Asserted on the schema class for the same reason as the pooled
+        fields above: FusedMemoryConfig() loads config.yaml, which by design
+        carries a calibration run's output.
+        """
+        from fused_memory.config.schema import WriteTriageConfig
+
+        assert WriteTriageConfig().t_high_by_category is None
+
+    def test_the_root_wiring_introduces_no_per_category_default(self):
+        factory = FusedMemoryConfig.model_fields['write_triage'].default_factory
+        assert factory is not None
+        assert factory().t_high_by_category is None  # type: ignore[call-arg]
+
+    def test_accepts_a_measured_mapping(self):
+        from fused_memory.config.schema import WriteTriageConfig
+
+        # Synthetic, full-precision: pins that a derived cutoff's precision
+        # survives the field without being mistakable for a measured value.
+        mapping = {'procedural_knowledge': 0.1234567890123456}
+        assert WriteTriageConfig(t_high_by_category=mapping).t_high_by_category == mapping
+
+    @pytest.mark.parametrize('value', [0.0, 1.0])
+    def test_accepts_a_per_category_cutoff_at_the_cosine_unit_bounds(self, value):
+        """Both bounds are INCLUSIVE, exactly as the pooled sibling's are.
+
+        A cosine of 1.0 is a legitimately measurable cutoff (identical
+        embeddings), and 0.0 is a measured number too. Tightening the check
+        to a strict inequality would reject a real calibration output while
+        passing every other test in this class.
+        """
+        from fused_memory.config.schema import WriteTriageConfig
+
+        assert WriteTriageConfig(
+            t_high_by_category={'procedural_knowledge': value},
+        ).t_high_by_category == {'procedural_knowledge': value}
+
+    def test_an_empty_mapping_is_accepted_and_means_no_category_calibrated(self):
+        """Distinct from None only in provenance, identical in effect.
+
+        A calibration run that derived nothing may still write an empty map;
+        rejecting it would force the writer to choose between two spellings
+        of the same measured outcome.
+        """
+        from fused_memory.config.schema import WriteTriageConfig
+
+        assert WriteTriageConfig(t_high_by_category={}).t_high_by_category == {}
+
+    @pytest.mark.parametrize('value', [-0.1, 1.1, 42.0])
+    def test_rejects_a_per_category_cutoff_outside_the_cosine_unit_range(self, value):
+        """A bad cutoff must fail at LOAD, not silently gate deletions.
+
+        This map is read by audit_duplicate_memories --apply. A cutoff of
+        42.0 would match nothing and a negative one would match everything;
+        either way the failure would surface as deleted (or undeleted)
+        memories rather than as a config error.
+        """
+        from fused_memory.config.schema import WriteTriageConfig
+
+        with pytest.raises(ValidationError):
+            WriteTriageConfig(t_high_by_category={'procedural_knowledge': value})
+
+    def test_the_rejection_names_the_offending_category(self):
+        """Which category is bad IS the actionable half of the error.
+
+        The map is written per category by the calibration script; an error
+        that only said "a cutoff is out of range" would leave an operator
+        diffing three numbers to find the one that failed.
+        """
+        from fused_memory.config.schema import WriteTriageConfig
+
+        with pytest.raises(ValidationError) as excinfo:
+            WriteTriageConfig(t_high_by_category={
+                'procedural_knowledge': 0.9, 'observations_and_summaries': 42.0,
+            })
+
+        message = str(excinfo.value)
+        assert 'observations_and_summaries' in message
+        assert '42.0' in message, 'the offending VALUE is evidence for the refusal'
+
+    @pytest.mark.parametrize('value', [True, False])
+    def test_a_bool_map_value_is_coerced_exactly_as_the_pooled_sibling_is(self, value):
+        """Measured, not assumed — and the consumer never sees a bool.
+
+        `audit_duplicate_memories._calibrated_float` deliberately refuses a
+        bool, so what matters here is that a YAML `true` cannot reach it AS a
+        bool: pydantic resolves it to a float at load, identically for the map
+        and for the pooled t_high beside it. Demanding stricter parsing for
+        one than the other would be an inconsistency invented here.
+        """
+        from fused_memory.config.schema import WriteTriageConfig
+
+        coerced = WriteTriageConfig(
+            t_high_by_category={'procedural_knowledge': value},
+        ).t_high_by_category
+        assert coerced is not None
+        assert coerced['procedural_knowledge'] == float(value)
+        assert not isinstance(coerced['procedural_knowledge'], bool)
+        assert coerced['procedural_knowledge'] == WriteTriageConfig(
+            t_high=value,  # pyright: ignore[reportArgumentType]
+        ).t_high
+
+    @pytest.mark.parametrize('value', [None, [0.9], 'abc', {'x': 1}])
+    def test_rejects_a_non_numeric_per_category_cutoff(self, value):
+        from fused_memory.config.schema import WriteTriageConfig
+
+        with pytest.raises(ValidationError):
+            WriteTriageConfig(t_high_by_category={'procedural_knowledge': value})
+
+    def test_a_numeric_string_is_coerced_exactly_as_the_pooled_sibling_coerces_it(self):
+        """Measured, not assumed: both fields take pydantic's lax float path.
+
+        The real input is a YAML numeric scalar written by the calibration
+        script, and demanding stricter parsing for the map than for the
+        pooled t_high beside it would be an inconsistency invented here
+        rather than one the config actually has.
+        """
+        from fused_memory.config.schema import WriteTriageConfig
+
+        # The numeric strings are deliberately off-type: the declared fields are
+        # float / dict[str, float], and what this asserts is precisely that
+        # pydantic coerces the YAML-scalar spelling the same way for both.
+        assert WriteTriageConfig(t_high='0.9').t_high == 0.9  # pyright: ignore[reportArgumentType]
+        assert WriteTriageConfig(
+            t_high_by_category={'procedural_knowledge': '0.9'},  # pyright: ignore[reportArgumentType]
+        ).t_high_by_category == {'procedural_knowledge': 0.9}
+
+    def test_one_bad_entry_rejects_the_whole_map(self):
+        """No partial acceptance: a half-applied set of cutoffs must not gate a sweep."""
+        from fused_memory.config.schema import WriteTriageConfig
+
+        with pytest.raises(ValidationError):
+            WriteTriageConfig(t_high_by_category={
+                'procedural_knowledge': 0.88, 'observations_and_summaries': 9.0,
+            })
+
+    # -- operator knobs (task 3127, PRD leaf beta) --------------------------
+    #
+    # DELIBERATELY NOT added to the `['t_high', 't_low',
+    # 'calibration_report_path']` parametrize lists above. Those pin "defaults
+    # to None", which encodes UNCALIBRATED — a meaningful state for a measured
+    # threshold and a meaningless one for a kill switch. `enabled` and
+    # `candidate_k` are hand-set OPERATOR knobs, not calibration outputs, so
+    # they ship with real defaults and get their own tests here.
+
+    def test_enabled_ships_off(self):
+        """The D10 staged-rollout flag ships FALSE, on every deployment.
+
+        `write_triage.enabled` is the PRD's `write_triage_enabled`: it swaps
+        the two reject guards for redirect-not-reject routing across every
+        add_memory write. Shipping it True would flip that behaviour on the
+        merge that lands the skeleton, ahead of the judge (leaf gamma) and
+        ahead of the 3169 flip gate.
+        """
+        from fused_memory.config.schema import WriteTriageConfig
+
+        value = WriteTriageConfig().enabled
+        assert value is False, (
+            f'write_triage.enabled must default to False (D10 staged rollout: '
+            f'the flag ships off and is flipped by task 3169); got {value!r}'
+        )
+
+    def test_candidate_k_default_is_materially_wider_than_the_retired_guards_five(self):
+        """k caps what any band threshold can achieve, so it is not inherited.
+
+        Measured same-category recall on the live corpus: 26.1% @5, 43.9% @10,
+        69.4% @20, 88.5% @50. Retrieval width is a RANK property — a candidate
+        that never enters the result set cannot be scored by any t_high or
+        t_low, so k is the ceiling on the whole band mechanism. The retired
+        near-dup guard's hardcoded `limit=5` (server/tools.py, at the guard
+        call site) is therefore the one number this leaf must NOT inherit by
+        analogy: at 5 the deterministic band would miss ~three quarters of the
+        duplicates it exists to catch, and the miss would be invisible.
+        """
+        from fused_memory.config.schema import WriteTriageConfig
+
+        value = WriteTriageConfig().candidate_k
+        assert isinstance(value, int) and not isinstance(value, bool), (
+            f'write_triage.candidate_k must be an int, got {value!r}'
+        )
+        assert value > 5, (
+            f'write_triage.candidate_k must be materially wider than the retired '
+            f'near-dup guard\'s hardcoded limit=5 (measured same-category recall: '
+            f'26.1% @5 vs 69.4% @20 — k caps what any band threshold can reach); '
+            f'got {value!r}'
+        )
+
+    @pytest.mark.parametrize('value', [0, -1])
+    def test_candidate_k_rejects_a_width_that_would_disable_retrieval(self, value):
+        """Bounded ge=1 so a typo cannot silently turn triage into a no-op.
+
+        A `candidate_k: 0` loads fine as an int and produces an empty
+        candidate list on every write, which the band router reads as "no
+        comparable candidate" and routes to `stored`. That is triage disabled
+        with no error, no log line, and nothing to grep — the exact silent
+        degradation INV-4 exists to prevent. Fail at LOAD instead.
+        """
+        from fused_memory.config.schema import WriteTriageConfig
+
+        with pytest.raises(ValidationError):
+            WriteTriageConfig(candidate_k=value)
+
+    def test_the_root_wiring_introduces_no_operator_knob_override(self):
+        """The submodel's own defaults are what every deployment gets.
+
+        Same half-of-the-invariant guard as
+        test_root_wiring_introduces_no_default above: a
+        ``default_factory=lambda: WriteTriageConfig(enabled=True)`` would
+        leave the class defaults clean while shipping the flag ON.
+        """
+        factory = FusedMemoryConfig.model_fields['write_triage'].default_factory
+        assert factory is not None
+        assert factory().enabled is False  # type: ignore[call-arg]
+        assert factory().candidate_k > 5  # type: ignore[call-arg]
+
+    def test_the_shipped_config_yaml_ships_the_flag_on_with_the_selected_judge(self, monkeypatch):
+        """The pin must hold on the REAL deployment file, not just the model.
+
+        config.yaml carries an explicit `write_triage:` block, so the shipped
+        values there are what the running server reads. Task 3169 flipped the
+        flag on (Leo, 2026-10-11) with the judge that gate Γ3 selected; the
+        judge keys are compared against the committed selection because a null
+        judge_model inherits llm.model, which the comparative scores worse than
+        leaving triage off.
+        """
+        config_dir = Path(__file__).resolve().parent.parent
+        yaml_path = config_dir / 'config' / 'config.yaml'
+        assert yaml_path.is_file(), f'expected config.yaml at {yaml_path}'
+        monkeypatch.setenv('CONFIG_PATH', str(yaml_path))
+        triage = FusedMemoryConfig().write_triage
+        selection = json.loads(
+            (config_dir / 'calibration' / 'write_triage_best_config.json').read_text()
+        )['selection']
+
+        assert triage.enabled is True
+        assert {
+            'judge_provider': triage.judge_provider,
+            'judge_model': triage.judge_model,
+            'judge_reasoning_effort': triage.judge_reasoning_effort,
+            'judge_candidate_count': triage.judge_candidate_count,
+            'field_chars': triage.judge_field_chars,
+        } == {key: selection[key] for key in (
+            'judge_provider', 'judge_model', 'judge_reasoning_effort',
+            'judge_candidate_count', 'field_chars',
+        )}
+        assert triage.candidate_k > 5, (
+            'fused-memory/config/config.yaml must ship a candidate_k wider than '
+            "the retired guard's limit=5 (measured recall 26.1% @5 vs 69.4% @20)"
+        )
+
+    def test_judge_field_chars_defaults_to_4000(self):
+        """The judge's per-field cap ships at 4,000 chars, not the old 1,200.
+
+        Why: task 6076's decision record,
+        calibration/write_triage_judge_field_chars_report.md.
+        """
+        from fused_memory.config.schema import WriteTriageConfig
+
+        assert WriteTriageConfig().judge_field_chars == 4000
+
+    @pytest.mark.parametrize('value', [0, -1])
+    def test_judge_field_chars_rejects_a_cap_that_would_empty_every_field(self, value):
+        """A non-positive cap is refused at load and reload, never at write time."""
+        from fused_memory.config.schema import WriteTriageConfig
+
+        with pytest.raises(ValidationError):
+            WriteTriageConfig(judge_field_chars=value)
+
+
+
+class TestMemoryMetadataConfig:
+    """`memory_metadata` — the Mem0 metadata write-boundary section (task 3195, leaf β).
+
+    A direct sibling of ``TaskMetadataConfig``: same top-level placement, same
+    warn-by-default posture, same RED-TIER/restart-only wording on the enforce
+    flag. PRD D3 names that precedent explicitly ("census first, tiers later"),
+    so this section follows it rather than inventing a second shape.
+    """
+
+    def _cls(self):
+        from fused_memory.config.schema import MemoryMetadataConfig
+
+        return MemoryMetadataConfig
+
+    def test_section_is_top_level_not_nested(self):
+        """Top-level, NOT under ``taskmaster``/``reconciliation``.
+
+        It governs a vocabulary shared beyond any one backend (the registry
+        lives in ``fused_memory.memory_metadata`` and leaf ι's prompt tests
+        import it), exactly the rationale ``TaskMetadataConfig`` records for
+        its own placement.
+        """
+        from fused_memory.config.schema import (
+            MemoryMetadataConfig,
+            ReconciliationConfig,
+            TaskmasterConfig,
+        )
+
+        assert 'memory_metadata' in FusedMemoryConfig.model_fields
+        annotation = FusedMemoryConfig.model_fields['memory_metadata'].annotation
+        assert isinstance(annotation, type) and issubclass(annotation, MemoryMetadataConfig)
+        assert 'memory_metadata' not in TaskmasterConfig.model_fields
+        assert 'memory_metadata' not in ReconciliationConfig.model_fields
+
+    def test_defaults_are_warn_mode(self):
+        """The ``enforce`` flag defaults OFF: a fatal shape violation censuses
+        and the write proceeds until the corpus is normalized (PRD §9 ε)."""
+        cfg = FusedMemoryConfig().memory_metadata
+        assert cfg.enforce is False
+        assert cfg.unknown_key_storm_threshold == 50
+        assert cfg.unknown_key_storm_window_seconds == 300
+
+    def test_extra_keys_are_forbidden(self):
+        """A mistyped leaf must fail LOUD at config load/reload.
+
+        With ``extra='ignore'`` an operator who typed ``enfroce``
+        would get a silently-ignored key and believe enforcement was on — the
+        no-silent-fail-soft invariant applied to the config surface.
+        """
+        assert self._cls().model_config.get('extra') == 'forbid'
+        with pytest.raises(ValidationError):
+            # Splatted rather than written as a literal keyword: the typo is
+            # the POINT of the test, and pyright rejects a misspelled keyword
+            # statically, which would fail the type gate before the runtime
+            # assertion could ever run.
+            self._cls()(**{'enfroce': True})
+
+    @pytest.mark.parametrize('bad', [0, -1, -50])
+    def test_storm_threshold_rejects_non_positive(self, bad):
+        with pytest.raises(ValidationError):
+            self._cls()(unknown_key_storm_threshold=bad)
+
+    @pytest.mark.parametrize('bad', [0, -1, -300])
+    def test_storm_window_rejects_non_positive(self, bad):
+        with pytest.raises(ValidationError):
+            self._cls()(unknown_key_storm_window_seconds=bad)
+
+    def test_round_trips_from_a_config_dict(self):
+        # `model_validate` rather than a splatted `__init__`: this is how a
+        # loaded config.yaml actually reaches the model, and a splat makes
+        # pyright widen every sibling field's type to the dict's value type,
+        # producing a type error per section of FusedMemoryConfig.
+        cfg = FusedMemoryConfig.model_validate({'memory_metadata': {'enforce': True}})
+        assert cfg.memory_metadata.enforce is True
+
+    def test_enforce_flag_is_restart_only(self):
+        """RED TIER, asserted behaviourally rather than as a doc blurb.
+
+        The operator-facing promise is not that some `description=` string
+        contains the letters "restart" — it is that `reload_config` REPORTS
+        this leaf as ``restart_required`` and does not silently no-op it.
+        That is a property of the reload allowlist and of `diff_config`, so
+        this pins both: the section has no hot-reloadable leaf, and a real
+        diff over a flipped flag buckets red, not green.
+
+        The step-11 ``description=`` strings are retained as operator
+        documentation; they are simply no longer test-pinned. Prose is
+        reviewed by humans and enforced by neither pyright nor pytest, and a
+        substring check over it fails open anyway (``'restarting is not
+        required'`` would have passed the check this replaces).
+        """
+        from fused_memory.config.reload import (
+            RELOADABLE_FIELDS,
+            diff_config,
+        )
+
+        # 1. No leaf of this section is hot-reloadable. An added-and-
+        #    unreviewed allowlist entry fails here, loudly.
+        assert not any(f.startswith('memory_metadata.') for f in RELOADABLE_FIELDS)
+
+        # 2. Observable bucketing through the real diff path, mirroring the
+        #    red-tier precedent `TestDiffConfig.
+        #    test_non_allowlisted_leaf_lands_in_restart_required`.
+        live = FusedMemoryConfig()
+        fresh = FusedMemoryConfig()
+        old = live.memory_metadata.enforce
+        # `object.__setattr__` is the established idiom in test_config_reload:
+        # it bypasses the validation/assignment wrapper so the diff sees a raw
+        # differing leaf.
+        object.__setattr__(fresh.memory_metadata, 'enforce', not old)
+
+        d = diff_config(live, fresh)
+
+        assert d.restart_required['memory_metadata.enforce'] == {'old': old, 'new': not old}
+        assert 'memory_metadata.enforce' not in d.applied_candidates
+
+
+# ── max_backlog_remediation_deferrals (task 3049) ────────────────────
+#
+# Bounds how long the inline remediation pass may be deferred while a project
+# is in backlog mode.  An UNBOUNDED gate would let a persistently-deep backlog
+# starve remediation indefinitely, turning a throughput fix into an integrity
+# regression; a consecutive-deferral cap makes the debt bounded and explicit.
+
+
+def test_max_backlog_remediation_deferrals_defaults_to_the_ceiling():
+    """Default is the largest streak the escalation semantics can absorb."""
+    from fused_memory.config.schema import MAX_BACKLOG_REMEDIATION_DEFERRALS_CEILING
+
+    assert ReconciliationConfig().max_backlog_remediation_deferrals == 1
+    assert (ReconciliationConfig().max_backlog_remediation_deferrals
+            == MAX_BACKLOG_REMEDIATION_DEFERRALS_CEILING)
+
+
+def test_max_backlog_remediation_deferrals_rejects_a_negative_value():
+    """A negative cap is meaningless — reject rather than silently coercing."""
+    with pytest.raises(ValidationError):
+        ReconciliationConfig(max_backlog_remediation_deferrals=-1)
+
+
+def test_max_backlog_remediation_deferrals_accepts_zero_as_the_off_switch():
+    """0 disables deferral entirely, restoring exact pre-task-3049 behaviour.
+
+    One int knob subsumes the on/off switch, so there is no second boolean
+    that can disagree with it.
+    """
+    assert ReconciliationConfig(max_backlog_remediation_deferrals=0
+                                ).max_backlog_remediation_deferrals == 0
+
+
+def test_max_backlog_remediation_deferrals_rejects_more_rope_than_the_ceiling():
+    """A longer streak would change escalation semantics, so the schema refuses it.
+
+    A deferred cycle writes ONE completed run instead of two, and
+    _finding_persistence_count counts completed runs that re-flag a finding —
+    including the remediating cycle's own remediation run, which completes
+    before the escalation gate reads the count (so the gate sees D + 2).
+    Past the ceiling a backlogged project accumulates enough re-flaggings to
+    reach _INTEGRITY_FINDING_RECURRENCE_THRESHOLD without a single remediation
+    attempt having run, so the first failed remediation escalates immediately
+    instead of the second.  Rejecting at config-load is louder than
+    letting the operator believe the extra rope was granted.
+    """
+    from fused_memory.config.schema import MAX_BACKLOG_REMEDIATION_DEFERRALS_CEILING
+
+    assert ReconciliationConfig(
+        max_backlog_remediation_deferrals=MAX_BACKLOG_REMEDIATION_DEFERRALS_CEILING
+    ).max_backlog_remediation_deferrals == MAX_BACKLOG_REMEDIATION_DEFERRALS_CEILING
+
+    with pytest.raises(ValidationError):
+        ReconciliationConfig(
+            max_backlog_remediation_deferrals=MAX_BACKLOG_REMEDIATION_DEFERRALS_CEILING + 1
+        )
+    with pytest.raises(ValidationError):
+        ReconciliationConfig(max_backlog_remediation_deferrals=20)
+
+
+def test_shipped_config_max_backlog_remediation_deferrals_is_within_the_ceiling(
+    monkeypatch,
+):
+    """The SHIPPED config.yaml value must itself satisfy the bound.
+
+    The schema would reject a larger value at load, so this pins that the file
+    an operator actually runs cannot be the thing that fails config load.
+    """
+    from fused_memory.config.schema import MAX_BACKLOG_REMEDIATION_DEFERRALS_CEILING
+
+    cfg = _shipped_reconciliation_config(monkeypatch)
+    assert 0 <= cfg.max_backlog_remediation_deferrals <= (
+        MAX_BACKLOG_REMEDIATION_DEFERRALS_CEILING)
+
+
+# ── the capacity claim as a checkable config invariant (task 3049) ────
+#
+# Lever 2 is a CLAIM about the shipped config: that the steady-state batch is
+# big enough to amortise the ~900s fixed per-cycle cost, and that the resulting
+# rate clears the observed burst inflow.  A claim that lives only in a decision
+# doc drifts silently the first time someone retunes a ratio.  These tests bind
+# the claim to the SHIPPED yaml, so the config and the arithmetic cannot part
+# ways without a red test naming exactly which one moved.
+
+
+def _shipped_reconciliation_config(monkeypatch):
+    """Load reconciliation config from the real deployment YAML."""
+    yaml_path = Path(__file__).resolve().parent.parent / 'config' / 'config.yaml'
+    assert yaml_path.is_file(), f'expected config.yaml at {yaml_path}'
+    monkeypatch.setenv('CONFIG_PATH', str(yaml_path))
+    return FusedMemoryConfig().reconciliation
+
+
+def test_shipped_config_steady_state_batch_amortises_the_fixed_cycle_cost(monkeypatch):
+    """buffer_size_threshold * conditional_trigger_ratio must clear the min batch.
+
+    T(B) = F + c*B with F ~ 900s is almost entirely FIXED cost, so a small
+    batch pays that 900s over very few events.  At the pre-3049 ratio of 0.2 the
+    quiescent trigger fires at 250 * 0.2 = 50 events — 20.5 s/event predicted,
+    matching the 18.9 s/event measured on 2026-07-25.  The claim is that the
+    shipped batch is at least STEADY_STATE_AMORTISATION_MIN_BATCH.
+    """
+    from fused_memory.reconciliation.throughput import (
+        STEADY_STATE_AMORTISATION_MIN_BATCH,
+    )
+
+    cfg = _shipped_reconciliation_config(monkeypatch)
+    batch = int(cfg.buffer_size_threshold * cfg.conditional_trigger_ratio)
+
+    assert batch >= STEADY_STATE_AMORTISATION_MIN_BATCH, (
+        f'shipped config triggers a steady-state batch of {batch} events '
+        f'(buffer_size_threshold={cfg.buffer_size_threshold} * '
+        f'conditional_trigger_ratio={cfg.conditional_trigger_ratio}), below the '
+        f'{STEADY_STATE_AMORTISATION_MIN_BATCH} needed to amortise the fitted '
+        f'~900s fixed per-cycle cost. Either raise the ratio or re-derive the '
+        f'constant from live data via '
+        f'`python -m fused_memory.reconciliation.throughput`.'
+    )
+
+
+def test_shipped_config_batch_clears_the_observed_burst_inflow(monkeypatch):
+    """The shipped batch's predicted rate must sustain more than the burst inflow.
+
+    This is ask (c): the threshold has to encode a real capacity claim.  With
+    lever 1 removing the remediation duty cycle, the shipped batch must yield a
+    sustainable events/day that clears the ~3.5k/day burst measured on reify.
+    """
+    from fused_memory.reconciliation.throughput import (
+        FITTED_CYCLE_FIXED_SECONDS,
+        FITTED_CYCLE_MARGINAL_SECONDS,
+        OBSERVED_BURST_EVENTS_PER_DAY,
+        capacity_verdict,
+        seconds_per_event,
+        sustainable_events_per_day,
+    )
+
+    cfg = _shipped_reconciliation_config(monkeypatch)
+    batch = int(cfg.buffer_size_threshold * cfg.conditional_trigger_ratio)
+
+    rate = seconds_per_event(
+        batch, FITTED_CYCLE_FIXED_SECONDS, FITTED_CYCLE_MARGINAL_SECONDS,
+    )
+    sustainable = sustainable_events_per_day(rate, 0.0, 1.0)
+    verdict = capacity_verdict(sustainable, OBSERVED_BURST_EVENTS_PER_DAY)
+
+    assert verdict['verdict'] == 'sufficient', (
+        f'shipped batch of {batch} events predicts {rate:.2f} s/event => '
+        f'{sustainable:.0f} events/day, which does not clear the observed '
+        f'{OBSERVED_BURST_EVENTS_PER_DAY}/day burst '
+        f'(headroom {verdict["headroom_ratio"]:.2f}x).'
+    )
+
+
+def test_shipped_config_max_staleness_still_bounds_latency(monkeypatch):
+    """Raising the trigger ratio must not remove the latency backstop.
+
+    The quiescent trigger is not the only way a cycle starts: max_staleness
+    fires independently of conditional_trigger_ratio (event_buffer.py:359), so
+    a bigger batch delays the quiescent trigger without letting an event sit
+    unbounded.  If that backstop were ever disabled, lever 2's latency argument
+    would be void.
+    """
+    cfg = _shipped_reconciliation_config(monkeypatch)
+
+    assert cfg.max_staleness_seconds > 0, (
+        'lever 2 raises the steady-state batch on the explicit premise that '
+        'max_staleness_seconds still bounds per-event latency independently'
+    )
+
+
+# ── coalesce_task_events (task 4278, recon lever 3) ──────────────────
+#
+# Push-time folding of repeat task events is on by default, switchable, and
+# restart-only: EventBuffer captures the flag by value at construction.
+
+
+def test_coalesce_task_events_defaults_on_and_can_be_switched_off():
+    assert ReconciliationConfig().coalesce_task_events is True
+    assert ReconciliationConfig(coalesce_task_events=False).coalesce_task_events is False
+
+
+def test_shipped_config_coalesces_task_events(monkeypatch):
+    assert _shipped_reconciliation_config(monkeypatch).coalesce_task_events is True
+
+
+def test_coalesce_task_events_is_restart_only():
+    from fused_memory.config.reload import RELOADABLE_FIELDS
+
+    assert 'reconciliation.coalesce_task_events' not in RELOADABLE_FIELDS
+
+
+def test_event_buffer_default_matches_the_config_default():
+    from fused_memory.reconciliation.event_buffer import EventBuffer
+
+    assert EventBuffer().coalesce_task_events is ReconciliationConfig().coalesce_task_events
+
+
+class TestWriteJournalConfig:
+    """Task 3212 item 4: `write_ops` retention is operator-tunable and its
+    read/search asymmetry is enforced, not merely documented.
+
+    Measured 2026-09-11 on a never-pruned journal: 35,428,715 rows / 16 GB, of
+    which 97.9% are task-read rows with no downstream consumer and 1.36% are
+    `search` rows that are leaf eta's (task 3213) SOLE data source. A future
+    edit that inverted the two horizons would silently starve that metric while
+    leaving the config looking reasonable, so the ordering is asserted here AND
+    rejected at load time.
+    """
+
+    def test_write_journal_section_is_a_bare_submodel_with_defaults(self):
+        from fused_memory.config.schema import WriteJournalConfig
+
+        section = FusedMemoryConfig().write_journal
+        assert isinstance(section, WriteJournalConfig), (
+            'RED: write_journal must be a BARE (non-Optional) submodel — reload.py '
+            'descends only into required submodels'
+        )
+        assert section.read_retention_days == 30.0
+        assert section.search_retention_days == 365.0
+        assert section.write_retention_days == 730.0
+        assert section.prune_batch_size == 500
+        assert section.prune_max_rows_per_run == 500_000
+        assert section.prune_max_seconds == 30.0
+        assert section.prune_interval_seconds == 1800.0
+        assert section.referent_findings_retention_days == 365.0
+        assert section.mem0_intents_retention_days == 30.0
+        assert section.idempotent_ops_retention_days == 7.0
+
+    @pytest.mark.parametrize(
+        ('field', 'env_name', 'days'),
+        [
+            ('mem0_intents_retention_days', 'WRITE_JOURNAL_MEM0_INTENTS_RETENTION_DAYS', 30.0),
+            ('idempotent_ops_retention_days', 'WRITE_JOURNAL_IDEMPOTENT_OPS_RETENTION_DAYS', 7.0),
+        ],
+    )
+    def test_small_table_horizon_has_a_schema_default_and_is_env_tunable(
+        self, monkeypatch, field, env_name, days,
+    ):
+        from fused_memory.config.schema import WriteJournalConfig
+
+        assert getattr(WriteJournalConfig(), field) == days
+
+        monkeypatch.setenv(env_name, '3')
+        assert getattr(FusedMemoryConfig().write_journal, field) == 3.0, (
+            f'RED: {env_name} must reach write_journal.{field} through config.yaml; '
+            'WriteJournalConfig ignores unknown keys, so a misspelled leaf reads '
+            'silently as the schema default'
+        )
+
+    @pytest.mark.parametrize(
+        'field', ['mem0_intents_retention_days', 'idempotent_ops_retention_days'],
+    )
+    def test_a_non_positive_small_table_horizon_is_rejected(self, field):
+        from fused_memory.config.schema import WriteJournalConfig
+
+        with pytest.raises(ValidationError) as excinfo:
+            WriteJournalConfig.model_validate({field: 0})
+        assert field in str(excinfo.value), (
+            'RED: a 0-day horizon deletes every row of its table at each startup; '
+            'the rejection must name the field'
+        )
+
+    def test_search_rows_outlive_task_read_rows(self):
+        section = FusedMemoryConfig().write_journal
+        assert section.search_retention_days > section.read_retention_days, (
+            'RED: search rows are 1.36% of the table and the only rows with a '
+            'consumer; task-read rows are 97.9% and have none. Inverting this '
+            'starves leaf eta while the config still looks plausible.'
+        )
+
+    def test_inverted_horizons_are_rejected_at_load_time(self):
+        from fused_memory.config.schema import WriteJournalConfig
+
+        with pytest.raises(ValidationError) as excinfo:
+            WriteJournalConfig(read_retention_days=400.0, search_retention_days=30.0)
+        assert 'search_retention_days' in str(excinfo.value), (
+            'RED: the rejection must name the field an operator has to fix'
+        )
+
+    def test_a_zero_prune_interval_is_rejected(self):
+        from fused_memory.config.schema import WriteJournalConfig
+
+        with pytest.raises(ValidationError) as excinfo:
+            WriteJournalConfig(prune_interval_seconds=0)
+        assert 'prune_interval_seconds' in str(excinfo.value), (
+            'RED: a zero interval would spin the periodic prune loop'
+        )
+
+    def test_values_load_from_yaml(self, tmp_path, monkeypatch):
+        config_data = {
+            'write_journal': {
+                'read_retention_days': 7.0,
+                'search_retention_days': 90.0,
+                'prune_max_seconds': 5.0,
+                'prune_interval_seconds': 600.0,
+            },
+        }
+        config_file = tmp_path / 'config.yaml'
+        config_file.write_text(yaml.dump(config_data))
+        monkeypatch.setenv('CONFIG_PATH', str(config_file))
+
+        section = FusedMemoryConfig().write_journal
+
+        assert section.read_retention_days == 7.0, 'RED: the section must be tunable'
+        assert section.search_retention_days == 90.0
+        assert section.prune_max_seconds == 5.0
+        assert section.prune_interval_seconds == 600.0
+        # Unmentioned leaves keep their defaults rather than being clobbered.
+        assert section.write_retention_days == 730.0
+        assert section.prune_batch_size == 500
+
+
+class TestWriteJournalGrowthAlarmConfig:
+    """Task 3311: the write_journal growth alarm's ceilings are operator-tunable.
+
+    The measured basis of the defaults lives in the
+    ``write_journal_growth_alarm`` block of ``fused-memory/config/config.yaml``.
+    """
+
+    def test_section_is_a_bare_submodel_with_defaults(self):
+        from fused_memory.config.schema import WriteJournalGrowthAlarmConfig
+
+        section = FusedMemoryConfig().write_journal_growth_alarm
+        assert isinstance(section, WriteJournalGrowthAlarmConfig), (
+            'RED: write_journal_growth_alarm must be a BARE (non-Optional) '
+            'submodel — reload.py descends only into required submodels'
+        )
+        assert section.max_file_bytes == 6_442_450_944
+        assert section.max_rows_inserted_per_day == 75_000
+        assert section.check_interval_seconds == 3600.0
+
+    def test_values_load_from_yaml(self, tmp_path, monkeypatch):
+        config_data = {
+            'write_journal_growth_alarm': {
+                'max_file_bytes': 1024,
+                'check_interval_seconds': 60.0,
+            },
+        }
+        config_file = tmp_path / 'config.yaml'
+        config_file.write_text(yaml.dump(config_data))
+        monkeypatch.setenv('CONFIG_PATH', str(config_file))
+
+        section = FusedMemoryConfig().write_journal_growth_alarm
+
+        assert section.max_file_bytes == 1024, 'RED: the section must be tunable'
+        assert section.check_interval_seconds == 60.0
+        assert section.max_rows_inserted_per_day == 75_000
+
+    def test_shipped_config_yaml_carries_exactly_the_schema_defaults(self, monkeypatch):
+        """The schema default and the config.yaml literal are two copies of one
+        number; the yaml's measured-basis comment is where it is justified."""
+        from fused_memory.config.schema import WriteJournalGrowthAlarmConfig
+
+        for name in (
+            'WRITE_JOURNAL_GROWTH_ALARM_MAX_FILE_BYTES',
+            'WRITE_JOURNAL_GROWTH_ALARM_MAX_ROWS_PER_DAY',
+            'WRITE_JOURNAL_GROWTH_ALARM_CHECK_INTERVAL_SECONDS',
+        ):
+            monkeypatch.delenv(name, raising=False)
+        yaml_path = Path(__file__).resolve().parent.parent / 'config' / 'config.yaml'
+        monkeypatch.setenv('CONFIG_PATH', str(yaml_path))
+
+        assert FusedMemoryConfig().write_journal_growth_alarm == WriteJournalGrowthAlarmConfig()
+
+    @pytest.mark.parametrize(
+        'field',
+        ['max_file_bytes', 'max_rows_inserted_per_day', 'check_interval_seconds'],
+    )
+    def test_non_positive_values_are_rejected(self, field):
+        from fused_memory.config.schema import WriteJournalGrowthAlarmConfig
+
+        with pytest.raises(ValidationError) as excinfo:
+            WriteJournalGrowthAlarmConfig.model_validate({field: 0})
+        assert field in str(excinfo.value), (
+            'RED: a ceiling of 0 fires permanently; the rejection must name the field'
+        )
+
+
+class TestDedupOutageDetectorConfig:
+    """Task 4718: the TicketJanitor's dedup-outage detector is configured under
+    ``curator.janitor.dedup_outage``. The defaults are back-tested in
+    ``plans/curator-dedup-outage-2026-08-15-rca.md``.
+    """
+
+    def test_nested_under_the_ticket_janitor_config(self):
+        from fused_memory.config.schema import DedupOutageDetectorConfig, TicketJanitorConfig
+
+        assert isinstance(TicketJanitorConfig().dedup_outage, DedupOutageDetectorConfig)
+
+    def test_defaults(self):
+        from fused_memory.config.schema import DedupOutageDetectorConfig
+
+        cfg = DedupOutageDetectorConfig()
+
+        assert cfg.enabled is True
+        assert cfg.window_seconds == 21600.0
+        assert cfg.min_samples == 10
+        assert cfg.max_median_resolve_seconds == 15.0
+
+    @pytest.mark.parametrize(
+        'field',
+        ['window_seconds', 'max_median_resolve_seconds', 'min_samples'],
+    )
+    def test_non_positive_bounds_are_rejected(self, field):
+        from fused_memory.config.schema import DedupOutageDetectorConfig
+
+        with pytest.raises(ValidationError) as excinfo:
+            DedupOutageDetectorConfig.model_validate({field: 0})
+        assert field in str(excinfo.value)
+
+    def test_reachable_from_the_top_level_config(self):
+        from fused_memory.config.schema import DedupOutageDetectorConfig
+
+        section = FusedMemoryConfig().curator.janitor.dedup_outage
+
+        assert isinstance(section, DedupOutageDetectorConfig)

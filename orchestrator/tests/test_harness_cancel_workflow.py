@@ -10,14 +10,17 @@ Verifies the registry-and-set behaviour without spinning up a real workflow:
 from __future__ import annotations
 
 import asyncio
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from _orch_helpers import _init_harness_state_for_test, wire_scheduler_liveness_mock
 
-from orchestrator.harness import Harness
+from orchestrator.config import OrchestratorConfig
+from orchestrator.harness import Harness, TaskReport
 from orchestrator.scheduler import TaskAssignment
+from orchestrator.slot_lease import SlotLease
 from orchestrator.workflow import WorkflowOutcome
+from orchestrator.workflow_types import WorkflowState
 
 
 @pytest.fixture
@@ -146,8 +149,11 @@ def harness_for_run_slot() -> Harness:
     h._merge_queue = None  # type: ignore[assignment]
     h._merge_worker = None
     h._merge_inflight_registry = None  # type: ignore[assignment]
+    h._task_verify_dispatcher = MagicMock()
+    h._verify_cache = MagicMock()
     h.cost_store = None
-    # _collect_done_reports uses these
+    # _collect_slot_report uses these
+    h._live_tasks = set()
     h._run_store = None
     h._run_id = None
     h.review_checkpoint = None
@@ -170,15 +176,15 @@ async def test_run_slot_returns_cancelled_report_when_hard_cancelled(
     harness_for_run_slot: Harness,
 ) -> None:
     """RED: CancelledError escapes _run_slot → wrapper_task.cancelled() is True;
-    _collect_done_reports' t.result() re-raises CancelledError past its own
-    `except Exception` guard, unwinding the harness main loop.
+    the done-callback's t.result() re-raises CancelledError past its own
+    `except Exception` guard.
 
     GREEN (step-10): _run_slot catches asyncio.CancelledError before
     `except Exception`, returns a synthetic TaskReport(outcome=CANCELLED) so:
     (a) wrapper_task completes normally (cancelled() is False);
     (b) wrapper_task.result() is a TaskReport(outcome=CANCELLED);
     (c) finally cleanup runs (registries cleared, semaphore released);
-    (d) _collect_done_reports appends the report without raising.
+    (d) _collect_slot_report appends the report without raising.
     """
     h = harness_for_run_slot
     tid = '42'
@@ -200,7 +206,7 @@ async def test_run_slot_returns_cancelled_report_when_hard_cancelled(
         mock_wf.run = _wedge
         mock_wf_cls.return_value = mock_wf
 
-        wrapper_task = asyncio.create_task(h._run_slot(assignment, sem))
+        wrapper_task = asyncio.create_task(h._run_slot(assignment, SlotLease(assignment.task_id, h.scheduler, sem)))
 
         # Poll until _run_slot registers itself in _workflow_slot_tasks.
         for _ in range(50):
@@ -244,11 +250,11 @@ async def test_run_slot_returns_cancelled_report_when_hard_cancelled(
         'grace stamp must persist past the finally (popped only at re-dispatch)'
     )
 
-    # (d) Regression: _collect_done_reports must handle the wrapper_task cleanly.
+    # (d) Regression: _collect_slot_report must handle the wrapper_task cleanly.
     task_reports: list = []
-    h._collect_done_reports({wrapper_task}, task_reports)
+    h._collect_slot_report(task_reports, wrapper_task)
     assert len(task_reports) == 1, (
-        f'Expected _collect_done_reports to append 1 report, got {len(task_reports)}'
+        f'Expected _collect_slot_report to append 1 report, got {len(task_reports)}'
     )
     assert task_reports[0].outcome == WorkflowOutcome.CANCELLED
 
@@ -280,7 +286,7 @@ async def test_run_slot_clears_stale_grace_stamp_at_dispatch(
         mock_wf.run = _wedge
         mock_wf_cls.return_value = mock_wf
 
-        wrapper_task = asyncio.create_task(h._run_slot(assignment, sem))
+        wrapper_task = asyncio.create_task(h._run_slot(assignment, SlotLease(assignment.task_id, h.scheduler, sem)))
 
         # Poll until the slot registers.  The stamp pop happens at dispatch,
         # just before the slot-task registration, so once the slot is present
@@ -300,3 +306,253 @@ async def test_run_slot_clears_stale_grace_stamp_at_dispatch(
         # Cleanup: hard-cancel the wedged slot and drain.
         h.hard_cancel_workflow(tid)
         await asyncio.wait({wrapper_task}, timeout=5.0)
+
+
+def _narrow(result: TaskReport | None) -> TaskReport:
+    """Narrow ``_run_slot``'s ``TaskReport | None`` to the report it always returns here.
+
+    Every path this driver exercises reaches the ``except asyncio.CancelledError``
+    handler, which returns a synthetic ``TaskReport``.  Stating that precondition
+    once keeps each caller's ``report.block_reason`` / ``.block_phase`` access
+    type-clean without weakening any assertion.
+    """
+    assert result is not None, 'expected a synthetic CANCELLED TaskReport, got None'
+    return result
+
+
+async def _drive_cancelled_slot(
+    h: Harness,
+    tid: str,
+    *,
+    reason: str | None = None,
+    state: WorkflowState | None = WorkflowState.EXECUTE,
+    cancel_during_setup: bool = False,
+    capture_task: list | None = None,
+) -> TaskReport:
+    """Run a real _run_slot to its hard-cancel and return the synthetic report.
+
+    Reuses the driver shape of test_run_slot_returns_cancelled_report_when_hard
+    _cancelled: a live slot task with build_workflow patched to a wedging run(),
+    then hard_cancel_workflow.
+
+    ``capture_task`` receives the wrapper asyncio.Task itself, for callers that
+    need to feed it back through ``_collect_slot_report`` (the runs.db half).
+    """
+    assignment = TaskAssignment(task_id=tid, task={'title': 'wedged task'}, modules=[])
+    sem = asyncio.Semaphore(0)
+
+    with patch('orchestrator.harness.build_workflow') as mock_wf_cls:
+        if cancel_during_setup:
+            # A cancel landing BEFORE `workflow` is bound.  The except handler
+            # must not touch an unbound local.
+            mock_wf_cls.side_effect = asyncio.CancelledError()
+            wrapper_task = asyncio.create_task(h._run_slot(assignment, SlotLease(assignment.task_id, h.scheduler, sem)))
+            done, _ = await asyncio.wait({wrapper_task}, timeout=5.0)
+            assert wrapper_task in done
+            return _narrow(wrapper_task.result())
+
+        async def _wedge() -> None:
+            await asyncio.sleep(3600)
+
+        mock_wf = MagicMock()
+        mock_wf.run = _wedge
+        mock_wf.state = state
+        mock_wf_cls.return_value = mock_wf
+
+        wrapper_task = asyncio.create_task(h._run_slot(assignment, SlotLease(assignment.task_id, h.scheduler, sem)))
+        if capture_task is not None:
+            capture_task.append(wrapper_task)
+        for _ in range(50):
+            if tid in h._workflow_slot_tasks:
+                break
+            await asyncio.sleep(0.01)
+        assert tid in h._workflow_slot_tasks
+
+        if reason is None:
+            h.hard_cancel_workflow(tid)
+        else:
+            h.hard_cancel_workflow(tid, reason=reason)
+
+        done, _ = await asyncio.wait({wrapper_task}, timeout=5.0)
+        assert wrapper_task in done, 'wrapper_task did not finish within 5 s'
+        return _narrow(wrapper_task.result())
+
+
+@pytest.mark.asyncio
+class TestHardCancelReportCarriesCause:
+    """A hard-cancelled slot's synthetic report must say WHY and WHERE (task 3172).
+
+    Before this, block_reason/block_phase both fell back to '', so a
+    drain-cancelled task was indistinguishable in runs.db from a
+    terminal-status cancel or an escalation-action teardown.
+    """
+
+    async def test_report_carries_the_attributed_cancel_reason(
+        self, harness_for_run_slot: Harness
+    ):
+        """The reason stamped by hard_cancel_workflow reaches the report."""
+        report = await _drive_cancelled_slot(
+            harness_for_run_slot, '42', reason='terminal_status_cancel'
+        )
+
+        assert report.outcome == WorkflowOutcome.CANCELLED
+        assert report.block_reason == 'terminal_status_cancel'
+
+    async def test_report_carries_the_live_workflow_phase(
+        self, harness_for_run_slot: Harness
+    ):
+        """block_phase reads the live workflow's own state, not a guess."""
+        report = await _drive_cancelled_slot(
+            harness_for_run_slot,
+            '42',
+            reason='terminal_status_cancel',
+            state=WorkflowState.VERIFY,
+        )
+
+        assert report.block_phase == WorkflowState.VERIFY.value
+
+    async def test_setup_phase_cancel_reports_dispatch_setup(
+        self, harness_for_run_slot: Harness
+    ):
+        """A cancel landing before build_workflow must not raise UnboundLocalError."""
+        report = await _drive_cancelled_slot(
+            harness_for_run_slot, '42', cancel_during_setup=True
+        )
+
+        assert report.outcome == WorkflowOutcome.CANCELLED
+        assert report.block_phase == 'dispatch_setup'
+
+
+@pytest.mark.asyncio
+class TestHardCancelReasonFallbackLadder:
+    """With no attributed cause, the reason is derived — never guessed (task 3172)."""
+
+    async def test_drain_cancel_reports_shutdown_drain(self, harness_for_run_slot: Harness):
+        """A slot drained by run()'s finally is separable from every other cancel.
+
+        _draining is a POSITIVE signal: it is set at the top of run()'s finally,
+        before the only loop that cancels slot tasks on SIGTERM/SIGINT.
+        """
+        harness_for_run_slot._draining = True
+
+        report = await _drive_cancelled_slot(harness_for_run_slot, '42')
+
+        assert report.block_reason == 'shutdown_drain'
+
+    async def test_unattributed_cancel_is_labelled_honestly(
+        self, harness_for_run_slot: Harness
+    ):
+        """No cause and no drain gets a residue label, not an invented one."""
+        harness_for_run_slot._draining = False
+
+        report = await _drive_cancelled_slot(harness_for_run_slot, '42')
+
+        assert report.block_reason == 'cancelled_unattributed'
+
+    async def test_stamped_cause_is_consumed_once(self, harness_for_run_slot: Harness):
+        """A re-dispatch of the same task cannot inherit a stale reason."""
+        harness_for_run_slot._draining = False
+
+        await _drive_cancelled_slot(harness_for_run_slot, '42', reason='terminal_status_cancel')
+
+        assert '42' not in harness_for_run_slot._workflow_cancel_causes
+
+    async def test_stamped_cause_wins_over_the_drain_flag(
+        self, harness_for_run_slot: Harness
+    ):
+        """An explicit attribution outranks the drain inference."""
+        harness_for_run_slot._draining = True
+
+        report = await _drive_cancelled_slot(
+            harness_for_run_slot, '42', reason='action_teardown:park'
+        )
+
+        assert report.block_reason == 'action_teardown:park'
+
+
+# ---------------------------------------------------------------------------
+# Cancel-source attribution — task 3172, step-19
+#
+# The fallback ladder above only stays honest if every in-process cancel
+# SOURCE registers itself.  A source that silently omits `reason` lands in the
+# `cancelled_unattributed` residue bucket, which is exactly the flattening
+# this task exists to remove.  These tests pin the two in-process sources.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestTerminalStatusWatcherAttributesItsCancel:
+    """The terminal-status watcher names itself when it hard-cancels a slot."""
+
+    async def test_hard_cancel_passes_terminal_status_cancel_reason(
+        self, harness: Harness
+    ):
+        """Driving the scan past the threshold attributes the cancel.
+
+        Reuses the watcher's own drive shape (two scans with threshold=2, the
+        second crossing it) from test_harness_terminal_status_watcher.py, but
+        patches ``hard_cancel_workflow`` so the assertion is on the CALL, not
+        on the downstream report — the report side is covered above.
+        """
+        h = harness
+        h.config = OrchestratorConfig(terminal_status_hard_cancel_polls=2)
+        h._terminal_cancel_counts = {}
+        h._workflow_cancel_events['6'] = asyncio.Event()
+        h.scheduler.get_statuses = AsyncMock(return_value=({'6': 'cancelled'}, None))
+        h.hard_cancel_workflow = MagicMock(return_value=True)
+
+        # Poll 1: below threshold → soft cancel only.
+        await h._scan_for_terminal_active_tasks()
+        h.hard_cancel_workflow.assert_not_called()  # type: ignore[attr-defined]
+
+        # Poll 2: at threshold → hard cancel, attributed.
+        await h._scan_for_terminal_active_tasks()
+
+        h.hard_cancel_workflow.assert_called_once()  # type: ignore[attr-defined]
+        kwargs = h.hard_cancel_workflow.call_args.kwargs  # type: ignore[attr-defined]
+        assert kwargs.get('reason') == 'terminal_status_cancel', (
+            'terminal-status watcher must attribute its own hard cancel; '
+            f'got reason={kwargs.get("reason")!r}'
+        )
+        # The pre-existing restamp contract must survive the new kwarg: only
+        # the threshold-CROSSING call restamps the R3 grace window.
+        assert kwargs.get('restamp') is True
+
+
+@pytest.mark.asyncio
+class TestCancelledReportReachesRunStore:
+    """The runs.db half of the acceptance query (task 3172, step-21).
+
+    events.db gets the new task_completed emit; runs.db gets the same two
+    fields via ``_collect_slot_report`` → ``save_task_result``.  Pinning both
+    keeps the two stores answerable by the SAME question.
+    """
+
+    async def test_save_task_result_receives_block_reason_and_phase(
+        self, harness_for_run_slot: Harness
+    ):
+        h = harness_for_run_slot
+        captured: list = []
+
+        await _drive_cancelled_slot(
+            h,
+            '42',
+            reason='action_teardown:restart',
+            state=WorkflowState.EXECUTE,
+            capture_task=captured,
+        )
+
+        # _collect_slot_report persists whatever the slot returned.  Wire the
+        # run store only now: _run_slot itself must not need it.
+        h._run_store = MagicMock()
+        h._run_id = 'run-1'
+        h.config = MagicMock()
+        h.config.fused_memory.project_id = 'dark_factory'
+
+        h._collect_slot_report([], captured[0])
+
+        h._run_store.save_task_result.assert_called_once()
+        saved_report = h._run_store.save_task_result.call_args.args[1]
+        assert saved_report.outcome == WorkflowOutcome.CANCELLED
+        assert saved_report.block_reason == 'action_teardown:restart'
+        assert saved_report.block_phase == WorkflowState.EXECUTE.value

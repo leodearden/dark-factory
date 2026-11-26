@@ -1,0 +1,72 @@
+{
+  "schema_version": 6,
+  "measured_at": "2026-10-07T20:13:12.060948+00:00",
+  "gpu": {
+    "name": "NVIDIA GeForce RTX 3090",
+    "driver_version": "580.178.04",
+    "total_mib": 24576
+  },
+  "arms": [
+    {
+      "arm_id": "qwen3.5-9b",
+      "axis": "llm",
+      "stack": "vllm",
+      "endpoint": "http://127.0.0.1:8410",
+      "served_model_name": "qwen3.5-9b",
+      "verdict": "PASS",
+      "reason": "ok",
+      "detail": "valid ProbeExtraction for qwen3.5-9b, capturing 4/4 known entities (4 as top-level entities)",
+      "latency_ms": 40194.2,
+      "first_probe_ms": 45587.2,
+      "measured_at": "2026-10-07T20:13:12.060948+00:00",
+      "arm_footprint_mib": 14901,
+      "reasoning": "on",
+      "top_level_entities_named": 4,
+      "measured_cached_prompt_tokens": null,
+      "repeat_latencies_ms": null
+    }
+  ],
+  "vram": {
+    "total_mib": 24576,
+    "used_mib": 21972,
+    "free_mib": 2120,
+    "baseline_mib": 7071,
+    "budget_mib": 17020,
+    "arm_footprint_mib": 14901,
+    "used_gib": 21.46,
+    "free_gib": 2.07,
+    "baseline_gib": 6.91,
+    "budget_gib": 16.62,
+    "arm_footprint_gib": 14.55,
+    "nominal_ceiling_gib": 19.5,
+    "operating_budget_gib": 16.37,
+    "headroom_gib": 2.07,
+    "verdict": "PASS",
+    "reason": "the arm took 14.55 GiB (21972 - 7071 MiB), within the 16.62 GiB budget free before it started",
+    "baseline_consumers": [
+      {
+        "pid": 9024,
+        "process_name": "python",
+        "used_mib": 4050
+      }
+    ],
+    "probe_consumers": [
+      {
+        "pid": 9024,
+        "process_name": "python",
+        "used_mib": 4050
+      },
+      {
+        "pid": 2601674,
+        "process_name": "VLLM::EngineCore",
+        "used_mib": 14902
+      }
+    ],
+    "consumer_inventory_note": "INVENTORY, not an accounting: `nvidia-smi --query-compute-apps` lists only CUDA compute applications. It does not list the KDE/X11 graphics contexts (Xorg, plasmashell, kwin_x11, and ~40 small KDE clients) that hold the remaining ~3.3 GiB on this host \u2014 which is exactly why the measured operating budget is ~16.37 GiB rather than 19.5. These entries name who else held the card; they do not sum to memory.used.",
+    "pollution": "CLEAN",
+    "pollution_reason": ""
+  },
+  "overall": "PASS",
+  "prd_marker": "PRD-MARKER:local-memory-models-eval serving",
+  "latency_caveat": "Latency here is a SINGLE-SAMPLE health-probe measurement taken with the engine warm and the prefix cache COLD (one discarded warm-up on a different prompt precedes it). It is NOT the p95-under-load envelope metric (task 3719 zeta; PRD episode-latency-p50/p95 under concurrent load), and it must not be used to rank arms against one another."
+}

@@ -21,9 +21,11 @@ from __future__ import annotations
 
 import json
 import logging
+from collections.abc import Iterable
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
+from escalation.categories import EscalationCategory
 from escalation.dedupe import DedupeConfig, content_fingerprint_key, submit_or_dedupe
 from escalation.models import Escalation
 
@@ -43,10 +45,7 @@ __all__ = [
     'stale_evidence_fingerprint',
 ]
 
-# Free-form category — escalation/server.CATEGORIES is inert/unvalidated
-# (see plan.json design_decisions), so no escalation/ package change is
-# needed to introduce this category.
-PROVENANCE_CONFLICT_CATEGORY = 'provenance_conflict'
+PROVENANCE_CONFLICT_CATEGORY = EscalationCategory.PROVENANCE_CONFLICT
 
 # Born-at-L2 sentinel role (mirrors deterministic_runner's
 # 'orchestrator-deterministic' pattern) — keeps severity='urgent'/level=2
@@ -131,16 +130,97 @@ def _reopen_at_matches(caller_value: object, memo_value: str) -> bool:
     return parsed_caller == _parse_reopen_at(memo_value)
 
 
+def _record_binds(record: Any, reopen_at: object) -> bool:
+    """True when the pending conflict *record* still binds a caller at *reopen_at*.
+
+    The single definition shared by the read side
+    (:meth:`ProvenanceConflictSink.arbitration_pending`) and the write side
+    (:func:`_refresh_folded_parent`).  The recorded values are the
+    ``reopen_at`` in the record's own ``detail`` plus the one in every fold
+    refresh — an amendment whose ``agent_role`` is
+    ``PROVENANCE_CONFLICT_AGENT_ROLE``.  Amendments by any other role are not
+    reopen evidence and are skipped, so a human note can never wedge a task.
+
+    ANY recorded value matching binds: a task's live ``reopen_at`` only moves
+    forward, so no caller presents a value older than the newest entry and
+    "any" agrees with "newest" without ordering the amendments.  Every
+    ambiguity binds too — an unparseable ``detail``, or a recorded value that
+    is absent or not a string.
+
+    Residual: refreshes share the amendment list with every other writer, and
+    ``escalation/src/escalation/amendments.py::MAX_AMENDMENTS`` sheds the
+    oldest entry, so that many foreign amendments after the newest refresh
+    shed it and a cold sink releases at the live ``reopen_at``.  Closing that
+    needs an atomic fold-plus-refresh primitive in the escalation package.
+    """
+    details = [getattr(record, 'detail', None)]
+    details.extend(
+        amendment.get('detail')
+        for amendment in getattr(record, 'amendments', None) or ()
+        if isinstance(amendment, dict)
+        and amendment.get('agent_role') == PROVENANCE_CONFLICT_AGENT_ROLE
+    )
+    for detail in details:
+        try:
+            recorded = json.loads(detail or '{}').get('reopen_at')
+        except (TypeError, ValueError, AttributeError):
+            return True
+        if not isinstance(recorded, str) or _reopen_at_matches(reopen_at, recorded):
+            return True
+    return False
+
+
+def _refresh_folded_parent(
+    queue: EscalationQueue, parent_id: str, esc: Escalation, reopen_at: str,
+) -> None:
+    """Make the folded-into parent bind *reopen_at* by appending *esc*'s framing.
+
+    A dedupe fold never touches the parent's ``detail``, so after a re-reopen
+    the durable record would still carry only the first ``reopen_at`` and a
+    cold sink would release a live hold.  The refresh is written only when
+    the parent does not already bind *reopen_at*, so same-reopen repeats from
+    any writer site add nothing (INV-4).  The ``get``/``amend`` pair is not
+    atomic, so two writers folding at once can each append a refresh; both
+    bind the same value, and the amendment cap bounds them.  ``amend``'s
+    status is ignored:
+    ``not_pending`` / ``not_found`` mean the parent was resolved in between,
+    which already released the hold.
+    """
+    parent = queue.get(parent_id)
+    if parent is None or _record_binds(parent, reopen_at):
+        return
+    queue.amend(
+        parent_id, summary=esc.summary, detail=esc.detail,
+        agent_role=PROVENANCE_CONFLICT_AGENT_ROLE,
+    )
+
+
 class ProvenanceConflictSink:
     """Records ``done_evidence_stale`` rejections; gates per-tick re-attempts.
 
-    Two-layer protection (see plan.json design_decisions):
+    Protection layers (see plan.json design_decisions):
     - ``should_skip`` — an in-memory per-task memo giving "no per-tick
       retry" (terminal-for-this-tick). Lost on restart.
     - ``record`` — the durable disk fingerprint dedup (``submit_or_dedupe``)
       giving "exactly one escalation / dedupe_count on repeats", including
       across a restart that clears the memo, or from a different writer
       site.
+    - ``arbitration_pending`` — the durable READ side (task 3534), deciding
+      "is this task still bound by an arbitration?" from the store's pending
+      records rather than the memo, so it holds on a process that did not
+      itself file the conflict. It shares ``should_skip``'s invalidation
+      semantics: a resolved escalation leaves ``get_by_task(...,
+      status='pending')`` (and is skipped defensively even if an unfiltered
+      read hands one over anyway), and a moved-on ``reopen_at`` releases
+      too. A released hold does NOT mean "flip to done" — the escalation is
+      still pending, so the caller's any-level pin veto then catches it and
+      the task dispatches instead.
+    - ``note_hold_observed`` / ``clear_hold_observed`` — log-streak
+      bookkeeping for that hold. Unlike a veto that ABSTAINS (the task
+      dispatches and stops being a candidate), a hold re-fires on every tick
+      until the arbitration ends, so its caller logs loudly only on a
+      ``(task_id, reopen_at)`` TRANSITION and quietly on the repeats (INV-4:
+      storm escape is ``dedupe_count``, never log spam).
 
     ``escalation_queue`` is a late-bindable public attribute: the harness
     constructs this sink before its ``EscalationQueue`` exists (the merge
@@ -153,6 +233,9 @@ class ProvenanceConflictSink:
         self.escalation_queue = escalation_queue
         # task_id -> (reopen_at, evidence_commit, escalation_id | None)
         self._memo: dict[str, tuple[str, str, str | None]] = {}
+        # task_id -> the reopen_at whose hold was last LOGGED loudly (None
+        # when the caller had none); see note_hold_observed/clear_hold_observed.
+        self._hold_logged: dict[str, str | None] = {}
 
     def record(
         self,
@@ -170,6 +253,10 @@ class ProvenanceConflictSink:
         ``None`` when no queue is bound yet — the memo is still updated
         (with a ``None`` escalation id) so ``should_skip`` still gates the
         in-process retry even before the queue is late-bound.
+
+        A fold at a ``reopen_at`` the parent does not yet bind appends a
+        sink-authored amendment, so the durable record binds the newest
+        ``reopen_at`` (see :func:`_refresh_folded_parent`).
         """
         if self.escalation_queue is None:
             # task 2677 amendment (reviewer_comprehensive
@@ -221,6 +308,8 @@ class ProvenanceConflictSink:
         )
         result = submit_or_dedupe(self.escalation_queue, esc, _dedupe_config())
         escalation_id = str(result['id'])
+        if result.get('status') == 'dedup_skipped':
+            _refresh_folded_parent(self.escalation_queue, escalation_id, esc, reopen_at)
         self._memo[task_id] = (reopen_at, evidence_commit, escalation_id)
         return escalation_id
 
@@ -282,6 +371,123 @@ class ProvenanceConflictSink:
             return True
         del self._memo[task_id]
         return False
+
+    def arbitration_pending(
+        self,
+        pending_records: Iterable[Any] | None,
+        *,
+        reopen_at: str | object = _UNKNOWN_REOPEN,
+    ) -> bool:
+        """True while a pending ``provenance_conflict`` record binds this task.
+
+        The restart-DURABLE twin of :meth:`should_skip`: decided from the
+        escalation store's own records instead of ``self._memo``, so it
+        survives the two cases the memo cannot cover — a cold memo (fleet
+        redeploy / watchdog restart) and a conflict filed by a different
+        writer site (``merge_queue.py``'s two ``ProvenanceConflictSink``
+        call sites).  ``should_skip`` remains the zero-I/O in-process fast
+        path; this is the correctness backstop underneath it.
+
+        Takes ALREADY-READ records rather than doing its own ``get_by_task``
+        so the caller pays for exactly one store read.
+        ``pending_records=None`` (an unreadable store) returns ``False``:
+        that disposition belongs to the caller, which already treats a failed
+        read as ``store_unavailable`` (see the already-landed dispatch gate's
+        try/except).
+
+        PRECONDITION, named in the parameter: pass the rows of
+        ``get_by_task(task_id, status='pending')``.  A resolved record must
+        RELEASE the hold — that is how an operator ends an arbitration, and it
+        is the same release arm ``should_skip`` gets from
+        ``_escalation_pending``'s ``esc.status == 'pending'`` check.  Records
+        whose ``status`` is present and not ``'pending'`` are therefore
+        skipped defensively here too, so a caller that hands over an
+        unfiltered ``get_by_task(task_id)`` (which also scans the archive
+        tier) cannot turn a long-resolved conflict into a permanent
+        withhold — precisely the wedge the reopen_at arm below exists to
+        avoid.  A record with no ``status`` attribute at all is treated as
+        pending, keeping the ambiguity-holds asymmetry below.
+
+        Shares :meth:`should_skip`'s reopen_at INVALIDATION ARM, comparing
+        the caller's value against every ``reopen_at`` the record carries: its
+        own ``detail`` JSON plus each fold refresh ``record()`` appended (see
+        :func:`_record_binds`).  That arm is load-bearing, not
+        incidental — ``merge_queue.py`` names it as the self-heal for a task
+        reopened after its conflict was filed — so a hold that ignored it
+        would trade the cold-memo bug for a permanent wedge (neither
+        dispatched nor flipped until a human resolved the L2).  Passing no
+        ``reopen_at`` (the ``_UNKNOWN_REOPEN`` sentinel) skips the arm,
+        exactly as it does for the memo, so the two layers invalidate on ONE
+        shared signal rather than two subtly different ones.
+
+        Deliberate asymmetry: EVERY ambiguity — caller passed no
+        ``reopen_at``, ``detail`` missing or unparseable, recorded value
+        absent or not a string — resolves to HOLD.  Releasing is the action
+        that lets a contested task move, so it must require positive
+        evidence that the arbitration is stale; the absence of evidence is
+        never enough.  ``_reopen_at_matches`` (not ``==``) performs the
+        comparison, so incidental ISO-8601 spelling drift between the stored
+        and caller-supplied strings cannot masquerade as a moved-on value.
+        """
+        if not pending_records:
+            return False
+        for record in pending_records:
+            if getattr(record, 'category', None) != PROVENANCE_CONFLICT_CATEGORY:
+                continue
+            if getattr(record, 'status', 'pending') != 'pending':
+                # Defence in depth for the PENDING precondition above: only
+                # a still-open arbitration binds the task, so a resolved /
+                # dismissed row released it (mirrors _escalation_pending's
+                # `esc.status == 'pending'`).  Cheap enough to be worth not
+                # depending on every present and future caller having
+                # remembered `status='pending'` on its read.
+                continue
+            if reopen_at is _UNKNOWN_REOPEN or _record_binds(record, reopen_at):
+                return True
+        return False
+
+    def note_hold_observed(
+        self, task_id: str, *, reopen_at: str | object = _UNKNOWN_REOPEN,
+    ) -> bool:
+        """Register an :meth:`arbitration_pending` hold; True on a TRANSITION.
+
+        INV-4 ("storm escape is ``dedupe_count``, never log spam") applied to
+        the hold's log line.  The any-level pin veto does not need this — it
+        ABSTAINS, so the task dispatches and stops being a gate candidate —
+        but a hold repeats on EVERY dispatch tick for as long as the
+        arbitration stands, and on a cold-memo process it short-circuits
+        before ``record()`` and so never re-warms anything that would quiet
+        it.  A caller logging it unconditionally at INFO would emit one line
+        per scheduler tick, indefinitely, until a human resolved the L2.
+
+        So the caller logs LOUDLY (INFO) only when this returns True — the
+        first observation of a given ``(task_id, reopen_at)`` — and quietly
+        (DEBUG) on the repeats.  A moved-on ``reopen_at`` is a genuinely new
+        hold state and is loud again, which is exactly the transition an
+        operator wants to see.
+
+        Advisory per-process state, deliberately: losing it on a restart
+        costs one extra INFO line per contested task, which is the right side
+        to fail on.  :meth:`clear_hold_observed` prunes it when the hold
+        releases, so it stays bounded by the count of CURRENTLY-held tasks
+        rather than every task ever contested in this process (the same
+        resource_management discipline ``should_skip``'s memo carries).
+        """
+        key = reopen_at if isinstance(reopen_at, str) else None
+        if task_id in self._hold_logged and self._hold_logged[task_id] == key:
+            return False
+        self._hold_logged[task_id] = key
+        return True
+
+    def clear_hold_observed(self, task_id: str) -> None:
+        """Drop *task_id*'s hold-log state — the arbitration no longer binds.
+
+        Called by a caller whose :meth:`arbitration_pending` came back False,
+        so a hold that returns later announces itself loudly again instead of
+        being silently folded into a stale streak, and so
+        :meth:`note_hold_observed`'s dict cannot grow monotonically.
+        """
+        self._hold_logged.pop(task_id, None)
 
     def _escalation_pending(self, escalation_id: str | None) -> bool:
         """True when *escalation_id* is still open (or unverifiable).

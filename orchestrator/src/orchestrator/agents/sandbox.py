@@ -65,17 +65,44 @@ def build_bwrap_command(
     - --ro-bind / / — read-only root (entire filesystem visible, nothing writable)
     - --bind <worktree>/<module> — writable overlay per locked module
     - --bind <worktree>/.task — always writable (agent artifacts)
-    - --tmpfs /tmp — writable tmp
+    - --tmpfs /tmp — mounted first, then covered by the root ro-bind: /tmp
+      is the host's, read-only
     - --dev /dev — device nodes
     - --proc /proc — proc filesystem
     - / is read-only; ~/.claude is read-only too except for whatever
       subpaths are supplied here via writable_extras (e.g.
       ~/.claude/fleet/, as computed by
-      orchestrator.agents.write_set.compute_write_set). The CLI's own
-      OAuth/session state is redirected to a per-task CLAUDE_CONFIG_DIR
-      inside the worktree (already writable via the module/.task binds),
-      so ~/.claude/settings.json stays read-only (PRD
+      orchestrator.agents.write_set.compute_write_set), so
+      ~/.claude/settings.json stays read-only (PRD
       deny-write-to-settings.json property).
+
+    CALLER OBLIGATION — CLAUDE_CONFIG_DIR must be granted, not assumed:
+    this function binds exactly the module dirs, <worktree>/.task, /dev,
+    /proc, and each writable_extra. Whoever redirects the
+    CLI's OAuth/session state to a per-task CLAUDE_CONFIG_DIR MUST ALSO
+    pass that directory in writable_extras. The orchestrator satisfies
+    this via the .task bind; reconciliation — which lands on THIS branch
+    whenever Landlock is unavailable — satisfies it via a per-run computed
+    extra in cli_stage_runner.run_stage_via_cli, machine-checked by
+    sandbox_guard.resolve_recon_sandbox_wrap. That check exists because the
+    obligation went silently unmet from 2026-07-18 (task 2744) to
+    2026-08-11 (task 4003): recon's config dir sat under
+    <data_dir>/recon-config/, outside every bind above, so every recon
+    stage was told where to write its transcript and then denied the write.
+    Note this branch drops a writable_extra that is not an existing file or dir
+    (see below), so a mistimed grant is vacuous here too — logged, not
+    silent, and landlock_exec._add_path now prints the same signal for its
+    --writable list, so the two backends degrade equally loudly.
+
+    ALSO NOTE the mount order below: `--tmpfs /tmp` comes BEFORE
+    `--ro-bind / /`, and the later root bind covers it, so the sandbox sees
+    the HOST /tmp, read-only (measured 2026-11-01, bwrap on this host: a
+    host file under /tmp reads, every write there fails EROFS). Unlike the
+    Landlock branch, which grants the host /tmp blanket, nothing under /tmp
+    is writable here. A CLAUDE_CONFIG_DIR under host /tmp is readable but
+    its session writes are denied unless it is named in writable_extras,
+    which are bound after the root. sandbox_guard._writable_roots excludes
+    /tmp from its containment roots for this reason.
     """
     cmd = [
         'bwrap',
@@ -99,23 +126,18 @@ def build_bwrap_command(
     os.makedirs(task_dir, exist_ok=True)
     cmd.extend(['--bind', task_dir, task_dir])
 
-    # Extra writable directories
+    # Extra writable files and directories
     if writable_extras:
         for extra in writable_extras:
-            if os.path.isdir(extra):
+            if os.path.isdir(extra) or os.path.isfile(extra):
                 cmd.extend(['--bind', extra, extra])
             else:
-                # bwrap cannot --bind a nonexistent path, and compute_write_set
-                # is intentionally pure (no makedirs) — existence/creation is
-                # the backend's job, but this backend does not create extras
-                # (unlike the writable_modules/.task loops above, which do).
-                # Silently dropping the bind would let a requested writable
-                # path (e.g. ~/.claude/fleet on first run) go missing with no
-                # signal, contrary to the loud-over-silent-degradation norm —
-                # so surface it instead of degrading silently.
+                # bwrap cannot --bind a nonexistent path and this backend does
+                # not create extras, so say so rather than degrade silently.
                 logger.warning(
-                    'build_bwrap_command: writable extra %r is not a directory '
-                    '— skipping bind (path missing or not created yet)', extra,
+                    'build_bwrap_command: writable extra %r is not an existing '
+                    'file or directory — skipping bind (path missing or not '
+                    'created yet)', extra,
                 )
 
     cmd.append('--')

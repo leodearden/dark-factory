@@ -1,62 +1,87 @@
 /* Escalations tab — read-only queue view.
  *
- * No JS test runner in this project (see scheduler_drawer.jsx comment).
- * Wiring contracts are verified via Python source-assertion tests in
- * dashboard/tests/test_tab_escalations.py.
+ * Its render decisions are exercised in a jsdom window by
+ * dashboard/tests/js/jsx_render.test.mjs; the pure decisions lifted OUT of
+ * this file are covered by `node --test` under dashboard/tests/js/, and the
+ * remaining wiring contracts by dashboard/tests/test_tab_escalations.py.
  *
  * Load order: tabs.jsx → tab_escalations.jsx → app.jsx
  * Export:     window.DF_TABS.EscalationsTab  (additive mutation of the object
  *             created by tabs.jsx; app.jsx destructures it last)
  */
 const { useState: uS, useEffect: uE } = React;
-const { ProjectGroup, taskId } = window.DF_SHELL;
+const { ProjectGroup, Pip, DatumReading, taskId } = window.DF_SHELL;
 const DF = window.DF_DATA;
+const DF_LOADER_ESC = window.DF_DATA_LOADER;
+const { useOnDemand } = DF_LOADER_ESC.createOnDemandHook(React);
 const C = window.DF_CHARTS;
+const { pinningSummary } = window.DF_PINS_RECOVERY;
+// The Datum wrappers. Module scope, no fallback — see the CANONICAL note in
+// datum.js's header.
+const { plainDatum, derivedDatum } = window.DF_DATUM;
+// The served views of the escalation corpus, its class split and each row's
+// task card — read only through their one client reader, escalation_views.js.
+const {
+  queuePending,
+  subsectionQueuePending,
+  openInHistoryOver,
+  corpusAgeCaption,
+  windowedClassSplit,
+  taskCard,
+  levelCount,
+  windowedEscPerDone,
+} = window.DF_ESCALATION_VIEWS;
+// The cross-tab focus lookup, keyed on (queue, id) — escalation_focus.js.
+const { findEscalationRow } = window.DF_ESCALATION_FOCUS;
+// A dependency_capability record's check owner — escalation_check_owner.js.
+const { checkOwnerPanel } = window.DF_ESCALATION_CHECK_OWNER;
+// The persisted UI-preference hooks — persisted_state.js.
+const { createPersistedHooks } = window.DF_PERSISTED_STATE;
+const { usePersistedState, useOpenSet } = createPersistedHooks(React);
 
-// ── Local helpers (tabs.jsx-compatible copies; not exported from any namespace) ──
+// Every number this tab renders arrives on one endpoint, and the path is the
+// lookup key into DF_DATA.__receipt (data.js keys one receipt per polled
+// endpoint by its URL with the query stripped).
+const EP_ESCALATIONS = '/api/v2/dashboard/escalations';
 
-function useOpenSet(ids, defaultOpen = true, storageKey = null) {
-  const [openMap, setOpenMap] = uS(() => {
-    let stored = {};
-    if (storageKey) {
-      try { stored = JSON.parse(localStorage.getItem(storageKey) || '{}') || {}; } catch (e) {}
-    }
-    const init = {};
-    for (const id of ids) init[id] = id in stored ? !!stored[id] : defaultOpen;
-    return init;
-  });
-  // Backfill ids that arrive after mount (ESCALATIONS.subsections starts [] and
-  // is populated by the first poll, so groups would otherwise render collapsed).
-  const idsKey = ids.join('\0');
-  uE(() => {
-    setOpenMap(m => {
-      let patch = null;
-      for (const id of ids) {
-        if (!(id in m)) { if (!patch) patch = {}; patch[id] = defaultOpen; }
-      }
-      return patch ? { ...m, ...patch } : m;
-    });
-  }, [idsKey]); // eslint-disable-line react-hooks/exhaustive-deps
-  uE(() => {
-    if (storageKey) {
-      try { localStorage.setItem(storageKey, JSON.stringify(openMap)); } catch (e) {}
-    }
-  }, [storageKey, openMap]);
-  const toggle = id => setOpenMap(m => ({ ...m, [id]: !m[id] }));
-  const setAll = v => setOpenMap(Object.fromEntries(ids.map(id => [id, v])));
-  return [openMap, toggle, setAll];
+// ── Cross-tab focus helpers (module scope) ──
+//
+// Stable empty payload for the `DF.ESCALATIONS` falsy case.  Hoisted rather
+// than written inline as `|| { subsections: [], ... }` because `escalations` is
+// a dependency of the focus effect below: a fresh literal per render would make
+// an effect that is meant to fire on payload ARRIVAL re-run on every paint.
+// data.js's applyKey refuses null/undefined (data.js:153) so the fallback is
+// unreachable today; hoisting keeps it stable if a change ever makes it
+// reachable.
+const ESC_EMPTY = { subsections: [], summary: { by_level: {}, by_status: {} } };
+
+// Has the escalations payload ARRIVED, as opposed to still being data.js's
+// pre-fetch seed?  Read from data.js's per-key first-success marker, which is
+// the only sound signal:
+//
+//   * Not derivable from the payload's contents — the seed and a loaded but
+//     genuinely EMPTY queue are structurally identical by design (ESCALATIONS
+//     is deliberately not in STABLE_ARRAY_KEYS, data.js:96-105).
+//   * Not derivable from object identity either.  Capturing `DF.ESCALATIONS`
+//     at module-eval time and testing `payload !== SEED` races Babel: this is
+//     a `type="text/babel"` module evaluated after DOMContentLoaded, so
+//     startPolling()'s immediate first fetch can land BEFORE the capture,
+//     freezing a real payload as the "seed" — and nothing unfreezes it while
+//     polling is paused or the endpoint is in backoff, so the tab would claim
+//     "still loading" above a fully-populated queue, indefinitely.
+//   * Not derivable from the `df-data-refresh` event, which fires after
+//     Promise.all even when the escalations fetch FAILED — that reports
+//     arrival on a failure, producing a false miss.
+//
+// The failure direction is chosen on purpose: an endpoint stuck in backoff
+// never sets the marker, so the UI keeps WAITING (and says so) rather than
+// asserting a false "no longer in the queue" — the stronger claim, on evidence
+// that cannot support it.
+function escalationsLoaded() {
+  return !!(DF.__loaded && DF.__loaded.ESCALATIONS);
 }
 
-function usePersistedState(storageKey, defaultValue) {
-  const [v, setV] = uS(() => {
-    try {
-      const raw = localStorage.getItem(storageKey);
-      return raw === null ? defaultValue : JSON.parse(raw);
-    } catch (e) { return defaultValue; }
-  });
-  uE(() => { try { localStorage.setItem(storageKey, JSON.stringify(v)); } catch (e) {} }, [storageKey, v]);
-  return [v, setV];
-}
+// ── Local helpers (a tabs.jsx-compatible copy; not exported from any namespace) ──
 
 function GroupAllToggle({ allOpen, onSetAll }) {
   return (
@@ -83,6 +108,64 @@ function sevClass(sev) {
   if (s === 'critical' || s === 'high') return 'esc-sev-high';
   if (s === 'medium') return 'esc-sev-medium';
   return 'esc-sev-low';
+}
+
+// ── Unreadable-queue-file notice ──
+//
+// Modelled on tab_memory_evals.jsx::IssuesNotice.  Expanded by default, on
+// purpose: collapsing a degraded-state notice reproduces the silent degradation
+// it exists to prevent (INV-2/INV-4, the 2658 parse_failures precedent).  Each
+// entry names its path and the parse error — a bare count tells the operator
+// something is wrong but not what.
+//
+// These records are deliberately NOT filtered by the level/status chips: a file
+// that could not be parsed has neither a `level` nor a `status`, so there is
+// nothing for matchesFilter to test, and routing them through the chips would
+// let an arbitrary default decide whether the operator is told about corruption.
+//
+// At most SKIPPED_ROW_CAP paths are listed, with an overflow line for the rest.
+// The normal case is one or two files, but a truncated write, a permission
+// fault, or a half-synced mount degrades a whole directory at once — hundreds of
+// always-expanded rows would push the actual escalation table far below the fold
+// and degrade the same operator view this notice exists to serve.  The headline
+// and the collapsed-group badge always state the TRUE total, so the cap shortens
+// the list without ever understating the loss.
+const SKIPPED_ROW_CAP = 20;
+
+function SkippedNotice({ skipped }) {
+  const rows = skipped || [];
+  if (!(rows.length > 0)) return null;
+  const shown = rows.slice(0, SKIPPED_ROW_CAP);
+  const hidden = rows.length - shown.length;
+  return (
+    <div
+      data-testid="escalation-skipped"
+      style={{
+        padding: '8px 12px',
+        marginBottom: 8,
+        border: '1px solid var(--line)',
+        borderRadius: 4,
+        background: 'var(--bg-2)',
+        color: 'var(--fg-2)',
+        fontFamily: 'var(--mono)',
+        fontSize: 11,
+      }}
+    >
+      <div style={{ color: 'var(--warn)', marginBottom: 4 }}>
+        {rows.length} queue file(s) unreadable — the counts for this queue are short by that many
+      </div>
+      {shown.map((s, i) => (
+        <div key={`${s.path}-${i}`} style={{ color: 'var(--fg-3)' }}>
+          {s.path || '—'} — {s.error || '—'}
+        </div>
+      ))}
+      {hidden > 0 && (
+        <div style={{ color: 'var(--fg-3)', marginTop: 4 }}>
+          …and {hidden} more (listing the first {SKIPPED_ROW_CAP})
+        </div>
+      )}
+    </div>
+  );
 }
 
 // ── Window slicing (trailing 7d, anchored to the payload's own generated_at
@@ -120,9 +203,10 @@ function sliceDailyByWindow(dailyObj, cutoff) {
   return out;
 }
 
-// ── EscalationStatStrip — four-tile summary (benign rate, 6h breaches,
-//    esc/done, churn), reading the ESCALATION_ANALYTICS payload already
-//    wired into DF_DATA by the analytics tab (no duplicated computation) ──
+// ── EscalationStatStrip — six-tile summary (benign rate, open in history,
+//    6h breaches, esc/done, churn, pinning), reading the ESCALATION_ANALYTICS payload
+//    already wired into DF_DATA by the analytics tab (no duplicated
+//    computation) ──
 
 function EscalationStatStrip({ analytics, projectFilter }) {
   const a = analytics || DF.ESCALATION_ANALYTICS;
@@ -136,80 +220,51 @@ function EscalationStatStrip({ analytics, projectFilter }) {
   // falls back to all rows via the slice helpers' pass-through.
   const cutoff = windowCutoffDate(a.generated_at, 7);
 
-  // (a) benign rate — workflow.flow_daily is the only per-day benign/
-  // actionable series in the payload; sum n by class across every filtered
-  // project's WINDOWED rows (cross-project rollup), also building a
-  // per-date map (summed across projects) for the trend sparkline.
-  let benignN = 0, actionableN = 0;
-  const benignByDate = {}; // date -> { benign, actionable }
-  for (const p of projects) {
-    const flowDaily = sliceRowsByWindow((p.workflow || {}).flow_daily || [], cutoff);
-    for (const row of flowDaily) {
-      const bucket = benignByDate[row.date] || (benignByDate[row.date] = { benign: 0, actionable: 0 });
-      if (row.class === 'benign') { benignN += row.n; bucket.benign += row.n; }
-      else if (row.class === 'actionable') { actionableN += row.n; bucket.actionable += row.n; }
-    }
-  }
-  const benignDenom = benignN + actionableN;
-  const benignRate = benignDenom > 0 ? benignN / benignDenom : null;
-  // Per-day benign rate, one point per date that appears in flow_daily (i.e.
-  // had at least one row that day). Windowed dates with NO flow_daily rows
-  // are OMITTED here, not zero-filled, so the sparkline is not fully
-  // window-aligned when flow_daily has gaps — it only covers dates the
-  // payload actually reported.
-  const benignSpark = Object.keys(benignByDate).sort().map(d => {
-    const { benign, actionable } = benignByDate[d];
-    const denom = benign + actionable;
-    return denom > 0 ? benign / denom : 0;
-  });
+  // (a) benign rate — every filtered project's WINDOWED workflow.flow_daily
+  // rows, split by class over ALL of them (escalation_views.js). The daily
+  // series has a point only for dates the payload reported.
+  const classSplit = windowedClassSplit(
+    projects.flatMap(p => sliceRowsByWindow((p.workflow || {}).flow_daily || [], cutoff)),
+  );
 
   // Stamped-share hint — NO per-day provenance series exists in the payload,
   // so this is an ALL-TIME aggregate from origin.sources[], weighted by each
-  // source's classified count (benign + actionable). A coarse adoption
-  // indicator, not a windowed figure.
+  // source's served classified count. A coarse adoption indicator, not a
+  // windowed figure.
   let stampedWeighted = 0, classifiedTotal = 0;
   for (const p of projects) {
     for (const s of (p.origin || {}).sources || []) {
-      const classified = (s.benign || 0) + (s.actionable || 0);
-      stampedWeighted += (s.stamped_share || 0) * classified;
-      classifiedTotal += classified;
+      stampedWeighted += (s.stamped_share || 0) * (s.classified || 0);
+      classifiedTotal += s.classified || 0;
     }
   }
   const stampedPct = classifiedTotal > 0 ? Math.round((stampedWeighted / classifiedTotal) * 100) : null;
 
-  // (b) 6h-breach — live pending queue (lifespan.open_items), NOT windowed;
-  // the payload carries no historical breach series.
+  // (b) 6h-breach — every open record, root or archive (lifespan.open_items),
+  // NOT windowed; the payload carries no historical breach series.
   let openItems = [];
   for (const p of projects) {
     openItems = openItems.concat((p.lifespan || {}).open_items || []);
   }
   const breachCount = openItems.filter(item => item.breach_6h).length;
 
-  // (c) esc-per-done — aggregate ratio sum(filings)/sum(done) over the
-  // WINDOWED rows, NOT a mean of daily ratios (undefined/biased on
-  // low-volume or done==0 days). Also builds a per-date map (summed across
-  // projects — dates can repeat across per_project entries) for the trend
-  // sparkline; re-derived from filings/done rather than the payload's
-  // per-project row.ratio, since that field isn't valid post-rollup.
-  let filingsSum = 0, doneSum = 0;
-  const epdByDate = {}; // date -> { filings, done }
-  for (const p of projects) {
-    const epd = sliceRowsByWindow((p.workflow || {}).esc_per_done_daily || [], cutoff);
-    for (const row of epd) {
-      filingsSum += row.filings || 0;
-      doneSum += row.done || 0;
-      const bucket = epdByDate[row.date] || (epdByDate[row.date] = { filings: 0, done: 0 });
-      bucket.filings += row.filings || 0;
-      bucket.done += row.done || 0;
-    }
-  }
-  const escPerDone = doneSum > 0 ? filingsSum / doneSum : null;
-  // Null ratio (done == 0 that day) is OMITTED rather than plotted as a
-  // misleading zero — same precedent as tab_escalation_analytics.jsx.
-  const epdSpark = Object.keys(epdByDate).sort()
-    .map(d => epdByDate[d])
-    .filter(b => b.done > 0)
-    .map(b => b.filings / b.done);
+  // (b2) pinning — same live open_items array, no extra payload. Truthiness,
+  // never an equality test: the backend OMITS pins_recovery when it could not
+  // compute the annotation, so `item.pins_recovery === false` would count an
+  // unclassified item as "does not pin". Unknown simply falls out of the count.
+  // That rule lives in pins_recovery.js, shared with the analytics tab's chip
+  // so the two surfaces cannot disagree, and covered by
+  // dashboard/tests/js/pins_recovery.test.mjs.
+  const { count: pinningCount, pinnedTaskCount } = pinningSummary(openItems);
+
+  // (c) esc-per-done — every filtered project's WINDOWED esc_per_done_daily
+  // rows and whether its completed-task counts were read, read once by
+  // escalation_views.js. Its filings feed the churn tile below too.
+  const escPerDone = windowedEscPerDone(projects.map(p => ({
+    project: p.project,
+    doneCountsRead: (p.workflow || {}).done_counts_read,
+    rows: sliceRowsByWindow((p.workflow || {}).esc_per_done_daily || [], cutoff),
+  })));
 
   // (d) churn-24h rate — sum(WINDOWED churn_daily)/sum(WINDOWED
   // esc_per_done_daily filings); both are keyed by filed-date
@@ -224,43 +279,54 @@ function EscalationStatStrip({ analytics, projectFilter }) {
       churnByDate[d] = (churnByDate[d] || 0) + n;
     }
   }
-  const churnRate = filingsSum > 0 ? churnSum / filingsSum : null;
+  const churnRate = escPerDone.filings > 0 ? churnSum / escPerDone.filings : null;
   // Per-day churn RATE (that day's churn / that day's filings), matching the
   // quantity the tile displays — plotting raw per-day counts here would show
   // a different quantity than the tile value and mislead when daily filing
-  // volume varies. Reuses epdByDate's per-day filings (already collected for
-  // the esc-per-done tile, same filed-date keying). Days with zero filings
-  // that day are OMITTED (undefined rate), mirroring epdSpark's done==0
-  // omission above.
+  // volume varies. Reuses the esc-per-done reading's per-day filings (same
+  // filed-date keying). Days with zero filings that day are OMITTED
+  // (undefined rate), as the esc/done spark omits a day that completed nothing.
   const churnSpark = Object.keys(churnByDate).sort()
-    .filter(d => (epdByDate[d] || {}).filings > 0)
-    .map(d => churnByDate[d] / epdByDate[d].filings);
+    .filter(d => (escPerDone.filingsByDate[d] || 0) > 0)
+    .map(d => churnByDate[d] / escPerDone.filingsByDate[d]);
 
   return (
     <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(160px, 1fr))', gap: 10, marginBottom: 10 }}>
       <C.StatTile
         label="benign rate"
-        value={benignRate != null ? `${Math.round(benignRate * 100)}%` : '—'}
+        datum={derivedDatum(classSplit.benignShare, EP_ESCALATIONS, 'no classified filings in this window')}
+        format={rate => `${Math.round(rate * 100)}%`}
         hint={stampedPct != null ? `${stampedPct}% stamped` : undefined}
-        spark={benignSpark}
+        history={classSplit.benignShareDaily}
         sparkColor={C.PALETTE.ok}
       />
       <C.StatTile
+        label="open in history"
+        datum={openInHistoryOver(DF, projectFilter)}
+      />
+      <C.StatTile
         label="6h breaches"
-        value={breachCount}
-        hint={`of ${openItems.length} pending`}
+        datum={plainDatum(breachCount, EP_ESCALATIONS)}
+        hint={`of ${openItems.length} open`}
       />
       <C.StatTile
         label="esc / done"
-        value={escPerDone != null ? escPerDone.toFixed(2) : '—'}
-        spark={epdSpark}
+        datum={derivedDatum(escPerDone.ratio, EP_ESCALATIONS, escPerDone.absentReason)}
+        format={ratio => ratio.toFixed(2)}
+        history={escPerDone.ratioDaily}
         sparkColor={C.PALETTE.accent}
       />
       <C.StatTile
         label="churn 24h"
-        value={churnRate != null ? `${Math.round(churnRate * 100)}%` : '—'}
-        spark={churnSpark}
+        datum={derivedDatum(churnRate, EP_ESCALATIONS, 'no filings in this window')}
+        format={rate => `${Math.round(rate * 100)}%`}
+        history={churnSpark}
         sparkColor={C.PALETTE.bad}
+      />
+      <C.StatTile
+        label="pinning"
+        datum={plainDatum(pinningCount, EP_ESCALATIONS)}
+        hint={`blocking ${pinnedTaskCount} task${pinnedTaskCount === 1 ? '' : 's'}`}
       />
     </div>
   );
@@ -268,8 +334,12 @@ function EscalationStatStrip({ analytics, projectFilter }) {
 
 // ── EscalationsTab ──
 
-function EscalationsTab({ projectFilter }) {
-  const escalations = DF.ESCALATIONS || { subsections: [], summary: { by_level: {}, by_status: {} } };
+function EscalationsTab({ projectFilter, focus, onFocusConsumed }) {
+  // ESC_EMPTY is hoisted to module scope; see the note at its declaration.
+  // Note it is NOT a "loaded" signal: arrival is read from data.js's
+  // first-success marker (escalationsLoaded), so falling back to this
+  // placeholder cannot be mistaken for an arrived payload.
+  const escalations = DF.ESCALATIONS || ESC_EMPTY;
 
   // Filter subsections by project when projectFilter is active.
   // Orchestrator subsections: filter by subsection label (label == project name).
@@ -329,14 +399,87 @@ function EscalationsTab({ projectFilter }) {
   // Selected row for sidebar
   const [selected, setSelected] = uS(null);
 
+  // A focus id that matched no row. Held rather than dropped: the operator
+  // clicked a link and is owed an answer either way.
+  const [focusMiss, setFocusMiss] = uS(null);
+  // A focus that matched more than one row of its queue: `{id, count}`. The
+  // lookup never elects one, so this opens nothing and says why.
+  const [focusAmbiguous, setFocusAmbiguous] = uS(null);
+
+  // Cross-tab focus handoff (from the memory-eval escalation links in
+  // tab_memory_evals.jsx, lifted through app.jsx). Resolve the `{queue, id}`
+  // focus to a row and open the existing detail sidebar with it.
+  //
+  // The focus is consumed once a DECISION is REACHABLE, never before. Keyed on
+  // `escalations` as well as `focus`: while the payload is still the pre-fetch
+  // seed the effect declines to decide, and the dep's per-poll identity change
+  // (applyKey replaces the reference) is what re-runs it — so a cold load, or an
+  // endpoint in backoff, no longer silently eats the focus.
+  //
+  // Once the payload is in, both outcomes are reported. A miss is real: the
+  // escalation may have resolved between the poll that produced the link and
+  // the click. It is still CONSUMED on a miss, because leaving it set would
+  // reopen a stale drawer on every later visit to this tab — but it is now
+  // recorded and rendered rather than dropped in silence.
+  uE(() => {
+    if (!focus) return;
+    if (!escalationsLoaded()) return;
+    const found = findEscalationRow(escalations, focus);
+    if (found.row) { setSelected(found.row); setFocusMiss(null); setFocusAmbiguous(null); }
+    else if (found.candidates.length > 1) {
+      setFocusAmbiguous({ id: focus.id, count: found.candidates.length });
+      setFocusMiss(null);
+    } else { setFocusMiss(focus.id); setFocusAmbiguous(null); }
+    if (onFocusConsumed) onFocusConsumed();
+  }, [focus, escalations]);
+
   // Global summary from top-level data
   const gs = escalations.summary || {};
-  const byLevel = gs.by_level || {};
-  const byStatus = gs.by_status || {};
+  const pendingInQueue = queuePending(DF);
 
   return (
     <div style={{ position: 'relative' }}>
       <EscalationStatStrip analytics={DF.ESCALATION_ANALYTICS} projectFilter={projectFilter} />
+
+      {/* Cross-tab focus feedback. A click that lands before the escalations
+          payload does is WAITING, not a miss, and saying "no longer in the
+          queue" while the endpoint is still in backoff would be a false
+          claim. A tie opens nothing rather than guessing. Each notice names
+          the id, so the operator can see which link they followed. */}
+      {focus && !escalationsLoaded() && (
+        <div className="badge" data-testid="esc-focus-pending" style={{ marginBottom: 8 }}>
+          waiting for the escalation queue to load — will open{' '}
+          <span className="mono">{focus.id}</span> when it arrives
+        </div>
+      )}
+      {focusMiss && (
+        <div className="badge warn" data-testid="esc-focus-miss" style={{ marginBottom: 8 }}>
+          <span className="mono">{focusMiss}</span> is not in the queue — it was
+          likely resolved between the poll that produced the link and the click
+          <button
+            type="button"
+            className="chip"
+            style={{ marginLeft: 8 }}
+            onClick={() => setFocusMiss(null)}
+          >
+            dismiss
+          </button>
+        </div>
+      )}
+      {focusAmbiguous && (
+        <div className="badge warn" data-testid="esc-focus-ambiguous" style={{ marginBottom: 8 }}>
+          <span className="mono">{focusAmbiguous.id}</span> matches {focusAmbiguous.count} rows
+          in its queue — none was opened
+          <button
+            type="button"
+            className="chip"
+            style={{ marginLeft: 8 }}
+            onClick={() => setFocusAmbiguous(null)}
+          >
+            dismiss
+          </button>
+        </div>
+      )}
 
       {/* Controls header */}
       <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 10, flexWrap: 'wrap' }}>
@@ -364,7 +507,23 @@ function EscalationsTab({ projectFilter }) {
         </button>
         {/* Summary pills */}
         <span style={{ marginLeft: 'auto', fontSize: 11, color: 'var(--fg-3)' }}>
-          {byStatus.pending || 0} pending · {byLevel[1] || 0} L1 · {byLevel[2] || 0} L2
+          <DatumReading datum={pendingInQueue} /> queue pending · <DatumReading datum={levelCount(DF, 1)} /> L1 · <DatumReading datum={levelCount(DF, 2)} /> L2
+          {/* Global, like the pips beside it: read from the unfiltered top-level
+              summary, so with a project filter active this can count files in
+              queues that are not rendered below.  Titled rather than re-derived
+              from the filtered subsections — a corruption signal that shrinks
+              when you narrow the view would understate the fleet's actual
+              degraded state, which is the failure this whole notice exists to
+              prevent.  The title states the mismatch instead of leaving the
+              operator to infer it from a count with no visible source. */}
+          {(gs.skipped_count || 0) > 0 && (
+            <span title="Across all queues, including any hidden by the project filter">
+              {' '}· {gs.skipped_count} unreadable
+            </span>
+          )}
+        </span>
+        <span style={{ fontSize: 10, color: 'var(--fg-3)' }} title="When the escalation queues were last walked">
+          {corpusAgeCaption(pendingInQueue, Date.now())}
         </span>
       </div>
 
@@ -375,7 +534,6 @@ function EscalationsTab({ projectFilter }) {
       {subsections.map(sec => {
         const secSummary = sec.summary || {};
         const secByLevel = secSummary.by_level || {};
-        const secByStatus = secSummary.by_status || {};
         const filteredRows = sortRows((sec.escalations || []).filter(row => {
           if (!matchesFilter(row)) return false;
           // Reconciliation subsections: filter by row.project (not subsection label).
@@ -385,14 +543,21 @@ function EscalationsTab({ projectFilter }) {
           return true;
         }));
 
+        // Queue files the reader could not parse.  Read unfiltered — see the
+        // SkippedNotice comment: a corrupt file has no level or status to chip-filter on.
+        const skipped = sec.skipped || [];
+
         const summary = (
           <>
-            <span className="pip" style={{ fontSize: 10 }}>{secByStatus.pending || 0} pending</span>
+            <Pip datum={subsectionQueuePending(sec, DF.__receipt)} label="queue pending" />
             {(secByLevel[1] || 0) > 0 && (
-              <span className="pip"><span className="badge warn" style={{ fontSize: 9 }}>L1 · {secByLevel[1]}</span></span>
+              <Pip datum={plainDatum(secByLevel[1], EP_ESCALATIONS)} badge="warn" format={n => `L1 · ${n}`} />
             )}
             {(secByLevel[2] || 0) > 0 && (
-              <span className="pip"><span className="badge bad" style={{ fontSize: 9 }}>L2 · {secByLevel[2]}</span></span>
+              <Pip datum={plainDatum(secByLevel[2], EP_ESCALATIONS)} badge="bad" format={n => `L2 · ${n}`} />
+            )}
+            {skipped.length > 0 && (
+              <Pip datum={plainDatum(skipped.length, EP_ESCALATIONS)} badge="bad" label="unreadable" />
             )}
             <span className="mono" style={{ color: 'var(--fg-3)', fontSize: 10 }}>{sec.kind}</span>
           </>
@@ -407,6 +572,10 @@ function EscalationsTab({ projectFilter }) {
               onToggle={() => toggle(sec.id)}
               summary={summary}
             >
+              {/* Above and outside the empty-state ternary on purpose: a group
+                  rendering "No escalations match current filters" while holding an
+                  unreadable file is precisely the looks-empty-but-isn't case. */}
+              <SkippedNotice skipped={skipped} />
               {filteredRows.length === 0 ? (
                 <div style={{ fontSize: 12, color: 'var(--fg-3)', padding: '8px 0' }}>
                   No escalations match current filters.
@@ -481,11 +650,69 @@ function EscalationsTab({ projectFilter }) {
   );
 }
 
+// ── CheckOwnerSection — who declares a failing delivered check, and where ──
+// It leads the sidebar because the owner's sites are the ones to edit; the
+// record's own task is the dependent, which is only re-pended.
+
+function CheckOwnerSection({ panel }) {
+  const owner = `T-${taskId(panel.ownerTaskId)}`;
+  return (
+    <div className="sched-drawer-section" data-testid="esc-check-owner">
+      <div style={{ fontSize: 10, color: 'var(--fg-3)', marginBottom: 4 }}>Delivered check owner</div>
+      <div data-testid="esc-check-owner-owner" style={{ fontSize: 12, color: 'var(--fg-1)', marginBottom: 6 }}>
+        Owning task: <span className="mono">{owner}</span>, the dependency that declares{' '}
+        <span className="mono">{panel.checkName}</span>
+      </div>
+      <div style={{ fontSize: 10, color: 'var(--fg-3)', marginBottom: 2 }}>Declaration sites (edit these)</div>
+      <div data-testid="esc-check-owner-metadata" style={{ fontSize: 12, color: 'var(--fg-1)' }}>
+        <span className="mono">{owner}</span> metadata.delivered_checks entry{' '}
+        <span className="mono">{panel.checkName}</span>
+      </div>
+      <div data-testid="esc-check-owner-sidecar" style={{ fontSize: 12, color: 'var(--fg-1)' }}>
+        {panel.sidecarPath ? (
+          <>
+            sidecar <span className="mono">{panel.sidecarPath}</span>{' '}
+            <span className={`badge ${panel.sidecarTone}`} style={{ fontSize: 10 }}>{panel.sidecarCaption}</span>
+          </>
+        ) : panel.sidecarCaption}
+      </div>
+      {panel.dependentTaskId && (
+        <div data-testid="esc-check-owner-dependent" style={{ fontSize: 12, color: 'var(--fg-1)', marginTop: 6 }}>
+          Blocked dependent: <span className="mono">T-{taskId(panel.dependentTaskId)}</span>, the task this record
+          is filed for. Re-pend it once the check passes on main; never edit its checks.
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── LinkedTaskProse — the linked task's description, read on demand ──
+// Task rows carry no prose; this is the Task Detail pane's taskProse read
+// (tab_tasks.jsx::TaskProse), addressed by the same task uid.
+
+function LinkedTaskProse({ uid }) {
+  const { view, value: prose } = useOnDemand('taskProse', uid);
+  switch (view) {
+    case DF_LOADER_ESC.ON_DEMAND_VIEWS.ready:
+      return prose.description ? (
+        <div style={{ fontSize: 11, color: 'var(--fg-2)', whiteSpace: 'pre-wrap', maxHeight: 120, overflow: 'auto' }}>
+          {prose.description}
+        </div>
+      ) : null;
+    case DF_LOADER_ESC.ON_DEMAND_VIEWS.loading:
+      return <div style={{ fontSize: 11, color: 'var(--fg-3)' }}>loading…</div>;
+    default:
+      return <div style={{ fontSize: 11, color: 'var(--warn)' }}>The description of this task could not be fetched.</div>;
+  }
+}
+
 // ── EscalationSidebar — read-only detail panel ──
 
 function EscalationSidebar({ row, onClose }) {
   if (!row) return null;
-  const task = row.task || null;
+  const card = taskCard(row, DF.__receipt, Date.now());
+  const task = card.task;
+  const checkOwner = checkOwnerPanel(row);
   return (
     <div className="sched-drawer" role="dialog" aria-label={`Escalation detail for ${row.id}`}>
       {/* Header */}
@@ -513,6 +740,8 @@ function EscalationSidebar({ row, onClose }) {
 
       {/* Body */}
       <div className="sched-drawer-body">
+        {checkOwner && <CheckOwnerSection panel={checkOwner} />}
+
         {/* Detail */}
         {row.detail && (
           <div className="sched-drawer-section">
@@ -558,28 +787,21 @@ function EscalationSidebar({ row, onClose }) {
         {/* Linked task */}
         <div className="sched-drawer-section">
           <div style={{ fontSize: 10, color: 'var(--fg-3)', marginBottom: 4 }}>Linked Task</div>
-          {row.task_id && row.task_unresolved ? (
-            // task_id present but could not be resolved — distinct from "no task linked"
+          {card.isHole ? (
             <div style={{ fontSize: 12, color: 'var(--fg-3)' }}>
-              Task ID <span className="mono">{row.task_id}</span> could not be resolved
-              {row.worktree && <span> (worktree: <span className="mono">{row.worktree}</span>)</span>}.
+              {row.task_id && <>Task <span className="mono">{row.task_id}</span>: </>}{card.reason}
             </div>
-          ) : task ? (
-            <div>
+          ) : (
+            <div title={card.reason || undefined}>
               <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginBottom: 4 }}>
                 <span className="mono" style={{ fontSize: 11, color: 'var(--fg-3)' }}>T-{taskId(String(task.id || ''))}</span>
                 <span className={`badge ${task.status === 'in-progress' ? 'ok' : task.status === 'blocked' ? 'bad' : ''}`}
                   style={{ fontSize: 10 }}>{task.status || '—'}</span>
+                {card.age && <span style={{ fontSize: 10, color: 'var(--fg-3)' }}>{card.age}</span>}
               </div>
               <div style={{ fontSize: 13, fontWeight: 500, color: 'var(--fg-0)', marginBottom: 4 }}>{task.title || '—'}</div>
-              {task.description && (
-                <div style={{ fontSize: 11, color: 'var(--fg-2)', whiteSpace: 'pre-wrap', maxHeight: 120, overflow: 'auto' }}>
-                  {task.description}
-                </div>
-              )}
+              <LinkedTaskProse uid={DF_LOADER_ESC.taskUid(row.project, task.id)} />
             </div>
-          ) : (
-            <div style={{ fontSize: 12, color: 'var(--fg-3)' }}>No linked task.</div>
           )}
         </div>
       </div>

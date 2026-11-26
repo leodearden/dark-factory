@@ -90,6 +90,59 @@ class TestQueryReconReportFindings:
         assert result == [systemic]
         assert state.calls == ['r1']
 
+    def test_drops_a_superseded_systemic_finding(self):
+        """task-4653: a superseded finding is a claim its own run has already
+        retired, so re-injecting it into Stage 2 would raise a known-false
+        instruction as a live flag.
+
+        Filtering HERE rather than in get_findings_for_run keeps that method's
+        raw/no-suppression contract intact — it exists so a
+        stage1_flag_suppression record can never hide a systemic_pattern
+        finding from Stage 2 (task-1966), and a supersession is a different
+        thing entirely: an explicit in-run retirement asserted by a later
+        finding, not an external suppression.
+
+        Ordering makes the filter load-bearing rather than cosmetic.
+        assemble_payload's poll loop dedups FIRST-WINS on signature/content
+        fingerprint, so an older superseded finding appearing earlier in this
+        run-scoped list would SHADOW its own newer replacement; and
+        _format_flagged truncates the TAIL at a fixed char budget, so a
+        retained-but-dead row can additionally push the live one off the end.
+        """
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _query_recon_report_findings,
+        )
+
+        superseded = {
+            'finding_id': 'f1',
+            'category': 'systemic_pattern',
+            'task_id': '452',
+            'flag_type': 'live_workflow_recurrence_counter_needed',
+            'description': 'the original claim',
+            'superseded_by': 'f2',
+        }
+        replacement = {
+            'finding_id': 'f2',
+            'category': 'systemic_pattern',
+            'task_id': '452',
+            'flag_type': 'live_workflow_recurrence_counter_needed_resolved',
+            'description': 'and now it is resolved',
+            'superseded_by': None,
+        }
+        unsuperseded = {
+            'finding_id': 'f3',
+            'category': 'systemic_pattern',
+            'task_id': '99',
+            'flag_type': 'other_pattern',
+            'description': 'unrelated live finding',
+            'superseded_by': None,
+        }
+        state = _FakeReconReportState(findings=[superseded, replacement, unsuperseded])
+
+        result = _query_recon_report_findings(state, 'r1')
+
+        assert result == [replacement, unsuperseded]
+
     def test_get_findings_for_run_exception_returns_empty_and_warns(self, caplog):
         """(c) get_findings_for_run raising -> [] + WARNING (best-effort,
         mirrors _query_stage2_flags)."""
@@ -131,27 +184,27 @@ class TestFlagContentFingerprint:
 
     def test_content_key_returns_content_fingerprint(self):
         """(a) An item with a `content` key returns
-        flag_dedup._content_fingerprint(content)."""
-        from fused_memory.reconciliation.flag_dedup import _content_fingerprint
+        flag_identity.content_fingerprint(content)."""
+        from fused_memory.reconciliation.flag_identity import content_fingerprint
         from fused_memory.reconciliation.stages.task_knowledge_sync import (
             _flag_content_fingerprint,
         )
 
         text = 'live workflow recurrence counter needed for task 452'
 
-        assert _flag_content_fingerprint({'content': text}) == _content_fingerprint(text)
+        assert _flag_content_fingerprint({'content': text}) == content_fingerprint(text)
 
     def test_description_only_key_returns_fingerprint_of_description(self):
         """(b) An item with only a `description` key (no `content`) returns
         the fingerprint of that description."""
-        from fused_memory.reconciliation.flag_dedup import _content_fingerprint
+        from fused_memory.reconciliation.flag_identity import content_fingerprint
         from fused_memory.reconciliation.stages.task_knowledge_sync import (
             _flag_content_fingerprint,
         )
 
         text = 'systemic pattern: repeated live workflow recurrence for task 452'
 
-        assert _flag_content_fingerprint({'description': text}) == _content_fingerprint(text)
+        assert _flag_content_fingerprint({'description': text}) == content_fingerprint(text)
 
     @pytest.mark.parametrize(
         'item',
@@ -214,15 +267,15 @@ class TestFlagContentFingerprint:
     def test_non_string_content_is_coerced_not_raised(self):
         """Defensive: a truthy non-string value under `content` (e.g. an int
         accidentally placed there) must not raise AttributeError out of
-        _normalize_content_description's `.split()` call — it is coerced to
+        normalize_description's `.split()` call — it is coerced to
         `str` first, mirroring compute_content_fingerprint_signature's
         `str(ftype)` coercion pattern."""
-        from fused_memory.reconciliation.flag_dedup import _content_fingerprint
+        from fused_memory.reconciliation.flag_identity import content_fingerprint
         from fused_memory.reconciliation.stages.task_knowledge_sync import (
             _flag_content_fingerprint,
         )
 
-        assert _flag_content_fingerprint({'content': 452}) == _content_fingerprint('452')
+        assert _flag_content_fingerprint({'content': 452}) == content_fingerprint('452')
 
 
 # ---------------------------------------------------------------------------
@@ -354,6 +407,35 @@ class TestAssemblePayloadReconReportChannel:
         assert 'standing_decision_id' in payload
         assert 'ENT-UUID:structural_size_conflation' in payload
         assert stage._recon_report_systemic_polled == 1
+
+    @pytest.mark.asyncio
+    async def test_a_superseded_finding_is_absent_from_the_rendered_payload(
+        self, mock_deps, watermark
+    ):
+        """task-4653: the superseded claim must not reach Stage 2's
+        combined_flags, while its live replacement does."""
+        stage = _make_configured_stage(
+            mock_deps, project_id='autopilot_video', project_root='/home/leo/src/autopilot-video'
+        )
+        superseded = self._systemic_finding()
+        superseded['description'] = 'the retired claim about task 452'
+        superseded['superseded_by'] = 'rr-finding-2'
+        replacement = self._systemic_finding(
+            flag_type='live_workflow_recurrence_counter_needed_resolved'
+        )
+        replacement['finding_id'] = 'rr-finding-2'
+        replacement['description'] = 'the live replacement claim about task 452'
+        stage._recon_report_state = _FakeReconReportState(
+            findings=[superseded, replacement]
+        )
+        stage1_report = self._stage1_report(items_flagged=[])  # Mem0 channel empty
+
+        payload = await stage.assemble_payload([], watermark, [stage1_report])
+
+        assert 'the live replacement claim about task 452' in payload
+        assert 'the retired claim about task 452' not in payload, (
+            'a superseded finding was re-injected into Stage 2 as a live flag'
+        )
 
     @pytest.mark.asyncio
     async def test_finding_already_in_stage1_report_not_double_rendered(

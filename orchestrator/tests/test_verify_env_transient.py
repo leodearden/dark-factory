@@ -35,6 +35,13 @@ from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from _xdist_crash_fixtures import (
+    XDIST_CRASH_ATTRIBUTED_FAILED_LINE,
+    XDIST_CRASH_ATTRIBUTED_FAILED_OUTPUT,
+    XDIST_FAILED_THEN_CRASHED_OUTPUT,
+    XDIST_IN_FLIGHT_NODEID,
+    XDIST_WORKER_CRASH_OUTPUT,
+)
 
 from orchestrator import verify
 from orchestrator.config import GitConfig, OrchestratorConfig
@@ -133,29 +140,64 @@ class TestEnvTransientNonMisattributionWiring:
     absent from all three collections.
     """
 
-    def test_worst_category_ranks_env_transient_above_test_failure(self):
-        """A mixed-category run resolves to env_transient, not test_failure.
+    def test_worst_category_keeps_another_legs_test_failure_over_env_transient(self):
+        """Across legs, a test red is never masked by another leg's env_transient.
 
-        This mirrors how a xdist-death run whose output contains BOTH the
-        env_transient signature and collateral FAILED lines must resolve to
-        the infra category, not the test-drift category.
+        ``_worst_category`` only ever decides between DIFFERENT legs. Task
+        #4103: a genuine test red plus a guard-3 false env_transient type leg
+        must not be held by the merge lane as transient infra (task 4843
+        inverted task 2048's original pin). Task 2048's own case is WITHIN one
+        leg: xdist-death output carrying both the env_transient signature and
+        collateral FAILED lines. ``classify_failure`` decides that one by arm
+        order, pinned in
+        test_xdist_death_with_collateral_failed_line_is_env_transient_within_the_leg.
         """
-        assert verify._worst_category(['test_failure', 'env_transient']) == 'env_transient'
+        assert verify._worst_category(['test_failure', 'env_transient']) == 'test_failure'
+
+    def test_xdist_death_with_collateral_failed_line_is_env_transient_within_the_leg(self):
+        """Task 2048's property, pinned where it lives: inside ONE pytest leg,
+        the xdist-vanished usage error beats a collateral FAILED line."""
+        output = (
+            'usage: pytest [options] [file_or_dir] [file_or_dir] [...]\n'
+            'pytest: error: unrecognized arguments: -n --dist --max-worker-restart=0\n'
+            'FAILED orchestrator/tests/test_x.py::test_y - AssertionError\n'
+        )
+        assert classify_failure(ToolKind.PYTEST, 4, output, False) == 'env_transient'
 
     def test_env_transient_skips_preexisting_break_probe(self):
         """env_transient is non-deterministic to re-probe on main (like infra_timeout)."""
         assert 'env_transient' in verify.PREEXISTING_BREAK_SKIP_CATEGORIES
 
-    def test_env_transient_not_archived(self):
-        """env_transient is infra, not human-triage-worthy — must not be archived."""
-        assert verify._should_archive_category('env_transient') is False
+    def test_env_transient_archived_for_human_triage(self):
+        """env_transient IS archived, since task 3683.
 
-    def test_env_transient_ranked_above_test_failure_in_category_priority(self):
-        """env_transient must outrank test_failure in the severity list."""
+        This test previously asserted False on "env_transient is infra, not
+        human-triage-worthy". The audit found infra and human-triage-worthy
+        are not exclusive here: the ENV_SERIAL retry is a SINGLE bounded
+        re-run (verify.py:5221-5233) that per task 3367 fires only when the
+        TEST leg failed, so a lint/type env_transient gets no retry at all —
+        and past it, workflow.py:9020's default-5-attempt window stamps
+        escalate_to_human=True / category='infra_issue' on exhaustion
+        (:9060-9067) and files a blocking level-1 escalation (:14791).
+        Archival is decided per attempt from the category alone
+        (verify.py:1902), so archive=False discarded the log on the attempt
+        that hands the incident to a human too. See
+        TestEnvTransientArchivesForHumanTriage in test_verify_categories.py.
+        """
+        assert verify._should_archive_category('env_transient') is True
+
+    def test_test_failure_ranked_above_env_transient_in_category_priority(self):
+        """test_failure must outrank env_transient in the severity list.
+
+        The list only decides between legs, and a host condition reported by
+        one leg must never mask another leg's verdict about the branch (task
+        #4103, task 4843). The within-leg xdist-death case task 2048 cared
+        about is decided by ``classify_failure``'s arm order instead.
+        """
         assert 'env_transient' in verify._CATEGORY_PRIORITY
         assert (
-            verify._CATEGORY_PRIORITY.index('env_transient')
-            < verify._CATEGORY_PRIORITY.index('test_failure')
+            verify._CATEGORY_PRIORITY.index('test_failure')
+            < verify._CATEGORY_PRIORITY.index('env_transient')
         )
 
 
@@ -187,8 +229,11 @@ class TestRunVerificationEnvRecovery:
     # structured (non-chained) render path puts base_flags before targets
     # and shlex.quote leaves the safe 'addopts=' token unquoted — distinct
     # from the deleted _force_serial_pytest's append-at-end, quoted
-    # ``addopts=''`` form.
+    # ``addopts=''`` form. It is what CheckRun.cmd persists; the spawned
+    # command additionally carries the default defect mode's
+    # ``-p _df_defect_plugin``.
     RECOVERED_TEST_COMMAND = 'uv run pytest -p no:xdist -o addopts= tests/'
+    SPAWNED_RECOVERY_COMMAND = 'uv run pytest -p no:xdist -o addopts= -p _df_defect_plugin tests/'
 
     def _make_config(self, tmp_path: Path) -> OrchestratorConfig:
         # lint/type are non-Optional str fields on OrchestratorConfig (unlike
@@ -225,9 +270,9 @@ class TestRunVerificationEnvRecovery:
             f'Expected exactly 2 pytest invocations (original + one bounded '
             f'recovery retry), got {len(pytest_invocations)}: {pytest_invocations!r}'
         )
-        assert any(c == self.RECOVERED_TEST_COMMAND for c in pytest_invocations), (
+        assert any(c == self.SPAWNED_RECOVERY_COMMAND for c in pytest_invocations), (
             f'Expected the serial_pytest()-rendered recovery command '
-            f'{self.RECOVERED_TEST_COMMAND!r} to be invoked, got {pytest_invocations!r}'
+            f'{self.SPAWNED_RECOVERY_COMMAND!r} to be invoked, got {pytest_invocations!r}'
         )
 
     @pytest.mark.asyncio
@@ -260,9 +305,9 @@ class TestRunVerificationEnvRecovery:
             f'the first-pass category untouched), got {len(pytest_invocations)}: '
             f'{pytest_invocations!r}'
         )
-        assert any(c == self.RECOVERED_TEST_COMMAND for c in pytest_invocations), (
+        assert any(c == self.SPAWNED_RECOVERY_COMMAND for c in pytest_invocations), (
             f'Expected the bounded recovery retry to invoke the '
-            f'serial_pytest()-rendered command {self.RECOVERED_TEST_COMMAND!r}, '
+            f'serial_pytest()-rendered command {self.SPAWNED_RECOVERY_COMMAND!r}, '
             f'got {pytest_invocations!r}'
         )
 
@@ -270,14 +315,14 @@ class TestRunVerificationEnvRecovery:
     async def test_env_transient_recovery_logs_addopts_clearing_note(
         self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
     ):
-        """Amendment regression (reviewer_comprehensive robustness_false_signal,
-        verify.py:637): serial_pytest's `-o addopts=` clears ALL
-        pyproject addopts, not just `-n auto` — including any marker filters
-        (e.g. `-m 'not integration'`) — so the single recovery run can
-        exercise a materially different test selection than the original.
-        At minimum this must be observable in the log so an operator
-        investigating a recovery-path result knows a broader test selection
-        may have run.
+        """The recovery WARNING shows the addopts the recovery run applies.
+
+        serial_pytest's `-o addopts=<value>` replaces the ini addopts, and a
+        blank one lets the recovery run exercise a broader test selection than
+        the original. The WARNING carries the recovered command itself, so an
+        operator investigating a recovery-path result reads which addopts it
+        ran under (task 5079; originally reviewer_comprehensive
+        robustness_false_signal).
         """
         import logging
 
@@ -297,11 +342,11 @@ class TestRunVerificationEnvRecovery:
         assert result.passed is True
         addopts_warnings = [
             r for r in caplog.records
-            if 'shared-venv transient' in r.getMessage() and 'addopts' in r.getMessage()
+            if 'shared-venv transient' in r.getMessage() and '-o addopts=' in r.getMessage()
         ]
         assert addopts_warnings, (
-            f'Expected the recovery WARNING to mention addopts/marker-filter '
-            f'clearing; got: {[r.getMessage() for r in caplog.records]}'
+            f'Expected the recovery WARNING to carry the recovered command and '
+            f'its -o addopts= value; got: {[r.getMessage() for r in caplog.records]}'
         )
 
     @pytest.mark.asyncio
@@ -632,23 +677,9 @@ class TestClassifyFailureXdistUsageErrorPytestScoped:
         assert self._classify(output, rc=4, timed_out=False) == 'env_transient'
 
 
-# task 2365: bare pytest-xdist worker-crash signature. Grounded in
-# config.yaml's task-2361 comment (under host CPU oversubscription a starved
-# xdist worker crosses the per-test wall-clock ceiling, gets os._exit()'d by
-# pytest-timeout's thread method, and --max-worker-restart=0 turns that into
-# a false-failing per-test "node down" on whatever test happens to be
-# running) and test_cli.py's grounded wording:
-# ``[gwN] node down: Not properly terminated``. NO ^E  /^FAILED /failed-summary
-# lines — a hard os._exit() worker kill produces no assertion traceback.
-_XDIST_WORKER_CRASH_OUTPUT = (
-    'orchestrator/tests/test_config.py ....\n'
-    '[gw3] node down: Not properly terminated\n'
-    "worker gw3 crashed while running 'orchestrator/tests/test_config.py::TestFoo::test_bar'\n"
-)
-
 # esc-2971-13 (steward-verified): the installed pytest-xdist actually quotes
 # the worker id too — ``worker 'gw24' crashed while running '<nodeid>'`` —
-# not just the trailing nodeid as _XDIST_WORKER_CRASH_OUTPUT above models.
+# not just the trailing nodeid as XDIST_WORKER_CRASH_OUTPUT models.
 # This models the FULL real-world combined output, where the node-down line
 # and the quoted worker-crash line appear together. On its own it does NOT
 # prove quote-tolerance: the ``[gwNN] node down`` line here already matches
@@ -666,73 +697,171 @@ _XDIST_WORKER_CRASH_QUOTED_WORKER_ID_OUTPUT = (
 # FAILED line from the dead worker's run) — the conservative discriminator
 # must treat this as a real failure and NOT reclassify it.
 _XDIST_CRASH_WITH_REAL_FAILURE_OUTPUT = (
-    _XDIST_WORKER_CRASH_OUTPUT
+    XDIST_WORKER_CRASH_OUTPUT
     + 'E   AssertionError: expected 3, got 4\n'
     + 'FAILED orchestrator/tests/test_x.py::test_real - AssertionError\n'
     + '========== 1 failed, 2 passed in 5.00s ==========\n'
 )
 
-# Same crash signature, but co-occurring with the ENUMERATED known load-flake
-# failure (esc-2496-3): under host CPU oversubscription a bare second-worker
-# hard-crash ([gwN] node down) can co-occur with the PGID-liveness race in
-# test_cli.py::test_verify_merge_cancel_end_to_end, which emits a
-# genuine-looking FAILED line for that one known-flaky test. The allow-listed
-# FAILED line — and its E-traceback / failure summary — are attributable to
-# the known flake, not a real regression, so this must still reclassify as a
-# bare crash.
-_XDIST_CRASH_WITH_KNOWN_LOAD_FLAKE_OUTPUT = (
-    _XDIST_WORKER_CRASH_OUTPUT
+# Same crash signature, co-occurring with a FAILED line for
+# test_cli.py::test_verify_merge_cancel_end_to_end — the one test a retired
+# allow-list (esc-2496-3) used to exempt as a known load flake. No test is
+# exempt any more, so this is a real failure like any other.
+_XDIST_CRASH_WITH_FORMERLY_EXEMPT_TEST_FAILURE_OUTPUT = (
+    XDIST_WORKER_CRASH_OUTPUT
     + 'E   AssertionError: expected process group to be alive\n'
     + 'FAILED orchestrator/tests/test_cli.py::test_verify_merge_cancel_end_to_end - '
     'AssertionError: expected process group to be alive\n'
     + '========== 1 failed, 2 passed in 5.00s ==========\n'
 )
 
-# Fixture (a) PLUS a genuine, non-allow-listed FAILED line — the strictness
-# guard: a real in-scope failure co-occurring with the known flake must still
-# route to the debugger, never blanket-discounted just because a
-# known-flake FAILED line is also present.
-_XDIST_CRASH_KNOWN_FLAKE_PLUS_GENUINE_OUTPUT = (
-    _XDIST_CRASH_WITH_KNOWN_LOAD_FLAKE_OUTPUT
-    + 'E   AssertionError: expected 3, got 4\n'
-    + 'FAILED orchestrator/tests/test_scheduler.py::test_dispatch_order - AssertionError\n'
-    + '========== 2 failed, 2 passed in 5.00s ==========\n'
-)
-
 # Crash signature + a FAILED line with no extractable pytest node-id (no
-# ``.py::`` substring — e.g. a doctest target). "No extractable node-id"
-# must be treated the same as "not on the allow-list": False.
+# ``.py::`` substring — e.g. a doctest target). The veto keys on the FAILED
+# line itself, never on a parseable node-id.
 _XDIST_CRASH_WITH_UNPARSEABLE_FAILED_NODEID_OUTPUT = (
-    _XDIST_WORKER_CRASH_OUTPUT
-    + 'E   AssertionError: doctest output mismatch\n'
+    XDIST_WORKER_CRASH_OUTPUT
     + 'FAILED some_doctest.txt::x\n'
-    + '========== 1 failed, 2 passed in 5.00s ==========\n'
 )
 
-# Fixture (a) PLUS a genuine ERROR (fixture/setup) failure for a DIFFERENT
-# test. An ERROR failure surface produces no FAILED line of its own, so the
-# per-FAILED-line allow-list check alone would never see it — the veto must
-# independently check for a co-occurring ERROR node-id.
-_XDIST_CRASH_KNOWN_FLAKE_PLUS_ERROR_NODEID_OUTPUT = (
-    _XDIST_CRASH_WITH_KNOWN_LOAD_FLAKE_OUTPUT
+
+# task 4066: a TRIMMED, VERBATIM transcription of the real captured verify log
+# data/verify-logs/2829/attempt-1.fused-memory.test-20260720T142419_980341Z.log
+# (log lines 84-87, 106-107 and 144-155). That run had 8 GENUINE failures, yet
+# _is_bare_xdist_worker_crash returned True on it: the xdist worker crashes
+# aborted the session through an INTERNALERROR in xdist's own loadscope
+# scheduler, so pytest never printed the per-test ``FAILED`` short-summary
+# block NOR the decorated ``=== N failed ===`` stats line — leaving a marker
+# profile of ZERO ``^FAILED `` lines, ZERO ``^E   `` lines, ZERO ``^ERROR ``
+# lines and 47 ``^INTERNALERROR>`` lines, with an UNDECORATED final tally.
+#
+# Transcribed inline rather than checked in as a log asset: data/ is untracked
+# runtime state (absent from task worktrees entirely), and this module's
+# established _XDIST_*_OUTPUT convention keeps the marker profile visible at
+# the assertion site — which matters here, because the point of the fixture is
+# what is ABSENT from it.
+_XDIST_CRASH_REAL_LOG_2829_OUTPUT = (
+    '...[gw14] node down: Not properly terminated\n'
+    'F[gw24] node down: Not properly terminated\n'
+    'F.[gw2] node down: Not properly terminated\n'
+    'F...F................................................................... [ 73%]\n'
+    '........................INTERNALERROR> Traceback (most recent call last):\n'
+    'INTERNALERROR>   File "/home/leo/src/dark-factory/.worktrees/_merge-337571ee/.venv/lib/python3.13/site-packages/_pytest/main.py", line 318, in wrap_session\n'
+    'INTERNALERROR>   File "/home/leo/src/dark-factory/.worktrees/_merge-337571ee/.venv/lib/python3.13/site-packages/xdist/scheduler/loadscope.py", line 354, in schedule\n'
+    'INTERNALERROR>     self._reschedule(node)\n'
+    'INTERNALERROR>     ~~~~~~~~~~~~~~~~^^^^^^\n'
+    'INTERNALERROR>   File "/home/leo/src/dark-factory/.worktrees/_merge-337571ee/.venv/lib/python3.13/site-packages/xdist/scheduler/loadscope.py", line 336, in _reschedule\n'
+    'INTERNALERROR>     self._assign_work_unit(node)\n'
+    'INTERNALERROR>     ~~~~~~~~~~~~~~~~~~~~~~^^^^^^\n'
+    'INTERNALERROR>   File "/home/leo/src/dark-factory/.worktrees/_merge-337571ee/.venv/lib/python3.13/site-packages/xdist/scheduler/loadscope.py", line 275, in _assign_work_unit\n'
+    'INTERNALERROR>     worker_collection = self.registered_collections[node]\n'
+    'INTERNALERROR>                         ~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^\n'
+    'INTERNALERROR> KeyError: <WorkerController gw35>\n'
+    '\n'
+    '8 failed, 6971 passed, 216 warnings in 131.42s (0:02:11)\n'
+)
+
+# task 4066, ISOLATING fixture: crash signature + INTERNALERROR ONLY. No tally
+# line of EITHER form, no FAILED line, no ``E   `` line — so the summary-regex
+# widening cannot green this and only the INTERNALERROR veto in the
+# no-FAILED-lines fallback can. The FAILED-lines branch has vetoed on this same
+# surface since task 3514 (see _XDIST_CRASH_KNOWN_FLAKE_PLUS_INTERNALERROR_OUTPUT
+# above, its direct analogue); the no-FAILED-lines fallback had not, and that
+# asymmetry is the defect.
+_XDIST_CRASH_NO_FAILED_PLUS_INTERNALERROR_OUTPUT = (
+    XDIST_WORKER_CRASH_OUTPUT
+    + 'INTERNALERROR> Traceback (most recent call last):\n'
+    + 'INTERNALERROR> KeyError: <WorkerController gw35>\n'
+)
+
+# task 4066, ISOLATING fixture: crash signature + an ERROR (fixture/setup)
+# short-summary line ONLY. Same isolation discipline as above — no tally, no
+# FAILED, no ``E   `` line.
+_XDIST_CRASH_NO_FAILED_PLUS_ERROR_NODEID_OUTPUT = (
+    XDIST_WORKER_CRASH_OUTPUT
     + 'ERROR orchestrator/tests/test_other.py::test_needs_fixture - '
     'Exception: fixture setup failed\n'
 )
 
-# Fixture (a) PLUS a genuine whole-module collection ERROR (bare file, no
-# ``::``, no FAILED line) — same strictness guard as above, bare-file form.
-_XDIST_CRASH_KNOWN_FLAKE_PLUS_COLLECTION_ERROR_OUTPUT = (
-    _XDIST_CRASH_WITH_KNOWN_LOAD_FLAKE_OUTPUT
+# task 4066, ISOLATING fixture: crash signature + a whole-module collection
+# ERROR (bare file, no ``::``) ONLY. Same isolation discipline as above.
+_XDIST_CRASH_NO_FAILED_PLUS_COLLECTION_ERROR_OUTPUT = (
+    XDIST_WORKER_CRASH_OUTPUT
     + "ERROR orchestrator/tests/test_broken.py - ImportError: cannot import name 'foo'\n"
 )
 
-# Fixture (a) PLUS a genuine INTERNALERROR (pytest plugin/internal crash) —
-# same strictness guard, no FAILED line of its own.
-_XDIST_CRASH_KNOWN_FLAKE_PLUS_INTERNALERROR_OUTPUT = (
-    _XDIST_CRASH_WITH_KNOWN_LOAD_FLAKE_OUTPUT
-    + 'INTERNALERROR> Traceback (most recent call last):\n'
-    + 'INTERNALERROR> RuntimeError: plugin crashed\n'
+# task 4066, ISOLATING fixture: crash signature + an UNDECORATED tally line
+# ONLY — no INTERNALERROR, no ``ERROR``, no ``FAILED``, no ``E   `` line, so
+# none of the vetoes added alongside it can green this and only the
+# failure-summary widening can. Shape grounded in `pytest -q`, whose terminal
+# reporter writes the stats line with no ``=`` separator (verified by running
+# it: ``1 failed, 1 passed in 0.02s``); verify-log 2829's INTERNALERROR abort
+# produces the same undecorated shape.
+_XDIST_CRASH_NO_FAILED_PLUS_UNDECORATED_SUMMARY_OUTPUT = (
+    XDIST_WORKER_CRASH_OUTPUT
+    + '8 failed, 6971 passed, 216 warnings in 131.42s (0:02:11)\n'
 )
+
+# task 4066 amendment: the CRASH-INDUCED internal error — an INTERNALERROR
+# whose frames are all xdist's own scheduler, raised BY the node-down handling
+# under --max-worker-restart=0 rather than by any test. Zero genuine failures:
+# no tally of either form, no FAILED line, no ``E   `` line. This is the case
+# the fallback's INTERNALERROR veto costs us (it returns False, routing to the
+# debugger rather than the bounded infra-retry); the fixture exists so that
+# cost is pinned as a decision rather than discovered as a surprise. Frames
+# transcribed from the same verify-log 2829 tail as
+# _XDIST_CRASH_REAL_LOG_2829_OUTPUT above, with the real run's failures
+# removed — which is precisely what makes it the isolating counterpart.
+_XDIST_CRASH_INDUCED_LOADSCOPE_INTERNALERROR_OUTPUT = (
+    XDIST_WORKER_CRASH_OUTPUT
+    + 'INTERNALERROR> Traceback (most recent call last):\n'
+    + 'INTERNALERROR>   File ".../xdist/scheduler/loadscope.py", line 336, in _reschedule\n'
+    + 'INTERNALERROR>     self._assign_work_unit(node)\n'
+    + 'INTERNALERROR>   File ".../xdist/scheduler/loadscope.py", line 275, in _assign_work_unit\n'
+    + 'INTERNALERROR>     worker_collection = self.registered_collections[node]\n'
+    + 'INTERNALERROR> KeyError: <WorkerController gw35>\n'
+)
+
+
+# task 5082, facet 1 STRICTNESS guard: the crash-attributed FAILED line PLUS a
+# genuine, independently-failing test. Widening the acceptance predicate must
+# never become a licence to discount every FAILED line just because a worker
+# died — the "never mask a real failure" norm that motivates every veto in
+# _is_bare_xdist_worker_crash, and that task 4066 billed a concrete incident
+# for (8 genuine failures silently reclassified as infra).
+_XDIST_CRASH_ATTRIBUTED_PLUS_GENUINE_OUTPUT = (
+    XDIST_CRASH_ATTRIBUTED_FAILED_OUTPUT
+    + 'E   AssertionError: expected 3, got 4\n'
+    + 'FAILED orchestrator/tests/test_x.py::test_real - AssertionError\n'
+)
+
+# task 5082, facet 1: the crash-attributed FAILED line PLUS an INTERNALERROR.
+# The task-4066 INTERNALERROR veto must keep dominating the NEW acceptance
+# clause — an INTERNALERROR produces no FAILED line of its own, so discounting
+# the crash-attributed FAILED line must never discount it too.
+_XDIST_CRASH_ATTRIBUTED_PLUS_INTERNALERROR_OUTPUT = (
+    XDIST_CRASH_ATTRIBUTED_FAILED_OUTPUT
+    + 'INTERNALERROR> Traceback (most recent call last):\n'
+    + 'INTERNALERROR> KeyError: <WorkerController gw35>\n'
+)
+
+# task 5082, facet 1: a worker death with NO ``crashed while running`` notice —
+# the shape a run without a FAILURES body (e.g. ``--tb=no``) leaves behind —
+# plus a FAILED line for the test that was in flight. Nothing attributes that
+# line to the crash, so it must be treated as the verdict it claims to be.
+_XDIST_FAILED_LINE_WITHOUT_CRASH_NOTICE_OUTPUT = (
+    'orchestrator/tests/test_config.py ....\n'
+    '[gw3] node down: Not properly terminated\n'
+    + XDIST_CRASH_ATTRIBUTED_FAILED_LINE
+)
+
+
+# The crash notice XDIST_WORKER_CRASH_OUTPUT carries for its in-flight test.
+_IN_FLIGHT_CRASH_NOTICE = f"crashed while running '{XDIST_IN_FLIGHT_NODEID}'"
+
+
+def _failed_lines(output: str) -> list[str]:
+    """The ``FAILED`` short-summary lines of a fixture, read off its text."""
+    return [line for line in output.splitlines() if line.startswith('FAILED ')]
 
 
 class TestBareXdistWorkerCrashDetector:
@@ -743,7 +872,7 @@ class TestBareXdistWorkerCrashDetector:
 
     def test_bare_worker_crash_is_true(self):
         """A bare node-down/worker-crash signature with no real failure marker -> True."""
-        assert verify._is_bare_xdist_worker_crash(_XDIST_WORKER_CRASH_OUTPUT) is True
+        assert verify._is_bare_xdist_worker_crash(XDIST_WORKER_CRASH_OUTPUT) is True
 
     def test_bare_worker_crash_with_quoted_worker_id_is_true(self):
         """esc-2971-13: the real pytest-xdist quoted form -- ``worker 'gwNN'
@@ -798,75 +927,365 @@ class TestBareXdistWorkerCrashDetector:
         )
         assert verify._is_bare_xdist_worker_crash(output) is False
 
-    def test_crash_with_known_load_flake_failed_is_true(self):
-        """Crash signature + ONLY the enumerated known-load-flake FAILED line -> True.
+    def test_crash_with_formerly_exempt_test_failure_is_false(self):
+        """Crash signature + a FAILED line for the once-allow-listed test -> False.
 
-        esc-2496-3: a bare second-worker hard-crash co-occurring with the
-        known PGID-liveness race in
-        test_cli.py::test_verify_merge_cancel_end_to_end must still
-        reclassify as transient infra so the bounded retry fires instead of
-        the debugger.
+        test_cli.py::test_verify_merge_cancel_end_to_end was exempted as a
+        known load flake (esc-2496-3) until the exemption outlived its fix
+        (task 2733). A failure of that test beside a crash is a real failure:
+        it must reach the debugger, not the bounded infra retry.
         """
-        assert verify._is_bare_xdist_worker_crash(_XDIST_CRASH_WITH_KNOWN_LOAD_FLAKE_OUTPUT) is True
-
-    def test_known_flake_plus_genuine_failure_is_false(self):
-        """Known-flake FAILED line PLUS a genuine, non-allow-listed FAILED line -> False.
-
-        Strictness guard: a real in-scope failure must still route to the
-        debugger even when a known load-flake FAILED line is also present —
-        never blanket-discount every FAILED line just because the crash
-        signature and one known flake co-occur.
-        """
-        result = verify._is_bare_xdist_worker_crash(_XDIST_CRASH_KNOWN_FLAKE_PLUS_GENUINE_OUTPUT)
+        result = verify._is_bare_xdist_worker_crash(
+            _XDIST_CRASH_WITH_FORMERLY_EXEMPT_TEST_FAILURE_OUTPUT
+        )
         assert result is False
 
-    def test_crash_with_unparseable_failed_nodeid_is_false(self):
-        """A FAILED line with no extractable ``.py::`` node-id -> False.
+    def test_crash_with_lone_unparseable_failed_line_is_false(self):
+        """A FAILED line is a veto on its own, node-id or no node-id -> False.
 
-        "No extractable node-id" must be treated the same as "not on the
-        allow-list" — never assume an unparseable FAILED line is a known
-        flake just because the crash signature is present.
+        The only fixture whose sole failure surface is the FAILED line (no
+        ``E   `` traceback, no summary), so it is what pins the FAILED-line
+        term of the veto set.
         """
         result = verify._is_bare_xdist_worker_crash(
             _XDIST_CRASH_WITH_UNPARSEABLE_FAILED_NODEID_OUTPUT
         )
         assert result is False
 
-    def test_known_flake_plus_error_nodeid_is_false(self):
-        """Known-flake FAILED line PLUS a genuine ERROR (fixture/setup) failure
-        for a different test -> False.
+    def test_real_captured_log_2829_with_internalerror_is_false(self):
+        """task 4066: the REAL captured verify-log 2829 output -> False.
 
-        An ERROR failure surface produces no FAILED line of its own, so the
-        per-FAILED-line allow-list check alone would never see it. Before
-        the ERROR/INTERNALERROR veto, this output would have returned True
-        (the lone FAILED line is the allow-listed known flake), silently
-        masking the genuine ERROR.
+        Provenance: data/verify-logs/2829/attempt-1.fused-memory.test-
+        20260720T142419_980341Z.log — a real run with 8 GENUINE failures,
+        transcribed inline here because data/ is untracked runtime state and
+        so cannot be referenced as a checked-in asset.
+
+        The asymmetry this closes: _is_bare_xdist_worker_crash's FAILED-lines
+        branch already vetoes on INTERNALERROR / ERROR-nodeid / ERROR-file,
+        but its no-FAILED-lines fallback did not. Because the
+        INTERNALERROR aborted the session, pytest printed NO ``FAILED`` short
+        summary and NO decorated ``=== N failed ===`` stats line, so BOTH of
+        the fallback's two markers missed and a run carrying 8 real failures
+        was reclassified as transient infra and silently retried.
+
+        The four marker assertions pin exactly WHY the pre-fix code returned
+        True, so a later edit to the transcription (or to a regex) that
+        changes the shape fails loudly instead of silently weakening this
+        test into a tautology.
+        """
+        output = _XDIST_CRASH_REAL_LOG_2829_OUTPUT
+        assert verify._XDIST_WORKER_CRASH_RE.search(output) is not None
+        assert verify._PYTEST_FAILED_LINE_RE.findall(output) == []
+        assert verify._PYTEST_TRACEBACK_E_RE.findall(output) == []
+        assert len(verify._PYTEST_INTERNALERROR_RE.findall(output)) > 0
+
+        assert verify._is_bare_xdist_worker_crash(output) is False
+
+    def test_no_failed_lines_plus_internalerror_is_false(self):
+        """task 4066: crash signature + INTERNALERROR and NO FAILED line -> False.
+
+        _is_bare_xdist_worker_crash's FAILED-lines branch has vetoed on
+        ``INTERNALERROR>`` since task 3514; its no-FAILED-lines fallback
+        did not, so an output carrying this surface and
+        no FAILED line was reclassified as transient infra. An INTERNALERROR
+        produces no FAILED line of its own, which is precisely why it lands
+        in THIS branch — the least defensible place to omit the veto.
+
+        Isolating by construction: no tally line of either form, so the
+        failure-summary regex widening cannot green this test.
         """
         result = verify._is_bare_xdist_worker_crash(
-            _XDIST_CRASH_KNOWN_FLAKE_PLUS_ERROR_NODEID_OUTPUT
+            _XDIST_CRASH_NO_FAILED_PLUS_INTERNALERROR_OUTPUT
         )
         assert result is False
 
-    def test_known_flake_plus_collection_error_is_false(self):
-        """Known-flake FAILED line PLUS a genuine whole-module collection ERROR
-        (bare file, no ``::``) -> False. Same gap as the ERROR-node-id case
-        above, for the bare-file collection-failure form."""
-        result = verify._is_bare_xdist_worker_crash(
-            _XDIST_CRASH_KNOWN_FLAKE_PLUS_COLLECTION_ERROR_OUTPUT
-        )
-        assert result is False
+    def test_no_failed_lines_plus_error_nodeid_is_false(self):
+        """task 4066: crash signature + an ERROR (fixture/setup) line and NO
+        FAILED line -> False.
 
-    def test_known_flake_plus_internalerror_is_false(self):
-        """Known-flake FAILED line PLUS a genuine INTERNALERROR -> False.
+        Same asymmetry as above for the ``ERROR <nodeid>`` surface: vetoed in
+        _is_bare_xdist_worker_crash's FAILED-lines branch, absent from its
+        no-FAILED-lines fallback. A fixture/setup ERROR produces no FAILED
+        line of its own, so this branch is where it is actually seen.
 
-        A pytest plugin/internal crash produces no FAILED line of its own
-        either, so it needs the same independent veto as the ERROR cases
-        above.
+        Isolating by construction: no tally line of either form.
         """
         result = verify._is_bare_xdist_worker_crash(
-            _XDIST_CRASH_KNOWN_FLAKE_PLUS_INTERNALERROR_OUTPUT
+            _XDIST_CRASH_NO_FAILED_PLUS_ERROR_NODEID_OUTPUT
         )
         assert result is False
+
+    def test_no_failed_lines_plus_collection_error_is_false(self):
+        """task 4066: crash signature + a whole-module collection ERROR (bare
+        file, no ``::``) and NO FAILED line -> False.
+
+        Same asymmetry as the two cases above, for the ``ERROR <file.py>``
+        collection-failure surface, vetoed in _is_bare_xdist_worker_crash's
+        FAILED-lines branch only. A collection failure produces no FAILED
+        line of its own.
+
+        Isolating by construction: no tally line of either form.
+        """
+        result = verify._is_bare_xdist_worker_crash(
+            _XDIST_CRASH_NO_FAILED_PLUS_COLLECTION_ERROR_OUTPUT
+        )
+        assert result is False
+
+    def test_no_failed_lines_plus_undecorated_summary_is_false(self):
+        """task 4066: crash signature + an UNDECORATED ``N failed, ...`` tally
+        and NO FAILED line -> False.
+
+        Defense-in-depth, and honestly so: with the INTERNALERROR veto in
+        place the real verify-log 2829 shape is already caught by that veto,
+        so this fixture is not what rescues the motivating case. Its value is
+        that it proves the failure-summary marker vetoes INDEPENDENTLY — if a
+        future refactor drops or re-scopes the INTERNALERROR veto (exactly the
+        drift that caused task 4066 in the first place), the 2829 shape is
+        still caught here.
+
+        The shape is not hypothetical: `pytest -q` writes the stats line with
+        no ``=`` separator (verified by running it: ``1 failed, 1 passed in
+        0.02s``), which is a genuinely reachable undecorated tally with no
+        INTERNALERROR anywhere in the output.
+
+        Isolating by construction: no INTERNALERROR / ERROR / FAILED / ``E``
+        line, so only the failure-summary regex widening can green this.
+        """
+        result = verify._is_bare_xdist_worker_crash(
+            _XDIST_CRASH_NO_FAILED_PLUS_UNDECORATED_SUMMARY_OUTPUT
+        )
+        assert result is False
+
+    def test_crash_induced_loadscope_internalerror_is_false_by_design(self):
+        """task 4066 amendment: a crash-INDUCED loadscope INTERNALERROR with
+        ZERO genuine failures -> False, deliberately.
+
+        This is the acknowledged cost of the fallback's INTERNALERROR veto,
+        pinned so it reads as a decision rather than an oversight. Under
+        ``--max-worker-restart=0`` a node-down can trip xdist's own scheduler
+        (``xdist/scheduler/loadscope.py … KeyError: <WorkerController gwNN>``)
+        — an artefact of the crash handling, attributable to no test. So this
+        output IS a bare worker crash by intent, yet the veto returns False
+        and routes it to the debugger instead of the bounded infra-retry.
+
+        Why the veto is nevertheless kept un-narrowed: verify-log 2829's own
+        INTERNALERROR is scheduler-origin too (compare the frames here with
+        _XDIST_CRASH_REAL_LOG_2829_OUTPUT — identical modulo the removed
+        failures), so excluding scheduler-origin frames would leave the
+        motivating 8-real-failures case resting on the failure-summary marker
+        alone, restoring the single-point-of-failure that billed for this bug.
+        The failure direction is also the safe one: an infra crash sent to the
+        debugger is loud and self-correcting, whereas the bug being fixed sent
+        8 real failures to a silent retry.
+
+        If a future change decides this cost is too high, THIS test is what it
+        must consciously flip — see the second 'Accepted tradeoff' paragraph
+        of _is_bare_xdist_worker_crash's docstring.
+        """
+        output = _XDIST_CRASH_INDUCED_LOADSCOPE_INTERNALERROR_OUTPUT
+        # Pin the isolation: this is a crash + INTERNALERROR and nothing else,
+        # so the verdict below is attributable to the INTERNALERROR veto alone.
+        assert verify._XDIST_WORKER_CRASH_RE.search(output) is not None
+        assert verify._PYTEST_FAILED_LINE_RE.findall(output) == []
+        assert verify._PYTEST_TRACEBACK_E_RE.findall(output) == []
+        assert verify._PYTEST_FAILURE_SUMMARY_RE.search(output) is None
+
+        assert verify._is_bare_xdist_worker_crash(output) is False
+
+    def test_crash_attributed_failed_line_is_true(self):
+        """task 5082: a FAILED line naming the CRASHED WORKER'S OWN in-flight
+        test is an xdist artefact, not a verdict -> True.
+
+        The esc-4292-3 shape. `xdist/dsession.py::handle_crashitem` synthesizes
+        the report itself with ``outcome="failed"``, ``when="???"`` and a
+        longrepr that is the crash message rather than a traceback; pytest then
+        prints an ordinary-looking FAILED line for it. Before this widening
+        that fabricated line defeated the discriminator and routed the run to
+        the DEBUGGER to chase a test that never actually failed (and passes in
+        isolation), instead of to the bounded infra retry.
+
+        The marker profile is pinned on the fixture text first so the verdict
+        is attributable: the crash notice and the ONLY FAILED line name the
+        same test, and no INTERNALERROR / ERROR surface is present to veto.
+        """
+        output = XDIST_CRASH_ATTRIBUTED_FAILED_OUTPUT
+        assert _failed_lines(output) == [f'FAILED {XDIST_IN_FLIGHT_NODEID}']
+        assert _IN_FLIGHT_CRASH_NOTICE in output
+        assert 'INTERNALERROR' not in output
+        assert not any(line.startswith('ERROR ') for line in output.splitlines())
+
+        assert verify._is_bare_xdist_worker_crash(output) is True
+
+    def test_crash_attributed_failed_plus_unrelated_failed_is_false(self):
+        """Crash-attributed FAILED line PLUS a genuine independent failure -> False.
+
+        Strictness guard, the same one _XDIST_CRASH_KNOWN_FLAKE_PLUS_GENUINE_OUTPUT
+        enforces for the allow-list clause: a real in-scope failure must still
+        route to the debugger. Widening the acceptance predicate is never a
+        licence to discount every FAILED line just because a worker died —
+        task 4066 bills a concrete incident for that direction of error.
+        """
+        output = _XDIST_CRASH_ATTRIBUTED_PLUS_GENUINE_OUTPUT
+        # Pin that BOTH failed lines are present and that no crash notice names
+        # the second, so a False verdict here can only come from that one.
+        assert len(_failed_lines(output)) == 2
+        assert "crashed while running 'orchestrator/tests/test_x.py::test_real'" not in output
+
+        assert verify._is_bare_xdist_worker_crash(output) is False
+
+    def test_crash_attributed_failed_plus_internalerror_is_false(self):
+        """Crash-attributed FAILED line PLUS an INTERNALERROR -> False.
+
+        The task-4066 veto must keep DOMINATING the new acceptance clause. An
+        INTERNALERROR produces no FAILED line of its own, so the per-FAILED-line
+        check would never see it — which is exactly why the veto sits above the
+        per-line loop and must stay there untouched.
+        """
+        output = _XDIST_CRASH_ATTRIBUTED_PLUS_INTERNALERROR_OUTPUT
+        # Isolate: the only FAILED line IS the crash-attributed one, so without
+        # the veto the widened predicate alone would green this.
+        assert _failed_lines(output) == _failed_lines(XDIST_CRASH_ATTRIBUTED_FAILED_OUTPUT)
+        assert 'INTERNALERROR>' in output
+
+        assert verify._is_bare_xdist_worker_crash(output) is False
+
+    def test_crashed_test_that_had_already_failed_is_false(self):
+        """The crashed worker's in-flight test on TWO FAILED lines -> False.
+
+        It failed in its call phase and THEN its worker died in teardown, so
+        xdist forwarded the genuine report before adding its synthesized one.
+        `handle_crashitem` synthesizes at most one report per node-id, so the
+        second line is a real verdict and must reach the debugger: a crash
+        notice naming a test is no licence to discount every line naming it.
+        """
+        output = XDIST_FAILED_THEN_CRASHED_OUTPUT
+        # Both FAILED lines name the crash-attributed test, so a False verdict
+        # can only come from the one-artefact-per-node-id rule.
+        assert _failed_lines(output) == [
+            f'FAILED {XDIST_IN_FLIGHT_NODEID} - AssertionError',
+            f'FAILED {XDIST_IN_FLIGHT_NODEID}',
+        ]
+        assert _IN_FLIGHT_CRASH_NOTICE in output
+
+        assert verify._is_bare_xdist_worker_crash(output) is False
+
+    def test_failed_line_without_a_crash_notice_is_false(self):
+        """A worker died, but no notice names the test it was running -> False.
+
+        Attribution is read only from xdist's ``crashed while running`` notice,
+        never guessed from the crash signature alone, so a FAILED line that no
+        notice names stays the verdict it claims to be.
+        """
+        output = _XDIST_FAILED_LINE_WITHOUT_CRASH_NOTICE_OUTPUT
+        assert 'node down: Not properly terminated' in output
+        assert 'crashed while running' not in output
+        assert _failed_lines(output) == [f'FAILED {XDIST_IN_FLIGHT_NODEID}']
+
+        assert verify._is_bare_xdist_worker_crash(output) is False
+
+
+class TestPytestFailureSummaryRegex:
+    """task 4066: _PYTEST_FAILURE_SUMMARY_RE must match pytest's UNDECORATED
+    tally line as well as the decorated one.
+
+    pytest prints the stats line without ``=`` bars in two real, observed
+    situations: when an ``INTERNALERROR`` aborts the session (verify-log 2829:
+    ``8 failed, 6971 passed, 216 warnings in 131.42s (0:02:11)``), and under
+    ``-q`` (``1 failed, 1 passed in 0.02s``). The original
+    ``^=+ \\d+ failed.*=+$`` matched neither, which is half of why a run with
+    8 genuine failures reclassified as transient infra.
+
+    The regex has exactly two consumers, and both benefit: the
+    no-FAILED-lines fallback in _is_bare_xdist_worker_crash (where a wider
+    match strictly INCREASES strictness — it can only flip True -> False) and
+    _extract_cause_hint's pattern-ladder rung 3.
+    """
+
+    # Decorated forms already matched before task 4066 — these are the
+    # preservation guards for the widening, not new coverage.
+    DECORATED_SAMPLES = (
+        '========== 1 failed, 2 passed in 5.00s ==========',
+        '=========================== 3 failed in 0.12s ============================',
+    )
+
+    # Undecorated forms, both transcribed verbatim from real output.
+    UNDECORATED_SAMPLES = (
+        '8 failed, 6971 passed, 216 warnings in 131.42s (0:02:11)',
+        '1 failed, 1 passed in 0.56s',
+    )
+
+    # Over-reach guards: dropping the trailing ``=+$`` requirement must not
+    # turn this into "any line mentioning failure".
+    #
+    # The two ``failed to fetch`` samples are the reason the pattern keeps
+    # pytest's tally SHAPE (comma-joined ``<N> <word>`` parts + an ``in <N>s``
+    # duration) instead of ``.*$``: this repo's verify path runs chained
+    # ``cargo … && uv run pytest`` commands, so non-pytest retry chatter shares
+    # the output. Rung 3 of _extract_cause_hint sits AHEAD of the ``error: ``,
+    # ``… FAILED``, timeout-wrapper and ``ERROR: `` rungs, so a line matched
+    # here pre-empts a genuinely more informative hint. Note the second one
+    # carries an ``in 30s`` of its own — requiring a duration alone is not
+    # enough to reject it.
+    NON_SUMMARY_SAMPLES = (
+        '1 xfailed, 2 passed in 3s',
+        'no tests ran in 0.01s',
+        'FAILED orchestrator/tests/test_x.py::test_y - AssertionError',
+        '0 failedcases reported',
+        '2 failed to fetch dependencies; retrying',
+        '2 failed to fetch dependencies; retrying in 30s',
+    )
+
+    # A bar-only separator line immediately preceding an undecorated tally —
+    # the shape wrapper/CI output produces when it echoes pytest's separator
+    # but not its stats decoration.
+    BAR_LINE_THEN_TALLY = (
+        '=========================\n'
+        '8 failed, 6971 passed in 1.00s\n'
+    )
+
+    def test_decorated_summary_forms_still_match(self):
+        """PRESERVATION: the ``=``-decorated forms the existing fixtures use
+        must keep matching after the widening."""
+        for sample in self.DECORATED_SAMPLES:
+            assert verify._PYTEST_FAILURE_SUMMARY_RE.search(sample) is not None, (
+                f'decorated summary no longer matches: {sample!r}'
+            )
+
+    def test_undecorated_summary_forms_match(self):
+        """The real undecorated tallies — verify-log 2829's INTERNALERROR-abort
+        line and the `pytest -q` form — must match."""
+        for sample in self.UNDECORATED_SAMPLES:
+            assert verify._PYTEST_FAILURE_SUMMARY_RE.search(sample) is not None, (
+                f'undecorated summary not matched: {sample!r}'
+            )
+
+    def test_non_failure_lines_do_not_match(self):
+        """Over-reach guards: an xfail tally, a no-tests-ran line, a FAILED
+        node-id line, ``0 failedcases`` (word-boundary guard) and non-pytest
+        ``N failed to …`` retry chatter must all stay unmatched."""
+        for sample in self.NON_SUMMARY_SAMPLES:
+            assert verify._PYTEST_FAILURE_SUMMARY_RE.search(sample) is None, (
+                f'over-reach — matched a non-summary line: {sample!r}'
+            )
+
+    def test_match_never_spans_a_line_break(self):
+        """The optional ``=`` decoration group must not swallow a NEWLINE.
+
+        ``\\s`` matches ``\\n``, so under re.MULTILINE an optional ``(?:=+\\s+)?``
+        prefix happily starts on a bar-only separator line and runs into the
+        tally on the NEXT line — making group(0) two lines long.
+        _extract_cause_hint returns ``m.group(0).strip()[:200]`` and documents
+        the result as a single line, so that match would put a line break into
+        a cause hint that flows on into failure reports and events. Pinning
+        the horizontal-whitespace class here because every other sample in
+        this class is a single-line string and so cannot catch it.
+        """
+        match = verify._PYTEST_FAILURE_SUMMARY_RE.search(self.BAR_LINE_THEN_TALLY)
+        assert match is not None, 'the tally line itself must still match'
+        assert '\n' not in match.group(0), (
+            f'match spans a line break: {match.group(0)!r}'
+        )
+        assert match.group(0) == '8 failed, 6971 passed in 1.00s'
 
 
 class TestRunVerificationXdistWorkerCrashRetry:
@@ -901,7 +1320,7 @@ class TestRunVerificationXdistWorkerCrashRetry:
 
         async def fake_cmd(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
             if 'pytest' in cmd:
-                return 1, _XDIST_WORKER_CRASH_OUTPUT, False
+                return 1, XDIST_WORKER_CRASH_OUTPUT, False
             return 0, '', False
 
         with (
@@ -912,6 +1331,163 @@ class TestRunVerificationXdistWorkerCrashRetry:
 
         assert exc_info.value.phase == 'xdist_worker_crash'
         assert exc_info.value.errno is None
+        assert XDIST_IN_FLIGHT_NODEID in str(exc_info.value)
+
+    @staticmethod
+    def _make_persisting_config(
+        tmp_path: Path, test_command: str = 'uv run pytest tests/',
+    ) -> OrchestratorConfig:
+        (tmp_path / '.task').mkdir(exist_ok=True)
+        return OrchestratorConfig(
+            project_root=tmp_path,
+            test_command=test_command,
+            lint_command='echo lint',
+            type_check_command='echo type',
+            verify_admission_enabled=False,
+            verify_cold_preprovision_command='',
+        )
+
+    @staticmethod
+    def _streaming_fake_cmd(pytest_result):
+        """A `_run_cmd` stub that streams pytest output to *log_path* as the real one does.
+
+        *pytest_result* maps the spawn's cwd to the ``(rc, output)`` pytest returns.
+        """
+
+        async def fake_cmd(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
+            if 'pytest' not in cmd:
+                return 0, '', False
+            rc, output = pytest_result(Path(cwd))
+            if log_path is not None:
+                Path(log_path).write_text(output)
+            return rc, output, False
+
+        return fake_cmd
+
+    @pytest.mark.asyncio
+    async def test_task_path_crash_archives_its_log_before_raising(self, tmp_path: Path):
+        config = self._make_persisting_config(tmp_path)
+        archive_root = tmp_path / 'verify-logs'
+        fake_cmd = self._streaming_fake_cmd(
+            lambda cwd: (1, XDIST_CRASH_ATTRIBUTED_FAILED_OUTPUT),
+        )
+
+        with (
+            patch('orchestrator.verify._run_cmd', side_effect=fake_cmd),
+            pytest.raises(verify.VerifyInfraError) as exc_info,
+        ):
+            await verify.run_verification(
+                tmp_path, config, attempt_id=1, task_id='5527', archive_root=archive_root,
+            )
+
+        exc = exc_info.value
+        assert exc.phase == 'xdist_worker_crash'
+        assert exc.errno is None
+        archived_logs = list((archive_root / '5527').glob('attempt-1.test-*.log'))
+        assert len(archived_logs) == 1
+        assert XDIST_IN_FLIGHT_NODEID in archived_logs[0].read_text()
+        archived_summaries = list((archive_root / '5527').glob('attempt-1.summary-*.json'))
+        assert len(archived_summaries) == 1
+        summary = json.loads(archived_summaries[0].read_text())
+        assert summary['role'] == 'task'
+        assert summary['category'] == classify_failure(
+            ToolKind.PYTEST, 1, XDIST_CRASH_ATTRIBUTED_FAILED_OUTPUT, False,
+        ) == 'test_failure'
+        assert 'xdist_worker_crash' in summary['cause_hint']
+        assert (tmp_path / '.task' / 'verify' / 'attempt-1.summary.json').exists()
+        assert XDIST_IN_FLIGHT_NODEID in str(exc)
+        assert str(archived_logs[0]) in str(exc)
+
+    @pytest.mark.asyncio
+    async def test_segmented_task_leg_crash_archives_the_aggregated_log(
+        self, tmp_path: Path,
+    ):
+        config = self._make_persisting_config(
+            tmp_path,
+            test_command='cd shared && uv run pytest tests/ && cd ../orchestrator && uv run pytest tests/',
+        )
+        (tmp_path / 'shared').mkdir()
+        (tmp_path / 'orchestrator').mkdir()
+        archive_root = tmp_path / 'verify-logs'
+        fake_cmd = self._streaming_fake_cmd(
+            lambda cwd: (
+                (1, XDIST_CRASH_ATTRIBUTED_FAILED_OUTPUT)
+                if cwd.name == 'shared'
+                else (0, '3 passed in 0.10s\n')
+            ),
+        )
+
+        with (
+            patch('orchestrator.verify._run_cmd', side_effect=fake_cmd),
+            pytest.raises(verify.VerifyInfraError) as exc_info,
+        ):
+            await verify.run_verification(
+                tmp_path, config, attempt_id=1, task_id='5527',
+                archive_root=archive_root, segment_chained_test=True,
+            )
+
+        worktree_test_log = tmp_path / '.task' / 'verify' / 'attempt-1.test.log'
+        assert worktree_test_log.exists()
+        assert XDIST_IN_FLIGHT_NODEID in worktree_test_log.read_text()
+        archived_logs = list((archive_root / '5527').glob('attempt-1.test-*.log'))
+        assert len(archived_logs) == 1
+        assert XDIST_IN_FLIGHT_NODEID in archived_logs[0].read_text()
+        assert str(archived_logs[0]) in str(exc_info.value)
+
+    @pytest.mark.asyncio
+    async def test_crash_without_archive_root_names_the_worktree_log(self, tmp_path: Path):
+        config = self._make_persisting_config(tmp_path)
+        fake_cmd = self._streaming_fake_cmd(
+            lambda cwd: (1, XDIST_CRASH_ATTRIBUTED_FAILED_OUTPUT),
+        )
+
+        with (
+            patch('orchestrator.verify._run_cmd', side_effect=fake_cmd),
+            pytest.raises(verify.VerifyInfraError) as exc_info,
+        ):
+            await verify.run_verification(
+                tmp_path, config, attempt_id=1, task_id='5527', archive_root=None,
+            )
+
+        worktree_test_log = tmp_path / '.task' / 'verify' / 'attempt-1.test.log'
+        assert worktree_test_log.exists()
+        assert XDIST_IN_FLIGHT_NODEID in str(exc_info.value)
+        assert str(worktree_test_log) in str(exc_info.value)
+
+    @pytest.mark.asyncio
+    async def test_genuine_failure_beside_crash_is_not_force_archived(self, tmp_path: Path):
+        config = self._make_persisting_config(tmp_path)
+        archive_root = tmp_path / 'verify-logs'
+        fake_cmd = self._streaming_fake_cmd(
+            lambda cwd: (1, _XDIST_CRASH_WITH_REAL_FAILURE_OUTPUT),
+        )
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_cmd):
+            result = await verify.run_verification(
+                tmp_path, config, attempt_id=1, task_id='5527', archive_root=archive_root,
+            )
+
+        assert result.passed is False
+        assert result.category == 'test_failure'
+        assert list((archive_root / '5527').glob('attempt-1.test-*.log')) == []
+
+    @pytest.mark.asyncio
+    async def test_merge_verify_crash_still_returns_and_archives(self, tmp_path: Path):
+        config = self._make_persisting_config(tmp_path)
+        archive_root = tmp_path / 'verify-logs'
+        fake_cmd = self._streaming_fake_cmd(
+            lambda cwd: (1, XDIST_CRASH_ATTRIBUTED_FAILED_OUTPUT),
+        )
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_cmd):
+            result = await verify.run_verification(
+                tmp_path, config, is_merge_verify=True, role='merge',
+                task_id='5527', archive_root=archive_root,
+            )
+
+        assert result.passed is False
+        assert result.archive_log_paths
+        assert all(Path(p).exists() for p in result.archive_log_paths)
 
     @pytest.mark.asyncio
     async def test_crash_with_real_failure_does_not_raise(self, tmp_path: Path):
@@ -932,36 +1508,16 @@ class TestRunVerificationXdistWorkerCrashRetry:
         assert result.category == 'test_failure'
 
     @pytest.mark.asyncio
-    async def test_crash_with_known_load_flake_raises_verify_infra_error(self, tmp_path: Path):
-        """Acceptance: crash + enumerated known-flake FAILED line routes to the
-        bounded infra-retry, not the debugger (esc-2496-3)."""
-        config = self._make_config(tmp_path)
-
-        async def fake_cmd(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
-            if 'pytest' in cmd:
-                return 1, _XDIST_CRASH_WITH_KNOWN_LOAD_FLAKE_OUTPUT, False
-            return 0, '', False
-
-        with (
-            patch('orchestrator.verify._run_cmd', side_effect=fake_cmd),
-            pytest.raises(verify.VerifyInfraError) as exc_info,
-        ):
-            await verify.run_verification(tmp_path, config)
-
-        assert exc_info.value.phase == 'xdist_worker_crash'
-        assert exc_info.value.errno is None
-
-    @pytest.mark.asyncio
-    async def test_crash_with_known_flake_plus_genuine_failure_does_not_raise(
+    async def test_crash_with_formerly_exempt_test_failure_does_not_raise(
         self, tmp_path: Path,
     ):
-        """Acceptance: a real in-scope FAILED co-occurring with the known flake
-        must still route to the debugger — no blanket retry."""
+        """Acceptance: a failure of the once-allow-listed test beside a crash
+        routes to the debugger as a real failure — no infra retry."""
         config = self._make_config(tmp_path)
 
         async def fake_cmd(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
             if 'pytest' in cmd:
-                return 1, _XDIST_CRASH_KNOWN_FLAKE_PLUS_GENUINE_OUTPUT, False
+                return 1, _XDIST_CRASH_WITH_FORMERLY_EXEMPT_TEST_FAILURE_OUTPUT, False
             return 0, '', False
 
         with patch('orchestrator.verify._run_cmd', side_effect=fake_cmd):
@@ -979,7 +1535,7 @@ class TestRunVerificationXdistWorkerCrashRetry:
 
         async def fake_cmd(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
             if 'pytest' in cmd:
-                return 1, _XDIST_WORKER_CRASH_OUTPUT, False
+                return 1, XDIST_WORKER_CRASH_OUTPUT, False
             return 0, '', False
 
         with patch('orchestrator.verify._run_cmd', side_effect=fake_cmd):
@@ -1003,7 +1559,7 @@ class TestRunVerificationXdistWorkerCrashRetry:
 
         async def fake_cmd(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
             if 'pytest' in cmd:
-                return 1, _XDIST_WORKER_CRASH_OUTPUT, False
+                return 1, XDIST_WORKER_CRASH_OUTPUT, False
             if 'lint' in cmd:
                 return 1, 'file.py:10:1: E501 line too long\n', False
             return 0, '', False
@@ -1021,7 +1577,7 @@ class TestRunVerificationXdistWorkerCrashRetry:
 
         async def fake_cmd(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
             if 'pytest' in cmd:
-                return 1, _XDIST_WORKER_CRASH_OUTPUT, False
+                return 1, XDIST_WORKER_CRASH_OUTPUT, False
             if 'type' in cmd:
                 return 1, 'file.py:3: error: Incompatible return value type\n', False
             return 0, '', False

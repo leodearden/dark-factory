@@ -12,45 +12,44 @@ eta's live throwaway-graph rehearsal -- see the script's module docstring.
 """
 from __future__ import annotations
 
-import importlib.util
 import json
-import sys
+import logging
 import types
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from _fm_helpers import extract_cypher, extract_params
+from _fm_helpers import extract_cypher, extract_params, load_script_module
+from _graph_access_fake import FakeGraphAccess
+from _store_mutation_preflight_contract import (
+    SENTINEL,
+    deny,
+    fail_closed_records,
+    neutralise_fixture,
+)
 
+from fused_memory.backends.graph_access import GraphHandle
 from fused_memory.maintenance.cross_graph_move import (
     CreateResult,
     SubgraphEdgeResult,
 )
+from fused_memory.utils.store_mutation_preflight import StoreMutationUnavailable
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'migrate_cross_graph_leak.py'
 
 
-def _load_module() -> types.ModuleType:
-    """Load migrate_cross_graph_leak.py from its file path.
-
-    The module is registered in sys.modules under its name so that
-    reflection-based decorators work correctly.
-    """
-    mod_name = 'migrate_cross_graph_leak'
-    spec = importlib.util.spec_from_file_location(mod_name, SCRIPT_PATH)
-    if spec is None or spec.loader is None:
-        raise ImportError(f'Cannot load {SCRIPT_PATH}')
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[mod_name] = module
-    try:
-        spec.loader.exec_module(module)  # type: ignore[union-attr]
-    except Exception:
-        sys.modules.pop(mod_name, None)
-        raise
-    return module
+_mod = load_script_module(SCRIPT_PATH, mod_name='migrate_cross_graph_leak')
 
 
-_mod = _load_module()
+_neutralise = neutralise_fixture(
+    _mod,
+    note="""``run(..., apply=True)`` runs the preflight before it loads the
+    reviewed manifest (task 4293). This suite is deliberately MOCK-unit
+    (MagicMock graphs, AsyncMock service, no live FalkorDB).
+    ``TestRunApplyStoreMutationPreflight`` re-rigs this per test -- to refuse,
+    to record, or to pass -- so the guard's own behaviour is still pinned
+    explicitly rather than assumed away.""",
+)
 
 
 # ===========================================================================
@@ -109,23 +108,27 @@ def _make_graph_mock(
     return graph
 
 
-def _make_memory_service(graphs: dict[str, MagicMock] | None = None) -> AsyncMock:
-    """AsyncMock memory_service with .graphiti wired for census + classify IO.
+def _handle(raw: MagicMock) -> GraphHandle:
+    """*raw* behind the production budgeted handle, for the handle-taking helpers."""
+    return FakeGraphAccess({'g': raw}).graph('g')
 
-    *graphs* maps graph name -> MagicMock graph (as returned by
-    _make_graph_mock); memory_service.graphiti._graph_for(name) looks it up
-    by name. memory_service.graphiti.list_graphs() defaults to sorted(graphs)
-    (callers needing a different/ordered graph list can override it after
-    construction).
+
+@pytest.fixture
+def make_memory_service(make_backend, mock_config):
+    """Factory fixture: (graphs) -> AsyncMock memory_service over a real backend.
+
+    *graphs* maps graph name -> raw graph double (as returned by
+    _make_graph_mock), wired through FakeGraphAccess, so a read of an unwired
+    name raises and memory_service.graphiti.list_graphs() lists sorted(graphs).
     """
-    graphs = graphs or {}
-    memory_service = AsyncMock()
-    graphiti = MagicMock()
-    graphiti._graph_for = MagicMock(side_effect=lambda name: graphs[name])
-    graphiti.list_graphs = AsyncMock(return_value=sorted(graphs))
-    graphiti._require_falkor_client = MagicMock(return_value=MagicMock())
-    memory_service.graphiti = graphiti
-    return memory_service
+    def _factory(graphs: dict[str, MagicMock] | None = None) -> AsyncMock:
+        memory_service = AsyncMock()
+        memory_service.graphiti = make_backend(
+            mock_config, graph_access=FakeGraphAccess(graphs or {}),
+        )
+        return memory_service
+
+    return _factory
 
 
 def _args(
@@ -336,26 +339,27 @@ class TestCensusForeignNodes:
     """Tests for async census_foreign_nodes(graphiti, graph_key, *, page_size)."""
 
     @pytest.mark.asyncio
-    async def test_uses_graph_for_and_ro_query_not_query(self):
-        """Resolves the graph via _graph_for(graph_key); reads via ro_query
-        only -- .query is NEVER called (read-only census)."""
+    async def test_reads_the_graph_named_by_key_via_ro_query_not_query(
+        self, make_backend, mock_config,
+    ):
+        """Reads the graph wired under graph_key (any other key is unwired) via
+        ro_query only -- .query is NEVER called (read-only census)."""
         graph = _make_graph_mock(ro_pages=[[]])
-        graphiti = MagicMock()
-        graphiti._graph_for = MagicMock(return_value=graph)
+        graphiti = make_backend(mock_config, graph_access=FakeGraphAccess({'dark_factory': graph}))
 
         await _mod.census_foreign_nodes(graphiti, 'dark_factory', page_size=1000)
 
-        graphiti._graph_for.assert_called_once_with('dark_factory')
         graph.ro_query.assert_awaited()
         graph.query.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_cypher_filters_foreign_nodes_via_skip_limit_not_collect(self):
+    async def test_cypher_filters_foreign_nodes_via_skip_limit_not_collect(
+        self, make_backend, mock_config,
+    ):
         """Cypher shape: WHERE n.group_id <> $graph_key, RETURN
         uuid/name/group_id/labels(n), SKIP/LIMIT params -- never collect()."""
         graph = _make_graph_mock(ro_pages=[[]])
-        graphiti = MagicMock()
-        graphiti._graph_for = MagicMock(return_value=graph)
+        graphiti = make_backend(mock_config, graph_access=FakeGraphAccess({'dark_factory': graph}))
 
         await _mod.census_foreign_nodes(graphiti, 'dark_factory', page_size=500)
 
@@ -370,15 +374,16 @@ class TestCensusForeignNodes:
         assert params.get('limit') == 500
 
     @pytest.mark.asyncio
-    async def test_full_page_then_short_page_advances_skip_and_concatenates(self):
+    async def test_full_page_then_short_page_advances_skip_and_concatenates(
+        self, make_backend, mock_config,
+    ):
         """A full first page (len==page_size) triggers a SECOND ro_query with
         skip advanced by page_size; a short second page ends the loop, and
         the result is the concatenation of both pages."""
         page1 = [_foreign_row(f'u{i}', 'dark_factory') for i in range(3)]
         page2 = [_foreign_row('u-last', 'know_live')]
         graph = _make_graph_mock(ro_pages=[page1, page2])
-        graphiti = MagicMock()
-        graphiti._graph_for = MagicMock(return_value=graph)
+        graphiti = make_backend(mock_config, graph_access=FakeGraphAccess({'reify': graph}))
 
         result = await _mod.census_foreign_nodes(graphiti, 'reify', page_size=3)
 
@@ -388,12 +393,11 @@ class TestCensusForeignNodes:
         assert [r['uuid'] for r in result] == ['u0', 'u1', 'u2', 'u-last']
 
     @pytest.mark.asyncio
-    async def test_terminates_on_short_page_no_third_query(self):
+    async def test_terminates_on_short_page_no_third_query(self, make_backend, mock_config):
         """After a short (non-full) page, no further ro_query is issued."""
         page1 = [_foreign_row('u0', 'dark_factory')]
         graph = _make_graph_mock(ro_pages=[page1])
-        graphiti = MagicMock()
-        graphiti._graph_for = MagicMock(return_value=graph)
+        graphiti = make_backend(mock_config, graph_access=FakeGraphAccess({'reify': graph}))
 
         result = await _mod.census_foreign_nodes(graphiti, 'reify', page_size=1000)
 
@@ -401,23 +405,21 @@ class TestCensusForeignNodes:
         assert len(result) == 1
 
     @pytest.mark.asyncio
-    async def test_empty_graph_returns_empty_list(self):
+    async def test_empty_graph_returns_empty_list(self, make_backend, mock_config):
         """A graph with zero foreign nodes returns an empty list, not an error."""
         graph = _make_graph_mock(ro_pages=[[]])
-        graphiti = MagicMock()
-        graphiti._graph_for = MagicMock(return_value=graph)
+        graphiti = make_backend(mock_config, graph_access=FakeGraphAccess({'reify': graph}))
 
         result = await _mod.census_foreign_nodes(graphiti, 'reify', page_size=1000)
 
         assert result == []
 
     @pytest.mark.asyncio
-    async def test_normalizes_rows_to_dicts_with_source_graph(self):
+    async def test_normalizes_rows_to_dicts_with_source_graph(self, make_backend, mock_config):
         """Each row normalizes to {uuid,name,group_id,labels,source_graph}."""
         row = _foreign_row('u0', 'dark_factory', name='Alice', labels=['Entity'])
         graph = _make_graph_mock(ro_pages=[[row]])
-        graphiti = MagicMock()
-        graphiti._graph_for = MagicMock(return_value=graph)
+        graphiti = make_backend(mock_config, graph_access=FakeGraphAccess({'reify': graph}))
 
         result = await _mod.census_foreign_nodes(graphiti, 'reify', page_size=1000)
 
@@ -427,7 +429,9 @@ class TestCensusForeignNodes:
         }]
 
     @pytest.mark.asyncio
-    async def test_full_final_page_at_cap_warns_no_silent_caps(self, caplog, monkeypatch):
+    async def test_full_final_page_at_cap_warns_no_silent_caps(
+        self, make_backend, mock_config, caplog, monkeypatch,
+    ):
         """When the page cap (MAX_CENSUS_PAGES) is hit and the last page
         fetched is STILL full, a no-silent-caps WARNING fires -- the census
         may be incomplete. Monkeypatches the cap down to 1 so a single full
@@ -435,8 +439,7 @@ class TestCensusForeignNodes:
         monkeypatch.setattr(_mod, 'MAX_CENSUS_PAGES', 1)
         page1 = [_foreign_row('u0', 'dark_factory')]
         graph = _make_graph_mock(ro_pages=[page1])
-        graphiti = MagicMock()
-        graphiti._graph_for = MagicMock(return_value=graph)
+        graphiti = make_backend(mock_config, graph_access=FakeGraphAccess({'reify': graph}))
 
         with caplog.at_level('WARNING'):
             result = await _mod.census_foreign_nodes(graphiti, 'reify', page_size=1)
@@ -449,11 +452,12 @@ class TestCensusForeignNodes:
         ), f'Expected a no-silent-caps WARNING, got: {[r.message for r in caplog.records]}'
 
     @pytest.mark.asyncio
-    async def test_no_warning_when_short_page_ends_enumeration(self, caplog):
+    async def test_no_warning_when_short_page_ends_enumeration(
+        self, make_backend, mock_config, caplog,
+    ):
         """A normal short-page termination does not log a WARNING."""
         graph = _make_graph_mock(ro_pages=[[_foreign_row('u0', 'dark_factory')]])
-        graphiti = MagicMock()
-        graphiti._graph_for = MagicMock(return_value=graph)
+        graphiti = make_backend(mock_config, graph_access=FakeGraphAccess({'reify': graph}))
 
         with caplog.at_level('WARNING'):
             await _mod.census_foreign_nodes(graphiti, 'reify', page_size=1000)
@@ -473,7 +477,7 @@ class TestNodePresentInGraph:
         """A non-empty result_set (the uuid was found) -> True."""
         graph = _make_graph_mock(ro_pages=[[['u0']]])
 
-        present = await _mod.node_present_in_graph(graph, 'u0')
+        present = await _mod.node_present_in_graph(_handle(graph), 'u0')
 
         assert present is True
 
@@ -482,7 +486,7 @@ class TestNodePresentInGraph:
         """An empty result_set (uuid not found) -> False."""
         graph = _make_graph_mock(ro_pages=[[]])
 
-        present = await _mod.node_present_in_graph(graph, 'missing-uuid')
+        present = await _mod.node_present_in_graph(_handle(graph), 'missing-uuid')
 
         assert present is False
 
@@ -491,7 +495,7 @@ class TestNodePresentInGraph:
         """Presence probe is read-only: ro_query is used, .query is NEVER called."""
         graph = _make_graph_mock(ro_pages=[[]])
 
-        await _mod.node_present_in_graph(graph, 'u0')
+        await _mod.node_present_in_graph(_handle(graph), 'u0')
 
         graph.ro_query.assert_awaited_once()
         graph.query.assert_not_called()
@@ -501,7 +505,7 @@ class TestNodePresentInGraph:
         """The probe's uuid param matches the uuid argument."""
         graph = _make_graph_mock(ro_pages=[[]])
 
-        await _mod.node_present_in_graph(graph, 'target-uuid')
+        await _mod.node_present_in_graph(_handle(graph), 'target-uuid')
 
         params = extract_params(graph.ro_query.call_args)
         assert params.get('uuid') == 'target-uuid'
@@ -518,7 +522,7 @@ class TestCountNodeEdgesEpisodes:
             _result([[2]]),  # MENTIONS count
         ])
 
-        counts = await _mod.count_node_edges_episodes(graph, 'u0')
+        counts = await _mod.count_node_edges_episodes(_handle(graph), 'u0')
 
         assert counts == {'edges': 4, 'episodes': 2}
 
@@ -531,7 +535,7 @@ class TestCountNodeEdgesEpisodes:
             _result([]),
         ])
 
-        counts = await _mod.count_node_edges_episodes(graph, 'u0')
+        counts = await _mod.count_node_edges_episodes(_handle(graph), 'u0')
 
         assert counts == {'edges': 0, 'episodes': 0}
 
@@ -540,7 +544,7 @@ class TestCountNodeEdgesEpisodes:
         """Both count reads are read-only: .query is NEVER called."""
         graph = _make_graph_mock(ro_side_effect=[_result([[0]]), _result([[0]])])
 
-        await _mod.count_node_edges_episodes(graph, 'u0')
+        await _mod.count_node_edges_episodes(_handle(graph), 'u0')
 
         graph.query.assert_not_called()
         assert graph.ro_query.await_count == 2
@@ -551,7 +555,7 @@ class TestCountNodeEdgesEpisodes:
         MENTIONS -- both scoped to the given uuid."""
         graph = _make_graph_mock(ro_side_effect=[_result([[1]]), _result([[1]])])
 
-        await _mod.count_node_edges_episodes(graph, 'target-uuid')
+        await _mod.count_node_edges_episodes(_handle(graph), 'target-uuid')
 
         first_cypher = extract_cypher(graph.ro_query.call_args_list[0])
         first_params = extract_params(graph.ro_query.call_args_list[0])
@@ -582,15 +586,14 @@ class TestClassifyNode:
     """Tests for async classify_node(graphiti, node, populated_graphs, *, alias_map)."""
 
     @pytest.mark.asyncio
-    async def test_resolved_target_absent_in_target_is_move(self):
+    async def test_resolved_target_absent_in_target_is_move(self, make_backend, mock_config):
         """A displaced-only node (group_id names a populated graph, absent
         from there) classifies MOVE. edge_count/episode_count are read from
         the SOURCE graph, not the target."""
         target_graph = _make_graph_mock(ro_pages=[[]])  # presence probe: absent
         source_graph = _make_graph_mock(ro_side_effect=[_result([[3]]), _result([[1]])])
         graphs = {'dark_factory': target_graph, 'reify': source_graph}
-        graphiti = MagicMock()
-        graphiti._graph_for = MagicMock(side_effect=lambda name: graphs[name])
+        graphiti = make_backend(mock_config, graph_access=FakeGraphAccess(graphs))
         node = _foreign_node('u0', 'dark_factory', name='Alice', source_graph='reify')
         populated = {'reify', 'dark_factory', 'know_live'}
 
@@ -603,14 +606,13 @@ class TestClassifyNode:
         }
 
     @pytest.mark.asyncio
-    async def test_resolved_target_present_in_target_is_merge(self):
+    async def test_resolved_target_present_in_target_is_merge(self, make_backend, mock_config):
         """A duplicate node (present in the resolved target) classifies
-        MERGE, and the presence probe is issued against _graph_for(target)."""
+        MERGE, and the presence probe is issued against the target graph."""
         target_graph = _make_graph_mock(ro_pages=[[['u0']]])  # presence probe: present
         source_graph = _make_graph_mock(ro_side_effect=[_result([[0]]), _result([[0]])])
         graphs = {'dark_factory': target_graph, 'reify': source_graph}
-        graphiti = MagicMock()
-        graphiti._graph_for = MagicMock(side_effect=lambda name: graphs[name])
+        graphiti = make_backend(mock_config, graph_access=FakeGraphAccess(graphs))
         node = _foreign_node('u0', 'dark_factory', source_graph='reify')
         populated = {'reify', 'dark_factory'}
 
@@ -618,18 +620,16 @@ class TestClassifyNode:
 
         assert record['disposition'] == _mod.MERGE
         assert record['target_graph'] == 'dark_factory'
-        graphiti._graph_for.assert_any_call('dark_factory')
         target_graph.ro_query.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_alias_mapped_orphan_resolves_via_alias_map(self):
+    async def test_alias_mapped_orphan_resolves_via_alias_map(self, make_backend, mock_config):
         """An orphan group_id (e.g. 'know-live') with no populated graph of
         its own resolves via ALIAS_MAP to its canonical target."""
         target_graph = _make_graph_mock(ro_pages=[[]])
         source_graph = _make_graph_mock(ro_side_effect=[_result([[0]]), _result([[0]])])
         graphs = {'know_live': target_graph, 'reify': source_graph}
-        graphiti = MagicMock()
-        graphiti._graph_for = MagicMock(side_effect=lambda name: graphs[name])
+        graphiti = make_backend(mock_config, graph_access=FakeGraphAccess(graphs))
         node = _foreign_node('u0', 'know-live', name='Bob', source_graph='reify')
         populated = {'reify', 'know_live'}
 
@@ -639,15 +639,16 @@ class TestClassifyNode:
         assert record['disposition'] == _mod.MOVE
 
     @pytest.mark.asyncio
-    async def test_unmapped_orphan_is_unresolved_with_no_presence_probe(self):
+    async def test_unmapped_orphan_is_unresolved_with_no_presence_probe(
+        self, make_backend, mock_config,
+    ):
         """An orphan with no populated graph and no ALIAS_MAP entry is
         UNRESOLVED, target_graph=None, and NO presence probe is issued on
-        any target -- _graph_for is called ONLY for the source graph (to
-        read edge/episode counts)."""
+        any target -- only the source graph is wired (a probe of any other
+        graph would raise), and only its two edge/episode counts are read."""
         source_graph = _make_graph_mock(ro_side_effect=[_result([[0]]), _result([[0]])])
         graphs = {'reify': source_graph}
-        graphiti = MagicMock()
-        graphiti._graph_for = MagicMock(side_effect=lambda name: graphs[name])
+        graphiti = make_backend(mock_config, graph_access=FakeGraphAccess(graphs))
         node = _foreign_node('u0', 'totally-unknown', name='Carl', source_graph='reify')
         populated = {'reify', 'dark_factory'}
 
@@ -657,10 +658,10 @@ class TestClassifyNode:
         assert record['disposition'] == _mod.UNRESOLVED
         assert record['edge_count'] == 0
         assert record['episode_count'] == 0
-        graphiti._graph_for.assert_called_once_with('reify')
+        assert source_graph.ro_query.await_count == 2
 
     @pytest.mark.asyncio
-    async def test_target_equals_source_is_rekey_not_merge(self):
+    async def test_target_equals_source_is_rekey_not_merge(self, make_backend, mock_config):
         """A variant-spelling leak whose alias resolves to its OWN source
         graph (e.g. a node physically living in the 'know_live' graph,
         tagged group_id='know-live') classifies REKEY, not MERGE.
@@ -687,8 +688,7 @@ class TestClassifyNode:
 
         graph = _make_graph_mock(ro_side_effect=_side_effect)
         graphs = {'know_live': graph}
-        graphiti = MagicMock()
-        graphiti._graph_for = MagicMock(side_effect=lambda name: graphs[name])
+        graphiti = make_backend(mock_config, graph_access=FakeGraphAccess(graphs))
         node = _foreign_node('u0', 'know-live', name='Alice', source_graph='know_live')
         populated = {'reify', 'dark_factory', 'know_live'}
 
@@ -702,7 +702,9 @@ class TestClassifyNode:
         assert graph.ro_query.await_count == 2
 
     @pytest.mark.asyncio
-    async def test_episodic_node_is_episodic_skip_no_presence_probe(self):
+    async def test_episodic_node_is_episodic_skip_no_presence_probe(
+        self, make_backend, mock_config,
+    ):
         """A foreign Episodic node (labels=['Episodic']) is never actioned by
         the :Entity-scoped epsilon primitives (move_entity_across_graphs /
         merge_foreign_duplicate) or rekey_node_in_place -- classify_node
@@ -715,8 +717,7 @@ class TestClassifyNode:
         still read from the source graph."""
         source_graph = _make_graph_mock(ro_side_effect=[_result([[3]]), _result([[1]])])
         graphs = {'reify': source_graph}
-        graphiti = MagicMock()
-        graphiti._graph_for = MagicMock(side_effect=lambda name: graphs[name])
+        graphiti = make_backend(mock_config, graph_access=FakeGraphAccess(graphs))
         node = _foreign_node(
             'u0', 'dark_factory', name='Ep1', source_graph='reify', labels=['Episodic'],
         )
@@ -728,11 +729,11 @@ class TestClassifyNode:
         assert record['target_graph'] == 'dark_factory'
         assert record['edge_count'] == 3
         assert record['episode_count'] == 1
-        graphiti._graph_for.assert_called_once_with('reify')
+        assert source_graph.ro_query.await_count == 2
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize('labels', [['Community'], []])
-    async def test_non_entity_labels_are_episodic_skip(self, labels):
+    async def test_non_entity_labels_are_episodic_skip(self, make_backend, mock_config, labels):
         """Any foreign node whose labels do not positively confirm :Entity
         (a Community node, or a row with no labels at all) is ALSO routed to
         EPISODIC_SKIP -- only a positively-confirmed :Entity node is ever
@@ -740,15 +741,14 @@ class TestClassifyNode:
         labels)."""
         source_graph = _make_graph_mock(ro_side_effect=[_result([[0]]), _result([[0]])])
         graphs = {'reify': source_graph}
-        graphiti = MagicMock()
-        graphiti._graph_for = MagicMock(side_effect=lambda name: graphs[name])
+        graphiti = make_backend(mock_config, graph_access=FakeGraphAccess(graphs))
         node = _foreign_node('u0', 'dark_factory', source_graph='reify', labels=labels)
         populated = {'reify', 'dark_factory'}
 
         record = await _mod.classify_node(graphiti, node, populated, alias_map=_mod.ALIAS_MAP)
 
         assert record['disposition'] == _mod.EPISODIC_SKIP
-        graphiti._graph_for.assert_called_once_with('reify')
+        assert source_graph.ro_query.await_count == 2
 
 
 # ===========================================================================
@@ -769,7 +769,7 @@ class TestRekeyNodeInPlace:
         param, and NO call ever carries 'CREATE' or 'DETACH DELETE'."""
         graph = _make_graph_mock()
 
-        await _mod.rekey_node_in_place(graph, 'u0', 'know_live')
+        await _mod.rekey_node_in_place(_handle(graph), 'u0', 'know_live')
 
         graph.query.assert_awaited()
         graph.ro_query.assert_not_called()
@@ -790,8 +790,10 @@ class TestRunDryRun:
     """Tests for async run(args, memory_service) -- dry-run branch (args.apply=False)."""
 
     @pytest.mark.asyncio
-    async def test_dry_run_enumerates_censuses_classifies_and_builds_manifest(self, monkeypatch):
-        """list_graphs() is enumerated; census_foreign_nodes runs per populated
+    async def test_dry_run_enumerates_censuses_classifies_and_builds_manifest(
+        self, make_memory_service, monkeypatch,
+    ):
+        """The backend's graph listing is enumerated; census_foreign_nodes runs per populated
         graph; each foreign node found is classified; the result is a
         build_manifest-shaped dict with dry_run=True, per-graph census
         counts, and the classified node records.
@@ -824,14 +826,13 @@ class TestRunDryRun:
 
         dark_factory_graph = _make_graph_mock(ro_side_effect=_dark_factory_side_effect)
 
-        memory_service = _make_memory_service({
+        memory_service = make_memory_service({
             'reify': reify_graph, 'dark_factory': dark_factory_graph,
         })
         args = _args(apply=False, page_size=1000)
 
         manifest = await _mod.run(args, memory_service)
 
-        memory_service.graphiti.list_graphs.assert_awaited_once()
         assert manifest['dry_run'] is True
         assert manifest['census'] == {'reify': 1, 'dark_factory': 0}
         assert len(manifest['nodes']) == 1
@@ -849,9 +850,9 @@ class TestRunDryRun:
         delete_mock.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_dry_run_with_no_foreign_nodes_returns_empty_manifest(self):
+    async def test_dry_run_with_no_foreign_nodes_returns_empty_manifest(self, make_memory_service):
         """No foreign nodes anywhere -> an empty-but-well-shaped manifest."""
-        memory_service = _make_memory_service({
+        memory_service = make_memory_service({
             'reify': _make_graph_mock(ro_pages=[[]]),
             'dark_factory': _make_graph_mock(ro_pages=[[]]),
         })
@@ -885,9 +886,11 @@ class TestLoadReviewedManifest:
         assert loaded == manifest
 
     @pytest.mark.asyncio
-    async def test_apply_without_manifest_refuses_with_no_mutations(self, monkeypatch):
+    async def test_apply_without_manifest_refuses_with_no_mutations(
+        self, make_memory_service, monkeypatch,
+    ):
         """--apply with no --manifest refuses: zero phase-primitive calls, no
-        census recompute (list_graphs is never even awaited), non-zero
+        census recompute (no wired graph is even read), non-zero
         exit_code."""
         create_mock = AsyncMock()
         recreate_mock = AsyncMock()
@@ -895,7 +898,8 @@ class TestLoadReviewedManifest:
         monkeypatch.setattr(_mod, 'create_moved_node', create_mock)
         monkeypatch.setattr(_mod, 'recreate_subgraph_relationships', recreate_mock)
         monkeypatch.setattr(_mod, 'delete_source_node', delete_mock)
-        memory_service = _make_memory_service({'reify': _make_graph_mock()})
+        reify_graph = _make_graph_mock()
+        memory_service = make_memory_service({'reify': reify_graph})
         args = _args(apply=True, manifest=None)
 
         report = await _mod.run(args, memory_service)
@@ -903,7 +907,7 @@ class TestLoadReviewedManifest:
         create_mock.assert_not_awaited()
         recreate_mock.assert_not_awaited()
         delete_mock.assert_not_awaited()
-        memory_service.graphiti.list_graphs.assert_not_awaited()
+        reify_graph.ro_query.assert_not_awaited()
         assert report['exit_code'] != 0
 
 
@@ -916,7 +920,9 @@ class TestRunApplyDispatch:
     through the three-phase barrier-ordered apply (task 2415)."""
 
     @pytest.mark.asyncio
-    async def test_dispatches_move_and_merge_skips_unresolved(self, tmp_path, monkeypatch):
+    async def test_dispatches_move_and_merge_skips_unresolved(
+        self, make_memory_service, tmp_path, monkeypatch,
+    ):
         """A MOVE node gets a Phase-A create_moved_node call (rewrite_group_id
         == its target_graph) and a Phase-C delete_source_node call for its
         source copy; a MERGE node gets no Phase-A create (its home copy
@@ -949,7 +955,7 @@ class TestRunApplyDispatch:
         monkeypatch.setattr(_mod, 'recreate_subgraph_relationships', recreate_mock)
         monkeypatch.setattr(_mod, 'delete_source_node', delete_mock)
 
-        memory_service = _make_memory_service({})
+        memory_service = make_memory_service({})
         args = _args(apply=True, manifest=str(manifest_path))
 
         report = await _mod.run(args, memory_service)
@@ -974,7 +980,7 @@ class TestRunApplyDispatch:
 
     @pytest.mark.asyncio
     async def test_move_dispatch_passes_rewrite_group_id_matching_target(
-        self, tmp_path, monkeypatch,
+        self, make_memory_service, tmp_path, monkeypatch,
     ):
         """Regression guard (review-fix cycle 1, Bug 2): a MOVE dispatch's
         Phase-A create_moved_node call must pass rewrite_group_id == the
@@ -1001,7 +1007,7 @@ class TestRunApplyDispatch:
         )
         monkeypatch.setattr(_mod, 'delete_source_node', AsyncMock(return_value=None))
 
-        memory_service = _make_memory_service({})
+        memory_service = make_memory_service({})
         args = _args(apply=True, manifest=str(manifest_path))
 
         await _mod.run(args, memory_service)
@@ -1027,7 +1033,9 @@ class TestRunApplyEpisodicSkip:
         return manifest_path
 
     @pytest.mark.asyncio
-    async def test_episodic_skip_node_never_dispatched(self, tmp_path, monkeypatch):
+    async def test_episodic_skip_node_never_dispatched(
+        self, make_memory_service, tmp_path, monkeypatch,
+    ):
         """An EPISODIC_SKIP node is never passed to create_moved_node,
         recreate_subgraph_relationships, or delete_source_node, and receives
         no rekey mutation either -- it is recorded blocked, not applied."""
@@ -1047,7 +1055,7 @@ class TestRunApplyEpisodicSkip:
         reify_graph = _make_graph_mock(
             ro_pages=[[_foreign_row('u-ep', 'dark_factory', labels=['Episodic'])]],
         )
-        memory_service = _make_memory_service({'reify': reify_graph})
+        memory_service = make_memory_service({'reify': reify_graph})
         args = _args(apply=True, manifest=str(manifest_path))
 
         report = await _mod.run(args, memory_service)
@@ -1064,7 +1072,9 @@ class TestRunApplyEpisodicSkip:
         assert ep_results[0]['disposition'] == _mod.EPISODIC_SKIP
 
     @pytest.mark.asyncio
-    async def test_episodic_skip_residual_matches_but_still_blocks_exit(self, tmp_path):
+    async def test_episodic_skip_residual_matches_but_still_blocks_exit(
+        self, make_memory_service, tmp_path,
+    ):
         """EPISODIC_SKIP is counted in expected_residual (mirroring
         UNRESOLVED), so a graph still holding the un-actioned foreign
         Episodic node after apply reconciles (matched=True -- NOT mistaken
@@ -1082,7 +1092,7 @@ class TestRunApplyEpisodicSkip:
         # relationships/delete_source_node) are ever invoked -- nothing to
         # monkeypatch.
 
-        memory_service = _make_memory_service({
+        memory_service = make_memory_service({
             'reify': _make_graph_mock(
                 ro_pages=[[_foreign_row('u-ep', 'dark_factory', labels=['Episodic'])]],
             ),
@@ -1114,7 +1124,9 @@ class TestRunApplyRekeyAndGuard:
         return manifest_path
 
     @pytest.mark.asyncio
-    async def test_apply_rekey_node_in_place_no_epsilon_call(self, tmp_path, monkeypatch):
+    async def test_apply_rekey_node_in_place_no_epsilon_call(
+        self, make_memory_service, tmp_path, monkeypatch,
+    ):
         """A REKEY node (source_graph == target_graph) never dispatches to
         any of the three phase primitives -- all three are monkeypatched to
         explode if invoked, as a hard guard against the data-loss bug this
@@ -1135,7 +1147,7 @@ class TestRunApplyRekeyAndGuard:
         monkeypatch.setattr(_mod, 'delete_source_node', delete_mock)
 
         home_graph = _make_graph_mock(ro_pages=[[]])  # clean post-verify re-census
-        memory_service = _make_memory_service({'know_live': home_graph})
+        memory_service = make_memory_service({'know_live': home_graph})
         args = _args(apply=True, manifest=str(manifest_path))
 
         report = await _mod.run(args, memory_service)
@@ -1157,7 +1169,9 @@ class TestRunApplyRekeyAndGuard:
         assert report['exit_code'] == 0
 
     @pytest.mark.asyncio
-    async def test_move_or_merge_with_source_equals_target_is_refused(self, tmp_path, monkeypatch):
+    async def test_move_or_merge_with_source_equals_target_is_refused(
+        self, make_memory_service, tmp_path, monkeypatch,
+    ):
         """A malformed/hand-edited manifest carrying a MOVE or MERGE node
         whose source_graph == target_graph (never produced by a correctly-
         behaving classify_node -- that's REKEY's territory) is REFUSED, not
@@ -1183,7 +1197,7 @@ class TestRunApplyRekeyAndGuard:
         monkeypatch.setattr(_mod, 'recreate_subgraph_relationships', recreate_mock)
         monkeypatch.setattr(_mod, 'delete_source_node', delete_mock)
 
-        memory_service = _make_memory_service({
+        memory_service = make_memory_service({
             'know_live': _make_graph_mock(ro_pages=[[]]),
             'reify': _make_graph_mock(ro_pages=[[]]),
         })
@@ -1220,7 +1234,9 @@ class TestRunApplyExceptionIsolation:
         return manifest_path
 
     @pytest.mark.asyncio
-    async def test_failed_dispatch_does_not_abort_remaining_nodes(self, tmp_path, monkeypatch):
+    async def test_failed_dispatch_does_not_abort_remaining_nodes(
+        self, make_memory_service, tmp_path, monkeypatch,
+    ):
         """A MOVE node whose Phase-A create_moved_node call raises is
         recorded blocked with the error captured, and is excluded from the
         Phase-B/C batch entirely (its edges cannot be safely recreated and
@@ -1252,7 +1268,7 @@ class TestRunApplyExceptionIsolation:
         monkeypatch.setattr(_mod, 'recreate_subgraph_relationships', recreate_mock)
         monkeypatch.setattr(_mod, 'delete_source_node', delete_mock)
 
-        memory_service = _make_memory_service({
+        memory_service = make_memory_service({
             'reify': _make_graph_mock(ro_pages=[[]]),
             'know_live': _make_graph_mock(ro_pages=[[]]),
         })
@@ -1288,7 +1304,7 @@ class TestRunApplyExceptionIsolation:
 
     @pytest.mark.asyncio
     async def test_phase_b_failure_surfaces_partial_edge_tally_not_zero(
-        self, tmp_path, monkeypatch,
+        self, make_memory_service, tmp_path, monkeypatch,
     ):
         """When recreate_subgraph_relationships (Phase B) raises partway
         through a batch, it has already mutated target graphs for whatever
@@ -1318,7 +1334,7 @@ class TestRunApplyExceptionIsolation:
         delete_mock = AsyncMock(return_value=None)
         monkeypatch.setattr(_mod, 'delete_source_node', delete_mock)
 
-        memory_service = _make_memory_service({
+        memory_service = make_memory_service({
             'reify': _make_graph_mock(ro_pages=[[]]),
             'dark_factory': _make_graph_mock(ro_pages=[[]]),
         })
@@ -1359,7 +1375,9 @@ class TestRunPostVerify:
         return manifest_path
 
     @pytest.mark.asyncio
-    async def test_clean_reconciliation_after_apply_is_exit_zero(self, tmp_path, monkeypatch):
+    async def test_clean_reconciliation_after_apply_is_exit_zero(
+        self, make_memory_service, tmp_path, monkeypatch,
+    ):
         """A clean post-apply re-census (the moved node is gone from both
         graphs, no UNRESOLVED nodes in the manifest) reconciles exactly with
         the expected (all-zero) residual -> exit_code 0 and a post_verify
@@ -1384,7 +1402,7 @@ class TestRunPostVerify:
         )
         monkeypatch.setattr(_mod, 'delete_source_node', AsyncMock(return_value=None))
 
-        memory_service = _make_memory_service({
+        memory_service = make_memory_service({
             'reify': _make_graph_mock(ro_pages=[[]]),
             'dark_factory': _make_graph_mock(ro_pages=[[]]),
         })
@@ -1392,7 +1410,6 @@ class TestRunPostVerify:
 
         report = await _mod.run(args, memory_service)
 
-        memory_service.graphiti.list_graphs.assert_awaited_once()
         assert report['post_verify'] == {
             'matched': True,
             'expected': {'reify': 0, 'dark_factory': 0},
@@ -1401,7 +1418,9 @@ class TestRunPostVerify:
         assert report['exit_code'] == 0
 
     @pytest.mark.asyncio
-    async def test_residual_foreign_node_after_apply_is_nonzero_exit(self, tmp_path, monkeypatch):
+    async def test_residual_foreign_node_after_apply_is_nonzero_exit(
+        self, make_memory_service, tmp_path, monkeypatch,
+    ):
         """If the post-apply re-census still finds a foreign node in a graph
         that should now be clean (e.g. a MOVE that silently failed to remove
         the source copy), the residual count mismatches the expectation ->
@@ -1426,7 +1445,7 @@ class TestRunPostVerify:
         )
         monkeypatch.setattr(_mod, 'delete_source_node', AsyncMock(return_value=None))
 
-        memory_service = _make_memory_service({
+        memory_service = make_memory_service({
             'reify': _make_graph_mock(ro_pages=[[_foreign_row('u-move', 'dark_factory')]]),
             'dark_factory': _make_graph_mock(ro_pages=[[]]),
         })
@@ -1439,7 +1458,7 @@ class TestRunPostVerify:
 
     @pytest.mark.asyncio
     async def test_any_unresolved_node_forces_nonzero_exit_even_if_counts_reconcile(
-        self, tmp_path,
+        self, make_memory_service, tmp_path,
     ):
         """An UNRESOLVED node blocks --apply's success regardless of whether
         the post-apply re-census otherwise reconciles: the residual foreign
@@ -1456,7 +1475,7 @@ class TestRunPostVerify:
         # No MOVE/MERGE node is present in this manifest, so none of the
         # three phase primitives are ever invoked -- nothing to monkeypatch.
 
-        memory_service = _make_memory_service({
+        memory_service = make_memory_service({
             'reify': _make_graph_mock(
                 ro_pages=[[_foreign_row('u-unresolved', 'my_solar_challenge_typo')]],
             ),
@@ -1494,7 +1513,7 @@ class TestRunApplyPhaseBarrier:
 
     @pytest.mark.asyncio
     async def test_all_phase_a_creates_precede_phase_b_which_precedes_all_phase_c_deletes(
-        self, tmp_path, monkeypatch,
+        self, make_memory_service, tmp_path, monkeypatch,
     ):
         """A manifest with two MOVE nodes and one MERGE node: every Phase-A
         create_moved_node call is logged before the single, batched Phase-B
@@ -1532,7 +1551,7 @@ class TestRunApplyPhaseBarrier:
         )
         monkeypatch.setattr(_mod, 'delete_source_node', AsyncMock(side_effect=_fake_delete))
 
-        memory_service = _make_memory_service({
+        memory_service = make_memory_service({
             'reify': _make_graph_mock(ro_pages=[[]]),
             'dark_factory': _make_graph_mock(ro_pages=[[]]),
             'know_live': _make_graph_mock(ro_pages=[[]]),
@@ -1589,7 +1608,7 @@ class TestRunApplyCoMovingPreserved:
 
     @pytest.mark.asyncio
     async def test_co_moving_pair_edge_recreated_count_folded_into_report(
-        self, tmp_path, monkeypatch,
+        self, make_memory_service, tmp_path, monkeypatch,
     ):
         """Two MOVE nodes (u-A, u-B) sharing a RELATES_TO edge, both moving
         reify -> dark_factory: run() passes BOTH specs to a single
@@ -1616,7 +1635,7 @@ class TestRunApplyCoMovingPreserved:
         ))
         monkeypatch.setattr(_mod, 'recreate_subgraph_relationships', recreate_mock)
 
-        memory_service = _make_memory_service({
+        memory_service = make_memory_service({
             'reify': _make_graph_mock(ro_pages=[[]]),
             'dark_factory': _make_graph_mock(ro_pages=[[]]),
         })
@@ -1647,6 +1666,101 @@ class TestRunApplyCoMovingPreserved:
 
 
 # ===========================================================================
+# Tests: run() apply surfaces the MERGE fold's dropped-MENTIONS census
+# (task 4183)
+# ===========================================================================
+
+class TestRunApplyMergeMentionsDroppedCensus:
+    """Proves Phase B's dropped-MENTIONS census (merge_mentions_dropped +
+    merge_mentions_dropped_uuids -- the incoming MENTIONS links onto a MERGE
+    spec's wrong copy that Phase C's DETACH DELETE destroys) reaches the
+    report verbatim, and follows embedding_omitted's informational,
+    NOT-folded-into-exit_code precedent rather than
+    dropped_cross_target_edges/phase_b_blocked's gating one.
+    """
+
+    def _write_manifest(self, tmp_path, nodes, census) -> Path:
+        manifest = _mod.build_manifest(nodes, census, dry_run=True)
+        manifest_path = tmp_path / 'manifest.json'
+        manifest_path.write_text(json.dumps(manifest))
+        return manifest_path
+
+    async def _run_with_edge_result(
+        self, tmp_path, monkeypatch, make_memory_service, edge_result,
+    ):
+        """Drive run() over one clean MOVE node with *edge_result* injected as
+        Phase B's return -- the same SubgraphEdgeResult-injection harness the
+        embedding_omitted / dropped_cross_target_edges tests use."""
+        move_node = _classified_node(
+            'u-M', source_graph='reify', target_graph='dark_factory', disposition=_mod.MOVE,
+        )
+        manifest_path = self._write_manifest(
+            tmp_path, [move_node], {'reify': 1, 'dark_factory': 0},
+        )
+
+        monkeypatch.setattr(_mod, 'create_moved_node', AsyncMock(return_value=None))
+        monkeypatch.setattr(_mod, 'delete_source_node', AsyncMock(return_value=None))
+        monkeypatch.setattr(
+            _mod, 'recreate_subgraph_relationships', AsyncMock(return_value=edge_result),
+        )
+
+        memory_service = make_memory_service({
+            'reify': _make_graph_mock(ro_pages=[[]]),
+            'dark_factory': _make_graph_mock(ro_pages=[[]]),
+        })
+        args = _args(apply=True, manifest=str(manifest_path))
+
+        return await _mod.run(args, memory_service)
+
+    @pytest.mark.asyncio
+    async def test_merge_mentions_dropped_surfaced_in_report_and_does_not_gate_exit_code(
+        self, make_memory_service, tmp_path, monkeypatch,
+    ):
+        """A Phase-B result carrying merge_mentions_dropped=2 with two
+        mentioning-episode uuids, everything else clean: both fields reach
+        the report VERBATIM (never truncated or re-ordered), and exit_code
+        stays 0. The census is deliberately NOT folded into exit_code, exactly
+        like embedding_omitted -- a MERGE whose wrong copy carries MENTIONS is
+        the EXPECTED case (a wrong-graph mentioning episode is EPISODIC_SKIP,
+        never actioned), so gating on it would make nearly every merge run
+        exit non-zero and train operators to ignore the signal.
+        """
+        report = await self._run_with_edge_result(
+            tmp_path, monkeypatch, make_memory_service,
+            SubgraphEdgeResult(
+                merge_mentions_dropped=2,
+                merge_mentions_dropped_uuids=['episode-1', 'episode-2'],
+            ),
+        )
+
+        assert report['merge_mentions_dropped'] == 2
+        assert report['merge_mentions_dropped_uuids'] == ['episode-1', 'episode-2']
+
+        # nothing else is dirty -- the census alone must not force a
+        # human-review exit.
+        assert report['post_verify']['matched'] is True
+        assert report['dropped_cross_target_edges'] == []
+        assert report['phase_b_blocked'] == []
+        assert report['exit_code'] == 0
+
+    @pytest.mark.asyncio
+    async def test_zero_census_still_reports_both_keys(
+        self, make_memory_service, tmp_path, monkeypatch,
+    ):
+        """A default (all-clean) Phase-B result still reports the keys as
+        0/[] -- they are always present, never conditionally omitted, so an
+        operator diffing two runs never has to distinguish "no dropped
+        MENTIONS" from "this build didn't count them"."""
+        report = await self._run_with_edge_result(
+            tmp_path, monkeypatch, make_memory_service, SubgraphEdgeResult(),
+        )
+
+        assert report['merge_mentions_dropped'] == 0
+        assert report['merge_mentions_dropped_uuids'] == []
+        assert report['exit_code'] == 0
+
+
+# ===========================================================================
 # Tests: run() apply surfaces cross-target-dropped edges
 # (task 2415, step-15/16)
 # ===========================================================================
@@ -1667,7 +1781,7 @@ class TestRunApplyCrossTargetDropped:
 
     @pytest.mark.asyncio
     async def test_dropped_cross_target_edges_surfaced_and_forces_blocking_exit(
-        self, tmp_path, monkeypatch,
+        self, make_memory_service, tmp_path, monkeypatch,
     ):
         """recreate_subgraph_relationships (monkeypatched) returns one
         dropped_cross_target record; run()'s report carries it verbatim
@@ -1701,7 +1815,7 @@ class TestRunApplyCrossTargetDropped:
             )),
         )
 
-        memory_service = _make_memory_service({
+        memory_service = make_memory_service({
             'reify': _make_graph_mock(ro_pages=[[]]),
             'dark_factory': _make_graph_mock(ro_pages=[[]]),
         })
@@ -1741,7 +1855,7 @@ class TestRunApplyPhaseBBlocked:
 
     @pytest.mark.asyncio
     async def test_blocked_edge_withholds_source_deletion_and_forces_blocking_exit(
-        self, tmp_path, monkeypatch,
+        self, make_memory_service, tmp_path, monkeypatch,
     ):
         """recreate_subgraph_relationships (monkeypatched) returns one
         blocked edge record naming 'u-move' as an incident node: run() must
@@ -1781,7 +1895,7 @@ class TestRunApplyPhaseBBlocked:
             )),
         )
 
-        memory_service = _make_memory_service({
+        memory_service = make_memory_service({
             'reify': _make_graph_mock(ro_pages=[[]]),
             'dark_factory': _make_graph_mock(ro_pages=[[]]),
         })
@@ -1813,7 +1927,7 @@ class TestRunApplyPhaseBBlocked:
 
     @pytest.mark.asyncio
     async def test_empty_blocked_list_still_deletes_source_and_exits_cleanly(
-        self, tmp_path, monkeypatch,
+        self, make_memory_service, tmp_path, monkeypatch,
     ):
         """Regression guard: an empty SubgraphEdgeResult.blocked list (the
         common, unaffected case) withholds no source deletion and, with an
@@ -1835,7 +1949,7 @@ class TestRunApplyPhaseBBlocked:
             )),
         )
 
-        memory_service = _make_memory_service({
+        memory_service = make_memory_service({
             'reify': _make_graph_mock(ro_pages=[[]]),
             'dark_factory': _make_graph_mock(ro_pages=[[]]),
         })
@@ -1876,7 +1990,7 @@ class TestRunApplyIdempotentReRun:
 
     @pytest.mark.asyncio
     async def test_reapplying_fully_migrated_manifest_is_a_safe_noop(
-        self, tmp_path, monkeypatch,
+        self, make_memory_service, tmp_path, monkeypatch,
     ):
         """A MOVE node and a MERGE node whose migration already fully
         completed on a prior run: Phase-A create_moved_node reports
@@ -1911,7 +2025,7 @@ class TestRunApplyIdempotentReRun:
         monkeypatch.setattr(_mod, 'recreate_subgraph_relationships', recreate_mock)
         monkeypatch.setattr(_mod, 'delete_source_node', delete_mock)
 
-        memory_service = _make_memory_service({
+        memory_service = make_memory_service({
             'reify': _make_graph_mock(ro_pages=[[]]),
             'dark_factory': _make_graph_mock(ro_pages=[[]]),
             'know_live': _make_graph_mock(ro_pages=[[]]),
@@ -1979,11 +2093,11 @@ class TestBuildArgParser:
 
 
 # ===========================================================================
-# Tests: build_memory_service (step-23/24)
+# Tests: open_memory_service (step-23/24)
 # ===========================================================================
 
-class TestBuildMemoryService:
-    """Tests for build_memory_service(args, config) -- task 2415 step-23/24.
+class TestOpenMemoryService:
+    """Tests for open_memory_service(args, config) -- task 2415 step-23/24.
 
     The dry-run/census path only needs a driver/client-wired
     GraphitiBackend for reads; building a full MemoryService -- whose
@@ -1994,7 +2108,7 @@ class TestBuildMemoryService:
     it keeps the full MemoryService, unskipped.
 
     GraphitiBackend/MemoryService are lazily imported inside
-    build_memory_service (mirroring main()'s existing _run_live lazy-import
+    open_memory_service (mirroring main()'s existing _run_live lazy-import
     idiom), so the classes are monkeypatched at their ORIGIN modules
     (not on `_mod`, which never binds these names at module scope).
     """
@@ -2005,8 +2119,8 @@ class TestBuildMemoryService:
     ):
         """Dry-run (args.apply=False): construct a lean GraphitiBackend,
         await its initialize(skip_maintenance=True), and never construct a
-        full MemoryService. The returned object exposes .graphiti (the
-        backend) and an awaitable close()."""
+        full MemoryService. The yielded object exposes .graphiti (the
+        backend), which is closed when the block exits."""
         backend_instance = AsyncMock()
         backend_cls = MagicMock(return_value=backend_instance)
         memory_service_cls = MagicMock()
@@ -2020,14 +2134,32 @@ class TestBuildMemoryService:
         args = _args(apply=False)
         config = mock_config
 
-        result = await _mod.build_memory_service(args, config)
+        async with _mod.open_memory_service(args, config) as result:
+            backend_cls.assert_called_once_with(config)
+            backend_instance.initialize.assert_awaited_once_with(skip_maintenance=True)
+            memory_service_cls.assert_not_called()
+            assert result.graphiti is backend_instance
+            assert backend_instance.close.await_count == 0
 
-        backend_cls.assert_called_once_with(config)
-        backend_instance.initialize.assert_awaited_once_with(skip_maintenance=True)
-        memory_service_cls.assert_not_called()
-        assert result.graphiti is backend_instance
+        backend_instance.close.assert_awaited_once()
 
-        await result.close()
+    @pytest.mark.asyncio
+    async def test_dry_run_closes_a_backend_whose_initialize_failed(
+        self, mock_config, monkeypatch,
+    ):
+        """The lean backend can connect its driver and then fail to initialize;
+        it is closed all the same, and the initialize error is what propagates."""
+        backend_instance = AsyncMock()
+        backend_instance.initialize.side_effect = ConnectionError('falkordb went away')
+        monkeypatch.setattr(
+            'fused_memory.backends.graphiti_client.GraphitiBackend',
+            MagicMock(return_value=backend_instance),
+        )
+
+        with pytest.raises(ConnectionError, match='falkordb went away'):
+            async with _mod.open_memory_service(_args(apply=False), mock_config):
+                pytest.fail('the body must not run')
+
         backend_instance.close.assert_awaited_once()
 
     @pytest.mark.asyncio
@@ -2051,9 +2183,270 @@ class TestBuildMemoryService:
         args = _args(apply=True, manifest='m.json')
         config = mock_config
 
-        result = await _mod.build_memory_service(args, config)
+        async with _mod.open_memory_service(args, config) as result:
+            memory_service_cls.assert_called_once_with(config)
+            memory_instance.initialize.assert_awaited_once_with()
+            backend_cls.assert_not_called()
+            assert result is memory_instance
 
-        memory_service_cls.assert_called_once_with(config)
-        memory_instance.initialize.assert_awaited_once_with()
-        backend_cls.assert_not_called()
-        assert result is memory_instance
+        memory_instance.close.assert_awaited_once()
+
+
+# ===========================================================================
+# Tests: --apply store-mutation preflight (task 4293)
+# ===========================================================================
+
+class TestRunApplyStoreMutationPreflight:
+    """``--apply`` refuses to START when this process cannot write mem0's store.
+
+    Ported from ``test_sweep_toolcall_xml_leak.TestRunApplyStoreMutationPreflight``
+    (task 3686), which is the in-repo precedent for this contract.
+
+    This script's apply path is a three-phase, create-before-delete graph
+    migration: Phase A creates the moved node in its home graph, Phase B
+    recreates its edges/mentions, Phase C ``DETACH DELETE``s the source copy.
+    Every one of those dispatches is wrapped in a per-node ``except Exception``
+    that records a blocked result and CONTINUES, and
+    ``StoreMutationUnavailable`` subclasses ``RuntimeError`` -- so a probe
+    placed inside the apply loop would be swallowed into N blocked rows while
+    the remaining nodes carried on mutating. Worse, a run stopped part-way
+    through the three phases strands nodes BETWEEN graphs: a created home copy
+    with no edges, or a deleted source whose edges never landed. Only one probe
+    per run, ahead of the manifest load, bounds that.
+
+    Placement is pinned from both sides here: the guard must sit BELOW the two
+    legitimate non-mutating refusals (the dry-run census return, and the
+    ``--apply`` with no manifest refusal) so neither is gated on write
+    capability, and ABOVE ``load_reviewed_manifest`` so nothing is read for a
+    run that was never going to be allowed to mutate.
+    """
+
+    def _manifest_path(self, tmp_path) -> Path:
+        """A reviewed manifest that drives ALL FOUR mutation primitives.
+
+        One MOVE (Phase A create + Phase B recreate + Phase C delete), one
+        MERGE (Phase B + Phase C delete, no create), and one REKEY (the
+        immediate in-place ``SET`` applied outside the three-phase barrier).
+        Covering a single disposition would make the zero-mutation assertion
+        below vacuous -- REKEY in particular is applied by a different code
+        path from MOVE/MERGE and would be missed.
+        """
+        nodes = [
+            _classified_node(
+                'u-move', source_graph='reify', target_graph='dark_factory',
+                disposition=_mod.MOVE,
+            ),
+            _classified_node(
+                'u-merge', source_graph='reify', target_graph='know_live',
+                disposition=_mod.MERGE,
+            ),
+            _classified_node(
+                'u-rekey', source_graph='reify', target_graph='dark_factory',
+                disposition=_mod.REKEY,
+            ),
+        ]
+        manifest = _mod.build_manifest(nodes, {'reify': 3}, dry_run=True)
+        path = tmp_path / 'manifest.json'
+        path.write_text(json.dumps(manifest))
+        return path
+
+    def _scenario(self, monkeypatch, make_memory_service):
+        """Patch every mutation primitive and build the service ``run`` drives.
+
+        The graph's ``ro_query`` is a callable side effect (not a page list) so
+        the post-verify re-census can issue as many reads as it likes -- this
+        fixture is about mutations, not paging.
+        """
+        mocks = {
+            'rekey': AsyncMock(return_value=None),
+            'create': AsyncMock(return_value=CreateResult(
+                uuid='u-move', source_graph='reify', target_graph='dark_factory',
+            )),
+            'recreate': AsyncMock(return_value=SubgraphEdgeResult()),
+            'delete': AsyncMock(return_value=None),
+        }
+        monkeypatch.setattr(_mod, 'rekey_node_in_place', mocks['rekey'])
+        monkeypatch.setattr(_mod, 'create_moved_node', mocks['create'])
+        monkeypatch.setattr(_mod, 'recreate_subgraph_relationships', mocks['recreate'])
+        monkeypatch.setattr(_mod, 'delete_source_node', mocks['delete'])
+
+        graph = _make_graph_mock(ro_side_effect=lambda *_a, **_kw: _result([]))
+        memory_service = make_memory_service({'reify': graph})
+        return mocks, memory_service, graph
+
+    @pytest.mark.asyncio
+    async def test_apply_performs_zero_mutations_when_the_store_is_unwritable(
+        self, make_memory_service, tmp_path, monkeypatch,
+    ):
+        """The whole point: refuse to start rather than half-complete.
+
+        The refusal must PROPAGATE, and EVERY primitive is asserted un-awaited
+        -- not one of them. Asserting a single phase would be vacuous precisely
+        because each node's dispatch is independently ``except Exception``-
+        wrapped: a swallowed refusal becomes blocked rows, not an abort, and
+        a half-applied three-phase move is the worst outcome available (a home
+        copy with no edges, or a deleted source whose edges never landed).
+        """
+        deny(_mod, monkeypatch)
+        mocks, memory_service, _ = self._scenario(monkeypatch, make_memory_service)
+        manifest_path = self._manifest_path(tmp_path)
+
+        with pytest.raises(
+            StoreMutationUnavailable, match=SENTINEL
+        ):
+            await _mod.run(
+                _args(apply=True, manifest=str(manifest_path)), memory_service,
+            )
+
+        mocks['rekey'].assert_not_awaited()
+        mocks['create'].assert_not_awaited()
+        mocks['recreate'].assert_not_awaited()
+        mocks['delete'].assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_the_guard_sits_before_the_manifest_is_even_read(
+        self, make_memory_service, tmp_path, monkeypatch,
+    ):
+        """It aborts without reading the reviewed manifest off disk, so a run
+        that was never going to be allowed to mutate pays for nothing -- and
+        nothing reaches the graph or the REKEY dispatch either."""
+        deny(_mod, monkeypatch)
+        mocks, memory_service, graph = self._scenario(monkeypatch, make_memory_service)
+        manifest_path = self._manifest_path(tmp_path)
+
+        load_mock = MagicMock(side_effect=AssertionError('manifest was loaded'))
+        monkeypatch.setattr(_mod, 'load_reviewed_manifest', load_mock)
+
+        with pytest.raises(StoreMutationUnavailable):
+            await _mod.run(
+                _args(apply=True, manifest=str(manifest_path)), memory_service,
+            )
+
+        load_mock.assert_not_called()
+        assert mocks['rekey'].await_count == 0
+        assert graph.ro_query.await_count == 0
+        assert graph.query.await_count == 0
+
+    @pytest.mark.asyncio
+    async def test_a_dry_run_is_never_gated_on_write_capability(
+        self, make_memory_service, monkeypatch,
+    ):
+        """A census/classify PREVIEW mutates nothing, so it must not require
+        the ability to mutate -- the manifest stays obtainable from anywhere,
+        with the deny still installed. It is not probed at all: the guard sits
+        below the dry-run return, so a denied environment can still produce the
+        manifest a later reviewed ``--apply`` consumes."""
+        calls: list[dict] = []
+        monkeypatch.setattr(
+            _mod, 'assert_store_mutation_allowed', lambda **kw: calls.append(kw)
+        )
+        mocks, memory_service, _ = self._scenario(monkeypatch, make_memory_service)
+
+        manifest = await _mod.run(_args(apply=False), memory_service)
+
+        assert manifest['dry_run'] is True
+        assert manifest['exit_code'] == 0
+        assert calls == [], 'a dry run mutates nothing, so it must not probe'
+        mocks['create'].assert_not_awaited()
+        mocks['delete'].assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_apply_without_a_manifest_is_never_gated_either(
+        self, make_memory_service, monkeypatch,
+    ):
+        """``--apply`` with no ``--manifest`` refuses through the NORMAL return
+        path (``exit_code`` 1, zero mutations, no census recompute) on grounds
+        that have nothing to do with write capability.
+
+        Pinned because it fixes the guard's placement from the other side: a
+        probe hoisted to the top of ``run`` would gate this refusal too, so an
+        operator who forgot ``--manifest`` inside a sandbox would be told the
+        store is unwritable instead of being told what they actually got wrong.
+        """
+        calls: list[dict] = []
+        monkeypatch.setattr(
+            _mod, 'assert_store_mutation_allowed', lambda **kw: calls.append(kw)
+        )
+        mocks, memory_service, _ = self._scenario(monkeypatch, make_memory_service)
+
+        report = await _mod.run(_args(apply=True, manifest=None), memory_service)
+
+        assert report['exit_code'] == 1
+        assert 'requires an existing, human-reviewed manifest file' in report['error']
+        assert calls == [], 'a refusal that mutates nothing must not probe'
+        mocks['create'].assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_apply_is_unchanged_when_the_preflight_passes(
+        self, make_memory_service, tmp_path, monkeypatch,
+    ):
+        """Happy path: a writable environment migrates exactly as before,
+        driving all three dispositions through their phases."""
+        mocks, memory_service, _ = self._scenario(monkeypatch, make_memory_service)
+        manifest_path = self._manifest_path(tmp_path)
+
+        report = await _mod.run(
+            _args(apply=True, manifest=str(manifest_path)), memory_service,
+        )
+
+        assert report['dry_run'] is False
+        assert {r['uuid'] for r in report['apply_results'] if r['applied']} == {
+            'u-move', 'u-merge', 'u-rekey',
+        }
+        mocks['rekey'].assert_awaited_once()
+        mocks['create'].assert_awaited_once()
+        mocks['recreate'].assert_awaited_once()
+        assert mocks['delete'].await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_the_probe_names_the_operation_being_gated(
+        self, make_memory_service, tmp_path, monkeypatch,
+    ):
+        """The refusal has to be attributable in a log, so the operation string
+        identifies this script and its mutating mode -- and for a manifest that
+        drives three nodes across three phases it is still probed exactly
+        once."""
+        calls: list[dict] = []
+        monkeypatch.setattr(
+            _mod, 'assert_store_mutation_allowed', lambda **kw: calls.append(kw)
+        )
+        mocks, memory_service, _ = self._scenario(monkeypatch, make_memory_service)
+        manifest_path = self._manifest_path(tmp_path)
+
+        await _mod.run(
+            _args(apply=True, manifest=str(manifest_path)), memory_service,
+        )
+
+        # Non-vacuity: the manifest really did reach more than one phase.
+        mocks['create'].assert_awaited_once()
+        assert mocks['delete'].await_count == 2
+        assert len(calls) == 1, 'probed ONCE per run, not once per manifest node'
+        assert 'migrate_cross_graph_leak' in calls[0]['operation']
+        assert '--apply' in calls[0]['operation']
+
+    @pytest.mark.asyncio
+    async def test_the_refusal_is_loud(self, make_memory_service, tmp_path, monkeypatch, caplog):
+        """The guard site logs its own fail-closed diagnosis before raising.
+
+        Nothing downstream will: this script's ``main`` has no blanket handler,
+        so without this record the operator sees a bare traceback naming an
+        exception class and no remedy.
+        """
+        deny(_mod, monkeypatch)
+        _, memory_service, _ = self._scenario(monkeypatch, make_memory_service)
+        manifest_path = self._manifest_path(tmp_path)
+
+        with (
+            caplog.at_level(logging.ERROR),
+            pytest.raises(StoreMutationUnavailable),
+        ):
+            await _mod.run(
+                _args(apply=True, manifest=str(manifest_path)), memory_service,
+            )
+
+        (record,) = fail_closed_records(caplog, 'migrate_cross_graph_leak')
+        assert SENTINEL in record.getMessage(), (
+            'nothing else explains this traceback -- the guard site must log '
+            'the fail-closed diagnosis before raising; got: '
+            f'{[rec.getMessage() for rec in caplog.records]}'
+        )

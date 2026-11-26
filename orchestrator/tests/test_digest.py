@@ -16,12 +16,19 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import pytest_asyncio
+from escalation.models import Escalation
 from shared.cost_store import _SCHEMA as _COST_SCHEMA
 from shared.cost_store import CostStore
 
 import orchestrator.digest as digest
 from orchestrator.event_store import EventStore
+from orchestrator.lane_record_divergence import (
+    LANE_RECORD_DIVERGENCE,
+    DivergenceStreak,
+    LaneDivergence,
+)
 from orchestrator.run_store import RunStore
+from orchestrator.starvation_watchdog import STARVATION_WATCHDOG_ROLE
 
 
 class TestUpdateEwa:
@@ -41,24 +48,65 @@ class TestUpdateEwa:
         result = digest.update_ewa(prev_ewa=0.0, escalations_in_step=4, done_in_step=0, alpha=0.3)
         assert result == pytest.approx(1.2), f"Expected 1.2; got {result}"
 
-    def test_esc_zero_raises_value_error(self) -> None:
-        """esc==0 raises ValueError — caller contract violation.
+    def test_esc_zero_decays_ewa(self) -> None:
+        """esc==0 is a LEGITIMATE drain window and must decay the EWA, not raise.
 
-        The digest gate guarantees escalations_in_step >= N >= 1 before
-        calling update_ewa, so esc=0 is always a caller error.  Raising keeps
-        the unreachable path loud rather than silently returning a stale EWA.
+        Task 4559: the EWA numerator now counts escalation SUBMISSIONS only —
+        resolutions feed the digest gate but not the numerator.  A backlog-drain
+        window (many resolutions, zero submissions) therefore arrives here with
+        escalations_in_step == 0, which is not a caller error but the healthy
+        case: such a window must HEAL the breaker rather than crash the digest.
+
+        prev=50.0, esc=0, done=0, alpha=0.3 -> 0.3*(0/1) + 0.7*50.0 = 35.0
         """
-        with pytest.raises(ValueError, match='escalations_in_step must be > 0'):
-            digest.update_ewa(prev_ewa=1.0, escalations_in_step=0, done_in_step=5, alpha=0.3)
+        result = digest.update_ewa(prev_ewa=50.0, escalations_in_step=0, done_in_step=0, alpha=0.3)
+        assert result == pytest.approx(35.0), f"Expected 35.0 (pure decay); got {result}"
 
-    def test_esc_zero_done_zero_raises_value_error(self) -> None:
-        """(esc=0, done=0) edge case raises ValueError — not a divide-by-zero path.
+    def test_esc_zero_with_dones_decays(self) -> None:
+        """Zero submissions with work landing also decays: prev=10.0, done=7, alpha=0.3 -> 7.0.
 
-        max(done, 1) would handle (esc=0, done=0) mathematically but the
-        ValueError guard fires first, keeping the caller contract explicit.
+        0.3*(0/7) + 0.7*10.0 = 7.0.  The denominator is irrelevant once the
+        numerator is zero, so a drain window decays at exactly (1-alpha) per
+        step regardless of how much work landed alongside it.
         """
-        with pytest.raises(ValueError, match='escalations_in_step must be > 0'):
-            digest.update_ewa(prev_ewa=0.42, escalations_in_step=0, done_in_step=0, alpha=0.3)
+        result = digest.update_ewa(prev_ewa=10.0, escalations_in_step=0, done_in_step=7, alpha=0.3)
+        assert result == pytest.approx(7.0), f"Expected 7.0 (pure decay); got {result}"
+
+    def test_negative_esc_raises_value_error(self) -> None:
+        """Negative esc raises ValueError — loudness preserved for the impossible input.
+
+        Task 4559 retired the old ``esc > 0`` contract (zero is now legitimate,
+        see test_esc_zero_decays_ewa) but a NEGATIVE count is still arithmetically
+        impossible: counters are monotonically non-decreasing and the diff is
+        taken against an earlier snapshot.  Reaching here with esc < 0 means a
+        counter was reset or a snapshot went backwards, which must be loud
+        rather than silently pushing the EWA down.
+        """
+        with pytest.raises(ValueError, match='escalations_in_step must be >= 0'):
+            digest.update_ewa(prev_ewa=1.0, escalations_in_step=-1, done_in_step=5, alpha=0.3)
+
+    def test_negative_esc_with_dones_raises_value_error(self) -> None:
+        """Negative esc raises regardless of done_in_step — the guard fires first.
+
+        Rewritten from the retired ``test_esc_zero_raises_value_error``.  Task
+        4559 made esc==0 legitimate (a drain window; see
+        test_esc_zero_decays_ewa), so the old ``esc > 0`` contract these tests
+        encoded no longer holds.  What survives is the negative-input guard,
+        and this case pins that it fires ahead of any denominator arithmetic.
+        """
+        with pytest.raises(ValueError, match='escalations_in_step must be >= 0'):
+            digest.update_ewa(prev_ewa=1.0, escalations_in_step=-3, done_in_step=5, alpha=0.3)
+
+    def test_negative_esc_done_zero_raises_value_error(self) -> None:
+        """(esc<0, done=0) raises — not a divide-by-zero path.
+
+        Rewritten from the retired ``test_esc_zero_done_zero_raises_value_error``
+        (task 4559).  max(done, 1) would handle (esc, done=0) mathematically,
+        but the ValueError guard fires first, keeping the surviving half of the
+        caller contract explicit.
+        """
+        with pytest.raises(ValueError, match='escalations_in_step must be >= 0'):
+            digest.update_ewa(prev_ewa=0.42, escalations_in_step=-1, done_in_step=0, alpha=0.3)
 
     def test_alpha_zero_returns_prev_unchanged(self) -> None:
         """alpha=0.0: EWA is never updated — returns prev unchanged.
@@ -345,6 +393,36 @@ class TestCountDoneInWindow:
         assert count == 2, f"Expected 2 done in window via relative path; got {count}"
         warnings = [r for r in caplog.records if r.levelno >= logging.WARNING and r.name == 'orchestrator.digest']
         assert not warnings, f"Relative path with existing DB must not WARNING; got: {[r.message for r in warnings]}"
+
+    def test_query_form_counts_on_an_open_connection(self, tmp_path: Path) -> None:
+        """The connection-taking form counts what the fail-open form counts and
+        leaves the connection it was handed open."""
+        db_path = tmp_path / 'events.db'
+        _seed_events_db_direct(db_path)
+        window = ('2026-05-10T00:00:00+00:00', '2026-05-10T23:59:59+00:00')
+
+        conn = sqlite3.connect(db_path)
+        try:
+            count = digest.query_count_done_in_window(conn, *window)
+            assert count == 2
+            assert count == digest.count_done_in_window(db_path, *window)
+            assert conn.execute('SELECT 1').fetchone() == (1,)
+        finally:
+            conn.close()
+
+    def test_query_form_raises_on_a_schema_less_db(self, tmp_path: Path) -> None:
+        """A missing events table raises instead of reading as zero done."""
+        db_path = tmp_path / 'schema-less.db'
+        sqlite3.connect(str(db_path)).close()
+
+        conn = sqlite3.connect(db_path)
+        try:
+            with pytest.raises(sqlite3.OperationalError, match='no such table'):
+                digest.query_count_done_in_window(
+                    conn, '2026-05-10T00:00:00+00:00', '2026-05-10T23:59:59+00:00',
+                )
+        finally:
+            conn.close()
 
 
 # ---------------------------------------------------------------------------
@@ -646,8 +724,18 @@ class TestCostInWindow:
 # ---------------------------------------------------------------------------
 
 
-def _make_digest_inputs(*, tripped: bool = False) -> digest.DigestInputs:
-    """Build a concrete DigestInputs for render tests."""
+def _make_digest_inputs(
+    *,
+    tripped: bool = False,
+    submissions_in_step: int = 0,
+    lifecycle_events_in_step: int = 0,
+) -> digest.DigestInputs:
+    """Build a concrete DigestInputs for render tests.
+
+    ``submissions_in_step`` / ``lifecycle_events_in_step`` are the task-4559
+    gate-vs-numerator split; they default to 0 so every existing caller of
+    this helper is unaffected.
+    """
     esc_stats = digest.EscalationStats(
         category_level_status_counts={
             ('infra_issue', 0, 'resolved'): 3,
@@ -684,6 +772,8 @@ def _make_digest_inputs(*, tripped: bool = False) -> digest.DigestInputs:
         },
         watcher_clusters=['infra × scope cross-pattern (3 events)', 'repeated timeout cluster'],
         dry_run_proposals=['unblock task-42: bump timeout', 'retry task-99 after requeue'],
+        submissions_in_step=submissions_in_step,
+        lifecycle_events_in_step=lifecycle_events_in_step,
     )
 
 
@@ -697,6 +787,53 @@ class TestRenderDigestMarkdown:
         assert '## Window' in md
         assert '2026-05-10T00:00:00+00:00' in md
         assert '2026-05-10T23:59:59+00:00' in md
+
+    def test_ewa_section_reports_submissions_and_gate_counts(self) -> None:
+        """The EWA section shows WHICH number drove the value (task 4559).
+
+        Before 4559 one counter served as both the digest gate and the EWA
+        numerator, so an operator reading a trip digest could not tell whether
+        the trip was driven by real new escalations or by cleanup of old ones.
+        That ambiguity is what made both 2026 outages hard to diagnose, so the
+        two figures are now rendered separately and the numerator is labelled.
+        """
+        md = digest.render_digest_markdown(
+            _make_digest_inputs(submissions_in_step=4, lifecycle_events_in_step=20)
+        )
+        ewa_section = md.split('## EWA', 1)[1].split('##', 1)[0]
+        assert 'EWA numerator' in ewa_section, (
+            f'Expected the submissions figure to be labelled as the numerator; '
+            f'got section:\n{ewa_section}'
+        )
+        # Anchored on the FULL rendered line, not a bare substring: the same
+        # section also renders '- Value / threshold: 2.5000 / 3.0000', so a
+        # loose `'4' in ewa_section` would pass on a stray digit from a float
+        # and go vacuously true if _make_digest_inputs's ewa_value/threshold
+        # ever changed -- even with both lines missing entirely.
+        assert '- Submissions in step (EWA numerator): 4' in ewa_section, (
+            f'Expected the submissions figure rendered as its own labelled '
+            f'line; got section:\n{ewa_section}'
+        )
+        assert '- Lifecycle events in step (digest gate): 20' in ewa_section, (
+            f'Expected the lifecycle-event (gate) figure rendered as its own '
+            f'labelled line; got section:\n{ewa_section}'
+        )
+
+    def test_digest_inputs_new_fields_default_to_zero(self) -> None:
+        """DigestInputs still constructs without the two task-4559 fields.
+
+        They are appended AFTER stale_lane_census with `= 0` defaults, following
+        the repo's existing "defaulted so existing constructors remain valid"
+        convention (see model_role_rollup / stale_lane_census), so no existing
+        construction across digest.py, harness.py or the test suite needs editing.
+        """
+        inputs = _make_digest_inputs()
+        assert inputs.submissions_in_step == 0, (
+            f'Expected default 0; got {inputs.submissions_in_step}'
+        )
+        assert inputs.lifecycle_events_in_step == 0, (
+            f'Expected default 0; got {inputs.lifecycle_events_in_step}'
+        )
 
     def test_escalation_outcomes_table(self) -> None:
         """Escalation outcomes section with category × level rows."""
@@ -812,6 +949,72 @@ class TestRenderDigestMarkdown:
         inputs.stale_lane_census = []
         md = digest.render_digest_markdown(inputs)
         assert '## Stale lane assignments\n_none_\n' in md
+
+    def test_lane_record_divergence_defaults_empty(self) -> None:
+        assert _make_digest_inputs().lane_record_divergence == ()
+
+    def test_lane_record_divergence_section_lists_each_divergence(self) -> None:
+        first_seen = _datetime(2026, 11, 9, 10, 0, tzinfo=UTC)
+        divergences = (
+            LaneDivergence(
+                lane='_lane-3', map_task_ids=('5260',), record_state=None,
+                record_task_id=None,
+                streak=DivergenceStreak(
+                    consecutive_digests=2, first_seen=first_seen,
+                    last_seen=first_seen + timedelta(hours=2),
+                ),
+            ),
+            LaneDivergence(
+                lane='_lane-9', map_task_ids=('4211',), record_state=None,
+                record_task_id=None, streak=DivergenceStreak.starting(first_seen),
+            ),
+        )
+        inputs = _make_digest_inputs()
+        inputs.lane_record_divergence = divergences
+
+        heading, *body = _lane_record_divergence_section(
+            digest.render_digest_markdown(inputs),
+        )
+
+        assert heading.startswith('## ') and LANE_RECORD_DIVERGENCE in heading
+        assert body[:2] == [f'- {d.render()}' for d in divergences]
+
+    def test_lane_record_divergence_section_clean(self) -> None:
+        inputs = _make_digest_inputs()
+        inputs.lane_record_divergence = ()
+
+        _, first = _lane_record_divergence_section(
+            digest.render_digest_markdown(inputs),
+        )[:2]
+
+        assert first == '_none_'
+
+    def test_lane_record_divergence_section_unavailable(self) -> None:
+        inputs = _make_digest_inputs()
+        inputs.lane_record_divergence = None
+
+        _, first = _lane_record_divergence_section(
+            digest.render_digest_markdown(inputs),
+        )[:2]
+
+        assert first != '_none_'
+        assert 'unavailable' in first
+
+    def test_lane_record_divergence_section_follows_stale_lanes(self) -> None:
+        md = digest.render_digest_markdown(_make_digest_inputs())
+        (heading, *_) = _lane_record_divergence_section(md)
+
+        assert md.index('## Stale lane assignments') < md.index(heading)
+
+
+def _lane_record_divergence_section(md: str) -> list[str]:
+    """The lane-record-divergence heading line and every line after it."""
+    lines = md.splitlines()
+    (start,) = [
+        i for i, line in enumerate(lines)
+        if line.startswith('## ') and LANE_RECORD_DIVERGENCE in line
+    ]
+    return lines[start:]
 
 
 # ---------------------------------------------------------------------------
@@ -1092,6 +1295,68 @@ class TestModelRoleRollupCore:
         )
         assert rollup.rows == []
 
+    def test_query_form_equals_the_fail_open_wrapper(self, tmp_path: Path) -> None:
+        """On a readable store the connection-taking form and the fail-open
+        form return the same rollup, turn-cap saturation included, and the
+        connection-taking form leaves the connection it was handed open."""
+        db_path = tmp_path / 'runs.db'
+        _seed_rollup_runs_db(db_path)
+        run_id = 'run-test'
+        window = ('2026-05-10T00:00:00+00:00', '2026-05-10T23:59:59+00:00')
+        _insert_task_result(db_path, run_id=run_id, task_id='t1', outcome='done')
+        _insert_invocation(
+            db_path, run_id=run_id, task_id='t1', model='sonnet', role='implementer',
+            cost_usd=2.0, capped=False, completed_at='2026-05-10T08:00:00+00:00',
+        )
+        _insert_event(
+            db_path, run_id=run_id, task_id='t1', event_type='routing_decision',
+            role='implementer', data={'max_turns': 30}, timestamp='2026-05-10T07:59:00+00:00',
+        )
+        _insert_event(
+            db_path, run_id=run_id, task_id='t1', event_type='invocation_end',
+            role='implementer', data={'turns': 30}, timestamp='2026-05-10T08:00:00+00:00',
+        )
+
+        conn = sqlite3.connect(db_path)
+        try:
+            rollup = digest.query_model_role_rollup(conn, *window)
+            assert conn.execute('SELECT 1').fetchone() == (1,)
+        finally:
+            conn.close()
+
+        assert rollup.rows
+        assert rollup.turn_cap_saturation
+        assert rollup == digest.model_role_rollup(db_path, *window)
+
+    @pytest.mark.parametrize('table', ['events', 'invocations', 'task_results'])
+    def test_query_form_raises_on_a_missing_table(self, tmp_path: Path, table: str) -> None:
+        """Each table the rollup reads is required: dropping any one raises
+        naming it, rather than yielding an empty or partial rollup."""
+        db_path = tmp_path / 'runs.db'
+        _seed_rollup_runs_db(db_path)
+
+        conn = sqlite3.connect(db_path)
+        try:
+            conn.execute(f'DROP TABLE {table}')
+            conn.commit()
+            with pytest.raises(sqlite3.OperationalError, match=table):
+                digest.query_model_role_rollup(
+                    conn, '2026-05-10T00:00:00+00:00', '2026-05-10T23:59:59+00:00',
+                )
+        finally:
+            conn.close()
+
+    def test_schema_less_db_still_returns_an_empty_rollup(self, tmp_path: Path) -> None:
+        """The path-taking form keeps failing open on a store with no tables."""
+        db_path = tmp_path / 'schema-less.db'
+        sqlite3.connect(str(db_path)).close()
+
+        rollup = digest.model_role_rollup(
+            db_path, '2026-05-10T00:00:00+00:00', '2026-05-10T23:59:59+00:00',
+        )
+
+        assert rollup == digest.ModelRoleRollup()
+
 
 class TestModelRoleRollupTurnCapSaturation:
     """Tests for digest.model_role_rollup(...).turn_cap_saturation (step-3/4)."""
@@ -1208,3 +1473,34 @@ class TestRenderDigestRollupSection:
         md = digest.render_digest_markdown(inputs)  # must not raise
         assert '## Per-(model×role) rollup' in md
         assert '_none_' in md
+
+
+# ---------------------------------------------------------------------------
+# Which escalations feed the EWA numerator (task 3821)
+# ---------------------------------------------------------------------------
+
+
+def _escalation_by(agent_role: str, level: int) -> Escalation:
+    return Escalation(
+        id=f'esc-T1-{level}',
+        task_id='T1',
+        agent_role=agent_role,
+        severity='info',
+        category='risk_identified',
+        summary='summary',
+        detail='detail',
+        suggested_action='manual_investigation',
+        level=level,
+    )
+
+
+class TestCountsTowardEwaNumerator:
+    @pytest.mark.parametrize('level', [0, 1])
+    def test_a_starvation_watchdog_alarm_is_an_observation_not_a_fault(self, level: int) -> None:
+        esc = _escalation_by(STARVATION_WATCHDOG_ROLE, level)
+        assert digest.counts_toward_ewa_numerator(esc) is False
+
+    @pytest.mark.parametrize('role', ['implementer', 'orchestrator-scheduler', 'steward'])
+    def test_every_other_role_counts(self, role: str) -> None:
+        assert digest.counts_toward_ewa_numerator(_escalation_by(role, 0)) is True
+

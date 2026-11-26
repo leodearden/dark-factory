@@ -16,10 +16,23 @@ FAIL-SAFE ASYMMETRY (the hard constraint):
 AdjudicationVerdict.should_allow_creation == True ← ONLY when verdict=='allow'
   and not failed.  Every other state: should_allow_creation == False.
 
+  That polarity is FAIL-SAFE TOWARD REJECTING, because the designed caller's
+  base state is "reject": every failure mode must preserve the Stage-1
+  rejection.  A caller whose base state is the OPPOSITE — allow, do nothing,
+  stamp nothing, e.g. the task-3122 soft-signal trigger, whose signals are
+  explicitly too weak to gate on — must NOT read ``not
+  should_allow_creation``: that would convert every timeout, breaker-open,
+  exception and malformed response into a positive finding manufactured by
+  infrastructure failure.  Such callers read
+  ``is_confirmed_misroute`` instead, which is fail-safe toward doing
+  nothing.  The two are deliberately NOT complements: both are False for
+  ``uncertain`` and both are False for every failed state.  Each is
+  fail-safe toward its own caller's base state.
+
 Reuses:
 - ``shared.cli_invoke.invoke_with_cap_retry`` (same call shape as TaskCurator)
 - ``AgentResult`` / ``is_zero_output_timeout`` / ``AllAccountsCappedException``
-- Consecutive-ZOT circuit breaker (mirrors task_curator.py lines 505-543)
+- ``middleware/zero_output_breaker.py::ZeroOutputBreaker`` (shared with TaskCurator)
 """
 
 from __future__ import annotations
@@ -28,16 +41,24 @@ import logging
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
+from shared.account_reserve import WorkClass, WorkKind
 from shared.cli_invoke import (
-    AgentResult,  # noqa: F401 (re-exported for tests)
+    BUDGET_EXHAUSTED_SUBTYPE,
+    AgentResult,  # (re-exported for tests)
     invoke_with_cap_retry,
     is_zero_output_timeout,
+    no_mcp_servers_config,
 )
 from shared.neutral_cwd import neutral_cli_cwd
 
+from fused_memory.middleware.zero_output_breaker import ZeroOutputBreaker
+
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
+    from shared.cost_store import CostStore
     from shared.usage_gate import UsageGate
 
     from fused_memory.config.schema import PathScopeAdjudicatorConfig
@@ -113,6 +134,9 @@ Do not add explanatory text outside the JSON.
 # of failure matters more than exhausting wait-for-cap credit.
 _ADJUDICATOR_CAP_WAIT_SANITY_SECS: float = 60.0
 
+# The invocations-ledger role this adjudicator's calls are recorded under.
+_LEDGER_ROLE = 'path_scope_adjudicator'
+
 
 # ---------------------------------------------------------------------------
 # Verdict dataclass
@@ -126,6 +150,11 @@ class AdjudicationVerdict:
     ``should_allow_creation`` is the primary decision gate for callers:
     - ``True`` ONLY when ``verdict == 'allow'`` AND ``failed == False``.
     - ``False`` for reject / uncertain / any failure mode.
+
+    ``is_confirmed_misroute`` is its correctly-polarised counterpart for a
+    caller whose base state is ALLOW rather than REJECT.  See the module
+    header's FAIL-SAFE ASYMMETRY block: the two properties are deliberately
+    not complements.
     """
 
     verdict: Literal['allow', 'reject', 'uncertain'] = 'uncertain'
@@ -137,6 +166,30 @@ class AdjudicationVerdict:
     def should_allow_creation(self) -> bool:
         """Return True iff the adjudicator is confident the heuristic hit was a false positive."""
         return self.verdict == 'allow' and not self.failed
+
+    @property
+    def is_confirmed_misroute(self) -> bool:
+        """Return True iff the adjudicator AFFIRMATIVELY confirmed a misroute.
+
+        True ONLY when ``verdict == 'reject'`` AND ``failed == False``.
+
+        DELIBERATELY NOT ``not should_allow_creation``, and getting that
+        wrong is silent and expensive.  ``should_allow_creation`` is
+        fail-safe toward REJECTING — its designed caller's base state is
+        "reject", so every failure mode must preserve that rejection.  A
+        soft-signal caller's base state is the OPPOSITE: allow, do nothing,
+        no marker, no escalation.  Reading ``not should_allow_creation``
+        there would convert every timeout, breaker-open, exception,
+        budget-misconfig and malformed response into a stamped misroute
+        marker plus an operator escalation — a false accusation manufactured
+        by infrastructure failure, on a signal whose whole premise is that
+        it is too weak to gate on.
+
+        So the two are not complements: BOTH are False for ``uncertain``,
+        and both are False for every failed state.  Each is fail-safe toward
+        its own caller's base state.  No existing caller's behaviour moves.
+        """
+        return self.verdict == 'reject' and not self.failed
 
 
 _VALID_VERDICTS = frozenset({'allow', 'reject', 'uncertain'})
@@ -172,48 +225,21 @@ class PathScopeAdjudicator:
         usage_gate: UsageGate | None = None,
         cwd: Path | None = None,
         scope_violation_escalator: ScopeViolationEscalator | None = None,
+        *,
+        cost_store: CostStore | None = None,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._config = config
+        self._clock = clock
         self._usage_gate = usage_gate
+        self._cost_store = cost_store
         self._cwd = cwd
         self._escalator = scope_violation_escalator
 
-        # Consecutive-ZOT circuit breaker (mirrors TaskCurator lines 505-543).
-        self._consecutive_zero_output_timeouts: int = 0
-        self._zero_output_breaker_open_until: float | None = None
-
-    # ------------------------------------------------------------------
-    # Circuit-breaker helpers (mirror task_curator.py 516-543)
-    # ------------------------------------------------------------------
-
-    def _breaker_open(self, now: float) -> bool:
-        """Return True while the ZOT breaker is tripped and cooldown has not elapsed."""
-        return (
-            self._zero_output_breaker_open_until is not None
-            and now < self._zero_output_breaker_open_until
+        self._zero_output_breaker = ZeroOutputBreaker(
+            threshold=config.zero_output_breaker_threshold,
+            cooldown_seconds=config.zero_output_breaker_cooldown_seconds,
         )
-
-    def _record_zero_output_timeout(self, now: float) -> None:
-        """Increment the consecutive-ZOT counter; open the breaker when threshold is reached."""
-        self._consecutive_zero_output_timeouts += 1
-        if (
-            self._consecutive_zero_output_timeouts
-            >= self._config.zero_output_breaker_threshold
-        ):
-            self._zero_output_breaker_open_until = (
-                now + self._config.zero_output_breaker_cooldown_seconds
-            )
-            logger.warning(
-                'path_scope_adjudicator: zero-output-breaker OPEN after %d consecutive ZOTs; '
-                'short-circuiting adjudicator LLM calls for %.0fs',
-                self._consecutive_zero_output_timeouts,
-                self._config.zero_output_breaker_cooldown_seconds,
-            )
-
-    def _reset_breaker(self) -> None:
-        """Reset the breaker on any real LLM success."""
-        self._consecutive_zero_output_timeouts = 0
-        self._zero_output_breaker_open_until = None
 
     # ------------------------------------------------------------------
     # Prompt builders
@@ -254,6 +280,20 @@ class PathScopeAdjudicator:
         )
 
     # ------------------------------------------------------------------
+    # LLM call
+    # ------------------------------------------------------------------
+
+    def _ledger_kwargs(self) -> dict[str, Any]:
+        """The ``invoke_with_cap_retry`` kwargs that land a call in the invocations ledger.
+
+        ``run_id`` is read from the gate, so adjudicator invocations and the gate's
+        own account events share one run key, as in
+        ``fused_memory/middleware/task_curator.py::TaskCurator._ledger_kwargs``.
+        """
+        run_id = (self._usage_gate.run_id or '') if self._usage_gate is not None else ''
+        return {'cost_store': self._cost_store, 'role': _LEDGER_ROLE, 'run_id': run_id}
+
+    # ------------------------------------------------------------------
     # Main entry point
     # ------------------------------------------------------------------
 
@@ -281,10 +321,10 @@ class PathScopeAdjudicator:
             suggested_project: The project the guard believes it belongs to.
             project_root: The filing project's root directory.
         """
-        now = time.monotonic()
+        now = self._clock()
 
         # --- Circuit-breaker gate ---
-        if self._breaker_open(now):
+        if self._zero_output_breaker.is_open(now):
             logger.debug(
                 'path_scope_adjudicator: breaker open; failing safe for project %r',
                 project_id,
@@ -321,9 +361,15 @@ class PathScopeAdjudicator:
                 max_budget_usd=self._config.max_budget_usd,
                 disallowed_tools=['*'],
                 output_schema=ADJUDICATION_SCHEMA,
+                mcp_config=no_mcp_servers_config(),
+                strict_mcp_config=True,
                 permission_mode='bypassPermissions',
                 timeout_seconds=self._config.timeout_seconds,
                 cap_wait_sanity_secs=_ADJUDICATOR_CAP_WAIT_SANITY_SECS,
+                work_class=WorkClass(
+                    kind=WorkKind.ESSENTIAL, project_id=project_id, role=_LEDGER_ROLE,
+                ),
+                **self._ledger_kwargs(),
             )
         except Exception as exc:
             logger.warning(
@@ -346,10 +392,10 @@ class PathScopeAdjudicator:
             # config defect, not a transient hang.  Gate on both subtype and
             # cost_usd>0 so:
             #   (a) genuine ZOTs (timed_out=True, cost=0) still fall through to
-            #       _record_zero_output_timeout (the ZOT breaker path);
+            #       the ZOT breaker path;
             #   (b) zero-cost error_max_budget_usd from a schema-tool-denied
             #       pre-turn failure are NOT misclassified as a budget defect.
-            if agent_result.subtype == 'error_max_budget_usd' and agent_result.cost_usd > 0:
+            if agent_result.subtype == BUDGET_EXHAUSTED_SUBTYPE and agent_result.cost_usd > 0:
                 misconfig_reason = (
                     f'budget-misconfig: error_max_budget_usd '
                     f'cost_usd={agent_result.cost_usd} turns={agent_result.turns} '
@@ -389,11 +435,17 @@ class PathScopeAdjudicator:
                     llm_used=True,
                 )
 
-            if is_zero_output_timeout(agent_result):
-                # Capture a fresh timestamp so the cooldown window is measured
-                # from when the failure was observed, not from before the
-                # (potentially 60s) hung LLM call started — mirrors task_curator.py:935-938.
-                self._record_zero_output_timeout(time.monotonic())
+            # A fresh timestamp measures the cooldown from when the failure was
+            # observed, not from before the (potentially 60s) hung LLM call started.
+            if is_zero_output_timeout(agent_result) and self._zero_output_breaker.record_timeout(
+                self._clock()
+            ):
+                logger.warning(
+                    'path_scope_adjudicator: zero-output-breaker OPEN after %d consecutive ZOTs; '
+                    'short-circuiting adjudicator LLM calls for %.0fs',
+                    self._zero_output_breaker.consecutive_timeouts,
+                    self._zero_output_breaker.cooldown_seconds,
+                )
             reason = (
                 f'llm-failed: timed_out={agent_result.timed_out} '
                 f'subtype={agent_result.subtype!r}'
@@ -410,7 +462,7 @@ class PathScopeAdjudicator:
             )
 
         # --- Success: reset breaker and parse output ---
-        self._reset_breaker()
+        self._zero_output_breaker.close()
 
         structured = agent_result.structured_output
         if not isinstance(structured, dict):

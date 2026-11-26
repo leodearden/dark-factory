@@ -23,6 +23,9 @@
 #   step-7  — single-ref LIVE/LANDED/ABSENT + substring-safety
 #   step-9  — fleet-audit mode (no status oracle)
 #   step-11 — fleet-audit status-oracle (advisory filter)
+#   esc-7244-16 — K1-K6: the conventional-commit citation form, the usual
+#            landed tip in both repos
+#   M — merge-subject arm rendered from shared.merge_subject (task 6716)
 #
 # Driven by orchestrator/tests/test_warm_lane_bash_suite.py (PORTED_TESTS).
 
@@ -139,7 +142,8 @@ fixture_branch_own_commit() {
 # U5 — --task with no value                    -> exit 2
 # U6 — --task N and --audit together           -> exit 2 (mutually exclusive)
 # U7 — --task with a non-numeric id            -> exit 2
-# All error cases (U1, U4-U7): empty stdout.
+# U8 — --task multi-line, first line numeric   -> exit 2, validator message
+# All error cases (U1, U4-U8): empty stdout.
 # ─────────────────────────────────────────────────────────────────────────────
 echo ""
 echo "--- step-1: arg-parsing / usage taxonomy ---"
@@ -181,6 +185,12 @@ run_helper --task abc
 assert "U7: --task with non-numeric id exits 2" test "$RC" -eq 2
 assert "U7: stderr is non-empty" bash -c '[ -n "$1" ]' _ "$ERR_OUT"
 assert "U7: stdout is empty" bash -c '[ -z "$1" ]' _ "$OUT"
+
+run_helper --task $'5\nx'
+assert "U8: --task with multi-line id exits 2" test "$RC" -eq 2
+assert "U8: stderr carries the --task validator message" \
+    bash -c 'grep -qF -- "--task must be a positive integer" <<<"$1"' _ "$ERR_OUT"
+assert "U8: stdout is empty" bash -c '[ -z "$1" ]' _ "$OUT"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # step-3 — structural-error taxonomy (exit 3)
@@ -429,6 +439,115 @@ assert "R1: stdout is 'landed <tip sha>' (prefix matched literally, not as ERE q
     bash -c '[ "$1" = "landed $2" ]' _ "$OUT" "$R1_TIP"
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Amendment (esc-7244-16) — conventional-commit citation-form coverage
+#
+# Task commits in both repos read `kind(<id>): …`, so the commonest landed tip
+# cites its task that way and in no other. Before the grammar recognised the
+# form, 81 such refs in the live pool classified as degenerate.
+#
+# K1 — task/47 tip is a non-merge `fix(47): …` commit on main (count==0)
+#      -> exit 4, "landed <sha>" (the conventional-commit path alone: no
+#      merge subject, no '#47').
+# K2 — task/48 tip reads `impl(4812): …` (count==0) -> exit 0, "degenerate
+#      <sha>": the arm's boundary, mirroring L4 and H2.
+# K3 — task/49 tip's SUBJECT cites nothing and its BODY lists `impl(49): …`
+#      (count==0) -> exit 0, "degenerate <sha>": the arm is subject-only, so
+#      a squash body listing this task's commits is not a citation.
+# K4 — show-ref is byte-identical across all five runs (read-only invariant).
+# K5 — task/50 tip's first paragraph spans two lines, the id on the second
+#      -> exit 4, "landed <sha>": this script holds %B, and the grammar's
+#      subject is git's %s (the joined first paragraph), so it agrees with the
+#      sweep and dark-factory, which hold %s.
+# K6 — task/51 tip is ANOTHER task's `fix(4812): rebase onto task/51` commit
+#      -> exit 4, "landed <sha>". Pinned as a known consequence, not a goal:
+#      the verdict is "the tip cites N", and that subject does. dark-factory
+#      accepts that direction of error on the MEASUREMENT (81 of 427
+#      live-pool refs flipped degenerate -> landed, none the reverse), NOT
+#      because a false `landed` is cheap at both its call sites. It is not:
+#        * `git_ops.py::_abort_lane_acquisition` deletes only on
+#          `degenerate`, so a false `landed` costs a retained, stale branch;
+#        * `harness.py`'s MARK_DONE_WITH_PROVENANCE downgrade also fires only
+#          on `degenerate`, so a false `landed` lets MARK_DONE proceed — a
+#          PHANTOM-DONE task, the exact failure that guard was written to
+#          prevent. Its one degeneracy-specific backstop is the independent
+#          `_branch_is_degenerate(branch, metadata)` disjunct, and that is
+#          fail-open: `landing_evidence.py::branch_is_degenerate` returns
+#          False whenever `metadata['branch_base_sha']` is absent or is not
+#          a 40-hex sha. THIS FIXTURE is that shape — a foreign on-main tip
+#          citing task 51 would phantom-complete task 51 at that site.
+#      A false `degenerate` is still the worse error (it re-dispatches landed
+#      work, or deletes its branch, on EVERY such ref rather than on a
+#      contrived one), which is what makes the widening net-positive.
+# ─────────────────────────────────────────────────────────────────────────────
+echo ""
+echo "--- amendment: conventional-commit citation-form coverage ---"
+
+# fixture_branch_at_message_commit <repo> <branch_task_id> <message> [prefix]
+# Creates a NEW non-merge commit directly on main carrying <message>, then
+# points refs/heads/<prefix><branch_task_id> at it, so exactly one citation
+# form — whichever <message> spells — can decide the verdict.
+fixture_branch_at_message_commit() {
+    local repo="$1" branch_id="$2" message="$3" prefix="${4:-task/}"
+    local sha
+    git -C "$repo" commit -q --allow-empty -m "$message" >/dev/null
+    sha="$(git -C "$repo" rev-parse HEAD)"
+    git -C "$repo" branch -q "${prefix}${branch_id}" "$sha"
+}
+
+K_TMP="$(mktemp -d /tmp/test-warm-lane-degen-ref-kind-XXXXXX)"
+_TMPDIRS+=("$K_TMP")
+K_REPO="$K_TMP/repo"
+build_fixture "$K_REPO"
+fixture_branch_at_message_commit "$K_REPO" 47 "fix(47): the task's last step"
+fixture_branch_at_message_commit "$K_REPO" 48 "impl(4812): a different task's step"
+fixture_branch_at_message_commit "$K_REPO" 49 "chore: squash summary
+
+impl(49): a listed commit, not a citation"
+fixture_branch_at_message_commit "$K_REPO" 50 "fix: rebase the loader
+onto task/50 before landing"
+fixture_branch_at_message_commit "$K_REPO" 51 "fix(4812): rebase onto task/51"
+
+K_47_TIP="$(git -C "$K_REPO" rev-parse refs/heads/task/47)"
+K_48_TIP="$(git -C "$K_REPO" rev-parse refs/heads/task/48)"
+K_49_TIP="$(git -C "$K_REPO" rev-parse refs/heads/task/49)"
+K_50_TIP="$(git -C "$K_REPO" rev-parse refs/heads/task/50)"
+K_51_TIP="$(git -C "$K_REPO" rev-parse refs/heads/task/51)"
+K_SHOWREF_BEFORE="$(git -C "$K_REPO" show-ref 2>/dev/null || true)"
+
+run_helper --task 47 --repo "$K_REPO"
+assert "K1: 'fix(47): …' tip (ancestor of main) exits 4" test "$RC" -eq 4
+assert "K1: stdout is 'landed <tip sha>'" \
+    bash -c '[ "$1" = "landed $2" ]' _ "$OUT" "$K_47_TIP"
+
+run_helper --task 48 --repo "$K_REPO"
+assert "K2: task 48 (tip reads 'impl(4812)', count==0) exits 0 (degenerate, not landed)" \
+    test "$RC" -eq 0
+assert "K2: stdout is 'degenerate <tip sha>'" \
+    bash -c '[ "$1" = "degenerate $2" ]' _ "$OUT" "$K_48_TIP"
+
+run_helper --task 49 --repo "$K_REPO"
+assert "K3: task 49 (own id only in a BODY line, count==0) exits 0 (degenerate)" \
+    test "$RC" -eq 0
+assert "K3: stdout is 'degenerate <tip sha>'" \
+    bash -c '[ "$1" = "degenerate $2" ]' _ "$OUT" "$K_49_TIP"
+
+run_helper --task 50 --repo "$K_REPO"
+assert "K5: a two-line first paragraph citing 50 on its second line exits 4 (landed)" \
+    test "$RC" -eq 4
+assert "K5: stdout is 'landed <tip sha>'" \
+    bash -c '[ "$1" = "landed $2" ]' _ "$OUT" "$K_50_TIP"
+
+run_helper --task 51 --repo "$K_REPO"
+assert "K6: a foreign 'fix(4812): rebase onto task/51' tip exits 4 (landed — the subject cites 51)" \
+    test "$RC" -eq 4
+assert "K6: stdout is 'landed <tip sha>'" \
+    bash -c '[ "$1" = "landed $2" ]' _ "$OUT" "$K_51_TIP"
+
+K_SHOWREF_AFTER="$(git -C "$K_REPO" show-ref 2>/dev/null || true)"
+assert "K4: show-ref is byte-identical across all five runs (read-only invariant)" \
+    bash -c '[ "$1" = "$2" ]' _ "$K_SHOWREF_BEFORE" "$K_SHOWREF_AFTER"
+
+# ─────────────────────────────────────────────────────────────────────────────
 # step-9 — fleet-audit mode (no status oracle)
 #
 # Fixture mix: two degenerate (9101, 9102; foreign merges), one live (9103;
@@ -547,5 +666,101 @@ assert "O2: 9206 (oracle prints empty) row status is 'unknown'" \
 assert "O2: summary flagged=2 (both unknown treated as non-terminal)" \
     bash -c 'printf "%s\n" "$1" | grep -qxF "audit: degenerate=2 live=0 landed=0 absent=0 total=2 flagged=2"' \
     _ "$OUT"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# M — merge-subject arm rendered from shared.merge_subject (task 6716)
+#
+# Every subject here is written by shared.merge_subject.format_merge_subject,
+# for a feat/ prefix landing into trunk, so a merge arm that still spells
+# "task/" or "main" cannot classify it.
+#
+# M1 — feat/<id> parked on a no-ff merge carrying its own landing subject
+#      -> `landed <sha>`, exit 4
+# M2 — feat/<id2> parked on `Revert "<landing subject of feat/<id2>>"`
+#      -> `degenerate <sha>`, exit 0
+# M3 — the script and its lib copied where no shared/src sits three levels up
+#      -> exit 2 (wiring), stderr names shared.merge_subject
+# M4 — the lib called in reify's three-argument form, with no merge head/into,
+#      on a body line that merely starts with the id -> refuses, rc 2, rather
+#      than citing; the five-argument call on the same message answers rc 1
+# M5 — task_citation_peer_ids in reify's two-argument form -> rc 2, no ids
+# ─────────────────────────────────────────────────────────────────────────────
+M_SHARED_SRC="$(cd "$WARM_LANE_SCRIPTS_DIR/../../.." && pwd)/shared/src"
+
+# m_subject <branch> <main_branch> — the landing subject, from shared.
+m_subject() {
+    python3 -I -c 'import sys; sys.path.insert(0, sys.argv[1]); from shared.merge_subject import format_merge_subject; print(format_merge_subject(sys.argv[2], sys.argv[3]))' \
+        "$M_SHARED_SRC" "$1" "$2"
+}
+
+M_TMP="$(mktemp -d /tmp/test-warm-lane-degen-ref-merge-subject-XXXXXX)"
+_TMPDIRS+=("$M_TMP")
+M_REPO="$M_TMP/repo"
+git init -q -b trunk "$M_REPO"
+git -C "$M_REPO" config user.email "test@test.local"
+git -C "$M_REPO" config user.name "Test"
+git -C "$M_REPO" commit -q --allow-empty -m "initial"
+
+git -C "$M_REPO" checkout -q -b _m-side trunk
+git -C "$M_REPO" commit -q --allow-empty -m "work for the merge-subject block"
+git -C "$M_REPO" checkout -q trunk
+git -C "$M_REPO" merge -q --no-ff -m "$(m_subject feat/6101 trunk)" _m-side
+git -C "$M_REPO" branch -q -D _m-side
+M_LANDED_TIP="$(git -C "$M_REPO" rev-parse HEAD)"
+git -C "$M_REPO" branch -q feat/6101 "$M_LANDED_TIP"
+
+git -C "$M_REPO" commit -q --allow-empty -m "Revert \"$(m_subject feat/6102 trunk)\""
+M_REVERT_TIP="$(git -C "$M_REPO" rev-parse HEAD)"
+git -C "$M_REPO" branch -q feat/6102 "$M_REVERT_TIP"
+
+run_helper --task 6101 --main-ref trunk --branch-prefix feat/ --repo "$M_REPO"
+assert "M1: feat/6101 on its own landing subject into trunk exits 4 (landed)" \
+    test "$RC" -eq 4
+assert "M1: stdout is 'landed <tip sha>'" \
+    bash -c '[ "$1" = "landed $2" ]' _ "$OUT" "$M_LANDED_TIP"
+
+run_helper --task 6102 --main-ref trunk --branch-prefix feat/ --repo "$M_REPO"
+assert "M2: feat/6102 on a Revert of its landing subject exits 0 (degenerate)" \
+    test "$RC" -eq 0
+assert "M2: stdout is 'degenerate <tip sha>'" \
+    bash -c '[ "$1" = "degenerate $2" ]' _ "$OUT" "$M_REVERT_TIP"
+
+M3_DIR="$M_TMP/relocated"
+mkdir -p "$M3_DIR"
+cp "$SCRIPT" "$WARM_LANE_SCRIPTS_DIR/lib_task_citation.sh" "$M3_DIR/"
+M3_RC=0
+M3_ERR="$(bash "$M3_DIR/warm-lane-degenerate-ref-check.sh" \
+    --task 6101 --main-ref trunk --branch-prefix feat/ --repo "$M_REPO" 2>&1 >/dev/null)" || M3_RC=$?
+assert "M3: no shared/src three levels above the relocated script exits 2 (wiring)" \
+    test "$M3_RC" -eq 2
+assert "M3: stderr names shared.merge_subject" \
+    bash -c 'printf "%s\n" "$1" | grep -qF "shared.merge_subject"' _ "$M3_ERR"
+
+M_LIB="$WARM_LANE_SCRIPTS_DIR/lib_task_citation.sh"
+M_BODY_MSG=$'chore: tidy\n\n6101 files touched'
+M_HEAD_INTO="$(python3 -I -c 'import sys; sys.path.insert(0, sys.argv[1]); from shared.merge_subject import rendered_prefix; print("\n".join(rendered_prefix(sys.argv[2])))' \
+    "$M_SHARED_SRC" feat/)"
+M_HEAD_RE="${M_HEAD_INTO%%$'\n'*}"
+M_INTO_RE="${M_HEAD_INTO#*$'\n'}"
+
+M4_RC=0
+M4_ERR="$(bash -c 'source "$1"; task_citation_message_cites "$2" 6101 "feat\\/"' \
+    _ "$M_LIB" "$M_BODY_MSG" 2>&1 >/dev/null)" || M4_RC=$?
+assert "M4: a three-argument call refuses with rc 2 rather than citing" \
+    test "$M4_RC" -eq 2
+assert "M4: stderr names the missing merge head/into" \
+    bash -c 'printf "%s\n" "$1" | grep -qF "<merge_head_re> and <merge_into_re>"' _ "$M4_ERR"
+assert "M4: control — the five-argument call on the same message does not cite (rc 1)" \
+    bash -c 'source "$1"; task_citation_message_cites "$2" 6101 "feat\\/" "$3" "$4"; [ "$?" -eq 1 ]' \
+    _ "$M_LIB" "$M_BODY_MSG" "$M_HEAD_RE" "$M_INTO_RE"
+
+M5_RC=0
+M5_OUT="$(bash -c 'source "$1"; task_citation_peer_ids "$2" "feat\\/"' \
+    _ "$M_LIB" "$M_BODY_MSG" 2>/dev/null)" || M5_RC=$?
+assert "M5: a two-argument task_citation_peer_ids refuses with rc 2" \
+    test "$M5_RC" -eq 2
+assert "M5: and names no peer id" \
+    test -z "$M5_OUT"
 
 test_summary

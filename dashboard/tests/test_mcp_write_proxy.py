@@ -1,0 +1,247 @@
+"""Every MCP-write route renders tool results and failures, and fails over, identically.
+
+Driven through the public HTTP seam only: each route is posted a valid body
+while ``memory.mcp_tool_call`` is scripted to answer that route's tool. The
+two-URL cases pin that a write is failed over to the next fused-memory URL only
+when the failure proves it never reached the server.
+"""
+
+from __future__ import annotations
+
+import logging
+from collections.abc import Awaitable, Callable
+from unittest.mock import AsyncMock, patch
+
+import httpx
+import pytest
+
+_PATCH_TARGET = 'dashboard.data.memory.mcp_tool_call'
+
+_WRITE_ROUTES = [
+    pytest.param(
+        '/api/v2/dashboard/curator/cancel',
+        {'ticket_id': 'tkt_abc'},
+        'cancel_ticket',
+        id='curator-cancel',
+    ),
+    pytest.param(
+        '/api/v2/dashboard/scheduler/override',
+        {'task_id': 'T1', 'project_root': '/proj'},
+        'set_task_priority_override',
+        id='scheduler-override',
+    ),
+    pytest.param(
+        '/api/v2/dashboard/scheduler/clear-override',
+        {'task_id': 'T1', 'project_root': '/proj'},
+        'clear_task_priority_override',
+        id='scheduler-clear-override',
+    ),
+    pytest.param(
+        '/api/v2/dashboard/scheduler/reorder-pin-queue',
+        {'task_ids': ['T1'], 'project_root': '/proj'},
+        'reorder_pin_queue',
+        id='scheduler-reorder-pin-queue',
+    ),
+    pytest.param(
+        '/api/v2/dashboard/scheduler/evict-park',
+        {'task_id': 'T1', 'project_root': '/proj'},
+        'request_park_eviction',
+        id='scheduler-evict-park',
+    ),
+]
+
+_DETAIL_CAUSE_CHAR_CAP = 200
+
+
+def _http_status_error(message: str) -> httpx.HTTPStatusError:
+    request = httpx.Request('POST', 'http://x')
+    return httpx.HTTPStatusError(
+        message, request=request, response=httpx.Response(500, request=request)
+    )
+
+
+_RENDERED_FAILURES = [
+    pytest.param(httpx.ConnectError('refused'), 'ConnectError: refused', id='ConnectError'),
+    pytest.param(
+        httpx.TimeoutException('timed out'),
+        'TimeoutException: timed out',
+        id='TimeoutException',
+    ),
+    pytest.param(
+        _http_status_error('server error'), 'HTTPStatusError: server error', id='HTTPStatusError'
+    ),
+    pytest.param(ValueError('X' * 300), 'ValueError: ' + 'X' * 300, id='long-ValueError'),
+    pytest.param(
+        _http_status_error('X' * 300),
+        'HTTPStatusError: ' + 'X' * 300,
+        id='long-HTTPStatusError',
+    ),
+]
+
+
+def _scripted_per_url(
+    tool_name: str, outcome_for: Callable[[str], object], dialed: list[str]
+) -> Callable[..., Awaitable[object]]:
+    """Answer *tool_name* at *url* with ``outcome_for(url)`` (raised if an exception).
+
+    Each URL *tool_name* is dialed at is appended to *dialed*. Each write route
+    dials only its own tool (``dashboard/src/dashboard/app.py::_mcp_write_proxy``),
+    so a dial of any other tool fails the test.
+    """
+
+    async def _scripted_mcp_tool_call(
+        client: object, url: str, called_tool: str, arguments: object, **kwargs: object
+    ) -> object:
+        assert called_tool == tool_name, f'route dialed {called_tool!r}, expected only {tool_name!r}'
+        dialed.append(url)
+        outcome = outcome_for(url)
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome
+
+    return _scripted_mcp_tool_call
+
+
+def _scripted(tool_name: str, outcome: object) -> Callable[..., Awaitable[object]]:
+    return _scripted_per_url(tool_name, lambda _url: outcome, dialed=[])
+
+
+def _post_with_tool_outcome(
+    client, path: str, body: dict, tool_name: str, outcome: object
+) -> httpx.Response:
+    with patch(_PATCH_TARGET, new=AsyncMock(side_effect=_scripted(tool_name, outcome))):
+        return client.post(path, json=body)
+
+
+def _call_site_warnings(caplog: pytest.LogCaptureFixture, tool_name: str) -> list[str]:
+    return [
+        r.getMessage()
+        for r in caplog.records
+        if r.name == 'dashboard.app'
+        and r.levelno == logging.WARNING
+        and r.getMessage().startswith(f'{tool_name} failed for ')
+    ]
+
+
+def _only_fused_memory_url(client) -> str:
+    (url,) = client.app.state.config.fused_memory_urls
+    return url
+
+
+@pytest.mark.parametrize(('path', 'body', 'tool_name'), _WRITE_ROUTES)
+def test_non_dict_tool_result_is_forwarded_verbatim(client, path, body, tool_name):
+    resp = _post_with_tool_outcome(client, path, body, tool_name, ['unexpected', 'list'])
+
+    assert resp.status_code == 200
+    assert resp.json() == ['unexpected', 'list']
+
+
+@pytest.mark.parametrize(('path', 'body', 'tool_name'), _WRITE_ROUTES)
+def test_failure_with_empty_message_names_the_exception_type(
+    client, caplog, path, body, tool_name
+):
+    url = _only_fused_memory_url(client)
+    with caplog.at_level(logging.DEBUG):
+        resp = _post_with_tool_outcome(client, path, body, tool_name, httpx.PoolTimeout(''))
+
+    assert resp.status_code == 502
+    assert resp.json()['error'] == 'fused_memory_unreachable'
+    assert resp.json()['detail'] == f'{url}: PoolTimeout'
+    assert _call_site_warnings(caplog, tool_name) == [f'{tool_name} failed for {url}: PoolTimeout']
+    assert not [
+        r
+        for r in caplog.records
+        if r.name == 'dashboard.data.mcp_fanout' and tool_name in r.getMessage()
+    ], 'log_failures=False must leave reporting entirely to the call site'
+
+
+@pytest.mark.parametrize(('exc', 'rendered_cause'), _RENDERED_FAILURES)
+@pytest.mark.parametrize(('path', 'body', 'tool_name'), _WRITE_ROUTES)
+def test_failure_names_its_type_once_capped_in_the_502_detail_but_whole_in_the_warning(
+    client, caplog, path, body, tool_name, exc, rendered_cause
+):
+    url = _only_fused_memory_url(client)
+    with caplog.at_level(logging.WARNING, logger='dashboard.app'):
+        resp = _post_with_tool_outcome(client, path, body, tool_name, exc)
+
+    assert resp.status_code == 502
+    assert resp.json()['detail'] == f'{url}: {rendered_cause[:_DETAIL_CAUSE_CHAR_CAP]}'
+    assert _call_site_warnings(caplog, tool_name) == [
+        f'{tool_name} failed for {url}: {rendered_cause}'
+    ]
+
+
+def _two_fused_memory_urls(client) -> tuple[str, str]:
+    first, second = client.app.state.config.fused_memory_urls
+    return first, second
+
+
+def _post_with_per_url_outcomes(
+    client, path: str, body: dict, tool_name: str, outcomes: dict[str, object]
+) -> tuple[httpx.Response, list[str]]:
+    dialed: list[str] = []
+    scripted = _scripted_per_url(tool_name, outcomes.__getitem__, dialed)
+    with patch(_PATCH_TARGET, new=AsyncMock(side_effect=scripted)):
+        resp = client.post(path, json=body)
+    return resp, dialed
+
+
+@pytest.mark.parametrize(
+    'exc',
+    [
+        pytest.param(httpx.ReadTimeout('read timed out'), id='ReadTimeout'),
+        pytest.param(httpx.WriteTimeout('write timed out'), id='WriteTimeout'),
+        pytest.param(_http_status_error('server error'), id='HTTPStatusError'),
+        pytest.param(ValueError('bad payload'), id='ValueError'),
+        pytest.param(TimeoutError('slow'), id='TimeoutError'),
+    ],
+)
+@pytest.mark.parametrize(('path', 'body', 'tool_name'), _WRITE_ROUTES)
+def test_ambiguous_failure_on_the_first_url_is_never_repeated_on_the_next(
+    two_url_client, path, body, tool_name, exc
+):
+    first, second = _two_fused_memory_urls(two_url_client)
+    resp, dialed = _post_with_per_url_outcomes(
+        two_url_client, path, body, tool_name, {first: exc, second: {'ok': True}}
+    )
+
+    assert dialed == [first]
+    assert resp.status_code == 502
+    assert resp.json()['error'] == 'fused_memory_outcome_unknown'
+    assert resp.json()['detail'].startswith(f'{first}: ')
+    assert second not in resp.json()['detail']
+
+
+@pytest.mark.parametrize(
+    'exc',
+    [
+        pytest.param(httpx.ConnectError('refused'), id='ConnectError'),
+        pytest.param(httpx.ConnectTimeout('connect timed out'), id='ConnectTimeout'),
+        pytest.param(httpx.PoolTimeout(''), id='PoolTimeout'),
+    ],
+)
+@pytest.mark.parametrize(('path', 'body', 'tool_name'), _WRITE_ROUTES)
+def test_undelivered_failure_on_the_first_url_fails_over_to_the_next(
+    two_url_client, path, body, tool_name, exc
+):
+    first, second = _two_fused_memory_urls(two_url_client)
+    resp, dialed = _post_with_per_url_outcomes(
+        two_url_client, path, body, tool_name, {first: exc, second: {'ok': True}}
+    )
+
+    assert dialed == [first, second]
+    assert resp.status_code == 200
+    assert resp.json() == {'ok': True}
+
+
+@pytest.mark.parametrize(('path', 'body', 'tool_name'), _WRITE_ROUTES)
+def test_undelivered_failure_on_every_url_is_unreachable(two_url_client, path, body, tool_name):
+    first, second = _two_fused_memory_urls(two_url_client)
+    refused = httpx.ConnectError('refused')
+    resp, dialed = _post_with_per_url_outcomes(
+        two_url_client, path, body, tool_name, {first: refused, second: refused}
+    )
+
+    assert dialed == [first, second]
+    assert resp.status_code == 502
+    assert resp.json()['error'] == 'fused_memory_unreachable'

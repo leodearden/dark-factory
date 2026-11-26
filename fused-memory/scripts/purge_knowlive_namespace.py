@@ -63,6 +63,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from fused_memory.models.scope import Scope
+from fused_memory.utils.store_mutation_preflight import assert_store_mutation_allowed
 
 # ---------------------------------------------------------------------------
 # Module-level constants
@@ -119,10 +120,11 @@ async def enumerate_graphiti_namespace(
     limit: int = 1000,
 ) -> list[dict]:
     """Read-only enumeration of every node in the *namespace* FalkorDB graph."""
-    graph = graphiti._graph_for(namespace)
+    graph = graphiti.graph_access.graph(namespace)
     result = await graph.ro_query(
         'MATCH (n) RETURN n.uuid, labels(n), n.name LIMIT $limit',
         {'limit': limit},
+        op='enumerate_graphiti_namespace',
     )
     rows = result.result_set or []
     if len(rows) >= limit:
@@ -140,9 +142,9 @@ async def enumerate_graphiti_namespace(
 
 async def purge_graphiti_namespace(graphiti: Any, namespace: str) -> dict:
     """Best-effort ``MATCH (n) DETACH DELETE n`` against the *namespace* graph."""
-    graph = graphiti._graph_for(namespace)
+    graph = graphiti.graph_access.graph(namespace)
     try:
-        await graph.query('MATCH (n) DETACH DELETE n')
+        await graph.query('MATCH (n) DETACH DELETE n', op='purge_graphiti_namespace')
     except Exception as e:
         logger.warning(
             "purge_knowlive_namespace: failed to purge graph '%s': %s",
@@ -286,6 +288,47 @@ async def run(
     )
     host_project: str = getattr(args, 'flag_host_project', None) or FLAG_HOST_PROJECT
 
+    # Fail-CLOSED capability preflight, one probe per run, BEFORE both scans.
+    #
+    # Why run-wide rather than per-record: purge_mem0_namespace fans its
+    # deletes out through ``asyncio.gather(..., return_exceptions=True)`` and
+    # funnels every failure into a ``logger.warning``, so a write-denied
+    # environment does not abort -- it yields N warnings and N already-
+    # destroyed Qdrant points, because mem0's ``_delete_memory`` removes the
+    # point BEFORE writing its SQLite history. A per-record probe would detect
+    # a run-wide condition one destroyed record too late. Worse still,
+    # purge_graphiti_namespace's ``MATCH (n) DETACH DELETE n`` is UNBOUNDED by
+    # --limit and is the FIRST mutation in program order, so it is the largest
+    # blast radius in the whole set and nothing downstream can bound it.
+    #
+    # Why before the scans, accepting that a refused --apply emits NO manifest:
+    # this module's docstring calls the dry-run manifest "the only recovery
+    # record of what is about to be deleted", which makes refusing this early
+    # look costly. It is not. The operator's remedy is to re-run WITHOUT
+    # --apply, which needs no write capability and emits the full manifest.
+    # Scanning first would buy a manifest already obtainable for free, at the
+    # price of two full-namespace scans (a FalkorDB ro_query plus a mem0
+    # count+get_all, --limit 1000 each) in an environment that was never going
+    # to be permitted to purge. Same tradeoff the reference accepted
+    # (sweep_toolcall_xml_leak.py: "Nothing was scanned and nothing was
+    # mutated").
+    #
+    # What that saves is scoped to ``run``, and the extra_detail below says so
+    # rather than claiming a doomed --apply costs nothing: ``main`` has already
+    # constructed the MemoryService and awaited ``initialize()`` before this
+    # function is entered. Neither of those mutates, so the guarantee that
+    # matters -- no enumeration, no mutation -- is exactly the one claimed.
+    if args.apply:
+        assert_store_mutation_allowed(
+            operation='purge_knowlive_namespace --apply',
+            logger=logger,
+            extra_detail=(
+                'a purge would delete Qdrant points and then fail to write their '
+                'history, and the unbounded Graphiti DETACH DELETE cannot be undone '
+                'at all. Neither namespace was enumerated and nothing was mutated.'
+            ),
+        )
+
     graphiti_rows = await enumerate_graphiti_namespace(
         memory_service.graphiti, namespace, limit=limit,
     )
@@ -381,21 +424,16 @@ def main() -> int:
     args = parser.parse_args()
 
     if args.config:
-        import os  # noqa: PLC0415
+        import os
         os.environ['CONFIG_PATH'] = str(args.config)
 
     async def _run_live() -> dict:
-        from fused_memory.config.schema import FusedMemoryConfig  # noqa: PLC0415
-        from fused_memory.services.memory_service import MemoryService  # noqa: PLC0415
+        from fused_memory.config.schema import FusedMemoryConfig
+        from fused_memory.maintenance._utils import maintenance_service
 
         config = FusedMemoryConfig()
-        memory = MemoryService(config)
-        try:
-            await memory.initialize()
+        async with maintenance_service(config=config) as (_, memory):
             return await run(args, memory, invalidation_time=datetime.now(UTC))
-        finally:
-            if hasattr(memory, 'close'):
-                await memory.close()
 
     report = asyncio.run(_run_live())
     print(json.dumps(report, indent=2, default=str))

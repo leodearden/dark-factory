@@ -3,38 +3,78 @@
 import asyncio
 import contextlib
 import logging
-from dataclasses import asdict
+import shlex
+from dataclasses import asdict, fields, replace
 from pathlib import Path
 from typing import Any, Literal
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
+from _serial_recovery_helpers import ORCH_SHAPED_PYPROJECT, ROOT_SHAPED_PYPROJECT, addopts_values
+from _xdist_crash_fixtures import (
+    NESTED_RUN_FAILED_NODEID,
+    PYTEST_INTERNALERROR_QUOTES_BAILOUT_OUTPUT,
+    PYTEST_Q_COMPLETE_ONE_FAILED_OUTPUT,
+    PYTEST_Q_NESTED_RUN_IN_CAPTURED_STDOUT_OUTPUT,
+    PYTEST_V_ASSERTION_QUOTES_BAILOUT_OUTPUT,
+    PYTEST_V_NESTED_BAILOUT_IN_CAPTURED_STDOUT_OUTPUT,
+    XDIST_BAILOUT_COMPLETE_SESSION_OUTPUT,
+    XDIST_BAILOUT_LINE,
+    XDIST_BAILOUT_PEER_FINISHED_ITS_QUEUE_OUTPUT,
+    XDIST_BAILOUT_WITH_STOPPED_PROGRESS_OUTPUT,
+    XDIST_CRASH_ATTRIBUTED_FAILED_LINE,
+    XDIST_CRASH_ATTRIBUTED_FAILED_OUTPUT,
+    XDIST_FAILED_THEN_CRASHED_OUTPUT,
+    XDIST_IN_FLIGHT_NODEID,
+    XDIST_MAX_WORKERS_REACHED_OUTPUT,
+    XDIST_PARTIAL_TALLY,
+    XDIST_Q_BAILOUT_UNDER_MAXFAIL_OUTPUT,
+    XDIST_Q_KILLED_AFTER_RECOVERED_CRASH_OUTPUT,
+    XDIST_Q_MAXFAIL_REAL_FAILED_LINE,
+    XDIST_Q_RECOVERED_OUTPUT,
+    XDIST_Q_RECOVERED_THEN_KEYBOARD_INTERRUPTED_OUTPUT,
+    XDIST_Q_RECOVERED_THEN_MAXFAIL_STOPPED_OUTPUT,
+    XDIST_Q_TRUNCATED_AT_LINE_EDGE_OUTPUT,
+    XDIST_Q_TRUNCATED_OUTPUT,
+    XDIST_RESTART_DISABLED_MESSAGE,
+    XDIST_SESSION_ABORTED_OUTPUT,
+    XDIST_V_BAILOUT_COMPLETE_SESSION_OUTPUT,
+    XDIST_V_BAILOUT_TRUNCATED_OUTPUT,
+    XDIST_WORKER_CRASH_OUTPUT,
+    XDIST_WORKER_REPLACED_OUTPUT,
+)
 
 from orchestrator import verify, verify_plan
 from orchestrator.config import ModuleConfig, OrchestratorConfig
 from orchestrator.verify import (
     _CATEGORY_PRIORITY,
     _PRUNE_THROTTLE_SECS,
+    SIGNAL_KILL_SUMMARY_MARKER,
+    WORKER_DEATH_SUMMARY_MARKER,
     VerifyResult,
     _aggregate_results,
     _apply_cargo_scope,
     _build_fallback_config,
+    _build_summary_payload,
     _extract_cause_hint,
     _is_collectable_test_file,
     _is_structural_python_file,
     _is_test_file,
+    _killed_leg_note,
     _maybe_prune_archive,
     _resolve_verify_env,
     _root_plus_single_subproject_prefix,
     _run_cmd,
+    _run_segmented,
     _scope_fallback_tool_to_subproject,
     _single_subproject_prefix,
+    _worker_death_leg_note,
     run_full_verification,
     run_scoped_verification,
     run_verification,
 )
 from orchestrator.verify_classify import classify_failure
-from orchestrator.verify_cmd import ToolKind, render
+from orchestrator.verify_cmd import ToolKind, render, split_and_chain_segments
 
 
 class TestKillCgroupScope:
@@ -794,41 +834,50 @@ class TestRunVerificationColdFirstUse:
         )
 
 
-def test_apply_cargo_scope_preserves_verify_cold_command_timeout_secs(tmp_path: Path):
-    """_apply_cargo_scope propagates verify_cold_command_timeout_secs to the rebuilt ModuleConfig.
-
-    Constructs a ModuleConfig with both warm and cold timeout values, forces the
-    cargo-scope rewrite path via mocked workspace discovery, and asserts the
-    returned ModuleConfig carries both timeout fields unchanged.
-    """
-    from unittest.mock import patch
-
-    from orchestrator.config import ModuleConfig
-    from orchestrator.verify import _apply_cargo_scope
+def test_apply_cargo_scope_preserves_every_non_command_field(tmp_path: Path):
+    """Cargo scoping rewrites only the three commands; every other ModuleConfig field survives."""
+    (tmp_path / 'Cargo.toml').write_text('[workspace]\nmembers = ["crates/*"]\n')
+    crate_dir = tmp_path / 'crates' / 'foo'
+    crate_dir.mkdir(parents=True)
+    (crate_dir / 'Cargo.toml').write_text('[package]\nname = "foo"\nversion = "0.1.0"\n')
 
     mc = ModuleConfig(
         prefix='crates',
         test_command='cargo test --workspace',
         lint_command='cargo clippy --workspace',
-        type_check_command=None,
+        type_check_command='cargo check --workspace',
+        lock_depth=3,
+        max_per_module=2,
+        module_overrides={'crates/foo': 1},
         verify_command_timeout_secs=2000.0,
         verify_cold_command_timeout_secs=6000.0,
+        concurrent_verify=False,
+        sequential_lint_first=True,
+        verify_env={'K': 'V'},
+        scope_cargo=True,
+        verify_cache='never',
+    )
+    left_default = [f.name for f in fields(ModuleConfig) if getattr(mc, f.name) == f.default]
+    assert left_default == [], (
+        f'Every ModuleConfig field must be set to a non-default value here so a dropped '
+        f'field is observable; still at default: {left_default}'
     )
 
-    # Force the rewrite path: workspace has one crate, and the .rs file maps to it.
-    with (
-        patch('orchestrator.verify.discover_workspace_crates', return_value={'crates/foo': 'foo'}),
-        patch('orchestrator.verify.files_to_crates', return_value=['foo']),
-    ):
-        result = _apply_cargo_scope(
-            mc,
-            task_files=['crates/foo/src/lib.rs'],
-            project_root=tmp_path,
-            scope_cargo_enabled=True,
-        )
+    result = _apply_cargo_scope(
+        mc,
+        task_files=['crates/foo/src/lib.rs'],
+        project_root=tmp_path,
+        scope_cargo_enabled=True,
+    )
 
-    assert result.verify_command_timeout_secs == 2000.0
-    assert result.verify_cold_command_timeout_secs == 6000.0
+    assert result is not mc
+    assert result.test_command == 'cargo test -p foo'
+    command_fields = {'test_command', 'lint_command', 'type_check_command'}
+    differing = [
+        f.name for f in fields(ModuleConfig)
+        if f.name not in command_fields and getattr(result, f.name) != getattr(mc, f.name)
+    ]
+    assert differing == [], f'Non-command fields changed by cargo scoping: {differing}'
 
 
 class TestIsTestFile:
@@ -1823,6 +1872,380 @@ class TestApplyCargoScopeRoutesThroughVerifyCmd:
         )
 
 
+class TestStripXdistGroupSuffix:
+    """``strip_xdist_group_suffix`` removes the ``@<group>`` xdist adds under ``--dist loadgroup``."""
+
+    @pytest.mark.parametrize(
+        ('raw', 'expected'),
+        [
+            pytest.param('x.py::t@grp', 'x.py::t', id='plain-test'),
+            pytest.param('x.py::t[p]@grp', 'x.py::t[p]', id='parametrised'),
+            pytest.param('x.py::C::t[p]@grp', 'x.py::C::t[p]', id='class-qualified'),
+            pytest.param('x.py::t@g1_g2', 'x.py::t', id='several-groups-joined'),
+            pytest.param('x.py::t[a@b]@grp', 'x.py::t[a@b]', id='at-inside-params-kept'),
+            pytest.param('x.py::t[a::b]@grp', 'x.py::t[a::b]', id='double-colon-inside-params'),
+            pytest.param(
+                'pkg.tests.test_probe.TestBox::test_inner@probe_group',
+                'pkg.tests.test_probe.TestBox::test_inner',
+                id='junit-classname-spelling',
+            ),
+        ],
+    )
+    def test_group_suffix_is_stripped(self, raw: str, expected: str):
+        assert verify.strip_xdist_group_suffix(raw) == expected
+
+    @pytest.mark.parametrize(
+        'raw',
+        [
+            pytest.param('x.py::t', id='no-suffix'),
+            pytest.param('x.py::t[a@b]', id='at-only-inside-params'),
+            pytest.param('x.py', id='bare-file-of-collection-error'),
+            pytest.param('dir@v2/x.py::t', id='at-in-path'),
+            pytest.param('x.py::t[a@b', id='unclosed-params-truncated-id'),
+            pytest.param('tests.t', id='bare-junit-module-id'),
+        ],
+    )
+    def test_id_without_a_group_suffix_is_unchanged(self, raw: str):
+        assert verify.strip_xdist_group_suffix(raw) == raw
+
+
+class TestParsePytestFailures:
+    """``parse_pytest_failures`` types each failing test by kind and first failure line."""
+
+    FAILED = verify.FailureKind.FAILED
+    ERROR = verify.FailureKind.ERROR
+
+    def _parse(self, output: str) -> list[tuple[str, str, str]]:
+        return [
+            (f.node_id, f.kind.value, f.first_line) for f in verify.parse_pytest_failures(output)
+        ]
+
+    def test_failed_line_is_kind_failed(self):
+        assert self._parse('FAILED tests/a.py::test_x - assert 1 == 2') == [
+            ('tests/a.py::test_x', 'failed', 'assert 1 == 2'),
+        ]
+
+    def test_error_node_line_is_kind_error(self):
+        assert self._parse('ERROR tests/a.py::test_x - RuntimeError: setup') == [
+            ('tests/a.py::test_x', 'error', 'RuntimeError: setup'),
+        ]
+
+    def test_bare_error_file_line_is_kind_error(self):
+        assert self._parse('ERROR tests/a.py - ImportError: nope') == [
+            ('tests/a.py', 'error', 'ImportError: nope'),
+        ]
+
+    def test_xdist_crash_notice_is_kind_failed(self):
+        output = "worker 'gw1' crashed while running 'tests/a.py::test_x'"
+        assert self._parse(output) == [('tests/a.py::test_x', 'failed', '')]
+
+    def test_xdist_node_down_preceding_line_is_kind_failed(self):
+        output = 'tests/a.py::test_x\n[gw0] node down: Not properly terminated\n'
+        assert self._parse(output) == [('tests/a.py::test_x', 'failed', '')]
+
+    def test_summary_reason_is_stripped_of_line_ending_and_trailing_spaces(self):
+        output = 'FAILED tests/a.py::test_x - AssertionError: boom  \r\n'
+        assert self._parse(output) == [('tests/a.py::test_x', 'failed', 'AssertionError: boom')]
+
+    def test_first_line_keeps_everything_after_first_separator(self):
+        output = 'FAILED tests/a.py::test_x - ValueError: a - b\n'
+        assert self._parse(output) == [('tests/a.py::test_x', 'failed', 'ValueError: a - b')]
+
+    def test_error_without_reason_takes_e_line_of_its_own_section(self):
+        output = (
+            '=== ERRORS ===\n'
+            '___ ERROR at setup of test_other ___\n'
+            'E   KeyError: other\n'
+            '___ ERROR at setup of test_x ___\n'
+            'x = 1\n'
+            'E   RuntimeError: fixture exploded\n'
+            'E   second line\n'
+            '=== short test summary info ===\n'
+            'ERROR tests/a.py::test_x\n'
+        )
+        assert self._parse(output) == [
+            ('tests/a.py::test_x', 'error', 'RuntimeError: fixture exploded'),
+        ]
+
+    def test_section_of_parametrised_id_is_matched_by_full_id(self):
+        output = (
+            '=== ERRORS ===\n'
+            '___ ERROR at setup of test_x[1] ___\n'
+            'E   KeyError: one\n'
+            '___ ERROR at setup of test_x[2] ___\n'
+            'E   KeyError: two\n'
+            '=== short test summary info ===\n'
+            'ERROR tests/a.py::test_x[2]\n'
+        )
+        assert self._parse(output) == [('tests/a.py::test_x[2]', 'error', 'KeyError: two')]
+
+    def test_section_of_class_qualified_id_uses_dotted_header(self):
+        output = (
+            '=== FAILURES ===\n'
+            '___ TestBox.test_x ___\n'
+            'E   AssertionError: boxed\n'
+            '=== short test summary info ===\n'
+            'FAILED tests/a.py::TestBox::test_x\n'
+        )
+        assert self._parse(output) == [
+            ('tests/a.py::TestBox::test_x', 'failed', 'AssertionError: boxed'),
+        ]
+
+    def test_collection_error_takes_e_line_of_collecting_section(self):
+        output = (
+            '=== ERRORS ===\n'
+            '___ ERROR collecting tests/a.py ___\n'
+            'E   ModuleNotFoundError: no module named zz\n'
+            '=== short test summary info ===\n'
+            'ERROR tests/a.py\n'
+        )
+        assert self._parse(output) == [
+            ('tests/a.py', 'error', 'ModuleNotFoundError: no module named zz'),
+        ]
+
+    def test_failed_and_error_sections_of_one_node_are_kept_apart(self):
+        output = (
+            '=== ERRORS ===\n'
+            '___ ERROR at teardown of test_x ___\n'
+            'E   OSError: teardown\n'
+            '=== FAILURES ===\n'
+            '___ test_x ___\n'
+            'E   AssertionError: body\n'
+            '=== short test summary info ===\n'
+            'FAILED tests/a.py::test_x\n'
+            'ERROR tests/a.py::test_x\n'
+        )
+        assert self._parse(output) == [
+            ('tests/a.py::test_x', 'failed', 'AssertionError: body'),
+            ('tests/a.py::test_x', 'error', 'OSError: teardown'),
+        ]
+
+    def test_first_line_is_empty_without_reason_or_section(self):
+        assert self._parse('ERROR tests/a.py::test_x\n') == [('tests/a.py::test_x', 'error', '')]
+
+    def test_section_without_e_line_leaves_first_line_empty(self):
+        output = (
+            '___ test_x ___\n'
+            'plain output\n'
+            '=== short test summary info ===\n'
+            'FAILED tests/a.py::test_x\n'
+        )
+        assert self._parse(output) == [('tests/a.py::test_x', 'failed', '')]
+
+    def test_e_line_after_the_section_ends_is_not_taken(self):
+        output = (
+            '___ test_x ___\n'
+            'plain output\n'
+            '___ test_y ___\n'
+            'E   KeyError: belongs to y\n'
+            'FAILED tests/a.py::test_x\n'
+        )
+        assert self._parse(output) == [('tests/a.py::test_x', 'failed', '')]
+
+    def test_same_named_tests_in_two_files_each_take_their_own_section(self):
+        output = (
+            '=== FAILURES ===\n'
+            '___ test_x ___\n'
+            'tests/a.py:3: in test_x\n'
+            'E   KeyError: from a\n'
+            '___ test_x ___\n'
+            'tests/b.py:9: in test_x\n'
+            'E   ValueError: from b\n'
+            '=== short test summary info ===\n'
+            'FAILED tests/b.py::test_x\n'
+            'FAILED tests/a.py::test_x\n'
+        )
+        assert self._parse(output) == [
+            ('tests/b.py::test_x', 'failed', 'ValueError: from b'),
+            ('tests/a.py::test_x', 'failed', 'KeyError: from a'),
+        ]
+
+    def test_same_named_tests_whose_sections_name_no_path_leave_first_line_empty(self):
+        output = (
+            '___ test_x ___\n'
+            'E   KeyError: from a\n'
+            '___ test_x ___\n'
+            'E   ValueError: from b\n'
+            'FAILED tests/a.py::test_x\n'
+            'FAILED tests/b.py::test_x\n'
+        )
+        assert self._parse(output) == [
+            ('tests/a.py::test_x', 'failed', ''),
+            ('tests/b.py::test_x', 'failed', ''),
+        ]
+
+    def test_extract_failing_test_ids_returns_every_reasonless_failure(self):
+        count = 500
+        output = (
+            ''.join(f'___ test_{i} ___\nE   Boom: {i}\n' for i in range(count))
+            + ''.join(f'FAILED tests/a.py::test_{i}\n' for i in range(count))
+        )
+        assert verify._extract_failing_test_ids(output) == [
+            f'tests/a.py::test_{i}' for i in range(count)
+        ]
+
+    def test_xdist_crash_has_no_section_first_line(self):
+        output = (
+            '___ test_x ___\n'
+            'E   KeyError: unrelated\n'
+            "worker 'gw1' crashed while running 'tests/a.py::test_x'\n"
+        )
+        assert self._parse(output) == [('tests/a.py::test_x', 'failed', '')]
+
+    def test_xdist_crash_takes_reason_of_failed_line_for_same_node(self):
+        output = (
+            "worker 'gw1' crashed while running 'tests/a.py::test_x'\n"
+            'FAILED tests/a.py::test_x - worker crashed\n'
+        )
+        assert self._parse(output) == [('tests/a.py::test_x', 'failed', 'worker crashed')]
+
+    def test_order_follows_position_across_interleaved_surfaces(self):
+        output = (
+            'FAILED tests/z.py::test_1 - a\n'
+            'ERROR tests/y.py::test_2 - b\n'
+            'FAILED tests/x.py::test_3 - c\n'
+            'ERROR tests/w.py - d\n'
+        )
+        assert [node for node, _, _ in self._parse(output)] == [
+            'tests/z.py::test_1',
+            'tests/y.py::test_2',
+            'tests/x.py::test_3',
+            'tests/w.py',
+        ]
+
+    def test_repeated_node_and_kind_is_one_entry_keeping_first_position(self):
+        output = (
+            'FAILED tests/a.py::test_x - first\n'
+            'FAILED tests/a.py::test_y - y\n'
+            'FAILED tests/a.py::test_x - second\n'
+        )
+        assert self._parse(output) == [
+            ('tests/a.py::test_x', 'failed', 'first'),
+            ('tests/a.py::test_y', 'failed', 'y'),
+        ]
+
+    def test_node_both_failed_and_error_is_two_entries_but_one_node_id(self):
+        output = 'FAILED tests/a.py::test_x - f\nERROR tests/a.py::test_x - e\n'
+        failures = verify.parse_pytest_failures(output)
+        assert [(f.kind, f.first_line) for f in failures] == [
+            (self.FAILED, 'f'),
+            (self.ERROR, 'e'),
+        ]
+        assert verify.node_ids_of(failures) == ['tests/a.py::test_x']
+
+    def test_empty_input_parses_to_empty_tuple(self):
+        assert verify.parse_pytest_failures('') == ()
+
+    def test_xdist_loadgroup_summary_lines_yield_plain_node_ids(self):
+        output = (
+            'FAILED pkg/tests/test_probe.py::test_ok[a@b]@probe_group - AssertionError: as...\n'
+            'FAILED pkg/tests/test_probe.py::test_ok[1]@probe_group - AssertionError: asse...\n'
+            'FAILED pkg/tests/test_probe.py::TestBox::test_inner@probe_group - AssertionEr...\n'
+        )
+        assert self._parse(output) == [
+            ('pkg/tests/test_probe.py::test_ok[a@b]', 'failed', 'AssertionError: as...'),
+            ('pkg/tests/test_probe.py::test_ok[1]', 'failed', 'AssertionError: asse...'),
+            ('pkg/tests/test_probe.py::TestBox::test_inner', 'failed', 'AssertionEr...'),
+        ]
+
+    def test_xdist_loadgroup_error_line_yields_plain_node_id(self):
+        assert self._parse('ERROR tests/a.py::test_x@grp - RuntimeError: setup') == [
+            ('tests/a.py::test_x', 'error', 'RuntimeError: setup'),
+        ]
+
+    def test_xdist_loadgroup_crash_notice_yields_plain_node_id(self):
+        output = "worker 'gw1' crashed while running 'tests/a.py::test_x[1]@grp'"
+        assert self._parse(output) == [('tests/a.py::test_x[1]', 'failed', '')]
+
+    def test_xdist_loadgroup_node_down_preceding_line_yields_plain_node_id(self):
+        output = 'tests/a.py::test_x@grp\n[gw0] node down: Not properly terminated\n'
+        assert self._parse(output) == [('tests/a.py::test_x', 'failed', '')]
+
+    def test_xdist_loadgroup_id_finds_its_unsuffixed_section(self):
+        output = (
+            '=== FAILURES ===\n'
+            '___ test_x[1] ___\n'
+            'E   AssertionError: grouped\n'
+            '=== short test summary info ===\n'
+            'FAILED tests/a.py::test_x[1]@grp\n'
+        )
+        assert self._parse(output) == [('tests/a.py::test_x[1]', 'failed', 'AssertionError: grouped')]
+
+    def test_xdist_loadgroup_id_dedups_across_summary_and_crash_surfaces(self):
+        output = (
+            'FAILED tests/a.py::t@g\n'
+            "worker 'gw0' crashed while running 'tests/a.py::t@g'\n"
+        )
+        assert verify.node_ids_of(verify.parse_pytest_failures(output)) == ['tests/a.py::t']
+
+    def test_extract_failing_test_ids_is_the_node_ids_of_the_parse(self):
+        output = (
+            'FAILED tests/b.py::test_1 - x\n'
+            'ERROR tests/a.py::test_2\n'
+            'ERROR tests/c.py\n'
+            'FAILED tests/a.py::test_2 - y\n'
+            "worker 'gw1' crashed while running 'tests/d.py::test_4'\n"
+            'FAILED tests/b.py::test_1 - again\n'
+        )
+        assert verify._extract_failing_test_ids(output) == verify.node_ids_of(
+            verify.parse_pytest_failures(output),
+        )
+        assert verify._extract_failing_test_ids(output) == [
+            'tests/b.py::test_1',
+            'tests/a.py::test_2',
+            'tests/c.py',
+            'tests/d.py::test_4',
+        ]
+
+
+class TestReproducedFailures:
+    """``reproduced_failures(original, rerun)`` — the one home of the kind rule."""
+
+    FAILED = verify.FailureKind.FAILED
+    ERROR = verify.FailureKind.ERROR
+
+    def _failure(self, node_id: str, kind: verify.FailureKind) -> verify.PytestFailure:
+        return verify.PytestFailure(node_id, kind, '')
+
+    def test_failed_then_failed_is_reproduced(self):
+        original = [self._failure('t.py::a', self.FAILED)]
+        rerun = [self._failure('t.py::a', self.FAILED)]
+        assert verify.reproduced_failures(original, rerun) == tuple(rerun)
+
+    def test_failed_then_error_is_not_reproduced(self):
+        original = [self._failure('t.py::a', self.FAILED)]
+        rerun = [self._failure('t.py::a', self.ERROR)]
+        assert verify.reproduced_failures(original, rerun) == ()
+
+    def test_error_then_error_is_reproduced(self):
+        original = [self._failure('t.py::a', self.ERROR)]
+        rerun = [self._failure('t.py::a', self.ERROR)]
+        assert verify.reproduced_failures(original, rerun) == tuple(rerun)
+
+    def test_error_then_failed_is_reproduced(self):
+        original = [self._failure('t.py::a', self.ERROR)]
+        rerun = [self._failure('t.py::a', self.FAILED)]
+        assert verify.reproduced_failures(original, rerun) == tuple(rerun)
+
+    def test_a_rerun_node_absent_from_the_original_is_dropped(self):
+        original = [self._failure('t.py::a', self.FAILED)]
+        rerun = [self._failure('t.py::b', self.FAILED), self._failure('t.py::a', self.FAILED)]
+        assert verify.reproduced_failures(original, rerun) == (rerun[1],)
+
+    def test_result_follows_rerun_order(self):
+        original = [self._failure('t.py::a', self.FAILED), self._failure('t.py::b', self.FAILED)]
+        rerun = [self._failure('t.py::b', self.FAILED), self._failure('t.py::a', self.FAILED)]
+        assert verify.reproduced_failures(original, rerun) == tuple(rerun)
+
+    def test_an_original_with_failed_and_error_for_one_node_accepts_error(self):
+        original = [self._failure('t.py::a', self.FAILED), self._failure('t.py::a', self.ERROR)]
+        rerun = [self._failure('t.py::a', self.ERROR)]
+        assert verify.reproduced_failures(original, rerun) == tuple(rerun)
+
+    def test_no_original_reproduces_nothing(self):
+        assert verify.reproduced_failures([], [self._failure('t.py::a', self.FAILED)]) == ()
+
+
 class TestExtractFailingTestIdsFromJunit:
     """``_extract_failing_test_ids_from_junit(path)`` parses a pytest junitxml
     report into a sorted, de-duplicated list of stable ``classname::name`` ids
@@ -1914,6 +2337,263 @@ class TestExtractFailingTestIdsFromJunit:
         ]
 
 
+class TestExtractTestIdsFromJunit:
+    """``_extract_test_ids_from_junit(path)`` — ONE parse, failing and skipped vectors.
+
+    Task 3226.  The failing vector alone leaves ``main_baseline_failing_ids``
+    unable to tell "main RAN this test and it passed" from "main never ran it";
+    only the first supports the task-fault conclusion the id-diff fast path in
+    ``verify_failure_is_preexisting_on_main`` draws.  The skipped vector is the
+    never-executed population, so it must hold exactly the tests the run did
+    not execute — an xfail ran.
+    """
+
+    # DELIBERATELY the failing parser's fixture, verbatim: the partition
+    # assertion below is that ONE report yields two disjoint vectors.
+    _JUNIT_XML = TestExtractFailingTestIdsFromJunit._JUNIT_XML
+
+    @staticmethod
+    def _parse(tmp_path: Path, xml: str) -> verify._JunitTestIds | None:
+        junit_path = tmp_path / 'junit.xml'
+        junit_path.write_text(xml)
+        return verify._extract_test_ids_from_junit(junit_path)
+
+    @staticmethod
+    def _suite(*testcases: str) -> str:
+        return (
+            '<?xml version="1.0" encoding="utf-8"?>\n'
+            '<testsuites><testsuite name="pytest">'
+            + ''.join(testcases)
+            + '</testsuite></testsuites>\n'
+        )
+
+    def test_one_report_partitions_into_failing_and_skipped(self, tmp_path: Path):
+        """Failing and skipped are DISJOINT, a pass is in neither, and the
+        failing projection agrees with the pair."""
+        ids = self._parse(tmp_path, self._JUNIT_XML)
+
+        assert ids == (
+            ['tests.test_sample::test_error', 'tests.test_sample::test_fail'],
+            ['tests.test_sample::test_skip'],
+            4,
+        ), ids
+        assert ids is not None
+        assert verify._extract_failing_test_ids_from_junit(tmp_path / 'junit.xml') == ids.failing
+
+    def test_nothing_skipped_is_an_empty_vector_not_none(self, tmp_path: Path):
+        """``[]`` ("junit collected, zero skipped") licenses "main ran
+        everything"; ``None`` (no report) licenses nothing."""
+        ids = self._parse(
+            tmp_path,
+            self._suite('<testcase classname="tests.test_sample" name="test_pass" />'),
+        )
+
+        assert ids == ([], [], 1)
+
+    def test_xfail_ran_so_it_is_not_skipped(self, tmp_path: Path):
+        """pytest writes an xfail as ``<skipped type="pytest.xfail">``
+        (``_pytest/junitxml.py::_NodeReporter.append_skipped``), but the test
+        RAN.  Counting it as skipped would let the merge-queue reason say
+        "main never ran" about a test main did run."""
+        ids = self._parse(
+            tmp_path,
+            self._suite(
+                '<testcase classname="t" name="test_xfail">'
+                '<skipped type="pytest.xfail" message="known bug" /></testcase>',
+                '<testcase classname="t" name="test_skip">'
+                '<skipped type="pytest.skip" message="no reify checkout">x</skipped>'
+                '</testcase>',
+            ),
+        )
+
+        assert ids == ([], ['t::test_skip'], 2), ids
+
+    def test_strict_xpass_ran_so_it_is_not_skipped(self, tmp_path: Path):
+        """A strict XPASS is written as an UNTYPED ``<skipped>`` with a fixed
+        message (``_pytest/junitxml.py::_NodeReporter.append_failure``); it ran
+        too.  An untyped collection skip did not, and stays skipped."""
+        ids = self._parse(
+            tmp_path,
+            self._suite(
+                '<testcase classname="t" name="test_xpass_strict">'
+                '<skipped message="xfail-marked test passes unexpectedly" /></testcase>',
+                '<testcase classname="t" name="test_module">'
+                '<skipped message="collection skipped">reason</skipped></testcase>',
+            ),
+        )
+
+        assert ids == ([], ['t::test_module'], 2), ids
+
+    def test_a_testcase_with_a_failure_is_failing_whatever_else_it_records(
+        self, tmp_path: Path,
+    ):
+        """A skip in the call phase plus a teardown error lands in ``failing``
+        only, so the two vectors stay disjoint by construction."""
+        ids = self._parse(
+            tmp_path,
+            self._suite(
+                '<testcase classname="t" name="test_both">'
+                '<skipped type="pytest.skip" message="s" />'
+                '<error message="failed on teardown">boom</error></testcase>',
+            ),
+        )
+
+        assert ids == (['t::test_both'], [], 1), ids
+
+    def test_bare_testsuite_root_is_handled(self, tmp_path: Path):
+        """A writer that omits the ``<testsuites>`` wrapper must not yield an
+        empty vector, which would read as "nothing skipped"."""
+        ids = self._parse(
+            tmp_path,
+            '<?xml version="1.0" encoding="utf-8"?>\n'
+            '<testsuite name="pytest" tests="1">'
+            '<testcase classname="tests.test_sample" name="test_skip">'
+            '<skipped message="no reify checkout" type="pytest.skip" />'
+            '</testcase></testsuite>\n',
+        )
+
+        assert ids == ([], ['tests.test_sample::test_skip'], 1)
+
+    def test_both_vectors_share_the_classname_file_name_id_fallback(self, tmp_path: Path):
+        """The vectors are set-differenced against each other downstream, so
+        they must spell an id identically: classname, then file, then name."""
+        ids = self._parse(
+            tmp_path,
+            self._suite(
+                '<testcase file="tests/test_x.py" name="test_by_file">'
+                '<skipped message="s" /></testcase>',
+                '<testcase name="test_bare"><failure message="f" /></testcase>',
+            ),
+        )
+
+        assert ids == (['test_bare'], ['tests/test_x.py::test_by_file'], 2), ids
+
+    def test_duplicate_ids_across_testsuites_are_deduplicated(self, tmp_path: Path):
+        ids = self._parse(
+            tmp_path,
+            '<?xml version="1.0" encoding="utf-8"?>\n'
+            '<testsuites>'
+            '<testsuite name="pytest"><testcase classname="tests.test_sample" name="test_skip">'
+            '<skipped message="x" /></testcase></testsuite>'
+            '<testsuite name="pytest-rerun"><testcase classname="tests.test_sample" name="test_skip">'
+            '<skipped message="x" /></testcase></testsuite>'
+            '</testsuites>\n',
+        )
+
+        assert ids == ([], ['tests.test_sample::test_skip'], 2)
+
+    def test_nonexistent_path_returns_none(self, tmp_path: Path):
+        """No junit collected — the B3 degrade signal, and NOT ``([], [])``,
+        which would license "main ran everything" from a report never written."""
+        assert verify._extract_test_ids_from_junit(tmp_path / 'missing.xml') is None
+
+    @pytest.mark.parametrize('content', ['not valid xml <<<', ''], ids=['malformed', 'empty'])
+    def test_unparseable_report_returns_none(self, tmp_path: Path, content: str):
+        assert self._parse(tmp_path, content) is None
+
+
+class TestExtractTestOutcomesFromJunit:
+    """``extract_test_outcomes_from_junit(path)`` — passed and skipped per testcase, failing excluded."""
+
+    @staticmethod
+    def _read(tmp_path: Path, xml: str) -> dict[str, str] | None:
+        junit_path = tmp_path / 'junit.xml'
+        junit_path.write_text(xml)
+        return verify.extract_test_outcomes_from_junit(junit_path)
+
+    @staticmethod
+    def _suite(*testcases: str) -> str:
+        return (
+            '<?xml version="1.0" encoding="utf-8"?>\n'
+            '<testsuites><testsuite name="pytest">'
+            + ''.join(testcases)
+            + '</testsuite></testsuites>\n'
+        )
+
+    def test_passed_and_skipped_are_reported_by_classname_and_name(self, tmp_path: Path):
+        outcomes = self._read(
+            tmp_path,
+            self._suite(
+                '<testcase classname="tests.test_a.TestX" name="test_pass" />',
+                '<testcase classname="tests.test_a" name="test_skip">'
+                '<skipped type="pytest.skip" message="no checkout">x</skipped></testcase>',
+            ),
+        )
+        assert outcomes == {
+            'tests.test_a.TestX::test_pass': 'passed',
+            'tests.test_a::test_skip': 'skipped',
+        }
+
+    def test_an_xfail_and_a_strict_xpass_ran_so_they_are_passed(self, tmp_path: Path):
+        outcomes = self._read(
+            tmp_path,
+            self._suite(
+                '<testcase classname="t" name="test_xfail">'
+                '<skipped type="pytest.xfail" message="known bug" /></testcase>',
+                '<testcase classname="t" name="test_xpass">'
+                '<skipped message="xfail-marked test passes unexpectedly" /></testcase>',
+            ),
+        )
+        assert outcomes == {'t::test_xfail': 'passed', 't::test_xpass': 'passed'}
+
+    def test_failing_and_erroring_testcases_are_excluded(self, tmp_path: Path):
+        outcomes = self._read(
+            tmp_path,
+            self._suite(
+                '<testcase classname="t" name="test_ok" />',
+                '<testcase classname="t" name="test_fail"><failure message="boom" /></testcase>',
+                '<testcase classname="t" name="test_err"><error message="boom" /></testcase>',
+            ),
+        )
+        assert outcomes == {'t::test_ok': 'passed'}
+
+    def test_a_bare_testsuite_root_is_read(self, tmp_path: Path):
+        outcomes = self._read(
+            tmp_path,
+            '<testsuite name="pytest"><testcase classname="t" name="test_ok" /></testsuite>',
+        )
+        assert outcomes == {'t::test_ok': 'passed'}
+
+    def test_several_testsuites_under_a_wrapper_are_merged(self, tmp_path: Path):
+        outcomes = self._read(
+            tmp_path,
+            '<testsuites>'
+            '<testsuite name="one"><testcase classname="a" name="test_x" /></testsuite>'
+            '<testsuite name="two"><testcase classname="b" name="test_y" /></testsuite>'
+            '</testsuites>',
+        )
+        assert outcomes == {'a::test_x': 'passed', 'b::test_y': 'passed'}
+
+    def test_a_report_without_testcases_is_an_empty_mapping_not_none(self, tmp_path: Path):
+        assert self._read(tmp_path, self._suite()) == {}
+
+    def test_a_missing_report_is_none(self, tmp_path: Path):
+        assert verify.extract_test_outcomes_from_junit(tmp_path / 'missing.xml') is None
+
+    @pytest.mark.parametrize('content', ['not valid xml <<<', ''], ids=['malformed', 'empty'])
+    def test_an_unreadable_report_is_none(self, tmp_path: Path, content: str):
+        assert self._read(tmp_path, content) is None
+
+    def test_ids_use_the_spelling_of_the_failing_reader(self, tmp_path: Path):
+        xml = self._suite(
+            '<testcase classname="tests.test_a" name="test_pass" />',
+            '<testcase file="tests/test_b.py" name="test_nofile" />',
+            '<testcase name="test_bare" />',
+        )
+        outcomes = self._read(tmp_path, xml)
+        assert outcomes == {
+            'tests.test_a::test_pass': 'passed',
+            'tests/test_b.py::test_nofile': 'passed',
+            'test_bare': 'passed',
+        }
+
+    def test_an_xdist_loadgroup_name_is_keyed_without_its_group_suffix(self, tmp_path: Path):
+        outcomes = self._read(
+            tmp_path, self._suite('<testcase classname="tests.test_sample" name="test_g[1]@grp" />'),
+        )
+        assert outcomes == {'tests.test_sample::test_g[1]': 'passed'}
+
+
 # ---------------------------------------------------------------------------
 # Task μ (verify-scope-inversion-prd.md) step-05: VerifyResult.failing_test_ids
 # — a plain JSON-native `list[str] | None` (mirrors the `contention` (task
@@ -1963,6 +2643,210 @@ class TestVerifyResultFailingTestIds:
 
         assert restored.failing_test_ids == []
         assert restored.failing_test_ids is not None
+
+
+class TestVerifyResultSkippedTestIds:
+    """VerifyResult carries `skipped_test_ids` beside `failing_test_ids` (task 3226).
+
+    Same three seams as the failing field — dataclass default, generic
+    asdict/**d codec, and `_aggregate_results` — because the two vectors are
+    consumed TOGETHER: a caller asks "did main run this test?" by checking one
+    against the other, and a field that survived only two of the three seams
+    would answer that question with stale or absent data at the third.
+
+    JSON-native `list[str] | None` like `contention`/`plan`/`failing_test_ids`,
+    so no serialization allowlist needs editing.
+    """
+
+    def _make_result(self, **overrides: Any) -> VerifyResult:
+        defaults: dict[str, Any] = dict(
+            passed=True,
+            test_output='',
+            lint_output='',
+            type_output='',
+            summary='all good',
+        )
+        defaults.update(overrides)
+        return VerifyResult(**defaults)
+
+    def test_default_skipped_test_ids_is_none(self):
+        """None is the fail-OPAQUE default: no junit collected, nothing may be concluded."""
+        assert self._make_result().skipped_test_ids is None
+
+    def test_skipped_test_ids_round_trips_via_asdict_codec(self):
+        vr = self._make_result(skipped_test_ids=['a::b'])
+
+        restored = VerifyResult(**asdict(vr))
+
+        assert restored.skipped_test_ids == ['a::b']
+        assert restored == vr
+
+    def test_empty_skipped_test_ids_is_preserved_not_coerced_to_none(self):
+        """`[]` ("junit collected, zero skipped") must survive the codec distinctly.
+
+        Coercing it to None across the wire would erase the only positive
+        evidence that main ran its whole suite — turning a genuine "main ran
+        everything" into "we do not know", which fails the wrong way for the
+        caller this field exists to serve.
+        """
+        vr = self._make_result(skipped_test_ids=[])
+
+        restored = VerifyResult(**asdict(vr))
+
+        assert restored.skipped_test_ids == []
+        assert restored.skipped_test_ids is not None
+
+    @pytest.mark.asyncio
+    async def test_run_verification_parses_both_vectors_from_one_report(
+        self, tmp_path: Path,
+    ):
+        """Both vectors reach the result from ONE parse of the report.
+
+        Drives the real ``run_verification`` seam (nothing executes —
+        ``_run_cmd`` is a spy).  ``role='merge'`` plus
+        ``merge_verify_breadth='full'`` is exactly what makes ``junit_path``
+        non-None, so the seam is reached.  A single parse is what guarantees
+        the two vectors describe the same run.
+        """
+        worktree = tmp_path / 'merge-wt'
+        worktree.mkdir()
+        config = OrchestratorConfig(
+            project_root=tmp_path, merge_verify_breadth='full',
+        )
+        failing_sentinel = ['sentinel::failing']
+        skipped_sentinel = ['sentinel::skipped']
+        parser = MagicMock(
+            return_value=verify._JunitTestIds(
+                failing=failing_sentinel, skipped=skipped_sentinel, testcases=2,
+            ),
+        )
+
+        with (
+            patch('orchestrator.verify._run_cmd', new=AsyncMock(return_value=(0, '', False))),
+            patch.object(verify, '_extract_test_ids_from_junit', new=parser),
+        ):
+            result = await run_verification(
+                worktree=worktree,
+                config=config,
+                module_config=ModuleConfig(prefix='pkg', test_command='pytest'),
+                role='merge',
+                attempt_id=None,
+            )
+
+        # (a) both vectors reach the result on the correct fields — neither
+        #     dropped, aliased, nor swapped.
+        assert result.failing_test_ids == failing_sentinel, (
+            f'the failing vector must reach the result; got {result.failing_test_ids!r}'
+        )
+        assert result.skipped_test_ids == skipped_sentinel, (
+            f'the skipped vector must reach the result; got {result.skipped_test_ids!r}'
+        )
+
+        # (b) the report was parsed exactly once.
+        assert parser.call_count == 1, parser.call_args_list
+
+    @pytest.mark.asyncio
+    async def test_neither_vector_is_parsed_when_the_seam_is_not_reached(
+        self, tmp_path: Path,
+    ):
+        """(c) role='task' leaves junit_path None: the report is not parsed and
+        BOTH fields come back None."""
+        worktree = tmp_path / 'task-wt'
+        worktree.mkdir()
+        config = OrchestratorConfig(
+            project_root=tmp_path, merge_verify_breadth='full',
+        )
+        parser = MagicMock(
+            return_value=verify._JunitTestIds(
+                failing=['sentinel::failing'], skipped=['sentinel::skipped'], testcases=2,
+            ),
+        )
+
+        with (
+            patch('orchestrator.verify._run_cmd', new=AsyncMock(return_value=(0, '', False))),
+            patch.object(verify, '_extract_test_ids_from_junit', new=parser),
+        ):
+            result = await run_verification(
+                worktree=worktree,
+                config=config,
+                module_config=ModuleConfig(prefix='pkg', test_command='pytest'),
+                role='task',
+                attempt_id=None,
+            )
+
+        parser.assert_not_called()
+        assert result.failing_test_ids is None, result.failing_test_ids
+        assert result.skipped_test_ids is None, result.skipped_test_ids
+
+    def test_both_id_vectors_coexist_on_one_result(self):
+        """The two fields are independent — neither aliases nor overwrites the other."""
+        vr = self._make_result(failing_test_ids=['f::1'], skipped_test_ids=['s::1'])
+
+        restored = VerifyResult(**asdict(vr))
+
+        assert restored.failing_test_ids == ['f::1']
+        assert restored.skipped_test_ids == ['s::1']
+
+
+class TestAggregateResultsSkippedTestIds:
+    """`_aggregate_results` unions skipped_test_ids by the SAME rule as the failing side."""
+
+    def _r(self, **overrides: Any) -> VerifyResult:
+        defaults: dict[str, Any] = dict(
+            passed=True, test_output='', lint_output='', type_output='', summary='ok'
+        )
+        defaults.update(overrides)
+        return VerifyResult(**defaults)
+
+    def test_all_none_stays_none(self):
+        agg = _aggregate_results([self._r(), self._r()])
+        assert agg.skipped_test_ids is None
+
+    def test_one_none_child_does_not_erase_another_childs_skip_evidence(self):
+        """The mixed case, and the reason the rule is None-iff-EVERY-child-is-None.
+
+        A module that collected no junit at all (None — OPAQUE command, or
+        breadth != full) knows nothing about skips; letting it POISON the
+        aggregate to None would discard a sibling module's real, collected skip
+        evidence and silently return the whole run to the can't-tell state this
+        task closes. None contributes nothing; it does not suppress.
+        """
+        agg = _aggregate_results([self._r(), self._r(skipped_test_ids=['a::b'])])
+
+        assert agg.skipped_test_ids == ['a::b'], (
+            f'an OPAQUE module must not erase a sibling\'s collected skips; got '
+            f'{agg.skipped_test_ids!r}'
+        )
+
+    def test_unions_sorts_and_dedupes_across_children(self):
+        agg = _aggregate_results(
+            [
+                self._r(skipped_test_ids=['y::2', 'shared::s']),
+                self._r(skipped_test_ids=['x::1', 'shared::s']),
+            ]
+        )
+
+        assert agg.skipped_test_ids == ['shared::s', 'x::1', 'y::2']
+
+    def test_empty_child_makes_the_aggregate_non_none(self):
+        """A child that collected junit and found zero skips is EVIDENCE, not silence."""
+        agg = _aggregate_results([self._r(), self._r(skipped_test_ids=[])])
+
+        assert agg.skipped_test_ids == []
+        assert agg.skipped_test_ids is not None
+
+    def test_failing_and_skipped_aggregate_independently(self):
+        """Wiring the new field must not perturb the failing side's aggregation."""
+        agg = _aggregate_results(
+            [
+                self._r(failing_test_ids=['f::1']),
+                self._r(skipped_test_ids=['s::1']),
+            ]
+        )
+
+        assert agg.failing_test_ids == ['f::1']
+        assert agg.skipped_test_ids == ['s::1']
+
 
 
 # ---------------------------------------------------------------------------
@@ -2115,7 +2999,7 @@ class TestRunVerificationJunitxmlInjection:
         assert result.failing_test_ids is None
 
     async def test_scoped_breadth_does_not_inject_or_collect(self, tmp_path: Path):
-        """merge_verify_breadth='scoped' (the default) — merge role but no injection."""
+        """merge_verify_breadth='scoped' (the per-project opt-down) — merge role but no injection."""
         config = self._make_config(tmp_path, breadth='scoped')
         module_config = self._module_config()
         fake_run_cmd, captured = self._fake_run_cmd_writing_junit()
@@ -2161,6 +3045,315 @@ class TestRunVerificationJunitxmlInjection:
             f'non-pytest command must never receive --junitxml; got {captured}'
         )
         assert result.failing_test_ids is None
+
+    async def test_caller_named_report_replaces_the_prefix_keyed_one(self, tmp_path: Path):
+        config = self._make_config(tmp_path, breadth='full')
+        report = tmp_path / 'custom' / 'r.xml'
+        report.parent.mkdir()
+        fake_run_cmd, captured = self._fake_run_cmd_writing_junit()
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            result = await run_verification(
+                tmp_path, config, self._module_config(), max_retries=0, role='merge',
+                junit_report=report,
+            )
+
+        [test_cmd] = [c for c in captured if 'pytest' in c]
+        parts = test_cmd.split()
+        assert parts.count('--junitxml') == 1, test_cmd
+        assert parts[parts.index('--junitxml') + 1] == str(report), test_cmd
+        assert result.failing_test_ids == ['tests.test_sample::test_fail']
+
+    async def test_caller_named_report_is_written_whatever_the_role_and_breadth(
+        self, tmp_path: Path,
+    ):
+        config = self._make_config(tmp_path, breadth='scoped')
+        report = tmp_path / 'custom' / 'r.xml'
+        report.parent.mkdir()
+        fake_run_cmd, captured = self._fake_run_cmd_writing_junit()
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            result = await run_verification(
+                tmp_path, config, self._module_config(), max_retries=0, role='task',
+                junit_report=report,
+            )
+
+        [test_cmd] = [c for c in captured if 'pytest' in c]
+        parts = test_cmd.split()
+        assert parts.count('--junitxml') == 1, test_cmd
+        assert parts[parts.index('--junitxml') + 1] == str(report), test_cmd
+        assert result.failing_test_ids == ['tests.test_sample::test_fail']
+
+    async def test_caller_named_report_is_refused_with_a_segmented_test_leg(
+        self, tmp_path: Path,
+    ):
+        report = tmp_path / 'r.xml'
+
+        with pytest.raises(ValueError, match='segment_chained_test=True') as refused:
+            await run_verification(
+                tmp_path, self._make_config(tmp_path), self._module_config(),
+                max_retries=0, role='task', segment_chained_test=True, junit_report=report,
+            )
+
+        assert repr(report) in str(refused.value)
+
+
+# ---------------------------------------------------------------------------
+# Task 5627: run_verification records WHICH module produced its junit ids —
+# VerifyResult.failing_test_ids_by_module, {module_prefix: failing_test_ids}.
+# It is set where a junit id and its module_prefix meet, so a consumer never
+# has to parse node-id strings to learn which module a red id belongs to.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestRunVerificationAttributesFailingIdsToModule:
+    """failing_test_ids_by_module: codec round-trip and run_verification wiring."""
+
+    _junit = TestRunVerificationJunitxmlInjection()
+
+    _PASSING_JUNIT_XML = (
+        '<?xml version="1.0" encoding="utf-8"?>\n'
+        '<testsuites>\n'
+        '<testsuite name="pytest" errors="0" failures="0" tests="1">\n'
+        '<testcase classname="tests.test_sample" name="test_ok" time="0.001">\n'
+        '</testcase>\n'
+        '</testsuite>\n'
+        '</testsuites>\n'
+    )
+
+    def _fake_run_cmd_writing_passing_junit(self):
+        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
+            if '--junitxml' in cmd:
+                parts = cmd.split()
+                junit_path = Path(parts[parts.index('--junitxml') + 1])
+                junit_path.parent.mkdir(parents=True, exist_ok=True)
+                junit_path.write_text(self._PASSING_JUNIT_XML)
+            return 0, 'ok', False
+
+        return fake_run_cmd
+
+    async def test_field_defaults_to_none_and_round_trips_both_codecs(self):
+        from orchestrator.verify_runner import result_from_dict, result_to_dict
+
+        assert VerifyResult(
+            passed=True, test_output='', lint_output='', type_output='', summary='x',
+        ).failing_test_ids_by_module is None
+
+        by_module = {'pkg': ['a::b'], 'other': []}
+        vr = VerifyResult(
+            passed=False, test_output='', lint_output='', type_output='', summary='x',
+            failing_test_ids=['a::b'], failing_test_ids_by_module=by_module,
+        )
+
+        via_asdict = VerifyResult(**asdict(vr))
+        via_wire = result_from_dict(result_to_dict(vr))
+
+        assert via_asdict.failing_test_ids_by_module == by_module
+        assert via_wire.failing_test_ids_by_module == by_module
+        assert via_asdict == vr
+        assert via_wire == vr
+
+    async def test_module_run_attributes_its_ids_to_its_prefix(self, tmp_path: Path):
+        config = self._junit._make_config(tmp_path, breadth='full')
+        fake_run_cmd, _ = self._junit._fake_run_cmd_writing_junit()
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            result = await run_verification(
+                tmp_path, config, self._junit._module_config(), max_retries=0, role='merge',
+            )
+
+        assert result.failing_test_ids == ['tests.test_sample::test_fail']
+        assert result.failing_test_ids_by_module == {'pkg': ['tests.test_sample::test_fail']}
+
+    async def test_global_command_run_has_no_module_to_attribute_to(self, tmp_path: Path):
+        config = OrchestratorConfig(
+            project_root=tmp_path, merge_verify_breadth='full', test_command='pytest tests/',
+        )
+        fake_run_cmd, _ = self._junit._fake_run_cmd_writing_junit()
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            result = await run_verification(
+                tmp_path, config, None, max_retries=0, role='merge',
+            )
+
+        assert result.failing_test_ids == ['tests.test_sample::test_fail']
+        assert result.failing_test_ids_by_module is None
+
+    async def test_run_that_collected_no_junit_has_no_attribution(self, tmp_path: Path):
+        config = self._junit._make_config(tmp_path, breadth='full')
+        fake_run_cmd, _ = self._junit._fake_run_cmd_writing_junit()
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            result = await run_verification(
+                tmp_path, config, self._junit._module_config(), max_retries=0, role='task',
+            )
+
+        assert result.failing_test_ids is None
+        assert result.failing_test_ids_by_module is None
+
+    async def test_clean_module_run_is_attributed_as_covered_and_clean(self, tmp_path: Path):
+        config = self._junit._make_config(tmp_path, breadth='full')
+
+        with patch(
+            'orchestrator.verify._run_cmd',
+            side_effect=self._fake_run_cmd_writing_passing_junit(),
+        ):
+            result = await run_verification(
+                tmp_path, config, self._junit._module_config(), max_retries=0, role='merge',
+            )
+
+        assert result.failing_test_ids == []
+        assert result.failing_test_ids_by_module == {'pkg': []}
+
+
+@pytest.mark.asyncio
+class TestScopedVerificationAggregatesModuleAttribution:
+    """Task 5627: a multi-module merge verify keeps each red id's module.
+
+    ``run_verification`` is faked per module exactly as the real one now
+    answers: ``failing_test_ids_by_module={prefix: failing_test_ids}``.
+    """
+
+    _PREFIXES = ('A', 'B', 'C')
+
+    def _module_configs(self, prefixes=_PREFIXES) -> list[ModuleConfig]:
+        return [
+            ModuleConfig(
+                prefix=p, test_command=f'pytest {p}/tests',
+                lint_command=None, type_check_command=None,
+            )
+            for p in prefixes
+        ]
+
+    def _per_module_fake(
+        self,
+        ids_by_prefix: dict[str, list[str] | None],
+        *,
+        unattributed: frozenset[str] = frozenset(),
+    ):
+        async def fake(worktree, config, module_config=None, **kwargs):
+            assert module_config is not None
+            ids = ids_by_prefix[module_config.prefix]
+            by_module = (
+                {module_config.prefix: ids}
+                if ids is not None and module_config.prefix not in unattributed
+                else None
+            )
+            return VerifyResult(
+                passed=not ids, test_output='', lint_output='', type_output='',
+                summary='All checks passed' if not ids else 'Failures: tests failed',
+                failing_test_ids=ids,
+                failing_test_ids_by_module=by_module,
+            )
+
+        return fake
+
+    async def _run(
+        self, tmp_path: Path, fake, prefixes=_PREFIXES,
+    ) -> VerifyResult:
+        config = OrchestratorConfig(project_root=tmp_path, merge_verify_breadth='full')
+        with patch.object(verify, 'run_verification', side_effect=fake):
+            return await run_scoped_verification(
+                tmp_path, config, self._module_configs(prefixes),
+                task_files=None, role='merge',
+            )
+
+    async def test_each_red_id_stays_with_its_module(self, tmp_path: Path):
+        result = await self._run(
+            tmp_path, self._per_module_fake({'A': ['a1'], 'B': [], 'C': ['c1', 'c2']}),
+        )
+
+        assert result.failing_test_ids == ['a1', 'c1', 'c2']
+        assert result.failing_test_ids_by_module == {
+            'A': ['a1'], 'B': [], 'C': ['c1', 'c2'],
+        }
+
+    async def test_an_unattributed_collecting_child_poisons_the_map(self, tmp_path: Path):
+        result = await self._run(
+            tmp_path,
+            self._per_module_fake(
+                {'A': ['a1'], 'B': ['x'], 'C': []}, unattributed=frozenset({'B'}),
+            ),
+        )
+
+        assert result.failing_test_ids == ['a1', 'x']
+        assert result.failing_test_ids_by_module is None
+
+    async def test_a_child_that_collected_nothing_does_not_poison(self, tmp_path: Path):
+        result = await self._run(
+            tmp_path, self._per_module_fake({'A': ['a1'], 'B': None}), prefixes=('A', 'B'),
+        )
+
+        assert result.failing_test_ids == ['a1']
+        assert result.failing_test_ids_by_module == {'A': ['a1']}
+
+    async def test_nothing_collected_anywhere_leaves_both_none(self, tmp_path: Path):
+        result = await self._run(
+            tmp_path, self._per_module_fake({'A': None, 'B': None, 'C': None}),
+        )
+
+        assert result.failing_test_ids is None
+        assert result.failing_test_ids_by_module is None
+
+    async def test_single_module_run_keeps_its_map(self, tmp_path: Path):
+        result = await self._run(
+            tmp_path, self._per_module_fake({'A': ['a1']}), prefixes=('A',),
+        )
+
+        assert result.failing_test_ids_by_module == {'A': ['a1']}
+
+
+class TestModuleAttributionInvariantIsNamedWhereResultsAreBuilt:
+    """A failing_test_ids_by_module that does not cover exactly failing_test_ids
+    is reported when the VerifyResult is built, naming the ids that disagree."""
+
+    @staticmethod
+    def _result(**fields: Any) -> VerifyResult:
+        return VerifyResult(
+            passed=False, test_output='', lint_output='', type_output='', summary='x', **fields,
+        )
+
+    @staticmethod
+    def _invariant_warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
+        return [
+            r.getMessage() for r in caplog.records
+            if r.levelno == logging.WARNING and 'failing_test_ids_by_module' in r.getMessage()
+        ]
+
+    def test_an_exact_map_reports_nothing(self, caplog: pytest.LogCaptureFixture) -> None:
+        with caplog.at_level(logging.WARNING, logger='orchestrator.verify'):
+            self._result(failing_test_ids=['a1'], failing_test_ids_by_module={'A': ['a1'], 'B': []})
+            self._result(failing_test_ids=['a1'])
+
+        assert self._invariant_warnings(caplog) == []
+
+    def test_an_id_no_module_owns_is_named(self, caplog: pytest.LogCaptureFixture) -> None:
+        with caplog.at_level(logging.WARNING, logger='orchestrator.verify'):
+            self._result(failing_test_ids=['a1', 'zz'], failing_test_ids_by_module={'A': ['a1']})
+
+        [message] = self._invariant_warnings(caplog)
+        assert "'zz'" in message and "'a1'" not in message, message
+
+    def test_a_map_without_collected_ids_is_named(self, caplog: pytest.LogCaptureFixture) -> None:
+        with caplog.at_level(logging.WARNING, logger='orchestrator.verify'):
+            self._result(failing_test_ids=None, failing_test_ids_by_module={'B': ['b1']})
+
+        [message] = self._invariant_warnings(caplog)
+        assert "'b1'" in message, message
+
+    def test_filtering_ids_through_replace_alone_is_named(
+        self, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        attributed = self._result(
+            failing_test_ids=['a1', 'b1'], failing_test_ids_by_module={'A': ['a1'], 'B': ['b1']},
+        )
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.verify'):
+            replace(attributed, failing_test_ids=['a1'])
+
+        [message] = self._invariant_warnings(caplog)
+        assert "'b1'" in message, message
 
 
 class TestExtractCauseHint:
@@ -2309,6 +3502,31 @@ class TestExtractCauseHint:
             f'Unexpected hint: {hint!r}'
         )
 
+    def test_pytest_undecorated_failure_summary_returned(self):
+        """task 4066: an UNDECORATED ``N failed, ...`` tally is a rung-3 match.
+
+        pytest omits the ``=`` bars when an ``INTERNALERROR`` aborts the
+        session (verify-log 2829's tally, transcribed verbatim below) and
+        under ``-q``. Before the summary regex was widened, rung 3 missed
+        those lines entirely and the hint fell through to the
+        last-non-blank-line fallback rung.
+
+        The trailing wrapper line is deliberate: without a non-progress line
+        AFTER the tally, the fallback rung would return the tally anyway and
+        this test would pass without rung 3 ever matching — proving nothing.
+        """
+        output = (
+            'orchestrator/tests/test_verify.py ...F..                          [ 73%]\n'
+            'orchestrator/tests/test_scheduler.py ....                         [ 99%]\n'
+            '\n'
+            '8 failed, 6971 passed, 216 warnings in 131.42s (0:02:11)\n'
+            'make: *** [Makefile:12: test] Error 1\n'
+        )
+        hint = _extract_cause_hint(output)
+        assert hint == '8 failed, 6971 passed, 216 warnings in 131.42s (0:02:11)', (
+            f'Unexpected hint: {hint!r}'
+        )
+
     def test_pytest_traceback_E_line_returns_last(self):
         """When only traceback E-lines exist (no FAILED/INTERNALERROR), the LAST E-line wins."""
         # No FAILED lines, no INTERNALERROR, no failure summary, no
@@ -2356,6 +3574,980 @@ class TestExtractCauseHint:
         assert hint == 'FAILED tests/test_x.py::test_first_subproject - AssertionError', (
             f'Unexpected hint: {hint!r}'
         )
+
+    # ---------------------------------------------------------------------
+    # task 5082 step-5: rung 0 — a session TRUNCATED by an xdist worker death.
+    #
+    # Two things go wrong today, and both are reporting defects rather than
+    # detection ones.  (1) The only FAILED line is often the one xdist
+    # FABRICATED for the test the dead worker had in flight
+    # (`dsession.py::handle_crashitem`, `outcome="failed"` / `when="???"`), so
+    # rung 1 names an innocent test that passes in isolation — esc-4292-3's
+    # measured shape.  (2) With no FAILED line at all the ladder falls through
+    # to rung 3 and quotes the tally, which after `triggershutdown()` counts
+    # only the tests that had already run — a PARTIAL count presented as a
+    # complete result.
+    # ---------------------------------------------------------------------
+
+    def test_worker_death_truncated_session_does_not_blame_crashed_test(self):
+        """The crashed worker's in-flight test is never named as the cause.
+
+        esc-4292-3: that FAILED line is xdist's own synthesis, and the test it
+        names passes in isolation.  Naming it sends the debugger after a
+        failure that never happened.
+        """
+        hint = _extract_cause_hint(XDIST_CRASH_ATTRIBUTED_FAILED_OUTPUT)
+        assert WORKER_DEATH_SUMMARY_MARKER in hint, f'Unexpected hint: {hint!r}'
+        assert 'test_config.py::TestFoo::test_bar' not in hint, (
+            f'Unexpected hint: {hint!r}'
+        )
+
+    def test_worker_death_hint_does_not_quote_the_partial_tally(self):
+        """Rung 0 pre-empts rung 3, so the PARTIAL tally is never quoted.
+
+        ``1 failed, 728 passed, 1 skipped`` counts only what had already run
+        before `triggershutdown()`; a clean re-run of the identical command
+        reported 19622 passed (esc-4176-6).  Quoting it as a cause reads as a
+        complete result.
+        """
+        hint = _extract_cause_hint(XDIST_CRASH_ATTRIBUTED_FAILED_OUTPUT)
+        assert '1 failed, 728 passed' not in hint, f'Unexpected hint: {hint!r}'
+
+    def test_worker_death_hint_still_names_a_surviving_real_failure(self):
+        """Truncation must never MASK a genuine independent failure.
+
+        Both facts are reported: the abort marker AND the FAILED line that is
+        not crash-attributed.  Suppressing every FAILED line on truncation
+        would recreate task 4066's incident (8 real failures hidden);
+        returning only the surviving line would let the ladder quote a partial
+        tally as complete.  Carrying both is the only option that adds
+        information without discarding any.
+        """
+        output = (
+            XDIST_CRASH_ATTRIBUTED_FAILED_OUTPUT
+            + 'FAILED orchestrator/tests/test_x.py::test_real - AssertionError\n'
+        )
+        hint = _extract_cause_hint(output)
+        assert WORKER_DEATH_SUMMARY_MARKER in hint, f'Unexpected hint: {hint!r}'
+        assert 'test_x.py::test_real' in hint, f'Unexpected hint: {hint!r}'
+
+    def test_non_truncated_crash_hint_is_unchanged(self):
+        """REGRESSION GUARD: rung 0 is INERT outside a confirmed truncation.
+
+        Same worker crash, but the session RECOVERED (no bailout marker), so
+        the tally is complete and trustworthy and today's rung-1 result must
+        come back byte-identical.
+        """
+        output = (
+            XDIST_WORKER_CRASH_OUTPUT
+            + XDIST_CRASH_ATTRIBUTED_FAILED_LINE
+            + '========== 1 failed, 2 passed in 5.00s ==========\n'
+        )
+        hint = _extract_cause_hint(output)
+        assert hint == f'FAILED {XDIST_IN_FLIGHT_NODEID}', f'Unexpected hint: {hint!r}'
+
+    def test_non_truncated_crash_hint_names_the_real_failure_first(self):
+        """Rung 1 skips the report xdist fabricated for the crashed test when
+        a genuine FAILED line follows it, so a recovered session's hint does
+        not send the debugger after a failure that never happened."""
+        real_failure = 'FAILED orchestrator/tests/test_x.py::test_real - AssertionError'
+        output = (
+            XDIST_WORKER_CRASH_OUTPUT
+            + XDIST_CRASH_ATTRIBUTED_FAILED_LINE
+            + real_failure + '\n'
+            + '========== 2 failed, 2 passed in 5.00s ==========\n'
+        )
+        hint = _extract_cause_hint(output)
+        assert hint == real_failure, f'Unexpected hint: {hint!r}'
+
+    @pytest.mark.parametrize(
+        'surviving_line',
+        [
+            'INTERNALERROR> Traceback (most recent call last):',
+            'ERROR orchestrator/tests/test_other.py::test_needs_fixture - Exception: setup failed',
+            "ERROR orchestrator/tests/test_broken.py - ImportError: cannot import name 'foo'",
+        ],
+        ids=['internalerror', 'error-nodeid', 'error-file'],
+    )
+    def test_worker_death_hint_names_a_surviving_error_surface(self, surviving_line):
+        """Truncation must not MASK an INTERNALERROR or ERROR line either.
+
+        xdist synthesizes only a FAILED report for the crashed test, so these
+        surfaces are never its artefact: with no surviving FAILED line, the
+        hint names them beside the abort marker instead of quoting only the
+        bailout — the INTERNALERROR rung 2 would have quoted stays visible.
+        """
+        hint = _extract_cause_hint(XDIST_CRASH_ATTRIBUTED_FAILED_OUTPUT + surviving_line + '\n')
+        assert WORKER_DEATH_SUMMARY_MARKER in hint, f'Unexpected hint: {hint!r}'
+        assert surviving_line in hint, f'Unexpected hint: {hint!r}'
+
+    def test_worker_death_hint_names_a_test_that_failed_before_its_worker_died(self):
+        """The crashed worker's in-flight test on TWO FAILED lines genuinely failed.
+
+        It failed in its call phase and then its worker died in teardown.
+        xdist synthesizes at most one report per node-id, so the other line is
+        a real verdict and the hint must name the test rather than hide it.
+        """
+        hint = _extract_cause_hint(XDIST_FAILED_THEN_CRASHED_OUTPUT)
+        assert WORKER_DEATH_SUMMARY_MARKER in hint, f'Unexpected hint: {hint!r}'
+        assert XDIST_IN_FLIGHT_NODEID in hint, f'Unexpected hint: {hint!r}'
+
+    def test_bailout_literal_is_still_the_quoted_evidence(self):
+        """REGRESSION GUARD: with no surviving failure and no percentage
+        progress line, the bailout literal is the evidence the hint quotes."""
+        hint = _extract_cause_hint(XDIST_SESSION_ABORTED_OUTPUT)
+        assert hint == (
+            f'{WORKER_DEATH_SUMMARY_MARKER}; worker gw3 crashed and worker restarting disabled'
+        ), f'Unexpected hint: {hint!r}'
+
+    def test_bailout_literal_outranks_the_stopped_progress_line(self):
+        """PRECEDENCE, pinned: a default-verbosity bailout prints the literal
+        AND stops pytest's final progress line short, so both witnesses hold.
+        The literal is quoted, keeping every hint it produced before -q
+        detection existed byte-for-byte."""
+        output = XDIST_BAILOUT_WITH_STOPPED_PROGRESS_OUTPUT
+        progress_witness_only = output.replace(XDIST_RESTART_DISABLED_MESSAGE, '')
+        assert _extract_cause_hint(progress_witness_only) == (
+            f'{WORKER_DEATH_SUMMARY_MARKER}; run stopped at 49% of collected tests'
+        ), 'the specimen no longer satisfies the progress witness on its own'
+        hint = _extract_cause_hint(output)
+        assert hint == f'{WORKER_DEATH_SUMMARY_MARKER}; {XDIST_RESTART_DISABLED_MESSAGE}', (
+            f'Unexpected hint: {hint!r}'
+        )
+
+
+# ---------------------------------------------------------------------------
+# task 5082 step-7: `_summarize_checks` must not assert a COMPLETE verdict for
+# a session xdist truncated.
+#
+# This is the task-3173 CONTRACT — "the summary may never assert a property
+# the gate did not measure" — applied to a SECOND cause of no-verdict.  A leg
+# SIGKILLed before it could emit diagnostics stopped being reported as "lint
+# issues" and now contributes `_killed_leg_note`.  A worker-death-truncated
+# test leg is the identical defect shape: ~97% of the suite never ran
+# (esc-4176-6: 1 failed/728 passed truncated vs 19622 passed on a clean re-run
+# of the identical command), yet the flat literal 'tests failed' claims a
+# complete measured verdict, and `merge_queue` surfaces it verbatim.
+# ---------------------------------------------------------------------------
+
+class TestWorkerDeathLegSummary:
+    """A truncated test leg contributes a worker-death note, not 'tests failed'."""
+
+    @staticmethod
+    def _summarize(test_rc: int, test_out: str, *, module: str | None = None) -> str:
+        """The truncated test leg beside CLEAN lint and type legs."""
+        from orchestrator.verify import _summarize_checks
+
+        _, _, _, summary, _ = _summarize_checks(
+            test_rc, test_out, False, 'uv run pytest',
+            0, '', False, 'ruff check',
+            0, '', False, 'pyright',
+            test_duration=209.67,
+            module=module,
+        )
+        return summary
+
+    def test_note_names_the_module_and_the_crashed_nodeid(self):
+        summary = self._summarize(1, XDIST_CRASH_ATTRIBUTED_FAILED_OUTPUT, module='orchestrator')
+        assert f'orchestrator test leg {WORKER_DEATH_SUMMARY_MARKER}' in summary, summary
+        assert f"worker died running '{XDIST_IN_FLIGHT_NODEID}'" in summary, summary
+        assert len(summary.removeprefix('Failures: ').split(', ')) == 1, summary
+
+    def test_crashed_nodeid_is_named_under_q(self):
+        summary = self._summarize(1, XDIST_Q_TRUNCATED_OUTPUT, module='orchestrator')
+        assert f"worker died running '{XDIST_IN_FLIGHT_NODEID}'" in summary, summary
+
+    def test_output_without_a_crash_notice_names_no_test(self):
+        summary = self._summarize(1, XDIST_BAILOUT_LINE + XDIST_PARTIAL_TALLY, module='orchestrator')
+        assert f'orchestrator test leg {WORKER_DEATH_SUMMARY_MARKER}' in summary, summary
+        assert 'worker died running' not in summary, summary
+
+    def test_external_kill_names_the_module(self):
+        summary = self._summarize(-9, XDIST_CRASH_ATTRIBUTED_FAILED_OUTPUT, module='orchestrator')
+        assert 'orchestrator test leg killed by signal 9' in summary, summary
+
+    def test_single_module_caller_names_no_module(self):
+        summary = self._summarize(1, XDIST_CRASH_ATTRIBUTED_FAILED_OUTPUT)
+        note = summary.removeprefix('Failures: ')
+        assert note.startswith(f'test leg {WORKER_DEATH_SUMMARY_MARKER}'), summary
+
+    def test_truncated_test_leg_does_not_claim_a_complete_verdict(self):
+        """The facet-2 core: 'tests failed' is a claim the gate cannot make."""
+        summary = self._summarize(1, XDIST_CRASH_ATTRIBUTED_FAILED_OUTPUT)
+        assert WORKER_DEATH_SUMMARY_MARKER in summary, f'Unexpected summary: {summary!r}'
+        assert 'tests failed' not in summary, f'Unexpected summary: {summary!r}'
+
+    def test_failures_envelope_is_preserved(self):
+        """Every existing consumer prefix- or substring-matches on this
+        envelope (task 3173's wording for the same requirement)."""
+        summary = self._summarize(1, XDIST_CRASH_ATTRIBUTED_FAILED_OUTPUT)
+        assert summary.startswith('Failures: '), f'Unexpected summary: {summary!r}'
+        assert summary != 'Failures: ', f'Unexpected summary: {summary!r}'
+
+    def test_note_is_one_aggregation_fragment(self):
+        """THE WIRE FORMAT, pinned at the producer.
+
+        `_summarize_checks` joins fragments with ', ' and `_aggregate_results`
+        recovers them with `.split(', ')`, keeping only marker-bearing ones.
+        A ', ' inside the note splits it in two and only the marker half
+        survives — the exact silent truncation the carry-through exists to
+        prevent, and the constraint `_killed_leg_note`'s docstring already
+        pins for the signal-kill note.
+        """
+        summary = self._summarize(1, XDIST_CRASH_ATTRIBUTED_FAILED_OUTPUT)
+        note_fragment = summary.removeprefix('Failures: ')
+        assert ', ' not in note_fragment, (
+            f'a comma+space in the note splits it across `.split(", ")` in '
+            f'_aggregate_results and only the {WORKER_DEATH_SUMMARY_MARKER!r} '
+            f'half survives; use "; " to separate clauses. Got: {note_fragment!r}'
+        )
+        # Exactly the parse `_aggregate_results` performs: one fragment in,
+        # one fragment out.
+        assert note_fragment.split(', ') == [note_fragment]
+
+    def test_external_kill_still_wins_over_worker_death(self):
+        """ORDERING, pinned: `is_external_kill_rc` is checked FIRST.
+
+        An external kill is the STRONGER no-verdict claim — the process
+        produced no diagnostics at all — so task 3173's wording must not
+        regress just because the (necessarily truncated) output it did capture
+        happens to carry a bailout marker.
+        """
+        summary = self._summarize(-9, XDIST_CRASH_ATTRIBUTED_FAILED_OUTPUT)
+        assert SIGNAL_KILL_SUMMARY_MARKER in summary, f'Unexpected summary: {summary!r}'
+        assert 'killed by signal 9' in summary, f'Unexpected summary: {summary!r}'
+        assert WORKER_DEATH_SUMMARY_MARKER not in summary, (
+            f'Unexpected summary: {summary!r}'
+        )
+
+    def test_untruncated_failing_test_leg_is_byte_identical(self):
+        """REGRESSION GUARD: with no bailout marker anywhere, the summary is
+        exactly today's."""
+        summary = self._summarize(1, 'FAILED orchestrator/tests/test_x.py::y\n')
+        assert summary == 'Failures: tests failed', f'Unexpected summary: {summary!r}'
+
+    @pytest.mark.parametrize(
+        'output',
+        [XDIST_SESSION_ABORTED_OUTPUT, XDIST_MAX_WORKERS_REACHED_OUTPUT],
+        ids=['restart-disabled', 'max-crashed-workers-reached'],
+    )
+    def test_either_bailout_spelling_labels_the_leg(self, output):
+        """Both literals xdist prints before `triggershutdown()` mean the rest
+        of the suite was abandoned: a cap of 0, and a non-zero cap exceeded."""
+        summary = self._summarize(1, output)
+        assert WORKER_DEATH_SUMMARY_MARKER in summary, f'Unexpected summary: {summary!r}'
+        assert 'tests failed' not in summary, f'Unexpected summary: {summary!r}'
+
+    def test_a_replaced_worker_run_keeps_its_verdict(self):
+        """THE LOAD-BEARING DISCRIMINATION: xdist replaced the crashed worker
+        and the session ran to COMPLETION, so its verdict is complete.
+
+        The fixture carries the same crash notice as the truncated specimen
+        and no bailout line, so this verdict can only come from keying on the
+        bailout literal rather than on the crash signature — which would
+        relabel every ``--max-worker-restart > 0`` target's complete run.
+        """
+        assert 'crashed while running' in XDIST_WORKER_REPLACED_OUTPUT
+        assert 'xdist:' not in XDIST_WORKER_REPLACED_OUTPUT
+        summary = self._summarize(1, XDIST_WORKER_REPLACED_OUTPUT)
+        assert summary == 'Failures: tests failed', f'Unexpected summary: {summary!r}'
+
+    @pytest.mark.parametrize(
+        'surviving_line',
+        [
+            'FAILED orchestrator/tests/test_x.py::test_real - AssertionError',
+            'INTERNALERROR> Traceback (most recent call last):',
+            'ERROR orchestrator/tests/test_other.py::test_needs_fixture - Exception: setup failed',
+        ],
+        ids=['failed', 'internalerror', 'error'],
+    )
+    def test_a_surviving_failure_is_reported_beside_the_note(self, surviving_line):
+        """BOTH facts, never just one: a truncated leg that still measured a
+        failure the dead worker did not fabricate reports 'tests failed' AND
+        the note — each its own aggregation fragment."""
+        summary = self._summarize(1, XDIST_CRASH_ATTRIBUTED_FAILED_OUTPUT + surviving_line + '\n')
+        fragments = summary.removeprefix('Failures: ').split(', ')
+        assert len(fragments) == 2, f'Unexpected summary: {summary!r}'
+        assert fragments[0] == 'tests failed', f'Unexpected summary: {summary!r}'
+        assert WORKER_DEATH_SUMMARY_MARKER in fragments[1], f'Unexpected summary: {summary!r}'
+
+
+class TestWorkerDeathLegNoteNamesWhoseLegDied:
+    """The note names the module whose leg died and the test its worker had in flight."""
+
+    def test_unlabelled_note_without_ids_is_byte_identical(self):
+        """A single-module caller passes neither and keeps today's sentence."""
+        assert _worker_death_leg_note('test') == (
+            'test leg session aborted after worker death; remaining tests never ran; tally is partial'
+        )
+
+    def test_module_names_the_leg(self):
+        note = _worker_death_leg_note('test', module='orchestrator')
+        assert note.startswith(f'orchestrator test leg {WORKER_DEATH_SUMMARY_MARKER}'), note
+        assert verify.is_no_verdict_summary(note)
+
+    def test_crashed_nodeid_follows_the_marker_clause(self):
+        note = _worker_death_leg_note('test', crashed_nodeids={XDIST_IN_FLIGHT_NODEID})
+        clause = f"worker died running '{XDIST_IN_FLIGHT_NODEID}'"
+        assert clause in note, note
+        assert (
+            note.index(WORKER_DEATH_SUMMARY_MARKER)
+            < note.index(clause)
+            < note.index('remaining tests never ran')
+        ), note
+
+    def test_parametrized_id_with_the_separator_stays_one_fragment(self):
+        note = _worker_death_leg_note(
+            'test', module='orchestrator', crashed_nodeids={'tests/test_x.py::test_p[a, b]'},
+        )
+        assert ', ' not in note, note
+        assert WORKER_DEATH_SUMMARY_MARKER in note, note
+        assert 'tests/test_x.py::test_p[a,b]' in note, note
+
+    def test_hostile_module_stays_one_fragment(self):
+        note = _worker_death_leg_note('test', module='a, b', crashed_nodeids={XDIST_IN_FLIGHT_NODEID})
+        assert ', ' not in note, note
+
+    def test_xdist_group_suffix_is_stripped(self):
+        note = _worker_death_leg_note('test', crashed_nodeids={'tests/test_x.py::test_y@grp'})
+        assert "'tests/test_x.py::test_y'" in note, note
+        assert '@grp' not in note, note
+
+    def test_several_ids_render_sorted(self):
+        note = _worker_death_leg_note(
+            'test', crashed_nodeids=['tests/test_z.py::test_b', 'tests/test_a.py::test_a'],
+        )
+        assert (
+            "worker died running 'tests/test_a.py::test_a' and 'tests/test_z.py::test_b'" in note
+        ), note
+
+    def test_many_ids_name_the_first_few_and_count_the_rest(self):
+        """The note travels into the bench reason and the escalation title, so
+        a session that lost many workers must not grow it without bound."""
+        nodeids = [f'tests/test_x.py::test_p[case-{i}]' for i in range(6)]
+        note = _worker_death_leg_note('test', module='orchestrator', crashed_nodeids=nodeids)
+        named = verify._MAX_NAMED_CRASHED_NODEIDS
+        for nodeid in nodeids[:named]:
+            assert f"'{nodeid}'" in note, note
+        for nodeid in nodeids[named:]:
+            assert nodeid not in note, note
+        assert f'(+{len(nodeids) - named} more)' in note, note
+        assert note.split(', ') == [note]
+
+    def test_ids_within_the_cap_are_not_counted(self):
+        note = _worker_death_leg_note('test', crashed_nodeids={XDIST_IN_FLIGHT_NODEID})
+        assert 'more)' not in note, note
+
+    def test_labelled_note_with_an_id_is_one_aggregation_fragment(self):
+        """Exactly the parse `_aggregate_results` performs."""
+        note = _worker_death_leg_note(
+            'test', module='orchestrator', crashed_nodeids={XDIST_IN_FLIGHT_NODEID},
+        )
+        assert note.split(', ') == [note]
+
+
+def _test_leg_result(test_output: str, *, module: str | None = None) -> VerifyResult:
+    """A *module*'s result whose failing TEST leg printed *test_output*, beside
+    clean lint and type legs.
+
+    Its summary is produced by `_summarize_checks` itself rather than
+    hand-written, so these tests cannot drift from the producer: an edit to
+    `_worker_death_leg_note`'s wording is exercised here automatically.
+    """
+    from orchestrator.verify import _summarize_checks
+
+    _, category, cause_hint, summary, failing_legs = _summarize_checks(
+        1, test_output, False, 'uv run pytest',
+        0, '', False, 'ruff check',
+        0, '', False, 'pyright',
+        test_duration=209.67,
+        module=module,
+    )
+    return VerifyResult(
+        passed=False,
+        test_output=test_output,
+        lint_output='',
+        type_output='',
+        summary=summary,
+        category=category,
+        cause_hint=cause_hint,
+        failing_leg_categories=failing_legs,
+    )
+
+
+def _worker_death_child(*, module: str = 'orchestrator') -> VerifyResult:
+    """A *module*'s child result whose TEST leg was truncated by an xdist
+    worker death."""
+    result = _test_leg_result(XDIST_CRASH_ATTRIBUTED_FAILED_OUTPUT, module=module)
+    return replace(result, cause_hint=f'{module}: {result.cause_hint}')
+
+
+class TestAggregateResultsKeepsWorkerDeathNote:
+    """A worker-death note must survive multi-subproject aggregation verbatim.
+
+    A DIRECT regression guard against the defect task 3173 recorded in
+    `_aggregate_results`: that loop substring-scans child summaries for
+    exactly three hardcoded literals ('tests failed' / 'lint issues' / 'type
+    errors'), so a note matching none of them made a multi-subproject verify
+    degrade to a bare 'Failures: ' with no parts at all — "erasing the one
+    fact that says the run produced no verdict". A second no-verdict note
+    reproduces that bug one edit later unless the carry-through is extended.
+    """
+
+    def test_note_survives_aggregation_beside_a_real_test_failure(self):
+        real_failure = VerifyResult(
+            passed=False, test_output='FAILED tests/x.py::y\n', lint_output='',
+            type_output='', summary='Failures: tests failed',
+            category='test_failure',
+        )
+        agg = _aggregate_results([real_failure, _worker_death_child(module='fused-memory')])
+        assert not agg.passed
+        assert WORKER_DEATH_SUMMARY_MARKER in agg.summary, (
+            f'Unexpected summary: {agg.summary!r}'
+        )
+        assert 'remaining tests never ran' in agg.summary, (
+            f'Unexpected summary: {agg.summary!r}'
+        )
+        # The sibling's genuine verdict is still reported — never masked.
+        assert 'tests failed' in agg.summary, f'Unexpected summary: {agg.summary!r}'
+        # The bug's signature: everything after the envelope dropped away.
+        assert agg.summary != 'Failures: '
+        assert agg.summary.strip() != 'Failures:'
+
+    def test_note_survives_aggregation_with_a_passing_sibling(self):
+        passing = VerifyResult(
+            passed=True, test_output='', lint_output='', type_output='',
+            summary='All checks passed', category='passed',
+        )
+        agg = _aggregate_results([passing, _worker_death_child()])
+        assert not agg.passed
+        assert WORKER_DEATH_SUMMARY_MARKER in agg.summary, (
+            f'Unexpected summary: {agg.summary!r}'
+        )
+        assert agg.summary != 'Failures: '
+
+    def test_duplicate_worker_death_notes_are_not_repeated(self):
+        """Two children of one module truncated identically must not stutter
+        the same sentence twice — the de-duplication the signal-kill
+        carry-through already guarantees."""
+        agg = _aggregate_results([_worker_death_child(), _worker_death_child()])
+        assert agg.summary.count(WORKER_DEATH_SUMMARY_MARKER) == 1, (
+            f'Unexpected summary: {agg.summary!r}'
+        )
+
+    def test_each_modules_worker_death_note_survives_naming_its_module(self):
+        agg = _aggregate_results([
+            _worker_death_child(),
+            _worker_death_child(module='dashboard'),
+        ])
+        assert 'orchestrator test leg session aborted after worker death' in agg.summary, agg.summary
+        assert 'dashboard test leg session aborted after worker death' in agg.summary, agg.summary
+
+    def test_note_names_the_dead_leg_beside_a_passing_sibling(self):
+        passing = VerifyResult(
+            passed=True, test_output='', lint_output='', type_output='',
+            summary='All checks passed', category='passed',
+        )
+        agg = _aggregate_results([passing, _worker_death_child()])
+        assert 'orchestrator test leg' in agg.summary, agg.summary
+        assert XDIST_IN_FLIGHT_NODEID in agg.summary, agg.summary
+        assert verify.is_no_verdict_summary(agg.summary)
+
+
+async def _module_verify_result(worktree: Path, test_command: str, module: str | None) -> VerifyResult:
+    """*test_command* run for real as *module*'s test leg beside clean lint and
+    type legs; *module* None runs the same commands as an unscoped verify."""
+    config = OrchestratorConfig(
+        project_root=worktree,
+        test_command=test_command,
+        lint_command='true',
+        type_check_command='true',
+        verify_timeout_retries=0,
+    )
+    module_config = None if module is None else ModuleConfig(
+        prefix=module, test_command=test_command, lint_command='true', type_check_command='true',
+    )
+    return await run_verification(
+        worktree, config, module_config, allow_cold_cache=False, max_retries=0,
+    )
+
+
+def _worker_death_command(worktree: Path) -> str:
+    output = worktree / 'xdist.out'
+    output.write_text(XDIST_SESSION_ABORTED_OUTPUT)
+    return f'cat {shlex.quote(str(output))}; exit 1'
+
+
+class TestModuleScopedNoVerdictNoteNamesItsModule:
+    """END TO END through `run_verification` against real subprocesses: a
+    module-scoped verify's no-verdict note names the module whose leg died."""
+
+    @pytest.mark.asyncio
+    async def test_worker_death_note_names_the_module_and_the_crashed_nodeid(self, tmp_path: Path):
+        result = await _module_verify_result(tmp_path, _worker_death_command(tmp_path), 'orchestrator')
+        assert f'orchestrator test leg {WORKER_DEATH_SUMMARY_MARKER}' in result.summary, result.summary
+        assert f"worker died running '{XDIST_IN_FLIGHT_NODEID}'" in result.summary, result.summary
+
+    @pytest.mark.asyncio
+    async def test_aggregate_points_at_the_leg_that_died_not_a_sibling(self, tmp_path: Path):
+        """A sibling that failed ORDINARILY keeps its verdict, and the
+        no-verdict note blames only the leg whose worker died."""
+        scripts = await _module_verify_result(
+            tmp_path, "echo 'FAILED tests/test_s.py::test_s'; exit 1", 'scripts',
+        )
+        orchestrator = await _module_verify_result(tmp_path, _worker_death_command(tmp_path), 'orchestrator')
+        agg = _aggregate_results([scripts, orchestrator])
+        fragments = agg.summary.removeprefix('Failures: ').split(', ')
+        no_verdict_notes = [f for f in fragments if verify.is_no_verdict_summary(f)]
+        assert len(no_verdict_notes) == 1, agg.summary
+        assert no_verdict_notes[0].startswith('orchestrator test leg'), agg.summary
+        assert 'scripts test leg' not in agg.summary, agg.summary
+        assert 'tests failed' in fragments, agg.summary
+
+    @pytest.mark.asyncio
+    async def test_signal_kill_note_names_the_module(self, tmp_path: Path):
+        result = await _module_verify_result(tmp_path, 'kill -9 $$', 'orchestrator')
+        assert 'orchestrator test leg killed by signal 9' in result.summary, result.summary
+
+    @pytest.mark.asyncio
+    async def test_unscoped_verify_names_no_module(self, tmp_path: Path):
+        """CONTROL: the same leg with no ModuleConfig keeps the unlabelled subject."""
+        result = await _module_verify_result(tmp_path, _worker_death_command(tmp_path), None)
+        note = result.summary.removeprefix('Failures: ')
+        assert note.startswith(f'test leg {WORKER_DEATH_SUMMARY_MARKER}'), result.summary
+
+
+class TestFailureReportNamesTheAbortedSession:
+    """`VerifyResult.failure_report()` must LEAD with the truncation caveat.
+
+    The same shape as the existing `## Verify Timed Out` section: tell the
+    debugger up front that the failure may not be real code, before it reads
+    a cause or a tally.  Without it the report hands over ``1 failed, 728
+    passed, 1 skipped`` with no indication that ~97% of the suite never ran
+    (esc-4176-6), and a ``FAILED`` line that xdist synthesized for the
+    crashed worker's in-flight test with no indication that it is not a
+    verdict (esc-4292-3).
+    """
+
+    HEADING = '## Session Aborted After Worker Death'
+
+    @staticmethod
+    def _result(test_output: str) -> VerifyResult:
+        return VerifyResult(
+            passed=False,
+            test_output=test_output,
+            lint_output='',
+            type_output='',
+            summary='Failures: tests failed',
+            category='test_failure',
+            cause_hint='session aborted after worker death; worker gw3 crashed',
+        )
+
+    def test_report_carries_the_section(self):
+        report = self._result(XDIST_CRASH_ATTRIBUTED_FAILED_OUTPUT).failure_report()
+        assert self.HEADING in report, f'Unexpected report: {report!r}'
+
+    def test_section_leads_the_report_ahead_of_the_failure_cause(self):
+        """Placement matches the `## Verify Timed Out` precedent: the caveat
+        comes BEFORE the cause, so it cannot be read as an afterthought."""
+        report = self._result(XDIST_CRASH_ATTRIBUTED_FAILED_OUTPUT).failure_report()
+        assert '## Failure Cause' in report, f'Unexpected report: {report!r}'
+        assert report.index(self.HEADING) < report.index('## Failure Cause'), (
+            f'Unexpected report: {report!r}'
+        )
+
+    def test_section_says_the_tally_is_partial(self):
+        """A reader must not mistake ``1 failed, 728 passed`` for complete."""
+        report = self._result(XDIST_CRASH_ATTRIBUTED_FAILED_OUTPUT).failure_report()
+        section = report.split(self.HEADING, 1)[1].split('\n## ', 1)[0].lower()
+        assert 'partial' in section, f'Unexpected section: {section!r}'
+        assert 'never ran' in section, f'Unexpected section: {section!r}'
+
+    def test_section_warns_the_failed_line_may_be_a_crash_artefact(self):
+        """esc-4292-3: the FAILED line naming the crashed worker's in-flight
+        test is xdist's own synthesis, not a verdict."""
+        report = self._result(XDIST_CRASH_ATTRIBUTED_FAILED_OUTPUT).failure_report()
+        section = report.split(self.HEADING, 1)[1].split('\n## ', 1)[0].lower()
+        assert 'crash' in section, f'Unexpected section: {section!r}'
+
+    def test_a_recovered_worker_crash_gets_no_section(self):
+        """NEGATIVE: a crash signature with NO bailout marker completed
+        normally, so the section must stay inert."""
+        report = self._result(XDIST_WORKER_REPLACED_OUTPUT).failure_report()
+        assert self.HEADING not in report, f'Unexpected report: {report!r}'
+
+    def test_an_ordinary_failure_report_is_byte_identical(self):
+        """REGRESSION GUARD: no crash signature at all -> today's report,
+        unchanged."""
+        ordinary = self._result(
+            'FAILED orchestrator/tests/test_x.py::test_real - AssertionError\n'
+            '========== 1 failed, 2 passed in 5.00s ==========\n'
+        )
+        report = ordinary.failure_report()
+        assert self.HEADING not in report, f'Unexpected report: {report!r}'
+        assert report.startswith('## Failure Cause'), f'Unexpected report: {report!r}'
+
+
+_Q_TRUNCATED_OUTPUTS = pytest.mark.parametrize(
+    'output',
+    [XDIST_Q_TRUNCATED_OUTPUT, XDIST_Q_TRUNCATED_AT_LINE_EDGE_OUTPUT],
+    ids=['final-line-after-status-chars', 'final-fill-on-a-fresh-line'],
+)
+
+
+class TestWorkerDeathTruncationWithoutTheBailoutLine:
+    """task 5337: the four worker-death consumers must fire under ``-q`` too.
+
+    Every ``-q`` module-scoped verify leg lacks the bailout literal (xdist
+    gates it on ``verbose >= 0``), so these specimens exercise the
+    progress-line witness alone: a crash signature, a final progress line
+    below ``[100%]``, pytest's own failure tally after it, and no
+    interrupted-run banner after that line.
+    """
+
+    HEADING = '## Session Aborted After Worker Death'
+
+    @_Q_TRUNCATED_OUTPUTS
+    def test_leg_summary_says_the_session_was_aborted(self, output):
+        """The crash-attributed FAILED line is the only failure, so nothing
+        survives to be reported as 'tests failed'."""
+        summary = _test_leg_result(output).summary
+        assert WORKER_DEATH_SUMMARY_MARKER in summary, f'Unexpected summary: {summary!r}'
+        assert 'tests failed' not in summary, f'Unexpected summary: {summary!r}'
+
+    @_Q_TRUNCATED_OUTPUTS
+    def test_failure_report_leads_with_the_aborted_section(self, output):
+        report = _test_leg_result(output).failure_report()
+        assert self.HEADING in report, f'Unexpected report: {report!r}'
+
+    @_Q_TRUNCATED_OUTPUTS
+    def test_note_survives_aggregation(self, output):
+        passing = VerifyResult(
+            passed=True, test_output='', lint_output='', type_output='',
+            summary='All checks passed', category='passed',
+        )
+        agg = _aggregate_results([passing, _test_leg_result(output)])
+        assert WORKER_DEATH_SUMMARY_MARKER in agg.summary, (
+            f'Unexpected summary: {agg.summary!r}'
+        )
+
+    @_Q_TRUNCATED_OUTPUTS
+    def test_cause_hint_blames_no_test_and_quotes_no_partial_tally(self, output):
+        hint = _extract_cause_hint(output)
+        assert WORKER_DEATH_SUMMARY_MARKER in hint, f'Unexpected hint: {hint!r}'
+        assert XDIST_IN_FLIGHT_NODEID not in hint, f'Unexpected hint: {hint!r}'
+        assert '9851 passed' not in hint, f'Unexpected hint: {hint!r}'
+
+    @_Q_TRUNCATED_OUTPUTS
+    def test_cause_hint_names_where_the_run_stopped(self, output):
+        """With no surviving failure, the hint quotes the evidence the detector
+        keyed on. Under -q that is the stop percentage, which tells the reader
+        how much of the suite never ran."""
+        hint = _extract_cause_hint(output)
+        assert hint == f'{WORKER_DEATH_SUMMARY_MARKER}; run stopped at 46% of collected tests', (
+            f'Unexpected hint: {hint!r}'
+        )
+
+    def test_a_recovered_run_that_reached_100_percent_keeps_its_verdict(self):
+        """THE LOAD-BEARING DISCRIMINATION: a recovering run carries the
+        identical crash notice, so keying on the crash signature alone would
+        relabel it. Only where the final progress line stops tells them apart.
+        """
+        output = XDIST_Q_RECOVERED_OUTPUT
+        result = _test_leg_result(output)
+        assert result.summary == 'Failures: tests failed', (
+            f'Unexpected summary: {result.summary!r}'
+        )
+        report = result.failure_report()
+        assert self.HEADING not in report, f'Unexpected report: {report!r}'
+        hint = _extract_cause_hint(output)
+        assert hint == f'FAILED {XDIST_IN_FLIGHT_NODEID}', f'Unexpected hint: {hint!r}'
+
+    def test_a_run_killed_after_a_recovered_crash_is_not_labelled(self):
+        """The process, not xdist, ended the loop: no FAILURES section and no
+        tally. The killed-leg note and the timeout rung own that case."""
+        output = XDIST_Q_KILLED_AFTER_RECOVERED_CRASH_OUTPUT
+        hint = _extract_cause_hint(output)
+        assert WORKER_DEATH_SUMMARY_MARKER not in hint, f'Unexpected hint: {hint!r}'
+        result = _test_leg_result(output)
+        report = result.failure_report()
+        assert self.HEADING not in report, f'Unexpected report: {report!r}'
+        assert result.summary == 'Failures: tests failed', (
+            f'Unexpected summary: {result.summary!r}'
+        )
+
+    @pytest.mark.parametrize(
+        ('output', 'expected_hint'),
+        [
+            (
+                XDIST_Q_RECOVERED_THEN_MAXFAIL_STOPPED_OUTPUT,
+                XDIST_Q_MAXFAIL_REAL_FAILED_LINE.strip(),
+            ),
+            (
+                XDIST_Q_RECOVERED_THEN_KEYBOARD_INTERRUPTED_OUTPUT,
+                f'FAILED {XDIST_IN_FLIGHT_NODEID}',
+            ),
+        ],
+        ids=['maxfail-stop', 'keyboard-interrupt'],
+    )
+    def test_an_interrupted_run_after_a_recovered_crash_is_not_labelled(
+        self, output, expected_hint,
+    ):
+        """task 5905: the stop came from pytest's interrupted run loop, not
+        from xdist abandoning the queue, so failure_report must not claim the
+        --max-worker-restart cap was exceeded. The hint names the real failure
+        that stopped an -x run, never the report xdist fabricated for the
+        crashed test; with no real failure, that report is all there is."""
+        result = _test_leg_result(output)
+        assert result.summary == 'Failures: tests failed', (
+            f'Unexpected summary: {result.summary!r}'
+        )
+        report = result.failure_report()
+        assert self.HEADING not in report, f'Unexpected report: {report!r}'
+        hint = _extract_cause_hint(output)
+        assert hint == expected_hint, f'Unexpected hint: {hint!r}'
+
+    def test_a_bailout_that_maxfail_also_counted_is_still_labelled(self):
+        """task 5905: a genuine bailout under -x prints pytest's 'stopping
+        after N failures' banner too, so that banner is no interruption."""
+        output = XDIST_Q_BAILOUT_UNDER_MAXFAIL_OUTPUT
+        _assert_labelled_aborted(output)
+        hint = _extract_cause_hint(output)
+        assert hint == f'{WORKER_DEATH_SUMMARY_MARKER}; run stopped at 46% of collected tests', (
+            f'Unexpected hint: {hint!r}'
+        )
+
+    def test_a_run_stopped_short_without_a_worker_crash_is_not_labelled(self):
+        """An -x/--maxfail stop: progress below 100% alone is never enough."""
+        failed_line = 'FAILED orchestrator/tests/test_x.py::test_real - AssertionError'
+        output = (
+            '....F'.ljust(73) + '[ 10%]\n'
+            + failed_line + '\n'
+            + '1 failed, 4 passed in 0.10s\n'
+        )
+        summary = _test_leg_result(output).summary
+        assert summary == 'Failures: tests failed', f'Unexpected summary: {summary!r}'
+        hint = _extract_cause_hint(output)
+        assert hint == failed_line, f'Unexpected hint: {hint!r}'
+
+
+_SESSION_START = ' test session starts '.center(80, '=') + '\n'
+_SESSION_ABORTED_HEADING = '## Session Aborted After Worker Death'
+_PASSING_SESSION = (
+    _SESSION_START
+    + '.' * 72 + ' [100%]\n'
+    + ' 300 passed in 5.00s '.center(80, '=') + '\n'
+)
+_STOPPED_PROGRESS_ONLY_OUTPUT = ''.join(
+    line
+    for line in XDIST_BAILOUT_WITH_STOPPED_PROGRESS_OUTPUT.splitlines(keepends=True)
+    if XDIST_RESTART_DISABLED_MESSAGE not in line
+)
+
+
+def _assert_labelled_aborted(output: str) -> None:
+    hint = _extract_cause_hint(output)
+    assert WORKER_DEATH_SUMMARY_MARKER in hint, f'Unexpected hint: {hint!r}'
+    result = _test_leg_result(output)
+    assert WORKER_DEATH_SUMMARY_MARKER in result.summary, (
+        f'Unexpected summary: {result.summary!r}'
+    )
+    report = result.failure_report()
+    assert _SESSION_ABORTED_HEADING in report, f'Unexpected report: {report!r}'
+
+
+async def _segmented_chain_output(*segments: tuple[int, str]) -> str:
+    """The aggregated output ``_run_segmented`` builds when each segment of a
+    two-subproject chain returns its ``(rc, output)`` pair, in order."""
+    chain = split_and_chain_segments(
+        'cd orchestrator && uv run pytest tests/ && cd ../fused-memory && uv run pytest tests/',
+    )
+    assert chain is not None and len(chain) == len(segments), f'Unexpected split: {chain!r}'
+    results = iter(segments)
+
+    async def run_one(cmd: str, cwd: Path, timeout: float, label: str) -> tuple[int, str, bool]:
+        rc, out = next(results)
+        return rc, out, False
+
+    _, output, _, _ = await _run_segmented(
+        chain,
+        run_one=run_one,
+        worktree=Path('.'),
+        budget_secs=10_000.0,
+        now=lambda: 0.0,
+    )
+    return output
+
+
+class TestCompleteSessionIsNotLabelledAborted:
+    """task 5891: a session whose every collected test reported is complete,
+    whatever worker-death text appears in its output."""
+
+    @pytest.mark.parametrize(
+        'output',
+        [
+            XDIST_BAILOUT_COMPLETE_SESSION_OUTPUT,
+            XDIST_BAILOUT_PEER_FINISHED_ITS_QUEUE_OUTPUT,
+            XDIST_V_BAILOUT_COMPLETE_SESSION_OUTPUT,
+        ],
+        ids=['crashed-test-was-last', 'peer-finished-its-queue', 'verbose-crashed-test-was-last'],
+    )
+    def test_a_bailout_that_still_reached_100_percent_keeps_its_verdict(self, output):
+        assert XDIST_RESTART_DISABLED_MESSAGE in output
+        result = _test_leg_result(output)
+        assert result.summary == 'Failures: tests failed', (
+            f'Unexpected summary: {result.summary!r}'
+        )
+        report = result.failure_report()
+        assert _SESSION_ABORTED_HEADING not in report, f'Unexpected report: {report!r}'
+        hint = _extract_cause_hint(output)
+        assert hint == f'FAILED {XDIST_IN_FLIGHT_NODEID}', f'Unexpected hint: {hint!r}'
+
+    def test_a_verbose_bailout_short_of_100_percent_is_still_labelled(self):
+        """GUARD: the -v outcome lines' percentage vetoes only at 100."""
+        _assert_labelled_aborted(XDIST_V_BAILOUT_TRUNCATED_OUTPUT)
+
+    def test_a_nested_runs_progress_line_in_captured_output_is_not_the_sessions(self):
+        output = PYTEST_Q_NESTED_RUN_IN_CAPTURED_STDOUT_OUTPUT
+        result = _test_leg_result(output)
+        assert result.summary == 'Failures: tests failed', (
+            f'Unexpected summary: {result.summary!r}'
+        )
+        report = result.failure_report()
+        assert _SESSION_ABORTED_HEADING not in report, f'Unexpected report: {report!r}'
+        hint = _extract_cause_hint(output)
+        assert hint == f'FAILED {NESTED_RUN_FAILED_NODEID} - assert 1 == 0', (
+            f'Unexpected hint: {hint!r}'
+        )
+
+    def test_an_earlier_sessions_recovered_crash_lends_nothing_to_a_later_session(self):
+        """The root test_command &&-chains default-verbosity sessions. A crash
+        the first session recovered from must not complete the -q witness for
+        a later session that ``-x`` stopped short."""
+        failed_line = 'FAILED orchestrator/tests/test_x.py::test_real - assert 0'
+        recovered_session = (
+            _SESSION_START
+            + '.' * 30 + '[gw0] node down: Not properly terminated\n'
+            + 'replacing crashed worker gw0\n'
+            + '.' * 41 + ' ' * 31 + '[100%]\n'
+            + ' 300 passed in 5.00s '.center(80, '=') + '\n'
+        )
+        stopped_session = (
+            _SESSION_START
+            + '....F'.ljust(73) + '[ 10%]\n'
+            + ' FAILURES '.center(80, '=') + '\n'
+            + 'E   assert 0\n'
+            + ' short test summary info '.center(80, '=') + '\n'
+            + failed_line + '\n'
+            + ' stopping after 1 failures '.center(80, '!') + '\n'
+            + ' 1 failed, 4 passed in 0.10s '.center(80, '=') + '\n'
+        )
+        output = recovered_session + stopped_session
+        summary = _test_leg_result(output).summary
+        assert summary == 'Failures: tests failed', f'Unexpected summary: {summary!r}'
+        hint = _extract_cause_hint(output)
+        assert hint == failed_line, f'Unexpected hint: {hint!r}'
+
+    @pytest.mark.parametrize(
+        'truncated_session',
+        [XDIST_BAILOUT_WITH_STOPPED_PROGRESS_OUTPUT, _STOPPED_PROGRESS_ONLY_OUTPUT],
+        ids=['with-bailout-literal', 'stopped-progress-only'],
+    )
+    def test_a_truncated_last_session_after_a_passing_one_is_still_labelled(
+        self, truncated_session,
+    ):
+        """GUARD: a session header must not hide the progress that follows it,
+        and an earlier session's [100%] must not veto the last session."""
+        output = _PASSING_SESSION + _SESSION_START + truncated_session
+        hint = _extract_cause_hint(output)
+        assert WORKER_DEATH_SUMMARY_MARKER in hint, f'Unexpected hint: {hint!r}'
+        summary = _test_leg_result(output).summary
+        assert WORKER_DEATH_SUMMARY_MARKER in summary, f'Unexpected summary: {summary!r}'
+
+    @pytest.mark.parametrize(
+        'output',
+        [
+            PYTEST_V_ASSERTION_QUOTES_BAILOUT_OUTPUT,
+            PYTEST_V_NESTED_BAILOUT_IN_CAPTURED_STDOUT_OUTPUT,
+            PYTEST_INTERNALERROR_QUOTES_BAILOUT_OUTPUT,
+        ],
+        ids=['assertion-quote', 'nested-run-in-captured-stdout', 'internalerror-mid-line'],
+    )
+    def test_a_quoted_bailout_literal_is_not_xdists(self, output):
+        hint = _extract_cause_hint(output)
+        assert WORKER_DEATH_SUMMARY_MARKER not in hint, f'Unexpected hint: {hint!r}'
+        result = _test_leg_result(output)
+        assert result.summary == 'Failures: tests failed', (
+            f'Unexpected summary: {result.summary!r}'
+        )
+        report = result.failure_report()
+        assert _SESSION_ABORTED_HEADING not in report, f'Unexpected report: {report!r}'
+
+
+class TestATruncatedSessionIsLabelledWhereverItSits:
+    """task 5891 review: each pytest session is judged alone, because the
+    segmented fallback runs every segment, so a truncated session need not be
+    last."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ('first', 'second'),
+        [
+            ((1, _SESSION_START + XDIST_BAILOUT_WITH_STOPPED_PROGRESS_OUTPUT), (0, _PASSING_SESSION)),
+            ((1, _SESSION_START + _STOPPED_PROGRESS_ONLY_OUTPUT), (0, _PASSING_SESSION)),
+            ((1, XDIST_Q_TRUNCATED_OUTPUT), (0, '.' * 72 + ' [100%]\n300 passed in 5.00s\n')),
+        ],
+        ids=[
+            'default-verbosity-bailout',
+            'default-verbosity-stopped-progress',
+            'q-segment-without-session-header',
+        ],
+    )
+    async def test_a_truncated_segment_ahead_of_a_complete_one_is_labelled(self, first, second):
+        output = await _segmented_chain_output(first, second)
+        _assert_labelled_aborted(output)
+
+    def test_a_plain_join_of_a_truncated_session_then_a_complete_one_is_labelled(self):
+        output = _SESSION_START + XDIST_BAILOUT_WITH_STOPPED_PROGRESS_OUTPUT + _PASSING_SESSION
+        _assert_labelled_aborted(output)
+
+    def test_a_truncated_q_module_after_a_completed_failing_one_is_labelled(self):
+        """The header-less -q join ``_aggregate_results`` builds: the earlier
+        module's stats line closes its report body, so the truncated module's
+        run stream is read."""
+        aggregated = _aggregate_results([
+            _test_leg_result(PYTEST_Q_COMPLETE_ONE_FAILED_OUTPUT, module='orchestrator'),
+            _test_leg_result(XDIST_Q_TRUNCATED_OUTPUT, module='fused-memory'),
+        ])
+        report = aggregated.failure_report()
+        assert _SESSION_ABORTED_HEADING in report, f'Unexpected report: {report!r}'
+        hint = _extract_cause_hint(aggregated.test_output)
+        assert WORKER_DEATH_SUMMARY_MARKER in hint, f'Unexpected hint: {hint!r}'
+
+    def test_a_truncated_q_module_after_a_completed_verbose_one_is_labelled(self):
+        """The -q module joins the -v session's stream, and its later progress
+        reading, not the -v session's [100%], decides the veto."""
+        aggregated = _aggregate_results([
+            _test_leg_result(_SESSION_START + XDIST_V_BAILOUT_COMPLETE_SESSION_OUTPUT),
+            _test_leg_result(XDIST_Q_TRUNCATED_OUTPUT),
+        ])
+        report = aggregated.failure_report()
+        assert _SESSION_ABORTED_HEADING in report, f'Unexpected report: {report!r}'
+
+    @pytest.mark.asyncio
+    async def test_a_complete_segment_ahead_of_a_passing_one_keeps_its_verdict(self):
+        """GUARD: per-session judging keeps the [100%] veto per session."""
+        output = await _segmented_chain_output(
+            (1, _SESSION_START + XDIST_BAILOUT_COMPLETE_SESSION_OUTPUT), (0, _PASSING_SESSION),
+        )
+        result = _test_leg_result(output)
+        assert result.summary == 'Failures: tests failed', (
+            f'Unexpected summary: {result.summary!r}'
+        )
+        report = result.failure_report()
+        assert _SESSION_ABORTED_HEADING not in report, f'Unexpected report: {report!r}'
+        hint = _extract_cause_hint(output)
+        assert hint == f'FAILED {XDIST_IN_FLIGHT_NODEID}', f'Unexpected hint: {hint!r}'
 
 
 class TestVerifyResultCauseHint:
@@ -2954,7 +5146,7 @@ class TestClassifyFailure:
     """
 
     def _classify(self, output: str, rc: int, timed_out: bool) -> str:
-        from orchestrator.verify_classify import classify_failure  # noqa: PLC0415
+        from orchestrator.verify_classify import classify_failure
         return classify_failure(ToolKind.OPAQUE, rc, output, timed_out)
 
     # (a) rc == 0 → 'passed' regardless of output content
@@ -3357,19 +5549,16 @@ class TestVerifyResultCategoryAndPaths:
 
 
 class TestPersistAttemptLogs:
-    """Tests for ``_persist_attempt_logs(worktree, attempt_id, runs, category, cause_hint)``.
+    """Tests for ``_persist_attempt_logs(worktree, attempt_id, runs, summary_record)``.
 
     Tests fail until step 8 implements the helper.
     """
 
     def _persist(self, worktree, attempt_id, runs, category='cargo_cli_error', cause_hint='error: bad'):
-        import asyncio  # noqa: PLC0415
-
-        from orchestrator.verify import _persist_attempt_logs  # noqa: PLC0415
-        return asyncio.run(
-            _persist_attempt_logs(worktree, attempt_id, runs, category, cause_hint)
-        ) if asyncio.iscoroutinefunction(_persist_attempt_logs) else _persist_attempt_logs(
-            worktree, attempt_id, runs, category, cause_hint
+        from orchestrator.verify import _persist_attempt_logs
+        return _persist_attempt_logs(
+            worktree, attempt_id, runs,
+            _build_summary_payload(runs, category, cause_hint, role='task'),
         )
 
     def _make_runs(self):
@@ -3528,14 +5717,17 @@ class TestPersistAttemptLogs:
 
 
 class TestArchiveAttemptLog:
-    """Tests for ``_archive_attempt_log(worktree_log_paths, archive_root, task_id, attempt_id, category)``.
+    """Tests for ``_archive_attempt_log(worktree_log_paths, archive_root, task_id, attempt_id, category, *, stamp)``.
 
     Tests fail until step 10 implements the helper.
     """
 
     def _archive(self, worktree_log_paths, archive_root, task_id, attempt_id, category):
-        from orchestrator.verify import _archive_attempt_log  # noqa: PLC0415
-        return _archive_attempt_log(worktree_log_paths, archive_root, task_id, attempt_id, category)
+        from orchestrator.verify import _archive_attempt_log, _archive_stamp
+        return _archive_attempt_log(
+            worktree_log_paths, archive_root, task_id, attempt_id, category,
+            stamp=_archive_stamp(),
+        )
 
     def _make_source_logs(self, tmp_path: Path) -> list[Path]:
         """Create two fake worktree log files and return their paths."""
@@ -3626,7 +5818,7 @@ class TestPruneArchive:
     """
 
     def _prune(self, archive_root, max_age_days=30, max_total_bytes=1_000_000_000):
-        from orchestrator.verify import _prune_archive  # noqa: PLC0415
+        from orchestrator.verify import _prune_archive
         return _prune_archive(archive_root, max_age_days=max_age_days, max_total_bytes=max_total_bytes)
 
     # (a) old files deleted, fresh files kept
@@ -3724,6 +5916,462 @@ class TestPruneArchive:
         self._prune(archive_root, max_age_days=365, max_total_bytes=100)
         assert not older.exists(), 'Oldest .json file should be deleted to satisfy cap'
         assert newer.exists(), 'Newer .json file should remain'
+
+    # (f) junit reports are retained on GREEN runs too, so this budget is the
+    # only thing bounding them.
+    def test_old_junit_report_deleted(self, tmp_path: Path):
+        import os
+        import time
+        archive_root = tmp_path / 'archive'
+        archive_root.mkdir()
+        old_report = archive_root / 'attempt-1.junit-20260101T000000_000000Z.xml.gz'
+        old_report.write_bytes(b'\x1f\x8b')
+        old_mtime = time.time() - 31 * 86_400
+        os.utime(old_report, (old_mtime, old_mtime))
+        self._prune(archive_root, max_age_days=30)
+        assert not old_report.exists(), 'Old junit report should have been deleted'
+
+    def test_junit_report_counted_toward_size_budget(self, tmp_path: Path):
+        import os
+        import time
+        archive_root = tmp_path / 'archive'
+        archive_root.mkdir()
+        t = time.time() - 60
+        older = archive_root / 'attempt-1.junit-old.xml.gz'
+        newer = archive_root / 'attempt-2.junit-new.xml.gz'
+        older.write_bytes(b'x' * 60)
+        newer.write_bytes(b'x' * 60)
+        os.utime(older, (t, t))
+        os.utime(newer, (t + 10, t + 10))
+        self._prune(archive_root, max_age_days=365, max_total_bytes=100)
+        assert not older.exists(), 'Oldest junit report should be deleted to satisfy cap'
+        assert newer.exists(), 'Newer junit report should remain'
+
+
+@pytest.mark.asyncio
+class TestVerifyPlanPersistedBesideTheAttempt:
+    """``run_scoped_verification`` leaves the plan's REASONS on disk.
+
+    Asserted on the written artefact, not on the writer.
+    """
+
+    _ATTEMPT_ID = 7
+    _TASK_ID = '4242'
+
+    def _worktree(self, tmp_path: Path) -> Path:
+        (tmp_path / '.task').mkdir()
+        touched = tmp_path / 'pkg' / 'tests'
+        touched.mkdir(parents=True)
+        (touched / 'test_changed.py').write_text('def test_x(): pass\n')
+        return tmp_path
+
+    async def _run(self, worktree: Path, archive_root: 'Path | None'):
+        config = OrchestratorConfig(project_root=worktree)
+        module_configs = [ModuleConfig(prefix='pkg', test_command='pytest tests/')]
+
+        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
+            return 0, '', False
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            return await run_scoped_verification(
+                worktree, config, module_configs,
+                task_files=['pkg/tests/test_changed.py'],
+                attempt_id=self._ATTEMPT_ID,
+                task_id=self._TASK_ID,
+                archive_root=archive_root,
+            )
+
+    def _plan_path(self, worktree: Path) -> Path:
+        return worktree / '.task' / 'verify' / f'attempt-{self._ATTEMPT_ID}.plan.json'
+
+    async def test_plan_json_records_a_reason_for_every_planned_run(self, tmp_path: Path):
+        import json
+        worktree = self._worktree(tmp_path)
+        await self._run(worktree, None)
+
+        plan_path = self._plan_path(worktree)
+        assert plan_path.is_file(), f'plan artefact missing at {plan_path}'
+        plan = json.loads(plan_path.read_text())
+        assert plan['runs'], f'plan recorded no runs: {plan}'
+        for run in plan['runs']:
+            assert run['reason'], f'a planned run carries no reason: {run}'
+            assert run['scope_kind'], f'a planned run carries no scope_kind: {run}'
+
+    async def test_plan_survives_the_worktree_via_the_archive(self, tmp_path: Path):
+        import json
+        worktree = self._worktree(tmp_path)
+        archive_root = tmp_path / 'data' / 'verify-logs'
+        await self._run(worktree, archive_root)
+
+        archived = list((archive_root / self._TASK_ID).glob(
+            f'attempt-{self._ATTEMPT_ID}.plan-*.json',
+        ))
+        assert len(archived) == 1, (
+            f'expected exactly one archived plan; got {archived}'
+        )
+        assert json.loads(archived[0].read_text()) == json.loads(
+            self._plan_path(worktree).read_text()
+        ), 'the archived plan must be the same record as the worktree copy'
+
+    async def test_no_archive_copy_without_an_archiving_caller(self, tmp_path: Path):
+        """``archive_root=None`` is how cold-shadow and drift probes opt out."""
+        worktree = self._worktree(tmp_path)
+        await self._run(worktree, None)
+        assert not (tmp_path / 'data').exists(), (
+            'a non-archiving caller must not create an archive tree'
+        )
+
+    async def test_fallback_scoped_run_persists_its_plan(self, tmp_path: Path):
+        """The no-module_configs fallback branch is a third plan call site."""
+        import json
+        worktree = tmp_path
+        (worktree / '.task').mkdir()
+        (worktree / 'pkg').mkdir()
+        (worktree / 'pkg' / 'mod.py').write_text('x = 1\n')
+        config = OrchestratorConfig(
+            project_root=worktree, test_command='pytest tests/',
+            lint_command='ruff check .', type_check_command='pyright',
+        )
+
+        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
+            return 0, '', False
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            await run_scoped_verification(
+                worktree, config, [], task_files=['pkg/mod.py'],
+                attempt_id=self._ATTEMPT_ID, task_id=self._TASK_ID,
+            )
+
+        plan = json.loads(self._plan_path(worktree).read_text())
+        assert plan['runs'], f'fallback branch persisted an empty plan: {plan}'
+
+
+@pytest.mark.asyncio
+class TestVerifyPlanOnTheMergePath:
+    """The merge lane carries NO attempt_id, and is the path this exists for.
+
+    ``verify_runner.LocalRunner.run_merge_verify`` passes ``task_id`` and
+    ``archive_root`` but no ``attempt_id``, so a plan writer gated on one
+    writes nothing on exactly the lane whose worktree is deleted minutes
+    later.  Both artefacts must land, under one joinable stem.
+    """
+
+    _TASK_ID = '4242'
+
+    def _worktree(self, tmp_path: Path) -> Path:
+        (tmp_path / 'pkg' / 'tests').mkdir(parents=True)
+        (tmp_path / 'pkg' / 'tests' / 'test_changed.py').write_text('def test_x(): pass\n')
+        return tmp_path
+
+    async def _run(self, worktree: Path, archive_root: Path, module_configs):
+        config = OrchestratorConfig(
+            project_root=worktree, merge_verify_breadth='full',
+        )
+
+        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
+            if '--junitxml' in cmd:
+                parts = cmd.split()
+                report = Path(parts[parts.index('--junitxml') + 1])
+                report.parent.mkdir(parents=True, exist_ok=True)
+                report.write_text('<testsuites><testsuite name="pytest"/></testsuites>')
+            return 0, '', False
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            return await run_scoped_verification(
+                worktree, config, module_configs,
+                task_files=['pkg/tests/test_changed.py'],
+                is_merge_verify=True, role='merge',
+                task_id=self._TASK_ID, archive_root=archive_root,
+            )
+
+    async def test_plan_and_junit_land_under_one_stem_without_an_attempt_id(
+        self, tmp_path: Path,
+    ):
+        worktree = self._worktree(tmp_path)
+        archive_root = tmp_path / 'data' / 'verify-logs'
+        await self._run(
+            worktree, archive_root,
+            [ModuleConfig(prefix='pkg', test_command='pytest tests/')],
+        )
+
+        archived = archive_root / self._TASK_ID
+        plans = list(archived.glob('attempt-*.plan-*.json'))
+        junits = list(archived.glob('attempt-*.junit-*.xml.gz'))
+        assert len(plans) == 1, f'merge-path plan not archived; got {plans}'
+        assert len(junits) == 1, f'merge-path junit not archived; got {junits}'
+        assert plans[0].name.split('.')[0] == junits[0].name.split('.')[0], (
+            'plan and junit must share an attempt-N stem so a census can join '
+            f'them; got {plans[0].name} vs {junits[0].name}'
+        )
+
+    async def test_per_module_fan_out_persists_its_plan(self, tmp_path: Path):
+        """force_workspace + breadth=full fans out per module — a plan site."""
+        import json
+        worktree = self._worktree(tmp_path)
+        archive_root = tmp_path / 'data' / 'verify-logs'
+        config = OrchestratorConfig(
+            project_root=worktree, merge_verify_breadth='full',
+        )
+
+        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
+            return 0, '', False
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            await run_scoped_verification(
+                worktree, config,
+                [ModuleConfig(prefix='pkg', test_command='pytest tests/')],
+                task_files=None, force_workspace=True,
+                is_merge_verify=True, role='merge',
+                task_id=self._TASK_ID, archive_root=archive_root,
+            )
+
+        plans = list((archive_root / self._TASK_ID).glob('attempt-*.plan-*.json'))
+        assert len(plans) == 1, f'fan-out branch plan not archived; got {plans}'
+        assert json.loads(plans[0].read_text())['runs'], 'fan-out plan has no runs'
+
+
+@pytest.mark.asyncio
+class TestJunitReportRetention:
+    """The merge-path junit report is archived on GREEN runs as well as red.
+
+    The log archival beside it is gated on ``not passed``; copying that gate
+    would have yielded a red-only cost corpus.
+    """
+
+    _ATTEMPT_ID = 3
+    _TASK_ID = '4242'
+
+    def _fake_run_cmd_writing_junit(self, *, rc: int):
+        xml = (
+            '<?xml version="1.0" encoding="utf-8"?>\n'
+            f'<testsuites><testsuite name="pytest" errors="0" failures="{int(rc != 0)}"'
+            ' tests="1"><testcase classname="tests.test_sample" name="test_one"'
+            ' time="0.001"/></testsuite></testsuites>\n'
+        )
+
+        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
+            if '--junitxml' in cmd:
+                parts = cmd.split()
+                junit_path = Path(parts[parts.index('--junitxml') + 1])
+                junit_path.parent.mkdir(parents=True, exist_ok=True)
+                junit_path.write_text(xml)
+                return rc, 'output', False
+            return 0, 'ok', False
+
+        return fake_run_cmd
+
+    async def _run(self, tmp_path: Path, *, rc: int) -> Path:
+        config = OrchestratorConfig(
+            project_root=tmp_path, merge_verify_breadth='full',
+        )
+        module_config = ModuleConfig(
+            prefix='pkg', test_command='pytest tests/',
+            lint_command=None, type_check_command=None,
+        )
+        archive_root = tmp_path / 'data' / 'verify-logs'
+        with patch(
+            'orchestrator.verify._run_cmd',
+            side_effect=self._fake_run_cmd_writing_junit(rc=rc),
+        ):
+            await run_verification(
+                tmp_path, config, module_config, max_retries=0, role='merge',
+                attempt_id=self._ATTEMPT_ID, task_id=self._TASK_ID,
+                archive_root=archive_root,
+            )
+        return archive_root
+
+    @pytest.mark.parametrize('rc', [0, 1])
+    async def test_junit_archived_whether_the_leg_passed_or_failed(
+        self, tmp_path: Path, rc: int,
+    ):
+        import gzip
+        archive_root = await self._run(tmp_path, rc=rc)
+        archived = list((archive_root / self._TASK_ID).glob(
+            f'attempt-{self._ATTEMPT_ID}.pkg.junit-*.xml.gz',
+        ))
+        assert len(archived) == 1, (
+            f'expected the junit report archived for rc={rc}; got {archived}'
+        )
+        assert '<testsuite' in gzip.decompress(archived[0].read_bytes()).decode(), (
+            'the archived copy must read back as the report itself, not a husk'
+        )
+
+    async def test_previous_passs_report_is_not_rearchived_as_this_run(
+        self, tmp_path: Path,
+    ):
+        """A merge worktree is reused across passes, and pytest only truncates
+        when it actually runs — so a leg that writes nothing must archive
+        nothing, not its predecessor's report under a fresh timestamp."""
+        stale = tmp_path / '.df-verify-junit' / 'report.pkg.xml'
+        stale.parent.mkdir(parents=True)
+        stale.write_text('<testsuites><testsuite name="STALE"/></testsuites>')
+
+        config = OrchestratorConfig(
+            project_root=tmp_path, merge_verify_breadth='full',
+        )
+        module_config = ModuleConfig(
+            prefix='pkg', test_command='pytest tests/',
+            lint_command=None, type_check_command=None,
+        )
+        archive_root = tmp_path / 'data' / 'verify-logs'
+
+        async def killed_before_writing(cmd, cwd, timeout, env=None, log_path=None, **kw):
+            return -9, '', False
+
+        with patch('orchestrator.verify._run_cmd', side_effect=killed_before_writing):
+            result = await run_verification(
+                tmp_path, config, module_config, max_retries=0, role='merge',
+                attempt_id=self._ATTEMPT_ID, task_id=self._TASK_ID,
+                archive_root=archive_root,
+            )
+
+        assert not list(archive_root.rglob('*.junit-*')), (
+            'a stale report from an earlier pass was archived as this run'
+        )
+        assert result.failing_test_ids is None, (
+            'the stale report must not be read back as this run\'s failing ids '
+            'either — "no report" is the degrade both readers already model'
+        )
+
+    async def test_first_pass_report_is_not_kept_by_a_killed_env_recovery_rerun(
+        self, tmp_path: Path,
+    ):
+        """pytest runs 1..N times inside ONE run_verification.
+
+        The env-recovery re-run fires regardless of ``max_retries``, so it is
+        live on the merge lane where every caller passes 0.  Seeding the
+        report outside the call cannot catch this: the first pass writes it
+        legitimately, and only the SECOND invocation must not inherit it.
+        """
+        env_transient = (
+            'pytest: error: unrecognized arguments: -n --dist --max-worker-restart=0'
+        )
+        first_pass_report = (
+            '<?xml version="1.0"?><testsuites><testsuite name="pytest" errors="0"'
+            ' failures="1" tests="1"><testcase classname="tests.test_old"'
+            ' name="test_from_first_pass"><failure message="x"/></testcase>'
+            '</testsuite></testsuites>'
+        )
+        config = OrchestratorConfig(
+            project_root=tmp_path, merge_verify_breadth='full',
+        )
+        module_config = ModuleConfig(
+            prefix='pkg', test_command='pytest tests/ -n auto',
+            lint_command=None, type_check_command=None,
+        )
+        archive_root = tmp_path / 'data' / 'verify-logs'
+        test_leg_runs = 0
+
+        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
+            nonlocal test_leg_runs
+            if 'pytest' not in cmd:
+                return 0, '', False
+            test_leg_runs += 1
+            if test_leg_runs > 1:
+                return -9, '', False  # recovery run: killed, writes nothing
+            if '--junitxml' in cmd:
+                parts = cmd.split()
+                report = Path(parts[parts.index('--junitxml') + 1])
+                report.parent.mkdir(parents=True, exist_ok=True)
+                report.write_text(first_pass_report)
+            return 4, env_transient, False
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            result = await run_verification(
+                tmp_path, config, module_config, max_retries=0, role='merge',
+                attempt_id=self._ATTEMPT_ID, task_id=self._TASK_ID,
+                archive_root=archive_root,
+            )
+
+        assert test_leg_runs == 2, (
+            f'expected the env-recovery re-run to fire; pytest ran {test_leg_runs}x'
+        )
+        assert result.failing_test_ids is None, (
+            'the recovery run never started pytest, so it owns no failing ids; '
+            f'got {result.failing_test_ids!r} from the first pass'
+        )
+        assert not list(archive_root.rglob('*.junit-*')), (
+            'the first pass\'s report was archived as the recovery run\'s cost'
+        )
+
+    async def test_a_leg_with_no_test_command_clears_nothing(self, tmp_path: Path):
+        """The unscoped type-check gate can never WRITE a report, so it must
+        not delete the scoped phase's one."""
+        report = tmp_path / '.df-verify-junit' / 'report.pkg.xml'
+        report.parent.mkdir(parents=True)
+        report.write_text('<testsuites><testsuite name="SCOPED PHASE"/></testsuites>')
+
+        config = OrchestratorConfig(
+            project_root=tmp_path, merge_verify_breadth='full',
+        )
+        type_only = ModuleConfig(
+            prefix='pkg', test_command=None,
+            lint_command=None, type_check_command='pyright',
+        )
+
+        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
+            return 0, '', False
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            await run_verification(
+                tmp_path, config, type_only, max_retries=0, role='merge',
+            )
+
+        assert report.is_file(), (
+            'a gate that never writes a junit report deleted one it did not own'
+        )
+
+    async def test_report_at_a_symlink_is_unlinked_as_a_link(self, tmp_path: Path):
+        """Clearing must remove the link, never follow it to its target."""
+        target = tmp_path / 'somebody_elses.xml'
+        target.write_text('<testsuites/>')
+        link = tmp_path / '.df-verify-junit' / 'report.pkg.xml'
+        link.parent.mkdir(parents=True)
+        link.symlink_to(target)
+
+        config = OrchestratorConfig(
+            project_root=tmp_path, merge_verify_breadth='full',
+        )
+        module_config = ModuleConfig(
+            prefix='pkg', test_command='pytest tests/',
+            lint_command=None, type_check_command=None,
+        )
+
+        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
+            return 0, '', False
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            await run_verification(
+                tmp_path, config, module_config, max_retries=0, role='merge',
+            )
+
+        assert target.is_file(), 'the symlink target was deleted instead of the link'
+        assert not link.is_symlink(), 'the stale link was not cleared'
+
+    async def test_no_junit_archived_when_none_was_written(self, tmp_path: Path):
+        """A non-pytest command injects no flag — absence, not degradation."""
+        config = OrchestratorConfig(
+            project_root=tmp_path, merge_verify_breadth='full',
+        )
+        module_config = ModuleConfig(
+            prefix='pkg', test_command='cargo test --workspace',
+            lint_command=None, type_check_command=None,
+        )
+        archive_root = tmp_path / 'data' / 'verify-logs'
+
+        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
+            return 0, 'ok', False
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            await run_verification(
+                tmp_path, config, module_config, max_retries=0, role='merge',
+                attempt_id=self._ATTEMPT_ID, task_id=self._TASK_ID,
+                archive_root=archive_root,
+            )
+
+        assert not list(archive_root.rglob('*.junit-*')), (
+            'no junit report was written, so none may be archived'
+        )
 
 
 @pytest.mark.asyncio
@@ -3863,9 +6511,7 @@ class TestRunVerificationMergeArchival:
 
     These tests use a fake worktree with NO .task/ dir (mimicking a merge
     worktree) and verify that passing role='merge' + archive_root causes
-    _archive_merge_verify_logs to be called directly.
-
-    Tests are RED until step-4 adds the role=='merge' branch to run_verification.
+    archive_verify_logs to be called directly.
     """
 
     def _make_config(self, tmp_path: Path) -> OrchestratorConfig:
@@ -3987,6 +6633,188 @@ class TestRunVerificationMergeArchival:
         )
 
 
+@pytest.mark.asyncio
+class TestTaskPathSummaryArchival:
+    """Every task-path attempt leaves its summary JSON in the durable archive.
+
+    The task-path counterpart of ``TestRunVerificationMergeArchival``.  The
+    worktree copy under ``.task/verify/`` dies with the worktree, so the
+    record of why an attempt passed or failed must also land under
+    ``<archive_root>/<task_id>/``.  Asserted on the files written, not on
+    the writer.
+    """
+
+    _TASK_ID = '5199'
+
+    def _worktree(self, tmp_path: Path) -> Path:
+        (tmp_path / '.task').mkdir()
+        return tmp_path
+
+    def _make_config(self, worktree: Path) -> OrchestratorConfig:
+        return OrchestratorConfig(
+            project_root=worktree,
+            test_command='cargo test --workspace',
+            lint_command='echo ok',
+            type_check_command='echo ok',
+        )
+
+    async def _verify(self, worktree: Path, archive_root: 'Path | None', attempt_id: int, fake_run_cmd):
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            return await run_verification(
+                worktree, self._make_config(worktree),
+                max_retries=0,
+                attempt_id=attempt_id,
+                task_id=self._TASK_ID,
+                archive_root=archive_root,
+            )
+
+    @staticmethod
+    async def _all_green(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
+        return 0, 'ok', False
+
+    def _archived_summaries(self, archive_root: Path, stem: str) -> list[Path]:
+        return sorted((archive_root / self._TASK_ID).glob(f'{stem}.summary-*.json'))
+
+    @staticmethod
+    def _load(path: Path) -> dict:
+        import json
+        return json.loads(path.read_text())
+
+    async def test_green_attempt_summary_survives_worktree_teardown(self, tmp_path: Path):
+        import shutil
+        worktree = self._worktree(tmp_path)
+        archive_root = tmp_path / 'data' / 'verify-logs'
+
+        result = await self._verify(worktree, archive_root, 3, self._all_green)
+
+        assert result.passed
+        archived = self._archived_summaries(archive_root, 'attempt-3')
+        assert len(archived) == 1, f'expected exactly one archived summary; got {archived}'
+        worktree_copy = worktree / '.task' / 'verify' / 'attempt-3.summary.json'
+        assert self._load(archived[0]) == self._load(worktree_copy), (
+            'the archived summary must be the same record as the worktree copy'
+        )
+        assert self._load(archived[0])['category'] == 'passed'
+
+        shutil.rmtree(worktree / '.task')
+        assert archived[0].is_file(), 'the archived summary must outlive the worktree'
+        assert self._load(archived[0])['category'] == 'passed'
+
+    async def test_summary_archived_even_when_the_logs_are_not(self, tmp_path: Path):
+        worktree = self._worktree(tmp_path)
+        archive_root = tmp_path / 'data' / 'verify-logs'
+
+        async def failing_tests(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
+            if 'cargo test' in cmd:
+                return 1, 'running 3 tests\ntest my::mod::it FAILED\n', False
+            return 0, 'ok', False
+
+        result = await self._verify(worktree, archive_root, 1, failing_tests)
+
+        assert result.category == 'test_failure', (
+            f'precondition: fixture must classify into the log deny-list; got {result.category!r}'
+        )
+        archived = self._archived_summaries(archive_root, 'attempt-1')
+        assert len(archived) == 1, f'expected exactly one archived summary; got {archived}'
+        assert self._load(archived[0])['category'] == 'test_failure'
+        assert list((archive_root / self._TASK_ID).glob('*.log')) == [], (
+            'the per-log category deny-list must be unchanged'
+        )
+        assert result.archive_log_paths == [], (
+            'the summary must not travel through the log-archival path'
+        )
+
+    async def test_attempts_and_module_prefixes_never_overwrite(self, tmp_path: Path):
+        worktree = self._worktree(tmp_path)
+        archive_root = tmp_path / 'data' / 'verify-logs'
+        prefixes = ('cratea', 'crateb')
+        module_configs = [
+            ModuleConfig(
+                prefix=prefix,
+                test_command=f'cargo test -p {prefix}',
+                lint_command=None,
+                type_check_command=None,
+            )
+            for prefix in prefixes
+        ]
+
+        async def module_specific_failures(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
+            for prefix in prefixes:
+                if prefix in cmd:
+                    return 1, f'{prefix} ERR\nfoo\n', False
+            return 0, 'ok', False
+
+        with patch('orchestrator.verify._run_cmd', side_effect=module_specific_failures):
+            for attempt_id in (1, 2):
+                await run_scoped_verification(
+                    worktree, self._make_config(worktree), module_configs,
+                    attempt_id=attempt_id,
+                    task_id=self._TASK_ID,
+                    archive_root=archive_root,
+                )
+
+        for attempt_id in (1, 2):
+            for prefix in prefixes:
+                archived = self._archived_summaries(archive_root, f'attempt-{attempt_id}.{prefix}')
+                assert len(archived) == 1, (
+                    f'expected one archived summary for attempt {attempt_id} / {prefix}; got {archived}'
+                )
+                cmds = [c['cmd'] for c in self._load(archived[0])['commands']]
+                assert cmds, f'archived summary for {prefix} records no commands'
+                assert all(prefix in cmd for cmd in cmds), (
+                    f'archived summary for {prefix} names another module: {cmds}'
+                )
+
+    async def test_rerun_of_the_same_attempt_keeps_both_records(self, tmp_path: Path):
+        """``workflow.py::_run_scoped_verification_with_infra_retry`` reuses the attempt id."""
+        worktree = self._worktree(tmp_path)
+        archive_root = tmp_path / 'data' / 'verify-logs'
+
+        for _ in range(2):
+            await self._verify(worktree, archive_root, 1, self._all_green)
+
+        archived = self._archived_summaries(archive_root, 'attempt-1')
+        assert len(set(archived)) == 2, (
+            f'a re-run of the same attempt must not overwrite the earlier record; got {archived}'
+        )
+
+    async def test_no_archive_tree_without_an_archiving_caller(self, tmp_path: Path):
+        """``archive_root=None`` is how cold-shadow and drift probes opt out."""
+        worktree = self._worktree(tmp_path)
+        before = set(tmp_path.rglob('*'))
+
+        await self._verify(worktree, None, 1, self._all_green)
+
+        assert (worktree / '.task' / 'verify' / 'attempt-1.summary.json').is_file()
+        created = sorted(p.relative_to(tmp_path) for p in set(tmp_path.rglob('*')) - before)
+        assert all(p.parts[0] == '.task' for p in created), (
+            f'a non-archiving caller may write only inside its worktree .task/; created {created}'
+        )
+
+    async def test_summary_and_logs_of_one_attempt_share_one_stamp(self, tmp_path: Path):
+        """A reader joins a task-path attempt's archived logs to its summary by stamp."""
+        worktree = self._worktree(tmp_path)
+        archive_root = tmp_path / 'data' / 'verify-logs'
+
+        async def cargo_cli_error(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
+            if 'cargo test' in cmd:
+                return 1, 'error: --exclude can only be used together with --workspace\n', False
+            return 0, 'ok', False
+
+        result = await self._verify(worktree, archive_root, 2, cargo_cli_error)
+
+        assert result.archive_log_paths, (
+            f'precondition: fixture must classify into an archived category; got {result.category!r}'
+        )
+        summaries = self._archived_summaries(archive_root, 'attempt-2')
+        assert len(summaries) == 1, f'expected exactly one archived summary; got {summaries}'
+        stamp = summaries[0].name.split('summary-', 1)[1].removesuffix('.json')
+        for log in result.archive_log_paths:
+            assert Path(log).name.endswith(f'-{stamp}.log'), (
+                f'log {Path(log).name!r} does not carry the summary stamp {stamp!r}'
+            )
+
+
 class TestPersistAttemptLogsModulePrefix:
     """Tests for the ``module_prefix`` parameter added to ``_persist_attempt_logs``.
 
@@ -4003,12 +6831,13 @@ class TestPersistAttemptLogsModulePrefix:
         cause_hint='error: bad',
         module_prefix=None,
     ):
-        from orchestrator.verify import _persist_attempt_logs  # noqa: PLC0415
+        from orchestrator.verify import _persist_attempt_logs
 
         kwargs = {}
         if module_prefix is not None:
             kwargs['module_prefix'] = module_prefix
-        return _persist_attempt_logs(worktree, attempt_id, runs, category, cause_hint, **kwargs)
+        summary = _build_summary_payload(runs, category, cause_hint, role='task')
+        return _persist_attempt_logs(worktree, attempt_id, runs, summary, **kwargs)
 
     def _make_runs(self):
         return [
@@ -4200,7 +7029,7 @@ class TestShouldArchiveCategory:
     """
 
     def _should_archive(self, category: str) -> bool:
-        from orchestrator.verify import _should_archive_category  # noqa: PLC0415
+        from orchestrator.verify import _should_archive_category
         return _should_archive_category(category)
 
     # Categories that MUST be archived (human triage required)
@@ -4224,6 +7053,30 @@ class TestShouldArchiveCategory:
         """'tree_sitter_generate_error' ends with '_error' → True."""
         assert self._should_archive('tree_sitter_generate_error') is True
 
+    def test_pytest_internalerror_archived_for_human_triage(self):
+        """'pytest_internalerror' → True since task 3683.
+
+        This test previously asserted False (and sat in the "must NOT be
+        archived" block below) on the rationale that "an xdist worker-kill
+        INTERNALERROR is infra noise, not human-triage content; the sweep
+        already retries on this category (returns None sentinel)". Task 3683's
+        audit overturned it: that sweep retry is the FIRST-PASS arm only
+        (verify.py:7062/:7141), which returns a None sentinel and never
+        escalates. The category is ALSO retried by three bounded windows that
+        each terminate in a blocking level-1 infra_issue escalation on
+        exhaustion — the primary one being workflow.py:9020's default-5-attempt
+        loop, which stamps escalate_to_human=True / category='infra_issue' at
+        :9060-9067.
+
+        Archival is decided per attempt from the category alone
+        (verify.py:1902), with no knowledge of whether this is the exhausting
+        attempt, so archive=False discarded the log on the attempt that hands
+        the incident to a human too — leaving that human only a truncated
+        failure_report(). See TestPytestInternalerrorArchivesForHumanTriage in
+        test_verify_categories.py for the full grounding.
+        """
+        assert self._should_archive('pytest_internalerror') is True
+
     # Categories that must NOT be archived (debugger can handle without human)
     def test_test_failure_not_archived(self):
         """'test_failure' does not end with '_error' → False."""
@@ -4244,15 +7097,6 @@ class TestShouldArchiveCategory:
     def test_empty_string_not_archived(self):
         """'' (empty) → False."""
         assert self._should_archive('') is False
-
-    def test_pytest_internalerror_not_archived(self):
-        """'pytest_internalerror' ends with '_error' but is in deny-list → False.
-
-        An xdist worker-kill INTERNALERROR is infra noise, not human-triage content.
-        The sweep already retries on this category (returns None sentinel); archiving
-        it would create spurious human-triage artifacts for transient crashes.
-        """
-        assert self._should_archive('pytest_internalerror') is False
 
 
 class TestBuildFallbackConfigConftest:
@@ -5515,6 +8359,82 @@ class TestRunScopedVerificationForwardsWorktreeToFallback:
         )
 
 
+class TestRunScopedVerificationOptsFallbackIntoSegmentedTest:
+    """The fallback branch asks `run_verification` to SEGMENT its test chain (task 3338).
+
+    Segmentation is opt-in and default-OFF: making `run_verification` segment
+    any chain it is handed would silently change the global tail, the
+    cargo-scoped path, `merge_queue._run_unscoped_typechecks` and every
+    module_configs run — a wide, unrequested change in a function dozens of
+    tests stub. The reported defect (esc-3062-2) is the FALLBACK path, so only
+    this call site opts in.
+
+    The flag goes on the `run_verification` call, NOT on
+    `_build_fallback_config`'s: the NOTE at that call site records (and
+    `TestRunScopedVerificationForwardsWorktreeToFallback` enforces) that its
+    test double is a fixed `(task_files, config=None, worktree=None)` fake with
+    no `**kwargs` catch-all, so any new keyword there breaks task 2344's test.
+
+    `role='merge'` is deliberately EXCLUDED (amendment). The trade inverts on
+    the merge lane: the per-segment diagnostic exists so a task agent can read
+    its own result rather than prove an unrelated red unrelated, but a merge
+    failure goes to a human who has the whole chain anyway — while the cost
+    (running seven more suites, up to the full budget, with the queue blocked)
+    lands on the path this module already treats as latency-critical.
+    """
+
+    @staticmethod
+    async def _await_kwargs(tmp_path: Path, role) -> dict:
+        (tmp_path / 'shared').mkdir(exist_ok=True)
+        (tmp_path / 'shared' / 'thing.py').write_text('x = 1\n')
+
+        fallback = ModuleConfig(
+            prefix='__fallback__',
+            test_command='cd shared && uv run pytest tests/ && uv run pytest tests/scripts/',
+            lint_command=None,
+            type_check_command=None,
+        )
+        passing = VerifyResult(
+            passed=True, test_output='', lint_output='', type_output='', summary='ok',
+        )
+        run_verification_double = AsyncMock(return_value=passing)
+        with patch('orchestrator.verify._build_fallback_config', return_value=fallback), \
+             patch('orchestrator.verify.run_verification', new=run_verification_double):
+            await run_scoped_verification(
+                tmp_path,
+                OrchestratorConfig(project_root=tmp_path),
+                [],
+                task_files=['shared/thing.py'],
+                role=role,
+            )
+
+        assert run_verification_double.await_count == 1
+        await_args = run_verification_double.await_args
+        assert await_args is not None, 'run_verification was not awaited'
+        # `.kwargs` is a Mapping; copy so the annotation is an honest dict.
+        return dict(await_args.kwargs)
+
+    @pytest.mark.asyncio
+    async def test_fallback_branch_passes_segment_chained_test_true(self, tmp_path: Path) -> None:
+        assert (await self._await_kwargs(tmp_path, 'task')).get('segment_chained_test') is True
+
+    @pytest.mark.asyncio
+    async def test_merge_role_fallback_keeps_the_fail_fast_chain(self, tmp_path: Path) -> None:
+        """A red merge verify must still stop at the first subproject.
+
+        Not a style preference: without the gate, a merge verify whose first
+        subproject goes red runs the remaining seven suites before reporting,
+        holding the merge queue for up to the full resolved budget (3600s warm /
+        5400s cold) on every red attempt — and budget exhaustion is strictly
+        MORE likely once every segment always runs.
+        """
+        kwargs = await self._await_kwargs(tmp_path, 'merge')
+        assert kwargs.get('segment_chained_test') is False
+        # The gate must key on `role`, not on some other merge-ish signal that
+        # a caller could set independently.
+        assert kwargs.get('role') == 'merge'
+
+
 class TestBuildFallbackConfigDataModule:
     """``_build_fallback_config`` must not pass non-test data modules to pytest.
 
@@ -5622,7 +8542,7 @@ class TestPruneArchiveDedupedAtAggregateSite:
 
     @pytest.fixture(autouse=True)
     def _reset_prune_throttle(self, monkeypatch):
-        from orchestrator import verify  # noqa: PLC0415
+        from orchestrator import verify
         monkeypatch.setattr(verify, '_LAST_PRUNE_AT', None)
 
     def _make_config(self, tmp_path: Path) -> OrchestratorConfig:
@@ -5655,8 +8575,8 @@ class TestPruneArchiveDedupedAtAggregateSite:
         ``_prune_archive`` belongs at the aggregate site in
         ``run_scoped_verification``, not inside the per-file copy loop.
         """
-        from orchestrator import verify  # noqa: PLC0415
-        from orchestrator.verify import _archive_attempt_log  # noqa: PLC0415
+        from orchestrator import verify
+        from orchestrator.verify import _archive_attempt_log
 
         log_file = tmp_path / 'attempt-1.test.log'
         log_file.write_text('cratea ERR\n')
@@ -5669,6 +8589,7 @@ class TestPruneArchiveDedupedAtAggregateSite:
                 task_id='42',
                 attempt_id=1,
                 category='cargo_cli_error',
+                stamp=verify._archive_stamp(),
             )
             assert spy.call_count == 0, (
                 f'_archive_attempt_log must not call _prune_archive; '
@@ -5694,7 +8615,7 @@ class TestPruneArchiveDedupedAtAggregateSite:
                 return 1, 'error: --exclude crateb\ncrateb ERR\n', False
             return 0, 'ok', False
 
-        from orchestrator import verify  # noqa: PLC0415
+        from orchestrator import verify
 
         with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd), \
                 patch.object(verify, '_prune_archive') as spy:
@@ -5723,7 +8644,7 @@ class TestPruneArchiveDedupedAtAggregateSite:
         async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
             return 1, 'error: --exclude\n', False
 
-        from orchestrator import verify  # noqa: PLC0415
+        from orchestrator import verify
 
         with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd), \
                 patch.object(verify, '_prune_archive') as spy:
@@ -5752,7 +8673,7 @@ class TestPruneArchiveDedupedAtAggregateSite:
         async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
             return 1, 'error: --exclude\nfoo\n', False
 
-        from orchestrator import verify  # noqa: PLC0415
+        from orchestrator import verify
 
         with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd), \
                 patch.object(verify, '_prune_archive') as spy:
@@ -6462,6 +9383,68 @@ class TestRunFullVerificationRole:
         )
 
 
+class TestRunFullVerificationMaxRetries:
+    """run_full_verification threads `max_retries` to every run_verification call.
+
+    Task 5812: the main-tip sweep passes max_retries=0 so a timeout reaches its
+    verdict without re-running; omitting it keeps config.verify_timeout_retries
+    in force for every other caller (e.g. review-checkpoint).
+    """
+
+    _PASSING = VerifyResult(
+        passed=True, test_output='', lint_output='', type_output='', summary='ok',
+    )
+
+    @pytest.mark.asyncio
+    async def test_threads_max_retries_to_each_subproject(self, tmp_path: Path):
+        config = OrchestratorConfig(project_root=tmp_path)
+        config._module_configs = {
+            'dashboard': ModuleConfig(prefix='dashboard', test_command='echo dash'),
+            'api': ModuleConfig(prefix='api', test_command='echo api'),
+        }
+
+        mock_run_verification = AsyncMock(return_value=self._PASSING)
+        with patch('orchestrator.verify.run_verification', new=mock_run_verification):
+            await run_full_verification(
+                tmp_path, config, role='background', max_retries=0,
+            )
+
+        assert mock_run_verification.call_count == 2
+        for one_call in mock_run_verification.call_args_list:
+            assert one_call.kwargs['max_retries'] == 0, one_call.kwargs
+
+    @pytest.mark.asyncio
+    async def test_threads_max_retries_to_the_global_fallback(self, tmp_path: Path):
+        config = OrchestratorConfig(project_root=tmp_path)
+        config._module_configs = {}  # discovered-empty → global fallback branch
+
+        mock_run_verification = AsyncMock(return_value=self._PASSING)
+        with patch('orchestrator.verify.run_verification', new=mock_run_verification):
+            await run_full_verification(tmp_path, config, max_retries=0)
+
+        assert mock_run_verification.call_count == 1
+        assert mock_run_verification.call_args_list[0].kwargs['max_retries'] == 0
+
+    @pytest.mark.asyncio
+    async def test_omitted_max_retries_leaves_config_default_in_force(
+        self, tmp_path: Path,
+    ):
+        """None reaches run_verification, which then uses config.verify_timeout_retries."""
+        config = OrchestratorConfig(project_root=tmp_path)
+        config._module_configs = {
+            'dashboard': ModuleConfig(prefix='dashboard', test_command='echo dash'),
+            'api': ModuleConfig(prefix='api', test_command='echo api'),
+        }
+
+        mock_run_verification = AsyncMock(return_value=self._PASSING)
+        with patch('orchestrator.verify.run_verification', new=mock_run_verification):
+            await run_full_verification(tmp_path, config)
+
+        assert mock_run_verification.call_count == 2
+        for one_call in mock_run_verification.call_args_list:
+            assert one_call.kwargs.get('max_retries') is None, one_call.kwargs
+
+
 class TestRunScopedVerificationForceWorkspace:
     """run_scoped_verification: force_workspace=True bypasses all scoping.
 
@@ -6773,7 +9756,7 @@ class TestRoleThreading:
 
 
 # ---------------------------------------------------------------------------
-# Step-1 (task 1768): _build_summary_payload + _archive_merge_verify_logs
+# Step-1 (task 1768): _build_summary_payload + archive_verify_logs
 # ---------------------------------------------------------------------------
 
 
@@ -6813,8 +9796,8 @@ class TestBuildSummaryPayload:
     """Tests for the extracted _build_summary_payload(runs, category, cause_hint) helper."""
 
     def _build(self, runs, category='test_failure', cause_hint=''):
-        from orchestrator.verify import _build_summary_payload  # noqa: PLC0415
-        return _build_summary_payload(runs, category, cause_hint)
+        from orchestrator.verify import _build_summary_payload
+        return _build_summary_payload(runs, category, cause_hint, role='task')
 
     def test_top_level_keys_present(self):
         """Returned dict has category, cause_hint, rc, timed_out, cmd, started_at,
@@ -6872,12 +9855,8 @@ class TestBuildSummaryPayload:
         assert payload['commands'] == []
 
 
-class TestArchiveMergeVerifyLogs:
-    """Tests for the new _archive_merge_verify_logs helper (task 1768).
-
-    These tests import the symbol directly and will fail with ImportError /
-    AttributeError until step-2 implements the function — that is the RED state.
-    """
+class TestArchiveVerifyLogs:
+    """Tests for archive_verify_logs (introduced by task 1768)."""
 
     def _archive(
         self,
@@ -6890,10 +9869,10 @@ class TestArchiveMergeVerifyLogs:
         *,
         module_prefix=None,
     ):
-        from orchestrator.verify import _archive_merge_verify_logs  # noqa: PLC0415
-        return _archive_merge_verify_logs(
+        from orchestrator.verify import archive_verify_logs
+        return archive_verify_logs(
             runs, archive_root, task_id, attempt_id, category, cause_hint,
-            module_prefix=module_prefix,
+            module_prefix=module_prefix, role='merge',
         )
 
     # (a) writes per-command .log files into <archive_root>/<task_id>/
@@ -6925,7 +9904,7 @@ class TestArchiveMergeVerifyLogs:
         json_files = list(task_dir.glob('*.json'))
         assert len(json_files) == 1, f'Expected 1 summary.json, got {json_files}'
 
-        import json  # noqa: PLC0415
+        import json
         payload = json.loads(json_files[0].read_text())
         assert payload['category'] == 'test_failure'
         assert payload['cause_hint'] == 'assert x == y'
@@ -6975,7 +9954,7 @@ class TestArchiveMergeVerifyLogs:
     # (f) swallows OSError best-effort (no crash when dir unwritable)
     def test_swallows_oserror_best_effort(self, tmp_path: Path):
         """When the archive dir is unwritable, no exception is raised."""
-        import stat  # noqa: PLC0415
+        import stat
         runs = _make_runs(test_rc=1)
         archive_root = tmp_path / 'data' / 'verify-logs'
         archive_root.mkdir(parents=True)
@@ -7012,6 +9991,23 @@ class TestArchiveMergeVerifyLogs:
         for p in paths:
             assert 'attempt-5' in Path(p).name, (
                 f'Expected attempt-5 in filename, got: {Path(p).name!r}'
+            )
+
+    def test_summary_and_logs_of_one_run_share_one_stamp(self, tmp_path: Path):
+        """A reader joins a merge run's logs to its summary by the shared stamp."""
+        runs = _make_runs(test_rc=1, include_lint=True)
+        archive_root = tmp_path / 'data' / 'verify-logs'
+        self._archive(runs, archive_root, '1768', 1, 'test_failure', module_prefix='pkg')
+
+        task_dir = archive_root / '1768'
+        summaries = list(task_dir.glob('attempt-1.pkg.summary-*.json'))
+        assert len(summaries) == 1, f'Expected exactly one summary, got {summaries}'
+        stamp = summaries[0].name.split('summary-', 1)[1].removesuffix('.json')
+        logs = list(task_dir.glob('*.log'))
+        assert logs, f'Expected archived logs in {task_dir}'
+        for log in logs:
+            assert log.name.endswith(f'-{stamp}.log'), (
+                f'log {log.name!r} does not carry the summary stamp {stamp!r}'
             )
 
 
@@ -7156,6 +10152,7 @@ class TestMergeConfigOnlyDiffForcesFullGate:
             git=GitConfig(merge_config_only_full_gate_globs=globs),
         )
 
+    @pytest.mark.usefixtures('code_default_config')
     def test_empty_globs_default_config_returns_false(self):
         """Default OrchestratorConfig (empty globs) → False regardless of files."""
         from orchestrator.verify import _merge_config_only_diff_forces_full_gate
@@ -7718,7 +10715,10 @@ class TestRunVerificationGovernRouting:
     equivalent to be covered by.
     """
 
-    def _make_govern_config(self, tmp_path, enabled=True, create_exec=True):
+    def _make_govern_config(
+        self, tmp_path, enabled=True, create_exec=True, *,
+        breadth: Literal['scoped', 'full'] = 'full',
+    ):
         """Build an OrchestratorConfig with cpu_governance wired to a tmp executable."""
         from orchestrator.config import CpuGovernConfig
         scripts = tmp_path / 'scripts'
@@ -7727,7 +10727,7 @@ class TestRunVerificationGovernRouting:
         if create_exec:
             exec_file.write_text('#!/bin/sh\nexec "$@"\n')
             exec_file.chmod(0o755)
-        config = OrchestratorConfig()
+        config = OrchestratorConfig(merge_verify_breadth=breadth)
         config.cpu_governance = CpuGovernConfig(
             enabled=enabled,
             exec_path='scripts/cpu-governed-exec.sh',
@@ -7904,7 +10904,9 @@ class TestRunVerificationGovernRouting:
         import shlex
 
         from orchestrator.config import ModuleConfig
-        config, exec_file = self._make_govern_config(tmp_path)
+        # Under 'full', role='merge' injects --junitxml into the test leg,
+        # which would change the exact inner command this test pins.
+        config, exec_file = self._make_govern_config(tmp_path, breadth='scoped')
         module_config = ModuleConfig(
             prefix='pkg',
             test_command='pytest tests/x.py -v',
@@ -7925,7 +10927,8 @@ class TestRunVerificationGovernRouting:
             )
 
         assert len(captured_cmds) == 1
-        expected_inner = 'pytest -v tests/x.py'  # canonical: flags before targets
+        # canonical: flags before targets, the default defect mode's plugin pair among them
+        expected_inner = 'pytest -v -p _df_defect_plugin tests/x.py'
         expected = f'{shlex.quote(abs_exec)} --role merge -- /bin/bash -c {shlex.quote(expected_inner)}'
         assert captured_cmds[0] == expected, (
             f'Expected govern wrap around the canonically-rendered inner command '
@@ -7944,13 +10947,9 @@ class TestRunVerificationGovernRouting:
         scope contains the cpu-governed-exec.sh invocation, which on its
         governed path itself tries to create an inner systemd-run --user --scope.
 
-        In the real environment reify currently sets verify_use_cgroup_scope=False,
-        so this combination does not occur on the live path.  cpu-governed-exec.sh
-        has a runtime probe + fail-open that handles systemd-run absence or
-        failures; the outer scope's cgroup kill still reaps the whole subtree.
-        This test confirms the code paths compose without crashing and that
-        governance wrapping still fires (the nested scope interaction is a
-        runtime-environment concern, not a code-correctness bug).
+        What the nested scope does and does not govern is stated at
+        verify.py::_govern_cpu_str.  This test confirms the two wrappings
+        compose and that governance wrapping still fires.
         """
         import shlex
 
@@ -8310,7 +11309,7 @@ class TestFailureAnchoredExcerpt:
 
     # (a) a buried failure marker deep inside a long PASS-wall must survive.
     def test_buried_failure_is_included_with_context(self):
-        from orchestrator.verify import _failure_anchored_excerpt  # noqa: PLC0415
+        from orchestrator.verify import _failure_anchored_excerpt
 
         pass_lines = [f'tests/test_mod.py::test_pass_{i} PASSED' for i in range(200)]
         buried = 'FAILED tests/pkg/test_mod.py::test_buried - AssertionError'
@@ -8324,7 +11323,7 @@ class TestFailureAnchoredExcerpt:
 
     # (b) no marker anywhere -> tail fallback, byte-identical to today's slice.
     def test_no_marker_falls_back_to_tail_slice(self):
-        from orchestrator.verify import _failure_anchored_excerpt  # noqa: PLC0415
+        from orchestrator.verify import _failure_anchored_excerpt
 
         output = '\n'.join(f'plain line {i}' for i in range(500))
 
@@ -8334,7 +11333,7 @@ class TestFailureAnchoredExcerpt:
 
     # (c) multiple markers: overlapping windows merge into one contiguous block.
     def test_overlapping_marker_windows_merge_without_elision_gap(self):
-        from orchestrator.verify import _failure_anchored_excerpt  # noqa: PLC0415
+        from orchestrator.verify import _failure_anchored_excerpt
 
         lines = [f'noise line {i}' for i in range(200)]
         lines[50] = 'FAILED tests/test_mod.py::test_alpha - AssertionError'
@@ -8351,7 +11350,7 @@ class TestFailureAnchoredExcerpt:
 
     # (c) multiple far-apart markers: total excerpt is capped.
     def test_many_far_apart_markers_capped_to_budget(self):
-        from orchestrator.verify import _failure_anchored_excerpt  # noqa: PLC0415
+        from orchestrator.verify import _failure_anchored_excerpt
 
         lines = []
         for i in range(40):
@@ -8373,7 +11372,7 @@ class TestFailureAnchoredExcerpt:
         ],
     )
     def test_marker_type_is_anchored(self, marker_line, needle):
-        from orchestrator.verify import _failure_anchored_excerpt  # noqa: PLC0415
+        from orchestrator.verify import _failure_anchored_excerpt
 
         pad = [f'noise line {i}' for i in range(100)]
         lines = pad[:50] + [marker_line] + pad[50:]
@@ -8915,3 +11914,1007 @@ class TestTrivialPassEscalatedEventContract:
             )
         assert rec.events_of(EventType.trivial_pass_escalated) == []
         assert result.trivial is True
+
+
+class TestWithJunitxmlStr:
+    """_with_junitxml_str(cmd, junit_path) — the string wrapper around
+    parse_config_command -> with_junitxml -> render, joining verify.py's
+    established `*_str` family (_serial_pytest_str, _with_pytest_timeout_str,
+    _govern_cpu_str, _reproject_str, _cargo_scope_str).
+
+    Task 3218 part 1b. The logic previously lived inline in a closure inside
+    ``run_verification``, which made it untestable in isolation and left the
+    capability loss it can cause — a merge run that was supposed to collect
+    junit silently not collecting it — with nowhere to be reported from.
+    Extracting it gives that INFO a home at the point of ACTUAL loss, which
+    covers every cause of the no-op (raw-retained chain, OPAQUE, non-pytest),
+    not just tail preservation.
+    """
+
+    _JUNIT = '/abs/j.xml'
+
+    def test_injects_into_a_structured_pytest_command(self):
+        from orchestrator.verify import _with_junitxml_str
+
+        result = _with_junitxml_str('uv run pytest tests/', self._JUNIT)
+        assert result is not None
+        assert f'--junitxml {self._JUNIT}' in result
+
+    def test_none_input_returns_none(self):
+        from orchestrator.verify import _with_junitxml_str
+
+        assert _with_junitxml_str(None, self._JUNIT) is None
+
+    @pytest.mark.parametrize(
+        'cmd',
+        [
+            'ruff check src/',
+            'true',
+            'uv run --directory orchestrator ruff check src/',
+        ],
+        ids=['non-pytest-ruff', 'opaque-true', 'non-round-tripping-directory'],
+    )
+    def test_noop_is_byte_identical(self, cmd: str):
+        """The parse->render round-trip must be SKIPPED, not merely produce
+        an equal string: a from-scratch render is only argv-equivalent, so
+        the identity-check guard is what keeps a no-op byte-identical.
+
+        Asserted with ``is``, not ``==``. Equality cannot pin this: the first
+        two inputs happen to round-trip byte-identically, so an ``==`` version
+        of this test still passes with the ``rewritten is parsed`` guard
+        DELETED and the function always re-rendering. Identity is the only
+        assertion that distinguishes "returned the caller's own string" from
+        "rebuilt an equal one".
+
+        The third input is the case where the two come apart even under
+        ``==``: ``render`` re-emits a uv ``--directory X`` as a leading ``cd X
+        &&``, so a re-render would return ``'cd orchestrator && uv run ruff
+        check src/'`` — a different string for the same argv.
+        """
+        from orchestrator.verify import _with_junitxml_str
+
+        assert _with_junitxml_str(cmd, self._JUNIT) is cmd
+
+    def test_suppressed_injection_on_a_pytest_chain_is_logged(
+        self, caplog: pytest.LogCaptureFixture,
+    ):
+        """The capability loss must be VISIBLE, not silent.
+
+        A raw-retained pytest chain parses as ToolKind.PYTEST but
+        ``with_junitxml`` is a documented no-op on it — so this run was
+        expected to produce a junit report and will not. Exactly one INFO
+        record, naming the junit path and saying no report will be collected.
+        """
+        from orchestrator.verify import _with_junitxml_str
+
+        cmd = 'cd a && uv run pytest tests/ && cd ../b && uv run pytest tests/'
+        with caplog.at_level(logging.INFO, logger='orchestrator.verify'):
+            result = _with_junitxml_str(cmd, self._JUNIT)
+
+        assert result is cmd, "the no-op must still return the caller's own string"
+        records = [r for r in caplog.records if r.name == 'orchestrator.verify']
+        assert len(records) == 1, f'expected exactly one record, got {[r.message for r in records]}'
+        assert records[0].levelno == logging.INFO
+        assert self._JUNIT in records[0].getMessage()
+        assert 'junit' in records[0].getMessage().lower()
+
+    @pytest.mark.parametrize(
+        'cmd',
+        ['uv run pytest tests/', 'ruff check src/', 'true'],
+        ids=['successful-injection', 'non-pytest-ruff', 'opaque-true'],
+    )
+    def test_silent_on_the_ordinary_paths(
+        self, cmd: str, caplog: pytest.LogCaptureFixture,
+    ):
+        """No record for a successful injection, and none for a command that
+        was never eligible to produce junit in the first place — otherwise
+        the log fires on every lint/type leg and trains operators to ignore it.
+        """
+        from orchestrator.verify import _with_junitxml_str
+
+        with caplog.at_level(logging.INFO, logger='orchestrator.verify'):
+            _with_junitxml_str(cmd, self._JUNIT)
+
+        assert [r.message for r in caplog.records if r.name == 'orchestrator.verify'] == []
+
+
+class TestSerialPytestStrLogsOnlyUnappliedRewrites:
+    """_serial_pytest_str places the flags where it can and RECORDS where it cannot.
+
+    A quoted chain operator (``-k 'a && b'``) once made the raw-chain
+    appender refuse (task 4121); since task 4178 those chains are recovered,
+    with no WARNING. A raw-retained PYTEST chain that still comes back
+    unchanged is logged: the ENV_TRANSIENT retry then re-runs the ORIGINAL
+    command, and an operator reading that log cannot otherwise tell
+    "recovery ran without its flags" from "recovery ran".
+
+    Modelled test-for-test on ``TestWithJunitxmlStr`` above — this file's
+    established template for a ``*_str`` wrapper's capability-loss record —
+    so the two such records in verify.py's ``*_str`` family are pinned the
+    same way rather than each inventing its own assertion style.
+    """
+
+    @pytest.mark.parametrize(
+        'raw',
+        [
+            pytest.param("pytest -k 'a && b' tests/ && true", id='quoted-and-single'),
+            pytest.param('pytest -k "a && b" tests/ && true', id='quoted-and-double'),
+            pytest.param("pytest -k 'a | b' tests/ && true", id='quoted-pipe'),
+            pytest.param("pytest --deselect 'x;y' tests/ && true", id='quoted-semicolon'),
+            pytest.param("uv run pytest -k 'a && b' tests/ && true", id='uv-run-prefix'),
+            pytest.param("( cd x && pytest -k 'a && b' tests/ )", id='inside-subshell'),
+            pytest.param("pytest -k 'a && b' t1/ && pytest t2/", id='two-invocations'),
+        ],
+    )
+    def test_a_quoted_chain_operator_is_recovered_without_a_warning(
+        self, raw: str, caplog: pytest.LogCaptureFixture,
+    ):
+        from orchestrator.verify import _serial_pytest_str
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.verify'):
+            result = _serial_pytest_str(raw, invocation_dir=None)
+
+        assert result is not raw
+        assert result is not None
+        assert 'no:xdist' in result
+        assert [r.message for r in caplog.records if r.name == 'orchestrator.verify'] == []
+
+    def test_the_message_does_not_assert_a_cause_it_has_not_measured(
+        self, caplog: pytest.LogCaptureFixture,
+    ):
+        """A no-op with NO unspliceable span must not be blamed on one.
+
+        ``echo "pytest" && true`` classifies as PYTEST with ``raw`` retained
+        (measured), so it reaches the same structural gate — but its only
+        ``pytest`` token sits inside ``echo``'s quotes, so
+        ``_unspliceable_pytest_spans`` is empty and there is no ``-k``
+        expression to inspect. The record must say what was actually
+        measured (nothing to append to) rather than name an unbalanced quote
+        in an invocation's arguments and send the operator hunting for a
+        ``-k`` that does not exist.
+        """
+        from orchestrator.verify import _serial_pytest_str
+
+        cmd = 'echo "pytest" && true'
+        with caplog.at_level(logging.WARNING, logger='orchestrator.verify'):
+            assert _serial_pytest_str(cmd, invocation_dir=None) is cmd
+
+        records = [r for r in caplog.records if r.name == 'orchestrator.verify']
+        assert len(records) == 1
+        message = records[0].getMessage()
+        assert cmd in message
+        assert 'unclosed quote' not in message
+
+    def test_the_numprocesses_sibling_refuses_the_same_way_but_stays_silent(
+        self, caplog: pytest.LogCaptureFixture,
+    ):
+        """The asymmetry ``_with_pytest_numprocesses_str``'s docstring claims.
+
+        Both wrappers find nothing to append to in ``echo "pytest" && true``
+        (one appender; the serial twin's WARNING for it is pinned above), but
+        only the serial one logs: a suppressed ``-n`` leaves the command at
+        its configured worker count, which is the pre-cap status quo and not
+        a lost capability, whereas suppressed serial-recovery flags mean a
+        recovery attempt ran without the thing that makes it a recovery. That
+        claim is pinned here rather than left to the docstring, since the
+        serial twin got a whole class for exactly this and the asymmetry was
+        otherwise unguarded.
+        """
+        from orchestrator.verify import _with_pytest_numprocesses_str
+
+        cmd = 'echo "pytest" && true'
+        with caplog.at_level(logging.WARNING, logger='orchestrator.verify'):
+            result = _with_pytest_numprocesses_str(cmd, '4')
+
+        assert result is cmd, "the no-op must return the caller's own string"
+        assert [r.message for r in caplog.records if r.name == 'orchestrator.verify'] == []
+
+    @pytest.mark.parametrize(
+        'cmd',
+        [
+            'cd a && uv run pytest t1 && cd b && uv run pytest t2',
+            'uv run pytest tests/',
+            "pytest -k 'a && pytest b' tests/",
+            'pytest tests/ && echo "pytest done"',
+            'ruff check src/',
+            'true',
+            None,
+        ],
+        ids=[
+            'successful-raw-chain-rewrite',
+            'successful-structured-rewrite',
+            'structured-despite-an-unspliceable-looking-span',
+            'quoted-pytest-word-in-another-command',
+            'non-pytest-ruff',
+            'opaque-true',
+            'none',
+        ],
+    )
+    def test_silent_on_the_ordinary_paths(
+        self, cmd: str | None, caplog: pytest.LogCaptureFixture,
+    ):
+        """No record for anything that is not an actual refusal.
+
+        The third case is why the gate must be STRUCTURAL rather than "does
+        this string contain an unspliceable span": ``pytest -k 'a && pytest
+        b' tests/`` parses with ``raw is None`` (measured), so it takes the
+        STRUCTURED path, never reaches the appender, and IS successfully
+        mutated via ``base_flags`` — a span-content gate would warn about a
+        command that lost nothing. The fourth is the over-refusal guard at
+        the log level: ``pytest tests/ && echo "pytest done"`` has the word
+        ``pytest`` inside ``echo``'s argument but no unterminated INVOCATION,
+        so its real invocation is rewritten normally and there is nothing to
+        report. The non-pytest and OPAQUE cases are expected, benign no-ops;
+        logging those would fire on every lint and type leg and train
+        operators to ignore the record.
+        """
+        from orchestrator.verify import _serial_pytest_str
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.verify'):
+            _serial_pytest_str(cmd, invocation_dir=None)
+
+        assert [r.message for r in caplog.records if r.name == 'orchestrator.verify'] == []
+
+    def test_serial_recovery_still_works_on_the_live_fleet_test_command(self):
+        """Guard that this change did not disable serial recovery generally.
+
+        Reads the committed corpus rather than a hand-copied literal, so a
+        refusal that started over-firing on the fleet's real ``test_command``
+        fails here instead of silently costing every ENV_TRANSIENT retry its
+        flags.
+        """
+        from _verify_config_corpus import ROOT_TEST_COMMAND
+
+        from orchestrator.verify import _serial_pytest_str
+
+        result = _serial_pytest_str(ROOT_TEST_COMMAND, invocation_dir=None)
+        assert result is not None
+        assert result is not ROOT_TEST_COMMAND
+        assert 'no:xdist' in result
+
+
+def _write_serial_recovery_tree(root: Path) -> Path:
+    """A real tree: a root-shaped root config and an orchestrator-shaped ``sub``."""
+    (root / 'pyproject.toml').write_text(ROOT_SHAPED_PYPROJECT, encoding='utf-8')
+    (root / 'sub' / 'tests').mkdir(parents=True)
+    (root / 'sub' / 'pyproject.toml').write_text(ORCH_SHAPED_PYPROJECT, encoding='utf-8')
+    (root / 'sub' / 'tests' / 'test_x.py').write_text('def test_t():\n    pass\n', encoding='utf-8')
+    return root
+
+
+class TestSerialPytestStrReSuppliesGoverningAddopts:
+    """``_serial_pytest_str(cmd, invocation_dir)`` re-supplies the governing addopts.
+
+    The config is resolved by pytest's own walk from the directory the command
+    runs in, so scoped and unscoped shapes of one module agree; every xdist
+    option is removed. ``invocation_dir=None`` is the historical blank.
+    """
+
+    def test_a_module_directory_command_carries_its_own_config(self, tmp_path):
+        from orchestrator.verify import _serial_pytest_str
+
+        tree = _write_serial_recovery_tree(tmp_path)
+        rendered = _serial_pytest_str('uv run --directory sub pytest tests/', invocation_dir=tree)
+        assert rendered is not None
+        assert addopts_values(shlex.split(rendered)) == ["-m 'not warm_lane_bash'"]
+        assert not any(
+            token in rendered for token in ('-n auto', '--dist', '--max-worker-restart')
+        ), rendered
+
+    def test_the_scoped_cwd_stripped_shape_carries_the_same_config(self, tmp_path):
+        from orchestrator.verify import _serial_pytest_str
+
+        tree = _write_serial_recovery_tree(tmp_path)
+        rendered = _serial_pytest_str(
+            'uv run --project sub pytest sub/tests/test_x.py::T::t', invocation_dir=tree,
+        )
+        assert rendered is not None
+        assert addopts_values(shlex.split(rendered)) == ["-m 'not warm_lane_bash'"]
+
+    def test_a_root_targeted_command_carries_the_root_config(self, tmp_path):
+        from orchestrator.verify import _serial_pytest_str
+
+        tree = _write_serial_recovery_tree(tmp_path)
+        rendered = _serial_pytest_str('uv run pytest tests/', invocation_dir=tree)
+        assert rendered is not None
+        assert addopts_values(shlex.split(rendered)) == [
+            "--import-mode=importlib -m 'not smoke and not integration and not warm_lane_bash'",
+        ]
+
+    def test_no_invocation_dir_is_the_historical_blank(self, tmp_path):
+        from orchestrator.verify import _serial_pytest_str
+
+        assert _serial_pytest_str('uv run --directory sub pytest tests/', invocation_dir=None) == (
+            'cd sub && uv run pytest -p no:xdist -o addopts= tests/'
+        )
+
+    def test_none_and_non_pytest_commands_pass_through(self, tmp_path):
+        from orchestrator.verify import _serial_pytest_str
+
+        tree = _write_serial_recovery_tree(tmp_path)
+        assert _serial_pytest_str(None, invocation_dir=tree) is None
+        cmd = 'cargo test --workspace'
+        assert _serial_pytest_str(cmd, invocation_dir=tree) is cmd
+
+    def test_a_refused_rewrite_still_logs_once_with_an_invocation_dir(
+        self, tmp_path, caplog: pytest.LogCaptureFixture,
+    ):
+        from orchestrator.verify import _serial_pytest_str
+
+        tree = _write_serial_recovery_tree(tmp_path)
+        refused = 'echo "pytest" && true'
+        with caplog.at_level(logging.WARNING, logger='orchestrator.verify'):
+            assert _serial_pytest_str(refused, invocation_dir=tree) is refused
+        records = [r for r in caplog.records if r.name == 'orchestrator.verify']
+        assert len(records) == 1
+        assert refused in records[0].getMessage()
+
+
+# ---------------------------------------------------------------------------
+# task 3173 step-7: the two paths that would otherwise ERASE the kill signal
+# after `_summarize_checks` (step-6) correctly recorded it.
+#
+# (a) `_aggregate_results` rebuilds the multi-subproject summary by
+#     substring-scanning child summaries for exactly three literals
+#     ('tests failed' / 'lint issues' / 'type errors').  A kill note matches
+#     none of them, so a multi-module verify silently degrades to a bare
+#     'Failures: ' with no parts at all.
+# (b) `_build_summary_payload` picks the "loudest raw exit code" with
+#     max(key=(rc, timed_out)).  A NEGATIVE rc sorts BELOW a passing rc=0, so
+#     whenever a killed leg co-occurs with a passing leg the archived summary
+#     reports the PASSING run's rc/cmd/duration — actively hiding the kill in
+#     the one artifact that survives for triage.  (This whole defect was only
+#     diagnosable because that archive existed; see the archive=True design
+#     decision.)
+# ---------------------------------------------------------------------------
+
+_KILLED_LINT_CMD = './scripts/verify.sh lint --scope branch --include-infra'
+
+
+def _kill_note_child(*, module: str = 'orchestrator') -> VerifyResult:
+    """A *module*'s child result whose lint leg was SIGKILLed at 0.31s."""
+    return VerifyResult(
+        passed=False,
+        test_output='',
+        lint_output='DF_VERIFY_ROLE=merge — forcing --scope all\n',
+        type_output='',
+        summary=f'Failures: {_killed_leg_note("lint", -9, 0.31010722508654, module=module)}',
+        category='infra_kill',
+        cause_hint=f'{module}: killed',
+        # Task 3173 review amendment: this child's ONE failing leg is the
+        # killed lint leg, so it is what `_summarize_checks` would publish.
+        failing_leg_categories=['infra_kill'],
+    )
+
+
+class TestAggregateResultsKeepsKillNote:
+    """A kill note must survive multi-subproject aggregation verbatim."""
+
+    def test_kill_note_survives_aggregation_with_a_passing_sibling(self):
+        passing = VerifyResult(
+            passed=True, test_output='', lint_output='', type_output='',
+            summary='All checks passed', category='passed',
+        )
+        agg = _aggregate_results([passing, _kill_note_child()])
+        assert not agg.passed
+        assert SIGNAL_KILL_SUMMARY_MARKER in agg.summary
+        assert 'killed by signal 9' in agg.summary
+        assert 'indeterminate' in agg.summary
+        # The bug's signature: everything after the envelope dropped away.
+        assert agg.summary != 'Failures: '
+        assert agg.summary.strip() != 'Failures:'
+
+    def test_kill_note_and_a_real_test_failure_both_survive(self):
+        real_failure = VerifyResult(
+            passed=False, test_output='FAILED tests/x.py::y\n', lint_output='',
+            type_output='', summary='Failures: tests failed',
+            category='test_failure',
+        )
+        agg = _aggregate_results([real_failure, _kill_note_child(module='fused-memory')])
+        assert 'tests failed' in agg.summary
+        assert 'killed by signal 9' in agg.summary
+        assert 'indeterminate' in agg.summary
+
+    def test_aggregate_category_is_infra_kill(self):
+        """_worst_category must let severity_rank=1 dominate test_failure."""
+        real_failure = VerifyResult(
+            passed=False, test_output='FAILED tests/x.py::y\n', lint_output='',
+            type_output='', summary='Failures: tests failed',
+            category='test_failure',
+        )
+        agg = _aggregate_results([real_failure, _kill_note_child()])
+        assert agg.category == 'infra_kill'
+
+    def test_duplicate_kill_notes_are_not_repeated(self):
+        """Two children of one module killed identically must not stutter the
+        same sentence twice; ordering stays deterministic."""
+        agg = _aggregate_results([_kill_note_child(), _kill_note_child()])
+        assert agg.summary.count('killed by signal 9') == 1
+
+    def test_each_modules_kill_note_survives_naming_its_module(self):
+        agg = _aggregate_results([_kill_note_child(), _kill_note_child(module='dashboard')])
+        assert 'orchestrator lint leg killed by signal 9' in agg.summary, agg.summary
+        assert 'dashboard lint leg killed by signal 9' in agg.summary, agg.summary
+
+    def test_genuine_multi_child_wording_is_unchanged(self):
+        """REGRESSION GUARD: with no kill anywhere, aggregation is
+        byte-identical to today."""
+        a = VerifyResult(
+            passed=False, test_output='', lint_output='', type_output='',
+            summary='Failures: tests failed', category='test_failure',
+        )
+        b = VerifyResult(
+            passed=False, test_output='', lint_output='', type_output='',
+            summary='Failures: lint issues, type errors', category='test_failure',
+        )
+        agg = _aggregate_results([a, b])
+        assert agg.summary == 'Failures: tests failed, lint issues, type errors'
+
+
+class TestSummaryPayloadNamesTheKilledRun:
+    """The archived summary.json must name the run that was killed."""
+
+    @staticmethod
+    def _runs() -> list[dict]:
+        return [
+            {'label': 'test', 'cmd': 'pytest', 'rc': 0, 'timed_out': False,
+             'started_at': 't0', 'duration_secs': 900.0},
+            {'label': 'lint', 'cmd': _KILLED_LINT_CMD, 'rc': -9, 'timed_out': False,
+             'started_at': 't1', 'duration_secs': 0.31},
+        ]
+
+    def test_killed_run_outranks_a_passing_run(self):
+        payload = _build_summary_payload(self._runs(), 'infra_kill', '', role='task')
+        assert payload['rc'] == -9
+        assert payload['cmd'] == _KILLED_LINT_CMD
+        assert payload['duration_secs'] == 0.31
+        assert payload['started_at'] == 't1'
+
+    def test_killed_run_outranks_a_genuine_nonzero_failure(self):
+        runs = self._runs()
+        runs[0]['rc'] = 1
+        payload = _build_summary_payload(runs, 'infra_kill', '', role='task')
+        assert payload['rc'] == -9
+        assert payload['cmd'] == _KILLED_LINT_CMD
+
+    def test_all_commands_are_still_listed(self):
+        payload = _build_summary_payload(self._runs(), 'infra_kill', '', role='task')
+        assert [c['label'] for c in payload['commands']] == ['test', 'lint']
+        assert [c['rc'] for c in payload['commands']] == [0, -9]
+
+    def test_control_loudest_nonnegative_rc_is_unchanged(self):
+        """CONTROL: with no negative rc anywhere, the existing
+        "loudest raw exit code" ordering (rc=1 beats rc=0) still holds."""
+        runs = [
+            {'label': 'test', 'cmd': 'pytest', 'rc': 1, 'timed_out': False,
+             'started_at': 't0', 'duration_secs': 12.0},
+            {'label': 'lint', 'cmd': 'ruff check .', 'rc': 0, 'timed_out': False,
+             'started_at': 't1', 'duration_secs': 3.0},
+        ]
+        payload = _build_summary_payload(runs, 'test_failure', '', role='task')
+        assert payload['rc'] == 1
+        assert payload['cmd'] == 'pytest'
+        assert payload['duration_secs'] == 12.0
+
+    def test_control_timed_out_tiebreak_is_unchanged(self):
+        runs = [
+            {'label': 'test', 'cmd': 'pytest', 'rc': 1, 'timed_out': True,
+             'started_at': 't0', 'duration_secs': 600.0},
+            {'label': 'lint', 'cmd': 'ruff check .', 'rc': 1, 'timed_out': False,
+             'started_at': 't1', 'duration_secs': 3.0},
+        ]
+        payload = _build_summary_payload(runs, 'infra_timeout', '', role='task')
+        assert payload['cmd'] == 'pytest'
+        assert payload['timed_out'] is True
+
+
+# ---------------------------------------------------------------------------
+# task 3173 step-14 (REVIEW AMENDMENT, blocking finding 1): VerifyResult must
+# CARRY what each failing leg decided, so merge_queue's veto gate never has to
+# infer it from the single severity-ranked aggregate `category`.
+#
+# `_worst_category` lets a rank-1 INFRA_KILL dominate a rank-11 TEST_FAILURE.
+# That is correct for "how bad was this run" and catastrophic if read as "this
+# run produced no verdict": a trust anchor whose test leg COMPLETED and blamed
+# the branch, next to an unrelated SIGKILLed lint leg, aggregates to
+# category='infra_kill'.  Only a run in which EVERY failing leg is verdict-less
+# may decline to veto, and that question is unanswerable from one string.
+#
+# RED today: the field does not exist.
+# ---------------------------------------------------------------------------
+
+
+class TestVerifyResultCarriesFailingLegCategories:
+    """`VerifyResult.failing_leg_categories`: None = NOT RECORDED (fail
+    CLOSED), a list = one category per FAILING leg in test/lint/type order."""
+
+    @staticmethod
+    def _child(category: str, *, legs: list[str] | None, passed: bool = False) -> VerifyResult:
+        return VerifyResult(
+            passed=passed, test_output='', lint_output='', type_output='',
+            summary='All checks passed' if passed else f'Failures: {category}',
+            category=category, failing_leg_categories=legs,
+        )
+
+    # -- the None contract -------------------------------------------------
+
+    def test_default_is_none_not_empty_list(self):
+        """None means "not recorded" and must NEVER be read as indeterminate.
+        Every result NOT produced by `run_verification` lands here: an old wire
+        payload, a `_trivial_pass`, a verify_runner UNSCOPED_TYPECHECK_*
+        sentinel, or any hand-constructed result in a test."""
+        vr = VerifyResult(
+            passed=False, test_output='', lint_output='', type_output='', summary='x',
+        )
+        assert vr.failing_leg_categories is None
+
+    def test_trivial_pass_leaves_it_none(self):
+        assert verify._trivial_pass('reason').failing_leg_categories is None
+
+    # -- codec round-trip (mirrors the `trivial` round-trip tests above) ----
+
+    def test_round_trips_losslessly_through_the_remote_codec(self):
+        from orchestrator.verify_runner import result_from_dict, result_to_dict
+
+        original = self._child('infra_kill', legs=['test_failure', 'infra_kill'])
+        restored = result_from_dict(result_to_dict(original))
+        assert restored.failing_leg_categories == ['test_failure', 'infra_kill']
+
+    def test_empty_list_round_trips_as_empty_not_none(self):
+        from orchestrator.verify_runner import result_from_dict, result_to_dict
+
+        restored = result_from_dict(result_to_dict(self._child('passed', legs=[], passed=True)))
+        assert restored.failing_leg_categories == []
+        assert restored.failing_leg_categories is not None
+
+    def test_payload_missing_the_key_reconstructs_as_none(self):
+        """DEPLOY ORDERING: an older remote's payload simply omits the key, so
+        the default must be the fail-CLOSED None rather than an empty list."""
+        from orchestrator.verify_runner import result_from_dict, result_to_dict
+
+        d = result_to_dict(self._child('test_failure', legs=['test_failure']))
+        d.pop('failing_leg_categories')
+        assert result_from_dict(d).failing_leg_categories is None
+
+    # -- aggregation over FAILING children only ----------------------------
+
+    def test_aggregate_unions_two_failing_children_in_order(self):
+        agg = _aggregate_results([
+            self._child('test_failure', legs=['test_failure']),
+            self._child('flock_error', legs=['flock_error']),
+        ])
+        assert agg.failing_leg_categories == ['test_failure', 'flock_error']
+
+    def test_passing_child_contributes_nothing(self):
+        passing = VerifyResult(
+            passed=True, test_output='', lint_output='', type_output='',
+            summary='All checks passed', category='passed', failing_leg_categories=[],
+        )
+        agg = _aggregate_results([passing, self._child('test_failure', legs=['test_failure'])])
+        assert agg.failing_leg_categories == ['test_failure']
+
+    def test_aggregate_de_duplicates_and_preserves_order(self):
+        agg = _aggregate_results([
+            self._child('test_failure', legs=['test_failure', 'infra_kill']),
+            self._child('infra_kill', legs=['infra_kill']),
+        ])
+        assert agg.failing_leg_categories == ['test_failure', 'infra_kill']
+
+    def test_a_failing_child_with_none_poisons_the_aggregate(self):
+        """FAIL CLOSED: one unrecorded failing child means the aggregate
+        cannot claim to know what every leg decided."""
+        agg = _aggregate_results([
+            self._child('test_failure', legs=['test_failure']),
+            self._child('infra_kill', legs=None),
+        ])
+        assert agg.failing_leg_categories is None
+
+    def test_a_PASSING_child_with_none_does_not_poison(self):
+        """Only FAILING children are consulted — a passing child has no legs to
+        report, so its None is not evidence of anything missing."""
+        passing = VerifyResult(
+            passed=True, test_output='', lint_output='', type_output='',
+            summary='All checks passed', category='passed', failing_leg_categories=None,
+        )
+        agg = _aggregate_results([passing, self._child('infra_kill', legs=['infra_kill'])])
+        assert agg.failing_leg_categories == ['infra_kill']
+
+    # -- THE REVIEWER'S COMPOSITION ----------------------------------------
+
+    def test_completed_test_failure_plus_kill_note_child_keeps_both(self):
+        """The aggregate `category` still collapses to the worst
+        (severity_rank=1 infra_kill dominates rank-11 test_failure — i.e.
+        `test_aggregate_category_is_infra_kill` is NOT weakened), while the
+        per-leg list preserves the completed, branch-blaming verdict that the
+        veto gate must not discard."""
+        real_failure = VerifyResult(
+            passed=False, test_output='FAILED tests/x.py::y\n', lint_output='',
+            type_output='', summary='Failures: tests failed',
+            category='test_failure', failing_leg_categories=['test_failure'],
+        )
+        agg = _aggregate_results([real_failure, _kill_note_child()])
+        assert agg.category == 'infra_kill'
+        assert agg.failing_leg_categories == ['test_failure', 'infra_kill']
+
+    def test_single_child_fast_path_passes_the_field_straight_through(self):
+        """len==1 returns the child object itself — pin it so the field cannot
+        be silently dropped by a future rewrite of that fast path."""
+        child = self._child('infra_kill', legs=['infra_kill'])
+        assert _aggregate_results([child]).failing_leg_categories == ['infra_kill']
+
+
+# ---------------------------------------------------------------------------
+# task 3173 amendment: the two couplings the step-5..8 tests left unpinned.
+#
+# (a) `_summarize_checks` joins its fragments with ', ' and `_aggregate_results`
+#     recovers them with `.split(', ')`, keeping only the marker-bearing ones.
+#     That works TODAY only because `_killed_leg_note` happens to separate its
+#     clauses with '; '.  A future comma inside the note — a plausible edit —
+#     would split it in two, and only the marker half would survive: the same
+#     silent degradation the carry-through was added to fix, one edit later.
+#     Pin it at the PRODUCER so the edit fails loudly there.
+# (b) `run_verification`'s two `_summarize_checks(...)` call sites are the only
+#     production consumers of test_duration/lint_duration/type_duration, and
+#     every other duration assertion in the suite calls `_summarize_checks`
+#     directly.  A cross-wire (`lint_duration=attempt.type.duration_secs`)
+#     would keep all of them green while the operator-facing sentence reported
+#     the wrong leg's survival time — and `_killed_leg_note`'s whole contract
+#     is that every clause is a MEASURED fact.
+# ---------------------------------------------------------------------------
+
+
+class TestKillNoteIsOneAggregationFragment:
+    """The ', '-joined summary is the wire format between `_summarize_checks`
+    and `_aggregate_results`, so a kill note must never contain ', '."""
+
+    @pytest.mark.parametrize(
+        'module', [None, 'orchestrator', 'foo/bar', 'a, b'],
+        ids=['unlabelled', 'plain', 'nested', 'hostile'],
+    )
+    @pytest.mark.parametrize(
+        ('label', 'rc', 'duration'),
+        [
+            ('test', -9, 900.5),
+            ('lint', -9, 0.31010722508654),
+            ('lint', -15, None),      # no duration in scope -> clause omitted
+            ('type', -2, 0.0),
+            ('type', -1, 12.5),
+        ],
+    )
+    def test_note_never_contains_the_fragment_separator(self, label, rc, duration, module):
+        note = _killed_leg_note(label, rc, duration, module=module)
+        assert ', ' not in note, (
+            f'a comma+space in the note splits it across `.split(", ")` in '
+            f'_aggregate_results and only the {SIGNAL_KILL_SUMMARY_MARKER!r} '
+            f'half survives; use "; " to separate clauses. Got: {note!r}'
+        )
+
+    def test_module_names_the_killed_leg(self):
+        note = _killed_leg_note('lint', -9, 0.31, module='scripts')
+        assert note.startswith('scripts lint leg killed by signal 9 after 0.31s'), note
+
+    def test_unlabelled_note_is_byte_identical(self):
+        """A single-module caller passes no module and keeps today's sentence."""
+        assert _killed_leg_note('lint', -9, 0.31) == (
+            'lint leg killed by signal 9 after 0.31s; no diagnostics produced; verdict indeterminate'
+        )
+
+    def test_labelled_note_is_still_a_no_verdict_summary(self):
+        assert verify.is_no_verdict_summary(_killed_leg_note('lint', -9, 0.31, module='scripts'))
+
+    def test_summarize_checks_names_the_killed_lint_legs_module(self):
+        from orchestrator.verify import _summarize_checks
+
+        _, _, _, summary, _ = _summarize_checks(
+            0, '', False, 'pytest',
+            -9, '', False, 'ruff check',
+            0, '', False, 'pyright',
+            lint_duration=0.31,
+            module='scripts',
+        )
+        assert 'scripts lint leg killed by signal 9' in summary, summary
+
+    def test_note_round_trips_through_the_consumer_split_intact(self):
+        """Exactly the parse `_aggregate_results` performs, run against the
+        producer's own output: one fragment in, one fragment out."""
+        note = _killed_leg_note('lint', -9, 0.31010722508654)
+        summary = f'Failures: {note}'
+        assert summary.removeprefix('Failures: ').split(', ') == [note]
+
+    def test_note_beside_a_real_verdict_still_round_trips(self):
+        """The mixed case: a genuine 'tests failed' fragment plus a kill note
+        must recover as exactly two fragments, the second one whole."""
+        note = _killed_leg_note('lint', -9, 0.31)
+        summary = f'Failures: tests failed, {note}'
+        assert summary.removeprefix('Failures: ').split(', ') == ['tests failed', note]
+
+
+class TestRunVerificationThreadsEachLegsOwnDuration:
+    """END-TO-END through `run_verification`: the reported survival time is
+    the KILLED leg's own, not another leg's."""
+
+    @staticmethod
+    def _config(tmp_path: Path) -> OrchestratorConfig:
+        return OrchestratorConfig(
+            project_root=tmp_path,
+            test_command='__test_cmd__',
+            lint_command='__lint_cmd__',
+            type_check_command='__type_cmd__',
+            verify_command_timeout_secs=30.0,
+            verify_timeout_retries=0,
+        )
+
+    @staticmethod
+    def _reported_duration(summary: str, signal: int) -> float:
+        import re
+        m = re.search(rf'killed by signal {signal} after (\d+\.\d+)s', summary)
+        assert m is not None, f'no "after N.NNs" clause for signal {signal}: {summary!r}'
+        return float(m.group(1))
+
+    @pytest.mark.asyncio
+    async def test_killed_lint_leg_reports_the_lint_legs_survival_time(self, tmp_path: Path):
+        """Only lint is killed, and it is the SLOW leg: test/type finish
+        immediately.  A cross-wire to either of them reports ~0.00s."""
+        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
+            if cmd == '__lint_cmd__':
+                await asyncio.sleep(0.30)
+                return -9, '', False  # SIGKILL: not one diagnostic emitted
+            return 0, '', False
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            result = await run_verification(tmp_path, self._config(tmp_path), max_retries=0)
+
+        assert not result.passed
+        assert result.category == 'infra_kill'
+        assert 'lint leg killed by signal 9' in result.summary
+        assert 'lint issues' not in result.summary
+        # >= 0.25 is comfortably above the other two legs (~0.00s) and immune
+        # to scheduler jitter and the ``:.2f`` rounding.
+        assert self._reported_duration(result.summary, 9) >= 0.25, result.summary
+
+    @pytest.mark.asyncio
+    async def test_two_killed_legs_each_report_their_own_duration(self, tmp_path: Path):
+        """The strict wiring test: distinct signals AND distinct durations, so
+        a swap between any two of the three kwargs is detectable."""
+        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
+            if cmd == '__type_cmd__':
+                await asyncio.sleep(0.40)
+                return -15, '', False  # SIGTERM, the slow leg
+            if cmd == '__test_cmd__':
+                return -9, '', False   # SIGKILL, immediate
+            return 0, '', False
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            result = await run_verification(tmp_path, self._config(tmp_path), max_retries=0)
+
+        assert result.category == 'infra_kill'
+        assert 'test leg killed by signal 9' in result.summary
+        assert 'type leg killed by signal 15' in result.summary
+        assert 'lint' not in result.summary, 'the passing leg must not be named'
+        # test died instantly; type survived 0.40s.  Cross-wiring the kwargs
+        # swaps these two numbers.
+        assert self._reported_duration(result.summary, 9) < 0.25, result.summary
+        assert self._reported_duration(result.summary, 15) >= 0.35, result.summary
+
+    @pytest.mark.asyncio
+    async def test_control_a_genuine_lint_failure_is_worded_as_today(self, tmp_path: Path):
+        """REGRESSION GUARD: the durations change nothing for a leg that
+        actually produced a verdict."""
+        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
+            if cmd == '__lint_cmd__':
+                await asyncio.sleep(0.05)
+                return 1, 'Found 1 error.\n', False
+            return 0, '', False
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            result = await run_verification(tmp_path, self._config(tmp_path), max_retries=0)
+
+        assert not result.passed
+        assert result.summary == 'Failures: lint issues'
+        assert result.category != 'infra_kill'
+        assert SIGNAL_KILL_SUMMARY_MARKER not in result.summary
+
+    @pytest.mark.asyncio
+    async def test_a_lint_failure_beside_a_green_test_leg_records_the_test_leg_as_passed(
+        self, tmp_path: Path,
+    ):
+        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
+            if cmd == '__lint_cmd__':
+                return 1, 'x.py:1:1: F401 unused import\n', False
+            return 0, '19639 passed in 2351s\n' if cmd == '__test_cmd__' else '', False
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            result = await run_verification(tmp_path, self._config(tmp_path), max_retries=0)
+
+        assert result.test_leg_failed is False
+        assert '19639 passed' in result.test_output
+        assert '## Test Output' not in result.failure_report()
+
+    @pytest.mark.asyncio
+    async def test_a_failed_test_leg_is_recorded_as_failed(self, tmp_path: Path):
+        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
+            if cmd == '__test_cmd__':
+                return 1, '....\n19638 passed, 1 error in 2351s\n', False
+            return 0, '', False
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            result = await run_verification(tmp_path, self._config(tmp_path), max_retries=0)
+
+        assert result.test_leg_failed is True
+        assert '## Test Output' in result.failure_report()
+
+
+# ---------------------------------------------------------------------------
+# Version pin survival through verify's scoping pipeline (task 3931)
+# ---------------------------------------------------------------------------
+
+# LOCAL literals, deliberately not derived from the committed YAML: these guards
+# state the scoper contract for a pinned clause independently of whether the
+# fleet chain is pinned. It is NOT — task 4538 pins the version out-of-band via
+# the repo-root package.json + `npm ci`, keeping all seven clauses bare — so a
+# derived fixture would test the unpinned spelling twice. The contract still
+# matters: verify runs against target projects whose own type_check_command may
+# spell `npx pyright@<version>` directly.
+_UNPINNED_TYPE_CHAIN_3931 = (
+    'cd fused-memory && npx pyright && cd ../orchestrator && npx pyright'
+    ' && cd ../dashboard && npx pyright && cd ../shared && npx pyright'
+    ' && cd ../escalation && npx pyright && cd ../sampler && npx pyright'
+    ' && cd ../cockpit && npx pyright'
+)
+_PINNED_TYPE_CHAIN_3931 = _UNPINNED_TYPE_CHAIN_3931.replace('npx pyright', 'npx pyright@1.1.408')
+_ESC_3805_FILE = 'orchestrator/tests/test_run_vllm_eval.py'
+
+
+class TestVersionPinSurvivesScoping:
+    """A pinned `npx pyright@<version>` must survive `_scope_to_keyword`.
+
+    Task 3931 / esc-3805-1. Assertions 1 and 2 below are the LOAD-BEARING
+    ones: without them, a version pin in dark-factory-orchestrator.yaml is
+    DECORATIVE on the exact FILE_SCOPED path that generated esc-3805-1 — it
+    reads as pinned in the config and runs unpinned in the gate.
+
+    MEASURED on this branch, before the step-6 change (and after the step-4
+    verify_cmd change, so this is verify.py's own stripping, not the parser's):
+
+        _scope_to_keyword(PINNED,   'pyright', [file])
+            -> 'npx pyright orchestrator/tests/test_run_vllm_eval.py'
+        _scope_to_keyword(UNPINNED, 'pyright', [file])
+            -> 'npx pyright orchestrator/tests/test_run_vllm_eval.py'
+
+    Byte-identical. ``retained = head[: idx + len(keyword)]`` (verify.py) is a
+    BYTE-OFFSET slice, so it cuts mid-token at the `@` and drops `@1.1.408`
+    before the string is ever re-parsed. The pin cannot survive a parser fix
+    alone; the truncation itself has to become token-aware.
+
+    A `.py`-touching diff takes exactly this FILE_SCOPED path: the leading
+    `cd` is folded away, leaving `npx pyright <repo-root-relative-file>` to run
+    FROM THE WORKTREE ROOT and then be wrapped by
+    `_scope_fallback_tool_to_subproject`.
+    """
+
+    def test_pinned_chain_keeps_its_version_through_scope_to_keyword(self):
+        scoped = verify._scope_to_keyword(_PINNED_TYPE_CHAIN_3931, 'pyright', [_ESC_3805_FILE])
+        assert scoped == f'npx pyright@1.1.408 {_ESC_3805_FILE}', (
+            f'_scope_to_keyword dropped the version pin, returning {scoped!r} '
+            '(task 3931, esc-3805-1). The byte-offset truncation '
+            '`head[: idx + len(keyword)]` slices mid-token at the `@`, so the '
+            'gate advertises a pinned pyright and runs whatever npx last '
+            'cached'
+        )
+
+    def test_pin_survives_the_uv_subproject_rescope(self):
+        scoped = verify._scope_to_keyword(_PINNED_TYPE_CHAIN_3931, 'pyright', [_ESC_3805_FILE])
+        rescoped = verify._scope_fallback_tool_to_subproject(scoped, 'pyright', 'orchestrator')
+        assert rescoped == (
+            f'uv run --project orchestrator npx pyright@1.1.408 {_ESC_3805_FILE}'
+        ), (
+            f'the pin did not survive the uv rescope, giving {rescoped!r} '
+            '(task 3931) — this is the command the FILE_SCOPED fallback path '
+            'actually dispatches for the esc-3805-1 diff'
+        )
+
+    def test_unpinned_chain_scopes_exactly_as_today(self):
+        """Regression floor: the bare spelling's scoped shape is unchanged."""
+        scoped = verify._scope_to_keyword(_UNPINNED_TYPE_CHAIN_3931, 'pyright', [_ESC_3805_FILE])
+        assert scoped == f'npx pyright {_ESC_3805_FILE}'
+        assert verify._scope_fallback_tool_to_subproject(scoped, 'pyright', 'orchestrator') == (
+            f'uv run --project orchestrator npx pyright {_ESC_3805_FILE}'
+        )
+
+    def test_a_longer_unrelated_token_is_not_absorbed_by_the_widening(self):
+        """The boundary rule: widen across an `@<version>` suffix ONLY.
+
+        Pins the chosen rule explicitly so the widening cannot creep into "keep
+        the whole token". `npx pyright-foo` is a DIFFERENT tool whose name
+        merely starts with the keyword; today the byte-offset slice truncates
+        it to `npx pyright` and this must stay byte-identical, because
+        retaining `pyright-foo` whole would reclassify the command (ToolKind.NPX)
+        and make `scope_to` replace the tool name with the touched file — the
+        very failure mode the pinned spelling suffered before step 4.
+
+        This assertion PASSES today and is a floor, not a RED: it is what
+        makes the step-6 widening provably narrow.
+        """
+        assert verify._scope_to_keyword('npx pyright-foo', 'pyright', [_ESC_3805_FILE]) == (
+            f'npx pyright {_ESC_3805_FILE}'
+        )
+
+
+# ---------------------------------------------------------------------------
+# End-to-end capstone: the REAL committed config's FILE_SCOPED dispatch (3931)
+# ---------------------------------------------------------------------------
+
+_REPO_ROOT_3931 = Path(__file__).resolve().parents[2]
+_DF_CONFIG_PATH_3931 = _REPO_ROOT_3931 / 'dark-factory-orchestrator.yaml'
+
+
+class TestFleetTypeCheckSurvivesTheRealFallbackPath:
+    """The committed config's type leg must still dispatch a scoped pyright.
+
+    Task 3931 / esc-3805-1. Every other guard in this task is over a LOCAL
+    literal or a single helper; this one runs the whole path end-to-end over
+    the config file the fleet actually loads.
+
+    This is precisely the esc-3805-1 shape: a diff touching one `.py` file
+    under a single subproject. `_build_fallback_config` takes the FILE_SCOPED
+    branch, `_scope_to_keyword` folds away the leading `cd fused-memory &&` and
+    emits `npx pyright <repo-root-relative-file>` to run FROM THE WORKTREE
+    ROOT — which is why that leg saw root-scoped pyright's 14 errors while
+    pre-commit's package-scoped leg saw 0 (closed by this task's extraPaths
+    change to orchestrator/pyproject.toml).
+
+    NOTE ON THE VERSION PIN. This class originally also asserted that the
+    dispatched command carried an inline `pyright@<version>`, because this
+    branch pinned the version by spelling it into all seven clauses of
+    `dark-factory-orchestrator.yaml`'s `type_check_command`. Task 4538 landed
+    on main first and pins the SAME version (1.1.408) a different way — one
+    authored declaration in the repo-root `package.json`, materialised into
+    every cold worktree's `node_modules/.bin` by the `npm ci` step in
+    `verify_cold_preprovision_command`, so the seven clauses stay BARE. Those
+    pin assertions were dropped on rebase rather than merged: they are the
+    exact inverse of the landed
+    `tests/scripts/test_pyright_version_pin.py::test_the_fleet_chain_stays_bare_npx_pyright`.
+    What survives here is the shape floor, which holds under either mechanism —
+    and the scoper's pin-preservation itself is still pinned, mechanism-side,
+    by `TestVersionPinSurvivesScoping` above over a local literal, so a target
+    project that DOES spell `npx pyright@<version>` in its own config is still
+    covered.
+    """
+
+    def _fallback_type_command(self) -> str:
+        from orchestrator.config import load_config
+
+        config = load_config(_DF_CONFIG_PATH_3931)
+        mc = _build_fallback_config([_ESC_3805_FILE], config=config)
+        assert mc is not None, (
+            '_build_fallback_config returned None for a single-.py diff (task '
+            '3931) — it only does that for a zero-.py diff, so the FILE_SCOPED '
+            'path this guard exists to cover was not exercised at all'
+        )
+        type_cmd = mc.type_check_command
+        assert type_cmd is not None, (
+            '_build_fallback_config produced a ModuleConfig with no '
+            'type_check_command for the esc-3805-1 diff (task 3931) — the '
+            'type gate would dispatch nothing at all, so there is no '
+            'pyright invocation left for this guard to inspect'
+        )
+        return type_cmd
+
+    def test_the_scoped_command_still_targets_only_the_touched_file(self):
+        """Regression floor: the FILE_SCOPED shape, whole-string.
+
+        If a version were ever mistaken for a target (the ToolKind.NPX misparse
+        this task's verify_cmd change fixed), `scope_to` would replace
+        `pyright@<version>` with the touched file and the command would lose
+        either its tool or its target. Asserting the exact whole string is what
+        pins that.
+        """
+        cmd = self._fallback_type_command()
+        assert cmd.startswith('npx pyright'), cmd
+        assert cmd.endswith(f' {_ESC_3805_FILE}'), cmd
+        assert cmd.count(_ESC_3805_FILE) == 1, cmd
+        assert 'cd ' not in cmd, (
+            f'{cmd!r} still carries a `cd` clause (task 3931) — the FILE_SCOPED '
+            'path runs from the worktree root, so a surviving cd would '
+            'misresolve the root-relative file path just scoped in'
+        )

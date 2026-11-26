@@ -1,22 +1,48 @@
 """Tests for scripts/legibility/sampling.py — zero-LLM signal scorer +
 stratified budget sampler (PRD §5.2 point 2, contract §7.4, boundary test §8.4).
 
-Self-contained: does not import task α's ``digest.py``. Imported as
-``from legibility import sampling`` (PEP-420 namespace package; see
-test_legibility_config.py's module docstring for the import mechanics).
+Imports ``digest.py`` for the sampler-vs-digest parity pins over the
+classifiers the two share. Imported as ``from legibility import sampling``
+(PEP-420 namespace package; see test_legibility_config.py's module docstring
+for the import mechanics).
 """
 from __future__ import annotations
 
+import dataclasses
 import json
 import textwrap
+import weakref
 from datetime import date as dt_date
 from pathlib import Path
 
+import pytest
+from legibility import coder, detectors, digest, inventory
 from legibility import config as config_mod
-from legibility import inventory
 from legibility import sampling as mod
+from legibility.detectors import AgentClass, SignalClass
+from legibility_carrier_fixtures import (
+    PROSE_QUOTING_THE_SCHEMA,
+    briefing_text,
+    census_synthesis_prompt,
+    census_verifier_prompt,
+    coder_judgment,
+    json_fenced,
+)
 
 MAIN_CWD = '/home/leo/src/dark-factory'
+
+
+def _sampling_config(
+    max_daily_digest_bytes: int = 405_000, *, top_fraction: float = 0.12, per_stratum_min: int = 2,
+) -> config_mod.LegibilityConfig:
+    return config_mod.LegibilityConfig(
+        project_id='dark_factory',
+        project_root=MAIN_CWD,
+        escalation_port=8103,
+        cwd_prefixes=[MAIN_CWD],
+        budgets=config_mod.Budgets(max_daily_digest_bytes=max_daily_digest_bytes),
+        sampling=config_mod.Sampling(top_fraction=top_fraction, per_stratum_min=per_stratum_min),
+    )
 
 
 def _write_transcript(path: Path, records: list[dict]) -> Path:
@@ -66,19 +92,16 @@ def _self_correct_record() -> dict:
 
 
 def _df_guard_record() -> dict:
-    # mcp__plan-tools__report_false_premise is a real dark_factory guard
-    # tool (orchestrator/src/orchestrator/mcp/plan_tools.py) — a structural
-    # tool_use.name match, not a text/substring guess.
     return {
-        'type': 'assistant',
+        'type': 'user',
         'timestamp': '2026-07-13T10:03:00.000Z',
         'message': {
             'content': [
                 {
-                    'type': 'tool_use',
-                    'id': 'tu1',
-                    'name': 'mcp__plan-tools__report_false_premise',
-                    'input': {'task_id': '2573', 'reason': 'premise invalid'},
+                    'type': 'tool_result',
+                    'tool_use_id': 'tu1',
+                    'is_error': False,
+                    'content': 'BLOCKED: merge gate refused',
                 },
             ]
         },
@@ -117,30 +140,200 @@ class TestScoreSignalsAllClasses:
         )
 
     def test_tool_error(self, tmp_path):
-        assert mod.score_signals(self._build(tmp_path)).tool_error == 1
+        assert mod.score_signals(self._build(tmp_path))[SignalClass.TOOL_ERROR] == 1
 
     def test_not_found(self, tmp_path):
-        assert mod.score_signals(self._build(tmp_path)).not_found == 1
+        assert mod.score_signals(self._build(tmp_path))[SignalClass.NOT_FOUND] == 1
 
     def test_self_correct(self, tmp_path):
-        assert mod.score_signals(self._build(tmp_path)).self_correct == 1
+        assert mod.score_signals(self._build(tmp_path))[SignalClass.SELF_CORRECT] == 1
 
     def test_df_guard(self, tmp_path):
-        assert mod.score_signals(self._build(tmp_path)).df_guard == 1
+        assert mod.score_signals(self._build(tmp_path))[SignalClass.DF_GUARD] == 1
 
     def test_interrupt(self, tmp_path):
-        assert mod.score_signals(self._build(tmp_path)).interrupt == 1
+        assert mod.score_signals(self._build(tmp_path))[SignalClass.INTERRUPT] == 1
 
     def test_total_signal_is_sum_of_classes(self, tmp_path):
         counts = mod.score_signals(self._build(tmp_path))
         assert counts.total_signal == (
-            counts.tool_error
-            + counts.not_found
-            + counts.self_correct
-            + counts.df_guard
-            + counts.interrupt
+            counts[SignalClass.TOOL_ERROR]
+            + counts[SignalClass.NOT_FOUND]
+            + counts[SignalClass.SELF_CORRECT]
+            + counts[SignalClass.DF_GUARD]
+            + counts[SignalClass.INTERRUPT]
         )
         assert counts.total_signal == 5
+
+
+_CEILING_DECLARATION = 'WATCHER_REARM_OUTCOME: CEILING exit=124'
+
+
+def _designed_outcome_record(i: int = 0) -> dict:
+    """An is_error tool_result carrying a DECLARED bounded-poll ceiling."""
+    return {
+        'type': 'user',
+        'timestamp': '2026-07-13T10:00:00.000Z',
+        'message': {
+            'content': [
+                {
+                    'type': 'tool_result',
+                    'tool_use_id': f'tu-c{i}',
+                    'is_error': True,
+                    'content': _CEILING_DECLARATION,
+                },
+            ]
+        },
+    }
+
+
+def _genuine_error_record() -> dict:
+    """An is_error tool_result that is a REAL failure (bare exit 2)."""
+    return {
+        'type': 'user',
+        'timestamp': '2026-07-13T10:05:00.000Z',
+        'message': {
+            'content': [
+                {
+                    'type': 'tool_result',
+                    'tool_use_id': 'tu-g',
+                    'is_error': True,
+                    'content': 'DARK_FACTORY_ROOT unset, exit code 2',
+                },
+            ]
+        },
+    }
+
+
+class TestSamplerDesignedOutcomeParity:
+    """The sampler must not over-rank a session on designed-outcome noise
+    any more than the digest does. sampling.py holds a SECOND, independent
+    five-class definition used for ranking; before task 3610 a ceiling-only
+    session digested as tool_error 0 but still RANKED as 13 errors, a silent
+    divergence between two things both documented as "PRD §7.2
+    signal_counts". Both now share digest's one classifier.
+    """
+
+    def test_ceiling_only_session_scores_zero_tool_errors(self, tmp_path):
+        path = _write_transcript(
+            tmp_path / 'ceilings.jsonl',
+            [_designed_outcome_record(i) for i in range(13)],
+        )
+
+        counts = mod.score_signals(path)
+
+        assert counts[SignalClass.TOOL_ERROR] == 0
+        assert counts[SignalClass.DESIGNED_OUTCOME] == 13
+
+    def test_genuine_failure_still_increments_tool_error(self, tmp_path):
+        path = _write_transcript(
+            tmp_path / 'mixed.jsonl',
+            [_designed_outcome_record(i) for i in range(3)] + [_genuine_error_record()],
+        )
+
+        counts = mod.score_signals(path)
+
+        assert counts[SignalClass.TOOL_ERROR] == 1
+        assert counts[SignalClass.DESIGNED_OUTCOME] == 3
+
+    def test_total_signal_excludes_designed_outcome(self, tmp_path):
+        # total_signal is the sampler's RANKING scale over the five scored
+        # confusion classes; adding designed outcomes must not move it.
+        base = _write_transcript(tmp_path / 'base.jsonl', [_genuine_error_record()])
+        noisy = _write_transcript(
+            tmp_path / 'noisy.jsonl',
+            [_genuine_error_record()] + [_designed_outcome_record(i) for i in range(9)],
+        )
+
+        base_counts = mod.score_signals(base)
+        noisy_counts = mod.score_signals(noisy)
+
+        assert noisy_counts[SignalClass.DESIGNED_OUTCOME] == 9
+        assert base_counts[SignalClass.DESIGNED_OUTCOME] == 0
+        assert noisy_counts.total_signal == base_counts.total_signal == 1
+
+    def test_ceiling_only_session_is_dropped_before_digest_time(self):
+        # The bound on "counted for visibility" (PRD §7.2.1): the
+        # zero-signal gate is score > 0 over the SCORED classes, so a
+        # session carrying nothing but designed outcomes never reaches the
+        # digest stage and its designed_outcome count is never observable.
+        # Pinned rather than left to the docstring, because the honest
+        # scope of the claim is exactly what a reader would otherwise
+        # over-read.
+        records = [
+            _scored('ceilings-only', 'watcher', mod.SignalCounts.of(designed_outcome=13), 'poll'),
+            _scored('real-signal', 'watcher', mod.SignalCounts.of(tool_error=1), 'boom'),
+        ]
+        config = _sampling_config()
+
+        result = mod.stratified_sample(records, config)
+
+        assert result.zero_signal_dropped == 1
+        assert {r.path.stem for r in result.selected} == {'real-signal'}
+
+    def test_co_mingled_ceiling_and_failure_ranks_as_a_genuine_error(self, tmp_path):
+        # A result carrying BOTH a designed CEILING and a real ERROR marker
+        # is a genuine failure at BOTH layers -- the shared classifier is
+        # what makes that true here without a second rule.
+        record = _designed_outcome_record(0)
+        record['message']['content'][0]['content'] = (
+            'WATCHER_REARM_OUTCOME: CEILING exit=124\n'
+            'WATCHER_REARM_OUTCOME: ERROR exit=2'
+        )
+        path = _write_transcript(tmp_path / 'comingled.jsonl', [record])
+
+        counts = mod.score_signals(path)
+
+        assert counts[SignalClass.TOOL_ERROR] == 1
+        assert counts[SignalClass.DESIGNED_OUTCOME] == 0
+        assert counts.total_signal == 1
+
+    def test_sampler_and_digest_agree_on_the_same_records(self, tmp_path):
+        # The anti-drift pin: one fixture, two independent scanners, same
+        # tool_error. This is the assertion that fails the moment either
+        # definition is changed without the other.
+        records = (
+            [_designed_outcome_record(i) for i in range(3)]
+            + [_genuine_error_record()]
+        )
+        path = _write_transcript(tmp_path / 'parity.jsonl', records)
+
+        sampled = mod.score_signals(path)
+        digested = digest.signal_counts(records)
+
+        assert sampled[SignalClass.TOOL_ERROR] == digested['tool_error'] == 1
+        assert sampled[SignalClass.DESIGNED_OUTCOME] == digested['designed_outcome'] == 3
+
+
+class TestSignalCounts:
+    def test_every_class_absent_from_the_mapping_counts_zero(self):
+        counts = mod.SignalCounts({SignalClass.NOT_FOUND: 2})
+
+        assert dict(counts) == {**dict.fromkeys(SignalClass, 0), SignalClass.NOT_FOUND: 2}
+
+    def test_a_key_that_is_not_a_signal_class_is_rejected(self):
+        with pytest.raises(TypeError, match='tool_error'):
+            mod.SignalCounts(json.loads('{"tool_error": 1}'))
+
+    def test_the_counts_do_not_follow_the_callers_mapping(self):
+        source = {SignalClass.TOOL_ERROR: 1}
+        counts = mod.SignalCounts(source)
+
+        source[SignalClass.TOOL_ERROR] = 9
+
+        assert counts[SignalClass.TOOL_ERROR] == 1
+
+    def test_of_names_classes_by_value(self):
+        assert mod.SignalCounts.of(tool_error=1) == mod.SignalCounts({SignalClass.TOOL_ERROR: 1})
+
+    def test_of_rejects_an_unknown_class_name_naming_the_vocabulary(self):
+        with pytest.raises(ValueError, match='bogus') as raised:
+            mod.SignalCounts.of(bogus=1)
+
+        assert all(signal.value in str(raised.value) for signal in SignalClass)
+
+    def test_of_with_no_names_maps_every_class_to_zero(self):
+        assert dict(mod.SignalCounts.of()) == dict.fromkeys(SignalClass, 0)
 
 
 class TestScoreSignalsClean:
@@ -148,83 +341,431 @@ class TestScoreSignalsClean:
         path = _write_transcript(tmp_path / 'clean.jsonl', [_clean_record(i) for i in range(3)])
         counts = mod.score_signals(path)
         assert counts.total_signal == 0
-        assert counts.tool_error == 0
-        assert counts.not_found == 0
-        assert counts.self_correct == 0
-        assert counts.df_guard == 0
-        assert counts.interrupt == 0
+        assert counts[SignalClass.TOOL_ERROR] == 0
+        assert counts[SignalClass.NOT_FOUND] == 0
+        assert counts[SignalClass.SELF_CORRECT] == 0
+        assert counts[SignalClass.DF_GUARD] == 0
+        assert counts[SignalClass.INTERRUPT] == 0
 
 
 def _user_turn(text: str) -> dict:
     return {'type': 'user', 'isSidechain': False, 'message': {'content': text}}
 
 
-class TestClassifyAgentClass:
-    """classify_agent_class(record, path) maps to the 5 strata. *record* is
-    the session's already-located first non-sidechain, non-meta user turn
-    (or None); *path*'s PARENT DIRECTORY NAME is the encoded dir — its
-    shape is checked first, before any content marker.
-    """
+def _queue_operation_record() -> dict:
+    return {'type': 'queue-operation', 'operation': 'enqueue', 'timestamp': '2026-07-13T09:59:00.000Z'}
 
-    MAIN_DIR_PATH = Path('/root/-home-leo-src-dark-factory/sess.jsonl')
 
-    def test_worktrees_encoded_dir_is_orchestrated_task(self):
-        path = Path('/root/-home-leo-src-dark-factory--worktrees-2573/sess.jsonl')
-        assert mod.classify_agent_class(_user_turn('anything'), path) == 'orchestrated-task'
+def _with_session(record: dict, session_id: str, *, cwd: str = MAIN_CWD) -> dict:
+    return {**record, 'sessionId': session_id, 'cwd': cwd}
 
-    def test_claude_worktrees_variant_is_orchestrated_task(self):
-        path = Path('/root/-home-leo-src-dark-factory--claude-worktrees-fix-foo/sess.jsonl')
-        assert mod.classify_agent_class(_user_turn('anything'), path) == 'orchestrated-task'
 
-    def test_reify_warm_lane_worktree_is_orchestrated_task(self):
-        # Faithful encoding of /home/leo/src/reify/.warm-lanes/worktrees/5187
-        # (encode_cwd maps both '/' and '.' to '-'), embedding the
-        # '-warm-lanes-worktrees-' substring (task 2612).
-        path = Path('/root/-home-leo-src-reify--warm-lanes-worktrees-5187/sess.jsonl')
-        assert mod.classify_agent_class(_user_turn('anything'), path) == 'orchestrated-task'
+class _WeakRecord(dict):
+    """A transcript record a test can hold a weak reference to."""
 
-    def test_reify_build_worktree_is_orchestrated_task(self):
-        # Embeds the '-reify-build-worktrees-' substring (task 2612).
-        path = Path('/root/-home-leo-src-reify-build-worktrees-abc/sess.jsonl')
-        assert mod.classify_agent_class(_user_turn('anything'), path) == 'orchestrated-task'
 
-    def test_reconciliation_run_header_is_recon(self):
-        text = '## Reconciliation Run\nStage 1: sync\n'
-        assert mod.classify_agent_class(_user_turn(text), self.MAIN_DIR_PATH) == 'recon'
+class TestScanTranscript:
+    """scan_transcript is the one pass over a transcript: signal counts, the
+    first user turn, and the session id the ledger is keyed by."""
 
-    def test_stage_2_task_knowledge_sync_header_is_recon(self):
-        # Real marker observed in ~/.claude/projects transcripts (task 2573 premise research).
-        text = '## Stage 2: Task-Knowledge Sync\n## Project: know_live\n'
-        assert mod.classify_agent_class(_user_turn(text), self.MAIN_DIR_PATH) == 'recon'
+    def _signal_transcript(self, tmp_path: Path) -> Path:
+        return _write_transcript(tmp_path / 'sess-abc.jsonl', [
+            _queue_operation_record(),
+            _with_session(_clean_record(0), 'sess-abc'),
+            _with_session(_tool_error_record(), 'sess-abc'),
+            _with_session(_not_found_record(), 'sess-abc'),
+            _with_session(_self_correct_record(), 'sess-abc'),
+        ])
 
-    def test_memory_consolidator_marker_is_recon(self):
-        text = 'Invoking memory_consolidator for this pass.'
-        assert mod.classify_agent_class(_user_turn(text), self.MAIN_DIR_PATH) == 'recon'
+    def test_counts_match_score_signals_and_first_turn_is_located(self, tmp_path):
+        path = self._signal_transcript(tmp_path)
+        scan = mod.scan_transcript(path)
+        assert scan.counts == mod.score_signals(path)
+        assert scan.counts.total_signal > 0
+        assert scan.first_turn_text == 'Please do the thing #0.'
+        assert scan.agent_class is AgentClass.INTERACTIVE
 
-    def test_recon_escalation_watcher_marker_is_watcher(self):
-        # skills/recon-escalation-watcher is a real dark_factory skill.
-        text = '<command-name>recon-escalation-watcher</command-name>'
-        assert mod.classify_agent_class(_user_turn(text), self.MAIN_DIR_PATH) == 'watcher'
+    def test_scan_is_frozen(self, tmp_path):
+        scan = mod.scan_transcript(self._signal_transcript(tmp_path))
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            scan.session_id = 'other'  # type: ignore[misc]
 
-    def test_curator_classifier_marker_is_curator_classifier(self):
-        # Verbatim opening of TRIAGE_SYSTEM_PROMPT
-        # (orchestrator/src/orchestrator/agents/triage.py:131).
-        text = 'You are a review suggestion classifier. You receive a numbered list...'
-        assert mod.classify_agent_class(_user_turn(text), self.MAIN_DIR_PATH) == 'curator-classifier'
+    def test_session_id_skips_a_leading_record_without_one(self, tmp_path):
+        assert mod.scan_transcript(self._signal_transcript(tmp_path)).session_id == 'sess-abc'
 
-    def test_main_dir_freeform_human_turn_is_interactive(self):
-        text = 'Can you help me fix this bug in the parser?'
-        assert mod.classify_agent_class(_user_turn(text), self.MAIN_DIR_PATH) == 'interactive'
+    def test_session_id_is_none_when_no_record_carries_one(self, tmp_path):
+        path = _write_transcript(tmp_path / 's.jsonl', [_clean_record(0), _tool_error_record()])
+        assert mod.scan_transcript(path).session_id is None
 
-    def test_none_record_defaults_to_interactive(self):
-        assert mod.classify_agent_class(None, self.MAIN_DIR_PATH) == 'interactive'
+    def test_session_id_of_an_all_sidechain_subagent_transcript_is_the_parents(self, tmp_path):
+        sidechain = {**_with_session(_clean_record(0), 'parent-sess'), 'isSidechain': True}
+        path = _write_transcript(tmp_path / 'agent-a1b2.jsonl', [sidechain])
+        scan = mod.scan_transcript(path)
+        assert scan.first_turn_text == ''
+        assert scan.session_id == 'parent-sess'
 
-    def test_worktree_shape_wins_over_content_markers(self):
-        # Encoded-dir shape is checked FIRST — even a recon-marker turn in
-        # a worktree dir classifies as orchestrated-task, not recon.
-        path = Path('/root/-home-leo-src-dark-factory--worktrees-2573/sess.jsonl')
-        text = '## Reconciliation Run\n'
-        assert mod.classify_agent_class(_user_turn(text), path) == 'orchestrated-task'
+    @pytest.mark.parametrize('sidechain', [False, True])
+    def test_session_id_agrees_with_the_digest_frontmatter_session(self, tmp_path, sidechain):
+        records = [
+            _queue_operation_record(),
+            {**_with_session(_clean_record(0), 'sess-agree'), 'isSidechain': sidechain},
+            {**_with_session(_tool_error_record(), 'sess-agree'), 'isSidechain': sidechain},
+        ]
+        path = _write_transcript(tmp_path / 'agent-x.jsonl', records)
+        frontmatter = coder.parse_frontmatter(digest.build_digest(path))
+        assert mod.scan_transcript(path).session_id == frontmatter['session']
+
+    def test_no_earlier_record_is_still_held_when_the_next_is_read(self, tmp_path, monkeypatch):
+        records = [
+            _with_session(_clean_record(0), 'sess-stream'),
+            _tool_error_record(),
+            _not_found_record(),
+            _self_correct_record(),
+        ]
+        still_held: list[int] = []
+
+        def streamed(_path):
+            refs: list[weakref.ref] = []
+            for record in records:
+                still_held.append(sum(ref() is not None for ref in refs[:-1]))
+                refs.append(weakref.ref(fresh := _WeakRecord(record)))
+                yield fresh
+                del fresh
+
+        monkeypatch.setattr(mod, 'iter_json_lines', streamed)
+        scan = mod.scan_transcript(tmp_path / 'sess-stream.jsonl')
+
+        assert still_held == [0] * len(records)
+        assert scan.counts == mod.SignalCounts.of(tool_error=1, not_found=1, self_correct=1)
+        assert scan.first_turn_text == 'Please do the thing #0.'
+
+    def test_a_read_failing_midway_degrades_to_an_empty_scan(self, tmp_path):
+        path = _write_transcript(tmp_path / 's.jsonl', [_tool_error_record(), _not_found_record()])
+        with path.open('ab') as f:
+            f.write(b'\xff\xfe not utf-8\n')
+
+        assert mod.scan_transcript(path) == mod.scan_transcript(tmp_path / 'missing.jsonl')
+
+    def test_unreadable_path_degrades_to_an_empty_scan(self, tmp_path):
+        scan = mod.scan_transcript(tmp_path / 'missing.jsonl')
+        assert scan.counts == mod.SignalCounts.of()
+        assert scan.agent_class is AgentClass.UNKNOWN
+        assert scan.first_turn_text == ''
+        assert scan.session_id is None
+
+
+class TestPeekSessionId:
+    """peek_session_id is scan_transcript's session_id, read only up to the
+    first record that carries one."""
+
+    @pytest.mark.parametrize('records', [
+        pytest.param([_queue_operation_record(), _with_session(_clean_record(0), 'sess-a')],
+                     id='leading-record-without-one'),
+        pytest.param([_clean_record(0), _tool_error_record()], id='none-carries-one'),
+        pytest.param([{**_with_session(_clean_record(0), 'parent'), 'isSidechain': True}],
+                     id='all-sidechain'),
+        pytest.param([_with_session(_clean_record(0), ''), _with_session(_clean_record(1), 'sess-b')],
+                     id='empty-id-skipped'),
+    ])
+    def test_agrees_with_the_full_scan(self, tmp_path, records):
+        path = _write_transcript(tmp_path / 's.jsonl', records)
+        assert mod.peek_session_id(path) == mod.scan_transcript(path).session_id
+
+    def test_unreadable_path_is_none(self, tmp_path):
+        assert mod.peek_session_id(tmp_path / 'missing.jsonl') is None
+
+    def test_stops_at_the_first_record_carrying_one(self, tmp_path):
+        """Bytes no full read can decode, placed well past the first decode
+        chunk, fail the scan but never reach the peek."""
+        path = _write_transcript(tmp_path / 's.jsonl', [
+            _with_session(_clean_record(0), 'sess-c'),
+            {'type': 'padding', 'text': 'x' * 65536},
+        ])
+        with path.open('ab') as f:
+            f.write(b'\xff\xfe not utf-8\n')
+        assert mod.scan_transcript(path).session_id is None
+        assert mod.peek_session_id(path) == 'sess-c'
+
+
+class TestDropCoded:
+    """drop_coded keeps, in order, the sessions whose transcript identity
+    (peek_session_id's key) is not in the coded set."""
+
+    @staticmethod
+    def _sessions(tmp_path: Path, *session_ids: str) -> list[inventory.SessionRecord]:
+        return [
+            _session_on_disk(tmp_path, session_id, [_with_session(_clean_record(0), session_id)])
+            for session_id in session_ids
+        ]
+
+    def test_drops_the_coded_session_and_keeps_input_order(self, tmp_path):
+        a, b, c = self._sessions(tmp_path, 'sess-a', 'sess-b', 'sess-c')
+        assert mod.drop_coded([a, b, c], frozenset({'sess-b'})) == [a, c]
+
+    def test_keys_on_the_first_record_carrying_a_session_id(self, tmp_path):
+        late = _session_on_disk(tmp_path, 'late', [
+            _queue_operation_record(), _with_session(_clean_record(0), 'sess-b'),
+        ])
+        assert mod.drop_coded([late], frozenset({'sess-b'})) == []
+
+    def test_keeps_a_session_with_no_readable_id(self, tmp_path):
+        missing = inventory.SessionRecord(
+            path=tmp_path / 'missing.jsonl', encoded_dir=tmp_path.name, cwd=MAIN_CWD,
+            date=dt_date(2026, 7, 13), size_bytes=0,
+        )
+        assert mod.drop_coded([missing], frozenset({'sess-b'})) == [missing]
+
+    def test_an_empty_coded_set_keeps_every_session(self, tmp_path):
+        sessions = self._sessions(tmp_path, 'sess-a', 'sess-b', 'sess-c')
+        assert mod.drop_coded(sessions, frozenset()) == sessions
+
+
+class TestScoreSession:
+    """score_session is the one scan + classify + first-turn-text step every
+    consumer of enumerated sessions shares."""
+
+    def test_scores_classifies_and_carries_the_session_id(self, tmp_path):
+        encoded = tmp_path / '-home-leo-src-dark-factory--worktrees-9'
+        encoded.mkdir()
+        path = _write_transcript(encoded / 'sess-1.jsonl', [
+            _with_session(_clean_record(3), 'sess-1'),
+            _with_session(_not_found_record(), 'sess-1'),
+        ])
+        session = inventory.SessionRecord(
+            path=path, encoded_dir=encoded.name, cwd=MAIN_CWD,
+            date=dt_date(2026, 7, 13), size_bytes=path.stat().st_size,
+        )
+
+        scored = mod.score_session(session)
+
+        scan = mod.scan_transcript(path)
+        assert scored.session is session
+        assert scored.stratum == scan.agent_class
+        assert scored.stratum == 'orchestrated-task'
+        assert scored.counts == scan.counts
+        assert scored.first_turn_text == 'Please do the thing #3.'
+        assert scored.session_id == 'sess-1'
+
+    def test_scored_record_session_id_defaults_to_none(self):
+        assert _scored('s', 'interactive', mod.SignalCounts.of(), '').session_id is None
+
+
+# ---------------------------------------------------------------------------
+# Re-ingested and non-human carriers (task 5693): the sampler's TEXT classes
+# ask digest's one carrier predicate, so a session whose only signal is
+# quoted machine content or harness material is not ranked on it.
+# ---------------------------------------------------------------------------
+
+_TEXT_CLASSES = (
+    SignalClass.SELF_CORRECT, SignalClass.NOT_FOUND, SignalClass.DF_GUARD, SignalClass.INTERRUPT,
+)
+
+_SIGNAL_LITERALS = (
+    "that's wrong",
+    'No such file or directory',
+    'done_gate_missing_files',
+    '[Request interrupted by user]',
+)
+_LITERAL_LINE = ' / '.join(_SIGNAL_LITERALS)
+"""One carrier quoting a hit for every sampler text class."""
+
+_GENUINE_SELF_CORRECTION = "That's wrong: the lease was stale."
+
+
+def _origin_stamped(record: dict, kind: str) -> dict:
+    return {**record, 'origin': {'kind': kind}}
+
+
+def _assistant_texts(*texts: str) -> dict:
+    return {
+        'type': 'assistant',
+        'message': {'content': [{'type': 'text', 'text': text} for text in texts]},
+    }
+
+
+def _tool_result_block(content: str, *, is_error: bool = False) -> dict:
+    return {'type': 'tool_result', 'tool_use_id': 'tu-r', 'is_error': is_error, 'content': content}
+
+
+def _user_blocks(*blocks: dict) -> dict:
+    return {'type': 'user', 'isSidechain': False, 'message': {'content': list(blocks)}}
+
+
+def _trickle_coder_prompt_turn() -> dict:
+    digest_text = '\n'.join(
+        f'- (turn {turn}) {literal}' for turn, literal in enumerate(_SIGNAL_LITERALS)
+    )
+    return _user_turn(
+        coder.build_prompt(digest_text=digest_text, codebook_index='', invariant_slugs=())
+    )
+
+
+def _stamped_tool_result_record() -> dict:
+    return _origin_stamped(
+        _user_blocks(_tool_result_block(
+            'BLOCKED: merge gate refused the branch\ncat: x: No such file or directory'
+        )),
+        'task-notification',
+    )
+
+
+def _text_class_counts(tmp_path: Path, records: list[dict]) -> dict[SignalClass, int]:
+    counts = dict(mod.score_signals(_write_transcript(tmp_path / 's.jsonl', records)))
+    return {name: counts[name] for name in _TEXT_CLASSES}
+
+
+def _session_on_disk(encoded: Path, name: str, records: list[dict]) -> inventory.SessionRecord:
+    path = _write_transcript(encoded / f'{name}.jsonl', records)
+    return inventory.SessionRecord(
+        path=path, encoded_dir=encoded.name, cwd=MAIN_CWD,
+        date=dt_date(2026, 7, 13), size_bytes=path.stat().st_size,
+    )
+
+
+class TestReingestedContentIsNotScored:
+    @pytest.mark.parametrize('records', [
+        pytest.param([_assistant_texts(coder_judgment(_LITERAL_LINE))], id='coder_judgment'),
+        pytest.param([_assistant_texts(json_fenced(coder_judgment(_LITERAL_LINE)))], id='json_fenced_coder_judgment'),
+        pytest.param([_trickle_coder_prompt_turn()], id='trickle_coder_prompt'),
+        pytest.param(
+            [_user_turn(census_verifier_prompt(*_SIGNAL_LITERALS))], id='census_verifier_prompt',
+        ),
+        pytest.param(
+            [_user_turn(census_synthesis_prompt(_LITERAL_LINE))], id='census_synthesis_prompt',
+        ),
+        pytest.param([_user_turn(briefing_text(_LITERAL_LINE))], id='briefing'),
+        pytest.param(
+            [_origin_stamped(_user_turn(_LITERAL_LINE), 'task-notification')],
+            id='non_human_origin_text',
+        ),
+        pytest.param([_stamped_tool_result_record()], id='non_human_origin_tool_result'),
+    ])
+    def test_a_non_dialogue_carrier_scores_no_text_class(self, tmp_path, records):
+        assert _text_class_counts(tmp_path, records) == dict.fromkeys(_TEXT_CLASSES, 0)
+
+    def test_a_trickle_coder_session_is_dropped_as_zero_signal(self, tmp_path):
+        encoded = tmp_path / '-home-leo-src-dark-factory'
+        encoded.mkdir()
+        sessions = [
+            _session_on_disk(encoded, 'coder-run', [
+                _trickle_coder_prompt_turn(), _assistant_texts(coder_judgment(_LITERAL_LINE)),
+            ]),
+            _session_on_disk(encoded, 'real-signal', [_clean_record(0), _not_found_record()]),
+        ]
+        config = _sampling_config()
+
+        scored = [mod.score_session(session) for session in sessions]
+        result = mod.stratified_sample(scored, config)
+
+        assert scored[0].counts.total_signal == 0
+        assert result.zero_signal_dropped == 1
+        assert {r.path.stem for r in result.selected} == {'real-signal'}
+
+    def test_prose_quoting_the_schema_inline_still_self_corrects(self, tmp_path):
+        records = [_assistant_texts(PROSE_QUOTING_THE_SCHEMA)]
+
+        assert _text_class_counts(tmp_path, records)[SignalClass.SELF_CORRECT] == 1
+
+    def test_a_coder_judgment_block_does_not_mask_a_sibling_self_correction(self, tmp_path):
+        records = [_assistant_texts(coder_judgment(_LITERAL_LINE), _GENUINE_SELF_CORRECTION)]
+
+        assert _text_class_counts(tmp_path, records)[SignalClass.SELF_CORRECT] == 1
+
+    def test_a_coder_judgment_tool_result_does_not_mask_a_sibling_not_found(self, tmp_path):
+        records = [_user_blocks(
+            _tool_result_block(coder_judgment(note='the module was not found')),
+            _tool_result_block('cat: x: No such file or directory'),
+        )]
+
+        assert _text_class_counts(tmp_path, records)[SignalClass.NOT_FOUND] == 1
+
+    def test_human_origin_keeps_every_text_class(self, tmp_path):
+        records = [
+            _origin_stamped(_user_turn(_LITERAL_LINE), 'human'),
+            _origin_stamped(
+                _user_blocks(_tool_result_block('cat: x: No such file or directory')), 'human',
+            ),
+            _assistant_texts(_GENUINE_SELF_CORRECTION),
+        ]
+
+        assert _text_class_counts(tmp_path, records) == dict.fromkeys(_TEXT_CLASSES, 1)
+
+    def test_a_structural_error_in_a_non_human_record_still_counts(self, tmp_path):
+        records = [_origin_stamped(
+            _user_blocks(_tool_result_block('DARK_FACTORY_ROOT unset, exit code 2', is_error=True)),
+            'task-notification',
+        )]
+        path = _write_transcript(tmp_path / 's.jsonl', records)
+
+        assert mod.score_signals(path)[SignalClass.TOOL_ERROR] == digest.signal_counts(records)['tool_error'] == 1
+
+
+class TestSamplerReingestedContentParity:
+    """The anti-drift pin for the carrier predicate the sampler shares with
+    the digest, in the shape of TestSamplerDesignedOutcomeParity: one
+    contaminated session, two scanners, the same text-class counts."""
+
+    def test_sampler_and_digest_agree_on_a_contaminated_session(self, tmp_path):
+        records = [
+            _trickle_coder_prompt_turn(),
+            _assistant_texts(coder_judgment(_LITERAL_LINE)),
+            _origin_stamped(_user_turn(_LITERAL_LINE), 'task-notification'),
+            _stamped_tool_result_record(),
+            _assistant_texts(_GENUINE_SELF_CORRECTION),
+            _user_blocks(_tool_result_block('cat: x: No such file or directory')),
+            _user_blocks(_tool_result_block('error: done_gate_missing_files')),
+            _user_turn('[Request interrupted by user for tool use]'),
+        ]
+        path = _write_transcript(tmp_path / 'parity.jsonl', records)
+
+        sampled = dict(mod.score_signals(path))
+        digested = digest.signal_counts(records)
+
+        assert {name: sampled[name] for name in _TEXT_CLASSES} == dict.fromkeys(_TEXT_CLASSES, 1)
+        assert {name: digested[name] for name in _TEXT_CLASSES} == dict.fromkeys(_TEXT_CLASSES, 1)
+
+    def test_a_briefing_split_across_text_blocks_is_judged_as_one_turn(self, tmp_path):
+        briefing = briefing_text(_LITERAL_LINE)
+        split = briefing.index('## Agent Identity')
+        head, tail = briefing[:split], briefing[split:]
+        record = _user_blocks({'type': 'text', 'text': head}, {'type': 'text', 'text': tail})
+        path = _write_transcript(tmp_path / 'split.jsonl', [record])
+
+        sampled = dict(mod.score_signals(path))
+        digested = digest.signal_counts([record])
+
+        assert detectors.is_non_dialogue_carrier(record, head) is False
+        assert {name: sampled[name] for name in _TEXT_CLASSES} == dict.fromkeys(_TEXT_CLASSES, 0)
+        assert {name: digested[name] for name in _TEXT_CLASSES} == dict.fromkeys(_TEXT_CLASSES, 0)
+
+
+def _trickle_coder_instrument_prompt() -> str:
+    return coder.build_prompt(digest_text='- (turn 1) ok', codebook_index='', invariant_slugs=())
+
+
+class TestLegibilityInstrumentStratum:
+    @pytest.mark.parametrize(
+        'build_prompt',
+        [_trickle_coder_instrument_prompt, census_verifier_prompt, census_synthesis_prompt],
+        ids=['trickle_coder', 'census_verifier', 'census_synthesis'],
+    )
+    def test_an_instrument_session_with_signal_is_sampled_in_its_own_stratum(
+        self, tmp_path, build_prompt,
+    ):
+        encoded = tmp_path / '-home-leo-src-dark-factory'
+        encoded.mkdir()
+        sessions = [
+            _session_on_disk(
+                encoded, 'instrument-run', [_user_turn(build_prompt()), _tool_error_record()],
+            ),
+            _session_on_disk(encoded, 'interactive-run', [_clean_record(0), _not_found_record()]),
+        ]
+        config = _sampling_config()
+
+        scored = [mod.score_session(session) for session in sessions]
+        result = mod.stratified_sample(scored, config)
+
+        assert result.per_stratum_counts == {'legibility-instrument': 1, 'interactive': 1}
 
 
 def _scored(session_id, stratum, counts, first_turn_text, size_bytes=1000):
@@ -236,7 +777,7 @@ def _scored(session_id, stratum, counts, first_turn_text, size_bytes=1000):
         size_bytes=size_bytes,
     )
     return mod.ScoredRecord(
-        session=session, stratum=stratum, counts=counts, first_turn_text=first_turn_text
+        session=session, stratum=AgentClass(stratum), counts=counts, first_turn_text=first_turn_text
     )
 
 
@@ -247,22 +788,22 @@ class TestShapeFingerprint:
     same classes night after night even when exact counts drift."""
 
     def test_clones_share_a_fingerprint(self):
-        a = _scored('a', 'recon', mod.SignalCounts(tool_error=1), '## Reconciliation Run\nDate: 2026-07-10\n')
-        b = _scored('b', 'recon', mod.SignalCounts(tool_error=3), '## Reconciliation Run\nDate: 2026-07-12\n')
+        a = _scored('a', 'recon', mod.SignalCounts.of(tool_error=1), '## Reconciliation Run\nDate: 2026-07-10\n')
+        b = _scored('b', 'recon', mod.SignalCounts.of(tool_error=3), '## Reconciliation Run\nDate: 2026-07-12\n')
         assert mod.shape_fingerprint(a) == mod.shape_fingerprint(b)
 
     def test_distinct_content_differs(self):
-        a = _scored('a', 'recon', mod.SignalCounts(tool_error=1), '## Reconciliation Run\nDate: 2026-07-10\n')
+        a = _scored('a', 'recon', mod.SignalCounts.of(tool_error=1), '## Reconciliation Run\nDate: 2026-07-10\n')
         distinct = _scored(
             'distinct', 'recon',
-            mod.SignalCounts(self_correct=1, not_found=1),
+            mod.SignalCounts.of(self_correct=1, not_found=1),
             'A completely different opening about something else entirely.',
         )
         assert mod.shape_fingerprint(a) != mod.shape_fingerprint(distinct)
 
     def test_different_stratum_differs_even_with_same_text_and_shape(self):
-        a = _scored('a', 'recon', mod.SignalCounts(tool_error=1), 'same text')
-        b = _scored('b', 'watcher', mod.SignalCounts(tool_error=1), 'same text')
+        a = _scored('a', 'recon', mod.SignalCounts.of(tool_error=1), 'same text')
+        b = _scored('b', 'watcher', mod.SignalCounts.of(tool_error=1), 'same text')
         assert mod.shape_fingerprint(a) != mod.shape_fingerprint(b)
 
 
@@ -273,20 +814,20 @@ class TestDedupeShapes:
 
     def _build(self):
         clone_low = _scored(
-            'recon-a', 'recon', mod.SignalCounts(tool_error=1),
+            'recon-a', 'recon', mod.SignalCounts.of(tool_error=1),
             '## Reconciliation Run\nDate: 2026-07-10\n',
         )
         clone_mid = _scored(
-            'recon-b', 'recon', mod.SignalCounts(tool_error=2),
+            'recon-b', 'recon', mod.SignalCounts.of(tool_error=2),
             '## Reconciliation Run\nDate: 2026-07-11\n',
         )
         clone_high = _scored(
-            'recon-c', 'recon', mod.SignalCounts(tool_error=3),
+            'recon-c', 'recon', mod.SignalCounts.of(tool_error=3),
             '## Reconciliation Run\nDate: 2026-07-12\n',
         )
         distinct = _scored(
             'recon-distinct', 'recon',
-            mod.SignalCounts(self_correct=1, not_found=1),
+            mod.SignalCounts.of(self_correct=1, not_found=1),
             'A completely different opening about something else entirely.',
         )
         return [clone_low, clone_mid, clone_high, distinct]
@@ -342,16 +883,6 @@ class TestSampleResultAccounting:
 
     _COST = staticmethod(lambda r: r.size_bytes)
 
-    def _config(self, max_bytes):
-        return config_mod.LegibilityConfig(
-            project_id='dark_factory',
-            project_root='/home/leo/src/dark-factory',
-            escalation_port=8103,
-            cwd_prefixes=['/home/leo/src/dark-factory'],
-            budgets=config_mod.Budgets(max_daily_digest_bytes=max_bytes),
-            sampling=config_mod.Sampling(top_fraction=0.12, per_stratum_min=2),
-        )
-
     def _build_records(self):
         """7 records; every stratum's survivors all reach the candidate stage.
 
@@ -365,21 +896,21 @@ class TestSampleResultAccounting:
         """
         return [
             _scored(
-                'recon-clone-a', 'recon', mod.SignalCounts(tool_error=3),
+                'recon-clone-a', 'recon', mod.SignalCounts.of(tool_error=3),
                 '## Reconciliation Run\nDate: 2026-07-10\n', 200_000,
             ),
             _scored(
-                'recon-clone-b', 'recon', mod.SignalCounts(tool_error=2),
+                'recon-clone-b', 'recon', mod.SignalCounts.of(tool_error=2),
                 '## Reconciliation Run\nDate: 2026-07-11\n', 200_000,
             ),
             _scored(
-                'recon-distinct', 'recon', mod.SignalCounts(self_correct=1, not_found=4),
+                'recon-distinct', 'recon', mod.SignalCounts.of(self_correct=1, not_found=4),
                 'A completely different opening about something else entirely.', 200_000,
             ),
-            _scored('quiet-a', 'interactive', mod.SignalCounts(), 'nothing went wrong here', 1_000),
-            _scored('quiet-b', 'interactive', mod.SignalCounts(), 'all green, no surprises', 1_000),
-            _scored('human-a', 'interactive', mod.SignalCounts(tool_error=9), 'human turn one', 1_000),
-            _scored('human-b', 'interactive', mod.SignalCounts(not_found=8), 'human turn two', 1_000),
+            _scored('quiet-a', 'interactive', mod.SignalCounts.of(), 'nothing went wrong here', 1_000),
+            _scored('quiet-b', 'interactive', mod.SignalCounts.of(), 'all green, no surprises', 1_000),
+            _scored('human-a', 'interactive', mod.SignalCounts.of(tool_error=9), 'human turn one', 1_000),
+            _scored('human-b', 'interactive', mod.SignalCounts.of(not_found=8), 'human turn two', 1_000),
         ]
 
     def _build_narrowed_records(self):
@@ -407,7 +938,7 @@ class TestSampleResultAccounting:
         return [
             _scored(
                 f'distinct-{index:02d}', 'interactive',
-                mod.SignalCounts(tool_error=index),
+                mod.SignalCounts.of(tool_error=index),
                 f'{opener} is behaving oddly and I need help working out why.',
                 1_000,
             )
@@ -416,12 +947,12 @@ class TestSampleResultAccounting:
 
     def test_total_records_counts_every_record_handed_to_the_sampler(self):
         records = self._build_records()
-        result = mod.stratified_sample(records, self._config(3_000), cost_fn=self._COST)
+        result = mod.stratified_sample(records, _sampling_config(3_000), cost_fn=self._COST)
         assert result.total_records == len(records) == 7
 
     def test_every_candidate_is_either_selected_or_budget_skipped(self):
         records = self._build_records()
-        result = mod.stratified_sample(records, self._config(3_000), cost_fn=self._COST)
+        result = mod.stratified_sample(records, _sampling_config(3_000), cost_fn=self._COST)
 
         # The squeeze really did bite (otherwise the conservation law below
         # would hold trivially with budget_skipped == 0).
@@ -449,7 +980,7 @@ class TestSampleResultAccounting:
         # thing excluding records here is the stratum sampling cut, so a
         # non-zero budget_skipped would mean the fixture is not isolating
         # what it claims to.
-        result = mod.stratified_sample(records, self._config(300_000), cost_fn=self._COST)
+        result = mod.stratified_sample(records, _sampling_config(300_000), cost_fn=self._COST)
 
         assert result.total_records == 17
         assert result.zero_signal_dropped == 0
@@ -475,7 +1006,7 @@ class TestSampleResultAccounting:
             (self._build_records(), 3_000),             # dedupe + zero-signal + budget
             (self._build_records(), 10),                # total suppression
         ):
-            result = mod.stratified_sample(records, self._config(max_bytes), cost_fn=self._COST)
+            result = mod.stratified_sample(records, _sampling_config(max_bytes), cost_fn=self._COST)
             accounted = (
                 result.zero_signal_dropped
                 + result.dedupe_collapsed
@@ -508,7 +1039,7 @@ class TestSampleResultAccounting:
         for size in range(len(base) + 1):
             for max_bytes in (0, 1, 999, 1_000, 1_001, 2_000, 3_000, 300_000):
                 result = mod.stratified_sample(
-                    base[:size], self._config(max_bytes), cost_fn=self._COST,
+                    base[:size], _sampling_config(max_bytes), cost_fn=self._COST,
                 )
                 looks_like_nothing_to_sample = (
                     not result.selected and result.budget_skipped == 0
@@ -527,7 +1058,7 @@ class TestSampleResultAccounting:
     def test_the_operator_line_reports_the_sampling_cut(self):
         """The counter is worthless if it never reaches the operator."""
         result = mod.stratified_sample(
-            self._build_narrowed_records(), self._config(300_000), cost_fn=self._COST,
+            self._build_narrowed_records(), _sampling_config(300_000), cost_fn=self._COST,
         )
         line = mod.format_sample_summary_line(result, max_bytes=300_000)
         assert 'below_sampling_cut=14' in line
@@ -538,7 +1069,7 @@ class TestSampleResultAccounting:
 
         # Budget squeezed below even the cheap group: real candidates existed
         # and every one was discarded on budget.
-        suppressed = mod.stratified_sample(records, self._config(10), cost_fn=self._COST)
+        suppressed = mod.stratified_sample(records, _sampling_config(10), cost_fn=self._COST)
         assert suppressed.selected == []
         assert suppressed.budget_skipped == 4
         assert (not suppressed.selected and suppressed.budget_skipped > 0) is True
@@ -547,7 +1078,7 @@ class TestSampleResultAccounting:
         # budget phase, so the SAME empty selection must NOT read as
         # suppression.
         quiet = [r for r in records if r.score == 0]
-        quiet_result = mod.stratified_sample(quiet, self._config(300_000), cost_fn=self._COST)
+        quiet_result = mod.stratified_sample(quiet, _sampling_config(300_000), cost_fn=self._COST)
         assert quiet_result.selected == []
         assert quiet_result.budget_skipped == 0
         assert quiet_result.total_records == 2
@@ -595,61 +1126,51 @@ class TestStratifiedSampleBoundary:
 
     def _build_records(self):
         records = [
-            _scored('recon-huge-1', 'recon', mod.SignalCounts(tool_error=500), 'recon run A', 200_000),
-            _scored('recon-huge-2', 'recon', mod.SignalCounts(tool_error=600), 'recon run B', 200_000),
-            _scored('recon-mid-1', 'recon', mod.SignalCounts(tool_error=25), 'recon mid run 1', 5_000),
-            _scored('recon-mid-2', 'recon', mod.SignalCounts(tool_error=27), 'recon mid run 2', 5_000),
-            _scored('recon-mid-3', 'recon', mod.SignalCounts(tool_error=29), 'recon mid run 3', 5_000),
+            _scored('recon-huge-1', 'recon', mod.SignalCounts.of(tool_error=500), 'recon run A', 200_000),
+            _scored('recon-huge-2', 'recon', mod.SignalCounts.of(tool_error=600), 'recon run B', 200_000),
+            _scored('recon-mid-1', 'recon', mod.SignalCounts.of(tool_error=25), 'recon mid run 1', 5_000),
+            _scored('recon-mid-2', 'recon', mod.SignalCounts.of(tool_error=27), 'recon mid run 2', 5_000),
+            _scored('recon-mid-3', 'recon', mod.SignalCounts.of(tool_error=29), 'recon mid run 3', 5_000),
         ]
         for i in range(12):
             records.append(
-                _scored(f'recon-zero-{i}', 'recon', mod.SignalCounts(), f'recon zero {i}', 500)
+                _scored(f'recon-zero-{i}', 'recon', mod.SignalCounts.of(), f'recon zero {i}', 500)
             )
         for i, score in enumerate((5, 6, 7, 8)):
             records.append(
                 _scored(
-                    f'watcher-clone-{i}', 'watcher', mod.SignalCounts(tool_error=score),
+                    f'watcher-clone-{i}', 'watcher', mod.SignalCounts.of(tool_error=score),
                     'watcher polling cycle', 2_000,
                 )
             )
-        records.append(_scored('interactive-1', 'interactive', mod.SignalCounts(tool_error=3), 'human turn A', 800))
-        records.append(_scored('interactive-2', 'interactive', mod.SignalCounts(tool_error=4), 'human turn B', 900))
+        records.append(_scored('interactive-1', 'interactive', mod.SignalCounts.of(tool_error=3), 'human turn A', 800))
+        records.append(_scored('interactive-2', 'interactive', mod.SignalCounts.of(tool_error=4), 'human turn B', 900))
         return records
-
-    def _config(self):
-        return config_mod.LegibilityConfig(
-            project_id='dark_factory',
-            project_root='/home/leo/src/dark-factory',
-            escalation_port=8103,
-            cwd_prefixes=['/home/leo/src/dark-factory'],
-            budgets=config_mod.Budgets(max_daily_digest_bytes=405_000),
-            sampling=config_mod.Sampling(top_fraction=0.12, per_stratum_min=2),
-        )
 
     def _selected_ids(self, result):
         return {r.path.stem for r in result.selected}
 
     def test_zero_signal_dropped(self):
-        result = mod.stratified_sample(self._build_records(), self._config(), cost_fn=self._COST)
+        result = mod.stratified_sample(self._build_records(), _sampling_config(), cost_fn=self._COST)
         assert not any(sid.startswith('recon-zero-') for sid in self._selected_ids(result))
 
     def test_zero_signal_drop_count(self):
-        result = mod.stratified_sample(self._build_records(), self._config(), cost_fn=self._COST)
+        result = mod.stratified_sample(self._build_records(), _sampling_config(), cost_fn=self._COST)
         assert result.zero_signal_dropped == 12
 
     def test_clones_deduped_to_single_highest_scorer(self):
-        result = mod.stratified_sample(self._build_records(), self._config(), cost_fn=self._COST)
+        result = mod.stratified_sample(self._build_records(), _sampling_config(), cost_fn=self._COST)
         watcher_selected = [r for r in result.selected if r.stratum == 'watcher']
         assert len(watcher_selected) == 1
         assert watcher_selected[0].path.stem == 'watcher-clone-3'
 
     def test_no_duplicate_fingerprints_in_selection(self):
-        result = mod.stratified_sample(self._build_records(), self._config(), cost_fn=self._COST)
+        result = mod.stratified_sample(self._build_records(), _sampling_config(), cost_fn=self._COST)
         fingerprints = [mod.shape_fingerprint(r) for r in result.selected]
         assert len(fingerprints) == len(set(fingerprints))
 
     def test_each_nonempty_stratum_retains_per_stratum_min_or_all_survivors(self):
-        result = mod.stratified_sample(self._build_records(), self._config(), cost_fn=self._COST)
+        result = mod.stratified_sample(self._build_records(), _sampling_config(), cost_fn=self._COST)
         per_stratum = {}
         for r in result.selected:
             per_stratum.setdefault(r.stratum, []).append(r)
@@ -658,12 +1179,12 @@ class TestStratifiedSampleBoundary:
         assert len(per_stratum['interactive']) >= 2
 
     def test_total_bytes_within_budget(self):
-        result = mod.stratified_sample(self._build_records(), self._config(), cost_fn=self._COST)
+        result = mod.stratified_sample(self._build_records(), _sampling_config(), cost_fn=self._COST)
         assert sum(r.size_bytes for r in result.selected) <= 405_000
         assert result.bytes_used == sum(r.size_bytes for r in result.selected)
 
     def test_tiny_stratum_survives_despite_huge_high_score_sessions_elsewhere(self):
-        result = mod.stratified_sample(self._build_records(), self._config(), cost_fn=self._COST)
+        result = mod.stratified_sample(self._build_records(), _sampling_config(), cost_fn=self._COST)
         selected_ids = self._selected_ids(result)
         assert 'interactive-1' in selected_ids
         assert 'interactive-2' in selected_ids
@@ -677,16 +1198,16 @@ class TestStratifiedSampleBoundary:
         # Without per-stratum reserve, recon's mid-tier candidate (score 29)
         # would consume the leftover budget ahead of lower-scoring strata;
         # the tight budget here must exclude it.
-        result = mod.stratified_sample(self._build_records(), self._config(), cost_fn=self._COST)
+        result = mod.stratified_sample(self._build_records(), _sampling_config(), cost_fn=self._COST)
         assert 'recon-mid-3' not in self._selected_ids(result)
 
     def test_selected_ordered_by_score_desc(self):
-        result = mod.stratified_sample(self._build_records(), self._config(), cost_fn=self._COST)
+        result = mod.stratified_sample(self._build_records(), _sampling_config(), cost_fn=self._COST)
         scores = [r.score for r in result.selected]
         assert scores == sorted(scores, reverse=True)
 
     def test_per_stratum_counts_accounting(self):
-        result = mod.stratified_sample(self._build_records(), self._config(), cost_fn=self._COST)
+        result = mod.stratified_sample(self._build_records(), _sampling_config(), cost_fn=self._COST)
         assert result.per_stratum_counts == {'recon': 2, 'watcher': 1, 'interactive': 2}
 
 
@@ -706,34 +1227,24 @@ class TestStratifiedSampleReserveExceedsBudget:
 
     _COST = staticmethod(lambda r: r.size_bytes)
 
-    def _config(self, max_bytes):
-        return config_mod.LegibilityConfig(
-            project_id='dark_factory',
-            project_root='/home/leo/src/dark-factory',
-            escalation_port=8103,
-            cwd_prefixes=['/home/leo/src/dark-factory'],
-            budgets=config_mod.Budgets(max_daily_digest_bytes=max_bytes),
-            sampling=config_mod.Sampling(top_fraction=0.12, per_stratum_min=2),
-        )
-
     def _build_records(self):
         return [
             # "recon" floor: expensive (200_000 bytes each -> 400_000 total).
-            _scored('recon-1', 'recon', mod.SignalCounts(tool_error=10), 'recon a', 200_000),
-            _scored('recon-2', 'recon', mod.SignalCounts(tool_error=9), 'recon b', 200_000),
+            _scored('recon-1', 'recon', mod.SignalCounts.of(tool_error=10), 'recon a', 200_000),
+            _scored('recon-2', 'recon', mod.SignalCounts.of(tool_error=9), 'recon b', 200_000),
             # "interactive" floor: cheap (1_000 bytes each -> 2_000 total).
-            _scored('interactive-1', 'interactive', mod.SignalCounts(tool_error=2), 'human a', 1_000),
-            _scored('interactive-2', 'interactive', mod.SignalCounts(tool_error=1), 'human b', 1_000),
+            _scored('interactive-1', 'interactive', mod.SignalCounts.of(tool_error=2), 'human a', 1_000),
+            _scored('interactive-2', 'interactive', mod.SignalCounts.of(tool_error=1), 'human b', 1_000),
         ]
 
     def test_total_never_exceeds_budget_even_when_floors_alone_would(self):
         # Both floors together (402_000) exceed a 3_000-byte budget.
-        result = mod.stratified_sample(self._build_records(), self._config(3_000), cost_fn=self._COST)
+        result = mod.stratified_sample(self._build_records(), _sampling_config(3_000), cost_fn=self._COST)
         assert sum(r.size_bytes for r in result.selected) <= 3_000
         assert result.bytes_used <= 3_000
 
     def test_cheap_stratum_preferred_when_budget_cannot_fit_both(self):
-        result = mod.stratified_sample(self._build_records(), self._config(3_000), cost_fn=self._COST)
+        result = mod.stratified_sample(self._build_records(), _sampling_config(3_000), cost_fn=self._COST)
         selected_ids = {r.path.stem for r in result.selected}
         assert {'interactive-1', 'interactive-2'} <= selected_ids
         assert 'recon-1' not in selected_ids
@@ -764,14 +1275,7 @@ class TestStratifiedSampleRealWorldSizes:
     def _stock_config(self):
         """The shipped budget/sampling numbers, verbatim — the point of these
         tests is that the STOCK configuration works on real session sizes."""
-        return config_mod.LegibilityConfig(
-            project_id='dark_factory',
-            project_root='/home/leo/src/dark-factory',
-            escalation_port=8103,
-            cwd_prefixes=['/home/leo/src/dark-factory'],
-            budgets=config_mod.Budgets(max_daily_digest_bytes=300_000),
-            sampling=config_mod.Sampling(top_fraction=0.12, per_stratum_min=2),
-        )
+        return _sampling_config(300_000)
 
     def _single_stratum(self):
         # Distinct WORD stems, never digits: _normalize_first_turn collapses
@@ -781,19 +1285,19 @@ class TestStratifiedSampleRealWorldSizes:
         return [
             _scored(
                 f'orch-{name}', 'orchestrated-task',
-                mod.SignalCounts(tool_error=score),
+                mod.SignalCounts.of(tool_error=score),
                 f'orchestrated task session {name}',
                 6_000_000,
             )
-            for name, score in zip(names, (40, 35, 30, 25, 20))
+            for name, score in zip(names, (40, 35, 30, 25, 20), strict=True)
         ]
 
     def _two_strata(self):
         records = self._single_stratum()[:4]
-        for name, score in zip(('one', 'two', 'three'), (18, 14, 11)):
+        for name, score in zip(('one', 'two', 'three'), (18, 14, 11), strict=True):
             records.append(
                 _scored(
-                    f'recon-{name}', 'recon', mod.SignalCounts(not_found=score),
+                    f'recon-{name}', 'recon', mod.SignalCounts.of(not_found=score),
                     f'reconciliation run {name}', 4_500_000,
                 )
             )
@@ -849,23 +1353,13 @@ class TestStratifiedSampleCostSeam:
         'interactive-b': 4_000,
     }
 
-    def _config(self, max_bytes=100_000):
-        return config_mod.LegibilityConfig(
-            project_id='dark_factory',
-            project_root='/home/leo/src/dark-factory',
-            escalation_port=8103,
-            cwd_prefixes=['/home/leo/src/dark-factory'],
-            budgets=config_mod.Budgets(max_daily_digest_bytes=max_bytes),
-            sampling=config_mod.Sampling(top_fraction=0.12, per_stratum_min=2),
-        )
-
     def _build_records(self):
         """Four candidates across two strata, each 6MB of raw transcript."""
         return [
-            _scored('recon-a', 'recon', mod.SignalCounts(tool_error=9), 'recon alpha opening', 6_000_000),
-            _scored('recon-b', 'recon', mod.SignalCounts(not_found=8), 'recon beta opening', 6_000_000),
-            _scored('interactive-a', 'interactive', mod.SignalCounts(tool_error=5), 'human turn one', 6_000_000),
-            _scored('interactive-b', 'interactive', mod.SignalCounts(self_correct=4), 'human turn two', 6_000_000),
+            _scored('recon-a', 'recon', mod.SignalCounts.of(tool_error=9), 'recon alpha opening', 6_000_000),
+            _scored('recon-b', 'recon', mod.SignalCounts.of(not_found=8), 'recon beta opening', 6_000_000),
+            _scored('interactive-a', 'interactive', mod.SignalCounts.of(tool_error=5), 'human turn one', 6_000_000),
+            _scored('interactive-b', 'interactive', mod.SignalCounts.of(self_correct=4), 'human turn two', 6_000_000),
         ]
 
     def _build_records_with_noise(self):
@@ -873,17 +1367,17 @@ class TestStratifiedSampleCostSeam:
         that ``dedupe_shapes`` collapses — records that must never be costed."""
         records = self._build_records()
         records.append(
-            _scored('recon-zero', 'recon', mod.SignalCounts(), 'recon zero opening', 6_000_000)
+            _scored('recon-zero', 'recon', mod.SignalCounts.of(), 'recon zero opening', 6_000_000)
         )
         records.append(
             _scored(
-                'recon-clone-1', 'recon', mod.SignalCounts(tool_error=1),
+                'recon-clone-1', 'recon', mod.SignalCounts.of(tool_error=1),
                 'recon clone cycle 2026-07-10', 6_000_000,
             )
         )
         records.append(
             _scored(
-                'recon-clone-2', 'recon', mod.SignalCounts(tool_error=2),
+                'recon-clone-2', 'recon', mod.SignalCounts.of(tool_error=2),
                 'recon clone cycle 2026-07-11', 6_000_000,
             )
         )
@@ -896,7 +1390,7 @@ class TestStratifiedSampleCostSeam:
         # Each record's size_bytes (6MB) alone blows the 100_000 budget, so a
         # non-empty selection is only reachable via the injected cost.
         result = mod.stratified_sample(
-            self._build_records(), self._config(), cost_fn=self._cost,
+            self._build_records(), _sampling_config(100_000), cost_fn=self._cost,
         )
         assert result.selected != []
         assert {r.path.stem for r in result.selected} == set(self._COSTS)
@@ -904,7 +1398,7 @@ class TestStratifiedSampleCostSeam:
 
     def test_bytes_used_sums_the_injected_cost(self):
         result = mod.stratified_sample(
-            self._build_records(), self._config(), cost_fn=self._cost,
+            self._build_records(), _sampling_config(100_000), cost_fn=self._cost,
         )
         assert result.bytes_used == sum(self._cost(r) for r in result.selected)
         assert result.bytes_used == sum(self._COSTS.values())
@@ -916,7 +1410,7 @@ class TestStratifiedSampleCostSeam:
         # By raw size_bytes both floors are identical (12MB), so this
         # ordering can only come from the injected cost.
         result = mod.stratified_sample(
-            self._build_records(), self._config(5_000), cost_fn=self._cost,
+            self._build_records(), _sampling_config(5_000), cost_fn=self._cost,
         )
         assert {r.path.stem for r in result.selected} == {'recon-a', 'recon-b'}
         assert result.bytes_used == 3_000
@@ -932,7 +1426,7 @@ class TestStratifiedSampleCostSeam:
             calls[record.path.stem] = calls.get(record.path.stem, 0) + 1
             return self._cost(record)
 
-        mod.stratified_sample(self._build_records(), self._config(), cost_fn=counting_cost)
+        mod.stratified_sample(self._build_records(), _sampling_config(100_000), cost_fn=counting_cost)
 
         assert calls, 'cost_fn was never invoked'
         assert max(calls.values()) == 1
@@ -947,7 +1441,7 @@ class TestStratifiedSampleCostSeam:
             return self._COSTS.get(record.path.stem, 1_000)
 
         mod.stratified_sample(
-            self._build_records_with_noise(), self._config(), cost_fn=recording_cost,
+            self._build_records_with_noise(), _sampling_config(100_000), cost_fn=recording_cost,
         )
 
         assert 'recon-zero' not in costed
@@ -968,7 +1462,7 @@ class TestDigestByteCostFn:
 
     def _record(self, size_bytes=6_000_000):
         return _scored(
-            'cost-sess', 'orchestrated-task', mod.SignalCounts(tool_error=7),
+            'cost-sess', 'orchestrated-task', mod.SignalCounts.of(tool_error=7),
             'orchestrated task session alpha', size_bytes,
         )
 
@@ -1113,21 +1607,14 @@ class TestDigestByteCostFn:
 
         records = [
             # Higher score -> reserved first, and it eats the whole budget.
-            _scored('ok-1', 'interactive', mod.SignalCounts(tool_error=9),
+            _scored('ok-1', 'interactive', mod.SignalCounts.of(tool_error=9),
                     'healthy session alpha', 900),
             # Lower score -> reaches the budget phase in the leftover fill,
             # where the strict greedy halt is unforgiving of an over-charge.
-            _scored('boom', 'interactive', mod.SignalCounts(tool_error=8),
+            _scored('boom', 'interactive', mod.SignalCounts.of(tool_error=8),
                     'failing session beta', 900),
         ]
-        cfg = config_mod.LegibilityConfig(
-            project_id='dark_factory',
-            project_root='/home/leo/src/dark-factory',
-            escalation_port=8103,
-            cwd_prefixes=['/home/leo/src/dark-factory'],
-            budgets=config_mod.Budgets(max_daily_digest_bytes=40_000),
-            sampling=config_mod.Sampling(top_fraction=1.0, per_stratum_min=1),
-        )
+        cfg = _sampling_config(40_000, top_fraction=1.0, per_stratum_min=1)
 
         result = mod.stratified_sample(
             records, cfg, cost_fn=mod.digest_byte_cost_fn(max_bytes=15360, build=build),
@@ -1158,8 +1645,8 @@ class TestDigestByteCostFn:
             date=dt_date(2026, 7, 13), size_bytes=path.stat().st_size,
         )
         record = mod.ScoredRecord(
-            session=session, stratum='interactive',
-            counts=mod.SignalCounts(tool_error=1), first_turn_text='Please help with the thing',
+            session=session, stratum=AgentClass.INTERACTIVE,
+            counts=mod.SignalCounts.of(tool_error=1), first_turn_text='Please help with the thing',
         )
 
         expected = len(
@@ -1170,7 +1657,7 @@ class TestDigestByteCostFn:
         assert mod.digest_byte_cost_fn(max_bytes=15360)(record) == expected
         assert expected > 0
 
-    def test_max_bytes_defaults_to_the_module_constant(self):
+    def test_max_bytes_defaults_to_the_digest_cap(self):
         calls = []
 
         def fake_build(path, **kwargs):
@@ -1178,31 +1665,14 @@ class TestDigestByteCostFn:
             return 'z'
 
         mod.digest_byte_cost_fn(build=fake_build)(self._record())
-        assert calls == [mod.DEFAULT_DIGEST_MAX_BYTES]
-
-    def test_module_constant_matches_the_renderers_own_default(self):
-        """The whole point of this change is that the COST basis and the
-        RENDER basis are provably the same number. ``digest.py`` is outside
-        task 3268's locked scope, so its ``max_bytes=15360`` literal stays a
-        third independent definition of the §7.2 cap — this pins it equal to
-        ours so a drift fails here instead of silently mis-charging the
-        budget (reviewer_comprehensive, task 3268 amendment pass).
-        """
-        import inspect
-
-        from legibility import digest as digest_mod
-
-        renderer_default = (
-            inspect.signature(digest_mod.build_digest).parameters['max_bytes'].default
-        )
-        assert mod.DEFAULT_DIGEST_MAX_BYTES == renderer_default
+        assert calls == [digest.DEFAULT_MAX_BYTES]
 
 
 class TestRenderManifest:
     def test_emits_one_json_object_per_line(self):
         records = [
-            _scored('sess-a', 'recon', mod.SignalCounts(tool_error=5), 'text', 1000),
-            _scored('sess-b', 'watcher', mod.SignalCounts(tool_error=3), 'text', 2000),
+            _scored('sess-a', 'recon', mod.SignalCounts.of(tool_error=5), 'text', 1000),
+            _scored('sess-b', 'watcher', mod.SignalCounts.of(tool_error=3), 'text', 2000),
         ]
         lines = mod.render_manifest(records).splitlines()
         assert len(lines) == 2
@@ -1290,7 +1760,7 @@ class TestMainCLI:
         ``main`` is the diagnostic an operator reads to decide whether the
         budget is the reason a session was skipped, so its ``bytes used``
         line has to be the same quantity ``nightly`` charges: the real
-        rendered digest bytes at ``DEFAULT_DIGEST_MAX_BYTES``.
+        rendered digest bytes at ``digest.DEFAULT_MAX_BYTES``.
         """
         from legibility import digest as digest_mod
 
@@ -1338,7 +1808,7 @@ class TestMainCLI:
                 digest_mod.build_digest(
                     Path(entry['session']),
                     agent_class_override=entry['stratum'],
-                    max_bytes=mod.DEFAULT_DIGEST_MAX_BYTES,
+                    max_bytes=digest_mod.DEFAULT_MAX_BYTES,
                 ).encode('utf-8')
             )
             for entry in selected
@@ -1348,7 +1818,7 @@ class TestMainCLI:
         # The two WRONG bases really are distinguishable on this fixture, so
         # the assertion above cannot pass by coincidence:
         #   - raw transcript size (the original defect): 768 bytes measured
-        #   - the flat DEFAULT_DIGEST_MAX_BYTES estimate (the step-4
+        #   - the flat digest.DEFAULT_MAX_BYTES estimate (the step-4
         #     fallback, and what main reported before this wiring): 30_720
         # against 744 real digest bytes. The flat-estimate margin is 41x;
         # the raw-size margin on a 2-line fixture is only ~24 bytes (the
@@ -1358,7 +1828,7 @@ class TestMainCLI:
         # saturate the 15KB cap and collapse the flat-estimate margin.
         raw_total = sum(entry['size'] for entry in selected)
         assert reported != raw_total
-        assert reported != len(selected) * mod.DEFAULT_DIGEST_MAX_BYTES
+        assert reported != len(selected) * digest_mod.DEFAULT_MAX_BYTES
 
     def test_main_threads_resolved_archive_roots_into_enumerate(self, tmp_path, monkeypatch):
         # Wiring proof (no operator flip): main() resolves the config's
@@ -1416,8 +1886,8 @@ class TestFormatSampleSummaryLine:
         wrong attribute is caught (an all-zeros fixture would not be)."""
         return mod.SampleResult(
             selected=[
-                _scored('sess-a', 'recon', mod.SignalCounts(tool_error=5), 'text a'),
-                _scored('sess-b', 'interactive', mod.SignalCounts(not_found=3), 'text b'),
+                _scored('sess-a', 'recon', mod.SignalCounts.of(tool_error=5), 'text a'),
+                _scored('sess-b', 'interactive', mod.SignalCounts.of(not_found=3), 'text b'),
             ],
             per_stratum_counts={'recon': 1, 'interactive': 1},
             zero_signal_dropped=3,

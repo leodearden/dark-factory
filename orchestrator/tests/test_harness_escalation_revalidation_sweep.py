@@ -33,6 +33,7 @@ This file covers:
 from __future__ import annotations
 
 import logging
+from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -41,6 +42,7 @@ from escalation.models import Escalation
 
 from orchestrator.config import RELOADABLE_FIELDS, OrchestratorConfig, diff_config
 from orchestrator.harness import EventType, Harness
+from orchestrator.main_tip_sweep_cadence import MainSweepColdControl, SweepSeedMode
 from orchestrator.verify import VerifyResult
 
 # ---------------------------------------------------------------------------
@@ -48,6 +50,7 @@ from orchestrator.verify import VerifyResult
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.usefixtures("code_default_config")
 def test_config_defaults_escalation_revalidation() -> None:
     """OrchestratorConfig exposes escalation_revalidation_enabled (True) —
     the single operator kill-switch for both new auto-closure paths."""
@@ -55,6 +58,7 @@ def test_config_defaults_escalation_revalidation() -> None:
     assert config.escalation_revalidation_enabled is True
 
 
+@pytest.mark.usefixtures("code_default_config")
 def test_config_defaults_escalation_revalidation_allowlist() -> None:
     """OrchestratorConfig exposes escalation_revalidation_allowlist (task 2724),
     a frozenset defaulting to the two categories where a terminal subject task
@@ -98,7 +102,9 @@ def _make_harness() -> Harness:
     """Build a minimal bare Harness for escalation-revalidation-sweep tests."""
     h = Harness.__new__(Harness)
     _init_harness_state_for_test(h)
-    h.config = OrchestratorConfig()
+    # pin: these tests are about the sweep, not the flag's default; the
+    # kill-switch tests flip it back off
+    h.config = OrchestratorConfig(escalation_revalidation_enabled=True)
     h.scheduler = MagicMock()
     h._escalation_queue = MagicMock()
     h._escalation_queue.make_id = MagicMock(return_value='esc-revalidation-1')
@@ -695,45 +701,109 @@ class TestCloseSupersededMainSweepEscalations:
 # ---------------------------------------------------------------------------
 
 
-def _make_main_tip_harness(*, main_sha: str) -> Harness:
-    """Build a minimal bare Harness for main-tip-sweep self-heal wiring tests."""
+def _make_main_tip_harness(
+    *,
+    main_sha: str,
+    config: OrchestratorConfig | None = None,
+    git_ops: MagicMock | None = None,
+    queue: MagicMock | None = None,
+    cold_control: MainSweepColdControl | None = None,
+) -> Harness:
+    """Build a minimal bare Harness for main-tip-sweep self-heal wiring tests.
+
+    A *git_ops* or *queue* passed in replaces the default mock whole, so it
+    must answer every call the exercised path makes (``get_main_sha`` included).
+    """
     h = Harness.__new__(Harness)
     _init_harness_state_for_test(h)
-    h.config = OrchestratorConfig()
-    h.git_ops = MagicMock()
-    h.git_ops.get_main_sha = AsyncMock(return_value=main_sha)
-    h._escalation_queue = MagicMock()
-    h._escalation_queue.make_id = MagicMock(return_value='esc-sweep-1')
-    h._escalation_queue.has_open_l1 = MagicMock(return_value=False)
+    h.config = config if config is not None else OrchestratorConfig()
+    if git_ops is None:
+        git_ops = MagicMock()
+        git_ops.get_main_sha = AsyncMock(return_value=main_sha)
+    h.git_ops = git_ops
+    if queue is None:
+        queue = MagicMock()
+        queue.make_id = MagicMock(return_value='esc-sweep-1')
+        queue.has_open_l1 = MagicMock(return_value=False)
+    h._escalation_queue = queue
     # Distinct from main_sha so the SHA-dedup gate does not short-circuit
     # before verify.run_main_tip_sweep is even called.
     h._last_swept_main_sha = 'stale-' + main_sha[:6]
+    h._run_store = None
+    h._main_sweep_cold_control = cold_control
+    h.event_store = None
     return h
 
 
+_FROZEN_NOW = datetime(2026, 10, 9, tzinfo=UTC)
+
+
+def _cold_control_choosing(mode: SweepSeedMode) -> MainSweepColdControl:
+    """A ledger-less cold control, its clock frozen at ``_FROZEN_NOW``, whose
+    next ``seed_mode()`` is *mode*: a cold verdict recorded at that instant
+    keeps it WARM, no history makes it COLD."""
+    control = MainSweepColdControl(None, 'dark_factory', clock=lambda: _FROZEN_NOW)
+    if mode is SweepSeedMode.WARM:
+        control.record_verdict(SweepSeedMode.COLD, 'a' * 40)
+    return control
+
+
 class TestMainTipSweepSelfHealWiring:
-    """step-9: _run_main_tip_sweep invokes the self-heal ONLY on a real PASS."""
+    """step-9: _run_main_tip_sweep invokes the self-heal ONLY on a real PASS,
+    of either seed mode: a warm (CoW-seeded) pass is accepted close evidence
+    (Leo ruling 2026-10-09, esc-5812-4 option C; task 6574)."""
 
     @pytest.mark.asyncio
-    async def test_pass_invokes_self_heal_with_clean_sha(self) -> None:
+    @pytest.mark.parametrize(
+        'mode', [SweepSeedMode.WARM, SweepSeedMode.COLD], ids=['warm', 'cold'],
+    )
+    async def test_pass_closes_superseded_escalation_in_either_seed_mode(
+        self, mode: SweepSeedMode,
+    ) -> None:
         from orchestrator import verify as verify_module
 
         clean_sha = 'c' * 40
-        h = _make_main_tip_harness(main_sha=clean_sha)
-        h._close_superseded_main_sweep_escalations = AsyncMock()  # type: ignore[method-assign]
+        # The PASS path reads only get_main_sha and is_ancestor from git_ops,
+        # and only get_pending and resolve from the queue.
+        git_ops = MagicMock()
+        git_ops.get_main_sha = AsyncMock(return_value=clean_sha)
+        git_ops.is_ancestor = AsyncMock(return_value=True)
+        esc = _make_esc(
+            level=1, category='infra_issue', agent_role='orchestrator-main-sweep',
+            task_id='main-sweep-deadbeef1234', esc_id='esc-main-sweep-superseded',
+        )
+        queue = MagicMock()
+        queue.get_pending.return_value = [esc]
+        h = _make_main_tip_harness(
+            main_sha=clean_sha,
+            # kwargs pin (task 4481): both fields decide whether the close
+            # runs and which seed mode the control picks
+            config=OrchestratorConfig(
+                escalation_revalidation_enabled=True,
+                main_tip_sweep_cold_interval_secs=86400.0,
+            ),
+            git_ops=git_ops,
+            queue=queue,
+            cold_control=_cold_control_choosing(mode),
+        )
         passing = VerifyResult(
             passed=True, test_output='', lint_output='', type_output='',
             summary='all checks passed',
         )
+        sweep = AsyncMock(return_value=(clean_sha, passing))
 
-        with patch.object(
-            verify_module, 'run_main_tip_sweep',
-            new=AsyncMock(return_value=(clean_sha, passing)),
-        ):
+        with patch.object(verify_module, 'run_main_tip_sweep', new=sweep):
             await h._run_main_tip_sweep()
 
-        h._close_superseded_main_sweep_escalations.assert_awaited_once_with(clean_sha)  # type: ignore[attr-defined]
-        h._escalation_queue.submit.assert_not_called()  # type: ignore[union-attr, attr-defined]
+        assert sweep.call_args.kwargs['seed_mode'] is mode
+        git_ops.is_ancestor.assert_awaited_once_with('deadbeef1234', clean_sha)
+        queue.resolve.assert_called_once()
+        args, kwargs = queue.resolve.call_args
+        assert args[0] == esc.id
+        assert kwargs.get('dismiss') is True
+        assert kwargs.get('resolved_by') == 'harness-main-tip-sweep-selfheal'
+        assert kwargs.get('resolution_class') == 'benign'
+        queue.submit.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_fail_does_not_invoke_self_heal(self) -> None:

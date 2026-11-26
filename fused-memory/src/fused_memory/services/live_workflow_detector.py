@@ -2,7 +2,8 @@
 
 Provides a per-task/branch liveness signal that complements the project-level
 ``is_orchestrator_live_for`` check.  Three OR-ed signals bias toward 'live' so
-recon does not race a working pipeline:
+recon does not race a working pipeline, plus one companion signal
+(``worktree_stale``) that can downgrade signal 1 — see below:
 
 1. **worktree_registered** — ``git worktree list --porcelain`` lists a worktree
    whose branch is ``task/<task_id>``.
@@ -74,6 +75,47 @@ unaffected either way, since it already ORs in ``worktree_registered``/
 The legitimate stranded case (orchestrator down, no worktree, no recent commits)
 has all three signals False, so recon still escalates it.
 
+**Pending deterministic pure gates (task 3751).** A third bare-orchestrator-lock
+false positive affects **pending** deterministic tasks of the PURE-GATE shape —
+``always_escalates`` truthy AND ``before_done`` absent (see
+:func:`is_pure_gate_metadata`).  ``DeterministicRunner`` dispatches such a task
+through section 3 only: file one born-at-L2 escalation (deduped), stamp
+``metadata.gate_escalated_at``, set status ``blocked``.  No script, no systemd,
+no ``git_ops`` — and, like every deterministic task, no worktree/branch ever.
+So while it is pending the bare project-wide lock is never task-specific
+evidence for it.  ``detect_live_workflow`` therefore forces ``orchestrator_live``
+to ``False`` when ``status == 'pending' AND task_kind == 'deterministic' AND
+pure_gate`` (rule 5 of :func:`_orchestrator_signal_ineligible`), with
+``pure_gate`` passed in by the callers that hold the task's metadata.
+
+This is deliberately NOT a wholesale addition of ``'pending'`` to
+``ORCH_LIVE_INELIGIBLE_STATUSES``.  Beyond breaking every dispatch-eligible
+pending task, it would race deterministic tasks that DO carry a
+``before_done``: ``Harness._run_deterministic_slot`` never flips a deterministic
+task to ``'in-progress'`` before invoking the runner, so such a task stays
+``'pending'`` for the whole duration of a blocking deploy/predicate script plus
+systemd inspection and fresh-PID verification — minutes of real, side-effecting
+work with zero git evidence to reveal it.  Restricting the exemption to the
+pure-gate subclass keeps it exactly as wide as the class of tasks that provably
+perform no side effects the bare lock could be evidence of (a short
+escalate-then-block write window does remain even for a pure gate — accepted
+residual risk, documented on :func:`is_pure_gate_metadata`).  Confirmed
+incident: dark_factory task **3845** (a
+pending ``always_escalates`` deterministic gate with no ``before_done``, verified
+by direct ``get_task`` read) stalled 3+ consecutive reconciliation cycles (runs
+0e98f0ac, f112de8), listed in Stage 2's Live-Workflow Signals with ONLY the bare
+``orchestrator`` signal, which permanently blocked its recon disposition; tasks
+3741/3749 were earlier observed instances of the same shape.
+
+**Pending normal tasks awaiting a dependency (task 8330).** The scheduler never
+dispatches a task with an unmet local dependency (``Scheduler._eligible_for_dispatch``
+via ``dependency_verdict.py::deps_verdict``), so for an unclaimed pending task
+awaiting one the bare project lock cannot be evidence of a dispatch a recon
+write could race; rule 6 of :func:`_orchestrator_signal_ineligible` drops it,
+keyed on the caller's :func:`is_unclaimed_awaiting_dependency` verdict.
+Confirmed incident: reify tasks 8155-8165, held live by the bare lock
+alone through recon runs 1171aa98 and 276cb3b7.
+
 **Reaped worktrees and bare branches (task 2767, reify#5245).** A worktree
 entry in ``git worktree list --porcelain`` marked ``prunable`` (its directory
 was removed/reaped, but the registration itself was not yet pruned) does NOT
@@ -93,7 +135,7 @@ orchestrator lock. Both gates are fail-safe TOWARD live: a missing branch, a
 subprocess error, or an unparseable ``rev-list`` count never marks a worktree
 prunable or a branch bare — only positive evidence does.
 
-**In-progress corroboration gate (task 2963).** The three rules above force
+**In-progress corroboration gate (task 2963).** The rules above force
 the *project-wide* ``orchestrator_live`` signal False for statuses/task_kinds
 where the bare lock is not per-task evidence. A separate, orthogonal failure
 mode remains for **in-progress** tasks after a fleet redeploy: the redeploy
@@ -115,6 +157,41 @@ task while never racing a genuinely live pipeline (any one fresh signal keeps
 it live). ``recent_commit`` is deliberately exempt — it is genuine per-task
 work evidence.
 
+**Stale worktree registrations (task 3947).** A registered worktree has no
+expiry of its own: ``worktree_registered`` reflects exactly what
+``git worktree list --porcelain`` reports, and only ``git worktree
+remove``/prune ever clears it — no amount of elapsed time can flip it False.
+A standing policy that waits for ``is_live`` to resolve on a task whose
+worktree lingers (e.g. a ``deferred`` task with no further dispatch coming)
+could therefore wait forever. ``detect_live_workflow`` computes a companion
+signal, ``worktree_stale``, True only when ALL of the following hold as
+POSITIVE evidence: a LIVE (non-prunable) worktree is registered for
+``branch``; there is no ``recent_commit``; the branch carries commits of its
+own beyond ``base_branch`` (``git rev-list --count <base_branch>..<branch> >
+0`` — a bare branch's tip is just the base-branch commit, not task work); and
+the branch's newest commit is older than *max_worktree_age_hours* (default:
+168 h / 7 days — unlike *max_commit_age_hours*, this default is ON, since no
+production caller overrides it, so the signal must default on to ever
+resolve without caller wiring). Passing ``None`` or any non-positive value
+disables the check entirely. When ``worktree_stale`` is True AND
+``orchestrator_live`` is False AND the caller has not supplied
+``corroborated=True``, ``is_live`` is downgraded to False and the result is
+flagged ``indeterminate=True`` — the same semantics as the task-2963 gate
+above, and the two are ORed together (they cannot conflict, since both
+produce identical output). ``orchestrator_live`` is deliberately required
+False so worktree age alone never overrides a live project-wide lock; in
+practice, ``_orchestrator_signal_ineligible``'s rule 1 is what makes the gate
+reachable for ``deferred``/``done``/``cancelled`` tasks holding a lingering
+registration. The ``corroborated is not True`` conjunct extends the 2963
+gate's "any one fresh per-task signal keeps it live" contract to this gate:
+a caller-supplied positive corroboration (fresh claimant heartbeat, scheduler
+holder/park, or post-restart routing decision) is never overridden by branch
+age alone; ``corroborated is None`` (the default) or ``False`` leaves the
+gate's reachability as described above. Like every signal in this module,
+``worktree_stale`` is fail-safe toward live: an absent/unparseable commit
+timestamp, an unknown own-commit count, or a disabled threshold all leave it
+False.
+
 Branch convention: ``task/<task_id>`` (matches the orchestrator's worktree naming).
 Injectable ``now`` for deterministic tests.
 """
@@ -122,14 +199,22 @@ Injectable ``now`` for deterministic tests.
 from __future__ import annotations
 
 import logging
-import subprocess
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from enum import StrEnum
 from pathlib import Path
 
-from shared.task_claimant import has_live_claimant
+from shared.git_async import run_git
+from shared.scheduler_state import SchedulerStateSnapshot
+from shared.task_claimant import (
+    DEFAULT_CLAIMANT_HEARTBEAT_TTL,
+    carries_claimant,
+    has_live_claimant,
+)
+from shared.task_fields import dependency_ids as task_dependency_ids
 from shared.task_metadata import RoutingState
+from shared.task_statuses import ACTIVE, TaskStatus
 
 from fused_memory.services.orchestrator_detector import is_orchestrator_live_for
 
@@ -138,6 +223,15 @@ logger = logging.getLogger(__name__)
 # Default age threshold for the recent-commit signal.  A commit newer than this
 # value (relative to ``now``) counts as evidence of an active workflow.
 DEFAULT_MAX_COMMIT_AGE_HOURS: float = 6.0
+
+# Default age threshold for the worktree-staleness signal (task 3947) — 28x
+# the 6 h recent-commit threshold above.  This is the DEFAULT, not merely a
+# suggested value: no production caller overrides it, so it must default ON
+# for a lingering worktree registration to ever resolve into a stale verdict
+# without caller wiring.  ``None`` or any non-positive value disables the
+# staleness check entirely (fail-safe toward live — see
+# `_worktree_age_exceeded`).
+DEFAULT_MAX_WORKTREE_AGE_HOURS: float = 168.0  # 7 days
 
 # Orchestrator branch naming convention: ``task/<id>``.
 DEFAULT_BRANCH_PREFIX: str = 'task/'
@@ -161,6 +255,14 @@ _GIT_TIMEOUT: int = 10
 # pipeline."  A blocked *deterministic* task is handled separately by
 # `_orchestrator_signal_ineligible` below — see its docstring — rather than by
 # adding 'blocked' here, since that would wrongly suppress normal blocked tasks.
+# The two 'pending' exceptions are likewise handled there, as compound rules:
+# rule 5 (task 3751) exempts a pending deterministic PURE GATE (`always_escalates`
+# truthy, `before_done` absent), whose whole DeterministicRunner run is
+# file-escalation-then-block; rule 6 (task 8330) exempts an unclaimed pending
+# normal task awaiting an unmet dependency. 'pending' itself stays out of this
+# set because a pending task with no unmet dependency is dispatch-eligible, and
+# a pending deterministic task WITH `before_done` can be mid-deploy inside the
+# runner (its status is never flipped to 'in-progress').
 ORCH_LIVE_INELIGIBLE_STATUSES: frozenset[str] = frozenset({'deferred', 'done', 'cancelled'})
 
 # task_kind value used by the orchestrator/scheduler for deterministic tasks
@@ -174,16 +276,11 @@ DETERMINISTIC_TASK_KIND: str = 'deterministic'
 # bare-orchestrator suppression.
 NORMAL_TASK_KIND: str = 'normal'
 
-# Heartbeat staleness threshold for the fresh-claimant corroboration signal
-# (task 2963). A killed workflow keeps its durable ``claimant_run_id`` but stops
-# advancing ``heartbeat_at``, so FRESHNESS (not presence) is the discriminator:
-# `has_live_claimant(task, now, ttl)` reports live only while the heartbeat is
-# newer than ``now - ttl``. Mirrors the orchestrator's validated
-# ``_RECONCILE_HEARTBEAT_TTL`` (harness.py:189) / ``_DEFAULT_HEARTBEAT_TTL``
-# (task_ground_truth.py:146) constant — the coordination point with sibling
-# task 2931's orphan-reaper liveness predicate (reuse this shared TTL, do not
-# invent a parallel heartbeat check).
-DEFAULT_HEARTBEAT_TTL: timedelta = timedelta(minutes=10)
+# Dependency statuses that are positive evidence the scheduler will not dispatch
+# the dependent: a strict subset of what
+# orchestrator/src/orchestrator/dependency_verdict.py::_local_verdict counts
+# unsatisfied. Terminal satisfies there; a same-train merge-deferred dep may too.
+UNMET_DEPENDENCY_STATUSES: frozenset[str] = ACTIVE - {TaskStatus.MERGE_DEFERRED}
 
 
 @dataclass(frozen=True)
@@ -202,18 +299,30 @@ class WorkflowLiveness:
         branch: The branch name inspected (e.g. ``task/4321``).
         last_commit_at: Parsed commit timestamp when ``recent_commit`` was evaluated.
             ``None`` when the branch was absent or the timestamp was unparseable.
-        indeterminate: True when the per-task corroboration gate (task 2963)
-            downgraded ``is_live`` to False for an in-progress task whose only
-            liveness signals were the project-wide ``orchestrator_live`` and/or
-            a lingering ``worktree_registered`` (no ``recent_commit``) and for
-            which the caller supplied ``corroborated=False`` (no fresh per-task
-            signal). This is SEMANTICALLY DISTINCT from an all-signals-false
-            genuine not-live result (``indeterminate`` False): the former had a
-            worktree/orchestrator signal but no corroboration — stranded but was
-            dispatched — while the latter never had any signal. Both carry
-            ``is_live=False`` so ``if is_live`` consumers stop treating the task
-            as owned, permitting the stranded-remediation path. Always False
-            unless the gate fired.
+        indeterminate: True when a downgrade gate forced ``is_live`` to False
+            for a task that DID have a liveness signal, but one judged not
+            trustworthy evidence of an active workflow. Two independent,
+            OR-ed producers set this flag: (1) the per-task corroboration
+            gate (task 2963) — an in-progress task whose only liveness
+            signals were the project-wide ``orchestrator_live`` and/or a
+            lingering ``worktree_registered`` (no ``recent_commit``), for
+            which the caller supplied ``corroborated=False`` (no fresh
+            per-task signal); and (2) the stale-worktree gate (task 3947) —
+            see the module docstring's "Stale worktree registrations" section
+            for its full definition. This is SEMANTICALLY DISTINCT from an
+            all-signals-false genuine not-live result (``indeterminate``
+            False): the former had a worktree/orchestrator signal but no
+            corroboration — stranded but was dispatched — while the latter
+            never had any signal. Both carry ``is_live=False`` so ``if
+            is_live`` consumers stop treating the task as owned, permitting
+            the stranded-remediation path. Always False unless one of the
+            gates fired.
+        worktree_stale: Companion signal (task 3947) that can downgrade a
+            stale-but-still-registered worktree's contribution to
+            ``is_live``. ``worktree_registered`` itself is NEVER rewritten by
+            this signal. See the module docstring's "Stale worktree
+            registrations" section for the full definition and fail-safe
+            contract.
     """
 
     is_live: bool
@@ -223,20 +332,25 @@ class WorkflowLiveness:
     branch: str
     last_commit_at: datetime | None
     indeterminate: bool = False
+    worktree_stale: bool = False
 
 
-def detect_live_workflow(
+async def detect_live_workflow(
     task_id: str,
     project_root: str | Path,
     *,
     now: datetime | None = None,
     max_commit_age_hours: float = DEFAULT_MAX_COMMIT_AGE_HOURS,
+    max_worktree_age_hours: float | None = DEFAULT_MAX_WORKTREE_AGE_HOURS,
     branch_prefix: str = DEFAULT_BRANCH_PREFIX,
     base_branch: str = DEFAULT_BASE_BRANCH,
     status: str | None = None,
     task_kind: str | None = None,
+    pure_gate: bool | None = None,
+    unclaimed_awaiting_dependency: bool | None = None,
     corroborated: bool | None = None,
     _orchestrator_live: bool | None = None,
+    worktree_index: Mapping[str, bool] | None = None,
 ) -> WorkflowLiveness:
     """Detect whether a live workflow is active for *task_id*.
 
@@ -247,6 +361,16 @@ def detect_live_workflow(
             ``datetime.now(UTC)`` when ``None``.  Pass a fixed datetime in
             tests for determinism.
         max_commit_age_hours: Commits newer than this many hours count as recent.
+        max_worktree_age_hours: Age threshold (hours) for the ``worktree_stale``
+            companion signal and its ``is_live`` downgrade gate (task 3947).
+            Defaults to :data:`DEFAULT_MAX_WORKTREE_AGE_HOURS` (168 h / 7
+            days, deliberately ON — see the module docstring's "Stale
+            worktree registrations" section for the full rationale and
+            fail-safe contract). Pass ``None`` or any non-positive value to
+            disable the check entirely. Independent of *max_commit_age_hours*
+            — a commit inside that window sets ``recent_commit`` True, which
+            the stale-gate computation requires False, so the two windows
+            overlapping is harmless.
         branch_prefix: Branch name prefix; combined with *task_id* to form the
             branch name (e.g. ``"task/4321"``).
         base_branch: The branch *branch* is created from.  Used to compute the
@@ -280,6 +404,32 @@ def detect_live_workflow(
             blocked task with genuine per-task evidence (a registered worktree
             or a recent commit), or for any non-blocked status, the
             orchestrator_live computation is unaffected by ``task_kind``.
+            ``task_kind`` also scopes rules 5 and 6 via ``pure_gate`` and
+            ``unclaimed_awaiting_dependency`` (below).
+        pure_gate: Whether the task's metadata has the ``DeterministicRunner``
+            PURE-GATE shape (``always_escalates`` truthy AND ``before_done``
+            absent), as classified by :func:`is_pure_gate_metadata` — passed in
+            by the callers that hold the task's metadata dict. When ``status ==
+            'pending'`` AND ``task_kind == DETERMINISTIC_TASK_KIND`` AND this is
+            truthy, the project-wide ``orchestrator_live`` signal is forced
+            ``False`` (rule 5, task 3751): such a task's entire run is "file one
+            escalation, stamp ``gate_escalated_at``, set blocked", so it
+            performs no side effects the bare project lock could be evidence of
+            (a short escalate-then-block write window does remain — see
+            :func:`is_pure_gate_metadata`). ``None`` (the default) and
+            ``False`` are equivalent and
+            leave the rule inert, so the detector is byte-for-byte unchanged for
+            every caller that does not pass this kwarg — including a pending
+            deterministic task WITH a ``before_done``, which may be mid-deploy
+            inside ``DeterministicRunner`` and must keep the signal. The
+            per-task ``worktree_registered``/``recent_commit`` signals are
+            unaffected, so a pure gate that somehow did acquire a worktree is
+            still ``is_live``.
+        unclaimed_awaiting_dependency: The caller's
+            :func:`is_unclaimed_awaiting_dependency` verdict, which keys rule 6
+            of :func:`_orchestrator_signal_ineligible` (task 8330): the
+            scheduler will not dispatch such a task. ``None`` (the default) and
+            ``False`` leave the rule inert.
         corroborated: Per-task corroboration verdict for the in-progress
             liveness gate (task 2963). Only an explicit ``False`` downgrades:
             when ``status == 'in-progress'`` AND there is no ``recent_commit``
@@ -292,22 +442,45 @@ def detect_live_workflow(
             in-progress workflow whose lingering worktree registration and the
             freshly-restarted project-wide orchestrator lock both still assert
             liveness. ``recent_commit`` is EXEMPT (genuine per-task work
-            evidence). ``corroborated is None`` (the default — used by every
-            existing caller, and by ``recon_write_policy``/integrity-escalation
-            which lack the task dict) and ``corroborated is True`` both leave
-            the gate inert, so the detector's behavior is byte-for-byte
-            unchanged for all existing callers. The verdict is computed by
-            :func:`corroboration_for_task` and passed in only by
-            :func:`_render_live_workflow_section`, which HAS the task dict.
+            evidence). ``corroborated is None`` (the default) and
+            ``corroborated is True`` both leave the gate inert, so the
+            detector's behavior is byte-for-byte unchanged for any caller that
+            does not pass this kwarg. The verdict is computed by
+            :func:`corroboration_for_task` and passed in by the three consumers
+            that hold the task dict, which task 2964 made agree with each other:
+            :func:`~fused_memory.reconciliation.live_workflow_section.render_live_workflow_section`
+            (the render-time Live-Workflow Signals section),
+            ``recon_write_policy.check``'s Gate 2 (via its
+            ``_corroboration_verdict`` helper), and ``reconciliation/harness.py``'s
+            integrity-escalation gate over cited tasks. ``corroborated is
+            True`` also inhibits the stale-worktree downgrade gate (task
+            3947, see the module docstring) — a caller-supplied positive
+            corroboration is never overridden by branch age alone.
         _orchestrator_live: Pre-computed project-level orchestrator-lock result.
             When provided, skips the ``is_orchestrator_live_for(project_root)``
             call — use this to hoist the constant project-level check out of
-            per-task loops (e.g. in :func:`_render_live_workflow_section`).
+            per-task loops (e.g. in
+            ``reconciliation/live_workflow_section.py::render_live_workflow_section``).
             ``None`` (default) triggers a fresh ``is_orchestrator_live_for``
             call.  Tests monkeypatch the module attribute directly; this
             parameter is only for performance hoisting, not test isolation.
             Ignored when :func:`_orchestrator_signal_ineligible` returns True
             for the given *status*/*task_kind* pair.
+        worktree_index: Pre-computed ``{ref: prunable}`` map from
+            :func:`worktree_index_for`.  When provided, skips this call's
+            ``git worktree list --porcelain`` subprocess entirely — use this to
+            hoist the whole-repo worktree list out of a per-task loop (task
+            3778; it was ~20 s of a measured 29 s render).  Like
+            *_orchestrator_live* this parameter is for performance hoisting
+            only, not test isolation — tests monkeypatch the module attributes
+            directly.
+
+            THREE-VALUED, matching :func:`worktree_index_for`'s contract:
+            ``None`` (the default) means "unknown" and triggers this call's own
+            probe, so behaviour is byte-for-byte unchanged for callers that do
+            not pass it; ``{}`` means "known: the repo has no registered
+            worktrees" and suppresses the probe, yielding
+            ``worktree_registered=False``; a populated map is used directly.
 
     Returns:
         A :class:`WorkflowLiveness` dataclass with all signals populated.
@@ -315,11 +488,31 @@ def detect_live_workflow(
     branch = f'{branch_prefix}{task_id}'
     root = str(project_root)
 
-    worktree_present, worktree_prunable = _check_worktree_registered(root, branch)
+    if worktree_index is None:
+        worktree_present, worktree_prunable = await _check_worktree_registered(root, branch)
+    else:
+        worktree_present, worktree_prunable = _registration_from_index(worktree_index, branch)
     worktree_registered = worktree_present and not worktree_prunable
-    last_commit_at, recent_commit = _check_recent_commit(
-        root, branch, now=now, max_commit_age_hours=max_commit_age_hours
+    # Hoisted once so the recent-commit and worktree-staleness age checks
+    # (task 3947) share one instant, rather than risking a skew where the two
+    # age computations straddle a `datetime.now` boundary. `_check_recent_commit`
+    # already performs exactly this None-resolution internally, so passing
+    # `reference` in here is behaviour-preserving.
+    reference = now if now is not None else datetime.now(UTC)
+    last_commit_at, recent_commit = await _check_recent_commit(
+        root, branch, now=reference, max_commit_age_hours=max_commit_age_hours
     )
+    # Single-shot memo for the branch's own-commit count (`git rev-list --count
+    # <base_branch>..<branch>`), shared by the branch_bare computation below
+    # and the worktree_stale confirmation (task 3947) so the subprocess call
+    # never runs more than once per detect_live_workflow invocation.
+    _own_count: list[int | None] = []
+
+    async def _own_commit_count() -> int | None:
+        if not _own_count:
+            _own_count.append(await _branch_own_commit_count(root, base_branch, branch))
+        return _own_count[0]
+
     # branch_bare: branch carries zero commits of its own beyond base_branch
     # (its tip is just the base-branch commit — reify#5245's shape). An
     # unknown count (missing branch, rev-list error) is NOT bare (fail-safe
@@ -338,9 +531,27 @@ def detect_live_workflow(
     if worktree_registered and not recent_commit:
         branch_bare = False
     else:
-        own_commit_count = _branch_own_commit_count(root, base_branch, branch)
+        own_commit_count = await _own_commit_count()
         branch_bare = own_commit_count == 0
     recent_commit = recent_commit and not branch_bare
+
+    # worktree_stale (task 3947): see the module docstring's "Stale worktree
+    # registrations" section for the full rule and rationale. The rev-list
+    # confirmation is a REQUIRED conjunct (not an optimization — a bare
+    # branch's tip is the base-branch commit, not task work), evaluated LAST
+    # via the memoized _own_commit_count() above so the common already-live/
+    # not-yet-stale paths pay no extra subprocess call.
+    worktree_stale = False
+    if (
+        worktree_registered
+        and not recent_commit
+        and _worktree_age_exceeded(last_commit_at, reference, max_worktree_age_hours)
+    ):
+        own = await _own_commit_count()
+        # own is None: unknown count (missing branch, rev-list error/timeout,
+        # unparseable output). own == 0: bare branch. Both fail safe to False
+        # — an unknown or bare count is never positive evidence of staleness.
+        worktree_stale = own is not None and own > 0
     # orchestrator_live is the project-level lock signal (True when the
     # orchestrator process holds an active lock for this project_root, regardless
     # of which task it is currently dispatching).  Pre-computed callers may pass
@@ -350,13 +561,24 @@ def detect_live_workflow(
     # project-wide lock is not evidence of liveness for a task that will never
     # be dispatched (or, for blocked deterministic tasks, never acquires a
     # worktree/branch of its own; or, for blocked normal tasks with no
-    # per-task git evidence, task 2409; or, status-agnostically, for a task
-    # whose branch is provably bare with its worktree reaped, task 2767).  The
-    # FINAL worktree_registered/recent_commit (post-prunable/post-bare, already
-    # computed above) and branch_bare are threaded through so rules 3 and 4 can
-    # evaluate the same evidence the caller sees.
+    # per-task git evidence, task 2409; or, for pending deterministic PURE
+    # GATES whose whole run is file-escalation-then-block, task 3751; or, for
+    # unclaimed pending normal tasks awaiting an unmet dependency, task 8330; or,
+    # status-agnostically, for a task whose branch is provably bare with its
+    # worktree reaped, task 2767).  The FINAL worktree_registered/recent_commit
+    # (post-prunable/post-bare, already computed above) and branch_bare are
+    # threaded through so rules 3, 4 and 6 can evaluate the same evidence the
+    # caller sees.  pure_gate and unclaimed_awaiting_dependency are normalized to
+    # bools here so the default None (every caller that does not classify the
+    # task) leaves rules 5 and 6 inert.
     if _orchestrator_signal_ineligible(
-        status, task_kind, worktree_registered, recent_commit, branch_bare
+        status,
+        task_kind,
+        worktree_registered,
+        recent_commit,
+        branch_bare,
+        bool(pure_gate),
+        bool(unclaimed_awaiting_dependency),
     ):
         orchestrator_live = False
     else:
@@ -384,7 +606,30 @@ def detect_live_workflow(
         and (worktree_registered or orchestrator_live)
         and corroborated is False
     )
-    if gate_fires:
+
+    # Stale-worktree downgrade gate (task 3947) — see the module docstring's
+    # "Stale worktree registrations" section for the full rationale. Mirrors
+    # the 2963 gate's (is_live=False, indeterminate=True) semantics, so ORing
+    # them cannot conflict. `corroborated is not True` extends the 2963
+    # gate's "any one fresh per-task signal keeps it live" contract here too,
+    # so a caller-supplied positive corroboration is never overridden by
+    # branch age alone.
+    stale_gate_fires = worktree_stale and not orchestrator_live and corroborated is not True
+
+    if stale_gate_fires:
+        # Loud, not silent: this is the one path in the module that flips a
+        # signal AGAINST liveness (every other fail-safe branch here logs at
+        # debug). last_commit_at is guaranteed non-None whenever worktree_stale
+        # is True (see _worktree_age_exceeded), but the age is recomputed via
+        # `is not None` rather than assumed, for the type checker's benefit.
+        age = (reference - last_commit_at) if last_commit_at is not None else None
+        logger.info(
+            'live_workflow_detector: stale-worktree downgrade for branch=%s '
+            'last_commit_at=%s age=%s threshold_hours=%s',
+            branch, last_commit_at, age, max_worktree_age_hours,
+        )
+
+    if gate_fires or stale_gate_fires:
         is_live = False
         indeterminate = True
     else:
@@ -399,10 +644,11 @@ def detect_live_workflow(
         branch=branch,
         last_commit_at=last_commit_at,
         indeterminate=indeterminate,
+        worktree_stale=worktree_stale,
     )
 
 
-def is_workflow_live_for_task(
+async def is_workflow_live_for_task(
     task_id: str,
     project_root: str | Path,
     **kwargs,
@@ -412,7 +658,8 @@ def is_workflow_live_for_task(
     Accepts the same keyword arguments as :func:`detect_live_workflow`,
     including the ``_orchestrator_live`` performance hint.
     """
-    return detect_live_workflow(task_id, project_root, **kwargs).is_live
+    liveness = await detect_live_workflow(task_id, project_root, **kwargs)
+    return liveness.is_live
 
 
 # ---------------------------------------------------------------------------
@@ -429,8 +676,9 @@ def is_workflow_live_for_task(
 #
 # Three corroborating signals, ANY sufficient:
 #   1. Fresh claimant/heartbeat — ``has_live_claimant(task, now, ttl)``.
-#   2. Scheduler holder/park — task_id in ``parks`` keys OR ``current_holders``
-#      values (both reset by an orchestrator restart).
+#   2. Scheduler holder/park — task_id in ``parks`` keys OR
+#      ``SchedulerStateSnapshot.holder_task_ids()`` (both reset by an
+#      orchestrator restart).
 #   3. routing.latest.decided_at newer than the orchestrator's start time (a
 #      dispatch predating the last restart cannot have a live workflow).
 
@@ -439,7 +687,7 @@ def has_live_workflow_corroboration(
     task_id: str | int,
     *,
     claimant_live: bool,
-    scheduler_state: Mapping | None,
+    scheduler_state: SchedulerStateSnapshot | None,
     routing_latest_decided_at: str | None,
     orchestrator_started_at: datetime | None,
 ) -> bool:
@@ -463,8 +711,8 @@ def corroboration_for_task(
     task_id: str | int,
     *,
     now: datetime,
-    heartbeat_ttl: timedelta = DEFAULT_HEARTBEAT_TTL,
-    scheduler_state: Mapping | None = None,
+    heartbeat_ttl: timedelta = DEFAULT_CLAIMANT_HEARTBEAT_TTL,
+    scheduler_state: SchedulerStateSnapshot | None = None,
     orchestrator_started_at: datetime | None = None,
 ) -> bool:
     """Assemble the three corroboration signals from a *task* dict.
@@ -479,7 +727,9 @@ def corroboration_for_task(
 
     then delegates to :func:`has_live_workflow_corroboration`. The *scheduler_state*
     and *orchestrator_started_at* inputs are hoisted once per render by the
-    caller (see :func:`_render_live_workflow_section`) and threaded through.
+    caller (see
+    ``reconciliation/live_workflow_section.py::render_live_workflow_section``)
+    and threaded through.
 
     Returns True when any signal corroborates a live workflow for *task_id*.
     """
@@ -495,32 +745,142 @@ def corroboration_for_task(
     )
 
 
+class ClaimantLabel(StrEnum):
+    LIVE = 'live'
+    STALE = 'stale'
+    NONE = 'none'
+    UNKNOWN = 'unknown'
+
+
+class TaskLiveness(StrEnum):
+    """UNKNOWN means a probe or its inputs failed, and is never collapsed into NOT_LIVE."""
+
+    LIVE = 'live'
+    NOT_LIVE = 'not_live'
+    UNKNOWN = 'unknown'
+
+
+def claimant_label(
+    task: object,
+    *,
+    now: datetime,
+    heartbeat_ttl: timedelta = DEFAULT_CLAIMANT_HEARTBEAT_TTL,
+) -> ClaimantLabel:
+    """Label *task*'s claimant for display; total, and it changes no ``is_live`` verdict.
+
+    STALE (a claimant whose heartbeat is old, missing or unparseable) is the
+    killed-but-lingering shape the task-2963 corroboration gate exists for.
+    UNKNOWN (an unreadable task) is never collapsed into NONE, so absence of
+    evidence never renders as evidence of absence.
+    """
+    if not isinstance(task, Mapping):
+        return ClaimantLabel.UNKNOWN
+    if not carries_claimant(task):
+        return ClaimantLabel.NONE
+    claimant = task.get('claimant_run_id')
+    try:
+        is_live = has_live_claimant(task, now, heartbeat_ttl)
+    except Exception:
+        logger.warning(
+            'live_workflow_detector.claimant_label: claimant liveness unreadable for %r',
+            claimant, exc_info=True,
+        )
+        return ClaimantLabel.UNKNOWN
+    return ClaimantLabel.LIVE if is_live else ClaimantLabel.STALE
+
+
+def is_pure_gate_metadata(metadata: object) -> bool:
+    """Return True when *metadata* has the ``DeterministicRunner`` PURE-GATE shape.
+
+    The pure-gate shape is ``always_escalates`` truthy AND ``before_done``
+    absent/falsy — the same two metadata fields ``DeterministicRunner`` itself
+    branches on (orchestrator/src/orchestrator/deterministic_runner.py section
+    3), and the same pair ``shared.task_metadata.TaskMetadata.
+    _deterministic_invariants`` validates. Such a task's ENTIRE execution is
+    "file one born-at-L2 escalation (deduped), stamp ``metadata.
+    gate_escalated_at``, set status ``blocked``": no script, no systemd, no
+    ``git_ops`` (the runner is constructed without ``git_ops`` for this path,
+    precisely to prove it). It therefore performs no git/worktree/script side
+    effects at all, so the bare project-wide lock carries no per-task evidence
+    for it — which is what makes it safe to drop that lock while the task is
+    still ``pending`` (see rule 5 of :func:`_orchestrator_signal_ineligible`,
+    task 3751).
+
+    That is a claim about EVIDENCE, not a claim that the task is never
+    mid-execution. A pending pure gate IS dispatch-eligible, and
+    ``Harness._run_deterministic_slot`` re-reads its status only once, at
+    dispatch (task 2983's double-dispatch guard); the task stays ``'pending'``
+    for the whole runner call. A short write window therefore remains between
+    the runner's escalation filing and its trailing
+    ``set_task_status(task_id, 'blocked')``, and that trailing write does NOT
+    re-check status first — so a recon-stage terminal write landing inside the
+    window would be clobbered (the task resurrected out of ``cancelled`` into
+    ``blocked``, with an L2 gate escalation standing for a task recon just
+    disposed of). Accepted residual risk: the window spans three writes with no
+    blocking work between them, and rule 2 (task 2067) already accepts a
+    comparable one for blocked deterministic tasks. There is no backstop guard
+    in ``DeterministicRunner`` today; hardening that trailing write is filed as
+    a follow-up (ticket ``tkt_0RS7FXG7C9W0RSTP9FBWK61V5Y``, from task 3751).
+
+    A truthy ``before_done`` deliberately DISQUALIFIES the shape: that path runs
+    a blocking deploy/predicate script plus systemd inspection and fresh-PID
+    verification — minutes of real, side-effecting work — while the task's
+    status is still ``'pending'``, because ``Harness._run_deterministic_slot``
+    never flips a deterministic task to ``'in-progress'`` before invoking the
+    runner. Such a task has no git evidence to reveal that it is running, so the
+    orchestrator lock is the only signal protecting it from a recon race.
+
+    Fail-safe toward live: only POSITIVE evidence of the shape returns True. Any
+    non-``Mapping`` input (``None``, a string, an int, a list) returns False, so
+    an absent, malformed, or unparseable metadata blob leaves the task live
+    rather than suppressing its signal. Uses truthiness rather than ``is True``
+    because task metadata round-trips through JSON.
+    """
+    if not isinstance(metadata, Mapping):
+        return False
+    return bool(metadata.get('always_escalates')) and not metadata.get('before_done')
+
+
+def is_unclaimed_awaiting_dependency(task: object, dependency_statuses: object) -> bool:
+    """Return True when *task* is unclaimed and awaits at least one unmet local dependency.
+
+    Unclaimed means no claimant (null or blank ``claimant_run_id``) and no
+    ``heartbeat_at``. Unmet means a dependency id whose status in
+    *dependency_statuses* is in :data:`UNMET_DEPENDENCY_STATUSES`. Feeds rule 6
+    of :func:`_orchestrator_signal_ineligible` (task 8330).
+
+    Fail-safe toward live: only positive evidence returns True. A non-Mapping
+    input, a task with no dependencies, or a dependency that is missing from the
+    map, reads ``'unknown'`` or is merge-deferred all return False.
+    """
+    if not isinstance(task, Mapping) or not isinstance(dependency_statuses, Mapping):
+        return False
+    if carries_claimant(task) or task.get('heartbeat_at') is not None:
+        return False
+    return any(
+        dependency_statuses.get(dep_id) in UNMET_DEPENDENCY_STATUSES
+        for dep_id in task_dependency_ids(dict(task))
+    )
+
+
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
 
 
 def _task_in_scheduler_holders_or_parks(
-    task_id: str | int, scheduler_state: Mapping | None
+    task_id: str | int, scheduler_state: SchedulerStateSnapshot | None
 ) -> bool:
-    """Return True when *task_id* is a scheduler park key or a current-holder value.
+    """Return True when *task_id* is a scheduler park owner or a lock holder.
 
-    ``scheduler_state`` is the ``read_scheduler_state`` snapshot: ``parks`` is
-    keyed by task_id, ``current_holders`` is ``{module: task_id}`` (so the task
-    appears as a VALUE there). Both are reset by an orchestrator restart, so a
-    stranded post-redeploy task is absent from both. Coerces to ``str`` for the
-    comparison since the on-disk JSON stores task_ids as strings. Tolerates a
-    ``None`` state or missing/ non-dict ``parks``/``current_holders`` keys
-    (returns False, never raises).
+    A lock holder per ``shared/src/shared/scheduler_state.py::SchedulerStateSnapshot.holder_task_ids``.
+    Both are reset by an orchestrator restart, so a stranded post-redeploy task
+    is absent from both. Snapshot task ids are strings.
     """
-    if not isinstance(scheduler_state, Mapping):
+    if scheduler_state is None:
         return False
     tid = str(task_id)
-    parks = scheduler_state.get('parks')
-    if isinstance(parks, Mapping) and tid in {str(k) for k in parks}:
-        return True
-    holders = scheduler_state.get('current_holders')
-    return isinstance(holders, Mapping) and tid in {str(v) for v in holders.values()}
+    return tid in scheduler_state.parks or tid in scheduler_state.holder_task_ids()
 
 
 def _routing_decided_after_restart(
@@ -549,12 +909,15 @@ def _orchestrator_signal_ineligible(
     worktree_registered: bool = False,
     recent_commit: bool = False,
     branch_bare: bool = False,
+    pure_gate: bool = False,
+    unclaimed_awaiting_dependency: bool = False,
 ) -> bool:
     """Return True when the project-wide ``orchestrator_live`` signal must be
     forced False for this *status*/*task_kind*/*worktree_registered*/
-    *recent_commit*/*branch_bare* combination.
+    *recent_commit*/*branch_bare*/*pure_gate*/*unclaimed_awaiting_dependency*
+    combination.
 
-    Four independent rules are centralized here:
+    Six independent rules are centralized here:
 
     1. ``status`` is a member of :data:`ORCH_LIVE_INELIGIBLE_STATUSES`
        (``deferred``, ``done``, ``cancelled``) — statuses that are never
@@ -585,15 +948,40 @@ def _orchestrator_signal_ineligible(
        **status/task_kind-agnostic** — unlike rules 1-3, this rule is
        evaluated regardless of ``status``/``task_kind`` (including for
        ``pending``/``in-progress``/``review``/``merge-deferred``, and
-       independent of rules 2/3's blocked-only scoping), because
-       ``recon_write_policy`` Gate 2 calls the detector without ``task_kind``
-       and with whatever status the task currently holds — a status-gated
-       rule would not fire there. Not a race risk: an absent branch yields an
+       independent of rules 2/3's blocked-only scoping), because its evidence
+       (a bare branch and a reaped worktree) is per-task proof whatever the
+       task's status or kind. Not a race risk: an absent branch yields an
        unknown (not ``0``) commit count (see
        :func:`_branch_own_commit_count`), so a not-yet-dispatched task is
        unaffected; a just-started dispatch keeps a LIVE (non-prunable)
        worktree, so ``worktree_registered`` is True and this rule stays
        inert.
+    5. ``status == 'pending' and task_kind == DETERMINISTIC_TASK_KIND and
+       pure_gate`` — a PENDING deterministic task of the PURE-GATE shape
+       (``always_escalates`` truthy AND ``before_done`` absent, classified by
+       :func:`is_pure_gate_metadata`), whose entire ``DeterministicRunner`` run
+       is "file one born-at-L2 escalation, stamp ``gate_escalated_at``, set
+       status blocked" — no script, no systemd, no ``git_ops``, and (like every
+       deterministic task) no worktree/branch — so it performs no side effects
+       the bare project lock could be evidence of (task 3751; confirmed
+       incident: task 3845 stalled 3+ recon cycles showing only the bare
+       ``orchestrator`` signal). A short escalate-then-block write window does
+       remain, and the runner's trailing ``blocked`` write does not re-check
+       status — accepted residual risk, documented in full on
+       :func:`is_pure_gate_metadata`. Unconditional on the git signals, like
+       rule 2. ``pure_gate`` defaults False, so this rule is inert for every
+       caller that does not classify the task's metadata. It is evaluated
+       before rule 4 in the body below purely for readability — the rules form
+       a disjunction of independent early returns, so their order is immaterial.
+    6. ``status == 'pending' and task_kind in (None, NORMAL_TASK_KIND) and not
+       worktree_registered and not recent_commit and
+       unclaimed_awaiting_dependency`` — an unclaimed pending normal task with a
+       positively unmet local dependency (classified by
+       :func:`is_unclaimed_awaiting_dependency`), which the scheduler refuses to
+       dispatch, so the bare project lock is not evidence of a dispatch a recon
+       write could race (task 8330). Guarded on the git signals like rule 3.
+       ``unclaimed_awaiting_dependency`` defaults False, so the rule is inert for
+       every caller that does not classify the task.
 
     ``'blocked'`` is deliberately NOT added to ``ORCH_LIVE_INELIGIBLE_STATUSES``
     wholesale: a normal blocked task (``task_kind`` absent or not
@@ -603,6 +991,13 @@ def _orchestrator_signal_ineligible(
     (status AND task_kind [AND NOT git-evidence]) conditions for rules 2 and 3,
     rather than an unconditional status addition. Rule 4 is the sole exception
     to the "scoped by status" pattern, by design (see above).
+
+    ``'pending'`` is likewise NOT added to ``ORCH_LIVE_INELIGIBLE_STATUSES``:
+    a pending task with no unmet dependency is dispatch-eligible, and a pending
+    *deterministic* task carrying a ``before_done`` may be mid-deploy inside
+    ``DeterministicRunner`` (``Harness._run_deterministic_slot`` never flips it
+    to ``'in-progress'``) with no git evidence to reveal it. Rules 5 and 6 are
+    the two compound pending exemptions.
     """
     if status is not None and status in ORCH_LIVE_INELIGIBLE_STATUSES:
         return True
@@ -615,59 +1010,195 @@ def _orchestrator_signal_ineligible(
             and not recent_commit
         ):
             return True
+    if status == 'pending' and task_kind == DETERMINISTIC_TASK_KIND and pure_gate:
+        return True
+    if (
+        status == 'pending'
+        and task_kind in (None, NORMAL_TASK_KIND)
+        and not worktree_registered
+        and not recent_commit
+        and unclaimed_awaiting_dependency
+    ):
+        return True
     return branch_bare and not worktree_registered and not recent_commit
 
 
-def _check_worktree_registered(project_root: str, branch: str) -> tuple[bool, bool]:
-    """Return ``(registered, prunable)`` for the git worktree tracking *branch*.
+def parse_worktree_index(stdout: str) -> dict[str, bool]:
+    """Parse ``git worktree list --porcelain`` output into ``{ref: prunable}``.
 
-    Parses ``git -C <root> worktree list --porcelain`` output into
-    blank-line-delimited stanzas (one per registered worktree). ``registered``
-    is True iff some stanza contains a line equal to ``branch refs/heads/<branch>``;
-    ``prunable`` is True iff that SAME stanza also contains a line starting with
-    ``prunable`` — git's marker for a worktree whose directory has been removed
-    or reaped, but whose registration has not yet been pruned (reify#5245's
-    shape: a stale worktree entry survives after the directory itself is gone).
+    THE SINGLE HOME OF THE PORCELAIN GRAMMAR. Both the per-task probe
+    (:func:`_check_worktree_registered`) and the hoisted whole-repo index
+    (:func:`worktree_index_for`) are expressed on top of this function, so the
+    stanza/prunable semantics cannot drift between them.
 
-    Any subprocess error or unexpected output silently returns ``(False, False)``
-    (fail-safe).
+    The output is blank-line-delimited stanzas, one per registered worktree.
+    A stanza contributes an entry keyed on its ``branch <ref>`` line's ref
+    (e.g. ``refs/heads/task/4321``); the value is True iff that SAME stanza
+    also contains a line starting with ``prunable`` — git's marker for a
+    worktree whose directory has been removed or reaped but whose registration
+    has not yet been pruned (reify#5245's shape: a stale worktree entry
+    survives after the directory itself is gone). Detached-HEAD stanzas carry
+    no ``branch`` line and so contribute nothing.
+
+    Malformed, empty or blank-only input yields ``{}`` and never raises — this
+    is a pure text parse with no error channel of its own; I/O failures are
+    the caller's to classify (see :func:`worktree_index_for`, which is careful
+    to return ``None`` rather than ``{}`` for them).
 
     Note: git only started emitting the ``prunable`` porcelain annotation in
     git 2.36 (2022). On an older git binary, a reaped worktree's directory can
-    be gone yet no ``prunable`` line is ever produced, so ``prunable`` silently
+    be gone yet no ``prunable`` line is ever produced, so the value silently
     stays False and a reaped worktree keeps counting as registered — the same
     silent-degradation shape reify#5245 hardened against, just one layer down
     in the toolchain. If a stale/reaped-worktree false positive resists this
     fix, check ``git --version`` on the host running this detector first.
     """
+    index: dict[str, bool] = {}
+    for stanza in stdout.split('\n\n'):
+        lines = [line.strip() for line in stanza.splitlines()]
+        ref = next(
+            (line[len('branch '):] for line in lines if line.startswith('branch ')),
+            None,
+        )
+        if not ref:
+            continue
+        index[ref] = any(line.startswith('prunable') for line in lines)
+    return index
+
+
+async def worktree_index_for(project_root: str) -> dict[str, bool] | None:
+    """Run ``git worktree list --porcelain`` ONCE and return the parsed index.
+
+    This is the hoisting entry point for task 3778: the worktree list is
+    invariant across every task in a reconciliation render, but was being
+    re-run inside :func:`_check_worktree_registered` on every
+    :func:`detect_live_workflow` call. Measured on the dark_factory repo at
+    ~513 worktrees, that is ~40 ms x ~500 tasks ≈ 20 s of an observed 29 s
+    render — the dominant term of the event-loop stall this task fixes.
+
+    THREE-VALUED CONTRACT — the return type is load-bearing:
+
+    - ``None``  → *unknown*. The probe failed (I/O error, timeout, non-zero
+      rc). Callers must fall back to the per-task probe. Returning ``{}`` here
+      instead would report every task as ``worktree_registered=False`` from a
+      hoisted ERROR, turning a transient git glitch into a project-wide
+      "nothing is live" verdict — exactly the false negative the detector's
+      exemption rules exist to prevent.
+    - ``{}``    → *known empty*. The probe succeeded and the repo genuinely has
+      no registered worktrees. No per-task probe is needed. Collapsing this
+      into ``None`` would waste the entire hoist on the commonest cheap case.
+    - ``{...}`` → *known*. Use it directly.
+
+    EVERY ``None`` IS LOGGED AT WARNING, here rather than at the callers. All
+    three failure legs — a spawn ``OSError``, a non-zero rc, and a timeout
+    (which ``run_git`` RETURNS as ``timed_out=True`` with a non-zero rc rather
+    than raising) — converge on this one function, and it is the only place
+    that knows it is about to hand back the "unknown" sentinel. A caller's
+    ``except Exception`` can only see an UNEXPECTED exception, so leaving these
+    legs at DEBUG made the designed failures the silent ones: an unknown index
+    costs every probed task its own re-probe, up to
+    ``MAX_ACTIVE_TASKS_RENDERED`` of them at ``_GIT_TIMEOUT`` each, which is
+    exactly the invisible degradation task 3778 exists to end.
+
+    The REPETITION is diagnostic, not noise: N+1 of these lines in one render
+    means the hoist failed and all N per-task fallbacks re-paid the cost, which
+    is the shape an operator needs to see. :func:`worktree_index_kwargs` is the
+    wrapper both fan-out call sites use.
+    """
     try:
-        result = subprocess.run(
+        result = await run_git(
             ['git', '-C', project_root, 'worktree', 'list', '--porcelain'],
-            capture_output=True,
-            text=True,
             timeout=_GIT_TIMEOUT,
         )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        logger.debug('live_workflow_detector: worktree list failed: %s', exc)
-        return False, False
+    except OSError as exc:
+        logger.warning(
+            'live_workflow_detector.worktree_index_unavailable: spawn failed for %s '
+            '(%s) — every probed task falls back to its own worktree list',
+            project_root, exc,
+        )
+        return None
 
     if result.returncode != 0:
-        logger.debug(
-            'live_workflow_detector: worktree list returned %d: %s',
-            result.returncode, result.stderr.strip(),
+        logger.warning(
+            'live_workflow_detector.worktree_index_unavailable: worktree list %s for '
+            '%s (rc=%d): %s — every probed task falls back to its own worktree list',
+            'TIMED OUT' if result.timed_out else 'returned non-zero',
+            project_root, result.returncode, result.stderr.strip(),
         )
+        return None
+
+    return parse_worktree_index(result.stdout)
+
+
+async def worktree_index_kwargs(project_root: str) -> dict[str, dict[str, bool]]:
+    """Return the ``detect_live_workflow`` kwargs carrying the hoisted index.
+
+    THE SINGLE HOME OF THE HOIST WIRING. A fan-out caller hoists the whole-repo
+    worktree list once and threads it into every per-task probe; doing that
+    correctly means honouring :func:`worktree_index_for`'s three-valued
+    contract, and spelling that out at each call site put one contract in two
+    places (task 3778 review). Both call sites are now a single splat::
+
+        liveness = await detect_live_workflow(
+            task_id, project_root, **await worktree_index_kwargs(project_root),
+        )
+
+    MIND THE TWO DIFFERENT ``{}``. This function's ``{}`` means *omit the
+    kwarg* — the index is unknown, so each task probes for itself exactly as it
+    did before the hoist existed. A known-empty repo is ``{'worktree_index':
+    {}}``, a real answer that suppresses the per-task probes. Collapsing the two
+    would either waste the hoist on the commonest cheap case or report every
+    task ``worktree_registered=False`` from a hoisted ERROR — see
+    :func:`worktree_index_for` for why that false negative is the one to avoid.
+
+    The fail-safe catch lives here so no caller can forget it: an unexpected
+    exception (anything :func:`worktree_index_for` does not already classify)
+    degrades to the per-task probe and is logged at WARNING with a traceback.
+    The three ANTICIPATED failures are already logged by
+    :func:`worktree_index_for` itself, so every path to "unknown" is loud
+    exactly once.
+    """
+    try:
+        index = await worktree_index_for(project_root)
+    except Exception:
+        logger.warning(
+            'live_workflow_detector.worktree_index_unavailable: hoist raised for %s '
+            '— every probed task falls back to its own worktree list',
+            project_root, exc_info=True,
+        )
+        return {}
+    return {} if index is None else {'worktree_index': index}
+
+
+def _registration_from_index(index: Mapping[str, bool], branch: str) -> tuple[bool, bool]:
+    """Look *branch* up in a parsed worktree index, returning ``(registered, prunable)``."""
+    ref = f'refs/heads/{branch}'
+    if ref not in index:
         return False, False
-
-    target = f'branch refs/heads/{branch}'
-    for stanza in result.stdout.split('\n\n'):
-        lines = [line.strip() for line in stanza.splitlines()]
-        if target in lines:
-            prunable = any(line.startswith('prunable') for line in lines)
-            return True, prunable
-    return False, False
+    return True, index[ref]
 
 
-def _check_recent_commit(
+async def _check_worktree_registered(project_root: str, branch: str) -> tuple[bool, bool]:
+    """Return ``(registered, prunable)`` for the git worktree tracking *branch*.
+
+    Runs the porcelain probe for THIS branch alone and reads the answer out of
+    :func:`parse_worktree_index`. Any subprocess error or unexpected output
+    returns ``(False, False)`` (fail-safe) — note this deliberately differs from
+    :func:`worktree_index_for`, which distinguishes failure (``None``) from
+    emptiness; here the caller has no third state to express. The failure itself
+    is not silent: :func:`worktree_index_for` logs every ``None`` at WARNING.
+
+    Callers fanning this out across many tasks should hoist
+    :func:`worktree_index_kwargs` instead and splat it into
+    :func:`detect_live_workflow` — the whole point of task 3778.
+    """
+    index = await worktree_index_for(project_root)
+    if index is None:
+        return False, False
+    return _registration_from_index(index, branch)
+
+
+async def _check_recent_commit(
     project_root: str,
     branch: str,
     *,
@@ -681,13 +1212,11 @@ def _check_recent_commit(
     of *now* (or ``datetime.now(UTC)`` when *now* is ``None``).
     """
     try:
-        result = subprocess.run(
+        result = await run_git(
             ['git', '-C', project_root, 'log', '-1', '--format=%cI', branch],
-            capture_output=True,
-            text=True,
             timeout=_GIT_TIMEOUT,
         )
-    except (OSError, subprocess.TimeoutExpired) as exc:
+    except OSError as exc:
         logger.debug('live_workflow_detector: git log failed for %s: %s', branch, exc)
         return None, False
 
@@ -716,7 +1245,30 @@ def _check_recent_commit(
     return last_commit_at, recent_commit
 
 
-def _branch_own_commit_count(project_root: str, base_branch: str, branch: str) -> int | None:
+def _worktree_age_exceeded(
+    last_commit_at: datetime | None,
+    reference: datetime,
+    max_worktree_age_hours: float | None,
+) -> bool:
+    """Return True iff *last_commit_at* is older than *max_worktree_age_hours*.
+
+    Fail-safe toward live (task 3947): returns False (not stale) unless ALL of
+    the following hold as POSITIVE evidence — ``max_worktree_age_hours`` is
+    not ``None`` and is strictly positive (``None`` or a non-positive value
+    disables the check entirely), ``last_commit_at`` is not ``None`` (the tip
+    timestamp parsed successfully), and the elapsed age STRICTLY exceeds the
+    threshold. The comparison is strict (``>``, not ``>=``) to mirror
+    :func:`_check_recent_commit`'s ``age <= timedelta(...)`` boundary, so a
+    tip exactly at the threshold is not yet considered stale.
+    """
+    if max_worktree_age_hours is None or max_worktree_age_hours <= 0:
+        return False
+    if last_commit_at is None:
+        return False
+    return reference - last_commit_at > timedelta(hours=max_worktree_age_hours)
+
+
+async def _branch_own_commit_count(project_root: str, base_branch: str, branch: str) -> int | None:
     """Return the number of commits *branch* carries beyond *base_branch*.
 
     Runs ``git -C <root> rev-list --count <base_branch>..<branch>``.  A result
@@ -728,13 +1280,11 @@ def _branch_own_commit_count(project_root: str, base_branch: str, branch: str) -
     ``0``/bare by callers).
     """
     try:
-        result = subprocess.run(
+        result = await run_git(
             ['git', '-C', project_root, 'rev-list', '--count', f'{base_branch}..{branch}'],
-            capture_output=True,
-            text=True,
             timeout=_GIT_TIMEOUT,
         )
-    except (OSError, subprocess.TimeoutExpired) as exc:
+    except OSError as exc:
         logger.debug(
             'live_workflow_detector: rev-list failed for %s..%s: %s',
             base_branch, branch, exc,

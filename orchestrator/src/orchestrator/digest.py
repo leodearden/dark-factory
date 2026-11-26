@@ -4,13 +4,28 @@ Task 1327: Every N escalation events the harness writes an append-only markdown
 digest summarising recent activity, and tracks an EWA of escalations/done that
 pauses the scheduler when it trips.
 
-All I/O in this module is fail-open: helpers return sentinels / zeros / None
-and log warnings rather than raising.  The digest is observability, not a
-correctness gate.
+The path-taking readers and writers in this module are fail-open: they return
+sentinels / zeros / None and log warnings rather than raising.  The digest is
+observability, not a correctness gate.  The connection-taking `query_*` forms
+beneath count_done_in_window and model_role_rollup raise sqlite3.Error instead,
+for a caller that must tell a failed read from a quiet window
+(scripts/sitting/fleet_state.py).
 
 Design decisions (see plan.json):
 - Pure, Harness-free helpers here; harness.py owns the trigger and state.
-- EWA state is process-local (reset on restart — consistent with park-stop counters).
+- Task 4559: the digest GATE counts escalation-lifecycle events (submits AND
+  resolves), but the EWA NUMERATOR counts SUBMISSIONS only — a resolve is work
+  being cleared, not a new fault.  A pure-drain window therefore has numerator
+  0 and the EWA decays, so draining a backlog heals the breaker instead of
+  re-tripping it.  The gate is deliberately left on all lifecycle events: a
+  submissions-only gate would fire no digest at all during a drain, freezing a
+  tripped EWA forever.  Task 3821: ``counts_toward_ewa_numerator`` keeps the
+  starvation watchdog's alarms out of the numerator; they are observations of
+  the queue, not faults (they still advance the gate).
+- EWA state is process-local EXCEPT across an ewa_trip_ pause (task 4559): the
+  tripping value is persisted on the scheduler_state row and restored on
+  startup, where the trip predicate is RE-TESTED before the halt is
+  re-asserted.  Every other pause reason is restored blind (task 3328).
 - write_digest_entry never raises; digest_dir is auto-created if missing.
 """
 
@@ -19,13 +34,14 @@ from __future__ import annotations
 import json
 import logging
 import sqlite3
+from collections import Counter
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Iterable
     from typing import Any
 
     from shared.cost_store import CostStore
@@ -33,6 +49,10 @@ if TYPE_CHECKING:
 from escalation.models import Escalation
 from escalation.queue import iter_all_escalation_paths
 
+from orchestrator.chain_telemetry import ChainTelemetry, summarize_chain_telemetry
+from orchestrator.event_store import EventType
+from orchestrator.lane_record_divergence import LANE_RECORD_DIVERGENCE, LaneDivergence
+from orchestrator.starvation_watchdog import STARVATION_WATCHDOG_ROLE
 from orchestrator.workflow import WorkflowOutcome
 
 logger = logging.getLogger(__name__)
@@ -48,6 +68,11 @@ _BLOCKED_OUTCOME: str = WorkflowOutcome.BLOCKED.value
 # ---------------------------------------------------------------------------
 
 
+def counts_toward_ewa_numerator(escalation: Escalation) -> bool:
+    """Whether a submitted *escalation* is a fault the EWA breaker should weigh."""
+    return escalation.agent_role != STARVATION_WATCHDOG_ROLE
+
+
 def update_ewa(
     prev_ewa: float,
     escalations_in_step: int,
@@ -59,11 +84,21 @@ def update_ewa(
     EWA(t+1) = alpha * (escalations_in_step / max(done_in_step, 1))
                + (1 - alpha) * prev_ewa
 
-    Caller contract: escalations_in_step must be > 0.  In normal flow
-    _maybe_write_digest only calls this when escalations_in_step >= N (the
-    digest gate guarantees this invariant).  A ValueError is raised so that
-    any caller that violates the contract is loud rather than silently
-    returning a stale value — keeping the unreachable path unreachable.
+    Caller contract: escalations_in_step must be >= 0.  Zero is LEGITIMATE.
+    As of task 4559 the numerator counts escalation SUBMISSIONS only —
+    resolutions still advance the digest GATE but no longer feed the
+    numerator — so a backlog-drain window (many resolutions, zero
+    submissions) reaches here with escalations_in_step == 0.  That case is
+    not a caller error but the healthy one: the ratio is 0, so
+    EWA(t+1) = (1 - alpha) * prev_ewa, pure decay.  Draining a backlog
+    therefore HEALS the breaker instead of re-tripping it, which is the
+    defect task 4559 exists to fix.  (Before 4559 this raised, on the
+    assumption that the digest gate guaranteed esc >= N >= 1; that
+    assumption held only while gate and numerator were the same counter.)
+
+    A NEGATIVE count is still rejected loudly: counters are monotonically
+    non-decreasing and the diff is taken against an earlier snapshot, so
+    esc < 0 means a counter was reset or a snapshot went backwards.
 
     done_in_step == 0 (with esc > 0) uses denominator 1 so a step with
     escalations and zero completions (the worst-case signal) pushes EWA up
@@ -71,10 +106,11 @@ def update_ewa(
 
     No other exception handling — pure arithmetic.
     """
-    if escalations_in_step == 0:
+    if escalations_in_step < 0:
         raise ValueError(
-            'update_ewa: escalations_in_step must be > 0; '
-            'the digest gate guarantees this — passing 0 is a caller error'
+            'update_ewa: escalations_in_step must be >= 0; '
+            f'got {escalations_in_step} — counters only ever increase, so a '
+            'negative step diff means a reset or a backwards snapshot'
         )
     ratio = escalations_in_step / max(done_in_step, 1)
     return alpha * ratio + (1 - alpha) * prev_ewa
@@ -83,6 +119,18 @@ def update_ewa(
 # ---------------------------------------------------------------------------
 # Escalation aggregation
 # ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class CategoryShare:
+    """One escalation category's count out of the window's total."""
+
+    category: str
+    count: int
+    total: int
+
+    def __str__(self) -> str:
+        return f'{self.count}/{self.total} {self.category}'
 
 
 @dataclass
@@ -98,6 +146,16 @@ class EscalationStats:
     dedupe_children_total: int = 0
     # Count of in-window escalations with status == 'pending'
     pending_total: int = 0
+
+    def dominant_category(self) -> CategoryShare | None:
+        """The most frequent category across every level and status; ties go to the smallest name."""
+        per_category: Counter[str] = Counter()
+        for (category, _level, _status), count in self.category_level_status_counts.items():
+            per_category[category] += count
+        if not per_category:
+            return None
+        category, count = min(per_category.items(), key=lambda kv: (-kv[1], kv[0]))
+        return CategoryShare(category=category, count=count, total=sum(per_category.values()))
 
 
 def aggregate_escalations(
@@ -220,9 +278,8 @@ def aggregate_escalations(
 
 
 # ---------------------------------------------------------------------------
-# Shared read-only-events-DB scaffold (used by count_done_in_window and
-# merge_disposition_counts below — factored out so the fail-open contract
-# lives in exactly one place instead of being stamped out per query).
+# Shared read-only-events-DB scaffold: every events.db reader in this module
+# goes through it, so the fail-open contract lives in exactly one place.
 # ---------------------------------------------------------------------------
 
 
@@ -277,6 +334,26 @@ def _query_events_ro(
 # ---------------------------------------------------------------------------
 
 
+def query_count_done_in_window(
+    conn: sqlite3.Connection,
+    window_start_iso: str,
+    window_end_iso: str,
+) -> int:
+    """Count done task_completed events in the window on *conn*.
+
+    sqlite3.Error propagates, and *conn* is neither opened nor closed here;
+    count_done_in_window is the fail-open form.
+    """
+    (count,) = conn.execute(
+        "SELECT COUNT(*) FROM events "
+        "WHERE event_type = 'task_completed' "
+        "  AND timestamp BETWEEN ? AND ? "
+        "  AND json_extract(data, '$.outcome') = ?",
+        (window_start_iso, window_end_iso, _DONE_OUTCOME),
+    ).fetchone()
+    return int(count)
+
+
 def count_done_in_window(
     events_db: Path,
     window_start_iso: str,
@@ -287,17 +364,10 @@ def count_done_in_window(
     Uses sqlite3 directly (read-only).  Fail-open: any exception returns 0.
     Missing DB returns 0 (DEBUG); other failures return 0 (WARNING).
     """
-    def _query(conn: sqlite3.Connection) -> int:
-        (count,) = conn.execute(
-            "SELECT COUNT(*) FROM events "
-            "WHERE event_type = 'task_completed' "
-            "  AND timestamp BETWEEN ? AND ? "
-            "  AND json_extract(data, '$.outcome') = ?",
-            (window_start_iso, window_end_iso, _DONE_OUTCOME),
-        ).fetchone()
-        return int(count)
-
-    return _query_events_ro(events_db, 'count_done_in_window', 0, _query)
+    return _query_events_ro(
+        events_db, 'count_done_in_window', 0,
+        lambda conn: query_count_done_in_window(conn, window_start_iso, window_end_iso),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -346,6 +416,55 @@ def merge_disposition_counts(
         return {disp: int(count) for disp, count in rows}
 
     return _query_events_ro(events_db, 'merge_disposition_counts', {}, _query)
+
+
+# ---------------------------------------------------------------------------
+# Deep merge-ahead chain telemetry (task 3188, PRD ε of
+# plans/deep-merge-ahead-prd.md).  This module owns the window;
+# orchestrator/src/orchestrator/chain_telemetry.py owns the arithmetic.
+# ---------------------------------------------------------------------------
+
+
+def _parse_payload(raw: str | None) -> dict[str, Any]:
+    try:
+        parsed = json.loads(raw) if raw else {}
+    except json.JSONDecodeError:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def chain_telemetry_in_window(
+    events_db: Path,
+    window_start_iso: str,
+    window_end_iso: str,
+) -> ChainTelemetry:
+    """Summarise merge_verify and merge_finalized events inside the window.
+
+    Both event types are windowed over the same run-agnostic
+    ``timestamp BETWEEN`` bounds, so the items-landed numerator and the
+    deep-verify denominator cover the same span across fleet redeploys.
+    A row whose ``data`` is not a JSON object is skipped.
+
+    Uses sqlite3 directly (read-only).  Fail-open: any exception returns
+    ``ChainTelemetry()``.
+    """
+    def _payloads(conn: sqlite3.Connection, event_type: EventType) -> list[dict[str, Any]]:
+        rows = conn.execute(
+            'SELECT data FROM events '
+            'WHERE event_type = ? AND timestamp BETWEEN ? AND ? ORDER BY id',
+            (event_type.value, window_start_iso, window_end_iso),
+        ).fetchall()
+        return [_parse_payload(raw) for (raw,) in rows]
+
+    def _query(conn: sqlite3.Connection) -> ChainTelemetry:
+        return summarize_chain_telemetry(
+            _payloads(conn, EventType.merge_verify),
+            _payloads(conn, EventType.merge_finalized),
+        )
+
+    return _query_events_ro(
+        events_db, 'chain_telemetry_in_window', ChainTelemetry(), _query,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -503,15 +622,14 @@ def _compute_turn_cap_saturation(
     return saturation
 
 
-def model_role_rollup(
-    runs_db: Path,
+def query_model_role_rollup(
+    conn: sqlite3.Connection,
     window_start_iso: str,
     window_end_iso: str,
 ) -> ModelRoleRollup:
-    """Aggregate per-(model, role) invocation outcomes for a digest window.
+    """Aggregate per-(model, role) invocation outcomes for a window on *conn*.
 
-    Uses sqlite3 directly (read-only) via the shared `_query_events_ro`
-    scaffold on `runs_db` (the same file backing EventStore/CostStore/
+    *conn* is a runs.db connection (the file backing EventStore/CostStore/
     RunStore). One query LEFT JOINs `invocations` to `task_results` on
     (run_id, task_id) so module_tagger rows (task_id IS NULL, never matched)
     still contribute invocation_count/cost/cap-hit but count as neither done
@@ -520,68 +638,188 @@ def model_role_rollup(
     Rates are derived in Python with divide-by-zero guards; cost_per_done is
     None (not 0/inf) when a cell has zero distinct done tasks.
 
-    Fail-open: a missing/unreadable DB returns an empty ModelRoleRollup.
+    sqlite3.Error propagates, and *conn* is neither opened nor closed here;
+    model_role_rollup is the fail-open form.
     """
-    def _query(conn: sqlite3.Connection) -> ModelRoleRollup:
-        raw_rows = conn.execute(
-            'SELECT i.model, i.role, '
-            '       COUNT(*) AS invocation_count, '
-            '       SUM(i.capped) AS capped_count, '
-            '       SUM(i.cost_usd) AS total_cost_usd, '
-            '       SUM(CASE WHEN tr.outcome = ? THEN 1 ELSE 0 END) AS done_count, '
-            '       SUM(CASE WHEN tr.outcome = ? THEN 1 ELSE 0 END) AS blocked_count, '
-            '       COUNT(DISTINCT CASE WHEN tr.outcome = ? THEN i.task_id END) '
-            '           AS distinct_done_tasks '
-            'FROM invocations i '
-            'LEFT JOIN task_results tr '
-            '    ON i.run_id = tr.run_id AND i.task_id = tr.task_id '
-            'WHERE i.completed_at BETWEEN ? AND ? '
-            'GROUP BY i.model, i.role',
+    raw_rows = conn.execute(
+        'SELECT i.model, i.role, '
+        '       COUNT(*) AS invocation_count, '
+        '       SUM(i.capped) AS capped_count, '
+        '       SUM(i.cost_usd) AS total_cost_usd, '
+        '       SUM(CASE WHEN tr.outcome = ? THEN 1 ELSE 0 END) AS done_count, '
+        '       SUM(CASE WHEN tr.outcome = ? THEN 1 ELSE 0 END) AS blocked_count, '
+        '       COUNT(DISTINCT CASE WHEN tr.outcome = ? THEN i.task_id END) '
+        '           AS distinct_done_tasks '
+        'FROM invocations i '
+        'LEFT JOIN task_results tr '
+        '    ON i.run_id = tr.run_id AND i.task_id = tr.task_id '
+        'WHERE i.completed_at BETWEEN ? AND ? '
+        'GROUP BY i.model, i.role',
+        (
+            _DONE_OUTCOME, _BLOCKED_OUTCOME, _DONE_OUTCOME,
+            window_start_iso, window_end_iso,
+        ),
+    ).fetchall()
+
+    rows: list[ModelRoleRow] = []
+    for (
+        model, role, invocation_count, capped_count, total_cost_usd,
+        done_count, blocked_count, distinct_done_tasks,
+    ) in raw_rows:
+        invocation_count = int(invocation_count or 0)
+        capped_count = int(capped_count or 0)
+        total_cost_usd = float(total_cost_usd or 0.0)
+        done_count = int(done_count or 0)
+        blocked_count = int(blocked_count or 0)
+        distinct_done_tasks = int(distinct_done_tasks or 0)
+
+        done_rate = (done_count / invocation_count) if invocation_count else 0.0
+        blocked_rate = (blocked_count / invocation_count) if invocation_count else 0.0
+        cap_hit_rate = (capped_count / invocation_count) if invocation_count else 0.0
+        cost_per_done = (
+            (total_cost_usd / distinct_done_tasks) if distinct_done_tasks > 0 else None
+        )
+
+        rows.append(ModelRoleRow(
+            model=model,
+            role=role,
+            invocation_count=invocation_count,
+            done_count=done_count,
+            blocked_count=blocked_count,
+            done_rate=done_rate,
+            blocked_rate=blocked_rate,
+            capped_count=capped_count,
+            cap_hit_rate=cap_hit_rate,
+            total_cost_usd=total_cost_usd,
+            cost_per_done=cost_per_done,
+        ))
+
+    turn_cap_saturation = _compute_turn_cap_saturation(
+        conn, window_start_iso, window_end_iso,
+    )
+    return ModelRoleRollup(rows=rows, turn_cap_saturation=turn_cap_saturation)
+
+
+def model_role_rollup(
+    runs_db: Path,
+    window_start_iso: str,
+    window_end_iso: str,
+) -> ModelRoleRollup:
+    """Fail-open form of query_model_role_rollup over a read-only `runs_db`.
+
+    A missing/unreadable DB returns an empty ModelRoleRollup.
+    """
+    return _query_events_ro(
+        runs_db, 'model_role_rollup', ModelRoleRollup(),
+        lambda conn: query_model_role_rollup(conn, window_start_iso, window_end_iso),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Scheduler-pause visibility (task 5311)
+# ---------------------------------------------------------------------------
+
+SCHEDULER_PAUSE_RESURFACE_AGE: timedelta = timedelta(hours=2)
+
+
+@dataclass(frozen=True)
+class RependedWhilePaused:
+    """A task a resolution re-pended while dispatch was paused."""
+
+    task_id: str
+    escalation_id: str
+    repended_at: str
+
+
+@dataclass(frozen=True)
+class OverdueEscalation:
+    """A pending escalation older than its re-surface age."""
+
+    escalation_id: str
+    age: timedelta
+    summary: str
+
+
+@dataclass(frozen=True)
+class PauseVisibility:
+    """What the digest's '## Paused, waiting' section renders."""
+
+    pause_reason: str | None = None
+    repended_waiting: tuple[RependedWhilePaused, ...] = ()
+    overdue_pause_escalations: tuple[OverdueEscalation, ...] = ()
+
+
+def repended_during_current_pause(events_db: Path) -> tuple[RependedWhilePaused, ...]:
+    """Latest re-pend per task since the last pause ended (a resume, or a restart that
+    declined to re-assert it), across every run; fail-open ()."""
+
+    def _query(conn: sqlite3.Connection) -> tuple[RependedWhilePaused, ...]:
+        rows = conn.execute(
+            "SELECT task_id, json_extract(data, '$.escalation_id'), timestamp, MAX(id) "
+            'FROM events WHERE event_type = ? '
+            'AND id > (SELECT COALESCE(MAX(id), 0) FROM events WHERE event_type = ? '
+            "OR (event_type = ? AND json_extract(data, '$.reasserted') = 0)) "
+            'GROUP BY task_id ORDER BY task_id',
             (
-                _DONE_OUTCOME, _BLOCKED_OUTCOME, _DONE_OUTCOME,
-                window_start_iso, window_end_iso,
+                EventType.repend_while_paused.value,
+                EventType.scheduler_resumed.value,
+                EventType.scheduler_pause_restored.value,
             ),
         ).fetchall()
-
-        rows: list[ModelRoleRow] = []
-        for (
-            model, role, invocation_count, capped_count, total_cost_usd,
-            done_count, blocked_count, distinct_done_tasks,
-        ) in raw_rows:
-            invocation_count = int(invocation_count or 0)
-            capped_count = int(capped_count or 0)
-            total_cost_usd = float(total_cost_usd or 0.0)
-            done_count = int(done_count or 0)
-            blocked_count = int(blocked_count or 0)
-            distinct_done_tasks = int(distinct_done_tasks or 0)
-
-            done_rate = (done_count / invocation_count) if invocation_count else 0.0
-            blocked_rate = (blocked_count / invocation_count) if invocation_count else 0.0
-            cap_hit_rate = (capped_count / invocation_count) if invocation_count else 0.0
-            cost_per_done = (
-                (total_cost_usd / distinct_done_tasks) if distinct_done_tasks > 0 else None
-            )
-
-            rows.append(ModelRoleRow(
-                model=model,
-                role=role,
-                invocation_count=invocation_count,
-                done_count=done_count,
-                blocked_count=blocked_count,
-                done_rate=done_rate,
-                blocked_rate=blocked_rate,
-                capped_count=capped_count,
-                cap_hit_rate=cap_hit_rate,
-                total_cost_usd=total_cost_usd,
-                cost_per_done=cost_per_done,
-            ))
-
-        turn_cap_saturation = _compute_turn_cap_saturation(
-            conn, window_start_iso, window_end_iso,
+        return tuple(
+            RependedWhilePaused(task_id=task_id, escalation_id=escalation_id, repended_at=ts)
+            for task_id, escalation_id, ts, _ in rows
         )
-        return ModelRoleRollup(rows=rows, turn_cap_saturation=turn_cap_saturation)
 
-    return _query_events_ro(runs_db, 'model_role_rollup', ModelRoleRollup(), _query)
+    return _query_events_ro(events_db, 'repended_during_current_pause', (), _query)
+
+
+def overdue_pending_escalations(
+    pending: Iterable[Escalation],
+    *,
+    category: str,
+    min_age: timedelta,
+    now: datetime,
+) -> tuple[OverdueEscalation, ...]:
+    """Pending escalations of *category* at least *min_age* old, oldest first."""
+    overdue: list[OverdueEscalation] = []
+    for esc in pending:
+        if esc.status != 'pending' or esc.category != category:
+            continue
+        try:
+            age = now - datetime.fromisoformat(esc.timestamp)
+        except (ValueError, TypeError):
+            continue
+        if age >= min_age:
+            overdue.append(OverdueEscalation(esc.id, age, esc.summary))
+    return tuple(sorted(overdue, key=lambda o: o.age, reverse=True))
+
+
+def _paused_waiting_lines(visibility: PauseVisibility) -> list[str]:
+    lines = ['## Paused, waiting']
+    if visibility.pause_reason is not None:
+        lines.append(
+            f'- Paused with {len(visibility.repended_waiting)} re-pended tasks waiting '
+            f'(pause reason: {visibility.pause_reason})'
+        )
+        lines.extend(
+            f'  - task {w.task_id} (re-pended {w.repended_at} via {w.escalation_id})'
+            for w in visibility.repended_waiting
+        )
+    else:
+        lines.append('- Not paused')
+    if visibility.overdue_pause_escalations:
+        hour = timedelta(hours=1)
+        lines.append(
+            '- Unresolved scheduler-pause escalations pending > '
+            f'{SCHEDULER_PAUSE_RESURFACE_AGE / hour:g}h:'
+        )
+        lines.extend(
+            f'  - {o.escalation_id} pending {o.age / hour:.1f}h: {o.summary}'
+            for o in visibility.overdue_pause_escalations
+        )
+    lines.append('')
+    return lines
 
 
 # ---------------------------------------------------------------------------
@@ -619,6 +857,19 @@ class DigestInputs:
     # stays valid.  These lanes are NEVER auto-reclaimed (WIP-preserving) — the
     # census only surfaces them for operator attention.
     stale_lane_census: list[str] = field(default_factory=list)
+    # Task 4559 — the gate/numerator split, rendered so the operator can see
+    # WHICH number drove the EWA.  submissions_in_step is the EWA NUMERATOR
+    # (new escalations only); lifecycle_events_in_step is the digest GATE
+    # (submits + resolves).  Defaulted to 0, appended last, so every existing
+    # constructor across digest.py, harness.py and the test suite stays valid.
+    submissions_in_step: int = 0
+    lifecycle_events_in_step: int = 0
+    # Task 5311 — the '## Paused, waiting' section; defaulted and appended last.
+    pause_visibility: PauseVisibility = field(default_factory=PauseVisibility)
+    # Task 3188 ε — the '## Deep merge-ahead chains' section; defaulted and appended last.
+    chain_telemetry: ChainTelemetry = field(default_factory=ChainTelemetry)
+    # Task 2987 δ; None = durable lane records unreadable.
+    lane_record_divergence: tuple[LaneDivergence, ...] | None = ()
 
 
 def render_digest_markdown(inputs: DigestInputs) -> str:
@@ -685,7 +936,18 @@ def render_digest_markdown(inputs: DigestInputs) -> str:
         f'- Value / threshold: {inputs.ewa_value:.4f} / {inputs.ewa_threshold:.4f}'
         f'{tripped_marker}'
     )
+    # Task 4559: make the gate/numerator split legible.  Reading a trip digest
+    # without these two figures cannot distinguish a burst of new escalations
+    # from a cleanup sweep of old ones.
+    lines.append(f'- Submissions in step (EWA numerator): {inputs.submissions_in_step}')
+    lines.append(
+        f'- Lifecycle events in step (digest gate): {inputs.lifecycle_events_in_step}'
+    )
+    share = inputs.escalation_stats.dominant_category()
+    lines.append(f'- Dominant escalation category: {share if share is not None else "none"}')
     lines.append('')
+
+    lines.extend(_paused_waiting_lines(inputs.pause_visibility))
 
     # Anomalies
     lines.append('## Anomalies')
@@ -742,6 +1004,8 @@ def render_digest_markdown(inputs: DigestInputs) -> str:
         lines.append('_none_')
     lines.append('')
 
+    lines.extend(_render_chain_telemetry_section(inputs.chain_telemetry))
+
     # Stale lane assignments (leaf γ, task 2891) — non-terminal warm-lane
     # records idle past lane_stale_report_days; surfaced for operator attention,
     # never auto-reclaimed (WIP-preserving invariant).
@@ -753,7 +1017,50 @@ def render_digest_markdown(inputs: DigestInputs) -> str:
         lines.append('_none_')
     lines.append('')
 
+    lines.extend(_lane_record_divergence_lines(inputs.lane_record_divergence))
+
     return '\n'.join(lines)
+
+
+def _lane_record_divergence_lines(
+    divergences: tuple[LaneDivergence, ...] | None,
+) -> list[str]:
+    lines = [f'## Lane record divergence ({LANE_RECORD_DIVERGENCE})']
+    if divergences is None:
+        lines.append('_unavailable: durable lane records could not be read_')
+    elif not divergences:
+        lines.append('_none_')
+    else:
+        lines.extend(f'- {d.render()}' for d in divergences)
+    lines.append('')
+    return lines
+
+
+def _render_chain_telemetry_section(telemetry: ChainTelemetry) -> list[str]:
+    lines = ['## Deep merge-ahead chains']
+    if telemetry.chain_items_histogram:
+        lines.append('| chain items | verifies | passed | pass rate |')
+        lines.append('|-------------|----------|--------|-----------|')
+        for chain_items, bucket in sorted(telemetry.chain_items_histogram.items()):
+            rate = bucket.rate
+            rate_str = f'{rate * 100:.1f}%' if rate is not None else 'n/a'
+            lines.append(f'| {chain_items} | {bucket.total} | {bucket.passed} | {rate_str} |')
+    else:
+        lines.append('_none_')
+    per_verify = telemetry.items_landed_per_deep_verify
+    lines.append(
+        f'- Items landed per deep verify: {per_verify:.2f}'
+        if per_verify is not None else '- Items landed per deep verify: n/a'
+    )
+    fail_rate = telemetry.deep_fail_rate
+    lines.append(
+        f'- Deep-fail rate: {fail_rate * 100:.1f}% '
+        f'({telemetry.deep_failures}/{telemetry.deep_verifies})'
+        if fail_rate is not None else '- Deep-fail rate: n/a'
+    )
+    lines.append(f'- Excluded legacy depth>=2 events: {telemetry.excluded_legacy_depth}')
+    lines.append('')
+    return lines
 
 
 # ---------------------------------------------------------------------------

@@ -11,7 +11,17 @@ contract intact across the cutover.
 
 from __future__ import annotations
 
-from typing import Any
+from collections.abc import Sequence
+from typing import Any, ClassVar
+
+from shared.declared_scope import DECLARED_SCOPE_METADATA_KEY, StampViolation
+from shared.followup_items import (
+    FOLLOWUP_ITEMS_METADATA_KEY,
+    FOLLOWUP_ITEMS_REFUSED_ERROR,
+    MAX_FOLLOWUP_ITEMS,
+    FollowupBundleInvalid,
+)
+from shared.task_deferral import DeferralRefusalCode
 
 TASKMASTER_TOOL_ERROR: str = 'TASKMASTER_TOOL_ERROR'
 TASKMASTER_UNAVAILABLE: str = 'TASKMASTER_UNAVAILABLE'
@@ -72,6 +82,46 @@ class DuplicateCandidateKeyError(TaskmasterError):
         self.candidate_key = candidate_key
 
 
+class LeakedEnvelopeMarkupError(TaskmasterError):
+    """Raised by ``add_task``/``update_task`` when task text carries a leaked
+    tool-call envelope fragment (task 4419).
+
+    The fragment is positive evidence that a harness parser terminated an
+    argument early and may have swallowed the arguments after it, so the
+    write is refused and its transaction rolled back rather than stored or
+    stripped: stripping would destroy the evidence of which writer leaked.
+    Detection and column scope come from
+    ``fused_memory/backends/task_text_markup_gate.py``.
+
+    Attributes:
+        column: The task-text column whose value carries the fragment.
+        fragment: The leaked fragment, from the stray closing tag onward.
+        recovered: The arguments the fragment swallowed, name -> value, i.e.
+            what the write would otherwise have silently defaulted. Empty when
+            no boundary is provable, never a guess.
+        clean_value: The column's value up to the fragment, or ``None`` under
+            that same condition.
+    """
+
+    def __init__(
+        self,
+        column: str,
+        fragment: str,
+        recovered: dict[str, str],
+        clean_value: str | None,
+    ) -> None:
+        super().__init__(
+            'LEAKED_ENVELOPE_MARKUP',
+            f'Refusing to store task text: {column!r} carries a leaked tool-call '
+            f'fragment {fragment!r}, so arguments after it may have been swallowed; '
+            f'recovered={recovered!r} clean_value={clean_value!r}',
+        )
+        self.column = column
+        self.fragment = fragment
+        self.recovered = recovered
+        self.clean_value = clean_value
+
+
 class TaskNotFoundError(TaskmasterError):
     """Raised by ``get_task`` when a successful zero-row query proves absence.
 
@@ -128,27 +178,32 @@ def status_via_update_task_error(task_id: str, status: object) -> dict[str, Any]
     }
 
 
+_DONE_PROVENANCE_HINT = (
+    'update_task cannot write metadata.done_provenance. Use '
+    'set_task_status(status="done", done_provenance={...}) instead — '
+    'it validates the kind/commit/note schema and runs an ancestor '
+    "backstop on the merge sha. Under metadata_mode='replace' the stored "
+    'done_provenance must be carried through verbatim: a whole-blob replace '
+    'may neither add, change nor drop it, so re-read the task and send the '
+    'stored value back unmodified.'
+)
+
+
 def done_provenance_via_update_task_error(task_id: str) -> dict[str, Any]:
-    """Canonical rejection shape for ``update_task`` calls writing ``metadata.done_provenance``.
+    """Canonical rejection shape for ``update_task`` calls that would add, change
+    or remove ``metadata.done_provenance``.
 
     ``set_task_status`` is the only sanctioned writer for ``done_provenance``
     — it validates the kind/commit/note schema and runs an ancestor backstop
-    on the merge sha. This dict is byte-identical to the historical
-    ``success: False`` variant produced by ``task_interceptor.py``'s
-    ``_reject_done_provenance_in_update_metadata``, so callers branching on
-    ``error == 'done_provenance_via_update_task'`` keep working across the
-    cutover.
+    on the merge sha. The stable promise across every surface is the ERROR
+    CODE: callers branch on ``error == 'done_provenance_via_update_task'``.
+    The ``hint`` is prose for the caller reading the failure and may grow.
     """
     return {
         'success': False,
         'error': 'done_provenance_via_update_task',
         'task_id': task_id,
-        'hint': (
-            'update_task cannot write metadata.done_provenance. Use '
-            'set_task_status(status="done", done_provenance={...}) instead — '
-            'it validates the kind/commit/note schema and runs an ancestor '
-            'backstop on the merge sha.'
-        ),
+        'hint': _DONE_PROVENANCE_HINT,
     }
 
 
@@ -179,38 +234,413 @@ class StatusWriteAuthorityError(TaskmasterError):
 
 
 class DoneProvenanceWriteAuthorityError(TaskmasterError):
-    """Raised when ``update_task`` is asked to write ``metadata.done_provenance``.
+    """Raised when ``update_task`` would add, change or remove ``metadata.done_provenance``.
 
     ``set_task_status`` is the sole sanctioned writer for ``done_provenance``
     — it validates the kind/commit/note schema and runs an ancestor backstop
     on the merge sha. Subclasses :class:`TaskmasterError` with the
-    ``TASKMASTER_TOOL_ERROR`` code and a ``set_task_status``-mentioning
-    message so existing ``TaskmasterError`` catchers/assertions keep working
-    unchanged; call :meth:`to_error_dict` for the canonical wire shape.
+    ``TASKMASTER_TOOL_ERROR`` code and the canonical hint as its message, so
+    existing ``TaskmasterError`` catchers/assertions keep working unchanged;
+    call :meth:`to_error_dict` for the canonical wire shape.
     """
 
     def __init__(self, task_id: str) -> None:
         self.task_id = task_id
-        super().__init__(
-            'TASKMASTER_TOOL_ERROR',
-            'update_task cannot write metadata.done_provenance. Use '
-            'set_task_status(status="done", done_provenance={...}) instead — '
-            'it validates the kind/commit/note schema and runs an ancestor '
-            'backstop on the merge sha.',
-        )
+        super().__init__('TASKMASTER_TOOL_ERROR', _DONE_PROVENANCE_HINT)
 
     def to_error_dict(self) -> dict[str, Any]:
         return done_provenance_via_update_task_error(self.task_id)
+
+
+def _defect_records_hint(key: str) -> str:
+    return (
+        f'update_task cannot write metadata.{key}. After creation its only writers are '
+        'declare_defect (Declare, DeclareClosure, DeclareRetirement, Sighting) and '
+        'record_defect_outcome (Proof, Rule), which apply the defect transition rules '
+        "in one write. Under metadata_mode='replace' the stored value must be carried "
+        'through verbatim: a whole-blob replace may neither add, change nor drop it, so '
+        're-read the task and send the stored value back unmodified.'
+    )
+
+
+class DefectRecordsWriteAuthorityError(TaskmasterError):
+    """Raised when ``update_task`` would add, change or remove a task's defect records.
+
+    ``key`` is ``defects`` or ``defect_test_retirements``; after creation only
+    ``declare_defect`` and ``record_defect_outcome`` write either
+    (``plans/defect-tests-prd.md`` decision 7). Call :meth:`to_error_dict` for
+    the wire shape; callers branch on ``error == 'defect_records_via_update_task'``.
+    """
+
+    def __init__(self, task_id: str, key: str) -> None:
+        self.task_id = task_id
+        self.key = key
+        super().__init__('TASKMASTER_TOOL_ERROR', _defect_records_hint(key))
+
+    def to_error_dict(self) -> dict[str, Any]:
+        return {
+            'success': False,
+            'error': 'defect_records_via_update_task',
+            'task_id': self.task_id,
+            'key': self.key,
+            'hint': self.message,
+        }
+
+
+_DEFERRAL_WRITE_AUTHORITY_HINT = (
+    "Only set_task_status(status='deferred', deferral={...}) writes metadata.deferral, "
+    'and only leaving deferred removes it; update_task and submit_task may not add, '
+    'alter or remove it (an unchanged echo of the stored record is accepted). '
+    "Recipe: docs/task-authoring.md §9 'Deferring a task'."
+)
+
+
+class DeferralWriteAuthorityError(TaskmasterError):
+    """Raised when a metadata writer would add, alter or remove ``metadata.deferral``.
+
+    The status choke point is the record's only writer (PRD
+    plans/deferral-flip-condition-prd.md decision 3). Call :meth:`to_error_dict`
+    for the wire shape.
+    """
+
+    def __init__(self, task_id: str | None, path: str = 'metadata.deferral') -> None:
+        self.task_id = task_id
+        self.path = path
+        super().__init__('TASKMASTER_TOOL_ERROR', _DEFERRAL_WRITE_AUTHORITY_HINT)
+
+    def to_error_dict(self) -> dict[str, Any]:
+        return {
+            'success': False,
+            'error': DeferralRefusalCode.WRITE_AUTHORITY.value,
+            'task_id': self.task_id,
+            'path': self.path,
+            'hint': _DEFERRAL_WRITE_AUTHORITY_HINT,
+        }
+
+
+_DECLARED_SCOPE_WRITE_AUTHORITY_HINT = (
+    'metadata.declared_scope is machine-stamped once, at filing, by submit_task; '
+    'submit_task and update_task may not add, alter or remove it. An unchanged echo of '
+    "the stored record is accepted, so a metadata_mode='replace' payload must carry it "
+    'through verbatim. See docs/task-authoring.md §8.'
+)
+
+
+class DeclaredScopeWriteAuthorityError(TaskmasterError):
+    """Raised when a caller would add, alter or remove ``metadata.declared_scope``.
+
+    PRD plans/follow-up-filing-shape-prd.md §3 decision 7. ``reason`` names the arm the write
+    tripped and ``stored`` is the stamp on the row, None when it has none. Call
+    :meth:`to_error_dict` for the wire shape; callers branch on ``error == ERROR``.
+    """
+
+    ERROR: ClassVar[str] = 'declared_scope_write_authority'
+
+    def __init__(self, task_id: str | None, reason: StampViolation, stored: Any = None) -> None:
+        self.task_id = task_id
+        self.reason = reason
+        self.stored = stored
+        super().__init__(
+            'TASKMASTER_TOOL_ERROR', f'{reason.value}: {_DECLARED_SCOPE_WRITE_AUTHORITY_HINT}',
+        )
+
+    def to_error_dict(self) -> dict[str, Any]:
+        return {
+            'success': False,
+            'error': self.ERROR,
+            'error_type': type(self).__name__,
+            'task_id': self.task_id,
+            'path': f'metadata.{DECLARED_SCOPE_METADATA_KEY}',
+            'reason': self.reason.value,
+            'stored': self.stored,
+            'hint': _DECLARED_SCOPE_WRITE_AUTHORITY_HINT,
+        }
+
+
+_FOLLOWUP_ITEMS_REFUSED_HINT = (
+    f'metadata.followup_items is a bundle of 1..{MAX_FOLLOWUP_ITEMS} observations with unique '
+    'keys, and every item file must also be in metadata.files. submit_task derives each item '
+    'key and origin_task and the top-level escalation_id and suggestion_hash, so do not send '
+    'them. Nothing was filed. See docs/task-authoring.md §8.'
+)
+
+
+class FollowupItemsRefusedError(TaskmasterError):
+    """Raised when a submission's ``metadata.followup_items`` breaks a create invariant.
+
+    PRD plans/follow-up-filing-shape-prd.md §4.1. Built from the shared
+    :class:`~shared.followup_items.FollowupBundleInvalid`: ``reason`` names the invariant, ``index``
+    the offending element when there is one, and ``detail`` the offending values. Call
+    :meth:`to_error_dict` for the wire shape; callers branch on ``error == ERROR`` and ``reason``.
+    """
+
+    ERROR: ClassVar[str] = FOLLOWUP_ITEMS_REFUSED_ERROR
+
+    def __init__(self, refusal: FollowupBundleInvalid) -> None:
+        self.reason = refusal.reason
+        self.index = refusal.index
+        self.detail = refusal.detail
+        super().__init__('TASKMASTER_TOOL_ERROR', str(refusal))
+
+    def to_error_dict(self) -> dict[str, Any]:
+        return {
+            'success': False,
+            'error': self.ERROR,
+            'error_type': type(self).__name__,
+            'path': f'metadata.{FOLLOWUP_ITEMS_METADATA_KEY}',
+            'reason': self.reason.value,
+            'index': self.index,
+            'detail': self.detail,
+            'hint': _FOLLOWUP_ITEMS_REFUSED_HINT,
+        }
+
+
+class DependencyCycle(TaskmasterError):
+    """Raised when a local dependency edge would close a cycle; nothing was written.
+
+    ``cycle`` is the path (task, depends_on, ..., task) the refused edge would close.
+    The rule's home is shared/src/shared/dependency_cycle.py. Call :meth:`to_error_dict`
+    for the wire shape; callers branch on ``error == ERROR`` and act on ``cycle``.
+    """
+
+    ERROR: ClassVar[str] = 'dependency_cycle'
+
+    def __init__(self, operation: str, cycle: Sequence[int]) -> None:
+        if len(cycle) < 2:
+            raise ValueError(f'a dependency cycle names at least two tasks, got {tuple(cycle)!r}')
+        if cycle[0] != cycle[-1]:
+            raise ValueError(
+                f'a dependency cycle must start and end on the same task, got {tuple(cycle)!r}'
+            )
+        self.operation = operation
+        self.cycle = tuple(cycle)
+        path = ' → '.join(str(task) for task in self.cycle)
+        super().__init__(
+            TASKMASTER_TOOL_ERROR,
+            f'{operation}: {self.cycle[0]} → {self.cycle[1]} would close a cycle {path}; '
+            'remove one of those edges first',
+        )
+
+    def to_error_dict(self) -> dict[str, Any]:
+        return {
+            'success': False,
+            'error': self.ERROR,
+            'error_type': type(self).__name__,
+            'operation': self.operation,
+            'task_id': self.cycle[0],
+            'depends_on': self.cycle[1],
+            'cycle': list(self.cycle),
+            'hint': self.message,
+        }
+
+
+_METADATA_NOT_AN_OBJECT_HINT = (
+    'update_task metadata must be a JSON object: a dict, or a JSON string '
+    'that encodes one. Nothing was written. Under merge/additive, send an '
+    "object of just the keys to set; under metadata_mode='replace', send the "
+    'complete blob as an object, carrying any stored done_provenance through '
+    'verbatim.'
+)
+
+
+def metadata_not_an_object_error(task_id: str | None, received: str) -> dict[str, Any]:
+    """Canonical rejection shape for ``update_task`` calls whose ``metadata``
+    payload is not a JSON object.
+
+    The stable promise across every surface is the ERROR CODE: callers branch
+    on ``error == 'metadata_not_an_object'``. ``received`` names what was sent
+    (see :class:`MetadataNotAnObjectError`). The ``hint`` is prose for the
+    caller reading the failure and may grow.
+    """
+    return {
+        'success': False,
+        'error': 'metadata_not_an_object',
+        'task_id': task_id,
+        'received': received,
+        'hint': _METADATA_NOT_AN_OBJECT_HINT,
+    }
+
+
+class MetadataNotAnObjectError(TaskmasterError):
+    """Raised when an ``update_task`` metadata payload is not a JSON object.
+
+    Such a payload has no keys to merge, and treating it as a last-write-wins
+    replacement wiped the whole stored blob, ``done_provenance`` included
+    (task 6130). Subclasses :class:`TaskmasterError` with the
+    ``TASKMASTER_TOOL_ERROR`` code so existing ``TaskmasterError``
+    catchers/assertions keep working unchanged; call :meth:`to_error_dict`
+    for the canonical wire shape.
+
+    Attributes:
+        task_id: The task the rejected write targeted (``None`` if not supplied).
+        received: ``'invalid_json'`` for a payload ``json.loads`` rejects;
+            otherwise the JSON type it decoded to: ``'array'``, ``'null'``,
+            ``'string'``, ``'number'`` or ``'boolean'``.
+    """
+
+    def __init__(self, task_id: str | None, received: str) -> None:
+        self.task_id = task_id
+        self.received = received
+        super().__init__(
+            'TASKMASTER_TOOL_ERROR',
+            f'Refusing an update_task metadata payload that is not a JSON '
+            f'object (received: {received}); nothing was written. '
+            f'{_METADATA_NOT_AN_OBJECT_HINT}',
+        )
+
+    def to_error_dict(self) -> dict[str, Any]:
+        return metadata_not_an_object_error(self.task_id, self.received)
+
+
+class MetadataTooDeepError(TaskmasterError):
+    """Raised when an additive metadata merge is nested too deeply to recurse.
+
+    The write is refused and nothing is written: the stored metadata,
+    ``done_provenance`` included, is left unchanged. Keeps the
+    ``TASKMASTER_TOOL_ERROR`` code. Like :class:`AppendUnsupportedFieldError`
+    it has no ``to_error_dict()`` and reaches callers raw through
+    ``server/tool_errors.py::mcp_tool_errors``.
+
+    Attributes:
+        task_id: The task the rejected write targeted (``None`` if not supplied).
+    """
+
+    def __init__(self, task_id: str | None) -> None:
+        self.task_id = task_id
+        super().__init__(
+            'TASKMASTER_TOOL_ERROR',
+            f'Refusing an additive metadata merge for task {task_id!r}: the '
+            'payload and the stored metadata share a key path nested too deeply '
+            'to merge recursively (beyond the interpreter recursion limit). '
+            'Nothing was written; the stored metadata, done_provenance included, '
+            'is unchanged. Flatten the payload, or pass metadata_mode=\'merge\' '
+            '(without append=True) to overwrite each supplied top-level key '
+            'wholesale.',
+        )
+
+
+class AppendUnsupportedFieldError(TaskmasterError):
+    """Raised when ``update_task`` combines ``append=True`` with a REPLACE-ONLY column.
+
+    ``title``, ``description`` and ``priority`` can only ever be REPLACED —
+    ``append`` has never governed them; it governs only the ``details`` /
+    ``prompt`` concatenation and the metadata merge mode. Before task 4039
+    the pair was accepted silently and the incoming text OVERWROTE the
+    column, destroying multi-KB authored prose with no error and no warning.
+
+    This mirrors the loud-over-silent guards
+    ``sqlite_task_backend.py::_resolve_metadata_mode`` already applies to the
+    two destructive metadata flag combinations (the task-2180 metadata-wipe
+    and the task-3581 nested-metadata clobber) — same method, same shape of
+    destructive combination, same principle — for the text columns that
+    cannot append at all.
+
+    Keeps ``code='TASKMASTER_TOOL_ERROR'`` so every existing ``except
+    TaskmasterError`` site and ``err.code == 'TASKMASTER_TOOL_ERROR'`` branch
+    keeps working unchanged (the same compatibility trick
+    :class:`TaskNotFoundError` uses); the subclass exists for ``isinstance``
+    discrimination and so the MCP boundary reports a specific
+    ``error_type='AppendUnsupportedFieldError'``. Deliberately has no
+    ``to_error_dict()`` — unlike the two write-authority errors above it has
+    no historical ``success: False`` wire shape to reproduce, and it reaches
+    callers by propagating raw to ``server/tool_errors.py::mcp_tool_errors``.
+
+    Attributes:
+        fields: The offending replace-only field name(s), in
+            ``sqlite_task_backend.py::_REPLACE_ONLY_FIELDS`` order.
+        task_id: The task the rejected write targeted (``None`` if not supplied).
+    """
+
+    def __init__(self, fields: tuple[str, ...], task_id: str | None = None) -> None:
+        self.fields = fields
+        self.task_id = task_id
+        named = ', '.join(fields)
+        plural = 's' if len(fields) > 1 else ''
+        super().__init__(
+            'TASKMASTER_TOOL_ERROR',
+            f'Refusing an append=True write to {named}: append has NEVER applied '
+            f'to the {named} column{plural} and never will — these columns are '
+            'REPLACE-ONLY, so this write would OVERWRITE the current value, not '
+            'concatenate onto it. Accepting it silently destroyed authored prose '
+            'in four recorded live repros, including reify task 6586 and reify '
+            'task 5791, the latter wiping ~17KB of a human-ratified decomposition '
+            'record that existed nowhere else. To EXTEND the field, read-modify-'
+            'write: call get_task to read the current text, concatenate locally, '
+            f'then resend the COMPLETE new {named} with append omitted. To '
+            'REPLACE it deliberately, drop append (or pass append=False) to '
+            'confirm the overwrite. If the append=True was meant for details/'
+            'prompt/metadata, split it into a separate update_task call.',
+        )
+
+
+class NoFieldsToUpdateError(TaskmasterError):
+    """Raised when a task-metadata write is called with nothing to write.
+
+    Such a call can only bump ``updated_at``. Reporting it as a success
+    hides a caller whose real argument was dropped on the way in: in
+    esc-3147-7 and esc-3671-7 a misnamed ``metadata`` argument vanished, the
+    call wrote nothing, and the reply still said ``updated: True``. A call
+    with no legitimate purpose is refused rather than quietly accepted. One
+    class serves every writer that can be called empty
+    (``update_task``, ``stamp_audit_metadata``), so callers branch on one type.
+
+    Keeps ``code='TASKMASTER_TOOL_ERROR'`` and, like
+    :class:`AppendUnsupportedFieldError`, has no ``to_error_dict()``: it
+    reaches callers by propagating raw to ``server/tool_errors.py::mcp_tool_errors``,
+    which reports ``error_type='NoFieldsToUpdateError'``.
+
+    Attributes:
+        operation: The writer that refused the call, e.g. ``'update_task'``.
+        task_id: The task the refused call targeted.
+        accepted_fields: The parameter names that would have made the call a
+            write, in the order the backend declares them; empty when the
+            writer accepts any key (``stamp_audit_metadata``).
+    """
+
+    def __init__(
+        self, operation: str, task_id: str, accepted_fields: tuple[str, ...] = (),
+    ) -> None:
+        self.operation = operation
+        self.task_id = task_id
+        self.accepted_fields = accepted_fields
+        if accepted_fields:
+            supplied = (
+                f'none of {", ".join(accepted_fields)} was supplied, so there is '
+                'nothing to write and nothing was written. If you passed one of '
+                'these under another name, that argument was ignored: resend it '
+                'under the name listed here.'
+            )
+        else:
+            supplied = (
+                'no writable metadata field was supplied (machine-authored keys '
+                'are stripped), so there is nothing to write and nothing was '
+                'written.'
+            )
+        super().__init__(
+            'TASKMASTER_TOOL_ERROR',
+            f'Refusing {operation} for task {task_id}: {supplied}',
+        )
 
 
 __all__ = [
     'TASKMASTER_TOOL_ERROR',
     'TASKMASTER_UNAVAILABLE',
     'DuplicateCandidateKeyError',
+    'LeakedEnvelopeMarkupError',
     'TaskmasterError',
     'TaskNotFoundError',
     'StatusWriteAuthorityError',
     'DoneProvenanceWriteAuthorityError',
+    'DefectRecordsWriteAuthorityError',
+    'DeferralWriteAuthorityError',
+    'DeclaredScopeWriteAuthorityError',
+    'FollowupItemsRefusedError',
+    'DependencyCycle',
+    'MetadataNotAnObjectError',
+    'MetadataTooDeepError',
+    'AppendUnsupportedFieldError',
+    'NoFieldsToUpdateError',
     'status_via_update_task_error',
     'done_provenance_via_update_task_error',
+    'metadata_not_an_object_error',
 ]

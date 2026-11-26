@@ -1,0 +1,57 @@
+q=0.13|hetero
+  base                               1.447 | vs base +0.0±0.0 | vs base +0.0±0.0 | wrong conv/100 0.26 right 4.1 | own-solo 0.11 | kinds alone 0 sub 0 mixed 0 clean 0 | wait 22/35
+  base, class prior                  1.461 | vs base +1.0±0.9 | vs base +1.0±0.9 | wrong conv/100 0.17 right 2.7 | own-solo 0.16 | kinds alone 0 sub 0 mixed 0 clean 0 | wait 22/36
+  U w0                               1.425 | vs base -1.5±0.9 | vs base -1.5±0.9 | wrong conv/100 0.28 right 4.5 | own-solo 0.14 | kinds alone 119 sub 5 mixed 7 clean 301 | wait 22/36
+  U w0, class prior                  1.457 | vs base +0.7±1.4 | vs U w0 +2.2±1.3 | wrong conv/100 0.18 right 3.6 | own-solo 0.13 | kinds alone 137 sub 29 mixed 77 clean 209 | wait 22/38
+  U w1                               1.453 | vs base +0.5±0.9 | vs base +0.5±0.9 | wrong conv/100 0.34 right 4.3 | own-solo 0.12 | kinds alone 129 sub 1 mixed 0 clean 301 | wait 22/35
+  U w1, class prior                  1.439 | vs base -0.6±0.9 | vs U w1 -1.0±0.8 | wrong conv/100 0.28 right 3.3 | own-solo 0.17 | kinds alone 112 sub 1 mixed 3 clean 309 | wait 22/36
+q=0.05|a=0.50
+  base                               2.648 | vs base +0.0±0.0 | vs base +0.0±0.0 | wrong conv/100 0.01 right 0.1 | own-solo 0.10 | kinds alone 0 sub 0 mixed 0 clean 0 | wait 13/25
+  U w1                               2.782 | vs base +5.1±1.4 | vs base +5.1±1.4 | wrong conv/100 0.02 right 0.3 | own-solo 0.08 | kinds alone 153 sub 8 mixed 32 clean 227 | wait 12/25
+  U w1, name as probability          3.113 | vs base +17.6±2.1 | vs U w1 +11.9±1.6 | wrong conv/100 0.09 right 1.4 | own-solo 0.05 | kinds alone 103 sub 24 mixed 40 clean 257 | wait 11/23
+  U w1 strict, name as probability   3.073 | vs base +16.1±1.9 | vs U w1 +10.5±1.3 | wrong conv/100 0.05 right 1.1 | own-solo 0.05 | kinds alone 102 sub 27 mixed 39 clean 255 | wait 11/23
+  U w0, name as probability          3.662 | vs base +38.3±3.4 | vs base +38.3±3.4 | wrong conv/100 0.23 right 2.4 | own-solo 0.02 | kinds alone 74 sub 30 mixed 100 clean 250 | wait 8/22
+q=0.05|a=0.80
+  base                               2.648 | vs base +0.0±0.0 | vs base +0.0±0.0 | wrong conv/100 0.01 right 0.1 | own-solo 0.10 | kinds alone 0 sub 0 mixed 0 clean 0 | wait 13/25
+  U w1                               2.782 | vs base +5.1±1.4 | vs base +5.1±1.4 | wrong conv/100 0.02 right 0.3 | own-solo 0.08 | kinds alone 153 sub 8 mixed 32 clean 227 | wait 12/25
+  U w1, name as probability          3.903 | vs base +47.4±2.5 | vs U w1 +40.3±2.3 | wrong conv/100 0.33 right 3.7 | own-solo 0.03 | kinds alone 58 sub 19 mixed 33 clean 308 | wait 8/19
+  U w1 strict, name as probability   3.542 | vs base +33.8±2.4 | vs U w1 +27.3±2.1 | wrong conv/100 0.04 right 1.8 | own-solo 0.04 | kinds alone 80 sub 27 mixed 45 clean 271 | wait 9/21
+  U w0, name as probability          4.711 | vs base +77.9±7.5 | vs base +77.9±7.5 | wrong conv/100 0.29 right 4.3 | own-solo 0.01 | kinds alone 31 sub 20 mixed 103 clean 298 | wait 6/18
+q=0.05|a=0.95
+  base                               2.648 | vs base +0.0±0.0 | vs base +0.0±0.0 | wrong conv/100 0.01 right 0.1 | own-solo 0.10 | kinds alone 0 sub 0 mixed 0 clean 0 | wait 13/25
+  U w1                               2.782 | vs base +5.1±1.4 | vs base +5.1±1.4 | wrong conv/100 0.02 right 0.3 | own-solo 0.08 | kinds alone 153 sub 8 mixed 32 clean 227 | wait 12/25
+  U w1, name as probability          4.340 | vs base +63.9±3.2 | vs U w1 +56.0±2.8 | wrong conv/100 0.33 right 4.6 | own-solo 0.02 | kinds alone 44 sub 0 mixed 10 clean 358 | wait 7/18
+  U w1 strict, name as probability   3.917 | vs base +47.9±2.7 | vs U w1 +40.8±2.4 | wrong conv/100 0.08 right 2.9 | own-solo 0.02 | kinds alone 63 sub 24 mixed 43 clean 290 | wait 8/20
+  U w0, name as probability          6.305 | vs base +138.1±5.4 | vs base +138.1±5.4 | wrong conv/100 0.30 right 5.0 | own-solo 0.01 | kinds alone 16 sub 3 mixed 42 clean 378 | wait 5/15
+q=0.14|a=0.50
+  base                               1.402 | vs base +0.0±0.0 | vs base +0.0±0.0 | wrong conv/100 0.22 right 4.3 | own-solo 0.12 | kinds alone 0 sub 0 mixed 0 clean 0 | wait 22/36
+  U w1                               1.410 | vs base +0.5±0.7 | vs base +0.5±0.7 | wrong conv/100 0.32 right 4.6 | own-solo 0.13 | kinds alone 130 sub 1 mixed 0 clean 301 | wait 22/36
+  U w1, name as probability          1.425 | vs base +1.7±0.9 | vs U w1 +1.1±0.8 | wrong conv/100 0.42 right 5.0 | own-solo 0.13 | kinds alone 126 sub 1 mixed 1 clean 306 | wait 22/35
+  U w1 strict, name as probability   1.416 | vs base +1.0±0.8 | vs U w1 +0.5±0.5 | wrong conv/100 0.29 right 4.6 | own-solo 0.13 | kinds alone 128 sub 1 mixed 1 clean 303 | wait 22/35
+  U w0, name as probability          1.439 | vs base +2.7±1.0 | vs base +2.7±1.0 | wrong conv/100 0.48 right 5.8 | own-solo 0.10 | kinds alone 106 sub 6 mixed 16 clean 308 | wait 21/36
+q=0.14|a=0.80
+  base                               1.402 | vs base +0.0±0.0 | vs base +0.0±0.0 | wrong conv/100 0.22 right 4.3 | own-solo 0.12 | kinds alone 0 sub 0 mixed 0 clean 0 | wait 22/36
+  U w1                               1.410 | vs base +0.5±0.7 | vs base +0.5±0.7 | wrong conv/100 0.32 right 4.6 | own-solo 0.13 | kinds alone 130 sub 1 mixed 0 clean 301 | wait 22/36
+  U w1, name as probability          1.612 | vs base +15.0±1.4 | vs U w1 +14.3±1.5 | wrong conv/100 1.21 right 10.0 | own-solo 0.08 | kinds alone 79 sub 1 mixed 10 clean 340 | wait 19/32
+  U w1 strict, name as probability   1.442 | vs base +2.9±1.0 | vs U w1 +2.3±0.9 | wrong conv/100 0.34 right 5.1 | own-solo 0.09 | kinds alone 119 sub 5 mixed 11 clean 299 | wait 22/35
+  U w0, name as probability          1.666 | vs base +18.8±1.5 | vs base +18.8±1.5 | wrong conv/100 0.65 right 10.2 | own-solo 0.05 | kinds alone 63 sub 7 mixed 29 clean 335 | wait 18/31
+q=0.14|a=0.95
+  base                               1.402 | vs base +0.0±0.0 | vs base +0.0±0.0 | wrong conv/100 0.22 right 4.3 | own-solo 0.12 | kinds alone 0 sub 0 mixed 0 clean 0 | wait 22/36
+  U w1                               1.410 | vs base +0.5±0.7 | vs base +0.5±0.7 | wrong conv/100 0.32 right 4.6 | own-solo 0.13 | kinds alone 130 sub 1 mixed 0 clean 301 | wait 22/36
+  U w1, name as probability          1.881 | vs base +34.2±1.7 | vs U w1 +33.4±1.7 | wrong conv/100 1.01 right 14.1 | own-solo 0.04 | kinds alone 32 sub 0 mixed 0 clean 393 | wait 16/28
+  U w1 strict, name as probability   1.621 | vs base +15.6±1.3 | vs U w1 +15.0±1.4 | wrong conv/100 0.38 right 8.3 | own-solo 0.03 | kinds alone 63 sub 13 mixed 39 clean 321 | wait 19/32
+  U w0, name as probability          1.903 | vs base +35.8±1.7 | vs base +35.8±1.7 | wrong conv/100 1.06 right 14.4 | own-solo 0.06 | kinds alone 28 sub 0 mixed 1 clean 397 | wait 16/28
+q=0.14|swing.07/.21x24h
+  base                               1.413 | vs base +0.0±0.0 | vs base +0.0±0.0 | wrong conv/100 0.23 right 4.2 | own-solo 0.15 | kinds alone 0 sub 0 mixed 0 clean 0 | wait 24/39
+  base, adaptive prior               1.396 | vs base -1.2±1.2 | vs base -1.2±1.2 | wrong conv/100 0.12 right 2.8 | own-solo 0.16 | kinds alone 0 sub 0 mixed 0 clean 0 | wait 25/40
+  U w0                               1.403 | vs base -0.7±1.3 | vs base -0.7±1.3 | wrong conv/100 0.31 right 4.4 | own-solo 0.10 | kinds alone 123 sub 6 mixed 9 clean 296 | wait 24/39
+  U w0, adaptive prior               1.356 | vs base -4.0±2.1 | vs U w0 -3.4±2.0 | wrong conv/100 0.23 right 3.6 | own-solo 0.13 | kinds alone 135 sub 24 mixed 39 clean 249 | wait 25/42
+  U w1                               1.413 | vs base +0.0±1.0 | vs base +0.0±1.0 | wrong conv/100 0.31 right 4.4 | own-solo 0.13 | kinds alone 131 sub 0 mixed 0 clean 301 | wait 24/39
+  U w1, adaptive prior               1.310 | vs base -7.2±1.6 | vs U w1 -7.3±1.6 | wrong conv/100 0.22 right 2.8 | own-solo 0.26 | kinds alone 100 sub 1 mixed 5 clean 313 | wait 27/42
+q=0.14|swing.05/.23x48h
+  base                               1.604 | vs base +0.0±0.0 | vs base +0.0±0.0 | wrong conv/100 0.26 right 3.0 | own-solo 0.12 | kinds alone 0 sub 0 mixed 0 clean 0 | wait 18/39
+  base, adaptive prior               1.645 | vs base +2.5±1.7 | vs base +2.5±1.7 | wrong conv/100 0.12 right 1.8 | own-solo 0.13 | kinds alone 0 sub 0 mixed 0 clean 0 | wait 16/39
+  U w0                               1.602 | vs base -0.1±1.0 | vs base -0.1±1.0 | wrong conv/100 0.27 right 3.6 | own-solo 0.07 | kinds alone 113 sub 6 mixed 9 clean 298 | wait 17/39
+  U w0, adaptive prior               1.769 | vs base +10.3±3.5 | vs U w0 +10.4±3.7 | wrong conv/100 0.13 right 2.6 | own-solo 0.09 | kinds alone 130 sub 22 mixed 40 clean 252 | wait 15/40
+  U w1                               1.623 | vs base +1.2±0.9 | vs base +1.2±0.9 | wrong conv/100 0.28 right 3.4 | own-solo 0.12 | kinds alone 119 sub 0 mixed 0 clean 303 | wait 18/38
+  U w1, adaptive prior               1.534 | vs base -4.4±2.3 | vs U w1 -5.5±2.4 | wrong conv/100 0.17 right 1.9 | own-solo 0.28 | kinds alone 98 sub 2 mixed 7 clean 309 | wait 16/41

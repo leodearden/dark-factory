@@ -57,7 +57,7 @@ tasks:
       kind: grep
       pattern: _drift_land_count
       paths:
-      - orchestrator/src/orchestrator/merge_drift.py
+      - orchestrator/src/orchestrator/merge_lane/drift.py
       expect: present
 - label: ε
   task_id: 2887
@@ -71,7 +71,7 @@ tasks:
       kind: grep
       pattern: foreign_drift
       paths:
-      - orchestrator/src/orchestrator/merge_disposition.py
+      - orchestrator/src/orchestrator/merge_lane/disposition.py
       expect: present
 - label: ζ
   task_id: 2888

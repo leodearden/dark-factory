@@ -38,23 +38,23 @@ echo "${ORCH_CONFIG_PATH:-unset}"
 # If "unset": continue below.
 ```
 
-If unset, find the config file in the target project. Filenames vary across projects (no auto-discovery — every project chose its own name); check all common locations:
+If unset, the config is the target project's `dark-factory-orchestrator.yaml` — the
+canonical, required filename for every factory-operated project (`CLAUDE.md`, "Repo Map";
+it is what the dashboard's escalation-URL discovery keys on):
 
 ```bash
-ls "$TARGET_PROJECT"/dark-factory-orchestrator.yaml \
-   "$TARGET_PROJECT"/orchestrator.yaml \
-   "$TARGET_PROJECT"/orchestrator-config.yaml \
-   "$TARGET_PROJECT"/config.yaml \
-   "$TARGET_PROJECT"/orchestrator/config.yaml 2>/dev/null
+TARGET_CONFIG="$TARGET_PROJECT"/dark-factory-orchestrator.yaml
+ls "$TARGET_CONFIG"
 ```
 
-Known locations for the three current projects:
-
-| Project | TARGET_CONFIG |
-|---------|---------------|
-| dark-factory | `/home/leo/src/dark-factory/dark-factory-orchestrator.yaml` |
-| reify | `/home/leo/src/reify/orchestrator.yaml` |
-| autopilot-video | `/home/leo/src/autopilot-video/orchestrator-config.yaml` |
+As of 2026-09-29 every project under `DASHBOARD_KNOWN_PROJECT_ROOTS` carries that file.
+Dashboard discovery reads only that name: task 7138 retired the legacy spellings
+(`orchestrator.yaml`, `orchestrator-config.yaml`, `orchestrator/config.yaml`), and a bare
+`config.yaml` was never read. A project using any other name still shows its tasks, but until
+renamed its escalation-backed views (escalations, merge queue and halt status, task runtime
+state) go dark and its burndown run-slot capacity reads as unknown. A stray legacy file can still sit BESIDE the canonical one (autopilot-video has a
+`config.yaml`, solar-challenge-platform an `orchestrator.yaml` symlink), so never let a glob over
+the legacy names win over the canonical path when both exist.
 
 Verify the file actually points at the target:
 
@@ -154,7 +154,8 @@ submit_result = submit_task(
     metadata={
         "source": "prd-decomposition",
         "spawn_context": "parse_prd",
-        "modules": ["<path/to/module>"],
+        # sparse is fine — the architect widens scope at plan time. File paths only (a directory is rejected); use [] to defer entirely.
+        "files": ["<path/to/file.py>"],
     },
 )
 ticket = submit_result["ticket"]
@@ -167,6 +168,14 @@ if resolve["status"] == "created":
     task_id = resolve["task_id"]           # new task
 elif resolve["status"] == "combined":
     task_id = resolve["task_id"]           # merged into existing task — normal, not an error
+elif resolve["status"] == "refused":
+    # A deterministic guard rejected the candidate: no task was created and there
+    # is no task_id. Intended outcome — record resolve["reason"] and move on.
+    # Do NOT retry and do NOT record a task id.
+    note_refused(resolve["reason"])
+elif resolve["status"] in ("pending", "awaiting_curation"):  # open — resolve the SAME ticket again, never re-submit (skills/_shared/ticket-failure-handling.md)
+    # No task_id yet. Still open after the re-resolve: record the ticket id.
+    note_parked(ticket)
 elif resolve["status"] == "failed":
     # On `failed`: surface the reason to the user and skip this task (user can
     # resubmit manually after investigating).
@@ -183,7 +192,7 @@ Then set dependencies:
 add_dependency(id="2", depends_on="1", project_root="$TARGET_PROJECT")
 ```
 
-After all tasks are written, verify with `get_tasks(project_root="$TARGET_PROJECT")` and show the user the final state.
+After all tasks are written, verify with one `get_task(id=..., project_root="$TARGET_PROJECT")` per task just filed and show the user the final state.
 
 ### 5. Proceed to execution
 
@@ -210,7 +219,7 @@ Before launching, verify:
 
 2. **Environment** — `OPENAI_API_KEY` must be set (used for embeddings). The orchestrator's Claude agents authenticate via OAuth (Max subscription), not an API key — `ANTHROPIC_API_KEY` is **not** required.
 
-3. **Tasks exist** — verify with `get_tasks(project_root="$TARGET_PROJECT")`. If the task tree is empty, go to [Decompose PRD](#decompose-prd) first. Confirm the returned tasks actually belong to the target project — if you see dark-factory task titles when the user is in reify, your `project_root` is wrong; go fix step 3 above before launching.
+3. **Tasks exist** — verify with `get_tasks(project_root="$TARGET_PROJECT", statuses=["pending", "in-progress", "blocked"], fields=["title", "status"], page_size=20)`. If the task tree is empty, go to [Decompose PRD](#decompose-prd) first. Confirm the returned tasks actually belong to the target project — if you see dark-factory task titles when the user is in reify, your `project_root` is wrong; go fix step 3 above before launching.
 
 ### Launch
 
@@ -256,6 +265,8 @@ The orchestrator will:
 8. Print a summary report with per-task outcomes and costs
 
 Each task gets its own git worktree and branch (`task/<id>`). Merges use `--no-ff` to preserve history.
+
+That is one landing per verify, which is the stock pipeline. When `merge_deep.chain_cap > 0` and the queue holds 2 or more mergeable items, a single verify instead covers a **chain** of queued items: the chain is built in one lane by merging them onto the head in submission order, only its tip is verified, and on a pass the whole verified prefix is CAS-landed in submission order — so one passing verify lands several tasks. `chain_cap` is only the kill switch: the shipped default `0` disables this entirely, leaving the pipeline exactly as described above, and any positive value turns it on. How deep a chain goes comes from `merge_deep.depth_table` and the rolling pass estimate. A tip failure lands nothing via the chain; each of its items then verifies alone, so a good one lands and the bad one is blocked. See OPERATIONS.md §5 "Deep merge-ahead chains", `plans/merge-lane-policy-prd.md` D6/D7 and `plans/deep-merge-ahead-prd.md` for the full contract.
 
 The **debugger** is a distinct agent role invoked automatically on each verify failure. It receives the failure report (test output, lint errors, type errors) and makes targeted fixes. The verify→debug loop repeats up to `max_verify_attempts` times (default 5) before the task blocks.
 
@@ -315,7 +326,7 @@ If children (agent subprocesses) are orphaned, kill them by PID. Do **not** use 
 
 ## Reload Config (vs Restart)
 
-Some config edits don't need a restart. `mcp__escalation__reload_config` hot-applies a **safe, allowlisted subset** of `orchestrator.yaml` changes to the already-running orchestrator process — no SIGTERM, no cold start, no in-flight agents or verify suites killed.
+Some config edits don't need a restart. `mcp__escalation__reload_config` hot-applies a **safe, allowlisted subset** of `dark-factory-orchestrator.yaml` changes to the already-running orchestrator process — no SIGTERM, no cold start, no in-flight agents or verify suites killed.
 
 ### Why this exists
 
@@ -337,10 +348,11 @@ It takes **no path argument** — it always re-reads the process's own `ORCH_CON
 |---|---|
 | Per-role `models` / `budgets` / `max_turns` / `effort` / `timeouts` / `backends` | Reload |
 | `routing.*` (`allowed_models` / `ladder` / `per_model_daily_ceiling_usd` / `rules`) | Reload |
-| Steward grace (`steward_completion_timeout`, `steward_lifetime_budget`) | Reload |
+| Steward (`steward_completion_timeout`, `steward_lifetime_budget`, `steward_session_mode`) | Reload |
 | Scheduler + starvation-watchdog tuning, loop-pass thresholds (`idle_poll_secs`, `orphan_l0_timeout_secs`, watcher-rotation params) | Reload |
 | `review.*` checkpoint knobs, `unblock_auto.*`, `verify_env` | Reload |
-| `git.offline_lane_*` leaf tunables (test threads, poll interval, red-advance count) | Reload |
+| `git.offline_lane_*` leaf tunables (test threads, poll interval, persist passes, recheck seconds, red-unlanded hours) | Reload |
+| `merge_deep.*` — deep merge-ahead chains: `chain_cap` is the kill switch (`0`, the shipped default, is off; any positive value is on) and `depth_table` sets depth (mechanism: OPERATIONS.md §5 "Deep merge-ahead chains") | Reload |
 | `max_concurrent_tasks`, pool sizes / `verify_runners`, `escalation` bind host/port, `sandbox.backend`, `project_root`, merge-lane `git.*` structural fields (`branch_prefix`, `main_branch`, `persistent_merge_worktree`, …) | **Restart** — these are startup-baked (semaphores, pool sizes, bound sockets, module globals); reload reports them in `restart_required` without touching the running process |
 | Any code change (not just YAML) | **Restart** — reload only re-reads config, never code |
 
@@ -371,28 +383,29 @@ When unsure, reload first — it's cheap and non-destructive (fail-closed on bad
 
 Every call — success or failure — appends a `config_reload` event row to `runs.db` and fires a WARNING journal line whenever `restart_required` is non-empty or `reloaded=false`, so an AFK operator can audit what happened after the fact.
 
-See `CLAUDE.md`'s "Orchestrator Config Reload" section for the quick-reference tier summary, and `plans/config-hot-reload-prd.md` for the full allowlist and invariants.
+See `OPERATIONS.md` §"Config reload vs restart" for the tier summary, and `plans/config-hot-reload-prd.md` for the full allowlist and invariants.
 
 ---
 
 ## Model Routing
 
-The orchestrator resolves `(model, effort, budget_usd, max_turns)` for every LLM invocation through a layered resolver (`routing.resolve_route`). See `CLAUDE.md`'s "Model Routing" section for the `routing.*` config block, the closed match/set vocabulary, and the layered precedence — this section covers the operator-facing CLI and how to read what was actually decided.
+The orchestrator resolves `(model, effort, budget_usd, max_turns)` for every LLM invocation through a layered resolver (`routing.resolve_route`). See OPERATIONS.md §7 "Model routing" for the `routing.*` config block, the closed match/set vocabulary, and the layered precedence — this section covers the operator-facing CLI and how to read what was actually decided.
 
 ### Probing model availability
 
-`orchestrator probe-models` exercises every configured pool account (`config.usage_cap.accounts`) × candidate model — default `config.routing.allowed_models` plus the fable candidate model (`claude-fable-5`) — with a cheap 1-turn invocation, and writes a deterministic, committable YAML availability artifact:
+`orchestrator probe-models` exercises every configured pool account (`config.usage_cap.accounts`) × candidate model — default `config.routing.allowed_models` plus the fable candidate model (`routing.FABLE_CANDIDATE_MODEL`) — with a cheap 1-turn invocation, and writes a deterministic, committable YAML availability artifact:
 
 ```bash
 cd /home/leo/src/dark-factory
 uv run --project orchestrator orchestrator probe-models --config "$TARGET_CONFIG" \
-  [--models m1,m2] [--output PATH]
+  [--models m1,m2] [--output PATH] [--budget-usd N]
 ```
 
 | Option | Default | Meaning |
 |---|---|---|
 | `--config` | required (or `ORCH_CONFIG_PATH`) | Same target-project rule as every other subcommand — selects `project_root` and the probed account/model config |
 | `--models` | `routing.allowed_models` + the fable candidate | Comma-separated override for the probed model set |
+| `--budget-usd` | `routing.DEFAULT_PROBE_BUDGET_USD` | Per-invocation USD ceiling for each one-turn probe — must clear one turn of the most expensive probed model, or every pair reports `budget_too_low` |
 | `--output` | `routing.DEFAULT_PROBE_ARTIFACT_PATH` (`config/model-availability.yaml`) | Where to write the rendered artifact |
 
 Per `(account, model)` pair, the artifact records one status (from `routing.classify_probe_outcome`, except `no_token`/`invoke_error` which the probe runner assigns directly around it):
@@ -405,9 +418,12 @@ Per `(account, model)` pair, the artifact records one status (from `routing.clas
 | `capped` | account is at or near its usage cap |
 | `no_token` | account's OAuth token env var is unresolvable — the model was never invoked for it |
 | `invoke_error` | the invocation call itself raised (network/subprocess) |
-| `error` | any other classified failure outcome (not a raised exception — that's `invoke_error`) |
+| `budget_too_low` | the probe turn aborted on the local `--budget-usd` ceiling. The API accepted the request and consumed real tokens, so the model DID resolve for this account — the turn simply never completed. This is a mis-sized budget, NOT unavailability: re-run with a higher `--budget-usd` |
+| `error` | a classified failure outcome matching none of the rows above (not a raised exception — that's `invoke_error`; not a budget abort — that's `budget_too_low`) |
 
-This artifact is the input a future fable-admission gate consumes to decide whether `claude-fable-5` is safe to add to `routing.allowed_models` fleet-wide — running the probe does not itself admit it.
+A mis-sized but *positive* `--budget-usd` clears the parse-time check and still produces an artifact that is uniformly and plausibly wrong, so the command reports budget aborts itself rather than leaving them for whoever opens the YAML: any `budget_too_low` rows raise a stderr warning naming how many pairs aborted and the ceiling in force, and a run in which **every** probed pair aborted exits **non-zero** — it produced no availability evidence at all, so it must not read as a successful probe. The artifact is written either way, before the non-zero exit; `budget_too_low` rows are honest evidence about the budget and are not discarded.
+
+This artifact is the per-`(account, model)` availability evidence an admission decision consumes — including for `routing.FABLE_CANDIDATE_MODEL`, which the probe unions into its target set whether or not a config already admits it. Running the probe does not itself admit anything: admission is a per-config operator edit to that project's `routing.allowed_models`.
 
 ### Reading routing decisions
 
@@ -417,7 +433,7 @@ Today's per-invocation routing visibility: every resolved invocation emits a `ro
 
 ### Reading scoped cap-hit / failover cost events
 
-`cap_hit`, `near_cap`, and `failover` account events (fired by the `UsageGate`, see CLAUDE.md's "Model-scoped account caps") land in the `account_events` table of `data/orchestrator/runs.db` — the same SQLite file the `CostStore` shares with `EventStore`/`RunStore`. Each row's `details` column is a JSON blob:
+`cap_hit`, `near_cap`, and `failover` account events (fired by the `UsageGate`, see OPERATIONS.md §7, subsection "Model-scoped account caps (`usage_cap.scoped_cap_models`)") land in the `account_events` table of `data/orchestrator/runs.db` — the same SQLite file the `CostStore` shares with `EventStore`/`RunStore`. Each row's `details` column is a JSON blob:
 
 ```bash
 sqlite3 data/orchestrator/runs.db \
@@ -453,9 +469,11 @@ This queries the fused-memory task tree and displays each task's status and modu
 You can also query tasks directly via fused-memory MCP tools for more detail. Always pass `project_root="$TARGET_PROJECT"` — passing dark-factory's path here will return the wrong project's tasks:
 
 ```
-get_tasks(project_root="$TARGET_PROJECT")
+get_tasks(project_root="$TARGET_PROJECT", statuses=["pending", "in-progress", "blocked"], fields=["title", "status"], page_size=20)
 get_task(id="4", project_root="$TARGET_PROJECT")
 ```
+
+Never call `get_tasks` with only `project_root`: it returns every task in the store, far more than a session can read. For ids and statuses alone, use `get_statuses(project_root="$TARGET_PROJECT", page_size=500)`, advancing `offset` by `pagination.page_size` until `pagination.has_more` is false, or pass `ids=[...]` for known tasks. A bare `get_statuses` is unbounded too, and `page_size` must stay at or below 2000.
 
 If the returned tasks don't look like the project the user is in (e.g. you see dark-factory titles when the user is in reify), your `project_root` is wrong — re-run step 1 of "identify the target project" before continuing.
 
@@ -483,10 +501,10 @@ Tasks block at specific workflow stages. The approach depends on where it got st
 |-------|---------|------------|
 | **PLAN** | "architect failed" or no `plan.json` | Task description may be too vague. Update the task with more detail via `update_task`, reset to pending, and re-run. |
 | **EXECUTE** | "Execution iterations exhausted" | Implementer couldn't complete all plan steps in 10 iterations. Check `iterations.jsonl` for where it got stuck. May need to simplify the task or split it. |
-| **VERIFY** | "Verification attempts exhausted" | Tests/lint/typecheck fail persistently. Check the worktree for the actual failures: `cd <worktree> && pytest` / `ruff check` / `pyright`. Fix manually or update the task. **Caveat**: verification currently runs repo-wide commands by default — pre-existing errors in unrelated modules can block tasks. Check whether the failures are in the task's own modules or elsewhere. |
+| **VERIFY** | "Verification attempts exhausted" | Tests/lint/typecheck fail persistently. Check the worktree for the actual failures: `cd <worktree> && pytest` / `ruff check` / `pyright`. Fix manually or update the task. Verification runs the target's test, lint and type-check commands, scoped per subproject where a module `orchestrator.yaml` overrides them; a repo-wide command can still fail on errors in unrelated modules, so check whether the failures are in the task's own modules. If verify and a hand-run import disagree about code the task just wrote, trust verify (it reads the worktree's own tree) and see the `AttributeError` row of OPERATIONS.md Troubleshooting. |
 | **REVIEW** | "Review cycles exhausted" with blocking issues | Reviewers found design problems the architect couldn't resolve in 2 replan cycles. Read `.task/reviews/*.json` for the specific issues. May need architectural guidance written to memory. |
 | **MERGE** | "Merge conflicts" / "Post-merge verification failed" | Another task modified the same code. Check `git log --oneline main` for recent merges. May need to rebase the task branch manually. |
-| **MERGE (halted)** | "Merge queue halted" / `wip_conflict` or `unmerged_state` escalation blocking all other merges / merge outcomes `wip_halted`, `done_wip_recovery`, `wip_recovery_no_advance`, `unmerged_state` | Exactly one escalation owns the halt (tracked on the merge worker as `_halt_owner_esc_id`). Resolve **that specific escalation** via `/escalation-watcher` or `mcp__escalation__resolve_issue` to un-halt the queue. For `wip_conflict`, check the recovery branch named in the detail (`wip/recovery-<task>-<ts>`); for `unmerged_state`, inspect `project_root` with `git status` and resolve UU/AA/DD markers. Do NOT manually toggle the halt flag — ownership is the single source of truth. |
+| **MERGE (halted)** | "Merge queue halted" / `wip_conflict`, `unmerged_state`, or `stash_failed` escalation blocking all other merges / merge outcomes `wip_halted`, `done_wip_recovery`, `wip_recovery_no_advance`, `unmerged_state`, `stash_failed` | Exactly one escalation owns the halt (tracked on the merge worker as `_halt_owner_esc_id`). Resolve **that specific escalation** via `/escalation-watcher` or `mcp__escalation__resolve_issue` to un-halt the queue. For `wip_conflict`, check the recovery branch named in the detail (`wip/recovery-<task>-<ts>`); for `unmerged_state`, inspect `project_root` with `git status` and resolve UU/AA/DD markers; for `stash_failed`, inspect and commit `project_root`'s uncommitted WIP — do NOT use `git stash` (CLAUDE.md forbids it in any dark-factory checkout; `refs/stash` is shared across worktrees and the merge worker's advance path consumes the same stack, incident 13674d3c68). Do NOT manually toggle the halt flag — ownership is the single source of truth. |
 
 ### Manual resolution workflow
 
@@ -496,16 +514,40 @@ All paths below operate on the **target** project (`$TARGET_PROJECT`), not dark-
 2. **Diagnose**: read `.task/plan.json`, check test output, review `git log`
 3. **Fix**: make changes directly in the worktree
 4. **Verify**: run the target project's verify commands (look these up in `$TARGET_CONFIG` — Rust projects use `cargo test`/`cargo clippy`, Python projects use `pytest`/`ruff`/`pyright`, etc. — do not assume Python tooling)
-5. **Merge manually** (if the fix is good):
+5. **Merge manually** (if the fix is good) — capture the merge sha **at the moment of the merge**, never by re-reading `HEAD` later:
    ```bash
    cd "$TARGET_PROJECT"
-   git merge --no-ff task/<task-id>
+   branch=$(git symbolic-ref --quiet --short HEAD); echo "on branch=$branch"
+   [ "$branch" = "main" ] \
+     && git merge --no-ff task/<task-id> \
+     && MERGE_SHA=$(git rev-parse HEAD) \
+     && [ "$(git rev-parse -q --verify "$MERGE_SHA^2")" = "$(git rev-parse task/<task-id>)" ] \
+     && echo "MERGE_SHA=$MERGE_SHA"
    ```
+   The `&&` chain is the point, not style. `$TARGET_PROJECT` is a **machine-operated checkout** — the merge worker, the startup reconciler and git hooks all act on it directly — so `main` can advance between this step and step 6, and a `git rev-parse HEAD` read there can return an *unrelated* task's merge. Chaining short-circuits a **conflicted** merge, so `MERGE_SHA` is never set from a merge that failed — resolve the conflict first and re-run the chain. But two paths exit **0 without creating this task's merge commit**, which is why the chain also checks the merge commit's second parent and opens with the branch guard. (a) **`Already up to date.`** — when the branch tip is already an ancestor of `main`, `git merge --no-ff` exits 0 and creates *no* merge commit at all, so `git rev-parse HEAD` returns whatever is on main's tip, which under a live merge worker can be an unrelated task's merge; the second-parent check rejects that, because `$MERGE_SHA^2` is then some other branch's tip (or absent). (b) **not on `main`** — the merge genuinely SUCCEEDS and `MERGE_SHA` points at a real merge commit of this branch that simply is not on main (measured: `git merge-base --is-ancestor "$MERGE_SHA" main` rc=1); the second-parent check *cannot* catch this, since it is a bona-fide merge of this branch, which is why the branch guard is the **first link of the same `&&` chain** — so a non-`main` HEAD short-circuits the chain and `git merge` never runs. Merging onto the wrong branch is itself the damage, not just a bad capture, so the guard has to *abort*, not merely warn: a standalone `[ ... ] || { echo "NOT ON main - stop"; }` before an unchained `git merge` prints its warning and then merges anyway (reproduced on git 2.43.0), and the chain still prints a `MERGE_SHA=` because the second-parent check passes. The `echo "on branch=$branch"` runs unconditionally so the guard's verdict is visible either way rather than being silent short-circuit. Stamp only a `MERGE_SHA=` the chain actually printed.
 6. **Update task status**:
    ```
-   set_task_status(id="<task-id>", status="done", project_root="$TARGET_PROJECT", done_provenance={"commit": "<merge-commit-sha>"})
+   set_task_status(id="<task-id>", status="done", project_root="$TARGET_PROJECT", done_provenance={"kind": "merged", "commit": "<merge-commit-sha>"})
    ```
-   Use `{"commit": "<sha>"}` when a merge commit contains the landed work (the normal case — read the SHA from `git log -1 --format=%H` after the merge). Use `{"note": "<one-sentence explanation>"}` for fast-forward merges or when the work was covered by a sibling task and no single commit applies.
+   `kind` is **required** — `_validate_done_provenance` (`fused-memory/src/fused_memory/middleware/task_interceptor.py`) rejects a kind-less blob with `done_provenance.kind is required`, and `DoneProvenance.kind` (`shared/src/shared/task_metadata.py`) has no default. Use `{"kind": "merged", "commit": "<sha>"}` when this branch supplied the merge you just performed — **the normal case here**, since step 5 merged by hand; use `{"kind": "found_on_main", "commit": "<sha>", "note": "<why>"}` when the work was already on main.
+
+   **Hand-merge carve-out — read this before reaching for the ladder.** `git merge --no-ff` in step 5 writes the subject `Merge branch 'task/<task-id>'`, which the orchestrator-shaped marker subject `Merge task/<task-id> into main` deliberately does **not** match. So on this path the marker search comes back **empty on a merge that plainly landed** — expected, not a signal. The commit to stamp is the one step 5 captured: `{"kind": "merged", "commit": "$MERGE_SHA"}`. It is attributable because step 5 proved its **second parent is this branch's tip** — that is what makes it a merge commit that brought *this* branch in, not whatever has landed on main since — and it was captured on `main`. **This path is explicitly not subject to the citation gate** in the shared doc below, which governs the fast-forward path only. If step 5's chain printed no `MERGE_SHA=`, this carve-out does **not** apply: fall through to **If `MERGE_SHA` is not in hand** below, which re-derives from the hand-merge subject, proves containment, and already bans a bare `git rev-parse HEAD`.
+
+   **If `MERGE_SHA` is not in hand** — step 6 reached in a fresh shell, a resumed session, or a merge performed earlier — do **not** substitute `git rev-parse HEAD`. Re-derive by the *hand-merge* subject and prove containment first:
+   ```bash
+   S="Merge branch 'task/<task-id>'"
+   sha=$(git log main --fixed-strings --grep="$S" --format='%H%x09%s' \
+           | awk -F'\t' -v s="$S" '$2==s && !seen {print $1; seen=1}')
+   echo "hand-merge sha=$sha"
+   [ -n "$sha" ] && { git merge-base --is-ancestor task/<task-id> "$sha"; echo "containment rc=$?"; }
+   ```
+   `--fixed-strings` against the full quoted subject is substring-safe — the trailing `'` stops `task/1` matching inside `Merge branch 'task/10'`. The `awk` half selects the newest hit whose **subject** is exactly that, scanning past commits that merely quote it in a body; **do not add `--max-count=1`**, which would stop at the newest *message* match and discard a genuine merge shadowed behind it — see [step 1](../_shared/deriving-landed-sha.md#step-1-subject-check) for the measured population. Stamp `$sha` only when it is **non-empty AND containment rc=0**, which together prove that merge brought *this* branch in — the subject conjunct is already discharged by the selection. The subject conjunct is load-bearing and **containment does not supply it**: `git log --grep` matches the whole commit message, so a commit that merely *quotes* the hand-merge subject in its body is matched too, and containment cannot reject it — containment exists to reject a **stale** marker from a previous incarnation (whose tip is a *descendant*, not an ancestor), but for a branch that genuinely landed earlier, *any* later commit on main has the branch as an ancestor and so passes rc=0. This is the same body-match hole [step 1](../_shared/deriving-landed-sha.md#step-1-subject-check) closes for the orchestrator-shaped marker. rc=1 means it did not (a different or earlier merge), rc=128 means one of the two shas did not resolve, and an empty `$sha` means no commit on main carries the hand-merge subject: on any of those, stamp nothing here and fall through to the ladder below. **Never stamp a bare `git rev-parse HEAD`** — that is main's current tip, not necessarily your merge, and the server's only backstop (`git merge-base --is-ancestor <sha> main`) passes for every recent commit on main, so nothing downstream would catch the substitution.
+
+   **Otherwise** — when the work was already on main and you are deriving rather than recording a merge you performed — derive the sha with the task-scoped ladder, never from main's current HEAD and never from an eyeballed listing: [`skills/_shared/deriving-landed-sha.md`](../_shared/deriving-landed-sha.md#the-ladder), the single normative copy (exact-subject marker search, ref-existence gate, containment, the group-merge candidate, the phantom-branch citation gate, and the `DoneProvenance` contract). Run it in full. Two adaptations for this call site: run every command in `$TARGET_PROJECT`, not dark-factory, and the shared doc writes the task id as `<TASK_ID>` where this workflow writes `<task-id>` — same value.
+
+   On the ladder's genuine not-landed outcomes — rc=0's **phantom-branch** exit, rc=1 **outside** both the `coalesce-*` and [rebased-solo-landing](../_shared/deriving-landed-sha.md#rebased-solo-landing) arms, and rc=128 with an empty marker search **outside** the `coalesce-*` arm — stamp nothing and report, rather than substituting a convenient sha. A citation gate that is **un-evaluable** (`git.commit_citation_pattern: ""`) proves neither verdict, and nor does the ladder's [landing-unattributable](../_shared/deriving-landed-sha.md#landing-unattributable) verdict: stamp nothing on either, and report each as such rather than as not-landed.
+
+   A note-only `{"note": "<one-sentence explanation>"}` payload is **no longer accepted** — the post-3092 hardening requires a commit on every kind. For a fast-forward merge, or when the work was covered by a sibling task, still cite a commit: `{"kind": "found_on_main", "commit": "<the commit on main that cites this task>", "note": "<one-sentence explanation>"}`, derived task-scoped as above.
 7. **Clean up worktree** (from inside `$TARGET_PROJECT`):
    ```bash
    git worktree remove .worktrees/<task-id>
@@ -518,10 +560,11 @@ If the block was caused by missing architectural context, write it to memory so 
 
 ```
 add_memory(
-  content="<the decision or convention that was missing>",
+  content="Task 3127 was blocked on <the decision or convention that was missing>",
   category="decisions_and_rationale",  # or "preferences_and_norms" for conventions
   project_id="<target project_id from TARGET_CONFIG>",
-  agent_id="claude-interactive"
+  agent_id="claude-interactive",
+  entities=[{'kind': 'task', 'id': 3127}]  # replace 3127 with the blocked task id here and in content; [] if none
 )
 ```
 
@@ -536,8 +579,10 @@ If tasks already exist from a prior session, first assess their state before re-
 ### 1. Audit the task tree
 
 ```
-get_tasks(project_root="$TARGET_PROJECT")
+get_tasks(project_root="$TARGET_PROJECT", statuses=["pending", "in-progress", "blocked"], fields=["title", "status", "dependencies"], page_size=200, offset=0)
 ```
+
+Page through the whole open set: advance `offset` by `pagination.page_size` until `pagination.has_more` is false. A task or dependency edge on a page you did not read is not missing.
 
 Review the task tree to understand the current state. **Do not change the status of existing tasks** — they may have been set by the user or another session. If a task's status looks wrong, ask the user before changing it.
 
@@ -557,35 +602,9 @@ The config file is selected via `--config <path>` or `ORCH_CONFIG_PATH=<path>` �
 
 YAML values in the loaded config support `${VAR_NAME}` and `${VAR_NAME:default}` environment variable expansion.
 
-### Core settings
+### Core settings and per-role settings
 
-| Setting | config.yaml | What it controls |
-|---------|-------------|-----------------|
-| `max_concurrent_tasks` | 24 | Parallel task workflows |
-| `max_per_module` | 1 | Tasks per code module (serialization) |
-| `max_execute_iterations` | 10 | Implementer retries before blocking |
-| `max_verify_attempts` | 5 | Debug-fix cycles before blocking |
-| `max_review_cycles` | 2 | Review-replan loops before blocking |
-| `lock_depth` | 4 | Module path depth for lock normalization |
-| `test_command` | pytest | Verification test runner |
-| `lint_command` | ruff check ... | Verification linter |
-| `type_check_command` | pyright (per-package) | Verification type checker |
-| `escalation.port` | 8102 | Escalation MCP server port |
-| `escalation.queue_dir` | data/escalations | Escalation queue directory |
-| `sandbox.enabled` | false | Enable bwrap filesystem sandbox |
-
-### Per-role settings
-
-Each role has model, budget, max turns, reasoning effort, and backend:
-
-| Role | Model | Budget | Turns | Effort | Backend |
-|------|-------|--------|-------|--------|---------|
-| architect | opus | $5 | 50 | max | claude |
-| implementer | sonnet | $10 | 80 | max | claude |
-| debugger | sonnet | $5 | 50 | max | claude |
-| reviewer | sonnet | $2 | 30 | medium | claude |
-| merger | opus | $5 | 50 | max | claude |
-| module_tagger | (sonnet) | ($2) | (30) | medium | claude |
+Values are not copied here, because they drift. Shipped defaults live in `orchestrator/src/orchestrator/defaults.yaml`, deep-merged under the target project's `dark-factory-orchestrator.yaml`, which overrides them. Read the target's file for the values in force: concurrency, lock depth, per-role model, effort, budget and max turns, escalation port, and the verify commands. OPERATIONS.md §7 "Model routing" explains how a role's model and effort are finally resolved.
 
 ### Module overrides
 
@@ -595,22 +614,8 @@ Subprojects can override verification commands by placing an `orchestrator.yaml`
 
 The `usage_cap` section configures automatic failover between Max subscription accounts when usage caps are hit. Accounts are tried in order; when one is capped, the orchestrator switches to the next and starts a background probe to detect when the capped account resets.
 
-`usage_cap.scoped_cap_models: list[str]` (default `['claude-fable-5']`) adds a **model-scoped** cap dimension on top of that per-account failover: a cap hit while running a listed model caps only that account's scope for that model — the account keeps serving general (non-listed-model) work untouched — and a general cap-hit always caps the whole account (every scope). `scoped_cap_models: []` is the kill switch, disabling scope tracking entirely. See CLAUDE.md's "Model-scoped account caps" (under "Model Routing") for the full scope semantics and how they interact with the `resolve_route` fail-safe check.
+`usage_cap.scoped_cap_models: list[str]` (default `['claude-fable-5']`) adds a **model-scoped** cap dimension on top of that per-account failover: a cap hit while running a listed model caps only that account's scope for that model — the account keeps serving general (non-listed-model) work untouched — and a general cap-hit always caps the whole account (every scope). `scoped_cap_models: []` is the kill switch, disabling scope tracking entirely. See OPERATIONS.md §7, subsection "Model-scoped account caps (`usage_cap.scoped_cap_models`)", for the full scope semantics and how they interact with the `resolve_route` fail-safe check.
 
 `usage_cap.*`, including `scoped_cap_models`, is **restart-tier** — it is not in `RELOADABLE_FIELDS`, so `mcp__escalation__reload_config` won't apply a change to it; see "Reload Config (vs Restart)" above.
 
 Override via YAML file (`--config`) or environment variables (`ORCH_MAX_CONCURRENT_TASKS=5`, `ORCH_MODELS__ARCHITECT=sonnet`).
-
----
-
-## Known Issues & Workarounds
-
-These are active issues that may affect orchestrator runs. Check the task tree for fix status.
-
-### Verification runs repo-wide (task 45)
-
-The verify step runs `ruff check`, `pyright`, and `pytest` with repo-wide scope by default. Pre-existing lint/type errors in modules outside a task's scope cause verification to fail even when the task's own code is clean. **Workaround**: ensure main is clean before starting a run (`ruff check && pyright` should pass). Module-scoped verification is planned but not yet implemented.
-
-### Worktree imports resolve from main tree (task 46)
-
-Worktrees share the main tree's `.venv`. Python imports resolve from the installed (main) package, not the worktree's modified source. New methods or changed signatures in worktree code fail at test time with `AttributeError` or assertion mismatches. **Workaround**: if a task blocks at verify with import errors for code it just wrote, manually verify the code is correct, merge to main, and confirm tests pass post-merge.

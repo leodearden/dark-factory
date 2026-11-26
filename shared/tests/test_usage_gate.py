@@ -14,10 +14,13 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _capacity_skip import looks_like_capacity_failure
+from _measured_cli_results import MEASURED_ORG_DISABLED_403
+from _oauth_accounts import available_tokens
 from test_config_dir import PROBE_PREFIX, find_dead_pid, plant
 
 from shared.cli_invoke import AgentResult
-from shared.config_dir import CONFIG_DIR_PREFIX, TaskConfigDir
+from shared.config_dir import CONFIG_DIR_PREFIX, TaskConfigDir, reset_sweep_once_state
 from shared.config_models import AccountConfig, UsageCapConfig
 from shared.invocation_outcome import CapHit, NearCap, classify_invocation
 from shared.usage_gate import (
@@ -72,36 +75,6 @@ def make_mock_cost_store() -> AsyncMock:
     store = AsyncMock()
     store.save_account_event = AsyncMock(return_value=None)
     return store
-
-
-@pytest.fixture
-def real_probe_dir_sweep():
-    """Opt out of the module-wide sweep neutralizer below (task 3086).
-
-    Request this from any test that must exercise the real sweep. Such a test
-    is responsible for redirecting the sweep away from the real /tmp — e.g.
-    ``patch('shared.config_dir.tempfile.gettempdir', return_value=str(tmp_path))``.
-    """
-    return True
-
-
-@pytest.fixture(autouse=True)
-def _keep_gates_off_the_real_tmp(request):
-    """Neutralize the probe-dir sweep for every gate built in this module.
-
-    ``UsageGate.__init__`` sweeps ``tempfile.gettempdir()`` (task 3086), so
-    the first real gate constructed in a pytest process would scandir the
-    developer's actual /tmp and delete real dead-PID probe dirs — a
-    multi-second stall inside a unit test, and a mutation no test asked for.
-    Defaulting it off also removes the ordering coupling that the process-wide
-    ``_probe_dir_sweep_done`` guard would otherwise create between test
-    classes. Tests that want the real thing request ``real_probe_dir_sweep``.
-    """
-    if 'real_probe_dir_sweep' in request.fixturenames:
-        yield
-        return
-    with patch('shared.usage_gate.sweep_stale_pid_dirs', return_value=0):
-        yield
 
 
 # ---------------------------------------------------------------------------
@@ -559,6 +532,34 @@ class TestBeforeInvokeGuardConsistency:
 
 
 # ---------------------------------------------------------------------------
+# Real _run_probe against a faked subprocess — shared by the probe classes below
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def probing_gate() -> tuple[UsageGate, AccountState]:
+    """A (gate, acct) pair running the real _run_probe with its config dir mocked."""
+    gate = make_gate(['probe-acct'])
+    del gate._run_probe  # drop make_gate's instance mock; use the class method
+    acct = gate._accounts[0]
+    config_dir = MagicMock()
+    config_dir.path = Path('/tmp/probe-test')
+    # _config_dir_for(acct) resolves via _probe_config_dirs[acct.name] first
+    # (task 2139), so both seams point at the same mock.
+    gate._probe_config_dir = config_dir
+    gate._probe_config_dirs = {acct.name: config_dir}
+    return gate, acct
+
+
+def _fake_probe_proc(returncode: int, stdout: bytes, stderr: bytes = b'') -> MagicMock:
+    proc = MagicMock()
+    proc.returncode = returncode
+    proc.pid = 12345
+    proc.communicate = AsyncMock(return_value=(stdout, stderr))
+    return proc
+
+
+# ---------------------------------------------------------------------------
 # UsageGate probe process-group tests (step-23 / step-24)
 # ---------------------------------------------------------------------------
 
@@ -567,38 +568,19 @@ class TestBeforeInvokeGuardConsistency:
 class TestUsageGateProbeProcessGroup:
     """_run_probe must spawn its subprocess in a fresh process group."""
 
-    @pytest.fixture
-    def gate_with_account(self) -> tuple[UsageGate, AccountState]:
-        """Return a (gate, acct) pair with _probe_config_dir mocked."""
-        gate = make_gate(['probe-acct'])
-        # Replace the mock inserted by make_gate with the real method for testing.
-        del gate._run_probe  # remove instance-level mock; fall back to class method
-        acct = gate._accounts[0]
-        # Stub the probe config dir to avoid real filesystem side-effects.
-        gate._probe_config_dir = MagicMock()
-        gate._probe_config_dir.path = Path('/tmp/probe-test')
-        gate._probe_config_dir.write_credentials = MagicMock()
-        # _config_dir_for(acct) resolves via _probe_config_dirs[acct.name] first
-        # (task 2139), so the per-account entry must point at the same mock.
-        gate._probe_config_dirs = {acct.name: gate._probe_config_dir}
-        return gate, acct
-
     async def test_usage_gate_probe_passes_start_new_session_true(
-        self, gate_with_account: tuple[UsageGate, AccountState]
+        self, probing_gate: tuple[UsageGate, AccountState]
     ) -> None:
         """create_subprocess_exec is called with start_new_session=True.
 
         Failing test — _run_probe does not pass that kwarg yet.
         """
-        gate, acct = gate_with_account
+        gate, acct = probing_gate
         captured_kwargs: dict = {}
 
         async def fake_exec(*args: object, **kwargs: object) -> MagicMock:
             captured_kwargs.update(kwargs)
-            proc = MagicMock()
-            proc.returncode = 0
-            proc.communicate = AsyncMock(return_value=(b'{"ok": true}', b''))
-            return proc
+            return _fake_probe_proc(0, b'{"ok": true}')
 
         with patch('shared.usage_gate.asyncio.create_subprocess_exec',
                    side_effect=fake_exec):
@@ -609,13 +591,13 @@ class TestUsageGateProbeProcessGroup:
         )
 
     async def test_usage_gate_probe_cleanup_uses_terminate_process_group(
-        self, gate_with_account: tuple[UsageGate, AccountState]
+        self, probing_gate: tuple[UsageGate, AccountState]
     ) -> None:
         """TimeoutError branch must await terminate_process_group, not bare kill.
 
         Failing test — shared.usage_gate does not import terminate_process_group yet.
         """
-        gate, acct = gate_with_account
+        gate, acct = probing_gate
 
         proc = MagicMock()
         proc.returncode = None
@@ -635,6 +617,34 @@ class TestUsageGateProbeProcessGroup:
         mock_tpg.assert_awaited_once()
 
 
+@pytest.mark.asyncio
+async def test_usage_gate_probe_child_env_carries_only_the_probed_credential(
+    probing_gate: tuple[UsageGate, AccountState], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The probe child sees its own account's token and config dir, never the pool."""
+    gate, acct = probing_gate
+    monkeypatch.setenv('CLAUDE_OAUTH_TOKEN_A', 'pool-a-' + 'A' * 41)
+    monkeypatch.setenv('CLAUDE_OAUTH_TOKEN_B', 'pool-b-' + 'B' * 41)
+    monkeypatch.setenv('OPENAI_API_KEY', 'openai-' + 'o' * 41)
+    captured_envs: list[dict] = []
+
+    async def fake_exec(*args: object, **kwargs: object) -> MagicMock:
+        env = kwargs.get('env')
+        assert isinstance(env, dict)
+        captured_envs.append(env)
+        return _fake_probe_proc(0, b'{"ok": true}')
+
+    with patch('shared.usage_gate.asyncio.create_subprocess_exec', side_effect=fake_exec):
+        await gate._run_probe(acct)
+
+    (env,) = captured_envs
+    assert [k for k in env if k.startswith('CLAUDE_OAUTH_TOKEN_')] == []
+    assert 'OPENAI_API_KEY' not in env
+    assert 'ANTHROPIC_API_KEY' not in env
+    assert env['CLAUDE_CODE_OAUTH_TOKEN'] == acct.token
+    assert env['CLAUDE_CONFIG_DIR'] == str(gate._config_dir_for(acct).path)
+
+
 # ---------------------------------------------------------------------------
 # _run_probe exit-code classification — distinguish local budget cap
 # (API accepted the request) from real Anthropic-side failures.
@@ -645,34 +655,17 @@ class TestUsageGateProbeProcessGroup:
 class TestUsageGateProbeExitCodeClassification:
     """_run_probe must NOT treat local $0.01 budget exhaustion as a cap."""
 
-    @pytest.fixture
-    def gate_with_account(self) -> tuple[UsageGate, AccountState]:
-        """Return a (gate, acct) pair with _probe_config_dir mocked."""
-        gate = make_gate(['probe-acct'])
-        del gate._run_probe  # fall back to class method
-        acct = gate._accounts[0]
-        gate._probe_config_dir = MagicMock()
-        gate._probe_config_dir.path = Path('/tmp/probe-test')
-        gate._probe_config_dir.write_credentials = MagicMock()
-        # _config_dir_for(acct) resolves via _probe_config_dirs[acct.name] first
-        # (task 2139), so the per-account entry must point at the same mock.
-        gate._probe_config_dirs = {acct.name: gate._probe_config_dir}
-        return gate, acct
-
     async def test_probe_local_budget_exhaustion_returns_true(
-        self, gate_with_account: tuple[UsageGate, AccountState]
+        self, probing_gate: tuple[UsageGate, AccountState]
     ) -> None:
         """Non-zero exit + subtype=error_max_budget_usd → success (API accepted)."""
-        gate, acct = gate_with_account
+        gate, acct = probing_gate
         stdout = (
             b'{"subtype":"error_max_budget_usd",'
             b'"total_cost_usd":0.053,'
             b'"errors":["Reached maximum budget ($0.01)"]}'
         )
-        proc = MagicMock()
-        proc.returncode = 1
-        proc.pid = 12345
-        proc.communicate = AsyncMock(return_value=(stdout, b''))
+        proc = _fake_probe_proc(1, stdout)
 
         with patch('shared.usage_gate.asyncio.create_subprocess_exec',
                    return_value=proc):
@@ -681,15 +674,12 @@ class TestUsageGateProbeExitCodeClassification:
         assert result is True
 
     async def test_probe_non_budget_error_still_returns_false(
-        self, gate_with_account: tuple[UsageGate, AccountState]
+        self, probing_gate: tuple[UsageGate, AccountState]
     ) -> None:
         """Non-zero exit + any other subtype → failure (unchanged behavior)."""
-        gate, acct = gate_with_account
+        gate, acct = probing_gate
         stdout = b'{"subtype":"error_api","errors":["auth failed"]}'
-        proc = MagicMock()
-        proc.returncode = 1
-        proc.pid = 12345
-        proc.communicate = AsyncMock(return_value=(stdout, b''))
+        proc = _fake_probe_proc(1, stdout)
 
         with patch('shared.usage_gate.asyncio.create_subprocess_exec',
                    return_value=proc):
@@ -698,30 +688,258 @@ class TestUsageGateProbeExitCodeClassification:
         assert result is False
 
     async def test_probe_cap_prefix_wins_over_budget_json(
-        self, gate_with_account: tuple[UsageGate, AccountState]
+        self, probing_gate: tuple[UsageGate, AccountState]
     ) -> None:
         """A cap prefix in stderr forces False even if stdout has budget JSON.
 
         Preserves the conservative bias documented at usage_gate._run_probe —
         any whiff of a real cap message keeps the account paused.
         """
-        gate, acct = gate_with_account
+        gate, acct = probing_gate
         stderr = b"You've hit your 5-hour usage limit. Resets at 3pm."
         stdout = (
             b'{"subtype":"error_max_budget_usd",'
             b'"total_cost_usd":0.053,'
             b'"errors":["Reached maximum budget ($0.01)"]}'
         )
-        proc = MagicMock()
-        proc.returncode = 1
-        proc.pid = 12345
-        proc.communicate = AsyncMock(return_value=(stdout, stderr))
+        proc = _fake_probe_proc(1, stdout, stderr)
 
         with patch('shared.usage_gate.asyncio.create_subprocess_exec',
                    return_value=proc):
             result = await gate._run_probe(acct)
 
         assert result is False
+
+
+# ---------------------------------------------------------------------------
+# _run_probe re-admits an account only on POSITIVE evidence the API served the
+# call (task 5944) — never on the mere absence of recognised failure text.
+# ---------------------------------------------------------------------------
+
+
+SERVED_SUCCESS_RESULT = json.dumps({
+    'type': 'result',
+    'subtype': 'success',
+    'is_error': False,
+    'result': 'ok',
+    'num_turns': 1,
+    'total_cost_usd': 0.002,
+}).encode()
+
+
+@pytest.mark.asyncio
+class TestUsageGateProbeRequiresServedResult:
+    """_run_probe returns True only when the CLI result proves it was served."""
+
+    async def _probe(
+        self, gate: UsageGate, acct: AccountState, returncode: int, stdout: bytes,
+    ) -> bool:
+        proc = _fake_probe_proc(returncode, stdout)
+        with patch('shared.usage_gate.asyncio.create_subprocess_exec',
+                   return_value=proc):
+            return await gate._run_probe(acct)
+
+    async def test_exit_0_with_the_measured_403_result_is_not_served(
+        self, probing_gate: tuple[UsageGate, AccountState]
+    ) -> None:
+        gate, acct = probing_gate
+        assert await self._probe(gate, acct, 0, MEASURED_ORG_DISABLED_403.encode()) is False
+
+    async def test_exit_0_with_is_error_true_and_no_status_is_not_served(
+        self, probing_gate: tuple[UsageGate, AccountState]
+    ) -> None:
+        gate, acct = probing_gate
+        stdout = json.dumps({
+            'type': 'result',
+            'subtype': 'success',
+            'is_error': True,
+            'result': 'something failed',
+        }).encode()
+        assert await self._probe(gate, acct, 0, stdout) is False
+
+    async def test_exit_0_with_empty_stdout_is_not_served(
+        self, probing_gate: tuple[UsageGate, AccountState]
+    ) -> None:
+        gate, acct = probing_gate
+        assert await self._probe(gate, acct, 0, b'') is False
+
+    async def test_exit_0_with_non_json_stdout_is_not_served(
+        self, probing_gate: tuple[UsageGate, AccountState]
+    ) -> None:
+        gate, acct = probing_gate
+        assert await self._probe(gate, acct, 0, b'ok') is False
+
+    async def test_exit_0_served_success_result_is_accepted(
+        self, probing_gate: tuple[UsageGate, AccountState]
+    ) -> None:
+        gate, acct = probing_gate
+        assert await self._probe(gate, acct, 0, SERVED_SUCCESS_RESULT) is True
+
+    @pytest.mark.parametrize(
+        ('result', 'served'),
+        [
+            (
+                {
+                    'type': 'result',
+                    'subtype': 'error_max_budget_usd',
+                    'total_cost_usd': 0.053,
+                },
+                True,
+            ),
+            (
+                {
+                    'type': 'result',
+                    'subtype': 'error_max_budget_usd',
+                    'total_cost_usd': 0,
+                    'api_error_status': 403,
+                },
+                False,
+            ),
+            (
+                {
+                    'type': 'result',
+                    'subtype': 'success',
+                    'is_error': False,
+                    'api_error_status': 529,
+                    'result': 'Overloaded',
+                },
+                False,
+            ),
+        ],
+        ids=[
+            'local-budget-cap-is-served',
+            'budget-cap-with-api-error-status-is-not-served',
+            'api-error-status-alone-is-not-served',
+        ],
+    )
+    async def test_exit_0_verdict_on_edge_results(
+        self,
+        probing_gate: tuple[UsageGate, AccountState],
+        result: dict[str, object],
+        served: bool,
+    ) -> None:
+        gate, acct = probing_gate
+        assert await self._probe(gate, acct, 0, json.dumps(result).encode()) is served
+
+    async def test_exit_1_with_the_measured_403_result_is_not_served(
+        self, probing_gate: tuple[UsageGate, AccountState]
+    ) -> None:
+        gate, acct = probing_gate
+        assert await self._probe(gate, acct, 1, MEASURED_ORG_DISABLED_403.encode()) is False
+
+    async def test_exit_0_with_a_schema_salvaged_result_is_not_served(
+        self, probing_gate: tuple[UsageGate, AccountState]
+    ) -> None:
+        gate, acct = probing_gate
+        stdout = json.dumps({
+            'type': 'result',
+            'subtype': 'success',
+            'is_error': True,
+            'structured_output': {'x': 1},
+            'result': 'err',
+        }).encode()
+        assert await self._probe(gate, acct, 0, stdout) is False
+
+    @pytest.mark.parametrize('stdout', [b'42', b'[1]', b'null', b'"ok"'])
+    async def test_exit_0_with_non_object_json_is_not_served(
+        self, probing_gate: tuple[UsageGate, AccountState], stdout: bytes,
+    ) -> None:
+        gate, acct = probing_gate
+        assert await self._probe(gate, acct, 0, stdout) is False
+
+    @pytest.mark.parametrize(
+        'stdout', [b'{"api_error_status": "403"}', b'{"api_error_status": [1]}'],
+    )
+    async def test_exit_0_with_a_non_int_api_error_status_is_not_served(
+        self, probing_gate: tuple[UsageGate, AccountState], stdout: bytes,
+    ) -> None:
+        gate, acct = probing_gate
+        assert await self._probe(gate, acct, 0, stdout) is False
+
+    async def test_not_served_warning_names_the_api_error_status(
+        self,
+        probing_gate: tuple[UsageGate, AccountState],
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        gate, acct = probing_gate
+        caplog.set_level(logging.WARNING, logger='shared.usage_gate')
+
+        await self._probe(gate, acct, 1, MEASURED_ORG_DISABLED_403.encode())
+
+        warnings = [
+            r.getMessage() for r in caplog.records if r.levelno == logging.WARNING
+        ]
+        assert any(
+            'probe-acct' in msg
+            and '403' in msg
+            and 'disabled Claude subscription access' in msg
+            for msg in warnings
+        ), warnings
+
+    async def test_auth_failed_account_stays_auth_failed_on_exit_0_403(
+        self, probing_gate: tuple[UsageGate, AccountState]
+    ) -> None:
+        gate, acct = probing_gate
+        acct.phase = AccountPhase.AUTH_FAILED
+        acct.auth_failed_at = datetime.now(UTC)
+        proc = _fake_probe_proc(0, MEASURED_ORG_DISABLED_403.encode())
+
+        with (
+            patch('shared.usage_gate.load_dotenv'),
+            patch('shared.usage_gate.asyncio.create_subprocess_exec',
+                  return_value=proc),
+        ):
+            await gate._reprobe_account(acct)
+
+        assert acct.phase == AccountPhase.AUTH_FAILED
+
+
+@pytest.mark.asyncio
+class TestUsageGateProbeReadsParsedResult:
+    """_run_probe classifies the parsed CLI result, not the raw stdout text."""
+
+    async def test_cap_reason_is_the_decoded_result_text(
+        self, probing_gate: tuple[UsageGate, AccountState]
+    ) -> None:
+        gate, acct = probing_gate
+        acct.phase = AccountPhase.AUTH_FAILED
+        acct.auth_failed_at = datetime.now(UTC)
+        cap_text = "You're out of extra usage · resets in 2h"
+        stdout = json.dumps({
+            'type': 'result',
+            'subtype': 'success',
+            'is_error': True,
+            'api_error_status': 429,
+            'result': cap_text,
+        }).encode()
+        proc = _fake_probe_proc(1, stdout)
+
+        with patch('shared.usage_gate.asyncio.create_subprocess_exec',
+                   return_value=proc):
+            served = await gate._run_probe(acct)
+
+        assert served is False
+        assert acct.phase == AccountPhase.CAPPED
+        assert gate.paused_reason == cap_text
+        await _drain_task(acct.resume_task)
+
+    async def test_not_served_warning_names_the_classified_outcome(
+        self,
+        probing_gate: tuple[UsageGate, AccountState],
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        gate, acct = probing_gate
+        caplog.set_level(logging.WARNING, logger='shared.usage_gate')
+        proc = _fake_probe_proc(1, MEASURED_ORG_DISABLED_403.encode())
+
+        with patch('shared.usage_gate.asyncio.create_subprocess_exec',
+                   return_value=proc):
+            await gate._run_probe(acct)
+
+        warnings = [
+            r.getMessage() for r in caplog.records if r.levelno == logging.WARNING
+        ]
+        assert any('probe-acct' in msg and 'AuthFailed' in msg for msg in warnings), warnings
 
 
 # ---------------------------------------------------------------------------
@@ -843,9 +1061,69 @@ class TestProbeConfigDirLeakSweep:
     """Stale probe-dir reclamation wired into UsageGate (task 3086)."""
 
     @pytest.fixture(autouse=True)
-    def _reset_sweep_guard(self, monkeypatch):
-        """Start every case as if this were a fresh process."""
-        monkeypatch.setattr('shared.usage_gate._probe_dir_sweep_done', False)
+    def _reset_sweep_guard(self):
+        """Start — and END — every case as if this were a fresh process.
+
+        The one-shot state moved into ``shared.config_dir`` with the sweep
+        wrapper itself, so this clears it through the hoisted test hook. Cleared
+        on the way out too, keeping the promise symmetric: the state is
+        module-global, so a case that marked the prefix and did not clear it
+        would leak into whichever test ran next.
+
+        SCOPED to the gate's own prefix, never the bare
+        ``reset_sweep_once_state()``. The bare form would also drop
+        ``claude-config-startup-probe-``, which this class neither owns nor
+        protects, and it is a widening even for THIS prefix: what it replaced
+        was a monkeypatch that RESTORED the prior value on teardown rather than
+        clearing unconditionally. Only ``test_config_dir.py``, which tests the
+        helper itself, legitimately wants the whole state cleared.
+        """
+        reset_sweep_once_state(PROBE_DIR_PREFIX)
+        yield
+        reset_sweep_once_state(PROBE_DIR_PREFIX)
+
+    def test_gate_construction_delegates_to_the_shared_once_helper(self):
+        """The once-per-process bookkeeping lives in shared.config_dir now.
+
+        Its twin used to live here in ~45 near-verbatim lines — same one-shot
+        flag, same set-before-call ordering, same broad except, same
+        silent-on-zero rule — and the two could drift apart with nothing to
+        notice.
+        """
+        with patch('shared.usage_gate.sweep_stale_pid_dirs_once', return_value=0) as once:
+            make_gate(['work'])
+
+        once.assert_called_once()
+        assert once.call_args.args[0] == PROBE_DIR_PREFIX
+
+    def test_the_module_level_sweep_name_is_still_the_interception_point(self):
+        """`shared.usage_gate.sweep_stale_pid_dirs` must stay what actually runs.
+
+        The ANTI-REGRESSION guard for the whole hoist, written BEFORE the rewire
+        so the guarantee is pinned rather than asserted after the fact. If the
+        helper ever resolves the sweep out of `shared.config_dir`'s own globals
+        instead — whether by a def-time default parameter, which cannot be
+        intercepted at all, or by calling that module's global by name, which
+        merely moves the single interception point there — then
+        df_pytest_isolation.py::confine_usage_gate_sweep and the ~dozen sibling
+        `patch('shared.usage_gate.sweep_stale_pid_dirs', ...)` sites in this
+        class silently stop intercepting, and this suite starts scandir-ing and
+        deleting the developer's real /tmp.
+        """
+        calls: list[str] = []
+
+        def _recording_sweep(prefix: str, **kwargs) -> int:
+            calls.append(prefix)
+            return 0
+
+        with patch('shared.usage_gate.sweep_stale_pid_dirs', _recording_sweep):
+            make_gate(['work'])
+
+        assert calls == [PROBE_DIR_PREFIX], (
+            'the sweep patched onto shared.usage_gate was not what ran — every '
+            'patch site in this module has stopped intercepting, and the suite '
+            'is now deleting real /tmp dirs'
+        )
 
     def test_gate_construction_sweeps_stale_probe_dirs(self):
         with patch('shared.usage_gate.sweep_stale_pid_dirs', return_value=0) as sweep:
@@ -974,8 +1252,9 @@ class TestProbeConfigDirLeakSweep:
     ):
         """The whole fix, exercised against a real (redirected) tmp dir.
 
-        Requests `real_probe_dir_sweep` to opt out of the module-wide
-        neutralizer. Patching shared.config_dir.tempfile.gettempdir then
+        Requests `real_probe_dir_sweep` to opt out of the suite-wide
+        confinement, df_pytest_isolation.py::arm_usage_gate_sweep_confinement.
+        Patching shared.config_dir.tempfile.gettempdir then
         redirects BOTH TaskConfigDir and the sweep's default base to tmp_path,
         so this never touches the real /tmp.
         """
@@ -1025,19 +1304,28 @@ class TestProbeConfigDirLeakSweep:
 # deselected by default (see shared/pyproject.toml addopts="-m 'not
 # integration'") and only exercised with `-m integration` plus a real OAuth
 # account in env. Mirrors test_cli_invoke_integration.py::TestConfigDirCredentials
-# ("MUST use real agents") — token discovery/skip and capacity-skip pattern
-# replicated minimally here rather than imported (same rationale as that
-# file's own _looks_like_capacity_failure: a purpose-built substring list is
-# the correct shape for a skip-guard, not the stricter combined
-# prefix+confirm-keyword production detector).
+# ("MUST use real agents") — token discovery/skip pattern replicated minimally
+# here.
+#
+# The capacity-skip guard is IMPORTED from _capacity_skip, not replicated.
+# A purpose-built substring list is still the right shape for a skip-guard
+# (rather than production's stricter combined prefix+confirm-keyword
+# detector) — but that argument justified duplicating the POLICY, and was
+# taken as licence to duplicate the STRINGS too. The two lists here and in
+# test_cli_invoke_integration.py stayed byte-for-byte identical and drifted
+# together, carrying the same blind spot into two live pytest.skip sites.
+# _capacity_skip is now the single source; see its contract tests in
+# test_capacity_skip.py.
+#
+# The account scan below is single-homed in _oauth_accounts for the same reason,
+# one task later (3700) — and this module is where the drift actually bit: it
+# held the `BCDEF` copy that could not reach CLAUDE_OAUTH_TOKEN_G. Taking the
+# FLEET default (no explicit letters) is the right choice HERE because this gate
+# spends real capacity. Full history, and why A is excluded, in
+# _oauth_accounts' module docstring; contract tests in test_oauth_accounts.py.
 # ---------------------------------------------------------------------------
 
-_TOKEN_ENV_VARS = [f'CLAUDE_OAUTH_TOKEN_{c}' for c in 'BCDEF']
-_AVAILABLE_TOKENS: list[tuple[str, str]] = [
-    (var, os.environ[var])
-    for var in _TOKEN_ENV_VARS
-    if os.environ.get(var)
-]
+_AVAILABLE_TOKENS: list[tuple[str, str]] = available_tokens(os.environ)
 
 _need_one_account = pytest.mark.skipif(
     len(_AVAILABLE_TOKENS) < 1,
@@ -1047,22 +1335,6 @@ _need_claude_cli = pytest.mark.skipif(
     shutil.which('claude') is None,
     reason='Requires the real claude CLI on PATH',
 )
-
-_CAPACITY_FAILURE_MARKERS: tuple[str, ...] = (
-    ' capped',
-    'rate limit',
-    'account unavailable',
-    'out of extra usage',
-    'usage limit',
-    "you've hit your usage",
-    "you've used all",
-)
-
-
-def _looks_like_capacity_failure(combined_output: str) -> bool:
-    """Conservative substring check — see module docstring above this class."""
-    haystack = combined_output.lower()
-    return any(marker in haystack for marker in _CAPACITY_FAILURE_MARKERS)
 
 
 @pytest.mark.integration
@@ -1128,7 +1400,7 @@ class TestProbeEnvTokenPrecedenceGuard:
         stderr_text = stderr_bytes.decode(errors='replace') if stderr_bytes else ''
         combined = f'{stdout_text}\n{stderr_text}'
 
-        if _looks_like_capacity_failure(combined):
+        if looks_like_capacity_failure(combined):
             pytest.skip(f'Capacity failure, not a precedence signal: {combined!r}')
 
         combined_lower = combined.lower()
@@ -2432,7 +2704,7 @@ class TestAuthRecoveryViaTransition:
         proc = MagicMock()
         proc.returncode = 1
         proc.pid = 12345
-        proc.communicate = AsyncMock(return_value=(b'', cap_stderr))
+        proc.communicate = AsyncMock(return_value=(b'{"subtype":"error_max_budget_usd"}', cap_stderr))
 
         with patch('shared.usage_gate.asyncio.create_subprocess_exec', return_value=proc):
             ok = await gate._run_probe(acct)
@@ -2579,8 +2851,8 @@ async def _idle_task() -> asyncio.Task:
 
 @pytest.mark.asyncio
 class TestSighupUncapsViaTransition:
-    """step-15: _on_sighup_async drives every account to AVAILABLE through
-    one forced _transition call each (DD-4)."""
+    """step-15: _on_sighup_async drives every account that is not
+    AUTH_FAILED to AVAILABLE through one forced _transition call each (DD-4)."""
 
     async def test_sighup_forces_every_account_to_available_via_transition(self):
         gate = make_gate(['a', 'b'], wait_for_reset=False, cost_store=None)
@@ -2591,8 +2863,7 @@ class TestSighupUncapsViaTransition:
         a.probe_count = 2
         a.resume_task = await _idle_task()
 
-        b.phase = AccountPhase.AUTH_FAILED
-        b.auth_failed_at = datetime.now(UTC)
+        b.phase = AccountPhase.PROBE_IN_FLIGHT
         b.auth_reprobe_task = await _idle_task()
 
         gate._open.clear()
@@ -2619,7 +2890,6 @@ class TestSighupUncapsViaTransition:
         assert a.resets_at is None
         assert a.pause_started_at is None
         assert a.probe_count == 0
-        assert b.auth_failed_at is None
         assert gate._open.is_set() is True
         assert gate._paused_reason == ''
 

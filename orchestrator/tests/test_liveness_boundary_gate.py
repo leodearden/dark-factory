@@ -15,7 +15,7 @@ See shared/tests/test_liveness_boundary_gate.py for the shared-contract half
 (B1/B2/B4/B7 predicate and reader assertions).
 
 The gate uses REAL on-disk JSONL transcripts driven through REAL count_transcript_turns /
-_run_subprocess watchdog / predicates / orchestrator consumers — the genuine two-way
+run_cli_subprocess watchdog / predicates / orchestrator consumers — the genuine two-way
 integration that per-component unit tests (which mock one side of the seam) do not provide.
 """
 
@@ -24,6 +24,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import time
 import uuid
 from pathlib import Path
@@ -31,11 +32,13 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from _orch_helpers import pydantic_spec
+from _workflow_helpers import fixed_prompt
 from shared.cli_invoke import (
-    _run_subprocess,
+    TranscriptWatch,
     count_transcript_turns,
     is_timed_out_with_progress,
     is_zero_output_timeout,
+    run_cli_subprocess,
 )
 from shared.config_dir import TaskConfigDir
 
@@ -154,6 +157,7 @@ def _make_workflow(
     config.recycle_config_dir_on_zero_output = False
     config.judge_after_each_iteration = False
     config.inter_iteration_rebase = False
+    config.backends.implementer = 'claude'
     # These tests pass a plain tmp_path as cwd (not a real linked worktree) and
     # do not assert on sandbox wiring; disable the sandbox block so _invoke does
     # not call compute_write_set(cwd) on a non-worktree path (task 2905 α3).
@@ -254,7 +258,7 @@ def _make_hanging_proc():
     """
     call_count = [0]
 
-    async def communicate_side_effect(input=None):  # noqa: A002
+    async def communicate_side_effect(input=None):
         call_count[0] += 1
         if call_count[0] == 1:
             # Hang until the watchdog cancels comm_task — CancelledError is raised here.
@@ -335,16 +339,28 @@ class TestB2PreTurn1Wedge:
     """B2: a zero-turn wedge is killed fast at the grace bound AND trips the breaker.
 
     Two sub-tests (two-way seam):
-      (a) Watchdog fast kill: real _run_subprocess with 0-turn transcript → killed at grace.
+      (a) Watchdog fast kill: real run_cli_subprocess with 0-turn transcript → killed at grace.
       (b) Consumer: zero-output AgentResult → breaker trips → BLOCKED, no resume.
     """
 
-    async def test_zero_turn_wedge_killed_at_grace_not_ceiling(self, tmp_path: Path) -> None:
+    async def test_zero_turn_wedge_killed_at_grace_not_ceiling(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
         """(a) Watchdog: 0-turn real transcript → fast kill at startup_grace_secs, not ceiling.
 
         Uses REAL count_transcript_turns reading a real 0-assistant JSONL transcript.
-        grace=0.05s, ceiling=5.0s, assert wall<2.0s (killed at grace, not ceiling).
+        grace=0.05s, ceiling=5.0s; asserts the kill came from the startup-grace
+        branch and that the WATCHDOG'S OWN clock puts it well under the ceiling.
+
+        Deliberately NOT asserted on outer wall-clock: under a saturated parallel
+        (full-suite xdist) run the coroutine can be descheduled for seconds either
+        side of ``run_cli_subprocess``, so wall time is not a sound proxy for which
+        kill path fired — same class as done tasks 1836/1851/2320/2840/2921/2959/
+        3491. Observed under load: 6.98s wall for a kill the watchdog itself
+        measured at 0.1s — correct behaviour reported red by scheduling noise
+        outside the code under test.
         """
+        caplog.set_level(logging.WARNING, logger='shared.cli_invoke')
         sid = str(uuid.uuid4())
         cfg_dir = tmp_path / 'cfg'
         cfg_dir.mkdir()
@@ -365,27 +381,40 @@ class TestB2PreTurn1Wedge:
             patch('shared.cli_invoke.asyncio.create_subprocess_exec', side_effect=fake_exec),
             patch('shared.cli_invoke.terminate_process_group', terminate_pg_mock),
         ):
-            t0 = time.monotonic()
-            result = await _run_subprocess(
-                ['fake'],
-                cwd=tmp_path,
-                env={},
-                model='opus',
-                timeout_seconds=5.0,
-                startup_grace_secs=0.05,
-                session_id=sid,
-                config_dir=cfg_dir,
+            result = await run_cli_subprocess(
+                ['fake'], cwd=tmp_path, env={},
+                backend='claude', model='opus', timeout_seconds=5.0,
+                transcript=TranscriptWatch(session_id=sid, config_dir=cfg_dir, startup_grace_secs=0.05),
             )
-            wall = time.monotonic() - t0
 
         assert result.timed_out is True, 'Expected timed_out=True for startup wedge kill'
         assert result.transcript_turns == 0, (
             f'Expected transcript_turns=0; got {result.transcript_turns!r}'
         )
         terminate_pg_mock.assert_called_once()
-        # Upper bound generous (2s) to avoid CI flakiness; key assertion: killed at grace.
-        assert wall < 2.0, (
-            f'Expected fast kill (<2s), got {wall:.3f}s — wedge not killed at grace bound'
+        # The kill came from the startup-grace branch, not the ceiling. This log
+        # line is emitted at exactly one place in cli_invoke (the
+        # `not seen_turn and live_turns == 0 and elapsed >= startup_grace_secs`
+        # branch), so its presence discriminates the two kill paths
+        # deterministically — the ceiling path never emits it.
+        wedge_log = re.search(r'Startup wedge detected after ([\d.]+)s', caplog.text)
+        assert wedge_log is not None, (
+            'Expected the startup-grace kill path to fire and log the wedge; '
+            f'caplog.text snippet: {caplog.text[-500:]!r}'
+        )
+        # Quantitative half, measured inside the watchdog loop (cli_invoke.py's
+        # `elapsed = time.monotonic() - watchdog_start`), so it excludes
+        # descheduling OUTSIDE `run_cli_subprocess` (before t0 / after the await)
+        # — but NOT in-loop event-loop starvation, since `elapsed` is read
+        # from inside the same coroutine that can itself be starved. The 2.0s
+        # bound below is a load margin, not a tight assertion about the 0.05s
+        # grace; do not tighten it toward 0.05s on the assumption this
+        # measurement is starvation-free. Guards a regression that still takes
+        # the wedge branch but only after ignoring startup_grace_secs.
+        detected_after = float(wedge_log.group(1))
+        assert detected_after < 2.0, (
+            f'Expected fast kill (<2s on the watchdog clock), got {detected_after}s '
+            '— wedge not killed at grace bound'
         )
 
     async def test_zero_output_result_trips_breaker(self, tmp_path: Path) -> None:
@@ -498,7 +527,7 @@ class TestB3ResumeAcrossWall:
             patch.object(wf, '_build_agent_env', return_value=None),
         ):
             mock_iwcr.return_value = success_result
-            await wf._invoke(IMPLEMENTER, 'test-prompt', tmp_path)
+            await wf._invoke(IMPLEMENTER, fixed_prompt('test-prompt'), tmp_path)
 
         # resume_session_id passed to invoke_with_cap_retry
         assert mock_iwcr.call_args is not None, 'Expected invoke_with_cap_retry to be called'
@@ -556,7 +585,7 @@ class TestB5EvidenceCarriesTranscript:
         assert wf.artifacts is not None
 
         # Build a real TaskConfigDir so _capture_zero_output_evidence can locate the transcript
-        config_dir = TaskConfigDir(wf.task_id, base_dir=wf.artifacts.root)
+        config_dir = TaskConfigDir(wf.task_id, base_dir=wf.artifacts.lane_root)
         wf._config_dir = config_dir  # type: ignore[attr-defined]
 
         sid = 'sid-b5-evidence'
@@ -577,7 +606,7 @@ class TestB5EvidenceCarriesTranscript:
 
         wf._capture_zero_output_evidence(result, iteration=3)  # type: ignore[attr-defined]
 
-        evidence_path = wf.artifacts.root / 'zero_output_evidence-iter3.json'
+        evidence_path = wf.artifacts.zero_output_evidence_path(3)
         assert evidence_path.exists(), f'Expected evidence file at {evidence_path}'
 
         data = json.loads(evidence_path.read_text())
@@ -661,15 +690,10 @@ class TestB6LongSyncToolSurvives:
             patch('shared.cli_invoke.terminate_process_group', terminate_pg_mock),
         ):
             t0 = time.monotonic()
-            result = await _run_subprocess(
-                ['fake'],
-                cwd=tmp_path,
-                env={},
-                model='opus',
-                timeout_seconds=0.3,
-                startup_grace_secs=0.05,
-                session_id=sid,
-                config_dir=cfg_dir,
+            result = await run_cli_subprocess(
+                ['fake'], cwd=tmp_path, env={},
+                backend='claude', model='opus', timeout_seconds=0.3,
+                transcript=TranscriptWatch(session_id=sid, config_dir=cfg_dir, startup_grace_secs=0.05),
             )
             wall = time.monotonic() - t0
 
@@ -756,15 +780,10 @@ class TestB7UnreadableTranscriptConservative:
             patch('shared.cli_invoke.terminate_process_group', terminate_pg_mock),
         ):
             t0 = time.monotonic()
-            result = await _run_subprocess(
-                ['fake'],
-                cwd=tmp_path,
-                env={},
-                model='opus',
-                timeout_seconds=0.3,
-                startup_grace_secs=0.05,
-                session_id=sid,
-                config_dir=cfg_dir,
+            result = await run_cli_subprocess(
+                ['fake'], cwd=tmp_path, env={},
+                backend='claude', model='opus', timeout_seconds=0.3,
+                transcript=TranscriptWatch(session_id=sid, config_dir=cfg_dir, startup_grace_secs=0.05),
             )
             wall = time.monotonic() - t0
 

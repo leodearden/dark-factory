@@ -22,6 +22,7 @@ Author mode established G1 / G3 / G4 / G5; this is a drift check, not a re-desig
 - **G3 re-check.** Run the overlay's substrate verifier (or the manual check) on every assumed capability. Any failure stops the queue.
 - **G4 re-check.** Read the cross-PRD relationship table; flag any reciprocal-ownership statements.
 - **G5 informational.** Note B vs B+H. If B+H, confirm the integration-gate task exists in the decomposition and names the boundary-test sketch as its signal.
+- **Code-anchor re-walk.** Any `path:line` anchor **this session introduces or edits** in the PRD, its `.md` manifest, or the `.yaml` sidecar must be re-cited by symbol/file/section-banner, or covered by a dated as-of SHA in the document header — normative rule in `author-mode.md` → *Code anchors in PRD prose*. A pre-existing undated anchor in a document this session does not otherwise touch is not a blocker.
 
 Any failure → stop and ask the user to fix the PRD before queueing.
 
@@ -41,22 +42,37 @@ Read `docs/legibility/design-invariants.md` — the single normative list; do no
 
 Resolve any hit by redesigning the task, or by waiving it: record `G7 waiver: <slug> — <rationale>` in the PRD's decomposition-plan row AND stamp `metadata.g7_waivers: [{"invariant": <slug>, "rationale": <text>}]` on the filed task at Step 3. An unresolved, unwaived hit **blocks** the batch until Step 3.
 
-Calibration fixtures will live at `docs/legibility/design-invariants-fixtures.md` once sibling task ε lands (file not yet present as of this doc's landing).
+**Calibration:** `docs/legibility/design-invariants-fixtures.md` (landed 2026-07-14, commit `df9f4dcf9d`) holds the seeded-violation fixtures — one PRD-leaf-shaped and one code-snippet-shaped per invariant — plus the rehearsal verdict table, for calibrating this walk against dark-factory's family.
 
 ### Step 2.5 — Capability manifest (mechanize G3 + G6; commit beside the PRD)
 
-Before filing, build the **capability manifest** (`gates.md` → *Capability Manifest — mechanizing G3 + G6 per leaf*). For each **leaf** task, enumerate the capabilities its signal asserts and bind each to evidence — `grep:file:line wired` / `producer:task-N upstream` / `grammar-fixture:path parses` / `floor:bound>X`. Any binding that resolves to `declared-only | test-only | producer-downstream | producer-absent | producer-extent-short | fixture-ERROR | bound≤floor | rejection-absent` **blocks the batch** — resolve it (rewrite to an existing capability, queue the prerequisite upstream + wire the dep, move the signal to the producing leaf, or relax the bound) **before** Step 3.
+Before filing, build the **capability manifest** (`gates.md` → *Capability Manifest — mechanizing G3 + G6 per leaf*). For each **leaf** task, enumerate the capabilities its signal asserts and bind each to evidence — `grep:<path>[::<dotted.name>]` wired (one backticked, repo-root-relative span; the `::<dotted.name>` part is for Python modules only — `gates.md` → *Evidence pointers*) / `capability→producer (built here)` / `producer:task-N upstream` / `grammar-fixture:path parses` / `floor:bound>X`. Any binding that resolves to `declared-only | test-only | producer-downstream | producer-absent | producer-extent-short | fixture-ERROR | bound≤floor | rejection-absent` **blocks the batch** — resolve it (rewrite to an existing capability, queue the prerequisite upstream + wire the dep, move the signal to the producing leaf, or relax the bound) **before** Step 3.
 
-Commit the manifest beside the PRD (the overlay names the path; generic default `<prd-path-without-ext>.capability-manifest.md`). This is the artifact a dispatch-time architect or downstream verifier diffs against substrate — the point is to pay the substrate check **once, here**, not once per task at dispatch. The empty-value sentinel, the production-entry-path grep targets, and the floor references are **[overlay]**-supplied; in generic mode, bind by hand against the codebase.
+Commit the manifest beside the PRD, at the path fixed in the sidecar paragraph below. Commit it only once every `grep:` pointer resolves on main as written: run the overlay's manifest-pointer resolver if it names one, else check each by hand (`gates.md` → *Evidence pointers*). The target project may resolve these pointers in its own test suite, and a decompose session commits without running that suite. This is the artifact a dispatch-time architect or downstream verifier diffs against substrate — the point is to pay the substrate check **once, here**, not once per task at dispatch. The empty-value sentinel, the production-entry-path grep targets, and the floor references are **[overlay]**-supplied; in generic mode, bind by hand against the codebase.
 
-**Also emit the machine-readable YAML sidecar twin**, alongside the `.md` manifest, at the **strictly derived** path `re.sub(r'\.md$', '', prd_path) + '.capability-manifest.yaml'` — never a hand-named or overlay-supplied path, unlike the `.md` twin (PRD §Resolved design decisions #2; the existing `.md` manifests drifted from their PRD's filename — e.g. `cross-project-task-deps.capability-manifest.md` vs `…-task-deps-prd.md` — so the sidecar convention is mechanical instead, letting a downstream stamper locate it from `metadata.prd_path` alone). **The two filenames may therefore legitimately have different stems — the `.md` path can be hand-named or overlay-supplied, the `.yaml` path is always PRD-derived; never rename the sidecar to match a drifted `.md` manifest.** Schema + validating loader: `shared/src/shared/capability_manifest.py` (`CapabilityManifestDoc`); full field reference at `plans/capability-delivered-checks-prd.md` §Contract. Imitate the committed exemplar, `plans/capability-delivered-checks-prd.capability-manifest.yaml`.
+**Also emit the machine-readable YAML sidecar twin**, alongside the `.md` manifest, at the **strictly derived** path `shared/src/shared/capability_manifest.py::sidecar_path(prd_path)` (`plans/x-prd.md` → `plans/x-prd.capability-manifest.yaml`) — never a hand-named or overlay-supplied path (PRD §Resolved design decisions #2: older `.md` manifests drifted from their PRD's filename — e.g. `cross-project-task-deps.capability-manifest.md` vs `…-task-deps-prd.md` — so the convention is mechanical, letting a downstream stamper locate the sidecar from `metadata.prd_path` alone). **The `.md` manifest sits at the sidecar's own stem, `<stem>.capability-manifest.md`; hand-named `.md` manifests such as that one predate this rule and carry no sidecar — never rename a sidecar to match one.** Schema + validating loader: `shared/src/shared/capability_manifest.py` (`CapabilityManifestDoc`); full field reference at `plans/capability-delivered-checks-prd.md` §Contract. Imitate the committed exemplar, `plans/capability-delivered-checks-prd.capability-manifest.yaml`, for its **shape** only — field layout, blocks, `delivered_check` forms. Its `binding` pointers predate the pointer grammar and are `file:line` pins, so write yours per `gates.md` → *Evidence pointers*; do not edit the exemplar itself, which is a dated decompose record. Every sidecar task `label` must also appear in the `.md` twin, verbatim or as its Greek letter for an ASCII-spelled name such as `gamma1`, so an amendment that adds a label to the sidecar adds that label's section or row to the `.md` in the same commit; `tests/repo_guards/test_checked_in_capability_manifest_twins.py` pins both this and the same-stem path for every tracked sidecar. Labels are that pin's ceiling: the `.md` may describe a capability in prose rather than by its sidecar `name`, and may keep a nuanced or authoring-time verdict, because the sidecar is the single home of the capability list and its current verdicts. If agreement on capability names or verdicts is ever needed, beyond the `binding`-span rule in `gates.md` → *Evidence pointers* rule 7, it comes from rendering the `.md`'s capability rows from the sidecar, never from a pin on hand-written names (INV-5 `no-lockstep-duplication`).
 
-For each capability, optionally bind a `delivered_check` — the dispatch-time-checkable twin of the authoring-time evidence binding above:
-- **Pattern-anchored, never `file:line`.** A check is either `kind: grep` (an ERE run via `git grep -E`, with `pattern` + `expect: present|absent` + optional `paths`) or `kind: script` (a short repo-relative committed script, must exist & be executable, exit 0 = delivered, bounded `timeout_secs`). Never bind a check to `file:line` — line anchors go stale the moment the file changes again.
+For each capability, optionally bind a `delivered_check` — the dispatch-time-checkable twin of the authoring-time evidence binding above. A `capability→producer (built here)` row always binds one (`gates.md` → *Evidence pointers*, rule 4):
+- **Pattern-anchored, never `file:line`.** A check is either `kind: grep` (an ERE run via `git grep -E`, with `pattern` + `expect: present|absent` + optional `paths`) or `kind: script` (a short repo-relative committed script, must exist & be executable, exit 0 = delivered, bounded `timeout_secs`). Never bind a check to `file:line` — line anchors go stale the moment the file changes again. The same anchoring discipline governs the PRD-family **prose** as well — the PRD `.md`, the `.md` manifest, and this sidecar; see `author-mode.md` → *Code anchors in PRD prose*, which states it normatively for documents. This bullet is that rule's mechanical-check case, not a second copy of it.
 - **`expect: absent`** is how a rejection-style capability (G6 branch 4) is expressed mechanically — the check passes when the asserted diagnostic/pattern does **not** appear.
 - **`kind: manual`** for capabilities that aren't mechanically expressible — field-population judgments, rejection-mechanism nuances a fixture already covers qualitatively. Record it in the sidecar (with a `reason`), but it is **excluded from the dispatch gate**: only mechanical (`grep`/`script`) checks get copied into a producer task's `metadata.delivered_checks`.
 
-The sidecar's `task_id` fields stay `null` (Greek labels only) until it is stamped — see the post-`commit_planning` step after Step 5.
+The sidecar's `task_id` fields stay `null` (Greek labels only) until it is stamped — see the post-`commit_planning` step after Step 5. Comments you write in the sidecar survive the stamp, but durable scope or provenance belongs in the `.md` twin or a block's declared `note:` field: those are validated and machine-readable, and a comment is neither.
+
+**Name the PRD's signal leaf in `signal_leaves`.** Set the top-level `signal_leaves` to the label(s) of the task(s) whose completion delivers the PRD's goal signal: its integration gate, or the leaf its decomposition plan marks as carrying the user-observable signal. The dashboard derives the PRD's delivered / partial / not-yet mark from those tasks' status; with the field absent the PRD reads "names no signal leaf". Every label must name a block in this sidecar, and you omit the field rather than write `[]` — an unknown label and `[]` are both rejected on load. The stamp leaves the field intact. Schema: `CapabilityManifestDoc.signal_leaves`; field reference: `plans/capability-delivered-checks-prd.md` §Contract.
+
+**A block whose producer lives in another project's registry sets `external_task_id` instead.** When a PRD's decomposition assigns a leaf to a task you are filing in a *different* project — a reify-side deploy step, say — that block's producer will never appear in this project's task store, so a stamped integer would read forever as a stale binding and a `null` would be indistinguishable from un-authored. Write the same canonical qualified `"project_id:task_id"` form used for cross-project `depends_on` (Step 3 → **Cross-project dependencies**, below):
+
+```yaml
+- label: η
+  external_task_id: reify:5613      # NOT task_id — the producer is reify's
+  title: Repoint the reify warm-lane GC systemd unit at dark-factory's sweep
+  capabilities: [...]               # authored exactly as any other block's
+```
+
+The two fields are **mutually exclusive** — a block naming both fails to load with a `ValidationError`, because it would be claiming two different producers in two different registries. `commit_planning` never stamps such a block (its write-back only touches labels present in the batch being committed, and a foreign producer is by construction not in one). Its `delivered_check`s are therefore deliberately **not evaluated by this project's dispatch gate**, which `docs/task-authoring.md` §3.3 already scopes to *local* (same-project) dependencies — record them anyway when the foreign project's own verify should assert them; they are the record of what that gate ought to check. `audit_manifest_descriptor_drift.py` counts these blocks in their own `external-registry task blocks:` coverage row, separate from the stale-binding row, so an operator is never told to re-stamp or retire a block that is correct as authored.
+
+Two details the model and the audit enforce, so you do not have to remember them. The value is **normalised to its canonical spelling on load** (`ExternalDep.render()`), so `" reify:5613 "` is accepted but stored as `"reify:5613"` — the stored string always joins against a task's `metadata.external_deps` entry. And the `project_id` half must name **another** project: a block spelling the *audited* project's own id validates structurally but is a mis-authored binding — it would excuse a LOCAL producer's block from drift comparison — so the audit counts it in a separate `self-bound external blocks:` row and names the manifest, label and value in the coverage details. A local producer belongs in `task_id`.
 
 ### Step 3 — File tasks (ALWAYS planning_mode=True; synchronous, curator-bypassing)
 
@@ -64,7 +80,11 @@ PRD-decomposition batches are the canonical use case for `planning_mode=True`. *
 
 `planning_mode=True` is **synchronous** and **bypasses the curator**. `submit_task` returns `{task_id, status: "deferred", planning_mode: True}` directly — there is no ticket, no `resolve_ticket` follow-up, no curator `combined` outcome. (The two-phase `submit_task` + `resolve_ticket` pattern applies only to `planning_mode=False`, which decompose mode never uses.)
 
-**Declare every leaf's execution path.** `planning_mode` bypasses the curator-side routing guards (1898/2225/2085) that would otherwise infer `task_kind`/`execution_class` — so the `submit_task` routing-intent lint runs at this boundary instead: a `task_kind="normal"` leaf whose own title/description/details declare a *different* execution path (e.g. "DO NOT IMPLEMENT", "no-code", "deterministic; no worktree", "escalate to a human instead of implementing") gets flagged (or, in enforce mode, rejected) because it carries no matching declaration. Set `task_kind` explicitly on every leaf (`"normal"` for code_tdd work; `"deterministic"` for a deploy/gate leaf — see `CLAUDE.md` "Deterministic task kind"), and set `metadata.execution_class` to `"operational"` or `"decision"` when the leaf is genuinely non-code work, so the lint reads it as an honest declaration rather than a mismatch.
+The server stamps every `planning_mode` birth with a `planning` deferral record (`metadata.deferral.kind == "planning"`); never pass `metadata.deferral` yourself, `submit_task` refuses it.
+
+**Declare every leaf's execution path.** `planning_mode` bypasses the curator-side routing guards (1898/2225/2085) that would otherwise infer `task_kind`/`execution_class` — so the `submit_task` routing-intent lint runs at this boundary instead: a `task_kind="normal"` leaf whose own title/description/details declare a *different* execution path (e.g. "DO NOT IMPLEMENT", "no-code", "deterministic; no worktree", "escalate to a human instead of implementing") gets flagged (or, in enforce mode, rejected) because it carries no matching declaration. Set `task_kind` explicitly on every leaf (`"normal"` for code_tdd work; `"deterministic"` for a deploy/gate leaf — see `docs/task-authoring.md` §5 "Deterministic tasks").
+
+**The execution-path question is "agent or human?", never "code or not code?"** A docs/comments/rename leaf — any edit an agent can execute mechanically — is `task_kind="normal"` + `metadata.complexity="simple"` (the fast path; its documented scope names docs edits). Set `metadata.execution_class` to `"operational"` or `"decision"` **only when the leaf genuinely requires a human** (a ruling, an operator action no agent can take): that declaration is converted at submit into a deterministic **always-escalates pure gate** whose sole dispatch action is a born-at-L2 escalation to a human, and human attention is the bottleneck. Multiple independent sessions have mis-filed docs leaves as `"operational"` because they "aren't code" (Leo's 2026-08-24 ruling retyped 4626/4671/4675/4680 out of exactly this; semantics reference: `docs/task-authoring.md` §4, "`execution_class` routes to a HUMAN").
 
 For each task in the plan, in dependency order (roots first):
 
@@ -90,13 +110,16 @@ Modules touched: <list>
         "user_observable_signal": "<signal>",
         "consumer_ref": "<consumer_ref>",
         "grammar_confirmed": True,   # or the overlay's substrate-confirmed flag name
-        "modules": ["<module_path>", ...],
+        # sparse is fine — the architect widens scope at plan time. File paths only (a directory is rejected); use [] to defer entirely.
+        "files": ["<path/to/file.py>", ...],
         # "g7_waivers": [{"invariant": "<slug>", "rationale": "<text>"}],  # only if Step 2.3 recorded a waiver for this task
-        # "execution_class": "operational" | "decision",  # only if this leaf is genuinely non-code work
+        # "execution_class": "operational" | "decision",  # only if a HUMAN must execute this leaf (a ruling, an operator action) — it becomes an always-escalates pure gate
     },
 )
 task_id = result["task_id"]   # status == "deferred", planning_mode == True
 ```
+
+Only a task in the PRD's decomposition plan carries a `prd_task_label`, and it is that plan's own label, verbatim; a task filed against the PRD from outside the plan (an out-of-batch dependent, a later follow-up) keeps `prd_path` and sets no `prd_task_label` — never an invented one — because Step 5.5 binds only labels the sidecar declares. The metadata key is **exactly** `prd_task_label` — not `prd_label`, `label`, `task_label` or any other spelling — and its value must equal the sidecar block's `label` **byte-for-byte**: the Greek letter itself, never a transliteration (`"gamma"` ≠ `"γ"`), with no surrounding whitespace. Anything else binds nothing; Step 5.5 reports it, but does not stamp it.
 
 If `submit_task` itself times out (no `task_id` returned), **don't retry**; poll `get_task` (by title, or by IDs above your last known one) to see whether the write landed asynchronously. Re-submitting on timeout risks double-filing — the curator-dedupe path is not active in planning_mode.
 
@@ -112,7 +135,7 @@ mcp__fused-memory__add_dependency(
 )
 ```
 
-Wire intra-batch (Greek-letter prereqs → the IDs from `submit_task`) and out-of-batch (PRD-declared prereqs → existing task IDs elsewhere). If the decomposition specified `metadata.unblocks` reverse-deps, set those via `update_task`.
+Wire intra-batch (Greek-letter prereqs → the IDs from `submit_task`) and out-of-batch (PRD-declared prereqs → existing task IDs elsewhere). If the decomposition specified `metadata.unblocks` reverse-deps, set those via `update_task`. An out-of-batch edge onto a held follow-up (one that depends on its project's follow-up holder, `docs/task-authoring.md` §3.4) promotes it with `by=dependent` when the dependent reaches `pending`, which for a batch task is its `commit_planning` flip; there is no separate release step.
 
 **Cross-project dependencies** — when a task depends on a task in a *different* project, pass a qualified `"project_id:task_id"` string as `depends_on`:
 
@@ -124,7 +147,7 @@ mcp__fused-memory__add_dependency(
 )
 ```
 
-A qualified `depends_on` (containing `:`) is routed to `metadata.external_deps` on the dependent task rather than the integer `dependencies` table. The foreign target is not verified at write time. At dispatch time the dependent's scheduler resolves each entry via `get_external_statuses` and gates dispatch until every external dep is `done`. A `cancelled` upstream immediately escalates to a human; a persistently-unresolvable dep (`unknown_project`, `unknown_task`, `malformed`) escalates after a grace period. See the Task Routing section of `CLAUDE.md` for the full dispatch policy.
+A qualified `depends_on` (containing `:`) is routed to `metadata.external_deps` on the dependent task rather than the integer `dependencies` table. The foreign target is not verified at write time. At dispatch time the dependent's scheduler resolves each entry via `get_external_statuses` and gates dispatch until every external dep is `done`. A `cancelled` upstream immediately escalates to a human; a persistently-unresolvable dep (`unknown_project`, `unknown_task`, `malformed`) escalates after a grace period. The full dispatch policy is in `docs/task-authoring.md` §3.2 "Cross-project external dependencies".
 
 Do **not** flip anything to `pending` until every edge is in. A partially-wired batch with some tasks already `pending` lets the scheduler grab a leaf whose real prereq hasn't been wired yet.
 
@@ -142,9 +165,22 @@ mcp__fused-memory__commit_planning(
 
 If a single bulk call is rejected (e.g. payload-size cap), split into the smallest number of bulk calls that fit — still never one-at-a-time.
 
+`commit_planning(target_status="pending")` releases only rows holding a `planning` record (or no record); any other hold is refused per id with `not_planning_hold` and stays parked. A task you deliberately hold OUT of the commit needs a real record instead: `commit_planning(project_root=…, task_ids="<id>", target_status="deferred", deferral={"kind": "until_condition", "condition": "<what ends the hold>"})`. Confirm each per-id result echoes `deferral`; no echo means the fused-memory server predates the deferral gate, so the hold is unrecorded: re-stamp it after fused-memory restarts. Recipe: `docs/task-authoring.md` §9 "Deferring a task".
+
 ### Step 5.5 — Stamp + commit the sidecar
 
-`commit_planning` is also the mechanical Greek-label → real-task-id mapping point: for every task in the batch carrying `metadata.prd_path` + `metadata.prd_task_label`, it locates the YAML sidecar from Step 2.5, stamps the matching label's `task_id`, writes the file back, and copies that label's mechanical (`grep`/`script`) `delivered_check`s into the producer task's `metadata.delivered_checks` (`manual` checks are never copied — they stay sidecar-only, excluded from the dispatch gate). The response carries a structured `manifest_stamping` report (`{path, stamped: [...], missing_labels: [...], errors: [...]}`); no sidecar on disk is a no-op — every non-manifest batch is byte-identical to today.
+`commit_planning` is also the mechanical Greek-label → real-task-id mapping point: for every task in the batch carrying `metadata.prd_path` + `metadata.prd_task_label`, it locates the YAML sidecar from Step 2.5, stamps the matching label's `task_id`, writes the file back, and copies that label's `delivered_check`s of every kind except `manual` into the producer task's `metadata.delivered_checks` (`manual` checks are never copied — they stay sidecar-only, excluded from the dispatch gate). The write-back rewrites only `task_id` values, so comments, quoting and key order survive; a stamp it cannot verify, or one that would leave the sidecar invalid, is refused, named in `errors`, and nothing is written. A batch with no `prd_path` is byte-identical to today. A batch task whose `prd_path` derives a sidecar absent from the tree searched is named under the report's `sidecar_not_found` (`{root, paths}`) and never blocks the flip — check its `root` before concluding the PRD has no manifest.
+
+The response carries a structured `manifest_stamping` report: always `{path, stamped, missing_labels, errors}`, plus `sidecar_not_found`, `external_labels`, `near_miss_labels`, `near_miss_keys`, `unlabeled_tasks` and `polarity_warnings` when non-empty. Every batch task carrying `prd_path` whose sidecar exists lands in exactly one bucket:
+
+- `stamped` — its label was found and stamped;
+- `missing_labels` — its `prd_task_label` names no block in the sidecar;
+- `external_labels` — its `prd_task_label` names a block that sets `external_task_id`, so it is not stamped (Step 2.5); the other labels in the batch still are;
+- `near_miss_labels` — its `prd_task_label` only resembles a sidecar label (case, whitespace, or a transliteration such as `gamma` for `γ`);
+- `near_miss_keys` — it carries its label under a misspelt key (`prd_label`, `label`, `task_label`, …);
+- `unlabeled_tasks` — it has no label at all, which is correct only for an out-of-plan follow-up (Step 3).
+
+**Stamping never blocks the flip, so a clean `success` does not mean a clean stamp.** If the response carries `manifest_stamping_action_required`, act on every line before committing the sidecar: repair the task's metadata with `update_task` (or the sidecar, if its label is the one that is wrong), then re-run `commit_planning` on those ids. For a task that is already `pending`, that re-run is a no-op flip that stamps the label and copies its checks. Never commit an under-stamped sidecar.
 
 The decompose session then commits the stamped sidecar — `git commit --only <sidecar>` in the same skill turn — mirroring how the `.md` manifest is committed beside the PRD (see CLAUDE.md "Working in the main checkout" for the `--only` rationale: it avoids sweeping up unrelated concurrent state in a machine-operated checkout).
 
@@ -153,10 +189,10 @@ This stamping is live in `commit_planning` (landed via task 2578, live since 202
 ### Step 6 — Verify
 
 ```
-mcp__fused-memory__get_tasks(project_root="<project_root>")
+mcp__fused-memory__get_task(id="<id>", project_root="<project_root>")
 ```
 
-Confirm every batch task shows up as `pending`, with the expected dependencies and metadata. Print a summary table:
+Call it once for each id in the batch. Confirm every batch task shows up as `pending`, with the expected dependencies and metadata. Print a summary table:
 
 | PRD label | Task ID | Title | Prereqs | Observable signal |
 |---|---|---|---|---|
@@ -177,6 +213,7 @@ State:
 
 - **Curator gate closed / planning_mode batch rejected.** Do **not** switch to non-planning_mode to paper over it. Wait or escalate — PRD-decomp batches are the precise case where planning_mode is correct.
 - **`add_dependency` fails** because a referenced task doesn't exist. Likely the out-of-batch prereq is `deferred` or `cancelled`; check via `get_task` and resolve with the user.
+- **`add_dependency` returns `error_type` `DependencyCycle`** while wiring. The plan's dependency graph is wrong: remove one of the edges its `cycle` names (fix the PRD ordering). Do not retry the same call.
 - **`commit_planning` rejects with "metadata.files missing".** Decompose mode shouldn't hit this (fresh tasks); if it does, a stale entry was probably combined into one of the new tasks — investigate before retrying.
 
 ## Anti-patterns

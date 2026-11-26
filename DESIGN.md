@@ -175,13 +175,34 @@ MemoryResult {
   content:         str          # the fact, preference, or summary
   category:        enum         # taxonomy category
   source_store:    str          # "graphiti" | "mem0"
-  relevance_score: float        # normalized 0-1 across stores
+  relevance_score: float        # ordinal RRF fusion score (K=60); NOT a similarity
   provenance:      list[str]    # episode IDs (Graphiti results only)
   temporal:        {valid_at, invalid_at}  # (Graphiti results only)
   entities:        list[str]    # related entity names (Graphiti results only)
-  metadata:        object
+  metadata:        object       # carries store_rank + store_score (below)
 }
 ```
+
+**Cross-store ordering is Reciprocal Rank Fusion** (task 3658, PRD D4). Each
+responding store ranks its own results — Mem0 by cosine descending, Graphiti
+by its backend rank — and the merged list is ordered by
+`1 / (60 + store_rank)`, ties broken by the router's primary store and then by
+store-internal rank. The primary store is a **tiebreak, not precedence**: it
+formerly ordered results wholesale, which let one store fill `limit` and made
+the other structurally unreachable.
+
+Consequences for consumers:
+
+- `relevance_score` is **ordinal, never a similarity**. Rank-1 scores
+  1/61 ≈ 0.0164 however good the match is, so it must not be thresholded,
+  compared against a cosine, or compared across API versions.
+- Per-store truth lives in `metadata`:
+  - `store_rank` — int, 1-based rank within the store that returned the
+    result (over that store's surviving results).
+  - `store_score` — float, the Mem0 cosine, verbatim; `null` for Graphiti,
+    whose search exposes no scores at all. That absence is why RRF was chosen
+    over score calibration, and why Graphiti no longer emits a synthesized
+    score.
 
 
 #### `get_entity`
@@ -450,6 +471,16 @@ on `not_found` and returns 404 immediately.  The executable contract for this be
 `dashboard/tests/test_api_curator_cancel.py:test_two_url_not_found_short_circuits_loop`
 (asserts `call_count == 1`, only URL[0] called).
 
+**Routing consequence for every write proxy.** Because the URLs are network paths to one store,
+a write that may have reached the server is never retried on another URL: the second attempt
+would apply it again, and none of the tools behind `dashboard/src/dashboard/app.py::_mcp_write_proxy`
+dedupes server-side. Only connect-phase failures, raised before a request byte is sent and
+listed in `dashboard/src/dashboard/data/mcp_fanout.py::_UNDELIVERED_FAILURES`, fail over. Anything else, the
+whole-operation deadline included, answers 502 `fused_memory_outcome_unknown`. The mechanism is
+`dashboard/src/dashboard/data/mcp_fanout.py::first_success`'s `ambiguous_result`; the
+executable contract is
+`dashboard/tests/test_mcp_write_proxy.py::test_ambiguous_failure_on_the_first_url_is_never_repeated_on_the_next`.
+
 **Trigger for revisiting.** If a future infra change introduces ticket replication or
 multi-region deployment, this invariant must be re-evaluated and the cancel proxy
 short-circuit relaxed to fan-out-then-quorum.
@@ -473,6 +504,17 @@ When task 99 submits a blocker that dedupes into task 42's pending parent:
   appending the child's synthetic id to `dedupe_children`).
 - Task 99's agent receives `{'status': 'dedup_skipped', 'action': 'terminate_cleanly'}`
   and stops working.
+- Stopping is right *here* because a `dedup_skipped` filing really did persist —
+  into the parent.  But `action` is a two-valued vocabulary, defined as
+  `escalation.models.FILER_ACTIONS`: `terminate_cleanly` on every branch whose
+  persistence was observed, and `keep_driving` on `status: 'accepted_unpersisted'`,
+  where the write was accepted but a post-write re-read could not confirm the record.
+  Nothing is *guaranteed* on disk for a handler to see on that branch — the
+  re-read either found no record or could not read one — so the filer must keep
+  driving its task and re-file rather than stop.  No code reads this key — its only
+  consumer is the agent reading the tool result — and
+  `orchestrator.agents.roles.ESCALATION_LADDER_CORE` quotes both tokens verbatim in
+  prose, so the definition and the prompt must move together.
 
 ### Contract
 

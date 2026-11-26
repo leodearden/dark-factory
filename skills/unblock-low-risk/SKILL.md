@@ -1,6 +1,6 @@
 ---
 name: unblock-low-risk
-description: "Autonomous, NON-INTERACTIVE unblock of a single blocked task — but ONLY when the orchestrator's at-block-time dry-run investigation labelled the fix `risk_label == 'low'`. This is the unattended counterpart to /unblock, built for AFK windows: the L2 escalation-watcher launches it as a sub-agent (no terminal) for `task_failure`/`review_issues` escalations whose latest `metadata.dry_run_proposals[-1]` is low-risk and fresh. It re-derives the fix from the proposal prose, applies it scoped to `files_referenced`, runs the project verify suite, and merges via the orchestrator merge queue — aborting cleanly (leaving the escalation pending for a human) on ANY doubt: non-low risk, stale proposal, scope creep, rebase conflict, verify failure, or a merge-queue result other than done. It NEVER touches main directly, never --no-verify, never retries. NOT for: medium / human-review-required proposals, interactive unblocking (use /unblock), any task without a low-risk dry-run proposal, or post-merge-red-main fix-forward tasks (block reason starts with 'Post-merge unscoped type-check failed' — b3_gate.check_proposal hard-ABORTs this entire class regardless of risk_label; see task 1680)."
+description: "Autonomous, NON-INTERACTIVE unblock of a single blocked task — but ONLY when the orchestrator's at-block-time dry-run investigation labelled the fix `risk_label == 'low'`. This is the unattended counterpart to /unblock, built for AFK windows: the L2 escalation-watcher launches it as a sub-agent (no terminal) for `task_failure`/`review_issues` escalations whose latest `metadata.dry_run_proposals[-1]` is low-risk and fresh. It re-derives the fix from the proposal prose, applies it scoped to `files_referenced`, runs the project verify suite, and merges via the orchestrator merge queue — aborting cleanly (leaving the escalation pending for a human) on ANY doubt: non-low risk, stale proposal, scope creep, rebase conflict, verify failure, or a merge-queue result other than done. A merge the worker has already picked up and is still live at the polling ceiling, or one still answering a wait-state reason, is handed back to the watcher (outcome handed_off), never cancelled; a submission superseded by a successor still unresolved at the ceiling is handed back the same way. It NEVER touches main directly, never --no-verify, never retries. NOT for: medium / human-review-required proposals, interactive unblocking (use /unblock), any task without a low-risk dry-run proposal, or post-merge-red-main fix-forward tasks (block reason starts with 'Post-merge unscoped type-check failed' — b3_gate.check_proposal hard-ABORTs this entire class regardless of risk_label; see task 1680)."
 ---
 
 # Unblock — Low-Risk (autonomous, non-interactive)
@@ -46,7 +46,12 @@ The watcher pre-gated, but you re-assert defensively (state can change between t
    human-rehearsal mandate. This precondition turns that external kill into a self-halt.
 
    **Mechanical backstop:** precondition 6's `b3_gate check` below now *also* scans the task
-   description and proposal/block-reason text for this same phrase family and returns
+   description, the proposal text and the block reason's prose for this same phrase family
+   (captured tool output — the fenced excerpt under each failure-report section whose heading
+   is listed in `orchestrator/src/orchestrator/b3_gate.py::_FAILURE_REPORT_CAPTURED_HEADINGS`
+   — is excluded, so
+   pytest/lint output that merely contains a phrase like
+   'do not run' no longer aborts; task 6933) and returns
    `verdict == 'abort'` with an `'explicit stop instruction present'` reason when found — so
    even if this precondition is somehow skipped, the existing "**ONLY** `verdict == 'fresh'`
    proceeds" rule at precondition 6 already routes this class to ABORT, with the gate's
@@ -71,7 +76,7 @@ The watcher pre-gated, but you re-assert defensively (state can change between t
      --worktree <worktree> \
      --project-root <project_root> \
      --category <category> \
-     --config <project_root>/orchestrator/config.yaml
+     --config <project_root>/dark-factory-orchestrator.yaml
    ```
 
    `<category>` is the escalation category already asserted in precondition 4. The gate reads
@@ -95,14 +100,50 @@ The watcher pre-gated, but you re-assert defensively (state can change between t
    must always be routed to a human. This skill will therefore never reach this class's proposals;
    the gate aborts them upstream.
 
+## Defect fixes
+
+When step 3's fix is for a defect (wrong runtime behaviour), it is made test-first.
+The rule's one home is `orchestrator/src/orchestrator/agents/roles.py::DEFECT_TEST_RULE`,
+the text the factory's fixing agents are given. The excerpt below is rendered
+from it and kept equal to it by `tests/scripts/test_defect_rule_mirror.py`.
+
+<!-- defect-test-rule-mirror:begin  rendered from orchestrator/src/orchestrator/agents/roles.py::DEFECT_TEST_RULE; pinned by tests/scripts/test_defect_rule_mirror.py -->
+```text
+## Fixing a defect
+
+A defect is wrong runtime behaviour. A defect fix starts from a test that fails
+without the fix and passes with it: write that test first and watch it fail.
+In a pytest project, when the defect is declared, mark that test
+`@pytest.mark.defect("<ref>")` with the defect's ref. A test carrying
+`@pytest.mark.defect` is a defect's reproducing test.
+
+Never weaken a failing test (loosen or delete an assertion, skip it, mark it
+xfail, or delete the test) without stating in the commit message why the test,
+not the code, was wrong.
+```
+<!-- defect-test-rule-mirror:end -->
+
 ## Procedure
 
 Run these strictly in order. Stop and ABORT at the first step that is not cleanly satisfied.
 
 1. **Release the orchestrator's grip.** `mcp__escalation__release_workflow(task_id, timeout_secs=30)`.
-   This soft-cancels any active workflow and parks the task as `blocked` (the reaper-immune holding
-   state). Inspect the result: if `was_active` is true but `slot_cleared` is false, the orchestrator
-   is still working the task — **ABORT** (do not race it).
+   This soft-cancels any active workflow; then, once no slot is live, if the task is still
+   `in-progress` the tool parks it as `blocked` (the reaper-immune holding state). That park
+   applies whether or not a slot was registered — an orphaned task whose lane was already reaped
+   (`was_active` false) is parked too. Do not *assume* the park happened — **confirm** it by
+   reading the returned fields, and apply this decision rule exactly (you are unattended; do not
+   improvise a fourth case):
+
+   | Result | Do |
+   |---|---|
+   | `slot_cleared: false` (whatever `was_active` says) | **ABORT.** A workflow slot is live at the end of the call — either the orchestrator never let go, or the scheduler dispatched a fresh one mid-call. Either way it owns the task; do not race it. |
+   | `parked: "blocked"` | **Proceed.** The hold landed. |
+   | `parked: null` **and** the task is already at `blocked` | **Proceed.** No park was needed — it was already in the safe state. |
+   | `parked: null` and any other status | **ABORT.** The task was not at `in-progress` and is not at `blocked` (e.g. it flipped to `pending`/`review`, went terminal, or the status read failed). You do not hold the task, so you have no reaper-immune hold to work under. |
+
+   For the two `parked: null` rows, read the status from `get_task(task_id)` (the same call
+   step 0's preconditions already make) — do not infer it from the release result alone.
 
 2. **Understand the issue.** In the worktree, read `latest['proposal_text']`, the review findings
    (`.task/reviews/*.json`), and the failing iteration (`.task/iterations.jsonl`). Treat the proposal
@@ -110,13 +151,19 @@ Run these strictly in order. Stop and ABORT at the first step that is not cleanl
 
 3. **Apply the fix — scoped.** Edit/Write **only** files in `latest['files_referenced']` (and their
    direct test files). The moment the correct fix demands touching a file outside that set — or any
-   of `main`-only paths, CI config, infra, or `orchestrator/config.yaml`/`.mcp.json`/systemd units —
+   of `main`-only paths, CI config, infra, or `dark-factory-orchestrator.yaml`/`.mcp.json`/systemd units —
    the change is no longer low-risk: **ABORT**. Do not commit `.task/`.
+   A defect fix follows [Defect fixes](#defect-fixes).
 
 4. **Rebase onto main.** `git -C <worktree> rebase main` (main may have moved). On **any conflict** →
+   run [Rebase recovery preflight](#rebase-recovery-preflight) to leave the worktree clean, then
    **ABORT** (a conflict means the change is no longer self-contained).
 
-5. **Verify.** Run the project's full verify suite from `orchestrator/config.yaml` in the worktree —
+   The cleanup is not optional politeness. Aborting the skill while the worktree is still
+   mid-rebase leaves precondition 5 refusing the *next* run for that exact reason, so the task
+   deadlocks: nothing can retry it and nothing cleans it up.
+
+5. **Verify.** Run the project's full verify suite from `<project_root>/dark-factory-orchestrator.yaml` in the worktree —
    `test_command`, then `lint_command`, then `type_check_command` (read them from the file; do not
    hardcode). Any non-zero exit → **ABORT**. (Pipe to a file + check exit status; never trust a
    tail.)
@@ -130,7 +177,7 @@ Run these strictly in order. Stop and ABORT at the first step that is not cleanl
    .venv/bin/python -m orchestrator.b3_gate charge \
      --task-id <task_id> \
      --project-root <project_root> \
-     --config <project_root>/orchestrator/config.yaml
+     --config <project_root>/dark-factory-orchestrator.yaml
    ```
 
    Note: `charge` takes **no `--worktree`** argument — cap state is keyed on `project_root` only.
@@ -145,8 +192,10 @@ Run these strictly in order. Stop and ABORT at the first step that is not cleanl
    Note: once `charged: true` is returned the slot is consumed even if the merge does not succeed.
    Completion is observed via `merge_status` polling (not a blocking return); outcomes that cost a
    slot: `{'error': ...}` (orchestrator down), or a polled/resolved state of `conflict`, `blocked`,
-   `abandoned`, `failed`, `unknown_branch`, or `unknown` (unconfirmed on main). These
-   post-charge aborts cost a slot. This is the accepted §4.2 tradeoff.
+   `abandoned`, `error`, `unknown_branch`, or an epistemic merge_status answer that step 9 aborts
+   on. These post-charge aborts cost a slot. This is the accepted §4.2 tradeoff. A hand-off,
+   whether at step 8's deadline or from step 9's `superseded` arm, consumes no further slot,
+   because resume mode never charges.
 
 8. **Merge via the queue — never directly.** Submit:
 
@@ -165,49 +214,118 @@ Run these strictly in order. Stop and ABORT at the first step that is not cleanl
 
    The response shape determines the next action:
 
-   - **TERMINAL (resolved within the bounded window):** `status` ∈ `done` | `conflict` | `blocked`
-     | `already_merged` | `unknown_branch` | `failed`. The call returns a `request_id` in all
+   <!-- merge-state-vocab:begin partition=SUBMIT_TERMINAL
+        Mirrors shared/src/shared/merge_state.py::SUBMIT_TERMINAL. Pinned by
+        scripts/tests/test_merge_state_vocabulary_consistency.py — extend the enum
+        and this list goes red until it matches. -->
+   - **TERMINAL (resolved within the bounded window):** `status` ∈ `done` | `conflict`
+     | `blocked` | `already_merged` | `done_wip_recovery` | `unknown_branch`
+     | `unmerged_state` | `stash_failed` | `wip_halted` | `wip_recovery_no_advance`
+     | `error` | `superseded`.
+     <!-- merge-state-vocab:end -->
+     The six worker-internal outcomes (`wip_halted`, `done_wip_recovery`,
+     `wip_recovery_no_advance`, `unmerged_state`, `stash_failed`, `error`) are rare;
+     `merge_status` collapses all of them except `done_wip_recovery` to `blocked` when
+     observed by polling (`escalation/src/escalation/merge_status_answer.py::map_terminal_state`) —
+     handle all of them but `done_wip_recovery` (which landed — treat it as `done`) as
+     `blocked`. (`failed`, which this list named until task 4829, is not a
+     value the server ever returns; the real one is `error`.)
+     The call returns a `request_id` in all
      cases except the `already_merged` ancestor fast-path, which short-circuits before entry
      construction (no `request_id`, `commit` is the ancestor sha). The `already_merged`
      worker-path (entry was constructed, merge found already done) does carry a `request_id`
      but may have `commit: null`. Proceed to step 9.
 
-   - **NON-TERMINAL — `status` ∈ `queued` | `attached`:** This is a **successful submission**, not
-     a failure. `queued` means the entry is waiting in the merge queue; `attached` means it was
-     coalesced with an existing in-flight request. Poll `merge_status` until the entry reaches a
-     terminal state:
+   <!-- merge-state-vocab:begin partition=SUBMIT_NON_TERMINAL
+        Mirrors shared/src/shared/merge_state.py::SUBMIT_NON_TERMINAL. Pinned by
+        scripts/tests/test_merge_state_vocabulary_consistency.py — extend the enum
+        and this list goes red until it matches. -->
+   - **NON-TERMINAL — `status` ∈ `queued` | `attached`:**
+     <!-- merge-state-vocab:end -->
+     This is a **successful submission**, not a failure. `queued` means the entry is
+     waiting in the merge queue; `attached` means it was
+     coalesced with an existing in-flight request.
+     <!-- merge-status-route:begin answer=LIVE_STATES,WAIT
+          Pinned by escalation/tests/test_merge_status_boundary.py (rows B1-B8). -->
+     While the `merge_status` answer is a live state or a wait-state reason, **WAIT**: keep
+     polling, up to the deadline below:
+     <!-- merge-status-route:end -->
 
      ```
-     deadline = now() + 1200 s          # 20-minute hard ceiling
-     while state ∈ {queued, verifying, gate, finalizing} and now() < deadline:
-         wait = clamp(eta_seconds if eta_seconds else 30, min=15, max=60)
-         sleep(wait)
+     deadline = now() + 1200 s          # 20-minute polling ceiling (resume mode: 3 h — see "Resuming a handed-off merge")
+     # WAIT_REASONS = the reasons whose action is WAIT in
+     #   skills/_shared/merge-status-reasons.md#the-switch
+     # merge-state-vocab:begin partition=LIVE_STATES
+     #   Mirrors shared/src/shared/merge_state.py::LIVE_STATES. Pinned by
+     #   scripts/tests/test_merge_state_vocabulary_consistency.py — extend the enum
+     #   and this set goes red until it matches.
+     while (state ∈ {queued, verifying, gate, finalizing} or reason ∈ WAIT_REASONS) and now() < deadline:
+     # merge-state-vocab:end
+         wait = clamp(eta_seconds if eta_seconds else 30, min=15, max=60)   # resume mode: min=60, max=300
+         sleep(wait)   # unattended: realise per skills/merge-queue/SKILL.md#waiting-between-polls, its FOREGROUND form only -- a bare sleep 60 is blocked by the harness
          result = mcp__escalation__merge_status(request_id)
-     if state ∈ {queued, verifying, gate, finalizing}:   # deadline exceeded, entry still live
-         mcp__escalation__merge_cancel(request_id)
-         ABORT   # leave escalation pending; 'one attempt, abort on doubt'
+     # merge-state-vocab:begin partition=LIVE_STATES
+     #   Mirrors shared/src/shared/merge_state.py::LIVE_STATES (second copy).
+     if state ∈ {queued, verifying, gate, finalizing} or reason ∈ WAIT_REASONS:   # deadline exceeded, entry still live or still waiting
+     # merge-state-vocab:end
+         if state == queued:      # never picked up by the merge worker — cancel-before-pickup
+             mcp__escalation__merge_cancel(request_id)
+             ABORT
+         else:                    # picked up by the merge worker, or still answering a wait-state reason — NEVER cancel
+             HAND OFF             # return outcome "handed_off" with request_id (see Return value)
      ```
 
      Use `eta_seconds` from each `merge_status` response as the cadence hint; clamp to [15 s,
-     60 s]. Cap total polling at 20 minutes: if the entry is still live at the deadline, call
-     `merge_cancel(request_id)` and ABORT — leaving the escalation pending for a human,
-     consistent with the skill's bounded-operation ethos and 'one attempt, abort on doubt'
-     principle. Proceed to step 9 with the final `result.state` if the deadline is not reached.
+     60 s]. The 20-minute ceiling bounds **this sub-agent's lifetime, not the merge**. At the
+     deadline the entry's state decides:
+     - **Still `queued`** — no worker has started it, so cancelling costs nothing: call
+       `merge_cancel(request_id)` and ABORT, leaving the escalation pending for a human.
+     - **Any other live state** (`verifying`, `gate`, `finalizing`, or any state later added to
+       `LIVE_STATES`) — the entry was picked up by the merge worker (merging or verifying).
+       `verifying` also covers an entry waiting for a verify slot, so it proves pickup, not a
+       running verify. **Never `merge_cancel` it**: on a pending waiter
+       `escalation/src/escalation/server.py::merge_cancel` retires the entry and reaps its
+       in-flight worktree, discarding the merge's progress and any verify that may be green. A merge
+       verify runs about 50–60 min (`plans/verify-admission-task-slots-gate.md`, M2), so a
+       picked-up entry at 20 minutes is the normal case, not a doubt signal. Instead **HAND
+       OFF**: leave the task status and the escalation untouched, call no `merge_cancel`, and
+       return `outcome: "handed_off"` with the `request_id` and the observed state in `reason`.
+       The escalation-watcher resumes it through [resume mode](#resuming-a-handed-off-merge-resume-mode).
+       Handing off is **not** an ABORT, so the cancel rule in "Aborting" does not apply to it.
+     - **Still answering a wait-state reason** (a **WAIT** row of [the shared reason
+       switch](../_shared/merge-status-reasons.md#the-switch)) — **HAND OFF** exactly as for a
+       picked-up entry, and call no `merge_cancel`. A wait-state reason says the server cannot
+       currently see the entry, not that it is idle; the switch's meaning column says why for
+       each reason. Return the `state` and `reason` in the hand-off's `reason`. This deadline
+       replaces the shared doc's own [wait bound](../_shared/merge-status-reasons.md#wait-bound).
+
+     Proceed to step 9 with the final `result` if the deadline is not reached; any epistemic
+     answer that reaches step 9 is therefore not a wait state.
 
 9. **Handle the outcome.** The `merge_request` (in-window) and `merge_status` (polled) vocabularies
-   overlap but differ: `failed`/`unknown_branch` appear only as `merge_request` statuses (the server
-   collapses them to `blocked` when observed via polling); `abandoned` is a polled-only state that
-   `merge_request` never returns; `unknown` is a polled-only fallback state.
+   overlap but differ: `error`/`unknown_branch` and the other worker-internal outcomes appear only
+   as `merge_request` statuses (the server collapses them to `blocked`, and `done_wip_recovery` to
+   `done`, when observed via polling); `abandoned` is a polled-only state that `merge_request`
+   never returns; the epistemic states are poll-only.
 
-   - **`done` (polled state) or `already_merged` (submit-time):** success.
+   <!-- merge-status-route:begin answer=done -->
+   - **`done` (polled state) or `already_merged` (submit-time):** **ACCEPT** — success.
+     <!-- merge-status-route:end -->
      `already_merged` comes in two sub-cases:
      - **Fast-path** (ancestor short-circuit): no `request_id`; `commit` is the ancestor sha —
        use `done_provenance={"kind": "merged", "commit": "<commit>"}`.
      - **Worker-path** (entry constructed, merge found already done): carries a `request_id`
-       but `commit` may be `null`. If `commit` is null, run `git log main --oneline -20` to
-       confirm the landed sha and use `done_provenance={"kind": "found_on_main",
-       "commit": "<sha from git log main --oneline -20>",
-       "note": "merge found already done by worker; sha confirmed via git log"}`.
+       but `commit` may be `null`. If `commit` is null, recover the landed sha with the
+       **task-scoped merge-marker search** (see [Deriving the landed
+       sha](#deriving-the-landed-sha) below) and use `done_provenance={"kind": "found_on_main",
+       "commit": "<sha from the merge-marker search>",
+       "note": "merge found already done by worker; sha confirmed via merge-marker search"}`.
+       If the search comes back empty, do **not** abort on that alone — you are holding a
+       server-issued `already_merged` verdict, and a fast-forward or coalesce-absorbed
+       landing carries no marker. Run the ancestry disposition in [Deriving the landed
+       sha](#deriving-the-landed-sha) and follow its arms; every arm that yields no sha takes
+       [this skill's disposition](#ladder-dispositions) for it. Those arms must never be
+       stamped: report them rather than proceeding to sub-steps a–d.
        `merge_cancel(request_id)` is a safe no-op (entry is terminal) and may be skipped.
      a. `set_task_status(id=task_id, status="done", project_root=project_root,
         done_provenance=<shape>)`. Choose by HOW `done` was observed:
@@ -215,43 +333,335 @@ Run these strictly in order. Stop and ABORT at the first step that is not cleanl
           `commit` field (the merge sha) — use
           `done_provenance={"kind": "merged", "commit": "<commit field from merge_request response>"}`.
         - **Polled** (`merge_status` returned `done`): the `merge_status` terminal response
-          carries **no `commit` field** — never assume one is present. Run
-          `git log main --oneline -20` to recover the landed sha, then use
+          carries **no `commit` field** — never assume one is present. An event-store `done`
+          (`source: "event_store"`) may carry `merge_sha`, the request's recorded landing sha.
+          **Never stamp it bare.** Run the ladder marker-first (see [Deriving the landed
+          sha](#deriving-the-landed-sha) below): the **task-scoped merge-marker search** stays
+          the first rung, and a marker sha it yields is the one you use, as
           `done_provenance={"kind": "merged", "commit": "<recovered sha>"}` (the server
           ancestor-checks it) or `done_provenance={"kind": "found_on_main",
           "commit": "<recovered sha>", "note": "merge completed per polled merge_status;
-          sha recovered from git log"}`. A polled-done sha MUST be recovered from git log;
-          it is never present in the merge_status response.
+          sha recovered via merge-marker search"}`. On an empty marker plus ancestry rc=1,
+          that `merge_sha` is the input to the ladder's [rebased-solo-landing
+          arm](../_shared/deriving-landed-sha.md#rebased-solo-landing). An empty search is
+          **not** by itself a not-landed verdict — you are holding a server-issued polled
+          `done`. Run the ancestry disposition in [Deriving the landed
+          sha](#deriving-the-landed-sha) and follow its arms; every arm that yields no sha takes
+          [this skill's disposition](#ladder-dispositions) for it, which says when to call
+          `merge_cancel`. Those arms must never be stamped.
         - **`already_merged` fast-path** and **worker-path**: handled by the sub-case bullets
           above; use the `done_provenance` shape specified there.
      b. **Restore metadata** — `set_task_status` overwrites the metadata blob, nuking
         `dry_run_proposals` / `memory_hints` / `files`. Immediately
         `update_task(..., append=true)` to restore them.
      c. Clean up: `git worktree remove .worktrees/<task_id>` and `git branch -d task/<task_id>`.
+        After a [rebased solo landing](../_shared/deriving-landed-sha.md#rebased-solo-landing)
+        `git branch -d` refuses, because the ref keeps its pre-rebase shas. `git branch -D
+        task/<task_id>` is safe once `git cherry main task/<task_id>` is non-empty and every line
+        starts with `-`; leaving the ref in place is also fine.
      d. `mcp__escalation__resolve_issue(escalation_id, resolution="Auto-merged low-risk fix
         (unblock-low-risk): <what changed + merge sha>", resolved_by="unblock-low-risk")`.
 
-   - **`conflict` | `blocked` | `abandoned` | `failed` | `unknown_branch`:**
+   - **`conflict` | `blocked` | `abandoned` | `error` | `unknown_branch`:**
      call `mcp__escalation__merge_cancel(request_id)` then **ABORT**. Do not resolve, do not
-     retry, do not direct-merge. (`failed`/`unknown_branch` appear only on the in-window
+     retry, do not direct-merge. (`error`/`unknown_branch` appear only on the in-window
      `merge_request` path; `abandoned` appears only on the polled `merge_status` path.)
 
-   - **`unknown`** (e.g., after an orchestrator restart; `merge_status` carries
-     `hint="check git log main"`): fall back to `git log main --oneline -20` and check whether
-     the task's commit landed on main.
-     - Confirmed on main → success; use `done_provenance={"kind": "found_on_main",
-       "commit": "<sha confirmed on main via git log main --oneline -20>",
-       "note": "confirmed on main after unknown merge_status; sha from git log"}` and proceed
-       with sub-steps a–d above.
-     - Not found → `mcp__escalation__merge_cancel(request_id)` then **ABORT**.
+   - **`superseded`:** **not a failure, and never handled as one.** `superseded` is
+     submit-terminal and is not a live state, so it reaches this step either straight from step 8's
+     submission or on the first poll tick that returns it — step 8's loop exits immediately
+     because `superseded ∉ {queued, verifying, gate, finalizing}`. It means your request was
+     replaced by a successor that may still be in flight and whose landing will carry this
+     branch's work. Reporting it as a failure would report a **false failure** and leave the
+     escalation pending on a branch that is about to land.
+     - **Do not call `merge_cancel(request_id)`.** On an absorbed id that call is a no-op which
+       answers an epistemic state (`escalation/src/escalation/server.py::merge_cancel`, its
+       no-waiter path), so it buys nothing and muddies the record. There is no
+       cancel path for an in-flight train at all.
+     - **Read `superseded_by`'s shape.** It names one of two mechanisms, and only one of them is a
+       request id:
+       - **`coalesce-*`** → a **train** id, not a request id: this submission was absorbed into a
+         coalesce train (`MergeOutcome('superseded', superseded_by=train_id)`,
+         `orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker._maybe_coalesce_waiting_singles`). Do **not** poll it by `request_id` —
+         it answers `stale_record` with reason `coalesce_train_id`: a member's record, never
+         this submission's outcome.
+       - **`mr-*`** → a generation advance: this same branch re-enqueued at a newer generation
+         (`MergeOutcome('superseded', superseded_by=gen_next.request_id, ...)`, same module).
+         Nothing was absorbed, and that id *is* pollable by `request_id`.
+     - **Resolve it by ancestry, not by re-polling the id you already hold.** Run the ancestry
+       disposition in [Deriving the landed sha](#deriving-the-landed-sha) — it already carries the
+       `coalesce-*` carve-outs, so do not restate or improvise any ladder text here. With the
+       branch handle's record (next bullet), this arm has four dispositions, and **two of them
+       are success**:
+       - **A stampable sha** — proceed with sub-steps **a–d** above.
+       - **Resolved, landed and already credited** — the `coalesce-*` arm's `done`-status
+         outcome: signal (a) shows the tip landed, and this task's scheduler status, re-read
+         fresh, already reads `done`. There is **nothing to stamp**, and that is **success, not
+         an abort**: skip sub-step (a), then run sub-steps **(c)** cleanup and **(d)**
+         `resolve_issue`, recording the tip merge sha in the resolution text. Without this
+         disposition a landed, correctly-credited task falls through to the polling exit below
+         and gets abandoned as in-flight — see [Deriving the landed
+         sha](#deriving-the-landed-sha)'s `coalesce-*` bullet for the full two-outcome split.
+       - **The successor failed** — the ladder yields neither success disposition, and the branch
+         handle serves a record in [merge-queue rule
+         1](../merge-queue/SKILL.md#follow-the-superseded-successor)'s resumed terminal set other
+         than `done` and other than a new `superseded` (the next bullet follows that one). It is
+         resolved but not landed: **ABORT** without `merge_cancel`, reporting the successor id
+         and the state it ended in as a failed successor. A train derail is not by itself this
+         case: merge-queue rule 4 re-pends the still-unlanded members for a solo re-merge, so
+         until the branch handle serves such a record the work is still in flight.
+       - **Not resolved yet** — the single poll-then-hand-off exit in the next bullet.
+
+       On the `coalesce-*` arm remember both carve-outs: **neither rc=1 nor rc=128-with-an-empty-marker is
+       not-landed**, and **neither arm carries a self-stamp** — the scheduler status decides only
+       which exit applies, never whether a write is permitted.
+     - **If it has not resolved yet, poll, then hand off — never a failure.** Keep polling the
+       **branch** handle (`mcp__escalation__merge_status(branch="task/<task_id>")`, same clamped
+       cadence), re-running the ancestry disposition on each tick, until step 8's polling
+       deadline. When the submission itself returned `superseded` in-window, step 8's poll loop
+       was never entered, so that deadline is 20 min from the `merge_request` call (in resume
+       mode, the resume deadline; see [resume mode](#resuming-a-handed-off-merge-resume-mode)).
+       A tick that serves a `superseded` record whose `superseded_by` differs from the one you
+       hold names a new successor: re-read its shape above and continue against it, per
+       [merge-queue rule 1](../merge-queue/SKILL.md#follow-the-superseded-successor). If the
+       successor is still unresolved at the deadline, **HAND OFF**: return `outcome:
+       "handed_off"` carrying this run's `request_id` and the `superseded_by` you then hold (the
+       latest one the branch handle served, not necessarily the first), put the ladder's last
+       verdict in `reason`, and leave the task status and the escalation untouched. The
+       escalation-watcher resumes the hand-off through [resume
+       mode](#resuming-a-handed-off-merge-resume-mode). This hand-off, like step 8's, is **not**
+       an ABORT. A `coalesce-*` landing that signal (a) shows but the scheduler has not credited
+       follows the `coalesce-*` arm's "Any other status" bullet in [this skill's
+       dispositions](#ladder-dispositions), which says when it is reported and when it hands
+       off. Never call `merge_cancel` and never claim a failure: this is **not** the plain
+       abort-as-failure the `conflict` / `blocked` / `abandoned` arm above prescribes. Never
+       resubmit and never direct-merge while the successor is unresolved.
+
+   - **An epistemic state** (it describes the server's records rather than the merge, and
+     always carries a `reason`): switch on `reason` per [the shared reason
+     switch](../_shared/merge-status-reasons.md#the-switch), including its [request_id re-poll
+     rule](../_shared/merge-status-reasons.md#request-id-polls) — this skill polls by
+     `request_id`, so before acting on `stale_record` or `no_record` (other than
+     `coalesce_train_id`, which that rule exempts) re-poll once with
+     `merge_status(task_id=task_id)` and switch on that answer instead. Unattended, so every
+     answer ends in ABORT except three:
+     - A re-poll `done` carrying `kind: "found_on_main"` and a `merge_sha` (the only re-poll
+       shape the shared rule counts as a landing) → success; proceed with sub-steps a–d using
+       `done_provenance={"kind": "found_on_main", "commit": "<merge_sha>", "note": "landed
+       per the task_id-keyed merge_status git-authority tier, after an epistemic request_id
+       answer"}`. **Two exceptions**, where `merge_sha` is not safe to stamp as returned: a
+       project that sets `git.commit_citation_pattern: ""` (there `merge_sha` is the raw
+       branch tip, not a commit on main), and a task that declares a non-empty
+       `metadata.delivered_checks` (there `merge_sha` may name a landing since reverted). In
+       either case, run [Deriving the landed sha](#deriving-the-landed-sha) and stamp only
+       the sha it yields.
+     - `landing_unattributable` → run [Deriving the landed sha](#deriving-the-landed-sha). A
+       stampable sha → success; proceed with sub-steps a–d using
+       `done_provenance={"kind": "found_on_main", "commit": "<sha from the ladder>",
+       "note": "<the note the ladder specifies for that outcome>"}`. Otherwise follow
+       [this skill's dispositions](#ladder-dispositions).
+     - A re-poll answering a live state (any of them, `queued` included) or a wait-state reason
+       → a merge carrying this task's work may still be in flight under another request. That
+       is the expected shape after an `attached` submit whose `poll_by` is `task_id` or
+       `branch`: this run's own `request_id` answers `no_record` while the entry it attached to
+       is live. **HAND OFF** exactly as step 8's deadline does for a picked-up entry: call no
+       `merge_cancel`, leave the task status and the escalation untouched, and return `outcome:
+       "handed_off"` carrying the re-poll's `request_id` when it has one (the in-flight entry,
+       which resume mode then polls), else this run's own, with the re-poll's `state` and
+       `reason` in `reason`.
+
+     <!-- merge-status-route:begin answer=prior_run_terminal,never_submitted,coalesce_train_id -->
+     Every other answer — `prior_run_terminal` (copy `last_outcome`'s `state`, `run_id`,
+     `finished_at` and `reason` into the return value's `reason`), `never_submitted`,
+     `coalesce_train_id`, a reason the shared doc does not list, or any other re-poll answer
+     (a `done` without `kind: "found_on_main"` included, even one carrying a `merge_sha`: that
+     sha is the record's, not a git proof, and the row may be an earlier round's) → `mcp__escalation__merge_cancel(request_id)` then
+     **ABORT**. Never resubmit, never direct-merge.
+     <!-- merge-status-route:end -->
+
+### Resuming a handed-off merge (resume mode)
+
+The escalation-watcher launches this skill in **resume mode** after a prior run returned
+`handed_off`: from step 8's deadline disposition, from step 9's `superseded` arm, or from step
+9's epistemic arm on a re-poll still live or waiting. Resume mode finishes that run's merge; it
+is not a second attempt.
+
+- **Inputs:** `task_id`, `escalation_id`, `project_root`, `worktree`, `request_id`, and an
+  optional `superseded_by`. `superseded_by` is present exactly when the hand-off came from step
+  9's `superseded` arm, and is the `mr-*` or `coalesce-*` value that run last held. If a required
+  input is missing, ABORT without `merge_cancel`.
+- **Skip** preconditions 0–6 and Procedure steps 1–7. **Never** call `merge_request`,
+  `b3_gate check`, `record-launch` or `charge`: the fix is already committed, gated and charged,
+  and the entry is already submitted. Re-charging would spend a second cap slot, and resubmitting
+  would race a live entry (the watcher's "Tracking in-flight merges").
+- **The one re-check:** `mcp__escalation__get_escalation(escalation_id)` must still be `pending`.
+  If it is not, someone has taken the item: return `aborted` without `merge_cancel` and without
+  touching the task, with a `reason` that says the escalation is no longer pending and names its
+  status. The merge carries on, and whoever resolved the escalation owns it.
+- **Poll** with the resume parameters: `deadline = now() + 3 h`, cadence clamp [60 s, 300 s].
+  Past pickup there is nothing left to cancel, and the remaining wait is a verify of about 50–60
+  min (`plans/verify-admission-task-slots-gate.md`, M2); 3 h covers a verify plus a gate
+  re-verify with margin, at a cadence that keeps this sub-agent's context small. A wait over
+  120 s still uses the foreground form of
+  [Waiting between polls](../merge-queue/SKILL.md#waiting-between-polls), with an explicit Bash
+  `timeout` above the wait. Where to start depends on `superseded_by`:
+  - **Without `superseded_by`:** enter step 8's poll loop at its first `merge_status(request_id)`
+    call (no submit).
+  - **With `superseded_by`:** do **not** poll `request_id`. It is already superseded: it
+    re-serves that `superseded` row, or after an orchestrator restart answers `stale_record`,
+    which would wrongly route into step 9's epistemic arm. Instead re-enter step 9's `superseded` arm at "Resolve it by ancestry",
+    treating the given `superseded_by` as the value read. It is where the arm starts, not a
+    fixed value: a fresh branch-handle record that is `superseded` with a different
+    `superseded_by` replaces it, per [merge-queue rule
+    1](../merge-queue/SKILL.md#follow-the-superseded-successor). Keep its `mr-*`/`coalesce-*`
+    reading and every `coalesce-*` carve-out, including no self-stamp on either arm.
+- **At the resume deadline** step 8's deadline disposition applies unchanged to a request-id
+  resume: still `queued` → `merge_cancel` and ABORT;
+  picked up, or still answering a wait-state reason → `handed_off` again. A superseded
+  resume whose successor is still unresolved returns `handed_off` again with the same
+  `request_id` and the latest `superseded_by`. It never calls `merge_cancel`, whatever state the
+  branch handle reports. The watcher does not launch a second resume (its "Completion handling").
+- **Otherwise run step 9 exactly as written**, including [this skill's
+  dispositions](#ladder-dispositions) on the ladder's verdicts. A polled `done` follows sub-step
+  a's **Polled** bullet: recover the sha with the task-scoped merge-marker ladder
+  ([Deriving the landed sha](#deriving-the-landed-sha)), stamp `kind` `"merged"` (or
+  `"found_on_main"`, as that bullet allows), then run sub-steps b–d. Wherever the superseded and
+  `coalesce-*` arms poll to step 8's polling deadline, that is this run's resume deadline. A
+  `superseded` first seen during
+  a request-id resume takes that arm too, and at the resume deadline it hands off carrying
+  `superseded_by`.
+- Return per "Return value".
+
+### Rebase recovery preflight
+
+`git rebase --abort` is the way out of a conflicted rebase, and it has two measured failure modes
+that leave the worktree wedged with no obvious way forward. Run the preflight first — from the
+**primary dark-factory checkout** (where `.venv/` and `orchestrator/` live — NOT the worktree,
+which has no `.venv`), exactly as precondition 6 invokes `b3_gate`:
+
+```
+.venv/bin/python -m orchestrator.rebase_recovery preflight --worktree <worktree>
+```
+
+Parse JSON stdout; `verdict` is one of `clean | repaired | blocked`.
+
+- `clean` or `repaired` → run the abort itself, **with the guard**:
+  `git -C <worktree> -c rerere.enabled=false rebase --abort`. Use that spelling every time, not
+  the bare `git rebase --abort`: with rerere disabled git never opens `MERGE_RR`, which is what
+  makes the abort survive both failure modes.
+- `blocked` → **ABORT** the skill without running the abort, copying the payload's `unrepaired`
+  entries verbatim into your `reason`. `blocked` means either something the preflight declined to
+  touch — typically a lock file a live process still holds open, and deciding what that process
+  is, is a human's call, not this skill's — or a worktree it could not resolve at all
+  (`resolved: false`), where it inspected nothing, so the empty `dangling`/`locks_*` lists report
+  an absence of looking rather than an absence of damage. Check the path you passed.
+
+Add `--report-only` to inspect without changing anything; it detects and reports, moves nothing,
+and returns `blocked` rather than `clean` when it finds damage it deliberately left in place.
+
+**What it does, so you can read its output.** The preflight moves a suspect `MERGE_RR` aside to
+`<git-common-dir>/rerere-specimens/MERGE_RR.<worktree>-<stamp>` — **moved, never deleted**, because a *successful*
+abort deletes that file and it is the only record of which conflict ids the worktree was carrying.
+It also removes `*.lock` files that are both older than an hour **and** held open by no running
+process; a lock with a live holder is retained at any age.
+
+The state it detects is an id present in `MERGE_RR` with no backing `rr-cache/<id>` directory. How
+those directories come to be missing is **not established** — do not repeat any explanation of the
+cause, including in a report; describe only what was observed.
+
+### Deriving the landed sha
+
+The derivation ladder itself — exact-subject marker search, the ref-existence gate, containment,
+the ancestry check, the phantom-branch citation gate, and the `DoneProvenance` contract — is
+[`skills/_shared/deriving-landed-sha.md`](../_shared/deriving-landed-sha.md#the-ladder), the
+single normative copy. Run it in full; do not improvise a shorter version.
+
+This skill enters it **marker-first**: run
+[step 1](../_shared/deriving-landed-sha.md#step-1)'s task-scoped marker search, then
+[step 2](../_shared/deriving-landed-sha.md#step-2)'s `git rev-parse --verify --quiet
+task/<TASK_ID>` ref-existence probe. (Where the call sites above say "run the ancestry
+disposition", that is [step 4](../_shared/deriving-landed-sha.md#step-4), reached from
+[step 3](../_shared/deriving-landed-sha.md#step-3) when the marker search comes back empty.)
+
+<a id="ladder-dispositions"></a>**This skill's dispositions on the ladder's verdicts.** Every sha recorded in `done_provenance`
+MUST come from that task-scoped ladder — never from main's current HEAD and never from an
+eyeballed listing.
+
+- **A stampable sha** — the ladder yields one on exactly five outcomes: a non-empty marker with
+  the branch ref **gone**; a marker that passes **containment rc=0**; a group/train merge
+  confirmed by **contained-before rc=1**; a landing — fast-forward *or* sibling-covered —
+  confirmed by a **subject-matching task citation** on main; and a **rebased solo landing** whose
+  recorded `merge_sha` passes the [rebased-solo-landing
+  arm](../_shared/deriving-landed-sha.md#rebased-solo-landing)'s three checks, stamped with that
+  arm's `{"kind": "merged", "commit": ..., "note": ...}`. Use the sha and the `note` the ladder
+  specifies for that outcome, and proceed with the calling arm's sub-steps a–d above.
+- **A genuine not-landed outcome** — the ladder's phantom-branch and rc=128 exits: rc=0's
+  **phantom-branch** exit (nothing on main cites this task), and rc=128 with an empty marker
+  search, outside the `coalesce-*` arm and with no request-scoped `done` in hand. On either:
+  `mcp__escalation__merge_cancel(request_id)` then **ABORT**. Do not resolve, do not retry, do
+  not direct-merge.
+- **rc=1 with no request-scoped `done`**, outside the `coalesce-*` and rebased-solo-landing arms,
+  with a `git cherry main task/<task_id>` that prints no `-` line — **ABORT** and report it as
+  *not landed or not confirmed landed*, quoting the `git cherry` output, *without*
+  `merge_cancel`. A single-commit branch that landed rebased with context drift prints exactly
+  one `+` line and is indistinguishable from a branch that never landed, so cherry alone never
+  licenses the cancel. A `+` line beside any `-` line is not confirmed landed either: same exit.
+- **Citation gate un-evaluable** (`git.commit_citation_pattern: ""`) — proves neither verdict, so
+  it is **not** a not-landed outcome: **ABORT** and report the gate as un-evaluable, *without*
+  calling `merge_cancel`. This skill scopes that call to genuine not-landed outcomes **only**.
+- **[Landing-unattributable](../_shared/deriving-landed-sha.md#landing-unattributable)** — the
+  work may well be on main, but no sha can be attributed to this request, so it is **not** a
+  not-landed outcome: **ABORT** and report it as landing-unattributable, naming the failing check
+  and quoting the `git cherry` output, *without* calling `merge_cancel`. A `done` or
+  `already_merged` carrying this submission's `request_id` is request-scoped, so outside the
+  `coalesce-*` arm an rc=1 or rc=128-with-an-empty-marker after one either stamps on the
+  rebased-solo-landing arm or lands here — never on the not-landed bullet above.
+- **On the `coalesce-*` arm, neither rc=1 nor rc=128-with-an-empty-marker is a not-landed
+  outcome** — a train merges only the tip branch, so an absorbed non-tip member has neither a
+  marker of its own nor an ancestor relationship to prove. Follow the ladder's pointer into
+  `merge-queue/SKILL.md`: rules 2–3 govern rc=1, rule 2a governs rc=128-with-empty-marker, and
+  **neither arm licenses a write** — never self-stamp on either. Read rules 2 and 2v there for the
+  argument rather than restating it; the disposition here is the **same on both arms**, and it
+  turns on re-reading this task's scheduler status **fresh**:
+  - **`done`** — `mark_member_done`'s automatic flip already happened, so the work is landed
+    **and already credited**. There is nothing to write: **skip sub-step (a) entirely** and
+    proceed to sub-steps **(c)** and **(d)**. This is a **success** path — not an abort, and not
+    a landed-but-not-credited report. (Sub-step (c)'s `git branch -d` will refuse on this arm:
+    the member ref is stale-by-rebase and not an ancestor of main. `git branch -D
+    task/<task_id>` is safe once `git cherry main task/<task_id>` is non-empty and every line
+    starts with `-`; leaving the ref in place is also fine.)
+  - **Any other status** — `pending`, `merge-deferred`, anything else, including a status you
+    cannot read — **never write**. Keep polling until the earlier of step 8's polling deadline
+    and 20 min after the tick on which signal (a) first fired, then take the
+    **landed-but-not-credited** report, citing the tip merge sha and the current status. The
+    20-min cap is [merge-queue rule 2v](../merge-queue/SKILL.md#follow-the-superseded-successor)'s
+    ceiling for the asynchronous flip, and it keeps a resume's 3 h deadline from delaying this
+    report. That report is an ABORT taken **without** `merge_cancel`: a non-failure report that
+    returns `outcome: "aborted"`. It is **not** handed off: the work is already on main, and
+    what is missing is credit the orchestrator withheld for one of the causes rule 2v names,
+    none of which more polling changes. The one exception: take that report only once a tick
+    **after** the one on which signal (a) first fired has re-read a non-`done` status. If this
+    run's polling deadline arrives before such a tick, the asynchronous flip may still be in
+    progress (rule 2v: it normally lands within a tick or two), so the arm counts as not
+    resolved yet and hands off per step 9's `superseded` arm.
+
+  In **neither** case `merge_cancel`, and in neither case report not-landed. This is
+  the one carve-out that most matters here: this skill is fully autonomous, so a wrong
+  not-landed reading cancels and abandons work that actually landed.
+- **No verdict** (containment rc=128) — re-derive per the ladder. Do not stamp, and do not read
+  it as either outcome.
+
+Where the ladder finds no honest commit, write **nothing at all** rather than substituting a
+convenient sha: `kind='found_on_main'` requires both a `commit` and a `note`, and declining to
+stamp is an available option on every failing arm.
 
 ## Merge-stage completion mode (block_class == 'merge_verify_red')
 
 Some proposals originate from a **post-merge-verify block**, not an ordinary
 agent-block: the task's solution already passed its own verify **and**
-review, but landing on `main` jammed (e.g. a rebase conflict, or an
-import/type/lint break introduced by whatever landed on `main` after this
-branch was verified). Recognize this mode from
+review, but landing on `main` jammed (the only kind this mode completes is
+an import/type/lint break introduced by whatever landed on `main` after this
+branch was verified; a rebase conflict is never completed here). Recognize this mode from
 `latest['block_class'] == 'merge_verify_red'` (present on the same
 `dry_run_proposals[-1]` entry precondition 1 already reads).
 
@@ -267,9 +677,10 @@ unchanged — there is nothing extra for you to check.
 
 Two refinements to the Procedure for this mode specifically:
 
-- **Step 3 (apply the fix — scoped)** is, in practice, either a **rebase/
-  conflict resolution** confined to files already in the task's own diff,
-  or an **import/type/lint repair** against the new `main` tip. If the fix
+- **Step 3 (apply the fix — scoped)** is, in this mode, an
+  **import/type/lint repair** against the new `main` tip only. A conflict
+  at step 4 aborts in this mode exactly as in every other: this mode never
+  resolves conflicts. If the fix
   demands anything beyond that (a logic change, a genuinely new and
   unrelated test failure, a cross-module edit), the investigator's
   labelling guidance (`skills/unblock-auto/SKILL.md`) says that should
@@ -296,19 +707,33 @@ on any doubt applies identically to this mode — nothing here loosens that.
 ## Aborting
 
 On any ABORT:
-- **Cancel any live durable-intent entry.** If the ABORT occurs AFTER a successful
-  `merge_request` submission (i.e., a `request_id` was returned — which excludes the
-  `already_merged` fast-path, which returns no `request_id`), call
-  `mcp__escalation__merge_cancel(request_id)` FIRST, before anything else. This prevents
-  an orphaned durable-intent entry (PRD D2 — submitted merges now outlive the MCP call and
-  session) from accumulating. `merge_cancel` never raises and is a safe no-op if the entry
-  already finalized (it returns `cancelled: false` with the terminal state). A coalesced or
-  `attached` `request_id` may resolve to `state: "unknown"` — treat the cancel as best-effort.
-- **Do NOT change the task status** beyond the `blocked` park that `release_workflow` already applied
-  (that is the safe, sweep-immune state — leave it there).
+- **Cancel a live durable-intent entry only on the arms listed here.** This is the one list of
+  `merge_cancel` call sites in this skill: an arm not listed never calls it. After a successful
+  `merge_request` submission (a `request_id` was returned — which excludes the `already_merged`
+  fast-path), call `mcp__escalation__merge_cancel(request_id)` FIRST, before anything else, on:
+  - an entry still `queued` at step 8's polling deadline;
+  - step 9's `conflict` | `blocked` | `abandoned` | `error` | `unknown_branch` arm;
+  - step 9's epistemic-state arm, on the answers its catch-all routes to `merge_cancel` (not
+    `landing_unattributable`, which takes [this skill's dispositions](#ladder-dispositions));
+  - the ladder's genuine not-landed outcome ([this skill's dispositions](#ladder-dispositions)).
+
+  Every other ABORT leaves the entry alone. No hand-off is an ABORT at all: not step 8's
+  hand-off of a picked-up entry or a wait-state answer, not step 9's hand-off of an unresolved
+  successor, and not step 9's hand-off of a re-poll still live or waiting. Where the call is made, it prevents an orphaned durable-intent entry (PRD D2 —
+  submitted merges now outlive the MCP call and session) from accumulating. `merge_cancel` never
+  raises and is a safe no-op if the entry already finalized (it returns `cancelled: false` with
+  the terminal state). A coalesced or `attached` `request_id` may answer an epistemic state (typically
+  `no_record`) — treat the cancel as best-effort.
+- **Do NOT change the task status.** `release_workflow` parks an `in-progress` task to `blocked`
+  (including when there was no active slot at all) — that is the safe, sweep-immune state, so
+  leave it there. If it returned `parked: null` the task was not at `in-progress`: leave it
+  wherever it is rather than forcing it to `blocked`.
 - **Leave the escalation `pending`.** Do not resolve or dismiss it — the human will handle it on
   return, exactly as the normal `task_failure`/`review_issues` path does.
 - Leave the worktree intact (do not remove it) so the human can inspect your partial work.
+  That includes any `<git-common-dir>/rerere-specimens/MERGE_RR.<worktree>-*` file the rebase-recovery preflight left behind: it is
+  preserved evidence of what the worktree was carrying when it wedged, and the human inspecting
+  your partial work is the reader it was preserved for. Do not tidy it away.
 - Return a structured result so the watcher can log it to the digest.
 
 ## Return value (your final message IS the data)
@@ -317,10 +742,12 @@ Return ONLY this JSON object (no prose):
 
 ```json
 {
-  "outcome": "merged" | "aborted",
+  "outcome": "merged" | "aborted" | "handed_off",
   "task_id": "<id>",
   "escalation_id": "<id>",
-  "reason": "<merged: what changed + merge sha | aborted: which precondition/step failed and why>",
+  "request_id": "<merge request id when this run submitted or resumed one (on step 9's re-poll hand-off, the re-poll's when it has one), else null — always set for handed_off>",
+  "superseded_by": "<latest successor id (mr-* or coalesce-*) when handed_off from step 9's superseded arm, else null>",
+  "reason": "<merged: what changed + merge sha | aborted: which precondition/step failed and why | handed_off: the merge state (with its `reason` when epistemic) at the polling deadline or on step 9's re-poll, or the unresolved successor and the ladder's last verdict>",
   "commit": "<merge sha if merged, else null>"
 }
 ```
@@ -343,11 +770,9 @@ Return ONLY this JSON object (no prose):
 - **Rolling-24h merge cap enforced by `b3_gate charge`** (step 7, immediately before `merge_request`):
   a refused charge (`charged: false`) → ABORT. All aborts before this step cost no slot.
 - Merge ONLY through `merge_request` with explicit `wait_secs=100`; completion is awaited ONLY via
-  `merge_status` polling (15 s→60 s backoff using `eta_seconds`); never a direct `git merge`;
-  never `--no-verify`.
-- **Cancel on abort:** any ABORT after a successful submission (a `request_id` was returned) MUST
-  call `merge_cancel(request_id)` first — so no durable-intent entry outlives the aborted run.
-  Skip only when `already_merged` (no `request_id` exists). The call is a safe no-op on terminal
-  entries.
-- One attempt. No retry loops. ABORT on the first sign of doubt.
+  `merge_status` polling (15 s→60 s backoff using `eta_seconds`; resume mode: 60 s→300 s); never
+  a direct `git merge`; never `--no-verify`.
+- **`merge_cancel` only on the arms "Aborting" lists** — that section is the single list.
+- One attempt. No retry loops. ABORT on the first sign of doubt. Resume mode is not a retry: it
+  never resubmits or re-charges.
 - After `set_task_status`, restore metadata via `update_task(append=true)`.

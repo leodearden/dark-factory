@@ -16,6 +16,86 @@
       "severity": "suggestion",
       "description": "`_make_status_setting_steward` resolves pending L0 escalations without asserting any exist (unlike `_make_resolving_steward`, which asserts `pending`). If the queue has no pending L0 for the task, the loop silently no-ops and the steward still sets `final_status`, potentially masking a setup regression where the escalation path was never exercised.",
       "mutation_type": "test_gap"
+    },
+    {
+      "id": "mined_1195_pool_01",
+      "location": "orchestrator/tests/test_workflow_e2e.py:3967",
+      "category": "misleading_comment",
+      "severity": "suggestion",
+      "description": "The rewritten 'Static Protocol conformance checks' header comment gives a false rationale: it says the block stays at the bottom of the file so the FakeScheduler import is resolved before pyright evaluates the checks, then concedes top placement would still work; pyright does not depend on statement order for module-level imports. It also contains reviewer-directed prose ('avoids unnecessary diff noise') and describes a block that actually sits ~1,100 lines further down (if TYPE_CHECKING at line 5091).",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "mined_1195_pool_02",
+      "location": "orchestrator/tests/_workflow_helpers.py:25",
+      "category": "invariant_far_from_definition",
+      "severity": "suggestion",
+      "description": "After FakeScheduler moved to _workflow_helpers.py, its static conformance check `_fake_scheduler_conforms: _SchedulerLike = FakeScheduler()` remains in test_workflow_e2e.py's TYPE_CHECKING block, so the shared helper module gives no sign that the fake is contract-checked against _SchedulerLike.",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "mined_1195_pool_03",
+      "location": "orchestrator/tests/test_workflow_helpers.py:17",
+      "category": "low_value_tests",
+      "severity": "suggestion",
+      "description": "The new, unrequested test_workflow_helpers.py adds tests of little value: test_imports_resolve duplicates what module-level imports in the two consumer test files already enforce at collection, and the FakeMcp/FakeBriefing smoke tests echo the fakes' canned literals. Its docstring says the 5 helpers 'behave as expected', yet the only helpers with logic, _make_resolving_steward and _make_status_setting_steward, have no tests.",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "mined_1195_pool_04",
+      "location": "orchestrator/tests/test_workflow_helpers.py:19",
+      "category": "unneeded_suppressions",
+      "severity": "suggestion",
+      "description": "Every test in test_workflow_helpers.py imports _workflow_helpers inside the function with `# noqa: PLC0415`. There is no cycle or ordering reason for a function-local import, and PLC is not in orchestrator's ruff select list, so the suppressions are inert noise.",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "mined_1195_pool_05",
+      "location": "orchestrator/tests/test_workflow_helpers.py:34",
+      "category": "duplicated_tests",
+      "severity": "suggestion",
+      "description": "FakeScheduler moved to _workflow_helpers.py, but its existing tests (TestFakeSchedulerGetStatus) stayed in test_workflow_e2e.py while the new test_fake_scheduler_smoke repeats the same get_status-after-two-sets behaviour, so the fake's tests now have two homes.",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "mined_1195_pool_06",
+      "location": "orchestrator/tests/_workflow_helpers.py:123",
+      "category": "misleading_private_names",
+      "severity": "suggestion",
+      "description": "_make_resolving_steward and _make_status_setting_steward keep a module-private leading underscore although they are now the exported API of a shared helper module imported by test_workflow_e2e.py, test_workflow_status_on_resume.py and test_workflow_helpers.py.",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "mined_1195_pool_07",
+      "location": "orchestrator/tests/_workflow_helpers.py:126",
+      "category": "context_dependent_docstring",
+      "severity": "suggestion",
+      "description": "The moved _make_resolving_steward docstring says it is 'Used by TestMarkBlockedFalseDoneGuard tests' and refers to _mark_blocked's `if not remaining:` branch, which is consumer-specific context from test_workflow_e2e.py that no longer reads correctly in a shared helper module.",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "mined_1195_pool_08",
+      "location": "orchestrator/tests/_workflow_helpers.py:5",
+      "category": "history_in_docstring",
+      "severity": "suggestion",
+      "description": "The new module docstrings cite task history instead of tracked sources: _workflow_helpers.py says 'See task 977 for convention rationale' (the convention is documented in tests/scripts/test_pytest_workspace_collection.py) and test_workflow_helpers.py says it verifies behaviour 'after extraction from test_workflow_e2e.py (task 1195)'.",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "mined_1195_pool_09",
+      "location": "orchestrator/tests/test_workflow_e2e.py:1572",
+      "category": "split_helper_family",
+      "severity": "suggestion",
+      "description": "Only the two cross-imported steward factories moved to _workflow_helpers.py; the sibling fake-steward factories (_make_dismissing_steward, _make_l1_escalating_steward, _make_done_setting_steward) remain in the 5,096-line test_workflow_e2e.py, so the factory family now lives in two files with no stated partition rule.",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "mined_1195_pool_10",
+      "location": "orchestrator/tests/_workflow_helpers.py:11",
+      "category": "annotation_only_import",
+      "severity": "suggestion",
+      "description": "_workflow_helpers.py imports EscalationQueue at runtime although, under `from __future__ import annotations`, it is used only in annotations; it could sit under TYPE_CHECKING. The cost is negligible because every consumer already imports escalation.queue.",
+      "mutation_type": "pooled_2026_10_22"
     }
   ],
   "provenance": {
@@ -32,5 +112,43 @@
     "runs_db_path": "/home/leo/src/dark-factory/data/orchestrator/runs.db",
     "runs_db_query": "SELECT task_id, project_id, outcome, review_cycles, verify_attempts FROM task_results WHERE review_cycles >= 1, cross-referenced with events (escalation_created, merge_finalized) -- see mining.mine_fn_candidates.",
     "escalation_refs": []
+  },
+  "context": {
+    "task": {
+      "title": "Extract shared test fixtures from test_workflow_e2e.py to a helpers module",
+      "description": "orchestrator/tests/test_workflow_status_on_resume.py imports `FakeBriefing`, `FakeMcp`, `FakeScheduler`, `_make_resolving_steward`, and `_make_status_setting_steward` directly from the sibling test module `test_workflow_e2e`. Cross-test imports create fragile coupling \u2014 if `test_workflow_e2e` collection fails or its helpers move, `test_workflow_status_on_resume` silently breaks. The reorder in task 1191 also moved this import ahead of first-party orchestrator imports, against convention.\n\nExtract these helpers into a shared module \u2014 either `orchestrator/tests/conftest.py` (for fixture-style helpers) or a `orchestrator/tests/_helpers.py` / `orchestrator/tests/_workflow_helpers.py` module \u2014 and import from there in both files. Note convention from task 977: prefer extracting to uniquely-named sibling modules over conftest when the helpers don't fit the fixture model. Restore correct first-party-last import grouping in test_workflow_status_on_resume.py after extraction.",
+      "test_strategy": "",
+      "details": "",
+      "authored": false,
+      "id": "1195",
+      "record_source": {
+        "path": ".taskmaster/tasks/tasks.db",
+        "tag": "master",
+        "read_at": "2026-09-11",
+        "updated_at": "2026-05-10T03:59:53.589Z",
+        "updated_after_merge": false,
+        "run_time_title_matches": true
+      }
+    },
+    "changed_files": [
+      "orchestrator/tests/_workflow_helpers.py",
+      "orchestrator/tests/test_workflow_e2e.py",
+      "orchestrator/tests/test_workflow_helpers.py",
+      "orchestrator/tests/test_workflow_status_on_resume.py"
+    ],
+    "base_sha": "1e9b81d8cd0e448935e4cbff470eb61615991c6c",
+    "branch_sha": "4037fe73739e036d0db1ac93955ab9f6cdb4ad35",
+    "base_sha_reason": null,
+    "plan": null,
+    "plan_reason": "no plan.json survives for this task. Absent: .worktrees/.task-meta/<id>/plan.json; data/orchestrator/agent-transcripts/<id>/; ~/.claude/projects/-home-leo-src-dark-factory--worktrees-<id>/; runs.db events with a plan payload (design_decisions/steps); runs.db plan-phase events (other than invocation/routing/phase bookkeeping) with a payload; data/orchestrator/landed_outbox.json entry. Wider hunt (escalations archive, fleet sessions, branch commit messages, branch tree, fused-memory) found nothing for this task",
+    "verification": {
+      "merge_sha": "754c0e32be21f8314948f8d9f9924e70e612ca6a",
+      "merge_base_sha": "1e9b81d8cd0e448935e4cbff470eb61615991c6c",
+      "diff_reproduces_from": "git diff 1e9b81d8cd 754c0e32be",
+      "diff_reproduces": true,
+      "merge_tree_equals_merge_commit_tree": true,
+      "changed_files_match_diff_headers": true,
+      "verified_at": "2026-09-11"
+    }
   }
 }

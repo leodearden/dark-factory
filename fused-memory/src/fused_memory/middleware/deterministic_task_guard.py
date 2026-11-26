@@ -7,8 +7,9 @@ diagnostic before any persistence happens.
 ## Contract (PRD §4 decisions 1-3, §11.1; §5 decisions 1,7,8; boundary
 scenarios B10, B11)
 
-A ``submit_task`` call is rejected (returns a structured ``ValidationError``
-dict) when any of these invariants is violated:
+A ``submit_task`` call is rejected (returns a structured error dict, whose
+``error_type`` is ``'ValidationError'`` except for invariant 4b) when any of
+these invariants is violated:
 
 1. ``task_kind`` not in ``{'normal', 'deterministic'}`` — enum reject.
 2. ``task_kind='deterministic'`` ∧ ``before_done is None`` ∧ ``not
@@ -17,9 +18,20 @@ dict) when any of these invariants is violated:
 3. ``task_kind='normal'`` ∧ ``before_done is not None`` — before_done is only
    valid on deterministic tasks.
 4. When ``before_done`` is present on a deterministic task: must be a dict;
-   ``script`` required string that resolves UNDER ``project_root``, exists,
-   and is executable (``os.access X_OK``); ``timeout_secs`` required positive
-   int; ``kind`` (when present) must be one of ``{'deploy', 'predicate'}``.
+   ``script`` required string that resolves UNDER ``project_root`` — or, when
+   ``script_root='factory'``, under the dark-factory root
+   (``shared.repo_paths.resolve_dark_factory_root``) — exists, and is
+   executable (``os.access X_OK``); ``cwd`` (when present) must be a string;
+   ``timeout_secs`` required positive int; ``kind`` (when present) must be
+   one of ``{'deploy', 'predicate'}``; ``script_root`` (when present) must
+   be one of ``{'project', 'factory'}``, and ``'factory'`` requires
+   ``kind='predicate'``. An unresolvable dark-factory root is a rejection.
+4b. ``before_done``'s key set is closed to ``BeforeDone``'s declared fields.
+   An unknown key is refused with ``error_type='UnsupportedTaskMetadata'``,
+   naming the running capabilities, so a client meeting an older server
+   learns of the skew (PRD ``plans/completion-driven-triggers-prd.md`` C2).
+   Submit-time only (task 3093): ``BeforeDone`` is ``extra='allow'``, so
+   ``update_task`` can still add an unknown key.
 5. ``metadata.milestone``, when present, must match the shared ``Milestone``
    model (``mode='dated'`` with a parseable ``at``, or ``mode='delayed'``
    with a positive int ``after_secs``). Checked by presence alone — this
@@ -30,6 +42,30 @@ dict) when any of these invariants is violated:
    ``always_escalates=True`` is forbidden (predicate escalation is
    conditional on the script's exit code, not unconditional).
    ``kind='deploy'`` (the default) behaviour is unaffected by this rule.
+7. ``metadata.recurrence``, when present, must be a well-formed chain link on
+   a well-formed CARRIER (task 4676; PRD
+   ``docs/prds/recurring-deterministic-tasks.md`` contract C-1, decision
+   R-D4). Two halves: the SHAPE is delegated to the shared ``Recurrence``
+   model (kebab-case ``key``, ``interval_secs > 0``, optional ``minted_from``
+   task id), and the CARRIER must be ``task_kind='deterministic'`` ∧
+   ``before_done.kind == 'predicate'`` ∧ ``metadata.milestone`` with
+   ``mode='dated'``. Recurrence on a deploy-kind deterministic task is
+   rejected as deliberately UNRULED, not merely unimplemented (PRD "Out of
+   scope"): a recurring chain of act-then-done deploys has no agreed
+   semantics for what re-running the action means.
+8. ``before_done.recheck_secs``, when present, declares that the predicate may
+   answer "not yet" (exit 75) and re-arm (PRD
+   ``plans/completion-driven-triggers-prd.md`` C1). Both halves are delegated:
+   the shape (a strict int >= ``RECHECK_SECS_MIN``) and the kind half
+   (``kind='predicate'``) to the shared ``BeforeDone`` model, and the
+   milestone half (a ``mode='dated'`` milestone, whose ``at`` the re-arm
+   advances) to ``recheck_secs_milestone_conflict``. Unlike recurrence's
+   carrier clauses, the milestone half also holds at ``update_task``, because
+   ``TaskMetadata`` applies the same rule at the write boundary.
+9. ``metadata.trigger_chain``, when present, must match the shared
+   ``TriggerChain`` model on a carrier its role allows (PRD
+   ``plans/completion-driven-triggers-prd.md`` C2). Like recurrence's, the
+   carrier rules apply at submit only (task 3093; see ``_validate_recurrence``).
 
 ``inject_task_kind`` normalises the metadata dict and sets
 ``metadata.task_kind`` so it is persisted alongside ``before_done`` /
@@ -38,21 +74,50 @@ dict) when any of these invariants is violated:
 
 from __future__ import annotations
 
-import json
-import logging
-import os
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any
+from typing import Any, assert_never, get_args
 
 from pydantic import ValidationError
-from shared.task_metadata import Milestone, parse_metadata
+from shared.before_done_paths import (
+    CwdRefused,
+    FactoryRootUnresolved,
+    ScriptMissing,
+    ScriptNotExecutable,
+    ScriptRefused,
+    ScriptRootRefused,
+    require_runnable_script,
+    resolve_before_done_paths,
+)
+from shared.repo_paths import DARK_FACTORY_ROOT_ENV, resolve_dark_factory_root
+from shared.task_metadata import (
+    RECHECK_SECS_MIN,
+    TASK_METADATA_CAPABILITIES,
+    TRIGGER_CHAIN_KEY,
+    BeforeDone,
+    Milestone,
+    Recurrence,
+    TriggerChain,
+    TriggerChainRole,
+    TriggerChainSkill,
+    recheck_secs_milestone_conflict,
+)
+
+from fused_memory.middleware.metadata_dict import raw_metadata_dict
 
 __all__ = [
+    'DETERMINISTIC_ROUTING_HINT',
     'deterministic_task_error',
     'inject_task_kind',
 ]
 
-logger = logging.getLogger(__name__)
+DETERMINISTIC_ROUTING_HINT = (
+    "This is likely task_kind='deterministic' work, which has no commit "
+    'requirement: point metadata.before_done at a committed script for a '
+    'scripted action, or set metadata.always_escalates=True for a human gate. '
+    'If a code deliverable really is intended, declare at least one '
+    'committable path in metadata.files.'
+)
 
 _VALID_KINDS: frozenset[str] = frozenset({'normal', 'deterministic'})
 
@@ -64,56 +129,10 @@ _VALID_KINDS: frozenset[str] = frozenset({'normal', 'deterministic'})
 # boundary.
 _VALID_BEFORE_DONE_KINDS: frozenset[str] = frozenset({'deploy', 'predicate'})
 
-# SchemaWarning codes (shared.task_metadata) that mean the WHOLE metadata
-# value was discarded — parse_metadata could not produce any dict at all.
-# Only these are loud here; 'unknown_key'/'invalid_field'/'invalid_submodel'
-# etc. are expected on legitimate curator-internal metadata (before_done,
-# always_escalates) and belong to the write boundary (W3-β), not here.
-_DISCARD_CODES = frozenset({'unparseable_json', 'not_an_object'})
-
 
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
-
-
-def _parse_metadata_with_discard(metadata: Any) -> tuple[dict, bool]:
-    """Parse *metadata* to a raw dict, delegating malformed-input policy to
-    :func:`shared.task_metadata.parse_metadata`.
-
-    Returns ``(parsed, discarded)``: ``discarded`` is True when *metadata* is
-    non-None but could not be treated as a JSON object at all (parse_metadata's
-    ``unparseable_json`` / ``not_an_object`` SchemaWarning codes) — the same
-    "whole metadata replaced by a fresh dict" event
-    ``TaskInterceptor._inject_routing_override`` already warns on.
-
-    ``parsed`` is always the RAW dict — never ``parse_metadata(...).model_dump()``
-    — so unknown keys (e.g. curator-internal ``spawned_from``) round-trip
-    byte-for-value (I1) instead of gaining ``TaskMetadata``'s typed-field
-    defaults. Only the parse/validate *policy* (what counts as malformed) is
-    delegated to shared; the returned value is independently re-derived from
-    the input so its shape is untouched.
-    """
-    if metadata is None:
-        return {}, False
-    if isinstance(metadata, dict):
-        return metadata, False
-    if isinstance(metadata, str) and not metadata:
-        # Empty string is benign-absent, not a discard — mirrors the
-        # pre-collapse `isinstance(raw, str) and raw` guard.
-        return {}, False
-    _, warnings = parse_metadata(metadata, direction='read')
-    if any(w.code in _DISCARD_CODES for w in warnings):
-        return {}, True
-    # metadata is a JSON string parse_metadata accepted as an object — reparse
-    # independently for the raw dict (see docstring: never model_dump()).
-    return json.loads(metadata), False
-
-
-def _parse_metadata(metadata: Any) -> dict:
-    """Return *metadata* as a dict (best-effort; unknown shapes → empty dict)."""
-    parsed, _ = _parse_metadata_with_discard(metadata)
-    return parsed
 
 
 def _validation_error(message: str, *, hint: str | None = None) -> dict[str, Any]:
@@ -125,6 +144,28 @@ def _validation_error(message: str, *, hint: str | None = None) -> dict[str, Any
     if hint is not None:
         err['hint'] = hint
     return err
+
+
+def _unsupported_before_done_keys_error(before_done: dict[str, Any]) -> dict[str, Any] | None:
+    """Refuse a before_done key this server's ``BeforeDone`` does not declare."""
+    unknown = sorted(set(before_done) - set(BeforeDone.model_fields))
+    if not unknown:
+        return None
+    capabilities = sorted(TASK_METADATA_CAPABILITIES)
+    return {
+        'error': (
+            f'before_done carries keys this server does not support: {unknown}. '
+            f'Supported before_done keys: {sorted(BeforeDone.model_fields)}. '
+            f'Running task-metadata capabilities: {capabilities}.'
+        ),
+        'error_type': 'UnsupportedTaskMetadata',
+        'unsupported_keys': unknown,
+        'task_metadata_capabilities': capabilities,
+        'hint': (
+            'Drop the key, or use the form your recipe names for a server without it '
+            '(skills/_shared/filing-the-trigger-chain.md §2 falls back to the interim form).'
+        ),
+    }
 
 
 def _validate_milestone(milestone: Any) -> dict[str, Any] | None:
@@ -151,6 +192,261 @@ def _validate_milestone(milestone: Any) -> dict[str, Any] | None:
     return None
 
 
+def _validate_recheck_secs(before_done: dict[str, Any], milestone: Any) -> dict[str, Any] | None:
+    """Validate a declared before_done.recheck_secs by delegating to its shared homes.
+
+    Returns a ValidationError dict on failure, or None when valid or absent.
+    ``BeforeDone`` is consulted only when ``recheck_secs`` is present, so a
+    recheck-free submission is judged exactly as before.
+    """
+    if before_done.get('recheck_secs') is None:
+        return None
+    try:
+        BeforeDone(**before_done)
+    except (ValidationError, TypeError) as exc:
+        return _validation_error(
+            f'metadata.before_done is invalid: {exc}',
+            hint=(
+                f'recheck_secs must be an int >= {RECHECK_SECS_MIN} on a '
+                "kind='predicate' action; drop it if the predicate never answers 'not yet'."
+            ),
+        )
+    conflict = recheck_secs_milestone_conflict(milestone)
+    if conflict is not None:
+        return _validation_error(
+            conflict,
+            hint=(
+                "Add 'milestone': {'mode': 'dated', 'at': '<ISO-8601 first check>'}, "
+                'or drop recheck_secs.'
+            ),
+        )
+    return None
+
+
+def _validate_recurrence(
+    recurrence: Any,
+    *,
+    task_kind: str,
+    before_done: Any,
+    milestone: Any,
+) -> dict[str, Any] | None:
+    """Validate metadata.recurrence — shape + carrier contract (task 4676).
+
+    Contract C-1 of PRD ``docs/prds/recurring-deterministic-tasks.md``.
+    Submit-time only: the sole caller is :func:`deterministic_task_error`,
+    reached from ``submit_task`` (``tools.py::submit_task``), and nothing here
+    persists anything — a violation returns a structured error and the
+    submission never lands.
+
+    Returns a ValidationError dict on failure, or None when valid.
+
+    Responsibility is split with the shared model. The SHAPE lives in
+    :class:`shared.task_metadata.Recurrence` — delegated to here rather than
+    re-implemented, exactly as milestone delegates to ``Milestone``, so guard
+    and persistence-layer semantics can never drift; that registration also
+    enforces the shape at the ``update_task``/write boundary under
+    ``enforce=True``, which this guard never sees. The cross-field CARRIER
+    clauses are guard-only, because they read ``task_kind``, ``before_done``
+    and ``milestone`` TOGETHER — a relation ``Recurrence`` alone cannot see.
+
+    RESIDUAL GAP, named rather than left implicit: the CARRIER contract is
+    submit-time ONLY. Registration buys the shape at the write boundary
+    (``backends.sqlite_task_backend::SqliteTaskBackend._validate_metadata_on_write``,
+    and only while ``_task_metadata_enforce`` is on), but nothing re-checks
+    the cross-field relation there — and ``update_task`` never runs this
+    guard at all. So an update that flips ``before_done.kind`` to
+    ``'deploy'``, deletes ``metadata.milestone``, or attaches ``recurrence``
+    to an existing normal task lands exactly the state C-1 forbids, and no
+    error is raised. This is a THIRD symptom of the root cause task **3093**
+    already tracks ("update_task never runs deterministic_task_error"),
+    whose two recorded symptoms are the milestone spec and a task_kind
+    change — so closing it belongs there, as one hoist of these clauses into
+    a helper both boundaries call, not as a recurrence-shaped patch here.
+    Task 4676 rules the submit boundary only. Until 3093 lands, r2's mint
+    MUST re-verify
+    the carrier of the link it is about to renew instead of trusting that
+    submit-time validation still holds — ``docs/task-authoring.md`` §6.1
+    carries the same warning for authors.
+
+    ``TypeError`` is caught alongside ``ValidationError`` for the same reason
+    as milestone's: a bare string or list value cannot be splatted into the
+    model's keyword arguments.
+    """
+    try:
+        Recurrence(**recurrence)
+    except (ValidationError, TypeError) as exc:
+        return _validation_error(
+            f'metadata.recurrence is invalid: {exc}',
+            hint=(
+                "A recurrence must be {'key': '<kebab-case chain id>', "
+                "'interval_secs': <positive int>} (plus an optional "
+                "'minted_from' task id, absent on the seed link)."
+            ),
+        )
+
+    # Carrier clause 1: task_kind.
+    if task_kind != 'deterministic':
+        return _validation_error(
+            f"metadata.recurrence requires task_kind='deterministic' "
+            f'(got task_kind={task_kind!r}).',
+            hint=(
+                "A recurring job is a chain of deterministic PREDICATE tasks. "
+                "Either set task_kind='deterministic' with a "
+                "'before_done': {'kind': 'predicate', ...}, or remove "
+                "'recurrence' from metadata."
+            ),
+        )
+
+    # Carrier clause 2: before_done must be a PREDICATE action. The isinstance
+    # half is defence-in-depth (invariant 4 already guarantees a dict when
+    # before_done is not None) and simultaneously covers the pure-gate case
+    # where before_done is None.
+    if not isinstance(before_done, dict):
+        return _validation_error(
+            'metadata.recurrence requires a before_done action with '
+            "kind='predicate', but this task has no before_done (a pure "
+            'escalation gate is not a chain link — there is nothing to '
+            're-run on the next tick).',
+            hint=(
+                "Add 'before_done': {'kind': 'predicate', 'script': '<path>', "
+                "'timeout_secs': <n>}, or remove 'recurrence' from metadata."
+            ),
+        )
+    # The shared BeforeDone.kind default is 'deploy', so an OMITTED kind must
+    # be reported (and rejected) as the deploy it actually is — not slip
+    # through because the key is merely absent.
+    effective_kind = before_done.get('kind') or 'deploy'
+    if effective_kind != 'predicate':
+        return _validation_error(
+            f"metadata.recurrence requires before_done.kind='predicate' "
+            f'(got {effective_kind!r}).',
+            hint=(
+                'Recurrence on a deploy-kind deterministic task is not merely '
+                'unimplemented — it is deliberately UNRULED, and therefore '
+                'forbidden UNTIL it is separately ruled on (PRD '
+                'docs/prds/recurring-deterministic-tasks.md, "Out of scope"): '
+                'a recurring chain of act-then-done deploys has no agreed '
+                'semantics for what re-running the action means. Use '
+                "kind='predicate', or remove 'recurrence' from metadata."
+            ),
+        )
+
+    # Carrier clause 3: a DATED milestone. Milestone's own shape is already
+    # validated by deterministic_task_error before this runs, so this clause
+    # only has to discriminate the mode.
+    if not isinstance(milestone, dict) or milestone.get('mode') != 'dated':
+        return _validation_error(
+            "metadata.recurrence requires a metadata.milestone with "
+            "mode='dated' (the chain link's fire time).",
+            hint=(
+                'A chain link is withheld until its fire time by the existing '
+                'milestone scheduler gate, and only a dated milestone carries '
+                "the 'at' the mint advances by interval_secs — a delayed "
+                'anchor has no fire time to advance from. Add '
+                "'milestone': {'mode': 'dated', 'at': '<ISO-8601 datetime>'}, "
+                "or remove 'recurrence' from metadata."
+            ),
+        )
+
+    return None
+
+
+def _alternatives(vocabulary: Any) -> str:
+    return '|'.join(repr(value) for value in get_args(vocabulary))
+
+
+_TRIGGER_CHAIN_SHAPE_HINT = (
+    f"A trigger_chain must be {{'role': {_alternatives(TriggerChainRole)}, "
+    f"'skill': {_alternatives(TriggerChainSkill)} (the bare skill name, no leading "
+    "slash), 'run_id': '<skill>-…', 'superseded_by': <run_id>|None}."
+)
+
+
+def _validate_trigger_chain(
+    trigger_chain: Any,
+    *,
+    task_kind: str,
+    before_done: Any,
+    always_escalates: Any,
+    carries_finding_run: bool,
+) -> dict[str, Any] | None:
+    """Validate metadata.trigger_chain — shape + carrier rules (PRD C2).
+
+    The shape is delegated to :class:`shared.task_metadata.TriggerChain`; the
+    carrier clauses read the rest of the metadata, as
+    :func:`_validate_recurrence`'s do, and share its submit-time-only residual.
+    """
+    try:
+        chain = TriggerChain(**trigger_chain)
+    except (ValidationError, TypeError) as exc:
+        return _validation_error(
+            f'metadata.trigger_chain is invalid: {exc}', hint=_TRIGGER_CHAIN_SHAPE_HINT
+        )
+    role = chain.role
+    if task_kind != 'deterministic':
+        return _validation_error(
+            f"metadata.trigger_chain role {role!r} requires task_kind='deterministic' "
+            f'(got task_kind={task_kind!r}).',
+            hint="Set task_kind='deterministic', or remove 'trigger_chain' from metadata.",
+        )
+    if carries_finding_run:
+        return _validation_error(
+            f'metadata.trigger_chain role {role!r} must not carry x_finding_run: a '
+            "chain task must never count toward its own run's measure.",
+            hint="Remove 'x_finding_run' from the chain task's metadata.",
+        )
+    match role:
+        case 'completion_gate':
+            return _completion_gate_carrier_error(before_done)
+        case 'human_gate':
+            return _human_gate_carrier_error(before_done, always_escalates)
+        case _:
+            assert_never(role)
+
+
+def _completion_gate_carrier_error(before_done: Any) -> dict[str, Any] | None:
+    # The dated-milestone clause is invariant 8's, through recheck_secs_milestone_conflict.
+    if not isinstance(before_done, dict):
+        return _validation_error(
+            "metadata.trigger_chain role 'completion_gate' requires a before_done "
+            "predicate, but this task has no before_done.",
+            hint=(
+                "Add 'before_done': {'kind': 'predicate', 'script': '<path>', "
+                "'timeout_secs': <n>, 'recheck_secs': <n>} on a dated milestone."
+            ),
+        )
+    effective_kind = before_done.get('kind') or 'deploy'
+    if effective_kind != 'predicate':
+        return _validation_error(
+            "metadata.trigger_chain role 'completion_gate' requires "
+            f"before_done.kind='predicate' (got {effective_kind!r}).",
+            hint="A completion gate checks the run's measure: set kind='predicate'.",
+        )
+    if before_done.get('recheck_secs') is None:
+        return _validation_error(
+            "metadata.trigger_chain role 'completion_gate' requires before_done.recheck_secs.",
+            hint=(
+                'A completion gate answers "not yet" until the run completes: declare '
+                "'recheck_secs' (e.g. 86400) on its predicate."
+            ),
+        )
+    return None
+
+
+def _human_gate_carrier_error(before_done: Any, always_escalates: Any) -> dict[str, Any] | None:
+    if always_escalates is True and before_done is None:
+        return None
+    return _validation_error(
+        "metadata.trigger_chain role 'human_gate' requires always_escalates=True and no "
+        f'before_done (got always_escalates={always_escalates!r}, before_done '
+        f'{"absent" if before_done is None else "present"}).',
+        hint=(
+            "A human gate is a pure escalation gate: set 'always_escalates': True and "
+            "remove 'before_done'. Its milestone is optional."
+        ),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Public guard functions
 # ---------------------------------------------------------------------------
@@ -160,18 +456,23 @@ def deterministic_task_error(
     task_kind: str,
     metadata: str | dict[str, Any] | None,
     project_root: str,
+    *,
+    factory_root_resolver: Callable[[], Path | None] = resolve_dark_factory_root,
 ) -> dict[str, Any] | None:
     """Validate the deterministic-task-kind invariants.
 
     Returns a structured error dict (``{'error': ..., 'error_type':
-    'ValidationError', ...}``) when any invariant is violated, or ``None``
-    when the submission is valid.
+    'ValidationError', ...}``, or ``'UnsupportedTaskMetadata'`` for invariant
+    4b) when any invariant is violated, or ``None`` when the submission is
+    valid.
 
     Args:
         task_kind: The caller-supplied kind string ('normal' or 'deterministic').
         metadata: Task metadata (dict, JSON string, or None).
         project_root: Absolute path to the project root (already normalised by
             the tools.py wrapper before this function is called).
+        factory_root_resolver: Locates the dark-factory root for a
+            ``script_root='factory'`` script; consulted only for those.
     """
     # Invariant 1: enum
     if task_kind not in _VALID_KINDS:
@@ -185,7 +486,7 @@ def deterministic_task_error(
             ),
         )
 
-    meta = _parse_metadata(metadata)
+    meta = raw_metadata_dict(metadata, source='deterministic_task_guard')
     before_done = meta.get('before_done')
     # Use identity check (is True) rather than bool() so that non-bool truthy values
     # (e.g. always_escalates='false', always_escalates=1) do NOT satisfy the gate.
@@ -236,7 +537,48 @@ def deterministic_task_error(
 
     # Invariant 4: before_done structural + filesystem checks (only when present)
     if before_done is not None:
-        err = _validate_before_done(before_done, project_root, always_escalates=always_escalates)
+        err = _validate_before_done(
+            before_done,
+            project_root,
+            always_escalates=always_escalates,
+            factory_root_resolver=factory_root_resolver,
+        )
+        if err is not None:
+            return err
+        err = _validate_recheck_secs(before_done, milestone)
+        if err is not None:
+            return err
+
+    # Invariant 5 (PRD recurring-deterministic-tasks C-1, task 4676):
+    # metadata.recurrence carrier contract. Deliberately LAST — the carrier
+    # clauses read before_done.kind, and invariant 4 above is what guarantees
+    # before_done is a dict carrying a valid kind enum, so running earlier
+    # would either crash on a non-dict before_done or emit a confusing
+    # "must be predicate" complaint about a fundamentally malformed action.
+    # First-violation-wins ordering is preserved: a bad script path is still
+    # reported first.
+    recurrence = meta.get('recurrence')
+    if recurrence is not None:
+        err = _validate_recurrence(
+            recurrence,
+            task_kind=task_kind,
+            before_done=before_done,
+            milestone=milestone,
+        )
+        if err is not None:
+            return err
+
+    # Invariant 9 (PRD completion-driven-triggers C2): last, for the reason
+    # given for recurrence above.
+    trigger_chain = meta.get(TRIGGER_CHAIN_KEY)
+    if trigger_chain is not None:
+        err = _validate_trigger_chain(
+            trigger_chain,
+            task_kind=task_kind,
+            before_done=before_done,
+            always_escalates=always_escalates,
+            carries_finding_run='x_finding_run' in meta,
+        )
         if err is not None:
             return err
 
@@ -248,6 +590,7 @@ def _validate_before_done(
     project_root: str,
     *,
     always_escalates: bool = False,
+    factory_root_resolver: Callable[[], Path | None] = resolve_dark_factory_root,
 ) -> dict[str, Any] | None:
     """Validate the before_done payload structurally and against the filesystem.
 
@@ -259,6 +602,8 @@ def _validate_before_done(
         always_escalates: The already-computed top-level metadata.always_escalates
             value — needed here (rather than re-derived) to enforce the
             kind='predicate' prohibition on always_escalates=True below.
+        factory_root_resolver: Locates the dark-factory root for a
+            ``script_root='factory'`` script; consulted only for those.
     """
     # Must be a dict
     if not isinstance(before_done, dict):
@@ -266,6 +611,10 @@ def _validate_before_done(
             f"before_done must be an object (dict), got {type(before_done).__name__!r}.",
             hint="Supply before_done as a JSON object: {'script': '<path>', 'timeout_secs': <n>}.",
         )
+
+    err = _unsupported_before_done_keys_error(before_done)
+    if err is not None:
+        return err
 
     # kind: optional enum (absent -> 'deploy', mirroring the shared BeforeDone
     # model's default). Checked early, like the task_kind enum check above,
@@ -279,41 +628,45 @@ def _validate_before_done(
             hint="Omit 'kind' (defaults to 'deploy'), or set it to 'deploy' or 'predicate'.",
         )
 
-    # script: required non-empty string
-    script = before_done.get('script')
-    if not isinstance(script, str) or not script.strip():
+    try:
+        paths = resolve_before_done_paths(
+            before_done, Path(project_root).resolve(), factory_root_resolver,
+        )
+    except ScriptRefused as exc:
         return _validation_error(
-            "before_done.script is required and must be a non-empty string path.",
+            str(exc),
             hint="Set 'script' to a relative path of an executable file under project_root.",
         )
-
-    # Resolve the script path relative to project_root
-    root = Path(project_root).resolve()
-    resolved_script = (root / script).resolve()
-
-    # Path containment: reject ../ escapes
-    try:
-        resolved_script.relative_to(root)
-    except ValueError:
+    except CwdRefused as exc:
         return _validation_error(
-            f"before_done.script {script!r} resolves outside project_root — "
-            "path traversal is not allowed.",
-            hint="Use a path relative to project_root without leading '../' segments.",
+            str(exc),
+            hint=(
+                "Omit 'cwd' to run the script from project_root, or set it to a "
+                'directory path; a relative cwd joins project_root.'
+            ),
         )
-
-    # File must exist and be executable
-    if not resolved_script.exists():
+    except ScriptRootRefused as exc:
         return _validation_error(
-            f"before_done.script {script!r} does not exist under project_root.",
-            hint=f"Expected an executable file at: {resolved_script}",
+            str(exc),
+            hint=(
+                "Omit 'script_root' to resolve the script under project_root, or set "
+                "script_root='factory' together with kind='predicate'."
+            ),
         )
-
-    if not os.access(resolved_script, os.X_OK):
+    except FactoryRootUnresolved as exc:
         return _validation_error(
-            f"before_done.script {script!r} exists but is not executable "
-            "(os.X_OK check failed).",
-            hint=f"Run: chmod +x {resolved_script}",
+            str(exc),
+            hint=(
+                f'Set {DARK_FACTORY_ROOT_ENV} for the fused-memory process to the '
+                "dark-factory checkout, or use script_root='project'."
+            ),
         )
+    script_base = paths.script_base.resolve()
+    err = _validate_script_under(
+        before_done['script'], paths.script, script_base, paths.script_root.base_name,
+    )
+    if err is not None:
+        return err
 
     # timeout_secs: required positive int
     timeout_secs = before_done.get('timeout_secs')
@@ -352,30 +705,60 @@ def _validate_before_done(
     return None
 
 
+def _validate_script_under(
+    script: str, script_path: Path, base: Path, where: str,
+) -> dict[str, Any] | None:
+    """Containment, existence and executable checks for the resolved *script_path* under *base*.
+
+    *script* is the submitted value the diagnostics quote; *where* names *base*.
+    """
+    resolved_script = script_path.resolve()
+
+    # Path containment: reject ../ escapes
+    try:
+        resolved_script.relative_to(base)
+    except ValueError:
+        return _validation_error(
+            f"before_done.script {script!r} resolves outside {where} — "
+            "path traversal is not allowed.",
+            hint=f"Use a path relative to {where} without leading '../' segments.",
+        )
+
+    try:
+        require_runnable_script(resolved_script)
+    except ScriptMissing:
+        return _validation_error(
+            f"before_done.script {script!r} does not exist under {where}.",
+            hint=f"Expected an executable file at: {resolved_script}",
+        )
+    except ScriptNotExecutable:
+        return _validation_error(
+            f"before_done.script {script!r} exists but is not executable "
+            "(os.X_OK check failed).",
+            hint=f"Run: chmod +x {resolved_script}",
+        )
+
+    return None
+
+
 def inject_task_kind(
     metadata: str | dict[str, Any] | None,
     task_kind: str,
 ) -> dict[str, Any]:
     """Return a metadata dict with ``task_kind`` set to *task_kind*.
 
-    Mirrors ``TaskInterceptor._inject_routing_override``: normalises *metadata*
-    (None / JSON-string / dict / unparseable → fresh dict) then shallow-copies
-    and sets ``metadata['task_kind']``, so the caller's object is not mutated
-    and the result is always a plain dict ready for JSON serialisation.
+    Resolves *metadata* through
+    :func:`fused_memory.middleware.metadata_dict.raw_metadata_dict` (so
+    unreadable metadata becomes an empty dict and is logged), then
+    shallow-copies it and sets ``metadata['task_kind']``. The caller's object
+    is never mutated, and the result is always a plain dict ready for JSON
+    serialisation.
 
     Args:
         metadata: Incoming task metadata (dict, JSON string, or None).
         task_kind: The validated kind string to persist ('normal' or
             'deterministic').
     """
-    parsed, discarded = _parse_metadata_with_discard(metadata)
-    if discarded:
-        logger.warning(
-            'task_metadata.schema_warning: non-dict metadata discarded '
-            '(type=%s); using fresh dict. Original value: %r',
-            type(metadata).__name__,
-            metadata,
-        )
-    meta = dict(parsed)  # shallow copy — don't mutate caller's dict
+    meta = dict(raw_metadata_dict(metadata, source='deterministic_task_guard'))
     meta['task_kind'] = task_kind
     return meta

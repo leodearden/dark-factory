@@ -38,6 +38,7 @@ import sys
 import uuid
 
 import httpx
+from shared.mcp_envelope import write_failure_reason
 
 from fused_memory.backends.sqlite_task_backend import (
     _RESERVED_METADATA_CONTROL_KEYS,
@@ -86,7 +87,8 @@ class FusedMemoryClient:
             'Accept': 'application/json, text/event-stream',
             'mcp-session-id': self._session_id or '',
         }
-        resp = await self._client.post(f'{self._url}/mcp/', json=payload, headers=headers)
+        from shared.mcp_post import mcp_endpoint_url  # local: E402-safe
+        resp = await self._client.post(mcp_endpoint_url(self._url), json=payload, headers=headers)
         resp.raise_for_status()
         # 202 Accepted (notifications) returns no body.
         if resp.status_code == 202 or not resp.content:
@@ -127,6 +129,8 @@ class FusedMemoryClient:
             raise RuntimeError(f'{name} failed: {result["error"]}')
         # MCP tools/call returns content list; structuredContent is the parsed dict
         content = result.get('result', {})
+        if content.get('isError'):
+            raise RuntimeError(f'{name} failed: {content.get("content")}')
         if 'structuredContent' in content:
             return content['structuredContent']
         # Fall back to first text content
@@ -139,7 +143,26 @@ class FusedMemoryClient:
         return content
 
 
-async def _clean_one_project(
+async def _write_cleaned_metadata(
+    client: FusedMemoryClient, project_root: str, task_id: str, cleaned: dict,
+) -> str | None:
+    """Replace the task's metadata with *cleaned*; return why it did not land, else None."""
+    try:
+        reply = await client.call_tool('update_task', {
+            'id': task_id,
+            'project_root': project_root,
+            'metadata': json.dumps(cleaned),
+            'metadata_mode': 'replace',
+        })
+    except Exception as exc:
+        return f'update_task failed: {exc}'
+    refusal = write_failure_reason(reply)
+    if refusal is not None:
+        return f'update_task REFUSED, nothing was written: {refusal}'
+    return None
+
+
+async def clean_one_project(
     client: FusedMemoryClient, project_root: str, task_ids: list[str], *, dry_run: bool,
 ) -> tuple[int, int, int]:
     """Visit each requested task id in one project. Returns (visited, cleaned, errors)."""
@@ -154,6 +177,11 @@ async def _clean_one_project(
             )
         except Exception as exc:
             print(f'  [skip] get_task failed for {project_root}#{task_id}: {exc}', file=sys.stderr)
+            error_count += 1
+            continue
+        unreadable = write_failure_reason(task)
+        if unreadable is not None:
+            print(f'  [skip] get_task refused for {project_root}#{task_id}: {unreadable}', file=sys.stderr)
             error_count += 1
             continue
 
@@ -206,25 +234,15 @@ async def _clean_one_project(
                 f'before={meta!r} after={cleaned!r}'
             )
         else:
-            try:
-                await client.call_tool('update_task', {
-                    'id': task_id,
-                    'project_root': project_root,
-                    'metadata': json.dumps(cleaned),
-                    'metadata_mode': 'replace',
-                })
-                print(
-                    f'  [{project_root}] task={task_id} dropped {dropped} '
-                    f'before={meta!r} after={cleaned!r}'
-                )
-            except Exception as exc:
-                print(
-                    f'  [error][{project_root}] task={task_id} update_task '
-                    f'failed: {exc}',
-                    file=sys.stderr,
-                )
+            failure = await _write_cleaned_metadata(client, project_root, task_id, cleaned)
+            if failure is not None:
+                print(f'  [error][{project_root}] task={task_id} {failure}', file=sys.stderr)
                 error_count += 1
                 continue
+            print(
+                f'  [{project_root}] task={task_id} dropped {dropped} '
+                f'before={meta!r} after={cleaned!r}'
+            )
         cleaned_count += 1
 
     return (visited, cleaned_count, error_count)
@@ -251,7 +269,7 @@ async def main_async(args: argparse.Namespace) -> int:
     async with FusedMemoryClient(args.server_url) as client:
         for root in roots:
             print(f'Project: {root}')
-            visited, cleaned_count, error_count = await _clean_one_project(
+            visited, cleaned_count, error_count = await clean_one_project(
                 client, root, task_ids, dry_run=args.dry_run,
             )
             totals['visited'] += visited
@@ -263,9 +281,10 @@ async def main_async(args: argparse.Namespace) -> int:
     print('---- summary ----')
     for k, v in totals.items():
         print(f'  {k}: {v}')
-    # Non-zero exit on any per-task failure (get_task/update_task errors,
-    # or the transform-contract safety check above) so an automated caller
-    # can detect partial failure instead of reading a bare 0 as success.
+    # Non-zero exit on any per-task failure (a get_task/update_task call
+    # that raised, a server reply refusing either one, or the
+    # transform-contract safety check above) so an automated caller can
+    # detect partial failure instead of reading a bare 0 as success.
     return 1 if totals['errors'] else 0
 
 

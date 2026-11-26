@@ -20,9 +20,8 @@ tasks:
         binding: "capability→producer (wired) — task 2847 done on main (scripts/eval_bootstrap_smoke.sh, found_on_main 8c8eeef745)"
         verdict: PASS
         delivered_check:
-          kind: grep
-          pattern: "eval_bootstrap_smoke"
-          paths: ["scripts/"]
+          kind: path
+          paths: ["scripts/eval_bootstrap_smoke.sh"]
           expect: present
       - name: "architect-fable-candidate"
         binding: "producer:task-π upstream (eval-revival lane; wired dep)"

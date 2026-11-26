@@ -47,17 +47,14 @@ around ``n = 1030``, and nothing in the M1 schema bounds a proportion's ``n``.
 
 Stdlib only — ``math.lgamma``/``math.exp``, no scipy or numpy (neither is a
 dependency of ``dark-factory-shared``, following the stdlib-only precedent of
-``orchestrator/src/orchestrator/evals/report.py``).
+``orchestrator/src/orchestrator/evals/stats.py``).
 """
 
 from __future__ import annotations
 
-import contextlib
 import hashlib
 import json
 import math
-import os
-import tempfile
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -65,6 +62,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
+from shared import safe_io
 from shared.memory_eval_metrics import (
     Metric,
     MetricDirection,
@@ -334,11 +332,11 @@ class LimitsConfig:
     """The declared inputs an operator actually reasons about.
 
     Deliberately NOT a home for a significance threshold. ``false_alarm_budget``
-    is a BUDGET DECLARATION in units a human can hold — *expected false alarms
-    per quarter* — and alpha is derived from it by :func:`derive_alpha` (PRD M2,
-    D3, G6). Nothing here is a p-value, and alpha is not stored: it depends on
-    how many metrics are alarm-eligible in a given run, which this config
-    cannot know.
+    is a BUDGET DECLARATION in units a human can hold — *an upper bound on
+    false alarms per quarter*, not a forecast of them — and alpha is derived
+    from it by :func:`derive_alpha` (PRD M2, D3, G6). Nothing here is a
+    p-value, and alpha is not stored: it depends on how many metrics are
+    alarm-eligible in a given run, which this config cannot know.
 
     ``min_samples`` and ``baseline_window`` are SUFFICIENCY guards on the canary
     precedent (``canary.py`` ``min_samples``), not thresholds on the statistic:
@@ -359,7 +357,8 @@ class LimitsConfig:
     """
 
     false_alarm_budget: float = 1.0
-    """Expected false alarms per quarter across the whole eval. PRD-sanctioned default."""
+    """Upper bound on expected false alarms per quarter across the whole eval; the realized
+    rate lands below it — see :func:`derive_alpha`. PRD-sanctioned default."""
 
     runs_per_quarter: int
     """How often this eval runs — 90 for the D10 daily cadence."""
@@ -403,9 +402,33 @@ def derive_alpha(
 
     ``alpha = budget / (runs_per_quarter * alarmed_metric_count)`` — a
     Bonferroni split of one quarterly budget across every opportunity to spend
-    it. Each run of each alarm-eligible metric is one such opportunity, so at
-    this alpha the expected number of false alarms per quarter is exactly the
-    declared budget.
+    it. Each run of each alarm-eligible metric is one such opportunity.
+
+    The budget is a CEILING on that count, not a prediction of it. Alpha only
+    bounds how often a run is SURPRISING; an alarm additionally requires that
+    surprise to be HARMFUL, and :func:`_verdict_from_p` combines the two via
+    ``alarmed = surprising and harmful``. The p-values judged against alpha
+    are two-sided (:func:`binomial_two_sided_p`, :func:`poisson_two_sided_p`),
+    while every metric that reaches the gate is directional — a missing
+    ``direction`` raises ``AssertionError`` — so part of each metric's alpha
+    is spent on outcomes that are surprising on the safe side, which report
+    as ``improved`` and never alarm. The exact discrete tests are already
+    conservative on their own, before the harm gate takes its cut: enumerated
+    against this module's own p-value engines, the total surprising mass
+    never exceeds alpha. A third share is never spendable at all:
+    :func:`evaluate_series` counts tripwires in ``alarmed_metric_count``,
+    even though a structural rule has no false-alarm probability under the
+    null and strictly does not consume budget. So the expected false alarms
+    per quarter are AT MOST the declared budget, never exactly it — and the
+    shortfall is not a constant fraction: at the exemplar's alpha of 1/360,
+    the harmful side carries ~0.50 of the surprising mass for a symmetric
+    binomial (n=30, p0=0.5), 0.24 for the upper tail of a n=200/p0=0.9
+    proportion, and 1.00 for a Poisson rate of 5, where the lower tail
+    cannot reach alpha at all, since ``poisson_two_sided_p(0, 5) = 0.0122``.
+    Treat ``false_alarm_budget`` as an upper bound on wake-ups, not a
+    forecast of them: loosening alpha to spend the unspent share is
+    deliberately NOT done here, since that is a policy change an operator
+    must decide, not a documentation fix.
 
     The consequence worth stating: alpha SHRINKS as metrics are added. That is
     intended, and it is why the evaluator recomputes alpha per run from the
@@ -1278,28 +1301,23 @@ def _artifact_from_result(result: EvaluationResult) -> LimitsArtifact:
 def _atomic_write_text(path: Path, text: str) -> None:
     """Write *text* to *path* via temp-in-dir + os.replace.
 
-    Copied from ``shared.prompt_artifact._atomic_write_text`` rather than
-    imported (it is module-private there, and ``shared.safe_io`` has only a
-    lenient reader — there is no atomic writer in ``shared/`` to reuse). The
-    temp comes from :func:`tempfile.mkstemp`, an OS-guaranteed fresh name,
-    rather than a pid-derived one, because the memory-eval runners all write
-    under a single artifact root and a shared ``<name>.<pid>.tmp`` would let
-    concurrent writers clobber each other mid-write.
+    Delegates to :func:`shared.safe_io.atomic_write_text` (task 3223, which
+    consolidated the four copies of this writer that used to exist). The
+    arguments preserve exactly what the previously-inlined body produced:
+    ``mode=0o600`` matches the :func:`tempfile.mkstemp` create, utf-8 was
+    already the encoding, and this site neither fsynced nor created its parent.
+
+    The unique-per-writer temp name the shared helper guarantees is what this
+    site always needed: the memory-eval runners all write under a single
+    artifact root, and a shared ``<name>.<pid>.tmp`` would let concurrent
+    writers clobber each other mid-write.
 
     This matters more here than for the metrics artifact: this file is
     RESUMABLE STATE, so a torn write would take the grandfather set with it and
     the next run would alarm on everything that was already known-bad. Either
     the old contents survive intact or the new ones land whole.
     """
-    fd, tmp_name = tempfile.mkstemp(suffix='.tmp', prefix=f'{path.name}.', dir=str(path.parent))
-    try:
-        with os.fdopen(fd, 'w', encoding='utf-8') as fh:
-            fh.write(text)
-        os.replace(tmp_name, path)
-    except BaseException:
-        with contextlib.suppress(OSError):
-            os.unlink(tmp_name)
-        raise
+    safe_io.atomic_write_text(path, text, encoding='utf-8', mode=0o600)
 
 
 def _artifact_payload(artifact: LimitsArtifact) -> dict[str, object]:

@@ -10,6 +10,10 @@ import pytest
 import pytest_asyncio
 
 from fused_memory.models.reconciliation import StageId, StageReport
+from fused_memory.reconciliation.graphiti_degradation_probe import (
+    GRAPHITI_DEGRADATION_REPRODUCED_STAT_KEY,
+    GRAPHITI_MIXED_STORE_PROBES_RUN_STAT_KEY,
+)
 from fused_memory.reconciliation.stage_stats import _COMPUTED_STAT_KEYS
 from fused_memory.reconciliation.stats_verifier import verify_and_rewrite_stats
 from fused_memory.services.write_journal import WriteJournal
@@ -100,7 +104,7 @@ async def test_verify_boundary_s1_computed_stats_override_llm_report(journal):
 def test_stats_verifier_has_no_alias_map():
     """_STAT_ALIASES is retired — memories_written no longer mirrors a
     canonical key; it's either dropped (S1) or absent entirely."""
-    import fused_memory.reconciliation.stats_verifier as sv  # noqa: PLC0415
+    import fused_memory.reconciliation.stats_verifier as sv
 
     assert not hasattr(sv, '_STAT_ALIASES')
 
@@ -307,6 +311,62 @@ async def test_verify_overrides_all_computed_keys_with_divergent_originals(journ
 
 
 @pytest.mark.asyncio
+async def test_verify_propagates_writes_dead_lettered_without_verifier_changes(journal):
+    """Cross-module contract: adding writes_dead_lettered to
+    _COMPUTED_STAT_KEYS propagates it through the verifier with NO
+    stats_verifier code change, because _apply_observed iterates that
+    frozenset and writes every key back 0-default.
+
+    The stage self-reported graphiti_writes_queued: 1 — it could not know
+    better, since dead-lettering is decided asynchronously by the durable
+    queue after the stage has already finished and reported. The journal
+    shows that enqueue died, so the verifier rewrites the counter to 0,
+    surfaces the death under writes_dead_lettered, and preserves the stage's
+    inflated original under _reported as the judge's divergence signal.
+    """
+    run_id = str(uuid.uuid4())
+    now = datetime.now(UTC)
+
+    write_op_id = str(uuid.uuid4())
+    await journal.log_write_op(
+        write_op_id=write_op_id,
+        causation_id=run_id,
+        source='mcp_tool',
+        operation='add_memory',
+        project_id='test',
+        agent_id='recon-stage-memory_consolidator',
+        result_summary={'memory_ids': [], 'stores': ['graphiti']},
+        success=True,
+    )
+    await journal.record_terminal_outcome(
+        write_op_id=write_op_id,
+        terminal_status='dead',
+        terminal_error='backend refused',
+    )
+
+    reports: dict[str, StageReport | dict] = {
+        'memory_consolidator': _stage_report(
+            StageId.memory_consolidator,
+            now - timedelta(minutes=1), now + timedelta(minutes=1),
+            stats={'graphiti_writes_queued': 1},
+        ),
+    }
+
+    observed = await verify_and_rewrite_stats(run_id, reports, journal)
+
+    assert observed['memory_consolidator']['graphiti_writes_queued'] == 0
+    assert observed['memory_consolidator']['writes_dead_lettered'] == 1
+
+    stats = reports['memory_consolidator'].stats  # type: ignore[union-attr]
+    # The write was accepted at enqueue but never landed: 0, not 1.
+    assert stats['graphiti_writes_queued'] == 0
+    # ...and the reason it is 0 is legible rather than silent.
+    assert stats['writes_dead_lettered'] == 1
+    # The stage's original claim survives as the judge's divergence signal.
+    assert stats['_reported']['graphiti_writes_queued'] == 1
+
+
+@pytest.mark.asyncio
 async def test_verify_returns_empty_when_no_write_journal():
     run_id = str(uuid.uuid4())
     now = datetime.now(UTC)
@@ -444,6 +504,62 @@ async def test_verify_skips_non_stage_id_keys_like_error(journal):
 
     assert '_error' not in observed
     assert reports['_error'] == {'message': 'stage crashed', 'stats': {}}
+
+
+@pytest.mark.asyncio
+async def test_verify_preserves_graphiti_probe_denominator_pair(journal):
+    """Task 4644 regression guard: the mixed-store probe counters must reach a
+    cycle report VERBATIM, denominator included.
+
+    ``graphiti_degradation_reproduced: 0`` is only readable next to
+    ``graphiti_mixed_store_probes_run: 3``; relocating either into
+    ``_reported``, or zeroing the denominator, turns "0 of 3" back into the
+    bare 0 that licensed the cd53b227 absence conclusion. Neither key is a
+    journal-computed counter, so neither may be overridden.
+
+    ``memories_added`` is asserted alongside precisely so this cannot pass by
+    the filter being inert: it IS computed, so it must be rewritten from the
+    journal with its inflated original snapshotted under ``_reported``. If a
+    future widening of the verifier's reported-counter set ever swallowed the
+    probe pair, the two halves of this test would disagree.
+    """
+    run_id = str(uuid.uuid4())
+    now = datetime.now(UTC)
+    stage_start = now - timedelta(minutes=1)
+    stage_end = now + timedelta(minutes=1)
+
+    # The stage claims 5 adds; the journal shows 2.
+    for _ in range(2):
+        await _log_write(
+            journal, causation_id=run_id, operation='add_memory',
+            agent_id='recon-stage-task_knowledge_sync',
+            result_summary={'memory_ids': ['m'], 'stores': ['mem0']},
+        )
+
+    reports: dict[str, StageReport | dict] = {
+        'task_knowledge_sync': _stage_report(
+            StageId.task_knowledge_sync, stage_start, stage_end,
+            stats={
+                GRAPHITI_MIXED_STORE_PROBES_RUN_STAT_KEY: 3,
+                GRAPHITI_DEGRADATION_REPRODUCED_STAT_KEY: 0,
+                'memories_added': 5,
+            },
+        ),
+    }
+
+    await verify_and_rewrite_stats(run_id, reports, journal)
+
+    stats = reports['task_knowledge_sync'].stats  # type: ignore[union-attr]
+
+    # The probe pair survives at TOP LEVEL, values untouched.
+    assert stats[GRAPHITI_MIXED_STORE_PROBES_RUN_STAT_KEY] == 3
+    assert stats[GRAPHITI_DEGRADATION_REPRODUCED_STAT_KEY] == 0
+    assert GRAPHITI_MIXED_STORE_PROBES_RUN_STAT_KEY not in stats['_reported']
+    assert GRAPHITI_DEGRADATION_REPRODUCED_STAT_KEY not in stats['_reported']
+
+    # The contrast: a genuinely computed key WAS overridden from the journal.
+    assert stats['memories_added'] == 2
+    assert stats['_reported']['memories_added'] == 5
 
 
 class TestUpdateEdgeVerifiedFilter:

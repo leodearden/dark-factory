@@ -67,13 +67,40 @@ misbehaviour.
 fused-memory MCP server whenever a write operation executes. The stats in stage reports \
 (e.g., memories consolidated, tasks updated) reflect actual work performed via these MCP calls.
 
-**Journal Entries** may be empty for CLI-executed stages. This is expected — CLI stages log \
-their mutations through the MCP server (captured as MCP Actions), not through the journal_entries \
-table. Empty journal entries with non-zero MCP actions is normal, not a contradiction.
-
 When evaluating a run, cross-reference stage report stats against MCP Actions to verify \
-consistency. Do NOT flag a run as contradictory simply because journal entries are empty \
-while stats show mutations were performed.
+consistency.
+
+**Write counters count writes that LANDED, not writes that were accepted.** A write can be \
+accepted at enqueue and still never reach the backend, because the durable queue retries it \
+asynchronously — often finishing long after the stage that issued it has reported — and may \
+ultimately dead-letter it. Such a write is EXCLUDED from the counter that counts THAT write, \
+and is reported separately under `writes_dead_lettered`. The exclusion is per-write, not \
+per-operation: a dead-lettered Graphiti enqueue suppresses `graphiti_writes_queued`, and a \
+dead-lettered `add_episode` suppresses `episodes_added`, but a dual-store `add_memory` whose \
+synchronous Mem0 write already returned memory IDs still counts in `memories_added` — only \
+its queued Graphiti half died, and the Mem0 half is already on disk.
+
+Read the two together. `graphiti_writes_queued: 0` alongside a non-zero \
+`writes_dead_lettered` does NOT mean the stage did nothing — it means the stage's writes \
+DIED, and should be judged as a failure rather than a no-op. A zero write counter with \
+`writes_dead_lettered: 0` is the genuine no-op case.
+
+Do not over-apply that reading. A NON-ZERO landed counter alongside a non-zero \
+`writes_dead_lettered` is a PARTIAL landing: some of the stage's writes persisted and some \
+died. That warrants a finding about the writes that died — it does NOT warrant a verdict \
+that the stage's writes all failed, and it is NOT a contradiction.
+
+Two deliberate overlaps, where one write registers in both a landed counter and \
+`writes_dead_lettered`. First, a *post-execute* dead-letter: the backend write landed and \
+only the queue's callback kept failing, so the data is really there — but the item still \
+needs operator attention and must not be blind-replayed. Second, a partially-landed dual \
+write: `memories_added: 1` next to `writes_dead_lettered: 1` means the Mem0 memory persisted \
+while its Graphiti twin died, so that half is missing. A stage whose landed counters are \
+non-zero AND whose `writes_dead_lettered` is non-zero is therefore not self-contradictory.
+
+A stage never self-reports `writes_dead_lettered` — it cannot know it, since dead-lettering \
+is decided after the stage ends. It is journal-derived only, so its absence from a stage's \
+`_reported` block is expected and is not a self-reporting failure.
 
 Evaluate this run on its own merits. Do not issue findings about trends or patterns across \
 runs — a separate code-side mechanism monitors verdict history and halts on systemic issues.
@@ -85,7 +112,6 @@ Respond with a JSON object:
   "severity": "ok|minor|moderate|serious",
   "findings": [
     {
-      "entry_id": "journal entry ID",
       "issue": "description of the problem",
       "severity": "ok|minor|moderate|serious",
       "recommendation": "what should be done"

@@ -1,0 +1,376 @@
+# LME replay corpus
+
+The committed replay corpus for PRD `plans/local-memory-models-eval-prd.md`
+task **δ**: a stratified sample of real `dark_factory` episodes that is
+**never conditioned on the incumbent extraction pipeline's outcome**.
+
+| file | what it is |
+|---|---|
+| `build_corpus.py` | the read-only builder + verifier (`--verify`) |
+| `corpus_manifest.json` | the committed artifact: 200 episode ids, content hashes, criteria, stratification report |
+
+Declared consumers: **ε** (replay engine input), **ζ** (control replays),
+**θ** (full arm replays). They read episode *content* from the store by uuid;
+the manifest deliberately carries only the id and a content hash, so a second
+copy of the bytes can never silently disagree with the first.
+
+## Re-deriving the corpus
+
+The one command a reviewer runs:
+
+```bash
+uv run python fused-memory/scripts/local_memory_models_eval/build_corpus.py --verify
+```
+
+It re-runs the sampler from the criteria the manifest records about **itself**
+— seed, N, dimensions, allocation rule, window — and compares the result to the
+recorded episode list, then re-hashes every episode's content. It never reads
+the manifest's own `episodes` list as the answer to what should be selected;
+that check would pass on any manifest, including a tampered one.
+
+Re-derivation samples the population **as of the recorded window**:
+`criteria.window.max_created_at` is a *bound*, not a description, so only
+episodes at or before it were ever in the sampling frame and only they are fed
+back through the sampler. That is what keeps the check pinned to the manifest's
+own frame instead of drifting as the factory keeps writing — see below. A
+manifest that does not state its window fails as `bad_manifest` rather than
+being silently checked against an unbounded population.
+
+The bound applies to the re-derivation only. `missing_episodes` and
+`hash_drift` are evaluated against the **full** live population, because "does
+the store still hold these 200 episodes, with the same bytes?" is a different
+question from "what was the sampling frame", and windowing it would hide a real
+deletion behind a bound the artifact itself supplies.
+
+Exit codes are per failure class, because each has a different remedy:
+
+| exit | status | means |
+|---|---|---|
+| 0 | `ok` | every id re-derived and every hash matched |
+| 2 | `id_mismatch` | the recorded criteria no longer produce the recorded corpus |
+| 3 | `hash_drift` | the selection is right, but episode bytes changed |
+| 4 | `missing_episodes` | an id the manifest names is gone from the store |
+| 5 | `bad_manifest` | the artifact is structurally unusable |
+| 1 | — | the run never reached a verdict (store unreachable, unsatisfiable `--n`, stdout unwritable — a reader closed the pipe early as in `\| head`, or a `>` redirect hit a full disk — the manifest unwritable at `--out`, or a store defect blocking the check under `--verify`: a duplicated episode uuid or an unparseable `created_at` on a live row) |
+
+Exit `1` is always accompanied by one `error: ...` line on stderr, never a
+traceback. Read it: a pipe that broke on the trailing `manifest: ...` line
+still exits `1`, and the message names the manifest that **was** written, so
+"the run failed" is not mistaken for "no artifact exists".
+
+To rebuild rather than check, drop `--verify`; add `--dry-run` to print the
+stratification report and write nothing.
+
+### Why the window bound is load-bearing
+
+`dark_factory` is written continuously by the running fleet — it grew from
+2,770 episodes to 2,775 in the two hours between this task's census and its
+build, and to 2,776 within minutes of that. Episode count is not a quantity
+that holds still.
+
+An unwindowed re-derivation samples whatever the store holds at check time, so
+each new episode shifts a cell denominator, largest-remainder allocation moves
+a seat or two, and `--verify` reports `id_mismatch` on a perfectly correct
+artifact. That failure is loud, but it is *wrong*, and a check that cries wolf
+within minutes of every build is a check reviewers learn to ignore — which is
+the same outcome as having no check, arrived at more slowly.
+
+Bounding the frame at `criteria.window.max_created_at` fixes this at the
+source: growth after the build is outside the frame by construction, so a green
+`--verify` is a durable statement about the artifact rather than a statement
+about one particular minute in the store's history. The population count no
+longer has to match for verification to pass — and when a re-derivation *does*
+fail, the `id_mismatch` detail says whether the frame reconciled, so a genuine
+shift is still distinguishable from tampering.
+
+Verified green against the live store at build time (2026-08-06, population
+2,775 recorded) and re-verified green afterwards at a larger live population,
+which is the property the bound buys.
+
+## Stratification
+
+Two dimensions, crossed: **`month(created_at)` × `payload_kind(source_description)`**.
+16 of the 20 cells are non-empty.
+
+**Why `source_description` and not `source`.** `e.source` looks like the
+payload-kind field and is not: measured read-only across the whole store, it is
+uniformly `'text'` for **every** episode and discriminates nothing. The real
+signal is `e.source_description`, which the writers shape as
+`add_memory:<category>` (and `replay_from_mem0:<category>` on the Mem0 replay
+path). A caller-supplied `add_episode` description buckets under a single
+explicit `add_episode` kind rather than fanning the axis into one stratum per
+caller string. The annotations `GraphitiBackend.add_episode` prepends,
+`[unverified_claim] ` and `[temporal:<ctx>] `, are stripped before
+classification, so a tagged write stays in its category's stratum; any other
+leading text is a caller string and buckets as `add_episode`.
+
+**The axis is closed.** `build_corpus.KNOWN_PAYLOAD_KINDS` declares the four
+measured kinds, and `add_episode` is deliberately not among them. A build (or
+`--dry-run`) over a population carrying any other kind exits 1, naming the
+kinds and the `source_description` values that produced them. The remedy is to
+re-measure the census before building the next corpus, or, when the cause is a
+new writer annotation, to extend the annotation regex.
+
+Allocation is **min-1 floor + largest-remainder proportional, capped at cell
+size**. The floor is load-bearing, not tidiness: the
+`('2026-04', 'procedural_knowledge')` cell holds exactly **one** episode of
+2,775, so its proportional share at N=200 is 0.07 seats. Pure proportional
+allocation rounds it to zero and deletes an entire payload kind from the corpus
+— and therefore from every downstream arm comparison — while the stratification
+report still reconciles perfectly. The floor costs 16 of 200 seats and makes
+that invisible loss impossible.
+
+Within a cell the draw is a **prefix of a seeded permutation**: sort the cell
+canonically by uuid (so the result does not depend on the order FalkorDB
+happens to return rows in, which is not guaranteed stable), permute under
+`Random(f'{seed}:{month}:{kind}')`, take the first `allocate()[cell]`.
+
+## N = 200 is final (ruled by ζ)
+
+200 was δ's choice: the midpoint of the PRD's 150–300 band, checked against the
+measured census so that all 16 non-empty cells receive at least one seat. PRD
+Open Q4 deferred the final corpus size to ζ, and **ζ kept N = 200** after
+measuring control variance and wall-clock on this exact manifest. Every LLM
+gated margin derived from the two incumbent control replays is far inside the
+0.10 adequacy bound, and wall-clock does not constrain N. The ruling and its
+measured basis are in `plans/local-memory-models-eval-preregistration.md`
+§"Corpus N".
+
+The controls, and every margin pre-registered from them, are bound to this
+manifest's `corpus_sha`. Re-running the builder at a different `--n` writes a
+different manifest with a different `corpus_sha`, which invalidates the
+controls. That would be a new pre-registration, not a re-tune.
+
+The builder's prefix property still holds. Each cell's take is a prefix of that
+cell's seeded permutation, so growing N only ever **appends** to a cell. This
+is a **per-cell** guarantee, not a global one: largest-remainder allocation can
+move a single seat between cells as N changes.
+
+## The binding hazard: no conditioning on the incumbent's outcome
+
+Corpus membership must never depend on how well the **incumbent** extraction
+pipeline did on an episode — otherwise every arm is compared on a corpus that
+was pre-selected to flatter one of them. `e.entity_edges` is the per-episode
+record of what that pipeline produced, so it is the exact outcome proxy that
+must stay untouched. The guarantee is mechanized three ways, each tested in
+`fused-memory/tests/test_local_memory_models_eval_corpus.py`:
+
+1. **The projection cannot see it.** The builder reads the population through
+   `build_corpus.py::POPULATION_READ`, built from the `PROJECTED_FIELDS`
+   constant, with no `WHERE` and no `entity_edges`. The population is read
+   whole: FalkorDB truncates every answer silently at its result-set cap
+   (`fused_memory/backends/paged_read.py::RESULTSET_SIZE`), so the read is
+   paged in `e.uuid` order and checked against a `count(e)` census. The
+   `LIMIT` each page carries is the page size, not a filter. The build exits
+   1 on a short read, a missing census or the page cap, and on any row count
+   that differs from the census, which catches any single write during the
+   read. The check is on the count, not on which rows came back: two writes
+   that offset each other mid-read leave the count equal and are not
+   caught. Tests assert the
+   projected field set by equality and assert the absence of a filter clause
+   directly.
+2. **The record cannot hold it.** `EpisodeRecord` has no outcome field, so no
+   sampling rule *can* condition on one. A test pins the field set exactly.
+3. **The sampler has nowhere to hide it.** Every input episode leaves
+   `select()` as either `selected` or `not_drawn` — there is deliberately no
+   `ineligible` or `low_quality` disposition, since either would be a place for
+   outcome conditioning to live. The disposition accounting is exhaustive.
+
+**The anchor.** Exactly one episode in the store —
+`e622a9bf-f1c8-431b-ad36-92762d69436d` (`add_memory:temporal_facts`,
+2026-05-16) — has `size(entity_edges) == 0`: the one the incumbent extracted
+nothing from. It is the concrete eligibility anchor, and a test class
+(`TestOutcomeFailedEpisodesStayEligible`) pins that it is fetched into the
+population and is selectable. It competes in cell `2026-05|temporal_facts`
+against 390 others on equal terms; at the committed seed it was not drawn, and
+that is the point — being drawn is a coin flip, being *eligible* is the
+guarantee.
+
+## Read-only, and no graphiti driver
+
+The builder issues only `GRAPH.RO_QUERY` reads: a `count(e)` census plus
+uuid-ordered pages. Read-only here is
+**server-enforced**, not a client-side promise: a `CREATE` issued through that
+command path is refused by FalkorDB and materializes nothing. A client-side
+guard sits on top of it: the graph handle the builder reads through forwards
+only the read primitive, so no write primitive can even be resolved on it.
+Should that guard ever fire on the builder's read, the refusal surfaces as a
+typed `CorpusBuildError` rather than as a redis error three layers down. Both
+the guard and the client opener live in
+`fused-memory/src/fused_memory/backends/falkor_read_only.py`, the read-only
+seam every audit and corpus script shares.
+
+It connects with `falkordb.asyncio.FalkorDB(...).select_graph(...)` and
+**never** constructs `graphiti_core.driver.falkordb_driver.FalkorDriver`, whose
+`__init__` fire-and-forgets `build_indices_and_constraints()` — that would
+create indices on `dark_factory` and destroy the protected no-index evidence
+owned by `docs/prds/falkordb-index-provisioning.md`. Both halves are *measured*,
+not promised: the offline tests booby-trap `FalkorDriver.__init__` and drive the
+reader against a double whose write-capable methods are tripwires (with a
+meta-test proving the tripwires fire), and the live smoke wraps the real graph
+handle so only `ro_query` can be reached.
+
+Test lane: the offline suite runs by default; the single live test is
+`@pytest.mark.integration` (per-test, never module-level — `addopts` is
+`-m 'not integration'`) and skips cleanly with no FalkorDB. It seeds and
+deletes a throwaway graph on the scratch FalkorDB and reads it read-only. No
+automated check asserts the real population's size, month span or window
+start; the build report prints them for the operator.
+
+```bash
+uv run pytest fused-memory/tests/test_local_memory_models_eval_corpus.py            # offline
+uv run pytest fused-memory/tests/test_local_memory_models_eval_corpus.py -m integration  # live, scratch FalkorDB
+```
+
+## Self-check
+
+The delivered_check for this PRD row
+(`plans/local-memory-models-eval-prd.capability-manifest.yaml`) greps the
+committed tree. Run it anchored to this directory's parent:
+
+```bash
+git grep -cE 'PRD[-]MARKER:local-memory-models-eval corpus[-]manifest' -- fused-memory/scripts/
+```
+
+Expected — two files, three matching lines:
+
+```
+fused-memory/scripts/local_memory_models_eval/build_corpus.py:2
+fused-memory/scripts/local_memory_models_eval/corpus_manifest.json:1
+```
+
+The builder carries the literal marker twice (its docstring's Artifacts section
+and the `PRD_MARKER` constant it serializes from); the manifest carries it once,
+as a top-level `prd_marker` field so it survives JSON serialization intact.
+
+This README deliberately spells the marker only in the bracketed `PRD[-]MARKER`
+regex form, never literally, so it does not satisfy the check it documents —
+the same trick the capability-manifest pair uses on itself. If you add a file
+here that carries the literal, update the expected count above in the same
+commit, or this self-check quietly stops meaning anything.
+
+# Arm-runner harness (task ε)
+
+`harness.py` is thin CLI wiring over `fused_memory.arm_harness`; read the
+module named in each row for behaviour. Run it from `fused-memory/` with
+`uv run python scripts/local_memory_models_eval/harness.py <subcommand> …`.
+Live endpoints come from `FusedMemoryConfig()` (honours `CONFIG_PATH`), with
+one split. The corpus read follows the config (`FALKORDB_URI`), because the
+corpus graph lives only on production; it is `GRAPH.RO_QUERY`, read-only.
+Every write, copy, index build and teardown goes to the scratch FalkorDB
+(`FALKOR_HOST`/`FALKOR_PORT`, default `localhost:6380`), which must hold
+`evalmem_lme_ref_incumbent_a`, seeded by
+`scripts/seed_scratch_reference_graph.py` (OPERATIONS.md "The scratch
+FalkorDB").
+
+| Subcommand | Invoked by | What it does |
+|---|---|---|
+| `run --arm-spec S --manifest M --out-root D --concurrency N --index-configuration {with-indices,embedding-only} [--reference-outcomes F] [--repo-root R] [--limit N]` | ζ, θ | Replays this corpus through one LLM arm (`run.py`) |
+| `smoke --arm-spec S` | η | One schema-constrained request plus the validator's negative control (`checks.py`) |
+| `index-check --arm-spec S --expect {with-indices,embedding-only}` | ι | Whether the scratch graph answers fulltext as claimed (`checks.py`) |
+| `integrity --reference G --candidate G` | ι | Re-embed integrity verdict over two scratch topologies (`topology.py`) |
+| `parity-check --run-a A --run-b B` | ζ | Client-class parity deltas (a − b) into `A/parity/<arm b>/metrics/` (`comparison.py`) |
+| `control-check --run A --run B [--run …] [--reference-outcomes F]` | ζ | Symmetry, one code sha, token/cost and reference checks (`checks.py`) |
+| `preregister --run-a A --run-b B --out F` | ζ | The incumbent control pair's margins, latency envelope and calls-per-episode profile, written to a fresh `F` (an existing `F` is refused, never overwritten); B must have run with `--reference-outcomes` A, and its graph-sameness is recomputed from both runs' outcomes (`preregistration.py`, `margins.py`) |
+| `screen --evidence-root R --arms-manifest Y --preregistration-inputs P --reference-outcomes O --out F` | η | Offline: loads each `arms.yaml` LLM arm's screening evidence under `R` and writes the survivor verdict to a fresh `F`. A zero-survivor verdict exits 0, and invalid evidence exits 2 (`screening.py`, `screening_evidence.py`) |
+| `incumbent-cost --telemetry T --until U --pricing-spec S --control-run A [--control-run …] --out-dir D` | θ | Offline: windows `telemetry_query.py`'s JSONL dump `T` from the first token-bearing graphiti LLM attempt up to `U` (ISO-8601 with an offset), prices it at `S`'s token rates, and adds each control run's replay unit cost. The dump must reach back past that first attempt and forward to `U`, or it is refused. Writes `D/production-telemetry.jsonl` and `D/incumbent-cost.json`, both or neither; an existing output is refused, never overwritten (`incumbent_cost.py`) |
+| `topology --graph G` | ζ, ι | A scratch graph's node and edge counts and topology hash: ζ freezes the reference graph, ι re-runs it to verify the graph is unchanged (`topology.py`) |
+| `teardown --arm-spec S [--collection]` | ι | Deletes the arm's scratch graph and, with `--collection`, its Qdrant replica (`teardown.py`) |
+| `mem0-snapshot --collection C --out F` | ι | A read-only scroll of Mem0 collection `C` into a fresh JSONL `F`, and its sha256 (`mem0_replica.py`) |
+| `probe-set --reference-json J --control-a-outcomes O --transcript-corpus T --mem0-snapshot F --registry R --out P` | ι | The embedding probe set, written to a fresh `P`. It reads the frozen reference through `ro_query` only and exits 3 if the reference's hash moved. δ's `corpus_sha` comes from the `run.json` beside `O`, and E1's registry and `content_key` are loaded from `memory_eval_retrieval_probe.py` (`probe_set.py`) |
+| `embed-specs --arms-manifest Y --probe-set P --code-sha C --preregistration-sha S --out-dir D` | ι | `D/<arm_id>.json` for the two incumbent controls, at the config's embedder, and for each `arms.yaml` embedding arm, all with `corpus_sha` = the sha of `P`. Writes all or none, and an existing spec is refused (`slate.py`) |
+| `embed-run --arm-spec S --probe-set P --mem0-snapshot F --out-root D [--repo-root R]` | ι | One embedding arm end to end: copy and re-embed the reference, probe both index configurations, build and probe the Mem0 replica, and time queries. A scratch graph or replica left by an earlier run is refused (exit 2) before anything is copied (`embedding_run.py`, `embedding_graph_phase.py`) |
+| `embed-preregister --run-a A --run-b B --out F` | ι | The embedding control pair's margins and query-latency envelope, written to a fresh `F`. A control with a failed latency query, or whose re-embed left a text unembedded, yields none (exit 2) (`embedding_preregistration.py`) |
+| `embed-compare --preregistration F --run R [--run …]` | ι | Offline: one markdown row per candidate and margin, then each candidate's envelope, reported rows and `non_inferior` verdict. A failed latency query keeps the envelope from admitting a candidate. A run whose re-embed left a text unembedded, or that ran at another code sha, corpus sha or search timeout than the pre-registration, is refused (exit 2) (`embedding_preregistration.py`) |
+
+`screen_slate.py`, beside `harness.py`, is η's sweep driver. It runs every LLM
+arm in turn: start, smoke, run, α's healthcheck, stop and teardown, all through
+the pinned harness. Each arm's traffic passes through the in-process usage tap
+(`usage_tap.py`), which records the server's own per-call `usage`. Leaving a
+tap session waits, up to the tap's upstream timeout, for calls the harness
+abandoned but the arm is still serving, so the arm is healthchecked and stopped
+only after they land; a call outlasting that bound is marked
+`outlived_session`. The tap prints a `usage tap:` line to stdout when it starts
+waiting, and another if the bound expires, so a pause before the healthcheck is
+explained in the journal. The sweep's provenance and run record:
+`plans/local-memory-models-eval-screening/README.md`.
+
+`run` refuses before touching any store unless the spec's `code_sha` is the
+clean HEAD of `--repo-root`, a candidate's `preregistration_sha` carries the
+preregistration doc, and the manifest's bytes hash to the spec's `corpus_sha`.
+It then requires `build_corpus.verify_manifest` to report `ok` on the fetched
+population.
+
+## Exit codes
+
+| Code | Meaning |
+|---|---|
+| 0 | ok |
+| 1 | the run could not complete (store unreachable, a store read overran its timeout budget, index build failed, the index probe could not remove its seeded node — the error names it — or a traceback) |
+| 2 | refused: invalid spec or input, a pre-run instrument check failed, a run dir is not fresh or not complete, an embedding arm's scratch graph or replica is stale, a control pair yields no valid pre-registration |
+| 3 | an instrument check failed (post-run, smoke, index-check, integrity, control-check, embed-run's mid-run checks, probe-set's frozen-reference check) |
+| 4 | INV-4 abort: consecutive episode failures stopped the run |
+| 5 | scratch guard: a non-`evalmem_` name reached a guarded checkpoint |
+| 6 | corpus integrity: `corpus_sha` mismatch, or δ's verdict is not ok |
+
+argparse usage errors also exit 2.
+
+## Run directory
+
+`<out-root>/<arm_id>/<STAMP>/`, where `STAMP` is `$MEMORY_EVAL_RUN_STAMP` or
+the current UTC time. A run refuses a stamp directory that already holds
+artifacts.
+
+| Path | Content |
+|---|---|
+| `run.json` | The `RunManifest`, written last: its absence marks an interrupted run |
+| `outcomes.jsonl` | One `EpisodeOutcome` per attempted episode |
+| `metrics/` | One `MetricsRecord` per metric |
+| `abort.json` | Present only after an INV-4 abort |
+| `graph_sameness_details.json` | Present only with `--reference-outcomes` |
+| `journal/` | The run-local write journal; read it with `OPERATOR_TELEMETRY_QUERY` |
+
+### Embedding run directory
+
+`embed-run` uses the same `<out-root>/<arm_id>/<STAMP>/` layout.
+
+| Path | Content |
+|---|---|
+| `run.json` | The `EmbeddingRunManifest`, written last; a failed instrument check writes none |
+| `metrics/` | Six per-configuration records (known-item recall@5, recall@10 and MRR for each index configuration), plus the Mem0, query-latency and re-embed-throughput records |
+
+Each embedding arm uses one graph (= `scratch_group_id`), which passes through
+embedding-only and then with-indices, plus a same-named Qdrant replica. So
+`teardown --arm-spec S --collection` removes both. The rationale is in
+`plans/local-memory-models-eval-embedding-report.md`.
+
+## Scratch names
+
+Every graph or collection the harness writes, indexes, reads for topology or
+deletes must pass `fused_memory/arm_harness/scratch_guard.py`; that module is
+the rule's one home. Protected graphs are unreachable by construction.
+
+## Live check
+
+```bash
+uv run pytest -m integration tests/arm_harness
+```
+
+It replays two episodes onto `evalmem_test_` graphs on the scratch FalkorDB
+at `FALKOR_HOST`/`FALKOR_PORT` (default `localhost:6380`; a test session aimed
+at production `:6379` exits 4) against a local mock endpoint, and asserts that
+no protected graph or index changed. `test_live_embedding_integration.py` does
+the same for an embedding arm's copy, re-embed and index transitions.
+
+## Known limitations
+
+- A search that overruns its read budget stops `embed-run` and `run`: they exit
+  1 with its `TimeoutError` and write no `run.json`. The timeout is never
+  counted in `query_failures` or read as a miss, because the budget spans the
+  query embedding and FalkorDB's search legs, so it is not the arm's. The arm's
+  own query latency is measured by `query-embed-latency-p95` against the
+  envelope. Before re-running, remove the scratch graph it left with
+  `teardown --arm-spec S`, adding `--collection` for an embedding arm's replica.
+- The harness never sets graphiti's `SEMAPHORE_LIMIT`, whose env name collides
+  with the queue knob. `run.json` records the effective value, and the
+  symmetry check requires it to be equal across arms.

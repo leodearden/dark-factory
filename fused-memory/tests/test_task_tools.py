@@ -4,13 +4,18 @@ import asyncio
 import contextlib
 import json
 import logging
+import subprocess
 from unittest.mock import AsyncMock
 
 import pytest
 import pytest_asyncio
 import yaml
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
+from fused_memory.middleware.task_text_write_guard import text_fp_of
 from fused_memory.server.tools import create_mcp_server
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 _TOOLS_LOGGER = 'fused_memory.server.tools'
 
@@ -190,6 +195,7 @@ async def test_update_task_param_forwarding(
         'dependencies': None,
         'agent_id': None,
         'client_op_id': None,
+        'expected_text_fp': None,
     }
     expected_kwargs = {**base_kwargs, **expected_overrides}
     task_interceptor.update_task.assert_called_once_with(**expected_kwargs)
@@ -410,6 +416,163 @@ async def test_update_task_rejects_metadata_done_provenance_json_string(
 
 
 @pytest.mark.asyncio
+async def test_update_task_replace_retires_a_key_on_a_done_task_across_surfaces(
+    real_task_stack, tmp_path,
+):
+    """Through the MCP tool, a whole-blob replace on a done task that carries
+    the stamped done_provenance verbatim is accepted and retires the omitted
+    key; dropping done_provenance is refused with the same canonical dict the
+    interceptor returns. Metadata is sent as a dict, so the tool's own
+    json.dumps coercion is on the path."""
+    from _fm_git_repos import _init_git_repo
+
+    from fused_memory.backends.task_backend_errors import done_provenance_via_update_task_error
+    from fused_memory.middleware.task_interceptor import interceptor_write_succeeded
+
+    server, interceptor = real_task_stack
+    repo = tmp_path / 'repo'
+    repo.mkdir()
+    sha = _init_git_repo(repo)
+    root = str(repo)
+    await interceptor.taskmaster.add_task(
+        project_root=root, title='T',
+        metadata=json.dumps({'files': ['x.py'], 'stale_key': 1}),
+    )
+    done = await interceptor.set_task_status(
+        '1', 'done', root, done_provenance={'kind': 'merged', 'commit': sha},
+    )
+    assert 'error' not in done, done
+    stamped = (await interceptor.get_task('1', root))['metadata']
+
+    without_done_provenance = {
+        key: value for key, value in stamped.items()
+        if key not in ('stale_key', 'done_provenance')
+    }
+    refused_tools = await server._tool_manager.call_tool(
+        'update_task',
+        {
+            'id': '1', 'project_root': root,
+            'metadata': without_done_provenance, 'metadata_mode': 'replace',
+        },
+    )
+    refused_interceptor = await interceptor.update_task(
+        '1', root,
+        metadata=json.dumps(without_done_provenance), metadata_mode='replace',
+    )
+    assert refused_tools == done_provenance_via_update_task_error('1')
+    assert refused_tools == refused_interceptor
+
+    passthrough = {key: value for key, value in stamped.items() if key != 'stale_key'}
+    accepted = await server._tool_manager.call_tool(
+        'update_task',
+        {
+            'id': '1', 'project_root': root,
+            'metadata': passthrough, 'metadata_mode': 'replace',
+        },
+    )
+    assert interceptor_write_succeeded(accepted), accepted
+
+    task = await interceptor.get_task('1', root)
+    assert task['status'] == 'done'
+    assert 'stale_key' not in task['metadata']
+    assert task['metadata']['done_provenance'] == stamped['done_provenance']
+    assert task['metadata']['files'] == ['x.py']
+
+
+async def _seed_task_with_done_provenance(interceptor, root: str) -> dict:
+    """Add task 1 carrying a done_provenance and return its stored metadata."""
+    await interceptor.taskmaster.add_task(
+        project_root=root, title='T',
+        metadata=json.dumps({
+            'done_provenance': {'kind': 'merged', 'commit': 'a' * 40},
+            'files': ['x.py'],
+        }),
+    )
+    return (await interceptor.get_task('1', root))['metadata']
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ('payload', 'received'),
+    [('not json{', 'invalid_json'), ('"bare"', 'string'), ('7', 'number')],
+)
+async def test_update_task_non_object_metadata_rejection_byte_identical_across_surfaces(
+    real_task_stack, tmp_path, payload, received,
+):
+    """A metadata payload that is not a JSON object is refused with the same
+    canonical dict through the MCP tool and the interceptor, and the stored
+    blob, done_provenance included, is left untouched (task 6130).
+
+    The payloads are ones FastMCP's argument pre-parse hands to the tool body
+    as strings; '[]' and 'null' are decoded before the tool runs and are
+    pinned separately below."""
+    from fused_memory.backends.task_backend_errors import metadata_not_an_object_error
+    from fused_memory.middleware.task_interceptor import interceptor_write_succeeded
+
+    server, interceptor = real_task_stack
+    root = str(tmp_path)
+    before = await _seed_task_with_done_provenance(interceptor, root)
+
+    dict_tools = await server._tool_manager.call_tool(
+        'update_task', {'id': '1', 'project_root': root, 'metadata': payload},
+    )
+    dict_interceptor = await interceptor.update_task(
+        '1', root, metadata=payload, metadata_mode='replace',
+    )
+
+    expected = metadata_not_an_object_error('1', received)
+    assert dict_tools == expected, f'tools.py surface diverged from canonical shape: {dict_tools}'
+    assert dict_interceptor == expected, (
+        f'interceptor surface diverged from canonical shape: {dict_interceptor}'
+    )
+    assert interceptor_write_succeeded(dict_tools) is False
+    assert interceptor_write_succeeded(dict_interceptor) is False
+    assert (await interceptor.get_task('1', root))['metadata'] == before
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('payload', ['[]', '["a"]'])
+async def test_update_task_array_metadata_fails_mcp_argument_validation(
+    real_task_stack, tmp_path, payload,
+):
+    """'[]' is the payload that wiped done_provenance in the original bug
+    (task 6130). Through the MCP tool, FastMCP's argument pre-parse decodes it
+    to a list, which fails argument validation before the tool body runs, and
+    the stored blob, done_provenance included, is left untouched."""
+    from mcp.server.fastmcp.exceptions import ToolError
+
+    server, interceptor = real_task_stack
+    root = str(tmp_path)
+    before = await _seed_task_with_done_provenance(interceptor, root)
+
+    with pytest.raises(ToolError, match=r'validation errors? for update_taskArguments\nmetadata\.'):
+        await server._tool_manager.call_tool(
+            'update_task', {'id': '1', 'project_root': root, 'metadata': payload},
+        )
+    assert (await interceptor.get_task('1', root))['metadata'] == before
+
+
+@pytest.mark.asyncio
+async def test_update_task_null_metadata_reads_as_omitted_at_mcp_surface(
+    real_task_stack, tmp_path,
+):
+    """Through the MCP tool, a 'null' metadata payload is decoded to an
+    omitted metadata argument (task 6130): the call writes no metadata, so the
+    stored blob, done_provenance included, is left untouched. With no other
+    field it is a fieldless call, which task 4867 refuses instead of
+    reporting a success that wrote nothing."""
+    server, interceptor = real_task_stack
+    root = str(tmp_path)
+    before = await _seed_task_with_done_provenance(interceptor, root)
+
+    result = await server._tool_manager.call_tool(
+        'update_task', {'id': '1', 'project_root': root, 'metadata': 'null'},
+    )
+    assert result['error_type'] == 'NoFieldsToUpdateError', result
+    assert (await interceptor.get_task('1', root))['metadata'] == before
+
+
+@pytest.mark.asyncio
 async def test_update_task_allows_unrelated_metadata(
     mcp_server_with_tasks, task_interceptor,
 ):
@@ -618,6 +781,36 @@ async def test_update_task_status_none_still_allowed(
     task_interceptor.update_task.assert_called_once()
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'ignored_arguments',
+    [{}, {'append': True}, {'metadata_mode': 'merge'}, {'tag': 'master'}],
+    ids=['bare', 'append-only', 'metadata_mode-only', 'tag-only'],
+)
+async def test_update_task_with_no_mutating_field_returns_typed_error(
+    real_task_stack, tmp_path, ignored_arguments,
+):
+    """Task 4867: a fieldless update_task reports failure, never ``updated``.
+
+    esc-3147-7 and esc-3671-7 came from a misnamed ``metadata`` argument being
+    dropped, so the call wrote nothing and still reported success. The
+    refusal reaches callers as the same ``error_type`` dict every other raw
+    backend refusal uses, through the real tool, interceptor and backend. No
+    task is created: the refusal is a floor that precedes the row lookup.
+    """
+    server, _interceptor = real_task_stack
+
+    result = await server._tool_manager.call_tool(
+        'update_task',
+        {'id': '1', 'project_root': str(tmp_path), **ignored_arguments},
+    )
+
+    assert result['error_type'] == 'NoFieldsToUpdateError', result
+    assert result['error'].startswith('TASKMASTER_TOOL_ERROR: '), result
+    assert 'metadata' in result['error'], result
+    assert 'updated' not in result, result
+
+
 # ------------------------------------------------------------------
 # Defensive tool registration (always registered, even without Taskmaster)
 # ------------------------------------------------------------------
@@ -758,6 +951,10 @@ async def test_set_task_status_accepts_merge_deferred(
         reopen_reason=None,
         agent_id=None,
         client_op_id=None,
+        deferral=None,
+        expected_stamped_at=None,
+        restamp_only=False,
+        release_holder=False,
     )
 
 
@@ -860,7 +1057,121 @@ async def test_update_task_accepts_agent_id_and_forwards_existing_kwargs_unchang
         dependencies=None,
         agent_id='recon-stage-7',
         client_op_id=None,
+        expected_text_fp=None,
     )
+
+
+@pytest.mark.asyncio
+async def test_update_task_forwards_expected_text_fp_verbatim(
+    mcp_server_with_tasks, task_interceptor,
+):
+    await mcp_server_with_tasks._tool_manager.call_tool(
+        'update_task',
+        {
+            'id': '1',
+            'project_root': '/project',
+            'details': 'New body.',
+            'expected_text_fp': 'tfp:abc',
+        },
+    )
+
+    _, kwargs = task_interceptor.update_task.call_args
+    assert kwargs['expected_text_fp'] == 'tfp:abc'
+
+
+async def _real_backend_task(real_task_stack, tmp_path, details: str):
+    from _fm_git_repos import _init_git_repo
+
+    server, interceptor = real_task_stack
+    repo = tmp_path / 'repo'
+    repo.mkdir()
+    _init_git_repo(repo)
+    root = str(repo)
+    await interceptor.taskmaster.add_task(
+        project_root=root, title='T', description='Summary.', details=details,
+    )
+
+    async def read() -> dict:
+        return await server._tool_manager.call_tool(
+            'get_task', {'id': '1', 'project_root': root},
+        )
+
+    async def write(**params: object) -> dict:
+        return await server._tool_manager.call_tool(
+            'update_task',
+            {
+                'id': '1', 'project_root': root,
+                'agent_id': 'recon-stage-task_knowledge_sync', **params,
+            },
+        )
+
+    return read, write
+
+
+@pytest.mark.asyncio
+async def test_two_recon_writers_on_one_read_cannot_clobber_each_other(
+    real_task_stack, tmp_path,
+):
+    """Task 4650's user-observable signal: two writers compose against the
+    same read; the first lands and reads back, the second is refused instead
+    of overwriting it, and lands only after re-reading."""
+    read, write = await _real_backend_task(real_task_stack, tmp_path, 'Original body.')
+
+    token_a = (await read())['task_text_fp']
+    token_b = (await read())['task_text_fp']
+
+    landed_a = await write(details='Body from writer A.', expected_text_fp=token_a)
+    assert landed_a['text_verified'] is True, landed_a
+
+    refused_b = await write(details='Body from writer B.', expected_text_fp=token_b)
+    assert refused_b['error_type'] == 'TaskTextBaseStale', refused_b
+    assert (await read())['details'] == 'Body from writer A.'
+
+    reread = await read()
+    landed_b = await write(
+        details=reread['details'] + ' Amended by writer B.',
+        expected_text_fp=reread['task_text_fp'],
+    )
+    assert landed_b['text_verified'] is True, landed_b
+    assert (await read())['details'] == 'Body from writer A. Amended by writer B.'
+
+
+@pytest.mark.asyncio
+async def test_a_recon_append_onto_description_hears_the_backend_floor_first(
+    real_task_stack, tmp_path,
+):
+    read, write = await _real_backend_task(real_task_stack, tmp_path, 'Original body.')
+
+    refused = await write(description='More summary.', append=True)
+
+    assert refused['error_type'] == 'AppendUnsupportedFieldError', refused
+    assert (await read())['description'] == 'Summary.'
+
+
+@pytest.mark.asyncio
+async def test_a_recon_details_append_reads_back_verified_on_the_real_backend(
+    real_task_stack, tmp_path,
+):
+    read, write = await _real_backend_task(real_task_stack, tmp_path, 'Original body.')
+
+    landed = await write(details='Appended section.', append=True)
+
+    assert landed['text_verified'] is True, landed
+    assert (await read())['details'] == 'Original body.\n\nAppended section.'
+
+
+@pytest.mark.asyncio
+async def test_a_recon_trimming_replace_reads_back_verified_on_the_real_backend(
+    real_task_stack, tmp_path,
+):
+    read, write = await _real_backend_task(
+        real_task_stack, tmp_path, 'Para A. Para B is a false premise.',
+    )
+
+    landed = await write(details='Para A.', expected_text_fp=(await read())['task_text_fp'])
+
+    assert landed['text_verified'] is True, landed
+    assert (await read())['details'] == 'Para A.'
 
 
 # ------------------------------------------------------------------
@@ -1169,6 +1480,40 @@ async def test_submit_task_operational_warning_not_merged_when_result_is_error(
     )
     assert 'operational_suggestion_warning' not in result
     assert result.get('error') == 'boom'
+
+
+@pytest.mark.asyncio
+async def test_submit_task_stage2_stamp_does_not_blind_operational_suggestion(
+    mcp_server_with_tasks, task_interceptor,
+):
+    """(d) A machine-injected Stage-2 doc-drift stamp appended to an
+    operational ask must not blind this guard at the WIRE boundary. The
+    stamp's bare "FIX" previously armed the code-change suppression, so the
+    finding was never produced and no warning reached the caller (task 4569,
+    ported from task 4532). Pins that the recovered finding actually flows
+    through the wiring, not just through the unit function -- and that the
+    guard stays WARN-ONLY, so the submission still reaches the
+    interceptor."""
+    task_interceptor.submit_task = AsyncMock(return_value={'ticket': 'tkt_x'})
+    result = await mcp_server_with_tasks._tool_manager.call_tool(
+        'submit_task',
+        {
+            'project_root': '/project',
+            'title': 'Restart fused-memory',
+            'description': (
+                'Restart the fused-memory service and confirm it is back up.'
+                '\n\n[Stage 2 task-knowledge sync 2026-07-07] DOC-DRIFT FIX '
+                '(finding 4e06f01a-cacb-4688-9670-ff6d6ce41baf): the '
+                '`dependencies` array carries 32 entries, but this prose '
+                'previously itemized only 31.'
+            ),
+            'agent_id': 'claude-interactive',
+        },
+    )
+    assert 'operational_suggestion_warning' in result, (
+        f'stamp must not blind the guard at the wire boundary; got: {result!r}'
+    )
+    task_interceptor.submit_task.assert_awaited_once()
 
 
 # ------------------------------------------------------------------
@@ -1622,7 +1967,7 @@ async def test_resolve_ticket_idempotent_passthrough_strips_whitespace(
 
     The MCP wire schema enforces ``ticket: str``, so int passthrough is
     only meaningful at the interceptor layer; it's covered by the
-    ``_looks_like_task_id`` unit tests in test_task_interceptor.py.
+    ``looks_like_task_id`` unit tests in shared/tests/test_task_submit.py.
     """
     from unittest.mock import AsyncMock
     task_interceptor.resolve_ticket = AsyncMock()
@@ -1913,6 +2258,33 @@ async def test_get_task_stamps_project_id(mcp_server_with_tasks, task_intercepto
     assert result.get('id') == 1654
     assert result.get('title') == 'real df task'
     assert result.get('status') == 'done'
+
+
+@pytest.mark.asyncio
+async def test_get_task_carries_the_task_text_fingerprint(
+    mcp_server_with_tasks, task_interceptor,
+):
+    row = {'id': '4650', 'description': 'Summary.', 'details': 'Body.', 'status': 'pending'}
+    task_interceptor.get_task = AsyncMock(return_value=row)
+
+    result = await mcp_server_with_tasks._tool_manager.call_tool(
+        'get_task', {'id': '4650', 'project_root': '/project'},
+    )
+
+    assert result['task_text_fp'] == text_fp_of(row)
+
+
+@pytest.mark.asyncio
+async def test_get_task_error_carries_no_task_text_fingerprint(
+    mcp_server_with_tasks, task_interceptor,
+):
+    task_interceptor.get_task = AsyncMock(return_value={'error': 'Task 4650 not found'})
+
+    result = await mcp_server_with_tasks._tool_manager.call_tool(
+        'get_task', {'id': '4650', 'project_root': '/project'},
+    )
+
+    assert 'task_text_fp' not in result
 
 
 @pytest.mark.asyncio
@@ -2286,6 +2658,247 @@ async def test_submit_task_accepts_none_metadata(
 
 
 # ---------------------------------------------------------------------------
+# Retired-key guard — retired_key_modules_error at the MCP boundary (task 4529)
+#
+# The unit matrix lives in test_retired_key_modules_guard.py. These drive the
+# REAL stack: a NEW submission carrying metadata.modules is rejected on both
+# creation paths and persists nothing, while update_task and commit_planning
+# stay tolerant of the historical carriers already in the corpus
+# (plans/metadata-modules-retirement-prd.md decision 3). Paths are UNOWNED by
+# any project prefix so the interceptor's path-scope guard never answers first.
+# ---------------------------------------------------------------------------
+
+
+async def _seed_modules_carrier(interceptor, root, status='pending'):
+    """Write a historical carrier straight through the backend, bypassing the
+    submit-time guard exactly as every pre-retirement record did."""
+    added = await interceptor.taskmaster.add_task(
+        project_root=root, title='Legacy carrier',
+        metadata=json.dumps({'files': ['src/a.py'], 'modules': ['src']}),
+        status=status,
+    )
+    return added['id']
+
+
+_MODULES_CARRIER_METADATA = {'modules': ['widget'], 'files': ['widget/src/widget/app.py']}
+
+
+async def _submit_carrier_shaped(server, root, planning_mode, metadata):
+    """Submit the one payload both paired tests share, varying only metadata.
+    The description quotes the retired key, which must never trip the guard."""
+    return await server._tool_manager.call_tool(
+        'submit_task',
+        {
+            'project_root': root,
+            'title': 'Declare widget scope',
+            'description': 'metadata.modules is retired; scope is declared in files',
+            'planning_mode': planning_mode,
+            'metadata': metadata,
+        },
+    )
+
+
+_ENCODINGS = pytest.mark.parametrize('encode', [dict, json.dumps], ids=['dict', 'json'])
+_CREATION_PATHS = pytest.mark.parametrize(
+    'planning_mode', [True, False], ids=['planning', 'curator'],
+)
+
+
+@_ENCODINGS
+@_CREATION_PATHS
+@pytest.mark.asyncio
+async def test_submit_task_modules_carrier_returns_retired_key_modules_error(
+    planning_mode, encode, real_task_stack, tmp_path,
+):
+    server, interceptor = real_task_stack
+    root = str(tmp_path)
+
+    result = await _submit_carrier_shaped(
+        server, root, planning_mode, encode(_MODULES_CARRIER_METADATA),
+    )
+
+    assert result.get('error_type') == 'RetiredMetadataKey', f'got {result!r}'
+    assert result['retired_key'] == 'modules'
+    assert result['replacement_key'] == 'files'
+    assert result['error']
+    assert result['hint']
+    assert 'ticket' not in result
+    assert 'task_id' not in result
+    assert await interceptor.get_statuses(root) == {}
+
+
+@_ENCODINGS
+@_CREATION_PATHS
+@pytest.mark.asyncio
+async def test_submit_task_without_modules_key_succeeds(
+    planning_mode, encode, real_task_stack, tmp_path,
+):
+    """Paired positive: the rejected payload minus ``modules`` is accepted, so
+    dropping the key is the whole fix."""
+    server, interceptor = real_task_stack
+    root = str(tmp_path)
+    metadata = {k: v for k, v in _MODULES_CARRIER_METADATA.items() if k != 'modules'}
+
+    result = await _submit_carrier_shaped(server, root, planning_mode, encode(metadata))
+
+    assert 'error' not in result, f'got {result!r}'
+    if planning_mode:
+        assert result.get('status') == 'deferred', f'got {result!r}'
+        persisted = (await interceptor.get_task(result['task_id'], root))['metadata']
+        assert persisted['files'] == metadata['files']
+        assert 'modules' not in persisted
+    else:
+        assert result['ticket'].startswith('tkt_'), f'got {result!r}'
+
+
+@pytest.mark.asyncio
+async def test_update_task_rewrite_of_existing_modules_carrier_is_not_rejected_by_retired_key_modules_error(
+    real_task_stack, tmp_path,
+):
+    """Amendments re-write an existing carrier whole, so the update path must
+    stay tolerant of the key it already holds."""
+    from fused_memory.middleware.task_interceptor import interceptor_write_succeeded
+
+    server, interceptor = real_task_stack
+    root = str(tmp_path)
+    task_id = await _seed_modules_carrier(interceptor, root)
+
+    replaced = await server._tool_manager.call_tool(
+        'update_task',
+        {
+            'id': task_id, 'project_root': root,
+            'metadata': {'files': ['src/a.py'], 'modules': ['src'], 'note': 'rewritten'},
+            'metadata_mode': 'replace',
+        },
+    )
+    assert interceptor_write_succeeded(replaced), replaced
+
+    merged = await server._tool_manager.call_tool(
+        'update_task',
+        {'id': task_id, 'project_root': root, 'metadata': {'note': 'amended'}},
+    )
+    assert interceptor_write_succeeded(merged), merged
+
+    persisted = (await interceptor.get_task(task_id, root))['metadata']
+    assert persisted['modules'] == ['src']
+    assert persisted['note'] == 'amended'
+
+
+@pytest.mark.asyncio
+async def test_commit_planning_of_modules_carrier_is_not_rejected_by_retired_key_modules_error(
+    real_task_stack, tmp_path,
+):
+    """A deferred historical carrier still commits: commit_planning releases
+    existing rows and mints no new carrier."""
+    server, interceptor = real_task_stack
+    root = str(tmp_path)
+    task_id = await _seed_modules_carrier(interceptor, root, status='deferred')
+
+    result = await server._tool_manager.call_tool(
+        'commit_planning', {'project_root': root, 'task_ids': task_id},
+    )
+
+    assert 'error' not in result, result
+    assert await interceptor.get_statuses(root, ids=[task_id]) == {task_id: 'pending'}
+
+
+# ---------------------------------------------------------------------------
+# Simple-task files guard δ — simple_task_files_error at the MCP boundary (task 4524)
+#
+# The unit matrix lives in test_simple_task_files_guard.py. These drive the
+# REAL stack: a complexity='simple' submission with no declared files is
+# rejected on both creation paths and persists nothing, while declaring files
+# (or not declaring simple) is accepted. Paths are UNOWNED by any project
+# prefix so the interceptor's path-scope guard never answers first.
+# ---------------------------------------------------------------------------
+
+
+async def _submit_simple_shaped(server, root, planning_mode, metadata):
+    """Submit the one payload the δ tests share, varying only metadata."""
+    return await server._tool_manager.call_tool(
+        'submit_task',
+        {
+            'project_root': root,
+            'title': 'Rename widget helper',
+            'description': 'Rename the widget helper for clarity',
+            'planning_mode': planning_mode,
+            'metadata': metadata,
+        },
+    )
+
+
+@pytest.mark.parametrize(
+    'metadata',
+    [{'complexity': 'simple'}, {'complexity': 'simple', 'files': []}, {'complexity': ' Simple '}],
+    ids=['files-absent', 'files-empty', 'non-canonical-spelling'],
+)
+@_ENCODINGS
+@_CREATION_PATHS
+@pytest.mark.asyncio
+async def test_submit_task_simple_without_files_returns_simple_task_files_error(
+    planning_mode, encode, metadata, real_task_stack, tmp_path,
+):
+    server, interceptor = real_task_stack
+    root = str(tmp_path)
+
+    result = await _submit_simple_shaped(server, root, planning_mode, encode(metadata))
+
+    assert result.get('error_type') == 'SimpleTaskFilesRequired', f'got {result!r}'
+    assert result['required_key'] == 'files'
+    assert result['error']
+    assert result['hint']
+    assert 'ticket' not in result
+    assert 'task_id' not in result
+    assert await interceptor.get_statuses(root) == {}
+
+
+@_ENCODINGS
+@_CREATION_PATHS
+@pytest.mark.asyncio
+async def test_submit_task_simple_with_files_succeeds(
+    planning_mode, encode, real_task_stack, tmp_path,
+):
+    """Paired positive: the rejected payload plus ``files`` is accepted, so
+    declaring the files is the whole fix."""
+    server, interceptor = real_task_stack
+    root = str(tmp_path)
+    metadata = {'complexity': 'simple', 'files': ['widget/src/widget/app.py']}
+
+    result = await _submit_simple_shaped(server, root, planning_mode, encode(metadata))
+
+    assert 'error' not in result, f'got {result!r}'
+    if planning_mode:
+        assert result.get('status') == 'deferred', f'got {result!r}'
+        persisted = (await interceptor.get_task(result['task_id'], root))['metadata']
+        assert persisted['complexity'] == 'simple'
+        assert persisted['files'] == metadata['files']
+    else:
+        assert result['ticket'].startswith('tkt_'), f'got {result!r}'
+
+
+@pytest.mark.parametrize(
+    'metadata', [{'complexity': 'full'}, {}], ids=['full', 'no-complexity'],
+)
+@_ENCODINGS
+@_CREATION_PATHS
+@pytest.mark.asyncio
+async def test_submit_task_non_simple_without_files_is_not_rejected_by_simple_task_files_error(
+    planning_mode, encode, metadata, real_task_stack, tmp_path,
+):
+    """A fileless full-path task stays legal: its architect derives scope."""
+    server, _ = real_task_stack
+    root = str(tmp_path)
+
+    result = await _submit_simple_shaped(server, root, planning_mode, encode(metadata))
+
+    assert 'error' not in result, f'got {result!r}'
+    if planning_mode:
+        assert result.get('status') == 'deferred', f'got {result!r}'
+    else:
+        assert result['ticket'].startswith('tkt_'), f'got {result!r}'
+
+
+# ---------------------------------------------------------------------------
 # Lock-charter guard γ — commit_planning wiring tests (step-7 RED / step-8 GREEN)
 # ---------------------------------------------------------------------------
 
@@ -2516,6 +3129,7 @@ async def test_commit_planning_stamps_manifest_and_copies_delivered_checks(
         'missing_labels': [],
         'errors': [],
     }
+    assert 'manifest_stamping_action_required' not in result
 
     alpha_task = await server._tool_manager.call_tool(
         'get_task', {'id': alpha_id, 'project_root': root},
@@ -2570,6 +3184,68 @@ async def test_commit_planning_stamps_manifest_and_copies_delivered_checks(
     reloaded = yaml.safe_load(sidecar_path.read_text(encoding='utf-8'))
     by_label = {t['label']: t['task_id'] for t in reloaded['tasks']}
     assert by_label == {'alpha': int(alpha_id), 'beta': int(beta_id)}
+
+
+@pytest.mark.asyncio
+async def test_commit_planning_surfaces_unlabeled_task_without_blocking_flip(
+    real_task_stack, tmp_path,
+):
+    """A PRD-bound task whose label sits under a near-miss key never blocks
+    the flip, but the response carries a top-level action list naming it.
+    Repairing the key and re-running commit_planning on the now-pending task
+    stamps the label and clears the action list."""
+    plans_dir = tmp_path / 'plans'
+    plans_dir.mkdir()
+    sidecar_path = plans_dir / 'foo-prd.capability-manifest.yaml'
+    sidecar_path.write_text(_FOO_PRD_SIDECAR_YAML, encoding='utf-8')
+
+    server, _interceptor = real_task_stack
+    root = str(tmp_path)
+
+    submitted = await server._tool_manager.call_tool(
+        'submit_task',
+        {
+            'project_root': root,
+            'title': 'Producer alpha',
+            'planning_mode': True,
+            'metadata': {
+                'files': ['src/alpha.py'],
+                'prd_path': 'plans/foo-prd.md',
+                'prd_label': 'alpha',
+            },
+        },
+    )
+    assert submitted['status'] == 'deferred', f'got {submitted!r}'
+    task_id = submitted['task_id']
+
+    result = await server._tool_manager.call_tool(
+        'commit_planning', {'project_root': root, 'task_ids': task_id},
+    )
+
+    task = await server._tool_manager.call_tool(
+        'get_task', {'id': task_id, 'project_root': root},
+    )
+    assert task['status'] == 'pending'
+    assert result['manifest_stamping']['near_miss_keys'] == [
+        {'task_id': task_id, 'key': 'prd_label', 'value': 'alpha', 'sidecar_label': 'alpha'},
+    ]
+    action = result['manifest_stamping_action_required']
+    assert action
+    assert any(task_id in line for line in action)
+
+    await server._tool_manager.call_tool(
+        'update_task',
+        {'id': task_id, 'project_root': root, 'metadata': {'prd_task_label': 'alpha'}},
+    )
+    rerun = await server._tool_manager.call_tool(
+        'commit_planning', {'project_root': root, 'task_ids': task_id},
+    )
+
+    assert rerun['manifest_stamping']['stamped'] == ['alpha']
+    assert 'manifest_stamping_action_required' not in rerun
+    reloaded = yaml.safe_load(sidecar_path.read_text(encoding='utf-8'))
+    by_label = {t['label']: t['task_id'] for t in reloaded['tasks']}
+    assert by_label == {'alpha': int(task_id), 'beta': None}
 
 
 @pytest.mark.asyncio
@@ -2662,6 +3338,467 @@ tasks:
     # The flip PROCEEDED despite the malformed sidecar.
     assert gamma_task['status'] == 'pending'
     assert 'delivered_checks' not in gamma_task['metadata']
+
+
+# ---------------------------------------------------------------------------
+# commit_planning delivered_check POLARITY gate (task 3500, step-11 RED /
+# step-12 GREEN)
+#
+# The invariant: a sound delivered_check FAILS at the authoring tree and
+# PASSES once its producer lands. `commit_planning` runs BEFORE the task is
+# implemented, so HEAD *is* the pre-task tree — a check that is already green
+# here can never signal anything, and one that can never go green wedges its
+# dependent forever (the measured 5799 -> 5919 wedge).
+#
+# Modelled on the lock-charter commit_planning exemplar above: same
+# `mcp_server_with_tasks`/`task_interceptor` fixtures, same `get_task`
+# side_effect shape, same `_tool_manager.call_tool` invocation, and the same
+# all-or-nothing `set_task_status.assert_not_called()` assertion. The one
+# addition is a REAL git repo — the gate greps a tree, so a synthetic
+# `/project` root cannot exercise a verdict (it exercises the fail-open-on-
+# infra path instead, which is step-13's business).
+# ---------------------------------------------------------------------------
+
+#: Token COMMITTED into the polarity fixture repo. An `expect='present'`
+#: grep for it already matches at the authoring tree -> vacuous_present.
+_POLARITY_COMMITTED_TOKEN = 'AlreadyLandedSymbol'
+#: Token absent from the fixture repo. An `expect='present'` grep for it is
+#: the healthy forward-looking majority case; an `expect='absent'` grep for
+#: it is already satisfied -> vacuous_absent.
+_POLARITY_FUTURE_TOKEN = 'NotYetWrittenSymbol'
+#: Token committed into BOTH fixture files. An `expect='absent'` grep for it
+#: is healthy under the 2x2 (it still matches, so it can go green) but is
+#: over-broad relative to a task declaring only the seed file -> warn.
+_POLARITY_WIDE_TOKEN = 'WidelyUsedSymbol'
+_POLARITY_SEED_REL = 'src/seeded.py'
+_POLARITY_OTHER_REL = 'src/other.py'
+
+
+def _run_polarity_git(root, *args):
+    subprocess.run(
+        ['git', '-C', str(root), *args], check=True, capture_output=True, text=True,
+    )
+
+
+@pytest.fixture
+def polarity_repo(tmp_path):
+    """A real one-commit git repo whose tree contains _POLARITY_COMMITTED_TOKEN.
+
+    Returns the repo root as a str, ready to pass as ``project_root`` — the
+    autouse ``passthrough_main_checkout`` fixture makes ``resolve_main_checkout``
+    the identity, so the path arrives at the gate unchanged.
+    """
+    root = tmp_path / 'polarity_repo'
+    root.mkdir()
+    subprocess.run(
+        ['git', 'init', '-b', 'main', str(root)],
+        check=True, capture_output=True, text=True,
+    )
+    _run_polarity_git(root, 'config', 'user.email', 'polarity-test@example.com')
+    _run_polarity_git(root, 'config', 'user.name', 'Polarity Test')
+    seed = root / _POLARITY_SEED_REL
+    seed.parent.mkdir(parents=True, exist_ok=True)
+    seed.write_text(
+        f'class {_POLARITY_COMMITTED_TOKEN}:\n'
+        f'    pass\n'
+        f'\n'
+        f'{_POLARITY_WIDE_TOKEN} = 1\n',
+        encoding='utf-8',
+    )
+    other = root / _POLARITY_OTHER_REL
+    other.write_text(f'use({_POLARITY_WIDE_TOKEN})\n', encoding='utf-8')
+    _run_polarity_git(root, 'add', _POLARITY_SEED_REL, _POLARITY_OTHER_REL)
+    _run_polarity_git(root, 'commit', '-m', 'seed the authoring tree')
+    return str(root)
+
+
+def _grep_check(name, pattern, expect, paths=None):
+    """A minimal metadata.delivered_checks entry."""
+    return {
+        'name': name,
+        'kind': 'grep',
+        'pattern': pattern,
+        'expect': expect,
+        'paths': list(paths or []),
+    }
+
+
+@pytest.mark.asyncio
+async def test_commit_planning_rejects_vacuous_present_check(
+    mcp_server_with_tasks, task_interceptor, polarity_repo,
+):
+    """A check already green at the authoring tree rejects the WHOLE batch.
+
+    The 5799 shape: the producer asserted ``expect=present`` for a pattern its
+    own diff was scoped to REMOVE, so the pattern was necessarily present when
+    the check was written — the check passed on day one, gated nothing, and its
+    dependent dispatched as if unguarded.
+    """
+    async def _get_task(tid, *args, **kwargs):
+        if tid == '43':
+            return {
+                'id': '43',
+                'metadata': {
+                    'files': [_POLARITY_SEED_REL],
+                    'delivered_checks': [
+                        _grep_check(
+                            'seeded-symbol-present',
+                            _POLARITY_COMMITTED_TOKEN,
+                            'present',
+                            [_POLARITY_SEED_REL],
+                        ),
+                    ],
+                },
+            }
+        return {'id': tid, 'metadata': {'files': ['a/b.py']}}
+
+    task_interceptor.get_task = AsyncMock(side_effect=_get_task)
+    task_interceptor.set_task_status = AsyncMock()
+
+    result = await mcp_server_with_tasks._tool_manager.call_tool(
+        'commit_planning',
+        {'project_root': polarity_repo, 'task_ids': '42,43'},
+    )
+
+    assert result.get('error_type') == 'DeliveredCheckPolarityViolation'
+    # The offending task id and check name must both be in the error message.
+    assert '43' in result.get('error', '')
+    assert 'seeded-symbol-present' in result.get('error', '')
+    codes = [c['code'] for c in result.get('checks', [])]
+    assert codes == ['vacuous_present'], f'got {result.get("checks")!r}'
+    # All-or-nothing: the gate runs BEFORE the flip, exactly like lock-charter.
+    task_interceptor.set_task_status.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_commit_planning_rejects_vacuous_absent_check(
+    mcp_server_with_tasks, task_interceptor, polarity_repo,
+):
+    """The symmetric cell: expect='absent' for a pattern already absent."""
+    task_interceptor.get_task = AsyncMock(
+        return_value={
+            'id': '44',
+            'metadata': {
+                'files': [_POLARITY_SEED_REL],
+                'delivered_checks': [
+                    _grep_check(
+                        'future-symbol-gone', _POLARITY_FUTURE_TOKEN, 'absent',
+                    ),
+                ],
+            },
+        },
+    )
+    task_interceptor.set_task_status = AsyncMock()
+
+    result = await mcp_server_with_tasks._tool_manager.call_tool(
+        'commit_planning',
+        {'project_root': polarity_repo, 'task_ids': '44'},
+    )
+
+    assert result.get('error_type') == 'DeliveredCheckPolarityViolation'
+    assert '44' in result.get('error', '')
+    codes = [c['code'] for c in result.get('checks', [])]
+    assert codes == ['vacuous_absent'], f'got {result.get("checks")!r}'
+    task_interceptor.set_task_status.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_commit_planning_rejects_a_check_naming_a_declared_file(
+    mcp_server_with_tasks, task_interceptor, polarity_repo,
+):
+    """MODE 3 as task 3536 measured it: the pattern is the name of a file the
+    task declares but has not created, so only metadata.files reveals it."""
+    declared = 'tests/test_zeta_strand.py'
+    task_interceptor.get_task = AsyncMock(
+        return_value={
+            'id': '46',
+            'metadata': {
+                'files': [declared],
+                'delivered_checks': [
+                    _grep_check('strand-suite-exists', 'test_zeta_strand', 'present', ['tests/']),
+                ],
+            },
+        },
+    )
+    task_interceptor.set_task_status = AsyncMock()
+
+    result = await mcp_server_with_tasks._tool_manager.call_tool(
+        'commit_planning',
+        {'project_root': polarity_repo, 'task_ids': '46'},
+    )
+
+    assert result.get('error_type') == 'DeliveredCheckPolarityViolation'
+    assert [c['code'] for c in result.get('checks', [])] == ['filename_shaped']
+    assert declared in result['checks'][0]['message']
+    task_interceptor.set_task_status.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_commit_planning_accepts_forward_looking_present_check(
+    mcp_server_with_tasks, task_interceptor, polarity_repo,
+):
+    """The healthy MAJORITY case commits normally and reports no polarity error.
+
+    An ``expect='present'`` grep for a symbol the producer has not written yet
+    fails at the authoring tree and passes once it lands — a 0->N transition,
+    which is exactly what a dep-gate is for. The gate must be invisible here.
+    """
+    task_interceptor.get_task = AsyncMock(
+        return_value={
+            'id': '45',
+            'metadata': {
+                'files': [_POLARITY_SEED_REL],
+                'delivered_checks': [
+                    _grep_check(
+                        'new-symbol-present', _POLARITY_FUTURE_TOKEN, 'present',
+                    ),
+                ],
+            },
+        },
+    )
+    task_interceptor.set_task_status = AsyncMock(return_value={'success': True})
+
+    result = await mcp_server_with_tasks._tool_manager.call_tool(
+        'commit_planning',
+        {'project_root': polarity_repo, 'task_ids': '45'},
+    )
+
+    assert result.get('error_type') != 'DeliveredCheckPolarityViolation'
+    assert result == {'success': True}
+    task_interceptor.set_task_status.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_commit_planning_lock_charter_still_wins_over_polarity(
+    mcp_server_with_tasks, task_interceptor, polarity_repo,
+):
+    """When one task violates BOTH gates, lock-charter is the reported one.
+
+    Ordering assertion: the polarity lint is layered AFTER the existing
+    directory-lock scan inside the same loop, so the new gate can never mask
+    the one already in place.
+    """
+    task_interceptor.get_task = AsyncMock(
+        return_value={
+            'id': '46',
+            'metadata': {
+                'files': ['orchestrator/'],
+                'delivered_checks': [
+                    _grep_check(
+                        'seeded-symbol-present',
+                        _POLARITY_COMMITTED_TOKEN,
+                        'present',
+                    ),
+                ],
+            },
+        },
+    )
+    task_interceptor.set_task_status = AsyncMock()
+
+    result = await mcp_server_with_tasks._tool_manager.call_tool(
+        'commit_planning',
+        {'project_root': polarity_repo, 'task_ids': '46'},
+    )
+
+    assert result.get('error_type') == 'LockCharterViolation'
+    assert 'orchestrator/' in result.get('directory_paths', [])
+    task_interceptor.set_task_status.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# commit_planning polarity gate — SCOPING, fail-open-on-infra, and
+# response-shape stability (task 3500, step-13 RED / step-14 GREEN)
+#
+# These are the properties that keep the rest of this file green. The gate is
+# fail-closed on a VERDICT and fail-open on INFRASTRUCTURE: an unevaluable
+# check must degrade toward the pre-gate status quo (task commits, dependent
+# dispatches ungated) and be LOUDLY reported, never toward the wedge the gate
+# exists to prevent, and never toward a silent pass.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_commit_planning_polarity_fails_open_on_non_git_root(
+    mcp_server_with_tasks, task_interceptor,
+):
+    """A non-git project_root reports 'errored', it does not reject.
+
+    `/project` (and `real_task_stack`'s bare tmp_path) are not git trees, so
+    the lint cannot reach a verdict there. Blocking would redden this whole
+    file and would halt planning on any non-git root; silently passing would
+    make an availability failure read as a clean bill of health. The third
+    option — report it and commit — is the only one that is both.
+    """
+    task_interceptor.get_task = AsyncMock(
+        return_value={
+            'id': '50',
+            'metadata': {
+                'files': ['src/seeded.py'],
+                'delivered_checks': [
+                    _grep_check('unevaluable-check', 'AnySymbol', 'present'),
+                ],
+            },
+        },
+    )
+    task_interceptor.set_task_status = AsyncMock(return_value={'success': True})
+
+    result = await mcp_server_with_tasks._tool_manager.call_tool(
+        'commit_planning',
+        {'project_root': '/project', 'task_ids': '50'},
+    )
+
+    assert result.get('error_type') != 'DeliveredCheckPolarityViolation'
+    task_interceptor.set_task_status.assert_called_once()
+    warnings = result.get('delivered_check_warnings')
+    assert warnings, f'an unevaluable check must be REPORTED, got {result!r}'
+    assert [w['severity'] for w in warnings] == ['errored']
+    assert warnings[0]['name'] == 'unevaluable-check'
+    assert warnings[0]['task_id'] == '50'
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('target_status', ['cancelled', 'deferred'])
+async def test_commit_planning_polarity_gate_is_pending_scoped(
+    mcp_server_with_tasks, task_interceptor, polarity_repo, target_status,
+):
+    """A reject-tier batch still commits at a non-'pending' target status.
+
+    `pending` is the only status that releases a task for scheduling, and so
+    the only one at which its delivered_checks begin gating dependents.
+    Gating a `cancelled`/`deferred` commit would block cleanup of exactly the
+    mis-authored batch the author is trying to discard.
+    """
+    task_interceptor.get_task = AsyncMock(
+        return_value={
+            'id': '51',
+            'metadata': {
+                'files': [_POLARITY_SEED_REL],
+                'delivered_checks': [
+                    _grep_check(
+                        'seeded-symbol-present',
+                        _POLARITY_COMMITTED_TOKEN,
+                        'present',
+                        [_POLARITY_SEED_REL],
+                    ),
+                ],
+            },
+        },
+    )
+    task_interceptor.set_task_status = AsyncMock(return_value={'success': True})
+
+    result = await mcp_server_with_tasks._tool_manager.call_tool(
+        'commit_planning',
+        {
+            'project_root': polarity_repo,
+            'task_ids': '51',
+            'target_status': target_status,
+        },
+    )
+
+    assert result.get('error_type') != 'DeliveredCheckPolarityViolation'
+    task_interceptor.set_task_status.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_commit_planning_reports_absent_overbroad_as_warning(
+    mcp_server_with_tasks, task_interceptor, polarity_repo,
+):
+    """An over-broad expect='absent' check commits AND is reported.
+
+    MODE 2 is genuinely undecidable at authoring time — task 3534's pattern
+    legitimately matched inside the very file it owned — so on a hard gate a
+    false reject costs more than a missed catch. It lands as a warn.
+    """
+    task_interceptor.get_task = AsyncMock(
+        return_value={
+            'id': '52',
+            'metadata': {
+                # Declares ONLY the seed file, but the pattern also matches
+                # src/other.py, which this task does not own.
+                'files': [_POLARITY_SEED_REL],
+                'delivered_checks': [
+                    _grep_check('wide-symbol-gone', _POLARITY_WIDE_TOKEN, 'absent'),
+                ],
+            },
+        },
+    )
+    task_interceptor.set_task_status = AsyncMock(return_value={'success': True})
+
+    result = await mcp_server_with_tasks._tool_manager.call_tool(
+        'commit_planning',
+        {'project_root': polarity_repo, 'task_ids': '52'},
+    )
+
+    assert result.get('error_type') != 'DeliveredCheckPolarityViolation'
+    task_interceptor.set_task_status.assert_called_once()
+    warnings = result.get('delivered_check_warnings')
+    assert warnings, f'an over-broad absent check must be reported, got {result!r}'
+    assert [(w['name'], w['code'], w['severity']) for w in warnings] == [
+        ('wide-symbol-gone', 'absent_overbroad', 'warn'),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_commit_planning_clean_batch_response_is_byte_identical(
+    mcp_server_with_tasks, task_interceptor, polarity_repo,
+):
+    """A clean batch's response gains NO new key.
+
+    `delivered_check_warnings` is attached only when non-empty, following the
+    precedent `manifest_stamping` already sets — the exact
+    `result == {'success': True}` assertions elsewhere in this file depend on
+    it.
+    """
+    task_interceptor.get_task = AsyncMock(
+        return_value={
+            'id': '53',
+            'metadata': {
+                'files': [_POLARITY_SEED_REL],
+                'delivered_checks': [
+                    _grep_check(
+                        'new-symbol-present',
+                        _POLARITY_FUTURE_TOKEN,
+                        'present',
+                        [_POLARITY_SEED_REL],
+                    ),
+                ],
+            },
+        },
+    )
+    task_interceptor.set_task_status = AsyncMock(return_value={'success': True})
+
+    result = await mcp_server_with_tasks._tool_manager.call_tool(
+        'commit_planning',
+        {'project_root': polarity_repo, 'task_ids': '53'},
+    )
+
+    assert result == {'success': True}
+    assert 'delivered_check_warnings' not in result
+
+
+@pytest.mark.asyncio
+async def test_commit_planning_polarity_gate_tolerates_malformed_metadata(
+    mcp_server_with_tasks, task_interceptor, polarity_repo,
+):
+    """An unparseable metadata JSON string commits normally and never crashes.
+
+    Benign-absent: an unreadable blob means "no checks to lint" here. A gate
+    that raised on a metadata shape it was not built to catch would take down
+    planning for a defect it does not even diagnose.
+    """
+    task_interceptor.get_task = AsyncMock(
+        return_value={'id': '54', 'metadata': '{not valid json'},
+    )
+    task_interceptor.set_task_status = AsyncMock(return_value={'success': True})
+
+    result = await mcp_server_with_tasks._tool_manager.call_tool(
+        'commit_planning',
+        {'project_root': polarity_repo, 'task_ids': '54'},
+    )
+
+    assert result == {'success': True}
+    assert 'delivered_check_warnings' not in result
+    task_interceptor.set_task_status.assert_called_once()
 
 
 # ---------------------------------------------------------------------------

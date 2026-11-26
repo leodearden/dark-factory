@@ -35,7 +35,7 @@
 #                          DIR (/home/leo/src/warm-lanes/worktrees), NOT the XFS mount
 #                          point (/home/leo/src/warm-lanes).
 #                          Derives: WORKTREES_DIR=$MOUNT (lanes live directly under it),
-#                                   BASE_TARGET=$(dirname "$MOUNT")/base/target
+#                                   BASE_TARGET=<parent of $MOUNT>/base/target
 #                                   (the XFS-sibling base dir, one level up from
 #                                   the worktrees-dir).
 #                          The two scripts consume the shared value differently:
@@ -52,21 +52,26 @@
 #                          Required unless --mount is given (or env override set).
 #   --base-target SYMLINK  Symlink at <base>/target → <base>/target.gen.N.
 #                          Required unless --mount is given (or env override set).
-#                          Resolved to its concrete .gen.N dir before invoking α.
+#                          Resolved to its concrete .gen.N dir per lane,
+#                          immediately before each α reseed.
 #   --main-ref REF         Git ref for "main" branch (default: main).
 #   --lane-glob GLOB       Glob matching pool-lane entries (default: _lane-*,_spec-*).
 #                          Matched entries are reset via α, not removed.
-#   --protect-glob GLOB    Glob matching entries to never touch (default:
-#                          _merge-*,_mainprobe-*,_mainsweep-*,_solo-*,
-#                          _substrate-gate-*,_offline-deep,_iact-*). Matched
-#                          entries are skipped entirely. This is the full set
-#                          of orchestrator-managed non-pool worktree kinds
-#                          dark-factory mints directly under the warm-lane
-#                          mount (git_ops.py ephemeral_worktree /
-#                          PROTECTED_PREFIXES); none of them may ever be
-#                          orphan-removed by Pass 2 — e.g. _mainprobe-*/
-#                          _mainsweep-* must survive while a background
-#                          integrity sweep is live (task 5221).
+#   --protect-glob GLOB    Glob matching entries to never touch. Matched entries
+#                          are skipped entirely. The DEFAULT is the full set of
+#                          orchestrator-managed non-pool worktree kinds
+#                          dark-factory mints directly under the warm-lane mount,
+#                          RENDERED from the registry (git_ops.py
+#                          PROTECTED_PREFIXES) via lib_lane_state.sh's
+#                          lane_protect_glob, minus the pool bands this sweep
+#                          owns; none of those kinds may ever be orphan-removed
+#                          by Pass 2 — e.g. _mainprobe-*/_mainsweep-* must
+#                          survive while a background integrity sweep is live
+#                          (task 5221). Run `lane_protect_glob _lane- _spec-` to
+#                          see the effective set for this deployment; it honours
+#                          REIFY_WARM_LANE_IACT_PREFIX. A failed render warns and
+#                          degrades to lib_lane_state.sh's static backstop, never
+#                          to an empty glob (task 3292).
 #   --extra-protect-glob GLOB
 #                          Additive protect glob (opt-in): ADDS to (never
 #                          replaces) the --protect-glob set above, comma-joined,
@@ -83,15 +88,42 @@
 #                          REIFY_WARM_LANE_GC_EXTRA_PROTECT_GLOB (any non-empty
 #                          value = on). Off by default.
 #   --seed-script PATH     Path to the α seed primitive (default: sibling seed-warm-lane.sh).
-#                          Overridable for hermetic testing.
+#                          Overridable for hermetic testing. A seed script that
+#                          is missing or not executable is never invoked and
+#                          never discards: the lane is preserved with target/
+#                          untouched (README.md "Delta 13").
 #   --disk-pressure        Fast-path: reclaim a lane by `rm -rf <lane>/target`
 #                          instead of invoking the α reflink-reseed clone — no
 #                          transient 2×-space requirement. Valid because
 #                          acquire_lane always re-seeds from base (D10 §9.5).
 #                          Applies to every flock-free lane in Pass 1
 #                          (always-reclaim); counted as `reset` in the
-#                          summary. Default: REIFY_WARM_LANE_GC_DISK_PRESSURE
-#                          (any non-empty value = on). Off by default.
+#                          summary. ALSO DOWNGRADES the Pass-1 record gate: an
+#                          assigned/in_use record stops being decisive and the
+#                          lane falls through to the LIVE-REFERENCE gate
+#                          instead of being preserved outright (task 5504).
+#                          The emergency therefore trades an AUTHORITATIVE
+#                          preserve for a PROBED one, never for none — a live
+#                          build is still protected. Default:
+#                          REIFY_WARM_LANE_GC_DISK_PRESSURE (any non-empty
+#                          value = on). Off by default.
+#   --max-record-age-days N
+#                          Upper bound on how old an assigned/in_use record may
+#                          be and still be decisive. A record whose `updated_at`
+#                          is older than N days is DOWNGRADED exactly as under
+#                          --disk-pressure: the lane falls through to the
+#                          live-reference gate instead of being preserved
+#                          (task 5504). N is a plain non-negative integer of at
+#                          most 5 digits with NO leading zero; anything else
+#                          exits 2 rather than risk meaning something other
+#                          than what was typed. `0` disables the bound — the
+#                          explicit escape hatch back to an unbounded
+#                          preserve. Default:
+#                          REIFY_WARM_LANE_GC_MAX_RECORD_AGE_DAYS, else 14 —
+#                          twice dark-factory's stock lane_stale_report_days
+#                          (7.0), so the daily digest's `## Stale lane
+#                          assignments` census reports a lane for a fortnight
+#                          before this sweep acts on it.
 #   -h, --help             Print this message and exit.
 #
 # Exit codes:
@@ -99,7 +131,8 @@
 #   1  — Runtime error: could not resolve required argument (e.g. base-target symlink).
 #   2  — Usage/WIRING error: unknown flag, missing subcommand, missing required
 #        option, or a missing sibling library (scripts/lib_live_refs.sh,
-#        scripts/lib_lane_state.sh). The library case is a wiring error, not a
+#        scripts/lib_lane_state.sh, scripts/lib_lane_seed.sh). The library
+#        case is a wiring error, not a
 #        runtime one: nothing about the
 #        invocation could have avoided it and no retry will fix it — the
 #        deployment is incomplete. Same class as an unknown flag, hence 2.
@@ -110,12 +143,17 @@
 #   REIFY_WARM_LANE_GC_BASE_TARGET      — default --base-target
 #   REIFY_WARM_LANE_GC_MAIN_REF         — default --main-ref (default: main)
 #   REIFY_WARM_LANE_GC_LANE_GLOB        — default --lane-glob
-#   REIFY_WARM_LANE_GC_PROTECT_GLOB     — default --protect-glob
+#   REIFY_WARM_LANE_GC_PROTECT_GLOB     — default --protect-glob. Any non-empty
+#                                         value also SHORT-CIRCUITS the registry
+#                                         render before it runs (task 3292).
 #   REIFY_WARM_LANE_GC_EXTRA_PROTECT_GLOB — default --extra-protect-glob (any
 #                                         non-empty value = on); off by default
 #   REIFY_WARM_LANE_GC_SEED_SCRIPT      — default --seed-script
 #   REIFY_WARM_LANE_GC_DISK_PRESSURE    — default --disk-pressure (any non-empty
 #                                         value = on); off by default
+#   REIFY_WARM_LANE_GC_MAX_RECORD_AGE_DAYS
+#                                       — default --max-record-age-days
+#                                         (default: 14; `0` disables the bound)
 #
 # Design notes:
 #   - --mount is the dark-factory consumer interface.  Dark-factory passes the same
@@ -124,7 +162,7 @@
 #       THIS script (gc.sh): --mount = the WORKTREES DIR.  The value is assigned to
 #         WORKTREES_DIR directly, and BASE_TARGET is derived from its PARENT:
 #           WORKTREES_DIR  = <--mount value>
-#           BASE_TARGET    = $(dirname <--mount value>)/base/target
+#           BASE_TARGET    = <parent of the --mount value>/base/target
 #         On the real host: --mount = /home/leo/src/warm-lanes/worktrees, so
 #           WORKTREES_DIR = /home/leo/src/warm-lanes/worktrees
 #           BASE_TARGET   = /home/leo/src/warm-lanes/base/target
@@ -178,12 +216,14 @@
 #     and only accretes disk. Task 5326's rule survives VERBATIM for a lane that
 #     is genuinely FREE; what task 3075 changed is that FREE is now DETERMINED
 #     from dark-factory's record rather than APPROXIMATED from the flock.
-#     Pass 1 has THREE preserve gates, checked in this order: (1) the
+#     Pass 1 has FOUR gates, checked in this order: (1) the
 #     live-consumer flock (inv.2); (2) the durable LANE RECORD (task 3075);
-#     (3) a live PROCESS REFERENCE at or under the lane dir (cwd / open fd /
-#     mmap — task 5572). The record sits BETWEEN the other two because it is
-#     both the cheaper and the more decisive predicate — see the record gate's
-#     own note in Pass 1. This subsumes the former Tier-3 terminal-task reclaim
+#     (3) SKIP-UNCHANGED, a lane nothing has written to since its last seed on
+#     the current gen (task 7859, off under --disk-pressure; README.md
+#     "Delta 14"); (4) a live PROCESS REFERENCE at or under the lane dir
+#     (cwd / open fd / mmap — task 5572). The record sits BEFORE the /proc
+#     walk because it is both the cheaper and the more decisive predicate —
+#     see the record gate's own note in Pass 1. This subsumes the former Tier-3 terminal-task reclaim
 #     (task 5167): the rebase-orphan ahead-of-main lane it targeted is now
 #     reclaimed by the general rule. Pass 2 keeps the clean+landed
 #     _is_reclaimable rule.
@@ -193,7 +233,8 @@
 #     i.e. not pool lanes, so the orchestrator mints no LaneLifecycle record for
 #     them by construction. A read there would be dead code that returns
 #     `unknown` for every candidate while implying a coverage that does not
-#     exist. live_ref_present remains their liveness guard (Block Q pins it).
+#     exist. live_ref_present remains their liveness guard
+#     (test_warm_lane_gc.sh Block Q pins it).
 #   - Live-reference gate (task 5572, both passes): the inv.2 flock is held only
 #     across the ACQUIRE reseed, NOT across the consumer's long cargo verify
 #     build, so during that build the flock is FREE and always-reclaim would wipe
@@ -258,18 +299,38 @@
 #     pre-mark live entries was CONSIDERED and rejected: it costs one extra full
 #     scan and only breaks even once ≥2 entries are live at pass start, which a
 #     pool at rest never is.
-#   - α reuse: resolve base symlink → concrete gen, hold flock -s during α call
-#     (D8 reader-refcount seam; same contract as the acquire path).
+#     AMENDED by task 8089: the fd/cwd walk is narrowed and live_ref_present
+#     re-measured, superseding the per-call live_ref_present figures above
+#     (~1.9s; ~1.5s cwd/fd, ~0.38s maps), and so leaving the ~2-3 min pool
+#     figure, which scales with them, stale (not re-measured); current
+#     per-call figures: lib_live_refs.sh's MEASURED COST. The ~1ms record read
+#     and the ~18ms _is_reclaimable git pair are unaffected.
+#   - α reuse: the base symlink is resolved to its concrete gen PER LANE, and
+#     flock -s is held on that gen during that lane's α call (D8 reader-refcount
+#     seam; same contract as the acquire path). If no gen can be pinned the seed
+#     is not invoked and the lane is left cold (reset_cold). Rationale for the
+#     per-lane pin and the re-check once locked: test_warm_lane_gc.sh Block T.
 #   - Safety-ranked order: reset lanes first (cheap), then remove orphans (destructive).
 #   - Stdout: machine-readable summary line only —
 #     `reclaim: reset=N removed=N preserved=N preserved_live_ref=N
-#     preserved_assigned=N`. New fields are APPENDED so prefix-matching
+#     preserved_assigned=N downgraded_assigned=N reset_cold=N
+#     skipped_unchanged=N`. New fields are APPENDED so prefix-matching
 #     consumers keep working.
 #     Stderr: all diagnostics (info/ok/warn/err).
 
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# dirname by PARAMETER EXPANSION, not a fork: a PATH without dirname yields an
+# EMPTY substitution, `cd ""` succeeds as a no-op, and SCRIPT_DIR silently becomes
+# the CALLER'S CWD. See README.md "Delta 7".
+_src="${BASH_SOURCE[0]}"
+_dir='.'
+case "$_src" in
+    */*) _dir="${_src%/*}"
+         [ -n "$_dir" ] || _dir='/' ;;
+esac
+SCRIPT_DIR="$(cd "$_dir" && pwd)"
+unset _src _dir
 
 # Shared live-reference /proc scanner (live_ref_present). Fail LOUDLY if it is
 # missing: a silently-absent liveness guard is precisely the failure mode task
@@ -293,14 +354,24 @@ source "$SCRIPT_DIR/lib_live_refs.sh"
 # incomplete, the same class as an unknown flag.
 #
 # Ordered AFTER the lib_live_refs.sh guard deliberately: a copy carrying neither
-# sibling must still report the live-refs one first, which is what Block A9's
-# asserted message pins.
+# sibling must still report the live-refs one first, which is what
+# test_warm_lane_gc.sh A9's asserted message pins.
 if [ ! -f "$SCRIPT_DIR/lib_lane_state.sh" ]; then
     echo "warm-lane-gc.sh: ERROR — scripts/lib_lane_state.sh not found next to warm-lane-gc.sh" >&2
     exit 2
 fi
 # shellcheck source=scripts/lib_lane_state.sh
 source "$SCRIPT_DIR/lib_lane_state.sh"
+
+# The Pass-1 skip-unchanged predicate (lane_seed_unchanged), task 7859. Same
+# guard, same exit 2, for the same reason; ordered after the two above so each
+# missing sibling still names itself (test_warm_lane_gc_native.sh A12).
+if [ ! -f "$SCRIPT_DIR/lib_lane_seed.sh" ]; then
+    echo "warm-lane-gc.sh: ERROR — scripts/lib_lane_seed.sh not found next to warm-lane-gc.sh" >&2
+    exit 2
+fi
+# shellcheck source=scripts/lib_lane_seed.sh
+source "$SCRIPT_DIR/lib_lane_seed.sh"
 
 # ── log helpers (all write to stderr) ─────────────────────────────────────────
 info()  { printf '\033[1;34m[info]\033[0m  %s\n' "$*" >&2; }
@@ -331,38 +402,84 @@ Usage: $(basename "$0") reclaim --mount WORKTREE_BASE [OPTIONS]
   Optional options:
     --main-ref REF        Git ref for 'main' (default: main).
     --lane-glob GLOB      Glob for pool-lane entries (default: _lane-*,_spec-*).
-    --protect-glob GLOB   Glob for protected entries (default:
-                          _merge-*,_mainprobe-*,_mainsweep-*,_solo-*,
-                          _substrate-gate-*,_offline-deep,_iact-*) — the full
-                          set of orchestrator-managed non-pool worktree kinds,
-                          which must never be orphan-removed (e.g. ephemeral
-                          verify/sweep worktrees while a background integrity
-                          sweep is live).
+    --protect-glob GLOB   Glob for protected entries. Default: the full set of
+                          orchestrator-managed non-pool worktree kinds, rendered
+                          from the registry (see lane_protect_glob in
+                          lib_lane_state.sh), which must never be orphan-removed
+                          (e.g. ephemeral verify/sweep worktrees while a
+                          background integrity sweep is live).
     --extra-protect-glob GLOB
                           Additive protect glob: ADDS to (never replaces) the
                           --protect-glob set, so a caller protects extra entries
                           without restating the default list (default:
                           REIFY_WARM_LANE_GC_EXTRA_PROTECT_GLOB). Off by default.
     --seed-script PATH    Path to α seed primitive (default: sibling seed-warm-lane.sh).
-    --disk-pressure       Fast-path: reclaim via `rm -rf <lane>/target` instead
+                          A missing or non-executable seed script is never
+                          invoked and never discards: the lane is preserved
+                          with target/ untouched (README.md "Delta 13").
+    --disk-pressure       Fast-path: reclaim via \`rm -rf <lane>/target\` instead
                           of the α reflink-reseed clone (default:
                           REIFY_WARM_LANE_GC_DISK_PRESSURE). Off by default.
+                          ALSO downgrades the Pass-1 record gate: an
+                          assigned/in_use record stops being decisive and the
+                          lane falls through to the live-reference gate rather
+                          than being preserved. Never reclaims an assigned lane
+                          outright — a live build keeps its /proc backstop, and
+                          the lane flock is untouched.
+    --max-record-age-days N
+                          Downgrade an assigned/in_use record whose \`updated_at\`
+                          is older than N days, the same way --disk-pressure
+                          does (default: REIFY_WARM_LANE_GC_MAX_RECORD_AGE_DAYS,
+                          else 14 — twice dark-factory's stock
+                          lane_stale_report_days, so the digest's stale-lane
+                          census reports a lane for a fortnight first). N is a
+                          plain non-negative integer of at most 5 digits with
+                          NO leading zero — \`08\` and \`010\` are rejected rather
+                          than read as octal, and an overflowing magnitude is
+                          rejected rather than wrapped. \`0\` disables the bound.
     -h, --help            Print this message and exit.
 
   Exit codes:
     0  — Completed sweep (per-candidate failures warn + continue).
     1  — Runtime error (e.g. base-target symlink unresolvable).
-    2  — Usage/wiring error (incl. a missing sibling scripts/lib_live_refs.sh).
+    2  — Usage/wiring error (incl. a missing sibling scripts/lib_*.sh).
 
   Output:
     stdout: machine-readable summary:
-            reclaim: reset=N removed=M preserved=K preserved_live_ref=L preserved_assigned=A
+            reclaim: reset=N removed=M preserved=K preserved_live_ref=L preserved_assigned=A downgraded_assigned=D reset_cold=C skipped_unchanged=S
             (L is the share of K held back by a live process reference — the
              only preserve reason that can shield an entry indefinitely)
             (A is the share of K held back by dark-factory's own durable lane
              record reading assigned/in_use — the only preserve reason that is
-             AUTHORITATIVE rather than a probe, and one that self-clears when
-             the lane is released)
+             AUTHORITATIVE rather than a probe. It self-clears only when the
+             release's DURABLE WRITE succeeds, which a full disk can stop it
+             doing; --disk-pressure (acute) and --max-record-age-days (chronic)
+             are the two bounds that keep such a record from holding the ENOSPC
+             valve shut. Both land in D. Full account: README.md "Delta 10".)
+            (D is the count of lanes whose assigned/in_use record was
+             DOWNGRADED — read, believed, and then deliberately made
+             non-decisive. Downgrade means the lane FALLS THROUGH to the
+             live-reference gate; it is NOT a reclaim, so a downgraded lane
+             ended the pass in one of FOUR states: reset (warm, or cold —
+             see C), preserved via preserved_live_ref, preserved because
+             the reset did not happen — the disk-pressure rm failed, the seed
+             script was not invocable, or the discard after a refusing seed
+             failed — or skipped unchanged (see S).
+             A and D partition the assigned lanes that REACHED the Pass-1
+             record gate — an assigned lane the protect glob skipped in the
+             enumeration loop, or the flock gate preserved first, is in
+             NEITHER, so A+D is not the pass's whole assigned population.)
+            (C is the share of N left COLD because the α seed REFUSED — its
+             uncertified target/ discarded here, or nothing staged to
+             discard — or because no base generation could be pinned to seed
+             from; reify PRD docs/prds/warm-lane-pool-cow-seeding.md §9.5
+             inv.13. A seed script that is missing or not executable is never
+             invoked, so its lane is in K, not in N or C: README.md
+             "Delta 13".)
+            (S is the count of lanes skipped because nothing was written to
+             their cache since their last seed on the current base
+             generation; a skipped lane is in neither N nor K. Never under
+             --disk-pressure. README.md "Delta 14".)
     stderr: all diagnostics.
 EOF
 }
@@ -380,6 +497,11 @@ EXTRA_PROTECT_GLOB="${REIFY_WARM_LANE_GC_EXTRA_PROTECT_GLOB:-}"
 SEED_SCRIPT="${REIFY_WARM_LANE_GC_SEED_SCRIPT:-}"
 # Disk-pressure fast-path (task 5167): any non-empty value = on; off by default.
 DISK_PRESSURE="${REIFY_WARM_LANE_GC_DISK_PRESSURE:-}"
+# Staleness bound on the Pass-1 record gate (task 5504); defaulted below.
+MAX_RECORD_AGE_DAYS="${REIFY_WARM_LANE_GC_MAX_RECORD_AGE_DAYS:-}"
+# Resolve→lock→verify rounds _reseed_lane_pinned makes before giving up on a lane.
+# A constant, not a knob: it only has to stop a dangling base from looping.
+readonly _BASE_GEN_PIN_ATTEMPTS=3
 
 # ── arg parsing ────────────────────────────────────────────────────────────────
 SUBCOMMAND=""
@@ -414,6 +536,9 @@ while [ $# -gt 0 ]; do
             SEED_SCRIPT="$2"; shift 2 ;;
         --disk-pressure)
             DISK_PRESSURE="1"; shift ;;
+        --max-record-age-days)
+            [ $# -ge 2 ] || { err "--max-record-age-days requires a value"; exit 2; }
+            MAX_RECORD_AGE_DAYS="$2"; shift 2 ;;
         reclaim)
             SUBCOMMAND="reclaim"; shift ;;
         -*)
@@ -437,9 +562,35 @@ fi
 # ── apply --mount derivation (before required-options validation) ──────────────
 # --mount sets WORKTREES_DIR and BASE_TARGET when not already set by explicit flags.
 # Explicit --worktrees-dir / --base-target always override the derived values.
+#
+# The parent of $MOUNT comes from PARAMETER EXPANSION, not a `dirname` fork —
+# see README.md "Delta 7". This is the same trim-then-`%/*` shape as
+# lib_lane_state.sh L141-146, and the guards are load-bearing, because the
+# derived VALUE must stay exactly what the header comments above document:
+#   - the `%/` trim: dirname "/a/b/wt/" is "/a/b", but a bare "${MOUNT%/*}"
+#     would give "/a/b/wt" — a trailing slash on --mount is plausible operator
+#     input, and this is the one edge where the naive form silently misderives.
+#   - BOTH empty-result guards: "${MOUNT%/}" is empty for MOUNT=/ and
+#     "${_mnt_trimmed%/*}" is empty for MOUNT=/worktrees; dirname answers "/"
+#     in both cases, so each needs its own `|| ...='/'`.
+#   - the `*/*` case: for a slashless relative MOUNT=worktrees, dirname gives
+#     "." where "${MOUNT%/*}" leaves it unchanged.
+# Verified equal to `dirname` over /worktrees, worktrees, /a/b/wt, /a/b/wt/, /,
+# ., ./x and the real host value. Not equal for MULTIPLE trailing slashes
+# (--mount /a/b//), which the single `%/` trim leaves at /a/b — stated rather
+# than papered over; it matches lib_lane_state.sh's existing behaviour and
+# --mount is documented above as a directory path.
 if [ -n "$MOUNT" ]; then
     [ -n "$WORKTREES_DIR" ] || WORKTREES_DIR="$MOUNT"
-    [ -n "$BASE_TARGET"   ] || BASE_TARGET="$(dirname "$MOUNT")/base/target"
+    _mnt_trimmed="${MOUNT%/}"
+    [ -n "$_mnt_trimmed" ] || _mnt_trimmed='/'
+    _mnt_parent='.'
+    case "$_mnt_trimmed" in
+        */*) _mnt_parent="${_mnt_trimmed%/*}"
+             [ -n "$_mnt_parent" ] || _mnt_parent='/' ;;
+    esac
+    [ -n "$BASE_TARGET" ] || BASE_TARGET="$_mnt_parent/base/target"
+    unset _mnt_trimmed _mnt_parent
 fi
 
 # ── validate required options ──────────────────────────────────────────────────
@@ -458,17 +609,53 @@ fi
 
 # ── apply defaults for optional globs and seed-script ─────────────────────────
 [ -n "$LANE_GLOB" ]    || LANE_GLOB="_lane-*,_spec-*"
-# This list mirrors dark-factory's PROTECTED_PREFIXES worktree-kind inventory
-# (git_ops.py) — every orchestrator-managed non-pool worktree kind minted
-# directly under the warm-lane mount. Keeping the full set here means Pass 2
+# The default protect set is RENDERED from dark-factory's PROTECTED_PREFIXES
+# registry (git_ops.py) through lib_lane_state.sh's lane_protect_glob — every
+# orchestrator-managed non-pool worktree kind minted directly under the warm-lane
+# mount, MINUS the pool bands this sweep owns. Having the full set means Pass 2
 # (destructive orphan removal) can only ever target genuine pool lanes
 # (_lane-*/_spec-*, handled by Pass 1's reset instead) and genuine cold
 # non-underscore orphans (e.g. legacy task-*) — never a live managed worktree
 # such as an ephemeral _mainsweep-*/_mainprobe-* verify sweep (task 5221).
-# _merge-* MUST stay first/present: it is _merge-verify's ONLY gc protection
-# (dark-factory's .merge_verify.lock is a different path gc never inspects),
-# so this list only ever grows, never narrows an existing prefix.
-[ -n "$PROTECT_GLOB" ] || PROTECT_GLOB="_merge-*,_mainprobe-*,_mainsweep-*,_solo-*,_substrate-gate-*,_offline-deep,_iact-*"
+#
+# It is NOT restated here in prose. This used to be a hand-copied literal
+# carrying a comment that asked for a cross-repo hand-sync; that request is now
+# retired, because the duplication it was managing is gone. Re-stating the
+# rendered contents in this comment would just re-create the same INV-5 mirror
+# one layer up, with the same silent failure mode: a band added to
+# PROTECTED_PREFIXES that nobody mirrors becomes a live managed worktree the
+# reaper happily removes. To see the effective set, run
+# `lane_protect_glob _lane- _spec-` (task 3292).
+#
+# `_lane- _spec-` are the bands THIS sweep owns, and must never come back as
+# protected: protecting them would make gc skip every lane in both passes, so a
+# python3 outage would FREEZE reclaim rather than degrade it — and a frozen
+# reclaim is what accreted the pool to the 2026-07-10 ENOSPC outage. See
+# PROTECT_GLOB_OWNED_POOL_BANDS in git_ops.py.
+#
+# The interactive band is honoured per-deployment via REIFY_WARM_LANE_IACT_PREFIX
+# (dark-factory's `git.iact_prefix` is config, not a constant — a deployment that
+# renamed it had the old literal protecting a band it never mints while omitting
+# the band it does, the dangerous direction). Pinned by
+# test_warm_lane_gc_native.sh Block X-band.
+#
+# The `||` is load-bearing, not stylistic: this script runs `set -euo pipefail`,
+# and lane_protect_glob fails LOUD (one [warn] naming the failing stage, EMPTY
+# stdout, non-zero) precisely so a failed render can never read as "nothing is
+# protected". Without the fallback the non-zero return would abort a
+# timer-driven reclaim sweep; with it, a failed render costs one visible [warn]
+# line and degrades to the machine-checked static backstop
+# (LANE_PROTECT_GLOB_FALLBACK, gated by
+# orchestrator/tests/test_lane_state_lib.py::TestProtectGlobFallbackDrift) —
+# never an empty glob. Pinned by test_warm_lane_gc_native.sh Block X-degrade.
+#
+# An explicit --protect-glob / REIFY_WARM_LANE_GC_PROTECT_GLOB still wins, and
+# short-circuits the bridge before it runs: the render costs one interpreter
+# start per INVOCATION (not per lane), so a caller that already knows its set
+# never pays for one.
+[ -n "$PROTECT_GLOB" ] || \
+    PROTECT_GLOB="$(lane_protect_glob _lane- _spec-)" || \
+    PROTECT_GLOB="$LANE_PROTECT_GLOB_FALLBACK"
 # Extra additive protect glob (task 5378): --extra-protect-glob /
 # REIFY_WARM_LANE_GC_EXTRA_PROTECT_GLOB ADDS to (never replaces) the effective
 # protect set — comma-joined onto whatever PROTECT_GLOB resolved to above
@@ -486,6 +673,98 @@ fi
 if [ -z "$SEED_SCRIPT" ]; then
     SEED_SCRIPT="$SCRIPT_DIR/seed-warm-lane.sh"
 fi
+
+# ── the Pass-1 record gate's staleness bound (task 5504) ──────────────────────
+# WHY 14. It is twice dark-factory's stock `lane_stale_report_days` (7.0), so
+# the daily digest's `## Stale lane assignments` census surfaces a lane for a
+# FORTNIGHT before this sweep acts on it — FOR THE POPULATION THAT CENSUS
+# COVERS, which is not every record this bound reaches. The census skips any
+# record whose backing task is terminal or unknown, so report-before-act holds
+# exactly where destruction is riskiest (a lane whose task is still
+# pending/in-progress/blocked) and deliberately NOT for an ENOSPC-stranded
+# record whose task has since gone terminal — nothing in the tree ever reports
+# that one, and acting on it unreported is the INTENT rather than a gap.
+# The ordering is machine-checked rather than merely documented:
+# orchestrator/tests/test_harness_warm_lane_gc.py fails the build if the config
+# field's DEFAULT ever rises past this one (defaults are all it can see; a
+# deployment that raises lane_stale_report_days in YAML is outside its reach).
+# 14d is also an enormous multiple of the longest expected task (hours), so a
+# genuinely live long-running task can never trip it.
+#
+# The bound REUSES harness.py::_stale_lane_assignment_census's definition rather
+# than re-deriving one: same field (`updated_at`), same "age greater than a days
+# threshold" predicate, same handling of an empty/unparseable value. What is NOT
+# reused is the ACTION. The census is report-only by explicit design and its
+# "never auto-reclaimed" statement is about RELEASING the lane assignment; this
+# deletes only `target/`, leaving the record `assigned` and
+# refs/heads/task/NNNN intact for acquire_lane to re-seed (D10 §9.5,
+# sizing-lifecycle T1).
+[ -n "$MAX_RECORD_AGE_DAYS" ] || MAX_RECORD_AGE_DAYS=14
+
+# A MISCONFIGURED BOUND IS FATAL, not fail-open, and this is the one place in
+# this script where fail-open is the wrong answer: EVERY way of arriving at a
+# bound other than the one typed — silently defaulted, silently zeroed,
+# negative, a LEADING ZERO read as octal by `$(( … * 86400 ))`, or a magnitude
+# that wraps that multiply negative — is INVISIBLE in the summary line.
+# README.md "Delta 10" records each door and what it measurably did, and why
+# the `^[0-9]+$` first cut — copied from warm-lane-gc-sweep.sh's
+# --critical-free-gib guard, where the octal flaw is inert — rejected junk and
+# negatives and nothing else. `00`, `010` and `9223372036854775807` all sailed
+# through it.
+#
+# Three properties of `^(0|[1-9][0-9]{0,4})$` are load-bearing and must survive
+# any edit here:
+#   * `0|` is the DOCUMENTED disable hatch. Arriving at zero is forbidden;
+#     TYPING it is not, and the difference is that one is silent.
+#   * a leading `[1-9]` kills every leading-zero spelling in one class.
+#   * THE 5-DIGIT CAP IS NOT COSMETIC — do not "simplify" `{0,4}` back to `+`.
+#     It is what makes 64-bit overflow UNREACHABLE: the largest accepted
+#     product is 99999 * 86400 = 8639913600, ~9 orders of magnitude under 2^63,
+#     and 99999 days is ~273 years, so it constrains no real operator.
+#
+# REJECTION, NOT NORMALIZATION. `$((10#$MAX_RECORD_AGE_DAYS))` would make `010`
+# mean 10 and is deliberately not used: the value is interpolated VERBATIM into
+# the downgrade reason below, so normalizing needs a second variable kept in
+# sync with the first, or the message names a different number than the one
+# applied.
+#
+# The error names the ENV VAR as well as the flag — a real second door into
+# this same guard, and an operator who used it would otherwise get an error
+# naming only a flag they never passed. Exit 2, the usage/WIRING class.
+if ! [[ "$MAX_RECORD_AGE_DAYS" =~ ^(0|[1-9][0-9]{0,4})$ ]]; then
+    err "REIFY_WARM_LANE_GC_MAX_RECORD_AGE_DAYS (or --max-record-age-days) must be a non-negative integer of at most 5 digits, with no leading zero (days); got: '$MAX_RECORD_AGE_DAYS'"
+    err "Run '$(basename "$0") --help' for usage."
+    exit 2
+fi
+MAX_RECORD_AGE_SECS=$(( MAX_RECORD_AGE_DAYS * 86400 ))
+
+# REDUNDANT BACKSTOP (heuristic 10). With the regex above this can only ever
+# fire on a bug, which is the point: it converts any residual arithmetic
+# failure into the correct exit class AT THE BOUNDARY, before a single lane is
+# touched, instead of a `set -u` abort mid-Pass-1 with exit 1 and no summary
+# line. NOTE there is deliberately no `MAX_RECORD_AGE_SECS=0` pre-assignment
+# before the multiply: it looks like the same belt-and-braces and is the
+# opposite, because 0 means "bound disabled" — a swallowed arithmetic failure
+# would silently open the very hole this guard exists to close.
+if ! [[ "${MAX_RECORD_AGE_SECS:-}" =~ ^[0-9]+$ ]]; then
+    err "internal: --max-record-age-days $MAX_RECORD_AGE_DAYS did not yield a non-negative seconds bound; got: '${MAX_RECORD_AGE_SECS:-}'"
+    exit 2
+fi
+
+# The clock is read ONCE per invocation, not once per lane.
+#
+# That is NOT the up-front-snapshot TOCTOU test_warm_lane_gc_native.sh
+# Block S-toctou forbids. What that test forbids is hoisting the per-lane
+# RECORD READ — one verdict computed once and then consumed across a 25-40
+# minute traversal, which is how a lane assigned mid-pass got reset out from
+# under a live agent. The record read stays firmly inside the loop; a THRESHOLD
+# is not a per-lane verdict.
+#
+# The resulting drift is the pass duration against a days-scale bound, so it
+# cannot flip a verdict at any plausible margin, and it drifts CONSERVATIVE:
+# lanes visited later in the pass are judged against an older cutoff, so they
+# are preserved rather than reclaimed. The idiom is warm-lane-audit.sh::NOW_EPOCH's.
+NOW_EPOCH="$(date +%s)"
 
 # ── helper: name matches a glob pattern ───────────────────────────────────────
 # _matches_glob <name> <comma-separated-globs>
@@ -518,7 +797,7 @@ _is_git_worktree() {
 _is_reclaimable() {
     local dir="$1"
     local name
-    name="$(basename "$dir")"
+    name="${dir##*/}"
 
     # (a) dirty tracked changes
     local dirty
@@ -542,6 +821,122 @@ _is_reclaimable() {
     return 0
 }
 
+# _record_gate_downgrade_reason <lane-name>
+# Prints a human reason when the AUTHORITATIVE lane record must stop being
+# decisive for the lane whose LANE_STATE_* globals are currently published, and
+# prints NOTHING when the gate stands. The OBSERVATION comes from the globals,
+# never from arguments, so it is necessarily the same one the gate is about to
+# act on; <lane-name> is carried purely so a degraded read can name itself on
+# stderr.
+#
+# The reasons are ORTHOGONAL dimensions of "the record is not decisive", OR'd
+# here at one site rather than nested into the loop body:
+#   ACUTE   — an emergency is in progress. About the whole pass, not one record.
+#   CHRONIC — this one record is too old to be believed. About one record, not
+#             the pass. (Added in task 5504's staleness step.)
+# Adding a third reason means adding a leg here, not another branch at the call
+# site, and each leg's own wording keeps the reasons separately attributable in
+# dark-factory's logs.
+_record_gate_downgrade_reason() {
+    local name="$1"
+    # ACUTE, and deliberately FIRST. --disk-pressure means the disk is at or
+    # below its critical floor and reclaim IS the response; an authoritative
+    # record that says "assigned" is exactly what a stranded ENOSPC-at-release
+    # record says, so believing it here is believing the failure's own alibi.
+    # Ordering it first also makes the valve immune to the chronic leg's
+    # fail-safe: no unreadable timestamp can hold the emergency shut.
+    if [ -n "$DISK_PRESSURE" ]; then
+        printf '%s' '--disk-pressure emergency override'
+        return 0
+    fi
+
+    # CHRONIC. A record whose last write (a lane-state transition, or the
+    # refresh a REUSE dispatch stamps — task 7863) is older than the bound is
+    # not a claim about a live task any more; it is a claim nobody has
+    # rewritten. Two producers, and the digest's `## Stale lane assignments`
+    # census covers only ONE of them. A lane whose task is still
+    # pending/in-progress/blocked is skipped BY DESIGN by harness.py's
+    # terminal-status reclaim, censused for a fortnight, and then finally acted
+    # on by this bound — report-before-act, exactly where destruction is
+    # riskiest. A release whose durable write hit ENOSPC and was swallowed
+    # (fail-open release, invariant I3) is NEVER censused: that census skips a
+    # record whose backing task is terminal, and a finished task's is. Acting
+    # unreported on that one is the intent — nothing else in the tree ever
+    # will.
+    [ "$MAX_RECORD_AGE_SECS" -gt 0 ] || return 0   # 0 = bound disabled
+
+    # FAIL SAFE — preserve, loudly — when the age cannot be judged: an absent
+    # `updated_at` (lane_state_read publishes ''), a value `date -d` refuses,
+    # or a non-GNU `date` that cannot parse ISO-8601 at all. This is the
+    # OPPOSITE direction to the state read's documented FAIL OPEN, and the
+    # asymmetry is the point. The two reads answer different questions: a
+    # readable `assigned` state is a trustworthy claim about STATE, so a bad
+    # timestamp leaves only the AGE unknown. Reclaiming on that would let a
+    # malformed field delete a genuinely live lane's build — strictly worse
+    # than one extra sweep of preservation. It is also verbatim the policy
+    # harness.py::_stale_lane_assignment_census documents for the same field
+    # ("a record with an empty/unparseable `updated_at` is skipped").
+    #
+    # The acute valve is NOT subject to this: --disk-pressure is evaluated
+    # FIRST and returns before this leg runs, so no unreadable timestamp can
+    # hold the ENOSPC valve shut. That ordering is load-bearing, not incidental
+    # line order — test_warm_lane_gc_native.sh Block S-age-degrade Arm B
+    # asserts it directly.
+    #
+    # ONE warn per affected lane, and the channel stays anomaly-only: a real
+    # producer (LaneLifecycle.transition or LaneLifecycle.refresh_assigned)
+    # always stamps the field, so this fires only on a record something wrote
+    # wrong. Degrading SILENTLY would be worse than the bound not existing —
+    # `downgraded_assigned=0` would read as "nothing was stale" when it means
+    # "nothing could be judged".
+    # The parse, and its `date -d ''` gotcha, live in
+    # lib_lane_state.sh::lane_state_epoch.
+    local record_epoch
+    if ! record_epoch="$(lane_state_epoch "$LANE_STATE_UPDATED_AT")"; then
+        warn "$name: cannot judge lane-state record age (updated_at='$LANE_STATE_UPDATED_AT') — the staleness bound does not apply, so the record's preserve stands"
+        return 0
+    fi
+    local age_secs=$(( NOW_EPOCH - record_epoch ))
+    if [ "$age_secs" -gt "$MAX_RECORD_AGE_SECS" ]; then
+        printf 'record updated_at=%s is %dd old, past the --max-record-age-days %s bound' \
+            "$LANE_STATE_UPDATED_AT" "$(( age_secs / 86400 ))" "$MAX_RECORD_AGE_DAYS"
+    fi
+    return 0
+}
+
+# ── seed-presence guard (dark-factory only) ────────────────────────────────────
+# True when SEED_SCRIPT can be invoked at all. The single home of the predicate
+# that keeps an ABSENT seed from reaching the discard below: dark-factory ships no
+# seed-warm-lane.sh, so the sibling default is routinely missing, and bash's
+# 126/127 for it is a non-zero status no seed ever produced. Why, and why it is
+# checked ahead of everything else in the α branch: README.md "Delta 13".
+_seed_script_invocable() { [ -f "$SEED_SCRIPT" ] && [ -x "$SEED_SCRIPT" ]; }
+
+# ── per-lane base-generation pin ───────────────────────────────────────────────
+# Print the concrete target.gen.N BASE_TARGET points at right now. The single
+# home of the D8 resolve rule: the seed needs the concrete path, because cp -a
+# copies a symlink rather than its target.
+_resolve_base_gen() { readlink -f "$BASE_TARGET" 2>/dev/null; }
+
+# _reseed_lane_pinned <lane>: reseed <lane> from the gen BASE_TARGET resolves to
+# now, under that gen's D8 reader lock (FD 9, scoped to this ( ) body). The gen is
+# re-checked once locked; why, and why per lane: test_warm_lane_gc.sh Block T.
+_reseed_lane_pinned() (
+    local lane="$1" gen="" attempt
+    for (( attempt = 1; attempt <= _BASE_GEN_PIN_ATTEMPTS; attempt++ )); do
+        gen="$(_resolve_base_gen)" || break
+        [ -d "$gen" ] || continue
+        if exec 9>>"${gen}.lock" && flock -s 9 && [ -d "$gen" ]; then
+            info "pinned base gen $gen for ${lane##*/}"
+            "$SEED_SCRIPT" "$gen" "$lane" --fresh-checkout --assume-lane-lock-held
+            return
+        fi
+        exec 9>&-
+    done
+    err "cannot pin a base generation for ${lane##*/}: $BASE_TARGET resolves to ${gen:-<unresolvable>}, which is missing or could not be locked"
+    return 1
+)
+
 # ── reclaim subcommand ─────────────────────────────────────────────────────────
 _do_reclaim() {
     local reset_count=0
@@ -561,24 +956,65 @@ _do_reclaim() {
     # Sub-count of preserved_count attributable to the Pass-1 lane-record gate
     # (task 3075). Reported SEPARATELY from preserved_live_ref_count, not folded
     # into it, because the two shares mean opposite things about pool health: a
-    # rising preserved_assigned is a BUSY pool and self-clears the moment
-    # dark-factory releases the lane, whereas a rising preserved_live_ref can
-    # shield a lane INDEFINITELY. One combined number would hide a permanently
-    # shielded pool behind ordinary business.
+    # rising preserved_assigned is usually a BUSY pool, whereas a rising
+    # preserved_live_ref can shield a lane INDEFINITELY. One combined number
+    # would hide a permanently shielded pool behind ordinary business.
+    #
+    # "Usually", because the record self-clears only when the release's DURABLE
+    # WRITE succeeds — WarmLanePool._note_released_durable swallows OSError by
+    # design (fail-open release, invariant I3), so an ENOSPC at release strands
+    # `assigned` on disk — and because a lane whose backing task is still
+    # non-terminal is skipped BY DESIGN by harness.py's terminal-status reclaim.
+    # Either way nothing rewrites the record, and an unbounded preserve made
+    # that permanent (task 5504). --disk-pressure (acute) and
+    # --max-record-age-days (chronic) are the two bounds; both land in
+    # downgraded_assigned_count below. Full account: README.md "Delta 10".
     local preserved_assigned_count=0
+    # Count of lanes whose assigned/in_use record was read, believed, and then
+    # deliberately made NON-DECISIVE. Disjoint from preserved_assigned_count by
+    # construction — a lane that REACHES this gate takes one branch or the other
+    # — so the two partition the assigned lanes that reached it. That is not the
+    # pass's whole assigned population: a lane the protect glob skipped in the
+    # enumeration loop, or the flock gate preserved first, reaches neither
+    # branch and is counted in neither.
+    #
+    # Counted separately rather than folded into reset_count because a downgrade
+    # is not an outcome: a downgraded lane falls through to the live-reference
+    # gate and may still be preserved there. D rising is the signal that the
+    # pool's authoritative records are being overridden, which is exactly the
+    # thing an operator wants to see explicitly rather than infer from a
+    # preserved_assigned that quietly stopped rising.
+    local downgraded_assigned_count=0
+    # Sub-count of reset_count left COLD rather than warm: lanes a REFUSING α
+    # seed left with no usable target/ — whether it aborted fail-closed onto the
+    # uncertified clone this script then discarded (§9.5 inv.13 caller
+    # obligation) or refused before staging one at all, leaving nothing to
+    # discard — and lanes for which no base generation could be pinned, so no
+    # seed ran at all. These are not distinguishable from here (see the discard
+    # branch) and need not be: what the count names is the lane's OUTCOME — reset to
+    # nothing — not which guard produced it. Reported separately because a bare
+    # reset=N cannot distinguish a lane reset WARM — the normal, valuable
+    # outcome — from one reset to nothing, and a fail-closed seed abort is
+    # rarely per-lane: inv.12 predicts that a bad base generation makes EVERY
+    # acquire against it abort identically, degrading the whole pool to cold
+    # fallback. A rising reset_cold is that degradation becoming visible; the
+    # per-lane warns on stderr name WHICH lanes and carry the seed's own [error]
+    # lines, which name the offending paths. A seed that could not be invoked at
+    # all is NOT counted here: its lane is preserved (see _seed_script_invocable).
+    local reset_cold_count=0
+    # Lanes the skip-unchanged gate left alone: in NEITHER reset nor preserved,
+    # because an unchanged lane has nothing to reclaim (README.md "Delta 14").
+    local skipped_unchanged_count=0
 
     info "warm-lane-gc.sh reclaim: worktrees_dir=$WORKTREES_DIR  base_target=$BASE_TARGET  main_ref=$MAIN_REF"
 
-    # Resolve the base-target symlink to its concrete gen dir (D8 seam).
-    # α requires the concrete path — cp -a copies the symlink otherwise.
-    local resolved_gen
-    if ! resolved_gen="$(readlink -f "$BASE_TARGET" 2>/dev/null)"; then
+    # Argument check only. readlink -f fails when a directory on the path is
+    # missing but accepts a missing final component, so a dangling base passes
+    # here and is handled per lane by _reseed_lane_pinned.
+    if ! _resolve_base_gen >/dev/null; then
         err "Cannot resolve base-target symlink: $BASE_TARGET"
         return 1  # runtime error; exit 2 is reserved for usage/wiring errors
     fi
-    local gen_lock="${resolved_gen}.lock"
-    touch "$gen_lock" 2>/dev/null || true
-    info "  resolved_gen=$resolved_gen  gen_lock=$gen_lock"
 
     # Enumerate all immediate subdirs in the worktrees-dir.
     # We collect entries first so we can do safety-ranked two-pass order:
@@ -593,7 +1029,10 @@ _do_reclaim() {
         # Strip trailing slash
         entry="${entry%/}"
         [ -d "$entry" ] || continue
-        name="$(basename "$entry")"
+        # Leaf by parameter expansion (README.md "Delta 7"): an EMPTY $name here
+        # matches NEITHER glob below, so a protected _merge-*/_iact-* entry would
+        # fall through to orphan_candidates.
+        name="${entry##*/}"
 
         # Skip protected entries entirely — count them as preserved in the summary
         # (they are not reclaimed, which is the user-visible meaning of "preserved").
@@ -619,7 +1058,7 @@ _do_reclaim() {
     # ── Pass 1: reset reclaimable lanes ───────────────────────────────────────
     local lane
     for lane in "${lane_candidates[@]+${lane_candidates[@]}}"; do
-        name="$(basename "$lane")"
+        name="${lane##*/}"
         local lane_lock="${WORKTREES_DIR}/${name}.lock"
 
         # Acquire the lane lock NON-BLOCKING in the PARENT shell so the same
@@ -635,11 +1074,12 @@ _do_reclaim() {
         fi
 
         # ── Pass-1 record gate (task 3075, reify esc-5334-6) ─────────────────
-        # Pass 1 has THREE preserve gates, checked in this order:
+        # Pass 1 has FOUR gates, checked in this order:
         #   (1) the live-consumer flock (inv.2) — acquired above;
         #   (2) THIS gate: dark-factory's own durable lane record at
         #       <worktrees-dir>/.lane-state/<lane>.json;
-        #   (3) a live PROCESS REFERENCE at or under the lane dir (task 5572).
+        #   (3) skip-unchanged (task 7859) — below, off under --disk-pressure;
+        #   (4) a live PROCESS REFERENCE at or under the lane dir (task 5572).
         #
         # The record is read BEFORE the /proc walk because it is BOTH the
         # cheaper and the more decisive predicate — cheapest-decisive-first, the
@@ -666,14 +1106,22 @@ _do_reclaim() {
         #     its protect CSV once and consumed it across a sweep that ran
         #     06:32-06:59 BST while _lane-5 dropped OUT of the protect set at
         #     06:32; and that same sweep reset _lane-5 at 20:55Z while a task-5334
-        #     agent session started 20:36Z was live (PRD §2). Block S-toctou goes
-        #     RED against any such hoist.
+        #     agent session started 20:36Z was live (PRD §2).
+        #     test_warm_lane_gc_native.sh Block S-toctou goes RED against any
+        #     such hoist.
         #   - UNDER the flock this loop already holds, so the read and the reset
         #     share one critical section and nothing can reassign the lane
         #     between verdict and action.
         #   - BEFORE both reset branches below (the --disk-pressure rm and the α
-        #     reseed), so neither path can bypass it — the same "before BOTH
-        #     branches" property Block K5 pins for the live-reference gate.
+        #     reseed), so neither path can bypass the READ — the same "before
+        #     BOTH branches" property test_warm_lane_gc.sh Block K5 pins for
+        #     the live-reference gate.
+        #     Its VERDICT, however, is advisory under --disk-pressure: see the
+        #     downgrade below. Evaluated-before is not the same as
+        #     decisive-always, and conflating the two is what let a stranded
+        #     record hold the ENOSPC valve shut (task 5504). The live-reference
+        #     gate below IS decisive on both paths, which is why a downgrade
+        #     falls through to it rather than reclaiming.
         #   - AFTER the flock acquire, so a flock-held lane keeps its own
         #     distinct diagnostic and all three preserve reasons stay
         #     distinguishable in dark-factory's logs.
@@ -693,21 +1141,37 @@ _do_reclaim() {
         local lane_class
         lane_class="$(lane_state_class "$LANE_STATE_RAW")"
         if [ "$lane_class" = "ASSIGNED" ]; then
-            exec 8>&-
-            # The `(state=<raw>)` suffix keeps the PRD-pinned prefix
-            # `preserving _lane-5: assigned to task 5334` matching as a
-            # substring while surfacing `in_use` vs `assigned` — the distinction
-            # leaf δ will begin writing and leaf ε depends on. A record with no
-            # task_id gets its OWN wording: `assigned to task ` with an empty id
-            # would be a dangling fact.
+            # The `assigned to task N` / `assigned, no task id` split is shared
+            # by the preserve and downgrade wordings, so it is resolved once:
+            # `assigned to task ` with an empty id would be a dangling fact.
+            local assigned_desc
             if [ -n "$LANE_STATE_TASK_ID" ]; then
-                warn "preserving $name: assigned to task $LANE_STATE_TASK_ID (state=$LANE_STATE_RAW)"
+                assigned_desc="assigned to task $LANE_STATE_TASK_ID"
             else
-                warn "preserving $name: assigned, no task id in record (state=$LANE_STATE_RAW)"
+                assigned_desc="assigned, no task id in record"
             fi
-            preserved_count=$((preserved_count + 1))
-            preserved_assigned_count=$((preserved_assigned_count + 1))
-            continue
+            local downgrade_reason
+            downgrade_reason="$(_record_gate_downgrade_reason "$name")"
+            if [ -n "$downgrade_reason" ]; then
+                # DOWNGRADE, not reclaim. FD 8 stays OPEN and there is no
+                # `continue`: the lane falls through to the live-reference gate
+                # below, still inside this critical section. So the emergency
+                # trades an AUTHORITATIVE preserve for a PROBED one, never for
+                # none — a live build keeps its /proc backstop, and Pass 2's
+                # conservative _is_reclaimable rule is untouched.
+                warn "downgrading record gate for $name: $downgrade_reason (state=$LANE_STATE_RAW, $assigned_desc); falling through to the live-reference gate"
+                downgraded_assigned_count=$((downgraded_assigned_count + 1))
+            else
+                exec 8>&-
+                # The `(state=<raw>)` suffix keeps the PRD-pinned prefix
+                # `preserving _lane-5: assigned to task 5334` matching as a
+                # substring while surfacing `in_use` vs `assigned` — the
+                # distinction leaf δ will begin writing and leaf ε depends on.
+                warn "preserving $name: $assigned_desc (state=$LANE_STATE_RAW)"
+                preserved_count=$((preserved_count + 1))
+                preserved_assigned_count=$((preserved_assigned_count + 1))
+                continue
+            fi
         fi
 
         # Deliberately ASYMMETRIC, and the asymmetry is the point.
@@ -728,6 +1192,23 @@ _do_reclaim() {
         # second copy of the recognized-state table here to drift.
         if [ "${LANE_STATE_CAUSE:-}" = "unparseable-record" ]; then
             warn "$name: lane-state record is present but unparseable-record — falling back to the /proc live-consumer scan for this lane"
+        fi
+
+        # Skip-unchanged gate (task 7859): nothing written to this lane's cache
+        # since its last seed on the current gen means nothing to reclaim. After
+        # the record gate, so an assigned lane keeps its attribution; before the
+        # /proc walk, cheapest-decisive-first; a skip is non-destructive, so it
+        # needs no liveness proof. Off under --disk-pressure: the emergency rm
+        # never waits on a heuristic. Rationale: README.md "Delta 14".
+        if [ -z "$DISK_PRESSURE" ]; then
+            if lane_seed_unchanged "$lane" "$(_resolve_base_gen)"; then
+                exec 8>&-
+                info "  skipping unchanged lane: $name ($LANE_SEED_REASON)"
+                skipped_unchanged_count=$((skipped_unchanged_count + 1))
+                continue
+            elif [ -n "$LANE_SEED_REASON" ]; then
+                info "  $name: not skipped — $LANE_SEED_REASON"
+            fi
         fi
 
         # Live-reference gate (task 5572). The flock above proves no consumer is
@@ -787,6 +1268,19 @@ _do_reclaim() {
             # α, this path never reads the base/gen tree. Still under the
             # lane flock acquired above, mirroring the manual 2026-07-10
             # remediation.
+            #
+            # This branch is reachable for a lane whose record says
+            # assigned/in_use, via the record-gate downgrade above — that is
+            # task 5504's whole point. warm-lane-gc-sweep.sh needs NO wiring
+            # change to get it: the sweep measures `df -B1 --output=avail` once
+            # per run and APPENDS --disk-pressure below its critical floor, so
+            # the unattended systemd path inherits the valve for free. The ε
+            # path (git_ops.py::_run_warm_lane_gc_reclaim) never passes the
+            # flag, so this ACUTE valve stays sweep-and-operator-only. Do NOT
+            # read that as "task 5504 cannot reach ε": the CHRONIC bound is on
+            # by DEFAULT (--max-record-age-days 14, no wiring needed), so ε
+            # does downgrade an assigned record older than a fortnight — into
+            # the α reseed branch below, never into this rm.
             info "  resetting lane (disk-pressure): $name"
             local rm_err
             if rm_err="$(rm -rf "$lane/target" 2>&1)"; then
@@ -798,25 +1292,91 @@ _do_reclaim() {
             fi
         else
             # Invoke α while the lane lock is held in the parent shell (FD 8;
-            # the action subshell inherits it, the parent still owns the lock)
+            # the helper's subshell inherits it, the parent still owns the lock)
             # AND a shared gen lock is held on FD 9 (flock -s; D8 reader-refcount
-            # seam). Pass --assume-lane-lock-held: seed-warm-lane.sh acquires the
+            # seam) — both via _reseed_lane_pinned, which passes
+            # --assume-lane-lock-held: seed-warm-lane.sh acquires the
             # lane lock BY DEFAULT under --fresh-checkout (esc-5214/task 5354
             # fail-safe), and its own FD-9 acquire would BOTH self-refuse against
             # gc's FD-8 lane lock AND clobber gc's FD-9 gen lock. The opt-out
             # makes seed skip its own acquire; gc's held locks already provide the
             # inv.2 one-consumer exclusivity + the gen reader-refcount.
             info "  resetting lane: $name"
-            if (
-                exec 9>"$gen_lock"
-                flock -s 9
-                "$SEED_SCRIPT" "$resolved_gen" "$lane" --fresh-checkout --assume-lane-lock-held
-            ) 2>&1 | while IFS= read -r line; do warn "  [seed] $line"; done; then
+            if ! _seed_script_invocable; then
+                # No seed can run, so none can certify or refuse: the discard
+                # below would destroy target/ for a certification nobody was
+                # asked to make. The warn keeps the pre-guard prefix, which
+                # git_ops.py::GitOps._run_warm_lane_gc_reclaim's WARNING quotes
+                # for exactly this case. README.md "Delta 13".
+                warn "  reset failed for $name (seed-script error); continuing — $SEED_SCRIPT is not an executable file, so it was not invoked and nothing was discarded"
+                preserved_count=$((preserved_count + 1))
+            elif _reseed_lane_pinned "$lane" 2>&1 | while IFS= read -r line; do warn "  [seed] $line"; done; then
                 ok "  reset lane: $name"
                 reset_count=$((reset_count + 1))
             else
-                warn "  reset failed for $name (seed-script error); continuing"
-                preserved_count=$((preserved_count + 1))
+                # Also reached when no gen could be pinned, so no seed ran.
+                #
+                # A non-zero α exit means the seed did NOT certify this lane, and
+                # its three fail-closed post-conditions all fire AFTER target/ has
+                # been replaced with the CoW clone — so the abort lands ONTO the
+                # hazardous state it just refused to certify. The seed
+                # deliberately leaves that clone in place (it refuses, it does not
+                # repair), which makes discarding it the caller's obligation:
+                # reify's docs/prds/warm-lane-pool-cow-seeding.md §9.5 inv.13,
+                # "Caller obligation on the fail-closed path", is the single
+                # normative home for the ruling.
+                #
+                # Keyed on the EXIT STATUS, not on the seed's stdout, and that is
+                # the same predicate: seed-warm-lane.sh runs under
+                # `set -euo pipefail` and writes stdout exactly once, at its
+                # terminal echo, so `err …; return 1` yields non-zero exit and
+                # empty stdout together. Observing that stdout is not open to us
+                # anyway — the α call's whole output is piped through the [seed]
+                # warn loop above, to protect this script's own single-line
+                # stdout contract.
+                warn "  reset did not certify $name; discarding any target/ it left behind"
+                # Probe BEFORE the rm: `rm -rf` exits 0 on a missing path, so its
+                # own status cannot tell "removed the uncertified target/" from
+                # "there was nothing there". A seed can refuse with the lane
+                # already empty — it moves the old target/ into its reseed trash
+                # BEFORE staging the clone, so any guard firing in that window
+                # (base absent, a build-flag mismatch, a usage error) leaves
+                # nothing behind. Reporting a discard that never happened would be
+                # a plain falsehood in the operator's log; the probe picks the
+                # wording. Note the converse is NOT knowable here: a target/ that
+                # IS present may be the fail-closed CoW clone or the lane's own
+                # pre-existing target/ (a refusal before the trash-move), hence
+                # "uncertified target/" rather than "clone" — either way the seed
+                # did not certify it and gc's job on this branch is to reset.
+                local had_target=0
+                [ -e "$lane/target" ] && had_target=1
+                local rm_err
+                if rm_err="$(rm -rf "$lane/target" 2>&1)"; then
+                    if [ "$had_target" = "1" ]; then
+                        warn "  discarded uncertified target/: $lane/target (§9.5 inv.13 caller obligation; lane left cold-but-safe)"
+                    else
+                        warn "  nothing to discard at $lane/target — the seed refused leaving none (§9.5 inv.13 caller obligation; lane left cold-but-safe)"
+                    fi
+                    # Counted identically on both wordings: the lane is left COLD
+                    # by a REFUSING seed either way, which is what reset_cold
+                    # names (see its declaration). A refusal that staged nothing
+                    # is if anything MORE likely to be inv.12's pool-wide
+                    # degradation than a per-lane one, so excluding it would hide
+                    # the signal the sub-count exists for.
+                    reset_count=$((reset_count + 1))
+                    reset_cold_count=$((reset_cold_count + 1))
+                else
+                    # The discard we just took on as an obligation did not happen,
+                    # so the clone survives. Count `preserved` and continue the
+                    # sweep — the same accounting the disk-pressure rm-failure
+                    # branch above uses, for the same reason: the lane was left
+                    # untouched, so calling it reset would be a lie. Deliberately
+                    # NOT reset_count/reset_cold_count, and deliberately not an
+                    # abort (per-candidate failures warn + continue).
+                    warn "  discard failed for $name: ${rm_err:-<rm produced no output>}; continuing"
+                    warn "  $lane/target RETAINS an uncertified clone — the next consumer must not build in it"
+                    preserved_count=$((preserved_count + 1))
+                fi
             fi
         fi
         exec 8>&-  # release lane lock; NOT removed — persists as per-lane mutex
@@ -825,7 +1385,7 @@ _do_reclaim() {
     # ── Pass 2: remove reclaimable orphans ────────────────────────────────────
     local orphan
     for orphan in "${orphan_candidates[@]+${orphan_candidates[@]}}"; do
-        name="$(basename "$orphan")"
+        name="${orphan##*/}"
         local orphan_lock="${WORKTREES_DIR}/${name}.lock"
 
         # Same single-acquisition pattern as Pass 1: non-blocking exclusive
@@ -902,14 +1462,19 @@ _do_reclaim() {
     done
 
     # ── Summary ───────────────────────────────────────────────────────────────
-    # preserved_live_ref and preserved_assigned are APPENDED, never interposed:
-    # existing consumers match the reset=/removed=/preserved= prefix (and the
-    # `preserved=N preserved_live_ref=M` adjacency), so a trailing field extends
-    # the line without breaking them.
-    printf 'reclaim: reset=%d removed=%d preserved=%d preserved_live_ref=%d preserved_assigned=%d\n' \
+    # preserved_live_ref, preserved_assigned, downgraded_assigned and
+    # reset_cold are APPENDED, never interposed: existing consumers match the
+    # reset=/removed=/preserved= prefix (and the
+    # `preserved=N preserved_live_ref=M preserved_assigned=A` adjacency), so a
+    # trailing field extends the line without breaking them. reify's copy puts
+    # reset_cold straight after preserved_live_ref, because it has neither
+    # record-gate field; here those two predate it (README.md "Delta 13").
+    # skipped_unchanged is appended after reset_cold (README.md "Delta 14").
+    printf 'reclaim: reset=%d removed=%d preserved=%d preserved_live_ref=%d preserved_assigned=%d downgraded_assigned=%d reset_cold=%d skipped_unchanged=%d\n' \
         "$reset_count" "$removed_count" "$preserved_count" "$preserved_live_ref_count" \
-        "$preserved_assigned_count"
-    ok "reclaim complete: reset=$reset_count removed=$removed_count preserved=$preserved_count preserved_live_ref=$preserved_live_ref_count preserved_assigned=$preserved_assigned_count"
+        "$preserved_assigned_count" "$downgraded_assigned_count" "$reset_cold_count" \
+        "$skipped_unchanged_count"
+    ok "reclaim complete: reset=$reset_count removed=$removed_count preserved=$preserved_count preserved_live_ref=$preserved_live_ref_count preserved_assigned=$preserved_assigned_count downgraded_assigned=$downgraded_assigned_count reset_cold=$reset_cold_count skipped_unchanged=$skipped_unchanged_count"
 }
 
 # ── dispatch ───────────────────────────────────────────────────────────────────

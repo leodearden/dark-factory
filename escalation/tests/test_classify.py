@@ -6,13 +6,24 @@ effective-benign predicate, and the per-path benign default helper
 from __future__ import annotations
 
 import pytest
+from _info_l0_records import done_step_tripwire, info_l0_note, info_scope_divergence
 
+from escalation.authority import COORDINATOR_IDENTITY
 from escalation.classify import (
+    DONE_STEP_COMMIT_ORPHAN_CLASS,
+    INFO_L0_MECHANICAL_ROLES,
+    RESOLVER_TIERS,
+    SeatTier,
     classify_resolver_tier,
+    closed_by_non_sweep_resolver,
     default_resolution_class_for_resolver,
     effective_benign,
+    info_l0_mechanical_class,
+    is_done_step_commit_orphan,
+    is_harness_filed,
+    resolver_tier,
 )
-from escalation.models import Escalation
+from escalation.models import HARNESS_SENTINEL_ROLE_PREFIXES, Escalation
 
 
 def _make_escalation(
@@ -20,6 +31,7 @@ def _make_escalation(
     *,
     status: str = 'pending',
     resolution_class: str | None = None,
+    resolved_by: str | None = None,
 ) -> Escalation:
     esc = Escalation(
         id=esc_id,
@@ -31,6 +43,7 @@ def _make_escalation(
     )
     esc.status = status
     esc.resolution_class = resolution_class
+    esc.resolved_by = resolved_by
     return esc
 
 
@@ -40,6 +53,10 @@ class TestClassifyResolverTierHuman:
     def test_interactive_is_human(self):
         """resolved_by='interactive' classifies as 'human'."""
         assert classify_resolver_tier('interactive') == 'human'
+
+    def test_coordinator_identity_is_human(self):
+        """A sitting's closes count in the human tier (PRD decision-stream §3 decision 3)."""
+        assert classify_resolver_tier(COORDINATOR_IDENTITY) == 'human'
 
     def test_escalation_watcher_is_human(self):
         """resolved_by='escalation-watcher' (exact) classifies as 'human'."""
@@ -109,6 +126,63 @@ class TestClassifyResolverTierUnknownAndOther:
     def test_random_role_is_other_auto(self):
         """resolved_by='random-role' (unrecognised) classifies as 'other-auto'."""
         assert classify_resolver_tier('random-role') == 'other-auto'
+
+
+_HUMAN_SEATS = ('interactive', 'escalation-watcher', COORDINATOR_IDENTITY)
+_NON_HUMAN_RESOLVERS = (
+    'l2-cascade:esc-5-1',
+    'escalation-watcher-auto',
+    'orchestrator-escalation-watcher-auto',
+    'claude-task-2656-steward',
+    'harness-orphan-reaper',
+    'auto-dismissed',
+    'harness-escalation-revalidation-sweep',
+    'orchestrator-starvation-watchdog',
+    None,
+    'random-role',
+)
+
+
+def _closed(resolved_by: str | None, ruled_by_human: bool | None) -> Escalation:
+    esc = _make_escalation(status='resolved', resolution_class='actionable', resolved_by=resolved_by)
+    esc.ruled_by_human = ruled_by_human
+    return esc
+
+
+_RULED_RECORDS = [_closed(r, True) for r in (*_HUMAN_SEATS, 'l2-cascade:esc-5-1')]
+_SEAT_RECORDS = [_closed(r, flag) for r in _HUMAN_SEATS for flag in (None, False)]
+_NON_HUMAN_RECORDS = [_closed(r, None) for r in _NON_HUMAN_RESOLVERS]
+
+
+class TestResolverTier:
+    """resolver_tier(record) reads the human-ruling flag first (plans/instruments-honesty-prd.md decision 10)."""
+
+    @pytest.mark.parametrize('record', _RULED_RECORDS, ids=lambda r: str(r.resolved_by))
+    def test_a_human_ruling_is_human_ruled_whoever_closed_it(self, record: Escalation):
+        assert resolver_tier(record) == 'human-ruled'
+
+    @pytest.mark.parametrize(
+        'record', _SEAT_RECORDS, ids=lambda r: f'{r.resolved_by}-{r.ruled_by_human}'
+    )
+    def test_a_human_seat_close_without_a_ruling_is_attended_seat(self, record: Escalation):
+        assert resolver_tier(record) == 'attended-seat'
+
+    @pytest.mark.parametrize('record', _NON_HUMAN_RECORDS, ids=lambda r: str(r.resolved_by))
+    def test_a_non_human_close_takes_the_resolved_by_tier(self, record: Escalation):
+        assert resolver_tier(record) == classify_resolver_tier(record.resolved_by)
+
+    @pytest.mark.parametrize(
+        'record',
+        [*_RULED_RECORDS, *_SEAT_RECORDS, *_NON_HUMAN_RECORDS],
+        ids=lambda r: f'{r.resolved_by}-{r.ruled_by_human}',
+    )
+    def test_every_tier_is_in_the_record_tier_vocabulary(self, record: Escalation):
+        assert resolver_tier(record) in RESOLVER_TIERS
+        assert 'human' not in RESOLVER_TIERS
+
+    def test_the_record_tier_vocabulary_is_the_human_split_plus_every_other_seat_tier(self):
+        other_seats = [tier.value for tier in SeatTier if tier is not SeatTier.HUMAN]
+        assert ('human-ruled', 'attended-seat', *other_seats) == RESOLVER_TIERS
 
 
 class TestEffectiveBenign:
@@ -193,3 +267,162 @@ class TestDefaultResolutionClassForResolver:
     def test_random_role_defaults_none(self):
         """resolved_by='random-role' (other-auto tier) defaults to None."""
         assert default_resolution_class_for_resolver('random-role') is None
+
+
+class TestClosedByNonSweepResolver:
+    """closed_by_non_sweep_resolver(record): terminal, and closed outside the reaper-sweep tier."""
+
+    def test_pending_record_is_never_closed(self):
+        """A pending record is not closed, whatever its resolved_by stamp says."""
+        record = _make_escalation(status='pending', resolved_by='claude-task-42-steward')
+        assert closed_by_non_sweep_resolver(record) is False
+
+    def test_steward_resolved_counts(self):
+        record = _make_escalation(status='resolved', resolved_by='claude-task-42-steward')
+        assert closed_by_non_sweep_resolver(record) is True
+
+    def test_steward_dismissed_counts(self):
+        """resolve_issue's close_only and abandon actions dismiss rather than resolve."""
+        record = _make_escalation(status='dismissed', resolved_by='claude-task-42-steward')
+        assert closed_by_non_sweep_resolver(record) is True
+
+    def test_steward_hand_off_dismissal_counts(self):
+        """The steward's give-up dismissal shares the 'steward' stamp with an
+        attributed agent close, so the predicate cannot exclude it."""
+        record = _make_escalation(status='dismissed', resolved_by='steward')
+        assert closed_by_non_sweep_resolver(record) is True
+
+    def test_human_resolved_counts(self):
+        record = _make_escalation(status='resolved', resolved_by='interactive')
+        assert closed_by_non_sweep_resolver(record) is True
+
+    def test_unattributed_close_counts(self):
+        """An agent close the steward has not yet attributed lands in tier 'unknown'."""
+        record = _make_escalation(status='resolved', resolved_by=None)
+        assert closed_by_non_sweep_resolver(record) is True
+
+    @pytest.mark.parametrize('resolved_by', ['auto-dismissed', 'harness-orphan-reaper'])
+    def test_reaper_sweep_dismissal_does_not_count(self, resolved_by):
+        record = _make_escalation(status='dismissed', resolved_by=resolved_by)
+        assert closed_by_non_sweep_resolver(record) is False
+
+
+# ---------------------------------------------------------------------------
+# Mechanical info-L0 classes (plans/info-l0-disposition-router-prd.md D8)
+# ---------------------------------------------------------------------------
+
+class TestInfoL0MechanicalRoles:
+    def test_bare_orchestrator_role_is_not_registered(self):
+        """The bare 'orchestrator' role also files blocking work, so it may
+        only match through a discriminator, never by role alone."""
+        assert 'orchestrator' not in INFO_L0_MECHANICAL_ROLES
+
+    def test_done_step_class_key_is_not_a_registered_role(self):
+        """The aggregate sentinel is keyed per class key, so the discriminated
+        class must not collide with a role-keyed one."""
+        assert DONE_STEP_COMMIT_ORPHAN_CLASS not in INFO_L0_MECHANICAL_ROLES
+
+    def test_the_lane_role_is_not_registered(self):
+        """The lane's records are not closed as status-info; a missing role routes loudly to the curator."""
+        assert 'orchestrator-offline-lane' not in INFO_L0_MECHANICAL_ROLES
+
+
+class TestIsDoneStepCommitOrphan:
+    def test_matches_the_done_step_tripwire_shape(self):
+        assert is_done_step_commit_orphan(done_step_tripwire()) is True
+
+    @pytest.mark.parametrize(
+        ('field', 'value'),
+        [
+            ('agent_role', 'implementer'),
+            ('category', 'design_concern'),
+            ('suggested_action', 'investigate_and_retry'),
+        ],
+    )
+    def test_any_one_differing_field_does_not_match(self, field: str, value: str):
+        esc = done_step_tripwire()
+        setattr(esc, field, value)
+        assert is_done_step_commit_orphan(esc) is False
+
+
+class TestInfoL0MechanicalClass:
+    @pytest.mark.parametrize('role', sorted(INFO_L0_MECHANICAL_ROLES))
+    def test_registered_role_is_its_own_class(self, role: str):
+        assert info_l0_mechanical_class(info_l0_note(agent_role=role)) == role
+
+    def test_done_step_tripwire_is_the_done_step_class(self):
+        assert info_l0_mechanical_class(done_step_tripwire()) == DONE_STEP_COMMIT_ORPHAN_CLASS
+
+    def test_agent_note_is_not_mechanical(self):
+        assert info_l0_mechanical_class(info_l0_note()) is None
+
+    def test_unregistered_orchestrator_role_is_not_mechanical(self):
+        record = info_l0_note(agent_role='orchestrator-some-new-monitor')
+        assert info_l0_mechanical_class(record) is None
+
+    def test_injected_registry_is_honoured(self):
+        record = info_l0_note(agent_role='orchestrator-starvation-watchdog')
+        assert info_l0_mechanical_class(record, frozenset()) is None
+
+    def test_scope_divergence_shape_is_not_mechanical(self):
+        """There is deliberately no scope-divergence class (esc-5221-3).
+
+        Its only filer,
+        orchestrator/src/orchestrator/workflow.py::TaskWorkflow._escalate_scope_invariant_violation,
+        files severity='blocking' by design (plans/task-escalation-state-graph-prd.md
+        D11), so the blocking reaper arm keeps it.  An INFO record of that shape
+        is therefore unexpected and must fall to the curator leg (D8 fail-loud)
+        rather than close silently as status-info.
+        """
+        assert info_l0_mechanical_class(info_scope_divergence()) is None
+
+
+class TestIsHarnessFiled:
+    """Whether a record was filed by the harness rather than by an agent."""
+
+    @pytest.mark.parametrize(
+        'record',
+        [
+            pytest.param(
+                info_l0_note(
+                    agent_role='orchestrator',
+                    category='infra_issue',
+                    suggested_action='investigate_log_corruption',
+                ),
+                id='corruption',
+            ),
+            pytest.param(
+                info_l0_note(agent_role='orchestrator', category='review_suggestions'),
+                id='suggestions-fallback',
+            ),
+            pytest.param(done_step_tripwire(), id='done-step-tripwire'),
+            pytest.param(info_l0_note(agent_role='orchestrator-workflow'), id='orchestrator-prefixed'),
+            pytest.param(info_l0_note(agent_role='harness-orphan-reaper'), id='harness-prefixed'),
+        ],
+    )
+    def test_a_harness_filing_shape_is_harness_filed(self, record: Escalation):
+        assert is_harness_filed(record) is True
+
+    @pytest.mark.parametrize('role', sorted(INFO_L0_MECHANICAL_ROLES))
+    def test_every_mechanical_role_is_harness_filed(self, role: str):
+        assert is_harness_filed(info_l0_note(agent_role=role)) is True
+
+    @pytest.mark.parametrize('prefix', HARNESS_SENTINEL_ROLE_PREFIXES)
+    def test_every_sentinel_prefix_is_harness_filed(self, prefix: str):
+        assert is_harness_filed(info_l0_note(agent_role=prefix + 'anything')) is True
+
+    @pytest.mark.parametrize(
+        'role',
+        [
+            'implementer',
+            'architect',
+            'debugger',
+            'deep_reviewer',
+            'reviewer_comprehensive',
+            'steward',
+            'orchestrators',
+            '',
+        ],
+    )
+    def test_an_agent_role_is_not_harness_filed(self, role: str):
+        assert is_harness_filed(info_l0_note(agent_role=role)) is False

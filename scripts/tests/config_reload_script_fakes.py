@@ -1,0 +1,513 @@
+"""Test doubles for the environment of a shell script that commits an
+orchestrator config and then hot-reloads it through
+`shared.mcp_session.SyncMcpSession`.
+
+That environment has three parts, each faked here for real rather than by a
+stand-in binary on PATH: the escalation MCP the reload talks to (a loopback
+HTTP server speaking its measured STATEFUL protocol, plus the catalogue of
+ways its transport can fail and the reply of a tool that raised), the git repo
+holding the config, and the `python3` a caller's shell offers the reload step.
+The readers of the JSON verdict such a script ends with live here too, so every
+suite reads it one way.
+
+Stdlib only, and free of pytest, so every consumer imports it by bare name
+(scripts/tests/conftest.py appends scripts/tests to sys.path).
+"""
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import socket
+import subprocess
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
+from typing import TypedDict
+
+
+def sse_frame(payload):
+    """One `event: message` SSE frame -- how the escalation MCP frames every
+    `tools/call` reply."""
+    return f"event: message\ndata: {json.dumps(payload)}\n\n"
+
+
+# ---------------------------------------------------------------------------
+# The stateful escalation MCP, for real, on an ephemeral port
+# ---------------------------------------------------------------------------
+
+# A tool handler's answer for a call the server never answers: it hangs up
+# with no response at all, as a server that restarts mid-call does, after the
+# tool has run.
+DROP_REPLY = object()
+
+class FakeEscalationMcp:
+    """A real HTTP server speaking the STATEFUL streamable-HTTP protocol the
+    escalation MCP really speaks, answering `reload_config` with *report*.
+
+    Modelled on the `_FakeMcpServer` fixture that task 5247 later retired,
+    and extended with the two behaviours that fixture has no
+    reason to model, its target (fused-memory :8002) being STATELESS: the 400
+    rejection of a session-less request, and `text/event-stream` framing of
+    the `tools/call` reply. Every behaviour below was measured live against
+    the dark-factory escalation MCP at 127.0.0.1:8102 on 2026-09-12:
+
+      * any request but `initialize` without an `mcp-session-id` header -> 400
+        carrying the server's own "Missing session ID" envelope;
+      * `initialize` -> 200 plus an `mcp-session-id` RESPONSE header;
+      * `notifications/initialized` -> 202 with no body at all;
+      * `tools/call` -> 200 `text/event-stream`, SSE-framed;
+      * `DELETE` (session termination) -> 200.
+
+    `received` records every (verb, headers, payload) seen, so a test asserts
+    the script really handshook — and really released the session — rather
+    than merely exited 0.
+
+    `initialize_reply` / `tool_call_reply` each override one step of that
+    exchange with a literal (status, headers, body) triple, which is how the
+    fault cases below are built without restating the handshake.
+    `faults_armed` gates both overrides: they bite only while it answers True,
+    so a fault can wait for a landing to happen first. `tool_call_delay`
+    holds the authenticated `tools/call` reply back that many seconds
+    (released early at exit), modelling a tool that outlives the client's
+    read timeout.
+
+    `tool_handlers` maps a tool name to a function of its arguments whose
+    return value is that tool's structuredContent, or DROP_REPLY. A tool
+    without a handler answers *report*, as reload_config does.
+    """
+
+    SESSION_ID = "sess-5379-fake"
+
+    MISSING_SESSION_REPLY = (
+        400,
+        {"Content-Type": "application/json"},
+        json.dumps({
+            "jsonrpc": "2.0",
+            "id": "server-error",
+            "error": {"code": -32600, "message": "Bad Request: Missing session ID"},
+        }),
+    )
+
+    def __init__(self, report=None, *, initialize_reply=None, tool_call_reply=None,
+                 tool_call_delay=0.0, tool_handlers=None, faults_armed=lambda: True):
+        self.report = report
+        self.initialize_reply = initialize_reply
+        self.tool_call_reply = tool_call_reply
+        self.tool_call_delay = tool_call_delay
+        self.tool_handlers = dict(tool_handlers or {})
+        self.faults_armed = faults_armed
+        self._release = threading.Event()
+        self.received = []
+        self._dispatched = []
+        outer = self
+
+        class Handler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length") or 0)
+                raw = self.rfile.read(length) if length else b""
+                try:
+                    payload = json.loads(raw) if raw else {}
+                except json.JSONDecodeError:
+                    payload = {"_raw": raw.decode()}
+                outer.received.append((self.command, dict(self.headers), payload))
+                response = outer._respond(self.headers, payload)
+                if response is None:
+                    self.close_connection = True
+                    return
+                self._reply(*response)
+
+            def do_DELETE(self):
+                outer.received.append((self.command, dict(self.headers), {}))
+                self._reply(200, {}, "")
+
+            def _reply(self, status, headers, body):
+                data = body.encode()
+                self.send_response(status)
+                for name, value in headers.items():
+                    self.send_header(name, value)
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                if data:
+                    self.wfile.write(data)
+
+            def log_message(self, *args):
+                pass
+
+        self._httpd = HTTPServer(("127.0.0.1", 0), Handler)
+        self.port = self._httpd.server_port
+
+    def _respond(self, headers, payload):
+        """(status, headers, body) for one request, or None for no reply."""
+        method = payload.get("method")
+        if method != "initialize" and not headers.get("mcp-session-id"):
+            return self.MISSING_SESSION_REPLY
+        armed = self.faults_armed()
+        if method == "initialize":
+            return (armed and self.initialize_reply) or (
+                200,
+                {"Content-Type": "application/json",
+                 "mcp-session-id": self.SESSION_ID},
+                json.dumps({"jsonrpc": "2.0", "id": payload.get("id"),
+                            "result": {"protocolVersion": "2024-11-05"}}),
+            )
+        if method == "notifications/initialized":
+            return (202, {}, "")
+        params = payload.get("params") or {}
+        self._dispatched.append((params.get("name"), params.get("arguments") or {}))
+        handler = self.tool_handlers.get(params.get("name"))
+        if handler is not None:
+            content = handler(params.get("arguments") or {})
+            return None if content is DROP_REPLY else self._structured(payload, content)
+        if self.tool_call_delay > 0:
+            self._release.wait(self.tool_call_delay)
+        return (armed and self.tool_call_reply) or self._structured(payload, self.report)
+
+    @staticmethod
+    def _structured(payload, content):
+        """A 200 SSE `tools/call` reply carrying *content* as structuredContent."""
+        return (
+            200,
+            {"Content-Type": "text/event-stream"},
+            sse_frame({"jsonrpc": "2.0", "id": payload.get("id"),
+                       "result": {"structuredContent": content}}),
+        )
+
+    def rpc_methods(self):
+        """The JSON-RPC methods the server saw, in order (a DELETE carries none)."""
+        return [payload["method"] for _, _, payload in self.received if payload.get("method")]
+
+    def called_tools(self):
+        """The tool names every `tools/call` the server saw asked for."""
+        return [
+            (payload.get("params") or {}).get("name")
+            for _, _, payload in self.received
+            if payload.get("method") == "tools/call"
+        ]
+
+    def tool_calls(self):
+        """(tool name, arguments) for every `tools/call` that reached a tool, in
+        order: the session-less first attempt the transport makes before its
+        handshake is rejected with a 400 and is not among them."""
+        return list(self._dispatched)
+
+    def delete_count(self):
+        """How many session-terminating DELETEs the server saw.
+
+        Read by the wire tests rather than left to SyncMcpSession's own suite:
+        the server a reload script talks to is the long-lived escalation
+        process, and a session it never releases stays in
+        `StreamableHTTPSessionManager`'s registry with a live anyio task behind
+        it, one per run.
+        """
+        return sum(1 for verb, _, _ in self.received if verb == "DELETE")
+
+    def __enter__(self):
+        self._thread = threading.Thread(target=self._httpd.serve_forever, daemon=True)
+        self._thread.start()
+        return self
+
+    def __exit__(self, *exc):
+        self._release.set()
+        self._httpd.shutdown()
+        self._httpd.server_close()
+        self._thread.join(timeout=5)
+
+
+class McpFault(TypedDict, total=False):
+    """The FakeEscalationMcp keyword arguments that inject one fault, each
+    overriding one step of the exchange with a literal (status, headers, body)
+    reply."""
+
+    initialize_reply: tuple[int, dict[str, str], str]
+    tool_call_reply: tuple[int, dict[str, str], str]
+
+
+def reload_report(**overrides):
+    """A reload report in orchestrator/src/orchestrator/harness.py::
+    reload_config's return shape, every field defaulted so each test states
+    only what it varies.
+
+    `unchanged` defaults to an INT count because that is what is really on
+    the wire (config.py::ConfigDiff declares `unchanged: int`) -- it carries
+    no key names.
+    """
+    report = {
+        "reloaded": True,
+        "config_path": None,
+        "applied": {},
+        "restart_required": {},
+        "unchanged": 37,
+        "error": None,
+    }
+    report.update(overrides)
+    return report
+
+
+# ---------------------------------------------------------------------------
+# Every way the transport can refuse to deliver reload_config
+# ---------------------------------------------------------------------------
+
+INITIALIZE_WITHOUT_A_SESSION = (
+    200,
+    {"Content-Type": "application/json"},
+    json.dumps({"jsonrpc": "2.0", "id": 1,
+                "result": {"protocolVersion": "2024-11-05"}}),
+)
+
+ENVELOPE_LEVEL_ERROR = (
+    200,
+    {"Content-Type": "text/event-stream"},
+    sse_frame({"jsonrpc": "2.0", "id": 1,
+               "error": {"code": -32602, "message": "Unknown tool: reload_config"}}),
+)
+
+# id -> fault.
+TRANSPORT_FAULTS: dict[str, McpFault] = {
+    # The shape a raw single-shot POST hits against the live server today --
+    # the direct regression test for the defect.
+    "always_400": {"initialize_reply": FakeEscalationMcp.MISSING_SESSION_REPLY},
+    # The session-less notifications/initialized that follows is refused 400,
+    # so SyncMcpSession fails the handshake; the script must surface it rather
+    # than swallow it.
+    "initialize_assigns_no_session": {"initialize_reply": INITIALIZE_WITHOUT_A_SESSION},
+    # The request reached the server but never a tool.
+    "envelope_level_error": {"tool_call_reply": ENVELOPE_LEVEL_ERROR},
+}
+
+
+class ClosedPort:
+    """A port with nothing listening on it, for the dead-socket case, held for
+    a with-block.
+
+    While held, the port is bound and not listening: no other socket can bind
+    it, and a connect to it is refused. `port` is offered only inside the
+    with-block. It is the same `port` attribute a script driver reads from a
+    FakeEscalationMcp, so the no-server case is driven the same way.
+    """
+
+    def __init__(self):
+        self._holder: socket.socket | None = None
+
+    @property
+    def port(self) -> int:
+        if self._holder is None:
+            raise RuntimeError("ClosedPort reserves its port only inside its with-block")
+        return self._holder.getsockname()[1]
+
+    def __enter__(self):
+        if self._holder is not None:
+            raise RuntimeError("ClosedPort is already held; enter a fresh one")
+        holder = socket.socket()
+        try:
+            holder.bind(("127.0.0.1", 0))
+        except BaseException:
+            holder.close()
+            raise
+        self._holder = holder
+        return self
+
+    def __exit__(self, *exc):
+        holder, self._holder = self._holder, None
+        if holder is not None:
+            holder.close()
+
+
+# ---------------------------------------------------------------------------
+# A tool that ran and raised
+# ---------------------------------------------------------------------------
+
+TOOL_IS_ERROR = (
+    200,
+    {"Content-Type": "text/event-stream"},
+    sse_frame({"jsonrpc": "2.0", "id": 1, "result": {
+        "isError": True,
+        "content": [{"type": "text", "text": "ToolError: reload_config failed"}],
+    }}),
+)
+
+# FastMCP's shape for a raised ToolError: the request reached the tool, which
+# ran and failed, so unlike every TRANSPORT_FAULTS entry it may have acted.
+TOOL_RAISED: McpFault = {"tool_call_reply": TOOL_IS_ERROR}
+
+
+# ---------------------------------------------------------------------------
+# The `python3` a caller's shell offers
+#
+# Measured on 2026-09-12: the system interpreter (/usr/bin/python3, 3.12.3)
+# lacks httpx, which the reload transport needs, while every venv in this
+# tree has it. Whether an interpreter lacks the transport
+# is decided by running the gate's own import step under it, so the premise a
+# test skips on is the very branch the gate takes.
+# ---------------------------------------------------------------------------
+
+SYSTEM_PYTHON = "/usr/bin/python3"
+
+_LACKS_THE_TRANSPORT = 3
+_TRANSPORT_PROBE = f"""
+import sys
+sys.path.insert(0, sys.argv[1])
+from _config_reload_gate import load_transport
+try:
+    load_transport()
+except ImportError:
+    sys.exit({_LACKS_THE_TRANSPORT})
+"""
+
+
+def system_python_without_the_transport():
+    """The system interpreter, or a skip reason if it cannot play the part.
+
+    Returns (interpreter, "") or (None, reason). An interpreter that CAN
+    import the transport would make an interpreter-resolution test pass while
+    proving nothing, so the premise is checked rather than assumed. A probe
+    that breaks any other way raises: misreading it as "lacks the transport"
+    would run those tests on a false premise.
+    """
+    if not os.path.exists(SYSTEM_PYTHON):
+        return None, f"{SYSTEM_PYTHON} is absent"
+    scripts_dir = Path(__file__).resolve().parent.parent
+    probe = subprocess.run(
+        [SYSTEM_PYTHON, "-c", _TRANSPORT_PROBE, str(scripts_dir)],
+        capture_output=True, text=True,
+    )
+    if probe.returncode == 0:
+        return None, f"{SYSTEM_PYTHON} can import the transport, so it proves nothing"
+    if probe.returncode == _LACKS_THE_TRANSPORT:
+        return SYSTEM_PYTHON, ""
+    raise RuntimeError(
+        f"the transport probe broke under {SYSTEM_PYTHON} (rc={probe.returncode}): {probe.stderr}"
+    )
+
+
+def venvless_checkout_copy(tmp_path, script):
+    """*script* copied into a fresh checkout at <tmp_path>/checkout that holds
+    everything it sources and its landing and reload steps import -- the real
+    scripts/lib, scripts/_config_reload_gate.py and scripts/_merge_queue_landing.py,
+    symlinked; the gate binds `shared` from the checkout it really lives in --
+    but NO .venv, so the script's bare-`python3` interpreter fallback is the
+    leg taken. Returns the copy."""
+    scripts_dir = tmp_path / "checkout" / "scripts"
+    scripts_dir.mkdir(parents=True)
+    copy = scripts_dir / script.name
+    shutil.copy2(script, copy)
+    for imported in ("lib", "_config_reload_gate.py", "_merge_queue_landing.py"):
+        (scripts_dir / imported).symlink_to(script.parent / imported)
+    return copy
+
+
+def path_python3_shimmed_to(tmp_path, interpreter):
+    """An env whose PATH `python3` is *interpreter*."""
+    return _path_python3_running(tmp_path, f'exec {interpreter} "$@"')
+
+
+def path_python3_that_cannot_run(tmp_path):
+    """An env whose PATH `python3` exits 1 without running anything."""
+    return _path_python3_running(tmp_path, "exit 1")
+
+
+def _path_python3_running(tmp_path, shell_body):
+    """An env whose PATH `python3` is a /bin/sh shim executing *shell_body*."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    shim = bin_dir / "python3"
+    shim.write_text(f"#!/bin/sh\n{shell_body}\n")
+    shim.chmod(0o755)
+    env = dict(os.environ)
+    env["PATH"] = f"{bin_dir}{os.pathsep}{env['PATH']}"
+    return env
+
+
+# ---------------------------------------------------------------------------
+# Real temp git repo holding a temp dark-factory-orchestrator.yaml
+# ---------------------------------------------------------------------------
+
+def git(repo, *args):
+    """Run a git command against *repo* and return its stdout, raising loudly
+    on failure -- test setup must never silently produce a repo that doesn't
+    match the spec."""
+    return subprocess.run(
+        ["git", "-C", str(repo), *args],
+        check=True, capture_output=True, text=True,
+    ).stdout
+
+
+def init_repo(tmp_path):
+    """An empty real git repo at <tmp_path>/repo, ready to commit into.
+
+    A real repo (rather than a faked `git`) keeps the script's checkout
+    resolution and its commit step -- including the "nothing to commit"
+    path -- faithful, with no fake to drift.
+    """
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    git(repo, "init", "-q", "-b", "main")
+    git(repo, "config", "user.email", "test@example.com")
+    git(repo, "config", "user.name", "Test")
+    return repo
+
+
+def commit_config(repo, text):
+    """Write *text* as *repo*'s dark-factory-orchestrator.yaml and commit it,
+    so the tree the script sees is clean. Returns the yaml path."""
+    config = repo / "dark-factory-orchestrator.yaml"
+    config.write_text(text)
+    git(repo, "add", "dark-factory-orchestrator.yaml")
+    git(repo, "commit", "-q", "-m", "seed")
+    return config
+
+
+def head(repo, *, short=False):
+    """*repo*'s HEAD sha -- abbreviated as the scripts print it if *short*."""
+    return git(repo, "rev-parse", *(["--short"] if short else []), "HEAD").strip()
+
+
+# ---------------------------------------------------------------------------
+# Reading a deploy script's JSON verdict
+#
+# Each script ends its stdout with one JSON object: `outcome: <name>` on
+# success, `failure: <tag>` on a designed failure. Every reader takes any
+# object carrying `.returncode` and `.stdout`, a CompletedProcess or a
+# namespace a test builds from a Popen's output.
+# ---------------------------------------------------------------------------
+
+def last_verdict(proc):
+    """The script's last non-empty stdout line, parsed as its JSON verdict."""
+    lines = [line for line in proc.stdout.splitlines() if line.strip()]
+    assert lines, f"no stdout at all; {_shown(proc)}"
+    return json.loads(lines[-1])
+
+
+def failure_tag(proc):
+    """The failure tag of a run that must have failed, read from its verdict."""
+    assert proc.returncode != 0, _shown(proc)
+    verdict = last_verdict(proc)
+    assert "outcome" not in verdict, verdict
+    return verdict["failure"]
+
+
+def verdict_lines(proc):
+    """(line, verdict) for every stdout line that parses as a JSON object."""
+    for line in proc.stdout.splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            parsed = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, dict):
+            yield line, parsed
+
+
+def outcome_verdict_lines(proc):
+    """Every stdout line that parses as a verdict claiming any success outcome."""
+    return [line for line, verdict in verdict_lines(proc) if "outcome" in verdict]
+
+
+def _shown(proc):
+    """*proc*'s exit and output for an assertion message; a namespace built
+    from a Popen may carry no stderr."""
+    return f"rc={proc.returncode} stdout={proc.stdout} stderr={getattr(proc, 'stderr', None)}"

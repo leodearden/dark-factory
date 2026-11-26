@@ -23,15 +23,22 @@ from typing import Any
 
 import pytest
 import startup_completion_fixtures as scf
+from _oauth_accounts import ALL_TOKEN_LETTERS, available_tokens
 
 from shared import cli_invoke
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
-# Live re-probe gate — mirrors test_cli_invoke_integration.py's _AVAILABLE_TOKENS
-# discovery, and startup_completion_probe._oauth_token's wider A..G sweep, so a
-# machine with no accounts records a legible skip instead of a spurious failure.
-_OAUTH_TOKEN_PRESENT = any(
-    os.environ.get(f'CLAUDE_OAUTH_TOKEN_{c}') for c in 'ABCDEFG'
-)
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
+
+# Live re-probe gate — account scan single-homed in _oauth_accounts (task 3700);
+# see its module docstring for the history and for the two letter sets.
+# ALL_TOKEN_LETTERS, not that module's fleet default: this gate spends no fleet
+# capacity and asks only "is there ANY account at all?", so the
+# interactive/primary account A is a legitimate answer and narrowing to the
+# fleet set would make a single-account machine report a failure it cannot act
+# on.  startup_completion_probe._oauth_token uses the same set for the same
+# reason.
+_OAUTH_TOKEN_PRESENT = bool(available_tokens(os.environ, ALL_TOKEN_LETTERS))
 
 # ONE pinned copy per concept, asserted equal to the module's own constant by
 # TestPinnedConstants.  Restating a closed set here is deliberate — a silent
@@ -960,6 +967,32 @@ class TestLiveReprobe:
             if line.strip()
         ]
         assert observations, 'probe emitted no observations'
+        degraded = [o for o in observations if o.get('redaction_failed')]
+        exit_degraded = [
+            o for o in observations if (o.get('run_exit') or {}).get('redaction_failed')
+        ]
+        assert not degraded and not exit_degraded, (
+            'DRIFT: the live re-probe emitted '
+            f'{len(degraded)} redaction_failed observation row(s) '
+            f'(sample_kind={[o.get("sample_kind") for o in degraded]!r}, '
+            f'pattern={[o.get("redaction_failure_pattern") for o in degraded]!r}) and '
+            f'{len(exit_degraded)} redaction_failed run_exit row(s) (pattern='
+            f'{[o["run_exit"].get("redaction_failure_pattern") for o in exit_degraded]!r}). '
+            "A degraded observation drops cli_version, transcript_relpath and "
+            "transcript_records by construction (see "
+            "startup_completion_probe.py::_poisoned_observation), so letting one reach "
+            "test_a/test_b/test_c would trade this DRIFT diagnostic for a bare KeyError "
+            "at exactly the moment it matters. A degraded run_exit row is stamped onto "
+            "EVERY observation of the run (see startup_completion_probe.py::_gate, "
+            "kind='run_exit') and no test subscripts it, so it would otherwise pass "
+            "through silently. Either shape means _scrub_value is incomplete, "
+            "which makes the whole capture suspect, not just the flagged row. Check the "
+            "probe's stderr WARNING: if the residue is real, fix "
+            "startup_completion_probe.py::_scrub_value so it cleans this shape; if the "
+            "generic heuristic fired on a benign long identifier, widen the lookarounds "
+            "in startup_completion_fixtures.py::GENERIC_CREDENTIAL_PATTERNS. Then "
+            "re-run the probe."
+        )
         return observations
 
     @pytest.fixture(scope='class')

@@ -25,18 +25,22 @@ project convention) -- that is mandated in the η live throwaway-graph
 rehearsal (PRD decision 5).
 
 All Cypher and the raw-embedding transport live in this module (reached via
-``graphiti._graph_for(name)`` and ``graphiti._require_falkor_client()``)
+``graphiti.graph_access.graph(name)``, whose handles budget every call)
 rather than as new ``GraphitiBackend`` methods, to avoid file-lock
 contention with the γ/W6 normalization work landing in graphiti_client.py
-concurrently (PRD G4).
+concurrently (PRD G4). Every budget's ``op`` names the public function that
+was running; a private helper takes it from its caller.
 """
 
 from __future__ import annotations
 
 import logging
+import types
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
+from fused_memory.backends.graph_access import GraphHandle
 from fused_memory.backends.graphiti_client import NodeNotFoundError
 
 logger = logging.getLogger(__name__)
@@ -118,12 +122,12 @@ def _quote_cypher_string(value: str) -> str:
 
 
 async def _read_compact_vector(
-    falkor_client: Any, *, group_id: str, cypher: str,
+    graph: GraphHandle, *, cypher: str, op: str,
 ) -> str | None:
     """Injectable raw ``--compact`` transport seam for a single vecf32 column.
 
     Issues *cypher* (expected to ``RETURN`` exactly one vecf32-typed value)
-    against *group_id* directly through the raw FalkorDB client (bypassing
+    against *graph* through its raw compact transport, under *op* (bypassing
     ``falkordb.Graph.query()``/``.ro_query()``, whose ``QueryResult.parse()``
     -- specifically ``__parse_vectorf32``/``__parse_double`` -- calls
     ``float()`` on each component and so silently adopts FalkorDB's lossy
@@ -150,7 +154,7 @@ async def _read_compact_vector(
     returns ``None`` for exactly that tag, letting callers recreate the
     node/edge embedding-less instead of failing. Any OTHER non-VECTORF32
     ``scalar_type`` (a genuinely wrong-typed column -- e.g. VALUE_ARRAY) is
-    still a hard, descriptively-messaged failure (naming *group_id* and
+    still a hard, descriptively-messaged failure (naming the graph and
     *cypher*) that surfaces a corrupt/unexpected source row immediately,
     rather than silently proceeding without it (which would produce a
     differently-shaped, harder-to-diagnose gap later -- e.g. a moved node
@@ -189,12 +193,12 @@ async def _read_compact_vector(
     leak-prd.md`` itself is outside ``fused_memory/maintenance``'s locked
     scope for this amendment pass and is not done here.
     """
-    reply = await falkor_client.execute_command('GRAPH.RO_QUERY', group_id, cypher, '--compact')
+    reply = await graph.ro_query_compact(cypher, op=op)
     rows = reply[1]
     if not rows:
         raise ValueError(
             f'_read_compact_vector: expected exactly one row for '
-            f'group_id={group_id!r} (cypher={cypher!r}), got zero rows -- '
+            f'group_id={graph.name!r} (cypher={cypher!r}), got zero rows -- '
             'the source row may have been deleted between an existence '
             'check and this read, or the reply shape is unexpected.'
         )
@@ -209,7 +213,7 @@ async def _read_compact_vector(
     if scalar_type != _VALUE_VECTORF32:
         raise ValueError(
             f'_read_compact_vector: expected a VECTORF32 (12) cell for '
-            f'group_id={group_id!r}, got scalar_type={scalar_type} '
+            f'group_id={graph.name!r}, got scalar_type={scalar_type} '
             f'(cypher={cypher!r}). A null/absent embedding on the source row '
             f'surfaces as scalar_type={_VALUE_NULL} (VALUE_NULL) and is '
             "returned as None instead -- see this function's docstring."
@@ -261,21 +265,18 @@ class _NodeCreateOutcome:
         new_group_id: ``rewrite_group_id`` if given, else the source node's
             own group_id -- None when ``already_moved`` (no further group_id
             use is possible; the caller returns immediately).
-        source: The resolved source-graph handle (``graphiti._graph_for``),
+        source: The resolved source-graph handle (``graphiti.graph_access``),
             so callers continuing past the node-create step don't need to
-            re-resolve it.
+            re-resolve it; its compact transport reads the embeddings.
         target: The resolved target-graph handle, likewise.
-        falkor_client: The raw transport client (``graphiti._require_falkor_client()``),
-            likewise -- None when ``already_moved``.
     """
 
     already_moved: bool
     created: bool
     node_uuid: str | None
     new_group_id: str | None
-    source: Any
-    target: Any
-    falkor_client: Any
+    source: GraphHandle
+    target: GraphHandle
 
 
 async def _create_entity_in_target(
@@ -284,6 +285,7 @@ async def _create_entity_in_target(
     source_graph: str,
     target_graph: str,
     *,
+    op: str,
     rewrite_group_id: str | None = None,
 ) -> _NodeCreateOutcome:
     """Node-core read+CREATE shared by ``create_moved_node`` (Phase A) and
@@ -302,13 +304,14 @@ async def _create_entity_in_target(
     to (but not including) edges/mentions/delete, which remain the caller's
     responsibility.
     """
-    source = graphiti._graph_for(source_graph)
-    target = graphiti._graph_for(target_graph)
+    source = graphiti.graph_access.graph(source_graph)
+    target = graphiti.graph_access.graph(target_graph)
 
     node_result = await source.ro_query(
         'MATCH (n:Entity {uuid: $uuid}) '
         'RETURN n.uuid, n.name, n.group_id, n.summary, n.created_at',
         {'uuid': uuid},
+        op=op,
     )
 
     # --- unconditional target-presence probe ---
@@ -320,6 +323,7 @@ async def _create_entity_in_target(
     target_probe = await target.ro_query(
         'MATCH (n:Entity {uuid: $uuid}) RETURN n.uuid, n.name, n.created_at',
         {'uuid': uuid},
+        op=op,
     )
     node_already_in_target = bool(target_probe.result_set)
 
@@ -337,12 +341,10 @@ async def _create_entity_in_target(
                 new_group_id=None,
                 source=source,
                 target=target,
-                falkor_client=None,
             )
         raise NodeNotFoundError(f'Entity node not found in source_graph {source_graph!r}: {uuid}')
     node_uuid, name, group_id, summary, created_at = node_result.result_set[0]
 
-    falkor_client = graphiti._require_falkor_client()
     new_group_id = group_id if rewrite_group_id is None else rewrite_group_id
 
     if node_already_in_target:
@@ -381,14 +383,13 @@ async def _create_entity_in_target(
             new_group_id=new_group_id,
             source=source,
             target=target,
-            falkor_client=falkor_client,
         )
 
     embedding_cypher = (
         f'MATCH (n:Entity {{uuid: {_quote_cypher_string(uuid)}}}) RETURN n.name_embedding'
     )
     embedding_reply = await _read_compact_vector(
-        falkor_client, group_id=source_graph, cypher=embedding_cypher,
+        source, cypher=embedding_cypher, op=op,
     )
 
     await target.query(
@@ -405,6 +406,7 @@ async def _create_entity_in_target(
             'summary': summary,
             'created_at': created_at,
         },
+        op=op,
     )
     return _NodeCreateOutcome(
         already_moved=False,
@@ -413,7 +415,6 @@ async def _create_entity_in_target(
         new_group_id=new_group_id,
         source=source,
         target=target,
-        falkor_client=falkor_client,
     )
 
 
@@ -468,7 +469,7 @@ async def create_moved_node(
 
     Args:
         graphiti: An initialized GraphitiBackend (or compatible object
-            exposing ``_graph_for`` / ``_require_falkor_client``).
+            exposing ``graph_access``).
         uuid: UUID of the Entity node to create in target_graph.
         source_graph: Graph the node currently lives in (read-only).
         target_graph: Graph to CREATE the node into.
@@ -488,13 +489,112 @@ async def create_moved_node(
             instead.
     """
     outcome = await _create_entity_in_target(
-        graphiti, uuid, source_graph, target_graph, rewrite_group_id=rewrite_group_id,
+        graphiti, uuid, source_graph, target_graph,
+        op='create_moved_node', rewrite_group_id=rewrite_group_id,
     )
     return CreateResult(
         uuid=uuid,
         source_graph=source_graph,
         target_graph=target_graph,
         already_created=not outcome.created,
+    )
+
+
+# ---------------------------------------------------------------------------
+# RELATES_TO edge carry (shared by S5, Phase B and S6)
+# ---------------------------------------------------------------------------
+
+# Every RELATES_TO property a recreate carries, in the edge read's RETURN order.
+# fact_embedding is absent: it travels the raw --compact transport
+# (_embedding_set_clause). Why expired_at is load-bearing:
+# fused_memory/backends/graphiti_client.py::GraphitiBackend.redirect_node_edges.
+_CARRIED_EDGE_PROPERTIES: tuple[str, ...] = (
+    'uuid', 'name', 'fact', 'valid_at', 'invalid_at', 'expired_at', 'created_at',
+    'group_id', 'episodes', 'superseded_edge_uuid', 'reassigned_from_node_uuid',
+)
+_EDGE_READ_COLUMNS: tuple[str, ...] = (
+    *(f'e.{prop}' for prop in _CARRIED_EDGE_PROPERTIES), 's.uuid', 't.uuid',
+)
+
+
+@dataclass(frozen=True)
+class _SourceEdge:
+    """A RELATES_TO edge as read from its source graph: its carried properties
+    plus its TRUE direction (``startNode``/``endNode``)."""
+
+    properties: Mapping[str, Any]
+    src_uuid: str
+    dst_uuid: str
+
+    @property
+    def uuid(self) -> str:
+        return self.properties['uuid']
+
+    @property
+    def group_id(self) -> str | None:
+        return self.properties['group_id']
+
+    @classmethod
+    def from_row(cls, row: Sequence[Any]) -> _SourceEdge:
+        if len(row) != len(_EDGE_READ_COLUMNS):
+            raise ValueError(
+                f'RELATES_TO edge read returned a {len(row)}-column row where '
+                f'{len(_EDGE_READ_COLUMNS)} columns {list(_EDGE_READ_COLUMNS)} '
+                f'were requested: {list(row)!r}'
+            )
+        return cls(
+            properties=types.MappingProxyType(
+                dict(zip(_CARRIED_EDGE_PROPERTIES, row[:-2], strict=True))
+            ),
+            src_uuid=row[-2],
+            dst_uuid=row[-1],
+        )
+
+
+async def _read_incident_edges(
+    graph: GraphHandle, entity_uuid: str, *, op: str,
+) -> list[_SourceEdge]:
+    """Every RELATES_TO edge incident to Entity *entity_uuid* in *graph*, either direction."""
+    # Undirected match + WITH DISTINCT e mirrors GraphitiBackend.get_valid_edges_for_node's
+    # established self-loop dedup idiom; startNode()/endNode() recover the edge's TRUE
+    # direction regardless of which side matched $uuid, so it can be preserved on recreate.
+    result = await graph.ro_query(
+        'MATCH (n:Entity {uuid: $uuid})-[e:RELATES_TO]-(m:Entity) '
+        'WITH DISTINCT e, startNode(e) AS s, endNode(e) AS t '
+        f'RETURN {", ".join(_EDGE_READ_COLUMNS)}',
+        {'uuid': entity_uuid},
+        op=op,
+    )
+    return [_SourceEdge.from_row(row) for row in result.result_set or []]
+
+
+async def _create_edge_copy(
+    graph: GraphHandle,
+    edge: _SourceEdge,
+    *,
+    group_id: str | None,
+    embedding_clause: str,
+    op: str,
+) -> Any:
+    """CREATE a copy of *edge* in *graph*, carrying every ``_CARRIED_EDGE_PROPERTIES``
+    value verbatim except ``group_id``, and return the query result.
+
+    Both endpoints are MATCHed, never CREATEd: if either is absent from
+    *graph* the MATCH yields no rows, nothing is created, and the result's
+    ``relationships_created`` stat reads 0.
+    """
+    assignments = ', '.join(f'r.{prop} = ${prop}' for prop in _CARRIED_EDGE_PROPERTIES)
+    return await graph.query(
+        'MATCH (a:Entity {uuid: $src_uuid}), (b:Entity {uuid: $dst_uuid}) '
+        'CREATE (a)-[r:RELATES_TO]->(b) '
+        f'SET {assignments}{embedding_clause}',
+        {
+            **edge.properties,
+            'group_id': group_id,
+            'src_uuid': edge.src_uuid,
+            'dst_uuid': edge.dst_uuid,
+        },
+        op=op,
     )
 
 
@@ -624,7 +724,7 @@ async def move_entity_across_graphs(
 
     Args:
         graphiti: An initialized GraphitiBackend (or compatible object
-            exposing ``_graph_for`` / ``_require_falkor_client``).
+            exposing ``graph_access``).
         uuid: UUID of the Entity node to move.
         source_graph: Graph the node currently lives in.
         target_graph: Graph to move the node into.
@@ -645,7 +745,8 @@ async def move_entity_across_graphs(
             *uuid* through ``merge_foreign_duplicate`` instead.
     """
     outcome = await _create_entity_in_target(
-        graphiti, uuid, source_graph, target_graph, rewrite_group_id=rewrite_group_id,
+        graphiti, uuid, source_graph, target_graph,
+        op='move_entity_across_graphs', rewrite_group_id=rewrite_group_id,
     )
     if outcome.already_moved:
         return MoveResult(
@@ -659,65 +760,29 @@ async def move_entity_across_graphs(
     target = outcome.target
     node_uuid = outcome.node_uuid
     new_group_id = outcome.new_group_id
-    falkor_client = outcome.falkor_client
 
     # --- RELATES_TO edges (step-7/8) ---
-    # Undirected match + WITH DISTINCT e mirrors GraphitiBackend.get_valid_edges_for_node's
-    # established self-loop dedup idiom; startNode()/endNode() recover the edge's TRUE
-    # direction regardless of which side matched $uuid, so it can be preserved on recreate.
-    edges_result = await source.ro_query(
-        'MATCH (n:Entity {uuid: $uuid})-[e:RELATES_TO]-(m:Entity) '
-        'WITH DISTINCT e, startNode(e) AS s, endNode(e) AS t '
-        'RETURN e.uuid, e.name, e.fact, e.valid_at, e.invalid_at, e.created_at, '
-        '       e.group_id, e.episodes, s.uuid, t.uuid',
-        {'uuid': uuid},
-    )
     edges_moved = 0
     edges_skipped = 0
-    for row in edges_result.result_set or []:
-        (edge_uuid, edge_name, fact, valid_at, invalid_at, edge_created_at,
-         _edge_group_id, episodes, src_uuid, dst_uuid) = row
-
+    for edge in await _read_incident_edges(source, uuid, op='move_entity_across_graphs'):
         edge_embedding_cypher = (
-            f'MATCH ()-[e:RELATES_TO {{uuid: {_quote_cypher_string(edge_uuid)}}}]-() '
+            f'MATCH ()-[e:RELATES_TO {{uuid: {_quote_cypher_string(edge.uuid)}}}]-() '
             'RETURN e.fact_embedding'
         )
         edge_embedding_reply = await _read_compact_vector(
-            falkor_client, group_id=source_graph, cypher=edge_embedding_cypher,
+            source, cypher=edge_embedding_cypher, op='move_entity_across_graphs',
         )
 
-        # Both endpoints are MATCHed (never CREATEd) by uuid: the other
-        # endpoint (dst_uuid) must already exist in target_graph for the
-        # edge to be recreated -- otherwise this MATCH yields no rows and
-        # the edge is silently skipped (left for the caller to move the
-        # other endpoint too, or accept the drop; see the docstring's
-        # "Residual hazard" note). relationships_created (FalkorDB's own
-        # CREATE stat) distinguishes the two outcomes -- edges_moved only
-        # counts a genuine create, never a silent no-op MATCH.
-        edge_create_result = await target.query(
-            'MATCH (a:Entity {uuid: $src_uuid}), (b:Entity {uuid: $dst_uuid}) '
-            'CREATE (a)-[r:RELATES_TO]->(b) '
-            'SET r.uuid = $edge_uuid, '
-            '    r.name = $name, '
-            '    r.fact = $fact, '
-            '    r.valid_at = $valid_at, '
-            '    r.invalid_at = $invalid_at, '
-            '    r.created_at = $created_at, '
-            '    r.group_id = $group_id, '
-            '    r.episodes = $episodes'
-            f'{_embedding_set_clause("r.fact_embedding", edge_embedding_reply)}',
-            {
-                'src_uuid': src_uuid,
-                'dst_uuid': dst_uuid,
-                'edge_uuid': edge_uuid,
-                'name': edge_name,
-                'fact': fact,
-                'valid_at': valid_at,
-                'invalid_at': invalid_at,
-                'created_at': edge_created_at,
-                'group_id': new_group_id,
-                'episodes': episodes,
-            },
+        # The other endpoint must already exist in target_graph for the
+        # edge to be recreated -- otherwise it is silently skipped (left for
+        # the caller to move the other endpoint too, or accept the drop; see
+        # the docstring's "Residual hazard" note). relationships_created
+        # (FalkorDB's own CREATE stat) distinguishes the two outcomes --
+        # edges_moved only counts a genuine create, never a silent no-op MATCH.
+        edge_create_result = await _create_edge_copy(
+            target, edge, group_id=new_group_id,
+            embedding_clause=_embedding_set_clause('r.fact_embedding', edge_embedding_reply),
+            op='move_entity_across_graphs',
         )
         if edge_create_result.relationships_created:
             edges_moved += 1
@@ -727,7 +792,7 @@ async def move_entity_across_graphs(
                 'move_entity_across_graphs: RELATES_TO edge uuid=%s silently '
                 'skipped -- other endpoint uuid=%s not present in '
                 'target_graph=%s (uuid=%s source=%s)',
-                edge_uuid, dst_uuid, target_graph, uuid, source_graph,
+                edge.uuid, edge.dst_uuid, target_graph, uuid, source_graph,
             )
 
     # --- Episodic MENTIONS links (step-9/10) ---
@@ -738,6 +803,7 @@ async def move_entity_across_graphs(
         'MATCH (ep:Episodic)-[e:MENTIONS]->(n:Entity {uuid: $uuid}) '
         'RETURN e.uuid, e.group_id, e.created_at, ep.uuid',
         {'uuid': uuid},
+        op='move_entity_across_graphs',
     )
     mentions_moved = 0
     mentions_skipped = 0
@@ -761,6 +827,7 @@ async def move_entity_across_graphs(
                 'group_id': new_group_id,
                 'created_at': mention_created_at,
             },
+            op='move_entity_across_graphs',
         )
         if mention_create_result.relationships_created:
             mentions_moved += 1
@@ -781,6 +848,7 @@ async def move_entity_across_graphs(
     await source.query(
         'MATCH (n:Entity {uuid: $uuid}) DETACH DELETE n',
         {'uuid': uuid},
+        op='move_entity_across_graphs',
     )
 
     logger.info(
@@ -864,6 +932,45 @@ class SubgraphEdgeResult:
             ``dropped_cross_target``/``blocked`` do, since a null embedding
             is valid data, not a failure. Always 0 for a batch where every
             recreated edge carried a real embedding.
+        merge_mentions_dropped: CENSUS (task 4183) of the incoming Episodic
+            ``MENTIONS`` LINKS onto a MERGE spec's wrong copy that are AT
+            RISK from the caller's Phase C: deleting that wrong copy with
+            ``DETACH DELETE`` destroys them. AT RISK, not confirmed
+            destroyed -- this is a Phase-B census, taken before Phase C runs
+            and blind to whether it runs at all, so a link counted here
+            SURVIVES whenever the caller withholds that node's deletion
+            (e.g. ``migrate_cross_graph_leak.run()`` withholds every source
+            deletion on a Phase-B error, and any node named in ``blocked``).
+            Read the number as an upper bound on the loss if Phase C
+            proceeds for every censused node. The MERGE fold recreates
+            RELATES_TO edges only -- it has no MENTIONS-fold analogue -- so
+            such a link is not carried over BY DESIGN: a wrong-graph
+            mentioning episode is classified
+            ``EPISODIC_SKIP`` (never actioned, see
+            ``scripts/migrate_cross_graph_leak.py``), so recreating the link
+            would nearly always be an undeliverable skip. Counted here so
+            the loss is reviewable rather than silent. Counts LINKS, not
+            episodes -- see ``merge_mentions_dropped_uuids``. Always 0 for a
+            batch with no MERGE specs, and for a MERGE spec whose wrong copy
+            carries no MENTIONS.
+        merge_mentions_dropped_uuids: The DISTINCT mentioning-Episodic uuids
+            behind ``merge_mentions_dropped``, in first-seen order, deduped
+            across the WHOLE batch (same cross-spec dedup convention as
+            ``edges_by_uuid``). Because one episode can mention two
+            merged-away entities, ``merge_mentions_dropped >=
+            len(merge_mentions_dropped_uuids)`` -- the count counts links
+            destroyed, this list holds distinct episodes; that is
+            deliberate, not an off-by-one. Order is first-seen (never a
+            ``set``) so two runs over identical data produce diffable
+            reports. The entity<->episode association this flat list cannot
+            carry is preserved by a per-spec ``logger.warning``. Like
+            ``embedding_omitted`` and UNLIKE
+            ``dropped_cross_target``/``blocked``, both census fields are
+            purely informational: they do NOT gate a caller's exit_code and
+            do NOT require withholding Phase C (task 4183, operator ruling
+            2026-08-12: visibility only -- an operator who wants to withhold
+            on a non-zero count acts on the report). Always empty for a
+            batch with no such links.
     """
 
     edges_recreated: int = 0
@@ -873,9 +980,11 @@ class SubgraphEdgeResult:
     dropped_cross_target: list = field(default_factory=list)
     blocked: list = field(default_factory=list)
     embedding_omitted: int = 0
+    merge_mentions_dropped: int = 0
+    merge_mentions_dropped_uuids: list = field(default_factory=list)
 
 
-async def _entity_present_in_graph(graph: Any, uuid: str) -> bool:
+async def _entity_present_in_graph(graph: GraphHandle, uuid: str, *, op: str) -> bool:
     """Read-only presence probe: True iff an ``:Entity`` node with *uuid*
     exists in *graph*.
 
@@ -891,11 +1000,14 @@ async def _entity_present_in_graph(graph: Any, uuid: str) -> bool:
     result = await graph.ro_query(
         'MATCH (n:Entity {uuid: $uuid}) RETURN n.uuid LIMIT 1',
         {'uuid': uuid},
+        op=op,
     )
     return bool(result.result_set)
 
 
-async def _relates_to_edge_already_in_target(graph: Any, edge_uuid: str) -> bool:
+async def _relates_to_edge_already_in_target(
+    graph: GraphHandle, edge_uuid: str, *, op: str,
+) -> bool:
     """Read-only presence probe: True iff a RELATES_TO edge with *edge_uuid*
     already exists in *graph* (either direction).
 
@@ -910,11 +1022,14 @@ async def _relates_to_edge_already_in_target(graph: Any, edge_uuid: str) -> bool
     result = await graph.ro_query(
         'MATCH ()-[e:RELATES_TO {uuid: $uuid}]-() RETURN e.uuid LIMIT 1',
         {'uuid': edge_uuid},
+        op=op,
     )
     return bool(result.result_set)
 
 
-async def _mentions_link_already_in_target(graph: Any, mention_uuid: str) -> bool:
+async def _mentions_link_already_in_target(
+    graph: GraphHandle, mention_uuid: str, *, op: str,
+) -> bool:
     """Read-only presence probe: True iff a MENTIONS link with *mention_uuid*
     already exists in *graph*.
 
@@ -929,6 +1044,7 @@ async def _mentions_link_already_in_target(graph: Any, mention_uuid: str) -> boo
     result = await graph.ro_query(
         'MATCH ()-[e:MENTIONS]->() WHERE e.uuid = $uuid RETURN e.uuid LIMIT 1',
         {'uuid': mention_uuid},
+        op=op,
     )
     return bool(result.result_set)
 
@@ -951,9 +1067,9 @@ async def recreate_subgraph_relationships(graphiti: Any, specs: list[dict]) -> S
     ``scripts/migrate_cross_graph_leak.py``'s ``run()``).
 
     MOVE edges: for every non-MERGE spec, every incident RELATES_TO edge
-    (full property row, read via the same ``startNode``/``endNode`` SELECT
-    ``move_entity_across_graphs`` uses) and every incident Episodic MENTIONS
-    link is read from the spec's ``source_graph``. Edges are accumulated
+    (``_read_incident_edges``, as ``move_entity_across_graphs`` reads it)
+    and every incident Episodic MENTIONS link is read from the spec's
+    ``source_graph``. Edges are accumulated
     into a single dict keyed by edge uuid -- so a co-moving edge incident to
     TWO specs in this batch (read once per incident spec) is recreated only
     ONCE, not twice. For each distinct edge, both endpoints' target graphs
@@ -988,8 +1104,8 @@ async def recreate_subgraph_relationships(graphiti: Any, specs: list[dict]) -> S
 
     MERGE fold: run AFTER the MOVE-edge/mentions passes above have fully
     completed for the batch. For every MERGE spec, every RELATES_TO edge
-    incident to its wrong-copy (``source_graph``) is read (full property
-    rows, same SELECT as above) and compared -- via
+    incident to its wrong-copy (``source_graph``) is read (same
+    ``_read_incident_edges`` as above) and compared -- via
     ``classify_unique_wrong_edges`` over uuid sets -- against the home
     copy's (``target_graph``) OWN current incident edge-uuid set (``_read_
     relates_to_edge_uuids``, S6's uuid-only reader). Only the edges unique
@@ -1001,8 +1117,19 @@ async def recreate_subgraph_relationships(graphiti: Any, specs: list[dict]) -> S
     EACH merge spec, an edge the MOVE-edge pass (or an earlier merge spec in
     this same batch) already landed on that home graph is correctly
     excluded here too -- no double-create for a MOVE<->MERGE or
-    MERGE<->MERGE shared edge. MERGE has no MENTIONS-fold analogue (mirrors
-    ``merge_foreign_duplicate``, which never touches MENTIONS either).
+    MERGE<->MERGE shared edge. MERGE still has no MENTIONS-fold analogue --
+    no MENTIONS link is ever recreated onto the home copy (mirrors
+    ``merge_foreign_duplicate``, which never touches MENTIONS either) -- but
+    those links are no longer lost invisibly: before folding a spec's edges,
+    the wrong copy's INCOMING MENTIONS are censused into
+    ``merge_mentions_dropped`` (link count) and
+    ``merge_mentions_dropped_uuids`` (distinct mentioning-episode uuids),
+    with one ``logger.warning`` per spec, so the loss the caller's Phase-C
+    ``DETACH DELETE`` would inflict on them is counted, uuid-listed and
+    reviewable (task 4183). Being a Phase-B census it is an UPPER BOUND: a
+    censused link survives whenever the caller withholds that node's
+    deletion. The census is read-only and informational -- it changes
+    neither this fold nor Phase C.
 
     Issues NO ``DETACH DELETE`` anywhere -- that is ``delete_source_node``'s
     job (Phase C), which callers must run only after this function has
@@ -1011,7 +1138,7 @@ async def recreate_subgraph_relationships(graphiti: Any, specs: list[dict]) -> S
 
     Args:
         graphiti: An initialized GraphitiBackend (or compatible object
-            exposing ``_graph_for`` / ``_require_falkor_client``).
+            exposing ``graph_access``).
         specs: Manifest-node-shaped dicts for every MOVE/MERGE node in this
             apply batch (``uuid``, ``disposition``, ``source_graph``,
             ``target_graph``).
@@ -1044,7 +1171,9 @@ async def recreate_subgraph_relationships(graphiti: Any, specs: list[dict]) -> S
     """
     result = SubgraphEdgeResult()
     try:
-        await _recreate_subgraph_relationships_batch(graphiti, specs, result)
+        await _recreate_subgraph_relationships_batch(
+            graphiti, specs, result, op='recreate_subgraph_relationships',
+        )
     except Exception as exc:
         exc.partial_result = result  # type: ignore[attr-defined]
         raise
@@ -1052,7 +1181,7 @@ async def recreate_subgraph_relationships(graphiti: Any, specs: list[dict]) -> S
 
 
 async def _recreate_subgraph_relationships_batch(
-    graphiti: Any, specs: list[dict], result: SubgraphEdgeResult,
+    graphiti: Any, specs: list[dict], result: SubgraphEdgeResult, *, op: str,
 ) -> None:
     """Phase-B batch work for ``recreate_subgraph_relationships``, mutating
     *result* in place as it recreates edges/mentions.
@@ -1062,7 +1191,6 @@ async def _recreate_subgraph_relationships_batch(
     ``exc.partial_result`` on failure -- see
     ``recreate_subgraph_relationships``'s docstring.
     """
-    falkor_client = graphiti._require_falkor_client()
     target_of: dict[str, str] = {spec['uuid']: spec['target_graph'] for spec in specs}
 
     # MERGE specs' edges are folded separately (step-10) -- only MOVE specs'
@@ -1071,35 +1199,26 @@ async def _recreate_subgraph_relationships_batch(
     # constant) -- this module must not import from its ζ-script consumer.
     move_specs = [spec for spec in specs if spec.get('disposition') != 'MERGE']
 
-    edges_by_uuid: dict[str, tuple[list, str]] = {}
+    edges_by_uuid: dict[str, tuple[_SourceEdge, str]] = {}
     mentions_by_uuid: dict[str, tuple[list, str, str]] = {}
     for spec in move_specs:
-        source = graphiti._graph_for(spec['source_graph'])
+        source = graphiti.graph_access.graph(spec['source_graph'])
 
-        edges_result = await source.ro_query(
-            'MATCH (n:Entity {uuid: $uuid})-[e:RELATES_TO]-(m:Entity) '
-            'WITH DISTINCT e, startNode(e) AS s, endNode(e) AS t '
-            'RETURN e.uuid, e.name, e.fact, e.valid_at, e.invalid_at, e.created_at, '
-            '       e.group_id, e.episodes, s.uuid, t.uuid',
-            {'uuid': spec['uuid']},
-        )
-        for row in edges_result.result_set or []:
-            edges_by_uuid.setdefault(row[0], (row, spec['source_graph']))
+        for edge in await _read_incident_edges(source, spec['uuid'], op=op):
+            edges_by_uuid.setdefault(edge.uuid, (edge, spec['source_graph']))
 
         mentions_result = await source.ro_query(
             'MATCH (ep:Episodic)-[e:MENTIONS]->(n:Entity {uuid: $uuid}) '
             'RETURN e.uuid, e.group_id, e.created_at, ep.uuid',
             {'uuid': spec['uuid']},
+            op=op,
         )
         for row in mentions_result.result_set or []:
             mentions_by_uuid.setdefault(row[0], (row, spec['source_graph'], spec['uuid']))
 
-    for edge_uuid, (row, source_graph) in edges_by_uuid.items():
-        (_edge_uuid, edge_name, fact, valid_at, invalid_at, edge_created_at,
-         _edge_group_id, episodes, src_uuid, dst_uuid) = row
-
-        src_target = target_of.get(src_uuid)
-        dst_target = target_of.get(dst_uuid)
+    for edge_uuid, (edge, source_graph) in edges_by_uuid.items():
+        src_target = target_of.get(edge.src_uuid)
+        dst_target = target_of.get(edge.dst_uuid)
 
         # A non-migrating endpoint (no spec of its own -- absent from
         # target_of) is deliverable only if it is already a home-resident in
@@ -1109,11 +1228,15 @@ async def _recreate_subgraph_relationships_batch(
         # MOVE spec's own incident-edge query (so that spec's uuid is always
         # one of the two endpoints).
         if src_target is None and dst_target is not None:
-            if await _entity_present_in_graph(graphiti._graph_for(dst_target), src_uuid):
+            if await _entity_present_in_graph(
+                graphiti.graph_access.graph(dst_target), edge.src_uuid, op=op,
+            ):
                 src_target = dst_target
         elif (
             dst_target is None and src_target is not None
-            and await _entity_present_in_graph(graphiti._graph_for(src_target), dst_uuid)
+            and await _entity_present_in_graph(
+                graphiti.graph_access.graph(src_target), edge.dst_uuid, op=op,
+            )
         ):
             dst_target = src_target
 
@@ -1126,8 +1249,8 @@ async def _recreate_subgraph_relationships_batch(
             # ever surfaced a bare count with no record of why).
             result.dropped_cross_target.append({
                 'edge_uuid': edge_uuid,
-                'src_uuid': src_uuid,
-                'dst_uuid': dst_uuid,
+                'src_uuid': edge.src_uuid,
+                'dst_uuid': edge.dst_uuid,
                 'src_target': src_target,
                 'dst_target': dst_target,
                 'reason': (
@@ -1139,9 +1262,9 @@ async def _recreate_subgraph_relationships_batch(
             continue
 
         target_graph_name = src_target
-        target = graphiti._graph_for(target_graph_name)
+        target = graphiti.graph_access.graph(target_graph_name)
 
-        if await _relates_to_edge_already_in_target(target, edge_uuid):
+        if await _relates_to_edge_already_in_target(target, edge_uuid, op=op):
             # Genuine idempotent no-op (re-run after a prior completed/
             # partial Phase B) -- not a loss, so neither counter is
             # incremented.
@@ -1153,34 +1276,14 @@ async def _recreate_subgraph_relationships_batch(
                 'RETURN e.fact_embedding'
             )
             edge_embedding_reply = await _read_compact_vector(
-                falkor_client, group_id=source_graph, cypher=edge_embedding_cypher,
+                graphiti.graph_access.graph(source_graph),
+                cypher=edge_embedding_cypher,
+                op=op,
             )
             embedding_clause = _embedding_set_clause('r.fact_embedding', edge_embedding_reply)
 
-            edge_create_result = await target.query(
-                'MATCH (a:Entity {uuid: $src_uuid}), (b:Entity {uuid: $dst_uuid}) '
-                'CREATE (a)-[r:RELATES_TO]->(b) '
-                'SET r.uuid = $edge_uuid, '
-                '    r.name = $name, '
-                '    r.fact = $fact, '
-                '    r.valid_at = $valid_at, '
-                '    r.invalid_at = $invalid_at, '
-                '    r.created_at = $created_at, '
-                '    r.group_id = $group_id, '
-                '    r.episodes = $episodes'
-                f'{embedding_clause}',
-                {
-                    'src_uuid': src_uuid,
-                    'dst_uuid': dst_uuid,
-                    'edge_uuid': edge_uuid,
-                    'name': edge_name,
-                    'fact': fact,
-                    'valid_at': valid_at,
-                    'invalid_at': invalid_at,
-                    'created_at': edge_created_at,
-                    'group_id': target_graph_name,
-                    'episodes': episodes,
-                },
+            edge_create_result = await _create_edge_copy(
+                target, edge, group_id=target_graph_name, embedding_clause=embedding_clause, op=op,
             )
             if edge_create_result.relationships_created:
                 result.edges_recreated += 1
@@ -1192,7 +1295,7 @@ async def _recreate_subgraph_relationships_batch(
                     'recreate_subgraph_relationships: RELATES_TO edge uuid=%s '
                     'silently skipped -- other endpoint (src=%s dst=%s) not '
                     'present in target_graph=%s',
-                    edge_uuid, src_uuid, dst_uuid, target_graph_name,
+                    edge_uuid, edge.src_uuid, edge.dst_uuid, target_graph_name,
                 )
         except Exception as exc:
             # Per-item isolation (CGL-η follow-up, task 2451): a single bad
@@ -1208,7 +1311,7 @@ async def _recreate_subgraph_relationships_batch(
                 'kind': 'edge',
                 'uuid': edge_uuid,
                 'reason': str(exc),
-                'node_uuids': [src_uuid, dst_uuid],
+                'node_uuids': [edge.src_uuid, edge.dst_uuid],
             })
             # error + exc_info (reviewer follow-up, task 2451 amendment):
             # this broad `except Exception` deliberately isolates any
@@ -1222,7 +1325,7 @@ async def _recreate_subgraph_relationships_batch(
                 'recreate_subgraph_relationships: RELATES_TO edge uuid=%s '
                 'blocked -- %s: %s (src=%s dst=%s target_graph=%s); batch '
                 'continues',
-                edge_uuid, type(exc).__name__, exc, src_uuid, dst_uuid,
+                edge_uuid, type(exc).__name__, exc, edge.src_uuid, edge.dst_uuid,
                 target_graph_name,
                 exc_info=True,
             )
@@ -1230,9 +1333,9 @@ async def _recreate_subgraph_relationships_batch(
     for mention_uuid, (row, _source_graph, entity_uuid) in mentions_by_uuid.items():
         _mention_uuid, _mention_group_id, mention_created_at, episode_uuid = row
         target_graph_name = target_of[entity_uuid]
-        target = graphiti._graph_for(target_graph_name)
+        target = graphiti.graph_access.graph(target_graph_name)
 
-        if await _mentions_link_already_in_target(target, mention_uuid):
+        if await _mentions_link_already_in_target(target, mention_uuid, op=op):
             # Genuine idempotent no-op (re-run after a prior completed/
             # partial Phase B) -- not a loss, so neither counter is
             # incremented. Mirrors the RELATES_TO skip above.
@@ -1252,6 +1355,7 @@ async def _recreate_subgraph_relationships_batch(
                     'group_id': target_graph_name,
                     'created_at': mention_created_at,
                 },
+                op=op,
             )
             if mention_create_result.relationships_created:
                 result.mentions_recreated += 1
@@ -1293,29 +1397,96 @@ async def _recreate_subgraph_relationships_batch(
     # observes it in home_edge_uuids and classify_unique_wrong_edges
     # correctly excludes it here -- no double-create.
     merge_specs = [spec for spec in specs if spec.get('disposition') == 'MERGE']
+    # Batch-wide dedup set for the dropped-MENTIONS census below (task 4183).
+    # Hoisted OUT of the per-spec loop: it is only ever grown, never reset, so
+    # rebuilding it per spec would be O(specs x accumulated episodes) for an
+    # identical result. Seeded from the list (empty here -- nothing else
+    # writes it) so the two stay in lockstep if that ever stops holding.
+    seen_episodes: set = set(result.merge_mentions_dropped_uuids)
     for spec in merge_specs:
         uuid = spec['uuid']
         wrong_graph = spec['source_graph']
         home_graph = spec['target_graph']
-        wrong = graphiti._graph_for(wrong_graph)
-        home = graphiti._graph_for(home_graph)
+        wrong = graphiti.graph_access.graph(wrong_graph)
+        home = graphiti.graph_access.graph(home_graph)
 
-        wrong_edges_result = await wrong.ro_query(
-            'MATCH (n:Entity {uuid: $uuid})-[e:RELATES_TO]-(m:Entity) '
-            'WITH DISTINCT e, startNode(e) AS s, endNode(e) AS t '
-            'RETURN e.uuid, e.name, e.fact, e.valid_at, e.invalid_at, e.created_at, '
-            '       e.group_id, e.episodes, s.uuid, t.uuid',
+        # Dropped-MENTIONS census (task 4183) -- the FIRST read for this
+        # spec, deliberately ahead of the edge fold so a mid-batch systemic
+        # raise still carries the already-censused specs out on
+        # exc.partial_result. Read-only: this fold recreates RELATES_TO only,
+        # so every incoming MENTIONS link on the wrong copy is destroyed IF
+        # the caller's Phase C deletes that copy (an upper bound, not a
+        # confirmed loss -- see the SubgraphEdgeResult docstring). Counting
+        # them here is what turns that risk from silent into reviewable.
+        # Reuses the MOVE pass's
+        # incoming-MENTIONS MATCH pattern with a narrowed projection.
+        # NOT wrapped in a per-item try/except: like _read_incident_edges and
+        # _read_relates_to_edge_uuids below, this is a per-spec gather read,
+        # which this module's documented convention treats as a systemic
+        # failure that RAISES (per-item isolation is reserved for a single
+        # edge/mention's embedding read or CREATE). Swallowing it would let a
+        # backend error read as a census of zero -- reintroducing exactly the
+        # invisibility this census removes.
+        mentions_census = await wrong.ro_query(
+            'MATCH (ep:Episodic)-[e:MENTIONS]->(n:Entity {uuid: $uuid}) '
+            'RETURN e.uuid, ep.uuid',
             {'uuid': uuid},
+            op=op,
         )
-        wrong_rows_by_uuid = {row[0]: row for row in (wrong_edges_result.result_set or [])}
-        wrong_edge_uuids = set(wrong_rows_by_uuid)
+        census_rows = mentions_census.result_set or []
+        if census_rows:
+            result.merge_mentions_dropped += len(census_rows)
+            # Dedup across the WHOLE batch (seen_episodes, hoisted above the
+            # loop), preserving first-seen order -- a bare set() for the
+            # reported list would make the report and its tests order-flaky.
+            # spec_episode_uuids is the per-spec ordered list for the warning
+            # below, with its own set for the membership test (a linear scan
+            # of the list would be O(k^2) for a heavily-mentioned entity).
+            spec_episode_uuids = []
+            spec_seen: set = set()
+            for row in census_rows:
+                # Null-tolerant: FalkorDB returns null for a missing property,
+                # and these maintenance scripts run against exactly the kind
+                # of damaged graph where an Episodic node has lost its uuid.
+                # Degrade to a visible placeholder rather than letting a
+                # read-only, purely informational census abort the whole
+                # Phase-B batch MID-MUTATION (this runs outside any per-item
+                # try/except, so a raise here would strand already-CREATEd
+                # edges and block every spec's Phase C).
+                episode_uuid = row[1] if row[1] else '<unknown>'
+                if episode_uuid not in seen_episodes:
+                    seen_episodes.add(episode_uuid)
+                    result.merge_mentions_dropped_uuids.append(episode_uuid)
+                if episode_uuid not in spec_seen:
+                    spec_seen.add(episode_uuid)
+                    spec_episode_uuids.append(episode_uuid)
+            # ONE warning per spec -- this is what preserves the
+            # entity<->episode association the flat uuid list cannot carry.
+            # str() on the join for the same reason as the placeholder above:
+            # a logging-format detail must never be able to fail the fold.
+            logger.warning(
+                'recreate_subgraph_relationships: MERGE fold -- %d incoming '
+                'MENTIONS link(s) onto wrong copy uuid=%s in wrong_graph=%s '
+                '(home_graph=%s) are AT RISK: Phase C\'s DETACH DELETE of '
+                'that wrong copy destroys them, since MERGE recreates '
+                'RELATES_TO only. Withhold this node\'s Phase-C deletion and '
+                'they survive; reported, not silently lost. Mentioning '
+                'episode uuid(s): %s',
+                len(census_rows), uuid, wrong_graph, home_graph,
+                ', '.join(str(u) for u in spec_episode_uuids),
+            )
 
-        home_edge_uuids = await _read_relates_to_edge_uuids(home, uuid)
-        unique_wrong_edge_uuids = classify_unique_wrong_edges(home_edge_uuids, wrong_edge_uuids)
+        wrong_edges_by_uuid = {
+            edge.uuid: edge for edge in await _read_incident_edges(wrong, uuid, op=op)
+        }
+
+        home_edge_uuids = await _read_relates_to_edge_uuids(home, uuid, op=op)
+        unique_wrong_edge_uuids = classify_unique_wrong_edges(
+            home_edge_uuids, set(wrong_edges_by_uuid),
+        )
 
         for edge_uuid in unique_wrong_edge_uuids:
-            (_edge_uuid, edge_name, fact, valid_at, invalid_at, edge_created_at,
-             edge_group_id, episodes, src_uuid, dst_uuid) = wrong_rows_by_uuid[edge_uuid]
+            edge = wrong_edges_by_uuid[edge_uuid]
 
             try:
                 edge_embedding_cypher = (
@@ -1323,41 +1494,20 @@ async def _recreate_subgraph_relationships_batch(
                     'RETURN e.fact_embedding'
                 )
                 edge_embedding_reply = await _read_compact_vector(
-                    falkor_client, group_id=wrong_graph, cypher=edge_embedding_cypher,
+                    wrong, cypher=edge_embedding_cypher,
+                    op=op,
                 )
                 embedding_clause = _embedding_set_clause('r.fact_embedding', edge_embedding_reply)
 
-                # Both endpoints are MATCHed (never CREATEd): the home copy
-                # of this MERGE node and the edge's other endpoint must
-                # already exist in home_graph, or this MATCH yields no rows
-                # and the edge is silently skipped -- same convention as the
-                # MOVE-edge pass above / merge_foreign_duplicate. group_id is
-                # preserved from the wrong copy verbatim -- MERGE has no
-                # rewrite_group_id analogue (mirrors merge_foreign_duplicate).
-                edge_create_result = await home.query(
-                    'MATCH (a:Entity {uuid: $src_uuid}), (b:Entity {uuid: $dst_uuid}) '
-                    'CREATE (a)-[r:RELATES_TO]->(b) '
-                    'SET r.uuid = $edge_uuid, '
-                    '    r.name = $name, '
-                    '    r.fact = $fact, '
-                    '    r.valid_at = $valid_at, '
-                    '    r.invalid_at = $invalid_at, '
-                    '    r.created_at = $created_at, '
-                    '    r.group_id = $group_id, '
-                    '    r.episodes = $episodes'
-                    f'{embedding_clause}',
-                    {
-                        'src_uuid': src_uuid,
-                        'dst_uuid': dst_uuid,
-                        'edge_uuid': edge_uuid,
-                        'name': edge_name,
-                        'fact': fact,
-                        'valid_at': valid_at,
-                        'invalid_at': invalid_at,
-                        'created_at': edge_created_at,
-                        'group_id': edge_group_id,
-                        'episodes': episodes,
-                    },
+                # The home copy of this MERGE node and the edge's other
+                # endpoint must already exist in home_graph, or the edge is
+                # silently skipped -- same convention as the MOVE-edge pass
+                # above / merge_foreign_duplicate. group_id is preserved from
+                # the wrong copy verbatim -- MERGE has no rewrite_group_id
+                # analogue (mirrors merge_foreign_duplicate).
+                edge_create_result = await _create_edge_copy(
+                    home, edge, group_id=edge.group_id,
+                    embedding_clause=embedding_clause, op=op,
                 )
                 if edge_create_result.relationships_created:
                     result.edges_recreated += 1
@@ -1369,7 +1519,7 @@ async def _recreate_subgraph_relationships_batch(
                         'recreate_subgraph_relationships: MERGE-fold RELATES_TO '
                         'edge uuid=%s silently skipped -- other endpoint '
                         '(src=%s dst=%s) not present in home_graph=%s',
-                        edge_uuid, src_uuid, dst_uuid, home_graph,
+                        edge_uuid, edge.src_uuid, edge.dst_uuid, home_graph,
                     )
             except Exception as exc:
                 # Per-item isolation, same rationale as the MOVE-edge pass
@@ -1378,7 +1528,7 @@ async def _recreate_subgraph_relationships_batch(
                     'kind': 'edge',
                     'uuid': edge_uuid,
                     'reason': str(exc),
-                    'node_uuids': [src_uuid, dst_uuid],
+                    'node_uuids': [edge.src_uuid, edge.dst_uuid],
                 })
                 # error + exc_info: see the RELATES_TO MOVE-edge pass's
                 # matching comment above -- keeps a programming-error
@@ -1388,7 +1538,7 @@ async def _recreate_subgraph_relationships_batch(
                     'recreate_subgraph_relationships: MERGE-fold RELATES_TO '
                     'edge uuid=%s blocked -- %s: %s (src=%s dst=%s '
                     'home_graph=%s); batch continues',
-                    edge_uuid, type(exc).__name__, exc, src_uuid, dst_uuid,
+                    edge_uuid, type(exc).__name__, exc, edge.src_uuid, edge.dst_uuid,
                     home_graph,
                     exc_info=True,
                 )
@@ -1416,17 +1566,18 @@ async def delete_source_node(graphiti: Any, uuid: str, source_graph: str) -> Non
 
     Args:
         graphiti: An initialized GraphitiBackend (or compatible object
-            exposing ``_graph_for``).
+            exposing ``graph_access``).
         uuid: UUID of the Entity node to delete from source_graph.
         source_graph: Graph to delete the node from.
 
     Returns:
         None.
     """
-    source = graphiti._graph_for(source_graph)
+    source = graphiti.graph_access.graph(source_graph)
     await source.query(
         'MATCH (n:Entity {uuid: $uuid}) DETACH DELETE n',
         {'uuid': uuid},
+        op='delete_source_node',
     )
     logger.info(
         'delete_source_node: deleted uuid=%s source=%s', uuid, source_graph,
@@ -1504,7 +1655,7 @@ async def create_moved_episode(
 
     Args:
         graphiti: An initialized GraphitiBackend (or compatible object
-            exposing ``_graph_for``).
+            exposing ``graph_access``).
         uuid: UUID of the Episodic node to create in target_graph.
         source_graph: Graph the episode currently lives in (read-only).
         target_graph: Graph to CREATE the episode into.
@@ -1519,20 +1670,22 @@ async def create_moved_episode(
         NodeNotFoundError: if no Episodic node with *uuid* exists in
             *source_graph* (and it is also absent from *target_graph*).
     """
-    source = graphiti._graph_for(source_graph)
-    target = graphiti._graph_for(target_graph)
+    source = graphiti.graph_access.graph(source_graph)
+    target = graphiti.graph_access.graph(target_graph)
 
     node_result = await source.ro_query(
         'MATCH (n:Episodic {uuid: $uuid}) '
         'RETURN n.uuid, n.name, n.group_id, n.source_description, n.source, '
         '       n.content, n.entity_edges, n.created_at, n.valid_at',
         {'uuid': uuid},
+        op='create_moved_episode',
     )
 
     # --- unconditional target-presence probe (mirrors create_moved_node) ---
     target_probe = await target.ro_query(
         'MATCH (n:Episodic {uuid: $uuid}) RETURN n.uuid',
         {'uuid': uuid},
+        op='create_moved_episode',
     )
     episode_already_in_target = bool(target_probe.result_set)
 
@@ -1591,6 +1744,7 @@ async def create_moved_episode(
             'created_at': created_at,
             'valid_at': valid_at,
         },
+        op='create_moved_episode',
     )
     return EpisodeCreateResult(
         uuid=uuid, source_graph=source_graph, target_graph=target_graph,
@@ -1619,17 +1773,18 @@ async def delete_source_episode(graphiti: Any, uuid: str, source_graph: str) -> 
 
     Args:
         graphiti: An initialized GraphitiBackend (or compatible object
-            exposing ``_graph_for``).
+            exposing ``graph_access``).
         uuid: UUID of the Episodic node to delete from source_graph.
         source_graph: Graph to delete the episode from.
 
     Returns:
         None.
     """
-    source = graphiti._graph_for(source_graph)
+    source = graphiti.graph_access.graph(source_graph)
     await source.query(
         'MATCH (n:Episodic {uuid: $uuid}) DETACH DELETE n',
         {'uuid': uuid},
+        op='delete_source_episode',
     )
     logger.info(
         'delete_source_episode: deleted uuid=%s source=%s', uuid, source_graph,
@@ -1687,18 +1842,18 @@ class MergeResult:
     home_edge_count_after: int = 0
 
 
-async def _read_relates_to_edge_uuids(graph: Any, uuid: str) -> set[str]:
+async def _read_relates_to_edge_uuids(graph: GraphHandle, uuid: str, *, op: str) -> set[str]:
     """Read the set of RELATES_TO edge uuids incident to Entity *uuid* (either direction).
 
-    Lightweight uuid-only counterpart of the full-property edge read in
-    ``move_entity_across_graphs`` -- used where only set-membership (not the
-    edges' own properties) is needed.
+    Lightweight uuid-only counterpart of ``_read_incident_edges`` -- used
+    where only set-membership (not the edges' own properties) is needed.
     """
     result = await graph.ro_query(
         'MATCH (n:Entity {uuid: $uuid})-[e:RELATES_TO]-(m:Entity) '
         'WITH DISTINCT e '
         'RETURN e.uuid',
         {'uuid': uuid},
+        op=op,
     )
     return {row[0] for row in (result.result_set or [])}
 
@@ -1730,7 +1885,7 @@ async def merge_foreign_duplicate(
 
     Args:
         graphiti: An initialized GraphitiBackend (or compatible object
-            exposing ``_graph_for`` / ``_require_falkor_client``).
+            exposing ``graph_access``).
         uuid: UUID of the Entity node whose duplicate is being merged.
         wrong_graph: Graph holding the foreign (to-be-deleted) duplicate.
         home_graph: Graph holding the canonical copy.
@@ -1743,66 +1898,39 @@ async def merge_foreign_duplicate(
         recreate silently matched nothing -- see
         ``_read_relates_to_edge_uuids``) rather than a tautology.
     """
-    wrong = graphiti._graph_for(wrong_graph)
-    home = graphiti._graph_for(home_graph)
+    wrong = graphiti.graph_access.graph(wrong_graph)
+    home = graphiti.graph_access.graph(home_graph)
 
-    wrong_edges_result = await wrong.ro_query(
-        'MATCH (n:Entity {uuid: $uuid})-[e:RELATES_TO]-(m:Entity) '
-        'WITH DISTINCT e, startNode(e) AS s, endNode(e) AS t '
-        'RETURN e.uuid, e.name, e.fact, e.valid_at, e.invalid_at, e.created_at, '
-        '       e.group_id, e.episodes, s.uuid, t.uuid',
-        {'uuid': uuid},
+    wrong_edges_by_uuid = {
+        edge.uuid: edge
+        for edge in await _read_incident_edges(wrong, uuid, op='merge_foreign_duplicate')
+    }
+
+    home_edge_uuids = await _read_relates_to_edge_uuids(home, uuid, op='merge_foreign_duplicate')
+
+    unique_wrong_edge_uuids = classify_unique_wrong_edges(
+        home_edge_uuids, set(wrong_edges_by_uuid),
     )
-    wrong_edge_rows = wrong_edges_result.result_set or []
-    wrong_rows_by_uuid = {row[0]: row for row in wrong_edge_rows}
-    wrong_edge_uuids = set(wrong_rows_by_uuid)
 
-    home_edge_uuids = await _read_relates_to_edge_uuids(home, uuid)
-
-    unique_wrong_edge_uuids = classify_unique_wrong_edges(home_edge_uuids, wrong_edge_uuids)
-
-    falkor_client = graphiti._require_falkor_client()
     edges_recreated = 0
     for edge_uuid in unique_wrong_edge_uuids:
-        (_edge_uuid, edge_name, fact, valid_at, invalid_at, edge_created_at,
-         edge_group_id, episodes, src_uuid, dst_uuid) = wrong_rows_by_uuid[edge_uuid]
+        edge = wrong_edges_by_uuid[edge_uuid]
 
         edge_embedding_cypher = (
             f'MATCH ()-[e:RELATES_TO {{uuid: {_quote_cypher_string(edge_uuid)}}}]-() '
             'RETURN e.fact_embedding'
         )
         edge_embedding_reply = await _read_compact_vector(
-            falkor_client, group_id=wrong_graph, cypher=edge_embedding_cypher,
+            wrong, cypher=edge_embedding_cypher, op='merge_foreign_duplicate',
         )
 
-        # Both endpoints are MATCHed (never CREATEd): the home copy of the
-        # moved-duplicate's node and the edge's other endpoint must already
-        # exist in home_graph, or this MATCH yields no rows and the edge is
+        # The home copy of the moved-duplicate's node and the edge's other
+        # endpoint must already exist in home_graph, or the edge is
         # silently skipped (same convention as move_entity_across_graphs).
-        await home.query(
-            'MATCH (a:Entity {uuid: $src_uuid}), (b:Entity {uuid: $dst_uuid}) '
-            'CREATE (a)-[r:RELATES_TO]->(b) '
-            'SET r.uuid = $edge_uuid, '
-            '    r.name = $name, '
-            '    r.fact = $fact, '
-            '    r.valid_at = $valid_at, '
-            '    r.invalid_at = $invalid_at, '
-            '    r.created_at = $created_at, '
-            '    r.group_id = $group_id, '
-            '    r.episodes = $episodes'
-            f'{_embedding_set_clause("r.fact_embedding", edge_embedding_reply)}',
-            {
-                'src_uuid': src_uuid,
-                'dst_uuid': dst_uuid,
-                'edge_uuid': edge_uuid,
-                'name': edge_name,
-                'fact': fact,
-                'valid_at': valid_at,
-                'invalid_at': invalid_at,
-                'created_at': edge_created_at,
-                'group_id': edge_group_id,
-                'episodes': episodes,
-            },
+        await _create_edge_copy(
+            home, edge, group_id=edge.group_id,
+            embedding_clause=_embedding_set_clause('r.fact_embedding', edge_embedding_reply),
+            op='merge_foreign_duplicate',
         )
         edges_recreated += 1
 
@@ -1814,7 +1942,9 @@ async def merge_foreign_duplicate(
     # edge's other endpoint is absent from home) would leave home's actual
     # edge count unchanged; only an independent re-read surfaces that
     # mismatch instead of masking it behind arithmetic.
-    home_edge_uuids_after = await _read_relates_to_edge_uuids(home, uuid)
+    home_edge_uuids_after = await _read_relates_to_edge_uuids(
+        home, uuid, op='merge_foreign_duplicate',
+    )
 
     # --- wrong-graph-copy DETACH DELETE (step-19/20) ---
     # Always the LAST mutation: every home-copy recreate above has already
@@ -1822,6 +1952,7 @@ async def merge_foreign_duplicate(
     await wrong.query(
         'MATCH (n:Entity {uuid: $uuid}) DETACH DELETE n',
         {'uuid': uuid},
+        op='merge_foreign_duplicate',
     )
 
     logger.info(

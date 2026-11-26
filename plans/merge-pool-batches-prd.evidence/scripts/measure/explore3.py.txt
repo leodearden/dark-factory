@@ -1,0 +1,23 @@
+import json
+from collections import Counter
+E = json.load(open('/tmp/gate-10069/measure/events.json'))
+Q = [e for e in E if e['type'] == 'merge_queued' and e['ts'] >= '2026-11-05']
+print('merge_queued head_sha non-null by day', sorted(Counter((e['ts'][:10], e['d'].get('head_sha') is not None) for e in Q).items()))
+D = [e for e in E if e['type'] == 'merge_dequeued' and e['ts'] >= '2026-11-05']
+print('dequeued with waiting key by day', sorted(Counter((e['ts'][:10], 'waiting' in e['d']) for e in D).items()))
+# does waiting include picked?
+inc = sum(1 for e in D if 'waiting' in e['d'] and any(w.get('request_id') == e['d'].get('request_id') for w in e['d']['waiting']))
+print('waiting includes picked request:', inc, 'of', sum(1 for e in D if 'waiting' in e['d']))
+ex = next(e for e in D if 'waiting' in e['d'])
+print(ex['ts'], json.dumps({k: v for k, v in ex['d'].items() if k != 'waiting'}), len(ex['d']['waiting']))
+print('waiting_dropped sample', Counter(str(e['d'].get('waiting_dropped')) for e in D if 'waiting' in e['d']).most_common(5))
+F = [e for e in E if e['type'] == 'merge_finalized' and e['ts'] >= '2026-11-05']
+print('finalized states', Counter(e['d'].get('state') for e in F))
+print('snapshot_tip nonnull', Counter(e['d'].get('snapshot_tip') is not None for e in F))
+G = [e for e in E if e['type'] == 'merge_reverify_gate' and e['ts'] >= '2026-11-05']
+print('reverify_gate reverify', Counter(e['d'].get('reverify') for e in G), Counter(e['d'].get('reason') for e in G))
+A = [e for e in E if e['type'] == 'merge_attempt' and e['ts'] >= '2026-11-05']
+print('attempt outcomes', Counter(e['d'].get('outcome') for e in A).most_common(), Counter(e['d'].get('disposition') for e in A))
+print(json.dumps([e['d'] for e in A if e['d'].get('outcome') == 'verify_failed'][-1])[:800])
+C = [e for e in E if e['type'] == 'merge_verify_cancelled' and e['ts'] >= '2026-11-05']
+print('cancel causes', Counter(e['d'].get('cause') for e in C))

@@ -1,0 +1,1214 @@
+"""Tests for escalation.pins — THE shared severity-aware pin classifier (task 3533).
+
+PRD ``plans/task-escalation-state-graph-prd.md`` D3, spec
+``docs/task-escalation-state-spec.md`` S6/E7. The classifier is the single
+pin predicate (INV-5) every recovery/redispatch veto site consumes; this task
+delivers the types + classifier + tests only — no veto site is rewired here.
+
+Covers:
+  step-3: pure type-surface contract — the StrEnum, the frozen report value
+          object, and the STATICALLY-CHECKED structural Protocol seam, with no
+          classification logic asserted yet.
+  step-5: the SEVERITY rules (spec S6 clauses i and ii) — info never pins;
+          missing/out-of-vocabulary severity fails safe to pinning, which
+          deliberately OUTRANKS the dead-L0 rule.
+  step-7: the LEVEL rule (L1/L2 always pin) and the DEAD-L0 FILING-INCARNATION
+          rule (spec S6 clauses iii and iv) — liveness is judged against the
+          incarnation that FILED the record.
+  step-9: the STORE-UNAVAILABLE third state (never collapsed into "no
+          records"), report aggregation, the two derived predicates, and
+          purity.
+  amend:  the two remaining fail-safes — a BORN_AT_L2 severity found at L0
+          (contradictory state), and a live-claimant identity that is not in
+          compose_claimant_run_id shape — plus classification of a REAL
+          ``escalation.models.Escalation`` (the server-side record type).
+"""
+
+from __future__ import annotations
+
+import copy
+import dataclasses
+import typing
+from pathlib import Path
+
+import pytest
+
+from escalation.models import BORN_AT_L2_SEVERITIES, KNOWN_SEVERITIES, Escalation
+from escalation.pins import (
+    ClusterPinRecord,
+    PinClass,
+    PinRecord,
+    PinReport,
+    classify_pins,
+    is_queue_handoff,
+    needs_human,
+    pinned_only_by_human_parked,
+)
+
+# ---------------------------------------------------------------------------
+# step-3 — pure type-surface contract
+# ---------------------------------------------------------------------------
+
+
+class TestPinClass:
+    """PinClass is a genuine-``str`` StrEnum with exactly three lowercase members."""
+
+    def test_members_have_exact_lowercase_values(self) -> None:
+        # Genuine str members — equality against a plain string holds without `.value`.
+        assert PinClass.DEAD_L0 == 'dead_l0'
+        assert PinClass.QUEUE_HANDOFF == 'queue_handoff'
+        assert PinClass.NON_PINNING == 'non_pinning'
+
+    def test_has_exactly_three_members(self) -> None:
+        assert {m.value for m in PinClass} == {'dead_l0', 'queue_handoff', 'non_pinning'}
+
+
+class TestPinReportTypeSurface:
+    """PinReport is a frozen value object with the PRD's three positional buckets."""
+
+    def test_is_frozen(self) -> None:
+        report = PinReport((), (), ())
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            report.dead_l0 = ('esc-1-1',)  # type: ignore[misc]
+
+    def test_constructs_positionally_with_prd_shape(self) -> None:
+        """The PRD's literal ``PinReport(dead_l0, queue_handoff, non_pinning)`` shape."""
+        report = PinReport((), (), ())
+        assert report.dead_l0 == ()
+        assert report.queue_handoff == ()
+        assert report.non_pinning == ()
+
+    def test_store_unavailable_and_task_id_default(self) -> None:
+        report = PinReport((), (), ())
+        assert report.store_unavailable is False
+        assert report.task_id == ''
+
+    def test_empty_available_report_does_not_pin_or_veto(self) -> None:
+        report = PinReport((), (), ())
+        assert report.pins is False
+        assert report.vetoes_done_flip is False
+
+    def test_derived_predicates_are_genuine_bools(self) -> None:
+        """``pins`` / ``vetoes_done_flip`` return real bools, not truthy tuples."""
+        report = PinReport((), (), ())
+        assert isinstance(report.pins, bool)
+        assert isinstance(report.vetoes_done_flip, bool)
+
+
+class TestPinRecordProtocol:
+    """PinRecord is a structural Protocol both record types satisfy.
+
+    Conformance is pinned by a STATIC, pyright-checked assignment rather than
+    runtime introspection: there is no runtime predicate for structural-Protocol
+    conformance that is both public and meaningful (``isinstance`` needs
+    ``@runtime_checkable``, which only re-checks attribute NAMES). The
+    assignment below also checks attribute TYPES and read-only compatibility.
+    """
+
+    def test_escalation_satisfies_pin_record_statically(self) -> None:
+        """The seam is checked by pyright too, not only at runtime — this
+        assignment fails type-check if PinRecord and Escalation ever drift."""
+        esc = Escalation(
+            id='esc-42-1', task_id='42', agent_role='implementer',
+            severity='blocking', category='infra_issue', summary='s',
+        )
+        record: PinRecord = esc
+        assert record.id == 'esc-42-1'
+
+    def test_escalation_satisfies_cluster_pin_record_statically(self) -> None:
+        """The members-carrying sub-protocol accepts the server-side record too."""
+        esc = Escalation(
+            id='esc-42-2', task_id='42', agent_role='escalation-watcher-auto',
+            severity='blocking', category='infra_issue', summary='s', level=2,
+            members=['esc-42-1'],
+        )
+        record: ClusterPinRecord = esc
+        assert list(record.members) == ['esc-42-1']
+
+
+class TestPinsModuleExports:
+    def test_all_exports_the_public_surface(self) -> None:
+        """Containment, not equality — a future export must not fail this for
+        a purely cosmetic reason. The module-level imports above already pin
+        that each name exists and is importable."""
+        import escalation.pins as pins_mod
+
+        assert {
+            'PinClass', 'PinRecord', 'PinReport', 'classify_pins', 'is_queue_handoff',
+            'needs_human',
+        } <= set(pins_mod.__all__)
+
+
+# ---------------------------------------------------------------------------
+# shared test doubles
+# ---------------------------------------------------------------------------
+
+#: A live incarnation's identity, in compose_claimant_run_id format.
+LIVE_ID = 'run-B/sess-B/pid=2'
+#: A DIFFERENT (prior) incarnation's identity.
+OTHER_ID = 'run-A/sess-A/pid=1'
+
+
+@dataclasses.dataclass(frozen=True)
+class _Rec:
+    """A minimal PinRecord double — keeps these tests independent of
+    ``Escalation``'s (much wider) constructor."""
+
+    id: str
+    level: int
+    severity: str
+    filing_claimant_run_id: str | None
+    members: tuple[str, ...] = ()
+
+
+def _rec(
+    *,
+    id: str = 'esc-42-1',  # mirrors the PinRecord attribute name
+    level: int = 0,
+    severity: str | None = 'blocking',
+    filing: str | None = None,
+    members: tuple[str, ...] = (),
+) -> _Rec:
+    return _Rec(
+        id=id,
+        level=level,
+        severity=typing.cast('str', severity),
+        filing_claimant_run_id=filing,
+        members=members,
+    )
+
+
+def _bucket_of(
+    record: _Rec,
+    *,
+    live_claimant: bool = True,
+    live_claimant_id: str | None = None,
+) -> str:
+    """Classify a single *record* and return the name of the bucket it lands in."""
+    report = classify_pins(
+        '42', [record], live_claimant=live_claimant, live_claimant_id=live_claimant_id,
+    )
+    landed = [
+        name
+        for name in ('dead_l0', 'queue_handoff', 'non_pinning')
+        if record.id in getattr(report, name)
+    ]
+    assert len(landed) == 1, f'record must land in exactly one bucket, got {landed}'
+    return landed[0]
+
+
+# ---------------------------------------------------------------------------
+# step-5 — severity rules (spec S6 clauses i and ii): precedence links 1 and 2
+# ---------------------------------------------------------------------------
+
+
+class TestInfoNeverPins:
+    """Clause (i): an ``info`` record never pins, at any level, unconditionally."""
+
+    @pytest.mark.parametrize('level', [0, 1, 2])
+    @pytest.mark.parametrize('live_claimant', [True, False])
+    @pytest.mark.parametrize('filing', [OTHER_ID, LIVE_ID, None])
+    def test_info_is_non_pinning_at_every_level_and_liveness(
+        self, level: int, live_claimant: bool, filing: str | None,
+    ) -> None:
+        bucket = _bucket_of(
+            _rec(level=level, severity='info', filing=filing),
+            live_claimant=live_claimant,
+            live_claimant_id=LIVE_ID,
+        )
+        assert bucket == 'non_pinning'
+
+    @pytest.mark.parametrize('raw', ['INFO', ' info ', 'Info', 'iNfO\n'])
+    def test_severity_is_normalised_before_matching(self, raw: str) -> None:
+        """Severity is stripped and lowercased before the vocabulary match."""
+        assert _bucket_of(_rec(severity=raw)) == 'non_pinning'
+
+
+class TestUnknownSeverityFailsSafeToPinning:
+    """Clause (ii): missing / out-of-vocabulary severity fails safe to PINNING —
+    "treated as a handoff, never to conversion" (spec S6)."""
+
+    @pytest.mark.parametrize('severity', ['', None, '   ', 'bogus', 'BLOCKER'])
+    @pytest.mark.parametrize('level', [0, 1, 2])
+    def test_unknown_severity_is_queue_handoff_at_every_level(
+        self, severity: str | None, level: int,
+    ) -> None:
+        assert severity is None or severity.strip().lower() not in KNOWN_SEVERITIES
+        assert _bucket_of(_rec(level=level, severity=severity)) == 'queue_handoff'
+
+    @pytest.mark.parametrize('severity', ['', None, '   ', 'bogus'])
+    def test_unknown_severity_outranks_the_dead_l0_rule(self, severity: str | None) -> None:
+        """THE precedence pin: an L0 with a provably-dead filer and an unknown
+        severity STILL pins — spec S6's "never to conversion" clause is only
+        meaningful if the fail-safe is evaluated ABOVE the L0 branch that
+        produces the convertible DEAD_L0 class. Do not "fix" this ordering."""
+        bucket = _bucket_of(
+            _rec(level=0, severity=severity, filing=OTHER_ID),
+            live_claimant=False,
+        )
+        assert bucket == 'queue_handoff', 'unknown severity must never convert to dead_l0'
+
+
+class TestKnownNonInfoSeveritiesArePinCandidates:
+    """Every known non-info severity is a pin candidate — never ``non_pinning``."""
+
+    @pytest.mark.parametrize('severity', sorted(KNOWN_SEVERITIES - {'info'}))
+    @pytest.mark.parametrize('level', [0, 1, 2])
+    def test_known_non_info_severity_is_not_non_pinning(
+        self, severity: str, level: int,
+    ) -> None:
+        bucket = _bucket_of(
+            _rec(level=level, severity=severity), live_claimant=True, live_claimant_id=LIVE_ID,
+        )
+        assert bucket != 'non_pinning'
+
+    def test_vocabulary_oracle_is_shared_with_models(self) -> None:
+        """The classifier's "known severity" set is models.KNOWN_SEVERITIES —
+        re-hardcoding it here would let a newly-added severity silently start
+        failing the classifier's fail-safe branch."""
+        assert 'info' in KNOWN_SEVERITIES
+        assert {'info', 'blocking', 'critical', 'urgent'} <= KNOWN_SEVERITIES
+
+
+# ---------------------------------------------------------------------------
+# step-7 — level rule + dead-L0 filing-incarnation rule (spec S6 clauses
+# iii and iv): precedence links 3 and 4
+# ---------------------------------------------------------------------------
+
+#: Severities for which the level/liveness outcome must be identical.
+NON_INFO = sorted(KNOWN_SEVERITIES - {'info'})
+#: The non-info severities an L0 can LEGALLY carry. critical/urgent are BORN at
+#: L2 (models.BORN_AT_L2_SEVERITIES) and routed straight to a human, so an L0
+#: carrying one is contradictory state that fails safe to pinning instead of
+#: reaching the dead-L0 rule — see TestBornAtL2SeverityAtLevelZeroFailsSafe.
+L0_NON_INFO = sorted(KNOWN_SEVERITIES - {'info'} - BORN_AT_L2_SEVERITIES)
+
+
+class TestLevelRule:
+    """Clause (iii): L1/L2 are queue-backed handoffs with supervised consumers —
+    they pin regardless of liveness, so the filing-incarnation rule is L0-ONLY."""
+
+    @pytest.mark.parametrize('severity', NON_INFO)
+    @pytest.mark.parametrize('level', [1, 2])
+    @pytest.mark.parametrize('live_claimant', [True, False])
+    @pytest.mark.parametrize('filing', [LIVE_ID, OTHER_ID])
+    def test_l1_and_l2_are_queue_handoff_under_every_liveness_combination(
+        self, severity: str, level: int, live_claimant: bool, filing: str,
+    ) -> None:
+        bucket = _bucket_of(
+            _rec(level=level, severity=severity, filing=filing),
+            live_claimant=live_claimant,
+            live_claimant_id=LIVE_ID,
+        )
+        assert bucket == 'queue_handoff', 'an L1/L2 is never dead_l0'
+
+    @pytest.mark.parametrize('level', [3, 99, -1])
+    def test_out_of_vocabulary_levels_fail_safe_to_queue_handoff(self, level: int) -> None:
+        """A corrupt/out-of-range level pins. This is the exact shape that would
+        wrongly become dead_l0 if the guard were written ``level >= 1`` instead
+        of ``level != 0``."""
+        bucket = _bucket_of(
+            _rec(level=level, severity='blocking', filing=OTHER_ID),
+            live_claimant=False,
+        )
+        assert bucket == 'queue_handoff'
+
+
+class TestDeadL0FilingIncarnationRule:
+    """Clause (iv): an L0 whose FILING incarnation is dead is DEAD_L0.
+
+    The rule itself is documented on ``escalation.pins.classify_pins`` (spec
+    ``docs/task-escalation-state-spec.md`` S6); these tests pin its outcomes.
+    Parametrised over L0_NON_INFO, not NON_INFO: critical/urgent never reach
+    this link (they are intercepted at L0 by link 3b)."""
+
+    @pytest.mark.parametrize('severity', L0_NON_INFO)
+    @pytest.mark.parametrize('filing', [OTHER_ID, None])
+    def test_no_live_claimant_at_all_is_dead_l0(self, severity: str, filing: str | None) -> None:
+        """With NO incarnation live, the filing one is necessarily dead —
+        identity-independent. This is the 2026-08-02 strand shape: 7 of 9
+        stranded tasks were pinned by their own dead-steward L0."""
+        bucket = _bucket_of(
+            _rec(level=0, severity=severity, filing=filing),
+            live_claimant=False,
+            live_claimant_id=None,
+        )
+        assert bucket == 'dead_l0'
+
+    @pytest.mark.parametrize('severity', L0_NON_INFO)
+    def test_newer_live_incarnation_does_not_keep_a_prior_incarnations_l0_alive(
+        self, severity: str,
+    ) -> None:
+        """THE load-bearing case (spec S6): a claimant IS live, but it is not
+        the one that filed this record — so the record's handoff has no
+        consumer left and must NOT keep pinning the task."""
+        bucket = _bucket_of(
+            _rec(level=0, severity=severity, filing=OTHER_ID),
+            live_claimant=True,
+            live_claimant_id=LIVE_ID,
+        )
+        assert bucket == 'dead_l0'
+
+    @pytest.mark.parametrize('severity', L0_NON_INFO)
+    def test_live_filing_incarnation_is_a_genuine_handoff(self, severity: str) -> None:
+        """An L0 whose filer IS the live incarnation is a real, live handoff —
+        it pins (queue_handoff is the only pinning bucket)."""
+        bucket = _bucket_of(
+            _rec(level=0, severity=severity, filing=LIVE_ID),
+            live_claimant=True,
+            live_claimant_id=LIVE_ID,
+        )
+        assert bucket == 'queue_handoff'
+
+    @pytest.mark.parametrize(
+        ('filing', 'live_id'),
+        [
+            (None, LIVE_ID),      # record's filing identity unknown
+            ('', LIVE_ID),        # ... blank
+            ('   ', LIVE_ID),     # ... whitespace-only
+            (OTHER_ID, None),     # caller could not resolve the live identity
+            (OTHER_ID, ''),       # ... blank
+            (OTHER_ID, '   '),    # ... whitespace-only
+            (None, None),         # neither side known
+        ],
+    )
+    def test_unknown_identity_on_either_side_fails_safe_to_pinning(
+        self, filing: str | None, live_id: str | None,
+    ) -> None:
+        """The classifier may only convert an L0 when it can PROVE the filing
+        incarnation is dead. It cannot here, so it pins.
+
+        Governs every record whose filing identity is unknown: legacy rows
+        written before task 3550, and producers that still do not stamp (see
+        the inventory on ``pins.classify_pins`` — most are moot above link
+        4)."""
+        bucket = _bucket_of(
+            _rec(level=0, severity='blocking', filing=filing),
+            live_claimant=True,
+            live_claimant_id=live_id,
+        )
+        assert bucket == 'queue_handoff', 'must never convert on unprovable liveness'
+
+    def test_identities_are_compared_as_exact_strings(self) -> None:
+        """Identities differing only in the ``pid=`` suffix are DIFFERENT
+        incarnations — shared.task_claimant ships a composer and deliberately
+        no parser, so the classifier never decomposes the triple."""
+        bucket = _bucket_of(
+            _rec(level=0, severity='blocking', filing='run-A/sess-A/pid=1'),
+            live_claimant=True,
+            live_claimant_id='run-A/sess-A/pid=2',
+        )
+        assert bucket == 'dead_l0'
+
+
+class TestBornAtL2SeverityAtLevelZeroFailsSafe:
+    """A ``BORN_AT_L2_SEVERITIES`` record found at L0 is CONTRADICTORY state.
+
+    critical/urgent escalations are created directly at L2 and routed straight
+    to a human (models.py's consumer-per-level contract), which is why every
+    in-repo producer stamps ``level=2`` alongside them. An L0 carrying one is
+    therefore corrupt, and — in the same spirit as link 3's ``!= 0`` — it fails
+    safe to PINNING rather than becoming a convertible ``dead_l0`` that
+    silently stops pinning a human-routed record.
+    """
+
+    @pytest.mark.parametrize('severity', sorted(BORN_AT_L2_SEVERITIES))
+    @pytest.mark.parametrize(
+        ('live_claimant', 'live_id', 'filing'),
+        [
+            (False, None, OTHER_ID),   # no incarnation live at all
+            (False, None, None),       # ... and no filing identity either
+            (True, LIVE_ID, OTHER_ID),  # a DIFFERENT incarnation is live
+        ],
+    )
+    def test_born_at_l2_severity_at_l0_is_queue_handoff(
+        self, severity: str, live_claimant: bool, live_id: str | None, filing: str | None,
+    ) -> None:
+        bucket = _bucket_of(
+            _rec(level=0, severity=severity, filing=filing),
+            live_claimant=live_claimant,
+            live_claimant_id=live_id,
+        )
+        assert bucket == 'queue_handoff', 'a human-routed record must never convert'
+
+    @pytest.mark.parametrize('severity', sorted(BORN_AT_L2_SEVERITIES))
+    @pytest.mark.parametrize('level', [1, 2])
+    def test_born_at_l2_severity_at_its_own_levels_still_pins(
+        self, severity: str, level: int,
+    ) -> None:
+        """The L0 interception changes nothing about the normal L1/L2 path."""
+        assert _bucket_of(_rec(level=level, severity=severity), live_claimant=False) == (
+            'queue_handoff'
+        )
+
+
+class TestInfoAtL2Coupling:
+    """The info-at-L2 / promote_to_l2 coupling (task 4402, follow-up to 3976).
+
+    Task 3976 changed ``promote_to_l2`` so an OMITTED ``severity`` argument
+    inherits ``max(member severities)`` instead of defaulting to
+    ``'blocking'`` — so promote_to_l2 can now MINT a FRESH L2 carrying
+    ``severity='info'``. (This was not the first way to reach an
+    info-severity L2 at all: ``EscalationQueue.park()`` has always been able
+    to PROMOTE an already-open info-severity L0/L1 to level=2 without
+    touching severity — see ``escalation.queue.EscalationQueue.park``. What's
+    new with 3976 is a fresh MINT at that combination, not the combination
+    itself.) Link 1 above short-circuits on ``severity == 'info'`` BEFORE the
+    ``level != 0`` link, so this record classifies ``NON_PINNING``. This is
+    documented as INTENDED semantics on ``escalation.server.promote_to_l2``'s
+    docstring (its members were themselves non-pinning, and the classifier is
+    not yet wired to any production veto site — task 3541).
+
+    The test below exercises the REAL derivation seam
+    (``escalation.server._derive_l2_severity``) against an all-info member
+    cluster and feeds the resulting level=2/severity='info' ``Escalation``
+    through ``classify_pins`` — so a regression on EITHER side of the
+    coupling (the inheritance losing 'info', or pins.py's precedence chain
+    being re-ordered) fails loudly here instead of only contradicting prose.
+    The liveness/filing-identity dimension is deliberately NOT re-parametrised
+    here: it is already exhaustively covered for severity='info' at every
+    level by ``TestInfoNeverPins``, and this test's own job is the derivation
+    seam, not another pass over that matrix."""
+
+    def test_promote_to_l2_mints_info_from_all_info_members_and_it_does_not_pin(
+        self, tmp_path: Path,
+    ) -> None:
+        from escalation.queue import EscalationQueue
+        from escalation.server import _derive_l2_severity, _read_members
+
+        queue = EscalationQueue(tmp_path / 'esc')
+        queue.submit(Escalation(
+            id='esc-42-1', task_id='42', agent_role='implementer',
+            severity='info', category='infra_issue', summary='s1',
+        ))
+        queue.submit(Escalation(
+            id='esc-42-2', task_id='42', agent_role='implementer',
+            severity='info', category='infra_issue', summary='s2',
+        ))
+
+        # Producer side: an all-info member cluster derives severity='info' —
+        # this is what an omitted promote_to_l2(severity=...) resolves to.
+        derived = _derive_l2_severity(_read_members(queue, ['esc-42-1', 'esc-42-2']))
+        assert derived == 'info'
+
+        # The shape promote_to_l2's create path mints from `derived`: an
+        # Escalation at level=2 carrying the derived severity and the member
+        # ids (see server.py's `effective_severity` / queue.submit call).
+        minted = Escalation(
+            id='esc-42-3', task_id='42', agent_role='escalation-watcher-auto',
+            severity=typing.cast('str', derived), category='design_concern',
+            summary='cluster', level=2, members=['esc-42-1', 'esc-42-2'],
+        )
+
+        # Consumer side: classify_pins reads the minted record as NON_PINNING.
+        report = classify_pins('42', [minted], live_claimant=False)
+        assert report.non_pinning == ('esc-42-3',)
+        assert report.queue_handoff == ()
+        assert report.pins is False
+
+
+class TestLiveClaimantIdShapeGuard:
+    """``live_claimant_id`` must be a full ``compose_claimant_run_id`` string.
+
+    The only in-repo producer of a live identity
+    (``TaskGroundTruth._resolve_live_claimant``) was normalised by task 3563
+    and now emits only composed identities or ``None``: its DB source yields
+    the composed identity, its plan.lock source yields a composed identity
+    when the lock records a run_id and ``None`` (unknown) otherwise, and its
+    in-memory source yields ``None``. Comparing a bare session_id against a
+    composed filing identity would always mismatch and so would convert a
+    genuinely LIVE filer's L0 to ``dead_l0`` — the unsafe direction. A format
+    mismatch is not PROOF that the filer is dead, so a non-composed identity
+    on EITHER side is treated as unknown.
+
+    Its plan.lock leg reads the ``.task-meta`` root the lock's writer targets
+    (task 4028), so a composed identity from that source is reachable on a real
+    run; no production caller passes a live identity into ``classify_pins`` yet
+    (task 3541).
+
+    The cases below are UNCHANGED and stay load-bearing: a bare session_id is
+    still a shape this guard must reject, merely no longer one the in-repo
+    resolver produces. Legacy plan.lock files already on disk, harness-less
+    workflows (whose DB claimant stamp is itself partial), and any future
+    producer can still supply one — defence in depth, not a substitute for the
+    producer-side normalisation.
+    """
+
+    @pytest.mark.parametrize(
+        'bare_live_id',
+        ['sess-A', '3533-f3af2d2a', 'run-A/sess-A', 'pid=1'],
+    )
+    def test_non_composed_live_identity_is_treated_as_unknown(self, bare_live_id: str) -> None:
+        bucket = _bucket_of(
+            _rec(level=0, severity='blocking', filing=OTHER_ID),
+            live_claimant=True,
+            live_claimant_id=bare_live_id,
+        )
+        assert bucket == 'queue_handoff', 'a shape mismatch is not proof of a dead filer'
+
+    @pytest.mark.parametrize('bare_filing', ['sess-A', 'run-A/sess-A'])
+    def test_non_composed_filing_identity_is_treated_as_unknown(self, bare_filing: str) -> None:
+        bucket = _bucket_of(
+            _rec(level=0, severity='blocking', filing=bare_filing),
+            live_claimant=True,
+            live_claimant_id=LIVE_ID,
+        )
+        assert bucket == 'queue_handoff'
+
+    def test_the_guard_is_a_shape_check_not_a_parse(self) -> None:
+        """Two composed identities are still compared WHOLE — the guard only
+        gates on the ``/pid=`` marker, it never decomposes the triple."""
+        assert (
+            _bucket_of(
+                _rec(level=0, severity='blocking', filing='run-A/sess-A/pid=1'),
+                live_claimant=True,
+                live_claimant_id='run-A/sess-A/pid=2',
+            )
+            == 'dead_l0'
+        )
+
+    def test_the_no_live_claimant_branch_is_identity_independent(self) -> None:
+        """``live_claimant=False`` decides before any identity is inspected, so
+        a bare live id cannot suppress the 2026-08-02 strand conversion."""
+        bucket = _bucket_of(
+            _rec(level=0, severity='blocking', filing=OTHER_ID),
+            live_claimant=False,
+            live_claimant_id='sess-A',
+        )
+        assert bucket == 'dead_l0'
+
+
+# ---------------------------------------------------------------------------
+# step-9 — store-correctness third state, aggregation, derived predicates
+# ---------------------------------------------------------------------------
+
+
+class TestStoreUnavailableThirdState:
+    """Spec S6 store-correctness contract (esc-3163 lesson): "store unavailable"
+    is a DISTINGUISHABLE third result, never collapsed into "no records" — a
+    false ``[]`` would route a genuinely-pinned strand into the plain revert
+    branch."""
+
+    def test_records_none_is_store_unavailable_and_pins(self) -> None:
+        report = classify_pins('42', None, live_claimant=False)
+
+        assert report.store_unavailable is True
+        assert report.dead_l0 == ()
+        assert report.queue_handoff == ()
+        assert report.non_pinning == ()
+        assert report.pins is True
+        assert report.vetoes_done_flip is True
+
+    def test_empty_records_is_store_available_and_does_not_pin(self) -> None:
+        report = classify_pins('42', [], live_claimant=False)
+
+        assert report.store_unavailable is False
+        assert report.dead_l0 == ()
+        assert report.queue_handoff == ()
+        assert report.non_pinning == ()
+        assert report.pins is False
+        assert report.vetoes_done_flip is False
+
+    def test_store_unavailable_is_not_equal_to_no_records(self) -> None:
+        """The regression pin: a false ``[]`` cannot masquerade as a store
+        failure (nor the reverse) — the collapse is structurally impossible,
+        not merely discouraged."""
+        unavailable = classify_pins('42', None, live_claimant=False)
+        empty = classify_pins('42', [], live_claimant=False)
+        assert unavailable != empty
+
+    @pytest.mark.parametrize('live_claimant', [True, False])
+    @pytest.mark.parametrize('live_id', [None, LIVE_ID, ''])
+    def test_none_short_circuits_regardless_of_liveness_arguments(
+        self, live_claimant: bool, live_id: str | None,
+    ) -> None:
+        report = classify_pins(
+            '42', None, live_claimant=live_claimant, live_claimant_id=live_id,
+        )
+        assert report.store_unavailable is True
+
+    def test_store_unavailable_report_echoes_task_id(self) -> None:
+        assert classify_pins('77', None, live_claimant=False).task_id == '77'
+
+
+class TestReportAggregation:
+    """A mixed batch splits into the three buckets, preserving input order."""
+
+    MIXED = [
+        _rec(id='esc-42-1', level=0, severity='info'),
+        _rec(id='esc-42-2', level=0, severity='blocking'),
+        _rec(id='esc-42-3', level=1, severity='blocking'),
+        _rec(id='esc-42-4', level=0, severity='bogus'),
+    ]
+
+    def _report(self) -> PinReport:
+        return classify_pins('42', self.MIXED, live_claimant=False)
+
+    def test_mixed_batch_splits_into_the_three_buckets(self) -> None:
+        report = self._report()
+        assert report.non_pinning == ('esc-42-1',)
+        assert report.dead_l0 == ('esc-42-2',)
+        assert report.queue_handoff == ('esc-42-3', 'esc-42-4')
+
+    def test_queue_handoff_preserves_input_order(self) -> None:
+        reordered = [self.MIXED[3], self.MIXED[2]]
+        report = classify_pins('42', reordered, live_claimant=False)
+        assert report.queue_handoff == ('esc-42-4', 'esc-42-3')
+
+    def test_buckets_are_tuples_of_ids(self) -> None:
+        report = self._report()
+        for bucket in (report.dead_l0, report.queue_handoff, report.non_pinning):
+            assert isinstance(bucket, tuple)
+            assert all(isinstance(item, str) for item in bucket)
+
+    def test_every_record_lands_in_exactly_one_bucket(self) -> None:
+        """No drops, no duplicates."""
+        report = self._report()
+        landed = [*report.dead_l0, *report.queue_handoff, *report.non_pinning]
+        assert len(landed) == len(self.MIXED)
+        assert sorted(landed) == sorted(rec.id for rec in self.MIXED)
+
+    def test_report_echoes_task_id_for_structured_emission(self) -> None:
+        assert self._report().task_id == '42'
+
+    def test_records_are_not_filtered_on_their_own_task_id(self) -> None:
+        """The CALLER owns the read scope; the classifier classifies what it is
+        given (an id-prefix filter here would silently drop rows)."""
+        foreign = _rec(id='esc-999-1', level=1, severity='blocking')
+        report = classify_pins('42', [foreign], live_claimant=False)
+        assert report.queue_handoff == ('esc-999-1',)
+
+
+class TestDerivedPredicates:
+    """``pins`` is the recovery veto; ``vetoes_done_flip`` is the deliberately
+    more conservative MARK_DONE veto (PRD D3)."""
+
+    def _classify(self, records: list[_Rec]) -> PinReport:
+        return classify_pins('42', records, live_claimant=False)
+
+    def test_dead_l0_only_batch_does_not_pin(self) -> None:
+        """PRD boundary row 7: a dead-L0 does not block conversion."""
+        report = self._classify([_rec(id='esc-42-1', level=0, severity='blocking')])
+        assert report.dead_l0 == ('esc-42-1',)
+        assert report.pins is False
+
+    def test_info_only_batch_does_not_pin(self) -> None:
+        """PRD boundary row 8."""
+        report = self._classify([_rec(id='esc-42-1', level=0, severity='info')])
+        assert report.non_pinning == ('esc-42-1',)
+        assert report.pins is False
+
+    def test_queue_handoff_batch_pins(self) -> None:
+        report = self._classify([_rec(id='esc-42-1', level=1, severity='blocking')])
+        assert report.pins is True
+
+    def test_dead_l0_still_vetoes_the_done_flip(self) -> None:
+        """PRD D3: ANY non-info open record still vetoes MARK_DONE —
+        phantom-done protection is the half of the veto that was always right."""
+        report = self._classify([_rec(id='esc-42-1', level=0, severity='blocking')])
+        assert report.vetoes_done_flip is True
+
+    def test_info_only_batch_does_not_veto_the_done_flip(self) -> None:
+        report = self._classify([_rec(id='esc-42-1', level=0, severity='info')])
+        assert report.vetoes_done_flip is False
+
+    def test_queue_handoff_vetoes_the_done_flip(self) -> None:
+        report = self._classify([_rec(id='esc-42-1', level=2, severity='blocking')])
+        assert report.vetoes_done_flip is True
+
+
+class TestPurity:
+    """The classifier mutates nothing and performs no I/O."""
+
+    def test_input_sequence_and_records_are_not_mutated(self) -> None:
+        records = [
+            _rec(id='esc-42-1', level=0, severity='blocking', filing=OTHER_ID),
+            _rec(id='esc-42-2', level=1, severity='info'),
+        ]
+        before = [dataclasses.replace(rec) for rec in records]
+
+        classify_pins('42', records, live_claimant=True, live_claimant_id=LIVE_ID)
+
+        assert records == before
+        assert len(records) == 2
+
+    def test_repeated_calls_are_deterministic(self) -> None:
+        records = [_rec(id='esc-42-1', level=0, severity='blocking', filing=OTHER_ID)]
+        first = classify_pins('42', records, live_claimant=False)
+        second = classify_pins('42', records, live_claimant=False)
+        assert first == second
+
+
+# ---------------------------------------------------------------------------
+# amend — the REAL server-side record type end to end
+# ---------------------------------------------------------------------------
+
+
+def _esc(
+    *,
+    id: str = 'esc-42-1',  # mirrors the PinRecord attribute name
+    level: int = 0,
+    severity: str = 'blocking',
+    filing_claimant_run_id: str | None = None,
+    members: tuple[str, ...] = (),
+    task_id: str = '42',
+) -> Escalation:
+    """A real ``escalation.models.Escalation`` — the server-side PinRecord."""
+    return Escalation(
+        id=id,
+        task_id=task_id,
+        agent_role='implementer',
+        severity=severity,
+        category='infra_issue',
+        summary='s',
+        level=level,
+        filing_claimant_run_id=filing_claimant_run_id,
+        members=list(members),
+    )
+
+
+class TestRealEscalationRecordsClassify:
+    """``escalation.models.Escalation`` — not just the ``_Rec`` double — flows
+    through the classifier, so the server-side consumer path is covered too."""
+
+    def test_dead_filer_l0_escalation_is_dead_l0(self) -> None:
+        report = classify_pins(
+            '42', [_esc(level=0, filing_claimant_run_id=OTHER_ID)], live_claimant=False,
+        )
+        assert report.dead_l0 == ('esc-42-1',)
+        assert report.pins is False
+        assert report.vetoes_done_flip is True
+
+    def test_l1_escalation_is_a_queue_handoff(self) -> None:
+        report = classify_pins('42', [_esc(level=1)], live_claimant=False)
+        assert report.queue_handoff == ('esc-42-1',)
+        assert report.pins is True
+
+    def test_info_escalation_is_non_pinning(self) -> None:
+        report = classify_pins('42', [_esc(severity='info')], live_claimant=False)
+        assert report.non_pinning == ('esc-42-1',)
+        assert report.pins is False
+
+    def test_escalation_rehydrated_with_null_severity_fails_safe_to_pinning(self) -> None:
+        """The `or ''` in the classifier's severity normalisation is
+        load-bearing: `Escalation.severity` is annotated `str`, but a record
+        rehydrated from a payload carrying `"severity": null` really does hold
+        None, and must fail safe to pinning rather than raising."""
+        payload = _esc(level=0, filing_claimant_run_id=OTHER_ID).to_dict()
+        payload['severity'] = None
+        record = Escalation.from_dict(payload)
+        assert record.severity is None
+
+        report = classify_pins('42', [record], live_claimant=False)
+
+        assert report.queue_handoff == ('esc-42-1',)
+        assert report.dead_l0 == ()
+
+    def test_legacy_escalation_without_filing_identity_classifies(self) -> None:
+        """A legacy on-disk record has no ``filing_claimant_run_id`` key at
+        all; it rehydrates to None and hits the unknown-identity fail-safe."""
+        payload = _esc(level=0).to_dict()
+        del payload['filing_claimant_run_id']
+        record = Escalation.from_dict(payload)
+        assert record.filing_claimant_run_id is None
+
+        report = classify_pins(
+            '42', [record], live_claimant=True, live_claimant_id=LIVE_ID,
+        )
+
+        assert report.queue_handoff == ('esc-42-1',)
+
+
+# ---------------------------------------------------------------------------
+# task 4541 RC#1 — "is everything that pins this task already before a human?"
+# ---------------------------------------------------------------------------
+
+
+class TestPinnedOnlyByHumanParked:
+    """``pinned_only_by_human_parked``: the streak alarm's suppression predicate.
+
+    True only when the read succeeded and EVERY record in the same
+    ``queue_handoff`` bucket ``PinReport.pins`` reads sits at ``level >= 2``.
+    Every uncertain input answers False, because a false True silences the
+    detector for a genuinely stranded task.
+    """
+
+    @staticmethod
+    def _parked(
+        records: typing.Any,
+        *,
+        live_claimant: bool = False,
+        live_claimant_id: str | None = None,
+        holder_candidates: typing.Any = (),
+    ) -> bool:
+        report = classify_pins(
+            '42', records, live_claimant=live_claimant, live_claimant_id=live_claimant_id,
+        )
+        return pinned_only_by_human_parked(
+            report, records, holder_candidates=holder_candidates,
+        )
+
+    def test_a_single_l2_is_human_parked(self) -> None:
+        assert self._parked([_esc(level=2)]) is True
+
+    def test_a_level_above_two_is_human_parked(self) -> None:
+        assert self._parked([_rec(level=3)]) is True
+
+    def test_an_l1_only_hold_is_not(self) -> None:
+        assert self._parked([_rec(level=1)]) is False
+
+    def test_an_l1_beside_an_l2_is_not(self) -> None:
+        """A pin nobody has promoted is still waiting on the auto-watcher."""
+        records = [_rec(id='esc-42-1', level=2), _rec(id='esc-42-2', level=1)]
+        assert self._parked(records) is False
+
+    def test_an_info_record_beside_an_l2_is_ignored(self) -> None:
+        """Link 1: an info record never pins, so it cannot spoil the answer."""
+        records = [_rec(id='esc-42-1', level=2), _rec(id='esc-42-2', severity='info')]
+        assert self._parked(records) is True
+
+    def test_a_dead_l0_beside_an_l2_is_ignored(self) -> None:
+        """A dead-filer L0 does not pin recovery (task 3541); the reaper owns it."""
+        records = [
+            _rec(id='esc-42-1', level=2),
+            _rec(id='esc-42-2', level=0, severity='blocking', filing=OTHER_ID),
+        ]
+        assert self._parked(records, live_claimant=False) is True
+
+    def test_a_dead_l0_alone_is_not(self) -> None:
+        """Nothing pins, so nothing is parked before a human."""
+        assert self._parked([_rec(level=0, severity='blocking')]) is False
+
+    def test_info_only_is_not(self) -> None:
+        assert self._parked([_rec(level=2, severity='info')]) is False
+
+    def test_no_records_is_not(self) -> None:
+        assert self._parked([]) is False
+
+    def test_store_unavailable_is_not(self) -> None:
+        """``records=None`` means the read FAILED (esc-3163), not "no records".
+
+        A store that cannot be read proves nothing about who holds the task,
+        so it must never suppress the alarm.
+        """
+        assert self._parked(None) is False
+
+    @pytest.mark.parametrize('severity', ['', None, 'warn'])
+    def test_an_unknown_severity_is_judged_on_its_level(self, severity: str | None) -> None:
+        assert self._parked([_rec(level=2, severity=severity)]) is True
+        assert self._parked([_rec(level=1, severity=severity)]) is False
+
+    def test_a_born_at_l2_severity_at_level_zero_is_not(self) -> None:
+        """Link 3b's contradictory state is no proof that a human holds the task."""
+        assert self._parked([_rec(level=0, severity='critical')]) is False
+
+    def test_a_live_filer_l0_beside_an_l2_is_not(self) -> None:
+        records = [
+            _rec(id='esc-42-1', level=2),
+            _rec(id='esc-42-2', level=0, severity='blocking', filing=LIVE_ID),
+        ]
+        assert self._parked(records, live_claimant=True, live_claimant_id=LIVE_ID) is False
+
+    def test_is_pure(self) -> None:
+        records = [_rec(id='esc-42-1', level=2), _rec(id='esc-42-2', severity='info')]
+        before = [dataclasses.replace(rec) for rec in records]
+
+        first = self._parked(records)
+        second = self._parked(records)
+
+        assert records == before
+        assert first == second
+
+    @pytest.mark.parametrize('level', ['3', 2.9, True, None])
+    def test_a_level_that_is_not_an_int_is_not(self, level: typing.Any) -> None:
+        """Never coerced: ``int()`` would read ``'3'`` and ``2.9`` as human levels."""
+        assert self._parked([_rec(level=level)]) is False
+
+    def test_a_handoff_id_the_records_do_not_carry_is_not(self) -> None:
+        """A report and records that disagree prove nothing about who holds the task."""
+        report = classify_pins('42', [_rec(id='esc-42-1', level=2)], live_claimant=False)
+
+        assert pinned_only_by_human_parked(report, [_rec(id='esc-42-2', level=2)]) is False
+
+    # -- task 7709: an L1 a human-level handoff holds as a member is parked --
+
+    def test_an_l1_its_l2_holds_is_human_parked(self) -> None:
+        """The promoted hold: the L2 names the L1 it was promoted from."""
+        records = [
+            _rec(id='esc-42-1', level=1),
+            _rec(id='esc-42-2', level=2, members=('esc-42-1',)),
+        ]
+        assert self._parked(records) is True
+
+    def test_an_l1_its_l2_holds_is_human_parked_on_real_escalations(self) -> None:
+        records = [
+            _esc(id='esc-42-1', level=1),
+            _esc(id='esc-42-2', level=2, members=('esc-42-1',)),
+        ]
+        assert self._parked(records) is True
+
+    def test_an_unheld_l1_beside_a_held_one_is_not(self) -> None:
+        records = [
+            _rec(id='esc-42-1', level=1),
+            _rec(id='esc-42-2', level=2, members=('esc-42-1',)),
+            _rec(id='esc-42-3', level=1),
+        ]
+        assert self._parked(records) is False
+
+    def test_an_info_l2_holds_nothing(self) -> None:
+        """Link 1 makes an info L2 an annotation, not a handoff, so it is no
+        proof that anyone must act on its members."""
+        records = [
+            _rec(id='esc-42-1', level=1),
+            _rec(id='esc-42-2', level=2, severity='info', members=('esc-42-1',)),
+        ]
+        assert self._parked(records) is False
+
+    def test_a_holder_below_human_level_parks_nothing(self) -> None:
+        records = [
+            _rec(id='esc-42-1', level=1),
+            _rec(id='esc-42-2', level=1, members=('esc-42-1',)),
+        ]
+        assert self._parked(records) is False
+
+    @pytest.mark.parametrize('level', ['1', 1.0, True, None, 0])
+    def test_a_held_member_that_is_not_a_genuine_l1_is_not(self, level: typing.Any) -> None:
+        """``promote_to_l2``: members stay at L1.  Anything else is contradictory
+        state, and a level is never coerced."""
+        records = [
+            _rec(id='esc-42-1', level=level),
+            _rec(id='esc-42-2', level=2, members=('esc-42-1',)),
+        ]
+        assert self._parked(records, live_claimant=True) is False
+
+    @pytest.mark.parametrize('members', [None, 'esc-42-1'], ids=['none', 'bare-string'])
+    def test_members_that_are_not_a_list_or_tuple_hold_nothing(
+        self, members: typing.Any,
+    ) -> None:
+        """Never coerced, and a bare string is never substring-matched."""
+        records = [
+            _rec(id='esc-42-1', level=1),
+            _rec(id='esc-42-2', level=2, members=typing.cast('tuple[str, ...]', members)),
+        ]
+        assert self._parked(records) is False
+
+    def test_an_unreadable_store_is_not_even_with_a_held_l1(self) -> None:
+        records = [
+            _rec(id='esc-42-1', level=1),
+            _rec(id='esc-42-2', level=2, members=('esc-42-1',)),
+        ]
+        report = classify_pins('42', None, live_claimant=False)
+
+        assert pinned_only_by_human_parked(report, records) is False
+
+    # -- task 7716: a holder outside the read --
+
+    def test_an_l1_an_outside_l2_holds_is_human_parked(self) -> None:
+        """``promote_to_l2`` mints a cluster L2 under ONE task id, so the L2
+        holding this task's L1 may sit outside the task's own read."""
+        records = [_rec(id='esc-42-1', level=1)]
+        candidates = [_rec(id='esc-7-2', level=2, members=('esc-42-1',))]
+
+        assert self._parked(records, holder_candidates=candidates) is True
+        assert self._parked(records) is False
+
+    def test_an_l1_an_outside_l2_holds_is_human_parked_on_real_escalations(self) -> None:
+        records = [_esc(id='esc-42-1', level=1)]
+        candidates = [_esc(id='esc-7-2', level=2, members=('esc-42-1',), task_id='7')]
+
+        assert self._parked(records, holder_candidates=candidates) is True
+
+    def test_an_outside_candidate_holding_another_id_holds_nothing(self) -> None:
+        records = [_rec(id='esc-42-1', level=1)]
+        candidates = [_rec(id='esc-7-2', level=2, members=('esc-7-1',))]
+
+        assert self._parked(records, holder_candidates=candidates) is False
+
+    def test_an_info_outside_candidate_holds_nothing(self) -> None:
+        records = [_rec(id='esc-42-1', level=1)]
+        candidates = [_rec(id='esc-7-2', level=2, severity='info', members=('esc-42-1',))]
+
+        assert self._parked(records, holder_candidates=candidates) is False
+
+    def test_an_outside_candidate_below_human_level_holds_nothing(self) -> None:
+        records = [_rec(id='esc-42-1', level=1)]
+        candidates = [_rec(id='esc-7-2', level=1, members=('esc-42-1',))]
+
+        assert self._parked(records, holder_candidates=candidates) is False
+
+    @pytest.mark.parametrize('level', ['2', 2.0, True, None])
+    def test_an_outside_candidate_level_that_is_not_an_int_holds_nothing(
+        self, level: typing.Any,
+    ) -> None:
+        """Never coerced, exactly as for an in-scope holder."""
+        records = [_rec(id='esc-42-1', level=1)]
+        candidates = [_rec(id='esc-7-2', level=level, members=('esc-42-1',))]
+
+        assert self._parked(records, holder_candidates=candidates) is False
+
+    @pytest.mark.parametrize('members', [None, 'esc-42-1'], ids=['none', 'bare-string'])
+    def test_outside_candidate_members_that_are_not_a_list_or_tuple_hold_nothing(
+        self, members: typing.Any,
+    ) -> None:
+        records = [_rec(id='esc-42-1', level=1)]
+        candidates = [_rec(id='esc-7-2', level=2, members=members)]
+
+        assert self._parked(records, holder_candidates=candidates) is False
+
+    def test_an_outside_candidate_parks_nothing_on_its_own(self) -> None:
+        """A candidate only holds members; it never pins this task."""
+        candidates = [_rec(id='esc-7-2', level=2, members=('esc-42-1',))]
+
+        assert self._parked([], holder_candidates=candidates) is False
+
+    def test_an_unheld_l1_beside_an_outside_held_one_is_not(self) -> None:
+        records = [_rec(id='esc-42-1', level=1), _rec(id='esc-42-3', level=1)]
+        candidates = [_rec(id='esc-7-2', level=2, members=('esc-42-1',))]
+
+        assert self._parked(records, holder_candidates=candidates) is False
+
+    def test_an_outside_candidate_cannot_park_an_l0_it_names(self) -> None:
+        """A held member must be a genuine int L1, wherever its holder sits."""
+        records = [_rec(id='esc-42-1', level=0, severity='blocking', filing=LIVE_ID)]
+        candidates = [_rec(id='esc-7-2', level=2, members=('esc-42-1',))]
+
+        parked = self._parked(
+            records, holder_candidates=candidates,
+            live_claimant=True, live_claimant_id=LIVE_ID,
+        )
+
+        assert parked is False
+
+    def test_in_scope_and_outside_holders_combine(self) -> None:
+        records = [
+            _rec(id='esc-42-1', level=1),
+            _rec(id='esc-42-2', level=1),
+            _rec(id='esc-42-3', level=2, members=('esc-42-1',)),
+        ]
+        candidates = [_rec(id='esc-7-2', level=2, members=('esc-42-2',))]
+
+        assert self._parked(records, holder_candidates=candidates) is True
+
+    def test_an_unreadable_store_is_not_even_with_an_outside_holder(self) -> None:
+        report = classify_pins('42', None, live_claimant=False)
+        candidates = [_rec(id='esc-7-2', level=2, members=('esc-42-1',))]
+
+        parked = pinned_only_by_human_parked(report, None, holder_candidates=candidates)
+
+        assert parked is False
+
+    def test_holder_candidates_are_not_mutated(self) -> None:
+        """Candidates are the pending queue's own rows, whose ``members`` is a
+        mutable list."""
+        records = [_esc(id='esc-42-1', level=1)]
+        candidates = [_esc(id='esc-7-2', level=2, members=('esc-42-1',), task_id='7')]
+        before = copy.deepcopy(candidates)
+
+        assert self._parked(records, holder_candidates=candidates) is True
+        assert candidates == before
+
+
+# ---------------------------------------------------------------------------
+# is_queue_handoff — the one-record gating answer (task 5221)
+# ---------------------------------------------------------------------------
+
+#: (record, expected is_queue_handoff) over the severity x level table.
+_HANDOFF_TABLE: list[tuple[Escalation, bool]] = [
+    # Link 1: info never gates, at any level, whatever its spelling.
+    (_esc(id='esc-42-1', severity='info', level=0), False),
+    (_esc(id='esc-42-2', severity='info', level=1), False),
+    (_esc(id='esc-42-3', severity='info', level=2), False),
+    (_esc(id='esc-42-4', severity=' INFO ', level=0), False),
+    # Link 3: queue-backed L1/L2 handoffs gate.
+    (_esc(id='esc-42-5', severity='blocking', level=1), True),
+    (_esc(id='esc-42-6', severity='blocking', level=2), True),
+    # Link 4: with no live id to compare, an L0 fails safe to a handoff.
+    (_esc(id='esc-42-7', severity='blocking', level=0), True),
+    (_esc(id='esc-42-8', severity='blocking', level=0, filing_claimant_run_id=LIVE_ID), True),
+    # Link 3b: born-at-L2 severities gate at either level.
+    (_esc(id='esc-42-9', severity='critical', level=2), True),
+    (_esc(id='esc-42-10', severity='critical', level=0), True),
+    # Link 2: an unknown severity fails safe to a handoff.
+    (_esc(id='esc-42-11', severity='', level=2), True),
+    (_esc(id='esc-42-12', severity='weird', level=2), True),
+]
+
+
+class TestIsQueueHandoff:
+    """``is_queue_handoff`` answers "does this ONE open record gate a live run?"
+    by delegating to the shared chain, never by a second predicate (INV-5)."""
+
+    @pytest.mark.parametrize(('record', 'expected'), _HANDOFF_TABLE, ids=lambda v: getattr(v, 'id', None))
+    def test_answer_over_the_severity_level_table(self, record: Escalation, expected: bool) -> None:
+        assert is_queue_handoff(record) is expected
+
+    @pytest.mark.parametrize(('record', 'expected'), _HANDOFF_TABLE, ids=lambda v: getattr(v, 'id', None))
+    def test_parity_with_the_shared_chain(self, record: Escalation, expected: bool) -> None:
+        report = classify_pins(record.task_id, [record], live_claimant=True)
+        assert is_queue_handoff(record) == (record.id in report.queue_handoff)
+
+    @pytest.mark.parametrize(('record', 'expected'), _HANDOFF_TABLE, ids=lambda v: getattr(v, 'id', None))
+    def test_is_pure(self, record: Escalation, expected: bool) -> None:
+        before = record.to_dict()
+        is_queue_handoff(record)
+        assert record.to_dict() == before
+
+
+# ---------------------------------------------------------------------------
+# needs_human — can only a human dispose of this ONE record? (task 6145)
+# ---------------------------------------------------------------------------
+
+#: (record, expected needs_human) over the severity x level table.
+_NEEDS_HUMAN_TABLE: list[tuple[Escalation, bool]] = [
+    # Info never needs a human, at any level, whatever its spelling.
+    (_esc(id='esc-42-1', severity='info', level=0), False),
+    (_esc(id='esc-42-2', severity='info', level=2), False),
+    (_esc(id='esc-42-3', severity=' INFO ', level=2), False),
+    # A blocking record needs a human only once it reaches L2.
+    (_esc(id='esc-42-4', severity='blocking', level=0), False),
+    (_esc(id='esc-42-5', severity='blocking', level=1), False),
+    (_esc(id='esc-42-6', severity='blocking', level=2), True),
+    (_esc(id='esc-42-7', severity='blocking', level=3), True),
+    # A born-at-L2 severity needs a human at any level.
+    (_esc(id='esc-42-8', severity='critical', level=0), True),
+    (_esc(id='esc-42-9', severity='critical', level=1), True),
+    (_esc(id='esc-42-10', severity='critical', level=2), True),
+    (_esc(id='esc-42-11', severity='urgent', level=0), True),
+    # An unknown severity is a handoff, so it needs a human at L2 only.
+    (_esc(id='esc-42-12', severity='weird', level=2), True),
+    (_esc(id='esc-42-13', severity='weird', level=1), False),
+    (_esc(id='esc-42-14', severity='', level=2), True),
+    # The born-at-L2 membership is raw, unlike the chain's normalised
+    # severity, so a re-spelt critical below L2 needs no human.  Normalising
+    # it would change what gates merge entry.
+    (_esc(id='esc-42-15', severity='CRITICAL', level=0), False),
+    (_esc(id='esc-42-16', severity=' critical ', level=1), False),
+]
+
+_NON_BORN_AT_L2_TABLE_SEVERITIES = sorted(
+    {record.severity for record, _ in _NEEDS_HUMAN_TABLE} - BORN_AT_L2_SEVERITIES,
+)
+
+
+class TestNeedsHuman:
+    """``needs_human`` answers "can only a human dispose of this ONE record?"
+    with a raw ``BORN_AT_L2_SEVERITIES`` membership check, or, at L2 and
+    above, the shared chain's handoff answer."""
+
+    @pytest.mark.parametrize(('record', 'expected'), _NEEDS_HUMAN_TABLE, ids=lambda v: getattr(v, 'id', None))
+    def test_answer_over_the_severity_level_table(self, record: Escalation, expected: bool) -> None:
+        assert needs_human(record) is expected
+
+    @pytest.mark.parametrize('record', [record for record, _ in _NEEDS_HUMAN_TABLE], ids=lambda v: v.id)
+    def test_is_pure(self, record: Escalation) -> None:
+        before = record.to_dict()
+        needs_human(record)
+        assert record.to_dict() == before
+
+    @pytest.mark.parametrize('level', [2, 3])
+    @pytest.mark.parametrize('severity', _NON_BORN_AT_L2_TABLE_SEVERITIES)
+    def test_a_human_level_record_needs_a_human_iff_it_is_a_queue_handoff(
+        self, severity: str, level: int,
+    ) -> None:
+        record = _esc(severity=severity, level=level)
+        assert needs_human(record) is is_queue_handoff(record)

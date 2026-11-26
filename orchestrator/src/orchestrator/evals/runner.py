@@ -5,17 +5,20 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import threading
 import time
 from collections.abc import Awaitable, Callable, Iterable
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
+from shared.eval_lane import is_eval_fixture_task_id
 from shared.usage_gate import UsageGate
 
 from orchestrator.agents.briefing import BriefingAssembler
+from orchestrator.agents.token_pricing import TokenUsage
 from orchestrator.config import (
     BackendsConfig,
     BudgetsConfig,
@@ -23,17 +26,31 @@ from orchestrator.config import (
     ModelsConfig,
     OrchestratorConfig,
     PriceEntry,
-    SandboxConfig,
+    RoutingConfig,
 )
 from orchestrator.git_ops import GitOps
+from orchestrator.implementer_brief_variant import execute_iteration_cap
 from orchestrator.scheduler import Scheduler, TaskAssignment
+from orchestrator.task_verify_dispatch import TaskVerifyPort
 from orchestrator.workflow import (
+    TaskWorkflow,
     WorkflowOutcome,
-    _inject_plan_tools_mcp,
-    _meta_root_for_worktree,
     build_workflow,
 )
 
+from .architect_eval import (
+    ArchitectEvalDeps,
+    PlanScoring,
+    assemble_metrics,
+    cell_label,
+    classify_attempt,
+    invoke_architect,
+    judge_plan,
+    log_architect_cell,
+    open_eval_artifacts,
+    read_reference_diff,
+)
+from .cell_sandbox import CellSandbox, bind_cell_sandbox_backend
 from .configs import (
     EVAL_CONFIGS,
     JUDGE_OFAT_IMPLEMENTER_PIN,
@@ -41,30 +58,36 @@ from .configs import (
     claude_endpoint_price_table,
     matrix_pairs,
 )
-from .metrics import EvalMetrics, collect_metrics, detect_invocation_error
+from .eval_gate import (
+    GATE_UNSET,
+    InjectedGate,
+    campaign_usage_gate,
+    owned_usage_gate,
+)
+from .fixture_agent_env import fixture_role_env_overrides
+from .fixture_gate import fixture_task_gate, run_fixture_gate
+from .hermeticity import (
+    NO_PRODUCTION_WRITERS,
+    ProductionWriters,
+    refuse_production_writers,
+    writers_held_by,
+)
+from .metrics import (
+    EvalMetrics,
+    RoleUnderTest,
+    compute_composite,
+    is_false_green,
+    is_null_work,
+    is_proxied_endpoint,
+    resolve_cost_usd,
+)
 from .profile import apply_eval_profile
+from .replay_frame import REPLAY_FRAME_ID, ReplayFramedBriefingAssembler
+from .results import CellName, EvalResult, ResultStore
+from .scoring import recovery_score_for_run
 from .snapshots import create_eval_worktree, read_python_pin
 
 logger = logging.getLogger(__name__)
-
-RESULTS_DIR = Path(__file__).parent / 'results'
-
-
-@dataclass
-class EvalResult:
-    """Result of one (task, config) eval run."""
-
-    task_id: str
-    config_name: str
-    outcome: str
-    metrics: dict[str, Any]
-    worktree_path: str
-    wall_clock_ms: int = 0
-    run_id: str = ''
-    trial: int = 1
-
-    def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
 
 
 def _find_repo_root(start: Path) -> Path:
@@ -84,9 +107,21 @@ def load_task(task_path: Path) -> dict:
     machines.  If the path in the JSON starts with ``$REPO_ROOT`` it is
     expanded; if the hardcoded absolute path does not exist the discovered
     repository root is used instead.
+
+    Raises ``ValueError`` when the fixture's ``id`` is not an eval fixture id.
     """
     with open(task_path) as f:
         task = json.load(f)
+
+    task_id = task.get('id')
+    if not is_eval_fixture_task_id(task_id):
+        raise ValueError(
+            f'eval fixture {task_path}: id {task_id!r} is not an eval fixture id '
+            '(<repo>_task_<n>[_<suffix>] or shadow_<task_id>_<cell_id>). Eval-lane '
+            'escalation containment (shared/src/shared/eval_lane.py) recognises '
+            'eval provenance by this grammar; an off-grammar id would let this '
+            "fixture's escalations reach the production human L2 queue."
+        )
 
     repo_root = _find_repo_root(task_path)
     raw_root = task.get('project_root', '')
@@ -98,6 +133,30 @@ def load_task(task_path: Path) -> dict:
         task['project_root'] = str(repo_root)
 
     return task
+
+
+def _admit_claude_role_models(
+    routing: RoutingConfig,
+    models: ModelsConfig,
+    backends: BackendsConfig,
+) -> RoutingConfig:
+    """Return *routing* with every claude-backend role's model in ``allowed_models``.
+
+    Restores, for one eval cell, the invariant
+    ``orchestrator/config.py::OrchestratorConfig._validate_models_in_allowlist``
+    enforces at load time and ``model_copy`` skips. Without it, a candidate
+    model outside the project allowlist (a proxied-endpoint implementer, a
+    fable architect) is rejected by ``resolve_route``'s allowlist layer and
+    the cell silently dispatches the role default under the candidate's label.
+    Only ``allowed_models`` changes; the ladder, ceilings and rules are kept.
+    """
+    claude_role_models = [
+        getattr(models, role)
+        for role in type(models).model_fields
+        if getattr(backends, role, 'claude') == 'claude'
+    ]
+    admitted = list(dict.fromkeys([*routing.allowed_models, *claude_role_models]))
+    return routing.model_copy(update={'allowed_models': admitted})
 
 
 def build_eval_orch_config(
@@ -115,7 +174,8 @@ def build_eval_orch_config(
     Reviewer is the new 1× Opus comprehensive reviewer (matches production
     after the reviewer-panel trial replaced the 5× sonnet panel; merged
     via 594658fbe3 / 2c26a30bca).
-    Only the implementer varies per eval config.
+    Only the implementer varies per eval config, and the implementer candidate's
+    ``harness_variant`` becomes the cell's ``implementer_brief_variant``.
 
     ``architect_config`` (eval-revival μ) drives the both-live end-to-end matrix
     /confirm runs (``run_end_to_end``): when supplied, the architect's
@@ -161,10 +221,23 @@ def build_eval_orch_config(
     ``snapshots._eval_setup_env`` reads from the SAME ``project_root`` (task
     2875, reverting task 2851's worktree-sourced pin). See the BUG 2a comment
     below.
+
+    A fixture from a project other than the base's runs with that project's
+    ``role_env_overrides`` in place of the base's, never merged with them, and
+    one that would outrank the candidate's ``env_overrides`` is refused
+    (``evals/fixture_agent_env.py``).
     """
     if base_config is None:
         raise ValueError('build_eval_orch_config requires an explicit base_config')
-    base = base_config
+    # Re-rooted BEFORE profiling, so the profile's eval-root leaves resolve
+    # against the fixture's project, the project its worktree is cut from.
+    project_root = Path(task.get('project_root', str(base_config.project_root)))
+    base = base_config.model_copy(update={
+        'project_root': project_root,
+        'role_env_overrides': fixture_role_env_overrides(
+            base_config, project_root, config.env_overrides,
+        ),
+    })
 
     # Architect pin: opus/claude/high by default (frozen-plan + plan-only paths),
     # or derived from architect_config for the both-live end-to-end run (μ). When
@@ -241,9 +314,9 @@ def build_eval_orch_config(
         'test_command': task.get('verify_commands', {}).get('test', base.test_command),
         'lint_command': task.get('verify_commands', {}).get('lint', base.lint_command),
         'type_check_command': task.get('verify_commands', {}).get('typecheck', base.type_check_command),
-        'sandbox': SandboxConfig(enabled=False),
-        'project_root': Path(task.get('project_root', str(base.project_root))),
         'env_overrides': config.env_overrides,
+        'implementer_brief_variant': config.harness_variant,
+        'routing': _admit_claude_role_models(profiled.routing, models, backends),
     }
     # BUG 2a: pin the eval verify interpreter to the target's own
     # .python-version (via verify_env['UV_PYTHON']) so `uv run pytest/ruff/
@@ -252,7 +325,7 @@ def build_eval_orch_config(
     # effective_verify_env, so the pin reaches every verify subprocess. Absent a
     # .python-version, inject nothing (fail-safe) — leave verify_env untouched.
     #
-    # pin_source is the target project_root's CURRENT checkout — mirroring
+    # The pin source is the target project_root's CURRENT checkout — mirroring
     # production dispatch, which verifies under the target's current
     # .python-version — and the SAME tree snapshots._eval_setup_env reads for the
     # setup `uv sync`, so setup and verify agree on the interpreter. This reverts
@@ -262,8 +335,7 @@ def build_eval_orch_config(
     # Sourcing from project_root (a 3.13-bearing tree) fixes that AND preserves
     # 2847's setup==verify agreement, now anchored to a 3.13-bearing tree instead
     # of an arbitrarily-old fixture baseline (task 2875).
-    pin_source = Path(task.get('project_root', str(base.project_root)))
-    pin = read_python_pin(pin_source)
+    pin = read_python_pin(project_root)
     if pin is not None:
         update['verify_env'] = {**profiled.verify_env, 'UV_PYTHON': pin}
     # D8: an explicit recording endpoint layers over the profile's null
@@ -276,24 +348,63 @@ def build_eval_orch_config(
         )
     # Task 2820 (ν follow-up, escalation esc-2479-1 finding #3): auto-merge
     # claude_endpoint_price_table() into config.prices whenever THIS
-    # candidate's env_overrides carries a proxied ANTHROPIC_BASE_URL — the
-    # identical leaf collect_metrics reads (`is_local = bool(workflow.config
-    # .env_overrides.get('ANTHROPIC_BASE_URL'))`) before calling
-    # resolve_cost_usd(model=workflow.config.models.implementer,
-    # prices=workflow.config.prices, ...). Without this, an operator who
-    # forgets to seed prices manually silently gets cost_source=
-    # 'unpriced_proxy' (there's already a loud WARNING on that fallback, so
-    # this is convenience hardening, not a silent-fail fix). Merge, not
-    # replace: profiled.prices (the base/manually-seeded table) wins on
-    # conflict, mirroring claude_endpoint_price_table()'s own
-    # default-table-then-candidate-table override order.
-    if config.env_overrides.get('ANTHROPIC_BASE_URL'):
+    # candidate runs against a PROXIED endpoint — the SAME predicate
+    # collect_metrics and run_architect_eval read before calling
+    # resolve_cost_usd(..., is_local_model=...), which is why it has one home
+    # (metrics.is_proxied_endpoint) instead of three inline env reads: the
+    # table that gets seeded and the flag that decides whether to trust the CLI
+    # figure must never disagree. Without this, an operator who forgets to seed
+    # prices manually silently gets cost_source='unpriced_proxy' (there's
+    # already a loud WARNING on that fallback, so this is convenience
+    # hardening, not a silent-fail fix). Merge, not replace: profiled.prices
+    # (the base/manually-seeded table) wins on conflict, mirroring
+    # claude_endpoint_price_table()'s own default-table-then-candidate-table
+    # override order.
+    if is_proxied_endpoint(config.env_overrides):
         seeded_prices = {
             model: PriceEntry(**rates)
             for model, rates in claude_endpoint_price_table().items()
         }
         update['prices'] = {**seeded_prices, **profiled.prices}
     return profiled.model_copy(update=update)
+
+
+class OrchConfigBuilder(Protocol):
+    """How a workflow cell's OrchestratorConfig is built from its candidate, fixture and base."""
+
+    def __call__(
+        self,
+        config: EvalConfig,
+        task: dict,
+        base_config: OrchestratorConfig | None = None,
+        memory_endpoint: str | None = None,
+        architect_config: EvalConfig | None = None,
+        judge_config: EvalConfig | None = None,
+    ) -> OrchestratorConfig: ...
+
+
+@dataclass(frozen=True)
+class CellProfile:
+    """The profile a workflow cell runs under: how its config is built, and its task gate."""
+
+    orch_config_builder: OrchConfigBuilder
+    task_gate: TaskVerifyPort
+
+
+def _corpus_profile() -> CellProfile:
+    return CellProfile(build_eval_orch_config, fixture_task_gate)
+
+
+WORKFLOW_CELL_TIMEOUT_MINUTES = 180
+"""A workflow cell verifies cold, and on a loaded host completed cells took 74 to 106 min."""
+
+ARCHITECT_CELL_TIMEOUT_MINUTES = 60
+"""A plan-only architect cell runs no verify."""
+
+
+def cell_timeout_minutes(task: dict, timeout_override: float | None, default: float) -> float:
+    """The cell's wall-clock ceiling: the caller's override, else the fixture's timeout_minutes, else *default*."""
+    return timeout_override or task.get('timeout_minutes', default)
 
 
 async def run_eval(
@@ -305,170 +416,54 @@ async def run_eval(
     worktree_path: Path | None = None,
     memory_endpoint: str | None = None,
     judge_config: EvalConfig | None = None,
+    *,
+    usage_gate: InjectedGate = GATE_UNSET,
+    store: ResultStore | None = None,
+    profile: CellProfile | None = None,
 ) -> EvalResult:
-    """Run one (task, config) pair through PLAN→EXECUTE→VERIFY→REVIEW.
+    """Run one (task, config) pair through PLAN→EXECUTE→VERIFY→REVIEW on its frozen plan.
 
-    When *worktree_path* is provided, the eval reuses an existing worktree
-    instead of creating a fresh one.  The relocated
-    ``.task-meta/<name>/plan.json`` (with step statuses) is used as the
-    initial plan, so the workflow naturally skips already-completed steps —
-    useful for resuming a blocked eval from the reviewer phase.
+    The cell persists into *store*; ``None`` persists into
+    :meth:`ResultStore.packaged`. *worktree_path* reuses an existing worktree and
+    resumes its relocated plan, so completed steps are skipped. *memory_endpoint*
+    is threaded to ``build_eval_orch_config``, which states its contract.
 
-    *memory_endpoint* (ε, D8) is threaded straight to
-    ``build_eval_orch_config``: left ``None``, the profile's null-sentinel
-    isolation stands; pass a ``RecordingMemorySink().url`` to capture the
-    intended memory writes instead of dropping them (see
-    ``build_eval_orch_config`` for the full contract).
+    *judge_config* (eval-revival ο) varies only the ζ completion judge: the
+    implementer stays pinned to *config*, and the cell is a JUDGE cell labelled
+    by the judge candidate, so ``select_survivors`` ranks judges as their own
+    axis. Without it the cell is an IMPLEMENTER cell labelled by *config*.
 
-    *judge_config* (eval-revival ο) is the judge OFAT knob: left ``None`` (every
-    existing caller) this is byte-identical to today — the result is labeled by
-    ``config`` and no ``role_under_test`` stamp fires. Supplied (run_ofat_stage's
-    judge branch), it (1) threads into ``build_eval_orch_config`` so ONLY the ζ
-    completion judge's model/effort derive from the candidate (the implementer
-    ``config`` stays pinned), (2) RELABELS the result to ``judge_config.name`` so
-    the persisted JSON is keyed by the judge candidate rather than the pinned
-    implementer (which would collide both judge rows), and (3) stamps
-    ``metrics['role_under_test']='judge'`` so ``select_survivors`` groups the
-    judge candidates as their own OFAT survivor axis.
+    A caller running the cell under another profile — the shadow profile —
+    passes it as *profile* (``None``: the corpus profile).
     """
+    cell_profile = profile or _corpus_profile()
     task = load_task(task_path)
-    task_id = task['id']
-    project_root = Path(task['project_root'])
-
-    # ο: when a judge candidate is under test, the persisted result must be keyed
-    # by the JUDGE candidate — not the pinned implementer `config`, which would
-    # collide both judge rows into one — so select_survivors ranks them as their
-    # own axis. None (every existing caller) → label is config.name, unchanged.
-    result_label = judge_config.name if judge_config is not None else config.name
-
-    logger.info(f'Starting eval: {task_id} × {config.name} (trial {trial})')
-    start_ms = int(time.monotonic() * 1000)
-
-    # 1. Create or reuse worktree
     if worktree_path is not None:
-        worktree = worktree_path
-        run_id = worktree.name
-        logger.info(f'Reusing existing worktree: {worktree}')
-    else:
-        worktree, run_id = await create_eval_worktree(
-            project_root, task_id, task['pre_task_commit'],
-            setup_commands=task.get('setup_commands'),
-        )
-
-    # 2. Build orchestrator config for this eval
-    orch_config = build_eval_orch_config(
-        config, task, base_config, memory_endpoint=memory_endpoint,
-        judge_config=judge_config,
-    )
-
-    # 3. Build task assignment
-    task_def = task.get('task_definition', {
-        'title': task.get('name', task_id),
-        'description': task.get('name', ''),
-    })
-    modules = task.get('modules', [])
-
-    assignment = TaskAssignment(
-        task_id=task_id,
-        task=task_def,
-        modules=list(modules),
-    )
-
-    # 4. Set up workflow dependencies
-    git_ops = GitOps(orch_config.git, orch_config.project_root)
-    scheduler, _ = _build_eval_scheduler(orch_config, task_id, list(modules))
-    briefing = BriefingAssembler(orch_config)
-    mcp = _EvalMcpStub(orch_config.fused_memory.url)
-
-    # 5. Load plan — from existing worktree state or task JSON
-    if worktree_path is not None:
-        initial_plan = _resume_plan_from_worktree(worktree, task)
+        initial_plan = _resume_plan_from_worktree(worktree_path, task)
     else:
         initial_plan = task.get('plan')
     if not initial_plan:
         raise ValueError(
-            f'Task {task_id} has no embedded plan. '
+            f'Task {task["id"]} has no embedded plan. '
             f'Run --plan-only to generate one first.'
         )
-    if not worktree_path:
-        logger.info(f'Using fixed plan ({len(initial_plan.get("steps", []))} steps)')
-
-    # 5b. Usage gate for account failover (judge hits Claude API, may cap)
-    usage_gate: UsageGate | None = None
-    if orch_config.usage_cap.enabled:
-        try:
-            usage_gate = UsageGate(orch_config.usage_cap)
-        except Exception as exc:
-            logger.warning(f'Failed to create UsageGate for eval: {exc} — running without failover')
-
-    # 6. Run the real workflow
-    workflow = build_workflow(
-        assignment=assignment,
-        config=orch_config,
-        git_ops=git_ops,
-        scheduler=scheduler,  # type: ignore[arg-type]
-        briefing=briefing,
-        mcp=mcp,  # type: ignore[arg-type]
+    return await _run_workflow_cell(
+        task,
+        lambda: cell_profile.orch_config_builder(
+            config, task, base_config, memory_endpoint=memory_endpoint,
+            judge_config=judge_config,
+        ),
+        label=judge_config.name if judge_config is not None else config.name,
+        role=RoleUnderTest.JUDGE if judge_config is not None else RoleUnderTest.IMPLEMENTER,
         initial_plan=initial_plan,
-        usage_gate=usage_gate,
-    )
-
-    # Override worktree since we created it ourselves
-    workflow.worktree = worktree
-
-    timeout_minutes = timeout_override or task.get('timeout_minutes', 60)
-    try:
-        # W9-γ: workflow.run() now returns a TerminalReport (TR-1); unwrap to
-        # the WorkflowOutcome this function has always propagated.
-        terminal_report = await asyncio.wait_for(
-            workflow.run(), timeout=timeout_minutes * 60,
-        )
-        outcome = terminal_report.outcome
-    except TimeoutError:
-        logger.error(
-            f'Eval {task_id} × {config.name} timed out after {timeout_minutes}m'
-        )
-        outcome = 'timeout'
-    except Exception as e:
-        logger.error(f'Eval {task_id} × {config.name} failed: {e}')
-        outcome = WorkflowOutcome.BLOCKED
-
-    wall_clock_ms = int(time.monotonic() * 1000) - start_ms
-
-    # 7. Collect metrics
-    try:
-        metrics = await collect_metrics(workflow, worktree, task)
-        metrics_dict = metrics.to_dict()
-    except Exception as e:
-        logger.warning(f'Metric collection failed: {e}')
-        metrics_dict = {}
-    # ο: stamp the judge OFAT axis so select_survivors groups judge runs as their
-    # own survivor group (collect_metrics itself does not know which role/stage
-    # invoked it — mirrors run_end_to_end's post-collect_metrics stamp). None →
-    # no stamp fires, so every existing caller is byte-identical.
-    if judge_config is not None:
-        metrics_dict['role_under_test'] = 'judge'
-
-    result = EvalResult(
-        task_id=task_id,
-        config_name=result_label,
-        outcome=outcome.value if isinstance(outcome, WorkflowOutcome) else str(outcome),
-        metrics=metrics_dict,
-        worktree_path=str(worktree),
-        wall_clock_ms=wall_clock_ms,
-        run_id=run_id,
+        replay_framed=False,
+        worktree=worktree_path,
         trial=trial,
+        timeout_override=timeout_override,
+        usage_gate=usage_gate,
+        store=store or ResultStore.packaged(),
+        task_gate=cell_profile.task_gate,
     )
-
-    # 8. Persist result
-    save_result(result)
-
-    logger.info(
-        f'Eval complete: {task_id} × {config.name} → {result.outcome} '
-        f'(total={wall_clock_ms / 1000:.1f}s, '
-        f'workflow={metrics_dict.get("workflow_duration_ms", 0) / 1000:.1f}s)'
-    )
-    return result
 
 
 async def run_architect_eval(
@@ -478,386 +473,64 @@ async def run_architect_eval(
     trial: int = 1,
     timeout_override: int | None = None,
     memory_endpoint: str | None = None,
+    *,
+    usage_gate: InjectedGate = GATE_UNSET,
+    store: ResultStore | None = None,
+    deps: ArchitectEvalDeps | None = None,
 ) -> EvalResult:
-    """Run ONE architect eval: invoke the architect LIVE and score its plan (θ).
+    """Run ONE architect eval: invoke the architect live, score its plan, persist the cell.
 
-    Unlike :func:`run_eval` (which FREEZES the plan and scores the implementer),
-    this drives ONLY the architect — the ``_run_plan_only`` invocation sequence
-    (create_eval_worktree at ``pre_task_commit`` → ``TaskArtifacts.init`` →
-    ``briefing.build_architect_prompt`` → ``invoke_agent(ARCHITECT)`` →
-    ``artifacts.read_plan``) — so every downstream role
-    (implementer/debugger/reviewer/verify) is FROZEN (decision 8: noise
-    isolation + token savings). The architect runs with THIS candidate's
-    model/backend/effort/env_overrides, not the hardcoded opus-high the
-    implementer path pins.
-
-    The produced plan is scored two ways: :func:`judge_plan_quality` (the LLM
-    judge, against the REAL landed reference diff
-    ``pre_task_commit..reference.post_task_commit`` — the always-available
-    ground truth since ζ fixtures frequently carry ``plan: null``), degrading to
-    the deterministic :func:`score_plan_structure` floor on ANY judge failure.
-    The judge is reached only for a plan that is
-    :func:`~orchestrator.evals.judge.is_scorable_plan` (task 3302): it has no
-    scorability guard of its own, so on a stepless artifact it can return a
-    confident nonzero score for the very shape ``score_plan_structure``
-    short-circuits to 0.0 — persisting a cell whose ``plan_steps=0``
-    contradicts its own ``plan_quality``.
-
-    ``plan_quality`` is therefore a non-sentinel float whenever the architect
-    was actually ASKED — with ONE deliberate exception (task 3118): when the
-    architect invocation failed in a way that left NO model content to score
-    AND no SCORABLE plan artifact was produced, scoring is skipped and the cell
-    records ``plan_quality=None`` plus ``cap_tainted=True`` and a stage-prefixed
-    ``invocation_error``. ``plan_quality is None`` on an architect run means
-    exactly that case, and the plan-quality aggregates EXCLUDE such cells rather
-    than averaging in a fabricated zero.
-
-    Which failures taint, and WHY the line falls where it does:
-
-    - **Transport refusal with no SCORABLE plan** (429 cap hit, auth failure,
-      model-not-found, zero-output wedge) → TAINTED. The candidate was never
-      asked; the outcome is a property of the schedule or of our configuration,
-      not of the candidate. "No scorable plan" covers both an absent artifact
-      and the header-only stub ``create_plan`` writes with zero steps — see
-      :func:`~orchestrator.evals.judge.is_scorable_plan`.
-    - **Harness error** (worktree/config/briefing/artifact-read raised) →
-      TAINTED, for the same reason: charging our own crash to the candidate
-      would be a fabricated score.
-    - **Transport refusal that still left a plan WITH STEPS** (a cap landing
-      mid-run, after the architect wrote real steps through plan-tools) → NOT
-      tainted. Model content exists, so the deterministic structural floor is a
-      genuine content measurement; the marker is recorded and the LLM judge is
-      skipped (it would 429 in the same window), but the cell stays in the
-      aggregate.
-    - **Timeout** → NOT tainted, deliberately. It is marked
-      (``architect:timeout: ...``) so it is never silently indistinguishable
-      from a bad plan, but unlike a cap hit it is CANDIDATE-attributable: the
-      model was asked and did not finish inside the operator's budget. Excluding
-      it would let a pathologically slow candidate dodge the penalty its
-      competitors paid, so it keeps scoring on content (an absent plan scores
-      the structural floor, 0.0) and the reliability signal is carried in BOTH
-      ``outcome='timeout'`` and ``invocation_error``.
-    - **Ordinary content failure** (an architect that ran fine and merely
-      produced a bad or absent plan) → NOT marked at all, scores 0.0. That is a
-      real reliability signal, not an infra failure. When the plan is stepless
-      the LLM judge is SKIPPED and the structural floor (0.0) is persisted
-      directly, so the score can never be the judge's opinion of an artifact
-      that carries nothing to judge (task 3302).
-    - **Refusal of the JUDGE alone** → recorded in ``invocation_error``
-      (prefixed ``judge:``) but does NOT taint: the structural floor is still
-      derived from a real produced plan.
-
-    The result carries ``role_under_test='architect'`` and is persisted via
-    :func:`save_result`.
+    Unlike :func:`run_eval`, which freezes the plan and scores the implementer,
+    only the architect runs, with this candidate's model, backend, effort and
+    env_overrides; every downstream role is frozen. The cell is
+    ``invoke_architect`` → ``read_reference_diff`` → ``classify_attempt`` →
+    ``judge_plan`` (only when judged) → ``assemble_metrics``, over *deps*
+    (production defaults, persisting into *store*, or
+    :meth:`ResultStore.packaged` when neither is given). Rationale:
+    docs/plan-scoring-and-judge.md, "The architect cell: invoke, classify,
+    assemble (task 6737)".
     """
-    from orchestrator.agents.briefing import BriefingAssembler
-    from orchestrator.agents.invoke import invoke_agent
-    from orchestrator.agents.roles import ARCHITECT
-    from orchestrator.artifacts import TaskArtifacts
-    from orchestrator.evals import snapshots
-    from orchestrator.evals.judge import (
-        is_scorable_plan,
-        judge_plan_quality,
-        score_plan_structure,
-    )
-
+    if store is not None and deps is not None:
+        raise ValueError(
+            'run_architect_eval takes store= or deps=, not both: deps.store is '
+            'where an injected deps persists the cell'
+        )
     task = load_task(task_path)
-    task_id = task['id']
-    project_root = Path(task['project_root'])
-    pre = task['pre_task_commit']
-
-    logger.info(
-        f'Starting architect eval: {task_id} × {config.name} (trial {trial})'
-    )
+    timeout_minutes = cell_timeout_minutes(task, timeout_override, ARCHITECT_CELL_TIMEOUT_MINUTES)
+    deps = deps or ArchitectEvalDeps(store=store or ResultStore.packaged())
+    label = cell_label(task, config)
+    logger.info(f'Starting architect eval: {label} (trial {trial})')
     start_ms = int(time.monotonic() * 1000)
-
-    # 1. Worktree at the fixture's pre_task_commit.
-    worktree, run_id = await snapshots.create_eval_worktree(
-        project_root, task_id, pre, setup_commands=task.get('setup_commands'),
-    )
-
-    plan: dict = {}
-    cost_usd = 0.0
-    arch_duration_ms = 0
-    outcome = 'done'
-    # The architect-side infra marker (task 3118): WHAT went wrong, if anything.
-    # Set on the transport-refusal path (classified from the AgentResult) AND on
-    # the timeout / harness-exception paths below, so no zero-content failure is
-    # left byte-indistinguishable from a genuinely terrible plan.
-    arch_error: str | None = None
-    # Whether that failure left NO model content to score — the input to the
-    # taint decision, kept SEPARATE from the marker because the two differ for a
-    # timeout: a timeout is marked (so it is legible) but is candidate-
-    # attributable, so it keeps scoring on content. See the scoring block below.
-    arch_unmeasurable = False
-    # Honor the operator's --timeout around the LIVE architect invoke, exactly
-    # as run_eval bounds workflow.run(). timeout_override is in MINUTES
-    # (run_eval convention — the CLI threads the same --timeout to both); without
-    # this a hung architect run would block indefinitely, bounded only by
-    # max_budget_usd.
-    timeout_minutes = timeout_override or task.get('timeout_minutes', 60)
-    try:
-        # 2. Eval orch config (project_root / verify / profile parity).
-        orch_config = build_eval_orch_config(
+    attempt = await invoke_architect(
+        task, config, deps,
+        build_orch_config=lambda: build_eval_orch_config(
             config, task, base_config, memory_endpoint=memory_endpoint,
-        )
-
-        # 3. Init artifacts so the architect has a place to write plan.json.
-        #    Target the RELOCATED .task-meta/<name>/ root — the SAME root the
-        #    injected plan-tools server writes to (BUG 1: writer==reader), so
-        #    read_plan() below picks up what the architect's plan-tools calls
-        #    persisted, exactly like real dispatch.
-        artifacts = TaskArtifacts(worktree, meta_root=_meta_root_for_worktree(worktree))
-        task_def = task.get('task_definition', {})
-        artifacts.init(
-            task_id,
-            task_def.get('title', ''),
-            task_def.get('description', ''),
-            base_commit=pre,
-        )
-
-        # 4. Build the architect prompt and invoke the architect LIVE with THIS
-        #    candidate's model/backend/effort/env_overrides.
-        briefing = BriefingAssembler(orch_config)
-        prompt = await briefing.build_architect_prompt(task_def, worktree=worktree)
-        # Wire plan-tools MCP via the SAME production seam real dispatch uses
-        # (workflow._invoke): relocated meta_root + direct-interpreter launch.
-        # strict_mcp_config stays default False so the ambient .mcp.json
-        # escalation/fused-memory servers still merge, mirroring _invoke.
-        mcp_config = _inject_plan_tools_mcp(None, worktree)
-        result = await asyncio.wait_for(
-            invoke_agent(
-                prompt=prompt,
-                system_prompt=ARCHITECT.system_prompt,
-                cwd=worktree,
-                model=config.model,
-                max_turns=task.get('max_architect_turns', 50),
-                max_budget_usd=config.max_budget_usd,
-                allowed_tools=ARCHITECT.allowed_tools or None,
-                disallowed_tools=ARCHITECT.disallowed_tools or None,
-                effort=config.effort or 'high',
-                backend=config.backend,
-                env_overrides=config.env_overrides or None,
-                mcp_config=mcp_config,
-            ),
-            timeout=timeout_minutes * 60,
-        )
-        cost_usd = result.cost_usd
-        arch_duration_ms = result.duration_ms
-        if not result.success:
-            outcome = 'blocked'
-        # Was this a TRANSPORT-layer refusal (a 429 cap hit / auth failure — we
-        # never got to ask the model) rather than an ordinary content failure?
-        # The outcome vocabulary stays 'blocked' either way; the distinction
-        # lives in metrics, which is what the report and the persisted JSON
-        # read. Guarded so a classifier bug degrades to an unmarked cell rather
-        # than nuking the whole run.
-        try:
-            arch_error = detect_invocation_error(result, backend=config.backend)
-            arch_unmeasurable = arch_error is not None
-        except Exception:
-            logger.warning(
-                f'invocation-error classification raised for {task_id} × '
-                f'{config.name}; leaving the cell unmarked',
-                exc_info=True,
-            )
-        # 5. Read the produced plan artifact (the scoring input).
-        plan = artifacts.read_plan() or {}
-    except TimeoutError:
-        logger.error(
-            f'Architect eval {task_id} × {config.name} timed out after '
-            f'{timeout_minutes}m'
-        )
-        outcome = 'timeout'
-        # MARKED but NOT unmeasurable: see the scoring block for why a timeout
-        # keeps scoring on content while a cap hit does not.
-        arch_error = arch_error or f'timeout: no answer within {timeout_minutes}m'
-    except Exception as e:
-        logger.error(f'Architect eval {task_id} × {config.name} failed: {e}')
-        outcome = 'blocked'
-        # A HARNESS failure (worktree/config/briefing/artifact-read raised), not
-        # a candidate failure — the candidate was never even asked, so scoring it
-        # 0.0 would charge our own crash to it. Marked AND unmeasurable. An
-        # already-classified transport refusal is more specific, so it wins.
-        # The reason is whitespace-collapsed and clipped so the marker stays a
-        # single short line in the result JSON and the report tables.
-        reason = ' '.join(str(e).split())[:80]
-        arch_error = arch_error or f'harness_error: {type(e).__name__}: {reason}'
-        arch_unmeasurable = True
-    finally:
-        # Plan already read above; the worktree is no longer needed (scoring
-        # reads the in-memory plan + the committed reference diff).
-        await snapshots.cleanup_eval_worktree(project_root, worktree)
-
-    # 6. Materialize the landed reference diff — the always-available ground
-    #    truth (ζ fixtures frequently carry plan: null).
-    reference = task.get('reference') or {}
-    post = reference.get('post_task_commit')
-    reference_diff = ''
-    if post:
-        try:
-            reference_diff = await snapshots.get_diff_between_commits(
-                project_root, pre, post,
-            )
-        except Exception as e:
-            logger.warning(f'reference diff failed for {task_id}: {e}')
-
-    # 7. Score the produced plan: LLM judge vs the landed diff, degrading to the
-    #    deterministic structural floor on ANY judge failure so plan_quality is a
-    #    non-sentinel float — UNLESS the architect invocation failed in a way
-    #    that left NOTHING to score (see the docstring's taint table for which
-    #    failures qualify and why a timeout deliberately does not).
-    plan_quality: float | None = None
-    judge_error: str | None = None
-    # The taint decision consults whether the artifact is SCORABLE, not merely
-    # whether one exists (reviewer: correctness). A session cap can land MID-run,
-    # after the architect has already written plan.json through plan-tools MCP —
-    # the common shape of a cap hit during a long campaign. When a plan WITH
-    # STEPS landed, nulling it would discard a genuine content measurement
-    # (exactly what the judge-only branch is careful NOT to do) while persisting
-    # a self-contradictory cell: plan_steps > 0 alongside "we never got to ask
-    # the model".
-    #
-    # Raw truthiness was INSUFFICIENT: create_plan — the architect's first
-    # plan-tools call, and the only one it can reach before a 429 — persists a
-    # truthy header-only dict with zero steps. A cap landing right after it left
-    # tainted=False while score_plan_structure short-circuited to a fabricated
-    # 0.0. is_scorable_plan is that short-circuit's own test, so the two can no
-    # longer disagree.
-    tainted = arch_unmeasurable and not is_scorable_plan(plan)
-    if tainted:
-        # We never got to ask the model AND no SCORABLE plan exists, so every
-        # available number would be FABRICATED — and a fabricated 0.0 is
-        # byte-indistinguishable from a genuinely terrible plan, which is the
-        # defect this marker exists to remove. The judge is skipped rather than
-        # invoked-and-discarded: it has nothing to judge, and inside a cap
-        # window it would 429 too (the second-order failure that manufactured
-        # the 0.0), burning an opus call on a doomed request.
-        logger.warning(
-            f'Architect eval {task_id} × {config.name}: invocation refused with '
-            f'no scorable plan artifact ({arch_error}) — plan judge skipped, '
-            f'plan_quality=None, cell marked cap_tainted (NOT scored 0.0)'
-        )
-    elif arch_unmeasurable:
-        # Refused, but a plan WITH STEPS landed first: score it on the
-        # deterministic structural floor and do NOT taint — symmetric with the
-        # judge-only case, where a content-derived score survives an infra
-        # refusal. Gating on is_scorable_plan is what makes that justification
-        # true: this branch now fires ONLY when the floor can actually derive a
-        # content score, never when it would short-circuit to a fabricated 0.0.
-        # The LLM judge is still skipped: inside the same cap window it would
-        # 429 too, and the floor is the exact degradation path a judge failure
-        # already takes. The marker is still recorded so the reader knows why.
-        plan_quality = score_plan_structure(plan)
-        logger.warning(
-            f'Architect eval {task_id} × {config.name}: invocation refused '
-            f'({arch_error}) but a plan artifact exists — LLM judge skipped, '
-            f'scored on the structural floor ({plan_quality}), NOT tainted'
-        )
-    elif not is_scorable_plan(plan):
-        # The architect ran FINE and produced nothing worth scoring. The LLM
-        # judge has no scorability guard of its own — it returns whatever the
-        # model says in [0, 1] — while score_plan_structure short-circuits a
-        # stepless artifact to 0.0 as a deliberate ANTI-FABRICATION guard
-        # (Graphiti e2066ec6). Trusting the judge here writes a cell whose own
-        # plan_steps=0 CONTRADICTS its score, which is the shape the report-layer
-        # floor (metrics.produced_a_plan, task 3302) has to defend the existing
-        # corpus against. Gating at the source keeps plan_steps and the persisted
-        # plan_quality consistent for every NEW cell.
-        #
-        # The judge is skipped rather than invoked-and-discarded, on the
-        # arch_unmeasurable branch's own justification: it has nothing to judge,
-        # inside a cap window it would 429 anyway, and an opus call on an
-        # unjudgeable artifact is pure waste.
-        #
-        # NOT tainted: no infra failure occurred. This is a CONTENT failure and
-        # must keep scoring on content — a genuine 0.0, distinct from the
-        # "we never got to ask" exclusion above (task 3118).
-        plan_quality = score_plan_structure(plan)
-        logger.warning(
-            f'Architect eval {task_id} × {config.name}: architect ran '
-            f'successfully but produced no scorable plan — plan judge skipped, '
-            f'scored on the structural floor ({plan_quality}), NOT tainted'
-        )
-    else:
-        try:
-            verdict = await judge_plan_quality(plan, reference_diff, task)
-            plan_quality = verdict.plan_quality
-            # getattr, not attribute access: a monkeypatched or legacy verdict
-            # without the field must not break scoring.
-            judge_error = getattr(verdict, 'invocation_error', None)
-        except Exception:
-            logger.warning(
-                f'plan judge raised for {task_id}; degrading to structural floor',
-                exc_info=True,
-            )
-        if plan_quality is None:
-            plan_quality = score_plan_structure(plan)
-
+        ),
+        usage_gate=usage_gate,
+        timeout_minutes=timeout_minutes,
+    )
+    reference_diff = await read_reference_diff(task, deps)
+    scoring = classify_attempt(attempt)
+    judgement = (
+        await judge_plan(attempt.plan, reference_diff, task, deps)
+        if scoring is PlanScoring.JUDGE else None
+    )
+    metrics = assemble_metrics(attempt, scoring, judgement)
     wall_clock_ms = int(time.monotonic() * 1000) - start_ms
-
-    # The marker names WHICH stage failed; the join keeps the field well-defined
-    # if both ever fire (today an architect-side refusal skips the judge, so at
-    # most one does). cap_tainted keys on ``tainted``, NOT on the marker: a
-    # judge-only refusal, a timeout, and a refusal that still left a plan behind
-    # all keep a content-derived score, so excluding those cells would discard
-    # valid measurements.
-    stage_markers = [
-        f'{stage}:{marker}'
-        for stage, marker in (('architect', arch_error), ('judge', judge_error))
-        if marker
-    ]
-    metrics = EvalMetrics(
-        plan_quality=plan_quality,
-        role_under_test='architect',
-        # NO test signal exists for a plan-only cell (task 3099): this path
-        # freezes implementer/debugger/reviewer/verify, so verification never
-        # runs. ``None`` is the documented "unknown" sentinel; the dataclass
-        # DEFAULT of ``False`` would read as "the tests failed" and hard-gate
-        # ``blend_composite`` to 0.0, collapsing every architect row's composite
-        # to 0.0000 and leaving ``select_survivors``' alphabetical tie-break as
-        # the whole selection mechanism.
-        #
-        # ``True`` is NOT the fix either, on two counts:
-        #   - ``build_composite_report`` draws each fixture's cost/latency FLOOR
-        #     from PASSING trials, and ``ofat_candidates()`` mixes architect,
-        #     implementer and judge candidates over the SAME fixtures into one
-        #     result set. A ~$0.30/60s plan-only cell marked passing would
-        #     become the floor for ~$5/900s full-workflow cells.
-        #   - it would fabricate a 100% ``tests_pass_rate`` for a cell that
-        #     never ran a test.
-        tests_pass=None,
-        # ``or []``, not a .get default: a plan can carry an explicit
-        # ``steps: None`` (the normalizer's other empty shape), and len(None)
-        # would crash the cell OUTSIDE the try above — turning a marked,
-        # recoverable cap cell into a lost run.
-        plan_steps=len(plan.get('steps') or []),
-        cost_usd=cost_usd,
-        workflow_duration_ms=arch_duration_ms,
-        invocation_error='; '.join(stage_markers) or None,
-        cap_tainted=tainted,
-    )
-    result_obj = EvalResult(
-        task_id=task_id,
-        config_name=config.name,
-        outcome=outcome,
+    result = EvalResult(
+        task_id=attempt.address.task_id,
+        config_name=attempt.address.config_name,
+        outcome=attempt.outcome,
         metrics=metrics.to_dict(),
-        worktree_path=str(worktree),
+        worktree_path=str(attempt.worktree),
         wall_clock_ms=wall_clock_ms,
-        run_id=run_id,
+        run_id=attempt.address.run_id,
         trial=trial,
+        timeout_minutes=timeout_minutes,
     )
-    save_result(result_obj)
-    logger.info(
-        f'Architect eval complete: {task_id} × {config.name} → '
-        f'plan_quality={plan_quality} ({wall_clock_ms / 1000:.1f}s)'
-        + (
-            f' [{"cap_tainted" if tainted else "invocation_error"}: '
-            f'{metrics.invocation_error}]'
-            if metrics.invocation_error else ''
-        )
-    )
-    return result_obj
+    deps.store.save(result)
+    log_architect_cell(label, scoring, metrics, wall_clock_ms)
+    return result
 
 
 async def run_end_to_end(
@@ -868,128 +541,422 @@ async def run_end_to_end(
     trial: int = 1,
     timeout_override: int | None = None,
     memory_endpoint: str | None = None,
+    *,
+    usage_gate: InjectedGate = GATE_UNSET,
+    store: ResultStore | None = None,
+    profile: CellProfile | None = None,
 ) -> EvalResult:
-    """Run ONE both-live end-to-end eval: architect LIVE feeding implementer LIVE.
+    """Run ONE both-live end-to-end cell: the architect plans live and feeds the live implementer.
 
-    Unlike :func:`run_eval` (frozen plan → implementer varies) and
-    :func:`run_architect_eval` (live architect → downstream frozen), this is the
-    ONLY executor where BOTH the architect and the implementer run live — the
-    matrix/confirm stages (eval-revival μ). It builds the both-live orch config
-    via ``build_eval_orch_config(impl_config, ..., architect_config=arch_config)``
-    and constructs the workflow with ``initial_plan=None`` so the workflow runs
-    its PLAN phase live (the architect plans against the fixture) and feeds that
-    plan to the live implementer — the only place the plan-style/implementer
-    coupling question exists (PRD decision 9).
-
-    The result's ``config_name`` encodes the ``(architect, implementer)`` combo
-    and its metrics carry ``role_under_test='end_to_end'``. Mirrors run_eval's
-    timeout / exception handling and persists via :func:`save_result`.
+    The matrix/confirm stages' executor (eval-revival μ): the only one where both
+    roles run live, so the only place the plan-style/implementer coupling
+    question exists (PRD decision 9). The cell is labelled
+    ``<architect>+<implementer>``, is an END_TO_END cell, and its architect is
+    briefed in the replay frame. It persists into *store* (``None``:
+    :meth:`ResultStore.packaged`). A caller running the cell under another
+    profile — the shadow profile — passes it as *profile* (``None``: the
+    corpus profile).
     """
+    cell_profile = profile or _corpus_profile()
     task = load_task(task_path)
-    task_id = task['id']
-    project_root = Path(task['project_root'])
-    config_name = f'{arch_config.name}+{impl_config.name}'
-
-    logger.info(
-        f'Starting end-to-end eval: {task_id} × {config_name} (trial {trial})'
+    return await _run_workflow_cell(
+        task,
+        lambda: cell_profile.orch_config_builder(
+            impl_config, task, base_config,
+            memory_endpoint=memory_endpoint, architect_config=arch_config,
+        ),
+        label=f'{arch_config.name}+{impl_config.name}',
+        role=RoleUnderTest.END_TO_END,
+        initial_plan=None,
+        replay_framed=True,
+        worktree=None,
+        trial=trial,
+        timeout_override=timeout_override,
+        usage_gate=usage_gate,
+        store=store or ResultStore.packaged(),
+        task_gate=cell_profile.task_gate,
     )
-    start_ms = int(time.monotonic() * 1000)
 
-    # 1. Fresh worktree at the fixture's pre_task_commit.
-    worktree, run_id = await create_eval_worktree(
-        project_root, task_id, task['pre_task_commit'],
+
+async def _run_workflow_cell(
+    task: dict,
+    build_orch_config: Callable[[], OrchestratorConfig],
+    *,
+    label: str,
+    role: RoleUnderTest,
+    initial_plan: dict | None,
+    replay_framed: bool,
+    worktree: Path | None,
+    trial: int,
+    timeout_override: int | None,
+    usage_gate: InjectedGate,
+    store: ResultStore,
+    task_gate: TaskVerifyPort,
+) -> EvalResult:
+    """Run one workflow cell of *task* under *label* and persist it into *store*.
+
+    *worktree* is adopted (its name is the run id); ``None`` creates a fresh one.
+    The cell's address is fixed before *build_orch_config* runs, so an
+    unaddressable label fails before anything is spent. *replay_framed* briefs
+    the workflow's architect in the replay frame and stamps the cell with it
+    (docs/eval-replay-frame.md). The wall clock includes worktree setup.
+    """
+    cell = f'{task["id"]} × {label}'
+    timeout_minutes = cell_timeout_minutes(task, timeout_override, WORKFLOW_CELL_TIMEOUT_MINUTES)
+    logger.info(f'Starting eval: {cell} (trial {trial})')
+    start_ms = int(time.monotonic() * 1000)
+    worktree, run_id = await _open_cell_worktree(task, worktree)
+    address = CellName(task['id'], label, run_id)
+    orch_config = build_orch_config()
+    sandbox_backend = bind_cell_sandbox_backend(orch_config)
+    replay_frame = REPLAY_FRAME_ID if replay_framed else None
+    async with owned_usage_gate(usage_gate, orch_config, label=cell) as gate:
+        workflow = _cell_workflow(
+            task, orch_config, worktree, initial_plan,
+            replay_framed=replay_framed, usage_gate=gate, task_gate=task_gate,
+        )
+        outcome = await _await_outcome(workflow, timeout_minutes, cell)
+        wall_clock_ms = int(time.monotonic() * 1000) - start_ms
+        metrics = await _cell_metrics(
+            workflow, worktree, task, role=role, replay_frame=replay_frame,
+            sandbox_backend=sandbox_backend,
+        )
+        result = EvalResult(
+            task_id=address.task_id,
+            config_name=address.config_name,
+            outcome=outcome,
+            metrics=metrics,
+            worktree_path=str(worktree),
+            wall_clock_ms=wall_clock_ms,
+            run_id=address.run_id,
+            trial=trial,
+            timeout_minutes=timeout_minutes,
+        )
+        store.save(result)
+    logger.info(
+        f'Eval complete: {cell} → {result.outcome} '
+        f'(total={wall_clock_ms / 1000:.1f}s, '
+        f'workflow={metrics.get("workflow_duration_ms", 0) / 1000:.1f}s)'
+    )
+    return result
+
+
+async def _open_cell_worktree(task: dict, worktree: Path | None) -> tuple[Path, str]:
+    """Adopt *worktree* (its name is the run id), or create one at the fixture's base."""
+    if worktree is not None:
+        logger.info(f'Reusing existing worktree: {worktree}')
+        return worktree, worktree.name
+    return await create_eval_worktree(
+        task['project_root'], task['id'], task['pre_task_commit'],
         setup_commands=task.get('setup_commands'),
     )
 
-    # 2. Both-live orch config: architect derived from arch_config, implementer
-    #    from impl_config.
-    orch_config = build_eval_orch_config(
-        impl_config, task, base_config,
-        memory_endpoint=memory_endpoint, architect_config=arch_config,
-    )
 
-    # 3. Task assignment.
-    task_def = task.get('task_definition', {
-        'title': task.get('name', task_id),
-        'description': task.get('name', ''),
-    })
+def _cell_workflow(
+    task: dict,
+    orch_config: OrchestratorConfig,
+    worktree: Path,
+    initial_plan: dict | None,
+    *,
+    replay_framed: bool,
+    usage_gate: UsageGate | None,
+    task_gate: TaskVerifyPort,
+    writers: ProductionWriters = NO_PRODUCTION_WRITERS,
+) -> TaskWorkflow:
+    """The real TaskWorkflow for *task*, run in *worktree* against the eval stubs.
+
+    Each verify attempt is gated by *task_gate*. ``initial_plan=None`` makes
+    the workflow's architect plan live. Handed
+    *writers* are refused with ``EvalHermeticityError`` before anything is
+    built, and so is a built workflow holding one it was not handed, so the
+    cell writes no production state (C11).
+    """
+    refuse_production_writers(writers)
+    task_id = task['id']
     modules = task.get('modules', [])
     assignment = TaskAssignment(
-        task_id=task_id, task=task_def, modules=list(modules),
+        task_id=task_id,
+        task=task.get('task_definition', {
+            'title': task.get('name', task_id),
+            'description': task.get('name', ''),
+        }),
+        modules=list(modules),
     )
-
-    # 4. Workflow dependencies (mirrors run_eval).
-    git_ops = GitOps(orch_config.git, orch_config.project_root)
     scheduler, _ = _build_eval_scheduler(orch_config, task_id, list(modules))
-    briefing = BriefingAssembler(orch_config)
-    mcp = _EvalMcpStub(orch_config.fused_memory.url)
-
-    usage_gate: UsageGate | None = None
-    if orch_config.usage_cap.enabled:
-        try:
-            usage_gate = UsageGate(orch_config.usage_cap)
-        except Exception as exc:
-            logger.warning(f'Failed to create UsageGate for eval: {exc} — running without failover')
-
-    # 5. Build the workflow with initial_plan=None → the architect plans LIVE and
-    #    feeds the live implementer (the both-live path; run_eval hands a frozen
-    #    plan here instead).
+    briefing = (
+        ReplayFramedBriefingAssembler(orch_config, base_commit=task['pre_task_commit'])
+        if replay_framed else BriefingAssembler(orch_config)
+    )
     workflow = build_workflow(
         assignment=assignment,
         config=orch_config,
-        git_ops=git_ops,
-        scheduler=scheduler,  # type: ignore[arg-type]
+        git_ops=GitOps(orch_config.git, orch_config.project_root),
+        scheduler=scheduler,
         briefing=briefing,
-        mcp=mcp,  # type: ignore[arg-type]
-        initial_plan=None,
+        mcp=eval_mcp_lifecycle(orch_config),
+        initial_plan=initial_plan,
         usage_gate=usage_gate,
+        escalation_queue=writers.escalation_queue,
+        steward_factory=writers.steward_factory,
+        event_store=writers.event_store,
+        cost_store=writers.cost_store,
+        task_verify=task_gate,
     )
+    if isinstance(workflow, TaskWorkflow):  # tests that patch build_workflow hand back a MagicMock
+        refuse_production_writers(writers_held_by(workflow))
     workflow.worktree = worktree
+    return workflow
 
-    timeout_minutes = timeout_override or task.get('timeout_minutes', 60)
+
+async def _await_outcome(workflow: TaskWorkflow, timeout_minutes: float, cell: str) -> str:
+    """The workflow's terminal outcome, where a ceiling that fired or a raise becomes the cell's outcome.
+
+    A workflow can absorb the deadline's cancellation and return CANCELLED, or
+    raise while finalising it, so a fired ceiling is read from the scope and
+    not only from a TimeoutError.
+    """
+    deadline = asyncio.timeout(timeout_minutes * 60)
     try:
-        terminal_report = await asyncio.wait_for(
-            workflow.run(), timeout=timeout_minutes * 60,
-        )
-        outcome = terminal_report.outcome
+        async with deadline:
+            report = await workflow.run()
     except TimeoutError:
-        logger.error(
-            f'End-to-end eval {task_id} × {config_name} timed out after '
-            f'{timeout_minutes}m'
-        )
-        outcome = 'timeout'
+        return _timed_out(cell, timeout_minutes)
     except Exception as e:
-        logger.error(f'End-to-end eval {task_id} × {config_name} failed: {e}')
-        outcome = WorkflowOutcome.BLOCKED
+        if deadline.expired():
+            return _timed_out(cell, timeout_minutes)
+        logger.error(f'Eval {cell} failed: {e}')
+        return WorkflowOutcome.BLOCKED.value
+    if deadline.expired():
+        return _timed_out(cell, timeout_minutes)
+    outcome = report.outcome
+    return outcome.value if isinstance(outcome, WorkflowOutcome) else str(outcome)
 
-    wall_clock_ms = int(time.monotonic() * 1000) - start_ms
 
-    # 6. Collect metrics, then STAMP role_under_test='end_to_end' (collect_metrics
-    #    itself does not know which methodology stage invoked it).
+def _timed_out(cell: str, timeout_minutes: float) -> str:
+    logger.error(f'Eval {cell} timed out after {timeout_minutes}m')
+    return 'timeout'
+
+
+async def _cell_metrics(
+    workflow: TaskWorkflow,
+    worktree: Path,
+    task: dict,
+    *,
+    role: RoleUnderTest,
+    replay_frame: str | None,
+    sandbox_backend: CellSandbox,
+) -> dict[str, Any]:
+    """The cell's metrics; a collection that raised leaves only the stamps the executor knows."""
     try:
-        metrics = await collect_metrics(workflow, worktree, task)
-        metrics_dict = metrics.to_dict()
+        metrics = await collect_metrics(
+            workflow, worktree, task, role=role, replay_frame=replay_frame,
+            sandbox_backend=sandbox_backend,
+        )
     except Exception as e:
         logger.warning(f'Metric collection failed: {e}')
-        metrics_dict = {}
-    metrics_dict['role_under_test'] = 'end_to_end'
+        return {
+            'role_under_test': role, 'replay_frame': replay_frame,
+            'sandbox_backend': sandbox_backend,
+        }
+    return metrics.to_dict()
 
-    result = EvalResult(
-        task_id=task_id,
-        config_name=config_name,
-        outcome=outcome.value if isinstance(outcome, WorkflowOutcome) else str(outcome),
-        metrics=metrics_dict,
-        worktree_path=str(worktree),
-        wall_clock_ms=wall_clock_ms,
-        run_id=run_id,
-        trial=trial,
+
+async def collect_metrics(
+    workflow: TaskWorkflow,
+    worktree: Path,
+    task: dict,
+    *,
+    role: RoleUnderTest,
+    replay_frame: str | None = None,
+    sandbox_backend: CellSandbox,
+) -> EvalMetrics:
+    """Collect metrics from a completed workflow run, stamped with *role*, *replay_frame* and *sandbox_backend*."""
+    wf_metrics = workflow.metrics
+
+    # Plan completion
+    plan = workflow.artifacts.read_plan() if workflow.artifacts else {}
+    steps = plan.get('steps', [])
+    done_count = sum(1 for s in steps if isinstance(s, dict) and s.get('status') == 'done')
+    total_steps = len(steps) if steps else 1
+    plan_completion = done_count / total_steps
+
+    # Verification results (re-read from last run)
+    verification = await run_fixture_gate(worktree, workflow.config)
+
+    # Review stats from artifacts
+    reviews = workflow.artifacts.aggregate_reviews() if workflow.artifacts else None
+    blocking_issues = len(reviews.blocking_issues) if reviews else 0
+    suggestions = len(reviews.suggestions) if reviews else 0
+
+    # Git stats (diff against pre-task commit to capture all workflow changes)
+    lines_changed, files_changed = await _git_diff_stats(
+        worktree, task['pre_task_commit'],
     )
-    save_result(result)
-    logger.info(
-        f'End-to-end eval complete: {task_id} × {config_name} → {result.outcome} '
-        f'({wall_clock_ms / 1000:.1f}s)'
+
+    # Inference speed metrics
+    duration_secs = wf_metrics.total_duration_ms / 1000 if wf_metrics.total_duration_ms else 0.0
+    tps = wf_metrics.total_output_tokens / duration_secs if duration_secs > 0 else 0.0
+    # Via the shared predicate, NOT an inline env read: the same signal decides
+    # whether build_eval_orch_config seeds the proxied price table, so the two
+    # must not be able to drift apart (see is_proxied_endpoint).
+    is_local = is_proxied_endpoint(workflow.config.env_overrides)
+
+    # Cost provenance (Invariant P5): the CLI's own cost figure is wrong for a
+    # proxied endpoint, so resolve cost from the config price table by the run's
+    # model, tracking which source was used. The workflow totals include every
+    # role's tokens (judge and reviewer too), cache reads and writes included,
+    # and all of them are priced at config.models.implementer whatever *role*
+    # the cell is stamped with; per-role pricing is task 9968.
+    # ``run_architect_eval`` resolves through this SAME seam (task 3656) — with
+    # ``model=EvalConfig.model`` and ``prices`` from its own eval orch config,
+    # the leaves that actually produced its tokens — and then composes its
+    # two-component (architect + plan-judge) label via ``compose_cost_source``.
+    # So both eval paths share ONE cost-provenance seam rather than one
+    # resolving and one copying the raw CLI number.
+    run_model = workflow.config.models.implementer
+    resolved_cost, cost_source = resolve_cost_usd(
+        TokenUsage(
+            input_tokens=wf_metrics.total_input_tokens,
+            output_tokens=wf_metrics.total_output_tokens,
+            cache_read_tokens=wf_metrics.total_cache_read_tokens,
+            cache_create_tokens=wf_metrics.total_cache_create_tokens,
+        ),
+        model=run_model,
+        prices=workflow.config.prices,
+        cli_cost_usd=wf_metrics.total_cost_usd,
+        is_local_model=is_local,
     )
-    return result
+
+    m = EvalMetrics(
+        tests_pass=verification.passed if verification else False,
+        lint_clean=(not verification.lint_output) if verification else False,
+        typecheck_clean=(not verification.type_output) if verification else False,
+        plan_completion_pct=plan_completion,
+        plan_steps=total_steps,
+        cost_usd=resolved_cost,
+        cost_source=cost_source,
+        workflow_duration_ms=wf_metrics.total_duration_ms,
+        turns_used=wf_metrics.total_turns,
+        iterations=wf_metrics.execute_iterations,
+        debug_cycles=wf_metrics.verify_attempts,
+        judge_invocations=wf_metrics.judge_invocations,
+        judge_cost_usd=wf_metrics.judge_cost_usd,
+        judge_early_exits=wf_metrics.judge_early_exits,
+        input_tokens=wf_metrics.total_input_tokens,
+        output_tokens=wf_metrics.total_output_tokens,
+        cache_read_tokens=wf_metrics.total_cache_read_tokens,
+        cache_create_tokens=wf_metrics.total_cache_create_tokens,
+        review_blocking_issues=blocking_issues,
+        review_suggestions=suggestions,
+        lines_changed=lines_changed,
+        files_changed=files_changed,
+        tokens_per_second=round(tps, 2),
+        is_local_model=is_local,
+        role_under_test=role,
+        replay_frame=replay_frame,
+        sandbox_backend=sandbox_backend,
+    )
+    # False-green guard — catches the 404-bug signature so the same class of
+    # silent failure doesn't need manual quarantine in future runs.
+    enforced_cap = execute_iteration_cap(
+        workflow.config.implementer_brief_variant,
+        workflow.config.max_execute_iterations,
+        lambda: plan,
+    )
+    if is_false_green(m, enforced_cap):
+        logger.warning(
+            'False-green signature for task %s: %d iters @ cap, '
+            '$0 cost, 0 lines / 0 files changed, T/T/T — '
+            'nulling gate fields so score is 0',
+            task.get('id', '?'), m.iterations,
+        )
+        m.tests_pass = None
+        m.lint_clean = None
+        m.typecheck_clean = None
+    # Null-work guard — catches the NULL-byte implementer signature where
+    # real inference ran (cost > 0) but the model emitted pad tokens instead
+    # of tool calls, producing zero code changes.
+    elif is_null_work(m):
+        logger.warning(
+            'Null-work signature for task %s: %d iters, '
+            '$%.4f cost, 0 lines / 0 files changed — '
+            'nulling gate fields so score is 0',
+            task.get('id', '?'), m.iterations, m.cost_usd,
+        )
+        m.tests_pass = None
+        m.lint_clean = None
+        m.typecheck_clean = None
+
+    m.composite_score = compute_composite(m)
+
+    # Stamp the adversarial flag from the task record BEFORE recovery scoring
+    # runs, so it is set regardless of whether recovery scoring succeeds, is
+    # None, or raises below. The report keys its ``adversarial`` column on this
+    # flag (not on ``recovery_score is not None``), so a recovery-scoring
+    # FAILURE on an adversarial fixture renders as ``adversarial: true`` with a
+    # null score — visibly distinct from a genuinely non-adversarial run.
+    m.adversarial = bool(task.get('adversarial'))
+
+    # Recovery-behavior scoring (eval-revival η) — a rubric DISTINCT from the
+    # base composite, scored only for adversarial fixtures (returns None
+    # otherwise). Guarded: a recovery-scoring bug degrades to a named WARNING +
+    # null column and never nukes the run's composite/cost/gate metrics.
+    try:
+        m.recovery_score = await recovery_score_for_run(
+            task, workflow.artifacts, worktree, task['pre_task_commit'],
+        )
+    except Exception:
+        logger.warning(
+            'recovery scoring failed for %s', task.get('id', '?'),
+            exc_info=True,
+        )
+
+    return m
+
+
+async def _git_diff_stats(worktree: Path, base_commit: str) -> tuple[int, int]:
+    """Get lines changed and files changed vs the pre-task baseline commit.
+
+    Returns (-1, -1) on git failure or subprocess error so callers can
+    distinguish a genuine zero-change diff from a failed measurement.
+    """
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            'git', 'diff', '--stat', f'{base_commit}..HEAD',
+            cwd=str(worktree),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await proc.communicate()
+        if proc.returncode != 0:
+            logger.warning(
+                '_git_diff_stats: git diff --stat failed (rc=%s) base=%s: %s',
+                proc.returncode, base_commit,
+                stderr.decode(errors='replace')[:200],
+            )
+            return -1, -1
+        output = stdout.decode().strip()
+        if not output:
+            return 0, 0
+
+        # Last line: " X files changed, Y insertions(+), Z deletions(-)"
+        summary = output.split('\n')[-1]
+        files_changed = 0
+        lines_changed = 0
+
+        m = re.search(r'(\d+) files? changed', summary)
+        if m:
+            files_changed = int(m.group(1))
+        for m in re.finditer(r'(\d+) (?:insertions?|deletions?)', summary):
+            lines_changed += int(m.group(1))
+
+        return lines_changed, files_changed
+    except Exception:
+        logger.warning(
+            '_git_diff_stats: git diff raised for base=%s',
+            base_commit, exc_info=True,
+        )
+        return -1, -1
 
 
 def _collect_cancel_errors(done: Iterable[asyncio.Task[Any]]) -> list[asyncio.CancelledError]:
@@ -1022,134 +989,20 @@ def _collect_cancel_errors(done: Iterable[asyncio.Task[Any]]) -> list[asyncio.Ca
     return errors
 
 
-async def run_eval_matrix(
-    task_paths: list[Path],
-    configs: list[EvalConfig] | None = None,
-    base_config: OrchestratorConfig | None = None,
-    max_parallel: int | None = None,
-    trials: int = 1,
-    force: bool = False,
-    timeout_override: int | None = None,
-) -> list[EvalResult]:
-    """Run all (task, config, trial) combinations with bounded concurrency.
-
-    Raises:
-        asyncio.CancelledError: if any individual eval coroutine raises
-            CancelledError, or if this coroutine itself is cancelled from
-            outside.  In either case we log, cancel any still-running
-            sibling tasks, await their cleanup, and re-raise.
-    """
-    configs = configs or EVAL_CONFIGS
-
-    combos = [
-        (task_path, config, t)
-        for task_path in task_paths
-        for config in configs
-        for t in range(1, trials + 1)
-    ]
-
-    if max_parallel is None:
-        max_parallel = len(combos)
-    sem = asyncio.Semaphore(max_parallel)
-
-    async def _run_one(
-        task_path: Path, config: EvalConfig, trial: int,
-    ) -> EvalResult | None:
-        task = load_task(task_path)
-        if not force and _result_exists(task['id'], config.name):
-            logger.info(f'Skipping existing: {task["id"]} × {config.name}')
-            return None
-        async with sem:
-            return await run_eval(
-                task_path, config, base_config,
-                trial=trial, timeout_override=timeout_override,
-            )
-
-    # Design decision: use asyncio.wait(FIRST_COMPLETED) monitor loop instead of
-    # asyncio.gather(return_exceptions=True).
-    #
-    # asyncio.gather(return_exceptions=True) blocks until ALL tasks complete before
-    # the post-gather loop can detect CancelledError and re-raise it.  For a large
-    # matrix where one eval is cancelled early, N-1 siblings continue running their
-    # full duration — wasting CPU proportional to matrix size × timeout_minutes.
-    #
-    # asyncio.wait(FIRST_COMPLETED) lets us react to each task completion
-    # individually: on CancelledError we immediately cancel all remaining tasks and
-    # re-raise, typically within milliseconds.  Non-cancel exceptions are still
-    # logged and the loop continues — identical happy-path/error-path semantics to
-    # the previous gather loop, with strictly better cancellation behaviour.
-    #
-    # This is the same pattern used in harness.py (lines 305, 317) for managing
-    # concurrent workflow tasks.  Cleanup follows the established pattern from
-    # steward.py (lines 101-104): cancel tasks explicitly then await them with
-    # return_exceptions=True to ensure clean teardown before re-raising.
-    active: set[asyncio.Task] = {
-        asyncio.create_task(_run_one(tp, cfg, t))
-        for tp, cfg, t in combos
-    }
-    results: list[EvalResult] = []
-    # Distinguish two cancellation scenarios:
-    #   Inner-task cancellation — an individual _run_one coroutine was cancelled
-    #     or raised CancelledError.  asyncio.wait surfaces this via
-    #     task.cancelled() or task.exception() inside the monitor loop below;
-    #     we log it, cancel siblings, and re-raise to propagate.
-    #   Outer-task cancellation — run_eval_matrix itself was cancelled (e.g.
-    #     SIGINT / asyncio.wait_for timeout).  The CancelledError interrupts
-    #     the *await asyncio.wait(...)* call directly and is caught by the
-    #     outer except clause, which performs the same sibling cleanup.
-    try:
-        while active:
-            done, active = await asyncio.wait(active, return_when=asyncio.FIRST_COMPLETED)
-            # Task 586: scan the full done batch for ALL CancelledErrors before
-            # processing any results.  Multiple tasks can complete in the same
-            # event-loop iteration and land in the same done set (e.g. when a
-            # shutdown signal fires while two evals are parked at the same
-            # await point).  The old code raised on the first cancel it saw,
-            # silently discarding subsequent cancels in the batch.
-            cancel_errors = _collect_cancel_errors(done)
-            if cancel_errors:
-                for ce in cancel_errors:
-                    logger.error('Eval cancelled', exc_info=ce)
-                for t in active:
-                    t.cancel()
-                await asyncio.gather(*active, return_exceptions=True)
-                active.clear()
-                raise cancel_errors[0]
-            # No cancellations in this batch — handle results and non-cancel
-            # exceptions.  task.cancelled() is False for all remaining tasks so
-            # task.exception() / task.result() are safe to call.
-            for task in done:
-                exc = task.exception()
-                if exc is not None:
-                    logger.error('Eval failed', exc_info=exc)
-                else:
-                    r = task.result()
-                    if r is not None:
-                        results.append(r)
-    except asyncio.CancelledError:
-        # External cancellation (e.g. SIGINT / asyncio.wait_for timeout).
-        # Cancel all remaining sibling tasks and await their cleanup before
-        # re-raising so we don't leave orphaned tasks behind.
-        for t in active:
-            t.cancel()
-        await asyncio.gather(*active, return_exceptions=True)
-        raise
-    return results
-
-
 async def _bounded_fanout(
     thunks: list[Callable[[], Awaitable[EvalResult | None]]],
     max_parallel: int | None = None,
 ) -> list[EvalResult]:
     """Run each *thunk* with bounded concurrency, returning the flattened results.
 
-    The single-sourced fan-out skeleton the μ methodology stages
-    (:func:`run_ofat_stage` / :func:`run_matrix_stage` / :func:`run_confirm_stage`)
-    share, mirroring :func:`run_eval_matrix`'s ``asyncio.wait(FIRST_COMPLETED)``
-    monitor loop EXACTLY: a non-cancel failure in one cell is logged and the
-    fan-out CONTINUES; a ``CancelledError`` (inner or external) cancels the
-    still-running siblings, awaits their teardown, and re-raises. Each thunk is a
-    zero-arg coroutine factory returning one ``EvalResult`` (or ``None`` to skip).
+    The fan-out skeleton every campaign entry point shares (:func:`run_eval_matrix`,
+    :func:`run_ofat_stage`, :func:`run_matrix_stage`, :func:`run_confirm_stage`).
+    An ``asyncio.wait(FIRST_COMPLETED)`` monitor loop rather than ``gather``, so
+    the fan-out reacts to each cell as it finishes: a non-cancel failure in one
+    cell is logged and the fan-out CONTINUES; a ``CancelledError`` (inner or
+    external) cancels the still-running siblings at once, awaits their teardown,
+    and re-raises. Each thunk is a zero-arg coroutine factory returning one
+    ``EvalResult`` (or ``None`` to skip).
     """
     if not thunks:
         return []
@@ -1191,6 +1044,55 @@ async def _bounded_fanout(
     return results
 
 
+async def run_eval_matrix(
+    task_paths: list[Path],
+    configs: list[EvalConfig] | None = None,
+    base_config: OrchestratorConfig | None = None,
+    max_parallel: int | None = None,
+    trials: int = 1,
+    force: bool = False,
+    timeout_override: int | None = None,
+    *,
+    store: ResultStore | None = None,
+) -> list[EvalResult]:
+    """Run all (task, config, trial) combinations with bounded concurrency.
+
+    A (task, config) pair *store* already holds is skipped unless *force*;
+    every cell run persists into *store* (``None`` means
+    :meth:`ResultStore.packaged`). A failed cell is logged and skipped, and a
+    cancellation cancels every sibling and re-raises (:func:`_bounded_fanout`).
+    """
+    configs = configs or EVAL_CONFIGS
+    store = store or ResultStore.packaged()
+
+    async with campaign_usage_gate(base_config) as gate:
+        # ONE gate for the whole matrix (task 4427) — see campaign_usage_gate for
+        # why sharing it across concurrent cells is safe, what else one gate
+        # shares, and why a None ``gate`` must still be threaded AS SUCH.
+        def _thunk(
+            task_path: Path, config: EvalConfig, trial: int,
+        ) -> Callable[[], Awaitable[EvalResult | None]]:
+            async def _run() -> EvalResult | None:
+                task = load_task(task_path)
+                if not force and store.exists(task['id'], config.name):
+                    logger.info(f'Skipping existing: {task["id"]} × {config.name}')
+                    return None
+                return await run_eval(
+                    task_path, config, base_config,
+                    trial=trial, timeout_override=timeout_override,
+                    usage_gate=gate, store=store,
+                )
+            return _run
+
+        thunks = [
+            _thunk(tp, config, trial)
+            for tp in task_paths
+            for config in configs
+            for trial in range(1, trials + 1)
+        ]
+        return await _bounded_fanout(thunks, max_parallel)
+
+
 async def run_ofat_stage(
     task_paths: list[Path],
     candidates: list[EvalConfig],
@@ -1202,50 +1104,55 @@ async def run_ofat_stage(
     """OFAT screen: dispatch each candidate by role over fixtures × trials (μ/ο).
 
     A role-dispatching fan-out over the EXISTING frozen-input executors
-    (decision 9): an implementer candidate (``role=='implementer'``) runs through
-    :func:`run_eval` (frozen plan → implementer varies, arch/reviewer pinned), an
-    architect candidate (``role=='architect'``) through :func:`run_architect_eval`
-    (live architect → downstream frozen), and a judge candidate (``role=='judge'``,
-    ο) through :func:`run_eval` with the implementer PINNED to
+    (decision 9): an IMPLEMENTER candidate runs through :func:`run_eval` (frozen
+    plan → implementer varies, arch/reviewer pinned), an ARCHITECT candidate
+    through :func:`run_architect_eval` (live architect → downstream frozen), and a
+    JUDGE candidate (ο) through :func:`run_eval` with the implementer PINNED to
     ``JUDGE_OFAT_IMPLEMENTER_PIN`` and the candidate riding ``judge_config`` — so
     ONLY the ζ completion judge varies (implementer/architect/reviewer held
     constant). No new per-role machinery. Returns the flattened ``EvalResult``
     list across every ``(candidate, fixture, trial)`` cell; a failed cell is
     logged and skipped via :func:`_bounded_fanout`.
     """
-    def _thunk(
-        task_path: Path, candidate: EvalConfig, trial: int,
-    ) -> Callable[[], Awaitable[EvalResult | None]]:
-        async def _run() -> EvalResult | None:
-            if candidate.role == 'architect':
-                return await run_architect_eval(
+    async with campaign_usage_gate(base_config) as gate:
+        # ONE gate for the whole stage (task 4427) — see campaign_usage_gate for
+        # why sharing it across concurrent cells is safe, what else one gate
+        # shares, and why a None ``gate`` must still be threaded AS SUCH.
+        def _thunk(
+            task_path: Path, candidate: EvalConfig, trial: int,
+        ) -> Callable[[], Awaitable[EvalResult | None]]:
+            async def _run() -> EvalResult | None:
+                if candidate.role is RoleUnderTest.ARCHITECT:
+                    return await run_architect_eval(
+                        task_path, candidate, base_config,
+                        trial=trial, timeout_override=timeout_override,
+                        usage_gate=gate,
+                    )
+                if candidate.role is RoleUnderTest.JUDGE:
+                    # ο: vary ONLY the judge — pin the implementer to the fixed cloud
+                    # incumbent (config=JUDGE_OFAT_IMPLEMENTER_PIN) and ride the judge
+                    # candidate on judge_config, so run_eval derives the ζ completion
+                    # judge's model/effort while implementer/architect/reviewer stay
+                    # fixed (true OFAT). run_eval relabels it as a JUDGE cell.
+                    return await run_eval(
+                        task_path, JUDGE_OFAT_IMPLEMENTER_PIN, base_config,
+                        trial=trial, timeout_override=timeout_override,
+                        judge_config=candidate, usage_gate=gate,
+                    )
+                return await run_eval(
                     task_path, candidate, base_config,
                     trial=trial, timeout_override=timeout_override,
+                    usage_gate=gate,
                 )
-            if candidate.role == 'judge':
-                # ο: vary ONLY the judge — pin the implementer to the fixed cloud
-                # incumbent (config=JUDGE_OFAT_IMPLEMENTER_PIN) and ride the judge
-                # candidate on judge_config, so run_eval derives the ζ completion
-                # judge's model/effort while implementer/architect/reviewer stay
-                # fixed (true OFAT). run_eval relabels + stamps role_under_test.
-                return await run_eval(
-                    task_path, JUDGE_OFAT_IMPLEMENTER_PIN, base_config,
-                    trial=trial, timeout_override=timeout_override,
-                    judge_config=candidate,
-                )
-            return await run_eval(
-                task_path, candidate, base_config,
-                trial=trial, timeout_override=timeout_override,
-            )
-        return _run
+            return _run
 
-    thunks = [
-        _thunk(tp, candidate, trial)
-        for tp in task_paths
-        for candidate in candidates
-        for trial in range(1, trials + 1)
-    ]
-    return await _bounded_fanout(thunks, max_parallel)
+        thunks = [
+            _thunk(tp, candidate, trial)
+            for tp in task_paths
+            for candidate in candidates
+            for trial in range(1, trials + 1)
+        ]
+        return await _bounded_fanout(thunks, max_parallel)
 
 
 async def run_matrix_stage(
@@ -1268,24 +1175,29 @@ async def run_matrix_stage(
     semantics to :func:`run_ofat_stage`). Both roles run LIVE. Returns the
     flattened ``EvalResult`` list; a failed cell is logged and skipped.
     """
-    def _thunk(
-        task_path: Path, arch: EvalConfig, impl: EvalConfig, trial: int,
-    ) -> Callable[[], Awaitable[EvalResult | None]]:
-        async def _run() -> EvalResult | None:
-            return await run_end_to_end(
-                task_path, arch, impl, base_config,
-                trial=trial, timeout_override=timeout_override,
-            )
-        return _run
+    async with campaign_usage_gate(base_config) as gate:
+        # ONE gate for the whole stage (task 4427) — see campaign_usage_gate for
+        # why sharing it across concurrent cells is safe, what else one gate
+        # shares, and why a None ``gate`` must still be threaded AS SUCH.
+        def _thunk(
+            task_path: Path, arch: EvalConfig, impl: EvalConfig, trial: int,
+        ) -> Callable[[], Awaitable[EvalResult | None]]:
+            async def _run() -> EvalResult | None:
+                return await run_end_to_end(
+                    task_path, arch, impl, base_config,
+                    trial=trial, timeout_override=timeout_override,
+                    usage_gate=gate,
+                )
+            return _run
 
-    pairs = matrix_pairs(arch_survivors, impl_survivors)
-    thunks = [
-        _thunk(tp, arch, impl, trial)
-        for tp in task_paths
-        for arch, impl in pairs
-        for trial in range(1, trials + 1)
-    ]
-    return await _bounded_fanout(thunks, max_parallel)
+        pairs = matrix_pairs(arch_survivors, impl_survivors)
+        thunks = [
+            _thunk(tp, arch, impl, trial)
+            for tp in task_paths
+            for arch, impl in pairs
+            for trial in range(1, trials + 1)
+        ]
+        return await _bounded_fanout(thunks, max_parallel)
 
 
 async def run_confirm_stage(
@@ -1309,35 +1221,40 @@ async def run_confirm_stage(
     :func:`run_matrix_stage`. Both roles run LIVE. Returns the flattened
     ``EvalResult`` list for the confirmation batch.
     """
-    def _thunk(
-        task_path: Path, trial: int,
-    ) -> Callable[[], Awaitable[EvalResult | None]]:
-        async def _run() -> EvalResult | None:
-            return await run_end_to_end(
-                task_path, arch_winner, impl_winner, base_config,
-                trial=trial, timeout_override=timeout_override,
-            )
-        return _run
+    async with campaign_usage_gate(base_config) as gate:
+        # ONE gate for the whole stage (task 4427) — see campaign_usage_gate for
+        # why sharing it across concurrent cells is safe, what else one gate
+        # shares, and why a None ``gate`` must still be threaded AS SUCH.
+        def _thunk(
+            task_path: Path, trial: int,
+        ) -> Callable[[], Awaitable[EvalResult | None]]:
+            async def _run() -> EvalResult | None:
+                return await run_end_to_end(
+                    task_path, arch_winner, impl_winner, base_config,
+                    trial=trial, timeout_override=timeout_override,
+                    usage_gate=gate,
+                )
+            return _run
 
-    thunks = [
-        _thunk(tp, trial)
-        for tp in task_paths
-        for trial in range(1, trials + 1)
-    ]
-    return await _bounded_fanout(thunks, max_parallel)
+        thunks = [
+            _thunk(tp, trial)
+            for tp in task_paths
+            for trial in range(1, trials + 1)
+        ]
+        return await _bounded_fanout(thunks, max_parallel)
 
 
 def _resume_plan_from_worktree(worktree: Path, task: dict) -> dict | None:
     """Load the initial plan for a --worktree resume run.
 
-    Reads the RELOCATED plan.json at ``_meta_root_for_worktree(worktree)/plan.json``.
+    Reads the RELOCATED plan.json through ``open_eval_artifacts(worktree)``.
     Production TaskWorkflow moved plan.json out of the legacy ``<worktree>/.task/``
     to the sibling ``.task-meta/<name>/`` root (W11 / task 2258); reading the
     stale legacy path silently missed and discarded completed-step progress on
     resume (D1 drift, task 2812). Falls back to the frozen ``task['plan']`` only
     when the relocated file is absent.
     """
-    existing_plan_path = _meta_root_for_worktree(worktree) / 'plan.json'
+    existing_plan_path = open_eval_artifacts(worktree).artifact_path('plan.json')
     if existing_plan_path.exists():
         initial_plan = json.loads(existing_plan_path.read_text())
         steps = initial_plan.get('steps', [])
@@ -1346,38 +1263,6 @@ def _resume_plan_from_worktree(worktree: Path, task: dict) -> dict | None:
         return initial_plan
     logger.info('No existing plan in worktree — using task JSON plan')
     return task.get('plan')
-
-
-def _result_exists(task_id: str, config_name: str) -> bool:
-    """Check if any result already exists for this (task, config) pair."""
-    if not RESULTS_DIR.exists():
-        return False
-    return any(RESULTS_DIR.glob(f'{task_id}__{config_name}__*.json'))
-
-
-def save_result(result: EvalResult) -> Path:
-    """Write eval result JSON to results directory."""
-    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-    filename = f'{result.task_id}__{result.config_name}__{result.run_id}.json'
-    path = RESULTS_DIR / filename
-    with open(path, 'w') as f:
-        json.dump(result.to_dict(), f, indent=2)
-    logger.info(f'Saved result: {path}')
-    return path
-
-
-def load_results() -> list[EvalResult]:
-    """Load all existing eval results from the results directory."""
-    results = []
-    if not RESULTS_DIR.exists():
-        return results
-    for path in sorted(RESULTS_DIR.glob('*.json')):
-        with open(path) as f:
-            data = json.load(f)
-        # Filter to known fields so old results with extra/missing keys load
-        known = {f.name for f in EvalResult.__dataclass_fields__.values()}
-        results.append(EvalResult(**{k: v for k, v in data.items() if k in known}))
-    return results
 
 
 # ---------------------------------------------------------------------------
@@ -1416,10 +1301,11 @@ class _StubMcpSession:
 
     Handles every tool the eval ``Scheduler`` dispatches via ``dispatch_tool``:
     ``set_task_status``, ``get_task``, ``get_tasks``, ``get_statuses``,
-    ``update_task``, ``set_task_claimant``, ``get_external_statuses`` (plus
-    ``add_dependency``, stubbed defensively though not yet dispatched).  The
-    ``test_scheduler_dispatch_literal_tripwire`` guard asserts every dispatched
-    literal has a branch here.  Any other tool name raises ``NotImplementedError``.
+    ``update_task``, ``set_task_claimant``, ``get_external_statuses``,
+    ``submit_task`` (plus ``add_dependency``, stubbed defensively though not
+    yet dispatched).  The ``test_scheduler_dispatch_literal_tripwire`` guard
+    asserts every dispatched literal has a branch here.  Any other tool name
+    raises ``NotImplementedError``.
     """
 
     def __init__(self) -> None:
@@ -1451,7 +1337,8 @@ class _StubMcpSession:
 
         Supported tools: ``set_task_status``, ``get_task``, ``get_tasks``,
         ``get_statuses``, ``update_task``, ``set_task_claimant``,
-        ``get_external_statuses``, ``add_dependency``.  Unknown tool names raise
+        ``get_external_statuses``, ``submit_task``, ``add_dependency``.  Unknown
+        tool names raise
         ``NotImplementedError``.
 
         .. note::
@@ -1504,6 +1391,14 @@ class _StubMcpSession:
             deps = arguments.get('deps', [])
             mapping = {d: 'done' for d in deps}
             return self._envelope(json.dumps(mapping))
+        if name == 'submit_task':
+            # Scheduler.submit_task files tasks for machine filers (auto-eval,
+            # the flake ledger). An eval run must create none, so the answer is
+            # the server's structured refusal, which parses to SubmitFailed.
+            return self._envelope(json.dumps({
+                'error': 'eval runs file no tasks',
+                'error_type': 'EvalStubRefusal',
+            }))
         if name == 'add_dependency':
             # Not currently dispatched by scheduler.py; added defensively per
             # task spec so a future dispatch site is already stubbed. Echo the id
@@ -1525,17 +1420,22 @@ class _EvalMcpStub:
         return {}
 
 
+def eval_mcp_lifecycle(orch_config: OrchestratorConfig) -> _EvalMcpStub:
+    """The harness MCP lifecycle every eval cell's workflow is built with."""
+    return _EvalMcpStub(orch_config.fused_memory.url)
+
+
 class _RecordingMemoryHandler(BaseHTTPRequestHandler):
     """Request handler for :class:`RecordingMemorySink`.
 
     Records every fused-memory ``tools/call`` write on the owning server's
     shared ``writes`` list and replies with a benign JSON-RPC success envelope
     (mirroring ``_StubMcpSession._envelope``). Any POST path is accepted — the
-    workflow write path targets ``{url}/mcp/`` but ``BaseHTTPRequestHandler``
+    workflow write path targets ``{url}/mcp`` but ``BaseHTTPRequestHandler``
     routes every POST here regardless of path.
     """
 
-    def do_POST(self) -> None:  # noqa: N802 — BaseHTTPRequestHandler API name
+    def do_POST(self) -> None:  # BaseHTTPRequestHandler API name
         server: Any = self.server  # _RecordingMemoryServer (carries writes/_envelope)
         length = int(self.headers.get('Content-Length', 0) or 0)
         raw = self.rfile.read(length) if length > 0 else b''
@@ -1555,7 +1455,7 @@ class _RecordingMemoryHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(payload)
 
-    def log_message(self, format: str, *args: Any) -> None:  # noqa: A002 — stdlib API name
+    def log_message(self, format: str, *args: Any) -> None:  # stdlib API name
         """Silence the default stderr access log (no per-request spam)."""
 
 
@@ -1594,7 +1494,7 @@ class RecordingMemorySink:
 
     A real loopback HTTP endpoint (stdlib ``http.server``) that receives the
     raw httpx POSTs the workflow's ``_write_*_to_memory`` methods send to
-    ``{self.mcp.url}/mcp/``, records each fused-memory ``tools/call`` write as
+    ``{self.mcp.url}/mcp``, records each fused-memory ``tools/call`` write as
     ``(tool_name, arguments)`` on :attr:`writes`, and replies with a benign
     JSON-RPC success envelope (mirroring ``_StubMcpSession._envelope`` so any
     caller that parses the reply stays happy).
@@ -1652,5 +1552,7 @@ class RecordingMemorySink:
 
 
 if __name__ == '__main__':
-    from orchestrator.cli import eval_cmd
+    from orchestrator.cli_config import load_program_dotenv
+    from orchestrator.evals.cli import eval_cmd
+    load_program_dotenv()
     eval_cmd()

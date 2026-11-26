@@ -1,11 +1,15 @@
 """Autonomous dry-run unblock — fire-and-forget investigation at block time.
 
 Invoked by workflow._mark_blocked when a task transitions to blocked.
-Runs the unblock-auto skill read-only, then persists a proposal entry to
+Runs the unblock-auto skill (with config.sandbox.enabled and a claude backend,
+under the OS sandbox: writable only <worktree>/.task, plan.json included, and
+/tmp), then persists a proposal entry to
 metadata.dry_run_proposals[] via scheduler.update_task(metadata_mode='additive')
 (list-union — preserves prior entries) and trims the list to keep_last entries
 via a separate update_task(default merge — overwrites dry_run_proposals wholesale
 while preserving sibling keys like memory_hints/files).
+A re-block whose branch content (a rebase-stable ``git patch-id``) and reason
+match the latest entry skips the investigation and only re-stamps that entry.
 Never mutates task state; all writes go through the parent process.
 """
 
@@ -14,11 +18,14 @@ from __future__ import annotations
 import asyncio
 import logging
 import uuid
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from types import MappingProxyType
+from typing import Any, NamedTuple
 
 from shared.cli_invoke import (
+    BUDGET_EXHAUSTED_SUBTYPE,
     AgentFailureKind,
     AllAccountsCappedException,
     classify_agent_failure,
@@ -27,14 +34,25 @@ from shared.cli_invoke import (
     is_zero_output_timeout,
 )
 from shared.config_dir import TaskConfigDir
+from shared.git_async import GitResult, run_git
+from shared.git_read_rules import git_read_rules
+from shared.transcript_archive import archive_task_transcripts
 
-from orchestrator.agents.invoke import invoke_agent  # noqa: E402
+from orchestrator.agents.invoke import invoke_agent
+from orchestrator.agents.sandbox_dispatch import (
+    SandboxUnavailable,
+    get_backend,
+    resolve_active_backend,
+    resolve_backend_or_refuse,
+)
 from orchestrator.agents.skill_prompt import load_skill_system_prompt
-from orchestrator.merge_completion import merge_completion_eligible
+from orchestrator.artifacts import TaskArtifacts
+from orchestrator.event_store import EventType
+from orchestrator.merge_lane.completion import merge_completion_eligible
 from orchestrator.routing import RoleDefaults
 from orchestrator.routing_dispatch import resolve_and_record_route
 from orchestrator.unblock_types import BlockClass, BlockRecord, classify_block_reason
-from orchestrator.workflow_types import BlockDisposition, classify_failure
+from orchestrator.workflow_types import BlockDisposition, WorkflowState, classify_failure
 
 logger = logging.getLogger(__name__)
 
@@ -65,13 +83,7 @@ DRY_RUN_PROPOSAL_SCHEMA: dict[str, Any] = {
 
 _RISK_LABELS: frozenset[str] = frozenset({'low', 'medium', 'human-review-required'})
 _HUMAN_REVIEW_REQUIRED: str = 'human-review-required'
-
-# Stable subtype values emitted by the CLI when the cost cap fires.
-# Mirrors the canonical value used in shared/src/shared/usage_gate.py and
-# fused-memory/src/fused_memory/middleware/task_curator.py — the Claude CLI
-# emits ``error_max_budget_usd`` (with the ``_usd`` suffix) on cost-cap
-# exhaustion, not ``error_max_budget``.
-_BUDGET_SUBTYPES: frozenset[str] = frozenset({'error_max_budget_usd'})
+_INFRA_FAILURE_STATUS: str = 'infra_failure'
 
 # Transient HOST infra wedges (e.g. a pre-turn-1 kill at the
 # UnblockAutoConfig.timeout ceiling -> empty stdout + timed_out) are
@@ -95,18 +107,23 @@ _BUDGET_SUBTYPES: frozenset[str] = frozenset({'error_max_budget_usd'})
 _INFRA_FAILURE_KINDS: frozenset[AgentFailureKind] = frozenset({
     AgentFailureKind.TIMED_OUT,
     AgentFailureKind.EMPTY_OUTPUT,
+    # The CLI rejected the invocation before any model turn (task 3143 /
+    # esc-3118-1) — the investigation never ran, so this must stay a retryable
+    # infra_failure proposal rather than a human-review conclusion. It reached
+    # this set via EMPTY_OUTPUT before the taxonomy split; listing it keeps that
+    # verdict while the proposal text now carries the CLI's real cause.
+    AgentFailureKind.CLI_INPUT_REJECTED,
 })
 
-# Outer wall-clock sanity bound for invoke_with_cap_retry's cap-hit patience
-# (shared/src/shared/cli_invoke.py cap-wait policy table). This is a
-# fire-and-forget, best-effort block-time investigation — it must NOT inherit
-# the 14-day default, which would leave a background task pending for weeks
-# under a sustained cap storm. Mirrors the 1800s reconciliation-stage
-# precedent (short-lived stage runners; see cli_invoke.py:82-94).
+# Outer wall-clock sanity bound for invoke_with_cap_retry's cap patience,
+# covering both its cap-retry loop and the gate's park on a pool frozen at
+# spawn. This is a fire-and-forget, best-effort block-time investigation — it
+# must NOT inherit the 14-day default, which would leave a background task
+# pending for weeks under a sustained cap storm.
 _DRY_RUN_CAP_WAIT_SANITY_SECS: float = 1800.0
 
 
-def _is_budget_exhausted(result: Any, budget_usd: float) -> bool:  # noqa: ARG001
+def _is_budget_exhausted(result: Any, budget_usd: float) -> bool:
     """Return True only when the agent's subtype explicitly signals budget exhaustion.
 
     We avoid the ``cost >= budget_usd`` heuristic: an agent can spend close to
@@ -114,8 +131,7 @@ def _is_budget_exhausted(result: Any, budget_usd: float) -> bool:  # noqa: ARG00
     which would mis-classify those failures as 'budget_exhausted' and produce
     misleading operator-visible status fields in metadata.
     """
-    subtype = getattr(result, 'subtype', '') or ''
-    return subtype in _BUDGET_SUBTYPES
+    return getattr(result, 'subtype', None) == BUDGET_EXHAUSTED_SUBTYPE
 
 
 def _failure_diagnostics(result: Any) -> dict[str, Any]:
@@ -154,37 +170,140 @@ def _failure_diagnostics(result: Any) -> dict[str, Any]:
     }
 
 
-# Read-only tools the dry-run agent is allowed to use.
-# Bash(pytest:*) and Bash(cargo:*) are intentionally omitted: both can
-# write .pyc/__pycache__/target/ files or fetch from the network, which
-# contradicts the read-only safety contract advertised in SKILL.md.
-# The agent can read existing test output from .task/iterations.jsonl instead.
-# Explicit read-only git subcommands instead of a wildcard — Bash(git:*) would
-# permit mutating subcommands (commit, push, reset, checkout, restore, clean)
-# which contradict the read-only contract for this autonomous, no-human-
-# checkpoint invocation where the threat profile is higher than interactive use.
+_TASK_TEXT_FIELD_CHARS = 4000
+"""Per-field cap on rendered task text in the investigation prompt.
+
+Generous enough that ordinary task text survives whole — unlike the 160/120-
+char clips the block `detail` already suffers — but bounded, so one oversized
+task record cannot crowd out the rest of the prompt.
+"""
+
+_TASK_UNAVAILABLE_STATE = '**Task record:** unavailable'
+
+_TASK_UNAVAILABLE_MARKER = (
+    f'{_TASK_UNAVAILABLE_STATE} — the task fetch failed, so this '
+    'investigation is running WITHOUT the task\'s title, description, details '
+    'or declared file scope. Judge scope creep conservatively.'
+)
+
+_TASK_EMPTY_STATE = '**Task record:** fetched but empty'
+
+_TASK_EMPTY_MARKER = (
+    f'{_TASK_EMPTY_STATE} — the task carries no title, '
+    'description, details or declared file scope, so this investigation is '
+    'running WITHOUT them. Judge scope creep conservatively.'
+)
+"""Distinct from _TASK_UNAVAILABLE_MARKER: the fetch SUCCEEDED and told us
+nothing.  Rendering a blank gap instead would read to the investigator as
+"this task has no description" when the truth is "we learned nothing" — the
+same ambiguity the marker exists to remove, one level in."""
+
+
+def _clip(value: str, label: str) -> str:
+    """Cap one rendered field, marking the clip the way the repo marks clips."""
+    text = str(value)
+    if len(text) <= _TASK_TEXT_FIELD_CHARS:
+        return text
+    return text[:_TASK_TEXT_FIELD_CHARS] + f'\n\n... [{label} truncated] ...'
+
+
+class _TaskContext(NamedTuple):
+    """The blocked task as the investigator sees it, and whether that view is
+    degraded.
+
+    One value from one decision point: the prompt's block and the entry's
+    ``task_context_unavailable`` flag are decided together, so the surface the
+    investigator reads and the surface an operator reads cannot drift apart.
+    """
+
+    block: str
+    degraded: bool
+
+
+def _task_context(task: dict[str, Any] | None) -> _TaskContext:
+    """Render the blocked task's own text for the investigation prompt.
+
+    THREE states, not two.  A fetch that failed and a record that carries
+    nothing are both degradations, and both are marked; only a record with
+    something to say is healthy.
+
+    The label vocabulary is INDEPENDENT of ``agents/briefing.py::_format_task``
+    rather than a mirror of it.  That renderer is an uncapped instance method
+    serving a different purpose, and the two have already diverged exactly
+    where the purposes do — ``**Declared files:**`` here against ``**Files:**``
+    there, because this reader is asked to judge a fix against the scope the
+    architect DECLARED.  Nothing needs to keep the two aligned.  What DOES need
+    to stay aligned is these labels and state phrases against
+    ``skills/unblock-auto/SKILL.md``, which tells the investigator how to read
+    them; that is guarded by
+    ``orchestrator/tests/test_dry_run_unblock.py::TestSkillPromptExplainsEveryTaskBlockState``.
+
+    ``metadata.files`` IS included here even though ``build_architect_prompt``
+    passes ``include_files=False`` to omit it.  Anti-anchoring applies to
+    deriving a NEW footprint, which is the architect's job; this investigator
+    does the opposite one — judging whether a proposed fix falls OUTSIDE the
+    footprint the architect already declared, which is exactly
+    ``skills/unblock-auto/SKILL.md``'s `human-review-required` scope-creep
+    trigger.  It cannot apply that rule with no scope to compare against.
+    """
+    if not task:
+        return _TaskContext(_TASK_UNAVAILABLE_MARKER, True)
+    lines = []
+    for label, value in (
+        ('Title', task.get('title')),
+        ('Description', task.get('description')),
+        ('Details', task.get('details')),
+    ):
+        if value:
+            lines.append(f'**{label}:** {_clip(value, label.lower())}')
+    metadata = task.get('metadata')
+    files = metadata.get('files') if isinstance(metadata, dict) else None
+    if files:
+        lines.append(
+            f'**Declared files:** '
+            f'{_clip(", ".join(str(f) for f in files), "declared files")}',
+        )
+    if not lines:
+        return _TaskContext(_TASK_EMPTY_MARKER, True)
+    return _TaskContext('\n'.join(lines), False)
+
+
+# The investigation's CLI envelope: it runs under --permission-mode dontAsk,
+# so the CLI denies, without a prompt, any tool call no allow rule admits.
+# Every entry is therefore a grant of a read. Bash(pytest:*) and Bash(cargo:*)
+# are omitted: both write build artefacts or fetch from the network. Git is
+# granted per read subcommand, never as a wildcard and never `git branch`,
+# which creates and deletes refs; the --output denies come from
+# shared/src/shared/git_read_rules.py and refuse only the plain spelling.
+# These rules are the first gate, not the write boundary: the boundary is the
+# OS sandbox of _investigation_sandbox_modules. Residual: `git status` may
+# refresh the index's stat cache, which changes no content.
+# The CLI reads no settings file (`--setting-sources ''`): the per-investigation
+# config dir symlinks the host's settings files and the worktree's own .claude/
+# settings belong to the task under investigation, so no ambient allow rule
+# reaches this envelope. _INVESTIGATION_ENV_OVERRIDES restores what the host's
+# settings file used to supply: transcript persistence, which the watchdog and
+# the zero-output retry read, and compaction off.
+_GIT_READS = git_read_rules('log', 'diff', 'status', 'show', 'rev-parse', 'ls-files')
+
 _ALLOWED_TOOLS: list[str] = [
     'Read',
     'Glob',
     'Grep',
-    'Bash(git log:*)',
-    'Bash(git diff:*)',
-    'Bash(git status:*)',
-    'Bash(git show:*)',
-    'Bash(git rev-parse:*)',
-    'Bash(git branch:*)',
-    'Bash(git ls-files:*)',
+    *_GIT_READS.allow,
     'mcp__fused-memory__search',
     'mcp__fused-memory__get_task',
     'mcp__fused-memory__get_tasks',
 ]
 
-# Mutating tools explicitly blocked.
-# Defence-in-depth: list the most dangerous git mutations alongside the
-# write-capable MCP tools so the allowlist and denylist are consistent.
+# With no settings file read, these denies guard against allow rules from
+# managed policy settings (not a settings source, so still applied) and against
+# a future widening of _ALLOWED_TOOLS: a deny rule beats an allow rule wherever
+# it came from.
 _DISALLOWED_TOOLS: list[str] = [
     'Edit',
     'Write',
+    'NotebookEdit',
     'Bash(git commit:*)',
     'Bash(git push:*)',
     'Bash(git reset:*)',
@@ -193,18 +312,87 @@ _DISALLOWED_TOOLS: list[str] = [
     'Bash(git clean:*)',
     'Bash(git merge:*)',
     'Bash(git rebase:*)',
+    *_GIT_READS.deny,
     'mcp__fused-memory__set_task_status',
     'mcp__fused-memory__update_task',
     'mcp__fused-memory__delete_memory',
+    # Strictly more destructive than delete_memory above (task 3133): one
+    # call deletes N records, patches M retained peers and re-homes their
+    # children. A dry run's whole premise is that it observes without
+    # mutating, so leaving this unlisted would not degrade a dry run — it
+    # would falsify it.
+    'mcp__fused-memory__consolidate_memories',
     'mcp__fused-memory__remove_task',
+    # Unscoped on purpose: removes the tool from the CLI registry, so no skill loads; SKILL.md invokes none.
+    'Skill',
 ]
+
+_GRANTED_TOOLS_LINE: str = (
+    f'**Granted tools:** {", ".join(_ALLOWED_TOOLS)}. '
+    'Every Bash command no rule above admits is denied permanently: a retry is denied again.'
+)
+
+_INVESTIGATION_ENV_OVERRIDES: Mapping[str, str] = MappingProxyType({
+    'CLAUDE_CODE_FORCE_SESSION_PERSISTENCE': '1',
+    'DISABLE_AUTO_COMPACT': '1',
+})
+
+def _investigation_sandbox_modules(config: Any) -> list[str] | None:
+    """``[]`` confines a claude investigation to writing ``<worktree>/.task``, where its config dir lives; ``None`` leaves it unconfined.
+
+    Raises ``SandboxUnavailable`` when confinement is required and no OS
+    sandbox resolves, so the run is refused rather than launched unconfined.
+    """
+    # gemini and pi stay unconfined: their CLIs' config-dir write sets are not mapped.
+    if not (config.sandbox.enabled and config.unblock_auto.backend == 'claude'):
+        return None
+    backend = get_backend()
+    if backend == 'none':
+        resolve_backend_or_refuse()  # the operator's escape hatch: logs the workflow's WARN and never refuses
+        return None
+    # Non-consuming check: the outage escalation is TaskWorkflow._guard_sandbox's, so no dry run spends its escalate-once token.
+    if resolve_active_backend() == 'none':
+        raise SandboxUnavailable(
+            f'Sandboxing is required for the dry-run investigation but backend={backend!r} resolved to no '
+            f'available OS sandbox (landlock/bwrap); refusing to run it unconfined.',
+            should_escalate=False, backend_state=backend,
+        )
+    return []
+
+
+# ---------------------------------------------------------------------------
+# In-flight identity
+# ---------------------------------------------------------------------------
+
+def investigation_task_name(task_id: str) -> str:
+    """The asyncio task name every spawner registers an investigation under."""
+    return f'unblock-auto-{task_id}'
+
+
+def investigation_in_flight(task_id: str) -> bool:
+    """Whether an investigation for *task_id* is running on the current loop.
+
+    The event loop lives exactly as long as the orchestrator process, which is
+    how long an investigation can live, so the scan sees runs started by any
+    earlier TaskWorkflow instance for the task and by the merge lane. With no
+    running loop it answers False.
+    """
+    try:
+        running = asyncio.all_tasks()
+    except RuntimeError:
+        return False
+    name = investigation_task_name(task_id)
+    return any(t.get_name() == name and not t.done() for t in running)
+
 
 # ---------------------------------------------------------------------------
 # SHA capture helper
 # ---------------------------------------------------------------------------
 
-async def _capture_worktree_shas(worktree: str) -> tuple[str | None, str | None]:
-    """Capture HEAD and main branch SHAs from the worktree via git.
+async def _capture_worktree_shas(
+    worktree: str, main_branch: str,
+) -> tuple[str | None, str | None]:
+    """Capture the HEAD and *main_branch* SHAs from the worktree via git.
 
     Fully defensive: any non-zero exit code, subprocess exception, or
     non-repo worktree yields None for that sha — never raises.
@@ -225,8 +413,140 @@ async def _capture_worktree_shas(worktree: str) -> tuple[str | None, str | None]
         except Exception:
             return None
 
-    head_sha, main_sha = await asyncio.gather(_rev_parse('HEAD'), _rev_parse('main'))
+    head_sha, main_sha = await asyncio.gather(_rev_parse('HEAD'), _rev_parse(main_branch))
     return head_sha, main_sha
+
+
+_EMPTY_BRANCH_PATCH_ID = '0' * 40
+"""The branch_patch_id of a branch that carries no change relative to main."""
+
+
+def _git_failure(step: str, result: GitResult) -> RuntimeError:
+    timed_out = ' (timed out)' if result.timed_out else ''
+    return RuntimeError(
+        f'{step} exited {result.returncode}{timed_out}: {result.stderr.strip()}',
+    )
+
+
+async def _capture_branch_patch_id(
+    worktree: str, *, main_branch: str, task_id: str,
+) -> str | None:
+    """Rebase-stable identity of the branch's committed change set relative to
+    *main_branch*.
+
+    ``git patch-id --stable`` ignores line numbers and whitespace, so a clean
+    rebase onto an advanced main keeps it. Any failure, a non-repo worktree or
+    a missing *main_branch* ref included, yields None and is logged at WARNING,
+    because None turns coverage dedup off for the run.
+    """
+    merge_base_range = f'{main_branch}...HEAD'
+    try:
+        diff = await run_git([
+            'git', '-C', worktree, 'diff', '--binary', '--no-color',
+            '--no-ext-diff', '--no-textconv', merge_base_range,
+        ])
+        if not diff.ok:
+            raise _git_failure(f'git diff {merge_base_range}', diff)
+        if not diff.stdout:
+            return _EMPTY_BRANCH_PATCH_ID
+        patch_id = await run_git(
+            ['git', '-C', worktree, 'patch-id', '--stable'], input_text=diff.stdout,
+        )
+        if not patch_id.ok:
+            raise _git_failure('git patch-id --stable', patch_id)
+        tokens = patch_id.stdout.split()
+        if not tokens:
+            raise RuntimeError('git patch-id produced no output')
+        return tokens[0]
+    except Exception as exc:
+        logger.warning(
+            'dry_run_unblock: branch patch-id unavailable for task %s '
+            '(worktree %s); coverage dedup is off for this run: %s',
+            task_id, worktree, exc,
+        )
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Coverage by the latest proposal
+# ---------------------------------------------------------------------------
+
+def _latest_proposal_covers(
+    proposals: list[Any], *, branch_patch_id: str | None, block_reason: str,
+    head_sha: str | None,
+) -> bool:
+    """Whether the latest entry already investigated this content and reason.
+
+    Only the latest entry counts, because the briefing and b3_gate both read
+    ``dry_run_proposals[-1]``. An unknown identity never covers. An
+    infra_failure entry never covers either: the wedge is retryable and
+    concluded nothing. A low-risk entry covers only at its own HEAD, because
+    b3_gate.check_proposal step 6 aborts once HEAD has moved.
+    """
+    if branch_patch_id is None or not proposals:
+        return False
+    latest = proposals[-1]
+    if not isinstance(latest, dict):
+        return False
+    return (
+        latest.get('branch_patch_id') == branch_patch_id
+        and latest.get('block_reason') == block_reason
+        and latest.get('status') != _INFRA_FAILURE_STATUS
+        and (latest.get('risk_label') != 'low' or latest.get('head_sha') == head_sha)
+    )
+
+
+async def _reaffirm_latest_proposal(
+    scheduler: Any, task_id: str, proposals: list[Any],
+) -> None:
+    """Move the covering entry's ``timestamp`` to now. Best-effort.
+
+    ``_mark_blocked`` has just stamped ``last_blocked_at``, and the briefing
+    hides an entry stamped before it. ``investigated_at``, the age b3_gate
+    reads, is left alone. The default merge mode overwrites only this key.
+    """
+    reaffirmed = {**proposals[-1], 'timestamp': _now_iso()}
+    try:
+        await scheduler.update_task(
+            task_id, {'dry_run_proposals': [*proposals[:-1], reaffirmed]},
+        )
+    except Exception as exc:
+        logger.warning(
+            'dry_run_unblock: re-stamping the covering proposal failed for '
+            'task %s (best-effort, continuing): %s',
+            task_id, exc,
+        )
+
+
+async def _skip_covered_reblock(
+    *, scheduler: Any, event_store: Any, task_id: str, proposals: list[Any],
+    branch_patch_id: str | None, block_reason: str,
+) -> None:
+    """Record a re-block the latest proposal covers, in place of investigating it.
+
+    The ``phase_skipped`` row keeps each skip countable in runs.db, which is
+    where a re-block loop is measured from once the skip makes it cost nothing.
+    """
+    logger.info(
+        'dry_run_unblock: task %s re-blocked on unchanged content '
+        '(branch_patch_id=%s) for the same reason %r; the latest '
+        'proposal already covers it, skipping the investigation',
+        task_id, branch_patch_id, block_reason,
+    )
+    await _reaffirm_latest_proposal(scheduler, task_id, proposals)
+    if event_store:
+        event_store.emit(
+            EventType.phase_skipped,
+            task_id=task_id,
+            phase=WorkflowState.BLOCKED.value,
+            role='unblock_auto',
+            data={
+                'reason': 'dry_run_covered',
+                'block_reason': block_reason,
+                'branch_patch_id': branch_patch_id,
+                'covering_investigated_at': proposals[-1].get('investigated_at'),
+            },
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -241,6 +561,27 @@ def _load_skill_system_prompt() -> str:
     Raises FileNotFoundError with a clear message if the file cannot be found.
     """
     return load_skill_system_prompt('unblock-auto')
+
+
+def _reviews_directory(worktree: str, task_id: str, reviews_dir: Path | None) -> str:
+    """The prompt's ``**Reviews directory:**`` value.
+
+    The caller's *reviews_dir* when given, since the dispatching workflow owns
+    which root its reviewers write to; else the task root's, the root every
+    non-eval dispatch uses. A task id no task root can be named for degrades
+    this one line to ``(unavailable: <reason>)`` rather than failing the
+    investigation.
+    """
+    if reviews_dir is not None:
+        return str(reviews_dir)
+    try:
+        return str(TaskArtifacts.for_task(Path(worktree), task_id).artifact_path('reviews'))
+    except ValueError as exc:
+        logger.warning(
+            'dry_run_unblock: no reviews directory for task %s — investigating '
+            'without it: %s', task_id, exc,
+        )
+        return f'(unavailable: {exc})'
 
 
 # ---------------------------------------------------------------------------
@@ -260,6 +601,7 @@ async def run_dry_run_unblock(
     usage_gate: Any = None,
     cost_store: Any = None,
     block_class: BlockClass | None = None,
+    reviews_dir: Path | None = None,
 ) -> None:
     """Investigate a blocked task and write a proposal to metadata.
 
@@ -271,21 +613,94 @@ async def run_dry_run_unblock(
     explicitly (e.g. workflow._spawn_dry_run_unblock classifies `reason`
     up front); when omitted (None), it is derived via
     ``classify_block_reason(reason)`` as a defensive fallback.
+
+    *reviews_dir* is where this dispatch's reviewers wrote their verdicts;
+    when omitted it is the task root's (see ``_reviews_directory``).
     """
     import time
 
     ua_cfg = config.unblock_auto
+    main_branch = config.git.main_branch
     start_time = time.monotonic()
     project_id = getattr(getattr(config, 'fused_memory', None), 'project_id', '') or ''
     run_id = getattr(event_store, 'run_id', '') or ''
 
     # Capture worktree SHAs before invoke_agent so both the success and
     # exception paths can stamp the same anchor values.
-    head_sha, main_sha = await _capture_worktree_shas(worktree)
+    head_sha, main_sha = await _capture_worktree_shas(worktree, main_branch)
+    branch_patch_id = await _capture_branch_patch_id(
+        worktree, main_branch=main_branch, task_id=task_id,
+    )
 
     config_dir: TaskConfigDir | None = None
     preserve_config_dir = False
+    # Initialised before the try: the stamp site below runs on EVERY path,
+    # including an exception raised ahead of the task fetch.
+    task_context_unavailable = False
     try:
+        # Fetched ONCE, above everything else in this try, so the single fetch
+        # serves the coverage check, the prompt's task-context block and the
+        # route resolution below.
+        # A failure degrades this investigation in two ways that are invisible
+        # at the call site — no task text in the prompt, and the task's
+        # model_overrides['unblock_auto'] routing pin silently dropped — so it
+        # is both logged and recorded on the entry rather than swallowed.
+        #
+        # The signal is the FALSY RESULT, not the exception: scheduler.py::
+        # get_task is documented to return None on failure or absence and
+        # catches its own exceptions, so an MCP timeout, a malformed reply and
+        # an absent task all arrive here as None. The `except` remains only for
+        # a scheduler implementation that does raise — this suite's
+        # non-awaitable MagicMock shape being the live example. Both causes
+        # converge on the one check below so the two surfaces an operator and
+        # the investigator read (the entry's flag and the prompt's
+        # _TASK_UNAVAILABLE_MARKER) can never disagree.
+        fetch_error: Exception | None = None
+        try:
+            task_doc = await scheduler.get_task(task_id)
+        except Exception as exc:
+            fetch_error = exc
+            task_doc = None
+        # The flag is READ OFF the renderer, never computed a second time —
+        # a degraded prompt and a healthy-looking entry is the exact incoherence
+        # this pairing exists to prevent.  Two causes, two accurate messages,
+        # still exactly one warning per run.
+        task_context = _task_context(task_doc)
+        task_context_unavailable = task_context.degraded
+        if not task_doc:
+            logger.warning(
+                'dry_run_unblock: task fetch failed for task %s — investigating '
+                'without task text and with routing overrides dropped: %s',
+                task_id, fetch_error or 'scheduler returned no task record',
+            )
+        elif task_context.degraded:
+            logger.warning(
+                'dry_run_unblock: task record for task %s carries no title, '
+                'description, details or declared files — investigating '
+                'without task text',
+                task_id,
+            )
+        # isinstance, not `or {}`: a non-dict metadata would otherwise flow
+        # into route resolution, and `.get` on it would raise past the outer
+        # handler — downgrading a working investigation to investigation_failed
+        # rather than degrading it.
+        raw_md = task_doc.get('metadata') if task_doc else None
+        md = raw_md if isinstance(raw_md, dict) else {}
+
+        proposals = md.get('dry_run_proposals')
+        if isinstance(proposals, list) and _latest_proposal_covers(
+            proposals, branch_patch_id=branch_patch_id, block_reason=reason,
+            head_sha=head_sha,
+        ):
+            await _skip_covered_reblock(
+                scheduler=scheduler, event_store=event_store, task_id=task_id,
+                proposals=proposals, branch_patch_id=branch_patch_id,
+                block_reason=reason,
+            )
+            return
+
+        sandbox_modules = _investigation_sandbox_modules(config)
+
         # Per-investigation isolated CLAUDE_CONFIG_DIR, named distinctly from
         # the main task's `claude-config-{task_id}` dir so this background
         # investigation cannot collide with the blocked task's own session/
@@ -300,7 +715,10 @@ async def run_dry_run_unblock(
             f'Task ID: {task_id}\n'
             f'Worktree: {worktree}\n'
             f'Block reason: {reason}\n'
-            f'Detail: {detail or "(none)"}\n\n'
+            f'Detail: {detail or "(none)"}\n'
+            f'**Reviews directory:** {_reviews_directory(worktree, task_id, reviews_dir)}\n'
+            f'{_GRANTED_TOOLS_LINE}\n\n'
+            f'{task_context.block}\n\n'
             'Investigate and emit your structured proposal.'
         )
 
@@ -318,11 +736,7 @@ async def run_dry_run_unblock(
         # read is skipped and this RoleDefaults base stands (byte-equivalent to
         # pre-η at stock config). Resolved ONCE here (not inside _one_attempt)
         # so the single zero-output-timeout retry does not double-emit.
-        try:
-            _fetched = await scheduler.get_task(task_id)
-            md = (_fetched or {}).get('metadata') or {}
-        except Exception:
-            md = {}
+        # `md` comes from the single task fetch above the prompt build.
         decision = await resolve_and_record_route(
             role_name='unblock_auto',
             role_defaults=RoleDefaults(
@@ -334,6 +748,7 @@ async def run_dry_run_unblock(
             event_store=event_store,
             scheduler=scheduler,
             cost_store=cost_store,
+            phase=WorkflowState.BLOCKED,
         )
 
         async def _one_attempt(session_id: str) -> Any:
@@ -347,6 +762,9 @@ async def run_dry_run_unblock(
                 project_id=project_id,
                 role='unblock_auto',
                 cap_wait_sanity_secs=_DRY_RUN_CAP_WAIT_SANITY_SECS,
+                # A fire-and-forget read-only investigation has no mid-work
+                # state worth resuming.
+                resume_on_cap_hit=False,
                 invoke_fn=invoke_agent,
                 backend=ua_cfg.backend,
                 session_id=session_id,
@@ -356,8 +774,12 @@ async def run_dry_run_unblock(
                 model=decision.model,
                 max_turns=decision.max_turns,
                 max_budget_usd=decision.budget_usd,
+                permission_mode='dontAsk',
+                sandbox_modules=sandbox_modules,
                 allowed_tools=_ALLOWED_TOOLS,
                 disallowed_tools=_DISALLOWED_TOOLS,
+                setting_sources=[],
+                env_overrides=dict(_INVESTIGATION_ENV_OVERRIDES),
                 mcp_config=mcp_config,
                 output_schema=DRY_RUN_PROPOSAL_SCHEMA,
                 effort=decision.effort,
@@ -399,8 +821,8 @@ async def run_dry_run_unblock(
             # the entry's proposal_text/block_class.
             disp = classify_failure(cap_exc)
             logger.warning(
-                'dry_run_unblock: %s for task %s: %s',
-                disp.reason_prefix.lower(), task_id, cap_exc,
+                'dry_run_unblock: %s for task %s (%.1fs elapsed)',
+                _cap_wedge(cap_exc, disp), task_id, cap_exc.elapsed_secs,
             )
             entry = _cap_exhausted_entry(reason=reason, exc=cap_exc, disp=disp)
             # This entry's block_class reflects THIS cap-hit, not the
@@ -433,26 +855,121 @@ async def run_dry_run_unblock(
         result = None
     finally:
         if config_dir is not None:
-            if preserve_config_dir:
-                # Not independently reaped here: this dir lives under
-                # <worktree>/.task/, which GitOps.cleanup_worktree() removes
-                # wholesale (`git worktree remove --force`) when the worktree
-                # is torn down — see the .task/ contamination-prevention
-                # notes atop git_ops.py. The forensic window is bounded by
-                # the worktree's lifetime, not unbounded.
-                logger.warning(
-                    'dry_run_unblock: config dir preserved for forensic analysis '
-                    '(doubly-wedged investigation) for task %s → %s',
-                    task_id, config_dir.path,
-                )
-            else:
-                try:
-                    config_dir.cleanup()
-                except Exception as exc:
+            # Archival is nested in its own try/finally so the preserve-or-
+            # cleanup branch below ALWAYS runs, even when the archival above
+            # propagates. Only one thing can propagate out of it — a
+            # CancelledError from the `await` (loop teardown / SIGTERM), which
+            # is deliberately re-raised rather than swallowed — and before this
+            # hook existed the dir was unconditionally reaped on that path.
+            # This dir holds a `.credentials.json`, so letting a cancellation
+            # skip teardown would be a real (if worktree-lifetime-bounded)
+            # regression introduced purely by inserting a new await AHEAD of
+            # the teardown. TaskWorkflow._invoke's hook needs no such nesting:
+            # it sits at the END of its own finally, so re-raising there costs
+            # nothing.
+            try:
+                # Producer hook (task 3271), mirroring the archival hook in
+                # TaskWorkflow._invoke's finally (orchestrator/workflow.py).
+                # Archive the investigation's transcripts to the durable root
+                # OUTSIDE the worktree BEFORE either exit branch disposes of
+                # the dir.
+                #
+                # Deliberately ABOVE `if preserve_config_dir:`, not inside its
+                # `else`. The regression cause (commit 7a07c40820, which
+                # introduced the per-investigation config dir near the top of
+                # this function) left BOTH branches lossy: the cleanup branch
+                # rmtree's the dir outright, and the forensic preserve branch
+                # only DEFERS the loss to `git worktree remove --force`. No
+                # backstop covers the deferred case either —
+                # GitOps.cleanup_worktree composes its archival target by
+                # literal f-string, `worktree / '.task' /
+                # f'claude-config-{branch}'`, with no glob and no
+                # CONFIG_DIR_PREFIX import, so `claude-config-{task_id}-unblock`
+                # can never match it. One call here covers both exits; the
+                # preserved case is also the highest-value one, firing only on
+                # a doubly-wedged investigation.
+                #
+                # Bound OUTSIDE the inner try so a mis-shaped config surfaces
+                # rather than being mistaken for an archival failure, and so
+                # the disabled path never spins up a worker thread. Mirrors
+                # TaskWorkflow._invoke (`ta = self.config.transcript_archive;
+                # if ta.enabled and ...`) and GitOps.cleanup_worktree
+                # (`if self.transcript_archive is not None and
+                # self.transcript_archive.enabled:`), so all three producers
+                # consult the one knob identically — which is what makes the
+                # config's documented "disable archival entirely" contract true
+                # fleet-wide rather than true-for-two-of-three.
+                ta = config.transcript_archive
+                if ta.enabled:
+                    try:
+                        await asyncio.to_thread(
+                            archive_task_transcripts,
+                            config_dir.path,
+                            # Plain task_id key, no subkey:
+                            # legibility.inventory._archive_enc derives the
+                            # encoded cwd as parts[1] of the archive-root-
+                            # relative path, so a `<task_id>/unblock/...` layout
+                            # would put the literal 'unblock' there, match no
+                            # project prefix, and have _enumerate silently skip
+                            # every archived investigation. Session ids are
+                            # fresh uuid4s, so sharing the key with the task's
+                            # own roles cannot collide.
+                            task_id,
+                            # session_id=None → whole-dir sweep of
+                            # projects/**/*.jsonl, as GitOps.cleanup_worktree's
+                            # teardown backstop passes. This dir is exclusive to
+                            # THIS investigation, so nothing foreign is
+                            # over-captured, and it captures BOTH the wedged
+                            # first attempt and the fresh-session retry — the
+                            # wedge being the diagnostically interesting one —
+                            # without threading a mutable last-session-id out of
+                            # the _one_attempt closure.
+                            None,
+                            archive_root=config.project_root / ta.root,
+                        )
+                    except asyncio.CancelledError:
+                        # Cooperative cancellation is a BaseException and must
+                        # propagate; deliberately NOT caught by the except
+                        # below. The enclosing finally still reaps the dir.
+                        raise
+                    except Exception:
+                        # Defense-in-depth for a finally that awaits
+                        # cross-module work. archive_task_transcripts is total
+                        # by contract (per-file OSErrors are caught + counted
+                        # inside it, never re-raised) but its top-level
+                        # Path/archive_root construction is not individually
+                        # guarded, and this finally may be unwinding an
+                        # in-flight exception that must not be replaced. Loud,
+                        # not silent: logged as a structured fact matching the
+                        # extra= shape _record_failure already emits.
+                        logger.warning(
+                            'dry_run_unblock: transcript archival failed for task %s',
+                            task_id,
+                            exc_info=True,
+                            extra={'task_id': task_id},
+                        )
+            finally:
+                if preserve_config_dir:
+                    # Not independently reaped here: this dir lives under
+                    # <worktree>/.task/, which GitOps.cleanup_worktree()
+                    # removes wholesale (`git worktree remove --force`) when
+                    # the worktree is torn down — see the .task/
+                    # contamination-prevention notes atop git_ops.py. The
+                    # forensic window is bounded by the worktree's lifetime,
+                    # not unbounded.
                     logger.warning(
-                        'dry_run_unblock: failed to clean up config dir for task %s: %s',
-                        task_id, exc,
+                        'dry_run_unblock: config dir preserved for forensic analysis '
+                        '(doubly-wedged investigation) for task %s → %s',
+                        task_id, config_dir.path,
                     )
+                else:
+                    try:
+                        config_dir.cleanup()
+                    except Exception as exc:
+                        logger.warning(
+                            'dry_run_unblock: failed to clean up config dir for task %s: %s',
+                            task_id, exc,
+                        )
 
     # Stamp the git anchor and typed block_class onto the entry at a single
     # point so all six shapes (ok, investigation_failed, budget_exhausted,
@@ -520,6 +1037,29 @@ async def run_dry_run_unblock(
             task_id, entry.get('status'),
         )
     entry.update(record.to_dict())
+    # Same single stamp point, same guarantee: outside DRY_RUN_PROPOSAL_SCHEMA
+    # (additionalProperties:False), so the investigating agent cannot forge it.
+    # Always present — False on the healthy path — matching the shape-parity
+    # convention _failure_diagnostics sets, so a consumer never has to
+    # distinguish an absent key from an old entry from a healthy one.
+    entry['task_context_unavailable'] = task_context_unavailable
+    # The coverage key the next re-block is compared against; stamped from
+    # the dispatch-time capture and, like the SHAs, outside the agent schema.
+    entry['branch_patch_id'] = branch_patch_id
+    # DIAGNOSTIC ONLY, and deferred on purpose — not an oversight. Review asked
+    # why b3_gate fails closed on an undeterminable AGE (step 7b) while an
+    # undeterminable TASK still certifies FRESH. Both offered remedies conflict
+    # with something already pinned: clamping risk_label here, beside the
+    # MERGE_VERIFY_RED clamp above, contradicts
+    # test_clamp_scoped_to_merge_verify_red_agent_failure_untouched (which pins
+    # that clamp as scoped, on a bare-MagicMock scheduler that takes this
+    # degraded path incidentally), and it would flip every other low-risk
+    # assertion sharing that fixture; teaching check_proposal this key instead
+    # would pull a dry_run_unblock-specific field into a module kept
+    # deliberately dependency-light. Either is a policy change owed its own
+    # plan. Until then this flag tells an operator reading the entry that the
+    # investigation was blind — strictly more than the silent fallback it
+    # replaced, and the input any such gate would need.
 
     try:
         await scheduler.update_task(
@@ -545,9 +1085,9 @@ async def run_dry_run_unblock(
     # Concurrency note: this read-modify-write is not atomic. If another writer
     # mutates the task metadata between get_task and the trim update_task, that
     # concurrent change is clobbered (stale-plus-trimmed blob wins).
-    # Concurrent dry-runs on the same blocked task are extremely unlikely — the
-    # scheduler dispatches at most one hook per task — so this is acceptable as
-    # a best-effort trim. A missed trim cycle is preferable to coordination
+    # Concurrent dry-runs on the same blocked task do not happen: both spawners
+    # skip while investigation_in_flight(task_id) holds for the whole event
+    # loop — so this is acceptable as a best-effort trim. A missed trim cycle is preferable to coordination
     # overhead.
     try:
         keep_last = ua_cfg.b3_proposal_keep_last
@@ -567,11 +1107,10 @@ async def run_dry_run_unblock(
 
     if event_store and result is not None:
         try:
-            from orchestrator.event_store import EventType
             event_store.emit(
                 EventType.invocation_end,
                 task_id=task_id,
-                phase='blocked',
+                phase=WorkflowState.BLOCKED.value,
                 role='unblock_auto',
                 cost_usd=getattr(result, 'cost_usd', 0.0),
                 duration_ms=getattr(result, 'duration_ms', int((time.monotonic() - start_time) * 1000)),
@@ -580,6 +1119,8 @@ async def run_dry_run_unblock(
                     'risk_label': entry.get('risk_label', _HUMAN_REVIEW_REQUIRED),
                     'success': getattr(result, 'success', False),
                     'status': entry.get('status', 'ok'),
+                    'cost_basis': str(getattr(result, 'cost_basis', 'reported')),
+                    'cost_delta_clamped': bool(getattr(result, 'cost_delta_clamped', False)),
                 },
             )
         except Exception as exc:
@@ -629,7 +1170,7 @@ def _build_entry(result: Any, *, reason: str, budget_usd: float) -> dict[str, An
                     f'wall / task is slow)'
                 )
             return {
-                'status': 'infra_failure',
+                'status': _INFRA_FAILURE_STATUS,
                 'proposal_text': proposal_text,
                 'risk_label': _HUMAN_REVIEW_REQUIRED,
                 'files_referenced': [],
@@ -670,31 +1211,41 @@ def _build_entry(result: Any, *, reason: str, budget_usd: float) -> dict[str, An
     }
 
 
+def _cap_wedge(exc: AllAccountsCappedException, disp: BlockDisposition) -> str:
+    """What spent the investigation's cap patience, for its log and its entry.
+
+    A deadline spent parked names the gate's frozen-pool snapshot instead of
+    *disp*'s cap phrase: a pool frozen on rejected credentials is not a cap.
+    """
+    if exc.pool_frozen is None:
+        return f'{disp.reason_prefix.lower()} after {exc.retries} retries'
+    return f'cap-wait bound spent parked ({exc.pool_frozen})'
+
+
 def _cap_exhausted_entry(
     *, reason: str, exc: AllAccountsCappedException, disp: BlockDisposition,
 ) -> dict[str, Any]:
     """Build the retryable infra_failure entry for a cap-exhausted investigation.
 
-    AllAccountsCappedException means invoke_with_cap_retry exceeded the
-    ``_DRY_RUN_CAP_WAIT_SANITY_SECS`` bound (all accounts capped) — no
-    AgentResult was ever produced, so this reuses the None-safe
-    ``_failure_diagnostics(None)`` shape rather than the AgentResult-derived
-    one, matching the task-2020 infra_failure entry shape.
+    AllAccountsCappedException means invoke_with_cap_retry spent the
+    ``_DRY_RUN_CAP_WAIT_SANITY_SECS`` bound, retrying caps or parked on a
+    frozen pool — no AgentResult was ever produced, so this reuses the
+    None-safe ``_failure_diagnostics(None)`` shape rather than the
+    AgentResult-derived one, matching the task-2020 infra_failure entry shape.
 
     *disp* (BD-1) is ``classify_failure(exc)`` — the SAME disposition-table
     lookup workflow.py/steward.py/review_checkpoint.py all consult for an
     ``AllAccountsCappedException``, single-sourcing ``proposal_text``'s
-    leading phrase (the caller separately rebinds the outer ``block_class``
+    cap phrase (the caller separately rebinds the outer ``block_class``
     from ``disp.block_class`` too — see ``run_dry_run_unblock``'s except
     clause).
     """
     now = _now_iso()
     return {
-        'status': 'infra_failure',
+        'status': _INFRA_FAILURE_STATUS,
         'proposal_text': (
             f'Infra wedge (retryable, not a human-review conclusion): '
-            f'{disp.reason_prefix.lower()} after {exc.retries} retries '
-            f'({exc.elapsed_secs:.1f}s elapsed)'
+            f'{_cap_wedge(exc, disp)} ({exc.elapsed_secs:.1f}s elapsed)'
         ),
         'risk_label': _HUMAN_REVIEW_REQUIRED,
         'files_referenced': [],

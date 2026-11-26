@@ -1,0 +1,104 @@
+"""B: replay recorded chains (membership recorded since 2026-11-15T11:19Z) under chooser / table-only / never-chain.
+C: elimination conviction counts since the un-chained mark deployed."""
+import json,collections,datetime as dt,sys
+P='/tmp/gate-10069/predict/'
+exec(open(P+'model_lib.py').read()) if False else None
+R={r['rid']:r for r in json.load(open(P+'requests.json'))}; TR=json.load(open(P+'trials.json'))
+rows_all={r['rid']:r for r in json.load(open(P+'rows_all.json'))}
+tv={t['vid']:t for t in TR}
+def T(s): return dt.datetime.fromisoformat(s).timestamp()
+MARK=T('2026-11-17T20:49:02+00:00'); D8528=T('2026-11-19T04:25:50+00:00'); CUT=json.load(open(P+'model_choice.json'))['cut']
+# ---- models (fit on labelled rows with verdict_t < CUT)
+F={'prior_fail':lambda r:'pf1+' if r['prior_fail']>0 else 'pf0','decl12':lambda r:'decl>=12' if (r['n_decl_files'] or 0)>=12 else 'decl<12',
+   'files12':lambda r:'na' if r['n_task_files'] is None else ('tf>=12' if r['n_task_files']>=12 else 'tf<12'),
+   'simple':lambda r:'simple' if r['complexity']=='simple' else 'std','nverif':lambda r:'v>=3' if r['n_task_verifies']>=3 else 'v<3',
+   'resub':lambda r:'resub_vblock' if r['resub']=='after_verify_block' else ('first' if r['resub']=='first' else 'resub_other')}
+train=[r for r in rows_all.values() if r['y'] is not None and r['verdict_t']<CUT and r['verdict_t']>=T('2026-10-22T00:00:00+00:00')]
+def fit(feats,m=8):
+    base=sum(r['y'] for r in train)/len(train); cell=collections.defaultdict(lambda:[0,0])
+    for r in train:
+        k=tuple(F[f](r) for f in feats); cell[k][0]+=1; cell[k][1]+=r['y']
+    return lambda r:((cell.get(tuple(F[f](r) for f in feats),(0,0))[1]+m*base)/(cell.get(tuple(F[f](r) for f in feats),(0,0))[0]+m))
+pA=fit(['prior_fail','decl12']); pB=fit(['files12','simple','nverif'])
+print('train rows',len(train),'cut',dt.datetime.fromtimestamp(CUT,dt.timezone.utc).isoformat())
+chains=[t for t in TR if t['k']>1 and t['members']]
+chains.sort(key=lambda t:t['t'])
+def outcome_after(rid,t):
+    r=R.get(rid)
+    if not r: return 'U',None
+    for v,pos in r['trials']:
+        x=tv[v]
+        if x['t']<=t['t']: continue
+        if x['k']==1:
+            if x['passed']: return 'P',x
+            if x['applied']: return 'F',x
+        elif x['passed']: return 'P',x
+    return 'U',None
+seen_red=set(); seen_any=set()
+recs=[]
+for t in chains:
+    mem=[]
+    for m in t['members']:
+        o,x=('P',None) if t['passed'] else outcome_after(m,t)
+        ra=rows_all.get(m)
+        mem.append({'rid':m,'task':R[m]['task'] if m in R else '?','o':o,'next':x,'pA':pA(ra) if ra else None,'pB':pB(ra) if ra else None,
+                    'prior_fail':ra['prior_fail'] if ra else None,'decl':ra['n_decl_files'] if ra else None})
+    rec={'t':t,'mem':mem,'fresh':not any(m in seen_red for m in t['members']),'first':not any(m in seen_any for m in t['members'])}
+    recs.append(rec)
+    seen_any.update(t['members'])
+    if not t['passed']: seen_red.update(t['members'])
+def cost(rec,flag,pess):
+    """returns (verifies_never, verifies_table, verifies_chooser, status) for one chain round"""
+    k=len(rec['mem']); red=not rec['t']['passed']
+    fl=[flag(m) for m in rec['mem']]
+    S=[m for m,f in zip(rec['mem'],fl) if not f]; Rk=[m for m,f in zip(rec['mem'],fl) if f]
+    table=1+(k if red else 0)
+    if not red: s_red=False
+    else:
+        known_F=any(m['o']=='F' for m in rec['mem']); anyU=any(m['o']=='U' for m in rec['mem'])
+        if any(m['o']=='F' for m in S): s_red=True
+        elif any(m['o']=='U' for m in S) and (pess or not known_F): s_red=True   # unknown culprit may sit in S
+        elif not known_F and not anyU: s_red=True   # external red: persists
+        else: s_red=False
+    ch=len(Rk)+(0 if not S else (1 if len(S)==1 else 1+(len(S) if s_red else 0)))
+    status='green' if not red else ('avoided' if (not s_red or len(S)<=1) else ('shrunk' if Rk else 'unchanged'))
+    return k,table,ch,status,len(Rk)
+def run(name,sub,flag):
+    for pess in(False,True):
+        tot=[0,0,0]; st=collections.Counter(); nfl=0; nm=0; pulled_green=0
+        for rec in sub:
+            a,b,c,s,nr=cost(rec,flag,pess); tot[0]+=a; tot[1]+=b; tot[2]+=c; st[s]+=1; nfl+=nr; nm+=len(rec['mem'])
+            if rec['t']['passed']: pulled_green+=nr
+        # landings: member-rounds resolved P
+        lp=sum(1 for rec in sub for m in rec['mem'] if m['o']=='P'); lu=sum(1 for rec in sub for m in rec['mem'] if m['o']=='U')
+        land=lp+(0 if pess else lu)
+        print(f'   {name:28s} {"pess(U=F)" if pess else "opt (U=P)"}: flagged {nfl}/{nm} members ({pulled_green} pulled from green chains) | red chains: {dict(st)} | verifies never={tot[0]} table={tot[1]} chooser={tot[2]} | per P-member-round: never={tot[0]/land:.2f} table={tot[1]/land:.2f} chooser={tot[2]/land:.2f} (P-rounds={land})')
+subsets={'ALL recorded chains 11-15T11:19..11-19T19:23':recs,
+ 'post-mark (>=11-17T20:49Z)':[r for r in recs if r['t']['t']>=MARK],
+ 'post-mark, pre-8528':[r for r in recs if MARK<=r['t']['t']<D8528],
+ 'post-8528 (>=11-19T04:26Z)':[r for r in recs if r['t']['t']>=D8528],
+ 'fresh chains (no member previously in a recorded red chain), whole window':[r for r in recs if r['fresh']]}
+for sn,sub in subsets.items():
+    red=[r for r in sub if not r['t']['passed']]
+    comp=collections.Counter()
+    for r in red:
+        nF=sum(m['o']=='F' for m in r['mem']); nU=sum(m['o']=='U' for m in r['mem'])
+        comp[('F=%d'%min(nF,2)+('+' if nF>=2 else ''),'U>0' if nU else 'U=0')]+=1
+    print(f'\n### {sn}: chains={len(sub)} green={len(sub)-len(red)} red={len(red)} members(rounds)={sum(len(r["mem"]) for r in sub)}')
+    print('   red-chain composition (known culprits F, unknown U):',dict(comp))
+    print('   member-round outcomes in red chains:',collections.Counter(m['o'] for r in red for m in r['mem']))
+    run('A prior_fail+decl12 p>=0.20',sub,lambda m:(m['pA'] or 0)>=0.20)
+    run('A prior_fail+decl12 p>1/3',sub,lambda m:(m['pA'] or 0)>1/3)
+    run('B inner-selected p>=0.20',sub,lambda m:(m['pB'] or 0)>=0.20)
+    run('oracle (flag true F)',sub,lambda m:m['o']=='F')
+# flagged-member precision among chain members
+print('\nprecision of flags among chain member-rounds with known outcome (all recorded chains):')
+for nm,fl in(('A>=0.20',lambda m:(m['pA'] or 0)>=0.20),('B>=0.20',lambda m:(m['pB'] or 0)>=0.20)):
+    seenm={}
+    for rec in recs:
+        for m in rec['mem']:
+            r=R.get(m['rid'])
+            seenm[m['rid']]=(fl(m),r['label'] if r else None)
+    kn=[(f,y) for f,y in seenm.values() if y is not None]
+    print(f'   {nm}: distinct requests {len(seenm)} labelled {len(kn)}; flagged {sum(f for f,y in kn)} of which fail {sum(1 for f,y in kn if f and y)}; unflagged {sum(1 for f,y in kn if not f)} of which fail {sum(1 for f,y in kn if not f and y)}')
+json.dump([{'ts':r['t']['ts'],'k':r['t']['k'],'passed':r['t']['passed'],'base_relation':r['t']['base_relation'],'fresh':r['fresh'],'mem':[{k:v for k,v in m.items() if k!='next'}|{'next_ts':m['next']['ts'] if m['next'] else None,'next_k':m['next']['k'] if m['next'] else None} for m in r['mem']]} for r in recs],open(P+'chain_recs.json','w'))

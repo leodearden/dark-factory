@@ -18,18 +18,28 @@ the implementation.
 from __future__ import annotations
 
 import asyncio
+import logging
 from dataclasses import dataclass
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock
+from typing import Any, cast
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from _orch_helpers import pydantic_spec
+from _merge_queue_doubles import ResolvingMergeQueue
+from _orch_helpers import MOCK_WORKFLOW_PROJECT_ROOT, pydantic_spec
+from _workflow_helpers import _bind_landed_row
 from escalation.models import Escalation  # noqa: F401 — keeps fixture parity
 
 from orchestrator.config import OrchestratorConfig
-from orchestrator.landed_outbox import LandedOutbox, LandedRow, MergeProvenance
-from orchestrator.merge_queue import GroupMergeRequest, MergeOutcome
-from orchestrator.workflow import TaskWorkflow, WorkflowCancelled, WorkflowOutcome
+from orchestrator.delivered_checks import DeliveredChecksBlock
+from orchestrator.merge_lane.landed_outbox import LandedOutbox, LandedRow, MergeProvenance
+from orchestrator.merge_lane.worker import GroupMergeRequest, MergeOutcome
+from orchestrator.workflow import (
+    TaskWorkflow,
+    WorkflowCancelled,
+    WorkflowOutcome,
+    WorkflowState,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -38,6 +48,27 @@ def _reset_merge_provenance():
     MergeProvenance._outbox = None
     yield
     MergeProvenance._outbox = None
+
+
+def _preset_cancel_event() -> asyncio.Event:
+    """An already-set soft-cancel event for ``TaskWorkflow(cancel_event=...)``.
+
+    ``_await_cancellable`` races the request future against this event, so
+    presetting it is the public way to make the cancel arm win — the request
+    future is left pending by ``ResolvingMergeQueue(outcome=None)``.
+    """
+    event = asyncio.Event()
+    event.set()
+    return event
+
+
+#: What the fixtures whose trigger must NOT fire hand their queue. Nothing is
+#: enqueued on their green path, so it goes unused — but a regression that DOES
+#: fire resolves at once and reds on ``result is None``, where a never-resolving
+#: queue would instead hang in ``_await_cancellable`` (which races only the
+#: request future and an unset cancel event, with no timeout) until
+#: pytest-timeout killed the xdist worker 300 seconds later.
+_FAST_FAIL_OUTCOME = MergeOutcome('done', merge_sha='deadbeef')
 
 
 # ---------------------------------------------------------------------------
@@ -59,6 +90,8 @@ def _make(
     metadata: dict | None = None,
     tasks_by_train_return: list[dict] | None = None,
     get_statuses_return: tuple[dict[str, str], Exception | None] | None = None,
+    merge_outcome: MergeOutcome | None = None,
+    cancel_event: asyncio.Event | None = None,
 ) -> _Fixture:
     assignment = MagicMock()
     assignment.task_id = task_id
@@ -74,7 +107,7 @@ def _make(
     config.fused_memory.url = 'http://localhost:8002'
     config.lock_depth = 2
     config.steward_completion_timeout = 300.0
-    config.project_root = Path('/tmp/non-existent-for-test')
+    config.project_root = MOCK_WORKFLOW_PROJECT_ROOT
     config.max_consecutive_infra_resumes = 3
     config.max_consecutive_merge_thrash = 3
     # task ν: GroupMergeRequest construction now parses branch/tip_branch via
@@ -116,7 +149,7 @@ def _make(
     esc_queue.submit = MagicMock()
     esc_queue.get_by_task = MagicMock(return_value=[])
 
-    merge_queue: asyncio.Queue = asyncio.Queue()
+    merge_queue: asyncio.Queue = ResolvingMergeQueue(merge_outcome)
 
     wf = TaskWorkflow(
         assignment=assignment,
@@ -127,6 +160,7 @@ def _make(
         mcp=MagicMock(),
         escalation_queue=esc_queue,  # type: ignore[arg-type]
         merge_queue=merge_queue,
+        cancel_event=cancel_event,
     )
 
     wf.artifacts = MagicMock()
@@ -155,8 +189,8 @@ async def test_tip_fires_group_merge_happy_path():
     """TIP member fires GroupMergeRequest when all three members are merge-deferred.
 
     Scenario: train T1, three members root→tip (101,102,103); self is 103 (tip,
-    order 2); all statuses are merge-deferred.  _await_cancellable returns
-    MergeOutcome('done', merge_sha='deadbeef').
+    order 2); all statuses are merge-deferred.  The queue resolves the enqueued
+    request with MergeOutcome('done', merge_sha='deadbeef').
 
     Asserts:
       (a) _maybe_enqueue_group_merge() returns WorkflowOutcome.DONE
@@ -176,10 +210,8 @@ async def test_tip_fires_group_merge_happy_path():
         task_id='103',
         metadata={'train': {'id': 'T1', 'order': 2}},
         tasks_by_train_return=members,
+        merge_outcome=MergeOutcome('done', merge_sha='deadbeef'),
     )
-
-    outcome_future = MergeOutcome('done', merge_sha='deadbeef')
-    f.wf._await_cancellable = AsyncMock(return_value=outcome_future)  # type: ignore[method-assign]
 
     result = await f.wf._maybe_enqueue_group_merge()
 
@@ -250,28 +282,21 @@ async def test_inline_mark_member_done_consumes_landed_row(tmp_path: Path):
         task_id='103',
         metadata={'train': {'id': 'T1', 'order': 2}},
         tasks_by_train_return=members,
+        merge_outcome=MergeOutcome('done', merge_sha='deadbeef'),
     )
-    f.wf._await_cancellable = AsyncMock(  # type: ignore[method-assign]
-        return_value=MergeOutcome('done', merge_sha='deadbeef'),
-    )
-
-    outbox = LandedOutbox(tmp_path / 'landed_outbox.json')
-    outbox.record(LandedRow(
-        task_id='101', branch_tip_sha='tip', advanced_sha='deadbeef', landed_at=1.0,
-    ))
-    MergeProvenance.bind(outbox)
+    _bind_landed_row(tmp_path, task_id='101', advanced_sha='deadbeef')
 
     await f.wf._maybe_enqueue_group_merge()
     req = f.merge_queue.get_nowait()
 
     # Row present BEFORE the done-write.
-    assert outbox.lookup('101') is not None
+    assert MergeProvenance.lookup('101') is not None
 
     await req.mark_member_done('101', 'sha9')
 
     # Member's write-ahead row consumed inline on the successful mark_done
     # (PRD B1: lookup==None after done).
-    assert outbox.lookup('101') is None
+    assert MergeProvenance.lookup('101') is None
 
 
 # ---------------------------------------------------------------------------
@@ -294,10 +319,8 @@ async def test_partial_train_does_not_fire():
         task_id='103',
         metadata={'train': {'id': 'T1', 'order': 2}},
         tasks_by_train_return=members,
+        merge_outcome=_FAST_FAIL_OUTCOME,
     )
-    # Should not be called, but stub defensively
-    f.wf._await_cancellable = AsyncMock(return_value=MergeOutcome('done'))  # type: ignore[method-assign]
-
     result = await f.wf._maybe_enqueue_group_merge()
 
     assert result is None, (
@@ -327,8 +350,8 @@ async def test_self_status_trusted_over_lagging_get_tasks():
         task_id='103',
         metadata={'train': {'id': 'T1', 'order': 2}},
         tasks_by_train_return=members,
+        merge_outcome=MergeOutcome('done', merge_sha='abc'),
     )
-    f.wf._await_cancellable = AsyncMock(return_value=MergeOutcome('done', merge_sha='abc'))  # type: ignore[method-assign]
 
     result = await f.wf._maybe_enqueue_group_merge()
 
@@ -357,9 +380,8 @@ async def test_non_tip_member_does_not_fire():
         task_id='101',
         metadata={'train': {'id': 'T1', 'order': 0}},
         tasks_by_train_return=members,
+        merge_outcome=_FAST_FAIL_OUTCOME,
     )
-    f.wf._await_cancellable = AsyncMock(return_value=MergeOutcome('done'))  # type: ignore[method-assign]
-
     result = await f.wf._maybe_enqueue_group_merge()
 
     assert result is None, (
@@ -374,14 +396,14 @@ async def test_non_tip_member_does_not_fire():
 async def test_enter_merge_deferred_returns_merge_deferred_when_trigger_parks():
     """Test D — _enter_merge_deferred returns MERGE_DEFERRED when trigger returns None.
 
-    Patch _maybe_enqueue_group_merge to AsyncMock→None; assert that
-    _enter_merge_deferred sets status=merge-deferred and returns MERGE_DEFERRED.
+    The train has no members (``tasks_by_train`` returns []), so the real
+    trigger parks on its own — no stub needed. Assert that _enter_merge_deferred
+    sets status=merge-deferred and returns MERGE_DEFERRED.
     """
     f = _make(
         task_id='103',
         metadata={'train': {'id': 'T1', 'order': 2}},
     )
-    f.wf._maybe_enqueue_group_merge = AsyncMock(return_value=None)  # type: ignore[method-assign]
 
     outcome = await f.wf._enter_merge_deferred()
 
@@ -403,7 +425,7 @@ async def test_enter_merge_deferred_returns_merge_deferred_when_trigger_parks():
 async def test_blocked_outcome_escalates_to_human():
     """Tip fires but merge fails with status='blocked' → _mark_blocked(escalate_to_human=True).
 
-    _await_cancellable returns MergeOutcome('blocked', reason='...rebase conflict...').
+    The queue resolves the request with MergeOutcome('blocked', reason='...rebase conflict...').
     Assert:
       (a) result is WorkflowOutcome.BLOCKED
       (b) _mark_blocked was awaited once with escalate_to_human=True
@@ -419,11 +441,11 @@ async def test_blocked_outcome_escalates_to_human():
         task_id='103',
         metadata={'train': {'id': 'T1', 'order': 2}},
         tasks_by_train_return=members,
+        merge_outcome=MergeOutcome(
+            'blocked',
+            reason='Train merge rejected: tip branch rebase conflict on main',
+        ),
     )
-    failed_outcome = MergeOutcome(
-        'blocked', reason='Train merge rejected: tip branch rebase conflict on main',
-    )
-    f.wf._await_cancellable = AsyncMock(return_value=failed_outcome)  # type: ignore[method-assign]
 
     result = await f.wf._maybe_enqueue_group_merge()
 
@@ -450,7 +472,8 @@ async def test_blocked_outcome_escalates_to_human():
 
 @pytest.mark.asyncio
 async def test_soft_cancel_delegates_to_handle_soft_cancel():
-    """_await_cancellable raises WorkflowCancelled('soft') (W9-θ) → propagates
+    """A set cancel event wins _await_cancellable's race (W9-θ), so
+    WorkflowCancelled('soft') propagates
     straight out of _maybe_enqueue_group_merge uncaught, to run()'s single
     WorkflowCancelled catch site.
 
@@ -469,13 +492,379 @@ async def test_soft_cancel_delegates_to_handle_soft_cancel():
         task_id='103',
         metadata={'train': {'id': 'T1', 'order': 2}},
         tasks_by_train_return=members,
+        cancel_event=_preset_cancel_event(),
     )
-    f.wf._await_cancellable = AsyncMock(side_effect=WorkflowCancelled('soft'))  # type: ignore[method-assign]
-    handle_soft_cancel = AsyncMock(return_value=WorkflowOutcome.REQUEUED)
-    f.wf._handle_soft_cancel = handle_soft_cancel  # type: ignore[method-assign]
 
     with pytest.raises(WorkflowCancelled) as excinfo:
         await f.wf._maybe_enqueue_group_merge()
 
     assert excinfo.value.kind == 'soft'
-    handle_soft_cancel.assert_not_awaited()
+    # Escaping UNCAUGHT is the contract, and it has a public projection:
+    # _finalise_cancellation — run()'s catch site, and the only caller of
+    # _handle_soft_cancel — enters CANCELLED before delegating, so a phase
+    # still short of CANCELLED proves this layer did not handle the cancel
+    # itself and then re-raise.
+    assert f.wf.state is not WorkflowState.CANCELLED, (
+        f'Expected the cancel to propagate uncaught, but the workflow already '
+        f'finalised it locally: state={f.wf.state!r}'
+    )
+
+
+# ---------------------------------------------------------------------------
+# Task 3057 step-11 (RED) — seam 10: the inline _mark_member_done closure
+#
+# This closure stamps kind='merged' on OTHER members' task rows.  A landed
+# train proves main advanced; it never proves that THIS member's declared
+# capability rode along (a member can be mis-stacked, dropped by a rebase, or
+# have delivered nothing at all).  Because the stamp targets a member id and
+# not self, the guard needs a scheduler.get_task(mid) round-trip for metadata —
+# unlike every self-task workflow seam above it.
+# ---------------------------------------------------------------------------
+
+_GATE_TARGET = 'orchestrator.workflow.gate_mark_done_on_delivered_checks'
+_PROV_TARGET = 'orchestrator.workflow.MergeProvenance'
+_DC_CHECK = {
+    'name': 'cap-x', 'kind': 'grep', 'pattern': 'SomePattern', 'expect': 'present',
+}
+_DC_TRAIN = 'T-dc'
+
+
+def _dc_block(reason: str = 'failed') -> DeliveredChecksBlock:
+    return DeliveredChecksBlock(
+        reason=reason,  # type: ignore[arg-type]
+        main_sha='m' * 40,
+        failed_check=_DC_CHECK if reason == 'failed' else None,
+    )
+
+
+async def _armed_member_callback(
+    *,
+    member_metadata: dict | None = None,
+    enabled: bool = True,
+    get_task: AsyncMock | None = None,
+) -> tuple[_Fixture, Any]:
+    """Build+enqueue the train GroupMergeRequest, return (fixture, callback).
+
+    Reuses this module's existing driver shape verbatim (``_make`` + a real
+    ``asyncio.Queue`` + ``_maybe_enqueue_group_merge``); only the live
+    ``delivered_checks`` config and the member-metadata read the guard needs
+    are added.  ``scheduler.get_task`` is reset after the enqueue so the
+    per-member round-trip assertions count ONLY the callback's own reads.
+    """
+    from orchestrator.config import DeliveredChecksConfig
+
+    members = [
+        {'id': '101', 'status': 'merge-deferred',
+         'metadata': {'train': {'id': _DC_TRAIN, 'order': 0}}},
+        {'id': '102', 'status': 'merge-deferred',
+         'metadata': {'train': {'id': _DC_TRAIN, 'order': 1}}},
+        {'id': '103', 'status': 'merge-deferred',
+         'metadata': {'train': {'id': _DC_TRAIN, 'order': 2}}},
+    ]
+    f = _make(
+        task_id='103',
+        metadata={'train': {'id': _DC_TRAIN, 'order': 2}},
+        tasks_by_train_return=members,
+        merge_outcome=MergeOutcome('done', merge_sha='deadbeef'),
+    )
+    f.wf.config.delivered_checks = DeliveredChecksConfig(
+        enabled=enabled, check_timeout_secs=7.5,
+    )
+    f.scheduler.get_task = get_task or AsyncMock(return_value={
+        'id': '101',
+        'metadata': (
+            {'delivered_checks': [_DC_CHECK]}
+            if member_metadata is None else member_metadata
+        ),
+    })
+    await f.wf._maybe_enqueue_group_merge()
+    req = f.merge_queue.get_nowait()
+    f.scheduler.get_task.reset_mock()
+    return f, req.mark_member_done
+
+
+@pytest.mark.asyncio
+class TestWorkflowMarkMemberDoneDeliveredChecksGuard:
+    """The delivered-capability guard on the inline train-member done flip.
+
+    Recovery contract: a withheld member RETURNS, never RAISES.  The merge
+    worker's post-advance flip loop collects raises into ``TRAIN_PARTIAL_FLIP``
+    — and a capability withholding is NOT a partial flip: main genuinely
+    advanced, only this member's declared deliverable is unverifiable.  The
+    write-ahead ``LandedRow`` is deliberately NOT consumed (it is the only
+    record of the crash-window intent), and the member is REVERTED to
+    'pending' (task 3057 step-23/24 — review remediation) so the scheduler
+    re-dispatches it.  Leaving it at 'merge-deferred' would wedge it
+    permanently: see ``TestWithheldTrainMemberHasRecoveryEdge`` in
+    test_reconcile_stranded.py for the three status filters that make that
+    status unreachable by every recovery path.
+    """
+
+    # --- row 1: hollow-done regression / FAILED ---------------------------
+
+    async def test_failed_block_withholds_flip_and_retains_landed_row(
+        self, tmp_path: Path, caplog,
+    ):
+        """No stamp, no LandedRow consume, no lane release — and no raise."""
+        outbox = LandedOutbox(tmp_path / 'landed_outbox.json')
+        outbox.record(LandedRow(
+            task_id='101', branch_tip_sha='tip',
+            advanced_sha='deadbeef', landed_at=1.0,
+        ))
+        MergeProvenance.bind(outbox)
+
+        f, cb = await _armed_member_callback()
+        guard = AsyncMock(return_value=_dc_block('failed'))
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.workflow'), \
+                patch(_GATE_TARGET, guard):
+            await cb('101', 'sha9')  # must return normally
+
+        f.scheduler.mark_done.assert_not_awaited()
+        # The write-ahead row SURVIVES: it is the reconciler's only record of
+        # the crash-window intent, so a withholding must not consume it.
+        assert outbox.lookup('101') is not None
+        cast(AsyncMock, f.wf.git_ops.release_lane_for_terminal_task).assert_not_awaited()
+
+        blob = '\n'.join(r.getMessage() for r in caplog.records)
+        assert _DC_TRAIN in blob, f'WARNING must name the train: {blob!r}'
+        assert '101' in blob, f'WARNING must name the member: {blob!r}'
+
+    # --- step-23 (RED): the withhold path's ACTUAL recovery edge ----------
+
+    @pytest.mark.parametrize('reason', ['failed', 'errored', 'main_sha_unresolved'])
+    async def test_withheld_member_is_reverted_to_pending(
+        self, reason: str, tmp_path: Path, caplog,
+    ):
+        """A withheld member must be handed back to the scheduler.
+
+        Before step-24 this seam withheld by RETURNING with the member left at
+        'merge-deferred' — a status no recovery path can reach (see
+        ``TestWithheldTrainMemberHasRecoveryEdge``). A permanently-ERRORing
+        check descriptor therefore wedged the member forever.
+        """
+        outbox = LandedOutbox(tmp_path / 'landed_outbox.json')
+        outbox.record(LandedRow(
+            task_id='101', branch_tip_sha='tip',
+            advanced_sha='deadbeef', landed_at=1.0,
+        ))
+        MergeProvenance.bind(outbox)
+
+        f, cb = await _armed_member_callback()
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.workflow'), \
+                patch(_GATE_TARGET, AsyncMock(return_value=_dc_block(reason))):
+            await cb('101', 'sha9')  # must return normally
+
+        f.scheduler.set_task_status.assert_awaited_once_with('101', 'pending')
+        # UNCHANGED from step-11 — this remediation must not silently relax
+        # either contract:
+        f.scheduler.mark_done.assert_not_awaited()
+        assert outbox.lookup('101') is not None, (
+            'the write-ahead row must still survive a withholding'
+        )
+        cast(AsyncMock, f.wf.git_ops.release_lane_for_terminal_task).assert_not_awaited()
+
+        blob = '\n'.join(r.getMessage() for r in caplog.records)
+        assert _DC_TRAIN in blob, f'WARNING must name the train: {blob!r}'
+        assert '101' in blob, f'WARNING must name the member: {blob!r}'
+        assert reason in blob, f'WARNING must name the block reason: {blob!r}'
+
+    async def test_revert_failure_is_swallowed_not_raised(self, caplog):
+        """A FAILED recovery edge must never become a TRAIN_PARTIAL_FLIP."""
+        f, cb = await _armed_member_callback()
+        f.scheduler.set_task_status = AsyncMock(
+            side_effect=RuntimeError('scheduler down'),
+        )
+        prov = MagicMock()
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.workflow'), \
+                patch(_GATE_TARGET, AsyncMock(return_value=_dc_block('failed'))), \
+                patch(_PROV_TARGET, prov):
+            await cb('101', 'sha9')  # must NOT raise
+
+        f.scheduler.set_task_status.assert_awaited_once_with('101', 'pending')
+        f.scheduler.mark_done.assert_not_awaited()
+        prov.consume.assert_not_called()
+
+        blob = '\n'.join(r.getMessage() for r in caplog.records)
+        assert '101' in blob
+        assert 'merge-deferred' in blob, (
+            f'a failed revert must say the member is left parked: {blob!r}'
+        )
+
+    # --- row 2: all_delivered -> byte-identical flip, in order -------------
+
+    async def test_all_delivered_flips_then_consumes_then_releases(self):
+        """mark_done -> MergeProvenance.consume -> lane release, unchanged."""
+        order: list[str] = []
+        f, cb = await _armed_member_callback()
+
+        f.scheduler.mark_done = AsyncMock(
+            side_effect=lambda *a, **k: order.append('mark_done'),
+        )
+        f.wf.git_ops.release_lane_for_terminal_task = AsyncMock(
+            side_effect=lambda *a, **k: order.append('release'),
+        )
+        prov = MagicMock()
+        prov.consume = MagicMock(side_effect=lambda mid: order.append('consume'))
+
+        with patch(_GATE_TARGET, AsyncMock(return_value=None)), \
+                patch(_PROV_TARGET, prov):
+            await cb('101', 'sha9')
+
+        assert order == ['mark_done', 'consume', 'release'], (
+            f'ordering must be byte-identical to today, got {order!r}'
+        )
+        call = f.scheduler.mark_done.await_args
+        assert call is not None
+        assert call.args[0] == '101'
+        assert call.kwargs['kind'] == 'merged'
+        assert call.kwargs['sha'] == 'sha9'
+        assert call.kwargs['note'] == f'train {_DC_TRAIN}'
+        prov.consume.assert_called_once_with('101')
+
+    # --- row 3: no delivered_checks -> unchanged (the common case) --------
+
+    async def test_check_less_member_flips_unchanged(self):
+        """Real (inert) helper: a member declaring no checks flips as today."""
+        f, cb = await _armed_member_callback(member_metadata={})
+
+        await cb('101', 'sha9')
+
+        f.scheduler.mark_done.assert_awaited_once()
+        assert f.scheduler.mark_done.await_args.kwargs['kind'] == 'merged'
+        cast(AsyncMock, f.wf.git_ops.release_lane_for_terminal_task).assert_awaited_once_with('101')
+
+    # --- rows 4 & 5: fail-safe blocks withhold identically ----------------
+
+    @pytest.mark.parametrize('reason', ['errored', 'main_sha_unresolved'])
+    async def test_fail_safe_blocks_withhold_and_revert_to_pending(
+        self, reason: str,
+    ):
+        """A malformed check descriptor ERRORs forever, so the fail-safe arms
+        are exactly where a silent park becomes a permanent wedge.  They take
+        the SAME recovery edge as ``failed``."""
+        f, cb = await _armed_member_callback()
+        prov = MagicMock()
+
+        with patch(_GATE_TARGET, AsyncMock(return_value=_dc_block(reason))), \
+                patch(_PROV_TARGET, prov):
+            await cb('101', 'sha9')
+
+        f.scheduler.mark_done.assert_not_awaited()
+        f.scheduler.set_task_status.assert_awaited_once_with('101', 'pending')
+        prov.consume.assert_not_called()
+        cast(AsyncMock, f.wf.git_ops.release_lane_for_terminal_task).assert_not_awaited()
+
+    # --- row 6: kill switch DISARMS the seam, pre-read included -----------
+
+    async def test_kill_switch_short_circuits_before_the_metadata_read(self):
+        """Retargeted by the task 3057 review.
+
+        This previously pinned that `enabled` is merely FORWARDED to the
+        shared gate and short-circuits nowhere locally. Correct for the
+        self-task seams, wrong here: this seam reads the MEMBER's row first,
+        and that read's fail-safe arms withhold without ever reaching the
+        gate — so forwarding alone could not disarm the seam. See
+        `test_kill_switch_disarms_the_metadata_pre_read`.
+        """
+        guard = AsyncMock(return_value=None)
+        f, cb = await _armed_member_callback(enabled=False)
+
+        with patch(_GATE_TARGET, guard):
+            await cb('101', 'sha9')
+
+        f.scheduler.mark_done.assert_awaited_once()
+        guard.assert_not_awaited()
+        f.scheduler.get_task.assert_not_called()
+        f.scheduler.set_task_status.assert_not_awaited()
+
+    @pytest.mark.parametrize('mode', ['none', 'raises'])
+    async def test_kill_switch_disarms_the_metadata_pre_read(self, mode: str):
+        """A disarmed fleet must reproduce pre-3057 behaviour EXACTLY.
+
+        With the kill switch off, an unreadable/absent member row must not
+        withhold the stamp nor revert the member to pending.
+        """
+        get_task = (
+            AsyncMock(return_value=None) if mode == 'none'
+            else AsyncMock(side_effect=RuntimeError('scheduler down'))
+        )
+        f, cb = await _armed_member_callback(enabled=False, get_task=get_task)
+        prov = MagicMock()
+
+        with patch(_PROV_TARGET, prov):
+            await cb('101', 'sha9')
+
+        get_task.assert_not_awaited()
+        f.scheduler.mark_done.assert_awaited_once()
+        assert f.scheduler.mark_done.await_args.kwargs['kind'] == 'merged'
+        prov.consume.assert_called_once_with('101')
+        f.scheduler.set_task_status.assert_not_awaited()
+
+    async def test_kill_switch_with_real_helper_flips_as_today(self):
+        f, cb = await _armed_member_callback(enabled=False)
+
+        await cb('101', 'sha9')
+
+        f.scheduler.mark_done.assert_awaited_once()
+
+    # --- plumbing: ONE metadata round-trip per member ---------------------
+
+    async def test_member_metadata_is_read_once_and_forwarded(self):
+        """The MEMBER's id and metadata reach the helper (never the tip's)."""
+        member_meta = {
+            'delivered_checks': [_DC_CHECK], 'train': {'id': _DC_TRAIN, 'order': 0},
+        }
+        get_task = AsyncMock(return_value={'id': '101', 'metadata': member_meta})
+        guard = AsyncMock(return_value=None)
+        f, cb = await _armed_member_callback(get_task=get_task)
+
+        with patch(_GATE_TARGET, guard):
+            await cb('101', 'sha9')
+
+        get_task.assert_awaited_once_with('101')
+        guard.assert_awaited_once()
+        assert guard.await_args is not None
+        assert guard.await_args.args[0] == '101', 'must gate on the MEMBER id'
+        assert guard.await_args.args[1] == member_meta
+        assert guard.await_args.kwargs['site'] == 'workflow-train-member-merged'
+        assert guard.await_args.kwargs['project_root'] == str(
+            f.wf.config.project_root,
+        ), 'checks evaluate the committed tree at main, not the worktree'
+
+    # --- fail-safe in ALL directions: unknown metadata withholds ----------
+
+    @pytest.mark.parametrize('mode', ['none', 'raises'])
+    async def test_unreadable_member_metadata_withholds_without_raising(
+        self, mode: str,
+    ):
+        """Never stamp on unknown metadata — and never propagate out of the
+        closure (the merge worker would read a raise as TRAIN_PARTIAL_FLIP)."""
+        get_task = (
+            AsyncMock(return_value=None) if mode == 'none'
+            else AsyncMock(side_effect=RuntimeError('scheduler down'))
+        )
+        f, cb = await _armed_member_callback(get_task=get_task)
+        prov = MagicMock()
+
+        with patch(_PROV_TARGET, prov):
+            await cb('101', 'sha9')  # must not raise
+
+        f.scheduler.mark_done.assert_not_awaited()
+        prov.consume.assert_not_called()
+        # The fail-safe withholds need the recovery edge too — a silent park
+        # here is the same permanent wedge.
+        f.scheduler.set_task_status.assert_awaited_once_with('101', 'pending')
+
+    async def test_guard_exception_withholds_without_raising(self):
+        """A raise from the guard itself is swallowed into a withholding: a
+        capability check must never be ABLE to fabricate a TRAIN_PARTIAL_FLIP."""
+        f, cb = await _armed_member_callback()
+
+        with patch(_GATE_TARGET, AsyncMock(side_effect=RuntimeError('boom'))):
+            await cb('101', 'sha9')  # must not raise
+
+        f.scheduler.mark_done.assert_not_awaited()
+        f.scheduler.set_task_status.assert_awaited_once_with('101', 'pending')

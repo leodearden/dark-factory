@@ -1,0 +1,3309 @@
+"""Discrete-event Monte-Carlo of the dark-factory merge lane, gate 10069.
+
+Extends /tmp/8528-study/model/engine.py (copied here as engine_orig.py): same
+frontier mechanics (2 hosts, K in-flight entries stacked speculatively, strict
+in-order landing, a red entry at the head tears down everything behind it),
+plus: policy-chosen entries, false failures, main-red episodes, closed-loop
+arrivals, per-category verify-time accounting, and the T / T+ / J / O policies.
+Time unit: hours.
+"""
+import heapq
+import math
+import random
+from collections import deque
+
+import numpy as np
+
+TABLE_OLD = ((0.93, 8), (0.85, 4), (0.75, 2))
+TABLE_NEW = ((0.992, 12), (0.990, 11), (0.988, 10), (0.984, 9), (0.979, 8),
+             (0.972, 7), (0.959, 6), (0.934, 5), (0.876, 4), (0.75, 3))
+
+DUR = {  # (green median min, red median min, lognormal sigma)
+    'W1': (43.0, 35.0, 0.30),
+    'W2': (75.0, 61.0, 0.30),
+    'W0': (25.0, 30.0, 0.40),
+    'DET': (43.0, 43.0, 0.0),
+}
+
+CATS = ('land', 'block', 'ownred', 'ff', 'mr', 'inh', 'torn', 'stale', 'adopt', 'noev')
+
+
+class Req:
+    __slots__ = ('id', 'arr', 'high', 'bad', 'cls', 'state', 'reserved',
+                 'done_t', 'outcome', 'backlog', 'n_verifies', 'own_verified', 'solo_only', 'unscan')
+
+    def __init__(self, rid, arr, high, bad, cls, backlog):
+        self.id = rid
+        self.arr = arr
+        self.high = high
+        self.bad = bad
+        self.cls = cls
+        self.state = 'buf'
+        self.reserved = False
+        self.done_t = None
+        self.outcome = None
+        self.backlog = backlog
+        self.n_verifies = 0
+        self.own_verified = False
+        self.solo_only = False
+        self.unscan = False
+
+
+class Entry:
+    __slots__ = ('eid', 'owner', 'members', 'basis', 'kind', 'pred', 'meta',
+                 'own_bad', 'tree_bad', 'tree', 'ahead', 'mr', 'status',
+                 'result', 'cause', 't0', 't1', 'ver', 'c3', 'landed',
+                 'base', 'deps', 'stale', 'gone', 'on_main', 'adopted', 'accident')
+
+    def __init__(self, eid):
+        self.eid = eid
+        self.status = 'run'
+        self.result = None
+        self.cause = None
+        self.ver = 0
+        self.landed = False
+        self.t1 = None
+        self.base = []      # live entries whose members are in this entry's tested tree
+        self.deps = set()   # entries whose failure kills this entry's base
+        self.stale = False  # an entry outside the tree landed after this one was built
+        self.gone = False   # left the frontier
+        self.on_main = False
+        self.adopted = None  # 'cancel' / 'override': landed on the authority of a green tree that contains it
+        self.accident = False
+
+
+def table_row(p, table):
+    for thr, d in table:
+        if p >= thr:
+            return d
+    return 1
+
+
+def window_estimate(win):
+    if not win:
+        return None
+    passes = sum(1 for _, p in win if p)
+    mean_d = sum(d for d, _ in win) / len(win)
+    return (passes / len(win)) ** (1.0 / mean_d)
+
+
+def table_depth(win, table):
+    est = window_estimate(win)
+    if est is None:
+        return table[0][1], 'NO_EST', None
+    return table_row(est, table), 'PASS_EST', est
+
+
+# ------------------------------------------------------------------ policies
+class Policy:
+    name = 'base'
+    mr_fix = False
+
+    def reset(self):
+        pass
+
+    def excluded(self, rid):
+        return False
+
+    def decide(self, eng, X, c3):
+        return 1, None, ()
+
+    def next_entry(self, eng):
+        """Today's shape: the lane picks X, the policy sizes the chain."""
+        X, src = eng.pick()
+        if X is None:
+            return None
+        spec = len(eng.inflight) > 0
+        c3 = (not spec) if src == 'park' else True
+        out = self.decide(eng, X, c3)
+        d, basis, snap = out[0], out[1], out[2]
+        links = list(snap[:d - 1]) if d >= 2 else []
+        ent = dict(members=[X.id] + links, basis=basis, c3=c3, popped=True)
+        if len(out) > 3 and out[3] is not None:
+            ent['pred'] = out[3] ** len(ent['members'])
+        return ent
+
+    def on_return(self, eng, e, result):
+        pass
+
+    def on_fail(self, eng, e):
+        pass
+
+    def on_applied(self, eng, e, outcome):
+        pass
+
+    def on_bounce(self, eng, e):
+        pass
+
+    def on_scan(self, eng, e, blocked, goods, base_bad):
+        pass
+
+    def on_alone(self, eng, ids, why):
+        pass
+
+    def want_scan(self, eng, e):
+        return True
+
+    def on_retire(self, rid, outcome):
+        pass
+
+    def on_restart(self, eng):
+        self.reset()
+
+    def tick(self, eng):
+        pass
+
+
+class Off(Policy):
+    name = 'OFF'
+
+
+class MainPolicy(Policy):
+    """8528 rules (i): MARK + halving, chain_cap (validation only)."""
+
+    def __init__(self, name='M', cap=6):
+        self.name = name
+        self.cap = cap
+        self.reset()
+
+    def reset(self):
+        self.MARK = set()
+        self.H = None
+
+    def excluded(self, rid):
+        return rid in self.MARK
+
+    def decide(self, eng, X, c3):
+        if not c3:
+            return 1, None, ()
+        if X.id in self.MARK:
+            return 1, 'MARKED', ()
+        snap = eng.snapshot(self.cap - 1)
+        d = min(1 + len(snap), self.cap, self.H if self.H is not None else 10 ** 6)
+        return d, 'MAIN', snap
+
+    def on_return(self, eng, e, result):
+        L = e.members
+        if len(L) >= 2:
+            if result == 'pass':
+                self.H = None
+            else:
+                self.H = max(1, len(L) // 2)
+                self.MARK.update(L)
+        elif result == 'pass' and e.c3 and self.H is not None:
+            self.H = None
+
+    def on_retire(self, rid, outcome):
+        self.MARK.discard(rid)
+
+
+class TPolicy(Policy):
+    """TODAY and its evidence fixes.
+
+    fold_at='return'  : the pass-estimate window takes a sized round's verdict
+                        at verify return (worker.py::_note_tip_result);
+            'applied' : 8528-study policy I (validation).
+    fix_i   : a red whose tree held unlanded entries ahead is provisional until
+              they resolve; void (no mark, no fold) when one does not land.
+    mr_fix  : reds returned during a detected main-red episode are void.
+    persist : marks survive restarts.
+    static_depth : a fixed depth instead of the rolling estimate.
+    pool    : pick and members in arrival (pool) order with no park rule.
+    """
+
+    def __init__(self, name='T', table=TABLE_NEW, fold_at='return', fix_i=False,
+                 mr_fix=False, persist=False, static_depth=None, pool=False,
+                 unmark=False, seq=False, elim=False):
+        self.name = name
+        self.table = table
+        self.fold_at = fold_at
+        self.fix_i = fix_i
+        self.mr_fix = mr_fix
+        self.persist = persist
+        self.static_depth = static_depth
+        self.pool = pool
+        # three bookkeeping rules over the member sets of confirmed red chains
+        # (no probabilities): unmark the rest once one member is blocked; test
+        # one member of a set at a time; block the last one left when every
+        # other member has landed.
+        self.unmark = unmark
+        self.seq = seq
+        self.elim = elim
+        self.reset()
+
+    def reset(self):
+        self.MARK = set()
+        self.WIN = deque(maxlen=30)
+        self.PROV = {}
+        self.HOLD = {}
+        self.G = {}
+        self.GM = {}
+        self.gid = 0
+
+    def on_restart(self, eng):
+        if not self.persist:
+            self.MARK = set()
+            self.G = {}
+            self.GM = {}
+
+    def excluded(self, rid):
+        return rid in self.MARK or rid in self.HOLD
+
+    def _depth(self):
+        if self.static_depth is not None:
+            return self.static_depth, 'STATIC', None
+        return table_depth(self.WIN, self.table)
+
+    def decide(self, eng, X, c3):
+        if not c3 or self.excluded(X.id):
+            return 1, None, ()
+        rd, basis, est = self._depth()
+        snap = eng.snapshot(rd - 1) if rd > 1 else ()
+        return min(rd, 1 + len(snap)), basis, snap, est
+
+    def next_entry(self, eng):
+        if not self.pool:
+            return Policy.next_entry(self, eng)
+        W = eng.waiting()
+        if not W:
+            return None
+        deferred = None
+        for X in W:
+            if self.excluded(X.id):
+                if self.seq and (X.id in self.HOLD or self._busy(eng, X.id)):
+                    if deferred is None:
+                        deferred = X
+                    continue
+                return dict(members=[X.id], basis=None, c3=True)
+            rd, basis, est = self._depth()
+            links = []
+            if rd > 1:
+                for r in W:
+                    if r.id != X.id and not self.excluded(r.id):
+                        links.append(r.id)
+                        if len(links) >= rd - 1:
+                            break
+            ent = dict(members=[X.id] + links, basis=basis, c3=True)
+            if est is not None:
+                ent['pred'] = est ** len(ent['members'])
+            return ent
+        if deferred is not None:
+            return dict(members=[deferred.id], basis=None, c3=True)
+        return None
+
+    def _busy(self, eng, rid):
+        gs = self.GM.get(rid)
+        if not gs:
+            return False
+        for e in eng.inflight:
+            if e.status == 'run' and len(e.members) == 1 and e.owner != rid:
+                og = self.GM.get(e.owner)
+                if og and (og & gs):
+                    return True
+        return False
+
+    def tick(self, eng):
+        if not self.elim:
+            return
+        again = True
+        while again:
+            again = False
+            for g, grp in list(self.G.items()):
+                if len(grp) == 1:
+                    (m,) = grp
+                    r = eng.reqs[m]
+                    if m in self.MARK and r.state in ('buf', 'park') and not r.reserved:
+                        eng.convict(m)
+                        again = True
+                        break
+
+    def _confirm(self, eng, members, sized, n, chain):
+        if chain:
+            alive = [m for m in members if eng.alive(m)]
+            self.MARK.update(alive)
+            if (self.unmark or self.seq or self.elim) and alive:
+                g = self.gid
+                self.gid += 1
+                self.G[g] = set(alive)
+                for m in alive:
+                    self.GM.setdefault(m, set()).add(g)
+        if sized and self.fold_at == 'return':
+            self.WIN.append((n, False))
+
+    def _release(self, members):
+        for m in members:
+            c = self.HOLD.get(m, 0) - 1
+            if c <= 0:
+                self.HOLD.pop(m, None)
+            else:
+                self.HOLD[m] = c
+
+    def on_return(self, eng, e, result):
+        sized = e.basis is not None
+        n = len(e.members)
+        chain = n >= 2
+        if result == 'pass':
+            if sized and self.fold_at == 'return':
+                self.WIN.append((n, True))
+            return
+        if not self.fix_i:
+            self._confirm(eng, e.members, sized, n, chain)
+            return
+        pending = set()
+        for a in e.ahead:
+            if a.landed:
+                continue
+            if a.status in ('vac', 'dead') or (a.status == 'ret' and a.result != 'pass'):
+                return  # an entry ahead failed: this red is void
+            pending.add(a.eid)
+        if not pending:
+            self._confirm(eng, e.members, sized, n, chain)
+            return
+        held = list(e.members) if chain else []
+        for m in held:
+            self.HOLD[m] = self.HOLD.get(m, 0) + 1
+        self.PROV[e.eid] = [list(e.members), pending, sized, n, chain, held]
+
+    def on_fail(self, eng, e):
+        if not self.PROV:
+            return
+        for k in [k for k, v in self.PROV.items() if e.eid in v[1]]:
+            v = self.PROV.pop(k)
+            self._release(v[5])
+
+    def on_applied(self, eng, e, outcome):
+        if self.fold_at == 'applied':
+            if e.basis is not None:
+                self.WIN.append((len(e.members), outcome == 'pass'))
+            return
+        if outcome == 'pass' and self.PROV:
+            for k in [k for k, v in self.PROV.items() if e.eid in v[1]]:
+                v = self.PROV[k]
+                v[1].discard(e.eid)
+                if not v[1]:
+                    del self.PROV[k]
+                    self._release(v[5])
+                    self._confirm(eng, v[0], v[2], v[3], v[4])
+
+    def on_bounce(self, eng, e):
+        self.MARK.discard(e.owner)
+
+    def on_retire(self, rid, outcome):
+        self.MARK.discard(rid)
+        self.HOLD.pop(rid, None)
+        gs = self.GM.pop(rid, None)
+        if not gs:
+            return
+        for g in gs:
+            grp = self.G.get(g)
+            if grp is None:
+                continue
+            grp.discard(rid)
+            if outcome != 'landed' and self.unmark:
+                for m in grp:   # the culprit is found: the rest are no longer held alone
+                    ms = self.GM.get(m)
+                    if ms:
+                        ms.discard(g)
+                        if not ms:
+                            del self.GM[m]
+                            self.MARK.discard(m)
+                del self.G[g]
+            elif not grp:
+                del self.G[g]
+
+
+class Oracle(Policy):
+    """Bound: never puts a bad request in a batch; a bad one is verified alone."""
+    mr_fix = True
+
+    def __init__(self, cap=12, name=None):
+        self.cap = cap
+        self.name = name or 'O%d' % cap
+
+    def next_entry(self, eng):
+        W = eng.waiting()
+        if not W:
+            return None
+        X = W[0]
+        if X.bad:
+            return dict(members=[X.id], basis='ORACLE', kind='solo')
+        links = [r.id for r in W[1:] if not r.bad][:self.cap - 1]
+        return dict(members=[X.id] + links, basis='ORACLE', kind='clean')
+
+
+# ------------------------------------------------------------------ follow-up cost model
+_FU = {}
+
+
+def split_size(m, g, mode, tau):
+    """How many of m iid items (P(good) = g, at least one bad) the next test takes."""
+    if mode == 'one' or m <= 1:
+        return 1
+    tot = 1.0 - g ** m
+    best, bd = 1, None
+    for s in range(1, m):
+        p = g ** s * (1.0 - g ** (m - s)) / tot
+        d = abs(p - tau)
+        if bd is None or d < bd - 1e-12:
+            best, bd = s, d
+    return best
+
+
+def followup(m, g, mode='one', tau=0.5, elim=True):
+    """Expected (verifies, landings, items resolved) to work through m iid items known to
+    hold at least one bad one: test a prefix (one item, or the prefix whose pass chance
+    is nearest tau); a passing prefix lands and the rest still holds a bad one; a red
+    prefix keeps the bad one and RELEASES the rest; a red single is blocked by its own
+    verify; the last item left is blocked with no verify when elim is on."""
+    key = (m, g, mode, tau, elim)
+    v = _FU.get(key)
+    if v is not None:
+        return v
+    if m <= 0 or 1.0 - g ** m < 1e-12:
+        v = (0.0, 0.0, 0.0)
+    elif m == 1:
+        v = (0.0, 0.0, 1.0) if elim else (1.0, 0.0, 1.0)
+    else:
+        s = split_size(m, g, mode, tau)
+        p = g ** s * (1.0 - g ** (m - s)) / (1.0 - g ** m)
+        V1, L1, R1 = followup(m - s, g, mode, tau, elim)
+        if s == 1:
+            V2, L2, R2 = 0.0, 0.0, 1.0
+        else:
+            V2, L2, R2 = followup(s, g, mode, tau, elim)
+        v = (1.0 + p * V1 + (1.0 - p) * V2, p * (s + L1) + (1.0 - p) * L2, p * (s + R1) + (1.0 - p) * R2)
+    _FU[key] = v
+    return v
+
+
+def followup_ff(m, g, mode='one', tau=0.5, elim=True):
+    """Same walk when every one of the m items is in fact good (a false failure)."""
+    key = ('ff', m, g, mode, tau, elim)
+    v = _FU.get(key)
+    if v is not None:
+        return v
+    if m <= 0:
+        v = (0.0, 0.0)
+    elif m == 1:
+        v = (0.0, 0.0) if elim else (1.0, 1.0)
+    else:
+        s = split_size(m, g, mode, tau)
+        V1, L1 = followup_ff(m - s, g, mode, tau, elim)
+        v = (1.0 + V1, s + L1)
+    _FU[key] = v
+    return v
+
+
+def cycle_ratio(k, q, e=0.0, mode='one', tau=0.5, elim=True, per='landing'):
+    """No-stacking cost of batch depth k at prevalence q: verifies per landing (or per item
+    resolved) of [one batch verify + the follow-up when it is red]."""
+    g = 1.0 - q
+    G = g ** k
+    V, L, R = followup(k, g, mode, tau, elim)
+    Vf, Lf = followup_ff(k, g, mode, tau, elim)
+    num = 1.0 + (1.0 - G) * V + e * G * Vf
+    land = (1.0 - e) * G * k + (1.0 - G) * L + e * G * Lf
+    if per == 'landing':
+        return num / land
+    return num / ((1.0 - e) * G * k + (1.0 - G) * R + e * G * k)
+
+
+# ------------------------------------------------------------------ belief
+_HCACHE = {}
+
+
+def _bits(n):
+    v = _HCACHE.get(n)
+    if v is None:
+        H = np.arange(1 << n, dtype=np.int64)
+        v = (H, [((H >> i) & 1).astype(bool) for i in range(n)])
+        _HCACHE[n] = v
+    return v
+
+
+def exact_posterior(priors, obs_masks, obs_miss):
+    """Exact enumeration over the 2^n bad-sets of one suspect group.
+
+    priors[i]    prior P(bad) of variable i
+    obs_masks[k] bitmask of the variables in red observation k
+    obs_miss[k]  P(the observation is red | none of its variables is bad)
+    Returns (weights over hypotheses, Z, marginals P(bad_i | observations)).
+    """
+    n = len(priors)
+    H, bits = _bits(n)
+    w = np.ones(1 << n)
+    for i, p in enumerate(priors):
+        w = w * np.where(bits[i], p, 1.0 - p)
+    for mask, miss in zip(obs_masks, obs_miss):
+        w = w * np.where((H & mask) != 0, 1.0, miss)
+    Z = float(w.sum())
+    marg = [float(w[bits[i]].sum()) / Z for i in range(n)]
+    return w, Z, marg
+
+
+class Belief:
+    """Red observations over unlanded requests, and what they imply.
+
+    A pass observation clears every request in its tree (a tree holding a bad
+    request never passes).  A red observation is the set of its tree's
+    requests not yet known good; each one is independent evidence (a sound
+    tree is red with probability e).  Requests linked by shared observations
+    form a group; the posterior over a group's bad-sets is enumerated exactly.
+
+    prune='cap'    : exact while a group has at most `cap` requests; a larger
+                     group first sheds observations that are strict supersets
+                     of another (they add little once the smaller one stands),
+                     then its lowest-priority requests leave the enumeration
+                     (`overflow`: marginalised at their prior, verified alone).
+    prune='always' : supersets and duplicates are always shed (exact at e = 0).
+    """
+
+    def __init__(self, prior_of, e_pol, cap=16, prune='cap', single=False):
+        self.prior_of = prior_of
+        self.e = e_pol
+        self.cap = cap
+        self.prune = prune
+        self.single = single   # a group above the cap made of ONE observation set is solved in closed form
+        self.boosts = {}       # observation id -> (request, likelihood ratio that it is the defective one)
+        self.obs = {}
+        self.next_id = 0
+        self.cleared = set()
+        self.dirty = True
+        self.comp_of = {}
+        self.overflow = set()
+        self.n_builds = 0
+        self.max_group = 0
+        self.n_shed = 0
+
+    @staticmethod
+    def _minimal(sets):
+        out = []
+        for o in sorted(set(sets), key=len):
+            if not any(k <= o for k in out):
+                out.append(o)
+        return out
+
+    def add_red(self, ids):
+        s = frozenset(i for i in ids if i not in self.cleared)
+        if not s:
+            return None
+        oid = self.next_id
+        self.next_id += 1
+        self.obs[oid] = s
+        self.dirty = True
+        return oid
+
+    def add_pass(self, ids):
+        ids = set(ids)
+        self.cleared |= ids
+        self._known_good(ids)
+
+    def _known_good(self, ids):
+        for oid, o in list(self.obs.items()):
+            if o & ids:
+                o2 = o - ids
+                if o2:
+                    self.obs[oid] = o2
+                else:
+                    del self.obs[oid]
+                self.dirty = True
+
+    def landed(self, rid):
+        self.cleared.discard(rid)
+        self._known_good({rid})
+
+    def blocked(self, rid):
+        self.cleared.discard(rid)
+        for oid in [k for k, o in self.obs.items() if rid in o]:
+            del self.obs[oid]
+            self.dirty = True
+
+    def drop(self, oid):
+        if self.obs.pop(oid, None) is not None:
+            self.dirty = True
+
+    @staticmethod
+    def _groups(sets):
+        parent = {}
+
+        def find(x):
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        for o in sets:
+            it = iter(o)
+            a = next(it)
+            parent.setdefault(a, a)
+            for b in it:
+                parent.setdefault(b, b)
+                ra, rb = find(a), find(b)
+                if ra != rb:
+                    parent[rb] = ra
+        groups = {}
+        for o in sets:
+            groups.setdefault(find(next(iter(o))), []).append(o)
+        return list(groups.values())
+
+    def _rebuild(self):
+        self.dirty = False
+        self.comp_of = {}
+        self.overflow = set()
+        if not self.obs:
+            self.boosts = {}
+            return
+        lr = {}
+        if self.boosts:
+            for oid in [k for k in self.boosts if k not in self.obs]:
+                del self.boosts[oid]
+            for oid, (N, x) in self.boosts.items():
+                if N in self.obs[oid]:
+                    lr[N] = lr.get(N, 1.0) * x
+
+        def pe(v):
+            p = self.prior_of(v)
+            x = lr.get(v)
+            return p if x is None else p * x / (p * x + 1.0 - p)
+
+        sets = list(self.obs.values())
+        if self.prune == 'always':
+            sets = self._minimal(sets)
+        todo = self._groups(sets)
+        final = []
+        singles = []
+        while todo:
+            obl = todo.pop()
+            vars_ = set().union(*obl)
+            if len(vars_) > self.cap:
+                uniq = set(obl)
+                if self.single and len(uniq) == 1:
+                    singles.append((sorted(vars_), len(obl)))
+                    continue
+                shed = None
+                for o in sorted(uniq, key=len, reverse=True):
+                    if any(k < o for k in uniq):
+                        shed = o
+                        break
+                if shed is not None:
+                    self.n_shed += 1
+                    todo.extend(self._groups([o for o in obl if o != shed]))
+                    continue
+            final.append((sorted(vars_), obl))
+        for vars_, obl in final:
+            self.max_group = max(self.max_group, len(vars_))
+            keep = vars_[:self.cap]
+            out = set(vars_[self.cap:])
+            self.overflow |= out
+            idx = {v: i for i, v in enumerate(keep)}
+            agg = {}
+            for o in obl:
+                m = 0
+                good = 1.0
+                for v in o:
+                    if v in idx:
+                        m |= 1 << idx[v]
+                    else:
+                        good *= 1.0 - pe(v)
+                if m:
+                    miss = 1.0 - (1.0 - self.e) * good
+                    agg[m] = agg.get(m, 1.0) * miss
+            w, Z, marg = exact_posterior([pe(v) for v in keep], list(agg.keys()), list(agg.values()))
+            self.n_builds += 1
+            comp = dict(vars=keep, idx=idx, w=w, Z=Z, marg=marg, qc={}, H=_bits(len(keep))[0])
+            for v in keep:
+                self.comp_of[v] = comp
+        for vars_, k in singles:
+            # one red observation over n requests, seen k times: P(M good | red) =
+            # (G_M - (1 - e^k) G_all) / (1 - (1 - e^k) G_all)
+            self.max_group = max(self.max_group, len(vars_))
+            g = [1.0 - pe(v) for v in vars_]
+            Gall = 1.0
+            for x in g:
+                Gall *= x
+            c1 = (1.0 - self.e ** k) * Gall
+            comp = dict(vars=vars_, idx={v: i for i, v in enumerate(vars_)}, single=True, g=g, c1=c1,
+                        Z=1.0 - c1, qc={})
+            comp['marg'] = [1.0 - (x - c1) / comp['Z'] for x in g]
+            self.n_builds += 1
+            for v in vars_:
+                self.comp_of[v] = comp
+
+    def comp(self, rid):
+        if self.dirty:
+            self._rebuild()
+        return self.comp_of.get(rid)
+
+    def p_bad(self, rid):
+        if rid in self.cleared:
+            return 0.0
+        c = self.comp(rid)
+        if c is None:
+            return self.prior_of(rid)
+        return c['marg'][c['idx'][rid]]
+
+    def _q(self, comp, mask):
+        v = comp['qc'].get(mask)
+        if v is None:
+            if comp.get('single'):
+                GM, g, mm = 1.0, comp['g'], mask
+                while mm:
+                    low = mm & -mm
+                    GM *= g[low.bit_length() - 1]
+                    mm ^= low
+                v = (GM - comp['c1']) / comp['Z']
+            else:
+                v = float(comp['w'][(comp['H'] & mask) == 0].sum()) / comp['Z']
+            comp['qc'][mask] = v
+        return v
+
+    def p_good(self, ids):
+        """P(every request in ids is good | observations)."""
+        if self.dirty:
+            self._rebuild()
+        p = 1.0
+        masks = {}
+        for rid in ids:
+            if rid in self.cleared:
+                continue
+            c = self.comp_of.get(rid)
+            if c is None:
+                p *= 1.0 - self.prior_of(rid)
+            else:
+                k = id(c)
+                if k in masks:
+                    masks[k][1] |= 1 << c['idx'][rid]
+                else:
+                    masks[k] = [c, 1 << c['idx'][rid]]
+        for c, m in masks.values():
+            p *= self._q(c, m)
+        return p
+
+    def variables(self):
+        if self.dirty:
+            self._rebuild()
+        return list(self.comp_of.keys())
+
+
+class JPolicy(Policy):
+    """Joint inference over failure evidence.
+
+    cap       : 'table' (table depth x cap_mult + cap_add), None (J-free), or an int.
+    depth_src : 'prior' table row at the batch's own per-item estimate; 'win' table row
+                at the lane's rolling tip estimate (last 30 clean-batch verdicts).
+    member    : 'rule' (n+1)P > nP under the cap; 'opt' J-opt, expected verifies per
+                landing of [this verify + follow-up if red + tear-down behind].
+    sus       : 'J1' solo in pool order; 'J1d' solo, one test per group at a time;
+                'J2' sub-batch nearest tau, one test per group at a time; 'J2p'
+                sub-batch, no waiting on the group's test in flight.
+    base_mode : 'B0' always stack on the tip; 'B1' build on main when the tip's tree is
+                risky (P(all its unlanded requests good) < base_x) or stale; 'B2' the
+                same for suspect verifies only.
+    nostack   : nothing is dispatched behind an unreturned suspect test (B3).
+    naming    : None; 'confirm' a request named by the failing test is verified alone
+                first and the rest of that observation is released; 'block' it is
+                blocked with no verify.
+    """
+    mr_fix = True
+
+    def __init__(self, name, prior, e_pol=0.01, theta=0.9, cap='table', sus='J1',
+                 tau=0.5, nostack=False, void_obj=False, table=TABLE_NEW,
+                 release=1.2, persist=True, prior_mode='lane', deadline_mult=2.0,
+                 convict=True, maxb=24, group_cap=16, clean_first=False,
+                 adaptive=0, cap_add=0, prune='cap', sticky=False,
+                 cap_mult=1, base_mode='B0', base_x=0.5, member='rule', opt_w=1.0,
+                 depth_src='prior', naming=None, single=True, opt_form='ratio', riders_free=False):
+        self.name = name
+        self.prior = prior
+        self.e_pol = e_pol
+        self.theta = theta
+        self.sus = sus
+        self.tau = tau
+        self.nostack = nostack
+        self.void_obj = void_obj
+        self.table = table
+        self.release = release
+        self.persist = persist
+        self.prior_mode = prior_mode
+        self.deadline_mult = deadline_mult
+        self.convict = convict
+        self.maxb = maxb
+        self.group_cap = group_cap
+        self.clean_first = clean_first
+        self.prune = prune
+        self.sticky = sticky          # a suspect stays one until it retires (mark-like)
+        self.adaptive = adaptive      # window (retirements) of the adaptive lane prior; 0 = fixed
+        self.cap_add = cap_add
+        self.cap_mult = cap_mult
+        self.base_mode = base_mode
+        self.base_x = base_x
+        self.member = member
+        self.opt_w = opt_w
+        self.depth_src = depth_src
+        self.naming = naming
+        self.single = single
+        self.riders_free = riders_free   # known-good requests join a batch without counting against its depth
+        self.opt_form = opt_form      # 'ratio' per-entry verifies/landing with the base's risk; 'ratio1' the same
+                                      # with the base taken as sound; 'marg' marginal cost against the lane's going rate
+        self.prior0 = prior
+        self.cap_mode = cap
+        self.table_d = table_row(1.0 - prior, table)
+        self.cap = maxb if cap in ('table', None) else cap
+        self.eng = None
+        self.stat = {}
+        self.reset()
+
+    def reset(self):
+        self.B = Belief(self._prior_of, self.e_pol, self.group_cap, self.prune, self.single)
+        self.since = {}
+        self.lpv_n = 0
+        self.lpv_l = 0
+        self.recent = deque(maxlen=self.adaptive or 1)
+        self.stuck = set()
+        self.named = {}
+        self.pending_block = set()
+        self.WIN = deque(maxlen=30)
+        self.rho_n = 0.0
+        self.rho_l = 0.0
+        self.prior = self.prior0
+        self.table_d = table_row(1.0 - self.prior, self.table)
+
+    def _prior_of(self, rid):
+        if self.prior_mode == 'class':
+            return self.eng.class_q[self.eng.reqs[rid].cls]
+        return self.prior
+
+    def on_restart(self, eng):
+        if not self.persist:
+            self.reset()
+
+    def _st(self, key, n=1):
+        if self.eng.t >= self.eng.warm:
+            self.stat[key] = self.stat.get(key, 0) + n
+
+    # ---- evidence
+    def on_return(self, eng, e, result):
+        self.eng = eng
+        R = eng.reqs
+        self.lpv_n += 1
+        self.rho_n = self.rho_n * 0.995 + 1.0
+        self.rho_l *= 0.995
+        if e.kind == 'clean':
+            self.WIN.append((len(e.members), result == 'pass'))
+        if result == 'pass':
+            alive = [m for m in e.tree if R[m].state != 'done']
+            self.B.add_pass(alive)
+            if self.named:
+                for m in alive:
+                    if m in self.named:
+                        self._name_passed(m)
+            return
+        ids = []
+        for m in e.tree:
+            r = R[m]
+            if r.outcome in ('blocked', 'convicted'):
+                return  # the red is already explained
+            if r.state != 'done':
+                ids.append(m)
+        oid = self.B.add_red(ids)
+        e.meta['obs'] = oid
+        N = e.meta.get('named')
+        if self.naming and N is not None and oid is not None and N in self.B.obs[oid]:
+            members = self.B.obs[oid]
+            self.named.setdefault(N, []).append(members)
+            self.B.drop(oid)           # every other member of the observation is released at once
+            e.meta['obs'] = None
+            e.meta['named_rec'] = (N, members)
+            if self.naming == 'block':
+                self.pending_block.add(N)
+
+    def _name_passed(self, N):
+        """The named request passed: fall back to the inference on what is left."""
+        R = self.eng.reqs
+        self.pending_block.discard(N)
+        for members in self.named.pop(N, ()):
+            ids = []
+            for m in members:
+                if m == N:
+                    continue
+                r = R[m]
+                if r.outcome in ('blocked', 'convicted'):
+                    ids = None
+                    break
+                if r.state != 'done':
+                    ids.append(m)
+            if ids:
+                self.B.add_red(ids)
+
+    def on_applied(self, eng, e, outcome):
+        if outcome == 'pass':
+            self.lpv_l += len(e.members)
+            self.rho_l += len(e.members)
+
+    def on_bounce(self, eng, e):
+        s = e.meta.get('obs')
+        if s is not None:
+            self.B.drop(s)
+        rec = e.meta.get('named_rec')
+        if rec is not None:
+            N, members = rec
+            lst = self.named.get(N)
+            if lst and members in lst:
+                lst.remove(members)
+                if not lst:
+                    del self.named[N]
+                    self.pending_block.discard(N)
+
+    def on_retire(self, rid, outcome):
+        self.since.pop(rid, None)
+        self.stuck.discard(rid)
+        if outcome == 'landed':
+            self.B.landed(rid)
+            if rid in self.named:
+                self._name_passed(rid)
+        else:
+            self.B.blocked(rid)
+            self.named.pop(rid, None)
+            self.pending_block.discard(rid)
+        if self.adaptive:
+            # lane prior = recent defect share, shrunk towards the long-run share
+            self.recent.append(outcome != 'landed')
+            k = 20.0
+            self.prior = (sum(self.recent) + k * self.prior0) / (len(self.recent) + k)
+            self.table_d = table_row(1.0 - self.prior, self.table)
+            self.B.dirty = True
+
+    def is_sus(self, rid):
+        B = self.B
+        if rid in self.stuck:
+            return True
+        if rid in B.cleared:
+            return False
+        c = B.comp(rid)
+        if c is None:
+            return rid in B.overflow
+        return c['marg'][c['idx'][rid]] > self.release * self._prior_of(rid)
+
+    def tick(self, eng):
+        """Blocks by name, conviction by elimination, then the suspect clocks."""
+        self.eng = eng
+        B = self.B
+        if self.pending_block:
+            for N in sorted(self.pending_block):
+                r = eng.reqs[N]
+                if r.state == 'done':
+                    self.pending_block.discard(N)
+                elif r.state in ('buf', 'park') and not r.reserved:
+                    self.pending_block.discard(N)
+                    eng.convict(N, 'named')
+        if self.convict:
+            again = True
+            while again:
+                again = False
+                for rid in B.variables():
+                    r = eng.reqs[rid]
+                    if r.state in ('buf', 'park') and not r.reserved and B.p_bad(rid) >= self.theta:
+                        if getattr(self, 'strict_conv', False) and not any(len(o) == 1 and rid in o for o in B.obs.values()):
+                            continue   # convict only the sole request left in a red observation
+                        eng.convict(rid)
+                        again = True
+                        break
+        live = set(self.stuck)
+        for rid in B.variables():
+            if self.is_sus(rid):
+                live.add(rid)
+                self.since.setdefault(rid, eng.t)
+                if self.sticky:
+                    self.stuck.add(rid)
+        for rid in B.overflow:
+            live.add(rid)
+            self.since.setdefault(rid, eng.t)
+        for rid in [k for k in self.since if k not in live]:
+            del self.since[rid]
+
+    # ---- choice
+    # P(pass) of an entry is the chance its TREE passes: every unlanded request
+    # it is built on plus its own members is good, times (1 - e_pol).
+    def _group_busy(self, eng, comp):
+        """A test of this group is in flight: an unreturned entry holds a request
+        of the group whose P(bad) is raised above release x prior."""
+        idx, marg = comp['idx'], comp['marg']
+        for e in eng.inflight:
+            if e.status == 'run':
+                for m in e.members:
+                    i = idx.get(m)
+                    if i is not None and marg[i] > self.release * self._prior_of(m):
+                        return True
+        return False
+
+    def _bases(self, eng):
+        """(base, T) for a clean entry and for a suspect entry; T is what the entry
+        would be built on, as the choice sees it."""
+        lin = eng.lineage()
+        T = [m for a in lin for m in a.members]
+        pT = self.B.p_good(T) if T else 1.0
+        tip = ('tip', [] if (T and pT < 1e-9) else T)   # a tip that cannot land: choose as if it were empty
+        if self.base_mode == 'B0' or not lin:
+            return tip, tip
+        risky = pT < self.base_x or any(a.stale for a in lin)
+        main = ('main', [])
+        if self.base_mode == 'B1':
+            return (main, main) if risky else (tip, tip)
+        return tip, (main if risky else tip)
+
+    def _entry(self, eng, members, kind, extra=None, base='tip'):
+        tree = set(members)
+        if base == 'tip':
+            for a in eng.lineage():
+                tree.update(a.members)
+        pred = (1.0 - self.e_pol) * self.B.p_good(tree)
+        ent = dict(members=members, basis='J', kind=kind, pred=pred, c3=True, base=base)
+        if extra:
+            ent.update(extra)
+        return ent
+
+    def _sus_entry(self, eng, X, W, bt, kind='sus'):
+        base, T = bt
+        B = self.B
+        comp = B.comp(X.id)
+        if comp is None or self.sus in ('J1', 'J1d'):
+            return self._entry(eng, [X.id], kind, None, base)
+        G = [r.id for r in W if r.id >= X.id and B.comp_of.get(r.id) is comp and self.is_sus(r.id)]
+        best_k, best_d = 1, None
+        for k in range(1, len(G) + 1):
+            d = abs((1.0 - self.e_pol) * B.p_good(T + G[:k]) - self.tau)
+            if best_d is None or d < best_d - 1e-12:
+                best_k, best_d = k, d
+            elif d > best_d + 0.2:
+                break
+        return self._entry(eng, G[:best_k], kind, None, base)
+
+    def _batch_stats(self, S, table_take, skipped):
+        if self.eng.t < self.eng.warm:
+            return
+        B = self.B
+        n, td = len(S), self.table_d
+        self._st('cb')
+        self._st('cb_n', n)
+        self._st('cb_lt' if n < td else ('cb_eq' if n == td else 'cb_gt'))
+        ncl = sum(1 for m in S if m in B.cleared)
+        self._st('cb_cleared', ncl)
+        if ncl:
+            self._st('cb_withcleared')
+        self._st('cb_implic_in', sum(1 for m in S if m not in B.cleared and m in B.comp_of))
+        if n - ncl < min(td, len(table_take)):
+            self._st('cb_fresh_lt')
+        elif n - ncl > td:
+            self._st('cb_fresh_gt')
+        for kind in skipped:
+            self._st('cb_skip_' + kind)
+
+    def _clean(self, eng, W, susset, bt):
+        """Walk the waiting requests in pool order; a candidate joins iff it
+        raises n * P(pass).  A candidate that is a suspect GIVEN the entries
+        ahead pass is passed over for this batch."""
+        base, T = bt
+        B = self.B
+        P0 = B.p_good(T) if T else 1.0
+        if self.void_obj:
+            v = (self.lpv_l / self.lpv_n) if self.lpv_n >= 20 else 1.5
+            charge = max(0, eng.K - 1 - len(eng.inflight)) * v
+        else:
+            charge = 0.0
+        cap = self.cap
+        by_table = self.cap_mode == 'table'
+        win_d = table_depth(self.WIN, self.table)[0] if self.depth_src == 'win' else None
+        S, P = [], P0
+        nrid = 0    # known-good riders taken outside the depth count (riders_free)
+        own = 1.0   # prior-or-cleared P(own members good), for the table's per-item estimate
+        table_take = []
+        passed_over = []
+        skipped = []
+        for r in W:
+            rid = r.id
+            if rid in susset:
+                continue
+            in_win = len(table_take) < self.table_d
+            if in_win:
+                table_take.append(rid)
+            if self.riders_free and rid in B.cleared:
+                if len(S) < self.maxb:
+                    S.append(rid)
+                    nrid += 1
+                continue
+            if len(S) - nrid >= cap:
+                if len(table_take) >= self.table_d:
+                    break
+                continue
+            if rid in B.cleared:
+                P2 = P
+                own2 = own
+            elif rid in B.comp_of:
+                if T and 1.0 - B.p_good(T + [rid]) / P0 > self.release * self._prior_of(rid):
+                    passed_over.append(r)
+                    if in_win:
+                        skipped.append('implic')
+                    continue
+                P2 = B.p_good(T + S + [rid])
+                own2 = own * (1.0 - B.p_bad(rid))
+            else:
+                P2 = P * (1.0 - self._prior_of(rid))
+                own2 = own * (1.0 - self._prior_of(rid))
+            n = len(S) - nrid
+            if by_table and n >= 1:
+                lim = win_d if win_d is not None else table_row(own2 ** (1.0 / (n + 1)), self.table)
+                if n + 1 > lim * self.cap_mult + self.cap_add:
+                    continue
+            if (n + 1) * P2 - (P0 - P2) * charge > n * P - (P0 - P) * charge:
+                S.append(rid)
+                P = P2
+                own = own2
+            elif in_win:
+                skipped.append('implic' if rid in B.comp_of else 'prior')
+        if not S:
+            if not passed_over:
+                return None
+            S = [passed_over[0].id]
+        Sset = set(S)
+        excl = any(t not in Sset for t in table_take)
+        self._batch_stats(S, table_take, skipped)
+        return self._entry(eng, S, 'clean', dict(tab_excl=excl, tab_n=len(table_take)), base)
+
+    # J-opt.  For a batch S of n members, m of them not already cleared, built on a
+    # base that lands as built with probability P_A:
+    #   G    = P(all of S good | base good)              (exact, from the posterior)
+    #   g    = G ** (1/m)                                (per-item, for the follow-up)
+    #   V, L = followup(m, g): verifies and landings of the isolation that follows a red S
+    #   Vf, Lf = the same walk after a false failure of a sound S
+    #   D    = opt_w * min(K - 1 - position, hosts - 1)  (verifies stacked behind, lost if S is red)
+    #   R(S) = [1/P_A + (1 - (1-e) G) D + (1 - G) V + e G Vf] / [(1-e) G n + (1 - G) L + e G Lf]
+    # c joins iff R(S + c) < R(S); the first candidate always joins.
+    def _elim_on(self):
+        if not self.convict:
+            return False
+        q, e = self.prior, self.e_pol
+        return e <= 0.0 or q / (q + (1.0 - q) * e) >= self.theta
+
+    def _ratio(self, n, m, G, invPA, D, elim):
+        e = self.e_pol
+        if m > 0 and G < 1.0:
+            g = round(G ** (1.0 / m), 4)
+            mode = 'one' if self.sus in ('J1', 'J1d') else 'split'
+            V, L, _ = followup(m, g, mode, self.tau, elim)
+            Vf, Lf = followup_ff(m, g, mode, self.tau, elim)
+        else:
+            V = L = Vf = Lf = 0.0
+        X = (1.0 - (1.0 - e) * G) * D + (1.0 - G) * V + e * G * Vf
+        Y = (1.0 - e) * G * n + (1.0 - G) * L + e * G * Lf
+        if self.opt_form == 'marg':
+            return X - invPA * Y          # here invPA carries the lane's going rate (verifies per landing)
+        return (invPA + X) / Y if Y > 1e-12 else float('inf')
+
+    def _clean_opt(self, eng, W, susset, bt):
+        base, T = bt
+        B = self.B
+        P0 = B.p_good(T) if T else 1.0
+        if self.opt_form == 'ratio':
+            invPA = 1.0 / max(P0, 1e-6)
+        elif self.opt_form == 'ratio1':
+            invPA = 1.0
+        else:
+            if self.rho_n >= 30.0 and self.rho_l > 0.0:
+                invPA = self.rho_n / self.rho_l
+            else:
+                invPA = cycle_ratio(self.table_d, self.prior, self.e_pol,
+                                    'one' if self.sus in ('J1', 'J1d') else 'split', self.tau, elim=True)
+        D = self.opt_w * max(0, min(eng.K - 1 - len(eng.inflight), eng.cfg['hosts'] - 1))
+        elim = self._elim_on()
+        S, n, m, G, Rcur = [], 0, 0, 1.0, float('inf')
+        table_take = []
+        passed_over = []
+        skipped = []
+        for r in W:
+            rid = r.id
+            if rid in susset:
+                continue
+            in_win = len(table_take) < self.table_d
+            if in_win:
+                table_take.append(rid)
+            if n >= self.maxb:
+                break
+            if rid in B.cleared:
+                # known good: it rides along and takes no part in the depth decision (if the batch
+                # fails it is still known good and rides the next one)
+                S.append(rid)
+                n += 1
+                continue
+            elif rid in B.comp_of:
+                if T and 1.0 - B.p_good(T + [rid]) / P0 > self.release * self._prior_of(rid):
+                    passed_over.append(r)
+                    if in_win:
+                        skipped.append('implic')
+                    continue
+                m2, G2 = m + 1, B.p_good(T + S + [rid]) / P0
+            else:
+                m2, G2 = m + 1, G * (1.0 - self._prior_of(rid))
+            R2 = self._ratio(m2, m2, G2, invPA, D, elim)
+            if m == 0 or R2 < Rcur - 1e-12:
+                S.append(rid)
+                n, m, G, Rcur = n + 1, m2, G2, R2
+            elif in_win:
+                skipped.append('implic' if rid in B.comp_of else 'prior')
+        if not S:
+            if not passed_over:
+                return None
+            S = [passed_over[0].id]
+        Sset = set(S)
+        excl = any(t not in Sset for t in table_take)
+        self._batch_stats(S, table_take, skipped)
+        return self._entry(eng, S, 'clean', dict(tab_excl=excl, tab_n=len(table_take)), base)
+
+    def next_entry(self, eng):
+        self.eng = eng
+        if self.nostack:
+            for a in eng.inflight:
+                if a.status == 'run' and (a.kind.startswith('sus') or a.kind == 'named'):
+                    return None
+        W = eng.waiting()
+        if not W:
+            return None
+        B = self.B
+        if B.dirty:
+            B._rebuild()
+        susset = set()
+        for r in W:
+            if (r.id in B.comp_of or r.id in B.overflow or r.id in self.stuck) and self.is_sus(r.id):
+                susset.add(r.id)
+        bc, bs = self._bases(eng)
+        for r in W:
+            if r.solo_only:      # a member of a stale batch, re-verified un-chained
+                return self._entry(eng, [r.id], 'resolo', None, bc[0])
+        if self.named:
+            for r in W:
+                if r.id in self.named:
+                    if self.naming == 'confirm':
+                        return self._entry(eng, [r.id], 'named', None, bs[0])
+                    susset.add(r.id)
+        if susset and self.sus != 'J1':
+            dl = self.deadline_mult * eng.p95_dur
+            for r in W:
+                if r.id in susset and eng.t - self.since.get(r.id, eng.t) > dl:
+                    return self._entry(eng, [r.id], 'sus_deadline', None, bs[0])
+        seq = self.sus in ('J1d', 'J2')
+        clean = self._clean_opt if self.member == 'opt' else self._clean
+        first_deferred = None
+        clean_tried = False
+        for r in W:
+            if r.id not in susset:
+                if not clean_tried:
+                    clean_tried = True
+                    ent = clean(eng, W, susset, bc)
+                    if ent is not None:
+                        return ent
+                continue
+            if self.clean_first:
+                if first_deferred is None:
+                    first_deferred = r
+                continue
+            if r.id not in B.comp_of:
+                return self._entry(eng, [r.id], 'sus_overflow' if r.id in B.overflow else 'sus', None, bs[0])
+            if seq and self._group_busy(eng, B.comp_of[r.id]):
+                if first_deferred is None:
+                    first_deferred = r
+                continue
+            return self._sus_entry(eng, r, W, bs)
+        if first_deferred is not None:
+            if first_deferred.id not in B.comp_of:
+                return self._entry(eng, [first_deferred.id],
+                                   'sus_overflow' if first_deferred.id in B.overflow else 'sus', None, bs[0])
+            return self._sus_entry(eng, first_deferred, W, bs, 'sus_fallback')
+        return None
+
+
+# ------------------------------------------------------------------ rule U
+_ACOST = {}
+
+
+def going_cost(e, theta, kmax=12, elim=False, follow_one=False, n=4000, wd=0.0):
+    """a(p): expected verifies to resolve one request whose P(defective) is p.
+
+    a(p) = min over k in 1..kmax of [1 + R_k (k - pi_k) a(p / R_k)] / k,
+    R_k = 1 - (1-p)^k (1-e); k = 1 costs 1 (a single red is a block).
+    elim: pi_k = (1-p)^(k-1) p / R_k, the chance the last member of a red batch
+    is the only bad one and is convicted when the others have landed, counted
+    only when that conviction would reach theta (pi_k = 0 otherwise).
+    follow_one: a(p') forced to 1 (every member of a red batch verified alone).
+    Returns (table, kbest) on the grid p = i/n."""
+    key = (e, theta, kmax, elim, follow_one, n, wd)
+    v = _ACOST.get(key)
+    if v is not None:
+        return v
+    a = [1.0] * (n + 1)
+    kb = [1] * (n + 1)
+    for i in range(n, -1, -1):
+        p = i / n
+        if i == 0:
+            a[0], kb[0] = (1.0 + wd * e) / (kmax * (1.0 - e)), kmax
+            continue
+        g = 1.0 - p
+        best, bk = 1.0 + wd * (1.0 - g * (1.0 - e)), 1   # wd: the tear-down term carried into the going cost
+        gk = g
+        el_on = elim and p / (p + g * e) >= theta if (p + g * e) > 0 else False
+        for k in range(2, kmax + 1):
+            gk1 = gk
+            gk *= g
+            R = 1.0 - gk * (1.0 - e)
+            pp = min(1.0, p / R)
+            if follow_one:
+                ap = 1.0
+            else:
+                x = pp * n
+                j = int(x)
+                if j <= i:
+                    ap = 1.0
+                elif j >= n:
+                    ap = a[n]
+                else:
+                    ap = a[j] + (a[j + 1] - a[j]) * (x - j)
+            pi = gk1 * p / R if el_on else 0.0
+            val = (1.0 + R * (k - pi) * ap + wd * R) / k
+            if val < best - 1e-12:
+                best, bk = val, k
+        a[i], kb[i] = best, bk
+    _ACOST[key] = (a, kb)
+    return a, kb
+
+
+def scan_cost_table(e, kmax, ct, mode, variant, n=4000):
+    """Going cost when a red batch is resolved by a scan: a(p) = min_k [1 + R_k (c_scan(k) + (k - k p / R_k) a_nd)] / k,
+    a_nd = a(0) (variant A: sound members come back known-good) or a(p) itself (variant B: at their prior)."""
+    def cs(k):
+        return ct * (0 if mode == 'free' else ((k + 1) if mode == 'lin' else (int(math.ceil(math.log2(k))) + 1 if k > 1 else 2)))
+    a0 = (1.0 + e * cs(kmax)) / (kmax * (1.0 - e))
+    out = [a0]
+    for i in range(1, n + 1):
+        p = i / n
+        best = float('inf')
+        g = 1.0
+        for k in range(1, kmax + 1):
+            g *= 1.0 - p
+            R = 1.0 - g * (1.0 - e)
+            if variant == 'A':
+                v = (1.0 + R * cs(k) + (k * R - k * p) * a0) / k
+            else:
+                den = k * (1.0 - R + p)
+                v = (1.0 + R * cs(k)) / den if den > 1e-12 else float('inf')
+            best = min(best, v)
+        out.append(best)
+    return out
+
+
+_FBTAB = {}
+
+
+def _trees(k, mode):
+    if mode == 'solo':      # base, tip, and each member alone on the base
+        return k + 2
+    if mode == 'pbin':      # base, tip, and a binary search over the prefix trees for the first culprit
+        return (int(math.ceil(math.log2(k))) if k > 1 else 0) + 2
+    return 0 if mode == 'free' else ((k + 1) if mode == 'lin' else (int(math.ceil(math.log2(k))) + 1 if k > 1 else 2))
+
+
+class FBCost:
+    """Closed-form follow-up cost of a red batch of k un-cleared members, each defective with probability p.
+
+    r_j = 1 - (1-p)^j (a j-set holds a culprit), v_j = 1 - (1 - p m)^j (it holds an unscannable culprit).
+    scanres : the scan resolves the red.  c_t (trees(k) + confirm trees) + (k - nb) a0 + [first_only] (nb - 1),
+              nb = k p / R_k the expected culprits given red.
+    ushare  : share of red k-batches that cannot be scanned: m (coin) or v_k / R_k (sticky).
+    fallback: 'alone' k ; 'halve' X(k) ; 'bisect' B(k) (see the methods).
+    """
+
+    def __init__(self, ct, mode, fb, m, model, confirm, first_only, noev, mt=0, pred_ct=None, A_ns=None):
+        self.pred_ct = pred_ct  # scan iff trees x pred_ct < unscanned(k): the rule prices the batch accordingly
+        self.A_ns = A_ns        # plain U's going cost, for the inference fallback of an unscanned red
+        self.ct, self.mode, self.fb, self.m, self.model = ct, mode, fb, m, model
+        self.mt = mt            # trees run before a red is found unscannable
+        self.confirm, self.first_only, self.noev = confirm, first_only, noev
+        self.a0 = None
+
+    def scanres(self, k, p, R, af=1.0):
+        if self.mode == 'pbin':
+            # only the first culprit is found: members before it are known good, members after it return as new
+            g, before = 1.0, 0.0
+            for j in range(1, k + 1):
+                before += (j - 1) * g * p
+                g *= 1.0 - p
+            rk = 1.0 - g
+            before = before / rk if rk > 0.0 else 0.0
+            own = min(1.0, rk / R) if R > 0.0 else 0.0     # the red has a culprit of its own (not a false failure)
+            c = self.ct * (_trees(k, self.mode) + (own if self.confirm else 0.0))
+            return c + own * (before * self.a0 + (k - 1 - before) * af) + (1.0 - own) * k * self.a0
+        nb = min(float(k), k * p / R) if R > 0.0 else 0.0
+        c = self.ct * _trees(k, self.mode)
+        if self.confirm:
+            c += self.ct * (min(1.0, nb) if self.first_only else nb)
+        c += (k - nb) * self.a0
+        if self.first_only:
+            c += max(0.0, nb - 1.0)
+        return c
+
+    def unscanned(self, k, p, R):
+        """Expected follow-up verifies of a red k-batch that is not scanned at all."""
+        if k < 2:
+            return 0.0
+        if self.fb == 'alone':
+            return float(k)
+        if self.fb == 'infer':
+            A = self.A_ns
+            x = min(1.0, p / R) * (len(A) - 1)
+            j = min(int(x), len(A) - 2)
+            return k * (A[j] + (A[j + 1] - A[j]) * (x - j))
+        m, model, ct = self.m, self.model, self.ct
+        self.m, self.model, self.ct = 1.0, 'coin', 0.0
+        v = self.fallback(k, p, 1.0, {})
+        self.m, self.model, self.ct = m, model, ct
+        return v
+
+    def scans(self, k_all, k, p, R):
+        return self.pred_ct is None or _trees(k_all, self.mode) * self.pred_ct < self.unscanned(k, p, R)
+
+    def ushare(self, k, p, R):
+        if self.fb == 'infer' or k < 2:
+            return 0.0
+        if self.model == 'sticky':
+            return min(1.0, (1.0 - (1.0 - p * self.m) ** k) / R) if R > 0.0 else 0.0
+        return self.m
+
+    def fallback(self, k, p, af, memo):
+        if k < 2:
+            return 0.0
+        c2 = self.ct * self.mt
+        if self.fb == 'alone':
+            return c2 + float(k)
+        if self.fb == 'alone_u':
+            # singles in land order up to and including the first culprit; the members behind it return as fresh
+            g, before = 1.0, 0.0
+            for j in range(1, k + 1):
+                before += (j - 1) * g * p
+                g *= 1.0 - p
+            before /= (1.0 - g)
+            return c2 + before + 1.0 + (k - 1 - before) * af
+        m, sticky = self.m, self.model == 'sticky'
+        r = lambda j: 1.0 - (1.0 - p) ** j
+        v = lambda j: 1.0 - (1.0 - p * m) ** j
+        S = lambda j: self.scanres(j, p, r(j), af) if j > 1 else 0.0
+
+        def X(j):   # halve: both halves verified as their own batches; a red half is scanned or halved again
+            if j < 2:
+                return 0.0
+            x = memo.get(('X', j))
+            if x is None:
+                a, b = (j + 1) // 2, j // 2
+                x = 2.0
+                for h, o in ((a, b), (b, a)):
+                    if h < 2:
+                        continue
+                    if sticky:
+                        x += (v(h) * (c2 + X(h)) + (r(h) - v(h)) * v(o) * S(h)) / v(j)
+                    else:
+                        x += r(h) / r(j) * (m * (c2 + X(h)) + (1.0 - m) * S(h))
+                memo[('X', j)] = x
+            return x
+
+        def B(j):   # bisect: a range known to hold a culprit; verify its first half, a green half lands
+            x = memo.get(('B', j))
+            if x is None:
+                a = (j + 1) // 2
+                b = j - a
+                green = 1.0 if b == 1 else B(b)
+                if sticky:
+                    pu, ps, pg = v(a) / v(j), (r(a) - v(a)) * v(b) / v(j), (1.0 - r(a)) * v(b) / v(j)
+                    x = 1.0 + pu * (b * af + ((c2 + B(a)) if a > 1 else 0.0)) + ps * (S(a) + b * af) + pg * green
+                else:
+                    pr, pg = r(a) / r(j), (1.0 - r(a)) * r(b) / r(j)
+                    x = 1.0 + pr * (b * af + ((m * (c2 + B(a)) + (1.0 - m) * S(a)) if a > 1 else 0.0)) + pg * green
+                memo[('B', j)] = x
+            return x
+
+        def K(j):   # halve2: a set known to hold a culprit; its first half is verified, the second half is held
+            x = memo.get(('K', j))
+            if x is None:
+                a = (j + 1) // 2
+                b = j - a
+                rho = r(a) / r(j)
+                red_a = (m * (c2 + K(a)) + (1.0 - m) * S(a)) if a > 1 else 0.0
+                # first half red: the second half is unknown and is verified as its own batch
+                unk_b = 1.0 + (r(b) * (m * (c2 + K(b)) + (1.0 - m) * S(b)) if b > 1 else 0.0)
+                green = 1.0 if b == 1 else K(b)     # first half green: the second half is known red, split unverified
+                x = memo[('K', j)] = 1.0 + rho * (red_a + unk_b) + (1.0 - rho) * green
+            return x
+
+        return c2 + (X(k) if self.fb == 'halve' else (K(k) if self.fb == 'halve2' else B(k)))
+
+    def table(self, e, kmax, n=4000):
+        """a(p) = min_k [1 + R_k ((1-u_k) scanres(k) + u_k fallback(k)) + noev k] / k on the grid p = i/n, and the k it picks."""
+        self.a0 = (1.0 + e * self.ct * _trees(kmax, self.mode) + self.noev * kmax) / (kmax * (1.0 - e))
+        fb = self.fb
+        key = (self.ct, self.mode, fb, self.m, self.model, self.confirm, self.first_only, self.noev, self.mt, e, kmax, n, self.pred_ct)
+        hit = _FBTAB.get(key)
+        if hit is not None:
+            return hit
+        prev = None
+        passes = ('infer', fb, fb, fb) if (fb in ('bisect', 'alone_u') or self.mode == 'pbin') else (fb,)
+        for mode in passes:
+            self.fb = mode
+            out, kb = [self.a0], [kmax]
+            for i in range(1, n + 1):
+                p = i / n
+                best, bk = float('inf'), 1
+                memo = {}
+                g = 1.0
+                for k in range(1, kmax + 1):
+                    g *= 1.0 - p
+                    R = 1.0 - g * (1.0 - e)
+                    u = self.ushare(k, p, R)
+                    af = prev[i] if prev else 1.0
+                    if not self.scans(k, k, p, R):
+                        val = (1.0 + R * self.unscanned(k, p, R) + self.noev * k) / k
+                        if val < best - 1e-12:
+                            best, bk = val, k
+                        continue
+                    val = (1.0 + R * ((1.0 - u) * self.scanres(k, p, R, af) + (u * self.fallback(k, p, af, memo) if u > 0.0 else 0.0))
+                           + self.noev * k) / k
+                    if val < best - 1e-12:
+                        best, bk = val, k
+                out.append(best)
+                kb.append(bk)
+            prev = out
+        self.fb = fb
+        _FBTAB[key] = (out, kb)
+        return out, kb
+
+
+class UPolicy(JPolicy):
+    """One membership rule from all available information (third run).
+
+    No depth table, no suspect flag, no isolation policy, no release threshold.
+    w        : weight of the tear-down term (0 or 1).
+    elim     : going cost and batch cost credit the conviction of the last member.
+    follow_one : every member of a red batch costs one verify (the table's cost model).
+    base     : 'tip' always stacked; 'cost' tip or main by the lower expected cost.
+    name_rho : a named member's P(defective) is raised to this (probability shift only).
+    """
+
+    def __init__(self, name, prior, e_pol=0.009, theta=0.9, w=0, elim=False, follow_one=False,
+                 deadline_mult=2.0, max_fresh=12, max_total=24, ubase='tip', name_rho=None,
+                 defer=True, strict_conv=False, w_in_a=False, scan=None, rider_only=0,
+                 fb='infer', fb_m=0.0, fb_model='coin', confirm=False, first_only=False, noev=0.0, miss_trees=0,
+                 sus_noscan=False, scan_pred=None, lookahead=False, **kw):
+        self.w = w
+        self.elim = elim
+        self.follow_one = follow_one
+        self.max_fresh = max_fresh
+        self.max_total = max_total
+        self.ubase = ubase
+        self.name_rho = name_rho
+        self.defer = defer
+        self.strict_conv = strict_conv
+        self.scan = scan            # dict(ct, mode, variant 'A'|'B', flake): reds are cheap, see _cost
+        self.rider_only = rider_only
+        self.cleared_at = {}
+        # what a red batch does when its failing set cannot be scanned: 'infer' joint inference (as before),
+        # 'alone' every member verifies alone, 'halve' two halves each its own batch, 'bisect' verify the first
+        # half of a range known to hold a culprit (a green half lands, the rest behind a red half returns fresh)
+        self.fb = fb
+        self.fb_m = fb_m            # the unscannable rate the cost rule assumes (per red batch: coin; per culprit: sticky)
+        self.fb_model = fb_model
+        self.confirm = confirm      # T1: one more scanned tree per blocked culprit
+        self.first_only = first_only  # T2: the scan blocks the first culprit only; later ones verify alone
+        self.noev = noev            # T4: share of verifies that return no evidence (all members then verify alone)
+        self.fbc = None
+        self.KB = None
+        self.sus_noscan = sus_noscan    # a batch holding a member of a red observation is costed without the scan
+        self.lookahead = lookahead      # the marginal test may stall on an odd size of a halving cost: try 2-4 fresh members jointly
+        self.scan_pred = scan_pred      # None always scan; 'cost' scan iff trees x c_t < expected fallback cost; 'queue' adds the backlog
+        self.A_ns = going_cost(e_pol, theta, max_fresh, False, False)[0] if (sus_noscan or scan_pred) else None
+        self._fbmemo = {}
+        if scan and ((fb != 'infer' and fb_m > 0.0) or confirm or first_only or noev > 0.0 or scan['mode'] in ('solo', 'pbin')):
+            assert scan['variant'] == 'A'
+            self.fbc = FBCost(scan['ct'], scan['mode'], fb if fb_m > 0.0 else 'infer', fb_m, fb_model, confirm, first_only, noev, miss_trees,
+                              pred_ct=scan.get('pred_ct'), A_ns=going_cost(e_pol, theta, max_fresh, False, False)[0] if scan.get('pred_ct') else None)
+            self.A, self.KB = self.fbc.table(0.0 if scan['flake'] == 'pass' else e_pol, max_fresh)
+        elif scan:
+            self.A = scan_cost_table(0.0 if scan['flake'] == 'pass' else e_pol, max_fresh, scan['ct'], scan['mode'], scan['variant'])
+        else:
+            self.A, _ = going_cost(e_pol, theta, max_fresh, elim, follow_one, wd=float(w) if w_in_a else 0.0)
+        self.NA = len(self.A) - 1
+        JPolicy.__init__(self, name, prior, e_pol=e_pol, theta=theta, deadline_mult=deadline_mult, **kw)
+
+    def reset(self):
+        JPolicy.reset(self)
+        self.defer_since = {}
+        self.alone = set()      # must verify alone until retired (or known good)
+        self.grp = {}           # gid -> dict(members: dispatched only as this batch, rest: held until it resolves)
+        self.grp_of = {}
+        self.parked = set()     # the rest of a bisected range, waiting on its first half
+        self.gid = 0
+        self.HOLD = {}          # members of a provisional unscannable red (entries ahead not resolved yet)
+        self.aset = {}          # alone_u: the red batch an alone member came from
+        self.asets = {}
+        self.asid = 0
+        self.PROV = {}
+
+    # ---- fallback for a red batch whose failing set cannot be scanned
+    def _red_no_scan(self, eng, e):
+        B = self.B
+        sus = [m for m in e.members if eng.alive(m) and m not in B.cleared]
+        if len(e.members) == 1 or not sus:
+            return                      # a red single blocks at the head; known-good riders stay riders
+        pending = set()
+        for a in e.ahead:
+            if a.landed:
+                continue
+            if a.status in ('vac', 'dead') or (a.status == 'ret' and a.result != 'pass'):
+                self._st('fb_void')
+                return                  # an entry ahead failed: this red is explained, nobody is touched
+            pending.add(a.eid)
+        if not pending:
+            self._fallback(eng, sus)
+            return
+        for m in sus:
+            self.HOLD[m] = self.HOLD.get(m, 0) + 1
+        self.PROV[e.eid] = [sus, pending]
+        self._st('fb_prov')
+
+    def _unhold(self, members):
+        for m in members:
+            c = self.HOLD.get(m, 0) - 1
+            if c <= 0:
+                self.HOLD.pop(m, None)
+            else:
+                self.HOLD[m] = c
+
+    def _fallback(self, eng, sus):
+        self._st('fb_n')
+        self._st('fb_members', len(sus))
+        eng.L('fallback %s on %s' % (self.fb, sus))
+        for g in {self.grp_of[m] for m in sus if m in self.grp_of}:
+            self._dissolve(g, False)
+        if self.fb in ('alone', 'alone_u') or len(sus) == 1:
+            self.alone.update(sus)
+            if self.fb == 'alone_u' and len(sus) > 1:
+                self.asid += 1
+                self.asets[self.asid] = set(sus)
+                for m in sus:
+                    self.aset[m] = self.asid
+        elif self.fb == 'halve':
+            h = (len(sus) + 1) // 2
+            self._group(sus[:h])
+            self._group(sus[h:])
+        else:                           # 'halve2' and 'bisect': the first half is verified, the rest waits on it
+            self._bisect(sus)
+
+    def fb_expect(self, n, single):
+        """Expected follow-up verifies if a red batch with n un-cleared members takes the fallback unscanned."""
+        if n <= 1:
+            return 0.0 if single else 1.0
+        p = self.prior
+        if self.fb == 'alone':
+            return float(n)
+        if self.fb == 'infer':
+            R = 1.0 - (1.0 - p) ** n
+            return n * self.a_ns(min(1.0, p / R))
+        key = ('exp', n)
+        v = self._fbmemo.get(key)
+        if v is None:
+            F = FBCost(0.0, 'solo', self.fb, 1.0, 'coin', False, False, 0.0, 0)
+            F.a0 = self.A[0]
+            v = self._fbmemo[key] = F.fallback(n, p, self.a(p), {})
+        return v
+
+    def want_scan(self, eng, e):
+        sp = self.scan_pred
+        if not sp:
+            return True
+        if sp == 'never':
+            return False
+        if sp == 'rule':
+            n = sum(1 for m in e.members if m not in self.B.cleared)
+            p = self.prior
+            yes = n >= 1 and self.fbc.scans(len(e.members), n, p, 1.0 - (1.0 - p) ** n)
+            self._st('pred_scan' if yes else 'pred_skip')
+            return yes
+        sc = eng.cfg['scan']
+        n = sum(1 for m in e.members if m not in self.B.cleared)
+        work = eng.scan_trees(len(e.members), sc['mode']) * sc['ct']       # verify durations on the scan resource
+        if sp == 'queue':
+            work += eng.scan_backlog() / eng.g_med
+        yes = work < self.fb_expect(n, len(e.members) == 1)
+        self._st('pred_scan' if yes else 'pred_skip')
+        return yes
+
+    def _group(self, members, rest=()):
+        if len(members) == 1 and not rest:
+            self.alone.add(members[0])
+            return
+        g = self.gid
+        self.gid += 1
+        self.grp[g] = dict(members=list(members), rest=list(rest))
+        for m in members:
+            self.grp_of[m] = g
+        self.parked.update(rest)
+
+    def _bisect(self, rng):
+        if len(rng) == 1:
+            self.alone.add(rng[0])      # the last one left verifies alone: no block by elimination
+            return
+        h = (len(rng) + 1) // 2
+        self._group(rng[:h], rng[h:])
+
+    def _dissolve(self, g, passed):
+        G = self.grp.pop(g, None)
+        if G is None:
+            return
+        for m in G['members']:
+            self.grp_of.pop(m, None)
+        self.parked.difference_update(G['rest'])
+        rest = [m for m in G['rest'] if self.eng.alive(m)]
+        if passed and rest:
+            self._bisect(rest)          # the first half is sound, so the culprit is in the rest
+        elif rest and self.fb == 'halve2':
+            self._group(rest)           # nothing is known about the second half: it is verified as its own batch
+        # 'bisect': the rest returns as fresh
+
+    def _passed(self, eng, e):
+        B = self.B
+        gids = set()
+        for m in e.tree:
+            self.alone.discard(m)
+            g = self.grp_of.get(m)
+            if g is not None:
+                gids.add(g)
+        for g in gids:
+            if all((m in B.cleared) or not eng.alive(m) for m in self.grp[g]['members']):
+                self._dissolve(g, True)
+
+    def on_alone(self, eng, ids, why):
+        self.eng = eng
+        for m in ids:
+            if not eng.alive(m):
+                continue
+            g = self.grp_of.get(m)
+            if g is not None:
+                self._dissolve(g, False)
+            self.alone.add(m)
+            self._st('alone_' + why)
+
+    def on_fail(self, eng, e):
+        if self.PROV:
+            for k in [k for k, v in self.PROV.items() if e.eid in v[1]]:
+                v = self.PROV.pop(k)
+                self._unhold(v[0])
+                self._st('fb_void')
+
+    def on_applied(self, eng, e, outcome):
+        JPolicy.on_applied(self, eng, e, outcome)
+        if outcome == 'pass' and self.PROV:
+            for k in [k for k, v in self.PROV.items() if e.eid in v[1]]:
+                v = self.PROV[k]
+                v[1].discard(e.eid)
+                if not v[1]:
+                    del self.PROV[k]
+                    self._unhold(v[0])
+                    sus = [m for m in v[0] if eng.alive(m) and m not in self.B.cleared]
+                    if sus:
+                        self._fallback(eng, sus)
+
+    def a(self, p):
+        if p <= 0.0:
+            return self.A[0]
+        if p >= 1.0:
+            return self.A[self.NA]
+        x = p * self.NA
+        j = int(x)
+        return self.A[j] + (self.A[j + 1] - self.A[j]) * (x - j)
+
+    def a_ns(self, p):
+        A = self.A_ns
+        if p >= 1.0:
+            return A[-1]
+        x = p * (len(A) - 1)
+        j = int(x)
+        return A[j] + (A[j + 1] - A[j]) * (x - j)
+
+    def on_scan(self, eng, e, blocked, goods, base_bad):
+        if self.scan and self.scan['variant'] == 'A' and goods:
+            self.B.add_pass(goods)
+            for m in goods:
+                self.cleared_at.setdefault(m, eng.t)
+
+    def on_retire(self, rid, outcome):
+        JPolicy.on_retire(self, rid, outcome)
+        self.alone.discard(rid)
+        self.HOLD.pop(rid, None)
+        self.parked.discard(rid)
+        sid = self.aset.pop(rid, None)
+        if sid is not None:
+            mates = self.asets.get(sid)
+            if mates is not None:
+                mates.discard(rid)
+                if outcome != 'landed':     # the culprit of that batch is found: its other members are fresh again
+                    for m in mates:
+                        self.alone.discard(m)
+                        self.aset.pop(m, None)
+                    del self.asets[sid]
+                elif not mates:
+                    del self.asets[sid]
+        g = self.grp_of.get(rid)
+        if g is not None:
+            if outcome != 'landed':
+                self._dissolve(g, False)    # the culprit of this batch is found
+            else:
+                self.grp_of.pop(rid, None)
+                G = self.grp[g]
+                G['members'].remove(rid)
+                if not G['members']:
+                    self._dissolve(g, True)
+        t0 = self.cleared_at.pop(rid, None)
+        if t0 is not None and outcome == 'landed' and self.eng.t >= self.eng.warm:
+            wt = self.eng.t - t0
+            self.stat['rw_n'] = self.stat.get('rw_n', 0) + 1
+            self.stat['rw_sum'] = self.stat.get('rw_sum', 0.0) + wt
+            if wt > 4.0:
+                self.stat['rw_gt4h'] = self.stat.get('rw_gt4h', 0) + 1
+            if wt > 12.0:
+                self.stat['rw_gt12h'] = self.stat.get('rw_gt12h', 0) + 1
+
+    def on_return(self, eng, e, result):
+        if result != 'pass' and self.scan and self.fb != 'infer':
+            self.eng = eng
+            self._red_no_scan(eng, e)
+            return
+        JPolicy.on_return(self, eng, e, result)
+        if result == 'pass' and (self.alone or self.grp_of):
+            self._passed(eng, e)
+        if self.name_rho is not None and result != 'pass':
+            N, oid = e.meta.get('named'), e.meta.get('obs')
+            B = self.B
+            if N is not None and oid is not None and oid in B.obs and N in B.obs[oid]:
+                good = 1.0
+                for m in B.obs[oid]:
+                    good *= 1.0 - self._prior_of(m)
+                pN = self._prior_of(N)
+                p0 = pN / (1.0 - (1.0 - self.e_pol) * good)
+                p0 = min(max(p0, 1e-6), 1.0 - 1e-6)
+                rho = min(self.name_rho, 1.0 - 1e-6)
+                B.boosts[oid] = (N, (rho / (1.0 - rho)) / (p0 / (1.0 - p0)))
+                B.dirty = True
+
+    # ---- cost of a batch given what it is built on
+    def _cost(self, ps, G, D, nosc=False):
+        """ps: P(defective | base sound) of each member in pool order (0 = known good);
+        G: P(all members good | base sound).  Returns (C, P(red))."""
+        e = self.e_pol
+        if nosc:
+            Pred = 1.0 - (1.0 if self.scan['flake'] == 'pass' else (1.0 - e)) * G
+            if len(ps) == 1:
+                return 1.0, Pred
+            tot = 0.0
+            for p in ps:
+                tot += self.A[0] if (p <= 0.0 or Pred <= 0.0) else self.a_ns(min(1.0, p / Pred))
+            return 1.0 + Pred * tot, Pred
+        if self.scan:
+            # C(S) = 1 + P_red * (c_scan(S) + sum_i (1 - p_i / P_red) * a_nd(i)): a red batch costs its scan,
+            # a defective member is blocked by it, a sound one comes back known-good (A) or at its prior (B)
+            sc = self.scan
+            Pred = 1.0 - (1.0 if sc['flake'] == 'pass' else (1.0 - e)) * G
+            k = len(ps)
+            F = self.fbc
+            if F is not None:
+                # C(S) = 1 + P_red ((1-u) scanres + u (fallback(n) + riders a0)) + noev k
+                a0 = self.A[0]
+                n, sp, nb, tot, gv = 0, 0.0, 0.0, 0.0, 1.0
+                for p in ps:
+                    if p <= 0.0 or Pred <= 0.0:
+                        tot += a0
+                    else:
+                        x = min(1.0, p / Pred)
+                        n += 1
+                        sp += p
+                        nb += x
+                        tot += (1.0 - x) * a0
+                        gv *= 1.0 - p * F.m
+                if F.pred_ct is not None and n >= 1 and Pred > 0.0:
+                    pb = max(sp / n, 1.0 / self.NA)
+                    if not F.scans(k, n, pb, Pred):     # the lane would not scan this batch: its red costs the fallback
+                        return 1.0 + Pred * (F.unscanned(n, pb, Pred) + (k - n) * a0) + F.noev * k, Pred
+                if sc['mode'] == 'pbin':
+                    pb = max(sp / n, 1.0 / self.NA) if n else 0.0
+                    sr = (F.scanres(n, pb, min(1.0, Pred), self.a(pb)) + (k - n) * a0 + sc['ct'] * (_trees(k, 'pbin') - _trees(n, 'pbin'))) if n else k * a0
+                else:
+                    cs = sc['ct'] * _trees(k, sc['mode'])
+                    if F.confirm:
+                        cs += sc['ct'] * (min(1.0, nb) if F.first_only else nb)
+                    sr = cs + tot + (max(0.0, nb - 1.0) if F.first_only else 0.0)
+                u = fbv = 0.0
+                if F.fb != 'infer' and n >= 2 and Pred > 0.0:
+                    u = min(1.0, (1.0 - gv) / Pred) if F.model == 'sticky' else F.m
+                    key = (n, int(round(sp / n * self.NA)))
+                    fbv = self._fbmemo.get(key)
+                    if fbv is None:
+                        pb = max(key[1], 1) / self.NA
+                        fbv = self._fbmemo[key] = F.fallback(n, pb, self.a(pb), {})
+                    fbv += (k - n) * a0
+                return 1.0 + Pred * ((1.0 - u) * sr + u * fbv) + F.noev * k, Pred
+            cs = sc['ct'] * (0 if sc['mode'] == 'free' else ((k + 1) if sc['mode'] == 'lin' else (int(math.ceil(math.log2(k))) + 1 if k > 1 else 2)))
+            tot = 0.0
+            a0 = self.A[0]
+            for p in ps:
+                if p <= 0.0 or Pred <= 0.0:
+                    tot += a0
+                else:
+                    tot += (1.0 - min(1.0, p / Pred)) * (a0 if sc['variant'] == 'A' else self.a(p))
+            return 1.0 + Pred * (cs + tot), Pred
+        Pred = 1.0 - (1.0 - e) * G
+        if len(ps) == 1:
+            return 1.0 + self.w * Pred * D, Pred
+        tot = 0.0
+        a0 = self.A[0]
+        for p in ps:
+            if p <= 0.0:
+                tot += a0
+            elif self.follow_one:
+                tot += 1.0
+            else:
+                tot += self.a(min(1.0, p / Pred))
+        return 1.0 + Pred * tot + self.w * Pred * D, Pred
+
+    def _elim_saving(self, ps, G, G_wo_last, Pred):
+        """Expected follow-up saved because the last un-cleared member is convicted when
+        every other member lands: P(others good | red) * a(p_last | red)."""
+        if not self.elim or len(ps) < 2:
+            return 0.0
+        e = self.e_pol
+        num = G_wo_last - G
+        den = G_wo_last - (1.0 - e) * G
+        if den <= 0.0 or num / den < self.theta:
+            return 0.0
+        last = next((p for p in reversed(ps) if p > 0.0), 0.0)
+        if last <= 0.0:
+            return 0.0
+        return (den / Pred) * self.a(min(1.0, last / Pred)) * Pred
+
+    def _compose(self, eng, P, T, mode):
+        """Front plus members.  mode 'tip': cost conditional on the base T landing as built;
+        'main': built on main, with the stale / torn-down terms of the lane's mechanics."""
+        B = self.B
+        e = self.e_pol
+        P0 = B.p_good(T) if T else 1.0
+        D = max(0, min(eng.K - 1 - len(eng.inflight), eng.cfg['hosts'] - 1))
+        comp_of, cleared = B.comp_of, B.cleared
+
+        def pc(rid):
+            if rid in cleared:
+                return 0.0
+            if rid in comp_of:
+                return max(0.0, 1.0 - (B.p_good(T + [rid]) / P0 if T else B.p_good([rid])))
+            return self._prior_of(rid)
+
+        if mode == 'main':
+            rv, casc = eng.cfg['reverify'], eng.cfg['cascade']
+            live = [x for x in eng.inflight if x.status not in ('vac', 'dead')]
+            noland = 1.0
+            allland = 1.0
+            for x in live:
+                if not [b for b in x.base if not b.gone and b.status not in ('vac', 'dead')]:
+                    noland *= 1.0 - (1.0 - e) * B.p_good(x.members)
+            allm = [m for x in live for m in x.members]
+            allland = (1.0 - e) ** len(live) * (B.p_good(allm) if allm else 1.0)
+            Lland = 1.0 - noland
+
+        def total(ps, S, G):
+            """Expected cost of dispatching S under this mode, and the plain batch cost."""
+            C, Pred = self._cost(ps, G, D, self.sus_noscan and any(m in comp_of and m not in cleared for m in S))
+            if self.elim and len(ps) >= 2:
+                li = max(i for i, p in enumerate(ps) if p > 0.0) if any(p > 0.0 for p in ps) else None
+                if li is not None:
+                    Gw = (B.p_good(T + [m for i, m in enumerate(S) if i != li]) / P0) if (T or True) else 1.0
+                    C -= self._elim_saving(ps, G, Gw, Pred)
+            if mode == 'tip':
+                return C
+            follow = C - 1.0
+            n = len(ps)
+            stale = 1.0 if rv == 'chain' else (n * self.A[0] if rv == 'pool' else float(n))
+            if casc == 'all':
+                unres = sum(self.a(p) if p > 0.0 else self.A[0] for p in ps)
+                F = 1.0 - allland
+                return 1.0 + F * unres + (1.0 - F) * (follow + (1.0 - Pred) * stale)
+            return 1.0 + follow + (1.0 - Pred) * Lland * stale
+
+        front = P[0]
+        S = [front.id]
+        ps = [pc(front.id)]
+        G = (B.p_good(T + S) / P0) if (T or front.id in comp_of) else (1.0 - ps[0])
+        if front.id in cleared:
+            G = 1.0
+        cur = total(ps, S, G)
+        nfresh = 0 if front.id in cleared else 1
+        rejected = set()
+        capf = capt = False
+        for r in P[1:]:
+            rid = r.id
+            if len(S) >= self.max_total:
+                capt = True
+                break
+            if rid in cleared:
+                p_c, G2 = 0.0, G
+            else:
+                if nfresh >= self.max_fresh:
+                    capf = True
+                    continue
+                if rid in comp_of:
+                    p_c = pc(rid)
+                    G2 = B.p_good(T + S + [rid]) / P0
+                else:
+                    p_c = self._prior_of(rid)
+                    key = round(p_c, 9)
+                    if key in rejected:
+                        continue
+                    G2 = G * (1.0 - p_c)
+            ps2 = ps + [p_c]
+            S2 = S + [rid]
+            new = total(ps2, S2, G2)
+            if new - cur < ((self.a_ns(p_c) if (self.sus_noscan and rid in comp_of) else self.a(p_c)) if p_c > 0.0 else self.A[0]):
+                S, ps, G, cur = S2, ps2, G2, new
+                if p_c > 0.0 or rid not in cleared:
+                    nfresh += 1
+                rejected = set()
+            elif rid not in comp_of and rid not in cleared:
+                rejected.add(round(p_c, 9))
+        pred = self.fbc is not None and self.fbc.pred_ct is not None
+        if self.lookahead and (pred or not comp_of):
+            inS = set(S)
+            cand = [r.id for r in P[1:] if r.id not in inS and r.id not in cleared and r.id not in comp_of]
+            grew = True
+            while grew and cand:
+                grew = False
+                # with a scan predicate the cost drops where a batch becomes worth scanning: look as far as the table's k
+                jmax = max(4, self.KB[int(round(self.prior * self.NA))] - nfresh) if pred else 4
+                for j in range(2, jmax + 1):
+                    if j > len(cand) or nfresh + j > self.max_fresh or len(S) + j > self.max_total:
+                        break
+                    add = cand[:j]
+                    pa = [self._prior_of(m) for m in add]
+                    G2 = G
+                    for x in pa:
+                        G2 *= 1.0 - x
+                    new = total(ps + pa, S + add, G2)
+                    if new - cur < sum(self.a(x) for x in pa):
+                        S, ps, G, cur = S + add, ps + pa, G2, new
+                        nfresh += j
+                        cand = cand[j:]
+                        grew = True
+                        break
+        return S, ps, cur, capf, capt, P0
+
+    def next_entry(self, eng):
+        self.eng = eng
+        W = eng.waiting()
+        if self.HOLD or self.parked:
+            W = [r for r in W if r.id not in self.HOLD and r.id not in self.parked]
+        if not W:
+            return None
+        B = self.B
+        if B.dirty:
+            B._rebuild()
+        # deferral: a request whose probability a verify in flight can still change waits
+        deferred = set()
+        if self.defer and B.comp_of:
+            flight = set()
+            for x in eng.inflight:
+                if x.status == 'run':
+                    flight.update(x.tree)
+            dl = self.deadline_mult * eng.p95_dur
+            hot = {}
+            for r in W:
+                c = B.comp_of.get(r.id)
+                if c is None or r.id in B.cleared:
+                    self.defer_since.pop(r.id, None)
+                    continue
+                k = id(c)
+                h = hot.get(k)
+                if h is None:
+                    h = hot[k] = any(v in flight for v in c['vars'])
+                if h:
+                    t0 = self.defer_since.setdefault(r.id, eng.t)
+                    if eng.t - t0 <= dl:
+                        deferred.add(r.id)
+                else:
+                    self.defer_since.pop(r.id, None)
+        P = [r for r in W if r.id not in deferred]
+        restr = bool(self.alone or self.grp_of)
+        riders = False
+        if self.rider_only:
+            rid_ = [r for r in P if r.id in B.cleared and not (restr and (r.id in self.alone or r.id in self.grp_of))]
+            if len(rid_) >= self.rider_only:      # enough known-good requests have accumulated: land them together
+                P = rid_
+                riders = True
+        fallback = False
+        if not P:
+            P = [W[0]]
+            fallback = True
+        if restr and not riders:
+            f = P[0].id
+            if f in self.alone:
+                return self._entry(eng, [f], 'fb_alone', dict(tab_n=1))
+            g = self.grp_of.get(f)
+            if g is not None:
+                mem = list(self.grp[g]['members'])
+                return self._entry(eng, mem, 'fb_half', dict(tab_n=len(mem), grp=g))
+            P = [r for r in P if r.id not in self.alone and r.id not in self.grp_of]
+        lin = eng.lineage()
+        T = [m for x in lin for m in x.members]
+        if T and B.p_good(T) < 1e-9:
+            T = []
+        S, ps, cost, capf, capt, PA = self._compose(eng, P, T, 'tip')
+        base = 'tip'
+        if self.ubase == 'cost' and lin:
+            Sm, psm, costm, capfm, captm, _ = self._compose(eng, P, [], 'main')
+            a0 = self.A[0]
+            unres_t = sum(self.a(p) if p > 0.0 else a0 for p in ps)
+            # built on the tip the verify is void when the base does not land as built
+            e_tip = PA * cost + (1.0 - PA) * (1.0 + unres_t)
+            net_t = e_tip - unres_t
+            net_m = costm - sum(self.a(p) if p > 0.0 else a0 for p in psm)
+            if eng.t >= eng.warm:
+                b = min(9, int(PA * 10))
+                self._st('bc_n')
+                self._st('bc_bin%d_n' % b)
+                if net_m < net_t:
+                    self._st('bc_main')
+                    self._st('bc_bin%d_main' % b)
+            if net_m < net_t:
+                S, ps, cost, capf, capt, base = Sm, psm, costm, capfm, captm, 'main'
+        # what kind of entry this is
+        grp = [m for m in S if m in B.comp_of and m not in B.cleared]
+        fresh = [m for m in S if m not in B.comp_of and m not in B.cleared]
+        if not grp:
+            kind = 'u_clean'
+        elif len(S) == 1:
+            kind = 'u_alone'
+        elif not fresh:
+            kind = 'u_sub'
+        else:
+            kind = 'u_mixed'
+        if eng.t >= eng.warm:
+            st = self._st
+            st('ub')
+            st('ub_n', len(S))
+            st('ub_fresh', len(fresh) + len(grp))
+            st('ub_cleared', len(S) - len(fresh) - len(grp))
+            if capf:
+                st('ub_capfresh')
+            if capt:
+                st('ub_captotal')
+            if grp:
+                st('m_' + kind[2:], len(grp))
+            if deferred:
+                st('df_events')
+                st('df_passed', len(deferred))
+            if fallback:
+                st('df_fallback')
+            for m in S:
+                t0 = self.defer_since.get(m)
+                if t0 is not None:
+                    wt = eng.t - t0
+                    st('dw_n')
+                    self.stat['dw_sum'] = self.stat.get('dw_sum', 0.0) + wt
+                    if wt > 1.0:
+                        st('dw_gt1h')
+                    if wt > 2.0 * eng.p95_dur:
+                        st('dw_gt2p95')
+        for m in S:
+            self.defer_since.pop(m, None)
+        return self._entry(eng, S, kind, dict(tab_n=len(S)), base)
+
+
+# ------------------------------------------------------------------ engine
+DEFAULT_CFG = dict(
+    q=0.14, e=0.0, dur='W1', horizon=144.0, warm=24.0,
+    arr=0.0, backlog=0, closed_N=0, closed_until=None,
+    high_share=0.0, hosts=2, K=3, build_base_min=0.0, build_link_min=0.0,
+    restarts=False, restart_every=12.0,
+    mainred=False, mr_durs=(4.0, 10.5), mr_lag=1.0,
+    hetero=None, picker='fifo', prompt_vac=False, cohort_tail=60.0,
+    reverify='chain',   # a passed entry whose base went stale: 'chain' same batch again at the head;
+                        # 'solo' each member alone; 'pool' members return to the pool as known-good
+    name_acc=None, name_none=0.2,
+    cascade='narrow',   # 'narrow': a failed entry tears down only what was built on it;
+                        # 'all': today's lane, every entry behind it is torn down
+    accident=0.0,       # share of dispatches behind a live in-flight entry that end up built on main unasked
+    adopt=False,        # task 10995: a green stacked verify lands every in-flight entry its tree contains
+    scan=None,          # dict(ct, mode 'lin'|'bin'|'free', miss, flake 'pass'|'stand'): re-run the failing tests
+                        # on the base and on each prefix of a red entry's members to name the culprit.  Optional keys:
+                        # miss_model 'coin' (per red entry) | 'sticky' (per culprit: any tree holding it cannot be scanned);
+                        # confirm (T1) one more tree per blocked culprit; first_only (T2) only the first culprit in land
+                        # order is blocked, later ones verify alone; offhost (T3) n scan resources off the verify hosts
+    noev=0.0,           # T4: a verify returns no evidence with this probability; all its members then verify alone
+)
+
+
+class Engine:
+    def __init__(self, cfg, policy, seed, log=False):
+        self.cfg = dict(DEFAULT_CFG)
+        self.cfg.update(cfg)
+        c = self.cfg
+        base = seed * 1000003
+        self.rw = random.Random(base + 11)   # request attributes, by id
+        self.ra = random.Random(base + 23)   # arrival times
+        self.rd = random.Random(base + 37)   # durations
+        self.rf = random.Random(base + 41)   # false failures
+        self.re = random.Random(base + 53)   # restarts, main-red episodes
+        self.rn = random.Random(base + 67)   # which request a failing test names
+        self.rx = random.Random(base + 71)   # accidental unstacked dispatches
+        self.rs = random.Random(base + 73)   # scans that cannot re-run the failing set
+        self.ru = random.Random(base + 79)   # sticky model: which requests' failures cannot be scanned, by id
+        self.rv = random.Random(base + 83)   # verifies that return no evidence
+        sc0 = c['scan']
+        self.m_sticky = sc0['miss'] if (sc0 and sc0.get('miss_model') == 'sticky') else 0.0
+        self.scan_free = (sc0.get('offhost') or 0) if sc0 else 0
+        self.scan_nres = max(1, self.scan_free)
+        self.scan_ends = []
+        self.scan_conc = (sc0.get('conc') or 1) if sc0 else 1
+        self.scanq = deque()
+        self.scan_waits = []
+        self.scan_holds = []
+        self.scan_res_busy = 0.0
+        self.scan_qmax = 0
+        self.n_unscan = 0
+        self.n_noscan = 0
+        self.n_noev = 0
+        self.b2b_w = []
+        self.scan_time = 0.0
+        self.n_scan = 0
+        self.first_disp = {}
+        self.b2b_sum = 0.0
+        self.b2b_n = 0
+        self.legacy = bool(c.get('legacy_rng'))
+        if self.legacy:  # one stream, drawn in engine_orig.py's order (validation a)
+            self.rw = self.ra = self.rd = self.rf = self.re = random.Random(seed)
+        self.pol = policy
+        policy.eng = self
+        policy.reset()
+        self.log = [] if log else None
+        self.t = 0.0
+        self.heap = []
+        self.seq = 0
+        self.reqs = []
+        self.high = []
+        self.norm = []
+        self.park = []
+        self.inflight = []
+        self.free_hosts = c['hosts']
+        self.K = c['K']
+        self.eid = 0
+        g, r, s = DUR[c['dur']]
+        self.g_med, self.r_med, self.sig = g / 60.0, r / 60.0, s
+        self.p95_dur = self.g_med * math.exp(1.645 * s)
+        self.H = c['horizon']
+        self.warm = c['warm']
+        het = c['hetero']
+        self.class_q = (het[2], het[1]) if het else (c['q'], c['q'])
+        self.n_live = 0
+        self.closed_N = c['closed_N']
+        self.closed_until = c['closed_until'] if c['closed_until'] is not None else (
+            self.H + 1 if self.closed_N else 0.0)
+        for _ in range(c['backlog']):
+            self._new_req(0.0, True)
+        self.topup()
+        if c['arr'] > 0:
+            t = self.closed_until if self.closed_N else 0.0
+            t += self.ra.expovariate(c['arr'])
+            while t < self.H:
+                self._push(t, 'arr', None)
+                t += self.ra.expovariate(c['arr'])
+        if c['restarts']:
+            t = self.re.uniform(0, c['restart_every'])
+            while t < self.H:
+                self._push(t, 'restart', None)
+                t += self.re.uniform(c['restart_every'] - 2, c['restart_every'] + 2)
+        self.mr_eps = []
+        self.mr_det = []
+        if c['mainred']:
+            durs = list(c['mr_durs'])
+            self.re.shuffle(durs)
+            for _ in range(1000):
+                starts = sorted(self.re.uniform(self.warm, self.H - max(durs)) for _ in durs)
+                eps = [(s0, s0 + d) for s0, d in zip(starts, durs)]
+                if all(eps[i][1] + 1.0 < eps[i + 1][0] for i in range(len(eps) - 1)):
+                    break
+            self.mr_eps = eps
+            self.mr_det = [s0 + c['mr_lag'] * self.g_med for s0, _ in eps]
+        ru2 = random.Random(base + 89)
+        self.mr_unscan = [ru2.random() < self.m_sticky for _ in self.mr_eps]
+        # stats (measurement window = [warm, H])
+        self.busy = 0.0
+        self.idle = 0.0
+        self.cat = dict.fromkeys(CATS, 0.0)
+        self.n_verifies = 0
+        self.n_solo = 0
+        self.n_chain = 0
+        self.n_cancelled = 0
+        self.n_voided = 0
+        self.n_bounce = 0
+        self.n_landed = 0
+        self.n_block_bad = 0
+        self.n_block_good = 0
+        self.n_conv_bad = 0
+        self.n_conv_good = 0
+        self.n_clean = 0
+        self.n_rule_excl = 0
+        self.n_below_table = 0
+        self.n_above_table = 0
+        self.size_hist = [0] * 26
+        self.kind_n = {}
+        self.kind_out = {}   # kind -> [returned, passed, landed entries, landed items, torn/cancelled]
+        self.calib = [[0, 0.0, 0] for _ in range(10)]
+        self.calib_head = [[0, 0.0, 0] for _ in range(10)]   # nothing unlanded ahead at dispatch
+        self.calib_stack = [[0, 0.0, 0] for _ in range(10)]  # stacked on unlanded entries
+        self.red_ret = 0
+        self.redchain = {}
+        self.ov_time = 0.0       # hours with two or more verifies running
+        self.ov_unstacked = 0.0  # of which the newer one's tree does not contain the older one
+        self.head = dict(land=0, block=0, vac=0, bounce=0, reverify=0)
+        self.om = dict(n=0, land=0, stale=0, torn=0, red=0)   # fates of entries built on main behind another
+        self.n_accident = 0
+        self.n_adopt_cancel = 0
+        self.n_adopt_override = 0
+        self.n_reverify = 0
+        self.n_stale = 0
+        self.n_dissolved = 0
+        self.n_on_main = 0
+        self.n_redobs = 0
+        self.n_redobs_stacked = 0
+        self.n_nb_good = 0
+        self.n_nb_bad = 0
+        self.n_named = 0
+        self.n_named_right = 0
+        self.red_ret_inh = 0
+        self.last_t = 0.0
+
+    # ---- helpers
+    def _new_req(self, t, backlog):
+        c = self.cfg
+        if self.legacy:
+            u_high, u_cls, u_bad = self.rw.random(), 1.0, self.rw.random()
+        else:
+            u_high, u_cls, u_bad = self.rw.random(), self.rw.random(), self.rw.random()
+        het = c['hetero']
+        cls = 1 if (het and u_cls < het[0]) else 0
+        qb = c.get('q_blocks')
+        if qb:
+            q_now = qb[0] if int(t / qb[2]) % 2 == 0 else qb[1]
+        else:
+            q_now = self.class_q[cls]
+        r = Req(len(self.reqs), t, u_high < c['high_share'], u_bad < q_now, cls, backlog)
+        if not self.legacy:
+            r.unscan = (self.ru.random() < self.m_sticky) and r.bad
+        self.reqs.append(r)
+        (self.high if r.high else self.norm).append(r)
+        self.n_live += 1
+        return r
+
+    def topup(self):
+        if self.closed_N and self.t < self.closed_until:
+            while self.n_live < self.closed_N:
+                self._new_req(self.t, False)
+
+    def _push(self, t, kind, payload):
+        self.seq += 1
+        heapq.heappush(self.heap, (t, self.seq, kind, payload))
+
+    def L(self, msg):
+        if self.log is not None:
+            self.log.append('%7.3fh %s' % (self.t, msg))
+
+    def alive(self, rid):
+        return self.reqs[rid].state != 'done'
+
+    def in_mr(self, t):
+        for i, (s0, s1) in enumerate(self.mr_eps):
+            if s0 <= t < s1:
+                return i
+        return None
+
+    def snapshot(self, n, exclude=()):
+        out = []
+        if n <= 0:
+            return out
+        ex = self.pol.excluded
+        for buf in (self.high, self.norm):
+            for r in buf:
+                if r.reserved or ex(r.id) or r.id in exclude:
+                    continue
+                out.append(r.id)
+                if len(out) >= n:
+                    return out
+        return out
+
+    def waiting(self):
+        out = [r for r in self.park if not r.reserved]
+        for buf in (self.high, self.norm):
+            out.extend(r for r in buf if not r.reserved)
+        out.sort(key=lambda r: r.id)
+        return out
+
+    def pick(self):
+        if self.park:
+            return self.park.pop(0), 'park'
+        if self.cfg['picker'] == 'aging':
+            for buf in (self.high, self.norm):
+                best = None
+                for i, r in enumerate(buf):
+                    if not r.reserved and (best is None or r.id < buf[best].id):
+                        best = i
+                if best is not None:
+                    return buf.pop(best), 'lane'
+            return None, None
+        for buf in (self.high, self.norm):
+            for i, r in enumerate(buf):
+                if not r.reserved:
+                    del buf[i]
+                    return r, 'lane'
+        return None, None
+
+    def _take(self, r):
+        if r.state == 'park':
+            self.park.remove(r)
+        else:
+            (self.high if r.high else self.norm).remove(r)
+
+    def requeue(self, r):
+        r.state = 'buf'
+        r.reserved = False
+        (self.high if r.high else self.norm).append(r)
+
+    def retire(self, rid, outcome):
+        r = self.reqs[rid]
+        assert r.state != 'done', 'r%d retired twice' % rid
+        if r.state == 'buf':
+            (self.high if r.high else self.norm).remove(r)
+        elif r.state == 'park':
+            self.park.remove(r)
+        r.state = 'done'
+        r.reserved = False
+        r.done_t = self.t
+        r.outcome = outcome
+        r.solo_only = False
+        if outcome != 'landed' and r.bad and self.t >= self.warm and rid in self.first_disp:
+            self.b2b_sum += self.t - self.first_disp[rid]
+            self.b2b_n += 1
+            self.b2b_w.append(self.t - self.first_disp[rid])
+        self.n_live -= 1
+        self.pol.on_retire(rid, outcome)
+
+    def convict(self, rid, how='elim'):
+        r = self.reqs[rid]
+        assert r.state in ('buf', 'park') and not r.reserved
+        self.retire(rid, 'convicted')
+        if self.t >= self.warm:
+            if how == 'named':
+                if r.bad:
+                    self.n_nb_bad += 1
+                else:
+                    self.n_nb_good += 1
+            elif r.bad:
+                self.n_conv_bad += 1
+            else:
+                self.n_conv_good += 1
+        self.L('CONVICT(%s) r%d%s without its own verify' % (how, rid, '*' if r.bad else ' (GOOD: WRONG)'))
+
+    def lineage(self):
+        """The newest live entry and the live entries its tree is built on, oldest first."""
+        tip = None
+        for a in reversed(self.inflight):
+            if a.status not in ('vac', 'dead'):
+                tip = a
+                break
+        if tip is None:
+            return []
+        return [b for b in tip.base if not b.gone and b.status not in ('vac', 'dead')] + [tip]
+
+    def _name(self, e):
+        """The request a red verify's failing test points at, or None."""
+        c = self.cfg
+        if self.rn.random() < c['name_none']:
+            return None
+        order = [m for a in e.base for m in a.members] + list(e.members)
+        order = [m for m in order if self.reqs[m].state != 'done']
+        if not order:
+            return None
+        u = self.rn.random()
+        if e.cause in ('own', 'inh'):
+            bads = [m for m in order if self.reqs[m].bad]
+            goods = [m for m in order if not self.reqs[m].bad]
+            if bads and (u < c['name_acc'] or not goods):
+                return bads[0]
+            return self.rn.choice(goods) if goods else None
+        return self.rn.choice(order)   # a false failure or a red main still points at somebody
+
+    def _clip(self, a, b):
+        return max(0.0, min(b, self.H) - max(a, self.warm))
+
+    def _spend(self, e, cat, upto=None):
+        d = self._clip(e.t0, e.t1 if upto is None else upto)
+        self.cat[cat] += d
+
+    def _duration(self, e, red):
+        med = self.r_med if red else self.g_med
+        z = self.rd.gauss(0, 1)
+        d = med * math.exp(self.sig * z) if self.sig > 0 else med
+        if len(e.members) >= 2:
+            d += (self.cfg['build_base_min'] + self.cfg['build_link_min'] * (len(e.members) - 1)) / 60.0
+        return d
+
+    def _start(self, e):
+        self.free_hosts -= 1
+        e.status = 'run'
+        e.t0 = self.t
+        e.ver += 1
+        u = 1.0 if self.legacy else self.rf.random()
+        if e.mr is not None:
+            result, cause = 'red', 'mr'
+        elif e.tree_bad:
+            result, cause = 'red', ('own' if e.own_bad else 'inh')
+        elif u < self.cfg['e']:
+            result, cause = 'red', 'ff'
+        else:
+            result, cause = 'pass', None
+        e.cause = cause
+        if self.t >= self.warm:
+            self.n_verifies += 1
+            n = len(e.members)
+            if n >= 2:
+                self.n_chain += 1
+            else:
+                self.n_solo += 1
+            self.size_hist[min(n, 25)] += 1
+            self.kind_n[e.kind] = self.kind_n.get(e.kind, 0) + 1
+            if e.kind == 'clean':
+                self.n_clean += 1
+                if e.meta.get('tab_excl'):
+                    self.n_rule_excl += 1
+                tn = e.meta.get('tab_n', n)
+                if n < tn:
+                    self.n_below_table += 1
+                elif n > tn:
+                    self.n_above_table += 1
+        self._push(self.t + self._duration(e, result == 'red'), 'ret', (e, e.ver, result))
+
+    def dispatch(self, ent):
+        members = ent['members']
+        e = Entry(self.eid)
+        self.eid += 1
+        X = self.reqs[members[0]]
+        assert X.state in ('buf', 'park') and not X.reserved, 'owner r%d is not waiting' % X.id
+        if not ent.get('popped'):
+            self._take(X)
+        X.state = 'flight'
+        X.reserved = False
+        for lid in members[1:]:
+            r = self.reqs[lid]
+            assert r.state in ('buf', 'park') and not r.reserved, 'link r%d is not waiting' % lid
+            r.reserved = True
+        for m in members:
+            self.first_disp.setdefault(m, self.t)
+        e.owner = X.id
+        e.members = list(members)
+        e.basis = ent.get('basis')
+        e.kind = ent.get('kind') or ('chain' if len(members) >= 2 else 'single')
+        e.pred = ent.get('pred')
+        e.meta = ent
+        e.c3 = ent.get('c3', True)
+        e.own_bad = any(self.reqs[m].bad for m in members)
+        on_main = ent.get('base') == 'main'
+        if (not on_main and self.cfg['accident'] > 0.0 and self.lineage()
+                and self.rx.random() < self.cfg['accident']):
+            on_main = True
+            e.accident = True
+            if self.t >= self.warm:
+                self.n_accident += 1
+        if on_main:
+            # built on main: its verdict is about main + its own members only, and no
+            # entry ahead can kill its base
+            ahead = []
+            e.deps = set()
+            e.on_main = bool(self.inflight)
+            if e.on_main and self.t >= self.warm:
+                self.n_on_main += 1
+                self.om['n'] += 1
+        else:
+            ahead = self.lineage()
+            if ahead:
+                tip = ahead[-1]
+                e.deps = {d for d in tip.deps if not d.gone}
+                e.deps.add(tip)
+                e.deps.update(self.inflight[self.inflight.index(tip) + 1:])
+            else:
+                e.deps = set(self.inflight)
+        e.base = ahead
+        e.ahead = ahead
+        tree = set(members)
+        for a in ahead:
+            tree.update(a.members)
+        e.tree = tree
+        e.tree_bad = e.own_bad or any(a.own_bad for a in ahead)
+        e.mr = self.in_mr(self.t)
+        self.inflight.append(e)
+        self._start(e)
+        self.L('dispatch e%d slot%d %s members %s tree %s pred %s'
+               % (e.eid, len(self.inflight) - 1, e.kind,
+                  ['r%d%s' % (m, '*' if self.reqs[m].bad else '') for m in e.members],
+                  sorted(tree), None if e.pred is None else round(e.pred, 3)))
+
+    def try_dispatch(self):
+        if self.inflight and self.inflight[0].status == 'gatewait' and self.free_hosts > 0:
+            h = self.inflight[0]
+            h.mr = self.in_mr(self.t)
+            h.tree_bad = h.own_bad
+            self._start(h)
+            self.L('re-verify start e%d members %s' % (h.eid, h.members))
+        while len(self.inflight) < self.K and self.free_hosts > 0:
+            ent = self.pol.next_entry(self)
+            if ent is None:
+                return
+            self.dispatch(ent)
+
+    def _teardown(self, e, kind):
+        if e.status in ('run', 'ret') and e.t0 >= self.warm:
+            self.kind_out.setdefault(e.kind, [0, 0, 0, 0, 0])[4] += 1
+        if e.status == 'run':
+            self.free_hosts += 1
+            e.ver += 1
+            self.busy += self._clip(e.t0, self.t)
+            self._spend(e, 'torn', self.t)
+            if self.t >= self.warm:
+                self.n_cancelled += 1
+        elif e.status == 'ret':
+            self._spend(e, 'torn')
+            if self.t >= self.warm:
+                self.n_voided += 1
+        if e.status != 'vac':
+            o = self.reqs[e.owner]
+            if o.state != 'done':
+                if kind == 'blocked':
+                    o.state = 'park'
+                    o.reserved = False
+                    self.park.append(o)
+                else:
+                    self.requeue(o)
+            for lid in e.members[1:]:
+                self.reqs[lid].reserved = False
+            e.status = 'dead'
+            self.pol.on_fail(self, e)
+        e.status = 'dead'
+
+    def cascade(self, dead, kind):
+        """Tear down every entry whose base died with *dead*; an entry built on a base
+        with no dead link keeps its place and its verdict."""
+        if self.cfg['cascade'] == 'all':
+            behind = [x for x in self.inflight if x.eid > dead.eid]
+        else:
+            behind = [x for x in self.inflight if dead in x.deps]
+        if not behind:
+            return
+        gone = set(behind)
+        self.inflight = [x for x in self.inflight if x not in gone]
+        for e in behind:
+            e.gone = True
+            if e.on_main and self.t >= self.warm:
+                self.om['torn'] += 1
+            self._teardown(e, kind)
+        self.L('cascade(%s) tore down %s' % (kind, ['e%d' % e.eid for e in behind]))
+
+    def _adopt(self, e):
+        """Task 10995: e's green tree contains the entries it was built on, so they land
+        with it; a verify of theirs still running is cancelled and an undelivered red of
+        theirs is overridden."""
+        for b in e.base:
+            if b.gone or b.stale:
+                continue
+            if b.status == 'run':
+                self.free_hosts += 1
+                b.ver += 1
+                b.t1 = self.t
+                self.busy += self._clip(b.t0, self.t)
+                b.status = 'ret'
+                b.result = 'pass'
+                b.adopted = 'cancel'
+                if self.t >= self.warm:
+                    self.n_adopt_cancel += 1
+            elif b.status == 'ret' and b.result != 'pass':
+                b.result = 'pass'
+                b.adopted = 'override'
+                if self.t >= self.warm:
+                    self.n_adopt_override += 1
+
+    def _mark_stale(self, landed):
+        out = []
+        for x in self.inflight:
+            if landed not in x.base and not x.stale and x.status != 'vac':
+                x.stale = True
+                if self.t >= self.warm:
+                    self.n_stale += 1
+                    if x.on_main:
+                        self.om['stale'] += 1
+                if x.status == 'ret' and x.result == 'pass':
+                    out.append(x)
+        if self.cfg['reverify'] == 'pool':
+            for x in out:
+                if not x.gone:
+                    self._dissolve(x)
+
+    def _dissolve(self, e):
+        """A passed entry on a stale base: its members go back to the pool (the policy
+        knows they are good) and whatever was built on it is torn down."""
+        self.inflight.remove(e)
+        e.gone = True
+        self._spend(e, 'stale')
+        if self.t >= self.warm:
+            self.n_dissolved += 1
+        e.status = 'dead'
+        self.requeue(self.reqs[e.owner])
+        for lid in e.members[1:]:
+            self.reqs[lid].reserved = False
+        self.L('stale e%d dissolved, members %s back to the pool' % (e.eid, e.members))
+        self.cascade(e, 'requeued')
+
+    def _reverify_head(self, e):
+        """The head passed on a base that has since moved: verify again on the new main."""
+        self.cascade(e, 'requeued')
+        self._spend(e, 'stale')
+        if self.t >= self.warm:
+            self.n_reverify += 1
+            self.head['reverify'] += 1
+        if self.cfg['reverify'] == 'solo' and len(e.members) > 1:
+            for lid in e.members[1:]:
+                r = self.reqs[lid]
+                r.reserved = False
+                r.solo_only = True
+            e.members = [e.owner]
+            e.own_bad = self.reqs[e.owner].bad
+        e.status = 'gatewait'
+        e.base = []
+        e.ahead = []
+        e.deps = set()
+        e.tree = set(e.members)
+        e.stale = False
+        e.result = None
+        e.pred = None
+        e.kind = 'reverify'
+        self.L('head e%d is stale: re-verify %s' % (e.eid, e.members))
+
+    def finalize(self):
+        while self.inflight and self.inflight[0].status in ('ret', 'vac'):
+            e = self.inflight[0]
+            if e.status == 'ret' and e.result == 'pass' and e.stale:
+                if self.cfg['reverify'] == 'pool':
+                    self._dissolve(e)
+                    continue
+                self._reverify_head(e)
+                break
+            self.inflight.pop(0)
+            e.gone = True
+            if self.t >= self.warm:
+                hk = 'vac' if e.status == 'vac' else ('land' if e.result == 'pass' else (
+                    'bounce' if (e.result == 'void' or e.mr is not None) else 'block'))
+                self.head[hk] += 1
+                if hk == 'land' and e.on_main and e.kind != 'reverify':
+                    self.om['land'] += 1
+            if e.status == 'vac':
+                self.pol.on_applied(self, e, 'redchain')
+                self.L('head e%d vacated did not advance' % e.eid)
+                self.cascade(e, 'requeued')
+            elif e.result == 'pass':
+                e.landed = True
+                self._spend(e, 'adopt' if e.adopted == 'cancel' else 'land')
+                for m in e.members:
+                    self.retire(m, 'landed')
+                if self.t >= self.warm:
+                    self.n_landed += len(e.members)
+                if e.t0 >= self.warm:
+                    ko = self.kind_out.setdefault(e.kind, [0, 0, 0, 0, 0])
+                    ko[2] += 1
+                    ko[3] += len(e.members)
+                self.pol.on_applied(self, e, 'pass')
+                self.L('head e%d LANDS %s' % (e.eid, e.members))
+                self._mark_stale(e)
+            elif e.result == 'void' or e.mr is not None:
+                self._spend(e, 'mr')
+                if self.t >= self.warm:
+                    self.n_bounce += 1
+                e.status = 'dead'
+                self.requeue(self.reqs[e.owner])
+                self.pol.on_bounce(self, e)
+                self.L('head e%d main-red solo: r%d bounced, not blocked' % (e.eid, e.owner))
+                self.cascade(e, 'requeued')
+            else:
+                self._spend(e, 'block')
+                o = self.reqs[e.owner]
+                o.own_verified = True
+                if self.t >= self.warm:
+                    if o.bad:
+                        self.n_block_bad += 1
+                    else:
+                        self.n_block_good += 1
+                self.retire(e.owner, 'blocked')
+                self.pol.on_applied(self, e, 'block')
+                self.L('head e%d BLOCKS r%d%s' % (e.eid, e.owner, '*' if o.bad else ' (GOOD)'))
+                self.cascade(e, 'blocked')
+
+    def scan_trees(self, k, mode):
+        if mode in ('solo', 'pbin'):
+            return _trees(k, mode)
+        if mode == 'free':
+            return 0
+        return (k + 1) if mode == 'lin' else (int(math.ceil(math.log2(k))) + 1 if k > 1 else 2)
+
+    def _base_bad(self, e):
+        return e.mr is not None or any(a.own_bad for a in e.base)
+
+    def _scan_apply(self, e):
+        """Verdict of the scan: a failing base blames nobody; otherwise every defective own member is
+        blocked (T2: only the first in land order, later ones verify alone) and the sound ones are known good."""
+        sc = self.cfg['scan']
+        L = e.members
+        base_bad = self._base_bad(e)
+        blocked, goods, later = [], [], []
+        if not base_bad:
+            for m in L:
+                if not self.reqs[m].bad:
+                    goods.append(m)
+                elif blocked and sc.get('first_only'):
+                    later.append(m)
+                else:
+                    blocked.append(m)
+        if sc['mode'] == 'pbin' and blocked:
+            i = L.index(blocked[0])     # the prefix search stops at the first culprit: what is behind it stays unknown
+            goods = [m for m in L[:i]]
+            blocked = blocked[:1]
+            later = []
+        for lid in L[1:]:
+            self.reqs[lid].reserved = False
+        for m in blocked:
+            if self.t >= self.warm:
+                self.n_block_bad += 1
+            self.retire(m, 'blocked')
+        o = self.reqs[e.owner]
+        if o.state != 'done':
+            self.requeue(o)
+        return blocked, goods, later, base_bad
+
+    def _scan_dur(self, e):
+        sc = self.cfg['scan']
+        k = len(e.members)
+        trees = self.scan_trees(k, sc['mode'])
+        if self.scan_conc > 1 and sc['mode'] == 'solo':
+            trees = 2 + int(math.ceil(k / float(self.scan_conc)))   # member trees run side by side; base and tip first
+        if sc.get('confirm') and not self._base_bad(e):
+            nb = sum(1 for m in e.members if self.reqs[m].bad)
+            trees += min(nb, 1) if (sc.get('first_only') or sc['mode'] == 'pbin') else nb
+        return sc['ct'] * trees * self.g_med
+
+    def scan_backlog(self):
+        """Hours until the scan resource would start a job queued now."""
+        w = sum(max(0.0, t1 - self.t) for t1 in self.scan_ends) + sum(d for _, d, _ in self.scanq)
+        return w / self.scan_nres
+
+    def _scan_done(self, e):
+        """The failing tests were re-run on the base and on the prefixes: every defective
+        own member is blocked now; a failing base blames nobody."""
+        self.free_hosts += 1
+        e.result = 'red'
+        e.t1 = self.t
+        self.busy += self._clip(e.t0, self.t)
+        self.scan_time += self._clip(e.meta['scan_t0'], self.t)
+        if e.t0 >= self.warm:
+            self.kind_out.setdefault(e.kind, [0, 0, 0, 0, 0])[0] += 1
+        base_bad = self._base_bad(e)
+        self._spend(e, 'mr' if e.mr is not None else ('inh' if base_bad else 'ownred'))
+        blocked, goods, later, base_bad = self._scan_apply(e)
+        e.status = 'vac'
+        if later:
+            self.pol.on_alone(self, later, 'behind')
+        self.pol.on_scan(self, e, blocked, goods, base_bad)
+        self.pol.on_fail(self, e)
+        self.finalize()
+        self.pol.tick(self)
+        self.topup()
+        self.try_dispatch()
+
+    def _scan_offhost(self, e, dur):
+        """T3: the verify host is released at the red return; the entry is vacated and its members are
+        held (not pickable) until the scan, queued FIFO on its own resource, has finished."""
+        self.free_hosts += 1
+        e.result = 'red'
+        e.t1 = self.t
+        self.busy += self._clip(e.t0, self.t)
+        if e.t0 >= self.warm:
+            self.kind_out.setdefault(e.kind, [0, 0, 0, 0, 0])[0] += 1
+        self._spend(e, 'mr' if e.mr is not None else ('inh' if self._base_bad(e) else 'ownred'))
+        e.status = 'vac'
+        e.meta['held'] = True
+        self.pol.on_fail(self, e)
+        self.scanq.append((e, dur, self.t))
+        self.L('red e%d %s: scan queued (%s), members %s' % (e.eid, e.status, 'unscannable' if e.meta.get('unscan') else 'scannable', e.members))
+        self.scan_qmax = max(self.scan_qmax, len(self.scanq))
+        self._scan_pump()
+        self.finalize()
+        self.pol.tick(self)
+        self.topup()
+        self.try_dispatch()
+
+    def _scan_pump(self):
+        while self.scan_free > 0 and self.scanq:
+            e, dur, tq = self.scanq.popleft()
+            self.scan_free -= 1
+            if tq >= self.warm:
+                self.scan_waits.append(self.t - tq)
+                self.scan_holds.append(self.t + dur - tq)
+            self.scan_res_busy += self._clip(self.t, self.t + dur)
+            self.scan_ends.append(self.t + dur)
+            self._push(self.t + dur, 'scandone', e)
+
+    def on_scandone(self, e):
+        self.scan_free += 1
+        self.scan_ends = [t1 for t1 in self.scan_ends if t1 > self.t + 1e-12]
+        self.L('scan done e%d %s held=%s unscan=%s' % (e.eid, e.status, e.meta.get('held'), e.meta.get('unscan')))
+        if e.meta.get('scan_dummy'):
+            self._scan_pump()
+            return
+        if not e.meta.get('unscan'):
+            e.meta['held'] = False
+            blocked, goods, later, base_bad = self._scan_apply(e)
+            if later:
+                self.pol.on_alone(self, later, 'behind')
+            self.pol.on_scan(self, e, blocked, goods, base_bad)
+        elif e.meta.get('held'):        # a batch: its members are released to the fallback
+            e.meta['held'] = False
+            for lid in e.members[1:]:
+                self.reqs[lid].reserved = False
+            self.requeue(self.reqs[e.owner])
+            if e.t0 >= self.warm:
+                self.n_redobs += 1
+                self.red_ret += 1
+            self.pol.on_return(self, e, 'red')
+        self._scan_pump()
+        self.pol.tick(self)
+        self.topup()
+        self.try_dispatch()
+
+    def _no_evidence(self, e):
+        """T4: the verify returned nothing usable: the entry does not land and every member verifies alone."""
+        self.free_hosts += 1
+        e.result = 'noev'
+        e.t1 = self.t
+        self.busy += self._clip(e.t0, self.t)
+        if e.t0 >= self.warm:
+            self.kind_out.setdefault(e.kind, [0, 0, 0, 0, 0])[0] += 1
+            self.n_noev += 1
+        self._spend(e, 'noev')
+        self.L('no evidence e%d members %s' % (e.eid, e.members))
+        for lid in e.members[1:]:
+            self.reqs[lid].reserved = False
+        self.requeue(self.reqs[e.owner])
+        e.status = 'vac'
+        self.pol.on_alone(self, list(e.members), 'noev')
+        self.pol.on_fail(self, e)
+        self.finalize()
+        self.pol.tick(self)
+        self.topup()
+        self.try_dispatch()
+
+    def _unscannable(self, e, sc):
+        if sc.get('miss_model') == 'sticky':
+            R = self.reqs
+            if any(R[m].unscan for m in e.members) or any(R[m].unscan for a in e.base for m in a.members):
+                return True
+            return e.mr is not None and self.mr_unscan[e.mr]
+        return self.rs.random() < sc['miss']
+
+    def on_ret(self, e, ver, result):
+        if e.ver != ver or e.status != 'run':
+            return
+        sc = self.cfg['scan']
+        if self.cfg['noev'] > 0.0 and result != 'scan' and 'scan_t0' not in e.meta and self.rv.random() < self.cfg['noev']:
+            self._no_evidence(e)
+            return
+        if sc and result == 'red' and 'scan_t0' not in e.meta:
+            if not (e.mr is not None and self.pol.mr_fix and self.t >= self.mr_det[e.mr]):
+                if e.cause == 'ff' and sc['flake'] == 'pass':
+                    result = 'pass'          # the flake re-run turns it into a pass
+                elif not self.pol.want_scan(self, e):
+                    e.meta['unscan'] = True      # the lane chose not to scan this red: straight to the fallback
+                    e.meta['noscan'] = True
+                    if e.t0 >= self.warm:
+                        self.n_noscan += 1
+                elif self._unscannable(e, sc):
+                    e.meta['unscan'] = True
+                    if e.t0 >= self.warm:
+                        self.n_unscan += 1
+                    dur = sc['ct'] * sc.get('miss_trees', 0) * self.g_med
+                    if dur > 0.0:           # the base and the tip are re-run; the tip does not reproduce the failure
+                        e.meta['scan_t0'] = self.t
+                        if sc.get('offhost'):
+                            if len(e.members) > 1:
+                                self._scan_offhost(e, dur)
+                                return
+                            # a red single blocks at the head whatever its scan says: the two trees only load the resource
+                            del e.meta['scan_t0']
+                            e.meta['scan_dummy'] = True
+                            self.scanq.append((e, dur, self.t))
+                            self.scan_qmax = max(self.scan_qmax, len(self.scanq))
+                            self._scan_pump()
+                        else:
+                            e.ver += 1
+                            self._push(self.t + dur, 'ret', (e, e.ver, 'red'))
+                            return
+                else:
+                    e.meta['scan_t0'] = self.t
+                    if self.t >= self.warm:
+                        self.n_scan += 1
+                    dur = self._scan_dur(e)
+                    if sc.get('offhost'):
+                        self._scan_offhost(e, dur)
+                        return
+                    if dur > 0.0:
+                        e.ver += 1
+                        self._push(self.t + dur, 'ret', (e, e.ver, 'scan'))
+                        return
+                    result = 'scan'
+        if result == 'scan':
+            if e.cause != 'ff':
+                self._scan_done(e)
+                return
+            self.scan_time += self._clip(e.meta['scan_t0'], self.t)
+            result = 'red'                   # nothing reproduced: the red stands as it would without a scan
+        elif result == 'red' and e.meta.get('unscan') and 'scan_t0' in e.meta:
+            self.scan_time += self._clip(e.meta['scan_t0'], self.t)
+        self.free_hosts += 1
+        e.result = result
+        e.t1 = self.t
+        self.busy += self._clip(e.t0, self.t)
+        L = e.members
+        chain = len(L) >= 2
+        for m in L:
+            self.reqs[m].n_verifies += 1
+        if e.t0 >= self.warm:
+            ko = self.kind_out.setdefault(e.kind, [0, 0, 0, 0, 0])
+            ko[0] += 1
+            ko[1] += result == 'pass'
+        if e.pred is not None and e.t0 >= self.warm:
+            for cal in (self.calib, self.calib_head if len(e.tree) == len(e.members) else self.calib_stack):
+                b = cal[min(9, int(e.pred * 10))]
+                b[0] += 1
+                b[1] += e.pred
+                b[2] += result == 'pass'
+        if result == 'red' and e.on_main and e.t0 >= self.warm:
+            self.om['red'] += 1
+        if result == 'red' and e.t0 >= self.warm:
+            self.red_ret += 1
+            if e.cause == 'inh':
+                self.red_ret_inh += 1
+            if chain:
+                self.redchain[e.cause] = self.redchain.get(e.cause, 0) + 1
+        void = (e.mr is not None and self.pol.mr_fix and self.t >= self.mr_det[e.mr])
+        idx = self.inflight.index(e)
+        if void:
+            e.result = 'void'
+            self.pol.on_fail(self, e)
+        else:
+            if result == 'red':
+                if e.t0 >= self.warm:
+                    self.n_redobs += 1
+                    if len(e.tree) > len(e.members):
+                        self.n_redobs_stacked += 1
+                if self.cfg['name_acc'] is not None:
+                    N = self._name(e)
+                    e.meta['named'] = N
+                    if N is not None and e.t0 >= self.warm:
+                        self.n_named += 1
+                        self.n_named_right += self.reqs[N].bad
+            self.pol.on_return(self, e, result)
+            if result == 'red':
+                self.pol.on_fail(self, e)
+        self.L('return e%d slot%d %s%s members %s' % (e.eid, idx, e.result, '(%s)' % e.cause if e.cause else '', L))
+        if chain and e.result != 'pass':
+            self._spend(e, {'own': 'ownred', 'inh': 'inh', 'ff': 'ff', 'mr': 'mr'}[e.cause])
+            e.status = 'vac'
+            for lid in L[1:]:
+                self.reqs[lid].reserved = False
+            self.requeue(self.reqs[e.owner])
+            if self.cfg['prompt_vac']:
+                self.inflight.pop(idx)
+                e.gone = True
+                self.pol.on_applied(self, e, 'redchain')
+                self.cascade(e, 'requeued')
+        else:
+            e.status = 'ret'
+            if e.stale and e.result == 'pass' and self.cfg['reverify'] == 'pool':
+                self._dissolve(e)
+            elif self.cfg['adopt'] and e.result == 'pass' and not e.stale and e.base:
+                self._adopt(e)
+        self.finalize()
+        self.pol.tick(self)
+        self.topup()
+        self.try_dispatch()
+
+    def on_arr(self):
+        self._new_req(self.t, False)
+        self.try_dispatch()
+
+    def on_restart(self):
+        for e in list(self.inflight):
+            e.gone = True
+            self._teardown(e, 'requeued')
+        self.inflight = []
+        for r in list(self.park):
+            held = r.reserved       # still a member of a vacated entry whose scan has not finished
+            self.park.remove(r)
+            self.requeue(r)
+            r.reserved = held
+        self.high.sort(key=lambda r: r.id)
+        self.norm.sort(key=lambda r: r.id)
+        self.pol.on_restart(self)
+        self.L('RESTART')
+        self.pol.tick(self)
+        self.topup()
+        self.try_dispatch()
+
+    def run(self):
+        H = self.H
+        self.try_dispatch()
+        while self.heap:
+            t, _, kind, payload = heapq.heappop(self.heap)
+            if t > H:
+                break
+            dt = self._clip(self.t, t)
+            self.idle += self.free_hosts * dt
+            if dt > 0.0:
+                running = [x for x in self.inflight if x.status == 'run']
+                if len(running) >= 2:
+                    self.ov_time += dt
+                    if any(running[i - 1] not in running[i].base for i in range(1, len(running))):
+                        self.ov_unstacked += dt
+            self.t = t
+            if kind == 'ret':
+                self.on_ret(*payload)
+            elif kind == 'arr':
+                self.on_arr()
+            elif kind == 'restart':
+                self.on_restart()
+            elif kind == 'scandone':
+                self.on_scandone(payload)
+        self.idle += self.free_hosts * self._clip(self.t, H)
+        for e in self.inflight:
+            if e.status == 'run':
+                self.busy += self._clip(e.t0, H)
+        self.t = H
+        return self.metrics()
+
+    def metrics(self):
+        H, W = self.H, self.warm
+        span = H - W
+        R = self.reqs
+        cohort = [r for r in R if W <= r.arr <= H - self.cfg['cohort_tail']]
+        good_w, good_c, bad_w, bad_c = [], 0, [], 0
+        for r in cohort:
+            if not r.bad:
+                if r.outcome == 'landed':
+                    good_w.append(r.done_t - r.arr)
+                elif r.outcome is None:
+                    good_c += 1
+                    good_w.append(float('inf'))
+            else:
+                if r.outcome in ('blocked', 'convicted'):
+                    bad_w.append(r.done_t - r.arr)
+                elif r.outcome is None:
+                    bad_c += 1
+                    bad_w.append(float('inf'))
+        B = getattr(self.pol, 'B', None)
+        return dict(
+            landings=self.n_landed, thr=self.n_landed / span,
+            busy=self.busy, idle=self.idle, lvh=self.n_landed / self.busy if self.busy else 0.0,
+            verifies=self.n_verifies, solo=self.n_solo, chain=self.n_chain,
+            cancelled=self.n_cancelled, voided=self.n_voided, bounce=self.n_bounce,
+            block_bad=self.n_block_bad, block_good=self.n_block_good,
+            conv_bad=self.n_conv_bad, conv_good=self.n_conv_good,
+            cat=dict(self.cat), n_clean=self.n_clean, rule_excl=self.n_rule_excl,
+            below_table=self.n_below_table, above_table=self.n_above_table,
+            size_hist=list(self.size_hist), kind_n=dict(self.kind_n),
+            kind_out={k: list(v) for k, v in self.kind_out.items()},
+            calib=[list(b) for b in self.calib],
+            calib_head=[list(b) for b in self.calib_head], calib_stack=[list(b) for b in self.calib_stack],
+            good_w=good_w, good_c=good_c, bad_w=bad_w, bad_c=bad_c,
+            red_ret=self.red_ret, red_ret_inh=self.red_ret_inh, redchain=dict(self.redchain),
+            waiting_end=self.n_live, arrived=len(R),
+            max_group=B.max_group if B else 0, builds=B.n_builds if B else 0,
+            reverify=self.n_reverify, stale=self.n_stale, dissolved=self.n_dissolved, on_main=self.n_on_main,
+            redobs=self.n_redobs, redobs_stacked=self.n_redobs_stacked,
+            nb_good=self.n_nb_good, nb_bad=self.n_nb_bad, named=self.n_named, named_right=self.n_named_right,
+            pstat=dict(getattr(self.pol, 'stat', {}) or {}),
+            ov_time=self.ov_time, ov_unstacked=self.ov_unstacked, head=dict(self.head), om=dict(self.om),
+            accident=self.n_accident, adopt_cancel=self.n_adopt_cancel, adopt_override=self.n_adopt_override,
+            scan_time=self.scan_time, n_scan=self.n_scan, b2b_sum=self.b2b_sum, b2b_n=self.b2b_n,
+            bad_landed=sum(1 for r in R if r.bad and r.outcome == 'landed'),
+            n_unscan=self.n_unscan, n_noscan=self.n_noscan, n_noev=self.n_noev, scan_waits=list(self.scan_waits), scan_holds=list(self.scan_holds),
+            scan_res_busy=self.scan_res_busy, scan_q_end=len(self.scanq), scan_qmax=self.scan_qmax, b2b_w=list(self.b2b_w),
+            kb=(self.pol.KB[int(round(self.cfg['q'] * self.pol.NA))] if getattr(self.pol, 'KB', None) else None),
+            a_q=(self.pol.a(self.cfg['q']) if hasattr(self.pol, 'a') else None),
+        )
+
+
+# ------------------------------------------------------------------ factory
+def make_policy(spec, cfg):
+    """spec: a name, or (name, kwargs)."""
+    if isinstance(spec, str):
+        name, kw = spec, {}
+    else:
+        name, kw = spec[0], dict(spec[1])
+    het = cfg.get('hetero')
+    q_lane = (het[0] * het[1] + (1 - het[0]) * het[2]) if het else cfg.get('q', DEFAULT_CFG['q'])
+    base = kw.pop('base', name)
+    if base == 'OFF':
+        return Off()
+    if base == 'M':
+        return MainPolicy('M', cap=kw.get('cap', 6))
+    if base == 'I':
+        return TPolicy(name, table=kw.get('table', TABLE_OLD), fold_at='applied')
+    if base == 'T':
+        return TPolicy(name, **kw)
+    if base == 'T+':
+        d = dict(fix_i=True, mr_fix=True, persist=True)
+        d.update(kw)
+        if d.get('static_depth') == 'table':
+            d['static_depth'] = table_row(1.0 - q_lane, d.get('table', TABLE_NEW))
+        return TPolicy(name, **d)
+    if base == 'O':
+        cap = kw.get('cap', 12)
+        if cap == 'table':
+            cap = table_row(1.0 - q_lane, TABLE_NEW)
+        return Oracle(cap, name)
+    if base == 'J':
+        prior = kw.pop('prior', None)
+        if prior is None:
+            prior = q_lane
+        return JPolicy(name, prior, **kw)
+    if base == 'U':
+        prior = kw.pop('prior', None)
+        if prior is None:
+            prior = q_lane
+        return UPolicy(name, prior, **kw)
+    raise ValueError(name)
+
+
+def run_one(cfg, spec, seed, log=False):
+    eng = Engine(cfg, make_policy(spec, cfg), seed, log=log)
+    m = eng.run()
+    return (m, eng) if log else m

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import subprocess
 import sys
@@ -9,10 +10,12 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from _git_fixtures import RepoSeed, seed_repo
 from fastmcp import FastMCP
 
+from orchestrator import quarantine_provenance
 from orchestrator.artifacts import TaskArtifacts
-from orchestrator.mcp import plan_tools
+from orchestrator.mcp import plan_markup_stamp, plan_tools
 from orchestrator.mcp.plan_tools import (
     _add_design_decision,
     _add_plan_step,
@@ -22,6 +25,7 @@ from orchestrator.mcp.plan_tools import (
     _coerce_files,
     _confirm_plan,
     _create_plan,
+    _drop_plan_file,
     _mark_step_done,
     _remove_plan_step,
     _replace_plan_step,
@@ -32,6 +36,21 @@ from orchestrator.mcp.plan_tools import (
     _report_unactionable_task,
     _update_plan_metadata,
 )
+
+
+@pytest.fixture(autouse=True)
+def _clear_pending_refusals():
+    """Clear the markup stamp's pending buffer around every test in this module.
+
+    THE SAME shape and the same reason as
+    ``test_plan_tools_markup_guard._clear_pending_refusals``: process-global
+    state on a per-agent stdio server, which one test would otherwise leak into
+    the next. ``_confirm_plan`` READS that buffer (task 4597), so without this
+    a buffered refusal would inflate an unrelated test's reported count.
+    """
+    plan_markup_stamp.clear_pending()
+    yield
+    plan_markup_stamp.clear_pending()
 
 
 @pytest.fixture()
@@ -129,6 +148,17 @@ class TestCoerceFiles:
             'residual bracket/quote characters' in r.getMessage() for r in caplog.records
         )
 
+    @pytest.mark.parametrize('value', [{'a.py': 1}, 42])
+    def test_unrecognized_type_maps_to_empty_and_logs_warning(self, caplog, value):
+        """A ``files`` value read back from a stored plan has passed no
+        pydantic boundary, so a type that is neither list, str nor None must
+        degrade to no files, loudly, rather than raise."""
+        with caplog.at_level(logging.WARNING, logger='orchestrator.mcp.plan_tools'):
+            result = _coerce_files(value)
+
+        assert result == []
+        assert any('unrecognized type' in r.getMessage() for r in caplog.records)
+
 
 # ---------------------------------------------------------------------------
 # Architect tool tests
@@ -188,6 +218,148 @@ class TestCreatePlan:
         )
 
         assert artifacts.read_plan() == {}
+
+
+class TestCreatePlanCarriesTheRejectionCounterThroughTheAlgebra:
+    """``_create_plan`` overwrites plan.json WHOLESALE (task 4597).
+
+    It is therefore the one consumer that takes a stored ``_markup_rejections``
+    block and puts it straight into a document it is about to author. Every
+    other consumer (``merge_block``, ``summary``) already treats plan.json as
+    agent-adjacent and degrades what it finds; copying the on-disk value
+    verbatim would be the single path that launders a mangled block into a
+    brand-new plan — and from there into the four architect-facing prompts that
+    embed the document.
+    """
+
+    KEY = plan_markup_stamp.PLAN_MARKUP_REJECTIONS_KEY
+
+    def _seed_with_block(self, artifacts, block):
+        _create_plan(artifacts, 'test-1', 'T', 'A', ['m.py'])
+        plan = artifacts.read_plan()
+        plan[self.KEY] = block
+        artifacts.write_plan(plan)
+
+    def test_a_usable_block_survives_the_overwrite(self, artifacts):
+        """Without this, a re-plan erases a counter earned earlier."""
+        self._seed_with_block(artifacts, plan_markup_stamp.block_of({
+            'ts': '2026-09-07T00:00:00+00:00',
+            'tool': 'add_design_decision',
+            'param': 'decision',
+            'outcome': 'rejected',
+        }))
+
+        _create_plan(artifacts, 'test-1', 'T2', 'A2', ['m.py'])
+
+        block = artifacts.read_plan()[self.KEY]
+        assert block['count'] == 1
+        assert block['by_tool'] == {'add_design_decision': 1}
+        assert block['note'] == plan_markup_stamp.STAMP_NOTE
+
+    def test_a_mangled_block_is_normalised_rather_than_copied(self, artifacts):
+        """The junk is re-projected, not laundered into the new document."""
+        self._seed_with_block(artifacts, {
+            'count': 2,
+            'by_tool': {'add_design_decision': 'lots', 'add_reuse_item': 2},
+            'events': [{'tool': 'add_design_decision', 'unreviewed_key': 'x' * 900}],
+            'note': 'a hand-edited note that is not the constant',
+        })
+
+        _create_plan(artifacts, 'test-1', 'T2', 'A2', ['m.py'])
+
+        block = artifacts.read_plan()[self.KEY]
+        assert block['count'] == 2
+        assert block['by_tool'] == {'add_design_decision': 0, 'add_reuse_item': 2}
+        assert block['note'] == plan_markup_stamp.STAMP_NOTE
+        assert set(block['events'][0]) <= set(plan_markup_stamp.STAMP_EVENT_KEYS), (
+            'an unreviewed key must not ride a carry-forward into a new plan'
+        )
+
+    def test_an_unrecoverable_block_is_dropped_rather_than_zeroed(self, artifacts):
+        """``None`` from the algebra means NO KEY, not a present-and-zero one.
+
+        The key's PRESENCE is the whole signal, so laundering junk into an
+        empty block would put a key meaning nothing onto a brand-new plan.
+        """
+        for junk in ('a string', 42, ['a', 'list'], {}, {'count': 'seven'}):
+            self._seed_with_block(artifacts, junk)
+
+            _create_plan(artifacts, 'test-1', 'T2', 'A2', ['m.py'])
+
+            assert self.KEY not in artifacts.read_plan(), (
+                f'{junk!r} holds no recorded refusal and must not become a key'
+            )
+
+    def test_the_clean_path_still_writes_no_key_at_all(self, artifacts):
+        """THE OVERWHELMINGLY COMMON PATH stays byte-identical to today."""
+        _create_plan(artifacts, 'test-1', 'T', 'A', ['m.py'])
+
+        _create_plan(artifacts, 'test-1', 'T2', 'A2', ['m.py'])
+
+        assert self.KEY not in artifacts.read_plan()
+
+
+def _quarantine_stamp(reason: str) -> dict[str, Any]:
+    return {
+        'branch': f'task/test-1-{reason}',
+        'tip_sha': 'abc123',
+        'unique_commit_count': 2,
+        'quarantined_at': '2026-11-12T00:00:00+00:00',
+        'reason': reason,
+        'parking': f'/quarantine/test-1-{reason}',
+        'stored_title': None,
+    }
+
+
+class TestCreatePlanCarriesQuarantineProvenance:
+    """A quarantine's ``_quarantined_from`` back-pointer survives a wholesale re-plan (task 4845)."""
+
+    KEY = quarantine_provenance.QUARANTINED_FROM_KEY
+
+    def test_a_re_plan_keeps_every_stamp_in_order_and_resets_steps(self, artifacts):
+        _create_plan(artifacts, 'test-1', 'T', 'A', ['m.py'])
+        first, second = _quarantine_stamp('orphan-reaper'), _quarantine_stamp('recovery-record-divergence')
+        assert quarantine_provenance.stamp_quarantined_from(artifacts, first)
+        assert quarantine_provenance.stamp_quarantined_from(artifacts, second)
+
+        assert _create_plan(artifacts, 'test-1', 'Re-plan', 'A2', ['b.py'])['status'] == 'ok'
+
+        plan = artifacts.read_plan()
+        assert plan['title'] == 'Re-plan'
+        assert plan['files'] == ['b.py']
+        assert plan['steps'] == []
+        assert plan[self.KEY] == [first, second]
+
+    def test_an_unstamped_plan_gains_no_key(self, artifacts):
+        _create_plan(artifacts, 'test-1', 'T', 'A', ['m.py'])
+
+        _create_plan(artifacts, 'test-1', 'Re-plan', 'A2', ['b.py'])
+
+        assert self.KEY not in artifacts.read_plan()
+
+    def test_only_the_normalized_projection_survives(self, artifacts):
+        _create_plan(artifacts, 'test-1', 'T', 'A', ['m.py'])
+        valid = _quarantine_stamp('orphan-reaper')
+        extra = {**_quarantine_stamp('recovery-identity-mismatch'), 'unreviewed': 'x' * 900}
+        plan = artifacts.read_plan()
+        plan[self.KEY] = [valid, 'not-a-dict', extra]
+        artifacts.write_plan(plan)
+
+        _create_plan(artifacts, 'test-1', 'Re-plan', 'A2', ['b.py'])
+
+        assert artifacts.read_plan()[self.KEY] == [valid, _quarantine_stamp('recovery-identity-mismatch')]
+
+    def test_the_orchestrator_stampers_keep_the_back_pointer(self, artifacts):
+        _create_plan(artifacts, 'test-1', 'T', 'A', ['m.py'])
+        _add_plan_step(artifacts, 'step-1', 'test', 'Write test for foo')
+        _add_plan_step(artifacts, 'step-2', 'impl', 'Implement foo')
+        quarantine_provenance.stamp_quarantined_from(artifacts, _quarantine_stamp('orphan-reaper'))
+        before = json.dumps(artifacts.read_plan()[self.KEY])
+
+        artifacts.stamp_plan_provenance('orch-sess-2', task_text_fp='tfp:abc')
+        artifacts.bump_revalidation_stamp('orch-sess-3')
+
+        assert json.dumps(artifacts.read_plan()[self.KEY]) == before
 
 
 class TestAddPlanStep:
@@ -288,6 +460,45 @@ class TestAddReuseItem:
 # ---------------------------------------------------------------------------
 
 
+_GIT_ARTIFACTS_SEED = RepoSeed(
+    files=(('.gitignore', '.task/\n'), ('m.py', 'x = 1\n')), message='Initial',
+)
+
+
+@pytest.fixture()
+def git_artifacts(tmp_path):
+    """TaskArtifacts pointing at a REAL git worktree (task 3651).
+
+    Mirrors ``test_reconcile_done_step_commits.py::_init_repo`` — including the
+    ``.gitignore`` = ``.task/`` line, without which ``git add -A`` would stage
+    the artifacts dir into the test's commits. Needed because
+    ``_mark_step_done``'s reachability guard shells out to real git; the plain
+    ``artifacts`` fixture (a bare temp dir) deliberately exercises the
+    git-unavailable fall-through instead.
+    """
+    repo = seed_repo(tmp_path / 'worktree', _GIT_ARTIFACTS_SEED)
+    a = TaskArtifacts(repo)
+    a.init('test-1', 'Test task', 'A test')
+    return a
+
+
+#: The opening angle bracket, spelled so no raw envelope sentinel ever
+#: appears verbatim in this file (a literal here corrupts the tool call
+#: that writes it). Same discipline as test_plan_tools_markup_repair.py.
+LT = chr(60)
+
+
+def _git_commit_file(repo: Path, name: str, content: str, message: str) -> str:
+    """Write, stage and commit *name*; return the resulting sha."""
+    (repo / name).write_text(content)
+    subprocess.run(['git', 'add', '-A'], cwd=repo, check=True, capture_output=True)
+    subprocess.run(['git', 'commit', '-m', message], cwd=repo, check=True, capture_output=True)
+    out = subprocess.run(
+        ['git', 'rev-parse', 'HEAD'], cwd=repo, check=True, capture_output=True, text=True,
+    )
+    return out.stdout.strip()
+
+
 class TestMarkStepDone:
     def _setup_plan(self, artifacts):
         _create_plan(artifacts, 'test-1', 'T', 'A', ['m.py'])
@@ -332,6 +543,187 @@ class TestMarkStepDone:
         result = _mark_step_done(artifacts, 'nonexistent', 'abc123')
         assert result['status'] == 'error'
         assert 'not found' in result['message']
+
+    # -- task 3651: on-branch reachability guard --------------------------
+
+    def test_reachable_sha_is_recorded(self, git_artifacts):
+        """The ordinary implementer path: a sha the branch actually carries is
+        accepted and recorded unchanged. Guards against the new reachability
+        check rejecting legitimate work."""
+        self._setup_plan(git_artifacts)
+        sha = _git_commit_file(
+            git_artifacts.worktree, 'm.py', 'x = 2\n', 'feat: step-1',
+        )
+
+        result = _mark_step_done(git_artifacts, 'step-1', sha)
+
+        assert result['status'] == 'ok'
+        assert result['commit'] == sha
+        plan = git_artifacts.read_plan()
+        assert plan['steps'][0]['status'] == 'done'
+        assert plan['steps'][0]['commit'] == sha
+
+    def test_unreachable_sha_is_rejected(self, git_artifacts):
+        """A REAL commit object that is not an ancestor of HEAD (it lives on a
+        side branch) must be refused, and NOTHING may be written to the plan.
+
+        This is the defect: today _mark_step_done records any string verbatim,
+        so a step can end up pointing at a sha the branch does not carry."""
+        self._setup_plan(git_artifacts)
+        repo = git_artifacts.worktree
+        subprocess.run(['git', 'switch', '-c', 'other'], cwd=repo, check=True, capture_output=True)
+        side_sha = _git_commit_file(repo, 'side.py', 'side\n', 'feat: on a side branch')
+        subprocess.run(['git', 'switch', 'main'], cwd=repo, check=True, capture_output=True)
+        # The object exists...
+        assert subprocess.run(
+            ['git', 'cat-file', '-e', side_sha], cwd=repo, capture_output=True,
+        ).returncode == 0
+        # ...but is not reachable from HEAD.
+        assert subprocess.run(
+            ['git', 'merge-base', '--is-ancestor', side_sha, 'HEAD'],
+            cwd=repo, capture_output=True,
+        ).returncode != 0
+
+        result = _mark_step_done(git_artifacts, 'step-1', side_sha)
+
+        assert result['status'] == 'error'
+        assert side_sha in result['message']
+        assert 'reachable' in result['message']
+        # The markup-repair envelope key is attached only when there ARE
+        # repairs (plan_tools.py::_with_markup_repairs); a clean plan's
+        # rejection must stay byte-identical to what every other caller sees.
+        assert 'markup_repairs' not in result
+        # Nothing was written.
+        plan = git_artifacts.read_plan()
+        assert plan['steps'][0]['status'] == 'pending'
+        assert not plan['steps'][0].get('commit')
+
+        # A fabricated sha is rejected the same way in this healthy repo.
+        fabricated = 'deadbeef' * 5
+        result2 = _mark_step_done(git_artifacts, 'step-1', fabricated)
+        assert result2['status'] == 'error'
+        assert fabricated in result2['message']
+        plan2 = git_artifacts.read_plan()
+        assert plan2['steps'][0]['status'] == 'pending'
+        assert not plan2['steps'][0].get('commit')
+
+    def test_records_and_warns_when_git_is_unavailable(self, artifacts, caplog):
+        """FAIL-OPEN, LOUDLY: when the reachability check cannot run at all
+        (no git repo at the worktree), the sha is still recorded — a false
+        reject would leave the step pending while its code sits on the branch,
+        which is the very failure this guard exists to prevent — but the
+        degradation is logged at WARNING, never silent.
+
+        Deliberately asymmetric to _mark_step_committed, which fails CLOSED."""
+        self._setup_plan(artifacts)
+
+        with caplog.at_level(logging.WARNING):
+            result = _mark_step_done(artifacts, 'step-1', 'abc123')
+
+        assert result['status'] == 'ok'
+        plan = artifacts.read_plan()
+        assert plan['steps'][0]['status'] == 'done'
+        assert plan['steps'][0]['commit'] == 'abc123'
+
+        warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+        assert any('step-1' in m and 'abc123' in m for m in warnings), (
+            f'expected a loud WARNING naming the step and sha, got {warnings}'
+        )
+
+    def test_unknown_step_is_reported_before_the_sha_is_probed(
+        self, git_artifacts, monkeypatch,
+    ):
+        """A typo'd step id gets the actionable 'not found' message, and git is
+        never consulted.
+
+        The cheap in-memory lookup runs FIRST: a call that cannot write must
+        not pay for two subprocesses, and must not answer a step-id typo with a
+        complaint about a sha that was never going to be recorded."""
+        self._setup_plan(git_artifacts)
+
+        def _boom(*_a, **_k):  # pragma: no cover - must never run
+            raise AssertionError('reachability was probed for an unknown step')
+
+        monkeypatch.setattr(subprocess, 'run', _boom)
+
+        result = _mark_step_done(git_artifacts, 'typo-step', 'deadbeef' * 5)
+
+        assert result['status'] == 'error'
+        assert 'not found' in result['message']
+
+    def test_a_probe_timeout_records_and_warns_rather_than_rejecting(
+        self, git_artifacts, monkeypatch, caplog,
+    ):
+        """FAIL-OPEN covers a BLOWN-UP probe, not just a missing repo.
+
+        The `artifacts`-fixture test above reaches 'unknown' through probe 1's
+        non-zero rc. This reaches it through probe 2 raising inside a perfectly
+        healthy repo — the branch a mistake would silently flip from fail-OPEN
+        to fail-CLOSED, rejecting real committed work."""
+        self._setup_plan(git_artifacts)
+        sha = _git_commit_file(
+            git_artifacts.worktree, 'm.py', 'x = 3\n', 'feat: step-1',
+        )
+        real_run = subprocess.run
+
+        def _fake_run(argv, **kwargs):
+            if 'merge-base' in argv:
+                raise subprocess.TimeoutExpired(cmd=argv, timeout=10)
+            return real_run(argv, **kwargs)
+
+        monkeypatch.setattr(subprocess, 'run', _fake_run)
+
+        with caplog.at_level(logging.WARNING):
+            result = _mark_step_done(git_artifacts, 'step-1', sha)
+
+        assert result['status'] == 'ok'
+        plan = git_artifacts.read_plan()
+        assert plan['steps'][0]['status'] == 'done'
+        assert plan['steps'][0]['commit'] == sha
+        warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+        assert any('step-1' in m and sha in m for m in warnings), (
+            f'expected a loud WARNING naming the step and sha, got {warnings}'
+        )
+
+    def test_a_rejection_still_reports_a_repair_that_already_landed(
+        self, git_artifacts,
+    ):
+        """The reject path must not swallow a markup repair.
+
+        `_read_plan_repaired` has ALREADY written the repair back to disk by
+        the time the guard runs, so a rejection that returned a bare dict would
+        lose the only report of a mutation the agent never made. The clean-plan
+        counterpart (`markup_repairs` ABSENT) is asserted in
+        `test_unreachable_sha_is_rejected`; this is the positive half, without
+        which a refactor could drop `_with_markup_repairs` here and stay
+        green."""
+        self._setup_plan(git_artifacts)
+        _add_design_decision(git_artifacts, 'A decision.', 'Clean rationale prose.')
+
+        # Poison the rationale with the measured trailing-residue shape, built
+        # from chr(60) so this file never carries a raw envelope literal.
+        clean = 'Clean rationale prose.'
+        residue = LT + '/rationale>' + '\n' + LT + '/invoke>' + '\n'
+        poisoned = git_artifacts.read_plan()
+        poisoned['design_decisions'][0]['rationale'] = clean + residue
+        git_artifacts.write_plan(poisoned)
+
+        repo = git_artifacts.worktree
+        subprocess.run(['git', 'switch', '-c', 'other2'], cwd=repo, check=True, capture_output=True)
+        side_sha = _git_commit_file(repo, 'side2.py', 'side\n', 'feat: side branch')
+        subprocess.run(['git', 'switch', 'main'], cwd=repo, check=True, capture_output=True)
+
+        result = _mark_step_done(git_artifacts, 'step-1', side_sha)
+
+        assert result['status'] == 'error'
+        repairs = result['markup_repairs']
+        assert [f['field'] for f in repairs] == ['rationale']
+        assert repairs[0]['outcome'] == 'repaired'
+        # The repair landed on disk; the step did not.
+        plan = git_artifacts.read_plan()
+        assert plan['design_decisions'][0]['rationale'] == clean
+        assert plan['steps'][0]['status'] == 'pending'
+        assert not plan['steps'][0].get('commit')
 
 
 # ---------------------------------------------------------------------------
@@ -424,6 +816,166 @@ class TestUpdatePlanMetadata:
 
         plan = artifacts.read_plan()
         assert plan['files'] == ['mod_a/foo.py', 'mod_a/bar.py']
+
+    def test_redeclaring_a_dropped_path_clears_its_drop_record(self, artifacts):
+        """``files`` and ``dropped_files`` stay disjoint: re-declaration wins."""
+        _create_plan(
+            artifacts, 'test-1', 'Test task', 'Analysis',
+            ['mod_a/foo.py', 'mod_a/bar.py', 'mod_a/baz.py'],
+        )
+        _drop_plan_file(artifacts, path='mod_a/bar.py', reason='Needed no edit')
+        _drop_plan_file(artifacts, path='mod_a/baz.py', reason='Also needed no edit')
+
+        result = _update_plan_metadata(
+            artifacts, files=['mod_a/foo.py', 'mod_a/bar.py'],
+        )
+
+        assert result['status'] == 'ok'
+        plan = artifacts.read_plan()
+        assert plan['files'] == ['mod_a/foo.py', 'mod_a/bar.py']
+        assert plan['dropped_files'] == [
+            {'path': 'mod_a/baz.py', 'reason': 'Also needed no edit'}
+        ]
+
+
+class TestDropPlanFile:
+    """``_drop_plan_file``: drop a declared entry and record why, atomically."""
+
+    def _three_file_plan(self, artifacts):
+        _create_plan(
+            artifacts, 'test-1', 'Test task', 'Analysis',
+            ['mod_a/foo.py', 'mod_a/bar.py', 'mod_a/baz.py'],
+        )
+
+    def test_drops_the_entry_and_records_the_reason(self, artifacts):
+        self._three_file_plan(artifacts)
+
+        reason = 'Declared defensively; the branch never needed to touch it'
+        result = _drop_plan_file(artifacts, path='mod_a/bar.py', reason=reason)
+
+        assert result['status'] == 'ok'
+
+        plan = artifacts.read_plan()
+        # (a) the dropped path is gone from the gate's re-check surface.
+        assert 'mod_a/bar.py' not in plan['files']
+        # (b) the entries the architect did NOT drop survive, in order — the
+        # partial-narrow half of the signal: an entry left in the list still
+        # reaches the gate's re-check.
+        assert plan['files'] == ['mod_a/foo.py', 'mod_a/baz.py']
+        # (c) the provenance the drop would otherwise have destroyed.
+        assert plan['dropped_files'] == [
+            {'path': 'mod_a/bar.py', 'reason': reason}
+        ]
+
+    def _assert_record_untouched(self, artifacts, files):
+        """A refusal must leave the durable record exactly as it was."""
+        plan = artifacts.read_plan()
+        assert plan['files'] == files
+        assert plan.get('dropped_files', []) == []
+
+    def test_unknown_path_is_refused(self, artifacts):
+        """A hallucinated or already-dropped entry must not silently no-op.
+
+        Appending a note explaining an absence that was never a declaration
+        would manufacture provenance rather than preserve it.
+        """
+        self._three_file_plan(artifacts)
+
+        result = _drop_plan_file(
+            artifacts, path='mod_a/nope.py', reason='Never needed'
+        )
+
+        assert result['status'] == 'error'
+        assert result['message']
+        self._assert_record_untouched(
+            artifacts, ['mod_a/foo.py', 'mod_a/bar.py', 'mod_a/baz.py']
+        )
+
+    def test_blank_reason_is_refused(self, artifacts):
+        """An unrecorded reason is exactly the falsified provenance
+        ``merge_gates.py::CROSS_REPO_DELIVERABLE_REASON_PREFIX`` objects to,
+        so an empty (or whitespace-only) one must not be accepted."""
+        self._three_file_plan(artifacts)
+
+        for reason in ('', '   '):
+            result = _drop_plan_file(
+                artifacts, path='mod_a/bar.py', reason=reason
+            )
+
+            assert result['status'] == 'error', f'reason={reason!r} was accepted'
+            assert result['message']
+            self._assert_record_untouched(
+                artifacts, ['mod_a/foo.py', 'mod_a/bar.py', 'mod_a/baz.py']
+            )
+
+    def test_refuses_to_drop_the_last_remaining_file(self, artifacts):
+        """Narrowing to empty silences the gate wholesale.
+
+        ``_task_files`` returns None for an empty list, so
+        ``workflow._check_plan_files_touched_in_branch`` is handed ``[]`` and
+        flags nothing — a plan with no files is not a narrowed plan, it is an
+        unchecked one.
+        """
+        _create_plan(artifacts, 'test-1', 'Test task', 'Analysis', ['mod_a/only.py'])
+
+        result = _drop_plan_file(
+            artifacts, path='mod_a/only.py', reason='Turned out unnecessary'
+        )
+
+        assert result['status'] == 'error'
+        assert result['message']
+        self._assert_record_untouched(artifacts, ['mod_a/only.py'])
+
+    def test_stringified_files_are_normalized_not_iterated_by_character(
+        self, artifacts
+    ):
+        """A stored non-list ``files`` must be coerced, not treated as a
+        string whose substrings and characters are the "entries"."""
+        self._three_file_plan(artifacts)
+        plan = artifacts.read_plan()
+        plan['files'] = '["mod_a/foo.py","mod_a/bar.py"]'
+        artifacts.write_plan(plan)
+
+        result = _drop_plan_file(
+            artifacts, path='mod_a/foo.py', reason='Needed no edit'
+        )
+
+        assert result['status'] == 'ok'
+        assert artifacts.read_plan()['files'] == ['mod_a/bar.py']
+
+    def test_stringified_files_single_entry_still_refuses_last_drop(
+        self, artifacts
+    ):
+        stored = '["mod_a/only.py"]'
+        self._three_file_plan(artifacts)
+        plan = artifacts.read_plan()
+        plan['files'] = stored
+        artifacts.write_plan(plan)
+
+        result = _drop_plan_file(
+            artifacts, path='mod_a/only.py', reason='Turned out unnecessary'
+        )
+
+        assert result['status'] == 'error'
+        assert 'last file' in result['message']
+        self._assert_record_untouched(artifacts, stored)
+
+    @pytest.mark.parametrize('stored', [{'mod_a/foo.py': True}, 42])
+    def test_unrecognized_stored_files_type_is_refused_not_raised(
+        self, artifacts, stored
+    ):
+        self._three_file_plan(artifacts)
+        plan = artifacts.read_plan()
+        plan['files'] = stored
+        artifacts.write_plan(plan)
+
+        result = _drop_plan_file(
+            artifacts, path='mod_a/foo.py', reason='Needed no edit'
+        )
+
+        assert result['status'] == 'error'
+        assert 'not in the plan files list' in result['message']
+        self._assert_record_untouched(artifacts, stored)
 
 
 class TestRemovePlanStep:
@@ -528,6 +1080,11 @@ class TestConfirmPlan:
         assert '_finalized_at' in plan
         assert plan['_finalized_at']
 
+    def test_records_the_architect_as_confirmer(self, artifacts):
+        _setup_full_plan(artifacts)
+        assert _confirm_plan(artifacts)['status'] == 'ok'
+        assert artifacts.read_plan()['_confirmed_by'] == 'architect'
+
     def test_no_plan_returns_error(self, artifacts):
         result = _confirm_plan(artifacts)
         assert result['status'] == 'error'
@@ -547,6 +1104,206 @@ class TestConfirmPlan:
         assert result['status'] == 'error'
         assert 'files' in result['message'].lower()
         assert '_finalized_at' not in artifacts.read_plan()
+
+
+class TestConfirmPlanSurfacesTheRejectionCounter:
+    """The architect's LAST tool result is where a loss reaches the transcript.
+
+    Task 4597. The block is already on disk by the time confirm_plan runs, but
+    a plan-tools tool result lands in the durable agent transcript — and that
+    is the one surface where the architect itself, mid-session, can still see
+    that calls it believed it made were refused. Hence a compact summary here
+    despite the block sitting two keys away in the document.
+
+    EVERY BRANCH, not just the success one. An architect that has been leaking
+    reaches an ERROR branch — refused add_plan_step calls are what leaves a
+    plan stepless, and a refused create_plan is what leaves it absent — so the
+    three error exits are where the explanation is most needed and were the
+    three that first went without it.
+    """
+
+    def _stamp(self, artifacts, **overrides):
+        """Put a rejection block on the plan, through the real algebra."""
+        plan = artifacts.read_plan()
+        block = plan_markup_stamp.merge_block(
+            plan_markup_stamp.block_of({
+                'ts': '2026-09-07T00:00:00+00:00',
+                'tool': 'add_design_decision',
+                'param': 'decision',
+                'outcome': 'rejected',
+            }),
+            plan_markup_stamp.block_of({
+                'ts': '2026-09-07T00:00:05+00:00',
+                'tool': 'add_reuse_item',
+                'param': 'how',
+                'outcome': 'unrepairable',
+            }),
+        )
+        block.update(overrides)
+        plan[plan_markup_stamp.PLAN_MARKUP_REJECTIONS_KEY] = block
+        artifacts.write_plan(plan)
+
+    def test_a_stamped_plan_reports_count_and_by_tool(self, artifacts):
+        _setup_full_plan(artifacts)
+        self._stamp(artifacts)
+
+        result = _confirm_plan(artifacts)
+
+        assert result['status'] == 'ok'
+        assert result['markup_rejections'] == {
+            'count': 2,
+            'by_tool': {'add_design_decision': 1, 'add_reuse_item': 1},
+        }
+
+    def test_the_summary_carries_no_events_and_no_note(self, artifacts):
+        """A SIGNAL to the architect, not a second copy of the block.
+
+        Echoing the events back would put the block's bulk into the response
+        that is already the largest thing the architect reads at the end of a
+        session, to say something the two numbers already say.
+        """
+        _setup_full_plan(artifacts)
+        self._stamp(artifacts)
+
+        result = _confirm_plan(artifacts)
+
+        assert set(result['markup_rejections']) == {'count', 'by_tool'}
+
+    def test_it_composes_with_the_existing_response_keys(self, artifacts):
+        """Purely ADDITIVE — the documented envelope keeps its keys."""
+        _setup_full_plan(artifacts)
+        self._stamp(artifacts)
+
+        result = _confirm_plan(artifacts)
+
+        assert result['finalized'] is True
+        assert result['steps'] == 3
+        assert result['files'] == 2
+
+    def test_an_unstamped_plan_response_is_byte_identical_to_today(self, artifacts):
+        """The omit-when-absent convention ``_with_markup_repairs`` keeps.
+
+        Absent, not present-and-zero. The overwhelming majority of plans refuse
+        nothing, and those responses must stay exactly what every existing
+        caller and every existing assertion already sees.
+        """
+        _setup_full_plan(artifacts)
+
+        result = _confirm_plan(artifacts)
+
+        assert 'markup_rejections' not in result
+        assert set(result) == {'status', 'finalized', 'steps', 'files'}
+
+
+    def _buffer(self, *, tool: str = 'create_plan', param: str = 'analysis') -> None:
+        """Hold one refusal in the pending buffer — the pre-plan leak shape.
+
+        A refused ``create_plan`` has no document to stamp, so its event waits
+        in process-global state until a plan exists to adopt it. That is the
+        case a plan-only view cannot describe, and the case an architect is
+        most likely to be sitting in when it calls confirm_plan.
+        """
+        plan_markup_stamp.note_pending({
+            'ts': '2026-09-07T00:00:00+00:00',
+            'tool': tool,
+            'param': param,
+            'outcome': 'rejected',
+        })
+
+    def test_a_stamped_plan_with_no_steps_still_reports_the_counter(self, artifacts):
+        """THE LIKELIEST ROW OF ALL, and the one the counter most has to serve.
+
+        Refused ``add_plan_step`` calls are precisely what leaves a plan with
+        no steps, so the branch that rejects a stepless plan is the branch an
+        architect that has been leaking reaches. Reporting the counter only on
+        the success branch would withhold the explanation from exactly the
+        response that needs it.
+        """
+        _create_plan(artifacts, 'test-1', 'T', 'A', ['m.py'])
+        self._stamp(artifacts)
+
+        result = _confirm_plan(artifacts)
+
+        assert result['status'] == 'error'
+        assert 'no steps' in result['message'].lower()
+        assert result['markup_rejections'] == {
+            'count': 2,
+            'by_tool': {'add_design_decision': 1, 'add_reuse_item': 1},
+        }
+
+    def test_a_stamped_plan_with_no_files_still_reports_the_counter(self, artifacts):
+        _create_plan(artifacts, 'test-1', 'T', 'A', [])
+        _add_plan_step(artifacts, 'step-1', 'test', 'Write a test')
+        self._stamp(artifacts)
+
+        result = _confirm_plan(artifacts)
+
+        assert result['status'] == 'error'
+        assert 'files' in result['message'].lower()
+        assert result['markup_rejections'] == {
+            'count': 2,
+            'by_tool': {'add_design_decision': 1, 'add_reuse_item': 1},
+        }
+
+    def test_a_buffered_refusal_is_reported_when_no_plan_exists(self, artifacts):
+        """The row that proves the fix reads the SESSION, not just the plan.
+
+        There is no document here to hold a block, so ``summary(plan)`` alone
+        returns None and this branch would stay silent — while the architect
+        that reached it did so *because* its create_plan was refused.
+        """
+        self._buffer(tool='create_plan')
+
+        result = _confirm_plan(artifacts)
+
+        assert result['status'] == 'error'
+        assert result['message'] == 'No plan exists.'
+        assert result['markup_rejections'] == {
+            'count': 1, 'by_tool': {'create_plan': 1},
+        }
+
+    def test_the_success_branch_reports_it_and_adds_no_other_key(self, artifacts):
+        """Routing all four exits through one responder must not widen any of them."""
+        _setup_full_plan(artifacts)
+        self._stamp(artifacts)
+
+        result = _confirm_plan(artifacts)
+
+        assert set(result) == {
+            'status', 'finalized', 'steps', 'files', 'markup_rejections',
+        }
+        assert result['markup_rejections'] == {
+            'count': 2,
+            'by_tool': {'add_design_decision': 1, 'add_reuse_item': 1},
+        }
+
+    def test_a_clean_session_leaves_the_three_error_responses_as_they_are(
+        self, artifacts
+    ):
+        """The omit-when-absent contract, on every branch that just grew a key.
+
+        Nothing stamped and nothing buffered, so each error response must be
+        EQUAL to what it is today — not merely free of a zeroed counter. The
+        key's PRESENCE is the signal, and an always-present one would be a
+        silent contract change on three envelopes at once.
+        """
+        assert _confirm_plan(artifacts) == {
+            'status': 'error', 'message': 'No plan exists.',
+        }
+
+        _create_plan(artifacts, 'test-1', 'T', 'A', [])
+        assert _confirm_plan(artifacts) == {
+            'status': 'error', 'message': 'Plan has no steps — cannot confirm.',
+        }
+
+        _add_plan_step(artifacts, 'step-1', 'test', 'Write a test')
+        assert _confirm_plan(artifacts) == {
+            'status': 'error',
+            'message': (
+                'Plan has no files — cannot confirm. Call create_plan (or '
+                'update_plan_metadata) with a non-empty files list first.'
+            ),
+        }
 
 
 class TestReportBlockingDependency:
@@ -792,7 +1549,7 @@ class TestArtifactsFromArgs:
             ['--worktree', str(wt), '--meta-root', str(mr)]
         )
 
-        assert artifacts.root == mr
+        assert artifacts.lane_root == artifacts.task_root == mr
         assert artifacts.worktree == wt
 
     def test_omitted_meta_root_falls_back_to_legacy_task_dir(self, tmp_path):
@@ -802,12 +1559,12 @@ class TestArtifactsFromArgs:
 
         artifacts = _artifacts_from_args(['--worktree', str(wt)])
 
-        assert artifacts.root == wt / '.task'
+        assert artifacts.lane_root == artifacts.task_root == wt / '.task'
         assert artifacts.worktree == wt
 
     def test_worktree_attr_survives_sibling_root_relocation(self, tmp_path):
         """Documents the plan_tools.py:600 bug this task fixes: once ``root``
-        is a sibling ``.task-meta`` dir, ``artifacts.root.parent`` is the
+        is a sibling ``.task-meta`` dir, ``artifacts.lane_root.parent`` is the
         `.task-meta` BASE, not the worktree — callers needing the worktree
         (e.g. resolving main's SHA via git) must use ``artifacts.worktree``.
         """
@@ -820,8 +1577,78 @@ class TestArtifactsFromArgs:
             ['--worktree', str(wt), '--meta-root', str(mr)]
         )
 
-        assert artifacts.root.parent != wt
+        assert artifacts.lane_root.parent != wt
         assert artifacts.worktree == wt
+
+
+def _dual_root_argv(tmp_path: Path, task_root: Path) -> tuple[list[str], Path]:
+    wt = tmp_path / 'wt'
+    wt.mkdir()
+    lane = tmp_path / '.task-meta' / 'wt'
+    lane.mkdir(parents=True)
+    argv = ['--worktree', str(wt), '--meta-root', str(lane), '--task-root', str(task_root)]
+    return argv, lane
+
+
+class TestArtifactsFromArgsTaskRoot:
+    """``--task-root`` (task 3155) gives the agent-side server the same two
+    roots the workflow uses: task-lifetime artifacts land in the task root,
+    the architect's structured exits stay in the lane root."""
+
+    def test_task_root_flag_produces_dual_roots(self, tmp_path):
+        task = tmp_path / '.task-meta' / 'task-3155'
+        argv, lane = _dual_root_argv(tmp_path, task)
+        task.mkdir()
+
+        artifacts = _artifacts_from_args(argv)
+
+        assert artifacts.lane_root == lane.resolve()
+        assert artifacts.task_root == task.resolve()
+
+    def test_missing_task_root_exits_naming_it(self, tmp_path, capsys):
+        task = tmp_path / '.task-meta' / 'task-absent'
+        argv, _ = _dual_root_argv(tmp_path, task)
+
+        with pytest.raises(SystemExit) as exc:
+            _artifacts_from_args(argv)
+
+        assert exc.value.code == 1
+        assert str(task.resolve()) in capsys.readouterr().err
+
+    @pytest.mark.asyncio
+    async def test_plan_lifecycle_writes_the_task_root_plan(self, tmp_path):
+        task = tmp_path / '.task-meta' / 'task-3155'
+        argv, lane = _dual_root_argv(tmp_path, task)
+        task.mkdir()
+        server = plan_tools.create_server(_artifacts_from_args(argv))
+
+        for name, arguments in (
+            ('create_plan', {'task_id': '3155', 'title': 'T', 'analysis': 'A', 'files': ['m.py']}),
+            ('add_plan_step', {'step_id': 'step-1', 'step_type': 'test', 'description': 'Write a test'}),
+            ('confirm_plan', {}),
+            ('mark_step_done', {'step_id': 'step-1', 'commit_sha': 'abc123'}),
+        ):
+            tool = await server.get_tool(name)
+            assert tool is not None
+            await tool.run(arguments)
+
+        plan = TaskArtifacts(tmp_path / 'wt', task).read_plan()
+        assert plan['steps'][0]['status'] == 'done'
+        assert not (lane / 'plan.json').exists()
+
+    @pytest.mark.asyncio
+    async def test_blocking_dependency_report_stays_in_the_lane_root(self, tmp_path):
+        task = tmp_path / '.task-meta' / 'task-3155'
+        argv, lane = _dual_root_argv(tmp_path, task)
+        task.mkdir()
+        server = plan_tools.create_server(_artifacts_from_args(argv))
+
+        tool = await server.get_tool('report_blocking_dependency')
+        assert tool is not None
+        await tool.run({'depends_on_task_id': '42', 'reason': 'missing foo()'})
+
+        assert (lane / 'blocking_dependency.json').is_file()
+        assert not (task / 'blocking_dependency.json').exists()
 
 
 # ---------------------------------------------------------------------------
@@ -831,26 +1658,19 @@ class TestArtifactsFromArgs:
 
 @pytest.mark.asyncio
 class TestReportBlockingDependencyToolResolvesRealWorktree:
-    """Pins the ``report_blocking_dependency`` MCP tool's git-resolution
-    target directly, rather than only asserting on the ``TaskArtifacts``
-    object in isolation (``TestArtifactsFromArgs`` above).
+    """The registered ``report_blocking_dependency`` tool resolves ``main``
+    in ``artifacts.worktree``, not in ``artifacts.lane_root.parent``.
 
-    ``TestReportBlockingDependency`` (the ``_report_blocking_dependency``
-    unit tests) call the private helper with an explicit ``main_sha=``,
-    bypassing the tool wrapper's own ``worktree = artifacts.worktree`` /
-    ``_resolve_main_sha(worktree)`` code path entirely — a regression that
-    reverted plan_tools.py:603 back to ``artifacts.root.parent`` would still
-    pass every one of those tests. This test drives the actual registered
-    MCP tool through ``create_server`` with a relocated (sibling)
-    ``meta_root`` and monkeypatches ``_resolve_main_sha`` to capture the
-    path it is invoked with, pinning that path to ``artifacts.worktree``.
+    The ``_report_blocking_dependency`` unit tests pass ``main_sha=``
+    explicitly and so bypass the wrapper's resolution. Here the worktree is a
+    real repo and the relocated ``--meta-root`` sibling is no repository, so
+    a regression to ``lane_root.parent`` records ``''`` and fails.
     """
 
-    async def test_tool_calls_resolve_main_sha_with_worktree_not_root_parent(
-        self, tmp_path, monkeypatch
+    async def test_tool_resolves_main_sha_in_the_worktree_not_root_parent(
+        self, tmp_path
     ):
-        wt = tmp_path / 'wt'
-        wt.mkdir()
+        wt = seed_repo(tmp_path / 'wt')
         mr = tmp_path / 'base' / '.task-meta' / 'wt'
         mr.mkdir(parents=True)
 
@@ -858,20 +1678,11 @@ class TestReportBlockingDependencyToolResolvesRealWorktree:
             ['--worktree', str(wt), '--meta-root', str(mr)]
         )
         artifacts.init('test-1', 'Test task', 'A test')
-        # Sanity check this fixture actually reproduces the bug scenario:
-        # once root is a relocated sibling, root.parent is the .task-meta
-        # BASE, not the worktree.
-        assert artifacts.root.parent != artifacts.worktree
-
-        captured: list[object] = []
-
-        def fake_resolve_main_sha(worktree):
-            captured.append(worktree)
-            return 'deadbeefcafef00d'
-
-        monkeypatch.setattr(
-            plan_tools, '_resolve_main_sha', fake_resolve_main_sha
-        )
+        assert artifacts.lane_root.parent != artifacts.worktree
+        main_sha = subprocess.run(
+            ['git', 'rev-parse', 'main'],
+            cwd=wt, check=True, capture_output=True, text=True,
+        ).stdout.strip()
 
         server = plan_tools.create_server(artifacts)
         tool = await server.get_tool('report_blocking_dependency')
@@ -882,11 +1693,9 @@ class TestReportBlockingDependencyToolResolvesRealWorktree:
         )
 
         assert result['status'] == 'ok'
-        assert captured == [artifacts.worktree]
-
         data = artifacts.read_blocking_dependency()
         assert data is not None
-        assert data['main_sha_at_report'] == 'deadbeefcafef00d'
+        assert data['main_sha_at_report'] == main_sha
 
 
 # ---------------------------------------------------------------------------
@@ -1026,10 +1835,11 @@ class TestMainSuppressesBanner:
 # mark_step_committed — pre-satisfy a plan step at AUTHORING time, guarded by a
 # REAL `git cat-file -e <sha>` existence check (task 3030 / PRD Contract A1).
 #
-# Driven against a REAL temp git repo, NOT a monkeypatched _sha_exists_on_branch:
-# a stubbed always-True guard would mask the corroborate-before-acting invariant,
-# so the bogus-sha "plan unchanged" assertion only has teeth when a real repo
-# distinguishes a resolving sha from a non-resolving one.
+# Driven against a REAL temp git repo, NOT a monkeypatched
+# branch_probes.sha_exists_on_branch: a stubbed always-True guard would mask the
+# corroborate-before-acting invariant, so the bogus-sha "plan unchanged"
+# assertion only has teeth when a real repo distinguishes a resolving sha from a
+# non-resolving one.
 # ---------------------------------------------------------------------------
 
 
@@ -1100,7 +1910,7 @@ class TestMarkStepCommitted:
         artifacts, _head = _init_git_repo_artifacts(tmp_path / 'repo')
         artifacts.write_plan(_committable_plan())
         artifacts.read_plan()  # stabilize any one-time normalization rewrite
-        before = (artifacts.root / 'plan.json').read_text()
+        before = artifacts.artifact_path('plan.json').read_text()
 
         bogus = 'f' * 40
         result = plan_tools._mark_step_committed(artifacts, 'step-1', bogus)
@@ -1110,7 +1920,7 @@ class TestMarkStepCommitted:
         assert bogus in result['message']
         # corroborate-before-acting: plan is byte-for-byte unchanged and the
         # step is still pending (the git cat-file -e guard refused the sha).
-        assert (artifacts.root / 'plan.json').read_text() == before
+        assert artifacts.artifact_path('plan.json').read_text() == before
         assert artifacts.read_plan()['steps'][0]['status'] == 'pending'
 
     async def test_unknown_step_id_errors(self, tmp_path):
@@ -1172,3 +1982,55 @@ class TestMarkStepCommitted:
         confirm = plan_tools._confirm_plan(artifacts)
         assert confirm['status'] == 'ok'
         assert confirm['finalized'] is True
+
+
+@pytest.mark.asyncio
+class TestDropPlanFileTool:
+    """The REGISTERED ``drop_plan_file`` MCP tool, not only its helper."""
+
+    def _three_file_plan(self, artifacts):
+        _create_plan(
+            artifacts, 'test-1', 'Test task', 'Analysis',
+            ['mod_a/foo.py', 'mod_a/bar.py', 'mod_a/baz.py'],
+        )
+
+    async def test_registered_tool_drops_via_fn(self, artifacts):
+        self._three_file_plan(artifacts)
+
+        server = plan_tools.create_server(artifacts)
+        tool = await server.get_tool('drop_plan_file')
+        assert tool is not None
+
+        # drop_plan_file is a sync def — call tool.fn() directly.
+        result = tool.fn(  # type: ignore[union-attr]
+            path='mod_a/bar.py',
+            reason='Declared for a rename that the final design avoided',
+        )
+
+        assert result['status'] == 'ok'
+        plan = artifacts.read_plan()
+        assert plan['files'] == ['mod_a/foo.py', 'mod_a/baz.py']
+        assert plan['dropped_files'] == [{
+            'path': 'mod_a/bar.py',
+            'reason': 'Declared for a rename that the final design avoided',
+        }]
+
+    async def test_registered_tool_refuses_unknown_path_via_run(self, artifacts):
+        # tool.run() goes through FastMCP's pydantic argument validation,
+        # which tool.fn() bypasses — the real wire-level boundary.
+        self._three_file_plan(artifacts)
+
+        server = plan_tools.create_server(artifacts)
+        tool = await server.get_tool('drop_plan_file')
+        assert tool is not None
+
+        result = await tool.run({
+            'path': 'mod_a/nope.py',
+            'reason': 'Never needed',
+        })
+
+        assert result.structured_content is not None
+        assert result.structured_content['status'] == 'error'
+        plan = artifacts.read_plan()
+        assert plan['files'] == ['mod_a/foo.py', 'mod_a/bar.py', 'mod_a/baz.py']
+        assert plan.get('dropped_files', []) == []

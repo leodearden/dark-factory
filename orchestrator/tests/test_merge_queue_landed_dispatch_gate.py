@@ -26,9 +26,10 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from _delivered_check_fixtures import install_delivered_check_script, script_check
 
-from orchestrator.landed_outbox import LandedOutbox, LandedRow
-from orchestrator.merge_queue import reconcile_landed_task
+from orchestrator.merge_lane.landed_outbox import LandedOutbox, LandedRow
+from orchestrator.merge_lane.worker import reconcile_landed_task
 
 # ---------------------------------------------------------------------------
 # Shared helpers (mirrors test_merge_queue_landed_reconciler.py)
@@ -49,6 +50,21 @@ def _fake_scheduler(*, get_status_result: str | None = None) -> MagicMock:
     scheduler.get_status = AsyncMock(return_value=get_status_result)
     scheduler.mark_done = AsyncMock()
     return scheduler
+
+
+_CHECK_SCRIPT_REL_PATH = 'scripts/capability_check.sh'
+_ABSENT_CAPABILITY_SCRIPT = '#!/bin/sh\nexit 1\n'
+
+
+def _absent_capability_check(name: str) -> dict:
+    """A script-kind ``delivered_checks`` entry naming :data:`_CHECK_SCRIPT_REL_PATH`.
+
+    Script kind rather than grep so the check runs against a plain temp
+    directory — no throwaway git repository is needed to make the real guard
+    reach a DEFINITIVE verdict, and the outcome is whatever the installed
+    script says rather than a property of the ambient filesystem.
+    """
+    return script_check(name, _CHECK_SCRIPT_REL_PATH, timeout_secs=10)
 
 
 # ---------------------------------------------------------------------------
@@ -264,3 +280,78 @@ class TestReconcileLandedTaskConsumeFailsAfterMarkDone:
         assert any(record.levelname == 'WARNING' for record in caplog.records), (
             'a swallowed consume() failure should be logged, not silent'
         )
+
+
+# ---------------------------------------------------------------------------
+# Task 3057 step-13 (RED) — the dispatch-gate mapping for the new
+# 'delivered_checks_withheld' disposition.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestReconcileLandedTaskDeliveredChecksWithheld:
+    """A capability withholding must NOT gate dispatch.
+
+    Gating would wedge the task: the RC-2 done-write is withheld precisely
+    because the declared capability is not on main, so the correct recovery is
+    to let the task dispatch and actually deliver it. Contrast
+    ``'stale_conflict'``, which DOES gate — a contested task under
+    provenance-conflict arbitration must never dispatch (task 2677). Both
+    contracts are pinned here so neither can drift into the other.
+
+    The withholding is DRIVEN, not asserted: a failing delivered check is
+    declared on the injected scheduler's task record and evaluated by the real
+    ``gate_mark_done_on_delivered_checks`` against ``project_root``, so the
+    test still reds if the guard stops being consulted from this path at all
+    (task 5027 γ4).
+    """
+
+    async def test_withheld_disposition_does_not_gate_dispatch(
+        self, tmp_path: Path,
+    ) -> None:
+        outbox = LandedOutbox(tmp_path / 'landed_outbox.json')
+        outbox.record(LandedRow(
+            task_id='Z', branch_tip_sha='tip', advanced_sha='ADV', landed_at=1.0,
+        ))
+        git_ops = _reconciler_git_ops(main_sha='MAIN', is_ancestor_result=True)
+        scheduler = MagicMock()
+        scheduler.get_status = AsyncMock(return_value='in-progress')
+        scheduler.mark_done = AsyncMock()
+        scheduler.get_task = AsyncMock(return_value={
+            'id': 'Z',
+            'metadata': {'delivered_checks': [_absent_capability_check('cap-x')]},
+        })
+        install_delivered_check_script(tmp_path, _CHECK_SCRIPT_REL_PATH, _ABSENT_CAPABILITY_SCRIPT)
+
+        result = await reconcile_landed_task(
+            'Z', git_ops=git_ops, scheduler=scheduler, outbox=outbox,
+            project_root=tmp_path, check_timeout_secs=7.5,
+        )
+
+        assert result is False, 'a withholding must let the task re-dispatch'
+        scheduler.mark_done.assert_not_called()
+        assert outbox.lookup('Z') is not None, 'row retained for the reconciler'
+
+    async def test_stale_conflict_still_gates_dispatch(
+        self, tmp_path: Path,
+    ) -> None:
+        """Re-pin of the task-2677 contract, so the new disposition's False
+        mapping cannot be generalised over it by a later refactor."""
+        outbox = LandedOutbox(tmp_path / 'landed_outbox.json')
+        outbox.record(LandedRow(
+            task_id='Z', branch_tip_sha='tip', advanced_sha='ADV', landed_at=1.0,
+        ))
+        git_ops = _reconciler_git_ops(main_sha='MAIN', is_ancestor_result=True)
+        scheduler = MagicMock()
+        scheduler.get_status = AsyncMock(return_value='in-progress')
+        scheduler.mark_done = AsyncMock()
+        sink = MagicMock()
+        sink.should_skip = MagicMock(return_value=True)
+
+        result = await reconcile_landed_task(
+            'Z', git_ops=git_ops, scheduler=scheduler, outbox=outbox,
+            provenance_conflict_sink=sink,
+        )
+
+        assert result is True, 'a contested task must never dispatch'
+        scheduler.mark_done.assert_not_called()

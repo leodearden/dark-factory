@@ -14,6 +14,7 @@ before the orchestrator burns another iteration's worth of budget.
 from __future__ import annotations
 
 import asyncio
+import logging
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -24,6 +25,8 @@ from _workflow_helpers import (
     FakeScheduler,
     _make_resolving_steward,
     _make_status_setting_steward,
+    fixed_prompt,
+    same_module_siblings,
 )
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
@@ -32,7 +35,14 @@ from orchestrator.agents.invoke import AgentResult
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, _run
-from orchestrator.scheduler import TaskAssignment, files_to_modules
+from orchestrator.pin_reservation import Blocker, BlockerKind
+from orchestrator.scheduler import BlastRadiusResult, TaskAssignment, files_to_modules
+from orchestrator.scope_drift import (
+    ScopeBoundary,
+    ScopeDriftReason,
+    ScopeRequest,
+    build_scope_drift_report,
+)
 from orchestrator.workflow import (
     IMPLEMENTER,
     TaskWorkflow,
@@ -40,7 +50,7 @@ from orchestrator.workflow import (
     WorkflowState,
     _PriorImplStatus,
 )
-from orchestrator.workflow_types import StewardResolved
+from orchestrator.workflow_types import PublishedStewardOutcome, StewardResolved
 
 # ---------------------------------------------------------------------------
 # Fixtures (kept local — these tests don't share runtime with test_workflow_e2e)
@@ -145,13 +155,16 @@ def _build_workflow(
     assignment: TaskAssignment,
     queue: EscalationQueue,
     worktree: Path,
+    *,
+    scheduler: FakeScheduler | None = None,
+    steward_factory: type | None = None,
 ) -> tuple[TaskWorkflow, FakeScheduler]:
     """Wire a TaskWorkflow with all fakes for these tests.
 
     Worktree is set externally (eval-mode path) so run() skips create_worktree
     AND skips merge phase (post-success path runs unconditionally though).
     """
-    scheduler = FakeScheduler()
+    scheduler = scheduler if scheduler is not None else FakeScheduler()
     workflow = TaskWorkflow(
         assignment=assignment,
         config=config,
@@ -161,6 +174,7 @@ def _build_workflow(
         mcp=FakeMcp(),  # type: ignore[arg-type]
         escalation_queue=queue,
         initial_plan=dict(PLAN),
+        steward_factory=steward_factory,
     )
     # Pre-set worktree so run() goes through the eval-mode external path.
     # _worktree_external is then set to True inside run() — MERGE block is
@@ -215,7 +229,7 @@ def _make_granting_steward(
     """
 
     class _FakeSteward:
-        def __init__(self, wt_path, cfg_dir):  # noqa: ARG002
+        def __init__(self, wt_path, cfg_dir):
             self._outcome_channel = None
             self._wip_probe = None
 
@@ -233,10 +247,11 @@ def _make_granting_steward(
                     esc.id, 'Granted scope expansion',
                     resolved_by='fake-steward', granted_files=granted_files,
                 )
-            if self._outcome_channel is not None:
-                self._outcome_channel.put_nowait(
-                    StewardResolved(resolution_text='Granted scope expansion'),
-                )
+                if self._outcome_channel is not None:
+                    self._outcome_channel.put_nowait(PublishedStewardOutcome(
+                        esc.id,
+                        StewardResolved(resolution_text='Granted scope expansion'),
+                    ))
 
         async def stop(self) -> None:
             pass
@@ -265,11 +280,13 @@ class TestStatusPreservationOnResume:
         wt = await _make_advanced_worktree(git_ops, task_assignment.task_id)
         queue = EscalationQueue(tmp_path / 'queue')
         _submit_l0(queue, task_assignment.task_id)
-        workflow, scheduler = _build_workflow(
+        scheduler = FakeScheduler()
+        workflow, _ = _build_workflow(
             config, git_ops, task_assignment, queue, wt,
-        )
-        workflow._steward_factory = _make_status_setting_steward(
-            queue, scheduler, task_assignment.task_id, 'deferred',
+            scheduler=scheduler,
+            steward_factory=_make_status_setting_steward(
+                queue, scheduler, task_assignment.task_id, 'deferred',
+            ),
         )
         evrl_mock, state = _make_evrl_returner(
             [WorkflowOutcome.ESCALATED, WorkflowOutcome.DONE],
@@ -307,11 +324,13 @@ class TestStatusPreservationOnResume:
         wt = await _make_advanced_worktree(git_ops, task_assignment.task_id)
         queue = EscalationQueue(tmp_path / 'queue')
         _submit_l0(queue, task_assignment.task_id)
-        workflow, scheduler = _build_workflow(
+        scheduler = FakeScheduler()
+        workflow, _ = _build_workflow(
             config, git_ops, task_assignment, queue, wt,
-        )
-        workflow._steward_factory = _make_status_setting_steward(
-            queue, scheduler, task_assignment.task_id, 'cancelled',
+            scheduler=scheduler,
+            steward_factory=_make_status_setting_steward(
+                queue, scheduler, task_assignment.task_id, 'cancelled',
+            ),
         )
         evrl_mock, state = _make_evrl_returner(
             [WorkflowOutcome.ESCALATED, WorkflowOutcome.DONE],
@@ -337,11 +356,13 @@ class TestStatusPreservationOnResume:
         wt = await _make_advanced_worktree(git_ops, task_assignment.task_id)
         queue = EscalationQueue(tmp_path / 'queue')
         _submit_l0(queue, task_assignment.task_id)
-        workflow, scheduler = _build_workflow(
+        scheduler = FakeScheduler()
+        workflow, _ = _build_workflow(
             config, git_ops, task_assignment, queue, wt,
-        )
-        workflow._steward_factory = _make_status_setting_steward(
-            queue, scheduler, task_assignment.task_id, 'done',
+            scheduler=scheduler,
+            steward_factory=_make_status_setting_steward(
+                queue, scheduler, task_assignment.task_id, 'done',
+            ),
         )
         evrl_mock, state = _make_evrl_returner(
             [WorkflowOutcome.ESCALATED, WorkflowOutcome.DONE],
@@ -375,10 +396,10 @@ class TestStatusPreservationOnResume:
         _submit_l0(queue, task_assignment.task_id)
         workflow, scheduler = _build_workflow(
             config, git_ops, task_assignment, queue, wt,
-        )
-        # Resolving steward — does not touch task status.
-        workflow._steward_factory = _make_resolving_steward(
-            queue, task_assignment.task_id,
+            # Resolving steward — does not touch task status.
+            steward_factory=_make_resolving_steward(
+                queue, task_assignment.task_id,
+            ),
         )
         # ESCALATED first, then DONE on the post-resume re-entry.
         evrl_mock, state = _make_evrl_returner(
@@ -409,6 +430,48 @@ class TestStatusPreservationOnResume:
             f'Resume invocation must use IMPLEMENTER role; got {role!r}'
         )
 
+    async def test_resume_builder_rereads_the_plan_on_every_build(
+        self, config, git_ops, task_assignment, tmp_path,
+    ):
+        """A retried resume is briefed from plan.json as it is THEN (task 5730)."""
+        wt = await _make_advanced_worktree(git_ops, task_assignment.task_id)
+        queue = EscalationQueue(tmp_path / 'queue')
+        _submit_l0(queue, task_assignment.task_id)
+        workflow, _scheduler = _build_workflow(
+            config, git_ops, task_assignment, queue, wt,
+            steward_factory=_make_resolving_steward(
+                queue, task_assignment.task_id,
+            ),
+        )
+        evrl_mock, _state = _make_evrl_returner(
+            [WorkflowOutcome.ESCALATED, WorkflowOutcome.DONE],
+        )
+        workflow._execute_verify_review_loop = evrl_mock  # type: ignore[method-assign]
+        rendered: list[str] = []
+
+        async def build_resume_prompt(
+            task, plan, escalation_summary, resolution, worktree=None, scope_drift=None,
+        ):
+            rendered.append(plan.get('analysis'))
+            return 'Resume'
+
+        workflow.briefing.build_resume_prompt = build_resume_prompt  # type: ignore[method-assign]
+
+        async def invoke_building_twice(role, build_prompt, cwd, output_schema=None):
+            await build_prompt()
+            assert workflow.artifacts is not None
+            plan = workflow.artifacts.read_plan()
+            plan['analysis'] = 'REWRITTEN-ANALYSIS'
+            workflow.artifacts.write_plan(plan)
+            await build_prompt()
+            return AgentResult(success=True, output='')
+
+        workflow._invoke = invoke_building_twice  # type: ignore[method-assign]
+
+        await workflow.run()
+
+        assert rendered == [PLAN['analysis'], 'REWRITTEN-ANALYSIS']
+
     async def test_scope_violation_resume_clean_tree_reinvokes_implementer(
         self, config, git_ops, task_assignment, tmp_path,
     ):
@@ -433,11 +496,11 @@ class TestStatusPreservationOnResume:
         _submit_l0(queue, task_assignment.task_id, category='scope_violation')
         workflow, scheduler = _build_workflow(
             config, git_ops, task_assignment, queue, wt,
-        )
-        # Resolving steward — does not touch task status, so it stays
-        # in-progress and the resume path is live.
-        workflow._steward_factory = _make_resolving_steward(
-            queue, task_assignment.task_id,
+            # Resolving steward — does not touch task status, so it stays
+            # in-progress and the resume path is live.
+            steward_factory=_make_resolving_steward(
+                queue, task_assignment.task_id,
+            ),
         )
         # ESCALATED first, then DONE on the post-resume re-entry.
         evrl_mock, state = _make_evrl_returner(
@@ -479,11 +542,11 @@ class TestStatusPreservationOnResume:
         _submit_l0(queue, task_assignment.task_id, category='scope_violation')
         workflow, scheduler = _build_workflow(
             config, git_ops, task_assignment, queue, wt,
-        )
-        # Granting steward — lock is free (FakeScheduler.blast_radius_result
-        # defaults to True), so the scope-widen must succeed.
-        workflow._steward_factory = _make_granting_steward(
-            queue, task_assignment.task_id, ['new.py'],
+            # Granting steward — lock is free (FakeScheduler.blast_radius_result
+            # defaults to applied), so the scope-widen must succeed.
+            steward_factory=_make_granting_steward(
+                queue, task_assignment.task_id, ['new.py'],
+            ),
         )
         # ESCALATED first, then DONE on the post-resume re-entry.
         evrl_mock, state = _make_evrl_returner(
@@ -532,8 +595,7 @@ class TestStatusPreservationOnResume:
         module set is unchanged.
         """
         # Same-package siblings: identical module set at config.lock_depth.
-        f1 = 'a/b/c/d/e.py'
-        f2 = 'a/b/c/d/f.py'
+        f1, f2 = same_module_siblings(config.lock_depth)
         assert files_to_modules([f1], config.lock_depth) == files_to_modules(
             [f1, f2], config.lock_depth,
         ), (
@@ -547,17 +609,17 @@ class TestStatusPreservationOnResume:
         _submit_l0(queue, task_assignment.task_id, category='scope_violation')
         workflow, scheduler = _build_workflow(
             config, git_ops, task_assignment, queue, wt,
+            # Granting steward — grant the same-package sibling; lock is free
+            # (blast_radius_result defaults to applied, though for a same-module widen no
+            # blast-radius call is expected at all).
+            steward_factory=_make_granting_steward(
+                queue, task_assignment.task_id, [f2],
+            ),
         )
         # Seed the plan with F1 only and the matching (single-module) lock set,
         # so the granted sibling F2 does NOT change the module set.
         workflow.initial_plan = {**dict(PLAN), 'files': [f1]}
         workflow.modules = files_to_modules([f1], config.lock_depth)
-        # Granting steward — grant the same-package sibling; lock is free
-        # (blast_radius_result defaults True, though for a same-module widen no
-        # blast-radius call is expected at all).
-        workflow._steward_factory = _make_granting_steward(
-            queue, task_assignment.task_id, [f2],
-        )
         evrl_mock, state = _make_evrl_returner(
             [WorkflowOutcome.ESCALATED, WorkflowOutcome.DONE],
         )
@@ -619,12 +681,12 @@ class TestStatusPreservationOnResume:
         _submit_l0(queue, task_assignment.task_id, category='scope_violation')
         workflow, scheduler = _build_workflow(
             config, git_ops, task_assignment, queue, wt,
+            steward_factory=_make_granting_steward(
+                queue, task_assignment.task_id, ['new.py'],
+            ),
         )
         # Sibling holds the additional lock the grant needs.
-        scheduler.blast_radius_result = False
-        workflow._steward_factory = _make_granting_steward(
-            queue, task_assignment.task_id, ['new.py'],
-        )
+        scheduler.blast_radius_result = BlastRadiusResult(applied=False)
         evrl_mock, state = _make_evrl_returner(
             [WorkflowOutcome.ESCALATED, WorkflowOutcome.DONE],
         )
@@ -647,6 +709,109 @@ class TestStatusPreservationOnResume:
             'is held by a sibling task.'
         )
 
+    async def test_a_scope_request_filed_by_the_resumed_implementer_is_applied(
+        self, config, git_ops, task_assignment, tmp_path, monkeypatch,
+    ):
+        """The escalation resume is an implementer session, so it ends at a
+        scope-request boundary like an execute iteration does (task 3090).
+
+        Without it, a request the resumed implementer files is left in
+        scope_requests.json and the reported file is edited unlocked.
+        """
+        wt_info = await git_ops.create_worktree(task_assignment.task_id)
+        wt = wt_info.path
+        queue = EscalationQueue(tmp_path / 'queue')
+        _submit_l0(queue, task_assignment.task_id, category='scope_violation')
+        workflow, scheduler = _build_workflow(
+            config, git_ops, task_assignment, queue, wt,
+            steward_factory=_make_resolving_steward(
+                queue, task_assignment.task_id,
+            ),
+        )
+        evrl_mock, _state = _make_evrl_returner(
+            [WorkflowOutcome.ESCALATED, WorkflowOutcome.DONE],
+        )
+        monkeypatch.setattr(workflow, '_execute_verify_review_loop', evrl_mock)
+        invocations = 0
+
+        async def resumed_implementer(*_args, **_kwargs) -> AgentResult:
+            nonlocal invocations
+            invocations += 1
+            if invocations == 1:
+                assert workflow.artifacts is not None
+                workflow.artifacts.write_scope_request(
+                    ScopeRequest('new.py', 'plan omitted it'),
+                )
+            return AgentResult(success=True, output='')
+
+        invoke_mock = AsyncMock(side_effect=resumed_implementer)
+        monkeypatch.setattr(workflow, '_invoke', invoke_mock)
+
+        outcome = (await workflow.run()).outcome
+
+        assert outcome == WorkflowOutcome.DONE
+        role = invoke_mock.await_args_list[0].args[0]
+        assert getattr(role, 'name', '') == 'implementer'
+        assert workflow.artifacts is not None
+        assert 'new.py' in workflow.artifacts.read_plan()['files']
+        assert len(scheduler.acquire_uncontested_calls) == 1
+        assert scheduler.acquire_uncontested_calls[0][2] == ScopeDriftReason.IMPLEMENT_SCOPE_EXPANDED
+        assert workflow.artifacts.read_scope_requests() == ()
+
+    async def test_a_brief_a_prior_dispatch_left_waiting_reaches_the_resumed_implementer(
+        self, config, git_ops, task_assignment, tmp_path, monkeypatch,
+    ):
+        """A contested scope-drift report no writer received outlives its dispatch (task 3090).
+
+        It waits in the task root, so this dispatch's first writer session is
+        briefed with it, and having taken a turn, consumes it.
+        """
+        wt = await _make_advanced_worktree(git_ops, task_assignment.task_id)
+        left_waiting = build_scope_drift_report(
+            ['held.py'], [Blocker('held.py', '777', BlockerKind.HELD)],
+            lock_depth=config.lock_depth, boundary=ScopeBoundary.EXECUTE,
+            role='implementer', iteration=1, task_id=task_assignment.task_id,
+        )
+        # This harness runs the eval-mode external-worktree path, whose task
+        # root is its lane root (workflow.py::TaskWorkflow._artifact_roots).
+        lane_root = TaskArtifacts.for_task(wt, task_assignment.task_id).lane_root
+        prior_dispatch = TaskArtifacts(wt, meta_root=lane_root, task_root=lane_root)
+        lane_root.mkdir(parents=True, exist_ok=True)
+        prior_dispatch.write_scope_drift_brief(left_waiting)
+        queue = EscalationQueue(tmp_path / 'queue')
+        _submit_l0(queue, task_assignment.task_id)
+        workflow, _scheduler = _build_workflow(
+            config, git_ops, task_assignment, queue, wt,
+            steward_factory=_make_resolving_steward(
+                queue, task_assignment.task_id,
+            ),
+        )
+        evrl_mock, _state = _make_evrl_returner(
+            [WorkflowOutcome.ESCALATED, WorkflowOutcome.DONE],
+        )
+        monkeypatch.setattr(workflow, '_execute_verify_review_loop', evrl_mock)
+        briefed: list[object] = []
+
+        async def build_resume_prompt(
+            task, plan, escalation_summary, resolution, worktree=None, scope_drift=None,
+        ):
+            briefed.append(scope_drift)
+            return 'Resume'
+
+        monkeypatch.setattr(workflow.briefing, 'build_resume_prompt', build_resume_prompt)
+
+        async def invoke_taking_a_turn(role, build_prompt, cwd, output_schema=None):
+            await build_prompt()
+            return AgentResult(success=True, output='', turns=2)
+
+        monkeypatch.setattr(workflow, '_invoke', invoke_taking_a_turn)
+
+        outcome = (await workflow.run()).outcome
+
+        assert outcome == WorkflowOutcome.DONE
+        assert briefed == [left_waiting]
+        assert prior_dispatch.read_scope_drift_brief() is None
+
     async def test_already_on_main_short_circuit_runs_before_status_check(
         self, config, git_ops, task_assignment, tmp_path,
     ):
@@ -662,12 +827,14 @@ class TestStatusPreservationOnResume:
         wt = wt_info.path
         queue = EscalationQueue(tmp_path / 'queue')
         _submit_l0(queue, task_assignment.task_id)
-        workflow, scheduler = _build_workflow(
+        scheduler = FakeScheduler()
+        workflow, _ = _build_workflow(
             config, git_ops, task_assignment, queue, wt,
-        )
-        # Steward sets deferred — Fix 1 would otherwise return BLOCKED here.
-        workflow._steward_factory = _make_status_setting_steward(
-            queue, scheduler, task_assignment.task_id, 'deferred',
+            scheduler=scheduler,
+            # Steward sets deferred — Fix 1 would otherwise return BLOCKED here.
+            steward_factory=_make_status_setting_steward(
+                queue, scheduler, task_assignment.task_id, 'deferred',
+            ),
         )
         # This fixture's worktree is fresh/empty (no commits), so it has no
         # real implementation work — in eval mode, _setup_worktree_and_artifacts
@@ -755,7 +922,7 @@ class TestSetTaskScope:
 
         result = await workflow._set_task_scope(['lib.py', 'new.py'])
 
-        assert result is True
+        assert result.applied is True
         on_disk = artifacts.read_plan()
         assert on_disk['files'] == ['lib.py', 'new.py']
         assert artifacts.validate_plan_owner(workflow.session_id) is True
@@ -777,11 +944,11 @@ class TestSetTaskScope:
         artifacts = workflow.artifacts
         assert artifacts is not None
         original_modules = list(workflow.modules)
-        scheduler.blast_radius_result = False
+        scheduler.blast_radius_result = BlastRadiusResult(applied=False)
 
         result = await workflow._set_task_scope(['lib.py', 'new.py'])
 
-        assert result is False
+        assert result.applied is False
         assert workflow.modules == original_modules, (
             'self.modules must stay unchanged on a lock conflict — the '
             'scheduler already requeued the task holding the ORIGINAL lock.'
@@ -809,8 +976,7 @@ class TestSetTaskScope:
         # Two files co-located in the same package: at config.lock_depth the
         # module set is identical with or without F2 — a genuine same-module
         # widen (self-validating precondition asserted first).
-        f1 = 'a/b/c/d/e.py'
-        f2 = 'a/b/c/d/f.py'
+        f1, f2 = same_module_siblings(config.lock_depth)
         assert files_to_modules([f1], config.lock_depth) == files_to_modules(
             [f1, f2], config.lock_depth,
         ), (
@@ -838,7 +1004,7 @@ class TestSetTaskScope:
 
         result = await workflow._set_task_scope([f1, f2])
 
-        assert result is True
+        assert result.applied is True
         assert workflow.modules == modules_before, (
             'self.modules must be UNCHANGED on a same-module widen'
         )
@@ -889,6 +1055,35 @@ class TestCheckScopeInvariant:
         )
         return workflow, scheduler, queue
 
+    # Sentinel default for `_arrange`'s `metadata_files` param — distinct from
+    # `None`/`[]` (both legitimate file lists) — meaning "leave
+    # scheduler.task_data empty", i.e. the get_task()-returns-None shape.
+    _NO_TASK_DATA = object()
+
+    def _arrange(
+        self, config, git_ops, task_assignment, tmp_path, plan_files,
+        metadata_files=_NO_TASK_DATA,
+    ):
+        """``_build`` plus the ``workflow.plan`` / ``scheduler.task_data``
+        wiring every test in this class needs, so the task-dict shape
+        (``{'id': ..., 'metadata': {'files': ...}}``) that
+        ``_check_scope_invariant`` reads lives in exactly one place. Pass
+        ``metadata_files`` to populate ``scheduler.task_data`` normally;
+        omit it (the sentinel default) to leave ``scheduler.task_data``
+        empty, which is what the ``get_task``-returns-``None`` fail-safe
+        test needs.
+        """
+        workflow, scheduler, queue = self._build(
+            config, git_ops, task_assignment, tmp_path,
+        )
+        workflow.plan = {'files': plan_files}
+        if metadata_files is not self._NO_TASK_DATA:
+            scheduler.task_data[task_assignment.task_id] = {
+                'id': task_assignment.task_id,
+                'metadata': {'files': metadata_files},
+            }
+        return workflow, scheduler, queue
+
     async def test_divergent_plan_and_metadata_files_escalates(
         self, config, git_ops, task_assignment, tmp_path,
     ):
@@ -896,22 +1091,26 @@ class TestCheckScopeInvariant:
         # top-level files 'a.py' and 'b.py' normalize to DISTINCT modules, so
         # {'a.py','b.py'} != {'a.py'} at module granularity too — the tripwire
         # (now module-granular, task 2505 reviewer amendment) still fires.
+        # PLAN-EXTRA / UNSAFE direction (task 3429): plan.files needs a lock
+        # module that metadata.files does not cover — this is the direction
+        # the narrowed containment check must still catch.
         plan_files = ['a.py', 'b.py']
         metadata_files = ['a.py']
-        assert files_to_modules(plan_files, config.lock_depth) != files_to_modules(
-            metadata_files, config.lock_depth,
-        ), (
+        plan_modules = set(files_to_modules(plan_files, config.lock_depth))
+        metadata_modules = set(files_to_modules(metadata_files, config.lock_depth))
+        assert plan_modules != metadata_modules, (
             'precondition: this test must exercise a genuine cross-MODULE '
             f'divergence at lock_depth={config.lock_depth}'
         )
-        workflow, scheduler, queue = self._build(
-            config, git_ops, task_assignment, tmp_path,
+        assert plan_modules - metadata_modules, (
+            'precondition: this must be a PLAN-EXTRA divergence — plan.files '
+            'needs a lock module metadata.files does not cover — at '
+            f'lock_depth={config.lock_depth}; plan_modules={plan_modules!r} '
+            f'metadata_modules={metadata_modules!r}'
         )
-        workflow.plan = {'files': plan_files}
-        scheduler.task_data[task_assignment.task_id] = {
-            'id': task_assignment.task_id,
-            'metadata': {'files': metadata_files},
-        }
+        workflow, scheduler, queue = self._arrange(
+            config, git_ops, task_assignment, tmp_path, plan_files, metadata_files,
+        )
 
         await workflow._check_scope_invariant()
 
@@ -930,16 +1129,17 @@ class TestCheckScopeInvariant:
 
         ``metadata.files`` is only persisted by ``handle_blast_radius_expansion``,
         which no-ops when the module set is unchanged, so the normal architect
-        widen — author declares ``a/b/c/d/e.py``; architect plans that plus the
-        same-package ``a/b/c/d/f.py`` — legitimately leaves plan.files and
+        widen — author declares one file; architect plans that plus a
+        same-package sibling — legitimately leaves plan.files and
         metadata.files differing at file level while the LOCK-MODULE sets (and
         thus the locks and the merge) agree. The MERGE-entry tripwire must not
         fire a blocking infra_issue for that benign case. This FAILS under the
         old file-granularity comparison (which would escalate) and passes under
         the module-granularity comparison.
         """
-        plan_files = ['a/b/c/d/e.py', 'a/b/c/d/f.py']
-        metadata_files = ['a/b/c/d/e.py']
+        _f1, _f2 = same_module_siblings(config.lock_depth)
+        plan_files = [_f1, _f2]
+        metadata_files = [_f1]
         # Self-validating precondition: genuinely same-module but file-divergent.
         assert files_to_modules(plan_files, config.lock_depth) == files_to_modules(
             metadata_files, config.lock_depth,
@@ -951,14 +1151,9 @@ class TestCheckScopeInvariant:
             'precondition: the file lists must genuinely differ (else this '
             'would collapse into the consistent-files case)'
         )
-        workflow, scheduler, queue = self._build(
-            config, git_ops, task_assignment, tmp_path,
+        workflow, scheduler, queue = self._arrange(
+            config, git_ops, task_assignment, tmp_path, plan_files, metadata_files,
         )
-        workflow.plan = {'files': plan_files}
-        scheduler.task_data[task_assignment.task_id] = {
-            'id': task_assignment.task_id,
-            'metadata': {'files': metadata_files},
-        }
 
         await workflow._check_scope_invariant()
 
@@ -971,14 +1166,10 @@ class TestCheckScopeInvariant:
     async def test_consistent_plan_and_metadata_files_no_escalation(
         self, config, git_ops, task_assignment, tmp_path,
     ):
-        workflow, scheduler, queue = self._build(
+        workflow, scheduler, queue = self._arrange(
             config, git_ops, task_assignment, tmp_path,
+            ['a.py', 'b.py'], ['a.py', 'b.py'],
         )
-        workflow.plan = {'files': ['a.py', 'b.py']}
-        scheduler.task_data[task_assignment.task_id] = {
-            'id': task_assignment.task_id,
-            'metadata': {'files': ['a.py', 'b.py']},
-        }
 
         await workflow._check_scope_invariant()
 
@@ -990,17 +1181,205 @@ class TestCheckScopeInvariant:
     async def test_get_task_none_is_fail_safe_no_escalation_no_raise(
         self, config, git_ops, task_assignment, tmp_path,
     ):
-        workflow, scheduler, queue = self._build(
-            config, git_ops, task_assignment, tmp_path,
+        # metadata_files intentionally omitted -> scheduler.task_data left
+        # empty -> get_task() -> None.
+        workflow, scheduler, queue = self._arrange(
+            config, git_ops, task_assignment, tmp_path, ['a.py', 'b.py'],
         )
-        workflow.plan = {'files': ['a.py', 'b.py']}
-        # scheduler.task_data intentionally left empty -> get_task() -> None.
 
         await workflow._check_scope_invariant()  # must not raise
 
         assert queue.get_by_task(task_assignment.task_id, status='pending') == [], (
             'an unreadable task must be treated as "cannot check", not '
             '"divergent" — no escalation on a transient read failure'
+        )
+
+    async def test_metadata_module_superset_of_plan_no_escalation(
+        self, config, git_ops, task_assignment, tmp_path, caplog,
+    ):
+        """SAFE direction (task 3429): metadata.files a strict module
+        SUPERSET of plan.files must NOT escalate.
+
+        Mirrors the measured structural false-positive class (7 of the 9
+        PLAN-MISSING divergence strands on 2026-08-06): the extra file is the
+        task's OWN TEST FILE living in a sibling directory. metadata.files is
+        the sole input the scheduler derives this task's file locks from, so
+        a module SUPERSET means the held locks are wider than the plan
+        needs — that cannot let two tasks collide, it can only
+        over-serialise — so this must not fire the blocking L0 that gates
+        the merge. The safe direction must still stay observable, so it is
+        logged at INFO instead of vanishing silently.
+        """
+        plan_files = ['scripts/foo.sh']
+        metadata_files = ['scripts/foo.sh', 'scripts/tests/test_foo.py']
+        plan_modules = set(files_to_modules(plan_files, config.lock_depth))
+        metadata_modules = set(
+            files_to_modules(metadata_files, config.lock_depth)
+        )
+        assert plan_modules < metadata_modules, (
+            'precondition: metadata_modules must be a STRICT superset of '
+            f'plan_modules at lock_depth={config.lock_depth}; '
+            f'plan_modules={plan_modules!r} metadata_modules={metadata_modules!r}'
+        )
+        workflow, scheduler, queue = self._arrange(
+            config, git_ops, task_assignment, tmp_path, plan_files, metadata_files,
+        )
+
+        with caplog.at_level(logging.INFO, logger='orchestrator.workflow'):
+            await workflow._check_scope_invariant()
+
+        assert queue.get_by_task(task_assignment.task_id, status='pending') == [], (
+            'a metadata.files module SUPERSET is a wider-than-needed lock '
+            'set — it cannot let two tasks collide, only over-serialise — '
+            'so it must NOT file the blocking L0 that gates the merge'
+        )
+        extra_modules = sorted(metadata_modules - plan_modules)
+        info_messages = [
+            r.getMessage() for r in caplog.records if r.levelno == logging.INFO
+        ]
+        matching = [
+            msg for msg in info_messages
+            if task_assignment.task_id in msg
+            and all(mod in msg for mod in extra_modules)
+        ]
+        assert matching, (
+            'expected an INFO log naming the task id and the extra metadata '
+            f'module(s) {extra_modules!r} so the benign-superset direction '
+            f'stays observable; INFO records: {info_messages!r}'
+        )
+
+    async def test_both_ways_divergence_escalates_and_detail_names_uncovered_modules(
+        self, config, git_ops, task_assignment, tmp_path,
+    ):
+        """BOTH-WAYS divergence (the measured task-3105 shape): each side has
+        a module the other lacks. The narrowed containment predicate must
+        still catch this — plan_modules - metadata_modules is non-empty — and
+        the escalation detail must name exactly which modules the locks do
+        not cover, instead of the old false "these derive DIFFERENT
+        lock-module sets ... keep the module sets in lockstep" claim, which
+        is false for the benign-superset population this record class now
+        also has to describe accurately.
+        """
+        plan_files = ['scripts/foo.sh', 'pkg/impl.py']
+        metadata_files = ['scripts/foo.sh', 'scripts/tests/test_foo.py']
+        plan_modules = set(files_to_modules(plan_files, config.lock_depth))
+        metadata_modules = set(
+            files_to_modules(metadata_files, config.lock_depth)
+        )
+        uncovered = plan_modules - metadata_modules
+        assert uncovered, (
+            'precondition: plan.files must need a module metadata.files '
+            f'does not cover at lock_depth={config.lock_depth}; '
+            f'plan_modules={plan_modules!r} metadata_modules={metadata_modules!r}'
+        )
+        assert metadata_modules - plan_modules, (
+            'precondition: this must be a genuine BOTH-WAYS divergence, not '
+            f'a plain PLAN-EXTRA — metadata_modules={metadata_modules!r} '
+            f'must also hold a module plan_modules={plan_modules!r} lacks'
+        )
+        workflow, scheduler, queue = self._arrange(
+            config, git_ops, task_assignment, tmp_path, plan_files, metadata_files,
+        )
+
+        await workflow._check_scope_invariant()
+
+        pending = queue.get_by_task(task_assignment.task_id, status='pending')
+        infra_issues = [e for e in pending if e.category == 'infra_issue']
+        assert len(infra_issues) == 1, (
+            f'expected exactly one infra_issue escalation; pending={pending!r}'
+        )
+        esc = infra_issues[0]
+        for module in sorted(uncovered):
+            assert module in esc.detail, (
+                f'expected uncovered module {module!r} to be named in the '
+                f'escalation detail so triage knows exactly what is not '
+                f'covered; detail={esc.detail!r}'
+            )
+        assert esc.severity == 'blocking', 'PRD D11 keeps the gate'
+        assert esc.category == 'infra_issue', 'PRD D11 keeps the gate'
+
+    async def test_empty_plan_files_with_nonempty_metadata_escalates(
+        self, config, git_ops, task_assignment, tmp_path,
+    ):
+        """Robustness (review amendment, task 3429): an EMPTY plan.files is
+        not evidence of a safe metadata.files superset — containment
+        (``uncovered = plan_modules - metadata_modules``) is vacuously empty
+        for an empty LHS regardless of what metadata_modules holds, so it
+        looks identical to a lost/never-populated plan.files. Must escalate
+        (loud-over-silent-degradation), not fall into the benign-superset
+        INFO path.
+        """
+        plan_files = []
+        metadata_files = ['a.py']
+        plan_modules = set(files_to_modules(plan_files, config.lock_depth))
+        metadata_modules = set(
+            files_to_modules(metadata_files, config.lock_depth)
+        )
+        assert not plan_modules and metadata_modules, (
+            'precondition: plan_modules must be empty and metadata_modules '
+            f'non-empty; plan_modules={plan_modules!r} '
+            f'metadata_modules={metadata_modules!r}'
+        )
+        workflow, scheduler, queue = self._arrange(
+            config, git_ops, task_assignment, tmp_path, plan_files, metadata_files,
+        )
+
+        await workflow._check_scope_invariant()
+
+        pending = queue.get_by_task(task_assignment.task_id, status='pending')
+        infra_issues = [e for e in pending if e.category == 'infra_issue']
+        assert infra_issues, (
+            'an empty plan.files next to non-empty metadata.files must '
+            f'escalate, not be treated as a benign superset; pending={pending!r}'
+        )
+        assert infra_issues[0].severity == 'blocking', 'PRD D11 keeps the gate'
+
+    async def test_all_directory_plan_files_with_nonempty_metadata_escalates(
+        self, config, git_ops, task_assignment, tmp_path,
+    ):
+        """Same robustness gap, reached via the other route: every
+        plan.files entry is directory-shaped (no recognised file
+        extension), so ``sanitize_files_for_persist`` alpha-strips the list
+        to empty before ``_check_scope_invariant`` ever computes
+        ``plan_modules`` — structurally identical to a genuinely empty
+        plan.files from this method's point of view, and must escalate for
+        the same reason.
+        """
+        from shared.locking import is_file_path
+
+        from orchestrator.module_charter import sanitize_files_for_persist
+
+        plan_files = ['pkg']  # directory-shaped: no '.', stripped on sanitize
+        metadata_files = ['a.py']
+        assert not is_file_path(plan_files[0]), (
+            'precondition: the fixture file must be directory-shaped (no '
+            f'recognised extension); is_file_path({plan_files[0]!r}) says '
+            'otherwise'
+        )
+        sanitized_plan_files = sanitize_files_for_persist(plan_files)
+        plan_modules = set(
+            files_to_modules(sanitized_plan_files, config.lock_depth)
+        )
+        metadata_modules = set(
+            files_to_modules(metadata_files, config.lock_depth)
+        )
+        assert not plan_modules and metadata_modules, (
+            'precondition: an all-directory plan_files must derive NO lock '
+            f'modules once sanitized (mirroring _check_scope_invariant\'s '
+            f'own sanitize_files_for_persist call); '
+            f'sanitized={sanitized_plan_files!r} plan_modules={plan_modules!r}'
+        )
+        workflow, scheduler, queue = self._arrange(
+            config, git_ops, task_assignment, tmp_path, plan_files, metadata_files,
+        )
+
+        await workflow._check_scope_invariant()
+
+        pending = queue.get_by_task(task_assignment.task_id, status='pending')
+        infra_issues = [e for e in pending if e.category == 'infra_issue']
+        assert infra_issues, (
+            'an all-directory plan.files (alpha-stripped to empty) next to '
+            f'non-empty metadata.files must escalate; pending={pending!r}'
         )
 
 
@@ -1045,7 +1424,7 @@ class TestRealPromptPassedToCliInvokeOnResume:
             new_callable=AsyncMock,
             return_value=AgentResult(success=True, output=''),
         ) as mock_cap_retry:
-            await workflow._invoke(IMPLEMENTER, 'REAL TASK PROMPT', cwd)
+            await workflow._invoke(IMPLEMENTER, fixed_prompt('REAL TASK PROMPT'), cwd)
 
         assert mock_cap_retry.await_count == 1, 'invoke_with_cap_retry must be called once'
         assert mock_cap_retry.await_args is not None, 'await_args must not be None'
@@ -1104,7 +1483,7 @@ class TestStartupGraceSecsReachesWatchdog:
             new_callable=AsyncMock,
             return_value=AgentResult(success=True, output=''),
         ) as mock_cap_retry:
-            await workflow._invoke(IMPLEMENTER, 'PROMPT', cwd)
+            await workflow._invoke(IMPLEMENTER, fixed_prompt('PROMPT'), cwd)
 
         assert mock_cap_retry.await_count == 1, 'invoke_with_cap_retry must be called once'
         assert mock_cap_retry.await_args is not None, 'await_args must be set after one await'

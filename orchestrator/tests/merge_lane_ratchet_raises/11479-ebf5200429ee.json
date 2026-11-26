@@ -1,0 +1,18 @@
+{
+  "task_id": "11479",
+  "reason": "task 11479: drift_check_lane is a new seam routing the drift check's local leg to a warm-seeded throwaway where a pool is configured, keeping today's cold path otherwise (net-additive; the cold branch moves out of drift.py in step-6)",
+  "measures": [
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/liveness.py",
+      "baseline": 67,
+      "current": 68
+    },
+    {
+      "measure": "total:cognitive",
+      "key": "<cluster>",
+      "baseline": 5268,
+      "current": 5269
+    }
+  ]
+}

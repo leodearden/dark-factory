@@ -1,53 +1,58 @@
-"""Tests for orchestrator.merge_liveness: extracted startup liveness-margin
+"""Tests for orchestrator.merge_lane.liveness: extracted startup liveness-margin
 guard, verify-host-unreachable alarms, and persistent-worktree operational
 guards (MQ-refactor task γ).
 
 These tests encode the behavior-preserving contracts of the module split,
 mirroring task β's test_merge_gates.py:
 
-1. Module-existence — ``orchestrator.merge_liveness`` exists and exports the
+1. Module-existence — ``orchestrator.merge_lane.liveness`` exists and exports the
    full closure of moved symbols (liveness-margin types/functions,
    verify-host-unreachable alarm helpers, and persistent-worktree guards).
-2. Logger-name — the module logs under the ``orchestrator.merge_queue``
-   logger name (not ``orchestrator.merge_liveness``) so existing ``caplog``
-   assertions filtered to the merge_queue logger keep capturing the moved
+2. Logger-name — the module logs under the lane's one logger name,
+   ``orchestrator.merge_lane`` (task 5037), so ``caplog`` assertions
+   filtered to that name keep capturing the moved
    guards' WARNING-level messages.
-3. Reach-back / string-path monkeypatch routing — the existing test suite
-   monkeypatches liveness-guard dependencies (including two module-level
-   CONSTANTS that stay behind in merge_queue.py) by STRING PATH
-   ``orchestrator.merge_queue.<name>``.  A moved function must resolve a
-   monkeypatched-or-staying sibling via a function-local deferred import so
-   those patches stay effective even though the function body now lives in
-   this module.  Each ``TestReachBackRouting`` test below patches BOTH
-   namespaces (merge_liveness-local naive vs. merge_queue reach-back
-   target) with CONTRASTING behaviour.  Every target in this module is a
-   SYNC function, so — unlike merge_shadow / merge_drift — this class
-   carries no ``@pytest.mark.asyncio`` marker.  Also covers the
-   engine-constant default-argument hazard's OTHER half:
-   ``enforce_persistent_worktree_serial_lane``'s ``_MERGE_AHEAD_BOUND``
-   None-default (design_decisions #3 in plan.json names both
-   ``liveness_secs``/``INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS`` and
-   ``merge_ahead_bound``/``_MERGE_AHEAD_BOUND``; the step-3 plan prose only
-   spelled out the former by name).
-4. Shim re-export identity (added in a later step, once merge_queue.py's
-   shim swap lands).
 """
 
 from __future__ import annotations
 
 import os
+import subprocess
+import sys
+import time
+from collections.abc import Callable
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from typing import Generic, TypeVar
+from unittest.mock import patch
 
 import pytest
+from _drift_lanes import registered_drift_lanes
+from _lane_test_helpers import get_head
+from _seed_script_stubs import (
+    CURRENT_LOCKING_SEED_SCRIPT,
+    commit_seed_script,
+    make_seed_test_repo,
+    warm_pool_git_config,
+)
+from shared.proc_group import cpu_ticks_under_path
 
-from orchestrator.config import GitConfig, OrchestratorConfig
+from orchestrator.config import GitConfig
+from orchestrator.git_ops import (
+    PERSISTENT_MERGE_WORKTREE_NAME,
+    GitOps,
+    WarmSeedUnavailable,
+    WorktreeKind,
+)
+from orchestrator.merge_lane.liveness import (
+    VerifyProgressWatch,
+    drift_check_lane,
+    verify_tree_cpu_ticks,
+)
 
 
 def test_merge_liveness_exports_moved_public_symbols() -> None:
-    from orchestrator.merge_liveness import (
+    from orchestrator.merge_lane.liveness import (
         _MERGE_WORKER_LOOP_DIED_SENTINEL,
-        _VERIFY_HOST_RECOVERED_SENTINEL_PREFIX,
         _VERIFY_HOST_UNREACHABLE_SENTINEL_PREFIX,
         MergeLivenessAssessment,
         MergeLivenessConfigError,
@@ -70,7 +75,6 @@ def test_merge_liveness_exports_moved_public_symbols() -> None:
         'PersistentWorktreeConfigError': PersistentWorktreeConfigError,
         '_safety_valve_due': _safety_valve_due,
         '_VERIFY_HOST_UNREACHABLE_SENTINEL_PREFIX': _VERIFY_HOST_UNREACHABLE_SENTINEL_PREFIX,
-        '_VERIFY_HOST_RECOVERED_SENTINEL_PREFIX': _VERIFY_HOST_RECOVERED_SENTINEL_PREFIX,
         '_MERGE_WORKER_LOOP_DIED_SENTINEL': _MERGE_WORKER_LOOP_DIED_SENTINEL,
         '_verify_host_unreachable_sentinel': _verify_host_unreachable_sentinel,
         '_alarm_verify_host_unreachable': _alarm_verify_host_unreachable,
@@ -91,14 +95,14 @@ class TestNewestContentMtime:
     (``_touch_owned_merge_worktrees``) only ``os.utime``s the ROOT inode, so
     a helper that never stats the root itself cannot be fooled by it.
 
-    RED (pre-impl): ``orchestrator.merge_liveness.newest_content_mtime`` does
+    RED (pre-impl): ``orchestrator.merge_lane.liveness.newest_content_mtime`` does
     not exist yet.
     """
 
     def test_returns_newest_mtime_among_content_strictly_below_root(
         self, tmp_path: Path,
     ) -> None:
-        from orchestrator.merge_liveness import newest_content_mtime
+        from orchestrator.merge_lane.liveness import newest_content_mtime
 
         older = tmp_path / 'older.txt'
         newer = tmp_path / 'newer.txt'
@@ -115,7 +119,7 @@ class TestNewestContentMtime:
         self, tmp_path: Path,
     ) -> None:
         """A sub-directory's own mtime (not just file mtimes) must be scanned."""
-        from orchestrator.merge_liveness import newest_content_mtime
+        from orchestrator.merge_lane.liveness import newest_content_mtime
 
         sub = tmp_path / 'subdir'
         sub.mkdir()
@@ -137,7 +141,7 @@ class TestNewestContentMtime:
         existing 3h root-mtime reaper never fires for a dead-verify-but-
         live-worker.  newest_content_mtime must never stat root itself.
         """
-        from orchestrator.merge_liveness import newest_content_mtime
+        from orchestrator.merge_lane.liveness import newest_content_mtime
 
         child = tmp_path / 'child.txt'
         child.write_text('x')
@@ -156,18 +160,18 @@ class TestNewestContentMtime:
         )
 
     def test_returns_none_for_empty_dir(self, tmp_path: Path) -> None:
-        from orchestrator.merge_liveness import newest_content_mtime
+        from orchestrator.merge_lane.liveness import newest_content_mtime
 
         assert newest_content_mtime(tmp_path) is None
 
     def test_returns_none_for_missing_path(self, tmp_path: Path) -> None:
-        from orchestrator.merge_liveness import newest_content_mtime
+        from orchestrator.merge_lane.liveness import newest_content_mtime
 
         missing = tmp_path / 'does-not-exist'
         assert newest_content_mtime(missing) is None
 
     def test_git_subtree_is_skipped(self, tmp_path: Path) -> None:
-        from orchestrator.merge_liveness import newest_content_mtime
+        from orchestrator.merge_lane.liveness import newest_content_mtime
 
         git_dir = tmp_path / '.git'
         git_dir.mkdir()
@@ -185,7 +189,7 @@ class TestNewestContentMtime:
 
     def test_unreadable_or_vanished_entry_does_not_raise(self, tmp_path: Path) -> None:
         """Best-effort: a broken symlink (stat-raises OSError) is skipped, not fatal."""
-        from orchestrator.merge_liveness import newest_content_mtime
+        from orchestrator.merge_lane.liveness import newest_content_mtime
 
         good = tmp_path / 'good.txt'
         good.write_text('z')
@@ -199,115 +203,62 @@ class TestNewestContentMtime:
         assert result == 100.0, f'a broken symlink must be skipped, not raised; got {result!r}'
 
 
-def test_merge_liveness_logger_name_is_merge_queue() -> None:
-    """merge_liveness emits under the 'orchestrator.merge_queue' logger name.
+def test_merge_liveness_logger_name_is_merge_lane() -> None:
+    """The liveness module logs under the lane's one name, 'orchestrator.merge_lane'.
 
-    RED (pre-module): ``orchestrator.merge_liveness`` does not exist yet.
-
-    Required so existing ``caplog.at_level(..., logger='orchestrator.merge_queue')``
-    assertions in test_merge_queue.py keep capturing the moved guards'
-    WARNING-level messages after relocation.
+    Every merge-lane module shares it (task 5037), so a
+    ``caplog.at_level(..., logger='orchestrator.merge_lane')`` filter
+    captures this module's records too.
     """
-    import orchestrator.merge_liveness as merge_liveness
+    import orchestrator.merge_lane.liveness as merge_liveness
 
-    assert merge_liveness.logger.name == 'orchestrator.merge_queue'
+    assert merge_liveness.logger.name == 'orchestrator.merge_lane'
 
 
-class TestReachBackRouting:
-    """Reach-back / string-path monkeypatch routing contract.
 
-    Every target below is a SYNC function; see the module docstring for why
-    this class carries no ``@pytest.mark.asyncio`` marker.
+class TestEngineConstantsAreReadAtCallTime:
+    """The liveness guards read their engine constants when CALLED, not when defined.
+
+    Each test patches one constant on ``orchestrator.merge_lane.liveness``, the
+    module that defines it and reads it, and calls the guard with the
+    corresponding argument omitted. A def-time default would have frozen the
+    original value and ignored the patch (see the module docstring of
+    ``orchestrator/src/orchestrator/merge_lane/liveness.py``).
     """
 
-    def test_enforce_merge_liveness_margin_reachback_to_check_merge_liveness_margin(
+    def test_check_merge_liveness_margin_defaults_liveness_secs_at_call_time(
         self, tmp_path: Path,
     ) -> None:
-        """(6) enforce_merge_liveness_margin must resolve check_merge_liveness_margin
-        via orchestrator.merge_queue, not the co-located merge_liveness copy."""
-        from orchestrator.merge_liveness import (
-            MergeLivenessAssessment,
-            MergeLivenessConfigError,
-            enforce_merge_liveness_margin,
+        from orchestrator.config import OrchestratorConfig
+        from orchestrator.merge_lane.liveness import check_merge_liveness_margin
+
+        cfg = OrchestratorConfig(project_root=tmp_path)
+        with patch('orchestrator.merge_lane.liveness.INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS', 600.0):
+            result = check_merge_liveness_margin(cfg)
+
+        assert result.liveness_secs == 600.0, result
+
+    def test_check_merge_liveness_margin_reads_heartbeat_poll_at_call_time(
+        self, tmp_path: Path,
+    ) -> None:
+        from orchestrator.config import OrchestratorConfig
+        from orchestrator.merge_lane.liveness import (
+            TOUCH_MISS_TOLERANCE,
+            check_merge_liveness_margin,
         )
 
         cfg = OrchestratorConfig(project_root=tmp_path)
-
-        # Naive-resolution target: reports safe → would NOT raise.
-        naive_safe = MergeLivenessAssessment(
-            worst_case_secs=1.0, threshold_secs=100.0, liveness_secs=10800.0,
-            heartbeat_poll_secs=30.0, touch_miss_tolerance=20,
-            safety_factor=0.75, safe=True,
-        )
-        # Reach-back target: reports UNSAFE → must raise MergeLivenessConfigError.
-        reachback_unsafe = MergeLivenessAssessment(
-            worst_case_secs=999999.0, threshold_secs=100.0, liveness_secs=10800.0,
-            heartbeat_poll_secs=30.0, touch_miss_tolerance=20,
-            safety_factor=0.75, safe=False,
-        )
-
-        with (
-            patch(
-                'orchestrator.merge_liveness.check_merge_liveness_margin',
-                MagicMock(return_value=naive_safe),
-            ),
-            patch(
-                'orchestrator.merge_queue.check_merge_liveness_margin',
-                MagicMock(return_value=reachback_unsafe),
-            ),
-            pytest.raises(MergeLivenessConfigError),
-        ):
-            enforce_merge_liveness_margin(cfg)
-
-    def test_check_merge_liveness_margin_reachback_to_heartbeat_constants(
-        self, tmp_path: Path,
-    ) -> None:
-        """(7a) check_merge_liveness_margin must read _HEARTBEAT_POLL_S and
-        TOUCH_MISS_TOLERANCE from orchestrator.merge_queue at call time."""
-        from orchestrator.merge_liveness import check_merge_liveness_margin
-
-        cfg = OrchestratorConfig(project_root=tmp_path)
-
-        with (
-            patch('orchestrator.merge_queue._HEARTBEAT_POLL_S', 1000.0),
-            patch('orchestrator.merge_queue.TOUCH_MISS_TOLERANCE', 1000),
-        ):
+        with patch('orchestrator.merge_lane.liveness._HEARTBEAT_POLL_S', 1000.0):
             result = check_merge_liveness_margin(cfg, liveness_secs=10800.0)
 
-        assert result.worst_case_secs == 1000.0 * 1000, (
-            f'expected worst_case_secs to reflect the orchestrator.merge_queue-patched '
-            f'_HEARTBEAT_POLL_S x TOUCH_MISS_TOLERANCE (1,000,000), got '
-            f'{result.worst_case_secs!r}'
-        )
-        assert result.safe is False, (
-            f'floor of 1,000,000s must blow well past the threshold; got safe={result.safe!r}'
-        )
+        assert result.worst_case_secs == 1000.0 * TOUCH_MISS_TOLERANCE, result
+        assert result.safe is False, result
 
-    def test_check_merge_liveness_margin_reachback_to_inflight_liveness_default(
+    def test_enforce_persistent_worktree_serial_lane_defaults_merge_ahead_bound_at_call_time(
         self, tmp_path: Path,
     ) -> None:
-        """(7b) check_merge_liveness_margin's None-default liveness_secs must
-        resolve INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS from orchestrator.merge_queue."""
-        from orchestrator.merge_liveness import check_merge_liveness_margin
-
-        cfg = OrchestratorConfig(project_root=tmp_path)
-
-        with patch('orchestrator.merge_queue.INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS', 600.0):
-            result = check_merge_liveness_margin(cfg)  # liveness_secs omitted → None-default path
-
-        assert result.liveness_secs == 600.0, (
-            f'expected the None-default liveness_secs to resolve via the '
-            f'orchestrator.merge_queue-patched INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS, '
-            f'got {result.liveness_secs!r}'
-        )
-
-    def test_enforce_persistent_worktree_serial_lane_reachback_to_merge_ahead_bound_default(
-        self, tmp_path: Path,
-    ) -> None:
-        """enforce_persistent_worktree_serial_lane's None-default merge_ahead_bound
-        must resolve _MERGE_AHEAD_BOUND from orchestrator.merge_queue (same
-        def-time-constant hazard as liveness_secs above; design_decisions #3)."""
-        from orchestrator.merge_liveness import (
+        from orchestrator.config import GitConfig, OrchestratorConfig
+        from orchestrator.merge_lane.liveness import (
             PersistentWorktreeConfigError,
             enforce_persistent_worktree_serial_lane,
         )
@@ -316,50 +267,245 @@ class TestReachBackRouting:
             project_root=tmp_path,
             git=GitConfig(persistent_merge_worktree=True),
         )
-
+        # merge_ahead_bound omitted; num_hosts=1, so per-host ceil(5/1)=5 > 1 raises.
         with (
-            patch('orchestrator.merge_queue._MERGE_AHEAD_BOUND', 5),
+            patch('orchestrator.merge_lane.liveness._MERGE_AHEAD_BOUND', 5),
             pytest.raises(PersistentWorktreeConfigError),
         ):
-            # merge_ahead_bound omitted → None-default path; num_hosts=1 →
-            # per_host=ceil(5/1)=5 > 1 → raises.
             enforce_persistent_worktree_serial_lane(cfg)
 
 
-def test_merge_queue_reexports_identical_objects() -> None:
-    """merge_queue re-exports the SAME objects from merge_liveness (shim identity).
+_T = TypeVar('_T')
+_PROBE_SECS = 30.0
 
-    Covers every one of the 14 moved names.
 
-    RED (pre-shim): merge_queue.py still defines its own independent copies
-    of these names (the duplicate definitions left in place by the EXPAND
-    step), so ``getattr(merge_queue, name) is getattr(merge_liveness, name)``
-    fails for every name — two distinct objects that merely share a name.
+class _Probe(Generic[_T]):
+    """A zero-argument progress probe returning a fixed reading, counting its calls."""
+
+    def __init__(self, reading: _T) -> None:
+        self.reading = reading
+        self.calls = 0
+
+    def __call__(self) -> _T:
+        self.calls += 1
+        return self.reading
+
+
+def _observe(
+    watch: VerifyProgressWatch,
+    now: float,
+    *,
+    cpu: _Probe[int | None],
+    mtime: _Probe[float | None],
+    dispatch_live: bool = False,
+) -> VerifyProgressWatch:
+    return watch.observe(
+        now, dispatch_live=dispatch_live, probe_every_secs=_PROBE_SECS,
+        cpu_ticks=cpu, content_mtime=mtime,
+    )
+
+
+class TestVerifyProgressWatch:
+    """The in-flight verify's progress evidence, unioned (task 5290).
+
+    A live remote dispatch short-circuits; otherwise each throttled probe
+    asks the verify tree's CPU fingerprint first and walks merge_wt's mtime
+    only when that is silent.
     """
-    import orchestrator.merge_liveness as merge_liveness
-    import orchestrator.merge_queue as merge_queue
 
-    moved_names = [
-        'MergeLivenessAssessment',
-        'check_merge_liveness_margin',
-        'MergeLivenessConfigError',
-        'enforce_merge_liveness_margin',
-        'PersistentWorktreeConfigError',
-        '_safety_valve_due',
-        '_VERIFY_HOST_UNREACHABLE_SENTINEL_PREFIX',
-        '_VERIFY_HOST_RECOVERED_SENTINEL_PREFIX',
-        '_MERGE_WORKER_LOOP_DIED_SENTINEL',
-        '_verify_host_unreachable_sentinel',
-        '_alarm_verify_host_unreachable',
-        '_clear_verify_host_unreachable',
-        '_acquire_warm_verify_worktree',
-        'enforce_persistent_worktree_serial_lane',
-    ]
+    def test_a_live_dispatch_is_progress_and_probes_nothing(self) -> None:
+        cpu, mtime = _Probe[int | None](100), _Probe[float | None](50.0)
+        watch = VerifyProgressWatch.start(0.0, cpu_ticks=100, content_mtime=50.0)
 
-    for name in moved_names:
-        mq_obj = getattr(merge_queue, name)
-        ml_obj = getattr(merge_liveness, name)
-        assert mq_obj is ml_obj, (
-            f'{name}: orchestrator.merge_queue.{name} and '
-            f'orchestrator.merge_liveness.{name} must be the identical object'
-        )
+        watch = _observe(watch, 1000.0, cpu=cpu, mtime=mtime, dispatch_live=True)
+
+        assert watch.no_progress_secs(1000.0) == 0.0
+        assert watch.dispatch_seen_in_flight is True
+        assert (cpu.calls, mtime.calls) == (0, 0)
+
+    def test_the_throttle_probes_nothing_inside_the_interval(self) -> None:
+        cpu, mtime = _Probe[int | None](100), _Probe[float | None](50.0)
+        start = VerifyProgressWatch.start(0.0, cpu_ticks=100, content_mtime=50.0)
+
+        early = _observe(start, _PROBE_SECS - 1.0, cpu=cpu, mtime=mtime)
+        assert early == start
+        assert (cpu.calls, mtime.calls) == (0, 0)
+
+        probed = _observe(start, _PROBE_SECS, cpu=cpu, mtime=mtime)
+        assert (cpu.calls, mtime.calls) == (1, 1)
+        _observe(probed, 2 * _PROBE_SECS - 1.0, cpu=cpu, mtime=mtime)
+        assert (cpu.calls, mtime.calls) == (1, 1)
+
+    @pytest.mark.parametrize('ticks', [107, 93], ids=['increase', 'decrease-a-process-exited'])
+    def test_a_cpu_change_is_progress_without_the_mtime_walk(self, ticks: int) -> None:
+        cpu, mtime = _Probe[int | None](ticks), _Probe[float | None](50.0)
+        watch = VerifyProgressWatch.start(0.0, cpu_ticks=100, content_mtime=50.0)
+
+        watch = _observe(watch, _PROBE_SECS, cpu=cpu, mtime=mtime)
+
+        assert watch.no_progress_secs(_PROBE_SECS) == 0.0
+        assert (cpu.calls, mtime.calls) == (1, 0)
+
+    @pytest.mark.parametrize('ticks', [100, None], ids=['unchanged', 'none-both-times'])
+    def test_silent_cpu_falls_through_to_a_newer_mtime(self, ticks: int | None) -> None:
+        cpu, mtime = _Probe[int | None](ticks), _Probe[float | None](60.0)
+        watch = VerifyProgressWatch.start(0.0, cpu_ticks=ticks, content_mtime=50.0)
+
+        watch = _observe(watch, _PROBE_SECS, cpu=cpu, mtime=mtime)
+
+        assert watch.no_progress_secs(_PROBE_SECS) == 0.0
+        assert (cpu.calls, mtime.calls) == (1, 1)
+
+    @pytest.mark.parametrize('reading', [50.0, None], ids=['equal-mtime', 'no-mtime'])
+    def test_a_wedged_tree_accrues_no_progress(self, reading: float | None) -> None:
+        """Alive, zero CPU delta, nothing written: no_progress_secs keeps growing."""
+        cpu, mtime = _Probe[int | None](100), _Probe[float | None](reading)
+        watch = VerifyProgressWatch.start(0.0, cpu_ticks=100, content_mtime=50.0)
+
+        for sweep in range(1, 5):
+            watch = _observe(watch, sweep * _PROBE_SECS, cpu=cpu, mtime=mtime)
+
+        assert watch.no_progress_secs(4 * _PROBE_SECS) == 4 * _PROBE_SECS
+        assert (cpu.calls, mtime.calls) == (4, 4)
+
+    def test_a_process_appearing_is_progress(self) -> None:
+        cpu, mtime = _Probe[int | None](5), _Probe[float | None](None)
+        watch = VerifyProgressWatch.start(0.0, cpu_ticks=None, content_mtime=None)
+
+        watch = _observe(watch, _PROBE_SECS, cpu=cpu, mtime=mtime)
+
+        assert watch.no_progress_secs(_PROBE_SECS) == 0.0
+        assert mtime.calls == 0
+
+    def test_observe_returns_a_new_value_and_leaves_the_original(self) -> None:
+        cpu, mtime = _Probe[int | None](100), _Probe[float | None](50.0)
+        start = VerifyProgressWatch.start(0.0, cpu_ticks=100, content_mtime=50.0)
+
+        after = _observe(start, 1000.0, cpu=cpu, mtime=mtime, dispatch_live=True)
+
+        assert after is not start
+        assert start.dispatch_seen_in_flight is False
+        assert start.no_progress_secs(1000.0) == 1000.0
+
+
+def _ticks_rise(read: Callable[[], int | None], *, within_secs: float) -> bool:
+    """Whether *read* returns an int that later strictly increases, within the deadline."""
+    first: int | None = None
+    deadline = time.monotonic() + within_secs
+    while time.monotonic() < deadline:
+        ticks = read()
+        if ticks is not None and first is None:
+            first = ticks
+        elif ticks is not None and first is not None and ticks > first:
+            return True
+        time.sleep(0.05)
+    return False
+
+
+def _busy_child(cwd: Path, *, own_session: bool) -> subprocess.Popen[bytes]:
+    return subprocess.Popen(
+        [sys.executable, '-c', 'while True: pass'], cwd=cwd, start_new_session=own_session,
+    )
+
+
+class TestVerifyTreeCpuTicks:
+    """The verify tree's CPU fingerprint on the real /proc, bounded."""
+
+    @pytest.mark.timeout(60)
+    def test_a_busy_verify_subprocess_in_its_own_session_is_counted(self, tmp_path: Path) -> None:
+        """Any child in its own session counts, a verify's or not: only the caller's pgrp is excluded."""
+        root = tmp_path.resolve()
+        child = _busy_child(root, own_session=True)
+        try:
+            assert _ticks_rise(lambda: verify_tree_cpu_ticks(root), within_secs=30.0)
+        finally:
+            child.kill()
+            child.wait()
+
+    @pytest.mark.timeout(60)
+    def test_the_orchestrators_own_process_group_is_never_counted(self, tmp_path: Path) -> None:
+        """Anti-masking (#1728): work in the caller's own process group cannot refresh it."""
+        root = tmp_path.resolve()
+        child = _busy_child(root, own_session=False)
+        try:
+            assert _ticks_rise(lambda: cpu_ticks_under_path(root), within_secs=30.0), (
+                'precondition: the unfiltered fingerprint sees the busy child'
+            )
+            assert verify_tree_cpu_ticks(root) is None
+        finally:
+            child.kill()
+            child.wait()
+
+
+# ---------------------------------------------------------------------------
+# task 11479: drift_check_lane — the drift check's local-leg lane rule
+# ---------------------------------------------------------------------------
+
+_NO_POOL_GIT_CONFIG = GitConfig(
+    main_branch='main', branch_prefix='task/', remote='origin',
+    worktree_dir='.worktrees', push_after_advance=False,
+)
+
+
+async def _drift_scene(
+    tmp_path: Path, *, pool: bool, warm_base: bool = True,
+) -> tuple[GitOps, Path, str]:
+    repo = make_seed_test_repo(tmp_path, warm_base=warm_base)
+    await commit_seed_script(repo, CURRENT_LOCKING_SEED_SCRIPT)
+    git_ops = (
+        GitOps(warm_pool_git_config(), repo, merge_spec_warm_lane_pool_size=1)
+        if pool else GitOps(_NO_POOL_GIT_CONFIG, repo)
+    )
+    return git_ops, repo, await get_head(repo)
+
+
+@pytest.mark.asyncio
+class TestDriftCheckLane:
+    """The drift check's local leg verifies warm wherever a pool is configured,
+    never silently cold; with no pool it keeps today's cold ``_merge-<hex>``
+    throwaway under its task-3018 lane flock. Real git, nothing patched."""
+
+    async def test_no_pool_keeps_the_cold_throwaway_under_its_lane_flock(
+        self, tmp_path: Path,
+    ) -> None:
+        git_ops, _repo, head = await _drift_scene(tmp_path, pool=False)
+        assert not git_ops.pool_in_use()
+
+        async with drift_check_lane(git_ops, head) as wt:
+            assert wt.name.startswith('_merge-')
+            assert wt.name != PERSISTENT_MERGE_WORKTREE_NAME
+            assert not (wt / 'target').exists()
+            outcome = await git_ops.remove_merge_worktree_guarded(wt, reason='reap-sim')
+            assert outcome == 'skipped_lease_held'
+            assert wt.exists()
+
+        assert not wt.exists(), 'the lease must close before the cleanup, or the tree leaks'
+
+    async def test_pool_configured_runs_seeded_without_taking_a_spec_lane(
+        self, tmp_path: Path,
+    ) -> None:
+        git_ops, _repo, head = await _drift_scene(tmp_path, pool=True)
+        spec_pool = git_ops.spec_warm_lane_pool
+        assert spec_pool is not None
+
+        async with drift_check_lane(git_ops, head) as wt:
+            assert wt.name.startswith(WorktreeKind.DRIFT_CHECK.value)
+            assert (wt / 'target' / 'seeded.bin').exists()
+            spec_lane = await spec_pool.try_acquire()
+            assert spec_lane is not None, 'the drift leg must not consume a _spec- lane'
+            await spec_pool.release(spec_lane)
+
+        assert not wt.exists()
+
+    async def test_pool_configured_without_a_seed_raises_and_builds_nothing_cold(
+        self, tmp_path: Path,
+    ) -> None:
+        git_ops, repo, head = await _drift_scene(tmp_path, pool=True, warm_base=False)
+        entered = False
+
+        with pytest.raises(WarmSeedUnavailable):
+            async with drift_check_lane(git_ops, head):
+                entered = True
+
+        assert not entered
+        assert registered_drift_lanes(repo) == []

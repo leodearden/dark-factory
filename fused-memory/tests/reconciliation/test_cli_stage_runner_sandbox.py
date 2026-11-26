@@ -8,17 +8,26 @@ Verifies:
   (d) non-mocked integration: resolve_recon_sandbox_wrap is actually importable from the
       test environment and returns a callable (or raises RemediationSandboxUnavailable if
       no backend is available) — catches the case where orchestrator becomes unimportable
+  (e) task 4003: the PER-RUN recon ``CLAUDE_CONFIG_DIR`` is inside the sandbox's writable
+      set, while the config-dir BASE and every sibling run's dir stay read-only.  From
+      task 2744 (2026-07-18) until task 4003 (2026-08-11) the per-run dir was outside the
+      writable set, so every recon stage silently wrote zero transcripts.
 """
 
 from __future__ import annotations
 
+import logging
 from unittest.mock import AsyncMock, patch
 
 import pytest
 from shared.cli_invoke import AgentResult
+from shared.config_dir import TaskConfigDir
 
 from fused_memory.config.schema import ReconciliationConfig
-from fused_memory.reconciliation.cli_stage_runner import run_stage_via_cli
+from fused_memory.reconciliation.cli_stage_runner import (
+    recon_config_base_dir,
+    run_stage_via_cli,
+)
 from fused_memory.reconciliation.sandbox_guard import (
     RemediationSandboxUnavailable,
     resolve_recon_sandbox_wrap,
@@ -203,4 +212,220 @@ def test_resolve_recon_sandbox_wrap_importable_and_functional(tmp_path):
     )
     assert all(isinstance(t, str) for t in result), (
         f'wrap callable result must be list[str]; got {result!r}'
+    )
+
+
+def _writable_values(argv: list[str]) -> list[str]:
+    """Extract the ``--writable <path>`` values from a wrapped argv.
+
+    Backend-agnostic on purpose: ``build_landlock_command`` emits
+    ``--writable <path>`` pairs, so this reads the grant list straight off the
+    argv the kernel helper will actually be handed — not off a mock.
+    """
+    return [argv[i + 1] for i, tok in enumerate(argv) if tok == '--writable']
+
+
+async def _capture_writables(config, cwd, config_dir):
+    """Drive the REAL two-layer path and return the granted ``--writable`` paths.
+
+    ``resolve_recon_sandbox_wrap`` is deliberately NOT mocked: this exercises
+    cli_stage_runner → sandbox_guard → build_landlock_command end to end, which
+    is the only way to catch a writable-set regression (a mocked wrap would have
+    happily passed all through the 2026-07-18 → 2026-08-11 breakage window).
+    """
+    mock_invoke = AsyncMock(return_value=_make_agent_result())
+
+    with patch(
+        'fused_memory.reconciliation.cli_stage_runner.invoke_with_cap_retry',
+        mock_invoke,
+    ), patch(
+        'orchestrator.agents.landlock.is_landlock_available',
+        return_value=True,
+    ):
+        result = await run_stage_via_cli(
+            system_prompt='sys',
+            payload='pay',
+            disallowed_tools=[],
+            config=config,
+            mcp_config=_make_mcp_config(),
+            cwd=cwd,
+            session_id='sid',
+            config_dir=config_dir,
+        )
+
+    assert mock_invoke.called, (
+        f'invoke_with_cap_retry must be called (fail-closed path taken?); '
+        f'StageResult.error={result.error!r}'
+    )
+    _, call_kwargs = mock_invoke.call_args
+    sandbox_wrap = call_kwargs.get('sandbox_wrap')
+    assert callable(sandbox_wrap), (
+        f'Expected a sandbox_wrap callable; got {sandbox_wrap!r}'
+    )
+    wrapped = sandbox_wrap(['claude', '--print'])
+    # `call_kwargs.get` is typed `object`; narrow before handing it to a
+    # `list[str]` parameter (same idiom as the import-boundary test above).
+    assert isinstance(wrapped, list), (
+        f'wrap callable must return a list; got {wrapped!r}'
+    )
+    return _writable_values(wrapped)
+
+
+@pytest.mark.asyncio
+async def test_recon_config_dir_is_landlock_writable(tmp_path):
+    """The PER-RUN recon config dir is writable; the base and siblings are NOT (task 4003).
+
+    Regression pin for the 2026-07-18 → 2026-08-11 silent-transcript-loss window.
+    Task 2744 redirected recon stages to a per-run ``CLAUDE_CONFIG_DIR`` under
+    ``<data_dir>/recon-config/`` — a path that is neither ``/tmp`` nor
+    ``<cwd>/.task``, i.e. outside every writable root both sandbox backends
+    grant.  The CLI could not write its session JSONL, so
+    ``count_transcript_turns`` returned None forever: the liveness watchdog went
+    inert and every cap-retry force-freshed instead of resuming, silently, for
+    three weeks.
+
+    The two negative assertions are the credential-isolation invariant and must
+    never regress: ``recon_config_base_dir(...)`` is the root under which EVERY
+    run's ``claude-config-<run_id>/.credentials.json`` lives, so granting the
+    base (the naive fix) would hand every recon stage write access to every
+    other run's OAuth credentials — a capability that does not exist today.
+    """
+    base = recon_config_base_dir(tmp_path)
+    mine = TaskConfigDir(task_id='run-mine', base_dir=base)
+    # A second run's dir must exist on disk, so "not granted" is a real
+    # statement about the ruleset rather than an accident of absence.
+    sibling = TaskConfigDir(task_id='run-other', base_dir=base)
+
+    writables = await _capture_writables(
+        _make_config(sandbox_recon_agents=True), tmp_path, mine,
+    )
+
+    assert str(mine.path) in writables, (
+        f'The per-run recon config dir must be in the writable set, else the CLI '
+        f'cannot write its transcript. Wanted {str(mine.path)!r}; got {writables!r}'
+    )
+    assert str(base) not in writables, (
+        f'The config-dir BASE must NEVER be granted — it would make every run\'s '
+        f'.credentials.json writable by every other run. Got {writables!r}'
+    )
+    assert str(sibling.path) not in writables, (
+        f'A sibling run\'s config dir must stay read-only. Got {writables!r}'
+    )
+
+
+@pytest.mark.asyncio
+async def test_operator_writable_extras_are_preserved(tmp_path):
+    """The computed per-run grant APPENDS to operator extras, never replaces them.
+
+    ``sandbox_recon_writable_extras`` is an operator escape hatch (e.g. a uvx
+    cache dir needed by a stdio MCP server); a computed grant that clobbered it
+    would break those hosts.
+    """
+    base = recon_config_base_dir(tmp_path)
+    mine = TaskConfigDir(task_id='run-mine', base_dir=base)
+
+    writables = await _capture_writables(
+        _make_config(
+            sandbox_recon_agents=True,
+            sandbox_recon_writable_extras=['/var/tmp/opextra'],
+        ),
+        tmp_path,
+        mine,
+    )
+
+    assert '/var/tmp/opextra' in writables, (
+        f'Operator-configured extras must survive the computed append; got {writables!r}'
+    )
+    assert str(mine.path) in writables, (
+        f'The per-run config dir must still be granted alongside operator extras; '
+        f'got {writables!r}'
+    )
+
+
+@pytest.mark.asyncio
+async def test_sandbox_on_without_config_dir_warns(tmp_path, caplog):
+    """Confinement ON with no config_dir is the one path that skips the guard — say so.
+
+    With ``config_dir=None`` there is nothing to grant and nothing to verify, so
+    the containment check is skipped and the CLI falls back to the process
+    default ``~/.claude`` — which NEITHER backend makes writable. That is the
+    same silent-transcript-loss shape task 4003 exists to end, reached from the
+    other direction, and it must not be the one configuration that stays quiet
+    while the module's docstrings advertise the invariant as machine-checked.
+
+    Unreachable in production today (``BaseStage.run`` always mints a
+    ``TaskConfigDir``), but nothing in the runner enforces that.
+    """
+    mock_invoke = AsyncMock(return_value=_make_agent_result())
+
+    with caplog.at_level(
+        logging.WARNING, logger='fused_memory.reconciliation.cli_stage_runner',
+    ), patch(
+        'fused_memory.reconciliation.cli_stage_runner.invoke_with_cap_retry',
+        mock_invoke,
+    ), patch(
+        'fused_memory.reconciliation.cli_stage_runner.resolve_recon_sandbox_wrap',
+        return_value=lambda cmd: cmd,
+    ) as mock_resolve:
+        await run_stage_via_cli(
+            system_prompt='sys',
+            payload='pay',
+            disallowed_tools=[],
+            config=_make_config(sandbox_recon_agents=True),
+            mcp_config=_make_mcp_config(),
+            cwd=tmp_path,
+            config_dir=None,
+        )
+
+    # The guard IS bypassed — that is the fact the warning exists to surface.
+    assert mock_resolve.call_args.kwargs.get('config_dir') is None, (
+        f'precondition: the guard is handed no config dir; '
+        f'got {mock_resolve.call_args.kwargs!r}'
+    )
+
+    warnings = [
+        r for r in caplog.records
+        if r.levelno >= logging.WARNING and 'config_dir' in r.getMessage()
+    ]
+    assert len(warnings) == 1, (
+        f'exactly one warning must name the bypass; got {[r.getMessage() for r in caplog.records]}'
+    )
+    msg = warnings[0].getMessage()
+    for needle in ('~/.claude', 'sandbox_recon_agents'):
+        assert needle in msg, f'warning must name {needle!r}; got {msg!r}'
+
+
+@pytest.mark.asyncio
+async def test_sandbox_on_with_config_dir_does_not_warn(tmp_path, caplog):
+    """The healthy path stays quiet — the bypass warning must not fire on every stage."""
+    base = recon_config_base_dir(tmp_path)
+    mine = TaskConfigDir(task_id='run-quiet', base_dir=base)
+    mock_invoke = AsyncMock(return_value=_make_agent_result())
+
+    with caplog.at_level(
+        logging.WARNING, logger='fused_memory.reconciliation.cli_stage_runner',
+    ), patch(
+        'fused_memory.reconciliation.cli_stage_runner.invoke_with_cap_retry',
+        mock_invoke,
+    ), patch(
+        'fused_memory.reconciliation.cli_stage_runner.resolve_recon_sandbox_wrap',
+        return_value=lambda cmd: cmd,
+    ):
+        await run_stage_via_cli(
+            system_prompt='sys',
+            payload='pay',
+            disallowed_tools=[],
+            config=_make_config(sandbox_recon_agents=True),
+            mcp_config=_make_mcp_config(),
+            cwd=tmp_path,
+            config_dir=mine,
+        )
+
+    bypass_warnings = [
+        r for r in caplog.records
+        if r.levelno >= logging.WARNING and 'config_dir' in r.getMessage()
+    ]
+    assert not bypass_warnings, (
+        f'a stage WITH a config dir must not warn; got '
+        f'{[r.getMessage() for r in bypass_warnings]}'
     )

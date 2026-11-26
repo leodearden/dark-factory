@@ -1,29 +1,51 @@
 """Tests for git operations — worktree lifecycle."""
 
+import ast
 import asyncio
 import contextlib
 import fcntl
 import json
 import logging
 import os
+import shutil
 import subprocess
+import time
+from collections.abc import Awaitable, Callable, Mapping
 from pathlib import Path
-from unittest.mock import patch
+from typing import NamedTuple
+from unittest.mock import MagicMock, patch
 
 import pytest
+from _backdated_index_lock import REIFY_LOCK_AGE_S, index_lock_written_ago
+from _blocked_commit_fixture import commit_blocked_in_pre_commit_hook
+from _constructed_proc_table import add_git_process, empty_proc_table
+from _git_fixtures import _git, seed_repo
 from _orch_helpers import (
     NonIsolatedGitRepoError,
     assert_isolated_git_repo,
     git_env_with_ceiling,
 )
+from _seed_script_stubs import seed_default_warm_base
+from _worktree_registrations import lane_admin_dir, registered_worktree_paths
+from shared.git_async import MAX_CONCURRENT_SPAWNS, GitResult
+from shared.merge_subject import format_merge_subject
 
+from orchestrator import git_ops as git_ops_module
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import GitConfig
 from orchestrator.git_ops import (
+    _EFFECT_SURVIVAL_AGGREGATE_THRESHOLD,
+    _EFFECT_SURVIVAL_PER_FILE_MIN_ADDED_LINES,
+    _EFFECT_SURVIVAL_PER_FILE_THRESHOLD,
     MERGE_PARK_REF,
     PERSISTENT_OFFLINE_DEEP_WORKTREE_NAME,
+    CommitEffectProbe,
     GitOps,
+    GitQueryFailed,
+    IndexLockStandOff,
     MergeParkContentionError,
+    MergeParkError,
+    MergeParkLockContentionError,
     MergeResult,
     TrainStackResult,
     WorktreeConflictError,
@@ -31,51 +53,20 @@ from orchestrator.git_ops import (
     WorktreeMissing,
     _assert_no_conflict_markers,
     _git_stderr_is_unresolved_ref,
-    _merge_subject,
     _run,
 )
+from orchestrator.index_lock_liveness import GitProcess, GitProcessScan, scan_index_lock_holders
+from orchestrator.lane_branch_holder import BranchCheckedOutElsewhere, BranchHolderAction
+from orchestrator.merge_lane.gates import _map_advance_failure
+from orchestrator.quarantine_provenance import NOT_RELOCATED
 
 
+# No warm base here: persistent-merge-worktree tests assert ``_merge-verify``
+# is absent until lazily created, so warm-lane tests seed it themselves.
 @pytest.fixture
 def git_repo(tmp_path: Path) -> Path:
     """Create a temporary git repository with an initial commit."""
-    repo = tmp_path / 'repo'
-    repo.mkdir()
-    asyncio.run(_setup_repo(repo))
-    return repo
-
-
-def _seed_default_warm_base(repo: Path) -> None:
-    """Pre-create the DEFAULT derived warm-lane base (task 2061).
-
-    <repo>/.worktrees/_merge-verify/target, non-empty — so the
-    acquire_warm_lane pre-acquire base-health gate sees WarmBaseHealth.OK for
-    warm-lane tests using the default (unoverridden) warm_lane_base_target_dir.
-    NOT folded into the shared git_repo fixture: several persistent-merge-
-    worktree tests in this file assert ``_merge-verify`` does NOT exist before
-    it is lazily created, so only warm-lane tests that need a resolvable base
-    call this explicitly.
-
-    Task 2099: also marks ``.pool-root`` present so the NEW mount-presence
-    guard on acquire_warm_lane/acquire_spec_lane's create-once discriminator
-    does not false-trip in these warm-lane tests, which simulate an
-    already-running warm-lane host (a resolvable base presupposes prior pool
-    warmup on an already-mounted host) — an orthogonal concern to whether the
-    base itself is buildable.
-    """
-    default_base = repo / '.worktrees' / '_merge-verify' / 'target'
-    default_base.mkdir(parents=True, exist_ok=True)
-    (default_base / '.keep').write_text('warm base sentinel\n')
-    (repo / '.worktrees' / '.pool-root').touch()
-
-
-async def _setup_repo(repo: Path):
-    await _run(['git', 'init', '-b', 'main'], cwd=repo)
-    await _run(['git', 'config', 'user.email', 'test@test.com'], cwd=repo)
-    await _run(['git', 'config', 'user.name', 'Test'], cwd=repo)
-    (repo / 'README.md').write_text('# Test\n')
-    await _run(['git', 'add', '-A'], cwd=repo)
-    await _run(['git', 'commit', '-m', 'Initial commit'], cwd=repo)
+    return seed_repo(tmp_path / 'repo')
 
 
 async def _inject_uu_state(cwd: Path, path: str, tag: str = '') -> None:
@@ -161,14 +152,7 @@ async def _setup_repo_with_remote(tmp_path: Path) -> tuple[Path, Path]:
     await _run(['git', 'init', '--bare', '-b', 'main'], cwd=origin)
 
     # Seed origin via a temp non-bare repo
-    seed = tmp_path / 'seed'
-    seed.mkdir()
-    await _run(['git', 'init', '-b', 'main'], cwd=seed)
-    await _run(['git', 'config', 'user.email', 'test@test.com'], cwd=seed)
-    await _run(['git', 'config', 'user.name', 'Test'], cwd=seed)
-    (seed / 'README.md').write_text('# Test\n')
-    await _run(['git', 'add', '-A'], cwd=seed)
-    await _run(['git', 'commit', '-m', 'Initial commit'], cwd=seed)
+    seed = seed_repo(tmp_path / 'seed')
     await _run(['git', 'remote', 'add', 'origin', str(origin)], cwd=seed)
     await _run(['git', 'push', 'origin', 'main'], cwd=seed)
 
@@ -279,25 +263,46 @@ def test_git_config_rejects_bypass_command_without_clear():
     time.  (The reverse — clear set, bypass unset — is a harmless no-op and
     stays permissive, asserted in test_git_config_accepts_main_gate_bypass_commands.)
     """
-    import pydantic  # noqa: PLC0415
+    import pydantic
 
     with pytest.raises((pydantic.ValidationError, ValueError)) as excinfo:
         GitConfig(main_gate_bypass_command='git config reify.mainGate.bypass true')
     assert 'main_gate_bypass_clear_command' in str(excinfo.value)
 
 
+async def _build_cold_orphan_branch(
+    git_ops: GitOps,
+    task_id: str,
+    *,
+    wip_name: str = 'orphan_work.py',
+    wip_content: str = 'value = 42\n',
+) -> str:
+    """Build the reaped-but-retained cold shape for *task_id*.
+
+    Build ``task/<task_id>`` in a throwaway worktree OUTSIDE
+    ``worktree_base``, commit a foreign WIP file onto it, then force-remove
+    the worktree — leaving the branch as a dangling ref carrying a real
+    commit beyond main, with ``worktree_base/<task_id>`` never having
+    existed. Returns the full branch name (``task/<task_id>``).
+    """
+    full_branch = f'task/{task_id}'
+    tmp_wt = git_ops.project_root.parent / f'tmp-{task_id}'
+    rc, _, err = await _run(
+        ['git', 'worktree', 'add', '-b', full_branch, str(tmp_wt), 'main'],
+        cwd=git_ops.project_root,
+    )
+    assert rc == 0, err
+    (tmp_wt / wip_name).write_text(wip_content)
+    await _run(['git', 'add', '-A'], cwd=tmp_wt)
+    await _run(['git', 'commit', '-m', 'orphan WIP commit'], cwd=tmp_wt)
+    await _run(
+        ['git', 'worktree', 'remove', '--force', str(tmp_wt)], cwd=git_ops.project_root,
+    )
+    return full_branch
+
+
 @pytest.mark.asyncio
 class TestWorktreeLifecycle:
-    async def test_worktree_info_stale_commits_field(self, git_ops: GitOps):
-        """WorktreeInfo.stale_commits defaults to None and can be set explicitly."""
-        info_default = WorktreeInfo(path=git_ops.project_root, base_commit='a' * 40)
-        assert info_default.stale_commits is None
-
-        info_explicit = WorktreeInfo(
-            path=git_ops.project_root, base_commit='a' * 40, stale_commits=5,
-        )
-        assert info_explicit.stale_commits == 5
-
     async def test_worktree_info_reify_debug_port_field(self, git_ops: GitOps):
         """WorktreeInfo.reify_debug_port defaults to None and can be set explicitly."""
         info_default = WorktreeInfo(path=git_ops.project_root, base_commit='a' * 40)
@@ -378,6 +383,68 @@ class TestWorktreeLifecycle:
         assert worktree_info.path.exists()
         assert (worktree_info.path / 'README.md').exists()
         assert len(worktree_info.base_commit) == 40
+
+    async def test_create_worktree_self_heals_duplicate_hooks_path(
+        self, git_ops: GitOps,
+    ):
+        """create_worktree must converge core.hooksPath even when it is already
+        duplicated in the shared config (task 4570).
+
+        A plain single-value `git config core.hooksPath hooks` is REFUSED by
+        git (exit 5, "cannot overwrite multiple values with a single value")
+        once the key already holds two values — which is exactly the jammed
+        state this self-heal exists to repair. Seed that jam directly (as an
+        external/manual mutation would) and confirm create_worktree both
+        succeeds and collapses the key back to a single "hooks" value.
+        """
+        await _run(['git', 'config', 'core.hooksPath', 'hooks'], cwd=git_ops.project_root)
+        await _run(['git', 'config', '--add', 'core.hooksPath', 'echo'], cwd=git_ops.project_root)
+        rc, dup_values, _ = await _run(
+            ['git', 'config', '--get-all', 'core.hooksPath'], cwd=git_ops.project_root,
+        )
+        assert rc == 0
+        assert dup_values.strip().splitlines() == ['hooks', 'echo']
+
+        worktree_info = await git_ops.create_worktree('hooks-path-jam')
+        assert worktree_info.path.exists()
+
+        rc, resolved, _ = await _run(
+            ['git', 'config', '--get-all', 'core.hooksPath'], cwd=git_ops.project_root,
+        )
+        assert rc == 0
+        assert resolved.strip().splitlines() == ['hooks']
+
+    async def test_create_worktree_logs_hooks_path_set_failure(
+        self, git_ops: GitOps, caplog,
+    ):
+        """A failed core.hooksPath write is logged, not silently discarded (4570).
+
+        --replace-all converges from the duplicated-key jam covered above, but
+        not from every failure mode — e.g. `.git/config.lock` contention with a
+        concurrent orchestrator/merge worker, or a read-only shared .git under
+        the OS-sandbox write-set. Silently discarding that rc is precisely what
+        let the exit-5 duplicate-value jam run unnoticed on every
+        worktree-create, so the write must stay best-effort (never raises) while
+        no longer being silent.
+        """
+        async def fake_run(cmd, cwd=None, **kwargs):
+            if cmd[:2] == ['git', 'config'] and 'core.hooksPath' in cmd:
+                return (
+                    255, '',
+                    "error: could not lock config file .git/config: File exists\n",
+                )
+            return await _run(cmd, cwd=cwd, **kwargs)
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.git_ops'), \
+                patch('orchestrator.git_ops._run', side_effect=fake_run):
+            worktree_info = await git_ops.create_worktree('hooks-path-set-failed')
+
+        # Best-effort: a wrong hooksPath must not block worktree create/dispatch.
+        assert worktree_info.path.exists()
+        warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert any('failed to set core.hooksPath' in r.getMessage() for r in warnings), (
+            f'All warnings: {[r.getMessage() for r in warnings]}'
+        )
 
     async def test_create_worktree_returns_worktree_info(self, git_ops: GitOps):
         """create_worktree returns WorktreeInfo with path and base_commit."""
@@ -492,21 +559,7 @@ class TestWorktreeLifecycle:
         """A leftover branch carrying a commit beyond main, whose worktree dir
         is gone (the reaped-but-retained shape), must be RE-ATTACHED and
         RESUMED — not destroyed via the old raise-on-leftover-branch path."""
-        full_branch = 'task/lo-commit'
-        # Build the branch with a real commit beyond main via a throwaway
-        # worktree, then remove the worktree so the branch is a dangling ref
-        # (worktree_base/'lo-commit' never existed — the reaped-but-retained
-        # shape: dir gone, branch survives).
-        tmp_wt = git_ops.project_root.parent / 'tmp-lo-commit'
-        rc, _, err = await _run(
-            ['git', 'worktree', 'add', '-b', full_branch, str(tmp_wt), 'main'],
-            cwd=git_ops.project_root,
-        )
-        assert rc == 0, err
-        (tmp_wt / 'orphan_work.py').write_text('value = 42\n')
-        await _run(['git', 'add', '-A'], cwd=tmp_wt)
-        await _run(['git', 'commit', '-m', 'orphan WIP commit'], cwd=tmp_wt)
-        await _run(['git', 'worktree', 'remove', '--force', str(tmp_wt)], cwd=git_ops.project_root)
+        full_branch = await _build_cold_orphan_branch(git_ops, 'lo-commit')
 
         info = await git_ops.create_worktree('lo-commit')
 
@@ -534,6 +587,10 @@ class TestWorktreeLifecycle:
         helper must raise rather than fall through to any destructive
         cleanup.  The branch, its commit, and the holding worktree's content
         all survive intact."""
+        # Deliberately does not use _build_cold_orphan_branch: that helper
+        # force-removes its throwaway worktree at the end (producing the
+        # dir-gone cold shape), but this test needs the OPPOSITE — the
+        # worktree left checked out and live — so it keeps its own setup.
         full_branch = 'task/lo-live'
         holding = git_ops.project_root.parent / 'holding-lo-live'
         rc, _, err = await _run(
@@ -834,14 +891,6 @@ class TestWorktreeLifecycle:
             'unresolved conflicts'
         )
 
-    async def test_diff_from_main(self, git_ops: GitOps):
-        worktree_info = await git_ops.create_worktree('feature-4')
-        (worktree_info.path / 'change.py').write_text('x = 1\n')
-        await git_ops.commit(worktree_info.path, 'Add change')
-        diff = await git_ops.get_diff_from_main(worktree_info.path)
-        assert 'change.py' in diff
-        assert 'x = 1' in diff
-
     async def test_diff_from_base(self, git_ops: GitOps):
         worktree_info = await git_ops.create_worktree('feature-4b')
         (worktree_info.path / 'base_change.py').write_text('y = 2\n')
@@ -851,12 +900,7 @@ class TestWorktreeLifecycle:
         assert 'y = 2' in diff
 
     async def test_diff_from_base_stable_when_main_advances(self, git_ops: GitOps):
-        """get_diff_from_base returns branch changes even after main advances.
-
-        This is the key test for the fix: when main advances during task execution,
-        get_diff_from_base must still return the branch's changes by using the
-        pinned base_commit instead of the moving main ref.
-        """
+        """get_diff_from_base diffs from the base it is given, whatever main does since."""
         # Create worktree and capture base_commit
         worktree_info = await git_ops.create_worktree('feature-adv')
         base_commit = worktree_info.base_commit
@@ -874,9 +918,6 @@ class TestWorktreeLifecycle:
         diff = await git_ops.get_diff_from_base(worktree_info.path, base_commit)
         assert 'branch_change.py' in diff
         assert 'z = 3' in diff
-
-        # Contrast: get_diff_from_main might return empty/different (main absorbed branch)
-        # This demonstrates that base_commit is needed for stable diffs
 
     async def test_cleanup_worktree(self, git_ops: GitOps):
         worktree_info = await git_ops.create_worktree('feature-5')
@@ -911,11 +952,7 @@ class TestWorktreeLifecycle:
         assert 'task/orig-task ' not in branches  # exact-match exclusion
 
         # New worktree is registered with git
-        rc, listing, _ = await _run(
-            ['git', 'worktree', 'list', '--porcelain'],
-            cwd=git_ops.project_root,
-        )
-        assert str(new_path.resolve()) in listing
+        assert str(new_path.resolve()) in registered_worktree_paths(git_ops.project_root)
 
     async def test_rename_worktree_unregistered_path_raises(
         self, git_ops: GitOps,
@@ -1332,34 +1369,31 @@ class TestWorktreeLifecycle:
 @pytest.mark.asyncio
 class TestFreshenMain:
     async def test_freshen_main_no_remote(self, git_ops: GitOps):
-        """Without a remote, _freshen_main returns (main_branch, None)."""
-        ref, stale = await git_ops._freshen_main()
+        """Without a remote, _freshen_main returns main_branch."""
+        ref = await git_ops._freshen_main()
         assert ref == git_ops.config.main_branch
-        assert stale is None
 
     async def test_freshen_main_remote_ahead(
         self, git_ops_with_remote: tuple[GitOps, Path],
     ):
-        """When origin/main is 3 commits ahead, returns ('origin/main', 3)."""
+        """When origin/main is 3 commits ahead, returns 'origin/main'."""
         git_ops, origin = git_ops_with_remote
         await _push_n_commits_to_origin(origin, 3)
-        ref, stale = await git_ops._freshen_main()
+        ref = await git_ops._freshen_main()
         assert ref == f'{git_ops.config.remote}/{git_ops.config.main_branch}'
-        assert stale == 3
 
     async def test_freshen_main_already_current(
         self, git_ops_with_remote: tuple[GitOps, Path],
     ):
-        """When local main == origin/main (no new commits), returns (main_branch, 0)."""
+        """When local main == origin/main (no new commits), returns main_branch."""
         git_ops, _origin = git_ops_with_remote
-        ref, stale = await git_ops._freshen_main()
+        ref = await git_ops._freshen_main()
         assert ref == git_ops.config.main_branch
-        assert stale == 0
 
     async def test_freshen_main_diverged(
-        self, git_ops_with_remote: tuple[GitOps, Path],
+        self, git_ops_with_remote: tuple[GitOps, Path], caplog,
     ):
-        """When local and remote have diverged, returns (main_branch, N) with N behind count."""
+        """When local and remote have diverged, returns main_branch and logs a divergence warning."""
         git_ops, origin = git_ops_with_remote
         local = git_ops.project_root
         # Add a local-only commit (not pushed to origin)
@@ -1368,15 +1402,21 @@ class TestFreshenMain:
         await _run(['git', 'commit', '-m', 'Local only commit'], cwd=local)
         # Add a different commit to origin (creates divergence)
         await _push_n_commits_to_origin(origin, 1, prefix='remote_div')
-        ref, stale = await git_ops._freshen_main()
+        with caplog.at_level(logging.WARNING, logger='orchestrator.git_ops'):
+            ref = await git_ops._freshen_main()
         # Diverged: use local ref to avoid losing advance_main commits
         assert ref == git_ops.config.main_branch
-        assert stale == 1
+        assert any(
+            r.levelno == logging.WARNING
+            and r.name == 'orchestrator.git_ops'
+            and 'diverged' in r.getMessage()
+            for r in caplog.records
+        )
 
     async def test_freshen_main_behind_rev_list_fails(
         self, git_ops_with_remote: tuple[GitOps, Path],
     ):
-        """When behind rev-list exits non-zero, _freshen_main returns (main_branch, None)."""
+        """When behind rev-list exits non-zero, _freshen_main returns main_branch."""
         git_ops, _origin = git_ops_with_remote
 
         async def fake_run(cmd, cwd=None):
@@ -1385,15 +1425,14 @@ class TestFreshenMain:
             return (128, '', 'fatal: bad revision')   # rev-list fails
 
         with patch('orchestrator.git_ops._run', side_effect=fake_run):
-            ref, stale = await git_ops._freshen_main()
+            ref = await git_ops._freshen_main()
 
         assert ref == git_ops.config.main_branch
-        assert stale is None
 
     async def test_freshen_main_behind_count_value_error(
         self, git_ops_with_remote: tuple[GitOps, Path],
     ):
-        """When behind rev-list returns non-numeric stdout, _freshen_main returns (main_branch, None)."""
+        """When behind rev-list returns non-numeric stdout, _freshen_main returns main_branch."""
         git_ops, _origin = git_ops_with_remote
 
         async def fake_run(cmd, cwd=None):
@@ -1402,15 +1441,14 @@ class TestFreshenMain:
             return (0, 'not-a-number', '')   # rev-list returns garbage
 
         with patch('orchestrator.git_ops._run', side_effect=fake_run):
-            ref, stale = await git_ops._freshen_main()
+            ref = await git_ops._freshen_main()
 
         assert ref == git_ops.config.main_branch
-        assert stale is None
 
     async def test_freshen_main_ahead_count_value_error(
         self, git_ops_with_remote: tuple[GitOps, Path],
     ):
-        """When ahead rev-list returns non-numeric stdout, falls back to (main_branch, behind)."""
+        """When ahead rev-list returns non-numeric stdout, falls back to main_branch."""
         git_ops, _origin = git_ops_with_remote
 
         remote_ref = f'{git_ops.config.remote}/'
@@ -1429,16 +1467,15 @@ class TestFreshenMain:
             return (0, '', '')
 
         with patch('orchestrator.git_ops._run', side_effect=fake_run):
-            ref, stale = await git_ops._freshen_main()
+            ref = await git_ops._freshen_main()
 
-        # Falls back to local main; reports behind count as-is
+        # Falls back to local main
         assert ref == git_ops.config.main_branch
-        assert stale == 3
 
     async def test_freshen_main_ahead_rev_list_fails(
         self, git_ops_with_remote: tuple[GitOps, Path], caplog,
     ):
-        """When ahead rev-list exits non-zero, _freshen_main returns (main_branch, behind) and logs a warning."""
+        """When ahead rev-list exits non-zero, _freshen_main returns main_branch and logs a warning."""
         git_ops, _origin = git_ops_with_remote
 
         call_count = 0
@@ -1454,10 +1491,9 @@ class TestFreshenMain:
 
         with caplog.at_level(logging.WARNING, logger='orchestrator.git_ops'), \
              patch('orchestrator.git_ops._run', side_effect=fake_run):
-            ref, stale = await git_ops._freshen_main()
+            ref = await git_ops._freshen_main()
 
         assert ref == git_ops.config.main_branch
-        assert stale == 3
         assert any('rev-list (ahead) failed' in r.message for r in caplog.records)
 
 
@@ -1471,30 +1507,12 @@ class TestCreateWorktreeFreshening:
         await _push_n_commits_to_origin(origin, 1, prefix='fresh')
         worktree_info = await git_ops.create_worktree('freshen-test')
         assert (worktree_info.path / 'fresh_0.txt').exists()
-        # Exactly 1 commit was pushed, so stale_commits must reflect that.
-        assert worktree_info.stale_commits == 1
         # base_commit must match origin/main SHA captured after create_worktree
         # (which internally fetched, so origin/main is now up-to-date in the local repo).
         _, expected_sha, _ = await _run(
             ['git', 'rev-parse', 'origin/main'], cwd=git_ops.project_root,
         )
         assert worktree_info.base_commit == expected_sha
-
-    async def test_create_worktree_stale_commits_populated(
-        self, git_ops_with_remote: tuple[GitOps, Path],
-    ):
-        """stale_commits == 2 when origin is 2 commits ahead at create_worktree time."""
-        git_ops, origin = git_ops_with_remote
-        await _push_n_commits_to_origin(origin, 2)
-        worktree_info = await git_ops.create_worktree('stale-commits-test')
-        assert worktree_info.stale_commits == 2
-
-    async def test_create_worktree_stale_commits_none_without_remote(
-        self, git_ops: GitOps,
-    ):
-        """stale_commits is None when no remote is configured (graceful degradation)."""
-        worktree_info = await git_ops.create_worktree('no-remote-test')
-        assert worktree_info.stale_commits is None
 
     async def test_create_worktree_revparse_fallback(self, git_ops: GitOps):
         """When rev-parse of start_ref fails, create_worktree falls back to local main.
@@ -1511,14 +1529,13 @@ class TestCreateWorktreeFreshening:
         local_main_sha = local_main_sha.strip()
 
         with patch.object(
-            git_ops, '_freshen_main', return_value=('origin/nonexistent-ref', 3),
+            git_ops, '_freshen_main', return_value='origin/nonexistent-ref',
         ):
             worktree_info = await git_ops.create_worktree('revparse-fallback-test')
 
         assert (worktree_info.path / 'README.md').exists()
         assert len(worktree_info.base_commit) == 40
         assert worktree_info.base_commit == local_main_sha
-        assert worktree_info.stale_commits == 3  # persists through fallback
 
 
 @pytest.mark.asyncio
@@ -1984,8 +2001,8 @@ class TestHasUncommittedWork:
     async def test_file_only_in_task_dir_returns_false(self, git_ops: GitOps):
         """Production's repo-root .gitignore carries a tracked `.task/`
         entry (independent of the since-removed `_ensure_task_gitignore`
-        nested gitignore) that every worktree inherits.  `_setup_repo`
-        builds a bare synthetic repo with no .gitignore at all, so commit
+        nested gitignore) that every worktree inherits.  The `git_repo` fixture
+        seeds a bare synthetic repo with no .gitignore at all, so commit
         one here first to exercise the same real-world condition
         `has_uncommitted_work` relies on.
         """
@@ -3323,7 +3340,13 @@ class TestAdvanceMainConflictMarkerGate:
         wt = await git_ops.create_worktree('task-dir-no-longer-blocks')
         lane = wt.path
 
-        # Force a `.task/` entry into the branch tree with RAW git.
+        # Force a `.task/` entry into the branch tree with RAW git.  Pin the
+        # repo's excludes file to an empty one first: without it `git add -A`
+        # honours the host user's global excludes (~/.config/git/ignore), and a
+        # host that ignores `.task/` there would silently skip the hostile add.
+        await _run(
+            ['git', 'config', 'core.excludesFile', '/dev/null'], cwd=lane,
+        )
         task_dir = lane / '.task'
         task_dir.mkdir(exist_ok=True)
         (task_dir / 'plan.json').write_text('{}')
@@ -3467,7 +3490,7 @@ class TestUnmergedDetection:
         # Sentinel standing in for the live task worktree that was corrupted.
         sentinel = tmp_path / 'live-worktree'
         sentinel.mkdir()
-        await _setup_repo(sentinel)
+        seed_repo(sentinel)
 
         # Stand-in for a pytest basetemp nested INSIDE that worktree.
         nested = sentinel / '.pytest-tmp' / 'test_x0'
@@ -4004,6 +4027,66 @@ class TestResolveBranchSha:
 
 
 @pytest.mark.asyncio
+class TestListLocalBranches:
+    async def test_fresh_repo_lists_main(self, git_ops: GitOps):
+        branches = await git_ops.list_local_branches()
+
+        assert isinstance(branches, frozenset)
+        assert 'main' in branches
+
+    async def test_lists_a_created_task_branch_by_its_full_name(
+        self, git_ops: GitOps,
+    ):
+        await git_ops.create_worktree('lb-1')
+
+        branches = await git_ops.list_local_branches()
+
+        assert branches is not None
+        assert 'task/lb-1' in branches
+
+    async def test_a_deleted_branch_is_no_longer_listed(self, git_ops: GitOps):
+        wt_info = await git_ops.create_worktree('lb-1')
+        assert wt_info is not None
+        await git_ops.cleanup_worktree(wt_info.path, 'lb-1')
+
+        branches = await git_ops.list_local_branches()
+
+        assert branches is not None
+        assert 'task/lb-1' not in branches
+
+    async def test_agrees_with_resolve_branch_sha(self, git_ops: GitOps):
+        await git_ops.create_worktree('lb-2')
+
+        branches = await git_ops.list_local_branches()
+
+        assert branches is not None
+        for name in branches:
+            assert await git_ops.resolve_branch_sha(name) is not None, name
+        assert 'task/lb-absent' not in branches
+        assert await git_ops.resolve_branch_sha('task/lb-absent') is None
+
+    async def test_returns_none_outside_a_git_repository(
+        self, git_config: GitConfig, tmp_path: Path,
+    ):
+        not_a_repo = tmp_path / 'not-a-repo'
+        not_a_repo.mkdir()
+
+        assert await GitOps(git_config, not_a_repo).list_local_branches() is None
+
+    async def test_a_branch_sharing_its_name_with_a_tag_keeps_its_exact_name(
+        self, git_ops: GitOps,
+    ):
+        for cmd in (['git', 'tag', 'dup'], ['git', 'branch', 'dup']):
+            rc, _, stderr = await _run(cmd, cwd=git_ops.project_root)
+            assert rc == 0, stderr
+
+        branches = await git_ops.list_local_branches()
+
+        assert branches is not None
+        assert 'dup' in branches
+
+
+@pytest.mark.asyncio
 class TestFindMergeMarker:
     """Real-git tests for GitOps.find_merge_marker.
 
@@ -4079,8 +4162,8 @@ class TestFindMergeMarker:
         """Substring safety: merging task/10 writes 'Merge task/10 into main'.
         find_merge_marker('task/1') must NOT match this commit.
 
-        The trailing ' into ' literal in the --fixed-strings --grep pattern
-        means 'Merge task/1 into ' is not a substring of 'Merge task/10 into main'.
+        A marker's subject must EQUAL 'Merge task/1 into main', which
+        'Merge task/10 into main' does not.
         """
         # Merge task/10 and delete branch
         tid = '10'
@@ -4138,7 +4221,7 @@ class TestFindMergeMarker:
         so a git-log invocation with conflicting --max-count=1 and -n 5000 flags would
         return both SHAs newline-joined (last-wins: -n 5000 overrides --max-count=1),
         corrupting done_provenance={'commit': marker_sha} in harness reconcile.
-        After dropping -n 5000, --max-count=1 alone ensures a single SHA is returned.
+        The newest marker must win, as a single SHA.
         """
         tid = 'reopened-1'
 
@@ -4187,7 +4270,230 @@ class TestFindMergeMarker:
         assert marker_sha is not None
         assert '\n' not in marker_sha   # anti-multiline regression
         assert len(marker_sha) == 40    # single-SHA shape
-        assert marker_sha == second_sha  # most-recent first (reverse chrono + --max-count=1)
+        assert marker_sha == second_sha  # most-recent first (git log is newest-first)
+
+
+@pytest.mark.asyncio
+class TestMergeMarkerIndex:
+    """The per-main-sha marker index behind GitOps.find_merge_marker.
+
+    The index replaced a full-history ``git log --grep`` that ran once per
+    dispatch candidate (~2.0s x ~721 candidates = the entire ~14min scheduler
+    tick).  It is a PERFORMANCE change only, so the load-bearing property is
+    that :meth:`GitOps._lookup_merge_marker` and the retained direct scan
+    :meth:`GitOps._scan_merge_marker` agree on every input.
+
+    ``TestFindMergeMarker`` above already exercises the indexed path end-to-end
+    through real merges (including substring safety and most-recent-wins for a
+    twice-merged branch); these tests pin the index's own seams.
+    """
+
+    async def test_index_and_direct_scan_agree(self, git_ops: GitOps):
+        """Indexed lookup == direct scan, for both a hit and a miss."""
+        repo = git_ops.project_root
+        marker = format_merge_subject('task/agree', git_ops.config.main_branch)
+        sha = await _seed_on_main(repo, {'agree.txt': 'x\n'}, marker)
+
+        assert await git_ops.find_merge_marker('task/agree') == sha
+        assert await git_ops._scan_merge_marker('task/agree') == sha
+
+        assert await git_ops.find_merge_marker('task/absent') is None
+        assert await git_ops._scan_merge_marker('task/absent') is None
+
+    async def test_non_canonical_subject_stays_invisible(self, git_ops: GitOps):
+        """A hand-written ``Merge task/x: ...`` subject is not a marker.
+
+        dark-factory's main carries 46 such commits against 2,972 canonical
+        ones.  They do not match ``format_merge_subject``'s ``into <main>`` shape and
+        are invisible to the grep, so the index must not surface them either.
+        """
+        repo = git_ops.project_root
+        await _seed_on_main(
+            repo, {'nc.txt': 'x\n'}, 'Merge task/noncanon: isolate the thing',
+        )
+
+        assert await git_ops.find_merge_marker('task/noncanon') is None
+        assert await git_ops._scan_merge_marker('task/noncanon') is None
+
+    async def test_index_rebuilds_when_main_advances(
+        self, git_ops: GitOps, monkeypatch: pytest.MonkeyPatch,
+    ):
+        """A marker landing after the index was built is found on a later call."""
+        monkeypatch.setattr(
+            'orchestrator.git_ops._MERGE_MARKER_INDEX_RECHECK_SECS', 0.0,
+        )
+        repo = git_ops.project_root
+
+        # Builds an index at a main sha that has no such marker.
+        assert await git_ops.find_merge_marker('task/later') is None
+
+        marker = format_merge_subject('task/later', git_ops.config.main_branch)
+        sha = await _seed_on_main(repo, {'later.txt': 'x\n'}, marker)
+
+        assert await git_ops.find_merge_marker('task/later') == sha
+
+    async def test_index_is_not_rebuilt_on_every_lookup(
+        self, git_ops: GitOps, monkeypatch: pytest.MonkeyPatch,
+    ):
+        """Repeated lookups reuse one index — the whole point of the change.
+
+        Without this the fix would be a no-op: rebuilding per candidate is
+        strictly worse than the per-candidate grep it replaced.
+        """
+        builds: list[int] = []
+        real = GitOps._build_merge_marker_index
+
+        async def _counting(self: GitOps) -> dict[str, str] | None:
+            builds.append(1)
+            return await real(self)
+
+        monkeypatch.setattr(GitOps, '_build_merge_marker_index', _counting)
+
+        for i in range(6):
+            assert await git_ops.find_merge_marker(f'task/miss-{i}') is None
+
+        assert len(builds) == 1, f'expected one index build, got {len(builds)}'
+
+    async def test_falls_back_to_scan_when_index_cannot_be_built(
+        self, git_ops: GitOps, monkeypatch: pytest.MonkeyPatch,
+    ):
+        """A failed index build degrades to the direct scan, not to a wrong answer."""
+        repo = git_ops.project_root
+        marker = format_merge_subject('task/fallback', git_ops.config.main_branch)
+        sha = await _seed_on_main(repo, {'fb.txt': 'x\n'}, marker)
+
+        async def _no_index(self: GitOps) -> dict[str, str] | None:
+            return None
+
+        monkeypatch.setattr(GitOps, '_build_merge_marker_index', _no_index)
+
+        assert await git_ops.find_merge_marker('task/fallback') == sha
+        assert git_ops._merge_marker_index is None
+
+    async def test_transient_build_failure_is_not_cached(
+        self, git_ops: GitOps, monkeypatch: pytest.MonkeyPatch,
+    ):
+        """A one-off build failure must not pin a marker-absent verdict.
+
+        Same rule as :data:`_EFFECT_PROBE_TRANSIENT_FAILURES`: caching a
+        subprocess failure would freeze a spurious answer for the life of the
+        current HEAD instead of self-healing on the next call.
+        """
+        monkeypatch.setattr(
+            'orchestrator.git_ops._MERGE_MARKER_INDEX_RECHECK_SECS', 0.0,
+        )
+        repo = git_ops.project_root
+        marker = format_merge_subject('task/flaky', git_ops.config.main_branch)
+        sha = await _seed_on_main(repo, {'flaky.txt': 'x\n'}, marker)
+
+        real = GitOps._build_merge_marker_index
+        state = {'fail_next': True}
+
+        async def _flaky(self: GitOps) -> dict[str, str] | None:
+            if state['fail_next']:
+                state['fail_next'] = False
+                return None
+            return await real(self)
+
+        monkeypatch.setattr(GitOps, '_build_merge_marker_index', _flaky)
+
+        # First call: build fails, answered by the direct scan, nothing cached.
+        assert await git_ops.find_merge_marker('task/flaky') == sha
+        assert git_ops._merge_marker_index is None
+        # Second call: build succeeds and is cached — no failure was pinned.
+        assert await git_ops.find_merge_marker('task/flaky') == sha
+        assert git_ops._merge_marker_index is not None
+
+
+async def _quote_marker_in_body(repo: Path, marker: str) -> None:
+    await _seed_on_main(
+        repo, {'notes.md': 'x\n'},
+        f'docs: explain markers\n\nQuoting {marker} verbatim.\n',
+    )
+
+
+async def _body_quote_only(repo: Path, task_id: str, marker: str) -> str | None:
+    """Task 4104 shape: e79f9b1094 quotes a marker in prose; nothing landed."""
+    await _quote_marker_in_body(repo, marker)
+    return None
+
+
+async def _body_quote_newer_than_true_merge(
+    repo: Path, task_id: str, marker: str,
+) -> str | None:
+    """Task 4181 shape: d0d67f0c53 quotes the marker after the real merge landed."""
+    merge = await _land_branch(repo, task_id, {'landed.txt': 'x\n'})
+    await _quote_marker_in_body(repo, marker)
+    return merge
+
+
+async def _revert_of_true_merge(repo: Path, task_id: str, marker: str) -> str | None:
+    """Task 5668 shape: 3e7d55ce47 'Revert "<marker>"' contains the marker."""
+    assert_isolated_git_repo(repo)
+    merge = await _land_branch(repo, task_id, {'landed.txt': 'x\n'})
+    rc, _, err = await _run(
+        ['git', 'revert', '--no-edit', '-m', '1', merge], cwd=repo,
+    )
+    assert rc == 0, f'revert failed: {err}'
+    return merge
+
+
+async def _suffixed_subject(repo: Path, task_id: str, marker: str) -> str | None:
+    """ce78ad8546 shape: '<marker>: extra words' is a longer subject."""
+    await _seed_on_main(repo, {'suffixed.txt': 'x\n'}, f'{marker}: extra words')
+    return None
+
+
+async def _single_parent_exact_subject(
+    repo: Path, task_id: str, marker: str,
+) -> str | None:
+    """task/176 shape: ba1bba2611 is a real marker with a single parent."""
+    return await _seed_on_main(repo, {'single.txt': 'x\n'}, marker)
+
+
+async def _wrapped_first_paragraph(repo: Path, task_id: str, marker: str) -> str | None:
+    """git's %s joins a wrapped first paragraph back into the marker."""
+    wrapped = marker.replace(' into ', '\ninto ', 1)
+    return await _seed_on_main(repo, {'wrapped.txt': 'x\n'}, wrapped)
+
+
+@pytest.mark.asyncio
+class TestMergeMarkerIsExactSubject:
+    """A marker is a commit whose git subject (``%s``) equals
+    ``format_merge_subject(branch, main_branch)``; the body and the parent count are
+    never consulted (task 5765).
+    """
+
+    @pytest.mark.parametrize(
+        'build',
+        [
+            pytest.param(_body_quote_only, id='body_quote_only'),
+            pytest.param(
+                _body_quote_newer_than_true_merge,
+                id='body_quote_newer_than_true_merge',
+            ),
+            pytest.param(_revert_of_true_merge, id='revert_of_true_merge'),
+            pytest.param(_suffixed_subject, id='suffixed_subject'),
+            pytest.param(
+                _single_parent_exact_subject, id='single_parent_exact_subject',
+            ),
+            pytest.param(_wrapped_first_paragraph, id='wrapped_first_paragraph'),
+        ],
+    )
+    async def test_marker_is_the_commit_whose_subject_is_exactly_the_merge_subject(
+        self,
+        git_ops: GitOps,
+        build: Callable[[Path, str, str], Awaitable[str | None]],
+    ):
+        repo = git_ops.project_root
+        task_id = '5765'
+        branch = f'task/{task_id}'
+        marker = format_merge_subject(branch, git_ops.config.main_branch)
+
+        expected = await build(repo, task_id, marker)
+
+        assert await git_ops.find_merge_marker(branch, gate_on_existing_ref=False) == expected
+        assert await git_ops._scan_merge_marker(branch) == expected
 
 
 @pytest.mark.asyncio
@@ -4333,14 +4639,14 @@ class TestCommitEffectPresentInMain:
     (a) TRUE when the commit's own touched paths are still byte-identical
         on main (effect present — here the trivial "commit == main HEAD"
         shape).
-    (b) FALSE when a later commit on main changes those same touched
-        paths again — the commit is STILL an ancestor of main, but its
-        own snapshot no longer matches HEAD (the blind spot this
-        primitive exists to catch).  The trigger condition is
-        deliberately broad: a genuine revert and ordinary later evolution
-        (e.g. another task's overlapping follow-up edit) are
-        indistinguishable here and both return False — see the
-        "Accepted risk" note on the primitive's docstring.
+    (b) FALSE when a later commit on main does not PRESERVE the lines the
+        commit added — here a wholesale replacement, survival 0.0 — the
+        commit is STILL an ancestor of main, but its own effect is gone
+        from HEAD (the blind spot this primitive exists to catch).  Since
+        task 3116 part (b) the trigger is no longer "any change to the
+        touched paths": ordinary additive evolution reads as PRESENT.  A
+        heavy REWRITE that drops most of those lines can still read as
+        absent — the narrowed residual risk, documented on the primitive.
     (c) For a no-ff merge commit, the primitive checks EVERY non-first
         parent's (each merged branch's) content — the paths it touched
         since its fork point (``merge-base(parent1, other_parent)``) —
@@ -4394,11 +4700,13 @@ class TestCommitEffectPresentInMain:
         STILL an ancestor of main (it is never removed from history) but a
         LATER commit on main changes the exact paths it touched — the
         effect is gone from HEAD even though ancestry alone says "landed".
-        The trigger is deliberately broad — this later commit need not be
-        an intentional revert; ANY change to the touched paths (a genuine
-        revert, or ordinary subsequent evolution such as another task's
-        overlapping edit) reads as "effect not present" here. See the
-        "Accepted risk" note on commit_effect_present_in_main's docstring.
+        The trigger is a change that does not PRESERVE the commit's added
+        lines — here a full replacement, so survival is 0.0.  Since task 3116
+        that is what "effect not present" means: ordinary additive evolution
+        (another task appending to a file this one touched) now reads as
+        PRESENT, because its added lines are still there.  See the
+        ``_EFFECT_SURVIVAL_*`` thresholds and the residual-risk note on
+        commit_effect_present_in_main's docstring.
         """
         (git_repo / 'fileA.py').write_text('fixed\n')
         await _run(['git', 'add', 'fileA.py'], cwd=git_repo)
@@ -4600,12 +4908,14 @@ class TestCommitEffectPresentInMain:
         diff-tree unless ``-z``/``-c core.quotePath=false`` is used.
         Without that, the quoted literal string (backslashes, octal
         escapes and all) fails to match the real file as a ``--``
-        pathspec, so the follow-up ``git diff --quiet`` call silently
-        reports "no difference" against an effectively empty pathspec —
-        a FALSE POSITIVE ("effect present") even though the file's
-        content at main HEAD has genuinely changed since the cited
-        commit. Confirmed False here pins that the primitive resolves
-        the real path, not git's quoted rendering of it.
+        pathspec, so the terminal comparison silently sees nothing at all
+        and reports a FALSE POSITIVE ("effect present") even though the
+        file's content at main HEAD no longer carries the cited commit's
+        lines. Confirmed False here pins that the primitive resolves the
+        real path, not git's quoted rendering of it.  That is a PATH-QUOTING
+        regression pin and is unaffected by the task-3116 survival semantics:
+        the later commit here replaces the file's content wholesale, so
+        survival is 0.0 under any threshold.
         """
         (git_repo / 'café.py').write_text('fixed\n')
         await _run(['git', 'add', 'café.py'], cwd=git_repo)
@@ -4621,6 +4931,1398 @@ class TestCommitEffectPresentInMain:
         assert rc == 0, f'later commit failed: {err}'
 
         assert await git_ops.commit_effect_present_in_main(fix_sha) is False
+
+
+@pytest.mark.asyncio
+class TestDescribeCommitEffectInMain:
+    """Real-git tests for GitOps.describe_commit_effect_in_main (task 3116).
+
+    The DIAGNOSTIC companion to ``commit_effect_present_in_main``: the bool
+    says only THAT the cited commit's effect is not present at main HEAD,
+    which is why two live instances (tasks 3653/3640/3717 and the
+    instance-2 co-touched-hot-file shape) each cost days of misdiagnosis.
+    ``describe_commit_effect_in_main`` returns the SAME verdict plus the
+    facts that explain it — WHICH paths diverged, WHICH anchor commit the
+    comparison ran against, and WHICH structural failure (if any) short-
+    circuited it.  ``commit_effect_present_in_main`` is a one-line wrapper
+    over this method, so the bool and its explanation can never drift.
+
+    These tests assert on DATACLASS FIELDS only, never on prose/docstrings.
+    """
+
+    async def test_present_for_non_merge_with_matching_paths(
+        self, git_ops: GitOps, git_repo: Path,
+    ) -> None:
+        """A commit that IS main HEAD: its touched paths trivially match, so
+        present is True with no divergence and no failure code, and the
+        anchor is the commit itself.
+        """
+        (git_repo / 'fileA.py').write_text('fixed\n')
+        await _run(['git', 'add', 'fileA.py'], cwd=git_repo)
+        rc, _, err = await _run(['git', 'commit', '-m', 'fix commit'], cwd=git_repo)
+        assert rc == 0, f'fix commit failed: {err}'
+        rc, fix_sha, err = await _run(['git', 'rev-parse', 'HEAD'], cwd=git_repo)
+        assert rc == 0, f'rev-parse failed: {err}'
+        fix_sha = fix_sha.strip()
+
+        probe = await git_ops.describe_commit_effect_in_main(fix_sha)
+
+        assert isinstance(probe, CommitEffectProbe)
+        assert probe.present is True
+        assert probe.diverged_paths == ()
+        assert probe.failure is None
+        assert probe.anchor_sha == fix_sha
+
+    async def test_names_diverged_path_for_non_merge(
+        self, git_ops: GitOps, git_repo: Path,
+    ) -> None:
+        """The one line that would have resolved both reported instances: a
+        later commit fully replaces the touched file, so the probe not only
+        says absent but NAMES ``fileA.py`` as the diverged path.  The naming
+        is the point here, not the bool.
+
+        The failure code became ``'effect_not_survived'`` with task 3116 part
+        (b).  The verdict is unchanged and so is the reason it is correct —
+        this is a full REPLACEMENT (``fixed`` -> ``changed again``), so line
+        survival is 0.0 and the commit's effect really is gone.  What changed
+        is only which fact decides it: ``'paths_diverged'`` (byte-identity
+        broken) is now a diagnostic that no longer decides anything, because
+        95.4% of the corpus breaks byte-identity while their deliverables sit
+        untouched at main.
+        """
+        (git_repo / 'fileA.py').write_text('fixed\n')
+        await _run(['git', 'add', 'fileA.py'], cwd=git_repo)
+        rc, _, err = await _run(['git', 'commit', '-m', 'fix commit'], cwd=git_repo)
+        assert rc == 0, f'fix commit failed: {err}'
+        rc, fix_sha, err = await _run(['git', 'rev-parse', 'HEAD'], cwd=git_repo)
+        assert rc == 0, f'rev-parse failed: {err}'
+        fix_sha = fix_sha.strip()
+
+        (git_repo / 'fileA.py').write_text('changed again\n')
+        await _run(['git', 'add', 'fileA.py'], cwd=git_repo)
+        rc, _, err = await _run(['git', 'commit', '-m', 'later commit'], cwd=git_repo)
+        assert rc == 0, f'later commit failed: {err}'
+
+        probe = await git_ops.describe_commit_effect_in_main(fix_sha)
+
+        assert probe.present is False
+        assert probe.failure == 'effect_not_survived'
+        assert probe.aggregate_survival == 0.0
+        assert probe.diverged_paths == ('fileA.py',)
+        assert probe.anchor_sha == fix_sha
+
+    async def test_merge_names_only_the_co_touched_hot_file(
+        self, git_ops: GitOps, git_repo: Path,
+    ) -> None:
+        """THE INSTANCE-2 SHAPE, in miniature.
+
+        A task branch touches its own ``deliverable.py`` AND a shared hot
+        file ``shared.manifest``.  Main independently edits a DISTANT,
+        non-conflicting line of ``shared.manifest`` BEFORE the merge, so
+        ``git merge --no-ff`` auto-merges cleanly and main HEAD carries
+        BOTH edits — a perfectly clean landing.  Byte-identity against the
+        second parent nonetheless fails, because the parent's pre-merge
+        blob for ``shared.manifest`` lacks main's independent edit.
+
+        SINCE TASK 3116 PART (b) THIS LANDING IS ACCEPTED, and the inversion
+        of this assertion is the entire point of the task rather than a
+        regression.  Nothing about the scenario changed — it was always a
+        clean landing whose deliverable is intact at main — only the question
+        being asked did.  Byte-identity ("has anyone touched these paths?")
+        said absent; line survival ("are the branch's added lines still
+        there?") says 1.0, because the merge integrated both edits exactly as
+        git intended.  Under the old semantics this shape cost a full
+        spurious dispatch: plan/verify/review re-run, a bogus task_failure
+        escalation filed, days blocked, and the condition is ABSORBING, so
+        every subsequent tick repeated it.
+
+        ``diverged_paths`` is still asserted, and still names
+        ``shared.manifest`` and NOT ``deliverable.py``.  That diagnostic is
+        retained on a PRESENT verdict on purpose: it is the single most
+        legible line in an escalation — it shows at a glance that the
+        diverged path is a co-touched hot file rather than this task's
+        deliverable, i.e. skew rather than a revert — it has simply stopped
+        being the thing that decides the verdict.
+        """
+        (git_repo / 'shared.manifest').write_text(
+            ''.join(f'line{i}\n' for i in range(1, 41))
+        )
+        await _run(['git', 'add', 'shared.manifest'], cwd=git_repo)
+        rc, _, err = await _run(['git', 'commit', '-m', 'seed manifest'], cwd=git_repo)
+        assert rc == 0, f'seed manifest failed: {err}'
+
+        rc, _, err = await _run(['git', 'checkout', '-b', 'task/9001'], cwd=git_repo)
+        assert rc == 0, f'checkout task/9001 failed: {err}'
+        (git_repo / 'deliverable.py').write_text('deliverable\n')
+        lines = (git_repo / 'shared.manifest').read_text().split('\n')
+        lines[0] = 'line1 touched by the task branch'
+        (git_repo / 'shared.manifest').write_text('\n'.join(lines))
+        await _run(['git', 'add', '-A'], cwd=git_repo)
+        rc, _, err = await _run(
+            ['git', 'commit', '-m', 'impl(9001): deliverable + manifest entry'],
+            cwd=git_repo,
+        )
+        assert rc == 0, f'branch commit failed: {err}'
+
+        rc, _, err = await _run(['git', 'checkout', 'main'], cwd=git_repo)
+        assert rc == 0, f'checkout main failed: {err}'
+        lines = (git_repo / 'shared.manifest').read_text().split('\n')
+        lines[39] = 'line40 touched independently on main'
+        (git_repo / 'shared.manifest').write_text('\n'.join(lines))
+        await _run(['git', 'add', '-A'], cwd=git_repo)
+        rc, _, err = await _run(
+            ['git', 'commit', '-m', 'unrelated: distant manifest edit'], cwd=git_repo,
+        )
+        assert rc == 0, f'main-side commit failed: {err}'
+
+        rc, _, err = await _run(
+            ['git', 'merge', '--no-ff', 'task/9001', '-m', 'Merge task/9001 into main'],
+            cwd=git_repo,
+        )
+        assert rc == 0, f'clean no-ff merge failed: {err}'
+        rc, merge_sha, err = await _run(['git', 'rev-parse', 'HEAD'], cwd=git_repo)
+        assert rc == 0, f'rev-parse failed: {err}'
+        merge_sha = merge_sha.strip()
+        rc, second_parent, err = await _run(
+            ['git', 'rev-parse', f'{merge_sha}^2'], cwd=git_repo,
+        )
+        assert rc == 0, f'rev-parse ^2 failed: {err}'
+        second_parent = second_parent.strip()
+
+        probe = await git_ops.describe_commit_effect_in_main(merge_sha)
+
+        assert probe.present is True
+        assert probe.failure is None
+        assert probe.aggregate_survival == 1.0
+        assert probe.diverged_paths == ('shared.manifest',)
+        assert 'deliverable.py' not in probe.diverged_paths
+        assert probe.anchor_sha == second_parent
+
+    async def test_unresolvable_commit_reports_failure_code(
+        self, git_ops: GitOps, git_repo: Path,
+    ) -> None:
+        """An unresolvable sha is fail-safe absent, but distinguishable from
+        a genuine path divergence — 'unresolvable_commit', not silence.
+        """
+        probe = await git_ops.describe_commit_effect_in_main('f' * 40)
+
+        assert probe.present is False
+        assert probe.failure == 'unresolvable_commit'
+        assert probe.diverged_paths == ()
+
+    async def test_empty_branch_merge_reports_failure_code(
+        self, git_ops: GitOps, git_repo: Path,
+    ) -> None:
+        """A merge whose branch nets ZERO content vs its own fork point has
+        no deliverable to confirm — fail-safe absent under the distinct
+        'empty_branch_merge' code, never conflated with paths_diverged.
+        """
+        rc, _, err = await _run(['git', 'checkout', '-b', 'branch'], cwd=git_repo)
+        assert rc == 0, f'checkout branch failed: {err}'
+        (git_repo / 'temp.py').write_text('temp\n')
+        await _run(['git', 'add', 'temp.py'], cwd=git_repo)
+        rc, _, err = await _run(['git', 'commit', '-m', 'add temp'], cwd=git_repo)
+        assert rc == 0, f'add temp failed: {err}'
+        (git_repo / 'temp.py').unlink()
+        await _run(['git', 'add', '-A'], cwd=git_repo)
+        rc, _, err = await _run(['git', 'commit', '-m', 'remove temp again'], cwd=git_repo)
+        assert rc == 0, f'remove temp failed: {err}'
+
+        rc, _, err = await _run(['git', 'checkout', 'main'], cwd=git_repo)
+        assert rc == 0, f'checkout main failed: {err}'
+        rc, _, err = await _run(
+            ['git', 'merge', '--no-ff', 'branch', '-m', 'Merge branch into main'],
+            cwd=git_repo,
+        )
+        assert rc == 0, f'merge failed: {err}'
+        rc, merge_sha, err = await _run(['git', 'rev-parse', 'HEAD'], cwd=git_repo)
+        assert rc == 0, f'rev-parse failed: {err}'
+
+        probe = await git_ops.describe_commit_effect_in_main(merge_sha.strip())
+
+        assert probe.present is False
+        assert probe.failure == 'empty_branch_merge'
+
+    async def test_empty_non_merge_commit_stays_present(
+        self, git_ops: GitOps, git_repo: Path,
+    ) -> None:
+        """Task-2500 behaviour preserved: a genuinely empty ordinary commit
+        has an empty touched-set, for which path-based revert detection is
+        inapplicable — present True, no failure code.
+        """
+        rc, _, err = await _run(
+            ['git', 'commit', '--allow-empty', '-m', 'empty commit'], cwd=git_repo,
+        )
+        assert rc == 0, f'empty commit failed: {err}'
+        rc, sha, err = await _run(['git', 'rev-parse', 'HEAD'], cwd=git_repo)
+        assert rc == 0, f'rev-parse failed: {err}'
+
+        probe = await git_ops.describe_commit_effect_in_main(sha.strip())
+
+        assert probe.present is True
+        assert probe.failure is None
+
+    async def test_non_ascii_diverged_path_round_trips_unquoted(
+        self, git_ops: GitOps, git_repo: Path,
+    ) -> None:
+        """The ``-z``/``core.quotePath=false`` hardening must survive into
+        the new OUTPUT parsing, not just the touched-set stage: a git-quoted
+        ``caf\\303\\251.py`` rendered into an escalation is a diagnostic that
+        misleads the human reading it.
+        """
+        (git_repo / 'café.py').write_text('fixed\n')
+        await _run(['git', 'add', 'café.py'], cwd=git_repo)
+        rc, _, err = await _run(['git', 'commit', '-m', 'fix commit'], cwd=git_repo)
+        assert rc == 0, f'fix commit failed: {err}'
+        rc, fix_sha, err = await _run(['git', 'rev-parse', 'HEAD'], cwd=git_repo)
+        assert rc == 0, f'rev-parse failed: {err}'
+        fix_sha = fix_sha.strip()
+
+        (git_repo / 'café.py').write_text('changed again\n')
+        await _run(['git', 'add', 'café.py'], cwd=git_repo)
+        rc, _, err = await _run(['git', 'commit', '-m', 'later commit'], cwd=git_repo)
+        assert rc == 0, f'later commit failed: {err}'
+
+        probe = await git_ops.describe_commit_effect_in_main(fix_sha)
+
+        assert probe.present is False
+        assert probe.diverged_paths == ('café.py',)
+
+
+async def _commit_all(repo: Path, message: str) -> str:
+    """Stage everything under *repo* and commit, returning the new sha."""
+    # esc-3072-3: git discovery walks UP, so a *repo* that is not itself a
+    # repository root sends `git add -A` + `git commit` into whatever repo
+    # encloses it — a real COMMIT into a live task worktree, sweeping up
+    # whatever uncommitted work it was holding. FIRST statement, before any
+    # subprocess, so a rejected call writes nothing anywhere.
+    assert_isolated_git_repo(repo)
+    await _run(['git', 'add', '-A'], cwd=repo)
+    rc, _, err = await _run(['git', 'commit', '-m', message], cwd=repo)
+    assert rc == 0, f'commit {message!r} failed: {err}'
+    rc, sha, err = await _run(['git', 'rev-parse', 'HEAD'], cwd=repo)
+    assert rc == 0, f'rev-parse failed: {err}'
+    return sha.strip()
+
+
+def _numbered(prefix: str, count: int) -> str:
+    """Return *count* unique, non-blank lines.
+
+    Uniqueness is load-bearing, not cosmetic: survival is measured by line-SET
+    membership, so duplicate or short-common lines can be "present" at main by
+    pure coincidence.  That is a real corpus hazard — motivating merge 3640 has
+    18 of its 45 removed lines still literally present at main for exactly this
+    reason (task 3116 b4) — and a fixture that tripped over it would measure
+    coincidence instead of survival.
+    """
+    return ''.join(f'{prefix}_{i:05d} = {i}\n' for i in range(count))
+
+
+async def _seed_on_main(
+    repo: Path, files: dict[str, str | bytes], message: str,
+) -> str:
+    """Write *files* and commit them straight to main (pre-branch baseline)."""
+    # Guarded ahead of the mkdir/write_text loop, not just inside _commit_all:
+    # a rejected call must leave no fixture litter in the wrong directory
+    # either (esc-3072-3).
+    assert_isolated_git_repo(repo)
+    for name, content in files.items():
+        path = repo / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if isinstance(content, bytes):
+            path.write_bytes(content)
+        else:
+            path.write_text(content)
+    return await _commit_all(repo, message)
+
+
+async def _land_branch(
+    repo: Path,
+    task_id: str,
+    files: Mapping[str, str | bytes] | None = None,
+    *,
+    deletes: tuple[str, ...] = (),
+    renames: tuple[tuple[str, str], ...] = (),
+) -> str:
+    """Create task/<id> off main, mutate the tree, merge --no-ff, return merge sha.
+
+    *files* values may be ``bytes`` to write a binary blob.  *deletes* and
+    *renames* exist because the vacuous cases (task 3116 b3) are defined by
+    having no added lines at all, which a write-only helper cannot express.
+    """
+    # esc-3072-3: the branch create, `git mv`/`git rm`, tree writes and
+    # `git merge --no-ff` below all mutate whatever repo encloses *repo* if it
+    # is not itself a repository root — this helper would MERGE into a live
+    # task worktree's main. FIRST statement, ahead of every subprocess and
+    # every filesystem write.
+    assert_isolated_git_repo(repo)
+    rc, _, err = await _run(
+        ['git', 'checkout', '-b', f'task/{task_id}', 'main'], cwd=repo,
+    )
+    assert rc == 0, f'branch create failed: {err}'
+    for old_path, new_path in renames:
+        rc, _, err = await _run(['git', 'mv', old_path, new_path], cwd=repo)
+        assert rc == 0, f'git mv {old_path} -> {new_path} failed: {err}'
+    for name in deletes:
+        rc, _, err = await _run(['git', 'rm', '-q', name], cwd=repo)
+        assert rc == 0, f'git rm {name} failed: {err}'
+    for name, content in (files or {}).items():
+        path = repo / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if isinstance(content, bytes):
+            path.write_bytes(content)
+        else:
+            path.write_text(content)
+    await _commit_all(repo, f'work for task {task_id}')
+    rc, _, err = await _run(['git', 'checkout', 'main'], cwd=repo)
+    assert rc == 0, f'checkout main failed: {err}'
+    rc, _, err = await _run(
+        [
+            'git', 'merge', '--no-ff',
+            '-m', f'Merge task/{task_id} into main', f'task/{task_id}',
+        ],
+        cwd=repo,
+    )
+    assert rc == 0, f'merge failed: {err}'
+    rc, sha, err = await _run(['git', 'rev-parse', 'HEAD'], cwd=repo)
+    assert rc == 0, f'rev-parse failed: {err}'
+    return sha.strip()
+
+
+@pytest.mark.asyncio
+class TestCommitEffectSurvival:
+    """Threshold line-SURVIVAL replaces byte-identity (task 3116 part b).
+
+    The predicate used to ask "does main still match the branch byte for
+    byte?", which is a question about whether ANYONE has touched the files
+    since — not about whether the branch's deliverable is still there.  On the
+    full corpus (2827 ``Merge task/N into main`` commits, measured at main
+    5bd7fd8489) that check reports effect_absent for 95.4% of all landings,
+    a third of them within 24 hours of merging.  A predicate that returns the
+    same answer for 95% of its population carries almost no information, and
+    the condition is ABSORBING — byte-identity once lost is never restored —
+    so each false False bought a full spurious dispatch (plan/verify/review, a
+    bogus task_failure escalation, days blocked; ~5.80 USD across tasks
+    3653/3640/3717).
+
+    The replacement asks the honest question: do the branch's ADDED LINES
+    still survive at main?  Verdict (constants pinned by test (f) below):
+
+        aggregate survival >= 0.98
+        AND every path with >= 25 added lines has per-file survival >= 0.90
+
+    Every fixture here is SYNTHETIC and sits at survival exactly 1.0 or 0.0,
+    so each case is unambiguous under ANY threshold in (0, 1) and no test
+    silently encodes a guessed number.  The two MIXED cases (c) and (d) are
+    the exceptions by necessity — they exist precisely to pin where the
+    per-file guard and its floor sit relative to each other — and both state
+    their arithmetic explicitly in the docstring.
+    """
+
+    async def test_additive_evolution_survives_the_task_3653_shape(
+        self, git_ops: GitOps, git_repo: Path,
+    ) -> None:
+        """THE DECISIVE MOTIVATING CASE, reconstructed synthetically.
+
+        A merge lands +N/-0 into a file; main then ADDS further lines to that
+        same file without touching any of the branch's.  Byte-identity is
+        broken, so the pre-3116 predicate said effect_absent — but every added
+        line is still literally there, so the effect plainly survived.
+
+        This is the exact live shape that re-dispatched task 3653 and left it
+        blocked four days: merge bd3d6f49b4 was +195/-0, additive edits landed
+        15.5 hours later, and the real merge measures aggregate survival
+        1.0000.  Mathematically 1.0 is guaranteed by construction here: a
+        later commit that only appends can never remove an anchor line from
+        main's line-set.
+
+        ``diverged_paths`` is asserted NON-empty on a PRESENT verdict on
+        purpose — byte-level divergence is still reported as a diagnostic, it
+        is simply no longer decisive.
+        """
+        merge_sha = await _land_branch(
+            git_repo, '3653', {'fileA.py': _numbered('branch', 6)},
+        )
+        (git_repo / 'fileA.py').write_text(
+            _numbered('branch', 6) + _numbered('later', 40),
+        )
+        await _commit_all(git_repo, 'later additive evolution on main')
+
+        probe = await git_ops.describe_commit_effect_in_main(merge_sha)
+
+        assert probe.present is True
+        assert probe.failure is None
+        assert probe.aggregate_survival == 1.0
+        assert probe.diverged_paths == ('fileA.py',), (
+            'byte-identity IS broken here — the path must still be reported '
+            'as a diagnostic even though it no longer decides the verdict'
+        )
+
+    async def test_genuine_revert_is_still_rejected(
+        self, git_ops: GitOps, git_repo: Path,
+    ) -> None:
+        """A real revert must still be caught — this is the task-1175 hole.
+
+        The branch's added lines are removed wholesale by a later commit, so
+        survival is exactly 0.0 and the verdict is False under any threshold.
+        The failure code is the NEW ``'effect_not_survived'``, distinct from
+        ``'paths_diverged'`` (which since part (b) means only "byte-identity
+        broken" — a much weaker, no-longer-decisive fact).
+        """
+        await _seed_on_main(git_repo, {'mod.py': _numbered('base', 10)}, 'seed mod')
+        merge_sha = await _land_branch(
+            git_repo, '1175',
+            {'mod.py': _numbered('base', 10) + _numbered('deliverable', 40)},
+        )
+        (git_repo / 'mod.py').write_text(_numbered('base', 10))
+        await _commit_all(git_repo, 'revert the deliverable')
+
+        probe = await git_ops.describe_commit_effect_in_main(merge_sha)
+
+        assert probe.present is False
+        assert probe.failure == 'effect_not_survived'
+        assert probe.aggregate_survival == 0.0
+        assert probe.diverged_paths == ('mod.py',)
+
+    async def test_per_file_guard_vetoes_reverted_deliverable(
+        self, git_ops: GitOps, git_repo: Path,
+    ) -> None:
+        """THE PER-FILE GUARD BITES — b2's own objection, closed.
+
+        b2 objected that a bare aggregate rule hides a reverted 20-line
+        deliverable behind a 2000-line test file.  This is that shape:
+
+            big_test.py    2000 added lines, untouched since  -> survival 1.00
+            deliverable.py   30 added lines, fully reverted   -> survival 0.00
+            aggregate = 2000/2030 = 0.9852  >= 0.98           -> PASSES
+
+        So the aggregate rule alone would wave this through.  The per-file
+        guard is what rejects it: deliverable.py carries 30 added lines, at or
+        above the 25-line floor, and 0.00 < 0.90.  The assertion on
+        ``aggregate_survival >= 0.98`` is load-bearing — it proves the GUARD
+        bit and not the aggregate, which is the whole point of the case.
+
+        On the real corpus this guard vetoes 40 merges that bare aggregate
+        would have accepted, at a cost of 1.5 points of recovery.
+        """
+        await _seed_on_main(
+            git_repo, {'deliverable.py': _numbered('base', 5)}, 'seed deliverable',
+        )
+        merge_sha = await _land_branch(
+            git_repo, '2000',
+            {
+                'deliverable.py': _numbered('base', 5) + _numbered('gone', 30),
+                'big_test.py': _numbered('kept', 2000),
+            },
+        )
+        (git_repo / 'deliverable.py').write_text(_numbered('base', 5))
+        await _commit_all(git_repo, 'revert only the deliverable')
+
+        probe = await git_ops.describe_commit_effect_in_main(merge_sha)
+
+        assert probe.present is False
+        assert probe.failure == 'effect_not_survived'
+        assert probe.aggregate_survival is not None
+        assert probe.aggregate_survival >= 0.98, (
+            'the aggregate must PASS here — otherwise this case proves '
+            'nothing about the per-file guard'
+        )
+        assert probe.worst_guarded_path == 'deliverable.py'
+        assert probe.worst_guarded_survival == 0.0
+
+    async def test_per_file_floor_protects_a_small_hot_file(
+        self, git_ops: GitOps, git_repo: Path,
+    ) -> None:
+        """THE FLOOR PROTECTS A SMALL HOT FILE — the task-3640 shape.
+
+        A substantial deliverable survives intact while a small, frequently
+        edited prose file the branch also touched is heavily rewritten:
+
+            deliverable.py  1200 added lines, untouched  -> survival 1.00
+            notes.md          20 added lines, rewritten  -> survival 0.00
+            aggregate = 1200/1220 = 0.9836  >= 0.98      -> PASSES
+            notes.md has 20 added lines < 25 floor       -> EXEMPT from guard
+
+        Without the floor, a per-file rule rejects a motivating case: real
+        merge ed56626ce0 (task 3640) has aggregate 0.9848 but per-file-MINIMUM
+        0.6087, driven entirely by a 23-line hot SKILL.md.  25 is the SMALLEST
+        floor that clears that anchor, keeping the guard as wide — as much
+        veto power — as the anchors allow.
+
+        ``notes.md`` is asserted present in ``diverged_paths`` to prove the
+        floor is what saved this landing: the file genuinely did diverge.
+        """
+        await _seed_on_main(
+            git_repo,
+            {'deliverable.py': _numbered('base', 5), 'notes.md': _numbered('note', 5)},
+            'seed deliverable and notes',
+        )
+        merge_sha = await _land_branch(
+            git_repo, '3640',
+            {
+                'deliverable.py': _numbered('base', 5) + _numbered('kept', 1200),
+                'notes.md': _numbered('note', 5) + _numbered('prose', 20),
+            },
+        )
+        (git_repo / 'notes.md').write_text(_numbered('rewritten', 30))
+        await _commit_all(git_repo, 'heavily rewrite the hot prose file')
+
+        probe = await git_ops.describe_commit_effect_in_main(merge_sha)
+
+        assert probe.present is True
+        assert probe.failure is None
+        assert probe.aggregate_survival is not None
+        assert probe.aggregate_survival >= 0.98
+        assert 'notes.md' in probe.diverged_paths, (
+            'notes.md genuinely diverged — the FLOOR is what saved this '
+            'landing, not an absence of divergence'
+        )
+
+    async def test_probe_carries_the_structured_survival_facts(
+        self, git_ops: GitOps, git_repo: Path,
+    ) -> None:
+        """The probe must carry WHY, not just THAT.
+
+        The probe has to name the ratio measured, the thresholds and floor
+        actually applied, and the worst offending guarded path.  An
+        escalation that says only "effect absent" is what cost days of
+        misdiagnosis twice.
+
+        THIS test asserts the dataclass only.  That those fields actually
+        reach the escalation body is a separate seam, pinned in
+        ``test_landing_evidence.py`` by
+        ``test_probe_carries_the_survival_facts_that_decided_it`` (threading
+        through ``_record_effect_divergence``) and
+        ``test_survival_measurement_is_rendered_not_just_carried``
+        (rendering).  Stated explicitly because this docstring previously
+        claimed ``format_unattributed_landing_detail`` "renders this
+        verbatim" while nothing rendered it at all — the same
+        prose-asserts-an-unimplemented-behaviour defect this task exists to
+        remove.
+        """
+        await _seed_on_main(git_repo, {'mod.py': _numbered('base', 10)}, 'seed mod')
+        merge_sha = await _land_branch(
+            git_repo, '4242',
+            {'mod.py': _numbered('base', 10) + _numbered('deliverable', 40)},
+        )
+        (git_repo / 'mod.py').write_text(_numbered('base', 10))
+        await _commit_all(git_repo, 'revert the deliverable')
+
+        probe = await git_ops.describe_commit_effect_in_main(merge_sha)
+
+        assert probe.added_lines_total == 40
+        assert probe.aggregate_survival == 0.0
+        assert probe.worst_guarded_path == 'mod.py'
+        assert probe.worst_guarded_survival == 0.0
+        assert probe.aggregate_threshold == _EFFECT_SURVIVAL_AGGREGATE_THRESHOLD
+        assert probe.per_file_threshold == _EFFECT_SURVIVAL_PER_FILE_THRESHOLD
+        assert (
+            probe.per_file_min_added_lines
+            == _EFFECT_SURVIVAL_PER_FILE_MIN_ADDED_LINES
+        )
+
+    async def test_repeated_added_lines_survive_only_as_often_as_main_kept_them(
+        self, git_ops: GitOps, git_repo: Path,
+    ) -> None:
+        """Survival is a MULTISET intersection, not set membership.
+
+        Every other fixture here uses ``_numbered``, whose lines are unique by
+        construction — which is exactly why set membership looked correct.
+        Real deliverables are not unique: a manifest gains 40 near-identical
+        entries, a module gains 40 ``return None`` guards, a config gains a
+        repeated import block.  Under set membership main retaining ONE copy
+        scored ALL 40 as surviving, so a reverted deliverable cleared the 0.98
+        aggregate.  That is a false ACCEPT, the one direction this check must
+        never take.
+
+        Here the anchor adds 40 identical lines and a later commit on main
+        keeps exactly one of them.  Correct survival is 1/40 = 0.025.
+        """
+        await _seed_on_main(git_repo, {'manifest.txt': 'seed\n'}, 'seed manifest')
+        repeated = 'entry = shared\n' * 40
+        merge_sha = await _land_branch(
+            git_repo, '9101', {'manifest.txt': 'seed\n' + repeated},
+        )
+        (git_repo / 'manifest.txt').write_text('seed\nentry = shared\n')
+        await _commit_all(git_repo, 'revert all but one copy of the entry')
+
+        probe = await git_ops.describe_commit_effect_in_main(merge_sha)
+
+        assert probe.added_lines_total == 40
+        assert probe.aggregate_survival == pytest.approx(1 / 40), (
+            'main kept ONE copy, so exactly one added line survived — set '
+            'membership would have scored all 40 and accepted the landing'
+        )
+        assert probe.present is False
+        assert probe.failure == 'effect_not_survived'
+
+    async def test_main_renaming_the_deliverable_after_landing_reads_as_absent(
+        self, git_ops: GitOps, git_repo: Path,
+    ) -> None:
+        """KNOWN GAP, pinned so it is explicit rather than folklore.
+
+        Survival is read PER PATH under the name the anchor used, so when a
+        later commit on main simply MOVES the deliverable, ``git show
+        <main>:<old path>`` fails, main's line multiset comes back None, and
+        every added line counts as lost — even though all of them are present
+        at main, intact, under the new name.
+
+        This is a false POSITIVE (a spurious reject), i.e. the fail-safe
+        direction, and it is a genuine member of the residual tail
+        :meth:`describe_commit_effect_in_main` describes.  It is NOT closed
+        here: resolving the path through ``git diff --name-status -M`` before
+        the read would loosen the predicate, and every threshold in this
+        module is calibrated against a full-corpus sweep taken WITHOUT that
+        loosening.  Retuning is a measurement, not an edit.
+
+        ``test_pure_rename_resolves_by_blob_not_line_set`` covers the mirror
+        case — a rename performed by the ANCHOR — which is decided correctly.
+        """
+        await _seed_on_main(git_repo, {'mod.py': _numbered('base', 5)}, 'seed mod')
+        merge_sha = await _land_branch(
+            git_repo, '9102',
+            {'mod.py': _numbered('base', 5) + _numbered('deliverable', 40)},
+        )
+
+        assert (await git_ops.describe_commit_effect_in_main(merge_sha)).present, (
+            'precondition: the landing reads as present before the move'
+        )
+
+        rc, _, err = await _run(['git', 'mv', 'mod.py', 'renamed.py'], cwd=git_repo)
+        assert rc == 0, f'rename on main failed: {err}'
+        await _commit_all(git_repo, 'main moves the deliverable to a new path')
+
+        assert _numbered('deliverable', 40) in (git_repo / 'renamed.py').read_text(), (
+            'precondition: every added line is still at main, just moved'
+        )
+
+        probe = await git_ops.describe_commit_effect_in_main(merge_sha)
+
+        assert probe.present is False, (
+            'CURRENT behaviour, deliberately pinned: a move by main reads as '
+            'a total loss. Closing this needs rename resolution plus a '
+            'corpus re-measurement, not a one-line edit'
+        )
+        assert probe.failure == 'effect_not_survived'
+        assert probe.aggregate_survival == 0.0
+
+    async def test_clean_paths_are_costed_in_one_batched_read(
+        self, git_ops: GitOps, git_repo: Path,
+    ) -> None:
+        """Paths that did NOT diverge are read in ONE batch, not ~5 subprocesses
+        each.
+
+        This is the COMMON path — re-run for every landing candidate on every
+        15s dispatch tick — and a clean landing touching many files used to
+        pay a full ``git diff`` (plus, for a vacuous path, four existence/oid
+        reads) for each one, all to learn a survival ratio that is 1.0 by
+        construction.  The memo does not save it: a merge landing is exactly
+        what advances main HEAD and invalidates every entry.
+
+        Asserting the COMMAND COUNT is what pins it; the verdict assertions
+        alone pass with the per-path loop restored.
+        """
+        await _seed_on_main(git_repo, {'seed.py': 'seed = 1\n'}, 'seed')
+        files = {f'pkg/mod_{i:02d}.py': _numbered(f'body{i}', 30) for i in range(12)}
+        merge_sha = await _land_branch(git_repo, '9103', files)
+
+        with _git_command_spy() as recorded:
+            probe = await git_ops.describe_commit_effect_in_main(merge_sha)
+            cold = list(recorded)
+
+        assert probe.present is True
+        assert probe.added_lines_total == 12 * 30
+        per_path_diffs = [
+            cmd for cmd in cold
+            if 'diff' in cmd and '--unified=0' in cmd and cmd[-2] == '--'
+        ]
+        assert len(per_path_diffs) <= 1, (
+            f'12 non-diverged paths must not cost a diff each; saw '
+            f'{len(per_path_diffs)} pathspec-scoped unified diffs'
+        )
+        assert len(cold) < 12, (
+            f'the whole clean probe must cost well under one command per '
+            f'touched path; saw {len(cold)}: {cold}'
+        )
+
+
+@pytest.mark.asyncio
+class TestCommitEffectSurvivalVacuousCases:
+    """ZERO-ADDED-LINES deliverables must not be waved through (task 3116 b3).
+
+    An added-lines-survive predicate is TRIVIALLY TRUE for a branch that added
+    no lines, so without a dedicated arm the detector silently becomes a NO-OP
+    for a whole class of deliverables: pure deletions, file removals, renames,
+    binaries, mode changes.  The amendment's words for that outcome are "the
+    fix is a green light that proves nothing".
+
+    The full corpus puts this class at 0.53% of merges (15 of 2822) — rare,
+    but a silent always-True for a deletion-shaped deliverable is exactly the
+    task-1175 clobber this gate exists to prevent, so rarity is not a reason
+    to skip it.  A deletion that gets reverted is a REAL revert and must be
+    caught; that is the whole point of the gate.
+
+    Each arm is decided by the mechanism that actually applies to its shape:
+
+        deleted path      still absent at main?          (presence)
+        rename / binary   same blob oid at main?         (blob comparison)
+        removed-only text removed lines still absent?    (line-set)
+
+    Removed-line absence is used HERE AND ONLY HERE.  It is deliberately NOT a
+    global conjunct on the survival path: corpus-wide only 73.0% of removed
+    lines are still absent, and motivating merge 3640 has 18 of its 45 removed
+    lines literally present again at main by short-common-line coincidence, so
+    a global conjunct would reject a case this task exists to fix (b4).
+    """
+
+    async def test_pure_line_deletion_holds_then_is_restored(
+        self, git_ops: GitOps, git_repo: Path,
+    ) -> None:
+        """A branch that ONLY removes lines: zero added lines throughout, so
+        this can be decided only by whether the removed lines are still gone.
+
+        Holding -> present.  Restored by a later commit -> absent: putting
+        back what the deliverable deleted is a genuine revert.
+        """
+        await _seed_on_main(
+            git_repo, {'mod.py': _numbered('base', 10)}, 'seed mod',
+        )
+        keep = ''.join(
+            line + '\n' for line in _numbered('base', 10).split('\n')[:4] if line
+        )
+        merge_sha = await _land_branch(git_repo, '7001', {'mod.py': keep})
+
+        probe = await git_ops.describe_commit_effect_in_main(merge_sha)
+        assert probe.present is True, 'the deletion still holds at main'
+        assert probe.aggregate_survival is None, (
+            'no added lines were measured, so no survival ratio may be claimed'
+        )
+
+        (git_repo / 'mod.py').write_text(_numbered('base', 10))
+        await _commit_all(git_repo, 'restore the deleted lines')
+
+        probe = await git_ops.describe_commit_effect_in_main(merge_sha)
+        assert probe.present is False
+        assert probe.failure == 'vacuous_effect_absent'
+        assert probe.vacuous_paths == ('mod.py',)
+
+    async def test_file_deletion_holds_then_is_resurrected(
+        self, git_ops: GitOps, git_repo: Path,
+    ) -> None:
+        """A branch whose deliverable IS a file removal.  Zero added lines, so
+        the pre-b3 code measured nothing at all here.
+        """
+        await _seed_on_main(
+            git_repo, {'obsolete.py': _numbered('old', 12)}, 'seed obsolete',
+        )
+        merge_sha = await _land_branch(git_repo, '7002', deletes=('obsolete.py',))
+
+        probe = await git_ops.describe_commit_effect_in_main(merge_sha)
+        assert probe.present is True, 'the file is still gone at main'
+
+        (git_repo / 'obsolete.py').write_text(_numbered('old', 12))
+        await _commit_all(git_repo, 'resurrect the deleted file')
+
+        probe = await git_ops.describe_commit_effect_in_main(merge_sha)
+        assert probe.present is False
+        assert probe.failure == 'vacuous_effect_absent'
+        assert 'obsolete.py' in probe.vacuous_paths
+
+    async def test_pure_rename_resolves_by_blob_not_line_set(
+        self, git_ops: GitOps, git_repo: Path,
+    ) -> None:
+        """A content-preserving rename must not be rescued by the identical
+        content still sitting at the OLD path.
+
+        MEASURED, and it corrected this test's original premise: git's rename
+        detection collapses the touched set for a pure rename to the
+        DESTINATION path alone (``diff --name-only`` reports only
+        ``new_name.py``), and a path-scoped ``diff --unified=0`` cannot see
+        the rename pair, so the destination reads as a plain 30-line ADD.  A
+        pure rename is therefore NOT vacuous under this enumeration and never
+        reaches the b3 arm — it is decided by ordinary line survival.
+
+        That is still correct, and for a reason worth pinning: survival is
+        measured PER PATH.  When the rename is undone, ``main:new_name.py``
+        does not resolve at all, so its line set is empty and survival is 0.0
+        no matter that the very same 30 lines are present at
+        ``main:old_name.py``.  Per-path scoping is what stops content
+        elsewhere in the tree from rescuing a reverted move; the assertion
+        below on the old path's content is what would catch a future
+        implementation that widened the line set beyond the path.
+        """
+        await _seed_on_main(
+            git_repo, {'old_name.py': _numbered('body', 30)}, 'seed old_name',
+        )
+        merge_sha = await _land_branch(
+            git_repo, '7003', renames=(('old_name.py', 'new_name.py'),),
+        )
+
+        probe = await git_ops.describe_commit_effect_in_main(merge_sha)
+        assert probe.present is True
+
+        rc, _, err = await _run(
+            ['git', 'mv', 'new_name.py', 'old_name.py'], cwd=git_repo,
+        )
+        assert rc == 0, f'rename revert failed: {err}'
+        await _commit_all(git_repo, 'revert the rename')
+
+        assert (git_repo / 'old_name.py').read_text() == _numbered('body', 30), (
+            'precondition: every one of the moved lines is still present at '
+            'main, just at the old path — this is what a path-blind line-set '
+            'implementation would be fooled by'
+        )
+
+        probe = await git_ops.describe_commit_effect_in_main(merge_sha)
+        assert probe.present is False, (
+            'the rename was undone — identical line CONTENT at the old path '
+            'must not read as the effect surviving'
+        )
+        assert probe.failure == 'effect_not_survived'
+        assert probe.aggregate_survival == 0.0
+
+    async def test_binary_blob_never_crashes_and_never_fakes_survival(
+        self, git_ops: GitOps, git_repo: Path,
+    ) -> None:
+        """A binary deliverable.  ``git diff --unified=0`` emits "Binary files
+        ... differ" and no + lines, so line survival is meaningless and must
+        not be fabricated as 1.0.  Decoding the blob would raise
+        UnicodeDecodeError inside _run, so the arm must never attempt it.
+        """
+        await _seed_on_main(
+            git_repo, {'asset.bin': b'\x00\x01\x02seed'}, 'seed asset',
+        )
+        merge_sha = await _land_branch(
+            git_repo, '7004', {'asset.bin': b'\x00\x01\x02delivered\xff'},
+        )
+
+        probe = await git_ops.describe_commit_effect_in_main(merge_sha)
+        assert probe.present is True
+        assert probe.aggregate_survival is None, (
+            'a binary contributes no measurable lines — reporting a survival '
+            'ratio here would be a number that was never computed'
+        )
+
+        (git_repo / 'asset.bin').write_bytes(b'\x00\x01\x02clobbered\xfe')
+        await _commit_all(git_repo, 'clobber the binary deliverable')
+
+        probe = await git_ops.describe_commit_effect_in_main(merge_sha)
+        assert probe.present is False
+        assert probe.failure == 'vacuous_effect_absent'
+        assert 'asset.bin' in probe.vacuous_paths
+
+    async def test_content_lines_that_look_like_diff_headers_still_count(
+        self, git_ops: GitOps, git_repo: Path,
+    ) -> None:
+        """A content line whose OWN TEXT starts with ``++`` is content, not a
+        ``+++ b/<path>`` file header.
+
+        ``git diff --unified=0`` prefixes every content line with exactly ONE
+        '+'/'-' column, so a C ``++counter;`` statement renders as
+        ``+++counter;`` and a SQL ``-- note`` comment renders as ``--- note``.
+        Classifying by raw prefix discards both as headers.  Here that emptied
+        the added-line set entirely and mis-routed a perfectly ordinary text
+        deliverable to the VACUOUS arm, so survival was never measured at all.
+
+        Real triggers are common: C/C++/Java/JS ``++i;``, SQL/Lua/Haskell
+        ``--`` comments, TOML ``+++`` front matter, and ``.patch``/``.diff``
+        fixture files.
+        """
+        await _seed_on_main(git_repo, {'mod.c': 'int seed;\n'}, 'seed mod.c')
+        body = ''.join(f'++counter_{i};\n' for i in range(40))
+        merge_sha = await _land_branch(
+            git_repo, '7101', {'mod.c': 'int seed;\n' + body},
+        )
+
+        probe = await git_ops.describe_commit_effect_in_main(merge_sha)
+
+        assert probe.added_lines_total == 40, (
+            'every ++-prefixed content line must be counted as added'
+        )
+        assert 'mod.c' not in probe.vacuous_paths, (
+            'a 40-line text deliverable is not a zero-added-lines shape'
+        )
+        assert probe.aggregate_survival == 1.0
+        assert probe.present is True
+
+    async def test_revert_of_only_the_header_lookalike_lines_is_not_survival(
+        self, git_ops: GitOps, git_repo: Path,
+    ) -> None:
+        """THE FALSE ACCEPT.  A branch adds 30 ``++``-prefixed lines and 30
+        ordinary ones; a later commit on main reverts ONLY the ``++`` half.
+
+        Half the deliverable is gone, but if the ``++`` lines were never
+        counted as added, the surviving half measures 1.0 and the gate marks
+        the task done.  That is a false accept on the exact task-1175 revert
+        class this check exists to catch — the one direction the primitive is
+        documented never to take ('never claim an effect is present on
+        doubt').
+        """
+        await _seed_on_main(git_repo, {'mod.c': 'int seed;\n'}, 'seed mod.c')
+        looky = ''.join(f'++counter_{i};\n' for i in range(30))
+        plain = ''.join(f'int plain_{i};\n' for i in range(30))
+        merge_sha = await _land_branch(
+            git_repo, '7102', {'mod.c': 'int seed;\n' + looky + plain},
+        )
+
+        # A later commit reverts ONLY the header-lookalike half.
+        (git_repo / 'mod.c').write_text('int seed;\n' + plain)
+        await _commit_all(git_repo, 'revert half the deliverable')
+
+        probe = await git_ops.describe_commit_effect_in_main(merge_sha)
+
+        assert probe.added_lines_total == 60
+        assert probe.aggregate_survival == pytest.approx(0.5), (
+            'half the added lines are gone from main'
+        )
+        assert probe.present is False, (
+            'a half-reverted deliverable must not read as a clean landing'
+        )
+
+    async def test_non_utf8_text_blob_is_fail_safe_not_a_crash(
+        self, git_ops: GitOps, git_repo: Path,
+    ) -> None:
+        """A latin-1 text file has no NUL bytes, so git treats it as TEXT and
+        ``git diff`` emits its raw bytes — which ``_run``'s strict
+        ``.decode()`` cannot decode.
+
+        Distinct from the binary case above, which uses NUL bytes and so only
+        ever exercises git's ASCII "Binary files ... differ" output.  This one
+        reaches the decode.  The contract is fail-safe throughout: any git
+        error yields present=False, never a fabricated True and never an
+        exception escaping into the dispatch gate.
+        """
+        await _seed_on_main(
+            git_repo, {'t.txt': b'seed\n'}, 'seed t.txt',
+        )
+        merge_sha = await _land_branch(
+            git_repo, '7103', {'t.txt': 'caf\xe9 na\xefve\n'.encode('latin-1')},
+        )
+
+        probe = await git_ops.describe_commit_effect_in_main(merge_sha)
+
+        assert probe.present is False
+        assert probe.failure == 'diff_failed'
+
+    async def test_vacuous_arm_and_text_arm_cannot_mask_each_other(
+        self, git_ops: GitOps, git_repo: Path,
+    ) -> None:
+        """MIXED branch — a text file with real added lines PLUS a deleted
+        file.  Neither arm may override the other:
+
+        - a surviving deletion must not rescue reverted text, and
+        - surviving text must not rescue a resurrected deletion.
+
+        Both directions are exercised, because a conservative-looking
+        implementation can easily get one right and the other wrong.
+        """
+        await _seed_on_main(
+            git_repo,
+            {'obsolete.py': _numbered('old', 12), 'impl.py': _numbered('base', 5)},
+            'seed obsolete and impl',
+        )
+        merge_sha = await _land_branch(
+            git_repo, '7005',
+            {'impl.py': _numbered('base', 5) + _numbered('feature', 40)},
+            deletes=('obsolete.py',),
+        )
+
+        probe = await git_ops.describe_commit_effect_in_main(merge_sha)
+        assert probe.present is True, 'both arms pass immediately after landing'
+
+        # Direction 1: text reverted, deletion still holding.
+        (git_repo / 'impl.py').write_text(_numbered('base', 5))
+        revert_text = await _commit_all(git_repo, 'revert the text deliverable')
+
+        probe = await git_ops.describe_commit_effect_in_main(merge_sha)
+        assert probe.present is False, (
+            'a surviving deletion must NOT mask reverted text'
+        )
+        assert probe.failure == 'effect_not_survived'
+
+        # Direction 2: text restored, deletion resurrected.
+        rc, _, err = await _run(
+            ['git', 'revert', '--no-edit', revert_text], cwd=git_repo,
+        )
+        assert rc == 0, f'revert of the revert failed: {err}'
+        (git_repo / 'obsolete.py').write_text(_numbered('old', 12))
+        await _commit_all(git_repo, 'resurrect the deleted file')
+
+        probe = await git_ops.describe_commit_effect_in_main(merge_sha)
+        assert probe.present is False, (
+            'surviving text must NOT mask a resurrected deletion'
+        )
+        assert probe.failure == 'vacuous_effect_absent'
+        assert 'obsolete.py' in probe.vacuous_paths
+
+    async def test_probe_distinguishes_a_vacuous_decision_from_a_survival_one(
+        self, git_ops: GitOps, git_repo: Path,
+    ) -> None:
+        """The probe is rendered verbatim into the escalation a human reads,
+        so it must never present a survival ratio it did not compute.
+
+        An all-vacuous branch reports aggregate_survival None (undefined, not
+        0.0 and not 1.0 — both would be assertions the code cannot support),
+        names the paths the vacuous arm decided, and uses a failure code
+        distinct from the survival path's 'effect_not_survived'.
+        """
+        await _seed_on_main(
+            git_repo, {'obsolete.py': _numbered('old', 12)}, 'seed obsolete',
+        )
+        merge_sha = await _land_branch(git_repo, '7006', deletes=('obsolete.py',))
+        (git_repo / 'obsolete.py').write_text(_numbered('old', 12))
+        await _commit_all(git_repo, 'resurrect the deleted file')
+
+        probe = await git_ops.describe_commit_effect_in_main(merge_sha)
+
+        assert probe.present is False
+        assert probe.failure == 'vacuous_effect_absent'
+        assert probe.failure != 'effect_not_survived'
+        assert probe.aggregate_survival is None
+        assert probe.added_lines_total == 0
+        assert probe.worst_guarded_path is None
+        assert probe.vacuous_paths == ('obsolete.py',)
+
+
+@contextlib.contextmanager
+def _git_command_spy():
+    """Record every git command GitOps issues, delegating to the real ``_run``.
+
+    Counting invocations through the module's ``_run`` seam is the only
+    non-flaky way to assert a memo actually elided work: timing a subprocess
+    round-trip on a loaded CI box measures the box, not the cache.
+    """
+    original_run = _run
+    recorded: list[list[str]] = []
+
+    async def recording_run(cmd, cwd=None, **kwargs):
+        recorded.append(list(cmd))
+        return await original_run(cmd, cwd=cwd, **kwargs)
+
+    with patch('orchestrator.git_ops._run', side_effect=recording_run):
+        yield recorded
+
+
+@pytest.mark.asyncio
+class TestCommitEffectProbeMemo:
+    """The probe is memoized on (commit_sha, main_sha) (task 3116 b5).
+
+    COST is a first-class constraint on part (b), not an afterthought.  The
+    pre-3116 check was ONE ``git diff --quiet``; line survival needs a blob
+    read plus a set comparison PER TOUCHED PATH.  The cheap byte-identity test
+    cannot serve as a fast path either, because the full corpus measured 94.9%
+    of merges failing it while their deliverables sit intact at main — so the
+    expensive path is the COMMON path, re-run for every landing candidate on
+    every ``idle_poll_secs`` (15s) dispatch tick.
+
+    The KEY is the correctness core.  A memo keyed on ``commit_sha`` alone
+    would freeze a verdict across exactly the event that changes the answer: a
+    main HEAD advance.  Keying on the pair means a HEAD movement invalidates
+    every entry by construction, and the value cached is the value computed
+    against that HEAD.
+
+    A warm hit still costs ONE command — ``git rev-parse main`` — because the
+    memo cannot know whether HEAD moved without asking.  That single
+    invocation is the pin used throughout this class: a cache hit issues
+    exactly it and nothing else.
+    """
+
+    async def test_repeat_probe_at_same_main_head_issues_git_work_once(
+        self, git_ops: GitOps, git_repo: Path,
+    ) -> None:
+        """(a) Two consecutive probes for the same commit at the same main
+        HEAD return EQUAL probes, and the second issues no git work beyond the
+        single HEAD resolution the key requires.
+        """
+        await _seed_on_main(git_repo, {'mod.py': _numbered('base', 40)}, 'seed mod')
+        merge_sha = await _land_branch(
+            git_repo, '8001',
+            {'mod.py': _numbered('base', 40) + _numbered('added', 40)},
+        )
+
+        with _git_command_spy() as recorded:
+            first = await git_ops.describe_commit_effect_in_main(merge_sha)
+            cold_cost = len(recorded)
+            recorded.clear()
+            second = await git_ops.describe_commit_effect_in_main(merge_sha)
+            warm = list(recorded)
+
+        assert first.present is True
+        assert second == first, 'a warm hit must return the same verdict and facts'
+        assert cold_cost > 1, (
+            f'sanity: the cold probe must actually do git work, saw {cold_cost}'
+        )
+        assert warm == [['git', 'rev-parse', 'main']], (
+            f'a warm hit must cost exactly the HEAD resolution, saw {warm}'
+        )
+
+    async def test_main_head_advance_invalidates_and_can_flip_the_verdict(
+        self, git_ops: GitOps, git_repo: Path,
+    ) -> None:
+        """(b) THE correctness core: the memo must not survive the HEAD
+        movement that changes the answer.
+
+        Probe once while the deliverable is intact (present), advance main so
+        it is reverted, probe again — the second call must RECOMPUTE and
+        report absent.  A commit_sha-only key would serve the stale True
+        forever, which is strictly worse than no memo: it would hand the
+        dispatch gate a landing verdict for a deliverable that is gone.
+        """
+        await _seed_on_main(git_repo, {'mod.py': _numbered('base', 40)}, 'seed mod')
+        merge_sha = await _land_branch(
+            git_repo, '8002',
+            {'mod.py': _numbered('base', 40) + _numbered('added', 40)},
+        )
+
+        before = await git_ops.describe_commit_effect_in_main(merge_sha)
+        assert before.present is True
+
+        (git_repo / 'mod.py').write_text(_numbered('base', 40))
+        await _commit_all(git_repo, 'revert the deliverable on main')
+
+        with _git_command_spy() as recorded:
+            after = await git_ops.describe_commit_effect_in_main(merge_sha)
+            recompute_cost = len(recorded)
+            recorded.clear()
+            again = await git_ops.describe_commit_effect_in_main(merge_sha)
+            warm = list(recorded)
+
+        assert after.present is False, 'the advance must be seen, not memoized away'
+        assert after.failure == 'effect_not_survived'
+        assert recompute_cost > 1, (
+            f'a new HEAD must force real recomputation, saw {recompute_cost} commands'
+        )
+        assert again == after, 'the recomputed verdict is itself memoized'
+        assert warm == [['git', 'rev-parse', 'main']]
+
+    async def test_memo_drops_entries_keyed_on_a_superseded_main_head(
+        self, git_ops: GitOps, git_repo: Path,
+    ) -> None:
+        """The memo is BOUNDED: a HEAD advance invalidates every entry keyed
+        on the old sha, so they are dropped rather than accumulated.
+
+        The orchestrator holds one GitOps for the life of the process and
+        probes on every 15s tick; an unbounded dict keyed on a moving HEAD is
+        a slow leak that never gets collected.
+        """
+        await _seed_on_main(git_repo, {'mod.py': _numbered('base', 40)}, 'seed mod')
+        merge_sha = await _land_branch(
+            git_repo, '8003',
+            {'mod.py': _numbered('base', 40) + _numbered('added', 40)},
+        )
+
+        await git_ops.describe_commit_effect_in_main(merge_sha)
+        old_main = await git_ops.get_main_sha()
+        assert list(git_ops._effect_probe_memo) == [(merge_sha, old_main)]
+
+        (git_repo / 'unrelated.md').write_text('later, unrelated work\n')
+        await _commit_all(git_repo, 'unrelated advance on main')
+        new_main = await git_ops.get_main_sha()
+        await git_ops.describe_commit_effect_in_main(merge_sha)
+
+        assert list(git_ops._effect_probe_memo) == [(merge_sha, new_main)], (
+            'entries keyed on a superseded main sha must not accumulate'
+        )
+
+    async def test_distinct_commits_at_the_same_head_do_not_collide(
+        self, git_ops: GitOps, git_repo: Path,
+    ) -> None:
+        """(c) Two commits probed at the same HEAD keep their own verdicts —
+        one intact, one reverted — and neither is served the other's answer.
+        """
+        await _seed_on_main(
+            git_repo,
+            {'kept.py': _numbered('kept', 40), 'lost.py': _numbered('lost', 40)},
+            'seed both files',
+        )
+        kept_sha = await _land_branch(
+            git_repo, '8004',
+            {'kept.py': _numbered('kept', 40) + _numbered('kept_new', 40)},
+        )
+        lost_sha = await _land_branch(
+            git_repo, '8005',
+            {'lost.py': _numbered('lost', 40) + _numbered('lost_new', 40)},
+        )
+        (git_repo / 'lost.py').write_text(_numbered('lost', 40))
+        await _commit_all(git_repo, 'revert only task 8005 deliverable')
+
+        kept_probe = await git_ops.describe_commit_effect_in_main(kept_sha)
+        lost_probe = await git_ops.describe_commit_effect_in_main(lost_sha)
+
+        assert kept_probe.present is True
+        assert lost_probe.present is False
+        assert kept_probe.anchor_sha != lost_probe.anchor_sha
+        # And re-reading either one after the other was cached is unaffected.
+        assert (await git_ops.describe_commit_effect_in_main(kept_sha)).present is True
+        assert (await git_ops.describe_commit_effect_in_main(lost_sha)).present is False
+
+    async def test_bool_wrapper_shares_the_memo_with_the_probe(
+        self, git_ops: GitOps, git_repo: Path,
+    ) -> None:
+        """(d) The decision call (the bool) and the reject-path enrichment
+        call (the probe) together cost ONE computation.
+
+        This is what makes landing_evidence's decide-with-the-bool /
+        enrich-with-the-probe split free — without a shared memo that split
+        would double the cost of the gate's hottest check.
+        """
+        await _seed_on_main(git_repo, {'mod.py': _numbered('base', 40)}, 'seed mod')
+        merge_sha = await _land_branch(
+            git_repo, '8006',
+            {'mod.py': _numbered('base', 40) + _numbered('added', 40)},
+        )
+
+        with _git_command_spy() as recorded:
+            probe = await git_ops.describe_commit_effect_in_main(merge_sha)
+            recorded.clear()
+            present = await git_ops.commit_effect_present_in_main(merge_sha)
+            after_probe = list(recorded)
+
+        assert present is probe.present
+        assert after_probe == [['git', 'rev-parse', 'main']], (
+            f'the bool must reuse the probe memo, saw {after_probe}'
+        )
+
+    async def test_probe_reuses_a_memo_warmed_by_the_bool_wrapper(
+        self, git_ops: GitOps, git_repo: Path,
+    ) -> None:
+        """(d), other order: the bool warms the same memo the probe reads, so
+        the enrichment call after a False decision is free too — which is the
+        order landing_evidence actually uses.
+        """
+        await _seed_on_main(git_repo, {'mod.py': _numbered('base', 40)}, 'seed mod')
+        merge_sha = await _land_branch(
+            git_repo, '8007',
+            {'mod.py': _numbered('base', 40) + _numbered('added', 40)},
+        )
+        (git_repo / 'mod.py').write_text(_numbered('base', 40))
+        await _commit_all(git_repo, 'revert the deliverable on main')
+
+        with _git_command_spy() as recorded:
+            present = await git_ops.commit_effect_present_in_main(merge_sha)
+            recorded.clear()
+            probe = await git_ops.describe_commit_effect_in_main(merge_sha)
+            after_bool = list(recorded)
+
+        assert present is False
+        assert probe.present is False
+        assert probe.failure == 'effect_not_survived'
+        assert after_bool == [['git', 'rev-parse', 'main']], (
+            f'the enrichment probe must reuse the bool\'s computation, '
+            f'saw {after_bool}'
+        )
+
+    async def test_memo_is_per_instance_and_does_not_leak_across_gitops(
+        self, git_ops: GitOps, git_config: GitConfig, git_repo: Path,
+    ) -> None:
+        """(e) The memo lives on the instance, not in a module global.
+
+        A module-level cache would survive a config change — a different
+        ``main_branch``, a different project_root — and answer for a
+        repository it never measured.
+        """
+        await _seed_on_main(git_repo, {'mod.py': _numbered('base', 40)}, 'seed mod')
+        merge_sha = await _land_branch(
+            git_repo, '8008',
+            {'mod.py': _numbered('base', 40) + _numbered('added', 40)},
+        )
+
+        warmed = await git_ops.describe_commit_effect_in_main(merge_sha)
+        other = GitOps(git_config, git_repo)
+        assert other._effect_probe_memo == {}, 'a fresh instance starts cold'
+
+        with _git_command_spy() as recorded:
+            fresh = await other.describe_commit_effect_in_main(merge_sha)
+
+        assert fresh == warmed
+        assert len(recorded) > 1, (
+            f'a second instance must recompute, not read a module global; '
+            f'saw {len(recorded)} commands'
+        )
+
+    async def test_transient_git_failures_are_never_memoized(
+        self, git_ops: GitOps, git_repo: Path,
+    ) -> None:
+        """A subprocess failure is NOT a repository fact and must not be
+        pinned for the life of the current HEAD.
+
+        The effect-absent condition is ABSORBING (byte-identity, once broken,
+        is never restored), so a memoized transient failure means a guaranteed
+        spurious full dispatch — plan/verify/review plus a task_failure
+        escalation — rather than a self-healing re-check.  Only verdicts
+        derived from repository CONTENT may be cached.
+        """
+        await _seed_on_main(git_repo, {'mod.py': _numbered('base', 40)}, 'seed mod')
+        merge_sha = await _land_branch(
+            git_repo, '8009',
+            {'mod.py': _numbered('base', 40) + _numbered('added', 40)},
+        )
+        original_run = _run
+
+        async def flaky_run(cmd, cwd=None, **kwargs):
+            if cmd[:2] == ['git', 'merge-base']:
+                return 128, '', 'fatal: simulated transient git failure'
+            return await original_run(cmd, cwd=cwd, **kwargs)
+
+        with patch('orchestrator.git_ops._run', side_effect=flaky_run):
+            failed = await git_ops.describe_commit_effect_in_main(merge_sha)
+
+        assert failed.present is False
+        assert failed.failure == 'merge_base_unresolved'
+        assert git_ops._effect_probe_memo == {}, (
+            'a transient git failure must not be cached'
+        )
+
+        recovered = await git_ops.describe_commit_effect_in_main(merge_sha)
+        assert recovered.present is True, (
+            'the next tick must re-measure, not replay the cached failure'
+        )
+
+    async def test_memo_evicts_the_oldest_entry_at_the_bound(
+        self, git_ops: GitOps, git_repo: Path,
+    ) -> None:
+        """(f) The FIFO bound actually holds, and drops the OLDEST entry.
+
+        Every other test in this class exercises the memo's correctness
+        machinery; this one covers the only branch that enforces its stated
+        SIZE bound.  It needs its own test precisely because the memo is a
+        pure optimization: evicting the newest entry, or an off-by-one that
+        drops the entry just inserted, leaves every functional test in this
+        file green while the bound silently stops holding or the cache stops
+        caching.
+
+        The bound is patched down to 2 rather than probing 257 commits — the
+        branch under test is ``len(memo) >= _EFFECT_PROBE_MEMO_MAX_ENTRIES``,
+        and it does not care what the constant is.  All three probes run at
+        ONE fixed main HEAD so the whole-memo staleness clear (a different
+        mechanism, covered above) cannot be what does the dropping.
+        """
+        await _seed_on_main(
+            git_repo,
+            {'a.py': _numbered('a', 30), 'b.py': _numbered('b', 30),
+             'c.py': _numbered('c', 30)},
+            'seed three files',
+        )
+        shas = [
+            await _land_branch(
+                git_repo, f'85{i:02d}',
+                {name: _numbered(name[0], 30) + _numbered(f'add{i}', 30)},
+            )
+            for i, name in enumerate(('a.py', 'b.py', 'c.py'))
+        ]
+        main_sha = await git_ops.get_main_sha()
+        assert main_sha
+
+        with patch('orchestrator.git_ops._EFFECT_PROBE_MEMO_MAX_ENTRIES', 2):
+            for sha in shas:
+                await git_ops.describe_commit_effect_in_main(sha)
+
+        assert list(git_ops._effect_probe_memo) == [
+            (shas[1], main_sha), (shas[2], main_sha),
+        ], (
+            'the bound must hold at 2 and the OLDEST key must be the one '
+            'dropped — the newest probe must still be cached'
+        )
 
 
 @pytest.mark.asyncio
@@ -4978,9 +6680,9 @@ class TestFindTaskCitationCommit:
 @pytest.mark.asyncio
 class TestMergeSubjectContract:
     """End-to-end contract: the merge subject written to main by merge_to_main
-    equals _merge_subject output, and find_merge_marker locates that commit.
+    equals format_merge_subject output, and find_merge_marker locates that commit.
 
-    If either the writer or reader drifts from _merge_subject (e.g. an inline
+    If either the writer or reader drifts from format_merge_subject (e.g. an inline
     f-string replaces the helper call with a different format), at least one of
     the two roundtrip assertions will fail.
     """
@@ -4988,7 +6690,7 @@ class TestMergeSubjectContract:
     async def test_merge_subject_roundtrip(
         self, git_ops: GitOps
     ) -> None:
-        """Assert the on-main subject equals _merge_subject output and that
+        """Assert the on-main subject equals format_merge_subject output and that
         find_merge_marker returns the same SHA.
         """
         tid = 'contract-1'
@@ -5015,34 +6717,11 @@ class TestMergeSubjectContract:
             ['git', 'log', '--format=%s', '-n', '1', result.merge_commit],
             cwd=git_ops.project_root,
         )
-        assert subject == _merge_subject(full_branch, git_ops.config.main_branch)
+        assert subject == format_merge_subject(full_branch, git_ops.config.main_branch)
 
         # find_merge_marker must locate the same commit
         marker_sha = await git_ops.find_merge_marker(full_branch)
         assert marker_sha == result.merge_commit
-
-
-class TestMergeSubject:
-    """Unit tests for the _merge_subject helper.
-
-    Locks the canonical format: 'Merge {branch} into {main_branch}'.
-    This helper is the single source of truth consumed by merge_to_main,
-    advance_main (retry path), and find_merge_marker.
-    """
-
-    @pytest.mark.parametrize(
-        'branch, main_branch, expected',
-        [
-            ('task/1', 'main', 'Merge task/1 into main'),
-            ('task/123', 'main', 'Merge task/123 into main'),
-            ('task/v1.0', 'develop', 'Merge task/v1.0 into develop'),
-        ],
-    )
-    def test_canonical_format(
-        self, branch: str, main_branch: str, expected: str
-    ) -> None:
-        """_merge_subject returns 'Merge {branch} into {main_branch}'."""
-        assert _merge_subject(branch, main_branch) == expected
 
 
 @pytest.mark.asyncio
@@ -5077,6 +6756,168 @@ class TestRunWorktreeMissing:
         assert not isinstance(exc.value, WorktreeMissing)
 
 
+async def _wait_for_child_pid(
+    pid_file: Path, *, timeout: float = 30.0, interval: float = 0.1,
+) -> int:
+    """Poll for *pid_file* to appear and return its pid.
+
+    The child writes its pid to a sibling ``<path>.tmp`` file and
+    ``os.replace()``s it into place, so the *moment* ``pid_file.exists()``
+    the file is guaranteed to hold complete, parseable content — no window
+    where the parent can observe a just-created-but-empty file (the old
+    ``open(path, 'w').write(...)`` pattern raced ``open``'s truncate against
+    the buffered ``write``) nor a torn/partial read of an in-progress write
+    (task 3851). Mirrors the monotonic-deadline + ``timeout``/``interval``
+    convention used by ``wait_for_pgid_file`` in
+    test_laptop_warm_verify_boundary.py.
+
+    After task 4109, this poll is the sole remaining startup-timing bound in
+    ``TestRunCancellationReapsChild``. ``timeout`` here is a diagnostic
+    CEILING, not a deadline that must be beaten: the loop returns the
+    instant ``pid_file`` exists, so the value is paid only when the child
+    genuinely never starts. It is kept well under the 60s
+    ``timeout``/``timeout_method = "thread"`` cap configured in
+    ``orchestrator/pyproject.toml``, so a genuine never-started child surfaces
+    as this function's own ``pytest.fail`` message below, not a generic
+    thread-method kill. Contrast ``_assert_child_reaped``'s 5.0s, which is
+    deliberately left unwidened — that is an ASSERTION window (prompt
+    reaping is the property under test), not an arrange wait.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if pid_file.exists():
+            with contextlib.suppress(ValueError):
+                return int(pid_file.read_text().strip())
+        await asyncio.sleep(interval)
+    pytest.fail(
+        f'child never wrote its pid to {pid_file} within {timeout}s (it may '
+        'never have started, or was killed before it could flush the pid '
+        'write)'
+    )
+
+
+async def _assert_child_reaped(
+    child_pid: int, *, timeout: float = 5.0, interval: float = 0.1,
+) -> None:
+    """Poll until *child_pid* is gone; fail if it outlives *timeout*."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            os.kill(child_pid, 0)
+        except ProcessLookupError:
+            return
+        await asyncio.sleep(interval)
+    pytest.fail(f'child pid {child_pid} was not reaped after cancellation')
+
+
+# Cancellation timeout for the wait_for-shaped caller in
+# TestRunCancellationReapsChild. NOT a tuned threshold: the child sleeps 60s
+# AFTER publishing its pid, and _start_hung_child does not return until that
+# pid is on disk, so this value only has to be SHORTER than 60s (a ~1200x
+# margin). It fails safe — a slower box makes the timeout MORE likely to
+# fire, never less. Contrast the single 5.0s deadline this replaced, which
+# had to do both jobs at once and was tuned down to 0/40 misses on one box
+# rather than eliminated (task 4109).
+#
+# A cancel landing while _run is still inside create_subprocess_exec's
+# post-fork setup is closed structurally (task 6346):
+# shared/src/shared/git_async.py::_spawn_session_leader shields the spawn and
+# kills what it forked.
+_CANCEL_TIMEOUT = 0.05
+
+
+async def _start_hung_child(
+    pid_file: Path, *, startup_delay: float = 0.0,
+) -> tuple[asyncio.Task[tuple[int, str, str]], int]:
+    """Spawn a child that publishes its pid then sleeps, and confirm it started.
+
+    The single spawn-and-confirm arrange path shared by both tests in
+    ``TestRunCancellationReapsChild``. Returns only once the child has
+    PUBLISHED its pid, so the caller's cancellation is guaranteed to hit a
+    live child and no caller-side timeout has to cover interpreter startup
+    (task 4109). ``startup_delay`` exists so the contract guard can inject a
+    startup slower than any caller timeout.
+    """
+    script = (
+        'import os, time\n'
+        f'time.sleep({startup_delay!r})\n'
+        f"tmp = {str(pid_file)!r} + '.tmp'\n"
+        "open(tmp, 'w').write(str(os.getpid()))\n"
+        # Atomic tmp-write + rename — see _wait_for_child_pid (task 3851).
+        f"os.replace(tmp, {str(pid_file)!r})\n"
+        'time.sleep(60)\n'
+    )
+    task = asyncio.ensure_future(_run(['python3', '-c', script]))
+    try:
+        child_pid = await _wait_for_child_pid(pid_file)
+    except BaseException:
+        # Drive the cancellation to completion rather than just scheduling
+        # it: _wait_for_child_pid's pytest.fail() raises a BaseException, and
+        # if we returned immediately after task.cancel() the event loop would
+        # never get a turn to run _run's own except BaseException: proc.kill()
+        # + await proc.wait() cleanup. Without this await, a genuine
+        # never-started-child diagnostic would itself leak the orphan
+        # sleeping child this test class exists to catch (task 4109).
+        task.cancel()
+        with contextlib.suppress(BaseException):
+            await task
+        raise
+    return task, child_pid
+
+
+@pytest.mark.asyncio
+class TestHungChildHelperContract:
+    """Contract for the ``_start_hung_child`` arrange helper.
+
+    Pins that the helper's arrange phase is deadline-independent: it waits
+    for the observable fact of the child's pid landing on disk, however long
+    interpreter startup takes, rather than racing a fixed clock (task 4109).
+    """
+
+    async def test_returns_only_after_pid_published_and_alive(
+        self, tmp_path: Path
+    ) -> None:
+        pid_file = tmp_path / 'child.pid'
+        # 4x _CANCEL_TIMEOUT (0.05s) — the discriminating leg. A helper that
+        # folded the spawn into any sub-second fixed deadline, or that
+        # returned before the pid was published, fails the assertions below
+        # here. This is the slow-interpreter-startup condition the old fixed
+        # 5.0s deadline could only cover probabilistically, applied
+        # deterministically instead of hoped for.
+        task, child_pid = await _start_hung_child(pid_file, startup_delay=0.2)
+
+        try:
+            assert pid_file.read_text().strip() == str(child_pid), (
+                f'pid_file contents {pid_file.read_text().strip()!r} do not '
+                f'match the pid the helper returned ({child_pid!r}) — the '
+                'returned pid must be the one the child actually published, '
+                'not a guess'
+            )
+
+            try:
+                os.kill(child_pid, 0)
+            except ProcessLookupError:
+                pytest.fail(
+                    f'child pid {child_pid} is not alive immediately after '
+                    '_start_hung_child returned — any cancellation the '
+                    'caller drives next would race a child that may already '
+                    'be gone'
+                )
+
+            assert not task.done(), (
+                'task is already done right after _start_hung_child '
+                'returned — the _run future must still be pending inside '
+                'await proc.communicate() so cancelling it exercises the '
+                'kill+reap path under test rather than an already-completed '
+                'no-op'
+            )
+        finally:
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            await _assert_child_reaped(child_pid)
+
+
 @pytest.mark.asyncio
 class TestRunCancellationReapsChild:
     """``_run`` kills+reaps the spawned child on cancellation (task 2608).
@@ -5088,68 +6929,38 @@ class TestRunCancellationReapsChild:
     ``_run`` on timeout. Before the fix, the spawned child kept running as
     an orphan with its stdout/stderr pipes open, leaking a process + FDs on
     every scheduler sweep for a persistently-hung script.
+
+    Both tests below arrange through ``_start_hung_child``, which returns
+    only once the child has published its pid, so neither cancellation path
+    depends on interpreter-startup timing (task 4109).
     """
 
     async def test_timeout_kills_and_reaps_hung_child(self, tmp_path: Path) -> None:
         pid_file = tmp_path / 'child.pid'
-        # A child that records its own pid then sleeps far longer than the
-        # wait_for timeout below — simulates a persistently-hung script.
-        script = (
-            'import os, time, sys\n'
-            f"open({str(pid_file)!r}, 'w').write(str(os.getpid()))\n"
-            'time.sleep(60)\n'
-        )
+        task, child_pid = await _start_hung_child(pid_file)
+
+        # The wait_for-shaped caller this test exists to model
+        # (delivered_checks._run_script_check) — but driven against an
+        # ALREADY-STARTED future. The child is confirmed alive before the clock
+        # starts, so _CANCEL_TIMEOUT does not have to cover interpreter startup;
+        # it only has to be shorter than the child's 60s sleep. That removed a
+        # fixed 5.0s from every run and the load-sensitive miss with it (task 4109).
         with pytest.raises(asyncio.TimeoutError):
-            await asyncio.wait_for(
-                _run(['python3', '-c', script]), timeout=1.0
-            )
+            await asyncio.wait_for(task, timeout=_CANCEL_TIMEOUT)
 
-        # Wait for the child to have written its pid (should be near-instant).
-        for _ in range(50):
-            if pid_file.exists():
-                break
-            await asyncio.sleep(0.1)
-        assert pid_file.exists(), 'child never started'
-        child_pid = int(pid_file.read_text())
-
-        # The cancelled _run must have killed + reaped the child by now — no
-        # zombie, no orphan still sleeping.
-        for _ in range(50):
-            try:
-                os.kill(child_pid, 0)
-            except ProcessLookupError:
-                break
-            await asyncio.sleep(0.1)
-        else:
-            pytest.fail(f'child pid {child_pid} was not reaped after cancellation')
+        # The cancelled _run must have killed + reaped the child — no zombie,
+        # no orphan still sleeping.
+        await _assert_child_reaped(child_pid)
 
     async def test_cancelled_error_kills_and_reaps_child(self, tmp_path: Path) -> None:
         pid_file = tmp_path / 'child.pid'
-        script = (
-            'import os, time\n'
-            f"open({str(pid_file)!r}, 'w').write(str(os.getpid()))\n"
-            'time.sleep(60)\n'
-        )
-        task = asyncio.ensure_future(_run(['python3', '-c', script]))
-        for _ in range(50):
-            if pid_file.exists():
-                break
-            await asyncio.sleep(0.1)
-        assert pid_file.exists(), 'child never started'
-        child_pid = int(pid_file.read_text())
+        task, child_pid = await _start_hung_child(pid_file)
 
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
 
-        for _ in range(50):
-            try:
-                os.kill(child_pid, 0)
-            except ProcessLookupError:
-                break
-            await asyncio.sleep(0.1)
-        else:
-            pytest.fail(f'child pid {child_pid} was not reaped after cancellation')
+        await _assert_child_reaped(child_pid)
 
 
 def _write_stored_title(worktree: Path, title: str) -> None:
@@ -5158,6 +6969,23 @@ def _write_stored_title(worktree: Path, title: str) -> None:
     task_dir.mkdir(parents=True, exist_ok=True)
     (task_dir / 'metadata.json').write_text(
         json.dumps({'title': title, 'task_id': worktree.name})
+    )
+
+
+def _write_sibling_stored_title(worktree_base: Path, name: str, title: str) -> None:
+    """Write a sibling ``.task-meta/<name>/metadata.json`` carrying *title*.
+
+    Cold-path analogue of :func:`_write_stored_title`: on the cold path the
+    worktree directory does not exist (only the branch survives), so
+    :func:`~orchestrator.worktree_identity.read_worktree_title` can only read
+    the SIBLING ``<worktree_base>/.task-meta/<name>`` root (which survives
+    ``cleanup_worktree``'s removal of the worktree dir), not an in-worktree
+    ``.task`` sidecar.
+    """
+    meta_root = TaskArtifacts.meta_root_for(worktree_base, name)
+    meta_root.mkdir(parents=True, exist_ok=True)
+    (meta_root / 'metadata.json').write_text(
+        json.dumps({'title': title, 'task_id': name})
     )
 
 
@@ -5199,6 +7027,28 @@ class TestWorktreeReuseIdentityGuard:
         assert len(quarantined) == 1
         assert (quarantined[0] / 'spline.rs').exists()
 
+    async def test_mismatch_stamps_the_live_plan_with_the_stored_title(
+        self, git_ops: GitOps,
+    ):
+        info = await git_ops.create_worktree('recycled-plan')
+        _write_stored_title(info.path, 'Trajectory beta: spline solver')
+        live = TaskArtifacts.for_task(info.path, 'recycled-plan')
+        live.task_root.mkdir(parents=True)
+        live.write_plan({'task_id': 'recycled-plan', 'title': 'Cycle-breaker beta: dedup edges', 'steps': []})
+        plan_before = live.read_plan()
+        assert plan_before is not None
+
+        await git_ops.create_worktree(
+            'recycled-plan', expected_title='Cycle-breaker beta: dedup edges',
+        )
+
+        (parking,) = git_ops.quarantine_base.glob('recycled-plan-*')
+        assert json.loads((parking / '.task' / 'plan.json').read_text()) == plan_before
+        (entry,) = live.read_plan()['_quarantined_from']
+        assert entry['reason'] == 'reuse-identity-mismatch'
+        assert entry['stored_title'] == 'Trajectory beta: spline solver'
+        assert entry['parking'] == str(parking)
+
     async def test_none_expected_title_skips_guard(self, git_ops: GitOps):
         info = await git_ops.create_worktree('reuse-noguard')
         _write_stored_title(info.path, 'Original task')
@@ -5207,6 +7057,339 @@ class TestWorktreeReuseIdentityGuard:
         info2 = await git_ops.create_worktree('reuse-noguard')
         assert info2.path == info.path
         assert not git_ops.quarantine_base.exists()
+
+    async def test_mismatch_relocates_foreign_meta_root_to_quarantine(
+        self, git_ops: GitOps,
+    ):
+        """Mirrors TestColdReattachIdentityGuard's
+        test_cold_reattach_mismatch_clears_foreign_meta_root: a confirmed
+        identity mismatch on the REUSE path must also relocate the foreign
+        sibling .task-meta/<id> root alongside the quarantined worktree —
+        not just quarantine the branch. Otherwise the deleted task's
+        plan.json survives at the old path and workflow.py's plan-resume
+        adopts it onto the NEW task; and if it were merely deleted instead
+        of relocated, an operator inspecting the quarantined worktree later
+        would have no record of which task it belonged to."""
+        task_id = 'reuse-clears-meta'
+        info = await git_ops.create_worktree(task_id)
+        meta = TaskArtifacts.meta_root_for(git_ops.worktree_base, task_id)
+        _write_sibling_stored_title(
+            git_ops.worktree_base, task_id, 'Trajectory beta: spline solver',
+        )
+        (meta / 'plan.json').write_text(json.dumps({
+            'task_id': task_id,
+            'title': 'Trajectory beta: spline solver',
+            'steps': [],
+            'confirmed': True,
+        }))
+        (info.path / 'spline.rs').write_text('fn solve() {}\n')
+        await git_ops.commit(info.path, 'trajectory WIP')
+
+        await git_ops.create_worktree(
+            task_id, expected_title='Cycle-breaker beta: dedup edges',
+        )
+
+        assert not (meta / 'plan.json').exists(), (
+            "the deleted task's plan.json must not survive at the old path"
+        )
+        quarantined = list(git_ops.quarantine_base.glob(f'{task_id}-*'))
+        assert len(quarantined) == 1
+        relocated_meta = TaskArtifacts.meta_root_for(
+            git_ops.quarantine_base, quarantined[0].name,
+        )
+        assert (relocated_meta / 'plan.json').exists(), (
+            'the sidecar must be relocated alongside the quarantined '
+            'worktree, not deleted'
+        )
+
+    async def test_match_preserves_meta_root(self, git_ops: GitOps):
+        """A same-task resume (matching title) must keep its own
+        .task-meta artifacts in place — _relocate_foreign_meta_root must
+        never be invoked on a same-task reuse route."""
+        task_id = 'reuse-preserves-meta'
+        await git_ops.create_worktree(task_id)
+        meta = TaskArtifacts.meta_root_for(git_ops.worktree_base, task_id)
+        _write_sibling_stored_title(
+            git_ops.worktree_base, task_id, 'Build the frobnicator',
+        )
+        (meta / 'plan.json').write_text(json.dumps({
+            'task_id': task_id,
+            'title': 'Build the frobnicator',
+            'steps': [],
+            'confirmed': True,
+        }))
+
+        await git_ops.create_worktree(
+            task_id, expected_title='Build the frobnicator',
+        )
+
+        assert (meta / 'plan.json').exists(), (
+            'a same-task resume must preserve its own plan.json in place'
+        )
+
+
+@pytest.mark.asyncio
+class TestColdReattachIdentityGuard:
+    """create_worktree(expected_title=...)'s cold-path γ reattach guard —
+    mirrors TestWorktreeReuseIdentityGuard above, but for the
+    reaped-but-retained shape (worktree dir gone, only the branch survives)
+    instead of a registered worktree."""
+
+    async def test_cold_reattach_mismatch_stamps_the_live_plan_with_the_stored_title(
+        self, git_ops: GitOps,
+    ):
+        await _build_cold_orphan_branch(git_ops, 'cold-stamp')
+        _write_sibling_stored_title(
+            git_ops.worktree_base, 'cold-stamp', 'Trajectory beta: spline solver',
+        )
+        live = TaskArtifacts.for_task(git_ops.worktree_base / 'cold-stamp', 'cold-stamp')
+        live.task_root.mkdir(parents=True, exist_ok=True)
+        live.write_plan({'task_id': 'cold-stamp', 'title': 'Cycle-breaker beta: dedup edges', 'steps': []})
+
+        await git_ops.create_worktree('cold-stamp', expected_title='Cycle-breaker beta: dedup edges')
+
+        (parking,) = git_ops.quarantine_base.glob('cold-stamp-*')
+        assert (parking / '.task' / 'plan.json').is_file()
+        entry = live.read_plan()['_quarantined_from'][-1]
+        assert entry['reason'] == 'cold-reattach-identity-mismatch'
+        assert entry['stored_title'] == 'Trajectory beta: spline solver'
+        assert entry['parking'] == str(parking)
+
+    async def test_cold_reattach_quarantines_on_identity_mismatch(
+        self, git_ops: GitOps, caplog,
+    ):
+        """A recycled task id whose surviving orphan branch belongs to a
+        DIFFERENT (deleted) task must be quarantined — not silently resumed
+        onto the new task."""
+        await _build_cold_orphan_branch(git_ops, 'cold-recycled')
+        _write_sibling_stored_title(
+            git_ops.worktree_base, 'cold-recycled', 'Trajectory beta: spline solver',
+        )
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.git_ops'):
+            info = await git_ops.create_worktree(
+                'cold-recycled', expected_title='Cycle-breaker beta: dedup edges',
+            )
+
+        assert info.path == git_ops.worktree_base / 'cold-recycled'
+        assert info.path.exists()
+        assert (info.path / 'README.md').exists(), 'must carry fresh main content'
+        assert not (info.path / 'orphan_work.py').exists(), (
+            "the foreign orphan's WIP must NOT be resumed onto the new task"
+        )
+
+        # The orphan (dir + branch) was relocated to quarantine, file intact.
+        assert git_ops.quarantine_base.exists()
+        quarantined = list(git_ops.quarantine_base.glob('cold-recycled-*'))
+        assert len(quarantined) == 1
+        assert (quarantined[0] / 'orphan_work.py').exists()
+
+        # The new branch is fresh — no trace of the orphan's commit.
+        rc, count_out, _ = await _run(
+            ['git', 'rev-list', '--count', 'main..task/cold-recycled'],
+            cwd=git_ops.project_root,
+        )
+        assert rc == 0
+        assert int(count_out.strip()) == 0
+
+        # Nothing was destroyed — the quarantined branch still exists.
+        rc, branch_out, _ = await _run(
+            ['git', 'branch', '--list', 'task/cold-recycled-*'],
+            cwd=git_ops.project_root,
+        )
+        assert rc == 0
+        assert branch_out.strip(), 'quarantined branch must survive — nothing destroyed'
+
+        assert any(
+            'mismatch' in r.message.lower() for r in caplog.records
+        ), 'a WARNING naming the identity mismatch must be logged (loud-over-silent)'
+
+    async def test_cold_reattach_mismatch_raises_when_quarantine_fails(
+        self, git_ops: GitOps,
+    ):
+        """If quarantine_worktree cannot relocate the mismatched orphan, the
+        caller must raise an actionable error — never fall through to the
+        opaque `git worktree add -b` collision with the still-present
+        branch and now-attached directory (the exact regression
+        _cleanup_leftover_branch's raise-not-destroy contract eliminated)."""
+        from unittest.mock import AsyncMock
+
+        full_branch = await _build_cold_orphan_branch(git_ops, 'cold-quarantine-fails')
+        _write_sibling_stored_title(
+            git_ops.worktree_base,
+            'cold-quarantine-fails',
+            'Trajectory beta: spline solver',
+        )
+        _, sha_before, _ = await _run(
+            ['git', 'rev-parse', full_branch], cwd=git_ops.project_root,
+        )
+        sha_before = sha_before.strip()
+
+        # quarantine_worktree never raises by contract — it returns
+        # NOT_RELOCATED when it could not relocate. Force that outcome.
+        git_ops.quarantine_worktree = AsyncMock(return_value=NOT_RELOCATED)
+
+        with pytest.raises(RuntimeError) as excinfo:
+            await git_ops.create_worktree(
+                'cold-quarantine-fails',
+                expected_title='Cycle-breaker beta: dedup edges',
+            )
+
+        message = str(excinfo.value)
+        assert 'refus' in message.lower()
+        assert full_branch in message
+        # Must NOT be the opaque fresh-create collision error a blind
+        # fall-through would produce.
+        assert 'Failed to create worktree' not in message
+        assert 'already exists' not in message
+
+        # Nothing was destroyed: the branch and its commit(s) survive intact.
+        rc, sha_after, _ = await _run(
+            ['git', 'rev-parse', full_branch], cwd=git_ops.project_root,
+        )
+        assert rc == 0, 'branch must still exist'
+        assert sha_after.strip() == sha_before, 'commit must be preserved'
+
+        rc, count_out, _ = await _run(
+            ['git', 'rev-list', '--count', f'main..{full_branch}'],
+            cwd=git_ops.project_root,
+        )
+        assert rc == 0
+        assert int(count_out.strip()) > 0, 'branch must still carry commits beyond main'
+
+    async def test_cold_reattach_resumes_on_title_match(self, git_ops: GitOps):
+        """A matching stored title must resume the orphan's WIP, not
+        quarantine it."""
+        await _build_cold_orphan_branch(git_ops, 'cold-match')
+        _write_sibling_stored_title(
+            git_ops.worktree_base, 'cold-match', 'Cycle-breaker beta: dedup edges',
+        )
+
+        info = await git_ops.create_worktree(
+            'cold-match', expected_title='Cycle-breaker beta: dedup edges',
+        )
+
+        assert (info.path / 'orphan_work.py').exists(), 'matching WIP must be resumed'
+        assert not git_ops.quarantine_base.exists()
+
+    async def test_cold_reattach_fails_open_on_titleless_orphan(self, git_ops: GitOps):
+        """A legacy orphan with no readable stored title must never be
+        quarantined — identities_match fails open."""
+        await _build_cold_orphan_branch(git_ops, 'cold-titleless')
+        # No .task-meta root written at all.
+
+        info = await git_ops.create_worktree(
+            'cold-titleless', expected_title='Some live task',
+        )
+
+        assert (info.path / 'orphan_work.py').exists(), 'title-less orphan must resume'
+        assert not git_ops.quarantine_base.exists()
+
+    async def test_cold_reattach_guard_skipped_when_expected_title_none(
+        self, git_ops: GitOps,
+    ):
+        """expected_title=None (the default) must skip the guard entirely,
+        exactly like the REUSE path's equivalent test."""
+        await _build_cold_orphan_branch(git_ops, 'cold-noguard')
+        _write_sibling_stored_title(
+            git_ops.worktree_base, 'cold-noguard', 'Some unrelated foreign task',
+        )
+
+        info = await git_ops.create_worktree('cold-noguard')
+
+        assert (info.path / 'orphan_work.py').exists(), 'guard opt-in only — must resume'
+        assert not git_ops.quarantine_base.exists()
+
+    async def test_cold_reattach_mismatch_clears_foreign_meta_root(
+        self, git_ops: GitOps,
+    ):
+        """A confirmed identity mismatch must also clear the foreign sibling
+        .task-meta/<id> root at its ORIGINAL path — otherwise the deleted
+        task's plan.json survives there and workflow.py's plan-resume adopts
+        it onto the NEW task (the cited reify task 3770 misattribution).
+        Quarantining only the branch leaves this half of the hole open. The
+        sidecar itself must not be destroyed, though — it is relocated
+        alongside the quarantined worktree, not deleted (it is the only
+        record tying the quarantined branch back to its original task)."""
+        task_id = 'cold-clears-meta'
+        await _build_cold_orphan_branch(git_ops, task_id)
+        meta = TaskArtifacts.meta_root_for(git_ops.worktree_base, task_id)
+        _write_sibling_stored_title(
+            git_ops.worktree_base, task_id, 'Trajectory beta: spline solver',
+        )
+        (meta / 'plan.json').write_text(json.dumps({
+            'task_id': task_id,
+            'title': 'Trajectory beta: spline solver',
+            'steps': [],
+            'confirmed': True,
+        }))
+
+        await git_ops.create_worktree(
+            task_id, expected_title='Cycle-breaker beta: dedup edges',
+        )
+
+        assert not (meta / 'plan.json').exists(), (
+            "the deleted task's plan.json must not survive at the old path"
+        )
+
+        # ...and must reappear alongside the quarantined worktree, not be
+        # destroyed outright.
+        quarantined = list(git_ops.quarantine_base.glob(f'{task_id}-*'))
+        assert len(quarantined) == 1
+        relocated_meta = TaskArtifacts.meta_root_for(
+            git_ops.quarantine_base, quarantined[0].name,
+        )
+        assert (relocated_meta / 'plan.json').exists(), (
+            'the sidecar must be relocated alongside the quarantined '
+            'worktree, not deleted'
+        )
+
+    async def test_cold_reattach_match_preserves_meta_root(self, git_ops: GitOps):
+        """A same-task resume (matching title) must keep its own
+        .task-meta artifacts intact IN PLACE — _relocate_foreign_meta_root
+        (like _clear_foreign_meta_root before it) must never be invoked on
+        a same-task reuse route, which owns and must preserve its own
+        artifacts."""
+        task_id = 'cold-preserves-meta'
+        await _build_cold_orphan_branch(git_ops, task_id)
+        meta = TaskArtifacts.meta_root_for(git_ops.worktree_base, task_id)
+        _write_sibling_stored_title(
+            git_ops.worktree_base, task_id, 'Cycle-breaker beta: dedup edges',
+        )
+        (meta / 'plan.json').write_text(json.dumps({
+            'task_id': task_id,
+            'title': 'Cycle-breaker beta: dedup edges',
+            'steps': [],
+            'confirmed': True,
+        }))
+
+        await git_ops.create_worktree(
+            task_id, expected_title='Cycle-breaker beta: dedup edges',
+        )
+
+        assert (meta / 'plan.json').exists(), (
+            'a same-task resume must preserve its own plan.json'
+        )
+
+
+async def _drop_admin_entry(git_ops: GitOps, worktree: Path) -> None:
+    """Delete *worktree*'s ``.git/worktrees/<name>`` admin entry: the 2097 orphaned-registration state."""
+    rc, admin_dir, err = await _run(['git', 'rev-parse', '--absolute-git-dir'], cwd=worktree)
+    assert rc == 0, err
+    shutil.rmtree(admin_dir.strip())
+    assert str(worktree.resolve()) not in registered_worktree_paths(git_ops.project_root)
+
+
+async def _branches_matching(git_ops: GitOps, pattern: str) -> str:
+    rc, branches, err = await _run(['git', 'branch', '--list', pattern], cwd=git_ops.project_root)
+    assert rc == 0, err
+    return branches.strip()
+
+
+async def _checked_out_ref(worktree: Path) -> str:
+    rc, ref, err = await _run(['git', 'rev-parse', '--symbolic-full-name', 'HEAD'], cwd=worktree)
+    assert rc == 0, err
+    return ref.strip()
 
 
 @pytest.mark.asyncio
@@ -5235,8 +7418,9 @@ class TestOrphanWorktreeHelpers:
         )
         (wt / conflicted_path).write_text(marker_content)
 
-        dest = await git_ops.quarantine_worktree(wt, 'q-conflict-task', 'unit-test')
+        outcome = await git_ops.quarantine_worktree(wt, 'q-conflict-task', 'unit-test')
 
+        dest = outcome.dest
         assert dest is not None
         assert dest.parent == git_ops.quarantine_base
         assert not wt.exists()  # still relocated despite the refused commit
@@ -5253,8 +7437,9 @@ class TestOrphanWorktreeHelpers:
         (info.path / 'work.py').write_text('x = 1\n')
         await git_ops.commit(info.path, 'committed work')
 
-        dest = await git_ops.quarantine_worktree(info.path, 'q-task', 'unit-test')
+        outcome = await git_ops.quarantine_worktree(info.path, 'q-task', 'unit-test')
 
+        dest = outcome.dest
         assert dest is not None
         assert dest.parent == git_ops.quarantine_base
         assert (dest / 'work.py').exists()  # committed work preserved
@@ -5264,6 +7449,323 @@ class TestOrphanWorktreeHelpers:
             ['git', 'branch', '--list', 'task/q-task'], cwd=git_ops.project_root,
         )
         assert branches.strip() == ''
+
+    async def test_quarantine_outcome_describes_the_parked_branch(self, git_ops: GitOps):
+        info = await git_ops.create_worktree('q-count')
+        (info.path / 'one.py').write_text('a = 1\n')
+        await git_ops.commit(info.path, 'first commit beyond main')
+        (info.path / 'two.py').write_text('b = 2\n')
+        await git_ops.commit(info.path, 'second commit beyond main')
+
+        outcome = await git_ops.quarantine_worktree(info.path, 'q-count', 'unit-test')
+
+        assert outcome.dest is not None
+        parked_branch = f'task/{outcome.dest.name}'
+        assert outcome.branch == parked_branch
+        assert outcome.tip_sha is not None
+        assert await git_ops.resolve_branch_sha(parked_branch) == outcome.tip_sha
+        assert outcome.unique_commit_count == 2
+
+    async def test_commits_beyond_main_counts_or_reports_none(self, git_ops: GitOps):
+        info = await git_ops.create_worktree('q-beyond')
+        assert await git_ops.commits_beyond_main('task/q-beyond') == 0
+        (info.path / 'one.py').write_text('a = 1\n')
+        await git_ops.commit(info.path, 'a commit beyond main')
+
+        assert await git_ops.commits_beyond_main('task/q-beyond') == 1
+        assert await git_ops.commits_beyond_main('task/no-such-branch') is None
+
+    async def test_quarantine_accepts_a_full_ref(self, git_ops: GitOps):
+        info = await git_ops.create_worktree('q-full')
+        (info.path / 'work.py').write_text('x = 1\n')
+        await git_ops.commit(info.path, 'committed work')
+
+        outcome = await git_ops.quarantine_worktree(info.path, 'task/q-full', 'unit-test')
+
+        dest = outcome.dest
+        assert dest is not None
+        assert dest.parent == git_ops.quarantine_base
+        assert dest.name.startswith('q-full-')
+        assert not (git_ops.quarantine_base / 'task').exists()
+        parked_branch = f'task/{dest.name}'
+        assert outcome.branch == parked_branch
+        assert await git_ops.resolve_branch_sha(parked_branch) is not None
+        assert await _branches_matching(git_ops, 'task/q-full') == ''
+        assert await _branches_matching(git_ops, 'task/task/*') == ''
+        assert not info.path.exists()
+
+    async def test_quarantine_relocates_an_unregistered_worktree(self, git_ops: GitOps):
+        info = await git_ops.create_worktree('q-orphan')
+        (info.path / 'work.py').write_text('x = 1\n')
+        await git_ops.commit(info.path, 'committed work')
+        await _drop_admin_entry(git_ops, info.path)
+
+        outcome = await git_ops.quarantine_worktree(info.path, 'q-orphan', 'unit-test')
+
+        assert not info.path.exists()
+        assert outcome.dest is not None
+        assert (outcome.dest / 'work.py').read_text() == 'x = 1\n'
+        assert outcome.branch is not None
+        assert await git_ops.resolve_branch_sha(outcome.branch) is not None
+        assert outcome.unique_commit_count == 1
+        assert await git_ops.resolve_branch_sha('task/q-orphan') is None
+
+    async def test_quarantine_unregistered_dir_without_branch(self, git_ops: GitOps):
+        info = await git_ops.create_worktree('q-nobranch')
+        await _drop_admin_entry(git_ops, info.path)
+        rc, _, err = await _run(['git', 'branch', '-D', 'task/q-nobranch'], cwd=git_ops.project_root)
+        assert rc == 0, err
+
+        outcome = await git_ops.quarantine_worktree(info.path, 'q-nobranch', 'unit-test')
+
+        assert not info.path.exists()
+        assert outcome.dest is not None
+        assert outcome.dest.is_dir()
+        assert outcome.branch is None
+
+    async def test_an_unregistered_parking_never_aliases_the_reused_slot(self, git_ops: GitOps):
+        info = await git_ops.create_worktree('q-alias')
+        (info.path / 'work.py').write_text('x = 1\n')
+        await git_ops.commit(info.path, 'committed work')
+        (info.path / 'wip.py').write_text('uncommitted\n')
+        await _drop_admin_entry(git_ops, info.path)
+
+        outcome = await git_ops.quarantine_worktree(info.path, 'q-alias', 'unit-test')
+        assert outcome.dest is not None
+        rc, _, err = await _run(
+            ['git', 'worktree', 'add', '-b', 'task/q-alias-next', str(info.path)],
+            cwd=git_ops.project_root,
+        )
+        assert rc == 0, err
+
+        rc, head, _ = await _run(['git', 'rev-parse', '--abbrev-ref', 'HEAD'], cwd=outcome.dest)
+        assert rc != 0, f'git in the parking resolved to a checkout: {head!r}'
+        assert (outcome.dest / 'wip.py').read_text() == 'uncommitted\n'
+
+    async def test_quarantine_snapshots_and_stamps_provenance(self, git_ops: GitOps):
+        info = await git_ops.create_worktree('q-prov')
+        ta = TaskArtifacts.for_task(info.path, 'q-prov')
+        ta.init('q-prov', 'Provenance', 'd')
+        ta.write_plan({
+            'task_id': 'q-prov',
+            'title': 'Provenance',
+            'steps': [
+                {'id': 'step-1', 'description': 'red', 'status': 'done', 'commit': 'abc'},
+                {'id': 'step-2', 'description': 'green', 'status': 'pending'},
+            ],
+        })
+        ta.ensure_lane_symlinks()
+        (info.path / 'work.py').write_text('x = 1\n')
+        await git_ops.commit(info.path, 'committed work')
+        plan_before = ta.read_plan()
+
+        outcome = await git_ops.quarantine_worktree(info.path, 'q-prov', 'unit-test')
+
+        assert outcome.dest is not None
+        parked_plan = outcome.dest / '.task' / 'plan.json'
+        assert parked_plan.is_file()
+        assert not parked_plan.is_symlink()
+        assert json.loads(parked_plan.read_text()) == plan_before
+        parked_metadata = outcome.dest / '.task' / 'metadata.json'
+        assert parked_metadata.is_file()
+        assert not parked_metadata.is_symlink()
+        stamp = TaskArtifacts.for_task(info.path, 'q-prov').read_plan()['_quarantined_from'][-1]
+        assert stamp['branch'] == outcome.branch
+        assert stamp['tip_sha'] == outcome.tip_sha
+        assert stamp['unique_commit_count'] == 1
+        assert stamp['parking'] == str(outcome.dest)
+
+    async def test_quarantine_without_a_plan_writes_no_plan(self, git_ops: GitOps):
+        info = await git_ops.create_worktree('q-noplan')
+        (info.path / 'work.py').write_text('x = 1\n')
+        await git_ops.commit(info.path, 'committed work')
+
+        outcome = await git_ops.quarantine_worktree(info.path, 'q-noplan', 'unit-test')
+
+        assert outcome.dest is not None
+        assert not TaskArtifacts.for_task(info.path, 'q-noplan').artifact_path('plan.json').exists()
+
+    async def test_quarantine_never_renames_a_branch_another_worktree_holds(
+        self, git_ops: GitOps,
+    ):
+        holder = await git_ops.create_worktree('q-held')
+        (holder.path / 'held.py').write_text('h = 1\n')
+        await git_ops.commit(holder.path, 'held work')
+        held_tip = await git_ops.resolve_branch_sha('task/q-held')
+        foreign = await git_ops.create_worktree('q-foreign')
+        (foreign.path / 'wip.py').write_text('w = 1\n')
+
+        outcome = await git_ops.quarantine_worktree(
+            foreign.path, 'q-held', 'recovery-record-divergence',
+        )
+
+        assert outcome.dest is not None
+        assert outcome.dest.parent == git_ops.quarantine_base
+        assert not foreign.path.exists()
+        assert outcome.branch is None
+        assert outcome.tip_sha is None
+        assert outcome.unique_commit_count is None
+        assert await _checked_out_ref(holder.path) == 'refs/heads/task/q-held'
+        assert await git_ops.resolve_branch_sha('task/q-held') == held_tip
+        assert await _branches_matching(git_ops, 'task/q-held-*') == ''
+        assert await _checked_out_ref(outcome.dest) == 'refs/heads/task/q-foreign'
+        assert (outcome.dest / 'wip.py').exists()
+        assert await git_ops.commits_beyond_main('task/q-foreign') == 0
+
+    async def test_quarantine_parks_the_branch_of_a_detached_worktree(self, git_ops: GitOps):
+        info = await git_ops.create_worktree('q-detached')
+        (info.path / 'work.py').write_text('x = 1\n')
+        await git_ops.commit(info.path, 'committed work')
+        tip = await git_ops.resolve_branch_sha('task/q-detached')
+        rc, _, err = await _run(['git', 'checkout', '--detach'], cwd=info.path)
+        assert rc == 0, err
+
+        outcome = await git_ops.quarantine_worktree(info.path, 'q-detached', 'unit-test')
+
+        assert outcome.dest is not None
+        assert not info.path.exists()
+        assert outcome.branch is not None
+        assert outcome.tip_sha == tip
+        assert outcome.unique_commit_count == 1
+        assert await git_ops.resolve_branch_sha('task/q-detached') is None
+
+    async def test_parking_a_detached_cold_incarnation_leaves_no_task_branch(
+        self, git_ops: GitOps,
+    ):
+        info = await git_ops.create_worktree('q-recut')
+        (info.path / 'work.py').write_text('x = 1\n')
+        await git_ops.commit(info.path, 'committed work')
+        tip = await git_ops.resolve_branch_sha('task/q-recut')
+        rc, _, err = await _run(['git', 'checkout', '--detach'], cwd=info.path)
+        assert rc == 0, err
+
+        parked = await git_ops.park_prior_incarnation('q-recut', reason='recut')
+
+        assert parked is not None and parked.parked_branch is not None
+        assert await git_ops.resolve_branch_sha('task/q-recut') is None
+        assert await git_ops.resolve_branch_sha(parked.parked_branch) == tip
+        assert parked.parked_tip == tip
+        assert parked.quarantined_worktree is not None
+        assert not info.path.exists()
+
+    async def test_a_failed_unregistered_move_restores_branch_and_gitfile(self, git_ops: GitOps):
+        info = await git_ops.create_worktree('q-rollback')
+        (info.path / 'work.py').write_text('x = 1\n')
+        await git_ops.commit(info.path, 'committed work')
+        tip = await git_ops.resolve_branch_sha('task/q-rollback')
+        await _drop_admin_entry(git_ops, info.path)
+        gitfile_before = (info.path / '.git').read_bytes()
+        git_ops.quarantine_base.parent.mkdir(parents=True, exist_ok=True)
+        git_ops.quarantine_base.write_text('not a directory\n')
+
+        outcome = await git_ops.quarantine_worktree(info.path, 'q-rollback', 'unit-test')
+
+        assert outcome.dest is None
+        assert info.path.is_dir()
+        assert await git_ops.resolve_branch_sha('task/q-rollback') == tip
+        assert await _branches_matching(git_ops, 'task/q-rollback-*') == ''
+        assert (info.path / '.git').read_bytes() == gitfile_before
+
+    async def test_a_failed_registered_move_restores_the_branch_checkout(self, git_ops: GitOps):
+        info = await git_ops.create_worktree('q-held-rollback')
+        (info.path / 'work.py').write_text('x = 1\n')
+        await git_ops.commit(info.path, 'committed work')
+        tip = await git_ops.resolve_branch_sha('task/q-held-rollback')
+        git_ops.quarantine_base.parent.mkdir(parents=True, exist_ok=True)
+        git_ops.quarantine_base.write_text('not a directory\n')
+
+        outcome = await git_ops.quarantine_worktree(info.path, 'q-held-rollback', 'unit-test')
+
+        assert outcome == NOT_RELOCATED
+        assert info.path.is_dir()
+        assert await _checked_out_ref(info.path) == 'refs/heads/task/q-held-rollback'
+        assert await git_ops.resolve_branch_sha('task/q-held-rollback') == tip
+        assert await _branches_matching(git_ops, 'task/q-held-rollback-*') == ''
+
+    async def test_a_failed_move_whose_branch_cannot_be_renamed_back_names_the_stranded_ref(
+        self, git_ops: GitOps, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+    ):
+        info = await git_ops.create_worktree('q-stranded')
+        (info.path / 'work.py').write_text('x = 1\n')
+        await git_ops.commit(info.path, 'committed work')
+        tip = await git_ops.resolve_branch_sha('task/q-stranded')
+        await _drop_admin_entry(git_ops, info.path)
+        project_root = git_ops.project_root
+
+        def rename_after_a_rival_takes_the_branch_name(source: object, destination: object) -> None:
+            subprocess.run(['git', 'branch', 'task/q-stranded', 'HEAD'], cwd=project_root, check=True)
+            raise OSError(18, 'Invalid cross-device link')
+
+        monkeypatch.setattr(os, 'rename', rename_after_a_rival_takes_the_branch_name)
+        with caplog.at_level(logging.ERROR, logger='orchestrator.git_ops'):
+            outcome = await git_ops.quarantine_worktree(info.path, 'q-stranded', 'unit-test')
+
+        assert outcome.dest is None
+        assert info.path.is_dir()
+        assert outcome.branch is not None
+        assert outcome.branch.startswith('task/q-stranded-')
+        assert outcome.tip_sha == tip
+        assert outcome.unique_commit_count == 1
+        assert await git_ops.resolve_branch_sha(outcome.branch) == tip
+        assert f'STRANDED on {outcome.branch}' in caplog.text
+        assert outcome.event_data('unit-test')['branch'] == outcome.branch
+
+    async def test_a_parked_branch_that_cannot_be_measured_is_still_reported_moved(
+        self, git_ops: GitOps, monkeypatch: pytest.MonkeyPatch,
+    ):
+        info = await git_ops.create_worktree('q-unmeasured')
+        (info.path / 'work.py').write_text('x = 1\n')
+        await git_ops.commit(info.path, 'committed work')
+
+        async def unmeasurable(full_branch: str) -> int | None:
+            raise RuntimeError(f'cannot count {full_branch}')
+
+        monkeypatch.setattr(git_ops, 'commits_beyond_main', unmeasurable)
+        outcome = await git_ops.quarantine_worktree(info.path, 'q-unmeasured', 'unit-test')
+
+        assert outcome.dest is not None
+        assert not info.path.exists()
+        assert outcome.branch == f'task/{outcome.dest.name}'
+        assert outcome.tip_sha is None
+        assert outcome.unique_commit_count is None
+
+    async def test_quarantine_relocates_a_registered_worktree_without_the_branch(
+        self, git_ops: GitOps,
+    ):
+        other = await git_ops.create_worktree('q-other')
+
+        outcome = await git_ops.quarantine_worktree(
+            other.path, 'q-absent', 'recovery-record-divergence',
+        )
+
+        assert outcome.dest is not None
+        assert not other.path.exists()
+        assert outcome.branch is None
+        assert str(outcome.dest.resolve()) in registered_worktree_paths(git_ops.project_root)
+
+    async def test_quarantine_unregistered_dir_leaves_a_branch_checked_out_elsewhere(
+        self, git_ops: GitOps, tmp_path: Path,
+    ):
+        orphan = await git_ops.create_worktree('q-split')
+        (orphan.path / 'work.py').write_text('x = 1\n')
+        await git_ops.commit(orphan.path, 'committed work')
+        await _drop_admin_entry(git_ops, orphan.path)
+        live = tmp_path / 'live-q-split'
+        rc, _, err = await _run(
+            ['git', 'worktree', 'add', str(live), 'task/q-split'], cwd=git_ops.project_root,
+        )
+        assert rc == 0, err
+
+        outcome = await git_ops.quarantine_worktree(
+            orphan.path, 'q-split', 'recovery-record-divergence',
+        )
+
+        assert outcome.dest is not None
+        assert not orphan.path.exists()
+        assert outcome.branch is None
+        assert await _checked_out_ref(live) == 'refs/heads/task/q-split'
+        assert await git_ops.resolve_branch_sha('task/q-split') is not None
+        assert await _branches_matching(git_ops, 'task/q-split-*') == ''
 
     async def test_unsaved_work_false_when_clean_no_commits(self, git_ops: GitOps):
         info = await git_ops.create_worktree('clean-wt')
@@ -5341,7 +7843,6 @@ class TestCreateWorktreeTrain:
         info = await git_ops.create_worktree('feature-notrain', train=None)
 
         assert info.base_commit == main_sha
-        assert info.stale_commits is None  # no remote in git_repo fixture
 
     async def test_train_order_zero_degenerate(self, git_ops: GitOps):
         """order=0 is degenerate — must branch from main, same as train=None."""
@@ -5380,17 +7881,14 @@ class TestCreateWorktreeTrain:
         # (1) WorktreeInfo.base_commit == α's branch tip SHA
         assert beta_info.base_commit == alpha_tip
 
-        # (2) stale_commits is None for train-based worktrees
-        assert beta_info.stale_commits is None
-
-        # (3) git merge-base task/beta task/alpha == α's tip (β forks from α)
+        # (2) git merge-base task/beta task/alpha == α's tip (β forks from α)
         _, mb, _ = await _run(
             ['git', 'merge-base', 'task/beta', 'task/alpha'],
             cwd=git_ops.project_root,
         )
         assert mb.strip() == alpha_tip
 
-        # (4) git log task/beta..task/alpha is empty (β already has all of α's commits)
+        # (3) git log task/beta..task/alpha is empty (β already has all of α's commits)
         _, log_out, _ = await _run(
             ['git', 'log', 'task/beta..task/alpha', '--oneline'],
             cwd=git_ops.project_root,
@@ -5613,7 +8111,7 @@ class TestFindInflightMergeWorktree:
     """Tests for GitOps.find_inflight_merge_worktree(branch).
 
     Uses real _merge-* worktrees created by merge_to_main, verified via HEAD
-    subject matching against _merge_subject.
+    subject matching against format_merge_subject.
     """
 
     async def _make_branch_with_commit(
@@ -5866,18 +8364,9 @@ class TestPersistentMergeWorktree:
         assert warm_path.exists()
 
         # Path is a registered git worktree
-        rc, out, _ = await _run(
-            ['git', 'worktree', 'list', '--porcelain'],
-            cwd=git_ops.project_root,
-        )
-        assert rc == 0
-        registered_paths = [
-            line[len('worktree '):].strip()
-            for line in out.splitlines()
-            if line.startswith('worktree ')
-        ]
-        assert str(warm_path) in registered_paths, (
-            f'_merge-verify not in registered worktrees: {registered_paths}'
+        registered = registered_worktree_paths(git_ops.project_root)
+        assert str(warm_path.resolve()) in registered, (
+            f'_merge-verify not in registered worktrees: {registered}'
         )
 
         # HEAD of warm worktree == merge_commit
@@ -6048,27 +8537,17 @@ class TestPersistentMergeWorktree:
         # Simulate shape-1: remove the .git/worktrees/<name> admin dir the
         # lane's .git pointer names — registration is gone while the on-disk
         # tree survives, exactly the interrupted-teardown on-disk shape.
-        shutil.rmtree(_lane_admin_dir(merge_wt))
+        shutil.rmtree(lane_admin_dir(merge_wt))
+        registered = registered_worktree_paths(git_ops.project_root)
+        assert str(merge_wt.resolve()) not in registered, (
+            f'shape-1 leak must be unregistered once its admin dir is gone (setup check): {registered}'
+        )
 
         await git_ops.cleanup_merge_worktree(merge_wt)
 
         # The on-disk tree is gone...
         assert not merge_wt.exists(), (
             'shape-1 leak tree must be removed by crash-safe cleanup'
-        )
-        # ...absent from git worktree list...
-        rc, out, _ = await _run(
-            ['git', 'worktree', 'list', '--porcelain'],
-            cwd=git_ops.project_root,
-        )
-        assert rc == 0
-        registered = [
-            line[len('worktree '):].strip()
-            for line in out.splitlines()
-            if line.startswith('worktree ')
-        ]
-        assert str(merge_wt) not in registered, (
-            f'shape-1 leak must be gone from git worktree list: {registered}'
         )
         # ...and NO _merge-* directory OR sibling .lock orphan survives under
         # worktree_base (task 2924's strict no-leak glob).
@@ -6283,18 +8762,9 @@ class TestPersistentOfflineDeepWorktree:
         assert warm_path.exists()
 
         # Path is a registered git worktree
-        rc, out, _ = await _run(
-            ['git', 'worktree', 'list', '--porcelain'],
-            cwd=git_ops.project_root,
-        )
-        assert rc == 0
-        registered_paths = [
-            line[len('worktree '):].strip()
-            for line in out.splitlines()
-            if line.startswith('worktree ')
-        ]
-        assert str(warm_path) in registered_paths, (
-            f'_offline-deep not in registered worktrees: {registered_paths}'
+        registered = registered_worktree_paths(git_ops.project_root)
+        assert str(warm_path.resolve()) in registered, (
+            f'_offline-deep not in registered worktrees: {registered}'
         )
 
         # HEAD of warm worktree == merge_commit
@@ -6900,55 +9370,81 @@ class TestParseDiffLineRanges:
 
 @pytest.mark.asyncio
 class TestGetChangedLineRanges:
-    """Unit tests for GitOps.get_changed_line_ranges."""
+    """PRD merge-pre-verify-screen §7 S1.3 ref: real git, not a mocked ``_run``."""
 
-    async def test_invokes_correct_git_command(self, git_config, git_repo):
-        """Verify that git diff is called with main...ref --unified=0 --no-color."""
-        ops = GitOps(git_config, git_repo)
-        ref = 'task/123'
+    @staticmethod
+    def _commit_on(repo: Path, branch: str, name: str, text: str = 'changed\n') -> None:
+        _git(repo, 'checkout', '-q', '-b', branch, 'main')
+        (repo / name).write_text(text)
+        _git(repo, 'add', name)
+        _git(repo, 'commit', '-q', '-m', f'add {name}')
+        _git(repo, 'checkout', '-q', 'main')
 
-        captured_cmds: list[list[str]] = []
-
-        async def mock_run(cmd, cwd=None):
-            captured_cmds.append(cmd)
-            return (0, CANNED_DIFF_TWO_FILES, '')
-
-        with patch('orchestrator.git_ops._run', side_effect=mock_run):
-            await ops.get_changed_line_ranges(ref)
-
-        assert len(captured_cmds) == 1
-        cmd = captured_cmds[0]
-        assert 'git' in cmd
-        assert 'diff' in cmd
-        assert f'{git_config.main_branch}...{ref}' in cmd
-        assert '--unified=0' in cmd
-        assert '--no-color' in cmd
-
-    async def test_returns_parsed_ranges(self, git_config, git_repo):
-        """Verify the returned dict matches parse_diff_line_ranges output."""
-        from orchestrator.git_ops import parse_diff_line_ranges
-        ops = GitOps(git_config, git_repo)
-        ref = 'task/456'
-
-        async def mock_run(cmd, cwd=None):
-            return (0, CANNED_DIFF_TWO_FILES, '')
-
-        with patch('orchestrator.git_ops._run', side_effect=mock_run):
-            result = await ops.get_changed_line_ranges(ref)
-
-        expected = parse_diff_line_ranges(CANNED_DIFF_TWO_FILES)
-        assert result == expected
-
-    async def test_empty_diff_returns_empty_dict(self, git_config, git_repo):
+    async def test_returns_exact_old_side_ranges_whatever_the_colour_config(
+        self, git_config, git_repo,
+    ):
+        lines = [f'line {n}\n' for n in range(1, 11)]
+        (git_repo / 'lines.txt').write_text(''.join(lines))
+        _git(git_repo, 'add', 'lines.txt')
+        _git(git_repo, 'commit', '-q', '-m', 'add lines.txt')
+        lines[4] = 'line 5 changed\n'
+        self._commit_on(git_repo, 'task/31', 'lines.txt', ''.join(lines))
+        _git(git_repo, 'config', 'color.ui', 'always')
         ops = GitOps(git_config, git_repo)
 
-        async def mock_run(cmd, cwd=None):
-            return (0, '', '')
+        result = await ops.get_changed_line_ranges('31')
 
-        with patch('orchestrator.git_ops._run', side_effect=mock_run):
-            result = await ops.get_changed_line_ranges('task/789')
+        assert result == {'lines.txt': [(5, 5)]}
 
-        assert result == {}
+    async def test_branch_with_no_commits_returns_empty_dict(self, git_config, git_repo):
+        _git(git_repo, 'branch', 'task/789', 'main')
+        ops = GitOps(git_config, git_repo)
+
+        assert await ops.get_changed_line_ranges('789') == {}
+
+    async def test_bare_id_diffs_the_task_branch_not_a_same_named_ref(self, git_config, git_repo):
+        self._commit_on(git_repo, 'task/5563', 'task_file.txt')
+        self._commit_on(git_repo, '5563', 'unrelated_file.txt')
+        ops = GitOps(git_config, git_repo)
+
+        result = await ops.get_changed_line_ranges('5563')
+
+        assert set(result) == {'task_file.txt'}
+
+    async def test_bare_id_never_resolves_as_an_abbreviated_commit_sha(
+        self, git_config, git_repo,
+    ):
+        self._commit_on(git_repo, 'scratch', 'unrelated_file.txt')
+        abbrev = subprocess.run(
+            ['git', 'rev-parse', '--short=7', 'scratch'],
+            cwd=git_repo, check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        _git(git_repo, 'branch', '-q', '-D', 'scratch')
+        self._commit_on(git_repo, f'task/{abbrev}', 'task_file.txt')
+        ops = GitOps(git_config, git_repo)
+
+        result = await ops.get_changed_line_ranges(abbrev)
+
+        assert set(result) == {'task_file.txt'}
+
+    async def test_prefixed_ref_still_works(self, git_config, git_repo):
+        self._commit_on(git_repo, 'task/77', 'task_file.txt')
+        ops = GitOps(git_config, git_repo)
+
+        result = await ops.get_changed_line_ranges('task/77')
+
+        assert set(result) == {'task_file.txt'}
+
+    async def test_missing_ref_raises_naming_ref_rc_and_stderr(self, git_config, git_repo):
+        ops = GitOps(git_config, git_repo)
+
+        with pytest.raises(GitQueryFailed) as excinfo:
+            await ops.get_changed_line_ranges('9999')
+
+        message = str(excinfo.value)
+        assert 'main...task/9999' in message
+        assert 'exited 128' in message
+        assert 'task/9999' in message.partition('exited 128')[2]
 
 
 # ---------------------------------------------------------------------------
@@ -7918,7 +10414,7 @@ class TestRecoverRedMain:
             git_repo,
         )
         target_sha, expected_main = await self._two_main_shas(git_repo)
-        # git_repo starts on main (git init -b main in _setup_repo)
+        # git_repo starts on main (git init -b main in _git_fixtures.py::build_repo)
 
         original_run = _run
         recorded: list[list[str]] = []
@@ -8078,7 +10574,7 @@ class TestWarmLaneScriptsHelperIsolation:
     async def test_cannot_commit_into_an_enclosing_repo(self, tmp_path: Path):
         sentinel = tmp_path / 'live-worktree'
         sentinel.mkdir()
-        await _setup_repo(sentinel)
+        seed_repo(sentinel)
 
         # Stand-in for a pytest basetemp nested inside that live worktree.
         nested = sentinel / '.pytest-tmp' / 'test_x0'
@@ -8123,7 +10619,7 @@ class TestCreateWorktreeWarmLaneRouting:
 
     @pytest.fixture(autouse=True)
     def _warm_base(self, git_repo: Path) -> None:
-        _seed_default_warm_base(git_repo)
+        seed_default_warm_base(git_repo)
 
     async def test_warm_path_returns_lane_not_branch_named_dir(
         self, git_repo: Path,
@@ -8274,7 +10770,7 @@ class TestCleanupWorktreePoolAware:
 
     @pytest.fixture(autouse=True)
     def _warm_base(self, git_repo: Path) -> None:
-        _seed_default_warm_base(git_repo)
+        seed_default_warm_base(git_repo)
 
     async def test_cleanup_lane_not_removed(
         self, git_repo: Path,
@@ -8445,7 +10941,7 @@ class TestCreateWorktreeRequeueAndRecycledId:
 
     @pytest.fixture(autouse=True)
     def _warm_base(self, git_repo: Path) -> None:
-        _seed_default_warm_base(git_repo)
+        seed_default_warm_base(git_repo)
 
     def _warm_config(self) -> GitConfig:
         return GitConfig(
@@ -8543,12 +11039,20 @@ class TestCreateWorktreeRequeueAndRecycledId:
         await git_ops.cleanup_worktree(lane, 'A')
         assert plan_file.exists(), 'prereq: plan.json must still exist after cleanup'
 
+        # Seed the lane→task routing key so the disk backstop MATCHES and the
+        # identity guard this test exists to prove is genuinely reached.
+        meta_root = TaskArtifacts.meta_root_for(lane.parent, lane.name)
+        meta_root.mkdir(parents=True, exist_ok=True)
+        (meta_root / 'metadata.json').write_text(
+            '{"task_id": "A", "title": "Old Task"}'
+        )
+
         # NEW task with recycled id 'A' but DIFFERENT title — should NOT inherit plan
         info2 = await git_ops.create_worktree('A', expected_title='New Task')
         assert info2.path == lane  # same pool lane
 
-        # TODAY: disk backstop reuses (task_id 'A' == 'A') → plan.json inherited → FAIL
-        # AFTER step-26: identity mismatch ('Old Task' != 'New Task') → fresh reset → plan gone
+        # Without the guard: disk backstop reuses (task_id 'A' == 'A') → plan inherited
+        # With it: identity mismatch ('Old Task' != 'New Task') → fresh reset → plan gone
         assert not plan_file.exists(), (
             'Recycled-id task MUST NOT inherit the prior task\'s plan.json '
             '(identity guard should route to fresh reset)'
@@ -8734,12 +11238,9 @@ class TestGetMergeCommitDiffFiles:
 
 @pytest.mark.asyncio
 class TestGetFilesTouchedInBranchWarning:
-    """Step-1 (RED): get_files_touched_in_branch must emit a WARNING when
-    git log exits non-zero (e.g. non-existent base SHA), while still
-    returning [].
-
-    Before step-2 impl: rc!=0 path is silent → RED (no WARNING).
-    After step-2 impl: WARNING captured at 'orchestrator.git_ops'.
+    """get_files_touched_in_branch must emit a WARNING when git log exits
+    non-zero (e.g. non-existent base SHA), and return the error with its
+    empty file list rather than an empty list alone (task 3918).
     """
 
     async def test_nonexistent_sha_returns_empty_and_warns(
@@ -8751,10 +11252,11 @@ class TestGetFilesTouchedInBranchWarning:
         non_existent = 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef'
 
         with caplog.at_level(logging.WARNING, logger='orchestrator.git_ops'):
-            result = await ops.get_files_touched_in_branch(non_existent, 'HEAD')
+            files, err = await ops.get_files_touched_in_branch(non_existent, 'HEAD')
 
-        assert result == [], (
-            f'Expected [] on git error; got {result!r}'
+        assert files == [], f'Expected [] on git error; got {files!r}'
+        assert isinstance(err, Exception), (
+            f'Expected the git error to be returned; got {err!r}'
         )
 
         warning_texts = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
@@ -8766,6 +11268,44 @@ class TestGetFilesTouchedInBranchWarning:
             'get_files_touched_in_branch' in t.lower()
             for t in warning_texts
         ), f'Expected WARNING to mention get_files_touched_in_branch; got: {warning_texts}'
+
+
+@pytest.mark.asyncio
+class TestGetChangedFilesWarning:
+    """Task 3493: get_changed_files keeps its fail-open ``[]`` on a git diff
+    error but no longer swallows the failure silently: it WARNs.
+    """
+
+    async def test_nonexistent_sha_returns_empty_and_warns(
+        self, git_ops: GitOps, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        unresolvable = 'deadbeef' * 5
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.git_ops'):
+            result = await git_ops.get_changed_files(unresolvable, 'HEAD')
+
+        assert result == [], f'Expected [] on git error; got {result!r}'
+        warning_texts = [
+            r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING
+        ]
+        assert any('get_changed_files' in t for t in warning_texts), (
+            f'Expected a WARNING naming get_changed_files; got: {warning_texts}'
+        )
+
+    async def test_success_lists_changed_files_without_warning(
+        self, git_ops: GitOps, git_repo: Path, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        (git_repo / 'base.py').write_text('# base\n')
+        base_sha = await _commit_all(git_repo, 'base')
+        (git_repo / 'alpha.py').write_text('# alpha\n')
+        (git_repo / 'beta.py').write_text('# beta\n')
+        head_sha = await _commit_all(git_repo, 'add alpha and beta')
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.git_ops'):
+            files = await git_ops.get_changed_files(base_sha, head_sha)
+
+        assert sorted(files) == ['alpha.py', 'beta.py']
+        assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
 
 
 # ---------------------------------------------------------------------------
@@ -9023,7 +11563,7 @@ class TestReleaseWarmLaneBranchRetention:
 
     @pytest.fixture(autouse=True)
     def _warm_base(self, git_repo: Path) -> None:
-        _seed_default_warm_base(git_repo)
+        seed_default_warm_base(git_repo)
 
     def _warm_config(self) -> GitConfig:
         return GitConfig(
@@ -9241,6 +11781,19 @@ class TestCleanupWorktreeColdBranchRetention:
         )
 
 
+def _worktree_listing_unreadable(git_ops: GitOps):
+    """Patch context forcing ``GitOps._settle_branch_checkout``'s fail-open read.
+
+    An unreadable ``git worktree list`` leaves the settle with no holder, so
+    the acquire enters its route as it did before task 5565 and the route's
+    own reattach rc guard is what must hold.
+    """
+    async def _no_holder(full_branch: str) -> None:
+        return None
+
+    return patch.object(git_ops, '_worktree_holding_branch', side_effect=_no_holder)
+
+
 # ===========================================================================
 # Task-1914 step-5: RED — create-once leftover protective guard + fail-safe
 # ===========================================================================
@@ -9249,14 +11802,16 @@ class TestCleanupWorktreeColdBranchRetention:
 @pytest.mark.asyncio
 class TestAcquireWarmLaneCreateOnceLeftoverGuard:
     """create-once site NEVER destroys a leftover task/<id> branch that carries
-    commits beyond main.  If the leftover cannot be re-attached (e.g. already
-    checked out in another worktree), acquire returns WarmLaneUnavailable.FAULT
-    while leaving the branch intact.  Fail-safe: _branch_has_commits_beyond_main
-    True (including on git error) → reattach/retain direction taken on both paths."""
+    commits beyond main.  A leftover checked out in a worktree outside the pool
+    is refused before the route (BranchCheckedOutElsewhere, task 5565); when
+    that pre-route read fails open and re-attach is refused by git, acquire
+    returns WarmLaneUnavailable.FAULT while leaving the branch intact.
+    Fail-safe: _branch_has_commits_beyond_main True (including on git error)
+    → reattach/retain direction taken on both paths."""
 
     @pytest.fixture(autouse=True)
     def _warm_base(self, git_repo: Path) -> None:
-        _seed_default_warm_base(git_repo)
+        seed_default_warm_base(git_repo)
 
     def _warm_config(self) -> GitConfig:
         return GitConfig(
@@ -9275,14 +11830,13 @@ class TestAcquireWarmLaneCreateOnceLeftoverGuard:
         be re-attached (already checked out in another worktree).
 
         Setup: create task/A with commits via a temp worktree and LEAVE the
-        worktree in place (not removed).  When acquire_warm_lane tries
-        `git worktree add <lane> task/A`, git refuses with 'branch already
-        checked out' — and the branch must NOT be deleted as a fallback.
+        worktree in place (not removed).
 
-        After step-4: the reattach guard fires and `git worktree add` (no -b)
-        fails → FAULT returned; task/A is never touched → both assertions PASS.
-        After step-6: same external result; the raise-not-destroy contract is
-        the same observable effect.
+        With the worktree listing readable, the pre-route settle refuses with
+        BranchCheckedOutElsewhere(REFUSE_FOREIGN_WORKTREE) and no lane is
+        created.  With it unreadable (fail-open), acquire enters the
+        create-once route, `git worktree add <lane> task/A` is refused by git
+        → FAULT, and the branch must NOT be deleted as a fallback.
         """
         from orchestrator.git_ops import WarmLaneUnavailable
 
@@ -9311,12 +11865,24 @@ class TestAcquireWarmLaneCreateOnceLeftoverGuard:
 
         # FRESH pool — _lane-0 never acquired
         git_ops = GitOps(self._warm_config(), git_repo, warm_lane_pool_size=1)
+        pool = git_ops.warm_lane_pool
+        assert pool is not None
+        (lane_path,) = pool.lane_paths()
 
-        result = await git_ops.acquire_warm_lane('A', start_ref)
+        with pytest.raises(BranchCheckedOutElsewhere) as refused:
+            await git_ops.acquire_warm_lane('A', start_ref)
+        assert refused.value.action is BranchHolderAction.REFUSE_FOREIGN_WORKTREE
+        assert refused.value.holder.resolve() == tmp_wt_a.resolve()
+        assert pool.assignment_for('A') is None
+        assert not pool.is_assigned(lane_path)
+        assert not lane_path.exists(), 'the refusal must come before any lane is created'
 
-        # Must return WarmLaneUnavailable (FAULT), NOT WorktreeInfo
-        assert isinstance(result, WarmLaneUnavailable), (
-            f'Expected WarmLaneUnavailable for unattachable orphan, got {result!r}'
+        with _worktree_listing_unreadable(git_ops):
+            result = await git_ops.acquire_warm_lane('A', start_ref)
+
+        # Must return WarmLaneUnavailable.FAULT, NOT WorktreeInfo
+        assert result is WarmLaneUnavailable.FAULT, (
+            f'Expected WarmLaneUnavailable.FAULT for unattachable orphan, got {result!r}'
         )
 
         # task/A branch must be RETAINED — never destroyed regardless of failure
@@ -9515,7 +12081,7 @@ class TestAcquireWarmLaneResetInPlaceCheckoutGuard:
 
     @pytest.fixture(autouse=True)
     def _warm_base(self, git_repo: Path) -> None:
-        _seed_default_warm_base(git_repo)
+        seed_default_warm_base(git_repo)
 
     def _warm_config(self) -> GitConfig:
         return GitConfig(
@@ -9539,16 +12105,14 @@ class TestAcquireWarmLaneResetInPlaceCheckoutGuard:
         (a) Create task/A with 2 commits via tmp_wt_a; LEAVE it checked out.
         (b) Register+free _lane-0 as 'seed' so the lane is on task/seed and
             the next acquire for 'A' hits the registered (else) path.
-        (c) Acquire for 'A' — reattach guard fires (task/A exists + commits)
-            but git checkout -f task/A inside the lane FAILS because task/A
-            is already checked out in tmp_wt_a.
-
-        RED today: rc of checkout is discarded and _reuse_warm_lane(lane,
-        task/A) runs against the lane still on task/seed, returning WorktreeInfo
-        instead of WarmLaneUnavailable.
-
-        GREEN after step-8: rc is captured; non-zero → RuntimeError →
-        top-level except → WarmLaneUnavailable.FAULT, task/A intact.
+        (c) Acquire for 'A' with the worktree listing readable: the pre-route
+            settle refuses with BranchCheckedOutElsewhere(REFUSE_FOREIGN_WORKTREE)
+            and the lane stays FREE on task/seed.
+        (d) Acquire for 'A' with the listing unreadable (fail-open): the
+            reattach guard fires (task/A exists + commits) but git checkout -f
+            task/A inside the lane FAILS because task/A is already checked out
+            in tmp_wt_a.  The rc is captured; non-zero → RuntimeError →
+            top-level except → WarmLaneUnavailable.FAULT, task/A intact.
         """
         from orchestrator.git_ops import WarmLaneUnavailable
 
@@ -9593,13 +12157,27 @@ class TestAcquireWarmLaneResetInPlaceCheckoutGuard:
             f'Lane should be on task/seed before reattach attempt, got {seed_head_raw.strip()!r}'
         )
 
-        # (d) Acquire for 'A' — hits reset-in-place site → reattach guard fires
-        #     → git checkout -f task/A FAILS (task/A checked out in tmp_wt_a)
-        result = await git_ops.acquire_warm_lane('A', start_ref)
+        # (c) Listing readable — refused before the route touches the lane.
+        with pytest.raises(BranchCheckedOutElsewhere) as refused:
+            await git_ops.acquire_warm_lane('A', start_ref)
+        assert refused.value.action is BranchHolderAction.REFUSE_FOREIGN_WORKTREE
+        assert refused.value.holder.resolve() == tmp_wt_a.resolve()
+        assert git_ops.warm_lane_pool.assignment_for('A') is None
+        assert not git_ops.warm_lane_pool.is_assigned(lane_path)
+        _, refused_head_raw, _ = await _run(
+            ['git', 'rev-parse', '--abbrev-ref', 'HEAD'], cwd=lane_path,
+        )
+        assert refused_head_raw.strip() == 'task/seed', (
+            f'The refusal must leave the lane on task/seed, got {refused_head_raw.strip()!r}'
+        )
 
-        # PRIMARY discriminator (RED today → GREEN after step-8):
-        # must return WarmLaneUnavailable.FAULT, NOT WorktreeInfo
-        assert isinstance(result, WarmLaneUnavailable), (
+        # (d) Listing unreadable — hits reset-in-place site → reattach guard
+        #     fires → git checkout -f task/A FAILS (task/A checked out in tmp_wt_a)
+        with _worktree_listing_unreadable(git_ops):
+            result = await git_ops.acquire_warm_lane('A', start_ref)
+
+        # PRIMARY discriminator: must return WarmLaneUnavailable.FAULT, NOT WorktreeInfo
+        assert result is WarmLaneUnavailable.FAULT, (
             f'Expected WarmLaneUnavailable.FAULT when checkout -f task/A fails '
             f'(branch already checked out in another worktree), got {result!r}. '
             f'The reset-in-place site must capture the checkout rc and raise, '
@@ -9731,7 +12309,7 @@ class TestRebindBranchToHead:
 
     @pytest.fixture(autouse=True)
     def _warm_base(self, git_repo: Path) -> None:
-        _seed_default_warm_base(git_repo)
+        seed_default_warm_base(git_repo)
 
     def _warm_config(self) -> GitConfig:
         return GitConfig(
@@ -9985,6 +12563,68 @@ class TestRebindBranchToHead:
         # Clean up the second worktree
         await _run(['git', 'worktree', 'remove', '--force', str(second_wt)], cwd=git_repo)
 
+    async def _lane_with_one_commit_on_x(
+        self, git_repo: Path,
+    ) -> tuple[GitOps, Path, str]:
+        await _add_warm_lane_scripts(git_repo)
+        _, start_ref_raw, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=git_repo)
+        git_ops = GitOps(self._warm_config(), git_repo, warm_lane_pool_size=1)
+        info = await git_ops.acquire_warm_lane('X', start_ref_raw.strip())
+        assert isinstance(info, WorktreeInfo), f'Acquire failed: {info!r}'
+        (info.path / 'wip.txt').write_text('work\n')
+        await _run(['git', 'add', '-A'], cwd=info.path)
+        await _run(['git', 'commit', '-m', 'wip'], cwd=info.path)
+        _, x_sha_raw, _ = await _run(
+            ['git', 'rev-parse', 'refs/heads/task/X'], cwd=git_repo,
+        )
+        return git_ops, info.path, x_sha_raw.strip()
+
+    async def test_rebind_refuses_a_lane_attached_to_a_foreign_branch(
+        self, git_repo: Path,
+    ):
+        """(e) task 10991: a lane on task/F must never become task/X's tip.
+
+        reify task/10089 lost its commit when its resume ran ``checkout -B``
+        over a lane a foreign checkout had left on another task's branch.
+        """
+        git_ops, lane, x_sha = await self._lane_with_one_commit_on_x(git_repo)
+        _, main_sha_raw, _ = await _run(['git', 'rev-parse', 'main'], cwd=git_repo)
+        await _run(['git', 'branch', 'task/F', 'main'], cwd=git_repo)
+        rc, _, err = await _run(['git', 'checkout', 'task/F'], cwd=lane)
+        assert rc == 0, err
+
+        result = await git_ops.rebind_branch_to_head(lane, 'task/X')
+
+        assert result is False
+        _, ref_sha_raw, _ = await _run(
+            ['git', 'rev-parse', 'refs/heads/task/X'], cwd=git_repo,
+        )
+        assert ref_sha_raw.strip() == x_sha
+        _, attached_raw, _ = await _run(
+            ['git', 'rev-parse', '--abbrev-ref', 'HEAD'], cwd=lane,
+        )
+        assert attached_raw.strip() == 'task/F'
+        _, f_sha_raw, _ = await _run(
+            ['git', 'rev-parse', 'refs/heads/task/F'], cwd=git_repo,
+        )
+        assert f_sha_raw.strip() == main_sha_raw.strip()
+
+    async def test_rebind_refuses_a_lane_detached_off_the_branch_lineage(
+        self, git_repo: Path,
+    ):
+        """(f) Detached at neither task/X's tip nor a descendant: refused."""
+        git_ops, lane, x_sha = await self._lane_with_one_commit_on_x(git_repo)
+        rc, _, err = await _run(['git', 'checkout', '--detach', 'main'], cwd=lane)
+        assert rc == 0, err
+
+        result = await git_ops.rebind_branch_to_head(lane, 'task/X')
+
+        assert result is False
+        _, ref_sha_raw, _ = await _run(
+            ['git', 'rev-parse', 'refs/heads/task/X'], cwd=git_repo,
+        )
+        assert ref_sha_raw.strip() == x_sha
+
 
 # ===========================================================================
 # Task-1923 step-5: RED — disk-backstop route end-to-end via acquire_warm_lane
@@ -10006,7 +12646,7 @@ class TestAcquireDiskBackstopReuseDetachedRebind:
 
     @pytest.fixture(autouse=True)
     def _warm_base(self, git_repo: Path) -> None:
-        _seed_default_warm_base(git_repo)
+        seed_default_warm_base(git_repo)
 
     def _warm_config(self) -> GitConfig:
         return GitConfig(
@@ -10025,7 +12665,7 @@ class TestAcquireDiskBackstopReuseDetachedRebind:
         task/D must be RETAINED by α (not deleted as 0-beyond-main).
 
         Sequence:
-        1. Acquire lane on 'D', write .task/plan.json, commit WIP commit
+        1. Acquire lane on 'D', seed the meta root's metadata.json, commit WIP
         2. Advance main
         3. release_warm_lane('D') → detach + retain task/D (WIP > 0) + FREE
         4. acquire_warm_lane('D', main_HEAD) → disk-backstop route (route 2)
@@ -10042,15 +12682,16 @@ class TestAcquireDiskBackstopReuseDetachedRebind:
 
         git_ops = GitOps(self._warm_config(), git_repo, warm_lane_pool_size=1)
 
-        # Step 1: Acquire lane on 'D', write plan.json, commit WIP
+        # Step 1: Acquire lane on 'D', seed metadata.json, commit WIP
         info = await git_ops.acquire_warm_lane('D', start_ref)
         assert isinstance(info, WorktreeInfo), f'Acquire failed: {info!r}'
         lane = info.path
 
-        # Write .task/plan.json with task_id='D' (forces disk-backstop route on re-acquire)
-        task_dir = lane / '.task'
-        task_dir.mkdir(parents=True, exist_ok=True)
-        (task_dir / 'plan.json').write_text(_json.dumps({'task_id': 'D'}))
+        # metadata.json with task_id='D' is the lane→task routing key that
+        # forces the disk-backstop route on re-acquire.
+        meta_root = TaskArtifacts.meta_root_for(lane.parent, lane.name)
+        meta_root.mkdir(parents=True, exist_ok=True)
+        (meta_root / 'metadata.json').write_text(_json.dumps({'task_id': 'D'}))
 
         # Commit WIP so task/D has commits beyond main
         (lane / 'wip_d.txt').write_text('work for task D\n')
@@ -10068,7 +12709,7 @@ class TestAcquireDiskBackstopReuseDetachedRebind:
         # Step 3: release_warm_lane → detach + retain + FREE
         await git_ops.release_warm_lane(lane, 'D')
 
-        # Verify: detached, task/D retained, plan.json intact
+        # Verify: detached, task/D retained, metadata.json intact
         _, abbrev_raw, _ = await _run(
             ['git', 'rev-parse', '--abbrev-ref', 'HEAD'], cwd=lane,
         )
@@ -10079,12 +12720,13 @@ class TestAcquireDiskBackstopReuseDetachedRebind:
             ['git', 'rev-parse', '--verify', 'task/D'], cwd=git_repo,
         )
         assert rc_verify == 0, 'task/D must be RETAINED after first release (α)'
-        assert (task_dir / 'plan.json').exists(), (
-            'plan.json must survive release_warm_lane (used by disk-backstop re-acquire)'
+        assert (meta_root / 'metadata.json').exists(), (
+            'metadata.json must survive release_warm_lane '
+            '(it is the disk-backstop re-acquire routing key)'
         )
 
         # Step 4: re-acquire via disk-backstop route
-        # (pool sees lane as FREE+registered with plan.json task_id=='D' → route 2)
+        # (pool sees lane as FREE+registered, metadata.json task_id=='D' → route 2)
         info2 = await git_ops.acquire_warm_lane('D', main_head)
 
         # Step 5: assertions on re-acquire result
@@ -10151,8 +12793,8 @@ class TestAcquireDiskBackstopReuseDetachedRebind:
 
 @pytest.mark.asyncio
 class TestReuseWarmLaneBranchAware:
-    """_reuse_warm_lane called on a DETACHED lane must rebind refs/heads/task/R
-    to the lane HEAD after commit()+rebase_onto_main.
+    """_reuse_warm_lane called on a DETACHED lane must leave the lane attached
+    on task/R, with refs/heads/task/R equal to the rebased lane HEAD.
 
     RED today: _reuse_warm_lane runs commit+rebase on the detached HEAD but
     never rebinds refs/heads/task/R — the ref stays at the pre-detach tip
@@ -10162,7 +12804,7 @@ class TestReuseWarmLaneBranchAware:
 
     @pytest.fixture(autouse=True)
     def _warm_base(self, git_repo: Path) -> None:
-        _seed_default_warm_base(git_repo)
+        seed_default_warm_base(git_repo)
 
     def _warm_config(self) -> GitConfig:
         return GitConfig(
@@ -10308,7 +12950,7 @@ class TestAcquireWarmLaneReclaimOnExhaustion:
 
     @pytest.fixture(autouse=True)
     def _warm_base(self, git_repo: Path) -> None:
-        _seed_default_warm_base(git_repo)
+        seed_default_warm_base(git_repo)
 
     def _warm_config(self) -> GitConfig:
         return GitConfig(
@@ -10552,15 +13194,6 @@ class TestAcquireWarmLaneReclaimOnExhaustion:
 # ===========================================================================
 
 
-def _lane_admin_dir(lane: Path) -> Path:
-    """Parse the ``.git/worktrees/<name>`` admin dir path out of a lane's
-    ``.git`` pointer file (``gitdir: <repo>/.git/worktrees/<name>``)."""
-    content = (lane / '.git').read_text().strip()
-    prefix = 'gitdir:'
-    assert content.startswith(prefix), f'unexpected worktree .git pointer: {content!r}'
-    return Path(content[len(prefix):].strip())
-
-
 @pytest.mark.asyncio
 class TestAcquireWarmLaneOrphanedReuseGuard:
     """The REUSE path (in-memory map hit -> reused=True) assumes a mapped
@@ -10581,7 +13214,7 @@ class TestAcquireWarmLaneOrphanedReuseGuard:
 
     @pytest.fixture(autouse=True)
     def _warm_base(self, git_repo: Path) -> None:
-        _seed_default_warm_base(git_repo)
+        seed_default_warm_base(git_repo)
 
     def _warm_config(self) -> GitConfig:
         return GitConfig(
@@ -10635,7 +13268,7 @@ class TestAcquireWarmLaneOrphanedReuseGuard:
         # so the next acquire_for('A') returns reused=True.
 
         # Simulate the prune wipe: delete the lane's admin dir.
-        admin_dir = _lane_admin_dir(lane)
+        admin_dir = lane_admin_dir(lane)
         shutil.rmtree(admin_dir)
         assert not await git_ops._is_registered_worktree(lane), (
             'lane must be unregistered after its admin dir is wiped (setup check)'
@@ -10702,7 +13335,7 @@ class TestAcquireWarmLaneOrphanedReuseGuard:
         _, main_head_raw, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=git_repo)
         main_head = main_head_raw.strip()
 
-        admin_dir = _lane_admin_dir(lane)
+        admin_dir = lane_admin_dir(lane)
         shutil.rmtree(admin_dir)
         assert not await git_ops._is_registered_worktree(lane), (
             'lane must be unregistered after its admin dir is wiped (setup check)'
@@ -10801,7 +13434,7 @@ class TestAcquireWarmLaneOrphanedReuseGuard:
 
         # Construct a REPAIRABLE orphan: corrupt the admin dir's gitdir
         # pointer (lane dir + admin dir both survive and stay linkable).
-        admin_dir = _lane_admin_dir(lane)
+        admin_dir = lane_admin_dir(lane)
         (admin_dir / 'gitdir').write_text('/tmp/bogus/.git\n')
         assert not await git_ops._is_registered_worktree(lane), (
             'lane must appear unregistered once its admin dir gitdir '
@@ -10964,7 +13597,7 @@ class TestWarmLaneRefIsDegenerate:
 
 
 # ---------------------------------------------------------------------------
-# Task 2442 step-3/4 — GitOps._run_thin_warm_lane unit tests (§9.5 η)
+# Task 2442 step-3/4 — GitOps.thin_warm_lane unit tests (§9.5 η)
 # ---------------------------------------------------------------------------
 
 
@@ -11005,8 +13638,8 @@ def _read_thin_warm_lane_call_log(repo: Path) -> list[str]:
 
 
 @pytest.mark.asyncio
-class TestRunThinWarmLane:
-    """Unit tests for GitOps._run_thin_warm_lane (task 2442 step-4).
+class TestThinWarmLane:
+    """Unit tests for GitOps.thin_warm_lane (task 2442 step-4).
 
     Fail-soft, never-raise wrapper around reify δ's
     scripts/thin-warm-lane.sh (§9.5 η): an absent script, a benign
@@ -11026,7 +13659,7 @@ class TestRunThinWarmLane:
         mock_run = AsyncMock(return_value=(0, '', ''))
 
         with patch('orchestrator.git_ops._run', mock_run):
-            rc = await git_ops._run_thin_warm_lane(lane)
+            rc = await git_ops.thin_warm_lane(lane)
 
         assert rc == 127
         mock_run.assert_not_called()
@@ -11041,7 +13674,7 @@ class TestRunThinWarmLane:
         lane = git_repo / '_lane-0'
         lane.mkdir()
 
-        rc = await git_ops._run_thin_warm_lane(lane)
+        rc = await git_ops.thin_warm_lane(lane)
 
         assert rc == 0
         [line] = _read_thin_warm_lane_call_log(git_repo)
@@ -11062,7 +13695,7 @@ class TestRunThinWarmLane:
         lane.mkdir()
 
         with caplog.at_level(logging.WARNING, logger='orchestrator.git_ops'):
-            rc = await git_ops._run_thin_warm_lane(lane)
+            rc = await git_ops.thin_warm_lane(lane)
 
         assert rc == 75
         warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
@@ -11082,12 +13715,12 @@ class TestRunThinWarmLane:
         lane.mkdir()
 
         with caplog.at_level(logging.WARNING, logger='orchestrator.git_ops'):
-            rc = await git_ops._run_thin_warm_lane(lane)
+            rc = await git_ops.thin_warm_lane(lane)
 
         assert rc == 1
         warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
-        assert any('_run_thin_warm_lane' in r.getMessage() for r in warnings), (
-            f'Expected a WARNING naming _run_thin_warm_lane, got '
+        assert any('thin_warm_lane' in r.getMessage() for r in warnings), (
+            f'Expected a WARNING naming thin_warm_lane, got '
             f'{[r.getMessage() for r in warnings]}'
         )
 
@@ -11105,12 +13738,12 @@ class TestRunThinWarmLane:
             caplog.at_level(logging.WARNING, logger='orchestrator.git_ops'),
             patch('orchestrator.git_ops._run', side_effect=RuntimeError('boom')),
         ):
-            rc = await git_ops._run_thin_warm_lane(lane)
+            rc = await git_ops.thin_warm_lane(lane)
 
         assert rc == 127, 'an exception from _run must fail-soft to 127, never raise'
         warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
-        assert any('_run_thin_warm_lane' in r.getMessage() for r in warnings), (
-            f'Expected a WARNING naming _run_thin_warm_lane, got '
+        assert any('thin_warm_lane' in r.getMessage() for r in warnings), (
+            f'Expected a WARNING naming thin_warm_lane, got '
             f'{[r.getMessage() for r in warnings]}'
         )
 
@@ -11133,7 +13766,7 @@ class TestRunThinWarmLane:
         assert git_ops.pool_in_use()
         assert not git_ops.pool_storage_present()
 
-        rc = await git_ops._run_thin_warm_lane(lane)
+        rc = await git_ops.thin_warm_lane(lane)
 
         assert rc == 127
         assert _read_thin_warm_lane_call_log(git_repo) == [], (
@@ -11142,7 +13775,7 @@ class TestRunThinWarmLane:
 
 
 # ---------------------------------------------------------------------------
-# Task 2442 amend — real flock contention for _run_thin_warm_lane's rc=75 path
+# Task 2442 amend — real flock contention for thin_warm_lane's rc=75 path
 # (review: git_ops.py:2323 — the rc=75 benign-skip path was previously only
 # exercised via a forced stub exit code, never an actual flock conflict on
 # <lane_dir>.lock, the mechanism a concurrent re-acquire actually relies on)
@@ -11153,7 +13786,7 @@ def _write_thin_warm_lane_flock_stub(scripts_dir: Path) -> None:
     """Write a thin-warm-lane.sh stub that mirrors the REAL T3 flock gate.
 
     Unlike ``_write_thin_warm_lane_stub`` above (a configurable-exit stub
-    used to unit-test each branch of ``_run_thin_warm_lane`` in isolation
+    used to unit-test each branch of ``thin_warm_lane`` in isolation
     without caring *why* a given rc was produced), this stub reproduces the
     shape of reify's actual ``scripts/thin-warm-lane.sh`` T3 block: it opens
     ``<lane_dir>.lock`` (a sibling lock file, trailing slash stripped —
@@ -11161,7 +13794,7 @@ def _write_thin_warm_lane_flock_stub(scripts_dir: Path) -> None:
     ``flock -n``, exiting 75 if — and only if — it genuinely cannot.
     Otherwise it exits 0. This lets a test hold a real OS-level flock on
     that same lock file from the test process and observe
-    ``_run_thin_warm_lane`` correctly propagate the rc=75 that real
+    ``thin_warm_lane`` correctly propagate the rc=75 that real
     contention produces, rather than one a stub was merely told to return.
     """
     script = scripts_dir / 'thin-warm-lane.sh'
@@ -11184,15 +13817,15 @@ def _write_thin_warm_lane_flock_stub(scripts_dir: Path) -> None:
 
 
 @pytest.mark.asyncio
-class TestRunThinWarmLaneFlockContention:
+class TestThinWarmLaneFlockContention:
     """rc=75 exercised against a REAL held flock, not a scripted exit code.
 
     Amendment requested by the task 2442 code review (git_ops.py:2323):
-    ``TestRunThinWarmLane.test_exit_75_returns_75_and_no_warning`` only
-    proves ``_run_thin_warm_lane`` *interprets* rc=75 correctly once told to
+    ``TestThinWarmLane.test_exit_75_returns_75_and_no_warning`` only
+    proves ``thin_warm_lane`` *interprets* rc=75 correctly once told to
     return it — it says nothing about whether genuine contention on
     ``<lane_dir>.lock`` (the T3 mechanism a concurrent re-acquire actually
-    relies on — see the "Flock contract" note on ``_run_thin_warm_lane``'s
+    relies on — see the "Flock contract" note on ``thin_warm_lane``'s
     docstring and reify PRD §9.3 invariant T3 / §9.5 inv.10) is observed
     correctly end-to-end. These tests hold a genuine OS-level flock from the
     test process itself, against a stub that performs the real ``flock -n``
@@ -11216,7 +13849,7 @@ class TestRunThinWarmLaneFlockContention:
             fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
 
             with caplog.at_level(logging.WARNING, logger='orchestrator.git_ops'):
-                rc = await git_ops._run_thin_warm_lane(lane)
+                rc = await git_ops.thin_warm_lane(lane)
 
             assert rc == 75, (
                 'a genuinely held flock on <lane_dir>.lock must surface as '
@@ -11249,7 +13882,7 @@ class TestRunThinWarmLaneFlockContention:
         lane = git_repo / '_lane-1'
         lane.mkdir()
 
-        rc = await git_ops._run_thin_warm_lane(lane)
+        rc = await git_ops.thin_warm_lane(lane)
 
         assert rc == 0, (
             'with no concurrent holder, the flock-real stub must acquire '
@@ -11271,7 +13904,7 @@ class TestRunThinWarmLaneFlockContention:
 class TestSeedWarmLaneTakesLaneLock:
     """Pins the lane-lock coupling gap CLOSED (task 2599).
 
-    ``_run_thin_warm_lane``'s rc=75 benign-skip protection (see its
+    ``thin_warm_lane``'s rc=75 benign-skip protection (see its
     "Lane-lock coupling gap" docstring note) only actually serializes a
     concurrent re-acquire against release-thin if the re-acquire side ALSO
     takes ``<lane_dir>.lock``. Previously ``_seed_warm_lane`` (the
@@ -11285,7 +13918,7 @@ class TestSeedWarmLaneTakesLaneLock:
     non-blocking ``flock -n`` a real counterparty. This test proves that
     concretely — a real, externally-held ``<lane_dir>.lock`` now BLOCKS
     ``_seed_warm_lane``'s progress until released, rather than being
-    ignored — so ``_run_thin_warm_lane``'s "Flock contract" note is now
+    ignored — so ``thin_warm_lane``'s "Flock contract" note is now
     backed by genuine DF-side enforcement on both sides of the race. If
     this test ever starts failing, ``_seed_warm_lane``'s locking model
     changed and the coupling-gap docstring note on both methods must be
@@ -11306,8 +13939,8 @@ class TestSeedWarmLaneTakesLaneLock:
         script.chmod(0o755)
 
         # Simulate a concurrent release-thin holding <lane_dir>.lock for the
-        # duration of its rm -rf — the exact lock _run_thin_warm_lane's real
-        # script contends on (see TestRunThinWarmLaneFlockContention above).
+        # duration of its rm -rf — the exact lock thin_warm_lane's real
+        # script contends on (see TestThinWarmLaneFlockContention above).
         lock_path = Path(f'{lane}.lock')
         lock_fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o644)
         fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -11531,7 +14164,7 @@ class TestSeedWarmLaneLockTimeout:
 
 # ---------------------------------------------------------------------------
 # Task 2599 (step-3) — end-to-end guard: _seed_warm_lane's new <lane_dir>.lock
-# and _run_thin_warm_lane's real script both agree on the SAME inode, so a
+# and thin_warm_lane's real script both agree on the SAME inode, so a
 # genuine concurrent seed really does make a racing thin exit 75 (benign
 # skip) — not just each side's lock behavior proven in isolation above.
 # ---------------------------------------------------------------------------
@@ -11540,16 +14173,16 @@ class TestSeedWarmLaneLockTimeout:
 @pytest.mark.asyncio
 class TestSeedAndThinMutualExclusion:
     """End-to-end: a live ``_seed_warm_lane`` holding ``<lane_dir>.lock``
-    makes a concurrent ``_run_thin_warm_lane``'s real ``flock -n`` gate exit
+    makes a concurrent ``thin_warm_lane``'s real ``flock -n`` gate exit
     75.
 
     ``TestSeedWarmLaneTakesLaneLock`` proves ``_seed_warm_lane`` blocks
-    against an externally-held lock; ``TestRunThinWarmLaneFlockContention``
-    proves ``_run_thin_warm_lane``'s real script surfaces rc=75 against an
+    against an externally-held lock; ``TestThinWarmLaneFlockContention``
+    proves ``thin_warm_lane``'s real script surfaces rc=75 against an
     externally-held lock. Neither, alone, proves the two sides actually
     contend with EACH OTHER on the same file. This test drives both real
     code paths at once — a genuine ``_seed_warm_lane`` in flight, and a
-    genuine ``_run_thin_warm_lane`` racing it — closing that last gap.
+    genuine ``thin_warm_lane`` racing it — closing that last gap.
     """
 
     async def test_seed_holding_lane_lock_makes_concurrent_thin_skip(
@@ -11572,7 +14205,7 @@ class TestSeedAndThinMutualExclusion:
         )
         seed_script.chmod(0o755)
 
-        # Real-T3 thin stub — the SAME stub TestRunThinWarmLaneFlockContention
+        # Real-T3 thin stub — the SAME stub TestThinWarmLaneFlockContention
         # uses — so this exercises the genuine flock -n gate, not a scripted rc.
         thin_scripts_dir = git_repo / 'scripts'
         thin_scripts_dir.mkdir(parents=True, exist_ok=True)
@@ -11596,10 +14229,10 @@ class TestSeedAndThinMutualExclusion:
 
             # seed_started existing proves _seed_warm_lane has acquired the
             # outer flock -x <lane_dir>.lock and is now blocking on release.
-            thin_rc = await git_ops._run_thin_warm_lane(lane)
+            thin_rc = await git_ops.thin_warm_lane(lane)
 
             assert thin_rc == 75, (
-                'a concurrent _run_thin_warm_lane must exit 75 (benign skip) '
+                'a concurrent thin_warm_lane must exit 75 (benign skip) '
                 'while _seed_warm_lane genuinely holds <lane_dir>.lock — the '
                 'two sides must contend on the SAME lock file'
             )
@@ -11841,7 +14474,7 @@ class TestDisableSharedRepoAutoMaintenance:
         self, git_ops: GitOps,
     ):
         """Both keys are set repo-locally, and a second call is a no-op-in-effect
-        (git config overwrites in place → naturally idempotent)."""
+        (it leaves identical values)."""
         await git_ops.disable_shared_repo_auto_maintenance()
 
         rc_gc, gc_val, _ = await _run(
@@ -11855,7 +14488,7 @@ class TestDisableSharedRepoAutoMaintenance:
         assert rc_mt == 0
         assert mt_val.strip() == 'false'
 
-        # Idempotency: a second call overwrites in place, leaving identical values.
+        # Idempotency: a second call leaves identical values.
         await git_ops.disable_shared_repo_auto_maintenance()
         rc_gc2, gc_val2, _ = await _run(
             ['git', 'config', '--get', 'gc.auto'], cwd=git_ops.project_root,
@@ -11867,6 +14500,31 @@ class TestDisableSharedRepoAutoMaintenance:
         assert gc_val2.strip() == '0'
         assert rc_mt2 == 0
         assert mt_val2.strip() == 'false'
+
+    @pytest.mark.parametrize(
+        ('key', 'value', 'stale'),
+        [('gc.auto', '0', '1'), ('maintenance.auto', 'false', 'true')],
+    )
+    async def test_disable_shared_repo_auto_maintenance_converges_duplicated_key(
+        self, git_ops: GitOps, key: str, value: str, stale: str,
+    ):
+        """A key already holding multiple values (manual ``git config --add``)
+        is converged to exactly one value; a plain ``git config`` would be
+        refused with exit 5 and leave it duplicated."""
+        cwd = git_ops.project_root
+        rc_set, _, _ = await _run(['git', 'config', key, stale], cwd=cwd)
+        rc_add, _, _ = await _run(['git', 'config', '--add', key, value], cwd=cwd)
+        assert rc_set == 0
+        assert rc_add == 0
+        rc_pre, out_pre, _ = await _run(['git', 'config', '--get-all', key], cwd=cwd)
+        assert rc_pre == 0
+        assert out_pre.splitlines() == [stale, value]
+
+        await git_ops.disable_shared_repo_auto_maintenance()
+
+        rc, out, _ = await _run(['git', 'config', '--get-all', key], cwd=cwd)
+        assert rc == 0
+        assert out.splitlines() == [value]
 
     async def test_disable_shared_repo_auto_maintenance_degrades_loudly_on_rc(
         self, git_ops: GitOps, caplog,
@@ -11925,3 +14583,1455 @@ class TestDisableSharedRepoAutoMaintenance:
         assert gc_val.strip() == '0'
         assert rc_mt == 0
         assert mt_val.strip() == 'false'
+
+
+# ---------------------------------------------------------------------------
+# task 3778 step-3: _run delegates its spawn to shared.git_async (INV-5)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestRunDelegatesToSharedGitAsync:
+    """``_run`` owns the WorktreeMissing taxonomy; ``shared.git_async`` owns the spawn.
+
+    The primitive (``create_subprocess_exec`` + LC_ALL=C child env + optional
+    stdin + the task-2608 kill+reap) grew here and is now needed verbatim by
+    fused-memory's live-workflow probes.  Rather than clone it (INV-5,
+    no-lockstep-duplication) it moved to ``shared/`` and ``_run`` became a thin
+    adapter.  What must NOT change is ``_run``'s own surface: the
+    ``WorktreeMissing`` pre-flight and re-classification, and the
+    ``(returncode, stdout, stderr)`` 3-tuple that git_ops' ~12k lines of call
+    sites destructure.
+    """
+
+    async def test_shared_helper_is_the_single_spawn_seam(self, tmp_path: Path) -> None:
+        """Patching the shared entry point AS BOUND IN git_ops intercepts _run.
+
+        Bare-name binding (``from shared.git_async import run_git``) is what
+        makes ``git_ops.run_git`` the patchable seam; a qualified
+        ``shared.git_async.run_git(...)`` call would leave this patch applying
+        cleanly but no longer intercepting.
+        """
+        sentinel = GitResult(returncode=7, stdout='intercepted', stderr='se')
+        with patch('orchestrator.git_ops.run_git', return_value=sentinel) as spawn:
+            rc, out, err = await _run(['git', 'status'], cwd=tmp_path)
+
+        assert spawn.await_count == 1, 'the spawn did not route through shared.git_async'
+        assert (rc, out, err) == (7, 'intercepted', 'se')
+
+    async def test_returns_the_same_three_tuple_shape(self, tmp_path: Path) -> None:
+        """Not the new GitResult dataclass — no call site changes."""
+        result = await _run(['git', 'init', '-q'], cwd=tmp_path)
+
+        assert isinstance(result, tuple)
+        assert len(result) == 3
+        rc, out, err = result
+        assert isinstance(rc, int)
+        assert isinstance(out, str)
+        assert isinstance(err, str)
+        assert rc == 0
+
+    async def test_cwd_vanishing_between_preflight_and_spawn_is_reclassified(
+        self, tmp_path: Path,
+    ) -> None:
+        """The race the pre-flight alone cannot catch.
+
+        cwd exists when ``_run`` checks it and is gone by the time the child is
+        spawned.  The helper surfaces a plain ``FileNotFoundError``; ``_run``
+        must re-classify it as :class:`WorktreeMissing` so callers still see a
+        deleted worktree as the recoverable race it is.
+        """
+        doomed = tmp_path / 'doomed'
+        doomed.mkdir()
+
+        async def _vanish_then_fail(*args, **kwargs):
+            shutil.rmtree(doomed)
+            raise FileNotFoundError(2, 'No such file or directory')
+
+        with (
+            patch('orchestrator.git_ops.run_git', new=_vanish_then_fail),
+            pytest.raises(WorktreeMissing) as exc,
+        ):
+            await _run(['git', 'status'], cwd=doomed)
+
+        assert exc.value.path == doomed
+
+    async def test_filenotfound_with_live_cwd_propagates_unchanged(
+        self, tmp_path: Path,
+    ) -> None:
+        """A missing BINARY is a real bug, not a vanished worktree."""
+
+        async def _boom(*args, **kwargs):
+            raise FileNotFoundError(2, 'No such file or directory')
+
+        with (
+            patch('orchestrator.git_ops.run_git', new=_boom),
+            pytest.raises(FileNotFoundError) as exc,
+        ):
+            await _run(['git', 'status'], cwd=tmp_path)
+
+        assert not isinstance(exc.value, WorktreeMissing)
+
+    async def test_a_long_running_script_cannot_delay_a_concurrent_git_call(
+        self,
+    ) -> None:
+        """``_run`` opts OUT of the shared per-loop spawn bound.
+
+        ``run_git``'s ``MAX_CONCURRENT_SPAWNS`` bound is sized for
+        fused-memory's live-workflow fan-out (hundreds of short-lived git
+        probes).  ``_run`` is the orchestrator's GENERAL subprocess runner:
+        ``delivered_checks`` puts operator-supplied script checks through it
+        and gathers them concurrently, ``merge_skew_tripwire`` runs its oracle
+        through it, and it also runs every merge-lane and scheduler git call.
+        If those shared one 8-slot queue, a handful of slow or abandoned
+        scripts would head-of-line block the merge lane.
+
+        Causal, not wall-clock: the fake children stay alive until an Event
+        this test controls, so the git call can only have spawned by NOT
+        having queued behind them.
+        """
+        released = asyncio.Event()
+        spawned: list[str] = []
+
+        class _Blocking:
+            pid = -1
+            returncode = 0
+
+            def __init__(self, tag: str) -> None:
+                self._tag = tag
+
+            async def communicate(self, input: bytes | None = None):
+                spawned.append(self._tag)
+                await released.wait()
+                return b'', b''
+
+            def kill(self) -> None:
+                return None
+
+            async def wait(self) -> int:
+                return 0
+
+        async def _fake_spawn(*args: object, **kwargs: object) -> object:
+            return _Blocking('git' if args and args[0] == 'git' else 'script')
+
+        # Comfortably more scripts than the shared bound, so a bound that
+        # applied here would certainly be saturated.
+        script_count = MAX_CONCURRENT_SPAWNS * 2
+
+        with patch.object(asyncio, 'create_subprocess_exec', _fake_spawn):
+            scripts = [
+                asyncio.create_task(_run(['sh', '-c', 'sleep forever']))
+                for _ in range(script_count)
+            ]
+            git_call = asyncio.create_task(_run(['git', 'rev-parse', 'HEAD']))
+            try:
+                deadline = asyncio.get_running_loop().time() + 2.0
+                while (
+                    'git' not in spawned
+                    and asyncio.get_running_loop().time() < deadline
+                ):
+                    await asyncio.sleep(0)
+
+                assert spawned.count('script') == script_count, (
+                    'script checks queued on a spawn bound _run must not have'
+                )
+                assert 'git' in spawned, (
+                    'the git call never spawned: _run is queueing behind '
+                    'long-running script children (it must pass bounded=False)'
+                )
+            finally:
+                released.set()
+                await asyncio.wait_for(
+                    asyncio.gather(git_call, *scripts, return_exceptions=True),
+                    timeout=5,
+                )
+
+class TestGitOpsHoldsNoSecondSpawnPrimitive:
+    """Source-level guard against a REGROWN duplicate of the spawn primitive.
+
+    A source scan rather than a behavioural assertion because the failure mode
+    is additive: a future edit that reintroduces a second
+    ``create_subprocess_exec`` into git_ops would leave every behavioural test
+    in the sibling class green while the two copies silently drift apart.
+
+    AST-based, not a substring scan: ``WorktreeMissing``'s docstring
+    legitimately NAMES ``asyncio.create_subprocess_exec`` when explaining where
+    the generic ``FileNotFoundError`` comes from, and prose should not be
+    collateral damage of a guard aimed at calls.
+    """
+
+    def test_git_ops_makes_no_direct_create_subprocess_exec_call(self) -> None:
+        source = Path(git_ops_module.__file__).read_text()
+        tree = ast.parse(source)
+
+        offenders = [
+            node.lineno
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == 'create_subprocess_exec'
+        ]
+
+        assert offenders == [], (
+            f'git_ops calls create_subprocess_exec directly at line(s) {offenders}; '
+            'it must delegate its spawn to shared.git_async instead of keeping a '
+            'second copy of the primitive (INV-5 no-lockstep-duplication)'
+        )
+
+# task 3060: advance_main stands off from a FOREIGN project_root index.lock
+# ---------------------------------------------------------------------------
+
+
+_HOLDER_PID = 728_900
+_HOLDER_COMMAND = 'git commit --only plans/x.md'
+_LATER_READER_COMMAND = 'git cherry main abc123'
+# A stand-off budget that still polls but costs no real wait.  The stale bar
+# is max(budget, _INDEX_LOCK_STALE_FLOOR_S), so it changes no verdict.
+_POLLED_BUDGET_S = 0.01
+
+
+def _table_holding_one_git_process(
+    tmp_path: Path, project_root: Path, *, command: str, started_at: float,
+) -> Path:
+    proc_root = empty_proc_table(tmp_path)
+    add_git_process(
+        proc_root, _HOLDER_PID, cwd=project_root, command=command, started_at=started_at,
+    )
+    return proc_root
+
+
+async def _park_lock_reason(git_ops: GitOps, merge_commit: str) -> str:
+    outcome = await _map_advance_failure(
+        git_ops, 'park_lock_contended',
+        task_id='t5229',
+        merge_commit_fallback=merge_commit,
+        halt=MagicMock(),
+        unhalt=MagicMock(),
+        cas_retries={},
+    )
+    return outcome.reason
+
+
+class _MergedNotAdvanced(NamedTuple):
+    """The two already-narrowed fields the stand-off tests need off a merge.
+
+    ``MergeResult.merge_commit``/``merge_worktree`` are declared ``| None``,
+    and pyright does NOT carry a helper's internal ``assert ... is not None``
+    across the return boundary — every caller would see ``str | None`` again.
+    Handing back this pair narrows once, in the helper, instead of making all
+    six call sites re-assert.
+    """
+
+    merge_commit: str
+    merge_worktree: Path
+
+
+@pytest.mark.asyncio
+class TestAdvanceMainIndexLockStandoff:
+    """A concurrent `git commit --only <path>` in project_root holds
+    `.git/index.lock` for the ENTIRE pre-commit hook run (this repo's hook
+    runs pyright; CLAUDE.md instructs callers to pass `timeout: 300000`).
+
+    Verified on git 2.43.0: with the lock held and a dirty tracked file,
+    `git status --porcelain` and `git diff --name-only` both succeed (rc=0)
+    while `git stash create` exits **rc=1 with EMPTY stdout AND stderr** — so
+    advance_main's park detects WIP, fails to stash it, and returns
+    `stash_failed`, which is in `_HALT_ADVANCE_RESULTS` and halts the WHOLE
+    merge queue behind an L1 escalation. That is the recurring 2+/day halt.
+
+    The fix stands off: wait (bounded by
+    `git.merge_park_lock_grace_seconds`) for the foreign lock to clear, and
+    if it is still held at the deadline return the new transient
+    `park_lock_contended` code having touched NOTHING — no ref move, no tree
+    write, no park, and the foreign lock left strictly alone.
+    """
+
+    @staticmethod
+    async def _make_merge(
+        git_ops: GitOps, branch: str, filename: str,
+    ) -> _MergedNotAdvanced:
+        """Create a mergeable commit on *branch* and merge it, returning its
+        (merge_commit, merge_worktree) pair — merged, but not yet advanced."""
+        worktree_info = await git_ops.create_worktree(branch)
+        (worktree_info.path / filename).write_text('x = 1\n')
+        await git_ops.commit(worktree_info.path, f'Add {filename}')
+        merge_result = await git_ops.merge_to_main(worktree_info.path, branch)
+        assert merge_result.success
+        assert merge_result.merge_commit is not None
+        assert merge_result.merge_worktree is not None
+        return _MergedNotAdvanced(
+            merge_result.merge_commit, merge_result.merge_worktree,
+        )
+
+    async def test_held_index_lock_returns_park_lock_contended_not_stash_failed(
+        self, git_ops: GitOps,
+    ):
+        """The headline regression: a held foreign index.lock must produce the
+        transient `park_lock_contended`, NOT the queue-halting `stash_failed`.
+
+        No `_run` mocking — a REAL `.git/index.lock` file is created, exactly
+        what a concurrent `git commit --only` leaves behind, so the real
+        rc=1/empty-stderr `git stash create` failure is what the gate is
+        protecting against.
+        """
+        _, main_before, _ = await _run(
+            ['git', 'rev-parse', 'main'], cwd=git_ops.project_root,
+        )
+
+        merge_result = await self._make_merge(
+            git_ops, 'lock-standoff', 'lock_standoff.py',
+        )
+
+        # Dirty a TRACKED file so the park would be armed.
+        dirty = '# dirty tracked edit racing a concurrent commit --only\n'
+        (git_ops.project_root / 'README.md').write_text(dirty)
+
+        # grace=0 == probe-only fail-fast. Direct attribute mutation is safe:
+        # GitConfig declares no model_config, so it is neither frozen nor
+        # validate_assignment.
+        git_ops.config.merge_park_lock_grace_seconds = 0
+
+        lock_path = git_ops.project_root / '.git' / 'index.lock'
+        lock_path.write_text('')
+        try:
+            result = await git_ops.advance_main(merge_result.merge_commit)
+        finally:
+            if lock_path.exists():
+                lock_path.unlink()
+            await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
+
+        assert result.result == 'park_lock_contended', (
+            'a foreign index.lock must be classified as transient contention, '
+            f'never as the queue-halting stash_failed; got {result.result!r}'
+        )
+
+        # (2) main did NOT move — nothing landed.
+        _, main_after, _ = await _run(
+            ['git', 'rev-parse', 'main'], cwd=git_ops.project_root,
+        )
+        assert main_before.strip() == main_after.strip()
+
+        # (3) The dirty edit is untouched: advance_main did NOT run
+        # `read-tree -u --reset`, which would have clobbered the concurrent
+        # commit's staged/working state.
+        assert (git_ops.project_root / 'README.md').read_text() == dirty
+
+    async def test_foreign_lock_file_is_never_deleted(self, git_ops: GitOps):
+        """We stand off; we never break another process's lock.
+
+        Deleting a live `git commit --only`'s index.lock would corrupt the
+        in-flight commit — the whole point of standing off is that when a
+        foreign process owns the index, the only safe action is to touch
+        nothing and come back later.
+        """
+        merge_result = await self._make_merge(
+            git_ops, 'lock-untouched', 'lock_untouched.py',
+        )
+        (git_ops.project_root / 'README.md').write_text('# dirty\n')
+        git_ops.config.merge_park_lock_grace_seconds = 0
+
+        lock_path = git_ops.project_root / '.git' / 'index.lock'
+        lock_path.write_text('sentinel-contents')
+        try:
+            result = await git_ops.advance_main(merge_result.merge_commit)
+            assert result.result == 'park_lock_contended'
+            assert lock_path.exists(), (
+                'advance_main must never delete a foreign index.lock'
+            )
+            assert lock_path.read_text() == 'sentinel-contents', (
+                'the foreign lock file must be left byte-identical'
+            )
+        finally:
+            if lock_path.exists():
+                lock_path.unlink()
+            await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
+
+    async def test_lock_clearing_during_grace_lets_the_merge_land(
+        self, git_ops: GitOps,
+    ):
+        """The transient case must LAND, not merely be classified.
+
+        Simulates the ordinary docs-direct-commit-on-main: the lock is held
+        when advance_main starts and is released partway through, as the
+        concurrent `git commit --only` finishes its pre-commit hook. Once
+        clear, every downstream step must be byte-identical to today — the
+        park/apply round-trip runs normally and the merge lands.
+
+        Deliberately asserts NO elapsed-wall-clock bound: the contract is
+        "waits until clear, then proceeds", not a latency figure.
+
+        The release is triggered by OBSERVATION COUNT, not by a sleep. A
+        pass-through spy on `_index_lock_state` unlinks the REAL lock file
+        after the gate has observed it held twice, so the waiter is proven
+        to have looped at least once and the test cannot flake on how long
+        advance_main's preamble happens to take. Everything the spy reports
+        is the real on-disk state; only the moment of the (real) unlink is
+        made deterministic.
+        """
+        merge_result = await self._make_merge(
+            git_ops, 'lock-clears', 'lock_clears.py',
+        )
+
+        wip = '# WIP that must survive the stand-off\n'
+        (git_ops.project_root / 'README.md').write_text(wip)
+
+        git_ops.config.merge_park_lock_grace_seconds = 5
+
+        lock_path = git_ops.project_root / '.git' / 'index.lock'
+        lock_path.write_text('')
+
+        original_state = git_ops._index_lock_state
+        observations: list[bool] = []
+
+        async def spy_index_lock_state():
+            present, age = await original_state()
+            observations.append(present)
+            # Release on the 2nd held observation: the waiter has polled at
+            # least once, so this genuinely exercises the wait loop.
+            if present and sum(observations) >= 2:
+                with contextlib.suppress(FileNotFoundError):
+                    lock_path.unlink()
+            return (present, age)
+
+        try:
+            with patch.object(
+                git_ops, '_index_lock_state', side_effect=spy_index_lock_state,
+            ):
+                result = await git_ops.advance_main(merge_result.merge_commit)
+        finally:
+            if lock_path.exists():
+                lock_path.unlink()
+            await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
+
+        assert sum(observations) >= 2, (
+            'the gate must have observed the lock HELD and then polled again '
+            f'— observations: {observations!r}'
+        )
+
+        # (1) It landed.
+        assert result.result == 'advanced', (
+            'once the foreign lock clears, the advance must proceed exactly '
+            f'as it does today; got {result.result!r}'
+        )
+
+        # (2) main moved to the merge commit.
+        _, main_after, _ = await _run(
+            ['git', 'rev-parse', 'main'], cwd=git_ops.project_root,
+        )
+        assert main_after.strip() == merge_result.merge_commit
+
+        # (3) The park/apply round-trip ran normally — WIP is back.
+        assert (git_ops.project_root / 'README.md').read_text() == wip
+
+        # (4) The park ref was cleaned up.
+        rc, _, _ = await _run(
+            ['git', 'rev-parse', '--verify', '--quiet', MERGE_PARK_REF],
+            cwd=git_ops.project_root,
+        )
+        assert rc != 0, f'expected {MERGE_PARK_REF} to be absent after advance'
+
+    async def test_clean_tree_race_is_gated_too(self, git_ops: GitOps):
+        """The stand-off must key on `is_on_main`, NOT on `dirty_tracked`.
+
+        With a CLEAN project_root tree the code skips the park entirely,
+        advances the ref, and then syncs the working tree with
+        `git read-tree -u --reset HEAD`. That sync's failure is only LOGGED
+        while the outcome still reports 'advanced' — so under a foreign lock
+        main LANDS with a stale project_root tree, and the NEXT advance then
+        reads the whole old-main→new-main delta as "dirty" WIP, cascading
+        into wip_overlap/park damage.
+
+        A gate placed inside `if dirty_tracked:` would leave that hole wide
+        open, because no park is attempted on this path at all.
+        """
+        _, main_before, _ = await _run(
+            ['git', 'rev-parse', 'main'], cwd=git_ops.project_root,
+        )
+
+        merge_result = await self._make_merge(
+            git_ops, 'clean-tree-race', 'clean_tree_race.py',
+        )
+
+        # Deliberately leave project_root free of TRACKED modifications, so
+        # advance_main's `dirty_tracked` set is empty and no park is ever
+        # attempted. (An untracked-only `?? .worktrees/` entry is expected
+        # here and deliberately does NOT arm the park — untracked entries
+        # survive read-tree without conflict.)
+        _, unstaged, _ = await _run(
+            ['git', 'diff', '--name-only'], cwd=git_ops.project_root,
+        )
+        _, staged, _ = await _run(
+            ['git', 'diff', '--name-only', '--cached'], cwd=git_ops.project_root,
+        )
+        assert unstaged.strip() == '' and staged.strip() == '', (
+            'this test requires NO tracked modifications in project_root; got '
+            f'unstaged={unstaged!r} staged={staged!r}'
+        )
+
+        git_ops.config.merge_park_lock_grace_seconds = 0
+
+        lock_path = git_ops.project_root / '.git' / 'index.lock'
+        lock_path.write_text('')
+        try:
+            result = await git_ops.advance_main(merge_result.merge_commit)
+        finally:
+            if lock_path.exists():
+                lock_path.unlink()
+            await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
+
+        assert result.result == 'park_lock_contended', (
+            'a foreign index lock must gate the CLEAN-tree path too — the '
+            'post-advance read-tree sync writes project_root just as the '
+            f'park does; got {result.result!r}'
+        )
+
+        # main must NOT have moved: landing it here is precisely the silent
+        # stale-tree failure described above.
+        _, main_after, _ = await _run(
+            ['git', 'rev-parse', 'main'], cwd=git_ops.project_root,
+        )
+        assert main_before.strip() == main_after.strip()
+
+    async def test_lock_appearing_after_the_gate_is_still_transient(
+        self, git_ops: GitOps, tmp_path: Path,
+    ):
+        """TOCTOU: a lock that appears BETWEEN the gate and `git stash create`
+        must still be classified as transient, not halt the queue.
+
+        The gate is a probe, so the window it cannot cover is the one where a
+        concurrent `git commit --only` starts right after the probe. The park
+        itself must therefore re-probe on failure and raise
+        MergeParkLockContentionError rather than the generic MergeParkError.
+        """
+        merge_result = await self._make_merge(
+            git_ops, 'lock-toctou', 'lock_toctou.py',
+        )
+        (git_ops.project_root / 'README.md').write_text('# dirty during toctou\n')
+        git_ops.config.merge_park_lock_grace_seconds = 0
+        git_ops.proc_root = empty_proc_table(tmp_path)
+
+        lock_path = git_ops.project_root / '.git' / 'index.lock'
+        original_run = _run
+
+        async def mock_run(cmd, cwd=None, **kwargs):
+            if cmd[:3] == ['git', 'stash', 'create']:
+                # The concurrent `git commit --only` grabs the index right
+                # after the gate probed it clear. Reproduce git 2.43's real
+                # signature: rc=1 with EMPTY stdout AND stderr.
+                lock_path.write_text('')
+                return (1, '', '')
+            return await original_run(cmd, cwd=cwd, **kwargs)
+
+        try:
+            with patch('orchestrator.git_ops._run', side_effect=mock_run):
+                result = await git_ops.advance_main(merge_result.merge_commit)
+        finally:
+            if lock_path.exists():
+                lock_path.unlink()
+            await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
+
+        assert result.result == 'park_lock_contended', (
+            'a lock appearing inside the TOCTOU window must still be '
+            f'transient, never a queue halt; got {result.result!r}'
+        )
+        scan = git_ops._last_park_lock_info.get('holder_scan')
+        assert scan == GitProcessScan((), confirmed=True), (
+            f'the mid-park side channel must carry its own holder scan; got {scan!r}'
+        )
+        reason = await _park_lock_reason(git_ops, merge_result.merge_commit)
+        assert 'rm -f' not in reason, (
+            f'a lock watched appearing is young, never a crashed leftover; got {reason!r}'
+        )
+
+    async def test_park_raises_lock_contention_error_when_lock_present(
+        self, git_ops: GitOps,
+    ):
+        """_park_wip_on_private_ref itself raises the subclass, so the
+        classification lives at the source rather than being re-derived by
+        every caller."""
+        (git_ops.project_root / 'README.md').write_text('# dirty for park\n')
+
+        lock_path = git_ops.project_root / '.git' / 'index.lock'
+        original_run = _run
+
+        async def mock_run(cmd, cwd=None, **kwargs):
+            if cmd[:3] == ['git', 'stash', 'create']:
+                lock_path.write_text('')
+                return (1, '', '')
+            return await original_run(cmd, cwd=cwd, **kwargs)
+
+        try:
+            with (
+                patch('orchestrator.git_ops._run', side_effect=mock_run),
+                pytest.raises(MergeParkLockContentionError),
+            ):
+                await git_ops._park_wip_on_private_ref('lbl')
+        finally:
+            if lock_path.exists():
+                lock_path.unlink()
+
+        # It must remain a MergeParkError subclass so any existing
+        # `except MergeParkError` handler still catches it.
+        assert issubclass(MergeParkLockContentionError, MergeParkError)
+
+    async def test_read_tree_failure_under_a_lock_is_NOT_transient(
+        self, git_ops: GitOps,
+    ):
+        """A read-tree failure must halt loudly even with a lock present.
+
+        read-tree runs AFTER `update-ref` has already created
+        MERGE_PARK_REF.  Classifying it as transient lock contention would
+        return a per-task 'park_lock_contended' that neither deletes the ref
+        nor applies it, leaving MERGE_PARK_REF dangling — and the NEXT
+        advance's single-flight guard would raise MergeParkContentionError
+        -> 'stash_failed', halting the WHOLE queue.  That converts a
+        transient race into a guaranteed later halt, so this site keeps the
+        generic MergeParkError (WIP safe on the ref, recovered this cycle).
+        """
+        (git_ops.project_root / 'README.md').write_text('# dirty for read-tree\n')
+
+        lock_path = git_ops.project_root / '.git' / 'index.lock'
+        original_run = _run
+
+        async def mock_run(cmd, cwd=None, **kwargs):
+            if cmd[:3] == ['git', 'read-tree', '-u']:
+                # A foreign `git commit --only` grabs the index between the
+                # successful update-ref and the tree clean.
+                lock_path.write_text('')
+                return (1, '', '')
+            return await original_run(cmd, cwd=cwd, **kwargs)
+
+        try:
+            with (
+                patch('orchestrator.git_ops._run', side_effect=mock_run),
+                pytest.raises(MergeParkError) as excinfo,
+            ):
+                await git_ops._park_wip_on_private_ref('lbl')
+        finally:
+            if lock_path.exists():
+                lock_path.unlink()
+
+        assert not isinstance(excinfo.value, MergeParkLockContentionError), (
+            'the post-update-ref read-tree failure must NOT be classified as '
+            'transient lock contention — that leaves MERGE_PARK_REF dangling '
+            f'and halts the queue on the NEXT advance; got {excinfo.value!r}'
+        )
+
+        # The WIP really is preserved on the ref, which is what justifies
+        # halting loudly here rather than pretending nothing happened.
+        rc, sha, _ = await _run(
+            ['git', 'rev-parse', '--verify', '--quiet', MERGE_PARK_REF],
+            cwd=git_ops.project_root,
+        )
+        assert rc == 0 and sha.strip(), (
+            'MERGE_PARK_REF must still hold the parked WIP after a read-tree '
+            'failure, so the halt is recoverable'
+        )
+        await _run(
+            ['git', 'update-ref', '-d', MERGE_PARK_REF],
+            cwd=git_ops.project_root,
+        )
+
+    async def test_stash_failure_without_a_lock_still_halts(self, git_ops: GitOps):
+        """NON-REGRESSION: a genuine park failure with NO index.lock present
+        keeps its existing loud queue-halt semantics.
+
+        The fix must narrow `stash_failed` to exactly the shared-hygiene
+        fault it was meant to report — not weaken it.
+        """
+        merge_result = await self._make_merge(
+            git_ops, 'stash-fail-nolock', 'stash_fail_nolock.py',
+        )
+        (git_ops.project_root / 'README.md').write_text('# dirty tracked edit\n')
+
+        lock_path = git_ops.project_root / '.git' / 'index.lock'
+        assert not lock_path.exists(), 'this test requires NO index.lock present'
+
+        original_run = _run
+
+        async def mock_run(cmd, cwd=None, **kwargs):
+            if cmd[:3] == ['git', 'stash', 'create']:
+                return (1, '', 'fatal: cannot stash changes')
+            return await original_run(cmd, cwd=cwd, **kwargs)
+
+        with patch('orchestrator.git_ops._run', side_effect=mock_run):
+            result = await git_ops.advance_main(merge_result.merge_commit)
+
+        await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
+
+        assert result.result == 'stash_failed', (
+            'a park failure with no lock present must keep halting the queue; '
+            f'got {result.result!r}'
+        )
+        assert git_ops._last_stash_dirty_files == ['README.md'], (
+            'the stash_failed escalation must still name the dirty tracked '
+            f'file(s); got {getattr(git_ops, "_last_stash_dirty_files", "<unset>")!r}'
+        )
+
+    async def test_side_channel_carries_the_age_seen_BEFORE_the_standoff(
+        self, git_ops: GitOps,
+    ):
+        """The side channel must report the age observed at the FIRST probe.
+
+        `_await_index_lock_clear` probes the lock once before waiting — the
+        only observation that predates the stand-off — and today DISCARDS it,
+        so the gate re-probes afterwards and reports
+        `age_seconds == initial_age + waited + epsilon`.  With grace=300 a
+        live `git commit --only` that started 2s before the advance reports
+        302s, and an hour-old crashed-git leftover reports 3900s: both exceed
+        `waited`, so a downstream staleness test keyed on the post-wait age
+        cannot discriminate them at all.  Only an age measured BEFORE the wait
+        carries the information.
+
+        LIVE-COMMIT SHAPE: a lock created moments ago, whose holder simply
+        outlives the grace.  Its reported age must exclude the stand-off.
+        """
+        merge_result = await self._make_merge(
+            git_ops, 'lock-initial-age', 'lock_initial_age.py',
+        )
+        (git_ops.project_root / 'README.md').write_text('# dirty for initial age\n')
+
+        # A short-but-real grace so the stand-off genuinely runs and the two
+        # probes are separated by a measurable interval.
+        git_ops.config.merge_park_lock_grace_seconds = 1.5
+
+        lock_path = git_ops.project_root / '.git' / 'index.lock'
+        lock_path.write_text('')  # freshly created => initial age ~0
+        try:
+            result = await git_ops.advance_main(merge_result.merge_commit)
+        finally:
+            if lock_path.exists():
+                lock_path.unlink()
+            await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
+
+        assert result.result == 'park_lock_contended'
+
+        info = git_ops._last_park_lock_info
+        assert 'initial_age_seconds' in info, (
+            'the pre-wait observation must reach the side channel; got keys '
+            f'{sorted(info)!r}'
+        )
+        # Deliberately NOT an absolute bound on `initial_age_seconds`.  The
+        # first probe sits behind advance_main's whole preamble (merge-base,
+        # rev-parse, unmerged-state and symbolic-ref subprocesses), so on a
+        # loaded box — 16 xdist workers — a lock created "moments ago" can
+        # legitimately read >1s old at that probe.  Bounding it by a constant
+        # measures the preamble, not the behaviour, and flakes.
+        #
+        # The load-independent fact: `age_seconds` and `initial_age_seconds`
+        # come from the SAME `time.time() - mtime` expression over the SAME
+        # (never rewritten) mtime, so their difference is exactly the interval
+        # between the two probes — and the entire stand-off lies inside it.
+        # The bug this pins (re-probing AFTER the wait and calling the result
+        # "initial") collapses that difference to ~0, whatever the load.  The
+        # epsilon absorbs time.time()/time.monotonic() source skew only.
+        assert (
+            info['age_seconds'] - info['initial_age_seconds']
+            >= info['waited_seconds'] - 0.05
+        ), (
+            'the first-probe age must predate the stand-off, so the post-wait '
+            're-probe must be older by at least the wait; got '
+            f'initial={info["initial_age_seconds"]!r} '
+            f'age={info["age_seconds"]!r} '
+            f'waited={info["waited_seconds"]!r}'
+        )
+        assert info['grace_seconds'] == 1.5, (
+            'the grace actually applied must travel in the side channel so '
+            'the mapper stays a pure function of it; got '
+            f'{info.get("grace_seconds", "<unset>")!r}'
+        )
+
+    async def test_side_channel_reports_a_crashed_leftover_as_old(
+        self, git_ops: GitOps, tmp_path: Path,
+    ):
+        """CRASHED-LEFTOVER SHAPE: a lock already ancient at the first probe,
+        and a complete holder scan that found no git process.
+
+        This is the ONLY shape for which destructive `rm -f` recovery advice
+        is defensible, so the side channel must make it distinguishable from
+        the live-commit shape above.  grace=0 (probe-only fail-fast) keeps the
+        test from sleeping.  The process table is an empty one, the proof of
+        no holder: whether the host's /proc yields a CONFIRMED scan depends on
+        every other process on it (see test_index_lock_liveness.py).
+        """
+        merge_result = await self._make_merge(
+            git_ops, 'lock-stale-age', 'lock_stale_age.py',
+        )
+        (git_ops.project_root / 'README.md').write_text('# dirty for stale age\n')
+
+        git_ops.config.merge_park_lock_grace_seconds = 0
+        git_ops.proc_root = empty_proc_table(tmp_path)
+
+        lock_path = index_lock_written_ago(git_ops.project_root, 1000)
+        try:
+            result = await git_ops.advance_main(merge_result.merge_commit)
+        finally:
+            if lock_path.exists():
+                lock_path.unlink()
+            await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
+
+        assert result.result == 'park_lock_contended'
+
+        info = git_ops._last_park_lock_info
+        assert info['initial_age_seconds'] >= 900, (
+            'a backdated lock must be reported as OLD at the first probe; got '
+            f'{info.get("initial_age_seconds", "<unset>")!r}'
+        )
+        assert info['grace_seconds'] == 0, (
+            'grace=0 must travel through as-is — the fail-fast off-switch is '
+            'still a real, comparable grace downstream; got '
+            f'{info.get("grace_seconds", "<unset>")!r}'
+        )
+        assert info.get('holder_scan') == GitProcessScan((), confirmed=True), (
+            'the side channel must carry the holder scan that proves no git '
+            f'process holds the lock; got {info.get("holder_scan", "<unset>")!r}'
+        )
+
+    async def test_a_live_commit_in_its_hook_is_named_not_called_a_leftover(
+        self, git_ops: GitOps,
+    ):
+        """THE REIFY INCIDENT (task 5229), end to end through the reason.
+
+        A healthy `git commit --only` in its pre-commit hook holds the index
+        lock with no fd on it, its git process alive in project_root.  The
+        lock is NOT backdated: a real commit's git starts before it writes
+        the lock, and backdating fakes the opposite.  The hour-old shape is
+        pinned on a constructed process table below.
+        """
+        merge_result = await self._make_merge(
+            git_ops, 'lock-live-holder', 'lock_live_holder.py',
+        )
+        (git_ops.project_root / 'README.md').write_text('# a commit in its hook\n')
+        git_ops.config.merge_park_lock_grace_seconds = 0
+        try:
+            with commit_blocked_in_pre_commit_hook(git_ops.project_root, 'README.md') as git_pid:
+                result = await git_ops.advance_main(merge_result.merge_commit)
+        finally:
+            await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
+
+        assert result.result == 'park_lock_contended'
+        scan = git_ops._last_park_lock_info.get('holder_scan')
+        assert isinstance(scan, GitProcessScan), (
+            f'the side channel must carry a holder scan; got {scan!r}'
+        )
+        assert git_pid in {process.pid for process in scan.processes}
+
+        reason = await _park_lock_reason(git_ops, merge_result.merge_commit)
+        assert f'pid {git_pid}' in reason
+        assert '--only README.md' in reason
+        assert 'rm -f' not in reason, (
+            f'a lock a live commit holds must never be offered removal; got {reason!r}'
+        )
+
+    async def test_an_old_lock_with_a_live_holder_is_still_waited_on(
+        self, git_ops: GitOps, tmp_path: Path, caplog,
+    ):
+        """Age past the floor no longer skips the stand-off when a live git
+        holds the lock: the reify commit finished minutes after the deferral.
+
+        `waited > 0.0` is load-independent: the short-circuit returns exactly
+        0.0, and the poll loop runs to its own monotonic deadline.
+        """
+        from orchestrator.git_ops import _INDEX_LOCK_STALE_FLOOR_S
+
+        lock_path = index_lock_written_ago(
+            git_ops.project_root, _INDEX_LOCK_STALE_FLOOR_S + 1000,
+        )
+        git_ops.proc_root = _table_holding_one_git_process(
+            tmp_path, git_ops.project_root,
+            command=_HOLDER_COMMAND, started_at=lock_path.stat().st_mtime - 60,
+        )
+        try:
+            with caplog.at_level(logging.WARNING, logger='orchestrator.git_ops'):
+                standoff = await git_ops._await_index_lock_clear(
+                    timeout_s=_POLLED_BUDGET_S, context='live-holder-old-lock',
+                )
+        finally:
+            lock_path.unlink()
+
+        assert standoff.cleared is False
+        assert standoff.initial_age_s > _INDEX_LOCK_STALE_FLOOR_S
+        assert standoff.waited_s > 0.0, (
+            f'a lock a live git process holds must be waited on; got waited={standoff.waited_s!r}'
+        )
+        assert any(f'pid {_HOLDER_PID}' in record.getMessage() for record in caplog.records), (
+            'the stand-off warning must name the live holder; got '
+            f'{[record.getMessage() for record in caplog.records]!r}'
+        )
+
+    async def test_an_hour_old_lock_whose_holder_predates_it_is_named_not_called_a_leftover(
+        self, git_ops: GitOps, tmp_path: Path,
+    ):
+        """THE REIFY SHAPE with an OLD lock: a commit 55 minutes into its
+        pre-commit hook.  Its git started before it wrote the lock, so the
+        lock's age, however great, never earns `rm -f`."""
+        merge_result = await self._make_merge(
+            git_ops, 'lock-old-holder', 'lock_old_holder.py',
+        )
+        git_ops.config.merge_park_lock_grace_seconds = 0
+        lock_path = index_lock_written_ago(git_ops.project_root, REIFY_LOCK_AGE_S)
+        git_ops.proc_root = _table_holding_one_git_process(
+            tmp_path, git_ops.project_root,
+            command=_HOLDER_COMMAND, started_at=lock_path.stat().st_mtime - 60,
+        )
+        try:
+            result = await git_ops.advance_main(merge_result.merge_commit)
+        finally:
+            lock_path.unlink()
+            await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
+
+        assert result.result == 'park_lock_contended'
+        reason = await _park_lock_reason(git_ops, merge_result.merge_commit)
+        assert f'pid {_HOLDER_PID}' in reason
+        assert _HOLDER_COMMAND in reason
+        assert 'rm -f' not in reason, (
+            f'a lock whose holder predates it must never be offered removal; got {reason!r}'
+        )
+
+    async def test_a_git_process_started_after_an_old_lock_does_not_mask_a_crashed_leftover(
+        self, git_ops: GitOps, tmp_path: Path,
+    ):
+        """The merge worker's own read-only `git cherry` / `git log` children
+        sit in project_root about half the time.  One that started after the
+        lock was written cannot have created it, so an hour-old lock nobody
+        else holds is still a crashed leftover."""
+        merge_result = await self._make_merge(
+            git_ops, 'lock-later-reader', 'lock_later_reader.py',
+        )
+        git_ops.config.merge_park_lock_grace_seconds = 0
+        lock_path = index_lock_written_ago(git_ops.project_root, REIFY_LOCK_AGE_S)
+        git_ops.proc_root = _table_holding_one_git_process(
+            tmp_path, git_ops.project_root,
+            command=_LATER_READER_COMMAND, started_at=time.time(),
+        )
+        try:
+            result = await git_ops.advance_main(merge_result.merge_commit)
+        finally:
+            lock_path.unlink()
+            await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
+
+        assert result.result == 'park_lock_contended'
+        assert git_ops._last_park_lock_info['holder_scan'] == GitProcessScan(
+            (), confirmed=True,
+        )
+        reason = await _park_lock_reason(git_ops, merge_result.merge_commit)
+        assert f'rm -f {lock_path}' in reason, (
+            f'a crashed leftover must still get its recovery advice; got {reason!r}'
+        )
+        assert 'git cherry' not in reason
+
+    async def test_a_git_process_started_after_an_old_lock_does_not_cost_the_standoff(
+        self, git_ops: GitOps, tmp_path: Path,
+    ):
+        lock_path = index_lock_written_ago(git_ops.project_root, REIFY_LOCK_AGE_S)
+        git_ops.proc_root = _table_holding_one_git_process(
+            tmp_path, git_ops.project_root,
+            command=_LATER_READER_COMMAND, started_at=time.time(),
+        )
+        try:
+            standoff = await git_ops._await_index_lock_clear(
+                timeout_s=1.0, context='later-reader-old-lock',
+            )
+        finally:
+            lock_path.unlink()
+
+        assert standoff.cleared is False
+        assert standoff.waited_s == 0.0, (
+            'a git process that started after the lock must not turn a crashed '
+            f'leftover into a stand-off; got waited={standoff.waited_s!r}'
+        )
+
+    async def test_a_skipped_standoff_reports_the_scan_it_decided_on(
+        self, git_ops: GitOps, tmp_path: Path,
+    ):
+        from orchestrator.git_ops import _INDEX_LOCK_STALE_FLOOR_S
+
+        git_ops.proc_root = empty_proc_table(tmp_path)
+        lock_path = index_lock_written_ago(
+            git_ops.project_root, _INDEX_LOCK_STALE_FLOOR_S + 1000,
+        )
+        try:
+            result = await git_ops._await_index_lock_clear(
+                timeout_s=1.0, context='skipped-standoff-scan',
+            )
+        finally:
+            lock_path.unlink()
+
+        assert result.cleared is False
+        assert result.waited_s == 0.0
+        assert result.holder_scan == GitProcessScan((), confirmed=True)
+
+    async def test_a_timed_out_standoff_reports_a_scan_taken_at_its_deadline(
+        self, git_ops: GitOps, tmp_path: Path,
+    ):
+        from orchestrator.git_ops import _INDEX_LOCK_STALE_FLOOR_S
+
+        lock_path = index_lock_written_ago(
+            git_ops.project_root, _INDEX_LOCK_STALE_FLOOR_S + 1000,
+        )
+        git_ops.proc_root = _table_holding_one_git_process(
+            tmp_path, git_ops.project_root,
+            command=_HOLDER_COMMAND, started_at=lock_path.stat().st_mtime - 60,
+        )
+        try:
+            timed_out = await git_ops._await_index_lock_clear(
+                timeout_s=_POLLED_BUDGET_S, context='timed-out-standoff-scan',
+            )
+        finally:
+            lock_path.unlink()
+        unheld = await git_ops._await_index_lock_clear(
+            timeout_s=1.0, context='no-lock-standoff-scan',
+        )
+
+        assert timed_out.cleared is False
+        assert timed_out.waited_s > 0.0
+        assert timed_out.holder_scan is not None
+        assert [process.pid for process in timed_out.holder_scan.processes] == [_HOLDER_PID]
+        assert unheld.cleared is True
+        assert unheld.holder_scan is None
+
+    async def test_a_short_circuited_deferral_keeps_the_rm_f_advice_when_a_git_process_appears_later(
+        self, git_ops: GitOps, tmp_path: Path,
+    ):
+        """The stand-off and the reason must judge the SAME scan.  A git
+        process that shows up after the scan that skipped the wait would
+        otherwise pair "waited 0s" with "wait for that process to exit"."""
+        merge_result = await self._make_merge(
+            git_ops, 'lock-one-scan', 'lock_one_scan.py',
+        )
+        git_ops.config.merge_park_lock_grace_seconds = 0
+        git_ops.proc_root = empty_proc_table(tmp_path)
+        lock_path = index_lock_written_ago(git_ops.project_root, REIFY_LOCK_AGE_S)
+        late_arrival = GitProcessScan(
+            (GitProcess(4_000_000, _LATER_READER_COMMAND),), confirmed=True,
+        )
+        scans_taken: list[Path] = []
+
+        def first_scan_real_then_a_late_arrival(
+            lock: Path, work_tree: Path, *, proc_root: Path,
+        ) -> GitProcessScan:
+            scans_taken.append(lock)
+            if len(scans_taken) > 1:
+                return late_arrival
+            return scan_index_lock_holders(lock, work_tree, proc_root=proc_root)
+
+        git_ops.holder_scanner = first_scan_real_then_a_late_arrival
+        try:
+            result = await git_ops.advance_main(merge_result.merge_commit)
+        finally:
+            lock_path.unlink()
+            await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
+
+        assert result.result == 'park_lock_contended'
+        info = git_ops._last_park_lock_info
+        assert info['waited_seconds'] == 0.0
+        assert info['holder_scan'] == GitProcessScan((), confirmed=True)
+        reason = await _park_lock_reason(git_ops, merge_result.merge_commit)
+        assert f'rm -f {lock_path}' in reason, (
+            f'the reason must come from the scan that skipped the wait; got {reason!r}'
+        )
+        assert '4000000' not in reason
+
+    async def test_an_old_lock_with_an_unconfirmed_scan_is_still_waited_on(
+        self, git_ops: GitOps, tmp_path: Path,
+    ):
+        """Unknown is never "none": a scan that could not enumerate the
+        process table cannot prove the holder dead, so the wait still runs."""
+        from orchestrator.git_ops import _INDEX_LOCK_STALE_FLOOR_S
+
+        git_ops.proc_root = tmp_path / 'no-proc-mounted'
+        lock_path = index_lock_written_ago(
+            git_ops.project_root, _INDEX_LOCK_STALE_FLOOR_S + 1000,
+        )
+        try:
+            standoff = await git_ops._await_index_lock_clear(
+                timeout_s=_POLLED_BUDGET_S, context='unconfirmed-scan-old-lock',
+            )
+        finally:
+            lock_path.unlink()
+
+        assert standoff.cleared is False
+        assert standoff.waited_s > 0.0, (
+            f'an unconfirmed scan must not skip the stand-off; got waited={standoff.waited_s!r}'
+        )
+
+    async def test_post_advance_sync_failure_under_a_lock_is_retried(
+        self, git_ops: GitOps,
+    ):
+        """The RESIDUAL TOCTOU window at the post-advance tree sync.
+
+        The pre-snapshot gate is a PROBE, so a foreign `git commit --only`
+        can still grab the index between it and the post-advance
+        `read-tree -u --reset HEAD` — and on the CLEAN-tree path there is no
+        park, hence no mid-park re-probe to catch it.  Left alone that is the
+        exact silent failure the gate exists to prevent: the sync's failure is
+        only LOGGED while the outcome still reports 'advanced', so main lands
+        with a stale project_root tree and the NEXT advance reads the whole
+        old-main->new-main delta as "dirty" WIP.
+
+        Returning 'park_lock_contended' here would be a LIE (update-ref has
+        already run), so the contract is a bounded stand-off and a RETRY of
+        the sync in place.
+        """
+        merge_result = await self._make_merge(
+            git_ops, 'sync-retry', 'sync_retry.py',
+        )
+        synced_file = git_ops.project_root / 'sync_retry.py'
+        assert not synced_file.exists(), (
+            'the merge commit is not in project_root\'s tree until the '
+            'post-advance sync runs — that is what this test measures'
+        )
+
+        git_ops.config.merge_park_lock_grace_seconds = 5
+
+        lock_path = git_ops.project_root / '.git' / 'index.lock'
+        original_run = _run
+        read_tree_calls: list[int] = []
+
+        async def mock_run(cmd, cwd=None, **kwargs):
+            if cmd[:3] == ['git', 'read-tree', '-u'] and cwd == git_ops.project_root:
+                read_tree_calls.append(1)
+                if len(read_tree_calls) == 1:
+                    # A foreign `git commit --only` grabbed the index in the
+                    # window the gate cannot cover. git 2.43's real signature:
+                    # rc=1 with EMPTY stdout AND stderr.
+                    lock_path.write_text('')
+                    return (1, '', '')
+            return await original_run(cmd, cwd=cwd, **kwargs)
+
+        original_state = git_ops._index_lock_state
+        held_observations: list[bool] = []
+
+        async def spy_index_lock_state():
+            present, age = await original_state()
+            held_observations.append(present)
+            # Release once the stand-off has actually observed it held, so the
+            # retry is reached without the test depending on wall-clock.
+            if present:
+                with contextlib.suppress(FileNotFoundError):
+                    lock_path.unlink()
+            return (present, age)
+
+        try:
+            with (
+                patch('orchestrator.git_ops._run', side_effect=mock_run),
+                patch.object(
+                    git_ops, '_index_lock_state',
+                    side_effect=spy_index_lock_state,
+                ),
+            ):
+                result = await git_ops.advance_main(merge_result.merge_commit)
+        finally:
+            if lock_path.exists():
+                lock_path.unlink()
+            await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
+
+        # (1) main landed — this site must NOT claim transient contention.
+        assert result.result == 'advanced', (
+            'update-ref already ran, so the outcome must stay \'advanced\'; '
+            f'got {result.result!r}'
+        )
+
+        # (2) The sync was RETRIED, not merely logged and abandoned.
+        assert len(read_tree_calls) >= 2, (
+            'a read-tree failure with a foreign lock held must be retried '
+            f'after standing off; got {len(read_tree_calls)} call(s)'
+        )
+        assert any(held_observations), (
+            'the retry path must have observed the foreign lock held; got '
+            f'{held_observations!r}'
+        )
+
+        # (3) The tree really is in sync with the new HEAD — the whole point.
+        assert synced_file.exists(), (
+            'project_root\'s working tree must match the advanced HEAD, or '
+            'the NEXT advance reads the delta as dirty WIP'
+        )
+
+    async def test_already_stale_lock_skips_the_standoff(
+        self, git_ops: GitOps, tmp_path: Path,
+    ):
+        """A crashed-git leftover must not cost the queue the whole grace.
+
+        A crashed leftover is a PRE-wait age past
+        `max(grace, _INDEX_LOCK_STALE_FLOOR_S)` AND a complete holder scan
+        that found no git process (here, an empty process table).  Waiting
+        cannot change that verdict, so waiting only burns the full grace in
+        the SERIALIZED merge worker for EVERY queued task until an operator
+        clears the file — a slow-motion version of the stall this gate exists
+        to remove.
+
+        Asserted by PROBE COUNT, not elapsed time: a short-circuit takes the
+        single pre-wait probe and nothing more.
+        """
+        from orchestrator.git_ops import _INDEX_LOCK_STALE_FLOOR_S
+
+        git_ops.proc_root = empty_proc_table(tmp_path)
+        lock_path = index_lock_written_ago(
+            git_ops.project_root, _INDEX_LOCK_STALE_FLOOR_S + 1000,
+        )
+
+        original_state = git_ops._index_lock_state
+        probes: list[bool] = []
+
+        async def counting_state():
+            present, age = await original_state()
+            probes.append(present)
+            return (present, age)
+
+        try:
+            with patch.object(
+                git_ops, '_index_lock_state', side_effect=counting_state,
+            ):
+                standoff = (
+                    await git_ops._await_index_lock_clear(
+                        timeout_s=60.0, context='stale-shortcircuit',
+                    )
+                )
+        finally:
+            lock_path.unlink()
+
+        assert standoff.cleared is False
+        assert standoff.waited_s == 0.0, (
+            'an already-stale lock must not be waited on at all; got '
+            f'waited={standoff.waited_s!r}'
+        )
+        assert standoff.initial_age_s > _INDEX_LOCK_STALE_FLOOR_S
+        assert len(probes) == 1, (
+            'the short-circuit must take exactly the pre-wait probe — more '
+            f'probes mean the poll loop ran anyway; got {probes!r}'
+        )
+
+    async def test_a_young_lock_is_still_waited_on(
+        self, git_ops: GitOps, tmp_path: Path,
+    ):
+        """The stale short-circuit must not over-fire.
+
+        The ordinary docs-direct-commit-on-main window is a YOUNG lock, and
+        that is precisely the case the stand-off exists for — it must still
+        get its full budget.  Contrast the test above.
+
+        The scan is complete and empty and the lock is older than the grace,
+        so the staleness floor alone withholds the short-circuit.
+        """
+        git_ops.proc_root = empty_proc_table(tmp_path)
+        lock_path = index_lock_written_ago(git_ops.project_root, 10.0)
+
+        original_state = git_ops._index_lock_state
+        probes: list[bool] = []
+
+        async def counting_state():
+            present, age = await original_state()
+            probes.append(present)
+            return (present, age)
+
+        try:
+            with patch.object(
+                git_ops, '_index_lock_state', side_effect=counting_state,
+            ):
+                standoff = (
+                    await git_ops._await_index_lock_clear(
+                        timeout_s=_POLLED_BUDGET_S, context='young-lock',
+                    )
+                )
+        finally:
+            lock_path.unlink()
+
+        assert standoff.cleared is False
+        assert len(probes) >= 2, (
+            'a young lock must be POLLED, not short-circuited — the whole '
+            f'point of the stand-off; got {probes!r}'
+        )
+
+    async def test_index_lock_path_resolves_a_dot_git_FILE_layout(
+        self, git_ops: GitOps,
+    ):
+        """`_index_lock_path`'s fallback branch — the only one that forks.
+
+        A linked worktree (and a submodule) has a `.git` FILE, not a
+        directory, so the `<project_root>/.git/index.lock` fast path is wrong
+        there: the real lock lives in the LINKED git-dir
+        (`<main-git-dir>/worktrees/<name>/index.lock`).  A wrong answer here
+        degrades silently to "no lock detected", i.e. straight back to the
+        halting behaviour this task removes — so the branch that resolves it
+        via `rev-parse --absolute-git-dir` needs its own pin.
+        """
+        worktree_info = await git_ops.create_worktree('dot-git-file-layout')
+        wt_path = worktree_info.path
+        try:
+            assert (wt_path / '.git').is_file(), (
+                'this test requires the .git-FILE layout a linked worktree '
+                'produces; got a directory'
+            )
+
+            linked = GitOps(git_ops.config, wt_path)
+            resolved = await linked._index_lock_path()
+
+            # (1) The fast path was NOT taken — that is the bug being pinned.
+            assert resolved != wt_path / '.git' / 'index.lock', (
+                'a .git FILE is not a directory to hang index.lock off; got '
+                f'{resolved}'
+            )
+            # (2) It is the linked git-dir git itself reports.
+            _, abs_git_dir, _ = await _run(
+                ['git', 'rev-parse', '--absolute-git-dir'], cwd=wt_path,
+            )
+            assert resolved == Path(abs_git_dir.strip()) / 'index.lock'
+            assert 'worktrees' in resolved.parts, (
+                f'expected a linked-worktree git-dir; got {resolved}'
+            )
+            assert resolved.parent.is_dir()
+
+            # (3) End-to-end: a lock written THERE is actually detected.
+            assert await linked._index_lock_state() == (False, 0.0)
+            resolved.write_text('')
+            try:
+                present, age = await linked._index_lock_state()
+                assert present is True, (
+                    'a lock in the linked git-dir must be detected, or the '
+                    'stand-off silently degrades to today\'s halt'
+                )
+                assert age >= 0.0
+            finally:
+                resolved.unlink()
+
+            # (4) Memoised — the git-dir cannot move under a live GitOps.
+            assert await linked._index_lock_path() == resolved
+        finally:
+            await git_ops.cleanup_worktree(wt_path, 'dot-git-file-layout')
+
+    async def test_standoff_deadline_is_monotonic_and_re_announces(
+        self, git_ops: GitOps, caplog,
+    ):
+        """The stand-off's budget is monotonic, and a long wait is LOUD.
+
+        Two behaviours with no wall-clock cost, pinned with a fake clock:
+
+        (a) The deadline keys on `time.monotonic()`, so a wall-clock
+            adjustment mid-wait can neither extend nor truncate the budget.
+            The fake wall clock below jumps an HOUR BACKWARD on every poll;
+            a `time.time()`-keyed deadline would never expire.
+        (b) A wait that outlives `_INDEX_LOCK_WARN_INTERVAL_S` re-announces
+            itself, so a stand-off is never a silent stall.
+        """
+        from orchestrator.git_ops import (
+            _INDEX_LOCK_POLL_INTERVAL_S,
+            _INDEX_LOCK_WARN_INTERVAL_S,
+        )
+
+        lock_path = git_ops.project_root / '.git' / 'index.lock'
+        lock_path.write_text('')
+        # Warm the git-dir memo BEFORE the clock is faked, so the wait itself
+        # touches nothing but `stat` and the (faked) clock.
+        await git_ops._index_lock_path()
+
+        budget = 3 * _INDEX_LOCK_WARN_INTERVAL_S
+
+        class _FakeClock:
+            """Monotonic under our control; wall clock deliberately hostile."""
+
+            def __init__(self) -> None:
+                self.mono = 1_000.0
+                self.wall = time.time()
+
+            def monotonic(self) -> float:
+                return self.mono
+
+            def time(self) -> float:
+                return self.wall
+
+        clock = _FakeClock()
+
+        async def fake_sleep(secs):
+            clock.mono += max(0.0, secs)
+            clock.wall -= 3600.0  # hostile wall-clock adjustment
+
+        class _FakeAsyncio:
+            def __init__(self, sleep) -> None:
+                self.sleep = sleep
+                self.to_thread = asyncio.to_thread
+
+        try:
+            with (
+                caplog.at_level(logging.WARNING, logger='orchestrator.git_ops'),
+                patch('orchestrator.git_ops.time', clock),
+                patch('orchestrator.git_ops.asyncio', _FakeAsyncio(fake_sleep)),
+            ):
+                standoff = (
+                    await git_ops._await_index_lock_clear(
+                        timeout_s=budget, context='fake-clock',
+                    )
+                )
+        finally:
+            lock_path.unlink()
+
+        # (a) It gave up at its own monotonic deadline, despite the wall clock
+        # running backwards by an hour per poll.
+        assert standoff.cleared is False
+        assert standoff.waited_s == pytest.approx(budget, abs=_INDEX_LOCK_POLL_INTERVAL_S), (
+            'the budget must be measured on the MONOTONIC clock; got '
+            f'waited={standoff.waited_s!r} for a {budget}s budget'
+        )
+
+        # (b) The wait re-announced itself rather than stalling silently.
+        still_waiting = [
+            r for r in caplog.records if 'Still waiting' in r.message
+        ]
+        assert len(still_waiting) >= 2, (
+            'a wait spanning several warn intervals must re-announce itself; '
+            f'got {[r.message for r in caplog.records]!r}'
+        )
+
+
+class TestIndexLockStandOffInvariant:
+    """A stand-off carries the holder scan its reason is rendered from exactly
+    when the lock was not cleared."""
+
+    def test_a_held_lock_without_a_scan_is_refused(self):
+        with pytest.raises(ValueError, match=r'(?s)cleared=False.*holder_scan=None'):
+            IndexLockStandOff(
+                cleared=False, waited_s=1.0, initial_age_s=12.0, holder_scan=None,
+            )
+
+    def test_a_cleared_lock_with_a_scan_is_refused(self):
+        with pytest.raises(ValueError, match=r'(?s)cleared=True.*GitProcessScan'):
+            IndexLockStandOff(
+                cleared=True, waited_s=0.0, initial_age_s=0.0,
+                holder_scan=GitProcessScan((), confirmed=True),
+            )
+
+
+@pytest.mark.asyncio
+class TestIsAncestorChecked:
+    """The ancestry read tells a git error (None) from a plain no (False)."""
+
+    @staticmethod
+    async def _first_and_diverged(repo: Path) -> tuple[str, str, str]:
+        (repo / 'first.txt').write_text('first\n')
+        first = await _commit_all(repo, 'first')
+        (repo / 'second.txt').write_text('second\n')
+        second = await _commit_all(repo, 'second')
+        rc, _, err = await _run(['git', 'checkout', '-b', 'side', first], cwd=repo)
+        assert rc == 0, err
+        (repo / 'side.txt').write_text('side\n')
+        side = await _commit_all(repo, 'side')
+        return first, second, side
+
+    async def test_an_ancestor_is_true(self, git_ops: GitOps, git_repo: Path):
+        first, second, _ = await self._first_and_diverged(git_repo)
+        assert await git_ops.is_ancestor_checked(first, second) is True
+        assert await git_ops.is_ancestor(first, second) is True
+
+    async def test_a_non_ancestor_is_false(self, git_ops: GitOps, git_repo: Path):
+        _, second, side = await self._first_and_diverged(git_repo)
+        assert await git_ops.is_ancestor_checked(side, second) is False
+        assert await git_ops.is_ancestor(side, second) is False
+
+    async def test_an_unknown_sha_is_none_and_not_an_ancestor(
+        self, git_ops: GitOps, git_repo: Path,
+    ):
+        first, _, _ = await self._first_and_diverged(git_repo)
+        unknown = '0123456789abcdef0123456789abcdef01234567'
+        assert await git_ops.is_ancestor_checked(unknown, first) is None
+        assert await git_ops.is_ancestor_checked(first, unknown) is None
+        assert await git_ops.is_ancestor(unknown, first) is False

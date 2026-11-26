@@ -14,6 +14,7 @@ dependencies = [
     "textual>=0.60",
     "pyyaml>=6.0",
     "orchestrator",
+    "dark-factory-shared",
 ]
 
 [project.scripts]
@@ -21,6 +22,7 @@ cockpit = "cockpit.app:main"
 
 [tool.uv.sources]
 orchestrator = { workspace = true }
+dark-factory-shared = { workspace = true }
 
 [dependency-groups]
 dev = [
@@ -28,15 +30,19 @@ dev = [
     "pytest>=8.0.0",
     "pytest-asyncio>=0.21.0",
     "pytest-timeout>=2.4.0",
+    "pytest-xdist>=3.6.0",
     "ruff>=0.7.1",
     "hypothesis>=6.0",
 ]
 
 [tool.pyright]
 include = ["src", "tests"]
-extraPaths = ["src", "../shared/src", "../orchestrator/src"]
+# ".." LAST (mirrors tests/conftest.py's sys.path.append): resolves the repo-root
+# df_pytest_isolation module without letting project dirs shadow their own src/.
+extraPaths = ["src", "../shared/src", "../orchestrator/src", ".."]
 pythonVersion = "3.11"
 typeCheckingMode = "basic"
+reportUnnecessaryTypeIgnoreComment = "error"
 venvPath = ".."
 venv = ".venv"
 
@@ -47,13 +53,58 @@ line-length = 100
 select = ["E", "F", "UP", "B", "SIM", "I"]
 ignore = ["E501"]
 
+# NOT an enforced gate — style config only: it shapes an ad-hoc or editor-on-save
+# `ruff format` into a repo-consistent single-quoted diff. Do not delete as unused,
+# do not promote to a gate. Why, and the measurements: CONTRIBUTING.md section 3;
+# both directions guarded by tests/scripts/test_ruff_format_policy.py (task 3441).
 [tool.ruff.format]
 quote-style = "single"
 indent-style = "space"
+docstring-code-format = true
 
 [tool.pytest.ini_options]
 markers = [
     "smoke: live smoke tests requiring a real X11/tmux host (DISPLAY, wmctrl/xdotool/xprop/tmux, python3-tk); deselect: -m 'not smoke'",
+    "defect(ref): this test reproduces the declared defect <ref>; the binding is read statically by shared/src/shared/defect_enumerator.py (plans/defect-tests-prd.md decision 8). Not deselected by default.",
+    "criterion(id): this test evidences acceptance criterion <id> (plans/client-feed-prd.md §7.7). Not deselected by default.",
+    "timing(reason): a deadline, grace period or timeout is the behaviour under test, named by reason=; the timing-dependence lint (fused-memory/scripts/_timing_dependence.py) accepts a real sleep, an elapsed-vs-literal assert or a literal wait deadline only under it. Not deselected by default.",
 ]
-addopts = "-m 'not smoke'"
+# PARALLEL TEST EXECUTION (task 5408). Spelling and flag ORDER copy
+# fused-memory/pyproject.toml verbatim (`-n auto --dist loadgroup -m 'not
+# integration'` there), so every parallel module in this workspace reads as one
+# family with only the marker differing.
+# WHY each flag is spelled this way is written ONCE, in the guard that enforces
+# it: tests/scripts/test_merge_gate_parallelism_config.py — its module docstring
+# for `auto` rather than a literal worker count (the count resolves through
+# dark-factory-orchestrator.yaml's PYTEST_XDIST_AUTO_NUM_WORKERS, so one knob
+# governs every parallel module and the A/B cut moves them together),
+# ::test_parallel_member_addopts_declare_xdist_with_loadgroup for `--dist
+# loadgroup`, and ::test_parallel_member_addopts_do_not_copy_max_worker_restart
+# for why orchestrator's `--max-worker-restart=0` is deliberately NOT copied.
+# Five near-identical copies of that argument would be five places to drift when
+# the A/B knob is next cut, so this file states only what is local to it.
+# THE `-m` TERM SURVIVES, and stays ONE flat `not X`: smoke tests drive real
+# X11/tmux against the live host DISPLAY and are opt-in only
+# (tests/test_smoke_marker_config.py proves that behaviourally), `-m` is a
+# single argparse option so a second one would silently replace this, and
+# tests/scripts/test_pytest_workspace_collection.py::_FLAT_DESELECT_RE rejects
+# any richer expression rather than approximating it.
+# MEASURED at `-n 8 --dist loadgroup` on the 5408 tree: 346 passed in 18.76s,
+# exit 0.
+addopts = "-n auto --dist loadgroup -m 'not smoke'"
 asyncio_mode = "auto"
+# Default per-test timeout. This entry CLOSES A TOTAL-ABSENCE GAP rather than
+# updating a stale value: until task 5442 this config declared neither key, so
+# this suite ran uncapped even though pytest-timeout was already a dev
+# dependency — the plugin was installed and inert.
+# `signal` is chosen from existing evidence, not a new experiment, and the
+# signal-vs-thread trade is deliberately NOT reopened here: the addopts above are
+# the IDENTICAL flag set dashboard/ and escalation/pyproject.toml run, both of
+# which carry timeout_method = "signal" and record themselves measured green
+# under exactly those flags (task 5408). The argument for why flipping to
+# `thread` is a real trade rather than a free upgrade lives once, in
+# tests/scripts/test_timeout_method_policy.py.
+# Value provenance: plans/pytest-per-test-timeout-measurement-2026-09-17.md.
+# Rationale for the setting: shared/pyproject.toml. Neither is restated here.
+timeout = 420
+timeout_method = "signal"

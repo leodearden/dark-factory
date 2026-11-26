@@ -1,0 +1,18 @@
+{
+  "task_id": "5229",
+  "reason": "live-holder scan added to the index.lock stand-off and its side channel (task 5229): three new park-lock tests in test_git_ops.py drive GitOps._await_index_lock_clear and read the _last_park_lock_info side channel, as the class's existing tests do",
+  "measures": [
+    {
+      "measure": "private_reads",
+      "key": "orchestrator/tests/test_git_ops.py",
+      "baseline": 101,
+      "current": 104
+    },
+    {
+      "measure": "total:private_reads",
+      "key": "<cluster>",
+      "baseline": 6118,
+      "current": 6121
+    }
+  ]
+}

@@ -54,41 +54,50 @@ class TestCriticalFilingGate:
 
 
 class TestRecordRunnerUnavailableDelegation:
-    """Regression guard: MergeQueue._record_runner_unavailable delegation is behavior-preserving.
+    """Regression guard: the bench tracker's delegation is behavior-preserving.
 
-    Step-7 refactored ``SpeculativeMergeWorker._record_runner_unavailable`` to
-    delegate to ``critical_filing_gate`` (passing an int ``threshold`` and no
+    Step-7 refactored the worker's RunnerUnavailable tracker (now
+    ``merge_lane/host_quarantine.py::HostQuarantine``) to delegate to
+    ``critical_filing_gate`` (passing an int ``threshold`` and no
     ``rerun_confirmed``).  This pins — inside this task's own diff — that the
-    delegation still fires exactly at ``streak >= _unreachable_escalate_after_n``
-    and not before, including the ``streak == threshold`` boundary and
-    ``rerun_confirmed`` defaulting ``False``.  (Fuller tracker coverage lives in
-    test_merge_queue_multihost_wiring.py, which is outside this task's scope.)
+    delegation still fires exactly at ``streak >= after_n`` and not before,
+    including the ``streak == threshold`` boundary and ``rerun_confirmed``
+    defaulting ``False``.  Each bench files the alarm when it is due; the
+    recording queue reports no open L1, so every due bench files one.  (Fuller
+    tracker coverage lives in test_merge_queue_multihost_wiring.py, which is
+    outside this task's scope.)
     """
 
-    def _make_worker(self, *, escalate_after_n):
-        import asyncio
-        from unittest.mock import MagicMock
+    def _make_quarantine(self, tmp_path, *, escalate_after_n):
+        from _gate_fixtures import TEST_DEPLOYED_SHA
+        from _merge_lane_fakes import FakeClock, RecordingEscalations
 
-        from orchestrator.merge_queue import SpeculativeMergeWorker
+        from orchestrator.config import OrchestratorConfig
+        from orchestrator.merge_lane.host_quarantine import HostQuarantine
 
-        git_ops = MagicMock()
-        git_ops.project_root = None
-        q: asyncio.Queue = asyncio.Queue()
-        worker = SpeculativeMergeWorker(git_ops=git_ops, queue=q)
-        worker._unreachable_escalate_after_n = escalate_after_n
-        return worker
+        escalations = RecordingEscalations()
+        quarantine = HostQuarantine(
+            clock=FakeClock(), allocator=lambda: None, event_store=lambda: None,
+            escalation_queue=lambda: escalations, deployed_sha=TEST_DEPLOYED_SHA,
+        )
+        quarantine.adopt_config(OrchestratorConfig(
+            project_root=tmp_path,
+            verify_host_unreachable_escalate_after_n=escalate_after_n,
+            verify_host_unreachable_escalate_after_secs=600.0,
+        ))
+        return quarantine, escalations
 
-    def test_delegation_fires_exactly_at_threshold(self):
-        """streak below N → False; streak == N (boundary) and beyond → True."""
+    def test_delegation_fires_exactly_at_threshold(self, tmp_path):
+        """streak below N → no alarm; streak == N (boundary) and beyond → alarm."""
         import time
 
-        worker = self._make_worker(escalate_after_n=3)
+        quarantine, escalations = self._make_quarantine(tmp_path, escalate_after_n=3)
         t = time.time()
-        r1 = worker._record_runner_unavailable('host1', 'ssh timeout', t)  # streak=1
-        r2 = worker._record_runner_unavailable('host1', 'ssh timeout', t + 1)  # streak=2
-        r3 = worker._record_runner_unavailable('host1', 'ssh timeout', t + 2)  # streak=3 == N
-        r4 = worker._record_runner_unavailable('host1', 'ssh timeout', t + 3)  # streak=4 > N
-        assert r1 is False  # 1 < 3 (single observation insufficient)
-        assert r2 is False  # 2 < 3 (under-threshold observation insufficient)
-        assert r3 is True  # 3 >= 3 (exact boundary, matches pre-refactor streak >= threshold)
-        assert r4 is True  # 4 >= 3 (persistent alarm condition)
+        filed = []
+        for offset in range(4):  # streak 1, 2, 3 == N, 4 > N
+            quarantine.quarantine_unreachable('host1', 'ssh timeout', t + offset)
+            filed.append(len(escalations.filed))
+        assert filed[0] == 0  # 1 < 3 (single observation insufficient)
+        assert filed[1] == 0  # 2 < 3 (under-threshold observation insufficient)
+        assert filed[2] == 1  # 3 >= 3 (exact boundary, matches pre-refactor streak >= threshold)
+        assert filed[3] == 2  # 4 >= 3 (persistent alarm condition)

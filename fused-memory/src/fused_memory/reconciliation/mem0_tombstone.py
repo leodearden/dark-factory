@@ -1,11 +1,30 @@
-"""Recon-initiated Mem0 deletion tombstones and the protected-mirror predicate
-(task 3041).
+"""Recon-initiated Mem0 deletion tombstones and the protected-record predicates
+(tasks 3041, 4375, 6241).
 
-Two independent units live here, both consumed by every recon path that
-deletes a Mem0 record — the marker-GC sweeps in
-``reconciliation.stages.task_knowledge_sync._sweep_stale_mem0_pool`` and the
-cycle_summary mirror pool trim in
-``reconciliation.summary_pool.enforce_summary_pool_cap``.
+Four units live here, with DIFFERENT consumers. They are attributed
+separately rather than lumped together because this module's whole value is
+that a reader can tell WHICH deletion paths are guarded without going and
+checking each one:
+
+- The tombstone writers (:func:`record_mem0_deletion_tombstone` and its
+  batched sibling :func:`record_mem0_deletion_tombstones`) are consumed by
+  every recon path that deletes a Mem0 record — the marker-GC sweeps in
+  ``reconciliation.stages.task_knowledge_sync._sweep_stale_mem0_pool`` AND
+  the cycle_summary mirror pool trim in
+  ``reconciliation.summary_pool.enforce_summary_pool_cap``.
+- The two protected-record predicates (:func:`is_protected_mirror_record`,
+  :func:`is_protected_audit_record`) are consumed at two choke points: the
+  in-cycle ``_sweep_stale_mem0_pool``, and the manual sweep's
+  ``fused-memory/scripts/sweep_orphan_flag_markers.py::delete_orphan_markers``
+  (through that script's ``protection_reason``). ``summary_pool`` calls
+  neither, and does not need to: it trims a pool it enumerated by
+  construction, so it is never at risk of matching a record belonging to
+  someone else. Its only mentions of these names are comments.
+- The pool-membership predicate (:func:`is_foreign_kind_record`, task 6241)
+  is consumed at three points: the in-cycle ``_sweep_stale_mem0_pool`` (for
+  the callers that opt in with ``pool_kind``),
+  ``reconciliation.stages.task_knowledge_sync._TasklessRetirement.permits``,
+  and the manual sweep's ``protection_reason``.
 
 Why this module exists
 ----------------------
@@ -33,10 +52,11 @@ because they are independent vocabularies answering different questions:
   cycle_summary record.
 - ``record_type == 'ledger_stamp'`` (task 2468) DISCRIMINATES the
   deterministic Python-written mirror of the authoritative ledger row from
-  the LLM-authored ``'narrative'`` reconstruction write in
-  ``reconciliation.prompts.stage2``. Task 2468 shipped ``record_type`` as
-  deliberately write-only ("no reader ... one lands alongside the tooling
-  that needs it"); this module is its first real reader.
+  the LLM-authored ``'narrative'`` reconstruction write that task 3734
+  retired, whose records can still exist in historical payloads. Task 2468
+  shipped ``record_type`` as deliberately write-only ("no reader ... one
+  lands alongside the tooling that needs it"); this module is its first real
+  reader.
 
 Checking both means a record missing either tag — an LLM narrative that
 omits ``record_type``, or a mirror whose ``kind`` was overwritten — is still
@@ -56,6 +76,20 @@ from also carrying. No amount of payload-filter tightening can guarantee
 precision when the matched key is one any writer can attach to any record —
 so the guard is enforced at the shared ``_sweep_stale_mem0_pool`` choke
 point instead, where every current and future sweep inherits it.
+
+Task 4375 closed off pool-narrowing for good, by measurement. The obvious
+"just require the kind/source Stage 1 stamps on relay markers" repair was
+evaluated against the tombstone ledger and rejected: of the 288 records the
+``flag_for_stage2`` sweep has destroyed, 165 (57%, across 5 of 6 projects)
+carried NO ``kind`` key at all and 248 (86%) carried no ``source``, and the
+kinds that DO appear are a ~37-value long tail of free-form LLM-authored
+strings. Qdrant payload filters are exact-equality and AND-only within one
+dict, with no key-existence operator — so neither "has a flag_type" nor
+"kind in {...}" is expressible as a pool filter at all. A positive allowlist
+would therefore enumerate ~0 records and silently reinstate the unbounded
+Mem0 leak that sweep exists to prevent, trading a data-loss bug for a
+data-growth bug while appearing to fix it. The pool filter stays deliberately
+WIDE; ALL discrimination lives in the predicates below.
 
 Import posture
 --------------
@@ -78,6 +112,7 @@ import json
 import logging
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime, timedelta
+from typing import TypeGuard
 
 from fused_memory.reconciliation.recon_ledger import (
     RECORD_KIND_MEM0_TOMBSTONE,
@@ -103,7 +138,10 @@ logger = logging.getLogger(__name__)
 # expires purely via expires_at.
 __all__ = [
     'MEM0_TOMBSTONE_TTL_DAYS',
+    'PROTECTED_AUDIT_KINDS',
     'RECORD_KIND_MEM0_TOMBSTONE',
+    'is_foreign_kind_record',
+    'is_protected_audit_record',
     'is_protected_mirror_record',
     'record_mem0_deletion_tombstone',
     'record_mem0_deletion_tombstones',
@@ -134,6 +172,40 @@ MEM0_TOMBSTONE_TTL_DAYS: int = 30
 # loudly rather than degrading the guard.
 _RECORD_TYPE_LEDGER_STAMP: str = CYCLE_SUMMARY_RECORD_TYPE_LEDGER_STAMP
 _KIND_CYCLE_SUMMARY: str = CYCLE_SUMMARY_KIND
+
+# ``metadata.kind`` values naming a DELIBERATELY-PERMANENT audit-log record —
+# never a recurring relay marker — that a marker-GC sweep must never delete
+# (task 4375). Read by is_protected_audit_record below.
+#
+# Seeded from the one kind with MEASURED harm: 40 ``kind='cadence_check'``
+# records in autopilot_video were destroyed by ``flag_for_stage2_gc_sweep``,
+# every row with deleted_at minus created_at of exactly 14 days (i.e. pure
+# age-GC, nothing about the record itself), and every row citing task 452.
+# Their live siblings carry the ENTIRE Stage-1 relay contract —
+# ``flag_for_stage2``, ``flag_type``, ``run_id``, ``source='recon-stage-
+# memory_consolidator'``, ``task_id='452'`` — so they are indistinguishable
+# from a genuine relay marker by every field except ``kind``. That is the
+# whole reason the discrimination has to happen here.
+#
+# HONEST WEAKNESS, stated so nobody mistakes this for the primary defence:
+# this is DENYLIST-BY-OMISSION, which is the exact failure mode that produced
+# the bug. A future audit-log kind whose author never thought to register it
+# here is NOT protected by this arm.
+#
+# MITIGATION: the terminal-task-closure gate in
+# ``stages/task_knowledge_sync.py::_sweep_stale_mem0_pool`` is the PRIMARY,
+# structurally-opt-IN defence — it demands positive evidence that the record's
+# cited task has closed, so an unregistered audit kind is still protected for
+# as long as its task stays open. All 40 measured victims would have survived
+# on that arm alone (task 452 is ``deferred``, which is not terminal). This
+# denylist is defence in depth for the residual intersection only: a permanent
+# audit record whose cited task LATER goes terminal. That gate is the
+# flag_for_stage2 collector's primary arm. Both stage1_flag_marker collectors —
+# the in-cycle ``_sweep_stale_mem0_flag_markers`` and the manual
+# ``fused-memory/scripts/sweep_orphan_flag_markers.py::protection_reason``,
+# whose ``--terminal-drain`` inverts the terminal gate — use
+# :func:`is_foreign_kind_record` as theirs (tasks 5286, 6241).
+PROTECTED_AUDIT_KINDS: frozenset[str] = frozenset({'cadence_check'})
 
 # Identifying victim keys copied into a tombstone payload. Deliberately an
 # identity-only projection — never the record's content — so a tombstone
@@ -185,6 +257,68 @@ def is_protected_mirror_record(metadata) -> bool:
     )
 
 
+def is_protected_audit_record(metadata) -> bool:
+    """Return True when *metadata* identifies a deliberately-permanent audit record.
+
+    A record matching this predicate must never be deleted by a marker-GC
+    sweep, no matter how stale it is: it is an audit-log entry that is
+    SUPPOSED to outlive the window in which its subject was interesting. See
+    :data:`PROTECTED_AUDIT_KINDS` for the measurement behind the seeded
+    membership, this arm's honest denylist-by-omission weakness, and why
+    ``stages/task_knowledge_sync.py::_sweep_stale_mem0_pool``'s
+    terminal-task-closure gate — not this predicate — is the primary defence.
+
+    Deliberately a SEPARATE predicate from :func:`is_protected_mirror_record`
+    rather than another arm folded into it. The two answer different
+    questions (that one is an OR over two independent discriminators
+    identifying one specific pool; this one is a membership test over an
+    open-ended set of kinds), and keeping them separate keeps each sweep skip
+    attributable to the guard that caused it — a mirror skip must not be
+    logged as an audit skip, or vice versa.
+
+    Fully defensive, exactly like its sibling: ``None``, a non-dict, or a dict
+    whose ``kind`` is of an unexpected type all return ``False`` without
+    raising. A marker sweep runs against whatever Mem0 hands back and must
+    never crash on a weird payload.
+
+    The ``isinstance(kind, str)`` test is load-bearing, not decoration. Mem0
+    metadata is JSON-shaped and nothing at the ``add_memory`` boundary
+    constrains ``kind`` to a scalar, so a list- or dict-valued ``kind`` is
+    reachable — and a bare ``kind in PROTECTED_AUDIT_KINDS`` raises
+    ``TypeError: unhashable type`` on exactly those payloads, from inside the
+    guard that exists to make the sweep SAFER. The sibling predicate compares
+    with ``==`` and so is immune for free; a frozenset membership test is not.
+
+    Args:
+        metadata: A Mem0 record's ``metadata`` mapping, or anything at all.
+
+    Returns:
+        ``True`` when the payload declares a ``kind`` in
+        :data:`PROTECTED_AUDIT_KINDS`; ``False`` otherwise.
+    """
+    if not isinstance(metadata, dict):
+        return False
+    kind = metadata.get('kind')
+    return isinstance(kind, str) and kind in PROTECTED_AUDIT_KINDS
+
+
+def is_foreign_kind_record(metadata, pool_kind: str) -> TypeGuard[dict]:
+    """Return True when *metadata* declares a ``kind`` other than *pool_kind*.
+
+    A marker pool's members carry either no ``kind`` or the pool's own marker
+    kind, so a declared different kind is positive evidence that the record
+    belongs to another pool, and a marker-GC sweep of this pool must not
+    delete it (tasks 5286, 6241).
+
+    Fully defensive: a non-dict returns ``False``, and ``kind`` is compared
+    with ``!=``, never set membership, so an unhashable kind cannot raise.
+    """
+    if not isinstance(metadata, dict):
+        return False
+    kind = metadata.get('kind')
+    return kind is not None and kind != pool_kind
+
+
 def _build_tombstone_record(
     project_id: str,
     memory_id: str,
@@ -193,6 +327,7 @@ def _build_tombstone_record(
     victim_created_at: str | None,
     deleter: str,
     deleting_run_id: str,
+    absorbed_by: str | None = None,
     now_dt: datetime,
 ) -> ReconLedgerRecord:
     """Build the one ledger row describing a single confirmed deletion.
@@ -205,6 +340,14 @@ def _build_tombstone_record(
     stay at their ``''`` defaults, so a later lookup needs only the one thing
     an auditor actually knows. ``expires_at`` hands retention to the ``gc()``
     pass ``_gc_recon_markers`` already runs every cycle.
+
+    ``absorbed_by`` (task 3133) is written ALWAYS, explicitly ``None`` when
+    absent, for the same reason the identity projection writes ``None`` for
+    victim keys the record did not have: only presence can distinguish
+    "reaped by a sweep, nothing absorbed it" from a tombstone written before
+    the field existed. It is a top-level field rather than part of the
+    projection because :data:`_VICTIM_IDENTITY_KEYS` is deliberately what the
+    VICTIM recorded about itself, and the id that absorbed it is not that.
     """
     metadata = victim_metadata if isinstance(victim_metadata, dict) else {}
     payload = {
@@ -212,6 +355,7 @@ def _build_tombstone_record(
         'deleting_run_id': deleting_run_id,
         'deleted_at': now_dt.isoformat(),
         'created_at': victim_created_at,
+        'absorbed_by': absorbed_by,
         **{key: metadata.get(key) for key in _VICTIM_IDENTITY_KEYS},
     }
     return ReconLedgerRecord(
@@ -236,6 +380,7 @@ async def record_mem0_deletion_tombstone(
     victim_created_at: str | None,
     deleter: str,
     deleting_run_id: str,
+    absorbed_by: str | None = None,
     now: datetime | None = None,
 ) -> bool:
     """Record that a recon sweep deleted the Mem0 record *memory_id*.
@@ -291,6 +436,15 @@ async def record_mem0_deletion_tombstone(
             distinct from the victim's own ``metadata['run_id']`` (also stored,
             via ``victim_metadata``) — conflating the two is precisely what
             made the original recon-gate-165 finding unreadable.
+        absorbed_by: For a CONSOLIDATION delete, the surviving canonical
+            id that absorbed this record — the REVERSE pointer, and the one
+            that closes the recon-gate-165 audit dead-end: the survivor
+            already carries a forward ``consolidated_from``, but an auditor
+            chasing a broken reference holds only the DEAD id, from which
+            that deletion was previously indistinguishable from silent data
+            loss. ``None`` for a pure GC/trim sweep, which absorbs nothing,
+            and written into the payload explicitly so absence reads as
+            "nothing absorbed it" rather than "this predates the field".
         now: Reference "current time". Defaults to ``datetime.now(UTC)``;
             tests inject a fixed value. Normalized via :func:`_assume_utc` and
             rendered with ``.isoformat()`` so ``expires_at`` stays correct
@@ -313,6 +467,7 @@ async def record_mem0_deletion_tombstone(
                 victim_created_at=victim_created_at,
                 deleter=deleter,
                 deleting_run_id=deleting_run_id,
+                absorbed_by=absorbed_by,
                 now_dt=_assume_utc(now or datetime.now(UTC)),
             )
         )
@@ -342,6 +497,7 @@ async def record_mem0_deletion_tombstones(
     *,
     deleter: str,
     deleting_run_id: str,
+    absorbed_by: str | None = None,
     now: datetime | None = None,
 ) -> int:
     """Tombstone a whole sweep's worth of deletions in ONE ledger transaction.
@@ -381,6 +537,15 @@ async def record_mem0_deletion_tombstones(
             ``'created_at'``. A victim with no usable ``'id'`` is skipped.
         deleter: The delete's ``_source`` audit tag — WHICH sweep took them.
         deleting_run_id: The run that performed the deletions.
+        absorbed_by: For a CONSOLIDATION delete, the surviving canonical
+            id that absorbed this record — the REVERSE pointer, and the one
+            that closes the recon-gate-165 audit dead-end: the survivor
+            already carries a forward ``consolidated_from``, but an auditor
+            chasing a broken reference holds only the DEAD id, from which
+            that deletion was previously indistinguishable from silent data
+            loss. ``None`` for a pure GC/trim sweep, which absorbs nothing,
+            and written into the payload explicitly so absence reads as
+            "nothing absorbed it" rather than "this predates the field".
         now: Reference "current time" for all rows in the batch (they share
             one timestamp, which is accurate: one sweep, one instant).
 
@@ -401,6 +566,10 @@ async def record_mem0_deletion_tombstones(
                 victim_created_at=victim.get('created_at'),
                 deleter=deleter,
                 deleting_run_id=deleting_run_id,
+                # Batch-LEVEL by construction: every victim in one
+                # consolidation is absorbed by the same canonical, so this
+                # is a property of the call rather than of each row.
+                absorbed_by=absorbed_by,
                 now_dt=now_dt,
             )
             for victim in victims

@@ -1,0 +1,67 @@
+{
+  "role": "reviewer_comprehensive",
+  "schema_version": 1,
+  "session_id": "",
+  "emitted_at": "2026-08-01T01:34:26.581375+00:00",
+  "verdict": {
+    "reviewer": "reviewer_comprehensive",
+    "verdict": "ISSUES_FOUND",
+    "issues": [
+      {
+        "file": "scripts/legibility/nightly.py",
+        "line": 872,
+        "severity": "medium",
+        "category": "correctness",
+        "short_summary": "Streak escalation is one-shot for a persistent condition",
+        "summary": "The barren-streak escalation is edge-triggered by exact equality with DEFAULT_MAX_BARREN_RUNS, and the sampling-cut door posts no per-night escalation, so that door's only escalation ever is a single one on night 3.",
+        "failure_scenario": "sampling.top_fraction is set too low for a project. Every night: below_sampling_cut>0, budget_skipped=0, selected=0 -> classify_run returns barren, streak increments. Night 3: consecutive_barren_runs == 3 == DEFAULT_MAX_BARREN_RUNS, one escalation posts. Nights 4..14: the streak is 4..14, so `doc.get('consecutive_barren_runs') != DEFAULT_MAX_BARREN_RUNS` returns early (nightly.py:872) and no escalation posts; _report_sample_outcome's new branch (nightly.py:727-746) returns False without escalating by design. The only remaining signal is a journal WARNING \u2014 exactly the surface that went unread for 14 nights in 2026-07-16..29. _escalate_barren_streak's own docstring (nightly.py:848-851) names this failure mode as the one it refuses to reproduce, then reproduces it for this door. The budget door is unaffected (it keeps its pre-existing per-night escalation), which is why the gap is specific to the newly-observed mode. Consider re-firing on a bounded backoff (e.g. streak in {3, 6, 12, 24}) rather than exactly once."
+      },
+      {
+        "file": "scripts/legibility/check_trickle_progress.py",
+        "line": 1,
+        "severity": "medium",
+        "category": "test-coverage",
+        "short_summary": "Progress probe ships with no caller anywhere in the repo",
+        "summary": "check_trickle_progress.py \u2014 the read half of the read/write pair, and the only level-triggered detector for a persistent barren streak \u2014 is not bound to any task predicate, timer, or runbook entry.",
+        "failure_scenario": "grep across the repo for `check_trickle_progress` finds hits only in plans/confusion-reduction-prd.md prose, the script itself, and its own tests. There is no `before_done={kind: predicate, script: scripts/legibility/check_trickle_progress.py, ...}` binding (contrast task kappa/kappa-prime, which do bind check_trickle_liveness.sh), no timer unit, and no OPERATIONS.md entry telling an operator the probe or the state file exists. Combined with the one-shot escalation above, a persistent sampling-cut suppression starting on day 1 is escalated once on day 3 and then observed by nothing at all until a human happens to run the script by hand \u2014 which nothing tells them to do. The module docstrings' extensive justification for the stdlib-only constraint (so the deterministic runner can EXEC it as a before_done predicate) is written for a binding that does not exist yet; either file/land that binding or say plainly in the PRD that the probe is hand-run-only for now."
+      },
+      {
+        "file": "scripts/legibility/trickle_state.py",
+        "line": 180,
+        "severity": "medium",
+        "category": "correctness",
+        "short_summary": "Writer and reader resolve the path from different process envs",
+        "summary": "trickle_state_path keys on the *calling process's* XDG_STATE_HOME/HOME, but the writer (systemd --user timer) and the reader (orchestrator-EXEC'd predicate) are different processes with independently-sourced environments, and nothing pins them to agree.",
+        "failure_scenario": "nightly.py writes the state file under legibility-trickle@<project>.service, whose environment comes from `systemd --user` (user record HOME, no shell rc). check_trickle_progress.py, once bound as a before_done predicate, is EXEC'd by deterministic_runner._default_run_script with `env = {**os.environ, ...}` (orchestrator/src/orchestrator/deterministic_runner.py:995) \u2014 i.e. the orchestrator process's environment, inherited from whatever shell launched it. If that shell exports XDG_STATE_HOME (or the orchestrator runs under a different user/HOME), the probe resolves e.g. $XDG_STATE_HOME/dark-factory/legibility/<pid>/trickle-state.json while the nightly writes ~/.local/state/dark-factory/legibility/<pid>/trickle-state.json. load_state returns ('missing', None), the probe takes branch 1 and exits 1 permanently, which for a milestone binding is a born-at-L2 milestone_check_failed escalation for a pipeline that is running perfectly. The worse variant: if HOME is unset in the orchestrator's env, trickle_state_path silently degrades to tempfile.gettempdir() (line 199) \u2014 a path the nightly never writes \u2014 and logs its warning to a logger the bare-python3 predicate never configures, so the degradation is invisible. No test covers writer/reader path agreement across environments; consider having the binding pass an explicit state path or Environment= pin, or having the probe report the resolved path in the 'missing' verdict (it does) *and* the PRD/runbook state the env requirement."
+      },
+      {
+        "file": "scripts/legibility/nightly.py",
+        "line": 828,
+        "severity": "low",
+        "category": "correctness",
+        "short_summary": "_escalate_barren_streak runs unguarded inside run_nightly's finally",
+        "summary": "_record_trickle_progress's docstring says 'the whole call is wrapped in try/except', but _escalate_barren_streak is called outside that try (nightly.py:828) while _record_trickle_progress itself runs from run_nightly's finally.",
+        "failure_scenario": "A recorder seam returning a doc whose 'counters' value is truthy but not a dict (e.g. {'outcome': 'barren', 'consecutive_barren_runs': 3, 'counters': 'x'}) makes `counters.get('budget_skipped')` at nightly.py:876 raise AttributeError. Because _record_trickle_progress is invoked from the `finally` at nightly.py:1154, that AttributeError propagates out of the finally and REPLACES whatever exception the run was already unwinding \u2014 the observability write becoming the new failure mode the docstring explicitly promises it will not become. Today this is reachable only through the injected recorder seam (record_run always writes a dict), so it is latent rather than live, but the fix is one line: move the _escalate_barren_streak call inside the existing try, or give it its own try/except -> WARNING."
+      },
+      {
+        "file": "scripts/legibility/nightly.py",
+        "line": 671,
+        "severity": "low",
+        "category": "docs-accuracy",
+        "short_summary": "Docstring claims both barren doors warn; only one does",
+        "summary": "_report_sample_outcome's new docstring says 'IT NOW REPORTS BOTH BARREN DOORS AT WARNING', but the new branch's `sample.budget_skipped <= 0` guard makes the two branches mutually exclusive, so when both doors are open only the budget WARNING fires.",
+        "failure_scenario": "A night with selected=0, budget_skipped=3, below_sampling_cut=14 (the stock top_fraction=0.12 shape described in SampleResult.below_sampling_cut). The new branch at nightly.py:727 is skipped because budget_skipped > 0; the budget branch fires and its detail text says the signal was 'entirely discarded on budgets.max_daily_digest_bytes' and to 'raise the budget'. An operator who raises only the budget recovers 3 records and leaves 14 behind the sampling cut, with nothing per-night naming the second remedy. Substantively the budget is the right first remedy, so this is a docstring/message-completeness issue rather than a wrong action \u2014 but the docstring's claim should be narrowed to 'reports whichever door is exclusively responsible', or the budget message should mention below_sampling_cut when it is non-zero."
+      },
+      {
+        "file": "scripts/legibility/trickle_state.py",
+        "line": 369,
+        "severity": "low",
+        "category": "docs-accuracy",
+        "short_summary": "record_run claims crash-safety it does not have (no fsync)",
+        "summary": "record_run's docstring says 'a crashed write can never leave a partial document that load_state would report as malformed', but the temp file is closed without fsync before os.replace, so the guarantee holds only for process crashes, not host crashes.",
+        "failure_scenario": "Host loses power between the `with open(tmp_path)` block closing (data in the page cache, not on disk) and the metadata reaching disk after os.replace. On reboot the state file can be present but zero-length or truncated; load_state then returns ('malformed', None) and check_trickle_progress.py takes branch 2 and exits 1 for a pipeline that was healthy. The consequence is benign by this module's own standards \u2014 the degradation is loud, distinct, and self-healing on the next nightly run \u2014 so this is a claim to soften rather than behavior to change, unless an f.flush()/os.fsync(f.fileno()) before os.replace is wanted to make the docstring literally true."
+      }
+    ],
+    "summary": "The change is structurally sound and well-tested: 165 tests pass, the classifier is genuinely derived from SampleResult's conservation invariant (branch 3 is provably false-alarm-free, so PRD decision 7's rationale really is satisfied rather than circumvented), the XDG rooting keeps the nightly rewrite out of the machine-operated checkout, and I verified line-by-line that the large try/finally refactor of run_nightly is semantically identical to the pre-change block (only `return NightlyResult(...)` -> `result = ...; return result` at five sites, plus the finally). No hard correctness bug found in the new code paths. What I did find is a coverage/claim gap concentrated on the NEW absence mode this task adds: the sampling-cut door gets no per-night escalation (deliberately), and the barren-streak escalation that is supposed to own it is edge-triggered by exact equality, so a persistently mis-tuned sampling cut produces exactly ONE escalation on night 3 and journal WARNINGs thereafter \u2014 the precise \"whoever misses the first escalation gets silence\" pathology _escalate_barren_streak's own docstring names and rejects. That is compounded by check_trickle_progress.py shipping with no caller anywhere in the repo (no task predicate, no timer, no runbook entry), and by the recorder and probe resolving the state path from two independent process environments with nothing pinning them together. The remaining items are docstring claims that overstate what the code does \u2014 normally trivial, but this module's whole contract is written in its docstrings, and a future maintainer relying on \"the whole call is wrapped in try/except\" or \"reports BOTH barren doors at WARNING\" would be misled."
+  }
+}

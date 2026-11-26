@@ -168,12 +168,14 @@ def _normal_two_sided_p(deviation: float, sd: float) -> float:
 
 
 _HUGE_INPUT_SECONDS = 5.0
-"""Wall-clock ceiling for the two huge-input tests below.
+"""CPU-time ceiling (measured via ``time.process_time()``) for the two
+huge-input tests below.
 
-Not a performance target — a shape discriminator, sized so it cannot flake. The
-implementations it rejects are ~100x over it (an O(n) binomial support at
-``n = 1e7``, an O(lam) Poisson left shoulder at ``lam = 1e8``); the walk that
-replaced them lands ~50x under it.
+Not a performance target — a shape discriminator, sized so it cannot flake.
+CPU time (not wall clock) is what's measured, so scheduler contention on a
+loaded host cannot trip it. The implementations it rejects are ~100x over it
+(an O(n) binomial support at ``n = 1e7``, an O(lam) Poisson left shoulder at
+``lam = 1e8``); the walk that replaced them lands ~50x under it.
 """
 
 
@@ -294,9 +296,9 @@ class TestBinomialExactTest:
         metric's probe/corpus size, which the M1 schema does not bound at all.
         The walk-from-the-mode implementation answers this in ~40 ms.
         """
-        start = time.perf_counter()
+        start = time.process_time()
         p = binomial_two_sided_p(5_010_000, 10_000_000, 0.5)
-        elapsed = time.perf_counter() - start
+        elapsed = time.process_time() - start
 
         # Cross-checked against the normal approximation, the only independent
         # reference that survives this n (both in-test enumerations above need
@@ -397,9 +399,9 @@ class TestPoissonExactTest:
         and take the grandfather-set update with it. Nothing bounds a count
         metric's value, so nothing bounds the rate a window of them derives.
         """
-        start = time.perf_counter()
+        start = time.process_time()
         p = poisson_two_sided_p(100_050_000, 1e8)
-        elapsed = time.perf_counter() - start
+        elapsed = time.process_time() - start
 
         # 5 sd above a rate of 1e8 (sd = sqrt(lam) = 1e4). Cross-checked against
         # the normal approximation, which agrees to ~2e-3 relative here.
@@ -2048,3 +2050,50 @@ class TestARunWithNothingAlarmEligible:
         assert result.alarmed_metric_count == 1
         assert result.alpha == derive_alpha(1.0, 90, 1)
         assert result.alarms == ()
+
+
+class TestDelegatesToSharedAtomicWriter:
+    """``_atomic_write_text`` delegates to ``shared.safe_io.atomic_write_text``.
+
+    Task 3223 consolidated four byte-identical copies of the tmp+rename writer
+    into ``shared.safe_io``.  These pin that this module's helper is now a
+    delegation preserving the exact semantics it had when inlined: the
+    ``tempfile.mkstemp``-created 0600 mode, utf-8, no fsync and no mkdir.
+    """
+
+    def test_delegates_with_preserved_semantics(self, tmp_path, monkeypatch):
+        """One delegated call, carrying this site's exact per-axis semantics."""
+        import shared.safe_io as _safe_io
+        from shared.memory_eval_limits import _atomic_write_text
+
+        calls = []
+
+        def recorder(path, text, **kwargs):
+            calls.append((path, text, kwargs))
+
+        monkeypatch.setattr(_safe_io, 'atomic_write_text', recorder)
+
+        target = tmp_path / 'artifact.json'
+        _atomic_write_text(target, '{"a": 1}')
+
+        assert len(calls) == 1, f'expected exactly one delegated call, got {calls}'
+        path, text, kwargs = calls[0]
+        assert Path(path) == target
+        assert text == '{"a": 1}'
+        assert kwargs.get('mode') == 0o600, 'mkstemp created 0600; must not widen'
+        assert kwargs.get('encoding') == 'utf-8'
+        assert not kwargs.get('fsync'), 'this site never fsynced'
+        assert not kwargs.get('mkdir'), 'this site never created its parent'
+
+    def test_real_write_lands_0600_utf8(self, tmp_path):
+        """End-to-end: the delegated write still produces a 0600 utf-8 file."""
+        from shared.memory_eval_limits import _atomic_write_text
+
+        target = tmp_path / 'artifact.json'
+        payload = '{"note": "h\u00e9llo \u2014 w\u00f6rld"}'
+        _atomic_write_text(target, payload)
+
+        assert target.read_text(encoding='utf-8') == payload
+        assert target.read_bytes() == payload.encode('utf-8')
+        assert target.stat().st_mode & 0o777 == 0o600
+        assert sorted(q.name for q in tmp_path.iterdir()) == ['artifact.json']

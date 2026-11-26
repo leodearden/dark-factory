@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import json
 import re
+from datetime import UTC, datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
@@ -22,15 +24,22 @@ from shared.memory_eval_metrics import (
     MetricSchemaError,
     MetricSeries,
     TripwireItem,
+    eval_dir,
+    format_stamp,
     load_metric_series,
     load_series_window,
     metrics_artifact_path,
     parse_metric_series,
     report_artifact_path,
     run_stamp,
+    stamp_datetime,
     validate_metric_series,
+    validate_stamp,
     write_metric_series,
 )
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 
 def _make_metric(**overrides) -> dict:
@@ -303,6 +312,26 @@ class TestArtifactWriter:
         assert report.parent == metrics.parent
         assert report.name == 'report-20260701T031500Z.txt'
 
+    def test_eval_dir_is_the_parent_of_both_artifact_paths(self, tmp_path):
+        directory = eval_dir(tmp_path, 'e1-retrieval-health')
+        assert directory == tmp_path / 'e1-retrieval-health'
+        metrics = metrics_artifact_path(tmp_path, 'e1-retrieval-health', '20260701T031500Z')
+        report = report_artifact_path(tmp_path, 'e1-retrieval-health', '20260701T031500Z')
+        assert directory == metrics.parent == report.parent
+
+    def test_metrics_artifact_path_rejects_a_malformed_stamp(self, tmp_path):
+        # The message names the helper that rejected it, like every other stamp
+        # boundary in the module ($MEMORY_EVAL_RUN_STAMP, before_stamp, ...), so
+        # an operator reading it out of an escalation can locate the call site.
+        with pytest.raises(MetricSchemaError) as exc_info:
+            metrics_artifact_path(tmp_path, 'e1-retrieval-health', '2026-07-04T03:15:00Z')
+        assert 'metrics_artifact_path' in str(exc_info.value)
+
+    def test_report_artifact_path_rejects_a_malformed_stamp(self, tmp_path):
+        with pytest.raises(MetricSchemaError) as exc_info:
+            report_artifact_path(tmp_path, 'e1-retrieval-health', '2026-07-04T03:15:00Z')
+        assert 'report_artifact_path' in str(exc_info.value)
+
     def test_run_stamp_honours_env_override(self, monkeypatch):
         monkeypatch.setenv('MEMORY_EVAL_RUN_STAMP', '20260704T031500Z')
         assert run_stamp() == '20260704T031500Z'
@@ -360,10 +389,10 @@ class TestArtifactWriter:
         payload = _make_series(metrics=[_make_metric(value=1.4)])
         with pytest.raises(MetricSchemaError):
             write_metric_series(payload, tmp_path)
-        eval_dir = tmp_path / 'e1-retrieval-health'
+        directory = eval_dir(tmp_path, 'e1-retrieval-health')
         # Not even a partial or temp file: validate-then-write ordering, and the
         # atomic writer unlinks its mkstemp temp on any failure.
-        leftovers = list(eval_dir.rglob('*')) if eval_dir.exists() else []
+        leftovers = list(directory.rglob('*')) if directory.exists() else []
         assert leftovers == []
 
     def test_malformed_series_does_not_corrupt_an_existing_artifact(self, tmp_path):
@@ -408,8 +437,8 @@ class TestSeriesWindowLoader:
 
     def test_window_excludes_non_metric_files(self, tmp_path):
         self._seed(tmp_path, ['20260701T031500Z'])
-        eval_dir = tmp_path / 'e1-retrieval-health'
-        (eval_dir / 'limits-current.json').write_text('{}', encoding='utf-8')
+        directory = eval_dir(tmp_path, 'e1-retrieval-health')
+        (directory / 'limits-current.json').write_text('{}', encoding='utf-8')
         window = load_series_window(tmp_path, 'e1-retrieval-health', limit=5, before_stamp=None)
         assert [s.run_stamp for s in window] == ['20260701T031500Z']
 
@@ -620,6 +649,25 @@ class TestStampShapeIsEnforcedNotAssumed:
         with pytest.raises(MetricSchemaError):
             validate_metric_series(_make_series(run_stamp='٢٠٢٦٠٧٠٤T٠٣١٥٠٠Z'))
 
+    def test_the_public_checker_returns_the_stamp_it_accepted(self):
+        """Pinned directly, because it is exported and called cross-package.
+
+        Every other assertion here reaches ``validate_stamp`` through a caller
+        that discards its return value, so all of them would still pass if it
+        started returning ``None`` or a normalized copy — and a cross-package
+        caller that uses it as a pass-through (``path = validate_stamp(s, ...)``)
+        would break silently. The contract is: the input object, unchanged.
+        """
+        stamp = '20260704T031500Z'
+        assert validate_stamp(stamp, what='a stamp') == stamp
+
+    def test_the_what_label_reaches_the_message(self):
+        # The whole point of a caller-supplied `what=`: the raiser names WHICH
+        # stamp was bad, so an out-of-module caller's failure is actionable
+        # without a traceback into this module.
+        with pytest.raises(MetricSchemaError, match='my-label'):
+            validate_stamp('2026-07-04T03:15:00Z', what='my-label')
+
     def test_a_well_formed_stamp_still_passes_everywhere(self, tmp_path):
         # The guard must not be so tight that the real thing fails: one stamp
         # through all four boundaries.
@@ -633,3 +681,91 @@ class TestStampShapeIsEnforcedNotAssumed:
             )
             != []
         )
+
+
+class TestStampDatetime:
+    """``stamp_datetime`` is ``run_stamp``'s inverse, beside the one stamp format.
+
+    A caller that orders runs in time (the write-after-miss producer tiles its
+    evaluation periods on consecutive run stamps) parses a stamp here rather
+    than restating ``%Y%m%dT%H%M%SZ`` in a second module.
+    """
+
+    def test_inverts_a_pinned_run_stamp_to_an_aware_utc_datetime(self, monkeypatch):
+        monkeypatch.setenv('MEMORY_EVAL_RUN_STAMP', '20260704T031500Z')
+        parsed = stamp_datetime(run_stamp())
+        assert parsed == datetime(2026, 7, 4, 3, 15, tzinfo=UTC)
+        assert parsed.tzinfo is not None
+
+    def test_a_misshapen_stamp_gets_the_validate_stamp_refusal(self):
+        with pytest.raises(MetricSchemaError, match='%Y%m%dT%H%M%SZ'):
+            stamp_datetime('2026-07-04T03:15:00Z')
+
+
+class TestFormatStamp:
+    """``format_stamp`` renders a moment in the one stamp format: ``stamp_datetime``'s forward half.
+
+    A caller that needs a stamp for a moment other than now (a test pinning a
+    future run) formats it here rather than restating the format.
+    """
+
+    def test_round_trips_through_stamp_datetime_to_the_second(self):
+        moment = datetime(2026, 7, 4, 3, 15, 42, 900_000, tzinfo=UTC)
+        stamp = format_stamp(moment)
+        assert stamp == '20260704T031542Z'
+        assert stamp_datetime(stamp) == moment.replace(microsecond=0)
+
+    def test_an_offset_moment_is_rendered_in_utc(self):
+        moment = datetime(2026, 7, 4, 5, 15, tzinfo=timezone(timedelta(hours=2)))
+        assert format_stamp(moment) == '20260704T031500Z'
+
+    def test_a_naive_moment_is_refused(self):
+        with pytest.raises(ValueError, match='timezone-aware'):
+            format_stamp(datetime(2026, 7, 4, 3, 15))
+
+
+class TestDelegatesToSharedAtomicWriter:
+    """``_atomic_write_text`` delegates to ``shared.safe_io.atomic_write_text``.
+
+    Task 3223 consolidated four byte-identical copies of the tmp+rename writer
+    into ``shared.safe_io``.  These pin that this module's helper is now a
+    delegation preserving the exact semantics it had when inlined: the
+    ``tempfile.mkstemp``-created 0600 mode, utf-8, no fsync and no mkdir.
+    """
+
+    def test_delegates_with_preserved_semantics(self, tmp_path, monkeypatch):
+        """One delegated call, carrying this site's exact per-axis semantics."""
+        import shared.safe_io as _safe_io
+        from shared.memory_eval_metrics import _atomic_write_text
+
+        calls = []
+
+        def recorder(path, text, **kwargs):
+            calls.append((path, text, kwargs))
+
+        monkeypatch.setattr(_safe_io, 'atomic_write_text', recorder)
+
+        target = tmp_path / 'artifact.json'
+        _atomic_write_text(target, '{"a": 1}')
+
+        assert len(calls) == 1, f'expected exactly one delegated call, got {calls}'
+        path, text, kwargs = calls[0]
+        assert Path(path) == target
+        assert text == '{"a": 1}'
+        assert kwargs.get('mode') == 0o600, 'mkstemp created 0600; must not widen'
+        assert kwargs.get('encoding') == 'utf-8'
+        assert not kwargs.get('fsync'), 'this site never fsynced'
+        assert not kwargs.get('mkdir'), 'this site never created its parent'
+
+    def test_real_write_lands_0600_utf8(self, tmp_path):
+        """End-to-end: the delegated write still produces a 0600 utf-8 file."""
+        from shared.memory_eval_metrics import _atomic_write_text
+
+        target = tmp_path / 'artifact.json'
+        payload = '{"note": "h\u00e9llo \u2014 w\u00f6rld"}'
+        _atomic_write_text(target, payload)
+
+        assert target.read_text(encoding='utf-8') == payload
+        assert target.read_bytes() == payload.encode('utf-8')
+        assert target.stat().st_mode & 0o777 == 0o600
+        assert sorted(q.name for q in tmp_path.iterdir()) == ['artifact.json']

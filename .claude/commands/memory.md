@@ -4,8 +4,8 @@
 
 | I want to... | Tool | Key args |
 |---|---|---|
-| Store a discrete fact | `add_memory` | content, project_id, category |
-| Ingest raw content for extraction | `add_episode` | content, project_id, source |
+| Store a discrete fact | `add_memory` | content, project_id, category, entities |
+| Ingest raw content for extraction | `add_episode` | content, project_id, source, entities |
 | Find memories by topic | `search` | query, project_id |
 | Look up a specific entity | `get_entity` | name, project_id |
 | Review ingestion history | `get_episodes` | project_id, last_n |
@@ -21,13 +21,16 @@
 
 Use when you have a specific, distilled piece of knowledge. Always include `project_id` and `agent_id`.
 
+Declare what the write is about with `entities`. List the tasks the content names, as in `[{'kind': 'task', 'id': 3127}]`, or pass `[]` when you considered it and none apply. Omitting `entities` always succeeds, and the referents are then inferred. A declaration that your own content contradicts is rejected, and the rejection's hint states the accepted shape.
+
 **Decisions & Rationale** (→ Graphiti):
 ```
 add_memory(
-  content="We chose PostgreSQL over MongoDB for the billing service because we need ACID transactions for payment processing",
+  content="For Task 3127 we chose PostgreSQL over MongoDB for the billing service because we need ACID transactions for payment processing",
   project_id="dark_factory",
   category="decisions_and_rationale",
-  agent_id="claude-interactive"
+  agent_id="claude-interactive",
+  entities=[{'kind': 'task', 'id': 3127}]
 )
 ```
 
@@ -37,17 +40,19 @@ add_memory(
   content="Python code in this project uses ruff for formatting with line-length=100",
   project_id="dark_factory",
   category="preferences_and_norms",
-  agent_id="claude-interactive"
+  agent_id="claude-interactive",
+  entities=[]
 )
 ```
 
 **Observations & Summaries** (→ Mem0):
 ```
 add_memory(
-  content="Session summary: Implemented the context builder module, added unit tests. The ContextBuilder class produces structured briefings from memory + task state. Left TODO: integration test with live backends.",
+  content="Session summary for Task 928: Implemented the context builder module, added unit tests. The ContextBuilder class produces structured briefings from memory + task state. Left TODO: integration test with live backends.",
   project_id="dark_factory",
   category="observations_and_summaries",
-  agent_id="claude-interactive"
+  agent_id="claude-interactive",
+  entities=[{'kind': 'task', 'id': 928}]
 )
 ```
 
@@ -57,7 +62,8 @@ add_memory(
   content="To run the fused-memory server locally: 1) Start docker services (cd fused-memory/docker && docker-compose up -d), 2) cd fused-memory && uv run python -m fused_memory.server.main",
   project_id="dark_factory",
   category="procedural_knowledge",
-  agent_id="claude-interactive"
+  agent_id="claude-interactive",
+  entities=[]
 )
 ```
 
@@ -67,7 +73,8 @@ add_memory(
   content="The TaskInterceptor middleware wraps TaskmasterBackend and emits ReconciliationEvents for every task state transition",
   project_id="dark_factory",
   category="entities_and_relations",
-  agent_id="claude-interactive"
+  agent_id="claude-interactive",
+  entities=[]
 )
 ```
 
@@ -77,9 +84,33 @@ add_memory(
   content="As of 2026-03-15, the reconciliation system supports targeted reconciliation but full-cycle reconciliation is not yet implemented",
   project_id="dark_factory",
   category="temporal_facts",
-  agent_id="claude-interactive"
+  agent_id="claude-interactive",
+  entities=[]
 )
 ```
+
+### Metadata vocabulary
+
+`add_memory` also takes an optional `metadata` dict. Five keys are reserved and
+validated on write:
+
+- `topic` — kebab-case slug naming the subject; groups every entry about it
+- `canonical` — the one authoritative entry for a topic (requires `topic`)
+- `kind` — record type, from a closed registry; not `source`, which is writer provenance
+- `parent_id` — UUID of a live entry this one attaches to
+- `supersedes` — list of UUIDs this entry replaces
+
+A small blessed set of conventional keys — `task_id`, `source`, `transition`,
+`stage` and a few more — is already known and does not warn; use those exact
+spellings rather than an `x_` variant of them, because metadata-keyed lookups
+filter on them. Any key outside that set and the five above still writes but
+warns to a census line; prefix a deliberate annotation `x_` and it passes
+silently.
+
+The exact shapes, validation rules and the kind registry itself live in
+`fused-memory/src/fused_memory/memory_metadata.py` — the single normative
+source. Consult it rather than this summary; the contract is
+`docs/prds/memory-metadata-vocabulary.md` (V1).
 
 ### `add_episode` — for raw content needing extraction (5-15 LLM calls)
 
@@ -91,7 +122,8 @@ add_episode(
   project_id="dark_factory",
   source="text",
   agent_id="claude-interactive",
-  source_description="architecture discussion about auth system"
+  source_description="architecture discussion about auth system",
+  entities=[]
 )
 ```
 
@@ -102,20 +134,17 @@ add_episode(
 ### Query patterns
 
 ```
-# Broad project context
-search(query="project overview and architecture", project_id="dark_factory")
-
 # Specific decisions
 search(query="why was X chosen over Y", project_id="dark_factory", categories=["decisions_and_rationale"])
 
 # Conventions
-search(query="coding conventions and style rules", project_id="dark_factory", categories=["preferences_and_norms"])
+search(query="conventions and gotchas for orchestrator merge lane", project_id="dark_factory", stores=["mem0"], categories=["preferences_and_norms", "procedural_knowledge"])
 
 # Entity relationships
 search(query="what depends on the TaskInterceptor", project_id="dark_factory", stores=["graphiti"])
 
-# Recent changes
-search(query="what changed recently in the reconciliation system", project_id="dark_factory", categories=["temporal_facts"])
+# How one subject changed over time
+search(query="how the reconciliation system changed", project_id="dark_factory", categories=["temporal_facts"])
 
 # How-to
 search(query="how to run tests", project_id="dark_factory", categories=["procedural_knowledge"])
@@ -164,19 +193,9 @@ To execute hints:
 
 ### Starting a session
 
-1. **Search for project context:**
-   ```
-   search(query="project overview and current status", project_id="dark_factory")
-   search(query="recent decisions and changes", project_id="dark_factory")
-   search(query="active conventions and procedures", project_id="dark_factory")
-   ```
+1. **Recall memory context and the task tree:** run the queries in [Context Briefing](#context-briefing) below.
 
-2. **Check task tree:**
-   ```
-   get_tasks(project_root="/home/leo/src/dark-factory")
-   ```
-
-3. **If working on a specific task**, fetch it and execute its memory_hints:
+2. **If working on a specific task**, fetch it and execute its memory_hints:
    ```
    get_task(id="7", project_root="/home/leo/src/dark-factory")
    # Then execute any memory_hints queries and entity lookups
@@ -209,13 +228,21 @@ Reflect on the session and write separate memories for:
 
 ## Context Briefing
 
-To build a comprehensive context briefing (useful at session start or before a complex task):
+To build a context briefing (at session start or before a complex task), run the queries below. Items 1-2 mirror the queries every dispatched agent's briefing fires; `shared/src/shared/briefing_queries.py` is the single home of their phrasing and of the measurements behind it, and where this section and that module disagree, the module wins. Items 3-4 are extra reads for an interactive session that the dispatched briefing does not make.
 
-1. **Project overview**: `search(query="project overview architecture goals", project_id="dark_factory")`
-2. **Recent decisions**: `search(query="recent decisions and rationale", project_id="dark_factory", categories=["decisions_and_rationale"])`
-3. **Active conventions**: `search(query="coding conventions and project norms", project_id="dark_factory", categories=["preferences_and_norms"])`
-4. **Procedures**: `search(query="development workflows and procedures", project_id="dark_factory", categories=["procedural_knowledge"])`
-5. **Task tree**: `get_tasks(project_root="/home/leo/src/dark-factory")`
-6. **Recent activity**: `get_episodes(project_id="dark_factory", last_n=5)`
+1. **Conventions for your working area**: Mem0-scoped, phrased from the prose words of the paths you work in. For example, `fused-memory/src/fused_memory/reconciliation/stages/` gives `fused memory reconciliation stages`:
+   ```
+   search(query="conventions and gotchas for fused memory reconciliation stages", project_id="dark_factory", stores=["mem0"], categories=["preferences_and_norms", "procedural_knowledge"])
+   ```
+   With no working area yet, use the same scoping with `query="conventions, norms and gotchas for working in this repository"`.
+2. **Context for a specific task**: a semantic search phrased from the task's title and area words, never the bare task id, then the graph's record of the task. The entity name is `Task <id>`, as in `orchestrator/src/orchestrator/agents/memory_recall.py::MemoryRecall._task_entity`:
+   ```
+   search(query="<task title> <area words>", project_id="dark_factory")
+   get_entity(name="Task 3127", project_id="dark_factory")
+   ```
+3. **Task state**, read narrowly. One task: `get_task(id="<id>", project_root="/home/leo/src/dark-factory")`. Was a task like X filed: `search_tasks(project_root="/home/leo/src/dark-factory", query="<paraphrase>")`. What is live now: `get_tasks(project_root="/home/leo/src/dark-factory", statuses=["in-progress", "blocked"], fields=["title", "status", "priority"])`. Every `get_tasks` call passes `statuses` and `fields`: without them it returns every task in the store, tens of megabytes that no session can read. For a large status such as `pending` it also passes `page_size`, about 250 with those three fields, whose rows average about 190 bytes against a tool-response limit of about 62 KB, and fewer with wider `fields`. For a status census use `get_statuses` with `page_size` of at most 2000; that bound is for its one-line rows and does not carry over to `get_tasks`. Both tools page alike: advance `offset` by `pagination['page_size']` until `pagination['has_more']` is false, as the "Pagination contract" in `fused-memory/src/fused_memory/server/tools.py::get_statuses` sets out. The allowed `fields` names are `fused-memory/src/fused_memory/backends/task_projection.py::TASK_ROW_KEYS`.
+4. **Recent activity**: `get_episodes(project_id="dark_factory", last_n=5)`. This is the recency read, because `search` has no recency predicate.
+
+Two queries are absent on purpose. There is no search for an overview of the project: memory holds no such entry, so read `CLAUDE.md`, `README.md` and `ARCHITECTURE.md` instead. There is no search for the latest decisions either: `search` cannot express recency, and that query measured 5/5 noise. The rationale lives in `shared/src/shared/briefing_queries.py::QUERY_SPECS`.
 
 Compile results into a structured document with sections for each area. Skip sections with no results.

@@ -1,37 +1,57 @@
 #!/usr/bin/env bash
 # watcher-rearm.sh -- canonical bounded-wait + re-arm wrapper for
-# escalation.watcher, shared by skills/escalation-watcher/SKILL.md and
-# skills/escalation-watcher-auto/SKILL.md.
+# escalation.watcher, shared by skills/escalation-watcher/SKILL.md,
+# skills/escalation-watcher-auto/SKILL.md and
+# skills/recon-escalation-watcher/SKILL.md (the level-less caller).
 #
 # Solves the watcher-loop-harness-mismatch cluster (agent-legibility survey
 # S2): callers no longer hand-maintain a growing --exclude-id list across
-# re-arms -- this wrapper owns a persisted --exclude-file (default
-# "<queue-dir>/.watcher-rearm-exclude-l<level>") that a loop caller appends
-# a deliberately-pending id to instead of rebuilding the whole list.
+# re-arms -- this wrapper owns a persisted --exclude-file that a loop caller
+# appends a deliberately-pending id to instead of rebuilding the whole list.
+# The default is "<queue-dir>/.watcher-rearm-exclude-l<level>" when --level
+# is set, and "<queue-dir>/.watcher-rearm-exclude" (no suffix) when it is
+# not -- the level-less form serving flat, level-less queues such as the
+# reconciliation queue. Both are dotfiles that do NOT end in ".json", which
+# is what keeps them invisible to the watcher's own esc-*.json glob and to
+# the dashboard's broader *.json glob over the same recon directory; keep
+# that property if you ever change these names.
 #
 # Usage:
-#   watcher-rearm.sh --level N [--queue-dir DIR] [--timeout SECS]
+#   watcher-rearm.sh [--level N] [--queue-dir DIR] [--timeout SECS]
 #                     [--exclude-file PATH] [--baseline]
 #                     [--ntfy-url URL] [--task-id ID] [--check]
 #
+# --level is OPTIONAL. Omitting it selects escalation.watcher's match-all
+# mode, for flat queues whose escalations carry no level worth filtering
+# (the reconciliation queue -- see skills/recon-escalation-watcher).
+# Because omission is silent by construction, the resolved level is DECLARED
+# on stderr at the top of every run ("level=<all>" vs "level=2") and in the
+# --check dry-run line -- so a levelled caller (L0 steward / L1 auto-watcher
+# / L2 human, the consumer-per-level invariant at
+# escalation/src/escalation/models.py:3-9) that forgot --level can see it has
+# been switched into match-all mode instead of silently consuming another
+# consumer's escalations.
+#
 # Env:
-#   DARK_FACTORY_ROOT     required; repo root used to locate the escalation
-#                         project for `uv run --project`.
+#   DARK_FACTORY_ROOT     required; repo root whose shared .venv
+#                         ($DARK_FACTORY_ROOT/.venv/bin/python) runs the
+#                         watcher.
 #   PROJECT_ROOT          optional; used to derive a default --queue-dir
 #                         ($PROJECT_ROOT/data/escalations) when --queue-dir
 #                         is not passed.
 #   WATCHER_REARM_PYTHON  optional interpreter override (default:
-#                         `uv run --project $DARK_FACTORY_ROOT/escalation
-#                         python`); tests inject `sys.executable` here to
-#                         drive the REAL escalation.watcher module directly
-#                         instead of spawning `uv run`.
+#                         $DARK_FACTORY_ROOT/.venv/bin/python); tests inject
+#                         `sys.executable` here to drive the REAL
+#                         escalation.watcher module directly instead of the
+#                         root venv's interpreter.
 #
 # Exit codes (preserved verbatim from escalation.watcher, except usage=2):
 #   0    FIRED    -- one matching escalation printed to stdout.
 #   124  CEILING  -- --timeout expired with nothing pending.
 #   137|143|144  KILLED -- external kill (SIGKILL/SIGTERM/etc).
-#   2    usage error / missing required input (silent-no-op guard) --
-#        NEVER a silent no-op: a diagnostic is always printed to stderr.
+#   2    usage error / missing required input / a missing or unusable root
+#        venv (silent-no-op guard) -- NEVER a silent no-op: a diagnostic is
+#        always printed to stderr.
 #   *    ERROR -- any other non-zero exit from the watcher itself.
 #
 # A machine-readable `WATCHER_REARM_OUTCOME: <FIRED|CEILING|KILLED|ERROR>
@@ -39,10 +59,10 @@
 # invocation outcome, so callers can grep the outcome without disturbing the
 # watcher's JSON on stdout -- do NOT pipe `2>&1` if you parse stdout as JSON.
 # NOTE: usage/guard failures (exit 2 -- missing DARK_FACTORY_ROOT, an
-# unresolved queue dir, missing --level, or a bad flag) return BEFORE the
-# watcher is ever invoked, so they print a plain stderr diagnostic instead of
-# this marker -- do not grep for the marker to detect a usage error, check
-# for exit code 2 instead.
+# unresolved queue dir, a missing or unusable root venv, or a bad flag)
+# return BEFORE the watcher is ever invoked, so they print a plain stderr
+# diagnostic instead of this marker -- do not grep for the marker to detect
+# a usage error, check for exit code 2 instead.
 #
 # NOTE: escalation.watcher installs its own SIGTERM handler that converts a
 # SIGTERM into a clean `sys.exit(0)` (see the module docstring in
@@ -137,13 +157,10 @@ if [ -z "$QUEUE_DIR" ]; then
     echo "watcher-rearm.sh: no queue dir resolved -- pass --queue-dir or set PROJECT_ROOT" >&2
     exit 2
 fi
-if [ -z "$LEVEL" ]; then
-    echo "watcher-rearm.sh: --level is required" >&2
-    exit 2
-fi
 
 # Wrapper-owned exclude-file: an explicit --exclude-file wins, else default
-# to a per-level path inside the queue dir. Always exists once we proceed
+# to a path inside the queue dir -- per-level when --level is set, and the
+# suffix-less form for a level-less (match-all) watch. Always exists once we proceed
 # past --check, so a caller can append a deliberately-pending id without
 # checking first. Appended ids are NEVER pruned, so the file grows by one
 # line per resolved escalation over a long-lived orchestrator's lifetime --
@@ -152,33 +169,71 @@ fi
 # unbounded growth is harmless in practice. A future pass could periodically
 # drop lines whose esc-<id>.json no longer exists in the queue dir if this
 # ever becomes a real problem.
-EXCLUDE_FILE="${EXCLUDE_FILE_ARG:-$QUEUE_DIR/.watcher-rearm-exclude-l$LEVEL}"
+if [ -n "$EXCLUDE_FILE_ARG" ]; then
+    EXCLUDE_FILE="$EXCLUDE_FILE_ARG"
+elif [ -n "$LEVEL" ]; then
+    EXCLUDE_FILE="$QUEUE_DIR/.watcher-rearm-exclude-l$LEVEL"
+else
+    EXCLUDE_FILE="$QUEUE_DIR/.watcher-rearm-exclude"
+fi
+
+# Default interpreter: the shared root .venv, run without uv (why:
+# escalation/tests/test_watcher_rearm.py::test_default_path_never_invokes_uv).
+ROOT_VENV="$DARK_FACTORY_ROOT/.venv"
+ROOT_VENV_PYTHON="$ROOT_VENV/bin/python"
+
+refuse_root_venv() {
+    echo "watcher-rearm.sh: shared root venv $ROOT_VENV cannot run the watcher: $1 -- this script never creates, syncs or repairs that venv; repair it with scripts/sync-orchestrator-env.sh" >&2
+    exit 2
+}
+
+require_runnable_root_venv() {
+    local err rc last_line
+    [ -x "$ROOT_VENV_PYTHON" ] \
+        || refuse_root_venv "$ROOT_VENV_PYTHON is not an executable interpreter (missing venv, missing bin/python, or a dangling link)"
+    err=$("$ROOT_VENV_PYTHON" -c 'import escalation.watcher' 2>&1 >/dev/null)
+    rc=$?
+    [ "$rc" -eq 0 ] && return 0
+    last_line=${err##*$'\n'}
+    refuse_root_venv "$ROOT_VENV_PYTHON cannot import escalation.watcher (${last_line:-exit $rc, no output})"
+}
+
+# WATCHER_REARM_PYTHON overrides the default (tests inject sys.executable).
+# Built as an array so the default branch keeps the interpreter path as a
+# single argv token -- space-safe even if DARK_FACTORY_ROOT contains spaces.
+# Only an explicit override is word-split, on the assumption that a caller
+# supplying a multi-word interpreter command (e.g. "python3 -I") wants each
+# word as a separate argv entry.
+if [ -n "${WATCHER_REARM_PYTHON:-}" ]; then
+    # shellcheck disable=SC2206
+    WATCHER_CMD=($WATCHER_REARM_PYTHON)
+else
+    require_runnable_root_venv
+    WATCHER_CMD=("$ROOT_VENV_PYTHON")
+fi
 
 if [ "$CHECK" -eq 1 ]; then
-    echo "watcher-rearm.sh: would watch queue-dir=$QUEUE_DIR level=$LEVEL timeout=$TIMEOUT exclude-file=$EXCLUDE_FILE"
+    # Render an unset LEVEL as the explicit token `<all>` rather than an
+    # empty `level=`, which a human doing a dry-run would misread as an
+    # unset-variable bug instead of the deliberate match-all mode.
+    echo "watcher-rearm.sh: would watch queue-dir=$QUEUE_DIR level=${LEVEL:-<all>} timeout=$TIMEOUT exclude-file=$EXCLUDE_FILE"
     exit 0
 fi
 
 mkdir -p "$(dirname "$EXCLUDE_FILE")"
 touch "$EXCLUDE_FILE"
-echo "watcher-rearm.sh: exclude-file=$EXCLUDE_FILE (append a deliberately-pending esc-id here to suppress it)" >&2
+# Declare the RESOLVED level on every live run, not just under --check: since
+# --level became optional, an accidentally-omitted flag would otherwise switch
+# a levelled caller into match-all mode with nothing in the runtime output
+# revealing that the filter is off (see the header note above).
+echo "watcher-rearm.sh: level=${LEVEL:-<all>} exclude-file=$EXCLUDE_FILE (append a deliberately-pending esc-id here to suppress it)" >&2
 
-# Interpreter prefix: WATCHER_REARM_PYTHON overrides the default `uv run`
-# invocation (tests inject sys.executable to drive the real module without
-# uv). Built as an array so the default branch keeps
-# "$DARK_FACTORY_ROOT/escalation" as a single argv token -- space-safe even
-# if DARK_FACTORY_ROOT contains spaces. Only an explicit WATCHER_REARM_PYTHON
-# override is word-split, on the assumption that a caller supplying a
-# multi-word interpreter command (e.g. "python3 -I") wants each word as a
-# separate argv entry.
-if [ -n "${WATCHER_REARM_PYTHON:-}" ]; then
-    # shellcheck disable=SC2206
-    WATCHER_CMD=($WATCHER_REARM_PYTHON)
-else
-    WATCHER_CMD=(uv run --project "$DARK_FACTORY_ROOT/escalation" python)
-fi
-
-WATCHER_ARGS=(-m escalation.watcher --queue-dir "$QUEUE_DIR" --level "$LEVEL" --timeout "$TIMEOUT" --exclude-file "$EXCLUDE_FILE")
+WATCHER_ARGS=(-m escalation.watcher --queue-dir "$QUEUE_DIR" --timeout "$TIMEOUT" --exclude-file "$EXCLUDE_FILE")
+# --level is OMITTED entirely when unset, never passed as an empty value:
+# escalation.watcher declares it `type=int`, so `--level ""` would crash
+# argparse. Omission selects the module's already-supported match-all mode
+# (default=None at watcher.py:192; _matches at watcher.py:67).
+[ -n "$LEVEL" ] && WATCHER_ARGS+=(--level "$LEVEL")
 [ -n "$NTFY_URL" ] && WATCHER_ARGS+=(--ntfy-url "$NTFY_URL")
 [ -n "$TASK_ID" ] && WATCHER_ARGS+=(--task-id "$TASK_ID")
 [ "$BASELINE" -eq 1 ] && WATCHER_ARGS+=(--baseline)

@@ -1,13 +1,18 @@
 """Tests for reconciliation journal (SQLite persistence)."""
 
+import asyncio
+import json
+import sqlite3
 import uuid
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 import pytest
 import pytest_asyncio
+from pydantic import ValidationError
 
 from fused_memory.models.reconciliation import (
-    JournalEntry,
+    JudgeInvocation,
     JudgeVerdict,
     ReconciliationRun,
     RunStatus,
@@ -18,7 +23,38 @@ from fused_memory.models.reconciliation import (
     VerdictSeverity,
     Watermark,
 )
-from fused_memory.reconciliation.journal import ReconciliationJournal
+from fused_memory.reconciliation.journal import (
+    REPAIRABLE_RUN_STATUSES,
+    ReconciliationJournal,
+)
+from fused_memory.services.memory_service import MemoryService
+
+_LEGACY_JOURNAL_ENTRIES_DDL = """
+CREATE TABLE journal_entries (
+    id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL,
+    stage TEXT,
+    timestamp TEXT NOT NULL,
+    operation TEXT NOT NULL,
+    target_system TEXT NOT NULL,
+    before_state TEXT,
+    after_state TEXT,
+    reasoning TEXT DEFAULT '',
+    evidence TEXT DEFAULT '[]'
+);
+CREATE INDEX idx_journal_run ON journal_entries(run_id);
+"""
+
+
+def _schema_names(db_path: Path, kind: str) -> set[str]:
+    conn = sqlite3.connect(f'file:{db_path}?mode=ro', uri=True)
+    try:
+        rows = conn.execute(
+            'SELECT name FROM sqlite_master WHERE type = ?', (kind,),
+        ).fetchall()
+    finally:
+        conn.close()
+    return {name for (name,) in rows}
 
 
 @pytest_asyncio.fixture
@@ -84,27 +120,58 @@ async def test_run_lifecycle(journal):
 
 
 @pytest.mark.asyncio
-async def test_journal_entries(journal):
-    run_id = str(uuid.uuid4())
-    entry = JournalEntry(
-        id=str(uuid.uuid4()),
-        run_id=run_id,
-        stage=StageId.memory_consolidator,
-        timestamp=datetime.now(UTC),
-        operation='delete_memory',
-        target_system='mem0',
-        before_state={'id': '123', 'content': 'old'},
-        after_state=None,
-        reasoning='Duplicate found',
-        evidence=[{'query': 'test', 'match': True}],
-    )
-    await journal.add_entry(entry)
+async def test_fresh_schema_creates_exactly_this_table_set(journal):
+    """The tables ReconciliationJournal.initialize() creates, read from the DB file.
 
-    entries = await journal.get_entries(run_id)
-    assert len(entries) == 1
-    assert entries[0].operation == 'delete_memory'
-    assert entries[0].before_state == {'id': '123', 'content': 'old'}
-    assert entries[0].evidence == [{'query': 'test', 'match': True}]
+    A tripwire on schema drift: the dashboard, a separate process, reads
+    these tables directly, so adding or dropping one must show up here.
+    The set cannot show that each table has a live producer (INV-13); whoever
+    adds a table owes that check.  recon_ledger shares the file but is
+    created by ReconLedgerStore, not by the journal.  judge_invocations is
+    written by Judge._record_cli_invocation (task 6573); sqlite_sequence is
+    SQLite's own, created by judge_invocations' AUTOINCREMENT.
+    """
+    db_path = journal.data_dir / 'reconciliation.db'
+
+    assert _schema_names(db_path, 'table') == {
+        'watermarks',
+        'runs',
+        'judge_verdicts',
+        'event_buffer',
+        'reconciliation_locks',
+        'burst_state',
+        'chunk_boundaries',
+        'run_actions',
+        'halt_state',
+        'judge_pending',
+        'judge_invocations',
+        'sqlite_sequence',
+    }
+
+
+@pytest.mark.asyncio
+async def test_initialize_drops_the_retired_journal_entries_table(journal, tmp_path):
+    """A reconciliation.db created before task 5890 loses the retired journal_entries table, and its index, on initialize."""
+    legacy_dir = tmp_path / 'legacy_recon'
+    legacy_dir.mkdir()
+    legacy_db = legacy_dir / 'reconciliation.db'
+    conn = sqlite3.connect(legacy_db)
+    try:
+        conn.executescript(_LEGACY_JOURNAL_ENTRIES_DDL)
+    finally:
+        conn.close()
+
+    legacy = ReconciliationJournal(legacy_dir)
+    try:
+        await legacy.initialize()
+    finally:
+        await legacy.close()
+
+    assert 'journal_entries' not in _schema_names(legacy_db, 'table')
+    assert 'idx_journal_run' not in _schema_names(legacy_db, 'index')
+    assert _schema_names(legacy_db, 'table') == _schema_names(
+        journal.data_dir / 'reconciliation.db', 'table',
+    )
 
 
 @pytest.mark.asyncio
@@ -190,6 +257,116 @@ async def test_add_verdict_atomically_clears_pending_marker(journal):
     assert run_id in {v.run_id for v in verdicts}
 
 
+_ARMED_CHECK = 'SELECT COUNT(*), MAX(completed_at) FROM judge_invocations'
+_TRIPWIRE_COUNT = 'SELECT COUNT(*) FROM judge_invocations WHERE ended_error_max_turns = 1'
+_TRIPWIRE_FIRST = (
+    'SELECT ji.completed_at, ji.run_id, r.project_id, ji.schema_salvaged, ji.num_turns,'
+    ' ji.rejected_tool_calls FROM judge_invocations ji LEFT JOIN runs r ON r.id = ji.run_id'
+    ' WHERE ji.ended_error_max_turns = 1 ORDER BY ji.completed_at LIMIT 1'
+)
+
+
+def _read_only_rows(db_path: Path, query: str) -> list[tuple]:
+    conn = sqlite3.connect(f'file:{db_path}?mode=ro', uri=True)
+    try:
+        return conn.execute(query).fetchall()
+    finally:
+        conn.close()
+
+
+def _invocation(**overrides) -> JudgeInvocation:
+    fields = {
+        'run_id': 'run-1',
+        'completed_at': datetime.now(UTC),
+        'ended_error_max_turns': False,
+        'schema_salvaged': False,
+        'num_turns': 2,
+        'rejected_tool_calls': 0,
+    }
+    return JudgeInvocation(**(fields | overrides))
+
+
+class TestJudgeInvocations:
+    """The judge_invocations table behind the turn-cap tripwire (task 6573).
+
+    Read back through a read-only sqlite3 connection with the same queries
+    OPERATIONS.md gives the operator, so the recipe is pinned against the
+    real schema.
+    """
+
+    @pytest.mark.asyncio
+    async def test_armed_check_then_round_trip(self, journal):
+        db_path = journal.data_dir / 'reconciliation.db'
+        assert _read_only_rows(db_path, _ARMED_CHECK) == [(0, None)]
+
+        first_at = datetime(2026, 11, 15, 12, 0, tzinfo=UTC)
+        second_at = first_at + timedelta(minutes=5)
+        await journal.record_judge_invocation(_invocation(
+            run_id='run-hit', completed_at=first_at,
+            ended_error_max_turns=True, schema_salvaged=True, num_turns=4, rejected_tool_calls=2,
+        ))
+        await journal.record_judge_invocation(_invocation(
+            run_id='run-ok', completed_at=second_at,
+            ended_error_max_turns=False, num_turns=None, rejected_tool_calls=None,
+        ))
+        await journal.close()
+
+        assert _read_only_rows(
+            db_path,
+            'SELECT run_id, completed_at, ended_error_max_turns, schema_salvaged, num_turns,'
+            ' rejected_tool_calls FROM judge_invocations ORDER BY completed_at',
+        ) == [
+            ('run-hit', first_at.isoformat(), 1, 1, 4, 2),
+            ('run-ok', second_at.isoformat(), 0, 0, None, None),
+        ]
+        assert _read_only_rows(db_path, _ARMED_CHECK) == [(2, second_at.isoformat())]
+        assert _read_only_rows(db_path, _TRIPWIRE_COUNT) == [(1,)]
+        assert _read_only_rows(db_path, _TRIPWIRE_FIRST) == [
+            (first_at.isoformat(), 'run-hit', None, 1, 4, 2),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_initialize_adds_the_table_to_an_existing_db(self, tmp_path):
+        data_dir = tmp_path / 'existing_recon'
+        before = ReconciliationJournal(data_dir)
+        await before.initialize()
+        await before.close()
+        conn = sqlite3.connect(data_dir / 'reconciliation.db')
+        try:
+            conn.execute('DROP TABLE judge_invocations')
+            conn.commit()
+        finally:
+            conn.close()
+
+        after = ReconciliationJournal(data_dir)
+        await after.initialize()
+        try:
+            await after.record_judge_invocation(_invocation())
+        finally:
+            await after.close()
+
+        assert _read_only_rows(data_dir / 'reconciliation.db', _ARMED_CHECK)[0][0] == 1
+
+    @pytest.mark.parametrize('field', ['num_turns', 'rejected_tool_calls'])
+    def test_model_rejects_negative_counts(self, field):
+        with pytest.raises(ValidationError):
+            _invocation(**{field: -1})
+
+    def test_model_rejects_a_zero_turn_count(self):
+        with pytest.raises(ValidationError):
+            _invocation(num_turns=0)
+
+    def test_model_requires_schema_salvaged(self):
+        fields = _invocation().model_dump(exclude={'schema_salvaged'})
+        with pytest.raises(ValidationError):
+            JudgeInvocation.model_validate(fields)
+
+    def test_model_is_frozen(self):
+        invocation = _invocation()
+        with pytest.raises(ValidationError):
+            invocation.num_turns = 5
+
+
 @pytest.mark.asyncio
 async def test_recent_runs(journal):
     for i in range(3):
@@ -257,154 +434,15 @@ async def test_get_running_runs_returns_all_running_regardless_of_age(journal):
 
 
 @pytest.mark.asyncio
-async def test_interrupted_status_roundtrips_and_get_interrupted_runs(journal):
-    """complete_run(run_id, 'interrupted') persists RunStatus.interrupted and
-    stamps completed_at (the interrupt instant); get_interrupted_runs() returns
-    exactly the interrupted rows, excluding running/failed/completed."""
-    interrupted = ReconciliationRun(
-        id=str(uuid.uuid4()),
-        project_id='test-project',
-        run_type=RunType.full,
-        trigger_reason='unit-test',
-        started_at=datetime.now(UTC),
-        status=RunStatus.running,
-        instance_id='instance-interrupted',
-    )
-    still_running = ReconciliationRun(
-        id=str(uuid.uuid4()),
-        project_id='test-project',
-        run_type=RunType.full,
-        trigger_reason='unit-test',
-        started_at=datetime.now(UTC),
-        status=RunStatus.running,
-        instance_id='instance-running',
-    )
-    failed = ReconciliationRun(
-        id=str(uuid.uuid4()),
-        project_id='test-project',
-        run_type=RunType.full,
-        trigger_reason='unit-test',
-        started_at=datetime.now(UTC),
-        status=RunStatus.running,
-    )
-    completed = ReconciliationRun(
-        id=str(uuid.uuid4()),
-        project_id='test-project',
-        run_type=RunType.full,
-        trigger_reason='unit-test',
-        started_at=datetime.now(UTC),
-        status=RunStatus.running,
-    )
-    await journal.start_run(interrupted)
-    await journal.start_run(still_running)
-    await journal.start_run(failed)
-    await journal.start_run(completed)
-    await journal.complete_run(interrupted.id, 'interrupted')
-    await journal.complete_run(failed.id, 'failed')
-    await journal.complete_run(completed.id, 'completed')
-
-    # Roundtrip: status persists as interrupted and completed_at (the interrupt
-    # instant, later reused as the resume freshness clock) is stamped.
-    loaded = await journal.get_run(interrupted.id)
-    assert loaded is not None
-    assert loaded.status == RunStatus.interrupted
-    assert loaded.completed_at is not None
-
-    # get_interrupted_runs returns exactly the interrupted row, mapping
-    # instance_id/session snapshot faithfully, and excludes every other status.
-    interrupted_runs = await journal.get_interrupted_runs()
-    interrupted_ids = {r.id for r in interrupted_runs}
-    assert interrupted_ids == {interrupted.id}, (
-        f'Expected exactly the interrupted run; got ids={interrupted_ids!r}'
-    )
-    assert still_running.id not in interrupted_ids
-    assert failed.id not in interrupted_ids
-    assert completed.id not in interrupted_ids
-    assert interrupted_runs[0].instance_id == 'instance-interrupted'
-
-
-@pytest.mark.asyncio
 async def test_runs_table_has_session_columns(journal):
     """A freshly-initialized runs table exposes session_id, stage_cursor, attempt."""
-    db = journal._require_db()
+    db = journal._require_access().connection
     async with db.execute('PRAGMA table_info(runs)') as cursor:
         rows = await cursor.fetchall()
     colnames = {row['name'] for row in rows}
     assert {'session_id', 'stage_cursor', 'attempt'} <= colnames, (
         f'runs table missing session columns; got {sorted(colnames)!r}'
     )
-
-
-@pytest.mark.asyncio
-async def test_record_run_session_persists_and_increments_attempt(journal):
-    """record_run_session persists (session_id, stage_cursor) and auto-increments
-    attempt; a second call bumps attempt and overwrites the snapshot. Both the
-    get_run and get_running_runs (_row_to_run) read paths carry the fields."""
-    run_id = str(uuid.uuid4())
-    run = ReconciliationRun(
-        id=run_id,
-        project_id='test-project',
-        run_type=RunType.full,
-        trigger_reason='session-capture',
-        started_at=datetime.now(UTC),
-        status=RunStatus.running,
-    )
-    await journal.start_run(run)
-
-    # First stage launch.
-    await journal.record_run_session(
-        run_id, session_id='S1', stage_cursor='memory_consolidator'
-    )
-    loaded = await journal.get_run(run_id)
-    assert loaded is not None
-    assert loaded.session_id == 'S1'
-    assert loaded.stage_cursor == 'memory_consolidator'
-    assert loaded.attempt == 1
-
-    # Same snapshot is visible via the _row_to_run recovery read path (σ).
-    running = {r.id: r for r in await journal.get_running_runs()}
-    assert running[run_id].session_id == 'S1'
-    assert running[run_id].stage_cursor == 'memory_consolidator'
-    assert running[run_id].attempt == 1
-
-    # Second stage launch bumps attempt and overwrites the snapshot.
-    await journal.record_run_session(
-        run_id, session_id='S2', stage_cursor='task_knowledge_sync'
-    )
-    loaded = await journal.get_run(run_id)
-    assert loaded is not None
-    assert loaded.session_id == 'S2'
-    assert loaded.stage_cursor == 'task_knowledge_sync'
-    assert loaded.attempt == 2
-
-
-@pytest.mark.asyncio
-async def test_clear_run_session_nulls_snapshot_but_retains_attempt(journal):
-    """clear_run_session nulls session_id/stage_cursor but leaves attempt intact."""
-    run_id = str(uuid.uuid4())
-    run = ReconciliationRun(
-        id=run_id,
-        project_id='test-project',
-        run_type=RunType.full,
-        trigger_reason='session-capture',
-        started_at=datetime.now(UTC),
-        status=RunStatus.running,
-    )
-    await journal.start_run(run)
-    await journal.record_run_session(
-        run_id, session_id='S1', stage_cursor='memory_consolidator'
-    )
-    await journal.record_run_session(
-        run_id, session_id='S2', stage_cursor='task_knowledge_sync'
-    )
-
-    await journal.clear_run_session(run_id)
-
-    loaded = await journal.get_run(run_id)
-    assert loaded is not None
-    assert loaded.session_id is None
-    assert loaded.stage_cursor is None
-    assert loaded.attempt == 2
 
 
 @pytest.mark.asyncio
@@ -449,6 +487,303 @@ async def test_stats(journal):
     assert stats['runs_count'] == 1
 
 
+class TestStatsPhantomVerdicts:
+    """get_stats must not count PHANTOM verdicts as genuine reviews.
+
+    A phantom is the placeholder ``Judge._parse_verdict`` fabricates when it
+    could not parse its own model output — no review happened.  Measured on
+    the live DB (task 3287): of the ten ``severity='serious'`` rows, NINE are
+    phantoms from the 2026-07-20..29 cap-storm resume failures, so any stats
+    window starting after 2026-04-19 reports serious reviews that never
+    occurred.
+
+    The contract is SUBTRACT-AND-NAME, not hide: every row removed from
+    ``verdicts`` is reported in the parallel ``phantom_verdicts`` bucket, and
+    the two dicts sum to the old total.  Nothing vanishes unnamed.
+    """
+
+    @staticmethod
+    async def _seed_verdict(journal, *, severity, findings, reviewed_at, action):
+        """Start one run and attach one verdict to it.
+
+        One run per verdict because ``judge_verdicts.run_id`` is the PK and
+        get_stats joins ``runs`` for project scoping — a second verdict on the
+        same run would collide rather than accumulate.
+        """
+        run_id = str(uuid.uuid4())
+        await journal.start_run(
+            ReconciliationRun(
+                id=run_id,
+                project_id='test-project',
+                run_type=RunType.full,
+                trigger_reason='test',
+                started_at=reviewed_at,
+                status=RunStatus.running,
+            )
+        )
+        await journal.complete_run(run_id, 'completed')
+        await journal.add_verdict(
+            JudgeVerdict(
+                run_id=run_id,
+                reviewed_at=reviewed_at,
+                severity=severity,
+                findings=findings,
+                action_taken=action,
+            )
+        )
+        return run_id
+
+    @staticmethod
+    def _genuine_serious_findings():
+        """The bc9459b8 shape: five substantive findings, no marker."""
+        return [
+            {
+                'issue': f'Substantive content issue #{i}',
+                'severity': 'serious',
+                'recommendation': f'Fix issue #{i}',
+            }
+            for i in range(5)
+        ]
+
+    @staticmethod
+    def _marked_phantom_findings():
+        """Post-2947 shape: the structured ``code`` marker."""
+        return [
+            {
+                'code': 'unparseable_judge_response',
+                'issue': (
+                    'Judge response could not be parsed: Expecting value: '
+                    'line 1 column 1 (char 0)'
+                ),
+                'severity': 'serious',
+            }
+        ]
+
+    @staticmethod
+    def _legacy_phantom_findings():
+        """Pre-2947 shape: no ``code`` key at all (rows e87d8e4a, 09d14a75)."""
+        return [
+            {
+                'issue': (
+                    'Judge response could not be parsed: Expecting value: '
+                    'line 1 column 1 (char 0)'
+                ),
+                'severity': 'serious',
+            }
+        ]
+
+    async def _seed_genuine_serious(self, journal, now):
+        await self._seed_verdict(
+            journal,
+            severity=VerdictSeverity.serious,
+            findings=self._genuine_serious_findings(),
+            reviewed_at=now,
+            action=VerdictAction.rollback,
+        )
+
+    async def _seed_both_phantoms(self, journal, now):
+        await self._seed_verdict(
+            journal,
+            severity=VerdictSeverity.serious,
+            findings=self._marked_phantom_findings(),
+            reviewed_at=now,
+            action=VerdictAction.halt,
+        )
+        await self._seed_verdict(
+            journal,
+            severity=VerdictSeverity.serious,
+            findings=self._legacy_phantom_findings(),
+            reviewed_at=now,
+            action=VerdictAction.halt,
+        )
+
+    async def _seed_ordinary(self, journal, now):
+        await self._seed_verdict(
+            journal,
+            severity=VerdictSeverity.ok,
+            findings=[],
+            reviewed_at=now,
+            action=VerdictAction.none,
+        )
+        await self._seed_verdict(
+            journal,
+            severity=VerdictSeverity.minor,
+            findings=[{'issue': 'minor drift in entity summary wording'}],
+            reviewed_at=now,
+            action=VerdictAction.none,
+        )
+
+    @pytest.mark.asyncio
+    async def test_phantoms_are_split_out_of_the_genuine_counts(self, journal):
+        """(a)(b) One genuine serious + two phantoms → serious: 1, phantom: 2."""
+        now = datetime.now(UTC)
+        await self._seed_genuine_serious(journal, now)
+        await self._seed_both_phantoms(journal, now)
+        await self._seed_ordinary(journal, now)
+
+        stats = await journal.get_stats('test-project', now - timedelta(hours=1))
+
+        assert stats['verdicts'] == {'serious': 1, 'ok': 1, 'minor': 1}
+        assert stats['phantom_verdicts'] == {'serious': 2}
+
+    @pytest.mark.asyncio
+    async def test_severity_dropping_to_zero_leaves_verdicts_but_is_still_named(
+        self, journal
+    ):
+        """(c) With no genuine serious row, 'serious' leaves ``verdicts`` entirely.
+
+        Matches GROUP BY's absent-key convention — a severity with no rows
+        simply has no key, so consumers need no new special case.  This is not
+        silent degradation: both phantoms are still reported by name in
+        ``phantom_verdicts``.
+        """
+        now = datetime.now(UTC)
+        await self._seed_both_phantoms(journal, now)
+        await self._seed_ordinary(journal, now)
+
+        stats = await journal.get_stats('test-project', now - timedelta(hours=1))
+
+        assert 'serious' not in stats['verdicts']
+        assert stats['verdicts'] == {'ok': 1, 'minor': 1}
+        assert stats['phantom_verdicts'] == {'serious': 2}
+
+    @pytest.mark.asyncio
+    async def test_no_phantoms_leaves_verdicts_byte_identical(self, journal):
+        """(d) With no phantom rows, the genuine counts are exactly today's output."""
+        now = datetime.now(UTC)
+        await self._seed_genuine_serious(journal, now)
+        await self._seed_ordinary(journal, now)
+
+        stats = await journal.get_stats('test-project', now - timedelta(hours=1))
+
+        assert stats['verdicts'] == {'serious': 1, 'ok': 1, 'minor': 1}
+        assert stats['phantom_verdicts'] == {}
+
+    @pytest.mark.asyncio
+    async def test_runs_count_and_duration_are_unaffected(self, journal):
+        """(e) The phantom split touches only the verdict buckets."""
+        now = datetime.now(UTC)
+        await self._seed_genuine_serious(journal, now)
+        await self._seed_both_phantoms(journal, now)
+
+        stats = await journal.get_stats('test-project', now - timedelta(hours=1))
+
+        assert stats['runs_count'] == 3
+        assert 'avg_duration_seconds' in stats
+
+    @pytest.mark.asyncio
+    async def test_verdict_outside_the_window_counts_in_neither_bucket(self, journal):
+        """(f) The ``since`` window applies to phantoms exactly as to genuine rows."""
+        now = datetime.now(UTC)
+        long_ago = now - timedelta(days=30)
+        await self._seed_verdict(
+            journal,
+            severity=VerdictSeverity.serious,
+            findings=self._marked_phantom_findings(),
+            reviewed_at=long_ago,
+            action=VerdictAction.halt,
+        )
+        await self._seed_verdict(
+            journal,
+            severity=VerdictSeverity.serious,
+            findings=self._genuine_serious_findings(),
+            reviewed_at=long_ago,
+            action=VerdictAction.rollback,
+        )
+
+        stats = await journal.get_stats('test-project', now - timedelta(hours=1))
+
+        assert stats['verdicts'] == {}
+        assert stats['phantom_verdicts'] == {}
+
+    # --- the SQL candidate prefilter's two disjuncts, exercised separately ---
+    #
+    # The prefilter is `(jv.severity = 'serious' OR jv.findings LIKE ?)`.  Every
+    # case above seeds its phantoms at severity=serious, so the FIRST disjunct
+    # alone satisfies all of them and the LIKE half is never exercised: if its
+    # pattern were wrong (wildcards dropped, constant mis-spelled, parameters
+    # swapped) every one of those tests would still pass.  The two cases below
+    # are the ones with teeth on it.
+
+    @pytest.mark.asyncio
+    async def test_marked_phantom_below_serious_is_caught_by_the_like_disjunct(
+        self, journal
+    ):
+        """(g) A marker-stamped phantom at a NON-serious severity is still split out.
+
+        `has_unparseable_marker` is documented as deliberately severity-agnostic
+        — the structured marker is ground truth about how the row was produced,
+        so a producer that stamps it at some severity other than `serious` is
+        still writing a phantom.  Reaching such a row requires the `findings
+        LIKE ?` disjunct: `severity = 'serious'` cannot match it.  This is the
+        only case in the class that fails if that pattern is broken.
+        """
+        now = datetime.now(UTC)
+        await self._seed_both_phantoms(journal, now)
+        await self._seed_verdict(
+            journal,
+            severity=VerdictSeverity.moderate,
+            findings=self._marked_phantom_findings(),
+            reviewed_at=now,
+            action=VerdictAction.halt,
+        )
+        await self._seed_ordinary(journal, now)
+
+        stats = await journal.get_stats('test-project', now - timedelta(hours=1))
+
+        assert stats['phantom_verdicts'] == {'serious': 2, 'moderate': 1}
+        # 'moderate' had exactly one row and it was phantom, so — like
+        # 'serious' in case (c) — the key leaves `verdicts` entirely rather
+        # than sitting at zero.  Nothing vanishes unnamed: it is reported
+        # above.
+        assert 'moderate' not in stats['verdicts']
+        assert stats['verdicts'] == {'ok': 1, 'minor': 1}
+
+    @pytest.mark.asyncio
+    async def test_genuine_row_mentioning_the_marker_string_stays_genuine(
+        self, journal
+    ):
+        """(h) The prefilter is a CANDIDATE filter, never the verdict.
+
+        The converse of (g): a real multi-finding serious review whose issue
+        prose merely MENTIONS `unparseable_judge_response` matches the LIKE
+        disjunct and is fetched — then correctly rejected in Python by
+        `is_phantom_verdict_row`, because it carries no `code` marker and has
+        more than one finding.  Widening the prefilter must never widen the
+        classification.
+        """
+        now = datetime.now(UTC)
+        mentions_marker = [
+            {
+                'issue': (
+                    'Nine judge verdicts in the 2026-07 window carry '
+                    'code=unparseable_judge_response and were never reviewed; '
+                    'the resume path needs a cap-storm guard.'
+                ),
+                'severity': 'serious',
+                'recommendation': 'Add a resume guard',
+            },
+            {
+                'issue': 'Entity resolution dropped two candidate merges',
+                'severity': 'serious',
+                'recommendation': 'Re-run resolution',
+            },
+        ]
+        await self._seed_verdict(
+            journal,
+            severity=VerdictSeverity.serious,
+            findings=mentions_marker,
+            reviewed_at=now,
+            action=VerdictAction.rollback,
+        )
+        await self._seed_both_phantoms(journal, now)
+
+        stats = await journal.get_stats('test-project', now - timedelta(hours=1))
+
+        assert stats['verdicts'] == {'serious': 1}
+        assert stats['phantom_verdicts'] == {'serious': 2}
+
+
 @pytest.mark.asyncio
 async def test_get_nonexistent_run(journal):
     result = await journal.get_run('nonexistent-id')
@@ -482,6 +817,62 @@ async def test_stage_reports_roundtrip(journal):
     loaded = await journal.get_run(run_id)
     assert 'memory_consolidator' in loaded.stage_reports
     assert loaded.stage_reports['memory_consolidator'].llm_calls == 3
+
+
+async def _start_test_run(journal) -> str:
+    run_id = str(uuid.uuid4())
+    await journal.start_run(
+        ReconciliationRun(
+            id=run_id,
+            project_id='test-project',
+            run_type=RunType.full,
+            trigger_reason='test',
+            started_at=datetime.now(UTC),
+            status=RunStatus.running,
+        )
+    )
+    return run_id
+
+
+@pytest.mark.asyncio
+async def test_stage_report_cache_tokens_roundtrip(journal):
+    run_id = await _start_test_run(journal)
+    now = datetime.now(UTC)
+    report = StageReport(
+        stage=StageId.task_knowledge_sync,
+        started_at=now,
+        completed_at=now,
+        tokens_used=1500,
+        cache_read_tokens=50000,
+        cache_create_tokens=4000,
+    )
+    await journal.update_run_stage_reports(run_id, {'task_knowledge_sync': report})
+
+    loaded = (await journal.get_run(run_id)).stage_reports['task_knowledge_sync']
+
+    assert loaded.tokens_used == 1500
+    assert loaded.cache_read_tokens == 50000
+    assert loaded.cache_create_tokens == 4000
+
+
+@pytest.mark.asyncio
+async def test_legacy_stage_report_without_cache_tokens_reads_zero(journal):
+    run_id = await _start_test_run(journal)
+    now = datetime.now(UTC).isoformat()
+    legacy = {
+        'stage': 'task_knowledge_sync',
+        'started_at': now,
+        'completed_at': now,
+        'llm_calls': 4,
+        'tokens_used': 0,
+    }
+    await journal.update_run_stage_reports(run_id, {'task_knowledge_sync': legacy})
+
+    loaded = (await journal.get_run(run_id)).stage_reports['task_knowledge_sync']
+
+    assert loaded.llm_calls == 4
+    assert loaded.cache_read_tokens == 0
+    assert loaded.cache_create_tokens == 0
 
 
 @pytest.mark.asyncio
@@ -631,3 +1022,852 @@ class TestExtractTarget:
         from fused_memory.reconciliation.journal import _extract_target
 
         assert _extract_target({'result_summary': 'not json'}) == '?'
+
+
+class TestGetRunWithStageReportsText:
+    """The CAS read primitive: one row read yields BOTH the parsed run and the
+    exact stored ``runs.stage_reports`` text used as a compare-and-set token.
+
+    The token must be the bytes actually in the column — not a re-serialization
+    of the parsed run — so the CAS in ``compare_and_set_run_stage_reports``
+    cannot fail spuriously the day the DB-text → parsed → model_dump → json.dumps
+    round-trip stops being byte-identical.
+    """
+
+    @staticmethod
+    async def _seed(journal, *, stage_reports=None) -> str:
+        run_id = str(uuid.uuid4())
+        now = datetime.now(UTC)
+        await journal.start_run(
+            ReconciliationRun(
+                id=run_id,
+                project_id='test-project',
+                run_type=RunType.full,
+                trigger_reason='test',
+                started_at=now,
+                status=RunStatus.running,
+            )
+        )
+        if stage_reports is not None:
+            await journal.update_run_stage_reports(run_id, stage_reports)
+        return run_id
+
+    @staticmethod
+    async def _raw_stage_reports(journal, run_id: str):
+        """Read the column directly, bypassing every parsing layer."""
+        row = await journal._require_access().read_one(
+            'SELECT stage_reports FROM runs WHERE id = ?', (run_id,)
+        )
+        return None if row is None else row['stage_reports']
+
+    @pytest.mark.asyncio
+    async def test_returns_the_parsed_run_and_the_exact_stored_text(self, journal):
+        now = datetime.now(UTC)
+        report = StageReport(
+            stage=StageId.memory_consolidator,
+            started_at=now,
+            completed_at=now,
+            stats={'created': 1, 'deleted': 2},
+            llm_calls=3,
+            tokens_used=500,
+        )
+        run_id = await self._seed(journal, stage_reports={'memory_consolidator': report})
+
+        result = await journal.get_run_with_stage_reports_text(run_id)
+        assert result is not None
+        run, text = result
+
+        # The parsed half matches what get_run() would have handed back.
+        via_get_run = await journal.get_run(run_id)
+        assert run.id == via_get_run.id
+        assert run.project_id == via_get_run.project_id
+        assert run.status == via_get_run.status
+        assert set(run.stage_reports) == set(via_get_run.stage_reports)
+        assert (
+            run.stage_reports['memory_consolidator'].model_dump(mode='json')
+            == via_get_run.stage_reports['memory_consolidator'].model_dump(mode='json')
+        )
+
+        # The token half is the column value byte-for-byte. Compared against a
+        # raw SELECT, NOT against a re-serialized round-trip — the whole point
+        # of the primitive is that it does not depend on round-trip stability.
+        assert text == await self._raw_stage_reports(journal, run_id)
+
+    @pytest.mark.asyncio
+    async def test_unknown_run_id_returns_none(self, journal):
+        assert await journal.get_run_with_stage_reports_text('nonexistent-id') is None
+
+    @pytest.mark.asyncio
+    async def test_never_written_stage_reports_is_carried_through_as_is(self, journal):
+        """The token is passed through untouched so it can be fed straight back
+        into the CAS — no normalising, no defaulting."""
+        run_id = await self._seed(journal)
+
+        result = await journal.get_run_with_stage_reports_text(run_id)
+        assert result is not None
+        run, text = result
+
+        assert text == await self._raw_stage_reports(journal, run_id)
+        assert run.stage_reports == {}
+
+
+class TestCompareAndSetRunStageReports:
+    """The serialised half of a read-modify-write of the WHOLE stage_reports
+    blob: the write applies only if the column still holds the exact text the
+    caller read, so a competing wholesale rewrite is refused rather than
+    silently clobbered.
+    """
+
+    @staticmethod
+    async def _seed(journal) -> str:
+        run_id = str(uuid.uuid4())
+        now = datetime.now(UTC)
+        await journal.start_run(
+            ReconciliationRun(
+                id=run_id,
+                project_id='test-project',
+                run_type=RunType.full,
+                trigger_reason='test',
+                started_at=now,
+                status=RunStatus.running,
+            )
+        )
+        await journal.update_run_stage_reports(run_id, {'seed': {'findings': []}})
+        return run_id
+
+    @pytest.mark.asyncio
+    async def test_fresh_token_applies(self, journal):
+        run_id = await self._seed(journal)
+
+        run, token = await journal.get_run_with_stage_reports_text(run_id)
+        run.stage_reports['seed']['findings'].append({'id': 'f-1'})
+
+        assert (
+            await journal.compare_and_set_run_stage_reports(
+                run_id, run.stage_reports, expected_text=token
+            )
+            is True
+        )
+
+        reloaded = await journal.get_run(run_id)
+        assert reloaded.stage_reports['seed']['findings'] == [{'id': 'f-1'}]
+
+    @pytest.mark.asyncio
+    async def test_stale_token_refuses_and_writes_nothing(self, journal):
+        """Lost-update prevention proper: assert BOTH the refusal and that no
+        partial write landed."""
+        run_id = await self._seed(journal)
+
+        mine, token = await journal.get_run_with_stage_reports_text(run_id)
+        mine.stage_reports['seed']['findings'].append({'id': 'mine'})
+
+        # A competing writer lands, from its own separately-read copy.
+        theirs = await journal.get_run(run_id)
+        theirs.stage_reports['seed']['findings'].append({'id': 'theirs'})
+        await journal.update_run_stage_reports(run_id, theirs.stage_reports)
+        competitors_blob = await journal.get_run(run_id)
+
+        assert (
+            await journal.compare_and_set_run_stage_reports(
+                run_id, mine.stage_reports, expected_text=token
+            )
+            is False
+        )
+
+        after = await journal.get_run(run_id)
+        assert after.stage_reports == competitors_blob.stage_reports
+        assert after.stage_reports['seed']['findings'] == [{'id': 'theirs'}]
+
+    @pytest.mark.asyncio
+    async def test_unknown_run_id_refuses_without_raising(self, journal):
+        assert (
+            await journal.compare_and_set_run_stage_reports(
+                'nonexistent-id', {'seed': {}}, expected_text='{}'
+            )
+            is False
+        )
+
+    @pytest.mark.asyncio
+    async def test_null_token_round_trips(self, journal):
+        """A NULL stage_reports column is CASable with expected_text=None,
+        proving the comparison is NULL-safe (``IS``) rather than silently
+        never matching."""
+        run_id = await self._seed(journal)
+        async with journal._require_access().write() as db:
+            await db.execute('UPDATE runs SET stage_reports = NULL WHERE id = ?', (run_id,))
+
+        run, token = await journal.get_run_with_stage_reports_text(run_id)
+        assert token is None
+
+        assert (
+            await journal.compare_and_set_run_stage_reports(
+                run_id, {'seed': {'findings': [{'id': 'f-1'}]}}, expected_text=token
+            )
+            is True
+        )
+        reloaded = await journal.get_run(run_id)
+        assert reloaded.stage_reports['seed']['findings'] == [{'id': 'f-1'}]
+
+
+class TestCompleteRunIfStatus:
+    """One-statement terminalisation for a caller acting on a row image it read
+    earlier: the write applies only if the row still holds the status that read
+    observed, so a run whose own coroutine terminalised it in between is left
+    exactly as its owner wrote it.
+    """
+
+    @staticmethod
+    async def _seed(journal, status: RunStatus = RunStatus.running) -> str:
+        run_id = str(uuid.uuid4())
+        now = datetime.now(UTC)
+        await journal.start_run(
+            ReconciliationRun(
+                id=run_id,
+                project_id='test-project',
+                run_type=RunType.full,
+                trigger_reason='test',
+                started_at=now,
+                status=RunStatus.running,
+            )
+        )
+        await journal.update_run_stage_reports(
+            run_id,
+            {
+                'memory_consolidator': StageReport(
+                    stage=StageId.memory_consolidator,
+                    started_at=now,
+                    completed_at=now,
+                    stats={'created': 1},
+                )
+            },
+        )
+        if status != RunStatus.running:
+            await journal.complete_run(run_id, status)
+        return run_id
+
+    @pytest.mark.asyncio
+    async def test_matching_status_terminalises_reports_status_and_completed_at_together(
+        self, journal
+    ):
+        run_id = await self._seed(journal)
+        stale = await journal.get_run(run_id)
+        reports = dict(stale.stage_reports)
+        reports['_error'] = {'error_type': 'stale_run', 'message': 'reaped'}
+
+        applied = await journal.complete_run_if_status(
+            run_id,
+            expected_status=RunStatus.running,
+            status=RunStatus.failed,
+            stage_reports=reports,
+        )
+
+        assert applied is True
+        after = await journal.get_run(run_id)
+        assert after.status == RunStatus.failed
+        assert after.completed_at is not None
+        assert after.stage_reports == reports
+
+    @pytest.mark.asyncio
+    async def test_mismatched_status_refuses_and_leaves_the_row_byte_identical(
+        self, journal
+    ):
+        run_id = await self._seed(journal)
+        stale = await journal.get_run(run_id)
+
+        # The run's own coroutine terminalises it.
+        owners = dict(stale.stage_reports)
+        owners['owner_marker'] = {'written_by': 'owner'}
+        await journal.update_run_stage_reports(run_id, owners)
+        await journal.complete_run(run_id, 'completed')
+        _, owners_text = await journal.get_run_with_stage_reports_text(run_id)
+        owners_row = await journal.get_run(run_id)
+
+        reaper_reports = dict(stale.stage_reports)
+        reaper_reports['_error'] = {'error_type': 'stale_run'}
+        applied = await journal.complete_run_if_status(
+            run_id,
+            expected_status=RunStatus.running,
+            status='failed',
+            stage_reports=reaper_reports,
+        )
+
+        assert applied is False
+        after, after_text = await journal.get_run_with_stage_reports_text(run_id)
+        assert after_text == owners_text
+        assert after.status == owners_row.status == RunStatus.completed
+        assert after.completed_at == owners_row.completed_at
+
+    @pytest.mark.asyncio
+    async def test_unknown_run_id_refuses_without_raising(self, journal):
+        assert (
+            await journal.complete_run_if_status(
+                'nonexistent-id',
+                expected_status=RunStatus.running,
+                status=RunStatus.failed,
+                stage_reports={},
+            )
+            is False
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'expected_status',
+        [
+            *sorted(REPAIRABLE_RUN_STATUSES),
+            pytest.param(RunStatus.completed.value, id='bare-str-completed'),
+        ],
+    )
+    async def test_a_status_citation_repair_writes_under_raises_before_writing(
+        self, journal, expected_status
+    ):
+        """This write does not carry citation repairs forward, so gating it on a
+        status a repair may already have written under would let it erase one."""
+        run_id = await self._seed(journal, RunStatus(expected_status))
+        before, before_text = await journal.get_run_with_stage_reports_text(run_id)
+
+        with pytest.raises(ValueError, match='expected_status'):
+            await journal.complete_run_if_status(
+                run_id,
+                expected_status=expected_status,
+                status=RunStatus.failed,
+                stage_reports={},
+            )
+
+        after, after_text = await journal.get_run_with_stage_reports_text(run_id)
+        assert after_text == before_text
+        assert after.status == before.status
+        assert after.completed_at == before.completed_at
+
+
+class TestIsRunCompleted:
+    """The journal's one answer to whether a run durably completed."""
+
+    @pytest.mark.asyncio
+    async def test_a_run_journaled_completed_answers_true(self, journal):
+        run_id = await TestCompleteRunIfStatus._seed(journal, RunStatus.completed)
+
+        assert await journal.is_run_completed(run_id) is True
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'status', [RunStatus.running, RunStatus.failed]
+    )
+    async def test_a_run_in_any_other_status_answers_false(self, journal, status):
+        run_id = await TestCompleteRunIfStatus._seed(journal, status)
+
+        assert await journal.is_run_completed(run_id) is False
+
+    @pytest.mark.asyncio
+    async def test_an_unknown_run_id_answers_false_without_raising(self, journal):
+        assert await journal.is_run_completed('nonexistent-id') is False
+
+
+class TestUpdateRunStageReportsPreservesCitationRepairs:
+    """The run owner's wholesale rewrite never erases a citation repair a
+    compare-and-set writer persisted: the owner's copy predates the repair, so
+    writing it back verbatim would silently undo an audit write that was
+    already reported ``repaired``.
+    """
+
+    @staticmethod
+    def _citation(memory_id: str) -> dict:
+        return {'memory_id': memory_id, 'store': 'mem0'}
+
+    @staticmethod
+    def _repair_record(memory_id: str, replacement: str) -> dict:
+        return {
+            'memory_id': memory_id,
+            'replacement_memory_id': replacement,
+            'store': 'mem0',
+            'reason': 'memory_not_found',
+            'justification': None,
+            'repaired_by': 'run:test',
+            'repaired_at': datetime.now(UTC).isoformat(),
+        }
+
+    async def _seed_completed(self, journal) -> tuple[str, StageReport]:
+        """A completed run whose integrity_check report flags f-1 (citing A)
+        and f-2 (citing B). Returns the run id and the owner's own copy of
+        that report, as the owner held it before any repair."""
+        run_id = str(uuid.uuid4())
+        now = datetime.now(UTC)
+        await journal.start_run(
+            ReconciliationRun(
+                id=run_id,
+                project_id='test-project',
+                run_type=RunType.full,
+                trigger_reason='test',
+                started_at=now,
+                status=RunStatus.running,
+            )
+        )
+        report = StageReport(
+            stage=StageId.integrity_check,
+            started_at=now,
+            completed_at=now,
+            items_flagged=[
+                {'finding_id': 'f-1', 'cited_memories': [self._citation('A')]},
+                {'finding_id': 'f-2', 'cited_memories': [self._citation('B')]},
+            ],
+            stats={'flagged': 2},
+        )
+        await journal.update_run_stage_reports(run_id, {'integrity_check': report})
+        await journal.complete_run(run_id, 'completed')
+        return run_id, report.model_copy(deep=True)
+
+    async def _repaired_copy(self, journal, run_id: str) -> tuple[dict, str | None, dict]:
+        """Read (run, token) and re-point f-1 from A to C with one provenance
+        record, as citation_repair does. Returns the repaired stage_reports,
+        the token they were read under, and the record."""
+        run, token = await journal.get_run_with_stage_reports_text(run_id)
+        record = self._repair_record('A', 'C')
+        f1 = run.stage_reports['integrity_check'].items_flagged[0]
+        f1['cited_memories'] = [self._citation('C')]
+        f1['citation_repairs'] = [record]
+        return run.stage_reports, token, record
+
+    @pytest.mark.asyncio
+    async def test_owner_rewrite_carries_a_persisted_repair_forward(self, journal):
+        run_id, owner_copy = await self._seed_completed(journal)
+        owner_copy.stats['owner_marker'] = 'written after the repair'
+
+        repaired, token, record = await self._repaired_copy(journal, run_id)
+        assert (
+            await journal.compare_and_set_run_stage_reports(
+                run_id, repaired, expected_text=token
+            )
+            is True
+        )
+
+        await journal.update_run_stage_reports(run_id, {'integrity_check': owner_copy})
+
+        after = (await journal.get_run(run_id)).stage_reports['integrity_check']
+        f1, f2 = after.items_flagged
+        assert f1['cited_memories'] == [self._citation('C')]
+        assert f1['citation_repairs'] == [record]
+        assert f2 == owner_copy.items_flagged[1]
+        assert after.stats['owner_marker'] == 'written after the repair'
+
+    @pytest.mark.asyncio
+    async def test_owner_rewrite_without_persisted_repairs_is_a_plain_wholesale_write(
+        self, journal
+    ):
+        run_id, owner_copy = await self._seed_completed(journal)
+        owner_copy.stats['owner_marker'] = 'plain rewrite'
+
+        await journal.update_run_stage_reports(run_id, {'integrity_check': owner_copy})
+
+        _, stored_text = await journal.get_run_with_stage_reports_text(run_id)
+        assert stored_text == json.dumps(
+            {'integrity_check': owner_copy.model_dump(mode='json')}
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_repair_landing_between_the_owner_read_and_write_survives(
+        self, journal
+    ):
+        """With the owner first in ``gather``, the owner's read takes the
+        AtomicConnection lock without suspending and then suspends on the
+        aiosqlite hop. The competitor queues on the lock and wins it FIFO
+        before the owner's compare-and-set, so the owner's first CAS is refused
+        and its retry must carry the repair forward. Whatever the interleaving,
+        the asserted end state is the property.
+        """
+        run_id, owner_copy = await self._seed_completed(journal)
+        owner_copy.stats['owner_marker'] = 'raced the repair'
+        repaired, token, record = await self._repaired_copy(journal, run_id)
+
+        _, competitor_applied = await asyncio.gather(
+            journal.update_run_stage_reports(run_id, {'integrity_check': owner_copy}),
+            journal.compare_and_set_run_stage_reports(
+                run_id, repaired, expected_text=token
+            ),
+        )
+
+        assert competitor_applied is True
+        after = (await journal.get_run(run_id)).stage_reports['integrity_check']
+        f1 = after.items_flagged[0]
+        assert f1['cited_memories'] == [self._citation('C')]
+        assert f1['citation_repairs'] == [record]
+        assert after.stats['owner_marker'] == 'raced the repair'
+
+    @pytest.mark.asyncio
+    async def test_a_finding_the_owner_copy_no_longer_carries_is_left_alone(
+        self, journal
+    ):
+        run_id, owner_copy = await self._seed_completed(journal)
+        repaired, token, _ = await self._repaired_copy(journal, run_id)
+        assert (
+            await journal.compare_and_set_run_stage_reports(
+                run_id, repaired, expected_text=token
+            )
+            is True
+        )
+        owner_copy.items_flagged = [owner_copy.items_flagged[1]]
+
+        await journal.update_run_stage_reports(run_id, {'integrity_check': owner_copy})
+
+        after = (await journal.get_run(run_id)).stage_reports['integrity_check']
+        assert after.items_flagged == owner_copy.items_flagged
+
+    @pytest.mark.asyncio
+    async def test_a_row_changing_under_every_attempt_raises_having_written_nothing(
+        self, journal, monkeypatch
+    ):
+        """A competitor commits between each of the owner's reads and its
+        compare-and-set, so every attempt is genuinely refused. The owner gives
+        up loudly, and its copy never lands — not even as a last-resort
+        unconditional write."""
+        run_id, owner_copy = await self._seed_completed(journal)
+        owner_copy.stats['owner_marker'] = 'must never land'
+        real_compare_and_set = journal._compare_and_set_stage_reports_text
+        competitor_texts: list[str] = []
+
+        async def a_competitor_commits_first(run_id_, text, *, expected_text):
+            _, current = await journal.get_run_with_stage_reports_text(run_id_)
+            competitor = json.loads(current)
+            competitor['competitor'] = {'write': len(competitor_texts)}
+            competitor_texts.append(json.dumps(competitor))
+            assert await real_compare_and_set(
+                run_id_, competitor_texts[-1], expected_text=current
+            )
+            return await real_compare_and_set(run_id_, text, expected_text=expected_text)
+
+        monkeypatch.setattr(
+            journal, '_compare_and_set_stage_reports_text', a_competitor_commits_first
+        )
+
+        with pytest.raises(RuntimeError, match=run_id):
+            await journal.update_run_stage_reports(run_id, {'integrity_check': owner_copy})
+
+        _, stored_text = await journal.get_run_with_stage_reports_text(run_id)
+        assert competitor_texts
+        assert stored_text == competitor_texts[-1]
+        assert 'must never land' not in stored_text
+
+
+class TestGetRunStageExecution:
+    """The narrow runs-table read behind typed cycle-summary absence (task 3731).
+
+    ``get_cycle_summary_presence`` cannot tell "the stage ran and lost its
+    ledger write" from "the stage never ran" or "the row was gc()'d" from the
+    ledger alone — a reaped ``cycle_summary`` row is hard-DELETEd and is then
+    byte-for-byte indistinguishable from one that was never written. The
+    ``runs`` table carries no TTL, so it is the durable evidence that outlives
+    the ledger; this projection is the read that reaches it.
+
+    Deliberately narrower than ``get_run``: project-scoped (the ledger's
+    identity is project-scoped too) and a four-column projection rather than
+    ``SELECT *`` piped through ``_row_to_run``, which materialises every
+    ``StageReport`` including the multi-KB ``items_flagged`` blobs.
+    """
+
+    @staticmethod
+    async def _start(journal, run_id, project_id='test-project', started_at=None):
+        await journal.start_run(
+            ReconciliationRun(
+                id=run_id,
+                project_id=project_id,
+                run_type=RunType.full,
+                trigger_reason='test',
+                started_at=started_at or datetime.now(UTC),
+                status=RunStatus.running,
+            )
+        )
+
+    @pytest.mark.asyncio
+    async def test_returns_none_when_no_such_run(self, journal):
+        assert (
+            await journal.get_run_stage_execution(
+                'test-project', 'nonexistent-id', 'task_knowledge_sync'
+            )
+            is None
+        )
+
+    @pytest.mark.asyncio
+    async def test_returns_none_for_run_under_a_different_project(self, journal):
+        run_id = str(uuid.uuid4())
+        await self._start(journal, run_id, project_id='owning-project')
+
+        # get_run would happily return this row — it is keyed on id alone. The
+        # presence lookup must not, because the ledger identity it explains is
+        # project-scoped.
+        assert await journal.get_run(run_id) is not None
+        assert (
+            await journal.get_run_stage_execution(
+                'other-project', run_id, 'task_knowledge_sync'
+            )
+            is None
+        )
+
+    @pytest.mark.asyncio
+    async def test_reports_stage_ran_with_run_status_and_timestamps(self, journal):
+        run_id = str(uuid.uuid4())
+        now = datetime.now(UTC)
+        await self._start(journal, run_id, started_at=now)
+        await journal.update_run_stage_reports(
+            run_id,
+            {
+                'task_knowledge_sync': StageReport(
+                    stage=StageId.task_knowledge_sync,
+                    started_at=now,
+                    completed_at=now,
+                    llm_calls=1,
+                )
+            },
+        )
+        await journal.complete_run(run_id, 'interrupted')
+
+        execution = await journal.get_run_stage_execution(
+            'test-project', run_id, 'task_knowledge_sync'
+        )
+
+        assert execution is not None
+        assert set(execution) == {
+            'status', 'stage_ran', 'resumed', 'settled', 'started_at', 'completed_at',
+        }
+        assert execution['stage_ran'] is True
+        assert execution['status'] == 'interrupted'
+        assert execution['started_at'] is not None
+        assert execution['completed_at'] is not None
+
+    @pytest.mark.asyncio
+    async def test_empty_stage_reports_is_positive_evidence_the_stage_never_ran(
+        self, journal
+    ):
+        run_id = str(uuid.uuid4())
+        await self._start(journal, run_id)
+
+        execution = await journal.get_run_stage_execution(
+            'test-project', run_id, 'task_knowledge_sync'
+        )
+
+        assert execution is not None
+        assert execution['stage_ran'] is False
+        assert execution['status'] == 'running'
+        assert execution['completed_at'] is None
+
+    @pytest.mark.asyncio
+    async def test_out_of_band_error_and_resume_keys_are_not_stage_evidence(
+        self, journal
+    ):
+        """``reconciliation/harness.py`` writes ``_error``/``_resume`` straight
+        into ``run.stage_reports`` before persisting. A run that holds only
+        those must still read as "the stage never ran" — the lookup is
+        stage-keyed, never "is there any report at all"."""
+        run_id = str(uuid.uuid4())
+        await self._start(journal, run_id)
+        await journal.update_run_stage_reports(
+            run_id,
+            {
+                '_error': {'error': 'boom', 'stage': 'task_knowledge_sync'},
+                '_resume': {'resumed_from': 'memory_consolidator'},
+            },
+        )
+
+        execution = await journal.get_run_stage_execution(
+            'test-project', run_id, 'task_knowledge_sync'
+        )
+
+        assert execution is not None
+        assert execution['stage_ran'] is False
+
+    @pytest.mark.asyncio
+    async def test_resumed_reports_whether_the_run_was_adopted_for_resume(
+        self, journal
+    ):
+        """``status`` alone cannot tell a settled legacy row from one that was
+        running again: before task 5514 retired resume, the startup
+        adopt-and-resume pass took over an interrupted run and
+        ``run_full_cycle`` marked it running only on the in-memory object,
+        leaving the column ``'interrupted'``. The adopt pass did persist its
+        ``_resume`` bookkeeping first, so that key is the one durable signal
+        that the blob may be a stale mid-flight snapshot, and the projection
+        surfaces it rather than making every caller re-parse ``stage_reports``
+        to find out."""
+        settled = str(uuid.uuid4())
+        await self._start(journal, settled)
+        await journal.update_run_stage_reports(settled, {'_error': {'error': 'boom'}})
+
+        adopted = str(uuid.uuid4())
+        await self._start(journal, adopted)
+        await journal.update_run_stage_reports(
+            adopted, {'_resume': {'count': 1, 'last_stage': 'memory_consolidator'}},
+        )
+
+        settled_exec = await journal.get_run_stage_execution(
+            'test-project', settled, 'task_knowledge_sync'
+        )
+        adopted_exec = await journal.get_run_stage_execution(
+            'test-project', adopted, 'task_knowledge_sync'
+        )
+
+        assert settled_exec['resumed'] is False
+        assert adopted_exec['resumed'] is True
+        # The resume key is bookkeeping, never stage evidence, in both shapes.
+        assert settled_exec['stage_ran'] is False
+        assert adopted_exec['stage_ran'] is False
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'status', ['completed', 'failed', 'rolled_back', 'circuit_breaker'],
+    )
+    async def test_every_status_that_flushes_the_blob_reads_as_settled(
+        self, journal, status
+    ):
+        """Statuses spelled out rather than parametrized over the frozenset
+        itself: reading the roster from the code under test would let a
+        narrowing edit silently drop a status while the suite stayed green,
+        which is the regression this pins. ``interrupted`` is covered
+        separately — it alone needs the resume evidence."""
+        run_id = str(uuid.uuid4())
+        await self._start(journal, run_id)
+        await journal.complete_run(run_id, status)
+
+        execution = await journal.get_run_stage_execution(
+            'test-project', run_id, 'task_knowledge_sync'
+        )
+
+        assert execution['status'] == status
+        assert execution['settled'] is True
+
+    @pytest.mark.asyncio
+    async def test_a_run_still_executing_has_not_settled(self, journal):
+        """The dominant shape: Stage 3 verifies the run it is running inside,
+        whose blob the harness has not flushed yet."""
+        run_id = str(uuid.uuid4())
+        await self._start(journal, run_id)
+
+        execution = await journal.get_run_stage_execution(
+            'test-project', run_id, 'task_knowledge_sync'
+        )
+
+        assert execution['status'] == 'running'
+        assert execution['stage_ran'] is False
+        assert execution['settled'] is False
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('adopted,settled', [(False, True), (True, False)])
+    async def test_interrupted_settles_only_when_it_was_never_adopted(
+        self, journal, adopted, settled
+    ):
+        """``interrupted`` was the one terminal status a run could leave: the
+        adopt-and-resume pass (retired by task 5514) persisted its ``_resume``
+        bookkeeping and then re-ran the run behind a status column only
+        ``complete_run`` ever writes. So on a legacy row the SAME terminal
+        status means "finished account" or "was executing again" depending on
+        that key, and the projection — not its caller — is what knows the
+        difference."""
+        run_id = str(uuid.uuid4())
+        await self._start(journal, run_id)
+        if adopted:
+            await journal.update_run_stage_reports(
+                run_id, {'_resume': {'count': 1, 'last_stage': 'memory_consolidator'}},
+            )
+        await journal.complete_run(run_id, 'interrupted')
+
+        execution = await journal.get_run_stage_execution(
+            'test-project', run_id, 'task_knowledge_sync'
+        )
+
+        assert execution['status'] == 'interrupted'
+        assert execution['resumed'] is adopted
+        assert execution['settled'] is settled
+
+    @pytest.mark.asyncio
+    async def test_unparseable_stage_reports_leaves_resumed_indeterminate(
+        self, journal
+    ):
+        """A blob that does not parse cannot answer either question, and
+        ``resumed`` must not collapse to False there — that would read as
+        positive evidence the run was never adopted and hand a caller back the
+        confident answer the indeterminate ``stage_ran`` exists to withhold."""
+        run_id = str(uuid.uuid4())
+        await self._start(journal, run_id)
+        async with journal._require_access().write() as db:
+            await db.execute(
+                'UPDATE runs SET stage_reports = ? WHERE id = ?',
+                ('["not", "a", "dict"]', run_id),
+            )
+
+        execution = await journal.get_run_stage_execution(
+            'test-project', run_id, 'task_knowledge_sync'
+        )
+
+        assert execution['stage_ran'] is None
+        assert execution['resumed'] is None
+
+    @pytest.mark.asyncio
+    async def test_lookup_is_keyed_on_the_requested_stage(self, journal):
+        run_id = str(uuid.uuid4())
+        now = datetime.now(UTC)
+        await self._start(journal, run_id, started_at=now)
+        await journal.update_run_stage_reports(
+            run_id,
+            {
+                'memory_consolidator': StageReport(
+                    stage=StageId.memory_consolidator,
+                    started_at=now,
+                    completed_at=now,
+                )
+            },
+        )
+
+        ran = await journal.get_run_stage_execution(
+            'test-project', run_id, 'memory_consolidator'
+        )
+        did_not_run = await journal.get_run_stage_execution(
+            'test-project', run_id, 'task_knowledge_sync'
+        )
+
+        assert ran is not None and ran['stage_ran'] is True
+        assert did_not_run is not None and did_not_run['stage_ran'] is False
+
+    @pytest.mark.asyncio
+    async def test_unparseable_stage_reports_is_indeterminate_and_loud(
+        self, journal, caplog
+    ):
+        """Unparseable stored JSON is a FAULT. It must not masquerade as the
+        definitive "the stage never ran" — that would silently suppress a real
+        data-loss finding — so it reports ``None`` and logs a WARNING."""
+        run_id = str(uuid.uuid4())
+        await self._start(journal, run_id)
+        async with journal._require_access().write() as db:
+            await db.execute(
+                'UPDATE runs SET stage_reports = ? WHERE id = ?', ('not json', run_id)
+            )
+
+        with caplog.at_level('WARNING'):
+            execution = await journal.get_run_stage_execution(
+                'test-project', run_id, 'task_knowledge_sync'
+            )
+
+        assert execution is not None
+        assert execution['stage_ran'] is None
+        assert execution['status'] == 'running'
+        assert len([r for r in caplog.records if r.levelname == 'WARNING']) == 1
+
+
+class TestMemoryServiceReconJournalWiring:
+    """The service-side seam for the runs lookup (task 3731).
+
+    Mirrors the ``set_recon_ledger`` precedent in
+    ``tests/test_recon_ledger.py`` verbatim. The journal is a SEPARATE
+    availability signal from the ledger: ``server/main.py`` constructs it
+    unconditionally inside the reconciliation-init block while the ledger sits
+    behind ``recon_ledger_enabled``, so the presence payload has to report the
+    two independently.
+    """
+
+    def test_recon_journal_defaults_to_none(self, mock_config):
+        svc = MemoryService(mock_config)
+
+        assert svc.recon_journal is None
+
+    def test_set_recon_journal_wires_the_journal(self, mock_config, tmp_path):
+        svc = MemoryService(mock_config)
+        journal = ReconciliationJournal(tmp_path / 'test_recon')
+
+        svc.set_recon_journal(journal)
+
+        assert svc.recon_journal is journal

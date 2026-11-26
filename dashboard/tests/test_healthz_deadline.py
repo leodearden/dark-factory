@@ -15,6 +15,16 @@ house route-test pattern (the synchronous ``TestClient`` fixture in
 conftest.py) cannot be wrapped in ``asyncio.wait_for``, so a RED test against
 a hanging handler would wedge the whole suite instead of failing fast.
 
+The step-13/14 cancellation tests at the end of this module are a deliberate
+exception to that convention: they call ``asyncio.create_task(healthz(...))``
+directly and ``await`` the task themselves instead of going through
+:func:`_call_healthz`, because they must own the task object to ``.cancel()``
+it — ``_call_healthz`` does not expose the task it awaits. This is still
+bounded: every DB target in those tests blocks for at most the probe budget
+before yielding, and the module-wide ``pytest-timeout`` (60s, see
+``pyproject.toml``) kills the process outright if that assumption is ever
+wrong, so a hang there still fails the suite rather than wedging it silently.
+
 The fakes below (``_BlockingConn``, ``_BlockingCursorCtx``, ``_BlockingPool``)
 model aiosqlite 0.22.1's actual shape, verified via ``inspect``:
 ``Connection.execute`` is a *synchronous* method (wrapped in aiosqlite's own
@@ -43,6 +53,7 @@ from fastapi import Request
 from fastapi.responses import JSONResponse
 
 import dashboard.app as app_module
+import dashboard.data.tasks as tasks_module
 from dashboard.app import healthz
 from dashboard.config import DashboardConfig
 from dashboard.data.db import DbPool
@@ -218,9 +229,40 @@ def _make_healthz_request(
         db=pool,
         config=config,
         start_time=start_time if start_time is not None else time.monotonic(),
+        # Read by the data-plane check (task 4884). Every test in this module
+        # runs under `stub_mcp_fanout_probe` below, which never touches it.
+        http_client=None,
     )
     app = SimpleNamespace(state=state)
     return cast(Request, SimpleNamespace(app=app))
+
+
+@pytest.fixture(autouse=True)
+def stub_mcp_fanout_probe(monkeypatch):
+    """Hold /healthz's MCP fan-out check at 'ok' for this whole module.
+
+    This module is about the DB-probe deadline; the data-plane probe task 4884
+    added has its own acceptance module (``test_healthz_data_plane.py``). Two
+    reasons this stub is required rather than merely tidy:
+
+    * HERMETICITY — the real probe issues a task read against
+      ``config.fused_memory_urls``, which defaults to ``http://localhost:8002``.
+      On a developer machine that server is frequently RUNNING, so without this
+      the module's assertions would depend on live infrastructure.
+    * SEMANTICS — a cold probe against a tmp_path project root cannot complete
+      inside ``_MCP_PROBE_TIMEOUT``, so every case here would exercise the
+      probe's cold path (``'probing'`` until its background fetch is older than
+      ``_MCP_PROBE_OUTSTANDING_LIMIT``, then ``'timeout'``) rather than the
+      deadline arithmetic these tests are about — and the later cases would
+      flip to 503 for a reason that has nothing to do with what they test.
+    """
+    async def _ok(_client, _config, _budget):
+        return 'ok'
+
+    monkeypatch.setattr(app_module, '_probe_mcp_fanout', _ok)
+    app_module._mcp_probe_state_clear()
+    yield
+    app_module._mcp_probe_state_clear()
 
 
 async def _call_healthz(request: Request, *, hard_cap: float) -> tuple[JSONResponse, float]:
@@ -332,6 +374,77 @@ def test_healthz_budget_is_structurally_deliverable(tmp_path):
     assert app_module._DB_PROBE_TIMEOUT * len(targets) <= app_module._HEALTHZ_TOTAL_BUDGET, (
         f'{app_module._DB_PROBE_TIMEOUT} * {len(targets)} probes exceeds the '
         f'whole-handler budget of {app_module._HEALTHZ_TOTAL_BUDGET}s'
+    )
+
+
+def test_healthz_data_plane_budget_is_structurally_deliverable(tmp_path):
+    """The MCP fan-out probe must fit INSIDE the existing /healthz envelope.
+
+    Sibling of :func:`test_healthz_budget_is_structurally_deliverable`, same
+    idiom: SHIPPED constants only, no fakes, no event loop, and the DB count
+    DERIVED from ``_healthz_db_targets`` rather than hard-coded, so adding a
+    fourth database fails here too.
+
+    The point of this test is that task 4884 adds a data-plane check by FITTING
+    it into the budget that already exists, never by widening one.
+    """
+    config = DashboardConfig(project_root=tmp_path)
+    targets = app_module._healthz_db_targets(config)
+
+    # (b) NON-VACUITY first: an invariant over a zero-valued or empty term is
+    # arithmetically true and checks nothing.
+    assert app_module._MCP_PROBE_TIMEOUT > 0, (
+        '_MCP_PROBE_TIMEOUT must be a real positive budget; a zero probe '
+        'budget would make the sum below trivially satisfiable while the '
+        'probe itself could never observe anything'
+    )
+    assert len(targets) > 0, (
+        '_healthz_db_targets returned nothing, so the DB term below is vacuous'
+    )
+
+    # (a) The whole arithmetic, with the data-plane term included.
+    total = app_module._DB_PROBE_TIMEOUT * len(targets) + app_module._MCP_PROBE_TIMEOUT
+    assert total <= app_module._HEALTHZ_TOTAL_BUDGET, (
+        f'{app_module._DB_PROBE_TIMEOUT} * {len(targets)} DB probes + '
+        f'{app_module._MCP_PROBE_TIMEOUT} MCP fan-out probe = {total}s exceeds '
+        f'the whole-handler budget of {app_module._HEALTHZ_TOTAL_BUDGET}s. '
+        'As shipped: 0.9*3 + 0.2 = 2.9 <= 3.0, leaving 0.1s of slack so the '
+        'total stays a real backstop for non-probe overhead (JSON '
+        'serialisation, event-loop scheduling) rather than a bound that '
+        'coincides exactly with the sum of its parts.'
+    )
+
+    # (c) STANDING GUARD: this work may not buy its headroom by widening.
+    assert app_module._HEALTHZ_TOTAL_BUDGET <= 3.0, (
+        f'_HEALTHZ_TOTAL_BUDGET was widened to '
+        f'{app_module._HEALTHZ_TOTAL_BUDGET}. The /healthz envelope is not a '
+        'free knob: the whole-handler budget exists because a degraded verdict '
+        'must be DELIVERABLE to `curl -sf --max-time 5` '
+        '(dark-factory-dashboard-watchdog.service:6), measured arriving at '
+        '50.6s before it existed. Task 4884 added the MCP fan-out probe by '
+        'fitting it inside this envelope; a later probe must do the same.'
+    )
+    assert app_module._DB_PROBE_TIMEOUT <= 0.9, (
+        f'_DB_PROBE_TIMEOUT was widened to {app_module._DB_PROBE_TIMEOUT}. '
+        'Widening a per-probe budget spends the same headroom the total '
+        'guards. See the 2026-07-30 incident (192 dashboard restarts in 3 '
+        'hours, ~27% downtime, from a service that was serving throughout) '
+        'for what happens when /healthz stops being a bounded, honest '
+        'diagnostic.'
+    )
+
+    # (d) A probe younger than the outstanding limit reports 'probing'; it
+    # must outlive one healthy task read, or a cold-but-healthy fetch
+    # is reported as a wedge.
+    assert (
+        app_module._MCP_PROBE_OUTSTANDING_LIMIT >= tasks_module.DEFAULT_WHOLE_OPERATION_BUDGET
+    ), (
+        f'_MCP_PROBE_OUTSTANDING_LIMIT ({app_module._MCP_PROBE_OUTSTANDING_LIMIT}) '
+        f'is below tasks.DEFAULT_WHOLE_OPERATION_BUDGET '
+        f'({tasks_module.DEFAULT_WHOLE_OPERATION_BUDGET}), the bound on one '
+        'healthy task read. The invariant is limit >= budget: a '
+        'probe still inside that budget has demonstrated nothing, so reporting '
+        "it as 'timeout' would call a cold but healthy read a wedge."
     )
 
 
@@ -605,3 +718,133 @@ async def test_healthz_reports_error_not_timeout_when_probe_raises(
             'the payload carries only the status string "error", so the '
             'exception TYPE must survive in the logs'
         )
+
+
+# ---------------------------------------------------------------------------
+# step-13 / step-14: caller/handler cancellation must not strand an
+# untracked probe task (task 4089 — reopens the task-leak class task 3466
+# already closed once, this time via CALLER cancellation rather than budget
+# expiry)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture()
+async def _drained_probe_registry():
+    """Yield ``_ABANDONED_PROBES``; on teardown, cancel + drain whatever remains.
+
+    Teardown-ONLY: deliberately does not ``.clear()`` the registry at setup.
+    Clearing would drop the strong reference to a task left in-flight by an
+    earlier test, which would GC it mid-flight — exactly the hazard this
+    registry exists to prevent (see the module comment at app.py:540-543).
+    Same hygiene rationale as the ``finally: await pool.close_all()`` blocks
+    above (lines 298-303 / 509-514): a RED assertion failure here must fail
+    loudly, not leak a pending task into the rest of the suite.
+    """
+    registry = app_module._ABANDONED_PROBES
+    yield registry
+    pending = set(registry)
+    if pending:
+        for task in pending:
+            task.cancel()
+        await asyncio.wait(pending, timeout=5.0)
+
+
+@pytest.mark.parametrize('trigger', ['budget_expiry', 'caller_cancelled'])
+async def test_probe_db_abandons_and_tracks_on_every_exit_path(
+    dashboard_config, _drained_probe_registry, trigger
+):
+    """No exit path out of ``_probe_db`` may leave its inner task untracked.
+
+    ``budget_expiry`` (budget=0.05) characterizes the pre-existing task-3466
+    fix: the inner task blocks past the budget, so ``_probe_db`` abandons +
+    tracks it on the ``if task not in done`` branch. This must stay green
+    through this change.
+
+    ``caller_cancelled`` uses budget=60.0 — chosen STRUCTURALLY, not tuned.
+    60.0s is far beyond any wall-clock this test can reach (and beyond the
+    60s pytest-timeout), so the outer ``probe`` task's own ``.cancel()`` is
+    provably the ONLY thing that can end the probe; the budget itself cannot
+    have expired. Before this change, cancelling the caller propagates
+    ``CancelledError`` straight out of ``_probe_db``'s ``asyncio.wait``,
+    jumping over the abandon+track call entirely — the inner task is then
+    referenced only by the event loop's WEAK set, the exact GC hazard
+    ``_ABANDONED_PROBES`` exists to prevent.
+
+    The inner task is identified by diffing ``asyncio.all_tasks()`` across
+    task creation, not by reading ``_ABANDONED_PROBES`` membership — the
+    registry is a module-level global that other tests in this module also
+    populate, so counting its members would be order- and timing-dependent.
+    """
+    config = dashboard_config
+    registry = _drained_probe_registry
+    pool = _BlockingPool({config.reconciliation_db: _BlockingConn(block_on='execute')})
+    budget = 0.05 if trigger == 'budget_expiry' else 60.0
+
+    before = asyncio.all_tasks()
+    probe = asyncio.create_task(
+        app_module._probe_db(cast(DbPool, pool), config.reconciliation_db, budget)
+    )
+    await asyncio.sleep(0.01)
+    new_tasks = (asyncio.all_tasks() - before) - {probe}
+    assert len(new_tasks) == 1, f'expected exactly one new inner task, got {new_tasks}'
+    inner = next(iter(new_tasks))
+
+    if trigger == 'budget_expiry':
+        assert await probe == 'timeout'
+    else:
+        probe.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await probe
+
+    assert inner in registry, 'inner probe task was not tracked in _ABANDONED_PROBES'
+    await asyncio.wait({inner}, timeout=5.0)
+    assert inner.cancelled(), 'inner probe task was tracked but never actually cancelled'
+    assert inner not in registry, (
+        'inner probe task leaked: still in _ABANDONED_PROBES after it finished'
+    )
+
+
+async def test_healthz_handler_cancellation_strands_no_probe_task(
+    dashboard_config, _drained_probe_registry
+):
+    """Cancelling the whole ``/healthz`` handler must not strand a probe task.
+
+    The production trigger: uvicorn's ``--timeout-graceful-shutdown`` force-
+    cancels remaining request tasks at every restart (the dashboard watchdog
+    restarts this unit routinely), and a client disconnect reaches the same
+    path. All three DB targets block in ``execute()`` so the handler is
+    guaranteed to still be parked inside ``_probe_db``'s ``asyncio.wait``
+    (on the FIRST target) when cancellation lands — only one inner task is
+    ever in flight at a time because ``healthz`` awaits ``_probe_db``
+    sequentially per DB target.
+    """
+    config = dashboard_config
+    registry = _drained_probe_registry
+    pool = _BlockingPool(
+        {
+            config.reconciliation_db: _BlockingConn(block_on='execute'),
+            config.write_journal_db: _BlockingConn(block_on='execute'),
+            config.runs_db: _BlockingConn(block_on='execute'),
+        }
+    )
+    request = _make_healthz_request(config, pool)
+
+    before = asyncio.all_tasks()
+    handler = asyncio.create_task(healthz(request))
+    await asyncio.sleep(0.01)
+    new_tasks = (asyncio.all_tasks() - before) - {handler}
+    assert len(new_tasks) == 1, (
+        f'expected exactly one in-flight inner probe task, got {new_tasks}'
+    )
+    inner = next(iter(new_tasks))
+
+    handler.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await handler
+
+    assert inner in registry, 'handler cancellation stranded an untracked probe task'
+    await asyncio.wait({inner}, timeout=5.0)
+    assert inner.cancelled(), 'stranded probe task was tracked but never actually cancelled'
+    assert inner not in registry, (
+        'inner probe task leaked: still in _ABANDONED_PROBES after it finished'
+    )

@@ -6,8 +6,6 @@ Built incrementally — one step at a time in TDD order.
 from __future__ import annotations
 
 import asyncio
-import contextlib
-import json
 import logging
 import sqlite3
 from datetime import UTC, datetime, timedelta
@@ -17,8 +15,13 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import aiosqlite
 import httpx
 import pytest
+from _curator_sampler_fixture import (
+    ACCOUNT_EVENTS_SCHEMA,
+    TICKETS_SCHEMA,
+    ListTicketsHandler,
+)
+from _dashboard_helpers import drive_metrics_loop
 
-from dashboard.app import _metrics_loop, _MetricsStore
 from dashboard.config import DashboardConfig
 from dashboard.data.db import DbPool
 from dashboard.data.metrics import (
@@ -26,101 +29,7 @@ from dashboard.data.metrics import (
     collect_metrics_snapshot,
     downsample_metrics,
 )
-
-# ---------------------------------------------------------------------------
-# Shared schemas (minimal for tests)
-# ---------------------------------------------------------------------------
-
-TICKETS_SCHEMA = """\
-CREATE TABLE IF NOT EXISTS tickets (
-    id          TEXT PRIMARY KEY,
-    project_id  TEXT,
-    status      TEXT NOT NULL,
-    created_at  TEXT NOT NULL,
-    resolved_at TEXT
-);
-"""
-
-ACCOUNT_EVENTS_SCHEMA = """\
-CREATE TABLE IF NOT EXISTS account_events (
-    id           INTEGER PRIMARY KEY AUTOINCREMENT,
-    account_name TEXT NOT NULL,
-    event_type   TEXT NOT NULL,
-    project_id   TEXT,
-    run_id       TEXT,
-    details      TEXT,
-    created_at   TEXT NOT NULL
-);
-"""
-
-# ---------------------------------------------------------------------------
-# MCP mock helpers (mirrors test_memory.py pattern)
-# ---------------------------------------------------------------------------
-
-
-def _make_mcp_response(inner_dict: dict, request_id: int = 1) -> httpx.Response:
-    body = {
-        'jsonrpc': '2.0',
-        'id': request_id,
-        'result': {
-            'content': [
-                {'type': 'text', 'text': json.dumps(inner_dict)},
-            ],
-        },
-    }
-    return httpx.Response(
-        200,
-        json=body,
-        headers={'mcp-session-id': 'test-session-id'},
-    )
-
-
-def _make_init_response(request_id: int = 1) -> httpx.Response:
-    body = {
-        'jsonrpc': '2.0',
-        'id': request_id,
-        'result': {
-            'protocolVersion': '2025-03-26',
-            'capabilities': {'tools': {}},
-            'serverInfo': {'name': 'test', 'version': '0.1'},
-        },
-    }
-    return httpx.Response(
-        200,
-        json=body,
-        headers={'mcp-session-id': 'test-session-id'},
-    )
-
-
-def _make_notify_response() -> httpx.Response:
-    return httpx.Response(202, headers={'mcp-session-id': 'test-session-id'})
-
-
-class _ListTicketsHandler:
-    """Mock MCP handler that returns a fixed count for list_tickets calls."""
-
-    def __init__(self, count: int = 2, project_id: str = 'test-project'):
-        self.count = count
-        self.project_id = project_id
-        self.calls: list[dict] = []
-
-    def __call__(self, request: httpx.Request) -> httpx.Response:
-        body = json.loads(request.content)
-        method = body.get('method', '')
-        request_id = body.get('id', 1)
-
-        if method == 'initialize':
-            return _make_init_response(request_id)
-        if method.startswith('notifications/'):
-            return _make_notify_response()
-
-        # tools/call
-        self.calls.append(body)
-        return _make_mcp_response(
-            {'count': self.count, 'tickets': [], 'project_id': self.project_id},
-            request_id,
-        )
-
+from dashboard.loops import _MetricsStore
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -312,39 +221,32 @@ async def test_get_curator_sparks_order_by_ts(metrics_db_path: Path):
 
 @pytest.mark.asyncio
 async def test_downsample_curator_snapshots_keeps_latest_per_hour(metrics_db_path: Path):
-    """After downsample_metrics, only the latest-per-hour row survives for >7d-old rows."""
-    now = datetime.now(UTC)
-    old = now - timedelta(days=10)
+    """After downsample_metrics, rows older than 7d keep one row per old hour."""
+    now = datetime(2026, 3, 1, 12, 0, tzinfo=UTC)
+    later_old_hour = (now - timedelta(days=10)).replace(minute=0, second=0, microsecond=0)
+    earlier_old_hour = later_old_hour - timedelta(hours=1)
+    seeds = [
+        (earlier_old_hour + timedelta(minutes=10), 11, 0),
+        (earlier_old_hour + timedelta(minutes=50), 19, 0),
+        (later_old_hour + timedelta(minutes=10), 1, 0),
+        (later_old_hour + timedelta(minutes=50), 9, 0),
+        # Very old row (100 days) — should be dropped entirely
+        (now - timedelta(days=100), 99, 1),
+    ]
 
     conn_sync = sqlite3.connect(str(metrics_db_path))
-    ts_early = (old + timedelta(minutes=5)).isoformat()
-    ts_late = (old + timedelta(minutes=55)).isoformat()
-    conn_sync.execute(
+    conn_sync.executemany(
         'INSERT INTO curator_snapshots '
         '(ts, pending_total, capped_now, p50_active_ms, p90_active_ms, p99_active_ms) '
-        'VALUES (?, ?, ?, ?, ?, ?)',
-        (ts_early, 1, 0, None, None, None),
-    )
-    conn_sync.execute(
-        'INSERT INTO curator_snapshots '
-        '(ts, pending_total, capped_now, p50_active_ms, p90_active_ms, p99_active_ms) '
-        'VALUES (?, ?, ?, ?, ?, ?)',
-        (ts_late, 9, 0, None, None, None),
-    )
-    # Very old row (100 days) — should be dropped entirely
-    very_old = (now - timedelta(days=100)).isoformat()
-    conn_sync.execute(
-        'INSERT INTO curator_snapshots '
-        '(ts, pending_total, capped_now, p50_active_ms, p90_active_ms, p99_active_ms) '
-        'VALUES (?, ?, ?, ?, ?, ?)',
-        (very_old, 99, 1, None, None, None),
+        'VALUES (?, ?, ?, NULL, NULL, NULL)',
+        [(ts.isoformat(), pending, capped) for ts, pending, capped in seeds],
     )
     conn_sync.commit()
     conn_sync.close()
 
     rw = await aiosqlite.connect(str(metrics_db_path))
     try:
-        await downsample_metrics(rw)
+        await downsample_metrics(rw, now=now)
     finally:
         await rw.close()
 
@@ -352,7 +254,7 @@ async def test_downsample_curator_snapshots_keeps_latest_per_hour(metrics_db_pat
     rows = inspect.execute('SELECT pending_total FROM curator_snapshots ORDER BY ts').fetchall()
     inspect.close()
 
-    assert rows == [(9,)], f'Expected [(9,)], got {rows}'
+    assert rows == [(19,), (9,)], f'Expected [(19,), (9,)], got {rows}'
 
 
 # ---------------------------------------------------------------------------
@@ -441,7 +343,7 @@ async def test_sample_curator_happy_path(tmp_path: Path, config):
     conn_sync.commit()
     conn_sync.close()
 
-    handler = _ListTicketsHandler(count=2)
+    handler = ListTicketsHandler(count=2)
     transport = httpx.MockTransport(handler)
 
     reset_sessions()
@@ -516,7 +418,7 @@ async def test_sample_curator_cap_overlap_subtraction(tmp_path: Path, config):
     conn_sync.commit()
     conn_sync.close()
 
-    handler = _ListTicketsHandler(count=0)
+    handler = ListTicketsHandler(count=0)
     transport = httpx.MockTransport(handler)
 
     reset_sessions()
@@ -576,7 +478,7 @@ async def test_sample_curator_capped_now_true(tmp_path: Path, config):
     conn_sync.commit()
     conn_sync.close()
 
-    handler = _ListTicketsHandler(count=0)
+    handler = ListTicketsHandler(count=0)
     transport = httpx.MockTransport(handler)
 
     reset_sessions()
@@ -632,7 +534,7 @@ async def test_sample_curator_capped_now_false_when_closed(tmp_path: Path, confi
     conn_sync.commit()
     conn_sync.close()
 
-    handler = _ListTicketsHandler(count=0)
+    handler = ListTicketsHandler(count=0)
     transport = httpx.MockTransport(handler)
 
     reset_sessions()
@@ -702,7 +604,7 @@ async def test_collect_metrics_snapshot_writes_curator_row(tmp_path: Path, confi
     conn_sync.commit()
     conn_sync.close()
 
-    handler = _ListTicketsHandler(count=2)
+    handler = ListTicketsHandler(count=2)
     transport = httpx.MockTransport(handler)
 
     reset_sessions()
@@ -752,20 +654,14 @@ async def test_metrics_loop_passes_tickets_db_kwarg(tmp_path: Path):
 
     Calls _metrics_loop directly against a hand-built app-state stub so the
     real lifespan — and its _burndown_loop side task — are never started.
-    Only _metrics_loop is exercised; collect_metrics_snapshot is patched to
-    record the call and set an event, then the task is cancelled cleanly.
+    Only _metrics_loop is exercised, via
+    dashboard/tests/_dashboard_helpers.py::drive_metrics_loop, which records
+    each collect_metrics_snapshot call and stops after the first.
 
     tickets.db is created on disk at the canonical path so DbPool.get() returns
     a real connection.  This pins the path-to-connection wiring: a wrong-but-
     missing path would make get() return None, failing the is-not-None assertion.
     """
-    called_event = asyncio.Event()
-
-    async def _side_effect(*args, **kwargs):
-        called_event.set()
-
-    mock_collect = AsyncMock(side_effect=_side_effect)
-
     # Minimal app-state stub — no real lifespan, no side tasks.
     fixed_config = DashboardConfig(
         project_root=tmp_path,
@@ -787,24 +683,14 @@ async def test_metrics_loop_passes_tickets_db_kwarg(tmp_path: Path):
         MagicMock()
     )  # collect_metrics_snapshot is patched; client never used
 
-    # _metrics_loop now takes a _MetricsStore, not a raw aiosqlite.Connection.
-    metrics_store = _MetricsStore(tmp_path / 'metrics.db', busy_timeout_ms=5000)
-    await metrics_store.open()
-
-    expected_conn = None
-    loop_opened = False
     try:
-        with patch('dashboard.app.collect_metrics_snapshot', mock_collect):
-            # _metrics_loop calls _run_once() immediately before entering the
-            # aligned-sleep loop.  We cancel the task once the event fires.
-            task = asyncio.create_task(_metrics_loop(metrics_store, mock_app))
-            try:
-                # 2 s is generous for a single fast AsyncMock _run_once() cycle.
-                await asyncio.wait_for(called_event.wait(), timeout=2.0)
-            finally:
-                task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await task
+        async with _MetricsStore(tmp_path / 'metrics.db', busy_timeout_ms=5000) as metrics_store:
+            calls = await drive_metrics_loop(
+                metrics_store,
+                mock_app,
+                pool=pool,
+                http_client=mock_app.state.http_client,
+            )
         # Verify the loop opened the connection BEFORE calling pool.get() ourselves.
         # pool.open_count > 0 means _metrics_loop._run_once() actually called pool.get();
         # without this check, pool.get() below would lazily open the connection and mask
@@ -814,13 +700,12 @@ async def test_metrics_loop_passes_tickets_db_kwarg(tmp_path: Path):
         # DbPool.get() is idempotent: returns the same cached object on repeat call.
         expected_conn = await pool.get(fixed_config.tickets_db)
     finally:
-        await metrics_store.close()
         await pool.close_all()
 
-    assert mock_collect.called, 'collect_metrics_snapshot was never called'
-    call_kwargs = mock_collect.call_args.kwargs if mock_collect.call_args else {}
+    assert calls, 'collect_metrics_snapshot was never called'
+    call_kwargs = calls[0]
     assert 'tickets_db' in call_kwargs, (
-        f'tickets_db not in kwargs: {call_kwargs}. All calls: {mock_collect.call_args_list}'
+        f'tickets_db not in kwargs: {call_kwargs}. All calls: {calls}'
     )
     assert loop_opened, (
         f'_metrics_loop._run_once() never called pool.get(); '
@@ -838,7 +723,7 @@ async def test_metrics_loop_passes_tickets_db_kwarg(tmp_path: Path):
     assert call_kwargs['tickets_db'] is expected_conn, (
         f'tickets_db should be the DbPool connection for {fixed_config.tickets_db} '
         f'but got {call_kwargs["tickets_db"]!r}. '
-        f'All calls: {mock_collect.call_args_list}'
+        f'All calls: {calls}'
     )
 
 
@@ -1063,7 +948,7 @@ async def test_fan_out_list_tickets_uses_LIST_TICKETS_LIMIT_constant(
         fused_memory_urls=['http://localhost:18765'],
         known_project_roots=[],
     )
-    handler = _ListTicketsHandler(count=50)
+    handler = ListTicketsHandler(count=50)
     transport = httpx.MockTransport(handler)
 
     reset_sessions()
@@ -1195,7 +1080,7 @@ async def test_sample_curator_delegates_to_compute_capped_now_and_windows(tmp_pa
     conn_sync.commit()
     conn_sync.close()
 
-    handler = _ListTicketsHandler(count=0)
+    handler = ListTicketsHandler(count=0)
     transport = httpx.MockTransport(handler)
     mock_helper = MagicMock(return_value=(7, []))
 
@@ -1287,7 +1172,7 @@ async def test_sample_curator_long_running_open_ended_cap_overlap_subtracted(
     conn_sync.commit()
     conn_sync.close()
 
-    handler = _ListTicketsHandler(count=0)
+    handler = ListTicketsHandler(count=0)
     transport = httpx.MockTransport(handler)
 
     reset_sessions()
@@ -1367,7 +1252,7 @@ async def test_fan_out_list_tickets_runs_roots_concurrently(tmp_path: Path):
     event_r1_started = asyncio.Event()
     event_r2_started = asyncio.Event()
 
-    async def _side_effect(http_client, url, tool, arguments):
+    async def _side_effect(http_client, url, tool, arguments, **kwargs):
         root = arguments.get('project_root', '')
         if root == str(r1):
             event_r1_started.set()
@@ -1503,7 +1388,7 @@ async def test_sample_curator_mixed_availability_returns_capped_now_zero(
     conn_sync.commit()
     conn_sync.close()
 
-    handler = _ListTicketsHandler(count=0)
+    handler = ListTicketsHandler(count=0)
     transport = httpx.MockTransport(handler)
 
     reset_sessions()
@@ -1630,7 +1515,7 @@ async def test_sample_curator_account_count_denominator_not_capped(tmp_path: Pat
         'account_count': 4,
     }
 
-    handler = _ListTicketsHandler(count=0)
+    handler = ListTicketsHandler(count=0)
     transport = httpx.MockTransport(handler)
 
     reset_sessions()
@@ -1700,7 +1585,7 @@ async def test_sample_curator_fallback_degrades_to_zero_when_helper_raises(
     conn_sync.commit()
     conn_sync.close()
 
-    handler = _ListTicketsHandler(count=0)
+    handler = ListTicketsHandler(count=0)
     transport = httpx.MockTransport(handler)
 
     reset_sessions()
@@ -1851,3 +1736,538 @@ async def test_fan_out_list_tickets_failover_on_malformed_result(tmp_path: Path)
         f'Expected 2 mcp_tool_call invocations (both URLs tried), got {mock_mcp.call_count}'
     )
     assert tickets == [], f'Expected empty tickets list, got {tickets}'
+
+
+# ---------------------------------------------------------------------------
+# task 3126: refused is a terminal ticket status and must count toward centiles
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_sample_curator_counts_refused_tickets_in_centiles(tmp_path: Path, config):
+    """A ticket resolved as 'refused' is terminal and must appear in the curator
+    latency centiles.
+
+    The terminal-status allowlist previously read
+    ``('created', 'combined', 'cancelled', 'failed')``, silently excluding
+    refusals — so every deterministic refusal vanished from the curator latency
+    metrics, exactly the decision an operator most wants to see the cost of.
+    """
+    from dashboard.data.memory import reset_sessions
+    from dashboard.data.metrics import _sample_curator
+    from dashboard.data.stats_utils import percentile
+
+    now = datetime.now(UTC)
+    t_base = now - timedelta(minutes=30)
+
+    tickets_path = tmp_path / 'tickets.db'
+    conn_sync = sqlite3.connect(str(tickets_path))
+    conn_sync.executescript(TICKETS_SCHEMA)
+    # One ordinary created ticket (100ms) and one refused ticket (400ms).
+    conn_sync.execute(
+        'INSERT INTO tickets (id, project_id, status, created_at, resolved_at) VALUES (?, ?, ?, ?, ?)',
+        (
+            't1', 'proj', 'created',
+            t_base.isoformat(),
+            (t_base + timedelta(milliseconds=100)).isoformat(),
+        ),
+    )
+    conn_sync.execute(
+        'INSERT INTO tickets (id, project_id, status, created_at, resolved_at) VALUES (?, ?, ?, ?, ?)',
+        (
+            't2', 'proj', 'refused',
+            t_base.isoformat(),
+            (t_base + timedelta(milliseconds=400)).isoformat(),
+        ),
+    )
+    conn_sync.commit()
+    conn_sync.close()
+
+    runs_path = tmp_path / 'runs.db'
+    conn_sync = sqlite3.connect(str(runs_path))
+    conn_sync.executescript(ACCOUNT_EVENTS_SCHEMA)
+    conn_sync.commit()
+    conn_sync.close()
+
+    handler = ListTicketsHandler(count=2)
+    transport = httpx.MockTransport(handler)
+
+    reset_sessions()
+    async with httpx.AsyncClient(transport=transport) as http_client:
+        tickets_conn = await aiosqlite.connect(str(tickets_path))
+        tickets_conn.row_factory = aiosqlite.Row
+        runs_conn = await aiosqlite.connect(str(runs_path))
+        runs_conn.row_factory = aiosqlite.Row
+        try:
+            result = await _sample_curator(
+                http_client, config, tickets_conn, [runs_conn], now=now,
+            )
+        finally:
+            await tickets_conn.close()
+            await runs_conn.close()
+
+    assert result is not None
+    # Both samples present: excluding the refusal would collapse every centile
+    # onto the single 100ms create.
+    assert result['p50_active_ms'] == int(percentile([100.0, 400.0], 50))
+    assert result['p90_active_ms'] == int(percentile([100.0, 400.0], 90))
+    assert result['p99_active_ms'] == int(percentile([100.0, 400.0], 99))
+
+
+# ---------------------------------------------------------------------------
+# task 3126 (review round 2): refusals need a COUNTED signal, not just latency
+#
+# A refusal discards a candidate permanently and creates nothing. The janitor
+# failure sweep deliberately excludes refusals, and the curator tab renders
+# pending tickets only — so an over-broad blocklist/premise entry could eat
+# real reconciliation output indefinitely with only a logger.info to show for
+# it. Folding refusals into the centiles (above) does not surface a RATE.
+# ---------------------------------------------------------------------------
+
+
+def _write_tickets(path: Path, rows: list[tuple[str, str, datetime, datetime]]) -> None:
+    """Seed a tickets.db with (id, status, created_at, resolved_at) rows."""
+    conn_sync = sqlite3.connect(str(path))
+    conn_sync.executescript(TICKETS_SCHEMA)
+    for ticket_id, status, created, resolved in rows:
+        conn_sync.execute(
+            'INSERT INTO tickets (id, project_id, status, created_at, resolved_at) '
+            'VALUES (?, ?, ?, ?, ?)',
+            (ticket_id, 'proj', status, created.isoformat(), resolved.isoformat()),
+        )
+    conn_sync.commit()
+    conn_sync.close()
+
+
+@pytest.mark.asyncio
+async def test_sample_curator_counts_refusals_in_the_last_hour(tmp_path: Path, config):
+    """_sample_curator returns refused_last_hour — the count an operator needs
+    to notice a guard entry whose refusal rate has spiked."""
+    from dashboard.data.memory import reset_sessions
+    from dashboard.data.metrics import _sample_curator
+
+    now = datetime.now(UTC)
+    recent = now - timedelta(minutes=30)
+    stale = now - timedelta(hours=3)
+
+    tickets_path = tmp_path / 'tickets.db'
+    _write_tickets(
+        tickets_path,
+        [
+            ('t1', 'created', recent, recent + timedelta(milliseconds=100)),
+            ('t2', 'refused', recent, recent + timedelta(milliseconds=400)),
+            ('t3', 'refused', recent, recent + timedelta(milliseconds=500)),
+            # Outside the 1-hour window — must not inflate the count.
+            ('t4', 'refused', stale, stale + timedelta(milliseconds=200)),
+        ],
+    )
+
+    runs_path = tmp_path / 'runs.db'
+    conn_sync = sqlite3.connect(str(runs_path))
+    conn_sync.executescript(ACCOUNT_EVENTS_SCHEMA)
+    conn_sync.commit()
+    conn_sync.close()
+
+    transport = httpx.MockTransport(ListTicketsHandler(count=2))
+    reset_sessions()
+    async with httpx.AsyncClient(transport=transport) as http_client:
+        tickets_conn = await aiosqlite.connect(str(tickets_path))
+        tickets_conn.row_factory = aiosqlite.Row
+        runs_conn = await aiosqlite.connect(str(runs_path))
+        runs_conn.row_factory = aiosqlite.Row
+        try:
+            result = await _sample_curator(
+                http_client, config, tickets_conn, [runs_conn], now=now,
+            )
+        finally:
+            await tickets_conn.close()
+            await runs_conn.close()
+
+    assert result['refused_last_hour'] == 2, (
+        'only the two in-window refusals count; the create and the 3h-old '
+        'refusal must not be counted'
+    )
+
+
+@pytest.mark.asyncio
+async def test_sample_curator_refusal_count_is_zero_not_none_when_sampled(
+    tmp_path: Path, config,
+):
+    """0 (sampled, nothing refused) must be distinguishable from None (window
+    never read) — otherwise a broken sampler reads as a quiet blocklist."""
+    from dashboard.data.memory import reset_sessions
+    from dashboard.data.metrics import _sample_curator
+
+    now = datetime.now(UTC)
+    recent = now - timedelta(minutes=30)
+
+    tickets_path = tmp_path / 'tickets.db'
+    _write_tickets(
+        tickets_path, [('t1', 'created', recent, recent + timedelta(milliseconds=100))],
+    )
+    runs_path = tmp_path / 'runs.db'
+    conn_sync = sqlite3.connect(str(runs_path))
+    conn_sync.executescript(ACCOUNT_EVENTS_SCHEMA)
+    conn_sync.commit()
+    conn_sync.close()
+
+    transport = httpx.MockTransport(ListTicketsHandler(count=2))
+    reset_sessions()
+    async with httpx.AsyncClient(transport=transport) as http_client:
+        tickets_conn = await aiosqlite.connect(str(tickets_path))
+        tickets_conn.row_factory = aiosqlite.Row
+        runs_conn = await aiosqlite.connect(str(runs_path))
+        runs_conn.row_factory = aiosqlite.Row
+        try:
+            sampled = await _sample_curator(
+                http_client, config, tickets_conn, [runs_conn], now=now,
+            )
+            # No tickets_db at all → the window was never read.
+            unsampled = await _sample_curator(
+                http_client, config, None, [runs_conn], now=now,
+            )
+        finally:
+            await tickets_conn.close()
+            await runs_conn.close()
+
+    assert sampled['refused_last_hour'] == 0
+    assert unsampled['refused_last_hour'] is None
+
+
+def test_curator_refusal_snapshots_table_exists_after_schema_migration(tmp_path: Path):
+    """METRICS_SCHEMA creates curator_refusal_snapshots.
+
+    A sibling table, not a column on curator_snapshots: the schema is applied
+    with CREATE TABLE IF NOT EXISTS only, so a new column would never
+    materialise on an existing metrics.db and its INSERT would then fail —
+    taking the whole curator sampler row down with it.
+    """
+    db_path = tmp_path / 'refusal_schema.db'
+    conn = sqlite3.connect(str(db_path))
+    conn.executescript(METRICS_SCHEMA)
+    conn.commit()
+
+    row = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' "
+        "AND name='curator_refusal_snapshots'"
+    ).fetchone()
+    assert row is not None, 'curator_refusal_snapshots was not created by METRICS_SCHEMA'
+
+    col_info = conn.execute('PRAGMA table_info(curator_refusal_snapshots)').fetchall()
+    assert {r[1] for r in col_info} == {'ts', 'refused_count'}
+    assert 'ts' in {r[1] for r in col_info if r[5] == 1}, 'ts is not the PRIMARY KEY'
+    conn.close()
+
+
+@pytest.mark.asyncio
+async def test_collect_metrics_snapshot_persists_the_refusal_count(tmp_path: Path, config):
+    """The count is durable, not just logged — an operator can chart a spike."""
+    from dashboard.data.memory import reset_sessions
+
+    t_base = datetime.now(UTC) - timedelta(minutes=30)
+
+    metrics_path = tmp_path / 'metrics.db'
+    metrics_conn = await aiosqlite.connect(str(metrics_path))
+    await metrics_conn.executescript(METRICS_SCHEMA)
+    await metrics_conn.commit()
+
+    tickets_path = tmp_path / 'tickets.db'
+    _write_tickets(
+        tickets_path,
+        [
+            ('t1', 'created', t_base, t_base + timedelta(milliseconds=100)),
+            ('t2', 'refused', t_base, t_base + timedelta(milliseconds=200)),
+            ('t3', 'refused', t_base, t_base + timedelta(milliseconds=300)),
+        ],
+    )
+
+    runs_path = tmp_path / 'runs.db'
+    conn_sync = sqlite3.connect(str(runs_path))
+    conn_sync.executescript(ACCOUNT_EVENTS_SCHEMA)
+    conn_sync.commit()
+    conn_sync.close()
+
+    transport = httpx.MockTransport(ListTicketsHandler(count=2))
+    reset_sessions()
+    async with httpx.AsyncClient(transport=transport) as http_client:
+        tickets_conn = await aiosqlite.connect(str(tickets_path))
+        tickets_conn.row_factory = aiosqlite.Row
+        runs_conn = await aiosqlite.connect(str(runs_path))
+        runs_conn.row_factory = aiosqlite.Row
+        try:
+            await collect_metrics_snapshot(
+                conn=metrics_conn,
+                config=config,
+                http_client=http_client,
+                recon_db=None,
+                merge_dbs=[('proj', runs_conn)],
+                tickets_db=tickets_conn,
+            )
+        finally:
+            await tickets_conn.close()
+            await runs_conn.close()
+
+    async with metrics_conn.execute(
+        'SELECT refused_count FROM curator_refusal_snapshots'
+    ) as cur:
+        refusal_rows = list(await cur.fetchall())
+    # The centiles row must still be written — the two inserts commit
+    # independently so neither can roll the other back.
+    async with metrics_conn.execute('SELECT COUNT(*) FROM curator_snapshots') as cur:
+        centile_row = await cur.fetchone()
+    await metrics_conn.close()
+
+    assert centile_row is not None
+    centile_count = centile_row[0]
+
+    assert len(refusal_rows) == 1
+    assert refusal_rows[0][0] == 2
+    assert centile_count == 1
+
+
+@pytest.mark.asyncio
+async def test_get_curator_refusal_spark_reads_the_persisted_counts(metrics_db_path: Path):
+    """The reader returns an in-window {labels, values} series, ts-ordered."""
+    from dashboard.data.metrics import get_curator_refusal_spark
+
+    now = datetime.now(UTC)
+    older_ts = (now - timedelta(hours=6)).isoformat()
+    newer_ts = (now - timedelta(hours=2)).isoformat()
+    out_of_window_ts = (now - timedelta(days=5)).isoformat()
+
+    conn_sync = sqlite3.connect(str(metrics_db_path))
+    for ts, count in ((newer_ts, 4), (older_ts, 1), (out_of_window_ts, 99)):
+        conn_sync.execute(
+            'INSERT INTO curator_refusal_snapshots (ts, refused_count) VALUES (?, ?)',
+            (ts, count),
+        )
+    conn_sync.commit()
+    conn_sync.close()
+
+    db = await aiosqlite.connect(f'file:{metrics_db_path}?mode=ro', uri=True)
+    db.row_factory = aiosqlite.Row
+    try:
+        series = await get_curator_refusal_spark(db, days=1)
+    finally:
+        await db.close()
+
+    assert series == {'labels': [older_ts, newer_ts], 'values': [1, 4]}
+
+
+@pytest.mark.asyncio
+async def test_get_curator_refusal_spark_none_db_returns_empty_series():
+    from dashboard.data.metrics import get_curator_refusal_spark
+
+    assert await get_curator_refusal_spark(None, days=1) == {'labels': [], 'values': []}
+
+
+@pytest.mark.asyncio
+async def test_get_curator_sparks_shape_is_unchanged_by_the_refusal_signal():
+    """The refusal count is a separate reader on purpose: get_curator_sparks'
+    4-key contract (consumed by shape_curator) must not shift underneath it."""
+    from dashboard.data.metrics import get_curator_sparks
+
+    assert set((await get_curator_sparks(None, days=1)).keys()) == {
+        'pending', 'p50', 'p90', 'p99',
+    }
+
+
+# ---------------------------------------------------------------------------
+# task-3871: fan_out_list_tickets threads its budget into mcp_tool_call
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_fan_out_list_tickets_threads_its_budget_to_mcp_tool_call(tmp_path: Path):
+    """The sampler's own budget — not mcp_tool_call's 10s default — is used.
+
+    fan_out_list_tickets already declares a ``timeout`` and wraps each call in
+    asyncio.wait_for, but it dropped that budget on the floor when invoking
+    mcp_tool_call, so each underlying post ran to httpx's 10s default — which
+    also governs pool acquisition on the shared client. Contract-level: the
+    caller's budget must reach the callee.
+    """
+    from dashboard.data.metrics import fan_out_list_tickets
+
+    cfg = DashboardConfig(
+        project_root=tmp_path,
+        fused_memory_urls=['http://localhost:18765'],
+        known_project_roots=[],
+    )
+    mock_mcp = AsyncMock(return_value={'count': 1, 'tickets': [], 'project_id': 'p'})
+    transport = httpx.MockTransport(lambda req: httpx.Response(200, json={}))
+
+    with patch('dashboard.data.metrics.mcp_tool_call', mock_mcp):
+        async with httpx.AsyncClient(transport=transport) as http_client:
+            await fan_out_list_tickets(http_client, cfg, timeout=0.25)
+
+    assert mock_mcp.call_count == 1, f'expected one call, got {mock_mcp.call_count}'
+    assert mock_mcp.call_args.kwargs.get('timeout') == 0.25, (
+        f"fan_out_list_tickets must hand its own budget to mcp_tool_call, not "
+        f"leave it at the 10s default; got "
+        f"{mock_mcp.call_args.kwargs.get('timeout')!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_fan_out_list_tickets_default_budget_is_the_sampler_timeout(
+    tmp_path: Path,
+):
+    """Guard: the default stays _HTTP_SAMPLER_TIMEOUT_SECONDS (5.0), unraised."""
+    from dashboard.data.metrics import (
+        _HTTP_SAMPLER_TIMEOUT_SECONDS,
+        fan_out_list_tickets,
+    )
+
+    cfg = DashboardConfig(
+        project_root=tmp_path,
+        fused_memory_urls=['http://localhost:18765'],
+        known_project_roots=[],
+    )
+    mock_mcp = AsyncMock(return_value={'count': 1, 'tickets': [], 'project_id': 'p'})
+    transport = httpx.MockTransport(lambda req: httpx.Response(200, json={}))
+
+    with patch('dashboard.data.metrics.mcp_tool_call', mock_mcp):
+        async with httpx.AsyncClient(transport=transport) as http_client:
+            await fan_out_list_tickets(http_client, cfg)
+
+    assert mock_mcp.call_args.kwargs.get('timeout') == _HTTP_SAMPLER_TIMEOUT_SECONDS
+
+
+# ---------------------------------------------------------------------------
+# Task 4133: per-project-root fan-out streak isolation + single type prefix
+# ---------------------------------------------------------------------------
+
+
+def _two_root_curator_cfg(tmp_path: Path) -> tuple[DashboardConfig, str, str]:
+    """One shared fused-memory URL, two project roots (A broken, B healthy)."""
+    root_a = tmp_path / 'proj-a'
+    root_b = tmp_path / 'proj-b'
+    root_a.mkdir()
+    root_b.mkdir()
+    cfg = DashboardConfig(
+        project_root=root_a,
+        fused_memory_urls=['http://localhost:18765'],
+        known_project_roots=[root_b],
+    )
+    return cfg, str(root_a), str(root_b)
+
+
+def _fail_root_a(root_a: str):
+    """mcp_tool_call side effect: ConnectError for root A, valid result for B."""
+    async def _call(client, url, tool, args, **kwargs):
+        if args.get('project_root') == root_a:
+            raise httpx.ConnectError('refused')
+        return {'count': 0, 'tickets': [], 'project_id': 'proj_b'}
+    return _call
+
+
+class TestFanOutListTicketsStreakIsolation:
+    """Per-root throttle-key isolation and single-prefix rendering for list_tickets.
+
+    Grouped into a class purely to carry ``_clean_state``, mirroring
+    test_tasks_fanout.py's ``TestFanoutStreakIsolationAcrossProjectRoots``.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _clean_state(self):
+        """Give each test clean streak state — before AND after.
+
+        Both tests key on basename 'proj-a' and the same URL, so resetting only
+        on entry would leave the first test's open streak of 3 on
+        ``('list_tickets[proj-a]', 'http://localhost:18765')`` behind. Any later
+        test in this module (or a ``-p no:randomly`` reordering) expecting a
+        fresh opening WARNING for a 'proj-a' root would then be silently demoted
+        to DEBUG — the exact failure mode ``reset_failure_streaks`` exists for.
+        """
+        from dashboard.data.memory import reset_sessions
+
+        reset_sessions()
+        yield
+        reset_sessions()
+
+    @pytest.mark.asyncio
+    async def test_fan_out_list_tickets_broken_root_warns_once_across_cycles(
+        self, tmp_path: Path, caplog
+    ):
+        """A broken project_root must not re-arm its WARNING every sampler cycle.
+
+        The mcp_fanout throttle key is ``(log_label, url)`` and one fused-memory
+        URL serves every root, so the fixed literal 'list_tickets' label collapsed
+        both roots onto one key. ``note_fanout_success`` pops that key, so root B's
+        success cleared root A's streak and A's next failure was ``streak == 1``
+        again — an opening plus a 'recovered' WARNING every cycle, indefinitely.
+
+        Note: ``fan_out_list_tickets`` fans the roots out via ``asyncio.gather``,
+        so within a single call the two roots race. The assertion is therefore on
+        the WARNING total across cycles, not on ordering.
+        """
+        from dashboard.data.metrics import fan_out_list_tickets
+
+        cfg, root_a, _root_b = _two_root_curator_cfg(tmp_path)
+        mock_mcp = AsyncMock(side_effect=_fail_root_a(root_a))
+        transport = httpx.MockTransport(lambda req: httpx.Response(200, json={}))
+
+        with (
+            caplog.at_level(logging.DEBUG, logger='dashboard.data.mcp_fanout'),
+            patch('dashboard.data.metrics.mcp_tool_call', mock_mcp),
+        ):
+            async with httpx.AsyncClient(transport=transport) as http_client:
+                for _ in range(3):
+                    await fan_out_list_tickets(http_client, cfg)
+
+        warnings = [
+            r.getMessage()
+            for r in caplog.records
+            if r.levelno == logging.WARNING and r.name == 'dashboard.data.mcp_fanout'
+        ]
+        assert len(warnings) == 1, (
+            f'a broken root must warn once, not once per sampler cycle, got {warnings}'
+        )
+        assert not [m for m in warnings if 'recovered' in m], (
+            f"root B's success must not close root A's streak, got {warnings}"
+        )
+        assert 'proj-a' in warnings[0], (
+            f'the WARNING must name the failing project_root, got {warnings[0]}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_fan_out_list_tickets_warning_names_the_cause_once(
+        self, tmp_path: Path, caplog
+    ):
+        """The operator WARNING must not carry a doubled exception-type prefix.
+
+        metrics pre-renders the real cause with ``describe_exc`` and re-raises to
+        signal fall-through; ``first_success`` then renders THAT through
+        ``describe_exc`` again, so a bare ``ValueError`` re-raise reached the
+        operator as 'ValueError: ConnectError: refused (project_root=...)'.
+        """
+        from dashboard.data.metrics import fan_out_list_tickets
+
+        cfg, root_a, _root_b = _two_root_curator_cfg(tmp_path)
+        mock_mcp = AsyncMock(side_effect=_fail_root_a(root_a))
+        transport = httpx.MockTransport(lambda req: httpx.Response(200, json={}))
+
+        with (
+            caplog.at_level(logging.DEBUG, logger='dashboard.data.mcp_fanout'),
+            patch('dashboard.data.metrics.mcp_tool_call', mock_mcp),
+        ):
+            async with httpx.AsyncClient(transport=transport) as http_client:
+                await fan_out_list_tickets(http_client, cfg)
+
+        warnings = [
+            r.getMessage()
+            for r in caplog.records
+            if r.levelno == logging.WARNING and r.name == 'dashboard.data.mcp_fanout'
+        ]
+        assert len(warnings) == 1, f'expected one opening WARNING, got {warnings}'
+        message = warnings[0]
+        assert message.count('ConnectError: refused') == 1, (
+            f'the cause must be rendered exactly once, got {message}'
+        )
+        assert 'ValueError: ConnectError' not in message, (
+            f'the type prefix must not be doubled, got {message}'
+        )
+        assert f'(project_root={root_a})' in message, (
+            f'metrics\' own project_root suffix must survive the fix, got {message}'
+        )

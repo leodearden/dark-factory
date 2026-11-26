@@ -28,6 +28,16 @@ task would silently lose the failure signal. On the success path,
 three enum members — honest-zero and read-failure stay distinguishable on
 the wire.
 
+The same honest-failure discipline extends to the ENVELOPE via
+``TaskRuntimeSnapshot.offline_reason`` (task 3517). ``offline=True`` alone
+cannot tell an operator whether the orchestrator is down or the dashboard
+was too starved to ask — the two demand opposite responses, and collapsing
+them is what made the 2026-07-30 event get misdiagnosed. ``offline_reason``
+carries that discriminator without touching ``offline``'s meaning: it is
+additive and defaulted, so an old server (which omits the key) decodes into
+``None`` on a new consumer, and a new server's explicit ``null`` is ignored
+by an old consumer. Nothing about ``offline`` changes.
+
 Follows the ``shared/src/shared/deploy_state.py`` precedent: a pydantic
 model living in ``shared/`` and imported directly by each consumer
 (``from shared.task_runtime_state import ...``), deliberately NOT
@@ -82,7 +92,30 @@ class TaskRuntimeSnapshot(BaseModel):
     ``offline`` is always ``False`` as emitted by the server itself — the
     dashboard (task gamma) synthesizes ``True`` client-side when the
     escalation server is unreachable.
+
+    ``offline_reason`` is the SAME species as ``offline``: always ``None`` as
+    emitted by the server, synthesized client-side by the dashboard's
+    ``dashboard.data.task_runtime._probe_one`` alongside ``offline=True``. It
+    names the FAULT DOMAIN of the failed probe (task 3517):
+
+    - ``'deadline_exceeded'`` — the probe's own deadline fired
+      (``DEFAULT_PER_CALL_TIMEOUT``). Under a starved dashboard event loop
+      this is the DASHBOARD's fault, not the orchestrator's: the dashboard
+      was too busy to ask, and the orchestrator may be perfectly healthy.
+      That is exactly the 2026-07-30 incident, which was misdiagnosed as an
+      orchestrator outage because this field did not exist.
+    - ``'unreachable'`` — connect refused, HTTP error status, or a malformed
+      payload. Here the orchestrator IS the fault domain and an operator's
+      next action is to go look at it. (Malformed-payload deliberately
+      shares this member: the fault domain and the operator's next action
+      are identical; the finer detail survives in the probe's WARNING.)
+
+    ``offline=True`` with ``offline_reason=None`` is OUT-OF-CONTRACT for a
+    dashboard-synthesized snapshot. It remains constructible (a hand-built
+    snapshot, or an older dashboard), and consumers must treat it as an
+    honest "unknown" — never fabricate a diagnosis for it.
     """
 
     offline: bool = False
+    offline_reason: Literal['unreachable', 'deadline_exceeded'] | None = None
     tasks: list[TaskRuntimeEntry] = Field(default_factory=list)

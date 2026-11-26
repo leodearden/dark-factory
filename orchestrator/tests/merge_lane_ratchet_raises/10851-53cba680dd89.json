@@ -1,0 +1,12 @@
+{
+  "task_id": "10851",
+  "reason": "amendment pass (review of task 10851): the fresh-dequeue base rule moved out of worker.py's _merger_stack_tip into the pure speculation_controller.py::fresh_dequeue_offer, so its deliberate dead-build branch is pinned through a public function; worker.py and _merger_loop fall by more than the controller module rises",
+  "measures": [
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/speculation_controller.py",
+      "baseline": 31,
+      "current": 34
+    }
+  ]
+}

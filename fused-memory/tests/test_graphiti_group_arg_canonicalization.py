@@ -23,6 +23,7 @@ Organised by pipeline layer / test focus:
 
 from __future__ import annotations
 
+import inspect
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -35,10 +36,11 @@ _PATH_SHAPED = '-home-leo-src-x'
 
 
 class TestReconcilePathKeyFilterAgreement:
-    """get_nodes_by_exact_name / find_duplicate_entity_nodes: graph-KEY
-    (selected via ``_driver._get_graph``) and the Cypher ``$group_id``
-    FILTER param must both carry the canonical form, and a path-shaped
-    group_id must be rejected before any DB call.
+    """get_nodes_by_exact_name / find_duplicate_entity_nodes /
+    find_entity_nodes_by_name_substring: graph-KEY (selected via
+    ``_driver._get_graph``) and the Cypher ``$group_id`` FILTER param must both
+    carry the canonical form, and a path-shaped group_id must be rejected
+    before any DB call.
     """
 
     @pytest.mark.asyncio
@@ -90,6 +92,36 @@ class TestReconcilePathKeyFilterAgreement:
 
         with pytest.raises(PathShapedProjectIdError):
             await backend.find_duplicate_entity_nodes('Foo', group_id=_PATH_SHAPED)
+
+        graph.ro_query.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_find_entity_nodes_by_name_substring_canonicalizes_key_and_filter(
+        self, mock_config, make_backend, make_graph_mock
+    ):
+        """The substring sibling (task 5264) reads through BOTH channels the
+        exact-match one does — a graph key from _graph_for and a $group_id
+        Cypher filter — so the agreement its pair above pins has to hold here
+        too, not merely be inherited by resemblance."""
+        backend = make_backend(mock_config)
+        graph = make_graph_mock([])
+        backend._driver._get_graph = MagicMock(return_value=graph)
+
+        await backend.find_entity_nodes_by_name_substring('605', group_id='know-live')
+
+        backend._driver._get_graph.assert_called_once_with('know_live')
+        assert extract_params(graph.ro_query.call_args)['group_id'] == 'know_live'
+
+    @pytest.mark.asyncio
+    async def test_find_entity_nodes_by_name_substring_rejects_path_shaped_group_id(
+        self, mock_config, make_backend, make_graph_mock
+    ):
+        backend = make_backend(mock_config)
+        graph = make_graph_mock([])
+        backend._driver._get_graph = MagicMock(return_value=graph)
+
+        with pytest.raises(PathShapedProjectIdError):
+            await backend.find_entity_nodes_by_name_substring('605', group_id=_PATH_SHAPED)
 
         graph.ro_query.assert_not_awaited()
 
@@ -220,38 +252,114 @@ class TestGroupIdsFilterAgreement:
         backend.client.build_communities.assert_not_called()
 
 
+_POSITIVE_PATH_COVERED = frozenset({
+    'get_nodes_by_exact_name',
+    'find_duplicate_entity_nodes',
+    'add_episode',
+    'search',
+    'search_nodes',
+    'build_communities',
+})
+
+
+def _public_group_arg_methods() -> set[str]:
+    return {
+        name
+        for name, method in inspect.getmembers(GraphitiBackend, inspect.isfunction)
+        if not name.startswith('_')
+        and {'group_id', 'group_ids'} & inspect.signature(method).parameters.keys()
+    }
+
+
 # (method_name, positional args, kwargs — group_id/group_ids set to the
 # path-shaped constant) for every public group-arg GraphitiBackend method
-# NOT already covered by the step-1/3/5 positive-path tests
-# (get_nodes_by_exact_name, find_duplicate_entity_nodes, add_episode,
-# search, search_nodes, build_communities). Together these 36 + 6 = 42
-# cover GraphitiBackend's full public group-arg surface (excluding
-# _driver_for/_graph_for/_ensure_indices/_resolve_or_create_entity/
-# node_count, which are deliberately undecorated, and _identity_lock_for,
-# covered separately by step-9/10).
+# NOT in _POSITIVE_PATH_COVERED. TestCompletenessSweep derives that surface
+# from the method signatures, so a new public method taking group_id or
+# group_ids fails it until it gains a row here.
+#
+# `ensure_indices` (task 3707, β) joined the table when it was added: it
+# resolves a FalkorDB graph KEY via _graph_for for its CREATE statements, so
+# the decorator is load-bearing there, and leaving it out would have left this
+# class's "EVERY remaining public group-arg method" claim silently false while
+# the suite stayed green.
+#
+# `enumerate_all_valid_edges` and `enumerate_entity_nodes` (task 4340) joined
+# for the same reason: both resolve a FalkorDB graph key via _graph_for, so the
+# decorator is load-bearing for them exactly as it is for the get_all_valid_edges
+# / list_entity_nodes shims they back.
+#
+# `find_entity_nodes_by_name_substring` (task 5264) joined for BOTH reasons at
+# once: it resolves a graph key via _graph_for AND filters on $group_id,
+# exactly as its exact-match sibling find_duplicate_entity_nodes does. It is
+# the one method appearing both here and in a positive-path pair above — the
+# pair pins that the key and the filter agree, this row pins that a path-shaped
+# id is refused before any DB call, and the two are different claims.
+#
+# `enumerate_ranked_entity_nodes` (task 5662) joined for both reasons too: it
+# resolves a graph key via _graph_for AND filters on $group_id.
+#
+# `enumerate_valid_edges_mentioning` (task 4851) joined for the same reason as
+# enumerate_all_valid_edges, whose narrowed sibling it is.
+#
+# `get_edges_by_uuids` (task 6137) joined because it resolves a graph key via
+# _graph_for, as its single-edge sibling get_edge_text does.
+#
+# `get_node_names_by_uuids` (task 10080) joined for the same reason as its
+# single-node sibling get_node_text.
+#
+# `ensure_entity_node` (task 3335, row added by task 6778) is the public
+# resolve-or-mint sibling of resolve_entity_by_name. The private
+# _mint_entity_node stays out (task 5003 D4): its rejection is pinned in
+# test_write_time_identity.py::TestMintEntityNode.
+#
+# `count_foreign_relationships`, `entity_uuids_with_prefix`,
+# `edge_uuids_with_prefix`, `reassign_edge` and `redact_episode_content` had
+# been decorated without a row; the derived-surface check (task 6778) found
+# them.
+#
+# `scan_episode_toolcall_leaks` (task 3233) joined because it resolves its
+# group's graph and filters episodes on $group_id, as redact_episode_content does.
 _ALL_GROUP_ARG_SWEEP_CASES = [
     ('get_episode_by_uuid', ('ep1',), {'group_id': _PATH_SHAPED}),
     ('remove_episode', ('ep1',), {'group_id': _PATH_SHAPED}),
+    ('redact_episode_content', ('ep1',), {'group_id': _PATH_SHAPED, 'new_content': 'c'}),
+    ('scan_episode_toolcall_leaks', (), {'group_id': _PATH_SHAPED}),
     ('remove_edge', ('e1',), {'group_id': _PATH_SHAPED}),
     ('update_edge', ('e1',), {'fact': 'f', 'group_id': _PATH_SHAPED}),
+    (
+        'reassign_edge',
+        ('e1', 'n2'),
+        {'which_end': 'source', 'group_id': _PATH_SHAPED},
+    ),
     ('query_stale_node_embeddings', (10,), {'group_id': _PATH_SHAPED}),
     ('query_stale_edge_embeddings', (10,), {'group_id': _PATH_SHAPED}),
+    ('entity_uuids_with_prefix', ('ab',), {'group_id': _PATH_SHAPED}),
+    ('edge_uuids_with_prefix', ('ab',), {'group_id': _PATH_SHAPED}),
     ('query_edges_by_time_range', ('2020-01-01', '2020-01-02'), {'group_id': _PATH_SHAPED}),
     ('get_valid_edges_for_node', ('n1',), {'group_id': _PATH_SHAPED}),
+    ('count_foreign_relationships', ('n1',), {'group_id': _PATH_SHAPED}),
     ('get_connected_entity_uuids', ('n1',), {'group_id': _PATH_SHAPED}),
     ('get_all_valid_edges', (), {'group_id': _PATH_SHAPED}),
+    ('enumerate_all_valid_edges', (), {'group_id': _PATH_SHAPED}),
+    ('enumerate_valid_edges_mentioning', ('605',), {'group_id': _PATH_SHAPED}),
     ('bulk_remove_edges', (['e1'],), {'group_id': _PATH_SHAPED}),
     ('dedup_valid_edges_for_node', ('n1',), {'group_id': _PATH_SHAPED}),
     ('redirect_node_edges', ('d1', 's1'), {'group_id': _PATH_SHAPED}),
+    ('redirect_node_mentions', ('d1', 's1'), {'group_id': _PATH_SHAPED}),
     ('merge_entities', ('d1', 's1'), {'group_id': _PATH_SHAPED}),
     ('delete_entity', ('n1',), {'group_id': _PATH_SHAPED}),
     ('delete_entity_node', ('n1',), {'group_id': _PATH_SHAPED}),
     ('get_node_text', ('n1',), {'group_id': _PATH_SHAPED}),
+    ('get_node_names_by_uuids', (['n1'],), {'group_id': _PATH_SHAPED}),
     ('resolve_entity_by_name', ('Foo',), {'group_id': _PATH_SHAPED}),
+    ('ensure_entity_node', ('Foo',), {'group_id': _PATH_SHAPED}),
+    ('find_entity_nodes_by_name_substring', ('605',), {'group_id': _PATH_SHAPED}),
     ('refresh_entity_summary', ('n1',), {'group_id': _PATH_SHAPED}),
     ('set_entity_summary', ('n1', 's'), {'group_id': _PATH_SHAPED}),
     ('rename_entity_node', ('n1', 'NewName'), {'group_id': _PATH_SHAPED}),
     ('list_entity_nodes', (), {'group_id': _PATH_SHAPED}),
+    ('enumerate_entity_nodes', (), {'group_id': _PATH_SHAPED}),
+    ('enumerate_ranked_entity_nodes', (), {'group_id': _PATH_SHAPED}),
     ('detect_stale_with_edges', (), {'group_id': _PATH_SHAPED}),
     ('detect_stale_dry_run', (), {'group_id': _PATH_SHAPED}),
     ('detect_stale_summaries', (), {'group_id': _PATH_SHAPED}),
@@ -260,30 +368,36 @@ _ALL_GROUP_ARG_SWEEP_CASES = [
     ('update_node_name', ('n1', 'Name'), {'group_id': _PATH_SHAPED}),
     ('get_edge_text', ('e1',), {'group_id': _PATH_SHAPED}),
     ('get_edge_invalid_at', ('e1',), {'group_id': _PATH_SHAPED}),
+    ('get_edges_by_uuids', (['e1'],), {'group_id': _PATH_SHAPED}),
     ('update_node_embedding', ('n1', [0.1]), {'group_id': _PATH_SHAPED}),
     ('update_edge_embedding', ('e1', [0.1]), {'group_id': _PATH_SHAPED}),
     ('list_indices', (), {'group_id': _PATH_SHAPED}),
+    ('ensure_indices', (), {'group_id': _PATH_SHAPED}),
     ('drop_index', ('Entity', 'name'), {'group_id': _PATH_SHAPED}),
+    (
+        'drop_vector_index',
+        ('Entity', 'name_embedding'),
+        {'entity_type': 'NODE', 'group_id': _PATH_SHAPED},
+    ),
     ('drop_vector_indices', (), {'group_id': _PATH_SHAPED}),
     ('retrieve_episodes', (), {'group_ids': [_PATH_SHAPED]}),
 ]
-
-assert len(_ALL_GROUP_ARG_SWEEP_CASES) == 36, (
-    'Sweep must cover exactly the 36 public group-arg GraphitiBackend methods '
-    'not already covered by the step-1/3/5 positive-path tests — update this '
-    'table if the decorated surface ever changes.'
-)
 
 
 class TestCompletenessSweep:
     """Behavioral sweep: EVERY remaining public group-arg GraphitiBackend
     method rejects a path-shaped group_id/group_ids element before any DB
-    call — rejection happens at the decorator, before any body logic runs.
+    call.
 
     Guards every method not individually tested above, and any method
-    added in the future — canonicalize-and-reject is the first group_id
-    operation for every one of them.
+    added in the future — the surface check fails until a new method gains
+    a row in _ALL_GROUP_ARG_SWEEP_CASES.
     """
+
+    def test_sweep_and_positive_path_tests_cover_every_public_group_arg_method(self):
+        swept = {case[0] for case in _ALL_GROUP_ARG_SWEEP_CASES}
+
+        assert swept | _POSITIVE_PATH_COVERED == _public_group_arg_methods()
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(

@@ -1,0 +1,9 @@
+# The worked publisher policy for this repository, installed per OPERATIONS.md §"Client feed".
+# Schema and defaults: client-feed/src/client_feed/policy.py::Policy.
+project_id: dark-factory
+project_root: /home/leo/src/dark-factory
+out_dir: /var/lib/scoping-intake-feeds/dark-factory/out
+in_dir: /var/lib/scoping-intake-feeds/dark-factory/in
+visible_globs:
+  - '*/src/**'
+  - '*/tests/**'

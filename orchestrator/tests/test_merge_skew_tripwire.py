@@ -1,4 +1,4 @@
-"""Tests for orchestrator.merge_skew_tripwire (task 2382, merge-skew δ).
+"""Tests for orchestrator.merge_lane.skew_tripwire (task 2382, merge-skew δ).
 
 M3 of plans/merge-skew-attribution-prd.md — the proactive pipeline-landing
 tripwire (PRD task δ, invariant I6, boundary rows 5-6): on each successful
@@ -15,12 +15,15 @@ test_merge_queue_lifecycle_registry.py / test_merge_queue_request_liveness.py.
 
 from __future__ import annotations
 
+import asyncio
+import logging
 import time
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
+import pytest_asyncio
 
 
 class TestLoadBearingOracle:
@@ -45,7 +48,7 @@ class TestLoadBearingOracle:
         self, tmp_path: Path,
     ) -> None:
         """Script present, exits 0 → True; receives the trailing changed-file args."""
-        from orchestrator.merge_skew_tripwire import _run_load_bearing_oracle
+        from orchestrator.merge_lane.skew_tripwire import _run_load_bearing_oracle
 
         sentinel = tmp_path / 'received_args.txt'
         script = self._write_oracle_script(tmp_path, f"""\
@@ -67,7 +70,7 @@ exit 0
     @pytest.mark.asyncio
     async def test_script_exits_nonzero_returns_false(self, tmp_path: Path) -> None:
         """Script present but exits non-zero → False (not load-bearing)."""
-        from orchestrator.merge_skew_tripwire import _run_load_bearing_oracle
+        from orchestrator.merge_lane.skew_tripwire import _run_load_bearing_oracle
 
         script = self._write_oracle_script(tmp_path, """\
 #!/usr/bin/env bash
@@ -84,7 +87,7 @@ exit 1
         self, tmp_path: Path,
     ) -> None:
         """oracle_cmd == [] → False without consulting any script (fail-open)."""
-        from orchestrator.merge_skew_tripwire import _run_load_bearing_oracle
+        from orchestrator.merge_lane.skew_tripwire import _run_load_bearing_oracle
 
         result = await _run_load_bearing_oracle(tmp_path, [], ['src/a.py'])
         assert result is False
@@ -94,7 +97,7 @@ exit 1
         self, tmp_path: Path,
     ) -> None:
         """oracle_cmd is None → False without consulting any script (fail-open)."""
-        from orchestrator.merge_skew_tripwire import _run_load_bearing_oracle
+        from orchestrator.merge_lane.skew_tripwire import _run_load_bearing_oracle
 
         result = await _run_load_bearing_oracle(tmp_path, None, ['src/a.py'])
         assert result is False
@@ -104,7 +107,7 @@ exit 1
         self, tmp_path: Path,
     ) -> None:
         """changed_files == [] → False without spawning (fail-open)."""
-        from orchestrator.merge_skew_tripwire import _run_load_bearing_oracle
+        from orchestrator.merge_lane.skew_tripwire import _run_load_bearing_oracle
 
         # A script that would exit 0 if invoked — must NOT be spawned at all.
         script = self._write_oracle_script(tmp_path, """\
@@ -118,7 +121,7 @@ exit 0
     @pytest.mark.asyncio
     async def test_missing_script_returns_false(self, tmp_path: Path) -> None:
         """oracle_cmd names a script that doesn't exist → False (fail-open)."""
-        from orchestrator.merge_skew_tripwire import _run_load_bearing_oracle
+        from orchestrator.merge_lane.skew_tripwire import _run_load_bearing_oracle
 
         missing = tmp_path / 'does-not-exist.sh'
         result = await _run_load_bearing_oracle(
@@ -129,7 +132,7 @@ exit 0
     @pytest.mark.asyncio
     async def test_non_executable_script_returns_false(self, tmp_path: Path) -> None:
         """Non-executable script → False (fail-open); exception absorbed by broad except."""
-        from orchestrator.merge_skew_tripwire import _run_load_bearing_oracle
+        from orchestrator.merge_lane.skew_tripwire import _run_load_bearing_oracle
 
         script = self._write_oracle_script(tmp_path, """\
 #!/usr/bin/env bash
@@ -150,7 +153,7 @@ exit 0
         the fail-open contract returns False (not load-bearing), satisfying
         I6 (never block/delay the merge-landed hot path) even for a
         misbehaving operator-supplied oracle."""
-        from orchestrator.merge_skew_tripwire import _run_load_bearing_oracle
+        from orchestrator.merge_lane.skew_tripwire import _run_load_bearing_oracle
 
         script = self._write_oracle_script(tmp_path, """\
 #!/usr/bin/env bash
@@ -171,6 +174,240 @@ exit 0
         )
 
 
+class TestAbandonedOracleRegistry:
+    """Task 4233 — the oracle task abandoned on ANY exceptional exit from
+    ``_run_load_bearing_oracle``'s ``asyncio.wait`` (budget expiry OR caller
+    cancellation) must be held by a strong reference (``_ABANDONED_ORACLES``)
+    until it finishes, then released.
+
+    Mirrors ``test_probe_db_abandons_and_tracks_on_every_exit_path`` /
+    ``_drained_probe_registry`` (dashboard/tests/test_healthz_deadline.py,
+    task 4089) — the landed sibling fix for the same defect class in
+    ``dashboard/app.py::_probe_db``.
+
+    Uses a stub replacing ``orchestrator.git_ops._run`` rather than the real
+    bash-script subprocess ``TestLoadBearingOracle`` drives above: a real
+    subprocess's ``communicate()`` internally ``gather()``s per-pipe reader
+    tasks, so identifying "the one abandoned task" by set-diffing
+    ``asyncio.all_tasks()`` (4089's trick) would not isolate a single task
+    here. The stub instead records ``asyncio.current_task()`` directly, which
+    identifies it exactly regardless of subprocess internals.
+    """
+
+    class _StubRun:
+        """Replaces ``orchestrator.git_ops._run``: records the calling task,
+        signals ``started``, then blocks until cancelled.
+
+        ``cleanup_raises`` models ``_run``'s real kill+reap cleanup (task
+        2608) RAISING during unwinding instead of completing the
+        cancellation cleanly — the realistic failure shape that is the
+        entire reason this call site abandons the task rather than awaiting
+        it.
+        """
+
+        def __init__(self, *, cleanup_raises: bool) -> None:
+            self.cleanup_raises = cleanup_raises
+            self.task: asyncio.Task | None = None
+            self.started = asyncio.Event()
+
+        async def __call__(
+            self, cmd: list[str], cwd: Path | None = None, *, input_text: str | None = None,
+        ) -> tuple[int, str, str]:
+            self.task = asyncio.current_task()
+            self.started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                if self.cleanup_raises:
+                    raise RuntimeError('oracle cleanup blew up') from None
+                raise
+            return (0, '', '')  # pragma: no cover — unreachable: the Event above is never set
+
+    @pytest_asyncio.fixture()
+    async def _drained_oracle_registry(self):
+        """Yield ``_ABANDONED_ORACLES``; on teardown, cancel + drain whatever
+        remains.
+
+        Teardown-ONLY: deliberately does not ``.clear()`` the registry at
+        setup. Clearing would drop the strong reference to a task left
+        in-flight by an earlier test, which would GC it mid-flight — exactly
+        the hazard this registry exists to prevent. Mirrors
+        ``_drained_probe_registry`` in dashboard/tests/test_healthz_deadline.py.
+        A RED assertion failure here must fail loudly, not leak a pending
+        task into the rest of the orchestrator suite.
+        """
+        from orchestrator.merge_lane import skew_tripwire as merge_skew_tripwire
+
+        registry = merge_skew_tripwire._ABANDONED_ORACLES
+        yield registry
+        pending = set(registry)
+        if pending:
+            for task in pending:
+                task.cancel()
+            await asyncio.wait(pending, timeout=5.0)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'cleanup_raises', [False, True], ids=['cancels_cleanly', 'raises_during_cleanup'],
+    )
+    async def test_timeout_abandons_and_tracks_until_drained(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        _drained_oracle_registry,
+        cleanup_raises: bool,
+    ) -> None:
+        """A timed-out oracle task must be strongly referenced in
+        ``_ABANDONED_ORACLES`` until it finishes, then released — whether it
+        cancels cleanly or its cleanup raises during unwinding. A registry
+        that only ever grows is itself a leak, so both terminal shapes are
+        parametrized: the release must happen for each of them, not only
+        for a clean cancel.
+        """
+        from orchestrator.merge_lane.skew_tripwire import _run_load_bearing_oracle
+
+        registry = _drained_oracle_registry
+        stub = self._StubRun(cleanup_raises=cleanup_raises)
+        monkeypatch.setattr('orchestrator.git_ops._run', stub)
+
+        result = await _run_load_bearing_oracle(
+            tmp_path, ['fake-oracle'], ['a.py'], timeout_secs=0.05,
+        )
+
+        assert result is False, 'fail-open contract unchanged: a timed-out oracle returns False'
+        assert stub.task is not None, 'stub was never invoked'
+        assert stub.task in registry, (
+            'abandoned oracle task was not tracked in _ABANDONED_ORACLES'
+        )
+
+        await asyncio.wait({stub.task}, timeout=5.0)
+        assert stub.task.done(), 'abandoned oracle task never finished'
+        assert stub.task not in registry, (
+            'abandoned oracle task leaked: still in _ABANDONED_ORACLES after it finished'
+        )
+
+    @pytest.mark.asyncio
+    async def test_caller_cancellation_abandons_and_tracks_until_drained(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        _drained_oracle_registry,
+    ) -> None:
+        """Cancelling the CALLER of ``_run_load_bearing_oracle`` must not
+        strand an untracked oracle task, and must not launder the
+        cancellation into a ``False`` verdict.
+
+        ``timeout_secs=60.0`` is chosen STRUCTURALLY, not tuned (mirrors
+        task 4089's rationale in
+        ``test_probe_db_abandons_and_tracks_on_every_exit_path``'s
+        ``caller_cancelled`` case, dashboard/tests/test_healthz_deadline.py):
+        60s is unreachable within this test's wall clock, so the caller's
+        own ``.cancel()`` is provably the ONLY thing that can end the
+        coroutine — the oracle budget cannot have expired, which is what
+        makes this a caller-cancellation test rather than a second
+        timeout test. Waiting on ``stub.started`` rather than sleeping a
+        fixed interval removes the remaining timing dependence.
+
+        The ``pytest.raises(asyncio.CancelledError)`` assertion is
+        load-bearing in its own right: it pins that the fix must
+        RE-RAISE, never swallow the cancellation into the fail-open
+        ``return False``. A cancelled caller must stay cancelled.
+        """
+        from orchestrator.merge_lane.skew_tripwire import _run_load_bearing_oracle
+
+        registry = _drained_oracle_registry
+        stub = self._StubRun(cleanup_raises=False)
+        monkeypatch.setattr('orchestrator.git_ops._run', stub)
+
+        caller = asyncio.create_task(
+            _run_load_bearing_oracle(tmp_path, ['fake-oracle'], ['a.py'], timeout_secs=60.0),
+        )
+        await asyncio.wait_for(stub.started.wait(), timeout=5.0)
+        inner = stub.task
+        assert inner is not None, 'stub was never invoked'
+
+        caller.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await caller
+
+        assert inner in registry, (
+            'caller cancellation must not strand an untracked oracle task'
+        )
+
+        await asyncio.wait({inner}, timeout=5.0)
+        assert inner.cancelled(), 'abandoned oracle task was tracked but never actually cancelled'
+        assert inner not in registry, (
+            'abandoned oracle task leaked: still in _ABANDONED_ORACLES after it finished'
+        )
+
+    @pytest.mark.asyncio
+    async def test_successful_oracle_run_is_never_tracked_in_registry(
+        self,
+        tmp_path: Path,
+        _drained_oracle_registry,
+    ) -> None:
+        """A normally-completing oracle run — well within its timeout, caller
+        never cancelled — must never enter ``_ABANDONED_ORACLES``: only
+        genuinely abandoned tasks belong there. Pins the negative alongside
+        the positive cases above, so a future refactor could not register
+        every task at creation (relying solely on the done-callback to drain
+        it) while keeping every assertion above green.
+        """
+        from orchestrator.merge_lane.skew_tripwire import _run_load_bearing_oracle
+
+        registry = _drained_oracle_registry
+        before = set(registry)
+        script = _write_oracle_script(tmp_path, exit_code=0)
+
+        result = await _run_load_bearing_oracle(
+            tmp_path, ['bash', str(script)], ['a.py'], timeout_secs=5.0,
+        )
+
+        assert result is True
+        assert registry == before, (
+            f'a normally-completing oracle task must never be tracked in '
+            f'_ABANDONED_ORACLES; registry changed to {registry!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_abandon_oracle_logs_warning_when_backlog_crosses_threshold(
+        self,
+        _drained_oracle_registry,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A persistent backlog of abandoned oracle tasks — e.g. several
+        landings in a row hitting a wedged oracle whose grandchild holds the
+        stdout/stderr pipes open (see ``_run_load_bearing_oracle``'s
+        docstring) — must be diagnosable from the log alone: the per-timeout
+        WARNING already logged by the caller reads as a transient hiccup,
+        not a pile-up.
+        """
+        from orchestrator.merge_lane import skew_tripwire as merge_skew_tripwire
+
+        registry = _drained_oracle_registry
+        before = set(registry)
+        threshold = merge_skew_tripwire._ABANDONED_ORACLES_WARN_THRESHOLD
+        tasks = [
+            asyncio.ensure_future(asyncio.Event().wait()) for _ in range(threshold + 1)
+        ]
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'):
+            for task in tasks:
+                merge_skew_tripwire._abandon_oracle(task)
+
+        expected_backlog = len(before) + threshold + 1
+        assert registry == before | set(tasks), (
+            'every newly-abandoned task must be tracked, and nothing pre-existing dropped'
+        )
+        assert any(
+            'abandoned oracle task' in r.message and str(expected_backlog) in r.message
+            for r in caplog.records
+        ), (
+            f'expected a backlog WARNING naming the count {expected_backlog}; '
+            f'got {[r.message for r in caplog.records]}'
+        )
+
+
 class TestComputeTripwireOverlap:
     """Unit tests for the pure ``compute_tripwire_overlap(landing_changed_files,
     inflight_diffs)``.
@@ -182,7 +419,7 @@ class TestComputeTripwireOverlap:
     """
 
     def test_overlapping_task_yields_hit_with_sorted_overlap_files(self) -> None:
-        from orchestrator.merge_skew_tripwire import TripwireHit, compute_tripwire_overlap
+        from orchestrator.merge_lane.skew_tripwire import TripwireHit, compute_tripwire_overlap
 
         landing_changed_files = ['src/a.py', 'src/b.py', 'src/c.py']
         inflight_diffs = [
@@ -196,7 +433,7 @@ class TestComputeTripwireOverlap:
         ]
 
     def test_non_overlapping_task_yields_no_hit(self) -> None:
-        from orchestrator.merge_skew_tripwire import compute_tripwire_overlap
+        from orchestrator.merge_lane.skew_tripwire import compute_tripwire_overlap
 
         landing_changed_files = ['src/a.py']
         inflight_diffs = [
@@ -208,7 +445,7 @@ class TestComputeTripwireOverlap:
         assert hits == []
 
     def test_mixed_overlapping_and_non_overlapping(self) -> None:
-        from orchestrator.merge_skew_tripwire import TripwireHit, compute_tripwire_overlap
+        from orchestrator.merge_lane.skew_tripwire import TripwireHit, compute_tripwire_overlap
 
         landing_changed_files = ['src/a.py']
         inflight_diffs = [
@@ -226,21 +463,21 @@ class TestComputeTripwireOverlap:
         )
 
     def test_empty_landing_set_yields_no_hits(self) -> None:
-        from orchestrator.merge_skew_tripwire import compute_tripwire_overlap
+        from orchestrator.merge_lane.skew_tripwire import compute_tripwire_overlap
 
         hits = compute_tripwire_overlap([], [('101', 'task/101', ['src/a.py'])])
 
         assert hits == []
 
     def test_empty_inflight_diffs_yields_no_hits(self) -> None:
-        from orchestrator.merge_skew_tripwire import compute_tripwire_overlap
+        from orchestrator.merge_lane.skew_tripwire import compute_tripwire_overlap
 
         hits = compute_tripwire_overlap(['src/a.py'], [])
 
         assert hits == []
 
     def test_ordering_is_deterministic_and_matches_input_order(self) -> None:
-        from orchestrator.merge_skew_tripwire import compute_tripwire_overlap
+        from orchestrator.merge_lane.skew_tripwire import compute_tripwire_overlap
 
         landing_changed_files = ['src/a.py', 'src/b.py']
         inflight_diffs = [
@@ -303,7 +540,7 @@ class TestEmitTripwire:
 
     async def test_oracle_negative_no_escalation(self, tmp_path: Path) -> None:
         """Boundary row 6: oracle-negative landing → zero escalations, zero updates."""
-        from orchestrator.merge_skew_tripwire import emit_pipeline_landing_tripwire
+        from orchestrator.merge_lane.skew_tripwire import emit_pipeline_landing_tripwire
 
         script = _write_oracle_script(tmp_path, exit_code=1)  # not load-bearing
         fake_eq = _FakeEscalationQueue()
@@ -335,7 +572,7 @@ class TestEmitTripwire:
         non-overlapping in-flight task → exactly one escalation naming only the
         overlapping task, and a metadata note attached only to that task.
         """
-        from orchestrator.merge_skew_tripwire import emit_pipeline_landing_tripwire
+        from orchestrator.merge_lane.skew_tripwire import emit_pipeline_landing_tripwire
 
         script = _write_oracle_script(tmp_path, exit_code=0)  # load-bearing
         fake_eq = _FakeEscalationQueue()
@@ -398,7 +635,7 @@ class TestEmitTripwire:
         """oracle_cmd falsy (None or []) → short-circuits before touching
         get_branch_diff/update_task at all — asserted by making both raise
         if they were ever (incorrectly) invoked."""
-        from orchestrator.merge_skew_tripwire import emit_pipeline_landing_tripwire
+        from orchestrator.merge_lane.skew_tripwire import emit_pipeline_landing_tripwire
 
         get_branch_diff = AsyncMock(side_effect=AssertionError('get_branch_diff must not be called'))
         update_task = AsyncMock(side_effect=AssertionError('update_task must not be called'))
@@ -429,7 +666,7 @@ class TestEmitTripwire:
         """I6 (≤1 escalation per landing): a pre-existing pending escalation
         for this landing's sentinel task_id suppresses a duplicate submit —
         mirrors _alarm_verify_worktree_contention's dedup guard."""
-        from orchestrator.merge_skew_tripwire import emit_pipeline_landing_tripwire
+        from orchestrator.merge_lane.skew_tripwire import emit_pipeline_landing_tripwire
 
         script = _write_oracle_script(tmp_path, exit_code=0)
         landing_sha = 'b' * 40
@@ -463,7 +700,7 @@ class TestEmitTripwire:
         """A raising get_branch_diff for one in-flight task must not prevent
         the remaining in-flight tasks from being processed, and must not
         propagate out of emit (fail-open)."""
-        from orchestrator.merge_skew_tripwire import emit_pipeline_landing_tripwire
+        from orchestrator.merge_lane.skew_tripwire import emit_pipeline_landing_tripwire
 
         script = _write_oracle_script(tmp_path, exit_code=0)
         fake_eq = _FakeEscalationQueue()
@@ -503,7 +740,7 @@ class TestEmitTripwire:
     ) -> None:
         """update_task raising must not propagate — the escalation itself
         (already submitted before update_task runs) is unaffected."""
-        from orchestrator.merge_skew_tripwire import emit_pipeline_landing_tripwire
+        from orchestrator.merge_lane.skew_tripwire import emit_pipeline_landing_tripwire
 
         script = _write_oracle_script(tmp_path, exit_code=0)
         fake_eq = _FakeEscalationQueue()
@@ -531,7 +768,7 @@ class TestEmitTripwire:
 
     async def test_escalation_submit_raising_is_swallowed(self, tmp_path: Path) -> None:
         """escalation_queue.submit raising must not propagate out of emit."""
-        from orchestrator.merge_skew_tripwire import emit_pipeline_landing_tripwire
+        from orchestrator.merge_lane.skew_tripwire import emit_pipeline_landing_tripwire
 
         script = _write_oracle_script(tmp_path, exit_code=0)
 
@@ -565,7 +802,7 @@ class TestEmitTripwire:
         oracle script bounded by a short oracle_timeout_secs fails open
         (no escalation) and returns promptly, rather than blocking for the
         script's full hang duration (I6)."""
-        from orchestrator.merge_skew_tripwire import emit_pipeline_landing_tripwire
+        from orchestrator.merge_lane.skew_tripwire import emit_pipeline_landing_tripwire
 
         script = tmp_path / 'hanging_oracle.sh'
         script.write_text("""\

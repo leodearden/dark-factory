@@ -1,0 +1,253 @@
+memory-eval run: e1-retrieval-health
+run_stamp:       20260805T093831Z
+schema_version:  1
+project_id:      dark_factory+reify
+corpus counts:
+  claim_queries_unscorable: 0
+  contamination_scored_results: 490
+  contamination_untopiced_results: 489
+  decisions_and_rationale: 17
+  degraded_queries: 0
+  entities_and_relations: 45
+  observations_and_summaries: 41569
+  observations_served_by_graphiti_at_k10: 87
+  observations_served_by_graphiti_at_k5: 87
+  observations_served_by_mem0_at_k10: 19
+  observations_served_by_mem0_at_k5: 11
+  preferences_and_norms: 2773
+  procedural_knowledge: 7341
+  temporal_facts: 18
+
+metrics (6):
+  [tripwire] topic-canonical-present: value=32.0 n=32
+    failing items (32/32):
+      - t-architect-plan-files-write-set
+      - t-architect-report-task-already-done-main-reachability
+      - t-background-task-reaping-and-wake-mechanisms
+      - t-boolean-operand-consumption-edges
+      - t-cargo-fmt-no-gate
+      - t-cargo-rerun-if-changed-warm-lane-mtime
+      - t-compiled-module-functions-user-source-only
+      - t-docs-prd-landing
+      - t-escalation-store-ambiguity
+      - t-eval-worktree-plan-tools-missing
+      - t-eval-worktree-venv-shadowing
+      - t-g7-design-invariants
+      - t-git-conventions
+      - t-harness-layout-gate-decision-rule
+      - t-harness-layout-gate-move-gotchas
+      - t-inv-geo-1-mesh-contract-mock
+      - t-memory-hygiene
+      - t-nextest-less-host-simulation
+      - t-patch_import_site_testing
+      - t-pkill-pgrep-self-match
+      - t-prd-gates
+      - t-pytest-xdist-serial-override
+      - t-pytest_importlib_relative_import_gotcha
+      - t-recon-project-root-misroute-retired
+      - t-reconciliation_cost_model
+      - t-reify-audit-ptodo-from-worktree
+      - t-reify-debug-mcp-driving
+      - t-reify-debug-mcp-gotchas
+      - t-reify-debug-mcp-tool-addition
+      - t-task-5422-fabrication-episode-disposition
+      - t-tracing-interest-cache-poisoning
+      - t-warm-lane-plan-json-loss-reconstruction
+    details: report-20260805T093831Z.txt
+  [proportion] canonical-in-top-5: value=0.02040816326530612 n=98 denominator=98
+    details: report-20260805T093831Z.txt
+  [proportion] canonical-in-top-10: value=0.030612244897959183 n=98 denominator=98
+    details: report-20260805T093831Z.txt
+  [proportion] canonical-in-top-5-held-out: value=0.0 n=32 denominator=32
+    details: report-20260805T093831Z.txt
+  [proportion] claim-recall: value=0.0625 n=32 denominator=32
+    details: report-20260805T093831Z.txt
+  [proportion] contamination-share: value=0.0 n=490 denominator=490
+    details: report-20260805T093831Z.txt
+
+metric families NOT MEASURED this run (1):
+  These metrics had no scored trial, so they were not emitted — a proportion
+  over zero trials and a count over zero exposure are not measurements, and
+  emitting either would put a fabricated datapoint into the baseline window
+  the limits evaluator computes from. Their absence is NOT a pass: the
+  evaluator joins a run to its baseline BY metric_id and simply stops trending
+  what is missing, so the gap is said here rather than left to be inferred
+  from which rows happen to be present.
+  - superseded-above-successor
+
+INITIAL STATE — known-bad items (32):
+  This is the INITIAL STATE of this eval: no prior run exists under this
+  artifact root. The items below are what the corpus looks like today,
+  inherited from the 3111/3112 fix lineage (canonical pinning, consolidation,
+  curator gates) that has been rewriting how memory is written for months.
+  They are a KNOWN-BAD snapshot, NOT A FINDING and not a regression anyone
+  introduced in this run. Deciding what to do with this list is a separate
+  leaf's job; this runner only measures.
+
+  Read this list together with "which store served the query" below BEFORE
+  concluding anything about findability. A phrasing the read router sent to a
+  store the canonical does not live in cannot hit however healthy retrieval
+  is, so a failing item here can be a routing fact rather than a corpus one,
+  and the two are not distinguishable from the rate alone. Which it is belongs
+  to the retrieval-fix lineage, not to this monitor.
+
+  - t-architect-plan-files-write-set
+  - t-architect-report-task-already-done-main-reachability
+  - t-background-task-reaping-and-wake-mechanisms
+  - t-boolean-operand-consumption-edges
+  - t-cargo-fmt-no-gate
+  - t-cargo-rerun-if-changed-warm-lane-mtime
+  - t-compiled-module-functions-user-source-only
+  - t-docs-prd-landing
+  - t-escalation-store-ambiguity
+  - t-eval-worktree-plan-tools-missing
+  - t-eval-worktree-venv-shadowing
+  - t-g7-design-invariants
+  - t-git-conventions
+  - t-harness-layout-gate-decision-rule
+  - t-harness-layout-gate-move-gotchas
+  - t-inv-geo-1-mesh-contract-mock
+  - t-memory-hygiene
+  - t-nextest-less-host-simulation
+  - t-patch_import_site_testing
+  - t-pkill-pgrep-self-match
+  - t-prd-gates
+  - t-pytest-xdist-serial-override
+  - t-pytest_importlib_relative_import_gotcha
+  - t-recon-project-root-misroute-retired
+  - t-reconciliation_cost_model
+  - t-reify-audit-ptodo-from-worktree
+  - t-reify-debug-mcp-driving
+  - t-reify-debug-mcp-gotchas
+  - t-reify-debug-mcp-tool-addition
+  - t-task-5422-fabrication-episode-disposition
+  - t-tracing-interest-cache-poisoning
+  - t-warm-lane-plan-json-loss-reconstruction
+
+canonicals matched by NEITHER key (32):
+  Neither the content hash nor last_known_id matched anything returned. Either
+  the entry is genuinely unfindable, the query was routed to a store the entry
+  does not live in, or the registry fixture has decayed past both keys — the
+  serving store is named per topic so an operator can tell those apart rather
+  than guessing between them.
+  - architect-plan-files-write-set (served by: graphiti)
+  - architect-report-task-already-done-main-reachability (served by: graphiti)
+  - background-task-reaping-and-wake-mechanisms (served by: graphiti)
+  - boolean-operand-consumption-edges (served by: graphiti)
+  - cargo-fmt-no-gate (served by: graphiti)
+  - cargo-rerun-if-changed-warm-lane-mtime (served by: graphiti, mem0)
+  - compiled-module-functions-user-source-only (served by: graphiti)
+  - docs-prd-landing (served by: graphiti, mem0)
+  - escalation-store-ambiguity (served by: graphiti)
+  - eval-worktree-plan-tools-missing (served by: graphiti, mem0)
+  - eval-worktree-venv-shadowing (served by: graphiti)
+  - g7-design-invariants (served by: graphiti)
+  - git-conventions (served by: graphiti)
+  - harness-layout-gate-decision-rule (served by: graphiti)
+  - harness-layout-gate-move-gotchas (served by: graphiti, mem0)
+  - inv-geo-1-mesh-contract-mock (served by: graphiti, mem0)
+  - memory-hygiene (served by: graphiti)
+  - nextest-less-host-simulation (served by: graphiti, mem0)
+  - patch_import_site_testing (served by: graphiti)
+  - pkill-pgrep-self-match (served by: graphiti)
+  - prd-gates (served by: graphiti)
+  - pytest-xdist-serial-override (served by: graphiti)
+  - pytest_importlib_relative_import_gotcha (served by: graphiti)
+  - recon-project-root-misroute-retired (served by: graphiti, mem0)
+  - reconciliation_cost_model (served by: graphiti)
+  - reify-audit-ptodo-from-worktree (served by: graphiti)
+  - reify-debug-mcp-driving (served by: graphiti, mem0)
+  - reify-debug-mcp-gotchas (served by: graphiti, mem0)
+  - reify-debug-mcp-tool-addition (served by: graphiti, mem0)
+  - task-5422-fabrication-episode-disposition (served by: graphiti, mem0)
+  - tracing-interest-cache-poisoning (served by: graphiti)
+  - warm-lane-plan-json-loss-reconstruction (served by: graphiti, mem0)
+
+claims not recalled (30):
+  - [architect-plan-files-write-set] 'what does the plan files list mean': missing 'WRITE-SET', 'CREATE or MODIFY'
+  - [architect-report-task-already-done-main-reachability] 'what does report_task_already_done require': missing 'main-reachable'
+  - [boolean-operand-consumption-edges] 'what discriminates the two boolean-operand answers': missing 'DISCRIMINATOR', 'resolve_boolean_arg'
+  - [cargo-fmt-no-gate] 'what does reify lint with instead of rustfmt': missing 'cargo clippy', 'rustfmt.toml'
+  - [cargo-rerun-if-changed-warm-lane-mtime] 'what interacts with warm-lane mtime normalisation': missing 'CARGO MECHANISM', 'seed-warm-lane.sh'
+  - [compiled-module-functions-user-source-only] 'what does compile_source_with_stdlib omit': missing 'USER-SOURCE-ONLY'
+  - [docs-prd-landing] 'where do PRD artifacts get committed': missing 'DIRECTLY ON main'
+  - [escalation-store-ambiguity] 'how many in-process callers does the escalation read API have': missing 'in-process'
+  - [eval-worktree-plan-tools-missing] 'what was ratified about plan-tools in the eval worktree': missing 'CANONICAL', 'eval_worktree_plan_tools_missing'
+  - [eval-worktree-venv-shadowing] 'what shadows what in the eval worktree': missing 'CANONICAL', 'shadowing'
+  - [g7-design-invariants] 'what is the /prd G7 design-invariant gate': missing 'NORM'
+  - [git-conventions] 'what fails with git commit --only': missing 'git commit --only', 'pathspec'
+  - [harness-layout-gate-decision-rule] 'what triggers the harness-layout gate': missing 'WHEN THIS FIRES', 'harness-layout-gate-move-gotchas'
+  - [harness-layout-gate-move-gotchas] 'which entry covers the harness move mechanics': missing 'MECHANICAL APPENDIX', 'harness-layout-gate-decision-rule'
+  - [inv-geo-1-mesh-contract-mock] 'what did the mesh-contract mock get wrong': missing 'MockGeometryKernel', 'THE TRAP'
+  - [memory-hygiene] 'what does the memory-hygiene norm say about performance claims': missing 'PERFORMANCE'
+  - [nextest-less-host-simulation] 'which techniques simulate a missing nextest': missing 'NEXTEST-LESS HOST', 'test_verify_'
+  - [patch_import_site_testing] 'what happened to tests patching invoke_with_cap_retry': missing 'silently'
+  - [pkill-pgrep-self-match] 'what is the pkill -f self-match mechanism': missing 'SELF-MATCH', 'FULL command line'
+  - [prd-gates] 'did the G7 walk change a design': missing 'Worked example', 'G6'
+  - [pytest-xdist-serial-override] 'which entry is the xdist canonical': missing 'pytest-xdist'
+  - [recon-project-root-misroute-retired] 'what is the status of the recon misroute bug': missing 'RETIRED', 'curator gate esc-5564-1'
+  - [reconciliation_cost_model] 'what is the fixed per-run reconciliation cost': missing 'Reconciliation cost model', 'per run'
+  - [reify-audit-ptodo-from-worktree] 'what are the PTODO detector authorities': missing 'reify-audit-ptodo-detector.md', 'invocation contexts'
+  - [reify-debug-mcp-driving] 'what is the reify debug MCP port contract': missing 'PORT CONTRACT', 'reify-debug-mcp-gotchas'
+  - [reify-debug-mcp-gotchas] 'what is the theme of the debug MCP gotchas': missing 'GOTCHA APPENDIX', 'reify-debug-mcp-driving'
+  - [reify-debug-mcp-tool-addition] 'what is the authority for adding a debug MCP tool': missing 'ADDING A TOOL', 'reify-debug-mcp-driving'
+  - [task-5422-fabrication-episode-disposition] 'what happened to the task-5422 episodes': missing 'DELIBERATE PROVENANCE ORPHANING', 'fabrication'
+  - [tracing-interest-cache-poisoning] 'what are the remedies for Interest cache poisoning': missing 'ROOT CAUSE'
+  - [warm-lane-plan-json-loss-reconstruction] 'what happens when an architect is re-invoked on task/NNNN': missing 'architect re-invoked', 'CONSOLIDATED'
+
+how the canonical was matched (observations):
+  The registry keys a canonical by content hash first because memory UUIDs rot
+  on re-consolidation, with last_known_id as a disclosed fallback. Which
+  matcher fired is a fixture-health signal: a run drifting toward
+  last_known_id needs re-hashing, and unmatched entries are either genuinely
+  gone or keyed past both.
+  content_hash: 6
+  last_known_id: 0
+  unmatched: 190
+
+which store served the query (observations):
+  MemoryService.search routes: the read router picks a store set per query,
+  and the lists come back homogeneous. A phrasing served entirely by Graphiti
+  cannot contain a Mem0 entry's raw content — Graphiti returns LLM-extracted
+  edge facts — so its canonical is unfindable there however healthy retrieval
+  is. The probe does not pin stores, because an agent's search is routed too;
+  it reports the routing instead, so a rate is never read as a corpus finding
+  when it is a routing one.
+  graphiti: 174
+  mem0: 30
+
+contamination classification:
+  scored results: 490
+  foreign (a DIFFERENT registered topic): 0
+  untopiced (no topic, or one this registry does not know): 489
+  Untopiced results are NOT counted as contamination. The census measured 491
+  of 49,628 entries carrying a topic at all, so treating an unstamped result
+  as foreign would measure stamping coverage while claiming to measure
+  contamination. As 3195/3201 widen the vocabulary this remainder shrinks and
+  the share reaches further, with no change to how it is computed.
+
+what the corpus counts cover:
+  The per-category sizes above come from count_memories_by_metadata, which is
+  an exact Qdrant payload count — a MEM0-SIDE count. The Graphiti-primary
+  categories (decisions_and_rationale, entities_and_relations, temporal_facts)
+  therefore read near zero here even when the graph holds thousands: the
+  number is honest about what was counted and would be misleading about what
+  exists, so it says which it is. The metrics above are unaffected — they are
+  computed over what search returned, not over these counts.
+
+registry composition (32 topics):
+  briefing_query: 1
+  census_topic: 4
+  curator_gate: 20
+  hand: 3
+  topic_guard_cluster: 4
+  derivation ledger — what it produced, and what it left out:
+    census_rows_malformed_count: 0
+    census_rows_malformed_value: 0
+    census_topics_emitted: 49
+    census_topics_skipped_singleton: 303
+    curator_clusters_without_canonical: 0
+    curator_gate_clusters: 20
+    derived_candidates_not_carried: 46
+    slug_collisions_dropped: 0
+    topic_guard_clusters: 5

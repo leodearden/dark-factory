@@ -8,32 +8,38 @@ See task 1372 (lint guard) and task 1339/1313/1064 (migration).
 
 from __future__ import annotations
 
-import importlib.util
+import ast
+import dataclasses
+import inspect
+import re
 import shutil
 import subprocess
-import sys
-import types
-from pathlib import Path
+from collections.abc import Iterable
+from pathlib import Path, PurePosixPath
+from typing import NamedTuple
 
 import pytest
+from _fm_helpers import load_script_module
+from shared.testing_ceiling_anchors import (
+    MAGICMOCK_REPO_SCAN_MEASURED_WORST_SECS,
+    MAGICMOCK_REPO_SCAN_TEST_TIMEOUT,
+)
+from shared.testing_timeout_headroom import UNDER_LOAD_HEADROOM_FACTOR
+from shared.testing_xdist_groups import single_xdist_group
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 # Load the checker script via importlib to avoid sys.path pollution.
 # fused-memory/scripts/ is not on PYTHONPATH per pyproject.toml (pythonpath=['src']).
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'check_bare_magicmock_config.py'
 
 
-def _load_checker() -> types.ModuleType:
-    """Load the checker module from its script path."""
-    spec = importlib.util.spec_from_file_location('check_bare_magicmock_config', SCRIPT_PATH)
-    if spec is None or spec.loader is None:
-        raise ImportError(f'Cannot load {SCRIPT_PATH}')
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)  # type: ignore[union-attr]
-    return module
-
-
-_checker = _load_checker()
+_checker = load_script_module(SCRIPT_PATH, mod_name='check_bare_magicmock_config')
 find_violations = _checker.find_violations
+_lint_cli = load_script_module(SCRIPT_PATH.with_name('_lint_cli.py'))
+_timing_debt = load_script_module(SCRIPT_PATH.with_name('_timing_dependence_debt.py'))
+Violation = _lint_cli.Violation
 
 
 class TestFindViolationsConfigNameDetection:
@@ -389,8 +395,7 @@ def _assert_violation_output(stdout: str, bad_file: Path) -> None:
     Checks: full bad_file path present, mock_orch_config present,
     MagicMock(spec_set=pydantic_spec(...)) present, task 1339 reference present.
 
-    Shared by TestCliExitCodes (sys.executable) and TestStdlibOnlyProof
-    (python3 -I -S) so both tests track the same output contract.
+    Shared by TestCliExitCodes and TestCliBoundary so both track the same output contract.
     """
     assert str(bad_file) in stdout, f'Expected bad_file path in violation output, got: {stdout!r}'
     assert 'mock_orch_config' in stdout, (
@@ -405,35 +410,32 @@ def _assert_violation_output(stdout: str, bad_file: Path) -> None:
 class TestCliExitCodes:
     """CLI exit-code contract: 1 on violations, 0 on clean input."""
 
-    def test_cli_exits_nonzero_and_prints_violations_on_bad_file(self, tmp_path: Path):
-        """Violations file → returncode 1, stdout contains path/alternatives/1339."""
+    def test_cli_exits_nonzero_and_prints_violations_on_bad_file(self, tmp_path: Path, capsys):
+        """Violations file → exit 1, stdout contains path/alternatives/1339."""
         bad_file = tmp_path / 'test_bad.py'
         bad_file.write_text(_VIOLATION_SOURCE)
-        result = subprocess.run(
-            [sys.executable, str(SCRIPT_PATH), str(bad_file)],
-            capture_output=True,
-            text=True,
-        )
-        assert result.returncode == 1
-        _assert_violation_output(result.stdout, bad_file)
+        exit_code = _checker.main([str(bad_file)])
+        assert exit_code == 1
+        _assert_violation_output(capsys.readouterr().out, bad_file)
 
-    def test_cli_exits_zero_on_clean_file(self, tmp_path: Path):
-        """Clean file (exempted) → returncode 0, stdout empty."""
+    def test_cli_exits_zero_on_clean_file(self, tmp_path: Path, capsys):
+        """Clean file (exempted) → exit 0, stdout empty."""
         clean_file = tmp_path / 'test_clean.py'
         clean_file.write_text(_CLEAN_SOURCE)
-        result = subprocess.run(
-            [sys.executable, str(SCRIPT_PATH), str(clean_file)],
-            capture_output=True,
-            text=True,
-        )
-        assert result.returncode == 0
-        assert result.stdout == ''
+        exit_code = _checker.main([str(clean_file)])
+        assert exit_code == 0
+        assert capsys.readouterr().out == ''
 
 
 class TestCliDirectoryScan:
-    """Directory-mode scans test_*.py and conftest.py recursively, ignores other .py files."""
+    """Directory-mode scans test_*.py, conftest.py and _*.py helper modules recursively.
 
-    def test_cli_recursively_scans_directory_for_test_files_and_conftest(self, tmp_path: Path):
+    Every other .py file is ignored.
+    """
+
+    def test_cli_recursively_scans_directory_for_test_files_and_conftest(
+        self, tmp_path: Path, capsys
+    ):
         """Dir scan: test_example.py + conftest.py flagged; other_file.py ignored."""
         subdir = tmp_path / 'sub'
         subdir.mkdir()
@@ -444,16 +446,46 @@ class TestCliDirectoryScan:
         # Should NOT be scanned (not a test_*.py or conftest.py)
         (subdir / 'other_file.py').write_text(_VIOLATION_SOURCE)
 
-        result = subprocess.run(
-            [sys.executable, str(SCRIPT_PATH), str(tmp_path)],
-            capture_output=True,
-            text=True,
-        )
-        assert result.returncode == 1
-        output = result.stdout
+        exit_code = _checker.main([str(tmp_path)])
+        assert exit_code == 1
+        output = capsys.readouterr().out
         assert 'test_example.py' in output
         assert 'conftest.py' in output
         assert 'other_file.py' not in output
+
+
+    def test_cli_scans_underscore_helper_modules(self, tmp_path: Path, capsys):
+        """``_*.py`` helpers are scanned, at any depth; other non-test files still are not."""
+        (tmp_path / '_helper.py').write_text(_VIOLATION_SOURCE)
+        subdir = tmp_path / 'sub'
+        subdir.mkdir()
+        (subdir / '_nested_helper.py').write_text(_VIOLATION_SOURCE)
+        (tmp_path / 'other_file.py').write_text(_VIOLATION_SOURCE)
+
+        exit_code = _checker.main([str(tmp_path)])
+        assert exit_code == 1
+        output = capsys.readouterr().out
+        assert '_helper.py' in output
+        assert '_nested_helper.py' in output
+        assert 'other_file.py' not in output
+
+    def test_discover_scan_targets_returns_the_sorted_union_of_the_three_globs(
+        self, tmp_path: Path
+    ):
+        """The one discovery seam the CLI and the baseline-integrity census both use."""
+        subdir = tmp_path / 'sub'
+        subdir.mkdir()
+        expected = [
+            tmp_path / 'test_a.py',
+            tmp_path / 'conftest.py',
+            tmp_path / '_h.py',
+            subdir / '_n.py',
+            subdir / 'test_b.py',
+        ]
+        for path in [*expected, tmp_path / 'plain.py']:
+            path.write_text('')
+
+        assert _checker.discover_scan_targets(tmp_path) == sorted(expected)
 
 
 class TestCliErrorHandling:
@@ -522,71 +554,73 @@ class TestCliErrorHandling:
         assert 'test_broken.py' in captured.err
         assert 'simulated transient read error' in captured.err
 
+    def test_explicit_non_test_file_is_still_scanned(self, tmp_path: Path, capsys):
+        """An explicit path bypasses the discovery globs: hooks pass staged files as-is."""
+        other = tmp_path / 'other_file.py'
+        other.write_text(_VIOLATION_SOURCE)
 
-class TestStdlibOnlyProof:
-    """Running the script under python3 -I -S proves it imports only stdlib modules.
+        assert _checker.main([str(other)]) == 1
+        assert str(other) in capsys.readouterr().out
 
-    ``python3 -I`` alone does NOT block venv site-packages on this machine (python 3.14,
-    uv-managed venv): ``-I`` only disables *user* site-packages (implies ``-s``), not system
-    or venv site-packages.  ``-I -S`` additionally skips site.py, so venv site-packages are
-    never added to sys.path — any accidental third-party import in the script would raise
-    ModuleNotFoundError at interpreter startup, loudly failing this test.
 
-    Three cases are exercised:
-      1. Empty directory: no test_*.py → exit 0, empty stdout (startup isolation).
-      2. Clean file: parse/scan runs → exit 0, empty stdout (scan path isolation).
-      3. Violation file: exit 1, stdout has violation + alternatives + 1339 (print path).
+class TestCliBoundary:
+    """The checker spawned under ``python3 -I -S``, stricter than any of its call sites.
+
+    hooks/project-checks and every lint_command run a bare ``python3 <script> <paths>``.
+    ``-I -S`` also drops the script's directory and site-packages from sys.path and ignores
+    PYTHON* env vars, so passing here implies passing there. The converse does not hold: a
+    failure that depends on the caller's environment, such as PYTHONPATH, does not reproduce here.
     """
 
-    def test_script_runs_under_isolated_python3_proves_stdlib_only(self, tmp_path: Path):
-        """python3 -I -S three-case stdlib-only proof."""
+    def test_isolated_python3_spawn_is_stdlib_only_and_reports_every_rule(self, tmp_path: Path):
+        """The single test that crosses the process boundary the nine call sites cross.
+
+        ``-I -S`` keeps venv site-packages off sys.path, so a third-party import anywhere in
+        any rule's path fails startup. A startup crash also exits 1, but with empty stdout, so
+        the stdout assertions are what make rc == 1 meaningful. Every other CLI behaviour is
+        driven in process through main().
+        """
         if shutil.which('python3') is None:
             pytest.skip('python3 not found on PATH — cannot verify hook runtime assumption')
 
-        # --- Case 1: empty directory (startup + import isolation) ---
+        rule_a_file = tmp_path / 'test_rule_a.py'
+        rule_a_file.write_text(_VIOLATION_SOURCE)
+        rule_b_file = tmp_path / 'test_rule_b.py'
+        rule_b_file.write_text(_TASK_3980_SHAPE)
+        rule_c_file = tmp_path / 'test_rule_c.py'
+        rule_c_file.write_text(_RULE_C_SOURCE)
+        rule_d_file = tmp_path / 'test_rule_d.py'
+        rule_d_file.write_text(_RULE_D_SOURCE)
+        (tmp_path / 'test_clean.py').write_text(_CLEAN_SOURCE)
+
         result = subprocess.run(
             ['python3', '-I', '-S', str(SCRIPT_PATH), str(tmp_path)],
             capture_output=True,
             text=True,
         )
-        assert result.returncode == 0, (
-            f'Script exited non-zero under python3 -I -S:\n'
+
+        assert result.returncode == 1, (
+            f'expected exit 1 under python3 -I -S, got {result.returncode}:\n'
             f'  stdout: {result.stdout!r}\n'
             f'  stderr: {result.stderr!r}'
         )
-        assert result.stdout == '', (
-            f'Expected empty stdout (no scan targets in empty dir), got: {result.stdout!r}'
+        assert 'Traceback' not in result.stderr, result.stderr
+        _assert_violation_output(result.stdout, rule_a_file)
+        reported = result.stdout.splitlines()
+        rule_b_report = [line for line in reported if line.startswith(f'{rule_b_file}:')]
+        rule_c_report = [line for line in reported if line.startswith(f'{rule_c_file}:')]
+        rule_d_report = [line for line in reported if line.startswith(f'{rule_d_file}:')]
+        for needle in ('bare-dataclass-double', 'VerifyResult', 'fake_verify_result', 'verify_skipped'):
+            assert any(needle in line for line in rule_b_report), (
+                f'expected {needle!r} on a {rule_b_file.name} line; got: {result.stdout!r}'
+            )
+        assert any('wall-clock-deadline' in line for line in rule_c_report), (
+            f'expected a wall-clock-deadline report for {rule_c_file.name}; got: {result.stdout!r}'
         )
-
-        # --- Case 2: clean file (parse/scan path isolation) ---
-        clean_file = tmp_path / 'test_clean.py'
-        clean_file.write_text(_CLEAN_SOURCE)
-        result2 = subprocess.run(
-            ['python3', '-I', '-S', str(SCRIPT_PATH), str(tmp_path)],
-            capture_output=True,
-            text=True,
+        assert any('timing-dependence' in line for line in rule_d_report), (
+            f'expected a timing-dependence report for {rule_d_file.name}; got: {result.stdout!r}'
         )
-        assert result2.returncode == 0, (
-            f'Script exited non-zero (clean scan) under python3 -I -S:\n'
-            f'  stdout: {result2.stdout!r}\n'
-            f'  stderr: {result2.stderr!r}'
-        )
-        assert result2.stdout == '', f'Expected empty stdout (clean file), got: {result2.stdout!r}'
-
-        # --- Case 3: violation file (print-violations branch isolation) ---
-        bad_file = tmp_path / 'test_bad.py'
-        bad_file.write_text(_VIOLATION_SOURCE)
-        result3 = subprocess.run(
-            ['python3', '-I', '-S', str(SCRIPT_PATH), str(bad_file)],
-            capture_output=True,
-            text=True,
-        )
-        assert result3.returncode == 1, (
-            f'Script should exit 1 under python3 -I -S, got {result3.returncode}:\n'
-            f'  stdout: {result3.stdout!r}\n'
-            f'  stderr: {result3.stderr!r}'
-        )
-        _assert_violation_output(result3.stdout, bad_file)
+        assert 'test_clean.py' not in result.stdout
 
 
 class TestHooksIntegration:
@@ -594,7 +628,7 @@ class TestHooksIntegration:
 
     def test_hook_invokes_check_with_python3_not_uv_run(self):
         """The bare-magicmock check invocation must use a python3 token, not uv run,
-        and the gate must target the five test directories.
+        and the gate must select staged files from MAGICMOCK_TEST_DIRS.
 
         Word-boundary regex r'\\bpython3(?:\\.\\d+)?\\b' accepts plain `python3`,
         versioned `python3.11`, and absolute paths, while rejecting `mypython3`.
@@ -604,16 +638,15 @@ class TestHooksIntegration:
         name must appear in the non-comment portion of the line. This excludes both
         full-line bash comments and inline comments.
 
-        Scan-dir coverage: commit 2a527c12c9 ("scope pre-commit to staged diff")
-        moved the five scan directories off the script-invocation line and onto the
-        `git diff --cached ... -- <dirs>` selection line (the `staged_mm=`
-        assignment); matching staged files are then piped to the script via xargs.
-        The directories therefore live on the selection line, not the invocation
-        line, so the coverage assertion scans the whole gate (selection +
-        invocation lines), each via its non-comment portion (`line.split('#')[0]`)
-        so comment-only occurrences don't satisfy it.
+        Scan-dir coverage: the gate selects staged files with
+        `git diff --cached ... -- "${MAGICMOCK_TEST_DIRS[@]}"` (the `staged_mm=`
+        assignment) and pipes them to the script via xargs. Which directories that
+        array names is pinned against the merge gate by
+        tests/scripts/test_hook_magicmock_test_dirs_drift.py (task 6308); this test
+        only asserts the gate block (selection through invocation, non-comment
+        portions) actually expands that array.
         """
-        import re as _re  # noqa: PLC0415 — avoid polluting module namespace
+        import re as _re  # avoid polluting module namespace
 
         hooks_path = Path(__file__).parent.parent.parent / 'hooks' / 'project-checks'
         content = hooks_path.read_text(encoding='utf-8')
@@ -632,14 +665,6 @@ class TestHooksIntegration:
             assert 'uv run' not in line, (
                 f'Found uv run in bare-magicmock check invocation (should use plain python3): {line!r}'
             )
-        # Assert ALL five configured scan directories appear in the bare-magicmock
-        # gate. The gate is the contiguous block that begins at the staged-file
-        # selection (`staged_mm=` — a multi-line `git diff --cached ... -- <dirs>`
-        # whose `-- <dirs>` pathspec carries the five directories on a backslash
-        # continuation line) and ends at the script-invocation line. Scanning the
-        # whole block (each line's non-comment portion) keeps a drop of any single
-        # directory immediately catchable regardless of which continuation line
-        # carries the pathspec.
         all_lines = content.splitlines()
         start_idx = next(
             (i for i, line in enumerate(all_lines) if 'staged_mm=' in line.split('#')[0]),
@@ -660,43 +685,2415 @@ class TestHooksIntegration:
         gate_code = '\n'.join(
             line.split('#')[0] for line in all_lines[start_idx : end_idx + 1]
         )
-        _EXPECTED_SCAN_DIRS = [
-            'shared/tests',
-            'escalation/tests',
-            'fused-memory/tests',
-            'orchestrator/tests',
-            'dashboard/tests',
-        ]
-        for expected_dir in _EXPECTED_SCAN_DIRS:
-            assert expected_dir in gate_code, (
-                f'Expected scan target {expected_dir!r} in the bare-magicmock gate '
-                f'(staged_mm selection + check_bare_magicmock_config.py invocation) '
-                f'in hooks/project-checks, got: {gate_code!r}'
+        assert '"${MAGICMOCK_TEST_DIRS[@]}"' in gate_code, (
+            'Expected the bare-magicmock gate (staged_mm selection + '
+            'check_bare_magicmock_config.py invocation) in hooks/project-checks to '
+            f'select from "${{MAGICMOCK_TEST_DIRS[@]}}", got: {gate_code!r}'
+        )
+
+
+# ===========================================================================
+# Rule B — `bare-dataclass-double` (task 4016)
+#
+# A SECOND, independently-named rule carried by the same script: a
+# position-blind walk flagging unspecced MagicMocks shaped like a registered
+# stdlib dataclass (VerifyResult today).  Rule A (`bare-magicmock`, config-name,
+# Assign/AnnAssign-only) is unchanged; every test above this banner pins it.
+# ===========================================================================
+
+def _fingerprinted_class(name: str) -> type:
+    """The class named *name* among those the gate-identity wire fingerprint hashes.
+
+    Imported here, not at module top, so an import-time break in orchestrator
+    fails only the tests that read it rather than collection of this whole suite.
+    """
+    from orchestrator.remote_gate import wire_classes
+
+    matches = [cls for cls in wire_classes() if cls.__qualname__ == name]
+    assert len(matches) == 1, (
+        f'orchestrator/src/orchestrator/remote_gate.py::wire_classes must hold exactly '
+        f'one class named {name!r}; got {matches}'
+    )
+    return matches[0]
+
+
+@pytest.fixture
+def verify_result_field_names() -> frozenset[str]:
+    """VerifyResult's real field names, read from the class the wire fingerprint hashes."""
+    return frozenset(f.name for f in dataclasses.fields(_fingerprinted_class('VerifyResult')))
+
+
+class TestDataclassShapeRegistry:
+    """The `_DATACLASS_SHAPES` registry that drives Rule B's anchor+overlap match."""
+
+    def test_registry_exists_and_is_a_nonempty_tuple(self):
+        """_DATACLASS_SHAPES is a non-empty tuple (immutable — the rule's whole input)."""
+        shapes = _checker._DATACLASS_SHAPES
+        assert isinstance(shapes, tuple), (
+            f'_DATACLASS_SHAPES must be a tuple (immutable registry); got {type(shapes)}'
+        )
+        assert shapes, '_DATACLASS_SHAPES must not be empty — Rule B would match nothing'
+
+    def test_registry_holds_exactly_the_verify_result_entry_today(self):
+        """v1 registers exactly one shape: VerifyResult."""
+        names = [s.name for s in _checker._DATACLASS_SHAPES]
+        assert names == ['VerifyResult'], (
+            f'v1 registers exactly one shape (VerifyResult); got {names}. '
+            'Adding a shape is a deliberate widening — update this test with it.'
+        )
+
+    def test_registry_names_no_stale_verify_result_field(self, verify_result_field_names):
+        """Every registered field is one VerifyResult really has, read at runtime.
+
+        The script must stay stdlib-only, so the registry derives its fields from
+        ``shape.home`` with ``dataclass_field_names``; a stale name means that reader
+        disagrees with ``dataclasses.fields``.  This test owns the STALE direction; the
+        MISSING direction is owned by
+        test_every_real_field_counts_toward_the_overlap_floor, so one drift fails once.
+        """
+        shape = _checker._DATACLASS_SHAPES[0]
+        stale = sorted(shape.fields - verify_result_field_names)
+        assert stale == [], (
+            'the registry reader disagrees with dataclasses.fields: '
+            f'orchestrator/src/orchestrator/verify.py::VerifyResult has no such field: {stale}; '
+            'fix fused-memory/scripts/check_bare_magicmock_config.py::dataclass_field_names'
+        )
+        assert isinstance(shape.fields, frozenset), (
+            f'fields must be a frozenset for cheap set algebra; got {type(shape.fields)}'
+        )
+
+    def test_verify_result_anchor_is_passed(self):
+        """anchors == {'passed'} — VerifyResult's first field and the census tell."""
+        shape = _checker._DATACLASS_SHAPES[0]
+        assert shape.anchors == frozenset({'passed'}), (
+            f"VerifyResult's anchor must be exactly {{'passed'}}; got {set(shape.anchors)}"
+        )
+
+    def test_every_real_field_counts_toward_the_overlap_floor(self, verify_result_field_names):
+        """Each real non-anchor field, paired with ``passed``, flags exactly one double.
+
+        The behavioural consequence of the registry: a field VerifyResult has but the
+        registry lacks would not count toward ``min_field_matches``, so a double built
+        from it would slip through.  The registry derives its fields from
+        ``shape.home`` with ``dataclass_field_names``, so a missing name means that
+        reader disagrees with ``dataclasses.fields``.
+        """
+        unflagged = []
+        for name in sorted(verify_result_field_names):
+            if name == 'passed':
+                continue
+            source = f'm = MagicMock(passed=True, {name}=None)\n'
+            violations = find_violations(source, _NON_DEBT_FILE)
+            if len(violations) != 1 or 'bare-dataclass-double' not in violations[0].message:
+                unflagged.append(name)
+        assert unflagged == [], (
+            'these VerifyResult fields do not count toward Rule B\'s overlap floor, so '
+            f'the registry reader disagrees with dataclasses.fields: {unflagged}; fix '
+            'fused-memory/scripts/check_bare_magicmock_config.py::dataclass_field_names'
+        )
+
+    def test_verify_result_min_field_matches_is_two(self):
+        """min_field_matches == 2 — the overlap floor that rejects a lone MagicMock(passed=True)."""
+        shape = _checker._DATACLASS_SHAPES[0]
+        assert shape.min_field_matches == 2, (
+            f'min_field_matches must be 2 (measured overlap floor); got {shape.min_field_matches}'
+        )
+
+    def test_anchors_are_a_subset_of_fields_for_every_shape(self):
+        """An anchor outside its own field set could never be reached by the overlap floor.
+
+        anchors ⊄ fields would be a silently dead registry entry: the anchor gate
+        could pass while contributing nothing toward min_field_matches, making the
+        effective floor stricter than declared.  Asserted for EVERY shape so a
+        future registration cannot introduce the defect.
+        """
+        for shape in _checker._DATACLASS_SHAPES:
+            assert shape.anchors <= shape.fields, (
+                f'{shape.name}: anchors must be a subset of fields; '
+                f'stray anchors={sorted(shape.anchors - shape.fields)}'
+            )
+
+    def test_every_shape_names_its_home_and_factory_remedy(self):
+        """Each shape carries the provenance the violation message is built from."""
+        for shape in _checker._DATACLASS_SHAPES:
+            assert shape.home, f'{shape.name}: home must be set (message provenance)'
+            assert shape.factory, f'{shape.name}: factory must name the canonical remedy'
+            assert shape.factory_home, (
+                f'{shape.name}: factory_home must name the file defining {shape.factory}'
+            )
+        verify_result = _checker._DATACLASS_SHAPES[0]
+        assert verify_result.factory == 'fake_verify_result'
+        assert verify_result.factory_home == 'orchestrator/tests/_verify_result_doubles.py'
+
+    def test_message_cites_the_file_defining_the_fingerprinted_verify_result(self):
+        """Rule B reads the VerifyResult the wire fingerprint hashes, and cites its file."""
+        source_file = inspect.getsourcefile(_fingerprinted_class('VerifyResult'))
+        assert source_file is not None, 'VerifyResult has no Python source file'
+        defining = Path(source_file).resolve().relative_to(_REPO_ROOT.resolve()).as_posix()
+        message = find_violations(_TASK_3980_SHAPE, 'test_3980.py')[0].message
+        assert f'{defining}::VerifyResult' in message, (
+            f'Rule B must read the VerifyResult defined in {defining}, the class '
+            'orchestrator/src/orchestrator/remote_gate.py::wire_classes fingerprints; '
+            f'got {message!r}'
+        )
+
+    def test_the_registered_factory_is_defined_at_its_registered_home(self):
+        """The printed remedy names a helper that really exists where it says.
+
+        Parsed, never imported: the home is an orchestrator test helper, and this
+        guard must not depend on that package's import path.
+        """
+        for shape in _checker._DATACLASS_SHAPES:
+            home = _REPO_ROOT / shape.factory_home
+            assert home.is_file(), (
+                f'{shape.name}: factory_home {shape.factory_home!r} is not a file; '
+                'update `_DATACLASS_SHAPES` in '
+                'fused-memory/scripts/check_bare_magicmock_config.py'
+            )
+            module = ast.parse(home.read_text(encoding='utf-8'))
+            top_level_functions = {
+                node.name for node in module.body if isinstance(node, ast.FunctionDef)
+            }
+            assert shape.factory in top_level_functions, (
+                f'{shape.name}: factory {shape.factory!r} is not a top-level function '
+                f'of {shape.factory_home!r}; update `_DATACLASS_SHAPES` in '
+                'fused-memory/scripts/check_bare_magicmock_config.py'
             )
 
 
-class TestFusedMemoryTestsDirectoryClean:
-    """Regression guard: fused-memory/tests must have zero bare MagicMock() config sites.
+class TestDataclassDoublePositionBlindness:
+    """Rule B flags a VerifyResult-shaped double in ANY syntactic position.
 
-    Task 1531 migrated all 26 violation sites in fused-memory/tests off bare
-    MagicMock() and onto MagicMock(spec_set=pydantic_spec(FusedMemoryConfig)).
-    This test re-runs the hook script against the real fused-memory/tests
-    directory so that any future reintroduction is caught at pytest time (not
-    only at commit time, since the hook is repo-wide and operators may skip it
-    locally).
+    Position-blindness is the whole point of the widening: Rule A inspects only
+    ast.Assign/ast.AnnAssign, so all ten ``return MagicMock(...)`` sites behind
+    task 3980 were invisible to it.
     """
 
-    def test_fused_memory_tests_directory_has_zero_violations(self):
-        """Running the checker against fused-memory/tests must exit 0 with empty stdout."""
-        tests_dir = Path(__file__).parent
-        result = subprocess.run(
-            [sys.executable, str(SCRIPT_PATH), str(tests_dir)],
-            capture_output=True,
-            text=True,
+    def test_flags_double_in_return_position(self):
+        """return MagicMock(passed=..., summary=...) → 1 violation (the exact 3980 shape)."""
+        source = "def f():\n    return MagicMock(passed=False, summary='x')\n"
+        violations = find_violations(source, 'test_return.py')
+        assert len(violations) == 1, (
+            'A VerifyResult-shaped double in RETURN position must be flagged — this is '
+            f'the exact shape task 3980 removed from ten sites; got {violations}'
         )
-        assert result.returncode == 0, (
-            f'check_bare_magicmock_config found violations in fused-memory/tests '
-            f'(task 1531 regression). Fix by wrapping each bare MagicMock() config '
-            f'with MagicMock(spec_set=pydantic_spec(FusedMemoryConfig)).\n'
-            f'Violations:\n{result.stdout}'
+        v = violations[0]
+        assert v.lineno == 2, f'violation anchors at the MagicMock( line; got {v.lineno}'
+
+    def test_flags_double_assigned_to_a_non_config_name(self):
+        """bare = MagicMock(passed=..., summary=...) → 1 violation (Rule A's name gate bypassed).
+
+        ``bare`` is not config/cfg/*_config/*_cfg, so Rule A ignores it entirely.
+        Rule B does not consult the binding name at all.
+        """
+        source = "bare = MagicMock(passed=False, summary='x')\n"
+        violations = find_violations(source, 'test_nonconfig_name.py')
+        assert len(violations) == 1, (
+            "Rule A's config-name gate must not apply to Rule B; a double bound to a "
+            f'non-config name must still be flagged; got {violations}'
         )
+
+    def test_flags_double_in_call_argument_position(self):
+        """handler(MagicMock(passed=..., summary=...)) → 1 violation (argument position)."""
+        source = "handler(MagicMock(passed=True, summary='x'))\n"
+        violations = find_violations(source, 'test_argpos.py')
+        assert len(violations) == 1, (
+            f'A double passed directly as a call argument must be flagged; got {violations}'
+        )
+
+    def test_flags_double_inside_comprehension_and_lambda(self):
+        """A double buried in a comprehension body and in a lambda body is still flagged."""
+        comprehension = "doubles = [MagicMock(passed=True, summary='x') for _ in range(3)]\n"
+        violations = find_violations(comprehension, 'test_comprehension.py')
+        assert len(violations) == 1, (
+            f'A double constructed inside a comprehension must be flagged; got {violations}'
+        )
+
+        lam = "make = lambda: MagicMock(passed=False, summary='x')\n"
+        violations = find_violations(lam, 'test_lambda.py')
+        assert len(violations) == 1, (
+            f'A double constructed inside a lambda body must be flagged; got {violations}'
+        )
+
+    def test_return_position_violation_carries_rule_b_remedy_not_rule_a(self):
+        """A Rule B violation speaks Rule B's vocabulary, never _VIOLATION_MSG."""
+        source = "def f():\n    return MagicMock(passed=False, summary='x')\n"
+        violations = find_violations(source, 'test_msg_split.py')
+        assert len(violations) == 1
+        message = violations[0].message
+        assert message != _checker._VIOLATION_MSG, (
+            "Rule B must not reuse Rule A's message — the remedies are unrelated "
+            '(mock_orch_config/pydantic_spec vs fake_verify_result/spec=VerifyResult)'
+        )
+        assert 'bare-dataclass-double' in message, (
+            f"Rule B's message must name its own noqa code; got {message!r}"
+        )
+
+
+class TestDataclassDoubleNegatives:
+    """Precision: shapes Rule B must NOT flag, drawn from the measured repo-wide census.
+
+    Each negative below corresponds to a real construction pattern that occurs in the
+    seven scanned tests/ directories.  A rule that flagged any of them would be
+    unshippable — hence the positive floor case at the end, which makes it impossible
+    to satisfy this class with a rule that simply flags nothing.
+    """
+
+    def test_positive_floor_case_still_flags(self):
+        """MagicMock(passed=True, summary='x') → 1 violation (anchor + exactly 2 fields).
+
+        Asserted FIRST so the negatives below cannot be trivially satisfied by a
+        rule that matches nothing at all.
+        """
+        source = "d = MagicMock(passed=True, summary='x')\n"
+        violations = find_violations(source, 'test_floor.py')
+        assert len(violations) == 1, (
+            'anchor present + exactly min_field_matches fields must flag; '
+            f'got {violations}'
+        )
+
+    def test_spec_keyword_exempts(self):
+        """MagicMock(spec=VerifyResult, passed=..., summary=...) → 0 violations."""
+        source = "d = MagicMock(spec=VerifyResult, passed=False, summary='x')\n"
+        assert find_violations(source, 'test_spec_kw.py') == []
+
+    def test_spec_set_keyword_exempts(self):
+        """MagicMock(spec_set=VerifyResult, passed=..., summary=...) → 0 violations."""
+        source = "d = MagicMock(spec_set=VerifyResult, passed=False, summary='x')\n"
+        assert find_violations(source, 'test_spec_set_kw.py') == []
+
+    def test_positional_spec_exempts(self):
+        """MagicMock(VerifyResult, passed=..., summary=...) → 0 (first positional IS spec)."""
+        source = "d = MagicMock(VerifyResult, passed=False, summary='x')\n"
+        assert find_violations(source, 'test_positional_spec.py') == [], (
+            "MagicMock's first positional argument IS spec — a positionally-specced "
+            'double is the remedy, not a violation'
+        )
+
+    def test_single_field_is_below_the_overlap_floor(self):
+        """MagicMock(passed=True) alone → 0 violations (anchor present, only 1 field).
+
+        This is precisely what the overlap floor buys: a stray ``passed=`` on an
+        unrelated object (a fake process result, a predicate double) is not a
+        VerifyResult impersonation.
+        """
+        source = 'd = MagicMock(passed=True)\n'
+        violations = find_violations(source, 'test_one_field.py')
+        assert violations == [], (
+            'a lone passed= kwarg is below the 2-field overlap floor and must NOT '
+            f'flag; got {violations}'
+        )
+
+    def test_return_value_kwarg_does_not_flag(self):
+        """MagicMock(return_value=x) → 0 violations (660 unspecced occurrences repo-wide)."""
+        source = 'd = MagicMock(return_value=sentinel)\n'
+        assert find_violations(source, 'test_return_value.py') == []
+
+    def test_side_effect_kwarg_does_not_flag(self):
+        """MagicMock(side_effect=e) → 0 violations (161 unspecced occurrences repo-wide)."""
+        source = 'd = MagicMock(side_effect=RuntimeError("boom"))\n'
+        assert find_violations(source, 'test_side_effect.py') == []
+
+    def test_plain_mock_is_not_targeted(self):
+        """Mock(passed=..., summary=...) → 0 violations (only MagicMock is targeted)."""
+        source = "d = Mock(passed=False, summary='x')\n"
+        assert find_violations(source, 'test_plain_mock_shape.py') == []
+
+    def test_async_mock_is_not_targeted(self):
+        """AsyncMock(passed=..., summary=...) → 0 violations (only MagicMock is targeted)."""
+        source = "d = AsyncMock(passed=False, summary='x')\n"
+        assert find_violations(source, 'test_async_mock_shape.py') == []
+
+    def test_kwargs_spread_alone_does_not_flag(self):
+        """MagicMock(**kw) → 0 violations (no LITERAL anchor kwarg is visible).
+
+        A ``**spread`` contributes a keyword whose ``.arg`` is None.  Rule B matches on
+        literal kwarg NAMES only, so a spread can never satisfy the anchor gate.
+        (Rule A's separate, conservative stance — flagging ``config = MagicMock(**kw)``
+        as unspecced — is unaffected and pinned by its own test above.)
+        """
+        source = 'd = MagicMock(**kw)\n'
+        violations = find_violations(source, 'test_spread_only.py')
+        assert violations == [], (
+            f'a **kwargs spread exposes no literal anchor name and must not flag; got {violations}'
+        )
+
+    def test_two_real_fields_without_the_anchor_does_not_flag(self):
+        """MagicMock(summary='x', timed_out=False) → 0 violations (anchor absent).
+
+        Two genuine VerifyResult field names are matched, but ``passed`` — the anchor
+        — is missing, so the overlap floor alone must not be sufficient.
+        """
+        source = "d = MagicMock(summary='x', timed_out=False)\n"
+        violations = find_violations(source, 'test_no_anchor.py')
+        assert violations == [], (
+            'the anchor gate is mandatory — two field matches without passed= must '
+            f'NOT flag; got {violations}'
+        )
+
+
+# The verbatim shape task 3980 removed from ten sites, preserved at
+# orchestrator/tests/test_merge_speculation.py::TestDispositionDoubleFidelity.test_bare_double_makes_classifier_fail_open.
+# Note `verify_skipped=`, which is a MergeOutcome field
+# (orchestrator/src/orchestrator/merge_types.py::MergeOutcome.verify_skipped), NOT a
+# VerifyResult field — a bare MagicMock accepts it without objection. This is the case
+# the "kwargs are a subset of the dataclass's fields" rule would have MISSED.
+_TASK_3980_SHAPE = (
+    'def make():\n'
+    '    return MagicMock(\n'
+    "        passed=False, summary='tests failed', test_output='FAIL',\n"
+    "        lint_output='', type_output='', category='', timed_out=False,\n"
+    '        verify_skipped=False,\n'
+    '    )\n'
+)
+
+
+class TestDataclassDoubleMessage:
+    """Rule B's violation message: names the shape, the drift, the remedy, and its own code."""
+
+    def test_task_3980_shape_is_flagged_despite_a_non_field_kwarg(self):
+        """The verbatim 3980 shape flags — the regression-critical case a subset rule misses.
+
+        ``verify_skipped`` is not a VerifyResult field, so ``kwargs <= fields`` is FALSE
+        here. Under the anchor+overlap rule the non-field kwarg is drift evidence, not
+        an exemption, and the site is correctly flagged.
+        """
+        violations = find_violations(_TASK_3980_SHAPE, 'test_3980.py')
+        assert len(violations) == 1, (
+            'the verbatim task-3980 shape MUST be flagged; a non-field kwarg is drift '
+            f'evidence, never an exemption. got {violations}'
+        )
+
+    def test_message_names_shape_remedy_and_origin_tasks(self):
+        """The message names VerifyResult, both remedies, dataclasses.fields, and 3477/3980."""
+        message = find_violations(_TASK_3980_SHAPE, 'test_3980.py')[0].message
+        for needle in (
+            'VerifyResult',
+            'fake_verify_result',
+            'orchestrator/tests/_verify_result_doubles.py',
+            'spec=VerifyResult',
+            'dataclasses.fields',
+            '3477',
+            '3980',
+        ):
+            assert needle in message, (
+                f'Rule B message must name {needle!r} so the remedy is actionable '
+                f'without leaving the error; got {message!r}'
+            )
+
+    def test_message_names_the_drift_kwarg(self):
+        """The message calls out `verify_skipped` as not-a-VerifyResult-field.
+
+        Naming the specific unknown kwarg is what turns the message from "this looks
+        wrong" into evidence: it is the strongest signal that the double has drifted
+        from the type it impersonates.
+        """
+        message = find_violations(_TASK_3980_SHAPE, 'test_3980.py')[0].message
+        assert 'verify_skipped' in message, (
+            f'the drift kwarg must be named as evidence; got {message!r}'
+        )
+
+    def test_message_does_not_leak_rule_a_pydantic_vocabulary(self):
+        """Rule A's pydantic remedies must not appear in a stdlib-dataclass message.
+
+        ``pydantic_spec`` reads ``model_fields`` and requires a BaseModel — it is
+        unusable for VerifyResult. Offering it here would send the reader down a
+        dead end.
+        """
+        message = find_violations(_TASK_3980_SHAPE, 'test_3980.py')[0].message
+        for forbidden in ('mock_orch_config', 'pydantic_spec'):
+            assert forbidden not in message, (
+                f"Rule A's {forbidden!r} must not leak into Rule B's message — it is "
+                f'unusable for a stdlib dataclass; got {message!r}'
+            )
+
+    def test_message_instructs_the_rule_b_noqa_code(self):
+        """The message tells the reader the correct, rule-specific suppression code."""
+        message = find_violations(_TASK_3980_SHAPE, 'test_3980.py')[0].message
+        assert '# noqa: bare-dataclass-double' in message, (
+            f'the message must instruct the Rule B noqa code verbatim; got {message!r}'
+        )
+
+
+_RULE_B_SOURCE = "bare = MagicMock(passed=False, summary='x')\n"
+_RULE_A_SOURCE = 'config = MagicMock()\n'
+
+
+class TestDataclassDoubleExemption:
+    """Rule B honours its OWN noqa code, on the preceding non-blank line, with a reason.
+
+    The two rules deliberately do NOT share a suppression code: their remedies are
+    unrelated, so a pragma written for one is never informed consent for the other.
+    """
+
+    def test_em_dash_exemption_suppresses_rule_b(self):
+        """# noqa: bare-dataclass-double — reason above the call → 0 violations."""
+        source = '# noqa: bare-dataclass-double — deliberate mutation leg\n' + _RULE_B_SOURCE
+        assert find_violations(source, 'test_b_exempt.py') == []
+
+    def test_ascii_hyphen_exemption_suppresses_rule_b(self):
+        """ASCII-hyphen separator is accepted, same as Rule A."""
+        source = '# noqa: bare-dataclass-double - deliberate mutation leg\n' + _RULE_B_SOURCE
+        assert find_violations(source, 'test_b_exempt_hyphen.py') == []
+
+    def test_exemption_tolerates_intervening_blank_lines(self):
+        """Blank lines between the pragma and the call are tolerated."""
+        source = (
+            '# noqa: bare-dataclass-double — deliberate mutation leg\n\n    \n' + _RULE_B_SOURCE
+        )
+        assert find_violations(source, 'test_b_exempt_blank.py') == []
+
+    def test_no_exemption_without_a_reason(self):
+        """# noqa: bare-dataclass-double with no reason after the separator → still flagged."""
+        for header in (
+            '# noqa: bare-dataclass-double\n',
+            '# noqa: bare-dataclass-double —\n',
+        ):
+            violations = find_violations(header + _RULE_B_SOURCE, 'test_b_no_reason.py')
+            assert len(violations) == 1, (
+                f'a reasonless pragma must NOT suppress Rule B; header={header!r} '
+                f'gave {violations}'
+            )
+
+    def test_intervening_code_line_breaks_the_exemption(self):
+        """A non-blank, non-matching line between pragma and call breaks the exemption."""
+        source = (
+            '# noqa: bare-dataclass-double — a reason\nsome_code = 42\n' + _RULE_B_SOURCE
+        )
+        assert len(find_violations(source, 'test_b_broken.py')) == 1
+
+    def test_inline_trailing_exemption_is_not_honored(self):
+        """Inline trailing placement is not honored for Rule B either."""
+        source = (
+            "bare = MagicMock(passed=False, summary='x')"
+            '  # noqa: bare-dataclass-double — inline\n'
+        )
+        assert len(find_violations(source, 'test_b_inline.py')) == 1, (
+            'only the nearest PRECEDING non-blank line is consulted, for both rules'
+        )
+
+    def test_rule_a_code_does_not_suppress_rule_b(self):
+        """CROSS-RULE ISOLATION: # noqa: bare-magicmock must NOT suppress a Rule B violation.
+
+        Otherwise a pragma written years ago for a config assignment would silently
+        exempt a VerifyResult-shaped double that later lands on the following line.
+        """
+        source = '# noqa: bare-magicmock — legacy config exemption\n' + _RULE_B_SOURCE
+        violations = find_violations(source, 'test_cross_a_to_b.py')
+        assert len(violations) == 1, (
+            "Rule A's noqa code must not suppress Rule B — the remedies are unrelated, "
+            f'so it is not informed consent; got {violations}'
+        )
+
+    def test_rule_b_code_does_not_suppress_rule_a(self):
+        """CROSS-RULE ISOLATION, the other direction: bare-dataclass-double ⊅ bare-magicmock."""
+        source = '# noqa: bare-dataclass-double — a reason\n' + _RULE_A_SOURCE
+        violations = find_violations(source, 'test_cross_b_to_a.py')
+        assert len(violations) == 1, (
+            f"Rule B's noqa code must not suppress a Rule A violation; got {violations}"
+        )
+
+    def test_rule_a_exemption_still_works_unchanged(self):
+        """Regression pin: keying ``_lint_cli.py::is_exempted`` on a code did not change Rule A."""
+        source = '# noqa: bare-magicmock — needed for legacy fixture migration\n' + _RULE_A_SOURCE
+        assert find_violations(source, 'test_a_still_exempt.py') == [], (
+            "Rule A's own exemption must remain bit-identical after parameterisation"
+        )
+
+
+_REPO_ROOT = Path(__file__).parent.parent.parent
+
+
+class TestRuleBIsUnconditional:
+    """Rule B has no suppression channel but the per-site pragma (task 4354).
+
+    Rule B shipped behind a shrink-only per-file debt baseline because 95 pre-existing
+    sites across 11 files would otherwise have turned orchestrator/tests' lint_command
+    red on day one and stalled the merge lane repo-wide.  All 95 are migrated, and the
+    baseline is gone.  What this class prevents is its RETURN: a per-file budget is
+    invisible at the offending site, so re-grandfathering a path would silently
+    re-cover doubles no reader of that file could tell were covered.
+    """
+
+    # The eleven paths that carried the retired baseline.  Literals on purpose: there
+    # is no source constant left to mirror, and these are precisely the paths a
+    # re-grandfathering would reach for.
+    _FORMERLY_GRANDFATHERED_PATHS = (
+        'orchestrator/tests/test_merge_queue.py',
+        'orchestrator/tests/test_merge_item_union.py',
+        'orchestrator/tests/test_concurrent_verify_boundary.py',
+        'orchestrator/tests/test_merge_queue_permit_conservation.py',
+        'orchestrator/tests/test_merge_queue_resolve_release.py',
+        'orchestrator/tests/test_merge_queue_request_liveness.py',
+        'orchestrator/tests/test_coalesce_integration_gate.py',
+        'orchestrator/tests/test_merge_queue_equivalence.py',
+        'orchestrator/tests/test_merge_queue_lifecycle_registry.py',
+        'orchestrator/tests/test_merge_queue_metrics.py',
+        'orchestrator/tests/test_merge_queue_single_writer_asserts.py',
+    )
+
+    @staticmethod
+    def _assert_reports_three_plain_hits(path: str, why: str) -> None:
+        """Three offending sites at *path* must yield three PLAIN Rule B hits.
+
+        Three rather than one because a residual budget of 1 or 2 would still let a
+        single site through: only a count that exceeds any plausible leftover budget
+        distinguishes "no suppression" from "suppressed just under the wire".
+        """
+        violations = _rule_b(_RULE_B_SOURCE * 3, path)
+        assert len(violations) == 3, (
+            f'{path} must report every Rule B site in full — {why}; got {violations}'
+        )
+        for violation in violations:
+            assert 'fake_verify_result' in violation.message, (
+                f'{path} must report a PLAIN Rule B hit carrying the migration remedy; '
+                f'got {violation.message!r}'
+            )
+            assert 'debt baseline' not in violation.message, (
+                f'{path} reported a debt-baseline OVERRUN, so some budget is still '
+                f'suppressing Rule B there; got {violation.message!r}'
+            )
+
+    def test_every_formerly_grandfathered_path_reports_rule_b_in_full(self):
+        """No residual suppression survives at any of the eleven migrated paths."""
+        for path in self._FORMERLY_GRANDFATHERED_PATHS:
+            self._assert_reports_three_plain_hits(
+                path, 'its baseline entry was retired by task 4354'
+            )
+
+    def test_a_rule_c_debt_file_reports_rule_b_in_full(self):
+        """Rule C's surviving baseline must not shadow Rule B at its own debt paths."""
+        entry, _budget = _live_rule_c_debt_entry()
+        self._assert_reports_three_plain_hits(
+            entry, "Rule C's baseline grandfathers wall-clock debt alone"
+        )
+
+
+# Both scan classes run on one loadgroup worker, so `repo_test_scan` is built once per run.
+_REPO_SCAN_GROUP_NAME = 'bare_magicmock_repo_scan'
+
+
+def _timeout_seconds(marker: pytest.Mark | None) -> float | None:
+    """The ceiling a pytest-timeout marker sets, in either spelling pytest-timeout accepts."""
+    if marker is None:
+        return None
+    value = marker.kwargs.get('timeout', marker.args[0] if marker.args else None)
+    return None if value is None else float(value)
+
+
+def test_only_the_repo_wide_scans_run_under_their_own_ceiling(request):
+    """The scan classes' items resolve the repo-scan ceiling; this module's unit tests resolve the family's.
+
+    Reads get_closest_marker on the collected items, which is what pytest-timeout
+    reads. The unit tests carry the family ceiling through module-level membership
+    in the task-role whole-tree guard family. Family rationale:
+    shared/src/shared/whole_tree_guard_family.py::WHOLE_TREE_SCAN_TEST_TIMEOUT.
+    """
+    scan_classes = (
+        TestAllScannedTestDirsClean,
+        TestWallClockDeadlineBaselineIntegrity,
+        TestTimingDependenceBaselineIntegrity,
+    )
+    scan_items = [item for item in request.session.items if getattr(item, 'cls', None) in scan_classes]
+    if not scan_items:
+        pytest.skip('no repo-wide scan item is selected in this session')
+    ini_default = float(request.config.getini('timeout'))
+    measured_need = MAGICMOCK_REPO_SCAN_MEASURED_WORST_SECS * UNDER_LOAD_HEADROOM_FACTOR
+    required = max(measured_need, ini_default)
+    ceilings = {item.nodeid: _timeout_seconds(item.get_closest_marker('timeout')) for item in scan_items}
+    short = {nodeid: ceiling for nodeid, ceiling in ceilings.items() if ceiling is None or ceiling < required}
+    assert short == {}, (
+        f'repo-wide scan items resolve a timeout below {required}s, the larger of the measured '
+        f'{MAGICMOCK_REPO_SCAN_MEASURED_WORST_SECS}s x headroom {UNDER_LOAD_HEADROOM_FACTOR} '
+        f'and the {ini_default}s ini default (None = no mark): {short}. Bind '
+        '@pytest.mark.timeout(MAGICMOCK_REPO_SCAN_TEST_TIMEOUT) on the scan class; a closer mark '
+        'on a scan test REPLACES it.'
+    )
+    own = _timeout_seconds(request.node.get_closest_marker('timeout'))
+    assert own == WHOLE_TREE_SCAN_TEST_TIMEOUT, (
+        f"this module's unit tests resolve a {own}s timeout mark, not the "
+        f'{WHOLE_TREE_SCAN_TEST_TIMEOUT}s whole-tree guard family ceiling its module-level '
+        'pytestmark binds; bind the repo-scan ceiling on the scan classes only.'
+    )
+
+
+def test_the_repo_wide_scans_share_one_xdist_worker(request):
+    scan_classes = (
+        TestAllScannedTestDirsClean,
+        TestWallClockDeadlineBaselineIntegrity,
+        TestTimingDependenceBaselineIntegrity,
+    )
+    scan_items = [item for item in request.session.items if getattr(item, 'cls', None) in scan_classes]
+    if not scan_items:
+        pytest.skip('no repo-wide scan item is selected in this session')
+
+    assert single_xdist_group(scan_items) == _REPO_SCAN_GROUP_NAME
+
+
+class _ScannedTestFile(NamedTuple):
+    """What the repo-wide scans need from one scanned file; its tree is not kept.
+
+    The two counts are the raw, pre-budget numbers each debt baseline records, from
+    the same ``check_bare_magicmock_config.py::scan_tree`` walk as the gate's verdict.
+    """
+
+    path: Path
+    relpath: str
+    gate_violations: tuple[Violation, ...]
+    rule_c_count: int
+    timing_count: int
+    syntax_error: SyntaxError | None
+
+
+def _scan_test_file(path: Path, relpath: str) -> _ScannedTestFile:
+    source = path.read_text(encoding='utf-8')
+    try:
+        tree = ast.parse(source, filename=str(path))
+    except SyntaxError as exc:
+        return _ScannedTestFile(
+            path, relpath, gate_violations=(), rule_c_count=0, timing_count=0, syntax_error=exc
+        )
+    scan = _checker.scan_tree(tree, source, str(path))
+    return _ScannedTestFile(
+        path,
+        relpath,
+        gate_violations=tuple(scan.violations),
+        rule_c_count=scan.debt.wall_clock_deadline,
+        timing_count=scan.debt.timing_dependence,
+        syntax_error=None,
+    )
+
+
+def _scan_repo_test_dirs(
+    repo_root: Path, scanned_dirs: Iterable[str]
+) -> tuple[_ScannedTestFile, ...]:
+    """Parse every file the lint call sites scan ONCE, for the gate and both debt censuses.
+
+    The file set, the strict utf-8 read and the filename are run_cli's, so the gate
+    sees what the CLI would. Facts, not trees: every ast.Module of seven packages'
+    tests, retained, would cost on the order of a GB of RSS on the scanning worker.
+    """
+    return tuple(
+        _scan_test_file(path, path.relative_to(repo_root).as_posix())
+        for scanned_dir in scanned_dirs
+        if (repo_root / scanned_dir).is_dir()
+        for path in _checker.discover_scan_targets(repo_root / scanned_dir)
+    )
+
+
+@pytest.fixture(scope='module')
+def repo_test_scan() -> tuple[_ScannedTestFile, ...]:
+    return _scan_repo_test_dirs(_REPO_ROOT, TestAllScannedTestDirsClean._SCANNED_DIRS)
+
+
+@pytest.mark.xdist_group(_REPO_SCAN_GROUP_NAME)
+@pytest.mark.timeout(MAGICMOCK_REPO_SCAN_TEST_TIMEOUT)
+class TestAllScannedTestDirsClean:
+    """Non-regression gate for all nine call sites: every scanned tests/ dir stays clean.
+
+    The checker is wired into seven package ``orchestrator.yaml`` lint_commands,
+    ``dark-factory-orchestrator.yaml``, and ``hooks/project-checks``.  Adding Rule B
+    — and then Rule C (task 4246) and Rule D (task 8254) — put a hot, position-blind rule
+    in front of all of
+    them at once, so a single unhandled site turns a package's lint_command red and
+    stalls the merge lane repo-wide.
+
+    This test proves each widening left every one of those callers green.  It is the
+    counterpart to TestRuleBIsUnconditional and TestWallClockDeadlineDebtBaseline:
+    those classes pin what may and may not be grandfathered, this one pins that
+    nothing else was missed.
+
+    It runs the checker in-process over the shared ``repo_test_scan``. The process
+    boundary is TestCliBoundary's; the CLI's in-process behaviour is TestCliExitCodes',
+    TestCliDirectoryScan's and TestCliErrorHandling's.
+    """
+
+    _SCANNED_DIRS = (
+        'shared/tests',
+        'escalation/tests',
+        'fused-memory/tests',
+        'orchestrator/tests',
+        'dashboard/tests',
+        'sampler/tests',
+        'cockpit/tests',
+    )
+
+    def test_every_scanned_tests_directory_exits_zero(self, repo_test_scan):
+        """The checker reports no violation over every directory the nine call sites scan."""
+        present = [d for d in self._SCANNED_DIRS if (_REPO_ROOT / d).is_dir()]
+        assert present, (
+            f'No scanned tests/ directory found under {_REPO_ROOT} — the repo-root '
+            'reach (Path(__file__).parent.parent.parent) is probably wrong'
+        )
+        violations = sorted(
+            (v for record in repo_test_scan for v in record.gate_violations),
+            key=lambda v: (v.filename, v.lineno, v.col_offset),
+        )
+        assert violations == [], (
+            'check_bare_magicmock_config found violations in the directories scanned '
+            'by the nine configured call sites (seven package orchestrator.yaml '
+            'lint_commands, dark-factory-orchestrator.yaml, hooks/project-checks). '
+            'Any non-zero exit here means at least one package lint_command is RED.\n'
+            'Remedy depends on the rule:\n'
+            '  bare-magicmock        → mock_orch_config / MagicMock(spec_set=pydantic_spec(...))\n'
+            '  bare-dataclass-double → fake_verify_result(...) / MagicMock(spec=VerifyResult)\n'
+            '  wall-clock-deadline   → wait_responsive(...) or poll_responsive(...) with a label= / bound derived from MERGE_RESULT_TIMEOUT,\n'
+            '                          or, for a debt-baseline slack report, lower the named budget\n'
+            '  timing-dependence     → wait on the event / fake_clock / virtual_clock_test / testing_own_time,\n'
+            '                          or @pytest.mark.timing(reason=...) when a deadline is the behaviour under test,\n'
+            '                          or, for a debt-baseline slack report, lower the named budget\n'
+            f'Scanned: {present}\n'
+            'Violations:\n'
+            + ''.join(f'{v.filename}:{v.lineno}:{v.col_offset}: {v.message}\n' for v in violations)
+        )
+
+
+# ===========================================================================
+# Rule C — wall-clock-deadline (task 4246)
+# ===========================================================================
+
+
+def _expr(source: str) -> ast.expr:
+    """Parse *source* as a single expression and return its AST node.
+
+    Rule C's shape predicate takes an ``ast.expr`` (the first positional
+    argument of a wait call), so the unit tests below drive it with parsed
+    expressions rather than with hand-built nodes.
+    """
+    return ast.parse(source, mode='eval').body
+
+
+class TestWallClockLoadBearingTarget:
+    """Rule C's shape predicate: which wait targets are load-bearing.
+
+    Ported from orchestrator/tests/test_merge_speculation.py::_load_bearing_wait_target
+    (task 3980), whose file-local copy this shared rule replaces.
+
+    Exactly two shapes are load-bearing, and both gate a hard assertion
+    downstream: a ``MergeRequest.result`` future (its resolution IS the event
+    the test waits for) and a zero-argument ``.wait()`` barrier (already
+    event-driven; only its deadline is wall-clock).
+
+    Both legs are pure SHAPE, on any receiver — a Name, an Attribute, a
+    Subscript or a Call.  No receiver name is consulted.  The barrier leg's
+    zero-argument requirement is its structural discriminator: it is what keeps
+    ``asyncio.wait(aws)`` and ``threading.Event.wait(timeout)`` out.
+
+    The Name negative is the load-bearing one: it is what keeps the
+    ``stop_merge_worker`` teardown join — ``asyncio.wait_for(worker_task, ...)``,
+    inside ``contextlib.suppress``, asserting nothing — exempt STRUCTURALLY by
+    its Name-vs-Attribute/Call shape rather than by a hand-maintained name list.
+    """
+
+    def test_attribute_result_is_a_merge_request_future(self):
+        """``req_a.result`` → described as a MergeRequest.result future."""
+        described = _checker._load_bearing_wait_target(_expr('req_a.result'))
+        assert described is not None
+        assert 'req_a.result' in described
+        assert 'MergeRequest.result future' in described
+
+    def test_subscripted_attribute_result_is_a_merge_request_future(self):
+        """``follower_reqs[tid].result`` → still an ast.Attribute named 'result'."""
+        described = _checker._load_bearing_wait_target(_expr('follower_reqs[tid].result'))
+        assert described is not None
+        assert 'follower_reqs[tid].result' in described
+        assert 'MergeRequest.result future' in described
+
+    def test_gate_wait_call_is_a_barrier(self):
+        """``gate_a_entered.wait()`` → described as a .wait() barrier."""
+        described = _checker._load_bearing_wait_target(_expr('gate_a_entered.wait()'))
+        assert described is not None
+        assert 'gate_a_entered.wait()' in described
+        assert '.wait() barrier' in described
+
+    def test_bare_gate_prefix_wait_call_is_a_barrier(self):
+        """``gate_entered.wait()`` → gate-named barriers stay detected."""
+        described = _checker._load_bearing_wait_target(_expr('gate_entered.wait()'))
+        assert described is not None
+        assert '.wait() barrier' in described
+
+    def test_bare_name_target_is_not_load_bearing(self):
+        """``worker_task`` → None.
+
+        THE load-bearing negative. ``stop_merge_worker``'s teardown join targets a
+        bare Name; that shape — not a name list — is what exempts it, which is
+        what lets the rule scan every scope in every scanned file.
+        """
+        assert _checker._load_bearing_wait_target(_expr('worker_task')) is None
+
+    def test_wrong_attribute_name_is_not_load_bearing(self):
+        """``obj.results`` → None (the attribute must be exactly 'result')."""
+        assert _checker._load_bearing_wait_target(_expr('obj.results')) is None
+
+    def test_a_non_gate_name_wait_call_is_a_barrier(self):
+        """``done.wait()`` → a barrier: no receiver name prefix is required."""
+        described = _checker._load_bearing_wait_target(_expr('done.wait()'))
+        assert described is not None
+        assert 'done.wait()' in described
+        assert '.wait() barrier' in described
+
+    @pytest.mark.parametrize(
+        'barrier',
+        [
+            'self._entered.wait()',
+            'drive.first_dispatched.wait()',
+            "verifier.entered[0].wait()",
+            "started['y'].wait()",
+            'some_call().wait()',
+        ],
+        ids=['attribute', 'nested-attribute', 'subscript', 'string-subscript', 'call'],
+    )
+    def test_a_wait_call_on_any_receiver_shape_is_a_barrier(self, barrier: str):
+        """Attribute, Subscript and Call receivers are barriers exactly like a Name."""
+        described = _checker._load_bearing_wait_target(_expr(barrier))
+        assert described is not None, f'{barrier} must be load-bearing'
+        assert '.wait() barrier' in described
+
+    def test_wrong_method_on_a_gate_is_not_load_bearing(self):
+        """``gate_a.set()`` → None (only ``.wait()`` blocks)."""
+        assert _checker._load_bearing_wait_target(_expr('gate_a.set()')) is None
+
+    @pytest.mark.parametrize(
+        'not_a_barrier',
+        ['asyncio.wait(pending)', 'ev.wait(5)', 'ev.wait(timeout=1)', 'ev.wait'],
+        ids=['asyncio-wait', 'positional-arg', 'keyword-arg', 'uncalled'],
+    )
+    def test_a_wait_taking_arguments_or_uncalled_is_not_a_barrier(self, not_a_barrier: str):
+        """The zero-argument requirement is the structural discriminator.
+
+        ``asyncio.wait(aws)`` and ``threading.Event.wait(timeout)`` take arguments;
+        an ``asyncio.Event``'s ``.wait()`` takes none.  An uncalled ``ev.wait`` is
+        not a wait at all.
+        """
+        assert _checker._load_bearing_wait_target(_expr(not_a_barrier)) is None
+
+
+# A brand-new orchestrator test file: NOT on any debt baseline, so Rule C
+# reports every violation it finds.  This is the filename that proves the rule
+# is opt-OUT — a file nobody has grandfathered is covered the day it is created.
+_NON_DEBT_FILE = 'orchestrator/tests/test_brand_new.py'
+
+
+def _rule_b(source: str, filename: str = _NON_DEBT_FILE) -> list:
+    """Return only the Rule B violations find_violations reports for *source*."""
+    return [
+        v
+        for v in find_violations(source, filename)
+        if 'bare-dataclass-double' in v.message
+    ]
+
+
+def _rule_c(source: str, filename: str = _NON_DEBT_FILE) -> list:
+    """Return only the Rule C violations find_violations reports for *source*."""
+    return [
+        v
+        for v in find_violations(source, filename)
+        if 'wall-clock-deadline' in v.message
+    ]
+
+
+class TestWallClockDeadlineDetection:
+    """Rule C end-to-end through find_violations: two offence kinds, position-blind.
+
+    Both counter-examples from the file-local suite this rule replaces
+    (orchestrator/tests/test_merge_speculation.py::TestLateArrivalWaitsAreLoadIndependent,
+    task 3980) are ported here so deleting that copy loses no coverage.
+    """
+
+    def test_a_class_no_name_list_would_have_covered_flags_both_kinds(self):
+        """The reviewer's own counter-example: a sixth late-arrival class.
+
+        An earlier revision of the file-local guard scanned a hand-maintained
+        frozenset of five class names; a sixth class added tomorrow with the
+        exact bare mid-range deadline that produced one of task 3980's three
+        measured failures would have passed it in silence.  Keying on call
+        SHAPE is what closes that, so this input must flag BOTH kinds.
+        """
+        source = (
+            'class TestSomeBrandNewLateArrivalCase:\n'
+            '    async def test_new_case(self):\n'
+            '        await asyncio.wait_for(req_x.result, timeout=25.0)\n'
+        )
+        violations = _rule_c(source)
+        assert len(violations) == 2, (
+            'expected BOTH offence kinds (bare asyncio.wait_for on a load-bearing '
+            f'target, and a raw wall-clock literal); got {violations!r}'
+        )
+        assert all(v.lineno == 3 for v in violations), violations
+
+    def test_a_name_targeted_teardown_join_is_clean(self):
+        """``stop_merge_worker``'s join stays exempt by its Name target, not by a list.
+
+        The rule scans every scope in every scanned file, so a module-level
+        teardown helper is squarely in range.  It must stay silent anyway.
+        """
+        source = (
+            'async def _teardown(worker, worker_task):\n'
+            '    with contextlib.suppress(Exception):\n'
+            '        await asyncio.wait_for(worker_task, timeout=5.0)\n'
+        )
+        assert _rule_c(source) == []
+
+    def test_detection_is_position_blind(self):
+        """The same offending call flags in a return, an argument, a comprehension and at module level."""
+        positions = {
+            'module level': 'asyncio.wait_for(req.result, timeout=1.0)\n',
+            'return': 'def f():\n    return asyncio.wait_for(req.result, timeout=1.0)\n',
+            'argument': 'def f():\n    g(asyncio.wait_for(req.result, timeout=1.0))\n',
+            'comprehension': 'def f():\n    return [asyncio.wait_for(r.result, timeout=1.0) for r in rs]\n',
+        }
+        for label, source in positions.items():
+            violations = _rule_c(source)
+            assert len(violations) == 2, (
+                f'Rule C must be position-blind; {label} yielded {violations!r}'
+            )
+
+    def test_migrated_site_with_a_raw_literal_flags_the_literal_kind_only(self):
+        """``wait_responsive(req.result, timeout=45.0, label='x')`` moved the accounting but kept the number.
+
+        wait_responsive takes a ``timeout`` keyword, so a migrated site can
+        still carry a hand-written wall-clock number.  That is the raw-literal
+        offence and nothing else — it is no longer a bare asyncio.wait_for.
+        """
+        source = "wait_responsive(req.result, timeout=45.0, label='x')\n"
+        violations = _rule_c(source)
+        assert len(violations) == 1, violations
+        assert 'MERGE_RESULT_TIMEOUT' in violations[0].message
+        assert 'bare asyncio.wait_for' not in violations[0].message
+
+    def test_fully_migrated_site_is_clean(self):
+        """``wait_responsive(req.result, label='x')`` with no literal is the remedy itself."""
+        assert _rule_c("wait_responsive(req.result, label='x')\n") == []
+
+    def test_gate_barrier_with_a_derived_timeout_flags_the_bare_wait_for_kind_only(self):
+        """A non-literal timeout is a derived bound, so only the routing is wrong."""
+        source = 'asyncio.wait_for(gate_a_entered.wait(), timeout=MERGE_RESULT_TIMEOUT / 2)\n'
+        violations = _rule_c(source)
+        assert len(violations) == 1, violations
+        assert 'wait_responsive' in violations[0].message
+        assert 'RAW wall-clock literal' not in violations[0].message
+
+    def test_boolean_timeout_is_not_a_numeric_literal(self):
+        """``timeout=True`` must not count as a raw number (bool is an int subclass)."""
+        source = 'asyncio.wait_for(req.result, timeout=True)\n'
+        violations = _rule_c(source)
+        assert len(violations) == 1, (
+            f'only the bare-wait_for kind should fire for timeout=True; got {violations!r}'
+        )
+        assert 'wait_responsive' in violations[0].message
+
+    def test_positional_timeout_literal_flags_both_kinds(self):
+        """``asyncio.wait_for(req.result, 25.0)`` writes its number positionally.
+
+        wait_for's second positional parameter IS its timeout, so a keyword-only
+        literal scan would see the routing offence and miss the written number.
+        """
+        violations = _rule_c('asyncio.wait_for(req.result, 25.0)\n')
+        assert len(violations) == 2, (
+            'a positional timeout literal is the raw-literal offence as surely as '
+            f'timeout=25.0; got {violations!r}'
+        )
+        assert any('MERGE_RESULT_TIMEOUT' in v.message for v in violations), violations
+
+    def test_positional_derived_timeout_flags_the_bare_wait_for_kind_only(self):
+        """A positional bound derived from MERGE_RESULT_TIMEOUT is not a written number."""
+        violations = _rule_c('asyncio.wait_for(req.result, MERGE_RESULT_TIMEOUT)\n')
+        assert len(violations) == 1, violations
+        assert 'RAW wall-clock literal' not in violations[0].message
+
+    def test_positional_boolean_timeout_is_not_a_numeric_literal(self):
+        """A positional ``True`` is not a raw number either (bool is an int subclass)."""
+        violations = _rule_c('asyncio.wait_for(req.result, True)\n')
+        assert len(violations) == 1, (
+            f'only the bare-wait_for kind should fire for a positional True; got {violations!r}'
+        )
+        assert 'RAW wall-clock literal' not in violations[0].message
+
+    def test_max_wall_s_literal_on_wait_responsive_flags_the_literal_kind(self):
+        """``max_wall_s=30.0`` is wait_responsive's wall-clock cap, written as a number."""
+        violations = _rule_c("wait_responsive(req.result, label='x', max_wall_s=30.0)\n")
+        assert len(violations) == 1, violations
+        assert 'RAW wall-clock literal' in violations[0].message
+        assert 'max_wall_s' in violations[0].message
+
+    def test_several_literals_on_one_call_are_one_raw_literal_violation(self):
+        """Offence kinds are per CALL: two written numbers are one raw-literal violation.
+
+        This keeps the per-file budget arithmetic at 0, 1 or 2 violations per call.
+        """
+        source = "wait_responsive(req.result, timeout=45.0, max_wall_s=90.0, label='x')\n"
+        violations = _rule_c(source)
+        assert len(violations) == 1, violations
+        assert 'RAW wall-clock literal' in violations[0].message
+
+    def test_a_non_gate_event_barrier_wait_flags_both_kinds(self):
+        """``asyncio.wait_for(done.wait(), timeout=5)`` → routing AND written number."""
+        violations = _rule_c('asyncio.wait_for(done.wait(), timeout=5)\n')
+        assert len(violations) == 2, violations
+
+    def test_a_non_gate_barrier_through_wait_responsive_flags_only_its_literal(self):
+        """A migrated non-gate barrier that kept its number trips the literal kind only."""
+        violations = _rule_c("wait_responsive(self._entered.wait(), timeout=30.0, label='x')\n")
+        assert len(violations) == 1, violations
+        assert 'RAW wall-clock literal' in violations[0].message
+
+    def test_asyncio_wait_inside_wait_for_is_not_a_barrier(self):
+        """``asyncio.wait(tasks)`` takes arguments, so it is not a ``.wait()`` barrier."""
+        assert _rule_c('asyncio.wait_for(asyncio.wait(tasks), timeout=5)\n') == []
+
+    def test_a_positional_timeout_on_a_non_gate_barrier_flags_both_kinds(self):
+        """``asyncio.wait_for(entered.wait(), 2.0)`` — the shape of the fused-memory sites."""
+        violations = _rule_c('asyncio.wait_for(entered.wait(), 2.0)\n')
+        assert len(violations) == 2, violations
+
+    def test_a_call_with_no_positional_args_does_not_crash(self):
+        """``asyncio.wait_for()`` has no args[0] to inspect — it must be skipped, not raise."""
+        assert _rule_c('asyncio.wait_for()\nwait_responsive()\n') == []
+
+    def test_unparseable_source_returns_empty(self):
+        """A SyntaxError must never fail the gate over an unrelated edit."""
+        assert find_violations('def broken(:\n', _NON_DEBT_FILE) == []
+
+    def test_a_non_wait_call_on_a_load_bearing_target_is_clean(self):
+        """The func shape gates the rule: ``foo(req.result)`` is not a wait."""
+        assert _rule_c('foo(req.result, timeout=5.0)\n') == []
+
+
+class TestWallClockDeadlineMessage:
+    """Rule C's message vocabulary is its own, and distinct per offence kind."""
+
+    _BOTH_KINDS = 'asyncio.wait_for(req_a.result, timeout=25.0)\n'
+
+    def test_the_two_kinds_carry_distinct_remedies(self):
+        """Each kind names its own remedy; conflating them sends the reader down a dead end.
+
+        Both messages mention both helpers in the shared reachability caveat, so the
+        filters key on the PRESCRIBING clause, not on the helper names.
+        """
+        messages = [v.message for v in _rule_c(self._BOTH_KINDS)]
+        assert len(messages) == 2, messages
+        bare = [m for m in messages if 'through wait_responsive(...) with a descriptive label=' in m]
+        literal = [m for m in messages if 'Derive the bound from MERGE_RESULT_TIMEOUT' in m]
+        assert len(bare) == 1, f'exactly one message must prescribe wait_responsive: {messages}'
+        assert len(literal) == 1, (
+            f'exactly one message must prescribe deriving from MERGE_RESULT_TIMEOUT: {messages}'
+        )
+        assert bare[0] != literal[0], 'the two kinds must not share a message'
+
+    def test_messages_name_the_load_bearing_target(self):
+        """The described target is what makes the failure directly actionable."""
+        for v in _rule_c(self._BOTH_KINDS):
+            assert 'req_a.result' in v.message
+            assert 'MergeRequest.result future' in v.message
+
+    def test_messages_explain_the_consequence(self):
+        """A deadline expiry on a load-bearing sync point fails a test that PASSED.
+
+        Stated without merge vocabulary: Rule C scans every package's tests, and an
+        ``Event.wait()`` in fused-memory/tests has no merge pipeline.
+        """
+        for v in _rule_c(self._BOTH_KINDS):
+            assert 'WALL CLOCK' in v.message or 'wall-clock' in v.message
+            assert 'awaited event did happen' in v.message, v.message
+            assert 'merge pipeline' not in v.message, v.message
+
+    def test_every_rule_c_message_says_where_its_remedy_is_importable(self):
+        """wait_responsive and MERGE_RESULT_TIMEOUT exist only under orchestrator/tests.
+
+        Both offence kinds and the debt overrun prescribe one of them, so each must
+        carry the same caveat naming the per-site noqa as the remedy elsewhere.
+        """
+        entry, budget = _live_rule_c_debt_entry()
+        messages = [v.message for v in _rule_c(self._BOTH_KINDS)]
+        messages += [v.message for v in _rule_c(_RULE_C_ONE_HIT * (budget + 1), entry)]
+        assert len(messages) == 3, messages
+        for message in messages:
+            assert 'importable only under orchestrator/tests' in message, message
+
+    def test_messages_name_the_suppression_code(self):
+        """Every rule's message tells the reader how to suppress that rule specifically."""
+        for v in _rule_c(self._BOTH_KINDS):
+            assert '# noqa: wall-clock-deadline' in v.message
+
+    def test_raw_literal_message_names_the_offending_parameter(self):
+        """The raw-literal message says WHICH bound carries the number."""
+        timeout_msgs = [
+            v.message
+            for v in _rule_c("wait_responsive(req.result, timeout=45.0, label='x')\n")
+        ]
+        assert len(timeout_msgs) == 1, timeout_msgs
+        assert 'timeout' in timeout_msgs[0]
+        assert 'max_wall_s' not in timeout_msgs[0]
+
+        cap_msgs = [
+            v.message
+            for v in _rule_c("wait_responsive(req.result, label='x', max_wall_s=30.0)\n")
+        ]
+        assert len(cap_msgs) == 1, cap_msgs
+        assert 'max_wall_s' in cap_msgs[0]
+
+    def test_messages_share_no_vocabulary_with_rule_a_or_rule_b(self):
+        """Rule A's and Rule B's remedies are unusable here and must not appear.
+
+        mock_orch_config / pydantic_spec read pydantic model_fields;
+        fake_verify_result / spec=VerifyResult spec a stdlib dataclass.  Neither
+        has anything to say about a wall-clock deadline on a future.
+        """
+        foreign = (
+            'mock_orch_config',
+            'pydantic_spec',
+            'fake_verify_result',
+            'spec=VerifyResult',
+            'bare-magicmock',
+            'bare-dataclass-double',
+        )
+        for v in _rule_c(self._BOTH_KINDS):
+            for needle in foreign:
+                assert needle not in v.message, (
+                    f'Rule C message must not offer {needle!r}: {v.message!r}'
+                )
+
+
+# One call, BOTH Rule C offence kinds — so a single suppression check at the site
+# is provably suppressing both, not just the one that happens to be reported first.
+_RULE_C_SOURCE = 'asyncio.wait_for(req_a.result, timeout=25.0)\n'
+_RULE_D_SOURCE = 'time.sleep(0.1)\n'
+
+
+class TestWallClockDeadlineExemption:
+    """Rule C honours its OWN noqa code, on the preceding non-blank line, with a reason.
+
+    The contract is inherited verbatim from ``_lint_cli.py::is_exempted``
+    rather than re-parsed, so an author learns the em-dash-or-hyphen,
+    mandatory-reason, preceding-line-only, no-inline-trailing rules once and they
+    hold for all three codes.  What is NOT shared is the code itself: Rule A's
+    remedy is mock_orch_config/pydantic_spec, Rule B's is fake_verify_result, and
+    Rule C's is wait_responsive/MERGE_RESULT_TIMEOUT — so a pragma written for one
+    is never informed consent for another.
+    """
+
+    def test_em_dash_exemption_suppresses_both_offence_kinds(self):
+        """One pragma at the site silences BOTH kinds, not just the first."""
+        unsuppressed = _rule_c(_RULE_C_SOURCE)
+        assert len(unsuppressed) == 2, (
+            f'this test is written against a source that trips BOTH kinds; got {unsuppressed!r}'
+        )
+        source = '# noqa: wall-clock-deadline — deliberate wall-clock leg\n' + _RULE_C_SOURCE
+        assert _rule_c(source) == []
+
+    def test_ascii_hyphen_exemption_suppresses_rule_c(self):
+        """ASCII-hyphen separator is accepted, same as Rules A and B."""
+        source = '# noqa: wall-clock-deadline - deliberate wall-clock leg\n' + _RULE_C_SOURCE
+        assert _rule_c(source) == []
+
+    def test_exemption_tolerates_intervening_blank_lines(self):
+        """Blank and whitespace-only lines between the pragma and the call are tolerated."""
+        source = (
+            '# noqa: wall-clock-deadline — deliberate wall-clock leg\n\n    \n' + _RULE_C_SOURCE
+        )
+        assert _rule_c(source) == []
+
+    def test_no_exemption_without_a_reason(self):
+        """A pragma with no reason after the separator does not suppress."""
+        for header in ('# noqa: wall-clock-deadline\n', '# noqa: wall-clock-deadline —\n'):
+            violations = _rule_c(header + _RULE_C_SOURCE)
+            assert len(violations) == 2, (
+                f'a reasonless pragma must NOT suppress Rule C; header={header!r} '
+                f'gave {violations!r}'
+            )
+
+    def test_inline_trailing_exemption_is_not_honored(self):
+        """Inline trailing placement is not honored for Rule C either."""
+        source = (
+            'asyncio.wait_for(req_a.result, timeout=25.0)'
+            '  # noqa: wall-clock-deadline — inline\n'
+        )
+        assert len(_rule_c(source)) == 2, (
+            'only the nearest PRECEDING non-blank line is consulted, for all three rules'
+        )
+
+    def test_intervening_code_line_breaks_the_exemption(self):
+        """A non-blank, non-matching line between pragma and call breaks the exemption."""
+        source = (
+            '# noqa: wall-clock-deadline — a reason\nsome_code = 42\n' + _RULE_C_SOURCE
+        )
+        assert len(_rule_c(source)) == 2
+
+
+class TestWallClockDeadlineCrossCodeIsolation:
+    """Registering a third code must not let any rule's pragma leak into another's.
+
+    Both directions are tested for each pairing.  A pragma written years ago for a
+    config assignment must not silently exempt a load-bearing wait that later lands
+    on the following line, and vice versa.
+    """
+
+    def test_rule_b_code_does_not_suppress_rule_c(self):
+        """# noqa: bare-dataclass-double must NOT suppress a Rule C violation."""
+        source = '# noqa: bare-dataclass-double — a reason\n' + _RULE_C_SOURCE
+        assert len(_rule_c(source)) == 2, (
+            "Rule B's noqa code must not suppress Rule C — fake_verify_result has "
+            'nothing to say about a wall-clock deadline'
+        )
+
+    def test_rule_a_code_does_not_suppress_rule_c(self):
+        """# noqa: bare-magicmock must NOT suppress a Rule C violation."""
+        source = '# noqa: bare-magicmock — legacy config exemption\n' + _RULE_C_SOURCE
+        assert len(_rule_c(source)) == 2, (
+            "Rule A's noqa code must not suppress Rule C"
+        )
+
+    def test_rule_c_code_does_not_suppress_rule_a(self):
+        """# noqa: wall-clock-deadline must NOT suppress a Rule A violation."""
+        source = '# noqa: wall-clock-deadline — a reason\n' + _RULE_A_SOURCE
+        violations = find_violations(source, 'test_cross_c_to_a.py')
+        assert len(violations) == 1, (
+            f"Rule C's noqa code must not suppress a Rule A violation; got {violations}"
+        )
+
+    def test_rule_c_code_does_not_suppress_rule_b(self):
+        """# noqa: wall-clock-deadline must NOT suppress a Rule B violation."""
+        source = '# noqa: wall-clock-deadline — a reason\n' + _RULE_B_SOURCE
+        violations = find_violations(source, 'test_cross_c_to_b.py')
+        assert len(violations) == 1, (
+            f"Rule C's noqa code must not suppress a Rule B violation; got {violations}"
+        )
+
+    def test_rule_a_and_rule_b_exemptions_are_bit_identical_after_registering_rule_c(self):
+        """Regression pin: registering a third rule code changed nothing for A or B."""
+        assert find_violations(
+            '# noqa: bare-magicmock — needed for legacy fixture migration\n' + _RULE_A_SOURCE,
+            'test_a_still_exempt_after_c.py',
+        ) == [], "Rule A's own exemption must remain bit-identical"
+        assert find_violations(
+            '# noqa: bare-dataclass-double — deliberate mutation leg\n' + _RULE_B_SOURCE,
+            'test_b_still_exempt_after_c.py',
+        ) == [], "Rule B's own exemption must remain bit-identical"
+
+
+class TestExemptionSeparatorVariants:
+    """Every rule honours every separator ``_lint_cli.py::exemption_pattern`` accepts.
+
+    A uniform cross-rule pin of the exemption contract: em-dash, ASCII hyphen and a
+    repeated hyphen, for all three codes.  A future regex edit cannot then honour a
+    separator for one rule and not for another.
+    """
+
+    @pytest.mark.parametrize(
+        ('code', 'offending'),
+        [
+            ('bare-magicmock', _RULE_A_SOURCE),
+            ('bare-dataclass-double', _RULE_B_SOURCE),
+            ('wall-clock-deadline', _RULE_C_SOURCE),
+        ],
+    )
+    @pytest.mark.parametrize('separator', ['—', '-', '--'])
+    def test_the_pragma_suppresses_its_rule_with_every_separator(
+        self, code: str, offending: str, separator: str
+    ):
+        """``# noqa: <code> <sep> a reason`` on the preceding line suppresses that rule."""
+        def own(violations: list) -> list:
+            return [v for v in violations if f'# noqa: {code}' in v.message]
+
+        assert own(find_violations(offending, _NON_DEBT_FILE)), (
+            f'the offending source must trip {code} unsuppressed, or this pin is vacuous'
+        )
+        source = f'# noqa: {code} {separator} a reason\n' + offending
+        assert own(find_violations(source, _NON_DEBT_FILE)) == [], (
+            f'{code} must honour the {separator!r} separator like every other rule'
+        )
+
+
+# The Rule C census, re-measured ONCE per widening of its detection, each time a
+# sanctioned rise where every added violation was newly SEEN, not new debt:
+#   * task 5269: 650 violations across 47 files in four packages (task 4246 shipped
+#     618 across 20, every one under orchestrator/tests/);
+#   * task 7800: 311 across 91 files in five packages after Rule C learned
+#     asyncio.timeout blocks and clock-deadline polls — every added violation newly
+#     SEEN, not new debt (220 across 39 before it), sites rebased in from main
+#     admitted at their measured counts per esc-7800-5 and esc-7800-7.
+# Counted as VIOLATIONS, not sites — one call can produce two.
+# test_merge_speculation.py measures ZERO (tasks 3980 and 7800 migrated it) and is
+# deliberately ABSENT.
+_EXPECTED_WALL_CLOCK_DEBT_PATHS = frozenset({
+    'orchestrator/tests/test_merge_queue_concurrent_verify.py',
+    'orchestrator/tests/test_merge_queue_request_liveness.py',
+    'orchestrator/tests/test_offline_lane.py',
+    'orchestrator/tests/test_live_merge_worker.py',
+    'orchestrator/tests/test_merge_queue.py',
+    'orchestrator/tests/test_verify_admission_integration_gate.py',
+    'orchestrator/tests/test_background_service.py',
+    'orchestrator/tests/test_harness_lifecycle_registry.py',
+    'orchestrator/tests/test_merge_queue_deep_dispatch.py',
+    'orchestrator/tests/test_merge_queue_verifier_raw_cancel.py',
+    'orchestrator/tests/_task_verify_integration_rig.py',
+    'orchestrator/tests/test_git_ops.py',
+    'orchestrator/tests/test_merge_queue_bounce.py',
+    'orchestrator/tests/test_merge_queue_deep_landing.py',
+    'orchestrator/tests/test_merge_queue_invariant_integration_gate.py',
+    'orchestrator/tests/test_merge_queue_supervisor.py',
+    'orchestrator/tests/test_workflow_cancellation.py',
+    'orchestrator/tests/test_harness.py',
+    'orchestrator/tests/test_merge_queue_coalesce.py',
+    'orchestrator/tests/test_merge_queue_deep_integration_gate.py',
+    'orchestrator/tests/test_merge_queue_rebased_landing_dead_base.py',
+    'orchestrator/tests/test_merge_skew_tripwire.py',
+    'orchestrator/tests/test_merge_worktree_lifecycle_integration_gate.py',
+    'orchestrator/tests/test_offline_lane_infra_integration.py',
+    'orchestrator/tests/test_offline_lane_integration.py',
+    'orchestrator/tests/test_verify_cancel_unwind.py',
+    'orchestrator/tests/test_verify_ruff_config_boundary.py',
+    'orchestrator/tests/test_before_done_script.py',
+    'orchestrator/tests/test_cancel_scope_bounded_cleanup.py',
+    'orchestrator/tests/test_cascade_unblock.py',
+    'orchestrator/tests/test_coalesce_integration_gate.py',
+    'orchestrator/tests/test_done_phase_wedge.py',
+    'orchestrator/tests/test_harness_force_release_wedged_slot.py',
+    'orchestrator/tests/test_harness_offline_lane.py',
+    'orchestrator/tests/test_harness_resume_scheduler.py',
+    'orchestrator/tests/test_lane_lock_leak_guard.py',
+    'orchestrator/tests/test_merge_lane_parked_custody.py',
+    'orchestrator/tests/test_merge_queue_lifecycle_registry.py',
+    'orchestrator/tests/test_merge_queue_orphan_reaper.py',
+    'orchestrator/tests/test_merge_queue_restart_hook.py',
+    'orchestrator/tests/test_offline_lane_records.py',
+    'orchestrator/tests/test_remote_gate.py',
+    'orchestrator/tests/test_verify.py',
+    'orchestrator/tests/test_verify_admission_cancel_release.py',
+    'orchestrator/tests/test_verify_admission_executor_bypass.py',
+    'orchestrator/tests/test_verify_admission_gate.py',
+    'orchestrator/tests/test_verify_admission_order_integration.py',
+    'orchestrator/tests/test_verify_admission_watch.py',
+    'orchestrator/tests/test_verify_hosts.py',
+    'orchestrator/tests/test_verify_plan_latch.py',
+    'orchestrator/tests/test_workflow_halt_owner.py',
+    'dashboard/tests/test_db.py',
+    'dashboard/tests/test_mcp_fanout.py',
+    'dashboard/tests/test_durability.py',
+    'dashboard/tests/test_metrics_curator.py',
+    'dashboard/tests/_dashboard_helpers.py',
+    'dashboard/tests/test_api_curator.py',
+    'dashboard/tests/test_memory_exchange_isolation.py',
+    'dashboard/tests/test_merge_queue_data.py',
+    'dashboard/tests/test_quality_sampler.py',
+    'dashboard/tests/test_quality_marker_sampler.py',
+    'dashboard/tests/test_escalation_corpus.py',
+    'fused-memory/tests/test_harness.py',
+    'fused-memory/tests/test_drain_signal_handler.py',
+    'fused-memory/tests/test_memory_service.py',
+    'fused-memory/tests/test_operator_signal_handler.py',
+    'fused-memory/tests/test_periodic_rebuild_summaries.py',
+    'fused-memory/tests/test_task_interceptor.py',
+    'fused-memory/tests/_fm_polling.py',
+    'fused-memory/tests/server/test_grouped_read.py',
+    'fused-memory/tests/test_dependency_direction_check.py',
+    'fused-memory/tests/test_e2e_durable_queue.py',
+    'fused-memory/tests/test_journaling_integration.py',
+    'fused-memory/tests/test_recon_claim_verification_wiring.py',
+    'fused-memory/tests/test_mem0_collection_provisioning.py',
+    'fused-memory/tests/test_event_loop_lag.py',
+    'fused-memory/tests/test_event_queue.py',
+    'fused-memory/tests/test_main_curator_usage_gate.py',
+    'shared/tests/test_cli_invoke.py',
+    'shared/tests/test_uuid_prefix_guard.py',
+    'shared/tests/test_async_sqlite_base.py',
+    'shared/tests/test_auth_failed.py',
+    'shared/tests/test_auth_reprobe_opt_out.py',
+    'shared/tests/test_cli_invoke_transcript_offloop.py',
+    'shared/tests/test_failover_integration.py',
+    'shared/tests/test_git_async.py',
+    'shared/tests/test_usage_gate_park_visibility.py',
+    'escalation/tests/test_prefix_resolver_client.py',
+})
+
+# Exactly ONE Rule C violation (bare wait_for; the bound is derived, not written),
+# so N copies produce N violations, copy i on line i, and the arithmetic in the
+# budget tests is exact.
+_RULE_C_ONE_HIT = 'asyncio.wait_for(req_a.result, timeout=MERGE_RESULT_TIMEOUT)\n'
+
+# One Rule C violation per non-Call leg: an asyncio.timeout block wrapping a poll,
+# and a poll giving up against a clock-deadline read.
+_RULE_C_POLL_LEGS = (
+    'import asyncio\n'
+    '\n'
+    '\n'
+    'async def await_ready(verifier, timeout):\n'
+    '    async with asyncio.timeout(timeout):\n'
+    '        while not verifier.ready:\n'
+    '            await asyncio.sleep(0.01)\n'
+    '\n'
+    '\n'
+    'async def await_done(state, deadline):\n'
+    '    loop = asyncio.get_running_loop()\n'
+    '    while loop.time() < deadline:\n'
+    '        if state.done:\n'
+    '            return\n'
+    '        await asyncio.sleep(0.01)\n'
+)
+
+
+def _live_rule_c_debt_entry() -> tuple[str, int]:
+    """The live baseline entry with the LARGEST budget, for the find_violations legs.
+
+    Chosen at runtime rather than named, so no future shrink can strand a test on a
+    migrated file; callers keep their arithmetic relative to the returned budget.
+
+    Fails rather than skips on an empty baseline: a skip would leave the debt
+    machinery and its tests dormant, unnoticed among thousands of passes.
+    """
+    debt = _checker._WALL_CLOCK_DEADLINE_DEBT
+    if not debt:
+        pytest.fail(
+            'the Rule C debt baseline is empty: every file is migrated. Retire '
+            "Rule C's debt items in this same change: _WALL_CLOCK_DEADLINE_DEBT, "
+            '_WALL_CLOCK_DEADLINE_BUDGETS, _wall_clock_overrun_msg and '
+            '_wall_clock_slack_msg in check_bare_magicmock_config.py, and the '
+            'tests that call _live_rule_c_debt_entry here. The shared DebtEntry, '
+            'DebtBaseline and apply_debt_budget in _lint_cli.py stay: Rule D '
+            'uses them'
+        )
+    return max(debt.items(), key=lambda item: item[1])
+
+
+class TestWallClockDeadlineDebtBaseline:
+    """The shrink-only per-file debt baseline that lets Rule C ship default-ON.
+
+    Pre-existing violations — 618 across 20 files when task 4246 shipped the rule,
+    650 across 47 files in four packages once task 5269 widened its detection, and
+    311 across 91 files in five packages once task 7800 taught it asyncio.timeout
+    blocks and clock-deadline polls (220 across 39 before; every added one newly
+    SEEN, not new debt) — mean a hot default-on rule would turn those packages' lint_commands red
+    immediately and stall the merge lane repo-wide — the identical situation Rule B
+    faced at 95 sites/11 files, solved the identical way and since retired, its debt
+    fully migrated (task 4354).
+
+    Opt-OUT rather than opt-in, deliberately: an opt-in list would exempt precisely
+    the brand-new file this rule exists to catch, and "which files are covered"
+    would become a hand-maintained list — the exact failure mode task 3980's
+    amendment pass deleted a class list to escape.
+
+    Modelled on Rule B's retired baseline class, and additionally pins that the
+    budget machinery suppresses Rule C alone.
+
+    NOT one-for-one, in both directions, and the difference is deliberate:
+
+      * A sum-and-count pin (``len(debt) == 20 and sum(...) == 618``) was tried and
+        REMOVED in task 4246's amendment pass. It restated in literals what the
+        exact-paths frozenset above and the checker's own exact budget already
+        enforce against the real repo — and it taxed the one workflow this whole
+        design exists to enable: migrating a single wait under orchestrator/tests
+        then meant editing three literals in another package's test file before
+        the suite went green.
+      * The exact-budget guard has no Rule B counterpart. That WAS a scope
+        escalation over the precedent, kept on purpose: Rule C's baseline is a
+        per-file BUDGET rather than Rule B's bare list, so slack above the
+        measurement is not inert — it silently licences that many new waits. It
+        first lived as live-census tests in this module, so an orchestrator-side
+        removal turned fused-memory RED.  Task 6202 moved it into the checker's
+        own slack leg (TestWallClockDeadlineDebtSlack): the same removal now reds
+        orchestrator's own lint_command, naming the edit, not this suite.
+
+    For the same reason as that removed pin, no test here is anchored to a real
+    file's exact budget: every leg drives find_violations against a live entry
+    picked at runtime and keeps its arithmetic relative to that entry's budget.
+    """
+
+    def test_debt_baseline_holds_exactly_the_measured_census_paths(self):
+        """_WALL_CLOCK_DEADLINE_DEBT == the measured census paths — no more, no less."""
+        debt = _checker._WALL_CLOCK_DEADLINE_DEBT
+        assert set(debt) == _EXPECTED_WALL_CLOCK_DEBT_PATHS, (
+            'Rule C debt baseline drifted from the measured census.\n'
+            f'  unexpected additions: {sorted(set(debt) - _EXPECTED_WALL_CLOCK_DEBT_PATHS)}\n'
+            f'  missing entries:      {sorted(_EXPECTED_WALL_CLOCK_DEBT_PATHS - set(debt))}\n'
+            'The list is SHRINK-ONLY: entries may be removed as files are migrated '
+            'onto wait_responsive(...), never added.'
+        )
+
+    def test_test_merge_speculation_is_not_grandfathered(self):
+        """test_merge_speculation.py must NOT be on the Rule C baseline.
+
+        It measures ZERO today because task 3980 migrated it. Even a budgeted entry
+        of zero would be a blanket suppression letting a regression land there
+        silently — which is what 3980 spent a task removing, and what makes it safe
+        to delete that module's file-local copy of this guard in step-12.
+        """
+        assert (
+            'orchestrator/tests/test_merge_speculation.py'
+            not in _checker._WALL_CLOCK_DEADLINE_DEBT
+        ), (
+            'test_merge_speculation.py must stay OFF the Rule C baseline — it is at '
+            'zero and must FAIL the gate on a regression, not be grandfathered'
+        )
+
+    def test_same_source_opposite_verdicts_by_filename(self):
+        """The identical offending source is suppressed in a debt file and flagged elsewhere."""
+        entry, budget = _live_rule_c_debt_entry()
+        assert budget >= 1, (
+            f'this leg drives {entry} at exactly its budget and expects the same source '
+            f'to flag elsewhere, so it needs a budget of at least 1; got {budget}'
+        )
+        source = _RULE_C_ONE_HIT * budget
+        assert _rule_c(source, entry) == [], (
+            'Rule C must be suppressed in a debt-listed file at its recorded budget'
+        )
+        flagged = _rule_c(source, _NON_DEBT_FILE)
+        assert len(flagged) == budget, (
+            'the SAME source in a non-debt file must still flag — otherwise the '
+            f'baseline is not a baseline but a global off switch; got {flagged!r}'
+        )
+
+    def test_suppression_works_for_absolute_paths(self):
+        """An absolute path ending in the debt components gets the budget too.
+
+        The nine call sites pass repo-relative paths; pytest passes absolutes. Both
+        must reach the same verdict or the baseline would be invisible to one caller.
+        """
+        entry, budget = _live_rule_c_debt_entry()
+        at_budget = _RULE_C_ONE_HIT * budget
+        assert _rule_c(at_budget, entry) == []
+        live_absolute = str(_REPO_ROOT / entry)
+        assert _rule_c(at_budget, live_absolute) == [], (
+            'find_violations must hand an absolute filename to the baseline lookup '
+            f'unchanged, so a debt file is suppressed for pytest callers too; '
+            f'filename={live_absolute!r}'
+        )
+
+    def test_matching_is_path_component_aware_not_substring(self):
+        """Trailing-COMPONENT matching: a substring match must not grandfather an unrelated file."""
+        entry, budget = _live_rule_c_debt_entry()
+        at_budget = _RULE_C_ONE_HIT * budget
+        prefixed = 'evil/' + entry
+        assert _rule_c(at_budget, prefixed) == [], (
+            f'{prefixed} has {entry} as its real trailing components and gets its budget'
+        )
+        live = PurePosixPath(entry)
+        live_substring = str(live.with_name('not_' + live.name))
+        flagged = _rule_c(at_budget, live_substring)
+        assert len(flagged) == budget, (
+            f'{live_substring} merely CONTAINS the debt filename {live.name} as a '
+            f'substring and must be reported in full; got {flagged!r}'
+        )
+        flagged_bare = _rule_c(at_budget, live.name)
+        assert len(flagged_bare) == budget, (
+            f'a bare basename {live.name} at another root shares only ONE trailing '
+            f'component with {entry} and must be reported in full; got {flagged_bare!r}'
+        )
+
+    def test_debt_file_is_silent_at_budget_and_reports_the_overrun_above_it(self):
+        """The budget is what makes 'shrink-only' checked rather than merely commented.
+
+        Without it a debt entry grandfathers its file WHOLESALE, so a brand-new
+        wall-clock wait added to an actively-developed debt file would be
+        invisible to the gate forever.
+        """
+        entry, budget = _live_rule_c_debt_entry()
+        at_budget = _rule_c(_RULE_C_ONE_HIT * budget, entry)
+        assert at_budget == [], (
+            f'{entry} carrying exactly its recorded {budget} violations must stay '
+            f'silent — that is the grandfathering the baseline exists for; got {at_budget!r}'
+        )
+
+        over_budget = _rule_c(_RULE_C_ONE_HIT * (budget + 2), entry)
+        assert len(over_budget) == 2, (
+            'a debt file that GROWS past its recorded budget must report exactly the '
+            f'overrun ({budget + 2} - budget {budget} = 2); got {over_budget!r}'
+        )
+
+    def test_reported_overrun_sites_are_the_last_in_source_order(self):
+        """The anchor is positional and deterministic, not a claim about which site is new."""
+        entry, budget = _live_rule_c_debt_entry()
+        over_budget = _rule_c(_RULE_C_ONE_HIT * (budget + 3), entry)
+        last_three = [budget + 1, budget + 2, budget + 3]
+        assert [v.lineno for v in over_budget] == last_three, (
+            f'expected the LAST 3 of {budget + 3} sites (budget {budget}); '
+            f'got {[v.lineno for v in over_budget]}'
+        )
+
+    def test_overrun_message_names_the_budget_and_forbids_raising_it(self):
+        """The overrun message must not read as a normal Rule C hit.
+
+        The remedy differs: a normal hit says "route this wait through
+        wait_responsive", an overrun says "you added debt to a file that may only
+        shrink". Conflating them invites the reader to fix it by editing the number.
+        """
+        entry, budget = _live_rule_c_debt_entry()
+        message = _rule_c(_RULE_C_ONE_HIT * (budget + 1), entry)[0].message
+        for needle in (
+            'debt baseline',
+            f'budget of {budget}',
+            f'{budget + 1} were found',
+            'Do NOT raise',
+        ):
+            assert needle in message, (
+                f'the overrun message must name {needle!r} so the reader fixes the debt '
+                f'rather than the baseline; got {message!r}'
+            )
+
+    def test_overrun_message_carries_rule_c_remedies_not_rule_b_ones(self):
+        """A Rule C overrun must never prescribe fake_verify_result.
+
+        Driven end to end through find_violations against a LIVE baseline entry, so
+        it also proves find_violations looks the filename up in the real baseline,
+        applies that budget to the count, and wires Rule C's own overrun builder.
+        """
+        entry, budget = _live_rule_c_debt_entry()
+        overrun = _rule_c(_RULE_C_ONE_HIT * (budget + 1), entry)
+        assert len(overrun) == 1, (
+            f'{budget + 1} hits against {entry} (budget {budget}) must report exactly '
+            f'the one-violation overrun; got {overrun!r}'
+        )
+        message = overrun[0].message
+        for needle in (
+            'wall-clock-deadline',
+            'wait_responsive',
+            'MERGE_RESULT_TIMEOUT',
+            'debt baseline',
+            f'budget of {budget}',
+        ):
+            assert needle in message, (
+                f'the Rule C overrun message must carry {needle!r}; got {message!r}'
+            )
+        for foreign in ('fake_verify_result', 'spec=VerifyResult', 'bare-dataclass-double'):
+            assert foreign not in message, (
+                f'Rule C overrun message must not offer {foreign!r}: {message!r}'
+            )
+
+    def test_overrun_message_cites_both_responsive_helpers_at_their_homes(self):
+        """An overrun may be a new poll as well as a new wait, so it names both remedies.
+
+        A debt file's budget now counts clock-deadline polls and timeout blocks, whose
+        remedy is poll_responsive, not wait_responsive.
+        """
+        entry, budget = _live_rule_c_debt_entry()
+        [overrun] = _rule_c(_RULE_C_ONE_HIT * (budget + 1), entry)
+        for citation in (
+            'orchestrator/tests/_orch_helpers.py::wait_responsive',
+            'orchestrator/tests/_poll_responsive.py::poll_responsive',
+            'poll_responsive(predicate, ...)',
+        ):
+            assert citation in overrun.message, (
+                f'the Rule C overrun message must cite {citation!r}; got {overrun.message!r}'
+            )
+
+
+class TestWallClockDeadlineDebtSlack:
+    """A debt file carrying FEWER violations than its budget is reported by the lint itself.
+
+    Slack above the measurement silently licences that many new wall-clock waits, so
+    the budget must stay exact.  Task 6202 moved that check out of a fused-memory-only
+    census test and into the checker: the red now lands in the owning package's own
+    lint_command (and the pre-commit hook), naming the one-line edit, instead of in
+    another package's suite after merge.
+    """
+
+    @staticmethod
+    def _live_entry_of_at_least_2() -> tuple[str, int]:
+        entry, budget = _live_rule_c_debt_entry()
+        assert budget >= 2, (
+            f'the slack legs drive budget-1 hits under {entry} and need that to be at '
+            f'least 1, so they need a budget of at least 2; got {budget}'
+        )
+        return entry, budget
+
+    def test_a_debt_file_below_its_budget_reports_one_file_level_slack_violation(self):
+        """Slack has no site — the removed wait is gone — so it is ONE violation at 1:0."""
+        entry, budget = self._live_entry_of_at_least_2()
+        slack = _rule_c(_RULE_C_ONE_HIT * (budget - 1), entry)
+        assert len(slack) == 1, (
+            f'{budget - 1} hits against {entry} (budget {budget}) must report exactly one '
+            f'file-level slack violation; got {slack!r}'
+        )
+        assert (slack[0].lineno, slack[0].col_offset) == (1, 0), (
+            f'the slack violation is file-level and anchors at 1:0; got {slack[0]!r}'
+        )
+
+    def test_the_slack_message_names_the_exact_edit(self):
+        """The message leads the author to the one-line budget edit, and nowhere else."""
+        entry, budget = self._live_entry_of_at_least_2()
+        message = _rule_c(_RULE_C_ONE_HIT * (budget - 1), entry)[0].message
+        for needle in (
+            f"_WALL_CLOCK_DEADLINE_DEBT['{entry}']",
+            f'from {budget} to {budget - 1}',
+            'fused-memory/scripts/check_bare_magicmock_config.py',
+            'wall-clock-deadline',
+        ):
+            assert needle in message, (
+                f'the slack message must name {needle!r}; got {message!r}'
+            )
+        # No per-site suppression can fix slack, and no Rule A/B remedy applies.
+        for foreign in (
+            'mock_orch_config',
+            'pydantic_spec',
+            'fake_verify_result',
+            'spec=VerifyResult',
+            'bare-magicmock',
+            'bare-dataclass-double',
+            '# noqa',
+        ):
+            assert foreign not in message, (
+                f'the slack message must not offer {foreign!r}: {message!r}'
+            )
+
+    def test_a_debt_file_at_zero_is_told_to_drop_its_entry(self):
+        """A fully migrated debt file must leave the baseline, not sit at a budget of 0."""
+        entry, _budget = self._live_entry_of_at_least_2()
+        slack = _rule_c('', entry)
+        assert len(slack) == 1, (
+            f'a debt file with no Rule C violations left must report one slack '
+            f'violation; got {slack!r}'
+        )
+        assert (slack[0].lineno, slack[0].col_offset) == (1, 0), (
+            f'the at-zero slack violation is file-level and anchors at 1:0; got {slack[0]!r}'
+        )
+        message = slack[0].message
+        for needle in (
+            f"_WALL_CLOCK_DEADLINE_DEBT['{entry}']",
+            '_EXPECTED_WALL_CLOCK_DEBT_PATHS',
+            'fused-memory/tests/test_check_bare_magicmock_config.py',
+        ):
+            assert needle in message, (
+                f'the at-zero slack message must name {needle!r}; got {message!r}'
+            )
+
+    def test_a_debt_file_at_exactly_its_budget_is_silent(self):
+        """Exactly the recorded number is the grandfathering the baseline exists for."""
+        entry, budget = self._live_entry_of_at_least_2()
+        assert _rule_c(_RULE_C_ONE_HIT * budget, entry) == []
+
+    def test_slack_quotes_the_baseline_key_not_the_scanned_filename(self):
+        """pytest passes absolute paths; only the dict KEY is an edit the author can apply."""
+        entry, budget = self._live_entry_of_at_least_2()
+        absolute = str(_REPO_ROOT / entry)
+        slack = _rule_c(_RULE_C_ONE_HIT * (budget - 1), absolute)
+        assert len(slack) == 1, slack
+        message = slack[0].message
+        assert f"['{entry}']" in message, (
+            f'the slack message must quote the baseline key {entry!r}; got {message!r}'
+        )
+        assert absolute not in message, (
+            f'the slack message must not quote the scanned filename {absolute!r}; '
+            f'got {message!r}'
+        )
+
+    def test_a_removal_reds_the_owning_packages_own_lint_command_naming_the_edit(
+        self, tmp_path: Path, capsys
+    ):
+        """DONE-WHEN (task 6202): the red lands in the author's own package lint.
+
+        Scans ``<tmp>/<pkg>/tests`` exactly as a package lint_command scans its tests
+        dir.  Removing one wait without the budget edit exits 1 naming the edit;
+        applying the count the edit records exits 0.  The file also carries exactly
+        its Rule D budget, if it has one, so Rule C's is the only budget under test.
+        """
+        entry, budget = self._live_entry_of_at_least_2()
+        debt_file = tmp_path / entry
+        debt_file.parent.mkdir(parents=True)
+        argv = [str(tmp_path.joinpath(*PurePosixPath(entry).parts[:2]))]
+        rule_d_at_budget = _RULE_D_SOURCE * _timing_debt.TIMING_DEPENDENCE_DEBT.get(entry, 0)
+
+        debt_file.write_text(_RULE_C_ONE_HIT * (budget - 1) + rule_d_at_budget)
+        removed_exit = _checker.main(argv)
+        removed = capsys.readouterr()
+        assert removed_exit == 1, (
+            f'a removal without the budget edit must red the package lint; '
+            f'stdout={removed.out!r} stderr={removed.err!r}'
+        )
+        edit = f"_WALL_CLOCK_DEADLINE_DEBT['{entry}'] from {budget} to {budget - 1}"
+        assert edit in removed.out, (
+            f'the package lint must name the edit {edit!r}; got {removed.out!r}'
+        )
+
+        debt_file.write_text(_RULE_C_ONE_HIT * budget + rule_d_at_budget)
+        exact_exit = _checker.main(argv)
+        exact = capsys.readouterr()
+        assert exact_exit == 0, (
+            f'a debt file at exactly its budget must leave the package lint green; '
+            f'stdout={exact.out!r} stderr={exact.err!r}'
+        )
+
+
+class TestDebtBaselineIsolation:
+    """Rule C's baseline is Rule C's alone: its debt entries suppress no other rule.
+
+    The Rule B leg is TestRuleBIsUnconditional::test_a_rule_c_debt_file_reports_rule_b_in_full.
+    """
+
+    def test_rule_a_is_reported_in_full_in_a_rule_c_debt_file(self):
+        """The Rule C baseline grandfathers wall-clock debt, not all test-quality discipline."""
+        entry, _budget = _live_rule_c_debt_entry()
+        violations = [
+            v for v in find_violations(_RULE_A_SOURCE, entry) if 'bare-magicmock' in v.message
+        ]
+        assert len(violations) == 1, (
+            'a bare config MagicMock in a Rule-C-debt file is still a Rule A '
+            f'violation; got {violations}'
+        )
+        assert 'mock_orch_config' in violations[0].message
+
+
+@pytest.mark.xdist_group(_REPO_SCAN_GROUP_NAME)
+@pytest.mark.timeout(MAGICMOCK_REPO_SCAN_TEST_TIMEOUT)
+class TestWallClockDeadlineBaselineIntegrity:
+    """The Rule C baseline names exactly the real files that carry Rule C debt.
+
+    Every assertion here recomputes against the live source with the checker's own
+    predicates.  A baseline asserted only from literals drifts silently: an entry
+    whose file was deleted or renamed becomes a blanket suppression for a path
+    nothing occupies — which would grandfather a NEW file created there — and an
+    offending file the census missed is reported only as a wall of lint output.
+
+    The per-file comparison of count against budget does NOT live here: the
+    checker's ``_lint_cli.py::apply_debt_budget`` makes it at every lint call site (and
+    TestAllScannedTestDirsClean runs that lint over every scanned dir), so a
+    removal reds the owning package's lint_command naming the edit (task 6202).
+    What a per-file lint cannot see is a debt file that no longer exists, which
+    is why the existence test stays.
+    """
+
+    def test_every_debt_entry_resolves_to_an_existing_file(self):
+        """A deleted or renamed file must not leave a stale blanket suppression behind."""
+        missing = [
+            entry
+            for entry in _checker._WALL_CLOCK_DEADLINE_DEBT
+            if not (_REPO_ROOT / entry).is_file()
+        ]
+        assert missing == [], (
+            f'Rule C debt baseline entries no longer exist in the repo: {missing}. '
+            'A stale entry silently suppresses Rule C for a path nothing occupies — '
+            'and would grandfather a NEW file created at that path. Remove them.'
+        )
+
+    def test_no_scanned_file_outside_the_baseline_carries_a_violation(self, repo_test_scan):
+        """The baseline is complete: every offending file in the seven scanned dirs is listed.
+
+        The complement of test_every_debt_entry_resolves_to_an_existing_file — that one
+        catches stale entries, this one catches a file the census missed (e.g. one added
+        on main since the measurement). Without it the repo-wide gate would be the only
+        signal, and it reports a wall of text rather than a filename.
+        """
+        listed = set(_checker._WALL_CLOCK_DEADLINE_DEBT)
+        unlisted = []
+        for record in repo_test_scan:
+            if record.relpath in listed:
+                continue
+            if record.syntax_error is not None:
+                raise record.syntax_error
+            if record.rule_c_count:
+                unlisted.append(f'{record.relpath}: {record.rule_c_count}')
+        assert unlisted == [], (
+            'These scanned files carry Rule C violations but are NOT on the baseline, '
+            'so their package lint_command is RED:\n  ' + '\n  '.join(unlisted)
+        )
+
+
+@pytest.mark.xdist_group(_REPO_SCAN_GROUP_NAME)
+@pytest.mark.timeout(MAGICMOCK_REPO_SCAN_TEST_TIMEOUT)
+class TestTimingDependenceBaselineIntegrity:
+    """The Rule D baseline names only real files, and every scanned file it must.
+
+    The same two complements as TestWallClockDeadlineBaselineIntegrity, over
+    ``_timing_dependence_debt.py::TIMING_DEPENDENCE_DEBT``. There is no literal
+    expected-paths set: at some 400 entries it would only restate the baseline
+    (INV-5), and each file's exact count is enforced by the lint's own budget at
+    every call site.
+
+    Known gap: ``repo_test_scan`` reads TestAllScannedTestDirsClean._SCANNED_DIRS,
+    which omits client-feed/tests although the dark-factory-orchestrator.yaml
+    lint_command scans it. A client-feed file missing from the baseline is caught
+    by that lint, not here.
+    """
+
+    def test_every_debt_entry_resolves_to_an_existing_file(self):
+        """A deleted or renamed file must not leave a stale budget behind."""
+        missing = [
+            entry
+            for entry in _timing_debt.TIMING_DEPENDENCE_DEBT
+            if not (_REPO_ROOT / entry).is_file()
+        ]
+        assert missing == [], (
+            f'Rule D debt baseline entries no longer exist in the repo: {missing}. '
+            'A stale entry would grandfather a NEW file created at that path. Remove them.'
+        )
+
+    def test_no_scanned_file_outside_the_baseline_carries_an_uncovered_site(self, repo_test_scan):
+        """The baseline is complete: every scanned file with an uncovered site is listed."""
+        listed = set(_timing_debt.TIMING_DEPENDENCE_DEBT)
+        unlisted = []
+        for record in repo_test_scan:
+            if record.relpath in listed:
+                continue
+            if record.syntax_error is not None:
+                raise record.syntax_error
+            if record.timing_count:
+                unlisted.append(f'{record.relpath}: {record.timing_count}')
+        assert unlisted == [], (
+            'These scanned files carry uncovered timing-dependence sites but are NOT on '
+            'the baseline, so their package lint_command is RED:\n  ' + '\n  '.join(unlisted)
+        )
+
+
+# ===========================================================================
+# Rule D — timing-dependence, composed into the one walk (task 8254)
+# ===========================================================================
+
+
+def _rule_d(source: str, filename: str = _NON_DEBT_FILE) -> list:
+    """Return only the Rule D violations find_violations reports for *source*."""
+    return [
+        v
+        for v in find_violations(source, filename)
+        if 'timing-dependence' in v.message
+    ]
+
+
+# A written bound Rule C ignores: the awaited call is no load-bearing wait.
+_UNBOUND_FETCH_WAIT = 'asyncio.wait_for(client.fetch(), timeout=5)\n'
+
+_TIMEOUT_BLOCK_ON_A_BARRIER = (
+    'import asyncio\n'
+    '\n'
+    '\n'
+    'async def test_case(ev):\n'
+    '    async with asyncio.timeout(5):\n'
+    '        await ev.wait()\n'
+)
+_SLEEP_IN_THE_BLOCK = '        await asyncio.sleep(0.1)\n'
+_SLEEP_IN_THE_BLOCK_LINENO = _TIMEOUT_BLOCK_ON_A_BARRIER.count('\n') + 1
+
+
+class TestTimingDependenceComposition:
+    """Rule D runs in the checker's one walk, and Rule C has precedence on a shared node.
+
+    A node Rule C reports, before its budget, is not also a Rule D literal-deadline
+    site: one site gets one code and one remedy. A Rule C noqa means Rule C reports
+    nothing, so Rule D still sees the literal. Sleeps are separate nodes and are
+    never deferred. Rule D's own legs are tested beside its module, in
+    test_timing_dependence.py.
+    """
+
+    def test_a_load_bearing_literal_wait_is_rule_c_alone(self):
+        assert len(_rule_c(_RULE_C_SOURCE)) == 2
+        assert _rule_d(_RULE_C_SOURCE) == []
+
+    def test_a_literal_wait_rule_c_ignores_is_one_rule_d_site(self):
+        assert _rule_c(_UNBOUND_FETCH_WAIT) == []
+        assert len(_rule_d(_UNBOUND_FETCH_WAIT)) == 1
+
+    def test_a_rule_c_exempted_wait_is_still_a_rule_d_site(self):
+        source = '# noqa: wall-clock-deadline — Process.wait()\n' + _RULE_C_SOURCE
+
+        assert _rule_c(source) == []
+        assert len(_rule_d(source)) == 1
+
+    def test_a_timeout_block_rule_c_reports_is_not_a_rule_d_site(self):
+        assert _rule_c(_TIMEOUT_BLOCK_ON_A_BARRIER) != []
+        assert _rule_d(_TIMEOUT_BLOCK_ON_A_BARRIER) == []
+
+    def test_a_sleep_inside_that_block_is_still_a_rule_d_site(self):
+        source = _TIMEOUT_BLOCK_ON_A_BARRIER + _SLEEP_IN_THE_BLOCK
+
+        [sleep] = _rule_d(source)
+
+        assert sleep.lineno == _SLEEP_IN_THE_BLOCK_LINENO
+        assert _rule_c(source) != []
+
+    def test_a_clock_plus_literal_argument_of_a_reported_block_is_not_a_rule_d_site(self):
+        source = _TIMEOUT_BLOCK_ON_A_BARRIER.replace(
+            'asyncio.timeout(5)', 'asyncio.timeout_at(asyncio.get_running_loop().time() + 5)'
+        )
+
+        assert _rule_c(source) != []
+        assert _rule_d(source) == []
+
+
+_ALL_FOUR_RULES = (
+    _RULE_A_SOURCE + _RULE_B_SOURCE + _RULE_C_SOURCE + _UNBOUND_FETCH_WAIT + _RULE_D_SOURCE
+)
+
+_COVERED_SLEEP = (
+    'import pytest\n'
+    'import time\n'
+    '\n'
+    '\n'
+    "@pytest.mark.timing(reason='the grace period is the behaviour under test')\n"
+    'def test_grace():\n'
+    '    time.sleep(0.1)\n'
+)
+
+
+def _debt_counts(source: str, filename: str = _NON_DEBT_FILE):
+    return _checker.count_debt_in_tree(ast.parse(source), source, filename)
+
+
+class TestCountDebtInTree:
+    """The raw, pre-budget counts each debt baseline records, from the walk the gate runs."""
+
+    def test_counts_name_each_budgeted_rule(self):
+        assert _debt_counts(_RULE_C_SOURCE + _RULE_D_SOURCE) == _checker.DebtCounts(
+            wall_clock_deadline=2, timing_dependence=1
+        )
+
+    def test_on_a_non_debt_file_the_counts_are_the_reported_violations(self):
+        counts = _debt_counts(_ALL_FOUR_RULES)
+
+        assert counts == (len(_rule_c(_ALL_FOUR_RULES)), len(_rule_d(_ALL_FOUR_RULES)))
+        assert counts == (2, 2)
+
+    def test_a_debt_budget_does_not_change_the_count(self):
+        entry, budget = _live_rule_c_debt_entry()
+
+        counts = _debt_counts(_RULE_C_ONE_HIT * (budget + 1), entry)
+
+        assert counts.wall_clock_deadline == budget + 1
+
+    def test_a_covered_timing_site_is_not_counted(self):
+        assert _debt_counts(_COVERED_SLEEP) == (0, 0)
+
+
+class TestScanTree:
+    """One walk yields the budgeted verdict and the raw counts; the narrow seams project it."""
+
+    def test_on_a_debt_file_the_verdict_is_budgeted_and_the_counts_are_raw(self):
+        entry, budget = _live_rule_c_debt_entry()
+        source = _RULE_C_ONE_HIT * (budget + 1)
+        tree = ast.parse(source)
+
+        scan = _checker.scan_tree(tree, source, entry)
+
+        assert scan.violations == find_violations(source, entry) != []
+        assert scan.debt == _checker.count_debt_in_tree(tree, source, entry)
+        assert scan.debt.wall_clock_deadline == budget + 1
+
+
+def _assert_the_tree_seam_agrees(source: str, filename: str) -> list:
+    expected = find_violations(source, filename)
+    tree = ast.parse(source, filename=filename)
+    assert _checker.find_violations_in_tree(tree, source, filename) == expected
+    return expected
+
+
+class TestFindViolationsInTree:
+    """The tree-taking seam is find_violations after its parse, for every rule."""
+
+    @pytest.mark.parametrize(
+        'source',
+        [
+            pytest.param(_RULE_A_SOURCE, id='rule-a'),
+            pytest.param(
+                '# noqa: bare-magicmock — exempted for the seam test\n' + _RULE_A_SOURCE,
+                id='rule-a-exempted',
+            ),
+            pytest.param(_RULE_B_SOURCE, id='rule-b'),
+            pytest.param(_RULE_C_SOURCE, id='rule-c'),
+            pytest.param(_RULE_D_SOURCE, id='rule-d'),
+        ],
+    )
+    def test_agrees_with_find_violations_on_each_rule(self, source: str):
+        _assert_the_tree_seam_agrees(source, _NON_DEBT_FILE)
+
+    @pytest.mark.parametrize('offset', [-1, 0, 1], ids=['below', 'at', 'above'])
+    def test_agrees_with_find_violations_on_the_debt_budget(self, offset: int):
+        entry, budget = _live_rule_c_debt_entry()
+
+        _assert_the_tree_seam_agrees(_RULE_C_ONE_HIT * (budget + offset), entry)
+
+    def test_agrees_with_find_violations_on_a_source_carrying_all_three(self):
+        source = _RULE_A_SOURCE + _RULE_B_SOURCE + _RULE_C_SOURCE
+
+        violations = _assert_the_tree_seam_agrees(source, _NON_DEBT_FILE)
+
+        assert [v.lineno for v in violations] == [1, 2, 3, 3]
+
+    def test_agrees_with_find_violations_on_a_source_carrying_all_four(self):
+        source = _RULE_A_SOURCE + _RULE_B_SOURCE + _RULE_C_SOURCE + _RULE_D_SOURCE
+
+        violations = _assert_the_tree_seam_agrees(source, _NON_DEBT_FILE)
+
+        assert [v.lineno for v in violations] == [1, 2, 3, 3, 4]
+        assert 'timing-dependence' in violations[-1].message
+
+
+class TestScanRepoTestDirs:
+    """One parse per scanned file yields both the gate's violations and Rule C's count."""
+
+    _DIRS = ('pkg_a/tests', 'pkg_b/tests', 'absent/tests')
+
+    @pytest.fixture
+    def fake_repo(self, tmp_path: Path) -> Path:
+        files = {
+            'pkg_a/tests/test_bad.py': _RULE_A_SOURCE,
+            'pkg_a/tests/conftest.py': 'import pytest\n',
+            'pkg_a/tests/_helper.py': _RULE_C_ONE_HIT,
+            'pkg_a/tests/notes.py': _RULE_A_SOURCE,
+            'pkg_b/tests/sub/test_broken.py': 'def broken(:\n',
+        }
+        for rel, source in files.items():
+            path = tmp_path / rel
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(source, encoding='utf-8')
+        return tmp_path
+
+    def test_scans_exactly_the_discovered_files_of_each_present_dir(self, fake_repo: Path):
+        scanned = _scan_repo_test_dirs(fake_repo, self._DIRS)
+
+        assert [record.path for record in scanned] == [
+            *_checker.discover_scan_targets(fake_repo / 'pkg_a/tests'),
+            *_checker.discover_scan_targets(fake_repo / 'pkg_b/tests'),
+        ]
+        assert [record.relpath for record in scanned] == [
+            'pkg_a/tests/_helper.py',
+            'pkg_a/tests/conftest.py',
+            'pkg_a/tests/test_bad.py',
+            'pkg_b/tests/sub/test_broken.py',
+        ]
+
+    def test_gate_violations_carry_the_filename_the_cli_passes(self, fake_repo: Path):
+        by_relpath = {r.relpath: r for r in _scan_repo_test_dirs(fake_repo, self._DIRS)}
+        bad = fake_repo / 'pkg_a/tests/test_bad.py'
+
+        assert by_relpath['pkg_a/tests/test_bad.py'].gate_violations == tuple(
+            find_violations(_RULE_A_SOURCE, str(bad))
+        )
+        assert by_relpath['pkg_a/tests/test_bad.py'].gate_violations[0].filename == str(bad)
+        assert by_relpath['pkg_a/tests/conftest.py'].gate_violations == ()
+
+    def test_rule_c_sites_are_counted_in_a_debt_free_file(self, fake_repo: Path):
+        by_relpath = {r.relpath: r for r in _scan_repo_test_dirs(fake_repo, self._DIRS)}
+
+        assert by_relpath['pkg_a/tests/_helper.py'].rule_c_count == 1
+        assert by_relpath['pkg_a/tests/test_bad.py'].rule_c_count == 0
+
+    def test_rule_c_count_includes_the_timeout_block_and_clock_poll_legs(self, tmp_path: Path):
+        relpath = 'pkg_a/tests/_poll_helper.py'
+        path = tmp_path / relpath
+        path.parent.mkdir(parents=True)
+        path.write_text(_RULE_C_POLL_LEGS, encoding='utf-8')
+
+        [record] = _scan_repo_test_dirs(tmp_path, ('pkg_a/tests',))
+
+        reported = [
+            v for v in find_violations(_RULE_C_POLL_LEGS, relpath) if 'wall-clock-deadline' in v.message
+        ]
+        assert record.rule_c_count == 2
+        assert record.rule_c_count == len(reported)
+
+    def test_timing_count_is_the_reported_rule_d_count_in_a_debt_free_file(self, tmp_path: Path):
+        relpath = 'pkg_a/tests/_poll_helper.py'
+        path = tmp_path / relpath
+        path.parent.mkdir(parents=True)
+        path.write_text(_RULE_C_POLL_LEGS, encoding='utf-8')
+
+        [record] = _scan_repo_test_dirs(tmp_path, ('pkg_a/tests',))
+
+        assert record.timing_count == 2
+        assert record.timing_count == len(_rule_d(_RULE_C_POLL_LEGS, relpath))
+
+    def test_a_syntax_error_is_recorded_with_no_gate_violation(self, fake_repo: Path):
+        by_relpath = {r.relpath: r for r in _scan_repo_test_dirs(fake_repo, self._DIRS)}
+        broken = by_relpath['pkg_b/tests/sub/test_broken.py']
+
+        assert isinstance(broken.syntax_error, SyntaxError)
+        assert broken.gate_violations == ()
+        assert by_relpath['pkg_a/tests/test_bad.py'].syntax_error is None
+
+
+_MERGE_SPECULATION = 'orchestrator/tests/test_merge_speculation.py'
+
+# The reviewer's own counter-example (task 3980): a sixth late-arrival class added
+# tomorrow, outside any hand-maintained list, carrying the exact bare mid-range
+# deadline that produced one of the three measured failures.
+_COUNTER_EXAMPLE_CLASS = (
+    '\n\n'
+    'class TestSomeBrandNewLateArrivalCase:\n'
+    '    async def test_new_case(self):\n'
+    '        await asyncio.wait_for(req_x.result, timeout=25.0)\n'
+)
+
+
+def _merge_speculation_source() -> str:
+    """Return the real test_merge_speculation.py source, or skip if absent.
+
+    Reached through the existing _REPO_ROOT, matching TestAllScannedTestDirsClean's
+    tolerance for a checkout without orchestrator/.
+    """
+    path = _REPO_ROOT / _MERGE_SPECULATION
+    if not path.is_file():
+        pytest.skip(f'{_MERGE_SPECULATION} not present under {_REPO_ROOT}')
+    return path.read_text(encoding='utf-8')
+
+
+def _strip_exemption_pragmas(source: str, code: str) -> str:
+    """Return *source* without the lines the checker reads as a *code* exemption.
+
+    Matches with ``_lint_cli.py::exemption_pattern`` on the stripped line, the
+    exact predicate ``_lint_cli.py::is_exempted`` applies, so this proof and the
+    rule cannot disagree about which separators spell a pragma.  Line endings are
+    kept, so the result equals *source* exactly when no line matched.
+    """
+    exempt_re = _lint_cli.exemption_pattern(code)
+    return ''.join(
+        line
+        for line in source.splitlines(keepends=True)
+        if not exempt_re.match(line.strip())
+    )
+
+
+class TestRuleCCoversMergeSpeculation:
+    """Two-sided proof that Rule C genuinely covers test_merge_speculation.py.
+
+    This is the PRECONDITION for deleting that module's file-local wall-clock
+    guard (_load_bearing_wait_target / _late_arrival_wait_offenders /
+    TestLateArrivalWaitsAreLoadIndependent, task 3980). Deleting a guard is only
+    honest if the replacement provably reaches the same code.
+
+    Leg (b) is the load-bearing one. Leg (a) alone — "the module is clean" — is
+    equally satisfied by a rule that never fires at all, or by one that quietly
+    grandfathered the module. Injecting the counter-example under that exact
+    filename and requiring it to flag is what distinguishes real coverage from
+    vacuous silence.
+    """
+
+    def test_the_module_is_clean_today(self):
+        """(a) Zero Rule C violations: task 3980 already migrated every site."""
+        violations = _rule_c(_merge_speculation_source(), _MERGE_SPECULATION)
+        assert violations == [], (
+            'test_merge_speculation.py must be Rule-C clean — task 3980 migrated its '
+            'load-bearing waits onto wait_responsive. Offenders:\n  '
+            + '\n  '.join(f'{v.lineno}: {v.message}' for v in violations)
+        )
+
+    def test_the_counter_example_flags_under_that_exact_filename(self):
+        """(b) The module is IN SCOPE, not grandfathered.
+
+        A sixth late-arrival class added tomorrow must trip BOTH offence kinds —
+        the wrong routing and the written number — under the module's own filename.
+        """
+        source = _merge_speculation_source() + _COUNTER_EXAMPLE_CLASS
+        violations = _rule_c(source, _MERGE_SPECULATION)
+        assert len(violations) == 2, (
+            'the counter-example must flag BOTH offence kinds under '
+            f'{_MERGE_SPECULATION}; got {violations!r}. If this is empty, the module '
+            'has been grandfathered onto _WALL_CLOCK_DEADLINE_DEBT and its file-local '
+            'guard must NOT be deleted.'
+        )
+        remedies = ' '.join(v.message for v in violations)
+        assert 'wait_responsive' in remedies
+        assert 'MERGE_RESULT_TIMEOUT' in remedies
+
+    def test_coverage_does_not_depend_on_the_file_local_guard_existing(self):
+        """The shared rule reads the module as plain source, not through its helpers.
+
+        Pinned explicitly because steps 12/14 delete those helpers: nothing about
+        this coverage may be an artefact of the guard being present when measured.
+        """
+        source = _merge_speculation_source()
+        assert '_late_arrival_wait_offenders' not in _COUNTER_EXAMPLE_CLASS
+        # The same verdict holds for a synthetic module carrying only the counter-example.
+        assert len(_rule_c(_COUNTER_EXAMPLE_CLASS, _MERGE_SPECULATION)) == 2
+        assert _rule_c(source, _MERGE_SPECULATION) == []
+
+
+# The Rule B counter-example: a VerifyResult-shaped double with the `passed` anchor
+# plus two more field matches, which is what _matching_shape requires.
+_RULE_B_COUNTER_EXAMPLE = (
+    '\n\n'
+    'class TestSomeBrandNewDoubleCase:\n'
+    '    def test_new_case(self):\n'
+    "        return MagicMock(passed=False, summary='x', verify_skipped=False)\n"
+)
+
+
+class TestRuleBCoversMergeSpeculation:
+    """Two-sided proof that Rule B already covers test_merge_speculation.py.
+
+    The PRECONDITION for deleting that module's file-local
+    `_BARE_DOUBLE_EXEMPT_SCOPES` / `_bare_verify_result_double_offenders` /
+    `TestNoBareVerifyResultDoubles` (task 3980), superseded by Rule B (task 4016).
+
+    MEASURED COVERAGE DELTA THE DELETION ACCEPTS — recorded here so a later reader
+    does not mistake the narrowing for an oversight. The two rules disagree in BOTH
+    directions:
+
+      * Rule B is STRICTER on ``MagicMock(spec=None)`` and on positional-arg specs.
+        ``_is_specced`` treats a literal ``None`` spec as no spec at all (it defeats
+        the rule's intent) and treats any concrete positional as a spec (MagicMock's
+        first positional IS spec). The file-local guard exempted anything carrying a
+        ``spec``/``spec_set`` kwarg, whatever its value.
+
+      * Rule B is NARROWER on a lone ``MagicMock(passed=True)``. It requires the
+        ``passed`` anchor PLUS at least two field matches, where the local guard
+        keyed on ``passed`` alone. That narrowing is deliberate and already argued
+        in ``_matching_shape``: the anchor by itself "would flag a stray
+        MagicMock(passed=True) on an unrelated object" across all seven scanned
+        packages. Every real site behind task 3980 carried four or more kwargs, so
+        the gap holds no measured site — and widening Rule B to close it would trade
+        a documented false negative for undocumented false positives repo-wide.
+    """
+
+    def test_the_module_is_clean_today(self):
+        """(a) Zero Rule B violations: the one deliberate site's pragma does the whole job.
+
+        This is what the deleted _BARE_DOUBLE_EXEMPT_SCOPES frozenset used to do,
+        now carried per-site by `# noqa: bare-dataclass-double` instead.
+        """
+        violations = _rule_b(_merge_speculation_source(), _MERGE_SPECULATION)
+        assert violations == [], (
+            'test_merge_speculation.py must be Rule-B clean. Offenders:\n  '
+            + '\n  '.join(f'{v.lineno}: {v.message}' for v in violations)
+        )
+
+    def test_the_counter_example_flags_under_that_exact_filename(self):
+        """(b) The module is IN SCOPE — and Rule B has no baseline to grandfather it."""
+        source = _merge_speculation_source() + _RULE_B_COUNTER_EXAMPLE
+        violations = _rule_b(source, _MERGE_SPECULATION)
+        assert len(violations) == 1, (
+            'a new bare VerifyResult-shaped double must flag under '
+            f'{_MERGE_SPECULATION}; got {violations!r}. If this is empty, the module '
+            'has been grandfathered and its file-local guard must NOT be deleted.'
+        )
+
+    @pytest.mark.parametrize('respelled', [False, True], ids=['as-written', 'ascii-hyphen'])
+    def test_stripping_the_pragma_makes_the_deliberate_site_flag(self, respelled: bool):
+        """(c) The exemption is the PRAGMA, not an accident of shape matching.
+
+        Without this, leg (a) is also satisfied by a deliberate site that Rule B
+        simply cannot see — in which case deleting the local guard would silently
+        drop coverage rather than transfer it.
+
+        Run once as written and once with the pragma's em-dash respelled as an ASCII
+        hyphen, a separator the checker equally accepts: the proof must hold for
+        every spelling of the pragma the rule honours.
+        """
+        original = _merge_speculation_source()
+        source = original
+        if respelled:
+            source = re.sub(r'(noqa: bare-dataclass-double) —', r'\1 -', original)
+            assert source != original, 'the respelling must actually change the pragma'
+        still_clean = _rule_b(source, _MERGE_SPECULATION)
+        assert still_clean == [], (
+            f'the respelled pragma must still exempt the site; got {still_clean!r}'
+        )
+        stripped = _strip_exemption_pragmas(source, _checker._RULE_B_CODE)
+        assert stripped != source, (
+            "no line matched the checker's own `bare-dataclass-double` exemption "
+            'regex, so there was no pragma to strip and this proof means nothing'
+        )
+        violations = _rule_b(stripped, _MERGE_SPECULATION)
+        assert len(violations) == 1, (
+            'with its pragma removed, the deliberate mutation site must flag — that '
+            f'is what proves Rule B sees it at all; got {violations!r}'
+        )
+
+    def test_the_documented_narrowing_is_real_and_deliberate(self):
+        """Pins the accepted delta in BOTH directions, so it stays a decision not a surprise."""
+        # NARROWER: the anchor alone is not enough (needs >= 2 field matches).
+        assert find_violations('m = MagicMock(passed=True)\n', _NON_DEBT_FILE) == [], (
+            'a lone MagicMock(passed=True) is deliberately NOT a Rule B match — the '
+            'anchor alone would flag stray unrelated objects repo-wide'
+        )
+        # STRICTER: spec=None does not exempt, where the file-local guard let it through.
+        assert len(
+            find_violations(
+                "m = MagicMock(spec=None, passed=True, summary='x')\n", _NON_DEBT_FILE
+            )
+        ) == 1, 'spec=None is semantically no spec at all and must NOT exempt'

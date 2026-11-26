@@ -19,13 +19,14 @@ from pathlib import Path
 import pytest
 from click.testing import CliRunner
 
-import orchestrator.cli as cli_module
+import orchestrator.cli_config as cli_config
+import orchestrator.evals.cli as eval_cli_module
 import orchestrator.evals.runner as runner_module
 from orchestrator.cli import main
 from orchestrator.config import OrchestratorConfig
 from orchestrator.evals import configs as configs_module
-from orchestrator.evals.report import build_composite_report
-from orchestrator.evals.runner import EvalResult
+from orchestrator.evals.composite_report import build_composite_report
+from orchestrator.evals.results import EvalResult
 
 
 def _mk_result(
@@ -40,11 +41,11 @@ def _mk_result(
     plan_quality: float | None = None,
     plan_steps: int | None = None,
     cap_tainted: bool = False,
-    invocation_error: str | None = None,
+    invocation_errors: list[dict[str, str]] | None = None,
 ) -> EvalResult:
     """A canned PASSING EvalResult carrying the C4 metrics the report reads.
 
-    ``plan_quality`` / ``cap_tainted`` / ``invocation_error`` mirror the
+    ``plan_quality`` / ``cap_tainted`` / ``invocation_errors`` mirror the
     PLAN-ONLY architect shape ``run_architect_eval`` writes (task 3099): a
     plan-only cell runs no test, so it carries ``tests_pass=None`` and its
     quality in ``plan_quality``.
@@ -73,7 +74,7 @@ def _mk_result(
             'plan_quality': plan_quality,
             'plan_steps': plan_steps,
             'cap_tainted': cap_tainted,
-            'invocation_error': invocation_error,
+            'invocation_errors': invocation_errors,
         },
         worktree_path='/tmp/eval-wt',
         wall_clock_ms=dur_ms,
@@ -108,7 +109,7 @@ def test_eval_ofat_invokes_run_ofat_stage_and_prints_report(
     monkeypatch, base_config, dummy_cfg_file, fixtures_dir,
 ):
     """``eval-ofat`` drives run_ofat_stage over ofat_candidates() and prints C4."""
-    monkeypatch.setattr(cli_module, 'load_config', lambda _: base_config)
+    monkeypatch.setattr(cli_config, 'load_config', lambda _: base_config)
 
     calls: list[tuple] = []
 
@@ -137,7 +138,7 @@ def test_eval_matrix_prints_composite_report_two_config_floor(
     monkeypatch, base_config, dummy_cfg_file, fixtures_dir,
 ):
     """``eval-matrix`` drives the matrix stage; report carries >=2 config rows."""
-    monkeypatch.setattr(cli_module, 'load_config', lambda _: base_config)
+    monkeypatch.setattr(cli_config, 'load_config', lambda _: base_config)
 
     calls: list[tuple] = []
 
@@ -183,7 +184,7 @@ def test_eval_confirm_invokes_run_confirm_stage(
     monkeypatch, base_config, dummy_cfg_file, fixtures_dir,
 ):
     """``eval-confirm`` drives run_confirm_stage for the single winning combo."""
-    monkeypatch.setattr(cli_module, 'load_config', lambda _: base_config)
+    monkeypatch.setattr(cli_config, 'load_config', lambda _: base_config)
 
     cands = configs_module.ofat_candidates()
     arch_name = next(c.name for c in cands if c.role == 'architect')
@@ -221,7 +222,7 @@ def test_eval_confirm_rejects_swapped_arch_impl_flags(
     both-live combo. The driver must reject it, NAME the offending flag, and
     never dispatch the confirmation batch (loud-over-silent).
     """
-    monkeypatch.setattr(cli_module, 'load_config', lambda _: base_config)
+    monkeypatch.setattr(cli_config, 'load_config', lambda _: base_config)
 
     cands = configs_module.ofat_candidates()
     arch_name = next(c.name for c in cands if c.role == 'architect')
@@ -257,7 +258,7 @@ def test_eval_matrix_flag_alias_routes_to_matrix_driver(
     alias must now route to ``run_matrix_stage`` and emit the composite report.
     ``run_eval_matrix`` is neutralized so the pre-impl path never does real work.
     """
-    monkeypatch.setattr(cli_module, 'load_config', lambda _: base_config)
+    monkeypatch.setattr(cli_config, 'load_config', lambda _: base_config)
 
     async def _neutralized_old_path(*args, **kwargs):
         return []
@@ -310,14 +311,17 @@ def _arch_ofat_results():
                    tests_pass=None, cost=0.3, dur_ms=60_000),
         _mk_result('arch-fable-high', role='architect', plan_quality=None,
                    tests_pass=None, cost=0.0, dur_ms=0, cap_tainted=True,
-                   invocation_error='architect:model_not_found: no such model'),
+                   invocation_errors=[{
+                       'stage': 'architect', 'cause': 'model_not_found',
+                       'reason': 'no such model',
+                   }]),
         _mk_result('impl-opus-high', role='implementer'),
     ]
 
 
 class TestEmitCompositeReportArchitectSurface:
     def test_architect_result_set_emits_both_tables(self, capsys):
-        cli_module._emit_composite_report(_arch_ofat_results(), {})
+        eval_cli_module._emit_composite_report(_arch_ofat_results(), {})
 
         out = capsys.readouterr().out
         assert 'composite report:' in out
@@ -329,13 +333,13 @@ class TestEmitCompositeReportArchitectSurface:
     def test_architect_surface_reuses_the_plan_quality_table_verbatim(self, capsys):
         """No second rendering path: the emitted section IS
         format_plan_quality_table(build_plan_quality_report(results))."""
-        from orchestrator.evals.report import (
+        from orchestrator.evals.plan_quality_report import (
             build_plan_quality_report,
             format_plan_quality_table,
         )
 
         results = _arch_ofat_results()
-        cli_module._emit_composite_report(results, {})
+        eval_cli_module._emit_composite_report(results, {})
 
         out = capsys.readouterr().out
         assert format_plan_quality_table(build_plan_quality_report(results)) in out
@@ -343,13 +347,13 @@ class TestEmitCompositeReportArchitectSurface:
     def test_non_architect_result_set_emits_exactly_todays_output(self, capsys):
         """The existing eval-matrix / eval-confirm end_to_end surfaces are
         unchanged — no extra section when no architect ran."""
-        from orchestrator.evals.report import format_composite_table
+        from orchestrator.evals.composite_report import format_composite_table
 
         results = [
             _mk_result('e2e-opus-opus', role='end_to_end', composite=0.85),
             _mk_result('e2e-sonnet-sonnet', role='end_to_end', composite=0.70),
         ]
-        cli_module._emit_composite_report(results, {})
+        eval_cli_module._emit_composite_report(results, {})
 
         out = capsys.readouterr().out
         assert 'plan_quality report:' not in out
@@ -362,7 +366,7 @@ class TestEmitCompositeReportArchitectSurface:
         self, monkeypatch, base_config, dummy_cfg_file, fixtures_dir,
     ):
         """End-to-end through the `eval-ofat` command, not just the helper."""
-        monkeypatch.setattr(cli_module, 'load_config', lambda _: base_config)
+        monkeypatch.setattr(cli_config, 'load_config', lambda _: base_config)
 
         async def fake_ofat(*args, **kwargs):
             return _arch_ofat_results()

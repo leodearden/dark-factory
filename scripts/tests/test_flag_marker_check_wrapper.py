@@ -1,0 +1,546 @@
+"""Tests for scripts/fused-memory-flag-marker-check.sh -- the read-only
+CHECK counterpart to fused-memory-flag-marker-sweep.sh (task 2596's
+--check/backlog_verdict predicate mode).
+
+Drives the wrapper via subprocess with the FLAG_MARKER_SWEEP_CMD test seam
+pointed at a `scripts/tests/conftest.py::fake_recorder` executable, as
+test_flag_marker_sweep_wrapper.py does.
+Real uv/fused_memory/live stores are never touched.
+
+Task 4591: this wrapper had the same bare-`uv`-from-PATH fragility that the
+sibling sweep wrapper actually tripped via its systemd unit's
+Persistent=true boot catch-up run (OBSERVED 2026-08-18 09:02:44 -- see
+fused-memory-flag-marker-sweep.sh's own header). This wrapper has no systemd
+unit or before_done predicate wired to it today (the watch gate is retired,
+task 3923), so the defect was LATENT rather than observed here directly --
+these tests pin the same absolute-uv-resolution fix so a future re-wiring
+doesn't reinherit it.
+
+Task 3498 ratified this wrapper's surviving role (an ad-hoc census
+instrument) and made its read-only claim a property rather than prose: the
+wrapper refuses ``--apply`` with its own rc=3. Refusing that one literal is
+complete only because the sweep's parser rejects abbreviations of it, which
+fused-memory/tests/test_sweep_orphan_flag_markers_cli.py pins next to that
+parser.
+"""
+from __future__ import annotations
+
+import os
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+import pytest
+
+WRAPPER = Path(__file__).parent.parent / "fused-memory-flag-marker-check.sh"
+
+# Resolved HERE, in the parent, because the uv-resolution tests below hand the
+# child an empty PATH -- `subprocess.run(["bash", ...])` looks argv[0] up in the
+# CHILD's env, so a bare "bash" is itself unfindable under a scrubbed PATH
+# (FileNotFoundError, nothing to do with the wrapper). An absolute interpreter
+# keeps the scrub aimed at `uv` alone, which is what these tests are about.
+BASH = shutil.which("bash") or "/bin/bash"
+
+
+# ---------------------------------------------------------------------------
+# Script driver
+# ---------------------------------------------------------------------------
+
+def _run_wrapper(
+    fake_recorder, tmp_path, *, exit_code=0, extra_env=None, dotenv_contents=None,
+    args=None,
+):
+    """Run fused-memory-flag-marker-check.sh with FLAG_MARKER_SWEEP_CMD
+    pointed at a fake recorder and REPO pointed at a tmp dir with no
+    `.env` (so the wrapper's `source .env` is a no-op under test) -- unless
+    `dotenv_contents` is given, in which case a `$REPO/.env` file with that
+    content is written first so the sourcing branch itself is exercised."""
+    recorder = fake_recorder("fake-check-recorder", exit_code=exit_code)
+
+    fake_repo = tmp_path / "fake-repo"
+    fake_repo.mkdir(exist_ok=True)
+    if dotenv_contents is not None:
+        (fake_repo / ".env").write_text(dotenv_contents)
+
+    env = dict(os.environ)
+    env["PATH"] = f"{recorder.bin_dir}{os.pathsep}{env['PATH']}"
+    env["FLAG_MARKER_SWEEP_CMD"] = "fake-check-recorder"
+    env["REPO"] = str(fake_repo)
+    if extra_env:
+        env.update(extra_env)
+
+    result = subprocess.run(
+        [BASH, str(WRAPPER), *(args or [])],
+        env=env, capture_output=True, text=True, timeout=30,
+    )
+    return result, recorder
+
+
+# ---------------------------------------------------------------------------
+# Baseline behaviour (passthrough, --check flag, exit propagation)
+# ---------------------------------------------------------------------------
+
+def test_wrapper_is_executable():
+    assert os.access(WRAPPER, os.X_OK), (
+        f"Expected {WRAPPER} to be executable (os.X_OK); it is not. "
+        f"Run: chmod +x {WRAPPER}"
+    )
+
+
+def test_wrapper_invokes_check_with_check_flag(fake_recorder, tmp_path):
+    result, recorder = _run_wrapper(fake_recorder, tmp_path)
+
+    assert result.returncode == 0, (
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+
+    calls = recorder.calls()
+    assert len(calls) == 1, f"calls={calls!r}"
+    argv = calls[0]
+    assert any(
+        a.endswith("fused-memory/scripts/sweep_orphan_flag_markers.py") for a in argv
+    ), f"Expected the sweep script path in argv={argv!r}"
+    assert "--check" in argv, f"argv={argv!r}"
+
+
+def test_wrapper_passes_extra_args_through(fake_recorder, tmp_path):
+    result, recorder = _run_wrapper(
+        fake_recorder, tmp_path, args=["--project-id", "reify", "--max-backlog", "0"],
+    )
+
+    assert result.returncode == 0, (
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    argv = recorder.calls()[0]
+    assert argv[1:] == [
+        "--check", "--project-id", "reify", "--max-backlog", "0",
+    ], (
+        f"Expected --check injected ahead of the caller's args, with their "
+        f"relative order preserved; argv={argv!r}"
+    )
+
+
+def test_wrapper_propagates_nonzero_exit(fake_recorder, tmp_path):
+    """Relayed verbatim, not merely non-zero: since task 3923 rc=1 is a
+    verdict (backlog over the ceiling, or an observed blind spot), and a
+    normalised code would make it indistinguishable from a crash."""
+    result, _recorder = _run_wrapper(fake_recorder, tmp_path, exit_code=1)
+
+    assert result.returncode == 1, (
+        f"Expected the sweep's own rc=1 relayed verbatim, got "
+        f"{result.returncode}; stdout={result.stdout!r} "
+        f"stderr={result.stderr!r}"
+    )
+
+
+def test_wrapper_sources_dotenv_and_propagates_to_check(fake_recorder, tmp_path):
+    """Mirrors the sweep wrapper's equivalent test: confirms the wrapper's
+    stated core purpose (source $REPO/.env, export CONFIG_PATH/PROJECT_ROOT/
+    FALKORDB_URI) actually reaches the check process."""
+    result, recorder = _run_wrapper(
+        fake_recorder, tmp_path,
+        dotenv_contents=(
+            "FALKORDB_URI=redis://test-env-host:1234\n"
+            "FLAG_MARKER_CHECK_TEST_SENTINEL=from-dot-env\n"
+        ),
+    )
+
+    assert result.returncode == 0, (
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+
+    envs = recorder.envs()
+    assert len(envs) == 1, f"envs={envs!r}"
+    recorded_env = envs[0]
+    assert recorded_env.get("FALKORDB_URI") == "redis://test-env-host:1234", (
+        f"Expected the sourced .env's FALKORDB_URI to reach the check "
+        f"process; recorded_env={recorded_env!r}"
+    )
+    assert recorded_env.get("FLAG_MARKER_CHECK_TEST_SENTINEL") == "from-dot-env", (
+        f"Expected a plain .env var to reach the check process via `set -a`; "
+        f"recorded_env={recorded_env!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Fake `uv` (pins the default FLAG_MARKER_SWEEP_CMD prefix)
+# ---------------------------------------------------------------------------
+
+def _empty_path_dir(tmp_path):
+    """An empty directory to use as the wrapper's entire PATH.
+
+    Task 4591 amendment (suggestion 7): scrubbing PATH to "/usr/bin:/bin"
+    is host-dependent -- on a host that packages uv into /usr/bin or /bin,
+    `command -v uv` succeeds, the wrapper runs the REAL uv against a tmp
+    fake-repo, and the unresolvable-uv assertions fail with a confusing uv
+    error instead of exercising (or skipping) the intended branch. An empty
+    dir is host-independent: nothing on the wrapper's pre-exec path needs an
+    external binary (`[`, `printf`, `command`, `source`, `echo` are all bash
+    builtins), so an empty PATH is sufficient AND guarantees no uv is found.
+    """
+    path_dir = tmp_path / "empty-path"
+    path_dir.mkdir(exist_ok=True)
+    return str(path_dir)
+
+
+def test_wrapper_default_prefix_invokes_uv_run_no_sync_project(fake_recorder, tmp_path):
+    """Pins the default FLAG_MARKER_SWEEP_CMD prefix -- `uv run --no-sync
+    --project "$FM" python`, built literally so "$FM" survives verbatim even
+    when the repo path contains spaces."""
+    uv = fake_recorder("uv", bin_dir=tmp_path / "uv-bin")
+
+    fake_repo = tmp_path / "fake repo with spaces"
+    fake_repo.mkdir(exist_ok=True)
+    fake_fm = fake_repo / "fused-memory"
+
+    env = dict(os.environ)
+    env["PATH"] = f"{uv.bin_dir}{os.pathsep}{env['PATH']}"
+    env["REPO"] = str(fake_repo)
+    env.pop("FLAG_MARKER_SWEEP_CMD", None)
+
+    result = subprocess.run(
+        [BASH, str(WRAPPER), "--project-id", "reify"],
+        env=env, capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 0, (
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+
+    calls = uv.calls()
+    assert len(calls) == 1, f"calls={calls!r}"
+    assert calls[0] == [
+        "run", "--no-sync", "--project", str(fake_fm), "python",
+        str(fake_fm / "scripts" / "sweep_orphan_flag_markers.py"),
+        "--check", "--project-id", "reify",
+    ], f"argv={calls[0]!r}"
+
+
+def test_wrapper_resolves_uv_by_absolute_path_when_path_omits_it(fake_recorder, tmp_path):
+    """Task 4591 / task 2917 EDIT 3 pattern. Pins that the wrapper resolves
+    `uv` to an ABSOLUTE path rather than trusting PATH.
+
+    Simulated by scrubbing PATH down to an empty dir (no `uv` anywhere on
+    it) while pointing the wrapper's UV_BIN override at the fake uv
+    recorder. A wrapper that still relies on a bare `uv` word exits 127
+    without ever invoking it -- the same `exec: uv: not found` / status=127
+    the sweep wrapper's systemd unit hit on its boot catch-up run."""
+    uv = fake_recorder("uv", bin_dir=tmp_path / "uv-bin")
+
+    fake_repo = tmp_path / "fake-repo"
+    fake_repo.mkdir(exist_ok=True)
+
+    env = dict(os.environ)
+    env["PATH"] = _empty_path_dir(tmp_path)
+    env["REPO"] = str(fake_repo)
+    env["UV_BIN"] = str(uv.path)
+    env.pop("FLAG_MARKER_SWEEP_CMD", None)
+
+    result = subprocess.run(
+        [BASH, str(WRAPPER)],
+        env=env, capture_output=True, text=True, timeout=30,
+    )
+
+    assert result.returncode == 0, (
+        f"Expected the wrapper to resolve uv via UV_BIN under a PATH that "
+        f"omits it (returncode 127 == the regression); "
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    calls = uv.calls()
+    assert len(calls) >= 1, (
+        f"Expected the absolute-path uv to actually be invoked; calls={calls!r} "
+        f"stderr={result.stderr!r}"
+    )
+
+
+def test_wrapper_fails_loud_when_uv_cannot_be_resolved(tmp_path):
+    """A missing interpreter must be DIAGNOSABLE, not a bare shell 127
+    (loud-over-silent-degradation).
+
+    Scrubs PATH to an EMPTY dir (task 4591 amendment, suggestion 7 -- see
+    _empty_path_dir; the previous "/usr/bin:/bin" was host-dependent and
+    would run the real uv wherever uv is packaged into /usr/bin or /bin),
+    leaves UV_BIN unset, and repoints HOME at a tmp dir so the
+    $HOME/.local/bin/uv fallback misses too. The wrapper must exit non-zero
+    AND print its own ERROR:-prefixed line naming `uv`.
+
+    /usr/local/bin/uv is the one remaining unavoidable host dependence: it
+    is a hardcoded absolute candidate in the ladder, so it cannot be scrubbed
+    from the environment -- hence the skip rather than an assertion."""
+    if os.path.exists("/usr/local/bin/uv"):
+        pytest.skip(
+            "/usr/local/bin/uv exists on this host, so the wrapper's last-resort "
+            "fallback resolves and the unresolvable-uv path cannot be exercised"
+        )
+
+    fake_repo = tmp_path / "fake-repo"
+    fake_repo.mkdir(exist_ok=True)
+    fake_home = tmp_path / "fake-home"
+    fake_home.mkdir(exist_ok=True)
+
+    env = dict(os.environ)
+    env["PATH"] = _empty_path_dir(tmp_path)
+    env["REPO"] = str(fake_repo)
+    env["HOME"] = str(fake_home)
+    env.pop("UV_BIN", None)
+    env.pop("FLAG_MARKER_SWEEP_CMD", None)
+
+    result = subprocess.run(
+        [BASH, str(WRAPPER)],
+        env=env, capture_output=True, text=True, timeout=30,
+    )
+
+    assert result.returncode != 0, (
+        f"Expected a non-zero exit when uv cannot be resolved; "
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    assert "ERROR:" in result.stderr, (
+        f"Expected the wrapper's own ERROR:-prefixed diagnostic rather than a "
+        f"bare shell 127; stderr={result.stderr!r}"
+    )
+    assert "uv" in result.stderr, (
+        f"Expected the diagnostic to name `uv`; stderr={result.stderr!r}"
+    )
+
+
+def test_wrapper_resolves_uv_from_home_local_bin_when_path_omits_it(fake_recorder, tmp_path):
+    """Task 4591 amendment (suggestion 3). Pins the SUCCESS side of the
+    candidate loop -- the branch that actually fires in the incident this fix
+    exists for.
+
+    In the observed boot-catch-up failure there is no UV_BIN, PATH carries no
+    uv, and uv is installed at $HOME/.local/bin/uv (the location the header
+    calls "the measured real location"; confirmed on this host). The other two
+    uv tests cover only the UV_BIN override and the total-miss branches, so a
+    wrapper that honoured UV_BIN and nothing else would pass them both while
+    still dying 127 on exactly the systemd run being fixed. This closes that.
+    """
+    fake_repo = tmp_path / "fake-repo"
+    fake_repo.mkdir(exist_ok=True)
+
+    # A fake HOME whose .local/bin holds the recorder, so the wrapper's
+    # "$HOME/.local/bin/uv" candidate -- and only that candidate -- resolves.
+    fake_home = tmp_path / "fake-home"
+    home_uv = fake_recorder("uv", bin_dir=fake_home / ".local" / "bin")
+
+    env = dict(os.environ)
+    env["PATH"] = _empty_path_dir(tmp_path)
+    env["HOME"] = str(fake_home)
+    env["REPO"] = str(fake_repo)
+    env.pop("UV_BIN", None)
+    env.pop("FLAG_MARKER_SWEEP_CMD", None)
+
+    result = subprocess.run(
+        [BASH, str(WRAPPER)],
+        env=env, capture_output=True, text=True, timeout=30,
+    )
+
+    assert result.returncode == 0, (
+        f"Expected the wrapper to fall back to $HOME/.local/bin/uv under a "
+        f"PATH that omits uv (returncode 127 == the boot-catch-up regression); "
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    calls = home_uv.calls()
+    assert len(calls) == 1, (
+        f"Expected the $HOME/.local/bin/uv fallback to actually be invoked; "
+        f"calls={calls!r} stderr={result.stderr!r}"
+    )
+    assert calls[0][:2] == ["run", "--no-sync"], f"argv={calls[0]!r}"
+
+
+def test_wrapper_fails_loud_when_uv_bin_is_set_but_not_executable(fake_recorder, tmp_path):
+    """Task 4591 amendment (suggestion 5). An explicit UV_BIN pin that does
+    not resolve must be a LOUD failure, never a silent fall-through.
+
+    Falling through to the PATH/candidate ladder would run a DIFFERENT uv than
+    the one the operator (or a test) named -- the opposite of the
+    loud-over-silent-degradation norm the ERROR: line exists to honour. Here
+    UV_BIN points at a real file with the exec bit cleared while a perfectly
+    good fake uv sits on PATH: a fall-through would exit 0 having invoked the
+    PATH copy, so the assertions below distinguish the two behaviours rather
+    than merely observing an error."""
+    uv = fake_recorder("uv", bin_dir=tmp_path / "uv-bin")
+
+    fake_repo = tmp_path / "fake-repo"
+    fake_repo.mkdir(exist_ok=True)
+
+    # A UV_BIN that exists but is NOT executable (the lost-exec-bit / stale-path
+    # case). The ladder below it WOULD resolve -- that is the point.
+    bad_uv = tmp_path / "bad-uv"
+    bad_uv.write_text("#!/bin/sh\nexit 0\n")
+    bad_uv.chmod(0o644)
+
+    env = dict(os.environ)
+    env["PATH"] = f"{uv.bin_dir}{os.pathsep}{_empty_path_dir(tmp_path)}"
+    env["REPO"] = str(fake_repo)
+    env["UV_BIN"] = str(bad_uv)
+    env.pop("FLAG_MARKER_SWEEP_CMD", None)
+
+    result = subprocess.run(
+        [BASH, str(WRAPPER)],
+        env=env, capture_output=True, text=True, timeout=30,
+    )
+
+    assert result.returncode != 0, (
+        f"Expected a non-zero exit when UV_BIN is set but not executable; "
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    assert "ERROR:" in result.stderr, (
+        f"Expected the wrapper's own ERROR:-prefixed diagnostic; "
+        f"stderr={result.stderr!r}"
+    )
+    assert str(bad_uv) in result.stderr, (
+        f"Expected the diagnostic to name the bad UV_BIN path so an operator "
+        f"can see WHICH pin failed; stderr={result.stderr!r}"
+    )
+    assert uv.calls() == [], (
+        f"Expected NO uv invocation: silently falling through to the uv on "
+        f"PATH would run a different uv than the one pinned. "
+        f"calls={uv.calls()!r}"
+    )
+
+
+def test_wrapper_resolves_uv_after_sourcing_dotenv_so_env_can_supply_uv_bin(
+    fake_recorder, tmp_path,
+):
+    """Task 4591 amendment (review suggestion 4). BEHAVIOURAL pin on the
+    ordering of the uv resolution relative to `set -a; source "$REPO/.env"`.
+
+    The resolution must run AFTER the source, so a UV_BIN (or PATH) set in
+    .env is visible to it. That is not a stylistic preference: it is exactly
+    the remedy an operator reaches for after a minimal-boot-PATH 127, and the
+    sibling fused-memory/scripts/cgl_eta_auto_apply.sh originally resolved
+    BEFORE its source -- so the same .env fix would have worked here and
+    failed there.
+
+    Driven end-to-end rather than by grepping the script text: UV_BIN is
+    supplied ONLY by the .env file (absent from the process env), under a PATH
+    scrubbed to an empty dir and a HOME with no .local/bin/uv. If the
+    resolution ran first, UV_BIN would still be unset at that moment, nothing
+    else would resolve, and the wrapper would exit 127 with its ERROR: line.
+    Reaching the fake uv at all is the proof.
+
+    MUTATION-VERIFIED by hoisting the whole resolve + CHECK_CMD block above
+    the `set -a` -- this test then fails with exactly the 127 + ERROR: line
+    described above. Note what does NOT move the needle, since it is the
+    non-obvious part: relocating the line that sources
+    scripts/lib/resolve_uv.sh alone changes nothing, because it only defines
+    functions and the require_uv_bin call lives inside the
+    FLAG_MARKER_SWEEP_CMD else-branch further down. The invocation point is
+    the invariant, not the definition point.
+
+    (The cgl wrapper hardcodes REPO and so cannot be pointed at a fake .env;
+    its copy of this invariant is pinned structurally instead, in
+    fused-memory/tests/test_cgl_eta_auto_apply_wrapper.py.)
+    """
+    if os.path.exists("/usr/local/bin/uv"):
+        pytest.skip(
+            "/usr/local/bin/uv exists on this host, so the ladder resolves "
+            "without .env's UV_BIN and the ordering cannot be discriminated"
+        )
+
+    uv = fake_recorder("uv", bin_dir=tmp_path / "uv-bin")
+
+    fake_home = tmp_path / "fake-home"
+    fake_home.mkdir(exist_ok=True)
+
+    fake_repo = tmp_path / "fake-repo"
+    fake_repo.mkdir(exist_ok=True)
+    (fake_repo / ".env").write_text(f"UV_BIN={uv.path}\n")
+
+    env = dict(os.environ)
+    env["PATH"] = _empty_path_dir(tmp_path)
+    env["HOME"] = str(fake_home)
+    env["REPO"] = str(fake_repo)
+    env.pop("UV_BIN", None)          # supplied by .env alone -- that is the point
+    env.pop("FLAG_MARKER_SWEEP_CMD", None)
+
+    result = subprocess.run(
+        [BASH, str(WRAPPER)],
+        env=env, capture_output=True, text=True, timeout=30,
+    )
+
+    assert result.returncode == 0, (
+        f"Expected UV_BIN set in $REPO/.env to be visible to the uv "
+        f"resolution. A non-zero exit here means the resolution ran BEFORE "
+        f"`source $REPO/.env`, making the .env remedy for a boot-PATH 127 "
+        f"silently ineffective; stdout={result.stdout!r} "
+        f"stderr={result.stderr!r}"
+    )
+    assert uv.calls(), (
+        f"Expected the uv named by .env to actually be invoked; "
+        f"stderr={result.stderr!r}"
+    )
+
+
+
+
+# --------------------------------------------------------------------------
+# Task 3498: the advertised read-only contract, enforced.
+# --------------------------------------------------------------------------
+
+def test_check_wrapper_refuses_apply(fake_recorder, tmp_path):
+    """`--check --apply` parses fine in the sweep, so without the guard an
+    `--apply --terminal-drain` through this "read-only" wrapper ran a
+    destructive drain. The refusal is the wrapper's own rc=3, raised before
+    the sweep is invoked at all.
+
+    Run under an empty PATH (see _empty_path_dir), with the recorder named
+    by an absolute interpreter so a regressed guard would still reach it:
+    the refusal diagnostic must name the wrapper without any external
+    binary."""
+    recorder_path = fake_recorder("fake-check-recorder").path
+    result, recorder = _run_wrapper(
+        fake_recorder, tmp_path,
+        args=["--project-id", "reify", "--apply", "--terminal-drain"],
+        extra_env={
+            "PATH": _empty_path_dir(tmp_path),
+            "FLAG_MARKER_SWEEP_CMD": f"{sys.executable} {recorder_path}",
+        },
+    )
+
+    assert result.returncode == 3, (
+        f"Expected the wrapper's own rc=3 refusal, distinct from the sweep's "
+        f"0/1/2 verdict codes; got {result.returncode}; "
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    assert recorder.calls() == [], (
+        f"Expected the sweep to NOT be invoked at all when --apply is "
+        f"refused; calls={recorder.calls()!r}"
+    )
+    assert "fused-memory-flag-marker-check.sh refuses '--apply'" in result.stderr, (
+        f"Expected a diagnostic naming the wrapper and the offending "
+        f"argument; stderr={result.stderr!r}"
+    )
+    assert "fused-memory-flag-marker-sweep.sh" in result.stderr, (
+        f"Expected the diagnostic to point the operator at the destructive "
+        f"counterpart wrapper; stderr={result.stderr!r}"
+    )
+
+
+def test_check_wrapper_allows_non_apply_args(fake_recorder, tmp_path):
+    """The refusal must match WHOLE arguments, never a substring:
+    --no-fail-on-blind-spot (census-only relaxation of task 3923's veto)
+    and a value that merely contains the text 'apply' both pass through
+    untouched."""
+    result, recorder = _run_wrapper(
+        fake_recorder, tmp_path,
+        args=[
+            "--project-id", "apply-test",
+            "--max-backlog", "0",
+            "--no-fail-on-blind-spot",
+        ],
+    )
+
+    assert result.returncode == 0, (
+        f"Expected non---apply arguments to pass through untouched; "
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    calls = recorder.calls()
+    assert len(calls) == 1, f"calls={calls!r}"
+    assert calls[0][1:] == [
+        "--check",
+        "--project-id", "apply-test",
+        "--max-backlog", "0",
+        "--no-fail-on-blind-spot",
+    ], f"argv={calls[0]!r}"

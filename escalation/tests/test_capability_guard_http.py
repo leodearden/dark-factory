@@ -34,157 +34,88 @@ See plans/escalation-connection-capability-guard-prd.md (tasks alpha/beta/gamma)
 
 from __future__ import annotations
 
-import asyncio
-import contextlib
-import socket
-import threading
-import time
 from collections.abc import Iterator
 from typing import Any
 
 import pytest
+from _escalation_http import escalation_http_call
+from _escalation_seed import seed_escalation
 from fastmcp import Client
 from fastmcp.client.transports import StreamableHttpTransport
 
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
-from escalation.server import create_server
 
 # ---------------------------------------------------------------------------
 # Harness: a real escalation MCP server served over HTTP in a daemon thread.
+#
+# Delegates to the shared ``serve_escalation_mcp_module`` factory fixture
+# (``conftest.py``) instead of a module-local copy of the start/serve/teardown
+# machinery (task 3736, INV-5 lockstep duplication -- this module used to carry
+# its own ephemeral-port picker and pending-task drainer plus the full thread +
+# event-loop dance, which is in fact the copy ``serve_escalation_mcp`` was
+# originally lifted from). The ``_module``-scoped variant is required because
+# a fixture may not depend on a narrower-scoped one; pytest forbids the reverse.
+# All teardown behaviour -- the ``stopping`` flag, the pending-task drain, the
+# bounded 5s join and its loud (never softened) hung-thread assert -- now lives
+# once in ``_serve_escalation_mcp_impl``, with its regression test in
+# ``test_serve_escalation_mcp_fixture.py``.
+#
+# Every part of the harness is now shared, none with a second copy (tasks
+# 3736 / 4345 / 4997, per INV-5). The SERVER-LIFECYCLE half comes from
+# ``conftest.py``'s ``serve_escalation_mcp_module``; the CALL half from
+# ``_escalation_http.escalation_http_call``; record seeding from
+# ``_escalation_seed.seed_escalation``. The ``async def`` partials and ``_seed``
+# below survive on purpose: each is a single delegation carrying one
+# per-module fact (per-tool intent in a docstring, or a default summary), so
+# there is nothing left that could drift. The CALL half's single-source
+# property is asserted, not merely asserted-to:
+# ``test_escalation_http_helper.py`` AST-scans this directory for it.
 # ---------------------------------------------------------------------------
-
-
-def _free_port() -> int:
-    """Return an ephemeral TCP port free on 127.0.0.1 at the time of the call.
-
-    Binds to port 0 (OS-assigned free port) and immediately closes the
-    socket. There is an inherent (small) TOCTOU window before the real
-    server binds the same port; acceptable for a single-threaded test run.
-    """
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(('127.0.0.1', 0))
-        return s.getsockname()[1]
-
-
-def _drain_pending_tasks(loop: asyncio.AbstractEventLoop) -> None:
-    """Cancel and await every task still pending on *loop* before it closes.
-
-    Mirrors ``asyncio.run()``'s own internal shutdown sequence
-    (``_cancel_all_tasks``). Without this, a task still suspended
-    mid-``await`` when the loop is stopped -- the server's own root task
-    (``run_http_async``), or an internal one it spawns (e.g.
-    sse_starlette's ``_shutdown_watcher``) -- is only unwound later at
-    uncontrolled garbage-collection time, outside of any running task
-    context, which crashes anyio's shielded lifespan cleanup with an
-    unraisable ``TypeError``/``NoEventLoopError`` instead of shutting down
-    cleanly (task 2741).
-    """
-    pending = asyncio.all_tasks(loop)
-    if not pending:
-        return
-    for task in pending:
-        task.cancel()
-    loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
 
 
 @pytest.fixture(scope='module')
 def http_server(
     tmp_path_factory: pytest.TempPathFactory,
+    serve_escalation_mcp_module,
 ) -> Iterator[tuple[str, EscalationQueue]]:
     """Serve a real escalation MCP server over HTTP for this module's tests.
 
-    Builds an ``EscalationQueue`` + ``create_server(queue, startup_sweep=False)``
-    (``startup_sweep=False`` so pre-seeded queue files are not relocated by the
-    startup sweep — mirrors the existing test convention), then serves it via
-    ``FastMCP.run_http_async`` on a free localhost port inside a daemon thread
-    running its own event loop. Readiness is polled by attempting a raw TCP
-    connect to the port (bounded to ~10s total) — no fixed sleep.
+    A thin scope/shape adapter over ``serve_escalation_mcp_module``: it owns no
+    server-lifecycle state, so there is nothing to tear down here -- teardown
+    happens once, in the shared fixture, at this module's end. The
+    ``_module`` variant specifically, because a fixture may not depend on a
+    narrower-scoped one and this one is module-scoped (see below).
 
-    Yields ``(base_url, queue)``: tests seed pending escalations directly via
-    ``queue.submit()`` (file-backed, per-id locked — safe across the test
-    thread and the server's serving thread) and then connect a
+    Three module-specific facts it does own:
+
+    * ``startup_sweep=False``, so pre-seeded queue files are not relocated by
+      the startup sweep (the existing convention in this suite; also the
+      factory's default, passed explicitly to keep it legible here).
+    * Deduplication: NOT passed, so this takes the factory's
+      ``DedupeConfig(infra_dedupe_enabled=False)`` default rather than
+      ``create_server``'s dedupe-ON default. Inert for this module -- every
+      record here is seeded through ``_seed`` (``queue.submit()`` directly),
+      and no test calls the dedupe-guarded ``escalate_*`` tools -- and the
+      safer default for a test: dedupe ON could collapse a
+      double-file regression into one record and let an "exactly one
+      escalation" assertion pass anyway.
+    * The yielded shape, ``(base_url, queue)`` -- the factory's ``port`` is
+      dropped, since every call site below unpacks a two-tuple.
+
+    Tests seed pending escalations directly via ``queue.submit()``
+    (file-backed, per-id locked -- safe across the test thread and the
+    server's serving thread), then connect a
     ``fastmcp.Client(StreamableHttpTransport(f'{base_url}/mcp/', headers=...))``
     per scenario to send per-connection capability headers over real HTTP.
 
-    Teardown is explicit: the event loop is created here in the fixture
-    body (not inside the thread target), so it can be stopped thread-safely
-    at teardown — ``loop.call_soon_threadsafe(loop.stop)`` unblocks
-    ``run_until_complete`` in the serving thread, which is then joined
-    (bounded to 5s) before this fixture finishes tearing down. This
-    prevents the daemon thread's event loop from outliving the test and
-    acting as a background ``time.monotonic()`` caller for the rest of the
-    process (task 2741). Any task still pending at that point is cancelled
-    and drained (``_drain_pending_tasks``) inside the serving thread before
-    the loop closes, so cleanup runs inside a live task context instead of
-    at uncontrolled GC time. A ``stopping`` flag distinguishes that
-    deliberate, stop-induced ``RuntimeError`` from a genuine startup
-    failure, so ``serve_error`` below still reflects only real errors
-    (mirrors ``test_status_authority_gate.py``'s ``http_server`` fixture).
-    A teardown that fails to stop the thread within the 5s join bound is
-    asserted rather than swallowed, so a genuine hang surfaces loudly
-    instead of silently leaking a daemon thread past this fixture.
+    Module-scoped: every test here shares this ONE ``EscalationQueue``, so
+    each must seed under its own ``task_id`` rather than depend on ``make_id``
+    sequencing.
     """
     queue_dir = tmp_path_factory.mktemp('esc_capability_guard')
-    queue = EscalationQueue(queue_dir)
-    mcp = create_server(queue, startup_sweep=False)
-    port = _free_port()
-    loop = asyncio.new_event_loop()
-    serve_error: BaseException | None = None
-    stopping = False
-
-    def _serve_forever() -> None:
-        nonlocal serve_error
-        asyncio.set_event_loop(loop)
-        try:
-            loop.run_until_complete(
-                mcp.run_http_async(
-                    host='127.0.0.1', port=port, show_banner=False, log_level='error',
-                )
-            )
-        except RuntimeError as exc:
-            # Expected when teardown stops the loop mid-serve ("Event loop
-            # stopped before Future completed") -- but only when *we*
-            # induced it; a RuntimeError raised before teardown began is a
-            # genuine startup failure and must be surfaced below.
-            if not stopping:
-                serve_error = exc
-        finally:
-            _drain_pending_tasks(loop)
-            loop.close()
-
-    thread = threading.Thread(
-        target=_serve_forever, name='escalation-capability-guard-http', daemon=True,
-    )
-    thread.start()
-
-    # Poll for readiness (bounded ~10s) instead of a fixed sleep.
-    deadline = time.monotonic() + 10.0
-    ready = False
-    while time.monotonic() < deadline:
-        with contextlib.suppress(OSError), socket.create_connection(('127.0.0.1', port), timeout=0.2):
-            ready = True
-        if ready:
-            break
-        time.sleep(0.05)
-    if not ready:
-        detail = f' (server thread raised: {serve_error!r})' if serve_error else ''
-        raise RuntimeError(
-            f'escalation HTTP test server did not become ready on '
-            f'127.0.0.1:{port} within 10s{detail}'
-        )
-
-    try:
-        yield f'http://127.0.0.1:{port}', queue
-    finally:
-        stopping = True
-        loop.call_soon_threadsafe(loop.stop)
-        thread.join(timeout=5.0)
-        assert not thread.is_alive(), (
-            'escalation-capability-guard-http serving thread did not stop '
-            'within the 5s teardown bound -- event loop stop is hung or the '
-            'server task is stuck in a non-cancellable await (task 2741)'
-        )
+    base_url, _port, queue = serve_escalation_mcp_module(queue_dir, startup_sweep=False)
+    yield base_url, queue
 
 
 # ---------------------------------------------------------------------------
@@ -197,101 +128,40 @@ def _seed(
     *,
     level: int,
     task_id: str,
-    agent_role: str = 'implementer',
+    summary: str | None = None,
     **kw: Any,
 ) -> Escalation:
-    """Seed a pending escalation at *level* directly via ``queue.submit()``.
-
-    Bypasses the MCP tools entirely (mirrors the ``_seed_esc`` helper in
-    test_server.py). ``severity``/``category``/``summary`` default to
-    innocuous values but can be overridden via **kw.
-    """
-    kw.setdefault('severity', 'blocking')
-    kw.setdefault('category', 'scope_violation')
-    kw.setdefault('summary', f'capability-guard test escalation (level={level})')
-    esc = Escalation(
-        id=queue.make_id(task_id),
-        task_id=task_id,
-        agent_role=agent_role,
-        level=level,
-        **kw,
-    )
-    queue.submit(esc)
-    return esc
+    """Delegates to ``seed_escalation`` with this module's default summary."""
+    if summary is None:
+        summary = f'capability-guard test escalation (level={level})'
+    return seed_escalation(queue, level=level, task_id=task_id, summary=summary, **kw)
 
 
-async def _resolve_over_http(
-    base_url: str,
-    *,
-    levels: str | None = None,
-    identity: str | None = None,
-    **resolve_kwargs: Any,
-) -> dict[str, Any]:
-    """Call ``resolve_issue`` over real HTTP, optionally with capability headers.
-
-    *levels* / *identity*, when not None, are sent as the literal
-    ``X-Escalation-Levels`` / ``X-Escalation-Identity`` request headers; when
-    None the header is omitted entirely (never sent as an empty string), so a
-    header-less call exercises the exact same default-open path a real
-    header-less client would hit.
-    """
-    headers: dict[str, str] = {}
-    if levels is not None:
-        headers['X-Escalation-Levels'] = levels
-    if identity is not None:
-        headers['X-Escalation-Identity'] = identity
-    transport = StreamableHttpTransport(f'{base_url}/mcp/', headers=headers)
-    async with Client(transport) as client:
-        result = await client.call_tool('resolve_issue', resolve_kwargs)
-        return result.data
+async def _resolve_over_http(base_url: str, **kwargs: Any) -> dict[str, Any]:
+    """``resolve_issue`` over real HTTP — the tool the capability guard gates."""
+    return await escalation_http_call(base_url, 'resolve_issue', **kwargs)
 
 
-async def _promote_over_http(
-    base_url: str,
-    *,
-    levels: str | None = None,
-    identity: str | None = None,
-    **promote_kwargs: Any,
-) -> dict[str, Any]:
-    """Call ``promote_to_l2`` over real HTTP, optionally with capability headers.
-
-    Mirrors ``_resolve_over_http`` — used to prove ``promote_to_l2`` is never
-    gated by X-Escalation-Levels (it is intentionally left ungated).
-    """
-    headers: dict[str, str] = {}
-    if levels is not None:
-        headers['X-Escalation-Levels'] = levels
-    if identity is not None:
-        headers['X-Escalation-Identity'] = identity
-    transport = StreamableHttpTransport(f'{base_url}/mcp/', headers=headers)
-    async with Client(transport) as client:
-        result = await client.call_tool('promote_to_l2', promote_kwargs)
-        return result.data
+async def _promote_over_http(base_url: str, **kwargs: Any) -> dict[str, Any]:
+    """``promote_to_l2`` over real HTTP — used to prove it is never gated by
+    X-Escalation-Levels (it is intentionally left ungated)."""
+    return await escalation_http_call(base_url, 'promote_to_l2', **kwargs)
 
 
-async def _stamp_triage_over_http(
-    base_url: str,
-    *,
-    levels: str | None = None,
-    identity: str | None = None,
-    **stamp_kwargs: Any,
-) -> dict[str, Any]:
-    """Call ``stamp_triage`` over real HTTP, optionally with capability headers.
+async def _stamp_triage_over_http(base_url: str, **kwargs: Any) -> dict[str, Any]:
+    """``stamp_triage`` over real HTTP — used to prove it is never gated by
+    X-Escalation-Levels (a triage-ack annotation, not a state transition) while
+    ``triaged_by`` is still server-attributed from X-Escalation-Identity when
+    present."""
+    return await escalation_http_call(base_url, 'stamp_triage', **kwargs)
 
-    Mirrors ``_resolve_over_http`` / ``_promote_over_http`` — used to prove
-    ``stamp_triage`` is never gated by X-Escalation-Levels (a triage-ack
-    annotation, not a state transition) while ``triaged_by`` is still
-    server-attributed from X-Escalation-Identity when present.
-    """
-    headers: dict[str, str] = {}
-    if levels is not None:
-        headers['X-Escalation-Levels'] = levels
-    if identity is not None:
-        headers['X-Escalation-Identity'] = identity
-    transport = StreamableHttpTransport(f'{base_url}/mcp/', headers=headers)
-    async with Client(transport) as client:
-        result = await client.call_tool('stamp_triage', stamp_kwargs)
-        return result.data
+
+async def _amend_over_http(base_url: str, **kwargs: Any) -> dict[str, Any]:
+    """``amend_escalation`` over real HTTP — used to prove it is never gated by
+    X-Escalation-Levels (an append-only annotation, not a state transition)
+    while the amendment's ``agent_role`` is server-attributed from
+    X-Escalation-Identity when present."""
+    return await escalation_http_call(base_url, 'amend_escalation', **kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -322,49 +192,11 @@ class TestHarnessSanity:
         assert result.data['level'] == 2
         assert result.data['status'] == 'pending'
 
-    def test_http_server_fixture_stops_serving_thread_on_teardown(
-        self, tmp_path_factory: pytest.TempPathFactory,
-    ) -> None:
-        """Regression test (task 2741): the module-scoped ``http_server``
-        fixture must explicitly stop its daemon serving thread + event loop
-        at teardown instead of relying on process exit to kill it.
-
-        Drives the fixture's own generator directly via ``__wrapped__``
-        (bypassing pytest's fixture caching) so this test's own serving
-        thread can be identified precisely — via a ``threading.enumerate()``
-        before/after diff — independently of the module-scoped fixture
-        instance already serving this class's other tests under the same
-        thread name.
-        """
-        before = set(threading.enumerate())
-        gen = http_server.__wrapped__(tmp_path_factory)  # pyright: ignore[reportAttributeAccessIssue]
-        try:
-            base_url, queue = next(gen)
-            new = [
-                t for t in set(threading.enumerate()) - before
-                if t.name == 'escalation-capability-guard-http'
-            ]
-            assert len(new) == 1, (
-                f'Expected exactly one new escalation-capability-guard-http '
-                f'serving thread; found {new}'
-            )
-            serving = new[0]
-            assert serving.is_alive(), 'Serving thread must be alive during yield'
-
-            with pytest.raises(StopIteration):
-                next(gen)
-
-            assert not serving.is_alive(), (
-                'http_server fixture leaked its daemon serving thread past '
-                'teardown (generator finalized via StopIteration) -- the '
-                'fixture must explicitly stop its event loop and join the '
-                'thread instead of relying on process exit to kill it.'
-            )
-        finally:
-            # Best-effort: ensure finalization ran even if an assertion
-            # above failed, so a RED failure does not leave extra servers
-            # running for the rest of the suite. No-op if already exhausted.
-            gen.close()
+    # The task-2741 daemon-thread teardown regression test used to live here,
+    # driving this module's own ``http_server`` generator. It now lives once,
+    # in ``test_serve_escalation_mcp_fixture.py``, targeting the shared
+    # ``serve_escalation_mcp`` fixture that owns that teardown (task 3736):
+    # keeping a copy here would test another module's fixture.
 
 
 # ---------------------------------------------------------------------------
@@ -425,6 +257,7 @@ class TestLevelForbidden:
         # (c) Contrast: a header-less client stays default-open on the same level.
         result_c = await _resolve_over_http(
             base_url, escalation_id=esc_open.id, resolution='ok', action='close_only',
+            resolution_class='actionable',
         )
         assert 'code' not in result_c and 'error' not in result_c, (
             f'Expected a clean success (no code/error), got: {result_c}'
@@ -567,6 +400,7 @@ class TestHumanUnrestrictedFullAuthority:
             base_url,
             escalation_id=esc_resume.id, resolution='fixed', action='resume',
             resolved_by='escalation-watcher',
+            resolution_class='actionable',
         )
         assert 'code' not in result_a and 'error' not in result_a, (
             f'Expected a clean success, got: {result_a}'
@@ -609,6 +443,7 @@ class TestHumanUnrestrictedFullAuthority:
             base_url,
             escalation_id=esc_close.id, resolution='no longer relevant',
             action='close_only', resolved_by='escalation-watcher',
+            resolution_class='benign',
         )
         assert 'code' not in result_c and 'error' not in result_c, (
             f'Expected a clean success, got: {result_c}'
@@ -650,6 +485,7 @@ class TestCascadeIntactHeaderless:
             base_url,
             escalation_id=l2.id, resolution='cluster resolved',
             action='close_only', resolved_by='escalation-watcher',
+            resolution_class='actionable',
         )
         assert 'code' not in result and 'error' not in result, (
             f'Expected a clean success, got: {result}'
@@ -866,6 +702,7 @@ class TestIdentityDerivedCeiling:
         result = await _resolve_over_http(
             base_url, identity='some-other-agent',
             escalation_id=esc.id, resolution='ok', action='close_only',
+            resolution_class='actionable',
         )
         assert 'code' not in result and 'error' not in result, (
             f'Expected a clean success (unmapped identity, no levels header), got: {result}'
@@ -1052,6 +889,7 @@ class TestL2AutoCloseCarveout:
                 'is-ancestor of the current clean tip.'
             ),
             resolved_by='spoofed-by-agent',
+            resolution_class='benign',
         )
         assert 'code' not in result_a and 'error' not in result_a, (
             f'Expected a clean success (allowlisted class + evidence), got: {result_a}'
@@ -1081,6 +919,7 @@ class TestL2AutoCloseCarveout:
             escalation_id=esc_b.id, action='close_only',
             resolution='live probe: curator paused=false — transient infra self-cleared',
             resolved_by='spoofed-by-agent',
+            resolution_class='benign',
         )
         assert 'code' not in result_b and 'error' not in result_b, (
             f'Expected a clean success (allowlisted class + evidence), got: {result_b}'
@@ -1123,6 +962,7 @@ class TestL2AutoCloseCarveout:
             escalation_id=esc.id, action='close_only',
             resolution='Subject task status=done per get_task; escalation moot.',
             resolved_by='spoofed-by-agent',
+            resolution_class='benign',
         )
         assert 'code' not in result and 'error' not in result, (
             f'Expected a clean success (stale_task_scoped class + evidence), got: {result}'
@@ -1343,6 +1183,7 @@ class TestL2AutoCloseCarveout:
             escalation_id=esc.id, action='close_only',
             resolution='live probe: curator paused=false — transient infra self-cleared',
             resolved_by='escalation-watcher',
+            resolution_class='benign',
         )
         assert 'code' not in result and 'error' not in result, (
             f'Expected a clean success (header-less keeps full L2 authority), got: {result}'
@@ -1442,4 +1283,66 @@ class TestTriageAnnotationUngated:
         )
         assert reread_b.triaged_at == stamped_triaged_at, (
             'Expected the triage stamp from (a) unchanged by the denied resolve attempt'
+        )
+
+
+# ---------------------------------------------------------------------------
+# TestAmendAnnotationUngated (task 4886): amend_escalation is NOT gated by the
+# connection-capability level check — a {0,1}-level-capped connection can
+# write a ruling onto a pending L2 it is forbidden to resolve. The amendment's
+# agent_role is server-attributed from X-Escalation-Identity, non-spoofable,
+# mirroring triaged_by / resolved_by.
+# ---------------------------------------------------------------------------
+
+
+class TestAmendAnnotationUngated:
+    """A {0,1}-capped connection can amend a pending L2 it cannot resolve."""
+
+    @pytest.mark.asyncio
+    async def test_capped_connection_amends_what_it_cannot_resolve(
+        self, http_server: tuple[str, EscalationQueue],
+    ) -> None:
+        base_url, queue = http_server
+        esc = _seed(queue, level=2, task_id='task-amend-ungated')
+
+        denied = await _resolve_over_http(
+            base_url, levels='0,1',
+            escalation_id=esc.id, resolution='x', action='resume',
+        )
+        assert denied.get('code') == 'level_forbidden', (
+            f"Expected code='level_forbidden', got: {denied}"
+        )
+
+        result = await _amend_over_http(
+            base_url, levels='0,1',
+            escalation_id=esc.id, summary='ruled elsewhere: proceed',
+            agent_role='interactive',
+        )
+        assert 'error' not in result, f'Expected the amend to succeed (ungated), got: {result}'
+        assert result['amendment_recorded'] is True
+        assert result['status'] == 'pending'
+        reread = queue.get(esc.id)
+        assert reread is not None
+        assert [a['summary'] for a in reread.amendments] == ['ruled elsewhere: proceed']
+
+    @pytest.mark.asyncio
+    async def test_identity_header_attributes_the_amendment(
+        self, http_server: tuple[str, EscalationQueue],
+    ) -> None:
+        base_url, queue = http_server
+        esc = _seed(queue, level=2, task_id='task-amend-identity')
+
+        result = await _amend_over_http(
+            base_url, levels='0,1', identity='orchestrator-escalation-watcher-auto',
+            escalation_id=esc.id, summary='attributed ruling',
+            agent_role='spoofed-by-agent',
+        )
+
+        assert 'error' not in result, f'Unexpected error: {result}'
+        reread = queue.get(esc.id)
+        assert reread is not None
+        [entry] = reread.amendments
+        assert entry['agent_role'] == 'orchestrator-escalation-watcher-auto', (
+            f'Expected the identity header to win over the spoofed tool arg, '
+            f"got: {entry['agent_role']!r}"
         )

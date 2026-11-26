@@ -1,0 +1,1402 @@
+"""Normative Mem0 metadata vocabulary registry (task 3195, leaf β).
+
+This module is the **single normative home** for the Mem0 metadata
+vocabulary defined by ``docs/prds/memory-metadata-vocabulary.md`` (V1).
+Per INV-5 and PRD §6, consumers **import** from here — they never restate
+the vocabulary.  A second copy of any constant in this module is a bug.
+
+Contents
+--------
+* ``TOPIC_SLUG_RE`` / ``TOPIC_SLUG_MAX_LEN`` / ``is_valid_topic_slug`` —
+  the shared ``topic`` slug shape (PRD D4:
+  ``ProceduralTopicCluster.topic_id`` and ``metadata.topic`` are one
+  namespace with one regex).  **Defined in**
+  :mod:`fused_memory.topic_slug` (task 3198, leaf ε) and re-exported here
+  bound to the *same objects*, so this registry remains the advertised
+  import site while ``config/schema.py`` — which cannot import this
+  module without a cycle — validates through the identical rule.  See
+  that module's docstring for the measured ``ImportError`` behind the
+  split.
+* ``is_canonical`` — the one strict reading of the ``canonical`` marker,
+  defined in ``canonical_marker.py::is_canonical`` and re-exported here as
+  the same object.
+* ``normalize_supersedes`` — PRD D2's scalar/list/None normalizer.
+* ``render_metadata_vocabulary_guidance`` — the writer-facing statement of
+  this vocabulary that the writing reconciliation stage prompts interpolate.
+
+``kind`` is deliberately **NOT** slug-validated: 321 of the 329 live
+``kind`` values are snake_case, so applying this regex to ``kind`` would
+reject essentially the entire live population.  ``kind`` is
+registry-membership-CENSUSED instead, and never rejected (PRD §10 open
+question 1, option (b)).
+
+Layering note
+-------------
+This module imports **downward** into :mod:`fused_memory.backends.mem0_client`
+for :data:`MEM0_MANAGED_METADATA_KEYS`.  That direction is deliberate, not
+accidental: PRD D12 / task 3055 §6 name ``backends/mem0_client.py`` as the
+decided home for that set, and INV-5 forbids a second copy.  The name is
+re-exported here (bound to the *same object*) so callers classifying keys
+have one import site.
+
+That single home has a MEASURED COST, stated here rather than left for a
+consumer to discover: ``backends/mem0_client.py`` does ``from mem0 import
+AsyncMemory`` and ``from fused_memory.config.schema import
+FusedMemoryConfig`` at module scope, so importing this registry transitively
+pulls in the mem0 SDK and the pydantic-settings config model.  This module
+is therefore **not import-cheap**, and an out-of-process consumer that
+cannot install ``mem0`` cannot import it at all.  Making the import
+genuinely light would mean re-homing the set into a leaf module — a change
+to a home decided by task 3055 §6 / PRD D12 and still awaited by task 3088,
+so it is deliberately NOT made unilaterally here.
+
+What the split from :mod:`fused_memory.services.memory_metadata_census`
+*does* buy — and the reason the observability half (census log line, storm
+detector, escalation filer) lives there rather than here — is narrower than
+"cheap import" but real: this module carries **no process-lifetime mutable
+state, no queue writer, and no dependency on the optional ``escalation``
+package**, so leaf ι's prompt-pinning tests and the drift test import a
+pure vocabulary rather than a running subsystem.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Mapping
+from dataclasses import dataclass
+from types import MappingProxyType
+from typing import Any
+
+from shared.memory_supersession import SUPERSEDED_BY_METADATA_KEY
+from shared.task_statuses import TaskStatus
+
+from fused_memory.backends.mem0_client import MEM0_MANAGED_METADATA_KEYS
+
+# Re-exported as the same object, like the topic_slug names below.
+from fused_memory.canonical_marker import is_canonical
+
+# Re-exported, NOT redefined (task 3198, leaf ε).  These are bound to the
+# *same objects* the leaf module defines, so this registry remains the
+# advertised import site for the vocabulary while ``config/schema.py`` —
+# which cannot import this module without the measured
+# ``ImportError: cannot import name 'FusedMemoryConfig'`` cycle — validates
+# through the identical rule.  Per INV-5 there is one copy of the pattern
+# and the cap in the tree; ``tests/test_topic_slug_namespace.py`` asserts
+# that by ``is``, so retyping either here fails by design.
+from fused_memory.topic_slug import (
+    TOPIC_SLUG_MAX_LEN,
+    TOPIC_SLUG_RE,
+    is_valid_topic_slug,
+)
+
+# The canonical-full-UUID predicate that used to live here (task 3132, leaf η).
+# It moved to ``utils/validation.py`` so the delete_memory guards, recon_report's
+# citation gate and citation_verifier's forwarding-pointer guard all answer
+# "is this a canonical full UUID" from ONE definition (INV-5).
+from fused_memory.utils.validation import is_full_uuid
+
+__all__ = [
+    'BLESSED_METADATA_KEYS',
+    'CHILD_KINDS',
+    'KIND_REGISTRY',
+    'MEM0_MANAGED_METADATA_KEYS',
+    'CanonicalUniquenessViolation',
+    'EXPERIMENTAL_KEY_PREFIX',
+    'MemoryMetadataValidationError',
+    'MetadataViolation',
+    'ORCHESTRATOR_COMPLETION_SOURCE',
+    'PARENT_ID_DEAD_CODE',
+    'PARENT_ID_UNAVAILABLE_CODE',
+    'ParentHasChildrenError',
+    'RECONCILIATION_COMPLETION_ECHO_MARKER',
+    'RECONCILIATION_VERDICT_KEY',
+    'RESERVED_VOCABULARY_KEYS',
+    'SERVER_STAMPED_KEYS',
+    'SUPERSEDED_BY_METADATA_KEY',
+    'TARGETED_RECONCILIATION_SOURCE',
+    'TOPIC_SLUG_MAX_LEN',
+    'TOPIC_SLUG_RE',
+    'TRIAGE_CONTESTED_METADATA_KEY',
+    'check_canonical_routing',
+    'classify_unknown_keys',
+    'is_canonical',
+    'is_completion_record',
+    'is_orchestrator_completion_record',
+    'is_reconciliation_completion_echo',
+    'is_reconciliation_verdict_note',
+    'is_valid_topic_slug',
+    'normalize_supersedes',
+    'parent_liveness_violation',
+    'render_metadata_vocabulary_guidance',
+    'validate_memory_metadata',
+]
+
+#: Prefix marking a deliberately-unvalidated experimental key (Tier-C).
+#: Ported from the task-metadata boundary (``shared/src/shared/task_metadata.py``),
+#: which uses the same escape hatch for the same reason: a writer that knows
+#: it is experimenting should be able to say so without manufacturing census
+#: noise.
+EXPERIMENTAL_KEY_PREFIX = 'x_'
+
+#: Marks a ``server/grouped_read.py::CONTESTED_METADATA_KEY`` flag that write
+#: triage's judge stamped, not one an agent declared. Only
+#: ``server/tools.py::add_memory``'s contested attach writes it, and that tool
+#: discards any value a caller supplies. Read by
+#: ``plans/write-triage-link-healing-prd.md`` H1 row 2.
+TRIAGE_CONTESTED_METADATA_KEY = f'{EXPERIMENTAL_KEY_PREFIX}contested_by_triage'
+
+
+def normalize_supersedes(value: Any) -> list[Any]:
+    """Normalize a ``supersedes`` metadata value to a list (PRD D2).
+
+    This docstring is the SINGLE HOME of the ``supersedes`` writer/reader
+    map; the other sites that touch the key point here instead of
+    re-deriving it, and name SYMBOLS rather than line numbers (a pinned
+    line number is falsified by the next edit made above it — the churn
+    that motivated this consolidation).
+
+    ``supersedes`` is a list in V1, but the corpus carries 81 records with
+    a **scalar** value and 65 with a list.  The writer —
+    ``ReconciliationHarness._reconcile_status_correction`` in
+    ``reconciliation/harness.py`` — emitted a scalar until task 3196
+    migrated it to the canonical list shape; the 81 measured records
+    predate that migration and are not rewritten by it (PRD D2 defers
+    retro normalization to leaf θ's stamping sweep), which is why read
+    tolerance for the legacy scalar stays.  The readers are
+    ``reconciliation.targeted._is_authoritative_resolution`` (truthiness
+    discriminator, which tests ``any()`` of the normalized members — see
+    ITS docstring for why member-level and not container truthiness),
+    leaf 3112's closure predicate,
+    ``server/write_triage.py::declares_supersession`` (a declaration
+    force-stores the write instead of triaging it) and
+    ``services/supersession_mark.py::mark_superseded`` (which marks each
+    declared record superseded).  All go through this helper — INV-5:
+    never a second ``supersedes`` parser.
+
+    Accepts ``None`` (→ ``[]``), a scalar (→ single-element list), or any
+    non-``str`` sequence (→ list copy).  The returned list is always a
+    fresh object, never an alias of the caller's list.
+
+    This function **never drops or coerces members**.  A malformed member
+    (short hex, non-string — the census counts 3 and 8 live respectively)
+    survives normalization intact so that
+    :func:`validate_memory_metadata` can reject it *by name*.  Silently
+    dropping it here would be a silent-fail-soft: the write would succeed
+    having quietly discarded a supersession edge.
+    """
+    if value is None:
+        return []
+    if isinstance(value, (str, bytes)):
+        return [value]
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return list(value)
+    # Any other scalar (int, dict, ...) is wrapped rather than rejected —
+    # the shape validator owns rejection, this function owns shape only.
+    return [value]
+
+
+#: The ``kind`` values a child entry carries when its ``parent_id`` attaches it
+#: to a parent: the V1 child kinds, triage attach outcomes only.  Both were
+#: confirmed ABSENT from the live corpus, so :data:`KIND_REGISTRY` unions them
+#: in explicitly (its BLOCK 3) rather than inheriting them from the census.
+CHILD_KINDS: frozenset[str] = frozenset({'amendment', 'sighting'})
+
+
+#: The registry of Mem0 ``metadata.kind`` values (PRD D3), FROZEN BY
+#: DECISION (task 5266, PRD §10 open question 1, option (b)).  It is the
+#: drift BASELINE, not a gate: :func:`validate_memory_metadata` censuses a
+#: non-member as ``unknown_kind`` and never rejects it.
+#:
+#: Generated mechanically from the census artifact, NOT read at import
+#: time: a registry that mutates when an artifact is regenerated is not
+#: a registry.  ``tests/test_memory_metadata.py::TestKindRegistry`` asserts
+#: this literal against the census it was DERIVED from — a frozen
+#: projection at ``tests/fixtures/census-grandfather-oracle.json``, not the
+#: live ``plans/`` artifact, which task 4006 turned into a nightly
+#: regenerated trend input (see that constant's docstring for the full
+#: rationale, and for why re-deriving needs leaf β review rather than a
+#: fixture refresh).
+#:
+#: REMOVAL POLICY — this is its one home.  APPEND-ONLY: a value is never
+#: removed.  Absence from one census is no evidence its writer is dead —
+#: most writers are agents and prompts a source grep cannot see, which is
+#: the rule BLOCK 2's retention already follows — and a shrinking baseline
+#: would hide exactly the departures the drift report exists to show.
+#:
+#: NO CENSUS TOP-UP: re-seeding from a census would zero the drift signal.
+#: A new normative kind enters only by a PRD decision, as CHILD_KINDS did.
+#:
+#: Live drift is the nightly ``kind_registry_drift`` block of
+#: ``plans/memory-metadata-census-report.{json,md}``, not a test: a
+#: tripwire that goes red every night trains its readers to ignore it.
+KIND_REGISTRY: frozenset[str] = frozenset({
+    # ---------------------------------------------------------------
+    # BLOCK 1 — CENSUS-MEASURED (329 values)
+    #
+    # Source: plans/memory-metadata-census-report.json @ b5af3e4b03,
+    # coverage.complete = true.  Measured over 49,628 records, of which
+    # 47,150 (95.0%) carry NO `kind` at all (kind_missing), leaving
+    # 2,478 kinded records across 329 distinct values.
+    # Top five: cycle_summary (1,323), cgl_eta_cross_target_rehome (253),
+    # task_completion_note (101), task_completion (68), completion_note (62).
+    #
+    # WARNING (PRD §10 open question 1): 242 of these 329 values are
+    # SINGLETONS.  The population is agent-invented free text and open
+    # in practice, which measured D3's "kind writers are in-repo code +
+    # prompts" premise FALSE — the reason that question was ruled
+    # option (b): `kind` membership never rejects.
+    # ---------------------------------------------------------------
+    'admin_cleanup_task_filed',
+    'architectural_failure_mode',
+    'batch_completion',
+    'batch_completion_note',
+    'block_analysis',
+    'block_reason_documentation',
+    'block_state_resolution_closure',
+    'branch_arg_closure',
+    'cancellation_note',
+    'cancellation_rationale',
+    'canonical_counting_methodology',
+    'cfg_prd_chain_status',
+    'cgl_eta_cross_target_rehome',
+    'citation_provenance_discipline',
+    'companion_marker_cleanup_canonical',
+    'completion_capture',
+    'completion_guard',
+    'completion_knowledge',
+    'completion_memory_existence_check_norm',
+    'completion_note',
+    'completion_note_backfill_tag',
+    'completion_note_guard',
+    'completion_note_unknown_provenance',
+    'completion_observation',
+    'completion_record',
+    'condition_flag_type_dedup_norm',
+    'consolidated_canonical',
+    'consolidated_incident_open',
+    'consolidated_merge',
+    'consolidated_norm',
+    'consolidated_observation',
+    'consolidated_procedural_knowledge',
+    'consolidation_closure_norm',
+    'consolidation_closure_record',
+    'consolidation_outcome',
+    'consolidation_pointer',
+    'consolidation_residual',
+    'contradiction_resolved',
+    'coordination_resolved',
+    'corrected_block_diagnosis',
+    'correction',
+    'correction_note',
+    'corrective_note',
+    'corrective_stage2_summary',
+    'cross_project_routing_deferral_note',
+    'cross_project_routing_note',
+    'curation_method',
+    'curator_retained_short_sibling',
+    'cycle_summary',
+    'cycle_summary_correction',
+    'cycle_summary_ledger_false_positive_note',
+    'dead_letter_replay_confirmation',
+    'decision_outcome_note',
+    'dedup_guidance_correction',
+    'deferral_note',
+    'deletion_recovery',
+    'delivered_check_reblock_guidance',
+    'delivered_check_reblock_recurrence',
+    'dep_chain_status',
+    'dep_resolution_note',
+    'design_tension',
+    'deterministic_gate_escalation_missing_correction',
+    'done_provenance_correction',
+    'done_task_completion_note',
+    'done_task_knowledge_capture',
+    'dry_run_contradiction_note',
+    'episode_disposition_note',
+    'esc_5330_1_residual_correction',
+    'escalation_5556_hint_sweep_complete',
+    'escalation_lookup_anomaly',
+    'evidence_refinement',
+    'failure_mode',
+    'false_done_correction',
+    'fix_effectiveness_resolution',
+    'flag_closure_note',
+    'flag_correction',
+    'flag_for_stage2',
+    'flag_marker_id_mismatch_norm',
+    'flag_resolution_note',
+    'followup_prd_pointer',
+    'followup_scope_note',
+    'found_on_main',
+    'found_on_main_spurious_stamp',
+    'gate_evaluation_note',
+    'gate_race_incident',
+    'gate_reopen_record',
+    'gate_resolution_rationale',
+    'gate_task_reopen_rationale',
+    'gotcha',
+    'gr016_alpha_beta_resolution',
+    'guard_backfill',
+    'handoff_brief_norm',
+    'historical_annotation',
+    'human_curator_gate_status_correction',
+    'human_gate_closure_confirmation',
+    'human_gate_closure_discipline_recipe',
+    'identification_aid',
+    'incident_archive',
+    'infra_observation',
+    'investigation_finding',
+    'investigation_outcome',
+    'latent-bug',
+    'live_workflow_resolution',
+    'live_workflow_signal_citation_convention',
+    'live_workflow_signal_granularity_caution',
+    'live_workflow_suppression_disposition',
+    'live_workflow_write_rejected',
+    'main_gate_audit_hazard',
+    'memory_contradiction_dedup_norm',
+    'memory_correction',
+    'merge_blocker_note',
+    'merge_confirmation',
+    'merge_queue_observation',
+    'merged_duplicate',
+    'norm_reinforcement',
+    'norms_consolidation',
+    'per_cycle_summary',
+    'phantom_done_annotation',
+    'phantom_done_finding',
+    'phantom_done_recurrence_note',
+    'post-reboot-resume',
+    'prepared_consolidation_plan',
+    'procedural_consolidation',
+    'procedural_consolidation_gui_feature_gate',
+    'procedural_consolidation_npx_vitest_tsc',
+    'procedural_consolidation_ptodo_phantom_tracking',
+    'procedural_consolidation_round1',
+    'procedural_consolidation_round2',
+    'procedural_consolidation_round2_corrected',
+    'procedural_consolidation_round3',
+    'procedural_consolidation_round4',
+    'procedural_consolidation_round5',
+    'procedural_consolidation_todo_own_number_cite',
+    'procedural_convention',
+    'procedural_correction',
+    'procedural_gotcha',
+    'procedural_heuristic',
+    'procedural_knowledge_companion_guard',
+    'procedural_norm',
+    'procedural_rule',
+    'procedure',
+    'process_lesson_generalization',
+    'promoted_procedural_pattern',
+    'provenance_correction',
+    'provenance_resolution',
+    'provenance_smear_residual',
+    'quota_outage_resolution_and_gap_note',
+    'reasoning_correction',
+    'rebase_integrity_note',
+    'reblock_cohort_remediation',
+    'recon_cycle_summary',
+    'recon_guard',
+    'recon_observation',
+    'recon_probe_correction',
+    'recon_procedure',
+    'recon_stage2_norm',
+    'reconciliation_action',
+    'reconciliation_gotcha',
+    'recurring_flag_standing_decision',
+    'red_main_record',
+    'refinement',
+    'refresh_entity_summary_general_noop_repro',
+    'remediation_action_record',
+    'remediation_confirmation',
+    'remediation_correction',
+    'remediation_decision',
+    'remediation_investigation',
+    'remediation_norm',
+    'remediation_note',
+    'remediation_replacement',
+    'remediation_resolution',
+    'remediation_verification',
+    'resolution_summary',
+    'review_suggestions_triage',
+    'root_cause',
+    'root_cause_confirmation',
+    'scheduler_churn_evidence',
+    'scope_qualifier',
+    'session_summary',
+    'session_summary_continuation',
+    'sigabrt_task_id_remap_correction',
+    'site_count_correction',
+    'snapshot_gap_root_cause',
+    'snapshot_norm_cross_reference',
+    'snapshot_write_norm_clarification',
+    'snapshot_write_norm_corrected',
+    'snapshot_write_prohibition_corrected',
+    'soak_gate_clarification',
+    'soak_gate_tracking',
+    'split_out_fact',
+    'stage1_consolidated_canonical',
+    'stage1_consolidation_convention',
+    'stage1_consolidation_merge',
+    'stage1_cycle_summary',
+    'stage1_discipline',
+    'stage1_disposition',
+    'stage1_finding_correction',
+    'stage1_flag',
+    'stage1_flag_followup',
+    'stage1_flag_for_stage2',
+    'stage1_flag_marker_content',
+    'stage1_flag_relay',
+    'stage1_flag_resolution',
+    'stage1_flag_suppression',
+    'stage1_flag_suppression_retirement',
+    'stage1_flag_sweep_dual_key_fix',
+    'stage1_investigation_note',
+    'stage1_project_db_correction',
+    'stage1_relay',
+    'stage1_remediation_clarification',
+    'stage1_remediation_consolidation',
+    'stage1_remediation_correction',
+    'stage1_remediation_finding',
+    'stage1_remediation_note',
+    'stage1_remediation_relay',
+    'stage1_residual_scope_reanchor',
+    'stage1_unresolved_relay',
+    'stage2_bookkeeping_norm',
+    'stage2_completion_guard',
+    'stage2_completion_note',
+    'stage2_correction',
+    'stage2_cycle_summary',
+    'stage2_deferral_note',
+    'stage2_disposition',
+    'stage2_disposition_note',
+    'stage2_finding_correction',
+    'stage2_flag_resolution',
+    'stage2_guard',
+    'stage2_procedural_norm',
+    'stage2_procedure_note',
+    'stage2_protective_annotation',
+    'stage2_remediation_action',
+    'stage2_remediation_note',
+    'stage2_remediation_recommendation',
+    'stage2_scope_decision',
+    'stage2_suppress_backfill_guard',
+    'stage2_suppress_guard',
+    'stage2_suppress_guard_backfill',
+    'stage2_sync',
+    'stage2_task_reconciliation_note',
+    'stage2_task_resolution',
+    'stage2_verification',
+    'stage2_write_convention',
+    'stage3_finding_relay',
+    'stage3_procedure',
+    'stale_assertion_correction',
+    'stale_blocker_verification',
+    'stale_claim_corrected',
+    'stale_completion_correction',
+    'stale_memory_supersession',
+    'status_correction',
+    'stranded_gate_recurrence',
+    'strategy_rescope_note',
+    'stray_commit_collision_resolution',
+    'supplement',
+    'system_improvements_summary',
+    'systemic_gap_resolved',
+    'systemic_infra_pattern',
+    'systemic_infra_pattern_2026_06_18',
+    'systemic_pattern_observation',
+    'systemic_pattern_status_confirmed',
+    'task_absence_confirmation',
+    'task_amendment_correction',
+    'task_block_diagnosis_correction',
+    'task_block_reason_correction',
+    'task_blocking_context',
+    'task_cancellation_rationale',
+    'task_completion',
+    'task_completion_capture',
+    'task_completion_correction',
+    'task_completion_enrichment',
+    'task_completion_guard',
+    'task_completion_knowledge',
+    'task_completion_note',
+    'task_completion_note_correction',
+    'task_completion_note_guard',
+    'task_completion_observation',
+    'task_completion_reconciliation_note',
+    'task_completion_state',
+    'task_completion_summary',
+    'task_completion_summary_guard_retag',
+    'task_context',
+    'task_correction_note',
+    'task_count_snapshot',
+    'task_count_snapshot_norm_supersession',
+    'task_count_snapshot_recurrence_note',
+    'task_decision_reissue',
+    'task_dep_successor_resolution',
+    'task_diagnosis_note',
+    'task_dispatch_diagnosis',
+    'task_disposition',
+    'task_done_note',
+    'task_fix_note',
+    'task_incident_log',
+    'task_knowledge_sync_note',
+    'task_lifecycle_correction',
+    'task_lifecycle_note',
+    'task_lifecycle_reset_detected',
+    'task_memory_correction',
+    'task_memory_mismatch_clarification',
+    'task_metadata_correction',
+    'task_premise_correction',
+    'task_reconciliation_finding',
+    'task_recurrence_finding',
+    'task_reopen_rationale',
+    'task_resolution_correction',
+    'task_resolution_note',
+    'task_risk_observation',
+    'task_routing_convention',
+    'task_routing_note',
+    'task_series_summary',
+    'task_status_correction',
+    'task_status_investigation',
+    'task_telemetry_correction',
+    'task_unblock_note',
+    'taskid_renumber_285x_mem0_smear_correction',
+    'technique',
+    'terminal_state_correction',
+    'test_design_norm',
+    'trend_observation',
+    'triage_pattern_occt_scope_timeout',
+    'unblock_procedure',
+    'unblock_resolution_guidance',
+    'unknown_provenance_note',
+    'vanishing_escalation_recheck_cohort',
+    'verification_note',
+    'verified_fix_confirmation',
+    'verify_mechanism_fact',
+    'zombie_reset_bypass_rule',
+    # ---------------------------------------------------------------
+    # BLOCK 2 — IN-REPO DECLARED, ZERO LIVE RECORDS (5 values)
+    #
+    # These five were named by the PRD's original §6 grandfather row
+    # but measure ZERO live records (esc-3194-1, re-verified against
+    # main @ 2814b01202).  They are retained anyway: grandfathering
+    # means "what is WRITTEN", not only what survives an aging sweep.
+    # Retained under the append-only policy above.
+    # ---------------------------------------------------------------
+    'consolidated_scope_correction',  # reconciliation/scope_freshness.py:97 (declared), written :251, :495
+    # ReconciliationHarness._reconcile_status_correction (same dict as `supersedes`)
+    'project_status_correction',
+    'count_snapshot_cleanup_audit',   # scripts/cleanup_count_snapshots.py:210
+    # No live Mem0 writer found — retained per esc-3194-1 and the
+    # append-only policy above.  `entity_standing_decision` is a SQLite
+    # recon_ledger record kind (reconciliation/standing_decision_writer.py,
+    # list_entity_standing_decisions), i.e. a DIFFERENT store's vocabulary;
+    # `stage1_flag_marker`'s Mem0 mirror write was RETIRED by task 2406
+    # (see reconciliation/flag_dedup.py:10), leaving only prompt/doc
+    # references.  Both are harmless allowlist entries.
+    'entity_standing_decision',
+    'stage1_flag_marker',
+    # ---------------------------------------------------------------
+    # BLOCK 3 — NEW IN THIS PRD: CHILD_KINDS, unioned in below.
+    # ---------------------------------------------------------------
+}) | CHILD_KINDS
+
+
+# ---------------------------------------------------------------------------
+# Top-level metadata key layers
+#
+# Four deliberately DISJOINT layers.  A key classified twice would make the
+# census line ambiguous about who owns it, so
+# ``tests/test_memory_metadata.py::TestKeyLayers`` asserts pairwise
+# disjointness across all six pairs.  ``run_id`` is the live trap: it is
+# server-stamped AND mem0-managed AND measures 4,518 live occurrences, so it
+# is the one key that would otherwise land in three tiers at once.  It is
+# classified under the mem0-managed layer only (see below) -- that layer is
+# the one with an external owner, so it wins the tie.
+# ---------------------------------------------------------------------------
+
+#: Keys this server stamps onto metadata itself.  They are NOT all stamped at
+#: the same layer, and a reviewer must not read these as four write-seam
+#: stamps:
+#:
+#: * ``category``   -- stamped at the write seam:
+#:                     ``memory_service.py:2193`` (``add_memory``) and
+#:                     ``:2542`` (``add_system_record``).
+#: * ``recon_pool`` -- stamped inside ``_apply_cycle_summary_metadata_tagging``
+#:                     (``memory_service.py:389``), cycle-summary writes only.
+#: * ``planned``    -- NOT a write-seam stamp at all.  It is a server-owned
+#:                     SEARCH-RESULT annotation (``memory_service.py:1932``,
+#:                     ``:2921``, read back at ``:2962``).  It is listed here
+#:                     so that a round-tripped search result re-written as
+#:                     metadata does not census-warn on the server's own field.
+#: * ``unverified_claim`` -- stamped at the add_memory write seam
+#:                     (``services/memory_service.py::MemoryService.add_memory``)
+#:                     when the completion-claim gate
+#:                     (``services/completion_claim_gate.py::UNVERIFIED_CLAIM_TAG``)
+#:                     flags the write.  Episode-derived facts get it from
+#:                     ``MemoryService._execute_mem0_classify_and_add``, which
+#:                     does not pass through this validator.  Unlike the
+#:                     census, which only stops warning about it, both seams
+#:                     DISCARD a caller-supplied value
+#:                     (``services/memory_service.py::_stamp_unverified_claim``),
+#:                     so a caller can neither forge the tag nor persist False.
+#:
+#: DELIBERATELY ABSENT: ``run_id``.  It *is* server-stamped, by the same
+#: ``_apply_cycle_summary_metadata_tagging`` helper (``memory_service.py:389``)
+#: as ``recon_pool`` -- but mem0 also owns and re-derives it, so it is already
+#: carried by :data:`MEM0_MANAGED_METADATA_KEYS`
+#: (``backends/mem0_client.py:35``).  Listing it in both sets would break the
+#: disjointness invariant above and leave the census line ambiguous about who
+#: owns the key.  Classification is unaffected either way --
+#: :data:`_KNOWN_METADATA_KEYS` is a union -- so the single-home rule decides.
+SERVER_STAMPED_KEYS: frozenset[str] = frozenset({
+    'category',
+    'recon_pool',
+    'planned',
+    'unverified_claim',
+})
+
+#: The five keys this PRD reserves and gives shape rules to (V1).  Every one
+#: is OPTIONAL: absence is never a violation.
+RESERVED_VOCABULARY_KEYS: frozenset[str] = frozenset({
+    'topic',
+    'canonical',
+    'kind',
+    'parent_id',
+    'supersedes',
+})
+
+#: Tier-A: conventional keys that are deliberate, documented and high-volume,
+#: and so must NOT manufacture census noise.  Ported from the task-metadata
+#: boundary's ``_BLESSED_METADATA_KEYS``.
+#:
+#: Seeded from leaf α's census at a stated **count >= 1000** cut, excluding
+#: anything already mem0-managed, server-stamped or reserved (counts inline,
+#: from plans/memory-metadata-census-report.json @ b5af3e4b03).
+#:
+#: WHY THIS TIER IS MANDATORY: the corpus carries 1,627 distinct top-level
+#: keys, 715 of them singletons.  Without a blessed tier, essentially every
+#: write emits an unknown-key census line -- which drowns the signal the
+#: census line exists to produce and makes the storm detector fire
+#: permanently against normal traffic, i.e. the warn path logged into
+#: oblivion (precisely what INV-4 exists to prevent).
+#:
+#: Everything BELOW the cut keeps warning.  That is the intended Tier-B/C
+#: drift signal, not noise: the 715 singleton keys are what a census is for.
+BLESSED_METADATA_KEYS: frozenset[str] = frozenset({
+    'task_id',               # 18,850
+    'source',                # 16,364
+    'transition',            # 15,529
+    '_deferred',             #  8,263
+    '_causation_id',         #  8,262
+    'stage',                 #  2,865
+    'stage2_suppress',       #  1,588
+    'echo_used_provenance',  #  1,284
+})
+
+#: The ``source`` the orchestrator stamps on its task completion record
+#: (``orchestrator/src/orchestrator/workflow.py::TaskWorkflow._write_completion_to_memory``).
+ORCHESTRATOR_COMPLETION_SOURCE = 'orchestrator_completion'
+
+
+def is_orchestrator_completion_record(meta: Mapping[str, Any]) -> bool:
+    return meta.get('source') == ORCHESTRATOR_COMPLETION_SOURCE
+
+
+#: The ``source`` reconciliation/targeted.py::TargetedReconciler stamps on its
+#: notes: the completion echo and the verification-verdict note. Both are
+#: records about their metadata.task_id, which :func:`is_completion_record` accepts.
+TARGETED_RECONCILIATION_SOURCE = 'targeted_reconciliation'
+
+#: The metadata that marks reconciliation's completion echo, as against its
+#: verification-verdict note. TargetedReconciler._on_task_done's fast path
+#: stamps it and TargetedReconciler._delete_stale_completion_echoes filters on
+#: it, so that sweep never deletes a verdict note.
+RECONCILIATION_COMPLETION_ECHO_MARKER: Mapping[str, str] = MappingProxyType({
+    'source': TARGETED_RECONCILIATION_SOURCE,
+    'transition': TaskStatus.DONE.value,
+})
+
+
+def is_reconciliation_completion_echo(meta: Mapping[str, Any]) -> bool:
+    return all(meta.get(key) == value for key, value in RECONCILIATION_COMPLETION_ECHO_MARKER.items())
+
+
+#: The key under which TargetedReconciler._on_task_done's verification-verdict
+#: note records the verifier's verdict on its metadata.task_id's completion.
+RECONCILIATION_VERDICT_KEY = 'verification_verdict'
+
+
+def is_reconciliation_verdict_note(meta: Mapping[str, Any]) -> bool:
+    verdict = meta.get(RECONCILIATION_VERDICT_KEY)
+    return meta.get('source') == TARGETED_RECONCILIATION_SOURCE and isinstance(verdict, str) and bool(verdict)
+
+
+def is_completion_record(meta: Mapping[str, Any]) -> bool:
+    """Is this a record ABOUT its metadata.task_id, as opposed to one merely written by that task?
+
+    Being about the task is not saying it completed: a verification-verdict note
+    whose verdict is 'contradicted' counts too.
+    """
+    return (
+        is_orchestrator_completion_record(meta)
+        or is_reconciliation_completion_echo(meta)
+        or is_reconciliation_verdict_note(meta)
+    )
+
+
+#: Union of every known layer, precomputed for the unknown-key scan.
+_KNOWN_METADATA_KEYS: frozenset[str] = (
+    MEM0_MANAGED_METADATA_KEYS
+    | SERVER_STAMPED_KEYS
+    | RESERVED_VOCABULARY_KEYS
+    | BLESSED_METADATA_KEYS
+)
+
+
+def classify_unknown_keys(meta: dict[str, Any]) -> list[str]:
+    """Return the top-level keys of *meta* that belong to no known layer.
+
+    A key is known if it is mem0-managed, server-stamped, reserved
+    vocabulary, blessed conventional, or carries the ``x_`` experimental
+    prefix.  Structurally identical to the task-metadata boundary's
+    unknown-key scan (``shared/src/shared/task_metadata.py:912-920``).
+
+    Returns a list (not a set) in the caller's key order so the census line
+    and any escalation summary are stable and readable.
+    """
+    return [
+        key
+        for key in meta
+        if key not in _KNOWN_METADATA_KEYS
+        and not key.startswith(EXPERIMENTAL_KEY_PREFIX)
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Violations and the strict-mode error
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class MetadataViolation:
+    """A single metadata shape/vocabulary violation.
+
+    Modelled on the task-metadata boundary's ``SchemaWarning``
+    (``shared/src/shared/task_metadata.py:680``) plus the ``fatal`` flag
+    this domain needs: an unknown KEY only ever censuses, while a
+    malformed reserved key is rejectable once ``memory_metadata.enforce``
+    is on.  Frozen so violations are hashable and directly assertable.
+
+    :param key:     the offending top-level metadata key.
+    :param code:    stable machine code, e.g. ``invalid_topic_slug``.  This
+                    is what the census line reports and what operators grep.
+    :param message: human-readable text naming the violated RULE and the
+                    registry location (see
+                    :class:`MemoryMetadataValidationError`).
+    :param fatal:   whether this violation would reject the write under
+                    ``enforce``.  Non-fatal violations always still census.
+    """
+
+    key: str
+    code: str
+    message: str
+    fatal: bool
+
+
+class MemoryMetadataValidationError(Exception):
+    """Raised at the write seam when ``memory_metadata.enforce`` is on and at
+    least one violation is fatal.
+
+    V1 requires the rejection hint to name BOTH the violated rule and where
+    the registry lives, so an agent that trips it can find the vocabulary
+    rather than guessing.  That is satisfied *by construction* here: every
+    violation ``message`` produced by :func:`validate_memory_metadata`
+    already names its rule, and this class appends the registry location, so
+    the guarantee does not depend on each call site remembering to add it.
+    """
+
+    #: Where the vocabulary lives.  Named in every rejection message.
+    REGISTRY_LOCATION = 'fused_memory.memory_metadata'
+
+    def __init__(self, violations: list[MetadataViolation]) -> None:
+        self.violations = list(violations)
+        detail = '; '.join(
+            f'{v.code}: {v.message}' for v in self.violations
+        )
+        super().__init__(
+            f'memory metadata rejected ({len(self.violations)} violation(s)): '
+            f'{detail} -- the metadata vocabulary is defined in '
+            f'{self.REGISTRY_LOCATION}'
+        )
+
+
+class ParentHasChildrenError(Exception):
+    """Raised by ``delete_memory`` when the target still has children.
+
+    PRD V3's lifecycle contract — "no operation may silently orphan a child
+    or dangle a pointer it could have seen" — has two halves.  The
+    *enforcement* half (the live child re-check, INV-3) belongs at the
+    delete seam in ``services/memory_service.py``, where the store lives.
+    The *contract-fixed* half is this error, and it belongs HERE for the
+    same reason :class:`MemoryMetadataValidationError` does: this module is
+    deliberately pure — no process-lifetime state, no queue writer, no
+    dependency on the optional ``escalation`` package — so an
+    out-of-process consumer, a lint sweep or a test can import the refusal
+    contract without pulling in a running ``MemoryService``.  Keeping both
+    contract-fixed errors side by side is also what makes them read
+    identically to a caller.
+
+    The message is the whole user-observable signal: at the MCP wire
+    ``@mcp_tool_errors`` renders the exception as
+    ``{'error': str(e), 'error_type': 'ParentHasChildrenError'}``, so an
+    agent that trips the refusal has ``str(err)`` and nothing else.  It
+    therefore names the parent, every listed child id, the count, the
+    ``cascade=true`` way out, and where the vocabulary lives.
+
+    :param parent_id:  the id whose deletion was refused.
+    :param child_ids:  ids of records whose ``metadata.parent_id`` points at
+                       *parent_id*.  Copied, never aliased, so a later
+                       mutation of the caller's scroll buffer cannot
+                       retroactively rewrite what the refusal claimed.
+    :param truncated:  True when the listing is known to be PARTIAL (the id
+                       scroll returned fewer rows than the live child count
+                       — a bounded scroll or a concurrent write).  The
+                       message then says "at least N", because a bounded
+                       listing that reads as exhaustive would understate
+                       what a subsequent ``cascade`` is about to delete.
+    """
+
+    def __init__(
+        self,
+        *,
+        parent_id: str,
+        child_ids: list[str],
+        truncated: bool = False,
+    ) -> None:
+        self.parent_id = parent_id
+        self.child_ids = list(child_ids)
+        self.truncated = truncated
+        count = (
+            f'at least {len(self.child_ids)}'
+            if truncated
+            else str(len(self.child_ids))
+        )
+        listed = ', '.join(self.child_ids)
+        super().__init__(
+            f'refusing to delete memory {parent_id}: it has {count} child '
+            f'record(s) whose metadata.parent_id points at it '
+            f'({listed}); deleting it would orphan them. Pass cascade=true '
+            f'to delete the children too, or reparent them first -- the '
+            f'metadata vocabulary is defined in '
+            f'{MemoryMetadataValidationError.REGISTRY_LOCATION}'
+        )
+
+
+class CanonicalUniquenessViolation(Exception):
+    """A second ``canonical`` write for a ``(project, topic)`` already taken.
+
+    V1 contract-fixes this type alongside
+    :class:`MemoryMetadataValidationError`, and requires the message to
+    NAME the incumbent's id -- counting is not enough, because an operator
+    who trips this needs to go look at the record that already holds the
+    topic. That obligation is why the seam counts first and only then
+    scrolls: ``count_memories_by_metadata`` is the contracted INV-3 gate
+    but returns an ``int``, which structurally cannot carry an id.
+
+    Deliberately **NOT** a subclass of
+    :class:`MemoryMetadataValidationError`. The two are separate rejection
+    contracts -- one is "your metadata is malformed", the other is "your
+    metadata is well-formed but collides with live state" -- and a caller
+    must be able to tell them apart at the ``except``. Subclassing would
+    also let the pre-existing
+    ``pytest.raises(MemoryMetadataValidationError)`` sites silently
+    swallow a uniqueness violation, i.e. pass for the wrong reason. The
+    structured fields below satisfy INV-2's structured-rejection
+    obligation without needing inheritance.
+
+    Raised ONLY from
+    :func:`~fused_memory.services.memory_service._apply_memory_metadata_validation`,
+    never from :func:`validate_memory_metadata`: the check needs live
+    store state, and the pure validator structurally cannot perform a
+    store lookup. Look for it at the seam, not in the shape validator.
+    """
+
+    def __init__(self, *, project_id: str, topic: str, incumbent_id: str) -> None:
+        self.project_id = project_id
+        self.topic = topic
+        self.incumbent_id = incumbent_id
+        super().__init__(
+            f'canonical uniqueness violated: memory {incumbent_id} is already '
+            f'canonical for topic {topic!r} in project {project_id!r}; at most '
+            f'one canonical memory is allowed per (project, topic). Update or '
+            f'supersede that memory instead of adding a second canonical -- the '
+            f'metadata vocabulary is defined in '
+            f'{MemoryMetadataValidationError.REGISTRY_LOCATION}'
+        )
+
+
+# ---------------------------------------------------------------------------
+# The shape validator
+# ---------------------------------------------------------------------------
+
+#: Appended to every violation message so
+#: :class:`MemoryMetadataValidationError`'s V1 hint obligation ("name the
+#: rule AND where the registry lives") is satisfied BY CONSTRUCTION rather
+#: than by each call site remembering to add it.
+_REGISTRY_HINT = f'(vocabulary: {MemoryMetadataValidationError.REGISTRY_LOCATION})'
+
+
+def _violation(key: str, code: str, rule: str, *, fatal: bool) -> MetadataViolation:
+    """Build a violation whose message names the rule and the registry."""
+    return MetadataViolation(
+        key=key, code=code, message=f'{rule} {_REGISTRY_HINT}', fatal=fatal
+    )
+
+
+#: Census code for a ``parent_id`` that shape-checks but resolves to
+#: nothing in the same project's Mem0 collection.
+PARENT_ID_DEAD_CODE = 'dead_parent_id'
+
+#: Census code for a ``parent_id`` whose liveness could NOT be determined
+#: because the backend lookup itself failed (a propagated Qdrant read
+#: timeout, a transport error).  Deliberately distinct from
+#: :data:`PARENT_ID_DEAD_CODE` — see :func:`parent_liveness_violation`.
+PARENT_ID_UNAVAILABLE_CODE = 'parent_id_liveness_unavailable'
+
+_PARENT_LIVENESS_RULES = {
+    PARENT_ID_DEAD_CODE: (
+        'parent_id {parent_id!r} must resolve to a live same-project Mem0 '
+        'entry; the lookup returned no such record, so writing this would '
+        'dangle a pointer at a dead parent'
+    ),
+    PARENT_ID_UNAVAILABLE_CODE: (
+        'parent_id {parent_id!r} could not be checked: the same-project Mem0 '
+        'lookup failed, so liveness is UNKNOWN rather than refuted'
+    ),
+}
+
+
+def parent_liveness_violation(parent_id: Any, *, code: str) -> MetadataViolation:
+    """Build a ``parent_id`` LIVENESS violation (leaf δ, task 3197).
+
+    Liveness itself is resolved at the write SEAM
+    (``services/memory_service.py::_apply_memory_metadata_validation``),
+    which is the only layer that can reach a store —
+    :func:`validate_memory_metadata` is pure by construction and must stay
+    that way.  But the CODES and the message WORDING live here, behind this
+    factory, so the registry remains the single normative home for the rule
+    and the seam cannot grow a second copy of the text (INV-5).  Delegating
+    to ``_violation`` also means the registry-location hint is appended by
+    construction rather than by the seam remembering to add it.
+
+    Both codes are ``fatal=True``, which is what lets liveness ride the
+    existing uniform arms at the seam: warn mode censuses and proceeds,
+    ``memory_metadata.enforce`` rejects.  No new config leaf, no third
+    rejection path.
+
+    The two codes are kept DISTINCT on purpose.
+    ``Mem0Backend.get_point_by_id`` propagates a read timeout rather than
+    collapsing it into ``None``, precisely so a timed-out read is never
+    mistaken for a genuine not-found; folding both into
+    :data:`PARENT_ID_DEAD_CODE` would discard that at the seam and tell an
+    operator a live parent is dead.  Fatal-on-unavailable is INV-3 read
+    literally: an actor that cannot corroborate must not act.
+
+    :raises ValueError: on an unrecognised *code*.  Census codes are what
+        operators grep, so a typo must fail loudly rather than quietly mint
+        a new census axis.
+    """
+    try:
+        rule = _PARENT_LIVENESS_RULES[code]
+    except KeyError:
+        raise ValueError(
+            f'unrecognised parent liveness code {code!r}; expected one of '
+            f'{sorted(_PARENT_LIVENESS_RULES)}'
+        ) from None
+    return _violation(
+        'parent_id', code, rule.format(parent_id=parent_id), fatal=True
+    )
+
+
+def validate_memory_metadata(meta: dict[str, Any]) -> list[MetadataViolation]:
+    """Shape-check the reserved Mem0 metadata vocabulary (PRD V1, leaf β).
+
+    Returns **every** violation found — it never short-circuits at the first
+    failure, because a validator that stopped early would make an operator
+    fix one violation per write attempt.  Returning violations rather than
+    raising mirrors ``parse_metadata``'s ``(value, warnings)`` contract
+    (``shared/src/shared/task_metadata.py``): the CALLER owns the
+    warn-vs-reject decision, driven by ``memory_metadata.enforce``.
+
+    *meta* is mutated in place in exactly one way: a ``supersedes`` value is
+    normalized to a list (PRD D2).  See
+    :func:`normalize_supersedes` and the β-before-γ note below.
+
+    SCOPE — SHAPE ONLY.  This is a pure synchronous function taking only a
+    dict, so it structurally **cannot** perform a store lookup.  That is
+    deliberate, not an oversight:
+
+    * ``parent_id`` **liveness** (does the parent still exist?) is leaf δ's,
+      and leaf δ (task 3197) has LANDED it at the write seam,
+      ``services/memory_service.py::_apply_memory_metadata_validation``.
+      The codes and wording it emits are still defined here — see
+      :func:`parent_liveness_violation`,
+      :data:`PARENT_ID_DEAD_CODE` and :data:`PARENT_ID_UNAVAILABLE_CODE` —
+      so the rule has exactly one home even though its two halves run in
+      two layers;
+    * ``canonical`` per-(project, topic) **uniqueness** is leaf ε's, and
+      lives at that same async seam
+      (:func:`~fused_memory.services.memory_service._apply_memory_metadata_validation`)
+      because it needs live store state.
+
+    Leaf ε (task 3198) split ``canonical`` along exactly that line.  Its
+    SHAPE half — a canonical assertion requires a ``topic`` (§2b's
+    ``canonical_without_topic``) — is checked HERE, because it needs
+    nothing but the dict.  Its UNIQUENESS half stays at the seam.  The
+    boundary moved no work into this function that a store lookup could
+    have been needed for.
+
+    Making the boundary structural rather than a comment is what forced
+    both later leaves to add their live-state checks at the seam, and kept
+    either from accidentally growing a second implementation in here
+    (INV-5).
+
+    Ordering inside the function is load-bearing:
+
+    1. normalize ``supersedes`` first, so the member checks below see a
+       uniform list regardless of which live shape arrived;
+    2. shape-check each reserved key that is PRESENT — absence is never a
+       violation, since none of V1's five keys is required;
+    3. classify unknown top-level keys (census-only, never fatal).
+    """
+    violations: list[MetadataViolation] = []
+
+    # 1. supersedes — NORMALIZE, never reject the container shape.
+    #
+    # The β-before-γ hazard: PRD §9 sequenced γ after β, and
+    # `reconciliation/harness.py` wrote a SCALAR `supersedes` (81 live
+    # records) for that whole window.  Rejecting the scalar form here would
+    # have broken the recon harness's own writes until γ migrated it.  That
+    # window is now CLOSED — task 3196 (γ) migrated that writer
+    # (`ReconciliationHarness._reconcile_status_correction`) to the canonical
+    # list shape.
+    #
+    # The in-place coercion below is nonetheless RETAINED as
+    # defense-in-depth, not left over: no corpus rewrite shipped with γ, so
+    # the 81 pre-migration records still carry scalars (PRD D2 defers retro
+    # normalization to leaf θ's stamping sweep), and out-of-repo writers are
+    # not bound by the in-repo migration.  Coercing at the write boundary
+    # mirrors `_normalize_task_id_metadata`, which already does exactly this
+    # for the same class of problem in the same two functions, and is
+    # compatible with V1's "legacy scalar tolerated on read".  Only malformed
+    # MEMBERS are rejected.
+    if 'supersedes' in meta:
+        members = normalize_supersedes(meta['supersedes'])
+        meta['supersedes'] = members
+        for member in members:
+            if not is_full_uuid(member):
+                violations.append(_violation(
+                    'supersedes',
+                    'invalid_supersedes_member',
+                    f'supersedes member {member!r} must be a canonical full-UUID '
+                    f'string; the census counts 3 live short-hex and 8 live '
+                    f'non-string members',
+                    fatal=True,
+                ))
+
+    # 2a. topic — the shared slug namespace (PRD D4).
+    if 'topic' in meta:
+        topic = meta['topic']
+        if not isinstance(topic, str):
+            violations.append(_violation(
+                'topic',
+                'invalid_topic_type',
+                f'topic must be a str, got {type(topic).__name__}',
+                fatal=True,
+            ))
+        # `is_valid_topic_slug`, NOT an inlined `TOPIC_SLUG_RE.match(...) or
+        # len(...) >` — the predicate is THE shared verdict (D4: one
+        # namespace, one answer), and the config-side validator and the
+        # seam's uniqueness guard both call it.  Re-expressing the rule here
+        # would split the closure the moment the predicate gains a step
+        # (a normalization pass, a reserved-prefix rule): the other two call
+        # sites would get it and the shape validator would not.  The
+        # `isinstance(topic, str)` branch above already separated the type
+        # defect from the shape defect, so both violation codes survive.
+        elif not is_valid_topic_slug(topic):
+            violations.append(_violation(
+                'topic',
+                'invalid_topic_slug',
+                f'topic {topic!r} must match TOPIC_SLUG_RE '
+                f'{TOPIC_SLUG_RE.pattern!r} and be at most '
+                f'{TOPIC_SLUG_MAX_LEN} chars',
+                fatal=True,
+            ))
+
+    # 2b. canonical — bools only.
+    if 'canonical' in meta:
+        canonical = meta['canonical']
+        # isinstance(..., bool), NOT truthiness: `1 == True` in Python, so a
+        # truthiness check would silently accept the int form.  The census
+        # counts exactly 1 live non-bool value — the record this rule exists
+        # to surface.
+        if not isinstance(canonical, bool):
+            violations.append(_violation(
+                'canonical',
+                'invalid_canonical_type',
+                f'canonical must be a bool, got {type(canonical).__name__} '
+                f'({canonical!r}); the check is isinstance(x, bool), not '
+                f'truthiness, so 1/0 do not pass as True/False',
+                fatal=True,
+            ))
+        # Read through is_canonical, so a non-bool value reports only the
+        # TYPE defect above rather than being double-counted here.
+        #
+        # Only the `topic` KEY's presence is tested: when it is present but
+        # malformed, 2a's invalid_topic_slug already describes that defect,
+        # and emitting both would report one defect twice while implying the
+        # writer forgot a key they did supply.
+        elif is_canonical(meta) and 'topic' not in meta:
+            violations.append(_violation(
+                'canonical',
+                'canonical_without_topic',
+                'canonical=True requires a topic: the marker asserts "this is '
+                'THE entry for its topic", so outside a topic there is no set '
+                'for it to be canonical of and the <=1-per-(project, topic) '
+                'uniqueness rule has no key to check',
+                fatal=True,
+            ))
+
+    # 2c. kind — registry membership, NOT slug shape.
+    #
+    # 321 of the 329 live `kind` values are snake_case, so applying
+    # TOPIC_SLUG_RE here would reject essentially the whole live population.
+    if 'kind' in meta:
+        kind = meta['kind']
+        if not isinstance(kind, str):
+            violations.append(_violation(
+                'kind',
+                'invalid_kind_type',
+                f'kind must be a str, got {type(kind).__name__}',
+                fatal=True,
+            ))
+        elif kind not in KIND_REGISTRY:
+            # Census-only by PRD §10 OQ1 option (b); the registry is the drift baseline.
+            violations.append(_violation(
+                'kind',
+                'unknown_kind',
+                f'kind {kind!r} is not in KIND_REGISTRY '
+                f'({len(KIND_REGISTRY)} grandfathered values)',
+                fatal=False,
+            ))
+
+    # 2d. parent_id — SHAPE only.
+    #
+    # LIVENESS is resolved one layer up, at the write seam
+    # (`_apply_memory_metadata_validation`), using
+    # `parent_liveness_violation()` above; it fires only when the shape
+    # check below has PASSED, so no store round-trip is ever spent on an id
+    # no store could resolve.  See the SCOPE section of the docstring.
+    if 'parent_id' in meta:
+        parent_id = meta['parent_id']
+        if not is_full_uuid(parent_id):
+            violations.append(_violation(
+                'parent_id',
+                'invalid_parent_id_shape',
+                f'parent_id {parent_id!r} must be a canonical full-UUID string '
+                f'(shape only — liveness is resolved at the write seam, '
+                f'see parent_liveness_violation)',
+                fatal=True,
+            ))
+
+    # 3. Unknown top-level keys — census-only, never fatal.
+    #
+    # 1,627 distinct live keys, 715 of them singletons.  This axis exists to
+    # PRODUCE a drift signal, not to reject; making it fatal would turn the
+    # long tail into an outage the moment `enforce` flipped.
+    for key in classify_unknown_keys(meta):
+        violations.append(_violation(
+            key,
+            'unknown_key',
+            f'metadata key {key!r} belongs to no known layer '
+            f'(mem0-managed / server-stamped / reserved / blessed) and lacks '
+            f'the {EXPERIMENTAL_KEY_PREFIX!r} experimental prefix',
+            fatal=False,
+        ))
+
+    return violations
+
+
+# ---------------------------------------------------------------------------
+# The routing rule
+# ---------------------------------------------------------------------------
+
+def check_canonical_routing(
+    meta: dict[str, Any], *, reaches_mem0: bool
+) -> list[MetadataViolation]:
+    """Refuse a ``canonical: True`` assertion on a write that misses Mem0.
+
+    Task 3508.  The third and last piece of ``canonical``, alongside the
+    SHAPE half (``canonical_without_topic`` / ``invalid_canonical_type``,
+    in :func:`validate_memory_metadata` above) and the LIVE half
+    (``_check_canonical_uniqueness`` at the service seam).
+
+    WHY A SEPARATE FUNCTION AND NOT A BRANCH IN THE VALIDATOR — the
+    boundary is structural, not stylistic.  :func:`validate_memory_metadata`
+    promises in its own docstring to be "a pure synchronous function taking
+    only a dict", and leaf ε recorded that as "deliberate, not an
+    oversight" precisely so a later leaf could not grow store- or
+    routing-dependent checks inside it (INV-5).  ``reaches_mem0`` is a
+    SERVICE-LAYER ROUTING fact — it is not derivable from *meta* at all —
+    so folding it in would blur exactly that boundary, and would churn four
+    external call sites that know nothing about routing.  The rule
+    nonetheless lives in THIS module so every violation code and message
+    stays single-homed with its siblings: the census vocabulary has one
+    registry, and an operator greps one file.
+
+    WHY THE RULE EXISTS — measured on graphiti_core 0.28.2, not assumed.
+    THIS DOCSTRING IS THE SINGLE HOME for that measurement: the two
+    service-seam docstrings and the three call-site comments (``add_memory``,
+    ``add_system_record``, ``update_memory``) carry at most a line, so there
+    is ONE thing to update when graphiti_core changes (INV-5).  Cited by
+    symbol, not line.  On a write that reaches only Graphiti the metadata is
+    not merely UNCOUNTED, it is DISCARDED:
+
+    * the ``add_memory_graphiti`` enqueue payload built in
+      :meth:`MemoryService.add_memory` carries no ``meta``; its only
+      metadata-derived fields are ``referents`` (bridged from ``task_id``
+      alone) and ``unverified_claim``, neither of which carries
+      ``canonical`` or ``topic``;
+    * :meth:`GraphitiBackend.add_episode` has no metadata parameter to
+      receive one; the string ``metadata`` occurs zero times in that module;
+    * ``entity_types``, the only route to ``EntityNode.attributes``, is
+      never supplied by any caller, so attributes are always ``{}``.
+
+    So the marker is never stored — hence never readable by any reader,
+    all of which read Mem0 payloads — and
+    never countable by the <=1-per-``(project, topic)`` probe, whose two
+    round-trips are Qdrant payload filters.  Admitting such a write would
+    silently destroy a caller's assertion, which is the fail-soft the house
+    no-silent-fail-soft invariant forbids.  Why a Graphiti-side COUNT was
+    rejected outright rather than deferred (four further measurements) is
+    likewise recorded once, in the leaf-ε section of
+    ``docs/prds/memory-metadata-vocabulary.md``.
+
+    WHAT THIS CLOSES, AND WHEN — do not over-read it.  Refusing the write
+    makes the <=1-per-``(project, topic)`` invariant hold for all six
+    categories by construction, at zero new I/O, but only ONCE
+    ``memory_metadata.enforce`` is on.  Under the SHIPPED default
+    (``enforce = False``) a Graphiti-only canonical write is censused
+    (``canonical_on_non_mem0_write``) and then PROCEEDS, and its marker is
+    discarded exactly as it was before this rule existed: the mechanism is
+    in place, the closure is not yet live, and the only live-fleet change
+    is one extra census line.  Task 3626 is the gate that re-measures and
+    decides the flip.
+
+    SCOPED TO ``canonical`` DELIBERATELY, not by oversight.  On that same
+    Graphiti-only write ``topic``, ``kind``, ``parent_id`` and
+    ``supersedes`` are equally discarded and stay admitted in silence
+    (``test_no_probe_and_no_new_code_on_a_graphiti_only_ordinary_write``
+    pins exactly that).  ``canonical`` alone carries a CROSS-RECORD
+    obligation — INV-3 uniqueness, which a discarded marker breaks for
+    records other than this one — while the others assert nothing another
+    record depends on.  Widening the refusal to the whole vocabulary is a
+    separate decision, not a follow-on of this one.
+
+    THE PREDICATE IS "WILL THIS LAND IN MEM0", NOT "IS THE CATEGORY
+    MEM0-PRIMARY".  That distinction is load-bearing: ``dual_write=True``
+    routes a Graphiti-primary category into Mem0 too, where ``canonical``
+    genuinely IS stored and IS enforceable, so a category-based test would
+    be wrong exactly when it mattered.  The caller passes the routing
+    OUTCOME (``resolved_category in MEM0_PRIMARY or dual_write``) rather
+    than the category, so this rule never restates the routing rule.
+    ``update_memory`` and ``add_system_record`` pass ``True`` because they
+    always land in Mem0, whatever their ``category`` tag.
+
+    ``fatal=True``, so it inherits warn-mode-first from the existing
+    ``memory_metadata.enforce`` flag exactly like every sibling shape
+    check — no new config leaf (see "WHAT THIS CLOSES" above for what that
+    means on the live fleet today).
+
+    Returns a list (never raises) for the same reason
+    :func:`validate_memory_metadata` does: the CALLER owns the
+    warn-vs-reject decision.  *meta* is NOT mutated — unlike the validator,
+    this normalizes nothing.  SYNCHRONOUS by design, unlike its sibling
+    ``_check_canonical_uniqueness``: that one is a coroutine because it
+    reads live store state, whereas this needs only the routing fact the
+    caller already holds, so there is nothing to await.
+
+    :param reaches_mem0: whether this write will actually be persisted to
+        Mem0.  Not defaulted anywhere up the call chain, deliberately: a
+        default would let a future write path skip the check silently,
+        which is the exact silence this rule removes.
+    """
+    # Read through is_canonical: the int form is `invalid_canonical_type`'s
+    # defect and is reported there; catching it here too would render one
+    # mistake as two.
+    if not is_canonical(meta) or reaches_mem0:
+        return []
+
+    return [_violation(
+        'canonical',
+        'canonical_on_non_mem0_write',
+        'canonical=True was asserted on a write that will not reach Mem0, '
+        'where the marker cannot be stored at all: the Graphiti write path '
+        'carries no metadata (the add_memory_graphiti payload omits it and '
+        'GraphitiBackend.add_episode has no metadata parameter), so canonical '
+        'and topic would be silently discarded — unreadable by pick_survivor '
+        'and uncountable by the <=1-per-(project, topic) uniqueness probe, '
+        'both of which read Mem0. Use a Mem0-primary category '
+        '(preferences_and_norms, procedural_knowledge, '
+        'observations_and_summaries), or pass dual_write=True to also land a '
+        'Mem0 twin, or drop the canonical marker',
+        fatal=True,
+    )]
+
+
+# ---------------------------------------------------------------------------
+# Writer guidance
+# ---------------------------------------------------------------------------
+
+def render_metadata_vocabulary_guidance() -> str:
+    """Teach a writing reconciliation stage this vocabulary, from the registry values.
+
+    Plain, brace-free text the stage prompts interpolate. Its hand-written
+    orchestrator twin is
+    ``orchestrator/src/orchestrator/agents/roles.py::METADATA_VOCABULARY_INSTRUCTIONS``;
+    ``fused-memory/tests/test_metadata_vocabulary_prompt_pinning.py`` holds both
+    to this registry.
+    """
+    child_kinds = ' or '.join(f'`{kind}`' for kind in sorted(CHILD_KINDS))
+    public_blessed_keys = ', '.join(
+        f'`{key}`' for key in sorted(BLESSED_METADATA_KEYS) if not key.startswith('_')
+    )
+    return (
+        '## Memory Metadata Vocabulary\n'
+        '`add_memory` and `update_memory` validate their `metadata` dict on write, '
+        "and `consolidate_memories`' `topic` argument is the same slug namespace. "
+        'Five keys are RESERVED:\n'
+        f'- `topic` — a kebab-case slug matching `{TOPIC_SLUG_RE.pattern}`, at most '
+        f'{TOPIC_SLUG_MAX_LEN} characters: `memory-write-path` is valid, '
+        '`memory_write_path` and `Memory Write Path` are not. A legacy snake_case '
+        'topic seen in the corpus is not a spelling to copy; `consolidate_memories` '
+        'refuses it.\n'
+        '- `canonical` — a bool marking the one authoritative entry for a topic; '
+        'requires `topic`, at most one entry per project and topic may claim it, and '
+        'it is only meaningful on a write that reaches Mem0.\n'
+        '- `kind` — the record type, drawn from a closed registry; distinct from '
+        '`source`, which records writer provenance rather than record type.\n'
+        '- `parent_id` — a full 36-character UUID of a live entry this one attaches '
+        f'to; triage attach outcomes only, with `kind` {child_kinds}.\n'
+        '- `supersedes` — a LIST of full 36-character UUIDs this entry replaces; '
+        'never a bare string, even for a single UUID.\n'
+        f'The blessed conventional keys {public_blessed_keys} do not warn; use those '
+        'exact spellings. Any other key still writes but warns to a census line; if such '
+        f'an annotation is deliberate, prefix it `{EXPERIMENTAL_KEY_PREFIX}` and it '
+        'passes silently.\n'
+        'A malformed reserved key is censused while `memory_metadata.enforce` is off '
+        'and rejected while it is on; the rejection names the violated rule and '
+        f'`{MemoryMetadataValidationError.REGISTRY_LOCATION}`. The registry module '
+        '`fused-memory/src/fused_memory/memory_metadata.py` is the single normative '
+        'source for all of this; consult it rather than guessing.'
+    )

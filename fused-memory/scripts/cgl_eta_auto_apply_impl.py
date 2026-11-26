@@ -96,12 +96,11 @@ def backup_falkordb() -> Path:
     return dest
 
 
-async def _compact_vec(backend, gkey, edge_uuid):
+async def _compact_vec(backend, gkey, edge_uuid, *, op: str):
     """Best-effort raw --compact fact_embedding read; None if null/absent."""
     q = f"MATCH ()-[e:RELATES_TO {{uuid: '{edge_uuid}'}}]-() RETURN e.fact_embedding"
     try:
-        client = backend._require_falkor_client()
-        reply = await client.execute_command('GRAPH.RO_QUERY', gkey, q, '--compact')
+        reply = await backend.graph_access.graph(gkey).ro_query_compact(q, op=op)
         rows = reply[1]
         if not rows:
             return None
@@ -125,7 +124,9 @@ async def dump_cross_target(backend, migrate, manifest) -> Path:
     async def present(g, u):
         k = (g, u)
         if k not in present_cache:
-            r = await backend._graph_for(g).ro_query('MATCH (n:Entity {uuid: $u}) RETURN n.uuid LIMIT 1', {'u': u})
+            r = await backend.graph_access.graph(g).ro_query(
+                'MATCH (n:Entity {uuid: $u}) RETURN n.uuid LIMIT 1', {'u': u}, op='dump_cross_target',
+            )
             present_cache[k] = bool(r.result_set)
         return present_cache[k]
 
@@ -136,12 +137,14 @@ async def dump_cross_target(backend, migrate, manifest) -> Path:
     seen: set = set()
     dropped = []
     for src_graph, uuids in by_src.items():
-        graph = backend._graph_for(src_graph)
+        graph = backend.graph_access.graph(src_graph)
         for uuid in uuids:
             res = await graph.ro_query(
                 'MATCH (n:Entity {uuid: $u})-[e:RELATES_TO]-(m:Entity) '
                 'WITH DISTINCT e, startNode(e) AS s, endNode(e) AS t '
-                'RETURN e.uuid, e.name, e.fact, s.uuid, s.name, t.uuid, t.name', {'u': uuid})
+                'RETURN e.uuid, e.name, e.fact, s.uuid, s.name, t.uuid, t.name', {'u': uuid},
+                op='dump_cross_target',
+            )
             for row in (res.result_set or []):
                 e_uuid, e_name, fact, s_uuid, s_name, t_uuid, t_name = row
                 if e_uuid in seen:
@@ -158,7 +161,9 @@ async def dump_cross_target(backend, migrate, manifest) -> Path:
                     'edge_uuid': e_uuid, 'edge_name': e_name, 'fact': fact,
                     'lives_in_graph': src_graph, 'src_uuid': s_uuid, 'src_name': s_name,
                     'dst_uuid': t_uuid, 'dst_name': t_name, 'src_target': s_tgt, 'dst_target': t_tgt,
-                    'fact_embedding_compact': await _compact_vec(backend, src_graph, e_uuid),
+                    'fact_embedding_compact': await _compact_vec(
+                        backend, src_graph, e_uuid, op='dump_cross_target',
+                    ),
                 })
     dest = OUTDIR / f'cross-target-edges-recovery-{STAMP}.json'
     dest.write_text(json.dumps({'count': len(dropped), 'edges': dropped}, indent=2, default=str))
@@ -212,6 +217,41 @@ async def main() -> int:
             return 3
 
         # 5. apply
+        #
+        # This call is this script's ENTIRE mutation surface, and it is
+        # deliberately NOT separately guarded by
+        # assert_store_mutation_allowed (task 4293). It inherits
+        # migrate_cross_graph_leak's fail-closed store preflight: _load_migrate
+        # above EXECUTES that file via importlib.spec_from_file_location, so
+        # the probe in its run() runs for this call exactly as it does for the
+        # CLI.
+        #
+        # The COST of siting the only probe here is real and is stated rather
+        # than waved away: in a write-denied environment steps 2-4 above (a
+        # fresh full-graph census, the cross-target recovery dump, and a
+        # FalkorDB BGSAVE plus a docker cp of the whole RDB with up to a 120s
+        # poll) are all performed and then thrown away when the refusal
+        # finally arrives here. An early probe at the top of main() would cost
+        # one file create+unlink and would buy that back. It is not added
+        # because a single probe site keeps this script's guard exactly
+        # co-extensive with migrate's -- there is no second message to keep in
+        # sync, and no way for the two to disagree about what is allowed. If
+        # that trade is ever revisited, the early probe is the change to make;
+        # migrate's run() probe must stay the authoritative one either way.
+        #
+        # That inheritance is load-bearing and fragile, so two things must stay
+        # true (both pinned by tests/test_cgl_eta_auto_apply_impl.py):
+        #   * the guard must live in migrate's run(). This script has no
+        #     argparse at all -- it builds SimpleNamespace(apply=True)
+        #     unconditionally, right here -- so a guard moved to migrate's
+        #     main()/build_arg_parser() would be bypassed entirely, leaving the
+        #     one bulk-apply in the tree that applies with no flag as the only
+        #     unguarded one;
+        #   * reaching migrate any other way does not inherit it:
+        #     _load_migrate never registers the module in sys.modules, so a
+        #     sys.modules-based lookup or interception finds nothing.
+        # The dry-run census at step 2 above is correctly NOT probed -- it
+        # mutates nothing and returns before migrate's guard site.
         apply_args = types.SimpleNamespace(apply=True, manifest=str(man_path), page_size=1000, config=None)
         report = await migrate.run(apply_args, shim)
         rep_path = OUTDIR / f'apply-report-{STAMP}.json'

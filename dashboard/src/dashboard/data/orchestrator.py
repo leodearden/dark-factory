@@ -1,10 +1,22 @@
-"""Functions for discovering orchestrator processes and task status.
+"""Discovering orchestrator PROCESSES: which ones run, and against what root.
 
-Scans running processes (via ``ps aux``) and fetches task trees from the
-fused-memory MCP server (which is the source of truth post-2026-05-02
-SQLite cutover). ``discover_orchestrators`` is async because the MCP call
-is async; the process-scanning helper remains sync and runs via
-``asyncio.to_thread`` from the async caller.
+Scans running processes (via ``ps aux``) and resolves each to the project root
+it targets. That is the whole job. ``discover_orchestrators`` is async only
+because the ``ps`` scan runs via ``asyncio.to_thread``; the scanning helper
+itself is sync.
+
+RETIRED, and deliberately: this module used to additionally fetch EVERY
+resolved root's whole task tree from fused-memory — under a two-layer budget,
+a per-root cache and an offline/degraded split of its own — to compute a
+five-key ``summary`` and a ``last_update`` for each entry. Those were the only
+consumers of the fetch, and both are gone from the wire. The task snapshot
+unit behind ``/api/v2/dashboard/tasks``
+(``dashboard/src/dashboard/data/task_snapshot.py``) is the SINGLE place the
+dashboard measures a task population now, so a second implementation here
+would be one more copy to keep in agreement by hand — and the one that fell
+behind, since nothing on this route ever validated its counts. A handler that
+reads no task tree needs no budget for one, which is why the budget constants
+went with it rather than being left inert.
 
 FORMAT COUPLING
 ================
@@ -20,6 +32,18 @@ the upstream format changes, this module must be updated by hand.
    ``orchestrator/src/orchestrator/cli.py`` (grep that file for ``def run``).
    Anyone renaming the ``run`` command or its ``--prd``/``--config`` flags
    must update ``find_running_orchestrators`` to match.
+
+2. Config DEFAULTS layering (:func:`read_run_slot_capacity`) — the
+   orchestrator's effective config is ``_deep_merge(_load_defaults(), project_config)``
+   (``orchestrator/src/orchestrator/config.py``), so a key a project's YAML
+   omits is still in force from ``orchestrator/src/orchestrator/defaults.yaml``.
+   Reading a project YAML alone therefore misreports the parity DENOMINATOR.
+   The two defaults this module needs are restated as
+   :data:`_ORCHESTRATOR_DEFAULT_MAX_CONCURRENT_TASKS` and
+   :data:`_ORCHESTRATOR_DEFAULT_MAIN_HEALTH_FIX_RESERVED_SLOTS`; anyone
+   changing ``max_concurrent_tasks`` or ``main_health_fix_reserved_slots`` in
+   ``defaults.yaml`` must update its constant (a test asserts each pair agrees
+   whenever the orchestrator source is present).
 
 RETIRED: this module used to re-derive a second format — the ``.task/``
 artifact layout (``metadata.json``, ``plan.json``, ``iterations.jsonl``,
@@ -38,12 +62,11 @@ import asyncio
 import logging
 import re
 import subprocess
+from collections.abc import Mapping
 from pathlib import Path
+from types import MappingProxyType
 
-import httpx
-
-from dashboard.config import DashboardConfig
-from dashboard.data.tasks import fetch_tasks
+from dashboard.config import _CANONICAL_CONFIG_NAME, DashboardConfig
 
 logger = logging.getLogger(__name__)
 
@@ -72,33 +95,212 @@ def _resolve_project_root(prd: str, default_root: Path) -> Path:
     return default_root.resolve()
 
 
+def _expand_env_placeholders(value: str) -> str:
+    """Expand ``${VAR}`` / ``${VAR:default}`` in an orchestrator-config scalar.
+
+    Matches orchestrator ``config.py`` behaviour: an unset ``VAR`` with no
+    default expands to the empty string, and callers decide what that means
+    (for both readers below: "unknown", never a usable value).
+    """
+    import os
+
+    return re.sub(
+        r'\$\{([^:}]+)(?::([^}]*))?\}',
+        lambda m: os.environ.get(m.group(1), m.group(2) or ''),
+        value,
+    )
+
+
 def _read_project_root_from_config(config_path: str) -> Path | None:
     """Extract ``project_root`` from an orchestrator config YAML file.
 
     Handles ``${VAR:default}`` env-var expansion for the project_root value.
     Returns ``None`` if the file can't be read or doesn't contain project_root.
     """
-    import os
-
-    import yaml
-
-    try:
-        raw = yaml.safe_load(Path(config_path).read_text())
-    except (FileNotFoundError, yaml.YAMLError, OSError):
-        return None
-    if not isinstance(raw, dict):
+    raw = _load_config_mapping(Path(config_path))
+    if raw is None:
         return None
     value = raw.get('project_root')
     if not isinstance(value, str):
         return None
-    # Expand ${VAR:default} patterns (matching orchestrator config.py behavior)
-    expanded = re.sub(
-        r'\$\{([^:}]+)(?::([^}]*))?\}',
-        lambda m: os.environ.get(m.group(1), m.group(2) or ''),
-        value,
-    )
-    p = Path(expanded)
+    p = Path(_expand_env_placeholders(value))
     return p.resolve() if p.is_absolute() else None
+
+
+_config_mapping_cache: dict[Path, tuple[tuple[int, int], Mapping[str, object] | None]] = {}
+"""Parsed config per path, valid while the file's ``(st_mtime_ns, st_size)`` holds.
+
+One entry per path (a changed file replaces its entry), so the cache is bounded
+by the number of distinct config paths ever seen. A parse failure is cached
+under the same key as a success: fixing the file changes the key.
+"""
+
+
+def _load_config_mapping(path: Path) -> Mapping[str, object] | None:
+    """Parse *path* as YAML and return it if it is a mapping, else ``None``.
+
+    The parse is cached on the file's ``(st_mtime_ns, st_size)``: this is
+    reached from every ``/orchestrators`` request (via
+    :func:`_read_project_root_from_config`) as well as the burndown collector,
+    and the pure-Python YAML parse is measurable on the event loop. An edited
+    file is re-parsed on the next call. A file that cannot be stat-ed is never
+    cached. Every caller shares the cached mapping, so it is returned as a
+    read-only view.
+
+    Never raises: this runs inside the burndown collector loop, where an
+    exception would take down a whole collection cycle — strictly worse than
+    an unknown value. ``ValueError`` covers ``UnicodeDecodeError`` for a
+    non-text file.
+    """
+    import yaml
+
+    try:
+        st = path.stat()
+    except OSError as exc:
+        logger.debug('Unreadable orchestrator config %s: %s', path, exc)
+        return None
+    key = (st.st_mtime_ns, st.st_size)
+    cached = _config_mapping_cache.get(path)
+    if cached is not None and cached[0] == key:
+        return cached[1]
+
+    try:
+        text = path.read_text()
+    except (OSError, ValueError) as exc:
+        logger.debug('Unreadable orchestrator config %s: %s', path, exc)
+        return None
+    try:
+        raw = yaml.safe_load(text)
+    except (ValueError, yaml.YAMLError) as exc:
+        logger.debug('Unparseable orchestrator config %s: %s', path, exc)
+        raw = None
+    mapping = MappingProxyType(raw) if isinstance(raw, dict) else None
+    _config_mapping_cache[path] = (key, mapping)
+    return mapping
+
+
+# FORMAT COUPLING item 2 (see the module docstring). Restate
+# ``orchestrator/src/orchestrator/defaults.yaml``'s ``max_concurrent_tasks``
+# and ``main_health_fix_reserved_slots``, which ``orchestrator.config``
+# deep-merges UNDER every project config. A project that omits either key
+# therefore runs with these values, not with none — so the reader must layer
+# them the same way or the parity alarm misjudges those projects (the exact
+# E12 miss it exists to catch). ``dashboard/tests/test_orchestrator.py``
+# asserts both constants against that file whenever the orchestrator source is
+# present, so drift fails a test rather than degrading an alarm.
+_ORCHESTRATOR_DEFAULT_MAX_CONCURRENT_TASKS = 24
+_ORCHESTRATOR_DEFAULT_MAIN_HEALTH_FIX_RESERVED_SLOTS = 1
+
+
+def _coerce_slot_count(
+    data: Mapping[str, object], key: str, default: int, path: Path
+) -> int | None:
+    """Read slot-count *key* from *data* (parsed from *path*) as a usable count, or ``None``.
+
+    ``None`` means UNKNOWN, which the parity alarm must never conflate with
+    "not breaching", and is reserved STRICTLY for "the value is malformed". A
+    malformed value logs a WARNING naming the key, the value and the file,
+    because that is a config defect an operator needs to see.
+
+    An ABSENT key is not unknown: the orchestrator deep-merges
+    ``defaults.yaml`` under the project config, so the project runs with
+    *default*. Returning ``None`` here would exclude the whole project from
+    the parity alarm — of the live configs under ``/home/leo/src``, two omit
+    ``max_concurrent_tasks``.
+
+    Boundaries:
+
+    * An explicit YAML null (``key:`` with no value) is MALFORMED, not absent:
+      ``OrchestratorConfig`` types both slot counts ``int``, so such a config
+      fails validation and no orchestrator runs from it at all.
+    * ``bool`` is rejected explicitly — it is an ``int`` subclass, so a bare
+      ``isinstance(value, int)`` would silently read ``true`` as 1.
+    * ``0`` is KEPT as a real count ("dispatch nothing" / "no reserve").
+      Tasks still in-progress against a 0 cap are a genuine breach; reporting
+      that as unknown would hide it.
+    * Negative counts are nonsense and rejected.
+    * A numeric *string* is accepted after ``${VAR:default}`` expansion —
+      that is how a config spells an env-driven int.
+    """
+    if key not in data:
+        logger.debug(
+            'No %s in %s — applying the orchestrator default of %d '
+            '(defaults.yaml is merged under every project config)',
+            key,
+            path,
+            default,
+        )
+        return default
+
+    value = data[key]
+    if isinstance(value, bool):
+        count = None
+    elif isinstance(value, int):
+        count = value
+    elif isinstance(value, str):
+        expanded = _expand_env_placeholders(value).strip()
+        try:
+            count = int(expanded)
+        except ValueError:
+            count = None
+    else:
+        count = None
+
+    if count is None or count < 0:
+        logger.warning(
+            'Ignoring unusable %s %r in %s — treating the run-slot capacity as unknown',
+            key,
+            value,
+            path,
+        )
+        return None
+    return count
+
+
+def read_run_slot_capacity(project_root: Path | str) -> int | None:
+    """Read *project_root*'s run-slot capacity, or ``None`` if unknown.
+
+    The capacity is ``max_concurrent_tasks + main_health_fix_reserved_slots``:
+    the orchestrator holds reserved slots beyond the general pool that only a
+    main-health fix may take, so a fix running on the reserve is legitimate
+    occupancy, not a breach (``docs/main-health-fix-run-slot-reserve.md``).
+
+    This is the burndown parity alarm's denominator. Both keys are
+    restart-only (red-tier: absent from ``config.py``'s hot-reload allowlist,
+    and the scheduler is sized once at startup), but a burndown window spans
+    restarts and the capacity varies between projects, so it is TIME-VARYING
+    across the window regardless. The collector therefore calls this once per
+    snapshot and stores the answer ON the snapshot row: comparing a historical
+    in-progress census against today's capacity would forgive a past breach
+    after a raise and invent one after a cut. Callers must treat ``None`` as
+    UNKNOWN, never as "not breaching".
+
+    Both keys come from *project_root*'s ``dark-factory-orchestrator.yaml``,
+    the only file read; an absent or non-mapping file makes the capacity
+    unknown. A key it OMITS gets the orchestrator's own default
+    (:data:`_ORCHESTRATOR_DEFAULT_MAX_CONCURRENT_TASKS`,
+    :data:`_ORCHESTRATOR_DEFAULT_MAIN_HEALTH_FIX_RESERVED_SLOTS`), because
+    ``orchestrator.config`` deep-merges ``defaults.yaml`` under every project
+    config. Either key being malformed makes the whole capacity unknown:
+    dropping only a bad reserve would understate capacity and false-alarm.
+    Never raises — see :func:`_load_config_mapping`.
+    """
+    path = Path(project_root) / _CANONICAL_CONFIG_NAME
+    data = _load_config_mapping(path)
+    if data is None:
+        return None
+    general = _coerce_slot_count(
+        data, 'max_concurrent_tasks', _ORCHESTRATOR_DEFAULT_MAX_CONCURRENT_TASKS, path
+    )
+    reserved = _coerce_slot_count(
+        data,
+        'main_health_fix_reserved_slots',
+        _ORCHESTRATOR_DEFAULT_MAIN_HEALTH_FIX_RESERVED_SLOTS,
+        path,
+    )
+    if general is None or reserved is None:
+        return None
+    return general + reserved
 
 
 def find_running_orchestrators() -> list[dict]:
@@ -162,18 +364,26 @@ def find_running_orchestrators() -> list[dict]:
     return orchestrators
 
 
-async def discover_orchestrators(
-    client: httpx.AsyncClient,
-    config: DashboardConfig,
-) -> list[dict]:
-    """Discover running orchestrators and enrich with task tree data.
+async def discover_orchestrators(config: DashboardConfig) -> list[dict]:
+    """Every running orchestrator process, grouped by the root it targets.
 
-    For each running orchestrator process, attaches:
-    - tasks: parsed task list fetched from fused-memory MCP
-    - summary: status counts {total, done, in_progress, blocked, pending}
+    Returns one entry per resolved project root — ``pids``, ``prd``, ``label``,
+    ``project_root``, ``running``, ``started`` — or ``[]`` when nothing is
+    running. Multiple PIDs that resolve to the same canonical root are ONE
+    entry with every pid in ``pids``, which is what makes the tab's row count
+    a count of projects rather than of processes.
 
-    Returns [] if no orchestrator processes are running.
-    Per-project task fetches that hit MCP errors degrade to an empty list.
+    NO TASK TREE IS READ, and *config* is the only argument because none is
+    needed for one: the MCP client this used to take is gone with the fetch.
+    Task counts live on ``/api/v2/dashboard/tasks``, inside a
+    ``Datum`` that says when they were measured — see
+    ``dashboard/src/dashboard/data/task_snapshot.py``. Two consequences worth
+    stating, since a reader may look for the old ones:
+
+    * there is no budget here to overrun, and no degraded/offline outcome to
+      report — nothing is attempted that could fail. ``ps`` is a local scan;
+    * ``last_update`` is no longer emitted. It was the max ``updated_at``
+      across a root's tasks, and nothing here reads a task any more.
     """
     processes = await asyncio.to_thread(find_running_orchestrators)
     if not processes:
@@ -198,66 +408,18 @@ async def discover_orchestrators(
     # same project are merged into a single entry with a 'pids' list.
     groups: dict[Path, list[dict]] = {}
     for proc in processes:
-        root = _resolve_root(proc)
-        groups.setdefault(root, []).append(proc)
-
-    # Cache per-project data so we don't re-fetch the same task list
-    # when multiple processes share a project root.
-    # Cache tuple: (tasks, offline, error)
-    project_cache: dict[Path, tuple[list[dict], bool, str | None]] = {}
+        groups.setdefault(_resolve_root(proc), []).append(proc)
 
     result: list[dict] = []
     for project_root, group in groups.items():
-        if project_root not in project_cache:
-            fetched = await fetch_tasks(client, config, project_root)
-            if isinstance(fetched, list):
-                tasks = fetched
-                offline = False
-                fetch_error: str | None = None
-            else:
-                # Offline marker: {'offline': True, 'error': ...}
-                tasks = []
-                offline = bool(fetched.get('offline')) if isinstance(fetched, dict) else False
-                fetch_error = str(fetched.get('error', '')) if isinstance(fetched, dict) else None
-            project_cache[project_root] = (tasks, offline, fetch_error)
-
-        tasks, offline, fetch_error = project_cache[project_root]
-        summary = {
-            'total': len(tasks),
-            'done': sum(1 for t in tasks if t.get('status') == 'done'),
-            'in_progress': sum(1 for t in tasks if t.get('status') == 'in-progress'),
-            'blocked': sum(1 for t in tasks if t.get('status') == 'blocked'),
-            'pending': sum(1 for t in tasks if t.get('status') == 'pending'),
-        }
-        # Lexicographic max over ISO-8601 strings is correct here because
-        # tasks.py copies updatedAt verbatim from a single upstream source, so
-        # all values share the same format and UTC offset.  If the source ever
-        # emits mixed offsets, switch to key=datetime.fromisoformat.
-        # Scope: top-level tasks only, matching the summary counts above.
-        # If subtask recency should count, flatten the task tree first.
-        last_update = max(
-            (t['updated_at'] for t in tasks if t.get('updated_at')),
-            default=None,
-        )
-
-        # Display label: prefer PRD path, fall back to project root path
+        # Display label: prefer PRD path, fall back to project root path.
         prd = next((p['prd'] for p in group if p.get('prd')), None)
-        label = prd if prd else str(project_root)
-
-        entry: dict = {
+        result.append({
             'pids': [p['pid'] for p in group],
             'prd': prd,
-            'label': label,
+            'label': prd if prd else str(project_root),
             'project_root': str(project_root),
             'running': any(p['running'] for p in group),
             'started': group[0]['started'],
-            'last_update': last_update,
-            'tasks': tasks,
-            'summary': summary,
-            'offline': offline,
-        }
-        if fetch_error:
-            entry['error'] = fetch_error
-        result.append(entry)
-
+        })
     return result

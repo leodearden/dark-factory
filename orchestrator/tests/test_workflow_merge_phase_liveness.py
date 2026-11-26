@@ -1,14 +1,8 @@
 """Durable merge-phase liveness stamp/clear + entry wiring (task 2991).
 
-Task 2991 (successor to task 2931): a legitimately-live task in the
-pre-enqueue MERGE phase runs a rebase/scoped-verify/queue-submit loop with NO
-LLM calls, so it never refreshes ``metadata.routing.latest`` — the orphan-L0
-divergence reaper's task-2931 ``_has_fresh_dispatch`` gate cannot see it and
-false-promotes its scope-invariant L0 to a human-facing L1 (cluster
-esc-2789-22). The fix is a DURABLE ``metadata.merge_phase_liveness =
-{'entered_at': <iso>}`` stamp — the restart-survivable analog of
-``routing.latest`` — written at merge entry and read by
-``_has_fresh_merge_phase`` (see test_orphan_l0_reaper.py).
+Task 2991 added a DURABLE ``metadata.merge_phase_liveness =
+{'entered_at': <iso>}`` stamp, written at merge entry. Who reads it is
+stated once, on ``TaskWorkflow._stamp_merge_phase_entered``.
 
 This module unit-tests the workflow producer side:
 
@@ -32,7 +26,8 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from _orch_helpers import pydantic_spec
+from _orch_helpers import MOCK_WORKFLOW_PROJECT_ROOT, pydantic_spec
+from shared.task_metadata import parse_metadata
 
 from orchestrator.config import OrchestratorConfig
 from orchestrator.verify import VerifyResult
@@ -73,7 +68,8 @@ def _make(
     config.fused_memory.url = 'http://localhost:8002'
     config.lock_depth = 2
     config.steward_completion_timeout = 300.0
-    config.project_root = Path('/tmp/non-existent-for-test')
+    config.project_root = MOCK_WORKFLOW_PROJECT_ROOT
+    config.git.branch_prefix = 'task/'  # a real str for QueuedBranch.parse
 
     if update_task_raises:
         update_task = AsyncMock(side_effect=RuntimeError('mcp down'))
@@ -93,6 +89,12 @@ def _make(
 
     git_ops = MagicMock()
     git_ops.get_main_sha = AsyncMock(return_value=main_sha)
+    # The merge phase's _settle_unmergeable_branch reads: no ref, a clean tree
+    # and a HEAD beyond main, so every merge-phase test here reads MERGEABLE.
+    git_ops.resolve_branch_sha = AsyncMock(return_value=None)
+    git_ops.has_uncommitted_work = AsyncMock(return_value=False)
+    git_ops.is_ancestor = AsyncMock(return_value=False)
+    git_ops.is_ancestor_checked = AsyncMock(return_value=False)
 
     queue = MagicMock()
     queue.get_by_task = MagicMock(return_value=[])
@@ -126,7 +128,7 @@ def _persisted_metadata(update_task: AsyncMock) -> dict:
 def _fake_run(*, head: str = 'HEAD-SHA', rc: int = 0):
     """Return an async stand-in for orchestrator.workflow._run (git rev-parse)."""
 
-    async def _run(cmd, cwd=None, **kwargs):  # noqa: ARG001
+    async def _run(cmd, cwd=None, **kwargs):
         if rc == 0:
             return (0, head + '\n', '')
         return (rc, '', 'fatal: bad revision')
@@ -143,6 +145,7 @@ class TestStampHelper:
     @pytest.mark.asyncio
     async def test_stamp_persists_entered_at_iso(self):
         f = _make(metadata={'retry_ledger': {'x': 1}})
+        pre_stamp_keys = set(f.wf.task['metadata'])
 
         await f.wf._stamp_merge_phase_entered()
 
@@ -151,7 +154,7 @@ class TestStampHelper:
         # (a) persisted stamp is exactly {'entered_at': <non-empty iso str>}.
         assert set(stamp) == {'entered_at'}
         assert isinstance(stamp['entered_at'], str) and stamp['entered_at']
-        # Parseable tz-aware ISO-8601 (what _has_fresh_merge_phase reads).
+        # Parseable tz-aware ISO-8601.
         parsed = datetime.fromisoformat(stamp['entered_at'])
         assert parsed.tzinfo is not None
         # (b) sibling metadata keys preserved (read-modify-write via
@@ -159,6 +162,14 @@ class TestStampHelper:
         assert meta['retry_ledger'] == {'x': 1}
         # (c) in-memory task metadata mirrors the persisted stamp.
         assert f.wf.task['metadata']['merge_phase_liveness'] == stamp
+        # (d) every key the stamp added is blessed, whatever the writer names
+        # it (task 5281).
+        added_keys = set(meta) - pre_stamp_keys
+        _, warnings = parse_metadata(meta, direction='read')
+        assert [
+            w.field for w in warnings
+            if w.code == 'unknown_key' and w.field in added_keys
+        ] == []
 
     @pytest.mark.asyncio
     async def test_stamp_overlays_backend_sibling_keys(self):
@@ -277,9 +288,7 @@ class TestClearHelper:
         # get_task raises. Under the old 'merge' mode that fallback was
         # harmless (omitted backend-only keys survived); under 'replace' it
         # would DELETE every backend-only key. So a failed read must SKIP the
-        # durable write entirely — bounded cost: the reaper may keep deferring
-        # for up to orphan_l0_merge_phase_freshness_secs until the stale stamp
-        # ages out (deferral, never suppression).
+        # durable write entirely, leaving a stale stamp.
         f = _make(
             metadata={
                 'merge_phase_liveness': dict(_STAMP),
@@ -324,8 +333,7 @@ class TestClearHelper:
         ``'merge'`` mode did not have: read-modify-write across an ``await``
         boundary, then a WHOLE-BLOB overwrite. Any key another process writes
         between the two round-trips is silently dropped — including
-        ``routing.latest``, the input to the reaper's sibling
-        ``_has_fresh_dispatch`` gate. Pinned here so the next reader finds it
+        ``routing.latest``. Pinned here so the next reader finds it
         as a known property rather than a surprise; it cannot be eliminated
         without a targeted key-delete mode (the backend accepts only
         {'merge', 'additive', 'replace'} — sqlite_task_backend._METADATA_MODES).
@@ -465,7 +473,7 @@ class TestEntryOrdering:
         wf.config.max_merge_retries = 1
         wf.config.max_pre_merge_retries = 1
 
-        async def fake_run(cmd, **kwargs):  # noqa: ARG001
+        async def fake_run(cmd, **kwargs):
             return 0, 'branch_head_sha\n', ''
 
         monkeypatch.setattr('orchestrator.workflow._run', fake_run)
@@ -538,7 +546,9 @@ class TestEntryReadCoalescing:
         f.scheduler.get_task.assert_not_awaited()
         # The prefetched blob really drove the comparison (divergent modules
         # at lock_depth=2 -> escalation filed with those metadata files).
-        spy.assert_called_once_with(['pkg/a.py'], ['other/b.py'])
+        # 'pkg/a.py' is not covered by metadata's 'other/b.py' (task 3429:
+        # third positional arg is the uncovered module list).
+        spy.assert_called_once_with(['pkg/a.py'], ['other/b.py'], ['pkg/a.py'])
 
     @pytest.mark.asyncio
     async def test_scope_check_falls_back_to_own_read_when_prefetch_unavailable(self):
@@ -556,7 +566,8 @@ class TestEntryReadCoalescing:
         await f.wf._check_scope_invariant(backend_metadata=None)
 
         f.scheduler.get_task.assert_awaited_once()
-        spy.assert_called_once_with(['pkg/a.py'], ['other/b.py'])
+        # task 3429: third positional arg is the uncovered module list.
+        spy.assert_called_once_with(['pkg/a.py'], ['other/b.py'], ['pkg/a.py'])
 
     @pytest.mark.asyncio
     async def test_scope_check_skips_when_own_read_returns_none(self):
@@ -589,7 +600,7 @@ class TestEntryReadCoalescing:
         wf.config.max_merge_retries = 1
         wf.config.max_pre_merge_retries = 1
 
-        async def fake_run(cmd, **kwargs):  # noqa: ARG001
+        async def fake_run(cmd, **kwargs):
             return 0, 'branch_head_sha\n', ''
 
         monkeypatch.setattr('orchestrator.workflow._run', fake_run)
@@ -626,7 +637,10 @@ class TestEntryReadCoalescing:
             f'{reads_at_scope_check}'
         )
         # The shared blob still drove a real comparison, not a skipped one.
-        escalate.assert_called_once_with(['pkg/a.py'], ['other/b.py'])
+        # task 3429: third positional arg is the uncovered module list.
+        escalate.assert_called_once_with(
+            ['pkg/a.py'], ['other/b.py'], ['pkg/a.py'],
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -664,7 +678,7 @@ class TestRetryLoopReStamp:
         wf.config.max_merge_retries = 2
         wf.config.max_pre_merge_retries = 1
 
-        async def fake_run(cmd, **kwargs):  # noqa: ARG001
+        async def fake_run(cmd, **kwargs):
             return 0, 'branch_head_sha\n', ''
 
         monkeypatch.setattr('orchestrator.workflow._run', fake_run)
@@ -681,9 +695,9 @@ class TestRetryLoopReStamp:
         wf._check_merge_outcome_thrash = AsyncMock(return_value=None)  # type: ignore[method-assign]
         wf.git_ops.get_main_sha = AsyncMock(return_value='main_sha')
         wf.git_ops.rebase_onto_main = AsyncMock(return_value=True)
-        # False → the "branch landed on main after steward resolution" break
-        # does not fire, so the loop actually reaches attempt 2.
-        wf.git_ops.is_ancestor = AsyncMock(return_value=False)
+        # False → the post-steward _settle_unmergeable_branch read finds the
+        # branch beyond main, so the loop actually reaches attempt 2.
+        wf.git_ops.is_ancestor_checked = AsyncMock(return_value=False)
 
         # The REAL stamp/clear helpers run; the stamp is only wrapped so calls
         # are counted. get_task mirrors the in-memory blob so the
@@ -701,7 +715,7 @@ class TestRetryLoopReStamp:
         outcomes = [WorkflowOutcome.REQUEUED, WorkflowOutcome.DONE]
 
         async def _submit(*_a, **_kw):
-            # Snapshot the metadata the reaper would see during this attempt's
+            # Snapshot the metadata a reader would see during this attempt's
             # pre-enqueue window, then faithfully model the production
             # enqueue-boundary clear (_submit_to_merge_queue).
             snapshots.append(copy.deepcopy(wf.task.get('metadata') or {}))
@@ -745,24 +759,40 @@ class TestEnqueueClearWiring:
     """The durable stamp is discharged at the enqueue boundary.
 
     Once the request is on the durable merge journal the pre-enqueue window is
-    over: the task is no longer "live in merge phase" in the sense the reaper
-    gate protects, so a lingering fresh stamp would briefly defer an unrelated
-    stranded divergence orphan. Mirrors the in-memory ``clear_merge_phase``
+    over. Mirrors the in-memory ``clear_merge_phase``
     call it is co-located with (test_workflow.py::
     test_submit_clears_merge_phase_after_enqueue).
     """
 
     @pytest.mark.asyncio
-    async def test_submit_clears_durable_stamp_after_enqueue(
-        self, tmp_path: Path, monkeypatch,
-    ):
+    async def test_submit_clears_durable_stamp_after_enqueue(self, tmp_path: Path):
         """RED on main: ``_submit_to_merge_queue`` never clears the durable stamp."""
         import asyncio
 
-        from orchestrator import merge_queue as merge_queue_mod
-        from orchestrator.merge_queue import InFlightMergeRegistry, MergeOutcome
+        from orchestrator.merge_lane.worker import InFlightMergeRegistry, MergeOutcome
 
-        real_queue: asyncio.Queue = asyncio.Queue()
+        class _RecordingQueue(asyncio.Queue):
+            """The real merge queue, keeping a cumulative record of every put.
+
+            Injected through the workflow's own ``merge_queue=`` constructor
+            keyword, so the production enqueue path runs unmodified and what
+            reached the durable journal is a public observation rather than a
+            call count on a substituted module attribute.  Cumulative, because
+            the worker below may already have consumed the item by the time
+            the clear runs — ``qsize()`` would be a race, ``enqueued`` is not.
+            """
+
+            def __init__(self) -> None:
+                super().__init__()
+                self.enqueued: list = []
+
+            def put_nowait(self, item) -> None:
+                # asyncio.Queue.put() delegates here, so this one override
+                # sees both spellings exactly once.
+                self.enqueued.append(item)
+                super().put_nowait(item)
+
+        real_queue = _RecordingQueue()
         registry = InFlightMergeRegistry()
         wt = tmp_path / 'wt'
         wt.mkdir(parents=True, exist_ok=True)
@@ -783,19 +813,13 @@ class TestEnqueueClearWiring:
         wf._module_configs = []
         wf.git_ops.rebind_branch_to_head = AsyncMock(return_value=True)
 
-        # Order the durable enqueue against the clear on one parent mock: the
-        # clear must fire AFTER the request is on the crash-safe journal, not
-        # before (a pre-enqueue clear would re-open the false-positive window
-        # the stamp exists to close).
-        parent = MagicMock()
-        enqueue = AsyncMock(
-            side_effect=merge_queue_mod.register_and_enqueue_merge_request,
-        )
-        clear = AsyncMock()
-        parent.attach_mock(enqueue, 'enqueue')
-        parent.attach_mock(clear, 'clear')
-        monkeypatch.setattr(
-            merge_queue_mod, 'register_and_enqueue_merge_request', enqueue,
+        # Order the durable enqueue against the clear by reading the QUEUE at
+        # the moment the clear runs: the clear must fire AFTER the request is
+        # on the crash-safe journal, not before (a pre-enqueue clear would
+        # re-open the false-positive window the stamp exists to close).
+        enqueued_at_clear: list[int] = []
+        clear = AsyncMock(
+            side_effect=lambda: enqueued_at_clear.append(len(real_queue.enqueued)),
         )
         wf._clear_merge_phase_entered = clear  # type: ignore[method-assign]
 
@@ -811,9 +835,12 @@ class TestEnqueueClearWiring:
         clear.assert_awaited_once()
         # Co-located with the in-memory grace clear (task 2753).
         f.scheduler.clear_merge_phase.assert_called_once_with('B')
-        names = [c[0] for c in parent.mock_calls]
-        assert names.index('enqueue') < names.index('clear'), (
-            f'expected enqueue < clear; got {names}'
+        # The REAL request the REAL enqueue path put on the queue.
+        assert [r.task_id for r in real_queue.enqueued] == ['B'], real_queue.enqueued
+        assert real_queue.enqueued[0].branch.full_name == 'task/B'
+        assert enqueued_at_clear == [1], (
+            f'the clear must fire after the request is on the durable queue; '
+            f'saw {enqueued_at_clear} request(s) enqueued at clear time'
         )
 
 
@@ -872,8 +899,7 @@ class TestMergeSuccessClearWiring:
 
     @pytest.mark.asyncio
     async def test_terminal_merge_outcome_leaves_stamp_intact(self):
-        # A merge that did NOT succeed returns early — the stamp must survive so
-        # the reaper keeps deferring while the task cycles through merge phase.
+        # A merge that did NOT succeed returns early, leaving the stamp in place.
         f = _make(metadata={'merge_phase_liveness': dict(_STAMP)})
         self._wire_finalise_spies(f, merge_result=WorkflowOutcome.BLOCKED)
 

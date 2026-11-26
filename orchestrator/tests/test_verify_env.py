@@ -4,17 +4,17 @@ Guards the 2026-05-29 ghost-venv fix: a target project's verify/build/test
 subprocess must NOT inherit the orchestrator's own venv/uv activation vars, or
 the target's ``uv`` resolves dark-factory/.venv and a target ``uv sync``
 corrupts the orchestrator runtime interpreter. See
-orchestrator/src/orchestrator/verify.py: ``_VENV_ISOLATION_KEYS`` /
-``_strip_venv_bin_from_path`` / ``_target_subprocess_env``.
+shared/src/shared/python_env.py::without_python_env_selection and
+orchestrator/src/orchestrator/verify.py::_target_subprocess_env.
 """
 
 import os
+from pathlib import Path
+
+import pytest
 
 from orchestrator import verify
-from orchestrator.verify import (
-    _strip_venv_bin_from_path,
-    _target_subprocess_env,
-)
+from orchestrator.verify import _target_subprocess_env
 
 ORCH_VENV = "/home/leo/src/dark-factory/.venv"
 
@@ -102,6 +102,70 @@ class TestTargetSubprocessEnvScrub:
         assert env["PATH"] == "/home/leo/.cargo/bin:/usr/bin"
         assert env["PYTHONUNBUFFERED"] == "1"
 
+
+
+class TestRuffCacheIsWorktreeLocal:
+    """The ruff cache dir must terminate at the worktree boundary (task 3922).
+
+    ruff resolves BOTH its config and its cache by walking parent dirs up from
+    each linted file.  A task worktree whose own root declares no
+    ``[tool.ruff]`` therefore escapes: the walk reaches the PARENT checkout's
+    pyproject.toml and, with it, the parent's ``.ruff_cache`` — so a merge gate
+    running inside ``.worktrees/<id>`` reads and writes cache state shared with
+    every concurrently-verifying sibling and with the parent's UNCOMMITTED
+    working tree.
+
+    Measured on ruff 0.15.9 in exactly that geometry: setting
+    ``RUFF_CACHE_DIR`` redirects the reported ``cache_dir`` while leaving the
+    resolved ``Settings path`` AND the emitted rule codes byte-identical
+    ({I001, F401} both ways).  That rule-neutrality is what licenses applying
+    the lever UNCONDITIONALLY — to every worktree at any base age — instead of
+    a ``--config`` pin, which was measured to silently fall back to ruff's
+    built-in defaults ({F401} only) when aimed at a rule-less pyproject.
+    """
+
+    def test_worktree_local_ruff_cache_dir_is_injected(self, monkeypatch):
+        fake_environ = {
+            "VIRTUAL_ENV": ORCH_VENV,
+            "PATH": f"{ORCH_VENV}/bin:/usr/bin",
+            "HOME": "/home/leo",
+        }
+        monkeypatch.setattr(verify.os, "environ", fake_environ)
+
+        env = _target_subprocess_env(None, worktree=Path("/w/.worktrees/77"))
+
+        assert env["RUFF_CACHE_DIR"] == "/w/.worktrees/77/.ruff_cache"
+        # the rest of the scrub is unchanged by the new parameter
+        assert env["PYTHONUNBUFFERED"] == "1"
+        assert "VIRTUAL_ENV" not in env
+
+    def test_caller_overlay_still_wins_over_injected_cache_dir(self, monkeypatch):
+        # An operator's `verify_env` (module or top-level, merged by
+        # _resolve_verify_env) must stay authoritative — same contract the
+        # CARGO_INCREMENTAL case above pins for os.environ.  This is what
+        # keeps the injection's POSITION (above `env.update(extra)`) load
+        # bearing: move it below and this assertion goes red.
+        fake_environ = {"PATH": "/usr/bin", "RUFF_CACHE_DIR": "/ambient/cache"}
+        monkeypatch.setattr(verify.os, "environ", fake_environ)
+
+        env = _target_subprocess_env(
+            {"RUFF_CACHE_DIR": "/operator/chosen"},
+            worktree=Path("/w/.worktrees/77"),
+        )
+
+        assert env["RUFF_CACHE_DIR"] == "/operator/chosen"
+
+    def test_no_worktree_leaves_ruff_cache_dir_untouched(self, monkeypatch):
+        # BACK-COMPAT: non-verify callers (and the project_root path) pass no
+        # worktree, so nothing is injected and any ambient value is preserved
+        # verbatim — the injection must never be synthesised from os.getcwd().
+        fake_environ = {"PATH": "/usr/bin", "RUFF_CACHE_DIR": "/ambient/cache"}
+        monkeypatch.setattr(verify.os, "environ", fake_environ)
+        assert _target_subprocess_env(None)["RUFF_CACHE_DIR"] == "/ambient/cache"
+
+        bare_environ = {"PATH": "/usr/bin"}
+        monkeypatch.setattr(verify.os, "environ", bare_environ)
+        assert "RUFF_CACHE_DIR" not in _target_subprocess_env(None)
 
 class TestOrchEnvScrub:
     """The orchestrator's ``ORCH_*`` control-plane namespace must not leak into
@@ -206,23 +270,40 @@ class TestOrchEnvScrub:
         assert env["FOO_ORCH"] == "1"
 
 
-class TestStripVenvBinFromPath:
-    def test_removes_leading_venv_bin(self):
-        path = f"{ORCH_VENV}/bin:/home/leo/.cargo/bin:/usr/bin"
-        assert _strip_venv_bin_from_path(path, ORCH_VENV) == (
-            "/home/leo/.cargo/bin:/usr/bin"
+class TestAccountPoolScrub:
+    """A target verify child inherits every credential except the Claude OAuth
+    account pool (``CLAUDE_OAUTH_TOKEN_*``), so a target test that prints its
+    environment cannot write the pool into a verify log (task 6828)."""
+
+    def test_pool_scrubbed_and_other_credentials_kept(self, monkeypatch):
+        fake_environ = {
+            "CLAUDE_OAUTH_TOKEN_A": "pool-a-probe",
+            "CLAUDE_OAUTH_TOKEN_H": "pool-h-probe",
+            "OPENAI_API_KEY": "openai-probe",
+            "CLAUDE_CODE_OAUTH_TOKEN": "session-probe",
+            "HOME": "/home/leo",
+            "PATH": "/usr/bin:/bin",
+        }
+        monkeypatch.setattr(verify.os, "environ", fake_environ)
+
+        env = _target_subprocess_env(None)
+
+        assert [k for k in env if k.startswith("CLAUDE_OAUTH_TOKEN_")] == []
+        assert env["OPENAI_API_KEY"] == "openai-probe"
+        assert env["CLAUDE_CODE_OAUTH_TOKEN"] == "session-probe"
+        assert env["HOME"] == "/home/leo"
+
+    @pytest.mark.asyncio
+    async def test_a_verify_leg_runs_without_the_pool(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("CLAUDE_OAUTH_TOKEN_B", "pool-b-probe")
+        monkeypatch.setenv("OPENAI_API_KEY", "openai-probe")
+
+        rc, out, timed_out = await verify._run_cmd(
+            'printf "%s|%s" "${CLAUDE_OAUTH_TOKEN_B-absent}" "${OPENAI_API_KEY-absent}"',
+            tmp_path,
+            timeout=5.0,
         )
 
-    def test_removes_venv_bin_even_when_not_leading(self):
-        path = f"/usr/bin:{ORCH_VENV}/bin:/bin"
-        assert _strip_venv_bin_from_path(path, ORCH_VENV) == "/usr/bin:/bin"
-
-    def test_noop_when_venv_is_none(self):
-        assert _strip_venv_bin_from_path("/a:/b", None) == "/a:/b"
-
-    def test_noop_when_path_is_none(self):
-        assert _strip_venv_bin_from_path(None, ORCH_VENV) is None
-
-    def test_trailing_slash_on_venv_is_normalized(self):
-        path = f"{ORCH_VENV}/bin:/usr/bin"
-        assert _strip_venv_bin_from_path(path, ORCH_VENV + "/") == "/usr/bin"
+        assert rc == 0, out
+        assert not timed_out
+        assert "absent|openai-probe" in out

@@ -51,6 +51,7 @@ import pytest
 from orchestrator.config import OrchestratorConfig
 from orchestrator.event_store import EventStore
 from orchestrator.harness import Harness, TaskReport
+from orchestrator.pause_policy import PauseClass
 from orchestrator.run_store import RunStore
 from orchestrator.workflow import WorkflowOutcome
 
@@ -168,6 +169,10 @@ class TestConstructedWithCallbacks:
         await asyncio.sleep(0)
 
         mock_run_store.save_scheduler_pause.assert_called_once()
+        assert (
+            mock_run_store.save_scheduler_pause.call_args.kwargs['pause_class']
+            is PauseClass.PARK_STOP
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -255,7 +260,11 @@ class TestMidRunSweepUsesIsActivelyHeld:
 
         processed: list[str] = []
 
-        async def _fake_reconcile_one(tid, status, *, mid_run):
+        # `tally` is the per-pass RecoverySweepTally accumulator (task 3535).
+        # Named explicitly rather than swallowed by **kwargs so this stand-in
+        # keeps mirroring the real signature it replaces; this test asserts the
+        # driver's DISPATCH behaviour, not what it accumulates.
+        async def _fake_reconcile_one(tid, status, *, mid_run, tally=None):
             processed.append(tid)
             return None
 

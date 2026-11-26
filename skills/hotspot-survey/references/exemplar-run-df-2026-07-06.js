@@ -1,3 +1,4 @@
+// PRE-CONTRACT: predates docs/quality-findings-contract.md (no keys, tags, severity or refresh mode) — adapt orchestration.md, not this.
 // EXEMPLAR — verbatim workflow script from the proven dark-factory run (2026-07-06,
 // session d1235f32-4830-4c28-8877-8ee89e87ae0e, run wf_195b1a6d-573: 28 agents,
 // 2.54M subagent tokens, 64 min, 75 findings -> plans/bug-hotspot-survey-2026-07-06.md).
@@ -5,6 +6,9 @@
 // DF-specific and pinned to that date. Adapt via references/orchestration.md, which
 // also folds in fixes for the failure modes this run exposed (degenerate miner
 // output, mining_summaries noise, verdict-count conflation).
+// STALE SOURCE: the tracker has since moved to `.taskmaster/tasks/tasks.db` (SQLite). The
+// tasks.json this script mines below was retired at the 2026-05-06 cutover and DELETED
+// 2026-08-25 — retarget it via references/orchestration.md rather than copying these lines.
 export const meta = {
   name: 'bug-hotspot-survey',
   description: 'Mine git/task history for bug hotspots, deep-review each, verify findings, synthesize cross-system improvements',

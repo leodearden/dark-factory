@@ -48,5 +48,43 @@
     "runs_db_path": "/home/leo/src/dark-factory/data/orchestrator/runs.db",
     "runs_db_query": "SELECT task_id, project_id, outcome, review_cycles, verify_attempts FROM task_results WHERE review_cycles >= 1, cross-referenced with events (escalation_created, merge_finalized) -- see mining.mine_fn_candidates.",
     "escalation_refs": []
+  },
+  "context": {
+    "task": {
+      "title": "Block new subtask creation: remove add_subtask from Stage 2 reconciliation tool surface",
+      "description": "Stage 2 reconciliation agent can still create new subtasks via mcp__fused-memory__add_subtask. The scheduler is top-level-only (orchestrator/scheduler.py:1051 \u2192 fetches tasks array, line 2266-2283 iterates without descending into t['subtasks']), so a new pending subtask is permanently invisible \u2014 a silent trap. Block creation at the Stage 2 tool surface and steer the agent to the documented planning_mode flatten recipe instead.",
+      "test_strategy": "",
+      "details": "## Context\n\nSubtasks were partially deprecated at the Taskmaster\u2192SQLite cutover (2026-05-01) via a one-time flatten procedure (procedural memory fca61c20). However the CREATION paths were never closed. Stage 2 reconciliation, when it sees a planning-budget-overflow escalation (e.g. esc-543-2 with $12.06 architect spend on splitting a too-large bundle), calls add_subtask instead of using submit_task(planning_mode=True). Result: know-live 543.1 (pending OTS/Rekor wiring, created 2026-05-27) is orphaned \u2014 the scheduler will never dispatch it.\n\nNB: df:1137 is \"Stage 2 reconciliation: enforce terminal-state pre-check, stall-guard freshness gate, post-action get_task verification, flag-counter completeness\" \u2014 NOT a subtask-serialization fix despite being miscited in escalation summaries. No prior task addressed the subtask-creation trap.\n\n## Changes\n\n1. `fused-memory/src/fused_memory/reconciliation/cli_stage_runner.py:34` \u2014 remove `'mcp__fused-memory__add_subtask'` from the Stage 2 agent tool list.\n2. `fused-memory/src/fused_memory/reconciliation/prompts/stage2.py:26` \u2014 remove the `add_subtask` mention from the tool documentation block.\n3. `fused-memory/src/fused_memory/reconciliation/prompts/__init__.py:25` \u2014 same.\n4. Add to the Stage 2 prompt a short paragraph describing the flatten recipe: when a task needs to be split, call `submit_task(planning_mode=True, \u2026, metadata={'decomposed_from': {...}, 'human_decomposed': true})` for each child, optionally `add_dependency(child_id \u2192 parent_id)`, then `commit_planning(task_ids='id1,id2,...', target_status='pending')`. Reference procedural memory ID fca61c20.\n\n## Scope guard \u2014 what this task does NOT do\n\n- Does NOT remove the `mcp__fused-memory__add_subtask` MCP tool registration (server/tools.py) \u2014 that is DF-D scope, deferred until soak.\n- Does NOT remove TaskInterceptor.add_subtask or backend code \u2014 also DF-D.\n- Does NOT touch the scheduler \u2014 scheduler being top-level-only is correct by design.\n- Does NOT sweep the surviving subtask (know-live 543.1) \u2014 that is DF-B scope.\n\n## Test Strategy\n\n- Regression test: assert the Stage 2 agent tool list does NOT contain `'mcp__fused-memory__add_subtask'`.\n- Prompt-content test: assert the Stage 2 prompt mentions `commit_planning` and `planning_mode=True`.\n- Smoke (manual): trigger a planning-budget-overflow scenario in a recon test fixture; assert no row with `parent_id != 0` appears in the test DB afterward.\n\n## Done criterion\n\nA Stage 2 run that previously would have created a subtask via add_subtask now produces a top-level task via submit_task(planning_mode=True) + commit_planning instead.",
+      "authored": false,
+      "id": "1541",
+      "record_source": {
+        "path": ".taskmaster/tasks/tasks.db",
+        "tag": "master",
+        "read_at": "2026-09-11",
+        "updated_at": "2026-05-28T13:07:01.665Z",
+        "updated_after_merge": false,
+        "run_time_title_matches": true
+      }
+    },
+    "changed_files": [
+      "fused-memory/src/fused_memory/reconciliation/cli_stage_runner.py",
+      "fused-memory/src/fused_memory/reconciliation/prompts/__init__.py",
+      "fused-memory/src/fused_memory/reconciliation/prompts/stage2.py",
+      "fused-memory/tests/test_stages.py"
+    ],
+    "base_sha": "c882892b313e7cc2d92577f8436ced46a075f387",
+    "branch_sha": "ac8c8b9614495df754717675650a21285dc16a38",
+    "base_sha_reason": null,
+    "plan": null,
+    "plan_reason": "no plan.json survives for this task. Absent: .worktrees/.task-meta/<id>/plan.json; data/orchestrator/agent-transcripts/<id>/; ~/.claude/projects/-home-leo-src-dark-factory--worktrees-<id>/; runs.db events with a plan payload (design_decisions/steps); runs.db plan-phase events (other than invocation/routing/phase bookkeeping) with a payload; data/orchestrator/landed_outbox.json entry. Wider hunt (escalations archive, fleet sessions, branch commit messages, branch tree, fused-memory) found nothing for this task",
+    "verification": {
+      "merge_sha": "5ec4bb48042e27116d7d32c06f1f780d3df7a467",
+      "merge_base_sha": "c882892b313e7cc2d92577f8436ced46a075f387",
+      "diff_reproduces_from": "git diff c882892b31 5ec4bb4804",
+      "diff_reproduces": true,
+      "merge_tree_equals_merge_commit_tree": true,
+      "changed_files_match_diff_headers": true,
+      "verified_at": "2026-09-11"
+    }
   }
 }

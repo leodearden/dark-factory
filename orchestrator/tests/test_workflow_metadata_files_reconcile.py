@@ -24,13 +24,48 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from _orch_helpers import pydantic_spec
-from _workflow_helpers import FakeScheduler
+from _workflow_helpers import FakeScheduler, same_module_siblings
 from shared.locking import directory_locks
 
 from orchestrator.artifacts import ReviewAggregation, TaskArtifacts
 from orchestrator.config import OrchestratorConfig
-from orchestrator.scheduler import files_to_modules
+from orchestrator.event_store import EventStore, EventType
+from orchestrator.scheduler import BlastRadiusResult, files_to_modules
 from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
+
+# The depth these tests pin on their MagicMock config, in ONE place.
+#
+# The constant alone only deduplicates a literal — it CANNOT by itself stop
+# the premise and the code under test from drifting apart, because it is
+# itself the re-typed value: swap a `config.lock_depth` pin for a real config
+# (which resolves the LIVE operational depth via the autouse
+# `_isolate_orch_config` fixture) and `_LOCK_DEPTH` still reads 2, so every
+# `files_to_modules(..., _LOCK_DEPTH)` precondition below would keep asserting
+# 2 and keep PASSING against a workflow running at 12.  That silently-wrong
+# outcome — rather than a loud precondition failure — is the failure mode task
+# 3866 exists to document, so it is `_assert_depth_pin_holds` below, not the
+# constant, that actually forecloses it.
+_LOCK_DEPTH = 2
+
+
+def _assert_depth_pin_holds(wf: TaskWorkflow) -> None:
+    """Fail LOUDLY if the workflow's real depth diverges from `_LOCK_DEPTH`.
+
+    Read through `wf.config` — the object the code under test actually
+    consults — not through the local pin, so this compares the premise the
+    preconditions were computed at against the depth the workflow will really
+    run at.  Both factories call it at construction time, which is what makes
+    the two impossible to diverge silently.
+    """
+    actual = wf.config.lock_depth
+    assert actual == _LOCK_DEPTH, (
+        f'this module computes its same-module/cross-module preconditions at '
+        f'lock_depth={_LOCK_DEPTH}, but the workflow under test resolves '
+        f'{actual}. Those preconditions are now false (or vacuous) for the code '
+        'being exercised. Re-point _LOCK_DEPTH at the depth the workflow really '
+        'uses — do NOT silence this by editing the preconditions alone (task '
+        '3866).'
+    )
 
 
 def _make_workflow(
@@ -38,6 +73,7 @@ def _make_workflow(
     project_root: Path,
     task_id: str = '101',
     backend_metadata: dict | None = None,
+    event_store: EventStore | None = None,
 ) -> tuple[TaskWorkflow, AsyncMock, AsyncMock, AsyncMock]:
     assignment = MagicMock()
     assignment.task_id = task_id
@@ -48,7 +84,7 @@ def _make_workflow(
     config = MagicMock(spec_set=_spec)
     config.fused_memory.project_id = 'dark_factory'
     config.fused_memory.url = 'http://localhost:8002'
-    config.lock_depth = 2
+    config.lock_depth = _LOCK_DEPTH
     config.project_root = project_root
 
     update_task = AsyncMock(return_value=True)
@@ -71,7 +107,9 @@ def _make_workflow(
         scheduler=scheduler,
         briefing=MagicMock(),
         mcp=MagicMock(),
+        event_store=event_store,
     )
+    _assert_depth_pin_holds(wf)
     return wf, update_task, get_merge_diff_files, get_merge_commit_diff_files
 
 
@@ -155,11 +193,15 @@ async def test_reconcile_ignores_stale_base_commit_uses_merge_first_parent(
 
 
 @pytest.mark.asyncio
-async def test_clears_when_merge_sha_missing(tmp_path: Path):
-    """No merge_sha (already-on-main shortcuts) → write empty list.
+async def test_writes_empty_when_merge_sha_missing_and_nothing_to_preserve(
+    tmp_path: Path,
+):
+    """No merge_sha and no recorded scope → ``[]`` is written.
 
-    The gate-skip-when-verified-provenance branch in fused-memory's
-    task_interceptor.py handles the missing-files case.
+    ``[]`` is persisted here only because nothing exists to preserve: a
+    missing merge diff means "cannot compute", so the reconcile keeps
+    whatever the backend already holds, and for a file-less task that is
+    already empty.
     """
     wf, update_task, get_merge_diff_files, get_merge_commit_diff_files = (
         _make_workflow(project_root=tmp_path)
@@ -173,6 +215,60 @@ async def test_clears_when_merge_sha_missing(tmp_path: Path):
     get_merge_commit_diff_files.assert_not_awaited()
     get_merge_diff_files.assert_not_awaited()
     update_task.assert_awaited_once_with('101', {'files': []})
+
+
+_PRIOR_SCOPE = ['src/prior_a.py', 'src/prior_b.py', 'pkg/mod/prior_c.py']
+_HINTS = {'entities': ['E3'], 'queries': ['q3']}
+
+
+@pytest.mark.asyncio
+async def test_preserves_existing_files_when_merge_sha_missing(tmp_path: Path):
+    """No merge_sha → the declared scope survives instead of being blanked.
+
+    Task 3113 (reify 5367/5602): a sha-less finalize used to persist
+    ``files=[]``, wiping the task's lock scope so the MERGE-entry tripwire
+    fired on the next dispatch.  An uncomputable merge diff is not evidence
+    that the task touched nothing.
+    """
+    wf, update_task, get_merge_diff_files, get_merge_commit_diff_files = (
+        _make_workflow(
+            project_root=tmp_path,
+            backend_metadata={'files': list(_PRIOR_SCOPE), 'memory_hints': _HINTS},
+        )
+    )
+    wf._merge_sha = None
+    wf.plan = {'files': ['anything.py']}
+
+    await wf._reconcile_metadata_files_for_done()
+
+    payload = _persisted_payload(update_task)
+    assert payload.get('files') == _PRIOR_SCOPE
+    assert payload.get('memory_hints') == _HINTS
+    assert wf.task['metadata']['files'] == _PRIOR_SCOPE
+    get_merge_commit_diff_files.assert_not_awaited()
+    get_merge_diff_files.assert_not_awaited()
+    get_task = wf.scheduler.get_task
+    assert isinstance(get_task, AsyncMock)
+    assert get_task.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_explicit_empty_override_still_blanks_when_merge_sha_missing(
+    tmp_path: Path,
+):
+    """An explicit ``override_files=[]`` is authoritative and wins over the preserve."""
+    wf, update_task, _, _ = _make_workflow(
+        project_root=tmp_path,
+        backend_metadata={'files': list(_PRIOR_SCOPE), 'memory_hints': _HINTS},
+    )
+    wf._merge_sha = None
+    wf.plan = {'files': ['anything.py']}
+
+    await wf._reconcile_metadata_files_for_done(override_files=[])
+
+    payload = _persisted_payload(update_task)
+    assert payload.get('files') == []
+    assert payload.get('memory_hints') == _HINTS
 
 
 @pytest.mark.asyncio
@@ -280,16 +376,18 @@ async def test_reconcile_explicit_files_override_backend_files(tmp_path: Path):
 
 
 @pytest.mark.asyncio
-async def test_reconcile_writes_empty_files_on_git_error_fail_open(tmp_path: Path):
-    """When get_merge_commit_diff_files returns ([], error), files=[] is written (fail-open).
+async def test_reconcile_preserves_existing_files_on_git_error(tmp_path: Path):
+    """When get_merge_commit_diff_files errors, the prior files persist.
 
-    Sibling keys from the backend are still preserved — the read-modify-write
-    structure is unchanged even on the error path.
+    Fail-open still never blocks the DONE, but a failed diff means "cannot
+    compute", not "touched nothing" (task 3113).  Sibling keys from the
+    backend are still preserved by the read-modify-write.
     """
     wf, update_task, get_merge_diff_files, get_merge_commit_diff_files = (
         _make_workflow(
             project_root=tmp_path,
             backend_metadata={
+                'files': ['src/prior_a.py', 'src/prior_b.py'],
                 'memory_hints': {'entities': ['E2'], 'queries': ['q2']},
             },
         )
@@ -301,8 +399,8 @@ async def test_reconcile_writes_empty_files_on_git_error_fail_open(tmp_path: Pat
     await wf._reconcile_metadata_files_for_done()
 
     payload = _persisted_payload(update_task)
-    assert payload.get('files') == [], (
-        f'files must be [] (fail-open) on git error; got {payload.get("files")!r}'
+    assert payload.get('files') == ['src/prior_a.py', 'src/prior_b.py'], (
+        f'prior files must survive a git error; got {payload.get("files")!r}'
     )
     assert payload.get('memory_hints') == {'entities': ['E2'], 'queries': ['q2']}, (
         f'memory_hints must survive even on git error path; got {payload!r}'
@@ -310,48 +408,73 @@ async def test_reconcile_writes_empty_files_on_git_error_fail_open(tmp_path: Pat
 
 
 @pytest.mark.asyncio
+async def test_reconcile_writes_empty_on_git_error_when_nothing_to_preserve(
+    tmp_path: Path,
+):
+    """A git error with no recorded scope writes ``[]``: the error path must not fabricate scope."""
+    wf, update_task, _, get_merge_commit_diff_files = _make_workflow(
+        project_root=tmp_path,
+        backend_metadata={'memory_hints': {'entities': ['E2'], 'queries': ['q2']}},
+    )
+    wf._merge_sha = 'b' * 40
+    get_merge_commit_diff_files.return_value = ([], OSError('diff failed'))
+
+    await wf._reconcile_metadata_files_for_done()
+
+    payload = _persisted_payload(update_task)
+    assert payload.get('files') == []
+    assert payload.get('memory_hints') == {'entities': ['E2'], 'queries': ['q2']}
+
+
+@pytest.mark.asyncio
 async def test_reconcile_strips_directory_shaped_merge_diff_files(tmp_path: Path):
     """Directory-shaped entries from git diff are stripped before persisting.
 
-    After the 2026-07-28 allowlist widening (reify #5726 / dark_factory #3117)
-    the ONLY directory-shaped output ``git diff --name-only`` can realistically
-    produce is an **extension-less tracked file** — measured: of 2124 tracked
-    paths in this repo, zero have a non-allowlisted extension, and 7 are
-    extension-less (``LICENSE``, ``hooks/pre-commit``,
-    ``fused-memory/docker/Dockerfile``, ...).  Both fixture entries below are
-    therefore real ``git ls-files`` paths that git genuinely emits in a diff,
-    not synthetic directory names: ``git diff --name-only`` lists *files*, never
-    bare directories.
+    The strip itself (``strip_directory_locks`` applied to diff output before
+    writing, mirroring the change-#1 ``scheduler._persist_files_metadata`` fix)
+    is unchanged and still pinned below.  What changed is WHICH entries are
+    directory-shaped.
 
-    Note the classification rule is per-segment-extension, NOT "dotfiles as a
-    class" — ``.gitignore`` IS file-shaped now (``gitignore`` is allowlisted).
-    The converse case (a leading-dot segment that stays directory-shaped, e.g.
-    ``.worktrees``) is pinned in the predicate suites themselves
-    (``test_leading_dot_directories_stay_directories`` in both
-    ``shared/tests/test_locking.py`` and
+    AMENDED by dark_factory #3248 — this test previously encoded the bug.  Its
+    fixture used ``fused-memory/docker/Dockerfile`` and ``hooks/pre-commit`` as
+    the entries that "must be stripped", and its own docstring explained why
+    that was wrong without drawing the conclusion: it argued that the only
+    directory-shaped output ``git diff --name-only`` can realistically produce
+    is an **extension-less tracked FILE**, because "git diff --name-only lists
+    *files*, never bare directories".  Both fixture entries were, by that same
+    reasoning, real ``git ls-files`` paths.  Asserting they be stripped was
+    therefore asserting that real tracked files be silently erased from
+    ``metadata.files`` on every reconcile — the exact data-loss defect #3248
+    fixes, not a property worth pinning.
+
+    Since #3248 those names are in ``EXTENSIONLESS_FILENAMES`` and classify as
+    files, so they now SURVIVE, and this test pins that.  A genuinely
+    directory-shaped entry is kept in the fixture so the strip is still proven
+    to function — it cannot arise from ``--name-only`` output, but the strip is
+    defensive and the coverage is worth keeping.
+
+    Note the classification rule is per-segment-extension (plus the enumerated
+    extension-less name list), NOT "dotfiles as a class" — ``.gitignore`` IS
+    file-shaped (``gitignore`` is allowlisted).  The converse case (a leading-dot
+    segment that stays directory-shaped, e.g. ``.worktrees``) is pinned in the
+    predicate suites themselves (``test_leading_dot_directories_stay_directories``
+    in both ``shared/tests/test_locking.py`` and
     ``fused-memory/tests/test_lock_charter_guard.py``) and deliberately is NOT
     re-asserted here, because such a path cannot appear in a merge diff.
-
-    ``is_file_path`` classifies extension-less entries as directory-shaped, so
-    they would cause the update_task lock-charter guard (changes #2/#3) to return
-    a LockCharterViolation — silently rejected (return value ignored at line
-    1343) — leaving stale plan.files and potentially tripping the phantom-done
-    gate.
-
-    The fix applies ``strip_directory_locks`` to the diff output before writing,
-    mirroring the change-#1 scheduler._persist_files_metadata fix.
     """
     wf, update_task, get_merge_diff_files, get_merge_commit_diff_files = (
         _make_workflow(project_root=tmp_path)
     )
     wf._base_commit = 'a' * 40
     wf._merge_sha = 'b' * 40
-    # Mixed: both extension-less tracked files (Dockerfile, hooks/pre-commit) are
-    # directory-shaped to is_file_path; the .py files are file-level.
+    # Mixed: the two extension-less entries are real tracked FILES and must
+    # SURVIVE (#3248); 'crates/reify-eval/src' is a real directory and must be
+    # stripped; the .py files are ordinary file-level entries.
     get_merge_commit_diff_files.return_value = (
         [
             'fused-memory/docker/Dockerfile',
             'hooks/pre-commit',
+            'crates/reify-eval/src',
             'src/landed.py',
             'orchestrator/src/orchestrator/workflow.py',
         ],
@@ -363,10 +486,13 @@ async def test_reconcile_strips_directory_shaped_merge_diff_files(tmp_path: Path
     persisted = _persisted_payload(update_task)['files']
     # Only file-level entries must survive (order preserved).
     assert persisted == [
+        'fused-memory/docker/Dockerfile',
+        'hooks/pre-commit',
         'src/landed.py',
         'orchestrator/src/orchestrator/workflow.py',
     ], (
-        f'directory-shaped entries must be stripped; got {persisted!r}'
+        f'directory-shaped entries must be stripped and real tracked files '
+        f'must survive; got {persisted!r}'
     )
     # The persisted set passes the update_task lock-charter guard.
     assert directory_locks(persisted) == [], (
@@ -376,6 +502,237 @@ async def test_reconcile_strips_directory_shaped_merge_diff_files(tmp_path: Path
     assert wf.task['metadata']['files'] == persisted, (
         f'in-memory task metadata.files must equal persisted files; got {wf.task["metadata"]["files"]!r}'
     )
+
+
+# ---------------------------------------------------------------------------
+# TestLandedScopeStamp — declared-vs-landed stamped before the overwrite (5731)
+# ---------------------------------------------------------------------------
+
+_MERGE_SHA = 'b' * 40
+
+
+def _event_store(tmp_path: Path) -> EventStore:
+    return EventStore(tmp_path / 'runs.db', 'run-test')
+
+
+def _stamps(store: EventStore) -> list[dict]:
+    return store.fetch_events_by_type(EventType.landed_scope_diff)
+
+
+def _only_stamp(store: EventStore) -> dict:
+    rows = _stamps(store)
+    assert len(rows) == 1, f'expected exactly one landed_scope_diff row; got {rows!r}'
+    assert rows[0]['task_id'] == '101'
+    return rows[0]['data']
+
+
+@pytest.mark.asyncio
+class TestLandedScopeStamp:
+    """The done reconcile differences the landed merge diff against the
+    plan.json declaration and the last-persisted metadata.files BEFORE the
+    overwrite destroys the latter, and emits one ``landed_scope_diff`` row.
+    """
+
+    async def test_merged_done_stamps_both_bases(self, tmp_path: Path):
+        store = _event_store(tmp_path)
+        diff = ['tests/test_x.py', 'src/a.py', 'src/pkg/m.py', 'src/widened.py']
+        wf, update_task, _, get_merge_commit_diff_files = _make_workflow(
+            project_root=tmp_path,
+            backend_metadata={'files': ['src/a.py', 'src/widened.py'], 'memory_hints': _HINTS},
+            event_store=store,
+        )
+        wf.plan = {'files': ['src/a.py', 'src/pkg/'], 'steps': []}
+        wf._merge_sha = _MERGE_SHA
+        get_merge_commit_diff_files.return_value = (list(diff), None)
+
+        await wf._reconcile_metadata_files_for_done()
+
+        assert _only_stamp(store) == {
+            'merge_sha': _MERGE_SHA,
+            'landed': sorted(diff),
+            'plan_files': {
+                'declared': ['src/a.py', 'src/pkg/'],
+                'undeclared': ['src/widened.py', 'tests/test_x.py'],
+                'undelivered': [],
+            },
+            'metadata_files': {
+                'declared': ['src/a.py', 'src/widened.py'],
+                'undeclared': ['src/pkg/m.py', 'tests/test_x.py'],
+                'undelivered': [],
+            },
+        }
+        payload = _persisted_payload(update_task)
+        assert payload['files'] == diff
+        assert payload['memory_hints'] == _HINTS
+
+    async def test_difference_is_taken_on_the_raw_declaration(self, tmp_path: Path):
+        store = _event_store(tmp_path)
+        wf, _, _, get_merge_commit_diff_files = _make_workflow(
+            project_root=tmp_path, event_store=store,
+        )
+        wf.plan = {'files': ['src/pkg'], 'steps': []}
+        wf._merge_sha = _MERGE_SHA
+        get_merge_commit_diff_files.return_value = (['src/pkg/m.py'], None)
+
+        await wf._reconcile_metadata_files_for_done()
+
+        assert _only_stamp(store)['plan_files'] == {
+            'declared': ['src/pkg'], 'undeclared': [], 'undelivered': [],
+        }
+
+    async def test_metadata_basis_is_the_backend_value_the_overwrite_replaces(
+        self, tmp_path: Path,
+    ):
+        store = _event_store(tmp_path)
+        wf, _, _, get_merge_commit_diff_files = _make_workflow(
+            project_root=tmp_path,
+            backend_metadata={'files': ['src/a.py']},
+            event_store=store,
+        )
+        wf.task['metadata'] = {'files': ['stale/in_memory.py']}
+        wf.plan = {'files': ['src/a.py'], 'steps': []}
+        wf._merge_sha = _MERGE_SHA
+        get_merge_commit_diff_files.return_value = (['src/a.py'], None)
+
+        await wf._reconcile_metadata_files_for_done()
+
+        assert _only_stamp(store)['metadata_files']['declared'] == ['src/a.py']
+        get_task = wf.scheduler.get_task
+        assert isinstance(get_task, AsyncMock)
+        assert get_task.await_count == 1
+
+    @pytest.mark.parametrize(
+        'failed_read',
+        [
+            pytest.param({'return_value': None}, id='vanished-task'),
+            pytest.param({'side_effect': RuntimeError('backend down')}, id='read-raised'),
+            pytest.param(
+                {'return_value': {'id': '101', 'metadata': 'corrupt'}}, id='corrupt-blob',
+            ),
+        ],
+    )
+    async def test_unreadable_backend_stamps_metadata_basis_as_none(
+        self, tmp_path: Path, failed_read: dict,
+    ):
+        store = _event_store(tmp_path)
+        diff = ['src/a.py', 'src/b.py']
+        wf, update_task, _, get_merge_commit_diff_files = _make_workflow(
+            project_root=tmp_path, event_store=store,
+        )
+        wf.scheduler.get_task = AsyncMock(**failed_read)
+        wf.task['metadata'] = {'files': ['stale/in_memory.py'], 'memory_hints': _HINTS}
+        wf.plan = {'files': ['src/a.py'], 'steps': []}
+        wf._merge_sha = _MERGE_SHA
+        get_merge_commit_diff_files.return_value = (list(diff), None)
+
+        await wf._reconcile_metadata_files_for_done()
+
+        stamp = _only_stamp(store)
+        assert stamp['metadata_files'] is None
+        assert stamp['plan_files'] == {
+            'declared': ['src/a.py'], 'undeclared': ['src/b.py'], 'undelivered': [],
+        }
+        update_task.assert_awaited_once_with(
+            '101', {'files': diff, 'memory_hints': _HINTS},
+        )
+
+    @pytest.mark.parametrize(
+        ('merge_sha', 'diff_result', 'override_files', 'expected_files'),
+        [
+            pytest.param(None, ([], None), None, _PRIOR_SCOPE, id='no-merge-sha'),
+            pytest.param(
+                _MERGE_SHA, ([], OSError('x')), None, _PRIOR_SCOPE, id='diff-error',
+            ),
+            pytest.param(None, ([], None), ['src/a.py'], ['src/a.py'], id='override-sha-less'),
+            pytest.param(
+                _MERGE_SHA, (['src/z.py'], None), ['src/a.py'], ['src/a.py'],
+                id='override-with-merge-sha',
+            ),
+        ],
+    )
+    async def test_no_stamp_without_a_measured_merge_diff(
+        self,
+        tmp_path: Path,
+        merge_sha: str | None,
+        diff_result: tuple[list[str], Exception | None],
+        override_files: list[str] | None,
+        expected_files: list[str],
+    ):
+        store = _event_store(tmp_path)
+        wf, update_task, _, get_merge_commit_diff_files = _make_workflow(
+            project_root=tmp_path,
+            backend_metadata={'files': list(_PRIOR_SCOPE)},
+            event_store=store,
+        )
+        wf.plan = {'files': ['src/a.py'], 'steps': []}
+        wf._merge_sha = merge_sha
+        get_merge_commit_diff_files.return_value = diff_result
+
+        await wf._reconcile_metadata_files_for_done(override_files=override_files)
+
+        assert _stamps(store) == []
+        assert _persisted_payload(update_task)['files'] == expected_files
+        if override_files is not None:
+            get_merge_commit_diff_files.assert_not_awaited()
+
+    async def test_no_plan_loaded_stamps_plan_basis_as_none(self, tmp_path: Path):
+        store = _event_store(tmp_path)
+        wf, _, _, get_merge_commit_diff_files = _make_workflow(
+            project_root=tmp_path,
+            backend_metadata={'files': ['src/a.py']},
+            event_store=store,
+        )
+        wf.plan = {}
+        wf._merge_sha = _MERGE_SHA
+        get_merge_commit_diff_files.return_value = (['src/a.py', 'src/b.py'], None)
+
+        await wf._reconcile_metadata_files_for_done()
+
+        stamp = _only_stamp(store)
+        assert stamp['plan_files'] is None
+        assert stamp['metadata_files'] == {
+            'declared': ['src/a.py'], 'undeclared': ['src/b.py'], 'undelivered': [],
+        }
+
+    async def test_malformed_declarations_never_block_the_done_write(
+        self, tmp_path: Path,
+    ):
+        store = _event_store(tmp_path)
+        diff = ['src/a.py', 'src/b.py']
+        wf, update_task, _, get_merge_commit_diff_files = _make_workflow(
+            project_root=tmp_path,
+            backend_metadata={'files': 'not-a-list'},
+            event_store=store,
+        )
+        wf.plan = {'files': ['src/a.py', {'path': 'x'}, 7], 'steps': []}
+        wf._merge_sha = _MERGE_SHA
+        get_merge_commit_diff_files.return_value = (list(diff), None)
+
+        await wf._reconcile_metadata_files_for_done()
+
+        assert _persisted_payload(update_task)['files'] == diff
+        stamp = _only_stamp(store)
+        assert stamp['plan_files']['declared'] == ['src/a.py']
+        assert stamp['metadata_files'] == {
+            'declared': [], 'undeclared': diff, 'undelivered': [],
+        }
+
+    async def test_without_an_event_store_the_reconcile_is_unchanged(
+        self, tmp_path: Path,
+    ):
+        wf, update_task, _, get_merge_commit_diff_files = _make_workflow(
+            project_root=tmp_path,
+            backend_metadata={'files': ['src/a.py'], 'memory_hints': _HINTS},
+        )
+        wf.plan = {'files': ['src/a.py'], 'steps': []}
+        wf._merge_sha = _MERGE_SHA
+        get_merge_commit_diff_files.return_value = (['src/a.py', 'src/b.py'], None)
+
+        await wf._reconcile_metadata_files_for_done()
+
+        update_task.assert_awaited_once_with(
+            '101', {'files': ['src/a.py', 'src/b.py'], 'memory_hints': _HINTS},
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -425,7 +782,7 @@ def _make_replan_workflow(
     config.fused_memory.url = 'http://localhost:8002'
     config.max_review_cycles = max_review_cycles
     config.max_amendment_rounds = 1
-    config.lock_depth = 2
+    config.lock_depth = _LOCK_DEPTH
     config.project_root = tmp_path / 'proj'
     # Real reviewer model string so _reviewer_config_fingerprint() (task 2749)
     # yields a deterministic, non-None digest — mirrors
@@ -444,6 +801,7 @@ def _make_replan_workflow(
         briefing=MagicMock(),
         mcp=MagicMock(),
     )
+    _assert_depth_pin_holds(wf)
     worktree = tmp_path / 'wt'
     worktree.mkdir(parents=True, exist_ok=True)
     artifacts = TaskArtifacts(worktree)
@@ -564,9 +922,9 @@ class TestReplanScopeReconcile:
     ):
         initial_files = ['a/b/c/d/e.py']
         new_file = 'x/y/z/w/v.py'
-        modules = files_to_modules(initial_files, 2)
-        assert files_to_modules(initial_files, 2) != files_to_modules(
-            [*initial_files, new_file], 2,
+        modules = files_to_modules(initial_files, _LOCK_DEPTH)
+        assert files_to_modules(initial_files, _LOCK_DEPTH) != files_to_modules(
+            [*initial_files, new_file], _LOCK_DEPTH,
         ), 'precondition: the new file must widen the MODULE set'
 
         wf, scheduler = _make_replan_workflow(
@@ -592,7 +950,7 @@ class TestReplanScopeReconcile:
             f'got {snapshots[1]["blast"]!r}'
         )
         widened_files = [*initial_files, new_file]
-        assert wf.modules == files_to_modules(widened_files, 2), (
+        assert wf.modules == files_to_modules(widened_files, _LOCK_DEPTH), (
             'wf.modules must cover the new file module before the 2nd '
             f'EXECUTE; got {wf.modules!r}'
         )
@@ -600,12 +958,12 @@ class TestReplanScopeReconcile:
     async def test_same_module_widen_persists_via_update_task_before_next_execute(
         self, tmp_path: Path,
     ):
-        f1 = 'a/b/c/d/e.py'
-        f2 = 'a/b/c/d/f.py'
-        assert files_to_modules([f1], 2) == files_to_modules([f1, f2], 2), (
-            'precondition: f1 and f2 must map to the SAME module set'
-        )
-        modules = files_to_modules([f1], 2)
+        # Derived, not a literal — see same_module_siblings' docstring for why.
+        f1, f2 = same_module_siblings(_LOCK_DEPTH)
+        assert files_to_modules([f1], _LOCK_DEPTH) == files_to_modules(
+            [f1, f2], _LOCK_DEPTH,
+        ), 'precondition: f1 and f2 must map to the SAME module set'
+        modules = files_to_modules([f1], _LOCK_DEPTH)
 
         wf, scheduler = _make_replan_workflow(
             tmp_path=tmp_path, initial_files=[f1], modules=modules,
@@ -643,15 +1001,16 @@ class TestReplanScopeReconcile:
         lock."""
         initial_files = ['a/b/c/d/e.py']
         new_file = 'x/y/z/w/v.py'
-        modules = files_to_modules(initial_files, 2)
-        assert files_to_modules(initial_files, 2) != files_to_modules(
-            [*initial_files, new_file], 2,
+        modules = files_to_modules(initial_files, _LOCK_DEPTH)
+        assert files_to_modules(initial_files, _LOCK_DEPTH) != files_to_modules(
+            [*initial_files, new_file], _LOCK_DEPTH,
         ), 'precondition: the new file must widen the MODULE set'
 
         wf, scheduler = _make_replan_workflow(
             tmp_path=tmp_path, initial_files=initial_files, modules=modules,
         )
-        scheduler.blast_radius_result = False  # a sibling holds the additional lock
+        # A sibling holds the additional lock.
+        scheduler.blast_radius_result = BlastRadiusResult(applied=False)
         snapshots: list[dict] = []
         wf._execute_iterations = _snapshotting_execute_iterations(scheduler, snapshots)
         wf._review = _blocking_then_pass_reviews()

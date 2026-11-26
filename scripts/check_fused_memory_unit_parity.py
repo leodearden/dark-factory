@@ -6,9 +6,17 @@ carries all host-invariant safety directives committed in the template
 
 Exit codes
 ----------
-0 — parity (all required directives present)
-1 — drift   (one or more required directives missing)
-2 — installed unit absent (no installed unit found at the given path)
+The family's codes are defined once, in
+``systemd_unit_parity.py::ParityExit``. Here, drift means a required directive
+is missing from the installed unit.
+
+An exit status alone is not enough to read this script's verdict: 2 is also
+what `python3` returns for a script it cannot open and what argparse returns
+for a rejected flag. So EVERY line this script emits carries the
+``[fused_memory_unit_parity]`` tag, and setup-host.sh's parity gate believes a
+status only when that tag is present in the captured output. The tag's ABSENCE
+is therefore conclusive rather than heuristic, which only holds because every
+PHYSICAL line carries it — see ``systemd_unit_parity.emit``.
 
 Usage
 -----
@@ -25,52 +33,170 @@ Usage
 
 Design notes
 ------------
-- Stdlib-only (pathlib, argparse, subprocess, sys) — runs under plain python3.
+- Stdlib-only (pathlib, argparse, subprocess, sys) plus the sibling
+  scripts/systemd_unit_parity.py, which is itself stdlib-only — so this still
+  runs under a plain python3 with no environment set up.
 - Required directives are an explicit curated allow-list of host-INVARIANT safety
   switches. They are NOT auto-derived from the template, because some template lines
   are host-specific (e.g. Environment=...PREDONE_HOOK...) and would produce false
-  drift alarms on other machines.
+  drift alarms on other machines. Their Environment= part is
+  ``systemd_unit_parity.py::ENV_POLICY``'s required projection.
 - --fix only APPENDS missing directives; it never removes or reorders existing lines.
   This preserves intentionally host-specific lines (e.g. extra
   DASHBOARD_KNOWN_PROJECT_ROOTS entries) that live only in the installed unit.
+- All output goes through the family's one tagger, ``systemd_unit_parity.emit``
+  (via ``_log``, or ``emit_block`` for the ``[override]`` block), so the report
+  is uniformly tagged; the contract is pinned by
+  test_main_every_emitted_line_carries_the_log_tag in
+  tests/scripts/test_check_fused_memory_unit_parity.py.
+- DROP-INS are consulted even when the unit file is at parity, via the shared
+  ``systemd_unit_parity.find_dropins``. `systemctl --user edit` never modifies
+  the unit file; it writes ``<unit>.d/override.conf`` beside it, which systemd
+  merges OVER the unit at load time — so the whole-line membership comparison
+  above can certify every required directive present while the configuration
+  that actually runs is a different one. This closed the LAST drop-in-blind
+  member of the check_*_unit_parity.py family (task-3775 lineage; defect
+  writeups 4382/4388); the dashboard, orchestrator and lms checkers already
+  consulted it. Reported, never removed: a drop-in can be load-bearing (task
+  3750), so removal has owners with preconditions
+  (scripts/remove-lms-arm-worktree-dropin.sh is the precedent) that a
+  general-purpose parity checker has no business re-implementing.
 """
 
 import argparse
 import pathlib
+import re
 import subprocess
 import sys
-from typing import Sequence
+from collections.abc import Sequence
+
+# A bare module-name import, the same mechanism the three sibling checkers use
+# — do not add a path shim. It resolves in BOTH contexts this script runs in:
+# under the CLI python puts the executed script's own directory (``scripts/``)
+# at ``sys.path[0]``, and under pytest ``tests/scripts/conftest.py`` inserts
+# ``scripts/`` explicitly (load-bearing, because pyproject sets
+# ``--import-mode=importlib``, under which pytest deliberately does not perform
+# that sys.path mutation itself).
+from systemd_unit_parity import (
+    ENV_POLICY,
+    SERVICE_SECTION,
+    ParityExit,
+    UnitFamily,
+    emit,
+    emit_block,
+    find_dropins,
+)
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
+
+# Prefixed onto every line this script prints, matching
+# [dashboard_unit_parity], [orchestrator_unit_parity] and [lms_unit_parity].
+# setup-host.sh routes operators to a detailed report BY TAG rather than by
+# position, so an untagged line in a long bring-up run has no reliable way to
+# point at its own output — and the gate's "no tag, so it did not run" test
+# would be answerable only by heuristic.
+LOG_TAG = "fused_memory_unit_parity"
 
 _DEFAULT_INSTALLED = pathlib.Path.home() / ".config" / "systemd" / "user" / "fused-memory.service"
 _SCRIPT_DIR = pathlib.Path(__file__).resolve().parent
 _DEFAULT_TEMPLATE = _SCRIPT_DIR / "fused-memory.service.template"
 
 # Host-invariant safety switches that MUST be present in [Service] as
-# non-comment directives.  Extend this list to guard additional safety flags.
-# Restart=on-failure / RestartSec=5 / TimeoutStartSec=300 / TimeoutStopSec=90
-# are host-invariant literal strings (already present verbatim in
-# scripts/fused-memory.service.template) — exact membership matching both
-# detects a divergent value (e.g. a wrong TimeoutStopSec) and lets --fix
-# append the correct line.
+# non-comment directives. The Environment= entries are ENV_POLICY's required
+# projection; a host-local name cannot be one, because EnvPolicy raises at import
+# (B5, plans/review-all-s25-scripts-instruments-prd.md D5).
+#
+# Restart=on-failure / RestartSec=5 / RestartSteps=4 / TimeoutStartSec=300 /
+# TimeoutStopSec=90 are host-invariant literal strings (already present
+# verbatim in scripts/fused-memory.service.template) — exact membership
+# matching both detects a divergent value (e.g. a wrong TimeoutStopSec) and
+# lets --fix append the correct line.
+#
+# RestartSteps=4 is host-invariant for the same reason the others are, and is
+# listed here rather than left to the template alone because the template is
+# not what runs: the unit above RestartSteps in the template declares
+# RestartMaxDelaySec=60, and systemd DISCARDS that cap on any unit that does
+# not also declare RestartSteps= (it logs "Service has RestartMaxDelaySec= but
+# no RestartSteps= setting. Ignoring." at load and moves on). An installed unit
+# missing this line therefore has no growing backoff at all, silently, and the
+# only way that gets corrected on the host is for this checker to report it.
+#
+# KillMode=mixed is host-invariant too (task 9493). Without it an installed unit
+# silently keeps the default control-group, where a restart double-signals the
+# server and SIGTERMs the subprocesses of live tool calls; listing it here is
+# what lets setup-host's parity gate report that and --fix append it in place.
 REQUIRED_SERVICE_DIRECTIVES: tuple[str, ...] = (
-    "Environment=MEM0_TELEMETRY=false",
+    *ENV_POLICY.required_directives(UnitFamily.FUSED_MEMORY),
     "WatchdogSec=120",
     "Restart=on-failure",
     "RestartSec=5",
+    "RestartSteps=4",
     "TimeoutStartSec=300",
     "TimeoutStopSec=90",
+    "KillMode=mixed",
 )
 
 # Directive PREFIXES that MUST be present (as the start of some non-comment
 # [Service] line) but whose full value is host-specific and therefore cannot
 # be exact-matched or synthesized by --fix. ExecStartPre= carries
 # host-specific paths (__REPO_ROOT__, /home/leo/bin) — only its presence can
-# be asserted.
-REQUIRED_SERVICE_DIRECTIVE_PREFIXES: tuple[str, ...] = ("ExecStartPre=",)
+# be asserted. ExecStopPost= is the hook that stops fused-memory.socket on a
+# deliberate stop; without it a stopped service is restarted by the next
+# connection to its still-listening port.
+REQUIRED_SERVICE_DIRECTIVE_PREFIXES: tuple[str, ...] = ("ExecStartPre=", "ExecStopPost=")
+
+# The backing stores must come up only through the FalkorDB AOF gate (task
+# 6330): a bare `docker compose ... up` ExecStartPre recreates falkordb onto
+# whatever AOF is on disk, and a stale one silently drops every later write.
+# Like the prefixes above, the gate's line carries host paths, so --fix can
+# only report these, never synthesize them.
+AOF_GATE_SCRIPT = "scripts/falkordb_aof_gate.py"
+AOF_GATE_DRIFT = f"ExecStartPre= running {AOF_GATE_SCRIPT} (task 6330)"
+# The compose services whose `up` cannot recreate falkordb, named as defined
+# in fused-memory/docker/docker-compose.yml. That holds only while none of them
+# declares a dependency, because compose starts a service's dependencies too;
+# tests/scripts/test_check_fused_memory_unit_parity.py::test_every_ungated_compose_service_starts_alone
+# pins it.
+UNGATED_COMPOSE_SERVICES: frozenset[str] = frozenset({"embedder"})
+BARE_COMPOSE_UP_DRIFT = (
+    "no ExecStartPre= running a `docker compose ... up` that names services beyond "
+    f"UNGATED_COMPOSE_SERVICES {sorted(UNGATED_COMPOSE_SERVICES)} "
+    f"(it could recreate falkordb without {AOF_GATE_SCRIPT})"
+)
+_COMPOSE_UP = re.compile(r"docker[ -]compose\b.*\sup(\s|$)")
+
+
+def compose_up_services(line: str) -> frozenset[str] | None:
+    """The services a compose `up` on *line* names, or None when it runs no compose `up`.
+
+    They are the `up`'s non-option tokens, so an option's separate value token
+    is read as a service too. An empty set means the `up` names none, which
+    brings up every service.
+    """
+    match = _COMPOSE_UP.search(line)
+    if match is None:
+        return None
+    return frozenset(token for token in line[match.end():].split() if not token.startswith("-"))
+
+
+def compose_up_bypasses_aof_gate(line: str) -> bool:
+    """True when *line* runs a compose `up` that could recreate falkordb.
+
+    Anything compose_up_services reads outside UNGATED_COMPOSE_SERVICES counts,
+    and so does naming no service, so an unrecognised `up` fails closed.
+    """
+    services = compose_up_services(line)
+    if services is None:
+        return False
+    return not services or not services <= UNGATED_COMPOSE_SERVICES
+
+
+def _log(message: str, *, stream=None) -> None:
+    """Tag every physical line of *message*; the contract lives in systemd_unit_parity.py::emit."""
+    emit(LOG_TAG, message, out=stream if stream is not None else sys.stdout)
+
 
 # ---------------------------------------------------------------------------
 # Unit parser
@@ -116,6 +242,8 @@ def find_drift(
     unit_text: str,
     required: tuple[str, ...] = REQUIRED_SERVICE_DIRECTIVES,
     required_prefixes: tuple[str, ...] = REQUIRED_SERVICE_DIRECTIVE_PREFIXES,
+    *,
+    check_aof_gate: bool = True,
 ) -> list[str]:
     """Return required directives NOT present as non-comment lines in [Service].
 
@@ -127,6 +255,13 @@ def find_drift(
     [Service] line starts with it — used for directives whose full value is
     host-specific (e.g. ExecStartPre=) and therefore cannot be exact-matched.
     Prefix misses are appended, in order, after the exact-match misses.
+
+    With ``check_aof_gate``, a unit whose ExecStartPre= lines exist but none
+    runs AOF_GATE_SCRIPT reports AOF_GATE_DRIFT, and one with an ExecStartPre=
+    compose up naming services beyond UNGATED_COMPOSE_SERVICES (see
+    compose_up_bypasses_aof_gate) reports BARE_COMPOSE_UP_DRIFT, appended
+    last. A unit with no ExecStartPre= at all is already reported by its
+    prefix miss.
 
     Args:
         unit_text: The full text of the systemd unit file.
@@ -142,12 +277,48 @@ def find_drift(
         Empty if everything required is present.
     """
     sections = parse_unit_sections(unit_text)
-    service_lines = sections.get("Service", [])
+    service_lines = sections.get(SERVICE_SECTION, [])
     missing = [d for d in required if d not in service_lines]
     missing.extend(
         p for p in required_prefixes if not any(line.startswith(p) for line in service_lines)
     )
+    if check_aof_gate:
+        missing.extend(_aof_gate_drift(service_lines))
     return missing
+
+
+def _aof_gate_drift(service_lines: list[str]) -> list[str]:
+    exec_start_pre = [line for line in service_lines if line.startswith("ExecStartPre=")]
+    if not exec_start_pre:
+        return []
+    drift = []
+    if not any(AOF_GATE_SCRIPT in line for line in exec_start_pre):
+        drift.append(AOF_GATE_DRIFT)
+    if any(compose_up_bypasses_aof_gate(line) for line in exec_start_pre):
+        drift.append(BARE_COMPOSE_UP_DRIFT)
+    return drift
+
+
+def _compose_up_bypass_details(unit_text: str) -> list[str]:
+    """Name each ExecStartPre= line BARE_COMPOSE_UP_DRIFT flags, with the services read from it."""
+    service_lines = parse_unit_sections(unit_text).get(SERVICE_SECTION, [])
+    details = []
+    for line in service_lines:
+        if line.startswith("ExecStartPre=") and compose_up_bypasses_aof_gate(line):
+            services = sorted(compose_up_services(line) or ())
+            details.append(f"      {line}")
+            details.append(f"      read as services: {services or 'none, so every service'}")
+    return details
+
+
+def _drift_entries(drift: list[str], unit_text: str) -> str:
+    """One `  - ` line per drift entry, each BARE_COMPOSE_UP_DRIFT followed by its offending lines."""
+    entries = []
+    for entry in drift:
+        entries.append(f"  - {entry}")
+        if entry == BARE_COMPOSE_UP_DRIFT:
+            entries.extend(_compose_up_bypass_details(unit_text))
+    return "\n".join(entries)
 
 
 # ---------------------------------------------------------------------------
@@ -178,7 +349,7 @@ def fix_unit_text(
     Returns:
         Updated text string (or the original if nothing was missing).
     """
-    missing = find_drift(unit_text, required, required_prefixes=())
+    missing = find_drift(unit_text, required, required_prefixes=(), check_aof_gate=False)
     if not missing:
         return unit_text
 
@@ -195,7 +366,7 @@ def fix_unit_text(
                 # Hit the section after [Service]
                 next_section_idx = i
                 break
-            if stripped == "[Service]":
+            if stripped == f"[{SERVICE_SECTION}]":
                 in_service = True
 
     # Ensure the line just before the insertion point ends with '\n' so the
@@ -207,6 +378,41 @@ def fix_unit_text(
     insertion_lines = [d + "\n" for d in missing]
     new_lines = lines[:next_section_idx] + insertion_lines + lines[next_section_idx:]
     return "".join(new_lines)
+
+
+# ---------------------------------------------------------------------------
+# Drop-in overrides
+# ---------------------------------------------------------------------------
+
+
+_OVERRIDE_TAIL: tuple[str, ...] = (
+    "systemd merges these over the unit at load time, so a directive set here "
+    "silently wins over the committed value. Inspect the merged result with: "
+    "systemctl --user cat fused-memory.service",
+    "Nothing was removed: this checker is read-only about drop-ins BY DESIGN, "
+    "because a drop-in can be load-bearing (task 3750). --fix appends to the "
+    "unit FILE and can neither synthesize nor resolve an override living in a "
+    "different one — remove it by hand, or move the setting into the committed "
+    "template.",
+)
+
+
+def _report_override(
+    installed_path: pathlib.Path, dropins: list[pathlib.Path]
+) -> None:
+    """Name every drop-in layered over the unit: its EFFECTIVE configuration went unverified."""
+    emit_block(
+        LOG_TAG,
+        "override",
+        header=(
+            f"{len(dropins)} drop-in(s) apply to {installed_path} — the unit file "
+            "was compared, but the EFFECTIVE configuration was NOT verified by "
+            "that comparison:"
+        ),
+        entries=[f"  {dropin}" for dropin in dropins],
+        tail=_OVERRIDE_TAIL,
+        out=sys.stdout,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -226,10 +432,10 @@ def daemon_reload() -> None:
         # systemctl not available (e.g. CI without systemd)
         pass
     except subprocess.CalledProcessError as exc:
-        print(
+        _log(
             f"[warn] systemctl --user daemon-reload failed (exit {exc.returncode}): "
             f"{exc.stderr.decode(errors='replace').strip()}",
-            file=sys.stderr,
+            stream=sys.stderr,
         )
 
 
@@ -239,12 +445,10 @@ def daemon_reload() -> None:
 
 
 def main(argv: Sequence[str]) -> int:
-    """Parse args and run parity check (and optional fix).
+    """Parse args and run parity check (and optional fix); return a ParityExit.
 
-    Returns:
-        0 — parity
-        1 — drift
-        2 — installed unit absent
+    systemd_unit_parity.py::ParityExit is the one statement of what each code
+    means — a drop-in alone is FINDING, never PARITY.
     """
     parser = argparse.ArgumentParser(
         description="Verify/fix parity of installed fused-memory systemd unit."
@@ -273,32 +477,48 @@ def main(argv: Sequence[str]) -> int:
 
     # Exit code 2: installed unit absent
     if not installed_path.exists():
-        print(
+        _log(
             f"[skip] Installed unit not found at {installed_path} "
             "(unit may not be installed on this host)",
-            file=sys.stderr,
+            stream=sys.stderr,
         )
-        return 2
+        return ParityExit.NOT_INSTALLED
 
     unit_text = installed_path.read_text(encoding="utf-8")
     drift = find_drift(unit_text)
+
+    # Consulted EVEN WHEN the unit file itself is at parity: a drop-in is
+    # layered OVER a matching unit file, so it is invisible to the whole-line
+    # membership comparison above. `--installed` names a FILE here (the three
+    # sibling checkers take an installed-DIR), so the drop-in directory is
+    # derived from it rather than passed in.
+    dropins = find_dropins(installed_path.parent, installed_path.name)
+    if dropins:
+        _report_override(installed_path, dropins)
 
     # Also verify that the template itself is not drifted (self-sanity check).
     if template_path.exists():
         template_drift = find_drift(template_path.read_text(encoding="utf-8"))
         if template_drift:
-            print(
+            _log(
                 f"[warn] Template {template_path} is itself missing: {template_drift}",
-                file=sys.stderr,
+                stream=sys.stderr,
             )
 
     if not drift:
-        print(f"[ok] {installed_path}: parity — all required directives present.")
-        return 0
+        if dropins:
+            # NOT parity, and deliberately not exit 0: the required directives
+            # all matched, but what this run could not establish is that the
+            # EFFECTIVE configuration matches. Reporting `[ok] ... parity` here
+            # would be a green claim covering exactly the configuration that is
+            # not running.
+            return ParityExit.FINDING
+        _log(f"[ok] {installed_path}: parity — all required directives present.")
+        return ParityExit.PARITY
 
-    print(
+    _log(
         f"[drift] {installed_path}: missing required directives:\n"
-        + "".join(f"  - {d}\n" for d in drift)
+        + _drift_entries(drift, unit_text)
     )
 
     if args.fix:
@@ -307,10 +527,10 @@ def main(argv: Sequence[str]) -> int:
         # / host paths) cannot be guessed. So the count of lines actually
         # appended is the number of missing EXACT directives, NOT len(drift)
         # (which also counts un-synthesizable prefix misses).
-        appended = find_drift(unit_text, required_prefixes=())
+        appended = find_drift(unit_text, required_prefixes=(), check_aof_gate=False)
         fixed_text = fix_unit_text(unit_text)
         installed_path.write_text(fixed_text, encoding="utf-8")
-        print(f"[fixed] Appended {len(appended)} directive(s) to {installed_path}")
+        _log(f"[fixed] Appended {len(appended)} directive(s) to {installed_path}")
         daemon_reload()
 
         # Re-check the written text with the default (prefix-aware) config. Any
@@ -319,21 +539,40 @@ def main(argv: Sequence[str]) -> int:
         # signalling parity with exit 0 — a follow-up plain verify would exit 1.
         residual = find_drift(fixed_text)
         if residual:
-            print(
+            _log(
                 f"[drift] {installed_path}: --fix cannot synthesize host-specific "
                 f"directive(s) (value carries host paths — add them by hand):\n"
-                + "".join(f"  - {d}\n" for d in residual),
-                file=sys.stderr,
+                + _drift_entries(residual, fixed_text),
+                stream=sys.stderr,
             )
-            return 1
-        return 0
+            return ParityExit.FINDING
 
-    print(
+        # An override is neither synthesizable nor removable HERE, so a --fix
+        # run that repaired everything it could must still decline to report
+        # success. The repair was real and is kept; what it cannot establish is
+        # that the values it just wrote are the ones that would take effect,
+        # because the drop-in lives in a DIFFERENT FILE and systemd merges it
+        # over them at load time. Reporting 0 would be the checker
+        # manufacturing the reassurance.
+        #
+        # Reported and NOT removed, following the lms precedent: a drop-in can
+        # be load-bearing (task 3750), so removal has a correct owner with
+        # preconditions — scripts/remove-lms-arm-worktree-dropin.sh — that a
+        # general-purpose parity checker has no business re-implementing.
+        # The [override] block was already emitted above and is worded APART
+        # from the residual-drift report just above: they share exit 1 but send
+        # the operator to different places (hand-add a host-specific directive
+        # vs. inspect and remove a drop-in).
+        if dropins:
+            return ParityExit.FINDING
+        return ParityExit.PARITY
+
+    _log(
         "Run with --fix to append missing directives without clobbering "
         "host-specific lines.",
-        file=sys.stderr,
+        stream=sys.stderr,
     )
-    return 1
+    return ParityExit.FINDING
 
 
 if __name__ == "__main__":

@@ -3,8 +3,8 @@
 TestApplyMcpStartupEnv — MCP_STARTUP_TIMEOUT_MS constant and
 apply_mcp_startup_env() helper (step-1/step-2).
 
-TestJcodemunchLaunchPinned — JCODEMUNCH_COMMAND/JCODEMUNCH_ENV constants and
-mcp_config_json() regression guard (step-3/step-4).
+TestMcpConfigServerSet — mcp_config_json() assembles exactly fused-memory,
+plus escalation when a URL is given, and no other server.
 
 TestInvokeInjectsMcpStartupTimeout — _invoke_claude_with_sandbox injects
 MCP_TIMEOUT into env_overrides (step-5/step-6).
@@ -20,6 +20,11 @@ TestVerdictToolsLaunchFastStart/DirectInterpreter/MetaRoot —
 verdict_tools_mcp_server() launch-dict factory, modeled on
 plan_tools_mcp_server (task 2482, PRD mcp-verdict-servers-prd.md task β,
 step-1/step-2).
+
+TestEnvelopeReadersAreReExported — tool_error_text() and tool_text_blocks()
+live in shared.mcp_envelope; mcp_lifecycle re-exports those same objects for
+scheduler.py and agents/memory_recall.py, so no second copy can drift
+(task 6216).
 """
 
 from __future__ import annotations
@@ -29,10 +34,15 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+import shared.mcp_envelope
 from _orch_helpers import pydantic_spec
 
+import orchestrator.mcp_lifecycle
 from orchestrator.config import OrchestratorConfig
-from orchestrator.mcp_lifecycle import plan_tools_mcp_server, verdict_tools_mcp_server
+from orchestrator.mcp_lifecycle import (
+    plan_tools_mcp_server,
+    verdict_tools_mcp_server,
+)
 
 # ---------------------------------------------------------------------------
 # Step-1/Step-2: apply_mcp_startup_env + MCP_STARTUP_TIMEOUT_MS
@@ -78,42 +88,31 @@ class TestApplyMcpStartupEnv:
 
 
 # ---------------------------------------------------------------------------
-# Step-3/Step-4: JCODEMUNCH_COMMAND / JCODEMUNCH_ENV + mcp_config_json
+# mcp_config_json server set
 # ---------------------------------------------------------------------------
 
 
-class TestJcodemunchLaunchPinned:
-    """mcp_config_json() uses the named constants and is pinned to the prebuilt
-    launcher (not uvx), guarding against regressions."""
+class TestMcpConfigServerSet:
+    """mcp_config_json() assembles the 'orchestrator' family's servers and
+    nothing else: fused-memory always, escalation only with a URL."""
 
-    def test_command_is_prebuilt_launcher_not_uvx(self):
-        """JCODEMUNCH_COMMAND is 'jcodemunch-mcp' (prebuilt, not 'uvx')."""
-        from orchestrator.mcp_lifecycle import JCODEMUNCH_COMMAND
-
-        assert JCODEMUNCH_COMMAND == 'jcodemunch-mcp'
-        assert JCODEMUNCH_COMMAND != 'uvx'
-
-    def test_env_contains_no_version_hint(self):
-        """JCODEMUNCH_ENV contains JCODEMUNCH_NO_VERSION_HINT."""
-        from orchestrator.mcp_lifecycle import JCODEMUNCH_ENV
-
-        assert 'JCODEMUNCH_NO_VERSION_HINT' in JCODEMUNCH_ENV
-
-    def test_mcp_config_json_uses_constants(self, mock_orch_config):
-        """mcp_config_json() jcodemunch entry matches constants (regression guard)."""
-        from orchestrator.mcp_lifecycle import JCODEMUNCH_COMMAND, JCODEMUNCH_ENV, McpLifecycle
+    def test_without_escalation_url_only_fused_memory(self, mock_orch_config):
+        from orchestrator.mcp_lifecycle import McpLifecycle
 
         mock_orch_config.fused_memory.url = 'http://localhost:8000'
         lifecycle = McpLifecycle(mock_orch_config)
         out = lifecycle.mcp_config_json()
 
-        jc = out['mcpServers']['jcodemunch']
-        assert jc['command'] == JCODEMUNCH_COMMAND
-        assert jc['env'] == JCODEMUNCH_ENV
-        # Regression guard: 'uvx' must not appear in command or args
-        assert 'uvx' not in jc.get('command', '')
-        args = jc.get('args', [])
-        assert not any('uvx' in str(a) for a in args)
+        assert set(out['mcpServers']) == {'fused-memory'}
+
+    def test_with_escalation_url_adds_only_escalation(self, mock_orch_config):
+        from orchestrator.mcp_lifecycle import McpLifecycle
+
+        mock_orch_config.fused_memory.url = 'http://localhost:8000'
+        lifecycle = McpLifecycle(mock_orch_config)
+        out = lifecycle.mcp_config_json(escalation_url='http://h:9999/mcp')
+
+        assert set(out['mcpServers']) == {'fused-memory', 'escalation'}
 
 
 # ---------------------------------------------------------------------------
@@ -175,7 +174,7 @@ class TestMcpConfigEscalationHeaders:
         assert 'escalation' not in out_headers_only['mcpServers']
 
     def test_headers_do_not_alter_other_server_blocks(self, mock_orch_config):
-        """escalation_headers only touches the escalation block; fused-memory/jcodemunch blocks unaffected."""
+        """escalation_headers only touches the escalation block; the fused-memory block is unaffected."""
         from orchestrator.mcp_lifecycle import McpLifecycle
 
         mock_orch_config.fused_memory.url = 'http://localhost:8000'
@@ -189,7 +188,6 @@ class TestMcpConfigEscalationHeaders:
         )
 
         assert with_headers['mcpServers']['fused-memory'] == baseline['mcpServers']['fused-memory']
-        assert with_headers['mcpServers']['jcodemunch'] == baseline['mcpServers']['jcodemunch']
 
 
 # ---------------------------------------------------------------------------
@@ -232,6 +230,7 @@ class TestInvokeInjectsMcpStartupTimeout:
                 sandbox_modules=None,
                 effort=None,
                 env_overrides=None,
+                runner=AsyncMock(),
             )
 
         mock_agent.assert_awaited_once()
@@ -266,6 +265,7 @@ class TestInvokeInjectsMcpStartupTimeout:
                 sandbox_modules=None,
                 effort=None,
                 env_overrides={'FOO': 'bar'},
+                runner=AsyncMock(),
             )
 
         mock_agent.assert_awaited_once()
@@ -354,8 +354,12 @@ class TestPlanToolsLaunchDirectInterpreter:
         assert cfg['command'] == '/venv/bin/python'
 
     def test_args_exact_module_invocation_sequence(self, cfg):
-        """args equals ['-m', 'orchestrator.mcp.plan_tools', '--worktree', '/wt'] exactly."""
-        assert cfg['args'] == ['-m', 'orchestrator.mcp.plan_tools', '--worktree', '/wt']
+        """args equals ['-m', 'orchestrator.mcp.plan_tools', '--worktree', '/wt',
+        '--grants-enforced'] exactly: the grant marker always follows the root
+        args (task 7717)."""
+        assert cfg['args'] == [
+            '-m', 'orchestrator.mcp.plan_tools', '--worktree', '/wt', '--grants-enforced',
+        ]
 
     def test_no_uv_tokens_anywhere_in_full_command(self, cfg):
         """None of {'uv', 'run', '--no-sync', '--frozen', '--project'} appear
@@ -434,6 +438,33 @@ class TestPlanToolsLaunchMetaRoot:
             python_executable='/venv/bin/python',
         )
         assert '--meta-root' not in cfg['args']
+
+
+class TestPlanToolsLaunchCallerRole:
+    """plan_tools_mcp_server(caller_role=...) names the role the launched
+    server serves, as an adjacent '--caller-role <role>' pair, on both launch
+    forms. It is attribution on markup records only (task 5055). The default,
+    None, emits no flag, so every other launch shape is unchanged."""
+
+    @pytest.mark.parametrize('python_executable', [None, '/venv/bin/python'], ids=['uv', 'direct'])
+    def test_the_role_follows_its_flag(self, python_executable):
+        args = plan_tools_mcp_server(
+            orch_project_dir=Path('/orch'), worktree=Path('/wt'),
+            python_executable=python_executable, caller_role='architect',
+        )['args']
+
+        idx = args.index('--caller-role')
+        assert args[idx:idx + 2] == ['--caller-role', 'architect']
+        assert args.count('--caller-role') == 1
+
+    @pytest.mark.parametrize('python_executable', [None, '/venv/bin/python'], ids=['uv', 'direct'])
+    def test_no_role_emits_no_flag(self, python_executable):
+        args = plan_tools_mcp_server(
+            orch_project_dir=Path('/orch'), worktree=Path('/wt'),
+            python_executable=python_executable,
+        )['args']
+
+        assert '--caller-role' not in args
 
 
 # ---------------------------------------------------------------------------
@@ -587,6 +618,67 @@ class TestVerdictToolsLaunchMetaRoot:
             python_executable='/venv/bin/python',
         )
         assert '--meta-root' not in cfg['args']
+
+
+# ---------------------------------------------------------------------------
+# Task 3155: plan-tools and verdict-tools launch with the task-lifetime root
+# ---------------------------------------------------------------------------
+
+_LANE_ROOT = Path('/base/.task-meta/wt')
+_TASK_ROOT = Path('/base/.task-meta/task-3155')
+_UV_PREFIX = ['run', '--project', '/orch', '--no-sync', '--frozen', 'python']
+
+
+def _plan_tools_launch(**kwargs) -> dict:
+    return plan_tools_mcp_server(orch_project_dir=Path('/orch'), worktree=Path('/wt'), **kwargs)
+
+
+def _verdict_tools_launch(**kwargs) -> dict:
+    return verdict_tools_mcp_server(
+        orch_project_dir=Path('/orch'), worktree=Path('/wt'), role='judge', **kwargs,
+    )
+
+
+@pytest.mark.parametrize('python_executable', [None, '/venv/bin/python'])
+class TestStdioLaunchTaskRoot:
+    """``task_root`` is passed as ``--task-root`` right after the ``--meta-root``
+    pair, on the hot path and the uv fallback alike."""
+
+    @pytest.mark.parametrize('launch', [_plan_tools_launch, _verdict_tools_launch])
+    def test_task_root_pair_follows_meta_root_pair(self, launch, python_executable):
+        args = launch(
+            python_executable=python_executable, meta_root=_LANE_ROOT, task_root=_TASK_ROOT,
+        )['args']
+
+        start = args.index('--meta-root')
+        assert args[start:start + 4] == [
+            '--meta-root', str(_LANE_ROOT), '--task-root', str(_TASK_ROOT),
+        ]
+
+    def test_verdict_role_tail_follows_task_root_pair(self, python_executable):
+        args = _verdict_tools_launch(
+            python_executable=python_executable, meta_root=_LANE_ROOT, task_root=_TASK_ROOT,
+        )['args']
+
+        assert args[-4:] == ['--task-root', str(_TASK_ROOT), '--verdict-role', 'judge']
+
+    def test_plan_tools_args_without_task_root_are_unchanged(self, python_executable):
+        args = _plan_tools_launch(python_executable=python_executable, meta_root=_LANE_ROOT)['args']
+
+        prefix = [] if python_executable else _UV_PREFIX
+        assert args == [
+            *prefix, '-m', 'orchestrator.mcp.plan_tools',
+            '--worktree', '/wt', '--meta-root', str(_LANE_ROOT), '--grants-enforced',
+        ]
+
+    def test_verdict_tools_args_without_task_root_are_unchanged(self, python_executable):
+        args = _verdict_tools_launch(python_executable=python_executable, meta_root=_LANE_ROOT)['args']
+
+        prefix = [] if python_executable else _UV_PREFIX
+        assert args == [
+            *prefix, '-m', 'orchestrator.mcp.verdict_tools',
+            '--worktree', '/wt', '--meta-root', str(_LANE_ROOT), '--verdict-role', 'judge',
+        ]
 
 
 # ---------------------------------------------------------------------------
@@ -913,3 +1005,16 @@ class TestManagedSpawnEnvInjection:
         env = captured_kwargs.get('env')
         assert env is not None
         assert env['RECONCILIATION_DATA_DIR'] == '/custom/r'
+
+
+# ---------------------------------------------------------------------------
+# Task 6216: the envelope readers are shared.mcp_envelope's own objects
+# ---------------------------------------------------------------------------
+
+
+class TestEnvelopeReadersAreReExported:
+    """mcp_lifecycle re-exports the shared readers; it must not hold a copy."""
+
+    @pytest.mark.parametrize('name', ['tool_error_text', 'tool_text_blocks'])
+    def test_the_re_exported_reader_is_the_shared_object(self, name):
+        assert getattr(orchestrator.mcp_lifecycle, name) is getattr(shared.mcp_envelope, name)

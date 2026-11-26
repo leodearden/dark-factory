@@ -18,22 +18,38 @@ from __future__ import annotations
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from _task_facts_rows import task_facts_rows
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.server.tools import create_mcp_server
 
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
+
 # Frames task 5252 as complete in present tense ("has landed", "now enforces").
 _COMPLETION_CONTENT = 'task 5252 has landed and now enforces the manifest gate'
+# (task 3403) The same claim, with a dotted doc-and-line citation between the
+# ref and its completion phrase. Byte-identical to the unit fixture in
+# test_task_filter.py, keeping the unit and gate layers in lockstep. Before the
+# clause-splitter widening every dot ended a clause, so this shattered into
+# 'Task 5252 (see CLAUDE' + 'md:95) has landed and now enforces the gate' — the
+# first clause holds the ref with no completion phrase, the second holds the
+# completion phrase with no ref, and the gate never fired.
+_COMPLETION_DOTTED_CONTENT = (
+    'Task 5252 (see CLAUDE.md:95) has landed and now enforces the gate.'
+)
 _PROJECT_ID = 'dark_factory'
 _KNOWN_PROJECTS = {'dark_factory': '/root'}
 
 
 def _server_with_statuses(mock_service, statuses):
-    """Build a server whose task_interceptor.get_statuses returns `statuses`.
+    """Build a server whose task store answers `statuses`, a string-keyed {id: status} map.
 
-    `statuses` is the string-keyed {id: status} map real get_statuses returns.
+    This gate reads get_statuses; the completion-claim gate that runs after it
+    reads get_task_facts, so both are stubbed from the same map.
     """
     task_interceptor = MagicMock()
     task_interceptor.get_statuses = AsyncMock(return_value=statuses)
+    task_interceptor.get_task_facts = AsyncMock(return_value=task_facts_rows(statuses))
     return create_mcp_server(
         mock_service,
         task_interceptor=task_interceptor,
@@ -100,6 +116,42 @@ class TestAddMemoryPrematureCompletionGate:
             f'Expected content_excerpt=content[:200], got: {result!r}'
         )
         assert result.get('hint'), f'Expected a non-empty hint, got: {result!r}'
+        mock_service.add_memory.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_rejects_completion_claim_with_dotted_token_between_ref_and_claim(self):
+        """(task 3403) A dotted doc citation between the ref and its completion
+        phrase must not let a premature completion claim past the gate.
+
+        This pins the shipped consequence of the clause-splitter widening, not
+        just the pure detector: the live get_statuses cross-check only runs on a
+        write the textual half already flagged, so a shattered clause meant the
+        claim was never cross-checked at all. MEASURED before the widening:
+        find_present_tense_completion_claim_task_ids returned set(), so this
+        write was NOT blocked and add_memory ran.
+        """
+        mock_service = AsyncMock()
+        server = _server_with_statuses(mock_service, {'5252': 'in-progress'})
+
+        result = await server._tool_manager.call_tool(
+            'add_memory',
+            {
+                'content': _COMPLETION_DOTTED_CONTENT,
+                'category': 'observations_and_summaries',
+                'agent_id': 'recon-stage-task_knowledge_sync',
+                'project_id': _PROJECT_ID,
+            },
+        )
+
+        assert isinstance(result, dict), f'Expected dict, got {type(result)}: {result!r}'
+        assert result.get('error') == 'premature_completion_claim_write_blocked', (
+            f"Expected error='premature_completion_claim_write_blocked' for a "
+            f'completion claim whose ref is separated from its completion phrase '
+            f'by a dotted doc citation, got: {result!r}'
+        )
+        assert result.get('blocked_task_ids') == [5252], (
+            f'Expected blocked_task_ids=[5252], got: {result!r}'
+        )
         mock_service.add_memory.assert_not_called()
 
     @pytest.mark.asyncio
@@ -242,6 +294,28 @@ class TestAddMemoryPrematureCompletionGate:
 
         assert result.get('error') != 'premature_completion_claim_write_blocked', (
             f"Gate must fail open on the 'unknown' sentinel status; got: {result!r}"
+        )
+        mock_service.add_memory.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_allows_a_merged_pull_request_number(self):
+        """'PR #5252' names a pull request, so the in-progress task 5252 is not
+        the subject of the 'Merged' and the write must not be blocked."""
+        mock_service = _allowing_service()
+        server = _server_with_statuses(mock_service, {'5252': 'in-progress'})
+
+        result = await server._tool_manager.call_tool(
+            'add_memory',
+            {
+                'content': 'Merged PR #5252 into main',
+                'category': 'observations_and_summaries',
+                'agent_id': 'recon-stage-task_knowledge_sync',
+                'project_id': _PROJECT_ID,
+            },
+        )
+
+        assert result.get('error') != 'premature_completion_claim_write_blocked', (
+            f'Gate must not read PR #5252 as task 5252; got: {result!r}'
         )
         mock_service.add_memory.assert_called_once()
 

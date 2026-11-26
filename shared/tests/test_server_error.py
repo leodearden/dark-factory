@@ -27,6 +27,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from shared.cli_invoke import (
+    BUDGET_EXHAUSTED_SUBTYPE,
     AgentFailureKind,
     AgentResult,
     AllAccountsCappedException,
@@ -200,7 +201,9 @@ class TestClassifyInvocationServerErrorPrecedence:
     @pytest.mark.parametrize('status', [401, 403])
     def test_auth_failed_outranks_server_error(self, status: int):
         result = AgentResult(success=False, output='Unauthorized', api_error_status=status)
-        assert classify_invocation(result, strict_confirm=True) == AuthFailed(status=status)
+        assert classify_invocation(result, strict_confirm=True) == AuthFailed(
+            status=status, body='Unauthorized'
+        )
 
     def test_404_stays_model_not_found(self):
         result = AgentResult(
@@ -401,6 +404,19 @@ class TestClassifyAgentFailureServerErrorPrecedence:
             api_error_status=503,
         )
         assert classify_agent_failure(result).kind is AgentFailureKind.MAX_TURNS
+
+    def test_budget_abort_with_a_5xx_stays_budget(self):
+        """The 5xx rule outranks the TIMEOUT rule only, not the
+        configured-ceiling rules: a budget abort stays BUDGET."""
+        result = AgentResult(
+            success=False,
+            output='',
+            subtype=BUDGET_EXHAUSTED_SUBTYPE,
+            turns=40,
+            cost_usd=5.01,
+            api_error_status=503,
+        )
+        assert classify_agent_failure(result).kind is AgentFailureKind.BUDGET
 
     def test_model_not_found_marker_outranks_the_5xx_rule(self):
         """INV-5: the two classifiers must agree.  ``classify_invocation``

@@ -1,0 +1,36 @@
+{
+  "task_id": "7863",
+  "reason": "Net-additive feature (task 7863): LaneLifecycle.refresh_assigned and WarmLanePool.refresh_assignment each add one holder/unwired guard (+1 cognitive per file, after removing redundant None checks), and the B7 acceptance test drives the real Harness._recover_crashed_tasks like B1-B3 already do (+1 private read).",
+  "measures": [
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/lane_lifecycle.py",
+      "baseline": 39,
+      "current": 40
+    },
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/warm_lane_pool.py",
+      "baseline": 75,
+      "current": 76
+    },
+    {
+      "measure": "private_reads",
+      "key": "orchestrator/tests/test_lane_lifecycle_integration.py",
+      "baseline": 12,
+      "current": 13
+    },
+    {
+      "measure": "total:cognitive",
+      "key": "<cluster>",
+      "baseline": 5059,
+      "current": 5061
+    },
+    {
+      "measure": "total:private_reads",
+      "key": "<cluster>",
+      "baseline": 6421,
+      "current": 6422
+    }
+  ]
+}

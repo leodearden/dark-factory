@@ -1,0 +1,18 @@
+{
+  "task_id": "10991",
+  "reason": "net-additive guard: _reuse_warm_lane attaches the lane before the WIP commit and checks the task branch out over a foreign HEAD instead of rebinding the branch to it",
+  "measures": [
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/git_ops.py",
+      "baseline": 1543,
+      "current": 1544
+    },
+    {
+      "measure": "total:cognitive",
+      "key": "<cluster>",
+      "baseline": 5231,
+      "current": 5232
+    }
+  ]
+}

@@ -18,21 +18,25 @@ from __future__ import annotations
 import contextlib
 import json
 import logging
-import os
-import tempfile
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, TypeGuard
+
+from shared import safe_io
 
 if TYPE_CHECKING:
+    from collections.abc import Iterable, Iterator
+
     from escalation.queue import EscalationQueue
+
+    from orchestrator.quarantine_provenance import QuarantineOutcome
 
 logger = logging.getLogger(__name__)
 
 # Escalation sentinel role for illegal-transition escalations. Matches the
-# 'harness-' prefix in escalation.server._HARNESS_SENTINEL_ROLE_PREFIXES so
+# 'harness-' prefix in escalation/models.py::HARNESS_SENTINEL_ROLE_PREFIXES so
 # the born-at-L2 record is exempt from the agent-role downgrade gate and
 # stays L2 (routes straight to a human). PRD Open Q4.
 ESCALATION_SENTINEL_ROLE = 'harness-lane-lifecycle'
@@ -75,6 +79,10 @@ LEGAL_TRANSITIONS: frozenset[tuple[LaneState | None, LaneState]] = frozenset(
         (LaneState.REGISTERED, LaneState.ASSIGNED),
         (LaneState.RELEASED, LaneState.ASSIGNED),
         (LaneState.ASSIGNED, LaneState.IN_USE),
+        # leaf δ's return edge: the last live dark-factory child in the lane
+        # exited. IN_USE is a liveness marker, so transition() refuses this
+        # edge when it would change the task_id.
+        (LaneState.IN_USE, LaneState.ASSIGNED),
         (LaneState.IN_USE, LaneState.RELEASED),
         (LaneState.ASSIGNED, LaneState.RELEASED),
         # recycle a quarantined slot back into service after its bad worktree
@@ -106,7 +114,7 @@ class AcquireRoute(Enum):
     #: main; ``git worktree add`` (no ``-b``) + seed, then the reuse tail.
     CREATE_ONCE_REATTACH = 'create_once_reattach'
     #: git_ops.py ~3132-3161 — already-registered lane whose
-    #: ``.task-meta/plan.json`` matches this task (post-restart backstop).
+    #: ``.task-meta/<lane>/metadata.json`` names this task (post-restart backstop).
     DISK_BACKSTOP_REUSE = 'disk_backstop_reuse'
     #: git_ops.py ~3163-3213 — already-registered lane whose orphan branch
     #: has commits beyond main; ``git checkout -f`` + the reuse tail.
@@ -163,7 +171,8 @@ _validate_acquire_route_transitions()
 
 
 class IllegalLaneTransition(Exception):
-    """Raised when a caller attempts a (from, to) edge not in LEGAL_TRANSITIONS.
+    """Raised when a caller attempts a (from, to) edge not in LEGAL_TRANSITIONS,
+    or ``refresh_assigned`` on a record the caller does not hold.
 
     Never silent-heal (PRD I2): the durable record is left unchanged when this
     is raised.
@@ -218,6 +227,20 @@ class LaneRecord:
         return cls.from_dict(json.loads(text))
 
 
+def _now_stamp() -> str:
+    """The ``updated_at`` stamp format, which warm-lane-gc.sh's record gate parses."""
+    return datetime.now(UTC).isoformat()
+
+
+def _held_by(record: LaneRecord | None, task_id: str) -> TypeGuard[LaneRecord]:
+    """True iff *record* is ``ASSIGNED``/``IN_USE`` for *task_id*."""
+    return (
+        record is not None
+        and record.state in (LaneState.ASSIGNED, LaneState.IN_USE)
+        and record.task_id == task_id
+    )
+
+
 class LaneLifecycle:
     """Single-writer, durable per-lane state record for the warm-lane pool.
 
@@ -229,7 +252,7 @@ class LaneLifecycle:
             unwired/bare-unit contexts green (no filing, no crash) — mirrors
             ``Harness._file_pool_storage_absent_escalation``.
         quarantine_worktree: Injected async ``(worktree, branch, reason) ->
-            Path | None`` callable (``GitOps.quarantine_worktree`` in
+            QuarantineOutcome`` callable (``GitOps.quarantine_worktree`` in
             production). Injected rather than importing ``GitOps`` directly
             to avoid the GitOps<->LaneLifecycle import cycle (gamma makes
             GitOps own a LaneLifecycle).
@@ -276,7 +299,7 @@ class LaneLifecycle:
         if not path.is_file():
             return None
         try:
-            return LaneRecord.from_json(path.read_text())
+            return LaneRecord.from_json(path.read_text(encoding='utf-8'))
         except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
             raise CorruptLaneRecord(f'unparseable lane record at {path}') from exc
 
@@ -288,35 +311,61 @@ class LaneLifecycle:
         rather than raising. Returns ``{}`` when ``state_dir`` doesn't exist
         (never created, or an empty/pre-record host).
         """
-        if not self.state_dir.is_dir():
-            return {}
         records: dict[str, LaneRecord] = {}
-        for path in sorted(self.state_dir.glob('*.json')):
-            record = self.read(path.stem)
+        for lane_name in self._record_lane_names():
+            record = self.read(lane_name)
             if record is not None:
-                records[path.stem] = record
+                records[lane_name] = record
         return records
+
+    def _record_lane_names(self) -> list[str]:
+        """Lane names with a record file, in record-file order; [] without ``state_dir``."""
+        if not self.state_dir.is_dir():
+            return []
+        return [path.stem for path in sorted(self.state_dir.glob('*.json'))]
 
     def _write(self, lane: Path | str, record: LaneRecord) -> None:
         """Atomically write *record* for *lane* (tmp file + os.replace).
 
-        Mirrors ``escalation.queue.EscalationQueue._atomic_write_path``: the
-        tmp file is created in the target's own parent dir so the replace
-        stays within one filesystem, and is cleaned up on failure.
+        Delegates to :func:`shared.safe_io.atomic_write_text` (task 3223, which
+        consolidated this repo's copies of the tmp+rename writer). The
+        arguments reproduce exactly what the previously-inlined body produced:
+        ``mkdir=True`` for the parent-dir create, ``mode=0o600`` matching the
+        :func:`tempfile.mkstemp` create, and no fsync.
+
+        Task 3223 reproduced the old inlined body's behaviour verbatim: a bare
+        ``os.fdopen(fd, 'w')``, which is locale-dependent, was preserved rather
+        than silently upgraded (that consolidation explicitly forbade changing
+        per-site encoding). Task 3387 fixed the resulting latent bug: this
+        payload is JSON (``record.to_json()``), and RFC 8259 requires JSON on
+        disk to be UTF-8 — under a non-UTF-8 locale this wrote bytes that THIS
+        CLASS'S OWN READER then rejects. Name it precisely, so the next
+        investigator does not go looking in the wrong module:
+        ``_read_or_raise`` raises ``CorruptLaneRecord`` (the decode error is a
+        ``UnicodeDecodeError``, a ``ValueError`` subclass, so it lands in that
+        method's ``except`` clause), which ``read()`` logs and maps to
+        ``None``, so ``all_records()`` then silently omits the lane. (An
+        earlier version of this paragraph cited
+        ``shared.safe_io.load_json_or_warn``; that helper never reads lane
+        records — its callers are ``b3_gate``, ``chronic_flake``,
+        ``landed_outbox`` and ``merge_queue_store``.)
+
+        ``encoding`` is now pinned ``'utf-8'`` at both halves of the
+        round-trip — here on write, and on ``_read_or_raise``'s ``read_text``
+        — regardless of the ambient locale.
+
+        Tracked as ticket ``tkt_0RRXRPD1EW9KP7JE2RDB0YXFWX``. That is a TICKET
+        id, not a task id — the curator resolves tickets to tasks
+        asynchronously, so do not search ``tasks.json`` for it and conclude it
+        is fake.
         """
-        path = self._record_path(lane)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        fd, tmp_path_str = tempfile.mkstemp(
-            suffix='.tmp', prefix=path.stem, dir=str(path.parent),
+        safe_io.atomic_write_text(
+            self._record_path(lane),
+            record.to_json(),
+            encoding='utf-8',
+            mode=0o600,
+            mkdir=True,
         )
-        try:
-            with os.fdopen(fd, 'w') as f:
-                f.write(record.to_json())
-            os.replace(tmp_path_str, str(path))
-        except Exception:
-            with contextlib.suppress(OSError):
-                os.unlink(tmp_path_str)
-            raise
 
     def transition(self, lane: Path | str, to: LaneState, **fields: object) -> LaneRecord:
         """The one mutator: validate (from, to), persist, return the new record.
@@ -332,7 +381,8 @@ class LaneLifecycle:
         escalation queue is wired) and raises ``IllegalLaneTransition``
         WITHOUT touching the on-disk record (PRD I2, never silent-heal). A
         corrupt record is never silently treated as a fresh, ``None``-origin
-        lane.
+        lane. The legal ``IN_USE -> ASSIGNED`` edge is refused the same way
+        when ``fields`` would change the record's ``task_id``.
 
         On a legal edge: merges **fields onto the current record (or an
         all-``None`` base if this is the first transition, or if the prior
@@ -369,6 +419,7 @@ class LaneLifecycle:
                 f'illegal lane transition for lane {Path(lane).name!r}: '
                 f'{current_state} -> {to}'
             )
+        self._refuse_in_use_rekey(lane, current, to, fields)
 
         record = LaneRecord(
             state=to,
@@ -376,7 +427,7 @@ class LaneLifecycle:
             title=current.title if current is not None else None,
             branch=current.branch if current is not None else None,
             seeded_from_sha=current.seeded_from_sha if current is not None else None,
-            updated_at=datetime.now(UTC).isoformat(),
+            updated_at=_now_stamp(),
         )
         for key, value in fields.items():
             setattr(record, key, value)
@@ -386,6 +437,44 @@ class LaneLifecycle:
 
         self._write(lane, record)
         return record
+
+    def _refuse_in_use_rekey(
+        self,
+        lane: Path | str,
+        current: LaneRecord | None,
+        to: LaneState,
+        fields: dict[str, object],
+    ) -> None:
+        """Escalate and raise when ``IN_USE -> ASSIGNED`` would change ``task_id``.
+
+        IN_USE marks a live child of the assignment it sits on, so its return
+        edge keeps that assignment; handing the lane to another task needs a
+        release first.
+        """
+        if current is None or (current.state, to) != (LaneState.IN_USE, LaneState.ASSIGNED):
+            return
+        new_task_id = fields.get('task_id', current.task_id)
+        if new_task_id == current.task_id:
+            return
+        lane_name = Path(lane).name
+        self._file_escalation(
+            lane,
+            summary=(
+                f'Refused re-key of IN_USE lane {lane_name!r}: task '
+                f'{current.task_id} -> {new_task_id}'
+            ),
+            detail=(
+                f'LaneLifecycle.transition refused IN_USE -> ASSIGNED for lane '
+                f'{lane_name!r} because it would change task_id from '
+                f'{current.task_id!r} to {new_task_id!r} while that task has a '
+                'live child in the lane. The durable record was left unchanged '
+                '(never silent-heal, PRD W11 I2).'
+            ),
+        )
+        raise IllegalLaneTransition(
+            f'lane {lane_name!r} is IN_USE for task {current.task_id!r}; '
+            f'refusing to re-key it to task {new_task_id!r}'
+        )
 
     def _file_escalation(self, lane: Path | str, *, summary: str, detail: str) -> None:
         """Best-effort born-at-L2 filer shared by the illegal-transition and
@@ -400,7 +489,7 @@ class LaneLifecycle:
         if self._escalation_queue is None:
             return
         try:
-            from escalation.models import Escalation  # noqa: PLC0415
+            from escalation.models import Escalation
 
             sentinel_task_id = f'lane-lifecycle-{Path(lane).name}'
             esc = Escalation(
@@ -451,7 +540,7 @@ class LaneLifecycle:
             ),
         )
 
-    async def quarantine(self, lane: Path | str, branch: str, reason: str) -> Path | None:
+    async def quarantine(self, lane: Path | str, branch: str, reason: str) -> QuarantineOutcome:
         """Delegate the git-side relocation, then record the QUARANTINED edge.
 
         Requires an injected ``quarantine_worktree`` callable (raises
@@ -475,9 +564,9 @@ class LaneLifecycle:
             raise RuntimeError(
                 'LaneLifecycle.quarantine: no quarantine_worktree callable wired'
             )
-        dest = await self._quarantine_worktree(lane, branch, reason)
+        outcome = await self._quarantine_worktree(lane, branch, reason)
         self.transition(lane, LaneState.QUARANTINED)
-        return dest
+        return outcome
 
     def note_assigned(
         self,
@@ -498,13 +587,16 @@ class LaneLifecycle:
 
         * Already ``ASSIGNED``/``IN_USE`` for the SAME ``task_id``: no-op —
           returns the existing record UNCHANGED, with no write at all
-          (idempotent).
+          (idempotent). It never restamps ``updated_at``; that is
+          ``refresh_assigned``'s job.
         * Already ``ASSIGNED``/``IN_USE`` for a DIFFERENT ``task_id`` (or any
           other state with no legal edge to ``ASSIGNED``): never steals,
-          never mutates — the final ``transition()`` call below raises
-          ``IllegalLaneTransition`` (propagated to the caller, NOT swallowed
-          — unlike the best-effort ``GitOps`` writer methods this mirrors)
-          and the durable record is left untouched.
+          never mutates — raises ``IllegalLaneTransition`` (propagated to the
+          caller, NOT swallowed — unlike the best-effort ``GitOps`` writer
+          methods this mirrors) and the durable record is left untouched.
+          ``transition()`` refuses both halves: the ``ASSIGNED`` one on the
+          table (``ASSIGNED -> ASSIGNED`` is illegal), the ``IN_USE`` one on
+          its re-key guard, because leaf δ made ``IN_USE -> ASSIGNED`` legal.
         * Current state ``QUARANTINED``: RECYCLED, not refused. Emits a LOUD
           ``WARNING`` (never silent-heal, PRD W11 I2), routes the ONE
           sanctioned ``QUARANTINED -> RELEASED`` recycle edge (which clears the
@@ -546,11 +638,7 @@ class LaneLifecycle:
         rec = self.read(lane)
         state = rec.state if rec is not None else None
 
-        if (
-            rec is not None
-            and state in (LaneState.ASSIGNED, LaneState.IN_USE)
-            and rec.task_id == task_id
-        ):
+        if _held_by(rec, task_id):
             return rec  # idempotent no-op; no I/O
 
         registered_fields = {'branch': branch} if branch is not None else {}
@@ -579,8 +667,8 @@ class LaneLifecycle:
             state = LaneState.RELEASED
         # REGISTERED/RELEASED (and a different-task ASSIGNED/IN_USE conflict)
         # fall straight through to the terminal edge below — transition()
-        # itself is the single legality gate, so a conflicting/illegal origin
-        # raises there.
+        # itself is the single gate: a different-task ASSIGNED origin raises
+        # on the table, a different-task IN_USE origin on its re-key guard.
 
         assigned_fields: dict[str, object] = {'task_id': task_id}
         if title is not None:
@@ -588,6 +676,114 @@ class LaneLifecycle:
         if branch is not None:
             assigned_fields['branch'] = branch
         return self.transition(lane, LaneState.ASSIGNED, **assigned_fields)
+
+    def note_in_use(self, lane: Path | str) -> bool:
+        """Best-effort ``ASSIGNED -> IN_USE``: a dark-factory child is live in *lane*.
+
+        Returns True when the record reads IN_USE afterwards; one already
+        IN_USE is a success with no write. Any other state (a benign race,
+        e.g. the lane was released while a child was finishing), a corrupt
+        or unreadable record, or a failed write returns False. Never raises:
+        unlike ``note_assigned``, which propagates, a liveness marker must
+        never abort the caller that is spawning the child.
+        """
+        rec = self._read_best_effort(lane)
+        if rec is not None and rec.state is LaneState.IN_USE:
+            return True
+        return self._best_effort_step(lane, rec, LaneState.ASSIGNED, LaneState.IN_USE)
+
+    def note_idle(self, lane: Path | str) -> bool:
+        """Best-effort ``IN_USE -> ASSIGNED``: the last live child left *lane*.
+
+        Same never-raise contract as ``note_in_use``; a record in any state
+        other than IN_USE, or a corrupt or unreadable one, is left alone and
+        False returned.
+        """
+        rec = self._read_best_effort(lane)
+        return self._best_effort_step(lane, rec, LaneState.IN_USE, LaneState.ASSIGNED)
+
+    def reset_stale_in_use(self, skip: Iterable[str] = ()) -> list[str]:
+        """Step every IN_USE record whose lane is not in *skip* back to ASSIGNED.
+
+        A crash mid-span leaves a record IN_USE forever, which after leaf ε
+        makes the lane permanently unreclaimable and re-creates the
+        2026-07-10 ENOSPC accretion. Run it at startup, or at any time with
+        *skip* naming the lanes that hold a live in-process span. Never
+        raises; returns the names of the lanes it reset, in lane-name order.
+        """
+        try:
+            lane_names = self._record_lane_names()
+        except OSError:
+            logger.warning(
+                'lane_lifecycle: could not scan %s for stale IN_USE records',
+                self.state_dir, exc_info=True,
+            )
+            return []
+        skipped = set(skip)
+        reset: list[str] = []
+        for lane_name in lane_names:
+            rec = self._read_best_effort(lane_name)
+            if rec is None or rec.state is not LaneState.IN_USE or lane_name in skipped:
+                continue
+            if self.note_idle(lane_name):
+                logger.info(
+                    'lane_lifecycle: reset stale IN_USE lane %s (task_id=%s) to assigned',
+                    lane_name, rec.task_id,
+                )
+                reset.append(lane_name)
+        return reset
+
+    def _read_best_effort(self, lane: Path | str) -> LaneRecord | None:
+        """``read()``, with an unreadable record file also mapped to ``None``."""
+        try:
+            return self.read(lane)
+        except OSError:
+            logger.warning(
+                'lane_lifecycle: could not read record for lane %s',
+                Path(lane).name, exc_info=True,
+            )
+            return None
+
+    def _best_effort_step(
+        self, lane: Path | str, rec: LaneRecord | None, origin: LaneState, to: LaneState,
+    ) -> bool:
+        lane_name = Path(lane).name
+        if rec is None or rec.state is not origin:
+            logger.debug(
+                'lane_lifecycle: lane %s is not %s (record: %s); not marking it %s',
+                lane_name, origin.value, rec, to.value,
+            )
+            return False
+        try:
+            self.transition(lane, to)
+        except (IllegalLaneTransition, OSError):
+            logger.warning(
+                'lane_lifecycle: failed to mark lane %s %s (task_id=%s)',
+                lane_name, to.value, rec.task_id, exc_info=True,
+            )
+            return False
+        return True
+
+    def refresh_assigned(self, lane: Path | str, *, task_id: str) -> LaneRecord:
+        """Restamp ``updated_at`` on a record *task_id* already holds.
+
+        ``updated_at`` is the activity clock warm-lane-gc.sh's record gate
+        reads (``--max-record-age-days``). This is the REUSE-dispatch stamp,
+        called only via ``WarmLanePool.refresh_assignment``. It is not a
+        transition: every other field is carried unchanged. A record that is
+        absent, unreadable, held by another task or in any other state raises
+        ``IllegalLaneTransition`` and is left untouched.
+        """
+        task_id = str(task_id)
+        rec = self.read(lane)
+        if not _held_by(rec, task_id):
+            raise IllegalLaneTransition(
+                f'refusing updated_at refresh for lane {Path(lane).name!r}: '
+                f'task_id={task_id!r} does not hold it (record={rec!r})'
+            )
+        refreshed = replace(rec, updated_at=_now_stamp())
+        self._write(lane, refreshed)
+        return refreshed
 
     def pool_storage_present(self) -> bool:
         """True iff worktree_base is backed by live pool storage (task 2099).
@@ -637,3 +833,36 @@ class LaneLifecycle:
                 self._worktree_base,
                 exc_info=True,
             )
+
+
+class LaneLiveness:
+    """In-process count of the live dark-factory children in each warm lane (leaf δ).
+
+    ``span`` holds a lane's durable record at IN_USE: every enter marks it,
+    so a span opened after a re-assignment is truthful, and only the exit of
+    the last live span marks it idle again. The edges themselves, and their
+    never-raise contract, are ``LaneLifecycle.note_in_use`` / ``note_idle``.
+    Counted per lane name, the identity a durable record is keyed by. Not
+    thread-safe: every span runs on the one asyncio loop, and nothing yields
+    between a count update and its record write.
+    """
+
+    def __init__(self) -> None:
+        self._depth: dict[str, int] = {}
+
+    @contextlib.contextmanager
+    def span(self, lane: Path, lifecycle: LaneLifecycle) -> Iterator[None]:
+        name = lane.name
+        self._depth[name] = self._depth.get(name, 0) + 1
+        try:
+            lifecycle.note_in_use(lane)
+            yield
+        finally:
+            self._depth[name] -= 1
+            if self._depth[name] == 0:
+                del self._depth[name]
+                lifecycle.note_idle(lane)
+
+    def live_lane_names(self) -> list[str]:
+        """Names of the lanes holding at least one live span."""
+        return list(self._depth)

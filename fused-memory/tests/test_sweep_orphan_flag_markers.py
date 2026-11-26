@@ -5,40 +5,42 @@ without sys.path pollution — mirrors the pattern in test_cleanup_count_snapsho
 """
 from __future__ import annotations
 
-import importlib.util
+import asyncio
+import json
 import logging
 import sys
 import types
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
+from _fm_helpers import load_script_module
+from _store_mutation_preflight_contract import (
+    SENTINEL,
+    deny,
+    fail_closed_records,
+    neutralise_fixture,
+)
+
+from fused_memory.reconciliation.mem0_tombstone import PROTECTED_AUDIT_KINDS
+from fused_memory.utils.store_mutation_preflight import StoreMutationUnavailable
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'sweep_orphan_flag_markers.py'
 
 
-def _load_module() -> types.ModuleType:
-    """Load sweep_orphan_flag_markers.py from its file path.
-
-    The module is registered in sys.modules under its name so that
-    reflection-based decorators work correctly.
-    """
-    mod_name = 'sweep_orphan_flag_markers'
-    spec = importlib.util.spec_from_file_location(mod_name, SCRIPT_PATH)
-    if spec is None or spec.loader is None:
-        raise ImportError(f'Cannot load {SCRIPT_PATH}')
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[mod_name] = module
-    try:
-        spec.loader.exec_module(module)  # type: ignore[union-attr]
-    except Exception:
-        sys.modules.pop(mod_name, None)
-        raise
-    return module
+_mod = load_script_module(SCRIPT_PATH, mod_name='sweep_orphan_flag_markers')
 
 
-_mod = _load_module()
+_neutralise = neutralise_fixture(
+    _mod,
+    note="""``run(..., apply=True)`` runs the preflight before it counts or
+    scrolls (task 4127). This suite is deliberately MOCK-unit (an AsyncMock
+    service, no live Qdrant). ``TestRunApplyStoreMutationPreflight`` re-rigs
+    this per test -- to refuse, to record, or to pass -- so the guard's own
+    behaviour is still pinned explicitly rather than assumed away.""",
+)
 
 
 # ===========================================================================
@@ -100,6 +102,161 @@ def _bothmissing(id: str) -> dict:
     but deleted exactly once when run() unions the two by id.
     """
     return _member(id, kind=None, task_id=None)
+
+
+def _mirror(id: str) -> dict:
+    """Member that is a protected cycle_summary ledger MIRROR (task 3041).
+
+    Isolates the first of ``is_protected_mirror_record``'s two independent
+    discriminators: ``kind == 'cycle_summary'``. Everything else about it
+    looks exactly like a sweepable marker (same ``source``, a valid numeric
+    ``task_id``, ``_member``'s default ``created_at``), which is the point —
+    the guard must key on the discriminator, not on the record looking odd.
+
+    Note this shape is ALSO caught by ``find_orphan_markers`` (its ``kind``
+    is not ``stage1_flag_marker``), so without the protected-mirror guard it
+    reaches the delete set through the ordinary orphan predicate.
+    """
+    return _member(id, kind='cycle_summary')
+
+
+def _ledger_stamp(id: str) -> dict:
+    """Member that is a protected ledger STAMP (task 3041).
+
+    Isolates the second discriminator: ``record_type == 'ledger_stamp'``,
+    while carrying a perfectly ordinary ``kind='stage1_flag_marker'`` and a
+    valid numeric ``task_id``. No automatic predicate catches this shape at
+    all — it reaches the delete set only via ``--delete-ids``, which is
+    precisely the case design_decision 2 says the guard must still refuse.
+    """
+    member = _member(id, kind='stage1_flag_marker')
+    member['metadata']['record_type'] = 'ledger_stamp'
+    return member
+
+
+def _audit(id: str, task_id: str = '452') -> dict:
+    """Member that is a deliberately-permanent AUDIT record (task 4375).
+
+    The motivating shape: 40 ``kind='cadence_check'`` records, every one
+    citing deferred task 452, were destroyed by a pure age-GC. Its kind comes
+    from ``PROTECTED_AUDIT_KINDS`` itself, so this fixture tracks the single
+    source of truth rather than a hand-typed copy of it.
+    """
+    return _member(id, kind=sorted(PROTECTED_AUDIT_KINDS)[0], task_id=task_id)
+
+
+def _foreign(id: str) -> dict:
+    """Member declaring a kind from some OTHER pool that nobody registered —
+    an audit kind its author never added to ``PROTECTED_AUDIT_KINDS``."""
+    return _member(id, kind='quarterly_audit_log')
+
+
+def _svc_with_ledger() -> tuple[AsyncMock, AsyncMock]:
+    """Build ``(memory_service, ledger)`` with a spyable ``recon_ledger``.
+
+    Ported from ``tests/test_mem0_tombstone.py::_svc_with_ledger`` (kept
+    local rather than imported, matching how this suite already keeps its own
+    member builders local). Gives the tombstone tests a direct read on the
+    written ``ReconLedgerRecord`` rows via
+    ``ledger.upsert_many.await_args.args[0]``, so ``deleter`` /
+    ``deleting_run_id`` / ``created_at`` are asserted on the actual row shape
+    an auditor reads rather than on a return count alone.
+    """
+    ledger = AsyncMock()
+    ledger.upsert_many = AsyncMock(return_value=None)
+    memory_service = AsyncMock()
+    memory_service.recon_ledger = ledger
+    return memory_service, ledger
+
+
+# ---------------------------------------------------------------------------
+# count_memories_by_metadata mock, keyed by FILTER rather than call ORDER
+# (task 3897 amendment, reviewer_comprehensive #4)
+#
+# run() counts three distinct filters — the source filter, the source+kind
+# filter, and the flag_for_stage2 census probe — repeating the first two
+# after an --apply delete pass. A positional `side_effect=[...]` list binds
+# every test to run()'s exact call order, so moving a count (e.g. issuing the
+# census probe after the scroll instead of before it) would silently feed the
+# 'after' count into the probe slot and vice versa, with the mis-wiring
+# surfacing only in production. Binding each mocked count to the filter it
+# ANSWERS removes that coupling, and makes an unexpected filter a loud
+# AssertionError rather than a silent mis-binding.
+# ---------------------------------------------------------------------------
+
+_SOURCE_FILTER = {'source': 'stage1_flag_marker'}
+_KIND_FILTER = {'source': 'stage1_flag_marker', 'kind': 'stage1_flag_marker'}
+_FLAG_FOR_STAGE2_FILTER = {'flag_for_stage2': True}
+
+
+def _filter_key(filters: dict | None) -> frozenset:
+    """Hashable identity of a metadata filter dict (order-insensitive)."""
+    return frozenset((filters or {}).items())
+
+
+def _counts(*, source: Any, kind: Any, flag_for_stage2: Any = 0) -> AsyncMock:
+    """Build a count_memories_by_metadata mock answering per filter.
+
+    Args:
+        source: Answer(s) for ``{'source': MARKER_SOURCE}``.
+        kind: Answer(s) for ``{'source': MARKER_SOURCE, 'kind': MARKER_KIND}``.
+        flag_for_stage2: Answer(s) for the ``{'flag_for_stage2': True}``
+            census probe (default 0 — the adjacent pool is irrelevant to
+            most tests).
+
+    Each value is either a scalar, answering every call on that filter, or a
+    LIST consumed in order — the shape an ``--apply`` run needs, where the
+    source/kind filters are counted twice (``before`` then ``after``), e.g.
+    ``source=[3, 1]``. Exhausting a list is a loud AssertionError, so an
+    unexpected extra count cannot pass silently. A value that is an exception
+    instance is RAISED rather than returned, which is how a failing census
+    probe is expressed.
+    """
+    queues: dict[frozenset, tuple[list, bool]] = {
+        _filter_key(spec_filter): (
+            (list(value), False) if isinstance(value, list) else ([value], True)
+        )
+        for spec_filter, value in (
+            (_SOURCE_FILTER, source),
+            (_KIND_FILTER, kind),
+            (_FLAG_FOR_STAGE2_FILTER, flag_for_stage2),
+        )
+    }
+
+    async def _count(*, project_id, filters, **_kwargs):
+        entry = queues.get(_filter_key(filters))
+        assert entry is not None, (
+            'count_memories_by_metadata called with an unexpected filter: '
+            f'{filters!r} — this mock answers the source, source+kind and '
+            'flag_for_stage2 filters only.'
+        )
+        values, is_constant = entry
+        assert values, (
+            f'count_memories_by_metadata called more times than the test '
+            f'supplied answers for filter {filters!r}.'
+        )
+        value = values[0] if is_constant else values.pop(0)
+        if isinstance(value, BaseException):
+            raise value
+        return value
+
+    return AsyncMock(side_effect=_count)
+
+
+def _probe_call(count_mock: AsyncMock):
+    """Return the single census-probe call made against *count_mock*.
+
+    Looked up BY FILTER, never by position, for the same reason :func:`_counts`
+    exists: a positional index would keep passing if the probe moved.
+    """
+    probe_calls = [
+        call for call in count_mock.call_args_list
+        if call.kwargs.get('filters') == _FLAG_FOR_STAGE2_FILTER
+    ]
+    assert len(probe_calls) == 1, (
+        f'Expected exactly one flag_for_stage2 census probe, got: {probe_calls!r}'
+    )
+    return probe_calls[0]
 
 
 # ===========================================================================
@@ -530,6 +687,293 @@ class TestFindTerminalTaskMarkers:
 
 
 # ===========================================================================
+# Tests: find_protected_markers (task 4435)
+# ===========================================================================
+
+class TestFindProtectedMarkers:
+    """Tests for the pure function find_protected_markers(members).
+
+    The script's half of the task-3041 protected-mirror guard: a thin,
+    order-preserving projection over
+    ``mem0_tombstone.is_protected_mirror_record``. A member it returns must
+    NEVER be deleted by this sweep.
+    """
+
+    def test_cycle_summary_mirror_is_returned(self):
+        """The kind=='cycle_summary' discriminator alone suffices."""
+        member = _mirror('m1')
+        result = _mod.find_protected_markers([member])
+        assert result == [member], f'Expected [m1], got: {result!r}'
+
+    def test_ledger_stamp_is_returned(self):
+        """The record_type=='ledger_stamp' discriminator alone suffices —
+        the predicate is an OR over two INDEPENDENT discriminators, not an
+        AND, so a record carrying only the second is protected too."""
+        member = _ledger_stamp('l1')
+        result = _mod.find_protected_markers([member])
+        assert result == [member], f'Expected [l1], got: {result!r}'
+
+    def test_ordinary_marker_shapes_are_never_returned(self):
+        """A well-formed marker, a kind-orphan and a taskless marker are all
+        sweepable — the guard must not over-protect the sweep's own targets."""
+        members = [_member('keep'), _orphan('o1'), _taskless('t1')]
+        result = _mod.find_protected_markers(members)
+        assert result == [], f'Expected [], got: {result!r}'
+
+    def test_preserves_order_and_identity(self):
+        """Returned dicts are the same objects, in input order, and only the
+        protected subset comes back from a mixed input."""
+        mirror = _mirror('m1')
+        stamp = _ledger_stamp('l1')
+        members = [_orphan('o1'), mirror, _member('keep'), stamp]
+        result = _mod.find_protected_markers(members)
+        assert result == [mirror, stamp], f'Expected [m1, l1], got: {result!r}'
+        assert result[0] is members[1], 'Expected same object identity'
+        assert result[1] is members[3], 'Expected same object identity'
+
+    def test_empty_input_returns_empty(self):
+        """Empty input list returns empty list."""
+        assert _mod.find_protected_markers([]) == []
+
+    @pytest.mark.parametrize('metadata', [None, ['not', 'a', 'dict'], 'string'])
+    def test_non_dict_metadata_is_not_protected_and_does_not_raise(self, metadata):
+        """A weird metadata payload is neither protected nor a crash.
+
+        The sweep runs against whatever Mem0 hands back, so the guard that
+        exists to make it SAFER must never be the thing that kills it.
+        """
+        member = {'id': 'weird', 'created_at': None, 'metadata': metadata}
+        assert _mod.find_protected_markers([member]) == []
+
+    def test_missing_metadata_key_is_not_protected_and_does_not_raise(self):
+        """A member with no 'metadata' key at all is handled, not raised on."""
+        member = {'id': 'nometa', 'created_at': None}
+        assert _mod.find_protected_markers([member]) == []
+
+    def test_audit_and_foreign_kind_records_are_returned(self):
+        """The audit and foreign-kind arms join the protected set (task 5286),
+        in input order and by object identity, beside the legacy shapes the
+        sweep still owns."""
+        audit = _audit('a1')
+        foreign = _foreign('f1')
+        assert audit['metadata']['kind'] in PROTECTED_AUDIT_KINDS
+        members = [_orphan('o1'), audit, _member('keep'), foreign]
+        result = _mod.find_protected_markers(members)
+        assert result == [audit, foreign], f'Expected [a1, f1], got: {result!r}'
+        assert result[0] is members[1], 'Expected same object identity'
+        assert result[1] is members[3], 'Expected same object identity'
+
+    def test_with_reasons_pairs_each_protected_member_with_its_arm(self):
+        """The attribution-preserving form returns the same members, each
+        paired with the arm protection_reason names for it."""
+        members = [_orphan('o1'), _mirror('m1'), _audit('a1'), _foreign('f1')]
+        pairs = _mod.find_protected_markers_with_reasons(members)
+        assert [member for member, _ in pairs] == _mod.find_protected_markers(members)
+        assert all(
+            paired is original for (paired, _), original in zip(pairs, members[1:], strict=True)
+        ), 'Expected same object identity'
+        assert [reason for _, reason in pairs] == [
+            _mod.ProtectionReason.CYCLE_SUMMARY_MIRROR,
+            _mod.ProtectionReason.PROTECTED_AUDIT_KIND,
+            _mod.ProtectionReason.FOREIGN_KIND,
+        ]
+
+
+class TestProtectionReason:
+    """protection_reason(metadata): WHICH guard withholds a record, if any.
+
+    The arms are checked in order mirror -> audit -> foreign-kind, and that
+    order IS the attribution: a record matching an earlier, specific arm is
+    never reported under a later, generic one.
+    """
+
+    @pytest.mark.parametrize('builder', [_mirror, _ledger_stamp])
+    def test_mirror_shapes_are_cycle_summary_mirror(self, builder):
+        member = builder('m1')
+        assert (
+            _mod.protection_reason(member['metadata'])
+            is _mod.ProtectionReason.CYCLE_SUMMARY_MIRROR
+        )
+
+    def test_audit_kind_is_attributed_to_the_audit_arm_not_foreign(self):
+        member = _audit('a1')
+        assert member['metadata']['kind'] in PROTECTED_AUDIT_KINDS
+        reason = _mod.protection_reason(member['metadata'])
+        assert reason is _mod.ProtectionReason.PROTECTED_AUDIT_KIND
+
+    @pytest.mark.parametrize('builder', [_foreign, _wrong_kind])
+    def test_unregistered_kind_is_foreign_kind(self, builder):
+        member = builder('f1')
+        assert (
+            _mod.protection_reason(member['metadata'])
+            is _mod.ProtectionReason.FOREIGN_KIND
+        )
+
+    @staticmethod
+    def _explicit_none_kind(id: str) -> dict:
+        member = _member(id)
+        member['metadata']['kind'] = None
+        return member
+
+    @pytest.mark.parametrize(
+        'builder',
+        [_member, _orphan, _taskless, _explicit_none_kind.__func__],
+        ids=['marker', 'kind_missing', 'taskless', 'kind_none'],
+    )
+    def test_legacy_marker_shapes_are_unprotected(self, builder):
+        """Kind absent or MARKER_KIND is exactly the pool this sweep owns."""
+        member = builder('keep')
+        assert _mod.protection_reason(member['metadata']) is None
+
+    @pytest.mark.parametrize('metadata', [None, ['not', 'a', 'dict'], 'string'])
+    def test_non_dict_metadata_is_unprotected_and_does_not_raise(self, metadata):
+        assert _mod.protection_reason(metadata) is None
+
+    @pytest.mark.parametrize(
+        'kind', [['cadence_check'], {'nested': 'cadence_check'}],
+        ids=['list_kind', 'dict_kind'],
+    )
+    def test_unhashable_kind_is_foreign_and_does_not_raise(self, kind):
+        """The unhashable-kind payload is_protected_audit_record guards
+        against: still withheld, never a TypeError."""
+        metadata = {'source': 'stage1_flag_marker', 'task_id': '1', 'kind': kind}
+        assert (
+            _mod.protection_reason(metadata)
+            is _mod.ProtectionReason.FOREIGN_KIND
+        )
+
+
+# ===========================================================================
+# Tests: find_undrainable_markers (task 4436)
+# ===========================================================================
+
+class TestFindUndrainableMarkers:
+    """Tests for the pure function find_undrainable_markers(members, drained_ids).
+
+    The PERMANENT floor on ``after.total_source``: the enumerated members no
+    invocation of this sweep can ever drain, minus the ones this run's delete
+    set already covers. Two structurally different arms compose it — the
+    UNDATED arm (``find_undated_markers``; invocation-relative, because
+    ``--delete-ids``/``--terminal-drain`` can still reach it) and the
+    PROTECTED arm (``find_protected_markers``; absolute, refused
+    unconditionally at the delete choke point even against ``--delete-ids``).
+    """
+
+    @staticmethod
+    def _undated(id: str, created_at: str | None = None) -> dict:
+        """Build an undated member with a valid kind and non-terminal task_id.
+
+        Mirrors ``TestFindUndatedMarkers._dated``: ``_member``'s hardcoded
+        ``created_at='2026-01-01T00:00:00Z'`` is always dated, so the undated
+        shapes are built by hand. Carries kind+task_id so no OTHER predicate
+        catches it — isolating the undated dimension.
+        """
+        member: dict = {
+            'id': id,
+            'metadata': {
+                'source': 'stage1_flag_marker',
+                'kind': 'stage1_flag_marker',
+                'task_id': '9001',
+            },
+        }
+        if created_at is not None:
+            member['created_at'] = created_at
+        return member
+
+    def test_missing_created_at_and_undrained_is_returned(self):
+        """(a) A member with no created_at key that this run does not delete
+        floors the backlog."""
+        member = self._undated('missing1')
+        result = _mod.find_undrainable_markers([member], set())
+        assert result == [member], f'Expected [missing1], got: {result!r}'
+
+    def test_none_created_at_and_undrained_is_returned(self):
+        """(b) created_at explicitly None is undated, hence floor."""
+        member = self._undated('none1')
+        member['created_at'] = None
+        result = _mod.find_undrainable_markers([member], set())
+        assert result == [member], f'Expected [none1], got: {result!r}'
+
+    def test_unparseable_created_at_and_undrained_is_returned(self):
+        """(c) An unparseable created_at is undated, hence floor."""
+        member = self._undated('bad1', created_at='not-a-date')
+        result = _mod.find_undrainable_markers([member], set())
+        assert result == [member], f'Expected [bad1], got: {result!r}'
+
+    def test_undated_but_drained_is_not_returned(self):
+        """(d) THE UNDATED KEY CASE — a member the delete set already covers
+        sets NO floor, however undated it is.
+
+        This is why ``undated_kept_count`` is the wrong number to key a
+        constraint on: ``find_orphan_markers`` / ``find_taskless_markers`` /
+        ``find_terminal_task_markers`` never consult ``created_at``, so an
+        undated member any of them catches IS drained this run.
+        """
+        member = self._undated('drained1')
+        result = _mod.find_undrainable_markers([member], {'drained1'})
+        assert result == [], f'Expected [] (already drained), got: {result!r}'
+
+    def test_dated_protected_members_are_returned(self):
+        """(e) THE PROTECTED ARM — fully DATED protected records floor the
+        backlog even though ``find_undated_markers`` returns neither.
+
+        The protected-mirror guard refuses them at every age and under every
+        flag, so they are undrainable in a strictly stronger sense than an
+        undated member is.
+        """
+        mirror = _mirror('m1')
+        stamp = _ledger_stamp('l1')
+        assert _mod.find_undated_markers([mirror, stamp]) == [], (
+            'Fixture drift: the protected arm must be exercised by DATED members'
+        )
+        result = _mod.find_undrainable_markers([mirror, stamp], set())
+        assert result == [mirror, stamp], f'Expected [m1, l1], got: {result!r}'
+
+    def test_protected_member_is_returned_even_when_in_drained_ids(self):
+        """(f) The protected arm does not depend on the caller having
+        subtracted protected members from its delete set first.
+
+        ``run()`` does subtract them, so this state is unreachable there —
+        which is exactly why the predicate must not TRUST that it happened.
+        """
+        mirror = _mirror('m1')
+        result = _mod.find_undrainable_markers([mirror], {'m1'})
+        assert result == [mirror], f'Expected [m1], got: {result!r}'
+
+    @pytest.mark.parametrize('drained_ids', [set(), {'keep'}])
+    def test_ordinary_dated_member_is_never_returned(self, drained_ids):
+        """(g) A dated, kinded, task_id-carrying marker floors nothing,
+        in or out of the delete set."""
+        member = _member('keep')
+        result = _mod.find_undrainable_markers([member], drained_ids)
+        assert result == [], f'Expected [], got: {result!r}'
+
+    def test_undated_and_protected_member_appears_exactly_once(self):
+        """(h) The two arms are an id-deduplicated UNION, not a concatenation."""
+        both = _mirror('both1')
+        del both['created_at']
+        assert _mod.find_undated_markers([both]) == [both], 'Fixture drift: not undated'
+        assert _mod.find_protected_markers([both]) == [both], 'Fixture drift: not protected'
+        result = _mod.find_undrainable_markers([both], set())
+        assert result == [both], f'Expected exactly one [both1], got: {result!r}'
+
+    def test_empty_input_returns_empty(self):
+        """(i) Empty input list returns empty list."""
+        assert _mod.find_undrainable_markers([], set()) == []
+
+    def test_preserves_order_and_identity(self):
+        """(j) Returned dicts are the same objects, in scroll order —
+        matching TestFindUndatedMarkers.test_preserves_order_and_identity."""
+        undated = self._undated('u1')
+        stamp = _ledger_stamp('l1')
+        members = [_orphan('o1'), undated, _member('keep'), stamp]
+        result = _mod.find_undrainable_markers(members, set())
+        assert result == [undated, stamp], f'Expected [u1, l1], got: {result!r}'
+        assert result[0] is members[1], 'Expected same object identity'
+        assert result[1] is members[3], 'Expected same object identity'
+
+
+# ===========================================================================
 # Tests: delete_orphan_markers
 # ===========================================================================
 
@@ -597,6 +1041,320 @@ class TestDeleteOrphanMarkers:
 
 
 # ===========================================================================
+# Tests: delete_orphan_markers protected-mirror guard (task 4435)
+# ===========================================================================
+
+class TestDeleteOrphanMarkersProtectedMirrorGuard:
+    """The protected-mirror guard at the DELETE CHOKE POINT (task 3041/4435).
+
+    Exercised through ``delete_orphan_markers`` called DIRECTLY, never via
+    ``run``. That is the whole point: ``run`` pre-partitions the union for
+    REPORTING, but the enforcement has to sit here, where every current and
+    future caller inherits it — including any caller that never consults
+    ``find_protected_markers`` at all. ``delete_orphan_markers`` is a public
+    module-level coroutine with its own direct tests, so a guard that lived
+    only in ``run`` would leave it able to destroy a mirror.
+    """
+
+    @pytest.mark.asyncio
+    async def test_protected_members_are_never_deleted(self):
+        """Only the unprotected members reach delete_memory."""
+        memory_service = AsyncMock()
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        orphans = [_orphan('o1'), _mirror('m1'), _ledger_stamp('l1'), _orphan('o2')]
+        result = await _mod.delete_orphan_markers(
+            memory_service, 'dark_factory', orphans,
+        )
+
+        assert memory_service.delete_memory.await_count == 2, (
+            'Expected exactly two deletes (o1, o2), got: '
+            f'{memory_service.delete_memory.call_args_list!r}'
+        )
+        called_ids = {
+            c.kwargs.get('memory_id')
+            for c in memory_service.delete_memory.call_args_list
+        }
+        assert called_ids == {'o1', 'o2'}, f'Unexpected delete set: {called_ids!r}'
+        # Belt and braces: the protected ids appear in NO call at all.
+        assert 'm1' not in repr(memory_service.delete_memory.call_args_list)
+        assert 'l1' not in repr(memory_service.delete_memory.call_args_list)
+
+        assert result['deleted'] == 2
+        assert result['failed'] == []
+        assert result['protected_skipped'] == ['m1', 'l1'], (
+            'protected_skipped must be order-preserving per the input, got: '
+            f"{result['protected_skipped']!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_each_skip_is_logged_at_warning(self, caplog):
+        """A skip is never silent: one WARNING per protected member, naming it.
+
+        Reaching this guard means the caller's delete set was over-broad, so
+        an operator must be able to see WHICH record was refused.
+        """
+        memory_service = AsyncMock()
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        orphans = [_orphan('o1'), _mirror('m1'), _ledger_stamp('l1')]
+        with caplog.at_level(logging.WARNING, logger='sweep_orphan_flag_markers'):
+            await _mod.delete_orphan_markers(
+                memory_service, 'dark_factory', orphans,
+            )
+
+        warnings = [
+            r for r in caplog.records
+            if r.name == 'sweep_orphan_flag_markers' and r.levelno == logging.WARNING
+        ]
+        for protected_id in ('m1', 'l1'):
+            matching = [r for r in warnings if protected_id in r.getMessage()]
+            assert len(matching) == 1, (
+                f'Expected exactly one WARNING naming {protected_id!r}, got: '
+                f'{[r.getMessage() for r in warnings]!r}'
+            )
+
+    @pytest.mark.asyncio
+    async def test_all_protected_input_performs_zero_deletes(self):
+        """An entirely-protected delete set deletes nothing and does not raise."""
+        memory_service = AsyncMock()
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        result = await _mod.delete_orphan_markers(
+            memory_service, 'dark_factory', [_mirror('m1')],
+        )
+
+        memory_service.delete_memory.assert_not_awaited()
+        assert result['deleted'] == 0
+        assert result['failed'] == []
+        assert result['protected_skipped'] == ['m1']
+
+    @pytest.mark.asyncio
+    async def test_protected_skipped_key_is_always_present(self):
+        """Callers must never need a .get fallback — including on the
+        empty-input fast path, which returns before the guard runs."""
+        memory_service = AsyncMock()
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        empty = await _mod.delete_orphan_markers(memory_service, 'dark_factory', [])
+        assert empty['protected_skipped'] == []
+
+        unprotected = await _mod.delete_orphan_markers(
+            memory_service, 'dark_factory', [_orphan('o1')],
+        )
+        assert unprotected['protected_skipped'] == []
+
+
+# ===========================================================================
+# Tests: delete_orphan_markers writes task-3041 tombstones (task 4435)
+# ===========================================================================
+
+class TestDeleteOrphanMarkersWritesTombstones:
+    """Every confirmed delete leaves the task-3041 audit trail behind it.
+
+    Without this, an operator chasing a broken memory-id reference cannot
+    distinguish a record this sweep reaped from silent data loss — and
+    ``delete_orphan_markers``' deletes are permanent, so there is no later
+    cycle that would reconstruct the answer.
+    """
+
+    @staticmethod
+    def _rows(ledger: AsyncMock) -> list:
+        """The ReconLedgerRecord rows of the single batch write."""
+        return list(ledger.upsert_many.await_args.args[0])
+
+    @pytest.mark.asyncio
+    async def test_one_batch_carries_every_victim_in_input_order(self):
+        """ONE upsert_many for the whole sweep (not one per victim), whose
+        rows' task_id fields are the victims' Mem0 uuids in input order."""
+        memory_service, ledger = _svc_with_ledger()
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        await _mod.delete_orphan_markers(
+            memory_service, 'dark_factory', [_orphan('o1'), _orphan('o2')],
+        )
+
+        assert ledger.upsert_many.await_count == 1, (
+            'Expected exactly one ledger transaction for the whole sweep, got '
+            f'{ledger.upsert_many.await_count}'
+        )
+        rows = self._rows(ledger)
+        assert [r.task_id for r in rows] == ['o1', 'o2'], (
+            f'Unexpected tombstone rows: {[r.task_id for r in rows]!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_payload_records_this_sweep_as_the_deleter(self):
+        """deleter is the same string delete_memory is passed as _source, and
+        created_at is the VICTIM's own created_at, not the tombstone's."""
+        memory_service, ledger = _svc_with_ledger()
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        victim = _orphan('o1')
+        await _mod.delete_orphan_markers(
+            memory_service, 'dark_factory', [victim],
+        )
+
+        payload = json.loads(self._rows(ledger)[0].payload_json)
+        assert payload['deleter'] == 'sweep_orphan_flag_markers'
+        assert payload['created_at'] == victim['created_at']
+
+    @pytest.mark.asyncio
+    async def test_deleting_run_id_is_the_causation_id_when_supplied(self):
+        """The tombstone's run id and the write journal's causation id name
+        the same thing, which is what makes the two cross-referenceable."""
+        memory_service, ledger = _svc_with_ledger()
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        await _mod.delete_orphan_markers(
+            memory_service, 'dark_factory', [_orphan('o1')],
+            causation_id='sweep-run-1',
+        )
+
+        payload = json.loads(self._rows(ledger)[0].payload_json)
+        assert payload['deleting_run_id'] == 'sweep-run-1'
+
+    @pytest.mark.asyncio
+    async def test_deleting_run_id_is_empty_string_without_a_causation_id(self):
+        """A manual/nightly sweep genuinely has no reconciliation run, so ''
+        is the honest value — and matches the ledger row's own run_id default."""
+        memory_service, ledger = _svc_with_ledger()
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        await _mod.delete_orphan_markers(
+            memory_service, 'dark_factory', [_orphan('o1')],
+        )
+
+        payload = json.loads(self._rows(ledger)[0].payload_json)
+        assert payload['deleting_run_id'] == ''
+
+    @pytest.mark.asyncio
+    async def test_a_failed_delete_is_never_tombstoned(self):
+        """ORDERING CONTRACT: a tombstone must never claim a record that is
+        still alive, so only the SUCCEEDING victim is written."""
+        memory_service, ledger = _svc_with_ledger()
+        memory_service.delete_memory = AsyncMock(
+            side_effect=[RuntimeError('boom'), None]
+        )
+
+        result = await _mod.delete_orphan_markers(
+            memory_service, 'dark_factory', [_orphan('o1'), _orphan('o2')],
+        )
+
+        rows = self._rows(ledger)
+        assert len(rows) == 1, f'Expected only the succeeding victim: {rows!r}'
+        assert rows[0].task_id == 'o2'
+        assert result['deleted'] == 1
+        assert result['failed'] == ['o1']
+        assert result['tombstoned'] == 1
+
+    @pytest.mark.asyncio
+    async def test_tombstoned_count_is_reported(self):
+        """The returned dict reports how many rows were actually written."""
+        memory_service, ledger = _svc_with_ledger()
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        result = await _mod.delete_orphan_markers(
+            memory_service, 'dark_factory', [_orphan('o1'), _orphan('o2')],
+        )
+
+        assert result['tombstoned'] == 2
+        assert result['tombstoned'] == len(self._rows(ledger))
+
+    @pytest.mark.asyncio
+    async def test_zero_successful_deletes_writes_no_batch_at_all(self):
+        """An all-failing sweep must not open a ledger transaction it has
+        nothing to put in."""
+        memory_service, ledger = _svc_with_ledger()
+        memory_service.delete_memory = AsyncMock(
+            side_effect=[RuntimeError('boom'), RuntimeError('boom')]
+        )
+
+        result = await _mod.delete_orphan_markers(
+            memory_service, 'dark_factory', [_orphan('o1'), _orphan('o2')],
+        )
+
+        ledger.upsert_many.assert_not_awaited()
+        assert result['deleted'] == 0
+        assert result['tombstoned'] == 0
+
+
+# ===========================================================================
+# Tests: the tombstone write can never break the sweep it accounts for
+# (task 4435)
+# ===========================================================================
+
+class TestTombstoneWriteIsFailSafe:
+    """The tombstone is an audit ADJUNCT to the delete, never a gate on it.
+
+    A deployment with no ``recon_ledger`` wired, a ledger that is down, or a
+    helper someone patched must all degrade to "records deleted, audit trail
+    missing, said out loud" — never to a raise that turns a successful sweep
+    into a fatal error, and never to a ``deleted`` count the caller cannot
+    trust.
+    """
+
+    @staticmethod
+    async def _run_two_deletes(memory_service) -> dict:
+        return await _mod.delete_orphan_markers(
+            memory_service, 'dark_factory', [_orphan('o1'), _orphan('o2')],
+        )
+
+    @pytest.mark.asyncio
+    async def test_no_ledger_wired_still_deletes(self):
+        """recon_ledger=None: no raise, deletes still counted, tombstoned 0."""
+        memory_service = AsyncMock()
+        memory_service.recon_ledger = None
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        result = await self._run_two_deletes(memory_service)
+
+        assert result['deleted'] == 2
+        assert result['tombstoned'] == 0
+
+    @pytest.mark.asyncio
+    async def test_a_raising_ledger_does_not_break_the_sweep(self):
+        """A down ledger exercises record_mem0_deletion_tombstones' OWN
+        internal fail-safe: it absorbs the error and returns 0."""
+        memory_service, ledger = _svc_with_ledger()
+        ledger.upsert_many = AsyncMock(side_effect=RuntimeError('ledger down'))
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        result = await self._run_two_deletes(memory_service)
+
+        assert result['deleted'] == 2
+        assert result['tombstoned'] == 0
+
+    @pytest.mark.asyncio
+    async def test_a_raising_helper_is_caught_by_the_second_belt(self, caplog):
+        """SECOND BELT: the helper is internally fail-safe already, so this
+        arm rigs a PATCHED/broken one that raises anyway — the only arm that
+        reaches the sweep's own try/except. It must not raise, must not alter
+        the count, and must say so out loud.
+        """
+        memory_service, _ledger = _svc_with_ledger()
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        async def _boom(*_args, **_kwargs):
+            raise RuntimeError('patched helper exploded')
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(_mod, 'record_mem0_deletion_tombstones', _boom)
+            with caplog.at_level(
+                logging.WARNING, logger='sweep_orphan_flag_markers'
+            ):
+                result = await self._run_two_deletes(memory_service)
+
+        assert result['deleted'] == 2
+        assert result['tombstoned'] == 0
+        # Level and existence only, never message prose (repo norm, task 3799).
+        assert any(
+            r.name == 'sweep_orphan_flag_markers' and r.levelno == logging.WARNING
+            for r in caplog.records
+        ), f'Expected a WARNING from the sweep logger, got: {caplog.records!r}'
+
+
+# ===========================================================================
 # Tests: run()
 # ===========================================================================
 
@@ -629,7 +1387,7 @@ class TestRun:
         """
         memory_service = AsyncMock()
         # count_memories_by_metadata: total=3, total+kind=1  (so 2 orphans by count)
-        memory_service.count_memories_by_metadata = AsyncMock(side_effect=[3, 1])
+        memory_service.count_memories_by_metadata = _counts(source=3, kind=1)
         # get_memories_by_metadata returns 1 valid + 2 orphans
         memory_service.get_memories_by_metadata = AsyncMock(return_value=[
             _member('v1'),
@@ -657,9 +1415,7 @@ class TestRun:
         memory_service = AsyncMock()
         # before: total=3, kind=1 → 2 orphans by count
         # after: total=1, kind=1 → 0 orphans
-        memory_service.count_memories_by_metadata = AsyncMock(
-            side_effect=[3, 1, 1, 1]
-        )
+        memory_service.count_memories_by_metadata = _counts(source=[3, 1], kind=[1, 1])
         memory_service.get_memories_by_metadata = AsyncMock(return_value=[
             _member('v1'),
             _orphan('o1'),
@@ -684,9 +1440,7 @@ class TestRun:
         """
         memory_service = AsyncMock()
         # before: total=3, kind=1 → 2 orphans by count; after: total=2, kind=1 → 1 residual
-        memory_service.count_memories_by_metadata = AsyncMock(
-            side_effect=[3, 1, 2, 1]
-        )
+        memory_service.count_memories_by_metadata = _counts(source=[3, 2], kind=[1, 1])
         memory_service.get_memories_by_metadata = AsyncMock(return_value=[
             _member('v1'),
             _orphan('o1'),   # this delete will fail
@@ -720,7 +1474,7 @@ class TestRun:
         semantic search (memory_service.search) is never called.
         """
         memory_service = AsyncMock()
-        memory_service.count_memories_by_metadata = AsyncMock(return_value=0)
+        memory_service.count_memories_by_metadata = _counts(source=0, kind=0)
         memory_service.get_memories_by_metadata = AsyncMock(return_value=[])
         memory_service.search = AsyncMock()
 
@@ -754,7 +1508,7 @@ class TestRun:
 
         # --- Dry run: verify enumeration/report shape ---
         dry_service = AsyncMock()
-        dry_service.count_memories_by_metadata = AsyncMock(side_effect=[4, 2])
+        dry_service.count_memories_by_metadata = _counts(source=4, kind=2)
         dry_service.get_memories_by_metadata = AsyncMock(return_value=members)
         dry_service.delete_memory = AsyncMock(return_value=None)
 
@@ -773,7 +1527,7 @@ class TestRun:
 
         # --- Apply: verify delete fan-out is deduped by id ---
         apply_service = AsyncMock()
-        apply_service.count_memories_by_metadata = AsyncMock(side_effect=[4, 2, 1, 1])
+        apply_service.count_memories_by_metadata = _counts(source=[4, 1], kind=[2, 1])
         apply_service.get_memories_by_metadata = AsyncMock(return_value=members)
         apply_service.delete_memory = AsyncMock(return_value=None)
 
@@ -819,7 +1573,7 @@ class TestRun:
 
         # --- Dry run ---
         dry_service = AsyncMock()
-        dry_service.count_memories_by_metadata = AsyncMock(side_effect=[5, 3])
+        dry_service.count_memories_by_metadata = _counts(source=5, kind=3)
         dry_service.get_memories_by_metadata = AsyncMock(return_value=members)
         dry_service.delete_memory = AsyncMock(return_value=None)
 
@@ -841,7 +1595,7 @@ class TestRun:
 
         # --- Apply: overlap1 (stale AND terminal) deleted exactly once ---
         apply_service = AsyncMock()
-        apply_service.count_memories_by_metadata = AsyncMock(side_effect=[5, 3, 1, 1])
+        apply_service.count_memories_by_metadata = _counts(source=[5, 1], kind=[3, 1])
         apply_service.get_memories_by_metadata = AsyncMock(return_value=members)
         apply_service.delete_memory = AsyncMock(return_value=None)
 
@@ -888,7 +1642,7 @@ class TestRun:
         members = [dated_stale, undated_missing, undated_bad]
 
         memory_service = AsyncMock()
-        memory_service.count_memories_by_metadata = AsyncMock(side_effect=[3, 3])
+        memory_service.count_memories_by_metadata = _counts(source=3, kind=3)
         memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
         memory_service.delete_memory = AsyncMock(return_value=None)
 
@@ -917,7 +1671,7 @@ class TestRun:
         members = [valid_fresh]
 
         memory_service = AsyncMock()
-        memory_service.count_memories_by_metadata = AsyncMock(side_effect=[1, 1])
+        memory_service.count_memories_by_metadata = _counts(source=1, kind=1)
         memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
         memory_service.delete_memory = AsyncMock(return_value=None)
 
@@ -932,6 +1686,275 @@ class TestRun:
         assert not any(
             'missing/unparseable created_at' in record.message for record in caplog.records
         )
+
+    # -----------------------------------------------------------------
+    # cross_check census block (task 3897)
+    #
+    # run() issues an additional count_memories_by_metadata call — the
+    # flag_for_stage2 census probe. These tests answer it through _counts()'s
+    # `flag_for_stage2=` argument and look the call itself up via
+    # _probe_call(), both keyed by FILTER, so nothing here depends on where
+    # in run()'s sequence the probe is issued.
+    # -----------------------------------------------------------------
+
+    _BLIND_SPOT_MSG = 'flag_for_stage2'
+
+    def _blind_spot_warnings(self, caplog) -> list:
+        """Return the WARNING records that are the blind-spot warning."""
+        return [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING
+            and r.name == 'sweep_orphan_flag_markers'
+            and self._BLIND_SPOT_MSG in r.message
+        ]
+
+    @pytest.mark.asyncio
+    async def test_cross_check_reports_blind_spot_on_live_dark_factory_shape(self, caplog):
+        """The live 2026-08-09 dark_factory shape: the source enumeration
+        matches 0 while 61 flag_for_stage2 records exist -> blind_spot True.
+
+        This is the exact false all-clear task 3897 exists to make loud:
+        before.total_source == 0 makes backlog_verdict hold unconditionally,
+        so without this block the run reads as a clean bill of health.
+        """
+        memory_service = AsyncMock()
+        memory_service.count_memories_by_metadata = _counts(source=0, kind=0, flag_for_stage2=61)
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=[])
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        with caplog.at_level(logging.WARNING, logger='sweep_orphan_flag_markers'):
+            report = await _mod.run(
+                self._args(apply=False), memory_service, now=self._NEUTRAL_NOW,
+            )
+
+        assert report['cross_check'] == {
+            'source_total': 0,
+            'flag_for_stage2_total': 61,
+            'blind_spot': True,
+            'probe_failed': False,
+        }
+
+        # The probe must use the boolean-typed adjacent filter and the same
+        # project as the sweep — a probe against a different project would
+        # compare two unrelated populations. Located by filter, not by call
+        # index (see _probe_call).
+        probe_call = _probe_call(memory_service.count_memories_by_metadata)
+        assert probe_call.kwargs['filters'] == {'flag_for_stage2': True}
+        assert probe_call.kwargs['project_id'] == 'dark_factory'
+
+        warnings = self._blind_spot_warnings(caplog)
+        assert warnings, (
+            'Expected a blind-spot WARNING, got: '
+            f'{[r.message for r in caplog.records]}'
+        )
+        # The warning must name BOTH counts, or an operator cannot tell how
+        # large the unseen population is. Asserted on the SUBSTITUTED values
+        # and on distinctive rendered fragments, not on `'0' in text` — the
+        # template hardcodes the literal '0 swept', so a bare substring check
+        # for '0' is self-satisfying and would stay green even if run()
+        # logged the wrong count in that slot. (One substitution stays
+        # inherently unfalsifiable here: in any GENUINE blind spot the
+        # source+kind count is necessarily 0 too, since it filters a strict
+        # subset of the source population. What these assertions do pin is
+        # the slot ORDER and the rendering — a swap of the two counts fails
+        # them.)
+        assert warnings[0].args[1:3] == (0, 61), (
+            'Expected the enumerated (0) and adjacent (61) counts as the '
+            f'logged args, got: {warnings[0].args!r}'
+        )
+        text = warnings[0].getMessage()
+        assert 'matched 0 records' in text, (
+            f'Expected the rendered enumerated count, got: {text!r}'
+        )
+        assert 'population of 61 records' in text, (
+            f'Expected the rendered adjacent count, got: {text!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_cross_check_no_blind_spot_when_enumeration_sees_its_pool(self, caplog):
+        """A non-zero source enumeration is not a blind spot, even when an
+        adjacent flag_for_stage2 population also exists.
+
+        Both pools being non-empty is the healthy steady state; warning here
+        would make the signal noise.
+        """
+        memory_service = AsyncMock()
+        memory_service.count_memories_by_metadata = _counts(source=3, kind=3, flag_for_stage2=61)
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=[
+            _member('v1'), _member('v2'), _member('v3'),
+        ])
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        with caplog.at_level(logging.WARNING, logger='sweep_orphan_flag_markers'):
+            report = await _mod.run(
+                self._args(apply=False), memory_service, now=self._NEUTRAL_NOW,
+            )
+
+        assert report['cross_check'] == {
+            'source_total': 3,
+            'flag_for_stage2_total': 61,
+            'blind_spot': False,
+            'probe_failed': False,
+        }
+        assert not self._blind_spot_warnings(caplog)
+
+    @pytest.mark.asyncio
+    async def test_cross_check_true_no_op_is_not_a_blind_spot(self, caplog):
+        """Nothing enumerated AND nothing adjacent is a genuine no-op.
+
+        This is the case that must stay silent, or every clean run warns and
+        operators learn to ignore the warning.
+        """
+        memory_service = AsyncMock()
+        memory_service.count_memories_by_metadata = _counts(source=0, kind=0, flag_for_stage2=0)
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=[])
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        with caplog.at_level(logging.WARNING, logger='sweep_orphan_flag_markers'):
+            report = await _mod.run(
+                self._args(apply=False), memory_service, now=self._NEUTRAL_NOW,
+            )
+
+        assert report['cross_check'] == {
+            'source_total': 0,
+            'flag_for_stage2_total': 0,
+            'blind_spot': False,
+            'probe_failed': False,
+        }
+        assert not self._blind_spot_warnings(caplog)
+
+    # -----------------------------------------------------------------
+    # cross_check probe is fail-safe (task 3897)
+    #
+    # The census probe is a DIAGNOSTIC. It must never abort the sweep, never
+    # alter the delete set, and never assert a blind spot it did not
+    # actually observe. Mirrors the posture of
+    # task_knowledge_sync._warn_on_flag_for_stage2_type_drift.
+    # -----------------------------------------------------------------
+
+    def _members_for_failsafe(self) -> list[dict]:
+        """Two orphans + one valid member — a delete set the probe must not perturb."""
+        return [_member('v1'), _orphan('o1'), _orphan('o2')]
+
+    @pytest.mark.asyncio
+    async def test_probe_failure_does_not_raise_and_marks_probe_failed(self, caplog):
+        """A raising census probe degrades to 'unknown', never a crash.
+
+        blind_spot must be False, not True: an unobserved population is not
+        an observed blind spot, and a diagnostic that invents findings when
+        it fails is worse than one that stays silent.
+        """
+        memory_service = AsyncMock()
+        memory_service.count_memories_by_metadata = _counts(
+            source=3, kind=1, flag_for_stage2=RuntimeError('qdrant down'),
+        )
+        memory_service.get_memories_by_metadata = AsyncMock(
+            return_value=self._members_for_failsafe()
+        )
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        with caplog.at_level(logging.WARNING, logger='sweep_orphan_flag_markers'):
+            report = await _mod.run(
+                self._args(apply=False), memory_service, now=self._NEUTRAL_NOW,
+            )
+
+        assert report['cross_check'] == {
+            'source_total': 3,
+            'flag_for_stage2_total': None,
+            'blind_spot': False,
+            'probe_failed': True,
+        }
+
+        # A failed probe must carry a stack trace, or a genuine wiring bug is
+        # indistinguishable in the journal from a transient backend blip.
+        failed_probe_records = [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING and r.exc_info is not None
+        ]
+        assert failed_probe_records, (
+            'Expected a WARNING with exc_info for the failed probe, got: '
+            f'{[(r.message, r.exc_info) for r in caplog.records]}'
+        )
+        assert 'RuntimeError' in caplog.text and 'qdrant down' in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_probe_failure_leaves_delete_set_identical(self):
+        """The delete set is byte-identical with and without a probe failure.
+
+        This is the contract that makes the probe safe to add to a script
+        whose --apply path performs irreversible deletes.
+        """
+        async def _run(probe_outcome):
+            memory_service = AsyncMock()
+            memory_service.count_memories_by_metadata = _counts(
+                source=3, kind=1, flag_for_stage2=probe_outcome,
+            )
+            memory_service.get_memories_by_metadata = AsyncMock(
+                return_value=self._members_for_failsafe()
+            )
+            memory_service.delete_memory = AsyncMock(return_value=None)
+            return await _mod.run(
+                self._args(apply=False), memory_service, now=self._NEUTRAL_NOW,
+            )
+
+        healthy = await _run(61)
+        broken = await _run(RuntimeError('qdrant down'))
+
+        assert healthy['orphan_ids'] == broken['orphan_ids'] == ['o1', 'o2']
+        assert healthy['orphan_count'] == broken['orphan_count'] == 2
+        # Everything except the cross_check block itself is untouched.
+        assert (
+            {k: v for k, v in healthy.items() if k != 'cross_check'}
+            == {k: v for k, v in broken.items() if k != 'cross_check'}
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('bad_return', [None, object(), '61', 3.5])
+    async def test_non_int_probe_return_is_treated_as_a_failed_probe(self, bad_return):
+        """An unexpected return shape degrades to 'unknown' rather than
+        crashing on the `> 0` comparison inside enumeration_blind_spot.
+
+        Note '61' (a str) and 3.5 (a float) are included deliberately: both
+        would either raise or silently misbehave under a naive comparison.
+        """
+        memory_service = AsyncMock()
+        memory_service.count_memories_by_metadata = _counts(
+            source=0, kind=0, flag_for_stage2=bad_return,
+        )
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=[])
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        report = await _mod.run(
+            self._args(apply=False), memory_service, now=self._NEUTRAL_NOW,
+        )
+
+        assert report['cross_check'] == {
+            'source_total': 0,
+            'flag_for_stage2_total': None,
+            'blind_spot': False,
+            'probe_failed': True,
+        }
+
+    @pytest.mark.asyncio
+    async def test_bool_probe_return_is_treated_as_a_failed_probe(self):
+        """`True` is an int subclass in Python, so an isinstance(x, int)
+        guard alone would let a boolean through and report
+        flag_for_stage2_total: True — a nonsense census. Guard against it
+        explicitly."""
+        memory_service = AsyncMock()
+        memory_service.count_memories_by_metadata = _counts(
+            source=0, kind=0, flag_for_stage2=True,
+        )
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=[])
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        report = await _mod.run(
+            self._args(apply=False), memory_service, now=self._NEUTRAL_NOW,
+        )
+
+        assert report['cross_check']['probe_failed'] is True
+        assert report['cross_check']['flag_for_stage2_total'] is None
+        assert report['cross_check']['blind_spot'] is False
 
 
 # ===========================================================================
@@ -949,6 +1972,11 @@ class TestTargetedCorrection:
     record (task_id='1944,2408', kept because not ALL components are
     terminal). Delete (not delete+recreate) is the honest correction — see
     design_decisions.
+
+    count_memories_by_metadata mock ordering (task 3897): the THIRD call is
+    run()'s flag_for_stage2 census probe, sitting between the two 'before'
+    counts and any 'after' counts. These fixtures pass 0 for it (no adjacent
+    population), which keeps blind_spot False and their semantics unchanged.
     """
 
     _NOW = datetime(2026, 7, 14, tzinfo=UTC)
@@ -1000,7 +2028,7 @@ class TestTargetedCorrection:
         members = [mistagged, composite]
 
         memory_service = AsyncMock()
-        memory_service.count_memories_by_metadata = AsyncMock(side_effect=[2, 2])
+        memory_service.count_memories_by_metadata = _counts(source=2, kind=2)
         memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
         memory_service.delete_memory = AsyncMock(return_value=None)
 
@@ -1026,7 +2054,7 @@ class TestTargetedCorrection:
         members = [mistagged, composite]
 
         memory_service = AsyncMock()
-        memory_service.count_memories_by_metadata = AsyncMock(side_effect=[2, 2, 0, 0])
+        memory_service.count_memories_by_metadata = _counts(source=[2, 0], kind=[2, 0])
         memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
         memory_service.delete_memory = AsyncMock(return_value=None)
 
@@ -1052,7 +2080,7 @@ class TestTargetedCorrection:
         members = [valid]
 
         memory_service = AsyncMock()
-        memory_service.count_memories_by_metadata = AsyncMock(side_effect=[1, 1])
+        memory_service.count_memories_by_metadata = _counts(source=1, kind=1)
         memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
         memory_service.delete_memory = AsyncMock(return_value=None)
 
@@ -1077,7 +2105,7 @@ class TestTargetedCorrection:
         members = [orphan]
 
         memory_service = AsyncMock()
-        memory_service.count_memories_by_metadata = AsyncMock(side_effect=[1, 0, 0, 0])
+        memory_service.count_memories_by_metadata = _counts(source=[1, 0], kind=[0, 0])
         memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
         memory_service.delete_memory = AsyncMock(return_value=None)
 
@@ -1098,7 +2126,7 @@ class TestTargetedCorrection:
         members = [valid]
 
         memory_service = AsyncMock()
-        memory_service.count_memories_by_metadata = AsyncMock(side_effect=[1, 1])
+        memory_service.count_memories_by_metadata = _counts(source=1, kind=1)
         memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
         memory_service.delete_memory = AsyncMock(return_value=None)
 
@@ -1109,6 +2137,1321 @@ class TestTargetedCorrection:
         )
 
         assert report['targeted_correction_ids'] == []
+
+
+# ===========================================================================
+# Tests: run() subtracts protected mirrors from the delete set (task 4435)
+# ===========================================================================
+
+class TestRunExcludesProtectedMirrorsFromTheDeleteSet:
+    """run()'s REPORTING partition, the companion to the choke-point guard.
+
+    ``orphan_count``'s documented contract is "the actual number of records
+    deleted (or that would be deleted)". A DRY RUN never reaches
+    ``delete_orphan_markers`` at all, so without this partition a dry run
+    would print a count the subsequent ``--apply`` silently does not honour —
+    and dry-run-then-apply is exactly the operator workflow this script is
+    built around.
+    """
+
+    _NEUTRAL_NOW = datetime(2026, 1, 1, tzinfo=UTC)
+
+    def _args(
+        self,
+        apply: bool = False,
+        project_id: str = 'dark_factory',
+        max_age_days: int = 14,
+        delete_ids: list[str] | None = None,
+    ):
+        import types as _types
+        return _types.SimpleNamespace(
+            apply=apply, project_id=project_id, max_age_days=max_age_days,
+            delete_ids=delete_ids,
+        )
+
+    @staticmethod
+    def _service(members: list[dict], *, apply: bool) -> AsyncMock:
+        memory_service = AsyncMock()
+        counts = (
+            _counts(source=[len(members), 0], kind=[0, 0]) if apply
+            else _counts(source=len(members), kind=0)
+        )
+        memory_service.count_memories_by_metadata = counts
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
+        memory_service.delete_memory = AsyncMock(return_value=None)
+        return memory_service
+
+    @pytest.mark.asyncio
+    async def test_dry_run_excludes_protected_members_from_orphan_count(self):
+        """A dry run reports the delete set it would actually take."""
+        members = [_orphan('o1'), _mirror('m1'), _ledger_stamp('l1')]
+        memory_service = self._service(members, apply=False)
+
+        report = await _mod.run(
+            self._args(apply=False), memory_service, now=self._NEUTRAL_NOW,
+        )
+
+        assert report['orphan_ids'] == ['o1'], (
+            f"Protected members leaked into the delete set: {report['orphan_ids']!r}"
+        )
+        assert report['orphan_count'] == 1
+        assert report['protected_skipped_count'] == 2
+        assert report['protected_skipped_ids'] == ['m1', 'l1']
+
+    @pytest.mark.asyncio
+    async def test_apply_reports_the_same_numbers_as_the_dry_run(self):
+        """A dry run and the --apply it precedes never disagree about the
+        delete set — the whole reason this partition exists in run()."""
+        members = [_orphan('o1'), _mirror('m1'), _ledger_stamp('l1')]
+        memory_service = self._service(members, apply=True)
+
+        report = await _mod.run(
+            self._args(apply=True), memory_service, now=self._NEUTRAL_NOW,
+        )
+
+        assert report['orphan_ids'] == ['o1']
+        assert report['orphan_count'] == 1
+        assert report['protected_skipped_count'] == 2
+        assert report['protected_skipped_ids'] == ['m1', 'l1']
+
+        deleted_ids = {
+            c.kwargs['memory_id']
+            for c in memory_service.delete_memory.call_args_list
+        }
+        assert deleted_ids == {'o1'}, f'Unexpected delete set: {deleted_ids!r}'
+
+    @pytest.mark.asyncio
+    async def test_bucket_counts_stay_consistent_with_orphan_count(self):
+        """bucket_counts is documented as a breakdown OF THE FINAL UNION, so
+        the protected members must be absent from it too."""
+        members = [_orphan('o1'), _mirror('m1'), _ledger_stamp('l1')]
+        memory_service = self._service(members, apply=False)
+
+        report = await _mod.run(
+            self._args(apply=False), memory_service, now=self._NEUTRAL_NOW,
+        )
+
+        assert sum(report['bucket_counts'].values()) == report['orphan_count']
+
+    @pytest.mark.asyncio
+    async def test_delete_ids_cannot_override_the_guard(self):
+        """--delete-ids is refused for a protected member, and the report
+        shows the request was SEEN and refused rather than silently lost."""
+        members = [_orphan('o1'), _mirror('m1'), _ledger_stamp('l1')]
+        memory_service = self._service(members, apply=True)
+
+        report = await _mod.run(
+            self._args(apply=True, delete_ids=['m1', 'l1']),
+            memory_service,
+            now=self._NEUTRAL_NOW,
+        )
+
+        deleted_ids = {
+            c.kwargs['memory_id']
+            for c in memory_service.delete_memory.call_args_list
+        }
+        assert 'm1' not in deleted_ids and 'l1' not in deleted_ids, (
+            f'--delete-ids overrode the guard: {deleted_ids!r}'
+        )
+        assert 'm1' not in report['orphan_ids']
+        assert 'l1' not in report['orphan_ids']
+        assert report['protected_skipped_ids'] == ['m1', 'l1']
+        # The operator's request stays visible: targeted_correction_ids
+        # records what --delete-ids MATCHED, which must not vanish just
+        # because the guard then refused it.
+        assert set(report['targeted_correction_ids']) == {'m1', 'l1'}
+
+    @pytest.mark.asyncio
+    async def test_apply_report_accounts_for_every_enumerated_member(self):
+        """The two views of "protected" are pinned against each other.
+
+        run() pre-subtracts, so the choke-point guard has nothing left to
+        catch and its refusal list must come back empty — which is what makes
+        ``deleted + len(failed) == orphan_count`` hold, i.e. the report's
+        delete count is fully accounted for. The guard exists for the case
+        where that stops being true, so the invariant it relies on is pinned
+        mechanically here rather than only asserted in a comment: a future
+        edit that reorders or drops the partition fails this test instead of
+        silently over-reporting the delete set in the nightly JSON.
+        """
+        members = [_orphan('o1'), _mirror('m1'), _ledger_stamp('l1')]
+        memory_service = self._service(members, apply=True)
+
+        report = await _mod.run(
+            self._args(apply=True), memory_service, now=self._NEUTRAL_NOW,
+        )
+
+        assert report['enforced_protected_skipped'] == [], (
+            'The choke-point guard fired on a delete set run() had already '
+            'partitioned — the two protected views have diverged: '
+            f"{report['enforced_protected_skipped']!r}"
+        )
+        assert report['deleted'] + len(report['failed']) == report['orphan_count']
+        # And the enumeration-scoped view still reports the full finding.
+        assert report['protected_skipped_ids'] == ['m1', 'l1']
+
+    @pytest.mark.asyncio
+    async def test_enforced_protected_skipped_is_apply_only(self):
+        """Apply-only, exactly like the sibling deleted/failed/tombstoned
+        keys — a dry run performs no delete, so it refused nothing."""
+        members = [_orphan('o1'), _mirror('m1')]
+        memory_service = self._service(members, apply=False)
+
+        report = await _mod.run(
+            self._args(apply=False), memory_service, now=self._NEUTRAL_NOW,
+        )
+
+        assert 'enforced_protected_skipped' not in report
+        assert json.dumps(report)
+
+    @pytest.mark.asyncio
+    async def test_the_subtraction_is_logged_at_warning(self, caplog):
+        """The subtraction is never silent in the journal.
+
+        run() pre-subtracts, so the choke-point guard's own per-member
+        WARNING cannot fire on this path — this is the ONLY journal output
+        the event produces, and the journal is where an operator greps after
+        a nightly run. The JSON key is not a substitute: `undated_kept_count`
+        is the precedent that a "why do this run's numbers look like that"
+        condition warrants both.
+        """
+        members = [_orphan('o1'), _mirror('m1'), _ledger_stamp('l1')]
+        memory_service = self._service(members, apply=False)
+
+        with caplog.at_level(logging.WARNING, logger='sweep_orphan_flag_markers'):
+            await _mod.run(
+                self._args(apply=False), memory_service, now=self._NEUTRAL_NOW,
+            )
+
+        warnings = [
+            r for r in caplog.records
+            if r.name == 'sweep_orphan_flag_markers' and r.levelno == logging.WARNING
+        ]
+        naming_both = [
+            r for r in warnings
+            if 'm1' in r.getMessage() and 'l1' in r.getMessage()
+        ]
+        assert len(naming_both) == 1, (
+            'Expected exactly one WARNING naming both protected ids, got: '
+            f'{[r.getMessage() for r in warnings]!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_no_warning_when_nothing_is_protected(self, caplog):
+        """A clean run stays quiet — otherwise the warning above is noise an
+        operator learns to filter out."""
+        members = [_orphan('o1'), _member('keep')]
+        memory_service = self._service(members, apply=False)
+
+        with caplog.at_level(logging.WARNING, logger='sweep_orphan_flag_markers'):
+            await _mod.run(
+                self._args(apply=False), memory_service, now=self._NEUTRAL_NOW,
+            )
+
+        protected_warnings = [
+            r for r in caplog.records
+            if r.name == 'sweep_orphan_flag_markers'
+            and r.levelno == logging.WARNING
+            and 'protected' in r.getMessage()
+        ]
+        assert protected_warnings == []
+
+    @pytest.mark.asyncio
+    async def test_keys_are_present_when_nothing_is_protected(self):
+        """The two keys are unconditional, so no report consumer needs a
+        .get fallback and a JSON diff across nights stays stable."""
+        members = [_orphan('o1'), _member('keep')]
+        memory_service = self._service(members, apply=False)
+
+        report = await _mod.run(
+            self._args(apply=False), memory_service, now=self._NEUTRAL_NOW,
+        )
+
+        assert report['protected_skipped_count'] == 0
+        assert report['protected_skipped_ids'] == []
+        assert report['protected_skipped_reasons'] == {}
+
+
+class TestProtectedAuditAndForeignKindRecordsAreNeverDeleted:
+    """Audit records and foreign-kind records are withheld in EVERY mode
+    (task 5286).
+
+    The motivating loss was an age-only collector taking 40 audit records
+    that all cited deferred task 452. Here every arm that could nominate such
+    a record is switched on at once: the age predicate (``now`` is months
+    past ``created_at``), the kind-orphan predicate (their kind is not
+    MARKER_KIND), and, under --terminal-drain, the terminal predicate (452 is
+    in the terminal set). None of them may get one deleted.
+    """
+
+    _AGED_NOW = datetime(2026, 9, 1, tzinfo=UTC)
+    _NEUTRAL_NOW = datetime(2026, 1, 1, tzinfo=UTC)
+    _service = staticmethod(TestRunExcludesProtectedMirrorsFromTheDeleteSet._service)
+
+    @staticmethod
+    def _args(apply: bool, delete_ids: list[str] | None = None):
+        return types.SimpleNamespace(
+            apply=apply, project_id='dark_factory', max_age_days=14,
+            delete_ids=delete_ids,
+        )
+
+    @staticmethod
+    def _deleted_ids(memory_service: AsyncMock) -> set[str]:
+        return {
+            c.kwargs['memory_id']
+            for c in memory_service.delete_memory.call_args_list
+        }
+
+    @pytest.mark.asyncio
+    async def test_choke_point_refuses_audit_and_foreign_kind_records(self):
+        memory_service = AsyncMock()
+        memory_service.delete_memory = AsyncMock(return_value=None)
+        audit = _audit('a1')
+        assert audit['metadata']['kind'] in PROTECTED_AUDIT_KINDS
+
+        result = await _mod.delete_orphan_markers(
+            memory_service, 'dark_factory', [_orphan('o1'), audit, _foreign('f1')],
+        )
+
+        assert self._deleted_ids(memory_service) == {'o1'}
+        assert memory_service.delete_memory.await_count == 1
+        assert result['protected_skipped'] == ['a1', 'f1']
+        assert result['deleted'] == 1
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'terminal_task_ids', [None, {'452'}], ids=['ordinary', 'terminal_drain'],
+    )
+    @pytest.mark.parametrize('apply', [False, True], ids=['dry_run', 'apply'])
+    async def test_run_withholds_them_in_every_mode(self, terminal_task_ids, apply):
+        audit = _audit('a1')
+        assert audit['metadata']['kind'] in PROTECTED_AUDIT_KINDS
+        members = [_orphan('o1'), audit, _foreign('f1')]
+        memory_service = self._service(members, apply=apply)
+
+        report = await _mod.run(
+            self._args(apply=apply), memory_service,
+            now=self._AGED_NOW, terminal_task_ids=terminal_task_ids,
+        )
+
+        assert 'a1' not in report['orphan_ids']
+        assert 'f1' not in report['orphan_ids']
+        assert report['protected_skipped_ids'] == ['a1', 'f1']
+        undrainable = report['structural_floor']['undrainable_ids']
+        assert 'a1' in undrainable and 'f1' in undrainable, undrainable
+        if apply:
+            deleted = self._deleted_ids(memory_service)
+            assert 'a1' not in deleted and 'f1' not in deleted, deleted
+            assert report['enforced_protected_skipped'] == []
+
+    @pytest.mark.asyncio
+    async def test_delete_ids_cannot_override_them(self):
+        audit = _audit('a1')
+        assert audit['metadata']['kind'] in PROTECTED_AUDIT_KINDS
+        members = [_orphan('o1'), audit, _foreign('f1')]
+        memory_service = self._service(members, apply=True)
+
+        report = await _mod.run(
+            self._args(apply=True, delete_ids=['a1', 'f1']), memory_service,
+            now=self._NEUTRAL_NOW,
+        )
+
+        deleted = self._deleted_ids(memory_service)
+        assert 'a1' not in deleted and 'f1' not in deleted, deleted
+        assert set(report['targeted_correction_ids']) == {'a1', 'f1'}
+
+
+class TestProtectedSkipsAreAttributedToTheirGuard:
+    """Each withheld record names the guard that withheld it (task 5286).
+
+    Mirrors the in-cycle collector's rule that a mirror skip must not be
+    logged as an audit skip, or vice versa. Asserted on the structured
+    ``ProtectionReason`` values, never on surrounding prose.
+    """
+
+    _NEUTRAL_NOW = datetime(2026, 1, 1, tzinfo=UTC)
+    _service = staticmethod(TestRunExcludesProtectedMirrorsFromTheDeleteSet._service)
+    _EXPECTED = {
+        'mirror-id': _mod.ProtectionReason.CYCLE_SUMMARY_MIRROR.value,
+        'audit-id': _mod.ProtectionReason.PROTECTED_AUDIT_KIND.value,
+        'foreign-id': _mod.ProtectionReason.FOREIGN_KIND.value,
+    }
+
+    @staticmethod
+    def _members() -> list[dict]:
+        return [
+            _mirror('mirror-id'), _audit('audit-id'),
+            _foreign('foreign-id'), _orphan('orphan-id'),
+        ]
+
+    @staticmethod
+    def _warnings(caplog) -> list[str]:
+        return [
+            r.getMessage() for r in caplog.records
+            if r.name == 'sweep_orphan_flag_markers' and r.levelno == logging.WARNING
+        ]
+
+    @pytest.mark.asyncio
+    async def test_choke_point_names_each_records_own_reason(self, caplog):
+        memory_service = AsyncMock()
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        with caplog.at_level(logging.WARNING, logger='sweep_orphan_flag_markers'):
+            await _mod.delete_orphan_markers(
+                memory_service, 'dark_factory', self._members(),
+            )
+
+        warnings = self._warnings(caplog)
+        for memory_id, reason in self._EXPECTED.items():
+            naming = [m for m in warnings if memory_id in m]
+            assert len(naming) == 1, (memory_id, warnings)
+            assert reason in naming[0], (memory_id, naming[0])
+        audit_line = next(m for m in warnings if 'audit-id' in m)
+        assert (
+            _mod.ProtectionReason.CYCLE_SUMMARY_MIRROR.value not in audit_line
+        ), audit_line
+
+    @pytest.mark.asyncio
+    async def test_run_aggregate_names_every_reason(self, caplog):
+        memory_service = self._service(self._members(), apply=False)
+
+        with caplog.at_level(logging.WARNING, logger='sweep_orphan_flag_markers'):
+            await _mod.run(
+                types.SimpleNamespace(
+                    apply=False, project_id='dark_factory', max_age_days=14,
+                    delete_ids=None,
+                ),
+                memory_service, now=self._NEUTRAL_NOW,
+            )
+
+        naming_all = [
+            m for m in self._warnings(caplog)
+            if all(memory_id in m for memory_id in self._EXPECTED)
+        ]
+        assert len(naming_all) == 1, self._warnings(caplog)
+        for reason in self._EXPECTED.values():
+            assert reason in naming_all[0], (reason, naming_all[0])
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('apply', [False, True], ids=['dry_run', 'apply'])
+    async def test_report_maps_each_skipped_id_to_its_reason(self, apply):
+        """The attribution reaches the JSON report as structured data, so a
+        consumer never greps the journal to tell the arms apart."""
+        memory_service = self._service(self._members(), apply=apply)
+
+        report = await _mod.run(
+            types.SimpleNamespace(
+                apply=apply, project_id='dark_factory', max_age_days=14,
+                delete_ids=None,
+            ),
+            memory_service, now=self._NEUTRAL_NOW,
+        )
+
+        assert report['protected_skipped_reasons'] == self._EXPECTED
+        assert list(report['protected_skipped_reasons']) == report['protected_skipped_ids']
+        assert json.dumps(report)
+
+
+# ===========================================================================
+# Tests: run() emits the structural_floor block (task 4436)
+# ===========================================================================
+
+class TestStructuralFloorReportBlock:
+    """The permanent backlog floor, made machine-readable beside cross_check.
+
+    ``undated_kept_count`` alone is the WRONG number to key a constraint on,
+    and after task 4435 it can be wrong in BOTH directions: an undated
+    kind-orphan is drained and floors nothing, while a fully dated protected
+    mirror floors permanently while contributing ``0`` to the raw count.
+    This block reports the raw count and the true floor side by side.
+
+    Mirrors ``TestRunExcludesProtectedMirrorsFromTheDeleteSet``'s local
+    ``_args``/``_service`` shape and its delete-set boundary assertions
+    rather than reaching into ``TestRun``.
+    """
+
+    _NEUTRAL_NOW = datetime(2026, 1, 1, tzinfo=UTC)
+
+    def _args(
+        self,
+        apply: bool = False,
+        project_id: str = 'dark_factory',
+        max_age_days: int = 14,
+        delete_ids: list[str] | None = None,
+    ):
+        import types as _types
+        return _types.SimpleNamespace(
+            apply=apply, project_id=project_id, max_age_days=max_age_days,
+            delete_ids=delete_ids,
+        )
+
+    @staticmethod
+    def _service(members: list[dict], *, apply: bool) -> AsyncMock:
+        memory_service = AsyncMock()
+        counts = (
+            _counts(source=[len(members), 0], kind=[0, 0]) if apply
+            else _counts(source=len(members), kind=0)
+        )
+        memory_service.count_memories_by_metadata = counts
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
+        memory_service.delete_memory = AsyncMock(return_value=None)
+        return memory_service
+
+    @staticmethod
+    def _undated(id: str, *, kind: str | None = 'stage1_flag_marker',
+                 task_id: str | None = '9001') -> dict:
+        """An undated member — no ``created_at`` key at all.
+
+        ``_member``'s hardcoded ``created_at`` is always dated, so undated
+        shapes are built by hand (the shape already used by
+        ``test_undated_members_are_kept_and_reported_with_warning``). The
+        default kind+task_id make it undrainable; pass ``kind=None`` to make
+        it a kind-orphan the delete set covers.
+        """
+        metadata: dict = {'source': 'stage1_flag_marker'}
+        if kind is not None:
+            metadata['kind'] = kind
+        if task_id is not None:
+            metadata['task_id'] = task_id
+        return {'id': id, 'metadata': metadata}
+
+    @pytest.mark.asyncio
+    async def test_block_shape(self):
+        """(a) The report carries a structural_floor dict with the floor keys."""
+        members = [_member('keep')]
+        memory_service = self._service(members, apply=False)
+
+        report = await _mod.run(
+            self._args(apply=False), memory_service, now=self._NEUTRAL_NOW,
+        )
+
+        block = report['structural_floor']
+        assert isinstance(block, dict), f'Expected a dict, got: {block!r}'
+        assert {'undated_kept_count', 'undrainable_count', 'undrainable_ids'} <= set(block)
+
+    @pytest.mark.asyncio
+    async def test_undated_and_undrained_member_is_the_floor(self):
+        """(b) An undated member no other predicate catches floors the backlog."""
+        members = [_member('keep'), self._undated('u1')]
+        memory_service = self._service(members, apply=False)
+
+        report = await _mod.run(
+            self._args(apply=False), memory_service, now=self._NEUTRAL_NOW,
+        )
+
+        assert report['orphan_ids'] == [], (
+            f"Fixture drift: u1 must be undrained, got: {report['orphan_ids']!r}"
+        )
+        block = report['structural_floor']
+        assert block['undrainable_count'] == 1
+        assert block['undrainable_ids'] == ['u1']
+
+    @pytest.mark.asyncio
+    async def test_undated_but_drained_member_floors_nothing(self):
+        """(c) THE FALSE-POSITIVE FIX, end to end.
+
+        An undated member that is ALSO a kind-orphan is in the delete set, so
+        it floors nothing — even though undated_kept_count counts it. Today's
+        WARNING is keyed on that raw count and tells an operator to raise
+        --max-backlog when the true floor is 0.
+        """
+        members = [self._undated('u1', kind=None)]
+        memory_service = self._service(members, apply=False)
+
+        report = await _mod.run(
+            self._args(apply=False), memory_service, now=self._NEUTRAL_NOW,
+        )
+
+        assert report['orphan_ids'] == ['u1'], (
+            f"Fixture drift: u1 must be drained, got: {report['orphan_ids']!r}"
+        )
+        block = report['structural_floor']
+        assert block['undated_kept_count'] == 1
+        assert block['undrainable_count'] == 0
+        assert block['undrainable_ids'] == []
+
+    @pytest.mark.asyncio
+    async def test_dated_protected_members_are_the_floor(self):
+        """(d) THE PROTECTED ARM, and the proof the block reads the
+        POST-subtraction delete set.
+
+        All three members are dated, so undated_kept_count is 0 — yet the two
+        protected records floor permanently. `m1` is ALSO a kind-orphan, so
+        it is in the union loop's `seen_ids`; computing the floor from that
+        superset would classify it as drained and under-report the floor,
+        which is the false negative this block exists to eliminate.
+        """
+        members = [_orphan('o1'), _mirror('m1'), _ledger_stamp('l1')]
+        memory_service = self._service(members, apply=False)
+
+        report = await _mod.run(
+            self._args(apply=False), memory_service, now=self._NEUTRAL_NOW,
+        )
+
+        block = report['structural_floor']
+        assert block['undated_kept_count'] == 0
+        assert block['undrainable_count'] == 2
+        assert block['undrainable_ids'] == ['m1', 'l1']
+
+    @pytest.mark.asyncio
+    async def test_top_level_undated_kept_count_is_unchanged(self):
+        """(e) REGRESSION PIN — the top-level key survives verbatim.
+
+        It is asserted by existing tests AND extracted into
+        done_provenance.note by the orchestrator's before_done path, so
+        relocating it would break a durable provenance record.
+        """
+        members = [self._undated('u1'), self._undated('u2', kind=None)]
+        memory_service = self._service(members, apply=False)
+
+        report = await _mod.run(
+            self._args(apply=False), memory_service, now=self._NEUTRAL_NOW,
+        )
+
+        assert report['undated_kept_count'] == 2, 'raw undated count, not the floor'
+        assert report['structural_floor']['undrainable_count'] == 1
+
+    @pytest.mark.asyncio
+    async def test_the_floor_never_widens_the_delete_set(self):
+        """(f) BOUNDARY — this block is diagnostic and must never delete.
+
+        Mirrors TestFlagForStage2IsNeverDeleted: no floor id appears in
+        orphan_ids, and under --apply delete_memory is never awaited with
+        one. Without this, a later edit could quietly turn a REPORTING
+        change into a DELETING one — the exact risk the rejected "make
+        find_undated_markers load-bearing in the delete set" option carries.
+        """
+        members = [_orphan('o1'), self._undated('u1'), _mirror('m1'), _ledger_stamp('l1')]
+        memory_service = self._service(members, apply=True)
+
+        report = await _mod.run(
+            self._args(apply=True), memory_service, now=self._NEUTRAL_NOW,
+        )
+
+        floor_ids = set(report['structural_floor']['undrainable_ids'])
+        assert floor_ids == {'u1', 'm1', 'l1'}, f'Unexpected floor: {floor_ids!r}'
+        assert not (floor_ids & set(report['orphan_ids'])), (
+            f"Floor leaked into the delete set: {report['orphan_ids']!r}"
+        )
+        deleted_ids = {
+            call.kwargs['memory_id']
+            for call in memory_service.delete_memory.call_args_list
+        }
+        assert deleted_ids == {'o1'}, f'Expected only o1 deleted, got: {deleted_ids!r}'
+        assert not (deleted_ids & floor_ids)
+
+    @pytest.mark.asyncio
+    async def test_all_dated_unprotected_population_has_no_floor(self):
+        """(g) The healthy steady state reports a zero floor."""
+        members = [_member('keep'), _orphan('o1')]
+        memory_service = self._service(members, apply=False)
+
+        report = await _mod.run(
+            self._args(apply=False), memory_service, now=self._NEUTRAL_NOW,
+        )
+
+        block = report['structural_floor']
+        assert block['undrainable_count'] == 0
+        assert block['undrainable_ids'] == []
+
+
+# ===========================================================================
+# Tests: run()'s undated WARNING is keyed on the UNDRAINED subset (task 4436)
+# ===========================================================================
+
+class TestStructuralFloorWarning:
+    """The false-positive fix: the created_at WARNING speaks for the floor,
+    not for the raw undated count.
+
+    Today the WARNING fires whenever ``undated_kept_count`` is nonzero and
+    tells the operator to raise ``--max-backlog`` — even when every undated
+    member is in this run's delete set and the true floor is 0.
+
+    The two arms of the floor keep SEPARATE log lines on purpose. This one
+    names ``missing/unparseable created_at``, which is simply false for a
+    fully dated protected mirror; the protected arm has its own WARNING
+    (task 4435) that already states its floor correctly.
+    """
+
+    _NEUTRAL_NOW = datetime(2026, 1, 1, tzinfo=UTC)
+    _UNDATED_MARKER = 'missing/unparseable created_at'
+
+    # Borrowed from the sibling class above: same populations, different
+    # question (the JSON block vs. the journal line). Re-wrapped in
+    # staticmethod because attribute access unwraps the descriptor, and a
+    # bare function assigned to a class attribute rebinds as an INSTANCE
+    # method — which would silently pass `self` as `members`.
+    _args = TestStructuralFloorReportBlock._args
+    _service = staticmethod(TestStructuralFloorReportBlock._service)
+    _undated = staticmethod(TestStructuralFloorReportBlock._undated)
+
+    @staticmethod
+    def _undated_warnings(caplog) -> list[str]:
+        return [
+            record.message for record in caplog.records
+            if record.levelno == logging.WARNING
+            and TestStructuralFloorWarning._UNDATED_MARKER in record.message
+        ]
+
+    @pytest.mark.asyncio
+    async def test_drained_undated_member_logs_no_warning(self, caplog):
+        """(a) THE FIX — an undated member the delete set already covers is
+        not a finding, so nothing is logged about it.
+
+        Against current behaviour this FAILS: undated_kept_count is 1, so
+        the WARNING fires and tells an operator to raise --max-backlog when
+        the true floor is 0.
+        """
+        members = [self._undated('u1', kind=None)]
+        memory_service = self._service(members, apply=False)
+
+        with caplog.at_level(logging.WARNING, logger='sweep_orphan_flag_markers'):
+            report = await _mod.run(
+                self._args(apply=False), memory_service, now=self._NEUTRAL_NOW,
+            )
+
+        assert report['undated_kept_count'] == 1, 'Fixture drift: u1 must be undated'
+        assert report['orphan_ids'] == ['u1'], 'Fixture drift: u1 must be drained'
+        assert report['structural_floor']['undrainable_count'] == 0
+        assert self._undated_warnings(caplog) == [], (
+            'A member the sweep is about to delete is not a finding: '
+            f'{self._undated_warnings(caplog)!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_undrained_undated_residue_logs_one_warning_with_remedies(self, caplog):
+        """(b) A genuine residue logs exactly one WARNING naming the undrained
+        count, the total enumerated, and every remedy."""
+        members = [_member('keep'), self._undated('u1'), self._undated('u2', kind=None)]
+        memory_service = self._service(members, apply=False)
+
+        with caplog.at_level(logging.WARNING, logger='sweep_orphan_flag_markers'):
+            report = await _mod.run(
+                self._args(apply=False), memory_service, now=self._NEUTRAL_NOW,
+            )
+
+        assert report['undated_kept_count'] == 2, 'Fixture drift: two undated members'
+        assert report['structural_floor']['undrainable_count'] == 1
+
+        warnings = self._undated_warnings(caplog)
+        assert len(warnings) == 1, f'Expected exactly one WARNING, got: {warnings!r}'
+        message = warnings[0]
+        # The UNDRAINED count (1), not the raw undated count (2), of 3 enumerated.
+        assert '1 of 3' in message, f'Expected the undrained count, got: {message!r}'
+        for remedy in ('--delete-ids', '--terminal-drain', '--max-backlog'):
+            assert remedy in message, f'Expected {remedy} named as a remedy: {message!r}'
+
+    @pytest.mark.asyncio
+    async def test_all_dated_population_logs_nothing(self, caplog):
+        """(c) An all-dated population is silent, as it is today."""
+        members = [_member('keep'), _orphan('o1')]
+        memory_service = self._service(members, apply=False)
+
+        with caplog.at_level(logging.WARNING, logger='sweep_orphan_flag_markers'):
+            report = await _mod.run(
+                self._args(apply=False), memory_service, now=self._NEUTRAL_NOW,
+            )
+
+        assert report['undated_kept_count'] == 0
+        assert self._undated_warnings(caplog) == []
+
+    @pytest.mark.asyncio
+    async def test_protected_arm_keeps_its_own_warning_and_is_not_swallowed(self, caplog):
+        """(d) SCOPE GUARD — the two arms keep separate log lines.
+
+        A dated protected member floors the backlog but has no created_at
+        problem, so the created_at WARNING must NOT speak for it. Its own
+        task-4435 WARNING must still fire: the re-key must not silently
+        swallow the other arm.
+        """
+        members = [_mirror('m1')]
+        memory_service = self._service(members, apply=False)
+
+        with caplog.at_level(logging.WARNING, logger='sweep_orphan_flag_markers'):
+            report = await _mod.run(
+                self._args(apply=False), memory_service, now=self._NEUTRAL_NOW,
+            )
+
+        assert report['structural_floor']['undrainable_count'] == 1, 'm1 floors'
+        assert report['structural_floor']['undated_kept_count'] == 0, 'but is dated'
+        assert self._undated_warnings(caplog) == [], (
+            f'created_at is not this floor\'s cause: {self._undated_warnings(caplog)!r}'
+        )
+        assert any(
+            record.levelno == logging.WARNING and 'protected records' in record.message
+            for record in caplog.records
+        ), f'The protected arm lost its own WARNING: {[r.message for r in caplog.records]!r}'
+
+
+# ===========================================================================
+# Tests: the checked constraint — structural_floor.gate_unsatisfiable (task 4436)
+# ===========================================================================
+
+class TestUnsatisfiableGateIsChecked:
+    """The constraint itself: a --check --max-backlog below the permanent
+    floor is reported as structurally unsatisfiable, and said out loud.
+
+    The exit-code surface is deliberately unchanged (see
+    scripts/fused-memory-flag-marker-check.sh's already-adjudicated ruling
+    that a distinct code buys separability nowhere it is consumed), so the
+    JSON block IS the machine-readable discriminator — exactly as
+    cross_check.blind_spot is for the enumeration blind spot.
+    """
+
+    _NEUTRAL_NOW = datetime(2026, 1, 1, tzinfo=UTC)
+
+    _service = staticmethod(TestStructuralFloorReportBlock._service)
+    _undated = staticmethod(TestStructuralFloorReportBlock._undated)
+
+    def _args(
+        self,
+        apply: bool = False,
+        max_backlog: int = 0,
+        check: bool = False,
+    ):
+        """A namespace carrying the gate config, unlike TestRun's."""
+        import types as _types
+        return _types.SimpleNamespace(
+            apply=apply, project_id='dark_factory', max_age_days=14,
+            delete_ids=None, max_backlog=max_backlog, check=check,
+        )
+
+    @staticmethod
+    def _errors(caplog) -> list[str]:
+        return [r.message for r in caplog.records if r.levelno == logging.ERROR]
+
+    @pytest.mark.asyncio
+    async def test_floor_above_ceiling_is_reported_unsatisfiable(self):
+        """(a) One undrainable member against --max-backlog 0."""
+        members = [self._undated('u1')]
+        memory_service = self._service(members, apply=False)
+
+        report = await _mod.run(
+            self._args(max_backlog=0), memory_service, now=self._NEUTRAL_NOW,
+        )
+
+        block = report['structural_floor']
+        assert block['undrainable_count'] == 1
+        assert block['max_backlog'] == 0
+        assert block['gate_unsatisfiable'] is True
+
+    @pytest.mark.asyncio
+    async def test_ceiling_that_accommodates_the_floor_is_satisfiable(self):
+        """(b) The same population against --max-backlog 1."""
+        members = [self._undated('u1')]
+        memory_service = self._service(members, apply=False)
+
+        report = await _mod.run(
+            self._args(max_backlog=1), memory_service, now=self._NEUTRAL_NOW,
+        )
+
+        block = report['structural_floor']
+        assert block['undrainable_count'] == 1
+        assert block['max_backlog'] == 1
+        assert block['gate_unsatisfiable'] is False
+
+    @pytest.mark.asyncio
+    async def test_all_drainable_population_is_satisfiable_at_zero(self):
+        """(c) A population that drains to 0 passes a --max-backlog 0 gate."""
+        members = [_orphan('o1'), self._undated('u2', kind=None)]
+        memory_service = self._service(members, apply=False)
+
+        report = await _mod.run(
+            self._args(max_backlog=0), memory_service, now=self._NEUTRAL_NOW,
+        )
+
+        assert report['structural_floor']['undrainable_count'] == 0
+        assert report['structural_floor']['gate_unsatisfiable'] is False
+
+    @pytest.mark.asyncio
+    async def test_protected_only_population_is_unsatisfiable(self):
+        """(d) PROTECTED-ONLY UNSATISFIABILITY — the case a floor keyed on
+        undated markers alone would have wrongly passed.
+
+        Everything here is dated, so undated_kept_count is 0; the protected
+        mirror nonetheless floors the backlog permanently, and task 4435's
+        own WARNING already asserts in prose that a gate below that floor can
+        never pass.
+        """
+        members = [_orphan('o1'), _mirror('m1')]
+        memory_service = self._service(members, apply=False)
+
+        report = await _mod.run(
+            self._args(max_backlog=0), memory_service, now=self._NEUTRAL_NOW,
+        )
+
+        block = report['structural_floor']
+        assert block['undated_kept_count'] == 0
+        assert block['undrainable_count'] == 1
+        assert block['gate_unsatisfiable'] is True
+
+    @pytest.mark.asyncio
+    async def test_namespace_without_check_or_max_backlog_defaults_safely(self, caplog):
+        """(e) THE ARGS GOTCHA — a namespace carrying NEITHER field.
+
+        Exactly what TestRun._args builds, and what ~40 existing tests pass.
+        A bare args.check / args.max_backlog would AttributeError across all
+        of them, so the getattr defaults are pinned here directly rather than
+        left to be discovered as collateral damage.
+        """
+        import types as _types
+        bare = _types.SimpleNamespace(
+            apply=False, project_id='dark_factory', max_age_days=14,
+        )
+        members = [self._undated('u1')]
+        memory_service = self._service(members, apply=False)
+
+        with caplog.at_level(logging.ERROR, logger='sweep_orphan_flag_markers'):
+            report = await _mod.run(bare, memory_service, now=self._NEUTRAL_NOW)
+
+        block = report['structural_floor']
+        assert block['max_backlog'] == 0, 'default ceiling'
+        assert block['gate_unsatisfiable'] is True, 'floor 1 > default ceiling 0'
+        assert self._errors(caplog) == [], 'no --check is being evaluated'
+
+    @pytest.mark.asyncio
+    async def test_check_with_unsatisfiable_gate_logs_one_error(self, caplog):
+        """(f) DIAGNOSIS — an operator evaluating the gate is told, loudly,
+        that re-running can never clear it."""
+        members = [self._undated('u1')]
+        memory_service = self._service(members, apply=False)
+
+        with caplog.at_level(logging.ERROR, logger='sweep_orphan_flag_markers'):
+            report = await _mod.run(
+                self._args(max_backlog=0, check=True),
+                memory_service, now=self._NEUTRAL_NOW,
+            )
+
+        assert report['structural_floor']['gate_unsatisfiable'] is True
+        errors = self._errors(caplog)
+        assert len(errors) == 1, f'Expected exactly one ERROR, got: {errors!r}'
+        message = errors[0]
+        assert 'u1' in message, f'Expected the floor member named: {message!r}'
+        # The floor and the ceiling are asserted IN CONTEXT. A bare
+        # `'1' in message and '0' in message` passed incidentally — the '1'
+        # from the fixture id 'u1' (already asserted above) and the '0' from
+        # the ceiling, which is formatted in regardless of the computed
+        # floor, so a floor that regressed to 0 still passed. Prose is not
+        # pinned: rewording the futility clause must not break a green test.
+        assert '--max-backlog 0 is' in message, (
+            f'Expected the evaluated ceiling named: {message!r}'
+        )
+        assert 'at least 1' in message, (
+            f'Expected the computed floor named: {message!r}'
+        )
+        for remedy in ('--delete-ids', '--terminal-drain', 'delete_memory'):
+            assert remedy in message, f'Expected {remedy} named: {message!r}'
+
+    @pytest.mark.asyncio
+    async def test_no_check_logs_no_error_but_still_reports_the_fact(self, caplog):
+        """(g) The nightly --apply --terminal-drain service passes no --check,
+        so it must not gain a spurious ERROR for a gate it never evaluates —
+        while still recording the satisfiability fact in its journal JSON."""
+        members = [self._undated('u1')]
+        memory_service = self._service(members, apply=False)
+
+        with caplog.at_level(logging.ERROR, logger='sweep_orphan_flag_markers'):
+            report = await _mod.run(
+                self._args(max_backlog=0, check=False),
+                memory_service, now=self._NEUTRAL_NOW,
+            )
+
+        assert report['structural_floor']['gate_unsatisfiable'] is True
+        assert self._errors(caplog) == []
+
+    @pytest.mark.asyncio
+    async def test_check_with_satisfiable_gate_logs_no_error(self, caplog):
+        """(h) A gate that CAN pass is silent, even under --check."""
+        members = [self._undated('u1')]
+        memory_service = self._service(members, apply=False)
+
+        with caplog.at_level(logging.ERROR, logger='sweep_orphan_flag_markers'):
+            report = await _mod.run(
+                self._args(max_backlog=1, check=True),
+                memory_service, now=self._NEUTRAL_NOW,
+            )
+
+        assert report['structural_floor']['gate_unsatisfiable'] is False
+        assert self._errors(caplog) == []
+
+    @pytest.mark.asyncio
+    async def test_gate_evaluated_separates_a_real_verdict_from_a_hypothetical(self):
+        """gate_unsatisfiable is computed unconditionally, so on its own it
+        cannot be read: the nightly --apply --terminal-drain service
+        publishes `true` for a gate it never runs. gate_evaluated is the
+        discriminator, as cross_check.probe_failed is for blind_spot."""
+        members = [self._undated('u1')]
+
+        evaluated = await _mod.run(
+            self._args(max_backlog=0, check=True),
+            self._service(members, apply=False), now=self._NEUTRAL_NOW,
+        )
+        hypothetical = await _mod.run(
+            self._args(max_backlog=0, check=False),
+            self._service(members, apply=False), now=self._NEUTRAL_NOW,
+        )
+
+        assert evaluated['structural_floor']['gate_unsatisfiable'] is True
+        assert hypothetical['structural_floor']['gate_unsatisfiable'] is True, (
+            'The field itself does not discriminate — that is the point'
+        )
+        assert evaluated['structural_floor']['gate_evaluated'] is True
+        assert hypothetical['structural_floor']['gate_evaluated'] is False, (
+            'A gate that never ran must not read as an evaluated verdict'
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_error_does_not_present_the_floor_as_a_sufficient_ceiling(
+        self, caplog,
+    ):
+        """Raising --max-backlog to the floor is NECESSARY, not sufficient.
+
+        _resolve_check_exit_code falls back to before.total_source whenever
+        no 'after' key is present — every dry-run --check, which is exactly
+        the shape scripts/fused-memory-flag-marker-check.sh hardcodes. So a
+        10-member population with a floor of 1 STILL exits 1 at
+        --max-backlog 1, and the one message whose purpose is to stop
+        operators mis-tuning that ceiling must not imply otherwise.
+        """
+        members = [self._undated('u1')] + [_member(f'live{i}') for i in range(9)]
+        memory_service = self._service(members, apply=False)
+
+        with caplog.at_level(logging.ERROR, logger='sweep_orphan_flag_markers'):
+            report = await _mod.run(
+                self._args(max_backlog=0, check=True),
+                memory_service, now=self._NEUTRAL_NOW,
+            )
+
+        floor = report['structural_floor']['undrainable_count']
+        residual = report['before']['total_source']
+        assert (floor, residual) == (1, 10), 'Fixture drift'
+        # The trap, reproduced: the gate is unsatisfiable, but clearing the
+        # floor does not make this dry run pass.
+        assert _mod._resolve_check_exit_code(report, max_backlog=floor) == 1
+        assert _mod._resolve_check_exit_code(report, max_backlog=residual) == 0
+
+        message = self._errors(caplog)[0]
+        assert 'NECESSARY but NOT sufficient' in message, (
+            f'The floor must not read as a sufficient ceiling: {message!r}'
+        )
+        assert 'before.total_source (10)' in message, (
+            f"The verdict's actual comparand must be named: {message!r}"
+        )
+
+    def test_the_exit_code_ignores_the_structural_floor(self):
+        """The design's central safety claim, pinned as a regression rather
+        than only asserted in prose: the constraint refines the REASON, never
+        the code.
+
+        The obvious follow-up — "make the constraint ENFORCED" by wiring the
+        floor into _resolve_check_exit_code — would otherwise land green.
+        This builds a report by hand precisely because the combination is
+        unreachable from run() (the residual is always >= the floor), which
+        is what makes it a clean probe of what the resolver READS.
+        """
+        report = {
+            'before': {'total_source': 3, 'total_with_kind': 3},
+            'after': {'total_source': 3, 'total_with_kind': 3},
+            'structural_floor': {
+                'undated_kept_count': 0,
+                'undrainable_count': 2,
+                'undrainable_ids': ['m1', 'l1'],
+                'max_backlog': 0,
+                'gate_unsatisfiable': True,
+                'gate_evaluated': True,
+            },
+        }
+        assert _mod.unsatisfiable_backlog_gate(2, 0) is True, 'Fixture drift'
+
+        assert _mod._resolve_check_exit_code(report, max_backlog=3) == 0, (
+            'A satisfiable backlog must still resolve to 0 with an '
+            'unsatisfiable floor in the report'
+        )
+        # Indifferent to the FLOOR specifically, not indifferent in general:
+        # both inputs the resolver does read still move the code.
+        assert _mod._resolve_check_exit_code(report, max_backlog=2) == 1, (
+            'the backlog verdict still decides'
+        )
+        report['cross_check'] = {
+            'source_total': 3, 'flag_for_stage2_total': 61,
+            'blind_spot': True, 'probe_failed': False,
+        }
+        assert _mod._resolve_check_exit_code(report, max_backlog=3) == 1, (
+            'the blind-spot veto still decides'
+        )
+
+
+# ===========================================================================
+# Tests: run() surfaces the tombstone count in the report (task 4435)
+# ===========================================================================
+
+class TestRunSurfacesTheTombstoneCount:
+    """An --apply run makes the audit trail's presence — or ABSENCE — readable
+    in the JSON the nightly timer prints.
+
+    The failure this exists to make visible is a deployment with no
+    ``recon_ledger`` wired: records get destroyed permanently and the only
+    trace is a WARNING in the systemd journal. ``deleted: 2, tombstoned: 0``
+    puts that divergence in the report an operator actually reads.
+    """
+
+    _NEUTRAL_NOW = datetime(2026, 1, 1, tzinfo=UTC)
+
+    def _args(self, apply: bool = True):
+        import types as _types
+        return _types.SimpleNamespace(
+            apply=apply, project_id='dark_factory', max_age_days=14,
+        )
+
+    @staticmethod
+    def _rig(memory_service: AsyncMock, members: list[dict], *, apply: bool):
+        memory_service.count_memories_by_metadata = (
+            _counts(source=[len(members), 0], kind=[0, 0]) if apply
+            else _counts(source=len(members), kind=0)
+        )
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
+        memory_service.delete_memory = AsyncMock(return_value=None)
+        return memory_service
+
+    @pytest.mark.asyncio
+    async def test_apply_reports_the_rows_written(self):
+        """A wired ledger: every confirmed delete is accounted for."""
+        memory_service, _ledger = _svc_with_ledger()
+        self._rig(memory_service, [_orphan('o1'), _orphan('o2')], apply=True)
+
+        report = await _mod.run(
+            self._args(apply=True), memory_service, now=self._NEUTRAL_NOW,
+        )
+
+        assert report['deleted'] == 2
+        assert report['tombstoned'] == 2
+
+    @pytest.mark.asyncio
+    async def test_a_missing_ledger_is_visible_as_a_shortfall(self):
+        """No recon_ledger wired: the records are still destroyed, and the
+        report says so — deleted 2, tombstoned 0 — rather than hiding the
+        missing audit trail behind a successful-looking sweep."""
+        memory_service = AsyncMock()
+        memory_service.recon_ledger = None
+        self._rig(memory_service, [_orphan('o1'), _orphan('o2')], apply=True)
+
+        report = await _mod.run(
+            self._args(apply=True), memory_service, now=self._NEUTRAL_NOW,
+        )
+
+        assert report['deleted'] == 2
+        assert report['tombstoned'] == 0
+
+    @pytest.mark.asyncio
+    async def test_dry_run_never_populates_tombstoned(self):
+        """tombstoned is apply-only, exactly like the pre-existing
+        deleted/failed/after keys — a dry run wrote no tombstone, and
+        reporting 0 would read as one that failed."""
+        memory_service, ledger = _svc_with_ledger()
+        self._rig(memory_service, [_orphan('o1')], apply=False)
+
+        report = await _mod.run(
+            self._args(apply=False), memory_service, now=self._NEUTRAL_NOW,
+        )
+
+        assert 'tombstoned' not in report, (
+            f"tombstoned must be apply-only, got: {report.get('tombstoned')!r}"
+        )
+        ledger.upsert_many.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_the_report_stays_json_serialisable(self):
+        """main() prints the report, so a non-serialisable value would only
+        blow up in production."""
+        memory_service, _ledger = _svc_with_ledger()
+        self._rig(memory_service, [_orphan('o1'), _orphan('o2')], apply=True)
+
+        report = await _mod.run(
+            self._args(apply=True), memory_service, now=self._NEUTRAL_NOW,
+        )
+
+        json.dumps(report)
+
+
+# ===========================================================================
+# Tests: the flag_for_stage2 pool is CENSUSED, never deleted (task 3897)
+# ===========================================================================
+
+class TestFlagForStage2IsNeverDeleted:
+    """The cross-check must never widen the delete set. Guard against a
+    future well-meaning edit that turns the census into a deletion.
+
+    The census probe is count-only BY DESIGN, on two surviving reasons: live
+    relay markers in that pool would be caught by this script's own
+    predicates (they are live, not dead weight), and task 2966's in-cycle
+    collector already drains the pool, so a second collector here would race
+    a correct one. A third reason — that this script had neither the
+    protected-mirror guard nor the tombstone write the in-cycle
+    _sweep_stale_mem0_pool applies — is retired: task 4435 added both, and
+    the boundary stands unchanged on the other two, each independently
+    sufficient. Full rationale and the dated measurements that back each of
+    those: docs/flag-marker-sweep-recurring.md ("Why the relay pool is
+    censused, never deleted") — deliberately not restated here, so there is
+    one copy to keep current. This class is what stops the design from
+    silently regressing.
+    """
+
+    _NEUTRAL_NOW = datetime(2026, 1, 1, tzinfo=UTC)
+
+    def _args(self):
+        import types as _types
+        return _types.SimpleNamespace(
+            apply=True, project_id='dark_factory', max_age_days=14,
+        )
+
+    @pytest.mark.asyncio
+    async def test_census_never_widens_the_delete_set(self):
+        """--apply + --terminal-drain + a 61-record adjacent population:
+        only scrolled, source-filtered members are ever deleted."""
+        # The scroll returns the source-filtered population only. 'keep1' is
+        # dated, non-terminal and has a task_id, so no predicate catches it.
+        members = [
+            _member('keep1', task_id='1970'),
+            _member('term1', task_id='2440'),   # terminal -> deleted
+            _taskless('taskless1'),             # no task_id -> deleted
+        ]
+        # Ids that live in the adjacent flag_for_stage2 pool. They are never
+        # scrolled, so they can only reach the delete set via a regression.
+        forbidden_ids = {'ffs2-a', 'ffs2-b', 'ffs2-c'}
+
+        memory_service = AsyncMock()
+        # source/kind are counted twice on --apply (before, then after).
+        memory_service.count_memories_by_metadata = _counts(
+            source=[3, 1], kind=[3, 1], flag_for_stage2=61,
+        )
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        report = await _mod.run(
+            self._args(),
+            memory_service,
+            now=self._NEUTRAL_NOW,
+            terminal_task_ids={'2440'},
+        )
+
+        # The blind spot IS reported — the census did its job.
+        assert report['cross_check']['flag_for_stage2_total'] == 61
+        assert report['cross_check']['blind_spot'] is False  # source_total is 3
+
+        # (a) Every delete targets an id drawn from the scrolled members.
+        scrolled_ids = {m['id'] for m in members}
+        deleted_ids = {
+            call.kwargs['memory_id']
+            for call in memory_service.delete_memory.call_args_list
+        }
+        assert deleted_ids == {'term1', 'taskless1'}
+        assert deleted_ids <= scrolled_ids
+
+        # (b) Nothing from the adjacent pool is touched, by id or by filter.
+        assert not (deleted_ids & forbidden_ids)
+        for call in memory_service.delete_memory.call_args_list:
+            assert 'filters' not in call.kwargs, (
+                'delete_memory must be called per-id, never with a bulk '
+                f'filter: {call.kwargs}'
+            )
+            assert 'flag_for_stage2' not in repr(call.kwargs)
+
+        # (c) The enumeration was NOT widened: exactly one scroll, on source.
+        memory_service.get_memories_by_metadata.assert_called_once()
+        scroll_kwargs = memory_service.get_memories_by_metadata.call_args.kwargs
+        assert scroll_kwargs['filters'] == {'source': _mod.MARKER_SOURCE}
+        assert 'flag_for_stage2' not in scroll_kwargs['filters']
+
+    @pytest.mark.asyncio
+    async def test_probe_only_ever_counts_never_scrolls(self):
+        """The adjacent filter appears in count calls only — never in a
+        get_memories_by_metadata scroll, which is the only way records could
+        become delete-set candidates."""
+        memory_service = AsyncMock()
+        memory_service.count_memories_by_metadata = _counts(
+            source=0, kind=0, flag_for_stage2=61,
+        )
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=[])
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        await _mod.run(
+            self._args(), memory_service, now=self._NEUTRAL_NOW,
+        )
+
+        scroll_filters = [
+            call.kwargs.get('filters')
+            for call in memory_service.get_memories_by_metadata.call_args_list
+        ]
+        assert all(
+            'flag_for_stage2' not in (f or {}) for f in scroll_filters
+        ), f'Adjacent filter leaked into a scroll: {scroll_filters}'
+
+        count_filters = [
+            call.kwargs.get('filters')
+            for call in memory_service.count_memories_by_metadata.call_args_list
+        ]
+        assert {'flag_for_stage2': True} in count_filters
+        memory_service.delete_memory.assert_not_called()
+
+
+# ===========================================================================
+# Tests: enumeration_blind_spot (task 3897)
+# ===========================================================================
+
+class TestEnumerationBlindSpot:
+    """Tests for the pure predicate enumeration_blind_spot(enumerated, adjacent).
+
+    Task 3897: this script enumerates on {'source': 'stage1_flag_marker'},
+    which measures 0 records in every project probed, while the adjacent
+    {'flag_for_stage2': True} relay pool is non-empty (dated census:
+    docs/flag-marker-sweep-recurring.md). The consequence is a structural
+    false all-clear: `before.total_source` is always 0, so
+    backlog_verdict(0, N) holds unconditionally and forever, and the nightly
+    sweep prints `orphan_count: 0` every night against a pool it cannot see.
+
+    This predicate is what makes that divergence nameable. It distinguishes
+    "swept nothing because there was nothing" (a true no-op) from "swept
+    nothing because the enumeration filter cannot see the population" (a
+    blind spot).
+    """
+
+    @pytest.mark.parametrize('enumerated,adjacent,expected', [
+        # The live dark_factory shape: the source filter sees nothing while
+        # a flag_for_stage2 population exists.
+        (0, 61, True),
+        # The live reify shape, same defect, different magnitude.
+        (0, 80, True),
+        # Genuinely nothing anywhere — a true no-op, NOT a blind spot. This
+        # is the case that must not warn, or the warning becomes noise on
+        # every clean run.
+        (0, 0, False),
+        # The sweep can see its own pool. An adjacent population merely
+        # existing is not a blind spot — the two pools are distinct
+        # populations and both being non-empty is the healthy steady state.
+        (3, 61, False),
+        (3, 0, False),
+    ])
+    def test_blind_spot_predicate(self, enumerated, adjacent, expected):
+        """Blind spot iff the enumeration saw nothing AND an adjacent
+        population is non-empty."""
+        assert _mod.enumeration_blind_spot(enumerated, adjacent) is expected
+
+    def test_flag_for_stage2_filters_constant_shape(self):
+        """The census filter mirrors task_knowledge_sync._FLAG_FOR_STAGE2_ENUM_FILTERS."""
+        assert _mod.FLAG_FOR_STAGE2_FILTERS == {'flag_for_stage2': True}
+
+    def test_flag_for_stage2_filter_value_is_boolean_not_string(self):
+        """The boolean True is load-bearing: Qdrant payload filters are
+        type-sensitive, and the string variant {'flag_for_stage2': 'true'}
+        measures 0 against live dark_factory (independently re-confirmed
+        2026-08-09). A silent str/bool drift here would reintroduce exactly
+        the zero-matching blind spot this cross-check exists to detect —
+        `== {'flag_for_stage2': True}` alone would NOT catch it, since
+        `True == 1` and Python's dict equality would also accept 1.
+        """
+        value = _mod.FLAG_FOR_STAGE2_FILTERS['flag_for_stage2']
+        assert isinstance(value, bool)
+        assert value is True
 
 
 # ===========================================================================
@@ -1141,6 +3484,61 @@ class TestBacklogVerdict:
     def test_over_max_backlog_returns_1(self, after_total_source, max_backlog):
         """Residual backlog above the ceiling is violated → 1."""
         assert _mod.backlog_verdict(after_total_source, max_backlog) == 1
+
+
+# ===========================================================================
+# Tests: unsatisfiable_backlog_gate (task 4436)
+# ===========================================================================
+
+class TestUnsatisfiableBacklogGate:
+    """Tests for the pure function unsatisfiable_backlog_gate(structural_floor,
+    max_backlog) (task 4436): is this gate configuration structurally
+    incapable of EVER passing?
+
+    The structural sibling of enumeration_blind_spot — it answers one
+    diagnostic question about the GATE rather than about the population, and
+    it distinguishes a TRANSIENT backlog violation, which a later drain
+    clears, from a PERMANENT one, which no re-run can.
+    """
+
+    @pytest.mark.parametrize('structural_floor,max_backlog', [
+        (1, 0),
+        (4, 3),
+    ])
+    def test_floor_above_ceiling_is_unsatisfiable(self, structural_floor, max_backlog):
+        """(a)/(d) A floor above the ceiling can never pass — the exact
+        `--check --max-backlog 0` footgun this task exists to make legible."""
+        assert _mod.unsatisfiable_backlog_gate(structural_floor, max_backlog) is True
+
+    @pytest.mark.parametrize('structural_floor,max_backlog', [
+        (0, 0),
+        (3, 3),
+        (0, 5),
+    ])
+    def test_floor_at_or_under_ceiling_is_satisfiable(self, structural_floor, max_backlog):
+        """(b)/(c)/(e) A floor the ceiling accommodates is satisfiable.
+
+        (0, 0) is the measured-today population: the check must NOT fire on a
+        clean pool. (3, 3) is the BOUNDARY — the ceiling is inclusive, exactly
+        as backlog_verdict's is.
+        """
+        assert _mod.unsatisfiable_backlog_gate(structural_floor, max_backlog) is False
+
+    @pytest.mark.parametrize('structural_floor', range(5))
+    @pytest.mark.parametrize('max_backlog', range(5))
+    def test_is_the_strict_complement_of_backlog_verdict(self, structural_floor, max_backlog):
+        """The two predicates can never disagree at the boundary.
+
+        Pins this constraint to the same inclusive `<=` semantics as the
+        verdict it describes. Without it, a later edit could drift the two
+        apart and make the structural_floor block claim "unsatisfiable" about
+        a gate that in fact passes — a checked constraint that lies, which is
+        worse than the prose caveat it replaces.
+        """
+        assert (
+            _mod.unsatisfiable_backlog_gate(structural_floor, max_backlog)
+            is (_mod.backlog_verdict(structural_floor, max_backlog) == 1)
+        )
 
 
 # ===========================================================================
@@ -1193,6 +3591,129 @@ class TestResolveCheckExitCode:
         }
         assert _mod._resolve_check_exit_code(report, max_backlog=0) == 1
 
+    # -----------------------------------------------------------------
+    # --fail-on-blind-spot escalation (task 3897)
+    # -----------------------------------------------------------------
+
+    @staticmethod
+    def _blind_spot_report(blind_spot=True, probe_failed=False, total_source=0):
+        return {
+            'before': {'total_source': total_source, 'total_with_kind': total_source},
+            'cross_check': {
+                'source_total': total_source,
+                'flag_for_stage2_total': None if probe_failed else 61,
+                'blind_spot': blind_spot,
+                'probe_failed': probe_failed,
+            },
+        }
+
+    def test_blind_spot_fails_the_check_verdict_by_default(self):
+        """ARMED BY DEFAULT (task 3923), the load-bearing case.
+
+        This test previously asserted the OPPOSITE, on the premise that the
+        check wrapper "is ALREADY wired as a before_done.script predicate
+        for a deterministic watch task" and so must not start failing. That
+        premise is now false — the gate's only consumer, task 2902, is done
+        — which is what licenses the inversion. Ruling:
+        docs/flag-marker-sweep-recurring.md §"Decision (task 3923)".
+
+        The explicit keyword is still honoured (see
+        test_blind_spot_fails_when_opted_in); what changes is that omitting
+        it no longer downgrades an OBSERVED blind spot to a pass.
+        """
+        report = self._blind_spot_report(blind_spot=True)
+        assert _mod._resolve_check_exit_code(report, max_backlog=0) == 1
+        assert _mod._resolve_check_exit_code(
+            report, max_backlog=0, fail_on_blind_spot=True,
+        ) == 1
+
+    def test_blind_spot_fails_when_opted_in(self):
+        """With --fail-on-blind-spot, an observed blind spot is exit 1 even
+        though the backlog itself trivially 'holds' at 0."""
+        report = self._blind_spot_report(blind_spot=True)
+        assert _mod._resolve_check_exit_code(
+            report, max_backlog=0, fail_on_blind_spot=True,
+        ) == 1
+
+    def test_opted_in_without_blind_spot_falls_through_to_backlog_verdict(self):
+        """--fail-on-blind-spot only adds a failure mode; it never masks the
+        existing backlog verdict."""
+        holds = self._blind_spot_report(blind_spot=False, total_source=0)
+        assert _mod._resolve_check_exit_code(
+            holds, max_backlog=0, fail_on_blind_spot=True,
+        ) == 0
+
+        violated = self._blind_spot_report(blind_spot=False, total_source=7)
+        assert _mod._resolve_check_exit_code(
+            violated, max_backlog=0, fail_on_blind_spot=True,
+        ) == 1
+
+    def test_failed_probe_never_fails_the_gate_even_when_opted_in(self):
+        """An UNOBSERVABLE population must not fail the gate.
+
+        A transient Qdrant blip would otherwise flap a deterministic
+        before_done predicate — the gate escalates on observed divergence
+        only, never on missing evidence.
+        """
+        report = self._blind_spot_report(blind_spot=False, probe_failed=True)
+        assert _mod._resolve_check_exit_code(
+            report, max_backlog=0, fail_on_blind_spot=True,
+        ) == 0
+
+    def test_report_without_cross_check_block_does_not_raise(self):
+        """Defensive: an older/cached report shape with no cross_check key
+        resolves through the pre-existing backlog path rather than raising."""
+        report = {'before': {'total_source': 0, 'total_with_kind': 0}}
+        assert _mod._resolve_check_exit_code(
+            report, max_backlog=0, fail_on_blind_spot=True,
+        ) == 0
+
+        report_violated = {'before': {'total_source': 9, 'total_with_kind': 9}}
+        assert _mod._resolve_check_exit_code(
+            report_violated, max_backlog=0, fail_on_blind_spot=True,
+        ) == 1
+
+    # -----------------------------------------------------------------
+    # Armed-by-default properties (task 3923)
+    # -----------------------------------------------------------------
+
+    def test_opting_out_relaxes_only_the_vacuity_check_not_the_backlog(self):
+        """The escape hatch must never MASK a real finding.
+
+        --no-fail-on-blind-spot exists for an ad-hoc census, where an
+        operator wants the plain backlog number without the vacuity
+        veto. It must not become a blanket 'exit 0' — a residual backlog
+        over the ceiling is a substantive violation that the opt-out has
+        no business suppressing.
+        """
+        report = self._blind_spot_report(blind_spot=True, total_source=7)
+        assert _mod._resolve_check_exit_code(
+            report, max_backlog=0, fail_on_blind_spot=False,
+        ) == 1
+
+    def test_failed_probe_never_fails_the_gate_under_the_armed_default(self):
+        """ANTI-FLAP, asserted with NO keyword so the new default is what
+        is under test rather than assumed to have survived the flip.
+
+        run() already forces blind_spot=False whenever the adjacent
+        population could not be observed, so a transient Qdrant blip
+        yields 'unobservable', not 'observed blind spot'. Arming the
+        default must not convert missing evidence into a failure — the
+        gate escalates on observed divergence only.
+        """
+        report = self._blind_spot_report(blind_spot=False, probe_failed=True)
+        assert _mod._resolve_check_exit_code(report, max_backlog=0) == 0
+
+    def test_report_without_cross_check_block_resolves_under_armed_default(self):
+        """A report shape predating the cross_check block (task 3897) must
+        still resolve through the backlog path rather than raising, now
+        that the blind-spot branch is reached by default. Asserted with no
+        keyword: the .get chain is what keeps the armed default safe on an
+        older/cached report."""
+        assert _mod._resolve_check_exit_code(
+            {'before': {'total_source': 0, 'total_with_kind': 0}}, max_backlog=0,
+        ) == 0
+
 
 # ===========================================================================
 # Tests: _build_parser (task 2596 CLI surface)
@@ -1219,6 +3740,35 @@ class TestBuildParser:
         assert args.check is False
         assert args.max_backlog == 0
         assert args.terminal_drain is False
+        # task 3923: the RAW parser leaves the tri-state sentinel UNRESOLVED
+        # (None = "nobody asked"). _parse_args resolves it to True after its
+        # cross-flag validation — see TestParseArgs. The distinction is
+        # load-bearing: keying the requires---check rejection on `is not
+        # None` is what lets the nightly `--apply --terminal-drain` run
+        # (which passes neither spelling) parse cleanly instead of being
+        # rejected with exit 2 by an armed default it never asked for.
+        assert args.fail_on_blind_spot is None
+        # task 2917 EDIT 1: the per-project resolution seam the nightly
+        # wrapper uses. Defaults off so every pre-existing invocation still
+        # sweeps rather than printing a list and returning.
+        assert args.list_known_projects is False
+
+    def test_list_known_projects_flag(self):
+        """--list-known-projects is the seam
+        scripts/fused-memory-flag-marker-sweep.sh uses to per-projectize the
+        nightly drain (task 2917 EDIT 1). Resolution lives HERE, in Python,
+        rather than inline in the bash wrapper, so it is unit-testable and
+        so the wrapper's fake-recorder harness can distinguish a resolution
+        call from a sweep call by argv alone."""
+        parser = _mod._build_parser()
+        args = parser.parse_args(['--list-known-projects'])
+        assert args.list_known_projects is True
+
+    def test_fail_on_blind_spot_opt_in(self):
+        """--fail-on-blind-spot is a store_true opt-in (task 3897)."""
+        parser = _mod._build_parser()
+        args = parser.parse_args(['--fail-on-blind-spot'])
+        assert args.fail_on_blind_spot is True
 
     def test_max_age_days_override(self):
         """--max-age-days accepts an int override."""
@@ -1287,6 +3837,277 @@ class TestBuildParser:
 
 
 # ===========================================================================
+# Tests: _parse_args cross-flag validation (task 3897 amendment,
+# reviewer_comprehensive #1)
+# ===========================================================================
+
+class TestParseArgs:
+    """--fail-on-blind-spot without --check is rejected at parse time.
+
+    The flag reaches an exit code only through _resolve_check_exit_code,
+    which main() consults ONLY under --check. Accepted silently, it would
+    hand an operator wiring it as a before_done.script predicate a gate that
+    STRUCTURALLY CANNOT FAIL — the exact defect class task 3897 exists to
+    eliminate, and a silent degradation besides. So it errors out (argparse
+    exit code 2) instead of no-op'ing.
+    """
+
+    def test_opt_in_without_check_is_rejected_with_exit_2(self, capsys):
+        """The bare dry-run shape: `--fail-on-blind-spot` alone."""
+        with pytest.raises(SystemExit) as exc_info:
+            _mod._parse_args(['--fail-on-blind-spot'])
+        assert exc_info.value.code == 2
+        stderr = capsys.readouterr().err
+        assert '--fail-on-blind-spot requires --check' in stderr, (
+            f'Expected an actionable error naming both flags, got: {stderr!r}'
+        )
+
+    def test_apply_without_check_is_also_rejected(self, capsys):
+        """`--apply --fail-on-blind-spot` — the shape an operator would reach
+        for when adding the gate to the nightly sweep — exits 0 regardless of
+        cross_check.blind_spot, so it is rejected too."""
+        with pytest.raises(SystemExit) as exc_info:
+            _mod._parse_args(['--apply', '--fail-on-blind-spot'])
+        assert exc_info.value.code == 2
+        assert '--fail-on-blind-spot requires --check' in capsys.readouterr().err
+
+    @pytest.mark.parametrize(
+        ('argv', 'offender'),
+        [
+            (['--apply', '--list-known-projects'], '--apply'),
+            (['--check', '--list-known-projects'], '--check'),
+            (['--terminal-drain', '--list-known-projects'], '--terminal-drain'),
+            (['--delete-ids', 'abc', '--list-known-projects'], '--delete-ids'),
+        ],
+    )
+    def test_list_known_projects_with_a_sweeping_flag_is_rejected(
+        self, argv, offender, capsys,
+    ):
+        """task 2917 EDIT 1. --list-known-projects returns BEFORE the sweep
+        runs, so pairing it with any sweep-performing or verdict-rendering
+        flag would print the list and SILENTLY NOT SWEEP -- the same
+        cannot-fail/no-op defect class this function already rejects for
+        --fail-on-blind-spot. An operator who wired
+        `--apply --terminal-drain --list-known-projects` into the nightly
+        service would get a green run that drained nothing."""
+        with pytest.raises(SystemExit) as exc_info:
+            _mod._parse_args(argv)
+        assert exc_info.value.code == 2
+        stderr = capsys.readouterr().err
+        assert '--list-known-projects' in stderr and offender in stderr, (
+            f'Expected an actionable error naming both flags, got: {stderr!r}'
+        )
+
+    def test_list_known_projects_alone_parses(self):
+        """The supported shape -- resolution only, no sweep flags."""
+        args = _mod._parse_args(['--list-known-projects'])
+        assert args.list_known_projects is True
+
+    def test_nightly_argv_still_parses_alongside_the_new_guard(self):
+        """The load-bearing ordering guard, re-asserted for task 2917: the
+        nightly `--apply --terminal-drain` argv must keep parsing cleanly.
+        The new validation sits alongside the --fail-on-blind-spot check and
+        BEFORE the tri-state resolution, so it cannot reject a run that
+        passes neither spelling."""
+        args = _mod._parse_args(['--apply', '--terminal-drain'])
+        assert args.apply is True
+        assert args.terminal_drain is True
+        assert args.list_known_projects is False
+        assert args.fail_on_blind_spot is True
+
+    def test_opt_in_with_check_parses(self):
+        """The supported wiring — and the one
+        scripts/fused-memory-flag-marker-check.sh produces, since its exec
+        line hardcodes --check."""
+        args = _mod._parse_args(['--check', '--fail-on-blind-spot'])
+        assert args.check is True
+        assert args.fail_on_blind_spot is True
+
+    def test_pre_existing_invocations_are_unaffected(self):
+        """Every shape that predates the flag still parses unchanged — the
+        validation must not narrow the existing CLI contract.
+
+        task 3923: the bare-dry-run assertion flips False -> True because
+        _parse_args now RESOLVES the tri-state sentinel to the armed
+        default. The contract that must not narrow is that these shapes
+        still PARSE; what the resolved default is is asserted here, and its
+        irrelevance to the non---check paths is pinned by
+        test_nightly_sweep_argv_still_parses_under_the_armed_default.
+        """
+        assert _mod._parse_args([]).fail_on_blind_spot is True
+        assert _mod._parse_args(['--check']).check is True
+        assert _mod._parse_args(['--apply', '--terminal-drain']).apply is True
+        assert _mod._parse_args(['--check', '--max-backlog', '5']).max_backlog == 5
+
+    # -----------------------------------------------------------------
+    # --no-fail-on-blind-spot escape hatch + armed default (task 3923)
+    # -----------------------------------------------------------------
+
+    def test_nightly_sweep_argv_still_parses_under_the_armed_default(self):
+        """THE REGRESSION GUARD THIS WHOLE SENTINEL EXISTS FOR.
+
+        This is the exact argv scripts/fused-memory-flag-marker-sweep.sh
+        passes from the nightly systemd service. Implementing task 3923's
+        armed default the naive way — flipping argparse's default from
+        False to True — would make the pre-existing requires---check
+        validation fire on this shape, rejecting EVERY nightly run with
+        exit 2 and turning a working timer into a permanent systemd
+        `failed` state. That is the perpetual-failure footgun
+        docs/flag-marker-sweep-recurring.md's "Why no --check in the
+        recurring service" section exists to prevent.
+
+        The resolved default is True here but reaches nothing: main()
+        consults _resolve_check_exit_code only under --check, which this
+        invocation does not pass.
+        """
+        args = _mod._parse_args(['--apply', '--terminal-drain'])
+        assert args.check is False
+        assert args.fail_on_blind_spot is True
+
+    def test_opt_out_with_check_parses(self):
+        """--no-fail-on-blind-spot is the ad-hoc-census escape hatch: it
+        yields exactly False, not the None sentinel, so an explicit opt-out
+        is distinguishable from 'nobody asked'."""
+        args = _mod._parse_args(['--check', '--no-fail-on-blind-spot', '--max-backlog', '5'])
+        assert args.check is True
+        assert args.fail_on_blind_spot is False
+        assert args.max_backlog == 5
+
+    def test_opt_out_without_check_is_also_rejected_with_exit_2(self, capsys):
+        """The rejection is symmetric across BOTH spellings.
+
+        --no-fail-on-blind-spot without --check is just as inert as the
+        opt-in spelling: it reaches an exit code only through the --check
+        verdict path. Accepted silently it would hand an operator the
+        impression they had relaxed a gate that was never running — the
+        same silent-no-op class the opt-in rejection already covers, so it
+        errors out rather than no-op'ing.
+        """
+        with pytest.raises(SystemExit) as exc_info:
+            _mod._parse_args(['--no-fail-on-blind-spot'])
+        assert exc_info.value.code == 2
+        stderr = capsys.readouterr().err
+        # Assert the CROSS-FLAG error specifically, not merely exit 2:
+        # argparse's own 'unrecognized arguments' also exits 2 and echoes
+        # the flag name, so a laxer assertion would pass today (before the
+        # flag exists) and could never detect the flag being dropped later.
+        assert 'requires --check' in stderr, (
+            f'Expected the cross-flag rejection, not an unknown-flag error: {stderr!r}'
+        )
+        assert '--no-fail-on-blind-spot' in stderr, (
+            f'Expected an error naming the spelling actually passed, got: {stderr!r}'
+        )
+
+
+# ===========================================================================
+# Tests: main() report -> exit-code wiring (task 3897 amendment,
+# reviewer_comprehensive #5)
+# ===========================================================================
+
+class TestMainExitCode:
+    """main() is the only place args.fail_on_blind_spot reaches
+    _resolve_check_exit_code.
+
+    Since task 3923 armed the blind-spot policy by default, that keyword is
+    what carries an operator's EXPLICIT --no-fail-on-blind-spot opt-out down
+    to the verdict. A regression dropping it would silently re-arm the gate
+    for a caller who asked to relax it, while leaving every other test in
+    this file green — so the wiring is asserted end-to-end here (argv ->
+    parse -> exit code), with the live MemoryService construction
+    short-circuited at asyncio.run.
+    """
+
+    _BLIND_SPOT_REPORT = {
+        'dry_run': True,
+        'before': {'total_source': 0, 'total_with_kind': 0},
+        'orphan_count': 0,
+        'orphan_ids': [],
+        'cross_check': {
+            'source_total': 0,
+            'flag_for_stage2_total': 61,
+            'blind_spot': True,
+            'probe_failed': False,
+        },
+    }
+
+    def _run_main(self, monkeypatch, argv: list[str], report: dict) -> int:
+        """Run main() with *argv*, short-circuiting the live sweep to *report*."""
+        def _fake_asyncio_run(coro):
+            # main() has already built the _run_live() coroutine; close it so
+            # the stub does not leak a never-awaited coroutine warning.
+            coro.close()
+            return report
+
+        monkeypatch.setattr(sys, 'argv', ['sweep_orphan_flag_markers.py', *argv])
+        monkeypatch.setattr(_mod.asyncio, 'run', _fake_asyncio_run)
+        return _mod.main()
+
+    def test_opt_in_escalates_an_observed_blind_spot_to_exit_1(self, monkeypatch, capsys):
+        """--check --fail-on-blind-spot against a blind-spot report: exit 1."""
+        assert self._run_main(
+            monkeypatch, ['--check', '--fail-on-blind-spot'], self._BLIND_SPOT_REPORT,
+        ) == 1
+
+    def test_check_alone_now_fails_on_the_same_report(self, monkeypatch, capsys):
+        """END-TO-END proof the armed default reaches the exit code (3923).
+
+        This previously asserted 0, citing "the already-wired esc-2866-1 O2
+        watch task's contract". That watch (task 2902) is done, so the
+        contract it protected is discharged — see
+        docs/flag-marker-sweep-recurring.md §"Decision (task 3923)".
+
+        Bare `--check` on a report whose enumeration matched nothing while
+        an adjacent population is non-empty must now be exit 1. Asserting
+        it through main() rather than _resolve_check_exit_code directly is
+        the point: it proves the armed default survives the full argv ->
+        _parse_args (sentinel resolution) -> main() -> verdict path, which
+        a unit-level assertion on the function default alone would miss.
+        """
+        assert self._run_main(
+            monkeypatch, ['--check'], self._BLIND_SPOT_REPORT,
+        ) == 1
+
+    def test_opt_out_returns_to_the_plain_backlog_verdict(self, monkeypatch, capsys):
+        """The escape hatch, end to end (task 3923).
+
+        An operator taking an ad-hoc census with
+        `--check --no-fail-on-blind-spot` still gets the plain backlog
+        verdict — 0 on this report, whose total_source is 0. Paired with
+        test_check_alone_now_fails_on_the_same_report, this pins that the
+        SAME report resolves differently based solely on the opt-out
+        reaching the verdict, which is what proves main() forwards the
+        parsed value rather than re-deriving a default.
+        """
+        assert self._run_main(
+            monkeypatch, ['--check', '--no-fail-on-blind-spot'], self._BLIND_SPOT_REPORT,
+        ) == 0
+
+    def test_opt_in_without_check_never_reaches_the_sweep(self, monkeypatch, capsys):
+        """Rejection happens at parse time, before any live service is built
+        — so an operator's mis-wiring fails loudly and instantly rather than
+        running a full sweep and then exiting 0."""
+        def _must_not_run(coro):
+            coro.close()
+            raise AssertionError('the sweep must not run for a rejected arg combination')
+
+        monkeypatch.setattr(
+            sys, 'argv', ['sweep_orphan_flag_markers.py', '--fail-on-blind-spot'],
+        )
+        monkeypatch.setattr(_mod.asyncio, 'run', _must_not_run)
+
+        with pytest.raises(SystemExit) as exc_info:
+            _mod.main()
+        assert exc_info.value.code == 2
+
+    def test_no_check_returns_0_and_prints_the_report(self, monkeypatch, capsys):
+        """The default (non---check) path is unchanged: always exit 0, with
+        the JSON report — cross_check block included — on stdout."""
+        assert self._run_main(monkeypatch, [], self._BLIND_SPOT_REPORT) == 0
+        stdout = capsys.readouterr().out
+        assert '"cross_check"' in stdout and '"blind_spot": true' in stdout
+
+
+# ===========================================================================
 # Tests: _resolve_terminal_task_ids (task 2596 amendment, reviewer_comprehensive #3)
 # ===========================================================================
 
@@ -1312,9 +4133,14 @@ class TestResolveTerminalTaskIds:
         )
 
         with caplog.at_level(logging.WARNING, logger='sweep_orphan_flag_markers'):
-            result = await _mod._resolve_terminal_task_ids()
+            result, mode = await _mod._resolve_terminal_task_ids('dark_factory')
 
         assert result == set()
+        assert mode == 'unconfigured', (
+            f'An unconfigured taskmaster must be reported as its OWN mode, not '
+            f'as a bare empty set: the journal line renders it differently from '
+            f'a backend that failed and from a genuine zero; got {mode!r}'
+        )
         assert not any(
             record.name == 'sweep_orphan_flag_markers' for record in caplog.records
         ), f'Expected no WARNING logs, got: {[r.message for r in caplog.records]}'
@@ -1335,7 +4161,16 @@ class TestResolveTerminalTaskIds:
 
         monkeypatch.setattr(
             'fused_memory.config.schema.FusedMemoryConfig',
-            lambda: types.SimpleNamespace(taskmaster=object()),
+            # project_root is present so the primary-project guard (task 2917)
+            # resolves and MATCHES, letting the run reach the backend -- this
+            # test is about backend wiring, not about the guard.
+            lambda: types.SimpleNamespace(
+                taskmaster=types.SimpleNamespace(project_root='/srv/dark-factory'),
+            ),
+        )
+        monkeypatch.setattr(
+            'fused_memory.models.scope.resolve_project_id_for_root',
+            lambda _root: 'dark_factory',
         )
         monkeypatch.setattr(
             'fused_memory.backends.sqlite_task_backend.SqliteTaskBackend',
@@ -1343,9 +4178,14 @@ class TestResolveTerminalTaskIds:
         )
 
         with caplog.at_level(logging.WARNING, logger='sweep_orphan_flag_markers'):
-            result = await _mod._resolve_terminal_task_ids()
+            result, mode = await _mod._resolve_terminal_task_ids('dark_factory')
 
         assert result == set()
+        assert mode == 'resolution-failed', (
+            f'A raising backend must be distinguishable from a narrowed sweep '
+            f'and from a genuine zero, or a nightly whose task store failed to '
+            f'open reads like a healthy one; got {mode!r}'
+        )
         matching = [
             record for record in caplog.records
             if record.name == 'sweep_orphan_flag_markers' and record.levelno == logging.WARNING
@@ -1358,4 +4198,773 @@ class TestResolveTerminalTaskIds:
         )
         assert 'RuntimeError' in caplog.text and 'boom' in caplog.text, (
             f'Expected the traceback text in caplog output, got: {caplog.text!r}'
+        )
+
+
+# ===========================================================================
+# Tests: --apply store-mutation preflight
+# ===========================================================================
+
+class TestRunApplyStoreMutationPreflight:
+    """``--apply`` refuses to START when this process cannot write mem0's store.
+
+    Ported from ``test_sweep_toolcall_xml_leak.TestRunApplyStoreMutationPreflight``
+    (task 3686), which is the in-repo precedent for this contract.
+
+    ``delete_orphan_markers`` fans its deletes out through
+    ``asyncio.gather(..., return_exceptions=True)`` and tallies per-record
+    results rather than aborting, so in a write-denied environment it would
+    delete Qdrant points one at a time and record each history-write failure as
+    an individual error -- mem0's ``_delete_memory`` removes the point BEFORE
+    writing its SQLite history, so each of those "errors" is an
+    already-destroyed record. Only a run-wide probe ahead of the counts bounds
+    that.
+    """
+
+    _NEUTRAL_NOW = datetime(2026, 1, 1, tzinfo=UTC)
+
+    def _args(
+        self,
+        apply: bool = True,
+        project_id: str = 'dark_factory',
+        max_age_days: int = 14,
+    ):
+        """Mirror of ``TestRun._args``."""
+        import types as _types
+        return _types.SimpleNamespace(
+            apply=apply, project_id=project_id, max_age_days=max_age_days,
+        )
+
+    def _service(self) -> AsyncMock:
+        """AsyncMock service holding two deletable orphans."""
+        memory_service = AsyncMock()
+        memory_service.count_memories_by_metadata = _counts(source=[3, 1], kind=[1, 1])
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=[
+            _member('v1'),
+            _orphan('o1'),
+            _orphan('o2'),
+        ])
+        memory_service.delete_memory = AsyncMock(return_value=None)
+        return memory_service
+
+    @pytest.mark.asyncio
+    async def test_apply_performs_zero_mutations_when_the_store_is_unwritable(
+        self, monkeypatch
+    ):
+        """The whole point: refuse to start rather than half-complete."""
+        deny(_mod, monkeypatch)
+        memory_service = self._service()
+
+        with pytest.raises(
+            StoreMutationUnavailable, match=SENTINEL
+        ):
+            await _mod.run(
+                self._args(apply=True), memory_service, now=self._NEUTRAL_NOW,
+                terminal_task_ids=set(),
+            )
+
+        memory_service.delete_memory.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_the_guard_sits_before_every_backend_read(self, monkeypatch):
+        """It aborts without a single round-trip: three counts (the two before-
+        counts plus the flag_for_stage2 census) and the scroll enumeration are
+        all skipped in an environment that was never going to be allowed to
+        delete."""
+        deny(_mod, monkeypatch)
+        memory_service = self._service()
+
+        with pytest.raises(StoreMutationUnavailable):
+            await _mod.run(
+                self._args(apply=True), memory_service, now=self._NEUTRAL_NOW,
+                terminal_task_ids=set(),
+            )
+
+        memory_service.count_memories_by_metadata.assert_not_awaited()
+        memory_service.get_memories_by_metadata.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_dry_run_is_never_gated_on_write_capability(self, monkeypatch):
+        """A read-only run mutates nothing, so it must not require the ability
+        to mutate -- the sweep report stays obtainable from anywhere."""
+        deny(_mod, monkeypatch)
+        memory_service = self._service()
+
+        report = await _mod.run(
+            self._args(apply=False), memory_service, now=self._NEUTRAL_NOW,
+            terminal_task_ids=set(),
+        )
+
+        assert report['dry_run'] is True
+        assert set(report['orphan_ids']) == {'o1', 'o2'}
+        assert report['orphan_count'] == 2
+        memory_service.count_memories_by_metadata.assert_awaited()
+        memory_service.get_memories_by_metadata.assert_awaited()
+        memory_service.delete_memory.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_apply_is_unchanged_when_the_preflight_passes(self):
+        """Happy path: a writable environment sweeps exactly as before."""
+        memory_service = self._service()
+
+        report = await _mod.run(
+            self._args(apply=True), memory_service, now=self._NEUTRAL_NOW,
+            terminal_task_ids=set(),
+        )
+
+        assert memory_service.delete_memory.await_count == 2
+        assert report['dry_run'] is False
+        assert report['deleted'] == 2
+        assert 'after' in report
+
+    @pytest.mark.asyncio
+    async def test_the_probe_names_the_operation_being_gated(self, monkeypatch):
+        """The refusal has to be attributable in a log, so the operation string
+        identifies this script and its mutating mode."""
+        calls: list[dict] = []
+        monkeypatch.setattr(
+            _mod, 'assert_store_mutation_allowed', lambda **kw: calls.append(kw)
+        )
+        memory_service = self._service()
+
+        await _mod.run(
+            self._args(apply=True), memory_service, now=self._NEUTRAL_NOW,
+            terminal_task_ids=set(),
+        )
+
+        assert len(calls) == 1, 'probed ONCE per run, not once per orphan'
+        assert 'sweep_orphan_flag_markers' in calls[0]['operation']
+        assert '--apply' in calls[0]['operation']
+
+    def test_the_refusal_is_loud_and_reaches_mains_fatal_abort_path(
+        self, monkeypatch, caplog
+    ):
+        """Pinned surfacing: ``StoreMutationUnavailable`` subclasses
+        ``RuntimeError``, so it IS caught by ``main``'s blanket
+        ``except Exception``, which logs and returns 2.
+
+        That handler labels it a generic fatal sweep error, which is precisely
+        why the guard site's own ``logger.error`` must carry the fail-closed
+        diagnosis before the raise. Both halves are asserted end-to-end: the
+        exit code is non-zero, never 0, AND the journal an operator reads
+        carries the diagnosis rather than only "fatal error during sweep".
+        """
+        deny(_mod, monkeypatch)
+        memory_service = self._service()
+        monkeypatch.setattr(
+            sys, 'argv', ['sweep_orphan_flag_markers.py', '--apply'],
+        )
+        real_asyncio_run = asyncio.run
+
+        def _drive(coro, *_a, **_kw):
+            coro.close()  # never construct the live MemoryService
+            return real_asyncio_run(
+                _mod.run(
+                    self._args(apply=True), memory_service, now=self._NEUTRAL_NOW,
+                    terminal_task_ids=set(),
+                )
+            )
+
+        monkeypatch.setattr(_mod.asyncio, 'run', _drive)
+
+        with caplog.at_level(logging.ERROR):
+            exit_code = _mod.main()
+
+        assert exit_code == 2
+        # ``main``'s own generic "fatal error during sweep" ERROR shares this
+        # logger AND this level, so only the markers can tell the two apart.
+        (record,) = fail_closed_records(caplog, 'sweep_orphan_flag_markers')
+        assert SENTINEL in record.getMessage(), (
+            "main's blanket handler only says 'fatal error during sweep', so "
+            'the guard site must log the fail-closed diagnosis itself; got: '
+            f'{[r.getMessage() for r in caplog.records]}'
+        )
+        memory_service.delete_memory.assert_not_awaited()
+
+    def test_a_denied_check_predicate_never_reports_a_satisfied_backlog(
+        self, monkeypatch, caplog
+    ):
+        """``--apply --check --max-backlog N`` is a ``before_done.script``
+        predicate mode: its exit code is a deterministic gate's verdict.
+
+        A fail-closed guard that let that gate read as PASSED would be worse
+        than no guard at all -- it would convert "this process may not mutate
+        the store" into "the backlog is within budget". Pin that the refusal
+        wins: exit 2, never the predicate's 0.
+        """
+        deny(_mod, monkeypatch)
+        memory_service = self._service()
+        monkeypatch.setattr(
+            sys, 'argv',
+            ['sweep_orphan_flag_markers.py', '--apply', '--check', '--max-backlog', '100'],
+        )
+        real_asyncio_run = asyncio.run
+
+        def _drive(coro, *_a, **_kw):
+            coro.close()
+            return real_asyncio_run(
+                _mod.run(
+                    self._args(apply=True), memory_service, now=self._NEUTRAL_NOW,
+                    terminal_task_ids=set(),
+                )
+            )
+
+        monkeypatch.setattr(_mod.asyncio, 'run', _drive)
+
+        with caplog.at_level(logging.ERROR):
+            exit_code = _mod.main()
+
+        assert exit_code == 2, 'a refused --apply must never satisfy the --check gate'
+        # ``main``'s own generic "fatal error during sweep" ERROR shares this
+        # logger AND this level, so only the markers can tell the two apart.
+        (record,) = fail_closed_records(caplog, 'sweep_orphan_flag_markers')
+        assert SENTINEL in record.getMessage(), (
+            'a gate that fails must say WHY it failed -- an exit 2 with no '
+            'fail-closed diagnosis is indistinguishable from a crashed sweep; '
+            f'got: {[r.getMessage() for r in caplog.records]}'
+        )
+        memory_service.delete_memory.assert_not_awaited()
+
+
+class TestKnownProjectsCoverageIssue:
+    """_known_projects_coverage_issue() — the degradation predicate behind
+    --list-known-projects (task 2917 EDIT 1, esc-2917-3 ruling).
+
+    EMPTINESS IS THE WRONG KEY. ``build_known_projects_map`` seeds its
+    candidates with the primary root BEFORE extending with the env roots, so
+    an unset DASHBOARD_KNOWN_PROJECT_ROOTS yields a ONE-entry map, never an
+    empty one: the ``if not known_projects`` guard is unreachable in exactly
+    the degradation it was written to catch, and the nightly drain narrows to
+    a single project at exit 0, silently.
+
+    DRIVEN END-TO-END, ON PURPOSE (task 2917 amendment,
+    reviewer_comprehensive #2). Every test here sets the real env var against
+    real tmp_path roots and feeds the real ``_known_projects_map()`` output
+    into the predicate. The previous version stubbed BOTH sides —
+    monkeypatching ``resolve_project_id_for_root`` AND hand-passing the
+    resolved id list — so it asserted on a (root_named, id_absent) state the
+    real pipeline provably cannot produce, and stayed green no matter what
+    the registry builder did.
+
+    Three cases must be told apart:
+      (i)   a named root that IS NOT A DIRECTORY (typo, moved/unmounted
+            checkout). The builder ADMITS it deliberately, with a WARNING
+            (task 5286, arm (b)), so the sweep runs a phantom project that
+            enumerates 0, deletes 0 and exits 0;
+      (ii)  a named root whose resolved path is ABSENT from the map, i.e. its
+            project_id was claimed first by another root (first-wins). That
+            checkout is never swept;
+      (iii) the env var is UNSET — primary-only coverage. Reported, but NOT
+            as a hard failure: a legitimately single-project install would
+            otherwise warn-as-error forever.
+    """
+
+    @staticmethod
+    def _resolve_pair(monkeypatch, primary_root, named_roots=None):
+        """Run the REAL resolution pair: build the registry exactly as
+        ``--list-known-projects`` does, then judge coverage on THAT map.
+
+        Returns ``(known_map, issue)`` so a test can assert on both what the
+        builder actually produced and what the predicate said about it.
+        """
+        monkeypatch.setenv('PROJECT_ROOT', str(primary_root))
+        if named_roots is None:
+            monkeypatch.delenv('DASHBOARD_KNOWN_PROJECT_ROOTS', raising=False)
+        else:
+            monkeypatch.setenv(
+                'DASHBOARD_KNOWN_PROJECT_ROOTS',
+                ','.join(str(root) for root in named_roots),
+            )
+        known = _mod._known_projects_map()
+        return known, _mod._known_projects_coverage_issue(known)
+
+    @staticmethod
+    def _mkroot(parent, name):
+        root = parent / name
+        root.mkdir(parents=True)
+        return root
+
+    def test_unset_env_reports_single_project_coverage(self, monkeypatch, tmp_path):
+        """Case (iii): primary-only is legible, not silent."""
+        primary = self._mkroot(tmp_path, 'dark-factory')
+
+        known, issue = self._resolve_pair(monkeypatch, primary, named_roots=None)
+
+        assert list(known) == ['dark_factory'], (
+            f'The primary root is always seeded, so an unset env var yields a '
+            f'ONE-entry map -- the exact state an emptiness check cannot see; '
+            f'got {known!r}'
+        )
+        assert issue is not None, (
+            'A primary-only map must be REPORTED: it is the exact degradation '
+            'an empty-map check can never see, since the primary root is '
+            'always seeded into the map.'
+        )
+        assert 'DASHBOARD_KNOWN_PROJECT_ROOTS' in issue, issue
+        assert 'dark_factory' in issue, issue
+
+    def test_named_root_that_is_not_a_directory_is_reported_root_by_root(
+        self, monkeypatch, tmp_path,
+    ):
+        """Case (i), and the reason id-membership was the wrong test.
+
+        A nonexistent root is NOT skipped by build_known_projects_map -- the
+        builder admits it deliberately, with a WARNING (task 5286, arm (b)),
+        under a basename-derived project_id. Its id IS therefore in the map, an
+        id-membership predicate reports clean, and the wrapper goes on to
+        sweep a phantom project that counts 0 and exits 0. Asserted here on
+        the REAL map so the dead branch cannot come back.
+        """
+        primary = self._mkroot(tmp_path, 'dark-factory')
+        present = self._mkroot(tmp_path, 'reify')
+        gone = tmp_path / 'gone-project'  # deliberately never created
+
+        known, issue = self._resolve_pair(monkeypatch, primary, [present, gone])
+
+        assert 'gone_project' in known, (
+            f'Premise of this test: the builder ADMITS a nonexistent root '
+            f'(task 5286, arm (b)), which is why membership-by-id cannot '
+            f'detect it; got {known!r}'
+        )
+        assert issue is not None, (
+            'A named root that is not a directory is a genuine degradation -- '
+            'it becomes a phantom project the sweep runs for nothing -- and '
+            'must not pass quietly.'
+        )
+        assert str(gone) in issue, (
+            f'Expected the BROKEN root to be named so the warning is '
+            f'actionable; got {issue!r}'
+        )
+        assert str(present) not in issue, (
+            f'Expected only the broken root to be named, not the healthy '
+            f'ones; got {issue!r}'
+        )
+
+    def test_first_wins_collision_is_reported(self, monkeypatch, tmp_path):
+        """Case (ii): two real roots claiming ONE project_id.
+
+        build_known_projects_map keeps the first and drops the second, so the
+        dropped checkout is never swept. Its id is still in the map (the
+        winner's), which is the second reason an id-membership test was
+        structurally blind here -- coverage must be judged by resolved PATH.
+        """
+        primary = self._mkroot(tmp_path, 'dark-factory')
+        winner = self._mkroot(tmp_path / 'a', 'reify')
+        loser = self._mkroot(tmp_path / 'b', 'reify')
+
+        known, issue = self._resolve_pair(monkeypatch, primary, [winner, loser])
+
+        assert known.get('reify') == str(winner), (
+            f'Premise: first-wins keeps the earlier root; got {known!r}'
+        )
+        assert issue is not None, (
+            'A root whose project_id was already claimed is silently dropped '
+            'by the builder and never swept -- that must be reported.'
+        )
+        assert str(loser) in issue, (
+            f'Expected the DROPPED root to be named; got {issue!r}'
+        )
+        assert str(winner) not in issue, (
+            f'Expected the surviving root not to be named; got {issue!r}'
+        )
+
+    def test_fully_resolved_multi_project_map_is_quiet(self, monkeypatch, tmp_path):
+        """No degradation, no noise — otherwise the warning stops being read."""
+        primary = self._mkroot(tmp_path, 'dark-factory')
+        reify = self._mkroot(tmp_path, 'reify')
+        autotrade = self._mkroot(tmp_path, 'autotrade')
+
+        known, issue = self._resolve_pair(monkeypatch, primary, [reify, autotrade])
+
+        assert sorted(known) == ['autotrade', 'dark_factory', 'reify'], known
+        assert issue is None, issue
+
+    def test_primary_root_repeated_in_the_env_var_is_not_a_degradation(
+        self, monkeypatch, tmp_path,
+    ):
+        """MEASURED on the live registry: DASHBOARD_KNOWN_PROJECT_ROOTS lists
+        the primary root too, and build_known_projects_map drops it as a
+        duplicate project_id (logged at INFO). A naive count comparison
+        (len(map) < 1 + len(named)) would therefore cry degradation on every
+        healthy nightly run, and so would a path check that ignored the
+        first-wins dedup. Built for real here -- the env var names the primary
+        root itself -- rather than re-running the previous test's fixture
+        (task 2917 amendment, reviewer_comprehensive #3).
+        """
+        primary = self._mkroot(tmp_path, 'dark-factory')
+        reify = self._mkroot(tmp_path, 'reify')
+
+        known, issue = self._resolve_pair(monkeypatch, primary, [primary, reify])
+
+        assert sorted(known) == ['dark_factory', 'reify'], (
+            f'The repeated primary root must be DEDUPED, not duplicated; '
+            f'got {known!r}'
+        )
+        assert issue is None, (
+            f'The repeated primary root resolves to a path that IS in the map, '
+            f'so it is not a degradation; got {issue!r}'
+        )
+
+
+class TestTerminalDrainIsPrimaryProjectOnly:
+    """--terminal-drain must never arm deletions in a project whose task
+    store this process does not own (task 2917, esc-2917-3 ruling).
+
+    The defect: `_resolve_terminal_task_ids` took no project argument and
+    resolved terminal ids from `config.taskmaster.project_root` -- ONE
+    project's task DB. `main` computed that set once and handed it to `run`,
+    which matched markers by PLAIN STRING MEMBERSHIP against whatever
+    `--project-id` it was sweeping. Once the wrapper began looping over the
+    registered fleet, a sibling project's marker whose task_id merely
+    COLLIDES with a terminal dark_factory id (ids are small integers; the
+    measured collision rate was ~96%) would be deleted -- unrecoverably,
+    since mem0 removes the Qdrant point BEFORE writing its SQLite history.
+
+    The ruling: terminal-drain stays scoped to the PRIMARY project (the one
+    whose taskmaster root this process is configured with); every other
+    registered project is swept AGE-ONLY. The guard lives here rather than in
+    the bash wrapper because this is the single chokepoint every caller --
+    including a direct CLI invocation -- passes through.
+    """
+
+    @staticmethod
+    def _rig(monkeypatch, *, primary_id='dark_factory'):
+        """Wire a config whose taskmaster root resolves to `primary_id`, plus a
+        stub backend that WOULD yield terminal ids if it were ever reached."""
+        seen: dict[str, Any] = {'constructed': 0, 'get_statuses_roots': []}
+
+        class _StubBackend:
+            def __init__(self, _cfg):
+                seen['constructed'] += 1
+
+            async def start(self):
+                return None
+
+            async def get_statuses(self, project_root):
+                seen['get_statuses_roots'].append(project_root)
+                return {'11': 'done', '12': 'pending', '13': 'cancelled'}
+
+            async def close(self):
+                return None
+
+        monkeypatch.setattr(
+            'fused_memory.config.schema.FusedMemoryConfig',
+            lambda: types.SimpleNamespace(
+                taskmaster=types.SimpleNamespace(project_root='/srv/dark-factory'),
+            ),
+        )
+        monkeypatch.setattr(
+            'fused_memory.models.scope.resolve_project_id_for_root',
+            lambda _root: primary_id,
+        )
+        monkeypatch.setattr(
+            'fused_memory.backends.sqlite_task_backend.SqliteTaskBackend',
+            _StubBackend,
+        )
+        return seen
+
+    @pytest.mark.asyncio
+    async def test_non_primary_project_gets_no_terminal_ids(self, monkeypatch, caplog):
+        """The escalation's own ask: sweeping `reify` must NOT receive
+        dark_factory's terminal task ids. Returning set() degrades that
+        project to an age-only sweep -- today's status quo, which self-drains
+        -- instead of arming a cross-project delete."""
+        seen = self._rig(monkeypatch, primary_id='dark_factory')
+
+        with caplog.at_level(logging.WARNING, logger='sweep_orphan_flag_markers'):
+            result, mode = await _mod._resolve_terminal_task_ids('reify')
+
+        assert mode == 'narrowed-non-primary', (
+            f'The narrowing is the whole point of the guard, so it must be '
+            f'reported as a mode and not inferred from an empty set; got '
+            f'{mode!r}'
+        )
+        assert result == set(), (
+            f"Expected NO terminal ids for a non-primary project (they would be "
+            f"matched against reify's markers by plain string membership); "
+            f"got {result!r}"
+        )
+        assert seen['constructed'] == 0, (
+            'Expected the guard to short-circuit BEFORE the task backend is '
+            'even constructed, so no other project pays for a resolution it '
+            'must not use.'
+        )
+        messages = [
+            r.getMessage() for r in caplog.records
+            if r.name == 'sweep_orphan_flag_markers' and r.levelno == logging.WARNING
+        ]
+        assert messages, (
+            'A narrowed sweep must be LOUD: expected a WARNING, got '
+            f'{[r.getMessage() for r in caplog.records]}'
+        )
+        joined = ' '.join(messages)
+        assert 'reify' in joined and 'dark_factory' in joined, (
+            f'Expected the WARNING to name BOTH the swept project and the '
+            f'primary project so the journal explains the narrowing; got {joined!r}'
+        )
+        # Case-insensitive: the message emphasises the downgrade as AGE-ONLY,
+        # and the contract is that it SAYS so, not how it capitalises it.
+        assert 'age-only' in joined.lower(), (
+            f'Expected the WARNING to state the sweep proceeds age-only; '
+            f'got {joined!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_primary_project_still_gets_its_terminal_ids(self, monkeypatch):
+        """The guard must not disarm the working case: the primary project's
+        sweep still resolves terminal ids exactly as before."""
+        seen = self._rig(monkeypatch, primary_id='dark_factory')
+
+        result, mode = await _mod._resolve_terminal_task_ids('dark_factory')
+
+        assert mode == 'terminal-drain', (
+            f'The working case must report the mode that actually ran; got '
+            f'{mode!r}'
+        )
+        assert result == {'11', '13'}, (
+            f'Expected the primary project to keep its terminal-drain set; '
+            f'got {result!r}'
+        )
+        assert seen['constructed'] == 1
+        assert seen['get_statuses_roots'] == ['/srv/dark-factory']
+
+
+class TestEffectiveModeLabel:
+    """_effective_mode_label() — the per-project coverage line in the journal
+    (task 2917 amendment, reviewer_comprehensive #4).
+
+    The line previously read `'terminal-drain (N)' if terminal_task_ids else
+    'age-only'`, keying on the TRUTHINESS of the resolved set. That collapses
+    four operational states into one word, and the state an operator most
+    needs to tell apart -- the PRIMARY project resolving zero terminal ids
+    because its task store failed to open -- then reads identically to a
+    correctly narrowed sibling project. The stated goal of the line is to
+    report coverage rather than intent; these tests pin that it does.
+    """
+
+    def test_terminal_drain_reports_the_count_including_zero(self):
+        """Zero terminal ids on the primary project is a REAL terminal-drain
+        run, not an age-only one: the set is authoritative and empty."""
+        assert _mod._effective_mode_label('terminal-drain', set()) == (
+            'terminal-drain (0 terminal task ids)'
+        )
+        assert _mod._effective_mode_label('terminal-drain', {'1', '2'}) == (
+            'terminal-drain (2 terminal task ids)'
+        )
+
+    @pytest.mark.parametrize(
+        'mode,expected_marker',
+        [
+            ('narrowed-non-primary', 'NARROWED'),
+            ('unconfigured', 'NO '),
+            ('resolution-failed', 'FAILED'),
+            ('not-requested', 'not requested'),
+        ],
+    )
+    def test_every_empty_set_reason_renders_distinctly(self, mode, expected_marker):
+        label = _mod._effective_mode_label(mode, set())
+        assert label.startswith('age-only ('), label
+        assert expected_marker in label, (
+            f'Mode {mode!r} must say WHY the sweep was age-only; got {label!r}'
+        )
+
+    def test_the_four_age_only_reasons_are_not_the_same_string(self):
+        """A regression that mapped two reasons to one label would defeat the
+        whole point, and would pass every test above."""
+        labels = {
+            _mod._effective_mode_label(mode, set())
+            for mode in (
+                'narrowed-non-primary', 'unconfigured',
+                'resolution-failed', 'not-requested',
+            )
+        }
+        assert len(labels) == 4, f'Expected four distinct labels, got {labels!r}'
+
+    def test_an_unlabelled_mode_is_loud_rather_than_mislabelled_age_only(self):
+        """Fail-visible: a mode added to the resolver without a label must not
+        silently print `age-only` for something that may not be age-only."""
+        label = _mod._effective_mode_label('brand-new-mode', set())
+        assert 'brand-new-mode' in label and 'UNKNOWN' in label, label
+
+
+class TestListKnownProjects:
+    """_known_projects_map() — the registry-backed resolution behind
+    --list-known-projects (task 2917 EDIT 1).
+
+    The nightly wrapper previously swept exactly ONE project (the sweep's
+    own `--project-id` default, dark_factory) while its per-project census
+    output read as if the fleet were covered. This helper is what lets the
+    wrapper ask the SAME {project_id: project_root} registry the
+    fused-memory server itself is configured from, rather than duplicating a
+    host-specific root list into a committed unit file.
+
+    Fail-safe posture mirrors _resolve_terminal_task_ids: any failure
+    degrades to {} (logged at WARNING) rather than propagating.
+
+    It returns the MAP, not just the ids: --list-known-projects prints
+    sorted(map) while _known_projects_coverage_issue judges coverage against
+    map.values(), so both consumers read ONE derivation of each root (task
+    2917 amendment, reviewer_comprehensive #6).
+    """
+
+    def test_returns_the_registry_map_verbatim(self, monkeypatch):
+        import fused_memory.models.scope as scope
+
+        monkeypatch.setattr(
+            scope, 'build_known_projects_map',
+            lambda *_a, **_kw: {'reify': '/b', 'dark_factory': '/a'},
+        )
+        assert _mod._known_projects_map() == {'reify': '/b', 'dark_factory': '/a'}, (
+            'The roots must survive the call: the coverage predicate compares '
+            'env-named roots against these VALUES, and re-deriving them is '
+            'what made it fragile.'
+        )
+
+    def test_passes_project_root_env_through_as_primary_root(self, monkeypatch):
+        """PROJECT_ROOT is the seam the wrapper already exports, so the
+        primary root the registry is built around must come from it."""
+        import fused_memory.models.scope as scope
+
+        seen: dict[str, Any] = {}
+
+        def _capture(primary_root, extra_roots=None):
+            seen['primary_root'] = primary_root
+            seen['extra_roots'] = extra_roots
+            return {'dark_factory': primary_root}
+
+        monkeypatch.setattr(scope, 'build_known_projects_map', _capture)
+        monkeypatch.setenv('PROJECT_ROOT', '/srv/some-checkout')
+
+        assert _mod._known_projects_map() == {'dark_factory': '/srv/some-checkout'}
+        assert seen['primary_root'] == '/srv/some-checkout'
+        # extra_roots left None so the registry defaults it from
+        # known_project_roots_from_env() (DASHBOARD_KNOWN_PROJECT_ROOTS) --
+        # the wrapper must not re-derive that list itself.
+        assert seen['extra_roots'] is None
+
+    def test_degrades_to_empty_map_when_registry_raises(self, monkeypatch, caplog):
+        """Fail-safe, not fail-open: a broken registry must not take down the
+        nightly drain, but it must be visible in the journal."""
+        import fused_memory.models.scope as scope
+
+        def _boom(*_a, **_kw):
+            raise RuntimeError('registry exploded')
+
+        monkeypatch.setattr(scope, 'build_known_projects_map', _boom)
+
+        with caplog.at_level(logging.WARNING):
+            assert _mod._known_projects_map() == {}
+        assert any(
+            'registry exploded' in r.getMessage()
+            or '_known_projects_map' in r.getMessage()
+            for r in caplog.records
+        ), f'Expected a WARNING naming the failure; got {[r.getMessage() for r in caplog.records]}'
+
+
+class TestMainListKnownProjects:
+    """main() --list-known-projects — the branch the nightly wrapper consumes
+    with `$( ... )` word-splitting (task 2917 amendment,
+    reviewer_comprehensive #5).
+
+    Every contract here is read by BASH, not by Python, and the wrapper-side
+    tests substitute a fake recorder for this script — so without these, a
+    regression in any of the three silently changes what the nightly sweeps:
+
+      * stdout is EXACTLY one project_id per line and nothing else. Any stray
+        stdout write is word-split into an extra `--project-id` the wrapper
+        then sweeps;
+      * exit 1 when the registry resolves empty. That non-zero is what trips
+        the wrapper's narrow-and-warn fallback; `_known_projects_map` returning
+        `{}` is tested on its own, but the exit code that turns it into a
+        caller-visible signal is what the wrapper actually keys on;
+      * NO MemoryService and NO FusedMemoryConfig are constructed on this path.
+        That is why the wrapper can resolve the project list before the stores
+        are known reachable.
+    """
+
+    @staticmethod
+    def _no_store(monkeypatch):
+        """Make ANY live-store construction an immediate, loud failure."""
+        def _forbidden(*_args, **_kwargs):
+            raise AssertionError(
+                'the --list-known-projects path must not touch the live stores'
+            )
+
+        monkeypatch.setattr(
+            'fused_memory.config.schema.FusedMemoryConfig', _forbidden,
+        )
+        monkeypatch.setattr(
+            'fused_memory.services.memory_service.MemoryService', _forbidden,
+        )
+        monkeypatch.setattr(_mod.asyncio, 'run', _forbidden)
+
+    def _run(self, monkeypatch, resolved):
+        monkeypatch.setattr(
+            sys, 'argv', ['sweep_orphan_flag_markers.py', '--list-known-projects'],
+        )
+        monkeypatch.setattr(_mod, '_known_projects_map', lambda: resolved)
+        self._no_store(monkeypatch)
+        return _mod.main()
+
+    def test_prints_one_sorted_project_id_per_line_and_nothing_else(
+        self, monkeypatch, capsys,
+    ):
+        exit_code = self._run(
+            monkeypatch, {'reify': '/b', 'dark_factory': '/a', 'autotrade': '/c'},
+        )
+        out = capsys.readouterr().out
+
+        assert exit_code == 0
+        assert out == 'autotrade\ndark_factory\nreify\n', (
+            f'The wrapper word-splits this stdout straight into --project-id '
+            f'arguments, so it must carry the ids and NOTHING else (sorted, so '
+            f'the journal order is stable); got {out!r}'
+        )
+
+    def test_json_report_is_not_printed_on_this_path(self, monkeypatch, capsys):
+        """The sweeping path ends with `print(json.dumps(report))`. If that
+        ever leaked into this branch every JSON token would become a swept
+        project_id."""
+        self._run(monkeypatch, {'dark_factory': '/a'})
+        out = capsys.readouterr().out
+
+        assert out.split() == ['dark_factory'], (
+            f'Expected exactly the id list; got {out!r}'
+        )
+
+    def test_empty_registry_exits_1_with_no_stdout(self, monkeypatch, capsys):
+        """The wrapper's narrow-and-warn fallback triggers on the EXIT CODE.
+        A 0 here would leave PROJECT_IDS empty-but-successful and the drain
+        would silently sweep nothing."""
+        exit_code = self._run(monkeypatch, {})
+        out = capsys.readouterr().out
+
+        assert exit_code == 1, (
+            f'An unresolvable registry must be a caller-visible signal, not a '
+            f'quiet success; got exit {exit_code}'
+        )
+        assert out == '', (
+            f'Nothing may reach stdout when there is no list to emit -- the '
+            f'wrapper only checks emptiness of what it captured; got {out!r}'
+        )
+
+    def test_reports_the_coverage_degradation_without_polluting_stdout(
+        self, monkeypatch, capsys, caplog,
+    ):
+        """A primary-only map is warned about (it is the degradation an
+        emptiness check can never see) — but on the LOG, never on stdout."""
+        monkeypatch.delenv('DASHBOARD_KNOWN_PROJECT_ROOTS', raising=False)
+
+        with caplog.at_level(logging.WARNING, logger='sweep_orphan_flag_markers'):
+            exit_code = self._run(monkeypatch, {'dark_factory': '/a'})
+        out = capsys.readouterr().out
+
+        assert exit_code == 0
+        assert out == 'dark_factory\n', out
+        assert any(
+            'DASHBOARD_KNOWN_PROJECT_ROOTS' in r.getMessage()
+            for r in caplog.records
+        ), (
+            'A primary-only map must still be REPORTED at WARNING; got '
+            f'{[r.getMessage() for r in caplog.records]}'
         )

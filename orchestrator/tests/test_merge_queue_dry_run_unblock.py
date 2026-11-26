@@ -2,7 +2,7 @@
 
 Closes the AFK coverage gap: today metadata.dry_run_proposals[] is written
 ONLY by workflow._spawn_dry_run_unblock at agent-block time — merge_queue's
-post-merge-verify block path (_run_post_merge_verify) produces a
+post-merge-verify block path (run_post_merge_verify) produces a
 MergeOutcome('blocked') but never spawned a dry-run investigation, so
 b3_gate.check_proposal returned ABORT 'no proposal to gate' for the entire
 merge-verify-RED class.
@@ -13,7 +13,7 @@ timeouts / disabled unblock_auto / duplicate in-flight investigations, and the
 exclusion of the sibling blocked classes (flock-contention, persistent
 ENOSPC, disk-guard-skip, main-health-red). Reuses the
 test_merge_queue_main_health.py driver (_make_config/_make_git_ops/_make_req,
-COMPILE_ERROR_RESULT) to reach _run_post_merge_verify's blocked outcomes.
+COMPILE_ERROR_RESULT) to reach run_post_merge_verify's blocked outcomes.
 """
 from __future__ import annotations
 
@@ -21,9 +21,15 @@ import asyncio
 import contextlib
 import os
 import shutil
+from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
+from _git_fixtures import seed_repo
+from _merge_lane_fakes import FakeVerifier, VerifyScript, lane_scene_config, make_lane
+from _orch_helpers import wait_responsive
 from test_dry_run_unblock import _init_git_repo, _make_agent_result, _RecordingScheduler
 from test_merge_queue_main_health import (
     COMPILE_ERROR_RESULT,
@@ -35,16 +41,22 @@ from test_merge_queue_main_health import (
 )
 
 from orchestrator.b3_gate import ABORT, check_proposal
+from orchestrator.config import GitConfig, OrchestratorConfig
+from orchestrator.dry_run_unblock import investigation_task_name
 from orchestrator.event_store import EventType
-from orchestrator.merge_queue import (
-    MAIN_HEALTH_RED_REASON_PREFIX,
+from orchestrator.git_ops import GitOps
+from orchestrator.merge_lane.main_health_probe import MAIN_HEALTH_RED_REASON_PREFIX
+from orchestrator.merge_lane.post_merge_verify import run_post_merge_verify
+from orchestrator.merge_lane.verify_failure_outcome import (
     TRANSIENT_INFRA_REASON_PREFIX,
+    DryRunInvestigationHandles,
+)
+from orchestrator.merge_lane.worker import (
+    PRODUCTION_CLOCK,
+    PRODUCTION_VERIFIER,
     MergeOutcome,
     MergeRequest,
-    RealMergeItem,
-    SpeculativeMergeWorker,
-    _DryRunInvestigationHandles,
-    _run_post_merge_verify,
+    QueuedBranch,
 )
 from orchestrator.unblock_types import BlockClass
 from orchestrator.verify import VerifyResult
@@ -52,7 +64,6 @@ from orchestrator.verify_runner import (
     FLOCK_CONTENTION_CATEGORY,
     UNSCOPED_TYPECHECK_FAILED_CATEGORY,
     UNSCOPED_TYPECHECK_TIMEOUT_CATEGORY,
-    HostLease,
 )
 
 PERSISTENT_ENOSPC_RESULT = VerifyResult(
@@ -93,15 +104,52 @@ FLOCK_CONTENTION_RESULT = VerifyResult(
 )
 
 
+class _SpawningVerifier(FakeVerifier):
+    """``FakeVerifier`` whose ``dry_run_unblock`` is the REAL investigation.
+
+    The capstones below assert on what ``run_dry_run_unblock`` actually
+    WRITES -- the scheduler's ``dry_run_proposals`` blob, the
+    ``invocation_end`` event -- so the port must run the production
+    investigation rather than record it. Everything else (the scoped verify
+    result, the disk guard) stays scripted, and the spawn is still recorded
+    in ``investigations``.
+    """
+
+    def dry_run_unblock(self, **investigation: Any):
+        self.investigations.append(investigation)
+        return PRODUCTION_VERIFIER.dry_run_unblock(**investigation)
+
+
+class _SpawnIsdirVerifier(FakeVerifier):
+    """``FakeVerifier`` that reads the spawned worktree's liveness AT SPAWN.
+
+    ``test_investigation_uses_retained_task_worktree_surviving_real_cleanup``
+    is about which worktree the investigation is handed while the ephemeral
+    merge worktree is being removed under it, so the ``isdir`` probe has to
+    happen when the port is called, not after the test has finished.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(default=VerifyScript(result=COMPILE_ERROR_RESULT))
+        self.isdir_at_spawn: list[bool] = []
+
+    def dry_run_unblock(self, **investigation: object):
+        worktree = investigation.get('worktree')
+        self.isdir_at_spawn.append(
+            isinstance(worktree, str) and os.path.isdir(worktree),
+        )
+        return super().dry_run_unblock(**investigation)
+
+
 def _make_handles(
     *, scheduler: object | None = None, mcp: object | None = None,
-) -> _DryRunInvestigationHandles:
+) -> DryRunInvestigationHandles:
     """Build a handles bundle with a live (non-None) scheduler by default.
 
-    A live scheduler is required for _spawn_merge_verify_dry_run to proceed
+    A live scheduler is required for spawn_merge_verify_dry_run to proceed
     past its `handles is None or handles.scheduler is None` early return.
     """
-    return _DryRunInvestigationHandles(
+    return DryRunInvestigationHandles(
         scheduler=MagicMock() if scheduler is None else scheduler,
         mcp=MagicMock() if mcp is None else mcp,
     )
@@ -112,16 +160,23 @@ async def _drive_verify_with_handles(
     merge_wt: Path,
     git_ops,
     *,
-    dry_run_handles: _DryRunInvestigationHandles | None,
+    verifier: FakeVerifier,
+    dry_run_handles: DryRunInvestigationHandles | None,
 ) -> MergeOutcome | None:
-    """test_merge_queue_main_health._drive_verify + the dry_run_handles kwarg."""
-    return await _run_post_merge_verify(
+    """test_merge_queue_main_health._drive_verify + the dry_run_handles kwarg.
+
+    *verifier* is the injected ``VerifyPort``: it decides the scoped verify's
+    result, answers the disk guard, and records (instead of running) the
+    dry-run investigation the block path spawns.
+    """
+    return await run_post_merge_verify(
         git_ops, req, merge_wt,
         timeouts={},
         enospc_retries={},
         max_timeouts=3,
         max_enospc=1,
         dry_run_handles=dry_run_handles,
+        verifier=verifier,
     )
 
 
@@ -132,7 +187,7 @@ class TestGenericMergeVerifyRedSpawnsDryRun:
     """
 
     def test_generic_merge_verify_red_spawns_dry_run(self, tmp_path: Path) -> None:
-        config = _make_config(tmp_path)
+        config = _make_config(tmp_path, escalate_preexisting=False)
         git_ops = _make_git_ops(tmp_path)
         merge_wt = tmp_path / 'merge-wt'
         merge_wt.mkdir()
@@ -140,45 +195,30 @@ class TestGenericMergeVerifyRedSpawnsDryRun:
         (tmp_path / 'task-wt').mkdir()
 
         handles = _make_handles()
-        run_dry_run_mock = AsyncMock(return_value=None)
+        verifier = FakeVerifier(default=VerifyScript(result=COMPILE_ERROR_RESULT))
 
         async def _run() -> MergeOutcome | None:
-            with (
-                patch(
-                    'orchestrator.merge_queue.run_scoped_verification',
-                    new=AsyncMock(return_value=COMPILE_ERROR_RESULT),
-                ),
-                patch(
-                    'orchestrator.merge_queue.verify_failure_is_preexisting_on_main',
-                    new=AsyncMock(return_value=(False, '')),
-                ),
-                patch(
-                    'orchestrator.merge_queue.run_dry_run_unblock',
-                    new=run_dry_run_mock,
-                ),
-            ):
-                outcome = await _drive_verify_with_handles(
-                    req, merge_wt, git_ops, dry_run_handles=handles,
+            outcome = await _drive_verify_with_handles(
+                req, merge_wt, git_ops, verifier=verifier, dry_run_handles=handles,
+            )
+            # Let the fire-and-forget create_task run to completion
+            # (the injected port's investigation resolves immediately) inside this SAME
+            # loop, before asyncio.run() tears it down — draining
+            # avoids a "coroutine was never awaited" / pending-task
+            # teardown warning (filterwarnings turns these into errors).
+            await asyncio.sleep(0)
+            if handles.background_tasks:
+                await asyncio.gather(
+                    *handles.background_tasks, return_exceptions=True,
                 )
-                # Let the fire-and-forget create_task run to completion
-                # (run_dry_run_mock resolves immediately) inside this SAME
-                # loop, before asyncio.run() tears it down — draining
-                # avoids a "coroutine was never awaited" / pending-task
-                # teardown warning (filterwarnings turns these into errors).
-                await asyncio.sleep(0)
-                if handles.background_tasks:
-                    await asyncio.gather(
-                        *handles.background_tasks, return_exceptions=True,
-                    )
-                return outcome
+            return outcome
 
         outcome = asyncio.run(_run())
 
         assert outcome is not None
         assert outcome.status == 'blocked'
-        run_dry_run_mock.assert_awaited_once()
-        assert run_dry_run_mock.await_args is not None
-        kwargs = run_dry_run_mock.await_args.kwargs
+        assert len(verifier.investigations) == 1, verifier.investigations
+        kwargs = verifier.investigations[0]
         assert kwargs['block_class'] == BlockClass.MERGE_VERIFY_RED, (
             f'Expected block_class=MERGE_VERIFY_RED; got {kwargs.get("block_class")!r}'
         )
@@ -201,41 +241,27 @@ class TestGenericMergeVerifyRedSpawnsDryRun:
     ) -> None:
         """dry_run_handles=None (the solo-reverify/train module-level callers)
         must not attempt to spawn any investigation."""
-        config = _make_config(tmp_path)
+        config = _make_config(tmp_path, escalate_preexisting=False)
         git_ops = _make_git_ops(tmp_path)
         merge_wt = tmp_path / 'merge-wt'
         merge_wt.mkdir()
         req = _make_req('99', tmp_path / 'task-wt', config)
         (tmp_path / 'task-wt').mkdir()
 
-        run_dry_run_mock = AsyncMock(return_value=None)
+        verifier = FakeVerifier(default=VerifyScript(result=COMPILE_ERROR_RESULT))
 
         async def _run() -> MergeOutcome | None:
-            with (
-                patch(
-                    'orchestrator.merge_queue.run_scoped_verification',
-                    new=AsyncMock(return_value=COMPILE_ERROR_RESULT),
-                ),
-                patch(
-                    'orchestrator.merge_queue.verify_failure_is_preexisting_on_main',
-                    new=AsyncMock(return_value=(False, '')),
-                ),
-                patch(
-                    'orchestrator.merge_queue.run_dry_run_unblock',
-                    new=run_dry_run_mock,
-                ),
-            ):
-                outcome = await _drive_verify_with_handles(
-                    req, merge_wt, git_ops, dry_run_handles=None,
-                )
-                await asyncio.sleep(0)
-                return outcome
+            outcome = await _drive_verify_with_handles(
+                req, merge_wt, git_ops, verifier=verifier, dry_run_handles=None,
+            )
+            await asyncio.sleep(0)
+            return outcome
 
         outcome = asyncio.run(_run())
 
         assert outcome is not None
         assert outcome.status == 'blocked'
-        run_dry_run_mock.assert_not_awaited()
+        assert verifier.investigations == [], verifier.investigations
 
 
 class TestTimeoutAndTransientInfraDoNotSpawn:
@@ -256,34 +282,24 @@ class TestTimeoutAndTransientInfraDoNotSpawn:
         (tmp_path / 'task-wt').mkdir()
 
         handles = _make_handles()
-        run_dry_run_mock = AsyncMock(return_value=None)
+        verifier = FakeVerifier(default=VerifyScript(result=INFRA_TIMEOUT_RESULT))
 
         async def _run() -> MergeOutcome | None:
-            with (
-                patch(
-                    'orchestrator.merge_queue.run_scoped_verification',
-                    new=AsyncMock(return_value=INFRA_TIMEOUT_RESULT),
-                ),
-                patch(
-                    'orchestrator.merge_queue.run_dry_run_unblock',
-                    new=run_dry_run_mock,
-                ),
-            ):
-                outcome = await _drive_verify_with_handles(
-                    req, merge_wt, git_ops, dry_run_handles=handles,
+            outcome = await _drive_verify_with_handles(
+                req, merge_wt, git_ops, verifier=verifier, dry_run_handles=handles,
+            )
+            await asyncio.sleep(0)
+            if handles.background_tasks:
+                await asyncio.gather(
+                    *handles.background_tasks, return_exceptions=True,
                 )
-                await asyncio.sleep(0)
-                if handles.background_tasks:
-                    await asyncio.gather(
-                        *handles.background_tasks, return_exceptions=True,
-                    )
-                return outcome
+            return outcome
 
         outcome = asyncio.run(_run())
 
         assert outcome is not None
         assert outcome.status == 'blocked'
-        run_dry_run_mock.assert_not_awaited()
+        assert verifier.investigations == [], verifier.investigations
 
     def test_disk_guard_skip_does_not_spawn(self, tmp_path: Path) -> None:
         config = _make_config(tmp_path)
@@ -294,32 +310,23 @@ class TestTimeoutAndTransientInfraDoNotSpawn:
         (tmp_path / 'task-wt').mkdir()
 
         handles = _make_handles()
-        run_dry_run_mock = AsyncMock(return_value=None)
         disk_reason = f'{TRANSIENT_INFRA_REASON_PREFIX}: pre-verify disk guard found only 0.10 GiB free'
 
+        verifier = FakeVerifier(disk_reason=disk_reason)
+
         async def _run() -> MergeOutcome | None:
-            with (
-                patch(
-                    'orchestrator.merge_queue._ensure_verify_disk_space',
-                    new=AsyncMock(return_value=disk_reason),
-                ),
-                patch(
-                    'orchestrator.merge_queue.run_dry_run_unblock',
-                    new=run_dry_run_mock,
-                ),
-            ):
-                outcome = await _drive_verify_with_handles(
-                    req, merge_wt, git_ops, dry_run_handles=handles,
-                )
-                await asyncio.sleep(0)
-                return outcome
+            outcome = await _drive_verify_with_handles(
+                req, merge_wt, git_ops, verifier=verifier, dry_run_handles=handles,
+            )
+            await asyncio.sleep(0)
+            return outcome
 
         outcome = asyncio.run(_run())
 
         assert outcome is not None
         assert outcome.status == 'blocked'
         assert outcome.verify_skipped is True
-        run_dry_run_mock.assert_not_awaited()
+        assert verifier.investigations == [], verifier.investigations
 
     def test_persistent_enospc_does_not_spawn(self, tmp_path: Path) -> None:
         config = _make_config(tmp_path)
@@ -330,24 +337,14 @@ class TestTimeoutAndTransientInfraDoNotSpawn:
         (tmp_path / 'task-wt').mkdir()
 
         handles = _make_handles()
-        run_dry_run_mock = AsyncMock(return_value=None)
+        verifier = FakeVerifier(default=VerifyScript(result=PERSISTENT_ENOSPC_RESULT))
 
         async def _run() -> MergeOutcome | None:
-            with (
-                patch(
-                    'orchestrator.merge_queue.run_scoped_verification',
-                    new=AsyncMock(return_value=PERSISTENT_ENOSPC_RESULT),
-                ),
-                patch(
-                    'orchestrator.merge_queue.run_dry_run_unblock',
-                    new=run_dry_run_mock,
-                ),
-            ):
-                outcome = await _drive_verify_with_handles(
-                    req, merge_wt, git_ops, dry_run_handles=handles,
-                )
-                await asyncio.sleep(0)
-                return outcome
+            outcome = await _drive_verify_with_handles(
+                req, merge_wt, git_ops, verifier=verifier, dry_run_handles=handles,
+            )
+            await asyncio.sleep(0)
+            return outcome
 
         outcome = asyncio.run(_run())
 
@@ -357,7 +354,7 @@ class TestTimeoutAndTransientInfraDoNotSpawn:
             f'Expected reason to start with TRANSIENT_INFRA_REASON_PREFIX; '
             f'got {outcome.reason!r}'
         )
-        run_dry_run_mock.assert_not_awaited()
+        assert verifier.investigations == [], verifier.investigations
 
 
 class TestUnscopedTypecheckFailedSpawns:
@@ -375,36 +372,25 @@ class TestUnscopedTypecheckFailedSpawns:
         (tmp_path / 'task-wt').mkdir()
 
         handles = _make_handles()
-        run_dry_run_mock = AsyncMock(return_value=None)
+        verifier = FakeVerifier(default=VerifyScript(result=UNSCOPED_TYPECHECK_FAILED_RESULT))
 
         async def _run() -> MergeOutcome | None:
-            with (
-                patch(
-                    'orchestrator.merge_queue.run_scoped_verification',
-                    new=AsyncMock(return_value=UNSCOPED_TYPECHECK_FAILED_RESULT),
-                ),
-                patch(
-                    'orchestrator.merge_queue.run_dry_run_unblock',
-                    new=run_dry_run_mock,
-                ),
-            ):
-                outcome = await _drive_verify_with_handles(
-                    req, merge_wt, git_ops, dry_run_handles=handles,
+            outcome = await _drive_verify_with_handles(
+                req, merge_wt, git_ops, verifier=verifier, dry_run_handles=handles,
+            )
+            await asyncio.sleep(0)
+            if handles.background_tasks:
+                await asyncio.gather(
+                    *handles.background_tasks, return_exceptions=True,
                 )
-                await asyncio.sleep(0)
-                if handles.background_tasks:
-                    await asyncio.gather(
-                        *handles.background_tasks, return_exceptions=True,
-                    )
-                return outcome
+            return outcome
 
         outcome = asyncio.run(_run())
 
         assert outcome is not None
         assert outcome.status == 'blocked'
-        run_dry_run_mock.assert_awaited_once()
-        assert run_dry_run_mock.await_args is not None
-        kwargs = run_dry_run_mock.await_args.kwargs
+        assert len(verifier.investigations) == 1, verifier.investigations
+        kwargs = verifier.investigations[0]
         assert kwargs['block_class'] == BlockClass.MERGE_VERIFY_RED, (
             f'Expected block_class=MERGE_VERIFY_RED; got {kwargs.get("block_class")!r}'
         )
@@ -421,30 +407,20 @@ class TestUnscopedTypecheckFailedSpawns:
         (tmp_path / 'task-wt').mkdir()
 
         handles = _make_handles()
-        run_dry_run_mock = AsyncMock(return_value=None)
+        verifier = FakeVerifier(default=VerifyScript(result=UNSCOPED_TYPECHECK_TIMEOUT_RESULT))
 
         async def _run() -> MergeOutcome | None:
-            with (
-                patch(
-                    'orchestrator.merge_queue.run_scoped_verification',
-                    new=AsyncMock(return_value=UNSCOPED_TYPECHECK_TIMEOUT_RESULT),
-                ),
-                patch(
-                    'orchestrator.merge_queue.run_dry_run_unblock',
-                    new=run_dry_run_mock,
-                ),
-            ):
-                outcome = await _drive_verify_with_handles(
-                    req, merge_wt, git_ops, dry_run_handles=handles,
-                )
-                await asyncio.sleep(0)
-                return outcome
+            outcome = await _drive_verify_with_handles(
+                req, merge_wt, git_ops, verifier=verifier, dry_run_handles=handles,
+            )
+            await asyncio.sleep(0)
+            return outcome
 
         outcome = asyncio.run(_run())
 
         assert outcome is not None
         assert outcome.status == 'blocked'
-        run_dry_run_mock.assert_not_awaited()
+        assert verifier.investigations == [], verifier.investigations
 
     def test_flock_contention_does_not_spawn(self, tmp_path: Path) -> None:
         config = _make_config(tmp_path)
@@ -455,30 +431,20 @@ class TestUnscopedTypecheckFailedSpawns:
         (tmp_path / 'task-wt').mkdir()
 
         handles = _make_handles()
-        run_dry_run_mock = AsyncMock(return_value=None)
+        verifier = FakeVerifier(default=VerifyScript(result=FLOCK_CONTENTION_RESULT))
 
         async def _run() -> MergeOutcome | None:
-            with (
-                patch(
-                    'orchestrator.merge_queue.run_scoped_verification',
-                    new=AsyncMock(return_value=FLOCK_CONTENTION_RESULT),
-                ),
-                patch(
-                    'orchestrator.merge_queue.run_dry_run_unblock',
-                    new=run_dry_run_mock,
-                ),
-            ):
-                outcome = await _drive_verify_with_handles(
-                    req, merge_wt, git_ops, dry_run_handles=handles,
-                )
-                await asyncio.sleep(0)
-                return outcome
+            outcome = await _drive_verify_with_handles(
+                req, merge_wt, git_ops, verifier=verifier, dry_run_handles=handles,
+            )
+            await asyncio.sleep(0)
+            return outcome
 
         outcome = asyncio.run(_run())
 
         assert outcome is not None
         assert outcome.status == 'blocked'
-        run_dry_run_mock.assert_not_awaited()
+        assert verifier.investigations == [], verifier.investigations
 
     def test_main_health_red_does_not_spawn(self, tmp_path: Path) -> None:
         config = _make_config(tmp_path)
@@ -489,25 +455,25 @@ class TestUnscopedTypecheckFailedSpawns:
         (tmp_path / 'task-wt').mkdir()
 
         handles = _make_handles()
-        run_dry_run_mock = AsyncMock(return_value=None)
+        verifier = FakeVerifier(default=VerifyScript(result=COMPILE_ERROR_RESULT))
 
         async def _run() -> MergeOutcome | None:
+            # The ONE patch this file still needs (PRD γ9 residual). Every
+            # sibling arm produces its condition for real -- the RED verify
+            # through the injected port, "not pre-existing" through
+            # `_make_config(tmp_path, escalate_preexisting=False)`, the disk
+            # skip through the port's disk guard -- but a genuinely RED main
+            # has no such seam: `verify_failure_is_preexisting_on_main` lives in
+            # `orchestrator.verify`, takes no port, and probes by running a
+            # real scoped verification in a real `_mainprobe-` worktree.
             with (
                 patch(
-                    'orchestrator.merge_queue.run_scoped_verification',
-                    new=AsyncMock(return_value=COMPILE_ERROR_RESULT),
-                ),
-                patch(
-                    'orchestrator.merge_queue.verify_failure_is_preexisting_on_main',
+                    'orchestrator.merge_lane.main_health_probe.verify_failure_is_preexisting_on_main',
                     new=AsyncMock(return_value=(True, MAIN_SHA)),
-                ),
-                patch(
-                    'orchestrator.merge_queue.run_dry_run_unblock',
-                    new=run_dry_run_mock,
                 ),
             ):
                 outcome = await _drive_verify_with_handles(
-                    req, merge_wt, git_ops, dry_run_handles=handles,
+                    req, merge_wt, git_ops, verifier=verifier, dry_run_handles=handles,
                 )
                 await asyncio.sleep(0)
                 return outcome
@@ -519,7 +485,7 @@ class TestUnscopedTypecheckFailedSpawns:
         assert outcome.reason.startswith(MAIN_HEALTH_RED_REASON_PREFIX), (
             f'Expected main-health-red reason prefix; got {outcome.reason!r}'
         )
-        run_dry_run_mock.assert_not_awaited()
+        assert verifier.investigations == [], verifier.investigations
 
 
 class TestUnblockAutoDisabledSkipsSpawn:
@@ -527,7 +493,7 @@ class TestUnblockAutoDisabledSkipsSpawn:
     when dry_run_handles carries a live scheduler."""
 
     def test_unblock_auto_disabled_skips_spawn(self, tmp_path: Path) -> None:
-        config = _make_config(tmp_path)
+        config = _make_config(tmp_path, escalate_preexisting=False)
         config.unblock_auto.enabled = False
         git_ops = _make_git_ops(tmp_path)
         merge_wt = tmp_path / 'merge-wt'
@@ -536,42 +502,28 @@ class TestUnblockAutoDisabledSkipsSpawn:
         (tmp_path / 'task-wt').mkdir()
 
         handles = _make_handles()
-        run_dry_run_mock = AsyncMock(return_value=None)
+        verifier = FakeVerifier(default=VerifyScript(result=COMPILE_ERROR_RESULT))
 
         async def _run() -> MergeOutcome | None:
-            with (
-                patch(
-                    'orchestrator.merge_queue.run_scoped_verification',
-                    new=AsyncMock(return_value=COMPILE_ERROR_RESULT),
-                ),
-                patch(
-                    'orchestrator.merge_queue.verify_failure_is_preexisting_on_main',
-                    new=AsyncMock(return_value=(False, '')),
-                ),
-                patch(
-                    'orchestrator.merge_queue.run_dry_run_unblock',
-                    new=run_dry_run_mock,
-                ),
-            ):
-                outcome = await _drive_verify_with_handles(
-                    req, merge_wt, git_ops, dry_run_handles=handles,
-                )
-                await asyncio.sleep(0)
-                return outcome
+            outcome = await _drive_verify_with_handles(
+                req, merge_wt, git_ops, verifier=verifier, dry_run_handles=handles,
+            )
+            await asyncio.sleep(0)
+            return outcome
 
         outcome = asyncio.run(_run())
 
         assert outcome is not None
         assert outcome.status == 'blocked'
-        run_dry_run_mock.assert_not_awaited()
+        assert verifier.investigations == [], verifier.investigations
 
 
 class TestInflightDedupSkipsDuplicate:
     """Step-9 (RED): a not-done investigation task already registered under
-    the same 'unblock-auto-<task_id>' name must suppress a second spawn."""
+    the task's investigation_task_name must suppress a second spawn."""
 
     def test_inflight_dedup_skips_duplicate(self, tmp_path: Path) -> None:
-        config = _make_config(tmp_path)
+        config = _make_config(tmp_path, escalate_preexisting=False)
         git_ops = _make_git_ops(tmp_path)
         merge_wt = tmp_path / 'merge-wt'
         merge_wt.mkdir()
@@ -579,36 +531,22 @@ class TestInflightDedupSkipsDuplicate:
         (tmp_path / 'task-wt').mkdir()
 
         handles = _make_handles()
-        run_dry_run_mock = AsyncMock(return_value=None)
+        verifier = FakeVerifier(default=VerifyScript(result=COMPILE_ERROR_RESULT))
 
         async def _run() -> MergeOutcome | None:
             async def _hang_forever() -> None:
                 await asyncio.Event().wait()
 
             dummy_task = asyncio.create_task(
-                _hang_forever(), name=f'unblock-auto-{req.task_id}',
+                _hang_forever(), name=investigation_task_name(req.task_id),
             )
             handles.background_tasks.add(dummy_task)
             try:
-                with (
-                    patch(
-                        'orchestrator.merge_queue.run_scoped_verification',
-                        new=AsyncMock(return_value=COMPILE_ERROR_RESULT),
-                    ),
-                    patch(
-                        'orchestrator.merge_queue.verify_failure_is_preexisting_on_main',
-                        new=AsyncMock(return_value=(False, '')),
-                    ),
-                    patch(
-                        'orchestrator.merge_queue.run_dry_run_unblock',
-                        new=run_dry_run_mock,
-                    ),
-                ):
-                    outcome = await _drive_verify_with_handles(
-                        req, merge_wt, git_ops, dry_run_handles=handles,
-                    )
-                    await asyncio.sleep(0)
-                    return outcome
+                outcome = await _drive_verify_with_handles(
+                    req, merge_wt, git_ops, verifier=verifier, dry_run_handles=handles,
+                )
+                await asyncio.sleep(0)
+                return outcome
             finally:
                 dummy_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
@@ -618,114 +556,160 @@ class TestInflightDedupSkipsDuplicate:
 
         assert outcome is not None
         assert outcome.status == 'blocked'
-        run_dry_run_mock.assert_not_awaited()
+        assert verifier.investigations == [], verifier.investigations
+
+    def test_investigation_running_outside_the_lane_skips_spawn(
+        self, tmp_path: Path,
+    ) -> None:
+        """A workflow-spawned investigation lives in no merge-worker set, so
+        the dedupe must see the whole loop, not handles.background_tasks."""
+        config = _make_config(tmp_path, escalate_preexisting=False)
+        git_ops = _make_git_ops(tmp_path)
+        merge_wt = tmp_path / 'merge-wt'
+        merge_wt.mkdir()
+        req = _make_req('99', tmp_path / 'task-wt', config)
+        (tmp_path / 'task-wt').mkdir()
+
+        handles = _make_handles()
+        verifier = FakeVerifier(default=VerifyScript(result=COMPILE_ERROR_RESULT))
+
+        async def _run() -> MergeOutcome | None:
+            elsewhere = asyncio.create_task(
+                asyncio.Event().wait(), name=investigation_task_name(req.task_id),
+            )
+            try:
+                outcome = await _drive_verify_with_handles(
+                    req, merge_wt, git_ops, verifier=verifier, dry_run_handles=handles,
+                )
+                await asyncio.sleep(0)
+                if handles.background_tasks:
+                    await asyncio.gather(
+                        *handles.background_tasks, return_exceptions=True,
+                    )
+                return outcome
+            finally:
+                elsewhere.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await elsewhere
+
+        outcome = asyncio.run(_run())
+
+        assert outcome is not None
+        assert outcome.status == 'blocked'
+        assert verifier.investigations == [], verifier.investigations
 
 
-class TestWorkerStoresAndThreadsHandles:
-    """Step-11 (RED): SpeculativeMergeWorker accepts optional
-    scheduler/mcp/usage_gate/cost_store handles (harness-owned; the worker
-    itself holds none of them today), stores them, and bundles them into a
-    single self._dry_run_handles so _run_post_merge_verify stays a pure git
-    engine (mirrors the train_callback_factory opaque-injection pattern at
-    harness.py:6468-6472 — the worker never imports the scheduler).
+def _lane_repo(tmp_path: Path) -> tuple[GitOps, OrchestratorConfig]:
+    """A real one-commit repo, its GitOps and a matching config.
+
+    The handles contract below is about what the LANE hands the
+    investigation, so it is driven through the lane's own public path (queue
+    in, MergeOutcome out) over a real repository -- the idiom
+    test_merge_lane_package.py established for the ports.
+    """
+    repo = seed_repo(tmp_path / 'repo')
+
+    git_config = GitConfig(
+        main_branch='main', branch_prefix='task/', remote='origin',
+        worktree_dir='.worktrees', push_after_advance=False,
+    )
+    git_ops = GitOps(git_config, repo)
+    config = lane_scene_config(repo, git_config)
+    return git_ops, config
+
+
+async def _drive_red_merge_through_lane(
+    git_ops: GitOps,
+    config: OrchestratorConfig,
+    verifier: FakeVerifier,
+    **lane_handles: object,
+) -> MergeOutcome:
+    """Land one branch through a real lane whose verify is scripted RED."""
+    worktree = (await git_ops.create_worktree('99')).path
+    (worktree / 'work.py').write_text('x = 1\n')
+    await git_ops.commit(worktree, 'Add work.py')
+
+    queue: asyncio.Queue = asyncio.Queue()
+    lane = make_lane(
+        git_ops, queue, verifier=verifier, clock=PRODUCTION_CLOCK, **lane_handles,
+    )
+    lane_task = asyncio.create_task(lane.run())
+    try:
+        req = MergeRequest(
+            task_id='99',
+            branch=QueuedBranch.parse('task/99', config.git.branch_prefix),
+            worktree=worktree,
+            pre_rebased=False,
+            task_files=None,
+            module_configs=[],
+            config=config,
+            result=asyncio.get_running_loop().create_future(),
+        )
+        await queue.put(req)
+        return await wait_responsive(req.result, label='merge outcome')
+    finally:
+        await lane.stop()
+        await lane_task
+
+
+@pytest.mark.asyncio
+class TestLaneHandsItsHandlesToTheInvestigation:
+    """The lane bundles the harness-owned scheduler/mcp/usage_gate/cost_store
+    it was constructed with and hands them to the investigation it spawns.
+
+    Replaces three construction-site tests that read
+    ``worker._scheduler`` / ``._mcp`` / ``._usage_gate`` / ``._cost_store`` /
+    ``._dry_run_handles`` / ``._background_tasks`` and spied on
+    ``run_post_merge_verify`` to watch ``dry_run_handles`` being threaded:
+    the same contract, observed where it actually matters -- on the
+    investigation the port is asked to run.
     """
 
-    def test_worker_stores_handles_and_threads_them(self, tmp_path: Path) -> None:
-        git_ops = _make_git_ops(tmp_path)
-        scheduler = MagicMock()
-        mcp = MagicMock()
-        usage_gate = MagicMock()
-        cost_store = MagicMock()
+    async def test_a_red_merge_spawns_the_investigation_with_the_lane_handles(
+        self, tmp_path: Path,
+    ) -> None:
+        git_ops, config = _lane_repo(tmp_path)
+        scheduler, mcp = MagicMock(), MagicMock()
+        usage_gate, cost_store = MagicMock(), MagicMock()
+        verifier = FakeVerifier(
+            default=VerifyScript(result=COMPILE_ERROR_RESULT),
+        )
 
-        worker = SpeculativeMergeWorker(
-            git_ops, asyncio.Queue(),
+        outcome = await _drive_red_merge_through_lane(
+            git_ops, config, verifier,
             scheduler=scheduler, mcp=mcp,
             usage_gate=usage_gate, cost_store=cost_store,
         )
 
-        assert worker._scheduler is scheduler
-        assert worker._mcp is mcp
-        assert worker._usage_gate is usage_gate
-        assert worker._cost_store is cost_store
-        assert isinstance(worker._background_tasks, set)
-        assert worker._dry_run_handles.scheduler is scheduler
-        assert worker._dry_run_handles.mcp is mcp
-        assert worker._dry_run_handles.usage_gate is usage_gate
-        assert worker._dry_run_handles.cost_store is cost_store
-        assert worker._dry_run_handles.background_tasks is worker._background_tasks, (
-            'handles.background_tasks must be the SAME set instance as '
-            'worker._background_tasks — a spawned investigation task strong-ref '
-            'must live exactly as long as the worker'
+        assert outcome.status == 'blocked', outcome
+        assert len(verifier.investigations) == 1, verifier.investigations
+        spawned = verifier.investigations[0]
+        assert spawned['block_class'] == BlockClass.MERGE_VERIFY_RED
+        assert spawned['task_id'] == '99'
+        assert (
+            spawned['scheduler'], spawned['mcp'],
+            spawned['usage_gate'], spawned['cost_store'],
+        ) == (scheduler, mcp, usage_gate, cost_store), (
+            'the investigation must be spawned with the handles the lane was '
+            f'constructed with; got {spawned!r}'
         )
 
-    def test_minimal_construction_still_works(self, tmp_path: Path) -> None:
-        """The existing git_ops+queue-only construction convention (used
-        throughout the test suite) must stay green — the four new handle
-        params default to None."""
-        git_ops = _make_git_ops(tmp_path)
-        worker = SpeculativeMergeWorker(git_ops, asyncio.Queue())
-
-        assert worker._scheduler is None
-        assert worker._mcp is None
-        assert worker._usage_gate is None
-        assert worker._cost_store is None
-        assert worker._dry_run_handles.scheduler is None
-        assert worker._dry_run_handles.mcp is None
-
-
-class TestRunInflightVerifyPassesHandles:
-    """Step-11 (RED): the production SpeculativeMergeWorker._run_inflight_verify
-    call site must pass dry_run_handles=self._dry_run_handles into
-    _run_post_merge_verify (mirrors
-    test_merge_queue_multihost_wiring.py's
-    TestRunInflightVerifyThreadsEscalationQueue, which pins the same
-    call-site-threading shape for self._escalation_queue).
-    """
-
-    def test_run_inflight_verify_passes_handles(self, tmp_path: Path) -> None:
-        git_ops = _make_git_ops(tmp_path)
-        config = _make_config(tmp_path)
-        scheduler = MagicMock()
-        worker = SpeculativeMergeWorker(
-            git_ops, asyncio.Queue(), scheduler=scheduler,
+    async def test_a_lane_built_without_handles_spawns_nothing(
+        self, tmp_path: Path,
+    ) -> None:
+        """The git_ops+queue-only construction convention stays green: with no
+        scheduler there is nobody to file a proposal with, so the same RED
+        merge spawns no investigation."""
+        git_ops, config = _lane_repo(tmp_path)
+        verifier = FakeVerifier(
+            default=VerifyScript(result=COMPILE_ERROR_RESULT),
         )
 
-        req = _make_req('99', tmp_path / 'task-wt', config)
-        (tmp_path / 'task-wt').mkdir()
-        merge_wt = tmp_path / 'merge-wt'
-        merge_wt.mkdir()
-        merge_result = MagicMock()
-        merge_result.merge_commit = 'abc123def456789abc1'
-        item = RealMergeItem(
-            request=req,
-            merge_result=merge_result,
-            merge_wt=merge_wt,
-            base_sha='base123',
-            speculative=False,
-        )
+        outcome = await _drive_red_merge_through_lane(git_ops, config, verifier)
 
-        # REMOTE lease — bypasses the local warm-swap path, keeping this
-        # test focused on the dry_run_handles kwarg (mirrors
-        # test_merge_queue_multihost_wiring.py's REMOTE-lease builder).
-        fake_runner = MagicMock()
-        fake_runner.name = 'leo-laptop'
-        fake_runner.is_local = False
-        lease = HostLease(name='leo-laptop', runner=fake_runner, is_local=False)
+        assert outcome.status == 'blocked', outcome
+        assert verifier.investigations == [], verifier.investigations
 
-        spy = AsyncMock(return_value=None)
-
-        async def _run() -> None:
-            with patch('orchestrator.merge_queue._run_post_merge_verify', new=spy):
-                await worker._run_inflight_verify(item, lease)
-
-        asyncio.run(_run())
-
-        assert spy.await_args is not None, '_run_post_merge_verify was not called'
-        assert spy.await_args.kwargs.get('dry_run_handles') is worker._dry_run_handles, (
-            '_run_inflight_verify must pass dry_run_handles=self._dry_run_handles '
-            'into _run_post_merge_verify — the worker holds the bundled handles '
-            'but never threaded them through'
-        )
 
 
 class TestHarnessWiresDryRunHandlesIntoWorker:
@@ -773,13 +757,17 @@ class TestHarnessWiresDryRunHandlesIntoWorker:
                 pass
 
         async def _run() -> None:
+            # The other γ9 residual: the contract IS the construction site, and
+            # Harness offers no seam for the worker it builds (no factory
+            # argument, no accessor) -- so substituting the class is the only
+            # way to see the kwargs it is constructed with. Observing this
+            # behaviourally would mean driving a real merge through a worker
+            # whose verify port the harness gives us no way to inject.
             with (
                 patch(
-                    'orchestrator.merge_queue.SpeculativeMergeWorker',
+                    'orchestrator.merge_lane.worker.SpeculativeMergeWorker',
                     CapturingWorker,
                 ),
-                patch('orchestrator.merge_queue.enforce_merge_liveness_margin'),
-                patch('orchestrator.merge_queue.enforce_persistent_worktree_serial_lane'),
                 patch.object(
                     harness,
                     '_build_service_restart_coordinator',
@@ -813,7 +801,7 @@ class TestMergeVerifyRedProducesGateableProposal:
     with block_class='merge_verify_red' that b3_gate.check_proposal accepts
     as non-ABORT — AND the investigation must emit the same
     invocation_end/'blocked' telemetry event the agent-block path emits
-    (observability parity).  Today _spawn_merge_verify_dry_run receives
+    (observability parity).  Today spawn_merge_verify_dry_run receives
     event_store but discards it (`_ = event_store`), so the investigation's
     emit never fires through this MagicMock — RED on the event assertion.
 
@@ -824,7 +812,7 @@ class TestMergeVerifyRedProducesGateableProposal:
     """
 
     def test_merge_verify_red_produces_gateable_proposal(self, tmp_path: Path) -> None:
-        config = _make_config(tmp_path)
+        config = _make_config(tmp_path, escalate_preexisting=False)
         git_ops = _make_git_ops(tmp_path)
         merge_wt = tmp_path / 'merge-wt'
         merge_wt.mkdir()
@@ -835,7 +823,7 @@ class TestMergeVerifyRedProducesGateableProposal:
         head_sha = _init_git_repo(req.worktree)
 
         scheduler = _RecordingScheduler({'dry_run_proposals': []})
-        handles = _DryRunInvestigationHandles(scheduler=scheduler)
+        handles = DryRunInvestigationHandles(scheduler=scheduler)
         event_store = MagicMock()
 
         structured = {
@@ -851,16 +839,10 @@ class TestMergeVerifyRedProducesGateableProposal:
                 return (0, head_sha)
             return (0, '')
 
+        verifier = _SpawningVerifier(default=VerifyScript(result=COMPILE_ERROR_RESULT))
+
         async def _run() -> MergeOutcome | None:
             with (
-                patch(
-                    'orchestrator.merge_queue.run_scoped_verification',
-                    new=AsyncMock(return_value=COMPILE_ERROR_RESULT),
-                ),
-                patch(
-                    'orchestrator.merge_queue.verify_failure_is_preexisting_on_main',
-                    new=AsyncMock(return_value=(False, '')),
-                ),
                 patch(
                     'orchestrator.dry_run_unblock.invoke_agent',
                     new=AsyncMock(return_value=agent_result),
@@ -878,7 +860,7 @@ class TestMergeVerifyRedProducesGateableProposal:
                     return_value=True,
                 ),
             ):
-                outcome = await _run_post_merge_verify(
+                outcome = await run_post_merge_verify(
                     git_ops, req, merge_wt,
                     timeouts={},
                     enospc_retries={},
@@ -886,6 +868,7 @@ class TestMergeVerifyRedProducesGateableProposal:
                     max_enospc=1,
                     dry_run_handles=handles,
                     event_store=event_store,
+                    verifier=verifier,
                 )
                 # Drain the fire-and-forget investigation (real run_dry_run_unblock,
                 # real git subprocess calls against merge_wt, mocked invoke_agent)
@@ -902,9 +885,14 @@ class TestMergeVerifyRedProducesGateableProposal:
         assert outcome is not None
         assert outcome.status == 'blocked'
 
-        proposals = scheduler._meta.get('dry_run_proposals', [])
-        assert proposals, 'Expected a dry_run_proposals entry to be written'
-        entry = proposals[-1]
+        # What the investigation WROTE, read off the recording scheduler's own
+        # call log rather than out of the double's internal blob.
+        writes = [
+            c for c in scheduler.update_task_calls
+            if 'dry_run_proposals' in c['metadata']
+        ]
+        assert writes, 'Expected a dry_run_proposals entry to be written'
+        entry = writes[-1]['metadata']['dry_run_proposals'][-1]
         assert entry['block_class'] == 'merge_verify_red', (
             f"Expected block_class='merge_verify_red'; got {entry.get('block_class')!r}"
         )
@@ -914,7 +902,7 @@ class TestMergeVerifyRedProducesGateableProposal:
 
         verdict = check_proposal(
             entry, worktree=str(req.worktree), category='task_failure',
-            run_git=_fake_run_git,
+            run_git=_fake_run_git, now=datetime.now(UTC),
         )
         assert verdict['verdict'] != ABORT, (
             f'Expected a non-ABORT (gateable) verdict; got {verdict!r}'
@@ -953,7 +941,7 @@ class TestMergeVerifyRedClampedWithoutCompletionEvidence:
     def test_merge_verify_red_without_completion_evidence_clamps_to_abort(
         self, tmp_path: Path,
     ) -> None:
-        config = _make_config(tmp_path)
+        config = _make_config(tmp_path, escalate_preexisting=False)
         git_ops = _make_git_ops(tmp_path)
         merge_wt = tmp_path / 'merge-wt'
         merge_wt.mkdir()
@@ -961,7 +949,7 @@ class TestMergeVerifyRedClampedWithoutCompletionEvidence:
         head_sha = _init_git_repo(req.worktree)
 
         scheduler = _RecordingScheduler({'dry_run_proposals': []})
-        handles = _DryRunInvestigationHandles(scheduler=scheduler)
+        handles = DryRunInvestigationHandles(scheduler=scheduler)
         # Bare event_store: no workflow_verify(passed) and no phase_enter(merge)
         # rows -> the real merge_completion_eligible returns False -> clamp fires.
         event_store = MagicMock()
@@ -979,16 +967,10 @@ class TestMergeVerifyRedClampedWithoutCompletionEvidence:
                 return (0, head_sha)
             return (0, '')
 
+        verifier = _SpawningVerifier(default=VerifyScript(result=COMPILE_ERROR_RESULT))
+
         async def _run() -> MergeOutcome | None:
             with (
-                patch(
-                    'orchestrator.merge_queue.run_scoped_verification',
-                    new=AsyncMock(return_value=COMPILE_ERROR_RESULT),
-                ),
-                patch(
-                    'orchestrator.merge_queue.verify_failure_is_preexisting_on_main',
-                    new=AsyncMock(return_value=(False, '')),
-                ),
                 patch(
                     'orchestrator.dry_run_unblock.invoke_agent',
                     new=AsyncMock(return_value=agent_result),
@@ -997,7 +979,7 @@ class TestMergeVerifyRedClampedWithoutCompletionEvidence:
                 # here — the real predicate runs against the evidence-free
                 # event_store and returns False, so the clamp fires.
             ):
-                outcome = await _run_post_merge_verify(
+                outcome = await run_post_merge_verify(
                     git_ops, req, merge_wt,
                     timeouts={},
                     enospc_retries={},
@@ -1005,6 +987,7 @@ class TestMergeVerifyRedClampedWithoutCompletionEvidence:
                     max_enospc=1,
                     dry_run_handles=handles,
                     event_store=event_store,
+                    verifier=verifier,
                 )
                 await asyncio.sleep(0)
                 if handles.background_tasks:
@@ -1018,9 +1001,14 @@ class TestMergeVerifyRedClampedWithoutCompletionEvidence:
         assert outcome is not None
         assert outcome.status == 'blocked'
 
-        proposals = scheduler._meta.get('dry_run_proposals', [])
-        assert proposals, 'Expected a dry_run_proposals entry to be written'
-        entry = proposals[-1]
+        # What the investigation WROTE, read off the recording scheduler's own
+        # call log rather than out of the double's internal blob.
+        writes = [
+            c for c in scheduler.update_task_calls
+            if 'dry_run_proposals' in c['metadata']
+        ]
+        assert writes, 'Expected a dry_run_proposals entry to be written'
+        entry = writes[-1]['metadata']['dry_run_proposals'][-1]
         assert entry['block_class'] == 'merge_verify_red', (
             f"Expected block_class='merge_verify_red'; got {entry.get('block_class')!r}"
         )
@@ -1051,7 +1039,7 @@ class TestInvestigationWorktreeSurvivesCleanup:
     which is exactly what hid this bug), *merge_wt* is actually removed
     before the fire-and-forget investigation task runs. The investigation
     must be pointed at the task's OWN retained worktree (``req.worktree`` —
-    which is never touched by ``_run_post_merge_verify`` and survives while
+    which is never touched by ``run_post_merge_verify`` and survives while
     the task stays blocked), not the ephemeral merge worktree that has
     already been deleted by the time the spawned task reads it.
     """
@@ -1059,7 +1047,7 @@ class TestInvestigationWorktreeSurvivesCleanup:
     def test_investigation_uses_retained_task_worktree_surviving_real_cleanup(
         self, tmp_path: Path,
     ) -> None:
-        config = _make_config(tmp_path)
+        config = _make_config(tmp_path, escalate_preexisting=False)
         git_ops = _make_git_ops(tmp_path)
         merge_wt = tmp_path / 'merge-wt'
         merge_wt.mkdir()
@@ -1077,41 +1065,20 @@ class TestInvestigationWorktreeSurvivesCleanup:
         git_ops.cleanup_merge_worktree = AsyncMock(side_effect=_real_cleanup)
 
         handles = _make_handles()
-        captured: dict[str, object] = {}
-
-        def _record_investigation(**kwargs: object) -> None:
-            wt = kwargs.get('worktree')
-            captured['worktree'] = wt
-            captured['isdir'] = isinstance(wt, str) and os.path.isdir(wt)
-
-        run_dry_run_mock = AsyncMock(side_effect=_record_investigation)
+        verifier = _SpawnIsdirVerifier()
 
         async def _run() -> MergeOutcome | None:
-            with (
-                patch(
-                    'orchestrator.merge_queue.run_scoped_verification',
-                    new=AsyncMock(return_value=COMPILE_ERROR_RESULT),
-                ),
-                patch(
-                    'orchestrator.merge_queue.verify_failure_is_preexisting_on_main',
-                    new=AsyncMock(return_value=(False, '')),
-                ),
-                patch(
-                    'orchestrator.merge_queue.run_dry_run_unblock',
-                    new=run_dry_run_mock,
-                ),
-            ):
-                outcome = await _drive_verify_with_handles(
-                    req, merge_wt, git_ops, dry_run_handles=handles,
+            outcome = await _drive_verify_with_handles(
+                req, merge_wt, git_ops, verifier=verifier, dry_run_handles=handles,
+            )
+            # Let the fire-and-forget create_task run to completion
+            # inside this SAME loop before asyncio.run() tears it down.
+            await asyncio.sleep(0)
+            if handles.background_tasks:
+                await asyncio.gather(
+                    *handles.background_tasks, return_exceptions=True,
                 )
-                # Let the fire-and-forget create_task run to completion
-                # inside this SAME loop before asyncio.run() tears it down.
-                await asyncio.sleep(0)
-                if handles.background_tasks:
-                    await asyncio.gather(
-                        *handles.background_tasks, return_exceptions=True,
-                    )
-                return outcome
+            return outcome
 
         outcome = asyncio.run(_run())
 
@@ -1120,12 +1087,13 @@ class TestInvestigationWorktreeSurvivesCleanup:
         assert not merge_wt.exists(), (
             'Expected the real cleanup_merge_worktree to have removed merge_wt'
         )
-        run_dry_run_mock.assert_awaited_once()
-        assert captured.get('worktree') == str(task_wt), (
+        assert len(verifier.investigations) == 1, verifier.investigations
+        spawned = verifier.investigations[0]
+        assert spawned.get('worktree') == str(task_wt), (
             f"Expected worktree={str(task_wt)!r} (the task's own retained "
-            f"worktree, req.worktree); got {captured.get('worktree')!r}"
+            f"worktree, req.worktree); got {spawned.get('worktree')!r}"
         )
-        assert captured.get('isdir') is True, (
+        assert verifier.isdir_at_spawn == [True], (
             'Expected the path handed to the investigation to still exist '
             'on disk when the investigation read it'
         )

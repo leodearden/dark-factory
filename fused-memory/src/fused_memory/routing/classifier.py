@@ -7,9 +7,10 @@ import re
 from openai import AsyncOpenAI
 
 from fused_memory.config.schema import FusedMemoryConfig
-from fused_memory.models.enums import MemoryCategory
+from fused_memory.models.enums import ClassificationFallback, MemoryCategory
 from fused_memory.models.memory import ClassificationResult
 from fused_memory.routing.json_extract import extract_json
+from fused_memory.routing.openai_client import LazyOpenAIClient, routing_chat_params
 
 logger = logging.getLogger(__name__)
 
@@ -56,21 +57,29 @@ Respond as JSON:
 }"""
 
 
+def _optional_category(value: object) -> MemoryCategory | None:
+    """The secondary category, or None for any answer that names none ("null", "none", 42, ...)."""
+    try:
+        return MemoryCategory(value)
+    except ValueError:
+        return None
+
+
 class WriteClassifier:
-    """Classifies content into a MemoryCategory for write routing."""
+    """Classifies content into a MemoryCategory for write routing.
 
-    def __init__(self, config: FusedMemoryConfig):
+    An injected ``openai_client`` is owned by the classifier: ``close()`` releases it.
+    """
+
+    def __init__(
+        self, config: FusedMemoryConfig, *, openai_client: AsyncOpenAI | None = None,
+    ):
         self.config = config
-        self._openai_client: AsyncOpenAI | None = None
+        self._openai = LazyOpenAIClient(config, openai_client)
 
-    def _get_openai_client(self) -> AsyncOpenAI:
-        if self._openai_client is None:
-            cfg = self.config.llm
-            api_key = None
-            if cfg.providers.openai:
-                api_key = cfg.providers.openai.api_key
-            self._openai_client = AsyncOpenAI(api_key=api_key)
-        return self._openai_client
+    async def close(self) -> None:
+        """Release the AsyncOpenAI this classifier holds, built or injected."""
+        await self._openai.close()
 
     async def classify(self, content: str) -> ClassificationResult:
         """Classify content — heuristic first, LLM fallback."""
@@ -91,6 +100,7 @@ class WriteClassifier:
             primary=MemoryCategory.observations_and_summaries,
             confidence=0.3,
             reasoning='No confident classification; defaulting to observations',
+            fallback=ClassificationFallback.no_confident_match,
         )
 
     def _heuristic_classify(self, content: str) -> ClassificationResult | None:
@@ -127,16 +137,14 @@ class WriteClassifier:
 
     async def _llm_classify(self, content: str) -> ClassificationResult:
         """Use LLM for classification."""
-        client = self._get_openai_client()
         try:
+            client = self._openai.get()
             response = await client.chat.completions.create(
-                model=self.config.llm.model,
                 messages=[
                     {'role': 'system', 'content': CLASSIFICATION_SYSTEM_PROMPT},
                     {'role': 'user', 'content': content[:2000]},
                 ],
-                temperature=0.0,
-                max_tokens=256,
+                **routing_chat_params(self.config),
             )
             raw = response.choices[0].message.content or ''
 
@@ -148,11 +156,12 @@ class WriteClassifier:
                     primary=MemoryCategory.observations_and_summaries,
                     confidence=0.4,
                     reasoning='LLM returned non-JSON response',
+                    fallback=ClassificationFallback.llm_no_json,
                 )
 
             data = json.loads(json_str)
             primary = MemoryCategory(data['primary'])
-            secondary = MemoryCategory(data['secondary']) if data.get('secondary') else None
+            secondary = _optional_category(data.get('secondary'))
             confidence = float(data.get('confidence', 0.7))
             reasoning = data.get('reasoning', '')
 
@@ -168,4 +177,5 @@ class WriteClassifier:
                 primary=MemoryCategory.observations_and_summaries,
                 confidence=0.3,
                 reasoning=f'LLM classification error: {e}',
+                fallback=ClassificationFallback.llm_error,
             )

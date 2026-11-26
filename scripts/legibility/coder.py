@@ -6,19 +6,29 @@ Task delta of the confusion-reduction PRD (plans/confusion-reduction-prd.md
 §5.3, contract §7.3, boundary tests §8.1 consumer side + §8.6). Reads ONE
 confusion digest (alpha/digest.py output), builds a COMPACT codebook index
 (entry ids + titles + one-line causes — NOT the full YAML) from the v2
-codebook (gamma/codebook.py), invokes ONE headless
-``claude -p --model <model>`` call (default haiku), parses the model's
-strict-JSON judgment, and assembles it into a deterministic-header coding
-record that codebook.validate_coding_record schema-gates.
+codebook (gamma/codebook.py), makes ONE model call (default haiku), parses
+the model's strict-JSON judgment, and assembles it into a deterministic-header
+coding record that codebook.validate_coding_record schema-gates.
 
-Dependency-light library + argparse CLI, a plain-Python scripts/legibility
-sibling of digest.py/codebook.py — deliberately does NOT import the
-heavyweight async ``shared.cli_invoke`` machinery (usage gates, cost
-stores, cap-retry, transcript watchdogs). The real LLM call lives behind
-exactly one swappable seam, the module-level ``_invoke_cli``, which every
-public function accepts as an ``invoke`` override — the LLM is ALWAYS
-mocked in this module's own test suite; no test ever shells out to a real
-model.
+The model call crosses exactly one seam, ``invoke``: a ``(prompt, model) ->
+str`` callable that every public function REQUIRES, with no default. The
+production one is ``session_runner.SessionRunner.invoker(TRICKLE_CODER_STAGE)``
+-- the orchestrator's own session runner over the fleet's account pool, never
+a spawn of this module's own (Leo's 2026-09-29 ruling, task 6042). Rotation,
+cap detection and credentials are all the runner's; what reaches this module
+is a reply, a ``session_runner.NoHeadroom`` (no pool account could take the
+call) or an ``InvocationFailed`` (any other call without a reply). No test
+reaches a real model: they inject an ``invoke``, or run ``main`` over a fake
+CLI.
+
+What this module still takes from ``shared`` directly is one pure function,
+``cap_markers.looks_like_blocking_banner``: the loose OR-substring DEFER GATE
+``census_headroom.preflight_headroom`` also uses, applied on one path only -- a reply
+that came back as a SUCCESS yet could not be parsed into a verdict. A real
+usage cap never arrives that way: the CLI delivers it as a failed result, which
+the runner's gate sees (task 6213). What does arrive unparseable is prose such
+as an auth banner. A loose false positive there can only re-label a digest that
+was failing anyway, and never touches an account.
 
 Never-fabricate contract (codebook lesson ``one-shot-subagent-contract`` —
 the fail-soft fallback that hid a total outage): a CLI-invocation error,
@@ -30,21 +40,61 @@ batch whose failure fraction STRICTLY exceeds 50% (failed/total > 0.5) is a
 run-level FAILURE: the CLI then writes ZERO coding records and exits
 non-zero. This module never escalates and never writes the codebook —
 that is epsilon/gamma's job.
+
+SKIPPED + COUNTED NOW ALSO MEANS ANNOUNCED (task 4511): every per-digest
+failure is logged at WARNING on ``legibility.coder`` as it happens, naming
+the session and the reason. Counting alone was not enough, because the
+count only ever reaches a human through epsilon's storm escalation — and a
+SUB-storm batch (failed/total <= 0.5) is ``CodingStatus.OK``, so those failures
+previously reached no sink whatsoever. Escalation is still not this
+module's job; a journal line is not an escalation.
 """
 from __future__ import annotations
 
 import argparse
 import json
-import os
+import logging
 import re
-import subprocess
 import sys
+from collections.abc import Sequence
 from dataclasses import dataclass
+from enum import StrEnum
 from pathlib import Path
 
-import yaml
+# Bind `shared` to the SAME checkout as this script via a __file__-relative
+# path, never a hardcoded absolute. An editable install puts the MAIN
+# checkout's shared/src on sys.path for a bare `python3`, so without this a
+# copy of this script running from a worktree would scan cap-banner text using
+# the MAIN checkout's marker list rather than its own. Same reasoning and same
+# form as census.py:74-88 (itself citing tasks 2881/2882/3329), with
+# parents[2] because coder.py sits at the same depth as census.py
+# (scripts/legibility/, not scripts/). Unconditional -- deliberately NOT
+# inside a `__main__` guard -- because the `shared.cap_markers` import it
+# enables is module-level, so it must resolve under pytest and package import
+# too. orchestrator/src is bound the same way, for the code-quality
+# Definition accessor `orchestrator.agents.code_quality` (stdlib-only): under
+# `uv run --project shared` nothing else puts it on sys.path.
+_SHARED_SRC = Path(__file__).resolve().parents[2] / "shared" / "src"
+if str(_SHARED_SRC) not in sys.path:
+    sys.path.insert(0, str(_SHARED_SRC))
+_ORCH_SRC = Path(__file__).resolve().parents[2] / "orchestrator" / "src"
+if str(_ORCH_SRC) not in sys.path:
+    sys.path.insert(0, str(_ORCH_SRC))
 
-import codebook as codebook_mod
+# Self-bootstrap for a standalone `python scripts/legibility/coder.py` run --
+# must precede the `legibility.*` import below, since a direct script
+# invocation puts only scripts/legibility/ (not scripts/) on sys.path. Skipped
+# under pytest/package import. Mirrors census.py/nightly.py's identical guard.
+if __name__ == "__main__":
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+import yaml  # noqa: E402
+from legibility import codebook as codebook_mod  # noqa: E402  # debt: task 6760
+from legibility import invariants, session_runner  # noqa: E402
+from orchestrator.agents import code_quality  # noqa: E402
+from shared.cap_markers import looks_like_blocking_banner  # noqa: E402
+
+logger = logging.getLogger("legibility.coder")
 
 
 class CoderParseError(Exception):
@@ -52,13 +102,6 @@ class CoderParseError(Exception):
     LLM's raw output into a usable structure. Never silently defaulted —
     callers must treat this as a hard per-digest failure (never-fabricate
     contract)."""
-
-
-class CoderInvocationError(Exception):
-    """Raised when the ``claude -p --model`` subprocess invocation fails —
-    non-zero exit or a timeout. Carries a stderr tail for diagnosis. Never
-    silently swallowed: code_digest turns this into a per-digest failure,
-    never a fabricated record."""
 
 
 @dataclass
@@ -71,12 +114,25 @@ class CodingResult:
     None and ``reason`` explains why: a CLI invocation error, unparseable
     LLM output, or a schema-invalid assembled record are never partially
     applied and never fabricated into a record.
+
+    ``capped=True`` means no pool account had headroom to take this digest
+    (``session_runner.NoHeadroom``), or the reply was a capacity/auth banner
+    rather than a verdict. It is a strict REFINEMENT of ``ok=False``,
+    never a third success state — ``record`` is still None and the
+    never-fabricate contract is untouched. What it records is a fact about
+    the ACCOUNT, not a judgment about the digest: this digest was never
+    actually coded, so charging it to the coder as a failure of the work is
+    simply wrong. Downstream (``code_digests`` tallies it, ``is_cap_deferral``
+    reads the tally) that distinction is what separates "there was no
+    headroom tonight" from "the coder is broken" — on 2026-08-24 their
+    conflation turned expected weather into an ERROR-level infra page.
     """
 
     ok: bool
     record: dict | None
     reason: str | None = None
     session: str | None = None
+    capped: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -161,13 +217,75 @@ def parse_frontmatter(digest_text: str) -> dict:
 # build_prompt — instructions + codebook index + digest, embedded verbatim
 # ---------------------------------------------------------------------------
 
-def build_prompt(digest_text: str, codebook_index: str) -> str:
+def _invariant_slugs_block(invariant_slugs: Sequence[str]) -> str:
+    if not invariant_slugs:
+        return (
+            "This project declares no invariant slugs in "
+            f"{invariants.DOC_RELPATH}, so invariant_violated must be null."
+        )
+    return (
+        "invariant_violated must be one of these slugs from this project's "
+        f"{invariants.DOC_RELPATH}, or null:\n"
+        + "\n".join(f"- {slug}" for slug in invariant_slugs)
+    )
+
+
+_MATCHES_KEY = "matches"
+_CANDIDATES_KEY = "candidates"
+
+
+def _prescribed_reply() -> dict[str, list[dict[str, str | None]]]:
+    """The reply build_prompt prescribes, one placeholder finding per key; a
+    fresh dict per call. Tied to the §7.3 record contract by
+    ``scripts/tests/test_legibility_coder.py::test_a_reply_shaped_as_the_prompt_prescribes_reaches_the_merger``."""
+    return {
+        _MATCHES_KEY: [{
+            "entry_id": "...", "origin_phase": "...", "manifested_phase": "...",
+            "invariant_violated": None, "note": "...", "evidence_quote": "...",
+        }],
+        _CANDIDATES_KEY: [{
+            "title": "...", "cause": "...", "area": "...", "origin_phase": "...",
+            "manifested_phase": "...", "evidence_quote": "...",
+        }],
+    }
+
+
+_REPLY_KEYS = tuple(_prescribed_reply())
+"""The reply schema code_digest reads: exactly the keys build_prompt prescribes."""
+
+_RULE_STAMP_FIELD = "attached_by"
+"""The finding field only a census rule writes: how an attach placed a
+sighting, which ``sighting_fit`` counts without a fit check."""
+
+
+def _without_rule_stamps(findings: object) -> object:
+    """*findings* with any rule stamp a reply claims removed. Every other field
+    passes through: the schema gate refuses a malformed one, and the merger's
+    never-delete guard names a removal action rather than letting it land as
+    a plain match."""
+    if not isinstance(findings, list):
+        return findings
+    return [
+        {field: value for field, value in finding.items() if field != _RULE_STAMP_FIELD}
+        if isinstance(finding, dict) else finding
+        for finding in findings
+    ]
+
+
+def build_prompt(
+    digest_text: str, codebook_index: str, *, invariant_slugs: Sequence[str]
+) -> str:
     """Compose the full prompt handed to the trickle coder LLM.
 
     Embeds *codebook_index* and *digest_text* verbatim (pure data
     plumbing — a broken coder would drop one), the legal phase vocabulary
-    (codebook.PHASES, including "unknown"), and the required strict-JSON
-    output shape (PRD §7.3).
+    (codebook.PHASES, including "unknown"), the required strict-JSON
+    output shape (PRD §7.3), the code-quality Definition as the test a
+    confusion must meet to be minted as a candidate, and the observed
+    project's *invariant_slugs* (an empty list is stated, not omitted).
+    The Definition is read on every call, so a renamed, removed, emptied or
+    braced section fails every digest in the batch rather than the import.
+    The slugs are guidance only: the merger is what enforces them.
     """
     phases = ", ".join(codebook_mod.PHASES)
     return (
@@ -178,16 +296,20 @@ def build_prompt(digest_text: str, codebook_index: str) -> str:
         "causes not yet in the codebook (candidates).\n\n"
         "Never guess a phase you can't support from the evidence — use "
         '"unknown" instead. Legal phase values: ' + phases + ".\n\n"
+        "Match an entry only when the digest shows the mechanism that "
+        "entry's title names, not merely a related theme, and copy the "
+        "digest text that shows it into the match's evidence_quote.\n\n"
         "Respond with STRICT JSON ONLY (no prose, no markdown fences), "
         "exactly this shape:\n"
-        '{"matches": [{"entry_id": "...", "origin_phase": "...", '
-        '"manifested_phase": "...", "invariant_violated": null, '
-        '"note": "..."}], '
-        '"candidates": [{"title": "...", "cause": "...", "area": "...", '
-        '"origin_phase": "...", "manifested_phase": "...", '
-        '"evidence_quote": "..."}]}\n'
-        'If nothing matches and nothing is novel, respond with '
-        '{"matches": [], "candidates": []}.\n\n'
+        + json.dumps(_prescribed_reply()) + "\n"
+        "If nothing matches and nothing is novel, respond with "
+        + json.dumps({key: [] for key in _REPLY_KEYS}) + ".\n\n"
+        "=== QUALITY DEFINITION ===\n"
+        "Mint a candidate only for a confusion that meets this definition, "
+        "that is, one that shows a cost or risk to the next change. "
+        "Otherwise do not mint one.\n"
+        + code_quality.definition() + "\n\n"
+        "=== INVARIANT SLUGS ===\n" + _invariant_slugs_block(invariant_slugs) + "\n\n"
         "=== CODEBOOK INDEX ===\n" + codebook_index + "\n\n"
         "=== SESSION DIGEST ===\n" + digest_text
     )
@@ -250,61 +372,23 @@ def parse_coder_output(raw: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# _invoke_cli — the ONE real `claude -p --model` subprocess boundary
+# TRICKLE_CODER_STAGE — how one trickle digest calls the model
 # ---------------------------------------------------------------------------
 
-_DEFAULT_INVOKE_TIMEOUT_SECS = 120
-"""Default subprocess timeout (seconds) for a single _invoke_cli call."""
+TRICKLE_CODER_STAGE = session_runner.StageSpec(
+    name="trickle-coder",
+    cwd=None,
+    timeout_secs=120,
+    max_turns=2,
+    max_budget_usd=1.0,
+    tools=session_runner.CLASSIFIER,
+)
+"""A pure classifier: the codebook index and the digest are both in the
+prompt, so it needs no tools and no project cwd. 120s, sized for one Haiku
+coding call, is the binding bound; turns and budget are ceilings.
 
-_CLAUDE_BIN_ENV_VAR = "LEGIBILITY_CLAUDE_BIN"
-"""Env var overriding the `claude` binary path; falls back to the bare
-"claude" (PATH-resolved -- /home/leo/.local/bin is on PATH)."""
-
-
-def _invoke_cli(
-    prompt: str,
-    model: str,
-    *,
-    claude_bin: str | None = None,
-    timeout: float = _DEFAULT_INVOKE_TIMEOUT_SECS,
-) -> str:
-    """Invoke the real headless ``claude -p --model <model>`` CLI exactly
-    once, delivering *prompt* via stdin, and return its raw stdout.
-
-    This is the ONE real-subprocess boundary in this module -- every
-    public function accepts an ``invoke`` override (this module's own
-    test suite always injects a fake one; no test ever reaches this
-    function). *claude_bin* resolves, in order: the explicit argument,
-    the ``LEGIBILITY_CLAUDE_BIN`` env var, else the bare ``"claude"``.
-
-    Raises CoderInvocationError on a non-zero exit or a timeout -- never
-    silently swallowed, never a fabricated empty stdout. The error
-    message carries a stderr tail for diagnosis.
-    """
-    resolved_bin = claude_bin or os.environ.get(_CLAUDE_BIN_ENV_VAR) or "claude"
-
-    try:
-        proc = subprocess.run(
-            [resolved_bin, "-p", "--model", model],
-            input=prompt,
-            text=True,
-            capture_output=True,
-            timeout=timeout,
-        )
-    except subprocess.TimeoutExpired as exc:
-        raise CoderInvocationError(
-            f"claude CLI timed out after {timeout}s (model={model!r}, "
-            f"claude_bin={resolved_bin!r})"
-        ) from exc
-
-    if proc.returncode != 0:
-        stderr_tail = (proc.stderr or "")[-2000:]
-        raise CoderInvocationError(
-            f"claude CLI exited {proc.returncode} (model={model!r}, "
-            f"claude_bin={resolved_bin!r}): {stderr_tail}"
-        )
-
-    return proc.stdout
+Only a failed result reaches the gate's cap detector, so a successful reply,
+parsed or truncated, that quotes a banner never caps the account."""
 
 
 # ---------------------------------------------------------------------------
@@ -317,22 +401,28 @@ def code_digest(
     *,
     project: str,
     model: str = "haiku",
-    invoke=None,
+    invariant_slugs: Sequence[str],
+    invoke,
 ) -> CodingResult:
     """Code one digest against one codebook.
 
     Flow: parse the digest's frontmatter -> build the compact codebook
-    index -> build the prompt -> invoke the LLM (*invoke* override, or the
-    real ``_invoke_cli`` by default) -> parse its strict-JSON judgment ->
+    index -> build the prompt -> make the model call through *invoke* ->
+    parse its strict-JSON judgment ->
     assemble a §7.3 coding record with a DETERMINISTIC header
     (session/date/agent_class from the digest's own frontmatter; project
-    from *project* — the LLM never supplies the header) -> schema-gate it
-    via codebook.validate_coding_record.
+    from *project* — the LLM never supplies the header; nor a rule stamp,
+    which is removed from every finding) -> schema-gate it via
+    codebook.validate_coding_record.
 
     Never-fabricate contract: unparseable/malformed digest frontmatter, an
-    invocation error, unparseable LLM output, or a schema-invalid assembled
-    record all come back as ``ok=False`` with ``record=None`` and
-    ``reason`` set — never partially applied, never fabricated. A
+    invocation error, a usage/auth CAP, unparseable LLM output, a reply
+    missing a key build_prompt prescribes, or a
+    schema-invalid assembled record all come back as ``ok=False`` with
+    ``record=None`` and ``reason`` set — never partially applied, never
+    fabricated. The cap case additionally sets ``capped=True``: it is the
+    one cause that says nothing about this digest or this coder, only that
+    no account had headroom left to look (see ``session_runner.NoHeadroom``). A
     legitimately empty judgment (``{"matches": [], "candidates": []}``)
     that passes schema validation is a genuine ``ok=True`` success: "coded
     fine, found nothing" is never conflated with "coding failed" (codebook
@@ -345,26 +435,81 @@ def code_digest(
     session = meta.get("session")
 
     index = build_codebook_index(codebook)
-    prompt = build_prompt(digest_text, index)
-    invoke_fn = invoke or _invoke_cli
+    prompt = build_prompt(digest_text, index, invariant_slugs=invariant_slugs)
 
     try:
-        raw = invoke_fn(prompt, model)
-    except CoderInvocationError as exc:
+        raw = invoke(prompt, model)
+    except session_runner.NoHeadroom as exc:
+        # ORDERED ABOVE the generic arm below, and that ordering is
+        # load-bearing: NoHeadroom SUBCLASSES InvocationFailed, so
+        # reversing these two silently routes every cap into the generic arm
+        # and the label is never applied.
+        return CodingResult(
+            ok=False, record=None, reason=str(exc), session=session, capped=True,
+        )
+    except session_runner.InvocationFailed as exc:
         return CodingResult(ok=False, record=None, reason=str(exc), session=session)
 
     try:
         judgment = parse_coder_output(raw)
     except CoderParseError as exc:
+        # The coder's one cap scan, and its placement INSIDE this arm is
+        # load-bearing. It only LABELS a digest that is already failing and
+        # never touches an account: the runner's gate sees real caps as failed
+        # results, so a banner reaching here (an auth banner, a new wording)
+        # is prose that could not be parsed into a verdict, and this is what
+        # labels it capped.
+        #
+        # Scanning only AFTER the parse has failed is census's
+        # split-on-parse-success rule, adopted unchanged (see
+        # ``census_verify.build_verify_fn``'s detector (a)): scanning
+        # arbitrary model output with the loose marker list aborted the
+        # census on cap-THEMED clusters, because this repo's
+        # codebook is dominated by clusters ABOUT usage and weekly limits, so
+        # the markers match ordinary HEALTHY content. The coder is exposed
+        # identically -- a judgment's model-authored
+        # ``title``/``cause``/``evidence_quote`` legitimately quote capped
+        # sessions, since "an agent stalled on a usage limit" is a real
+        # confusion worth coding. A pre-parse scan would discard exactly those
+        # findings, quietly, and label the loss a deferral. A reply that
+        # PARSES into a verdict is a verdict.
+        #
+        # ONE deliberate divergence from census: no confirmation probe. Census
+        # needs one because its scan can strike a reply it would otherwise
+        # have ACCEPTED, so a false positive there destroys a good verdict.
+        # This scan sits on an already-failed path, where the alternative
+        # disposition is already "per-digest failure" -- so a false positive
+        # can only re-LABEL a digest that was failing anyway, never launder a
+        # genuine verdict into a defer. It also never costs an account: the
+        # label stays on this digest, and the account is not reported to the
+        # pool.
+        marker = looks_like_blocking_banner(raw)
+        if marker:
+            return CodingResult(
+                ok=False, record=None, session=session, capped=True,
+                reason=(
+                    f"CLI reply is a capacity/auth banner, not a verdict "
+                    f"(marker: {marker!r}); {exc}"
+                ),
+            )
         return CodingResult(ok=False, record=None, reason=str(exc), session=session)
+
+    missing = [key for key in _REPLY_KEYS if key not in judgment]
+    if missing:
+        return CodingResult(
+            ok=False, record=None, session=session,
+            reason=(
+                f"coder reply lacks the prescribed key(s) {missing}; "
+                f"it carried {sorted(judgment)}"
+            ),
+        )
 
     record = {
         "session": session,
         "date": meta.get("date"),
         "project": project,
         "agent_class": meta.get("agent_class"),
-        "matches": judgment.get("matches") or [],
-        "candidates": judgment.get("candidates") or [],
+        **{key: _without_rule_stamps(judgment[key]) for key in _REPLY_KEYS},
     }
 
     errors = codebook_mod.validate_coding_record(record)
@@ -380,6 +525,14 @@ def code_digest(
 # code_digests — a batch of digests -> RunResult, with the storm threshold
 # ---------------------------------------------------------------------------
 
+class CodingStatus(StrEnum):
+    """A coded batch's run-level verdict."""
+
+    OK = "ok"
+    FAILURE = "failure"
+    """A storm: the batch's failure fraction STRICTLY exceeds 0.5."""
+
+
 @dataclass
 class RunResult:
     """Outcome of coding a batch of digests via code_digests().
@@ -387,19 +540,36 @@ class RunResult:
     ``records`` holds every successful (schema-valid) coding record;
     ``failures`` holds a ``(session, reason)`` pair for every digest that
     could not be coded — never a fabricated record. ``status`` is
-    ``"failure"`` when the batch's failure fraction STRICTLY exceeds 0.5
-    (``failed/total > 0.5``, PRD §5.3/§6.8's storm threshold); exactly 50%
-    failed is NOT a storm and stays ``"ok"``. This function never
-    escalates and never touches the codebook — that is epsilon/gamma's
-    job; it only returns the tallied result.
+    :attr:`CodingStatus.FAILURE` when the batch's failure fraction STRICTLY
+    exceeds 0.5 (``failed/total > 0.5``, PRD §5.3/§6.8's storm threshold);
+    exactly 50% failed is NOT a storm and stays :attr:`CodingStatus.OK`.
+    This function never escalates and never touches the codebook — that is
+    epsilon/gamma's job; it only returns the tallied result.
+
+    ``capped`` counts how many of those failures were a usage/auth CAP
+    rather than a failure of the coding — digests the CLI never actually
+    looked at. It REFINES ``failed`` (a capped digest is counted in both),
+    and it is deliberately a COUNT plus the ``is_cap_deferral`` predicate
+    rather than a third ``CodingStatus`` member: census treats anything but
+    FAILURE as a non-storm batch, so a third member would make a capped
+    mining batch count as saturated.
+
+    TAINT-AND-EXCLUDE for a sub-storm capped run: a capped digest is
+    labelled and left out of ``records``, but the batch's genuinely coded
+    records still merge. 2 capped of 20 stays ``CodingStatus.OK`` and returns
+    all 18 real records — the same contract ``evals/runner.py`` uses when it
+    excludes a ``cap_exhausted:`` cell from a reported mean instead of
+    scoring it 0.0. Discarding 18 records that cost real tokens because two
+    digests found no headroom would be its own kind of fabrication.
     """
 
-    status: str
+    status: CodingStatus
     records: list
     failures: list
     total: int
     succeeded: int
     failed: int
+    capped: int = 0
 
 
 def code_digests(
@@ -408,7 +578,8 @@ def code_digests(
     *,
     project: str,
     model: str = "haiku",
-    invoke=None,
+    invariant_slugs: Sequence[str],
+    invoke,
 ) -> RunResult:
     """Code a batch of digests against one codebook.
 
@@ -420,41 +591,130 @@ def code_digests(
     ``failures`` as ``(session, reason)`` pairs (session is ``None`` when
     the crash happened before a session could even be determined).
 
-    ``status`` is ``"failure"`` when ``failed/total`` STRICTLY exceeds
-    0.5 — a majority-failure storm — else ``"ok"``. Never escalates,
-    never writes the codebook.
+    EACH FAILURE IS ALSO ANNOUNCED AT WARNING AS IT HAPPENS, through ONE
+    append+log funnel that both failure paths converge on — the isolating
+    ``except`` above and the ``not result.ok`` arm — so neither can drift
+    from the other or be forgotten by a later edit.
+
+    That WARNING is the ONLY sink some failures ever reach. A batch whose
+    failure fraction does not STRICTLY exceed 0.5 (2 of 4, say) returns
+    ``CodingStatus.OK``, so epsilon escalates nothing and, before this, those
+    failures were invisible everywhere: not the journal, not an escalation,
+    nowhere. Per-digest lines also keep 38 identical ENOENTs distinguishable
+    from 38 distinct model errors — a distinction epsilon's single joined
+    aggregate detail flattens.
+
+    WARNING rather than ERROR, deliberately: one failed digest does not by
+    itself fail the run. Only the storm does, and that branch's ERROR is
+    the trickle's alarm, journaled by ``alarm.raise_alarm``. The reason is
+    logged unbounded; ``session_runner`` already tail-bounds the output
+    streams it embeds.
+
+    TWO CONSUMERS, VERY DIFFERENT VOLUMES — and everything above is the
+    TRICKLE's argument. ``nightly.run_nightly`` codes exactly ONE small
+    batch per night, so its worst case is a handful of lines.
+    ``census_mining.mine_to_saturation`` calls this once per MINED BATCH, in a loop that
+    runs until novelty saturates or the batch source exhausts — and a storm
+    batch explicitly does NOT stop mining. So under a SYSTEMIC failure (the
+    ENOENT-on-``claude`` shape) a census emits one WARNING per failed digest
+    per batch, bounded by nothing but the operator's ``--max-batches``. That
+    output is not swallowed: ``nightly._default_census_launcher`` runs
+    census.py with no ``capture_output``, so census inherits the trickle
+    unit's stderr and the volume lands in the same
+    ``journalctl --user -u legibility-trickle@<project>`` an operator reads.
+
+    That volume is bounded CALLER-SIDE rather than here, deliberately.
+    Bounding it inside this function cannot work: the flood comes from the
+    batch COUNT, which only the mining loop knows, and a per-batch cap would
+    buy nothing when a batch is already only a handful of digests. The bound
+    lives in ``scripts/legibility/census_mining.py::mine_to_saturation`` (see its
+    ``_bounded_coder_warnings``). Do NOT silence this line or drop it to
+    DEBUG: that restores the sub-storm blind spot above for EVERY caller,
+    including the trickle, to spare a flood only one of them can produce.
+
+    ``status`` is ``CodingStatus.FAILURE`` when ``failed/total`` STRICTLY
+    exceeds 0.5 — a majority-failure storm — else ``CodingStatus.OK``.
+    Never escalates, never writes the codebook.
     """
     records = []
     failures = []
+    capped = 0
 
     for digest_text in digests:
         try:
             result = code_digest(
-                digest_text, codebook, project=project, model=model, invoke=invoke,
+                digest_text, codebook, project=project, model=model,
+                invariant_slugs=invariant_slugs, invoke=invoke,
             )
         except Exception as exc:  # isolate: one crash can't abort the batch
-            failures.append((None, str(exc)))
-            continue
-
-        if result.ok:
-            records.append(result.record)
+            # An unexpected crash is never a cap: the cap paths are typed and
+            # return a CodingResult, they do not escape as bare exceptions.
+            failure, was_capped = (None, str(exc)), False
         else:
-            failures.append((result.session, result.reason))
+            if result.ok:
+                records.append(result.record)
+                continue
+            failure, was_capped = (result.session, result.reason), result.capped
+
+        # ONE append+log site for BOTH failure paths, so they cannot drift
+        # apart and a later edit cannot silence one of them. The cap tally is
+        # threaded THROUGH this funnel rather than counted at a second site,
+        # for the same reason: two sites are two things to forget.
+        session, reason = failure
+        logger.warning(
+            "legibility coder: digest failed (session=%s): %s", session, reason,
+        )
+        failures.append(failure)
+        if was_capped:
+            capped += 1
 
     total = len(digests)
     failed = len(failures)
     succeeded = len(records)
-    status = "failure" if total and (failed / total) > 0.5 else "ok"
+    status = (
+        CodingStatus.FAILURE if total and (failed / total) > 0.5
+        else CodingStatus.OK
+    )
 
     return RunResult(
         status=status, records=records, failures=failures,
-        total=total, succeeded=succeeded, failed=failed,
+        total=total, succeeded=succeeded, failed=failed, capped=capped,
     )
+
+
+def is_cap_deferral(result: RunResult) -> bool:
+    """True when a run-level FAILURE is really a capped night — a DEFERRAL
+    rather than a coder failure.
+
+    An all-accounts-capped night is a NORMAL operating condition (Leo's
+    standing directive; sibling task 4503), not an incident. The coder must
+    not fabricate a verdict for a digest it never got to look at, and must
+    not present the resulting empty night as an infra failure. Before this
+    existed, 2026-08-24 came back as 17 of 20 hard per-digest failures,
+    tripped the >50% storm threshold, and became ``exit_code=1`` plus an
+    ERROR-level escalation — an operator paged for expected weather.
+
+    The majority rule (``capped * 2 > failed``) deliberately reuses the storm
+    threshold's own strictly-greater-than-half shape. A genuine coder
+    regression that merely COINCIDES with a cap or two still reads as a
+    storm, still exits non-zero, and still gets looked at: the deferral
+    branch must not become a place for real bugs to hide.
+
+    A PREDICATE over ``RunResult``, deliberately NOT a third
+    ``CodingStatus`` member: census treats anything but FAILURE as a
+    non-storm batch. One policy, one home, two callers (``main`` here and
+    ``nightly.run_nightly``).
+
+    Note the FAILURE guard: a sub-storm run with a minority of
+    caps is NOT a deferral. Those runs coded most of their digests and their
+    records still merge (see ``RunResult``'s taint-and-exclude contract).
+    """
+    return result.status == CodingStatus.FAILURE and result.capped * 2 > result.failed
 
 
 # ---------------------------------------------------------------------------
 # main(argv) — CLI: digests + codebook -> JSONL of §7.3 coding records.
-# Fail-loud: a storm (code_digests status="failure") writes ZERO records and
+# Fail-loud: a storm (CodingStatus.FAILURE) writes ZERO records and
 # returns non-zero, so epsilon can escalate and skip the merge (PRD §8.6).
 # ---------------------------------------------------------------------------
 
@@ -462,6 +722,7 @@ def _print_summary(result: RunResult, *, matched: int, candidates: int, file) ->
     print(
         f"coder: status={result.status} total={result.total} "
         f"succeeded={result.succeeded} failed={result.failed} "
+        f"capped={result.capped} "
         f"matched={matched} candidates={candidates}",
         file=file,
     )
@@ -472,15 +733,32 @@ def main(argv: list[str] | None = None) -> int:
 
     Reads each digest file (positional args and/or every file in a
     ``--digests`` directory), loads the codebook via ``codebook.load``,
-    and calls ``code_digests``. On a run-level ``"ok"`` status, writes
+    and calls ``code_digests``. On a run-level ``CodingStatus.OK``, writes
     every successful record as a JSONL line to ``--out`` (or stdout) and
-    returns 0. On a run-level ``"failure"`` status (storm, PRD §8.6),
+    returns 0. On a run-level ``CodingStatus.FAILURE`` (storm, PRD §8.6),
     writes ZERO coding records — if ``--out`` is given, it is truncated to
     empty so a stale file from a prior successful run is never left
     looking like this run's output — prints a failure summary to stderr,
     and returns 1 (fail-loud), so a driving script (epsilon) can escalate
     and skip the merge. Either way, a one-line status summary is printed
     to stderr.
+
+    THIRD DISPOSITION — the DEFERRAL (task 4736). When that run-level
+    failure is really a capped night (``is_cap_deferral``), the same
+    zero-records/truncate discipline applies but the exit code is 0 and the
+    banner says ``coder: DEFERRED`` rather than ``coder: FAILURE``. An
+    all-accounts-capped night is a normal operating condition, not an
+    incident (Leo's directive; sibling task 4503), and a non-zero exit here
+    made ``check_trickle_liveness.sh`` report a failure for a timer behaving
+    exactly as designed — on 2026-08-24 that became an ERROR-level
+    escalation. The shape deliberately mirrors ``census.main``, which prints
+    ``census: deferred -- stage=... -- <reason>`` and returns 0 for its own
+    headroom defer, so an operator reads the same thing from both legibility
+    CLIs. The one-line summary still reports ``status=failure`` with the
+    true counts: the exit code changes, the tally never lies.
+
+    Every digest is coded on the fleet's shared account pool, through one
+    ``session_runner`` opened for the run and closed when coding ends.
     """
     parser = argparse.ArgumentParser(
         prog="coder",
@@ -504,6 +782,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--project", required=True,
         help="Project id stamped into each coding record's deterministic header",
+    )
+    parser.add_argument(
+        "--project-root", required=True,
+        help="The observed project's root, whose design-invariants doc "
+        "declares the invariant slugs the prompt lists",
     )
     parser.add_argument(
         "--model", default="haiku", help="LLM model tier (default: %(default)s)",
@@ -533,28 +816,50 @@ def main(argv: list[str] | None = None) -> int:
 
     codebook = codebook_mod.load(args.codebook)
     digests = [p.read_text(encoding="utf-8") for p in digest_paths]
+    invariant_slugs = invariants.read_slugs(args.project_root)
 
-    result = code_digests(digests, codebook, project=args.project, model=args.model)
-
-    matched = sum(len(r.get("matches") or []) for r in result.records)
-    candidates = sum(len(r.get("candidates") or []) for r in result.records)
-
-    if result.status == "failure":
-        print(
-            f"coder: FAILURE - {result.failed}/{result.total} digests failed "
-            "coding (storm threshold exceeded) -- zero coding records written",
-            file=sys.stderr,
+    with session_runner.open_pooled_runner(label="legibility-coder-cli") as runner:
+        result = code_digests(
+            digests, codebook, project=args.project, model=args.model,
+            invariant_slugs=invariant_slugs,
+            invoke=runner.invoker(TRICKLE_CODER_STAGE),
         )
+
+    matched = sum(len(r[_MATCHES_KEY]) for r in result.records)
+    candidates = sum(len(r[_CANDIDATES_KEY]) for r in result.records)
+
+    if result.status == CodingStatus.FAILURE:
+        deferred = is_cap_deferral(result)
+        if deferred:
+            print(
+                f"coder: DEFERRED - {result.capped}/{result.total} digests hit "
+                "a usage/auth cap (no headroom) -- zero coding records "
+                "written, nothing fabricated",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                f"coder: FAILURE - {result.failed}/{result.total} digests failed "
+                "coding (storm threshold exceeded) -- zero coding records written",
+                file=sys.stderr,
+            )
+        # The same per-session loop for BOTH arms, so the cap banner the CLI
+        # actually printed reaches the operator instead of being summarised
+        # away -- the whole point of carrying it this far.
         for session, reason in result.failures:
             print(f"  session={session!r}: {reason}", file=sys.stderr)
         if args.out:
             # Never leave a stale --out from a prior successful run lying
-            # around on a storm: a downstream consumer that reads the file
-            # instead of gating on the exit code must see this run's true
-            # (empty) outcome, not a previous night's records.
+            # around on a storm OR a deferral: a downstream consumer that
+            # reads the file instead of gating on the exit code must see this
+            # run's true (empty) outcome, not a previous night's records.
             Path(args.out).write_text("", encoding="utf-8")
+        # The summary stays honest either way -- status=failure with the true
+        # counts. Exit 0 must not launder the tally: "deferred, nothing coded"
+        # being readable as "coded fine, found nothing" is the never-fabricate
+        # conflation again, at the run level.
         _print_summary(result, matched=matched, candidates=candidates, file=sys.stderr)
-        return 1
+        return 0 if deferred else 1
 
     lines = [json.dumps(record) for record in result.records]
     output = "\n".join(lines)

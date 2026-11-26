@@ -12,14 +12,17 @@ Covers:
 from __future__ import annotations
 
 import contextlib
-import os
-import uuid
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import pytest_asyncio
-from _fm_helpers import assert_ro_query_only, extract_cypher, extract_params, make_rebuild_detail
-from falkordb import FalkorDB as _SyncFalkorDB
+from _fm_falkor_live import FALKOR_HOST, FALKOR_PORT, falkor_skipif, unique_graph_name
+from _fm_helpers import (
+    assert_ro_query_only,
+    extract_cypher,
+    extract_params,
+    make_rebuild_detail,
+)
 from falkordb.asyncio import FalkorDB
 
 from fused_memory.backends.graphiti_client import (
@@ -61,7 +64,16 @@ class TestResolveEntityByName:
     async def test_raises_ambiguous_error_when_multiple_match(
         self, mock_config, make_backend, make_graph_mock
     ):
-        """Raises AmbiguousEntityError when multiple entities share the same name."""
+        """Raises AmbiguousEntityError when multiple entities share the same name.
+
+        Also pins the class's structured-field invariant AT THIS RAISE SITE.
+        The invariant spans both sites by design — a consumer keys off
+        .name/.group_id/.uuids without parsing the message — so checking it at
+        only one of them would let this one drift while the class docstring
+        still named it. The sibling pin is
+        test_write_time_identity.py::TestEnsureEntityNodeNoMerge::
+        test_refusal_carries_structured_name_group_and_uuids.
+        """
         backend = make_backend(mock_config)
         rows = [['uuid-1', 'Alice'], ['uuid-2', 'Alice']]
         graph = make_graph_mock(rows)
@@ -71,6 +83,13 @@ class TestResolveEntityByName:
         # Error message should include both UUIDs so callers can disambiguate
         assert 'uuid-1' in str(exc_info.value)
         assert 'uuid-2' in str(exc_info.value)
+        # ... and the same facts as DATA, so nothing downstream parses that
+        # message. group_id is the CANONICALIZED one the method actually
+        # queried, not the raw argument.
+        assert exc_info.value.name == 'Alice'
+        assert exc_info.value.group_id == 'test'
+        assert exc_info.value.uuids == ('uuid-1', 'uuid-2')
+        assert isinstance(exc_info.value.uuids, tuple)
 
     @pytest.mark.asyncio
     async def test_raises_when_not_initialized(self, mock_config):
@@ -229,8 +248,8 @@ class TestGetValidEdgesForNode:
         """Returns list of dicts with uuid/fact/name keys for matching edges."""
         backend = make_backend(mock_config)
         rows = [
-            ['edge-1', 'Alice knows Bob', 'knows'],
-            ['edge-2', 'Alice works at Acme', 'works_at'],
+            ['edge-1', 'Alice knows Bob', 'knows', None, None],
+            ['edge-2', 'Alice works at Acme', 'works_at', None, None],
         ]
         graph = make_graph_mock(rows)
         backend._driver._get_graph = MagicMock(return_value=graph)
@@ -263,7 +282,7 @@ class TestGetValidEdgesForNode:
     async def test_null_fact_defaults_to_empty_string(self, mock_config, make_backend, make_graph_mock):
         """Rows with NULL fact field (row[1] is None) yield fact='' in result dict."""
         backend = make_backend(mock_config)
-        rows = [['edge-1', None, 'knows']]
+        rows = [['edge-1', None, 'knows', None, None]]
         graph = make_graph_mock(rows)
         backend._driver._get_graph = MagicMock(return_value=graph)
         result = await backend.get_valid_edges_for_node('node-uuid-1', group_id='test')
@@ -274,7 +293,7 @@ class TestGetValidEdgesForNode:
     async def test_null_name_defaults_to_empty_string(self, mock_config, make_backend, make_graph_mock):
         """Rows with NULL name field (row[2] is None) yield name='' in result dict."""
         backend = make_backend(mock_config)
-        rows = [['edge-1', 'Alice knows Bob', None]]
+        rows = [['edge-1', 'Alice knows Bob', None, None, None]]
         graph = make_graph_mock(rows)
         backend._driver._get_graph = MagicMock(return_value=graph)
         result = await backend.get_valid_edges_for_node('node-uuid-1', group_id='test')
@@ -305,6 +324,32 @@ class TestGetValidEdgesForNode:
         assert call_args is not None, "graph.ro_query was not called"
         cypher = extract_cypher(call_args)
         assert 'invalid_at IS NULL' in cypher, f"Cypher must filter by invalid_at IS NULL: {cypher}"
+
+    @pytest.mark.asyncio
+    async def test_does_not_filter_on_expired_at(
+        self, mock_config, make_backend, make_graph_mock
+    ):
+        """A restored edge — ``invalid_at`` NULL, ``expired_at`` SET — stays active
+        (task 4714, esc-4714-9).
+
+        The restore hooks clear ``invalid_at`` and keep ``expired_at`` as the
+        restored-edge signature, so an ``expired_at`` clause would hide exactly
+        the edges they restore (3,024 of 15,766 active edges when measured).
+        """
+        backend = make_backend(mock_config)
+        graph = make_graph_mock([])
+        backend._driver._get_graph = MagicMock(return_value=graph)
+        await backend.get_valid_edges_for_node('node-uuid-1', group_id='test')
+        call_args = graph.ro_query.call_args
+        assert call_args is not None, "graph.ro_query was not called"
+        cypher = extract_cypher(call_args)
+        assert 'e.invalid_at IS NULL' in cypher, (
+            f'Cypher must still exclude superseded edges: {cypher}'
+        )
+        assert 'expired_at' not in cypher, (
+            f'Cypher must not hide restored edges by filtering expired_at: {cypher}'
+        )
+        graph.query.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_uses_ro_query_not_query(self, mock_config, make_backend, make_graph_mock):
@@ -351,8 +396,8 @@ class TestGetValidEdgesForNode:
         """
         backend = make_backend(mock_config)
         rows = [
-            ['edge-1', 'same fact', 'rel'],
-            ['edge-1', 'same fact', 'rel'],
+            ['edge-1', 'same fact', 'rel', None, None],
+            ['edge-1', 'same fact', 'rel', None, None],
         ]
         graph = make_graph_mock(rows)
         backend._driver._get_graph = MagicMock(return_value=graph)
@@ -403,9 +448,15 @@ class TestGetAllValidEdges:
         graph = make_graph_mock([])
         backend._driver._get_graph = MagicMock(return_value=graph)
         await backend.get_all_valid_edges(group_id='test')
-        call_args = graph.ro_query.call_args
-        assert call_args is not None, "graph.ro_query was not called"
-        cypher = extract_cypher(call_args)
+        # The read is paginated (task 4340), so `call_args` is only the LAST
+        # call — read the SKIP/LIMIT page query explicitly instead.
+        pages = [
+            extract_cypher(c)
+            for c in graph.ro_query.call_args_list
+            if 'SKIP' in extract_cypher(c)
+        ]
+        assert pages, f'no page query issued: {graph.ro_query.call_args_list}'
+        cypher = pages[0]
         # The whole point of W6-zeta (task 2213): drop the WITH DISTINCT idiom.
         assert 'WITH DISTINCT' not in cypher, (
             f'Cypher must NOT use WITH DISTINCT — dedup is (n.uuid, e.uuid)-keyed in Python: {cypher}'
@@ -429,7 +480,11 @@ class TestGetAllValidEdges:
         graph = make_graph_mock([])
         backend._driver._get_graph = MagicMock(return_value=graph)
         await backend.get_all_valid_edges(group_id='test')
-        graph.ro_query.assert_awaited_once()
+        # Paginated (task 4340): a census probe plus N pages, so "exactly one
+        # query" no longer describes the shape. The load-bearing half of the
+        # original assertion — every query stays on the read-only path — is
+        # what this test is named for and is kept.
+        assert graph.ro_query.await_count >= 1
         graph.query.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -471,19 +526,52 @@ class TestGetAllValidEdges:
             await backend.get_all_valid_edges(group_id='test')
 
     @pytest.mark.asyncio
-    async def test_none_result_set_returns_empty_dict(self, mock_config, make_backend, make_graph_mock):
-        """result_set=None from the driver is treated as empty — returns {}."""
+    async def test_none_result_set_returns_empty_dict(self, mock_config, make_backend):
+        """result_set=None from the driver is treated as empty — returns {}.
+
+        Defensive-coding pin: the read path uses ``result.result_set or []``
+        (in ``_census_count`` and in the ``_paged_ro_query`` page loop) to
+        tolerate a driver that returns None where an empty list is expected.
+        Without the guard, ``list(None)`` raises ``TypeError``, so this test
+        fails loudly rather than merely returning something different.
+
+        WHY A LOCAL DOUBLE AND NOT ``make_graph_mock`` (task 4340 amendment).
+        This test used to do ``graph.ro_query.return_value.result_set = None``
+        on a ``make_graph_mock`` graph.  That fixture now drives ``ro_query``
+        with a ``side_effect`` callable so it can answer per-cypher, and
+        ``unittest.mock`` IGNORES ``return_value`` entirely once a
+        ``side_effect`` callable returns a non-DEFAULT value — so the override
+        was a silent no-op.  The test kept passing only because
+        ``make_graph_mock([])`` yields empty rows; it would have passed
+        identically with the guard deleted.  Do not "simplify" this back to
+        the shared fixture without giving that fixture an explicit
+        None-result-set knob.
+        """
+        class _NoneResult:
+            result_set = None
+            header: list = []
+
+        class _NoneResultGraph:
+            """Answers EVERY query with result_set=None — census and pages alike."""
+
+            def __init__(self):
+                self.queries: list[str] = []
+
+            async def ro_query(self, cypher, params=None):
+                self.queries.append(cypher)
+                return _NoneResult()
+
+            async def query(self, cypher, params=None):  # pragma: no cover
+                raise AssertionError('read paths must use ro_query, never query')
+
         backend = make_backend(mock_config)
-        graph = make_graph_mock([])
-        # Defensive-coding pin: get_all_valid_edges() uses `result.result_set or []`
-        # to tolerate a driver that returns None instead of an empty list — this
-        # test exercises that guard.
-        # Override the awaited return value to have result_set=None, simulating
-        # a driver that returns None instead of an empty list.
-        graph.ro_query.return_value.result_set = None
+        graph = _NoneResultGraph()
         backend._driver._get_graph = MagicMock(return_value=graph)
         result = await backend.get_all_valid_edges(group_id='test')
         assert result == {}
+        # The guard was really reached: a query was issued and its None
+        # result_set was coerced, rather than the read short-circuiting.
+        assert graph.queries
 
     @pytest.mark.asyncio
     async def test_rows_sharing_uuid_pair_collapse_to_one(self, mock_config, make_backend, make_graph_mock):
@@ -713,6 +801,45 @@ class TestRefreshEntitySummary:
         assert result['new_summary'] == 'Alice knows Bob'
         assert result['edge_count'] == 1
         backend.update_node_summary.assert_awaited_once_with('node-uuid-1', 'Alice knows Bob', group_id='test')
+
+    @pytest.mark.asyncio
+    async def test_regenerates_from_a_population_including_restored_edges(
+        self, mock_config, make_backend, make_graph_mock
+    ):
+        """The regenerated summary keeps restored edges (task 4714, esc-4714-9).
+
+        Unlike its siblings above, this drives the REAL get_valid_edges_for_node
+        rather than stubbing it, because the point is which population the
+        refresh reads: superseded facts (``invalid_at`` set) stay out, but a
+        restored fact — ``invalid_at`` cleared, ``expired_at`` kept — must be
+        re-concatenated into the summary like any other active fact.
+        """
+        backend = make_backend(mock_config)
+        # The query's WHERE clause decides the population; the mock returns what
+        # a FalkorDB honouring the Cypher pinned below would: the live edge and
+        # the restored one.
+        graph = make_graph_mock([
+            ['e1', 'Task 99 depends on Task 98', 'DEPENDS_ON', None, None],
+            ['e-restored', 'Task 99 depends on Task 97', 'DEPENDS_ON', None, None],
+        ])
+        backend._driver._get_graph = MagicMock(return_value=graph)
+        backend.update_node_summary = AsyncMock()
+
+        result = await backend.refresh_entity_summary(
+            'n-99', group_id='test', name='Task 99', old_summary='stale'
+        )
+
+        cypher = extract_cypher(graph.ro_query.call_args)
+        assert 'e.invalid_at IS NULL' in cypher, (
+            f'refresh must keep excluding superseded edges: {cypher}'
+        )
+        assert 'expired_at' not in cypher, (
+            f'refresh must not drop restored edges by filtering expired_at: {cypher}'
+        )
+        assert result['new_summary'] == (
+            'Task 99 depends on Task 98\nTask 99 depends on Task 97'
+        )
+        assert result['edge_count'] == 2
 
 
 # ---------------------------------------------------------------------------
@@ -1270,35 +1397,16 @@ class TestMemoryServiceRefreshEntitySummaryJournalFix:
 #       property tuple — as redirect_node_edges produces on the merge path —
 #       are both counted, not collapsed into one.
 # Skipped automatically when FalkorDB is not reachable, following the
-# established pattern in tests/test_list_indices_integration.py.
-
-FALKOR_HOST: str = os.environ.get('FALKOR_HOST', 'localhost')
-FALKOR_PORT: int = int(os.environ.get('FALKOR_PORT', '6379'))
-
-
-def _falkor_available() -> bool:
-    """FalkorDB-native reachability probe (mirrors test_list_indices_integration.py)."""
-    try:
-        client = _SyncFalkorDB(host=FALKOR_HOST, port=FALKOR_PORT, socket_connect_timeout=2)
-        try:
-            client.select_graph('_probe').query('RETURN 1')
-        finally:
-            with contextlib.suppress(Exception):
-                client.close()
-        return True
-    except Exception:
-        return False
-
+# established pattern in tests/test_list_indices_integration.py. The
+# reachability probe, connection constants and per-run graph name come from
+# _fm_falkor_live (task 3502) — see its module docstring for why it is not
+# conftest.py. Only the fixture body below is per-module; do not re-fork the
+# shared helpers back into this file.
 
 @pytest_asyncio.fixture
 async def edge_dedup_live_graph():
-    """Provision a throwaway, uniquely-named FalkorDB graph, yield it, then clean up.
-
-    A fresh graph name is minted on every invocation (rather than a shared
-    module-level constant) so the dedup tests below never share state, even
-    under pytest-xdist or a shared FalkorDB instance.
-    """
-    graph_name = f'_test_2084_edge_dedup_{uuid.uuid4().hex[:8]}'
+    """Provision a throwaway, uniquely-named FalkorDB graph, yield it, then clean up."""
+    graph_name = unique_graph_name('2084_edge_dedup')
     client = FalkorDB(host=FALKOR_HOST, port=FALKOR_PORT)
     with contextlib.suppress(Exception):
         stale = client.select_graph(graph_name)
@@ -1313,7 +1421,7 @@ async def edge_dedup_live_graph():
             await client.aclose()
 
 
-@pytest.mark.skipif(not _falkor_available(), reason='FalkorDB not reachable')
+@falkor_skipif()
 @pytest.mark.timeout(15)
 @pytest.mark.integration
 class TestEdgeDedupLiveFalkorDB:
@@ -1390,3 +1498,51 @@ class TestEdgeDedupLiveFalkorDB:
             assert len(all_edges['node-c']) == 1
         finally:
             await backend.close()
+
+
+@falkor_skipif()
+@pytest.mark.timeout(15)
+@pytest.mark.integration
+class TestActiveEdgePopulationLiveFalkorDB:
+    """On a real server, the single-entity and bulk reads serve one ACTIVE
+    population (task 4714, esc-4714-9).
+
+    A superseded edge (``invalid_at`` set, ``expired_at`` alongside it, as
+    graphiti_core writes them) stays out.  A restored edge (``invalid_at``
+    cleared, ``expired_at`` kept) and a legacy edge that never carried either
+    property both stay in — the server, not a mock, decides that a missing
+    property is NULL.
+    """
+
+    @pytest.mark.asyncio
+    async def test_single_and_bulk_reads_agree_on_the_active_population(
+        self, mock_config, edge_dedup_live_graph
+    ):
+        graph_name, graph = edge_dedup_live_graph
+        await graph.query(
+            "CREATE (:Entity {uuid: 'n-99', name: 'Task 99'}), "
+            "(:Entity {uuid: 'n-98', name: 'Task 98'})"
+        )
+        retired = '2024-09-01T10:00:00+00:00'
+        for edge_uuid, invalid_at, expired_at in (
+            ('e-legacy', None, None),
+            ('e-superseded', retired, retired),
+            ('e-restored', None, retired),
+        ):
+            await graph.query(
+                "MATCH (a:Entity {uuid: 'n-99'}), (b:Entity {uuid: 'n-98'}) "
+                'CREATE (a)-[:RELATES_TO {uuid: $uuid, fact: $uuid, '
+                "name: 'DEPENDS_ON', invalid_at: $invalid_at, expired_at: $expired_at}]->(b)",
+                {'uuid': edge_uuid, 'invalid_at': invalid_at, 'expired_at': expired_at},
+            )
+        backend = GraphitiBackend(mock_config)
+        backend._driver = _MultiTenantFalkorDriver(host=FALKOR_HOST, port=FALKOR_PORT)
+        try:
+            single = await backend.get_valid_edges_for_node('n-99', group_id=graph_name)
+            bulk = await backend.get_all_valid_edges(group_id=graph_name)
+        finally:
+            await backend.close()
+
+        active = {'e-legacy', 'e-restored'}
+        assert {e['uuid'] for e in single} == active
+        assert {e['uuid'] for e in bulk['n-99']} == active

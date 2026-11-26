@@ -99,6 +99,24 @@ class TestWmBackendFocusPrefersWindowId:
         assert result.ok is True
         assert runner.calls == [['wmctrl', '-i', '-a', '0x123']]
 
+    def test_focus_converts_decimal_window_id_to_canonical_hex(self):
+        """Task 2933: a DECIMAL wm_window_id is converted to canonical 0x-hex
+        before `wmctrl -i -a`, since `wmctrl -i` parses its arg base-16 — a
+        bare decimal '52428807' would be MIS-read as hex and miss the window.
+        52428807 == 0x03200007 is an exact identity.
+        """
+        from cockpit.backends.base import DisplayTarget
+        from cockpit.backends.wm import WmBackend
+
+        runner = ScriptedRunner()
+        backend = WmBackend(run=runner)
+        target = DisplayTarget(kind='wm', wm_title='session-a', wm_window_id='52428807')
+
+        result = backend.focus(target)
+
+        assert result.ok is True
+        assert runner.calls == [['wmctrl', '-i', '-a', '0x03200007']]
+
     def test_focus_falls_back_to_title_when_window_id_activate_fails(self):
         from cockpit.backends.base import CommandResult, DisplayTarget
         from cockpit.backends.wm import WmBackend
@@ -306,6 +324,31 @@ class TestWmBackendIsAlive:
         )
         backend = WmBackend(run=runner)
         target = DisplayTarget(kind='wm', wm_title='renamed-title', wm_window_id='0x01')
+
+        assert backend.is_alive(target) is True
+
+    def test_true_when_wm_window_id_is_decimal_but_column_is_equivalent_hex(self):
+        """Task 2933: a session captured from a DECIMAL $WINDOWID is still found.
+
+        Real terminal emulators export $WINDOWID as a bare decimal (e.g.
+        '52428807') while wmctrl -l always prints the canonical zero-padded
+        0x-hex ('0x03200007'). The two encode the SAME integer
+        (52428807 == 0x03200007), so is_alive must compare by integer
+        identity, not exact string. The title deliberately does NOT match, so
+        only the window-id path can succeed.
+        """
+        from cockpit.backends.base import CommandResult, DisplayTarget
+        from cockpit.backends.wm import WmBackend
+
+        runner = ScriptedRunner(
+            results={
+                ('wmctrl', '-l'): CommandResult(
+                    returncode=0, stdout='0x03200007 0 host session-a\n'
+                )
+            }
+        )
+        backend = WmBackend(run=runner)
+        target = DisplayTarget(kind='wm', wm_title='renamed-title', wm_window_id='52428807')
 
         assert backend.is_alive(target) is True
 

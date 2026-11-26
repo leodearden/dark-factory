@@ -7,95 +7,82 @@ about any specific sandbox backend.
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
-from typing import Any
-from unittest.mock import patch
 
 import pytest
 
 from shared.cli_invoke import (
     AgentResult,
-    _SubprocessResult,
     invoke_claude_agent,
     invoke_with_cap_retry,
 )
+from shared.testing_cli_runner import RecordingRunner, canned_claude_result, pin_claude_binary
 
 
-def _make_subprocess_result(**overrides: Any) -> _SubprocessResult:
-    """Build a minimal _SubprocessResult that _parse_claude_output can parse."""
-    stdout = json.dumps({
-        'result': 'ok',
-        'is_error': False,
-        'subtype': 'success',
-        'cost_usd': 0.01,
-        'duration_ms': 100,
-        'num_turns': 1,
-        'session_id': 'test-session',
-    })
-    defaults: dict[str, Any] = {
-        'stdout': stdout,
-        'stderr': '',
-        'returncode': 0,
-        'duration_ms': 100,
-        'timed_out': False,
-    }
-    defaults.update(overrides)
-    return _SubprocessResult(**defaults)
+@pytest.fixture
+def pinned_claude(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> str:
+    """Pin CLAUDE_BINARY at a real executable and yield its absolute path.
+
+    build_claude_argv now resolves argv[0] to an absolute path rather than
+    emitting the bare name 'claude' (task 4448), so these argv assertions need
+    a deterministic value that does not depend on whether the CLI happens to
+    be on the CI PATH.
+    """
+    return pin_claude_binary(monkeypatch, tmp_path)
 
 
 @pytest.mark.asyncio
-async def test_sandbox_wrap_applied_to_argv(tmp_path: Path) -> None:
-    """When sandbox_wrap is set, _invoke_claude applies it to cmd before spawning.
+async def test_sandbox_wrap_reaches_the_runner_as_wrap_argv(
+    tmp_path: Path, pinned_claude: str,
+) -> None:
+    """When sandbox_wrap is set, the runner gets it as wrap_argv with the unwrapped argv.
 
-    The wrapped argv should start with the wrap token ('WRAP') but still
-    contain 'claude' as the wrapped command.  Confirms the hook fires between
-    temp-file creation and _run_subprocess, as designed.
+    The runner applies the wrap once, before spawn (pinned in
+    test_cli_runner.py), so _invoke_claude must hand it over untouched rather
+    than pre-wrapping the claude argv itself.
     """
-    captured: list[list[str]] = []
+    runner = RecordingRunner(canned_claude_result())
 
-    async def fake_run_subprocess(cmd: list[str], *args: Any, **kwargs: Any) -> _SubprocessResult:
-        captured.append(list(cmd))
-        return _make_subprocess_result()
+    def wrap(cmd: list[str]) -> list[str]:
+        return ['WRAP', *cmd]
 
-    with patch('shared.cli_invoke._run_subprocess', side_effect=fake_run_subprocess):
-        await invoke_claude_agent(
-            prompt='hello',
-            system_prompt='sys',
-            cwd=tmp_path,
-            sandbox_wrap=lambda cmd: ['WRAP'] + cmd,
-        )
+    await invoke_claude_agent(
+        prompt='hello',
+        system_prompt='sys',
+        cwd=tmp_path,
+        sandbox_wrap=wrap,
+        runner=runner,
+    )
 
-    assert len(captured) == 1, 'Expected exactly one subprocess invocation'
-    argv = captured[0]
-    assert argv[0] == 'WRAP', f'Expected wrapped argv to start with WRAP; got {argv[:3]}'
-    assert 'claude' in argv, f'Expected wrapped argv to contain claude; got {argv[:5]}'
+    [spawn] = runner.calls
+    assert spawn.cmd[0] == pinned_claude, f'Expected the unwrapped claude argv; got {spawn.cmd[:3]}'
+    assert spawn.kw['wrap_argv'] is wrap
 
 
 @pytest.mark.asyncio
-async def test_sandbox_wrap_none_leaves_argv_unchanged(tmp_path: Path) -> None:
-    """When sandbox_wrap is None (default), cmd is passed to _run_subprocess unchanged.
+async def test_sandbox_wrap_none_reaches_the_runner_as_none(
+    tmp_path: Path, pinned_claude: str,
+) -> None:
+    """When sandbox_wrap is None (default), the runner gets wrap_argv=None.
 
-    The first token in the captured argv must be 'claude', confirming no
-    accidental transformation.
+    The first token in the captured argv must be the resolved claude binary,
+    confirming no accidental transformation — in particular that NO sandbox
+    wrapper was prepended.
     """
-    captured: list[list[str]] = []
+    runner = RecordingRunner(canned_claude_result())
 
-    async def fake_run_subprocess(cmd: list[str], *args: Any, **kwargs: Any) -> _SubprocessResult:
-        captured.append(list(cmd))
-        return _make_subprocess_result()
+    await invoke_claude_agent(
+        prompt='hello',
+        system_prompt='sys',
+        cwd=tmp_path,
+        runner=runner,
+    )
 
-    with patch('shared.cli_invoke._run_subprocess', side_effect=fake_run_subprocess):
-        await invoke_claude_agent(
-            prompt='hello',
-            system_prompt='sys',
-            cwd=tmp_path,
-            # sandbox_wrap intentionally omitted (defaults to None)
-        )
-
-    assert len(captured) == 1
-    argv = captured[0]
-    assert argv[0] == 'claude', f'Expected unchanged argv to start with claude; got {argv[:3]}'
+    [spawn] = runner.calls
+    assert spawn.cmd[0] == pinned_claude, (
+        f'Expected unchanged argv to start with the claude binary; got {spawn.cmd[:3]}'
+    )
+    assert spawn.kw['wrap_argv'] is None
 
 
 # ── invoke_with_cap_retry forwarding tests ────────────────────────────────────
@@ -182,7 +169,7 @@ async def test_invoke_with_cap_retry_forwards_sandbox_wrap_with_gate(tmp_path: P
         soonest_resets_at = None
 
         @contextlib.asynccontextmanager
-        async def invoke_slot(self, scope=None):
+        async def invoke_slot(self, scope=None, *, park=True, max_wait_secs=None):
             yield slot
 
     await invoke_with_cap_retry(

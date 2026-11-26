@@ -12,9 +12,10 @@ a single file rather than to an opaque aggregate.
 Three non-vacuity guards are load-bearing here, because PRD leaf **κ** deletes
 reify's originals on the strength of this suite being green:
 
-* ``PORTED_TESTS`` is an explicit manifest asserted set-equal to the on-disk
-  glob.  A glob-only driver reports a green suite when it discovers zero files;
-  the manifest turns a dropped, renamed or mis-globbed port into a hard failure.
+* ``BASH_SUITES`` (``PORTED_TESTS`` plus ``NATIVE_TESTS``) is an explicit
+  manifest asserted set-equal to the on-disk glob.  A glob-only driver reports a
+  green suite when it discovers zero files; the manifest turns a dropped,
+  renamed or mis-globbed suite into a hard failure.
 * Required host tools FAIL rather than skip.  reify's originals hard-require
   ``flock``, ``git``, procfs, ``du``, ``dd`` and (for audit) ``python3`` with no
   guards at all, so a skip on a tool-less host would silently convert this
@@ -23,8 +24,18 @@ reify's originals on the strength of this suite being green:
   ``N`` at or above a per-suite floor — the same strictly-stronger predicate
   reify's own runner (``tests/infra/run_all_ambient_isolation_lib.sh``) applies.
   Exit-status-only would be the weak link in κ's chain: a block that skips or
-  short-circuits still exits 0 while its share of the 837 asserts never runs.
+  short-circuits still exits 0 while its share of the asserts never runs.
   See ``ASSERT_FLOORS``.
+
+These items no longer run in the default ``orchestrator`` suite.  Task 3349
+took PRD §11 q4's documented escape: they are deselected via
+``orchestrator/pyproject.toml``'s ``addopts`` (``-m 'not warm_lane_bash'``) and
+re-selected post-merge by the ``warm-lane-bash`` ``LaneCommand`` in
+``dark-factory-orchestrator.yaml``.  So a reader who runs ``pytest tests/`` and
+sees nothing from this module is looking at a relocation, NOT a dropped port —
+select them on demand with ``-m warm_lane_bash``.  The two config edits are
+coupled, and ``test_warm_lane_bash_bucket_placement.py`` is the guard that
+keeps them that way.
 
 See ``orchestrator/tests/warm-lane/README.md`` for provenance, the enumerated
 deltas from the reify sources, and the measured wall-clock per test.
@@ -61,6 +72,13 @@ PORTED_TESTS: tuple[str, ...] = (
     'test_provision_warm_lane_fs.sh',
 )
 
+#: Bash suites with no reify source, never diffed against reify; currently only
+#: the dark-factory-native half of the gc split (task 6931).
+NATIVE_TESTS: tuple[str, ...] = ('test_warm_lane_gc_native.sh',)
+
+#: Every bash suite this driver runs, whatever its provenance.
+BASH_SUITES: tuple[str, ...] = PORTED_TESTS + NATIVE_TESTS
+
 #: Every invocable script α relocated, mapped to the ported bash test that owns
 #: its coverage.  The parenthesised notes record *additional* real exercise, so a
 #: future reader can see which tests break if a script changes; the mapping
@@ -68,7 +86,8 @@ PORTED_TESTS: tuple[str, ...] = (
 #: ``lib_live_refs.sh`` / ``lib_portable.sh`` are deliberately absent — see
 #: ``test_every_invocable_script_has_ported_coverage``.
 SCRIPT_COVERAGE = {
-    # also exercised for real by test_warm_lane_gc_sweep.sh blocks G4/G5/U/W
+    # also exercised for real by test_warm_lane_gc_sweep.sh blocks G4/G5/U/W, and
+    # by test_warm_lane_gc_native.sh (the native half of the gc split, task 6931)
     'warm-lane-gc.sh': 'test_warm_lane_gc.sh',
     'warm-lane-gc-sweep.sh': 'test_warm_lane_gc_sweep.sh',
     # also test_warm_lane_sizing_lifecycle.sh
@@ -81,7 +100,7 @@ SCRIPT_COVERAGE = {
     'provision-warm-lane-fs.sh': 'test_provision_warm_lane_fs.sh',
 }
 
-#: Minimum ``Results: N passed`` count each ported suite must report.  The floor
+#: Minimum ``Results: N passed`` count each bash suite must report.  The floor
 #: is the count guaranteed on ANY host that satisfies ``REQUIRED_HOST_TOOLS``,
 #: i.e. the measured count minus the asserts in blocks whose skip guards are
 #: enumerated below.  Exit status alone cannot see a block that skipped: reify's
@@ -89,23 +108,26 @@ SCRIPT_COVERAGE = {
 #: deletes reify's originals on the strength of this suite, so the weaker
 #: predicate is not good enough here.
 #:
-#: Only TWO deductions from the measured counts in
-#: ``orchestrator/tests/warm-lane/README.md`` are legitimate, both from skip
-#: guards this leaf was required to preserve verbatim:
+#: Only THREE deductions from the measured counts are legitimate, each from a
+#: skip guard ported verbatim from reify:
 #:
 #: * ``test_provision_warm_lane_fs.sh`` Block I (5 asserts) — real-geometry
 #:   ``xfs_info``/``xfs_db`` proof, guarded on ``mkfs.xfs``/``xfs_info``/
-#:   ``xfs_db``.  Measured: 111 with xfsprogs, 106 without.  xfsprogs is
+#:   ``xfs_db``.  Measured 115 with xfsprogs on 2026-11-17; without it
+#:   Block I's 5 asserts are skipped.  xfsprogs is
 #:   deliberately NOT added to ``REQUIRED_HOST_TOOLS`` — that guard exists so the
 #:   bash file stays runnable by a developer on any host, and promoting it to a
 #:   hard requirement would red the whole orchestrator suite on a host that only
 #:   lacks an optional package.
 #: * ``test_warm_lane_audit.sh`` L9 (3 asserts) — unreadable-record degradation,
 #:   guarded on ``id -u != 0`` because mode 000 is not a barrier for root.
+#: * ``test_warm_lane_gc.sh`` S-discard3 (8 asserts) — a seed whose discard of
+#:   ``<lane>/target`` itself fails, staged with ``chmod a-w`` on the lane dir
+#:   and so guarded on ``id -u != 0``: the same root-guarded rule as L9.
 #:
 #: ``test_thin_warm_lane.sh``'s Block C df-delta assert is not a deduction: it is
 #: gated on ``REIFY_WARM_LANE_MOUNT``, which ``_sanitized_env`` always strips, so
-#: 45 is both its floor and its measured count under this driver.
+#: 74 is both its floor and its measured count under this driver.
 #:
 #: Any OTHER shortfall — a block short-circuited by a future edit — fails loudly
 #: here instead of passing as a green item that ran less than it claims.  Leaf γ
@@ -114,15 +136,86 @@ SCRIPT_COVERAGE = {
 #: durable lane record and added 28 asserts (Block S + Block A's A10), so the
 #: floor moved 170 → 198.  It moved because the count was RE-MEASURED, not to
 #: make a red run green.
+#:
+#: Dark-factory task 3292 then wired ``warm-lane-gc.sh``'s PROTECT_GLOB default
+#: to ``lib_lane_state.sh``'s ``lane_protect_glob`` (deleting the hand-mirrored
+#: literal) and added Block X's 16 asserts, so the floor moved 198 → 214 — again
+#: RE-MEASURED against the suite, not raised to absorb a red.  Block X carries no
+#: skip guard, so 214 is both its floor and its measured count on any host that
+#: satisfies ``REQUIRED_HOST_TOOLS``: X-degrade reaches the bridge's degrade
+#: branch by RELOCATING a copy of gc.sh (its resolved repo root then carries no
+#: dark-factory checkout), which needs no python3 and no network.
+#:
+#: Dark-factory task 3655 then added the gc-SWEEP suite's Block Y — the first
+#: assertions anywhere to inspect the protect glob that 3292's bridge-cost pin
+#: short-circuits — so that floor moved 86 → 90.  RE-MEASURED against the suite
+#: (``Results: 90 passed, 0 failed``), not raised to absorb a red.  Block Y needs
+#: no python3: its whole point is that the pin prevents the render, and it is
+#: NON-VACUOUS by construction — removing the pin from ``run_sweep`` flips Y2/Y3
+#: to ``88 passed, 2 failed`` (task 3655's negative control).
+#:
+#: Dark-factory task 5566 then ported reify's K1–K6 block (esc-7244-16), which
+#: pins the conventional-commit arm of the citation grammar
+#: ``warm-lane-degenerate-ref-check.sh`` now sources from
+#: ``lib_task_citation.sh``, so the degenerate-ref floor moved 70 → 81.
+#: RE-MEASURED both sides: ``Results: 70 passed, 0 failed`` before the port, and
+#: ``Results: 81 passed, 0 failed`` after the script was rewired.  The block
+#: carries no skip guard, so 81 is both floor and measured count on any host
+#: that satisfies ``REQUIRED_HOST_TOOLS`` — it needs only ``git``.  NON-VACUOUS
+#: by construction: against the pre-port inline predicate the same block reports
+#: ``75 passed, 6 failed`` (K1/K5/K6, two asserts each).
+#:
+#: Dark-factory task 7862 then ported reify's seed-failure discard (Block
+#: S-discard, 43 asserts) and per-lane base-generation pin (Block T, 21) into
+#: ``warm-lane-gc.sh``, so that floor moved 280 → 336.  RE-MEASURED against the
+#: suite (``Results: 344 passed, 0 failed``), not raised to absorb a red, less
+#: the 8 asserts of S-discard3's ``id -u != 0`` arm — the only new skip guard,
+#: deducted on the same root-guarded rule as ``test_warm_lane_audit.sh``'s L9.
+#: NON-VACUOUS by construction: against the pre-port script the two blocks
+#: reported ``20`` and ``10`` failures respectively.
+#:
+#: Dark-factory task 7859 then added gc's skip-unchanged gate (Block V, 102
+#: asserts, plus A12's 3 for its new sibling lib) and the sweep's
+#: trash-and-emergency mode (Block Z, 28), so the floors moved 336 → 441 and
+#: 102 → 130.  RE-MEASURED against the suites (``Results: 449 passed, 0
+#: failed`` less S-discard3's 8 root-guarded asserts, and ``Results: 130
+#: passed, 0 failed``), not raised to absorb a red.  Neither block adds a skip
+#: guard.  NON-VACUOUS by construction: against the pre-change scripts they
+#: reported ``29`` and ``9`` failures respectively, and the four V5 arms added
+#: on review (NaN, Infinity, a non-object stamp, no python3; 17 asserts) 5 more.
+#:
+#: Dark-factory task 5307 then ported reify task 5823's live-process-reference
+#: gate into ``thin-warm-lane.sh`` with its coverage — A12, the B3 token pair,
+#: B3b and Block F — so the thin floor moved 45 → 74.  RE-MEASURED against the
+#: suite (``Results: 74 passed, 0 failed``), not raised to absorb a red.  The new
+#: asserts carry no skip guard; they need only ``flock`` and a readable ``/proc``.
+#: NON-VACUOUS by construction: against the pre-port script the same file reports
+#: ``60 passed, 14 failed``.
+#:
+#: Dark-factory task 6931 then split ``test_warm_lane_gc.sh`` along its
+#: reify-ported / dark-factory-native seam into ``test_warm_lane_gc.sh`` and
+#: ``test_warm_lane_gc_native.sh``, so the single 441 floor became two:
+#: 441 → 226 and a new 217.  RE-MEASURED against each half
+#: (``Results: 234 passed, 0 failed`` and ``Results: 217 passed, 0 failed``),
+#: not raised to absorb a red.  The partition is lossless: the two halves'
+#: sorted PASS labels equal the pre-split suite's 449 plus the native suite's
+#: own TRASH1/TRASH2 pair.  No skip guard moved: S-discard3 stays in the
+#: ported half, which still deducts its 8 root-guarded asserts, and the native
+#: floor is its measured count.  The decision is recorded in
+#: ``orchestrator/tests/warm-lane/README.md`` "Delta 10".
 ASSERT_FLOORS = {
-    'test_warm_lane_disk_guard.sh': 62,
-    'test_warm_lane_degenerate_ref.sh': 70,
-    'test_thin_warm_lane.sh': 45,
-    'test_warm_lane_gc.sh': 198,  # 170 + 28 (Block S 23 + A10 3 + S9b/S10b)
-    'test_warm_lane_gc_sweep.sh': 86,
-    'test_warm_lane_audit.sh': 225,  # 228 measured − 3 (L9, root-guarded)
+    'test_warm_lane_disk_guard.sh': 89,  # 79 + 10 (A10, task 5940)
+    'test_warm_lane_degenerate_ref.sh': 95,  # 70 + 11 (K1-K6: the conventional-commit citation arm)
+                                             # + 3 (U8, task 5940)
+                                             # + 6 (M1-M3: merge arm from shared.merge_subject, task 6716)
+                                             # + 5 (M4-M5: the lib refuses an empty merge arm, task 6716)
+    'test_thin_warm_lane.sh': 74,  # 45 + 29 (A12 3, B3 2, B3b 6, Block F 18)
+    'test_warm_lane_gc.sh': 226,  # 234 measured − 8 (S-discard3, root-guarded)
+    'test_warm_lane_gc_native.sh': 217,  # 215 moved from test_warm_lane_gc.sh + 2 (its own TRASH pair)
+    'test_warm_lane_gc_sweep.sh': 130,  # 99 + 3 (G6g, task 5940) + 28 (Z, task 7859)
+    'test_warm_lane_audit.sh': 232,  # 235 measured − 3 (L9, root-guarded); incl. Block R's 3 (task 10896)
     'test_warm_lane_sizing_lifecycle.sh': 65,
-    'test_provision_warm_lane_fs.sh': 106,  # 111 measured − 5 (Block I, xfsprogs)
+    'test_provision_warm_lane_fs.sh': 110,  # 115 measured − 5 (Block I, xfsprogs)
 }
 
 #: ``test_helpers.sh::test_summary``'s pass/fail protocol line, verbatim.
@@ -153,10 +246,15 @@ _RESULTS_RE = re.compile(r'^Results: (\d+) passed, (\d+) failed$', re.MULTILINE)
 #: re-measurement, never to make a red run green, and the arithmetic above is
 #: recorded so the next mover can check it rather than re-derive it.  The cost
 #: is bounded and one-sided — a genuinely hung suite now reports in 15 minutes
-#: instead of 5.  If the fleet-load figure keeps climbing, the sanctioned next
-#: lever is NOT another bump but the README's documented escape:
-#: ``git.offline_lane_commands``, which runs the ``warm_lane_bash`` bucket
-#: post-merge, off the verify hot path.
+#: instead of 5.
+#:
+#: That next lever HAS NOW BEEN PULLED.  Task 3349 took the README's documented
+#: escape and moved this bucket onto ``git.offline_lane_commands``, post-merge
+#: and off the verify hot path (PRD §11 q4, re-decided 2026-08-01, on a
+#: re-measured 289.58s at loadavg 128.72 on 32 cores — 6.2x the 47s module
+#: baseline).  The 900/960 pair is RETAINED UNCHANGED and still governs this
+#: bucket wherever it runs, the offline lane included; a further bump remains
+#: the wrong answer.
 SUBPROC_TIMEOUT = 900
 
 #: Host tools reify's originals hard-require with no skip guards.
@@ -166,9 +264,9 @@ REQUIRED_HOST_TOOLS = ('bash', 'git', 'flock', 'du', 'dd', 'python3')
 #: rationale.  The ``GIT_*`` pair is the subtler hazard — pytest's ``--basetemp``
 #: may legally sit INSIDE a checkout, and this suite runs under git hooks and
 #: ``git rebase --exec``, which export ``GIT_DIR``, under which a bare
-#: ``git init`` in a test fixture fails outright.  Six of the ported tests build
-#: synthetic git repos and ``test_warm_lane_gc.sh`` alone does 34
-#: ``git worktree add`` calls, so stripping these is non-negotiable.
+#: ``git init`` in a test fixture fails outright.  Seven of the bash suites build
+#: synthetic git repos, and both gc suites call ``git worktree add``
+#: throughout, so stripping these is non-negotiable.
 _HOSTILE_ENV_KEYS = ('GIT_DIR', 'GIT_WORK_TREE')
 
 #: A PREFIX rule, not a name list.  The relocated scripts read ~30 ``REIFY_*``
@@ -241,9 +339,10 @@ def _tail(text: str, limit: int = 4000) -> str:
 
 
 def test_manifest_matches_disk() -> None:
-    """``PORTED_TESTS`` must name exactly the ``test_*.sh`` files on disk.
+    """``BASH_SUITES`` must name exactly the ``test_*.sh`` files on disk.
 
-    The non-vacuity guard, plus its companion: ``ASSERT_FLOORS`` must be keyed by
+    The non-vacuity guard, plus its companions: a suite is either a reify port
+    or dark-factory-native, never both, and ``ASSERT_FLOORS`` must be keyed by
     exactly the same set.  ``test_helpers.sh`` is excluded: it is the sourced
     harness, not a runnable suite.
     """
@@ -251,18 +350,23 @@ def test_manifest_matches_disk() -> None:
         p.name for p in BASH_TEST_DIR.glob('test_*.sh')
         if p.name != 'test_helpers.sh'
     }
-    assert set(PORTED_TESTS) == on_disk, (
-        f'PORTED_TESTS and {BASH_TEST_DIR} disagree.\n'
-        f'  manifest-only (dropped/renamed port?): {sorted(set(PORTED_TESTS) - on_disk)}\n'
-        f'  disk-only (unregistered port?):        {sorted(on_disk - set(PORTED_TESTS))}'
+    assert set(BASH_SUITES) == on_disk, (
+        f'BASH_SUITES and {BASH_TEST_DIR} disagree.\n'
+        f'  manifest-only (dropped/renamed suite?): {sorted(set(BASH_SUITES) - on_disk)}\n'
+        f'  disk-only (unregistered suite?):        {sorted(on_disk - set(BASH_SUITES))}'
     )
-    # Every suite must carry an assert floor, and a removed port must not leave a
-    # stale one behind: without this, a dropped floor is a KeyError at run time
-    # while a stale floor is invisible.
-    assert set(ASSERT_FLOORS) == set(PORTED_TESTS), (
-        f'ASSERT_FLOORS and PORTED_TESTS disagree.\n'
-        f'  floor without a port:  {sorted(set(ASSERT_FLOORS) - set(PORTED_TESTS))}\n'
-        f'  port without a floor:  {sorted(set(PORTED_TESTS) - set(ASSERT_FLOORS))}'
+    overlap = set(PORTED_TESTS) & set(NATIVE_TESTS)
+    assert not overlap, (
+        f'PORTED_TESTS and NATIVE_TESTS overlap: {sorted(overlap)}. A suite is '
+        f'either a reify port or dark-factory-native, never both.'
+    )
+    # Every suite must carry an assert floor, and a removed suite must not leave
+    # a stale one behind: without this, a dropped floor is a KeyError at run
+    # time while a stale floor is invisible.
+    assert set(ASSERT_FLOORS) == set(BASH_SUITES), (
+        f'ASSERT_FLOORS and BASH_SUITES disagree.\n'
+        f'  floor without a suite:  {sorted(set(ASSERT_FLOORS) - set(BASH_SUITES))}\n'
+        f'  suite without a floor:  {sorted(set(BASH_SUITES) - set(ASSERT_FLOORS))}'
     )
 
 
@@ -278,12 +382,30 @@ def test_every_invocable_script_has_ported_coverage() -> None:
     removes one whose test is still listed.  PRD leaf κ needs that condition to
     be false before it deletes reify's originals.
 
-    ``lib_live_refs.sh`` and ``lib_portable.sh`` are excluded from the key set by
-    decision, not oversight: both are ``source``-only, neither has a ``--help``
-    or any invocable entry point, and both are covered *transitively* — the
-    gc/gc-sweep ``exit 2``-on-missing-sibling assertions (``test_warm_lane_gc.sh``
-    A9) exercise ``lib_live_refs.sh``, and ``test_warm_lane_audit.sh`` exercises
-    ``lib_portable.sh`` on every audit invocation.
+    The ``lib_`` prefix is excluded from the key set by decision, not oversight:
+    every one of those files is ``source``-only, none has a ``--help`` or any
+    invocable entry point, and each is covered *transitively* by the script that
+    sources it —
+
+    * ``lib_live_refs.sh`` by the gc/gc-sweep ``exit 2``-on-missing-sibling
+      assertions (``test_warm_lane_gc.sh`` A9);
+    * ``lib_portable.sh`` by ``test_warm_lane_audit.sh``, on every audit
+      invocation;
+    * ``lib_lane_state.sh`` by the same audit suite's Block L and by
+      ``test_lane_state_lib.py``, which pins it directly;
+    * ``lib_lane_seed.sh`` by ``test_warm_lane_gc_native.sh`` Block V, which
+      drives its one predicate through gc.sh's Pass 1, and A12, its
+      missing-sibling guard (task 7859);
+    * ``lib_task_citation.sh`` — TWO of its three exports, by
+      ``test_warm_lane_degenerate_ref.sh``: every classification runs through
+      ``task_citation_message_cites``, and the ``--branch-prefix``
+      metacharacter block through ``task_citation_regex_escape``.  Its third,
+      ``task_citation_peer_ids``, has no dark-factory caller (the sole one is
+      reify's ``task-branch-contamination-sweep.sh``, which is not among the
+      relocated scripts) and therefore travels UNEXERCISED — the standing gap
+      ``lib_portable.sh``'s ``allocate_free_port`` and ``portable_timeout``
+      already carry, recorded in
+      ``orchestrator/scripts/warm-lane/README.md`` Delta 11 (task 5566).
     """
     invocable = {
         p.name for p in WARM_LANE_SCRIPT_DIR.glob('*.sh')
@@ -364,6 +486,13 @@ def _run_bash_suite(name: str) -> tuple[int, str, str]:
     output, rather than propagating ``TimeoutExpired`` (whose stdout/stderr hang
     off the exception object), so the hang path produces the same
     failure-with-captured-tail shape the module docstring and README promise.
+
+    The other half of that contract is that the pgid is FROZEN at spawn rather
+    than re-derived at kill time — see ``shared/src/shared/proc_group.py``'s
+    module docstring for why ``os.getpgid(proc.pid)`` in a kill path is the
+    task-845 footgun — and that the frozen number is only dispatched while the
+    leader is still unreaped, since a reaped pid may be recycled onto an
+    unrelated group.
     """
     with subprocess.Popen(
         ['bash', str(BASH_TEST_DIR / name)],
@@ -374,13 +503,43 @@ def _run_bash_suite(name: str) -> tuple[int, str, str]:
         env=_sanitized_env(),
         start_new_session=True,
     ) as proc:
+        # Frozen at spawn: start_new_session=True makes proc its own group
+        # leader, so pgid == proc.pid by POSIX guarantee.  Re-reading it at kill
+        # time with os.getpgid would be the task-845 footgun — a reaped pid can
+        # be recycled onto an unrelated group (in the original incidents, the
+        # user's `systemd --user` group, killing the whole login session).
+        pgid = proc.pid
         try:
             stdout, stderr = proc.communicate(timeout=SUBPROC_TIMEOUT)
         except subprocess.TimeoutExpired:
-            try:
-                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-            except (ProcessLookupError, PermissionError):  # pragma: no cover
-                proc.kill()
+            # The other half of the frozen-pgid contract: a frozen pgid is only
+            # safe while its leader is UNREAPED, because the number itself goes
+            # stale the moment the kernel may recycle that pid.  So dispatch no
+            # signal at all once the process has been reaped, mirroring
+            # `shared.proc_group.terminate_process_group` step 1 and
+            # `shared.proc_group.sigkill_process_group`'s reaped-leader
+            # short-circuit.
+            #
+            # `Popen.communicate(timeout=...)` deliberately does NOT reap on
+            # timeout, so `returncode` is normally None here and the kill still
+            # dispatches.  Read `returncode` (a plain attribute) and NOT
+            # `poll()`: `poll()` is not a read of existing state, it calls
+            # `waitpid(WNOHANG)` and REAPS an exited leader — which would then
+            # suppress the very killpg this path exists for.  That matters
+            # concretely: a suite whose bash leader exits while a backgrounded
+            # helper (`( flock -x 9 && ... sleep 300 ) &`) still holds the stdout
+            # pipe open times out with the leader an unreaped zombie whose pid
+            # the kernel cannot recycle — so the frozen pgid is still valid and
+            # the group must be killed, or the helper holds a lane flock for
+            # minutes and turns one timeout into a cascade.  This spelling
+            # mirrors `shared.proc_group.sigkill_process_group`'s reaped-leader
+            # short-circuit, so both sites enforce the same two-part rule the
+            # killpg guard's failure message states.
+            if proc.returncode is None:
+                try:
+                    os.killpg(pgid, signal.SIGKILL)
+                except (ProcessLookupError, PermissionError):  # pragma: no cover
+                    proc.kill()
             # ``Popen.communicate``'s ``TimeoutExpired`` carries no output (only
             # ``subprocess.run`` repopulates it), so the resumed call is what
             # recovers the captured tail.  Bounded: a pipe held open by a
@@ -399,13 +558,13 @@ def _run_bash_suite(name: str) -> tuple[int, str, str]:
         return proc.returncode, stdout, stderr
 
 
-@pytest.mark.parametrize('name', PORTED_TESTS, ids=PORTED_TESTS)
+@pytest.mark.parametrize('name', BASH_SUITES, ids=BASH_SUITES)
 def test_bash_suite_passes(name: str) -> None:
-    """Each ported bash suite must be green by reify's own greenness predicate.
+    """Each bash suite must be green by reify's own greenness predicate.
 
     ``exit 0`` AND a ``Results: N passed, 0 failed`` line AND ``N`` at or above
-    ``ASSERT_FLOORS[name]``.  Exit status alone cannot distinguish "all 837
-    asserts ran and passed" from "a block skipped and the rest passed", and leaf
+    ``ASSERT_FLOORS[name]``.  Exit status alone cannot distinguish "every
+    assert ran and passed" from "a block skipped and the rest passed", and leaf
     κ deletes reify's originals on the strength of this item being green.
     """
     returncode, stdout, stderr = _run_bash_suite(name)

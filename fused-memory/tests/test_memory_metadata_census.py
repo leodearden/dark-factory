@@ -1,0 +1,622 @@
+"""Tests for :mod:`fused_memory.services.memory_metadata_census` — the
+observability half of the Mem0 metadata vocabulary contract (task 3195,
+leaf β of ``docs/prds/memory-metadata-vocabulary.md``).
+
+Two contracts live here, both from PRD V1 / INV-4:
+
+* the grep-anchored **census line**, which is how a warn-mode violation is
+  actually observed (in warn mode nothing raises, so the log line IS the
+  signal — if it is wrong, the whole warn tier is silent);
+* the **unknown-key storm escape**, so "a drifting writer flooding unknown
+  keys is heard, not logged into oblivion".
+
+The clock is injected everywhere; these tests never sleep.
+"""
+
+import logging
+
+import pytest
+
+_CENSUS_LOGGER = 'fused_memory.services.memory_metadata_census'
+
+
+def _violation(key='weird_key', code='unknown_key', message='m', fatal=False):
+    from fused_memory.memory_metadata import MetadataViolation
+
+    return MetadataViolation(key=key, code=code, message=message, fatal=fatal)
+
+
+class TestCensusLine:
+    """The grep anchor ``memory_metadata.schema_warning``.
+
+    Ported from ``backends/sqlite_task_backend.py:853`` ``_emit_schema_warning``,
+    one domain over.
+    """
+
+    def _emit(self, violations, *, project_id: str = 'dark_factory',
+              agent_id: str | None = 'claude-x'):
+        # `agent_id: str | None` mirrors emit_schema_warnings' own signature —
+        # the absent-agent_id placeholder case below passes None deliberately.
+        from fused_memory.services.memory_metadata_census import emit_schema_warnings
+
+        emit_schema_warnings(violations, project_id=project_id, agent_id=agent_id)
+
+    def test_one_violation_emits_exactly_one_warning_with_every_field(self, caplog):
+        """The anchor token AND each k=v pair are asserted SEPARATELY.
+
+        A single "does the whole line look right" assertion would let a
+        future format tweak keep the anchor while silently dropping a field,
+        which is exactly the failure that makes a census unusable months
+        later when someone tries to grep it.
+
+        NOTE: ``memory_metadata.schema_warning`` is CONTRACT-FIXED. It is
+        what the enforce-gate census greps for. It must never be renamed.
+        """
+        caplog.set_level(logging.WARNING, logger=_CENSUS_LOGGER)
+        self._emit(
+            [_violation(key='weird_key', code='unknown_key')],
+            project_id='dark_factory',
+            agent_id='claude-task-3195',
+        )
+        records = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(records) == 1
+        message = records[0].getMessage()
+        assert 'memory_metadata.schema_warning' in message
+        assert 'project_id=dark_factory' in message
+        assert 'agent_id=claude-task-3195' in message
+        assert 'code=unknown_key' in message
+        assert 'key=weird_key' in message
+
+    def test_one_line_per_violation(self, caplog):
+        caplog.set_level(logging.WARNING, logger=_CENSUS_LOGGER)
+        self._emit([
+            _violation(key='a', code='unknown_key'),
+            _violation(key='b', code='unknown_key'),
+            _violation(key='topic', code='invalid_topic_slug', fatal=True),
+        ])
+        assert len([r for r in caplog.records if r.levelno == logging.WARNING]) == 3
+
+    def test_no_violations_emits_nothing(self, caplog):
+        caplog.set_level(logging.WARNING, logger=_CENSUS_LOGGER)
+        self._emit([])
+        assert not [r for r in caplog.records if r.levelno == logging.WARNING]
+
+    def test_absent_agent_id_renders_a_stable_placeholder(self, caplog):
+        """`agent_id=None` must not render as the bare string 'None'.
+
+        'None' is indistinguishable from a writer that literally set that
+        string, which would corrupt the per-writer aggregation the storm
+        detector keys on. A distinct placeholder keeps "unset" greppable.
+        """
+        caplog.set_level(logging.WARNING, logger=_CENSUS_LOGGER)
+        self._emit([_violation()], agent_id=None)
+        message = caplog.records[0].getMessage()
+        assert 'agent_id=None' not in message
+        assert 'agent_id=<unset>' in message
+
+    def test_fatal_violation_also_censuses_under_warn_mode(self, caplog):
+        """Nothing is silently swallowed.
+
+        Under warn mode a fatal violation does not reject — so if it did not
+        also census, the single most enforcement-relevant class of violation
+        would be the one class that left no trace at all.
+        """
+        caplog.set_level(logging.WARNING, logger=_CENSUS_LOGGER)
+        self._emit([_violation(key='topic', code='invalid_topic_slug', fatal=True)])
+        message = caplog.records[0].getMessage()
+        assert 'memory_metadata.schema_warning' in message
+        assert 'code=invalid_topic_slug' in message
+
+
+class _FakeClock:
+    """Injected monotonic clock — deterministic, and no test ever sleeps."""
+
+    def __init__(self, now=1000.0):
+        self.now = now
+
+    def __call__(self):
+        return self.now
+
+    def advance(self, seconds):
+        self.now += seconds
+
+
+def _detector(clock, *, threshold=5, window_seconds=300, **options):
+    from fused_memory.services.memory_metadata_census import UnknownKeyStormDetector
+
+    return UnknownKeyStormDetector(
+        threshold=threshold, window_seconds=window_seconds, time_fn=clock, **options
+    )
+
+
+class TestUnknownKeyStormDetector:
+    """Per-(project_id, agent_id) rolling-window counter.
+
+    A storm is a DRIFTING WRITER, not global volume: with a 1,627-key live
+    baseline a global counter would fire on healthy fleet traffic and would
+    never identify the culprit.
+    """
+
+    def test_below_threshold_never_fires(self):
+        clock = _FakeClock()
+        detector = _detector(clock, threshold=5)
+        for _ in range(4):
+            assert detector.record('p', 'a', ['k']) is False
+
+    def test_fires_exactly_on_the_crossing_call(self):
+        clock = _FakeClock()
+        detector = _detector(clock, threshold=5)
+        results = [detector.record('p', 'a', ['k']) for _ in range(5)]
+        assert results == [False, False, False, False, True]
+
+    def test_does_not_re_fire_after_crossing(self):
+        """Returning True forever would mint a fresh escalation per write.
+
+        The filer's open-escalation dedup is the second line of defence, but
+        a detector that latched True would hammer it on every single write.
+        """
+        clock = _FakeClock()
+        detector = _detector(clock, threshold=3)
+        assert [detector.record('p', 'a', ['k']) for _ in range(3)][-1] is True
+        for _ in range(10):
+            assert detector.record('p', 'a', ['k']) is False
+
+    def test_each_key_counts_as_one_warn(self):
+        """The census emits one line per KEY, so the counter must too."""
+        clock = _FakeClock()
+        detector = _detector(clock, threshold=3)
+        assert detector.record('p', 'a', ['k1', 'k2']) is False
+        assert detector.record('p', 'a', ['k3']) is True
+
+    def test_writers_do_not_aggregate(self):
+        """A different agent_id must not push another writer over the line."""
+        clock = _FakeClock()
+        detector = _detector(clock, threshold=3)
+        assert detector.record('p', 'agent-a', ['k']) is False
+        assert detector.record('p', 'agent-b', ['k']) is False
+        assert detector.record('p', 'agent-b', ['k']) is False
+        # agent-a still has 1 of 3 — agent-b's traffic did not count for it.
+        assert detector.record('p', 'agent-a', ['k']) is False
+
+    def test_projects_do_not_aggregate(self):
+        clock = _FakeClock()
+        detector = _detector(clock, threshold=3)
+        assert detector.record('proj-a', 'a', ['k']) is False
+        assert detector.record('proj-b', 'a', ['k']) is False
+        assert detector.record('proj-b', 'a', ['k']) is False
+        assert detector.record('proj-a', 'a', ['k']) is False
+
+    def test_stale_warns_drop_out_of_the_window(self):
+        """A slow trickle must never accumulate into a false storm."""
+        clock = _FakeClock()
+        detector = _detector(clock, threshold=3, window_seconds=300)
+        assert detector.record('p', 'a', ['k']) is False
+        assert detector.record('p', 'a', ['k']) is False
+        clock.advance(301)
+        # The first two are now stale, so this is warn 1 of 3, not 3 of 3.
+        assert detector.record('p', 'a', ['k']) is False
+        assert detector.record('p', 'a', ['k']) is False
+        assert detector.record('p', 'a', ['k']) is True
+
+    def test_empty_key_list_is_a_no_op(self):
+        clock = _FakeClock()
+        detector = _detector(clock, threshold=1)
+        assert detector.record('p', 'a', []) is False
+
+    def test_a_writer_that_falls_silent_leaves_no_residue(self):
+        """Process-lifetime state must not grow without bound.
+
+        A writer's stale timestamps are pruned only when that SAME writer
+        records again, so without a sweep every distinct writer that ever
+        drifted keeps a dict entry (plus a window of floats) for the life of
+        the process. agent_id is free-form per-task text in this fleet, so
+        that key space is effectively unbounded in a long-lived MCP server.
+        """
+        clock = _FakeClock()
+        detector = _detector(clock, threshold=3, window_seconds=300, sweep_every=2)
+
+        detector.record('p', 'transient-writer', ['k'])
+        assert ('p', 'transient-writer') in detector.tracked_writers
+
+        clock.advance(301)
+        # Two records by a DIFFERENT writer, so the sweep is what evicts the
+        # silent one — not its own prune loop, which never runs again.
+        detector.record('p', 'steady-writer', ['k'])
+        detector.record('p', 'steady-writer', ['k'])
+
+        assert ('p', 'transient-writer') not in detector.tracked_writers
+        assert ('p', 'steady-writer') in detector.tracked_writers, (
+            'the live writer must survive'
+        )
+
+    def test_the_sweep_never_evicts_the_writer_that_triggered_it(self):
+        """Its deque was appended at `now`, so it is never stale."""
+        clock = _FakeClock()
+        detector = _detector(clock, threshold=3, window_seconds=300, sweep_every=1)
+
+        detector.record('p', 'a', ['k'])
+        detector.record('p', 'a', ['k'])
+        assert ('p', 'a') in detector.tracked_writers
+        # And both prior events survived: the third crosses.
+        assert detector.record('p', 'a', ['k']) is True
+
+    def test_eviction_clears_the_firing_latch_so_a_recurrence_is_heard(self):
+        """A drained writer is no longer over the line.
+
+        A latch that outlived the writer's eviction would be one nothing can
+        ever clear, permanently silencing a writer that drifts, is fixed, and
+        later drifts again.
+        """
+        clock = _FakeClock()
+        detector = _detector(clock, threshold=2, window_seconds=300, sweep_every=2)
+
+        assert detector.record('p', 'a', ['k', 'k2']) is True
+
+        clock.advance(301)
+        detector.record('p', 'other', ['k'])
+        detector.record('p', 'other', ['k'])
+        assert ('p', 'a') not in detector.tracked_writers
+
+        assert detector.record('p', 'a', ['k', 'k2']) is True, 'must fire again'
+
+    def test_a_drained_writer_is_heard_again_when_its_recurrence_is_one_multi_key_call(
+        self,
+    ):
+        clock = _FakeClock()
+        detector = _detector(clock, threshold=3, window_seconds=300)
+        assert [detector.record('p', 'a', ['k']) for _ in range(3)] == [
+            False,
+            False,
+            True,
+        ]
+
+        clock.advance(301)
+        assert detector.record('p', 'a', ['x', 'y', 'z']) is True, (
+            'the window fully drained, so this is a new crossing'
+        )
+        assert detector.record('p', 'a', ['k']) is False, (
+            'the refire re-latched: the crossing is the event, not the state'
+        )
+
+    def test_a_partially_drained_writer_that_re_crosses_in_one_call_is_heard(self):
+        """The t=1000 pair ages out by t=1301, leaving 3 of 5: below the line."""
+        clock = _FakeClock(now=1000.0)
+        detector = _detector(clock, threshold=5, window_seconds=300)
+        assert detector.record('p', 'a', ['a', 'b']) is False
+        clock.now = 1100.0
+        assert detector.record('p', 'a', ['c', 'd', 'e']) is True
+
+        clock.now = 1301.0
+        assert detector.record('p', 'a', ['f', 'g']) is True
+        assert detector.record('p', 'a', ['h']) is False
+
+    def test_whether_an_unrelated_sweep_ran_never_changes_the_decision(self):
+        """Evicting a drained writer must not decide differently from keeping it.
+
+        ``other``'s record triggers the sweep when ``sweep_every=1``, evicting
+        the drained ``a``; at 256 no sweep runs and ``a`` keeps its counter.
+        """
+        recurrences = []
+        for sweep_every in (1, 256):
+            clock = _FakeClock()
+            detector = _detector(
+                clock, threshold=3, window_seconds=300, sweep_every=sweep_every
+            )
+            assert [detector.record('p', 'a', ['k']) for _ in range(3)][-1] is True
+            clock.advance(301)
+            detector.record('p', 'other', ['k'])
+            recurrences.append(detector.record('p', 'a', ['x', 'y', 'z']))
+
+        assert recurrences == [True, True]
+
+    def _latched_at_1100_then_advanced(self, advance):
+        clock = _FakeClock(now=1000.0)
+        detector = _detector(clock, threshold=4, window_seconds=300)
+        assert detector.record('p', 'a', ['k', 'k']) is False
+        clock.now = 1100.0
+        assert detector.record('p', 'a', ['k', 'k']) is True
+        clock.now = 1100.0 + advance
+        return detector
+
+    @pytest.mark.parametrize(
+        ('advance', 'n_keys', 'expected'),
+        [
+            # No drain: all 4 prior events remain, so nothing re-arms.
+            (0, 2, False),
+            (0, 3, False),
+            (0, 4, False),
+            # The t=1000 pair aged out: 2 remain, the first key re-arms.
+            (201, 2, True),
+            (201, 3, True),
+            (201, 4, True),
+            # Fully drained: only a call carrying the whole threshold crosses.
+            (301, 2, False),
+            (301, 3, False),
+            (301, 4, True),
+            (400, 2, False),
+            (400, 3, False),
+            (400, 4, True),
+        ],
+    )
+    def test_one_multi_key_call_decides_like_the_same_keys_as_single_key_calls(
+        self, advance, n_keys, expected
+    ):
+        as_one_call = self._latched_at_1100_then_advanced(advance)
+        as_single_key_calls = self._latched_at_1100_then_advanced(advance)
+
+        one_call = as_one_call.record('p', 'a', ['k'] * n_keys)
+        single_key_calls = any(
+            [as_single_key_calls.record('p', 'a', ['k']) for _ in range(n_keys)]
+        )
+
+        assert single_key_calls is expected
+        assert one_call is single_key_calls
+
+    def test_defaults_to_monotonic_not_wall_clock(self):
+        """Wall-clock would let an NTP step corrupt the window."""
+        import time
+
+        from fused_memory.services.memory_metadata_census import UnknownKeyStormDetector
+
+        detector = UnknownKeyStormDetector(threshold=5, window_seconds=300)
+        assert detector._time_fn is time.monotonic
+
+
+class TestUnknownKeyStormDetectorDelegatesToTheSharedRegistry:
+    """INV-5: the per-writer windows ARE ``shared.storm_counter.KeyedStormCounters``.
+
+    PROVENANCE, which is what makes this a re-copy rather than a body that
+    merely predates the shared class. Task 3088 extracted the
+    append-prune-count-fire body into one home on 2026-07-30 (a41ff0ac02,
+    since promoted to ``shared`` by task 3689) explicitly "so a fourth consumer
+    reuses rather than re-copies it". This module arrived ONE DAY LATER, on
+    2026-07-31 (7d509f0dd7), carrying its own deque, its own
+    ``cutoff``/``popleft`` loop and its own count-versus-threshold compare —
+    the copy the extraction had just been made to prevent. Task 4519 closes
+    that gap, and task 5102 moves the per-writer keying and sweep into the
+    one keyed registry.
+
+    Structural rather than behavioural on purpose, exactly as task 3259's
+    ``test_harness.py::test_all_three_storm_counters_are_the_shared_storm_counter``
+    argues: a hand-rolled deque reproduces every behaviour asserted in the
+    sibling class above and is still another copy, which is the thing INV-5
+    forbids. The behavioural halves stay where they are.
+    """
+
+    def test_the_writer_windows_are_the_shared_keyed_registry(self):
+        from shared.storm_counter import KeyedStormCounters
+
+        detector = _detector(_FakeClock(), threshold=5)
+
+        assert isinstance(detector._warns, KeyedStormCounters)
+
+    def test_a_writer_over_the_line_for_multiple_windows_still_fires_once(self):
+        """The latch-vs-rate-limit discriminator, at the census level.
+
+        A CHARACTERIZATION gate: it passes against the pre-migration
+        hand-rolled body too, and is authored here precisely because the
+        sibling ``test_does_not_re_fire_after_crossing`` never advances the
+        clock — so a counter that re-fired once per window would satisfy it and
+        the migration could adopt the wrong fire policy undetected. Here the
+        writer stays over the line across more than a full window: a
+        rate-limited counter fires again at t=400 (398s since its fire, past
+        the 300s window, with three events still in the sliding window), a
+        latched one does not.
+        """
+        clock = _FakeClock()
+        detector = _detector(clock, threshold=3, window_seconds=300)
+
+        crossing = [detector.record('p', 'a', ['k']) for _ in range(3)]
+        assert crossing == [False, False, True]
+
+        for offset in (100, 200, 300, 400):
+            clock.now = 1000.0 + offset
+            assert detector.record('p', 'a', ['k']) is False, (
+                f'the crossing is the event, not the state (t={offset})'
+            )
+
+    def test_the_latch_re_arms_without_eviction_when_the_window_drains(self):
+        """The drained window re-arms the latch IN PLACE, not only by eviction.
+
+        :meth:`UnknownKeyStormDetector.record`'s docstring promises "a writer
+        that drifts, is fixed, and later drifts again is heard both times", but
+        ``test_eviction_clears_the_firing_latch_so_a_recurrence_is_heard`` goes
+        through the sweep, so it proves the latch was cleared by DELETING the
+        counter, not by the re-arm. This pins the re-arm path itself, so a
+        future edit cannot widen the latch into a permanent one and stay green.
+
+        Eviction is structurally excluded: the registry's sweep never evicts
+        the key being recorded, and only writer ``a`` records here.
+        """
+        clock = _FakeClock()
+        detector = _detector(clock, threshold=3, window_seconds=300)
+
+        assert [detector.record('p', 'a', ['k']) for _ in range(3)][-1] is True
+
+        clock.advance(301)
+        assert [detector.record('p', 'a', ['k']) for _ in range(3)] == [
+            False,
+            False,
+            True,
+        ], 'the drained window re-arms, so the second drift is heard'
+
+
+class TestFileUnknownKeyStormEscalation:
+    """End-to-end against a real queue: what the census actually files."""
+
+    def _file(self, tmp_path, *, project_id='dark_factory', agent_id='claude-x',
+              keys=('weird_key', 'other_key')):
+        from fused_memory.services.memory_metadata_census import (
+            file_unknown_key_storm_escalation,
+        )
+
+        return file_unknown_key_storm_escalation(
+            str(tmp_path), project_id=project_id, agent_id=agent_id, keys=list(keys)
+        )
+
+    @staticmethod
+    def _filed(tmp_path) -> list[dict]:
+        import json
+
+        return [
+            json.loads(f.read_text())
+            for f in sorted((tmp_path / 'data' / 'escalations').glob('esc-*.json'))
+        ]
+
+    def test_files_one_escalation_naming_the_writer_and_the_keys(self, tmp_path):
+        pytest.importorskip('escalation')
+
+        esc_id = self._file(tmp_path, project_id='dark_factory', agent_id='claude-drifter')
+
+        filed = self._filed(tmp_path)
+        assert len(filed) == 1
+        esc = filed[0]
+        assert esc_id == esc['id']
+        # The summary must identify WHO is drifting — an escalation that
+        # only says "a storm happened" leaves the operator to go find the
+        # writer by hand, which is the whole job.
+        assert 'dark_factory' in esc['summary']
+        assert 'claude-drifter' in esc['summary']
+        blob = f"{esc['summary']}\n{esc['detail']}"
+        assert 'weird_key' in blob
+        assert 'other_key' in blob
+
+    def test_two_different_writers_get_two_escalations(self, tmp_path):
+        """A global anchor would mask every writer after the first.
+
+        The escalation's whole job is to name WHICH writer is drifting. With
+        one shared anchor, writer A's still-open escalation absorbs writer
+        B's crossing and B survives only in an INFO log line — the operator
+        sees one culprit named and no signal that anyone else crossed.
+        """
+        pytest.importorskip('escalation')
+
+        first = self._file(tmp_path, agent_id='claude-drifter-a')
+        second = self._file(tmp_path, agent_id='claude-drifter-b')
+
+        # Both writers must actually get an id: a `None` here would mean the
+        # filing degraded to a log line, and the per-writer assertions below
+        # would then be vacuous rather than failing.
+        assert first is not None
+        assert second is not None
+        assert first != second, 'the second writer must not be folded into the first'
+        assert len(self._filed(tmp_path)) == 2
+        assert 'claude-drifter-a' in first
+        assert 'claude-drifter-b' in second
+
+        # ...while a REPEAT from the same writer still dedups, so one writer
+        # cannot flood the queue.
+        assert self._file(tmp_path, agent_id='claude-drifter-a') == first
+        assert len(self._filed(tmp_path)) == 2
+
+    def test_anchor_slugs_unsafe_writer_ids(self):
+        """The anchor becomes a `.seq` FILENAME via `make_id`.
+
+        agent_id is free-form text, so path separators, spaces and unbounded
+        length all have to be neutralised before it names a file.
+        """
+        from fused_memory.services.memory_metadata_census import writer_anchor_task_id
+
+        anchor = writer_anchor_task_id('Proj/Ect', 'agent id/../etc')
+        assert '/' not in anchor
+        assert ' ' not in anchor
+        assert anchor == 'memory-metadata-unknown-key-storm-proj-ect-agent-id-etc'
+
+        long_anchor = writer_anchor_task_id('p', 'a' * 500)
+        assert len(long_anchor) < 150
+
+    def test_absent_agent_id_gets_its_own_anchor(self):
+        """`None` must not collide with a writer literally named 'unknown'."""
+        from fused_memory.services.memory_metadata_census import writer_anchor_task_id
+
+        assert writer_anchor_task_id('p', None).endswith('-unset')
+
+
+class TestDelegatesToTheSharedHelper:
+    """What the census forwards to `file_folded_escalation` — above all its
+    COMPUTED per-writer anchor, which `writer_anchor_task_id`'s docstring
+    records as load-bearing rather than tidy: a global anchor would fold every
+    later writer's crossing into the first writer's still-open escalation,
+    leaving writers B..N visible only in an INFO line.
+    """
+
+    def _file(self, tmp_path, *, project_id='dark_factory', agent_id='claude-x',
+              keys=('weird_key', 'other_key')):
+        from fused_memory.services.memory_metadata_census import (
+            file_unknown_key_storm_escalation,
+        )
+
+        return file_unknown_key_storm_escalation(
+            str(tmp_path), project_id=project_id, agent_id=agent_id, keys=list(keys)
+        )
+
+    def test_forwards_the_computed_per_writer_anchor_and_this_modules_identity(
+        self, tmp_path, monkeypatch,
+    ):
+        import fused_memory.services.memory_metadata_census as census
+
+        seen: dict = {}
+
+        def _spy(project_root, **kwargs):
+            seen['project_root'] = project_root
+            seen.update(kwargs)
+            return 'esc-anything-1'
+
+        monkeypatch.setattr(census, 'file_folded_escalation', _spy)
+
+        result = self._file(tmp_path, project_id='dark_factory', agent_id='claude-drifter')
+
+        assert result == 'esc-anything-1'
+        # The COMPUTED anchor, not the series base name: passing the bare
+        # prefix would restore exactly the masking the per-writer keying
+        # exists to remove.
+        assert seen['anchor_task_id'] == (
+            'memory-metadata-unknown-key-storm-dark-factory-claude-drifter'
+        )
+        assert seen['agent_role'] == 'fused-memory/memory-metadata-census'
+        assert seen['category'] == 'memory_metadata_unknown_key_storm'
+        assert seen['severity'] == 'info'
+        assert seen['level'] == 1
+        assert seen['project_root'] == str(tmp_path)
+
+    def test_two_writers_in_one_project_get_two_different_anchors(
+        self, tmp_path, monkeypatch,
+    ):
+        """The census docstring states the per-writer keying exists so a
+        second, different drifting writer is not masked — the anchor-collision
+        hazard in its per-writer form."""
+        import fused_memory.services.memory_metadata_census as census
+
+        anchors: list = []
+
+        def _spy(_project_root, **kwargs):
+            anchors.append(kwargs['anchor_task_id'])
+            return 'esc-anything-1'
+
+        monkeypatch.setattr(census, 'file_folded_escalation', _spy)
+        self._file(tmp_path, project_id='dark_factory', agent_id='writer-a')
+        self._file(tmp_path, project_id='dark_factory', agent_id='writer-b')
+
+        assert len(anchors) == 2
+        assert anchors[0] != anchors[1], (
+            f'two writers in one project must not fold together: {anchors!r}'
+        )
+        assert 'writer-a' in anchors[0] and 'writer-b' in anchors[1]
+
+    def test_forwards_the_key_list_and_detail_it_builds(
+        self, tmp_path, monkeypatch,
+    ):
+        import fused_memory.services.memory_metadata_census as census
+
+        seen: dict = {}
+
+        def _spy(_project_root, **kwargs):
+            seen.update(kwargs)
+            return 'esc-anything-1'
+
+        monkeypatch.setattr(census, 'file_folded_escalation', _spy)
+        self._file(tmp_path, keys=('weird_key', 'other_key'))
+
+        assert 'weird_key' in seen['detail'] and 'other_key' in seen['detail']
+        assert 'weird_key' in seen['summary']
+        assert 'memory_metadata_census' in seen['log_label']

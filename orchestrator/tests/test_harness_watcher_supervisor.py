@@ -15,17 +15,28 @@ Steps covered by this file:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
+import re
+import threading
 import time
 from collections import deque
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from _orch_helpers import _init_harness_state_for_test
+from _roles_helpers import tool_is_granted
+from escalation.models import RESOLUTION_CLASSES
 from escalation.queue import EscalationQueue
+from shared.project_layout import escalation_queue_dir
+from shared.repo_paths import DARK_FACTORY_ROOT_ENV
 
+from orchestrator.agents.skill_prompt import load_skill_system_prompt
+from orchestrator.agents.watcher_rearm_outcome_guidance import WATCHER_REARM_OUTCOME_GUIDANCE
 from orchestrator.config import OrchestratorConfig
+from orchestrator.event_store import EventStore, EventType
 from orchestrator.harness import (
     _WATCHER_ALLOWED_TOOLS,
     _WATCHER_DISALLOWED_TOOLS,
@@ -33,7 +44,10 @@ from orchestrator.harness import (
     _WATCHER_MAX_BACKOFF_SECS,
     _WATCHER_TIMEOUT_GRACE_SECS,
     Harness,
+    WatcherRecoveryEvidence,
 )
+from orchestrator.pause_policy import PAUSE_POLICY, PauseClass
+from orchestrator.scheduler import Scheduler
 
 # ---------------------------------------------------------------------------
 # step-3: Config field presence and defaults
@@ -479,12 +493,93 @@ class TestRunWatcherRotation:
 
     @pytest.mark.asyncio
     async def test_env_overrides_injects_bash_max_timeout_ms(self, tmp_path: Path) -> None:
-        """invoke_with_cap_retry receives env_overrides == {'BASH_MAX_TIMEOUT_MS': '<ms>'}.
+        """invoke_with_cap_retry receives BASH_MAX_TIMEOUT_MS='<ms>' in a CLOSED dict.
 
-        Exact-dict equality:
+        Both original intents are preserved:
           - pins the injected value against the known literal for the default config
-          - also asserts BASH_DEFAULT_TIMEOUT_MS is NOT injected (belt-only per D1)
+          - asserts BASH_DEFAULT_TIMEOUT_MS is NOT injected (belt-only per D1)
         Default: rotation_hours=4.0, grace=300.0 → 14700 s → '14700000' ms.
+
+        Task 3605 changed the form from exact-dict equality to a pinned key SET:
+        the rotation now also injects DARK_FACTORY_ROOT.  The resolver is patched
+        to a known path so the key set stays closed and deterministic — a loose
+        `'BASH_MAX_TIMEOUT_MS' in env_overrides` check would silently discard the
+        second intent and let any future key slip in untested.
+        """
+        from shared.cli_invoke import AgentResult
+
+        h = _make_rotation_harness(tmp_path)
+        df_root = tmp_path / 'df-checkout'
+        captured: dict = {}
+
+        async def fake_invoke(usage_gate, label, *, invoke_fn, **kwargs):
+            captured['env_overrides'] = kwargs.get('env_overrides')
+            return AgentResult(success=True, output='')
+
+        with (
+            patch('orchestrator.harness.invoke_with_cap_retry', fake_invoke),
+            patch('orchestrator.harness.resolve_dark_factory_root', return_value=df_root),
+        ):
+            await h._run_watcher_rotation()
+
+        env_overrides = captured['env_overrides']
+        # Assert against the known literal for the default config to catch formula drift.
+        # Derivation: rotation_hours=4.0, grace=300.0 → 14700 s → 14700000 ms.
+        assert env_overrides['BASH_MAX_TIMEOUT_MS'] == '14700000', (
+            f'BASH_MAX_TIMEOUT_MS must be "14700000"; got {env_overrides!r}'
+        )
+        assert 'BASH_DEFAULT_TIMEOUT_MS' not in env_overrides, (
+            f'BASH_DEFAULT_TIMEOUT_MS must NOT be injected (belt-only per D1); '
+            f'got {env_overrides!r}'
+        )
+        assert set(env_overrides) == {'BASH_MAX_TIMEOUT_MS', 'DARK_FACTORY_ROOT'}, (
+            f'env_overrides must stay CLOSED to exactly these keys; got {env_overrides!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_env_overrides_injects_dark_factory_root(self, tmp_path: Path) -> None:
+        """DARK_FACTORY_ROOT is injected into the spawned rotation's environment.
+
+        Task 3605 (census 2026-08-02 §1.3).  The rotation's own re-arm instruction
+        (skills/escalation-watcher-auto/SKILL.md) interpolates $DARK_FACTORY_ROOT;
+        with the var unset in the spawned process that expanded to `/scripts/...`
+        and sighted sessions guessed a path instead.  The value must be a str,
+        since cli_invoke does `env.update(env_overrides)` into a dict[str, str].
+        """
+        from shared.cli_invoke import AgentResult
+
+        h = _make_rotation_harness(tmp_path)
+        df_root = tmp_path / 'df-checkout'
+        captured: dict = {}
+
+        async def fake_invoke(usage_gate, label, *, invoke_fn, **kwargs):
+            captured['env_overrides'] = kwargs.get('env_overrides')
+            return AgentResult(success=True, output='')
+
+        with (
+            patch('orchestrator.harness.invoke_with_cap_retry', fake_invoke),
+            patch('orchestrator.harness.resolve_dark_factory_root', return_value=df_root),
+        ):
+            await h._run_watcher_rotation()
+
+        env_overrides = captured['env_overrides']
+        assert env_overrides['DARK_FACTORY_ROOT'] == str(df_root), (
+            f'DARK_FACTORY_ROOT must be the resolved root as a str; got '
+            f'{env_overrides.get("DARK_FACTORY_ROOT")!r}'
+        )
+        assert env_overrides['BASH_MAX_TIMEOUT_MS'] == '14700000', (
+            'the pre-existing BASH_MAX_TIMEOUT_MS injection must survive'
+        )
+
+    @pytest.mark.asyncio
+    async def test_env_overrides_omits_dark_factory_root_when_unresolvable(
+        self, tmp_path: Path
+    ) -> None:
+        """An unresolvable root OMITS the key — never present-and-empty (task 3605).
+
+        DARK_FACTORY_ROOT='' is strictly worse than unset: it re-creates the
+        sighted `cd  && scripts/...` / `/scripts/...` expansion AND defeats the
+        receiving watcher-rearm.sh `[ -z ... ]` guard's own exit-2 diagnostic.
         """
         from shared.cli_invoke import AgentResult
 
@@ -495,14 +590,308 @@ class TestRunWatcherRotation:
             captured['env_overrides'] = kwargs.get('env_overrides')
             return AgentResult(success=True, output='')
 
-        with patch('orchestrator.harness.invoke_with_cap_retry', fake_invoke):
+        with (
+            patch('orchestrator.harness.invoke_with_cap_retry', fake_invoke),
+            patch('orchestrator.harness.resolve_dark_factory_root', return_value=None),
+        ):
             await h._run_watcher_rotation()
 
-        # Assert against the known literal for the default config to catch formula drift.
-        # Derivation: rotation_hours=4.0, grace=300.0 → 14700 s → 14700000 ms.
-        assert captured.get('env_overrides') == {'BASH_MAX_TIMEOUT_MS': '14700000'}, (
-            f'env_overrides must be exactly {{"BASH_MAX_TIMEOUT_MS": "14700000"}}; '
-            f'got {captured.get("env_overrides")!r}'
+        env_overrides = captured['env_overrides']
+        assert 'DARK_FACTORY_ROOT' not in env_overrides, (
+            f'the key must be ABSENT, never present-and-empty; got {env_overrides!r}'
+        )
+        assert env_overrides['BASH_MAX_TIMEOUT_MS'] == '14700000', (
+            'an unresolvable DF root must not disturb the BASH_MAX_TIMEOUT_MS injection'
+        )
+
+    @pytest.mark.asyncio
+    async def test_banner_names_dark_factory_root_and_canonical_rearm_invocation(
+        self, tmp_path: Path
+    ) -> None:
+        """The injected banner carries the tooling root AND the canonical re-arm form.
+
+        Task 3605.  Setting the env var is only half the fix: the sighted sessions
+        also had no way to SEE where the rearm script lived, so they guessed
+        (reify/scripts/) or swept the filesystem (find dark-factory*).  The banner
+        must state the absolute path outright.
+
+        The canonical invocation is asserted as a literal substring copied from
+        skills/escalation-watcher-auto/SKILL.md and skills/escalation-watcher/SKILL.md,
+        so the injected instruction and the skill text cannot drift into two
+        different "canonical" forms.
+
+        _make_rotation_harness sets project_root=tmp_path, so the default fixture
+        state IS the cross-project case (project_root != resolved DF root).
+        """
+        from shared.cli_invoke import AgentResult
+
+        h = _make_rotation_harness(tmp_path)
+        df_root = tmp_path / 'df-tooling-checkout'
+        assert df_root != h.config.project_root, 'fixture must exercise cross-project'
+        captured: dict = {}
+
+        async def fake_invoke(usage_gate, label, *, invoke_fn, **kwargs):
+            captured['prompt'] = kwargs.get('prompt', '')
+            return AgentResult(success=True, output='')
+
+        with (
+            patch('orchestrator.harness.invoke_with_cap_retry', fake_invoke),
+            patch('orchestrator.harness.resolve_dark_factory_root', return_value=df_root),
+        ):
+            await h._run_watcher_rotation()
+
+        prompt = captured['prompt']
+        assert 'DARK_FACTORY_ROOT' in prompt, 'banner must name the variable'
+        assert str(df_root) in prompt, (
+            'banner must state the resolved absolute path, so no filesystem sweep '
+            f'is ever needed; {df_root} not found in prompt'
+        )
+        assert 'cd $DARK_FACTORY_ROOT && scripts/watcher-rearm.sh' in prompt, (
+            'banner must restate the canonical invocation verbatim as it appears in '
+            'skills/escalation-watcher-auto/SKILL.md'
+        )
+        # No-regression: the pre-existing banner lines survive.
+        assert f'Project root: {h.config.project_root}' in prompt
+        assert 'Escalation queue:' in prompt
+
+    @pytest.mark.asyncio
+    async def test_rearm_queue_dir_matches_the_queue_the_harness_watches(
+        self, tmp_path: Path
+    ) -> None:
+        """The banner's --queue-dir is the SAME path the orchestrator itself uses.
+
+        Task 3605 (review amendment).  The banner hands the agent an executable
+        `--queue-dir` it is told to run verbatim, so a divergence arms an inotify
+        watcher on a directory that never receives escalations.  Both the banner
+        line and the argument must be shared.project_layout.escalation_queue_dir.
+        """
+        from shared.cli_invoke import AgentResult
+
+        h = _make_rotation_harness(tmp_path)
+        df_root = tmp_path / 'df-tooling-checkout'
+        captured: dict = {}
+
+        async def fake_invoke(usage_gate, label, *, invoke_fn, **kwargs):
+            captured['prompt'] = kwargs.get('prompt', '')
+            return AgentResult(success=True, output='')
+
+        with (
+            patch('orchestrator.harness.invoke_with_cap_retry', fake_invoke),
+            patch('orchestrator.harness.resolve_dark_factory_root', return_value=df_root),
+        ):
+            await h._run_watcher_rotation()
+
+        prompt = captured['prompt']
+        expected = str(escalation_queue_dir(h.config.project_root))
+        assert f'--queue-dir {expected}' in prompt, (
+            'the re-arm command must name the queue the harness itself watches; '
+            f'expected --queue-dir {expected} in:\n{prompt}'
+        )
+        assert f'Escalation queue: {expected}' in prompt, (
+            'the banner line and the re-arm argument must be the same string'
+        )
+
+    @pytest.mark.asyncio
+    async def test_banner_flags_cross_project_tooling_root(self, tmp_path: Path) -> None:
+        """Cross-project: the banner says outright that the tooling root is another repo.
+
+        Task 3605.  This is the datum whose absence made sighted sessions guess
+        reify/scripts/ or run a filesystem-wide `find dark-factory*`: they could
+        not tell that the rearm script simply is not in the project they were
+        working on.
+        """
+        from shared.cli_invoke import AgentResult
+
+        h = _make_rotation_harness(tmp_path)
+        df_root = tmp_path / 'df-tooling-checkout'
+        assert df_root != h.config.project_root
+        captured: dict = {}
+
+        async def fake_invoke(usage_gate, label, *, invoke_fn, **kwargs):
+            captured['prompt'] = kwargs.get('prompt', '')
+            return AgentResult(success=True, output='')
+
+        with (
+            patch('orchestrator.harness.invoke_with_cap_retry', fake_invoke),
+            patch('orchestrator.harness.resolve_dark_factory_root', return_value=df_root),
+        ):
+            await h._run_watcher_rotation()
+
+        prompt = captured['prompt']
+        assert str(df_root) in prompt, 'the tooling root must be named'
+        assert str(h.config.project_root) in prompt, 'the target project root must be named'
+        # Case-insensitive: the banner capitalises for emphasis (DIFFERENT), and the
+        # matching absence assertion in the same-project test must not be able to
+        # pass vacuously just because the impl shouted the word.
+        assert 'different repo' in prompt.lower(), (
+            'the banner must say IN WORDS that the tooling root is a different '
+            f'repository from the target project root; got:\n{prompt}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_banner_still_names_root_for_same_project_target(
+        self, tmp_path: Path
+    ) -> None:
+        """Same-project target: the root and canonical form are STILL emitted (task 3605).
+
+        The auto-watcher skill interpolates $DARK_FACTORY_ROOT unconditionally, so
+        gating the block on cross-project would leave a same-project rotation
+        running `cd  && scripts/watcher-rearm.sh`.  Only the cross-project NOTE is
+        conditional, and it must be absent here rather than making a false claim.
+        """
+        from shared.cli_invoke import AgentResult
+
+        h = _make_rotation_harness(tmp_path)
+        captured: dict = {}
+
+        async def fake_invoke(usage_gate, label, *, invoke_fn, **kwargs):
+            captured['prompt'] = kwargs.get('prompt', '')
+            return AgentResult(success=True, output='')
+
+        with (
+            patch('orchestrator.harness.invoke_with_cap_retry', fake_invoke),
+            patch(
+                'orchestrator.harness.resolve_dark_factory_root',
+                return_value=h.config.project_root,
+            ),
+        ):
+            await h._run_watcher_rotation()
+
+        prompt = captured['prompt']
+        assert 'DARK_FACTORY_ROOT' in prompt
+        assert str(h.config.project_root) in prompt
+        assert 'cd $DARK_FACTORY_ROOT && scripts/watcher-rearm.sh' in prompt, (
+            'the canonical form is an UNCONDITIONAL guarantee, not a cross-project extra'
+        )
+        assert 'different repo' not in prompt.lower(), (
+            'the cross-project note must be absent when the tooling root IS the '
+            'target project root — the banner must not make a false claim'
+        )
+
+    @pytest.mark.asyncio
+    async def test_banner_degrades_loudly_when_root_unresolvable(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Unresolvable: say so, and render NO empty interpolation (task 3605).
+
+        A bare `cd  && scripts/watcher-rearm.sh` (or a `root: ` line with nothing
+        after it) is the sighted failure rendered into the prompt itself.  The
+        degraded banner must be loud instead.
+
+        The env var is cleared so this test pins the GENUINELY-UNSET variant; the
+        inherited-but-known-bad variant is a separate test below, and the two make
+        contradictory claims that must not be able to swap under an ambient export.
+        """
+        from shared.cli_invoke import AgentResult
+
+        monkeypatch.delenv(DARK_FACTORY_ROOT_ENV, raising=False)
+        h = _make_rotation_harness(tmp_path)
+        captured: dict = {}
+
+        async def fake_invoke(usage_gate, label, *, invoke_fn, **kwargs):
+            captured['prompt'] = kwargs.get('prompt', '')
+            return AgentResult(success=True, output='')
+
+        with (
+            patch('orchestrator.harness.invoke_with_cap_retry', fake_invoke),
+            patch('orchestrator.harness.resolve_dark_factory_root', return_value=None),
+        ):
+            await h._run_watcher_rotation()
+
+        prompt = captured['prompt']
+        assert 'could not be auto-resolved' in prompt, (
+            f'the banner must state the degradation outright; got:\n{prompt}'
+        )
+        assert 'DARK_FACTORY_ROOT is NOT set' in prompt, (
+            f'with the var genuinely unset the banner must say so; got:\n{prompt}'
+        )
+        assert 'ask the operator' in prompt, (
+            'the degraded banner must give the agent its ONE sanctioned next move: '
+            'ask, rather than guess a path or sweep the filesystem (census #1/#4); '
+            f'got:\n{prompt}'
+        )
+        assert 'cd  &&' not in prompt, 'never render an empty $DARK_FACTORY_ROOT expansion'
+        assert ': None' not in prompt, 'never render the Python None literal as a path'
+
+    @pytest.mark.asyncio
+    async def test_banner_does_not_claim_unset_when_a_bad_value_is_inherited(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A rejected ambient export is reported as INHERITED-and-bad, not as unset.
+
+        Task 3605 (review amendment).  Omitting the key from env_overrides does not
+        unset it in the child: shared/cli_invoke.py seeds the subprocess env from
+        os.environ and then applies the overrides, so a stale export on the
+        orchestrator process (a systemd unit, say) reaches the rotation regardless.
+        Claiming "DARK_FACTORY_ROOT is NOT set" there is simply false, and an agent
+        that believes it will `cd` into a directory that exists but carries no
+        watcher-rearm.sh — passing that script's own `[ -d ]` guard and getting a
+        bare "No such file or directory" instead of the designed exit-2 diagnostic.
+        """
+        from shared.cli_invoke import AgentResult
+
+        stale = tmp_path / 'stale-not-a-df-checkout'
+        stale.mkdir()
+        monkeypatch.setenv(DARK_FACTORY_ROOT_ENV, str(stale))
+        h = _make_rotation_harness(tmp_path)
+        captured: dict = {}
+
+        async def fake_invoke(usage_gate, label, *, invoke_fn, **kwargs):
+            captured['prompt'] = kwargs.get('prompt', '')
+            return AgentResult(success=True, output='')
+
+        # Only the RESOLVER is patched (ascent also fails); the rejected-override
+        # helper runs for real against the env var set above.
+        with (
+            patch('orchestrator.harness.invoke_with_cap_retry', fake_invoke),
+            patch('orchestrator.harness.resolve_dark_factory_root', return_value=None),
+        ):
+            await h._run_watcher_rotation()
+
+        prompt = captured['prompt']
+        assert 'DARK_FACTORY_ROOT is NOT set' not in prompt, (
+            'the banner must not assert the var is unset when the child inherits it; '
+            f'got:\n{prompt}'
+        )
+        assert str(stale) in prompt, (
+            f'the inherited value must be named so the agent can recognise it; '
+            f'got:\n{prompt}'
+        )
+        assert 'INHERITED' in prompt, 'the banner must say the value reaches the child'
+        assert 'known-bad' in prompt, 'the banner must say the inherited value is wrong'
+        assert 'ask the operator' in prompt
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('root_resolves', [True, False], ids=['resolved', 'unresolved'])
+    async def test_user_prompt_carries_rearm_outcome_guidance(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, root_resolves: bool
+    ) -> None:
+        """The outcome-branching block reaches prompt= whether or not the tooling root resolved.
+
+        Task 3606: the re-arm command the banner hands over is useless without
+        what to do with its result, in both banner branches.
+        """
+        from shared.cli_invoke import AgentResult
+
+        if not root_resolves:
+            monkeypatch.delenv(DARK_FACTORY_ROOT_ENV, raising=False)
+        h = _make_rotation_harness(tmp_path)
+        resolved_root = tmp_path / 'df-tooling-checkout' if root_resolves else None
+        captured: dict = {}
+
+        async def fake_invoke(usage_gate, label, *, invoke_fn, **kwargs):
+            captured['prompt'] = kwargs.get('prompt', '')
+            return AgentResult(success=True, output='')
+
+        with (
+            patch('orchestrator.harness.invoke_with_cap_retry', fake_invoke),
+            patch('orchestrator.harness.resolve_dark_factory_root', return_value=resolved_root),
+        ):
+            await h._run_watcher_rotation()
+
+        assert WATCHER_REARM_OUTCOME_GUIDANCE in captured['prompt'], (
+            'the rotation prompt must carry WATCHER_REARM_OUTCOME_GUIDANCE verbatim; '
+            f'got:\n{captured["prompt"]}'
         )
 
     @pytest.mark.asyncio
@@ -555,6 +944,23 @@ def _make_loop_harness(tmp_path: Path) -> Harness:
     return h
 
 
+@contextlib.contextmanager
+def _patch_monotonic_for_this_thread(fake: Callable[[], float]) -> Iterator[None]:
+    """Serve *fake* as ``time.monotonic`` to the entering thread only (task 5676).
+
+    ``orchestrator.harness.time`` is the stdlib module, so the patch is
+    process-global; every other thread keeps reading the real clock.
+    """
+    real_monotonic = time.monotonic
+    owner = threading.get_ident()
+
+    def monotonic() -> float:
+        return fake() if threading.get_ident() == owner else real_monotonic()
+
+    with patch('orchestrator.harness.time.monotonic', new=monotonic):
+        yield
+
+
 def _build_monotonic_timestamps(
     durations: list[float],
     *,
@@ -596,7 +1002,8 @@ async def _run_supervisor_with_rotation_durations(
     """Drive _watcher_supervisor_loop with controlled per-rotation durations.
 
     Each entry in *rotation_durations_secs* becomes one paired (start, end)
-    timestamp consumed by the patched ``time.monotonic``.
+    timestamp served by a thread-scoped ``time.monotonic`` patch, so only the
+    calling thread consumes the script.
 
     When *expect_cancelled* is ``True`` (the default), a final start timestamp
     is appended and ``fake_rotation`` raises ``CancelledError`` on the (n+1)th
@@ -639,18 +1046,92 @@ async def _run_supervisor_with_rotation_durations(
     if expect_cancelled:
         with (
             patch('orchestrator.harness.asyncio.sleep', recording_sleep),
-            patch('orchestrator.harness.time.monotonic', side_effect=fake_monotonic),
+            _patch_monotonic_for_this_thread(fake_monotonic),
             pytest.raises(asyncio.CancelledError),
         ):
             await h._watcher_supervisor_loop()
     else:
         with (
             patch('orchestrator.harness.asyncio.sleep', recording_sleep),
-            patch('orchestrator.harness.time.monotonic', side_effect=fake_monotonic),
+            _patch_monotonic_for_this_thread(fake_monotonic),
         ):
             await h._watcher_supervisor_loop()
 
     return sleep_durations
+
+
+# ---------------------------------------------------------------------------
+# task 5676: the scripted supervisor clock serves only the test's own thread
+# ---------------------------------------------------------------------------
+
+class TestScriptedSupervisorClockIgnoresOtherThreads:
+
+    @pytest.mark.asyncio
+    async def test_background_monotonic_reader_does_not_consume_scripted_timestamps(
+        self, tmp_path: Path,
+    ) -> None:
+        """A foreign thread reading ``time.monotonic()`` mid-loop must not
+        consume the supervisor's exact-length timestamp script.
+
+        The digest hook blocks each iteration until the reader has read the
+        clock inside the patched window, so the steal is forced
+        deterministically rather than left to GIL scheduling.
+        """
+        h = _make_loop_harness(tmp_path)
+        h.config = h.config.model_copy(update={
+            'watcher_max_misconfigured_clean_exits': 99,
+            'watcher_misconfigured_min_rotation_secs': 120.0,
+            'watcher_subprocess_restart_backoff_secs': 1.0,
+            'watcher_crashloop_window_secs': 600,
+            'watcher_max_crashloop_restarts': 99,
+        })
+
+        stop = threading.Event()
+        window_open = threading.Event()
+        read_in_window = threading.Event()
+        reader_errors: list[BaseException] = []
+
+        def read_clock_until_stopped() -> None:
+            while not stop.is_set():
+                if not window_open.wait(timeout=0.05):
+                    continue
+                try:
+                    time.monotonic()
+                except BaseException as exc:
+                    reader_errors.append(exc)
+                    return
+                read_in_window.set()
+
+        async def digest_hook_forcing_a_foreign_read() -> None:
+            read_in_window.clear()
+            window_open.set()
+            if not read_in_window.wait(timeout=5.0):
+                pytest.fail(
+                    'monotonic-reader thread never read the clock inside the '
+                    'patched window; the regression test cannot prove anything'
+                )
+            window_open.clear()
+
+        h._maybe_write_digest = digest_hook_forcing_a_foreign_read  # type: ignore[method-assign]
+
+        reader = threading.Thread(
+            target=read_clock_until_stopped, name='monotonic-reader', daemon=True,
+        )
+        reader.start()
+        try:
+            sleep_durations = await _run_supervisor_with_rotation_durations(h, [1.0] * 4)
+        finally:
+            stop.set()
+            reader.join(timeout=5.0)
+
+        assert not reader.is_alive(), 'monotonic-reader thread did not stop within 5s'
+        assert reader_errors == [], (
+            f'monotonic-reader thread hit the scripted clock and raised: {reader_errors!r}'
+        )
+        assert sleep_durations == pytest.approx([1.0, 2.0, 4.0, 8.0]), (
+            f'Expected the scripted exponential floor [1.0, 2.0, 4.0, 8.0] with a '
+            f'concurrent foreign clock reader; got {sleep_durations}'
+        )
 
 
 class TestWatcherSupervisorLoopClassification:
@@ -950,15 +1431,15 @@ class TestWatcherCrashloopTrip:
         })
 
         rotation_calls = 0
-        pause_calls: list[str] = []
+        pause_calls: list[tuple[str, PauseClass]] = []
 
         async def fake_rotation() -> AgentResult:
             nonlocal rotation_calls
             rotation_calls += 1
             return AgentResult(success=False, output='')
 
-        async def fake_pause_scheduler(reason: str) -> None:
-            pause_calls.append(reason)
+        async def fake_pause_scheduler(reason: str, pause_class: PauseClass) -> None:
+            pause_calls.append((reason, pause_class))
 
         async def fake_sleep(duration: float) -> None:
             pass  # instant, no blocking
@@ -969,12 +1450,12 @@ class TestWatcherCrashloopTrip:
         # patch monotonic to return a stable time (all exits within the window)
         stable_time = time.monotonic()
         with patch('orchestrator.harness.asyncio.sleep', fake_sleep), \
-             patch('orchestrator.harness.time.monotonic', return_value=stable_time):
+             _patch_monotonic_for_this_thread(lambda: stable_time):
             # Loop should exit after max_restarts unclean exits
             await h._watcher_supervisor_loop()
 
         # pause_scheduler called exactly once with the crashloop reason
-        assert pause_calls == ['watcher_crashloop'], (
+        assert pause_calls == [('watcher_crashloop', PauseClass.WATCHER_GUARD)], (
             f'Expected pause_scheduler("watcher_crashloop") once; got {pause_calls}'
         )
         # Loop exited (returned) — no further rotations after the trip
@@ -996,7 +1477,7 @@ class TestWatcherCrashloopTrip:
         })
 
         rotation_calls = 0
-        pause_calls: list[str] = []
+        pause_calls: list[tuple[str, PauseClass]] = []
 
         async def fake_rotation() -> AgentResult:
             nonlocal rotation_calls
@@ -1005,8 +1486,8 @@ class TestWatcherCrashloopTrip:
                 raise asyncio.CancelledError()
             return AgentResult(success=False, output='')
 
-        async def fake_pause_scheduler(reason: str) -> None:
-            pause_calls.append(reason)
+        async def fake_pause_scheduler(reason: str, pause_class: PauseClass) -> None:
+            pause_calls.append((reason, pause_class))
 
         h._run_watcher_rotation = fake_rotation          # type: ignore[method-assign]
         h.pause_scheduler = fake_pause_scheduler         # type: ignore[method-assign]
@@ -1034,7 +1515,7 @@ class TestWatcherCrashloopTrip:
             'watcher_subprocess_restart_backoff_secs': 0.0,
         })
 
-        pause_calls: list[str] = []
+        pause_calls: list[tuple[str, PauseClass]] = []
         rotation_calls = 0
 
         # Monotonic clock advances to put first exits outside the window.
@@ -1056,8 +1537,8 @@ class TestWatcherCrashloopTrip:
                 raise asyncio.CancelledError()
             return AgentResult(success=False, output='')
 
-        async def fake_pause_scheduler(reason: str) -> None:
-            pause_calls.append(reason)
+        async def fake_pause_scheduler(reason: str, pause_class: PauseClass) -> None:
+            pause_calls.append((reason, pause_class))
 
         h._run_watcher_rotation = fake_rotation          # type: ignore[method-assign]
         h.pause_scheduler = fake_pause_scheduler         # type: ignore[method-assign]
@@ -1070,7 +1551,7 @@ class TestWatcherCrashloopTrip:
 
         with (
             patch('orchestrator.harness.asyncio.sleep', AsyncMock()),
-            patch('orchestrator.harness.time.monotonic', side_effect=fake_monotonic),
+            _patch_monotonic_for_this_thread(fake_monotonic),
             pytest.raises(asyncio.CancelledError),
         ):
             # Loop should cancel (not trip) because old exits are evicted
@@ -1103,7 +1584,7 @@ class TestWatcherCrashloopTrip:
         })
 
         rotation_calls = 0
-        pause_calls: list[str] = []
+        pause_calls: list[tuple[str, PauseClass]] = []
 
         async def fake_rotation() -> AgentResult:
             nonlocal rotation_calls
@@ -1114,8 +1595,8 @@ class TestWatcherCrashloopTrip:
                 raise asyncio.CancelledError()
             return AgentResult(success=False, output='')
 
-        async def raising_pause_scheduler(reason: str) -> None:
-            pause_calls.append(reason)
+        async def raising_pause_scheduler(reason: str, pause_class: PauseClass) -> None:
+            pause_calls.append((reason, pause_class))
             raise RuntimeError('pause failed')
 
         h._run_watcher_rotation = fake_rotation              # type: ignore[method-assign]
@@ -1124,7 +1605,7 @@ class TestWatcherCrashloopTrip:
         stable_time = time.monotonic()
         with (
             patch('orchestrator.harness.asyncio.sleep', AsyncMock()),
-            patch('orchestrator.harness.time.monotonic', return_value=stable_time),
+            _patch_monotonic_for_this_thread(lambda: stable_time),
         ):
             # Supervisor must return even though pause_scheduler raises.
             # In RED state: CancelledError fires at max_restarts*2+1 rotations, and
@@ -1132,7 +1613,7 @@ class TestWatcherCrashloopTrip:
             await h._watcher_supervisor_loop()
 
         # pause_scheduler was called exactly once with the crashloop reason
-        assert pause_calls == ['watcher_crashloop'], (
+        assert pause_calls == [('watcher_crashloop', PauseClass.WATCHER_GUARD)], (
             f'Expected pause_scheduler("watcher_crashloop") once; got {pause_calls}'
         )
         # No 4th rotation after the failing trip (supervisor stopped)
@@ -1189,7 +1670,7 @@ class TestWatcherMisconfiguredGuard:
 
         with (
             patch('orchestrator.harness.asyncio.sleep', AsyncMock()),
-            patch('orchestrator.harness.time.monotonic', side_effect=fake_monotonic),
+            _patch_monotonic_for_this_thread(fake_monotonic),
             pytest.raises(asyncio.CancelledError),
         ):
             await h._watcher_supervisor_loop()
@@ -1235,7 +1716,7 @@ class TestWatcherMisconfiguredGuard:
 
         with (
             patch('orchestrator.harness.asyncio.sleep', AsyncMock()),
-            patch('orchestrator.harness.time.monotonic', side_effect=fake_monotonic),
+            _patch_monotonic_for_this_thread(fake_monotonic),
             pytest.raises(asyncio.CancelledError),
         ):
             await h._watcher_supervisor_loop()
@@ -1263,7 +1744,7 @@ class TestWatcherMisconfiguredGuard:
         })
 
         rotation_calls = 0
-        pause_calls: list[str] = []
+        pause_calls: list[tuple[str, PauseClass]] = []
 
         # All rotations are fast-clean (duration 1s < 120s).
         # Guard: cancel after max_misconfig * 2 rotations to prevent an infinite loop
@@ -1277,8 +1758,8 @@ class TestWatcherMisconfiguredGuard:
                 raise asyncio.CancelledError()
             return AgentResult(success=True, output='', timed_out=False)
 
-        async def fake_pause_scheduler(reason: str) -> None:
-            pause_calls.append(reason)
+        async def fake_pause_scheduler(reason: str, pause_class: PauseClass) -> None:
+            pause_calls.append((reason, pause_class))
 
         h._run_watcher_rotation = fake_rotation          # type: ignore[method-assign]
         h.pause_scheduler = fake_pause_scheduler         # type: ignore[method-assign]
@@ -1296,12 +1777,12 @@ class TestWatcherMisconfiguredGuard:
 
         with (
             patch('orchestrator.harness.asyncio.sleep', AsyncMock()),
-            patch('orchestrator.harness.time.monotonic', side_effect=fake_monotonic),
+            _patch_monotonic_for_this_thread(fake_monotonic),
         ):
             # Loop should exit after max_misconfig fast-clean exits (no CancelledError)
             await h._watcher_supervisor_loop()
 
-        assert pause_calls == ['watcher_misconfigured'], (
+        assert pause_calls == [('watcher_misconfigured', PauseClass.WATCHER_GUARD)], (
             f'Expected pause_scheduler("watcher_misconfigured") once; got {pause_calls}'
         )
         assert rotation_calls == max_misconfig, (
@@ -1336,7 +1817,7 @@ class TestWatcherMisconfiguredGuard:
             'watcher_max_crashloop_restarts': 99,  # disable crashloop trip
         })
 
-        pause_calls: list[str] = []
+        pause_calls: list[tuple[str, PauseClass]] = []
         rotation_calls = 0
 
         # Drive 2 fast-clean exits at old_time, then jump past window,
@@ -1376,15 +1857,15 @@ class TestWatcherMisconfiguredGuard:
                 raise asyncio.CancelledError()
             return AgentResult(success=True, output='', timed_out=False)
 
-        async def fake_pause_scheduler(reason: str) -> None:
-            pause_calls.append(reason)
+        async def fake_pause_scheduler(reason: str, pause_class: PauseClass) -> None:
+            pause_calls.append((reason, pause_class))
 
         h._run_watcher_rotation = fake_rotation          # type: ignore[method-assign]
         h.pause_scheduler = fake_pause_scheduler         # type: ignore[method-assign]
 
         with (
             patch('orchestrator.harness.asyncio.sleep', AsyncMock()),
-            patch('orchestrator.harness.time.monotonic', side_effect=fake_monotonic),
+            _patch_monotonic_for_this_thread(fake_monotonic),
             pytest.raises(asyncio.CancelledError),
         ):
             # Loop should cancel (not trip) because old entries are evicted
@@ -1435,7 +1916,7 @@ class TestWatcherMisconfiguredGuard:
         })
 
         rotation_calls = 0
-        pause_calls: list[str] = []
+        pause_calls: list[tuple[str, PauseClass]] = []
 
         # Guard: cancel after max_misconfig * 2 iterations to prevent an infinite
         # loop when the defensive wrapper is absent (makes failure fast).
@@ -1446,8 +1927,8 @@ class TestWatcherMisconfiguredGuard:
                 raise asyncio.CancelledError()
             return AgentResult(success=True, output='', timed_out=False)
 
-        async def raising_pause_scheduler(reason: str) -> None:
-            pause_calls.append(reason)
+        async def raising_pause_scheduler(reason: str, pause_class: PauseClass) -> None:
+            pause_calls.append((reason, pause_class))
             raise RuntimeError('pause failed')
 
         h._run_watcher_rotation = fake_rotation              # type: ignore[method-assign]
@@ -1464,12 +1945,12 @@ class TestWatcherMisconfiguredGuard:
 
         with (
             patch('orchestrator.harness.asyncio.sleep', AsyncMock()),
-            patch('orchestrator.harness.time.monotonic', side_effect=fake_monotonic),
+            _patch_monotonic_for_this_thread(fake_monotonic),
         ):
             # Supervisor must return even though pause_scheduler raises.
             await h._watcher_supervisor_loop()
 
-        assert pause_calls == ['watcher_misconfigured'], (
+        assert pause_calls == [('watcher_misconfigured', PauseClass.WATCHER_GUARD)], (
             f'Expected pause_scheduler("watcher_misconfigured") once; got {pause_calls}'
         )
         assert rotation_calls == max_misconfig, (
@@ -1610,10 +2091,10 @@ class TestWatcherMisconfiguredGuard:
             'watcher_max_crashloop_restarts': 99,  # disable crashloop trip
         })
 
-        pause_calls: list[str] = []
+        pause_calls: list[tuple[str, PauseClass]] = []
 
-        async def fake_pause_scheduler(reason: str) -> None:
-            pause_calls.append(reason)
+        async def fake_pause_scheduler(reason: str, pause_class: PauseClass) -> None:
+            pause_calls.append((reason, pause_class))
 
         h.pause_scheduler = fake_pause_scheduler  # type: ignore[method-assign]
 
@@ -1623,7 +2104,7 @@ class TestWatcherMisconfiguredGuard:
             h, [1.0, 1.0, 1.0], expect_cancelled=False
         )
 
-        assert pause_calls == ['watcher_misconfigured'], (
+        assert pause_calls == [('watcher_misconfigured', PauseClass.WATCHER_GUARD)], (
             f'Expected pause_scheduler("watcher_misconfigured") once; got {pause_calls}'
         )
         # Key assertion: floor sequence proves pre-guard increment ordering.
@@ -1811,7 +2292,7 @@ class TestWatcherMisconfiguredGuard:
 
         with (
             patch('orchestrator.harness.asyncio.sleep', fake_sleep),
-            patch('orchestrator.harness.time.monotonic', side_effect=lambda: next(monotonic_iter)),
+            _patch_monotonic_for_this_thread(lambda: next(monotonic_iter)),
             pytest.raises(asyncio.CancelledError),
         ):
             await h._watcher_supervisor_loop()
@@ -2165,7 +2646,7 @@ class TestMaybeWriteDigestSurfacesMissingState:
         # asyncio.sleep: instant no-op so the degenerate-clean backoff floor
         # doesn't actually sleep.
         with (
-            patch('orchestrator.harness.time.monotonic', return_value=0.0),
+            _patch_monotonic_for_this_thread(lambda: 0.0),
             patch('orchestrator.harness.asyncio.sleep', new=AsyncMock()),
             pytest.raises(AttributeError, match='_escalation_event_count'),
         ):
@@ -2210,7 +2691,7 @@ class TestMaybeWriteDigestSurfacesMissingState:
         # propagates the error regardless of its origin.
         digest_mock = AsyncMock(side_effect=AttributeError('scheduler'))
         with (
-            patch('orchestrator.harness.time.monotonic', return_value=0.0),
+            _patch_monotonic_for_this_thread(lambda: 0.0),
             patch('orchestrator.harness.asyncio.sleep', new=AsyncMock()),
             patch.object(h, '_maybe_write_digest', digest_mock),
             pytest.raises(AttributeError, match='scheduler'),
@@ -2237,6 +2718,7 @@ def _make_harness_with_queue(tmp_path: Path) -> tuple[Harness, EscalationQueue]:
     h._watcher_supervisor_task = None
     h._watcher_unclean_exits = deque()
     h._watcher_degenerate_clean_exits = deque()
+    h.scheduler = Scheduler(config)
 
     queue = EscalationQueue(tmp_path / 'esc')
     h._escalation_queue = queue
@@ -2335,6 +2817,33 @@ class TestFileWatcherOutageL2:
         # Must not raise
         h._file_watcher_outage_l2('watcher_crashloop')
 
+    def test_filing_emits_escalation_created_for_the_l2(self, tmp_path: Path) -> None:
+        h, queue = _make_harness_with_queue(tmp_path)
+        h.event_store = MagicMock(spec=EventStore)
+
+        h._file_watcher_outage_l2('watcher_crashloop')
+
+        (l2,) = [e for e in queue.get_pending() if e.level == 2]
+        h.event_store.emit.assert_called_once()
+        (event_type,) = h.event_store.emit.call_args.args
+        assert event_type is EventType.escalation_created
+        assert h.event_store.emit.call_args.kwargs['task_id'] == '__watcher_supervisor__'
+        data = h.event_store.emit.call_args.kwargs['data']
+        assert data['escalation_id'] == l2.id
+        assert (data['level'], data['severity']) == (2, 'urgent')
+        assert data['category'] == 'infra_issue'
+        assert data['reason'] == 'watcher-supervisor-outage'
+
+    def test_pending_count_failure_files_nothing_and_does_not_raise(
+        self, tmp_path: Path,
+    ) -> None:
+        h, queue = _make_harness_with_queue(tmp_path)
+
+        with patch.object(queue, 'get_pending', side_effect=RuntimeError('boom')):
+            h._file_watcher_outage_l2('watcher_crashloop')
+
+        assert queue.get_pending() == []
+
 
 # ---------------------------------------------------------------------------
 # task 1501: _resolve_watcher_outage_l2 resolves the open outage L2
@@ -2354,19 +2863,21 @@ class TestResolveWatcherOutageL2:
         l2_id = l2s_before[0].id
 
         # Resolve
-        h._resolve_watcher_outage_l2()
+        h._resolve_watcher_outage_l2(WatcherRecoveryEvidence.HEALTHY_ROTATION)
 
         # Must no longer be in pending
         l2s_after = [e for e in queue.get_pending() if e.level == 2]
         assert len(l2s_after) == 0, (
             f'Expected 0 pending L2s after resolve; got {l2s_after}'
         )
-        # Must be resolved in the full queue
+        # Must be resolved in the full queue, recording the caller's evidence
         resolved = queue.get(l2_id)
         assert resolved is not None, f'escalation {l2_id} not found in queue'
         assert resolved.status == 'resolved', (
             f'Expected status="resolved"; got {resolved.status!r}'
         )
+        assert resolved.resolution == WatcherRecoveryEvidence.HEALTHY_ROTATION
+        assert resolved.resolution_class is not None, 'a level-2 close must be classified'
 
     def test_noop_when_no_open_l2(self, tmp_path: Path) -> None:
         """When no pending L2 with root_cause='watcher_supervisor_down', must be a no-op."""
@@ -2376,7 +2887,7 @@ class TestResolveWatcherOutageL2:
         pending_before = list(queue.get_pending())
 
         # Must not raise
-        h._resolve_watcher_outage_l2()
+        h._resolve_watcher_outage_l2(WatcherRecoveryEvidence.DRAINED_QUEUE)
 
         # Queue unchanged
         pending_after = list(queue.get_pending())
@@ -2392,7 +2903,7 @@ class TestResolveWatcherOutageL2:
         h._escalation_queue = None
 
         # Must not raise
-        h._resolve_watcher_outage_l2()
+        h._resolve_watcher_outage_l2(WatcherRecoveryEvidence.HEALTHY_ROTATION)
 
 
 # ---------------------------------------------------------------------------
@@ -2421,7 +2932,7 @@ class TestCheckWatcherGuardFilesL2Outage:
         )
 
         assert tripped is True, 'Guard should have tripped'
-        h.pause_scheduler.assert_awaited_once_with('watcher_crashloop')
+        h.pause_scheduler.assert_awaited_once_with('watcher_crashloop', PauseClass.WATCHER_GUARD)
 
         l2s = [e for e in queue.get_pending() if e.level == 2]
         assert len(l2s) == 1, (
@@ -2546,7 +3057,9 @@ class TestEnforceCostCeilingsFilesL2:
 
         await h._enforce_cost_ceilings()
 
-        h.pause_scheduler.assert_awaited_once_with('cost_ceiling_watcher_exceeded')
+        h.pause_scheduler.assert_awaited_once_with(
+            'cost_ceiling_watcher_exceeded', PauseClass.COST_CEILING,
+        )
 
         l2s = [e for e in queue.get_pending() if e.level == 2]
         assert len(l2s) == 1, (
@@ -2567,6 +3080,7 @@ class TestEnforceCostCeilingsFilesL2:
 def _make_loop_harness_with_queue(tmp_path: Path) -> tuple[Harness, EscalationQueue]:
     """Extend _make_loop_harness with a real EscalationQueue for recovery tests."""
     h = _make_loop_harness(tmp_path)
+    h.scheduler = Scheduler(h.config)
     queue = EscalationQueue(tmp_path / 'esc')
     h._escalation_queue = queue
     return h, queue
@@ -2581,7 +3095,8 @@ class TestWatcherSupervisorLoopRecoveryResolvesL2:
 
         Pre-file an outage L2, drive _watcher_supervisor_loop with one rotation
         lasting >= watcher_misconfigured_min_rotation_secs (healthy-clean path),
-        then assert the L2 is no longer pending (it was resolved).
+        then assert the L2 is no longer pending and records HEALTHY_ROTATION
+        as the evidence that cleared it.
         """
         h, queue = _make_loop_harness_with_queue(tmp_path)
         min_secs = 30.0
@@ -2601,6 +3116,7 @@ class TestWatcherSupervisorLoopRecoveryResolvesL2:
             if e.level == 2 and e.root_cause == h._WATCHER_OUTAGE_ROOT_CAUSE
         ]
         assert len(pending_before) == 1, 'Pre-condition: outage L2 must be filed before loop runs'
+        l2_id = pending_before[0].id
 
         # Drive with one healthy-clean rotation (duration > min_secs)
         await _run_supervisor_with_rotation_durations(h, [min_secs + 1.0])
@@ -2613,6 +3129,9 @@ class TestWatcherSupervisorLoopRecoveryResolvesL2:
             f'Expected outage L2 to be resolved after healthy-clean rotation; '
             f'still pending: {pending_after}'
         )
+        resolved = queue.get(l2_id)
+        assert resolved is not None
+        assert resolved.resolution == WatcherRecoveryEvidence.HEALTHY_ROTATION
 
     @pytest.mark.asyncio
     async def test_degenerate_clean_does_NOT_resolve_outage_l2(self, tmp_path: Path) -> None:
@@ -2655,48 +3174,599 @@ class TestWatcherSupervisorLoopRecoveryResolvesL2:
 
 
 # ---------------------------------------------------------------------------
-# task 1501: _WATCHER_ALLOWED_TOOLS must include promote_to_l2
+# Tools SKILL.md depends on are granted and not disallowed (tasks 1501, 2629,
+# 3176, 3726, 3999, 4081, 10426)
 # ---------------------------------------------------------------------------
 
+_FILING_PAIR = ('mcp__fused-memory__submit_task', 'mcp__fused-memory__resolve_ticket')
+_RECORD_AND_MERGE_STATE_READS = (
+    'mcp__escalation__get_escalation',
+    'mcp__escalation__get_task_escalation_history',
+    'mcp__escalation__merge_status',
+    'mcp__escalation__get_merge_queue',
+)
+_REQUIRED_GRANTS: tuple[tuple[str, str], ...] = (
+    ('mcp__escalation__promote_to_l2',
+     'the rotation promotes out-of-scope L1s to a human L2 stream (task 1501)'),
+    ('Task',
+     'the sonnet rotation delegates deep RCA to an opus subagent (task 2629)'),
+    ('Bash(git cat-file:*)',
+     'the orphan-reaper auto-close probes objects and <ref>:<path>s in its '
+     'investigation step and close conditions 2 and 3 (task 4081)'),
+    ('mcp__escalation__get_task_escalations',
+     "the drain reads archived L2s' member_ids to keep already-promoted L1s "
+     'out of work_batch (task 3999)'),
+    *((tool, "SKILL.md's Read-only investigation toolset lists it; the "
+             'single-record read calls get_escalation and the task_failure '
+             'handler reads merge_status.failure_diagnostic (task 3176)')
+      for tool in _RECORD_AND_MERGE_STATE_READS),
+    *((tool, 'filing a finding needs submit_task, which yields only a ticket, '
+             'and resolve_ticket, which yields the task id the resolution '
+             'must cite (task 3726)')
+      for tool in _FILING_PAIR),
+    ('mcp__fused-memory__search_tasks',
+     "SKILL.md's existence checks call it, so a refused lookup would read as "
+     "'no matching task' (task 10426)"),
+)
+
+
+def _disallow_entry_blocks(entry: str, tool: str) -> bool:
+    """Whether disallow-list *entry* blocks *tool*, beyond an exact match.
+
+    A bare tool name blocks every scoped form of it (`Bash` blocks
+    `Bash(git log:*)`), an `mcp__<family>__*` wildcard blocks its family, and
+    a `Bash(<prefix>:*)` rule blocks any Bash rule whose command starts with
+    that prefix (`Bash(git:*)` blocks `Bash(git cat-file:*)`).
+    """
+    if entry == tool or entry == tool.partition('(')[0] or tool_is_granted(tool, {entry}):
+        return True
+    if not (entry.startswith('Bash(') and entry.endswith(':*)') and tool.startswith('Bash(')):
+        return False
+    prefix = entry.removeprefix('Bash(').removesuffix(':*)')
+    return tool.removeprefix('Bash(').startswith(prefix)
+
+
 class TestWatcherAllowedTools:
-    """_WATCHER_ALLOWED_TOOLS includes the L2-promotion tool (task 1501)."""
+    """The rotation's allowed/disallowed tool lists match what SKILL.md uses."""
 
-    def test_promote_to_l2_in_allowed_tools(self) -> None:
-        """mcp__escalation__promote_to_l2 must be in _WATCHER_ALLOWED_TOOLS.
+    @pytest.mark.parametrize(
+        ('tool', 'why'), _REQUIRED_GRANTS, ids=[tool for tool, _ in _REQUIRED_GRANTS],
+    )
+    def test_required_tool_is_granted_and_not_disallowed(self, tool: str, why: str) -> None:
+        """allowed_tools reaches the CLI as --allowed-tools, an ALLOWLIST
+        (shared/src/shared/cli_invoke.py), and MCP tools are not covered by
+        permission-bypass mode (SKILL.md "Headless-mode permission gotchas"),
+        so an unnamed MCP tool is permission-denied: a silent no-op. The
+        Bash and Task entries work under bypassPermissions today, but a
+        tightened policy, or a broad disallow rule, would strand them with
+        no other test failing."""
+        assert tool in _WATCHER_ALLOWED_TOOLS, (
+            f'{tool} must be in _WATCHER_ALLOWED_TOOLS: {why}; '
+            f'current list: {_WATCHER_ALLOWED_TOOLS}'
+        )
+        blockers = [e for e in _WATCHER_DISALLOWED_TOOLS if _disallow_entry_blocks(e, tool)]
+        assert not blockers, (
+            f'{tool} is blocked by _WATCHER_DISALLOWED_TOOLS entries {blockers}: {why}'
+        )
 
-        The autonomous L1-watcher agent can promote escalations to L2 when they
-        exceed its scope — this requires the promote_to_l2 MCP tool in its
-        allowed-tools allowlist (consumer-per-level contract from
-        plans/escalation-l2-tiering.md).
-        """
-        assert 'mcp__escalation__promote_to_l2' in _WATCHER_ALLOWED_TOOLS, (
-            'mcp__escalation__promote_to_l2 must be in _WATCHER_ALLOWED_TOOLS '
-            'so the autonomous watcher can promote L1→L2 escalations; '
+    def test_declare_pin_is_not_granted(self) -> None:
+        """Wildcard-aware: an `mcp__escalation__*` grant would cover it too."""
+        assert not tool_is_granted(
+            'mcp__escalation__declare_pin', set(_WATCHER_ALLOWED_TOOLS),
+        ), (
+            'mcp__escalation__declare_pin must not be granted to the rotation, '
+            'directly or by an mcp__escalation__* wildcard: see '
+            'skills/escalation-watcher-auto/SKILL.md "Declared pins" (task 3176); '
             f'current list: {_WATCHER_ALLOWED_TOOLS}'
         )
 
-    def test_task_in_allowed_tools(self) -> None:
-        """'Task' must be in _WATCHER_ALLOWED_TOOLS, and not in the disallowed list.
+    def test_skill_tool_is_denied(self) -> None:
+        """The bare 'Skill' tool is denied, and never pre-granted.
 
-        The sonnet top-level rotation (task 2629) delegates hard or
-        investigation-class items to an opus subagent via the Task tool
-        (SKILL.md "Delegating deep RCA to an opus subagent") instead of
-        running the whole rotation on opus. Task is not blocked by
-        bypassPermissions, so the delegation works today without this entry
-        — but a future tightening of the tool policy (e.g. an exhaustive
-        allowlist, or adding Task to _WATCHER_DISALLOWED_TOOLS) could
-        silently break this cost-optimization design with no test failing.
-        This assertion makes the dependency explicit and enforced.
+        On 2026-08-08 a resumed rotation invoked Skill{escalation-watcher}
+        and force-released the L2 watcher lease. The rotation runs under
+        bypassPermissions, where only the deny list blocks a tool, and an
+        allowlist entry is a permission pre-grant.
         """
-        assert 'Task' in _WATCHER_ALLOWED_TOOLS, (
-            "'Task' must be in _WATCHER_ALLOWED_TOOLS so the watcher rotation "
-            'can delegate deep RCA to an opus subagent (task 2629); '
-            f'current list: {_WATCHER_ALLOWED_TOOLS}'
+        assert 'Skill' in _WATCHER_DISALLOWED_TOOLS, (
+            "'Skill' must be in _WATCHER_DISALLOWED_TOOLS: on 2026-08-08 a "
+            'resumed rotation invoked Skill{escalation-watcher} and '
+            'force-released the watcher lease, and under bypassPermissions '
+            f'only the deny list blocks; current list: {_WATCHER_DISALLOWED_TOOLS}'
         )
-        assert 'Task' not in _WATCHER_DISALLOWED_TOOLS, (
-            "'Task' must not be in _WATCHER_DISALLOWED_TOOLS — that would "
-            'silently break the opus-subagent deep-RCA delegation (task 2629); '
-            f'current list: {_WATCHER_DISALLOWED_TOOLS}'
+        granted = [
+            t for t in _WATCHER_ALLOWED_TOOLS
+            if t == 'Skill' or t.startswith('Skill(')
+        ]
+        assert granted == [], (
+            f'_WATCHER_ALLOWED_TOOLS pre-grants the Skill tool via {granted}; '
+            'the 2026-08-08 incident (Skill{escalation-watcher} took the '
+            'watcher lease) needs it denied, not granted'
+        )
+
+
+# ---------------------------------------------------------------------------
+# task 3999: the drain protocol in the rotation's system prompt
+# ---------------------------------------------------------------------------
+
+_DRAIN_HEADING = '### Draining pending escalations'
+
+
+def _watcher_skill_text() -> str:
+    return load_skill_system_prompt('escalation-watcher-auto')
+
+
+def _fenced_code_blocks(text: str) -> list[str]:
+    return re.findall(r'```.*?\n(.*?)```', text, re.S)
+
+
+def _skill_section(text: str, heading: str) -> str:
+    """`heading` up to the next heading of the same or a shallower level,
+    ignoring lines inside ``` fences. `heading` must occur exactly once."""
+    lines = text.splitlines()
+    occurrences = lines.count(heading)
+    if occurrences != 1:
+        raise AssertionError(
+            f'SKILL.md has {occurrences} heading lines {heading!r}; '
+            'a section must be found by exactly one'
+        )
+    start = lines.index(heading)
+    level = len(heading) - len(heading.lstrip('#'))
+    boundary = re.compile(rf'#{{1,{level}}} ')
+    in_fence = False
+    end = len(lines)
+    for i in range(start + 1, len(lines)):
+        if lines[i].lstrip().startswith('```'):
+            in_fence = not in_fence
+        elif not in_fence and boundary.match(lines[i]):
+            end = i
+            break
+    return '\n'.join(lines[start:end])
+
+
+class TestWatcherSkillDrainProtocol:
+    """The rotation's drain protocol, read as the harness injects it.
+
+    SKILL.md's body IS the rotation's system prompt, and its fenced code
+    blocks are the calls the rotation makes. These tests pin only that API
+    surface: tool names, call shapes and projection keys.
+    """
+
+    def test_every_mcp_tool_the_skill_calls_is_granted(self) -> None:
+        called = {
+            token
+            for block in _fenced_code_blocks(_watcher_skill_text())
+            for token in re.findall(r'mcp__[a-z-]+__[a-z0-9_]+', block)
+        }
+        assert called, 'found no MCP tool calls in SKILL.md code blocks'
+        granted = set(_WATCHER_ALLOWED_TOOLS)
+        ungranted = sorted(t for t in called if not tool_is_granted(t, granted))
+        assert not ungranted, (
+            'SKILL.md code blocks call MCP tools missing from '
+            '_WATCHER_ALLOWED_TOOLS; grant them in '
+            'harness.py::_WATCHER_ALLOWED_TOOLS or reword the skill: '
+            f'{ungranted}'
+        )
+
+    def test_drain_rebuilds_already_promoted_archive_inclusively(self) -> None:
+        drain = _skill_section(_watcher_skill_text(), _DRAIN_HEADING)
+        assert 'get_task_escalations' in drain, (
+            'the drain must read L2s archive-inclusively via '
+            'get_task_escalations: get_pending_escalations is pending-only, so '
+            "a resolved L2's members re-enter work_batch "
+            '(delivered_check drain-loop-reads-the-escalation-archive)'
+        )
+        assert 'member_ids' in drain, (
+            'the drain must union member_ids, the compact projection key '
+            '(escalation/src/escalation/server.py::_compact_escalation)'
+        )
+
+    def test_drain_reads_l2s_compact_and_l1_candidates_full(self) -> None:
+        drain = _skill_section(_watcher_skill_text(), _DRAIN_HEADING)
+        lines = [
+            line
+            for block in _fenced_code_blocks(drain)
+            for line in block.splitlines()
+        ]
+        pending_l2_reads = [
+            line for line in lines if 'get_pending_escalations(level=2' in line
+        ]
+        archive_l2_reads = [line for line in lines if 'get_task_escalations(' in line]
+        l1_reads = [line for line in lines if 'get_pending_escalations(level=1' in line]
+        assert pending_l2_reads and archive_l2_reads and l1_reads, (
+            'the drain section must show the pending-L2, archive-L2 and L1 '
+            'candidate reads as one-line calls in a code block; found '
+            f'{pending_l2_reads=} {archive_l2_reads=} {l1_reads=}'
+        )
+        full_l2_reads = [
+            line
+            for line in pending_l2_reads + archive_l2_reads
+            if 'compact=True' not in line
+        ]
+        assert not full_l2_reads, (
+            'every L2 read must pass compact=True: member_ids exists only on '
+            f'compact rows (server.py::_compact_escalation): {full_l2_reads}'
+        )
+        compact_l1_reads = [line for line in l1_reads if 'compact=True' in line]
+        assert not compact_l1_reads, (
+            'the L1 candidate read must stay FULL-shape: the compact projection '
+            'drops agent_role and detail, which the path-guard carve-out and '
+            f'the handlers read: {compact_l1_reads}'
+        )
+
+    def test_skill_never_reads_members_off_an_escalation_row(self) -> None:
+        """No code block reads the model field `members` off an escalation row.
+
+        Every L2 read in this skill is compact (pinned by
+        test_drain_reads_l2s_compact_and_l1_candidates_full), and
+        server.py::_compact_escalation emits the projection key `member_ids`;
+        the model field `members` exists only in the FULL shape. Reading
+        `members` off an L2 row therefore silently yields nothing — in the
+        stranded_blocked guard that fails OPEN and re-resumes a task a
+        sibling escalation is already handling.
+
+        A read is `.members`, `.get("members"` or `["members"]` in either
+        quote style, off any receiver. The one legitimate read is
+        promote_to_l2's RESPONSE key `members`, so a read is exempt exactly
+        when its receiver is a variable bound to a promote_to_l2 call.
+        """
+        code = '\n'.join(_fenced_code_blocks(_watcher_skill_text()))
+        promote_results = set(
+            re.findall(r'(\w+)\s*=\s*mcp__escalation__promote_to_l2\(', code)
+        )
+        reads = re.finditer(
+            r'''(\w*)\s*(?:\.\s*get\(\s*["']|\[\s*["']|\.)\s*members\b''', code
+        )
+        found = [m.group(0) for m in reads if m.group(1) not in promote_results]
+        assert not found, (
+            'SKILL.md reads `members` off an escalation row; compact rows carry '
+            f'only `member_ids`, so the read silently yields nothing: {found}'
+        )
+
+
+# ---------------------------------------------------------------------------
+# task 3726: the Tier-1 mutating-tool bullet and the grant move in lockstep
+# ---------------------------------------------------------------------------
+
+_READ_ONLY_GRANTED_MCP_TOOLS = frozenset({
+    *_RECORD_AND_MERGE_STATE_READS,
+    'mcp__escalation__get_pending_escalations',
+    'mcp__escalation__get_task_escalations',
+    'mcp__fused-memory__get_task',
+    'mcp__fused-memory__get_tasks',
+    'mcp__fused-memory__search',
+    'mcp__fused-memory__search_tasks',
+})
+_TIER1_BULLET = '- **Tier-1 admin actions ONLY.**'
+
+
+def _tier1_mcp_tools(text: str) -> set[str]:
+    bullets = [line for line in text.splitlines() if line.startswith(_TIER1_BULLET)]
+    assert len(bullets) == 1, (
+        f'SKILL.md must carry exactly one {_TIER1_BULLET!r} Hard Constraints '
+        f'line; found {len(bullets)}'
+    )
+    return set(re.findall(r'`(mcp__[a-z-]+__[a-z0-9_]+)`', bullets[0]))
+
+
+class TestWatcherTier1BulletMatchesGrant:
+    """The Tier-1 bullet names exactly the granted mutating MCP tools.
+
+    The bullet ends "Nothing else mutates state", so a granted mutating tool
+    it omits is one the rotation is told never to use, and a tool it names
+    but the grant lacks is permission-denied.
+    """
+
+    def test_tier1_bullet_is_parseable(self) -> None:
+        assert _tier1_mcp_tools(_watcher_skill_text()), (
+            f'the {_TIER1_BULLET!r} line names no backticked mcp__ tools'
+        )
+
+    def test_tier1_bullet_matches_granted_mutating_tools(self) -> None:
+        declared = _tier1_mcp_tools(_watcher_skill_text())
+        granted = {
+            tool for tool in _WATCHER_ALLOWED_TOOLS if tool.startswith('mcp__')
+        } - _READ_ONLY_GRANTED_MCP_TOOLS
+        assert granted == declared, (
+            'harness.py::_WATCHER_ALLOWED_TOOLS and the SKILL.md Hard '
+            'Constraints Tier-1 bullet must change in lockstep. '
+            'Granted but forbidden to the agent by the Tier-1 bullet: '
+            f'{sorted(granted - declared)}. '
+            'Declared in the Tier-1 bullet but not granted: '
+            f'{sorted(declared - granted)}. '
+            'A newly granted READ tool belongs in _READ_ONLY_GRANTED_MCP_TOOLS.'
+        )
+
+
+# ---------------------------------------------------------------------------
+# task 3726: the convert-to-tracked-work (file-and-resolve) disposition
+# ---------------------------------------------------------------------------
+
+_CONVERT_HEADING = '### Convert to tracked work (file-and-resolve)'
+_CURATOR_ORIGIN_ROLES = ('fused-memory/task-curator', 'fused-memory/ticket-janitor')
+_RESOLUTION_CLASS_LITERAL = r'resolution_class\s*=\s*["\']([a-z-]+)["\']'
+
+
+def _convert_section() -> str:
+    return _skill_section(_watcher_skill_text(), _CONVERT_HEADING)
+
+
+class TestWatcherConvertToTrackedWork:
+    """A work-shaped L1 is filed as a task and closed citing that task id.
+
+    Pins only call shapes and structured tokens of the section: tool names,
+    metadata keys, resolve_ticket status values and resolution classes.
+    """
+
+    def test_files_through_the_two_phase_api(self) -> None:
+        code = '\n'.join(_fenced_code_blocks(_convert_section()))
+        missing = [tool for tool in _FILING_PAIR if f'{tool}(' not in code]
+        assert not missing, (
+            'the Convert section must show submit_task (yields a ticket) then '
+            'resolve_ticket (yields the task id the close cites) as calls in a '
+            f'code block; missing: {missing}'
+        )
+
+    def test_submit_call_carries_the_r4_idempotency_keys(self) -> None:
+        submit_blocks = [
+            block
+            for block in _fenced_code_blocks(_convert_section())
+            if 'submit_task(' in block
+        ]
+        assert submit_blocks, 'the Convert section has no submit_task( code block'
+        submit_code = '\n'.join(submit_blocks)
+        missing = [
+            key
+            for key in ('escalation_id', 'suggestion_hash')
+            if not re.search(rf'["\']{key}["\']\s*:', submit_code)
+        ]
+        assert not missing, (
+            'the submit_task metadata must carry the R4 idempotency keys as '
+            'dict keys — they are the interceptor\'s only dedupe handle on a '
+            're-file (orchestrator/src/orchestrator/agents/roles.py::'
+            f'submit_only_instructions); missing: {missing}'
+        )
+
+    def test_branches_on_every_resolve_ticket_status(self) -> None:
+        resolve_code = '\n'.join(
+            block
+            for block in _fenced_code_blocks(_convert_section())
+            if 'resolve_ticket(' in block
+        )
+        assert resolve_code, 'the Convert section has no resolve_ticket( code block'
+        missing = [
+            status
+            for status in ('created', 'combined', 'failed', 'refused', 'awaiting_curation')
+            if not re.search(rf'["\']{status}["\']', resolve_code)
+        ]
+        assert not missing, (
+            'the resolve_ticket code block must branch on every status it can '
+            'return, each as a quoted literal '
+            '(fused-memory/src/fused_memory/server/tools.py::resolve_ticket); '
+            '`refused` is terminal, carries no task_id and is never retried, '
+            '`awaiting_curation` is parked and never re-submitted; '
+            f'missing: {missing}'
+        )
+
+    def test_close_is_stamped_converted(self) -> None:
+        classes = [
+            cls
+            for block in _fenced_code_blocks(_convert_section())
+            if 'mcp__escalation__resolve_issue(' in block
+            for cls in re.findall(_RESOLUTION_CLASS_LITERAL, block)
+        ]
+        assert classes and set(classes) == {'converted'}, (
+            'a close citing a curator-created task is resolution_class '
+            "'converted' (escalation/src/escalation/models.py::"
+            f'RESOLUTION_CLASSES); found {classes}'
+        )
+        assert 'converted' in RESOLUTION_CLASSES
+
+    def test_unconvertible_outcomes_promote(self) -> None:
+        code = '\n'.join(_fenced_code_blocks(_convert_section()))
+        assert 'mcp__escalation__promote_to_l2(' in code, (
+            'a refused/failed filing, a submit error or a pin-refused close '
+            'must end in a promote_to_l2 call, never a park'
+        )
+
+    def test_curator_origin_records_are_never_refiled(self) -> None:
+        section = _convert_section()
+        missing = [role for role in _CURATOR_ORIGIN_ROLES if role not in section]
+        assert not missing, (
+            'the Convert section must exclude curator-origin records by '
+            'agent_role: re-filing through the curator that produced them '
+            f'loops watcher -> curator -> watcher; missing: {missing}'
+        )
+
+    def test_every_resolution_class_in_the_skill_is_server_vocabulary(self) -> None:
+        classes = {
+            cls
+            for block in _fenced_code_blocks(_watcher_skill_text())
+            for cls in re.findall(_RESOLUTION_CLASS_LITERAL, block)
+        }
+        assert classes, 'found no resolution_class literals in SKILL.md code blocks'
+        unknown = sorted(classes - RESOLUTION_CLASSES)
+        assert not unknown, (
+            'escalation/src/escalation/server.py::resolve_issue rejects a '
+            'resolution_class outside escalation.models.RESOLUTION_CLASSES, '
+            f'so these templates fail at runtime: {unknown}'
+        )
+
+
+# ---------------------------------------------------------------------------
+# task 3726: cleanup_needed files the cleanup instead of claiming tracking
+# ---------------------------------------------------------------------------
+
+_CLEANUP_HEADING = '#### `cleanup_needed`'
+
+
+class TestWatcherCleanupNeededFilesWork:
+    """The cleanup_needed handler files through the Convert disposition.
+
+    Its old close claimed the cleanup was "tracked in digest", but no
+    component reads the rotation's digest, so nothing tracked it.
+    """
+
+    def test_cleanup_routes_through_the_convert_disposition(self) -> None:
+        section = _skill_section(_watcher_skill_text(), _CLEANUP_HEADING)
+        assert '](#convert-to-tracked-work-file-and-resolve)' in section, (
+            'the cleanup_needed handler must link the Convert to tracked work '
+            'section, the one home of the submit/resolve filing procedure'
+        )
+
+    def test_cleanup_close_is_stamped_converted(self) -> None:
+        section = _skill_section(_watcher_skill_text(), _CLEANUP_HEADING)
+        classes = [
+            cls
+            for block in _fenced_code_blocks(section)
+            if 'resolve_issue(' in block
+            for cls in re.findall(_RESOLUTION_CLASS_LITERAL, block)
+        ]
+        assert classes and set(classes) == {'converted'}, (
+            'a cleanup_needed close cites the task filed for the cleanup, so '
+            f"it is resolution_class 'converted'; found {classes}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# task 3726: every L1 in work_batch ends resolved, filed-and-resolved or promoted
+# ---------------------------------------------------------------------------
+
+_TERMINAL_HEADING = '### Terminal dispositions — never park'
+_GRACEFUL_DEGRADATION_HEADING = '## Graceful Degradation'
+
+
+class TestWatcherTerminalDispositions:
+    """The L1 decision tree is total: three named exits, no park.
+
+    A park (e.g. esc-5665-2's invented "hold for a 3rd occurrence") is the
+    hole a missing exit leaves; the section names the three tools that
+    close it.
+    """
+
+    def test_names_the_three_terminal_dispositions(self) -> None:
+        section = _skill_section(_watcher_skill_text(), _TERMINAL_HEADING)
+        missing = [
+            tool
+            for tool in ('resolve_issue', 'submit_task', 'promote_to_l2')
+            if tool not in section
+        ]
+        assert not missing, (
+            'the terminal-dispositions section must name resolve it '
+            '(resolve_issue), file-and-resolve it (submit_task) and promote it '
+            f'(promote_to_l2); missing: {missing}'
+        )
+
+    def test_graceful_degradation_covers_the_filing_pair(self) -> None:
+        section = _skill_section(_watcher_skill_text(), _GRACEFUL_DEGRADATION_HEADING)
+        missing = [tool for tool in _FILING_PAIR if tool not in section]
+        assert not missing, (
+            'Graceful Degradation must feature-detect the filing pair like '
+            'promote_to_l2, so the skill is safe to load before orchestrators '
+            f'restart onto the new allowlist; missing: {missing}'
+        )
+
+
+# ---------------------------------------------------------------------------
+# task 3726: the remaining explicit park sites end in a terminal disposition
+# ---------------------------------------------------------------------------
+
+_DECLARED_PINS_HEADING = '### Declared pins: a close can be REFUSED (`declared_pin_refused`)'
+_CURATOR_RUNG_HEADING = '#### Curator-origin records — promote, never re-file'
+
+
+class TestWatcherNoParkingSites:
+    """Sites that used to park a record, or report it to the unread digest."""
+
+    def test_candidate_pin_is_promoted(self) -> None:
+        section = _skill_section(_watcher_skill_text(), _DECLARED_PINS_HEADING)
+        assert 'promote_to_l2' in section, (
+            'a candidate pin (load-bearing, no pin_declared_by) must be '
+            'promoted: promotion is the only channel by which a human learns '
+            'to run declare_pin, and no component reads the digest'
+        )
+
+    def test_curator_origin_rung_promotes_and_never_refiles(self) -> None:
+        section = _skill_section(_watcher_skill_text(), _CURATOR_RUNG_HEADING)
+        code = '\n'.join(_fenced_code_blocks(section))
+        assert 'mcp__escalation__promote_to_l2(' in code, (
+            'the curator-origin rung must end in a promote_to_l2 call'
+        )
+        assert 'submit_task(' not in code, (
+            'the curator-origin rung must never file through the curator that '
+            'produced the record: that loops watcher -> curator -> watcher'
+        )
+        missing = [role for role in _CURATOR_ORIGIN_ROLES if role not in section]
+        assert not missing, (
+            'the rung discriminates on producer agent_role '
+            '(curator_escalator.py::_curator_escalation, ticket_janitor.py); '
+            f'missing: {missing}'
+        )
+
+
+# ---------------------------------------------------------------------------
+# task 3726: every per-category routing handler ends in a terminal disposition
+# ---------------------------------------------------------------------------
+
+_ROUTING_TABLE_HEADING = '## Per-Category Routing Table'
+_REVIEW_SUGGESTIONS_HEADING = '#### `review_suggestions`'
+_TERMINAL_CALLS = ('mcp__escalation__resolve_issue(', 'mcp__escalation__promote_to_l2(')
+_TERMINAL_LINKS = ('](#convert-to-tracked-work-file-and-resolve)', '](#promote-to-l2)')
+
+
+def _handler_headings(section: str) -> list[str]:
+    headings = []
+    in_fence = False
+    for line in section.splitlines():
+        if line.lstrip().startswith('```'):
+            in_fence = not in_fence
+        elif not in_fence and line.startswith('#### '):
+            headings.append(line)
+    return headings
+
+
+def _ends_in_terminal_disposition(handler: str) -> bool:
+    code = '\n'.join(_fenced_code_blocks(handler))
+    return any(call in code for call in _TERMINAL_CALLS) or any(
+        link in handler for link in _TERMINAL_LINKS
+    )
+
+
+class TestWatcherRoutingHandlersAreTerminal:
+    """Every `####` routing handler shows a terminal call or links one.
+
+    A terminal call is a fenced resolve_issue/promote_to_l2 call; a terminal
+    link points at the Convert or Promote section. A tool named only in prose
+    does not count: a handler can name resolve_issue to forbid it.
+
+    A link counts wherever it sits, prose included, so a handler that links
+    Promote to L2 only to forbid promoting would pass. Telling an instruction
+    from a mention would mean parsing prose, which these tests do not do.
+    """
+
+    def test_every_routing_handler_ends_in_a_terminal_disposition(self) -> None:
+        text = _watcher_skill_text()
+        headings = _handler_headings(_skill_section(text, _ROUTING_TABLE_HEADING))
+        assert headings, f'found no #### handlers under {_ROUTING_TABLE_HEADING!r}'
+        parks = [
+            heading
+            for heading in headings
+            if not _ends_in_terminal_disposition(_skill_section(text, heading))
+        ]
+        assert not parks, (
+            'these routing handlers have no fenced resolve_issue/promote_to_l2 '
+            'call and no link to Convert to tracked work or Promote to L2, so '
+            'each is a park that Harness._watcher_has_actionable_l1 re-arms on '
+            f'every poll: {parks}'
+        )
+
+    def test_review_suggestions_are_filed_not_skipped(self) -> None:
+        section = _skill_section(_watcher_skill_text(), _REVIEW_SUGGESTIONS_HEADING)
+        assert '](#convert-to-tracked-work-file-and-resolve)' in section, (
+            'a review_suggestions record exists only because '
+            'TaskWorkflow._route_review_suggestions_to_curator had no curator '
+            'transport, so the curator never received the suggestions; filing '
+            'them through Convert to tracked work completes that route'
         )
 
 
@@ -2778,6 +3848,35 @@ class TestWatcherHasActionableL1:
         _submit_sample_l2(queue, 'task-promoted-cluster', members=[promoted_id])
         assert h._watcher_has_actionable_l1() is True
 
+    def test_member_missed_by_a_dispositioned_l2_cascade_returns_true(
+        self, tmp_path: Path,
+    ) -> None:
+        """A pending L1 whose resolved L2's cascade missed it — actionable.
+
+        The rotation's drain closes such a stranded member (SKILL.md
+        "Draining pending escalations"), so launching for it is how it leaves
+        the queue. Excluding archived L2s' members here would strand it.
+        """
+        h, queue = _make_harness_with_queue(tmp_path)
+        l1_id = _submit_sample_l1(queue, 'task-stranded')
+        l2_id = _submit_sample_l2(queue, 'task-stranded', members=[l1_id])
+        resolve = EscalationQueue.resolve
+
+        def resolve_missing_the_member(
+            self: EscalationQueue, escalation_id: str, *args, **kwargs,
+        ):
+            if escalation_id == l1_id:
+                raise OSError('simulated cascade failure')
+            return resolve(self, escalation_id, *args, **kwargs)
+
+        with patch.object(EscalationQueue, 'resolve', resolve_missing_the_member):
+            queue.resolve(l2_id, 'human answered the cluster', resolution_class='actionable')
+
+        l2, l1 = queue.get(l2_id), queue.get(l1_id)
+        assert l2 is not None and l2.status == 'resolved'
+        assert l1 is not None and l1.status == 'pending'
+        assert h._watcher_has_actionable_l1() is True
+
     def test_only_l0_returns_false(self, tmp_path: Path) -> None:
         """Only a pending level-0 escalation — not actionable at L1.
 
@@ -2819,6 +3918,28 @@ class TestWatcherHasActionableL1:
 # task 2629 step-5: _watcher_supervisor_loop consults the empty-queue precheck
 # ---------------------------------------------------------------------------
 
+async def _run_one_drained_supervisor_iteration(h: Harness) -> tuple[AsyncMock, list[float]]:
+    """Drive one supervisor iteration that ends at the empty-queue poll sleep.
+
+    Returns the rotation spy and the recorded sleep durations; the fake sleep
+    raises CancelledError so the loop stops after its first poll.
+    """
+    sleep_durations: list[float] = []
+    rotation_spy = AsyncMock()
+
+    async def fake_sleep(duration: float) -> None:
+        sleep_durations.append(duration)
+        raise asyncio.CancelledError()
+
+    with (
+        patch.object(h, '_run_watcher_rotation', rotation_spy),
+        patch('orchestrator.harness.asyncio.sleep', fake_sleep),
+        pytest.raises(asyncio.CancelledError),
+    ):
+        await h._watcher_supervisor_loop()
+    return rotation_spy, sleep_durations
+
+
 class TestWatcherSupervisorLoopEmptyQueueSkip:
     """_watcher_supervisor_loop skips the rotation launch when the L1 queue
     has no actionable work, and launches normally otherwise.
@@ -2830,19 +3951,8 @@ class TestWatcherSupervisorLoopEmptyQueueSkip:
         the loop sleeps watcher_empty_queue_poll_secs and re-checks.
         """
         h, _queue = _make_loop_harness_with_queue(tmp_path)
-        sleep_durations: list[float] = []
-        rotation_spy = AsyncMock()
-        h._run_watcher_rotation = rotation_spy  # type: ignore[method-assign]
 
-        async def fake_sleep(duration: float) -> None:
-            sleep_durations.append(duration)
-            raise asyncio.CancelledError()
-
-        with (
-            patch('orchestrator.harness.asyncio.sleep', fake_sleep),
-            pytest.raises(asyncio.CancelledError),
-        ):
-            await h._watcher_supervisor_loop()
+        rotation_spy, sleep_durations = await _run_one_drained_supervisor_iteration(h)
 
         rotation_spy.assert_not_called()
         assert sleep_durations == [h.config.watcher_empty_queue_poll_secs], (
@@ -2855,11 +3965,11 @@ class TestWatcherSupervisorLoopEmptyQueueSkip:
         """Empty L1 queue with a stale outage L2 open -> the skip path both
         skips the rotation launch AND resolves the outage L2.
 
-        Reaching the empty-queue skip branch proves the supervisor loop is
-        alive and the queue is readable (the precheck fails open on a
-        None/erroring queue), which is exactly the 'watcher is up again'
-        signal the outage L2 represents -- so a stale L2 must not linger as
-        a false alarm just because the L1 queue happens to be drained.
+        With no scheduler pause holding, reaching the empty-queue skip branch
+        evidences that the supervisor loop is alive and the queue is readable
+        (the precheck fails open on a None/erroring queue), so a stale L2
+        must not linger as a false alarm just because the L1 queue happens to
+        be drained. The resolution records DRAINED_QUEUE as that evidence.
         """
         h, queue = _make_loop_harness_with_queue(tmp_path)
 
@@ -2872,20 +3982,9 @@ class TestWatcherSupervisorLoopEmptyQueueSkip:
             if e.level == 2 and e.root_cause == h._WATCHER_OUTAGE_ROOT_CAUSE
         ]
         assert len(pending_before) == 1, 'Pre-condition: outage L2 must be filed before loop runs'
+        l2_id = pending_before[0].id
 
-        sleep_durations: list[float] = []
-        rotation_spy = AsyncMock()
-        h._run_watcher_rotation = rotation_spy  # type: ignore[method-assign]
-
-        async def fake_sleep(duration: float) -> None:
-            sleep_durations.append(duration)
-            raise asyncio.CancelledError()
-
-        with (
-            patch('orchestrator.harness.asyncio.sleep', fake_sleep),
-            pytest.raises(asyncio.CancelledError),
-        ):
-            await h._watcher_supervisor_loop()
+        rotation_spy, sleep_durations = await _run_one_drained_supervisor_iteration(h)
 
         rotation_spy.assert_not_called()
         assert sleep_durations == [h.config.watcher_empty_queue_poll_secs], (
@@ -2901,6 +4000,9 @@ class TestWatcherSupervisorLoopEmptyQueueSkip:
             f'Expected the stale outage L2 to be resolved on the empty-queue skip path; '
             f'still pending: {pending_after}'
         )
+        resolved = queue.get(l2_id)
+        assert resolved is not None
+        assert resolved.resolution == WatcherRecoveryEvidence.DRAINED_QUEUE
 
     @pytest.mark.asyncio
     async def test_launch_when_actionable_l1_present(self, tmp_path: Path) -> None:
@@ -2935,7 +4037,7 @@ class TestWatcherSupervisorLoopEmptyQueueSkip:
 
         with (
             patch('orchestrator.harness.asyncio.sleep', recording_sleep),
-            patch('orchestrator.harness.time.monotonic', side_effect=fake_monotonic),
+            _patch_monotonic_for_this_thread(fake_monotonic),
             pytest.raises(asyncio.CancelledError),
         ):
             await h._watcher_supervisor_loop()
@@ -2946,4 +4048,243 @@ class TestWatcherSupervisorLoopEmptyQueueSkip:
         assert sleep_durations == [h.config.watcher_subprocess_restart_backoff_secs], (
             f'Expected the healthy-clean restart-backoff sleep (proving the rotation '
             f'actually ran, not the empty-queue skip path); got {sleep_durations}'
+        )
+
+
+# ---------------------------------------------------------------------------
+# task 5315: no recovery evidence clears the outage L2 while a pause holds
+# ---------------------------------------------------------------------------
+
+def _pending_outage_l2_id(h: Harness, queue: EscalationQueue) -> str:
+    l2_id = queue.find_pending_l2_by_root_cause(h._WATCHER_OUTAGE_ROOT_CAUSE)
+    assert l2_id is not None, 'Pre-condition: an outage L2 must be pending'
+    return l2_id
+
+
+class TestWatcherOutageL2HeldOpenWhileSchedulerPaused:
+    """While the scheduler holds a pause, neither a drained precheck nor a
+    healthy rotation resolves the shared watcher-outage L2; after a resume
+    the next drained poll does.
+    """
+
+    @pytest.mark.asyncio
+    async def test_cost_ceiling_pause_with_drained_queue_keeps_outage_l2_open(
+        self, tmp_path: Path,
+    ) -> None:
+        """The real watcher cost trip, then a drained precheck, leaves the L2 open.
+
+        _enforce_cost_ceilings pauses with COST_CEILING and files both the
+        scheduler-pause L1 and the outage L2. Promoting that L1 into a cluster
+        drains the actionable queue, which is the state in which the precheck
+        used to mark the L2 'watcher recovered' while the hold still stood,
+        and _enforce_cost_ceilings' paused early return never re-files it.
+        """
+        h, queue = _make_loop_harness_with_queue(tmp_path)
+        h._run_store = None
+        h.event_store = None
+        cost_store = MagicMock()
+        cost_store.cost_totals_in_window = AsyncMock(
+            return_value=(0.0, h.config.watcher_daily_cost_ceiling_usd + 1.0),
+        )
+        h.cost_store = cost_store
+
+        await h._enforce_cost_ceilings()
+
+        pause_l1_ids = [e.id for e in queue.get_pending() if e.level == 1]
+        assert len(pause_l1_ids) == 1, f'Expected the one scheduler-pause L1; got {pause_l1_ids}'
+        _submit_sample_l2(queue, 'task-pause-cluster', members=pause_l1_ids)
+
+        assert h._watcher_has_actionable_l1() is False
+        assert h.scheduler.is_paused
+        assert h.scheduler.pause_class is PauseClass.COST_CEILING
+        l2_id = _pending_outage_l2_id(h, queue)
+
+        rotation_spy, sleep_durations = await _run_one_drained_supervisor_iteration(h)
+
+        rotation_spy.assert_not_called()
+        assert sleep_durations == [h.config.watcher_empty_queue_poll_secs]
+        held = queue.get(l2_id)
+        assert held is not None
+        assert held.status == 'pending'
+        assert held.resolution is None
+        assert h.scheduler.is_paused
+
+    @pytest.mark.asyncio
+    async def test_healthy_rotation_during_cost_ceiling_pause_keeps_outage_l2_open(
+        self, tmp_path: Path,
+    ) -> None:
+        """Rotations keep running during a cost-ceiling hold; a healthy one
+        must not mark the outage L2 recovered while the hold stands.
+        """
+        h, queue = _make_loop_harness_with_queue(tmp_path)
+        min_secs = 30.0
+        h.config = h.config.model_copy(update={'watcher_misconfigured_min_rotation_secs': min_secs})
+        h.scheduler.pause('cost_ceiling_watcher_exceeded', PauseClass.COST_CEILING)
+        h._file_watcher_outage_l2('cost_ceiling_watcher_exceeded')
+        _submit_sample_l1(queue)
+        l2_id = _pending_outage_l2_id(h, queue)
+
+        sleep_durations = await _run_supervisor_with_rotation_durations(h, [min_secs + 1.0])
+
+        assert sleep_durations == [h.config.watcher_subprocess_restart_backoff_secs], (
+            f'Expected the healthy-clean restart-backoff sleep (proving the rotation '
+            f'ran its full course); got {sleep_durations}'
+        )
+        held = queue.get(l2_id)
+        assert held is not None
+        assert held.status == 'pending'
+        assert held.resolution is None
+
+    @pytest.mark.parametrize('evidence', list(WatcherRecoveryEvidence))
+    @pytest.mark.parametrize(
+        'pause_class', [c for c in PauseClass if PAUSE_POLICY[c].may_halt],
+    )
+    def test_no_evidence_clears_outage_l2_under_any_pause(
+        self,
+        tmp_path: Path,
+        pause_class: PauseClass,
+        evidence: WatcherRecoveryEvidence,
+    ) -> None:
+        """The gate is uniform: any pause class blocks every evidence kind."""
+        h, queue = _make_harness_with_queue(tmp_path)
+        h.scheduler.pause('held', pause_class)
+        h._file_watcher_outage_l2('watcher_crashloop')
+        l2_id = _pending_outage_l2_id(h, queue)
+
+        h._resolve_watcher_outage_l2(evidence)
+
+        held = queue.get(l2_id)
+        assert held is not None
+        assert held.status == 'pending'
+        assert held.resolution is None
+
+    @pytest.mark.asyncio
+    async def test_drained_poll_after_resume_resolves_with_drained_evidence(
+        self, tmp_path: Path,
+    ) -> None:
+        """Once a human resumes, the next drained poll clears the held L2."""
+        h, queue = _make_loop_harness_with_queue(tmp_path)
+        h.scheduler.pause('cost_ceiling_watcher_exceeded', PauseClass.COST_CEILING)
+        h._file_watcher_outage_l2('cost_ceiling_watcher_exceeded')
+        l2_id = _pending_outage_l2_id(h, queue)
+        h.scheduler.resume()
+
+        rotation_spy, sleep_durations = await _run_one_drained_supervisor_iteration(h)
+
+        rotation_spy.assert_not_called()
+        assert sleep_durations == [h.config.watcher_empty_queue_poll_secs]
+        resolved = queue.get(l2_id)
+        assert resolved is not None
+        assert resolved.status == 'resolved'
+        assert resolved.resolution == WatcherRecoveryEvidence.DRAINED_QUEUE
+
+
+# ---------------------------------------------------------------------------
+# task 4559 step-17: the empty-queue precheck must not skip digest re-evaluation
+# ---------------------------------------------------------------------------
+
+class TestDigestRunsRegardlessOfEmptyQueuePrecheck:
+    """The digest check must run on EVERY supervisor iteration, not only after
+    a rotation.
+
+    Evidence (task 4559): zero digests fired in BOTH 2026 paused windows.  The
+    EWA breaker halts fleet-wide dispatch, the L1 queue then drains, the
+    empty-queue precheck starts returning False, and its ``continue``
+    (harness.py:12354) returns to the loop top — skipping the SOLE
+    ``_maybe_write_digest`` call site (harness.py:12382).  The EWA therefore
+    can never be re-evaluated while the fleet is paused, so the breaker can
+    never observe its own recovery: a dead end.  The task-2629 comment at
+    harness.py:12334 claims the bypass "does not touch ``_maybe_write_digest``"
+    — that claim is false today, and this suite is what makes it true.
+
+    RED today for the empty-queue case; the rotation case is a regression
+    guard so the hoist cannot silently drop the original call.
+    """
+
+    @pytest.mark.asyncio
+    async def test_digest_runs_even_when_l1_queue_is_empty(self, tmp_path: Path) -> None:
+        """Precheck returns False (drained queue) -> the digest STILL runs.
+
+        This is the paused-and-drained steady state of both outages: no
+        rotation launches, so under today's code the digest never runs and
+        the tripped EWA is frozen forever.
+        """
+        h, _queue = _make_loop_harness_with_queue(tmp_path)
+        h._watcher_has_actionable_l1 = lambda: False  # type: ignore[method-assign]
+
+        digest_spy = AsyncMock()
+        h._maybe_write_digest = digest_spy  # type: ignore[method-assign]
+
+        rotation_spy, sleep_durations = await _run_one_drained_supervisor_iteration(h)
+
+        rotation_spy.assert_not_called()
+        assert sleep_durations == [h.config.watcher_empty_queue_poll_secs], (
+            f'Expected the empty-queue bypass path (one sleep of '
+            f'watcher_empty_queue_poll_secs={h.config.watcher_empty_queue_poll_secs}); '
+            f'got {sleep_durations}'
+        )
+        assert digest_spy.await_count == 1, (
+            f'Expected _maybe_write_digest to be awaited exactly once on the '
+            f'empty-queue bypass iteration (otherwise a paused, drained fleet can '
+            f'never re-evaluate the EWA that paused it); await_count='
+            f'{digest_spy.await_count}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_digest_still_runs_on_the_rotation_path(self, tmp_path: Path) -> None:
+        """Precheck returns True -> the digest still runs exactly once per
+        iteration (regression guard: the hoist must MOVE the call site, not
+        drop it).
+        """
+        from shared.cli_invoke import AgentResult
+
+        h, queue = _make_loop_harness_with_queue(tmp_path)
+        _submit_sample_l1(queue)
+        min_secs = h.config.watcher_misconfigured_min_rotation_secs
+
+        digest_spy = AsyncMock()
+        h._maybe_write_digest = digest_spy  # type: ignore[method-assign]
+
+        # One full healthy-clean iteration; the loop is broken at the
+        # restart-backoff sleep so exactly one iteration body executes
+        # regardless of where in that body the digest call sits.
+        monotonic_sequence = iter(
+            _build_monotonic_timestamps([min_secs + 1.0], expect_cancelled=False)
+        )
+
+        def fake_monotonic() -> float:
+            return next(monotonic_sequence)
+
+        rotation_calls = 0
+
+        async def fake_rotation() -> AgentResult:
+            nonlocal rotation_calls
+            rotation_calls += 1
+            return AgentResult(success=True, output='', timed_out=False)
+
+        sleep_durations: list[float] = []
+
+        async def recording_sleep(duration: float) -> None:
+            sleep_durations.append(duration)
+            raise asyncio.CancelledError()
+
+        h._run_watcher_rotation = fake_rotation  # type: ignore[method-assign]
+
+        with (
+            patch('orchestrator.harness.asyncio.sleep', recording_sleep),
+            _patch_monotonic_for_this_thread(fake_monotonic),
+            pytest.raises(asyncio.CancelledError),
+        ):
+            await h._watcher_supervisor_loop()
+
+        assert rotation_calls == 1, (
+            f'Expected exactly one rotation on the actionable-L1 path; got {rotation_calls}'
+        )
+        assert sleep_durations == [h.config.watcher_subprocess_restart_backoff_secs], (
+            f'Expected the healthy-clean restart-backoff sleep (proving the rotation '
+            f'actually ran, not the empty-queue skip path); got {sleep_durations}'
+        )
+        assert digest_spy.await_count == 1, (
+            f'Expected _maybe_write_digest to be awaited exactly once per supervisor '
+            f'iteration on the rotation path; await_count={digest_spy.await_count}'
         )

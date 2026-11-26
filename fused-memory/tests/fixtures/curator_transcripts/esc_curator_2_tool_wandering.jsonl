@@ -1,0 +1,21 @@
+{"type": "queue-operation", "timestamp": "2026-07-14T14:35:14.659Z", "operation": "enqueue"}
+{"type": "queue-operation", "timestamp": "2026-07-14T14:35:14.660Z", "operation": "dequeue"}
+{"type": "attachment", "timestamp": "2026-07-14T14:35:10.945Z", "attachment": {"type": "hook_success"}}
+{"type": "user", "timestamp": "2026-07-14T14:35:14.717Z", "message": {"role": "user", "content": "redacted"}}
+{"type": "attachment", "timestamp": "2026-07-14T14:35:14.714Z", "attachment": {"type": "deferred_tools_delta"}}
+{"type": "attachment", "timestamp": "2026-07-14T14:35:14.714Z", "attachment": {"type": "skill_listing"}}
+{"type": "attachment", "timestamp": "2026-07-14T14:35:14.714Z", "attachment": {"type": "budget_usd"}}
+{"type": "last-prompt", "lastPrompt": "redacted"}
+{"type": "assistant", "timestamp": "2026-07-14T14:35:44.222Z", "message": {"role": "assistant", "model": "claude-sonnet-5", "stop_reason": "tool_use", "content": [{"type": "thinking", "thinking": "redacted", "signature": "redacted"}]}}
+{"type": "assistant", "timestamp": "2026-07-14T14:35:44.387Z", "message": {"role": "assistant", "model": "claude-sonnet-5", "stop_reason": "tool_use", "content": [{"type": "tool_use", "id": "toolu_fixture_01", "name": "ToolSearch", "input": {"query": "redacted", "max_results": 3}}]}}
+{"type": "user", "timestamp": "2026-07-14T14:35:47.574Z", "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_fixture_01", "content": [{"type": "tool_reference", "tool_name": "TaskGet"}]}]}}
+{"type": "attachment", "timestamp": "2026-07-14T14:35:47.579Z", "attachment": {"type": "budget_usd"}}
+{"type": "assistant", "timestamp": "2026-07-14T14:35:49.172Z", "message": {"role": "assistant", "model": "claude-sonnet-5", "stop_reason": "tool_use", "content": [{"type": "thinking", "thinking": "redacted", "signature": "redacted"}]}}
+{"type": "assistant", "timestamp": "2026-07-14T14:35:49.224Z", "message": {"role": "assistant", "model": "claude-sonnet-5", "stop_reason": "tool_use", "content": [{"type": "tool_use", "id": "toolu_fixture_02", "name": "TaskGet", "input": {"taskId": "redacted"}}]}}
+{"type": "user", "timestamp": "2026-07-14T14:36:19.261Z", "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_fixture_02", "content": "redacted"}]}}
+{"type": "attachment", "timestamp": "2026-07-14T14:36:19.269Z", "attachment": {"type": "budget_usd"}}
+{"type": "assistant", "timestamp": "2026-07-14T14:36:24.213Z", "message": {"role": "assistant", "model": "claude-sonnet-5", "stop_reason": "tool_use", "content": [{"type": "thinking", "thinking": "redacted", "signature": "redacted"}]}}
+{"type": "assistant", "timestamp": "2026-07-14T14:36:24.315Z", "message": {"role": "assistant", "model": "claude-sonnet-5", "stop_reason": "tool_use", "content": [{"type": "tool_use", "id": "toolu_fixture_03", "name": "ToolSearch", "input": {"query": "redacted", "max_results": 10}}]}}
+{"type": "user", "timestamp": "2026-07-14T14:36:32.350Z", "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_fixture_03", "content": [{"type": "tool_reference", "tool_name": "TaskCreate"}, {"type": "tool_reference", "tool_name": "TaskGet"}, {"type": "tool_reference", "tool_name": "TaskUpdate"}, {"type": "tool_reference", "tool_name": "TaskList"}, {"type": "tool_reference", "tool_name": "CronCreate"}, {"type": "tool_reference", "tool_name": "EnterWorktree"}, {"type": "tool_reference", "tool_name": "PushNotification"}, {"type": "tool_reference", "tool_name": "SendMessage"}]}]}}
+{"type": "attachment", "timestamp": "2026-07-14T14:36:32.354Z", "attachment": {"type": "budget_usd"}}
+{"type": "last-prompt", "lastPrompt": "redacted"}

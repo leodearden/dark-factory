@@ -7,36 +7,13 @@ import json
 
 import httpx
 import pytest
-
-
-def _mcp_response(inner: dict, request_id: int = 1) -> httpx.Response:
-    return httpx.Response(
-        200,
-        json={
-            'jsonrpc': '2.0',
-            'id': request_id,
-            'result': {
-                'content': [{'type': 'text', 'text': json.dumps(inner)}],
-            },
-        },
-        headers={'mcp-session-id': 'test-session-id'},
-    )
-
-
-def _init_response(request_id: int = 1) -> httpx.Response:
-    return httpx.Response(
-        200,
-        json={
-            'jsonrpc': '2.0',
-            'id': request_id,
-            'result': {
-                'protocolVersion': '2025-03-26',
-                'capabilities': {'tools': {}},
-                'serverInfo': {'name': 'test', 'version': '0.1'},
-            },
-        },
-        headers={'mcp-session-id': 'test-session-id'},
-    )
+from _dashboard_helpers import (
+    cold_session_responses,
+    mcp_init_response,
+    mcp_notify_response,
+    mcp_tool_response,
+)
+from shared.testing_virtual_clock import virtual_clock_test
 
 
 class _PerPortHandler:
@@ -45,6 +22,7 @@ class _PerPortHandler:
     ``responses`` maps port → halt-status dict to return on tools/call.
     ``fail_ports`` raise httpx.ConnectError.
     ``slow_ports`` sleep before responding (to drive the timeout path).
+    ``raise_ports`` maps port → an arbitrary exception INSTANCE to raise.
     """
 
     def __init__(
@@ -53,14 +31,18 @@ class _PerPortHandler:
         *,
         fail_ports: set[int] | None = None,
         slow_ports: dict[int, float] | None = None,
+        raise_ports: dict[int, BaseException] | None = None,
     ):
         self.responses = responses or {}
         self.fail_ports = fail_ports or set()
         self.slow_ports = slow_ports or {}
+        self.raise_ports = raise_ports or {}
 
     async def __call__(self, request: httpx.Request) -> httpx.Response:
         port = request.url.port
         assert port is not None
+        if port in self.raise_ports:
+            raise self.raise_ports[port]
         if port in self.fail_ports:
             raise httpx.ConnectError('refused')
         if port in self.slow_ports:
@@ -69,12 +51,12 @@ class _PerPortHandler:
         method = body.get('method', '')
         request_id = body.get('id', 1)
         if method == 'initialize':
-            return _init_response(request_id)
+            return mcp_init_response(request_id)
         if method.startswith('notifications/'):
-            return httpx.Response(202, headers={'mcp-session-id': 'test-session-id'})
+            return mcp_notify_response()
         # tools/call
         inner = self.responses.get(port, {'wired': False, 'halted': False})
-        return _mcp_response(inner, request_id)
+        return mcp_tool_response(inner, request_id)
 
 
 @pytest.fixture(autouse=True)
@@ -129,8 +111,16 @@ class TestGetMergeHaltStatus:
         assert result['proj8102']['halted'] is False
         assert 'error' in result['proj8102']
 
+    @virtual_clock_test
     async def test_timeout_yields_offline_entry(self):
+        """A project that does not answer inside per_call_timeout is offline,
+        while a sibling that did answer stays online.
+
+        A shared/src/shared/testing_virtual_clock.py::virtual_clock_test, so
+        host stalls cannot expire the deadline.
+        """
         from dashboard.data.merge_halt import get_merge_halt_status
+
         handler = _PerPortHandler(
             {8100: {'wired': True, 'halted': False}},
             slow_ports={8105: 0.5},
@@ -140,6 +130,7 @@ class TestGetMergeHaltStatus:
             result = await get_merge_halt_status(
                 client, _urls(8100, 8105), per_call_timeout=0.05,
             )
+
         assert result['proj8100']['offline'] is False
         assert result['proj8105']['offline'] is True
         assert 'error' in result['proj8105']
@@ -155,3 +146,94 @@ class TestGetMergeHaltStatus:
             result = await get_merge_halt_status(client, _urls(8100, 8102, 8105))
         # All projects must appear regardless of per-call failure.
         assert set(result) == {'proj8100', 'proj8102', 'proj8105'}
+
+
+def _server_error() -> httpx.HTTPStatusError:
+    request = httpx.Request('POST', 'http://127.0.0.1:8108/mcp')
+    response = httpx.Response(500, request=request)
+    return httpx.HTTPStatusError('server error', request=request, response=response)
+
+
+class TestProbeFailuresAreContained:
+    """No probe failure may escape _probe_one.
+
+    ``get_merge_halt_status`` gathers its probes with
+    ``return_exceptions=False``, and the ``/merge-queue`` handler in
+    ``dashboard/src/dashboard/api/merge_queue.py`` gathers
+    ``get_merge_halt_status`` the same way, so any exception escaping
+    ``_probe_one`` 500s ``/merge-queue`` instead of marking one project
+    offline.
+    """
+
+    @pytest.mark.parametrize(
+        'exc',
+        [
+            httpx.ConnectError('refused'),
+            httpx.ReadTimeout('no bytes'),
+            _server_error(),
+            TimeoutError('whole-operation deadline'),
+            ValueError('soft failure'),
+            OSError('network is unreachable'),
+        ],
+        ids=[
+            'connect_error',
+            'httpx_timeout',
+            'http_status_error',
+            'builtin_timeout',
+            'value_error',
+            'os_error',
+        ],
+    )
+    async def test_failure_marks_only_that_project_offline(self, exc):
+        """Listed explicitly, not derived from the site's catch tuple, so this
+        pins the behaviour independently of how that tuple is spelled."""
+        from dashboard.data.merge_halt import get_merge_halt_status
+        handler = _PerPortHandler(
+            {8100: {'wired': True, 'halted': False}},
+            raise_ports={8108: exc},
+        )
+        transport = httpx.MockTransport(handler)
+        async with httpx.AsyncClient(transport=transport) as client:
+            result = await get_merge_halt_status(client, _urls(8100, 8108))
+
+        assert result['proj8100']['offline'] is False
+        assert result['proj8108']['offline'] is True
+        assert result['proj8108']['wired'] is False
+        assert result['proj8108']['halted'] is False
+        assert 'error' in result['proj8108']
+
+
+class TestProbeOneTimeoutBudget:
+    """The probe's budget must reach client.post, not just the wait_for.
+
+    ``asyncio.wait_for`` bounds the operation as a whole, but the individual
+    posts underneath it were still issued with httpx's 10s default — which
+    also governs **pool acquisition**. Under a 2.0s probe budget that meant a
+    poll cycle could block on a connection slot for five times its own
+    deadline before wait_for finally cancelled it. This asserts the contract
+    only: budget in, same budget on every post. Nothing about sockets or
+    pool slots.
+
+    AsyncMock rather than MockTransport deliberately: MockTransport never
+    surfaces the ``timeout`` kwarg to its handler, so it cannot witness this.
+    """
+
+    async def test_budget_reaches_every_post(self):
+        from unittest.mock import AsyncMock
+
+        from dashboard.data.merge_halt import _probe_one
+
+        url = 'http://127.0.0.1:8100'
+        mock_client = AsyncMock()
+        mock_client.post.side_effect = cold_session_responses(
+            {'wired': True, 'halted': False}, url,
+        )
+
+        result = await _probe_one(mock_client, url, 5.0)
+
+        assert result['offline'] is False, f'probe should have succeeded: {result}'
+        timeouts = [c.kwargs['timeout'] for c in mock_client.post.call_args_list]
+        assert timeouts == [5.0, 5.0, 5.0], (
+            f'the probe budget must reach every post, not httpx\'s 10s '
+            f'default, got {timeouts}'
+        )

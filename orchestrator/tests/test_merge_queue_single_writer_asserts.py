@@ -3,8 +3,8 @@
 Covers:
   step-03 RED — module-level ``_DEBUG_ASSERTS`` flag and the
                 ``_assert_single_writer`` owner-task-identity guard, wired at
-                the lane-buffer mutation choke points (``_buffer_owned_request``'s
-                append, ``_pop_next_pickable``'s ``del buf[i]`` removal).
+                the lane-buffer mutation choke points (``buffer_owned_request``'s
+                append, ``pop_next_pickable``'s ``del buf[i]`` removal).
                 Exercises the full semantics matrix:
 
                   (1) flag OFF                              → always a no-op
@@ -15,7 +15,7 @@ Covers:
                                                                 drain tolerance)
                   (5) flag ON + owner task IS the caller      → no-op
 
-See ``_lane_buffers``' "Accessed only from the merger coroutine" docstring
+See the lane buffers' "Accessed only from the merger coroutine" comment in MergeIntake.__init__
 comment and ``_spawn_loop`` (stores ``self._merger_task``) for the
 single-writer discipline this enforces.
 
@@ -43,6 +43,12 @@ lane-buffer mutation call sites.
                 forced on, proving the steps 04/06 wiring never raises a
                 false-positive ``AssertionError`` against the production
                 coroutines.
+
+These real-git cases observe the lane through an injected ``VerifyPort``
+rather than a patch of ``run_scoped_verification``.  What that does and
+does NOT stub of the post-merge gate chain is stated once, with the
+measurement behind it, in
+``orchestrator/tests/_merge_lane_fakes.py::FakeVerifier``'s docstring.
 """
 
 from __future__ import annotations
@@ -51,19 +57,22 @@ import asyncio
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Literal, cast
-from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _git_fixtures import seed_repo
+from _live_merge_worker import REAL_GIT_MERGE_RESULT_TIMEOUT, running_merge_worker
+from _merge_lane_fakes import FakeVerifier, lane_scene_config
+from _orch_helpers import wait_responsive
 
-from orchestrator import merge_queue
 from orchestrator.config import GitConfig, OrchestratorConfig
-from orchestrator.git_ops import GitOps, _run
-from orchestrator.merge_queue import InflightEntry, MergeRequest, SpeculativeMergeWorker
-from orchestrator.merge_types import QueuedBranch
+from orchestrator.git_ops import GitOps
+from orchestrator.merge_lane import worker as merge_queue
+from orchestrator.merge_lane.types import QueuedBranch
+from orchestrator.merge_lane.worker import InflightEntry, MergeRequest, SpeculativeMergeWorker
 
 # ── Fixtures ──────────────────────────────────────────────────────────────
 #
-# _buffer_owned_request / _pop_next_pickable are pure in-memory lane-buffer
+# buffer_owned_request / pop_next_pickable are pure in-memory lane-buffer
 # operations that never touch the filesystem or shell out to git, so (unlike
 # the frozen-prefix / two-layer-invariant test files) no real git repo is
 # needed — a bare tmp_path stands in for project_root.
@@ -82,7 +91,7 @@ def git_config() -> GitConfig:
 
 @pytest.fixture
 def config(tmp_path, git_config: GitConfig) -> OrchestratorConfig:
-    return OrchestratorConfig(project_root=tmp_path, git=git_config)
+    return lane_scene_config(tmp_path, git_config)
 
 
 @pytest.fixture
@@ -97,26 +106,10 @@ def git_ops(git_config: GitConfig, tmp_path) -> GitOps:
 # to git, so they keep using the bare-tmp_path git_ops/config fixtures above.
 
 
-async def _setup_e2e_repo(repo: Path) -> None:
-    """Initialise a minimal real git repo with one initial commit on main.
-
-    Mirrors test_merge_queue.py's module-level ``_setup_repo``.
-    """
-    await _run(['git', 'init', '-b', 'main'], cwd=repo)
-    await _run(['git', 'config', 'user.email', 'test@test.com'], cwd=repo)
-    await _run(['git', 'config', 'user.name', 'Test'], cwd=repo)
-    (repo / 'README.md').write_text('# Test\n')
-    await _run(['git', 'add', '-A'], cwd=repo)
-    await _run(['git', 'commit', '-m', 'Initial commit'], cwd=repo)
-
-
 @pytest.fixture
 def e2e_git_repo(tmp_path: Path) -> Path:
     """Real initialised git repo for the step-07 end-to-end conformance test."""
-    repo = tmp_path / 'e2e-repo'
-    repo.mkdir()
-    asyncio.run(_setup_e2e_repo(repo))
-    return repo
+    return seed_repo(tmp_path / 'e2e-repo')
 
 
 @pytest.fixture
@@ -126,7 +119,7 @@ def e2e_git_ops(git_config: GitConfig, e2e_git_repo: Path) -> GitOps:
 
 @pytest.fixture
 def e2e_config(e2e_git_repo: Path, git_config: GitConfig) -> OrchestratorConfig:
-    return OrchestratorConfig(project_root=e2e_git_repo, git=git_config)
+    return lane_scene_config(e2e_git_repo, git_config)
 
 
 def _make_worker(git_ops: GitOps) -> SpeculativeMergeWorker:
@@ -135,8 +128,12 @@ def _make_worker(git_ops: GitOps) -> SpeculativeMergeWorker:
     Mirrors test_merge_queue_verify_base_invariant.py's helper of the same
     name. ``_merger_task``/``_verifier_task`` default to None (never-started
     loops) and ``_running`` defaults to True (see merge_queue.py ``__init__``).
+
+    ``escalation_queue`` is passed explicitly rather than defaulted: several
+    tests below drive a deliberately-unregistered sentinel request_id, and a
+    non-None queue would make the lifecycle alarm actually submit.
     """
-    return SpeculativeMergeWorker(git_ops, asyncio.Queue())
+    return SpeculativeMergeWorker(git_ops, asyncio.Queue(), escalation_queue=None)
 
 
 def _make_req(
@@ -224,8 +221,8 @@ class TestAssertSingleWriterLaneBufferWiring:
     """``_assert_single_writer`` at the merger-owned lane-buffer choke points (task 1999 I7).
 
     RED until step-04 GREEN adds the module flag, the helper, and wires it at
-    ``_buffer_owned_request``'s append and the ``del buf[i]`` removal inside
-    ``_pop_next_pickable``.
+    ``buffer_owned_request``'s append and the ``del buf[i]`` removal inside
+    ``pop_next_pickable``.
     """
 
     async def test_flag_off_is_noop_for_append_and_pop(
@@ -234,12 +231,11 @@ class TestAssertSingleWriterLaneBufferWiring:
         """(1) Flag OFF: a foreign merger task never raises — zero-overhead no-op."""
         monkeypatch.setattr(merge_queue, '_DEBUG_ASSERTS', False)
         worker = _make_worker(git_ops)
-        worker._running = True
         worker._merger_task = await _make_foreign_task()
 
         req = _make_req(config, tmp_path)
-        worker._buffer_owned_request(req)  # must not raise
-        popped = worker._pop_next_pickable()  # must not raise
+        worker._intake.buffer_owned_request(req)  # must not raise
+        popped = worker._intake.pop_next_pickable()  # must not raise
         assert popped is req
 
     async def test_flag_on_foreign_owner_raises_on_append(
@@ -248,31 +244,29 @@ class TestAssertSingleWriterLaneBufferWiring:
         """(2) Flag ON + running + foreign merger task: append raises, naming the structure."""
         monkeypatch.setattr(merge_queue, '_DEBUG_ASSERTS', True)
         worker = _make_worker(git_ops)
-        worker._running = True
         worker._merger_task = await _make_foreign_task()
 
         req = _make_req(config, tmp_path)
         with pytest.raises(AssertionError, match='_lane_buffers'):
-            worker._buffer_owned_request(req)
+            worker._intake.buffer_owned_request(req)
 
     async def test_flag_on_foreign_owner_raises_on_pop(
         self, git_ops: GitOps, config: OrchestratorConfig, tmp_path, monkeypatch,
     ) -> None:
         """(2) Flag ON + running + foreign merger task: pop raises, naming the structure.
 
-        Seeds the buffer directly (bypassing ``_buffer_owned_request``) so the
+        Seeds the buffer directly (bypassing ``buffer_owned_request``) so the
         append and pop choke points are exercised independently.
         """
         worker = _make_worker(git_ops)
         req = _make_req(config, tmp_path)
-        worker._lane_buffers['normal'].append(req)
+        worker._intake.buffer_owned_request(req)
 
         monkeypatch.setattr(merge_queue, '_DEBUG_ASSERTS', True)
-        worker._running = True
         worker._merger_task = await _make_foreign_task()
 
         with pytest.raises(AssertionError, match='_lane_buffers'):
-            worker._pop_next_pickable()
+            worker._intake.pop_next_pickable()
 
     async def test_flag_on_owner_task_none_is_noop(
         self, git_ops: GitOps, config: OrchestratorConfig, tmp_path, monkeypatch,
@@ -280,12 +274,11 @@ class TestAssertSingleWriterLaneBufferWiring:
         """(3) Flag ON but no owner task recorded yet: no-op (direct-call / unstarted-loop)."""
         monkeypatch.setattr(merge_queue, '_DEBUG_ASSERTS', True)
         worker = _make_worker(git_ops)
-        worker._running = True
         worker._merger_task = None
 
         req = _make_req(config, tmp_path)
-        worker._buffer_owned_request(req)  # must not raise
-        popped = worker._pop_next_pickable()  # must not raise
+        worker._intake.buffer_owned_request(req)  # must not raise
+        popped = worker._intake.pop_next_pickable()  # must not raise
         assert popped is req
 
     async def test_flag_on_not_running_is_noop(
@@ -298,8 +291,8 @@ class TestAssertSingleWriterLaneBufferWiring:
         worker._running = False
 
         req = _make_req(config, tmp_path)
-        worker._buffer_owned_request(req)  # must not raise
-        popped = worker._pop_next_pickable()  # must not raise
+        worker._intake.buffer_owned_request(req)  # must not raise
+        popped = worker._intake.pop_next_pickable()  # must not raise
         assert popped is req
 
     async def test_flag_on_owner_is_current_task_is_noop(
@@ -308,12 +301,11 @@ class TestAssertSingleWriterLaneBufferWiring:
         """(5) Flag ON + running + the CALLER is the recorded owner: no-op."""
         monkeypatch.setattr(merge_queue, '_DEBUG_ASSERTS', True)
         worker = _make_worker(git_ops)
-        worker._running = True
         worker._merger_task = asyncio.current_task()
 
         req = _make_req(config, tmp_path)
-        worker._buffer_owned_request(req)  # must not raise
-        popped = worker._pop_next_pickable()  # must not raise
+        worker._intake.buffer_owned_request(req)  # must not raise
+        popped = worker._intake.pop_next_pickable()  # must not raise
         assert popped is req
 
 
@@ -337,7 +329,6 @@ class TestAssertSingleWriterInflightWiring:
         """(1) Flag OFF: a foreign verifier task never raises — zero-overhead no-op."""
         monkeypatch.setattr(merge_queue, '_DEBUG_ASSERTS', False)
         worker = _make_worker(git_ops)
-        worker._running = True
         worker._verifier_task = await _make_foreign_task()
 
         entry = _sentinel_entry()
@@ -354,7 +345,6 @@ class TestAssertSingleWriterInflightWiring:
         """(2) Flag ON + running + foreign verifier task: append raises, naming the structure."""
         monkeypatch.setattr(merge_queue, '_DEBUG_ASSERTS', True)
         worker = _make_worker(git_ops)
-        worker._running = True
         worker._verifier_task = await _make_foreign_task()
 
         with pytest.raises(AssertionError, match='_inflight'):
@@ -372,7 +362,6 @@ class TestAssertSingleWriterInflightWiring:
         worker._inflight.append(_sentinel_entry())
 
         monkeypatch.setattr(merge_queue, '_DEBUG_ASSERTS', True)
-        worker._running = True
         worker._verifier_task = await _make_foreign_task()
 
         with pytest.raises(AssertionError, match='_inflight'):
@@ -386,7 +375,6 @@ class TestAssertSingleWriterInflightWiring:
         worker._inflight.append(_sentinel_entry())
 
         monkeypatch.setattr(merge_queue, '_DEBUG_ASSERTS', True)
-        worker._running = True
         worker._verifier_task = await _make_foreign_task()
 
         with pytest.raises(AssertionError, match='_inflight'):
@@ -398,7 +386,6 @@ class TestAssertSingleWriterInflightWiring:
         """(3) Flag ON but no owner task recorded yet: no-op (direct-call / unstarted-loop)."""
         monkeypatch.setattr(merge_queue, '_DEBUG_ASSERTS', True)
         worker = _make_worker(git_ops)
-        worker._running = True
         worker._verifier_task = None
 
         entry = _sentinel_entry()
@@ -429,7 +416,6 @@ class TestAssertSingleWriterInflightWiring:
         """(5) Flag ON + running + the CALLER is the recorded owner: no-op."""
         monkeypatch.setattr(merge_queue, '_DEBUG_ASSERTS', True)
         worker = _make_worker(git_ops)
-        worker._running = True
         worker._verifier_task = asyncio.current_task()
 
         entry = _sentinel_entry()
@@ -489,7 +475,6 @@ class TestSentinelEntryChokePointContract:
         actually submit.
         """
         worker = _make_worker(git_ops)
-        assert worker._escalation_queue is None
 
         entry = _sentinel_entry()
         worker._inflight_append(entry)  # must not raise
@@ -547,7 +532,7 @@ class TestDebugAssertsSuiteWideAndConformance:
         through a LIVE ``worker.run()`` (merger + verifier loops) to
         resolution — must complete cleanly with the debug asserts forced ON,
         proving the production merger/verifier coroutines only ever mutate
-        ``_lane_buffers``/``_inflight`` from their own recorded owner task
+        the lane buffers/``_inflight`` from their own recorded owner task
         (``self._merger_task`` / ``self._verifier_task``) — i.e. the steps
         04/06 wiring produces no false-positive ``AssertionError`` under a
         real run.
@@ -599,26 +584,27 @@ class TestDebugAssertsSuiteWideAndConformance:
         )
 
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
-        worker = SpeculativeMergeWorker(e2e_git_ops, queue)
-        worker_task = asyncio.create_task(worker.run())
+        worker = SpeculativeMergeWorker(e2e_git_ops, queue, verifier=FakeVerifier())
 
-        with patch(
-            'orchestrator.merge_queue.run_scoped_verification',
-            AsyncMock(return_value=MagicMock(passed=True, summary='')),
-        ):
-            req_n = _make_e2e_request('sw-e2e-n', 'sw-e2e-n', wt_n, e2e_config)
-            req_n1 = _make_e2e_request('sw-e2e-n1', 'sw-e2e-n1', wt_n1, e2e_config)
+        req_n = _make_e2e_request('sw-e2e-n', 'sw-e2e-n', wt_n, e2e_config)
+        req_n1 = _make_e2e_request('sw-e2e-n1', 'sw-e2e-n1', wt_n1, e2e_config)
 
+        async with running_merge_worker(worker):
             # Submit both before the worker processes them, matching
             # test_speculative_basic_throughput's real-pipeline shape.
             await queue.put(req_n)
             await queue.put(req_n1)
 
-            outcome_n = await asyncio.wait_for(req_n.result, timeout=60)
-            outcome_n1 = await asyncio.wait_for(req_n1.result, timeout=60)
+            outcome_n = await wait_responsive(
+                req_n.result,
+                timeout=REAL_GIT_MERGE_RESULT_TIMEOUT,
+                label='sw-e2e-n (N) merge outcome, debug asserts ON',
+            )
+            outcome_n1 = await wait_responsive(
+                req_n1.result,
+                timeout=REAL_GIT_MERGE_RESULT_TIMEOUT,
+                label='sw-e2e-n1 (N+1) merge outcome, debug asserts ON',
+            )
 
-        assert outcome_n.status == 'done', f'N failed: {outcome_n}'
-        assert outcome_n1.status == 'done', f'N+1 failed: {outcome_n1}'
-
-        await worker.stop()
-        await worker_task
+            assert outcome_n.status == 'done', f'N failed: {outcome_n}'
+            assert outcome_n1.status == 'done', f'N+1 failed: {outcome_n1}'

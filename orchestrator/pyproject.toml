@@ -12,7 +12,17 @@ description = "Agent orchestration system — decomposes PRDs into concurrent TD
 requires-python = ">=3.11,<4"
 dependencies = [
     "click>=8.0",
-    "fastmcp>=2.0",
+    # >=3.2, raised from >=2.0 by task 3690: orchestrator/mcp/verdict_tools.py
+    # now registers shared.mcp_markup_middleware.MarkupGuardMiddleware, and
+    # that module imports `fastmcp.tools.base` (a path that exists only after
+    # tool.py was renamed to base.py) and `fastmcp.server.middleware.Middleware`
+    # (absent before 2.9). Under the old >=2.0 floor a fresh resolve could hand
+    # this package a 2.x where `import shared.mcp_markup_middleware` fails
+    # OUTRIGHT rather than degrading. 3.2.2 is the version every substrate fact
+    # in that module was measured against and what uv.lock already resolves.
+    # Mirrors shared/pyproject.toml, which carries the same floor for the same
+    # reason.
+    "fastmcp>=3.2",
     "httpx>=0.27",
     "pydantic>=2.7",
     "pydantic-settings>=2.0",
@@ -29,10 +39,41 @@ dark-factory-shared = { workspace = true }
 orchestrator = "orchestrator.cli:main"
 
 [tool.pyright]
-include = ["src", "tests"]
-extraPaths = ["src", "tests", "../shared/src", "../escalation/src", "../fused-memory/src"]
+include = ["src", "tests", "scripts"]
+# ".." LAST (mirrors tests/conftest.py's sys.path.append): resolves the repo-root
+# df_pytest_isolation module without letting project dirs shadow their own src/.
+#
+# "../scripts" — task 3931 / esc-3805-1 (2026-08-09), esc-3805-6 (2026-08-12),
+# break-glass hotfix 27ac22a6a6. The root pyproject.toml's own extraPaths lists
+# `scripts`, so ROOT-scoped pyright resolves tests/test_run_vllm_eval.py's
+# `import run_vllm_eval` and EvalSummary/PodHandle become real types; without
+# this entry PACKAGE-scoped pyright leaves that import unresolved, everything
+# degrades to Unknown, and the defects go unreported HERE while the root-scoped
+# verify gate reports them. MEASURED at pyright 1.1.408 with the hotfix
+# reverse-applied: `npx pyright orchestrator/tests/test_run_vllm_eval.py` from
+# the worktree ROOT -> 14 reportArgumentType errors (first at :1827);
+# `cd orchestrator && npx pyright tests/test_run_vllm_eval.py` -> 0 errors.
+# verify's FILE_SCOPED fallback runs pyright root-scoped while pre-commit
+# (hooks/project-checks) and the fleet chain run it package-scoped, so this
+# entry is what keeps the two gates in agreement. DO NOT REMOVE — pinned by
+# tests/test_run_vllm_eval.py::TestPyrightScopeParity and by
+# tests/scripts/test_fallback_verify_config.py's chain-independent
+# generalisation. It only widens IMPORT RESOLUTION: the REPO-ROOT ../scripts is
+# absent from `include` above, so its files are not themselves type-checked here.
+# "tests/cross_suite_helpers": test helpers shared with tests/scripts (task 8507),
+# ahead of "tests" as tests/conftest.py's sys.path puts it.
+extraPaths = ["src", "tests/cross_suite_helpers", "tests", "../scripts", "../shared/src", "../escalation/src", "../fused-memory/src", ".."]
 pythonVersion = "3.11"
 typeCheckingMode = "basic"
+# Task 3367 / esc-3359-1: pins pyright's interpreter to THIS worktree's own
+# .venv (venvPath is resolved relative to this file's directory, so it can
+# never name another tree's environment). Without it, `cd orchestrator && npx
+# pyright` resolves the interpreter from ambient VIRTUAL_ENV/PATH — which
+# verify._target_subprocess_env deliberately strips — so a cold merge worktree
+# type-checks against an env holding none of the workspace's third-party
+# packages: measured 496 phantom reportMissingImports here, 0 with this pin.
+venvPath = ".."
+venv = ".venv"
 
 [tool.ruff]
 line-length = 100
@@ -40,10 +81,22 @@ line-length = 100
 [tool.ruff.lint]
 select = ["E", "F", "UP", "B", "SIM", "I"]
 ignore = ["E501"]
+extend-select = ["TID251"]
+
+[tool.ruff.lint.flake8-tidy-imports.banned-api]
+"asyncio.get_event_loop".msg = "Raises 'no current event loop' once asyncio.run() has cleared it (task 1711): use asyncio.get_running_loop() in an async body or helper, asyncio.run(coro) in a sync driver, or make_placeholder_future() from orchestrator/tests/_orch_helpers.py for a sync test's placeholder future."
+"asyncio.events.get_event_loop".msg = "Raises 'no current event loop' once asyncio.run() has cleared it (task 1711): use asyncio.get_running_loop() in an async body or helper, asyncio.run(coro) in a sync driver, or make_placeholder_future() from orchestrator/tests/_orch_helpers.py for a sync test's placeholder future."
 
 [tool.ruff.lint.per-file-ignores]
 "tests/**/*.py" = ["F811"]
+# src/ still calls asyncio.get_event_loop(), outside the retired AST guard's tests-only scope.
+# Its owner is recorded in shared/tests/test_shared_governed_lists.py::RUFF_CONFIG_SUPPRESSIONS.
+"src/**/*.py" = ["TID251"]
 
+# NOT an enforced gate — style config only: it shapes an ad-hoc or editor-on-save
+# `ruff format` into a repo-consistent single-quoted diff. Do not delete as unused,
+# do not promote to a gate. Why, and the measurements: CONTRIBUTING.md section 3;
+# both directions guarded by tests/scripts/test_ruff_format_policy.py (task 3441).
 [tool.ruff.format]
 quote-style = "single"
 indent-style = "space"
@@ -77,42 +130,364 @@ filterwarnings = [
     # Sync def collected inside an @pytest.mark.asyncio class: mark mismatch.
     # Pins: pytest_asyncio/plugin.py (message emitted at the collection phase).
     "error:The test .* is marked with '@pytest.mark.asyncio' but it is not an async function:pytest.PytestWarning",
+    # A test's background thread died with an unhandled exception.
+    #
+    # GUARDS: the task-2413 autouse aiosqlite reaper
+    # (tests/conftest.py::_reap_leaked_aiosqlite_connections) and its
+    # task-2780 siblings (_reap_leaked_merge_workers,
+    # _reap_leaked_claimant_heartbeats). A leaked aiosqlite Connection runs a
+    # background worker thread; once its per-test event loop closes, the
+    # thread's next `future.get_loop().call_soon_threadsafe(...)` raises
+    # RuntimeError: Event loop is closed, and pytest's threadexception plugin
+    # attributes it to whatever UNRELATED test is running when the thread
+    # fires (under -n auto on an oversubscribed host, reliably an innocent one).
+    #
+    # WHY AN ERROR, NOT A WARNING: reap_leaked_aiosqlite_connections()'s
+    # MAINTENANCE NOTE documents that the helper degrades to a silent no-op
+    # (returns 0) if aiosqlite renames `_running` / `_thread` /
+    # `core._connection_worker_thread`. In that degraded state the leak still
+    # happens — but as a warning nobody reads, so the suite stays green and
+    # the regression is invisible. This entry is what makes the degradation
+    # loud. Task 4075.
+    #
+    # ANCHOR: category only, empty message field — deliberately unlike the two
+    # coroutine entries above, which anchor on a message verb. The
+    # thread-exception message is a formatted traceback
+    # ("Exception in thread <name>" + traceback.format_exception(...) + a
+    # tracemalloc hint), so the only stable prefix is the thread name — useless
+    # as a discriminator and brittle across versions. This is also the exact
+    # spelling already shipped at shared/tests/test_async_sqlite_base.py:596,
+    # keeping the repo's only two promotions of this category identical.
+    #
+    # MECHANISM (pytest 9.0.3 — revisit on a pytest major upgrade):
+    # _pytest/threadexception.py::collect_thread_exception emits via
+    # warnings.warn(...) inside a `try/except
+    # PytestUnhandledThreadExceptionWarning` and re-raises out of the trylast
+    # pytest_runtest_setup/call/teardown hooks, so an ini filter alone is
+    # sufficient — no -W flag and no plugin change needed.
+    #
+    # MEASURED: full orchestrator suite green with this promotion active —
+    # 16223 passed, 1 skipped, 2 xfailed in 872.57s under
+    # `-n auto --dist loadgroup --max-worker-restart=0 -m 'not warm_lane_bash'`.
+    # No pre-existing thread exceptions from any other source.
+    #
+    # NOT MIRRORED into the repo-root pyproject.toml (deliberate): that file's
+    # mirroring rule at its lines 50-56 is about MARKER deselection, whose
+    # failure mode is that deselected tests silently RUN. Mirroring here would
+    # instead impose an unmeasured promotion on shared/, fused-memory/,
+    # dashboard/ and sampler/. Consequence: a root-bound run does not promote,
+    # and the three guards in tests/test_aiosqlite_leak_isolation.py skip there
+    # by design (naming the governing inifile) rather than false-failing.
+    "error::pytest.PytestUnhandledThreadExceptionWarning",
 ]
 # Default per-test timeout — see shared/pyproject.toml for the full rationale
-# (UsageGate mock hang, make_gate_mock, asyncio-sleep footguns).
-# Slow tests opt out with @pytest.mark.timeout(N).
-# timeout_method: signal mode was paired with serial execution; once xdist
-# was enabled here (matching fused-memory/pyproject.toml) the worker
-# subprocesses run pytest in a thread, so signal-based interruption is no
-# longer reliable inside the worker — switch to thread mode like fused-memory.
-timeout = 60
-timeout_method = "thread"
+# (UsageGate mock hang, make_gate_mock, asyncio-sleep footguns, and why this
+# is large rather than the original 60: the cap is WALL-CLOCK, so a healthy test
+# starved of CPU on a loaded 32-core host trips it; under signal it reds
+# itself, where thread mode plus --max-worker-restart=0 used to red a SHIFTING
+# VICTIM). 420 is DERIVED FROM MEASUREMENT — worst unmarked per-test wall clock
+# under real fleet load x the 8x headroom factor — and no longer judgement-picked;
+# the measurement and the value's history are in
+# plans/pytest-per-test-timeout-measurement-2026-09-17.md.
+# Slow tests opt out with @pytest.mark.timeout(N) — but N is NOT free, and
+# that line used to imply it was. A marker OVERRIDES the budget in BOTH
+# directions rather than raising a floor under it, so any N below the
+# --timeout=300 verify passes silently TIGHTENS the run that gates your merge.
+# NOTE that CLI budget is now TIGHTER than this ini default rather than equal to
+# it: task 5442 raised the ini 300 -> 540 and deliberately left every verify
+# test_command's --timeout=300 alone, that knob being yaml rather than pyproject.
+# The band below is stated against the CLI budget, which is the one that
+# actually governs a merge-gating run.
+# That inversion cost tasks 4176, 4384 and 4405. Write either N <= 60 (a
+# DELIBERATE tight bound, for a test asserting something happens FAST) or
+# @pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT) from tests/_orch_helpers.py.
+# The SINGLE home of this rationale, including why the marker beats this
+# setting, is shared/src/shared/testing_timeout_markers.py. Enforced by
+# tests/test_timeout_marker_inversion_guard.py.
+# timeout_method: signal, decided on measurement by task 6354. The trade and
+# its measurement live in tests/scripts/test_timeout_method_policy.py.
+# UNCHANGED by every change of the value, deliberately: a raise attacks the
+# trigger, not the two safety mechanisms.
+# MIRRORED by tests/_orch_helpers.py::PYPROJECT_DEFAULT_TIMEOUT, which
+# test_whole_tree_scan_timeout_guard.py::TestTimeoutConstants asserts against
+# this value with tomllib at runtime — edit the two together.
+timeout = 420
+timeout_method = "signal"
+# A test still running after this many seconds dumps every thread's stack to
+# the worker's stderr, which the verify log carries. Kept under verify's CLI
+# --timeout=300 so the dump lands before the cap fails an unmarked test. It is
+# the ONLY witness for a main thread stuck in a C call, which signal cannot
+# interrupt. Why stderr, and why below the cap:
+# test_whole_tree_scan_timeout_guard.py::TestTimeoutConstants, which pins it.
+faulthandler_timeout = 240
 # Parallelise the 2183-test orchestrator suite. ``-n auto`` picks worker
 # count from CPUs; ``--dist loadgroup`` keeps tests tagged with the same
 # xdist_group on a single worker (see test_cargo_scope.py /
 # test_stale_escalation_cleanup.py for the unsafe-to-share fixtures).
-# ``--max-worker-restart=0`` is the resilience net (task 1907): if any test
-# ever exceeds the 60s timeout, pytest-timeout's thread method os._exit()s the
-# xdist worker. With restarts allowed, xdist spawns a replacement node that
-# re-collects the full suite and re-dies → restart/re-collect/re-die loop that
-# hangs the whole suite at ~98%. Disabling restarts degrades a worker death to
-# a single clean per-test failure instead of a suite-wide hang.
-addopts = "-n auto --dist loadgroup --max-worker-restart=0"
+# ``--max-worker-restart=0`` (task 1907) is kept under signal for the worker
+# deaths a timeout no longer causes (segfault, OOM kill, os._exit in code under
+# test): with restarts allowed, each replacement re-collects the full suite,
+# and two concurrent replacements can abort the session unattributed. The
+# reason, and the pin: tests/scripts/test_xdist_worker_restart_policy.py.
+# ``-m 'not warm_lane_bash'`` deselects the ported warm-lane bash bucket from
+# the default suite — PRD §11 q4 RE-DECIDED (task 3349, 2026-08-01): the
+# documented escape is taken and the bucket now runs post-merge on
+# ``git.offline_lane_commands`` (the ``warm-lane-bash`` entry in
+# dark-factory-orchestrator.yaml). Measured 289.58s serialised onto one xdist
+# worker at loadavg 128.72 on 32 cores — 6.2x the README's 47s module baseline,
+# and fully additive to the verify critical path since ``xdist_group`` pins all
+# 12 items to a single worker. Deselecting HERE rather than in
+# orchestrator.yaml's test_command follows the shipped ``integration``
+# precedent (shared/pyproject.toml, fused-memory/pyproject.toml): test_command
+# is a bare directory-arg pytest with no ``-m`` of its own, so this one edit
+# point covers merge-verify AND a bare local ``pytest`` with no risk of the two
+# spellings drifting apart. COUPLED to the lane entry — see the marker note
+# below and test_warm_lane_bash_bucket_placement.py.
+addopts = "-n auto --dist loadgroup --max-worker-restart=0 -m 'not warm_lane_bash'"
+# Every marker APPLIED under orchestrator/tests/ must appear in this list, or
+# be registered via `config.addinivalue_line('markers', ...)` in
+# tests/conftest.py (e.g. real_psi_reader) — pinned by
+# tests/test_marker_registration_drift.py (task 3532), so a typo'd marker
+# collects clean and passes forever instead of failing loudly.
+# `--strict-markers` was evaluated and deliberately NOT added to addopts:
+# MEASURED on pytest 9.0.3, the flag is INERT there — a typo'd marker still
+# collects clean and passes (exit 0) even though
+# `config.option.strict_markers` reads True — and only enforces when passed
+# on the command line. Adding it here would be enforcement in appearance
+# only; see test_marker_registration_drift.py's module docstring for the
+# full measurement.
 markers = [
     "exercise_dry_run_unblock: allow workflow._mark_blocked to spawn the real run_dry_run_unblock hook (fire-and-forget Claude CLI). Default: autouse no-op installed in conftest.py.",
     "mocks_dry_run_unblock: opt the class into an AsyncMock(return_value=None) patch of orchestrator.workflow.run_dry_run_unblock so BLOCKED-driving e2e tests do not invoke the real fire-and-forget hook. Default in test_workflow_e2e.py: a fail-fast stub that records calls and asserts in teardown.",
     "guard_self_test: marks a test class as a self-test of _dry_run_unblock_e2e_guard; suppresses the fixture's teardown assertion so deliberate stub invocations inside pytest.raises do not produce a false-positive failure.",
-    "exercise_merge_verify: opt a test OUT of the autouse `_mock_merge_queue_verification` patch so its post-merge verify gate runs the REAL orchestrator.merge_queue.run_scoped_verification (e.g. cargo) instead of the passed=True stub. Default: autouse mock installed in conftest.py.",
+    "exercise_merge_verify: opt a test OUT of the autouse `_mock_merge_queue_verification` patch so its post-merge verify gate runs the REAL orchestrator.merge_lane.worker.run_scoped_verification (e.g. cargo) instead of the passed=True stub. Default: autouse mock installed in conftest.py.",
+    "exit_contract_violation_expected: opt a test OUT of the autouse `_no_unexpected_exit_contract_violation` guard, for a test that DELIBERATELY drives a run()-exit contract violation (spec docs/task-escalation-state-spec.md §5; the WHY is orchestrator/src/orchestrator/exit_contract.py). Never a fix for an unexpected violation: that is a producer or test-double bug (task 3542).",
+    "spawns_agent_cli: opt a test OUT of the autouse `_forbid_agent_cli_spawn` guard (tests/_agent_cli_guard.py, task 4701) because it DELIBERATELY spawns an agent-CLI process (any binary in tests/_agent_cli_guard.py::AGENT_CLI_BINARIES), e.g. a fake `claude` script on PATH. Never a fix for a guard failure caused by a stale invoke_agent patch target: repoint that patch at the consuming module's import site instead.",
     "real_verify_admission: opt a test OUT of the autouse `_neutralize_verify_admission` patch so it exercises the REAL orchestrator.verify admission wiring (nice-prefix wrap + shared.verify_admission.acquire_task_slot) instead of the force-inactive stub. Default: autouse neutralize installed in conftest.py (task 2390).",
-    "warm_lane_bash: marks the pytest items in test_warm_lane_bash_suite.py that shell out to the ported warm-lane bash tests under tests/warm-lane/ (task 3073, PRD leaf α2). Registered for ON-DEMAND selection/deselection only (`-m warm_lane_bash` / `-m 'not warm_lane_bash'`); deliberately NOT deselected in addopts, because PRD leaf γ changes warm-lane-gc.sh's core predicate and needs this coverage actually running on its verify leg, and leaf κ deletes reify's originals on the strength of this suite being green. See orchestrator/tests/warm-lane/README.md.",
+    "warm_lane_bash: marks the pytest items in test_warm_lane_bash_suite.py that shell out to the ported warm-lane bash tests under tests/warm-lane/ (task 3073, PRD leaf α2). DESELECTED from the default suite in addopts and re-selected post-merge by the `warm-lane-bash` LaneCommand in dark-factory-orchestrator.yaml — PRD §11 q4 re-decided (task 3349, 2026-08-01) to take the escape the PRD itself documented. Two grounds: leaf γ (task 3075) has LANDED with this coverage green on its verify leg, consuming half the original justification; and the surviving cost ground inverted — measured 289.58s at loadavg 128.72 on 32 cores, 6.2x the README's 47s module baseline. Still selectable on demand with `-m warm_lane_bash`, which is exactly how the lane re-selects it (a CLI -m overrides the addopts -m, last wins). PRD leaves δ/δ2/ε, which still change warm-lane behaviour, must run `-m warm_lane_bash` explicitly on their own verify legs. The addopts deselection and the lane entry are COUPLED and never move independently — pinned by test_warm_lane_bash_bucket_placement.py. See orchestrator/tests/warm-lane/README.md.",
+    "slow: marks heavyweight tests that shell out to real subprocesses (uv run pytest, plan-tools MCP servers) rather than mocking them, so they run materially slower than the rest of the suite. Call sites: test_verify_plan_integration.py::test_scoped_pytest_producer_and_runner_agree_on_scope (one real `uv run ... pytest` subprocess), test_merge_history_leg_runner.py::test_a_passing_leg_passes_without_the_per_test_ids_a_bare_run_collects (two) and test_plan_tools_startup_load.py::test_concurrent_startup_no_hang (six real subprocesses). Deselect with -m 'not slow and not warm_lane_bash' — NOT a bare -m 'not slow': pytest's -m is single-value, so a CLI -m overrides addopts' `-m 'not warm_lane_bash'` entirely (last wins, per the warm_lane_bash note above), and a bare 'not slow' would silently RE-SELECT that already-deselected 12-item bucket instead of speeding the run up. Unlike warm_lane_bash this marker is NOT deselected by addopts by default — registering it here only stops it being silently accepted as an unknown/typo-able marker name (task 3506).",
+    "reads_git_history: the test reads the checkout's git history (log, merge-base, rev-list, describe), so a byte-identical tree under a new parent can verify differently; re-run alone on the merge gate's same-tree path by merge_gate_history_test_command. Not deselected by default.",
+    "defect(ref): this test reproduces the declared defect <ref>; the binding is read statically by shared/src/shared/defect_enumerator.py (plans/defect-tests-prd.md decision 8). Not deselected by default.",
+    "criterion(id): this test evidences acceptance criterion <id> (plans/client-feed-prd.md §7.7). Not deselected by default.",
+    "timing(reason): a deadline, grace period or timeout is the behaviour under test, named by reason=; the timing-dependence lint (fused-memory/scripts/_timing_dependence.py) accepts a real sleep, an elapsed-vs-literal assert or a literal wait deadline only under it. Not deselected by default.",
 ]
 
 [dependency-groups]
 dev = [
+    # complexipy — the cognitive-complexity engine behind
+    # scripts/merge_lane_metrics.py and the merge-lane ratchet
+    # (tests/test_merge_lane_ratchet.py). PRD plans/merge-lane-quality-prd.md
+    # task α. BOTH bounds are load-bearing and were MEASURED in this worktree
+    # on 2026-09-03 against src/orchestrator/merge_queue.py (21,550 lines):
+    #
+    #   version | wall clock | file total | _verifier_loop
+    #   3.0.0   |     4.63s  |      2031  |  186
+    #   4.0.0   |     4.31s  |      2124  |  188
+    #   5.0.0   |     4.81s  |      2092  |  192
+    #   6.0.0   |     5.18s  |      2133  |  245
+    #   6.2.0   |     4.75s  |      2133  |  245
+    #   7.0.1   |   247.00s  |      2133  |  245
+    #
+    # The FLOOR (>=6.2) is correctness: 3/4/5 compute DIFFERENT numbers, so an
+    # older resolve would silently rewrite every baseline figure and turn the
+    # ratchet into noise. 6.x and 7.0.1 agree, and reproduce exactly the
+    # figures the PRD Background table quotes; 6.2.0 is the newest 6.x and the
+    # one every committed baseline number was measured with.
+    #
+    # The CEILING (<7) is not hygiene — it is what keeps the instrument from
+    # becoming a timeout landmine. 7.0.1's cost grows roughly cubically
+    # in file size (2,800 lines = 0.31s; 21,550 lines = 247s), so the whole
+    # 22-path cluster costs ~330s+ at 7.0.1 against 9.52s at 6.2.0, unloaded.
+    # Under verify load multiply that by the tree-scan family's measured ~4.8x
+    # inflation (the MEASURED history at
+    # shared/src/shared/whole_tree_guard_family.py::WHOLE_TREE_SCAN_TEST_TIMEOUT),
+    # which puts 7.x past the ceiling. The ratchet carries
+    # @pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT); exceeding it fails the
+    # ratchet test, and only once complexipy's Rust call returns, because
+    # signal cannot interrupt it sooner (see
+    # shared/src/shared/whole_tree_guard_family.py::WHOLE_TREE_SCAN_TEST_TIMEOUT).
+    # Do not relax to >=6 or drop the <7 ceiling without re-measuring.
+    "complexipy>=6.2,<7",
+    # lizard — per-function cyclomatic complexity for Cargo projects, read by
+    # its one consumer scripts/rust_metrics_snapshot.py (run as
+    # `python -m lizard`, its version recorded in the snapshot's params).
+    "lizard>=1.26,<1.27",
+    # mutmut — the mutation-score baseline of task 5035 ([tool.mutmut] below).
+    # <3.8 because 3.8.0 requires click>=8.4.2 and uv.lock pins click 8.3.2.
+    "mutmut>=3.7,<3.8",
     "pyright>=1.1.404",
     "pytest>=8.0.0",
     "pytest-asyncio>=0.21.0",
     "pytest-timeout>=2.4.0",
-    "pytest-xdist>=3.0",
+    "pytest-xdist>=3.6.0",
+    # radon — used ONLY for the reported-not-ratcheted maintainability-index
+    # column of scripts/merge_lane_metrics.py --report (radon.metrics.mi_visit;
+    # measured 0.00 for both merge_queue.py and git_ops.py, reproducing the
+    # PRD's "Maintainability index (radon) | 0" row). It is genuinely exercised
+    # by metrics.maintainability_index() — NOT dead, do not delete as unused.
+    "radon>=6.0,<7",
     "ruff>=0.7.1",
+]
+
+# mutmut: the merge lane's mutation-score baseline (tasks 5035, 6374), run from
+# this directory. The procedure and results are in
+# plans/merge-lane-quality-prd.mutation-baseline.md. merge_lane/worker.py is
+# deliberately not mutated; task 6327 owns it.
+[tool.mutmut]
+source_paths = ["src/"]
+only_mutate = [
+    "src/orchestrator/merge_lane/gates.py",
+    "src/orchestrator/merge_lane/types.py",
+]
+# Logger calls are not mutated (PRD Open question 4, Leo 2026-10-05). mutmut
+# skips any expression that starts on a matching line, multi-line calls
+# included; the anchor keeps lines that merely mention `logger.` mutable.
+do_not_mutate_patterns = ['^\s*logger\.(debug|info|warning|error|exception|critical)\(']
+# mutmut maps tests to the functions they reach in-process, so xdist is off.
+pytest_add_cli_args = ["-n", "0", "-p", "no:cacheprovider"]
+# The lane-importing test files (scripts/merge_lane_cluster.py::
+# imports_lane_module) that execute at least one function of gates.py or
+# types.py: a snapshot, re-derived as the baseline report's Method describes.
+pytest_add_cli_args_test_selection = [
+    "tests/test_atomic_train_merge.py",
+    "tests/test_block_disposition.py",
+    "tests/test_cli_verify_merge.py",
+    "tests/test_coalesce_integration_gate.py",
+    "tests/test_concurrent_verify_boundary.py",
+    "tests/test_config_disjoint_skip_reload.py",
+    "tests/test_config_reload_integration_gate.py",
+    "tests/test_convert_to_blocked.py",
+    "tests/test_crash_recovery.py",
+    "tests/test_critical_gate.py",
+    "tests/test_halt_owner.py",
+    "tests/test_harness.py",
+    "tests/test_harness_already_landed_gate_wiring.py",
+    "tests/test_harness_claimant_clear.py",
+    "tests/test_harness_infra_resume_truthful.py",
+    "tests/test_harness_interactive_reaper.py",
+    "tests/test_harness_merge_registry_wiring.py",
+    "tests/test_harness_merge_store_wiring.py",
+    "tests/test_harness_no_landings_breaker.py",
+    "tests/test_harness_offline_lane.py",
+    "tests/test_harness_orphan_merge_reaper_wiring.py",
+    "tests/test_harness_reblock_guard.py",
+    "tests/test_harness_terminal_lane_record_reclaim.py",
+    "tests/test_harness_train_callbacks.py",
+    "tests/test_harness_warm_lane_wiring.py",
+    "tests/test_inflight_verify_merge_lease.py",
+    "tests/test_interactive_warm_worktree_integration_gate.py",
+    "tests/test_invoke_role_config_resolution.py",
+    "tests/test_landed_outbox.py",
+    "tests/test_lane_lifecycle_integration.py",
+    "tests/test_laptop_warm_verify_boundary.py",
+    "tests/test_mcp_post_transport.py",
+    "tests/test_merge_attempt_disposition.py",
+    "tests/test_merge_boundary_effective_module_configs.py",
+    "tests/test_merge_cancel_retire.py",
+    "tests/test_merge_drift.py",
+    "tests/test_merge_gates.py",
+    "tests/test_merge_gates_drop_guard_rename.py",
+    "tests/test_merge_gates_equivalence_rename.py",
+    "tests/test_merge_gates_plan_files_rename.py",
+    "tests/test_merge_guard_pipeline.py",
+    "tests/test_merge_item_union.py",
+    "tests/test_merge_lane_package.py",
+    "tests/test_merge_queue.py",
+    "tests/test_merge_queue_auto_heal.py",
+    "tests/test_merge_queue_bounce.py",
+    "tests/test_merge_queue_build_chain.py",
+    "tests/test_merge_queue_c3_submit_identity.py",
+    "tests/test_merge_queue_chain_intact.py",
+    "tests/test_merge_queue_coalesce.py",
+    "tests/test_merge_queue_concurrent_verify.py",
+    "tests/test_merge_queue_conflict_graph.py",
+    "tests/test_merge_queue_deep_dispatch.py",
+    "tests/test_merge_queue_deep_integration_gate.py",
+    "tests/test_merge_queue_deep_landing.py",
+    "tests/test_merge_queue_depth_telemetry.py",
+    "tests/test_merge_queue_dispatch_fill_redispatch.py",
+    "tests/test_merge_queue_disposition_wiring.py",
+    "tests/test_merge_queue_dry_run_unblock.py",
+    "tests/test_merge_queue_duplicate_submission.py",
+    "tests/test_merge_queue_equivalence.py",
+    "tests/test_merge_queue_finalize_head_visibility.py",
+    "tests/test_merge_queue_flake_recorder.py",
+    "tests/test_merge_queue_frozen_prefix.py",
+    "tests/test_merge_queue_host_observability.py",
+    "tests/test_merge_queue_invariant_integration_gate.py",
+    "tests/test_merge_queue_lifecycle_registry.py",
+    "tests/test_merge_queue_main_health.py",
+    "tests/test_merge_queue_main_health_deferred.py",
+    "tests/test_merge_queue_metrics.py",
+    "tests/test_merge_queue_multihost_wiring.py",
+    "tests/test_merge_queue_orphan_reaper.py",
+    "tests/test_merge_queue_permit_conservation.py",
+    "tests/test_merge_queue_persistent_worktree.py",
+    "tests/test_merge_queue_phase_derivation.py",
+    "tests/test_merge_queue_redispatch_entries.py",
+    "tests/test_merge_queue_request_liveness.py",
+    "tests/test_merge_queue_resolve_release.py",
+    "tests/test_merge_queue_resource_audit.py",
+    "tests/test_merge_queue_restart_hook.py",
+    "tests/test_merge_queue_single_writer_asserts.py",
+    "tests/test_merge_queue_speculative_probe.py",
+    "tests/test_merge_queue_store.py",
+    "tests/test_merge_queue_supervisor.py",
+    "tests/test_merge_queue_train_attribution.py",
+    "tests/test_merge_queue_two_layer_integration.py",
+    "tests/test_merge_queue_verifier_raw_cancel.py",
+    "tests/test_merge_queue_verify_base_invariant.py",
+    "tests/test_merge_queue_warm_cold_shadow.py",
+    "tests/test_merge_request_ledger.py",
+    "tests/test_merge_serial_lane_tripwire.py",
+    "tests/test_merge_shadow.py",
+    "tests/test_merge_skew_end_to_end.py",
+    "tests/test_merge_speculation.py",
+    "tests/test_merge_speculation_controller.py",
+    "tests/test_merge_types.py",
+    "tests/test_merge_types_invariants.py",
+    "tests/test_merge_unstack_admission.py",
+    "tests/test_merge_worktree_lifecycle_integration_gate.py",
+    "tests/test_multihost_verify_integration.py",
+    "tests/test_offline_lane_infra_integration.py",
+    "tests/test_offline_lane_integration.py",
+    "tests/test_orphan_reaper.py",
+    "tests/test_outcome_kind.py",
+    "tests/test_permit_ledger.py",
+    "tests/test_pool_storage_guard.py",
+    "tests/test_provenance_gate_integration.py",
+    "tests/test_reconcile_stranded.py",
+    "tests/test_recovery_emission_wiring.py",
+    "tests/test_repend_state_machine.py",
+    "tests/test_restart_durable_guards.py",
+    "tests/test_routing_integration_gate.py",
+    "tests/test_session_resume_integration_gate.py",
+    "tests/test_stranded_verified_green.py",
+    "tests/test_substrate_gate.py",
+    "tests/test_suffix_conflict_tracker.py",
+    "tests/test_train_integration.py",
+    "tests/test_train_moved_main.py",
+    "tests/test_transcript_archive_startup_sweeper.py",
+    "tests/test_verdict_servers_integration_gate.py",
+    "tests/test_verify_plan_integration.py",
+    "tests/test_verify_scope_inversion_boundary.py",
+    "tests/test_warm_lane_integration_gate.py",
+    "tests/test_warm_lane_structural_exhaustion.py",
+    "tests/test_workflow.py",
+    "tests/test_workflow_cancellation.py",
+    "tests/test_workflow_e2e.py",
+    "tests/test_workflow_first_enqueue_stamp.py",
+    "tests/test_workflow_main_health_routing.py",
+    "tests/test_workflow_merge_blocked_surfacing.py",
+    "tests/test_workflow_merge_phase_liveness.py",
+    "tests/test_workflow_merge_superseded.py",
+    "tests/test_workflow_merge_thrash.py",
+    "tests/test_workflow_ready_to_merge.py",
+    "tests/test_workflow_skew_surfacing.py",
+    "tests/test_workflow_state_machine_boundary.py",
+    "tests/test_workflow_terminal_report.py",
+    "tests/test_workflow_train_attribution.py",
+    "tests/test_workflow_train_completion.py",
+    "tests/test_workflow_train_halt_owner.py",
+    "tests/test_workflow_worktree_missing.py",
 ]

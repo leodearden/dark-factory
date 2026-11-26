@@ -7,14 +7,15 @@ Pins four contracts:
 2. merge_phase=True suppresses the hook entirely.
 3. unblock_auto.enabled=False suppresses the hook but does NOT suppress the
    real 'blocked' status write.
-4. spawn_dry_run=True with merge_phase=True is only valid for
-   POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX (ordering invariant: advance_main
-   has already moved main before this path runs).
+4. dry_run_spawn=DryRunSpawn.POST_MERGE_RED_MAIN with merge_phase=True is only
+   valid for POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX (ordering invariant:
+   advance_main has already moved main before this path runs).
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from collections.abc import Iterable
 from datetime import datetime
 from pathlib import Path
@@ -23,11 +24,16 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 from _orch_helpers import pydantic_spec
+from shared.task_submit import SubmitFailed, SubmitOutcome
 
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import OrchestratorConfig
-from orchestrator.merge_queue import POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX
+from orchestrator.dry_run_unblock import investigation_task_name
+from orchestrator.lock_table import UncontestedAcquisition
+from orchestrator.merge_lane import POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX
+from orchestrator.scheduler import BlastRadiusResult
 from orchestrator.workflow import TaskWorkflow
+from orchestrator.workflow_types import DryRunSpawn
 
 
 class _Scheduler:
@@ -60,10 +66,16 @@ class _Scheduler:
     async def handle_blast_radius_expansion(
         self, task_id, current, needed, /, *, persist_files=None
     ):
-        return False
+        return BlastRadiusResult(applied=False)
 
-    async def dispatch_tool(self, name, arguments, *, timeout=30.0):
+    async def acquire_uncontested(self, task_id, modules, /, *, reason):
+        return UncontestedAcquisition(acquired=tuple(modules), contested=())
+
+    async def dispatch_tool(self, name: str, arguments: dict, *, timeout: float = 30.0) -> dict:
         return {}
+
+    async def submit_task(self, arguments: dict, *, timeout: float = 30) -> SubmitOutcome:
+        return SubmitFailed('_Scheduler files nothing')
 
     def release(self, tid):
         pass
@@ -87,6 +99,9 @@ class _Scheduler:
 
     def clear_merge_phase(self, tid: str) -> None:
         pass
+
+    def blocked_writes_suppressed(self, tid: str, /) -> bool:
+        return False
 
 
 def _make_workflow(*, tmp_path: Path, task_id: str = '42',
@@ -123,13 +138,30 @@ def _make_workflow(*, tmp_path: Path, task_id: str = '42',
     worktree = tmp_path / 'wt'
     worktree.mkdir(parents=True, exist_ok=True)
     wf.artifacts = TaskArtifacts(worktree)
+    wf.artifacts.init(task_id, 'title', 'desc')
     wf.worktree = worktree
     wf.plan = {'files': []}
-    wf._module_configs = []
     # No escalation queue so _mark_blocked doesn't try to submit escalations
     wf.escalation_queue = None
     wf.event_store = None
     return wf, scheduler
+
+
+async def _drain_unblock_tasks(wf: TaskWorkflow) -> None:
+    """Await the dry-run investigation task(s) running for this workflow's task.
+
+    The task name is the public identity
+    ``orchestrator.dry_run_unblock.investigation_task_name``; reading it back
+    off ``asyncio.all_tasks()`` keeps pytest-asyncio from warning "Task
+    destroyed but it is pending".
+    """
+    me = asyncio.current_task()
+    spawned = [
+        t for t in asyncio.all_tasks()
+        if t is not me and t.get_name() == investigation_task_name(wf.task_id)
+    ]
+    if spawned:
+        await asyncio.gather(*spawned, return_exceptions=True)
 
 
 # ---------------------------------------------------------------------------
@@ -162,12 +194,10 @@ class TestMarkBlockedSpawnsFireAndForget:
         # Give the background task a tick to register its call
         await asyncio.sleep(0)
 
-        # Capture any still-pending background tasks before releasing hang,
-        # then await them so pytest-asyncio doesn't warn "Task destroyed while pending".
-        pending = list(wf._background_tasks)
+        # Release the hanging investigation, then drain it so pytest-asyncio
+        # doesn't warn "Task destroyed but it is pending".
         hang_event.set()
-        if pending:
-            await asyncio.gather(*pending, return_exceptions=True)
+        await _drain_unblock_tasks(wf)
 
         # run_dry_run_unblock was called with the right kwargs
         assert len(calls) == 1
@@ -204,8 +234,14 @@ class TestMarkBlockedSkipsDryRunWhenMergePhase:
         # hook was NOT called
         assert len(dry_run_calls) == 0
 
-        # blocked status was NOT written (merge_phase suppresses it)
-        assert 'blocked' not in scheduler.statuses.get('43', [])
+        # The 'blocked' status IS written.  Task 3537 (spec §8-E2, INV-6)
+        # narrowed merge_phase's suppression to the ENTRY transition only:
+        # this call takes _mark_blocked's final fall-through BLOCKED return,
+        # which is a SLOT EXIT, so the row must be parked truthfully rather
+        # than left 'in-progress' with no live claimant.  merge_phase still
+        # suppresses the write on the REQUEUED retry-in-place arm, which is
+        # the carve-out's only real dependent (commit 22918d5c24).
+        assert 'blocked' in scheduler.statuses.get('43', [])
 
 
 # ---------------------------------------------------------------------------
@@ -300,15 +336,14 @@ class TestMarkBlockedDeduplicatesDryRun:
             f'Expected 1 dry-run invocation, got {len(calls)}'
         )
 
-        # Clean up: release the hanging task
-        pending = list(wf._background_tasks)
+        # Release the hanging investigation, then drain it so pytest-asyncio
+        # doesn't warn "Task destroyed but it is pending".
         hang_event.set()
-        if pending:
-            await asyncio.gather(*pending, return_exceptions=True)
+        await _drain_unblock_tasks(wf)
 
 
 # ---------------------------------------------------------------------------
-# step-1: merge_phase=True WITH spawn_dry_run=True opts in to the hook
+# step-1: merge_phase=True WITH DryRunSpawn.POST_MERGE_RED_MAIN opts in to the hook
 # ---------------------------------------------------------------------------
 
 class TestMarkBlockedSpawnsDryRunWhenMergePhaseAndOptIn:
@@ -316,14 +351,15 @@ class TestMarkBlockedSpawnsDryRunWhenMergePhaseAndOptIn:
     async def test_mark_blocked_spawns_dry_run_when_merge_phase_and_opt_in(
         self, tmp_path
     ):
-        """_mark_blocked(merge_phase=True, spawn_dry_run=True) must schedule
-        run_dry_run_unblock even though merge_phase suppresses the status
-        transition.
+        """_mark_blocked(merge_phase=True, dry_run_spawn=POST_MERGE_RED_MAIN)
+        must schedule run_dry_run_unblock even though merge_phase suppresses
+        the status transition.
 
         This is the post-merge red-main class: main is already advanced when
         _mark_blocked runs, so the SHA capture inside run_dry_run_unblock
-        naturally reflects post-merge reality.  The status write is still
-        suppressed (merge_phase=True contract intact).
+        naturally reflects post-merge reality.  The status write now HAPPENS
+        here (task 3537): merge_phase suppresses only the entry transition,
+        and this escalate_to_human short-circuit is a slot exit.
         """
         wf, scheduler = _make_workflow(tmp_path=tmp_path, task_id='47', enabled=True)
 
@@ -343,7 +379,7 @@ class TestMarkBlockedSpawnsDryRunWhenMergePhaseAndOptIn:
                 wf._mark_blocked(
                     _reason,
                     merge_phase=True,
-                    spawn_dry_run=True,
+                    dry_run_spawn=DryRunSpawn.POST_MERGE_RED_MAIN,
                 ),
                 timeout=2.0,
             )
@@ -353,11 +389,10 @@ class TestMarkBlockedSpawnsDryRunWhenMergePhaseAndOptIn:
         # Give the background task a tick to register its call
         await asyncio.sleep(0)
 
-        # Capture pending tasks and drain them cleanly
-        pending = list(wf._background_tasks)
+        # Release the hanging investigation, then drain it so pytest-asyncio
+        # doesn't warn "Task destroyed but it is pending".
         hang_event.set()
-        if pending:
-            await asyncio.gather(*pending, return_exceptions=True)
+        await _drain_unblock_tasks(wf)
 
         # run_dry_run_unblock was called once with the correct task worktree
         assert len(calls) == 1, f'Expected 1 dry-run invocation, got {len(calls)}'
@@ -367,16 +402,20 @@ class TestMarkBlockedSpawnsDryRunWhenMergePhaseAndOptIn:
         assert 'worktree' in kwargs
         assert kwargs['worktree'] == str(wf.worktree)
 
-        # merge_phase=True suppresses the 'blocked' status write — still
-        assert 'blocked' not in scheduler.statuses.get('47', [])
+        # The 'blocked' status IS written.  This is the escalate_to_human
+        # short-circuit, a SLOT EXIT: the merge landed, main advanced, and an
+        # L1 goes to a human, so the workflow returns BLOCKED and frees the
+        # slot.  Task 3537 (spec §8-E2, INV-6) made merge-phase BLOCKED exits
+        # park the row instead of leaving it 'in-progress' unclaimed.
+        assert 'blocked' in scheduler.statuses.get('47', [])
 
 
 # ---------------------------------------------------------------------------
-# Amendment 1: ordering invariant — spawn_dry_run=True only valid for
-# POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX (the post-advance class).
-# Pins the runtime assertion added to _mark_blocked's elif spawn_dry_run:
-# block so a future caller on a pre-advance path fails loudly rather than
-# silently producing a stale-SHA dry-run proposal.
+# Amendment 1: ordering invariant — DryRunSpawn.POST_MERGE_RED_MAIN only
+# valid for POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX (the post-advance class).
+# Pins the runtime assertion in _mark_blocked's POST_MERGE_RED_MAIN arm so
+# a future caller on a pre-advance path fails loudly rather than silently
+# producing a stale-SHA dry-run proposal.
 # ---------------------------------------------------------------------------
 
 class TestMarkBlockedSpawnDryRunOrderingInvariant:
@@ -384,11 +423,11 @@ class TestMarkBlockedSpawnDryRunOrderingInvariant:
     async def test_spawn_dry_run_wrong_prefix_raises_assertion_error(
         self, tmp_path
     ):
-        """_mark_blocked(merge_phase=True, spawn_dry_run=True) must raise
-        AssertionError when the reason does NOT start with
+        """_mark_blocked(merge_phase=True, dry_run_spawn=POST_MERGE_RED_MAIN)
+        must raise AssertionError when the reason does NOT start with
         POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX.
 
-        This pins the ordering invariant: spawn_dry_run=True is only safe
+        This pins the ordering invariant: POST_MERGE_RED_MAIN is only safe
         when advance_main has already moved refs/heads/main, which is
         guaranteed only for the POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX
         class (_check_post_merge_pyright is called exclusively from
@@ -406,15 +445,15 @@ class TestMarkBlockedSpawnDryRunOrderingInvariant:
             await wf._mark_blocked(
                 'some-other-blocked-class: unexpected failure detail',
                 merge_phase=True,
-                spawn_dry_run=True,
+                dry_run_spawn=DryRunSpawn.POST_MERGE_RED_MAIN,
             )
 
     @pytest.mark.asyncio
     async def test_spawn_dry_run_correct_prefix_does_not_raise(
         self, tmp_path
     ):
-        """_mark_blocked(merge_phase=True, spawn_dry_run=True) must NOT
-        raise when the reason starts with POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX.
+        """_mark_blocked(merge_phase=True, dry_run_spawn=POST_MERGE_RED_MAIN)
+        must NOT raise when the reason starts with POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX.
 
         This is the counterpart to the wrong-prefix test: confirms the
         guard is a targeted prefix check, not an unconditional block.
@@ -432,12 +471,13 @@ class TestMarkBlockedSpawnDryRunOrderingInvariant:
 
         with patch('orchestrator.workflow.run_dry_run_unblock', new=_spy):
             # Must not raise
-            await wf._mark_blocked(_reason, merge_phase=True, spawn_dry_run=True)
+            await wf._mark_blocked(
+                _reason, merge_phase=True,
+                dry_run_spawn=DryRunSpawn.POST_MERGE_RED_MAIN,
+            )
 
         await asyncio.sleep(0)
-        pending = list(wf._background_tasks)
-        if pending:
-            await asyncio.gather(*pending, return_exceptions=True)
+        await _drain_unblock_tasks(wf)
 
         assert len(dry_run_calls) == 1, (
             f'Correct prefix should spawn once, got {len(dry_run_calls)}'
@@ -473,9 +513,7 @@ class TestMarkBlockedForwardsResilienceContext:
             await wf._mark_blocked('verify exhausted')
 
         await asyncio.sleep(0)  # let the background task register its call
-        pending = list(wf._background_tasks)
-        if pending:
-            await asyncio.gather(*pending, return_exceptions=True)
+        await _drain_unblock_tasks(wf)
 
         assert len(calls) == 1, f'Expected 1 dry-run invocation, got {len(calls)}'
         kwargs = calls[0]
@@ -509,9 +547,7 @@ class TestMarkBlockedStampsLastBlockedAt:
             await wf._mark_blocked('verify exhausted', detail='All attempts failed')
 
         await asyncio.sleep(0)  # let any background tasks register
-        pending = list(wf._background_tasks)
-        if pending:
-            await asyncio.gather(*pending, return_exceptions=True)
+        await _drain_unblock_tasks(wf)
 
         # Confirmed block transition: the status write succeeded first.
         assert 'blocked' in scheduler.statuses.get('46', [])
@@ -584,15 +620,201 @@ class TestMarkBlockedStampPrecedesDryRunSpawn:
             await wf._mark_blocked('verify exhausted', detail='All attempts failed')
 
         await asyncio.sleep(0)  # let any background tasks register/finish
-        pending = list(wf._background_tasks)
-        if pending:
-            await asyncio.gather(*pending, return_exceptions=True)
+        await _drain_unblock_tasks(wf)
 
         assert call_order == ['stamp', 'spawn'], (
             'Expected the last_blocked_at stamp to be awaited BEFORE '
             '_spawn_dry_run_unblock is invoked, so a freshly-produced '
             f'proposal always compares as non-stale; got {call_order}'
         )
+
+
+# ---------------------------------------------------------------------------
+# task 3125 guard (1): an architect verdict is itself the investigation, so
+# the block it produces spawns no dry-run.  The filter is the caller's typed
+# DryRunSpawn policy, not an escalate_to_human rule or a reason-prose sniff.
+# ---------------------------------------------------------------------------
+
+def _last_blocked_at_stamps(scheduler: _Scheduler) -> list[dict]:
+    return [
+        c for c in scheduler.update_calls
+        if isinstance(c['metadata'], dict) and 'last_blocked_at' in c['metadata']
+    ]
+
+
+class TestArchitectVerdictSkipsDryRun:
+    @pytest.mark.asyncio
+    async def test_unactionable_report_does_not_spawn(self, tmp_path):
+        wf, scheduler = _make_workflow(tmp_path=tmp_path, task_id='60', enabled=True)
+        assert wf.artifacts is not None
+        wf.artifacts.write_unactionable_task('filed in the wrong project tree', 'evidence text')
+
+        calls = []
+
+        async def _spy_dry_run(**kwargs):
+            calls.append(kwargs)
+
+        with patch('orchestrator.workflow.run_dry_run_unblock', new=_spy_dry_run):
+            await wf._handle_unactionable_task_report()
+        await asyncio.sleep(0)
+        await _drain_unblock_tasks(wf)
+
+        assert calls == []
+        assert 'blocked' in scheduler.statuses.get('60', [])
+        assert len(_last_blocked_at_stamps(scheduler)) == 1
+
+    @pytest.mark.asyncio
+    async def test_false_premise_report_does_not_spawn(self, tmp_path):
+        wf, scheduler = _make_workflow(tmp_path=tmp_path, task_id='61', enabled=True)
+        assert wf.artifacts is not None
+        wf.artifacts.write_false_premise(
+            classification='numeric_bound', premise='p', evidence='e',
+            proposed_resolution='r',
+        )
+
+        calls = []
+
+        async def _spy_dry_run(**kwargs):
+            calls.append(kwargs)
+
+        with patch('orchestrator.workflow.run_dry_run_unblock', new=_spy_dry_run):
+            await wf._handle_false_premise_report()
+        await asyncio.sleep(0)
+        await _drain_unblock_tasks(wf)
+
+        assert calls == []
+        assert 'blocked' in scheduler.statuses.get('61', [])
+        assert len(_last_blocked_at_stamps(scheduler)) == 1
+
+    @pytest.mark.asyncio
+    async def test_never_policy_suppresses_spawn(self, tmp_path):
+        wf, scheduler = _make_workflow(tmp_path=tmp_path, task_id='62', enabled=True)
+
+        calls = []
+
+        async def _spy_dry_run(**kwargs):
+            calls.append(kwargs)
+
+        with patch('orchestrator.workflow.run_dry_run_unblock', new=_spy_dry_run):
+            await wf._mark_blocked('verify exhausted', dry_run_spawn=DryRunSpawn.NEVER)
+        await asyncio.sleep(0)
+        await _drain_unblock_tasks(wf)
+
+        assert calls == []
+        assert 'blocked' in scheduler.statuses.get('62', [])
+
+    @pytest.mark.asyncio
+    async def test_escalate_to_human_with_default_policy_still_spawns(self, tmp_path):
+        """The suppression belongs to the caller's policy: the post-merge
+        red-main path legitimately pairs escalate_to_human with an opt-in, and
+        the reason text below is deliberately the unactionable handler's own.
+        """
+        wf, _ = _make_workflow(tmp_path=tmp_path, task_id='63', enabled=True)
+
+        calls = []
+
+        async def _spy_dry_run(**kwargs):
+            calls.append(kwargs)
+
+        with patch('orchestrator.workflow.run_dry_run_unblock', new=_spy_dry_run):
+            await wf._mark_blocked(
+                'Architect reported task unactionable: x', escalate_to_human=True,
+            )
+        await asyncio.sleep(0)
+        await _drain_unblock_tasks(wf)
+
+        assert len(calls) == 1
+
+
+# ---------------------------------------------------------------------------
+# task 3125 guard (3): the in-flight check spans the whole event loop.  A
+# re-dispatch builds a fresh TaskWorkflow whose own background set is empty,
+# and the merge lane spawns investigations into a set no workflow sees, so a
+# per-instance scan would let either start a duplicate.
+# ---------------------------------------------------------------------------
+
+_REBLOCK_REASON = 'Steward re-escalated to human'
+
+
+class TestDryRunInFlightSurvivesReDispatch:
+    @pytest.mark.asyncio
+    async def test_second_workflow_instance_does_not_spawn_while_first_runs(
+        self, tmp_path,
+    ):
+        wf_a, _ = _make_workflow(tmp_path=tmp_path / 'a', task_id='70')
+        wf_b, _ = _make_workflow(tmp_path=tmp_path / 'b', task_id='70')
+
+        calls = []
+        release = asyncio.Event()
+
+        async def _hanging_dry_run(**kwargs):
+            calls.append(kwargs)
+            await release.wait()
+
+        with patch('orchestrator.workflow.run_dry_run_unblock', new=_hanging_dry_run):
+            await wf_a._mark_blocked(_REBLOCK_REASON, skip_escalation=True)
+            await asyncio.sleep(0)
+            await wf_b._mark_blocked(_REBLOCK_REASON, skip_escalation=True)
+            await asyncio.sleep(0)
+
+        release.set()
+        await _drain_unblock_tasks(wf_a)
+
+        assert len(calls) == 1, f'Expected 1 dry-run invocation, got {len(calls)}'
+
+    @pytest.mark.asyncio
+    async def test_re_dispatch_after_completion_spawns_again(self, tmp_path):
+        wf_a, _ = _make_workflow(tmp_path=tmp_path / 'a', task_id='70')
+        wf_b, _ = _make_workflow(tmp_path=tmp_path / 'b', task_id='70')
+        wf_c, _ = _make_workflow(tmp_path=tmp_path / 'c', task_id='70')
+
+        calls = []
+        release = asyncio.Event()
+
+        async def _hanging_dry_run(**kwargs):
+            calls.append(kwargs)
+            await release.wait()
+
+        with patch('orchestrator.workflow.run_dry_run_unblock', new=_hanging_dry_run):
+            await wf_a._mark_blocked(_REBLOCK_REASON, skip_escalation=True)
+            await asyncio.sleep(0)
+            await wf_b._mark_blocked(_REBLOCK_REASON, skip_escalation=True)
+            await asyncio.sleep(0)
+            release.set()
+            await _drain_unblock_tasks(wf_a)
+            assert len(calls) == 1, f'Expected 1 dry-run invocation, got {len(calls)}'
+
+            await wf_c._mark_blocked(_REBLOCK_REASON, skip_escalation=True)
+            await asyncio.sleep(0)
+            await _drain_unblock_tasks(wf_c)
+
+        assert len(calls) == 2, (
+            'A finished investigation must not keep suppressing spawns; '
+            f'got {len(calls)} invocations'
+        )
+
+    @pytest.mark.asyncio
+    async def test_investigation_started_elsewhere_suppresses_spawn(self, tmp_path):
+        wf, _ = _make_workflow(tmp_path=tmp_path, task_id='71')
+
+        calls = []
+
+        async def _spy_dry_run(**kwargs):
+            calls.append(kwargs)
+
+        elsewhere = asyncio.create_task(
+            asyncio.Event().wait(), name=investigation_task_name('71'),
+        )
+        try:
+            with patch('orchestrator.workflow.run_dry_run_unblock', new=_spy_dry_run):
+                await wf._mark_blocked('verify exhausted')
+            await asyncio.sleep(0)
+        finally:
+            elsewhere.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await elsewhere
+
+        assert calls == []
 
 
 # ---------------------------------------------------------------------------

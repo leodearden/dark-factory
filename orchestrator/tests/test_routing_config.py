@@ -21,6 +21,7 @@ from orchestrator.config import (
     RoutingRule,
     RuleMatch,
     RuleSet,
+    SplitMatch,
 )
 from orchestrator.routing import DEFAULT_LADDER
 
@@ -66,6 +67,44 @@ class TestClosedVocabularyForbidsUnknownKeys:
         assert 'vibe' in str(exc_info.value)
 
 
+class TestSplitMatchValidation:
+    """A split condition is validated at construction: a malformed split
+    raises a ValidationError whose loc names the offending field."""
+
+    def test_valid_split_parses_and_rides_on_rule_match(self):
+        split = SplitMatch(salt='routing-exp-1', buckets=2, bucket=1)
+        assert RuleMatch(split=split).split == split
+        assert RuleMatch().split is None
+
+    def test_fewer_than_two_buckets_rejected(self):
+        with pytest.raises(ValidationError) as exc_info:
+            SplitMatch(salt='x', buckets=1, bucket=0)
+        assert exc_info.value.errors()[0]['loc'][-1] == 'buckets'
+
+    def test_bucket_equal_to_buckets_rejected_naming_both_values(self):
+        with pytest.raises(ValidationError) as exc_info:
+            SplitMatch(salt='x', buckets=2, bucket=2)
+        error = exc_info.value.errors()[0]
+        assert error['loc'][-1] == 'bucket'
+        assert 'bucket 2' in error['msg']
+        assert 'buckets=2' in error['msg']
+
+    def test_negative_bucket_rejected(self):
+        with pytest.raises(ValidationError) as exc_info:
+            SplitMatch(salt='x', buckets=2, bucket=-1)
+        assert exc_info.value.errors()[0]['loc'][-1] == 'bucket'
+
+    def test_empty_salt_rejected(self):
+        with pytest.raises(ValidationError) as exc_info:
+            SplitMatch(salt='', buckets=2, bucket=0)
+        assert exc_info.value.errors()[0]['loc'][-1] == 'salt'
+
+    def test_unknown_key_rejected_naming_the_key(self):
+        with pytest.raises(ValidationError) as exc_info:
+            SplitMatch.model_validate({'salt': 'x', 'buckets': 2, 'bucket': 0, 'arm': 1})
+        assert exc_info.value.errors()[0]['loc'][-1] == 'arm'
+
+
 class TestRoutingConfigDefaults:
     """(d) RoutingConfig() defaults: ladder, per_model_daily_ceiling_usd, rules."""
 
@@ -82,14 +121,13 @@ class TestRoutingConfigDefaults:
         assert cfg.rules == []
 
 
+@pytest.mark.usefixtures("code_default_config")
 class TestOrchestratorConfigRoundTripsWithNewFields:
     """(e) An OrchestratorConfig() with the new routing fields still
     round-trips ``_validate_models_in_allowlist`` (no regression from
     extending RoutingConfig)."""
 
-    def test_default_orchestrator_config_constructs_ok(self, monkeypatch, tmp_path):
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+    def test_default_orchestrator_config_constructs_ok(self):
         cfg = OrchestratorConfig()
         assert cfg.routing.ladder == list(DEFAULT_LADDER)
         assert cfg.routing.per_model_daily_ceiling_usd == {}
@@ -108,9 +146,7 @@ class TestOrchestratorConfigRoundTripsWithNewFields:
             'simple-saturated-full-path', 'retry-tier-up',
         ]
 
-    def test_orchestrator_config_with_rule_constructs_ok(self, monkeypatch, tmp_path):
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+    def test_orchestrator_config_with_rule_constructs_ok(self):
         cfg = OrchestratorConfig(
             routing=RoutingConfig(
                 rules=[

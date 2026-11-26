@@ -23,8 +23,7 @@ from pathlib import Path
 # silently resolve against the installed editable package instead of the
 # local worktree src/, causing hard-to-diagnose test failures.
 # ---------------------------------------------------------------------------
-_SRC = Path(__file__).parent.parent / 'src'
-if str(_SRC) not in sys.path:
+if str(_SRC := Path(__file__).parent.parent / 'src') not in sys.path:
     sys.path.insert(0, str(_SRC))
 # Also front-load this worktree's shared/src so `import shared` (e.g. the
 # shared.mcp_idempotency helper the McpSession twin imports, task 2766) loads
@@ -32,18 +31,77 @@ if str(_SRC) not in sys.path:
 # tree — otherwise a brand-new shared submodule that has not yet landed on
 # main is unimportable here, breaking collection of tests that touch it.
 # Mirrors orchestrator/tests/conftest.py's shared/src insertion.
-_SHARED_SRC = Path(__file__).parent.parent.parent / 'shared' / 'src'
-if str(_SHARED_SRC) not in sys.path:
+if str(_SHARED_SRC := Path(__file__).parent.parent.parent / 'shared' / 'src') not in sys.path:
     sys.path.insert(0, str(_SHARED_SRC))
-_TESTS_DIR = Path(__file__).parent
-if str(_TESTS_DIR) not in sys.path:
+if str(_TESTS_DIR := Path(__file__).parent) not in sys.path:
     sys.path.insert(0, str(_TESTS_DIR))
 
-import aiosqlite  # noqa: E402
-import httpx  # noqa: E402
-import pytest  # noqa: E402
-from _dashboard_helpers import RECONCILIATION_SCHEMA  # noqa: E402
-from starlette.testclient import TestClient  # noqa: E402
+# Suite-wide git isolation (task 3355, incident esc-3072-3).  The verify lane
+# runs `cd dashboard && uv run pytest tests/`, which makes rootdir the
+# SUBPROJECT — the repo-root conftest.py is never loaded, so each test-root
+# conftest wires the defence itself.  APPEND the repo root, never insert(0, ...):
+# at sys.path[0] it would make the subproject directories resolve as namespace
+# packages pointing at the project folder instead of src/<pkg>/, defeating the
+# guard block above.
+if str(REPO_ROOT := Path(__file__).resolve().parents[2]) not in sys.path:
+    sys.path.append(str(REPO_ROOT))
+
+import aiosqlite
+import httpx
+import pytest
+from _dashboard_helpers import RECONCILIATION_SCHEMA, apply_isolated_env
+from df_pytest_isolation import (
+    arm_leaked_drain_process_guard,
+    arm_test_root_isolation,
+    reject_unsafe_basetemp,
+)
+from shared.pytest_fake_clock import fake_clock as fake_clock
+from starlette.testclient import TestClient
+
+
+def pytest_configure(config):
+    """Refuse a --basetemp aimed inside a live task worktree (esc-3072-3); arm the suite-wide defences."""
+    reject_unsafe_basetemp(config)
+    arm_test_root_isolation(config)
+    arm_leaked_drain_process_guard(config)
+
+
+@pytest.fixture(scope='session', autouse=True)
+def _isolated_project_root(tmp_path_factory):
+    """Point the whole suite's DashboardConfig at a pytest-owned temp root.
+
+    Task 3503.  ``lifespan()`` opens **writable WAL** stores at
+    ``config.burndown_db`` / ``config.metrics_db`` and read-only-opens
+    ``config.reconciliation_db`` / ``config.tickets_db``.  Unset, those
+    resolved to the operator's live checkout, so merely running this suite
+    wrote live databases — and the read-only open of a live WAL database is
+    the path behind the task-3466 ``SQLITE_READONLY_RECOVERY`` incident.
+
+    SCOPE RATIONALE — session, not function.  ~15 ``TestClient(app)`` fixtures
+    in this suite are ``scope='module'``, and the built-in ``monkeypatch``
+    fixture is function-scoped, so they cannot request it; a function-scoped
+    autouse fixture would be instantiated only AFTER such a lifespan had
+    already opened the live databases.  pytest instantiates higher-scoped
+    fixtures first within a test's setup (autouse before non-autouse at the
+    same scope), so session-scoped autouse is the only scope that provably
+    precedes every ``TestClient(app)`` here.  It is also exhaustive by
+    construction: a new module that writes ``with TestClient(app)`` is covered
+    automatically, with nothing to remember and no source-grep lint needed.
+
+    This sets a DEFAULT, not a lock.  A function-scoped ``monkeypatch.setenv``
+    is created after — and torn down before — this fixture, so a test that
+    sets ``DASHBOARD_PROJECT_ROOT`` itself (test_durability.py:54,114;
+    test_scaffold.py:58,120,135) still wins.
+
+    ``pytest.MonkeyPatch.context()`` rather than the ``monkeypatch`` fixture:
+    the fixture is function-scoped and cannot be requested here.  The context
+    manager restores ``os.environ`` at session teardown, so this suite leaves
+    no env residue for sibling subproject suites in the same verify run.
+    """
+    root = tmp_path_factory.mktemp('dashboard_project_root')
+    with pytest.MonkeyPatch.context() as mp:
+        apply_isolated_env(mp, root)
+        yield root
 
 
 @pytest.fixture()
@@ -61,6 +119,21 @@ async def dummy_client():
 
 
 @pytest.fixture()
+def fresh_task_snapshot_state():
+    """A test using this starts and leaves the task-snapshot collectors' state empty.
+
+    That per-process state is the snapshot unit cache, the last-good store
+    and the root rotation. Modules opt in with
+    ``pytestmark = pytest.mark.usefixtures('fresh_task_snapshot_state')``.
+    """
+    from dashboard.data.active_tasks import reset_task_snapshot_state
+
+    reset_task_snapshot_state()
+    yield
+    reset_task_snapshot_state()
+
+
+@pytest.fixture()
 def dummy_config(tmp_path):
     from dashboard.config import DashboardConfig
 
@@ -72,7 +145,7 @@ def two_url_config(tmp_path):
     """Create a DashboardConfig with two test URLs (ports 9000, 9001).
 
     Port 9000 is used as the failing server in fallback tests; port 9001
-    responds successfully. Using ports distinct from the default (8002)
+    responds successfully. Using ports distinct from the suite-wide default
     makes the test intent explicit.
     """
     from dashboard.config import DashboardConfig
@@ -85,7 +158,20 @@ def two_url_config(tmp_path):
 
 @pytest.fixture()
 def client():
-    """Create a TestClient for the dashboard FastAPI app."""
+    """Create a TestClient for the dashboard FastAPI app.
+
+    Its lifespan is isolated on BOTH axes by the session-scoped
+    ``_isolated_project_root`` fixture: the DB paths it opens resolve under a
+    pytest-owned temp dir rather than the operator's live checkout (task
+    3503), and its fused-memory fan-out dials a measured-dead loopback port
+    rather than the operator's live instance on 8002 (task 5185).  The second
+    half is not cosmetic: without it every lifespan here makes two real MCP
+    round trips, and one slow response wedges ``TestClient.__exit__``.
+
+    The samplers are off suite-wide via the session ``_isolated_project_root``
+    (dashboard/tests/_dashboard_helpers.py::apply_isolated_env), because their
+    discovery ``ps``-scans the real host.
+    """
     from dashboard.app import app
 
     with TestClient(app) as c:
@@ -99,6 +185,14 @@ def two_url_client(monkeypatch):
     Uses monkeypatch.setenv so DashboardConfig.from_env() inside the lifespan
     produces the two-URL list naturally — no post-hoc mutation of app.state.
     monkeypatch teardown restores os.environ automatically after each test.
+
+    Only the fused-memory URLs are overridden here; project_root still comes
+    from the session-scoped ``_isolated_project_root`` temp dir, so this
+    lifespan does not touch the operator's live checkout either (task 3503).
+
+    The samplers are off suite-wide via the session ``_isolated_project_root``
+    (dashboard/tests/_dashboard_helpers.py::apply_isolated_env), because their
+    discovery ``ps``-scans the real host.
     """
     from dashboard.app import app
 
@@ -215,44 +309,6 @@ def reconciliation_db(tmp_path):
         ),
     )
 
-    # Journal entries for run-001
-    conn.execute(
-        """INSERT INTO journal_entries
-           (id, run_id, stage, timestamp, operation, target_system,
-            before_state, after_state, reasoning, evidence)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (
-            'je-001',
-            'run-001',
-            'memory_consolidation',
-            (now - timedelta(hours=1, minutes=55)).isoformat(),
-            'consolidate',
-            'mem0',
-            '{"count": 5}',
-            '{"count": 3}',
-            'Merged duplicate memories',
-            '[{"source": "mem0", "id": "m-1"}]',
-        ),
-    )
-    conn.execute(
-        """INSERT INTO journal_entries
-           (id, run_id, stage, timestamp, operation, target_system,
-            before_state, after_state, reasoning, evidence)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (
-            'je-002',
-            'run-001',
-            'task_knowledge_sync',
-            (now - timedelta(hours=1, minutes=50)).isoformat(),
-            'sync',
-            'graphiti',
-            None,
-            '{"entities": 2}',
-            '',
-            '[]',
-        ),
-    )
-
     # Judge verdict
     conn.execute(
         """INSERT INTO judge_verdicts (run_id, reviewed_at, severity, findings, action_taken)
@@ -307,3 +363,110 @@ async def empty_recon_conn(empty_reconciliation_db):
     async with aiosqlite.connect(str(empty_reconciliation_db)) as conn:
         conn.row_factory = aiosqlite.Row
         yield conn
+
+
+# ---------------------------------------------------------------------------
+# Shared served-asset fixtures (task 3549).
+#
+# The suite asserts structural contracts against the *served* .jsx/.js/.html
+# text, so nearly every such module needs a TestClient and the response body of
+# one or more static assets.  Nine modules used to carry byte-identical private
+# copies of exactly these fixtures; they live here now so a change lands once.
+#
+# SCOPE — module, matching the copies they replace.  Each CONSUMING MODULE pays
+# one app lifespan, not each test.  conftest's other TestClient fixture,
+# ``client`` above, is function-scoped and is a different thing: swapping these
+# onto it would stand up and tear down the app once per test across the whole
+# suite.  test_jsx_source_helpers.py pins the scope so that cannot happen
+# silently.
+#
+# ISOLATION — unchanged from the copies.  These lifespans still run under the
+# session-scoped autouse ``_isolated_project_root`` above (task 3503), so the
+# app opens its WAL databases inside a pytest temp root and never touches the
+# operator's live checkout.  That fixture is session-scoped precisely because a
+# module-scoped TestClient like this one cannot request a function-scoped
+# monkeypatch.
+#
+# SHADOWING IS INTENDED, BUT IT MUST SAY SO AT THE SITE.  A module that defines
+# its own ``_client`` overrides this one; that is not automatically a leftover to
+# be cleaned up.  test_fixture_isolation.py in particular MUST keep its copy —
+# there the module-scoped TestClient is the SUBJECT UNDER TEST (its docstring:
+# "only a *session*-scoped fix satisfies both" scopes), so deleting it would
+# delete the coverage.
+#
+# The MECHANISM that records such an exception is a
+# ``# noqa: module-local-testclient — <reason>`` pragma on the line above the
+# construction, enforced by
+# ``fused-memory/scripts/check_module_local_testclient.py`` (task 4485) from
+# dashboard's ``lint_command`` and ``hooks/project-checks``.  Without that pragma
+# the lint rejects the fixture and names conftest's shared ``_client`` as the
+# remedy — so this note and the gate cannot drift apart, which is exactly what
+# happened before: task 3571 deleted five copies, asserted in its own commit
+# message that conftest and test_fixture_isolation.py were the only survivors,
+# and left a byte-identical copy in test_tab_tasks_offline_banner.py that no
+# human reviewer or purpose-built guard caught.  Task 4485 burned that copy down.
+#
+# APPEND ONLY BELOW THE sys.path BLOCK.  Adding a top-level non-stdlib import
+# above it fails test_conftest_import_guard.py's AST ordering guard.
+# ``TestClient`` is already imported at the top of this file, so this block adds
+# no import at all.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(scope='module')
+def _client():
+    """Module-scoped TestClient for static-asset and wiring assertions."""
+    from dashboard.app import app
+
+    with TestClient(app) as c:
+        yield c
+
+
+@pytest.fixture(scope='module')
+def index_html_body(_client):
+    return _client.get('/static/redux/index.html').text
+
+
+@pytest.fixture(scope='module')
+def data_js_body(_client):
+    return _client.get('/static/redux/data.js').text
+
+
+@pytest.fixture(scope='module')
+def app_jsx_body(_client):
+    return _client.get('/static/redux/app.jsx').text
+
+
+@pytest.fixture(scope='module')
+def shell_jsx_body(_client):
+    return _client.get('/static/redux/shell.jsx').text
+
+
+@pytest.fixture(scope='module')
+def tabs_jsx_body(_client):
+    return _client.get('/static/redux/tabs.jsx').text
+
+
+@pytest.fixture(scope='module')
+def charts_jsx_body(_client):
+    return _client.get('/static/redux/charts.jsx').text
+
+
+@pytest.fixture(scope='module')
+def tab_analytics_jsx_body(_client):
+    return _client.get('/static/redux/tab_escalation_analytics.jsx').text
+
+
+@pytest.fixture(scope='module')
+def tab_overview_jsx_body(_client):
+    return _client.get('/static/redux/tab_overview.jsx').text
+
+
+@pytest.fixture(scope='module')
+def tab_escalations_jsx_body(_client):
+    return _client.get('/static/redux/tab_escalations.jsx').text
+
+
+@pytest.fixture(scope='module')
+def tab_tasks_jsx_body(_client):
+    return _client.get('/static/redux/tab_tasks.jsx').text

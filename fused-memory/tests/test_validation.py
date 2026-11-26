@@ -1,5 +1,7 @@
 """Unit tests for fused_memory.utils.validation helpers."""
 
+import uuid
+
 import pytest
 
 from fused_memory.utils.validation import (
@@ -8,11 +10,14 @@ from fused_memory.utils.validation import (
     _safe_repr,
     _validate_identifier,
     canonicalize_project_id,
+    is_full_uuid,
+    require_full_uuid,
     require_int_ids,
     require_known_project_id,
     require_project_id,
     require_project_root,
     require_run_id,
+    validate_full_uuid,
     validate_int_ids,
     validate_known_project_id,
     validate_project_id,
@@ -1264,3 +1269,207 @@ class TestCanonicalizeProjectId:
         with pytest.raises(PathShapedProjectIdError) as exc_info:
             canonicalize_project_id(bad)
         assert bad in str(exc_info.value)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Full-UUID validation (task 3132 — delete_memory hard-errors on truncated ids)
+# ─────────────────────────────────────────────────────────────────────────────
+
+# A real corpus-shaped canonical UUID, used across the three classes below.
+_CANONICAL = 'fccfa232-16fe-404a-880a-8eca32eb974e'
+# stage1.py's own worked example of the failure mode: an 8-char hex prefix
+# lifted out of a search-result snippet.
+_TRUNCATED_PREFIX = '2531b4d8'
+
+
+class TestIsFullUuid:
+    """is_full_uuid — the single shared canonical-full-UUID predicate."""
+
+    def test_canonical_lowercase_accepted(self):
+        assert is_full_uuid(_CANONICAL) is True
+
+    def test_generated_uuid4_accepted(self):
+        """str(uuid4()) is exactly the shape both stores mint ids in."""
+        assert is_full_uuid(str(uuid.uuid4())) is True
+
+    def test_uppercase_accepted(self):
+        """Graphiti/Neo4j and mem0 do not normalise UUID case on read-back, so
+        rejecting uppercase would mask real ids as malformed."""
+        assert is_full_uuid(_CANONICAL.upper()) is True
+
+    def test_mixed_case_accepted(self):
+        mixed = 'FCCFA232-16fe-404A-880a-8ECA32EB974E'
+        assert is_full_uuid(mixed) is True
+
+    def test_truncated_hex_prefix_rejected(self):
+        assert is_full_uuid(_TRUNCATED_PREFIX) is False
+
+    def test_hyphenless_32_hex_rejected(self):
+        """Parses under uuid.UUID() but is not a store primary key."""
+        assert is_full_uuid(_CANONICAL.replace('-', '')) is False
+
+    def test_trailing_newline_rejected(self):
+        """Anchored '^...$' + .match() ACCEPTS this (Python's $ matches before a
+        trailing newline); the parse-based predicate must not."""
+        assert is_full_uuid(_CANONICAL + '\n') is False
+
+    def test_leading_space_rejected(self):
+        assert is_full_uuid(' ' + _CANONICAL) is False
+
+    def test_braced_form_rejected(self):
+        """uuid.UUID() strips braces, so a bare parse would admit this."""
+        assert is_full_uuid('{' + _CANONICAL + '}') is False
+
+    def test_urn_prefixed_form_rejected(self):
+        """uuid.UUID() strips the urn:uuid: prefix, so a bare parse would admit it."""
+        assert is_full_uuid('urn:uuid:' + _CANONICAL) is False
+
+    def test_empty_string_rejected(self):
+        assert is_full_uuid('') is False
+
+    def test_whitespace_only_rejected(self):
+        assert is_full_uuid('   ') is False
+
+    def test_none_rejected_without_raising(self):
+        assert is_full_uuid(None) is False
+
+    def test_non_str_rejected_without_raising(self):
+        """A non-str value must not raise TypeError out of the predicate."""
+        assert is_full_uuid(123) is False
+        assert is_full_uuid(['a']) is False
+
+
+class TestValidateFullUuid:
+    """validate_full_uuid — MCP-facing form: returns an error dict or None."""
+
+    def test_canonical_returns_none(self):
+        assert validate_full_uuid(_CANONICAL) is None
+
+    def test_uppercase_returns_none(self):
+        assert validate_full_uuid(_CANONICAL.upper()) is None
+
+    def test_truncated_prefix_returns_error_dict(self):
+        result = validate_full_uuid(_TRUNCATED_PREFIX)
+        assert result is not None
+        assert result['error_type'] == 'ValidationError'
+
+    def test_error_message_names_the_offending_id(self):
+        """The signal explicitly requires the malformed id be named."""
+        result = validate_full_uuid(_TRUNCATED_PREFIX)
+        assert result is not None
+        assert _TRUNCATED_PREFIX in result['error']
+
+    def test_error_carries_non_empty_hint(self):
+        result = validate_full_uuid(_TRUNCATED_PREFIX)
+        assert result is not None
+        assert result.get('hint')
+        assert isinstance(result['hint'], str)
+
+    def test_error_dict_shape(self):
+        result = validate_full_uuid(_TRUNCATED_PREFIX)
+        assert result is not None
+        assert set(result.keys()) == {'error', 'error_type', 'hint'}
+
+    def test_hyphenless_32_hex_returns_error(self):
+        assert validate_full_uuid(_CANONICAL.replace('-', '')) is not None
+
+    def test_trailing_newline_returns_error(self):
+        assert validate_full_uuid(_CANONICAL + '\n') is not None
+
+    def test_braced_form_returns_error(self):
+        assert validate_full_uuid('{' + _CANONICAL + '}') is not None
+
+    def test_urn_prefixed_form_returns_error(self):
+        assert validate_full_uuid('urn:uuid:' + _CANONICAL) is not None
+
+    def test_leading_space_returns_error(self):
+        assert validate_full_uuid(' ' + _CANONICAL) is not None
+
+    def test_empty_string_returns_error(self):
+        assert validate_full_uuid('') is not None
+
+    def test_whitespace_only_returns_error(self):
+        assert validate_full_uuid('   ') is not None
+
+    def test_none_returns_error_without_raising(self):
+        assert validate_full_uuid(None) is not None
+
+    def test_non_str_returns_error_without_raising(self):
+        assert validate_full_uuid(123) is not None
+
+    def test_default_field_name_is_memory_id(self):
+        result = validate_full_uuid(_TRUNCATED_PREFIX)
+        assert result is not None
+        assert 'memory_id' in result['error']
+
+    def test_field_name_customises_label(self):
+        """Leaf θ/C2 validates supersedes list members and needs per-element labels."""
+        result = validate_full_uuid(_TRUNCATED_PREFIX, field_name='supersedes[0]')
+        assert result is not None
+        assert 'supersedes[0]' in result['error']
+        assert 'memory_id' not in result['error']
+
+    def test_oversized_value_is_truncated_in_message(self):
+        """Mirror TestTruncationInErrorMessages: _safe_repr caps hostile values."""
+        big_value = 'z' * (1024 * 1024)
+        result = validate_full_uuid(big_value)
+        assert result is not None
+        assert '...(truncated)' in result['error']
+        assert len(result['error']) < 400
+
+
+class TestRequireFullUuid:
+    """require_full_uuid — internal fail-fast form: raises InputValidationError."""
+
+    def test_canonical_does_not_raise(self):
+        assert require_full_uuid(_CANONICAL) is None
+
+    def test_uppercase_does_not_raise(self):
+        assert require_full_uuid(_CANONICAL.upper()) is None
+
+    def test_truncated_prefix_raises_input_validation_error(self):
+        with pytest.raises(InputValidationError):
+            require_full_uuid(_TRUNCATED_PREFIX)
+
+    def test_raise_is_catchable_as_value_error(self):
+        """InputValidationError subclasses ValueError, so existing `except
+        ValueError` / gather_collect guards in the callers still degrade."""
+        with pytest.raises(ValueError):
+            require_full_uuid(_TRUNCATED_PREFIX)
+
+    def test_message_carries_both_the_id_and_the_hint(self):
+        """An exception has no room for a separate structured key, so the hint
+        is folded into the message."""
+        with pytest.raises(InputValidationError) as exc_info:
+            require_full_uuid(_TRUNCATED_PREFIX)
+        msg = str(exc_info.value)
+        assert _TRUNCATED_PREFIX in msg
+        expected_hint = validate_full_uuid(_TRUNCATED_PREFIX)
+        assert expected_hint is not None
+        assert expected_hint['hint'] in msg
+
+    def test_trailing_newline_raises(self):
+        with pytest.raises(InputValidationError):
+            require_full_uuid(_CANONICAL + '\n')
+
+    def test_hyphenless_32_hex_raises(self):
+        with pytest.raises(InputValidationError):
+            require_full_uuid(_CANONICAL.replace('-', ''))
+
+    def test_none_raises(self):
+        with pytest.raises(InputValidationError):
+            require_full_uuid(None)
+
+    def test_non_str_raises(self):
+        with pytest.raises(InputValidationError):
+            require_full_uuid(123)
+
+    def test_field_name_customises_message(self):
+        with pytest.raises(InputValidationError) as exc_info:
+            require_full_uuid(_TRUNCATED_PREFIX, field_name='supersedes[0]')
+        assert 'supersedes[0]' in str(exc_info.value)
+
+    def test_oversized_value_is_truncated_in_message(self):
+        with pytest.raises(InputValidationError) as exc_info:
+            require_full_uuid('z' * (1024 * 1024))
+        assert '...(truncated)' in str(exc_info.value)

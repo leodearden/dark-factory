@@ -17,8 +17,8 @@ Hold this end-state in mind; every stage moves toward it:
 2. The target is a git repo (the orchestrator branches task worktrees from `main` — no repo, no worktrees).
 3. A canonical `project_id` is chosen — lowercase, **no hyphens** — and pinned where the directory name would otherwise disagree with it.
 4. A unique escalation port is chosen and recorded.
-5. The target repo contains `dark-factory-orchestrator.yaml`, `.mcp.json`, `.envrc`, a `.gitignore` covering orchestrator scratch dirs, a `.jcodemunch.jsonc` indexer config, a `.claude/settings.json` with the `BASH_MAX_TIMEOUT_MS` env (escalation-watcher waits need it), and (where needed) a `CLAUDE.md` project_id pin.
-6. The project root is registered in `DASHBOARD_KNOWN_PROJECT_ROOTS` (reconciliation, restarted + verified — **before any task is queued**) and added to the `jcodemunch-watcher` `--repos` list (re-indexed).
+5. The target repo contains `dark-factory-orchestrator.yaml`, `.mcp.json`, `.envrc`, a `.gitignore` covering orchestrator scratch dirs, a `.claude/settings.json` with the `BASH_MAX_TIMEOUT_MS` env (escalation-watcher waits need it), and (where needed) a `CLAUDE.md` project_id pin.
+6. The project root is registered in `DASHBOARD_KNOWN_PROJECT_ROOTS` (reconciliation, restarted + verified — **before any task is queued**).
 7. The right next step is launched: existing code → `/spawn /review-briefing` then `/spawn /review` then *offer* `/spawn /prd`; greenfield → a goals discussion, then `/spawn /prd` run 1–5× serially to queue the first task batch.
 
 ## Operating principles
@@ -71,7 +71,6 @@ Exact templates, the verify-command cookbook, and merge-don't-clobber guidance l
 - **`.envrc`** — `export ORCH_CONFIG_PATH="<absolute path to dark-factory-orchestrator.yaml>"`. direnv may not be installed (don't auto-install — offer it); without direnv this file is inert and the orchestrator needs `--config` explicitly.
 - **`.gitignore`** — ensure `.worktrees/`, `.task/`, `.taskmaster/`, `data/escalations/`, `data/queue/`, and `data/reconciliation/` are ignored. `.task/` is critical: if it ever lands on `main` it contaminates every future worktree. `data/queue/` and `data/reconciliation/` hold the managed fused-memory server's runtime SQLite state (write_queue.db, reconciliation.db, tickets.db); if tracked, that state dirties the tree on every write, tripping the startup dirty-tree-guard and poisoning warm-lane GC (task 2439). Merge into any existing `.gitignore` rather than overwriting.
 - **`CLAUDE.md`** — if a project_id pin is needed (hyphenated dir), add it plus the dark-factory routing conventions (route all task ops through fused-memory MCP with `project_root=<target>`; write-tag with `project_id=<id>`). Merge into an existing `CLAUDE.md`, never clobber it.
-- **`.jcodemunch.jsonc`** — the per-project code-indexer config (languages, ignore patterns) so the orchestrator's agents get structured code retrieval over this repo. Detect the language(s) from the repo. **Crucial:** add the project's own heavy dirs to `extra_ignore_patterns` — especially a non-dotfile virtualenv like `venv/`, which the *global* ignore list (`~/.code-index/config.jsonc`, which only knows `.venv/`) won't catch, so the indexer would otherwise crawl thousands of installed library files.
 - **`.claude/settings.json`** — merge `{"env": {"BASH_MAX_TIMEOUT_MS": "3900000"}}` into the target repo's project settings (create the file if absent; merge, never clobber). Every dark-factory project runs interactive escalation-watcher sessions whose canonical watcher waits use `--timeout 3600`; a foreground wait that long needs the Claude Code Bash-tool ceiling raised to ≥ 3660000 ms — without this setting, explicit foreground timeouts are capped at 600000 ms and an omitted timeout dies at the 2-minute default. See `skills/escalation-watcher/SKILL.md` §"Bash-tool timeout contract". Project-level settings ship with the repo so every operator inherits the requirement.
 - `mkdir -p <target>/data/escalations`.
 
@@ -85,26 +84,16 @@ Expect "No tasks found." (or an empty tree) — *not* a config error. This confi
 
 ## Stage 6 — Register with dark-factory's shared services
 
-Two registrations. The reconciliation one is destructive (restarts a shared service) and load-bearing for correctness; the jcodemunch one is cheap and safe.
+One registration, the reconciliation one. It is destructive (restarts a shared service) and load-bearing for correctness.
 
-### 6a. Reconciliation (DESTRUCTIVE — confirm first)
+### Reconciliation (DESTRUCTIVE — confirm first)
 
 Full procedure and rationale in **`references/recon-registration.md`**. The shape:
 
 1. Registration is a **local setting — do NOT commit it.** The committed templates (`scripts/fused-memory.service.template`, `scripts/dashboard.service.template`) intentionally default to this repo only; the maintainer's other projects don't belong in source control (a fresh clone won't have them).
-2. Append `,<target>` to the `DASHBOARD_KNOWN_PROJECT_ROOTS=` line in the **installed** units with a **surgical one-line edit** — `~/.config/systemd/user/fused-memory.service` (governs reconciliation) and, for parity, `~/.config/systemd/user/dark-factory-dashboard.service` (dashboard aggregation) — then `systemctl --user daemon-reload`. Do *not* re-render from the template unless you substitute *both* `__REPO_ROOT__` and `__UV_PATH__` — a partial render leaves `ExecStart` broken.
+2. Append `,<target>` to the `DASHBOARD_KNOWN_PROJECT_ROOTS=` line in the **installed** units with a **surgical one-line edit** — `~/.config/systemd/user/fused-memory.service` (governs reconciliation) and, for parity, `~/.config/systemd/user/dark-factory-dashboard.service` (dashboard aggregation) — then `systemctl --user daemon-reload`. Do *not* hand-roll a `sed` re-render: it strips this host's other roots, and if partial it leaves `__UV_PATH__` literal so `ExecStart` fails. If you do need a full re-render, `scripts/render_systemd_unit.py` no longer strips this host's `DASHBOARD_KNOWN_PROJECT_ROOTS` (tasks 4793, 4796) — see `references/recon-registration.md` for the invocation. **Re-running `scripts/setup-host.sh` is not a substitute for the surgical edit:** it no longer strips the extra roots either, but it also restarts fused-memory (severing this session's MCP tools — see step 3) *without* the confirmation step 3 requires, and re-provisions the whole host besides.
 3. **Confirm with the user, then `systemctl --user restart fused-memory`.** ⚠️ This severs *this* session's fused-memory MCP tools — they do not reconnect. That's acceptable: nothing after this point needs MCP in this session, and the sessions you spawn in Stage 7 get fresh connections to the restarted server.
 4. Verify: a python-urllib probe to `8002/health` returns healthy, and `journalctl --user -u fused-memory` shows the new project in the `project_prefix_registry` line. Detection is heuristic (it may not claim ambiguous prefixes like `src/`), so *confirm in the log* rather than assuming.
-
-### 6b. jcodemunch code indexer (safe)
-
-So the orchestrator's agents get structured code retrieval over the new repo. There's one global `jcodemunch-watcher.service` that watches a **multi-repo `--repos` list**; the live unit (not the single-repo template) is the source of truth for that list.
-
-1. Append ` <target>` to the `--repos` line in `~/.config/systemd/user/jcodemunch-watcher.service` (space-separated), then `systemctl --user daemon-reload`.
-2. `systemctl --user restart jcodemunch-watcher`. Unlike 6a this is cheap and non-disruptive — it just re-indexes and does **not** sever any MCP (the user-scope jcodemunch retrieval MCP is a separate process from the watcher). No confirmation needed beyond the user already wanting jcodemunch.
-3. Verify the project is being indexed: `journalctl --user -u jcodemunch-watcher --since '1 min ago'` mentions `<target>`.
-
-(The global `~/.code-index/config.jsonc` and the user-scope jcodemunch MCP already exist from the dark-factory install — verify, don't recreate.)
 
 ## Stage 7 — Route by code presence
 

@@ -1,0 +1,38 @@
+import sys
+sys.path.insert(0, '/tmp/gate-10069/sim')
+import rep2, gridlib as G
+D = {(r['cell'], r['pol']): r for r in rep2.load('S')['recs']}
+rep2.full('S', 'U')
+def pd(ra, rb):
+    d = [y - x for x, y in zip(ra['lvh_runs'], rb['lvh_runs'])]; m, c = G._ci(d); return '%+.0f±%.0f' % (100 * m / ra['lvh'][0], 100 * c / ra['lvh'][0])
+def line(r, ref=None):
+    ps = r.get('pstat') or {}; ub = max(1, ps.get('ub', 0)); ko = r['kind_out']
+    ret = sum(v[0] for v in ko.values()); pas = sum(v[1] for v in ko.values())
+    return '%.2f %s land/h %.2f vpl %.2f void %.0f%% torn %.0f%% scan %.1f%% red %.0f%% batch %.1f wait %s/%s b2b %s/%s wrong %.2f rider-wait %.1fh >4h %.0f%% >12h %.0f%%' % (
+        r['lvh'][0], ('[%s]' % pd(ref, r)) if ref else '', r['thr'][0], r['vpl'][0], 100 * r['void_share'], 100 * r['torn_share'], 100 * r['scan_share'], 100 * (1 - pas / max(1, ret)),
+        ps.get('ub_n', 0) / ub, rep2.fq(r['good_p50']), rep2.fq(r['good_p95']), rep2.fq(r['bad_p50']), rep2.fq(r['bad_p95']), r['conv_wrong_per100'] + r['false_block_per100'],
+        ps.get('rw_sum', 0) / max(1, ps.get('rw_n', 0)), 100 * ps.get('rw_gt4h', 0) / max(1, ps.get('rw_n', 0)), 100 * ps.get('rw_gt12h', 0) / max(1, ps.get('rw_n', 0)))
+for q in (0.03, 0.05, 0.08, 0.14, 0.20):
+    c0, c1 = 'cap|q=%.2f|W1|env=on|noscan' % q, 'cap|q=%.2f|W1|env=on|scan' % q
+    u = D[(c0, 'U')]
+    print('q=%.2f  [delta vs U]' % q)
+    for p in ('T', 'base'):
+        print('  %-26s %s' % (p, line(D[(c0, p)], u)))
+    print('  %-26s %s' % ('U', line(u)))
+    for (c, p) in D:
+        if c == c1:
+            print('  %-26s %s' % (p[:26], line(D[(c, p)], u)))
+    a0, a1 = D[('cap|q=%.2f|W1|env=on|10995|noscan' % q, 'U')], D[('cap|q=%.2f|W1|env=on|10995|scan' % q, 'U+S riders12')]
+    n0, n1 = D[('cap|q=%.2f|W1|env=on|narrow+riders|noscan' % q, 'U base by cost')], D[('cap|q=%.2f|W1|env=on|narrow+riders|scan' % q, 'U+S riders12 base by cost')]
+    print('  10995 on: U %.2f, U+S riders12 %.2f [%s] | narrowed+riders+base by cost: U %.2f, U+S %.2f [%s], sizes U+S riders12: %s' % (a0['lvh'][0], a1['lvh'][0], pd(a0, a1), n0['lvh'][0], n1['lvh'][0], pd(n0, n1),
+          ' '.join('%d:%d%%' % (i, round(100.0 * D[(c1, 'U+S riders12')]['size'][i] / sum(D[(c1, 'U+S riders12')]['size']))) for i in range(26) if D[(c1, 'U+S riders12')]['size'][i] / sum(D[(c1, 'U+S riders12')]['size']) >= 0.05)))
+print('sensitivity (U+S riders12; delta vs the default scan config ct=0.05, linear, A, flake->pass, miss 0)')
+for q in (0.05, 0.14):
+    d0 = D[('cap|q=%.2f|W1|env=on|scan' % q, 'U+S riders12')]
+    out = []
+    for tag in ('ct=0.02', 'ct=0.10', 'ct=0.20', 'B', 'binary', 'free', 'miss=0.05', 'miss=0.20', 'flake stands'):
+        r = D[('cap|q=%.2f|W1|env=on|scan|%s' % (q, tag), 'U+S riders12')]
+        out.append('%s %s (scan %.0f%%, wrong %.2f)' % (tag, pd(d0, r), 100 * r['scan_share'], r['conv_wrong_per100'] + r['false_block_per100']))
+    print('  q=%.2f: ' % q + ' ; '.join(out))
+    b = D[('cap|q=%.2f|W1|env=on|N150|noscan' % q, 'U')]
+    print('  q=%.2f waiting set 150: U %.2f ; ' % (q, b['lvh'][0]) + ' ; '.join('%s %.2f [%s] land/h %.2f' % (p, D[('cap|q=%.2f|W1|env=on|N150|scan' % q, p)]['lvh'][0], pd(b, D[('cap|q=%.2f|W1|env=on|N150|scan' % q, p)]), D[('cap|q=%.2f|W1|env=on|N150|scan' % q, p)]['thr'][0]) for p in ('U+S riders12', 'U+S 48/96 riders12')))

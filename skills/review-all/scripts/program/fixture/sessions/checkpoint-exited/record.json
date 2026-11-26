@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "session_slug": "fixture-s1-q2-team",
+  "title": "team:fixture S1 Q2",
+  "role": "team",
+  "project": "fixture",
+  "task_id": null,
+  "escalation_id": null,
+  "prompt": "Read /review-all-fixture/home/briefs/S1.investigate-Q2.md and follow it as your brief.",
+  "cwd": "/review-all-fixture/project",
+  "launcher_pid": 4242,
+  "start_ts": "2026-10-19T10:00:00Z",
+  "status": "exited",
+  "exit_code": 0,
+  "result_file": "sessions/checkpoint-exited/result.md",
+  "transcript_path": null,
+  "parent_session_id": null,
+  "spawn_mode": "child",
+  "display": null,
+  "question": null,
+  "claude_session_id": null,
+  "claude_owner_pid": null
+}

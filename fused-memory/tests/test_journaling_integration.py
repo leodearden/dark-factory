@@ -1,12 +1,21 @@
 """Integration tests verifying causation_id flows through all paths."""
 
+import asyncio
+import json
 import uuid
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import pytest_asyncio
+from _queued_write_fixtures import enqueued, envelope, episode_write, queued
 
+from fused_memory.backends.llm_token_usage import (
+    AttributingTokenUsageTracker,
+    measure_llm_tokens,
+)
 from fused_memory.services.memory_service import MemoryService
+from fused_memory.services.queued_writes import QueuedMem0Fact
 from fused_memory.services.write_journal import WriteJournal
 
 
@@ -30,12 +39,18 @@ def service(mock_config, write_journal):
     svc.graphiti.add_episode = AsyncMock(return_value=None)
     svc.graphiti.remove_episode = AsyncMock()
     svc.graphiti.remove_edge = AsyncMock()
+    svc.graphiti.token_probe = lambda: measure_llm_tokens(None)
     install_identity_mocks(svc.graphiti)
 
     svc.mem0 = MagicMock()
     svc.mem0.search = AsyncMock(return_value={'results': []})
     svc.mem0.add = AsyncMock(return_value={'results': [{'id': 'mem0-1'}]})
     svc.mem0.delete = AsyncMock(return_value={'message': 'deleted'})
+    # delete_memory's child gate (task 3197) awaits count_by_metadata on
+    # every mem0 delete; the childless default models the live corpus leaf α
+    # measured (`metadata.parent_id` has zero footprint).
+    svc.mem0.count_by_metadata = AsyncMock(return_value=0)
+    svc.mem0.scroll_by_metadata = AsyncMock(return_value=[])
 
     svc.durable_queue = MagicMock()
     svc.durable_queue.enqueue = AsyncMock(return_value=1)
@@ -90,21 +105,21 @@ async def test_add_episode_logs_write_op_with_causation(service, write_journal):
 
 @pytest.mark.asyncio
 async def test_add_episode_propagates_causation_to_queue(service, write_journal):
-    """Causation_id is injected into the queue payload for later Layer 2 logging."""
+    """Causation_id is carried on the queued value's envelope for later Layer 2 logging."""
     cid = str(uuid.uuid4())
     await service.add_episode(
         content='Test content',
         project_id='test',
         causation_id=cid,
     )
-    payload = service.durable_queue.enqueue.call_args[1]['payload']
-    assert payload['_causation_id'] == cid
-    assert '_write_op_id' in payload
+    value = service.durable_queue.enqueue.call_args.args[0]
+    assert value.envelope.causation_id == cid
+    assert value.envelope.write_op_id is not None
 
 
 @pytest.mark.asyncio
 async def test_graphiti_write_logs_backend_op(service, write_journal):
-    """_execute_graphiti_write logs Layer 2 with causation from payload."""
+    """_execute_graphiti_write logs Layer 2 with causation from the value's envelope."""
     cid = str(uuid.uuid4())
     wid = str(uuid.uuid4())
     payload = {
@@ -116,7 +131,7 @@ async def test_graphiti_write_logs_backend_op(service, write_journal):
         '_causation_id': cid,
         '_write_op_id': wid,
     }
-    await service._execute_graphiti_write('add_episode', payload)
+    await service._execute_graphiti_write(queued('add_episode', payload))
     backend_ops = await write_journal.get_backend_ops_for_write_op(wid)
     assert len(backend_ops) == 1
     assert backend_ops[0]['backend'] == 'graphiti'
@@ -125,7 +140,7 @@ async def test_graphiti_write_logs_backend_op(service, write_journal):
 
 @pytest.mark.asyncio
 async def test_dual_write_callback_enqueues_with_causation(service, write_journal):
-    """Dual-write callback batch-enqueues facts with causation_id in payload."""
+    """Dual-write callback batch-enqueues facts with causation_id on the envelope."""
     from _fm_helpers import MockAddEpisodeResult, MockEdge
 
     cid = str(uuid.uuid4())
@@ -133,19 +148,18 @@ async def test_dual_write_callback_enqueues_with_causation(service, write_journa
         MockEdge(fact='Always use type hints in Python'),
     ])
 
-    payload = {
-        'project_id': 'test',
-        'agent_id': 'test-agent',
-        '_causation_id': cid,
-    }
-    await service._dual_write_callback('dual_write_episode', result, payload)
+    value = episode_write(
+        envelope=envelope(agent_id='test-agent', causation_id=cid),
+    )
+    await service._dual_write_callback(value, result)
 
     service.durable_queue.enqueue_batch.assert_called_once()
-    batch = service.durable_queue.enqueue_batch.call_args[0][0]
+    batch = enqueued(service.durable_queue.enqueue_batch)
     assert len(batch) == 1
-    assert batch[0]['operation'] == 'mem0_classify_and_add'
-    assert batch[0]['payload']['_causation_id'] == cid
-    assert batch[0]['payload']['fact_text'] == 'Always use type hints in Python'
+    fact, _callback = batch[0]
+    assert isinstance(fact, QueuedMem0Fact)
+    assert fact.envelope.causation_id == cid
+    assert fact.fact_text == 'Always use type hints in Python'
 
 
 @pytest.mark.asyncio
@@ -155,7 +169,7 @@ async def test_search_logged_when_causation_present(service, write_journal):
 
     # Without causation — no log
     await service.search(query='test', project_id='test')
-    ops = await write_journal.get_ops_since('2000-01-01T00:00:00')
+    ops = await write_journal.get_stored_ops_since('2000-01-01T00:00:00')
     assert len(ops) == 0
 
     # With causation — logged
@@ -169,7 +183,10 @@ async def test_search_logged_when_causation_present(service, write_journal):
 async def test_delete_memory_logs_both_layers(service, write_journal):
     cid = str(uuid.uuid4())
     await service.delete_memory(
-        memory_id='test-id', store='mem0', project_id='test', causation_id=cid,
+        memory_id='00000000-0000-4000-8000-00000000000b',
+        store='mem0',
+        project_id='test',
+        causation_id=cid,
     )
     ops = await write_journal.get_ops_by_causation(cid)
     write_ops = [o for o in ops if o['layer'] == 'write_op']
@@ -195,3 +212,535 @@ async def test_targeted_recon_source_tag(service, write_journal):
     write_ops = [o for o in ops if o['layer'] == 'write_op']
     assert len(write_ops) == 1
     assert write_ops[0]['source'] == 'targeted_recon'
+
+
+# ------------------------------------------------------------------
+# Terminal queue outcome write-back (task 3582)
+# ------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_record_queue_terminal_outcome_stamps_journal(service, write_journal):
+    """The queue's on_terminal hook lands on the write_ops row."""
+    op_id = str(uuid.uuid4())
+    await write_journal.log_write_op(write_op_id=op_id, operation='add_episode')
+
+    await service._record_queue_terminal_outcome(
+        op_id, 'dead', 'RuntimeError: boom'
+    )
+
+    row = await write_journal.get_write_op(op_id)
+    assert row is not None
+    assert row['terminal_status'] == 'dead'
+    assert 'boom' in row['terminal_error']
+    # "Enqueue accepted" is still true and still recorded.
+    assert row['success'] == 1
+
+
+@pytest.mark.asyncio
+async def test_record_queue_terminal_outcome_without_journal_is_noop(mock_config):
+    """The hook must resolve self._write_journal at CALL time, not capture it.
+
+    server/main.py calls memory_service.initialize() — where the
+    DurableWriteQueue is constructed — BEFORE set_write_journal(), so the
+    journal is None when the queue (and hence the hook) is wired.
+    """
+    svc = MemoryService(mock_config)
+    assert svc._write_journal is None
+    # Must not raise.
+    await svc._record_queue_terminal_outcome('W-none', 'completed', None)
+
+
+@pytest.mark.asyncio
+async def test_execute_mem0_write_journals_on_failure(service, write_journal):
+    """A dead-lettering mem0_add must still leave a Layer-1 row behind.
+
+    This used to journal only after a successful await, so a queued mem0_add
+    that failed its way to 'dead' produced no write_ops row at all — the
+    terminal write-back then had nothing well-formed to land on and the
+    failure was invisible to the journal.
+    """
+    op_id = str(uuid.uuid4())
+    service.mem0.add = AsyncMock(side_effect=RuntimeError('mem0 exploded'))
+
+    with pytest.raises(RuntimeError):
+        await service._execute_mem0_write(
+            queued('mem0_add', {
+                'content': 'a fact that never lands',
+                'project_id': 'test',
+                '_write_op_id': op_id,
+                'metadata': {'category': 'preferences_and_norms'},
+            })
+        )
+
+    row = await write_journal.get_write_op(op_id)
+    assert row is not None, 'a failed queued mem0 write must still be journaled'
+    assert row['operation'] == 'add_memory'
+    assert row['success'] == 0
+    assert 'mem0 exploded' in row['error']
+
+    # ...and the queue's terminal write-back now has a real row to complete.
+    await service._record_queue_terminal_outcome(
+        op_id, 'dead', 'RuntimeError: mem0 exploded'
+    )
+    row = await write_journal.get_write_op(op_id)
+    assert row['terminal_status'] == 'dead'
+    assert row['operation'] == 'add_memory'
+
+
+@pytest.mark.asyncio
+async def test_execute_mem0_write_still_journals_on_success(service, write_journal):
+    """The success path keeps its Layer-1 row, result summary and all."""
+    op_id = str(uuid.uuid4())
+
+    await service._execute_mem0_write(
+        queued('mem0_add', {
+            'content': 'a fact that lands',
+            'project_id': 'test',
+            '_write_op_id': op_id,
+            'metadata': {'category': 'preferences_and_norms'},
+        })
+    )
+
+    row = await write_journal.get_write_op(op_id)
+    assert row is not None
+    assert row['operation'] == 'add_memory'
+    assert row['success'] == 1
+    assert row['error'] is None
+    assert row['result_summary'] is not None
+
+
+@pytest.mark.asyncio
+async def test_execute_mem0_write_journals_cancellation_as_failure(
+    service, write_journal
+):
+    """A CANCELLED queued mem0 write must never journal as a success.
+
+    The durable queue cancels a write in two ordinary ways: the
+    ``asyncio.wait_for(..., self._write_timeout_seconds)`` around every
+    execute (durable_queue.py), and ``close()`` cancelling its worker tasks.
+    Either way the write provably never executed — so the Layer-1 row must
+    say so. ``success`` was derived from the ABSENCE of a recorded error, and
+    ``asyncio.CancelledError`` is a BaseException that sails past
+    ``except Exception``, so the ``finally`` journalled ``success=True`` for a
+    write that never reached mem0 at all.
+
+    Task 3582's property is preserved, not traded away: the row must still
+    EXIST on the cancellation path. Only its content changes.
+    """
+    op_id = str(uuid.uuid4())
+
+    # A plain hanging coroutine function, deliberately NOT an AsyncMock
+    # side_effect: the await must be a real suspension point so wait_for can
+    # actually cancel it mid-flight.
+    async def _hang(*_args, **_kwargs):
+        await asyncio.sleep(30)
+
+    service.mem0.add = _hang
+
+    with pytest.raises(TimeoutError):
+        await asyncio.wait_for(
+            service._execute_mem0_write(
+                queued('mem0_add', {
+                    'content': 'a fact cancelled mid-flight',
+                    'project_id': 'test',
+                    '_write_op_id': op_id,
+                    'metadata': {'category': 'preferences_and_norms'},
+                })
+            ),
+            0.2,
+        )
+
+    row = await write_journal.get_write_op(op_id)
+    assert row is not None, 'a cancelled queued mem0 write must still be journaled'
+    assert row['operation'] == 'add_memory'
+    assert row['success'] == 0, 'a cancelled write never landed — it is not a success'
+    assert 'CancelledError' in (row['error'] or '')
+
+
+@pytest.mark.asyncio
+async def test_a_cancelled_backend_call_still_leaves_a_layer_2_row(
+    service, write_journal
+):
+    """A cancelled backend call must leave a Layer-2 row, not vanish.
+
+    Every backend write routes through one shared Layer-2 helper, and its
+    handler was ``except Exception``. On a cancellation NEITHER branch ran,
+    so no backend_ops row was written at all — the cancelled call simply
+    disappeared from Layer 2. That is the row an operator is sent to when
+    deciding whether a write landed (DurableWriteQueue.get_dead_items), so a
+    missing one leaves the question unanswerable exactly when it is asked.
+
+    Driven through the public ``add_memory``, whose Mem0 leg is a direct
+    journaled call, and cancelled once that call is in flight — the way a
+    request timeout or a client disconnect cancels it.
+    """
+    cid = str(uuid.uuid4())
+    in_flight = asyncio.Event()
+
+    async def _hang(*_args, **_kwargs):
+        in_flight.set()
+        await asyncio.sleep(30)
+
+    service.mem0.add = _hang
+
+    call = asyncio.create_task(
+        service.add_memory(
+            content='a fact cancelled mid-flight',
+            category='preferences_and_norms',
+            project_id='test',
+            causation_id=cid,
+        )
+    )
+    try:
+        await asyncio.wait_for(in_flight.wait(), 10)
+    finally:
+        call.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await call
+
+    ops = await write_journal.get_ops_by_causation(cid)
+    mem0_adds = [
+        o for o in ops
+        if o['layer'] == 'backend_op' and o['backend'] == 'mem0' and o['operation'] == 'add'
+    ]
+    assert len(mem0_adds) == 1, 'a cancelled backend call must still be journaled'
+    assert mem0_adds[0]['success'] == 0
+    assert 'CancelledError' in (mem0_adds[0]['error'] or '')
+
+
+@pytest.mark.asyncio
+async def test_add_episode_journals_cancellation_as_failure(service, write_journal):
+    """A cancelled add_episode enqueue must never journal as a success.
+
+    Per the write_ops schema, a row's ``success`` means "the enqueue was
+    ACCEPTED" — it is stamped the instant durable_queue.enqueue() commits.
+    An enqueue cancelled mid-commit was therefore never accepted, and is by
+    definition not a success.
+
+    This is the same defect as ``_execute_mem0_write``'s (optimistic
+    ``success = True`` initialiser + ``except Exception`` + a ``finally``
+    that journals it) on the far higher-traffic producer: the ``mem0_add``
+    queue operation has no live producer at all, while ``add_episode`` is
+    the hot Layer-1 path. The two are a documented pair — each file's
+    comment already names the other as its mirror — so they are fixed
+    together.
+    """
+    cid = str(uuid.uuid4())
+
+    async def _hang(*_args, **_kwargs):
+        await asyncio.sleep(30)
+
+    service.durable_queue.enqueue = _hang
+
+    with pytest.raises(TimeoutError):
+        await asyncio.wait_for(
+            service.add_episode(
+                content='never enqueued',
+                project_id='test',
+                causation_id=cid,
+            ),
+            0.2,
+        )
+
+    # add_episode mints its write_op_id internally and never returns it, so
+    # causation_id is the only join key available here.
+    ops = await write_journal.get_ops_by_causation(cid)
+    write_ops = [o for o in ops if o['layer'] == 'write_op']
+    assert len(write_ops) == 1, 'a cancelled add_episode must still be journaled'
+    assert write_ops[0]['operation'] == 'add_episode'
+    assert write_ops[0]['success'] == 0, 'an enqueue that never committed is not accepted'
+    assert 'CancelledError' in (write_ops[0]['error'] or '')
+
+
+# ── task 3212: the SECOND copy of the search-telemetry shape ──────────
+#
+# MemoryService.search self-journals whenever causation_id is truthy — the
+# whole reconciliation read path.  Widening only the MCP tool would leave
+# every recon-path row unusable by leaf eta (3213) while LOOKING done, and
+# would leave two copies of one shape free to drift (INV-5).
+
+_LONG_QUERY = (
+    'what did reconciliation actually retrieve for this task event, and did the '
+    'agent that later wrote a near-duplicate memory ever see the canonical it '
+    'duplicated, across a query long enough that the old 200-character cut would '
+    'have discarded the half that carries the question ENDMARKER'
+)
+assert len(_LONG_QUERY) > 200, 'fixture must exceed the old 200-char truncation'
+
+
+def _mem0_hit(memory_id: str, memory: str, score: float) -> dict:
+    return {'id': memory_id, 'memory': memory, 'score': score, 'metadata': {}}
+
+
+@pytest.mark.asyncio
+async def test_write_journal_is_a_public_read_only_accessor(mock_config, write_journal):
+    """ContextAssembler must reach the journal without touching a private attribute."""
+    from _fm_helpers import install_identity_mocks
+
+    svc = MemoryService(mock_config)
+    svc.graphiti = MagicMock()
+    install_identity_mocks(svc.graphiti)
+
+    assert svc.write_journal is None, (
+        'An unwired service must report None so a caller can skip journalling '
+        f'rather than crash, got {svc.write_journal!r}. RED: accessor missing.'
+    )
+
+    svc.set_write_journal(write_journal)
+    assert svc.write_journal is write_journal, (
+        'The public accessor must return the journal wired by set_write_journal — '
+        'reaching across a package boundary into _write_journal is what this '
+        f'property exists to avoid. got {svc.write_journal!r}. RED: accessor missing.'
+    )
+
+
+@pytest.mark.asyncio
+async def test_causation_search_row_carries_the_widened_shape(service, write_journal):
+    """The recon read path must journal the SAME shape as the MCP tool."""
+    cid = str(uuid.uuid4())
+    service.mem0.search = AsyncMock(
+        return_value={
+            'results': [
+                _mem0_hit('mem0-aaa', 'the canonical body', 0.81),
+                _mem0_hit('mem0-bbb', 'a shorter body', 0.42),
+            ]
+        }
+    )
+
+    await service.search(query=_LONG_QUERY, project_id='test', causation_id=cid)
+
+    ops = await write_journal.get_ops_by_causation(cid)
+    rows = [o for o in ops if o.get('operation') == 'search']
+    assert len(rows) == 1, f'Expected one journalled search row, got {ops!r}'
+    summary = json.loads(rows[0]['result_summary'])
+    params = json.loads(rows[0]['params'])
+
+    entries = summary.get('results') or []
+    assert [e['id'] for e in entries] == ['mem0-aaa', 'mem0-bbb'], (
+        'The recon read path must record per-result IDs too — leaf eta reads these '
+        f'rows, not just the MCP ones. got {summary!r}. '
+        "RED: this copy of the shape is still {'count': N}."
+    )
+    assert [e['content_size'] for e in entries] == [
+        len('the canonical body'),
+        len('a shorter body'),
+    ], f'Per-result content sizes must be recorded, got {summary!r}. RED: not widened.'
+    assert all(e['relevance_score'] is not None for e in entries), (
+        f'Per-result relevance scores must be recorded, got {summary!r}. RED: not widened.'
+    )
+    assert summary.get('size_unit') == 'chars', (
+        f'The size unit must be NAMED on this row too, got {summary!r}. RED: not widened.'
+    )
+    assert 'failed_stores' in summary, (
+        'failed_stores was already recorded here and must SURVIVE the widening — a '
+        f'widening that drops a pre-existing fact is a regression. got {summary!r}.'
+    )
+    assert summary.get('degraded') is False, (
+        'The recon producer stamps degraded by the same rule as the other two, so a '
+        f'healthy row says so rather than staying silent. got {summary!r}.'
+    )
+    assert params.get('query') == _LONG_QUERY, (
+        'The full query must be journalled on the recon path as well, '
+        f'got {params.get("query")!r}. RED: still truncated at 200.'
+    )
+    assert params.get('query_truncated') is False, (
+        'The query bound is disclosed on this row too — one contract, three '
+        f'producers. got {params!r}.'
+    )
+
+
+# ── task 3716: per-call backend telemetry on the persisted Layer-2 row ──
+#
+# The 10 ms sleep is the floor; 9.0 ms leaves ~1 ms for asyncio firing a timer
+# up to one clock resolution early (perf_counter and the loop clock are both
+# CLOCK_MONOTONIC on Linux).
+
+_SLEEP_SECONDS = 0.01
+_MIN_MEASURED_MS = 9.0
+
+
+@pytest.mark.asyncio
+async def test_successful_backend_call_persists_measured_duration_ms(
+    service, write_journal
+):
+    cid = str(uuid.uuid4())
+
+    async def _slow_add(*_args, **_kwargs):
+        await asyncio.sleep(_SLEEP_SECONDS)
+        return {'results': [{'id': 'mem0-1'}]}
+
+    service.mem0.add = _slow_add
+
+    await service.add_memory(
+        content='a fact that takes a while to land',
+        category='preferences_and_norms',
+        project_id='test',
+        causation_id=cid,
+    )
+
+    ops = await write_journal.get_ops_by_causation(cid)
+    [mem0_add] = [
+        o for o in ops
+        if o['layer'] == 'backend_op' and o['backend'] == 'mem0' and o['operation'] == 'add'
+    ]
+    assert isinstance(mem0_add['duration_ms'], float)
+    assert mem0_add['duration_ms'] >= _MIN_MEASURED_MS
+
+
+@pytest.mark.asyncio
+async def test_failed_backend_call_still_persists_measured_duration_ms(
+    service, write_journal
+):
+    cid = str(uuid.uuid4())
+
+    async def _slow_failing_add(*_args, **_kwargs):
+        await asyncio.sleep(_SLEEP_SECONDS)
+        raise RuntimeError('mem0 exploded after burning time')
+
+    service.mem0.add = _slow_failing_add
+
+    await service.add_memory(
+        content='a fact that never lands',
+        category='preferences_and_norms',
+        project_id='test',
+        causation_id=cid,
+    )
+
+    ops = await write_journal.get_ops_by_causation(cid)
+    [backend_row] = [o for o in ops if o['layer'] == 'backend_op']
+    assert backend_row['success'] == 0
+    assert isinstance(backend_row['duration_ms'], float)
+    assert backend_row['duration_ms'] >= _MIN_MEASURED_MS
+
+
+_EPISODE_RESULT = 'episode-result-sentinel'
+
+
+def _graphiti_write_payload(cid: str, wid: str) -> dict:
+    return {
+        'name': 'test',
+        'content': 'test content',
+        'source': 'text',
+        'group_id': 'test',
+        'source_description': '',
+        '_causation_id': cid,
+        '_write_op_id': wid,
+    }
+
+
+@pytest.fixture
+def llm_tracked_client(service) -> SimpleNamespace:
+    """The graphiti mock's token probe measures this client's tracker."""
+    client = SimpleNamespace(token_tracker=AttributingTokenUsageTracker())
+    service.graphiti.token_probe = lambda: measure_llm_tokens(client)
+    return client
+
+
+@pytest.mark.asyncio
+async def test_graphiti_write_persists_its_llm_tokens_and_duration(
+    service, write_journal, llm_tracked_client
+):
+    async def _add_episode(**_kwargs):
+        llm_tracked_client.token_tracker.record('extract_nodes', 120, 45)
+        return _EPISODE_RESULT
+
+    service.graphiti.add_episode = _add_episode
+    wid = str(uuid.uuid4())
+
+    await service._execute_graphiti_write(
+        queued('add_episode', _graphiti_write_payload(str(uuid.uuid4()), wid))
+    )
+
+    [row] = await write_journal.get_backend_ops_for_write_op(wid)
+    assert isinstance(row['duration_ms'], float)
+    assert row['duration_ms'] > 0
+    summary = json.loads(row['result_summary'])
+    assert summary['tokens'] == {
+        'input_tokens': 120,
+        'output_tokens': 45,
+        'total_tokens': 165,
+        'llm_calls': 1,
+    }
+    assert summary['result'] == _EPISODE_RESULT
+
+
+@pytest.mark.asyncio
+async def test_failed_graphiti_write_still_persists_the_tokens_it_recorded(
+    service, write_journal, llm_tracked_client
+):
+    async def _add_episode(**_kwargs):
+        llm_tracked_client.token_tracker.record('extract_nodes', 10, 2)
+        raise RuntimeError('extraction failed after an LLM call')
+
+    service.graphiti.add_episode = _add_episode
+    wid = str(uuid.uuid4())
+
+    with pytest.raises(RuntimeError, match='extraction failed'):
+        await service._execute_graphiti_write(
+            queued('add_episode', _graphiti_write_payload(str(uuid.uuid4()), wid))
+        )
+
+    [row] = await write_journal.get_backend_ops_for_write_op(wid)
+    assert row['success'] == 0
+    assert json.loads(row['result_summary'])['tokens']['total_tokens'] == 12
+
+
+@pytest.mark.asyncio
+async def test_mem0_backend_row_keeps_its_plain_string_result_summary(
+    service, write_journal, llm_tracked_client
+):
+    cid = str(uuid.uuid4())
+
+    await service.add_memory(
+        content='a fact with no graphiti LLM spend',
+        category='preferences_and_norms',
+        project_id='test',
+        causation_id=cid,
+    )
+
+    ops = await write_journal.get_ops_by_causation(cid)
+    [mem0_add] = [
+        o for o in ops
+        if o['layer'] == 'backend_op' and o['backend'] == 'mem0' and o['operation'] == 'add'
+    ]
+    assert mem0_add['result_summary'] == str({'results': [{'id': 'mem0-1'}]})
+    assert 'tokens' not in mem0_add['result_summary']
+
+
+@pytest.mark.asyncio
+async def test_unmeasured_graphiti_write_keeps_its_plain_result_summary(
+    service, write_journal
+):
+    service.graphiti.add_episode = AsyncMock(return_value=_EPISODE_RESULT)
+    wid = str(uuid.uuid4())
+
+    await service._execute_graphiti_write(
+        queued('add_episode', _graphiti_write_payload(str(uuid.uuid4()), wid))
+    )
+
+    [row] = await write_journal.get_backend_ops_for_write_op(wid)
+    assert row['success'] == 1
+    assert row['result_summary'] == _EPISODE_RESULT
+
+
+@pytest.mark.asyncio
+async def test_a_token_probe_that_cannot_open_is_journaled_as_the_backend_failure(
+    service, write_journal
+):
+    def _unopenable_probe():
+        raise RuntimeError('token probe unavailable')
+
+    service.graphiti.token_probe = _unopenable_probe
+    wid = str(uuid.uuid4())
+
+    with pytest.raises(RuntimeError, match='token probe unavailable'):
+        await service._execute_graphiti_write(
+            queued('add_episode', _graphiti_write_payload(str(uuid.uuid4()), wid))
+        )
+
+    [row] = await write_journal.get_backend_ops_for_write_op(wid)
+    assert row['success'] == 0
+    assert row['error'] == 'RuntimeError: token probe unavailable'
+    assert isinstance(row['duration_ms'], float)
+    service.graphiti.add_episode.assert_not_awaited()

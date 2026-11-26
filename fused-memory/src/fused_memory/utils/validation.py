@@ -12,6 +12,9 @@ from __future__ import annotations
 import logging
 import os
 import re
+import uuid
+
+from shared.project_id import normalize_project_id
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +64,50 @@ def _is_plain_int(x: object) -> bool:
     as list[int] element IDs.
     """
     return isinstance(x, int) and not isinstance(x, bool)
+
+
+# Remediation text for a rejected non-full-UUID id.  Single-sourced here so the
+# structured `hint` key returned by validate_full_uuid and the message raised by
+# require_full_uuid stay in agreement.
+_FULL_UUID_HINT = (
+    'Resolve the full 36-character UUID first — call search or get_memory_by_id '
+    'and pass that result\'s `id` field verbatim. An 8-character hex prefix read '
+    'out of a search-result snippet is not a valid id.'
+)
+
+
+def is_full_uuid(value: object) -> bool:
+    """True iff *value* is a canonical full-UUID string.
+
+    Deliberately stricter than a bare ``uuid.UUID(value)`` call, which also
+    accepts the 32-char undashed form, braced forms and ``urn:uuid:``
+    prefixes.  Requiring the canonical 36-char dashed rendering is what
+    rejects the ``short_hex`` shape the census counted (3 live ``supersedes``
+    members) and truncated hex generally — a bare parse would let a
+    32-hex-digit string through as "well formed" while no store would
+    resolve it in that spelling.
+
+    Case is tolerated (``str(uuid.UUID(x))`` is lowercase) because casing is
+    a rendering choice, not a different identifier.  Graphiti/Neo4j and mem0
+    do not normalise UUID case on read-back, so rejecting an uppercase id
+    here would mask real edges and memories as malformed before the store is
+    even called.
+
+    Surrounding whitespace is rejected, and that rejection is intentional
+    rather than incidental: ``uuid.UUID`` strips ``urn:``/``uuid:`` prefixes,
+    braces and dashes, but never whitespace — so ``'<uuid>\\n'`` yields a
+    33-character hex body and raises.  This is the one behaviour an anchored
+    ``^...$`` regex applied with ``.match()`` cannot reproduce, because
+    Python's ``$`` matches immediately before a trailing newline; such an id
+    would pass a regex gate and then silently resolve to nothing downstream.
+    """
+    if not isinstance(value, str):
+        return False
+    try:
+        parsed = uuid.UUID(value)
+    except (ValueError, AttributeError, TypeError):
+        return False
+    return str(parsed) == value.lower()
 
 
 def _validate_identifier(value: str, field_name: str) -> dict[str, str] | None:
@@ -146,6 +193,30 @@ def validate_int_ids(ids: object, *, name: str = 'ids') -> dict[str, str] | None
     return None
 
 
+def validate_full_uuid(
+    value: object, *, field_name: str = 'memory_id'
+) -> dict[str, str] | None:
+    """Return an error dict if *value* is not a canonical full UUID, else None.
+
+    Shape rules live in :func:`is_full_uuid`.  The ``field_name`` keyword
+    argument customises the field label in the error message so the helper
+    generalises to callers validating list members (e.g. ``supersedes[0]``).
+
+    Unlike the sibling validators this returns a third ``hint`` key: a caller
+    that supplied a truncated id needs to be told how to obtain the real one,
+    not merely that the one it sent was wrong.
+    """
+    if is_full_uuid(value):
+        return None
+    return {
+        'error': (
+            f'{field_name} must be a full 36-character UUID, got {_safe_repr(value)}'
+        ),
+        'error_type': 'ValidationError',
+        'hint': _FULL_UUID_HINT,
+    }
+
+
 def require_project_root(project_root: str) -> None:
     """Raise InputValidationError if project_root is not a non-empty absolute path."""
     if err := validate_project_root(project_root):
@@ -168,6 +239,17 @@ def require_int_ids(ids: object, *, name: str = 'ids') -> None:
     """Raise InputValidationError if ids is not a list of plain (non-bool) integers."""
     if err := validate_int_ids(ids, name=name):
         raise InputValidationError(err['error'])
+
+
+def require_full_uuid(value: object, *, field_name: str = 'memory_id') -> None:
+    """Raise InputValidationError if *value* is not a canonical full UUID.
+
+    The hint is folded into the exception message because an exception has no
+    room for a separate structured key — see :func:`validate_full_uuid` for the
+    MCP-facing form that keeps them apart.
+    """
+    if err := validate_full_uuid(value, field_name=field_name):
+        raise InputValidationError(f'{err["error"]} {err["hint"]}')
 
 
 def validate_known_project_id(
@@ -247,39 +329,19 @@ class PathShapedProjectIdError(ValueError):
     """Raised when a project_id looks like a mangled filesystem path rather
     than a clean project key (e.g. '-home-leo-src-dark-factory').
 
-    Path-shaped ids must NEVER be silently normalized: lower() +
-    replace('-', '_') would map a mangled path to a NEW, wrong canonical
-    key (e.g. '-home-leo-src-dark-factory' -> '_home_leo_src_dark_factory'),
-    compounding the RCA §4 cross-graph leak hazard instead of fixing it.
-    Callers must reject path-shaped input LOUDLY rather than canonicalizing
-    it. Subclasses ValueError so ``except ValueError`` callers still catch it.
+    Path-shaped ids must NEVER be silently normalized:
+    ``shared.project_id.normalize_project_id`` would map a mangled path to a
+    NEW, wrong canonical key (e.g. '-home-leo-src-dark-factory' ->
+    '_home_leo_src_dark_factory'), compounding the RCA §4 cross-graph leak
+    hazard instead of fixing it. Callers must reject path-shaped input LOUDLY
+    rather than canonicalizing it. Subclasses ValueError so ``except
+    ValueError`` callers still catch it.
     """
-
-
-def _to_underscore_canonical(raw: str) -> str:
-    """Pure normalization step: lowercase *raw* and map hyphens to underscores.
-
-    No validation or rejection here -- this is only the mapping rule itself,
-    factored out so it has a single source of truth. Shared by:
-
-    - :func:`canonicalize_project_id` below, which applies this AFTER its
-      path-shape guard (raw project_id input may be path-shaped and must be
-      rejected, not normalized).
-    - :func:`fused_memory.models.scope.resolve_project_id`, which applies
-      this to an already-extracted path basename (via ``PurePosixPath(...).name``),
-      where the path-shape guard does not apply -- resolve_project_id's
-      long-standing contract is to always normalize, never raise, and is
-      relied on by ~15 call sites across the codebase.
-
-    Leading underscore marks this as an internal helper for those two known
-    call sites, not a general-purpose public API.
-    """
-    return raw.lower().replace('-', '_')
 
 
 def canonicalize_project_id(raw: str) -> str:
-    """Return the underscore-canonical form of *raw*: lowercased, with
-    hyphens mapped to underscores.
+    """Return ``shared.project_id.normalize_project_id(raw)``, the one
+    project-id rule, after refusing path-shaped input.
 
     This is a normalizer, not a validator: it does not reject empty strings
     or enforce a charset allowlist (see validate_project_id for that). Its
@@ -289,8 +351,8 @@ def canonicalize_project_id(raw: str) -> str:
     a mangled path would produce a NEW, wrong canonical key (RCA §4).
 
     Idempotent: canonicalize_project_id(canonicalize_project_id(x)) ==
-    canonicalize_project_id(x) for any non-path-shaped x, since lower() and
-    replace('-', '_') are each idempotent and a non-path-shaped input's
+    canonicalize_project_id(x) for any non-path-shaped x, since
+    normalize_project_id is idempotent and a non-path-shaped input's
     canonical form is itself never path-shaped.
     """
     if is_path_shaped_name(raw):
@@ -300,4 +362,4 @@ def canonicalize_project_id(raw: str) -> str:
             'would silently produce a new, wrong canonical key). Pass the '
             'resolved project_id instead.'
         )
-    return _to_underscore_canonical(raw)
+    return normalize_project_id(raw)

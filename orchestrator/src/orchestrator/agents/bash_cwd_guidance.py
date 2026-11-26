@@ -1,0 +1,86 @@
+"""Role-prompt guidance: an earlier `cd` can move every later relative path, or strand the shell in a deleted directory.
+
+`orchestrator/src/orchestrator/agents/harness_guidance.py::BASH_CAPABLE_ROLE_PREAMBLE`
+splices `BASH_CWD_ANCHOR_GUIDANCE` into every role holding unqualified `Bash`.
+It is a leaf module, imported downward by harness_guidance.py. Provenance:
+reify #7924 via task 5971; dark_factory codebook entry-cand-20260729-4;
+codebook entry-cand-20261118-2 via task 11554.
+
+The block is one section built from two named halves.
+`LINGERING_CD_GUIDANCE` covers a `cd` that outlives its call and moves every
+later relative path. `DELETED_CWD_GUIDANCE` covers a call that removes the
+directory its own shell stands in, which strands the shell.
+
+The mechanical counterpart is
+`orchestrator/src/orchestrator/agents/invoke.py::apply_bash_cwd_reset_env`.
+This prose is written to hold whether or not the shell is reset: non-Claude
+backends ignore that env var, and an operator may opt out.
+
+`orchestrator/src/orchestrator/agents/path_not_found_guidance.py::PATH_NOT_FOUND_GUIDANCE`
+owns RECOVERING a not-found path by search; this block owns the CWD cause and
+its prevention.
+
+`orchestrator/tests/test_roles_bash_cwd_anchor.py` checks the block's shape,
+its composition and its splice, never its wording.
+"""
+
+LINGERING_CD_GUIDANCE = """
+## Where your shell stands: a lingering `cd`, or a deleted directory
+
+You are dispatched with your working directory at the ROOT of your checkout.
+Whether a `cd` outlives the `Bash` call that ran it depends on the session: in
+some, the shell stays in that directory for every later call -- including
+after a `cd` buried in a compound command many turns ago; in others it is put
+back at the root, often silently. A relative or omitted `path` given to `Grep`
+or `Glob` resolves against that same shell directory. A repo-root-relative
+path used after a lingering `cd` then fails as "No such file or directory" or
+"Path does not exist" for a file that is really there, and the shell's error
+names neither the directory you assumed nor the one you got. Rely on neither
+behaviour:
+
+- Keep a `cd` in the command that needs it -- `cd crates/foo && cargo test` --
+  never in an earlier call.
+- Anchor any command that uses repo-root-relative paths:
+  `cd "$(git rev-parse --show-toplevel)" && <command>`. That query answers with
+  the checkout root from every directory inside it.
+- Give `Read`, `Grep` and `Glob` an ABSOLUTE path. Leaving `path` out does not
+  help: an omitted path is the same shell directory.
+- When a repo-root-relative path you expected comes back not-found, check
+  where the shell is before anything else: run `pwd` and
+  `git rev-parse --show-toplevel`. A drifted directory breaks EVERY relative
+  path you use next, not only this one, so fix the directory once. Searching
+  for the file by name recovers that one path; fixing the directory recovers
+  all of them. A `Grep` "Path does not exist" error already names your current
+  working directory -- read it.
+- A `Bash` result ending "Shell cwd was reset to <dir>" means the harness put
+  you back at <dir>, and the `cd` in that call did not carry over. Its absence
+  proves nothing: the reset can also be silent.
+"""
+
+DELETED_CWD_GUIDANCE = """
+LEAVE A DIRECTORY BEFORE YOU DELETE IT. A call that `cd`s into a scratch
+directory (a `mktemp -d` dir, a throwaway `git worktree add`) and then removes
+it leaves the shell standing in a directory that no longer exists. Measured
+2026-11-25 (Claude Code CLI 2.1.330, dispatched session):
+`D=$(mktemp -d) && cd "$D" && rm -rf "$D"; echo after` printed `after`, then
+"pwd: error retrieving current directory: getcwd: cannot access parent
+directories: No such file or directory". The call reported "Exit code 1",
+although every command in it succeeded. Where the `cd` persists, the NEXT call
+is refused unrun with "Working directory ... no longer exists, so this command
+was not run", even a call that opens with an absolute `cd`; the shell is then
+put back at its launch directory (observed 2026-11-18, CLI 2.1.325).
+
+- Run the entered part in a subshell, `( cd "$D" && <command> )`, so the `cd`
+  ends with it. Or pass the directory instead of entering it: `git -C "$D"`,
+  `uv run --directory "$D"`, absolute paths. Not `uv run --project "$D"`: the
+  child it starts still runs in your shell's directory.
+- Before removing a directory you may be inside, `cd` to an absolute path
+  outside it. `cd ..` from a subdirectory of it does not get you out. Nor does
+  `cd "$(git rev-parse --show-toplevel)"` from inside a scratch worktree: that
+  answers with the scratch worktree itself.
+- A getcwd line or "Exit code 1" straight after such a removal is the stranded
+  shell, not a failure of your commands: read their own output. A call refused
+  as "not run" did nothing, so re-issue it.
+"""
+
+BASH_CWD_ANCHOR_GUIDANCE = LINGERING_CD_GUIDANCE + DELETED_CWD_GUIDANCE

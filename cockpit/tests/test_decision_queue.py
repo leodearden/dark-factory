@@ -3,8 +3,8 @@ formatting, and order_queue's queue-build/sort (Fleet Cockpit C5b, PRD §9).
 
 Pure, deterministic unit tests only -- no Textual import, no pilot. The
 DecisionQueue(DataTable) widget itself is covered by test_app.py's pilot
-tests (a later C5b step). Mirrors test_registry_reader.py/test_app.py's
-_make_record convention: a fields dict + .update(overrides).
+tests (a later C5b step). Mirrors test_registry_reader.py::_make_record and
+_cockpit_session_records.py::make_record: a fields dict + .update(overrides).
 """
 
 from __future__ import annotations
@@ -13,7 +13,8 @@ from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import cast
 
-from orchestrator import session_registry as sr
+from orchestrator import decision_registry as dr
+from orchestrator import session_records
 
 from cockpit.panes.decision_queue import QueueItem, _QueueRowLike
 
@@ -56,8 +57,8 @@ def _make_queue_item(**overrides) -> QueueItem:
         'filed_at': datetime(2026, 7, 1, tzinfo=UTC),
         'score': 1.0,
         'target': None,
-        'handling': False,
         'escalation_id': 'esc-1',
+        'session_slug': None,
     }
     fields.update(overrides)
     return QueueItem(**fields)
@@ -71,14 +72,14 @@ def _make_decision(**overrides):
         'filed_at': '2026-07-07T00:00:00+00:00',
     }
     fields.update(overrides)
-    return sr.DecisionRecord(**fields)
+    return dr.DecisionRecord(**fields)
 
 
 def _make_session(**overrides):
-    """Mirrors test_app.py/test_registry_reader.py's _make_record convention."""
+    """Mirrors _cockpit_session_records.py::make_record and test_registry_reader.py::_make_record."""
     fields: dict = {
         'session_slug': 'unblock-df-2085-4242',
-        'status': sr.Status.RUNNING,
+        'status': session_records.Status.RUNNING,
         'title': 'unblock:df#2085 slug',
         'role': 'unblock',
         'project': 'df',
@@ -86,7 +87,7 @@ def _make_session(**overrides):
         'start_ts': '2026-07-07T00:00:00+00:00',
     }
     fields.update(overrides)
-    return sr.SessionRecord(**fields)
+    return session_records.SessionRecord(**fields)
 
 
 class TestScoringAdapters:
@@ -97,7 +98,7 @@ class TestScoringAdapters:
         decision = _make_decision(
             project='df',
             manual_boost=3,
-            state=sr.DecisionState.OPEN,
+            state=dr.DecisionState.OPEN,
             filed_at='2026-07-01T00:00:00+00:00',
         )
 
@@ -125,7 +126,7 @@ class TestScoringAdapters:
         """state is copied through verbatim -- order_queue is what filters to 'open'."""
         from cockpit.panes.decision_queue import decision_to_scoring_item
 
-        decision = _make_decision(state=sr.DecisionState.DROPPED)
+        decision = _make_decision(state=dr.DecisionState.DROPPED)
 
         item = decision_to_scoring_item(decision, now=_NOW)
 
@@ -153,9 +154,9 @@ class TestScoringAdapters:
         from cockpit.panes.decision_queue import session_to_scoring_item
 
         session = _make_session(
-            status=sr.Status.AWAITING_INPUT,
+            status=session_records.Status.AWAITING_INPUT,
             project='df',
-            question=sr.Question(text='Which port?', asked_at='2026-07-05T00:00:00+00:00'),
+            question=session_records.Question(text='Which port?', asked_at='2026-07-05T00:00:00+00:00'),
         )
 
         item = session_to_scoring_item(session, now=_NOW)
@@ -171,7 +172,7 @@ class TestScoringAdapters:
         from cockpit.panes.decision_queue import session_to_scoring_item
 
         session = _make_session(
-            status=sr.Status.AWAITING_INPUT,
+            status=session_records.Status.AWAITING_INPUT,
             question=None,
             start_ts='2026-07-03T00:00:00+00:00',
         )
@@ -183,7 +184,7 @@ class TestScoringAdapters:
     def test_session_to_scoring_item_empty_start_ts_degrades_to_now(self):
         from cockpit.panes.decision_queue import session_to_scoring_item
 
-        session = _make_session(status=sr.Status.AWAITING_INPUT, question=None, start_ts='')
+        session = _make_session(status=session_records.Status.AWAITING_INPUT, question=None, start_ts='')
 
         item = session_to_scoring_item(session, now=_NOW)
 
@@ -193,12 +194,102 @@ class TestScoringAdapters:
         from cockpit.panes.decision_queue import session_to_scoring_item
 
         session = _make_session(
-            status=sr.Status.AWAITING_INPUT, question=None, start_ts='not-a-timestamp'
+            status=session_records.Status.AWAITING_INPUT, question=None, start_ts='not-a-timestamp'
         )
 
         item = session_to_scoring_item(session, now=_NOW)
 
         assert item.filed_at == _NOW
+
+
+class TestQuestionWidth:
+    """derive_question_width(items, now, available_width) -- how many cells
+    the question column gets once the three fixed columns have taken theirs.
+
+    Pure: the widget supplies the measured width, this decides the bound.
+    With _make_row_item()'s defaults at available_width=200, cell_padding=1
+    the three fixed columns render 7 + 5 + 14 = 26 cells ('score' the label
+    beats '1.0', 'age' the label ties '10d', 'project#task' the label beats
+    'df#2085', each plus two padding cells), leaving 200 - 26 - 2 == 172.
+    """
+
+    def test_wide_terminal_leaves_the_question_everything_the_others_do_not_take(self):
+        from cockpit.panes.decision_queue import derive_question_width
+
+        assert derive_question_width([_make_row_item()], _NOW, 200) == 172
+
+    def test_a_column_label_wider_than_every_cell_sets_that_column_s_floor(self):
+        from cockpit.panes.decision_queue import derive_question_width
+
+        item = _make_row_item(project='d', task_id=None)
+
+        assert derive_question_width([item], _NOW, 200) == 172
+
+    def test_a_cell_wider_than_its_label_takes_the_excess_from_the_question(self):
+        from cockpit.panes.decision_queue import derive_question_width
+
+        long_project = 'a-very-long-project-name-here'
+        item = _make_row_item(project=long_project, task_id=None)
+
+        excess = len(long_project) - len('project#task')
+
+        assert derive_question_width([item], _NOW, 200) == 172 - excess
+
+    def test_the_bound_grows_one_for_one_with_the_available_width(self):
+        from cockpit.panes.decision_queue import derive_question_width
+
+        items = [_make_row_item()]
+
+        wide = derive_question_width(items, _NOW, 300)
+        narrow = derive_question_width(items, _NOW, 200)
+
+        assert wide - narrow == 100
+
+    def test_zero_cell_padding_frees_two_cells_per_column(self):
+        from cockpit.panes.decision_queue import derive_question_width
+
+        items = [_make_row_item()]
+
+        padded = derive_question_width(items, _NOW, 200, cell_padding=1)
+        unpadded = derive_question_width(items, _NOW, 200, cell_padding=0)
+
+        assert unpadded - padded == 8
+
+    def test_a_narrow_terminal_floors_rather_than_going_to_zero_or_negative(self):
+        from cockpit.panes.decision_queue import derive_question_width
+
+        bound = derive_question_width([_make_row_item()], _NOW, 30)
+
+        assert bound == 20
+        assert bound >= len('(no question)')
+
+    def test_an_unmeasured_width_returns_the_pre_layout_fallback(self):
+        from cockpit.panes.decision_queue import derive_question_width
+
+        assert derive_question_width([_make_row_item()], _NOW, 0) == 60
+
+    def test_no_items_still_reserves_the_three_column_labels(self):
+        from cockpit.panes.decision_queue import derive_question_width
+
+        assert derive_question_width([], _NOW, 200) == 172
+
+    def test_a_double_width_cell_claims_two_cells_per_character(self):
+        """The budget is spent in the unit Textual lays a column out in.
+        Measured in characters, a 6-character CJK project would claim 6 of
+        the 12 'project#task' already reserves and cost the question column
+        nothing -- while rendering 12 cells wide on screen and pushing the
+        row past the terminal."""
+        from cockpit.panes.decision_queue import derive_question_width
+
+        item = _make_row_item(project='プロジェクト', task_id=None)
+
+        # 6 characters, 12 cells: exactly ties 'project#task''s own 12
+        assert derive_question_width([item], _NOW, 200) == 172
+
+        wider = _make_row_item(project='プロジェクトー', task_id=None)
+
+        # one more double-width character takes TWO cells from the question
+        assert derive_question_width([wider], _NOW, 200) == 170
 
 
 class TestFormatQueueRow:
@@ -281,6 +372,142 @@ class TestFormatQueueRow:
         assert question_col != ''
 
 
+    def test_the_question_is_cut_to_the_supplied_bound(self):
+        from cockpit.panes.decision_queue import format_queue_row
+
+        item = _make_row_item(question='x' * 200)
+        now = datetime(2026, 7, 8, tzinfo=UTC)
+
+        _, _, _, question_col = format_queue_row(item, now, question_width=25)
+
+        assert len(question_col) == 25
+        assert question_col.endswith('\u2026')
+
+    def test_the_cut_tracks_the_bound_rather_than_a_constant(self):
+        from cockpit.panes.decision_queue import format_queue_row
+
+        item = _make_row_item(question='x' * 200)
+        now = datetime(2026, 7, 8, tzinfo=UTC)
+
+        _, _, _, question_col = format_queue_row(item, now, question_width=120)
+
+        assert len(question_col) == 120
+        assert question_col.endswith('\u2026')
+
+    def test_a_question_under_the_bound_passes_through_unmarked(self):
+        from cockpit.panes.decision_queue import format_queue_row
+
+        item = _make_row_item(question='Which port?')
+        now = datetime(2026, 7, 8, tzinfo=UTC)
+
+        _, _, _, question_col = format_queue_row(item, now, question_width=40)
+
+        assert question_col == 'Which port?'
+        assert '\u2026' not in question_col
+
+    def test_a_question_exactly_at_the_bound_is_not_truncated(self):
+        from cockpit.panes.decision_queue import format_queue_row
+
+        item = _make_row_item(question='x' * 40)
+        now = datetime(2026, 7, 8, tzinfo=UTC)
+
+        _, _, _, question_col = format_queue_row(item, now, question_width=40)
+
+        assert question_col == 'x' * 40
+
+    def test_whitespace_still_collapses_before_the_bound_is_applied(self):
+        from cockpit.panes.decision_queue import format_queue_row
+
+        item = _make_row_item(question='word\n\nword   word  ' * 10)
+        now = datetime(2026, 7, 8, tzinfo=UTC)
+
+        _, _, _, question_col = format_queue_row(item, now, question_width=25)
+
+        assert len(question_col) == 25
+        assert '\n' not in question_col
+        assert '  ' not in question_col
+        assert question_col == 'word word word word word\u2026'
+
+    def test_a_blank_question_degrades_to_the_placeholder_at_any_bound(self):
+        from cockpit.panes.decision_queue import format_queue_row
+
+        now = datetime(2026, 7, 8, tzinfo=UTC)
+
+        for blank in ('', None, '   '):
+            _, _, _, question_col = format_queue_row(
+                _make_row_item(question=blank), now, question_width=25
+            )
+            assert question_col == '(no question)'
+
+    def test_omitting_the_bound_falls_back_to_the_unmeasured_width(self):
+        from cockpit.panes.decision_queue import format_queue_row
+
+        item = _make_row_item(question='x' * 200)
+        now = datetime(2026, 7, 8, tzinfo=UTC)
+
+        _, _, _, question_col = format_queue_row(item, now)
+
+        assert len(question_col) == 60
+        assert question_col.endswith('\u2026')
+
+    def test_the_bound_is_spent_in_cells_not_characters(self):
+        """The bound must buy the same number of CELLS whatever the script,
+        because that is what the column is laid out and cropped in. Cut by
+        character count, a Japanese question bounded at 172 renders 343 cells
+        wide, so Textual crops it near its middle -- taking the ellipsis with
+        it and leaving no sign the text was truncated."""
+        from rich.cells import cell_len
+
+        from cockpit.panes.decision_queue import format_queue_row
+
+        item = _make_row_item(question='\u3053\u308c\u306f\u30c6\u30b9\u30c8\u7528\u306e\u8cea\u554f\u3067\u3059\u3002' * 30)
+        now = datetime(2026, 7, 8, tzinfo=UTC)
+
+        _, _, _, question_col = format_queue_row(item, now, question_width=172)
+
+        assert cell_len(question_col) <= 172
+        assert cell_len(question_col) >= 171  # fills the column, minus a split-char cell
+        assert len(question_col) < 172  # ... in far fewer characters
+        assert question_col.endswith('\u2026')
+
+    def test_an_odd_bound_across_a_double_width_character_still_fits(self):
+        """Cutting at an odd cell count splits a double-width character.
+        The result must stay INSIDE the bound (rich pads the split with a
+        space; that padding is stripped before the ellipsis is appended)
+        rather than rounding up and overrunning the column by a cell."""
+        from rich.cells import cell_len
+
+        from cockpit.panes.decision_queue import format_queue_row
+
+        item = _make_row_item(question='\u3042' * 50)
+        now = datetime(2026, 7, 8, tzinfo=UTC)
+
+        for bound in range(20, 31):
+            _, _, _, question_col = format_queue_row(item, now, question_width=bound)
+
+            assert cell_len(question_col) <= bound
+            assert question_col.endswith('\u2026')
+
+    def test_a_non_positive_bound_degrades_instead_of_inverting_the_cut(self):
+        """format_queue_row exposes the bound as a public keyword, so the
+        function is total for every int it accepts -- not only for the ones
+        derive_question_width happens to return. A negative bound used to
+        become a negative slice and silently return almost the whole
+        question; it is clamped to the placeholder's width instead."""
+        from rich.cells import cell_len
+
+        from cockpit.panes.decision_queue import format_queue_row
+
+        item = _make_row_item(question='x' * 200)
+        now = datetime(2026, 7, 8, tzinfo=UTC)
+
+        for bound in (-5, 0, 1, 13):
+            _, _, _, question_col = format_queue_row(item, now, question_width=bound)
+
+            assert cell_len(question_col) == len('(no question)')
+            assert question_col.endswith('\u2026')
+
+
 class TestFormatCopyPayload:
     """format_copy_payload(item) -- the copy affordance's clipboard text
     (task 2517). A pure QueueItem -> str transform, mirroring
@@ -315,6 +542,7 @@ class TestFormatCopyPayload:
             kind='session',
             decision_id=None,
             question='Which host?',
+            session_slug='my-slug',
         )
 
         payload = format_copy_payload(item)
@@ -339,7 +567,9 @@ class TestFormatCopyPayload:
         over-long OSC 52 clipboard write, so an unbounded question could
         otherwise land on the clipboard as nothing at all with no
         operator-visible feedback (task 2517 amendment: reviewer_comprehensive
-        robustness suggestion)."""
+        robustness suggestion). Only the OSC 52 leg needs that cap, but the
+        payload is formatted once for both legs, so it is unconditional here
+        -- see _cap_for_clipboard's comment (task 5448)."""
         from cockpit.panes.decision_queue import _COPY_QUESTION_MAX_CHARS, format_copy_payload
 
         long_question = 'x' * (_COPY_QUESTION_MAX_CHARS + 500)
@@ -370,11 +600,11 @@ class TestOrderQueue:
         from cockpit.panes.decision_queue import order_queue
         from cockpit.priority import Priorities
 
-        open_decision = _make_decision(id='dec-open', state=sr.DecisionState.OPEN)
-        dropped_decision = _make_decision(id='dec-dropped', state=sr.DecisionState.DROPPED)
-        answered_decision = _make_decision(id='dec-answered', state=sr.DecisionState.ANSWERED)
-        awaiting_session = _make_session(session_slug='awaiting-1', status=sr.Status.AWAITING_INPUT)
-        running_session = _make_session(session_slug='running-1', status=sr.Status.RUNNING)
+        open_decision = _make_decision(id='dec-open', state=dr.DecisionState.OPEN)
+        dropped_decision = _make_decision(id='dec-dropped', state=dr.DecisionState.DROPPED)
+        answered_decision = _make_decision(id='dec-answered', state=dr.DecisionState.ANSWERED)
+        awaiting_session = _make_session(session_slug='awaiting-1', status=session_records.Status.AWAITING_INPUT)
+        running_session = _make_session(session_slug='running-1', status=session_records.Status.RUNNING)
 
         items = order_queue(
             [open_decision, dropped_decision, answered_decision],
@@ -392,7 +622,7 @@ class TestOrderQueue:
         from cockpit.panes.decision_queue import QueueItem, order_queue
         from cockpit.priority import Priorities
 
-        decision = _make_decision(state=sr.DecisionState.OPEN)
+        decision = _make_decision(state=dr.DecisionState.OPEN)
 
         items = order_queue([decision], [], Priorities.default(), _NOW)
 
@@ -418,7 +648,7 @@ class TestOrderQueue:
             _make_decision(id='dec-a', manual_boost=1),
             _make_decision(id='dec-b', manual_boost=3),
         ]
-        sessions = [_make_session(session_slug='s-1', status=sr.Status.AWAITING_INPUT)]
+        sessions = [_make_session(session_slug='s-1', status=session_records.Status.AWAITING_INPUT)]
 
         first = order_queue(decisions, sessions, Priorities.default(), _NOW)
         second = order_queue(decisions, sessions, Priorities.default(), _NOW)
@@ -431,9 +661,9 @@ class TestOrderQueue:
         from cockpit.panes.decision_queue import order_queue
         from cockpit.priority import Priorities
 
-        display = sr.Display(kind='wm', wm_title='unblock:df#2085 slug')
+        display = session_records.Display(kind='wm', wm_title='unblock:df#2085 slug')
         session = _make_session(
-            session_slug='awaiting-1', status=sr.Status.AWAITING_INPUT, display=display
+            session_slug='awaiting-1', status=session_records.Status.AWAITING_INPUT, display=display
         )
 
         items = order_queue([], [session], Priorities.default(), _NOW)
@@ -446,11 +676,11 @@ class TestOrderQueue:
         from cockpit.panes.decision_queue import order_queue
         from cockpit.priority import Priorities
 
-        display = sr.Display(kind='tmux', tmux_target='fleet-df:3')
+        display = session_records.Display(kind='tmux', tmux_target='fleet-df:3')
         linked_session = _make_session(
-            session_slug='linked-1', status=sr.Status.RUNNING, display=display
+            session_slug='linked-1', status=session_records.Status.RUNNING, display=display
         )
-        decision = _make_decision(session_id='linked-1', state=sr.DecisionState.OPEN)
+        decision = _make_decision(session_id='linked-1', state=dr.DecisionState.OPEN)
 
         items = order_queue([decision], [linked_session], Priorities.default(), _NOW)
 
@@ -461,7 +691,7 @@ class TestOrderQueue:
         from cockpit.panes.decision_queue import order_queue
         from cockpit.priority import Priorities
 
-        decision = _make_decision(session_id='no-such-session', state=sr.DecisionState.OPEN)
+        decision = _make_decision(session_id='no-such-session', state=dr.DecisionState.OPEN)
 
         items = order_queue([decision], [], Priorities.default(), _NOW)
 
@@ -472,7 +702,7 @@ class TestOrderQueue:
         from cockpit.panes.decision_queue import order_queue
         from cockpit.priority import Priorities
 
-        decision = _make_decision(session_id=None, state=sr.DecisionState.OPEN)
+        decision = _make_decision(session_id=None, state=dr.DecisionState.OPEN)
 
         items = order_queue([decision], [], Priorities.default(), _NOW)
 
@@ -514,16 +744,6 @@ class TestOrderQueue:
 
         assert deferred[0].decision_id == 'dec-newer'
 
-    def test_handling_flag_reflected_on_item(self):
-        from cockpit.panes.decision_queue import order_queue
-        from cockpit.priority import Priorities
-
-        decision = _make_decision(id='dec-1', state=sr.DecisionState.OPEN)
-
-        items = order_queue([decision], [], Priorities.default(), _NOW, handling={'decision:dec-1'})
-
-        assert items[0].handling is True
-
     def test_escalation_id_populated_from_backing_record_for_both_kinds(self):
         """USER-OBSERVABLE SIGNAL (task 2517): the copy affordance needs the
         escalation id on QueueItem for both a decision row and an
@@ -532,12 +752,12 @@ class TestOrderQueue:
         from cockpit.panes.decision_queue import order_queue
         from cockpit.priority import Priorities
 
-        decision = _make_decision(id='dec-1', state=sr.DecisionState.OPEN, escalation_id='esc-9')
+        decision = _make_decision(id='dec-1', state=dr.DecisionState.OPEN, escalation_id='esc-9')
         no_escalation = _make_decision(
-            id='dec-2', state=sr.DecisionState.OPEN, escalation_id=None
+            id='dec-2', state=dr.DecisionState.OPEN, escalation_id=None
         )
         session = _make_session(
-            session_slug='awaiting-1', status=sr.Status.AWAITING_INPUT, escalation_id='esc-7'
+            session_slug='awaiting-1', status=session_records.Status.AWAITING_INPUT, escalation_id='esc-7'
         )
 
         items = order_queue(
@@ -559,12 +779,12 @@ class TestOrderQueue:
         decision = _make_decision(
             id='dec-critical',
             severity='critical',
-            state=sr.DecisionState.OPEN,
+            state=dr.DecisionState.OPEN,
             filed_at=_NOW.isoformat(),
         )
         stale_session = _make_session(
             session_slug='stale-1',
-            status=sr.Status.AWAITING_INPUT,
+            status=session_records.Status.AWAITING_INPUT,
             question=None,
             start_ts=(_NOW - timedelta(days=8)).isoformat(),
         )
@@ -583,12 +803,12 @@ class TestOrderQueue:
         decision = _make_decision(
             id='dec-blocking',
             severity='blocking',
-            state=sr.DecisionState.OPEN,
+            state=dr.DecisionState.OPEN,
             filed_at=_NOW.isoformat(),
         )
         stale_session = _make_session(
             session_slug='stale-1',
-            status=sr.Status.AWAITING_INPUT,
+            status=session_records.Status.AWAITING_INPUT,
             question=None,
             start_ts=(_NOW - timedelta(days=8)).isoformat(),
         )
@@ -654,3 +874,101 @@ class TestKnownProjectRoots:
         roots = known_project_roots(sessions, ['/home/leo/src/dark-factory'])
 
         assert roots == ['/home/leo/src/dark-factory']
+
+
+class TestQueueItemSessionSlug:
+    """QueueItem.session_slug -- carried from the SessionRecord order_queue
+    already holds, so it is asserted on order_queue's own output rather than
+    on a hand-built item."""
+
+    def test_order_queue_carries_the_slug_on_a_session_item_and_none_on_a_decision(self):
+        from cockpit.panes.decision_queue import order_queue
+        from cockpit.priority import Priorities
+
+        decision = _make_decision(id='dec-1', state=dr.DecisionState.OPEN)
+        sessions = [_make_session(session_slug='awaiting-1', status=session_records.Status.AWAITING_INPUT)]
+
+        items = order_queue([decision], sessions, Priorities.default(), _NOW)
+
+        by_kind = {item.kind: item for item in items}
+        assert by_kind['session'].session_slug == 'awaiting-1'
+        assert by_kind['decision'].session_slug is None
+
+
+class TestResolveTargetLinksThroughRecordSlug:
+    """A decision focuses the session its filer's record_slug names (task 4237).
+
+    session_id is the filer's provenance label -- in production a watcher's
+    lease token, never a registry key -- so it resolves only as a fallback.
+    """
+
+    _WATCHER_SLUG = 'session-dark-factory-sess-watcher'
+    _LEASE_TOKEN = 'watcher-df-1348600'
+
+    def _sessions(self, *sessions: session_records.SessionRecord) -> dict[str, session_records.SessionRecord]:
+        return {session.session_slug: session for session in sessions}
+
+    def _watcher(self, **overrides) -> session_records.SessionRecord:
+        display = session_records.Display(kind='wm', wm_title='escalation-watcher df')
+        return _make_session(
+            **{'session_slug': self._WATCHER_SLUG, 'display': display, **overrides}
+        )
+
+    def test_record_slug_resolves_to_that_sessions_display(self):
+        from cockpit.backends import DisplayTarget
+        from cockpit.panes.decision_queue import resolve_target
+
+        decision = _make_decision(session_id=self._LEASE_TOKEN, record_slug=self._WATCHER_SLUG)
+
+        target = resolve_target(decision, self._sessions(self._watcher()))
+
+        assert target == DisplayTarget(kind='wm', wm_title='escalation-watcher df')
+
+    def test_record_slug_wins_over_a_session_id_naming_another_known_session(self):
+        from cockpit.backends import DisplayTarget
+        from cockpit.panes.decision_queue import resolve_target
+
+        other = _make_session(
+            session_slug='other-session',
+            display=session_records.Display(kind='tmux', tmux_target='fleet-df:9'),
+        )
+        decision = _make_decision(session_id='other-session', record_slug=self._WATCHER_SLUG)
+
+        target = resolve_target(decision, self._sessions(self._watcher(), other))
+
+        assert target == DisplayTarget(kind='wm', wm_title='escalation-watcher df')
+
+    def test_a_lease_token_session_id_without_record_slug_stays_unresolved(self):
+        from cockpit.panes.decision_queue import resolve_target
+
+        decision = _make_decision(session_id=self._LEASE_TOKEN, record_slug='')
+
+        assert resolve_target(decision, self._sessions(self._watcher())) is None
+
+    def test_both_blank_is_unresolved(self):
+        from cockpit.panes.decision_queue import resolve_target
+
+        decision = _make_decision(session_id=None, record_slug='')
+
+        assert resolve_target(decision, self._sessions(self._watcher())) is None
+
+    def test_a_linked_session_without_a_display_is_unresolved(self):
+        from cockpit.panes.decision_queue import resolve_target
+
+        decision = _make_decision(record_slug=self._WATCHER_SLUG)
+
+        assert resolve_target(decision, self._sessions(self._watcher(display=None))) is None
+
+    def test_order_queue_gives_a_record_slug_decision_a_focus_target(self):
+        from cockpit.panes.decision_queue import order_queue
+        from cockpit.priority import Priorities
+
+        decision = _make_decision(
+            session_id=self._LEASE_TOKEN,
+            record_slug=self._WATCHER_SLUG,
+            state=dr.DecisionState.OPEN,
+        )
+
+        [item] = order_queue([decision], [self._watcher()], Priorities.default(), _NOW)
+
+        assert item.target is not None

@@ -1,0 +1,447 @@
+"""Build beta's markup guard for fused-memory's BUNDLED FastMCP (task 4458).
+
+PRD ``plans/toolcall-markup-containment-prd.md``, leaf gamma-3. Task 3689
+(beta) delivered :class:`shared.mcp_markup_middleware.MarkupGuardMiddleware` as
+a :class:`fastmcp.server.middleware.Middleware`, attached with
+``mcp.add_middleware(...)``. fused-memory does not run that FastMCP.
+
+:func:`build_markup_guard` builds the markup member, wired to this server's
+residue and storm escalation sinks, and installs nothing. The chain it joins,
+and the order, live in :mod:`fused_memory.server.boundary_guards`;
+:mod:`fused_memory.server.tool_middleware_bridge` runs that chain UNMODIFIED at
+the bundled ``ToolManager.call_tool`` chokepoint, and says why a rejection
+RAISES ``ToolError`` and must sit outside ``main._install_safe_tool_wrapper``.
+INV-5: no second implementation of detection, repair, policy or payload shape
+lives here, and nothing is imported from the middleware but its public names.
+
+Because argument validation runs inside ``Tool.run``, after that chokepoint, a
+leak that swallowed a REQUIRED parameter is repaired before pydantic ever sees
+the call. Unguarded, that same call fails with a bare ``Field required``; behind
+the guard it is rejected with the repair attached.
+
+## Measured parity with the write-time gate this replaces
+
+Before the four in-line ``_markup_gate`` call sites in ``tools.py`` were
+retired, this boundary was driven over the retiring gate's ENTIRE scanned
+surface — its three hand-authored specimens against ``{'content'}`` on
+add_memory / add_episode and ``{title, description, details, prompt}`` on
+submit_task / update_task, 30 combinations. All 30 were rejected here, none
+reached the service or the interceptor, and each named the same matched literal
+the gate named. There was no gap to close.
+
+The rejections use two vocabularies, both this guard's: ``mcp_markup_detected``
+carries a repair, ``mcp_markup_unrepairable`` refuses without one. The split is
+:func:`shared.toolcall_markup.repair`'s NO SILENT PARTIAL REPAIR contract, not
+a hole — ``\x3c/invoke>`` closes the ENVELOPE rather than a parameter, and an
+opener with no preceding mis-close leaves the repairer nothing to attribute the
+residue to. Either way nothing is written and the residue is escalated rather
+than dropped. ``tests/server/test_markup_tripwire_gate.py`` holds the
+expectation table and the per-specimen reasoning.
+
+The envelope closer above is spelled with the ``\\x3c`` escape, never a raw
+bracket: the "Sentinel-literal hazard" section of
+``shared/src/shared/toolcall_markup.py``, the owner of this convention, says
+why.
+"""
+
+from __future__ import annotations
+
+import enum
+import logging
+from collections.abc import Callable, Mapping
+from typing import Any
+
+from shared.markup_residue_custody import log_unpreserved_residue
+from shared.mcp_markup_middleware import (
+    MARKUP_RECURRENCE_ROUTING,
+    MarkupGuardMiddleware,
+    RepairPolicy,
+    ResiduePreservation,
+    SpooledResidue,
+    residue_payload_length,
+)
+from shared.toolcall_markup import scan_parameter_values
+
+from fused_memory.server.markup_tripwire import (
+    _MARKUP_STORM_THRESHOLD,
+    _MARKUP_STORM_WINDOW_SECONDS,
+    emit_markup_residue_escalation,
+    emit_markup_storm_escalation,
+)
+
+logger = logging.getLogger(__name__)
+
+
+#: Tools DECLARED to carry envelope literals as ordinary DATA, and therefore not
+#: scanned (INV-1: a declared, machine-checkable opt-out, never a heuristic).
+#:
+#: Names are BARE in-server names. ``context.message.name`` is
+#: ``scan_memory_content``, not the agent-facing
+#: ``mcp__fused-memory__scan_memory_content`` that the specimen corpus records,
+#: so an exemption declared with the prefixed spelling would silently never
+#: match — and a machine-checked declaration that fails open is worse than none.
+#:
+#: One name, with the reason it is here:
+#:
+#: * ``scan_memory_content`` — PRD boundary row B7. Its whole job is scanning the
+#:   corpus for exactly these substrings, so guarding it would make the
+#:   retroactive-sweep tool unable to look for the thing it was built to find.
+#:   It is the sanctioned tool for that lookup precisely because the fragments
+#:   carry almost no semantic signal (a live 2026-07-26 semantic probe for the
+#:   known corrupted records returned ZERO), so there is no other path to the
+#:   same answer. Load-bearing on a MEASURED shape, not a precaution: ``needles``
+#:   is declared ``list[str] | None`` and the bundled dispatcher accepts it as a
+#:   JSON STRING and coerces it, which makes it a scanned string argument — and
+#:   without this exemption a sweep for the envelope literals is refused with
+#:   ``mcp_markup_unrepairable``.
+#:
+#: Surveyed for other legitimate carriers and deliberately NOT exempted:
+#: ``redact_episode_content``, whose ``new_content`` is the CLEAN replacement
+#: text for a corrupted episode — markup there is a defect, so rejecting it is
+#: correct; and ``search``, whose ``query`` is not a sanctioned carrier because
+#: ``scan_memory_content`` is explicitly the tool for literal substring lookup.
+EXEMPT_TOOLS: frozenset[str] = frozenset({'scan_memory_content'})
+
+
+#: The anchor this guard files bursts under. Deliberately NOT markup_tripwire's
+#: ``markup-tripwire``: the L1 escalation watcher files its own cluster records
+#: under that id and SQUATS it — measured, the tripwire filed nothing
+#: 2026-08-16..2026-08-19 while 41 rejections occurred, and all 17 records sat at
+#: dedupe_count 0. Deduping against a squatted anchor is suppression that reads
+#: as calm, so this guard needs an anchor of its own.
+_STORM_ANCHOR_TASK_ID = 'markup-guard'
+
+#: The one record kind the storm filer understands. The middleware sends its
+#: per-call RESIDUE records down the same channel, and those are not bursts.
+_STORM_ERROR_TYPE = 'mcp_markup_storm'
+
+#: The anchor the per-call RESIDUE records file under — a third series,
+#: distinct from both storm anchors because it is a different record KIND: it
+#: holds one caller's payload rather than summarising a burst, and it is never
+#: deduped (folding two residue records together would destroy one payload).
+_RESIDUE_ANCHOR_TASK_ID = 'markup-residue'
+
+
+def _resolve_project_root(project: Any, known_projects: Mapping[str, str] | None) -> str | None:
+    """Turn the middleware's ``project`` label into a filesystem project_root.
+
+    ``MarkupGuardMiddleware._identity`` resolves ``project_root`` FIRST then
+    ``project_id``, so the label arrives in one of two shapes depending on which
+    tool leaked: the task tools carry a ``project_root`` and yield a PATH, while
+    the memory tools carry only a ``project_id`` and yield a BARE ID like
+    ``dark_factory``. Filing against a bare id would open a queue at a relative
+    directory named after the project.
+
+    So an absolute path resolves to itself, and anything else is looked up in
+    *known_projects* — the same ``_kp.get(project_id)`` translation the
+    write-time gate does at its four call sites.
+
+    Either way the answer must be a root the REGISTRY vouches for. The label is
+    the caller's RAW ``project_root`` argument, read at the dispatch boundary
+    before ``submit_task``/``update_task`` normalise it, and
+    ``EscalationQueue.__init__`` does ``mkdir(parents=True)`` — so accepting an
+    arbitrary absolute string would let any caller create a
+    ``<anything>/data/escalations/`` tree on this host simply by leaking markup
+    often enough to fire a burst. The retired ``_markup_gate`` never had that
+    exposure: it saw either an already-normalized ``project_root`` or a
+    ``_kp.get(project_id)`` lookup, never a raw one.
+
+    An unresolvable project yields ``None`` and files NOTHING. An escalation
+    filed against a guessed default is worse than one an operator has to place
+    by hand — and an escalation filed against a caller-CHOSEN default is worse
+    than both.
+    """
+    if not isinstance(project, str) or not project:
+        return None
+    if project.startswith('/') and project in (known_projects or {}).values():
+        return project
+    if known_projects:
+        return known_projects.get(project)
+    return None
+
+
+#: The pseudo-parameters a refused payload may name its own project with.
+_ROUTING_PARAMETERS = ('project_id', 'project_root')
+
+#: Prefixed to a re-derived residue copy's ``suggested_action``, so the
+#: operator reading the queue knows how the record got there.
+_REDERIVED_PROVENANCE = (
+    'UNVERIFIED ROUTING: this record was placed in this queue by scanning the '
+    "refused payload's own residue for its project, checked only against the "
+    'project registry. Believe it for queue placement, never for the write. '
+)
+
+
+def _rederive_project(
+    record: Mapping[str, Any], known_projects: Mapping[str, str] | None
+) -> str | None:
+    """The queue root a refused payload names for itself, else ``None``.
+
+    add_memory declares ``content`` before ``project_id``, so a leak in
+    ``content`` eats the routing key and the middleware's ``project`` is
+    ``None``. The id usually survives inside ``raw_value``. Every scanned token
+    goes through :func:`_resolve_project_root`, so a re-derived root is one the
+    registry vouches for. Two different roots are ambiguous and yield ``None``.
+    """
+    scanned = scan_parameter_values(record.get('raw_value'), _ROUTING_PARAMETERS)
+    roots = {
+        root: token
+        for token in scanned.values()
+        if (root := _resolve_project_root(token, known_projects)) is not None
+    }
+    if len(roots) != 1:
+        return None
+    [(root, token)] = roots.items()
+    logger.warning(
+        'markup_guard_residue: %s.%s carried no resolvable project, so its '
+        'queue was re-derived from the refused payload: scanned %r -> '
+        'project_root=%r (unverified provenance)',
+        record.get('tool'), record.get('field'), token, root,
+    )
+    return root
+
+
+def _with_rederived_provenance(record: Mapping[str, Any]) -> dict[str, Any]:
+    """A shallow copy of *record* whose ``suggested_action`` states how it was
+    routed. ``project`` is left as the identity actually resolved."""
+    return {
+        **record,
+        'suggested_action': _REDERIVED_PROVENANCE + str(record.get('suggested_action') or ''),
+    }
+
+
+#: The floor under the residue queue: takes a record, returns the absolute
+#: path of the file now holding it, or ``None``.
+ResidueFloor = Callable[[dict[str, Any]], 'str | None']
+
+
+class ResidueTier(enum.StrEnum):
+    """Which tier held a residue record's payload.
+
+    Every residue outcome logs one ERROR record carrying this as
+    ``extra={'residue_tier': ...}``, so an operator's log query, and a test,
+    reads the outcome as data rather than from the wording of the line.
+    """
+
+    QUEUE = 'queue'
+    FLOOR = 'floor'
+    UNPRESERVED = 'unpreserved'
+
+
+def _queue_residue(
+    record: dict[str, Any], known_projects: Mapping[str, str] | None
+) -> str | None:
+    """Tier 1: file *record* into its project's escalation queue.
+
+    The project is the caller's resolved identity, else the one the refused
+    payload names for itself (:func:`_rederive_project`).
+    """
+    project_root = _resolve_project_root(record.get('project'), known_projects)
+    filed = record
+    if project_root is None:
+        project_root = _rederive_project(record, known_projects)
+        if project_root is None:
+            return None
+        filed = _with_rederived_provenance(record)
+    # Purely additive, same as the storm branch: the refusal is already
+    # decided, and emit_markup_residue_escalation is itself built never to
+    # raise, so this guards only against a defect in it.
+    try:
+        escalation_id = emit_markup_residue_escalation(
+            project_root, filed, anchor_task_id=_RESIDUE_ANCHOR_TASK_ID
+        )
+    except Exception:
+        logger.exception(
+            'markup_guard: emit_markup_residue_escalation raised for '
+            'project_root=%r; residue of %r not filed',
+            project_root, record.get('tool'),
+        )
+        return None
+    if escalation_id is not None:
+        logger.error(
+            'markup_guard_residue: preserved the %r residue of %s.%s in %s '
+            '(%d chars); %s',
+            record.get('error_type'), record.get('tool'), record.get('field'),
+            escalation_id, residue_payload_length(record), MARKUP_RECURRENCE_ROUTING,
+            extra={'residue_tier': ResidueTier.QUEUE, 'residue_locator': escalation_id},
+        )
+    return escalation_id
+
+
+def _floor_residue(
+    record: dict[str, Any], residue_floor: ResidueFloor | None
+) -> SpooledResidue | None:
+    """Tier 2: hand *record* to the durable floor, when one is wired."""
+    if residue_floor is None:
+        return None
+    try:
+        path = residue_floor(record)
+    except Exception:
+        logger.exception(
+            'markup_guard: the residue floor raised for %s.%s; falling through '
+            'to the log', record.get('tool'), record.get('field'),
+        )
+        return None
+    if path is None:
+        return None
+    logger.error(
+        'markup_guard_residue: preserved the %r residue of %s.%s, which no '
+        'queue took, in the residue floor file %s (%d chars); %s',
+        record.get('error_type'), record.get('tool'), record.get('field'), path,
+        residue_payload_length(record), MARKUP_RECURRENCE_ROUTING,
+        extra={'residue_tier': ResidueTier.FLOOR, 'residue_locator': path},
+    )
+    return SpooledResidue(path)
+
+
+def _log_unpreserved(record: dict[str, Any], *, floor_wired: bool) -> None:
+    """Tier 3: no tier held *record*, so this log line carries it."""
+    floor = 'the residue floor failed' if floor_wired else 'no residue floor is wired'
+    log_unpreserved_residue(
+        logger, record,
+        why=f'no queue took it (project={record.get("project")!r}) and {floor}',
+        extra={'residue_tier': ResidueTier.UNPRESERVED, 'residue_floor_wired': floor_wired},
+    )
+
+
+def build_markup_guard(
+    *,
+    policy: RepairPolicy,
+    known_projects: Mapping[str, str] | None,
+    exempt_tools: frozenset[str] = EXEMPT_TOOLS,
+    residue_floor: ResidueFloor | None = None,
+) -> MarkupGuardMiddleware:
+    """The shared markup guard, wired to this server's escalation sinks.
+
+    *policy* is REQUIRED and keyword-only: the declared tier for this server
+    belongs at the interception point, never inferred per call from the shape of
+    the damage or from a tool's name (INV-1).
+    ``fused_memory/server/boundary_guards.py::boundary_guard_chain`` declares it.
+
+    *known_projects* is the ``project_id -> project_root`` registry the storm
+    escalation sink uses to place a burst in the right queue. Accepted here and
+    threaded to the sink; the guard's rejection behaviour does not depend on it.
+
+    *exempt_tools* names the tools allowed to carry envelope literals as data.
+
+    *residue_floor* is the floor under the residue queue. It is called only
+    when the queue yields no id, and the path it returns reaches the refused
+    caller as ``residue_spool_path``, never as ``escalation_id``.
+
+    Install the returned member through one chain, never twice: a second guard
+    would count every rejection twice into the storm window.
+    """
+
+    def _file_residue(record: dict[str, Any]) -> ResiduePreservation:
+        """Preserve one residue record's payload, of either kind, and report where it went.
+
+        Queue, then floor, then log. The full record, which carries the
+        caller's ``raw_value`` verbatim, reaches the log ONLY when neither the
+        queue nor the floor held it. Logging it on every refusal would put the
+        whole payload in the log on every call of the commonest rejection
+        shape, i.e. maximum log volume exactly when a leak is bursting, while a
+        durable copy already exists.
+        """
+        escalation_id = _queue_residue(record, known_projects)
+        if escalation_id is not None:
+            return escalation_id
+        spooled = _floor_residue(record, residue_floor)
+        if spooled is None:
+            _log_unpreserved(record, floor_wired=residue_floor is not None)
+        return spooled
+
+    def _escalation_sink(record: dict[str, Any]) -> ResiduePreservation:
+        """File a fired burst, and never change the rejection that fired it.
+
+        ONE sink serves TWO record kinds — measured, not assumed. The middleware
+        routes both its storm summaries (``error_type='mcp_markup_storm'``:
+        count, threshold, window_seconds, outcome, project) AND its per-call
+        RESIDUE records (``mcp_markup_unrepairable``, carrying the ``raw_value``
+        the caller lost) through this one injected callable.
+
+        Each kind has its OWN filer and its own anchor, because they are not the
+        same record: a storm summarises a burst and is DEDUPED into one open
+        record, while a residue record HOLDS one caller's payload and must never
+        be folded into another's. Before this dispatch existed, a residue record
+        went to the storm filer, which filed a rejected_writes_in_window=None
+        escalation under the STORM anchor and logged 'None None outcome(s) in
+        Nones'.
+
+        The residue id is RETURNED, and that return value is load-bearing: the
+        middleware folds it into the refusal as ``escalation_id`` beside a hint
+        telling the caller its payload is preserved in the escalation named
+        there. A sink that returns nothing makes that sentence a lie — and
+        unrepairable is the COMMON outcome for the real corpus shapes, not an
+        edge case. When no queue takes the record (an unresolvable project, no
+        escalation package, a queue outage) the floor's file is returned
+        instead, as a :class:`SpooledResidue` so the middleware reports it as a
+        path and never as an escalation id. Only when the floor is absent or
+        fails too is the caller told nothing was preserved, and THEN the full
+        record is dumped to the log.
+
+        The middleware delegates dedup here on purpose — whether an open
+        escalation already exists is queue knowledge the shared layer does not
+        have and must not guess at.
+        """
+        if record.get('error_type') != _STORM_ERROR_TYPE:
+            return _file_residue(record)
+
+        project_root = _resolve_project_root(record.get('project'), known_projects)
+        if project_root is None:
+            logger.error(
+                'markup_guard_storm: %s %s outcome(s) in %ss but project=%r could '
+                'not be resolved to a project_root, so NO escalation was filed — '
+                'the serialization leak is ACTIVE; %s',
+                record.get('count'), record.get('outcome'),
+                record.get('window_seconds'), record.get('project'), MARKUP_RECURRENCE_ROUTING,
+            )
+            return None
+
+        # ONE greppable operator-facing ERROR line. The storm summary folded
+        # into the tool response reaches only the leaking caller — the one party
+        # that already knows — so the operator's copy cannot ride on it. Naming
+        # the count here is also the visible-counter half of the remedy, without
+        # an escalation-schema change.
+        logger.error(
+            'markup_guard_storm: %s %s outcome(s) in %ss for project_root=%r '
+            '(threshold=%s) — the serialization leak is ACTIVE; %s',
+            record.get('count'), record.get('outcome'), record.get('window_seconds'),
+            project_root, record.get('threshold'), MARKUP_RECURRENCE_ROUTING,
+        )
+
+        # Purely additive: the rejection is already decided, so a queue failure
+        # costs the operator a heads-up and nothing else. Same reasoning the
+        # retiring _markup_gate applies to its own emitter — and
+        # emit_markup_storm_escalation is itself built never to raise, so this
+        # guards only against a defect in it.
+        try:
+            emit_markup_storm_escalation(
+                project_root, record, anchor_task_id=_STORM_ANCHOR_TASK_ID
+            )
+        except Exception:
+            logger.exception(
+                'markup_guard: emit_markup_storm_escalation raised for '
+                'project_root=%r; storm %r not escalated',
+                project_root, record,
+            )
+        # The storm id is deliberately not reported back: the middleware folds a
+        # returned id into the REFUSAL payload as the record holding that
+        # caller's data, and a burst summary holds no payload.
+        return None
+
+    return MarkupGuardMiddleware(
+        policy,
+        exempt_tools,
+        escalation_sink=_escalation_sink,
+        # ONE source for the tuning across both guards, so the in-line gate and
+        # the boundary cannot drift to different thresholds while both are live.
+        storm_threshold=_MARKUP_STORM_THRESHOLD,
+        storm_window_seconds=_MARKUP_STORM_WINDOW_SECONDS,
+        # fact_sink is deliberately left unwired: the middleware already emits
+        # the structured fact unconditionally as a WARNING (INV-2), and
+        # fused-memory has no queue-backed CONSUMER for the stream. This task's
+        # consumers are the calling agent (served by repaired_call) and the
+        # operator (served by the storm escalation above). Left explicit so a
+        # future consumer wires it deliberately rather than inheriting a guess.
+        fact_sink=None,
+    )

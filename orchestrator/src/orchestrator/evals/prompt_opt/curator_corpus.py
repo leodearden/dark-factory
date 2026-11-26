@@ -22,7 +22,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import random
 import sqlite3
 from collections import Counter
@@ -31,16 +30,11 @@ from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
+from orchestrator.evals.paths import main_checkout
 from orchestrator.evals.reviewer_trial.adjudication import AdjudicationLog
 from orchestrator.evals.reviewer_trial.mining import assign_split
 
 logger = logging.getLogger(__name__)
-
-# The repo checkout `propose_curator_label_frontier`'s invoke_agent harness
-# runs in. Overridable via CURATOR_REPO_ROOT for portability across
-# checkouts/CI (same reasoning as __main__.py's CURATOR_TICKETS_DB) -- see
-# curator_replay_corpus/README.md's "Building the corpus" section.
-_DEFAULT_REPO_ROOT = Path(os.environ.get('CURATOR_REPO_ROOT', '/home/leo/src/dark-factory'))
 
 __all__ = [
     'AuditReport',
@@ -100,7 +94,16 @@ def recover_recorded_action(
     disambiguate them -- only the embedded action can. Falls back to
     ``status == 'created' -> 'create'`` when *result_json* carries no
     recoverable action (the real add_task-result JSON has no ``'action'``
-    key). ``target_id`` prefers ``result_json['id']`` (or the less common
+    key), and to ``status == 'refused' -> 'refuse'``. Refusal is the one
+    action that IS unambiguous from status alone: only the deterministic
+    guards (cancelled-premise blocklist, recon premise registry) ever emit
+    it, and it carries no target. Recovering it keeps the verdict READABLE
+    (provenance); it does not make it a corpus item —
+    :func:`build_curator_corpus` filters the 'refuse' stratum out before
+    sampling and frontier labeling, since no frontier proposer can emit
+    'refuse' and the curator LLM never sees a guard-refused candidate.
+    ``target_id`` prefers ``result_json['id']``
+    (or the less common
     ``result_json['target_id']``), falling back to the ticket row's own
     *task_id* column when neither is present -- but only for drop/combine,
     since 'create' has no "target being combined into".
@@ -145,6 +148,14 @@ def recover_recorded_action(
 
     if action is None and status == 'created':
         action = 'create'
+
+    if action is None and status == 'refused':
+        # Unlike drop/combine, 'refused' needs no result_json to disambiguate:
+        # only the deterministic guards ever emit it, so the status alone is
+        # unambiguous. Note 'refuse' is deliberately NOT in _RECOVERABLE_ACTIONS
+        # -- that tuple also drives _FRONTIER_CURATOR_LABEL_SCHEMA, and a
+        # frontier model must never be able to PROPOSE a refusal.
+        action = 'refuse'
 
     if action is None:
         return None
@@ -507,7 +518,10 @@ async def build_curator_corpus(
     """Build a labeled curator replay corpus from *db_path* (T5).
 
     Reads recorded decisions from tickets.db (:func:`read_curator_decisions`),
-    optionally downsamples to *n* stratified by recorded action
+    DROPS every ``action='refuse'`` decision (deterministic-guard refusals are
+    provenance only -- see the inline rationale below; they are unlabelable by
+    construction and the curator LLM never sees those candidates), optionally
+    downsamples the remainder to *n* stratified by recorded action
     (:func:`_sample_stratified`), obtains a GOLD label for every sampled
     candidate from the injected *frontier_proposer* (NEVER the recorded
     decision -- PRD D-6: decisions != ground truth), flags a deterministic
@@ -521,7 +535,33 @@ async def build_curator_corpus(
     and only reads (never writes) *db_path*.
     """
     decisions = read_curator_decisions(db_path)
-    sampled = _sample_stratified(decisions, n, seed)
+    # Refusals are recovered as PROVENANCE ONLY -- they are never labeled
+    # corpus items. `recover_recorded_action` keeps status='refused' readable
+    # (an auditor reading tickets.db still sees the verdict), but a refused row
+    # must not reach _sample_stratified or the frontier proposer:
+    #   * PRD D-6 sources every gold label from *frontier_proposer*, whose
+    #     schema (_FRONTIER_CURATOR_LABEL_SCHEMA) is deliberately restricted to
+    #     drop/combine/create -- no proposer can emit 'refuse', so every
+    #     refused item would carry a definitionally-wrong gold label.
+    #   * The curator LLM never sees these candidates in production anyway:
+    #     both deterministic guards short-circuit pre-LLM, so no prompt change
+    #     could ever be trained or scored on them.
+    #   * _sample_stratified round-robins across recorded-action strata, so a
+    #     'refuse' stratum would additionally spend ~1/4 rather than ~1/3 of a
+    #     bounded *n* -- and select_spot_check_subset would spend scarce human
+    #     review budget -- on rows whose gold labels are noise.
+    labelable = [d for d in decisions if d.action != 'refuse']
+    refused_excluded = len(decisions) - len(labelable)
+    if refused_excluded:
+        # Never a silent drop: an operator comparing corpus size against the
+        # ticket count must be able to account for the difference.
+        logger.info(
+            'curator corpus: excluded %d refused decision(s) of %d recovered — '
+            'refusals are provenance only (no frontier label is possible for them)',
+            refused_excluded,
+            len(decisions),
+        )
+    sampled = _sample_stratified(labelable, n, seed)
 
     spot_check_ids = set(select_spot_check_subset(sampled, cap=spot_check_size, seed=seed))
 
@@ -600,23 +640,16 @@ async def propose_curator_label_frontier(
 ) -> FrontierLabel:
     """Propose a GOLD curator label for *candidate* via a frontier model.
 
-    Build-time only -- never called from a hermetic test (those inject a
-    fake ``FrontierProposerFn``). Mirrors
-    ``reviewer_trial.mining.propose_labels_frontier``'s ``invoke_agent``
-    pattern: no tools, structured JSON output, cost always reported --
-    unlike the reviewer_trial version (which returns a ``(issues, cost_usd)``
-    tuple), ``FrontierProposerFn`` is a plain ``Callable[[dict],
-    Awaitable[FrontierLabel]]``, so the cost is instead stamped onto the
-    returned label's ``FrontierLabel.cost_usd`` field. ``__main__.py``'s
+    Its production callers are build-time only; corpus-building tests inject a
+    fake ``FrontierProposerFn`` instead. Calls ``invoke_agent`` with no tools and
+    structured JSON output, and always reports cost: ``FrontierProposerFn``
+    is a plain ``Callable[[dict], Awaitable[FrontierLabel]]``, so the cost
+    is stamped onto the returned label's ``FrontierLabel.cost_usd`` field. ``__main__.py``'s
     ``build-curator-corpus`` command wraps this proposer to accumulate
     ``cost_usd`` across every sampled candidate and prints the total.
 
     *cwd* is the repo checkout ``invoke_agent`` runs its harness in; it
-    defaults to ``_DEFAULT_REPO_ROOT`` (the ``CURATOR_REPO_ROOT`` env var,
-    falling back to ``/home/leo/src/dark-factory``) so a different
-    checkout/CI environment can point this at the right working directory
-    without a code change -- see curator_replay_corpus/README.md's "Building
-    the corpus" section.
+    defaults to the main checkout (``orchestrator.evals.paths.main_checkout``).
 
     Never raises: an unparseable/malformed response degrades to
     ``action='create'`` -- the live curator's own best-effort fallback
@@ -654,7 +687,7 @@ justification. Output your decision as JSON.
     result = await invoke_agent(
         prompt=prompt,
         system_prompt=system_prompt,
-        cwd=cwd if cwd is not None else _DEFAULT_REPO_ROOT,
+        cwd=cwd if cwd is not None else main_checkout(),
         model=model,
         max_turns=max_turns,
         max_budget_usd=1.0,

@@ -23,6 +23,7 @@ from typing import Any
 
 from pydantic import BaseModel, ValidationError
 
+from fused_memory.config.overlay import EMBEDDER_SPACE_UNITS, PROVENANCE_FIELD
 from fused_memory.config.schema import FusedMemoryConfig
 
 # Code-owned allowlist of dotted leaf paths safe to hot-apply in place. Seeded
@@ -53,6 +54,38 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset({
     # knobs above; _iter_leaves treats the whole list[ProceduralTopicCluster]
     # as a single atomic leaf, so the clusters list reloads atomically (task 2845).
     'reconciliation.procedural_knowledge_topic_guard_clusters',
+    # Read live by resolve_topic_cluster_autoseed_enabled
+    # (server/near_duplicate_guard.py) at BOTH of its consumers -- per
+    # add_memory merge and per consolidate_memories seed -- off the shared
+    # memory_service.config.reconciliation object, never at store construction
+    # (main.py builds the store unconditionally). So False drops derived
+    # clusters from the very next guard read and True restores them, both
+    # without a restart (task 3135).
+    'reconciliation.procedural_knowledge_topic_cluster_autoseed_enabled',
+    # Read live by resolve_retired_derived_topic_ids
+    # (server/near_duplicate_guard.py) at the same two consumers as the
+    # switch above, off the same shared object, so retiring one misfiring
+    # derived cluster is a reload, not a restart (task 3135 review).
+    'reconciliation.procedural_knowledge_topic_cluster_autoseed_retired',
+    # Read live per MemoryService.search by resolve_topic_anchor_enabled
+    # (services/topic_anchor.py) off the shared memory_service.config.reconciliation
+    # object — never captured at construction — so an in-place reload flips the
+    # topic-anchored canonical pin on the NEXT search without a restart (task
+    # 3111; see TestTopicAnchoredRecallReloadTier, which pins both the live-read
+    # property and the resulting search behaviour change). Registration is
+    # LOAD-BEARING, not cosmetic: anything absent from this frozenset silently
+    # degrades to restart-only.
+    'reconciliation.topic_anchored_recall_enabled',
+    # PRD C5's caller bar for `deterministic-*` done provenance (task 5237,
+    # consumed by task epsilon). Green tier because the value an operator
+    # reaches for during an incident is the EMPTY list -- deny every caller --
+    # and a deny-all that needs a restart arrives after the writes it was meant
+    # to stop. _iter_leaves yields the list WHOLE, so it reloads atomically: a
+    # half-applied prefix list would admit a caller no operator ever wrote.
+    'reconciliation.deterministic_provenance_allowed_agent_prefixes',
+    # Recon transcript archival (task 3972); why green: the schema descriptions.
+    'reconciliation.transcript_archive_enabled',
+    'reconciliation.transcript_archive_root',
     # Write-triage band thresholds (task 3130). Written by
     # scripts/calibrate_write_triage.py --write-config, which derives them from
     # measured similarity distributions -- so hot-reload is what lets a
@@ -66,6 +99,228 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset({
     # Traceability pointer to the report that produced the two thresholds
     # above; reloaded alongside them so config never names a stale run.
     'write_triage.calibration_report_path',
+    # Per-category cutoffs (task 3357), same green tier and same live-read
+    # path as the pooled t_high above. _iter_leaves yields the dict WHOLE, so
+    # the map reloads as ONE atomic leaf (same treatment as the
+    # procedural_knowledge_topic_guard_clusters list): a half-applied set of
+    # per-category cutoffs can never gate an audit_duplicate_memories sweep.
+    # Replaced wholesale rather than merged, so a category the latest run
+    # stopped deriving a cutoff for does not keep a stale one.
+    'write_triage.t_high_by_category',
+    # Per-project cutoffs (task 5547). No server-side consumer: the audit CLI
+    # builds a fresh FusedMemoryConfig per run, so an in-place reload is safe
+    # and restart_required would be a false alarm. Yielded whole by
+    # _iter_leaves, so it reloads all-or-nothing like the map above.
+    'write_triage_project_calibrations',
+    # Config overlay provenance (task 6798). Read live off
+    # memory_service.config by get_status (embedder/status.py), and it travels
+    # with the overlay values it vouches for, so it reloads exactly when they do.
+    'config_overlay',
+    # The two write-triage OPERATOR KNOBS (task 3127), green-tier for a
+    # different reason than the calibrated thresholds above: they are hand-set,
+    # not derived, and both are read LIVE off the shared
+    # memory_service.config.write_triage object on every add_memory write by
+    # server/write_triage.py's resolvers -- nothing is captured at import or at
+    # construction, which is what makes this registration real rather than
+    # restart-only in disguise (the reload-safety rule this module documents).
+    # `enabled` is the staged-rollout kill switch (D10, flipped by task 3169)
+    # and MUST be green-tier for the same reason mem0_update.enabled below is:
+    # it is what an operator flips to stop an in-flight triage incident, and a
+    # restart-only kill switch is no kill switch. NOTE it lives in a section a
+    # script rewrites -- scripts/calibrate_write_triage.py --write-config
+    # replaces the calibration keys above and PRESERVES these two, precisely so
+    # a hot-reloadable flag cannot be silently reverted to off by a
+    # re-calibration.
+    'write_triage.enabled',
+    # Retrieval width, tuned against measured recall on a running server rather
+    # than by redeploying. Read live per write, same path as the flag above.
+    'write_triage.candidate_k',
+    # The attach-guard knobs (task 7158): hand-set, read live per write by
+    # server/write_triage.py's resolvers; None is each rule's hot off-switch.
+    'write_triage.min_parent_cosine',
+    'write_triage.hoist_max_cosine_gap',
+    # The write-triage JUDGE knobs (task 3128, PRD leaf gamma). Green-tier
+    # for exactly the reason the two operator knobs above are: every one of
+    # them is read LIVE off the shared memory_service.config.write_triage
+    # object per middle-band write by server/write_triage_judge.py's resolvers,
+    # and nothing is captured at import or at construction -- which is what
+    # makes this registration real rather than restart-only in disguise.
+    # tests/test_config_reload.py::TestWriteTriageJudgeLeavesAreGreenTier pins
+    # both halves, and derives the expected leaf set from
+    # WriteTriageConfig.model_fields, so a further judge_* leaf added later
+    # without a line here fails there rather than degrading silently.
+    #
+    # `judge_enabled` in particular MUST be green-tier, for the same reason
+    # `write_triage.enabled` and `mem0_update.enabled` are: it is the lever an
+    # operator flips to stop an in-flight JUDGE incident (spend, latency, a bad
+    # model) WITHOUT disabling the deterministic bands, and a restart-only kill
+    # switch is no kill switch. It is the strictly finer of the two levers, so
+    # making it restart-only would leave `enabled` -- the blunt one -- as the
+    # only hot response to a judge-specific problem.
+    'write_triage.judge_enabled',
+    'write_triage.judge_provider',
+    'write_triage.judge_model',
+    'write_triage.judge_api_url',
+    'write_triage.judge_api_key',
+    'write_triage.judge_timeout_seconds',
+    'write_triage.judge_candidate_count',
+    'write_triage.judge_reasoning_effort',
+    'write_triage.judge_field_chars',
+    # The traceability pointer to leaf gamma's committed accuracy report, the
+    # exact sibling of calibration_report_path above: reloaded alongside the
+    # knobs it describes so config never names a stale measurement run. This is
+    # the one judge leaf with no live resolver -- it is read by the operator at
+    # the task-3169 flip gate, not on the write path.
+    'write_triage.judge_accuracy_report_path',
+    # In-place update_memory authorization (task 3088). Read live per tool call
+    # by resolve_mem0_update_enabled (server/mem0_update_authz.py) off the
+    # shared memory_service.config.mem0_update object -- the resolver captures
+    # nothing at import or construction, so an in-place reload flips the tool
+    # off on the very next call. This is the one leaf that MUST be green-tier:
+    # it is what an operator flips to stop an in-flight silent-rewrite
+    # incident, and a restart-only kill switch is no kill switch.
+    'mem0_update.enabled',
+    # Read live per tool call by resolve_mem0_update_allowed_prefixes, same
+    # live-read path as the kill switch above. The two lists are registered
+    # SEPARATELY because they gate different arms: widening the metadata bar
+    # alone is the supported way to admit an interactive curator-gate tagging
+    # flow on a running server WITHOUT granting content-amend authority.
+    'mem0_update.content_amend_allowed_agent_prefixes',
+    'mem0_update.metadata_patch_allowed_agent_prefixes',
+    # Read live per refusal by resolve_mem0_update_sanctioned_uses
+    # (server/mem0_update_authz.py) off the shared memory_service.config.mem0_update
+    # object. Rendering-only: it never changes an allow/deny decision. A dict,
+    # so _iter_leaves yields it whole and it reloads all-or-nothing, like
+    # write_triage.t_high_by_category.
+    'mem0_update.agent_prefix_sanctioned_use',
+    # Read live per shadow job by services/overreach_shadow.py::OverreachShadow,
+    # whose settings() re-reads memory_service.config.overreach_guard on every
+    # submit and judge call. shadow_enabled is the shadow's kill switch.
+    'overreach_guard.shadow_enabled',
+    'overreach_guard.judge_timeout_seconds',
+    # Storm-alarm knobs, read live off the shared config by
+    # MemoryService.update_memory and passed INTO StormCounter.record() on every
+    # call. That per-call argument is the non-obvious part: the shared
+    # StormCounter (shared/src/shared/storm_counter.py) deliberately does NOT
+    # capture threshold/window in __init__, because a value captured at
+    # construction cannot observe an in-place mutation (see this module's
+    # reload-safety rule) -- which would make these two leaves restart-only
+    # while sitting in this allowlist as if they were green-tier.
+    'mem0_update.storm_threshold',
+    'mem0_update.storm_window_seconds',
+    # ensure_entity_node authorization (task 4932). Read live per tool call by
+    # resolve_entity_mint_enabled (server/entity_mint_authz.py) off the shared
+    # memory_service.config.entity_mint object -- the resolver captures nothing
+    # at import or construction, so an in-place reload denies the very next
+    # call. Same must-be-green-tier argument as mem0_update.enabled above: this
+    # is what an operator flips to stop a runaway minter, and a restart-only
+    # kill switch is no kill switch.
+    'entity_mint.enabled',
+    # Read live per tool call by resolve_entity_mint_allowed_prefixes, same
+    # live-read path as the kill switch above. Widening this list on a running
+    # server is the supported way to admit a new repair flow without a restart.
+    # NOTE the bar gates on a SELF-REPORTED agent_id, so it deters misuse by
+    # cooperating callers rather than enforcing a security boundary.
+    'entity_mint.allowed_agent_prefixes',
+    # Bound on the wait for the per-group_id write-time-identity lock, read live
+    # off the shared config by MemoryService.ensure_entity_node and passed as
+    # the timeout ARGUMENT to asyncio.wait_for on every call. That per-call
+    # argument is the non-obvious part -- a timeout captured at construction
+    # could not observe an in-place mutation, which would make this leaf
+    # restart-only while sitting in this allowlist as if it were green-tier.
+    'entity_mint.lock_timeout_seconds',
+    # Mint-path storm-alarm knobs, read live off the shared config by
+    # MemoryService.ensure_entity_node and passed INTO StormCounter.record() on
+    # every call, for exactly the reason spelled out for the mem0_update storm
+    # leaves above: the shared StormCounter
+    # (shared/src/shared/storm_counter.py) deliberately does NOT capture
+    # threshold/window in __init__.
+    'entity_mint.storm_threshold',
+    'entity_mint.storm_window_seconds',
+    # ---- Deterministic auto-consolidation (task 5237, PRD Section 7/11) ----
+    # The live-read consumers are
+    # reconciliation/consolidation_auto_executor.py::run_auto_consolidation
+    # (MemoryConsolidator.run reads memory.config.consolidation_auto once per
+    # cycle, never at construction) and server/tools.py::propose_consolidation.
+    # Registration is load-bearing: anything absent from this frozenset
+    # silently degrades to restart-only.
+    #
+    # Two of these MUST be green tier for the PRD Section 11 rollout to work at
+    # all. `enabled` is the kill switch -- what an operator flips to stop a
+    # mis-consolidating cycle -- and a restart-only kill switch is no kill
+    # switch (the mem0_update.enabled lesson above). `enabled_projects` is the
+    # per-project staging lever, which is a rollout tool only if it moves on a
+    # running server.
+    'consolidation_auto.enabled',
+    'consolidation_auto.enabled_projects',
+    # Stamped onto every verdict and onto auto-execution provenance, read live
+    # per verdict so a reload retags subsequent verdicts rather than needing a
+    # restart to change what the corpus audit trail says.
+    'consolidation_auto.predicate_version',
+    # Proposal-shape bounds, enforced at the emit boundary by
+    # server/consolidation.py::validate_consolidate_args. Green tier so the
+    # supervised cycle can tighten or loosen what counts as a cluster from the
+    # evidence it is producing, without a redeploy between observations.
+    'consolidation_auto.member_min',
+    'consolidation_auto.member_max',
+    'consolidation_auto.claim_max_chars',
+    # Blast-radius caps. Both admit 0 as a narrow off switch, which is the
+    # value an operator sets mid-incident to stop execution (or gate filing)
+    # while leaving the rest of the pipeline observing -- useless if it needed
+    # a restart.
+    'consolidation_auto.max_auto_per_cycle',
+    'consolidation_auto.max_gate_filings_per_cycle',
+    # Ranking + re-proposal tuning, calibrated against what the supervised
+    # cycle actually produces (PRD Section 12 Q2), so they must move on a
+    # running server or the calibration loop is a redeploy loop.
+    'consolidation_auto.backlog_multiplier',
+    'consolidation_auto.canonical_absent_bonus',
+    'consolidation_auto.refusal_streak_threshold',
+    'consolidation_auto.slug_collision_jaccard',
+    'consolidation_auto.proposal_ttl_hours',
+    # ATOMICITY NOTE for the two containers above and below: _iter_leaves
+    # yields `enabled_projects` (list) and `category_weights` (dict) WHOLE,
+    # never descending into them -- the same treatment as
+    # reconciliation.procedural_knowledge_topic_guard_clusters and
+    # write_triage.t_high_by_category. Each therefore reloads all-or-nothing,
+    # which is why a partially-applied ranking map can never gate a cycle.
+    'consolidation_auto.category_weights',
+    # Adjudicator leaves (plans/consolidation-adjudicator-prd.md K7), read by
+    # reconciliation/consolidation_adjudicator.py,
+    # reconciliation/consolidation_adjudicator_calibration.py and the executor
+    # (task gamma of that PRD).
+    'consolidation_auto.max_adjudications_per_cycle',
+    'consolidation_auto.adjudicator_model',
+    'consolidation_auto.adjudicator_reasoning_effort',
+    'consolidation_auto.adjudicator_timeout_seconds',
+    'consolidation_auto.adjudicator_field_chars',
+    'consolidation_auto.adjudicator_member_max',
+    'consolidation_auto.outcome_retention_days',
+    'consolidation_auto.memo_days',
+    # ---- Link-heal executor caps and adjudicator knobs (tasks 6181, 6184;
+    # plans/write-triage-link-healing-prd.md H1, H2) ----
+    # The consumers are fused-memory/scripts/link_heal.py and
+    # fused-memory/scripts/eval_link_adjudicator.py, which load config at each
+    # run start. The server holds no copy, so an edit must never report
+    # restart_required.
+    'link_heal.max_actions_per_run',
+    'link_heal.backlog_multiplier',
+    'link_heal.write_failure_streak',
+    'link_heal.adjudicator_model',
+    'link_heal.shard_size',
+    'link_heal.field_chars',
+    'link_heal.misfile_share_ceiling',
+    'link_heal.corrects_share_ceiling',
+    'link_heal.shard_failure_streak',
+    # The scheduled sweep, its calibration gate and its adjudication cap
+    # (tasks 7159, 6188): same consumers.
+    'link_heal.projects',
+    'link_heal.writes',
+    'link_heal.sweep_actions',
+    'link_heal.sweep_window_hours',
+    'link_heal.max_adjudications_per_run',
+    'link_heal.calibration_kappa_margin',
+    'link_heal.calibration_min_project_items',
 })
 
 
@@ -80,6 +335,50 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset({
 # so the report stays machine-checkable — rather than raising the KeyError of
 # task 2718 review esc-2718-1.
 _ABSENT = '<absent>'
+
+
+# Any embedder leaf, not only model and dimensions: the overlay provenance
+# vouches for every key the overlay merged, endpoint included, so it must
+# never report a merge the live embedder is still waiting on a restart for.
+_EMBEDDER_SECTION_PREFIX = 'embedder.'
+
+# The leaves that wait with the embedder section: the overlay's embedder-space
+# units and the provenance that vouches for them.
+_EMBEDDER_SPACE_LEAVES: frozenset[str] = frozenset(
+    {PROVENANCE_FIELD}
+    | {
+        f'{unit.section}.{key}'
+        for unit in EMBEDDER_SPACE_UNITS if unit.keys is not None
+        for key in unit.keys
+    }
+)
+_EMBEDDER_SPACE_SECTIONS: frozenset[str] = frozenset(
+    unit.section for unit in EMBEDDER_SPACE_UNITS if unit.keys is None
+)
+
+
+def _waits_with_the_embedder(path: str) -> bool:
+    return (
+        path in _EMBEDDER_SPACE_LEAVES
+        or path.split('.', 1)[0] in _EMBEDDER_SPACE_SECTIONS
+    )
+
+
+def _hold_embedder_space_while_the_embedder_waits(
+    applied_candidates: dict[str, dict[str, Any]],
+    restart_required: dict[str, dict[str, Any]],
+) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
+    """Move every embedder-space candidate to restart_required when an embedder leaf is there."""
+    if not any(path.startswith(_EMBEDDER_SECTION_PREFIX) for path in restart_required):
+        return applied_candidates, restart_required
+    held = {
+        path: entry for path, entry in applied_candidates.items()
+        if _waits_with_the_embedder(path)
+    }
+    still_applied = {
+        path: entry for path, entry in applied_candidates.items() if path not in held
+    }
+    return still_applied, restart_required | held
 
 
 @dataclass
@@ -152,6 +451,11 @@ def diff_config(
     allowlisted). The union + ``_ABSENT`` fallback merely guarantees any residual
     one-sided leaf is still bucketed (never a ``KeyError``) if that symmetry were
     ever broken — see task 2718 review esc-2718-1.
+
+    Embedder-space values (bands, calibrations) mean nothing outside the
+    embedder's space, and the overlay provenance vouches for the embedder
+    keys it merged, so when an ``embedder.*`` leaf waits for a restart, so
+    do they.
     """
     live_leaves = dict(_iter_leaves(live))
     fresh_leaves = dict(_iter_leaves(fresh))
@@ -169,6 +473,9 @@ def diff_config(
                 restart_required[path] = entry
         else:
             unchanged += 1
+    applied_candidates, restart_required = _hold_embedder_space_while_the_embedder_waits(
+        applied_candidates, restart_required,
+    )
     return ConfigDiff(
         applied_candidates=applied_candidates,
         restart_required=restart_required,

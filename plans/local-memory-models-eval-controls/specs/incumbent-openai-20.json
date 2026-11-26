@@ -1,0 +1,24 @@
+{
+  "arm_id": "incumbent-openai-20",
+  "arm_role": "control",
+  "axis": "llm",
+  "client_class": "openai",
+  "code_sha": "055e9c15a0d756704017b0d77ffbe4185155402f",
+  "corpus_sha": "850cf7c937c745b0d224a0ba975efc1c69080ad61d84c5369d06287cdd16f2e8",
+  "model_id": "gpt-4o-mini",
+  "params": {
+    "max_tokens": 4096,
+    "temperature": 0.0
+  },
+  "preregistration_sha": null,
+  "pricing": {
+    "usd_per_mtok_input": 0.15,
+    "usd_per_mtok_output": 0.6
+  },
+  "scratch_group_id": "evalmem_lme_ctl_openai_20",
+  "serving": {
+    "base_url": "https://api.openai.com/v1",
+    "stack": "openai"
+  },
+  "structured_output_mode": "json_schema"
+}

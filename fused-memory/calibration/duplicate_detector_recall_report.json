@@ -1,0 +1,1155 @@
+{
+  "setting": {
+    "scan_set": "fixture_only",
+    "records": 104,
+    "top_k": 10,
+    "per_category": true,
+    "embedder": {
+      "model": "text-embedding-3-small",
+      "dimensions": 1536
+    }
+  },
+  "pair_counts": {
+    "true_dup_pairs": 301,
+    "hard_negative_pairs": 18,
+    "unrelated_pairs": 5037
+  },
+  "candidate_generation": {
+    "top_k": 10,
+    "candidates_generated": 655,
+    "true_caught": {
+      "hits": 262,
+      "total": 301,
+      "rate": 0.8704318936877077,
+      "wilson_95": [
+        0.8277763234938658,
+        0.9037511320765026
+      ]
+    },
+    "hard_negative_generated": 18,
+    "cross_category_true_pairs": 27,
+    "disclosure": {
+      "top_k_saturated": 96,
+      "below_threshold_dropped": 0,
+      "unknown_neighbor_dropped": 0,
+      "missing_vector": 0,
+      "uncalibrated_category_dropped": 0
+    }
+  },
+  "baseline": {
+    "arm": "calibrated-ann",
+    "arm_class": "baseline",
+    "model": "cosine",
+    "granularity": "full_text",
+    "status": "measured",
+    "skip_reason": null,
+    "skip_detail": null,
+    "operating_rule": "calibrated_ann_cutoffs",
+    "auc": {
+      "value": 0.25396825396825395,
+      "n_true": 301,
+      "n_hard_negative": 18,
+      "hanley_mcneil_95": [
+        0.1204878830568542,
+        0.3874486248796537
+      ]
+    },
+    "operating_threshold": null,
+    "paraphrase_band_recall": {
+      "hits": 27,
+      "total": 301,
+      "rate": 0.08970099667774087,
+      "wilson_95": [
+        0.06237935223938533,
+        0.12736377993155196
+      ]
+    },
+    "precision": {
+      "hits": 27,
+      "total": 27,
+      "rate": 1.0,
+      "wilson_95": [
+        0.8754409628553641,
+        1.0
+      ]
+    },
+    "hard_negative_flagged": {
+      "hits": 0,
+      "total": 18,
+      "rate": 0.0,
+      "wilson_95": [
+        0.0,
+        0.1758845505823749
+      ]
+    },
+    "recall_at_precision": null,
+    "pairs_scored": null,
+    "unscored_pairs": null,
+    "cost_usd": null,
+    "pairs_over_max_length": null,
+    "device": null,
+    "vram_peak_mib": null,
+    "max_length": null,
+    "scoring_seconds": null
+  },
+  "arms": [
+    {
+      "arm": "qwen3-reranker-0.6b",
+      "arm_class": "local_cross_encoder",
+      "model": "Qwen/Qwen3-Reranker-0.6B",
+      "granularity": "full_text",
+      "status": "measured",
+      "skip_reason": null,
+      "skip_detail": null,
+      "operating_rule": "max_caught_at_precision_floor",
+      "auc": {
+        "value": 0.20302694721299372,
+        "n_true": 301,
+        "n_hard_negative": 18,
+        "hanley_mcneil_95": [
+          0.07769229462328728,
+          0.3283615998027002
+        ]
+      },
+      "operating_threshold": null,
+      "paraphrase_band_recall": {
+        "hits": 0,
+        "total": 301,
+        "rate": 0.0,
+        "wilson_95": [
+          0.0,
+          0.012601954588875008
+        ]
+      },
+      "precision": null,
+      "hard_negative_flagged": {
+        "hits": 0,
+        "total": 18,
+        "rate": 0.0,
+        "wilson_95": [
+          0.0,
+          0.1758845505823749
+        ]
+      },
+      "recall_at_precision": [
+        {
+          "precision_floor": 0.8,
+          "threshold": 6.5,
+          "caught": 195,
+          "flagged": 242,
+          "recall": {
+            "hits": 195,
+            "total": 301,
+            "rate": 0.6478405315614618,
+            "wilson_95": [
+              0.5923256017416251,
+              0.6996293020510332
+            ]
+          },
+          "precision": {
+            "hits": 195,
+            "total": 242,
+            "rate": 0.8057851239669421,
+            "wilson_95": [
+              0.7513250343549466,
+              0.8506886199655589
+            ]
+          }
+        },
+        {
+          "precision_floor": 0.9,
+          "threshold": null,
+          "caught": 0,
+          "flagged": 0,
+          "recall": {
+            "hits": 0,
+            "total": 301,
+            "rate": 0.0,
+            "wilson_95": [
+              0.0,
+              0.012601954588875008
+            ]
+          },
+          "precision": null
+        },
+        {
+          "precision_floor": 0.95,
+          "threshold": null,
+          "caught": 0,
+          "flagged": 0,
+          "recall": {
+            "hits": 0,
+            "total": 301,
+            "rate": 0.0,
+            "wilson_95": [
+              0.0,
+              0.012601954588875008
+            ]
+          },
+          "precision": null
+        }
+      ],
+      "pairs_scored": 1388,
+      "unscored_pairs": 0,
+      "cost_usd": 0.0,
+      "pairs_over_max_length": 0,
+      "device": "cuda:0 (NVIDIA GeForce RTX 3090)",
+      "vram_peak_mib": 4412.72265625,
+      "max_length": 8192,
+      "scoring_seconds": 122.30532903410494
+    },
+    {
+      "arm": "mxbai-rerank-base-v2",
+      "arm_class": "local_cross_encoder",
+      "model": "mixedbread-ai/mxbai-rerank-base-v2",
+      "granularity": "full_text",
+      "status": "measured",
+      "skip_reason": null,
+      "skip_detail": null,
+      "operating_rule": "max_caught_at_precision_floor",
+      "auc": {
+        "value": 0.3353636028054633,
+        "n_true": 301,
+        "n_hard_negative": 18,
+        "hanley_mcneil_95": [
+          0.19478210069491883,
+          0.4759451049160077
+        ]
+      },
+      "operating_threshold": 0.9999446868896484,
+      "paraphrase_band_recall": {
+        "hits": 105,
+        "total": 301,
+        "rate": 0.3488372093023256,
+        "wilson_95": [
+          0.2972056224088237,
+          0.40427868944362694
+        ]
+      },
+      "precision": {
+        "hits": 105,
+        "total": 115,
+        "rate": 0.9130434782608695,
+        "wilson_95": [
+          0.8473013610685256,
+          0.952082019835131
+        ]
+      },
+      "hard_negative_flagged": {
+        "hits": 8,
+        "total": 18,
+        "rate": 0.4444444444444444,
+        "wilson_95": [
+          0.24559231101389126,
+          0.6628393057174837
+        ]
+      },
+      "recall_at_precision": [
+        {
+          "precision_floor": 0.8,
+          "threshold": 0.9996620416641235,
+          "caught": 232,
+          "flagged": 290,
+          "recall": {
+            "hits": 232,
+            "total": 301,
+            "rate": 0.770764119601329,
+            "wilson_95": [
+              0.7200419028577326,
+              0.8146620220658999
+            ]
+          },
+          "precision": {
+            "hits": 232,
+            "total": 290,
+            "rate": 0.8,
+            "wilson_95": [
+              0.7501738930772719,
+              0.8419818806457138
+            ]
+          }
+        },
+        {
+          "precision_floor": 0.9,
+          "threshold": 0.9999446868896484,
+          "caught": 105,
+          "flagged": 115,
+          "recall": {
+            "hits": 105,
+            "total": 301,
+            "rate": 0.3488372093023256,
+            "wilson_95": [
+              0.2972056224088237,
+              0.40427868944362694
+            ]
+          },
+          "precision": {
+            "hits": 105,
+            "total": 115,
+            "rate": 0.9130434782608695,
+            "wilson_95": [
+              0.8473013610685256,
+              0.952082019835131
+            ]
+          }
+        },
+        {
+          "precision_floor": 0.95,
+          "threshold": 0.9999645352363586,
+          "caught": 68,
+          "flagged": 71,
+          "recall": {
+            "hits": 68,
+            "total": 301,
+            "rate": 0.22591362126245848,
+            "wilson_95": [
+              0.18229623182215232,
+              0.2764390588993241
+            ]
+          },
+          "precision": {
+            "hits": 68,
+            "total": 71,
+            "rate": 0.9577464788732394,
+            "wilson_95": [
+              0.8829739389031531,
+              0.9855270017501733
+            ]
+          }
+        }
+      ],
+      "pairs_scored": 1388,
+      "unscored_pairs": 0,
+      "cost_usd": 0.0,
+      "pairs_over_max_length": 0,
+      "device": "cuda:0 (NVIDIA GeForce RTX 3090)",
+      "vram_peak_mib": 2113.6416015625,
+      "max_length": 8192,
+      "scoring_seconds": 63.46135861054063
+    },
+    {
+      "arm": "bge-reranker-v2-m3",
+      "arm_class": "local_cross_encoder",
+      "model": "BAAI/bge-reranker-v2-m3",
+      "granularity": "full_text",
+      "status": "measured",
+      "skip_reason": null,
+      "skip_detail": null,
+      "operating_rule": "max_caught_at_precision_floor",
+      "auc": {
+        "value": 0.43078626799557035,
+        "n_true": 301,
+        "n_hard_negative": 18,
+        "hanley_mcneil_95": [
+          0.28942170962176633,
+          0.5721508263693744
+        ]
+      },
+      "operating_threshold": 0.8898184597492218,
+      "paraphrase_band_recall": {
+        "hits": 52,
+        "total": 301,
+        "rate": 0.17275747508305647,
+        "wilson_95": [
+          0.13424357971343467,
+          0.21951916132978253
+        ]
+      },
+      "precision": {
+        "hits": 52,
+        "total": 57,
+        "rate": 0.9122807017543859,
+        "wilson_95": [
+          0.8105488754539574,
+          0.9619488892333616
+        ]
+      },
+      "hard_negative_flagged": {
+        "hits": 1,
+        "total": 18,
+        "rate": 0.05555555555555555,
+        "wilson_95": [
+          0.009874935830924525,
+          0.2575779980200754
+        ]
+      },
+      "recall_at_precision": [
+        {
+          "precision_floor": 0.8,
+          "threshold": 0.8069539070129395,
+          "caught": 92,
+          "flagged": 114,
+          "recall": {
+            "hits": 92,
+            "total": 301,
+            "rate": 0.30564784053156147,
+            "wilson_95": [
+              0.2563237374484455,
+              0.3598703777904195
+            ]
+          },
+          "precision": {
+            "hits": 92,
+            "total": 114,
+            "rate": 0.8070175438596491,
+            "wilson_95": [
+              0.7250557059201088,
+              0.8689620263577964
+            ]
+          }
+        },
+        {
+          "precision_floor": 0.9,
+          "threshold": 0.8898184597492218,
+          "caught": 52,
+          "flagged": 57,
+          "recall": {
+            "hits": 52,
+            "total": 301,
+            "rate": 0.17275747508305647,
+            "wilson_95": [
+              0.13424357971343467,
+              0.21951916132978253
+            ]
+          },
+          "precision": {
+            "hits": 52,
+            "total": 57,
+            "rate": 0.9122807017543859,
+            "wilson_95": [
+              0.8105488754539574,
+              0.9619488892333616
+            ]
+          }
+        },
+        {
+          "precision_floor": 0.95,
+          "threshold": 0.9123358130455017,
+          "caught": 41,
+          "flagged": 43,
+          "recall": {
+            "hits": 41,
+            "total": 301,
+            "rate": 0.1362126245847176,
+            "wilson_95": [
+              0.1020188773415048,
+              0.17957523579790927
+            ]
+          },
+          "precision": {
+            "hits": 41,
+            "total": 43,
+            "rate": 0.9534883720930233,
+            "wilson_95": [
+              0.8454422407613695,
+              0.9871510096826803
+            ]
+          }
+        }
+      ],
+      "pairs_scored": 1388,
+      "unscored_pairs": 0,
+      "cost_usd": 0.0,
+      "pairs_over_max_length": 728,
+      "device": "cuda:0 (NVIDIA GeForce RTX 3090)",
+      "vram_peak_mib": 1184.091796875,
+      "max_length": 1024,
+      "scoring_seconds": 25.331357820890844
+    },
+    {
+      "arm": "gpt-4o-mini-pairwise",
+      "arm_class": "llm_pairwise",
+      "model": "gpt-4o-mini",
+      "granularity": "full_text",
+      "status": "measured",
+      "skip_reason": null,
+      "skip_detail": null,
+      "operating_rule": "max_caught_at_precision_floor",
+      "auc": {
+        "value": 0.4034699150978221,
+        "n_true": 301,
+        "n_hard_negative": 18,
+        "hanley_mcneil_95": [
+          0.2615766189897101,
+          0.5453632112059341
+        ]
+      },
+      "operating_threshold": 0.009642121776022623,
+      "paraphrase_band_recall": {
+        "hits": 145,
+        "total": 301,
+        "rate": 0.48172757475083056,
+        "wilson_95": [
+          0.42586565006561017,
+          0.5380500359824882
+        ]
+      },
+      "precision": {
+        "hits": 145,
+        "total": 161,
+        "rate": 0.9006211180124224,
+        "wilson_95": [
+          0.8446691587015289,
+          0.9379002897872022
+        ]
+      },
+      "hard_negative_flagged": {
+        "hits": 10,
+        "total": 18,
+        "rate": 0.5555555555555556,
+        "wilson_95": [
+          0.3371606942825164,
+          0.7544076889861088
+        ]
+      },
+      "recall_at_precision": [
+        {
+          "precision_floor": 0.8,
+          "threshold": 4.1591740231250167e-07,
+          "caught": 209,
+          "flagged": 260,
+          "recall": {
+            "hits": 209,
+            "total": 301,
+            "rate": 0.6943521594684385,
+            "wilson_95": [
+              0.6401296222095805,
+              0.7436762625515545
+            ]
+          },
+          "precision": {
+            "hits": 209,
+            "total": 260,
+            "rate": 0.8038461538461539,
+            "wilson_95": [
+              0.7513035083942234,
+              0.8475406465836117
+            ]
+          }
+        },
+        {
+          "precision_floor": 0.9,
+          "threshold": 0.009642121776022623,
+          "caught": 145,
+          "flagged": 161,
+          "recall": {
+            "hits": 145,
+            "total": 301,
+            "rate": 0.48172757475083056,
+            "wilson_95": [
+              0.42586565006561017,
+              0.5380500359824882
+            ]
+          },
+          "precision": {
+            "hits": 145,
+            "total": 161,
+            "rate": 0.9006211180124224,
+            "wilson_95": [
+              0.8446691587015289,
+              0.9379002897872022
+            ]
+          }
+        },
+        {
+          "precision_floor": 0.95,
+          "threshold": 0.6602442071428121,
+          "caught": 42,
+          "flagged": 44,
+          "recall": {
+            "hits": 42,
+            "total": 301,
+            "rate": 0.13953488372093023,
+            "wilson_95": [
+              0.10491512866963779,
+              0.1832397688246675
+            ]
+          },
+          "precision": {
+            "hits": 42,
+            "total": 44,
+            "rate": 0.9545454545454546,
+            "wilson_95": [
+              0.8486472847469684,
+              0.9874451536330189
+            ]
+          }
+        }
+      ],
+      "pairs_scored": 1388,
+      "unscored_pairs": 0,
+      "cost_usd": 0.2515794,
+      "pairs_over_max_length": null,
+      "device": "remote:api.openai.com",
+      "vram_peak_mib": null,
+      "max_length": null,
+      "scoring_seconds": 92.14968649391085
+    },
+    {
+      "arm": "jina-reranker",
+      "arm_class": "hosted_api",
+      "model": "jina-reranker-v3.5",
+      "granularity": "full_text",
+      "status": "skipped",
+      "skip_reason": "no_credential",
+      "skip_detail": "JINA_API_KEY unset",
+      "operating_rule": null,
+      "auc": null,
+      "operating_threshold": null,
+      "paraphrase_band_recall": null,
+      "precision": null,
+      "hard_negative_flagged": null,
+      "recall_at_precision": null,
+      "pairs_scored": null,
+      "unscored_pairs": null,
+      "cost_usd": null,
+      "pairs_over_max_length": null,
+      "device": null,
+      "vram_peak_mib": null,
+      "max_length": null,
+      "scoring_seconds": null
+    },
+    {
+      "arm": "voyage-rerank",
+      "arm_class": "hosted_api",
+      "model": "rerank-2.5",
+      "granularity": "full_text",
+      "status": "skipped",
+      "skip_reason": "no_credential",
+      "skip_detail": "VOYAGE_API_KEY unset",
+      "operating_rule": null,
+      "auc": null,
+      "operating_threshold": null,
+      "paraphrase_band_recall": null,
+      "precision": null,
+      "hard_negative_flagged": null,
+      "recall_at_precision": null,
+      "pairs_scored": null,
+      "unscored_pairs": null,
+      "cost_usd": null,
+      "pairs_over_max_length": null,
+      "device": null,
+      "vram_peak_mib": null,
+      "max_length": null,
+      "scoring_seconds": null
+    },
+    {
+      "arm": "cohere-rerank",
+      "arm_class": "hosted_api",
+      "model": "rerank-v4.0-pro",
+      "granularity": "full_text",
+      "status": "skipped",
+      "skip_reason": "no_credential",
+      "skip_detail": "COHERE_API_KEY / CO_API_KEY unset",
+      "operating_rule": null,
+      "auc": null,
+      "operating_threshold": null,
+      "paraphrase_band_recall": null,
+      "precision": null,
+      "hard_negative_flagged": null,
+      "recall_at_precision": null,
+      "pairs_scored": null,
+      "unscored_pairs": null,
+      "cost_usd": null,
+      "pairs_over_max_length": null,
+      "device": null,
+      "vram_peak_mib": null,
+      "max_length": null,
+      "scoring_seconds": null
+    },
+    {
+      "arm": "qwen3-reranker-0.6b+claims",
+      "arm_class": "local_cross_encoder",
+      "model": "Qwen/Qwen3-Reranker-0.6B",
+      "granularity": "claims",
+      "status": "measured",
+      "skip_reason": null,
+      "skip_detail": null,
+      "operating_rule": "max_caught_at_precision_floor",
+      "auc": {
+        "value": 0.2901439645625692,
+        "n_true": 301,
+        "n_hard_negative": 18,
+        "hanley_mcneil_95": [
+          0.15269390003400088,
+          0.42759402909113753
+        ]
+      },
+      "operating_threshold": 8.114583333333334,
+      "paraphrase_band_recall": {
+        "hits": 9,
+        "total": 301,
+        "rate": 0.029900332225913623,
+        "wilson_95": [
+          0.01580871436196775,
+          0.055840299420928025
+        ]
+      },
+      "precision": {
+        "hits": 9,
+        "total": 10,
+        "rate": 0.9,
+        "wilson_95": [
+          0.5958436145024278,
+          0.9821242504842788
+        ]
+      },
+      "hard_negative_flagged": {
+        "hits": 1,
+        "total": 18,
+        "rate": 0.05555555555555555,
+        "wilson_95": [
+          0.009874935830924525,
+          0.2575779980200754
+        ]
+      },
+      "recall_at_precision": [
+        {
+          "precision_floor": 0.8,
+          "threshold": 1.503125,
+          "caught": 221,
+          "flagged": 275,
+          "recall": {
+            "hits": 221,
+            "total": 301,
+            "rate": 0.7342192691029901,
+            "wilson_95": [
+              0.6815899443221729,
+              0.7809453526976564
+            ]
+          },
+          "precision": {
+            "hits": 221,
+            "total": 275,
+            "rate": 0.8036363636363636,
+            "wilson_95": [
+              0.7526388773244441,
+              0.8462674551596614
+            ]
+          }
+        },
+        {
+          "precision_floor": 0.9,
+          "threshold": 8.114583333333334,
+          "caught": 9,
+          "flagged": 10,
+          "recall": {
+            "hits": 9,
+            "total": 301,
+            "rate": 0.029900332225913623,
+            "wilson_95": [
+              0.01580871436196775,
+              0.055840299420928025
+            ]
+          },
+          "precision": {
+            "hits": 9,
+            "total": 10,
+            "rate": 0.9,
+            "wilson_95": [
+              0.5958436145024278,
+              0.9821242504842788
+            ]
+          }
+        },
+        {
+          "precision_floor": 0.95,
+          "threshold": 8.389136904761905,
+          "caught": 5,
+          "flagged": 5,
+          "recall": {
+            "hits": 5,
+            "total": 301,
+            "rate": 0.016611295681063124,
+            "wilson_95": [
+              0.0071155849735820825,
+              0.03829029138974891
+            ]
+          },
+          "precision": {
+            "hits": 5,
+            "total": 5,
+            "rate": 1.0,
+            "wilson_95": [
+              0.5655085052479191,
+              1.0
+            ]
+          }
+        }
+      ],
+      "pairs_scored": 1388,
+      "unscored_pairs": 0,
+      "cost_usd": 0.0,
+      "pairs_over_max_length": 0,
+      "device": "cuda:0 (NVIDIA GeForce RTX 3090)",
+      "vram_peak_mib": 1394.2158203125,
+      "max_length": 8192,
+      "scoring_seconds": 4189.282328483649
+    },
+    {
+      "arm": "mxbai-rerank-base-v2+claims",
+      "arm_class": "local_cross_encoder",
+      "model": "mixedbread-ai/mxbai-rerank-base-v2",
+      "granularity": "claims",
+      "status": "measured",
+      "skip_reason": null,
+      "skip_detail": null,
+      "operating_rule": "max_caught_at_precision_floor",
+      "auc": {
+        "value": 0.47471391657438167,
+        "n_true": 301,
+        "n_hard_negative": 18,
+        "hanley_mcneil_95": [
+          0.3353893210367349,
+          0.6140385121120284
+        ]
+      },
+      "operating_threshold": 0.9992733945449193,
+      "paraphrase_band_recall": {
+        "hits": 12,
+        "total": 301,
+        "rate": 0.03986710963455149,
+        "wilson_95": [
+          0.022950103141283908,
+          0.06838126370628544
+        ]
+      },
+      "precision": {
+        "hits": 12,
+        "total": 12,
+        "rate": 1.0,
+        "wilson_95": [
+          0.7574992425007574,
+          1.0
+        ]
+      },
+      "hard_negative_flagged": {
+        "hits": 0,
+        "total": 18,
+        "rate": 0.0,
+        "wilson_95": [
+          0.0,
+          0.1758845505823749
+        ]
+      },
+      "recall_at_precision": [
+        {
+          "precision_floor": 0.8,
+          "threshold": 0.9313053637742996,
+          "caught": 143,
+          "flagged": 178,
+          "recall": {
+            "hits": 143,
+            "total": 301,
+            "rate": 0.4750830564784053,
+            "wilson_95": [
+              0.4193367048552379,
+              0.5314574124830781
+            ]
+          },
+          "precision": {
+            "hits": 143,
+            "total": 178,
+            "rate": 0.8033707865168539,
+            "wilson_95": [
+              0.7388387659781506,
+              0.8550847366747076
+            ]
+          }
+        },
+        {
+          "precision_floor": 0.9,
+          "threshold": 0.9992733945449193,
+          "caught": 12,
+          "flagged": 12,
+          "recall": {
+            "hits": 12,
+            "total": 301,
+            "rate": 0.03986710963455149,
+            "wilson_95": [
+              0.022950103141283908,
+              0.06838126370628544
+            ]
+          },
+          "precision": {
+            "hits": 12,
+            "total": 12,
+            "rate": 1.0,
+            "wilson_95": [
+              0.7574992425007574,
+              1.0
+            ]
+          }
+        },
+        {
+          "precision_floor": 0.95,
+          "threshold": 0.9992733945449193,
+          "caught": 12,
+          "flagged": 12,
+          "recall": {
+            "hits": 12,
+            "total": 301,
+            "rate": 0.03986710963455149,
+            "wilson_95": [
+              0.022950103141283908,
+              0.06838126370628544
+            ]
+          },
+          "precision": {
+            "hits": 12,
+            "total": 12,
+            "rate": 1.0,
+            "wilson_95": [
+              0.7574992425007574,
+              1.0
+            ]
+          }
+        }
+      ],
+      "pairs_scored": 1388,
+      "unscored_pairs": 0,
+      "cost_usd": 0.0,
+      "pairs_over_max_length": 0,
+      "device": "cuda:0 (NVIDIA GeForce RTX 3090)",
+      "vram_peak_mib": 1048.765625,
+      "max_length": 8192,
+      "scoring_seconds": 3170.2713903412223
+    },
+    {
+      "arm": "bge-reranker-v2-m3+claims",
+      "arm_class": "local_cross_encoder",
+      "model": "BAAI/bge-reranker-v2-m3",
+      "granularity": "claims",
+      "status": "measured",
+      "skip_reason": null,
+      "skip_detail": null,
+      "operating_rule": "max_caught_at_precision_floor",
+      "auc": {
+        "value": 0.3401624215577704,
+        "n_true": 301,
+        "n_hard_negative": 18,
+        "hanley_mcneil_95": [
+          0.19935917998199817,
+          0.4809656631335426
+        ]
+      },
+      "operating_threshold": 0.36864760730012286,
+      "paraphrase_band_recall": {
+        "hits": 148,
+        "total": 301,
+        "rate": 0.49169435215946844,
+        "wilson_95": [
+          0.43567745265075203,
+          0.5479205864620199
+        ]
+      },
+      "precision": {
+        "hits": 148,
+        "total": 164,
+        "rate": 0.9024390243902439,
+        "wilson_95": [
+          0.8474022431479169,
+          0.9390535580360566
+        ]
+      },
+      "hard_negative_flagged": {
+        "hits": 11,
+        "total": 18,
+        "rate": 0.6111111111111112,
+        "wilson_95": [
+          0.3861866858065617,
+          0.7969500807306884
+        ]
+      },
+      "recall_at_precision": [
+        {
+          "precision_floor": 0.8,
+          "threshold": 0.14239367195038433,
+          "caught": 211,
+          "flagged": 262,
+          "recall": {
+            "hits": 211,
+            "total": 301,
+            "rate": 0.7009966777408638,
+            "wilson_95": [
+              0.6470070483443332,
+              0.7499204051265843
+            ]
+          },
+          "precision": {
+            "hits": 211,
+            "total": 262,
+            "rate": 0.8053435114503816,
+            "wilson_95": [
+              0.7531310798299212,
+              0.8487310816978456
+            ]
+          }
+        },
+        {
+          "precision_floor": 0.9,
+          "threshold": 0.36864760730012286,
+          "caught": 148,
+          "flagged": 164,
+          "recall": {
+            "hits": 148,
+            "total": 301,
+            "rate": 0.49169435215946844,
+            "wilson_95": [
+              0.43567745265075203,
+              0.5479205864620199
+            ]
+          },
+          "precision": {
+            "hits": 148,
+            "total": 164,
+            "rate": 0.9024390243902439,
+            "wilson_95": [
+              0.8474022431479169,
+              0.9390535580360566
+            ]
+          }
+        },
+        {
+          "precision_floor": 0.95,
+          "threshold": 0.6693071300784748,
+          "caught": 17,
+          "flagged": 17,
+          "recall": {
+            "hits": 17,
+            "total": 301,
+            "rate": 0.05647840531561462,
+            "wilson_95": [
+              0.03555764530204751,
+              0.08857764331997785
+            ]
+          },
+          "precision": {
+            "hits": 17,
+            "total": 17,
+            "rate": 1.0,
+            "wilson_95": [
+              0.8156763396284354,
+              1.0
+            ]
+          }
+        }
+      ],
+      "pairs_scored": 1388,
+      "unscored_pairs": 0,
+      "cost_usd": 0.0,
+      "pairs_over_max_length": 0,
+      "device": "cuda:0 (NVIDIA GeForce RTX 3090)",
+      "vram_peak_mib": 1133.60498046875,
+      "max_length": 1024,
+      "scoring_seconds": 1634.7032659351826
+    }
+  ],
+  "chosen": {
+    "arm": "bge-reranker-v2-m3+claims",
+    "rule": "the measured non-baseline arm catching the most true pairs at the precision floor; a tie goes to the higher AUC, then the earlier row",
+    "verdict": {
+      "on_point_estimates": false,
+      "on_lower_bounds": false
+    }
+  },
+  "gate_proposal": {
+    "precision_floor": 0.9,
+    "min_paraphrase_band_recall": 0.75,
+    "min_auc": 0.8,
+    "proposed_on": "2026-11-16",
+    "basis": [
+      "precision 0.90: a filed gate's member list is the curator's working list (task 4916), and a false member is a distinct claim proposed for folding; at the fixture's mean cluster of about 5 members (104 records / 20 canonicals, about 10 pairs) that is about one false pair per gate.",
+      "recall 0.75: guards against the systematically under-inclusive gate (the esc-5541 false-closure shape flagged in the 2026-07-30 review of PRD leaf kappa); transitive closure recovers a member through any one caught pair, so member recall is at least pair recall; the floor sits below the per-category top-10 generator's ceiling (262/301 = 0.870 when registered; this report's candidate_generation block re-measures it), so it is attainable by an adjudicator over this generator.",
+      "AUC 0.80: Hosmer, Lemeshow and Sturdivant, Applied Logistic Regression, 3rd ed., section 5.2.4, rate 0.8-0.9 'excellent' discrimination; hard negatives are exactly the same-topic, different-claim pairs whose folding loses information; with 18 hard negatives the Hanley-McNeil interval is about +/-0.08, so both the point and lower-bound verdicts are reported for the ratifier (task 10244)."
+    ]
+  },
+  "recall_caveat_entry": {
+    "measured_at": "2026-11-16",
+    "detector": "bge-reranker-v2-m3+claims",
+    "scan_set": {
+      "setting": "fixture_only",
+      "records": 104
+    },
+    "candidate_generation": {
+      "top_k": 10,
+      "caught": 262,
+      "of": 301
+    },
+    "operating_threshold": 0.36864760730012286,
+    "paraphrase_band_recall": {
+      "caught": 148,
+      "of": 301,
+      "rate": 0.49169435215946844,
+      "wilson_95": [
+        0.43567745265075203,
+        0.5479205864620199
+      ]
+    },
+    "precision_at_operating_point": {
+      "flagged": 164,
+      "rate": 0.9024390243902439,
+      "wilson_95": [
+        0.8474022431479169,
+        0.9390535580360566
+      ]
+    },
+    "hard_negative_flagged": {
+      "flagged": 11,
+      "of": 18
+    },
+    "auc_true_vs_hard_negative": {
+      "value": 0.3401624215577704,
+      "n_true": 301,
+      "n_hard_negative": 18,
+      "hanley_mcneil_95": [
+        0.19935917998199817,
+        0.4809656631335426
+      ]
+    },
+    "meets_proposed_gate": false,
+    "source": "fused-memory/calibration/duplicate_detector_recall_report.json (task 10243)"
+  },
+  "caveats": [
+    "The scan set is the fixture alone (fixture_only, 104 records): the most favourable setting, with no live-corpus distractors competing for each record's top_k=10 window.",
+    "27 of the 301 true pairs are cross-category. The per-category generator never forms them, so no adjudicator over it can catch them; recall still divides by all 301.",
+    "Each arm's operating threshold is selected in-sample on these 104 records at the 0.90 precision floor; nothing is held out.",
+    "AUC is rank-based (Mann-Whitney, ties count half) over every true and hard-negative pair, including pairs the generator never forms; its interval is Hanley-McNeil (1982).",
+    "A pair's adjudicator score is the mean of its two directional scores: the scorers are query/document asymmetric, the duplicate relation is symmetric.",
+    "The calibrated-ann baseline replays the 2026-08-11 detector (ANN hits at each category's calibrated cutoff, AUC over raw cosine). It is never eligible to be chosen.",
+    "jev-choice is excluded by design: its scores are a probability distribution over one slate, not a pairwise judgement.",
+    "The LLM pairwise arm is not run at claim granularity: claims multiply its call count roughly a hundredfold.",
+    "pairs_over_max_length is a lower bound on truncation (entry plus candidate tokens, without the template): qwen3-reranker-0.6b at 8192 tokens: 0 slate pair(s) over; mxbai-rerank-base-v2 at 8192 tokens: 0 slate pair(s) over; bge-reranker-v2-m3 at 1024 tokens: 728 slate pair(s) over; qwen3-reranker-0.6b+claims at 8192 tokens: 0 slate pair(s) over; mxbai-rerank-base-v2+claims at 8192 tokens: 0 slate pair(s) over; bge-reranker-v2-m3+claims at 1024 tokens: 0 slate pair(s) over.",
+    "jina-reranker was skipped (no_credential): JINA_API_KEY unset",
+    "voyage-rerank was skipped (no_credential): VOYAGE_API_KEY unset",
+    "cohere-rerank was skipped (no_credential): COHERE_API_KEY / CO_API_KEY unset"
+  ],
+  "provenance": {
+    "fixture_path": "tests/fixtures/write_triage_calibration.jsonl",
+    "record_count": 104,
+    "top_k": 10,
+    "ann_cutoffs": {
+      "observations_and_summaries": 0.8868282526657318,
+      "preferences_and_norms": 0.8868282526657318,
+      "procedural_knowledge": 0.839045608910388
+    },
+    "ann_cutoff_disclosure": {
+      "ann_disabled_uncalibrated": 0,
+      "ann_pooled_fallback_categories": 2
+    },
+    "project_id": null,
+    "measured_at": "2026-11-16",
+    "arm_filter": null,
+    "device": "auto",
+    "local_batch_size": 4,
+    "vram_cap_gib": 8.0,
+    "pairwise_concurrency": 20,
+    "max_arm_spend_usd": 2.0,
+    "libraries": {
+      "torch": "2.14.0",
+      "sentence-transformers": "6.1.0",
+      "transformers": "5.17.0",
+      "openai": "2.31.0"
+    }
+  }
+}

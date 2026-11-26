@@ -4,14 +4,26 @@
 of already-fetched ``MemoryResult`` search hits and a similarity threshold,
 it selects the single best near-duplicate candidate (or ``None``). It does
 no I/O and makes no assumptions about embedding accuracy — callers inject
-explicit ``relevance_score`` values, so these tests exercise pure comparison
-logic only.
+explicit cosine values, so these tests exercise pure comparison logic only.
+
+Task 3658 moved the cosine those callers inject: ``MemoryService.search`` now
+returns an ORDINAL RRF value in ``relevance_score`` (single-store rank-1 is
+1/61 ~ 0.0164) and carries the honest per-store cosine in
+``metadata['store_score']``.  The guard's 0.92 threshold is a cosine
+threshold, so it must read the cosine — hence ``_result`` below builds the
+post-RRF result shape, and every threshold expectation in this module is
+unchanged.
 """
 
 from __future__ import annotations
 
+import logging
 import types
+from collections.abc import Iterator
+from pathlib import Path
 from unittest.mock import AsyncMock
+
+import pytest
 
 from fused_memory.config.schema import ProceduralTopicCluster
 from fused_memory.models.enums import MemoryCategory, SourceStore
@@ -20,13 +32,28 @@ from fused_memory.server.near_duplicate_guard import (
     _DEFAULT_NEAR_DUP_GUARD_ENABLED,
     _DEFAULT_NEAR_DUP_THRESHOLD,
     _TOPIC_CLUSTER_DEFAULT_HINT,
+    build_near_duplicate_block,
     build_topic_cluster_block,
+    can_share_one_occurrence,
     find_matching_topic_cluster,
     find_near_duplicate_memory,
+    merge_topic_clusters,
     resolve_near_dup_guard_enabled,
     resolve_near_dup_threshold,
+    resolve_retired_derived_topic_ids,
+    resolve_topic_cluster_autoseed_enabled,
     resolve_topic_guard_clusters,
 )
+from fused_memory.server.topic_cluster_store import TopicClusterStore
+from fused_memory.services.memory_service import RRF_K
+from fused_memory.utils.clip_disclosure import TRUNCATION_FACTS_KEY
+
+# The real post-RRF relevance_score for a rank-1 hit on the guard's
+# single-store search(stores=['mem0'], limit=5) path — 1/(RRF_K + 1).
+# RRF_K comes from production rather than being restated as the literal 60, so
+# a retune of the constant carries this fixture with it instead of leaving it
+# silently modelling a shape ``search()`` no longer emits.
+_RRF_RANK1 = 1.0 / (RRF_K + 1)
 
 
 def _result(
@@ -36,13 +63,22 @@ def _result(
     category: MemoryCategory | None = MemoryCategory.procedural_knowledge,
     source_store: SourceStore = SourceStore.mem0,
     content: str = 'some procedural content',
+    relevance_score: float = _RRF_RANK1,
+    store_rank: int = 1,
 ) -> MemoryResult:
+    """Build a POST-RRF ``MemoryResult``: *score* is the cosine, in metadata.
+
+    ``relevance_score`` defaults to the ordinal RRF value a real rank-1 mem0
+    hit now carries, deliberately UNRELATED to *score* — so any test that
+    passes only because the guard still reads ``relevance_score`` fails.
+    """
     return MemoryResult(
         id=id_,
         content=content,
         category=category,
         source_store=source_store,
-        relevance_score=score,
+        relevance_score=relevance_score,
+        metadata={'store_rank': store_rank, 'store_score': score},
     )
 
 
@@ -85,11 +121,15 @@ class TestFindNearDuplicateMemory:
         assert match is None
 
     def test_picks_max_score_among_multiple_qualifying_results(self):
+        # Distinct cosines, IDENTICAL fused scores (all rank-1 ordinals): the
+        # selection must be driven by the cosine, not by relevance_score, which
+        # here cannot discriminate at all.
         results = [
             _result('m1', 0.93),
             _result('m2', 0.99),
             _result('m3', 0.95),
         ]
+        assert len({r.relevance_score for r in results}) == 1
         match = find_near_duplicate_memory(results, 0.92)
         assert match is not None
         assert match.id == 'm2'
@@ -103,6 +143,70 @@ class TestFindNearDuplicateMemory:
         match = find_near_duplicate_memory(results, 0.92)
         assert match is not None
         assert match.id == 'm2'
+
+    # --- task 3658 / esc-3658-1 -------------------------------------------
+
+    def test_post_rrf_result_still_matches_on_its_cosine(self):
+        """The regression this guard would otherwise have suffered silently.
+
+        A real rank-1 mem0 hit on the guard's ``stores=['mem0']`` search path
+        now carries ``relevance_score`` ~ 0.0164.  Comparing THAT against the
+        0.92 cosine threshold can never be true, so the guard would have
+        returned ``None`` for every input — silently disabling the documented
+        write-time soft-block without even entering its own fail-open logging
+        branch.
+        """
+        result = _result('m1', 0.97, relevance_score=_RRF_RANK1)
+        assert result.relevance_score < 0.02, 'fixture must model the real fused value'
+
+        match = find_near_duplicate_memory([result], 0.92)
+
+        assert match is not None, (
+            'The guard must threshold on the cosine in metadata.store_score, '
+            'not on the ordinal RRF relevance_score'
+        )
+        assert match.id == 'm1'
+
+    def test_result_without_store_score_never_qualifies(self):
+        """A missing cosine is "not comparable", never "compared and passed"."""
+        no_metadata = MemoryResult(
+            id='m1',
+            content='some procedural content',
+            category=MemoryCategory.procedural_knowledge,
+            source_store=SourceStore.mem0,
+            relevance_score=0.99,
+        )
+        assert find_near_duplicate_memory([no_metadata], 0.92) is None
+        # ...at ANY threshold, including one a 0.0 default would clear.
+        assert find_near_duplicate_memory([no_metadata], 0.0) is None
+
+    def test_result_with_none_store_score_never_qualifies(self):
+        """The Graphiti shape (store_score=None) can never be a near-duplicate."""
+        none_score = MemoryResult(
+            id='m1',
+            content='some procedural content',
+            category=MemoryCategory.procedural_knowledge,
+            source_store=SourceStore.mem0,
+            relevance_score=0.99,
+            metadata={'store_rank': 1, 'store_score': None},
+        )
+        assert find_near_duplicate_memory([none_score], 0.92) is None
+        assert find_near_duplicate_memory([none_score], 0.0) is None
+
+    def test_non_numeric_store_score_never_qualifies(self):
+        """A bool or string cosine is not a measurement (mirrors the config readers)."""
+        for bogus in (True, '0.99', object()):
+            bad = MemoryResult(
+                id='m1',
+                content='some procedural content',
+                category=MemoryCategory.procedural_knowledge,
+                source_store=SourceStore.mem0,
+                relevance_score=_RRF_RANK1,
+                metadata={'store_rank': 1, 'store_score': bogus},
+            )
+            assert find_near_duplicate_memory([bad], 0.92) is None, (
+                f'{bogus!r} must not be read as a cosine'
+            )
 
 
 def _memory_service_with_reconciliation(**fields) -> types.SimpleNamespace:
@@ -169,11 +273,13 @@ def _cluster(
     topic_id: str = 'topic-a',
     phrases: list[str] | None = None,
     min_phrase_hits: int = 2,
+    sufficient_phrases: list[str] | None = None,
 ) -> ProceduralTopicCluster:
     return ProceduralTopicCluster(
         topic_id=topic_id,
         phrases=phrases if phrases is not None else ['alpha', 'beta', 'gamma'],
         min_phrase_hits=min_phrase_hits,
+        sufficient_phrases=sufficient_phrases if sufficient_phrases is not None else [],
     )
 
 
@@ -225,6 +331,182 @@ class TestFindMatchingTopicCluster:
     def test_whitespace_content_returns_none(self):
         cluster = _cluster(phrases=['alpha', 'beta'], min_phrase_hits=1)
         assert find_matching_topic_cluster('   \n\t ', [cluster]) is None
+
+
+class TestFindMatchingTopicClusterSufficientPhrases:
+    """A single DECLARED-sufficient phrase qualifies its cluster alone (task 3054).
+
+    Count-only matching cannot block a write that straddles several
+    clusters at one hit each; a phrase distinctive enough that it cannot
+    appear incidentally should not have to wait for a second one.
+    """
+
+    def test_single_sufficient_phrase_matches_below_min_phrase_hits(self):
+        cluster = _cluster(
+            phrases=['alpha', 'beta'],
+            min_phrase_hits=2,
+            sufficient_phrases=['alpha'],
+        )
+        match = find_matching_topic_cluster('only alpha here', [cluster])
+        assert match is not None
+
+    def test_sufficient_match_still_returns_the_two_tuple_shape(self):
+        """The return shape is load-bearing: server/tools.py destructures a 2-tuple.
+
+        ``matched_phrases`` is deliberately SHORTER than ``min_phrase_hits``
+        here -- it reports exactly what fired, which is the one sufficient
+        phrase.
+        """
+        cluster = _cluster(
+            phrases=['alpha', 'beta'],
+            min_phrase_hits=2,
+            sufficient_phrases=['alpha'],
+        )
+        match = find_matching_topic_cluster('only alpha here', [cluster])
+        assert match is not None
+        matched_cluster, matched_phrases = match
+        assert matched_cluster.topic_id == cluster.topic_id
+        assert matched_phrases == ['alpha']
+        assert len(matched_phrases) < cluster.min_phrase_hits
+
+    def test_single_non_sufficient_phrase_still_returns_none(self):
+        # 'beta' is a phrase but NOT declared sufficient -- one hit is still
+        # below min_phrase_hits, so the count-only path must still apply.
+        cluster = _cluster(
+            phrases=['alpha', 'beta'],
+            min_phrase_hits=2,
+            sufficient_phrases=['alpha'],
+        )
+        assert find_matching_topic_cluster('only beta here', [cluster]) is None
+
+    def test_sufficient_matching_is_case_insensitive_and_lowercases(self):
+        # Same convention as test_matching_is_case_insensitive above.
+        cluster = _cluster(
+            phrases=['Alpha', 'beta'],
+            min_phrase_hits=2,
+            sufficient_phrases=['ALPHA'],
+        )
+        match = find_matching_topic_cluster('SOME AlPhA content', [cluster])
+        assert match is not None
+        _, matched_phrases = match
+        assert matched_phrases == ['alpha']
+
+    def test_empty_sufficient_phrases_behaves_exactly_as_today(self):
+        cluster = _cluster(phrases=['alpha', 'beta'], min_phrase_hits=2, sufficient_phrases=[])
+        assert find_matching_topic_cluster('only alpha here', [cluster]) is None
+        match = find_matching_topic_cluster('alpha and beta', [cluster])
+        assert match is not None
+        _, matched_phrases = match
+        assert matched_phrases == ['alpha', 'beta']
+
+    def test_count_path_still_qualifies_when_no_sufficient_phrase_hits(self):
+        # Reaching min_phrase_hits on NON-sufficient phrases must still match:
+        # sufficiency is an additional way to qualify, not a replacement.
+        cluster = _cluster(
+            phrases=['alpha', 'beta', 'gamma'],
+            min_phrase_hits=2,
+            sufficient_phrases=['alpha'],
+        )
+        match = find_matching_topic_cluster('beta and gamma only', [cluster])
+        assert match is not None
+        _, matched_phrases = match
+        assert matched_phrases == ['beta', 'gamma']
+
+    def test_empty_content_returns_none_even_with_sufficient_phrases(self):
+        cluster = _cluster(
+            phrases=['alpha', 'beta'],
+            min_phrase_hits=2,
+            sufficient_phrases=['alpha'],
+        )
+        assert find_matching_topic_cluster('', [cluster]) is None
+
+    def test_whitespace_content_returns_none_even_with_sufficient_phrases(self):
+        cluster = _cluster(
+            phrases=['alpha', 'beta'],
+            min_phrase_hits=2,
+            sufficient_phrases=['alpha'],
+        )
+        assert find_matching_topic_cluster('   \n\t ', [cluster]) is None
+
+    def test_earlier_cluster_wins_on_a_sufficient_phrase(self):
+        # First-qualifying-cluster ordering is unchanged by sufficiency.
+        cluster_a = _cluster(
+            topic_id='topic-a',
+            phrases=['alpha', 'beta'],
+            min_phrase_hits=2,
+            sufficient_phrases=['alpha'],
+        )
+        cluster_b = _cluster(topic_id='topic-b', phrases=['alpha', 'delta'], min_phrase_hits=1)
+        match = find_matching_topic_cluster('alpha only', [cluster_a, cluster_b])
+        assert match is not None
+        assert match[0].topic_id == 'topic-a'
+
+    def test_earlier_count_match_wins_over_a_later_sufficient_match(self):
+        """The converse precedence, pinned deliberately rather than left incidental.
+
+        Sufficiency decides WHETHER a cluster qualifies, never WHICH
+        qualifying cluster wins: the scan is a single pass in list order, so
+        an earlier cluster reaching ``min_phrase_hits`` on ordinary phrases
+        beats a later cluster whose declared-sufficient phrase also fired.
+        Seed order stays the single priority knob.
+        """
+        cluster_a = _cluster(topic_id='topic-a', phrases=['alpha', 'beta'], min_phrase_hits=2)
+        cluster_b = _cluster(
+            topic_id='topic-b',
+            phrases=['gamma'],
+            min_phrase_hits=2,
+            sufficient_phrases=['gamma'],
+        )
+        match = find_matching_topic_cluster('alpha beta gamma', [cluster_a, cluster_b])
+        assert match is not None
+        assert match[0].topic_id == 'topic-a'
+        assert match[1] == ['alpha', 'beta']
+
+    def test_reordering_the_same_clusters_hands_the_win_to_the_sufficient_one(self):
+        """Confirms the previous test pins ORDER, not a count-beats-sufficiency rule."""
+        cluster_a = _cluster(topic_id='topic-a', phrases=['alpha', 'beta'], min_phrase_hits=2)
+        cluster_b = _cluster(
+            topic_id='topic-b',
+            phrases=['gamma'],
+            min_phrase_hits=2,
+            sufficient_phrases=['gamma'],
+        )
+        match = find_matching_topic_cluster('alpha beta gamma', [cluster_b, cluster_a])
+        assert match is not None
+        assert match[0].topic_id == 'topic-b'
+        assert match[1] == ['gamma']
+
+
+class TestCanShareOneOccurrence:
+    """Whether one occurrence of some text could score both phrases as distinct hits (task 5933)."""
+
+    @pytest.mark.parametrize(
+        ('first', 'second'),
+        [
+            pytest.param('ruff format', 'format-clean', id='whole-word-overlap'),
+            pytest.param(
+                'git add -f .task/', '.task/plan.json is gitignored', id='path-word-overlap'
+            ),
+            pytest.param('plan.json', '.task/plan.json', id='nesting'),
+            pytest.param('lane reseed', 'lane reseed', id='exact-duplicate'),
+            pytest.param('Ruff Format', 'format-clean', id='case-insensitive-like-the-matcher'),
+        ],
+    )
+    def test_pairs_one_occurrence_can_hold(self, first: str, second: str):
+        assert can_share_one_occurrence(first, second)
+        assert can_share_one_occurrence(second, first)
+
+    @pytest.mark.parametrize(
+        ('first', 'second'),
+        [
+            pytest.param('locks', 'set', id='fragment-inside-a-word-on-both-sides'),
+            pytest.param('ruff format', 'ruff check', id='disjoint'),
+            pytest.param('ruff format', 'not format-clean', id='ruff-format-seed-replacement'),
+        ],
+    )
+    def test_pairs_one_occurrence_cannot_hold(self, first: str, second: str):
+        assert not can_share_one_occurrence(first, second)
+        assert not can_share_one_occurrence(second, first)
 
 
 class TestResolveTopicGuardClusters:
@@ -298,3 +580,353 @@ class TestBuildTopicClusterBlock:
         cluster = _cluster(topic_id='topic-a')
         block = build_topic_cluster_block(None, 'content', cluster, ['alpha'])
         assert block['agent_id'] is None
+
+
+class TestGuardBlocksDiscloseTheirExcerptClip:
+    """A 200-char excerpt that cut its source says so beside itself (task 5365).
+
+    The excerpt VALUES stay ``content[:200]`` with no inline marker, so every
+    reader comparing them is untouched; the cut rides as a sibling
+    ``truncation_facts`` list of ``{field, cap, elided}`` dicts instead.
+    """
+
+    def test_a_near_duplicate_block_reports_both_cut_excerpts(self):
+        content = 'x' * 450
+        match = _result('m1', 0.97, content='y' * 330)
+
+        block = build_near_duplicate_block('agent', content, match, 0.92)
+
+        assert block['content_excerpt'] == content[:200]
+        assert block['matched_excerpt'] == match.content[:200]
+        assert block[TRUNCATION_FACTS_KEY] == [
+            {'field': 'content_excerpt', 'cap': 200, 'elided': 250},
+            {'field': 'matched_excerpt', 'cap': 200, 'elided': 130},
+        ]
+
+    def test_a_near_duplicate_block_reports_only_the_cut_side(self):
+        match = _result('m1', 0.97, content='y' * 330)
+
+        block = build_near_duplicate_block('agent', 'short content', match, 0.92)
+
+        assert block['content_excerpt'] == 'short content'
+        assert block[TRUNCATION_FACTS_KEY] == [
+            {'field': 'matched_excerpt', 'cap': 200, 'elided': 130},
+        ]
+
+    def test_a_topic_cluster_block_reports_its_cut_excerpt(self):
+        content = 'x' * 500
+
+        block = build_topic_cluster_block('agent', content, _cluster(topic_id='t'), ['alpha'])
+
+        assert block['content_excerpt'] == content[:200]
+        assert block[TRUNCATION_FACTS_KEY] == [
+            {'field': 'content_excerpt', 'cap': 200, 'elided': 300},
+        ]
+
+    def test_an_uncut_block_carries_no_truncation_facts(self):
+        at_cap = 'x' * 200
+        near_duplicate = build_near_duplicate_block(
+            'agent', at_cap, _result('m1', 0.97, content=at_cap), 0.92
+        )
+        topic_cluster = build_topic_cluster_block('agent', at_cap, _cluster(topic_id='t'), ['a'])
+
+        assert TRUNCATION_FACTS_KEY not in near_duplicate, near_duplicate
+        assert TRUNCATION_FACTS_KEY not in topic_cluster, topic_cluster
+
+
+class TestMergeTopicClusters:
+    """Config seeds first, runtime-derived clusters after; config wins a topic_id collision (task 3135)."""
+
+    def test_config_seeds_come_first_then_runtime_in_order(self):
+        config = [_cluster(topic_id='cfg-a'), _cluster(topic_id='cfg-b')]
+        runtime = [_cluster(topic_id='rt-a'), _cluster(topic_id='rt-b')]
+
+        merged = merge_topic_clusters(config, runtime)
+
+        assert [c.topic_id for c in merged] == ['cfg-a', 'cfg-b', 'rt-a', 'rt-b']
+
+    def test_the_config_cluster_wins_the_first_match_rule(self):
+        config_cluster = _cluster(topic_id='cfg-a', phrases=['alpha', 'beta'])
+        runtime_cluster = _cluster(topic_id='rt-a', phrases=['alpha', 'beta', 'gamma'])
+        content = 'alpha and beta and gamma'
+        control = find_matching_topic_cluster(content, [runtime_cluster, config_cluster])
+        assert control is not None and control[0] is runtime_cluster
+
+        match = find_matching_topic_cluster(
+            content, merge_topic_clusters([config_cluster], [runtime_cluster])
+        )
+
+        assert match is not None
+        assert match[0] is config_cluster
+
+    def test_a_runtime_cluster_colliding_with_a_config_seed_is_dropped(self):
+        curated = ProceduralTopicCluster(
+            topic_id='shared-topic',
+            phrases=['alpha', 'beta'],
+            sufficient_phrases=['alpha'],
+            hint='route to human gate 2841',
+        )
+        derived = ProceduralTopicCluster(
+            topic_id='shared-topic', phrases=['gamma', 'delta'], hint='derived hint'
+        )
+
+        merged = merge_topic_clusters([curated], [derived])
+
+        assert merged == [curated]
+        assert merged[0].hint == 'route to human gate 2841'
+        assert merged[0].sufficient_phrases == ['alpha']
+
+    def test_duplicate_runtime_topic_ids_keep_only_the_first(self):
+        first = _cluster(topic_id='rt-a', phrases=['alpha', 'beta'])
+        second = _cluster(topic_id='rt-a', phrases=['gamma', 'delta'])
+
+        merged = merge_topic_clusters([], [first, second])
+
+        assert merged == [first]
+
+    def test_an_empty_runtime_list_returns_the_config_list(self):
+        config = [_cluster(topic_id='cfg-a'), _cluster(topic_id='cfg-b')]
+        assert merge_topic_clusters(config, []) == config
+
+    def test_neither_input_is_mutated(self):
+        config = [_cluster(topic_id='cfg-a'), _cluster(topic_id='shared')]
+        runtime = [_cluster(topic_id='shared'), _cluster(topic_id='rt-a')]
+        config_before = list(config)
+        runtime_before = list(runtime)
+
+        merged = merge_topic_clusters(config, runtime)
+
+        assert config == config_before
+        assert runtime == runtime_before
+        assert merged is not config
+        assert merged is not runtime
+
+
+    def test_a_retired_runtime_cluster_is_dropped(self):
+        config = [_cluster(topic_id='cfg-a')]
+        runtime = [_cluster(topic_id='rt-a'), _cluster(topic_id='rt-b')]
+
+        merged = merge_topic_clusters(config, runtime, retired=frozenset({'rt-a'}))
+
+        assert [c.topic_id for c in merged] == ['cfg-a', 'rt-b']
+
+    def test_retiring_a_topic_id_never_drops_a_config_cluster(self):
+        config = [_cluster(topic_id='shared')]
+        runtime = [_cluster(topic_id='shared'), _cluster(topic_id='rt-a')]
+
+        merged = merge_topic_clusters(config, runtime, retired=frozenset({'shared'}))
+
+        assert merged == [config[0], runtime[1]]
+
+
+class TestResolveRetiredDerivedTopicIds:
+    """Defensive config resolver: only a real dict of lists retires anything."""
+
+    def test_returns_the_projects_retired_topic_ids(self):
+        memory_service = _memory_service_with_reconciliation(
+            procedural_knowledge_topic_cluster_autoseed_retired={
+                'dark_factory': ['topic-a', 'topic-b'],
+                'reify': ['topic-c'],
+            }
+        )
+        assert resolve_retired_derived_topic_ids(memory_service, 'dark_factory') == frozenset(
+            {'topic-a', 'topic-b'}
+        )
+
+    def test_another_project_has_nothing_retired(self):
+        memory_service = _memory_service_with_reconciliation(
+            procedural_knowledge_topic_cluster_autoseed_retired={'reify': ['topic-c']}
+        )
+        assert resolve_retired_derived_topic_ids(memory_service, 'dark_factory') == frozenset()
+
+    def test_non_string_entries_are_ignored(self):
+        memory_service = _memory_service_with_reconciliation(
+            procedural_knowledge_topic_cluster_autoseed_retired={'dark_factory': ['topic-a', 7, None]}
+        )
+        assert resolve_retired_derived_topic_ids(memory_service, 'dark_factory') == frozenset(
+            {'topic-a'}
+        )
+
+    @pytest.mark.parametrize(
+        'memory_service',
+        [
+            pytest.param(_memory_service_with_reconciliation(), id='leaf_missing'),
+            pytest.param(AsyncMock(), id='mock'),
+            pytest.param(
+                _memory_service_with_reconciliation(
+                    procedural_knowledge_topic_cluster_autoseed_retired=['topic-a']
+                ),
+                id='not_a_dict',
+            ),
+            pytest.param(
+                _memory_service_with_reconciliation(
+                    procedural_knowledge_topic_cluster_autoseed_retired={'dark_factory': 'topic-a'}
+                ),
+                id='value_not_a_list',
+            ),
+            pytest.param(types.SimpleNamespace(), id='config_missing'),
+        ],
+    )
+    def test_anything_malformed_retires_nothing(self, memory_service):
+        assert resolve_retired_derived_topic_ids(memory_service, 'dark_factory') == frozenset()
+
+
+class TestResolveTopicClusterAutoseedEnabled:
+    """Defensive config resolver: only a real bool is honoured, else the schema default True."""
+
+    @pytest.mark.parametrize('value', [True, False])
+    def test_returns_a_real_bool(self, value):
+        memory_service = _memory_service_with_reconciliation(
+            procedural_knowledge_topic_cluster_autoseed_enabled=value
+        )
+        assert resolve_topic_cluster_autoseed_enabled(memory_service) is value
+
+    @pytest.mark.parametrize('value', [0, 1])
+    def test_an_int_is_not_a_bool(self, value):
+        memory_service = _memory_service_with_reconciliation(
+            procedural_knowledge_topic_cluster_autoseed_enabled=value
+        )
+        assert resolve_topic_cluster_autoseed_enabled(memory_service) is True
+
+    def test_falls_back_to_true_when_leaf_missing(self):
+        memory_service = _memory_service_with_reconciliation()
+        assert resolve_topic_cluster_autoseed_enabled(memory_service) is True
+
+    def test_falls_back_to_true_when_value_is_a_mock(self):
+        memory_service = AsyncMock()
+        assert resolve_topic_cluster_autoseed_enabled(memory_service) is True
+
+    def test_falls_back_to_true_when_reconciliation_is_none(self):
+        memory_service = types.SimpleNamespace(config=types.SimpleNamespace(reconciliation=None))
+        assert resolve_topic_cluster_autoseed_enabled(memory_service) is True
+
+    def test_falls_back_to_true_when_config_missing(self):
+        assert resolve_topic_cluster_autoseed_enabled(types.SimpleNamespace()) is True
+
+
+_DERIVED = ProceduralTopicCluster(
+    topic_id='derived-topic',
+    phrases=['--dist loadgroup', 'max-worker-restart'],
+    hint='Consolidated topic; update canonical 0000 instead.',
+)
+
+
+@pytest.fixture
+def seeded_store(tmp_path: Path) -> Iterator[TopicClusterStore]:
+    store = TopicClusterStore(tmp_path / 'topic_clusters.db')
+    store.open()
+    store.upsert(_DERIVED, source='consolidate_memories', project_id='dark_factory')
+    try:
+        yield store
+    finally:
+        store.close()
+
+
+class _RaisingStore:
+    def list_clusters(self, project_id: str) -> list:
+        raise RuntimeError('store exploded')
+
+
+class _NonListStore:
+    def list_clusters(self, project_id: str) -> object:
+        return ('not', 'a', 'list')
+
+
+def _guard_service(
+    config: list, *, autoseed: bool = True, retired: dict | None = None
+) -> types.SimpleNamespace:
+    return _memory_service_with_reconciliation(
+        procedural_knowledge_topic_guard_clusters=config,
+        procedural_knowledge_topic_cluster_autoseed_enabled=autoseed,
+        procedural_knowledge_topic_cluster_autoseed_retired=retired or {},
+    )
+
+
+class TestResolveMergesTheRuntimeStore:
+    """resolve_topic_guard_clusters is THE merge chokepoint for derived clusters (task 3135)."""
+
+    CONFIG = [_cluster(topic_id='cfg-a'), _cluster(topic_id='cfg-b')]
+
+    def test_without_keywords_it_returns_exactly_the_config_list(self, seeded_store):
+        assert resolve_topic_guard_clusters(_guard_service(self.CONFIG)) == self.CONFIG
+
+    def test_merges_the_projects_derived_cluster_after_the_config_seeds(self, seeded_store):
+        resolved = resolve_topic_guard_clusters(
+            _guard_service(self.CONFIG), runtime_store=seeded_store, project_id='dark_factory'
+        )
+        assert resolved == [*self.CONFIG, _DERIVED]
+
+    def test_an_inert_config_still_serves_the_derived_cluster(self, seeded_store):
+        resolved = resolve_topic_guard_clusters(
+            _guard_service([]), runtime_store=seeded_store, project_id='dark_factory'
+        )
+        assert resolved == [_DERIVED]
+
+    def test_another_projects_write_sees_config_seeds_only(self, seeded_store):
+        resolved = resolve_topic_guard_clusters(
+            _guard_service(self.CONFIG), runtime_store=seeded_store, project_id='reify'
+        )
+        assert resolved == self.CONFIG
+
+    def test_a_store_without_a_project_is_config_only(self, seeded_store):
+        resolved = resolve_topic_guard_clusters(
+            _guard_service(self.CONFIG), runtime_store=seeded_store, project_id=None
+        )
+        assert resolved == self.CONFIG
+
+    def test_a_project_without_a_store_is_config_only(self):
+        resolved = resolve_topic_guard_clusters(
+            _guard_service(self.CONFIG), runtime_store=None, project_id='dark_factory'
+        )
+        assert resolved == self.CONFIG
+
+    def test_the_kill_switch_is_read_live(self, seeded_store):
+        svc = _guard_service(self.CONFIG, autoseed=False)
+
+        def resolve() -> list:
+            return resolve_topic_guard_clusters(
+                svc, runtime_store=seeded_store, project_id='dark_factory'
+            )
+
+        assert resolve() == self.CONFIG
+        svc.config.reconciliation.procedural_knowledge_topic_cluster_autoseed_enabled = True
+        assert resolve() == [*self.CONFIG, _DERIVED]
+        svc.config.reconciliation.procedural_knowledge_topic_cluster_autoseed_enabled = False
+        assert resolve() == self.CONFIG
+
+    def test_a_retired_topic_is_dropped_for_its_project_only(self, seeded_store):
+        def resolve(retired: dict) -> list:
+            return resolve_topic_guard_clusters(
+                _guard_service(self.CONFIG, retired=retired),
+                runtime_store=seeded_store,
+                project_id='dark_factory',
+            )
+
+        assert resolve({'dark_factory': [_DERIVED.topic_id]}) == self.CONFIG
+        assert resolve({'reify': [_DERIVED.topic_id]}) == [*self.CONFIG, _DERIVED]
+        assert seeded_store.list_clusters('dark_factory') == [_DERIVED]
+
+    def test_retirement_is_read_live(self, seeded_store):
+        svc = _guard_service(self.CONFIG)
+
+        def resolve() -> list:
+            return resolve_topic_guard_clusters(
+                svc, runtime_store=seeded_store, project_id='dark_factory'
+            )
+
+        assert resolve() == [*self.CONFIG, _DERIVED]
+        svc.config.reconciliation.procedural_knowledge_topic_cluster_autoseed_retired = {
+            'dark_factory': [_DERIVED.topic_id]
+        }
+        assert resolve() == self.CONFIG
+        svc.config.reconciliation.procedural_knowledge_topic_cluster_autoseed_retired = {}
+        assert resolve() == [*self.CONFIG, _DERIVED]
+
+    @pytest.mark.parametrize('store', [_RaisingStore(), _NonListStore()], ids=['raises', 'non_list'])
+    def test_a_misbehaving_store_degrades_to_config_only_and_warns(self, store, caplog):
+        with caplog.at_level(logging.WARNING, logger='fused_memory.server.near_duplicate_guard'):
+            resolved = resolve_topic_guard_clusters(
+                _guard_service(self.CONFIG), runtime_store=store, project_id='dark_factory'
+            )
+        assert resolved == self.CONFIG
+        assert any(record.levelno == logging.WARNING for record in caplog.records)

@@ -13,8 +13,10 @@ import pytest
 from _fm_helpers import pydantic_spec
 from shared.config_models import AccountConfig, UsageCapConfig
 from shared.cost_store import CostStore
+from shared.testing_reserve import RESERVE_ACCOUNT, fake_tokens, write_reserve_accounts_file
 from shared.usage_gate import UsageGate
 
+from fused_memory.config.checkout_anchor import CHECKOUT_ROOT
 from fused_memory.config.schema import FusedMemoryConfig
 from fused_memory.server.main import _resolve_curator_cost_store_path
 
@@ -95,7 +97,7 @@ class TestCuratorCapEventPersisted:
 @pytest.mark.parametrize(
     ('reconciliation_cfg', 'expected'),
     [
-        (None, Path('./data/curator_events.db')),
+        (None, CHECKOUT_ROOT / 'data' / 'curator_events.db'),
         (MagicMock(data_dir='/tmp/recon'), Path('/tmp/recon/curator_events.db')),
     ],
     ids=['fallback', 'with_data_dir'],
@@ -115,7 +117,7 @@ def test_resolve_curator_cost_store_path(reconciliation_cfg, expected):
 @pytest.mark.parametrize(
     ('reconciliation_cfg', 'expected'),
     [
-        (None, Path('./data/curator_escalator_state.json')),
+        (None, CHECKOUT_ROOT / 'data' / 'curator_escalator_state.json'),
         (MagicMock(data_dir='/tmp/recon'), Path('/tmp/recon/curator_escalator_state.json')),
     ],
     ids=['fallback', 'with_data_dir'],
@@ -124,7 +126,7 @@ def test_resolve_curator_escalator_state_path(reconciliation_cfg, expected):
     """Path helper returns correct state-file path based on reconciliation config."""
     # Lazy import so a missing helper produces a test failure, not a module
     # import error that would break ALL tests in this file.
-    from fused_memory.server.main import _resolve_curator_escalator_state_path  # noqa: PLC0415
+    from fused_memory.server.main import _resolve_curator_escalator_state_path
 
     config = MagicMock(spec_set=pydantic_spec(FusedMemoryConfig))
     config.reconciliation = reconciliation_cfg
@@ -152,7 +154,7 @@ class TestCuratorUsageGateLeakGuard:
         """
         # Lazy import — ImportError here until step-2 adds the helper; that is
         # the expected "red" state for this TDD step.
-        from fused_memory.server.main import _setup_curator_usage_gate  # noqa: PLC0415
+        from fused_memory.server.main import _setup_curator_usage_gate
 
         acct_cfg = AccountConfig(name='acct-a', oauth_token_env='TEST_TOKEN_ACCT_A')
         usage_cap_cfg = UsageCapConfig(accounts=[acct_cfg], wait_for_reset=False)
@@ -203,8 +205,8 @@ class TestCuratorUsageGateLeakGuard:
         neither cleanup runs — this test will FAIL until step-2 folds the log
         call into the guarded block.
         """
-        import fused_memory.server.main as main_module  # noqa: PLC0415
-        from fused_memory.server.main import _setup_curator_usage_gate  # noqa: PLC0415
+        import fused_memory.server.main as main_module
+        from fused_memory.server.main import _setup_curator_usage_gate
 
         acct_cfg = AccountConfig(name='acct-a', oauth_token_env='TEST_TOKEN_ACCT_A')
         usage_cap_cfg = UsageCapConfig(accounts=[acct_cfg], wait_for_reset=False)
@@ -263,7 +265,7 @@ class TestCuratorUsageGateLeakGuard:
     @pytest.mark.asyncio
     async def test_setup_returns_store_and_gate_on_success(self, tmp_path):
         """Happy path: helper returns both open store and gate; store stays open."""
-        from fused_memory.server.main import _setup_curator_usage_gate  # noqa: PLC0415
+        from fused_memory.server.main import _setup_curator_usage_gate
 
         acct_cfg = AccountConfig(name='acct-a', oauth_token_env='TEST_TOKEN_ACCT_A')
         usage_cap_cfg = UsageCapConfig(
@@ -292,9 +294,9 @@ class TestCuratorUsageGateLeakGuard:
 
     def test_setup_returns_none_when_usage_cap_is_none(self):
         """Helper returns (None, None) immediately when config.usage_cap is None."""
-        import asyncio  # noqa: PLC0415
+        import asyncio
 
-        from fused_memory.server.main import _setup_curator_usage_gate  # noqa: PLC0415
+        from fused_memory.server.main import _setup_curator_usage_gate
 
         config = MagicMock(spec_set=pydantic_spec(FusedMemoryConfig))
         config.usage_cap = None
@@ -305,9 +307,9 @@ class TestCuratorUsageGateLeakGuard:
 
     def test_setup_returns_none_when_usage_cap_disabled(self):
         """Helper returns (None, None) immediately when usage_cap.enabled is False."""
-        import asyncio  # noqa: PLC0415
+        import asyncio
 
-        from fused_memory.server.main import _setup_curator_usage_gate  # noqa: PLC0415
+        from fused_memory.server.main import _setup_curator_usage_gate
 
         config = MagicMock(spec_set=pydantic_spec(FusedMemoryConfig))
         config.usage_cap = UsageCapConfig(enabled=False)
@@ -327,7 +329,7 @@ class TestCuratorUsageGateLeakGuard:
         WAL background thread after the with block exits (where patches are
         gone and the real close is available again).
         """
-        from fused_memory.server.main import _setup_curator_usage_gate  # noqa: PLC0415
+        from fused_memory.server.main import _setup_curator_usage_gate
 
         acct_cfg = AccountConfig(name='acct-a', oauth_token_env='TEST_TOKEN_ACCT_A')
         usage_cap_cfg = UsageCapConfig(accounts=[acct_cfg], wait_for_reset=False)
@@ -375,3 +377,144 @@ class TestCuratorUsageGateLeakGuard:
         # only useful action is cleanup.
         await opened_stores[0].close()
 
+
+
+# ---------------------------------------------------------------------------
+# task 4718: the curator gate carries a per-process run id
+# ---------------------------------------------------------------------------
+
+
+def _enabled_cap_config(data_dir: Path) -> MagicMock:
+    config = MagicMock(spec_set=pydantic_spec(FusedMemoryConfig))
+    config.usage_cap = UsageCapConfig(
+        accounts=[AccountConfig(name='acct-a', oauth_token_env='TEST_TOKEN_ACCT_A')],
+        wait_for_reset=False,
+    )
+    config.reconciliation = MagicMock(data_dir=str(data_dir))
+    return config
+
+
+async def _landed_account_event_run_ids(db_path: Path, timeout: float = 5.0) -> list:
+    """Every ``account_events.run_id``, once the gate's fire-and-forget write has landed."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while True:
+        async with aiosqlite.connect(db_path) as conn:
+            cursor = await conn.execute('SELECT run_id FROM account_events')
+            run_ids = [row[0] for row in await cursor.fetchall()]
+        if run_ids or loop.time() >= deadline:
+            return run_ids
+        await asyncio.sleep(0.02)
+
+
+class TestCuratorRunId:
+    """One run key for both curator writers: the gate's account events and the
+    curator's invocations, which ``TaskCurator`` reads back from the gate."""
+
+    @pytest.mark.asyncio
+    async def test_minted_run_id_names_the_fused_memory_process(self, tmp_path):
+        from fused_memory.server.main import _setup_curator_usage_gate
+
+        with patch.dict(os.environ, {'TEST_TOKEN_ACCT_A': 'fake-token'}):
+            store, gate = await _setup_curator_usage_gate(_enabled_cap_config(tmp_path))
+        try:
+            assert gate is not None
+            assert isinstance(gate.run_id, str)
+            assert gate.run_id.startswith('fused-memory-')
+        finally:
+            if gate is not None:
+                await gate.shutdown()
+            if store is not None:
+                await store.close()
+
+    @pytest.mark.asyncio
+    async def test_explicit_run_id_is_carried_by_the_gate(self, tmp_path):
+        from fused_memory.server.main import _setup_curator_usage_gate
+
+        opened: list[tuple[CostStore | None, UsageGate | None]] = []
+        try:
+            with patch.dict(os.environ, {'TEST_TOKEN_ACCT_A': 'fake-token'}):
+                for run_id in ('run-a', 'run-b'):
+                    opened.append(await _setup_curator_usage_gate(
+                        _enabled_cap_config(tmp_path / run_id), run_id=run_id,
+                    ))
+            assert [gate and gate.run_id for _, gate in opened] == ['run-a', 'run-b']
+        finally:
+            for store, gate in opened:
+                if gate is not None:
+                    await gate.shutdown()
+                if store is not None:
+                    await store.close()
+
+    @pytest.mark.asyncio
+    async def test_gate_account_events_carry_the_run_id(self, tmp_path):
+        from fused_memory.server.main import _setup_curator_usage_gate
+
+        with patch.dict(os.environ, {'TEST_TOKEN_ACCT_A': 'fake-token'}):
+            store, gate = await _setup_curator_usage_gate(_enabled_cap_config(tmp_path))
+        assert store is not None and gate is not None
+        try:
+            lease = await gate.before_invoke()
+            assert lease is not None
+            assert gate.detect_cap_hit(
+                '', "You've hit your usage limit. Your plan resets in 3 hours.",
+                oauth_token=lease.token,
+            )
+            run_ids = await _landed_account_event_run_ids(tmp_path / 'curator_events.db')
+        finally:
+            await gate.shutdown()
+            await store.close()
+
+        assert gate.run_id
+        assert run_ids == [gate.run_id]
+
+    @pytest.mark.asyncio
+    async def test_disabled_cap_with_run_id_allocates_nothing(self):
+        from fused_memory.server.main import _setup_curator_usage_gate
+
+        config = MagicMock(spec_set=pydantic_spec(FusedMemoryConfig))
+        config.usage_cap = UsageCapConfig(enabled=False)
+
+        assert await _setup_curator_usage_gate(config, run_id='run-x') == (None, None)
+
+
+async def _landed_account_events(db_path: Path) -> list[tuple[str, dict, str]]:
+    """Every ``account_events`` row as (event_type, details, run_id), once a write has landed.
+
+    The per-test timeout is the only hang backstop, so a slow loop cannot fail a write that landed.
+    """
+    while True:
+        async with aiosqlite.connect(db_path) as conn:
+            cursor = await conn.execute('SELECT event_type, details, run_id FROM account_events')
+            rows = [(row[0], json.loads(row[1]), row[2]) for row in await cursor.fetchall()]
+        if rows:
+            return rows
+        await asyncio.sleep(0)
+
+
+class TestCuratorReserveConfig:
+    """The curator's store records the accounts file's reserve (allowance reserve PRD §6.6)."""
+
+    @pytest.mark.asyncio
+    async def test_the_reserve_config_row_carries_the_curator_run_id(self, tmp_path):
+        from fused_memory.server.main import _setup_curator_usage_gate
+
+        config = MagicMock(spec_set=pydantic_spec(FusedMemoryConfig))
+        config.usage_cap = UsageCapConfig(
+            accounts_file=str(write_reserve_accounts_file(tmp_path)), wait_for_reset=False,
+        )
+        config.reconciliation = MagicMock(data_dir=str(tmp_path))
+        with patch.dict(os.environ, fake_tokens()):
+            store, gate = await _setup_curator_usage_gate(config)
+        assert store is not None and gate is not None
+        try:
+            rows = await _landed_account_events(tmp_path / 'curator_events.db')
+        finally:
+            await gate.shutdown()
+            await store.close()
+
+        assert [(event_type, run_id) for event_type, _, run_id in rows] == [
+            ('reserve_config', gate.run_id),
+        ]
+        [(_, details, _)] = rows
+        assert (details['state'], details['account']) == ('active', RESERVE_ACCOUNT)

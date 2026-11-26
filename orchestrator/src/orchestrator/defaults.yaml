@@ -3,6 +3,11 @@
 
 # Concurrency
 max_concurrent_tasks: 24
+# Run slots beyond max_concurrent_tasks that only a main-health fix may take;
+# rationale in docs/main-health-fix-run-slot-reserve.md. The dashboard restates
+# this value (dashboard/src/dashboard/data/orchestrator.py, FORMAT COUPLING
+# item 2), so change both together.
+main_health_fix_reserved_slots: 1
 max_per_module: 1
 lock_depth: 4
 module_overrides: {}
@@ -26,6 +31,7 @@ suppress_resettled_review_suggestions: true
 # Merge conflict reduction
 max_advance_attempts: 3
 max_pre_merge_retries: 2
+pre_merge_reverify: false
 max_merge_retries: 3
 inter_iteration_rebase: true
 # Rebase onto main before each verify retry (Fix 3 — closes the verify-only
@@ -77,6 +83,15 @@ requeue_cap: 3
 # exempt from requeue_cap.  Guards against unbounded retry on a persistent
 # provider outage.  Process-local; orchestrator restart resets it.
 transient_requeue_cap: 10
+# Jittered exponential backoff for the transient lane (PRD contract C3).  The
+# n-th transient requeue arms min(base * 2**(n-1), cap) seconds, drawn with
+# equal jitter U(cooldown/2, cooldown); n is the task's transient requeue
+# count at arming.  30/900 walks 30/60/120/240/480 and pins at 900s from n=6,
+# so a provider outage settles into a 7.5-15 min cadence instead of a flat-30s
+# retry storm (2026-07-29: 67 starts in one half-hour bucket).  GENUINE
+# (non-5xx) requeues are unaffected — they stay flat at requeue_cooldown_secs.
+transient_requeue_backoff_base_secs: 30.0
+transient_requeue_backoff_cap_secs: 900.0
 
 # Verification timeouts
 verify_command_timeout_secs: 1800
@@ -150,6 +165,18 @@ prices:
   gpt-5.4:
     input_per_1m: 2.50
     output_per_1m: 10.00
+  gpt-6-astra:
+    input_per_1m: 10.00
+    output_per_1m: 50.00
+    cached_input_per_1m: 1.00
+  gpt-6.1-sol:
+    input_per_1m: 2.00
+    output_per_1m: 10.00
+    cached_input_per_1m: 0.10
+  gpt-6.1-terra:
+    input_per_1m: 1.00
+    output_per_1m: 5.00
+    cached_input_per_1m: 0.05
   o4-mini:
     input_per_1m: 1.10
     output_per_1m: 4.40
@@ -351,7 +378,15 @@ budgets:
   architect: 15.0
   implementer: 10.0
   debugger: 5.0
-  reviewer: 5.0
+  # 5.0 -> 12.0 (2026-08-17, task-3543 /unblock investigation; see task 3321).
+  # Measured over 475 reviewer_comprehensive invocations since 2026-08-10:
+  # 5.3% hit the $5 ceiling, and $268 of $908 total reviewer spend (29.5%) went
+  # to cap-killed runs that produced nothing. Successful reviews cost p50=$1.46,
+  # p95=$3.10, max=$4.92 — the ceiling sat barely above the largest legitimate
+  # review. $12 is ~4x p95 / ~2.4x observed max: a runaway guard normal
+  # operation never touches. Reduces net spend, since a cap-killed run burns the
+  # full ceiling, yields nothing, then retries up to 4 more times.
+  reviewer: 12.0
   merger: 5.0
   steward: 5.0
   triage: 2.0
@@ -364,10 +399,22 @@ budgets:
 
 # Turn limits per invocation
 max_turns:
-  architect: 100
+  # Leo 2026-11-04: matches the df/reify value; seat U's 17 mechanical no-plan failures were the 100-turn cap.
+  architect: 180
   implementer: 80
   debugger: 50
-  reviewer: 30
+  # 30 -> 60 (2026-08-17, task-3543 /unblock investigation; see task 3321).
+  # Same failure mode simple_task hit below, and worse: over 475
+  # reviewer_comprehensive invocations since 2026-08-10, 19.6% exceeded 30
+  # turns, and of 79 failures 43 sat at EXACTLY turns=31 while only 11 were
+  # anything other than a cap hit. Successful reviews run p50=19, p90=31,
+  # p95=33, max=43 — so the cap was firing BELOW the p90 of normal successful
+  # operation, which makes it a throttle rather than a runaway guard. 60 leaves
+  # ~40% headroom over the observed max. NB the observed maxima are CENSORED by
+  # the cap itself, so true demand may run higher.
+  # 60 -> 90 with effort xhigh (Leo 2026-10-31, task 7972): opus high's p99 is 28 turns in
+  # production and xhigh runs about 2.25x longer, so xhigh's p99 is about 63. Gate 7973 re-measures.
+  reviewer: 90
   merger: 50
   steward: 100
   triage: 25
@@ -382,17 +429,21 @@ max_turns:
 # Reasoning effort per role
 effort:
   # architect: EVAL-GOVERNED -- see the models.architect comment above and
-  # plans/architect-effort-adoption-decision-2026-07-28.md (task iota; MARGINAL
-  # verdict 2026-07-27, held at max rather than flipped to high).
-  architect: "max"
-  implementer: "max"
-  debugger: "max"
-  reviewer: "high"
-  merger: "max"
+  # plans/architect-effort-adoption-decision-2026-07-28.md (task iota; its
+  # 2026-07-27 run compared opus-max vs opus-high only, MARGINAL, held at max).
+  # Leo 2026-11-03: xhigh, as max is no longer a good choice since Opus 5.5
+  # (reviewer moved to xhigh 2026-10-31, task 7972).
+  architect: "xhigh"
+  # Leo 2026-11-16: xhigh, as max is no longer a good choice since Opus 5.5.
+  implementer: "xhigh"
+  debugger: "xhigh"
+  # Leo 2026-10-31 (task 7972); evidence and revert: gate task 7973.
+  reviewer: "xhigh"
+  merger: "xhigh"
   steward: "high"
   triage: "medium"
   module_tagger: "medium"
-  deep_reviewer: "max"
+  deep_reviewer: "xhigh"
   judge: "medium"
   simple_task: "high"
 
@@ -417,6 +468,8 @@ review:
   full_review_on_complete: true
   briefing_path: "review/briefing.yaml"
   reports_dir: "data/review-checkpoints"
+  # d2 fleet-wide: Leo 2026-10-31 (task 7972), first adopted for dark_factory by commit 6bd91df23d.
+  reviewer_briefing: "d2"
 
 # Scheduler fairness — anti-starvation for broad-footprint tasks.
 #
@@ -454,15 +507,24 @@ fairness:
 # a whole namespace.  TRAP: `<name>.*` does NOT match the bare parent key
 # `<name>`, so a top-level dict key must be listed EXACTLY.
 #
-# Excused keys stay listed by check-config (at exit 0) and in reload_config's
+# Excused keys stay listed by check-config and in reload_config's
 # `ignored_config_keys`, so an over-broad glob remains auditable.
+#
+# PREFER the reasoned mapping form.  An entry is an ASSERTION that some
+# non-orchestrator consumer reads the key; a bare string makes that assertion
+# unfalsifiable and nothing ever re-checks it.  A bare string still works but
+# check-config reports it as un-reasoned DEBT (advisory, exit 0).  If the
+# consumer has NOT landed yet, the reason MUST cite its tracking task as
+# `#NNNN` — an uncited "pending" claim has no expiry (hard finding, exit 2).
 # See OPERATIONS.md §6a.
 config_key_census:
   ignore: []
   # ignore:
-  #   - 'cpu_governance.*'       # whole namespace
-  #   - 'fairness.scheduler_v2'  # exact path
-  #   - 'warm_lane_pool'         # top-level dict key — must be exact
+  #   - path: 'cpu_governance.*'          # whole namespace
+  #     reason: read verbatim by scripts/cpu-governed-exec.sh
+  #   - path: 'warm_lane_pool'            # top-level dict key — must be exact
+  #     reason: temporary — pending #5908, which deletes this entry
+  #   - 'fairness.scheduler_v2'           # bare form: accepted, reports as debt
 
 # Starvation watchdog (task 1880).
 #
@@ -474,6 +536,29 @@ config_key_census:
 #   - idle-only backstop — idle_only_secs of continuous eligibility ALONE,
 #     regardless of skip_count (see idle_only_secs below).
 # Auto-resolves when the task finally dispatches.  Set enabled: false to silence.
+#
+# PREDICATE RETUNE (task 3821, esc-4851-3): age alone NEVER fires.  The
+# idle-only backstop below fired on age alone, so in a deep backlog every
+# low/medium task crossed 72h and the watchdog filed hundreds of alarms with
+# skip_count=0.  Every gate now needs the eligibility-age floor AND a stuck
+# signal seen while the task was a dispatch candidate:
+#   - dual         — skip_threshold top-skips AND age >= idle_secs.
+#   - lock_refused — skip_threshold scans in which the task was refused its
+#                    locks while a LOWER-ranked candidate dispatched, AND
+#                    age >= idle_only_secs.  Replaces the idle-only backstop;
+#                    idle_only_secs keeps its name as this gate's age floor.
+#   - park_blocked — the task's live park has a module held by another task
+#                    for park_blocked_age_secs.  Takes precedence; never pins.
+# The age is measured from a DURABLE anchor stamped at first dispatch
+# candidacy (data/orchestrator/scheduler_eligibility.db).  It survives
+# restarts and transient candidacy gaps, so a restart no longer stamps the
+# whole backlog into one cohort that fires 72h later.
+# Consequence: dual / lock_refused auto-pin the task when it has no overrides
+# row (source starvation_watchdog, ttl auto_pin_ttl_secs), at most
+# auto_pin_max_concurrent at once; firings beyond the cap share ONE level-1
+# escalation instead of one each.  park_blocked files a level-1 escalation
+# naming the blocking holder.  Every firing emits a starvation_detected event.
+# Watchdog escalations no longer feed the digest's EWA numerator.
 #
 # idle_secs default raised to 259200 (72h) — task 2631, owner decision (Leo
 # 2026-07-15): archive analysis of 209 prior firings found max starving
@@ -497,11 +582,16 @@ config_key_census:
 # violates the idle_only_secs >= idle_secs validator and FAILS config load AND
 # hot-reload (both knobs are green-tier reloadable).  This is loud-over-silent by
 # design — bump BOTH knobs together whenever you push idle_secs past 259200.
+# Task 3821 retains that validator: idle_only_secs is now the lock_refused
+# gate's age floor, and the coupling still holds.
 starvation_watchdog:
   enabled: true
   skip_threshold: 50
   idle_secs: 259200.0
   idle_only_secs: 259200.0
+  park_blocked_age_secs: 14400.0
+  auto_pin_max_concurrent: 3
+  auto_pin_ttl_secs: 86400.0
 
 # Warm-lane base hard-down watchdog (task 2061).
 #
@@ -532,7 +622,6 @@ sandbox:
 
 # Escalation
 escalation:
-  queue_dir: "data/escalations"
   port: 8100
   host: "127.0.0.1"
 
@@ -592,14 +681,21 @@ git:
   # _lane- (warm-lane pool) or _spec- (merge-speculation pool).
   iact_prefix: "_iact-"
 
-# Deep merge-ahead chains (task 3183).  chain_cap is the single gate for the
-# whole feature: the maximum number of queued items one verify may cover as a
-# chain.  0 (shipped default) is the KILL SWITCH — byte-identical to pre-PRD
-# merge behaviour.  Green-tier hot-reloadable, so enable/retune/kill never needs
-# a restart; set it with scripts/merge-deep-set-cap.sh.  Dispatch contract and
-# cap-staging plan: plans/deep-merge-ahead-prd.md.
+# Deep merge-ahead chains (task 3183).  chain_cap is the KILL SWITCH only:
+# 0 (shipped default) is byte-identical to pre-PRD merge behaviour, and any
+# positive value turns chains on without bounding them.  depth_table sets the
+# depth: the first [min_pass_estimate, depth] row the rolling per-item pass
+# estimate meets, else 1 (task 8528).  Green-tier hot-reloadable, so
+# enable/retune/kill never needs a restart; set the switch with
+# scripts/merge-deep-set-cap.sh.  Policy: plans/merge-lane-policy-prd.md D6/D7.
 merge_deep:
   chain_cap: 0
+  depth_table: [[0.992, 12], [0.990, 11], [0.988, 10], [0.984, 9], [0.979, 8],
+                [0.972, 7], [0.959, 6], [0.934, 5], [0.876, 4], [0.75, 3]]
+  # Chain-build deadline (s); above reify's measured whole-process build p99 (~1230 s).
+  chain_build_timeout_secs: 1800
+  # How long a built chain's links stay reserved for its tip verify (s).
+  chain_reservation_timeout_secs: 7200
 
 # Chronic pool-infra flake auto-file detector (task 2358). Gated OFF until
 # reify task 5142's flaky-ledger.jsonl + CHRONIC-FLAKY marker substrate is
@@ -623,6 +719,34 @@ zero_progress_requeue:
   enabled: true
   threshold: 5
   min_span_seconds: 900.0
+
+# Structured recovery-decision emission (task 3535, PRD
+# plans/task-escalation-state-graph-prd.md D5).  Every veto/LEAVE site in the
+# recovery machinery emits a recovery_vetoed / recovery_left event naming WHAT
+# held a stranded task, and a blocking L1 is filed against a streak sentinel
+# after `veto_streak_threshold` IDENTICAL consecutive vetoes spanning at least
+# `veto_streak_min_span_secs`.  Changes no recovery disposition — see
+# orchestrator/src/orchestrator/recovery_emission.py (module docstring) for the
+# canonical WHY, the signature-transition emission cadence, and the derivation
+# of the 1500.0s span default.  Shipped ENABLED: without it a strand held by an
+# open escalation leaves no machine-readable trace of what held it.
+recovery_emission:
+  enabled: true
+  veto_streak_threshold: 3
+  veto_streak_min_span_secs: 1500.0
+  # The narrower kill switch: the only part of the mechanism that WRITES to the
+  # escalation queue.  Turn this off to keep the telemetry and silence the L1.
+  streak_escalation_enabled: true
+  # Task 4541 -- no L1 for a hold pinned only by L2s; see recovery_emission.py.
+  streak_escalation_suppress_human_parked: true
+  # Task 4647 -- the landing-detector storm escape.  git_error is the one
+  # landing reason whose REPETITION means the detector is broken rather than
+  # the task being unlanded, and a broken detector is silent by construction:
+  # every verdict it produces rejects.  STRICT exceedance of this trailing-hour
+  # rate files ONE blocking L1 against a synthetic sentinel.  Same narrow
+  # kill-switch discipline as streak_escalation_enabled above.
+  landing_git_error_rate_per_hour: 10
+  landing_git_error_escalation_enabled: true
 
 # Autonomous dry-run unblock hook
 unblock_auto:
@@ -717,6 +841,42 @@ park_stop_enabled: true
 park_stop_parked_threshold: 15
 park_stop_parked_window_hours: 1.0
 
+# EASY-backfill admission through parks (task 3823, PRD task η / C7)
+#
+# A candidate blocked ONLY by another task's park may be admitted through it
+# when its predicted hold, times a safety factor, provably fits inside the gap
+# the park's owner is going to wait anyway.  The final acquisition still goes
+# through try_acquire, and only the PARK gate is bypassed — the held-lock limit
+# gate is untouched, so an admitted-but-actually-contended candidate simply
+# fails to acquire.
+#
+# Evidence: plans/evidence/scheduler-scoring-2026-08-06/PARKING_MODEL_REPORT.md
+#
+# backfill_enabled: operator kill switch.  When false, a park-blocked candidate
+#   is passed over exactly as before (no admission is even attempted).
+#
+# backfill_safety_factor: multiplier on the candidate's predicted hold before it
+#   is compared against the parked owner's provable assembly delay (gt=0;
+#   default 2.5).  2.5 is INTERPOLATED between two measured 80%-coverage
+#   multipliers — x2.9 (dark-factory) and x2.0 (reify), report :126 — not
+#   guessed; modelled overstay at x2.5 is 7-9% (:254-255).  Raise it toward 2.9
+#   if park_backfill_overstay events show a sustained higher rate.
+#
+# backfill_min_samples: minimum observed hold samples before the predictor will
+#   answer at all (ge=1; default 3).  Below it predicted_hold is None and
+#   backfill REFUSES.  This is the single source of truth for HoldHistory's
+#   sample floor.  A floor of 0 would let an empty history certify a backfill.
+#
+# backfill_max_park_age_secs: refuse backfill through any park older than this,
+#   measured from the owner's FIRST install (gt=0; default 3600.0).  The clause
+#   is measured (report :256 — without a cutoff one reify starver flips to
+#   never-dispatched in-window); the 1h figure is a judgment default, ~40% of
+#   the measured 2.2-3h median process era.
+backfill_enabled: true
+backfill_safety_factor: 2.5
+backfill_min_samples: 3
+backfill_max_park_age_secs: 3600.0
+
 # Escalation-watcher subprocess supervisor (AFK hardening, task 1326)
 #
 # An orchestrator-managed asyncio supervisor that keeps a fresh
@@ -788,15 +948,17 @@ watcher_backend: claude
 # watcher_daily_cost_ceiling_usd: ceiling for escalation-watcher invocations
 #   only (role LIKE '%watcher%').  This is the early-warning trip — runaway
 #   watcher dispatch is the most likely cost source during AFK windows.
-#   Trip reason: cost_ceiling_watcher_exceeded (default 50.0).
+#   Trip reason: cost_ceiling_watcher_exceeded (default 150.0).
 #
 # orch_daily_cost_ceiling_usd: ceiling for ALL orchestrator invocations
 #   (entire invocations table, trailing 24h).  Final safety net.
-#   Trip reason: cost_ceiling_orch_exceeded (default 200.0).
+#   Trip reason: cost_ceiling_orch_exceeded (default 10000.0).
 #
-# Disable a ceiling by setting it to a very high value.
-watcher_daily_cost_ceiling_usd: 50.0
-orch_daily_cost_ceiling_usd: 200.0
+# Disable a ceiling by setting it to a very high value.  The orch-wide
+# default is effectively off: it stays as an opt-in tripwire (task 8262;
+# ruling in plans/cross-project-weights-study-2026-11-12/rulings.md).
+watcher_daily_cost_ceiling_usd: 150.0
+orch_daily_cost_ceiling_usd: 10000.0
 
 # Merge-queue train coalescing (tasks 1717-1722)
 #
@@ -827,13 +989,27 @@ merge_train_former_enabled: false
 merge_train_max_members: 3
 merge_train_coalesce_enabled: false
 
-# merge_verify_breadth: staged-rollout gate for the broad merge gate (λ, task
-#   2589).  'scoped' (shipped default) is the legacy per-touched-module verify
-#   plan.  'full' makes merge-role verify run every REGISTERED module's full
-#   suite, not just the touched ones.  Restart-only (NOT hot-reloadable — see
-#   config.py's merge_verify_breadth field).  Flipped 'scoped' -> 'full' by
-#   the σ capstone and activated by the τ deterministic-deploy fleet restart.
-merge_verify_breadth: scoped
+# merge_verify_breadth: the breadth of the MERGE-role verify gate.
+#   'full' (shipped default; task 7008, Leo's 2026-10-15 ruling): every
+#   REGISTERED module's full suite runs on the merged tree, whatever the diff
+#   touched.  'full' is also the only breadth under which merge-run junit is
+#   archived (verify.py::_JunitReportPlan).
+#   'scoped' is the explicit per-project opt-down: the legacy per-touched-
+#   module plan of verify_plan.py::_derive_module_runs at role='merge'.  It
+#   runs only the touched test files (a touched conftest or test-data module
+#   still widens to that module's full suite), and no pytest at all for a
+#   source-only diff (arm 5).
+#   Restart-only (NOT hot-reloadable — see config.py's merge_verify_breadth
+#   field).
+#
+#   PAIRED POLICY.  TASK-role verify is scoped by policy and has no knob.
+#   verify_plan.py::_derive_module_runs arm 3: a touched source/structural
+#   file runs the touched tests plus the module's whole-tree guard family,
+#   falling back to the module's full suite when no guard family applies
+#   (docs/task-role-pytest-floor.md).  Arm 4b: a test-only diff stays
+#   file-scoped.  Read the two defaults together: narrow task verify, broad
+#   merge gate.
+merge_verify_breadth: full
 
 # Lever C: remote-verify host availability monitoring (task 1795).
 #
@@ -855,6 +1031,38 @@ merge_verify_breadth: scoped
 #   hosts for reachability (ssh BatchMode health probe) every this many
 #   seconds.  On recovery the host is immediately cleared back into the live
 #   pool without a restart; the open L1 escalation is resolved automatically.
+#
+# verify_host_policy: which host the NEXT merge-verify dispatch prefers.
+#   prefer_local (default) keeps today's order byte-for-byte — local when it is
+#   free, first eligible remote as overflow.  prefer_remote inverts it so a free
+#   remote absorbs verify load instead of idling while the lane serialises on
+#   local, falling back to local when no remote is eligible.  Eligibility is
+#   unchanged either way (FREE, not quarantined, not PARKED), so the queue never
+#   stalls on a sick remote.  Green-tier: reloadable without a restart.
+#   TRUST-ANCHOR CAVEAT: prefer-local exists because local is the trust anchor
+#   after a laptop false-green landed a red commit.  Under prefer_remote nearly
+#   every verdict is a REMOTE verdict, which promotes
+#   verify_drift_check_every_n_lands from a spot check to the standing fidelity
+#   guard — set that cadence deliberately before flipping this knob.
 verify_host_unreachable_escalate_after_n: 3
 verify_host_unreachable_escalate_after_secs: 600.0
+verify_host_policy: prefer_local
 verify_host_reprobe_interval_s: 120.0
+
+# Remote task-leg verifies (task 6670; plans/remote-task-leg-verify-prd.md
+# §5.7).  All four are green-tier: the dispatcher reads them per dispatch.
+#
+# verify_task_host_policy: local (default) runs every task verify locally and
+#   writes no dispatch sidecar.  remote_modules makes a verify eligible when its
+#   executed modules intersect verify_task_remote_modules (which must then be
+#   non-empty); remote_all makes every verify eligible.  Rollback is one reload
+#   back to local.
+# verify_task_remote_cross_check_every_n: every n-th verify that returns a
+#   remote verdict (green or red, counted per orchestrator process) is re-run
+#   locally, local authoritative (0 = off).
+# verify_task_remote_red_confirms_locally: a remote red is re-run locally and
+#   the local verdict returned.
+verify_task_host_policy: local
+verify_task_remote_modules: []
+verify_task_remote_cross_check_every_n: 0
+verify_task_remote_red_confirms_locally: false

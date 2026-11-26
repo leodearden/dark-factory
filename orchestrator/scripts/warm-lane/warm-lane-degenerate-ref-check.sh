@@ -31,10 +31,32 @@
 #   the only thing distinguishing "degenerate, parked on a foreign ancestor"
 #   from "genuinely landed" is whether the tip commit cites ITS OWN task id.
 #
-# The citation predicate mirrors dark-factory orchestrator/git_ops.py's
-# citation regex byte-for-byte: a merge-commit subject `^Merge <prefix><id>
-# into ` OR a `#<id>` reference, both with digit-boundary safety (task/1 does
-# not match "Merge task/10 into main"; #45 does not match #4588).
+# The citation predicate is NOT defined here. It lives in
+# scripts/lib_task_citation.sh, the single copy of a grammar that is normative
+# across the reify/dark-factory seam, which this script sources: a line opening
+# with the landing subject of <prefix><id> (its merge arm, which this script
+# renders once from shared/src/shared/merge_subject.py::rendered_prefix and
+# passes in; see README.md "Delta 19"), a conventional-commit subject citing the id
+# (`impl(<id>): …`, dark-factory's kind list), OR a `#<id>` reference, each
+# boundary-safe (task/1 does not match "Merge task/10 into main"; impl(5) does
+# not match impl(50); #45 does not match #4588). Do not re-inline it here — see
+# that file's header, which also records where it agrees with dark-factory.
+# That lib is the SINGLE copy; dark-factory ports no separate lib test, as for
+# lib_live_refs.sh and lib_portable.sh, so re-inlining either ERE here would
+# reintroduce the drift the lib exists to prevent with nothing to catch it.
+#
+# The conventional-commit arm is what makes `landed` reachable for the usual
+# tip: a branch whose last commit reads "fix(<id>): …" and is on main. Without
+# it, 81 of the 427 refs this script reported degenerate over the live pool
+# were such tips (2026-09-17, esc-7244-16: every one of the 81 flipped to
+# landed, and no landed ref flipped back) — and dark-factory treats degenerate
+# as "zero task work", downgrading a MARK_DONE recovery to a
+# revert-and-redispatch.
+#
+# The claim this replaced — that the predicate mirrored
+# orchestrator/git_ops.py::DEFAULT_COMMIT_CITATION_PATTERN byte-for-byte — was
+# FALSE IN BOTH DIRECTIONS: that pattern has no `#<id>` arm at all, and its
+# conventional-commit alternative was absent from this copy.
 #
 # Usage — two mutually exclusive modes:
 #
@@ -79,7 +101,14 @@
 # Exit codes (single-ref mode; audit mode always exits 0 on a completed sweep):
 #   0  — degenerate  (count==0, tip does not cite N — skip-sweep / prune-safe)
 #   1  — live        (count>0 — own commits ahead of main)
-#   2  — usage error
+#   2  — usage/WIRING error: an unknown flag, a missing flag value, a
+#        missing sibling library (scripts/lib_task_citation.sh), OR a merge
+#        arm that cannot be rendered from shared.merge_subject (no
+#        shared/src three levels up, no python3, or a failed render). The
+#        library and render cases are wiring errors, not runtime ones: nothing
+#        about the invocation could have avoided them and no retry will fix
+#        them — the deployment is incomplete. Same class as an unknown flag,
+#        hence 2.
 #   3  — structural  (not a git work tree, or --main-ref unresolvable)
 #   4  — landed      (count==0, tip DOES cite N — genuinely merged)
 #   5  — absent      (no such ref)
@@ -87,6 +116,36 @@
 # See: docs/design/warm-lane-degenerate-ref-seam.md
 
 set -euo pipefail
+
+# dirname by PARAMETER EXPANSION, not a fork: a PATH without dirname yields an
+# EMPTY substitution, `cd ""` succeeds as a no-op, and SCRIPT_DIR silently becomes
+# the CALLER'S CWD. See README.md "Delta 7".
+_src="${BASH_SOURCE[0]}"
+_dir='.'
+case "$_src" in
+    */*) _dir="${_src%/*}"
+         [ -n "$_dir" ] || _dir='/' ;;
+esac
+SCRIPT_DIR="$(cd "$_dir" && pwd)"
+unset _src _dir
+
+# ── the citation grammar (sourced, never re-inlined) ─────────────────────────
+# scripts/lib_task_citation.sh is the SINGLE copy of the "cites task N"
+# grammar; see its header for why that matters across the reify/dark-factory
+# seam. Re-inlining either ERE here is what the lib exists to prevent.
+#
+# Fail LOUDLY if the lib is missing: without it EVERY classification is wrong,
+# and an absent sibling is an incomplete DEPLOYMENT, never a data problem --
+# exit 2 (usage/WIRING), not the 1 bash's own bare `source` failure produces
+# under `set -e`. reify's copy does a bare `source`; this guard is the
+# dark-factory divergence recorded in README.md "Delta 11", in the shape task
+# 3370 ("Delta 8") established for lib_portable.sh.
+if [ ! -f "$SCRIPT_DIR/lib_task_citation.sh" ]; then
+    echo "warm-lane-degenerate-ref-check.sh: ERROR — scripts/lib_task_citation.sh not found next to warm-lane-degenerate-ref-check.sh" >&2
+    exit 2
+fi
+# shellcheck source=orchestrator/scripts/warm-lane/lib_task_citation.sh
+source "$SCRIPT_DIR/lib_task_citation.sh"
 
 # ── log helpers (all write to stderr) ─────────────────────────────────────────
 info()  { printf '\033[1;34m[info]\033[0m  %s\n' "$*" >&2; }
@@ -113,7 +172,10 @@ Usage: $(basename "$0") --task <id> [OPTIONS]
     --status-cmd <cmd>       (--audit only) Advisory status oracle.
     -h, --help               Print this message and exit 0.
 
-  Exit codes: 0=degenerate 1=live 2=usage 3=structural 4=landed 5=absent
+  Exit codes: 0=degenerate 1=live 2=usage/wiring 3=structural 4=landed
+              5=absent
+    2 also covers a missing sibling scripts/lib_task_citation.sh, and a
+    merge arm shared.merge_subject cannot render.
 
   See: docs/design/warm-lane-degenerate-ref-seam.md
 EOF
@@ -168,10 +230,48 @@ if [ -z "$TASK_ID" ] && [ "$AUDIT_MODE" -ne 1 ]; then
 fi
 
 # ── numeric --task validation ─────────────────────────────────────────────────
-if [ -n "$TASK_ID" ] && ! printf '%s\n' "$TASK_ID" | grep -qE '^[0-9]+$'; then
+if [ -n "$TASK_ID" ] && ! [[ "$TASK_ID" =~ ^[0-9]+$ ]]; then
     err "--task must be a positive integer (got: '$TASK_ID')"
     exit 2
 fi
+
+# ── the merge arm, rendered from shared.merge_subject ─────────────────────────
+# The citation lib's merge arm is NOT spelled here: shared.merge_subject's
+# rendered_prefix renders its ERE (head, into) for --branch-prefix, once.
+# shared/src sits three levels above this script's directory, located by path
+# arithmetic, and the module is stdlib-only, so `python3 -I` with that one
+# sys.path entry imports it whatever the caller's environment. Any failure
+# exits 2: an incomplete deployment, the same wiring class as a missing lib,
+# never a classification. See README.md "Delta 19".
+_MERGE_ARM_PY='import sys
+sys.path.insert(0, sys.argv[1])
+from shared.merge_subject import rendered_prefix
+head, into = rendered_prefix(sys.argv[2])
+print(head)
+print(into)'
+
+SHARED_SRC="$SCRIPT_DIR/../../../shared/src"
+if [ -d "$SHARED_SRC" ]; then
+    SHARED_SRC="$(cd "$SHARED_SRC" && pwd)"
+fi
+
+_merge_arm_unrenderable() {
+    err "cannot render the merge arm with shared.merge_subject.rendered_prefix" \
+        "(interpreter: python3, shared_src: $SHARED_SRC): $1"
+    exit 2
+}
+
+[ -f "$SHARED_SRC/shared/merge_subject.py" ] \
+    || _merge_arm_unrenderable "shared/merge_subject.py not found"
+_rendered="$(python3 -I -c "$_MERGE_ARM_PY" "$SHARED_SRC" "$BRANCH_PREFIX")" \
+    || _merge_arm_unrenderable "the render exited $?"
+[[ "$_rendered" == *$'\n'* ]] \
+    || _merge_arm_unrenderable "the render printed no head/into pair"
+MERGE_HEAD_RE="${_rendered%%$'\n'*}"
+MERGE_INTO_RE="${_rendered#*$'\n'}"
+[ -n "$MERGE_HEAD_RE" ] && [ -n "$MERGE_INTO_RE" ] \
+    || _merge_arm_unrenderable "the render printed an empty head or into"
+unset _rendered
 
 # ── structural preflight (shared by single-ref and audit modes) ──────────────
 [ -n "$REPO_DIR" ] || REPO_DIR="."
@@ -192,13 +292,10 @@ fi
 # ── shared classify core (single-ref and audit modes both call this) ─────────
 
 # _regex_escape <string>
-# Escapes ERE metacharacters in <string> (anything outside [a-zA-Z0-9_]) so
-# it can be safely interpolated into a `grep -E` pattern as a literal. Guards
-# _cites_task's merge-subject check against a caller-supplied --branch-prefix
-# containing regex metacharacters (e.g. "." or "+"), which would otherwise be
-# interpreted as regex syntax instead of matched literally.
+# Thin local alias for the library's escape, kept so the call sites below read
+# unchanged. See task_citation_regex_escape for the contract.
 _regex_escape() {
-    printf '%s' "$1" | sed -e 's/[^a-zA-Z0-9_]/\\&/g'
+    task_citation_regex_escape "$1"
 }
 
 # BRANCH_PREFIX pre-escaped for safe interpolation into _cites_task's ERE
@@ -206,17 +303,15 @@ _regex_escape() {
 BRANCH_PREFIX_RE="$(_regex_escape "$BRANCH_PREFIX")"
 
 # _cites_task <commit> <id>
-# True iff <commit>'s message cites task <id>: either a merge-commit subject
-# "Merge <prefix><id> into " or a "#<id>" reference, both with digit-boundary
-# safety (task/1 must not match "Merge task/10 into main"; #45 must not match
-# #4588). Mirrors dark-factory orchestrator/git_ops.py's citation regex so
-# both repos agree on "cites task N" byte-for-byte.
+# True iff <commit>'s message cites task <id>. This function owns only the
+# FETCH — resolving <commit> to its message text; the grammar itself lives in
+# scripts/lib_task_citation.sh, so this copy and reify's consumers of the same
+# lib can never drift apart on what "cites task N" means.
 _cites_task() {
     local commit="$1" id="$2" msg
     msg="$(git -C "$REPO_DIR" log -1 --format=%B "$commit" 2>/dev/null || true)"
-    printf '%s\n' "$msg" | grep -qE "^Merge ${BRANCH_PREFIX_RE}${id} into " && return 0
-    printf '%s\n' "$msg" | grep -qE "(^|[^0-9])#${id}([^0-9]|\$)" && return 0
-    return 1
+    task_citation_message_cites "$msg" "$id" "$BRANCH_PREFIX_RE" \
+        "$MERGE_HEAD_RE" "$MERGE_INTO_RE"
 }
 
 # _classify_ref <id>

@@ -6,8 +6,8 @@ Covers:
 - GraphitiBackend._run_startup_identity_scan — per-graph orchestrator
 - GraphitiBackend.initialize() wiring
 
-An idempotent startup identity-integrity pass, run per-graph over
-list_graphs() during initialize(). Two responsibilities: (a) dup-NODE
+An idempotent startup identity-integrity pass, run per registered graph
+during initialize(). Two responsibilities: (a) dup-NODE
 alarm — detect exact-name duplicate Entity nodes and emit a LOUD WARN
 naming group_id+name (a safety net for the write-time identity gate, task
 2198/α + task 2202/β — a POSITIVE DETECTION signal, not input rejection);
@@ -20,15 +20,19 @@ from __future__ import annotations
 
 import contextlib
 import logging
-import os
 import uuid
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import pytest_asyncio
-from _fm_helpers import extract_cypher, extract_params
-from falkordb import FalkorDB as _SyncFalkorDB
+from _fm_falkor_live import FALKOR_HOST, FALKOR_PORT, falkor_skipif, unique_graph_name
+from _fm_helpers import (
+    extract_cypher,
+    extract_params,
+)
+from _graph_access_fake import FakeGraphAccess
 from falkordb.asyncio import FalkorDB
+from redis.exceptions import ResponseError
 
 from fused_memory.backends.graphiti_client import GraphitiBackend, _MultiTenantFalkorDriver
 
@@ -41,43 +45,19 @@ from fused_memory.backends.graphiti_client import GraphitiBackend, _MultiTenantF
 # re-run, group_id exclusion of a task-2115 foreign clone) against a REAL
 # FalkorDB server -- the mock tests above can only pin the Cypher
 # string/params shape, not FalkorDB's actual grouping/count semantics.
-# Duplicated (not shared via conftest.py) from test_merge_entities.py's
-# harness (itself duplicated from test_refresh_entity_summary.py /
-# test_list_indices_integration.py), per the established per-module
-# duplication convention that sidesteps the `sys.modules['conftest']`
-# collision documented in _fm_helpers.py.
+# The reachability probe, connection constants and per-run graph name come
+# from _fm_falkor_live (task 3502) — see its module docstring for why it is not
+# conftest.py. Only the fixture body below is per-module; do not re-fork the
+# shared helpers back into this file.
 #
 # Skipped automatically when FalkorDB is not reachable; the mock tests above
 # guarantee coverage in that case.
 # ---------------------------------------------------------------------------
 
-FALKOR_HOST: str = os.environ.get('FALKOR_HOST', 'localhost')
-FALKOR_PORT: int = int(os.environ.get('FALKOR_PORT', '6379'))
-
-
-def _falkor_available() -> bool:
-    """FalkorDB-native reachability probe (mirrors test_merge_entities.py)."""
-    try:
-        client = _SyncFalkorDB(host=FALKOR_HOST, port=FALKOR_PORT, socket_connect_timeout=2)
-        try:
-            client.select_graph('_probe').query('RETURN 1')
-        finally:
-            with contextlib.suppress(Exception):
-                client.close()
-        return True
-    except Exception:
-        return False
-
-
 @pytest_asyncio.fixture
 async def startup_scan_live_graph():
-    """Provision a throwaway, uniquely-named FalkorDB graph, yield it, then clean up.
-
-    A fresh graph name is minted on every invocation (rather than a shared
-    module-level constant) so this module's live tests never share state,
-    even under pytest-xdist or a shared FalkorDB instance.
-    """
-    graph_name = f'_test_2210_startup_scan_{uuid.uuid4().hex[:8]}'
+    """Provision a throwaway, uniquely-named FalkorDB graph, yield it, then clean up."""
+    graph_name = unique_graph_name('2210_startup_scan')
     client = FalkorDB(host=FALKOR_HOST, port=FALKOR_PORT)
     with contextlib.suppress(Exception):
         stale = client.select_graph(graph_name)
@@ -90,6 +70,19 @@ async def startup_scan_live_graph():
             await graph.delete()
         with contextlib.suppress(Exception):
             await client.aclose()
+
+
+async def _seed_relates_to_edge(graph, src, dst, edge_uuid, fact, embedding=None):
+    """Seed a legacy RELATES_TO edge between two existing :Entity nodes."""
+    query = (
+        'MATCH (a:Entity {uuid: $src}), (b:Entity {uuid: $dst}) '
+        'CREATE (a)-[e:RELATES_TO {uuid: $edge_uuid, name: $name, fact: $fact}]->(b)'
+    )
+    params = {'src': src, 'dst': dst, 'edge_uuid': edge_uuid, 'name': 'rel', 'fact': fact}
+    if embedding is not None:
+        query += ' SET e.fact_embedding = vecf32($embedding)'
+        params['embedding'] = embedding
+    await graph.query(query, params)
 
 
 # ---------------------------------------------------------------------------
@@ -162,7 +155,7 @@ class TestRepairDuplicateEdgeUuids:
 
     @pytest.mark.asyncio
     async def test_remints_all_but_first_edge_in_dup_group(
-        self, mock_config, make_backend, make_graph_mock,
+        self, mock_config, make_backend, make_graph_driver, make_graph_mock,
     ):
         """A three-edge dup-uuid group re-mints the last two (the survivor
         keeps eids[0]'s original uuid), returning the re-mint count. Neither
@@ -170,8 +163,6 @@ class TestRepairDuplicateEdgeUuids:
         group_id predicate -- the repair is graph-key-scoped so EVERY
         RELATES_TO edge reaches per-uuid uniqueness, regardless of its
         group_id property."""
-        backend = make_backend(mock_config)
-
         async def router(cypher, params=None):
             result = MagicMock()
             if 'collect(ID(e))' in cypher:
@@ -181,20 +172,25 @@ class TestRepairDuplicateEdgeUuids:
             return result
 
         graph = make_graph_mock([])
-        graph.query = AsyncMock(side_effect=router)
-        backend._driver._get_graph = MagicMock(return_value=graph)
+        graph.ro_query = AsyncMock(side_effect=router)
+        backend = make_backend(mock_config, driver=make_graph_driver({'g1': graph}))
 
         result = await backend._repair_duplicate_edge_uuids(group_id='g1')
 
         assert result == 2
 
-        all_calls = graph.query.call_args_list
-        detection_calls = [c for c in all_calls if 'collect(ID(e))' in extract_cypher(c)]
-        repair_calls = [c for c in all_calls if 'WHERE ID(e) = $eid' in extract_cypher(c)]
+        detection_calls = [
+            c for c in graph.ro_query.call_args_list if 'collect(ID(e))' in extract_cypher(c)
+        ]
+        write_calls = graph.query.call_args_list
+        repair_calls = [c for c in write_calls if 'WHERE ID(e) = $eid' in extract_cypher(c)]
 
         assert len(detection_calls) == 1
         assert 'group_id' not in extract_cypher(detection_calls[0])
         assert 'group_id' not in extract_params(detection_calls[0])
+        assert not any('collect(ID(e))' in extract_cypher(c) for c in write_calls), (
+            'dup-uuid detection must be read over GRAPH.RO_QUERY, never GRAPH.QUERY'
+        )
 
         assert len(repair_calls) == 2, (
             f'expected one per-edge repair call per re-minted edge, got '
@@ -230,18 +226,18 @@ class TestRepairDuplicateEdgeUuids:
 
     @pytest.mark.asyncio
     async def test_clean_graph_no_dup_uuids_is_noop(
-        self, mock_config, make_backend, make_graph_mock,
+        self, mock_config, make_backend, make_graph_driver, make_graph_mock,
     ):
-        """No dup-uuid groups -> return 0 and zero repair queries (only the
-        detection query ran)."""
-        backend = make_backend(mock_config)
+        """No dup-uuid groups -> return 0 and zero GRAPH.QUERY write commands
+        (only the read-only detection ran)."""
         graph = make_graph_mock([])
-        backend._driver._get_graph = MagicMock(return_value=graph)
+        backend = make_backend(mock_config, driver=make_graph_driver({'g1': graph}))
 
         result = await backend._repair_duplicate_edge_uuids(group_id='g1')
 
         assert result == 0
-        graph.query.assert_awaited_once()
+        graph.ro_query.assert_awaited_once()
+        graph.query.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------
@@ -252,11 +248,14 @@ class TestRunStartupIdentityScan:
     """GraphitiBackend._run_startup_identity_scan() — per-graph orchestrator."""
 
     @pytest.mark.asyncio
-    async def test_scans_and_repairs_every_graph_and_aggregates_stats(
-        self, mock_config, make_backend,
+    async def test_scans_and_repairs_every_registered_graph_and_aggregates_stats(
+        self, mock_config, make_backend, make_graph_mock,
     ):
-        backend = make_backend(mock_config)
-        backend.list_graphs = AsyncMock(return_value=['g1', 'g2'])
+        backend = make_backend(
+            mock_config,
+            registered_graph_ids={'g1', 'g2'},
+            graph_access=FakeGraphAccess({'g1': make_graph_mock(), 'g2': make_graph_mock()}),
+        )
         backend._scan_duplicate_entity_names = AsyncMock(return_value=[('Foo', 2)])
         backend._repair_duplicate_edge_uuids = AsyncMock(return_value=3)
 
@@ -275,13 +274,16 @@ class TestRunStartupIdentityScan:
 
     @pytest.mark.asyncio
     async def test_one_graph_failure_does_not_abort_the_sweep(
-        self, mock_config, make_backend, caplog,
+        self, mock_config, make_backend, make_graph_mock, caplog,
     ):
         """Per-graph best-effort: a raise on one graph is caught and logged,
         and the sweep still processes the remaining graphs (mirrors the
         initialize() index-setup loop idiom, graphiti_client.py:378-385)."""
-        backend = make_backend(mock_config)
-        backend.list_graphs = AsyncMock(return_value=['g1', 'g2'])
+        backend = make_backend(
+            mock_config,
+            registered_graph_ids={'g1', 'g2'},
+            graph_access=FakeGraphAccess({'g1': make_graph_mock(), 'g2': make_graph_mock()}),
+        )
         backend._scan_duplicate_entity_names = AsyncMock(return_value=[])
 
         async def repair_side_effect(group_id):
@@ -298,6 +300,31 @@ class TestRunStartupIdentityScan:
         assert stats['graphs_scanned'] == 2
         assert stats['edges_repaired'] == 3  # only g2's 3 counted; g1 failed
         assert any(r.levelno >= logging.WARNING for r in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_never_touches_a_graph_outside_the_registry(
+        self, mock_config, make_backend, make_graph_mock,
+    ):
+        """The sweep REPAIRS (writes), so its scope is the registry, never the
+        raw server listing: another test's private graph on a shared FalkorDB
+        must not be read, let alone re-minted (task 11326)."""
+        registered = make_graph_mock(ro_rows=[])
+        foreign = make_graph_mock(ro_rows=[])
+        backend = make_backend(
+            mock_config,
+            registered_graph_ids={'alpha_proj'},
+            graph_access=FakeGraphAccess({
+                'alpha_proj': registered,
+                '_test_2207_merge_entities_0badc0de': foreign,
+            }),
+        )
+
+        stats = await backend._run_startup_identity_scan()
+
+        foreign.ro_query.assert_not_awaited()
+        foreign.query.assert_not_awaited()
+        assert registered.ro_query.await_count >= 1
+        assert stats['graphs_scanned'] == 1
 
 
 # ---------------------------------------------------------------------------
@@ -366,9 +393,9 @@ class TestInitializeSkipMaintenance:
 
     The ζ dry-run/census (migrate_cross_graph_leak.py) only needs a
     driver/client-wired backend for reads; the two startup maintenance
-    blocks (the index-build loop and the W6-ε startup identity scan, which
-    REPAIRS dup-uuid edges — a write) are needless mutation on a read-only
-    path and contend with a running service. skip_maintenance=True guards
+    blocks (the registered-graph index provisioning sweep and the W6-ε
+    startup identity scan, which REPAIRS dup-uuid edges — a write) are
+    needless mutation on a read-only path and contend with a running service. skip_maintenance=True guards
     BOTH blocks; the default (False) must keep running both.
     """
 
@@ -376,9 +403,9 @@ class TestInitializeSkipMaintenance:
     async def test_skip_maintenance_true_skips_both_blocks(
         self, mock_config, monkeypatch,
     ):
-        """skip_maintenance=True must skip BOTH the index-build loop and
-        _run_startup_identity_scan, while driver/client wiring still
-        completes."""
+        """skip_maintenance=True must skip BOTH the registered-graph index
+        provisioning sweep and _run_startup_identity_scan, while driver/client
+        wiring still completes."""
         import fused_memory.backends.graphiti_client as graphiti_client_module
 
         mock_config.llm.providers.openai.api_key = ''  # skip the OpenAI preflight/client
@@ -390,12 +417,12 @@ class TestInitializeSkipMaintenance:
         )
 
         backend = GraphitiBackend(mock_config)
-        backend._ensure_indices = AsyncMock()
+        backend.provision_registered_graphs = AsyncMock()
         backend._run_startup_identity_scan = AsyncMock(return_value={})
 
         await backend.initialize(skip_maintenance=True)
 
-        backend._ensure_indices.assert_not_awaited()
+        backend.provision_registered_graphs.assert_not_awaited()
         backend._run_startup_identity_scan.assert_not_awaited()
         assert backend.client is not None
         assert backend._driver is not None
@@ -419,16 +446,39 @@ class TestInitializeSkipMaintenance:
         )
 
         backend = GraphitiBackend(mock_config)
-        falkor_client_stub = MagicMock()
-        falkor_client_stub.list_graphs = AsyncMock(return_value=['g1'])
-        backend._require_falkor_client = MagicMock(return_value=falkor_client_stub)
-        backend._ensure_indices = AsyncMock()
+        backend.provision_registered_graphs = AsyncMock()
         backend._run_startup_identity_scan = AsyncMock(return_value={})
 
         await backend.initialize()
 
-        backend._ensure_indices.assert_awaited_once_with('g1')
+        backend.provision_registered_graphs.assert_awaited_once_with()
         backend._run_startup_identity_scan.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_initialize_survives_a_provisioning_sweep_failure(
+        self, mock_config, monkeypatch,
+    ):
+        """A sweep that raises (e.g. the graph listing is unreachable) must not
+        break backend startup, and must not skip the identity scan after it."""
+        import fused_memory.backends.graphiti_client as graphiti_client_module
+
+        mock_config.llm.providers.openai.api_key = ''
+        monkeypatch.setattr(
+            graphiti_client_module, '_MultiTenantFalkorDriver', MagicMock(),
+        )
+        monkeypatch.setattr(
+            graphiti_client_module, 'Graphiti', MagicMock(return_value=AsyncMock()),
+        )
+
+        backend = GraphitiBackend(mock_config)
+        backend.provision_registered_graphs = AsyncMock(side_effect=RuntimeError('boom'))
+        backend._run_startup_identity_scan = AsyncMock(return_value={})
+
+        await backend.initialize()  # must not raise
+
+        backend.provision_registered_graphs.assert_awaited_once_with()
+        backend._run_startup_identity_scan.assert_awaited_once()
+        assert backend.client is not None
 
 
 # ---------------------------------------------------------------------------
@@ -440,12 +490,12 @@ class TestInitializeSkipMaintenance:
 # uniqueness, or whether ID(e) enumeration + `WHERE ID(e) = $eid` keying
 # genuinely rewrites the intended edge while leaving the rest untouched.
 # These tests pin the true B5/B6 semantics against a REAL FalkorDB server,
-# mirroring test_merge_entities.py:1021-1131 (task 2207 W6-δ's own live
-# pin for the sibling redirect_node_edges fix).
+# mirroring test_merge_entities.py's TestRedirectNodeEdgesLiveFalkorDB (task
+# 2207 W6-δ's own live pin for the sibling redirect_node_edges fix).
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.skipif(not _falkor_available(), reason='FalkorDB not reachable')
+@falkor_skipif()
 @pytest.mark.timeout(15)
 @pytest.mark.integration
 class TestScanDuplicateEntityNamesLiveFalkorDB:
@@ -473,8 +523,11 @@ class TestScanDuplicateEntityNamesLiveFalkorDB:
             {'gid': graph_name},
         )
 
-        backend = GraphitiBackend(mock_config)
-        backend._driver = _MultiTenantFalkorDriver(host=FALKOR_HOST, port=FALKOR_PORT)
+        backend = GraphitiBackend.with_driver(
+            mock_config,
+            _MultiTenantFalkorDriver(host=FALKOR_HOST, port=FALKOR_PORT),
+            registered_graph_ids=(),
+        )
         try:
             with caplog.at_level(logging.WARNING, logger='fused_memory.backends.graphiti_client'):
                 result = await backend._scan_duplicate_entity_names(graph_name)
@@ -493,7 +546,7 @@ class TestScanDuplicateEntityNamesLiveFalkorDB:
             await backend.close()
 
 
-@pytest.mark.skipif(not _falkor_available(), reason='FalkorDB not reachable')
+@falkor_skipif()
 @pytest.mark.timeout(15)
 @pytest.mark.integration
 class TestRepairDuplicateEdgeUuidsLiveFalkorDB:
@@ -522,26 +575,18 @@ class TestRepairDuplicateEdgeUuidsLiveFalkorDB:
             "(:Entity {uuid: 'd', name: 'D'})"
         )
 
-        async def seed_edge(src, dst, edge_uuid, fact, embedding):
-            await graph.query(
-                'MATCH (a:Entity {uuid: $src}), (b:Entity {uuid: $dst}) '
-                'CREATE (a)-[e:RELATES_TO {uuid: $edge_uuid, name: $name, fact: $fact}]->(b) '
-                'SET e.fact_embedding = vecf32($embedding)',
-                {
-                    'src': src, 'dst': dst, 'edge_uuid': edge_uuid,
-                    'name': 'rel', 'fact': fact, 'embedding': embedding,
-                },
-            )
-
         # One distinct-uuid edge (must be left untouched) plus a
         # PRE-EXISTING dup-uuid pair ('dup') between two DIFFERENT node
         # pairs.
-        await seed_edge('a', 'b', 'distinct1', 'a relates to b', [1.0, 2.0])
-        await seed_edge('c', 'd', 'dup', 'c relates to d', [3.0, 4.0])
-        await seed_edge('a', 'd', 'dup', 'a relates to d', [5.0, 6.0])
+        await _seed_relates_to_edge(graph, 'a', 'b', 'distinct1', 'a relates to b', [1.0, 2.0])
+        await _seed_relates_to_edge(graph, 'c', 'd', 'dup', 'c relates to d', [3.0, 4.0])
+        await _seed_relates_to_edge(graph, 'a', 'd', 'dup', 'a relates to d', [5.0, 6.0])
 
-        backend = GraphitiBackend(mock_config)
-        backend._driver = _MultiTenantFalkorDriver(host=FALKOR_HOST, port=FALKOR_PORT)
+        backend = GraphitiBackend.with_driver(
+            mock_config,
+            _MultiTenantFalkorDriver(host=FALKOR_HOST, port=FALKOR_PORT),
+            registered_graph_ids=(),
+        )
         try:
             result = await backend._repair_duplicate_edge_uuids(graph_name)
             # (a) One dup-uuid group of size 2 -> re-mint 1, keep 1 survivor.
@@ -600,3 +645,99 @@ class TestRepairDuplicateEdgeUuidsLiveFalkorDB:
             assert dup_check2.result_set[0][0] == 0
         finally:
             await backend.close()
+
+    @pytest.mark.asyncio
+    async def test_repair_on_a_graph_deleted_after_listing_leaves_it_deleted(
+        self, mock_config, startup_scan_live_graph,
+    ):
+        """The startup scan lists a graph, then a teardown deletes it before
+        the repair visits it. The repair's detection must not recreate it."""
+        graph_name, graph = startup_scan_live_graph
+        await graph.query("CREATE (:Entity {uuid: 'v1', name: 'V'})")
+        await graph.delete()
+
+        backend = GraphitiBackend.with_driver(
+            mock_config,
+            _MultiTenantFalkorDriver(host=FALKOR_HOST, port=FALKOR_PORT),
+            registered_graph_ids=(),
+        )
+        client = FalkorDB(host=FALKOR_HOST, port=FALKOR_PORT)
+        try:
+            with contextlib.suppress(ResponseError):
+                await backend._repair_duplicate_edge_uuids(graph_name)
+            assert graph_name not in await client.list_graphs(), (
+                f'the identity scan detection materialized {graph_name!r}, '
+                f'a graph that had been deleted'
+            )
+        finally:
+            await backend.close()
+            await client.aclose()
+
+
+async def _seed_dup_uuid_pair(graph) -> None:
+    """Seed two RELATES_TO edges sharing the uuid 'dup', from one node to two others."""
+    await graph.query(
+        "CREATE (:Entity {uuid: 'a', name: 'A'}), "
+        "(:Entity {uuid: 'b', name: 'B'}), "
+        "(:Entity {uuid: 'c', name: 'C'})"
+    )
+    await _seed_relates_to_edge(graph, 'a', 'b', 'dup', 'a relates to b')
+    await _seed_relates_to_edge(graph, 'a', 'c', 'dup', 'a relates to c')
+
+
+async def _sweep_with_registry(mock_config, registered_graph_ids) -> dict:
+    backend = GraphitiBackend.with_driver(
+        mock_config,
+        _MultiTenantFalkorDriver(host=FALKOR_HOST, port=FALKOR_PORT),
+        registered_graph_ids=registered_graph_ids,
+    )
+    try:
+        return await backend._run_startup_identity_scan()
+    finally:
+        await backend.close()
+
+
+async def _edge_uuids_and_supersessions(graph) -> list[list]:
+    return (await graph.query(
+        'MATCH ()-[e:RELATES_TO]->() RETURN e.uuid, e.superseded_edge_uuid'
+    )).result_set
+
+
+@falkor_skipif()
+@pytest.mark.timeout(15)
+@pytest.mark.integration
+class TestStartupIdentityScanScopeLiveFalkorDB:
+    """Pin the sweep's scope against a REAL FalkorDB server's graph listing
+    (task 11326): a backend whose registry does not name a graph leaves that
+    graph's deliberately duplicated edge uuids exactly as seeded, and one whose
+    registry does name it still repairs them. The unregistered graph stands in
+    for a concurrent test's private graph on the shared scratch server; the
+    registered one proves the registry ids still match raw GRAPH.LIST names."""
+
+    @pytest.mark.asyncio
+    async def test_a_sweep_leaves_an_unregistered_graphs_dup_uuids_untouched(
+        self, mock_config, startup_scan_live_graph,
+    ):
+        _, graph = startup_scan_live_graph
+        await _seed_dup_uuid_pair(graph)
+
+        await _sweep_with_registry(mock_config, ())
+
+        assert await _edge_uuids_and_supersessions(graph) == [['dup', None], ['dup', None]]
+
+    @pytest.mark.asyncio
+    async def test_a_sweep_repairs_a_registered_graphs_dup_uuids(
+        self, mock_config, startup_scan_live_graph,
+    ):
+        graph_name, graph = startup_scan_live_graph
+        await _seed_dup_uuid_pair(graph)
+
+        stats = await _sweep_with_registry(mock_config, (graph_name,))
+
+        assert stats['graphs_scanned'] == 1
+        assert stats['edges_repaired'] == 1
+        rows = await _edge_uuids_and_supersessions(graph)
+        assert len(rows) == 2
+        assert {(edge_uuid == 'dup', superseded) for edge_uuid, superseded in rows} == {
+            (True, None), (False, 'dup'),
+        }

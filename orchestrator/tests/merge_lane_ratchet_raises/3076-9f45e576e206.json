@@ -1,0 +1,48 @@
+{
+  "task_id": "3076",
+  "reason": "net-additive \u03b4 work \u2014 lane_in_use refcount (only the last span out marks a lane idle) and the live-span-aware reset_stale_lane_in_use_records delegator",
+  "measures": [
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/git_ops.py",
+      "baseline": 1424,
+      "current": 1425
+    },
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/git_ops.py::GitOps::lane_in_use",
+      "baseline": 2,
+      "current": 3
+    },
+    {
+      "measure": "lines",
+      "key": "orchestrator/src/orchestrator/git_ops.py",
+      "baseline": 15882,
+      "current": 15905
+    },
+    {
+      "measure": "prose_lines",
+      "key": "orchestrator/src/orchestrator/git_ops.py",
+      "baseline": 9293,
+      "current": 9305
+    },
+    {
+      "measure": "total:cognitive",
+      "key": "<cluster>",
+      "baseline": 4843,
+      "current": 4844
+    },
+    {
+      "measure": "total:lines",
+      "key": "<cluster>",
+      "baseline": 57458,
+      "current": 57481
+    },
+    {
+      "measure": "total:prose_lines",
+      "key": "<cluster>",
+      "baseline": 31987,
+      "current": 31999
+    }
+  ]
+}

@@ -61,6 +61,20 @@ Write each memory as a separate `add_memory` call with the appropriate category:
 
 Use `agent_id: "claude-interactive"` (or whatever agent context you're in) and the correct `project_id`.
 
+Declare what each memory is about with `entities`. List the tasks it concerns, or pass `[]` when it concerns no task:
+
+```
+add_memory(
+  content="Task 3127's retry loop swallowed the timeout; we moved the deadline to the caller because the retries hid the real latency",
+  category="decisions_and_rationale",
+  project_id="dark_factory",
+  agent_id="claude-interactive",
+  entities=[{'kind': 'task', 'id': 3127}]
+)
+```
+
+Omitting `entities` always succeeds, so never drop a memory for fear of a rejection. The only write rejected is one whose declaration its own content contradicts.
+
 Write the content as a clear, standalone statement. Include enough context that the memory is useful without knowing which session produced it. For decisions, always include the reasoning — "we chose X" is nearly useless without "because Y".
 
 ### 4. Confirm

@@ -8,7 +8,7 @@ from dashboard.data.outcome_colors import assign_outcome_colors, classify_outcom
 # Step-1: reify leaf-signal — five cross-family codes all get distinct colors
 # ---------------------------------------------------------------------------
 
-# outcome_distribution sorts non-canonical codes alphabetically; the five reify
+# MergeAttempts.outcome_chart sorts non-canonical codes alphabetically; the five reify
 # codes are all non-canonical so they appear sorted:
 REIFY_LABELS = [
     'cas_retry',
@@ -146,12 +146,12 @@ _ALL_ENUMERATED_CODES: dict[str, list[str]] = {
     ],
 }
 
-# Canonical codes always emitted first (in this order) by outcome_distribution.
+# Canonical codes always emitted first (in this order) by MergeAttempts.outcome_chart.
 _CANONICAL_ORDER = ['done', 'conflict', 'blocked', 'already_merged']
 
 
 def _build_realistic_label_list() -> list[str]:
-    """Reproduce outcome_distribution ordering: canonical first, then sorted."""
+    """Reproduce MergeAttempts.outcome_chart ordering: canonical first, then sorted."""
     canonical_set = set(_CANONICAL_ORDER)
     all_codes = [c for codes in _ALL_ENUMERATED_CODES.values() for c in codes]
     remaining = sorted(c for c in all_codes if c not in canonical_set)
@@ -172,7 +172,7 @@ def test_every_enumerated_code_classifies_to_known_family():
 
 
 def test_realistic_label_set_no_adjacent_color_collision():
-    """The realistic outcome_distribution label ordering has no adjacent color collision."""
+    """The realistic MergeAttempts.outcome_chart label ordering has no adjacent color collision."""
     labels = _build_realistic_label_list()
     colors = assign_outcome_colors(labels)
     assert len(colors) == len(labels)
