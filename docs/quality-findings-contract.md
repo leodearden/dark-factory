@@ -186,7 +186,17 @@ metadata.x_finding_run   = "<run_id>"         # the run that filed it
 metadata.x_supersedes_task = <task id>        # only when §8 step 1c applies
 metadata.x_acceptance_reason = "<text>"       # only on an accepting task (§7), set when it is cancelled
 metadata.source          = "<instrument>"     # existing convention
+metadata.finding_set_hold = {ruling: "<who, when, which finding>"}
+                                              # only on a cleanup set a ruling says is not
+                                              # scheduled individually; holds it
 ```
+
+`finding_set_hold` is not Tier-C: it is a registered submodel
+(`shared/src/shared/followup_hold_records.py::FindingSetHold`), validated at
+the write boundary. Stamped on every member of a low cleanup set, it holds
+the set behind its project's follow-up holder on either filing path, the
+ticket path or `planning_mode` (`plans/follow-up-filing-shape-prd.md` §3
+decision 9).
 
 Before filing, in this order, and the report records the step that
 decided each finding:
@@ -200,6 +210,10 @@ decided each finding:
       `docs/task-authoring.md` §3.4), append the finding key to its
       `x_finding_key` with `update_task(metadata_mode='additive')`. That
       promotes it with `by=citation` (`ref` = the key), so it dispatches.
+      A held task carrying `finding_set_hold` is not appended to: it stays
+      held as a set, and an append would not promote it anyway (the
+      citation is deferred, `plans/follow-up-filing-shape-prd.md` §3
+      decision 14).
    b. A `cancelled` task carrying `x_acceptance_reason` → `accepted:<id>`;
       do not file. A `cancelled` task without it was abandoned, not
       accepted: treat as absent and continue to step 2.
@@ -209,7 +223,8 @@ decided each finding:
    `score_threshold ≥ 0.6`; its corpus excludes `deferred` tasks, which is
    why step 1 runs first. A plausible match is read with `get_task` before
    deciding. A plausible match on a held task gets the same append as in
-   step 1a and is recorded as `filed:<id>`.
+   step 1a, with the same exception for a task carrying `finding_set_hold`,
+   and is recorded as `filed:<id>`.
 3. **Curator.** The ticket path's own `candidate_key` dedup is the last net,
    never the first.
 

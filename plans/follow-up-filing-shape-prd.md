@@ -184,12 +184,20 @@ Lead's decisions under those rulings:
    allowed to import `shared.declared_scope`; verify admission, verify scope, the merge-lane disjoint
    skip, the verify-result cache, `agents/triage.py::is_declared_simple_task` and
    `routing.py` are outside it (heuristic 10).
-9. **Hold rule.** A created task is held iff (`metadata.source == 'agent-followup'` or
-   `metadata.spawn_context == 'review_suggestions'`) and priority in `{low, polish}` and
-   `task_kind` is `'normal'` or absent (an absent key reads as normal; reviewer suggestions are
-   code-filed without one) and no `execution_class` and no `prd_path` and no `x_finding_key`.
-   Simple follow-ups are held (same verify toll). A planning-mode birth is never held (a PRD
-   decompose is a citation by construction).
+9. **Hold rule.** A created task is held iff priority is in `{low, polish}`, `task_kind` is
+   `'normal'` or absent (an absent key reads as normal; reviewer suggestions are code-filed without
+   one), it has no `execution_class`, and one of two arms holds:
+   - **The uncited follow-up arm.** `metadata.source == 'agent-followup'` or
+     `metadata.spawn_context == 'review_suggestions'`, and no `prd_path`, no `x_finding_key` and no
+     `human_decomposed`. Simple follow-ups are held (same verify toll). A planning-mode birth is not
+     held by this arm (a PRD decompose is a citation by construction).
+   - **The finding-set arm** (amended 2026-11-26, §11). The task carries `x_finding_key` and a valid
+     `metadata.finding_set_hold {ruling}`, whatever its `source`, `prd_path` or `human_decomposed`.
+     The marker records a ruling that a review-finding cleanup set is not to be scheduled
+     individually. It is structured metadata the filing instrument stamps, never parsed from prose,
+     and a malformed marker holds nothing and logs one WARNING. Such a member is held at birth on
+     BOTH filing paths, the ticket path and `planning_mode`, so this arm is the one exception to "a
+     planning-mode birth is never held". The backfill (decision 12) holds it too.
 10. **Holder shape: deterministic pure gate with `deferred_watch`.** One per project, minted
     idempotently on first need: `task_kind='deterministic'`, `always_escalates=true`, no
     `before_done`, no dependencies, `execution_class='decision'`, priority low,
@@ -239,7 +247,9 @@ Lead's decisions under those rulings:
     sweep the deferral PRD routes through an interceptor `client_op_id`), for every
     `deferred → pending` landing, promoting the held dependencies of the task that just became
     pending;
-    `update_task` adding `x_finding_key` or `prd_path`; `_execute_combine` absorbing a candidate
+    `update_task` adding `x_finding_key` or `prd_path`, except a task carrying `finding_set_hold`:
+    its citation is deferred (`followup_promotion_deferred`, guard `finding_set_hold`) and it stays
+    held; every other cause promotes it as usual; `_execute_combine` absorbing a candidate
     outside the hold scope into a held target; the packing sweep and riders PRDs calling it; a human
     `remove_dependency(held, holder)` detected in the interceptor and recorded as `by=human`, and an
     `update_task` replacement `dependencies` list that drops the holder edge, recorded as
@@ -342,10 +352,17 @@ class PromotionRecord(BaseModel):
     at: str
     ref: str | None = None                # the dependent id, finding key, combining ticket, sweep run id
 
-def hold_scope(metadata: Mapping[str, object], priority: str, task_kind: str) -> bool     # decision 9, pure
+class FindingSetHold(BaseModel):          # metadata.finding_set_hold, caller-written at filing (decision 9)
+    ruling: str                           # non-empty: who ruled, when, on which finding
+
+def hold_scope(metadata: object, priority: object) -> bool     # decision 9, pure; both arms
 def ensure_holder(tm, project_root) -> int      # idempotent mint; refuses a second live marker
 def is_holder(task) -> bool
-def hold_at_create(kwargs, holder_id) -> None   # appends the edge + stamps followup_hold before tm.add_task
+def hold_at_create(kwargs, metadata, holder_id, *, held_at) -> tuple[dict, dict]
+    # the add_task kwargs with the holder edge appended, and the metadata with followup_hold stamped
+async def hold_birth(tm, project_root, holders, kwargs, metadata) -> tuple[dict, object, int | None]
+    # hold_scope, then ensure_holder and hold_at_create; both creation paths (the ticket create
+    # branch and planning_mode) call it under the write lock; holder id None when not held
 def backfill(tm, project_root) -> int           # backend-direct under _write_lock; one event per project
 HoldEmit = Callable[[EventType, Mapping[str, object]], Awaitable[None]]
     # journals one hold event; a caller outside the interceptor (the packer, γ's rider_carry and
@@ -385,12 +402,14 @@ interfaces `submit_task`, `resolve_ticket`, `get_task`, `add_dependency`, `remov
 | 4 | three same-parent tickets in one worker batch, two combinable | worker drains them together | one task created, one ticket `combined`, one created; the combined task's items are the union; audit row `batch_internal: true`; `declared_scope.basis == 'combine'` on the survivor |
 | 5 | a combine whose batch target is itself a drop | curator emits combine→B, B is drop→C | A degrades to create with `batch-target-not-create` in the audit; nothing lost |
 | 6 | a submission supplies `declared_scope` | any | refused with `DeclaredScopeWriteAuthorityError`; nothing filed |
-| 7 | a medium follow-up, a PRD leaf (planning_mode), and a task with `x_finding_key` are filed | holder exists | none of the three carries the holder edge |
+| 7 | a medium follow-up, a PRD leaf (planning_mode), and a task with `x_finding_key` and no `finding_set_hold` are filed | holder exists | none of the three carries the holder edge |
+| 7b | a low finding-set member carrying `finding_set_hold` is filed by the ticket path, and another by `planning_mode` | any | both carry the holder edge and a `followup_held` event, and stay held after `commit_planning` |
 | 8 | `add_dependency(new_task, held)` from a pending task | scenario 1 | `held` is ready next tick; `followup_hold.promoted.by == 'dependent'`; `pending_since` unchanged; event emitted |
 | 9 | `add_dependency(deferred_batch_task, held)` then the batch task reaches pending by `commit_planning`, by a plain `set_task_status`, or by the deferral-flip path | planning batch | not promoted at the edge; promoted at the flip by every one of the three paths, `by == 'dependent'` |
 | 9b | X is held, X depends on held H, X is promoted by citation | both held; X has no other unmet dependency | H is promoted too, `by == 'dependent'`, `ref == X`; X is a dispatch candidate next tick |
 | 10 | a parent edge is added between two held follow-ups (6072 shape) | both held | neither promoted on insert |
-| 11 | `update_task(held, metadata gains x_finding_key)` | scenario 1 | promoted `by == 'citation'`, `ref == the key` |
+| 11 | `update_task(held, metadata gains x_finding_key)` on a held task without `finding_set_hold` | scenario 1 | promoted `by == 'citation'`, `ref == the key` |
+| 11b | `update_task(held finding-set member, metadata gains x_finding_key)` | scenario 7b | still held; `followup_promotion_deferred{guard: finding_set_hold, by: citation}`; a human `remove_dependency(held, holder)` then promotes it `by == 'human'` |
 | 12 | a medium candidate combines into a held target | held target pending | target promoted `by == 'combine'`; items merged |
 | 13 | a human `remove_dependency(held, holder)` | scenario 1 | task ready; `promoted.by == 'human'`; event emitted |
 | 14 | `set_task_status(holder, 'cancelled')` without `release_holder` | 1,332 held | refused with `FollowupHolderProtectedError{held_count: 1332}`; no L1 filed; event emitted |
@@ -407,7 +426,7 @@ interfaces `submit_task`, `resolve_ticket`, `get_task`, `add_dependency`, `remov
 | other PRD / document | direction | seam mechanism | owner | status |
 |---|---|---|---|---|
 | `plans/cancel-with-children-prd.md` (8142 in progress, 8143–8148 pending) | consumes | holder cancel refusal before 8147 enforces; a `repoint` / `fold` of a held child of a cancelled parent moves only the parent edge and leaves the holder edge; `keep` leaves it held | this PRD owns the refusal (ε); that PRD owns dispositions; ζ adds one sentence to its §4.2 seam list as a companion correction | queued |
-| `docs/quality-findings-contract.md` §8 step 1a | this PRD edits | a step-1/step-2 match on a held task appends `x_finding_key` and promotes `by=citation` | this PRD (ζ) | queued |
+| `docs/quality-findings-contract.md` §8 step 1a | this PRD edits | a step-1/step-2 match on a held task appends `x_finding_key` and promotes `by=citation`; a cleanup set a ruling says is not scheduled individually is filed with `finding_set_hold`, is not appended to, and a citation would not promote it (decision 9's finding-set arm, decision 14's exception) | this PRD (ζ; the finding-set exception by task 11873) | queued |
 | the packing sweep PRD (option B, next) | produces for | `followup_hold` + `declared_scope.band` as the pack candidate pool; `merge_items` on fold; `promote(by='pack')` | that PRD owns the packer; this PRD owns the records it reads | to author |
 | the riders PRD (option C) | produces for | `promote(by='rider')`; held pool ∩ host lock set | that PRD | to author |
 | reify alpha-spine Ω 9739 | coexists | double edges (Ω + holder) are AND, harmless; Ω's resolve offers "re-park behind the next holder": the follow-up holder is the destination for the follow-up share | reify spine PRD | wired |
@@ -577,3 +596,27 @@ Companion corrections:
 - 6072 was annotated with the composition rule: the parent edge and the holder edge are ANDed, and a
   parent edge never promotes on insert.
 - 3260 was annotated: γ never writes `metadata.files` from a combine.
+
+## 11. Amendment record (2026-11-26)
+
+Leo's ruling item 705 resolves esc-10746-2. That escalation came from esc-8417-1: the 2026-11-12
+cleanup set 9494-9501, filed from one `/review-all` finding (`fk-c0932f0b7df1`) with
+`source='review-all'`, `x_finding_key`, priority low and `human_decomposed` (a planning-mode birth),
+was ruled not to be scheduled individually, yet decision 9 could not hold it on three counts: the
+source, the finding key and the planning birth, so the set dispatched individually.
+
+Task 11873 implements the ruling:
+
+- Decision 9 gains the finding-set arm, keyed on the registered marker `metadata.finding_set_hold
+  {ruling}` (`shared/src/shared/followup_hold_records.py::FindingSetHold`). The uncited follow-up arm
+  is unchanged.
+- The planning-mode creation path applies the hold too, through
+  `fused-memory/src/fused_memory/middleware/followup_hold.py::hold_birth`, which the ticket create
+  branch also calls. Without it a marked set would dispatch at `commit_planning` and be caught only by
+  the next restart's backfill.
+- Decision 14's citation trigger gains its exception: `followup_hold.py::_first_deferral` defers a
+  `citation` of a marked task before any registered guard runs. Without it the next instrument run
+  that re-observes the finding would promote each member by citation (`docs/quality-findings-contract.md`
+  §8 step 1a). `dependent` still promotes, so no pending dependent of a set member jams silently;
+  `human` is the release, and `pack` is the intended future drain.
+- Boundary rows 7 and 11 are narrowed to unmarked tasks, and rows 7b and 11b are added.

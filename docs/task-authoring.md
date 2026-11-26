@@ -866,20 +866,25 @@ local dependency edge, until a promotion removes that edge. The contract is
 `plans/follow-up-filing-shape-prd.md` §3 decisions 9–15 and §4.3. The one
 implementation is `fused-memory/src/fused_memory/middleware/followup_hold.py`.
 
-**The hold rule** (`followup_hold.py::hold_scope`). A task is held if all of
-these are true:
+**The hold rule** (`followup_hold.py::hold_scope`). A task is held if its
+priority is `low` or `polish`, its `task_kind` is `normal` or absent, it
+carries no `execution_class`, and one of two arms matches:
 
-- it was filed as a follow-up: `metadata.source == 'agent-followup'` or
-  `metadata.spawn_context == 'review_suggestions'`;
-- its priority is `low` or `polish`;
-- its `task_kind` is `normal` or absent;
-- it carries none of `execution_class`, `prd_path`, `x_finding_key` or
-  `human_decomposed`.
+- **an uncited follow-up**: it was filed as a follow-up
+  (`metadata.source == 'agent-followup'` or
+  `metadata.spawn_context == 'review_suggestions'`) and carries none of
+  `prd_path`, `x_finding_key` or `human_decomposed`;
+- **a finding-set member**: it carries `x_finding_key` and a valid
+  `metadata.finding_set_hold {ruling}`, whatever its `source`, `prd_path`
+  or `human_decomposed`. The marker records a ruling that a review-finding
+  cleanup set is not to be scheduled individually; `ruling` names who ruled,
+  when, and on which finding. A malformed marker holds nothing and logs one
+  WARNING naming `finding_set_hold`.
 
-Every planning-mode birth carries `human_decomposed`, so a PRD decompose is
-never held. Neither is a task that a finding cites. To keep a follow-up out
-of the hold, file it at a higher priority, or attach the finding key or PRD
-that makes it wanted.
+Every planning-mode birth carries `human_decomposed`, so the first arm never
+holds a PRD decompose, and neither arm holds a task that a finding cites
+unless it carries the marker. To keep a follow-up out of the hold, file it at
+a higher priority, or attach the finding key or PRD that makes it wanted.
 
 **Held means a dependency edge on the holder.** The edge decides whether a
 task is held now. `metadata.followup_hold`
@@ -896,7 +901,11 @@ its `followup_hold` record is written in the same `add_task`, so the
 scheduler never sees it ready. A `followup_held {task_id, holder_id}` event
 is journaled beside `task_created`, and the ticket's stored outcome
 (`result_json`) carries `held_by`, the holder's id; `resolve_ticket` does
-not return it. The holder is minted the first time a project needs one, and
+not return it. A `planning_mode` submission the rule matches, which can only
+be a marked finding-set member, is born `deferred` AND held the same way and
+journals the same `followup_held` event, so the set stays held after
+`commit_planning`. Both paths share one helper,
+`followup_hold.py::hold_birth`. The holder is minted the first time a project needs one, and
 its mint journals a `task_created` event with `source:
 'followup-holder-mint'`, whether a filing or the backfill minted it.
 
@@ -976,6 +985,12 @@ Every trigger runs under the project's write lock:
 - **A citation** (`by: citation`, `ref`: the first finding key, else the PRD
   path): an `update_task` on a held task whose metadata payload carries
   `x_finding_key` or `prd_path`, the keys that keep a filing out of the hold.
+  A held task carrying `finding_set_hold` is the exception: its citation is
+  deferred before any registered guard runs, journaling
+  `followup_promotion_deferred` with `guard: finding_set_hold` and a reason
+  naming the ruling, and it stays held. Every other cause below promotes it
+  as usual; a human removal or the explicit release is how the set leaves the
+  hold.
 - **A combine** (`by: combine`, `ref`: the candidate's ticket id): the
   curator combining a candidate the hold rule does not match into a held
   target. A candidate the rule matches leaves its held target held.
@@ -1936,7 +1951,10 @@ writes them: the mint writes the marker, and the hold at filing and the
 startup backfill write the record. A held task's `followup_hold.promoted`
 (`by` one of `dependent`, `citation`, `combine`, `pack`, `rider`, `human`) is
 the history of its release. The dependency edge on the holder, not this
-record, decides whether the task is held now.
+record, decides whether the task is held now. `finding_set_hold` is a third
+registered submodel (`shared/src/shared/followup_hold_records.py::FindingSetHold`,
+cardinality dict), written by the filing instrument at filing and not by
+`followup_hold.py`, which only reads it (§3.4).
 
 `claimant_exception` is the machine ledger entry
 `{claimant_run_id, target_status, agent_id, tag, stamped_at}`. The
