@@ -22,6 +22,8 @@ from fused_memory.middleware.curator_types import DEFAULT_PRIORITY
 from fused_memory.middleware.task_curator import (
     _PRIORITY_RANK,
     BACKFILL_DEFAULT_CONCURRENCY,
+    BACKFILL_MAX_CONSECUTIVE_FAILED_BATCHES,
+    BACKFILL_UPSERT_ATTEMPTS,
     BACKFILL_UPSERT_BATCH_SIZE,
     BackfillResult,
     TaskCurator,
@@ -134,6 +136,11 @@ class RecordingEmbedder:
             return self._vector
         finally:
             self.in_flight -= 1
+
+
+def _every_attempt_from(first_call: int) -> frozenset[int]:
+    """The upsert call indices of every attempt at a batch first tried as call *first_call*."""
+    return frozenset(range(first_call, first_call + BACKFILL_UPSERT_ATTEMPTS))
 
 
 def _titled_tasks(count: int, *, title_chars: int = 20, description_chars: int = 20) -> list[dict]:
@@ -342,32 +349,102 @@ class TestBackfillBatching:
             await curator.close()
 
     @staticmethod
-    async def _backfill_in_threes(
-        tasks: list[dict], embedder: RecordingEmbedder, *, fail_calls: frozenset[int],
-    ) -> tuple[BackfillResult, int, RecordingQdrant]:
-        """Backfill *tasks* 3 points a batch, refusing the listed upsert calls.
+    async def _backfill_batched(
+        tasks: list[dict],
+        embedder: RecordingEmbedder,
+        qdrant: RecordingQdrant,
+        *,
+        batch_size: int = 3,
+    ) -> tuple[BackfillResult, int]:
+        """Backfill *tasks* over *qdrant*, *batch_size* points a batch.
 
-        Returns the result, the persisted corpus count and the Qdrant double.
+        Returns the result and the persisted corpus count.
         """
-        qdrant = RecordingQdrant(fail_calls=fail_calls)
         curator = in_memory_corpus_curator(embedder, qdrant_client=qdrant)
         try:
-            result = await curator.backfill_corpus(tasks, 'proj', batch_size=3)
-            return result, await curator.corpus_count('proj'), qdrant
+            result = await curator.backfill_corpus(tasks, 'proj', batch_size=batch_size)
+            return result, await curator.corpus_count('proj')
         finally:
             await curator.close()
 
     @pytest.mark.asyncio
     async def test_refused_middle_batch_costs_only_its_own_points(self):
         embedder = RecordingEmbedder()
-        result, persisted, qdrant = await self._backfill_in_threes(
-            _titled_tasks(7), embedder, fail_calls=frozenset({1}),
-        )
+        qdrant = RecordingQdrant(fail_calls=_every_attempt_from(1))
+        result, persisted = await self._backfill_batched(_titled_tasks(7), embedder, qdrant)
 
         assert result == BackfillResult(upserted=4, skipped=0, errors=3)
         assert persisted == 4
-        assert qdrant.upsert_sizes == [3, 3, 1]
+        assert qdrant.upsert_sizes == [3, *[3] * BACKFILL_UPSERT_ATTEMPTS, 1]
         assert embedder.calls == 7
+
+    @pytest.mark.asyncio
+    async def test_transient_upsert_failure_is_retried_without_re_embedding(self):
+        embedder = RecordingEmbedder()
+        qdrant = RecordingQdrant(fail_calls=frozenset({1}))
+        result, persisted = await self._backfill_batched(_titled_tasks(7), embedder, qdrant)
+
+        assert result == BackfillResult(upserted=7, skipped=0, errors=0)
+        assert persisted == 7
+        assert qdrant.upsert_sizes == [3, 3, 3, 1]
+        assert embedder.calls == 7
+
+    @staticmethod
+    def _failed_batches_then_two_more() -> list[dict]:
+        """Enough 3-task batches to reach the stop threshold, then two batches more."""
+        return _titled_tasks(3 * (BACKFILL_MAX_CONSECUTIVE_FAILED_BATCHES + 2))
+
+    @pytest.mark.asyncio
+    async def test_systemic_upsert_refusal_stops_the_run_unembedded(self, caplog):
+        tasks = self._failed_batches_then_two_more()
+        embedder = RecordingEmbedder()
+        qdrant = RecordingQdrant(max_request_bytes=0)
+        with caplog.at_level(logging.ERROR, logger=_CURATOR_LOGGER):
+            result, persisted = await self._backfill_batched(tasks, embedder, qdrant)
+
+        failed_batches = BACKFILL_MAX_CONSECUTIVE_FAILED_BATCHES
+        attempted = 3 * failed_batches
+        assert result == BackfillResult(upserted=0, skipped=0, errors=len(tasks))
+        assert persisted == 0
+        assert embedder.calls == attempted
+        assert qdrant.upsert_sizes == [3] * (failed_batches * BACKFILL_UPSERT_ATTEMPTS)
+        errors = [
+            record for record in caplog.records
+            if record.name == _CURATOR_LOGGER and record.levelno == logging.ERROR
+        ]
+        assert len(errors) == 1
+        message = errors[0].getMessage()
+        assert 'project=proj' in message
+        assert 'stopped' in message
+        assert f'{len(tasks) - attempted} tasks not attempted' in message
+
+    @pytest.mark.asyncio
+    async def test_embedder_outage_stops_the_run_too(self):
+        tasks = self._failed_batches_then_two_more()
+        embedder = RecordingEmbedder(fail_marker='Task')
+        qdrant = RecordingQdrant()
+        result, persisted = await self._backfill_batched(tasks, embedder, qdrant)
+
+        assert result == BackfillResult(upserted=0, skipped=0, errors=len(tasks))
+        assert persisted == 0
+        assert embedder.calls == 3 * BACKFILL_MAX_CONSECUTIVE_FAILED_BATCHES
+        assert qdrant.upsert_sizes == []
+
+    @pytest.mark.asyncio
+    async def test_failed_batches_short_of_the_threshold_in_a_row_do_not_stop_the_run(self):
+        run = [*['failing'] * (BACKFILL_MAX_CONSECUTIVE_FAILED_BATCHES - 1), 'landing']
+        tasks = [
+            _make_task(str(i), title=f'{kind.upper()} task {i}')
+            for i, kind in enumerate(run * 2)
+        ]
+        embedder = RecordingEmbedder(fail_marker='FAILING')
+        result, persisted = await self._backfill_batched(
+            tasks, embedder, RecordingQdrant(), batch_size=1,
+        )
+
+        assert result == BackfillResult(upserted=2, skipped=0, errors=len(tasks) - 2)
+        assert persisted == 2
+        assert embedder.calls == len(tasks)
 
     @pytest.mark.asyncio
     async def test_run_interrupted_in_the_last_batch_keeps_the_batches_before_it(self):
@@ -392,8 +469,9 @@ class TestBackfillBatching:
             _make_task('refused', title='EMBED-REFUSED task'),
             *_titled_tasks(5),
         ]
-        result, persisted, qdrant = await self._backfill_in_threes(
-            tasks, RecordingEmbedder(fail_marker='EMBED-REFUSED'), fail_calls=frozenset({0}),
+        qdrant = RecordingQdrant(fail_calls=_every_attempt_from(0))
+        result, persisted = await self._backfill_batched(
+            tasks, RecordingEmbedder(fail_marker='EMBED-REFUSED'), qdrant,
         )
 
         assert result.skipped == 1
@@ -404,8 +482,9 @@ class TestBackfillBatching:
     @pytest.mark.asyncio
     async def test_refused_batch_logs_one_warning_naming_it(self, caplog):
         with caplog.at_level(logging.WARNING, logger=_CURATOR_LOGGER):
-            await self._backfill_in_threes(
-                _titled_tasks(7), RecordingEmbedder(), fail_calls=frozenset({1}),
+            await self._backfill_batched(
+                _titled_tasks(7), RecordingEmbedder(),
+                RecordingQdrant(fail_calls=_every_attempt_from(1)),
             )
 
         warnings = [

@@ -372,6 +372,12 @@ BACKFILL_UPSERT_BATCH_SIZE = 128
 BACKFILL_DEFAULT_CONCURRENCY = 10
 """Most embedding calls a backfill keeps in flight unless told otherwise."""
 
+BACKFILL_UPSERT_ATTEMPTS = 3
+"""Most times a backfill sends one batch's upsert before writing its points off."""
+
+BACKFILL_MAX_CONSECUTIVE_FAILED_BATCHES = 3
+"""Batches in a row landing no point after which a backfill stops embedding the rest."""
+
 
 @dataclass
 class PruneResult:
@@ -2100,10 +2106,15 @@ class TaskCurator:
 
         The corpus is written in batches of at most *batch_size* points: each
         slice of tasks is embedded, then upserted, before the next slice is
-        embedded. A batch whose upsert fails is logged, its points are counted
-        in ``errors``, and the run continues with the next slice. Idempotent:
-        uses the same deterministic UUID5 point-ID scheme as record_task(), so
-        a rerun re-upserts the same points, including a failed batch's.
+        embedded. A batch's upsert is sent up to ``BACKFILL_UPSERT_ATTEMPTS``
+        times with its embeddings in hand; a batch it never lands is logged,
+        its points are counted in ``errors``, and the run continues with the
+        next slice. After ``BACKFILL_MAX_CONSECUTIVE_FAILED_BATCHES`` batches
+        in a row land no point, whether every upsert attempt was refused or
+        every embed failed, the run logs one ERROR and stops: the tasks left
+        are counted in ``errors`` without being embedded. Idempotent: uses the
+        same deterministic UUID5 point-ID scheme as record_task(), so a rerun
+        re-upserts the same points, including a failed batch's.
 
         Args:
             tasks: Flat list of task dicts (as returned by flatten_task_tree).
@@ -2133,7 +2144,18 @@ class TaskCurator:
         embed_slots = asyncio.Semaphore(concurrency)
         batches = [titled[start:start + batch_size] for start in range(0, len(titled), batch_size)]
 
+        failed_in_a_row = 0
         for number, batch in enumerate(batches, start=1):
+            if failed_in_a_row == BACKFILL_MAX_CONSECUTIVE_FAILED_BATCHES:
+                unattempted = sum(len(rest) for rest in batches[number - 1:])
+                result.errors += unattempted
+                logger.error(
+                    'task_curator: backfill_corpus project=%s stopped before batch %d/%d: '
+                    '%d batches in a row landed no point; %d tasks not attempted, '
+                    'counted as errors',
+                    project_id, number, len(batches), failed_in_a_row, unattempted,
+                )
+                break
             embedded = await asyncio.gather(*(
                 self._backfill_point(task, project_id, embedder, embed_slots) for task in batch
             ))
@@ -2144,6 +2166,7 @@ class TaskCurator:
             )
             result.upserted += landed
             result.errors += len(batch) - landed
+            failed_in_a_row = 0 if landed else failed_in_a_row + 1
             if landed:
                 logger.info(
                     'task_curator: backfill_corpus project=%s batch %d/%d upserted, '
@@ -2167,19 +2190,34 @@ class TaskCurator:
         number: int,
         total: int,
     ) -> int:
-        """Upsert one backfill batch; how many of *points* landed: all of them, or 0 (logged)."""
+        """Upsert one backfill batch; how many of *points* landed: all of them, or 0 (logged).
+
+        A failed attempt is retried at once, up to ``BACKFILL_UPSERT_ATTEMPTS``
+        attempts in all. Resending is safe: point ids are deterministic, so an
+        attempt that landed server-side but failed client-side is overwritten
+        with the same points.
+        """
         if not points:
             return 0
-        try:
-            await client.upsert(collection_name=collection, points=points)
-        except Exception:
-            logger.warning(
-                'task_curator: backfill_corpus project=%s batch %d/%d of %d points '
-                'failed to upsert',
-                project_id, number, total, len(points), exc_info=True,
-            )
-            return 0
-        return len(points)
+        for attempt in range(1, BACKFILL_UPSERT_ATTEMPTS + 1):
+            try:
+                await client.upsert(collection_name=collection, points=points)
+            except Exception as exc:
+                if attempt == BACKFILL_UPSERT_ATTEMPTS:
+                    logger.warning(
+                        'task_curator: backfill_corpus project=%s batch %d/%d of %d points '
+                        'failed to upsert after %d attempts',
+                        project_id, number, total, len(points), attempt, exc_info=True,
+                    )
+                else:
+                    logger.info(
+                        'task_curator: backfill_corpus project=%s batch %d/%d upsert '
+                        'attempt %d/%d failed, retrying: %r',
+                        project_id, number, total, attempt, BACKFILL_UPSERT_ATTEMPTS, exc,
+                    )
+            else:
+                return len(points)
+        return 0
 
     async def _backfill_point(
         self,
