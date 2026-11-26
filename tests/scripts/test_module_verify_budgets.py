@@ -208,21 +208,17 @@ REPO_ROOT = pathlib.Path(__file__).parents[2]
 #                 and (f) the cold fall-through. Do not infer a measurement floor
 #                 here that does not exist.
 #
-#   shared        W was RE-MEASURED by task 5131 under a real NINE-WAY gather
-#                 at base 1b3c50e98f, so unlike the other entries drawn from
-#                 the task-3473 sweep it is NOT from the 5a7770d239 epoch. Collection grew 3243 ->
-#                 4802 (+48%) over that epoch, but the worst-run wall clock
-#                 grew only ~35.5% (219.08s -> 296.88s) — LESS than the count
-#                 ratio predicts. Do NOT scale this figure by a test-count
-#                 ratio next time it goes stale — RE-MEASURE instead. That
-#                 same +48% growth also makes
-#                 MEASURED_FLEET_SEGMENT_SECS['shared'] = 120.21 in
-#                 test_fallback_verify_config.py (n=1, 2026-07-31, task 3062)
-#                 known-stale by the same evidence — a DIFFERENT command
-#                 feeding a DIFFERENT floor (task 4902 precedent keeps the
-#                 two tables separate homes), so it is not corrected here;
-#                 filed as a follow-up re-measure (tkt_0RTA9W8FEYMNAC7RQ4Y0QR857R)
-#                 instead.
+#   shared        W is the worst GREEN run of the verbatim test_command in the
+#                 verify archive: task 8254 attempt 1, merge role, read on
+#                 2026-11-26 by `scripts/timeout_headroom_selfcheck.py
+#                 --dry-run` (task 11824). Like fused-memory's, it is a
+#                 PRODUCTION figure, not a hand sweep. RE-MEASURE by repeating
+#                 that dry-run, never by scaling; every run and its summary
+#                 path is in shared/orchestrator.yaml's provenance block. The
+#                 different-command MEASURED_FLEET_SEGMENT_SECS['shared'] =
+#                 120.21 in test_fallback_verify_config.py is known-stale and
+#                 kept a separate home (task 4902 precedent); its re-measure
+#                 is tkt_0RTA9W8FEYMNAC7RQ4Y0QR857R.
 #
 #   orchestrator  NOT SIZED LIKE ANY OTHER ENTRY HERE, in two ways, both
 #                 deliberate.
@@ -279,21 +275,18 @@ REPO_ROOT = pathlib.Path(__file__).parents[2]
 #
 # ONE METHODOLOGICAL LIMIT ON FOUR ENTRIES. The concurrent arm of the task-3473
 # sweep was a 6-WAY wave, and four entries still come from it: escalation,
-# dashboard, sampler and cockpit. `shared` was RE-MEASURED under a real
-# NINE-WAY gather (task 5131, see its entry above) — production's own gather
-# width. Production's ``verify.run_full_verification`` gathers over EVERY
-# registered module config — nine today, including the dominant `orchestrator`
-# segment — so for those four the measured wave remains a LOWER BOUND on the
-# fully-concurrent cost, not a reproduction of it. See the same note in each
-# of those four yamls' provenance blocks for what bounds the gap; shared's own
-# provenance block records the nine-way gather directly, so no such note
-# applies there. Nor does it apply to `orchestrator` or `fused-memory`, whose
-# figures did not come from that sweep AT ALL — each is a fleet census of
-# production verify runs (see their entries above), so the 6-way/9-way
-# distinction is not the axis their error bars lie on — nor to `client-feed`,
-# re-measured separately by task 11846.
+# dashboard, sampler and cockpit. Production's
+# ``verify.run_full_verification`` gathers over EVERY registered module
+# config, including the dominant `orchestrator` segment, so for those four the
+# measured wave remains a LOWER BOUND on the fully-concurrent cost, not a
+# reproduction of it. See the same note in each of those four yamls'
+# provenance blocks for what bounds the gap. It does not apply to `shared`,
+# `orchestrator` or `fused-memory`, whose figures did not come from that sweep
+# AT ALL — each is drawn from production verify runs (see their entries
+# above), so the 6-way/9-way distinction is not the axis their error bars lie
+# on — nor to `client-feed`, re-measured separately by task 11846.
 MEASURED_MODULE_SUITE_WORST_SECS: dict[str, float] = {
-    'shared': 296.88,
+    'shared': 1060.1538237752393,
     'escalation': 354.56,
     'fused-memory': 1695.0841336008161,
     'dashboard': 653.54,

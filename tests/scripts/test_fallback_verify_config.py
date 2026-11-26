@@ -715,7 +715,7 @@ POST_CAP_ORCHESTRATOR_GREEN_N = 28
 # collection growth; re-measure ticket tkt_0RTA9W8FEYMNAC7RQ4Y0QR857R) and
 # `escalation` OVER-states (task 5408 moved it to xdist: 49.63s vs 123.29s
 # serial). 5131's own 296.88 is the WORST run of a different command under
-# contention (test_module_verify_budgets.py::MEASURED_MODULE_SUITE_WORST_SECS)
+# contention (then test_module_verify_budgets.py::MEASURED_MODULE_SUITE_WORST_SECS)
 # and does not belong in a table of representative green runs. The sum still
 # reads as a lower bound on the median chain, because the omitted suites'
 # 5408-measured cost (dashboard 95.07 + cockpit 16.78) exceeds escalation's
