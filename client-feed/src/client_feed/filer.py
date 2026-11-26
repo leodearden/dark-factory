@@ -53,7 +53,8 @@ MAX_BACKOFF_SECONDS: Final = 300
 
 _UNCONVERGED_LINE: Final = '%s not converged: %s refused (%s, %s), %s after %d attempts'
 _STALLED_LINE: Final = (
-    '%s stalled: %s refused (%s, %s), %s after %d attempts; it is retried every pass and needs an operator'
+    '%s stalled: %d attempts refused, the last by %s (%s); this pass %s refused (%s, %s), %s;'
+    ' it is retried every pass and needs an operator'
 )
 
 _COUNTED: Final = frozenset({Disposition.FALLBACK, Disposition.RETRY_THEN_FALLBACK})
@@ -66,7 +67,7 @@ _WITHDRAWABLE: Final = frozenset(
 
 
 class Unconverged(BaseModel):
-    """A ref the pass could not bring to its final state, the refusal that stopped it, and whether its attempts reached the stall bound."""
+    """A ref the pass could not bring to its final state, the refusal that stopped it, and its record's attempts, the step and code that last counted one, and whether they reached the stall bound."""
 
     model_config = ConfigDict(frozen=True, extra='forbid')
 
@@ -76,6 +77,8 @@ class Unconverged(BaseModel):
     code: str
     disposition: Disposition
     attempts: int
+    last_tool: str | None
+    last_code: str | None
     stalled: bool
 
 
@@ -329,6 +332,8 @@ def _unconverged(ref: str, refused: ToolRefused, record: RefRecord | None) -> Un
         code=refused.code,
         disposition=refused.disposition,
         attempts=0 if record is None else record.attempts,
+        last_tool=None if record is None else record.last_tool,
+        last_code=None if record is None else record.last_code,
         stalled=record is not None and record.stalled,
     )
 
@@ -455,10 +460,13 @@ def run_pass(policy: Policy, tools: ClosedTools, cursor: FilerCursor) -> tuple[P
 
 
 def _log_unconverged(report: PassReport) -> None:
-    """One line per unconverged ref each pass: a WARNING, or an ERROR naming an operator once the ref is stalled."""
+    """One line per unconverged ref each pass: a WARNING, or once the ref is stalled an ERROR naming an operator and the counted refusal that stalled it."""
     for item in report.unconverged:
-        level, line = (logging.ERROR, _STALLED_LINE) if item.stalled else (logging.WARNING, _UNCONVERGED_LINE)
-        logger.log(level, line, item.ref, item.tool, item.kind, item.code, item.disposition, item.attempts)
+        refusal = (item.tool, item.kind, item.code, item.disposition)
+        if item.stalled:
+            logger.error(_STALLED_LINE, item.ref, item.attempts, item.last_tool, item.last_code, *refusal)
+        else:
+            logger.warning(_UNCONVERGED_LINE, item.ref, *refusal, item.attempts)
 
 
 def file_once(policy: Policy, *, open_tools: OpenTools) -> PassReport:
