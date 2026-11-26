@@ -39,9 +39,9 @@ from orchestrator.review_payload import (
 
 _REVIEWER = 'reviewer_comprehensive'
 
-_BLOCKING = {'severity': 'blocking', 'description': 'b1', 'location': 'm/x.py:1'}
-_SUGGESTION_1 = {'severity': 'suggestion', 'description': 's1', 'location': 'm/x.py:2'}
-_SUGGESTION_2 = {'severity': 'suggestion', 'description': 's2', 'location': 'm/x.py:3'}
+_BLOCKING = {'kind': 'defect', 'severity': 'blocking', 'description': 'b1', 'location': 'm/x.py:1'}
+_SUGGESTION_1 = {'kind': 'defect', 'severity': 'suggestion', 'description': 's1', 'location': 'm/x.py:2'}
+_SUGGESTION_2 = {'kind': 'defect', 'severity': 'suggestion', 'description': 's2', 'location': 'm/x.py:3'}
 
 
 def _payload(verdict: str = 'ISSUES_FOUND', issues: list | None = None) -> dict:
@@ -83,8 +83,8 @@ class TestNormalizeReview:
         assert normalize_review(envelope) == normalize_review(payload)
 
     def test_every_non_blocking_issue_is_a_suggestion(self):
-        nit = {'severity': 'nit', 'description': 'n'}
-        unrated = {'description': 'u'}
+        nit = {'kind': 'defect', 'severity': 'nit', 'description': 'n'}
+        unrated = {'kind': 'defect', 'description': 'u'}
         payload = normalize_review(
             _payload(issues=[dict(_BLOCKING), dict(_SUGGESTION_1), nit, unrated]),
         )

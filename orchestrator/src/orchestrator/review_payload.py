@@ -8,7 +8,7 @@ from enum import StrEnum
 from typing import Any, ClassVar, TypeVar
 
 from escalation.disposition import ReviewerDisposition
-from shared.defects import MalformedDefectRef, RulingSubject, parse_ref
+from shared.defects import MalformedDefectRef, RulingSubject, issue_kind_of, parse_ref
 
 from orchestrator.review_issue_contract import IssueField, IssueSeverity, parse_severity
 
@@ -254,6 +254,16 @@ def _verdict(payload: Mapping[str, Any]) -> Verdict:
         ) from None
 
 
+def _with_kind_reading(issue: dict[str, Any]) -> dict[str, Any]:
+    """A copy of *issue* recording ``kind_flag`` when its kind reads fail-closed as ``defect``.
+
+    The written ``kind`` stays as received, so every later ``issue_kind_of`` reader
+    flags the same issue the same way.
+    """
+    reading = issue_kind_of(issue)
+    return {**issue, 'kind_flag': reading.flag.value} if reading.flag else dict(issue)
+
+
 def _issues(payload: Mapping[str, Any]) -> tuple[dict[str, Any], ...]:
     raw = payload.get('issues')
     if raw is None:
@@ -263,7 +273,7 @@ def _issues(payload: Mapping[str, Any]) -> tuple[dict[str, Any], ...]:
             f'review from {payload.get("reviewer")!r} has issues {raw!r} '
             f'({type(raw).__name__}); expected a list'
         )
-    return tuple(dict(issue) if isinstance(issue, dict) else issue for issue in raw)
+    return tuple(_with_kind_reading(issue) if isinstance(issue, dict) else issue for issue in raw)
 
 
 def normalize_review(artifact: object) -> ReviewPayload:
