@@ -20,23 +20,10 @@
 #   description_substrings: list[str]  — AT LEAST ONE must appear in
 #                           candidate description+details (case-insensitive)
 #
-# Detection axis (task 2687): a candidate whose metadata.execution_class is
-# "operational" or "decision" routes to the deterministic PURE-GATE
-# UNCONDITIONALLY — regardless of these substring entries, regardless of
-# title/description wording, and regardless of the "fix"/"bug"/"crash"/
-# "implement" safety net described below. operational_ask_registry.py's
-# match_candidate() checks this axis FIRST: an explicit recon-stage
-# execution_class declaration is authoritative and wording-independent, so
-# e.g. a title containing "fix" does not suppress the route when the
-# candidate is explicitly tagged execution_class='operational' (motivating
-# case: task 2686). execution_class='code_tdd' or unset candidates are
-# unaffected by this axis and fall through to the substring entries below.
-# Caveat: "unconditionally" describes match_candidate()'s own logic once it
-# runs. TaskCurator._maybe_route_deterministic still requires THIS FILE to
-# load successfully with at least one entry before it ever calls
-# match_candidate — a missing/unreadable/unparseable/empty registry (or an
-# unconfigured registry path) disables the execution_class axis too, failing
-# open to the architect the same as every other case in that state.
+# Tagged asks (task δ): match_candidate() skips a candidate whose
+# metadata.execution_class is "operational" or "decision"; the submit
+# boundary routes it instead. See the module docstring of
+# fused-memory/src/fused_memory/middleware/operational_ask_registry.py.
 #
 # Guidance for operators adding new entries:
 #   - Use a tight title anchor: prefer the specific script/tool/namespace name
@@ -49,7 +36,14 @@
 #     such as FalkorDB) as a description anchor: code tasks about that script
 #     carry it too. Prefer a phrase only the live-data ask uses ("untagged",
 #     "production FalkorDB"). Pinned by
-#     tests/test_operational_ask_registry.py::TestSeedOperationalAskRegistry.
+#     fused-memory/tests/test_operational_ask_registry.py::TestSeedOperationalAskRegistry.
+#     Two older entries still break this rule and are left as they are:
+#     rebuild_entity_summaries_project_wide ("stale", "backfill") and
+#     knowlive_namespace_purge_apply ("--apply", "namespace"). In task
+#     10112's census of the live task store they matched only their own
+#     asks (1946; 1939) and 1937, which built the knowlive script: now that
+#     the script exists, a re-proposal of 1937's work is operational.
+#     Tighten either one the first time it routes a code task.
 #   - Only add an entry once an operational ask of that shape has RECURRED —
 #     a one-off ask should go through the architect's normal
 #     unactionable-report path so a human can decide whether it deserves a
@@ -80,7 +74,6 @@
     - "prune_recon_cycle_summaries"
   description_substrings:
     - "untagged"
-    - "pre-existing pile"
 
 - name: merge_entities_live_graph
   reason: >
