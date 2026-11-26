@@ -36,7 +36,7 @@ def _data(event: Event) -> Mapping[str, Any]:
     return data if isinstance(data, Mapping) else {}
 
 
-def _instant(raw: object) -> datetime | None:
+def parse_instant(raw: object) -> datetime | None:
     """An events-table timestamp as tz-aware UTC, or None when absent or unparseable."""
     if not isinstance(raw, str) or not raw:
         return None
@@ -48,7 +48,7 @@ def _instant(raw: object) -> datetime | None:
 
 
 def _at(event: Event) -> datetime | None:
-    return _instant(event.get('timestamp'))
+    return parse_instant(event.get('timestamp'))
 
 
 def _number(raw: object) -> float | None:

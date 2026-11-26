@@ -101,17 +101,7 @@ TaskMoment = tuple[datetime, str]
 
 def _moments(conn: sqlite3.Connection, sql: str, params: tuple[object, ...]) -> list[TaskMoment]:
     rows = conn.execute(sql, params).fetchall()
-    return [(moment, str(task)) for raw, task in rows if (moment := _parse_instant(raw)) is not None]
-
-
-def _parse_instant(raw: object) -> datetime | None:
-    if not isinstance(raw, str):
-        return None
-    try:
-        parsed = datetime.fromisoformat(raw)
-    except ValueError:
-        return None
-    return parsed.replace(tzinfo=UTC) if parsed.tzinfo is None else parsed.astimezone(UTC)
+    return [(moment, str(task)) for raw, task in rows if (moment := canary.parse_instant(raw)) is not None]
 
 
 _PHASE_ROWS = (
@@ -292,7 +282,7 @@ _HANDLERS: tuple[tuple[re.Pattern[str], Handler], ...] = (
 
 def _handle(acc: _JournalAccumulator, line: str) -> bool:
     parsed = _JOURNAL_LINE.match(line)
-    moment = None if parsed is None else _parse_instant(parsed['at'])
+    moment = None if parsed is None else canary.parse_instant(parsed['at'])
     if parsed is None or moment is None or parsed['level'] not in canary.AuditLevel.__members__:
         return False
     for pattern, handler in _HANDLERS:
