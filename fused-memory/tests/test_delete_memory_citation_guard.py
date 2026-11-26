@@ -1966,3 +1966,117 @@ class TestChildRefusalPrecedesAnyRepoint:
 
         assert result['status'] == 'deleted'
         service.refuse_if_children.assert_not_awaited()
+
+
+class TestIgnoredOverrideNoteAdvertisesOnlyARealRemedy:
+    """A non-boolean override is always NAMED, but "resend it" only where it helps.
+
+    The note telling a caller to resend allow_dangling_citations as JSON true
+    is advice, and advice into a wall is worse than none. On a
+    CitationReplacement* refusal taking the override would strand live citers
+    the caller has a survivor for; CitationScanFailed cannot be unlocked by it
+    at all. Only a refusal for which the override is the documented remedy may
+    advertise the resend.
+    """
+
+    @pytest.fixture
+    def mock_service(self):
+        return _make_service()
+
+    @pytest.fixture
+    def interceptor(self):
+        return _make_interceptor([
+            _task('1701', 'pending', {'mem0_canonical_entry': DOOMED}),
+        ])
+
+    @pytest.fixture
+    def mcp_server(self, mock_service, interceptor):
+        return create_mcp_server(
+            mock_service, task_interceptor=interceptor, known_projects=KNOWN_PROJECTS,
+        )
+
+    @staticmethod
+    def _assert_named_but_no_resend(result, value):
+        assert result['ignored_override'] == {'allow_dangling_citations': value}
+        assert 'Resend it as JSON true' not in result['hint']
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('value', ['yes', 1, 'true'])
+    async def test_a_malformed_replacement_is_not_told_to_resend(
+        self, mcp_server, mock_service, value,
+    ):
+        result = await _call_delete(
+            mcp_server,
+            agent_id='claude-interactive',
+            replacement_memory_id=SURVIVOR[:8],
+            metadata={'allow_dangling_citations': value},
+        )
+
+        assert result['error_type'] == 'CitationReplacementInvalid'
+        self._assert_named_but_no_resend(result, value)
+        assert 'copy it from the search result' in result['hint']
+        mock_service.delete_memory.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('value', ['yes', 1, 'true'])
+    async def test_an_unresolvable_replacement_is_not_told_to_resend(
+        self, mcp_server, mock_service, value,
+    ):
+        result = await _call_delete(
+            mcp_server,
+            agent_id='claude-interactive',
+            replacement_memory_id=HALLUCINATED,
+            metadata={'allow_dangling_citations': value},
+        )
+
+        assert result['error_type'] == 'CitationReplacementNotFound'
+        self._assert_named_but_no_resend(result, value)
+        assert "Re-read the surviving entry's id" in result['hint']
+        mock_service.delete_memory.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('value', ['yes', 1, 'true'])
+    async def test_a_scan_failure_is_not_told_to_resend(self, mock_service, value):
+        interceptor = _make_interceptor([])
+        interceptor.get_tasks = AsyncMock(side_effect=RuntimeError('task db unreachable'))
+        mcp_server = create_mcp_server(
+            mock_service, task_interceptor=interceptor, known_projects=KNOWN_PROJECTS,
+        )
+
+        result = await _call_delete(
+            mcp_server,
+            agent_id='claude-interactive',
+            metadata={'allow_dangling_citations': value},
+        )
+
+        assert result['error_type'] == 'CitationScanFailed'
+        self._assert_named_but_no_resend(result, value)
+        mock_service.delete_memory.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('value', ['yes', 1, 'true'])
+    async def test_a_cascade_blocked_only_by_missing_repoints_is_told_to_resend(
+        self, value,
+    ):
+        """Positive control: every blocked[] entry is CitationRepointRequired,
+        for which the override is the documented remedy."""
+        service = _make_service(descendants=[CHILD])
+        interceptor = _make_interceptor([
+            _task('1711', 'pending', {'mem0_canonical_entry': CHILD}),
+            _task('1712', 'pending', {'mem0_canonical_entry': DOOMED}),
+        ])
+        mcp_server = create_mcp_server(
+            service, task_interceptor=interceptor, known_projects=KNOWN_PROJECTS,
+        )
+
+        result = await _call_delete(
+            mcp_server,
+            cascade=True,
+            metadata={'allow_dangling_citations': value},
+        )
+
+        assert result['error_type'] == 'CascadeCitationGateRejected'
+        assert {b['error_type'] for b in result['blocked']} == {'CitationRepointRequired'}
+        assert result['ignored_override'] == {'allow_dangling_citations': value}
+        assert 'Resend it as JSON true' in result['hint']
+        service.delete_memory.assert_not_awaited()
