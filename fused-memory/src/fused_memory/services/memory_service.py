@@ -9396,9 +9396,13 @@ class MemoryService:
                 # The child's OWN subtree went first, so its ids precede it
                 # here — the same deepest-first order the deletes actually
                 # ran in. Dropping this frame's return value would report
-                # A→B→C as having destroyed only B.
-                deleted.extend(child_result.get('cascaded_child_ids') or [])
-                deleted.append(child_id)
+                # A→B→C as having destroyed only B. A child that vanished
+                # before its own delete (MemoryNotFound) was not destroyed by
+                # this cascade, so it is not reported; one that genuinely
+                # survived is still caught by the re-count below.
+                if child_result.get('status') == 'deleted':
+                    deleted.extend(child_result.get('cascaded_child_ids') or [])
+                    deleted.append(child_id)
 
         if await self._count_children(memory_id, project_id=project_id):
             survivors = [
