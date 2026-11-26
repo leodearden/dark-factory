@@ -20,10 +20,11 @@ the repo ``.env``), and replaces them with ``shared.secret_redaction``'s
 same-length placeholders. It reads only regular files, and skips those
 modified within ``min_age_secs``, which a live session or test run may still
 be appending to. A sweep that redacted or refused anything files one
-``risk_identified`` info escalation, and a sweep that could not run, found a
-required root absent, could not read an orchestrator unit or found no unit
-naming a project root files one ``infra_issue`` info escalation naming each
-shortfall. A dry run (``--dry-run``) rewrites and files nothing and lists what
+``risk_identified`` info escalation, whose detail lists refused lines first and
+one by one, then summarises redacted files by directory; a sweep that could
+not run, found a required root absent, could not read an orchestrator unit or
+found no unit naming a project root files one ``infra_issue`` info escalation
+naming each shortfall. A dry run (``--dry-run``) rewrites and files nothing and lists what
 a real run would redact under ``matched``. On a host with no orchestrator
 units (the laptop), ``--host-configs-dir`` takes project roots from its verify
 configs, whose transcript archive is not required (a verify host archives no
