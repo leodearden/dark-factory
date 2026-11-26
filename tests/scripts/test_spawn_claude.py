@@ -1586,6 +1586,78 @@ def test_failed_to_start_detected_on_detached_exit0(tmp_path: pathlib.Path) -> N
         )
 
 
+def _write_mktemp_recorder(bin_dir: pathlib.Path, log: pathlib.Path) -> None:
+    """Shadow `mktemp`, appending each name it prints to *log* unchanged.
+
+    Same delegation shape as _write_mv_recorder: the real binary is resolved
+    once and exec'd by absolute path, so the shim cannot recurse into itself.
+    """
+    real_mktemp = shutil.which("mktemp")
+    assert real_mktemp is not None, "no real `mktemp` on PATH to delegate to"
+    assert not real_mktemp.startswith(str(bin_dir)), (
+        f"the recorder must delegate to the real mktemp, not itself: {real_mktemp!r}"
+    )
+    p = bin_dir / "mktemp"
+    p.write_text(
+        "#!/usr/bin/env bash\n"
+        f"name=$({shlex.quote(real_mktemp)} \"$@\") || exit $?\n"
+        f"printf '%s\\n' \"$name\" >> {shlex.quote(str(log))}\n"
+        "printf '%s\\n' \"$name\"\n"
+    )
+    p.chmod(0o755)
+
+
+def _write_fts_marker_planting_terminal(
+    bin_dir: pathlib.Path, name: str, mktemp_log: pathlib.Path
+) -> None:
+    """A detaching launcher that creates the reserved `.fts` marker
+    ZERO-LENGTH -- the state the watchdog's `>` leaves between open() and
+    write() -- then exits 0 without running the payload.
+    """
+    p = bin_dir / name
+    p.write_text(
+        "#!/usr/bin/env bash\n"
+        f"m=$(grep -m1 -E '\\.fts$' {shlex.quote(str(mktemp_log))})\n"
+        "if [[ -z \"$m\" ]]; then\n"
+        "  echo 'fts-planting terminal: no .fts reservation recorded' >&2\n"
+        "  exit 1\n"
+        "fi\n"
+        ": > \"$m\"\n"
+        "exit 0\n"
+    )
+    p.chmod(0o755)
+
+
+def test_empty_failed_to_start_marker_yields_144_not_bash_usage_2(
+    tmp_path: pathlib.Path,
+) -> None:
+    """An empty failed-to-start marker must still exit EXIT_FAILED_TO_START.
+
+    The marker is gated on existence but was read for content, so a read
+    landing before the watchdog's write gave `exit ""` -> bash's 2 (offline-lane
+    pass 20261125T230534-1e3e47: "line 1048: exit: : numeric argument
+    required"). Sibling of the task-5137 sentinel-content tests.
+    """
+    bin_dir = _make_bin_dir(tmp_path)
+    mktemp_log = tmp_path / "mktemp_names"
+    _write_mktemp_recorder(bin_dir, mktemp_log)
+    _write_fts_marker_planting_terminal(bin_dir, "custom-term", mktemp_log)
+    env = _sentinel_test_env(bin_dir, "custom-term", tmp_path)
+    # Far above the run: the real watchdog never writes the marker, so the
+    # planted empty file is the only one. _cleanup kills the watchdog on exit.
+    env["SPAWN_STARTED_GRACE_SECS"] = "600"
+
+    result = _run_spawn(env, tmp_path)
+
+    stderr = result.stderr.decode()
+    assert result.returncode == 144, (
+        "an empty failed-to-start marker must still yield EXIT_FAILED_TO_START "
+        f"(144), never bash's usage code 2: got {result.returncode}\n"
+        f"stderr: {stderr}"
+    )
+    assert b"numeric argument required" not in result.stderr, stderr
+
+
 # ===========================================================================
 # Task 2733 step-3/4: _load_scaled_grace -- load-adaptive SPAWN_STARTED_GRACE_SECS
 # ===========================================================================
