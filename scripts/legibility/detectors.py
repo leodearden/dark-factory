@@ -10,10 +10,10 @@ disagree with the other (plans/confusion-reduction-prd.md §7.2.4).
 It also holds the parses of what a user turn carries: its text
 (:func:`user_turn_text`), the one grammar for Claude Code's slash-command
 markup (:func:`parse_slash_command_expansion`, which
-check_transcript_persistence also uses), and the gold-only rule for a turn
-the client composed (:func:`is_client_rendered_turn`), which
-:func:`record_hits` never asks. Imports only :mod:`legibility.reingestion`
-and :mod:`legibility.inventory`.
+check_transcript_persistence also uses), and the rule for a turn the client
+composed (:func:`is_client_rendered_turn`), which :func:`dialogue_turn_text`
+asks and :func:`record_hits` never does. Imports only
+:mod:`legibility.reingestion` and :mod:`legibility.inventory`.
 """
 from __future__ import annotations
 
@@ -267,9 +267,9 @@ def is_client_rendered_turn(text: str) -> bool:
     slash command with no typed args, one local command's output echo, or the
     bare interrupt marker, so it holds no prose a human typed.
 
-    Asked by the gold-turn filter only, never by :func:`is_non_dialogue_carrier`:
-    the interrupt marker is this session's own INTERRUPT signal, which the
-    dialogue carriers must keep.
+    Asked by :func:`dialogue_turn_text` only, never by
+    :func:`is_non_dialogue_carrier`: the interrupt marker is this session's
+    own INTERRUPT signal, which the dialogue carriers must keep.
     """
     expansion = parse_slash_command_expansion(text)
     if expansion is not None:
@@ -667,12 +667,14 @@ def dialogue_turn_text(record: Mapping[str, Any]) -> str | None:
     other record: the single rule behind the digest's gold user turns and
     n_user_turns, and the classifier's INTERACTIVE.
 
-    Main chain only, since no human types on a sub-agent's chain.
+    Main chain only, since no human types on a sub-agent's chain. A turn the
+    client composed from a UI action (:func:`is_client_rendered_turn`) is not
+    one a human addressed either.
     """
     if not is_primary_user_turn(record):
         return None
     text = user_turn_text(record)
-    if text is None or is_non_dialogue_carrier(record, text):
+    if text is None or is_non_dialogue_carrier(record, text) or is_client_rendered_turn(text):
         return None
     return text
 
