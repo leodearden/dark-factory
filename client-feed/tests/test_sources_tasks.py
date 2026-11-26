@@ -426,9 +426,16 @@ class TestDefectCarriers:
             carrier(6, gated=True, waits_on_deferred_gate=(gate_status == 'deferred')),
         )
 
-    @pytest.mark.parametrize('status', ['pending', 'in-progress', 'blocked', 'review'])
+    @pytest.mark.parametrize(
+        'status',
+        [
+            s
+            for s in TaskStatus
+            if s not in {TaskStatus.DEFERRED, TaskStatus.DONE, TaskStatus.CANCELLED}
+        ],
+    )
     def test_an_unfinished_carrier_behind_a_deferred_gate_for_its_ref_waits_on_it(
-        self, root: Path, tasks: TasksDb, status: str
+        self, root: Path, tasks: TasksDb, status: TaskStatus
     ) -> None:
         tasks.add(5, status='deferred', updated_at=LATE, metadata=gate_for(FIX))
         tasks.add(6, status=status, updated_at=LATE, metadata=carrying(FIX), depends_on=(5,))

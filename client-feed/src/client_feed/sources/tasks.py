@@ -258,7 +258,7 @@ class _Gate(NamedTuple):
     deferred: bool
 
 
-def _carrying(status: str) -> TaskStatus | None:
+def _carrying_status(status: str) -> TaskStatus | None:
     """The status of a task that carries its reports: any but deferred; an unknown status carries nothing."""
     try:
         task_status = TaskStatus(status)
@@ -272,7 +272,7 @@ def _lowest_holders(held: list[tuple[int, str, str]], *, project_id: str) -> dic
     lowest: dict[str, _Holder] = {}
     for task_id, status, ref in held:
         named = parse_portal_ref(ref, project_id=project_id)
-        carrying = _carrying(status)
+        carrying = _carrying_status(status)
         if named is not None and carrying is not None:
             holder = _Holder(task_id, named, carrying)
             lowest[ref] = min(lowest.get(ref, holder), holder)
