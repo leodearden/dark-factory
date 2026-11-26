@@ -78,6 +78,20 @@ def _not_planning_hold(task: Mapping[str, Any], task_id: str) -> Reply | None:
     }
 
 
+def _holder_protected(task_id: int, status: str, held_count: int) -> Reply:
+    """set_task_status's refusal to release a follow-up holder, shaped as followup_hold.py::FollowupHolderProtectedError.to_error_dict."""
+    return {
+        'success': False,
+        'error': 'followup_holder_protected',
+        'error_type': 'FollowupHolderProtectedError',
+        'holder_id': str(task_id),
+        'attempted_status': status,
+        'protection': 'protected_status',
+        'held_count': held_count,
+        'hint': _HOLDER_PROTECTED_HINT,
+    }
+
+
 def _assign_status(task: dict[str, Any], status: str) -> None:
     """A status change; leaving deferred clears the deferral record, as fused-memory's deferral gate does."""
     task['status'] = status
@@ -451,20 +465,6 @@ class FakeFusedMemory:
         status = arguments['status']
         held_count = self._holders.get(task['id'])
         if held_count is not None and status in _HOLDER_PROTECTED_STATUSES and arguments.get('release_holder') is not True:
-            return self._holder_protected(task['id'], status, held_count)
+            return _holder_protected(task['id'], status, held_count)
         _assign_status(task, status)
         return {'success': True, 'task_id': str(task['id']), 'status': task['status']}
-
-    @staticmethod
-    def _holder_protected(task_id: int, status: str, held_count: int) -> Reply:
-        """set_task_status's refusal to release a follow-up holder, shaped as followup_hold.py::FollowupHolderProtectedError.to_error_dict."""
-        return {
-            'success': False,
-            'error': 'followup_holder_protected',
-            'error_type': 'FollowupHolderProtectedError',
-            'holder_id': str(task_id),
-            'attempted_status': status,
-            'protection': 'protected_status',
-            'held_count': held_count,
-            'hint': _HOLDER_PROTECTED_HINT,
-        }

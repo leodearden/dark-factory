@@ -340,9 +340,9 @@ def test_a_symlinked_inbox_is_named_unusable_holds_the_cursor_and_calls_nothing(
 RAW_CANARY = 'CANARY-RAW-11881'
 
 
-def _rejection_warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
+def _rejection_warnings(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
     return [
-        record.getMessage()
+        record
         for record in caplog.records
         if record.name == 'client_feed.filer' and record.levelno == logging.WARNING and 'rejected' in record.getMessage()
     ]
@@ -363,7 +363,7 @@ def test_rejected_inbox_lines_are_logged_with_their_offsets_and_never_their_text
     assert report.rejected_lines == 1
     assert report.converged == (REF,)
     [rejection] = _rejection_warnings(caplog)
-    assert all(token in rejection for token in (PROJECT, '1', str(offset)))
+    assert rejection.args == (PROJECT, 1, str(offset))
     assert all(RAW_CANARY not in record.getMessage() for record in caplog.records)
     caplog.clear()
     with caplog.at_level(logging.WARNING, logger='client_feed.filer'):
