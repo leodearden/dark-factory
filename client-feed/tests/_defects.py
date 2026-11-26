@@ -91,10 +91,22 @@ def add_dependency(tasks: TasksDb, task_id: int, depends_on: int, *, tag: str = 
         conn.close()
 
 
-def carrier_for(ref: str, *, project_id: str, task_id: int, gated: bool = False) -> DefectCarrier:
+def carrier_for(
+    ref: str,
+    *,
+    project_id: str,
+    task_id: int,
+    gated: bool = False,
+    waits_on_deferred_gate: bool = False,
+) -> DefectCarrier:
     """The carrier of `ref`, its block and report read back through the one ref rule."""
     named = parse_portal_ref(ref, project_id=project_id)
     assert named is not None, f'{ref} is no portal ref of {project_id}'
     return DefectCarrier(
-        ref=ref, block=named.block, report=named.report, task_id=task_id, gated=gated
+        ref=ref,
+        block=named.block,
+        report=named.report,
+        task_id=task_id,
+        gated=gated,
+        waits_on_deferred_gate=waits_on_deferred_gate,
     )
