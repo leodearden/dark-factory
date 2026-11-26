@@ -357,7 +357,9 @@ routing:
     # Listed LAST, deliberately: first-match-wins means a large-plan retry
     # matches large-plan-steps/large-plan-modules FIRST and keeps their opus +
     # max_turns=120 headroom (retry-tier-up sets no max_turns). Placing it
-    # before them would strip that headroom from large-plan retries.
+    # before them would strip that headroom from large-plan retries. On
+    # experiment 1's arm 1 a 3-module, <12-step plan is not a large plan, so
+    # its retry lands here: opus at the role's configured max_turns.
     #
     # Inert at tier 0 (min_routing_tier>=1), so the default-tier resolution is
     # byte-equivalent to pre-mu (invariant 3) -- a fresh dispatch never matches

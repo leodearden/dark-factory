@@ -194,3 +194,24 @@ class TestLargePlanRetryKeepsHeadroom:
         assert decision.model == 'opus'
         assert decision.max_turns == 120
         assert decision.source_layer == 'policy_rule'
+
+
+class TestExperimentOneArmOneRetry:
+    """Experiment 1 of plans/routing-experiment-substrate-prd.md: on arm 1 a
+    3-module, under-12-step plan matches no large-plan rule, so its retry
+    takes retry-tier-up -- opus at the role's configured max_turns. On
+    retries the arms then differ in turns only."""
+
+    def test_tier1_three_module_plan_takes_retry_tier_up_without_headroom(self):
+        cfg = OrchestratorConfig()
+        task_id = task_id_in_rule_arm(cfg, 'large-plan-modules-4')
+        decision = resolve_route(
+            _inputs(
+                'implementer', routing_tier=1, plan_shape=LARGE_MODULES_PLAN, task_id=task_id,
+            ),
+            cfg,
+        )
+
+        assert decision.rule_id == RULE_ID
+        assert decision.model == 'opus'
+        assert decision.max_turns == cfg.max_turns.implementer
