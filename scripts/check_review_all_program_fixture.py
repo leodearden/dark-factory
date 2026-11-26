@@ -33,7 +33,6 @@ FIXTURE_DIR = PROGRAM_DIR / 'fixture'
 FIXTURE_RETURNS = FIXTURE_DIR / 'returns'
 FIXTURE_PROGRAM = FIXTURE_DIR / 'program.json'
 FAKE_STORE = FIXTURE_DIR / 'fake_store.py'
-RUN_ID: str = json.loads(FIXTURE_PROGRAM.read_text(encoding='utf-8'))['run_id']
 
 ISOLATION_FLAGS = ('-I', '-S')
 ISOLATED_ENV_NAMES = frozenset({'PATH', 'HOME', 'REVIEW_ALL_HOME', 'FUSED_MEMORY_URL'})
@@ -52,6 +51,10 @@ class ScenarioFailed(Exception):
     def __init__(self, invariant: str, diagnostics: str = '') -> None:
         super().__init__(invariant)
         self.diagnostics = diagnostics
+
+
+class CannotRun(Exception):
+    """The walk cannot start at all: main prints why and exits 2."""
 
 
 @dataclass(frozen=True)
@@ -309,6 +312,7 @@ class ProgramRun:
     root: Path
     store_url: str
     journal: Journal
+    run_id: str
 
     @property
     def homes_root(self) -> Path:
@@ -324,7 +328,7 @@ class ProgramRun:
 
     @property
     def home(self) -> Path:
-        return self.homes_root / RUN_ID
+        return self.homes_root / self.run_id
 
     @property
     def render(self) -> Path:
@@ -392,14 +396,15 @@ def _fresh_run_root(scratch: Path, name: str) -> Path:
 
 @dataclass(frozen=True)
 class Walk:
-    """One walk: its journal, its scratch root and the shared store over the pristine fixture."""
+    """One walk: its journal, its scratch root, the shared store over the pristine fixture, and its run id."""
 
     journal: Journal
     scratch: Path
     store_url: str
+    run_id: str
 
     def new_run(self, name: str) -> ProgramRun:
-        return ProgramRun(_fresh_run_root(self.scratch, name), self.store_url, self.journal)
+        return ProgramRun(_fresh_run_root(self.scratch, name), self.store_url, self.journal, self.run_id)
 
     @contextlib.contextmanager
     def own_run(self, name: str, store_fixture: str, *flags: str) -> Iterator[ProgramRun]:
@@ -408,7 +413,7 @@ class Walk:
         store = root / 'store.json'
         shutil.copyfile(FIXTURE_DIR / store_fixture, store)
         with serving(self.journal, store, *flags, scratch=root) as url:
-            yield ProgramRun(root, url, self.journal)
+            yield ProgramRun(root, url, self.journal, self.run_id)
 
 
 @dataclass(frozen=True)
@@ -479,7 +484,7 @@ def _expect_author_applied(run: ProgramRun, applied: Invocation) -> str:
 
 
 def _expect_seam_candidates(run: ProgramRun) -> None:
-    scanned = expect_exit(run.run('seam_scan.py', 'S1', '--run', RUN_ID), 0, 'seam_scan.py lists S1 candidates')
+    scanned = expect_exit(run.run('seam_scan.py', 'S1', '--run', run.run_id), 0, 'seam_scan.py lists S1 candidates')
     rows = _candidate_rows(scanned.stdout)
     expect('metadata.files' in rows.get(SEAM_DECLARER, ''),
            f'seam_scan names task {SEAM_DECLARER}, declaring a touched path in metadata.files', scanned)
@@ -531,7 +536,7 @@ def b3_decompose_rejected(walk: Walk) -> str:
 
 
 def _expect_scan_repaths(run: ProgramRun) -> None:
-    scan = expect_exit(run.run('clerk_batch.py', 'write', '--run', RUN_ID, '--scan'), 0,
+    scan = expect_exit(run.run('clerk_batch.py', 'write', '--run', run.run_id, '--scan'), 0,
                        'clerk_batch.py write --scan')
     ledger = run.ledger()
     repaths = {line['task']: line for line in ledger
@@ -556,7 +561,7 @@ def _held_leaf() -> dict[str, Any]:
 
 def _expect_held_on_roster(run: ProgramRun) -> str:
     leaf = _held_leaf()
-    roster = expect_exit(run.run('program_doc.py', '--run', RUN_ID, '--roster'), 0, 'program_doc.py --roster')
+    roster = expect_exit(run.run('program_doc.py', '--run', run.run_id, '--roster'), 0, 'program_doc.py --roster')
     held = [line for line in roster.stdout.splitlines() if line.startswith(f'held {leaf["task_id"]} ')]
     expect(len(held) == 1 and f'release owner {leaf["release_owner"]}' in held[0],
            f'--roster lists held leaf {leaf["task_id"]} with release owner {leaf["release_owner"]}', roster)
@@ -593,7 +598,7 @@ def _decomposed_s1(run: ProgramRun) -> ProgramRun:
 
 
 def _render(run: ProgramRun, *args: str | Path) -> Invocation:
-    return run.run('program_doc.py', '--run', RUN_ID, *args)
+    return run.run('program_doc.py', '--run', run.run_id, *args)
 
 
 def _rendered_text(run: ProgramRun, *args: str | Path) -> str:
@@ -710,7 +715,7 @@ CORRECTED_GATE_DEPS = [101, 104, 106]
 
 
 def _gate_check(run: ProgramRun) -> Invocation:
-    return run.run('gate_check.py', '--run', RUN_ID)
+    return run.run('gate_check.py', '--run', run.run_id)
 
 
 def _names_task(invocation: Invocation, verdict: str, task_id: int) -> bool:
@@ -734,7 +739,7 @@ def _expect_interim_gate(walk: Walk) -> None:
                f"the last line reads 'gate {GATE}: correct'", correct)
         edit_store(run.own_store, {GATE: None})
         absent = expect_exit(_gate_check(run), 3, 'with no gate the check reports its own state, apart from defective')
-        expect(f'no human_gate task carries trigger_chain.run_id = {RUN_ID}' in absent.stdout.splitlines(),
+        expect(f'no human_gate task carries trigger_chain.run_id = {run.run_id}' in absent.stdout.splitlines(),
                'gate_check says no human_gate task carries the run', absent)
 
 
@@ -744,7 +749,7 @@ def _expect_final_gate(walk: Walk) -> None:
         defective = expect_exit(_gate_check(run), 1, f'final gate {GATE} over an untagged program task is defective')
         expect(_names_task(defective, 'escapes the completion measure', ESCAPEE),
                f'gate_check reports task {ESCAPEE} escaping the completion measure', defective)
-        edit_store(run.own_store, {ESCAPEE: {'metadata': {'x_finding_run': RUN_ID}}})
+        edit_store(run.own_store, {ESCAPEE: {'metadata': {'x_finding_run': run.run_id}}})
         expect_exit(_gate_check(run), 0, f'the final gate is correct once task {ESCAPEE} carries the run')
 
 
@@ -776,7 +781,7 @@ UNKNOWN_ACTION = 'A99'
 
 def b13_clerk_ingest(walk: Walk) -> str:
     run = _decomposed_s1(walk.new_run('b13-ingest'))
-    expect_exit(run.run('clerk_batch.py', 'write', '--run', RUN_ID), 0, 'clerk_batch.py write')
+    expect_exit(run.run('clerk_batch.py', 'write', '--run', run.run_id), 0, 'clerk_batch.py write')
     batch_ids = [action['id'] for action in read_json(run.home / 'actions' / 'batch-1.json')['actions']]
     expect(len(batch_ids) >= 2, f'batch-1 carries at least two actions, not {batch_ids}')
     applied, skipped = batch_ids[:2]
@@ -800,7 +805,7 @@ def b13_clerk_ingest(walk: Walk) -> str:
 
 def _rule(run: ProgramRun, ruling: str, *extra: str, by: str = 'human') -> Invocation:
     return run.run(
-        'record.py', 'rule', '--run', RUN_ID, '--by', by, '--question', 'Does alpha or beta own C1?',
+        'record.py', 'rule', '--run', run.run_id, '--by', by, '--question', 'Does alpha or beta own C1?',
         '--ruling', ruling, '--source', 'fixture walk', '--option', 'a', '--option', 'b',
         '--consequence', 'c', *extra,
     )
@@ -829,7 +834,7 @@ def _program_stream(stream_id: str) -> dict[str, Any]:
 
 
 def _brief(run: ProgramRun, *args: str) -> Invocation:
-    return run.run('gen_brief.py', '--run', RUN_ID, *args)
+    return run.run('gen_brief.py', '--run', run.run_id, *args)
 
 
 def _json_objects(text: str) -> list[Any]:
@@ -845,11 +850,32 @@ def _after(argv: Sequence[str], flag: str) -> str | None:
     return argv[argv.index(flag) + 1] if flag in argv[:-1] else None
 
 
+def _fenced_json(text: str) -> list[Any]:
+    """Each fenced ```json block in *text* that parses, in order."""
+    blocks: list[Any] = []
+    body: list[str] | None = None
+    for line in text.splitlines():
+        if body is None:
+            body = [] if line.strip() == '```json' else None
+        elif line.strip() == '```':
+            with contextlib.suppress(ValueError):
+                blocks.append(json.loads('\n'.join(body)))
+            body = None
+        else:
+            body.append(line)
+    return blocks
+
+
 def _expect_return_section(run: ProgramRun, text: str, stem: str, written: Invocation) -> None:
     schema = fixture_return('S1.author.json')['schema']
     inbox = run.home / 'inbox' / f'{stem}.json'
     expect(schema in text and str(inbox) in text and '--check' in text,
            f'the {stem} brief names schema {schema}, {inbox} and --check', written)
+    stream, pass_ = stem.split('.')
+    identity = {'schema': schema, 'run_id': run.run_id, 'stream': stream, 'pass': pass_}
+    expect(any(isinstance(block, dict) and all(block.get(key) == value for key, value in identity.items())
+               for block in _fenced_json(text)),
+           f'the {stem} brief carries a fenced JSON example with {identity}', written)
 
 
 S1_TITLE, S2_TITLE, S3_TITLE, Q2_TITLE = 'prd:fixture S1', 'prd:fixture S2', 'prd:fixture S3', 'team:fixture S1 Q2'
@@ -958,7 +984,7 @@ def _put_record(run: ProgramRun, label: str, slug: str) -> None:
 
 
 def _watch(run: ProgramRun) -> Invocation:
-    return run.run('watch_sessions.py', '--run', RUN_ID)
+    return run.run('watch_sessions.py', '--run', run.run_id)
 
 
 def _standing(watched: Invocation, title: str) -> str:
@@ -1166,16 +1192,14 @@ def _holds(walk: Walk, scenario: Scenario) -> bool:
     return True
 
 
-def _walk_scenarios(scratch: Path) -> int:
+def _walk_scenarios(scratch: Path, run_id: str) -> int:
     journal = Journal()
     with contextlib.ExitStack() as stack:
         try:
             store_url = stack.enter_context(serving(journal, FIXTURE_DIR / 'store.json', scratch=scratch))
         except ScenarioFailed as broken:
-            print(f'cannot run: the shared fake store did not start: {broken}\n{broken.diagnostics}',
-                  file=sys.stderr)
-            return 2
-        walk = Walk(journal, scratch, store_url)
+            raise CannotRun(f'the shared fake store did not start: {broken}\n{broken.diagnostics}') from None
+        walk = Walk(journal, scratch, store_url, run_id)
         started = time.monotonic()
         held = sum(_holds(walk, scenario) for scenario in SCENARIOS)
         elapsed = time.monotonic() - started
@@ -1189,16 +1213,33 @@ def _exit_on_sigterm(signum: int, _frame: object) -> None:
     raise SystemExit(128 + signum)
 
 
-def main(argv: Sequence[str] | None = None) -> int:
-    argparse.ArgumentParser(description=(__doc__ or '').splitlines()[0]).parse_args(argv)
-    signal.signal(signal.SIGTERM, _exit_on_sigterm)
+def _fixture_run_id() -> str:
+    try:
+        run_id = read_json(FIXTURE_PROGRAM)['run_id']
+    except (OSError, ValueError, LookupError, TypeError) as broken:
+        raise CannotRun(f'no run_id read from {FIXTURE_PROGRAM}: {type(broken).__name__}: {broken}') from None
+    if not isinstance(run_id, str) or not run_id:
+        raise CannotRun(f'{FIXTURE_PROGRAM} names run_id {run_id!r}, not a non-empty string')
+    return run_id
+
+
+def _walk_in_scratch() -> int:
+    run_id = _fixture_run_id()
     with tempfile.TemporaryDirectory(prefix=SCRATCH_PREFIX) as scratch_text:
         scratch = Path(scratch_text).resolve()
         if inside_checkout(scratch):
-            print(f'cannot run: the scratch root {scratch} is inside the checkout {REPO_ROOT}; '
-                  'point TMPDIR outside it', file=sys.stderr)
-            return 2
-        return _walk_scenarios(scratch)
+            raise CannotRun(f'the scratch root {scratch} is inside the checkout {REPO_ROOT}; point TMPDIR outside it')
+        return _walk_scenarios(scratch, run_id)
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    argparse.ArgumentParser(description=(__doc__ or 'review-all fixture walk').splitlines()[0]).parse_args(argv)
+    signal.signal(signal.SIGTERM, _exit_on_sigterm)
+    try:
+        return _walk_in_scratch()
+    except CannotRun as reason:
+        print(f'cannot run: {reason}', file=sys.stderr)
+        return 2
 
 
 if __name__ == '__main__':
