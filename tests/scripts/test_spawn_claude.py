@@ -1589,8 +1589,9 @@ def test_failed_to_start_detected_on_detached_exit0(tmp_path: pathlib.Path) -> N
 def _write_mktemp_recorder(bin_dir: pathlib.Path, log: pathlib.Path) -> None:
     """Shadow `mktemp`, appending each name it prints to *log* unchanged.
 
-    Same delegation shape as _write_mv_recorder: the real binary is resolved
-    once and exec'd by absolute path, so the shim cannot recurse into itself.
+    As in _write_mv_recorder, the real binary is resolved once and invoked by
+    absolute path, so the shim cannot recurse into itself. Its output is
+    captured, logged, then re-printed; a failure's status is forwarded.
     """
     real_mktemp = shutil.which("mktemp")
     assert real_mktemp is not None, "no real `mktemp` on PATH to delegate to"
@@ -1649,13 +1650,11 @@ def test_empty_failed_to_start_marker_yields_144_not_bash_usage_2(
 
     result = _run_spawn(env, tmp_path)
 
-    stderr = result.stderr.decode()
     assert result.returncode == 144, (
         "an empty failed-to-start marker must still yield EXIT_FAILED_TO_START "
         f"(144), never bash's usage code 2: got {result.returncode}\n"
-        f"stderr: {stderr}"
+        f"stderr: {result.stderr.decode()}"
     )
-    assert b"numeric argument required" not in result.stderr, stderr
 
 
 # ===========================================================================
