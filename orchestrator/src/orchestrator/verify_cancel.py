@@ -35,6 +35,8 @@ The subcommand also records its verify worktree beside the pgid file
 (:func:`write_worktree_path`).  A cancel SIGKILLs the tree and so skips the
 subcommand's own ``finally``; the record is what lets :func:`cancel_request`
 reap that worktree instead (PRD plans/remote-task-leg-verify-prd.md §4.2).
+The reap first waits, within :data:`KILLED_RUN_LOCK_RELEASE_SECS`, for the
+killed root to drop the worktree's lane flock.
 Only a cancel that swept a real pgid reaps it.  A corrupt pgid file, or a
 watchdog ``os._exit`` that beats that ``finally``, leaves the record and its
 worktree to the age-keyed sweep
@@ -319,6 +321,8 @@ def cancel_request(
     failed_pids_out: list | None = None,
     killed_pgid_out: list[int] | None = None,
     remove_worktree: Callable[[Path], None] | None = None,
+    monotonic: Callable[[], float] = time.monotonic,
+    sleep: Callable[[float], None] = time.sleep,
 ) -> int:
     """Cancel the verify-merge or verify-task identified by the pgid file at *path*.
 
@@ -340,7 +344,9 @@ def cancel_request(
     3. If any live process could not be killed → return 1 and **retain** the
        pgid file (lets a retry or β's quarantine probe act on it).
        Otherwise remove the file, reap the recorded worktree (below), report
-       *pgid* on *killed_pgid_out*, and return 0.
+       *pgid* on *killed_pgid_out*, and return 0.  The reap first waits,
+       within :data:`KILLED_RUN_LOCK_RELEASE_SECS`, for the killed root to
+       drop the worktree's lane flock.
 
     Parameters
     ----------
@@ -362,6 +368,9 @@ def cancel_request(
         the swept-and-returned-0 path, after the pgid file is gone.  ``None``
         retains the record.  Injected because this module cannot import
         ``git_ops`` (which imports it).
+    monotonic / sleep:
+        The clock of that lane-flock wait (default ``time.monotonic`` /
+        ``time.sleep``), injectable so tests run it on a virtual clock.
 
     Return value
     ------------
@@ -472,7 +481,9 @@ def cancel_request(
         # caller was about to declare free.
         return 1
     remove_pgid_file(path)
-    _reap_recorded_worktree(path, remove_worktree)
+    _reap_recorded_worktree(
+        path, remove_worktree, killed_pid=pgid, monotonic=monotonic, sleep=sleep,
+    )
     # The ONLY path that both swept a real pgid and returned 0 — see the
     # docstring's "0 does NOT mean something was killed" note.
     if killed_pgid_out is not None:
@@ -481,15 +492,50 @@ def cancel_request(
 
 
 def _reap_recorded_worktree(
-    pgid_path: Path, remove_worktree: Callable[[Path], None] | None,
+    pgid_path: Path,
+    remove_worktree: Callable[[Path], None] | None,
+    *,
+    killed_pid: int,
+    monotonic: Callable[[], float],
+    sleep: Callable[[float], None],
 ) -> None:
     """Hand the killed run's recorded worktree to *remove_worktree*, then drop the record."""
     if remove_worktree is None:
         return
     worktree = read_worktree_path(pgid_path)
     if worktree is not None:
+        _wait_for_lock_release(
+            lane_lock_path(worktree), killed_pid, monotonic=monotonic, sleep=sleep,
+        )
         remove_worktree(worktree)
     remove_worktree_path(pgid_path)
+
+
+#: How long a cancel waits for the run it SIGKILLed to drop its worktree's
+#: lane flock before reaping.
+KILLED_RUN_LOCK_RELEASE_SECS: float = 10.0
+
+_LOCK_RELEASE_POLL_SECS: float = 0.05
+
+
+def _wait_for_lock_release(
+    lock_path: Path,
+    holder_pid: int,
+    *,
+    monotonic: Callable[[], float],
+    sleep: Callable[[float], None],
+) -> bool:
+    """Wait, within the bound, until *holder_pid* no longer holds *lock_path*; True if it let go.
+
+    Reads the lock table, not process liveness: a SIGKILLed multithreaded
+    leader can read as a zombie while a sibling thread still holds the fd table.
+    """
+    deadline = monotonic() + KILLED_RUN_LOCK_RELEASE_SECS
+    while holder_pid in lane_lock_holder_pids(lock_path):
+        if monotonic() >= deadline:
+            return False
+        sleep(_LOCK_RELEASE_POLL_SECS)
+    return True
 
 
 # ---------------------------------------------------------------------------
