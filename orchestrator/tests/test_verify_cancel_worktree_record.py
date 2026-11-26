@@ -221,19 +221,29 @@ def _foreign_lane_holder(lock_path: Path) -> Iterator[subprocess.Popen[bytes]]:
 
 
 class _VirtualClock:
-    """Injected ``monotonic``/``sleep``: each sleep advances ``now`` and is recorded."""
+    """Injected ``monotonic``/``sleep``: each sleep is recorded and advances ``now``.
 
-    def __init__(self, on_first_sleep: Callable[[], None] | None = None) -> None:
+    The advance is the requested secs, or *step* when given, so a test that
+    must exhaust the bound does so in a few lock-table reads.
+    """
+
+    def __init__(
+        self,
+        on_first_sleep: Callable[[], None] | None = None,
+        *,
+        step: float | None = None,
+    ) -> None:
         self.now = 0.0
         self.sleeps: list[float] = []
         self._on_first_sleep = on_first_sleep
+        self._step = step
 
     def monotonic(self) -> float:
         return self.now
 
     def sleep(self, secs: float) -> None:
         self.sleeps.append(secs)
-        self.now += secs
+        self.now += secs if self._step is None else self._step
         callback, self._on_first_sleep = self._on_first_sleep, None
         if callback is not None:
             callback()
@@ -319,6 +329,37 @@ class TestCancelRequestWaitsForTheKilledHolder:
         assert remover.calls == [wt]
         assert clock.sleeps == []
 
+    def test_a_holder_other_than_the_killed_run_is_not_waited_for(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        wt = tmp_path / 'wt' / '_merge-newer'
+        wt.parent.mkdir(parents=True)
+        pgf = pgid_file(tmp_path / 'wt', 'req-newer')
+        remover = _LockProbingRemover(lane_lock_path(wt))
+        clock = _VirtualClock()
+
+        with _foreign_lane_holder(lane_lock_path(wt)) as child:
+            killed_pgid = 4242
+            assert child.pid != killed_pgid
+            write_pgid_file(pgf, killed_pgid)
+            write_worktree_path(pgf, wt)
+
+            rc = cancel_request(
+                pgf,
+                ppid_map_provider=dict,
+                kill=_ignore_signal,
+                killpg=_ignore_signal,
+                remove_worktree=remover,
+                monotonic=clock.monotonic,
+                sleep=clock.sleep,
+            )
+
+        assert rc == 0
+        assert remover.calls == [wt]
+        assert remover.lock_free_at_call == [False]
+        assert clock.sleeps == []
+        assert capsys.readouterr().err == ''
+
     def test_a_holder_that_outlives_the_bound_is_reported_and_still_handed_to_the_remover(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str],
     ) -> None:
@@ -326,7 +367,7 @@ class TestCancelRequestWaitsForTheKilledHolder:
         wt.parent.mkdir(parents=True)
         pgf = pgid_file(tmp_path / 'wt', 'req-stuck')
         remover = _LockProbingRemover(lane_lock_path(wt))
-        clock = _VirtualClock()
+        clock = _VirtualClock(step=KILLED_RUN_LOCK_RELEASE_SECS / 4)
 
         with _foreign_lane_holder(lane_lock_path(wt)) as child:
             write_pgid_file(pgf, child.pid)
