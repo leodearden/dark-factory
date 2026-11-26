@@ -8,7 +8,8 @@ projects — making the curator blind to all pre-existing work.
 This script fetches the full task tree from the SQLite task backend,
 flattens it, and calls ``TaskCurator.backfill_corpus()`` to populate the
 collection. The corpus is upserted in bounded batches, so a batch Qdrant
-refuses is reported in ``errors`` rather than aborting the project.
+refuses is reported in ``errors`` rather than aborting the project; the CLI
+then exits 1.
 
 The operation is idempotent: re-running just re-upserts the same deterministic
 point IDs, leaving nothing duplicated.
@@ -351,8 +352,13 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main(argv: Sequence[str] | None = None) -> None:
-    """Parse *argv* (default ``sys.argv[1:]``), run the backfill or the prune, print a summary."""
+def main(argv: Sequence[str] | None = None) -> int:
+    """Parse *argv* (default ``sys.argv[1:]``), run the backfill or the prune, print a summary.
+
+    Returns the process exit status: 1 when the backfill left any task's
+    point unwritten (``errors`` above 0), so a wrapper checking ``$?`` never
+    reads a partly written corpus as success; 0 otherwise.
+    """
     args = build_parser().parse_args(argv)
     if args.prune:
         prune_report = asyncio.run(
@@ -362,18 +368,19 @@ def main(argv: Sequence[str] | None = None) -> None:
             f'Prune complete: pruned={prune_report.pruned} live={prune_report.live_tasks} '
             f'skipped={prune_report.skipped} reason={prune_report.reason!r}'
         )
-    else:
-        result = asyncio.run(run_backfill(
-            config_path=args.config,
-            project_root=args.project_root,
-            concurrency=args.concurrency,
-        ))
-        print(
-            f'Backfill complete: upserted={result.upserted} skipped={result.skipped} '
-            f'errors={result.errors}'
-        )
+        return 0
+    result = asyncio.run(run_backfill(
+        config_path=args.config,
+        project_root=args.project_root,
+        concurrency=args.concurrency,
+    ))
+    print(
+        f'Backfill complete: upserted={result.upserted} skipped={result.skipped} '
+        f'errors={result.errors}'
+    )
+    return 1 if result.errors else 0
 
 
 if __name__ == '__main__':
     logging.basicConfig(level=logging.INFO)
-    main()
+    raise SystemExit(main())

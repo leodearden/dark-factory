@@ -1043,10 +1043,24 @@ class TestBackfillCli:
 
         monkeypatch.setattr(backfill_curator_corpus, 'run_backfill', fake_run_backfill)
 
-        backfill_curator_corpus.main(['--project-root', '/x', '--concurrency', '3'])
+        status = backfill_curator_corpus.main(['--project-root', '/x', '--concurrency', '3'])
 
+        assert status == 0
         assert received == [{'config_path': None, 'project_root': '/x', 'concurrency': 3}]
         assert 'Backfill complete: upserted=5 skipped=1 errors=0' in capsys.readouterr().out
+
+    def test_main_exits_non_zero_when_any_task_failed_to_land(self, monkeypatch, capsys):
+        from fused_memory.maintenance import backfill_curator_corpus
+
+        async def fake_run_backfill(**kwargs: Any) -> BackfillResult:
+            return BackfillResult(upserted=5, skipped=0, errors=1)
+
+        monkeypatch.setattr(backfill_curator_corpus, 'run_backfill', fake_run_backfill)
+
+        status = backfill_curator_corpus.main(['--project-root', '/x'])
+
+        assert status == 1
+        assert 'errors=1' in capsys.readouterr().out
 
 
 # ──────────────────────────────────────────────────────────────────────────────
