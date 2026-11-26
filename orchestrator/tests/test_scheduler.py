@@ -6109,13 +6109,13 @@ class _PagingStatusesSession:
         return tool_reply_body(self._payload(items, arguments.get('page_size'), offset))
 
     def _payload(self, items: list[tuple[str, str]], requested: int | None, offset: int) -> dict:
-        if requested is None and (self._cap is None or len(items) <= self._cap):
-            return {'statuses': dict(items)}
-        if requested is None:
-            served, echoed, marker = self._cap, self._cap, {'auto_paginated': True}
-        else:
+        if requested is not None:
             served = requested if self._cap is None else min(requested, self._cap)
             echoed, marker = requested, {}
+        elif self._cap is None or len(items) <= self._cap:
+            return {'statuses': dict(items)}
+        else:
+            served, echoed, marker = self._cap, self._cap, {'auto_paginated': True}
         window = dict(items[offset:offset + served])
         returned = len(window)
         if offset == 0 and self._first_page_claims_returned is not None:
