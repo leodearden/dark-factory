@@ -73,8 +73,12 @@ class _Scene:
 
 
 @pytest.fixture
-def scene(tmp_path: Path) -> _Scene:
-    return _Scene(tmp_path)
+def scene(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> _Scene:
+    built = _Scene(tmp_path)
+    # The autouse config isolation pins ORCH_PROJECT_ROOT to tmp_path, which outranks the yaml's
+    # project_root; module discovery must walk the repo, not the merge worktrees beside it.
+    monkeypatch.setenv('ORCH_PROJECT_ROOT', str(built.repo.root))
+    return built
 
 
 def _full(reason: MissReason, path: str | None = None) -> tuple[MergeGateResolution, GateMiss, None]:

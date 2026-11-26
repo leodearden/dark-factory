@@ -50,7 +50,14 @@ from shared.python_env import without_python_env_selection
 from shared.secret_env import without_account_pool
 from shared.verify_admission import acquire_task_slot, is_gated_role, nice_prefix
 
-from orchestrator import remote_gate, verify_evidence, verify_fallback_floor, verify_plan
+from orchestrator import (
+    narrow_gate_delta,
+    narrow_gate_plan,
+    remote_gate,
+    verify_evidence,
+    verify_fallback_floor,
+    verify_plan,
+)
 from orchestrator.cargo_scope import discover_workspace_crates, files_to_crates
 from orchestrator.config import ModuleConfig, OrchestratorConfig
 
@@ -61,6 +68,8 @@ from orchestrator.config import ModuleConfig, OrchestratorConfig
 # flake_ledger depends only on shared.sqlite_sync_base, so there is no cycle.
 from orchestrator.flake_ledger import FlakeCallSite, FlakeSuppression, FlakeVerdict
 from orchestrator.main_tip_sweep_cadence import SweepSeedMode
+from orchestrator.narrow_gate_class import ChangedPath, GateMiss, MissReason
+from orchestrator.narrow_gate_plan import NarrowGateDecision
 from orchestrator.relocated_scopes import relocated_scopes
 from orchestrator.scope_launch_handshake import ScopeLaunchHandshake
 from orchestrator.tree_removal import remove_tree
@@ -4428,6 +4437,82 @@ def _merge_config_only_diff_forces_full_gate(
     return any(
         fnmatch.fnmatchcase(f, g) for f in changed_files for g in globs
     )
+
+
+async def narrow_merge_gate_decision(
+    worktree: Path,
+    config: OrchestratorConfig,
+    *,
+    base_sha: str,
+    merge_sha: str,
+) -> NarrowGateDecision:
+    """THE merge-role narrow resolution for the merge *merge_sha* onto *base_sha*, checked out at *worktree*.
+
+    The docs or comments gate when the real tree delta qualifies and its evidence is on disk;
+    otherwise the full gate, with the miss that sent it there (docs/narrow-merge-gate.md). The
+    2838 globs and reify's verify-pipeline-guard still force the full gate, through the helpers
+    above. Never raises: a fault degrades to the full gate rather than stalling the merge lane.
+    """
+    if not config.narrow_merge_gate.enabled:
+        return NarrowGateDecision.full(GateMiss(MissReason.DISABLED))
+    try:
+        return await _narrow_merge_gate_decision_body(worktree, config, base_sha, merge_sha)
+    except Exception:
+        logger.warning('narrow_merge_gate_decision: unexpected error for %s; full gate', worktree, exc_info=True)
+        return NarrowGateDecision.full(GateMiss(MissReason.DELTA_UNREADABLE))
+
+
+async def _narrow_merge_gate_decision_body(
+    worktree: Path, config: OrchestratorConfig, base_sha: str, merge_sha: str,
+) -> NarrowGateDecision:
+    if await narrow_gate_delta.read_head(worktree) != merge_sha:
+        return NarrowGateDecision.full(GateMiss(MissReason.EVIDENCE_ABSENT))
+    delta = await narrow_gate_delta.read_tree_delta(worktree, base_sha, merge_sha)
+    tree_paths = await narrow_gate_delta.list_tree_paths(worktree, merge_sha)
+    if delta is None or tree_paths is None:
+        return NarrowGateDecision.full(GateMiss(MissReason.DELTA_UNREADABLE))
+    changed = tuple(change.path for change in delta)
+    if not delta:
+        return NarrowGateDecision.full(GateMiss(MissReason.EMPTY_DELTA))
+    modules = list(config.module_configs_or_empty.values())
+    lister = narrow_gate_plan.module_test_lister(tree_paths, [mc.prefix for mc in modules])
+    miss = await _narrow_gate_evidence_miss(worktree, config, delta, [t for mc in modules for t in lister(mc.prefix)])
+    if miss is not None:
+        return NarrowGateDecision.full(miss, changed)
+    classification = await narrow_gate_delta.classify_tree_delta(
+        worktree, base_sha, merge_sha, config.narrow_merge_gate.docs_paths,
+    )
+    if classification.miss is not None:
+        return NarrowGateDecision.full(classification.miss, changed)
+    plan = narrow_gate_plan.narrow_gate_plan(
+        classification.resolution, changed, modules,
+        list_pkg_tests=lister, worktree_reader=_worktree_reader(worktree, cache={}),
+    )
+    if plan is None:
+        return NarrowGateDecision.full(GateMiss(MissReason.EMPTY_COMMAND_SET), changed)
+    return NarrowGateDecision(classification.resolution, None, plan, changed)
+
+
+async def _narrow_gate_evidence_miss(
+    worktree: Path,
+    config: OrchestratorConfig,
+    delta: Sequence[ChangedPath],
+    module_tests: Sequence[str],
+) -> GateMiss | None:
+    """The miss when *worktree*'s disk cannot vouch for the delta, or a full-gate backstop fires.
+
+    Every present changed path and every registered module's test file must be on disk: a
+    clobbered worktree (incident 83336a32) would otherwise shrink what the narrow gate runs.
+    """
+    present = [change.path for change in delta if change.status != 'D']
+    absent = next((path for path in (*present, *sorted(module_tests)) if not (worktree / path).is_file()), None)
+    if absent is not None:
+        return GateMiss(MissReason.EVIDENCE_ABSENT, absent)
+    if _merge_config_only_diff_forces_full_gate(config, [change.path for change in delta]):
+        return GateMiss(MissReason.FORCED_FULL_GATE)
+    if await _verify_pipeline_guard_requires_full_gate(worktree, present):
+        return GateMiss(MissReason.FORCED_FULL_GATE)
+    return None
 
 
 def _single_subproject_prefix(files: list[str], worktree: Path | None) -> str | None:

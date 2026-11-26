@@ -13,9 +13,11 @@ from orchestrator.verify_artifact_consumers import (
 )
 from orchestrator.verify_cmd import parse_config_command
 from orchestrator.verify_plan import (
+    FileKind,
     PlannedRun,
     ScopeKind,
     VerifyPlan,
+    classify_file,
     deselecting_expression_for_command,
     scope_prefix_to_keyword,
     whole_tree_guard_family,
@@ -87,13 +89,30 @@ def narrow_gate_plan(
     return VerifyPlan(runs)
 
 
+def module_test_lister(tree_paths: Sequence[str], prefixes: Sequence[str]) -> PkgTestLister:
+    """A ``list_pkg_tests`` seam over a tree's paths: each module's collectable test files, wherever under it they sit.
+
+    A path counts under its longest owning prefix only, so a nested module's tests run once, under its own command.
+    """
+    owned: dict[str, list[str]] = {}
+    for path in tree_paths:
+        owner = _owner(path, prefixes)
+        if owner is not None and classify_file(path, None) is FileKind.COLLECTABLE_TEST:
+            owned.setdefault(owner, []).append(path)
+    return lambda prefix: list(owned.get(prefix, ()))
+
+
+def _owner(path: str, prefixes: Sequence[str]) -> str | None:
+    return max((p for p in prefixes if path.startswith(p + '/')), key=len, default=None)
+
+
 def _changed_py_by_owner(
     changed_paths: Sequence[str], module_configs: Sequence[ModuleConfig],
 ) -> Mapping[str, tuple[str, ...]] | None:
     prefixes = [mc.prefix for mc in module_configs]
     owned: dict[str, list[str]] = {}
     for path in sorted(p for p in changed_paths if p.endswith('.py')):
-        owner = max((p for p in prefixes if path.startswith(p + '/')), key=len, default=None)
+        owner = _owner(path, prefixes)
         if owner is None:
             return None
         owned.setdefault(owner, []).append(path)

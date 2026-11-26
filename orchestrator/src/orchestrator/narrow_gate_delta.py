@@ -44,6 +44,18 @@ async def read_tree_delta(repo: Path, base: str, head: str) -> tuple[ChangedPath
     return None if out is None else _parse_raw_delta(out)
 
 
+async def read_head(repo: Path) -> str | None:
+    """The commit *repo*'s HEAD names; None when git cannot say."""
+    head = await _git_stdout(repo, ['rev-parse', '--verify', 'HEAD'])
+    return head if head is not None and _OBJECT_ID.fullmatch(head) else None
+
+
+async def list_tree_paths(repo: Path, rev: str) -> tuple[str, ...] | None:
+    """Every file path in *rev*'s tree; None when git cannot say."""
+    out = await _git_stdout(repo, ['ls-tree', '-r', '-z', '--name-only', rev])
+    return None if out is None else tuple(path for path in out.split('\0') if path)
+
+
 async def classify_tree_delta(repo: Path, base: str, head: str, docs_paths: Sequence[str]) -> GateClassification:
     """The gate the change *base*..*head* qualifies for, with both sides' blobs read from git, never the working tree."""
     delta = await read_tree_delta(repo, base, head)

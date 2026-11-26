@@ -8,7 +8,7 @@ from _serial_recovery_helpers import ORCH_SHAPED_PYPROJECT
 
 from orchestrator.config import ModuleConfig
 from orchestrator.narrow_gate_class import GateMiss, MergeGateResolution, MissReason
-from orchestrator.narrow_gate_plan import NarrowGateDecision, narrow_gate_plan
+from orchestrator.narrow_gate_plan import NarrowGateDecision, module_test_lister, narrow_gate_plan
 from orchestrator.verify_artifact_consumers import BEHAVIOURAL_ARTIFACTS
 from orchestrator.verify_cmd import parse_config_command
 from orchestrator.verify_plan import (
@@ -259,3 +259,33 @@ class TestNarrowGateDecision:
 
         with pytest.raises(ValueError, match=resolution.value):
             NarrowGateDecision(resolution, miss, plan)
+
+
+class TestModuleTestLister:
+
+    _TREE = (
+        'orchestrator/src/orchestrator/verify.py',
+        'orchestrator/tests/test_a.py',
+        'orchestrator/tests/conftest.py',
+        'orchestrator/tests/_helpers.py',
+        'tests/scripts/test_line_pin_policy.py',
+        'tests/repo_guards/test_design_invariants_consistency.py',
+        'tests/repo_guards/nested/test_inner.py',
+        'scripts/tests/test_codebook.py',
+        'README.md',
+        'test_root_level.py',
+    )
+
+    def test_a_module_lists_its_collectable_tests_wherever_they_sit(self) -> None:
+        lister = module_test_lister(self._TREE, ['orchestrator', 'tests/scripts', 'scripts'])
+
+        assert lister('orchestrator') == ['orchestrator/tests/test_a.py']
+        assert lister('tests/scripts') == ['tests/scripts/test_line_pin_policy.py']
+        assert lister('scripts') == ['scripts/tests/test_codebook.py']
+        assert lister('unregistered') == []
+
+    def test_a_nested_module_owns_its_own_tests(self) -> None:
+        lister = module_test_lister(self._TREE, ['tests/repo_guards', 'tests/repo_guards/nested'])
+
+        assert lister('tests/repo_guards') == ['tests/repo_guards/test_design_invariants_consistency.py']
+        assert lister('tests/repo_guards/nested') == ['tests/repo_guards/nested/test_inner.py']
