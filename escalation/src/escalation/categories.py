@@ -67,6 +67,8 @@ class EscalationCategory(StrEnum):
     MERGE_REQUEST_STUCK = 'merge_request_stuck'
     MERGE_RESOURCE_LEAK = 'merge_resource_leak'
     MERGE_SCOPE_MISMATCH = 'merge_scope_mismatch'
+    MERGE_SCREEN = 'merge_screen'
+    MERGE_SCREEN_UNAVAILABLE = 'merge_screen_unavailable'
     MERGE_VERIFY_BASE_DIVERGENCE = 'merge_verify_base_divergence'
     MILESTONE_CHECK_FAILED = 'milestone_check_failed'
     MILESTONE_CHECK_STALLED = 'milestone_check_stalled'

@@ -12333,6 +12333,7 @@ class Harness:
             enforce_merge_liveness_margin,
             enforce_persistent_worktree_serial_lane,
         )
+        from orchestrator.merge_lane.screen import MergeScreen
         from orchestrator.merge_lane.worker import PRODUCTION_VERIFIER, SpeculativeMergeWorker
 
         # K = verify hosts + 1 counts the frontier and sizes the worker's
@@ -12421,6 +12422,10 @@ class Harness:
             host_holder_reader=self._host_pool.holders,
             on_host_readmitted=self._note_verify_host_readmitted,
             task_priority=self._task_priority,
+            screen=MergeScreen(
+                self.git_ops, event_store=self.event_store,
+                escalation_queue=self._escalation_queue,
+            ),
         )
         # Manage every remote host from the start, so a task-path bench before
         # the first merge lands on a tracked host (task 6670).  Without a

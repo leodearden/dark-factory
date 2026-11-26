@@ -1664,6 +1664,7 @@ class OutcomeKind(StrEnum):
     cas_retry = 'cas_retry'
     gate_retry = 'gate_retry'
     post_merge_generation_chained = 'post_merge_generation_chained'
+    screen_failed = 'screen_failed'
 
     @property
     def is_terminal(self) -> bool:

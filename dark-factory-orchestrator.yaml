@@ -1855,6 +1855,12 @@ merge_deep:
   # No warm spec pool here, so builds are git-only (8 builds, max 31 s).
   chain_build_timeout_secs: 300
 
+# Merge pre-verify screen (task 7919). Kill switch: a hot reload of manifest: null.
+# It fails open; a streak of errored screens files merge_screen_unavailable.
+# See plans/merge-pre-verify-screen-prd.md decisions 3, 4 and 8.
+merge_screen:
+  manifest: scripts/merge_screen.yaml
+
 # TRIAL (Leo 2026-11-14, lock hand-off study): the automatic file reservation
 # is off. A task earns one when its count of skips reaches its tier's threshold,
 # and the count resets only when the task starts or the orchestrator restarts.

@@ -19,6 +19,7 @@ class MergeBlockCategory(StrEnum):
     POST_MERGE_VERIFY = EscalationCategory.POST_MERGE_VERIFY.value
     MERGE_NEEDS_REBASE = EscalationCategory.MERGE_NEEDS_REBASE.value
     MERGE_ERROR = EscalationCategory.MERGE_ERROR.value
+    MERGE_SCREEN = EscalationCategory.MERGE_SCREEN.value
 
 
 MAX_RECORDED_CONFLICTED_PATHS = 100

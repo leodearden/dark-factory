@@ -184,6 +184,7 @@ from orchestrator.merge_lane.request_ledger import (
     report_stuck_requests,
 )
 from orchestrator.merge_lane.reverify_gate_decision import GateClearance, ReverifyDispatch
+from orchestrator.merge_lane.screen import Bounce, ScreenPort, ScreenSite, screen_or_proceed
 from orchestrator.merge_lane.shadow import (
     _maybe_schedule_shadow_compare,
     _run_cold_shadow_verify,
@@ -1248,6 +1249,7 @@ class _TrainMergeHost(Protocol):
     _clock: ClockPort
     _host_quarantine: HostQuarantine
     _escalation_queue: Any
+    _screen: ScreenPort | None
 
     # ── Per-task counters (mutated by shared helpers) ─────────────────────
     _post_merge_verify_timeouts: dict[str, int]
@@ -1521,6 +1523,39 @@ async def _forget_landed_stack_bases(git_ops: GitOps, req: GroupMergeRequest) ->
             "Train %s: could not clear its members' stack-base records",
             req.train_id, exc_info=True,
         )
+
+
+async def _screen_merged_item(
+    worker: _TrainMergeHost,
+    req: MergeRequest,
+    result: MergedOk | Decided,
+    *,
+    started_monotonic: float | None,
+) -> MergedOk | Decided:
+    """Screen the merger's merged item before it reaches verify; a bounce becomes a :class:`Decided`.
+
+    Only the merger loop calls this, so the remerge paths, which share
+    :func:`classify_and_merge`, never screen. The bounce is delivered as the
+    drop guard's is: no verify, no host lease
+    (plans/merge-pre-verify-screen-prd.md decisions 1 and 7).
+    """
+    if worker._screen is None or not isinstance(result, MergedOk):
+        return result
+    merge_result = result.merge_result
+    assert merge_result.merge_commit is not None
+    decision = await screen_or_proceed(
+        worker._screen, task_id=req.task_id, merged_sha=merge_result.merge_commit.strip(),
+        base_sha=merge_result.pre_merge_sha, config=req.config, site=ScreenSite.MERGER,
+    )
+    if not isinstance(decision, Bounce):
+        return result
+    if result.merge_wt is not None:
+        await worker._git_ops.cleanup_merge_worktree(result.merge_wt)
+    _emit_merge_attempt(
+        worker._event_store, req.task_id, OutcomeKind.screen_failed,
+        duration_ms=_elapsed_ms(started_monotonic),
+    )
+    return Decided(decision.outcome)
 
 
 async def classify_and_merge(
@@ -2664,6 +2699,44 @@ def _derail_on_train_verify_failure(
     return verify_outcome
 
 
+async def _screen_train_tip(
+    worker: _TrainMergeHost,
+    req: GroupMergeRequest,
+    merge_result: MergeResult,
+    *,
+    started_monotonic: float,
+) -> MergeOutcome | None:
+    """Screen a declared train's merged tip before its verify; ``None`` lets the verify run.
+
+    A bounce derails the train with the screen's own outcome, UNTAGGED: it
+    never goes through :func:`_derail_on_train_verify_failure`, so it is not
+    read as a cross-member interaction (plans/merge-pre-verify-screen-prd.md
+    decision 7).
+    """
+    if worker._screen is None:
+        return None
+    assert merge_result.merge_commit is not None
+    decision = await screen_or_proceed(
+        worker._screen, task_id=req.task_id, merged_sha=merge_result.merge_commit.strip(),
+        base_sha=merge_result.pre_merge_sha, config=req.config, site=ScreenSite.TRAIN,
+    )
+    if not isinstance(decision, Bounce):
+        return None
+    if merge_result.merge_worktree:
+        await worker._git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
+    logger.info('Train %s: merge screen bounced the tip on %s', req.train_id, decision.check_ids)
+    _emit_train_event(
+        worker._event_store, EventType.train_derailed,
+        task_id=req.task_id, train_id=req.train_id,
+        member_task_ids=req.member_task_ids,
+        data={'derail_reason': decision.outcome.reason},
+    )
+    _emit_train_attempt(
+        worker._event_store, req, OutcomeKind.screen_failed, started_monotonic=started_monotonic,
+    )
+    return decision.outcome
+
+
 @dataclasses.dataclass(frozen=True)
 class _TrainAdvance:
     """How a train's CAS loop (:func:`_advance_train`) ended."""
@@ -3225,6 +3298,9 @@ async def _do_train_merge(
             f'Train {req.train_id}: merge_to_main reported success '
             f'but merge_worktree is None'
         )
+    screened = await _screen_train_tip(worker, req, merge_result, started_monotonic=t0)
+    if screened is not None:
+        return screened
 
     # (e) Workspace-wide post-merge verify via the shared helper, on the
     # worker's injected VerifyPort and a leased host (_leased_train_verify).
@@ -4671,9 +4747,12 @@ class SpeculativeMergeWorker:
         host_holder_reader: Callable[[], Mapping[str, str]] | None = None,
         on_host_readmitted: Callable[[str], None] | None = None,
         task_priority: TaskPriorityLookup | None = None,
+        screen: ScreenPort | None = None,
     ):
         self._git_ops = git_ops
         self._queue = queue
+        # The merge pre-verify screen (task 7919); None screens nothing at any site.
+        self._screen = screen
         self._event_store = event_store
         # Task η (AFK coverage gap): harness-owned handles for the
         # merge-verify dry-run investigation spawn.  The worker holds none of
@@ -11150,10 +11229,10 @@ class SpeculativeMergeWorker:
                     # events internally, so the event stream is identical to the
                     # pre-extraction inline copy.  See its docstring for the full
                     # equivalence-matrix contract shared with _do_merge/_remerge.
-                    result = await classify_and_merge(
+                    result = await _screen_merged_item(self, req, await classify_and_merge(
                         self, req, base_for_merge, speculative=speculative,
                         started_monotonic=t0,
-                    )
+                    ), started_monotonic=t0)
                     if isinstance(result, Decided):
                         # Uniform _oob_deliver call: its own predicate already
                         # excludes status in {'done','already_merged'}, so this

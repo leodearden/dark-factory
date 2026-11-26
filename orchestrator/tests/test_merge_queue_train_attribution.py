@@ -63,6 +63,7 @@ def _make_host(git_ops: MagicMock) -> MagicMock:
     host = MagicMock()
     host._git_ops = git_ops
     host._event_store = None
+    host._screen = None
     host._post_merge_verify_timeouts = {}
     host._post_merge_verify_enospc_retries = {}
     host._cas_retries = {}
