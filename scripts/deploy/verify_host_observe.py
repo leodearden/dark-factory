@@ -2,7 +2,8 @@
 """Observe a verify host's facts and print them as one JSON object.
 
 Stdlib only and Python >= 3.10: check_verify_host.py ships this file to the host
-over ssh stdin, and runs it locally for the workstation's reference facts.
+over ssh stdin, and it and verify_host_contract.py import observe_environment for
+the workstation's reference facts, so both sides are read by one code path.
 EnvironmentFacts and HostFacts are the single definition of that JSON.
 """
 
@@ -90,7 +91,7 @@ class HostFacts(_StrictJson):
     bash_version: str | None
     flock_version: str | None
     npm_version: str | None
-    uv_python_313: str | None
+    uv_managed_python_313: str | None
     systemd_run_scope_rc: int | None
     linger: str | None
     landlock_abi: int
@@ -273,7 +274,7 @@ def observe_host(args: argparse.Namespace) -> HostFacts:
         bash_version=_first_line(['bash', '--version']),
         flock_version=_first_line(['flock', '--version']),
         npm_version=_first_line(['npm', '--version']),
-        uv_python_313=_first_line(['uv', 'python', 'find', '3.13']),
+        uv_managed_python_313=_first_line(['uv', 'python', 'find', '--managed-python', '3.13']),
         systemd_run_scope_rc=_returncode(['systemd-run', '--user', '--scope', '--quiet', 'true']),
         linger=_stdout(['loginctl', 'show-user', user, '-p', 'Linger', '--value']) if user else None,
         landlock_abi=_landlock_abi(),
@@ -294,25 +295,16 @@ def observe_host(args: argparse.Namespace) -> HostFacts:
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--environment-only', action='store_true')
-    parser.add_argument('--df-checkout')
+    parser.add_argument('--df-checkout', required=True)
     parser.add_argument('--project-checkout', action='append', default=[])
     parser.add_argument('--config-path', action='append', default=[])
-    parser.add_argument('--wrapper-path')
-    parser.add_argument('--disk-path')
+    parser.add_argument('--wrapper-path', required=True)
+    parser.add_argument('--disk-path', required=True)
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = _parser()
-    args = parser.parse_args(argv)
-    if args.environment_only:
-        facts: EnvironmentFacts | HostFacts = observe_environment()
-    elif None in (args.df_checkout, args.wrapper_path, args.disk_path):
-        parser.error('a host observation needs --df-checkout, --wrapper-path and --disk-path')
-    else:
-        facts = observe_host(args)
-    print(json.dumps(dataclasses.asdict(facts)))
+    print(json.dumps(dataclasses.asdict(observe_host(_parser().parse_args(argv)))))
     return 0
 
 

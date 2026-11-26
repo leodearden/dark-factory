@@ -30,6 +30,7 @@ import _checkout as _checkout
 import verify_host_observe
 import yaml
 from orchestrator.config import GitConfig, VerifyRunnerConfig
+from orchestrator.verify_cancel import SSH_SERVER_ALIVE_COUNT_MAX, SSH_SERVER_ALIVE_INTERVAL
 from orchestrator.verify_host_roster_file import (
     Roster,
     RosterFileError,
@@ -42,8 +43,8 @@ from verify_host_observe import EnvironmentFacts, HostFacts
 DISPATCHER_SSH_OPTS = (
     '-o', 'BatchMode=yes',
     '-o', 'ConnectTimeout=10',
-    '-o', 'ServerAliveInterval=15',
-    '-o', 'ServerAliveCountMax=4',
+    '-o', f'ServerAliveInterval={SSH_SERVER_ALIVE_INTERVAL}',
+    '-o', f'ServerAliveCountMax={SSH_SERVER_ALIVE_COUNT_MAX}',
 )
 DEFAULT_WRAPPER_PATH = '/usr/local/bin/orchestrator'
 WRAPPER_PATH_ENV = 'VERIFY_HOST_WRAPPER_PATH'
@@ -355,12 +356,15 @@ def _toolchain(host: HostFacts, reference: EnvironmentFacts, spec: HostSpec) -> 
     problems = [f'{tool} missing' for tool, version_of in REQUIRED_TOOLS.items() if version_of(host) is None]
     if reference.uv_version is None or env.uv_version != reference.uv_version:
         problems.append(f'uv {env.uv_version}')
-    if host.uv_python_313 is None:
-        problems.append('no CPython 3.13 that uv finds')
+    if host.uv_managed_python_313 is None:
+        problems.append('no uv-managed CPython 3.13')
     node_major = _node_major(reference.node_version)
     if node_major is None or _node_major(env.node_version) != node_major:
         problems.append(f'node {env.node_version}')
-    return _judged(problems, f'uv {env.uv_version}; node {env.node_version}; CPython 3.13 at {host.uv_python_313}')
+    return _judged(
+        problems,
+        f'uv {env.uv_version}; node {env.node_version}; uv-managed CPython 3.13 at {host.uv_managed_python_313}',
+    )
 
 
 def _systemd_needed(reference: EnvironmentFacts, spec: HostSpec) -> str:

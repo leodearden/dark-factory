@@ -69,13 +69,10 @@ def _os_release() -> dict[str, str]:
     return {key: value.strip('"') for key, value in pairs}
 
 
-def test_environment_only_prints_exactly_the_environment_facts(tmp_path: Path) -> None:
-    assert set(_observe(tmp_path, '--environment-only')) == ENVIRONMENT_FIELDS
-
-
-def test_the_printed_json_parses_back_strictly(tmp_path: Path) -> None:
+def test_the_environment_facts_parse_back_strictly() -> None:
     observer = _load_observer()
-    observed = _observe(tmp_path, '--environment-only')
+    observed = dataclasses.asdict(observer.observe_environment())
+    assert set(observed) == ENVIRONMENT_FIELDS
     facts = observer.EnvironmentFacts.from_json(json.dumps(observed))
     assert dataclasses.asdict(facts) == observed
     with pytest.raises(ValueError, match='surplus'):

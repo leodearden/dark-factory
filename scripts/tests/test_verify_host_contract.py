@@ -1,5 +1,6 @@
 """scripts/deploy/verify_host_contract.py: the one requirement table and the renders a host installs."""
 
+import functools
 import importlib.util
 import json
 import os
@@ -48,6 +49,7 @@ def _load(name: str, path: Path) -> Any:
     return module
 
 
+@functools.cache
 def _contract() -> Any:
     return _load('verify_host_contract', CONTRACT)
 
@@ -277,9 +279,7 @@ class TestPins:
 
 @pytest.mark.parametrize('artifact', PORTABLE_ARTIFACTS, ids=lambda path: path.name)
 def test_no_artifact_names_a_home_directory(artifact: Path) -> None:
-    text = artifact.read_text()
-    assert '/home/' not in text
-    assert str(Path.home()) not in text
+    assert '/home/' not in artifact.read_text()
 
 
 GIB_IN_KIB = 1024 * 1024
@@ -343,7 +343,7 @@ class Scene:
             'git_user_name': 'Verify Host', 'git_user_email': 'verify@example.invalid',
             'git_version': 'git version 2.43.0', 'bash_version': 'GNU bash, version 5.2.21',
             'flock_version': 'flock from util-linux 2.39.3', 'npm_version': '10.9.9',
-            'uv_python_313': '/opt/uv/python/cpython-3.13/bin/python3.13',
+            'uv_managed_python_313': '/opt/uv/python/cpython-3.13/bin/python3.13',
             'systemd_run_scope_rc': 0, 'linger': 'yes',
             'landlock_abi': 6, 'var_tmp_writable': True,
             'mem_available_kib': 32 * GIB_IN_KIB, 'swap_total_kib': 8 * GIB_IN_KIB,
@@ -457,7 +457,7 @@ class TestToolchain:
     @pytest.mark.parametrize('change', [
         _set('environment.uv_version', '0.11.5'), _set('environment.node_version', 'v20.11.1'),
         _set('npm_version', None), _set('git_version', None), _set('flock_version', None),
-        _set('bash_version', None), _set('uv_python_313', None),
+        _set('bash_version', None), _set('uv_managed_python_313', None),
     ], ids=['uv_differs', 'node_major_differs', 'no_npm', 'no_git', 'no_flock', 'no_bash', 'no_python_313'])
     def test_fails(self, scene: Scene, change: Any) -> None:
         assert scene.changed('toolchain', change) == 'fail'

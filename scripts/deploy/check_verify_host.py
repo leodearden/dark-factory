@@ -24,19 +24,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import _checkout as _checkout
 import verify_host_contract as contract
+import verify_host_observe
 from orchestrator.verify_host_roster_file import RosterFileError, load_roster, roster_file_path
 from orchestrator.verify_runner import REMOTE_TOOL_PATH_PRELUDE
 from verify_host_observe import EnvironmentFacts, HostFacts
 
 OBSERVER = Path(__file__).with_name('verify_host_observe.py')
-REFERENCE_TIMEOUT_SECS = 300
 NETWORK_TIMEOUT_SECS = 60
 OBSERVE_TIMEOUT_SECS = 900
 DETAIL_TAIL_CHARS = 400
-
-
-class ReferenceUnobserved(RuntimeError):
-    """This workstation's own environment facts, the reference every host is held to, are unreadable."""
 
 
 def _run(argv: list[str], timeout: float, stdin: bytes = b'') -> tuple[int | None, str, str]:
@@ -49,15 +45,6 @@ def _run(argv: list[str], timeout: float, stdin: bytes = b'') -> tuple[int | Non
         return None, '', str(exc)
     stderr = proc.stderr.decode(errors='replace').strip()
     return proc.returncode, proc.stdout.decode(errors='replace'), f'exit {proc.returncode}: {stderr[-DETAIL_TAIL_CHARS:]}'
-
-
-def _reference() -> EnvironmentFacts:
-    returncode, stdout, detail = _run(
-        [sys.executable, '-I', str(OBSERVER), '--environment-only'], REFERENCE_TIMEOUT_SECS,
-    )
-    if returncode != 0:
-        raise ReferenceUnobserved(f'observing this workstation failed: {detail}')
-    return EnvironmentFacts.from_json(stdout)
 
 
 def _network(spec: contract.HostSpec, ssh: list[str]) -> contract.NetworkFacts:
@@ -129,13 +116,8 @@ def main(argv: list[str] | None = None) -> int:
     except (contract.ContractError, RosterFileError) as exc:
         print(f'check_verify_host: {exc}', file=sys.stderr)
         return 2
-    try:
-        reference = _reference()
-    except ReferenceUnobserved as exc:
-        print(f'check_verify_host: {exc}', file=sys.stderr)
-        return 2
     ssh_bin = os.environ.get(contract.SSH_BIN_ENV, contract.DEFAULT_SSH_BIN)
-    rows = evaluate(spec, observe(spec, ssh_bin), reference)
+    rows = evaluate(spec, observe(spec, ssh_bin), verify_host_observe.observe_environment())
     print(json.dumps({'host': spec.name, 'rows': rows}, indent=2) if args.json else _table(rows))
     return 1 if any(row['verdict'] == 'fail' for row in rows) else 0
 

@@ -146,7 +146,7 @@ fi
 for tool in node npm npx; do
     ln -sfn "$HOME/.local/node/bin/$tool" "$HOME/.local/bin/$tool"
 done
-say "uv $(uv --version | cut -d' ' -f2); node $(node --version); CPython 3.13 at $(uv python find 3.13)"
+say "uv $(uv --version | cut -d' ' -f2); node $(node --version); uv-managed CPython 3.13 at $(uv python find --managed-python 3.13)"
 REMOTE
 }
 
