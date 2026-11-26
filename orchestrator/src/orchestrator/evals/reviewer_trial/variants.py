@@ -13,6 +13,7 @@ from types import MappingProxyType
 
 from orchestrator.agents.review_briefing import ReviewBriefing
 from orchestrator.agents.roles import AgentRole, build_reviewer_role
+from orchestrator.config import OrchestratorConfig
 
 # ---------------------------------------------------------------------------
 # Spec + config types
@@ -61,8 +62,23 @@ def campaign_arms(
 # Trial reviewer role builder
 # ---------------------------------------------------------------------------
 
+def trial_reviewer_max_turns(override: int | None = None) -> int:
+    """*override*, or production's reviewer turn cap when it is None; never below 1.
+
+    Production resolves a reviewer's cap through ``routing.resolve_route``'s
+    config layer, ``max_turns.reviewer``, which no shipped routing rule
+    overrides for a reviewer.
+    """
+    turns = OrchestratorConfig().max_turns.reviewer if override is None else override
+    if turns < 1:
+        raise ValueError(f'a reviewer turn cap must be at least 1, got {turns}')
+    return turns
+
+
 def build_trial_reviewer_role(
-    spec_in: ReviewerSpec, briefing: ReviewBriefing = ReviewBriefing.DIFF_ONLY,
+    spec_in: ReviewerSpec,
+    briefing: ReviewBriefing = ReviewBriefing.DIFF_ONLY,
+    max_turns: int | None = None,
 ) -> AgentRole:
     """The production ``reviewer_<name>`` role of the *briefing* generation, set up for a trial.
 
@@ -70,7 +86,8 @@ def build_trial_reviewer_role(
     ``reviewer_<name>`` identity are production's, so the trial measures the
     prompt production dispatches; the verdict-tools server checks the emitted
     ``reviewer`` field against ``role.name``. The trial takes model and budget
-    from the spec; the runner passes ``spec_in.effort`` itself, since
+    from the spec, and the turn cap from production unless *max_turns*
+    overrides it; the runner passes ``spec_in.effort`` itself, since
     AgentRole has no effort field.
     """
     role = build_reviewer_role(spec_in.name, spec_in.specialization, briefing)
@@ -79,7 +96,7 @@ def build_trial_reviewer_role(
         disallowed_tools=['Edit', 'Write'],
         default_model=spec_in.model,
         default_budget=spec_in.budget,
-        default_max_turns=30,
+        default_max_turns=trial_reviewer_max_turns(max_turns),
     )
 
 
