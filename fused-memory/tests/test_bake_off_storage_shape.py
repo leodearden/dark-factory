@@ -45,7 +45,7 @@ from _fm_helpers import lease_isolated_monkeypatch, load_script_module
 from _fm_qdrant_live import QDRANT_URL, qdrant_skipif
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
-from fused_memory.config.checkout_anchor import anchor_at_checkout
+from fused_memory.config.schema import QueueConfig
 
 pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
@@ -4451,7 +4451,7 @@ def _driver_config() -> _FakeConfig:
         # anchored at the checkout, so from every cwd it is the live server's
         # own queue DB.  The driver must repoint it at a per-run temp dir
         # before `MemoryService.initialize()` can attach to it.
-        queue=types.SimpleNamespace(data_dir=anchor_at_checkout('./data/queue')),
+        queue=types.SimpleNamespace(data_dir=QueueConfig().data_dir),
     )
 
 
