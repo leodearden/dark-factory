@@ -3813,11 +3813,12 @@ class Scheduler:
         names that cohort; a tick with no lock held changes nothing, and
         ``starvation_cap.py`` holds the rule.  The task records are the
         tick's read at ``ctx.tasks_read_at``, and their claimant heartbeats
-        are judged as of that instant, because the phases between that read
-        and this one can outlast ``claimant_liveness_ttl_secs``.  Blockers,
-        in-flight slots and held locks are read here with no await between
-        them, so they are one snapshot of the lock state after the tick's
-        live status read; each task's blockers are read once per pass.
+        are judged as of that instant
+        (plans/scheduler-dispatch-scoring-and-lock-layer-prd.md C4 "Cap L1"
+        *Liveness*).  Blockers, in-flight slots and held locks are read here
+        with no await between them, so they are one snapshot of the lock
+        state after the tick's live status read; each task's blockers are
+        read once per pass.
         """
         if ctx.tasks_read_at is None:
             raise ValueError(
