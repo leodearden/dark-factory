@@ -1,6 +1,7 @@
 """The defect filer's pass (plans/client-feed-prd.md §14.4, §14.5): B25-B29 filing each portal report once as a fix and its gate, B35 its failures and the loop, B38-B40 rulings."""
 
 import contextlib
+import json
 import logging
 import tempfile
 import threading
@@ -334,6 +335,41 @@ def test_a_symlinked_inbox_is_named_unusable_holds_the_cursor_and_calls_nothing(
     [warning] = [record.getMessage() for record in caplog.records if record.levelno == logging.WARNING]
     assert PROJECT in warning
     assert 'symlink' in warning
+
+
+RAW_CANARY = 'CANARY-RAW-11881'
+
+
+def _rejection_warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == 'client_feed.filer' and record.levelno == logging.WARNING and 'rejected' in record.getMessage()
+    ]
+
+
+def test_rejected_inbox_lines_are_logged_with_their_offsets_and_never_their_text(
+    gated: World, caplog: pytest.LogCaptureFixture
+) -> None:
+    append_inbox(gated.in_dir, reported(2, 3, at=AT))
+    offset = gated.inbox_size()
+    raw = {**reported(2, 4, at=AT, seq=2).model_dump(mode='json'), 'text': RAW_CANARY}
+    with (gated.in_dir / INBOX_FILENAME).open('a') as inbox:
+        inbox.write(json.dumps(raw) + '\n')
+
+    with caplog.at_level(logging.WARNING, logger='client_feed.filer'):
+        report, cursor = gated.run()
+
+    assert report.rejected_lines == 1
+    assert report.converged == (REF,)
+    [rejection] = _rejection_warnings(caplog)
+    assert all(token in rejection for token in (PROJECT, '1', str(offset)))
+    assert all(RAW_CANARY not in record.getMessage() for record in caplog.records)
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger='client_feed.filer'):
+        clean, _ = gated.run(cursor)
+    assert clean.rejected_lines == 0
+    assert _rejection_warnings(caplog) == []
 
 
 SECRET_OBSERVED = 'SECRET-OBSERVED'
