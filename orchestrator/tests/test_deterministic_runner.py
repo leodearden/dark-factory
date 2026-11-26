@@ -33,7 +33,7 @@ from escalation.queue import EscalationQueue
 # inside each test, as this file has always done): a `parametrize` decorator is
 # evaluated at collection time, so the disposition matrix below cannot name its
 # enum members any other way.
-from orchestrator.before_done_script import ProcessTeardown
+from orchestrator.before_done_script import REAP_GRACE_SECS, ProcessTeardown
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -3337,7 +3337,7 @@ class TestDefaultRunnerInnerTimeoutDeployHonesty:
             )
 
             survivor_pid = read_survivor_pid(pidfile)
-            assert await asyncio.to_thread(wait_pid_gone, survivor_pid, timeout=3.0), (
+            assert await asyncio.to_thread(wait_pid_gone, survivor_pid, timeout=REAP_GRACE_SECS), (
                 f'THE MEASUREMENT the assertions below are about: survivor pid '
                 f'{survivor_pid}, holding the pipe of a reaped script, must die '
                 f'with the group'
