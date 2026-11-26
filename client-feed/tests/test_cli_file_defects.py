@@ -21,8 +21,10 @@ from client_feed.defect_ref import check_ref, portal_ref
 from client_feed.filer_state import (
     CURSOR_NAME,
     LOCK_NAME,
+    STALLED_AFTER_ATTEMPTS,
     FilerCursor,
     FilerLockHeld,
+    RefRecord,
     held_state_dir,
 )
 from client_feed.filer_tools import CLOSED_TOOLS, READ_TOOLS, WRITE_TOOLS
@@ -200,6 +202,54 @@ def test_check_prints_the_reads_performed_and_the_writes_withheld_and_stores_not
         (name, arguments.get('ref')) for name, arguments in client.fake.calls
     ]
     assert sorted(path.name for path in client.state_dir.iterdir()) == [LOCK_NAME]
+    assert printed['stalled'] == {}
+
+
+def _store_cursor(config: Path, attempts: int) -> None:
+    """The cursor an earlier run left in S: REF refused `attempts` times by a hold commit_planning cannot release."""
+    record = RefRecord(attempts=attempts, last_tool='commit_planning', last_code='deferral_invalid')
+    with held_state_dir(load_filer_policy(config)) as state:
+        state.write_cursor(FilerCursor(refs={REF: record}))
+
+
+STALLED_RECORD = {
+    'attempts': STALLED_AFTER_ATTEMPTS,
+    'last_tool': 'commit_planning',
+    'last_code': 'deferral_invalid',
+    'fallback': None,
+}
+
+
+def test_check_names_a_stalled_ref_from_the_stored_cursor_and_exits_1(
+    client: Client, server: StubMcpServer, capsys: pytest.CaptureFixture[str]
+) -> None:
+    append_inbox(client.in_dir, reported(2, 3, at=AT))
+    config = client.config(server.url)
+    _store_cursor(config, STALLED_AFTER_ATTEMPTS)
+
+    code = main(['file-defects', '--config', str(config), '--check'])
+
+    assert code == 1
+    printed = json.loads(capsys.readouterr().out)
+    assert printed['ok'] is False
+    assert printed['problem'] is None
+    assert printed['stalled'] == {REF: STALLED_RECORD}
+    assert client.fake.tasks() == ()
+
+
+def test_check_passes_with_a_stored_ref_below_the_bound(
+    client: Client, server: StubMcpServer, capsys: pytest.CaptureFixture[str]
+) -> None:
+    append_inbox(client.in_dir, reported(2, 3, at=AT))
+    config = client.config(server.url)
+    _store_cursor(config, STALLED_AFTER_ATTEMPTS - 1)
+
+    code = main(['file-defects', '--config', str(config), '--check'])
+
+    assert code == 0
+    printed = json.loads(capsys.readouterr().out)
+    assert printed['ok'] is True
+    assert printed['stalled'] == {}
 
 
 def test_check_names_a_closed_tool_the_server_does_not_list(
@@ -253,3 +303,17 @@ def test_check_against_a_closed_port_names_the_transport_failure(
     assert printed['ok'] is False
     assert 'TRANSPORT' in printed['problem']
     assert not (client.state_dir / CURSOR_NAME).exists()
+
+
+def test_check_against_a_closed_port_still_names_a_stalled_ref_read_from_the_stored_cursor(
+    client: Client, capsys: pytest.CaptureFixture[str]
+) -> None:
+    config = client.config(_closed_url())
+    _store_cursor(config, STALLED_AFTER_ATTEMPTS)
+
+    code = main(['file-defects', '--config', str(config), '--check'])
+
+    assert code == 1
+    printed = json.loads(capsys.readouterr().out)
+    assert 'TRANSPORT' in printed['problem']
+    assert printed['stalled'] == {REF: STALLED_RECORD}
