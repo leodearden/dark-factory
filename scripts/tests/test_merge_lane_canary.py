@@ -616,3 +616,83 @@ def test_chain_attributed_episodes_need_a_chain_landing_in_the_candidate_range()
     assert canary.chain_attributed_episodes([first], ledger, ['at-green']) == 0
     assert canary.chain_attributed_episodes([second], ledger, ['later', 'unlanded']) == 0
     assert canary.chain_attributed_episodes([], ledger, ['in']) == 0
+
+
+# ---------------------------------------------------------------------------
+# evaluate: the ten D12 rows, and what a false row recommends.
+# ---------------------------------------------------------------------------
+
+D12_KEYS = (
+    'gates_per_landing', 'voids_per_landing', 'p_gate_after_gate', 'laptop_finished_share',
+    'frozen_tip_violations', 'speculation_accounting_violations', 'chain_attributed_red_main',
+    'queue_to_land_p50_hours', 'local_verify_hours_per_week', 'deep_chain_p90_secs',
+)
+
+
+def healthy_figures(**overrides: Any) -> canary.CanaryFigures:
+    values: dict[str, Any] = {
+        'gates_per_landing': 0.2, 'voids_per_landing': 0.05, 'p_gate_after_gate': 0.1,
+        'laptop_finished_share': 0.05, 'frozen_tip_violations': 0,
+        'speculation_accounting_violations': 0, 'chain_attributed_red_main': 0,
+        'queue_to_land_p50_hours': 0.5, 'local_verify_hours_per_week': 40.0,
+        'deep_chain_p90_secs': 10800.0,
+    }
+    return canary.CanaryFigures(**{**values, **overrides})
+
+
+def test_evaluate_returns_the_ten_d12_rows_in_order_with_their_values():
+    rows = canary.evaluate(healthy_figures())
+
+    assert tuple(row.key for row in rows) == D12_KEYS
+    assert [row.value for row in rows] == [0.2, 0.05, 0.1, 0.05, 0, 0, 0, 0.5, 40.0, 10800.0]
+    assert all(row.holds for row in rows)
+    assert all(row.rule and row.label for row in rows)
+
+
+def test_evaluate_carries_each_limit_comparison_and_baseline():
+    by_key = {row.key: row for row in canary.evaluate(healthy_figures())}
+    lt, le, eq0 = canary.Comparison.LT, canary.Comparison.LE, canary.Comparison.EQ0
+
+    assert {key: (row.limit, row.comparison, row.baseline) for key, row in by_key.items()} == {
+        'gates_per_landing': (0.3, lt, '0.84'),
+        'voids_per_landing': (0.1, lt, '0.78'),
+        'p_gate_after_gate': (0.3, lt, '0.79'),
+        'laptop_finished_share': (0.1, lt, '33%'),
+        'frozen_tip_violations': (0, eq0, '—'),
+        'speculation_accounting_violations': (0, eq0, '—'),
+        'chain_attributed_red_main': (0, eq0, '—'),
+        'queue_to_land_p50_hours': (1.0, lt, '5.4 h'),
+        'local_verify_hours_per_week': (60.0, lt, '~100 h'),
+        'deep_chain_p90_secs': (10800.0, le, '—'),
+    }
+
+
+def test_exactly_the_three_invariant_rows_are_chain_traced():
+    traced = {row.key for row in canary.evaluate(healthy_figures()) if row.chain_traced}
+    assert traced == {'frozen_tip_violations', 'speculation_accounting_violations', 'chain_attributed_red_main'}
+
+
+def test_false_predicates_include_unmeasured_rows():
+    rows = canary.evaluate(healthy_figures(gates_per_landing=0.84, deep_chain_p90_secs=None))
+    assert [row.key for row in canary.false_predicates(rows)] == ['gates_per_landing', 'deep_chain_p90_secs']
+
+
+def test_a_false_gate_row_alone_does_not_recommend_chain_cap_zero():
+    rows = canary.evaluate(healthy_figures(gates_per_landing=0.84, voids_per_landing=0.78))
+    assert canary.recommends_chain_cap_zero(rows) is False
+
+
+@pytest.mark.parametrize('key', ['frozen_tip_violations', 'speculation_accounting_violations', 'chain_attributed_red_main'])
+def test_a_false_chain_traced_row_recommends_chain_cap_zero(key):
+    assert canary.recommends_chain_cap_zero(canary.evaluate(healthy_figures(**{key: 1}))) is True
+
+
+def test_an_unmeasured_chain_traced_row_recommends_chain_cap_zero():
+    rows = canary.evaluate(healthy_figures(chain_attributed_red_main=None))
+    assert canary.recommends_chain_cap_zero(rows) is True
+
+
+def test_all_rows_holding_recommend_nothing():
+    rows = canary.evaluate(healthy_figures())
+    assert canary.false_predicates(rows) == ()
+    assert canary.recommends_chain_cap_zero(rows) is False
