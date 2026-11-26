@@ -8,14 +8,18 @@ from orchestrator.config import default_price_table
 from orchestrator.evals.reviewer_trial.variants import (
     _SPEC_COMPREHENSIVE,
     ALL_VARIANTS,
+    CAMPAIGN_VARIANTS,
+    FABLE_EVIDENCE_VARIANTS,
     REVIEWER_REFRESH_VARIANTS,
     VARIANT_A,
     VARIANT_A_XHIGH,
     VARIANT_B,
     VARIANT_BASELINE,
     VARIANT_C,
+    VARIANT_CODEX_SOL62,
     VARIANT_CROSS_FAMILY,
     VARIANT_D,
+    VARIANT_FABLE52_SOLO,
     VARIANT_SONNET5_SOLO,
     ReviewerSpec,
     build_trial_reviewer_role,
@@ -312,3 +316,57 @@ class TestBriefingArms:
         assert role.prompt_harness_version == production.prompt_harness_version
         assert role.system_prompt == production.system_prompt
         assert role.allowed_tools == production.allowed_tools
+
+
+class TestD2Round2Variants:
+    """The d2 reviewer campaign's round-2 arms: a Fable 5.2 and a GPT-6.2 Sol
+    generalist, each the incumbent's single-generalist shape."""
+
+    def test_fable52_solo_is_one_fable_5_2_generalist(self) -> None:
+        assert VARIANT_FABLE52_SOLO.name == 'variant_fable52_solo'
+        assert len(VARIANT_FABLE52_SOLO.reviewers) == 1
+        reviewer = VARIANT_FABLE52_SOLO.reviewers[0]
+        assert (reviewer.name, reviewer.model, reviewer.backend, reviewer.effort, reviewer.budget) == (
+            'comprehensive_reviewer', 'claude-fable-5-2', 'claude', 'high', 10.0,
+        )
+        assert reviewer.specialization == _SPEC_COMPREHENSIVE
+        assert reviewer.oauth_token_env is None
+        assert reviewer.env_overrides is None
+
+    def test_codex_sol62_is_one_gpt_6_2_sol_generalist_on_the_chatgpt_login(self) -> None:
+        assert VARIANT_CODEX_SOL62.name == 'variant_codex_sol62'
+        assert len(VARIANT_CODEX_SOL62.reviewers) == 1
+        reviewer = VARIANT_CODEX_SOL62.reviewers[0]
+        assert (reviewer.name, reviewer.model, reviewer.backend, reviewer.effort, reviewer.budget) == (
+            'comprehensive_reviewer', 'gpt-6.2-sol', 'codex', 'high', 5.0,
+        )
+        assert reviewer.specialization == _SPEC_COMPREHENSIVE
+        assert reviewer.oauth_token_env is None
+        assert reviewer.env_overrides is None
+
+    def test_no_campaign_arm_runs_gpt_6_2_astra(self) -> None:
+        models = {r.model for variant in CAMPAIGN_VARIANTS.values() for r in variant.reviewers}
+        assert 'gpt-6.2-astra' not in models
+
+    def test_the_campaign_registry_names_every_evidence_arm_and_both_new_arms(self) -> None:
+        for name, variant in CAMPAIGN_VARIANTS.items():
+            assert name == variant.name
+        assert {
+            'variant_a', 'variant_sonnet5_solo', 'variant_fable51_solo', 'variant_cross_family',
+            'variant_a_xhigh', 'variant_fable52_solo', 'variant_codex_sol62',
+        } <= set(CAMPAIGN_VARIANTS)
+        assert [v.name for v in FABLE_EVIDENCE_VARIANTS] == [
+            'variant_a', 'variant_sonnet5_solo', 'variant_fable51_solo', 'variant_cross_family',
+            'variant_a_xhigh',
+        ]
+
+    def test_round_2_d2_arms_are_named_for_d2_and_keep_their_models(self) -> None:
+        arms = campaign_arms(
+            [CAMPAIGN_VARIANTS[n] for n in ('variant_a_xhigh', 'variant_fable52_solo', 'variant_codex_sol62')],
+            [ReviewBriefing.CONTEXT_COMPLETE],
+        )
+
+        assert [arm.name for arm in arms] == [
+            'variant_a_xhigh_d2', 'variant_fable52_solo_d2', 'variant_codex_sol62_d2',
+        ]
+        assert [arm.reviewers[0].model for arm in arms] == ['opus', 'claude-fable-5-2', 'gpt-6.2-sol']
