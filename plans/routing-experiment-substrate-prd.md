@@ -70,12 +70,13 @@ imbalance table on an unchanged window and exits non-zero when the split is skew
   must be checked on an unchanged window before arming.
 - Where the contrast lives: dark-factory stays out of experiment 1 (its configured implementer
   turn cap is 160, so arm 1 would change the affected subset's turns from 120 to 160, and its yaml
-  carries the effort experiment's own splits); its yaml keeps the pre-experiment table. Reify
-  restates the rule list and its scheduler is halted (2026-11-02 ruling). The treated population is the five client/greenfield projects,
-  about 2,000 implementer-reaching tasks per month between them, so roughly 500 per arm per
-  fortnight; the affected subset (plans with exactly 3 modules and fewer than 12 steps) is
-  unknown until α records `plan_modules`, which is why the sample target is set on the affected
-  subset and the gate is dated at 28 days with an interim read at 14.
+  will carry the effort experiment's own splits, task 10581); its yaml keeps the pre-experiment
+  table. Reify restates the rule list and its scheduler is halted (2026-11-02 ruling). The
+  treated population is the five client/greenfield projects, about 2,000 implementer-reaching
+  tasks per month between them, so roughly 500 per arm per fortnight; the affected subset (plans
+  with exactly 3 modules and fewer than 12 steps) is unknown until α records `plan_modules`,
+  which is why the sample target is set on the affected subset and the gate is dated at 28 days
+  with an interim read at 14.
 - The curator (`fused-memory/src/fused_memory/middleware/task_curator.py::CURATOR_OUTPUT_SCHEMA`,
   sonnet) already returns an optional `rewritten_task` that
   `task_interceptor.py` applies on create via `CandidateTask.from_rewritten_task`; its schema has
@@ -144,6 +145,13 @@ from the two rules and reloading. Sample target: 400 affected-subset tasks per a
 whichever first. δ arms it: a deterministic leaf whose `before_done` script runs the readout in
 `--aa` mode on the trailing 30 days with the experiment salt (must exit 0), then issues
 `reload_config` to every running unit and records the flip timestamp in its result.
+
+Sequencing hazard: every load re-reads `defaults.yaml` from main (see "Pre-conditions for
+activating"), so once γ lands, any unit that restarts (the fleet redeploy, a watchdog revival)
+runs the split rules before δ fires. That contaminates both δ's trailing A/A window and the flip
+time η anchors on. So δ runs as soon as γ lands, and the A/A window's end and the arm start are
+taken from γ's landing on main (or, per unit, its first `large-plan-modules-4`
+`routing_decision`), never from δ's reload time.
 
 ### Experiment 2: the curator hint (ε)
 
