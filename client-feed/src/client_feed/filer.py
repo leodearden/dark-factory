@@ -402,6 +402,18 @@ def _read(policy: Policy, offset: int) -> tuple[InboxRead, int]:
         return read_inbox(policy.in_dir, offset=0), 0
 
 
+def _log_rejected(project_id: str, read: InboxRead) -> None:
+    """The lines failing the inbox contract, by offset only: their detail can echo raw client text."""
+    if read.rejected:
+        offsets = ', '.join(str(line.offset) for line in read.rejected)
+        logger.warning(
+            'inbox of %s: rejected %d lines that fail the inbox contract (offsets %s)',
+            project_id,
+            len(read.rejected),
+            offsets,
+        )
+
+
 def run_pass(policy: Policy, tools: ClosedTools, cursor: FilerCursor) -> tuple[PassReport, FilerCursor]:
     """One pass over the inbox from the cursor; stateless, so the caller stores the cursor it returns."""
     try:
@@ -422,6 +434,7 @@ def run_pass(policy: Policy, tools: ClosedTools, cursor: FilerCursor) -> tuple[P
             inbox_problem=str(exc.problem),
         )
         return unusable, cursor
+    _log_rejected(policy.project_id, read)
     outcomes: dict[str, _Outcome] = {}
     for ref, state in _ref_states(read, policy.project_id).items():
         record = cursor.refs.get(ref)
