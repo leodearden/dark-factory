@@ -27,6 +27,9 @@ from shared.secret_env import is_secret_env_name
 from shared.secret_redaction import FileChangedDuringRedaction
 from shared.testing_mcp_stub import StubMcpServer
 from shared.transcript_archive import STAGING_SUFFIX
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 POOL_A = 'sk-ant-oat01-' + 'Lv' * 17 + 'A'
 OPENAI = 'sk-proj-' + 'Ok' * 20
