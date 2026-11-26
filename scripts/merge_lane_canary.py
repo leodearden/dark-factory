@@ -16,7 +16,8 @@ value FAILs".
 """
 from __future__ import annotations
 
-from collections import defaultdict
+import statistics
+from collections import Counter, defaultdict
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -25,6 +26,7 @@ from itertools import pairwise
 from typing import Any
 
 import merge_lane_throughput as mlt
+from merge_deep_canary_predicate import pct
 
 Event = Mapping[str, Any]
 
@@ -374,3 +376,190 @@ def queue_to_land(finalized: Sequence[Event]) -> QueueToLand:
     return QueueToLand(
         p50_hours=None if p50 is None else p50 / 3600.0, n=series['n'], n_missing=series['n_missing'],
     )
+
+
+# ---------------------------------------------------------------------------
+# Chain figures over merge_verify payloads: chain_items, chain_task_ids and
+# chain_depth_reason {basis, pass_estimate, row: [threshold, depth], queue_depth}.
+# ---------------------------------------------------------------------------
+
+DEEP_CHAIN_MIN_ITEMS = 2
+UNSIZED = 'unsized'
+
+
+def _chain_items(event: Event) -> int | None:
+    raw = _data(event).get('chain_items')
+    return raw if isinstance(raw, int) and not isinstance(raw, bool) else None
+
+
+def _duration_secs(event: Event) -> float | None:
+    millis = _number(_data(event).get('duration_ms'))
+    return None if millis is None else millis / 1000.0
+
+
+def deep_chain_p90_secs(verify: Sequence[Event]) -> float | None:
+    """Nearest-rank p90 of deep verifies' (``chain_items`` >= 2) duration, the 3190 script's rule."""
+    secs = [
+        duration for e in verify
+        if (_chain_items(e) or 0) >= DEEP_CHAIN_MIN_ITEMS and (duration := _duration_secs(e)) is not None
+    ]
+    return pct(secs, 0.9)
+
+
+def chain_items_distribution(verify: Sequence[Event]) -> dict[int, int]:
+    """``chain_items`` -> number of merge verifies, per merge_lane_throughput.compute_chains."""
+    return mlt.compute_chains([], [dict(e) for e in verify])['chain_items']['distribution']
+
+
+def _depth_reason(event: Event) -> Mapping[str, Any] | None:
+    reason = _data(event).get('chain_depth_reason')
+    return reason if isinstance(reason, Mapping) else None
+
+
+def depth_reason_tally(verify: Sequence[Event]) -> dict[str, int]:
+    """Merge verifies by ``chain_depth_reason.basis``; a null reason is :data:`UNSIZED`."""
+    return dict(Counter(
+        UNSIZED if (reason := _depth_reason(e)) is None else str(reason.get('basis'))
+        for e in verify
+    ))
+
+
+class Starvation(StrEnum):
+    FULL = 'full'
+    TOO_FEW_WAITING = 'too_few_waiting'
+    OTHER = 'other'
+
+
+def _policy_depth(reason: Mapping[str, Any]) -> int | None:
+    row = reason.get('row')
+    depth = row[1] if isinstance(row, list) and len(row) == 2 else None
+    return depth if isinstance(depth, int) and not isinstance(depth, bool) else None
+
+
+def _starvation(event: Event) -> Starvation | None:
+    """How a policy-sized verify's chain compares with the depth its policy row chose."""
+    reason, items = _depth_reason(event), _chain_items(event)
+    depth = None if reason is None else _policy_depth(reason)
+    if reason is None or depth is None or items is None:
+        return None
+    if items >= depth:
+        return Starvation.FULL
+    waiting = _number(reason.get('queue_depth'))
+    return Starvation.TOO_FEW_WAITING if waiting is not None and waiting < depth else Starvation.OTHER
+
+
+@dataclass(frozen=True)
+class DepthStarved:
+    sized: int
+    starved: int
+    too_few_waiting: int
+    other: int
+    share_of_verifies: float | None
+
+
+def depth_starved(verify: Sequence[Event]) -> DepthStarved:
+    """Policy-sized verifies whose chain fell short of the policy row's depth.
+
+    ``too_few_waiting``: the queue held fewer items than that depth;
+    ``share_of_verifies`` is starved / every merge verify passed in.
+    """
+    tally = Counter(kind for e in verify if (kind := _starvation(e)) is not None)
+    starved = tally[Starvation.TOO_FEW_WAITING] + tally[Starvation.OTHER]
+    return DepthStarved(
+        sized=sum(tally.values()), starved=starved,
+        too_few_waiting=tally[Starvation.TOO_FEW_WAITING], other=tally[Starvation.OTHER],
+        share_of_verifies=_share(starved, len(verify)),
+    )
+
+
+def _red_chain_ends(verify: Sequence[Event]) -> dict[str, list[datetime]]:
+    """Member task -> end of each failed deep verify whose chain carried it."""
+    ends: dict[str, list[datetime]] = defaultdict(list)
+    for event in verify:
+        data, moment = _data(event), _at(event)
+        members = data.get('chain_task_ids')
+        if (_chain_items(event) or 0) < DEEP_CHAIN_MIN_ITEMS or data.get('passed') is not False:
+            continue
+        if moment is not None and isinstance(members, list):
+            for member in members:
+                ends[str(member)].append(moment)
+    return ends
+
+
+def _follows_unretired_red(
+    task: str, solo_start: datetime,
+    red_ends: Mapping[str, list[datetime]], finalizes: Mapping[str, list[datetime]],
+) -> bool:
+    return any(
+        red_end <= solo_start
+        and not any(red_end < retired < solo_start for retired in finalizes.get(task, ()))
+        for red_end in red_ends.get(task, ())
+    )
+
+
+def _next_finalize_state(finalized: Sequence[Event], task: str, after: datetime) -> object:
+    later = [
+        (moment, _data(e).get('state')) for e in finalized
+        if str(e.get('task_id')) == task and (moment := _at(e)) is not None and moment > after
+    ]
+    return min(later, key=lambda pair: pair[0])[1] if later else None
+
+
+@dataclass(frozen=True)
+class PostRedSolos:
+    count: int
+    hours: float
+    share_of_verify_hours: float | None
+    next_finalize_blocked: int
+
+
+def _hours(span: Interval) -> float:
+    return (span[1] - span[0]).total_seconds() / 3600.0
+
+
+def post_red_chain_solos(
+    verify: Sequence[Event], finalized: Sequence[Event], lo: datetime, hi: datetime,
+) -> PostRedSolos:
+    """Solo (``chain_items`` 1) verifies in ``[lo, hi)`` re-verifying a member of a red chain.
+
+    The red chain is an earlier failed deep verify that ended at or before the
+    solo started (it may predate *lo*: pass a lookback), and the member's
+    request was not retired (no ``merge_finalized`` row) between the two.
+    """
+    red_ends, finalizes = _red_chain_ends(verify), _times_by_task(finalized)
+    in_window = [
+        (e, span) for e in verify
+        if (span := _interval(e, 'duration_ms')) is not None and lo <= span[1] < hi
+    ]
+    solos = [
+        (str(e.get('task_id')), span) for e, span in in_window
+        if _chain_items(e) == 1
+        and _follows_unretired_red(str(e.get('task_id')), span[0], red_ends, finalizes)
+    ]
+    solo_hours = sum(_hours(span) for _, span in solos)
+    return PostRedSolos(
+        count=len(solos), hours=solo_hours,
+        share_of_verify_hours=_share(solo_hours, sum(_hours(span) for _, span in in_window)),
+        next_finalize_blocked=sum(
+            1 for task, span in solos if _next_finalize_state(finalized, task, span[1]) == 'blocked'
+        ),
+    )
+
+
+@dataclass(frozen=True)
+class ChainWall:
+    n: int
+    p50_secs: float
+    max_secs: float
+
+
+def per_item_chain_wall(verify: Sequence[Event], min_items: int = 8) -> ChainWall | None:
+    """Verify wall time per chained item, over chains of at least *min_items*; None without one."""
+    per_item = [
+        secs / items for e in verify
+        if (items := _chain_items(e)) is not None and items >= min_items
+        and (secs := _duration_secs(e)) is not None
+    ]
+    if not per_item:
+        return None
+    return ChainWall(n=len(per_item), p50_secs=statistics.median(per_item), max_secs=max(per_item))
