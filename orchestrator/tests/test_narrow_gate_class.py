@@ -1,6 +1,9 @@
 """Which merge changes qualify for the narrow merge gate: path globs and the classifiers (task 5411)."""
 from __future__ import annotations
 
+import textwrap
+from collections.abc import Callable
+
 import pytest
 
 from orchestrator.narrow_gate_class import (
@@ -9,8 +12,10 @@ from orchestrator.narrow_gate_class import (
     GateMiss,
     MergeGateResolution,
     MissReason,
+    classify_change,
     classify_docs_change,
     matches_path_glob,
+    python_comments_only,
 )
 
 DOCS_PATHS = ['*.md', 'docs/**', 'plans/*.md', 'README*', 'skills/**/*.md']
@@ -127,3 +132,184 @@ class TestClassifyDocsChange:
     @pytest.mark.parametrize('path', ['/etc/passwd.md', 'docs/../src/x.md', '../README.md'])
     def test_an_unnormalised_path_takes_the_full_gate(self, path: str) -> None:
         assert classify_docs_change([_modified(path)], ['**']) == _full(MissReason.NOT_ALLOWLISTED, path)
+
+
+def _src(text: str) -> str:
+    return textwrap.dedent(text).lstrip('\n')
+
+
+_BASE = _src('''
+    """Module docstring."""
+    import os
+
+
+    class Thing:
+        """Class docstring."""
+
+        def method(self) -> str:
+            """Method docstring."""
+            label = 'a label'
+            return label + os.sep
+
+
+    async def fetch() -> int:
+        """Async docstring."""
+        count = 1  # noqa: F841
+        total = 2
+        return total
+''')
+
+
+class TestPythonCommentsOnly:
+
+    @pytest.mark.parametrize(('old', 'new'), [
+        ("label = 'a label'\n", "label = 'a label'  # a new comment\n"),
+        ('count = 1  # noqa: F841\n', 'count = 1  # noqa: F841  # reworded\n'),
+        ('"""Module docstring."""', '"""A reworded module docstring."""'),
+        ('"""Class docstring."""', '"""A reworded class docstring."""'),
+        ('"""Method docstring."""', '"""A reworded method docstring."""'),
+        ('"""Async docstring."""', '"""A reworded async docstring."""'),
+        ('    """Async docstring."""\n', ''),
+        ('count = 1  # noqa: F841\n', 'count = 1  # type: ignore[assignment]\n'),
+    ])
+    def test_a_comment_or_docstring_edit_is_comments_only(self, old: str, new: str) -> None:
+        assert _BASE.count(old) == 1
+        assert python_comments_only(_BASE, _BASE.replace(old, new)) is True
+
+    def test_adding_a_docstring_where_none_existed_is_comments_only(self) -> None:
+        base = _src('''
+            def f() -> int:
+                return 1
+        ''')
+        head = _src('''
+            def f() -> int:
+                """Now documented."""
+                return 1
+        ''')
+
+        assert python_comments_only(base, head) is True
+
+    @pytest.mark.parametrize(('old', 'new'), [
+        ("label = 'a label'", "label = 'another label'"),
+        ('total = 2\n    return total', 'subtotal = 2\n    return subtotal'),
+        ('count = 1  # noqa: F841\n    total = 2', 'total = 2\n    count = 1  # noqa: F841'),
+    ])
+    def test_a_code_edit_is_not_comments_only(self, old: str, new: str) -> None:
+        assert _BASE.count(old) == 1
+        assert python_comments_only(_BASE, _BASE.replace(old, new)) is False
+
+    def test_a_changed_shebang_is_not_comments_only(self) -> None:
+        body = 'print(1)\n'
+
+        assert python_comments_only('#!/usr/bin/env python3\n' + body, '#!/usr/bin/python\n' + body) is False
+
+    def test_adding_a_shebang_is_not_comments_only(self) -> None:
+        assert python_comments_only('print(1)\n', '#!/usr/bin/env python3\nprint(1)\n') is False
+
+    def test_an_unchanged_shebang_with_a_comment_edit_is_comments_only(self) -> None:
+        base = '#!/usr/bin/env python3\nprint(1)\n'
+
+        assert python_comments_only(base, base + '# trailing\n') is True
+
+    def test_a_changed_coding_cookie_is_not_comments_only(self) -> None:
+        body = "label = 'a'\n"
+
+        assert python_comments_only(body, '# -*- coding: latin-1 -*-\n' + body) is False
+
+    @pytest.mark.parametrize(('base', 'head'), [
+        ('def broken(:\n', 'def broken(:\n# comment\n'),
+        ('x = 1\n', 'x = (\n'),
+        ('x = (\n', 'x = 1\n'),
+    ])
+    def test_a_syntax_error_on_either_side_is_not_comments_only(self, base: str, head: str) -> None:
+        assert python_comments_only(base, head) is False
+
+    def test_the_inputs_are_not_mutated_between_calls(self) -> None:
+        head = _BASE.replace('"""Module docstring."""', '"""Reworded."""')
+
+        assert python_comments_only(_BASE, head) is True
+        assert python_comments_only(_BASE, head.replace("'a label'", "'x'")) is False
+
+
+_COMMENT_ONLY_PY = ("x = 1\n", "x = 1  # explained\n")
+_CODE_CHANGED_PY = ("x = 1\n", "x = 2\n")
+
+
+def _reader(blobs: dict[str, tuple[str | None, str | None]]) -> Callable[[str], tuple[str | None, str | None]]:
+    return lambda path: blobs[path]
+
+
+class TestClassifyChange:
+
+    def test_only_allowlisted_docs_take_the_docs_gate(self) -> None:
+        changes = [_modified('README.md'), _added('docs/a.md')]
+
+        assert classify_change(changes, DOCS_PATHS, _reader({})) == GateClassification(MergeGateResolution.DOCS)
+
+    def test_docs_plus_a_comment_only_py_take_the_comments_gate(self) -> None:
+        changes = [_modified('README.md'), _modified('pkg/mod.py')]
+
+        classification = classify_change(changes, DOCS_PATHS, _reader({'pkg/mod.py': _COMMENT_ONLY_PY}))
+
+        assert classification == GateClassification(MergeGateResolution.COMMENTS)
+
+    def test_a_comment_only_py_alone_takes_the_comments_gate(self) -> None:
+        classification = classify_change(
+            [_modified('pkg/mod.py')], DOCS_PATHS, _reader({'pkg/mod.py': _COMMENT_ONLY_PY}),
+        )
+
+        assert classification == GateClassification(MergeGateResolution.COMMENTS)
+
+    def test_a_py_whose_ast_changed_takes_the_full_gate_naming_it(self) -> None:
+        changes = [_modified('README.md'), _modified('pkg/mod.py')]
+
+        classification = classify_change(changes, DOCS_PATHS, _reader({'pkg/mod.py': _CODE_CHANGED_PY}))
+
+        assert classification == _full(MissReason.CODE_CHANGED, 'pkg/mod.py')
+
+    @pytest.mark.parametrize('path', ['crates/a/src/lib.rs', 'dashboard/src/app.ts'])
+    def test_a_language_with_no_comment_predicate_takes_the_full_gate(self, path: str) -> None:
+        classification = classify_change([_modified(path)], DOCS_PATHS, _reader({path: ('// a\n', '// b\n')}))
+
+        assert classification == _full(MissReason.NO_COMMENT_PREDICATE, path)
+
+    def test_a_newly_added_py_takes_the_full_gate(self) -> None:
+        classification = classify_change(
+            [_added('pkg/new.py')], DOCS_PATHS, _reader({'pkg/new.py': (None, '# only a comment\n')}),
+        )
+
+        assert classification == _full(MissReason.CODE_CHANGED, 'pkg/new.py')
+
+    @pytest.mark.parametrize('pair', [(None, 'x = 1\n'), ('x = 1\n', None), (None, None)])
+    def test_an_unreadable_side_takes_the_full_gate(self, pair: tuple[str | None, str | None]) -> None:
+        classification = classify_change([_modified('pkg/mod.py')], DOCS_PATHS, _reader({'pkg/mod.py': pair}))
+
+        assert classification == _full(MissReason.UNDECODABLE, 'pkg/mod.py')
+
+    def test_a_deleted_py_takes_the_full_gate(self) -> None:
+        classification = classify_change([_deleted('pkg/mod.py')], DOCS_PATHS, _reader({}))
+
+        assert classification == _full(MissReason.DELETED, 'pkg/mod.py')
+
+    def test_a_mode_changed_py_takes_the_full_gate(self) -> None:
+        changes = [_modified('pkg/mod.py', old_mode='100644', new_mode='100755')]
+
+        classification = classify_change(changes, DOCS_PATHS, _reader({'pkg/mod.py': _COMMENT_ONLY_PY}))
+
+        assert classification == _full(MissReason.MODE_CHANGED, 'pkg/mod.py')
+
+    def test_an_empty_change_set_takes_the_full_gate(self) -> None:
+        assert classify_change([], DOCS_PATHS, _reader({})) == _full(MissReason.EMPTY_DELTA, None)
+
+    def test_the_miss_is_the_first_in_sorted_path_order(self) -> None:
+        changes = [_modified('z/lib.rs'), _modified('b/mod.py'), _modified('a/mod.py')]
+        blobs = {'z/lib.rs': ('', ''), 'b/mod.py': _CODE_CHANGED_PY, 'a/mod.py': _CODE_CHANGED_PY}
+
+        assert classify_change(changes, DOCS_PATHS, _reader(blobs)) == _full(MissReason.CODE_CHANGED, 'a/mod.py')
+
+    def test_a_docs_path_is_never_read(self) -> None:
+        changes = [_modified('README.md'), _modified('pkg/mod.py')]
+
+        classification = classify_change(changes, DOCS_PATHS, _reader({'pkg/mod.py': _COMMENT_ONLY_PY}))
+
+        assert classification.resolution is MergeGateResolution.COMMENTS
