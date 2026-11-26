@@ -605,7 +605,7 @@ def _unwrap_dispatch_envelope(result: object) -> dict:
     that simply does not carry its key: :func:`_extract_task` would report no
     task, and :func:`_extract_results_list` no results, for EVERY successful
     production call, as the adapter's ``get_statuses`` reader once did.  Corroborated by
-    ``orchestrator/src/orchestrator/scheduler.py::SchedulerFacade.get_statuses``, which
+    ``shared/src/shared/status_paging.py::read_status_page``, which
     parses the very same ``dispatch_tool`` result with
     ``shared.mcp_envelope.parse_tool_result(result, 'statuses', dict)`` — a
     parser that requires exactly ``result['result']['content'][i]['text']``.
@@ -616,7 +616,7 @@ def _unwrap_dispatch_envelope(result: object) -> dict:
     stand in for this generic unwrap, because it accepts ONLY the strict
     ``result.content[].text`` spelling and rejects every bare shape; where one
     tool's reader must match the scheduler's, as ``get_statuses``' must,
-    :func:`_read_status_page` reads the response through the shared page reader
+    :func:`_ledger_status_page` reads the response through the shared page reader
     and this unwrap only describes a failed read.
     """
     if not isinstance(result, dict):
@@ -675,8 +675,8 @@ def _is_jsonrpc_response(result: object) -> bool:
     return isinstance(result, dict) and 'jsonrpc' in result
 
 
-def _read_status_page(result: object) -> StatusPage[str]:
-    """Read one ``dispatch_tool`` result for ``get_statuses`` as a page of the walk.
+def _ledger_status_page(result: object) -> StatusPage[str]:
+    """Read one ``dispatch_tool`` result for ``get_statuses`` as a page of the flake ledger's walk.
 
     Every response, a non-JSON-RPC one included, is read by
     ``shared/src/shared/status_paging.py::read_status_page``, the reader
@@ -864,7 +864,7 @@ class SchedulerChronicFlakeTaskClient:
 
         The dispatch stays here so the seam remains ``dispatch_tool`` alone, but
         pages are read by ``shared/src/shared/status_paging.py::read_status_page``
-        (see :func:`_read_status_page`) and assembled by ``::walk_status_pages``:
+        (see :func:`_ledger_status_page`) and assembled by ``::walk_status_pages``:
         the same reader and walk ``scheduler.py::Scheduler.get_statuses`` runs.
         ``orchestrator/tests/test_chronic_flake.py::TestGetStatusesHasOneParser``
         pins the two to one answer over the real composition, paged answers
@@ -883,7 +883,7 @@ class SchedulerChronicFlakeTaskClient:
                     list(ids), offset, exc_info=True,
                 )
                 raise
-            return _read_status_page(result)
+            return _ledger_status_page(result)
 
         try:
             return await walk_status_pages(_page, self._project_root), None
