@@ -7,8 +7,9 @@ the production baseline (5x sonnet specialists).
 from __future__ import annotations
 
 import dataclasses
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
+from types import MappingProxyType
 
 from orchestrator.agents.review_briefing import ReviewBriefing
 from orchestrator.agents.roles import AgentRole, build_reviewer_role
@@ -384,3 +385,44 @@ FABLE_EVIDENCE_VARIANTS = [
     VARIANT_CROSS_FAMILY,
     VARIANT_A_XHIGH,
 ]
+
+
+# ---------------------------------------------------------------------------
+# d2 reviewer campaign round 2 (Leo 2026-11-25, consumer task 11727): a
+# Fable 5.2 and a GPT-6.2 Sol generalist in the incumbent's shape. A
+# candidate's name embeds its model id and is never re-pointed at another.
+# ---------------------------------------------------------------------------
+
+VARIANT_FABLE52_SOLO = VariantConfig(
+    name='variant_fable52_solo',
+    description='1x Fable 5.2 generalist — model swap vs the 1x opus incumbent',
+    reviewers=[
+        ReviewerSpec(
+            name='comprehensive_reviewer',
+            model='claude-fable-5-2',
+            specialization=_SPEC_COMPREHENSIVE,
+            budget=10.0,
+            effort='high',
+        ),
+    ],
+)
+
+VARIANT_CODEX_SOL62 = VariantConfig(
+    name='variant_codex_sol62',
+    description='1x codex generalist (GPT-6.2 Sol, ChatGPT login) — cross-family model swap vs the 1x opus incumbent',
+    reviewers=[
+        ReviewerSpec(
+            name='comprehensive_reviewer',
+            model='gpt-6.2-sol',
+            specialization=_SPEC_COMPREHENSIVE,
+            budget=5.0,
+            effort='high',
+            backend='codex',
+        ),
+    ],
+)
+
+# Every arm `campaign --arms` can name, keyed by its name.
+CAMPAIGN_VARIANTS: Mapping[str, VariantConfig] = MappingProxyType({
+    v.name: v for v in (*FABLE_EVIDENCE_VARIANTS, VARIANT_FABLE52_SOLO, VARIANT_CODEX_SOL62)
+})
