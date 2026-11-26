@@ -22,7 +22,6 @@ import pytest
 from _git_fixtures import seed_repo
 from _merge_lane_fakes import (
     FakeVerifier,
-    RecordingEscalations,
     branch_merge_request,
     lane_scene_config,
     make_lane,
@@ -258,7 +257,7 @@ async def test_kill_switch_is_byte_identical_to_no_screen(
     without = await _two_request_scene(tmp_path / 'none', git_config, lambda git_ops, store: None)
     killed = await _two_request_scene(
         tmp_path / 'killed', git_config,
-        lambda git_ops, store: MergeScreen(git_ops, store, RecordingEscalations()),
+        lambda git_ops, store: MergeScreen(git_ops, store, None),
     )
 
     assert [status for status, _, _ in without[0]] == ['done', 'done']

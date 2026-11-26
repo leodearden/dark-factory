@@ -39,7 +39,6 @@ from orchestrator.git_ops import (
     WorktreeKind,
 )
 from orchestrator.merge_lane.outcome_facts import MergeBlockCategory
-from orchestrator.merge_lane.types import MergeOutcome
 from orchestrator.merge_lane.screen import (
     MERGE_SCREEN_ALARM_TASK_ID,
     Bounce,
@@ -49,6 +48,7 @@ from orchestrator.merge_lane.screen import (
     run_screen,
     screen_or_proceed,
 )
+from orchestrator.merge_lane.types import MergeOutcome
 from orchestrator.verify import NodeIdResult, NodeIdStatus
 from orchestrator.verify_cancel import lane_lock_path
 
@@ -219,8 +219,8 @@ class RecordingEscalationQueue:
     filed: list[Any] = field(default_factory=list)
     resolved: list[str] = field(default_factory=list)
 
-    def make_id(self, task_id: str) -> str:
-        return f'esc-{task_id}-{len(self.filed) + 1}'
+    def make_id(self, key: str) -> str:
+        return f'esc-{key}-{len(self.filed) + 1}'
 
     def submit(self, escalation: Any) -> None:
         self.filed.append(escalation)

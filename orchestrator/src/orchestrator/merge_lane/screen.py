@@ -19,7 +19,7 @@ from collections.abc import Awaitable, Collection, Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal, Protocol
+from typing import TYPE_CHECKING, Literal, Protocol
 
 from escalation.categories import EscalationCategory
 from escalation.models import Escalation
@@ -206,6 +206,51 @@ class ScreenPort(Protocol):
     ) -> ScreenDecision: ...
 
 
+async def screen_or_proceed(
+    port: ScreenPort, *, task_id: str, merged_sha: str, base_sha: str | None,
+    config: OrchestratorConfig, site: ScreenSite,
+) -> ScreenDecision:
+    """Screen through *port*; any fault in the port is a Proceed (PRD decision 8).
+
+    The use-site guard every call site goes through, whatever the port.
+    """
+    try:
+        return await port.screen_item(
+            task_id=task_id, merged_sha=merged_sha, base_sha=base_sha, config=config, site=site,
+        )
+    except Exception:
+        logger.warning(
+            'merge screen for task %s at %s raised; the item proceeds', task_id, merged_sha,
+            exc_info=True,
+        )
+        return PROCEED
+
+
+class ScreenEventSink(Protocol):
+    """Where the per-screen ``merge_screen`` event goes: :class:`orchestrator.event_store.EventStore`."""
+
+    def emit(
+        self, event_type: EventType, *, task_id: str | None = None, data: dict | None = None,
+    ) -> int | None: ...
+
+
+class ScreenAlarmQueue(Protocol):
+    """The calls the ``merge_screen_unavailable`` alarm makes on an escalation queue."""
+
+    def make_id(self, key: str) -> str: ...
+
+    def submit(self, escalation: Escalation) -> object: ...
+
+    def has_open_l1(self, task_id: str) -> bool: ...
+
+    def get_by_task(self, task_id: str, status: str | None = None) -> Sequence[Escalation]: ...
+
+    def resolve(
+        self, escalation_id: str, resolution: str, *,
+        resolved_by: str | None = None, resolution_class: str | None = None,
+    ) -> object: ...
+
+
 @dataclass(frozen=True)
 class _ScreenOutcome:
     """What one screen concluded; ``own`` holds the checks red on the item only."""
@@ -237,14 +282,16 @@ class MergeScreen:
 
     It keeps only what must outlive one screen: a bounded per-base-sha cache
     of pass/finding verdicts, and the consecutive-error streak behind the
-    ``merge_screen_unavailable`` alarm.
+    ``merge_screen_unavailable`` alarm. The event sink and the alarm queue are
+    optional, and a fault in either is logged and swallowed: reporting never
+    costs an item its decision.
     """
 
     def __init__(
         self,
         git_ops: GitOps,
-        event_store: Any,
-        escalation_queue: Any,
+        event_store: ScreenEventSink | None,
+        escalation_queue: ScreenAlarmQueue | None,
         *,
         run_ids: NodeIdRunner = run_node_id_results,
     ) -> None:
@@ -264,7 +311,8 @@ class MergeScreen:
         started = time.monotonic()
         lane = _LaneChoice()
         outcome = await self._bounded_screen(merged_sha, base_sha, config, lane)
-        self._track_streak(outcome, config)
+        self._track_streak(outcome)
+        self._sync_alarm(outcome, config)
         self._emit(task_id, site, merged_sha, base_sha, outcome, lane, time.monotonic() - started)
         if outcome.status != 'bounce':
             return PROCEED
@@ -349,21 +397,27 @@ class MergeScreen:
         while len(self._base_verdicts) > BASE_VERDICT_CACHE_CAP:
             self._base_verdicts.popitem(last=False)
 
-    def _track_streak(self, outcome: _ScreenOutcome, config: OrchestratorConfig) -> None:
-        if outcome.status != 'error':
-            self._error_streak = 0
-            self._close_alarm()
-            return
-        self._error_streak += 1
-        if self._error_streak >= config.merge_screen.error_streak_alarm:
-            self._raise_alarm(outcome.causes)
+    def _track_streak(self, outcome: _ScreenOutcome) -> None:
+        self._error_streak = self._error_streak + 1 if outcome.status == 'error' else 0
 
-    def _raise_alarm(self, causes: tuple[str, ...]) -> None:
-        if self._escalation_queue.has_open_l1(MERGE_SCREEN_ALARM_TASK_ID):
+    def _sync_alarm(self, outcome: _ScreenOutcome, config: OrchestratorConfig) -> None:
+        queue = self._escalation_queue
+        if queue is None:
+            return
+        try:
+            if outcome.status != 'error':
+                _close_alarm(queue)
+            elif self._error_streak >= config.merge_screen.error_streak_alarm:
+                self._raise_alarm(queue, outcome.causes)
+        except Exception:
+            logger.warning('merge screen alarm sync failed; the screen goes on', exc_info=True)
+
+    def _raise_alarm(self, queue: ScreenAlarmQueue, causes: tuple[str, ...]) -> None:
+        if queue.has_open_l1(MERGE_SCREEN_ALARM_TASK_ID):
             return
         last_cause = causes[0] if causes else 'unknown'
-        self._escalation_queue.submit(Escalation(
-            id=self._escalation_queue.make_id(MERGE_SCREEN_ALARM_TASK_ID),
+        queue.submit(Escalation(
+            id=queue.make_id(MERGE_SCREEN_ALARM_TASK_ID),
             task_id=MERGE_SCREEN_ALARM_TASK_ID,
             agent_role=_ALARM_ROLE,
             severity='info',
@@ -385,32 +439,39 @@ class MergeScreen:
             ),
         ))
 
-    def _close_alarm(self) -> None:
-        for esc in self._escalation_queue.get_by_task(MERGE_SCREEN_ALARM_TASK_ID, status='pending'):
-            self._escalation_queue.resolve(
-                esc.id, 'merge screen ran clean again', resolved_by=_ALARM_ROLE,
-                resolution_class='benign',
-            )
-
     def _emit(
         self, task_id: str, site: ScreenSite, merged_sha: str, base_sha: str | None,
         outcome: _ScreenOutcome, lane: _LaneChoice, wall_s: float,
     ) -> None:
-        self._event_store.emit(EventType.merge_screen, task_id=task_id, data={
-            'site': site.value,
-            'status': outcome.status,
-            'merged_sha': merged_sha,
-            'base_sha': base_sha,
-            'lane': lane.kind,
-            'fallback_reason': lane.fallback_reason,
-            'checks': [
-                {'id': check.id, 'status': check.status, 'duration_s': check.duration_s}
-                for check in outcome.checks
-            ],
-            'errors': list(outcome.causes),
-            'wall_s': wall_s,
-            'error_streak': self._error_streak,
-        })
+        sink = self._event_store
+        if sink is None:
+            return
+        try:
+            sink.emit(EventType.merge_screen, task_id=task_id, data={
+                'site': site.value,
+                'status': outcome.status,
+                'merged_sha': merged_sha,
+                'base_sha': base_sha,
+                'lane': lane.kind,
+                'fallback_reason': lane.fallback_reason,
+                'checks': [
+                    {'id': check.id, 'status': check.status, 'duration_s': check.duration_s}
+                    for check in outcome.checks
+                ],
+                'errors': list(outcome.causes),
+                'wall_s': wall_s,
+                'error_streak': self._error_streak,
+            })
+        except Exception:
+            logger.warning('merge screen event emit failed; the screen goes on', exc_info=True)
+
+
+def _close_alarm(queue: ScreenAlarmQueue) -> None:
+    for esc in queue.get_by_task(MERGE_SCREEN_ALARM_TASK_ID, status='pending'):
+        queue.resolve(
+            esc.id, 'merge screen ran clean again', resolved_by=_ALARM_ROLE,
+            resolution_class='benign',
+        )
 
 
 def _error_causes(checks: tuple[ScreenCheck, ...]) -> tuple[str, ...]:
