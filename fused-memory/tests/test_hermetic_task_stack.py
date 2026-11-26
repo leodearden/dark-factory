@@ -4,12 +4,10 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from pathlib import Path
-from typing import Any
 
 import pytest
-from _fastmcp_tool_result import tool_result_dict
 from _fm_sockets import refused_port
-from _hermetic_task_stack import hermetic_task_stack
+from _hermetic_task_stack import HermeticTaskStack, hermetic_task_stack
 
 pytestmark = pytest.mark.asyncio
 
@@ -27,12 +25,8 @@ def unreachable_corpus_services(monkeypatch: pytest.MonkeyPatch) -> Iterator[Non
         yield
 
 
-async def call(server: Any, tool: str, args: dict[str, Any]) -> dict[str, Any]:
-    return tool_result_dict(await server._tool_manager.call_tool(tool, args))
-
-
-async def file_planned(server: Any, root: str) -> str:
-    submitted = await call(server, 'submit_task', {
+async def file_planned(stack: HermeticTaskStack, root: str) -> str:
+    submitted = await stack.call('submit_task', {
         'project_root': root,
         'title': 'Probe the hermetic stack',
         'description': 'A planned task the hermeticity tests commit or retitle.',
@@ -44,29 +38,29 @@ async def file_planned(server: Any, root: str) -> str:
 
 async def test_a_pending_commit_builds_no_curator(tmp_path: Path) -> None:
     root = str(tmp_path)
-    async with hermetic_task_stack(tmp_path) as (server, _interceptor):
-        task_id = await file_planned(server, root)
+    async with hermetic_task_stack(tmp_path) as stack:
+        task_id = await file_planned(stack, root)
 
-        committed = await call(server, 'commit_planning', {'project_root': root, 'task_ids': task_id})
+        committed = await stack.call('commit_planning', {'project_root': root, 'task_ids': task_id})
         assert 'error' not in committed, committed
-        task = await call(server, 'get_task', {'id': task_id, 'project_root': root})
+        task = await stack.call('get_task', {'id': task_id, 'project_root': root})
         assert task['status'] == 'pending'
 
-        state = await call(server, 'get_curator_state', {})
+        state = await stack.call('get_curator_state', {})
 
     assert state['registries'] == []
 
 
 async def test_a_title_update_builds_no_curator(tmp_path: Path) -> None:
     root = str(tmp_path)
-    async with hermetic_task_stack(tmp_path) as (server, _interceptor):
-        task_id = await file_planned(server, root)
+    async with hermetic_task_stack(tmp_path) as stack:
+        task_id = await file_planned(stack, root)
 
-        updated = await call(server, 'update_task', {
+        updated = await stack.call('update_task', {
             'id': task_id, 'project_root': root, 'title': 'Probe the hermetic stack, retitled',
         })
         assert 'error' not in updated, updated
 
-        state = await call(server, 'get_curator_state', {})
+        state = await stack.call('get_curator_state', {})
 
     assert state['registries'] == []
