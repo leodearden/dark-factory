@@ -2893,7 +2893,9 @@ class Scheduler:
             statuses, err = parse_tool_result(result, 'statuses', dict)
             if err is not None:
                 raise err
-            payload, _ = parse_tool_result(result, None, dict)
+            payload, err = parse_tool_result(result, None, dict)
+            if err is not None:
+                raise err
             assert statuses is not None and payload is not None  # invariant: parse_tool_result → (None, err) | (value, None)
             return StatusPage(statuses, len(statuses), payload.get('pagination'))
 
