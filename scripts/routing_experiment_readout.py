@@ -116,25 +116,37 @@ def _roots_listed(text: str) -> tuple[Path, ...]:
     return known_project_roots({KNOWN_PROJECT_ROOTS_ENV: text})
 
 
+def _distinct(roots: Iterable[Path]) -> tuple[Path, ...]:
+    """*roots* less any that resolves to an earlier one, first spelling kept: one project, one read."""
+    seen: set[Path] = set()
+    distinct: list[Path] = []
+    for root in roots:
+        resolved = root.resolve()
+        if resolved not in seen:
+            seen.add(resolved)
+            distinct.append(root)
+    return tuple(distinct)
+
+
 def resolve_roots(
     cli_roots: str | None,
     environ: Mapping[str, str],
     unit_environment: Callable[[], UnitRead],
 ) -> RootSelection:
-    """The roots to read: --roots, else the environment, else the installed fused-memory unit.
+    """The distinct roots to read: --roots, else the environment, else the installed fused-memory unit.
 
     There is deliberately no default-project-root fallback: reading dark-factory
     alone would certify only the null-contrast project.
     """
     if cli_roots is not None:
-        return RootSelection(_roots_listed(cli_roots), RootSource.CLI)
-    from_environment = known_project_roots(environ)
+        return RootSelection(_distinct(_roots_listed(cli_roots)), RootSource.CLI)
+    from_environment = _distinct(known_project_roots(environ))
     if from_environment:
         return RootSelection(from_environment, RootSource.ENVIRONMENT)
     unit = unit_environment()
     if isinstance(unit, UnitUnread):
         return RootSelection((), RootSource.NONE, unit_problem=unit.reason)
-    from_unit = known_project_roots(unit)
+    from_unit = _distinct(known_project_roots(unit))
     if from_unit:
         return RootSelection(from_unit, RootSource.UNIT)
     return RootSelection((), RootSource.NONE)
@@ -221,12 +233,9 @@ class RootStatus:
     """What happened to one root's stores; a problem is a human-readable reason, None when read."""
 
     root: Path
+    project: str
     runs_db_problem: str | None = None
     tasks_db_problem: str | None = None
-
-    @property
-    def project(self) -> str:
-        return self.root.name
 
     @property
     def read(self) -> bool:
@@ -514,35 +523,44 @@ def _keyed_records(
     return tuple(records), dict(exclusions)
 
 
-def _skipped(root: Path, problem: str) -> FleetLoad:
-    return FleetLoad((), (RootStatus(root, runs_db_problem=problem),), ProducerEvidence())
+def _skipped(root: Path, project: str, problem: str) -> FleetLoad:
+    return FleetLoad((), (RootStatus(root, project, runs_db_problem=problem),), ProducerEvidence())
 
 
 def load_project(
-    root: Path, window: Window, salt: str, buckets: int, key: KeyKind,
+    root: Path, project: str, window: Window, salt: str, buckets: int, key: KeyKind,
 ) -> FleetLoad:
-    """One root's population records, read status, producer evidence and exclusions."""
+    """One root's population records, read status, producer evidence and exclusions, labelled *project*."""
     runs_path = runs_db(root)
     if not runs_path.is_file():
-        return _skipped(root, 'runs.db absent')
+        return _skipped(root, project, 'runs.db absent')
     try:
         ledgers, events = _read_runs_db(runs_path, window)
     except UNREADABLE_STORE_ERRORS as exc:
-        return _skipped(root, _store_problem('runs.db', exc))
+        return _skipped(root, project, _store_problem('runs.db', exc))
     task_rows, tasks_db_problem = _read_task_rows(root)
-    records, exclusions = _keyed_records(root.name, ledgers, task_rows, salt, buckets, key)
+    records, exclusions = _keyed_records(project, ledgers, task_rows, salt, buckets, key)
     return FleetLoad(
         records,
-        (RootStatus(root, tasks_db_problem=tasks_db_problem),),
+        (RootStatus(root, project, tasks_db_problem=tasks_db_problem),),
         _evidence(events, records),
         exclusions,
     )
 
 
+def project_labels(roots: Sequence[Path]) -> dict[Path, str]:
+    """Each root's project label: its basename, or its full path when another root shares that name."""
+    names = Counter(root.name for root in roots)
+    return {root: root.name if names[root.name] == 1 else str(root) for root in roots}
+
+
 def load_fleet(
     roots: Sequence[Path], window: Window, salt: str, buckets: int, key: KeyKind,
 ) -> FleetLoad:
-    return FleetLoad.combined(load_project(root, window, salt, buckets, key) for root in roots)
+    labels = project_labels(roots)
+    return FleetLoad.combined(
+        load_project(root, labels[root], window, salt, buckets, key) for root in roots
+    )
 
 
 # Experiment 1's affected population: plans/routing-experiment-substrate-prd.md

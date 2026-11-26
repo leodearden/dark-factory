@@ -175,6 +175,21 @@ def test_no_source_naming_a_root_resolves_no_roots(unit_assignments):
     assert selection.unit_problem is None
 
 
+def test_a_root_named_twice_or_through_a_symlink_is_read_once_in_first_seen_order(tmp_path):
+    real = tmp_path / 'real'
+    real.mkdir()
+    link = tmp_path / 'link'
+    link.symlink_to(real)
+
+    from_cli = readout.resolve_roots(f'/b,{real},/b,{link}', {}, _unit_must_not_be_read)
+    from_environment = readout.resolve_roots(
+        None, {'DASHBOARD_KNOWN_PROJECT_ROOTS': '/c,/d,/c'}, _unit_must_not_be_read
+    )
+
+    assert from_cli.roots == (Path('/b'), real)
+    assert from_environment.roots == (Path('/c'), Path('/d'))
+
+
 def test_an_unreadable_unit_resolves_no_roots_and_carries_the_reason():
     selection = readout.resolve_roots(
         None, {}, lambda: readout.UnitUnread('busctl: exit 1: Unit not found')
@@ -475,6 +490,28 @@ def test_records_carry_their_project_so_one_task_id_in_two_projects_is_two_recor
     assert sorted((record.project, record.task_id) for record in load.records) == [
         ('proj-a', '1'), ('proj-b', '1'), ('proj-b', '2'),
     ]
+
+
+def test_two_roots_sharing_a_basename_are_labelled_by_their_full_paths(fleet_root, capsys):
+    first = fleet_root('x/proj', [TaskSpec(1)])
+    second = fleet_root('y/proj', [TaskSpec(1)])
+    other = fleet_root('other', [TaskSpec(2)])
+
+    assert sorted(record.project for record in _load([first, second, other]).records) == sorted(
+        [str(first), str(second), 'other']
+    )
+    assert _run_main([first, second, other]) == readout.EXIT_OK
+    assert f'read {first}, {second}, other' in _rule_line(capsys.readouterr().out)
+
+
+def test_main_over_a_root_listed_twice_counts_its_tasks_once(fleet_root, capsys):
+    root = fleet_root('proj-a', [TaskSpec(1), TaskSpec(2)])
+
+    assert _run_main([root, root]) == readout.EXIT_OK
+
+    rule = _rule_line(capsys.readouterr().out)
+    assert 'population = the 2 tasks' in rule
+    assert 'read proj-a;' in rule
 
 
 @pytest.fixture
