@@ -6086,9 +6086,7 @@ class TestGetStatusesPaging:
 
     @staticmethod
     def _scheduler(session: PagingStatusesSession) -> Scheduler:
-        scheduler = Scheduler(OrchestratorConfig(), mcp_session=session)
-        scheduler.finish_startup()
-        return scheduler
+        return Scheduler(OrchestratorConfig(), mcp_session=session)
 
     @pytest.mark.asyncio
     async def test_a_truncated_answer_is_walked_to_the_whole_map(self):
