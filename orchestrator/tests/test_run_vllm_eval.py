@@ -2573,3 +2573,19 @@ def test_the_launcher_imports_on_a_host_with_nothing_in_the_operators_home(tmp_p
     project_root, key_error = proc.stdout.splitlines()
     assert Path(project_root) == Path(__file__).resolve().parents[2]
     assert str(home / ".ssh" / "id_runpod.pub") in key_error
+
+
+def test_a_launcher_without_its_toolkit_names_the_variable_to_set(tmp_path: Path) -> None:
+    """From a checkout with no runpod-toolkit sibling the import says how to point at one."""
+    proc = subprocess.run(
+        [sys.executable, "-c", "import run_vllm_eval"],
+        cwd=_SCRIPTS,
+        env={"HOME": str(tmp_path), "RUNPOD_TOOLKIT_PATH": str(tmp_path), "PATH": os.environ["PATH"]},
+        capture_output=True,
+        text=True,
+        timeout=LAUNCHER_IMPORT_TIMEOUT_SECONDS,
+        check=False,
+    )
+    assert proc.returncode != 0
+    assert "ModuleNotFoundError" in proc.stderr
+    assert "RUNPOD_TOOLKIT_PATH" in proc.stderr

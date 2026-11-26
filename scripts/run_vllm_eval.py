@@ -45,8 +45,17 @@ from orchestrator.evals.configs import (
 from orchestrator.evals.results import ResultStore
 from orchestrator.evals.runner import WORKFLOW_CELL_TIMEOUT_MINUTES, cell_timeout_minutes
 from orchestrator.evals.snapshots import eval_worktree_root
-from runpod_toolkit.compute import PodStatus, RunPodClient  # type: ignore[import]
-from runpod_toolkit.config import RunPodConfig  # type: ignore[import]
+
+try:
+    from runpod_toolkit.compute import PodStatus, RunPodClient  # type: ignore[import]
+    from runpod_toolkit.config import RunPodConfig  # type: ignore[import]
+except ModuleNotFoundError as exc:
+    raise ModuleNotFoundError(
+        f"{exc}. Set RUNPOD_TOOLKIT_PATH to the runpod-toolkit checkout: it defaults to the "
+        "runpod-toolkit sibling of the checkout this launcher ships in, which a task worktree "
+        "under .worktrees/ does not have.",
+        name=exc.name,
+    ) from exc
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -282,7 +291,8 @@ def build_eval_env() -> dict[str, str]:
     declares ``accounts_file:
     "${USAGE_ACCOUNTS_FILE:/home/leo/src/dark-factory/config/usage-accounts.yaml}"``.
     ``PROJECT_ROOT`` is the checkout this launcher ships in, so a run
-    launched from a worktree rosters that checkout's tracked file and
+    launched from a worktree (which needs ``RUNPOD_TOOLKIT_PATH`` set)
+    rosters that checkout's tracked file and
     reads that checkout's ``.env``; from the main checkout, as every
     documented launch line runs, the value equals that default. Two
     reasons for setting it:
