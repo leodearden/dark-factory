@@ -1818,6 +1818,50 @@ class TestScanProcessGroupsAgainstASyntheticProc:
 
         assert scan_process_groups_under_path(os.fsdecode(root_bytes)) == {900}
 
+    @pytest.mark.parametrize(
+        'error',
+        [
+            pytest.param(ProcessLookupError, id='vanished-pid'),
+            pytest.param(PermissionError, id='permission-denied-pid'),
+        ],
+    )
+    def test_a_raising_readlink_skips_cwd_and_fds_but_maps_still_match(
+        self, tmp_path, monkeypatch, error
+    ):
+        """A raising readlink is swallowed and the walk goes on to maps.
+
+        Pid 100 references root through cwd, an fd and maps; pid 200 through
+        cwd alone. With every readlink raising, only maps can find 100 and
+        nothing can find 200, so ``{100}`` shows both the swallow-and-continue
+        and that the patch is in force. A raise would be laundered into
+        ``set()``.
+        """
+        proc_root = tmp_path / 'proc'
+        root = tmp_path.resolve() / '_merge-verify'
+        root.mkdir()
+        mapped = proc_root / '100'
+        (mapped / 'fd').mkdir(parents=True)
+        (mapped / 'stat').write_text(synthetic_stat_line(100, 100))
+        (mapped / 'cwd').symlink_to(root)
+        (mapped / 'fd' / '3').symlink_to(root / 'lock')
+        (mapped / 'maps').write_bytes(
+            b'7f0a1d000000-7f0a1d002000 r-xp 00000000 08:01 4242       '
+            + os.fsencode(root / 'lib.so')
+            + b'\n'
+        )
+        cwd_only = proc_root / '200'
+        cwd_only.mkdir()
+        (cwd_only / 'stat').write_text(synthetic_stat_line(200, 200))
+        (cwd_only / 'cwd').symlink_to(root)
+
+        def raising_readlink(*_args, **_kwargs):
+            raise error('readlink refused mid-scan')
+
+        monkeypatch.setattr('shared.proc_group._PROC_ROOT', proc_root)
+        monkeypatch.setattr('shared.proc_group.os.readlink', raising_readlink)
+
+        assert scan_process_groups_under_path(root) == {100}
+
     def test_a_missing_proc_root_yields_an_empty_set(self, tmp_path, monkeypatch):
         """The `not proc_dir.exists()` branch — an empty result, not a raise.
 
