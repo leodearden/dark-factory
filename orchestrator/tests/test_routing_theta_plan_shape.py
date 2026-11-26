@@ -19,6 +19,7 @@ selection to the whole owning package).
 from __future__ import annotations
 
 import pytest
+from _routing_arms import task_id_in_rule_arm
 
 from orchestrator.config import OrchestratorConfig
 from orchestrator.routing import PlanShape, RoleDefaults, RouteInputs, resolve_route
@@ -36,10 +37,12 @@ _SENTINEL_ROLE_DEFAULTS = RoleDefaults(
 )
 
 
-def _inputs_for(role_name: str, *, plan_shape: PlanShape | None = None) -> RouteInputs:
+def _inputs_for(
+    role_name: str, *, plan_shape: PlanShape | None = None, task_id: str = '1',
+) -> RouteInputs:
     return RouteInputs(
         role_name=role_name,
-        task_id='1',
+        task_id=task_id,
         task_metadata={},
         plan_shape=plan_shape,
         routing_tier=0,
@@ -98,13 +101,18 @@ class TestLargePlanStepsRuleFires:
 
 class TestLargePlanModulesRuleFires:
     """(b) A non-Rust plan with >=3 modules (and <12 steps) upgrades
-    implementer/debugger to opus via the `large-plan-modules` rule."""
+    implementer/debugger to opus via the `large-plan-modules` rule, for a
+    task in that rule's arm of experiment 1
+    (plans/routing-experiment-substrate-prd.md)."""
 
     @pytest.mark.parametrize('role_name', ['implementer', 'debugger'])
     def test_modules_trigger_upgrades_to_opus(self, role_name):
         cfg = OrchestratorConfig()
+        task_id = task_id_in_rule_arm(cfg, 'large-plan-modules')
 
-        decision = resolve_route(_inputs_for(role_name, plan_shape=MODULES_TRIGGER_PLAN), cfg)
+        decision = resolve_route(
+            _inputs_for(role_name, plan_shape=MODULES_TRIGGER_PLAN, task_id=task_id), cfg,
+        )
 
         assert decision.model == 'opus'
         assert decision.source_layer == 'policy_rule'
@@ -172,8 +180,11 @@ class TestLargePlanMaxTurnsHeadroom:
     @pytest.mark.parametrize('role_name', ['implementer', 'debugger'])
     def test_modules_trigger_raises_max_turns(self, role_name):
         cfg = OrchestratorConfig()
+        task_id = task_id_in_rule_arm(cfg, 'large-plan-modules')
 
-        decision = resolve_route(_inputs_for(role_name, plan_shape=MODULES_TRIGGER_PLAN), cfg)
+        decision = resolve_route(
+            _inputs_for(role_name, plan_shape=MODULES_TRIGGER_PLAN, task_id=task_id), cfg,
+        )
 
         assert decision.max_turns == 120
 
