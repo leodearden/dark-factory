@@ -13475,10 +13475,9 @@ class Harness:
         return strands
 
     def _report_stale_l0_strands(self, strands: list[dict[str, Any]]) -> None:
-        """Emit one event per swept strand and file the aggregate escalation.
+        """Emit one event per swept strand; file the aggregate only when a workflow was waiting.
 
-        No-op when nothing was stranded — an ordinary restart that sweeps only
-        seconds-old L0s stays quiet.
+        An info-only sweep keeps its events and WARNING but files no record (task 5200).
         """
         if not strands:
             return
@@ -13492,20 +13491,28 @@ class Harness:
                 )
 
         max_age = max(s['pending_secs'] for s in strands)
+        waiting = sum(1 for s in strands if s['workflow_blocked'])
+        filing = (
+            'filing the level-1 strand record' if waiting
+            else 'no level-1 record filed because no workflow was waiting'
+        )
         logger.warning(
             f'Dismissed {len(strands)} STALE-STRAND L0 escalation(s) at startup '
-            f'(max pending {max_age}s); these had been waiting far longer than '
-            f'the {self.config.orphan_l0_timeout_secs:.0f}s strand threshold and '
-            f'are NOT ordinary restart artifacts'
+            f'(max pending {max_age}s, {waiting} with a workflow waiting); these '
+            f'had been waiting far longer than the '
+            f'{self.config.orphan_l0_timeout_secs:.0f}s strand threshold and are '
+            f'NOT ordinary restart artifacts; {filing}'
         )
 
-        self._file_stale_l0_strand_escalation(strands)
+        if waiting:
+            self._file_stale_l0_strand_escalation(strands)
 
     # Strand-sweep aggregate escalation (task 3172).  One record per sweep that
-    # strands anything, however many strands it sweeps.  The rate is bounded by
-    # the strand threshold, not by a guard: each sweep dismisses every pending
-    # L0, so a strand at the next sweep was filed after this one and has aged
-    # past orphan_l0_timeout_secs since (task 4988).
+    # strands an L0 a workflow was waiting on (task 5200), however many strands
+    # it sweeps.  The rate is bounded by the strand threshold, not by a guard:
+    # each sweep dismisses every pending L0, so a strand at the next sweep was
+    # filed after this one and has aged past orphan_l0_timeout_secs since
+    # (task 4988).
 
     @staticmethod
     def _open_stale_l0_strand_records(
