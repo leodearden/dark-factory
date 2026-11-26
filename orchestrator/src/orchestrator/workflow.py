@@ -9988,7 +9988,7 @@ class TaskWorkflow:
                 if self.config.recycle_config_dir_on_zero_output:
                     self._recycle_config_dir()
                 continue  # skip judge on zero-output; increment next iteration
-            elif is_timed_out_with_progress(result):
+            elif is_timed_out_with_progress(result) and self._resumes_killed_sessions(IMPLEMENTER):
                 # γ: a productive implementer iteration was killed at the wall
                 # (transcript_turns > 0 — real work done).  Resume the SAME Claude
                 # session next iteration so the ~20 min of context continues instead
@@ -10047,7 +10047,9 @@ class TaskWorkflow:
                 )
                 continue  # re-dispatch with --resume; skip judge this iteration
             else:
-                # Non-timeout result: reset both consecutive counters.
+                # Neither a wedge nor a resumable progress kill: a non-timeout
+                # result, or a productive kill on a backend that cannot resume,
+                # which re-dispatches fresh. Reset both consecutive counters.
                 consecutive_zero_output = 0
                 consecutive_progress_timeouts = 0
 
@@ -14988,6 +14990,14 @@ class TaskWorkflow:
                 'resume-outcome sink', self.task_id, exc_info=True,
             )
 
+    def _backend_for(self, role: AgentRole) -> str:
+        """The configured agent backend that runs *role*."""
+        return getattr(self.config.backends, _config_key(role.name), 'claude')
+
+    def _resumes_killed_sessions(self, role: AgentRole) -> bool:
+        """Whether _invoke can continue *role*'s killed session: its resume lifecycle corroborates against a claude transcript."""
+        return self._backend_for(role) == 'claude'
+
     async def _invoke(
         self,
         role: AgentRole,
@@ -15009,7 +15019,6 @@ class TaskWorkflow:
                 f'— check for work before invoking'
             )
         timeouts_cfg = self.config.timeouts
-        backends_cfg = self.config.backends
 
         # Full-name lookup is deliberate (routing alpha, task 2531) — do NOT
         # re-derive a split('_')[0] prefix here. Every routing submodel now
@@ -15021,7 +15030,9 @@ class TaskWorkflow:
         # already resolved config by full role name: module_tagger
         # (harness.py's self.config.models.module_tagger) and deep_reviewer
         # (review_checkpoint.py's getattr(self.config.models, 'deep_reviewer', ...)).
-        role_key = role.name
+        # _config_key only collapses every reviewer* role to the shared
+        # 'reviewer' slot.
+        role_key = _config_key(role.name)
 
         # Route resolution (PRD adaptive-model-routing, task ε): the single
         # layered authority for (model, effort, budget_usd, max_turns),
@@ -15062,16 +15073,11 @@ class TaskWorkflow:
         source_layer = decision.source_layer
         rule_id = decision.rule_id
 
-        timeout_val = getattr(timeouts_cfg, role_key, self.config.invocation_timeout)
-        backend_val = getattr(backends_cfg, role_key, 'claude')
-
         # timeout_val/backend_val are resolver-external (route resolution
         # owns model/effort/budget_usd/max_turns only — see this task's plan
-        # design_decisions) — the reviewer* collapse stays local to _invoke
-        # for just these two fields.
-        if role.name.startswith('reviewer'):
-            timeout_val = timeouts_cfg.reviewer
-            backend_val = backends_cfg.reviewer
+        # design_decisions).
+        timeout_val = getattr(timeouts_cfg, role_key, self.config.invocation_timeout)
+        backend_val = self._backend_for(role)
 
         scope = invocation_scope(self.config, role)
 
