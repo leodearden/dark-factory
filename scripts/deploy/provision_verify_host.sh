@@ -39,7 +39,7 @@ CONTRACT="$HERE/verify_host_contract.py"
 CHECKER="$HERE/check_verify_host.py"
 SWAPFILE=/swapfile
 SWAPFILE_SIZE_GIB=8
-MAIN_BRANCH=main
+DF_MAIN_BRANCH=main
 CURRENT_STEP=setup
 
 die() { echo "[provision_verify_host] ERROR: $*" >&2; exit 1; }
@@ -85,11 +85,11 @@ step_network() {
 }
 
 step_os_and_user() {
-    remote "$HOST_NAME" <<'REMOTE'
-host_name="$1"
+    remote "$HOST_NAME" "$REQUIRED_OS_ID" "$REQUIRED_OS_VERSION_ID" <<'REMOTE'
+host_name="$1"; os_id="$2"; os_version_id="$3"
 [ "$(id -u)" != 0 ] || fail "refusing to provision as root; ssh in as the verify user"
 . /etc/os-release
-[ "$ID $VERSION_ID" = 'ubuntu 24.04' ] || fail "needs Ubuntu 24.04, found $ID $VERSION_ID"
+[ "$ID" = "$os_id" ] && [ "$VERSION_ID" = "$os_version_id" ] || fail "needs $os_id $os_version_id, found $ID $VERSION_ID"
 apt_install git bash util-linux curl ca-certificates xz-utils python3 locales
 git config --global user.name >/dev/null || git config --global user.name "$host_name verify host"
 git config --global user.email >/dev/null || git config --global user.email "$(id -un)@$host_name"
@@ -127,8 +127,13 @@ if [ "$(uv --version 2>/dev/null | cut -d' ' -f2)" != "$uv_version" ]; then
 fi
 uv python install 3.13
 if [ "$("$HOME/.local/node/bin/node" --version 2>/dev/null)" != "$node_version" ]; then
+    case "$(uname -m)" in
+        x86_64) node_arch=x64 ;;
+        aarch64) node_arch=arm64 ;;
+        *) fail "nodejs.org ships no linux build this step installs for architecture $(uname -m) (x86_64 and aarch64 only)" ;;
+    esac
     base="https://nodejs.org/dist/$node_version"
-    tarball="node-$node_version-linux-x64.tar.xz"
+    tarball="node-$node_version-linux-$node_arch.tar.xz"
     scratch="$(mktemp -d)"
     trap 'rm -rf "$scratch"' EXIT
     curl -fsSL "$base/$tarball" -o "$scratch/$tarball"
@@ -181,18 +186,24 @@ step_disk() {
 }
 
 step_checkouts() {
-    remote "$MAIN_BRANCH" "$DF_CHECKOUT_PATH" "${PROJECT_ROOTS[@]}" <<'REMOTE'
-main_branch="$1"; shift
-for checkout in "$@"; do
+    local checkout_branch_pairs=("$DF_CHECKOUT_PATH" "$DF_MAIN_BRANCH") i
+    for i in "${!PROJECT_ROOTS[@]}"; do
+        checkout_branch_pairs+=("${PROJECT_ROOTS[$i]}" "${PROJECT_MAIN_BRANCHES[$i]}")
+    done
+    remote "${checkout_branch_pairs[@]}" <<'REMOTE'
+checkouts=0
+while [ $# -gt 0 ]; do
+    checkout="$1"; branch="$2"; shift 2
     mkdir -p "$checkout"
-    [ -e "$checkout/.git" ] || git init -q -b "$main_branch" "$checkout"
+    [ -e "$checkout/.git" ] || git init -q -b "$branch" "$checkout"
     git -C "$checkout" config receive.denyCurrentBranch updateInstead
+    checkouts=$((checkouts + 1))
 done
-say "$# checkouts accept pushes to their branch"
+say "$checkouts checkouts accept pushes to their branch"
 REMOTE
     GIT_SSH_COMMAND="$SSH_BIN ${SSH_OPTS[*]}" \
-        git -C "$CHECKOUT" push --quiet "$SSH_HOST:$DF_CHECKOUT_PATH" "$MAIN_BRANCH:refs/heads/$MAIN_BRANCH" \
-        || die "pushing this workstation's $MAIN_BRANCH to $SSH_HOST:$DF_CHECKOUT_PATH failed"
+        git -C "$CHECKOUT" push --quiet "$SSH_HOST:$DF_CHECKOUT_PATH" "$DF_MAIN_BRANCH:refs/heads/$DF_MAIN_BRANCH" \
+        || die "pushing this workstation's $DF_MAIN_BRANCH to $SSH_HOST:$DF_CHECKOUT_PATH failed"
     remote "$DF_CHECKOUT_PATH" <<'REMOTE'
 cd "$1"
 uv sync --all-packages
@@ -269,7 +280,7 @@ dry_run() {
     echo "host $HOST_NAME via ssh $SSH_HOST (wrapper $WRAPPER_PATH)"
     echo "dark factory checkout $DF_CHECKOUT_PATH (gate checkouts $GATE_CHECKOUTS_PATH)"
     for i in "${!PROJECT_IDS[@]}"; do
-        echo "project ${PROJECT_IDS[$i]} checkout ${PROJECT_ROOTS[$i]} (config ${CONFIG_PATHS[$i]})"
+        echo "project ${PROJECT_IDS[$i]} checkout ${PROJECT_ROOTS[$i]} on ${PROJECT_MAIN_BRANCHES[$i]} (config ${CONFIG_PATHS[$i]})"
     done
     while IFS=$'\t' read -r id title; do
         echo "$id: $title"

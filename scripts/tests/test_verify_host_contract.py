@@ -12,7 +12,7 @@ from typing import Any
 import pytest
 import yaml
 from cli_subprocess_timeout import cli_timeout_from_env
-from orchestrator.config import OrchestratorConfig, VerifyCgroupMemoryConfig
+from orchestrator.config import GitConfig, OrchestratorConfig, VerifyCgroupMemoryConfig
 from orchestrator.verify_host_roster_file import load_roster
 from orchestrator.verify_runner import GIT_PUSH_SSH_CONFIG, REMOTE_TOOL_PATH_PRELUDE
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
@@ -62,7 +62,7 @@ def _run(*args: str, env: dict[str, str] | None = None) -> subprocess.CompletedP
 P_HOST_CONFIG = """
     project_root: /srv/host/p
     verify_cgroup_memory: {max_gib: 12}
-    git: {main_branch: main}
+    git: {main_branch: trunk}
 """
 
 
@@ -137,14 +137,14 @@ class TestRender:
         assert yaml.safe_load(body) == {
             'project_root': '/srv/host/p',
             'verify_cgroup_memory': {'max_gib': 12},
-            'git': {'main_branch': 'main'},
+            'git': {'main_branch': 'trunk'},
         }
         assert yaml.safe_load((out / 'q.yaml').read_text()) == {'project_root': '/srv/host/q'}
 
     def test_key_order_in_the_roster_does_not_change_the_bytes(self, tmp_path: Path) -> None:
         first = _rendered(tmp_path, _roster(tmp_path), out='first') / 'p.yaml'
         swapped = """
-            git: {main_branch: main}
+            git: {main_branch: trunk}
             verify_cgroup_memory: {max_gib: 12}
             project_root: /srv/host/p
         """
@@ -163,6 +163,9 @@ class TestRender:
         assert _sourced(env_file, 'PROJECT_IDS') == ['p', 'q']
         assert _sourced(env_file, 'CONFIG_PATHS') == ['/srv/host/p.yaml', '/srv/host/q.yaml']
         assert _sourced(env_file, 'PROJECT_ROOTS') == ['/srv/host/p', '/srv/host/q']
+        assert _sourced(env_file, 'PROJECT_MAIN_BRANCHES') == ['trunk', contract.DEFAULT_MAIN_BRANCH]
+        assert _sourced(env_file, 'REQUIRED_OS_ID') == [contract.REQUIRED_OS[0]]
+        assert _sourced(env_file, 'REQUIRED_OS_VERSION_ID') == [contract.REQUIRED_OS[1]]
 
     def test_the_wrapper_is_written(self, tmp_path: Path) -> None:
         assert (_rendered(tmp_path, _roster(tmp_path)) / 'wrapper.sh').is_file()
@@ -227,6 +230,13 @@ class TestRenderRefuses:
         message = self._refused(tmp_path, _roster(tmp_path, p_host_config='git: {main_branch: main}'))
         assert all(word in message for word in ('box', "'p'", 'project_root'))
 
+    @pytest.mark.parametrize('git', ['{main_branch: [trunk]}', '{main_branch: ""}', 'trunk'],
+                             ids=['branch_not_a_string', 'branch_empty', 'git_not_a_mapping'])
+    def test_a_host_config_main_branch_that_is_not_a_branch_name(self, tmp_path: Path, git: str) -> None:
+        host_config = f'project_root: /srv/host/p\ngit: {git}'
+        message = self._refused(tmp_path, _roster(tmp_path, p_host_config=host_config))
+        assert all(word in message for word in ('box', "'p'", 'git.main_branch'))
+
     @pytest.mark.parametrize('unsafe', ['"', '$'])
     def test_a_df_checkout_path_unsafe_inside_double_quotes(self, tmp_path: Path, unsafe: str) -> None:
         message = self._refused(tmp_path, _roster(tmp_path, df=f'/srv/d{unsafe}f'))
@@ -257,9 +267,12 @@ class TestPins:
     def test_the_host_config_keys_it_reads_are_config_fields(self) -> None:
         contract = _contract()
         memory_key, max_gib_key = contract.MEMORY_MAX_GIB_KEYS
+        git_key, main_branch_key = contract.MAIN_BRANCH_KEYS
         assert contract.PROJECT_ROOT_KEY in OrchestratorConfig.model_fields
         assert memory_key in OrchestratorConfig.model_fields
         assert max_gib_key in VerifyCgroupMemoryConfig.model_fields
+        assert git_key in OrchestratorConfig.model_fields
+        assert main_branch_key in GitConfig.model_fields
 
 
 @pytest.mark.parametrize('artifact', PORTABLE_ARTIFACTS, ids=lambda path: path.name)

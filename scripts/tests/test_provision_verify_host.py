@@ -41,7 +41,7 @@ hosts:
       q:
         git_remote: box
         config_path: {self.remote}/config/q.yaml
-        host_config: {{project_root: {self.remote}/q}}
+        host_config: {{project_root: {self.remote}/q, git: {{main_branch: trunk}}}}
 """)
         self.env = {
             'HOME': str(self.home),
@@ -94,6 +94,8 @@ def test_a_dry_run_names_each_step_and_touches_nothing(scene: Scene) -> None:
     assert [line.split(':')[0] for line in step_lines] == _table_ids()
     assert 'box-alias' in proc.stdout
     assert f'{scene.remote}/df' in proc.stdout
+    assert f'checkout {scene.remote}/p on main ' in proc.stdout
+    assert f'checkout {scene.remote}/q on trunk ' in proc.stdout
     assert scene.ssh_calls() == []
     assert not scene.remote.exists()
 

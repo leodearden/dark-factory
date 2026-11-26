@@ -29,7 +29,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import _checkout as _checkout
 import verify_host_observe
 import yaml
-from orchestrator.config import VerifyRunnerConfig
+from orchestrator.config import GitConfig, VerifyRunnerConfig
 from orchestrator.verify_host_roster_file import (
     Roster,
     RosterFileError,
@@ -52,6 +52,8 @@ SSH_BIN_ENV = 'VERIFY_HOST_SSH'
 SYNC_WRITE_WARN_MS = 20.0
 PROJECT_ROOT_KEY = 'project_root'
 MEMORY_MAX_GIB_KEYS = ('verify_cgroup_memory', 'max_gib')
+MAIN_BRANCH_KEYS = ('git', 'main_branch')
+DEFAULT_MAIN_BRANCH: str = GitConfig.model_fields['main_branch'].default
 
 WRAPPER_TEMPLATE = Path(__file__).with_name('verify-host-wrapper.template.sh')
 GENERATED_HEADER = (
@@ -80,6 +82,7 @@ class ProjectSpec:
     project_id: str
     config_path: str
     project_root: str
+    main_branch: str
     host_config: Mapping[str, Any]
     disk_footprint_gib: int | None
 
@@ -152,9 +155,19 @@ def _project_spec(
         project_id=project_id,
         config_path=config_path,
         project_root=project_root,
+        main_branch=_main_branch(where, host_config),
         host_config=host_config,
         disk_footprint_gib=disk_footprint_gib,
     )
+
+
+def _main_branch(where: str, host_config: Mapping[str, Any]) -> str:
+    section_key, value_key = MAIN_BRANCH_KEYS
+    section = host_config.get(section_key, {})
+    branch = section.get(value_key, DEFAULT_MAIN_BRANCH) if isinstance(section, Mapping) else None
+    if not isinstance(branch, str) or not branch:
+        raise ContractError(f'{where}: host_config.{section_key}.{value_key} must be a branch name, got {branch!r}')
+    return branch
 
 
 def render_host_config(host_config: Mapping[str, Any]) -> str:
@@ -187,6 +200,8 @@ def render_host_env(spec: HostSpec, reference: EnvironmentFacts, ssh_bin: str) -
         'GATE_CHECKOUTS_PATH': spec.gate_checkouts_path,
         'WRAPPER_PATH': spec.wrapper_path,
         'TOOL_PATH_PRELUDE': REMOTE_TOOL_PATH_PRELUDE,
+        'REQUIRED_OS_ID': REQUIRED_OS[0],
+        'REQUIRED_OS_VERSION_ID': REQUIRED_OS[1],
         'REF_TIME_ZONE': reference.time_zone or '',
         'REF_LOCALE': reference.locale or '',
         'REF_UV_VERSION': reference.uv_version or '',
@@ -197,6 +212,7 @@ def render_host_env(spec: HostSpec, reference: EnvironmentFacts, ssh_bin: str) -
         'PROJECT_IDS': tuple(project.project_id for project in spec.projects),
         'CONFIG_PATHS': tuple(project.config_path for project in spec.projects),
         'PROJECT_ROOTS': tuple(project.project_root for project in spec.projects),
+        'PROJECT_MAIN_BRANCHES': tuple(project.main_branch for project in spec.projects),
     }
     lines = [f'{name}={shlex.quote(value)}' for name, value in scalars.items()]
     lines += [f'{name}=({" ".join(shlex.quote(item) for item in items)})' for name, items in arrays.items()]
