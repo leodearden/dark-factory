@@ -409,11 +409,11 @@ class TestVerifyLegInjectionEndToEnd:
         worktree = _make_fixture_project(tmp_path / 'worktree')
         recorded = worktree / 'pkg' / 'tests' / 'inherited-env.json'
         (recorded.parent / 'test_session_env.py').write_text(
-            'import json\nimport os\nimport pathlib\n\n\n'
-            'def test_records_its_session_env():\n'
+            'import json\nimport os\nimport pathlib\n\nfrom xdist import get_xdist_worker_id\n\n\n'
+            'def test_records_its_session_env(request):\n'
             "    pathlib.Path(__file__).with_name('inherited-env.json').write_text(json.dumps({\n"
             "        'temproot': os.environ.get('PYTEST_DEBUG_TEMPROOT', ''),\n"
-            "        'xdist_worker': os.environ.get('PYTEST_XDIST_WORKER', ''),\n"
+            "        'xdist_workerid': get_xdist_worker_id(request),\n"
             "    }), encoding='utf-8')\n",
             encoding='utf-8',
         )
@@ -429,10 +429,11 @@ class TestVerifyLegInjectionEndToEnd:
             'use the real host temp root and leave the stand-in untouched with or '
             'without --basetemp: the assertion below would pass vacuously'
         )
-        assert session_env['xdist_worker'].startswith('gw'), (
-            'the leg ran without xdist workers, so its controller never resolved a '
-            'basetemp and never armed the exit-time sweep: the assertion below would '
-            f"pass vacuously (PYTEST_XDIST_WORKER={session_env['xdist_worker']!r})"
+        assert session_env['xdist_workerid'].startswith('gw'), (
+            'the recorder ran outside any xdist worker, so the leg had no xdist '
+            'controller, which is what resolves a basetemp and arms the exit-time '
+            'sweep: the assertion below would pass vacuously '
+            f"(worker id {session_env['xdist_workerid']!r})"
         )
         after = listing(host)
         assert after == before, (
