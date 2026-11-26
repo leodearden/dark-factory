@@ -460,17 +460,17 @@ class TestMergeScreenBounceSurfacing:
         store = EventStore(tmp_path / 'runs.db', run_id='run-screen')
         workflow = _make_routing_workflow(config, worktree, event_store=store)
         submitted: list = []
-        workflow.escalation_queue = _l0_capturing_queue(submitted)  # type: ignore[assignment]
         merge_queue: asyncio.Queue = asyncio.Queue()
         workflow.merge_queue = merge_queue
         bounce = _screen_bounce()
 
         with patch.object(
+            workflow, 'escalation_queue', new=_l0_capturing_queue(submitted),
+        ), patch.object(
             workflow, '_ensure_steward_started', new=AsyncMock(return_value=None),
         ), patch.object(
             workflow, '_ensure_l1_escalation_for_blocked', new=AsyncMock(return_value=None),
-        ):
-            workflow._steward = None
+        ), patch.object(workflow, '_steward', new=None):
             driven = asyncio.run(drive_merge(
                 workflow._submit_to_merge_queue('task/42', pre_rebased=False, merge_phase=True),
                 merge_queue,
@@ -500,8 +500,6 @@ class TestMergeScreenBounceSurfacing:
         mark_blocked = AsyncMock(side_effect=[
             WorkflowOutcome.REQUEUED, WorkflowOutcome.REQUEUED, WorkflowOutcome.BLOCKED,
         ])
-        workflow._mark_blocked = mark_blocked  # type: ignore[method-assign]
-        workflow._write_merge_failure_review = MagicMock()
         merge_queue: asyncio.Queue = asyncio.Queue()
         workflow.merge_queue = merge_queue
 
@@ -521,7 +519,10 @@ class TestMergeScreenBounceSurfacing:
         async def two_bounces() -> list[WorkflowOutcome | None]:
             return [await bounce_then_check_thrash() for _ in range(2)]
 
-        first, second = asyncio.run(two_bounces())
+        with patch.object(workflow, '_mark_blocked', new=mark_blocked), patch.object(
+            workflow, '_write_merge_failure_review', new=MagicMock(),
+        ):
+            first, second = asyncio.run(two_bounces())
 
         assert first is None
         assert second == WorkflowOutcome.BLOCKED

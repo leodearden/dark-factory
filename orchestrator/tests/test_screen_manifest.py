@@ -6,6 +6,7 @@ parse; only a whole-document fault yields no checks at all.
 
 from __future__ import annotations
 
+import dataclasses
 from pathlib import Path
 
 import pytest
@@ -59,10 +60,8 @@ def test_a_well_formed_doc_parses_every_check_in_file_order():
 
 def test_parsed_records_are_frozen():
     manifest = _parse(_entry())
-    with pytest.raises(AttributeError):
-        manifest.checks[0].id = 'other'  # type: ignore[misc]
-    with pytest.raises(AttributeError):
-        manifest.checks = ()  # type: ignore[misc]
+    pytest.raises(dataclasses.FrozenInstanceError, setattr, manifest.checks[0], 'id', 'other')
+    pytest.raises(dataclasses.FrozenInstanceError, setattr, manifest, 'checks', ())
 
 
 @pytest.mark.parametrize(

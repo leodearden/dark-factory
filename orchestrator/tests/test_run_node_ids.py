@@ -188,6 +188,27 @@ def test_a_run_that_reports_its_ids_is_not_rerun(tmp_path):
     assert _sessions(sessions) == 1
 
 
+def test_a_module_or_class_id_names_every_testcase_under_it(tmp_path):
+    tree = _make_tree(tmp_path)
+    (tree / 'pkg' / 'tests' / 'test_green.py').write_text(
+        'def test_one():\n    pass\n\n\nclass TestTwo:\n    def test_two(self):\n        pass\n',
+        encoding='utf-8',
+    )
+    green_module = 'pkg/tests/test_green.py'
+    red_module = 'pkg/tests/test_probe.py'
+    box_class = 'pkg/tests/test_probe.py::TestBox'
+    module_relative_green = 'tests/test_green.py'
+
+    statuses = asyncio.run(run_node_ids(
+        tree, _make_config(tree), [_module_config('pkg')],
+        [green_module, red_module, box_class, module_relative_green],
+    ))
+
+    assert dict(statuses) == {
+        green_module: 'pass', red_module: 'fail', box_class: 'pass', module_relative_green: 'pass',
+    }
+
+
 def test_an_uncollectable_id_errors_alone(tmp_path):
     tree = _make_tree(tmp_path)
 

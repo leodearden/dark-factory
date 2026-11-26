@@ -13,12 +13,11 @@ red-base cases use the real pytest runner.
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import fcntl
 import os
 import subprocess
 import sys
-from collections.abc import AsyncIterator, Collection, Iterator, Mapping, Sequence
+from collections.abc import Collection, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -272,6 +271,22 @@ def held_merger_lane(git_ops: GitOps) -> Iterator[None]:
         os.close(fd)
 
 
+@dataclass
+class _RaisingEntry:
+    """An async context manager whose entry records *label* and raises *error*."""
+
+    error: BaseException
+    label: str
+    entered: list[str]
+
+    async def __aenter__(self) -> Path:
+        self.entered.append(self.label)
+        raise self.error
+
+    async def __aexit__(self, *exc_info: object) -> None:
+        return None
+
+
 class _UnenterableTrees:
     """A GitOps stand-in whose lane and fallback both raise on entry, recording each attempt."""
 
@@ -280,17 +295,11 @@ class _UnenterableTrees:
         self.fallback_error = fallback_error
         self.entered: list[str] = []
 
-    @contextlib.asynccontextmanager
-    async def screen_lane(self, lane: ScreenLane, sha: str, **_: Any) -> AsyncIterator[Path]:
-        self.entered.append(f'lane:{sha}')
-        raise self.lane_error
-        yield Path()  # pragma: no cover
+    def screen_lane(self, lane: ScreenLane, sha: str, **_: Any) -> _RaisingEntry:
+        return _RaisingEntry(self.lane_error, f'lane:{sha}', self.entered)
 
-    @contextlib.asynccontextmanager
-    async def ephemeral_worktree(self, kind: WorktreeKind, sha: str, **_: Any) -> AsyncIterator[Path]:
-        self.entered.append(f'fallback:{sha}')
-        raise self.fallback_error
-        yield Path()  # pragma: no cover
+    def ephemeral_worktree(self, kind: WorktreeKind, sha: str, **_: Any) -> _RaisingEntry:
+        return _RaisingEntry(self.fallback_error, f'fallback:{sha}', self.entered)
 
 
 # ---------------------------------------------------------------------------

@@ -69,9 +69,11 @@ class TestValidation:
         assert 'error_streak_alarm' in str(excinfo.value)
 
     @pytest.mark.usefixtures('code_default_config')
-    def test_rejected_at_load_through_the_nested_dict_shape(self):
+    def test_rejected_at_load_from_a_project_yaml(self, tmp_path: Path):
+        project_cfg = tmp_path / 'orchestrator.yaml'
+        project_cfg.write_text(yaml.dump({'merge_screen': {'manifest': '/etc/screen.yaml'}}))
         with pytest.raises(ValidationError) as excinfo:
-            OrchestratorConfig(merge_screen={'manifest': '/etc/screen.yaml'})  # type: ignore[arg-type]
+            load_config(project_cfg)
         assert 'manifest' in str(excinfo.value)
 
 

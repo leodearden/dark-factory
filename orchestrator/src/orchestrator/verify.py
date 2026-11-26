@@ -1478,6 +1478,16 @@ def _junit_spelling(node_id: str) -> str:
     return f"{'.'.join(names[:-1])}::{names[-1]}"
 
 
+def _junit_container(node_id: str) -> str:
+    """The junit classname of *node_id* read as a module or class, when the rootdir is the id's root."""
+    path, *names = node_id.split('::')
+    return '.'.join([path.replace('/', '.').removesuffix('.py'), *names])
+
+
+def _junit_classname_under(classname: str, containers: Collection[str]) -> bool:
+    return any(classname == container or classname.startswith(f'{container}.') for container in containers)
+
+
 def _junit_testcase_never_ran(testcase: ET.Element) -> bool:
     skipped = testcase.find('skipped')
     return (
@@ -11660,21 +11670,22 @@ def _node_id_results(
     """The result of each id the junit *report* records; ``None`` when no report parsed.
 
     An id names the testcase spelled from its qualified id with the rootdir at
-    the tree root or at the module dir, and a function id without parameters
-    names every parametrization of it. An id that names no testcase is left out.
+    the tree root or at the module dir; a function id without parameters
+    names every parametrization of it, and a module or class id every
+    testcase under it. An id that names no testcase is left out.
     """
     testcases = _junit_testcase_results(report)
     if testcases is None:
         return None
     results: dict[str, NodeIdResult] = {}
     for node_id, qualified in qualified_by_id.items():
-        spellings = {
-            _junit_spelling(qualified),
-            _junit_spelling(qualified.removeprefix(f'{prefix}/')),
-        }
+        rooted = (qualified, qualified.removeprefix(f'{prefix}/'))
+        spellings = {_junit_spelling(spelled) for spelled in rooted}
+        containers = {_junit_container(spelled) for spelled in rooted}
         named = [
             result for testcase, result in testcases.items()
             if spellings & {testcase, testcase.partition('[')[0]}
+            or _junit_classname_under(testcase.partition('::')[0], containers)
         ]
         if named:
             results[node_id] = min(named, key=_by_node_id_precedence)
@@ -11804,15 +11815,14 @@ async def run_node_id_results(
 
     ``'pass'`` and ``'fail'`` are verdicts on the test. ``'skipped'`` means it
     never ran, which is not a pass: SKIP is not ALLOW. ``'error'`` means no
-    verdict was obtained: the id maps to no module in *module_configs*, names
-    no test function (a module or class id matches no testcase), was never
-    reported, errored in setup or teardown, or its run raised or wrote no
-    junit report.
+    verdict was obtained: the id maps to no module in *module_configs*,
+    names no testcase, was never reported, errored in setup or teardown, or
+    its run raised or wrote no junit report.
 
-    A function id without its parameters names every parametrization:
-    ``'fail'`` if any failed, else ``'error'`` if any errored, else
-    ``'skipped'`` if any was skipped, else ``'pass'`` (every parametrization
-    passed).
+    A function id without its parameters names every parametrization, and a
+    module or class id every testcase under it: ``'fail'`` if any failed,
+    else ``'error'`` if any errored, else ``'skipped'`` if any was skipped,
+    else ``'pass'`` (every one passed).
 
     Each id is mapped to its module on its own, so one unmappable id errors
     alone. The ids of one module run together, serially, scoped and with a
