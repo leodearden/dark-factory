@@ -15,6 +15,7 @@ from _fm_helpers import make_insufficient_quota_error
 from qdrant_client import AsyncQdrantClient
 from shared.cli_invoke import AgentResult
 
+from fused_memory.backends.task_backend_protocol import TaskBackendProtocol
 from fused_memory.backends.task_backend_types import MetadataLookupResult
 from fused_memory.config.schema import CuratorConfig, FusedMemoryConfig
 from fused_memory.middleware.curator_types import (
@@ -196,15 +197,19 @@ def exhaustible_embedder() -> ExhaustibleEmbedder:
 
 
 def in_memory_corpus_curator(
-    embedder: CorpusEmbedder, config: FusedMemoryConfig | None = None,
+    embedder: CorpusEmbedder,
+    config: FusedMemoryConfig | None = None,
+    *,
+    taskmaster: TaskBackendProtocol | None = None,
 ) -> TaskCurator:
     """A real TaskCurator over an in-memory Qdrant corpus embedded by *embedder*.
 
-    It never calls the LLM. The caller awaits ``curator.close()``.
+    Its corpus also reads *taskmaster*'s store when one is given. It never
+    calls the LLM. The caller awaits ``curator.close()``.
     """
     return TaskCurator(
         config=config or make_config(),
-        taskmaster=None,
+        taskmaster=taskmaster,
         invoke=must_not_invoke(),
         embedder=embedder,
         qdrant_client=AsyncQdrantClient(location=':memory:'),
