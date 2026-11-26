@@ -30,7 +30,7 @@ import pytest
 from orchestrator.agents.write_set import (
     WriteSet,
     compute_write_set,
-    ensure_claude_fleet_dir,
+    ensure_sandbox_dirs,
     write_set_of,
 )
 from orchestrator.artifacts import TaskArtifacts
@@ -444,57 +444,90 @@ class TestWriteSetDigest:
 
 
 # ---------------------------------------------------------------------------
-# task 2996: ensure_claude_fleet_dir() — side-effecting pre-creation helper
+# tasks 2996 / 3382: ensure_sandbox_dirs() — side-effecting pre-creation helper
 # ---------------------------------------------------------------------------
 
 
-class TestEnsureClaudeFleetDir:
-    """Pins ``ensure_claude_fleet_dir(write_set) -> bool`` — the SEPARATE,
-    explicitly side-effecting helper that materializes ~/.claude/fleet OUTSIDE
-    the sandbox before dispatch (task 2996).
+class TestEnsureSandboxDirs:
+    """Pins ``ensure_sandbox_dirs(write_set) -> list[Path]`` — the SEPARATE,
+    explicitly side-effecting helper that materializes every must-pre-exist
+    carve-out OUTSIDE the sandbox before dispatch: ``claude_fleet`` (task 2996)
+    and ``tree_sitter_cache`` (task 3382). It returns the paths it could NOT
+    create; an empty list means every carve-out is present.
 
     ``compute_write_set`` stays PURE (``test_purity_no_makedirs_side_effect``);
-    this helper is the one place the load-bearing ``claude_fleet`` carve-out is
-    created so BOTH backends can grant it (neither can --bind / add a
-    nonexistent path with parent ~/.claude read-only). Hermetic: ``claude_fleet``
-    always points under ``tmp_path`` — never the real ~/.claude.
+    this helper is the one place those carve-outs are created so BOTH backends
+    can grant them (neither can bind / add a nonexistent path, and the agent
+    cannot create one from inside, where ~/.claude and ~/.cache are read-only).
+
+    This class tests the MODULE-LEVEL helper. The same-named class in
+    ``test_workflow_sandbox_events.py`` tests the ``TaskWorkflow._ensure_sandbox_dirs``
+    wrapper that calls it and owns the operator-facing warning.
+
+    Hermetic: every test overrides BOTH ``claude_fleet`` and
+    ``tree_sitter_cache`` to paths under ``tmp_path``, because
+    ``_make_write_set`` defaults them to real-looking absolute dummies.
     """
 
-    def test_creates_dir_and_missing_parents_when_absent(self, tmp_path: Path):
-        # (a) parents=True: a claude_fleet whose parent does not yet exist is
-        # created in full, and the call reports success.
-        claude_fleet = tmp_path / 'nonexistent-home' / '.claude' / 'fleet'
-        ws = _make_write_set(claude_fleet=claude_fleet)
+    def test_creates_tree_sitter_cache_when_absent(self, tmp_path: Path):
+        claude_fleet = tmp_path / 'home' / '.claude' / 'fleet'
+        claude_fleet.mkdir(parents=True)
+        tree_sitter_cache = tmp_path / 'home' / '.cache' / 'tree-sitter'
+        ws = _make_write_set(claude_fleet=claude_fleet, tree_sitter_cache=tree_sitter_cache)
+        assert not tree_sitter_cache.exists()
+
+        assert ensure_sandbox_dirs(ws) == []
+
+        assert tree_sitter_cache.is_dir()
+
+    def test_creates_both_carve_outs_in_one_call(self, tmp_path: Path):
+        claude_fleet = tmp_path / 'home' / '.claude' / 'fleet'
+        tree_sitter_cache = tmp_path / 'home' / '.cache' / 'tree-sitter'
+        ws = _make_write_set(claude_fleet=claude_fleet, tree_sitter_cache=tree_sitter_cache)
         assert not claude_fleet.exists()
-        assert not claude_fleet.parent.exists()  # missing parent chain
+        assert not tree_sitter_cache.exists()
 
-        assert ensure_claude_fleet_dir(ws) is True
+        assert ensure_sandbox_dirs(ws) == []
 
         assert claude_fleet.is_dir()
-        assert claude_fleet.parent.is_dir()  # parents=True built the chain
+        assert tree_sitter_cache.is_dir()
 
-    def test_idempotent_when_dir_already_exists(self, tmp_path: Path):
-        # (b) exist_ok=True: a second call on an already-present dir returns
-        # True and does not raise.
+    def test_creates_dirs_and_missing_parents_when_absent(self, tmp_path: Path):
+        home = tmp_path / 'nonexistent-home'
+        claude_fleet = home / '.claude' / 'fleet'
+        tree_sitter_cache = home / '.cache' / 'tree-sitter'
+        ws = _make_write_set(claude_fleet=claude_fleet, tree_sitter_cache=tree_sitter_cache)
+        assert not home.exists()
+
+        assert ensure_sandbox_dirs(ws) == []
+
+        assert claude_fleet.is_dir()
+        assert tree_sitter_cache.is_dir()
+
+    def test_idempotent_when_dirs_already_exist(self, tmp_path: Path):
         claude_fleet = tmp_path / '.claude' / 'fleet'
-        ws = _make_write_set(claude_fleet=claude_fleet)
-        assert ensure_claude_fleet_dir(ws) is True
-        assert claude_fleet.is_dir()
+        tree_sitter_cache = tmp_path / '.cache' / 'tree-sitter'
+        ws = _make_write_set(claude_fleet=claude_fleet, tree_sitter_cache=tree_sitter_cache)
+        assert ensure_sandbox_dirs(ws) == []
 
-        assert ensure_claude_fleet_dir(ws) is True
-        assert claude_fleet.is_dir()
+        assert ensure_sandbox_dirs(ws) == []
 
-    def test_returns_false_when_mkdir_raises_oserror(self, tmp_path: Path):
-        # (c) failure path: a regular FILE cannot be a parent dir, so
-        # mkdir(parents=True) raises NotADirectoryError (an OSError subclass),
-        # which the helper catches -> returns False, and nothing is created.
+        assert claude_fleet.is_dir()
+        assert tree_sitter_cache.is_dir()
+
+    def test_returns_failing_path_and_still_creates_the_other(self, tmp_path: Path):
+        # A regular FILE cannot be a parent dir, so mkdir(parents=True) raises
+        # NotADirectoryError. One failing carve-out must not suppress the rest.
         blocker = tmp_path / 'blocker'
         blocker.write_text('i am a regular file, not a directory\n')
         claude_fleet = blocker / 'fleet'
-        ws = _make_write_set(claude_fleet=claude_fleet)
+        tree_sitter_cache = tmp_path / '.cache' / 'tree-sitter'
+        ws = _make_write_set(claude_fleet=claude_fleet, tree_sitter_cache=tree_sitter_cache)
 
-        assert ensure_claude_fleet_dir(ws) is False
+        assert ensure_sandbox_dirs(ws) == [claude_fleet]
+
         assert not claude_fleet.exists()
+        assert tree_sitter_cache.is_dir()
 
 
 # ---------------------------------------------------------------------------
