@@ -154,6 +154,18 @@ class TestComputeWriteSetHappyPath:
         assert ws.tmp == Path('/tmp')
         assert ws.dev == Path('/dev')
 
+    def test_tree_sitter_grant_covers_no_other_cache_peer(
+        self, worktree: Path, tmp_home: Path,
+    ):
+        # The grant is the tree-sitter SUBDIR. Widening it to ~/.cache, or to
+        # any other ancestor of a ~/.cache/<tool> peer, makes a granted path an
+        # ancestor of that peer. /tmp and /dev are left out: the blanket /tmp
+        # scratch grant is an ancestor of tmp_path, so of this fake home.
+        ws = compute_write_set(worktree, task_id='2904', home=tmp_home)
+        peer = tmp_home.resolve() / '.cache' / 'other-tool'
+        granted = [p for p in ws.writable_paths() if p not in (ws.tmp, ws.dev)]
+        assert [p for p in granted if peer.is_relative_to(p)] == []
+
     def test_final_writable_list_excludes_whole_claude_and_hooks_state(
         self, worktree: Path, tmp_home: Path,
     ):
