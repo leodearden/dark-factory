@@ -408,3 +408,76 @@ def test_per_item_chain_wall_over_deep_enough_chains():
 
 def test_per_item_chain_wall_is_none_without_a_deep_enough_chain():
     assert canary.per_item_chain_wall([chain_verify(1, 'a', 5)], min_items=8) is None
+
+
+# ---------------------------------------------------------------------------
+# The two chain-traced invariant predicates whose producers are not in runs.db.
+# ---------------------------------------------------------------------------
+
+
+def anchor(minutes: float, task_id: str, base: str | None, reason: str = 'live_tip', **extra: Any) -> dict[str, Any]:
+    return ev(minutes, task_id, anchor_reason=reason, anchor_base=base, point='dispatch', **extra)
+
+
+def test_a_live_tip_anchor_onto_an_already_dead_tip_is_a_new_class_violation():
+    voided = [
+        anchor(1, 'k', None, reason='tip_dead', dead_link='dead-link', item_commit='dead-item'),
+        anchor(5, 'x', 'dead-link'),
+        anchor(8, 'w', 'fresh'),
+        anchor(9, 'q', None, reason='no_tip', dead_link='fresh'),
+        anchor(10, 'v', 'dead-link', reason='tip_vacated'),
+        anchor(11, 'u', 'healthy'),
+    ]
+    discards = [anchor(6, 'y', 'red-tip'), anchor(7, 'z', 'dead-item')]
+    verify = [ev(2, 'r', merge_sha='red-tip', passed=False), ev(3, 'g', merge_sha='healthy', passed=True)]
+
+    result = canary.frozen_tip_violations(voided, discards, verify)
+
+    assert result.anchors == 5
+    assert result.violations == (
+        ('x', at(5), 'dead-link'),
+        ('y', at(6), 'red-tip'),
+        ('z', at(7), 'dead-item'),
+    )
+    assert result.died_after_anchor == 1
+
+
+def test_a_tip_recorded_dead_at_the_anchor_instant_is_not_earlier():
+    voided = [anchor(5, 'x', 'tip'), anchor(5, 'k', None, reason='tip_dead', dead_link='tip')]
+    result = canary.frozen_tip_violations(voided, [], [])
+    assert (result.anchors, result.violations, result.died_after_anchor) == (1, (), 0)
+
+
+def test_an_anchor_without_a_string_base_is_not_examined():
+    result = canary.frozen_tip_violations([anchor(5, 'x', None)], [], [])
+    assert result.anchors == 0
+
+
+def audit(minutes: float, *texts: str, level: str = 'WARNING') -> canary.AuditRecord:
+    return canary.AuditRecord(at=at(minutes), level=canary.AuditLevel(level), violations=texts)
+
+
+LEDGER_TEXT = 'unregistered on-disk merge worktree /w/_merge-1 (age 9001s > grace 9000s) absent from owned ledger'
+
+
+def test_accounting_violations_count_distinct_texts_of_the_four_prefixes():
+    records = [
+        audit(1, 'speculation-slot conservation violated: slot_available=0', LEDGER_TEXT),
+        audit(2, 'speculation-slot conservation violated: slot_available=0'),
+        audit(3, 'merge-ahead-cap conservation violated: held=2 cap=1'),
+        audit(4, 'merge-ahead-cap handoff violated: RealMergeItem in x'),
+        audit(5, 'speculation_accounting_violations: merge-ahead-cap check raised: boom'),
+        audit(6, LEDGER_TEXT),
+        audit(7, level='INFO'),
+    ]
+
+    tally = canary.accounting_violations(records)
+
+    assert tally.distinct_texts == 4
+    assert tally.records_with_any == 5
+    assert tally.worktree_ledger_records == 2
+
+
+def test_worktree_ledger_records_alone_are_not_accounting_violations():
+    tally = canary.accounting_violations([audit(1, LEDGER_TEXT), audit(2, LEDGER_TEXT)])
+    assert (tally.distinct_texts, tally.records_with_any, tally.worktree_ledger_records) == (0, 0, 2)
