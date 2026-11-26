@@ -39,7 +39,7 @@ _CANONICAL_EXTENSIONS = [
     'lock', 'log',
     'manifest', 'md', 'mjs', 'mts',
     'npmrc', 'png', 'py', 'python-version',
-    'ri', 'rs', 'scss', 'service', 'sh', 'step', 'stl', 'svg',
+    'ri', 'rs', 'scss', 'service', 'sh', 'stderr', 'step', 'stl', 'svg',
     'template', 'timer', 'tombstones', 'toml', 'ts', 'tsv', 'tsx', 'txt', 'typed',
     'yaml', 'yml',
 ]
@@ -142,6 +142,8 @@ _ACCEPT_PATHS = [
     'docs/reify-language-spec.tombstones',  # reify
     # reify #9058 (α-first): the first tracked reify `.tsv`, landed by reify #8662.
     'tests/infra/affected-crates-direct-sets.tsv',  # reify
+    # reify #10618 (α-first): trybuild expected output for reify #10554's must_not_compile cases.
+    'crates/reify-eval-core/tests/must_not_compile/await_inside_section.stderr',  # reify
 ]
 
 # REJECT corpus (α/γ shared vector — all must return False).  Verbatim duplicate
