@@ -28,6 +28,9 @@ from client_feed.filer_tools import FILER_IDENTITY, WRITE_TOOLS, OpenTools, Tool
 from client_feed.policy import Policy
 from client_feed.publisher import run_pass
 from shared.toolcall_markup import CANONICAL_OPENER_PREFIX, closer_for
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 PROJECT = 'demo-client'
 CLIENT_FEED_FIXTURES = Path(__file__).resolve().parents[2] / 'client-feed' / 'tests' / 'fixtures'
