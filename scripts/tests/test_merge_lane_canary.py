@@ -136,6 +136,12 @@ def test_landings_are_done_finalizes_union_train_members_in_time_order():
     assert [r.via_chain for r in rows] == [False, False, False, True]
 
 
+def test_a_train_member_with_its_own_done_finalize_lands_once():
+    finalized = [ev(10, 'm1', state='done', merge_sha='sha-t')]
+    train_merged = [ev(10, 't', member_task_ids=['m1', 'm2'], merge_commit_sha='sha-t')]
+    assert [r.task_id for r in canary.landings(finalized, train_merged)] == ['m1', 'm2']
+
+
 @pytest.mark.parametrize(('raw', 'via_chain'), [(1, True), (2.0, True), (None, False), (True, False), ('1', False)])
 def test_via_chain_is_true_only_for_a_non_bool_number(raw, via_chain):
     finalized = [ev(1, 'a', state='done', merge_sha='s', landed_via_chain=raw)]
