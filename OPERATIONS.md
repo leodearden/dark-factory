@@ -837,7 +837,8 @@ any request. To run one by hand, stop the instance first.
 
 - `--once` runs one pass and prints its report as JSON. It exits 0 even when
   a report could not be filed. Such a report is named under `unconverged`, by
-  the refusing tool and its code, and is retried on the next pass. An
+  the refusing tool and its code, and is retried on the next pass. Each entry
+  there also carries `attempts` and `stalled` (see "A stalled ref" below). An
   unreachable fused-memory exits 1. The loop instead counts it as a
   transient pass and backs off.
 - `--check` is σ4's install check. It takes the lock and handshakes with
@@ -846,7 +847,11 @@ any request. To run one by hand, stop the instance first.
   not list. It looks up `portal:<project_id>:check:1`, a ref the portal never
   mints. Then it prints the calls one pass would make over the inbox: reads
   performed, writes withheld. It writes nothing but the lock file, and stores
-  no cursor. It exits 0 only when every tool is listed and nothing refused.
+  no cursor. It exits 0 only when every tool is listed, nothing refused, and
+  no stored ref is stalled.
+
+Inbox lines that fail the inbox contract are logged as a WARNING with their
+byte offsets, never their text: such a line may carry raw client text.
 
 Before enabling the filer for a live client, Leo confirms σ4's six checks
 (`plans/client-feed-prd.md` §14.8, row σ4):
@@ -893,6 +898,34 @@ on the fix's defect depends on where that defect stands:
 In every case a pending fix is still cancelled, a started fix is left running,
 and a done fix is left untouched. The gate is cancelled after the fix's step,
 because cancelling a gate first would release the fix.
+
+**A stalled ref.** Every refusal that a retry alone will not clear counts an
+attempt against the ref in `cursor.json`'s `refs`, at whichever step it came,
+filing or ruling. Transport, HTTP-status and reconciliation-backlog refusals
+do not count; the loop backs off for those instead. The record names the
+refusing tool (`last_tool`) and its code (`last_code`), and is dropped once
+the ref converges. At
+`client-feed/src/client_feed/filer_state.py::STALLED_AFTER_ATTEMPTS` attempts
+the ref is stalled. Each pass then logs it at ERROR rather than WARNING, and
+still retries it at the normal interval, so it converges on the pass after its
+cause is cleared:
+
+```bash
+journalctl --user -u client-feed-filer@<name>.service -p err
+```
+
+With the instance stopped, `--check` names the stored stalled refs under
+`stalled`, each with its last tool and code, and exits 1.
+
+Two refusals stall a ref until an operator acts:
+
+- `commit_planning` refused `deferral_invalid`: another hold, not the filer's
+  planning hold, sits on the fix or its gate, and `commit_planning` releases
+  only a planning hold. Check who holds it. Once it may go, release it with a
+  plain `set_task_status pending`.
+- `set_task_status` refused `FollowupHolderProtectedError`: the fix or gate is
+  its project's follow-up holder. Cancelling it releases every held follow-up,
+  which is a human act made with `release_holder`.
 
 A report the filer has not filed in time shows as the `filer` source under
 "Reading the heartbeat's degraded list" below.
