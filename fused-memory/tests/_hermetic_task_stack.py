@@ -9,10 +9,14 @@ The store's project root is *tmp_path*, which is not a git worktree, so for the
 stack's lifetime ``fused_memory.server.tools.resolve_main_checkout`` hands every
 project root back unchanged instead of refusing it.
 
-``config.taskmaster`` is cleared so the curator's one-shot corpus backfill
-never fires, which keeps the stack hermetic whatever the ambient
-fused-memory/config/config.yaml says. That clearing is what sets it apart from
-``test_task_tools.py::real_task_stack``, a fixture that passes no config.
+``config.taskmaster`` is cleared, so the curator's corpus backfill never fires.
+``config.curator.enabled`` is False, so ``commit_planning``'s corpus indexing and
+``update_task``'s re-embed are no-ops and ``search_tasks`` answers
+``ConfigurationError``; with the curator on, ``TaskCurator`` embeds through
+OpenAI and writes ``task_curator_<project_id>`` into the Qdrant at
+``config.mem0.qdrant_url``, the live one under the suite's pinned config. That
+config is what sets it apart from ``test_task_tools.py::real_task_stack``, a
+fixture that passes no config.
 """
 
 from __future__ import annotations
@@ -42,6 +46,7 @@ async def hermetic_task_stack(tmp_path: Path) -> AsyncIterator[tuple[Any, TaskIn
     await ticket_store.initialize()
     config = FusedMemoryConfig()
     config.taskmaster = None
+    config.curator.enabled = False
     interceptor = TaskInterceptor(backend, None, event_buffer, config, ticket_store=ticket_store)
     try:
         with patch('fused_memory.server.tools.resolve_main_checkout', _project_root_unchanged):
