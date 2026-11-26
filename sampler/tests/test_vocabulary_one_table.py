@@ -220,6 +220,9 @@ def _scope() -> list[tuple[Path, bool]]:
         REPO_ROOT / 'scripts' / 'resource_report.py',
         REPO_ROOT / 'scripts' / 'resource_report_holds.py',
         REPO_ROOT / 'scripts' / 'resource_report_holds_render.py',
+        REPO_ROOT / 'scripts' / 'verify_host_trial_stores.py',
+        REPO_ROOT / 'scripts' / 'verify_host_trial_measures.py',
+        REPO_ROOT / 'scripts' / 'verify_host_trial_report.py',
     ]
     return [(path, path == _SPEC_HOME) for path in sampler_modules] + [
         (path, False) for path in others
