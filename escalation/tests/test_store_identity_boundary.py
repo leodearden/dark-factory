@@ -29,25 +29,11 @@ from escalation.store_identity import StoreIdentity
 TASK = '5534'
 READS = stores.GUARDED_READS
 WRITES = stores.GUARDED_WRITES
-GUARDED = READS + WRITES
-_FILING = {
-    'task_id': TASK,
-    'agent_role': 'implementer',
-    'category': 'design_concern',
-    'summary': 's',
-}
+GUARDED = READS + WRITES + stores.GUARDED_RESOLVES
 
 
 def arguments(name: str, escalation_id: str) -> dict[str, Any]:
-    table: dict[str, dict[str, Any]] = {
-        'get_pending_escalations': {'task_id': TASK},
-        'get_escalation': {'escalation_id': escalation_id},
-        'get_task_escalation_history': {'task_id': TASK},
-        'get_task_escalations': {'task_id': TASK},
-        'escalate_info': _FILING,
-        'escalate_blocker': _FILING,
-    }
-    return dict(table[name])
+    return stores.guarded_arguments(name, task_id=TASK, escalation_id=escalation_id)
 
 
 def pending_ids(queue: EscalationQueue) -> list[str]:

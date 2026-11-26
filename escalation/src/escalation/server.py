@@ -2423,6 +2423,7 @@ def create_server(
         recut: bool = False,
         terminate: Any = None,
         ruled_by_human: bool | None = None,
+        project_root: str | None = None,
     ) -> dict[str, Any]:
         """Resolve or dismiss an escalation.
 
@@ -2544,6 +2545,12 @@ def create_server(
         ``ruled_by_human_forbidden``. Header-less callers are trusted, as for
         ``resolved_by``; the decision-stream audit checks their assertions.
 
+        *project_root* — optional. When given, it must name the project root
+        this store serves; otherwise the call returns ``{'error': ...}``
+        naming both stores (or naming the reconciliation store), and nothing
+        is read or changed. Omitted or ``''``, the call is unchanged. The rule
+        is ``escalation.project_root_guard::ProjectRootGuard``'s.
+
         **A resolve on an ALREADY-AUTO-DISMISSED record does NOT take effect**
         (task 4495).  ``queue.resolve``'s status check is an atomic
         check-and-set, so if an automated sweep (the W9-δ steward auto-dismiss,
@@ -2607,7 +2614,9 @@ def create_server(
         ``escalation.action_effects`` module docstring for the archive
         verification behind this).
 
-        **Gate precedence**, in order: the argument-validation refusals
+        **Gate precedence**, in order: the ``project_root`` guard (a bare
+        ``{'error': ...}`` with no ``code`` key, the same shape as the sibling
+        tools' refusal) → the argument-validation refusals
         (``invalid_resolution_class``, ``recut_requires_restart``) → the
         connection-capability gate
         (``bad_capability_header`` / ``level_forbidden``) → the policy-table
@@ -2712,6 +2721,8 @@ def create_server(
         inline, which closes it or re-holds it, instead of being re-pended, see
         ``orchestrator/src/orchestrator/harness.py::Harness._run_held_pure_gate_inline``.
         """
+        if (refusal := project_root_guard.check(project_root)) is not None:
+            return refusal
         if terminate is not None:
             return {
                 'error': (
