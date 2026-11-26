@@ -297,9 +297,10 @@ class AmbiguousRun(LookupError):
 
 @dataclass(frozen=True)
 class RunRow:
-    """One run; ``invocation_run_id`` is the run id the adjudicator calls it asked were written
-    under in the invocations ledger (``models/invocation_ledger.py::invocations_ledger_path``),
-    None for a run that asked none."""
+    """One run; ``invocation_run_id`` is the invocations-ledger run id its adjudicator wrote
+    under (``models/invocation_ledger.py::invocations_ledger_path``), which can hold no rows,
+    as when every verdict was reused; None for a run with no adjudicator, or one whose calls
+    are written nowhere."""
 
     run_id: str
     source: RunSource
@@ -309,7 +310,7 @@ class RunRow:
     counts: Mapping[str, Any] | None
     plan_sha256: str | None
     plan_path: Path | None
-    invocation_run_id: str | None = None
+    invocation_run_id: str | None
 
     @property
     def kind(self) -> RunKind:

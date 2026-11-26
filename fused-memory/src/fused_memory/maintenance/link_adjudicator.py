@@ -465,7 +465,7 @@ class ConfiguredAdjudicator:
     field_chars: int
     failure_streak: int
     ask: ShardAsker
-    invocation_run_id: str | None = None
+    invocation_run_id: str | None
 
     async def __call__(
         self, pairs: Sequence[LinkPair], *, on_failure_storm: StormHook | None = None,
