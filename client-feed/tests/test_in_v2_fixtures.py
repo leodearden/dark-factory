@@ -1,4 +1,8 @@
-"""The factory's in-v2 stand-in, read as the portal will write it, and B23's rejection cases."""
+"""The in-v2 inbox, the factory's hand-written stand-in and the portal's vendored writer output.
+
+Every test runs over both directories: each line reads as an inbox line, B23's rejection
+cases are derived by mutating copies of them, and a publisher pass reads them in order.
+"""
 
 import json
 import shutil
@@ -31,7 +35,7 @@ from client_feed.policy import Policy
 from client_feed.publisher import run_pass
 from client_feed.validate import validate_out_dir
 
-IN_V2 = Path(__file__).parent / 'fixtures' / 'in-v2-factory'
+FIXTURES = Path(__file__).parent / 'fixtures'
 PROJECT = 'demo-client'
 T0 = datetime(2026, 10, 23, 9, 0, tzinfo=UTC)
 NOW = datetime(2026, 10, 23, 10, 0, tzinfo=UTC)
@@ -40,26 +44,36 @@ RESTATED_LINE = 1
 QUARANTINED_LINE = 2
 
 
-def fixture_lines() -> tuple[str, ...]:
-    return split_jsonl((IN_V2 / INBOX_FILENAME).read_text())
+def fixture_lines(directory: Path) -> tuple[str, ...]:
+    return split_jsonl((directory / INBOX_FILENAME).read_text())
 
 
-def mutated(index: int, mutate: Callable[[dict[str, Any]], object]) -> str:
-    record = json.loads(fixture_lines()[index])
+def mutated(directory: Path, index: int, mutate: Callable[[dict[str, Any]], object]) -> str:
+    record = json.loads(fixture_lines(directory)[index])
     mutate(record)
     return json.dumps(record)
 
 
+@pytest.fixture(
+    params=[
+        pytest.param(FIXTURES / 'in-v2-factory', id='factory'),
+        pytest.param(FIXTURES / 'in-v2', id='portal'),
+    ]
+)
+def in_v2(request: pytest.FixtureRequest) -> Path:
+    return request.param
+
+
 @pytest.fixture
-def in_dir(tmp_path: Path) -> Path:
+def in_dir(tmp_path: Path, in_v2: Path) -> Path:
     copied = tmp_path / 'in'
     copied.mkdir()
-    shutil.copyfile(IN_V2 / INBOX_FILENAME, copied / INBOX_FILENAME)
+    shutil.copyfile(in_v2 / INBOX_FILENAME, copied / INBOX_FILENAME)
     return copied
 
 
-def test_every_fixture_line_is_a_valid_inbox_line() -> None:
-    parsed = [parse_inbox_line(text, line_no=n) for n, text in enumerate(fixture_lines(), 1)]
+def test_every_fixture_line_is_a_valid_inbox_line(in_v2: Path) -> None:
+    parsed = [parse_inbox_line(text, line_no=n) for n, text in enumerate(fixture_lines(in_v2), 1)]
 
     assert [type(line) for line in parsed] == [
         RevealRequested,
@@ -112,10 +126,10 @@ def test_every_fixture_line_is_a_valid_inbox_line() -> None:
     ],
 )
 def test_a_defect_line_off_the_contract_is_refused_naming_its_field(
-    index: int, mutate: Callable[[dict[str, Any]], object], field: str
+    in_v2: Path, index: int, mutate: Callable[[dict[str, Any]], object], field: str
 ) -> None:
     with pytest.raises(ContractViolation) as caught:
-        parse_inbox_line(mutated(index, mutate), line_no=index + 1)
+        parse_inbox_line(mutated(in_v2, index, mutate), line_no=index + 1)
 
     assert field in caught.value.detail
 
@@ -130,9 +144,11 @@ def test_the_fixture_inbox_reads_as_requests_and_reports_in_order(in_dir: Path) 
     assert read.offset == (in_dir / INBOX_FILENAME).stat().st_size
 
 
-def test_a_defect_line_carrying_raw_text_is_rejected_and_the_rest_are_read(in_dir: Path) -> None:
-    lines = list(fixture_lines())
-    lines[RESTATED_LINE] = mutated(RESTATED_LINE, lambda r: r.update(text='raw client words'))
+def test_a_defect_line_carrying_raw_text_is_rejected_and_the_rest_are_read(
+    in_v2: Path, in_dir: Path
+) -> None:
+    lines = list(fixture_lines(in_v2))
+    lines[RESTATED_LINE] = mutated(in_v2, RESTATED_LINE, lambda r: r.update(text='raw client words'))
     inbox = in_dir / INBOX_FILENAME
     inbox.write_text(''.join(f'{line}\n' for line in lines))
 
@@ -185,9 +201,9 @@ def test_a_publisher_pass_answers_both_requests_and_counts_nothing_under_inbox(
 
 
 def test_a_pass_over_an_inbox_of_only_defect_reports_moves_the_offset_past_them(
-    policy: Policy, in_dir: Path
+    in_v2: Path, policy: Policy, in_dir: Path
 ) -> None:
-    lines = fixture_lines()
+    lines = fixture_lines(in_v2)
     inbox = in_dir / INBOX_FILENAME
     inbox.write_text(''.join(f'{lines[index]}\n' for index in (RESTATED_LINE, QUARANTINED_LINE)))
 
