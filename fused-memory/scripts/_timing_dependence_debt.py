@@ -156,7 +156,6 @@ TIMING_DEPENDENCE_DEBT: dict[str, int] = {
     'orchestrator/tests/test_verify_admission_cancel_release.py': 2,
     'orchestrator/tests/test_verify_admission_executor_bypass.py': 2,
     'orchestrator/tests/test_verify_cmd.py': 2,
-    'orchestrator/tests/test_verify_role_integration.py': 2,
     'orchestrator/tests/test_verify_scope_handshake_fds.py': 2,
     'orchestrator/tests/test_warm_lane_audit_mount_and_age.py': 2,
     'orchestrator/tests/test_warm_lane_bash_suite.py': 2,
