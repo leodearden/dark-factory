@@ -511,7 +511,10 @@ class TestMergeScreenBounceSurfacing:
                 bounce,
             )
             assert driven.result == WorkflowOutcome.REQUEUED
-            ledger = (workflow.task.get('metadata') or {}).get('retry_ledger') or {}
+            assert workflow._last_merge_block_reason == _SCREEN_REASON, (
+                '_run_merge_phase runs the thrash guard only when the bounce set this gate'
+            )
+            ledger =(workflow.task.get('metadata') or {}).get('retry_ledger') or {}
             return await workflow._check_merge_outcome_thrash(
                 ledger.get('last_merge_outcome_signature'), workflow._merge_outcome_signature(),
             )
