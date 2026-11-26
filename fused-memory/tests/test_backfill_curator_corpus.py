@@ -734,6 +734,27 @@ class TestBackfillPointIdConsistency:
         )
 
 
+class TestBackfillManager:
+    @pytest.mark.asyncio
+    async def test_backfill_carries_concurrency_to_the_curator(self):
+        from fused_memory.maintenance.backfill_curator_corpus import BackfillManager
+
+        taskmaster = AsyncMock()
+        taskmaster.get_tasks = AsyncMock(return_value={'tasks': _titled_tasks(8)})
+        embedder = RecordingEmbedder()
+        curator = in_memory_corpus_curator(embedder)
+        manager = BackfillManager(config=make_config(), taskmaster=taskmaster, curator=curator)
+        try:
+            report = await manager.backfill('/fake/proj', concurrency=2)
+
+            assert embedder.peak == 2
+            assert report.upserted == 8
+            assert report.errors == 0
+            assert await curator.corpus_count(report.project_id) == 8
+        finally:
+            await curator.close()
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Step 8: run_backfill() orchestration
 # ──────────────────────────────────────────────────────────────────────────────
@@ -821,6 +842,21 @@ class TestRunBackfill:
 
         # Result propagated
         assert result.upserted == 3
+
+    @pytest.mark.asyncio
+    async def test_run_backfill_passes_concurrency_to_curator(self):
+        from fused_memory.maintenance.backfill_curator_corpus import run_backfill
+
+        with self._run_backfill_context() as (mock_curator, mock_tm_cls):
+            mock_curator.backfill_corpus = AsyncMock(return_value=BackfillResult(upserted=1))
+            mock_tm_instance = AsyncMock()
+            mock_tm_instance.get_tasks = AsyncMock(return_value={'tasks': _titled_tasks(1)})
+            mock_tm_cls.return_value = mock_tm_instance
+
+            await run_backfill(config_path=None, project_root='/fake/project', concurrency=4)
+
+        mock_curator.backfill_corpus.assert_awaited_once()
+        assert mock_curator.backfill_corpus.call_args.kwargs['concurrency'] == 4
 
     @pytest.mark.asyncio
     async def test_run_backfill_closes_curator(self):
