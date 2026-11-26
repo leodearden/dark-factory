@@ -665,7 +665,9 @@ class TestAllowDanglingCitationsEscape:
 
         assert result['error_type'] == 'CitationRepointRequired', value
         mock_service.delete_memory.assert_not_awaited()
-        assert result['ignored_override'] == {'allow_dangling_citations': value}
+        assert result['ignored_override'] == {
+            'allow_dangling_citations': value, 'is_remedy': True,
+        }
         assert 'literal boolean True' in result['hint']
 
     @pytest.mark.asyncio
@@ -2011,8 +2013,10 @@ class TestIgnoredOverrideNoteAdvertisesOnlyARealRemedy:
 
     @staticmethod
     def _assert_named_but_no_resend(result, value):
-        assert result['ignored_override'] == {'allow_dangling_citations': value}
-        assert 'Resend it as JSON true' not in result['hint']
+        assert result['ignored_override'] == {
+            'allow_dangling_citations': value, 'is_remedy': False,
+        }
+        assert 'is not the way past THIS refusal' in result['hint']
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize('value', ['yes', 1, 'true'])
@@ -2091,7 +2095,10 @@ class TestIgnoredOverrideNoteAdvertisesOnlyARealRemedy:
 
         assert result['error_type'] == 'CascadeCitationGateRejected'
         assert {b['error_type'] for b in result['blocked']} == {'CitationRepointRequired'}
-        assert result['ignored_override'] == {'allow_dangling_citations': value}
+        assert result['escape_offered'] is True
+        assert result['ignored_override'] == {
+            'allow_dangling_citations': value, 'is_remedy': True,
+        }
         assert 'Resend it as JSON true' in result['hint']
         service.delete_memory.assert_not_awaited()
 
@@ -2116,6 +2123,12 @@ class TestCascadeHintOffersTheEscapeOnlyWhereItIsTheRemedy:
         assert 'nothing was deleted' in hint
         assert 'blocked[]' in hint
 
+    @classmethod
+    def _assert_no_escape_offered(cls, result):
+        assert result['escape_offered'] is False
+        assert 'a wrong one is wrong for every record' in result['hint']
+        cls._assert_shared_cascade_guidance(result['hint'])
+
     @pytest.mark.asyncio
     async def test_a_replacement_inside_the_set_is_not_offered_the_escape(self):
         service = _make_service(descendants=[CHILD])
@@ -2129,8 +2142,7 @@ class TestCascadeHintOffersTheEscapeOnlyWhereItIsTheRemedy:
 
         assert result['error_type'] == 'CascadeCitationGateRejected'
         assert result['blocked'][0]['error_type'] == 'CitationReplacementInvalid'
-        assert 'allow_dangling_citations' not in result['hint']
-        self._assert_shared_cascade_guidance(result['hint'])
+        self._assert_no_escape_offered(result)
         service.delete_memory.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -2151,8 +2163,7 @@ class TestCascadeHintOffersTheEscapeOnlyWhereItIsTheRemedy:
         assert [b['error_type'] for b in result['blocked']] == [
             'CitationReplacementNotFound', 'CitationReplacementNotFound',
         ]
-        assert 'allow_dangling_citations' not in result['hint']
-        self._assert_shared_cascade_guidance(result['hint'])
+        self._assert_no_escape_offered(result)
         service.delete_memory.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -2169,6 +2180,7 @@ class TestCascadeHintOffersTheEscapeOnlyWhereItIsTheRemedy:
         assert [b['error_type'] for b in result['blocked']] == [
             'CitationRepointRequired', 'CitationRepointRequired',
         ]
+        assert result['escape_offered'] is True
         assert 'allow_dangling_citations' in result['hint']
         self._assert_shared_cascade_guidance(result['hint'])
         service.delete_memory.assert_not_awaited()
@@ -2308,8 +2320,9 @@ class TestMissingTargetIsRefusedBeforeAnyCitationPass:
         assert result['id'] == DOOMED
         assert 'citing_tasks' not in result
         if override is not None:
-            assert result['ignored_override']['allow_dangling_citations'] == override
-            assert 'Resend it as JSON true' not in result['hint']
+            assert result['ignored_override'] == {
+                'allow_dangling_citations': override, 'is_remedy': False,
+            }
         interceptor.update_task.assert_not_awaited()
         service.delete_memory.assert_not_awaited()
 

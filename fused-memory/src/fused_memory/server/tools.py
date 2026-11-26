@@ -1920,12 +1920,9 @@ def create_mcp_server(
     _DANGLING_OVERRIDE_REMEDIES = frozenset({'CitationRepointRequired'})
 
     def _dangling_override_is_the_remedy(rejection: Mapping[str, Any]) -> bool:
-        if rejection.get('error_type') in _DANGLING_OVERRIDE_REMEDIES:
-            return True
-        if rejection.get('error_type') != 'CascadeCitationGateRejected':
-            return False
-        blocked = rejection.get('blocked') or []
-        return bool(blocked) and all(_dangling_override_is_the_remedy(b) for b in blocked)
+        if rejection.get('error_type') == 'CascadeCitationGateRejected':
+            return rejection.get('escape_offered') is True
+        return rejection.get('error_type') in _DANGLING_OVERRIDE_REMEDIES
     _CITATION_REPLACEMENT_NOT_FOUND_HINT = (
         'replacement_memory_id is well-formed but resolves to nothing, so '
         'repointing to it would rewrite every live citation to address a '
@@ -3117,16 +3114,21 @@ def create_mcp_server(
 
         The hint is DERIVED from *blocked*, never passed in: it offers the
         allow_dangling_citations escape only when every blocked record is one
-        the override is meant to clear.
+        the override is meant to clear. ``escape_offered`` carries that same
+        decision as data, and is what ``_dangling_override_is_the_remedy``
+        reads for a cascade refusal.
         """
-        escape_is_the_remedy = all(_dangling_override_is_the_remedy(b) for b in blocked)
+        escape_offered = bool(blocked) and all(
+            _dangling_override_is_the_remedy(b) for b in blocked
+        )
         return {
             'error': error,
             'error_type': 'CascadeCitationGateRejected',
             'memory_id': memory_id,
             'cascade_size': cascade_size,
             'blocked': blocked,
-            'hint': _CASCADE_GATE_HINT if escape_is_the_remedy else _CASCADE_GATE_NO_ESCAPE_HINT,
+            'escape_offered': escape_offered,
+            'hint': _CASCADE_GATE_HINT if escape_offered else _CASCADE_GATE_NO_ESCAPE_HINT,
             **extra,
         }
 
@@ -5991,14 +5993,18 @@ def create_mcp_server(
             # without comment — this fires only for a non-boolean value. The
             # resend is advertised only where the override is the remedy.
             if override_supplied and not isinstance(raw_override, bool):
+                is_remedy = _dangling_override_is_the_remedy(rejection)
                 note = (
                     _IGNORED_DANGLING_OVERRIDE_HINT
-                    if _dangling_override_is_the_remedy(rejection)
+                    if is_remedy
                     else _IGNORED_DANGLING_OVERRIDE_NOT_A_REMEDY_HINT
                 )
                 rejection = {
                     **rejection,
-                    'ignored_override': {'allow_dangling_citations': raw_override},
+                    'ignored_override': {
+                        'allow_dangling_citations': raw_override,
+                        'is_remedy': is_remedy,
+                    },
                     'hint': ' '.join(p for p in (rejection.get('hint'), note) if p),
                 }
             return rejection
