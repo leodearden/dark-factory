@@ -218,3 +218,91 @@ def test_gate_conditionals_are_unmeasured_when_no_gated_landing_has_a_successor(
 
     assert result.p_gate_after_gate is None
     assert result.p_gate_after_ungated == 1.0
+
+
+# ---------------------------------------------------------------------------
+# Time-based figures: heartbeat-weighted shares and verify-interval unions
+# (merge-throughput report: C-laptop, B-ledger §4b, D-regimes §3.2).
+# ---------------------------------------------------------------------------
+
+
+def heartbeat(minutes: float, *leases: tuple[str, str]) -> dict[str, Any]:
+    return ev(minutes, None, occupancy={
+        'leases': [{'host': host, 'task_id': 'x', 'activity': activity} for host, activity in leases],
+    })
+
+
+def test_finished_share_weights_each_heartbeat_by_the_gap_to_the_next():
+    beats = [
+        heartbeat(0, ('laptop', 'verifying')),
+        heartbeat(5, ('laptop', 'finished')),
+        heartbeat(10, ('local', 'finished')),
+    ]
+    assert canary.host_finished_share(beats, at(15), host='laptop') == pytest.approx(1 / 3)
+
+
+def test_finished_share_caps_a_gap_at_600_seconds():
+    beats = [heartbeat(0, ('laptop', 'finished')), heartbeat(120, ('laptop', 'verifying'))]
+    assert canary.host_finished_share(beats, at(125), host='laptop') == pytest.approx(600 / 900)
+
+
+def test_the_last_heartbeat_is_carried_to_hi_under_the_same_cap():
+    beats = [heartbeat(0, ('laptop', 'verifying')), heartbeat(5, ('laptop', 'finished'))]
+    assert canary.host_finished_share(beats, at(600), host='laptop') == pytest.approx(600 / 900)
+
+
+def test_another_hosts_finished_lease_does_not_count():
+    beats = [heartbeat(0, ('local', 'finished')), heartbeat(5, ('laptop', 'verifying'))]
+    assert canary.host_finished_share(beats, at(10), host='laptop') == 0.0
+
+
+def test_finished_share_is_unmeasured_without_heartbeats():
+    assert canary.host_finished_share([], at(10), host='laptop') is None
+
+
+def completed(end_minutes: float, runner: str, duration_minutes: float, **extra: Any) -> dict[str, Any]:
+    return ev(end_minutes, extra.pop('task_id', 'v'), runner=runner,
+              duration_ms=duration_minutes * 60_000, **extra)
+
+
+def cancelled_verify(end_minutes: float, host: str, elapsed_minutes: float) -> dict[str, Any]:
+    return ev(end_minutes, 'c', host=host, elapsed_ms=elapsed_minutes * 60_000, cause='void')
+
+
+def test_host_verify_hours_is_the_clipped_union_of_one_hosts_intervals():
+    verify = [
+        completed(120, 'local', 60),   # [60, 120]
+        completed(150, 'local', 60),   # [90, 150], overlaps: union [60, 150] = 90 min
+        completed(300, 'laptop', 60),  # another host
+        completed(30, 'local', 60),    # [-30, 30], clipped to [0, 30] = 30 min
+    ]
+    cancelled = [cancelled_verify(400, 'local', 30), cancelled_verify(500, 'laptop', 30)]
+
+    result = canary.host_verify_hours(verify, cancelled, at(0), at(600), host='local')
+
+    assert result.hours == pytest.approx(2.5)
+    assert result.per_week == pytest.approx(2.5 * 168 / 10)
+
+
+def test_union_busy_hours_counts_two_hosts_verifying_at_once_once():
+    verify = [completed(120, 'local', 60), completed(150, 'laptop', 60)]
+    assert canary.union_busy_hours(verify, at(0), at(600)) == pytest.approx(1.5)
+
+
+def test_queue_to_land_is_the_median_of_done_landings_in_hours():
+    finalized = [
+        ev(1, 'a', state='done', queue_to_land_secs=3600.0),
+        ev(2, 'b', state='done', queue_to_land_secs=10800.0),
+        ev(3, 'c', state='done', queue_to_land_secs=7200.0),
+        ev(4, 'd', state='done'),
+        ev(5, 'e', state='blocked', queue_to_land_secs=99999.0),
+    ]
+
+    result = canary.queue_to_land(finalized)
+
+    assert result.p50_hours == pytest.approx(2.0)
+    assert (result.n, result.n_missing) == (3, 1)
+
+
+def test_queue_to_land_is_unmeasured_without_a_landing():
+    assert canary.queue_to_land([]).p50_hours is None
