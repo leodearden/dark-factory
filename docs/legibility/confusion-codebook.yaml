@@ -1592,6 +1592,13 @@ entries:
     manifested_phase: unknown
     note: A guard tripped on a 'known-false premise about recon internals' at turn 116, which is the premise-verification failure this entry names. The digest does not show where the premise was filed or dispatched, so both phases are unknown.
     evidence_quote: known-false premise about recon internals
+  - date: '2026-11-25'
+    project: dark_factory
+    session: c229e2be-9a61-4d70-a0ad-5bea43fadc5a
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: Weak match. A guard flagged a known-false premise about recon internals, and the not-found hits show references to nonexistent paths and symbols, which is the premise-verification gap this entry names. The digest does not show which phase filed or dispatched the task, so both phases are unknown.
+    evidence_quote: known-false premise about recon internals
   last_seen_runs:
   - census-dark_factory-20261024
 - id: warm-lane-cache-incoherence
@@ -5168,6 +5175,13 @@ entries:
     manifested_phase: recon
     note: 'The recon agent called count_memories_by_metadata with a guessed ''metadata'' argument without first loading the tool''s schema. The server rejected it twice with unknown_argument (declared: project_id, filters). The agent repeated the same wrong parameter on a second call (task 10207 after task 10210) instead of loading the schema.'
     evidence_quote: 'This tool''s input schema was not in your prompt when you called it. The input schema is: {"type":"object","properties":{"project_id":{"title":"Project Id","type":"string"},"filters":{"additionalProperties":true,"title":"Filters","type":"object"}}'
+  - date: '2026-11-25'
+    project: dark_factory
+    session: ccc01981-734f-42cc-bded-31d074d385fd
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: The get_tasks schema was not in the prompt when the call was made, and the call guessed an 'ids' parameter and failed validation. The error output directs the agent to ToolSearch, which is the deferred-tool pattern the entry describes.
+    evidence_quote: This tool's input schema was not in your prompt when you called it.
   last_seen_runs:
   - census-dark_factory-20261024
   - census-dark_factory-20261031
@@ -14258,6 +14272,13 @@ entries:
       - (record 104) blocked:
 
       - (record 113) blocked:'
+  - date: '2026-11-25'
+    project: dark_factory
+    session: 9bf7c845-ae1a-4279-8613-b62afdc87b75/subagents/agent-aba2d647bba239774
+    origin_phase: unknown
+    manifested_phase: ops
+    note: Guard trips and not-found signals render as bare templates with the matched substring missing. Both guard entries show an empty 'blocked:' field, and the not-found entries show only the generic error text.
+    evidence_quote: '- (record 60) blocked:'
   last_seen_runs:
   - census-dark_factory-20261017
   - census-dark_factory-20261024
@@ -24888,6 +24909,37 @@ entries:
     manifested_phase: unknown
     note: Orchestrated worktree session (cwd .worktrees/11434, agent_class orchestrated-task) with 7 not_found signals, all 'no such file or directory' or 'does not exist', and every other signal count at zero, so the digest gives no further diagnostic context. Phase is unknown because the digest does not show which stage the session was in.
     evidence_quote: (record 90) no such file or directory / (record 135) no such file or directory / (record 150) does not exist / (record 156) does not exist / (record 314) no such file or directory / (record 344) no such file or directory / (record 391) no such file or directory
+  - date: '2026-11-25'
+    project: dark_factory
+    session: fab2ca8b-754f-4688-a794-5749cfd3a186
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: Orchestrated worktree session (agent_class orchestrated-task, cwd .worktrees/11554) with 14 not_found signals, all 'no such file or directory' or 'does not exist', and no other diagnostic signal. The getcwd error shows the shell's working directory was no longer valid, which is the repeated-missing-path pattern the entry names. The digest does not show the cause as another session removing the worktree; the shell's own cwd probe removed its directory, so the entry's 'another session' attribution is not confirmed.
+    evidence_quote: 'pwd: error retrieving current directory: getcwd: cannot access parent directories: No such file or directory'
+  - date: '2026-11-25'
+    project: dark_factory
+    session: 7748db81-6a7c-437a-af01-3e3690eb134a
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: Orchestrated task running in a worktree cwd (.worktrees/11732) fires repeated 'no such file or directory' not_found signals (records 63, 84, 503, 525), and no other signal fires (tool_error, self_correct, df_guard, interrupt, designed_outcome all 0), so the failure carries no other diagnostic. Phase is not supported by the digest.
+    evidence_quote: '- (record 63) no such file or directory
+
+      - (record 84) no such file or directory
+
+      - (record 503) no such file or directory
+
+      - (record 525) no such file or directory'
+  - date: '2026-11-25'
+    project: dark_factory
+    session: 00e62079-37aa-460f-bda7-44b1a96f6d93
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: Orchestrated worktree session (cwd .worktrees/7919) shows three 'no such file or directory' / 'does not exist' not-found signals with no other diagnostic text in the digest, matching the titled mechanism.
+    evidence_quote: '- (record 101) no such file or directory
+
+      - (record 154) does not exist
+
+      - (record 499) no such file or directory'
   last_seen_runs:
   - census-dark_factory-20261017
   - census-dark_factory-20261024
@@ -25798,6 +25850,13 @@ entries:
     evidence_quote: '## Retry Loops
 
       - Bash x6 (2 designed-outcome results: [exit 124] [watcher-rearm-declared])'
+  - date: '2026-11-25'
+    project: dark_factory
+    session: 9bf7c845-ae1a-4279-8613-b62afdc87b75
+    origin_phase: ops
+    manifested_phase: ops
+    note: The 'Retry Loops' bucket flagged 34 calls to the watcher re-arm script, which is the watcher's designed re-arm cycle rather than a retry loop.
+    evidence_quote: 'Bash x34: {"command": "DARK_FACTORY_ROOT=/home/leo/src/dark-factory scripts/watcher-rearm.sh --queue-dir /home/leo/src/dark-factory/data/escalations --level 2 --timeout 3600", "description": "Re-arm the L2 escalation watcher"'
   last_seen_runs:
   - census-dark_factory-20261017
   - census-dark_factory-20261024
@@ -28789,6 +28848,31 @@ entries:
     manifested_phase: unknown
     note: The 'User Corrections' bucket captures a /unblock skill invocation and its injected instructions as if they were user corrections.
     evidence_quote: <command-name>/unblock</command-name>
+  - date: '2026-11-25'
+    project: dark_factory
+    session: 9bf7c845-ae1a-4279-8613-b62afdc87b75
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: The 'User Corrections' bucket captured a slash-command skill invocation (/escalation-watcher with its injected instruction block) as if it were human corrective feedback.
+    evidence_quote: <command-name>/escalation-watcher</command-name>
+  - date: '2026-11-25'
+    project: dark_factory
+    session: c2ffc154-4efe-4b43-9e62-39c455ed2ba3
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: The 'User Corrections' bucket captures skill invocations (/team and /prd command wrappers) and an injected citations block as corrective user feedback, which is the mechanism this entry names.
+    evidence_quote: '<command-message>team</command-message>
+
+      <command-name>/team</command-name>'
+  - date: '2026-11-25'
+    project: dark_factory
+    session: 16e32957-5b2a-449b-afb2-3823f2036b78
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: 'The digest''s ''User Corrections'' bucket includes record 5, a /team skill invocation, which is the mechanism this entry names: skill invocations captured as user corrections.'
+    evidence_quote: '(record 5) <command-message>team</command-message>
+
+      <command-name>/team</command-name>'
   filed_tickets:
   - ticket: tkt_0RW5FRCC10XP47EPHA3X9HRK50
     project_root: /home/leo/src/dark-factory
@@ -29340,6 +29424,20 @@ entries:
     manifested_phase: unknown
     note: An unattended sub-agent's read-only Bash inspection calls (sed -n and grep on worker.py, plus ls) were both rejected, so it could not read the code it was examining. The digest does not show the task's phase or whether it was a verify failure, so both phases stay unknown.
     evidence_quote: The user doesn't want to proceed with this tool use. The tool use was rejected (eg. if it was a file edit, the new_string was NOT written to the file). STOP what you are doing and wait for the user to tell you how to proceed.
+  - date: '2026-11-25'
+    project: dark_factory
+    session: c5b55398-770e-418d-9656-90e0e1221c62
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: Orchestrated-task session's read-only git inspection Bash call was denied in don't-ask mode, and the agent then continued without that evidence. The digest does not show the phase.
+    evidence_quote: Permission to use Bash has been denied because Claude Code is running in don't ask mode.
+  - date: '2026-11-25'
+    project: dark_factory
+    session: ccc01981-734f-42cc-bded-31d074d385fd
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: Orchestrated-task session hit don't-ask-mode denials on read-only inspection calls (a git merge-base/show Bash command and a fused-memory get_statuses read), matching the entry's denied-read-only-inspection mechanism. The digest does not show the verify-failure context, so phases are unknown.
+    evidence_quote: Permission to use Bash has been denied because Claude Code is running in don't ask mode.
   filed_tickets:
   - ticket: null
     project_root: /home/leo/src/dark-factory
@@ -29784,6 +29882,13 @@ entries:
     origin_phase: recon
     manifested_phase: recon
     evidence_quote: 'count_memories_by_metadata was called with argument(s) it does not declare: metadata", "code": "unknown_argument" ... "declared": ["project_id", "filters"]'
+  - date: '2026-11-25'
+    project: dark_factory
+    session: ccc01981-734f-42cc-bded-31d074d385fd
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: A fused-memory read (get_tasks) was called with an undeclared 'ids' argument, which the server rejected as unknown_argument. This is the same undeclared-argument mechanism the entry names, on a different tool.
+    evidence_quote: 'get_tasks was called with argument(s) it does not declare: ids'
   filed_tickets:
   - ticket: null
     project_root: /home/leo/src/dark-factory
@@ -47638,6 +47743,32 @@ candidates:
   - h3
   - kind:confusion
   promoted_to: entry-cand-20261122-3
+- id: cand-20261125-1
+  title: Escalation resolve_issue rejects ruled_by_human parameter with a pydantic unexpected-keyword error
+  cause: The resolve_issue tool schema does not declare a ruled_by_human argument that the escalation watcher passes, so each resume call fails validation and must be retried.
+  area: escalation-mcp
+  first_seen: '2026-11-25'
+  disposition: pending
+  sightings:
+  - date: '2026-11-25'
+    project: dark_factory
+    session: 9bf7c845-ae1a-4279-8613-b62afdc87b75
+    origin_phase: ops
+    manifested_phase: ops
+    evidence_quote: "-> 1 validation error for call[resolve_issue]\nruled_by_human\n  Unexpected keyword argument [type=unexpected_keyword_argument, input_value=False, input_type=bool]"
+- id: cand-20261125-2
+  title: git grep stops option parsing at the first positional argument, so a trailing -A is treated as a revision and fails
+  cause: 'The agent placed `-A 5` after the search pattern in `git grep -n ''class EscalationCategory'' -A 5 -- escalation/src`. git grep ends option parsing at the first non-option argument, so `-A` is read as a revision (fatal: unable to resolve revision: -A), wasting a tool call and forcing a retry.'
+  area: agent-tooling / shell command construction
+  first_seen: '2026-11-25'
+  disposition: pending
+  sightings:
+  - date: '2026-11-25'
+    project: dark_factory
+    session: 00e62079-37aa-460f-bda7-44b1a96f6d93
+    origin_phase: unknown
+    manifested_phase: unknown
+    evidence_quote: 'fatal: unable to resolve revision: -A'
 historical_backfill:
   run_id: census-dark_factory-20261024
   unmatched_task_ids:
