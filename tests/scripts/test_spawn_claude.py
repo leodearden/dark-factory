@@ -20,7 +20,7 @@ import textwrap
 import threading
 import time
 import urllib.parse
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -651,16 +651,11 @@ def _run_spawn(
     so this can only lengthen the bound under contention, never shorten
     one.
 
-    scale_timeout=False is the documented opt-out for call sites whose
-    verdict is load-INSENSITIVE (the no-emulator/no-tmux 126 sites, per
-    task 3486's audit) -- there, scaling would only make a genuine
-    regression take longer to report.
-
-    `timeout` must be passed as an UNSCALED base. A caller that already
-    computed a load-adaptive value (e.g. via _set_started_grace or
-    _load_scaled_grace) and adds fixed margin on top -- as the
-    "must-not-be-flagged" family below does (grace + sleep + margin) --
-    must also pass scale_timeout=False, or _spawn_run_budget scales an
+    `timeout` must be passed as an UNSCALED base. scale_timeout=False is
+    the opt-out for a caller that already computed a load-adaptive value
+    (e.g. via _set_started_grace or _load_scaled_grace) and adds fixed
+    margin on top -- as the "must-not-be-flagged" family below does
+    (grace + sleep + margin). Without it _spawn_run_budget scales an
     already-scaled number a second time, discarding that site's own
     derivation under load instead of honoring it.
     """
@@ -671,6 +666,36 @@ def _run_spawn(
         capture_output=True,
         timeout=budget,
     )
+
+
+def _run_spawn_without_emulator(
+    tmp_path: pathlib.Path, extra_env: Mapping[str, str] | None = None
+) -> subprocess.CompletedProcess[bytes]:
+    """Invoke spawn-claude.sh on a PATH holding a fake `claude` plus only
+    bash, mktemp, sleep, cat, rm and uname: no terminal emulator, no tmux,
+    so every backend fails its availability guard with exit 126.
+
+    python3 is deliberately absent too, which makes the session-registry
+    `launching` write no-op, so no CLAUDE_FLEET_ROOT isolation is needed.
+
+    The env is built from _hermetic_environ() at call time, so a test's
+    monkeypatched os.environ is honoured -- and scrubbed -- here.
+    """
+    bin_dir = _make_bin_dir(tmp_path)
+    _write_fake_claude(bin_dir, exit_code=0)
+
+    sys_bin = tmp_path / "sys_bin"
+    sys_bin.mkdir()
+    for util in ["bash", "mktemp", "sleep", "cat", "rm", "uname"]:
+        src = shutil.which(util)
+        if src:
+            (sys_bin / util).symlink_to(src)
+
+    env = _hermetic_environ()
+    env["PATH"] = f"{bin_dir}:{sys_bin}"
+    env.pop("CLAUDE_TERMINAL_CMD", None)
+    env.update(extra_env or {})
+    return _run_spawn(env, tmp_path)
 
 
 # ===========================================================================
@@ -771,50 +796,27 @@ def test_spawn_omits_wm_title_export_when_ambient_wm_title_leaks(
 def test_no_emulator_found_yields_126_ignores_ambient_spawn_backend(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Proves the OTHER `dict(os.environ)` sites in this file are hermetic
-    too, not just `_base_env`: an ambient CLAUDE_SPAWN_BACKEND=tmux must not
-    reroute this no-emulator scenario down the tmux lane.
+    """Proves _run_spawn_without_emulator's env construction is hermetic, not
+    just _base_env's: an ambient CLAUDE_SPAWN_BACKEND=tmux must not reroute
+    this no-emulator scenario down the tmux lane.
 
     Both leak paths exit 126 (spawn-claude.sh's "tmux not found" branch vs.
     its "no terminal emulator found" branch), so an exit-code-only assertion
-    can't discriminate between them -- confirmed empirically that
+    can't discriminate between them -- before the hermetic fix,
     `CLAUDE_SPAWN_BACKEND=tmux pytest ...::test_no_emulator_found_yields_126`
-    passes today despite taking the wrong branch. This test asserts on
-    stderr content instead.
+    was confirmed to pass despite taking the wrong branch. This test asserts
+    on stderr content instead.
 
     RED before this file's own _hermetic_environ() fix: a raw
-    `dict(os.environ)` (this test's own construction, mirroring
-    test_no_emulator_found_yields_126 and test_tmux_backend_missing_tmux_
-    yields_126 below) passes the ambient CLAUDE_SPAWN_BACKEND straight
+    `dict(os.environ)` passes the ambient CLAUDE_SPAWN_BACKEND straight
     through, so the run takes the tmux branch and stderr says "tmux not
-    found" instead of "no terminal emulator found".
+    found" instead of "no terminal emulator found". The env under test is
+    _run_spawn_without_emulator's, the one construction all three 126 sites
+    share, so this proves every one of them hermetic.
     """
-    import shutil as _shutil
-
     monkeypatch.setenv("CLAUDE_SPAWN_BACKEND", "tmux")
 
-    bin_dir = _make_bin_dir(tmp_path)
-    _write_fake_claude(bin_dir, exit_code=0)
-
-    # Minimal system-bin with only the utilities the script needs -- NO
-    # tmux, NO terminal emulator (mirrors test_no_emulator_found_yields_126's
-    # sys_bin exactly).
-    sys_bin = tmp_path / "sys_bin"
-    sys_bin.mkdir()
-    for util in ["bash", "mktemp", "sleep", "cat", "rm", "uname"]:
-        src = _shutil.which(util)
-        if src:
-            (sys_bin / util).symlink_to(src)
-
-    env = _hermetic_environ()
-    env["PATH"] = str(bin_dir) + ":" + str(sys_bin)
-    env.pop("CLAUDE_TERMINAL_CMD", None)
-
-    # Task 3599 audit: same no-emulator availability-guard shape as
-    # test_no_emulator_found_yields_126 below -- rc==126 is load-INSENSITIVE
-    # (task 3486), so this stays unscaled rather than inheriting the new
-    # load-scaled default.
-    result = _run_spawn(env, tmp_path, timeout=10, scale_timeout=False)
+    result = _run_spawn_without_emulator(tmp_path)
     stderr = result.stderr.decode()
     assert result.returncode == 126, (
         f"expected 126, got {result.returncode}\nstderr: {stderr}"
@@ -1046,31 +1048,7 @@ def test_genuine_launcher_failure_yields_127(
 )
 def test_no_emulator_found_yields_126(tmp_path: pathlib.Path) -> None:
     """When no emulator is found, spawn-claude.sh must exit 126."""
-    import shutil as _shutil
-
-    bin_dir = _make_bin_dir(tmp_path)
-    _write_fake_claude(bin_dir, exit_code=0)
-
-    # Build a minimal system-bin that has only the utilities the script needs
-    # but NOT any terminal emulator (gnome-terminal/konsole/kitty/xterm).
-    # We look up each utility by its absolute path using the full system PATH
-    # so we get the real binary, then symlink it in our minimal dir.
-    sys_bin = tmp_path / "sys_bin"
-    sys_bin.mkdir()
-    for util in ["bash", "mktemp", "sleep", "cat", "rm", "uname"]:
-        src = _shutil.which(util)
-        if src:
-            (sys_bin / util).symlink_to(src)
-
-    env = _hermetic_environ()
-    env["PATH"] = str(bin_dir) + ":" + str(sys_bin)
-    env.pop("CLAUDE_TERMINAL_CMD", None)
-
-    # Task 3599 audit: rc==126 is load-INSENSITIVE (no emulator on PATH
-    # fails the availability guard immediately; task 3486 measured 0.05s),
-    # so this stays unscaled rather than inheriting the new load-scaled
-    # default.
-    result = _run_spawn(env, tmp_path, timeout=10, scale_timeout=False)
+    result = _run_spawn_without_emulator(tmp_path)
     assert result.returncode == 126, (
         f"No emulator must yield 126, got {result.returncode}\n"
         f"stderr: {result.stderr.decode()}"
@@ -2002,14 +1980,13 @@ def test_spawn_run_cap_leaves_headroom_inside_governing_timeout() -> None:
     assert _SPAWN_RUN_CAP_SECS + _READINESS_WAIT_CAP_SECS < 300
 
 
-def _capture_spawn_timeout(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, **kwargs
+def _capture_run_timeout(
+    monkeypatch: pytest.MonkeyPatch, invoke: Callable[[], object]
 ) -> float:
-    """Invoke _run_spawn with subprocess.run monkeypatched to a no-op stub
-    that records the `timeout` kwarg it was handed, so the load-scaling
-    policy is pinned as runtime behaviour (the actual argument
-    subprocess.run receives) without ever launching a real subprocess or
-    sleeping.
+    """Call *invoke* with subprocess.run monkeypatched to a no-op stub that
+    records the `timeout` kwarg it was handed, so the load-scaling policy
+    is pinned as runtime behaviour (the actual argument subprocess.run
+    receives) without ever launching a real subprocess or sleeping.
     """
     captured: dict[str, float] = {}
 
@@ -2018,8 +1995,18 @@ def _capture_spawn_timeout(
         return subprocess.CompletedProcess(argv, 0, b"", b"")
 
     monkeypatch.setattr(subprocess, "run", _fake_run)
-    _run_spawn({}, tmp_path, **kwargs)
+    invoke()
+    assert "timeout" in captured, (
+        f"{invoke!r} never called subprocess.run, so there is no bound to capture"
+    )
     return captured["timeout"]
+
+
+def _capture_spawn_timeout(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, **kwargs
+) -> float:
+    """The `timeout` a bare _run_spawn call with *kwargs* hands subprocess.run."""
+    return _capture_run_timeout(monkeypatch, lambda: _run_spawn({}, tmp_path, **kwargs))
 
 
 def test_run_spawn_scales_its_timeout_under_load(
@@ -2073,12 +2060,11 @@ def test_run_spawn_idle_host_timeout_is_byte_identical(
 def test_run_spawn_scale_timeout_false_forwards_base_unchanged(
     monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
 ) -> None:
-    """scale_timeout=False is the documented opt-out that preserves task
-    3486's audited decision for the load-INSENSITIVE 126/no-emulator sites
-    (rc==126 is decided by an immediate availability-guard failure; load-
-    scaling would only make a genuine regression take longer to report).
-    Pinned as a contract here rather than left as an undocumented
-    convention, so a future edit to _run_spawn cannot silently drop it.
+    """scale_timeout=False forwards `timeout` unscaled: the opt-out the
+    grace + sleep + margin sites rely on, whose budget is already
+    load-scaled and must not be scaled a second time. Pinned as a contract
+    here rather than left as an undocumented convention, so a future edit
+    to _run_spawn cannot silently drop it.
     """
     monkeypatch.setattr(os, "getloadavg", lambda: (96.0, 96.0, 96.0))
     monkeypatch.setattr(os, "cpu_count", lambda: 32)
@@ -2087,6 +2073,23 @@ def test_run_spawn_scale_timeout_false_forwards_base_unchanged(
         monkeypatch, tmp_path, scale_timeout=False, timeout=10
     )
     assert timeout == 10
+
+
+def test_no_emulator_spawn_bound_is_load_scaled(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """rc==126 is load-insensitive, but reaching it under contention is not:
+    esc-7143-3 saw this 0.05s-idle path cross a fixed 10s bound at 10.6s
+    and 10.7s. So the 126 sites take the same load-scaled must-not-hang
+    bound as every other _run_spawn site.
+    """
+    monkeypatch.setattr(os, "getloadavg", lambda: (96.0, 96.0, 96.0))
+    monkeypatch.setattr(os, "cpu_count", lambda: 32)
+
+    bound = _capture_run_timeout(
+        monkeypatch, lambda: _run_spawn_without_emulator(tmp_path)
+    )
+    assert bound == _capture_spawn_timeout(monkeypatch, tmp_path)
 
 
 # ===========================================================================
@@ -3745,37 +3748,11 @@ def test_tmux_backend_missing_tmux_yields_126(tmp_path: pathlib.Path) -> None:
     command-not-found (bash exit 127) -> resolve_detached's launch_rc!=0
     branch -> exit 127, not 126. GREEN after step-8.
     """
-    import shutil as _shutil
-
-    bin_dir = _make_bin_dir(tmp_path)
-    _write_fake_claude(bin_dir, exit_code=0)
-
-    # Minimal system-bin with only the utilities the script needs -- NO
-    # tmux, NO terminal emulator (mirrors test_no_emulator_found_yields_126's
-    # sys_bin exactly, including the deliberate exclusion of python3, which
-    # makes the session-registry `launching` write no-op so this test needs
-    # no CLAUDE_FLEET_ROOT isolation).
-    sys_bin = tmp_path / "sys_bin"
-    sys_bin.mkdir()
-    for util in ["bash", "mktemp", "sleep", "cat", "rm", "uname"]:
-        src = _shutil.which(util)
-        if src:
-            (sys_bin / util).symlink_to(src)
-
-    env = _hermetic_environ()
-    env["PATH"] = str(bin_dir) + ":" + str(sys_bin)
-    env["CLAUDE_SPAWN_BACKEND"] = "tmux"
-    # Task 3486 audit: SPAWN_LAUNCH_GRACE_SECS="2" and timeout=10 below stay
-    # FIXED on purpose -- rc==126 is load-INSENSITIVE (no tmux/emulator on
-    # PATH fails the availability guard immediately; load-scaling would only
-    # make a genuine regression take longer to report). Measured: 0.05s.
-    # Task 3599 audit: _run_spawn's timeout now load-scales by default, so
-    # the explicit scale_timeout=False below is what keeps this pin FIXED --
-    # both audits are one decision, not a reversal.
-    env["SPAWN_LAUNCH_GRACE_SECS"] = "2"
-    env.pop("CLAUDE_TERMINAL_CMD", None)
-
-    result = _run_spawn(env, tmp_path, timeout=10, scale_timeout=False)
+    # Bounds the launch-grace wait (script default 5s) should the tmux
+    # availability guard regress; unused on the passing path.
+    result = _run_spawn_without_emulator(
+        tmp_path, {"CLAUDE_SPAWN_BACKEND": "tmux", "SPAWN_LAUNCH_GRACE_SECS": "2"}
+    )
     assert result.returncode == 126, (
         f"missing tmux in tmux-backend mode must yield 126, got "
         f"{result.returncode}\nstderr: {result.stderr.decode()}"
