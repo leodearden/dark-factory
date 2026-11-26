@@ -1349,7 +1349,7 @@ Add to digest: `PROMOTED (L2 <id>): risk_identified — <sentinel_task_id> — <
 
 #### Stale-L0 strand sweep L1s (`__stale_l0_strand_sweep__`)
 
-`orchestrator/src/orchestrator/harness.py::Harness._file_stale_l0_strand_escalation` files ONE blocking L1 per startup sweep that dismissed L0s already older than `orphan_l0_timeout_secs`. Notes the info-L0 router owns are never strands (`Harness._snapshot_stale_l0_strands` skips them), so every listed note is one nothing else routed.
+`orchestrator/src/orchestrator/harness.py::Harness._file_stale_l0_strand_escalation` files ONE blocking L1 per startup sweep that dismissed L0s already older than `orphan_l0_timeout_secs`, and only when at least one of them had a workflow waiting (`workflow_blocked=True`, task 5200); the record still lists every strand that sweep dismissed. Notes the info-L0 router owns are never strands (`Harness._snapshot_stale_l0_strands` skips them), so every listed note is one nothing else routed. An info-only record (every strand `workflow_blocked=False`) comes only from builds before task 5200 and is still handled by the branch below.
 
 **Class discriminator.** `task_id == "__stale_l0_strand_sweep__"` AND `agent_role == "harness-stale-l0-strand-sweep"`.
 

@@ -13353,6 +13353,16 @@ class Harness:
         operator-tuned "an unattended L0 this old is overdue" bound avoids
         minting a guessed constant.
 
+        The anchor decides CLASSIFICATION only: the ``'stale-strand'`` stamp,
+        the per-strand event and the WARNING line.  The level-1 record is
+        filed only when a strand had a workflow waiting (Leo's ruling (b) on
+        esc-__stale_l0_strand_sweep__-4, task 5200).  With
+        ``info_l0_router_enabled`` the notes the router owns are routed first
+        and never counted, so the records filed are for blocking strands.  An
+        info strand (the router off, or an eval-lane note the router does not
+        own) is stamped and reported but files no record; it stays readable
+        by id from the escalation archive.
+
         Why the startup sweep is the ONLY place this class is ever observed:
         ``_reap_orphan_l0_escalations`` skips any L0 whose task has a live
         workflow attending it ("active workflow will handle it"), so a blocking
@@ -13424,10 +13434,13 @@ class Harness:
         """Per-record detail for the L0s about to be swept as strands.
 
         Taken BEFORE ``dismiss_all_pending`` because the sweep returns only an
-        int, and the whole point of task 3172 is the per-record detail.  Safe
-        to read here: this runs at startup step 1c, immediately after
-        ``_lifecycle.start_all()``, with no dispatched workflows yet, so the
-        queue is single-writer.
+        int, and the whole point of task 3172 is the per-record detail.  This
+        runs at startup step 1c with no in-process workflows dispatched yet,
+        but other processes (fused-memory middlewares, reconciliation) write
+        the same queue directory and may file or resolve an L0 between this
+        snapshot and ``dismiss_all_pending``, so the per-record detail is
+        best-effort telemetry.  The concurrency contract is
+        ``escalation/src/escalation/sweep.py``'s module docstring.
 
         ``workflow_blocked`` is DERIVED from the record's own severity, not
         from harness runtime state: at this point the process has just
