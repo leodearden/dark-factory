@@ -838,7 +838,8 @@ any request. To run one by hand, stop the instance first.
 - `--once` runs one pass and prints its report as JSON. It exits 0 even when
   a report could not be filed. Such a report is named under `unconverged`, by
   the refusing tool and its code, and is retried on the next pass. Each entry
-  there also carries `attempts` and `stalled` (see "A stalled ref" below). An
+  there also carries its record's `attempts`, `last_tool` and `last_code`, and
+  `stalled` (see "A stalled ref" below). An
   unreachable fused-memory exits 1. The loop instead counts it as a
   transient pass and backs off.
 - `--check` is σ4's install check. It takes the lock and handshakes with
@@ -912,7 +913,9 @@ the stall, never the fallback. At
 `client-feed/src/client_feed/filer_state.py::STALLED_AFTER_ATTEMPTS` attempts
 the ref is stalled. Each pass then logs it at ERROR rather than WARNING, and
 still retries it at the normal interval, so it converges on the pass after its
-cause is cleared:
+cause is cleared. The ERROR line names that cause, the record's `last_tool` and
+`last_code`, before the refusal of the pass itself: a transient refusal of a
+stalled ref leaves its record, and so its cause, unchanged.
 
 ```bash
 journalctl --user -u client-feed-filer@<name>.service -p err
@@ -920,6 +923,11 @@ journalctl --user -u client-feed-filer@<name>.service -p err
 
 With the instance stopped, `--check` names the stored stalled refs under
 `stalled`, each with its last tool and code, and exits 1.
+
+`FALLBACK_AFTER_RESTATEMENTS` and `STALLED_AFTER_ATTEMPTS` are equal, so a ref
+refused only at its restatement reaches the stall on the pass that first takes
+the fallback. If a later step of that pass is refused too, the ref is logged
+as stalled before its fallback has had a pass of its own.
 
 Two refusals stall a ref until an operator acts:
 
