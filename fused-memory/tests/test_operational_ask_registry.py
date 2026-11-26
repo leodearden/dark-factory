@@ -9,6 +9,7 @@ TestLoadPremiseRegistry / TestMatchCandidate — same shape, new module.
 
 from __future__ import annotations
 
+import dataclasses
 import os
 import sys
 from pathlib import Path
@@ -668,6 +669,88 @@ class TestSeedOperationalAskRegistry:
             f"Entries: {[e.name for e in entries]}"
         )
         assert entry.name == "merge_entities_live_graph"
+
+    _PRUNE_ENTRY = "prune_recon_cycle_summaries_apply"
+    _MERGE_ENTITIES_ENTRY = "merge_entities_live_graph"
+    _PRUNE_DESCRIPTION_ANCHORS_BEFORE_10112 = ["--apply", "cycle-summary", "cycle_summary"]
+    _MERGE_ENTITIES_DESCRIPTION_ANCHORS_BEFORE_10112 = ["FalkorDB", "production graph"]
+
+    def _assert_only_the_description_anchors_protect(
+        self, candidate, entries, entry_name, anchors_before_10112,
+    ):
+        from fused_memory.middleware.operational_ask_registry import match_candidate
+
+        matched = match_candidate(candidate, entries)
+        assert matched is None, f"code task matched {matched.name if matched else None}"
+
+        entry = next(e for e in entries if e.name == entry_name)
+        widened = dataclasses.replace(entry, description_substrings=anchors_before_10112)
+        assert match_candidate(candidate, [widened]) is not None, (
+            f"the candidate must pass {entry_name}'s title gate, so its description "
+            "anchors alone are what protect it"
+        )
+
+    def test_prune_script_docstring_code_task_does_not_match(self):
+        """Task 4281, a code task about the prune script, was routed as an operational ask.
+
+        A token the script's own code or tests carry (a CLI flag, a metadata
+        value, a backend name in a test id) collides with code tasks about that
+        script, so it cannot anchor a live-data ask (task 10112).
+        """
+        candidate = CandidateTask(
+            title=(
+                "prune_recon_cycle_summaries.py docstring advertises a --dry-run flag "
+                "that build_parser() never registers"
+            ),
+            description=(
+                "Noticed while mapping that script's --apply path. The only mode flag "
+                "is --apply; dry-run is simply the default when --apply is absent."
+            ),
+        )
+        self._assert_only_the_description_anchors_protect(
+            candidate, self._load_entries(),
+            self._PRUNE_ENTRY, self._PRUNE_DESCRIPTION_ANCHORS_BEFORE_10112,
+        )
+
+    def test_prune_script_pool_stages_refactor_does_not_match(self):
+        """Task 6198."""
+        candidate = CandidateTask(
+            title=(
+                "Derive prune_recon_cycle_summaries._POOL_STAGES from "
+                "recon_pool_map.CYCLE_SUMMARY_STAGE_TO_RECON_POOL instead of a "
+                "hand-copied tuple"
+            ),
+            description=(
+                "Those strings are exactly the keys of CYCLE_SUMMARY_STAGE_TO_RECON_POOL, "
+                "the single source of truth for which metadata.stage values form the "
+                "two per-cycle kind='cycle_summary' pools."
+            ),
+        )
+        self._assert_only_the_description_anchors_protect(
+            candidate, self._load_entries(),
+            self._PRUNE_ENTRY, self._PRUNE_DESCRIPTION_ANCHORS_BEFORE_10112,
+        )
+
+    def test_merge_entities_flake_debt_task_does_not_match(self):
+        """Task 11326, an offline-lane flake-debt task."""
+        test_id = (
+            "tests/test_merge_entities.py::TestRedirectNodeEdgesLiveFalkorDB::"
+            "test_redirect_repairs_dup_uuids_no_loss_preserves_embeddings"
+        )
+        candidate = CandidateTask(
+            title=(
+                f"Flake debt: {test_id} — cleared on the offline lane "
+                "(qdrant-integration), cycle 1"
+            ),
+            description=(
+                "The test failed in an offline-lane detection run and passed an "
+                f"isolated, serial re-run at the same head. test: {test_id}"
+            ),
+        )
+        self._assert_only_the_description_anchors_protect(
+            candidate, self._load_entries(),
+            self._MERGE_ENTITIES_ENTRY, self._MERGE_ENTITIES_DESCRIPTION_ANCHORS_BEFORE_10112,
+        )
 
     def test_rebuild_entity_summaries_project_wide_matches(self):
         """(b) A project-wide rebuild_entity_summaries ask matches (task 1946)."""

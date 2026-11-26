@@ -2686,30 +2686,38 @@ class CuratorConfig(BaseModel):
     deferral_backoff_base_seconds: float = Field(default=60.0, gt=0)
     deferral_backoff_max_seconds: float = Field(default=1800.0, gt=0)
 
-    # Cancelled-premise blocklist: path (absolute, or relative to server cwd)
-    # of a YAML file listing premises proven wrong by revert. Matching
-    # candidates are dropped before any LLM call. None disables the guard.
+    # Cancelled-premise blocklist: path (absolute, or relative to the
+    # TaskCurator's cwd, which the server sets to taskmaster.project_root; the
+    # process cwd only when a curator is built without one) of a YAML file
+    # listing premises proven wrong by revert. Matching candidates are dropped
+    # before any LLM call. None disables the guard.
     # See fused-memory/config/cancelled_premise_blocklist.yaml for the schema.
     cancelled_premise_blocklist_path: str | None = Field(
         default=None,
         description=(
-            "Path (absolute or relative to server cwd) of a YAML file listing "
+            "Path (absolute, or relative to the TaskCurator's cwd, which the server "
+            "sets to taskmaster.project_root; the process cwd only when a curator "
+            "is built without one) of a YAML file listing "
             "premises proven wrong by revert; matching candidates are dropped "
             "before any LLM call. None disables the guard."
         ),
     )
 
     # Recon code-fix premise-verification registry: path (absolute, or relative
-    # to server cwd) of a YAML registry of self-referential recon code-fix
-    # premises. Matching candidates are dropped BEFORE any LLM call ONLY WHILE
-    # the live source/tests still refute the premise (self-correcting — unlike
+    # to the TaskCurator's cwd, which the server sets to taskmaster.project_root;
+    # the process cwd only when a curator is built without one) of a YAML
+    # registry of self-referential recon code-fix premises. Matching candidates
+    # are dropped BEFORE any LLM call ONLY WHILE the live source/tests still
+    # refute the premise (self-correcting — unlike
     # cancelled_premise_blocklist_path's unconditional forever-drop). None
     # disables the guard. See
     # fused-memory/config/recon_code_fix_premise_registry.yaml for the schema.
     recon_code_fix_premise_registry_path: str | None = Field(
         default=None,
         description=(
-            "Path (absolute or relative to server cwd) of a YAML registry of "
+            "Path (absolute, or relative to the TaskCurator's cwd, which the server "
+            "sets to taskmaster.project_root; the process cwd only when a curator "
+            "is built without one) of a YAML registry of "
             "self-referential recon code-fix premises; matching candidates are "
             "dropped BEFORE any LLM call only while the live source/tests still "
             "refute the premise. None disables the guard."
@@ -2737,8 +2745,10 @@ class CuratorConfig(BaseModel):
         ),
     )
 
-    # Operational-ask registry: path (absolute, or relative to server cwd) of a
-    # YAML registry of recurring operational live-data/live-mutation asks —
+    # Operational-ask registry: path (absolute, or relative to the TaskCurator's
+    # cwd, which the server sets to taskmaster.project_root; the process cwd
+    # only when a curator is built without one) of a YAML registry of recurring
+    # operational live-data/live-mutation asks —
     # deliverables that are already-built+unit-tested scripts whose remaining
     # work is dry-run -> human-review -> apply against live external stores,
     # modifying ZERO repo files. The TDD architect cannot author a RED->GREEN
@@ -2749,7 +2759,9 @@ class CuratorConfig(BaseModel):
     operational_ask_registry_path: str | None = Field(
         default=None,
         description=(
-            "Path (absolute or relative to server cwd) of a YAML registry of "
+            "Path (absolute, or relative to the TaskCurator's cwd, which the server "
+            "sets to taskmaster.project_root; the process cwd only when a curator "
+            "is built without one) of a YAML registry of "
             "recurring operational live-data/live-mutation asks; matching "
             "candidates are routed BEFORE any LLM call to a deterministic "
             "PURE-GATE instead of the TDD architect. None disables the gate."
