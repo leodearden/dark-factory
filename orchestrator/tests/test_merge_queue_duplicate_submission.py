@@ -55,11 +55,12 @@ from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
+from _git_fixtures import seed_repo
 from _merge_lane_census import census_for
 from _merge_lane_fakes import lane_scene_config
 
 from orchestrator.config import GitConfig, OrchestratorConfig
-from orchestrator.git_ops import GitOps, _run
+from orchestrator.git_ops import GitOps
 from orchestrator.merge_lane.intake import MERGE_LANES
 from orchestrator.merge_lane.types import MergeRequest, QueuedBranch
 
@@ -69,23 +70,10 @@ from orchestrator.merge_lane.types import MergeRequest, QueuedBranch
 # ---------------------------------------------------------------------------
 
 
-async def _setup_repo(repo: Path) -> None:
-    """Initialise a bare git repository with a single commit on main."""
-    await _run(['git', 'init', '-b', 'main'], cwd=repo)
-    await _run(['git', 'config', 'user.email', 'test@test.com'], cwd=repo)
-    await _run(['git', 'config', 'user.name', 'Test'], cwd=repo)
-    (repo / 'README.md').write_text('# Test\n')
-    await _run(['git', 'add', '-A'], cwd=repo)
-    await _run(['git', 'commit', '-m', 'Initial commit'], cwd=repo)
-
-
 @pytest.fixture
 def git_repo(tmp_path: Path) -> Path:
     """Create a temporary git repository with an initial commit."""
-    repo = tmp_path / 'repo'
-    repo.mkdir()
-    asyncio.run(_setup_repo(repo))
-    return repo
+    return seed_repo(tmp_path / 'repo')
 
 
 @pytest.fixture

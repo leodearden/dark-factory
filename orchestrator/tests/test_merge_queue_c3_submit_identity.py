@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from _git_fixtures import seed_repo
 
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.event_store import EventStore
@@ -37,16 +38,6 @@ from orchestrator.merge_lane.types import (
 # test_remove_merge_worktree_guarded.py:47-84; merge_queue symbols imported
 # LOCALLY inside each test so a not-yet-defined symbol never breaks collection).
 # ---------------------------------------------------------------------------
-
-
-async def _setup_repo(repo: Path) -> None:
-    """Initialise a git repository with a single commit on main."""
-    await _run(['git', 'init', '-b', 'main'], cwd=repo)
-    await _run(['git', 'config', 'user.email', 'test@test.com'], cwd=repo)
-    await _run(['git', 'config', 'user.name', 'Test'], cwd=repo)
-    (repo / 'README.md').write_text('# Test\n')
-    await _run(['git', 'add', '-A'], cwd=repo)
-    await _run(['git', 'commit', '-m', 'Initial commit'], cwd=repo)
 
 
 async def _head_sha(repo: Path) -> str:
@@ -70,10 +61,7 @@ async def _commit(repo: Path, name: str) -> str:
 
 @pytest.fixture
 def git_repo(tmp_path: Path) -> Path:
-    repo = tmp_path / 'repo'
-    repo.mkdir()
-    asyncio.run(_setup_repo(repo))
-    return repo
+    return seed_repo(tmp_path / 'repo')
 
 
 @pytest.fixture
