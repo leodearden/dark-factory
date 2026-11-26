@@ -587,12 +587,44 @@ class MetricRow:
     null: NullBand | None
 
 
+    @property
+    def over_p99(self) -> bool:
+        return self.null is not None and self.diff is not None and abs(self.diff) > self.null.p99
+
+
 @dataclass(frozen=True)
 class Comparison:
     """Arm *arm* against arm 0, one row per metric."""
 
     arm: int
     rows: tuple[MetricRow, ...]
+
+
+@dataclass(frozen=True)
+class Finding:
+    """One headline row of one comparison that the A/A verdict reports."""
+
+    arm: int
+    row: MetricRow
+
+
+@dataclass(frozen=True)
+class AAVerdict:
+    """Headline rows whose |diff| exceeds null p99, and those with no null to judge against."""
+
+    skewed: tuple[Finding, ...]
+    uncertified: tuple[Finding, ...]
+
+
+def aa_verdict(comparisons: Iterable[Comparison]) -> AAVerdict:
+    headline = [
+        Finding(comparison.arm, row)
+        for comparison in comparisons for row in comparison.rows if row.headline
+    ]
+    return AAVerdict(
+        skewed=tuple(finding for finding in headline if finding.row.over_p99),
+        uncertified=tuple(finding for finding in headline if finding.row.null is None),
+    )
 
 
 _ArmSums = tuple[int, float]  # an arm's eligible task count and its value total
@@ -841,6 +873,7 @@ class Report:
     exclusions: dict[str, int]
     tasks: tuple[TaskRecord, ...]
     comparisons: tuple[Comparison, ...]
+    verdict: AAVerdict | None
 
 
 def _listing(items: Sequence[str]) -> str:
@@ -880,6 +913,8 @@ def _rule_line(report: Report) -> str:
         'null p95/p99 = percentiles of |diff|',
         'mde = (z0.95 + z0.80) x sd(diff)',
         f'no null below {MIN_ELIGIBLE_PER_ARM} eligible tasks in an arm',
+        '--aa fails when a headline metric has |diff| > null p99, and is unproven when a '
+        'headline metric has no null',
     ])
 
 
@@ -897,7 +932,10 @@ def _arm_sizes_line(report: Report) -> str:
     return '; '.join(f'arm {arm}: {sizes[arm]} tasks' for arm in range(report.settings.buckets))
 
 
-_TABLE_COLUMNS = '{marker} {metric:<26}{n0:>6}{n1:>6}{mean0:>10}{mean1:>10}{diff:>10}{p95:>10}{p99:>10}{mde:>10}'
+_TABLE_COLUMNS = (
+    '{marker} {metric:<26}{n0:>6}{n1:>6}{mean0:>10}{mean1:>10}{diff:>10}{p95:>10}{p99:>10}'
+    '{mde:>10}{over:>10}'
+)
 
 
 def _number(value: float | None, sign: str = '') -> str:
@@ -917,14 +955,15 @@ def _table_row(row: MetricRow) -> str:
         p95=_number(null and null.p95),
         p99=_number(null and null.p99),
         mde=_number(null and null.mde),
-    )
+        over='>p99' if row.over_p99 else '',
+    ).rstrip()
 
 
 def _comparison_table(comparison: Comparison) -> list[str]:
     arm = comparison.arm
     header = _TABLE_COLUMNS.format(
         marker=' ', metric='metric', n0='n0', n1=f'n{arm}', mean0='mean0', mean1=f'mean{arm}',
-        diff='diff', p95='null_p95', p99='null_p99', mde='mde',
+        diff='diff', p95='null_p95', p99='null_p99', mde='mde', over='over_p99',
     )
     return [
         '',
@@ -934,12 +973,42 @@ def _comparison_table(comparison: Comparison) -> list[str]:
     ]
 
 
+def _finding_line(label: str, finding: Finding) -> str:
+    row, arm = finding.row, finding.arm
+    subject = f'{label} {row.metric} (arm {arm} vs arm 0)'
+    if row.null is None or row.diff is None:
+        return (
+            f'{subject}: eligible n0={row.base_n} n{arm}={row.arm_n}, below '
+            f'{MIN_ELIGIBLE_PER_ARM} in an arm, so no null to judge it against'
+        )
+    return f'{subject}: |diff| {abs(row.diff):.3f} > null p99 {row.null.p99:.3f}'
+
+
+def verdict_lines(verdict: AAVerdict) -> list[str]:
+    """The problems an A/A verdict found, one line each."""
+    return [
+        *(_finding_line('SKEWED', finding) for finding in verdict.skewed),
+        *(_finding_line('UNCERTIFIED', finding) for finding in verdict.uncertified),
+    ]
+
+
+def _verdict_section(verdict: AAVerdict) -> list[str]:
+    if verdict.skewed:
+        heading = 'A/A check failed: the split is skewed on this window'
+    elif verdict.uncertified:
+        heading = 'A/A check unproven: a headline metric cannot be judged'
+    else:
+        heading = "A/A check passed: no headline metric's |diff| exceeds its null p99"
+    return ['', heading, *verdict_lines(verdict)]
+
+
 def render_text(report: Report) -> str:
     lines = [
         _rule_line(report),
         _producers_line(report.evidence),
         _arm_sizes_line(report),
         *(line for comparison in report.comparisons for line in _comparison_table(comparison)),
+        *(_verdict_section(report.verdict) if report.verdict is not None else ()),
     ]
     return '\n'.join(lines) + '\n'
 
@@ -962,6 +1031,16 @@ def render_json(report: Report) -> str:
 
 def _warn(message: str) -> None:
     print(f'routing_experiment_readout: {message}', file=sys.stderr)
+
+
+def _exit_status(verdict: AAVerdict | None) -> int:
+    if verdict is None:
+        return EXIT_OK
+    if verdict.skewed:
+        return EXIT_AA_SKEWED
+    if verdict.uncertified:
+        return EXIT_UNPROVEN
+    return EXIT_OK
 
 
 def _warn_unread_stores(statuses: Iterable[RootStatus]) -> None:
@@ -1017,9 +1096,13 @@ def main(
         load.exclusions,
         load.records,
         comparisons,
+        aa_verdict(comparisons) if args.aa else None,
     )
     sys.stdout.write(render_json(report) if args.json else render_text(report))
-    return EXIT_OK
+    if report.verdict is not None:
+        for line in verdict_lines(report.verdict):
+            _warn(line)
+    return _exit_status(report.verdict)
 
 
 if __name__ == '__main__':
