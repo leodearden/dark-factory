@@ -515,7 +515,7 @@ class CheckedCall(BaseModel):
 
 
 class CheckReport(BaseModel):
-    """σ4's install check: the closed tools the server lacks, the check ref's standing, and the calls one pass would make."""
+    """σ4's install check: the closed tools the server lacks, the check ref's standing, the calls one pass would make, and the stored cursor's stalled refs."""
 
     model_config = ConfigDict(frozen=True, extra='forbid')
 
@@ -525,6 +525,7 @@ class CheckReport(BaseModel):
     check_ref_live: bool | None
     calls: tuple[CheckedCall, ...]
     problem: str | None
+    stalled: dict[str, RefRecord]
 
 
 def _pass_problem(report: PassReport) -> str | None:
@@ -536,19 +537,23 @@ def _pass_problem(report: PassReport) -> str | None:
 
 def _check_report(
     ref: str,
+    cursor: FilerCursor,
     missing: tuple[str, ...],
     live: bool | None,
     withheld: WithheldWrites | None,
     problem: str | None,
 ) -> CheckReport:
+    """The report, naming every ref the stored cursor holds stalled: --check withholds writes, so that record is its only sight of a write refusal."""
     calls = () if withheld is None else withheld.calls
+    stalled = {stalled_ref: record for stalled_ref, record in cursor.refs.items() if record.stalled}
     return CheckReport(
-        ok=not missing and problem is None,
+        ok=not missing and problem is None and not stalled,
         missing_tools=missing,
         check_ref=ref,
         check_ref_live=live,
         calls=tuple(CheckedCall(tool=call.tool, arguments=dict(call.arguments), withheld=call.withheld) for call in calls),
         problem=problem,
+        stalled=stalled,
     )
 
 
@@ -556,14 +561,14 @@ def _checked(policy: Policy, session: ListingCaller, cursor: FilerCursor, ref: s
     try:
         missing = missing_tools(session)
     except ToolRefused as refused:
-        return _check_report(ref, (), None, None, str(refused))
+        return _check_report(ref, cursor, (), None, None, str(refused))
     try:
         live = bool(ClosedTools(session, policy.project_root).lookup_defect_ref(ref).carriers)
     except ToolRefused as refused:
-        return _check_report(ref, missing, None, None, str(refused))
+        return _check_report(ref, cursor, missing, None, None, str(refused))
     withheld = WithheldWrites(session)
     report, _ = run_pass(policy, ClosedTools(withheld, policy.project_root), cursor)
-    return _check_report(ref, missing, live, withheld, _pass_problem(report))
+    return _check_report(ref, cursor, missing, live, withheld, _pass_problem(report))
 
 
 def check(policy: Policy, *, open_session: OpenSession) -> CheckReport:
@@ -575,4 +580,4 @@ def check(policy: Policy, *, open_session: OpenSession) -> CheckReport:
             with opened(policy, open_session) as session:
                 return _checked(policy, session, cursor, ref)
         except SessionUnavailable as exc:
-            return _check_report(ref, (), None, None, str(exc))
+            return _check_report(ref, cursor, (), None, None, str(exc))
