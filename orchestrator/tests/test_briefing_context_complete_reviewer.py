@@ -20,7 +20,6 @@ from _briefing_helpers import (
     _search_arguments,
     memory_transport,
 )
-from _briefing_helpers import briefing as briefing
 
 from orchestrator.agents.briefing import BriefingAssembler
 from orchestrator.agents.review_briefing import (

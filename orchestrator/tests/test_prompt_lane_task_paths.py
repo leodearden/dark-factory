@@ -10,7 +10,6 @@ from unittest.mock import AsyncMock
 
 import pytest
 from _briefing_helpers import _mcp_search_envelope, memory_transport
-from _briefing_helpers import briefing as briefing
 from _role_splice_contract import SpliceContract, assert_nonempty, assert_opens_own_section
 
 from orchestrator.agents.briefing import BriefingAssembler

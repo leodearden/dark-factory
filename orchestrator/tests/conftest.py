@@ -324,10 +324,9 @@ def tree_pass(request: pytest.FixtureRequest) -> TreePass:
 def briefing(tmp_path: Path) -> BriefingAssembler:
     """Minimal BriefingAssembler over a stub OrchestratorConfig (no I/O).
 
-    Shared by ``test_roles_wait_pattern.py`` and
-    ``test_roles_background_warning.py`` (task 3747 — the two files were
-    forked from a common ancestor and carried byte-identical copies of this
-    fixture until they were consolidated here).
+    The suite's one shared ``briefing`` fixture: a test module that requests
+    ``briefing`` without defining its own gets this assembler, so no module
+    imports one.
     """
     config = OrchestratorConfig(
         project_root=tmp_path,

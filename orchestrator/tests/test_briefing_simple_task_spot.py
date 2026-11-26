@@ -13,7 +13,6 @@ from collections import Counter
 from typing import Any
 
 import pytest
-from _briefing_helpers import briefing as briefing
 from _role_splice_contract import assert_nonempty
 from shared.followup_items import FOLLOWUP_ITEMS_METADATA_KEY, observed_item
 

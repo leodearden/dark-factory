@@ -31,7 +31,6 @@ from _briefing_helpers import (
     _result,
     _search_arguments,
     amendment_list_chars,
-    briefing,  # noqa: F401 — re-export: pytest fixture used by test methods
     memory_transport,
     recorded_search_envelope,
     recorded_search_text,
