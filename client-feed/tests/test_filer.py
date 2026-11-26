@@ -25,6 +25,7 @@ from client_feed.filer import (
     FALLBACK_AFTER_RESTATEMENTS,
     MAX_BACKOFF_SECONDS,
     PassReport,
+    file_once,
     next_delay,
     run_pass,
     run_until_stopped,
@@ -718,6 +719,46 @@ def test_a_gate_held_by_another_hold_is_named_stalled_at_the_bound_and_converges
     assert REF not in cursor.refs
     assert cursor.inbox_offset == gated.inbox_size()
     assert (gated.fix_of(REF)['status'], gated.fake.task(gate_id)['status']) == ('pending', 'pending')
+
+
+def test_a_transient_refusal_of_a_stalled_ref_keeps_its_record_and_its_stall_line_names_the_counted_cause(
+    gated: World, caplog: pytest.LogCaptureFixture
+) -> None:
+    append_inbox(gated.in_dir, reported(2, 3, at=AT))
+    gated.fake.crash_before('commit_planning', 1)
+    with pytest.raises(SimulatedCrash):
+        gated.run()
+    gated.fake.hold(gated.gate_of(REF)['id'])
+    cursor = FilerCursor()
+    for _ in range(STALLED_AFTER_ATTEMPTS):
+        _, cursor = gated.run(cursor)
+    stalled = cursor.refs[REF]
+    assert stalled.stalled
+    with held_state_dir(gated.policy) as state:
+        state.write_cursor(cursor)
+    gated.fake.refuse_next('lookup_defect_ref', BACKLOG)
+
+    with caplog.at_level(logging.WARNING, logger='client_feed.filer'):
+        report = file_once(gated.policy, open_tools=lambda policy: _session(gated.fake, up=True))
+
+    [named] = report.unconverged
+    assert (named.tool, named.code, named.disposition, named.attempts, named.stalled) == (
+        'lookup_defect_ref',
+        'ReconciliationBacklogExceeded',
+        Disposition.RETRY,
+        STALLED_AFTER_ATTEMPTS,
+        True,
+    )
+    assert (named.last_tool, named.last_code) == ('commit_planning', 'deferral_invalid')
+    with held_state_dir(gated.policy) as state:
+        assert state.read_cursor().refs[REF] == stalled
+    [line] = [record for record in caplog.records if record.name == 'client_feed.filer' and REF in record.getMessage()]
+    assert line.levelno == logging.ERROR
+    message = line.getMessage()
+    assert all(
+        token in message
+        for token in ('commit_planning', 'deferral_invalid', 'lookup_defect_ref', 'ReconciliationBacklogExceeded')
+    )
 
 
 DEFECT_WRITES = ('declare_defect', 'record_defect_outcome')
