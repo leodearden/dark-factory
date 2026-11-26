@@ -1934,29 +1934,16 @@ class TaskCurator:
                 candidate.title, candidate.description, candidate.files_to_modify,
             )
             embedding = await embedder.create(text)
-
-            from qdrant_client.models import PointStruct
-
-            point_id = self._point_id(project_id, task_id)
-            client = await self._get_qdrant()
-            await client.upsert(
-                collection_name=collection,
-                points=[
-                    PointStruct(
-                        id=point_id,
-                        vector=embedding,
-                        payload={
-                            'task_id': task_id,
-                            'title': candidate.title,
-                            'description': candidate.description[:1000],
-                            'files_to_modify': candidate.files_to_modify or [],
-                            'priority': candidate.priority or DEFAULT_PRIORITY,
-                            'project_id': project_id,
-                            'updated_at': datetime.now(UTC).isoformat(),
-                        },
-                    ),
-                ],
+            point = self._corpus_point(
+                project_id, task_id,
+                title=candidate.title,
+                description=candidate.description,
+                files=candidate.files_to_modify,
+                priority=candidate.priority,
+                vector=embedding,
             )
+            client = await self._get_qdrant()
+            await client.upsert(collection_name=collection, points=[point])
         except Exception:
             logger.warning(
                 'task_curator: record_task failed for %s', task_id, exc_info=True,
@@ -2005,9 +1992,44 @@ class TaskCurator:
     def _point_id(project_id: str, task_id: str) -> str:
         """Deterministic UUID5 point ID for a task in a project.
 
-        Shared by record_task() and backfill_corpus() to ensure idempotent overlap.
+        Every corpus point gets its id here (via _corpus_point, which
+        record_task() and backfill_corpus() share), so the two writers overlap
+        idempotently.
         """
         return str(uuid_mod.uuid5(uuid_mod.NAMESPACE_URL, f'{project_id}/{task_id}'))
+
+    @classmethod
+    def _corpus_point(
+        cls,
+        project_id: str,
+        task_id: str,
+        *,
+        title: str,
+        description: str,
+        files: list[str] | None,
+        priority: str | None,
+        vector: list[float],
+    ) -> PointStruct:
+        """The corpus point for one task, in the one payload shape the corpus holds.
+
+        record_task() and backfill_corpus() both write through it, and
+        search_corpus() reads its payload keys.
+        """
+        from qdrant_client.models import PointStruct
+
+        return PointStruct(
+            id=cls._point_id(project_id, task_id),
+            vector=vector,
+            payload={
+                'task_id': task_id,
+                'title': title,
+                'description': description[:1000],
+                'files_to_modify': files or [],
+                'priority': priority or DEFAULT_PRIORITY,
+                'project_id': project_id,
+                'updated_at': datetime.now(UTC).isoformat(),
+            },
+        )
 
     async def corpus_count(self, project_id: str) -> int:
         """Return the number of points in the curator corpus for a project.
@@ -2227,8 +2249,6 @@ class TaskCurator:
         embed_slots: asyncio.Semaphore,
     ) -> PointStruct | None:
         """The corpus point for titled *task*, or None when its embed fails (logged)."""
-        from qdrant_client.models import PointStruct
-
         task_id = str(task.get('id', '') or '')
         title = _task_title(task)
         description = str(task.get('description', '') or '')
@@ -2241,18 +2261,13 @@ class TaskCurator:
                 'task_curator: backfill embed failed for task %s', task_id, exc_info=True,
             )
             return None
-        return PointStruct(
-            id=self._point_id(project_id, task_id),
+        return self._corpus_point(
+            project_id, task_id,
+            title=title,
+            description=description,
+            files=files,
+            priority=task.get('priority'),
             vector=embedding,
-            payload={
-                'task_id': task_id,
-                'title': title,
-                'description': description[:1000],
-                'files_to_modify': files,
-                'priority': task.get('priority') or DEFAULT_PRIORITY,
-                'project_id': project_id,
-                'updated_at': datetime.now(UTC).isoformat(),
-            },
         )
 
     async def prune_orphans(self, project_id: str, live_task_ids) -> PruneResult:
