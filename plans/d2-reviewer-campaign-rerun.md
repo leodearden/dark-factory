@@ -23,7 +23,10 @@ below is one action.
    ```
 3. This runbook's campaign ran its reviewers at a fixed 30 turns. Since task
    11728 the CLI defaults to production's `max_turns.reviewer`, so to
-   reproduce it, add `--max-turns 30` to every invocation below.
+   reproduce it, add `--max-turns 30` to every invocation below. With
+   `--max-turns 30` the keyless panels already in `$RESULTS` are reused.
+   Without it, every incumbent panel is re-run at production's cap, beside
+   them.
 
 The evidence package (`plans/fable-evidence-package-2026-09-10/` and
 its `.md`) is untracked and lives only in the main checkout. That covers its
