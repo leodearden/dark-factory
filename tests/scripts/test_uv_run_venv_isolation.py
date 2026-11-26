@@ -103,7 +103,7 @@ _EXPECTED_UV_RUN_UNITS = frozenset(
     }
 )
 
-# Every non-test shell script in the checkout that runs `uv run`, whether or not
+# Every non-test shell script in git's index that runs `uv run`, whether or not
 # a unit runs it; asserted by EQUALITY for the reason _EXPECTED_UV_RUN_UNITS states.
 _EXPECTED_UV_RUN_SCRIPTS = frozenset(
     {
@@ -879,12 +879,21 @@ def test_discover_uv_run_scripts_reads_every_shell_script_outside_test_trees(
     assert discover_uv_run_scripts(tmp_path) == ["scripts/a.sh", "scripts/odd.sh", "top.sh"]
 
 
+_FIXTURE_GIT_IDENTITY = (
+    "-c", "user.email=uv-run-sweep-guard@example.invalid",
+    "-c", "user.name=uv run sweep guard",
+    "-c", "commit.gpgsign=false",
+)
+
+
 def test_discover_uv_run_scripts_ignores_an_untracked_script(tmp_path: pathlib.Path) -> None:
-    """An untracked script is not swept; a staged one is, because it is what the commit lands."""
+    """An untracked script is not swept; a committed one is, and so is a staged one, because it is what the commit lands."""
     git(tmp_path, "init", "-q")
     _plant(tmp_path, {"scripts/a.sh": "uv run --no-sync --project shared python x.py\n"})
+    git(tmp_path, "add", "scripts/a.sh")
+    git(tmp_path, *_FIXTURE_GIT_IDENTITY, "commit", "--no-verify", "-q", "-m", "fixture")
     _plant(tmp_path, {"scripts/new.sh": "uv run --no-sync --project shared python y.py\n"})
-    git(tmp_path, "add", "scripts/a.sh", "scripts/new.sh")
+    git(tmp_path, "add", "scripts/new.sh")
     _plant(
         tmp_path,
         {"plans/study/repro/trial.sh": "nice uv run --project shared pytest tests/scripts/ -q\n"},
@@ -893,8 +902,8 @@ def test_discover_uv_run_scripts_ignores_an_untracked_script(tmp_path: pathlib.P
         "task 10840: an untracked plans/.../repro/trial.sh in the main checkout "
         "refused every commit there that selected screen:uv_run_venv_isolation, "
         "the nightly legibility trickle's codebook commit included. The sweep's "
-        "population is checked-in scripts, i.e. git's index: a staged script is "
-        "swept, an untracked one is not."
+        "population is checked-in scripts, i.e. git's index: a committed script "
+        "and a staged one are swept, an untracked one is not."
     )
 
 

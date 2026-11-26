@@ -27,10 +27,13 @@ What every such guard needs from git:
   contributes files. Pinned by
   ``tests/scripts/test_nonmember_ruff_config.py::test_the_derivation_excludes_submodules_and_foreign_checkouts``.
   ``-z`` keeps a path holding a space or a quote unmangled.
-* ``tracked_files`` is ``--cached`` alone, git's index: a staged new file
-  counts, an untracked one does not. It is the choice for a guard whose
-  population is what a commit lands, so an untracked scratch file in a
-  checkout cannot fail it (task 10840) and a tracked file cannot hide from it.
+* ``tracked_files`` is ``--cached`` alone, the checkout's own index: a staged
+  new file counts, an untracked one does not. Because ``git`` scrubs
+  ``GIT_INDEX_FILE``, under pre-commit that is the default index, a superset of
+  what the commit lands (``git commit --only`` leaves other staged paths in
+  it). It is the choice for a guard whose population is checked-in files, so
+  an untracked scratch file in a checkout cannot fail it (task 10840) and a
+  tracked file cannot hide from it.
 
 IMPORT ME, DO NOT COPY ME.
 

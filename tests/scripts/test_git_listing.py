@@ -11,6 +11,12 @@ from pathlib import Path
 import pytest
 from git_listing import git, listed_files, run_git, tracked_files
 
+_FIXTURE_GIT_IDENTITY = (
+    '-c', 'user.email=git-listing-guard@example.invalid',
+    '-c', 'user.name=git listing guard',
+    '-c', 'commit.gpgsign=false',
+)
+
 
 def _repo(path: Path) -> Path:
     path.mkdir(parents=True)
@@ -70,19 +76,22 @@ def test_listed_files_is_not_blinded_by_literal_pathspecs(
 def test_tracked_files_lists_the_index_but_not_untracked_files(tmp_path: Path) -> None:
     root = _repo(tmp_path / 'repo')
     (root / 'committed.sh').write_text('true\n')
+    git(root, 'add', 'committed.sh')
+    git(root, *_FIXTURE_GIT_IDENTITY, 'commit', '--no-verify', '-q', '-m', 'fixture')
     (root / 'staged.sh').write_text('true\n')
     (root / 'scratch').mkdir()
     (root / 'scratch' / 'untracked.sh').write_text('true\n')
     (root / 'gone.sh').write_text('true\n')
-    git(root, 'add', 'committed.sh', 'staged.sh', 'gone.sh')
+    git(root, 'add', 'staged.sh', 'gone.sh')
     (root / 'gone.sh').unlink()
 
     assert sorted(tracked_files(root, '*.sh')) == [root / 'committed.sh', root / 'staged.sh'], (
         'tracked_files must list exactly git\'s index: an untracked file must '
         'not be listed, because an untracked scratch script in the main '
         'checkout is what refused that checkout\'s commits (task 10840); a '
-        'staged file must be listed, because it is what pre-commit is about to '
-        'land; and an index entry deleted from disk is dropped, as in listed_files.'
+        'committed file must be listed, and so must a staged one, because it is '
+        'what pre-commit is about to land; and an index entry deleted from disk '
+        'is dropped, as in listed_files.'
     )
 
 
