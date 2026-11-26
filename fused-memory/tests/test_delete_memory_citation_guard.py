@@ -2080,3 +2080,81 @@ class TestIgnoredOverrideNoteAdvertisesOnlyARealRemedy:
         assert result['ignored_override'] == {'allow_dangling_citations': value}
         assert 'Resend it as JSON true' in result['hint']
         service.delete_memory.assert_not_awaited()
+
+
+class TestCascadeHintOffersTheEscapeOnlyWhereItIsTheRemedy:
+    """The cascade refusal's hint names allow_dangling_citations only when
+    every blocked[] record is one the override is meant to clear.
+
+    A replacement-class refusal was reached BY naming a survivor, so the escape
+    there would strand citers the caller can repoint; the replacement-outside-set
+    refusal is decided before the override is even consulted.
+    """
+
+    @staticmethod
+    def _server(service, interceptor):
+        return create_mcp_server(
+            service, task_interceptor=interceptor, known_projects=KNOWN_PROJECTS,
+        )
+
+    @staticmethod
+    def _assert_shared_cascade_guidance(hint):
+        assert 'nothing was deleted' in hint
+        assert 'blocked[]' in hint
+
+    @pytest.mark.asyncio
+    async def test_a_replacement_inside_the_set_is_not_offered_the_escape(self):
+        service = _make_service(descendants=[CHILD])
+        interceptor = _make_interceptor([
+            _task('1801', 'pending', {'mem0_canonical_entry': DOOMED}),
+        ])
+
+        result = await _call_delete(
+            self._server(service, interceptor), cascade=True, replacement_memory_id=CHILD,
+        )
+
+        assert result['error_type'] == 'CascadeCitationGateRejected'
+        assert result['blocked'][0]['error_type'] == 'CitationReplacementInvalid'
+        assert 'allow_dangling_citations' not in result['hint']
+        self._assert_shared_cascade_guidance(result['hint'])
+        service.delete_memory.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_an_unresolvable_replacement_is_not_offered_the_escape(self):
+        service = _make_service(descendants=[CHILD])
+        interceptor = _make_interceptor([
+            _task('1811', 'pending', {'mem0_canonical_entry': CHILD}),
+            _task('1812', 'pending', {'mem0_canonical_entry': DOOMED}),
+        ])
+
+        result = await _call_delete(
+            self._server(service, interceptor),
+            cascade=True,
+            replacement_memory_id=HALLUCINATED,
+        )
+
+        assert result['error_type'] == 'CascadeCitationGateRejected'
+        assert [b['error_type'] for b in result['blocked']] == [
+            'CitationReplacementNotFound', 'CitationReplacementNotFound',
+        ]
+        assert 'allow_dangling_citations' not in result['hint']
+        self._assert_shared_cascade_guidance(result['hint'])
+        service.delete_memory.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_missing_repoints_are_offered_the_escape(self):
+        service = _make_service(descendants=[CHILD])
+        interceptor = _make_interceptor([
+            _task('1821', 'pending', {'mem0_canonical_entry': CHILD}),
+            _task('1822', 'pending', {'mem0_canonical_entry': DOOMED}),
+        ])
+
+        result = await _call_delete(self._server(service, interceptor), cascade=True)
+
+        assert result['error_type'] == 'CascadeCitationGateRejected'
+        assert [b['error_type'] for b in result['blocked']] == [
+            'CitationRepointRequired', 'CitationRepointRequired',
+        ]
+        assert 'allow_dangling_citations' in result['hint']
+        self._assert_shared_cascade_guidance(result['hint'])
+        service.delete_memory.assert_not_awaited()
