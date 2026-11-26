@@ -904,7 +904,11 @@ attempt against the ref in `cursor.json`'s `refs`, at whichever step it came,
 filing or ruling. Transport, HTTP-status and reconciliation-backlog refusals
 do not count; the loop backs off for those instead. The record names the
 refusing tool (`last_tool`) and its code (`last_code`), and is dropped once
-the ref converges. At
+the ref converges. Its `restatements` counts only the refusals of the fix's
+restatement: the typed-facts fallback is taken once those reach
+`client-feed/src/client_feed/filer.py::FALLBACK_AFTER_RESTATEMENTS`, or at
+once for a fallback-class code. Refusals at any other step move `attempts` and
+the stall, never the fallback. At
 `client-feed/src/client_feed/filer_state.py::STALLED_AFTER_ATTEMPTS` attempts
 the ref is stalled. Each pass then logs it at ERROR rather than WARNING, and
 still retries it at the normal interval, so it converges on the pass after its
