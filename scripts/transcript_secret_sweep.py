@@ -134,6 +134,7 @@ class SweepConfig:
 class FileHits:
     path: Path
     counts: Mapping[str, int]
+    group: Path
 
 
 @dataclass(frozen=True)
@@ -321,12 +322,12 @@ def _scan(config: SweepConfig, needles: NeedlesByMarkup) -> SweepResult:
     deferred: list[Path] = []
     unreadable: list[Path] = []
     clean = 0
-    for path in _swept_files(config.trees, unreadable):
+    for path, group in _swept_files(config.trees, unreadable):
         outcome = _sweep_file(path, needles, cutoff_ns, redact)
         match outcome:
             case FileRedaction():
                 if outcome.redacted:
-                    hits.append(FileHits(path, outcome.counts))
+                    hits.append(FileHits(path, outcome.counts, group))
                 refused.extend(RefusedFileLine(path, line.var, line.line_number) for line in outcome.refused)
             case _Verdict.CLEAN:
                 clean += 1
@@ -348,7 +349,7 @@ def _scan(config: SweepConfig, needles: NeedlesByMarkup) -> SweepResult:
     )
 
 
-def _swept_files(trees: Iterable[SweptTree], unreadable: list[Path]) -> Iterator[Path]:
+def _swept_files(trees: Iterable[SweptTree], unreadable: list[Path]) -> Iterator[tuple[Path, Path]]:
     def note_unlistable(error: OSError) -> None:
         if not isinstance(error, FileNotFoundError):
             unreadable.append(Path(error.filename))
@@ -360,7 +361,12 @@ def _swept_files(trees: Iterable[SweptTree], unreadable: list[Path]) -> Iterator
             subdirs.sort()
             for name in sorted(files):
                 if name.endswith(tree.suffixes):
-                    yield Path(directory) / name
+                    path = Path(directory) / name
+                    yield path, _group_of(tree.root, path)
+
+
+def _group_of(root: Path, path: Path) -> Path:
+    return root / path.relative_to(root).parts[0]
 
 
 def _format_of(name: str) -> tuple[Markup, Codec]:
@@ -408,10 +414,6 @@ def _drop_page_cache(path: Path) -> None:
             os.close(fd)
 
 
-def _counts_label(counts: Mapping[str, int]) -> str:
-    return ', '.join(f'{var}×{n}' for var, n in sorted(counts.items()))
-
-
 def _bounded(lines: Sequence[str], now: datetime.datetime) -> str:
     whole = '\n'.join(lines)
     if len(lines) <= MAX_DETAIL_LINES and len(whole.encode()) <= MAX_DETAIL_BYTES:
@@ -447,8 +449,8 @@ def _escalation_arguments(result: SweepResult, now: datetime.datetime) -> dict[s
         'refused and left un-redacted'
     )
     lines = [
-        *(f'{f.path}: {_counts_label(f.counts)}' for f in result.redacted),
         *(f'{f.path}: refused ({f.var} on line {f.line_number}), left un-redacted' for f in result.refused),
+        *_group_lines(result.redacted),
     ]
     return {
         'task_id': AGENT_ROLE,
@@ -462,6 +464,19 @@ def _escalation_arguments(result: SweepResult, now: datetime.datetime) -> dict[s
         ),
         'evidence': [{'observation': summary, 'measured_at': now.isoformat(), 'ref': AGENT_ROLE}],
     }
+
+
+def _group_lines(hits: Sequence[FileHits]) -> list[str]:
+    groups: dict[Path, list[FileHits]] = {}
+    for hit in hits:
+        groups.setdefault(hit.group, []).append(hit)
+    return [_group_line(group, members) for group, members in groups.items()]
+
+
+def _group_line(group: Path, members: Sequence[FileHits]) -> str:
+    occurrences = sum(sum(member.counts.values()) for member in members)
+    names = ', '.join(sorted({var for member in members for var in member.counts}))
+    return f'{group}: {len(members)} file(s), {occurrences} occurrence(s) of {names}'
 
 
 def _shortfall_arguments(result: SweepResult, now: datetime.datetime) -> dict[str, object]:
