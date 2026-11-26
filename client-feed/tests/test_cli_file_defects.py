@@ -214,6 +214,7 @@ def _store_cursor(config: Path, attempts: int) -> None:
 
 STALLED_RECORD = {
     'attempts': STALLED_AFTER_ATTEMPTS,
+    'restatements': 0,
     'last_tool': 'commit_planning',
     'last_code': 'deferral_invalid',
     'fallback': None,

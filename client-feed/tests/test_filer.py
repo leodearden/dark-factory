@@ -22,7 +22,7 @@ from client_feed.contract import INBOX_FILENAME, QuarantineReason
 from client_feed.defect_ref import portal_ref
 from client_feed.envelope import Stamp
 from client_feed.filer import (
-    FALLBACK_AFTER_ATTEMPTS,
+    FALLBACK_AFTER_RESTATEMENTS,
     MAX_BACKOFF_SECONDS,
     PassReport,
     next_delay,
@@ -420,11 +420,11 @@ def test_b35_a_refused_restatement_is_filed_as_typed_facts_and_a_gate_in_the_sam
 
 def test_an_unknown_refusal_is_retried_and_named_then_falls_back_on_its_last_attempt(auto: World) -> None:
     append_inbox(auto.in_dir, reported(2, 3, at=AT))
-    for _ in range(FALLBACK_AFTER_ATTEMPTS):
+    for _ in range(FALLBACK_AFTER_RESTATEMENTS):
         auto.fake.refuse_next('submit_task', {'error': 'odd', 'error_type': 'SomethingOdd'})
 
     cursor = FilerCursor()
-    for attempt in range(1, FALLBACK_AFTER_ATTEMPTS):
+    for attempt in range(1, FALLBACK_AFTER_RESTATEMENTS):
         report, cursor = auto.run(cursor)
         [named] = report.unconverged
         assert (named.ref, named.tool, named.code, named.disposition, named.attempts) == (
@@ -434,7 +434,7 @@ def test_an_unknown_refusal_is_retried_and_named_then_falls_back_on_its_last_att
             Disposition.RETRY_THEN_FALLBACK,
             attempt,
         )
-        assert (cursor.inbox_offset, cursor.refs[REF].attempts) == (0, attempt)
+        assert (cursor.inbox_offset, cursor.refs[REF].attempts, cursor.refs[REF].restatements) == (0, attempt, attempt)
         assert auto.fixes() == []
     last, cursor = auto.run(cursor)
 
@@ -443,6 +443,58 @@ def test_an_unknown_refusal_is_retried_and_named_then_falls_back_on_its_last_att
     _assert_filed_and_gated(auto)
     assert last.converged == (REF,)
     assert cursor == FilerCursor(inbox_offset=auto.inbox_size())
+
+
+def test_refusals_before_the_restatement_never_bring_its_fallback_forward(auto: World) -> None:
+    append_inbox(auto.in_dir, reported(2, 3, at=AT))
+
+    cursor = FilerCursor()
+    for attempt in range(1, FALLBACK_AFTER_RESTATEMENTS):
+        auto.fake.refuse_next('lookup_defect_ref', ODD)
+        report, cursor = auto.run(cursor)
+        [named] = report.unconverged
+        assert (named.tool, named.attempts) == ('lookup_defect_ref', attempt)
+        assert cursor.refs[REF].restatements == 0
+        assert auto.fixes() == []
+    auto.fake.refuse_next('submit_task', ODD)
+    report, cursor = auto.run(cursor)
+
+    [named] = report.unconverged
+    assert (named.tool, named.code, named.attempts) == ('submit_task', 'SomethingOdd', FALLBACK_AFTER_RESTATEMENTS)
+    assert (cursor.refs[REF].restatements, cursor.refs[REF].fallback) == (1, None)
+    assert auto.fixes() == []
+    clean, after = auto.run(cursor)
+    assert clean.converged == (REF,)
+    assert REF not in after.refs
+    [fix] = auto.fixes()
+    assert _fallback_of(fix) is None
+    assert RESTATED_HEADING in fix['description']
+    assert auto.gates() == []
+
+
+def test_a_restatement_count_survives_refusals_at_other_steps(auto: World) -> None:
+    append_inbox(auto.in_dir, reported(2, 3, at=AT))
+
+    cursor = FilerCursor()
+    for restatement in range(1, FALLBACK_AFTER_RESTATEMENTS):
+        auto.fake.refuse_next('submit_task', ODD)
+        _, cursor = auto.run(cursor)
+        assert cursor.refs[REF].restatements == restatement
+    auto.fake.refuse_next('lookup_defect_ref', ODD)
+    _, cursor = auto.run(cursor)
+    record = cursor.refs[REF]
+    assert (record.attempts, record.restatements, record.last_tool) == (
+        FALLBACK_AFTER_RESTATEMENTS,
+        FALLBACK_AFTER_RESTATEMENTS - 1,
+        'lookup_defect_ref',
+    )
+    auto.fake.refuse_next('submit_task', ODD)
+    last, _ = auto.run(cursor)
+
+    assert last.converged == (REF,)
+    fix, _ = auto.fix_and_gate()
+    assert _fallback_of(fix) == {'kind': 'REPLY_CODE', 'code': 'SomethingOdd'}
+    _assert_filed_and_gated(auto)
 
 
 @pytest.mark.parametrize(
@@ -460,7 +512,7 @@ def test_a_transient_refusal_is_retried_every_pass_never_falls_back_and_holds_up
     append_inbox(gated.in_dir, reported(2, 3, at=AT), reported(2, 4, at=AT, seq=2))
 
     cursor = FilerCursor()
-    for _ in range(FALLBACK_AFTER_ATTEMPTS + 1):
+    for _ in range(FALLBACK_AFTER_RESTATEMENTS + 1):
         _refuse(gated.fake, 'submit_task', refusal)
         report, cursor = gated.run(cursor)
         [named] = report.unconverged
@@ -546,7 +598,13 @@ def test_a_refusal_at_any_filing_step_counts_one_attempt_and_takes_no_fallback(g
         1,
     )
     record = cursor.refs[REF]
-    assert (record.attempts, record.last_tool, record.last_code, record.fallback) == (1, tool, 'SomethingOdd', None)
+    assert (record.attempts, record.restatements, record.last_tool, record.last_code, record.fallback) == (
+        1,
+        0,
+        tool,
+        'SomethingOdd',
+        None,
+    )
     assert cursor.inbox_offset == 0
     clean, after = gated.run(cursor)
     assert clean.converged == (REF,)
