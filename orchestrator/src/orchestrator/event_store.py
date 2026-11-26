@@ -437,6 +437,10 @@ class EventType(StrEnum):
     # in-worktree path is None-safe (correctness fix still applies; only the
     # event is dispatch-local, mirroring merge_flake_suppressed).
     trivial_pass_escalated = 'trivial_pass_escalated'
+    # Task 5411: the merge gate a post-merge verify took, narrow or full, and what it ran
+    # (docs/narrow-merge-gate.md). task_id-keyed; data carries {resolution, miss_reason,
+    # miss_path, changed_paths, commands (None on the full gate), passed, base_sha, merge_sha}.
+    merge_gate_resolution = 'merge_gate_resolution'
     # Contract-currency (INV-2, plans/merge-verdict-integrity-prd.md §1, §3.1)
     # telemetry: a RemoteRunner's verdict is adoptable only if the remote ran
     # the dispatcher's own gate code.  Since task 6565 every remote verify runs

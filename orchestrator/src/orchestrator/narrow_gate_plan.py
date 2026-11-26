@@ -11,7 +11,7 @@ from orchestrator.verify_artifact_consumers import (
     ConsumerDemand,
     consumer_demand,
 )
-from orchestrator.verify_cmd import parse_config_command
+from orchestrator.verify_cmd import parse_config_command, render
 from orchestrator.verify_plan import (
     FileKind,
     PlannedRun,
@@ -87,6 +87,11 @@ def narrow_gate_plan(
     if not any(run.cmd is not None for run in runs):
         return None
     return VerifyPlan(runs)
+
+
+def executed_commands(plan: VerifyPlan) -> tuple[str, ...]:
+    """The rendered command of every run *plan* executes, in plan order."""
+    return tuple(render(run.cmd) for run in plan.runs if run.cmd is not None)
 
 
 def module_test_lister(tree_paths: Sequence[str], prefixes: Sequence[str]) -> PkgTestLister:
