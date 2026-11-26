@@ -92,9 +92,10 @@ shadow it with a namespace package.
 whose name means one thing suite-wide lives in
 `orchestrator/tests/conftest.py`, or in
 `orchestrator/tests/_orch_suite_fixtures.py` when its definition needs a
-first-party import, and the modules that request it bind nothing. A fixture
-whose name means different things in different modules (`git_repo`,
-`config`, `harness` and similar scene names) is bound in each consuming
+first-party import that `conftest.py` does not already make, and the modules
+that request it bind nothing. A fixture whose name means different things
+in different modules (`git_repo`, `config`, `harness` and similar scene
+names) is bound in each consuming
 module as `from <home> import <name> as <name>`. Never bind a fixture that
 tests request by name with a `# noqa: F401` import or a module-level
 assignment: ruff F811 is enforced under `orchestrator/tests`. Autouse

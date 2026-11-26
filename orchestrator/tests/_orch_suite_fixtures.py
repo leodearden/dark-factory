@@ -5,10 +5,16 @@ test in the suite can request these fixtures by name and no module binds them.
 They are not in ``conftest.py`` itself because a new first-party import there
 would follow its ``sys.path`` setup and need an ``E402`` suppression. The rule
 for where a shared fixture lives is in ``CONTRIBUTING.md`` §2.
+
+A plugin's fixtures are session-global, not scoped to ``orchestrator/tests``
+as conftest fixtures are: a session that also collects another workspace
+member's tests offers them there too. A name hosted here must therefore be
+unambiguous across the whole workspace.
 """
 
 from __future__ import annotations
 
+from contextlib import AsyncExitStack
 from pathlib import Path
 
 import pytest
@@ -35,18 +41,16 @@ async def _cost_store_factory(tmp_path: Path):
         store = await _cost_store_factory()
         store2 = await _cost_store_factory('other.db')
 
-    All opened stores are closed in a ``finally`` block when the test finishes,
-    preventing aiosqlite connection and background-thread leaks.
+    Every opened store is closed when the test finishes, even if closing
+    another one raises, preventing aiosqlite connection and background-thread
+    leaks.
     """
-    stores: list[CostStore] = []
+    async with AsyncExitStack() as opened_stores:
 
-    async def _open(filename: str = 'cost.db') -> CostStore:
-        store = CostStore(tmp_path / filename)
-        await store.open()
-        stores.append(store)
-        return store
+        async def _open(filename: str = 'cost.db') -> CostStore:
+            store = CostStore(tmp_path / filename)
+            await store.open()
+            opened_stores.push_async_callback(store.close)
+            return store
 
-    yield _open
-
-    for store in stores:
-        await store.close()
+        yield _open
