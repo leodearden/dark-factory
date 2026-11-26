@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from orchestrator.agents.review_briefing import ReviewBriefing
 from orchestrator.agents.roles import AgentRole, build_reviewer_role
 from orchestrator.config import default_price_table
@@ -24,6 +26,7 @@ from orchestrator.evals.reviewer_trial.variants import (
     ReviewerSpec,
     build_trial_reviewer_role,
     campaign_arms,
+    trial_reviewer_max_turns,
     with_briefing,
 )
 
@@ -370,3 +373,35 @@ class TestD2Round2Variants:
             'variant_a_xhigh_d2', 'variant_fable52_solo_d2', 'variant_codex_sol62_d2',
         ]
         assert [arm.reviewers[0].model for arm in arms] == ['opus', 'claude-fable-5-2', 'gpt-6.2-sol']
+
+
+class TestTrialReviewerTurnCap:
+    """A trial reviewer runs at production's reviewer turn cap unless told otherwise."""
+
+    @pytest.mark.usefixtures('code_default_config')
+    def test_a_d2_arm_built_with_no_override_carries_production_s_90_turns(self) -> None:
+        for variant in (VARIANT_A_XHIGH, VARIANT_FABLE52_SOLO, VARIANT_CODEX_SOL62):
+            arm = with_briefing(variant, ReviewBriefing.CONTEXT_COMPLETE)
+            role = build_trial_reviewer_role(arm.reviewers[0], arm.briefing)
+            assert role.default_max_turns == 90
+        assert trial_reviewer_max_turns() == 90
+
+    def test_the_cap_follows_production_s_reviewer_config(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv('ORCH_MAX_TURNS__REVIEWER', '77')
+
+        assert build_trial_reviewer_role(VARIANT_A.reviewers[0]).default_max_turns == 77
+        assert trial_reviewer_max_turns() == 77
+
+    def test_an_explicit_cap_wins_so_the_30_turn_campaign_stays_reproducible(self) -> None:
+        role = build_trial_reviewer_role(
+            VARIANT_A_XHIGH.reviewers[0], ReviewBriefing.CONTEXT_COMPLETE, max_turns=30,
+        )
+
+        assert role.default_max_turns == 30
+        assert trial_reviewer_max_turns(30) == 30
+
+    def test_a_non_positive_cap_is_refused_naming_it(self) -> None:
+        with pytest.raises(ValueError, match='0'):
+            trial_reviewer_max_turns(0)
+        with pytest.raises(ValueError, match='0'):
+            build_trial_reviewer_role(VARIANT_A.reviewers[0], max_turns=0)
