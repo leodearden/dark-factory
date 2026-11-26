@@ -121,7 +121,7 @@ The fields are:
 | `skip_parity` | With `--reference`, the parity block, written into both runners' records; else null. It names `runner` (the `--runner` side) and `reference`, so on the reference's own record `skip_parity.reference` equals the record's own `runner`. |
 
 The test ids use junit's `classname::name` spelling, for example
-`tests.test_verify_role_integration::test_role_env_propagates_to_reify_verify_plan[merge]`.
+`tests.test_example::test_needs_a_host_tool[merge]`.
 Skipped ids are not attributed per module, because `VerifyResult` carries no
 per-module skip attribution. The ids are module-relative, and many test file
 names repeat across workspace modules, so the same id can name different tests
@@ -155,9 +155,9 @@ a test id in junit spelling, the task or ticket that will remove it, and why:
 
 ```yaml
 exceptions:
-  - test_id: "tests.test_verify_role_integration::test_role_env_propagates_to_reify_verify_plan[merge]"
-    owner: {type: task, id: 7030}
-    reason: Needs a reify checkout at the workstation's reify sha, which task 7030 provisions on verify hosts.
+  - test_id: "tests.test_example::test_needs_a_host_tool[merge]"
+    owner: {type: task, id: 1234}
+    reason: Needs a tool only the reference host has, which task 1234 installs on verify hosts.
 ```
 
 Every entry must be owned (INV-12). `owner` is the house owner record,
