@@ -72,6 +72,7 @@ def fleet_root(tmp_path, make_seeding_runs_db, make_tasks_db):
         orchestrator_dir = root / 'data' / 'orchestrator'
         orchestrator_dir.mkdir(parents=True)
         conn = make_seeding_runs_db(orchestrator_dir)
+        conn.execute('PRAGMA synchronous = OFF')  # every seed_* commits; skip the fsyncs
         for spec in tasks:
             for run_number, row in enumerate(spec.results):
                 conn.seed_task_result(
