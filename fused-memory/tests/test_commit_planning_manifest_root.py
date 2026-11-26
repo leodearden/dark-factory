@@ -7,11 +7,9 @@ branch that holds a PRD family not yet on main.
 
 from __future__ import annotations
 
-import contextlib
-from collections.abc import AsyncIterator, Callable
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
-from unittest.mock import AsyncMock, patch
 
 import pytest
 import yaml
@@ -71,18 +69,6 @@ def write_prd_family(root: Path, stem: str, label: str) -> Path:
     return sidecar
 
 
-@contextlib.asynccontextmanager
-async def task_stack(main: Path) -> AsyncIterator[Any]:
-    """The hermetic MCP server over *main*, its corpus indexing stubbed out.
-
-    A ``pending`` commit indexes the batch into the curator corpus, which
-    reaches a live embedder; that is not this file's subject.
-    """
-    async with hermetic_task_stack(main) as (server, interceptor):
-        with patch.object(interceptor, 'index_committed_tasks', AsyncMock()):
-            yield server
-
-
 async def call(server: Any, tool: str, args: dict[str, Any]) -> dict[str, Any]:
     return tool_result_dict(await server._tool_manager.call_tool(tool, args))
 
@@ -110,7 +96,7 @@ async def test_prd_family_only_in_a_worktree_is_stamped_there(
     git_stdout(wt, 'add', '-A')
     git_stdout(wt, 'commit', '-q', '--no-verify', '-m', 'prd: foo')
 
-    async with task_stack(main) as server:
+    async with hermetic_task_stack(main) as (server, _interceptor):
         task_id = await submit_planned(server, main, _producer_metadata())
 
         result = await call(server, 'commit_planning', {
@@ -201,7 +187,7 @@ async def test_manifest_root_that_is_not_a_worktree_of_the_repo_is_refused(
     manifest_root, sidecars = build_case(tmp_path, main, wt)
     snapshot = {sidecar: sidecar.read_bytes() for sidecar in sidecars}
 
-    async with task_stack(main) as server:
+    async with hermetic_task_stack(main) as (server, _interceptor):
         task_id = await submit_planned(server, main, _producer_metadata())
 
         result = await call(server, 'commit_planning', {
@@ -224,7 +210,7 @@ async def test_manifest_root_is_refused_when_project_root_is_not_a_git_checkout(
     sidecar = write_prd_family(wt, 'foo', 'alpha')
     snapshot = sidecar.read_bytes()
 
-    async with task_stack(store) as server:
+    async with hermetic_task_stack(store) as (server, _interceptor):
         task_id = await submit_planned(server, store, _producer_metadata())
 
         result = await call(server, 'commit_planning', {
@@ -244,7 +230,7 @@ async def test_manifest_root_is_refused_when_git_cannot_run(
     sidecar = write_prd_family(wt, 'foo', 'alpha')
     snapshot = sidecar.read_bytes()
 
-    async with task_stack(main) as server:
+    async with hermetic_task_stack(main) as (server, _interceptor):
         task_id = await submit_planned(server, main, _producer_metadata())
 
         with monkeypatch.context() as env:
@@ -268,7 +254,7 @@ async def test_absent_sidecar_is_reported_with_the_root_searched(
     if searched == 'wt':
         args['manifest_root'] = str(wt)
 
-    async with task_stack(main) as server:
+    async with hermetic_task_stack(main) as (server, _interceptor):
         task_id = await submit_planned(server, main, _producer_metadata())
 
         result = await call(server, 'commit_planning', {**args, 'task_ids': task_id})
@@ -291,7 +277,7 @@ async def test_absent_sidecar_beside_a_found_one_is_reported(
     main, wt = repo_layout
     write_prd_family(wt, 'foo', 'alpha')
 
-    async with task_stack(main) as server:
+    async with hermetic_task_stack(main) as (server, _interceptor):
         alpha = await submit_planned(server, main, _producer_metadata(label='alpha'))
         beta = await submit_planned(
             server, main, _producer_metadata(prd_path='plans/bar-prd.md', label='beta'),
