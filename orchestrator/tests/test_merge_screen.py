@@ -178,7 +178,7 @@ class ScriptedRunner:
     """A node-id runner that answers from the checked-out tree, recording each call."""
 
     verdict: Any = _defect_fails
-    sleep_secs: float = 0.0
+    hangs: bool = False
     calls: list[RunnerCall] = field(default_factory=list)
 
     async def __call__(
@@ -189,8 +189,8 @@ class ScriptedRunner:
         self.calls.append(RunnerCall(
             tree, sha, tuple(ids), tuple(mc.prefix for mc in module_configs), concurrent_groups,
         ))
-        if self.sleep_secs:
-            await asyncio.sleep(self.sleep_secs)
+        if self.hangs:
+            await asyncio.Event().wait()
         return {node_id: self.verdict(tree, node_id) for node_id in ids}
 
     def runs_at(self, sha: str) -> list[RunnerCall]:
@@ -424,7 +424,7 @@ async def test_an_unregistered_manifest_module_fails_open(
 async def test_a_runner_past_the_timeout_fails_open(
     repo: Path, history: History, git_ops: GitOps,
 ) -> None:
-    screen, events = _screen(git_ops, run_ids=ScriptedRunner(sleep_secs=60.0))
+    screen, events = _screen(git_ops, run_ids=ScriptedRunner(hangs=True))
     config = _config(repo, timeout_secs=1.0)
     await _assert_fails_open(screen, events, config, history, cause='timed out')
 
