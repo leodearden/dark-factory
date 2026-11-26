@@ -1,0 +1,24 @@
+{
+  "task_id": "7919",
+  "reason": "review fix: merge screen fails open at every point (None-safe, guarded event/alarm side effects, screen_or_proceed at both call sites)",
+  "measures": [
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/screen.py",
+      "baseline": 70,
+      "current": 76
+    },
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/screen.py::MergeScreen::_emit",
+      "baseline": 0,
+      "current": 2
+    },
+    {
+      "measure": "total:cognitive",
+      "key": "<cluster>",
+      "baseline": 5349,
+      "current": 5355
+    }
+  ]
+}
