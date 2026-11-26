@@ -8,6 +8,9 @@ from unittest.mock import patch
 import pytest
 import yaml
 from _landing_git_scenarios import LandingRepo
+from _narrow_gate_fixtures import GUARD as _GUARD
+from _narrow_gate_fixtures import REGISTERED_MODULE
+from _narrow_gate_fixtures import SOURCE as _SOURCE
 
 from orchestrator.config import OrchestratorConfig, load_config
 from orchestrator.event_store import EventType
@@ -17,18 +20,6 @@ from orchestrator.verify import VerifyResult, narrow_merge_gate_decision, run_sc
 from orchestrator.verify_cmd import VerifyCmd, parse_config_command
 from orchestrator.verify_plan import PlannedRun, ScopeKind, VerifyPlan
 
-_GUARD = 'pkg/tests/test_guard.py'
-_SOURCE = 'pkg/src/pkg/mod.py'
-_GUARD_SOURCE = (
-    'import pytest\n'
-    'from _orch_helpers import WHOLE_TREE_SCAN_TEST_TIMEOUT\n'
-    'pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)\n'
-)
-_MODULE_YAML = yaml.safe_dump({
-    'test_command': 'cd pkg && uv run pytest',
-    'lint_command': 'cd pkg && uv run ruff check',
-    'type_check_command': 'cd pkg && uv run pyright',
-})
 _GUARD_SCRIPT = '#!/bin/sh\nexit 0\n'
 
 
@@ -40,14 +31,7 @@ class _Scene:
         root = tmp_path / 'repo'
         root.mkdir()
         self.repo = LandingRepo.init(root)
-        self.repo.commit('base', {
-            'README.md': 'hello\n',
-            'docs/a.md': 'a\n',
-            'pkg/orchestrator.yaml': _MODULE_YAML,
-            _SOURCE: '"""Module."""\nx = 1\n',
-            _GUARD: _GUARD_SOURCE,
-            'pkg/tests/test_plain.py': 'def test_plain():\n    pass\n',
-        })
+        self.repo.commit('base', {'README.md': 'hello\n', 'docs/a.md': 'a\n', **REGISTERED_MODULE})
         self._merges = 0
 
     def on_main(self, files: dict[str, str]) -> None:

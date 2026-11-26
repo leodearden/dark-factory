@@ -16,22 +16,32 @@ from typing import Any
 
 import pytest
 import pytest_asyncio
-from _git_fixtures import seed_repo
+import yaml
+from _git_fixtures import RepoSeed, seed_repo
 from _merge_lane_fakes import (
     FakeRemoteRunner,
     FakeVerifier,
     RecordingEscalations,
     VerifyScript,
+    delegates_to,
     fails,
     passes,
     raises,
 )
+from _narrow_gate_fixtures import REGISTERED_MODULE, SOURCE
 
-from orchestrator.config import GitConfig, OrchestratorConfig
+from orchestrator.config import GitConfig, OrchestratorConfig, load_config
+from orchestrator.event_store import EventType
 from orchestrator.git_ops import GitOps
-from orchestrator.merge_lane.post_merge_verify import run_post_merge_verify
+from orchestrator.merge_lane.post_merge_verify import (
+    TRIVIAL_PASS_MAIN_RED_REASON_PREFIX,
+    run_post_merge_verify,
+)
 from orchestrator.merge_lane.types import MergeOutcome, MergeRequest, QueuedBranch
-from orchestrator.verify import VerifyResult
+from orchestrator.narrow_gate_class import MergeGateResolution, MissReason
+from orchestrator.narrow_gate_plan import NarrowGateDecision
+from orchestrator.verify import VerifyResult, cached_main_baseline_failing_ids, seed_main_baseline
+from orchestrator.verify_cmd import render
 from orchestrator.verify_runner import (
     FLOCK_CONTENTION_CATEGORY,
     RunnerUnavailable,
@@ -68,16 +78,13 @@ class _Scene:
         )
 
 
-@pytest_asyncio.fixture
-async def scene(tmp_path: Path) -> _Scene:
-    repo = seed_repo(tmp_path / 'repo')
+async def _merged_scene(repo: Path, config: OrchestratorConfig, files: dict[str, str]) -> _Scene:
+    """*files* committed on task/<TASK_ID> and merged into a fresh merge worktree."""
     git_ops = GitOps(_git_config(), repo)
-    config = OrchestratorConfig(
-        project_root=repo, git=_git_config(), escalate_preexisting_main_break=False,
-        verify_cross_check_remote_green=True,
-    )
     worktree = (await git_ops.create_worktree(TASK_ID)).path
-    (worktree / 'feature.txt').write_text('feature\n')
+    for path, text in files.items():
+        (worktree / path).parent.mkdir(parents=True, exist_ok=True)
+        (worktree / path).write_text(text)
     await git_ops.commit(worktree, 'Add feature')
     merged = await git_ops.merge_to_main(worktree, f'task/{TASK_ID}')
     assert merged.success and merged.merge_worktree is not None, merged
@@ -93,6 +100,16 @@ async def scene(tmp_path: Path) -> _Scene:
         result=asyncio.get_running_loop().create_future(),
     )
     return _Scene(git_ops, req, merged.merge_worktree, merged.merge_commit)
+
+
+@pytest_asyncio.fixture
+async def scene(tmp_path: Path) -> _Scene:
+    repo = seed_repo(tmp_path / 'repo')
+    config = OrchestratorConfig(
+        project_root=repo, git=_git_config(), escalate_preexisting_main_break=False,
+        verify_cross_check_remote_green=True,
+    )
+    return await _merged_scene(repo, config, {'feature.txt': 'feature\n'})
 
 
 class _ScriptedRemote(FakeRemoteRunner):
@@ -247,6 +264,174 @@ class TestCrossCheckOfARemoteGreen:
         assert await scene.verify(verifier, runner=remote) is None
         assert remote.calls == [scene.merge_sha]
         assert verifier.verified == [TASK_ID]
+
+
+class _RecordingEventStore:
+    run_id = 'pmv-run'
+
+    def __init__(self) -> None:
+        self.events: list[tuple[Any, dict[str, Any]]] = []
+
+    def emit(self, event_type: Any, *, data: dict[str, Any] | None = None, **_kw: Any) -> int | None:
+        self.events.append((event_type, dict(data or {})))
+        return None
+
+    def of(self, event_type: EventType) -> list[dict[str, Any]]:
+        return [data for kind, data in self.events if kind == event_type]
+
+
+class _ScopedRecorder:
+    """A scoped verify that records the narrow decision it was handed and answers as the executor would."""
+
+    def __init__(self) -> None:
+        self.decisions: list[NarrowGateDecision | None] = []
+
+    async def __call__(self, *_args: Any, **options: Any) -> VerifyResult:
+        decision = options.get('narrow_gate')
+        self.decisions.append(decision)
+        return VerifyResult(
+            passed=True, test_output='', lint_output='', type_output='', summary='ok',
+            failing_test_ids=[], skipped_test_ids=[],
+            narrow_gate=None if decision is None else decision.resolution,
+        )
+
+
+class _NarrowLane:
+    """A repo whose main registers one module, with the narrow merge gate configured for its docs."""
+
+    def __init__(self, tmp_path: Path) -> None:
+        self.tmp_path = tmp_path
+        self.repo = seed_repo(tmp_path / 'repo', RepoSeed(
+            files=(('README.md', '# Test\n'), ('docs/a.md', 'a\n'), *REGISTERED_MODULE.items()),
+            message='Initial commit',
+        ))
+        self.events = _RecordingEventStore()
+        self.recorder = _ScopedRecorder()
+        self.results: list[VerifyResult] = []
+
+    def config(self, *, enabled: bool) -> OrchestratorConfig:
+        path = self.tmp_path / 'dark-factory-orchestrator.yaml'
+        path.write_text(yaml.safe_dump({
+            'project_root': str(self.repo),
+            'git': _git_config().model_dump(include={
+                'main_branch', 'branch_prefix', 'remote', 'worktree_dir', 'push_after_advance',
+            }),
+            'escalate_preexisting_main_break': False,
+            'verify_cross_check_remote_green': True,
+            'narrow_merge_gate': {'enabled': enabled, 'docs_paths': ['docs/**']},
+        }))
+        return load_config(path)
+
+    async def merge(self, files: dict[str, str], *, enabled: bool = True) -> tuple[_Scene, str]:
+        """The merged scene and the main sha it was built on."""
+        base = await GitOps(_git_config(), self.repo).get_main_sha()
+        return await _merged_scene(self.repo, self.config(enabled=enabled), files), base
+
+    async def verify(self, scene: _Scene, **options: Any) -> MergeOutcome | None:
+        return await scene.verify(
+            FakeVerifier(delegates_to(self.recorder)), event_store=self.events,
+            on_result=self.results.append, **options,
+        )
+
+    def resolutions(self) -> list[dict[str, Any]]:
+        return self.events.of(EventType.merge_gate_resolution)
+
+
+@pytest.fixture
+def lane(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> _NarrowLane:
+    built = _NarrowLane(tmp_path)
+    # The autouse config isolation pins ORCH_PROJECT_ROOT to tmp_path, which outranks the yaml's
+    # project_root; module discovery must walk the repo.
+    monkeypatch.setenv('ORCH_PROJECT_ROOT', str(built.repo))
+    return built
+
+
+_DOCS = {'docs/x.md': 'x\n'}
+
+
+def _rendered(decision: NarrowGateDecision | None) -> list[str]:
+    assert decision is not None and decision.plan is not None
+    return [render(run.cmd) for run in decision.plan.runs if run.cmd is not None]
+
+
+@pytest.mark.asyncio
+class TestNarrowMergeGate:
+    """Task 5411: a docs or comments merge verifies on the local host under its narrow command set."""
+
+    async def test_a_docs_merge_lands_on_a_local_narrow_verify(self, lane: _NarrowLane) -> None:
+        scene, base = await lane.merge(_DOCS)
+
+        assert await lane.verify(scene, narrow_gate_base=base) is None
+        [decision] = lane.recorder.decisions
+        assert decision is not None and decision.resolution is MergeGateResolution.DOCS
+
+    async def test_a_narrow_verify_never_reaches_the_remote_nor_its_cross_check(self, lane: _NarrowLane) -> None:
+        scene, base = await lane.merge(_DOCS)
+        remote = _ScriptedRemote(passes().result)
+
+        assert await lane.verify(scene, narrow_gate_base=base, runner=remote) is None
+        assert remote.calls == []
+        [decision] = lane.recorder.decisions
+        assert decision is not None and decision.resolution is MergeGateResolution.DOCS
+
+    async def test_the_resolution_is_recorded_with_what_ran(self, lane: _NarrowLane) -> None:
+        scene, base = await lane.merge(_DOCS)
+
+        await lane.verify(scene, narrow_gate_base=base)
+
+        [event] = lane.resolutions()
+        [decision] = lane.recorder.decisions
+        assert _rendered(decision)
+        assert {key: event[key] for key in (
+            'resolution', 'changed_paths', 'commands', 'passed', 'base_sha', 'merge_sha',
+        )} == {
+            'resolution': 'docs_gate', 'changed_paths': ['docs/x.md'], 'commands': _rendered(decision),
+            'passed': True, 'base_sha': base, 'merge_sha': scene.merge_sha,
+        }
+
+    async def test_a_narrow_pass_neither_feeds_the_shadow_nor_seeds_the_baseline(self, lane: _NarrowLane) -> None:
+        scene, base = await lane.merge(_DOCS)
+
+        assert await lane.verify(scene, narrow_gate_base=base) is None
+        assert lane.results == []
+        assert cached_main_baseline_failing_ids(scene.merge_sha) is None
+
+    async def test_a_narrow_pass_over_a_known_red_main_is_withheld(self, lane: _NarrowLane) -> None:
+        scene, base = await lane.merge(_DOCS)
+        seed_main_baseline(await scene.git_ops.get_main_sha(), frozenset({'pkg/tests/test_x.py::test_red'}))
+
+        outcome = await lane.verify(scene, narrow_gate_base=base)
+
+        assert outcome is not None and outcome.status == 'blocked'
+        assert outcome.reason.startswith(TRIVIAL_PASS_MAIN_RED_REASON_PREFIX), outcome.reason
+        assert 'docs_gate' in outcome.reason
+
+    async def test_a_code_merge_takes_the_full_gate_and_records_why(self, lane: _NarrowLane) -> None:
+        scene, base = await lane.merge({SOURCE: '"""Module."""\nx = 2\n'})
+        remote = _ScriptedRemote(passes().result)
+
+        assert await lane.verify(scene, narrow_gate_base=base, runner=remote) is None
+        assert remote.calls == [scene.merge_sha]
+        assert lane.recorder.decisions == [None]
+        [event] = lane.resolutions()
+        assert (event['resolution'], event['miss_reason'], event['commands']) == (
+            'full_gate', MissReason.CODE_CHANGED, None,
+        )
+
+    async def test_without_a_base_the_lane_is_unchanged(self, lane: _NarrowLane) -> None:
+        scene, _base = await lane.merge(_DOCS)
+
+        assert await lane.verify(scene) is None
+        assert lane.recorder.decisions == [None]
+        assert lane.resolutions() == []
+        assert len(lane.results) == 1
+
+    async def test_a_disabled_gate_leaves_the_lane_unchanged(self, lane: _NarrowLane) -> None:
+        scene, base = await lane.merge(_DOCS, enabled=False)
+
+        assert await lane.verify(scene, narrow_gate_base=base) is None
+        assert lane.recorder.decisions == [None]
+        assert lane.resolutions() == []
 
 
 _HOMES = {
