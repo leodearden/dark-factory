@@ -286,19 +286,28 @@ _FILLER_RUN: str = (
     r'still|yet|soon|finally|eventually|first|only|fully|successfully))*'
 )
 
+_NON_VERIDICAL_CUE: str = r'(?<![-\w])(?:if|whether|unless|in\s+case)'
+_TEMPORAL_CUE: str = (
+    r'(?<![-\w])(?:when(?:ever)?|once|after|before|until|till|as\s+soon\s+as|the\s+day)'
+)
+# The cues opening a _MOOD_SCOPES scope; a governed-verb tail that swallowed one would lose it.
+_MOOD_CUE: str = r'(?:' + _NON_VERIDICAL_CUE + r'|' + _TEMPORAL_CUE + r')(?![-\w])'
+
 # A modal or intention phrase, the filler run, then the verb it governs: "must
 # have landed", "won’t be merged", "is supposed to be filed as tkt_X next week".
 # The intention phrases are FUTURE_ASPIRATIONAL_RE's. The governed verb is one
 # word, or a two-word extension form swallowed whole ("re filed").
 # A bare 'be' governs too, since a base-form 'be' never asserts: an infinitive ('to be merged'), a
 # mandative subjunctive ('asked that task N be cancelled', esc-unverified-claim-9007-1, task 11770)
-# or a 'let' complement. Pinned by tests/test_completion_claim_mood.py::TestModalFormsAreNotClaims.
+# or a 'let' complement. The tail stops short of a mood cue: 'it'll be when task N has landed'
+# keeps its 'when' scope.
+# Pinned by tests/test_completion_claim_mood.py::TestModalFormsAreNotClaims.
 _GOVERNED_VERB_RE: re.Pattern[str] = re.compile(
     r'\b(?:going\s+to|plans?\s+to|planned\s+to|intends?\s+to|intended\s+to|'
     r'aims?\s+to|meant\s+to|hopes?\s+to|expects?\s+to|scheduled\s+to|slated\s+to|'
     r'supposed\s+to|needs?\s+to|be|' + _MODAL + r')\b'
     + _FILLER_RUN
-    + r'\s+(?:(?:' + _EXTENSION_ANY_FORM + r')\b|[\w-]+)',
+    + r'\s+(?!' + _MOOD_CUE + r')(?:(?:' + _EXTENSION_ANY_FORM + r')\b|[\w-]+)',
     re.IGNORECASE,
 )
 
@@ -392,11 +401,7 @@ def _blank_quotations(text: str) -> str:
 
 
 _NON_VERIDICAL_CUE_RE: re.Pattern[str] = re.compile(
-    r'(?<![-\w])(?:if|whether|unless|in\s+case)(?![-\w])',
-    re.IGNORECASE,
-)
-_TEMPORAL_CUE: str = (
-    r'(?<![-\w])(?:when(?:ever)?|once|after|before|until|till|as\s+soon\s+as|the\s+day)'
+    _NON_VERIDICAL_CUE + r'(?![-\w])', re.IGNORECASE,
 )
 _TEMPORAL_CUE_RE: re.Pattern[str] = re.compile(_TEMPORAL_CUE + r'(?![-\w])', re.IGNORECASE)
 _PRESENT_AUXILIARY_RE: re.Pattern[str] = re.compile(
