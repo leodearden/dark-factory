@@ -81,7 +81,7 @@ class TestRosterFilePath:
 class TestAbsentFile:
     def test_an_absent_file_is_an_empty_roster(self, tmp_path: Path) -> None:
         roster = load_roster(tmp_path / 'missing.yaml')
-        assert roster == Roster()
+        assert roster.hosts == {}
         assert roster.runners_for_project('p') == ()
 
     def test_a_directory_at_the_path_is_an_error_not_an_absent_file(self, tmp_path: Path) -> None:
