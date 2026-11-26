@@ -151,7 +151,7 @@ from fused_memory.services.provider_billing import billing_source_of
 
 if TYPE_CHECKING:
     from qdrant_client import AsyncQdrantClient
-    from qdrant_client.models import ExtendedPointId
+    from qdrant_client.models import ExtendedPointId, PointStruct
     from shared.cost_store import CostStore
     from shared.usage_gate import UsageGate
 
@@ -364,6 +364,10 @@ class BackfillResult:
     upserted: int = 0
     skipped: int = 0
     errors: int = 0
+
+
+BACKFILL_UPSERT_BATCH_SIZE = 128
+"""Most points one backfill upsert request carries, far under Qdrant's 32 MiB request limit."""
 
 
 @dataclass
@@ -2085,15 +2089,20 @@ class TaskCurator:
         self,
         tasks: list[dict],
         project_id: str,
+        *,
+        batch_size: int = BACKFILL_UPSERT_BATCH_SIZE,
     ) -> BackfillResult:
         """Upsert embeddings for a flat list of existing task dicts.
 
-        Idempotent: uses the same deterministic UUID5 point-ID scheme as
-        record_task(). Re-running just re-upserts the same points.
+        The corpus is written in batches of at most *batch_size* points: each
+        slice of tasks is embedded, then upserted, before the next slice is
+        embedded. Idempotent: uses the same deterministic UUID5 point-ID
+        scheme as record_task(). Re-running just re-upserts the same points.
 
         Args:
             tasks: Flat list of task dicts (as returned by flatten_task_tree).
             project_id: Project identifier used for the collection name and point IDs.
+            batch_size: Most points one upsert request carries.
 
         Returns:
             BackfillResult with counts of upserted, skipped, and error tasks.
@@ -2101,66 +2110,65 @@ class TaskCurator:
         if not tasks:
             return BackfillResult()
 
-        result = BackfillResult()
+        titled = [task for task in tasks if _task_title(task)]
+        result = BackfillResult(skipped=len(tasks) - len(titled))
         collection = await self._ensure_collection(project_id)
         embedder = await self._get_embedder()
         client = await self._get_qdrant()
+        embed_slots = asyncio.Semaphore(10)
 
-        from qdrant_client.models import PointStruct
-
-        # Embed all tasks with bounded concurrency.
-        sem = asyncio.Semaphore(10)
-        points: list[PointStruct] = []
-
-        async def _embed_one(task: dict) -> None:
-            task_id = str(task.get('id', '') or '')
-            title = str(task.get('title', '') or '').strip()
-            if not title:
-                result.skipped += 1
-                return
-
-            description = str(task.get('description', '') or '')
-            files = _task_files(task)
-            text = embedding_text(title, description, files)
-
-            try:
-                async with sem:
-                    embedding = await embedder.create(text)
-            except Exception:
-                logger.warning(
-                    'task_curator: backfill embed failed for task %s', task_id, exc_info=True,
-                )
-                result.errors += 1
-                return
-
-            point_id = self._point_id(project_id, task_id)
-            points.append(
-                PointStruct(
-                    id=point_id,
-                    vector=embedding,
-                    payload={
-                        'task_id': task_id,
-                        'title': title,
-                        'description': description[:1000],
-                        'files_to_modify': files,
-                        'priority': task.get('priority') or DEFAULT_PRIORITY,
-                        'project_id': project_id,
-                        'updated_at': datetime.now(UTC).isoformat(),
-                    },
-                )
-            )
-
-        await asyncio.gather(*[_embed_one(t) for t in tasks])
-
-        if points:
-            await client.upsert(collection_name=collection, points=points)
-            result.upserted = len(points)
+        for start in range(0, len(titled), batch_size):
+            batch = titled[start:start + batch_size]
+            embedded = await asyncio.gather(*(
+                self._backfill_point(task, project_id, embedder, embed_slots) for task in batch
+            ))
+            points = [point for point in embedded if point is not None]
+            result.errors += len(batch) - len(points)
+            if points:
+                await client.upsert(collection_name=collection, points=points)
+                result.upserted += len(points)
 
         logger.info(
             'task_curator: backfill_corpus complete project=%s upserted=%d skipped=%d errors=%d',
             project_id, result.upserted, result.skipped, result.errors,
         )
         return result
+
+    async def _backfill_point(
+        self,
+        task: dict,
+        project_id: str,
+        embedder: CorpusEmbedder,
+        embed_slots: asyncio.Semaphore,
+    ) -> PointStruct | None:
+        """The corpus point for titled *task*, or None when its embed fails (logged)."""
+        from qdrant_client.models import PointStruct
+
+        task_id = str(task.get('id', '') or '')
+        title = _task_title(task)
+        description = str(task.get('description', '') or '')
+        files = _task_files(task)
+        try:
+            async with embed_slots:
+                embedding = await embedder.create(embedding_text(title, description, files))
+        except Exception:
+            logger.warning(
+                'task_curator: backfill embed failed for task %s', task_id, exc_info=True,
+            )
+            return None
+        return PointStruct(
+            id=self._point_id(project_id, task_id),
+            vector=embedding,
+            payload={
+                'task_id': task_id,
+                'title': title,
+                'description': description[:1000],
+                'files_to_modify': files,
+                'priority': task.get('priority') or DEFAULT_PRIORITY,
+                'project_id': project_id,
+                'updated_at': datetime.now(UTC).isoformat(),
+            },
+        )
 
     async def prune_orphans(self, project_id: str, live_task_ids) -> PruneResult:
         """Health-gated reconciliation sweep: delete corpus points for tasks
@@ -3300,6 +3308,11 @@ def _count_absent(task_ids: Iterable[str], admitted: set[str]) -> int:
     moment each cap fires reports entries that end up present.
     """
     return len({tid for tid in task_ids if tid and tid not in admitted})
+
+
+def _task_title(task: dict) -> str:
+    """The stripped title of a raw taskmaster task dict; '' when it has none."""
+    return str(task.get('title', '') or '').strip()
 
 
 def _task_files(task: dict) -> list[str]:
