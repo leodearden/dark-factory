@@ -2,18 +2,24 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import uuid
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
-from _curator_helpers import curator_double
+from _curator_helpers import curator_double, in_memory_corpus_curator, make_config
+from qdrant_client import AsyncQdrantClient
+from qdrant_client.http.exceptions import UnexpectedResponse
+from qdrant_client.models import PointsList, UpdateResult
 
 from fused_memory.config.schema import CuratorConfig, FusedMemoryConfig
 from fused_memory.middleware.curator_types import DEFAULT_PRIORITY
 from fused_memory.middleware.task_curator import (
     _PRIORITY_RANK,
+    BACKFILL_UPSERT_BATCH_SIZE,
     BackfillResult,
     TaskCurator,
 )
@@ -46,6 +52,88 @@ def _make_task(
 
 def _expected_point_id(project_id: str, task_id: str) -> str:
     return str(uuid.uuid5(uuid.NAMESPACE_URL, f'{project_id}/{task_id}'))
+
+
+QDRANT_DEFAULT_MAX_REQUEST_BYTES = 32 * 2**20
+"""Qdrant's default ``service.max_request_size_mb``, in bytes."""
+
+
+class RecordingQdrant(AsyncQdrantClient):
+    """An in-memory Qdrant that records each upsert's point count and refuses some upserts.
+
+    An upsert is refused with the 400 Qdrant answers to an oversized body when
+    its serialised body exceeds *max_request_bytes*, or when its 0-based call
+    index is in *fail_calls*. A refused upsert writes nothing.
+    """
+
+    def __init__(
+        self,
+        *,
+        max_request_bytes: int | None = None,
+        fail_calls: frozenset[int] = frozenset(),
+    ) -> None:
+        super().__init__(location=':memory:')
+        self._max_request_bytes = max_request_bytes
+        self._fail_calls = fail_calls
+        self.upsert_sizes: list[int] = []
+
+    async def upsert(
+        self, collection_name: str, points: Any, *args: Any, **kwargs: Any,
+    ) -> UpdateResult:
+        call_index = len(self.upsert_sizes)
+        point_list = list(points)
+        self.upsert_sizes.append(len(point_list))
+        body_bytes = len(PointsList(points=point_list).model_dump_json())
+        oversized = self._max_request_bytes is not None and body_bytes > self._max_request_bytes
+        if oversized or call_index in self._fail_calls:
+            raise UnexpectedResponse(
+                status_code=400,
+                reason_phrase='Bad Request',
+                content=f'JSON payload ({body_bytes} bytes) refused'.encode(),
+                headers=httpx.Headers(),
+            )
+        return await super().upsert(collection_name, point_list, *args, **kwargs)
+
+
+class RecordingEmbedder:
+    """A corpus embedder that counts its calls and the most calls it ever had in flight.
+
+    Each call yields to the event loop once while in flight, so concurrent
+    calls overlap with no wall-clock wait. A text containing *fail_marker*
+    raises. Every component has a worst-case-length float repr, so a point
+    serialises as large as a real embedding's can.
+    """
+
+    def __init__(self, *, fail_marker: str | None = None) -> None:
+        self._vector = [-0.0123456789012345] * make_config().embedder.dimensions
+        self._fail_marker = fail_marker
+        self.calls = 0
+        self.in_flight = 0
+        self.peak = 0
+
+    async def create(self, input_data: str) -> list[float]:
+        self.calls += 1
+        self.in_flight += 1
+        self.peak = max(self.peak, self.in_flight)
+        try:
+            await asyncio.sleep(0)
+            if self._fail_marker is not None and self._fail_marker in input_data:
+                raise RuntimeError(f'embedder refused a text containing {self._fail_marker!r}')
+            return self._vector
+        finally:
+            self.in_flight -= 1
+
+
+def _titled_tasks(count: int, *, title_chars: int = 20, description_chars: int = 20) -> list[dict]:
+    """*count* titled tasks with distinct ids and padded title and description texts."""
+    return [
+        _make_task(
+            str(i),
+            title=f'Task {i} '.ljust(title_chars, 't'),
+            description=f'Description {i} '.ljust(description_chars, 'd'),
+        )
+        for i in range(count)
+    ]
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -222,6 +310,24 @@ class TestBackfillEdgeCases:
         assert result.errors == 1
         assert result.upserted == 2
         assert result.skipped == 0
+
+
+class TestBackfillBatching:
+    @pytest.mark.asyncio
+    async def test_project_over_qdrant_request_limit_lands_in_bounded_batches(self):
+        """1,200 worst-case points are about 36.8 MiB as one body, over Qdrant's 32 MiB limit."""
+        qdrant = RecordingQdrant(max_request_bytes=QDRANT_DEFAULT_MAX_REQUEST_BYTES)
+        curator = in_memory_corpus_curator(RecordingEmbedder(), qdrant_client=qdrant)
+        tasks = _titled_tasks(1200, title_chars=200, description_chars=1000)
+        try:
+            result = await curator.backfill_corpus(tasks, 'proj')
+
+            assert result == BackfillResult(upserted=1200, skipped=0, errors=0)
+            assert await curator.corpus_count('proj') == 1200
+            assert len(qdrant.upsert_sizes) > 1
+            assert max(qdrant.upsert_sizes) <= BACKFILL_UPSERT_BATCH_SIZE
+        finally:
+            await curator.close()
 
 
 # ──────────────────────────────────────────────────────────────────────────────
