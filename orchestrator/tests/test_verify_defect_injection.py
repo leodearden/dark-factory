@@ -24,6 +24,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+from _host_pytest_temp_root import listing, seed_dead_session_dirs
 from _orch_helpers import VERIFY_CLI_PER_TEST_TIMEOUT
 from shared.defect_plugin_location import DEFECT_PLUGIN_DIR
 
@@ -392,6 +393,43 @@ class TestVerifyLegInjectionEndToEnd:
         assert legs and all(_carries_plugin(cmd) for cmd, _ in legs), legs
         assert all(kw.get('defect_plugin') is True for _, kw in legs)
         assert json.loads(collection_map_path(report).read_text()) == _EXPECTED_FIXTURE_MAP
+
+    def test_an_xdist_leg_leaves_the_hosts_default_pytest_temp_root_untouched(
+        self, tmp_path, monkeypatch,
+    ):
+        monkeypatch.delenv('PYTHONPATH', raising=False)
+        host = tmp_path / 'host-temp'
+        seed_dead_session_dirs(host)
+        before = listing(host)
+        monkeypatch.setenv('PYTEST_DEBUG_TEMPROOT', str(host))
+        worktree = _make_fixture_project(tmp_path / 'worktree')
+        recorder = worktree / 'pkg' / 'tests' / 'inherited-temproot'
+        (recorder.parent / 'test_temp_root.py').write_text(
+            'import os\nimport pathlib\n\n\n'
+            'def test_records_its_temp_root():\n'
+            "    pathlib.Path(__file__).with_name('inherited-temproot').write_text(\n"
+            "        os.environ.get('PYTEST_DEBUG_TEMPROOT', ''), encoding='utf-8',\n"
+            '    )\n',
+            encoding='utf-8',
+        )
+
+        result, _ = _verify(
+            worktree, _make_config(worktree), 'pytest -n 2', junit_report=tmp_path / 'out' / 'r.xml',
+        )
+
+        assert result.passed, result.test_output
+        assert recorder.read_text(encoding='utf-8') == str(host), (
+            'the nested session never inherited PYTEST_DEBUG_TEMPROOT, so it would '
+            'use the real host temp root and leave the stand-in untouched with or '
+            'without --basetemp: the assertion below would pass vacuously'
+        )
+        after = listing(host)
+        assert after == before, (
+            "a nested xdist verify leg must not create, lock or clean dirs in the "
+            "host's default pytest temp root: its exit-time cleanup of other "
+            "sessions' dead dirs is unbounded and runs before the leg's child exits\n"
+            f'before: {before}\nafter:  {after}'
+        )
 
     def test_task_cost_archive_carries_the_map(self, tmp_path, monkeypatch):
         monkeypatch.delenv('PYTHONPATH', raising=False)
