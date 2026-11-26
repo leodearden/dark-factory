@@ -511,7 +511,7 @@ async def protection_refusal(
 
 
 class PromotionDeferral(BaseModel):
-    """A registered guard's answer that a held task must not be promoted yet, and why."""
+    """The answer, from the finding-set rule or a registered guard, that a held task must not be promoted yet, and why."""
 
     model_config = ConfigDict(frozen=True, extra='forbid')
 
@@ -558,9 +558,10 @@ async def promote(
     The caller holds the project's interceptor write lock, so each task is read and promoted with
     no write in between. Each promotion is ONE backend write that drops the holder edge and stamps
     ``followup_hold.promoted``, then one ``followup_promoted`` event; ``pending_since`` is never
-    written. A registered guard's deferral, or a guard that raises, leaves its task held, emits
-    ``followup_promotion_deferred`` and promotes none of that task's dependencies. A task that is
-    not held now promotes nothing. Returns the promoted ids in promotion order; an unknown *by*
+    written. A deferral leaves its task held, emits ``followup_promotion_deferred`` and promotes
+    none of that task's dependencies: a ``citation`` of a task carrying ``finding_set_hold`` is
+    deferred before any registered guard runs, and then a registered guard's deferral, or a guard
+    that raises, defers too. A task that is not held now promotes nothing. Returns the promoted ids in promotion order; an unknown *by*
     raises ``ValueError``.
     """
     walk = await _promote_frontier(tm, project_root, [(held_id, PromotionCause(by), ref)], emit)
@@ -836,7 +837,14 @@ class PromotionDeferredError(TaskmasterError):
 
 
 def _first_deferral(row: Mapping[str, object], cause: PromotionCause, ref: str | None) -> PromotionDeferral | None:
-    """The first registered guard's deferral; a guard that raises defers too, so a fault keeps the task held."""
+    """The finding-set rule's deferral, else the first registered guard's.
+
+    A ``citation`` of a task carrying ``finding_set_hold`` is deferred before any registered guard
+    runs. A guard that raises defers too, so a fault keeps the task held.
+    """
+    finding_set = _finding_set_deferral(row, cause)
+    if finding_set is not None:
+        return finding_set
     for guard in tuple(_PROMOTION_GUARDS):
         try:
             deferral = guard(row, cause.value, ref)
@@ -847,6 +855,22 @@ def _first_deferral(row: Mapping[str, object], cause: PromotionCause, ref: str |
         if deferral is not None:
             return deferral
     return None
+
+
+def _finding_set_deferral(row: Mapping[str, object], cause: PromotionCause) -> PromotionDeferral | None:
+    """Decision 14's citation exception: a set held by ruling is not scheduled one member at a time."""
+    if cause is not PromotionCause.CITATION:
+        return None
+    marker = _finding_set_hold(raw_metadata_dict(row.get('metadata'), source=_METADATA_SOURCE), row.get('id'))
+    if marker is None:
+        return None
+    return PromotionDeferral(
+        guard=FINDING_SET_HOLD_METADATA_KEY,
+        reason=(
+            f'held as a finding set by ruling ({marker.ruling}): a citation does not schedule one member; '
+            'a human releases it with remove_dependency on the holder edge or the holder release'
+        ),
+    )
 
 
 async def backfill(
