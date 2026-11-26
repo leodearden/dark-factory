@@ -1,6 +1,7 @@
 """scripts/deploy/verify_host_contract.py: the one requirement table and the renders a host installs."""
 
 import importlib.util
+import json
 import os
 import subprocess
 import sys
@@ -12,6 +13,7 @@ import pytest
 import yaml
 from cli_subprocess_timeout import cli_timeout_from_env
 from orchestrator.config import OrchestratorConfig, VerifyCgroupMemoryConfig
+from orchestrator.verify_host_roster_file import load_roster
 from orchestrator.verify_runner import GIT_PUSH_SSH_CONFIG, REMOTE_TOOL_PATH_PRELUDE
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
@@ -257,3 +259,265 @@ def test_no_artifact_names_a_home_directory(artifact: Path) -> None:
     text = artifact.read_text()
     assert '/home/' not in text
     assert str(Path.home()) not in text
+
+
+GIB_IN_KIB = 1024 * 1024
+
+VERDICT_ROSTER = """\
+hosts:
+  box:
+    ssh_host: box-alias
+    df_checkout_path: /srv/box/df
+    projects:
+      p:
+        git_remote: box
+        config_path: /srv/box/p.yaml
+        disk_footprint_gib: 40
+        host_config: {project_root: /srv/box/p, verify_cgroup_memory: {max_gib: 12}}
+      q:
+        git_remote: box
+        config_path: /srv/box/q.yaml
+        disk_footprint_gib: 10
+        host_config: {project_root: /srv/box/q, verify_cgroup_memory: {max_gib: 8}}
+"""
+
+UNSTATED_ROSTER = """\
+hosts:
+  box:
+    ssh_host: box-alias
+    df_checkout_path: /srv/box/df
+    projects:
+      p:
+        git_remote: box
+        config_path: /srv/box/p.yaml
+        host_config: {project_root: /srv/box/p}
+"""
+
+REFERENCE = {
+    'time_zone': 'Europe/London',
+    'locale': 'en_US.UTF-8',
+    'locale_available': True,
+    'tzdata_legacy_installed': True,
+    'uv_version': '0.11.6',
+    'node_version': 'v22.23.4',
+}
+
+
+class Scene:
+    """One roster host, a reference workstation and a host observation where every row is ok."""
+
+    def __init__(self, tmp_path: Path, roster_text: str = VERDICT_ROSTER) -> None:
+        self.contract = _contract()
+        self.observer = self.contract.verify_host_observe
+        roster = tmp_path / 'verify-hosts.yaml'
+        roster.write_text(roster_text)
+        self.spec = self.contract.HostSpec.from_roster(load_roster(roster), 'box')
+        self.reference = self.observer.EnvironmentFacts.from_json(json.dumps(REFERENCE))
+
+    def baseline(self) -> dict[str, Any]:
+        roots = [self.spec.df_checkout_path, *(project.project_root for project in self.spec.projects)]
+        return {
+            'environment': dict(REFERENCE),
+            'os_id': 'ubuntu', 'os_version_id': '24.04', 'user': 'verify', 'uid': 1000,
+            'git_user_name': 'Verify Host', 'git_user_email': 'verify@example.invalid',
+            'git_version': 'git version 2.43.0', 'bash_version': 'GNU bash, version 5.2.21',
+            'flock_version': 'flock from util-linux 2.39.3', 'npm_version': '10.9.9',
+            'uv_python_313': '/opt/uv/python/cpython-3.13/bin/python3.13',
+            'systemd_run_scope_rc': 0, 'linger': 'yes',
+            'landlock_abi': 6, 'var_tmp_writable': True,
+            'mem_available_kib': 32 * GIB_IN_KIB, 'swap_total_kib': 8 * GIB_IN_KIB,
+            'disk_free_gib': 100, 'sync_write_ms': 2.0,
+            'checkouts': {root: {'exists': True, 'receive_deny_current_branch': 'updateInstead'} for root in roots},
+            'df_orchestrator_executable': True,
+            'wrapper_text': self.contract.render_wrapper(self.spec),
+            'wrapper_probe_stdout': 'gate-identity', 'wrapper_probe_rc': 0,
+            'configs': {
+                project.config_path: self.contract.render_host_config(project.host_config)
+                for project in self.spec.projects
+            },
+            'credentials_present': False,
+        }
+
+    def observation(self, facts: dict[str, Any] | None = None, **network: Any) -> Any:
+        host = self.observer.HostFacts.from_json(json.dumps(facts if facts is not None else self.baseline()))
+        network_facts = self.contract.NetworkFacts(**{'reachable': True, 'host_key_pinned': True, 'detail': '', **network})
+        return self.contract.Observation(network=network_facts, host=host, unobserved_reason='')
+
+    def verdict(self, row_id: str, observation: Any = None, reference: dict[str, Any] | None = None) -> Any:
+        (row,) = (row for row in self.contract.REQUIREMENTS if row.id == row_id)
+        reference_facts = (
+            self.reference if reference is None
+            else self.observer.EnvironmentFacts.from_json(json.dumps(reference))
+        )
+        return row.evaluate(observation or self.observation(), reference_facts, self.spec)
+
+    def changed(self, row_id: str, change: Any) -> str:
+        facts = self.baseline()
+        change(facts)
+        return self.verdict(row_id, self.observation(facts)).verdict
+
+
+@pytest.fixture
+def scene(tmp_path: Path) -> Scene:
+    return Scene(tmp_path)
+
+
+def _set(path: str, value: Any) -> Any:
+    *parents, leaf = path.split('.')
+
+    def change(facts: dict[str, Any]) -> None:
+        target = facts
+        for key in parents:
+            target = target[key]
+        target[leaf] = value
+
+    return change
+
+
+class TestTheTable:
+    def test_every_row_is_ok_on_the_baseline(self, scene: Scene) -> None:
+        verdicts = {row.id: scene.verdict(row.id) for row in scene.contract.REQUIREMENTS}
+        assert {row_id: verdict.verdict for row_id, verdict in verdicts.items()} == dict.fromkeys(TABLE_IDS, 'ok')
+
+    def test_every_row_states_what_it_observed_and_needed(self, scene: Scene) -> None:
+        for row in scene.contract.REQUIREMENTS:
+            verdict = scene.verdict(row.id)
+            assert verdict.observed and verdict.needed, row.id
+
+    def test_an_unobserved_host_fails_every_host_row_but_not_the_network_row(self, scene: Scene) -> None:
+        observation = scene.contract.Observation(
+            network=scene.contract.NetworkFacts(reachable=True, host_key_pinned=True, detail=''),
+            host=None, unobserved_reason='observer exited 1',
+        )
+        for row in scene.contract.REQUIREMENTS:
+            verdict = scene.verdict(row.id, observation)
+            if row.id == 'network':
+                assert verdict.verdict == 'ok'
+            else:
+                assert verdict.verdict == 'fail', row.id
+                assert verdict.observed == 'not observed: observer exited 1', row.id
+
+
+class TestNetwork:
+    def test_unreachable_fails(self, scene: Scene) -> None:
+        assert scene.verdict('network', scene.observation(reachable=False, detail='timed out')).verdict == 'fail'
+
+    def test_reachable_but_the_host_key_not_pinned_fails(self, scene: Scene) -> None:
+        assert scene.verdict('network', scene.observation(host_key_pinned=False)).verdict == 'fail'
+
+
+class TestOsAndUser:
+    @pytest.mark.parametrize('change', [
+        _set('os_version_id', '22.04'), _set('os_id', 'debian'), _set('uid', 0),
+        _set('git_user_name', None), _set('git_user_email', None),
+    ], ids=['os_22_04', 'not_ubuntu', 'root', 'no_git_name', 'no_git_email'])
+    def test_fails(self, scene: Scene, change: Any) -> None:
+        assert scene.changed('os_and_user', change) == 'fail'
+
+
+class TestTimeZoneAndLocale:
+    @pytest.mark.parametrize('change', [
+        _set('environment.time_zone', 'UTC'), _set('environment.locale', 'C.UTF-8'),
+        _set('environment.locale_available', False), _set('environment.tzdata_legacy_installed', False),
+    ], ids=['time_zone_differs', 'locale_differs', 'locale_unavailable', 'no_tzdata_legacy'])
+    def test_fails(self, scene: Scene, change: Any) -> None:
+        assert scene.changed('time_zone_and_locale', change) == 'fail'
+
+
+class TestToolchain:
+    @pytest.mark.parametrize('change', [
+        _set('environment.uv_version', '0.11.5'), _set('environment.node_version', 'v20.11.1'),
+        _set('npm_version', None), _set('git_version', None), _set('flock_version', None),
+        _set('bash_version', None), _set('uv_python_313', None),
+    ], ids=['uv_differs', 'node_major_differs', 'no_npm', 'no_git', 'no_flock', 'no_bash', 'no_python_313'])
+    def test_fails(self, scene: Scene, change: Any) -> None:
+        assert scene.changed('toolchain', change) == 'fail'
+
+    def test_the_same_node_major_with_another_patch_is_ok(self, scene: Scene) -> None:
+        assert scene.changed('toolchain', _set('environment.node_version', 'v22.1.0')) == 'ok'
+
+
+class TestSystemd:
+    @pytest.mark.parametrize('change', [_set('systemd_run_scope_rc', 1), _set('linger', 'no')],
+                             ids=['scope_fails', 'no_linger'])
+    def test_fails(self, scene: Scene, change: Any) -> None:
+        assert scene.changed('systemd', change) == 'fail'
+
+
+class TestKernel:
+    @pytest.mark.parametrize('change', [
+        _set('landlock_abi', 1), _set('landlock_abi', -1), _set('var_tmp_writable', False),
+    ], ids=['landlock_abi_1', 'no_landlock', 'var_tmp_read_only'])
+    def test_fails(self, scene: Scene, change: Any) -> None:
+        assert scene.changed('kernel', change) == 'fail'
+
+
+class TestMemory:
+    def test_no_swap_fails(self, scene: Scene) -> None:
+        assert scene.changed('memory', _set('swap_total_kib', 0)) == 'fail'
+
+    def test_mem_available_below_the_summed_scope_caps_fails(self, scene: Scene) -> None:
+        assert scene.changed('memory', _set('mem_available_kib', 19 * GIB_IN_KIB)) == 'fail'
+
+    def test_no_stated_scope_cap_warns(self, tmp_path: Path) -> None:
+        assert Scene(tmp_path, UNSTATED_ROSTER).verdict('memory').verdict == 'warn'
+
+
+class TestDisk:
+    def test_free_space_below_the_summed_footprints_fails(self, scene: Scene) -> None:
+        assert scene.changed('disk', _set('disk_free_gib', 49)) == 'fail'
+
+    def test_no_stated_footprint_warns(self, tmp_path: Path) -> None:
+        assert Scene(tmp_path, UNSTATED_ROSTER).verdict('disk').verdict == 'warn'
+
+    def test_a_slow_synchronous_write_warns(self, scene: Scene) -> None:
+        assert scene.changed('disk', _set('sync_write_ms', 126.0)) == 'warn'
+
+    def test_a_synchronous_write_under_the_threshold_is_ok(self, scene: Scene) -> None:
+        fast = scene.contract.SYNC_WRITE_WARN_MS - 0.5
+        assert scene.changed('disk', _set('sync_write_ms', fast)) == 'ok'
+
+
+class TestCheckouts:
+    def test_an_absent_project_checkout_fails(self, scene: Scene) -> None:
+        change = _set('checkouts./srv/box/p', {'exists': False, 'receive_deny_current_branch': None})
+        assert scene.changed('checkouts', change) == 'fail'
+
+    def test_a_checkout_refusing_pushes_to_its_branch_fails(self, scene: Scene) -> None:
+        change = _set('checkouts./srv/box/df', {'exists': True, 'receive_deny_current_branch': None})
+        assert scene.changed('checkouts', change) == 'fail'
+
+    def test_a_df_venv_without_its_orchestrator_fails(self, scene: Scene) -> None:
+        assert scene.changed('checkouts', _set('df_orchestrator_executable', False)) == 'fail'
+
+
+class TestWrapper:
+    def test_an_installed_wrapper_differing_from_the_render_fails(self, scene: Scene) -> None:
+        def change(facts: dict[str, Any]) -> None:
+            facts['wrapper_text'] += '# hand edit\n'
+
+        assert scene.changed('wrapper', change) == 'fail'
+
+    def test_a_wrapper_ignoring_orch_gate_bin_fails(self, scene: Scene) -> None:
+        assert scene.changed('wrapper', _set('wrapper_probe_stdout', 'usage: orchestrator')) == 'fail'
+
+
+class TestPerHostYaml:
+    def test_a_missing_config_file_fails_naming_the_project(self, scene: Scene) -> None:
+        facts = scene.baseline()
+        facts['configs']['/srv/box/q.yaml'] = None
+        verdict = scene.verdict('per_host_yaml', scene.observation(facts))
+        assert verdict.verdict == 'fail'
+        assert "'q'" in verdict.observed
+
+    def test_a_config_file_differing_from_the_render_fails_naming_the_project(self, scene: Scene) -> None:
+        facts = scene.baseline()
+        facts['configs']['/srv/box/p.yaml'] += 'concurrent_verify: true\n'
+        verdict = scene.verdict('per_host_yaml', scene.observation(facts))
+        assert verdict.verdict == 'fail'
+        assert "'p'" in verdict.observed
+
+
+class TestNoCredentials:
+    def test_an_agent_credential_file_fails(self, scene: Scene) -> None:
+        assert scene.changed('no_credentials', _set('credentials_present', True)) == 'fail'
