@@ -794,9 +794,11 @@ async def run_server():
         from fused_memory.reconciliation.bulk_reset_guard import BulkResetGuard
         from fused_memory.reconciliation.event_buffer import EventBuffer
         from fused_memory.reconciliation.event_queue import EventQueue
-        from fused_memory.reconciliation.harness import ReconciliationHarness
+        from fused_memory.reconciliation.harness import (
+            ReconciliationHarness,
+            build_reconciliation_usage_gate,
+        )
         from fused_memory.reconciliation.journal import ReconciliationJournal
-        from fused_memory.reconciliation.recon_usage_gate import build_reconciliation_usage_gate
         from fused_memory.reconciliation.sqlite_watchdog import SqliteWatchdog
         from fused_memory.reconciliation.targeted import TargetedReconciler
 

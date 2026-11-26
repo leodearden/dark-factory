@@ -5,7 +5,7 @@ from shared.config_models import AccountConfig, UsageCapConfig
 from shared.usage_gate import UsageGate
 
 from fused_memory.config.schema import ReconciliationConfig
-from fused_memory.reconciliation.recon_usage_gate import build_reconciliation_usage_gate
+from fused_memory.reconciliation.harness import build_reconciliation_usage_gate
 
 
 def test_no_gate_when_the_reconciliation_usage_cap_is_disabled():

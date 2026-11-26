@@ -30,7 +30,7 @@ from fused_memory.backends.falkor_indices import (
     expected_index_set,
     normalize_index_records,
 )
-from fused_memory.config.schema import FusedMemoryConfig
+from fused_memory.config.schema import FusedMemoryConfig, ReconciliationConfig
 from fused_memory.mcp_tools.scheduler_state import read_scheduler_state
 from fused_memory.models.reconciliation import (
     AssembledPayload,
@@ -86,7 +86,6 @@ from fused_memory.reconciliation.overreach_flags import (
 )
 from fused_memory.reconciliation.predecessor_drain_recovery import recover_predecessor_drains
 from fused_memory.reconciliation.queue_health import summarize_graphiti_queue_health
-from fused_memory.reconciliation.recon_usage_gate import build_reconciliation_usage_gate
 from fused_memory.reconciliation.reserve_step_aside import ReserveStepAside, StepAsideSite
 from fused_memory.reconciliation.scope_freshness import (
     ScopeFreshnessResult,
@@ -799,6 +798,11 @@ def _log_dropped_escalation(category: str, run_id: str, summary: str, *, reason:
         'reconciliation.escalation_dropped (%s): category=%s run_id=%s summary=%s',
         reason, category, run_id, summary,
     )
+
+
+def build_reconciliation_usage_gate(config: ReconciliationConfig) -> UsageGate | None:
+    """The reconciliation subsystem's usage gate; the harness given it owns its shutdown."""
+    return UsageGate(config.usage_cap) if config.usage_cap.enabled else None
 
 
 class ReconciliationHarness:
