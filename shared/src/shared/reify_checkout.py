@@ -3,12 +3,11 @@
 The single source of reify-checkout resolution in dark-factory.  Promoted here
 (task 3978) from ``fused-memory/tests/test_lock_charter_guard.py``, where task
 3843 first established the semantics, so the cross-repo call sites share one
-implementation instead of drifting apart.  The two consumers are
-``orchestrator/tests/test_verify_role_integration.py``, which gates on reify's
-``scripts/verify.sh``, and ``scripts/check_lock_charter_drift.py``, the off-gate
-lock-charter drift check, which gates on reify's
-``scripts/lock-charter-guard.sh``.  Both the resolution AND the skip wording
-live here: a call site that hand-rolled its own "reify checkout not
+implementation instead of drifting apart.  The one consumer is
+``scripts/check_lock_charter_drift.py``, the off-gate lock-charter drift check,
+which gates on reify's ``scripts/lock-charter-guard.sh``.  No merge-gate test
+reads a reify checkout (tasks 11623, 11630).  Both the resolution AND the skip
+wording live here: a call site that hand-rolled its own "reify checkout not
 discoverable" string would re-open exactly the conflation `reify_skip_reason`
 exists to prevent.
 
@@ -29,9 +28,8 @@ convention for this kind of module here (``shared.testing``,
 This module is pure stdlib on purpose: it must NOT import pytest, which is in
 shared's ``[dependency-groups] dev`` and not its ``[project]`` dependencies.
 Callers get a skip *reason* string from `reify_skip_reason` and act on it
-themselves — which is also the shape the two consumers need anyway, since they
-need DIFFERENT ones (a module-level ``pytest.mark.skipif`` marker in the
-orchestrator test, an exit-2 UNAVAILABLE report in the drift check).
+themselves: the drift check reports it as an exit-2 UNAVAILABLE report
+(``scripts/check_lock_charter_drift.py::reconcile``).
 """
 
 from __future__ import annotations
@@ -47,7 +45,7 @@ __all__ = [
     'resolve_reify_checkout',
 ]
 
-#: The one env var steering every reify-dependent test in dark-factory.  Named
+#: The one env var steering every reify-dependent check in dark-factory.  Named
 #: here rather than respelled at each call site, so one `export REIFY_ROOT=...`
 #: cannot be half-honored by a consumer that typo'd the name.
 REIFY_ROOT_ENV = 'REIFY_ROOT'
@@ -76,7 +74,7 @@ def resolve_reify_checkout(marker: str | Path, *, start: Path) -> ReifyCheckout:
     """Locate the reify checkout carrying *marker*, independent of checkout layout.
 
     *marker* is a relpath INSIDE the checkout that identifies a usable one for
-    the caller (e.g. ``scripts/verify.sh`` or ``scripts/lock-charter-guard.sh``).
+    the caller (e.g. ``scripts/lock-charter-guard.sh``).
     *start* is the calling module's own file — pass ``Path(__file__)`` from the
     CALL SITE.  It is keyword-only and required by design: defaulting it to this
     module's ``__file__`` would start every walk in ``shared/src/shared/``
@@ -124,11 +122,6 @@ def resolve_reify_checkout(marker: str | Path, *, start: Path) -> ReifyCheckout:
          a usable checkout for that caller.
       3. Otherwise ``ReifyCheckout(None, False)`` — the legitimate
          standalone-checkout discovery MISS.
-
-    Call sites typically resolve this into module-level constants, which are
-    evaluated at IMPORT time.  REIFY_ROOT must therefore be exported BEFORE
-    pytest starts to steer them; a mid-session ``monkeypatch.setenv`` only
-    affects direct `resolve_reify_checkout` calls.
     """
     override = os.environ.get(REIFY_ROOT_ENV, '').strip()
     if override:
@@ -143,11 +136,11 @@ def resolve_reify_checkout(marker: str | Path, *, start: Path) -> ReifyCheckout:
 def reify_skip_reason(
     marker: str | Path, root: Path | None, *, named_by_env: bool
 ) -> str | None:
-    """Why a reify-dependent test cannot run against *root*, or None if it can.
+    """Why a reify-dependent check cannot run against *root*, or None if it can.
 
-    Returns ``None`` when ``root / marker`` is a real file — the gate must RUN.
-    Otherwise returns a non-empty reason string for the caller to feed to
-    ``pytest.skip`` / ``pytest.mark.skipif``.  It never returns ``''``: a falsy
+    Returns ``None`` when ``root / marker`` is a real file — the check must RUN.
+    Otherwise returns a non-empty reason string for the caller to report, as
+    the drift check's UNAVAILABLE detail does.  It never returns ``''``: a falsy
     reason would silently DISABLE a call site that gates on truthiness, turning
     a skip into a phantom pass.
 
@@ -172,7 +165,7 @@ def reify_skip_reason(
         naming a path that is not there — which is why the message names the
         path, and, when *named_by_env*, says so: it is the path *you* named.
         The override is honored verbatim rather than silently falling back to
-        discovery, so a typo is self-evident in ``pytest -rs`` output instead of
+        discovery, so a typo is self-evident in the caller's report instead of
         quietly answering for a different repo than the operator asked for.
     """
     if root is None:
