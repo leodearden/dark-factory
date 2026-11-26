@@ -905,6 +905,48 @@ class TestRunBackfill:
         mock_curator.close.assert_awaited_once()
 
 
+class TestBackfillCli:
+    def test_concurrency_defaults_to_the_curator_default(self):
+        from fused_memory.maintenance.backfill_curator_corpus import build_parser
+
+        args = build_parser().parse_args(['--project-root', '/x'])
+
+        assert args.concurrency == BACKFILL_DEFAULT_CONCURRENCY
+
+    def test_concurrency_is_parsed_as_an_int(self):
+        from fused_memory.maintenance.backfill_curator_corpus import build_parser
+
+        args = build_parser().parse_args(['--project-root', '/x', '--concurrency', '4'])
+
+        assert args.concurrency == 4
+
+    @pytest.mark.parametrize('text', ['0', '-1', 'abc'])
+    def test_non_positive_or_non_int_concurrency_is_a_usage_error(self, text: str, capsys):
+        from fused_memory.maintenance.backfill_curator_corpus import build_parser
+
+        with pytest.raises(SystemExit) as exit_info:
+            build_parser().parse_args(['--project-root', '/x', '--concurrency', text])
+
+        assert exit_info.value.code == 2
+        assert '--concurrency' in capsys.readouterr().err
+
+    def test_main_runs_the_backfill_with_the_parsed_concurrency(self, monkeypatch, capsys):
+        from fused_memory.maintenance import backfill_curator_corpus
+
+        received: list[dict[str, Any]] = []
+
+        async def fake_run_backfill(**kwargs: Any) -> BackfillResult:
+            received.append(kwargs)
+            return BackfillResult(upserted=5, skipped=1, errors=0)
+
+        monkeypatch.setattr(backfill_curator_corpus, 'run_backfill', fake_run_backfill)
+
+        backfill_curator_corpus.main(['--project-root', '/x', '--concurrency', '3'])
+
+        assert received == [{'config_path': None, 'project_root': '/x', 'concurrency': 3}]
+        assert 'Backfill complete: upserted=5 skipped=1 errors=0' in capsys.readouterr().out
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # TestPruneDriver: BackfillManager.prune() / run_prune() orchestration
 # (curator corpus RC1 — task 2520, Layer C driver)
