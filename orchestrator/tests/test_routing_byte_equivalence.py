@@ -21,10 +21,11 @@ model-upgrade coverage.
 
 Experiment 1 of plans/routing-experiment-substrate-prd.md (task 8375) puts a
 split on the shipped table: the >=3-module lift now holds on arm 0 of salt
-routing-exp-1 and arm 1 needs >=4 modules, so the task id moves a decision
-for an implementer or debugger with a 3-module, under-12-step plan and
-nowhere else (TestExperimentOneRuleTable, TestExperimentOneResolution,
-TestTaskIdMovesOnlyTheSplitRules).
+routing-exp-1 and arm 1 needs >=4 modules. So the task id moves a decision
+for an implementer or debugger with a >=3-module, under-12-step plan and
+nowhere else: the outcome for exactly 3 modules, and only the attributed
+rule id for 4 or more (TestExperimentOneRuleTable,
+TestExperimentOneResolution, TestTaskIdMovesOnlyTheSplitRules).
 
 Fixtures are kept MODULE-LOCAL (not conftest.py) -- mirrors test_routing.py's
 documented rationale (a conftest.py edit forces verify.py's has_conftest to
@@ -271,8 +272,9 @@ def _decisions_over_task_ids(role_name: str, plan_shape: PlanShape | None):
 class TestTaskIdMovesOnlyTheSplitRules:
     """Invariant 3, extended: the task id changes a decision only where an
     experiment-1 split rule can match -- an implementer or debugger with a
-    plan of exactly 3 modules and under 12 steps -- and there it picks one of
-    the two arm outcomes."""
+    plan of >=3 modules and under 12 steps. With exactly 3 modules it picks
+    one of the two arm outcomes; with 4 or more only the attributed rule id
+    differs."""
 
     @pytest.mark.parametrize(
         'plan_shape',
@@ -293,3 +295,10 @@ class TestTaskIdMovesOnlyTheSplitRules:
         rule_ids = {d.rule_id for d in _decisions_over_task_ids(role_name, _THREE_MODULE_PLAN)}
 
         assert rule_ids == {'large-plan-modules', None}
+
+    @pytest.mark.parametrize('role_name', ['implementer', 'debugger'])
+    def test_four_module_executor_differs_by_arm_only_in_rule_id(self, role_name):
+        decisions = _decisions_over_task_ids(role_name, _FOUR_MODULE_PLAN)
+
+        assert {d.rule_id for d in decisions} == {'large-plan-modules-4', 'large-plan-modules'}
+        assert len({(d.model, d.max_turns) for d in decisions}) == 1
