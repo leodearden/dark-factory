@@ -114,7 +114,6 @@ from fused_memory.middleware.done_provenance import (
 from fused_memory.middleware.followup_hold import (
     HOLDER_GATE_KEYS,
     HOLDER_MINT_SOURCE,
-    DuplicateFollowupHolderError,
     FollowupHolders,
     HoldEmit,
     HolderEdgeStripRefusedError,
@@ -4409,7 +4408,10 @@ class TaskInterceptor:
         birth carries ``human_decomposed``, only a marked finding-set member
         matches (plans/follow-up-filing-shape-prd.md §3 decision 9).
 
-        Returns ``{'task_id', 'status', 'planning_mode'}`` synchronously.
+        Returns ``{'task_id', 'status', 'planning_mode'}`` synchronously, plus
+        ``held_by``, the holder's id, when the birth was held. A failure of the
+        hold or of the insert returns ``{'error', 'error_type'}``, and the
+        submitted task is not created.
         """
         normalized_metadata: dict[str, Any]
         if metadata is None:
@@ -4454,9 +4456,6 @@ class TaskInterceptor:
                 held_kwargs, held_metadata, birth_holder = await hold_birth(
                     tm, project_root, self._followup_holders, kwargs, normalized_metadata,
                 )
-            except DuplicateFollowupHolderError as exc:
-                return {'error': str(exc), 'error_type': type(exc).__name__}
-            try:
                 add_result = await tm.add_task(
                     project_root=project_root,
                     metadata=json.dumps(held_metadata),
@@ -4484,7 +4483,7 @@ class TaskInterceptor:
                 }
             except Exception as exc:
                 logger.exception(
-                    'submit_task[planning_mode]: tm.add_task failed for project=%s',
+                    'submit_task[planning_mode]: the hold or tm.add_task failed for project=%s',
                     project_id,
                 )
                 return {'error': str(exc), 'error_type': type(exc).__name__}
@@ -4498,10 +4497,7 @@ class TaskInterceptor:
         )
         await self._journal(event)
         if birth_holder is not None:
-            await self._journal(self._make_event(
-                EventType.followup_held, project_root,
-                {'task_id': task_id_str, 'holder_id': str(birth_holder)},
-            ))
+            await self._journal_followup_held(project_root, task_id_str, birth_holder)
         await self._journal_creation_outcome(
             project_root=project_root,
             status=TicketStatus.CREATED,
@@ -4515,7 +4511,14 @@ class TaskInterceptor:
             'task_id': task_id_str,
             'status': 'deferred',
             'planning_mode': True,
+            **({} if birth_holder is None else {_HELD_BY_RESULT_KEY: str(birth_holder)}),
         }
+
+    async def _journal_followup_held(self, project_root: str, task_id: str, holder_id: int | str) -> None:
+        """The ``followup_held`` event of a birth :func:`hold_birth` held, from either creation path."""
+        await self._journal(self._make_event(
+            EventType.followup_held, project_root, {'task_id': task_id, 'holder_id': str(holder_id)},
+        ))
 
     async def resolve_ticket(
         self,
@@ -5907,11 +5910,9 @@ class TaskInterceptor:
                         )
                         await self._journal(event)
                         if result_dict is not None and _HELD_BY_RESULT_KEY in result_dict:
-                            await self._journal(self._make_event(
-                                EventType.followup_held,
-                                t.project_root,
-                                {'task_id': task_id, 'holder_id': result_dict[_HELD_BY_RESULT_KEY]},
-                            ))
+                            await self._journal_followup_held(
+                                t.project_root, task_id, result_dict[_HELD_BY_RESULT_KEY],
+                            )
 
                     self._signal_ticket_event(t.ticket_id)
 
