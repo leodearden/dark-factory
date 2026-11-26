@@ -13,11 +13,13 @@ from orchestrator.narrow_gate_class import (
     MergeGateResolution,
     MissReason,
 )
+from orchestrator.narrow_gate_config import NarrowMergeGateConfig
 from orchestrator.narrow_gate_delta import (
     classify_branch_change,
     classify_tree_delta,
     narrow_member_ids,
     read_tree_delta,
+    train_exclusions,
 )
 
 DOCS_PATHS = ['*.md', 'docs/**']
@@ -174,3 +176,24 @@ class TestBranchChange:
         }, DOCS_PATHS)
 
         assert members == frozenset({'1', '2'})
+
+    async def test_train_exclusions_are_the_narrow_members_while_the_gate_is_on(self, repo: LandingRepo) -> None:
+        for branch, files in (('task/docs', {'docs/a.md': 'reworded\n'}), ('task/code', {_PY: 'x = 3\n'})):
+            repo.git('checkout', '-q', '-b', branch, 'main')
+            repo.commit(branch, files)
+        repo.git('checkout', '-q', 'main')
+        gate = NarrowMergeGateConfig(enabled=True, docs_paths=DOCS_PATHS)
+
+        excluded = await train_exclusions(gate, repo.root, 'main', {'1': 'task/docs', '2': 'task/code'})
+
+        assert excluded == frozenset({'1'})
+
+    async def test_train_exclusions_read_no_git_while_the_gate_is_off(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        gate = NarrowMergeGateConfig(enabled=False, docs_paths=DOCS_PATHS)
+
+        excluded = await train_exclusions(gate, tmp_path / 'no-repo', 'main', {'1': 'task/docs'})
+
+        assert excluded == frozenset()
+        assert caplog.records == []

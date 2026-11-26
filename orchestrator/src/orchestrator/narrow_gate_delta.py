@@ -21,6 +21,7 @@ from orchestrator.narrow_gate_class import (
     full_gate,
     is_docs_path,
 )
+from orchestrator.narrow_gate_config import NarrowMergeGateConfig
 
 logger = logging.getLogger(__name__)
 
@@ -96,6 +97,18 @@ async def narrow_member_ids(
         else:
             raise result
     return frozenset(narrow)
+
+
+async def train_exclusions(
+    gate: NarrowMergeGateConfig, repo: Path, main_ref: str, branch_refs: Mapping[str, str],
+) -> frozenset[str]:
+    """The ids in *branch_refs* that must not ride a merge train because the gate would verify them narrowly; none, read from no git, while it is off."""
+    if not gate.enabled:
+        return frozenset()
+    excluded = await narrow_member_ids(repo, main_ref, branch_refs, gate.docs_paths)
+    if excluded:
+        logger.info('narrow gate: %s stay off any merge train', sorted(excluded))
+    return excluded
 
 
 async def _git_stdout(repo: Path, args: Sequence[str], *, input_text: str | None = None) -> str | None:

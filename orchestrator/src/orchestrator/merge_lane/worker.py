@@ -268,6 +268,7 @@ from orchestrator.merge_lane.verify_failure_outcome import (
 from orchestrator.merge_verify_facts import (
     ChainDepthReason,
 )
+from orchestrator.narrow_gate_delta import train_exclusions
 from orchestrator.scheduler import StaleEvidenceRejection
 from orchestrator.task_priority import TaskPriorityLookup
 from orchestrator.task_status import WORKFLOW_PRESERVE_STATUSES
@@ -10767,10 +10768,14 @@ class SpeculativeMergeWorker:
         ranges_by_id: dict[str, dict] = {
             tid: r for tid, r in zip(all_ids, range_results, strict=True)
         }
+        excluded = await train_exclusions(
+            orch_config.narrow_merge_gate, self._git_ops.project_root, self._git_ops.config.main_branch,
+            {c.task_id: c.branch.full_name for c in candidates},
+        )
 
         selected = select_train_members(
             anchor.task_id, other_ids, ranges_by_id,
-            orch_config.merge_train_max_members,
+            orch_config.merge_train_max_members, excluded=excluded,
         )
         if len(selected) < 2:
             # Signature already recorded above; no further work needed.

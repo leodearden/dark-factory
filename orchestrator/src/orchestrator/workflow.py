@@ -31,6 +31,7 @@ from escalation.classify import closed_by_non_sweep_resolver
 from escalation.dedupe import submit_or_dedupe
 from escalation.pins import is_queue_handoff, needs_human
 from pydantic import ValidationError
+from shared.branch_names import canonical_queued_branch_name
 from shared.cli_invoke import (
     PROGRESS_TIMEOUT_RESUME_PROMPT,
     AgentFailureKind,
@@ -195,6 +196,7 @@ from orchestrator.merge_lane.unmeasured_delivery import (
 )
 from orchestrator.merger_failure import merger_failure_report
 from orchestrator.module_charter import derive_modules, sanitize_files_for_persist
+from orchestrator.narrow_gate_delta import train_exclusions
 from orchestrator.plan_descope import (
     DoneStepIntegrityVerdict,
     check_done_step_integrity,
@@ -2340,10 +2342,14 @@ class TaskWorkflow:
         ranges_by_id: dict[str, dict[str, list[tuple[int, int]]]] = {
             cid: r for cid, r in zip(_all_range_ids, _range_results, strict=True)
         }
+        excluded = await train_exclusions(
+            self.config.narrow_merge_gate, self.git_ops.project_root, self.git_ops.config.main_branch,
+            {cid: canonical_queued_branch_name(cid, self.git_ops.config.branch_prefix) for cid in _all_range_ids},
+        )
 
         selected = select_train_members(
             self.task_id, candidate_ids, ranges_by_id,
-            self.config.merge_train_max_members,
+            self.config.merge_train_max_members, excluded=excluded,
         )
         if len(selected) < 2:
             # No viable train (no stackable candidates or lone anchor).
