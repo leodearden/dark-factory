@@ -29,7 +29,7 @@ from _merge_lane_fakes import (
     merge_through_lane,
     running_lane,
 )
-from _orch_helpers import git_env_with_ceiling
+from _orch_helpers import VERIFY_CLI_PER_TEST_TIMEOUT, git_env_with_ceiling
 
 from orchestrator.config import GitConfig, MergeScreenConfig, OrchestratorConfig
 from orchestrator.event_store import EventStore
@@ -51,7 +51,7 @@ from orchestrator.merge_lane.worker import (
     classify_and_merge,
 )
 
-pytestmark = pytest.mark.timeout(120)
+pytestmark = pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)
 
 FINDING = 'inline_suppressions: scripts/x.py:3 unowned suppression'
 

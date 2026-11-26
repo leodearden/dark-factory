@@ -17,8 +17,7 @@ from pathlib import Path
 
 import pytest
 import yaml
-from _orch_helpers import git_env_with_ceiling
-from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+from _orch_helpers import VERIFY_CLI_PER_TEST_TIMEOUT, git_env_with_ceiling
 
 from orchestrator.config import load_config
 from orchestrator.merge_lane.screen import run_screen
@@ -26,7 +25,7 @@ from orchestrator.merge_lane.screen import run_screen
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 pytestmark = [
-    pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT),
+    pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT),
     pytest.mark.xdist_group('merge_screen_manifest_live'),
 ]
 
