@@ -442,6 +442,21 @@ def test_a_live_tip_anchor_onto_an_already_dead_tip_is_a_new_class_violation():
     assert result.died_after_anchor == 1
 
 
+def test_a_red_tip_re_verified_green_before_the_anchor_is_live_again():
+    verify = [
+        ev(2, 'r', merge_sha='retried', passed=False),
+        ev(3, 'r', merge_sha='retried', passed=True),
+        ev(4, 's', merge_sha='still-red', passed=True),
+        ev(5, 's', merge_sha='still-red', passed=False),
+    ]
+    discards = [anchor(6, 'y', 'retried'), anchor(7, 'z', 'still-red')]
+
+    result = canary.frozen_tip_violations([], discards, verify)
+
+    assert result.violations == (('z', at(7), 'still-red'),)
+    assert result.died_after_anchor == 0
+
+
 def test_a_tip_recorded_dead_at_the_anchor_instant_is_not_earlier():
     voided = [anchor(5, 'x', 'tip'), anchor(5, 'k', None, reason='tip_dead', dead_link='tip')]
     result = canary.frozen_tip_violations(voided, [], [])

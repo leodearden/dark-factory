@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import statistics
 from collections import Counter, defaultdict
-from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence, Set
+from collections.abc import Callable, Iterable, Mapping, Sequence, Set
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
@@ -600,26 +600,42 @@ WORKTREE_LEDGER_PREFIX = 'unregistered on-disk merge worktree'
 Anchor = tuple[str, datetime, str]
 
 
-def _recorded_dead(
+@dataclass(frozen=True)
+class _DeathRecords:
+    """Where each tip was recorded dead: named by a void or discard row, or failed by a merge verify."""
+
+    discarded: Mapping[str, list[datetime]]
+    verdicts: Mapping[str, list[tuple[datetime, bool]]]
+
+    def dead_before(self, sha: str, moment: datetime) -> bool:
+        """Named dead earlier, or its latest verify verdict before *moment* failed."""
+        if any(t < moment for t in self.discarded.get(sha, ())):
+            return True
+        earlier = [verdict for verdict in self.verdicts.get(sha, ()) if verdict[0] < moment]
+        return bool(earlier) and not max(earlier)[1]
+
+    def dead_from(self, sha: str, moment: datetime) -> bool:
+        return any(t >= moment for t in self.discarded.get(sha, ())) or any(
+            t >= moment and not passed for t, passed in self.verdicts.get(sha, ())
+        )
+
+
+def _death_records(
     voided: Sequence[Event], discards: Sequence[Event], verify: Sequence[Event],
-) -> Iterator[tuple[object, datetime | None]]:
+) -> _DeathRecords:
+    discarded: dict[str, list[datetime]] = defaultdict(list)
     for event in (*voided, *discards):
-        data = _data(event)
-        yield data.get('dead_link'), _at(event)
-        yield data.get('item_commit'), _at(event)
+        moment, data = _at(event), _data(event)
+        for sha in (data.get('dead_link'), data.get('item_commit')):
+            if isinstance(sha, str) and sha and moment is not None:
+                discarded[sha].append(moment)
+    verdicts: dict[str, list[tuple[datetime, bool]]] = defaultdict(list)
     for event in verify:
-        if _data(event).get('passed') is False:
-            yield _data(event).get('merge_sha'), _at(event)
-
-
-def _first_recorded_dead(
-    voided: Sequence[Event], discards: Sequence[Event], verify: Sequence[Event],
-) -> dict[str, datetime]:
-    first: dict[str, datetime] = {}
-    for sha, moment in _recorded_dead(voided, discards, verify):
-        if isinstance(sha, str) and sha and moment is not None:
-            first[sha] = min(first.get(sha, moment), moment)
-    return first
+        moment, data = _at(event), _data(event)
+        sha, passed = data.get('merge_sha'), data.get('passed')
+        if isinstance(sha, str) and sha and moment is not None and isinstance(passed, bool):
+            verdicts[sha].append((moment, passed))
+    return _DeathRecords(discarded=discarded, verdicts=verdicts)
 
 
 def _anchors(rows: Iterable[Event]) -> list[Anchor]:
@@ -646,16 +662,17 @@ def frozen_tip_violations(
 
     An anchor is a ``verdict_voided`` or ``speculative_discard`` row with
     ``anchor_reason`` live_tip and a str ``anchor_base``. It violates when that
-    base was recorded dead STRICTLY EARLIER: a ``dead_link`` or ``item_commit``
-    of a void/discard row, or the ``merge_sha`` of a failed merge verify. A
-    base recorded dead only at or after the anchor is INV-3's adoption
-    backstop, counted in ``died_after_anchor``. The vacated-tip half of the
-    class has no event, so it is not measured here.
+    base was dead STRICTLY EARLIER: named as a ``dead_link`` or ``item_commit``
+    of a void/discard row, or failed by its latest merge verify before the
+    anchor (a red tree re-verified green is live again). A base recorded dead
+    only at or after the anchor is INV-3's adoption backstop, counted in
+    ``died_after_anchor``. The vacated-tip half of the class has no event, so
+    it is not measured here.
     """
-    dead_at = _first_recorded_dead(voided, discards, verify)
+    deaths = _death_records(voided, discards, verify)
     anchors = _anchors((*voided, *discards))
-    violations = tuple(a for a in anchors if a[2] in dead_at and dead_at[a[2]] < a[1])
-    died_after = sum(1 for a in anchors if a[2] in dead_at and dead_at[a[2]] >= a[1])
+    violations = tuple(a for a in anchors if deaths.dead_before(a[2], a[1]))
+    died_after = sum(1 for a in anchors if not deaths.dead_before(a[2], a[1]) and deaths.dead_from(a[2], a[1]))
     return FrozenTipResult(anchors=len(anchors), violations=violations, died_after_anchor=died_after)
 
 

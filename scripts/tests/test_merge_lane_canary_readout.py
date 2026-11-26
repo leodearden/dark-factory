@@ -124,8 +124,11 @@ def alpha_events(shas: dict[str, str]) -> list[dict[str, Any]]:
         row('merge_heartbeat', 60, None, occupancy={'leases': [{'host': 'laptop', 'activity': 'finished'}]}),
         row('merge_heartbeat', 65, None, occupancy={'leases': []}),
         row('phase_enter', 180, 't', 'verify'),
-        row('workflow_verify', 190, 't', passed=True),
-        row('phase_exit', 191, 't', 'verify'),
+        row('phase_exit', 190, 't', 'verify'),
+        row('workflow_verify', 190.5, 't', passed=True),
+        row('phase_enter', 200, 'u', 'verify'),
+        row('phase_exit', 210, 'u', 'verify'),
+        row('phase_enter', 220, 'u', 'execute'),
         row('merge_finalized', 24 * 60, 'late', 'merge', state='done', merge_sha='z' * 40,
             queue_to_land_secs=60.0),
     ]
@@ -179,7 +182,7 @@ def test_the_readout_values_follow_the_fixture(project, tmp_path):
     assert '| chain-attributed red-main episodes | 1 | = 0 | FALSE |' in text
     assert '| speculation accounting violations | 0 | = 0 | holds |' in text
     assert f'first red {shas["f2"][:12]}' in text
-    assert '- task verifies started on red: 1 of 1' in text
+    assert '- task verifies started on red: 2 of 2 (100.0%), 1 failed' in text
     assert '- direct_only: 1' in text
 
 

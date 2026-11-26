@@ -126,25 +126,35 @@ _GREEN_ROWS = (
 def load_task_verify_starts(conn: sqlite3.Connection, lo: datetime, hi: datetime) -> list[canary.TaskVerifyStart]:
     """Task verifies started in ``[lo, hi)``: ``phase_enter`` rows with phase verify.
 
-    One passed when a passed ``workflow_verify`` row for its task lands before
-    that verify's ``phase_exit``; it failed when the exit came without one, and
-    is undecided (None) when no exit is recorded. Exits and verdicts are read
-    to a day past *hi*, so a verify started near the end still resolves.
+    The workflow emits ``workflow_verify`` (only on a green verify) just AFTER
+    the verify's ``phase_exit``, so a verify passed when a passed row for its
+    task is stamped after its start and before the task's next verify start.
+    Without one it failed if its exit is recorded, and is undecided (None)
+    otherwise. Starts, exits and verdicts are read to a day past *hi*, so a
+    verify started near the end still resolves.
     """
     settle = hi + timedelta(days=1)
-    enters = _moments(conn, _PHASE_ROWS, ('phase_enter', 'verify', _iso(lo), _iso(hi)))
+    enters = _moments(conn, _PHASE_ROWS, ('phase_enter', 'verify', _iso(lo), _iso(settle)))
     exits = _moments(conn, _PHASE_ROWS, ('phase_exit', 'verify', _iso(lo), _iso(settle)))
     greens = _moments(conn, _GREEN_ROWS, (_iso(lo), _iso(settle)))
-    return [_task_verify_start(moment, task, exits, greens) for moment, task in enters]
+    return [_task_verify_start(moment, task, enters, exits, greens) for moment, task in enters if moment < hi]
+
+
+def _first_after(moments: Sequence[TaskMoment], task: str, after: datetime) -> datetime | None:
+    return min((t for t, k in moments if k == task and t > after), default=None)
 
 
 def _task_verify_start(
-    moment: datetime, task: str, exits: Sequence[TaskMoment], greens: Sequence[TaskMoment],
+    moment: datetime, task: str, enters: Sequence[TaskMoment], exits: Sequence[TaskMoment],
+    greens: Sequence[TaskMoment],
 ) -> canary.TaskVerifyStart:
-    exit_at = min((t for t, k in exits if k == task and t >= moment), default=None)
-    green = any(k == task and moment <= t and (exit_at is None or t <= exit_at) for t, k in greens)
-    passed = True if green else (None if exit_at is None else False)
-    return canary.TaskVerifyStart(task_id=task, at=moment, passed=passed)
+    next_start = _first_after(enters, task, moment)
+    green = _first_after(greens, task, moment)
+    exit_at = _first_after(exits, task, moment)
+    if green is not None and (next_start is None or green < next_start):
+        return canary.TaskVerifyStart(task_id=task, at=moment, passed=True)
+    exited = exit_at is not None and (next_start is None or exit_at < next_start)
+    return canary.TaskVerifyStart(task_id=task, at=moment, passed=False if exited else None)
 
 
 # ---------------------------------------------------------------------------
