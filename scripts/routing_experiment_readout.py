@@ -947,7 +947,8 @@ def _rule_line(report: Report) -> str:
     excluded = [f'{count} {reason}' for reason, count in report.exclusions.items()]
     return 'rule: ' + '; '.join([
         f'window [{start}, {end})',
-        f'population = the {len(report.tasks)} tasks with a task_results row completed in the window',
+        f'population = the {len(report.tasks)} tasks with a task_results row completed in the '
+        'window, less those excluded',
         _roots_clause(report.source, report.roots),
         f'key {settings.key.value}',
         f'split salt {settings.salt!r} buckets {settings.buckets}',
