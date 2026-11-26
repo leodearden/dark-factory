@@ -324,9 +324,7 @@ def tree_pass(request: pytest.FixtureRequest) -> TreePass:
 def briefing(tmp_path: Path) -> BriefingAssembler:
     """Minimal BriefingAssembler over a stub OrchestratorConfig (no I/O).
 
-    The suite's one shared ``briefing`` fixture: a test module that requests
-    ``briefing`` without defining its own gets this assembler, so no module
-    imports one.
+    The suite's one shared ``briefing``, so no test module imports one.
     """
     config = OrchestratorConfig(
         project_root=tmp_path,
@@ -586,12 +584,10 @@ def pytest_configure(config: pytest.Config) -> None:
     task worktree, where every git command this suite runs would resolve against
     the enclosing worktree's repo (task 3355, incident esc-3072-3).
 
-    It also arms the UsageGate probe-dir sweep confinement (task 6275),
-    importing ``shared.usage_gate`` here because a module-level import after
-    this file's ``sys.path`` setup would need a new ``E402`` suppression. For
-    the same reason it registers ``_orch_suite_fixtures`` as a plugin here, so
-    the suite-wide fixtures that need first-party imports are visible to every
-    test.
+    It also arms the UsageGate probe-dir sweep confinement (task 6275) and
+    registers the ``_orch_suite_fixtures`` fixture plugin, importing both here
+    because a module-level import after this file's ``sys.path`` setup would
+    need a new ``E402`` suppression.
 
     ``orchestrator/pyproject.toml``'s ``[tool.pytest.ini_options] markers``
     list is outside this task's locked scope, so the marker used by the
