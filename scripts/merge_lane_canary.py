@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import statistics
 from collections import Counter, defaultdict
-from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence, Set
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
@@ -682,3 +682,235 @@ def accounting_violations(records: Sequence[AuditRecord]) -> AccountingTally:
             1 for r in records if any(t.startswith(WORKTREE_LEDGER_PREFIX) for t in r.violations)
         ),
     )
+
+
+# ---------------------------------------------------------------------------
+# Main's history (from its reflog), the gate re-verify split, red-main
+# episodes (from the main-tip integrity sweep's journal verdicts) and the
+# verifies that started on a red main.
+# ---------------------------------------------------------------------------
+
+
+class CommitClass(StrEnum):
+    QUEUE = 'queue'
+    DIRECT = 'direct'
+
+
+@dataclass(frozen=True)
+class MainUpdate:
+    """One reflog update of main, with the first-parent commits it added, oldest first."""
+
+    at: datetime
+    new_sha: str
+    commits: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class CommitLedger:
+    classes: Mapping[str, CommitClass]
+    landed_at: Mapping[str, datetime]
+
+
+def classify_commits(updates: Sequence[MainUpdate], done_merge_shas: Set[str]) -> CommitLedger:
+    """Every commit of an update landing a done ``merge_sha`` is QUEUE, every other one DIRECT.
+
+    A queue landing's commits include a fast-forward landing's inner commits
+    (the 2026-11-20 ruling on gate 10572). A commit seen twice keeps its first update.
+    """
+    classes: dict[str, CommitClass] = {}
+    landed_at: dict[str, datetime] = {}
+    for update in sorted(updates, key=lambda u: u.at):
+        kind = CommitClass.QUEUE if update.new_sha in done_merge_shas else CommitClass.DIRECT
+        for sha in update.commits:
+            classes.setdefault(sha, kind)
+            landed_at.setdefault(sha, update.at)
+    return CommitLedger(classes=classes, landed_at=landed_at)
+
+
+class GateRange(StrEnum):
+    QUEUE_ONLY = 'queue_only'
+    DIRECT_ONLY = 'direct_only'
+    BOTH = 'both'
+    EMPTY = 'empty'
+    UNCLASSIFIED = 'unclassified'
+
+
+def rebase_range(gate_row: Event) -> tuple[str, str] | None:
+    """A gate row's ``(rebased_from, rebased_onto)``, or None when either is missing."""
+    data = _data(gate_row)
+    start, end = _str_or_none(data.get('rebased_from')), _str_or_none(data.get('rebased_onto'))
+    return None if start is None or end is None else (start, end)
+
+
+def _gate_range(commits: Sequence[str] | None, classes: Mapping[str, CommitClass]) -> GateRange:
+    if commits is None or any(sha not in classes for sha in commits):
+        return GateRange.UNCLASSIFIED
+    kinds = {classes[sha] for sha in commits}
+    if not kinds:
+        return GateRange.EMPTY
+    if len(kinds) > 1:
+        return GateRange.BOTH
+    return GateRange.QUEUE_ONLY if CommitClass.QUEUE in kinds else GateRange.DIRECT_ONLY
+
+
+def gate_reverify_split(
+    gate_rows: Sequence[Event],
+    range_commits: Mapping[tuple[str, str], Sequence[str]],
+    classes: Mapping[str, CommitClass],
+) -> dict[GateRange, int]:
+    """Re-verifying gates by what main gained under them: ``rebased_from..rebased_onto``.
+
+    A range with a commit main's ledger does not classify, or whose commits
+    could not be read, is UNCLASSIFIED rather than guessed.
+    """
+    tally = Counter(
+        _gate_range(None if (key := rebase_range(e)) is None else range_commits.get(key), classes)
+        for e in gate_rows if _reverifies(e)
+    )
+    return {kind: tally[kind] for kind in GateRange}
+
+
+@dataclass(frozen=True)
+class SweepVerdict:
+    """One main-tip integrity sweep: its swept SHA, verdict and, for a failure, whether it filed an L1."""
+
+    started_at: datetime
+    verdict_at: datetime
+    sha12: str
+    passed: bool
+    filed: bool | None
+
+
+@dataclass(frozen=True)
+class RedEpisode:
+    first_red_sha12: str
+    opening_sha12: str
+    green_sha12: str | None
+    candidate_after: datetime | None
+    start: datetime
+    end: datetime | None
+    red_verdicts: int
+
+
+@dataclass(frozen=True)
+class RedEpisodes:
+    episodes: tuple[RedEpisode, ...]
+    unconfirmed: int
+
+
+FailureRun = tuple[SweepVerdict | None, tuple[SweepVerdict, ...], SweepVerdict | None]
+
+
+def _failure_runs(ordered: Sequence[SweepVerdict]) -> list[FailureRun]:
+    """Each maximal run of failed verdicts, with the green verdicts before and after it."""
+    runs: list[FailureRun] = []
+    last_green: SweepVerdict | None = None
+    run: list[SweepVerdict] = []
+    for verdict in ordered:
+        if not verdict.passed:
+            run.append(verdict)
+            continue
+        if run:
+            runs.append((last_green, tuple(run), verdict))
+        last_green, run = verdict, []
+    if run:
+        runs.append((last_green, tuple(run), None))
+    return runs
+
+
+def _episode(failure_run: FailureRun, landed: Mapping[str, datetime]) -> RedEpisode | None:
+    last_green, run, green = failure_run
+    opening = next((v for v in run if v.filed is True), None)
+    if opening is None:
+        return None
+    return RedEpisode(
+        first_red_sha12=run[0].sha12, opening_sha12=opening.sha12,
+        green_sha12=None if green is None else green.sha12,
+        candidate_after=None if last_green is None else landed.get(last_green.sha12, last_green.started_at),
+        start=landed.get(run[0].sha12, run[0].started_at),
+        end=None if green is None else landed.get(green.sha12, green.verdict_at),
+        red_verdicts=len(run),
+    )
+
+
+def red_episodes(sweeps: Sequence[SweepVerdict], landed_at: Mapping[str, datetime]) -> RedEpisodes:
+    """Red-main episodes: a run of failed sweep verdicts holding a confirmed (L1-filed) failure.
+
+    The span runs from the landing of the run's first red swept SHA to the
+    landing of the next green swept SHA (*landed_at* is keyed by full SHA and
+    matched on the 12-char prefix), falling back to that sweep's start / verdict
+    instant. A run with no filed failure is stale or transient by the sweep's
+    own rule: it opens no episode, and every unconfirmed failure is counted.
+    """
+    landed = {sha[:12]: moment for sha, moment in landed_at.items()}
+    runs = _failure_runs(sorted(sweeps, key=lambda v: v.started_at))
+    return RedEpisodes(
+        episodes=tuple(ep for run in runs if (ep := _episode(run, landed)) is not None),
+        unconfirmed=sum(1 for v in sweeps if not v.passed and v.filed is False),
+    )
+
+
+@dataclass(frozen=True)
+class TaskVerifyStart:
+    task_id: str
+    at: datetime
+    passed: bool | None
+
+
+@dataclass(frozen=True)
+class StartedOnRed:
+    started: int
+    share: float | None
+    failed: int
+
+
+@dataclass(frozen=True)
+class RedStarts:
+    merge: StartedOnRed
+    task: StartedOnRed
+
+
+def _on_red(moment: datetime, episodes: Sequence[RedEpisode]) -> bool:
+    return any(ep.start <= moment and (ep.end is None or moment < ep.end) for ep in episodes)
+
+
+def _started_on_red(starts: Sequence[tuple[datetime, bool]], episodes: Sequence[RedEpisode]) -> StartedOnRed:
+    on_red = [failed for moment, failed in starts if _on_red(moment, episodes)]
+    return StartedOnRed(started=len(on_red), share=_share(len(on_red), len(starts)), failed=sum(on_red))
+
+
+def verifies_started_on_red(
+    episodes: Sequence[RedEpisode], verify: Sequence[Event], cancelled: Sequence[Event],
+    task_verifies: Sequence[TaskVerifyStart],
+) -> RedStarts:
+    """Merge and task verifies whose start falls in a red-main episode (a lower bound).
+
+    A merge verify starts at its timestamp less ``duration_ms`` (completed) or
+    ``elapsed_ms`` (cancelled); only a completed one with passed false fails.
+    """
+    merge_starts = [
+        (span[0], _data(e).get('passed') is False)
+        for e in verify if (span := _interval(e, 'duration_ms')) is not None
+    ] + [(span[0], False) for e in cancelled if (span := _interval(e, 'elapsed_ms')) is not None]
+    task_starts = [(t.at, t.passed is False) for t in task_verifies]
+    return RedStarts(
+        merge=_started_on_red(merge_starts, episodes), task=_started_on_red(task_starts, episodes),
+    )
+
+
+def _in_candidate_range(episode: RedEpisode, landed: datetime | None) -> bool:
+    return landed is not None and landed <= episode.start and (
+        episode.candidate_after is None or landed > episode.candidate_after
+    )
+
+
+def chain_attributed_episodes(
+    episodes: Sequence[RedEpisode], ledger: CommitLedger, chain_landing_shas: Iterable[str],
+) -> int:
+    """Episodes with a chain landing after the last green swept SHA and at or before the first red one.
+
+    Conservative: a chain landing in the range need not be the cause, so this
+    can only over-attribute.
+    """
+    landings_at = [ledger.landed_at.get(sha) for sha in chain_landing_shas]
+    return sum(1 for ep in episodes if any(_in_candidate_range(ep, t) for t in landings_at))
