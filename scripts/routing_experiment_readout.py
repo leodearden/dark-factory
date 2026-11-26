@@ -529,6 +529,50 @@ def load_fleet(
     return FleetLoad.combined(load_project(root, window, salt, buckets, key) for root in roots)
 
 
+# Experiment 1's affected population: plans/routing-experiment-substrate-prd.md
+# §"Experiment 1" (arm 1 plans with exactly 3 modules and fewer than 12 steps).
+EXACT_3_MODULES_PLAN_MODULES = 3
+EXACT_3_MODULES_MAX_STEPS_EXCLUSIVE = 12
+_SUBSET_DEFINITIONS = {
+    Subset.ALL: Subset.ALL.value,
+    Subset.EXACT_3_MODULES: (
+        f'{Subset.EXACT_3_MODULES.value} (plan_modules == {EXACT_3_MODULES_PLAN_MODULES} '
+        f'and plan_steps < {EXACT_3_MODULES_MAX_STEPS_EXCLUSIVE})'
+    ),
+}
+
+
+def _subset_exclusion(record: TaskRecord, subset: Subset) -> str | None:
+    """Why *record* falls outside *subset*, or None when it is in it."""
+    if subset is Subset.ALL:
+        return None
+    if record.plan_modules is None or record.plan_steps is None:
+        return 'no plan shape'
+    if record.plan_modules != EXACT_3_MODULES_PLAN_MODULES:
+        return f'plan_modules != {EXACT_3_MODULES_PLAN_MODULES}'
+    if record.plan_steps >= EXACT_3_MODULES_MAX_STEPS_EXCLUSIVE:
+        return f'plan_steps >= {EXACT_3_MODULES_MAX_STEPS_EXCLUSIVE}'
+    return None
+
+
+def select_subset(load: FleetLoad, subset: Subset) -> tuple[tuple[TaskRecord, ...], dict[str, int]]:
+    """The records inside *subset*, and every exclusion so far counted by reason."""
+    kept: list[TaskRecord] = []
+    exclusions = Counter(load.exclusions)
+    for record in load.records:
+        reason = _subset_exclusion(record, subset)
+        if reason is None:
+            kept.append(record)
+        else:
+            exclusions[reason] += 1
+    return tuple(kept), dict(sorted(exclusions.items()))
+
+
+def subset_unproven(subset: Subset, evidence: ProducerEvidence) -> bool:
+    """A plan-shape subset with no plan-shape producer row cannot be formed at all."""
+    return subset is not Subset.ALL and not evidence.plan_shape_decisions
+
+
 MIN_ELIGIBLE_PER_ARM = 20  # seat N's prototype floor: below it an arm gets no null
 _MDE_Z = NormalDist().inv_cdf(0.95) + NormalDist().inv_cdf(0.80)
 
@@ -862,6 +906,8 @@ class Settings:
     subset: Subset
     resamples: int
     seed: int
+    aa: bool
+    expect_rules: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -905,7 +951,7 @@ def _rule_line(report: Report) -> str:
         _roots_clause(report.source, report.roots),
         f'key {settings.key.value}',
         f'split salt {settings.salt!r} buckets {settings.buckets}',
-        f'subset {settings.subset.value}',
+        f'subset {_SUBSET_DEFINITIONS[settings.subset]}',
         f'excluded {_listing(excluded)}',
         f'null = {settings.resamples} permutations of the observed arm labels (seed '
         f'{settings.seed}), arm sizes kept, one permutation shared by every metric',
@@ -918,12 +964,20 @@ def _rule_line(report: Report) -> str:
     ])
 
 
+NO_PRODUCER_ROW = 'no producer row in window'
+
+
+def _produced(count: int) -> str:
+    """A producer count, where zero means the producer wrote nothing, never a healthy 0."""
+    return str(count) if count else NO_PRODUCER_ROW
+
+
 def _producers_line(evidence: ProducerEvidence) -> str:
-    rule_ids = [f'{rule_id}={count}' for rule_id, count in evidence.rule_id_counts.items()]
+    rule_ids = ', '.join(f'{rule_id}={count}' for rule_id, count in evidence.rule_id_counts.items())
     return 'producers: ' + '; '.join([
-        f'routing_decision rule ids {_listing(rule_ids)}',
-        f'implementer decisions carrying plan shape {evidence.plan_shape_decisions}',
-        f'tasks carrying {CURATOR_HINT_KEY} {evidence.hinted_tasks}',
+        f'routing_decision rule ids: {rule_ids or NO_PRODUCER_ROW}',
+        f'implementer decisions carrying plan shape: {_produced(evidence.plan_shape_decisions)}',
+        f'tasks carrying {CURATOR_HINT_KEY}: {_produced(evidence.hinted_tasks)}',
     ])
 
 
@@ -1003,13 +1057,13 @@ def _verdict_section(verdict: AAVerdict) -> list[str]:
 
 
 def render_text(report: Report) -> str:
-    lines = [
-        _rule_line(report),
-        _producers_line(report.evidence),
-        _arm_sizes_line(report),
-        *(line for comparison in report.comparisons for line in _comparison_table(comparison)),
-        *(_verdict_section(report.verdict) if report.verdict is not None else ()),
-    ]
+    """The rule and producers lines, then (unless no comparison was computed) the tables."""
+    lines = [_rule_line(report), _producers_line(report.evidence)]
+    if report.comparisons:
+        lines.append(_arm_sizes_line(report))
+        lines.extend(line for comparison in report.comparisons for line in _comparison_table(comparison))
+    if report.verdict is not None:
+        lines.extend(_verdict_section(report.verdict))
     return '\n'.join(lines) + '\n'
 
 
@@ -1033,12 +1087,37 @@ def _warn(message: str) -> None:
     print(f'routing_experiment_readout: {message}', file=sys.stderr)
 
 
-def _exit_status(verdict: AAVerdict | None) -> int:
-    if verdict is None:
-        return EXIT_OK
-    if verdict.skewed:
+def build_report(settings: Settings, source: RootSource, load: FleetLoad) -> Report:
+    """The report over *load*: no comparison when the subset cannot be formed."""
+    tasks, exclusions = select_subset(load, settings.subset)
+    comparisons = () if subset_unproven(settings.subset, load.evidence) else compare_arms(
+        tasks, METRICS, settings.buckets, settings.resamples, random.Random(settings.seed)
+    )
+    verdict = aa_verdict(comparisons) if settings.aa and comparisons else None
+    return Report(
+        settings, source, load.roots, load.evidence, exclusions, tasks, comparisons, verdict,
+    )
+
+
+def unproven_reasons(settings: Settings, evidence: ProducerEvidence) -> list[str]:
+    """Each producer precondition of the report's claims that the window does not meet."""
+    reasons = [
+        f'no routing_decision in the window carries rule id {rule_id!r}'
+        for rule_id in settings.expect_rules if rule_id not in evidence.rule_id_counts
+    ]
+    if subset_unproven(settings.subset, evidence):
+        reasons.append(
+            f'--subset {settings.subset.value} needs plan_steps/plan_modules on implementer '
+            f'routing_decision events, and they have {NO_PRODUCER_ROW}; no table computed'
+        )
+    return reasons
+
+
+def _exit_status(verdict: AAVerdict | None, unproven: bool) -> int:
+    """A skew is reported first; then anything unproven; otherwise ok."""
+    if verdict is not None and verdict.skewed:
         return EXIT_AA_SKEWED
-    if verdict.uncertified:
+    if unproven or (verdict is not None and verdict.uncertified):
         return EXIT_UNPROVEN
     return EXIT_OK
 
@@ -1052,6 +1131,20 @@ def _warn_unread_stores(statuses: Iterable[RootStatus]) -> None:
                 f'{status.root}: {status.tasks_db_problem}; complexity, curator hint and '
                 'candidate_key read as absent'
             )
+
+
+def _settings(args: argparse.Namespace) -> Settings:
+    return Settings(
+        window=Window.trailing(args.until or datetime.now(UTC), args.days),
+        salt=args.salt,
+        buckets=args.buckets,
+        key=args.key,
+        subset=args.subset,
+        resamples=args.resamples,
+        seed=args.seed,
+        aa=args.aa,
+        expect_rules=tuple(args.expect_rule),
+    )
 
 
 def main(
@@ -1068,16 +1161,8 @@ def main(
             f'install {FUSED_MEMORY_UNIT} with it in its Environment='
         )
         return EXIT_NOTHING_READ
-    settings = Settings(
-        Window.trailing(args.until or datetime.now(UTC), args.days),
-        args.salt,
-        args.buckets,
-        args.key,
-        args.subset,
-        args.resamples,
-        args.seed,
-    )
-    load = load_fleet(selection.roots, settings.window, args.salt, args.buckets, args.key)
+    settings = _settings(args)
+    load = load_fleet(selection.roots, settings.window, settings.salt, settings.buckets, settings.key)
     _warn_unread_stores(load.roots)
     if not any(status.read for status in load.roots):
         _warn(
@@ -1085,24 +1170,12 @@ def main(
             f'{selection.source.value}'
         )
         return EXIT_NOTHING_READ
-    comparisons = compare_arms(
-        load.records, METRICS, args.buckets, args.resamples, random.Random(args.seed)
-    )
-    report = Report(
-        settings,
-        selection.source,
-        load.roots,
-        load.evidence,
-        load.exclusions,
-        load.records,
-        comparisons,
-        aa_verdict(comparisons) if args.aa else None,
-    )
+    report = build_report(settings, selection.source, load)
     sys.stdout.write(render_json(report) if args.json else render_text(report))
-    if report.verdict is not None:
-        for line in verdict_lines(report.verdict):
-            _warn(line)
-    return _exit_status(report.verdict)
+    unproven = unproven_reasons(settings, load.evidence)
+    for line in [*(verdict_lines(report.verdict) if report.verdict else ()), *unproven]:
+        _warn(line)
+    return _exit_status(report.verdict, bool(unproven))
 
 
 if __name__ == '__main__':
