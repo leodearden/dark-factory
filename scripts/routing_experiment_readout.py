@@ -35,7 +35,7 @@ from enum import Enum
 from operator import itemgetter
 from pathlib import Path
 from statistics import NormalDist
-from typing import Any
+from typing import Protocol, TypeVar
 
 import _checkout as _checkout
 from _task_db_scan import UNREADABLE_STORE_ERRORS, decode_metadata
@@ -672,7 +672,11 @@ def aa_verdict(comparisons: Iterable[Comparison]) -> AAVerdict:
 
 
 _ArmSums = tuple[int, float]  # an arm's eligible task count and its value total
-_Picker = Callable[[Sequence[Any]], tuple[Any, ...]]
+_T = TypeVar("_T")
+
+
+class _Picker(Protocol):
+    def __call__(self, column: Sequence[_T], /) -> tuple[_T, ...]: ...
 
 
 def _picker(members: Sequence[int]) -> _Picker:
