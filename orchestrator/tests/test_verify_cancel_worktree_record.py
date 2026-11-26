@@ -13,7 +13,10 @@ import sys
 from collections.abc import Callable, Iterator
 from pathlib import Path
 
+import pytest
+
 from orchestrator.verify_cancel import (
+    KILLED_RUN_LOCK_RELEASE_SECS,
     acquire_merge_verify_flock,
     cancel_request,
     lane_lock_path,
@@ -315,3 +318,35 @@ class TestCancelRequestWaitsForTheKilledHolder:
         assert rc == 0
         assert remover.calls == [wt]
         assert clock.sleeps == []
+
+    def test_a_holder_that_outlives_the_bound_is_reported_and_still_handed_to_the_remover(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        wt = tmp_path / 'wt' / '_merge-stuck'
+        wt.parent.mkdir(parents=True)
+        pgf = pgid_file(tmp_path / 'wt', 'req-stuck')
+        remover = _LockProbingRemover(lane_lock_path(wt))
+        clock = _VirtualClock()
+
+        with _foreign_lane_holder(lane_lock_path(wt)) as child:
+            write_pgid_file(pgf, child.pid)
+            write_worktree_path(pgf, wt)
+
+            rc = cancel_request(
+                pgf,
+                ppid_map_provider=dict,
+                kill=_ignore_signal,
+                killpg=_ignore_signal,
+                remove_worktree=remover,
+                monotonic=clock.monotonic,
+                sleep=clock.sleep,
+            )
+
+        assert rc == 0
+        assert remover.calls == [wt]
+        assert remover.lock_free_at_call == [False]
+        assert clock.now >= KILLED_RUN_LOCK_RELEASE_SECS
+        assert not worktree_path_file(pgf).exists()
+        err = capsys.readouterr().err
+        assert str(child.pid) in err
+        assert str(lane_lock_path(wt)) in err
