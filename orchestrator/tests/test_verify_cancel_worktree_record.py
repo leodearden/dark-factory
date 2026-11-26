@@ -7,12 +7,19 @@ removes its worktree; the record is what lets ``cancel_request`` reap it
 
 from __future__ import annotations
 
+import contextlib
+import subprocess
+import sys
+from collections.abc import Callable, Iterator
 from pathlib import Path
 
 from orchestrator.verify_cancel import (
+    acquire_merge_verify_flock,
     cancel_request,
+    lane_lock_path,
     pgid_file,
     read_worktree_path,
+    release_merge_verify_flock,
     remove_worktree_path,
     worktree_path_file,
     write_pgid_file,
@@ -181,3 +188,130 @@ class TestCancelRequestReapsRecordedWorktree:
 
         assert rc == 0
         assert read_worktree_path(pgf) == tmp_path / 'wt' / '_merge-f'
+
+
+_HOLDER_SCRIPT = (
+    'import fcntl, os, sys, time\n'
+    'fd = os.open(sys.argv[1], os.O_RDWR | os.O_CREAT)\n'
+    'fcntl.flock(fd, fcntl.LOCK_EX)\n'
+    "print('locked', flush=True)\n"
+    'time.sleep(300)\n'
+)
+
+
+@contextlib.contextmanager
+def _foreign_lane_holder(lock_path: Path) -> Iterator[subprocess.Popen[bytes]]:
+    """A child process that holds an exclusive flock on *lock_path* until killed."""
+    child = subprocess.Popen(
+        [sys.executable, '-c', _HOLDER_SCRIPT, str(lock_path)], stdout=subprocess.PIPE,
+    )
+    try:
+        assert child.stdout is not None
+        assert child.stdout.readline() == b'locked\n', 'the holder child never took the lock'
+        yield child
+    finally:
+        if child.poll() is None:
+            child.kill()
+        child.wait()
+        if child.stdout is not None:
+            child.stdout.close()
+
+
+class _VirtualClock:
+    """Injected ``monotonic``/``sleep``: each sleep advances ``now`` and is recorded."""
+
+    def __init__(self, on_first_sleep: Callable[[], None] | None = None) -> None:
+        self.now = 0.0
+        self.sleeps: list[float] = []
+        self._on_first_sleep = on_first_sleep
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def sleep(self, secs: float) -> None:
+        self.sleeps.append(secs)
+        self.now += secs
+        callback, self._on_first_sleep = self._on_first_sleep, None
+        if callback is not None:
+            callback()
+
+
+class _LockProbingRemover:
+    """A ``remove_worktree`` double that notes whether the lane flock was free."""
+
+    def __init__(self, lock_path: Path) -> None:
+        self.lock_path = lock_path
+        self.calls: list[Path] = []
+        self.lock_free_at_call: list[bool] = []
+
+    def __call__(self, worktree: Path) -> None:
+        self.calls.append(worktree)
+        fd = acquire_merge_verify_flock(self.lock_path, 0.0)
+        self.lock_free_at_call.append(fd is not None)
+        if fd is not None:
+            release_merge_verify_flock(fd)
+
+
+def _kill_and_reap(child: subprocess.Popen[bytes]) -> Callable[[], None]:
+    def finish_the_kill() -> None:
+        child.kill()
+        child.wait()
+    return finish_the_kill
+
+
+class TestCancelRequestWaitsForTheKilledHolder:
+    def test_reaps_only_after_the_killed_holder_releases_the_lane_lock(
+        self, tmp_path: Path,
+    ) -> None:
+        wt = tmp_path / 'wt' / '_merge-held'
+        wt.parent.mkdir(parents=True)
+        pgf = pgid_file(tmp_path / 'wt', 'req-held')
+        remover = _LockProbingRemover(lane_lock_path(wt))
+        out: list[int] = []
+
+        with _foreign_lane_holder(lane_lock_path(wt)) as child:
+            write_pgid_file(pgf, child.pid)
+            write_worktree_path(pgf, wt)
+            clock = _VirtualClock(on_first_sleep=_kill_and_reap(child))
+
+            rc = cancel_request(
+                pgf,
+                ppid_map_provider=dict,
+                kill=_ignore_signal,
+                killpg=_ignore_signal,
+                killed_pgid_out=out,
+                remove_worktree=remover,
+                monotonic=clock.monotonic,
+                sleep=clock.sleep,
+            )
+
+        assert rc == 0
+        assert remover.calls == [wt]
+        assert remover.lock_free_at_call == [True]
+        assert clock.sleeps != []
+        assert not worktree_path_file(pgf).exists()
+        assert out == [child.pid]
+
+    def test_no_wait_when_the_recorded_worktree_has_no_lane_lock(
+        self, tmp_path: Path,
+    ) -> None:
+        pgf = pgid_file(tmp_path / 'wt', 'req-unlocked')
+        write_pgid_file(pgf, 4242)
+        wt = tmp_path / 'wt' / '_merge-unlocked'
+        write_worktree_path(pgf, wt)
+        remover = _RecordingRemover(pgf)
+        clock = _VirtualClock()
+
+        rc = cancel_request(
+            pgf,
+            ppid_map_provider=dict,
+            kill=_ignore_signal,
+            killpg=_ignore_signal,
+            remove_worktree=remover,
+            monotonic=clock.monotonic,
+            sleep=clock.sleep,
+        )
+
+        assert rc == 0
+        assert remover.calls == [wt]
+        assert clock.sleeps == []
