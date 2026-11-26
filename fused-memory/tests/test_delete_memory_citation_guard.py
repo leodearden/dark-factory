@@ -2290,6 +2290,44 @@ class TestMissingTargetIsRefusedBeforeAnyCitationPass:
         assert not [r for r in caplog.records if 'dangling' in r.getMessage()]
         service.delete_memory.assert_not_awaited()
 
+    @pytest.mark.parametrize('override', [None, 'yes'])
+    @pytest.mark.asyncio
+    async def test_a_plain_delete_of_a_missing_cited_target_is_not_offered_an_escape(
+        self, interceptor, override,
+    ):
+        """A citation refusal would advertise replacement_memory_id and
+        allow_dangling_citations; either retry meets ``MemoryNotFound``, so
+        that is the refusal given first."""
+        service = _make_service(missing=[DOOMED])
+        mcp_server = self._server(service, interceptor)
+        extra = {} if override is None else {'metadata': {'allow_dangling_citations': override}}
+
+        result = await _call_delete(mcp_server, **extra)
+
+        assert result['error_type'] == 'MemoryNotFound'
+        assert result['id'] == DOOMED
+        assert 'citing_tasks' not in result
+        if override is not None:
+            assert result['ignored_override']['allow_dangling_citations'] == override
+            assert 'Resend it as JSON true' not in result['hint']
+        interceptor.update_task.assert_not_awaited()
+        service.delete_memory.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_an_uncited_plain_delete_pays_for_no_existence_probe(self):
+        """The probe is charged on the refusal path only; the service settles
+        existence itself for a delete the gate lets through."""
+        service = _make_service()
+        interceptor = _make_interceptor([
+            _task('1803', 'pending', {'unrelated': 'nothing'}),
+        ])
+
+        result = await _call_delete(self._server(service, interceptor))
+
+        assert result['status'] == 'deleted'
+        service.memory_exists.assert_not_awaited()
+        service.delete_memory.assert_awaited_once()
+
     @pytest.mark.asyncio
     async def test_an_existing_target_still_repoints_and_deletes(self, interceptor):
         """Positive control: the probe answering True leaves the path as it was."""

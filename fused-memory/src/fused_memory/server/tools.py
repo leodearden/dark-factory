@@ -5956,9 +5956,10 @@ def create_mcp_server(
             # service's own order. A plain uncited delete — the common path,
             # and every one of the six in-repo recon callers — pays nothing
             # extra.
-            if _citation_gate_applies(store, project_id) and (
+            gate_can_mutate = _citation_gate_applies(store, project_id) and (
                 replacement_memory_id is not None or allow_dangling_citations
-            ):
+            )
+            if gate_can_mutate:
                 rejection = await _missing_target_refusal(
                     resolved_id, store, project_id
                 )
@@ -5971,6 +5972,15 @@ def create_mcp_server(
                     resolved_id, store, project_id, agent_id, replacement_memory_id,
                     allow_dangling_citations=allow_dangling_citations,
                 )
+                # A plain delete the gate refused advertises the escapes, and
+                # for a target that does not exist every one of them retries
+                # into MemoryNotFound. So that refusal is given first; the
+                # probe runs on this refusal path only.
+                if rejection is not None and not gate_can_mutate:
+                    rejection = (
+                        await _missing_target_refusal(resolved_id, store, project_id)
+                        or rejection
+                    )
         if rejection:
             # The `is True` strictness above is right, but dropping a
             # non-conforming value in SILENCE is not: the caller would get back
