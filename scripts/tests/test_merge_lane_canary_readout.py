@@ -17,8 +17,11 @@ import merge_lane_canary as canary
 import merge_lane_canary_readout as readout
 import pytest
 from shared.project_layout import runs_db
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
-LO = datetime(2026, 11, 20, 0, 0, tzinfo=UTC)
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
+
+LO =datetime(2026, 11, 20, 0, 0, tzinfo=UTC)
 HI = LO + timedelta(days=1)
 WINDOW = f'{LO.isoformat()}..{HI.isoformat()}'
 
