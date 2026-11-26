@@ -51,6 +51,11 @@ logger = logging.getLogger(__name__)
 FALLBACK_AFTER_ATTEMPTS: Final = 5
 MAX_BACKOFF_SECONDS: Final = 300
 
+_UNCONVERGED_LINE: Final = '%s not converged: %s refused (%s, %s), %s after %d attempts'
+_STALLED_LINE: Final = (
+    '%s stalled: %s refused (%s, %s), %s after %d attempts; it is retried every pass and needs an operator'
+)
+
 _COUNTED: Final = frozenset({Disposition.FALLBACK, Disposition.RETRY_THEN_FALLBACK})
 _DEFERRED: Final = TaskStatus.DEFERRED
 _TERMINAL: Final = frozenset({TaskStatus.DONE, TaskStatus.CANCELLED})
@@ -61,7 +66,7 @@ _WITHDRAWABLE: Final = frozenset(
 
 
 class Unconverged(BaseModel):
-    """A ref the pass could not bring to its final state, and the refusal that stopped it."""
+    """A ref the pass could not bring to its final state, the refusal that stopped it, and whether its attempts reached the stall bound."""
 
     model_config = ConfigDict(frozen=True, extra='forbid')
 
@@ -71,6 +76,7 @@ class Unconverged(BaseModel):
     code: str
     disposition: Disposition
     attempts: int
+    stalled: bool
 
 
 class PassReport(BaseModel):
@@ -324,6 +330,7 @@ def _unconverged(ref: str, refused: ToolRefused, record: RefRecord | None) -> Un
         code=refused.code,
         disposition=refused.disposition,
         attempts=0 if record is None else record.attempts,
+        stalled=record is not None and record.stalled,
     )
 
 
@@ -436,16 +443,10 @@ def run_pass(policy: Policy, tools: ClosedTools, cursor: FilerCursor) -> tuple[P
 
 
 def _log_unconverged(report: PassReport) -> None:
+    """One line per unconverged ref each pass: a WARNING, or an ERROR naming an operator once the ref is stalled."""
     for item in report.unconverged:
-        logger.warning(
-            '%s not converged: %s refused (%s, %s), %s after %d attempts',
-            item.ref,
-            item.tool,
-            item.kind,
-            item.code,
-            item.disposition,
-            item.attempts,
-        )
+        level, line = (logging.ERROR, _STALLED_LINE) if item.stalled else (logging.WARNING, _UNCONVERGED_LINE)
+        logger.log(level, line, item.ref, item.tool, item.kind, item.code, item.disposition, item.attempts)
 
 
 def file_once(policy: Policy, *, open_tools: OpenTools) -> PassReport:

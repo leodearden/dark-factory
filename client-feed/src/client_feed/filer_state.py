@@ -22,6 +22,7 @@ logger = logging.getLogger(__name__)
 
 LOCK_NAME: Final = 'filer.lock'
 CURSOR_NAME: Final = 'cursor.json'
+STALLED_AFTER_ATTEMPTS: Final = 5
 _STATE_DIR_MODE: Final = 0o700
 _LOCK_MODE: Final = 0o600
 
@@ -35,6 +36,11 @@ class RefRecord(BaseModel):
     last_tool: Token | None = None
     last_code: Token
     fallback: FilerFallback | None = None
+
+    @property
+    def stalled(self) -> bool:
+        """Refused often enough that retrying alone will not converge it: an operator must look."""
+        return self.attempts >= STALLED_AFTER_ATTEMPTS
 
 
 class FilerCursor(BaseModel):
