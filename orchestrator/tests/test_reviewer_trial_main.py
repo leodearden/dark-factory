@@ -893,3 +893,10 @@ class TestCampaignRound2ArmsAndTurnCap:
         assert 'variant_codex_sol99' in result.output
         assert 'variant_codex_sol62' in result.output
         assert fake.awaits == []
+
+    def test_a_repeated_arm_is_a_usage_error_naming_it(self, tmp_path: Path) -> None:
+        result, fake = self._invoke(tmp_path, '--arms', 'variant_a,variant_a_xhigh,variant_a')
+
+        assert result.exit_code == 2, f'{result.output}\n{result.exception!r}'
+        assert 'each arm runs once; repeated: variant_a' in result.output
+        assert fake.awaits == []

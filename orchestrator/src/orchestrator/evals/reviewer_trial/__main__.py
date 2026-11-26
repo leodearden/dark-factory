@@ -33,6 +33,8 @@ from orchestrator.main_checkout_defaults import cli_default
 from orchestrator.review_payload import Verdict, normalize_review
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     from .corpus import CorpusDiff, CorpusManifest
     from .scorer import ScoringResult
     from .variants import VariantConfig
@@ -900,6 +902,20 @@ def refresh_trial(max_parallel: int, stagger: float, report_dir: Path | None) ->
 # the same fixtures for N trials, scored, reduced by campaign.py.
 # ---------------------------------------------------------------------------
 
+def _comma_names(value: str, known: Sequence[str], noun: str) -> list[str]:
+    """*value*'s comma-separated names, in order; a usage error unless each is one of *known*, given once."""
+    names = [name.strip() for name in value.split(',') if name.strip()]
+    unknown = [name for name in names if name not in known]
+    if unknown or not names:
+        raise click.BadParameter(
+            f'{", ".join(unknown) or "(none)"}: each must be one of {", ".join(known)}',
+        )
+    repeated = sorted({name for name in names if names.count(name) > 1})
+    if repeated:
+        raise click.BadParameter(f'each {noun} runs once; repeated: {", ".join(repeated)}')
+    return names
+
+
 def _parse_briefings(
     _ctx: click.Context, _param: click.Parameter, value: str,
 ) -> list[ReviewBriefing]:
@@ -910,16 +926,7 @@ def _parse_briefings(
     before diff-only would invert the gate. A repeat would collide on its
     result paths.
     """
-    valid = [b.value for b in ReviewBriefing]
-    names = [name.strip() for name in value.split(',') if name.strip()]
-    unknown = [name for name in names if name not in valid]
-    if unknown or not names:
-        raise click.BadParameter(
-            f'{", ".join(unknown) or "(none)"}: each must be one of {", ".join(valid)}',
-        )
-    repeated = sorted({name for name in names if names.count(name) > 1})
-    if repeated:
-        raise click.BadParameter(f'each generation runs once; repeated: {", ".join(repeated)}')
+    names = _comma_names(value, [b.value for b in ReviewBriefing], 'generation')
     briefings = [ReviewBriefing(name) for name in names]
     if ReviewBriefing.DIFF_ONLY in briefings and briefings[0] is not ReviewBriefing.DIFF_ONLY:
         raise click.BadParameter(
@@ -932,18 +939,15 @@ def _parse_briefings(
 def _parse_arms(
     _ctx: click.Context, _param: click.Parameter, value: str | None,
 ) -> list[VariantConfig]:
-    """The named campaign arms, in the order given; the evidence set when none is named."""
+    """The named campaign arms, each once, in the order given; the evidence set when none is named.
+
+    A repeat would collide on its result paths.
+    """
     from .variants import CAMPAIGN_VARIANTS, FABLE_EVIDENCE_VARIANTS
 
     if value is None:
         return list(FABLE_EVIDENCE_VARIANTS)
-    names = [name.strip() for name in value.split(',') if name.strip()]
-    unknown = [name for name in names if name not in CAMPAIGN_VARIANTS]
-    if unknown or not names:
-        raise click.BadParameter(
-            f'{", ".join(unknown) or "(none)"}: each must be one of {", ".join(sorted(CAMPAIGN_VARIANTS))}',
-        )
-    return [CAMPAIGN_VARIANTS[name] for name in names]
+    return [CAMPAIGN_VARIANTS[name] for name in _comma_names(value, sorted(CAMPAIGN_VARIANTS), 'arm')]
 
 
 @cli.command('campaign')
