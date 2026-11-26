@@ -13,7 +13,8 @@ import contextlib
 import json
 import shutil
 from collections.abc import Callable, Iterator, Mapping
-from datetime import UTC, datetime
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Literal
 
@@ -27,6 +28,7 @@ from client_feed.filer_tasks import FIX_TITLE, GATE_TITLE, RESTATED_HEADING
 from client_feed.filer_tools import FILER_IDENTITY, WRITE_TOOLS, OpenTools, ToolCaller, open_session
 from client_feed.policy import Policy
 from client_feed.publisher import run_pass
+from shared.mcp_markup_middleware import MARKUP_UNREPAIRABLE_ERROR_TYPE
 from shared.toolcall_markup import CANONICAL_OPENER_PREFIX, closer_for
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
@@ -76,17 +78,15 @@ class CrashingCaller:
         self._seen = 0
 
     def call_tool(self, name: str, arguments: Mapping[str, Any]) -> dict[str, Any]:
-        crashes = name == self._tool and self._count() == self._nth
+        if name == self._tool:
+            self._seen += 1
+        crashes = name == self._tool and self._seen == self._nth
         if crashes and self._when == 'before':
             raise SimulatedCrash(f'before {name} #{self._nth}')
         reply = self._caller.call_tool(name, arguments)
         if crashes:
             raise SimulatedCrash(f'after {name} #{self._nth}')
         return reply
-
-    def _count(self) -> int:
-        self._seen += 1
-        return self._seen
 
 
 def over_session(wrap: Callable[[ToolCaller], ToolCaller]) -> OpenTools:
@@ -98,6 +98,33 @@ def over_session(wrap: Callable[[ToolCaller], ToolCaller]) -> OpenTools:
             yield wrap(session)
 
     return open_tools
+
+
+@dataclass(frozen=True)
+class Rows:
+    """One get_tasks read of the store: every task row, and the filer's fixes and gates among them."""
+
+    tasks: tuple[dict[str, Any], ...]
+
+    @property
+    def fixes(self) -> list[dict[str, Any]]:
+        return [
+            task
+            for task in self.tasks
+            if task['metadata'].get('source') == FILER_IDENTITY and task['metadata'].get('defects')
+        ]
+
+    @property
+    def gates(self) -> list[dict[str, Any]]:
+        return [task for task in self.tasks if 'x_client_defect_gate_for' in task['metadata']]
+
+    def fix_of(self, ref: str) -> dict[str, Any]:
+        [fix] = [task for task in self.fixes if task['metadata']['defects'][0]['ref'] == ref]
+        return fix
+
+    def gate_of(self, ref: str) -> dict[str, Any]:
+        [gate] = [task for task in self.gates if task['metadata']['x_client_defect_gate_for'] == ref]
+        return gate
 
 
 class Bridge:
@@ -131,34 +158,17 @@ class Bridge:
         """One filer pass on a fresh session from the stored cursor: a restarted filer."""
         return file_once(self.policy, open_tools=open_tools)
 
-    def tasks(self) -> list[dict[str, Any]]:
+    def rows(self) -> Rows:
+        """The store's rows as its own get_tasks tool returns them now."""
         with open_session(self.policy) as reader:
             reply = reader.call_tool('get_tasks', {'project_root': str(self.root)})
-        return reply['tasks']
-
-    def fixes(self) -> list[dict[str, Any]]:
-        return [
-            task
-            for task in self.tasks()
-            if task['metadata'].get('source') == FILER_IDENTITY and task['metadata'].get('defects')
-        ]
-
-    def gates(self) -> list[dict[str, Any]]:
-        return [task for task in self.tasks() if 'x_client_defect_gate_for' in task['metadata']]
-
-    def fix_of(self, ref: str) -> dict[str, Any]:
-        [fix] = [task for task in self.fixes() if task['metadata']['defects'][0]['ref'] == ref]
-        return fix
-
-    def gate_of(self, ref: str) -> dict[str, Any]:
-        [gate] = [task for task in self.gates() if task['metadata']['x_client_defect_gate_for'] == ref]
-        return gate
+        return Rows(tuple(reply['tasks']))
 
     def publish(self) -> tuple[FeedLine, ...]:
         """One publisher pass over the same store; the whole feed after it."""
         self._published += 1
         out = OutDir.open(self.out_dir, project_id=PROJECT)
-        run_pass(self.policy, out, now=NOW.replace(hour=NOW.hour + self._published))
+        run_pass(self.policy, out, now=NOW + timedelta(hours=self._published))
         return read_feed_lines(self.out_dir)
 
 
@@ -204,13 +214,13 @@ def defects_filed(feed: tuple[FeedLine, ...]) -> set[tuple[str, int, int, int, b
     }
 
 
-def assert_one_gated_fix_per_ref(bridge: Bridge, refs: tuple[str, ...]) -> None:
-    assert len(bridge.fixes()) == len(bridge.gates()) == len(refs)
+def assert_one_gated_fix_per_ref(rows: Rows, refs: tuple[str, ...]) -> None:
+    assert len(rows.fixes) == len(rows.gates) == len(refs)
     for ref in refs:
-        fix, gate = bridge.fix_of(ref), bridge.gate_of(ref)
+        fix, gate = rows.fix_of(ref), rows.gate_of(ref)
         assert [str(task_id) for task_id in fix['dependencies']] == [gate['id']]
         assert (fix['status'], gate['status']) == ('pending', 'pending')
-    assert [task['id'] for task in bridge.tasks() if task['status'] == 'deferred'] == []
+    assert [task['id'] for task in rows.tasks if task['status'] == 'deferred'] == []
 
 
 def test_b36_b25_the_vendored_inbox_is_filed_as_gated_fixes_on_the_real_store(gated: Bridge) -> None:
@@ -218,22 +228,23 @@ def test_b36_b25_the_vendored_inbox_is_filed_as_gated_fixes_on_the_real_store(ga
     calls: Calls = []
 
     report = gated.file(recording(calls))
+    rows = gated.rows()
 
     assert set(report.converged) == {RESTATED, QUARANTINED}
     assert report.offset_to == gated.inbox.stat().st_size
     for ref, criterion_id in CRITERIA.items():
-        fix, gate = gated.fix_of(ref), gated.gate_of(ref)
+        fix, gate = rows.fix_of(ref), rows.gate_of(ref)
         [entry] = fix['metadata']['defects']
         assert (entry['ref'], entry['origin'], entry['status'], entry['sightings']) == (ref, 'client', 'open', 1)
         assert fix['title'] == FIX_TITLE.format(ref=ref, criterion_id=criterion_id)
         assert gate['metadata']['task_kind'] == 'deterministic'
         assert gate['metadata']['always_escalates'] is True
         assert gate['title'] == GATE_TITLE.format(ref=ref)
-    assert RESTATED_HEADING in gated.fix_of(RESTATED)['description']
-    quarantined = gated.fix_of(QUARANTINED)['description']
+    assert RESTATED_HEADING in rows.fix_of(RESTATED)['description']
+    quarantined = rows.fix_of(QUARANTINED)['description']
     assert RESTATED_HEADING not in quarantined
     assert all(reason in quarantined for reason in QUARANTINE_REASONS)
-    assert_one_gated_fix_per_ref(gated, (RESTATED, QUARANTINED))
+    assert_one_gated_fix_per_ref(rows, (RESTATED, QUARANTINED))
     names = [name for name, _ in calls]
     assert names.index('lookup_defect_ref') < names.index('submit_task')
     assert all(arguments['planning_mode'] is True for name, arguments in calls if name == 'submit_task')
@@ -241,7 +252,7 @@ def test_b36_b25_the_vendored_inbox_is_filed_as_gated_fixes_on_the_real_store(ga
     feed = gated.publish()
 
     assert defects_filed(feed) == {
-        (ref, 2, report_no, int(gated.fix_of(ref)['id']), True)
+        (ref, 2, report_no, int(rows.fix_of(ref)['id']), True)
         for ref, report_no in ((RESTATED, 1), (QUARANTINED, 2))
     }
 
@@ -266,10 +277,12 @@ def test_b36_b29_every_crash_point_converges_to_one_gated_fix_per_report(
     report = gated.file()
 
     assert set(report.converged) == {RESTATED, QUARANTINED}
-    assert_one_gated_fix_per_ref(gated, (RESTATED, QUARANTINED))
+    assert_one_gated_fix_per_ref(gated.rows(), (RESTATED, QUARANTINED))
 
 
-def test_b36_b35_a_restatement_the_real_guard_refuses_is_filed_as_typed_facts_and_a_gate(auto: Bridge) -> None:
+def test_b36_b35_a_restatement_the_real_guard_refuses_is_filed_as_typed_facts_and_a_gate(
+    auto: Bridge, served: ServedTaskStack
+) -> None:
     observed = (
         'The running balance beside the third entry shows 90.00.'
         + closer_for('description')
@@ -282,17 +295,27 @@ def test_b36_b35_a_restatement_the_real_guard_refuses_is_filed_as_typed_facts_an
     auto.inbox.write_text(json.dumps(record, separators=(',', ':')) + '\n')
 
     report = auto.file()
+    rows = auto.rows()
 
-    fix, gate = auto.fix_of(RESTATED), auto.gate_of(RESTATED)
+    residue = served.residue_spool.status()
+    assert residue['spooled_files'] == 1
+    refused = json.loads(Path(residue['last_preserved']).read_text())
+    assert (refused['error_type'], refused['tool'], refused['field']) == (
+        MARKUP_UNREPAIRABLE_ERROR_TYPE,
+        'submit_task',
+        'description',
+    )
+    assert observed in refused['raw_value']
+    fix, gate = rows.fix_of(RESTATED), rows.gate_of(RESTATED)
     assert fix['metadata']['x_client_defect']['filer_fallback'] == {'kind': 'TOOL_ERROR', 'code': 'is_error'}
     assert 'is_error' in gate['description']
     assert RESTATED_HEADING not in fix['description']
     assert all(
         observed not in task['title'] + task['description']
         and closer_for('description') not in task['title'] + task['description']
-        for task in auto.tasks()
+        for task in rows.tasks
     )
-    assert_one_gated_fix_per_ref(auto, (RESTATED,))
+    assert_one_gated_fix_per_ref(rows, (RESTATED,))
     assert report.converged == (RESTATED,)
     assert report.offset_to == auto.inbox.stat().st_size
 
@@ -306,7 +329,7 @@ def test_b38_over_in_v3_reports_ruled_in_the_same_pass_are_never_filed(gated: Br
     report = gated.file(recording(calls))
 
     assert writes(calls) == []
-    assert gated.tasks() == []
+    assert gated.rows().tasks == ()
     assert set(report.converged) == set(IN_V3_RULED)
     assert report.offset_to == gated.inbox.stat().st_size
     assert defects_filed(gated.publish()) == set()
@@ -320,11 +343,12 @@ def test_b38_over_in_v3_reports_ruled_in_a_later_pass_are_withdrawn_then_fix_the
     gated.inbox.write_bytes(b''.join(lines[:6]))
 
     gated.file()
+    rows = gated.rows()
 
-    assert_one_gated_fix_per_ref(gated, tuple(later_ruled))
-    assert all(task['metadata']['defects'][0]['ref'] != first_ruled for task in gated.fixes())
+    assert_one_gated_fix_per_ref(rows, tuple(later_ruled))
+    assert all(task['metadata']['defects'][0]['ref'] != first_ruled for task in rows.fixes)
     filed = {
-        (ref, 2, report_no, int(gated.fix_of(ref)['id']), True)
+        (ref, 2, report_no, int(rows.fix_of(ref)['id']), True)
         for ref, report_no in zip(later_ruled, (2, 3), strict=True)
     }
     assert defects_filed(gated.publish()) == filed
@@ -333,9 +357,10 @@ def test_b38_over_in_v3_reports_ruled_in_a_later_pass_are_withdrawn_then_fix_the
         inbox.write(b''.join(lines[6:]))
     calls: Calls = []
     gated.file(recording(calls))
+    rows = gated.rows()
 
     for ref in later_ruled:
-        fix, gate = gated.fix_of(ref), gated.gate_of(ref)
+        fix, gate = rows.fix_of(ref), rows.gate_of(ref)
         assert [write for write in writes(calls) if write[1] in (fix['id'], gate['id'])] == [
             ('declare_defect', fix['id'], None, None),
             ('record_defect_outcome', fix['id'], ref, None),
@@ -349,4 +374,4 @@ def test_b38_over_in_v3_reports_ruled_in_a_later_pass_are_withdrawn_then_fix_the
     assert defects_filed(feed) == filed
     assert sum(isinstance(line, DefectFiled) for line in feed) == len(filed)
     for ref in later_ruled:
-        assert newest_status(feed, gated.fix_of(ref)['id']) == newest_status(feed, gated.gate_of(ref)['id']) == 'cancelled'
+        assert newest_status(feed, rows.fix_of(ref)['id']) == newest_status(feed, rows.gate_of(ref)['id']) == 'cancelled'
