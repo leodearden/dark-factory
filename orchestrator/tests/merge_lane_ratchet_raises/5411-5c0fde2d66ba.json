@@ -1,0 +1,54 @@
+{
+  "task_id": "5411",
+  "reason": "Net-additive, call sites only (task 5411, the docs-only/comments-only narrow merge gate). The classifier, command set and git delta logic live OUTSIDE the cluster in orchestrator/src/orchestrator/narrow_gate_{class,plan,delta}.py; inside it only the call sites grew. post_merge_verify.py cognitive 40 -> 49 (+9), all from step-18: _merge_gate_decision 2 (the no-base / history-leg / gate-off guard), _record_gate_resolution 2 (the no-decision-or-no-store guard), _narrow 2 and _under_gate 1 (the narrow decision always runs on the local pool), _withheld_trivial_pass 4 -> 5 (its reason names the narrow resolution or 'trivial'), and run 4 -> 1 plus the new _verify 4 (+1 net: run's verify body moved into _verify unchanged so the gate decision can wrap it). train_selection.py cognitive 19 -> 22 and select_train_members 8 -> 11 (+3), from step-22: the excluded-anchor guard (+1) and the excluded-candidate skip inside the loop (+2). Filtering the iterable with a comprehension instead measured the same 11, so no honest reduction is left. private_reads +3 in test_merge_queue_coalesce.py (TestNarrowGateExclusion drives worker._intake.replace_lane, ._intake.buffered and ._maybe_coalesce_waiting_singles exactly as the file's existing coalesce scenes do) and +3 in test_workflow_train_former.py (three new tests call wf._maybe_form_train like the file's existing former tests). total:cognitive 5358 -> 5370 (+12) and total:private_reads 6138 -> 6144 (+6) are those sums; worker.py's cognitive holds at 1479 because its train exclusion is one await.",
+  "measures": [
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/post_merge_verify.py",
+      "baseline": 40,
+      "current": 49
+    },
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/post_merge_verify.py::_PostMergeVerify::_withheld_trivial_pass",
+      "baseline": 4,
+      "current": 5
+    },
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/train_selection.py",
+      "baseline": 19,
+      "current": 22
+    },
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/train_selection.py::select_train_members",
+      "baseline": 8,
+      "current": 11
+    },
+    {
+      "measure": "private_reads",
+      "key": "orchestrator/tests/test_merge_queue_coalesce.py",
+      "baseline": 85,
+      "current": 88
+    },
+    {
+      "measure": "private_reads",
+      "key": "orchestrator/tests/test_workflow_train_former.py",
+      "baseline": 22,
+      "current": 25
+    },
+    {
+      "measure": "total:cognitive",
+      "key": "<cluster>",
+      "baseline": 5358,
+      "current": 5370
+    },
+    {
+      "measure": "total:private_reads",
+      "key": "<cluster>",
+      "baseline": 6138,
+      "current": 6144
+    }
+  ]
+}
