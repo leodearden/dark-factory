@@ -1,4 +1,4 @@
-"""A recorder of the process's file and database opens, filesystem mutations, socket connects and spawns, from every thread.
+"""A recorder of the process's file and database opens, directory listings, filesystem mutations, socket connects and spawns, from every thread.
 
 B1 (plans/client-feed-prd.md §8) confines the publisher with it: every effect of a pass lies under its project root,
 its out and in dirs and its policy, or in the interpreter. B30 (§14.5) scopes the filer with it: every effect of a
@@ -23,6 +23,7 @@ _OPEN: Final = 'open'
 _CONNECT: Final = 'socket.connect'
 _DATABASE: Final = 'sqlite3.connect'
 _POPEN: Final = 'subprocess.Popen'
+_LISTINGS: Final = frozenset({'os.listdir', 'os.scandir'})
 _MUTATIONS: Final = frozenset({
     'os.mkdir',
     'os.rename',
@@ -44,7 +45,7 @@ _SPAWNS: Final = frozenset({
     'os.fork',
     'os.forkpty',
 })
-_RECORDED: Final = frozenset({_OPEN, _CONNECT, _DATABASE, *_MUTATIONS, *_SPAWNS})
+_RECORDED: Final = frozenset({_OPEN, _CONNECT, _DATABASE, *_LISTINGS, *_MUTATIONS, *_SPAWNS})
 _BYTECODE_CACHE: Final = '__pycache__'
 _URI_SCHEME: Final = 'file:'
 _PATHLESS_DATABASES: Final = frozenset({'', ':memory:'})
@@ -76,6 +77,17 @@ class Connected:
 class DatabaseOpened:
     """A sqlite connect; `path` is None for a database with no file, such as ':memory:'."""
 
+    path: Path | None
+
+
+@dataclass(frozen=True)
+class Listed:
+    """A directory enumeration, glob and Path.iterdir included; `path` is None for one through a file descriptor.
+
+    A descriptor's directory is named by the recorded open that made it.
+    """
+
+    event: str
     path: Path | None
 
 
@@ -128,6 +140,11 @@ def _opened(args: tuple[Any, ...]) -> Opened | None:
 def _mutated(event: str, args: tuple[Any, ...]) -> Mutated:
     named = args[1:2] if event == 'os.symlink' else args
     return Mutated(event, tuple(path for path in map(_path, named) if path is not None))
+
+
+def _listed(event: str, args: tuple[Any, ...]) -> Listed:
+    target = args[0] if args else None
+    return Listed(event, _path(os.curdir if target is None else target))
 
 
 def _database_opened(args: tuple[Any, ...]) -> DatabaseOpened:
@@ -221,6 +238,10 @@ class AuditRecord:
         return tuple(_database_opened(args) for event, args in self._raw() if event == _DATABASE)
 
     @property
+    def listings(self) -> tuple[Listed, ...]:
+        return tuple(_listed(event, args) for event, args in self._raw() if event in _LISTINGS)
+
+    @property
     def spawns(self) -> tuple[Spawned, ...]:
         return tuple(_spawned(event, args) for event, args in self._raw() if event in _SPAWNS)
 
@@ -228,6 +249,11 @@ class AuditRecord:
         """Leaves out reads under `roots` and writes into a bytecode cache under them; any other write is kept."""
         resolved = _resolved(roots)
         return tuple(opened for opened in self.opens if not _exempt_open(opened, resolved))
+
+    def listings_outside(self, roots: tuple[Path, ...]) -> tuple[Listed, ...]:
+        """Leaves out listings of directories under `roots`; a listing through a file descriptor is kept."""
+        resolved = _resolved(roots)
+        return tuple(listed for listed in self.listings if listed.path is None or not _under(listed.path, resolved))
 
     def mutations_outside(self, roots: tuple[Path, ...]) -> tuple[Mutated, ...]:
         """Leaves out the importer's bytecode-cache writes under `roots`; any other mutation under them is kept."""
@@ -257,7 +283,7 @@ def _resolved(roots: tuple[Path, ...]) -> tuple[Path, ...]:
 
 @contextmanager
 def recording() -> Iterator[AuditRecord]:
-    """Record every open, database open, mutation, connect and spawn raised in this process until the block exits."""
+    """Record every open, database open, listing, mutation, connect and spawn raised in this process until the block exits."""
     global _active
     _install()
     events: list[tuple[str, tuple[Any, ...]]] = []

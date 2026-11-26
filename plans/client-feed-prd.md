@@ -783,9 +783,12 @@ escalation text (never shown). A second feed transport. Per-person links. Failin
     B1, B2, B15, the ban in (d) and the fixture check never skip.
   - (c) The recorder `client-feed/tests/_audit_hook.py::recording` now records database opens
     (`client-feed/tests/_audit_hook.py::DatabaseOpened`, a `file:` URI decoded to its path). It also
-    records the cwd and args of every `subprocess.Popen` (`client-feed/tests/_audit_hook.py::Spawned`).
-    B1 exempts only `client-feed/tests/_audit_hook.py::interpreter_roots`, the sys prefixes and
-    site-packages. `client-feed/tests/_audit_hook.py::runtime_roots` adds the CA bundles and stays
+    records the cwd and args of every `subprocess.Popen` (`client-feed/tests/_audit_hook.py::Spawned`),
+    and every directory listing (`client-feed/tests/_audit_hook.py::Listed`, `os.listdir` and
+    `os.scandir`, through which glob and `Path.iterdir` list). B1 fails on a listing of any directory
+    outside the project root and the out and in dirs. B1 exempts only
+    `client-feed/tests/_audit_hook.py::interpreter_roots`, the sys prefixes and site-packages.
+    `client-feed/tests/_audit_hook.py::runtime_roots` adds the CA bundles and stays
     B30's exemption, through `AuditRecord.opens_outside_runtime` and
     `AuditRecord.mutations_outside_runtime`.
   - (d) `default_project_root` is proven unused twice. At runtime,

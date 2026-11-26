@@ -24,6 +24,7 @@ from _two_projects import CANARY_A_DESC, Project, TwoProjects, build_two_project
 from shared.project_layout import (
     KNOWN_PROJECT_ROOTS_ENV,
     default_project_root,
+    escalation_queue_dir,
     main_checkout_of,
     runs_db,
     tasks_db,
@@ -104,6 +105,11 @@ def _breaches(record: AuditRecord, scope: Project) -> list[str]:
         if not _inside(path, (scope.out_dir,))
     ]
     found += [
+        f'{listed.event} {listed.path}'
+        for listed in record.listings_outside(exempt)
+        if listed.path is not None and not _inside(listed.path, readable)
+    ]
+    found += [
         f'sqlite3.connect {database.path}'
         for database in record.database_opens
         if database.path is not None and not _inside(database.path, (scope.root,))
@@ -136,6 +142,7 @@ def test_b1_a_snapshot_touches_only_its_own_root_out_and_in_dirs_and_policy(
         path.is_relative_to(verify_logs_dir(a.root)) and '.junit-' in path.name for path in opened
     )
     assert {a.in_dir / ENGAGEMENT_FILENAME, a.in_dir / INBOX_FILENAME} <= opened
+    assert escalation_queue_dir(a.root) in {listed.path for listed in record.listings}
     assert a.root in {spawn.cwd for spawn in record.spawns if spawn.event == 'subprocess.Popen'}
     assert any(opened.writes and opened.path.is_relative_to(a.out_dir) for opened in record.opens)
     assert _breaches(record, a) == []

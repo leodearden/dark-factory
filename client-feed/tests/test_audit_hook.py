@@ -1,5 +1,6 @@
 """The audit-hook recorder B1 and B30 scope effects with: what it records, and what it leaves out."""
 
+import glob
 import json
 import os
 import site
@@ -14,6 +15,7 @@ import pytest
 from _audit_hook import (
     Connected,
     DatabaseOpened,
+    Listed,
     Mutated,
     Opened,
     Spawned,
@@ -183,6 +185,39 @@ def test_a_subprocess_spawn_records_its_cwd_and_args(tmp_path: Path) -> None:
 
     popens = [spawn for spawn in rec.spawns if spawn.event == 'subprocess.Popen']
     assert popens == [Spawned('subprocess.Popen', 'git', cwd=tmp_path, args=('git', '--version'))]
+
+
+def test_a_listing_records_its_directory_however_it_is_asked_for(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / 'a.json').write_text('{}')
+    monkeypatch.chdir(tmp_path)
+
+    with recording() as rec:
+        os.listdir()
+        list(tmp_path.iterdir())
+        list(tmp_path.glob('*.json'))
+        glob.glob(str(tmp_path / '*.json'))
+
+    assert rec.listings == (
+        Listed('os.listdir', tmp_path),
+        *(Listed('os.scandir', tmp_path) for _ in range(3)),
+    )
+
+
+def test_listings_outside_given_roots_keep_one_through_a_file_descriptor(tmp_path: Path) -> None:
+    descriptor = os.open(tmp_path, os.O_RDONLY)
+    try:
+        with recording() as rec:
+            os.listdir(Path(json.__file__).parent)
+            os.listdir(tmp_path)
+            os.listdir(descriptor)
+    finally:
+        os.close(descriptor)
+
+    assert rec.listings_outside(interpreter_roots()) == (
+        Listed('os.listdir', tmp_path), Listed('os.listdir', None),
+    )
 
 
 def _ca_bundles() -> set[Path]:
