@@ -135,6 +135,7 @@ def test_an_empty_out_dir_opens_at_the_start(out_dir: Path) -> None:
         line_counts=None,
         defect_scan_offset=0,
         pending_reports={},
+        deferred_gate_reports={},
     )
     assert out.uncommitted == ()
     assert out.next_seq == 1
@@ -171,6 +172,41 @@ def test_a_cursor_written_before_feed_1_1_opens_with_the_defect_scan_at_its_defa
 def test_a_pending_report_time_that_is_not_utc_is_refused(when: str) -> None:
     with pytest.raises(ValidationError, match='pending_reports'):
         Cursor.model_validate({'pending_reports': {'portal:acme:2:1': when}})
+
+
+def test_no_report_is_held_behind_a_deferred_gate_at_the_start() -> None:
+    assert Cursor().deferred_gate_reports == {}
+
+
+def test_deferred_gate_reports_round_trip_through_cursor_json() -> None:
+    cursor = Cursor(deferred_gate_reports={'portal:acme:2:1': at(3)})
+
+    assert Cursor.model_validate_json(cursor.model_dump_json()) == cursor
+
+
+def test_a_cursor_written_without_deferred_gate_reports_opens_with_none_held(
+    out_dir: Path,
+) -> None:
+    out = OutDir.open(out_dir, project_id=PROJECT)
+    written = Cursor(events_id=12, defect_scan_offset=40, pending_reports={'portal:acme:2:1': at(3)})
+    out.commit(three_events(out), written)
+    committed = stored_cursor(out_dir)
+    earlier_shape = committed.model_dump_json(exclude={'deferred_gate_reports'})
+    assert 'deferred_gate_reports' not in earlier_shape
+    (out_dir / 'cursor.json').write_text(earlier_shape)
+
+    reopened = OutDir.open(out_dir, project_id=PROJECT)
+
+    assert reopened.cursor == committed
+    assert reopened.cursor.deferred_gate_reports == {}
+    assert (reopened.cursor.events_id, reopened.cursor.defect_scan_offset) == (12, 40)
+    assert reopened.cursor.pending_reports == {'portal:acme:2:1': at(3)}
+
+
+@pytest.mark.parametrize('when', ['2026-10-21T12:00:00+02:00', '2026-10-21T12:00:00'])
+def test_a_deferred_gate_report_time_that_is_not_utc_is_refused(when: str) -> None:
+    with pytest.raises(ValidationError, match='deferred_gate_reports'):
+        Cursor.model_validate({'deferred_gate_reports': {'portal:acme:2:1': when}})
 
 
 def test_a_stamp_allocates_seq_in_call_order(out_dir: Path) -> None:
