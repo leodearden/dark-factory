@@ -267,6 +267,33 @@ async def test_citing_a_held_task_promotes_it(
 
 
 @pytest.mark.asyncio
+async def test_citing_a_held_finding_set_member_leaves_it_held_until_a_human_releases_it(
+    stack: Stack, curator_creates: list[PreparedCandidate],
+) -> None:
+    held = await stack.file_normal(
+        title='Switch judge.py to the public name',
+        description='Switch judge.py to the public name: one member of a finding set.',
+        priority='low',
+        metadata={
+            'source': 'review-all', 'x_finding_key': ['fk-1'],
+            'finding_set_hold': {'ruling': 'Leo 2026-11-12 on fk-1'}, 'files': [_FILE],
+        },
+    )
+    assert await _holder_edge(stack, held), held
+
+    _ok(await stack.call('update_task', id=held, metadata={'x_finding_key': ['fk-1', 'fk-2']}, metadata_mode='additive'))
+
+    await _assert_held(stack, held)
+    assert await _promoted_events(stack) == []
+    [deferred] = await stack.events(EventType.followup_promotion_deferred)
+    assert (deferred['guard'], deferred['by']) == ('finding_set_hold', 'citation')
+
+    _ok(await stack.call('remove_dependency', id=held, depends_on=await _holder(stack)))
+
+    await _assert_promoted(stack, held, by='human', ref='remove_dependency')
+
+
+@pytest.mark.asyncio
 async def test_citing_a_held_task_promotes_the_held_task_it_depends_on(
     stack: Stack, curator_creates: list[PreparedCandidate],
 ) -> None:
