@@ -202,6 +202,7 @@ class ProducerEvidence:
     rule_id_counts: dict[str, int] = field(default_factory=dict)
     plan_shape_decisions: int = 0
     hinted_tasks: int = 0
+    unmeasured_verify_rows: int = 0
 
     @classmethod
     def combined(cls, parts: Iterable[ProducerEvidence]) -> ProducerEvidence:
@@ -213,6 +214,7 @@ class ProducerEvidence:
             dict(sorted(rule_ids.items())),
             sum(part.plan_shape_decisions for part in parts),
             sum(part.hinted_tasks for part in parts),
+            sum(part.unmeasured_verify_rows for part in parts),
         )
 
 
@@ -360,14 +362,28 @@ def _store_problem(store: str, exc: Exception) -> str:
     return f'{store} unreadable: {exc}'
 
 
-def _summed_payload_field(payloads: Sequence[dict], name: str, divisor: float = 1.0) -> float | None:
-    """The sum of *name* over *payloads* divided by *divisor*; 0.0 for none, None if any lacks it.
+def _measured_nothing(payload: dict, name: str) -> bool:
+    """Whether *payload* carries *name* as an explicit null: its producer measured nothing.
 
-    The one field-presence rule: an event written before its producer carried
-    the field makes the metric unknown for that task, rather than silently low.
+    A merge_request verified_green vouch writes ``duration_ms: None``
+    (orchestrator/src/orchestrator/verify_evidence.py::workflow_verify_event_data
+    writes None whenever it has no verify result).
+    """
+    return name in payload and payload[name] is None
+
+
+def _summed_payload_field(payloads: Sequence[dict], name: str, divisor: float = 1.0) -> float | None:
+    """The sum of *name* over *payloads* divided by *divisor*; 0.0 for none.
+
+    The one field-presence rule. A payload that measured nothing adds 0. A
+    payload lacking the key was written before its producer carried the field,
+    and any other non-number is malformed: either makes the metric unknown for
+    the task (None), rather than silently low.
     """
     numbers: list[float] = []
     for payload in payloads:
+        if _measured_nothing(payload, name):
+            continue
         value = payload.get(name)
         if isinstance(value, bool) or not isinstance(value, (int, float)):
             return None
@@ -432,10 +448,8 @@ def _record(
 def _evidence(
     events: Mapping[str, Sequence[_Event]], records: Sequence[TaskRecord],
 ) -> ProducerEvidence:
-    decisions = [
-        event for task_events in events.values() for event in task_events
-        if event.event_type == _ROUTING_DECISION
-    ]
+    every_event = [event for task_events in events.values() for event in task_events]
+    decisions = [event for event in every_event if event.event_type == _ROUTING_DECISION]
     rule_ids = Counter(
         rule_id for decision in decisions
         if (rule_id := _text(decision.data.get('rule_id'))) is not None
@@ -444,6 +458,10 @@ def _evidence(
         rule_id_counts=dict(sorted(rule_ids.items())),
         plan_shape_decisions=sum(1 for decision in decisions if _carries_plan_shape(decision)),
         hinted_tasks=sum(1 for record in records if record.curator_complexity_hint is not None),
+        unmeasured_verify_rows=sum(
+            1 for event in every_event
+            if event.event_type == _WORKFLOW_VERIFY and _measured_nothing(event.data, 'duration_ms')
+        ),
     )
 
 
@@ -983,6 +1001,8 @@ def _producers_line(evidence: ProducerEvidence) -> str:
         f'routing_decision rule ids: {rule_ids or NO_PRODUCER_ROW}',
         f'implementer decisions carrying plan shape: {_produced(evidence.plan_shape_decisions)}',
         f'tasks carrying {CURATOR_HINT_KEY}: {_produced(evidence.hinted_tasks)}',
+        'workflow_verify rows with null duration_ms (added as 0 minutes): '
+        f'{evidence.unmeasured_verify_rows}',
     ])
 
 

@@ -302,6 +302,41 @@ def test_verify_minutes_sum_present_durations_and_are_none_when_a_duration_is_mi
     assert (records['3'].workflow_verify_minutes, records['3'].merge_verify_minutes) == (0.0, 0.0)
 
 
+@pytest.fixture
+def vouched_root(fleet_root):
+    """One task with a measured implement verify and a merge_request vouch that measured nothing."""
+    return fleet_root(
+        'proj-a',
+        [
+            TaskSpec(
+                1,
+                events=(
+                    Event('workflow_verify', {'site': 'implement', 'duration_ms': 60_000}),
+                    Event('workflow_verify', {'site': 'mcp:merge_request', 'duration_ms': None}),
+                ),
+            ),
+        ],
+    )
+
+
+def test_a_null_duration_adds_no_minutes_and_is_counted_as_an_unmeasured_row(vouched_root):
+    load = _load([vouched_root])
+
+    (record,) = load.records
+    assert record.workflow_verify_minutes == 1.0
+    assert load.evidence.unmeasured_verify_rows == 1
+
+
+def test_the_producers_line_counts_workflow_verify_rows_with_a_null_duration(
+    vouched_root, capsys,
+):
+    assert _run_main([vouched_root]) == readout.EXIT_OK
+
+    assert 'workflow_verify rows with null duration_ms (added as 0 minutes): 1' in (
+        _producers_line(capsys.readouterr().out)
+    )
+
+
 def test_reviewer_blocking_count_sums_and_is_none_when_a_review_lacks_the_field(ledger_root):
     records = _by_task(_load([ledger_root]))
 
