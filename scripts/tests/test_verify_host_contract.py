@@ -405,6 +405,14 @@ class TestTheTable:
                 assert verdict.verdict == 'fail', row.id
                 assert verdict.observed == 'not observed: observer exited 1', row.id
 
+    def test_an_unobserved_row_states_the_same_need_as_an_observed_one(self, scene: Scene) -> None:
+        unobserved = scene.contract.Observation(
+            network=scene.contract.NetworkFacts(reachable=True, host_key_pinned=True, detail=''),
+            host=None, unobserved_reason='observer exited 1',
+        )
+        for row in scene.contract.REQUIREMENTS:
+            assert scene.verdict(row.id, unobserved).needed == scene.verdict(row.id).needed, row.id
+
 
 class TestNetwork:
     def test_unreachable_fails(self, scene: Scene) -> None:
@@ -458,6 +466,12 @@ class TestKernel:
     ], ids=['landlock_abi_1', 'no_landlock', 'var_tmp_read_only'])
     def test_fails(self, scene: Scene, change: Any) -> None:
         assert scene.changed('kernel', change) == 'fail'
+
+    def test_the_need_and_the_verdict_share_the_contract_minimum(self, scene: Scene) -> None:
+        minimum = scene.contract.MIN_LANDLOCK_ABI
+        assert scene.changed('kernel', _set('landlock_abi', minimum - 1)) == 'fail'
+        assert scene.changed('kernel', _set('landlock_abi', minimum)) == 'ok'
+        assert f'Landlock ABI {minimum}' in scene.verdict('kernel').needed
 
 
 class TestMemory:
