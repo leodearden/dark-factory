@@ -109,3 +109,106 @@ def test_a_window_without_cancelled_rows_names_only_that_event():
     assert canary.missing_alpha_fields(verify, [], voided, finalized) == (
         'merge_verify_cancelled',
     )
+
+
+# ---------------------------------------------------------------------------
+# The landing ledger and the gate/void ratios (merge-throughput report,
+# B-ledger.md population rules and P5).
+# ---------------------------------------------------------------------------
+
+
+def test_landings_are_done_finalizes_union_train_members_in_time_order():
+    finalized = [
+        ev(30, 'b', state='done', merge_sha='sha-b', landed_via_chain=1),
+        ev(10, 'a', state='done', merge_sha='sha-a', landed_via_chain=None),
+        ev(20, 'x', state='blocked', merge_sha=None),
+    ]
+    train_merged = [ev(25, 't', member_task_ids=['m1', 'm2'], merge_commit_sha='sha-t')]
+
+    rows = canary.landings(finalized, train_merged)
+
+    assert [(r.task_id, r.at, r.merge_sha) for r in rows] == [
+        ('a', at(10), 'sha-a'),
+        ('m1', at(25), 'sha-t'),
+        ('m2', at(25), 'sha-t'),
+        ('b', at(30), 'sha-b'),
+    ]
+    assert [r.via_chain for r in rows] == [False, False, False, True]
+
+
+@pytest.mark.parametrize(('raw', 'via_chain'), [(1, True), (2.0, True), (None, False), (True, False), ('1', False)])
+def test_via_chain_is_true_only_for_a_non_bool_number(raw, via_chain):
+    finalized = [ev(1, 'a', state='done', merge_sha='s', landed_via_chain=raw)]
+    assert canary.landings(finalized, [])[0].via_chain is via_chain
+
+
+def two_landings() -> tuple[canary.Landing, ...]:
+    return canary.landings(
+        [ev(10, 'a', state='done', merge_sha='sa'), ev(20, 'b', state='done', merge_sha='sb')], [],
+    )
+
+
+def test_gates_per_landing_counts_only_reverifying_gate_rows():
+    gates = [ev(5, 'a', reverify=True), ev(15, 'b', reverify=False), ev(16, 'b', reverify=True)]
+    assert canary.gates_per_landing(gates, two_landings()) == 1.0
+
+
+def test_gates_per_landing_is_unmeasured_without_a_landing():
+    assert canary.gates_per_landing([ev(5, 'a', reverify=True)], ()) is None
+
+
+def test_voids_per_landing_splits_dispatch_from_adoption_voids():
+    voided = [ev(1, 'a', point='dispatch'), ev(2, 'b', point='dispatch'), ev(3, 'c', point='adoption')]
+
+    tally = canary.voids_per_landing(voided, two_landings())
+
+    assert (tally.total, tally.before_host, tally.at_adoption) == (3, 2, 1)
+    assert tally.per_landing == 1.5
+
+
+def test_voids_per_landing_is_unmeasured_without_a_landing():
+    assert canary.voids_per_landing([ev(1, 'a', point='dispatch')], ()).per_landing is None
+
+
+def gated_ledger(pattern: str) -> tuple[tuple[canary.Landing, ...], list[dict[str, Any]], list[dict[str, Any]]]:
+    """One landing per letter, ten minutes apart; 'G' lands behind a re-verifying gate."""
+    finalized, gates, queued = [], [], []
+    for i, letter in enumerate(pattern):
+        task = f't{i}'
+        queued.append(ev(10 * i + 1, task))
+        if letter == 'G':
+            gates.append(ev(10 * i + 5, task, reverify=True))
+        finalized.append(ev(10 * i + 9, task, state='done', merge_sha=f's{i}'))
+    return canary.landings(finalized, []), gates, queued
+
+
+def test_gate_conditionals_over_a_known_sequence():
+    ledger, gates, queued = gated_ledger('GGNGGG')
+
+    result = canary.gate_conditionals(ledger, gates, queued)
+
+    assert result.gated == (True, True, False, True, True, True)
+    assert result.p_gate_after_gate == 0.75
+    assert result.p_gate_after_ungated == 1.0
+
+
+def test_a_gate_from_an_earlier_submission_does_not_gate_the_landing():
+    queued = [ev(1, 'a'), ev(20, 'a')]
+    gates = [ev(5, 'a', reverify=True), ev(25, 'a', reverify=False)]
+    ledger = canary.landings([ev(30, 'a', state='done', merge_sha='s')], [])
+
+    assert canary.gate_conditionals(ledger, gates, queued).gated == (False,)
+
+
+def test_a_gate_stamped_after_the_landing_does_not_gate_it():
+    ledger = canary.landings([ev(30, 'a', state='done', merge_sha='s')], [])
+    assert canary.gate_conditionals(ledger, [ev(31, 'a', reverify=True)], [ev(1, 'a')]).gated == (False,)
+
+
+def test_gate_conditionals_are_unmeasured_when_no_gated_landing_has_a_successor():
+    ledger, gates, queued = gated_ledger('NG')
+
+    result = canary.gate_conditionals(ledger, gates, queued)
+
+    assert result.p_gate_after_gate is None
+    assert result.p_gate_after_ungated == 1.0
