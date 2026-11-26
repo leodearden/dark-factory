@@ -69,7 +69,12 @@ from client_feed.sources.store import StoreReadError
 from client_feed.sources.tasks import TasksRead, read_defect_carriers, read_tasks
 from client_feed.sources.tree import VisibleTree, visible_tree
 from client_feed.stream_events import Identity, StreamOutput, identity, stream_events
-from client_feed.unfiled import still_unfiled, unfiled_degradation
+from client_feed.unfiled import (
+    deferred_gate_degradation,
+    still_behind_deferred_gates,
+    still_unfiled,
+    unfiled_degradation,
+)
 from client_feed.value_events import (
     branch_event,
     budget_event,
@@ -472,6 +477,7 @@ class _Acknowledgement:
     events: tuple[DefectFiled, ...]
     defect_scan_offset: int
     pending_reports: dict[str, datetime]
+    deferred_gate_reports: dict[str, datetime]
 
 
 def _acknowledgement_unit(
@@ -484,7 +490,9 @@ def _acknowledgement_unit(
 ) -> _Acknowledgement:
     """Each carrier filing the state does not say yet; each report read with no carrier waits, and names `filer` past the grace.
 
-    The inbox is scanned whatever the engagement, from its own offset; its rejected lines are the reveal tail's to count.
+    A filed report whose carrier waits on a deferred gate is held from the pass that first saw it so, and names
+    `filer` past the grace too. The inbox is scanned whatever the engagement, from its own offset; its rejected
+    lines are the reveal tail's to count.
     """
     scan = _guarded(lambda: read_inbox(policy.in_dir, offset=cursor.defect_scan_offset), degraded)
     carriers = _guarded(
@@ -499,14 +507,24 @@ def _acknowledgement_unit(
         project_id=policy.project_id,
         filed=None if carriers is None else {carrier.ref for carrier in carriers},
     )
-    filer = unfiled_degradation(pending, now=now, grace_seconds=policy.filer_grace_seconds)
-    if filer is not None:
-        _log.warning('source %s %s', filer.source, filer.reason)
-        degraded.append(filer)
+    held = still_behind_deferred_gates(
+        cursor.deferred_gate_reports,
+        None if carriers is None else {c.ref for c in carriers if c.waits_on_deferred_gate},
+        now=now,
+    )
+    grace = policy.filer_grace_seconds
+    for filer in (
+        unfiled_degradation(pending, now=now, grace_seconds=grace),
+        deferred_gate_degradation(held, now=now, grace_seconds=grace),
+    ):
+        if filer is not None:
+            _log.warning('source %s %s', filer.source, filer.reason)
+            degraded.append(filer)
     return _Acknowledgement(
         events=events,
         defect_scan_offset=cursor.defect_scan_offset if scan is None else scan.offset,
         pending_reports=pending,
+        deferred_gate_reports=held,
     )
 
 
@@ -523,11 +541,13 @@ def _advanced(
     """Each source position past what this pass read, where its unit succeeded; head and line counts move with the tree.
 
     The inbox offset, reveals_head and added-line counts move with a reveal unit that ran; an inbox read holding no
-    request moves its offset alone. The defect scan's offset and pending reports move as the acknowledgement left them.
+    request moves its offset alone. The defect scan's offset, its pending reports and the reports held behind a
+    deferred gate move as the acknowledgement left them.
     """
     update: dict[str, object] = {
         'defect_scan_offset': acknowledgement.defect_scan_offset,
         'pending_reports': acknowledgement.pending_reports,
+        'deferred_gate_reports': acknowledgement.deferred_gate_reports,
     }
     if events_id is not None:
         update['events_id'] = events_id
