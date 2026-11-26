@@ -17,11 +17,9 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-import pytest_asyncio
 from _orch_helpers import HermeticMcpSession
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
-from shared.cost_store import CostStore
 
 import orchestrator.digest as digest
 from orchestrator.config import OrchestratorConfig
@@ -35,35 +33,6 @@ from orchestrator.pause_policy import (
 )
 from orchestrator.run_store import RunStore
 from orchestrator.scheduler import Scheduler
-
-# ---------------------------------------------------------------------------
-# Helpers shared by cost-ceiling tests
-# ---------------------------------------------------------------------------
-
-@pytest_asyncio.fixture
-async def _cost_store_factory(tmp_path: Path):
-    """Fixture factory that opens CostStore instances and closes them on teardown.
-
-    Usage within a test::
-
-        store = await _cost_store_factory()
-        store2 = await _cost_store_factory('other.db')
-
-    All opened stores are closed in a ``finally`` block when the test finishes,
-    preventing aiosqlite connection and background-thread leaks.
-    """
-    stores: list[CostStore] = []
-
-    async def _open(filename: str = 'cost.db') -> CostStore:
-        store = CostStore(tmp_path / filename)
-        await store.open()
-        stores.append(store)
-        return store
-
-    yield _open
-
-    for store in stores:
-        await store.close()
 
 
 def _iso(delta: timedelta) -> str:

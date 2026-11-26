@@ -579,7 +579,7 @@ def df_warm_lane_script_dir(monkeypatch, tmp_path: Path):
 
 
 def pytest_configure(config: pytest.Config) -> None:
-    """Refuse an unsafe ``--basetemp``, arm the suite-wide defences, register the opt-out markers.
+    """Refuse an unsafe ``--basetemp``, arm the suite-wide defences, register plugins and markers.
 
     The ``reject_unsafe_basetemp`` call comes FIRST and is unrelated to the
     marker below: it aborts collection when ``--basetemp`` points inside a live
@@ -588,7 +588,10 @@ def pytest_configure(config: pytest.Config) -> None:
 
     It also arms the UsageGate probe-dir sweep confinement (task 6275),
     importing ``shared.usage_gate`` here because a module-level import after
-    this file's ``sys.path`` setup would need a new ``E402`` suppression.
+    this file's ``sys.path`` setup would need a new ``E402`` suppression. For
+    the same reason it registers ``_orch_suite_fixtures`` as a plugin here, so
+    the suite-wide fixtures that need first-party imports are visible to every
+    test.
 
     ``orchestrator/pyproject.toml``'s ``[tool.pytest.ini_options] markers``
     list is outside this task's locked scope, so the marker used by the
@@ -607,6 +610,7 @@ def pytest_configure(config: pytest.Config) -> None:
     from shared import usage_gate
 
     arm_usage_gate_sweep_confinement(config, usage_gate)
+    config.pluginmanager.import_plugin('_orch_suite_fixtures')
     config.addinivalue_line(
         'markers',
         'real_psi_reader: opt a test OUT of the autouse `_hermetic_psi_reader` '
