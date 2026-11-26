@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 import uuid
 from typing import TYPE_CHECKING, Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -56,6 +57,8 @@ def _expected_point_id(project_id: str, task_id: str) -> str:
 
 QDRANT_DEFAULT_MAX_REQUEST_BYTES = 32 * 2**20
 """Qdrant's default ``service.max_request_size_mb``, in bytes."""
+
+_CURATOR_LOGGER = 'fused_memory.middleware.task_curator'
 
 
 class RecordingQdrant(AsyncQdrantClient):
@@ -328,6 +331,68 @@ class TestBackfillBatching:
             assert max(qdrant.upsert_sizes) <= BACKFILL_UPSERT_BATCH_SIZE
         finally:
             await curator.close()
+
+    @staticmethod
+    async def _backfill_in_threes(
+        tasks: list[dict], embedder: RecordingEmbedder, *, fail_calls: frozenset[int],
+    ) -> tuple[BackfillResult, int, RecordingQdrant]:
+        """Backfill *tasks* 3 points a batch, refusing the listed upsert calls.
+
+        Returns the result, the persisted corpus count and the Qdrant double.
+        """
+        qdrant = RecordingQdrant(fail_calls=fail_calls)
+        curator = in_memory_corpus_curator(embedder, qdrant_client=qdrant)
+        try:
+            result = await curator.backfill_corpus(tasks, 'proj', batch_size=3)
+            return result, await curator.corpus_count('proj'), qdrant
+        finally:
+            await curator.close()
+
+    @pytest.mark.asyncio
+    async def test_refused_middle_batch_costs_only_its_own_points(self):
+        embedder = RecordingEmbedder()
+        result, persisted, qdrant = await self._backfill_in_threes(
+            _titled_tasks(7), embedder, fail_calls=frozenset({1}),
+        )
+
+        assert result == BackfillResult(upserted=4, skipped=0, errors=3)
+        assert persisted == 4
+        assert qdrant.upsert_sizes == [3, 3, 1]
+        assert embedder.calls == 7
+
+    @pytest.mark.asyncio
+    async def test_batch_failure_counts_compose_with_skips_and_embed_failures(self):
+        tasks = [
+            _make_task('untitled', title=''),
+            _make_task('refused', title='EMBED-REFUSED task'),
+            *_titled_tasks(5),
+        ]
+        result, persisted, qdrant = await self._backfill_in_threes(
+            tasks, RecordingEmbedder(fail_marker='EMBED-REFUSED'), fail_calls=frozenset({0}),
+        )
+
+        assert result.skipped == 1
+        assert result.upserted + result.errors == 6
+        assert result.errors == 1 + qdrant.upsert_sizes[0]
+        assert persisted == result.upserted
+
+    @pytest.mark.asyncio
+    async def test_refused_batch_logs_one_warning_naming_it(self, caplog):
+        with caplog.at_level(logging.WARNING, logger=_CURATOR_LOGGER):
+            await self._backfill_in_threes(
+                _titled_tasks(7), RecordingEmbedder(), fail_calls=frozenset({1}),
+            )
+
+        warnings = [
+            record for record in caplog.records
+            if record.name == _CURATOR_LOGGER and record.levelno == logging.WARNING
+        ]
+        assert len(warnings) == 1
+        message = warnings[0].getMessage()
+        assert 'project=proj' in message
+        assert 'batch 2/3' in message
+        assert '3 points' in message
+        assert warnings[0].exc_info is not None
 
 
 # ──────────────────────────────────────────────────────────────────────────────
