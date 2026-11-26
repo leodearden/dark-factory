@@ -2,16 +2,20 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
+from unittest.mock import patch
 
 import pytest
 import yaml
 from _landing_git_scenarios import LandingRepo
 
 from orchestrator.config import OrchestratorConfig, load_config
+from orchestrator.event_store import EventType
 from orchestrator.narrow_gate_class import GateMiss, MergeGateResolution, MissReason
 from orchestrator.narrow_gate_plan import NarrowGateDecision
-from orchestrator.verify import narrow_merge_gate_decision
-from orchestrator.verify_plan import PlannedRun, ScopeKind
+from orchestrator.verify import VerifyResult, narrow_merge_gate_decision, run_scoped_verification
+from orchestrator.verify_cmd import render
+from orchestrator.verify_plan import PlannedRun, ScopeKind, VerifyPlan
 
 _GUARD = 'pkg/tests/test_guard.py'
 _SOURCE = 'pkg/src/pkg/mod.py'
@@ -192,3 +196,116 @@ class TestNarrowMergeGateDecision:
         )
 
         assert decision.resolution is MergeGateResolution.FULL
+
+
+class _RecordingEventStore:
+    def __init__(self) -> None:
+        self.events: list[tuple[Any, dict[str, Any]]] = []
+
+    def emit(self, event_type: Any, *, data: dict[str, Any] | None = None, **_kw: Any) -> None:
+        self.events.append((event_type, dict(data or {})))
+
+    def of(self, event_type: EventType) -> list[dict[str, Any]]:
+        return [data for kind, data in self.events if kind == event_type]
+
+
+class _Execution:
+    """One merge-role run_scoped_verification over a merge, with every command recorded instead of run."""
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+        self.events = _RecordingEventStore()
+
+    async def _record(self, cmd: str, *_args: Any, **_kwargs: Any) -> tuple[int, str, bool]:
+        self.calls.append(cmd)
+        return 0, '', False
+
+    async def verify(
+        self, worktree: Path, config: OrchestratorConfig, task_files: list[str], **narrow: Any,
+    ) -> VerifyResult:
+        with patch('orchestrator.verify._run_cmd', side_effect=self._record):
+            return await run_scoped_verification(
+                worktree, config, list(config.module_configs_or_empty.values()), task_files,
+                role='merge', is_merge_verify=True, event_store=self.events,  # type: ignore[arg-type]
+                **narrow,
+            )
+
+    def escalations(self) -> list[str]:
+        return [data['resolution'] for data in self.events.of(EventType.trivial_pass_escalated)]
+
+
+def _prescribed(plan: VerifyPlan) -> list[str]:
+    return sorted(render(run.cmd) for run in plan.runs if run.cmd is not None)
+
+
+def _executed_as_prescribed(calls: list[str], plan: VerifyPlan) -> bool:
+    """Each call is one prescribed command, verbatim up to the flags execution appends, and none is missing."""
+    prescribed = _prescribed(plan)
+    return len(calls) == len(prescribed) and all(
+        sum(call == cmd or call.startswith(cmd + ' ') for call in calls) == 1 for cmd in prescribed
+    )
+
+
+async def _merged_decision(scene: _Scene, files: dict[str, str]) -> tuple[Path, OrchestratorConfig, NarrowGateDecision]:
+    worktree, base, merge_sha = scene.merge(files)
+    config = scene.config()
+    return worktree, config, await narrow_merge_gate_decision(worktree, config, base_sha=base, merge_sha=merge_sha)
+
+
+def _passed(**fields: Any) -> VerifyResult:
+    return VerifyResult(passed=True, test_output='', lint_output='', type_output='', summary='ok', **fields)
+
+
+@pytest.mark.asyncio
+class TestNarrowGateExecution:
+
+    @pytest.mark.parametrize(('files', 'resolution'), [
+        ({'docs/x.md': 'x\n'}, MergeGateResolution.DOCS),
+        ({_SOURCE: '"""Reworded."""\nx = 1  # why\n'}, MergeGateResolution.COMMENTS),
+    ])
+    async def test_a_narrow_decision_runs_exactly_its_plan(
+        self, scene: _Scene, files: dict[str, str], resolution: MergeGateResolution,
+    ) -> None:
+        worktree, config, decision = await _merged_decision(scene, files)
+        assert decision.resolution is resolution and decision.plan is not None
+        execution = _Execution()
+
+        result = await execution.verify(worktree, config, list(decision.changed_paths), narrow_gate=decision)
+
+        assert _executed_as_prescribed(execution.calls, decision.plan), (execution.calls, _prescribed(decision.plan))
+        assert (result.passed, result.trivial, result.narrow_gate) == (True, False, resolution)
+        assert result.plan == decision.plan.to_dict()
+        assert execution.escalations() == []
+
+    async def test_without_a_decision_a_docs_merge_still_escalates_to_the_full_gate(self, scene: _Scene) -> None:
+        worktree, config, decision = await _merged_decision(scene, {'docs/x.md': 'x\n'})
+        execution = _Execution()
+
+        result = await execution.verify(worktree, config, list(decision.changed_paths))
+
+        assert execution.escalations() == ['full_gate']
+        assert result.narrow_gate is None
+
+    async def test_a_full_decision_is_not_narrowed_on(self, scene: _Scene) -> None:
+        worktree, config, _decision = await _merged_decision(scene, {'docs/x.md': 'x\n'})
+        execution = _Execution()
+
+        result = await execution.verify(
+            worktree, config, ['docs/x.md'], narrow_gate=NarrowGateDecision.full(GateMiss(MissReason.DISABLED)),
+        )
+
+        assert execution.escalations() == ['full_gate']
+        assert result.narrow_gate is None
+
+
+class TestWholeTreeEvidence:
+
+    def test_an_ordinary_pass_is_whole_tree_evidence(self) -> None:
+        assert _passed().is_whole_tree_evidence is True
+
+    def test_a_trivial_pass_is_not(self) -> None:
+        assert _passed(trivial=True).is_whole_tree_evidence is False
+
+    @pytest.mark.parametrize('resolution', [MergeGateResolution.DOCS, MergeGateResolution.COMMENTS])
+    def test_a_narrow_gate_pass_is_not(self, resolution: MergeGateResolution) -> None:
+        assert _passed(narrow_gate=resolution).is_whole_tree_evidence is False
