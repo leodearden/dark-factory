@@ -28,14 +28,6 @@ from _git_fixtures import RepoSeed, _git, seed_repo
 from _orch_helpers import VERIFY_CLI_PER_TEST_TIMEOUT, git_env_with_ceiling
 from _verify_artifact_fixtures import registry_config
 from escalation.categories import EscalationCategory
-from orchestrator.merge_lane.screen import (
-    MERGE_SCREEN_ALARM_TASK_ID,
-    Bounce,
-    MergeScreen,
-    Proceed,
-    ScreenSite,
-    run_screen,
-)
 
 from orchestrator.config import GitConfig, MergeScreenConfig, ModuleConfig, OrchestratorConfig
 from orchestrator.event_store import EventType
@@ -47,7 +39,15 @@ from orchestrator.git_ops import (
     WorktreeKind,
 )
 from orchestrator.merge_lane.outcome_facts import MergeBlockCategory
-from orchestrator.verify import NodeIdResult
+from orchestrator.merge_lane.screen import (
+    MERGE_SCREEN_ALARM_TASK_ID,
+    Bounce,
+    MergeScreen,
+    Proceed,
+    ScreenSite,
+    run_screen,
+)
+from orchestrator.verify import NodeIdResult, NodeIdStatus
 from orchestrator.verify_cancel import lane_lock_path
 
 pytestmark = pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)
@@ -357,7 +357,7 @@ async def test_base_verdict_is_cached_per_sha(repo: Path, history: History, git_
 # (d) instrument errors fail open
 
 
-def _status_for_clean(status: str) -> Any:
+def _status_for_clean(status: NodeIdStatus) -> Any:
     def verdict(tree: Path, node_id: str) -> NodeIdResult:
         return NodeIdResult(status, 'probe') if node_id == CLEAN_ID else NodeIdResult('pass')
     return verdict
@@ -385,7 +385,7 @@ async def _assert_fails_open(
 @pytest.mark.asyncio
 @pytest.mark.parametrize('status', ['error', 'skipped'])
 async def test_a_non_verdict_id_is_an_error_not_a_pass(
-    repo: Path, history: History, git_ops: GitOps, status: str,
+    repo: Path, history: History, git_ops: GitOps, status: NodeIdStatus,
 ) -> None:
     screen, events = _screen(git_ops, run_ids=ScriptedRunner(verdict=_status_for_clean(status)))
     await _assert_fails_open(screen, events, _config(repo), history, cause='clean')
