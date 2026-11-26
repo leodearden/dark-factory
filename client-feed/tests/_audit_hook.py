@@ -169,7 +169,7 @@ def _ca_bundles() -> list[str]:
     return [*bundles, certifi.where()]
 
 
-def _roots(paths: Sequence[str]) -> tuple[Path, ...]:
+def _roots(paths: Sequence[str | os.PathLike[str]]) -> tuple[Path, ...]:
     return tuple(dict.fromkeys(Path(os.path.abspath(path)) for path in paths))
 
 
@@ -181,15 +181,15 @@ def interpreter_roots() -> tuple[Path, ...]:
 
 def runtime_roots() -> tuple[Path, ...]:
     """Where the Python runtime and the CA bundle live: what any process opens, so no scope rule is about them."""
-    return _roots([*map(str, interpreter_roots()), *_ca_bundles()])
+    return _roots([*interpreter_roots(), *_ca_bundles()])
 
 
 def _under(path: Path, roots: tuple[Path, ...]) -> bool:
     return any(candidate.is_relative_to(root) for candidate in {path, path.resolve()} for root in roots)
 
 
-def _in_runtime_cache(path: Path, roots: tuple[Path, ...]) -> bool:
-    """Whether `path` lies in a bytecode cache of the runtime, the one place the importer writes there."""
+def _in_bytecode_cache_under(path: Path, roots: tuple[Path, ...]) -> bool:
+    """Whether `path` lies in a bytecode cache under `roots`, the one place the importer writes there."""
     return _BYTECODE_CACHE in path.parts and _under(path, roots)
 
 
@@ -227,12 +227,12 @@ class AuditRecord:
     def opens_outside(self, roots: tuple[Path, ...]) -> tuple[Opened, ...]:
         """Leaves out reads under `roots` and writes into a bytecode cache under them; any other write is kept."""
         resolved = _resolved(roots)
-        return tuple(opened for opened in self.opens if not _runtime_open(opened, resolved))
+        return tuple(opened for opened in self.opens if not _exempt_open(opened, resolved))
 
     def mutations_outside(self, roots: tuple[Path, ...]) -> tuple[Mutated, ...]:
         """Leaves out the importer's bytecode-cache writes under `roots`; any other mutation under them is kept."""
         resolved = _resolved(roots)
-        return tuple(mutated for mutated in self.mutations if not _runtime_cache_write(mutated, resolved))
+        return tuple(mutated for mutated in self.mutations if not _exempt_cache_write(mutated, resolved))
 
     def opens_outside_runtime(self) -> tuple[Opened, ...]:
         """Leaves out reads of the runtime and the CA bundle, and the importer's bytecode-cache writes; any other write is kept."""
@@ -243,12 +243,12 @@ class AuditRecord:
         return self.mutations_outside(runtime_roots())
 
 
-def _runtime_open(opened: Opened, roots: tuple[Path, ...]) -> bool:
-    return _in_runtime_cache(opened.path, roots) if opened.writes else _under(opened.path, roots)
+def _exempt_open(opened: Opened, roots: tuple[Path, ...]) -> bool:
+    return _in_bytecode_cache_under(opened.path, roots) if opened.writes else _under(opened.path, roots)
 
 
-def _runtime_cache_write(mutated: Mutated, roots: tuple[Path, ...]) -> bool:
-    return bool(mutated.paths) and all(_in_runtime_cache(path, roots) for path in mutated.paths)
+def _exempt_cache_write(mutated: Mutated, roots: tuple[Path, ...]) -> bool:
+    return bool(mutated.paths) and all(_in_bytecode_cache_under(path, roots) for path in mutated.paths)
 
 
 def _resolved(roots: tuple[Path, ...]) -> tuple[Path, ...]:
