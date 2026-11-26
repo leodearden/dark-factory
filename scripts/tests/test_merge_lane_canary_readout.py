@@ -241,3 +241,28 @@ def test_the_journal_parser_types_sweep_verdicts_and_audit_records():
         (canary.AuditLevel.WARNING, (LEDGER_TEXT,)), (canary.AuditLevel.INFO, ()),
     ]
     assert parsed.unparsed == 1
+
+
+def test_a_missing_journal_extract_is_a_fault_not_a_traceback(project, tmp_path, capsys):
+    root, _shas, _extract = project
+    out = tmp_path / 'canary.md'
+
+    rc = run_readout(root, tmp_path / 'absent-journal.txt', out)
+
+    assert rc == readout.EXIT_FAULT
+    assert 'absent-journal.txt' in capsys.readouterr().err
+    assert not out.exists()
+
+
+def test_a_missing_runs_db_is_a_fault_not_a_traceback(tmp_path, capsys):
+    root = tmp_path / 'project'
+    build_repo(root)
+    extract = tmp_path / 'journal.txt'
+    extract.write_text('', encoding='utf-8')
+    out = tmp_path / 'canary.md'
+
+    rc = run_readout(root, extract, out)
+
+    assert rc == readout.EXIT_FAULT
+    assert str(runs_db(root)) in capsys.readouterr().err
+    assert not out.exists()

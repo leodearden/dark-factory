@@ -18,7 +18,8 @@ cause predates the window's start still sees it.
 
 EXIT CODES: 0 the readout was written, whatever its predicates say; 3 the
 window's rows predate the D10 alpha fields, and the refusal naming them was
-written instead; 2 a usage or git fault.
+written instead; 2 a usage fault, an unreadable runs.db or journal extract, or
+a git fault.
 """
 from __future__ import annotations
 
@@ -586,32 +587,41 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _fault(message: object) -> int:
+    print(message, file=sys.stderr)
+    return EXIT_FAULT
+
+
 def main(argv: Sequence[str], now: datetime | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
         lo, hi = mlt.parse_window(args.window, now or datetime.now(UTC))
     except argparse.ArgumentTypeError as exc:
-        print(exc, file=sys.stderr)
-        return EXIT_FAULT
+        return _fault(exc)
     root = mlt.resolve_project_roots([args.project_root] if args.project_root else None)[0]
     git_root = Path(args.git_root).resolve() if args.git_root else root
     db = runs_db(root)
-    with closing(_connect_ro(db)) as conn:
-        events = load_window(conn, lo, hi)
-        task_starts = load_task_verify_starts(conn, lo, hi)
+    try:
+        with closing(_connect_ro(db)) as conn:
+            events = load_window(conn, lo, hi)
+            task_starts = load_task_verify_starts(conn, lo, hi)
+    except sqlite3.Error as exc:
+        return _fault(f'runs.db read failed: {db}: {exc}')
     missing = canary.missing_alpha_fields(events.verify, events.cancelled, events.voided, events.finalized)
     if missing:
         args.out.write_text(render_refusal(missing, lo, hi), encoding='utf-8')
         return EXIT_REFUSED
-    journal = parse_journal(args.journal_extract.read_text(encoding='utf-8').splitlines())
+    try:
+        journal = parse_journal(args.journal_extract.read_text(encoding='utf-8').splitlines())
+    except (OSError, UnicodeDecodeError) as exc:
+        return _fault(f'journal extract read failed: {exc}')
     try:
         history = MainHistory(
             updates=tuple(read_main_updates(git_root, lo - LOOKBACK, hi)),
             gate_ranges=read_gate_ranges(git_root, events.gates),
         )
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
-        print(f'git read failed: {exc}', file=sys.stderr)
-        return EXIT_FAULT
+        return _fault(f'git read failed: {exc}')
     sources = (f'runs.db: {db}', f"main's reflog: {git_root}", f'journal extract: {args.journal_extract}')
     readout = compute(events, task_starts, journal, history, (lo, hi), Hosts(args.laptop_host, args.local_host), sources)
     args.out.write_text(render(readout), encoding='utf-8')
