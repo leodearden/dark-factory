@@ -17,7 +17,6 @@ DEPLOY = Path(__file__).resolve().parents[1] / 'deploy'
 PROVISION = DEPLOY / 'provision_verify_host.sh'
 CONTRACT = DEPLOY / 'verify_host_contract.py'
 CLI_TIMEOUT = cli_timeout_from_env('PROVISION_VERIFY_HOST_TEST_TIMEOUT')
-HOST_CHANGING_COMMANDS = {'apt-get', 'sudo', 'uv'}
 
 
 class Scene:
@@ -60,7 +59,7 @@ hosts:
             [str(script), *args], env=self.env, capture_output=True, text=True, timeout=CLI_TIMEOUT, check=False,
         )
 
-    def ssh_calls(self) -> list[list[str]]:
+    def ssh_calls(self) -> list[dict]:
         if not self.ssh_log.exists():
             return []
         return [json.loads(line) for line in self.ssh_log.read_text().splitlines()]
@@ -120,9 +119,7 @@ class TestSyncConfig:
         assert scene.run('box', '--roster', str(scene.roster), '--sync-config').returncode == 0
         assert sorted(path.name for path in scene.remote.iterdir()) == ['config']
         assert scene.home_snapshot() == before
-        for argv in scene.ssh_calls():
-            assert not HOST_CHANGING_COMMANDS & set(argv), argv
-            assert ['git', 'push'] not in [argv[i:i + 2] for i in range(len(argv))], argv
+        assert [call['step'] for call in scene.ssh_calls()] == ['per_host_yaml']
 
     def test_an_unchanged_render_is_not_rewritten(self, scene: Scene) -> None:
         configs = [scene.remote / 'config' / name for name in ('p.yaml', 'q.yaml')]
