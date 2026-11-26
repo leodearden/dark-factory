@@ -16,11 +16,13 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+from _defect_ruling_fixtures import RULED_REF, SECOND_RULED_REF, contract_ruling
 from _plan_model_helpers import read_model
 from _review_fixtures import review_aggregation, review_issue
 from _review_payloads import blocking_review, pass_review
 from escalation.disposition import ReviewerDisposition
 from shared import safe_io
+from shared.defects import IssueKind, IssueKindFlag, RulingSubject
 
 from orchestrator.artifacts import (
     LANE_SYMLINKED_ARTIFACTS,
@@ -38,11 +40,12 @@ from orchestrator.artifacts import (
     ReviewsRootMissing,
     TaskArtifacts,
     _normalize_plan,
+    format_issue_section,
     iteration_entry_written_by_orchestrator,
     plan_task_text_fp,
 )
 from orchestrator.mcp.verdict_tools import _submit_review_verdict
-from orchestrator.review_payload import NoteDisposition, ReviewPayloadError
+from orchestrator.review_payload import DefectRuling, NoteDisposition, ReviewPayloadError
 
 
 @pytest.fixture
@@ -1465,6 +1468,35 @@ class TestReviews:
         agg = self._aggregation([])
         assert agg.format_for_escalation() == agg.format_for_replan()
 
+    @staticmethod
+    def _kind_line(text: str) -> str:
+        [line] = [line for line in text.splitlines() if line.startswith('**Kind:**')]
+        return line
+
+    def test_an_issue_kind_is_rendered_as_written(self):
+        issue = {**review_issue('alpha', 'blocking'), 'kind': IssueKind.DOCS.value}
+
+        text = format_issue_section('# Feedback\n', [issue])
+
+        assert self._kind_line(text) == f'**Kind:** {IssueKind.DOCS.value}'
+
+    @pytest.mark.parametrize(
+        ('kind', 'flag'),
+        [
+            pytest.param(None, IssueKindFlag.MISSING, id='missing'),
+            pytest.param('bug', IssueKindFlag.UNRECOGNISED, id='unrecognised'),
+        ],
+    )
+    def test_a_kind_read_fail_closed_is_rendered_with_its_flag(self, kind, flag):
+        issue = review_issue('alpha', 'blocking')
+        if kind is not None:
+            issue['kind'] = kind
+
+        line = self._kind_line(review_aggregation([issue], []).format_for_replan())
+
+        assert line.startswith(f'**Kind:** {IssueKind.DEFECT.value}')
+        assert flag.value in line
+
     def test_format_for_replan_stays_blocking_only(self):
         agg = self._aggregation(['alpha', 'beta'])
         text = agg.format_for_replan()
@@ -1597,6 +1629,74 @@ class TestReviewNoteDispositions:
         )
 
         assert aggregation.note_dispositions == ()
+
+
+_RETIREMENT_RULING = contract_ruling(
+    ref=SECOND_RULED_REF, subject=RulingSubject.RETIREMENT.value, accepted=False,
+)
+_TYPED_RULINGS = (
+    DefectRuling(RULED_REF, RulingSubject.CLOSURE, True),
+    DefectRuling(SECOND_RULED_REF, RulingSubject.RETIREMENT, False),
+)
+
+
+class TestReviewDefectRulings:
+    def test_mirrored_review_rulings_reach_the_aggregation_in_order(
+        self, artifacts: TaskArtifacts,
+    ):
+        artifacts.write_review('reviewer_comprehensive', {
+            'reviewer': 'reviewer_comprehensive',
+            'verdict': 'PASS',
+            'issues': [],
+            'summary': 'OK',
+            'defect_rulings': [contract_ruling(), dict(_RETIREMENT_RULING)],
+        })
+
+        assert artifacts.aggregate_reviews().defect_rulings == _TYPED_RULINGS
+
+    def test_an_error_review_contributes_no_rulings(self, artifacts: TaskArtifacts):
+        artifacts.write_review('reviewer_comprehensive', {
+            'reviewer': 'reviewer_comprehensive',
+            'verdict': 'ERROR',
+            'issues': [],
+            'summary': 'Reviewer error',
+            'defect_rulings': [contract_ruling()],
+        })
+
+        assert artifacts.aggregate_reviews().defect_rulings == ()
+
+    def test_a_review_without_the_key_gives_none(self, artifacts: TaskArtifacts):
+        artifacts.write_review('reviewer_comprehensive', {
+            'reviewer': 'reviewer_comprehensive',
+            'verdict': 'PASS',
+            'issues': [],
+            'summary': 'OK',
+        })
+
+        assert artifacts.aggregate_reviews().defect_rulings == ()
+
+    def test_rulings_survive_the_verdict_tool_to_mirror_round_trip(
+        self, artifacts: TaskArtifacts,
+    ):
+        role = 'reviewer_comprehensive'
+        result = _submit_review_verdict(
+            artifacts, role, 'sid', role, 'PASS', [], 'OK',
+            defect_rulings=[contract_ruling(), dict(_RETIREMENT_RULING)],
+        )
+        assert result['status'] == 'ok'
+        envelope = artifacts.read_verdict(role)
+        assert envelope is not None
+
+        artifacts.write_review(role, envelope['verdict'])
+
+        assert artifacts.aggregate_reviews().defect_rulings == _TYPED_RULINGS
+
+    def test_a_directly_built_aggregation_carries_no_rulings(self):
+        aggregation = ReviewAggregation(
+            has_blocking_issues=False, blocking_issues=[], suggestions=[], reviews={},
+        )
+
+        assert aggregation.defect_rulings == ()
 
 
 class TestBlockingDependency:

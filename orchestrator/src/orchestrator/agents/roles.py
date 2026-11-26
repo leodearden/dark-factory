@@ -3,9 +3,11 @@
 import textwrap
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
+from enum import StrEnum
 from types import MappingProxyType
-from typing import Literal
+from typing import Literal, TypeVar
 
+from shared.defects import IssueKind, RulingSubject
 from shared.followup_items import (
     FOLLOWUP_ITEMS_METADATA_KEY,
     FOLLOWUP_ITEMS_REFUSED_ERROR,
@@ -1173,7 +1175,8 @@ DEBUGGER = AgentRole(
 #
 # _REVIEWER_CONTRACT_TEMPLATE is the FROZEN machine contract: the
 # submit_review_verdict tool-call instruction and the verdict-field schema
-# (the reviewer_{name} identity literal, and the verdict/severity enums) —
+# (the reviewer_{name} identity literal, and the verdict/severity/kind and
+# ruling-subject enums) —
 # everything the verdict-tools server + read_verdict parse. It is
 # un-editable by construction: a pinned artifact only ever supplies the
 # heuristics argument to compose_prompt, never the contract (see
@@ -1200,7 +1203,32 @@ DEBUGGER = AgentRole(
 # specialization footer always follows the whole contract.
 # ----------------------------------------------------------------------
 
-_SEVERITY_CHOICES = ' or '.join(f'`"{severity}"`' for severity in IssueSeverity)
+_Choice = TypeVar('_Choice', bound=StrEnum)
+
+
+def _quoted_choices(vocabulary: type[StrEnum]) -> str:
+    *rest, last = (f'`"{member}"`' for member in vocabulary)
+    return f'{", ".join(rest)} or {last}' if rest else last
+
+
+def _choice_meanings(vocabulary: type[_Choice], meanings: Mapping[_Choice, str]) -> str:
+    return ''.join(f'  - `"{member}"`: {meanings[member]}\n' for member in vocabulary)
+
+
+_ISSUE_KIND_MEANINGS: Mapping[IssueKind, str] = MappingProxyType({
+    IssueKind.DEFECT: 'wrong runtime behaviour: the code does the wrong thing when it runs.',
+    IssueKind.TEST_QUALITY: 'a finding about the tests themselves, not the code they test.',
+    IssueKind.DOCS: 'a documentation, prompt or comment finding.',
+    IssueKind.PROCESS: (
+        'any other finding that is not wrong runtime behaviour, such as a '
+        'code-quality heuristic, a lint or type error, scope, plan or commit hygiene.'
+    ),
+})
+
+_RULING_SUBJECT_MEANINGS: Mapping[RulingSubject, str] = MappingProxyType({
+    RulingSubject.CLOSURE: "an exemption or withdrawal declared for one of this task's defects.",
+    RulingSubject.RETIREMENT: 'a defect test this change removes.',
+})
 
 _REVIEWER_CONTRACT_TEMPLATE = """\
 You are a code reviewer specializing in: **{specialization}**
@@ -1217,9 +1245,13 @@ Call `submit_review_verdict` with these fields:
 - **reviewer**: the literal string `"reviewer_{name}"` — it MUST match
   this exactly, or your verdict is rejected.
 - **verdict**: `"PASS"` or `"ISSUES_FOUND"`.
-- **issues**: a list of objects, each with `severity` (""" + _SEVERITY_CHOICES + """),
+- **issues**: a list of objects, each with `severity` (""" + _quoted_choices(IssueSeverity) + """),
+  `kind` (""" + _quoted_choices(IssueKind) + """),
   `location` (e.g. `"src/foo.py:42"`), `category`, a `description`, and a
-  `suggested_fix`. Empty when `verdict` is `"PASS"`.
+  `suggested_fix`. Empty when `verdict` is `"PASS"`. The `kind` is:
+""" + _choice_meanings(IssueKind, _ISSUE_KIND_MEANINGS) + """\
+  Every issue MUST carry one. An issue without a valid `kind` is refused and
+  nothing is written, so call `submit_review_verdict` again with it.
 - **summary**: a one-paragraph summary of the review.
 - **note_dispositions**: one object per id listed under
   `{notes_heading}` in your briefing, each with
@@ -1228,6 +1260,12 @@ Call `submit_review_verdict` with these fields:
   note describes, and you verified it), `"no_action"` (a pure observation,
   nothing to do) or `"work"` (follow-up work this branch does not do; it
   becomes a task). Omit it when the briefing lists no notes.
+- **defect_rulings**: one object per pending defect closure or defect-test
+  retirement your briefing asks you to rule on, each with `ref` (exactly as
+  the briefing gives it), `subject` (""" + _quoted_choices(RulingSubject) + """) and
+  `accepted` (`true` or `false`). The `subject` is:
+""" + _choice_meanings(RulingSubject, _RULING_SUBJECT_MEANINGS) + """\
+  Omit it when the briefing lists none.
 """
 
 REVIEWER_INV12_BLOCKERS = """
@@ -1316,11 +1354,11 @@ _REVIEWER_HEURISTICS_TEMPLATES: dict[ReviewBriefing, str] = {
 # outdated contract assumption (mirrors _CURATOR_PROMPT_HARNESS_VERSION).
 # Each generation has its own, so a pinned incumbent artifact can never
 # resolve for the context-complete role, whose prompt_id is the same.
-_REVIEWER_PROMPT_HARNESS_VERSION = 'reviewer-v2'
+_REVIEWER_PROMPT_HARNESS_VERSION = 'reviewer-v3'
 
 _REVIEWER_PROMPT_HARNESS_VERSIONS: dict[ReviewBriefing, str] = {
     ReviewBriefing.DIFF_ONLY: _REVIEWER_PROMPT_HARNESS_VERSION,
-    ReviewBriefing.CONTEXT_COMPLETE: 'reviewer-d2-v2',
+    ReviewBriefing.CONTEXT_COMPLETE: 'reviewer-d2-v3',
 }
 
 

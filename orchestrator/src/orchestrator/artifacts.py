@@ -23,12 +23,13 @@ from types import MappingProxyType
 from typing import Any
 
 from shared import safe_io
+from shared.defects import issue_kind_of
 from shared.plan_deviation import DeviationRecord
 
 from orchestrator import file_mutex
 from orchestrator.config import TASK_META_DIRNAME
 from orchestrator.review_issue_contract import REVIEW_ISSUE_OFF_CONTRACT_FACT, check_issues
-from orchestrator.review_payload import NoteDisposition, Verdict, normalize_review
+from orchestrator.review_payload import DefectRuling, NoteDisposition, Verdict, normalize_review
 from orchestrator.scope_drift import InvalidScopeRequest, ScopeDriftReport, ScopeRequest
 
 logger = logging.getLogger(__name__)
@@ -768,6 +769,7 @@ class ReviewAggregation:
     reviewer_errors: list[str] = field(default_factory=list)
     errored_reviews: dict[str, dict] = field(default_factory=dict)
     note_dispositions: tuple[NoteDisposition, ...] = ()
+    defect_rulings: tuple[DefectRuling, ...] = ()
 
     @property
     def all_reviewers_errored(self) -> bool:
@@ -801,7 +803,7 @@ def _warn_off_contract_issues(reviewer_name: str, issues: tuple[dict, ...]) -> N
 
 
 def format_issue_section(heading: str, issues: Iterable[Mapping[str, Any]], *, issue_level: int = 2) -> str:
-    """*heading*, then each review issue under a level-*issue_level* heading: reviewer, category, location, issue and suggested fix."""
+    """*heading*, then each review issue under a level-*issue_level* heading: reviewer, category, kind, location, issue and suggested fix."""
     issue_heading = '#' * issue_level
     lines = [heading]
     for issue in issues:
@@ -810,7 +812,12 @@ def format_issue_section(heading: str, issues: Iterable[Mapping[str, Any]], *, i
         category = issue.get('category', '')
         description = issue.get('description', '')
         fix = issue.get('suggested_fix', '')
+        reading = issue_kind_of(issue)
         lines.append(f'{issue_heading} [{reviewer}] {category}')
+        lines.append(
+            f'**Kind:** {reading.kind}'
+            + (f' (read fail-closed: kind {reading.flag})' if reading.flagged else '')
+        )
         if location:
             lines.append(f'**Location:** {location}')
         lines.append(f'**Issue:** {description}')
@@ -1856,6 +1863,7 @@ class TaskArtifacts:
         suggestions = []
         errored_reviews = {}
         note_dispositions: list[NoteDisposition] = []
+        defect_rulings: list[DefectRuling] = []
 
         for reviewer_name, review in reviews.items():
             payload = normalize_review(review)
@@ -1864,6 +1872,7 @@ class TaskArtifacts:
             else:
                 _warn_off_contract_issues(reviewer_name, payload.issues)
             note_dispositions.extend(payload.note_dispositions)
+            defect_rulings.extend(payload.defect_rulings)
             blocking.extend(
                 {**issue, 'reviewer': reviewer_name} for issue in payload.blocking_issues
             )
@@ -1880,6 +1889,7 @@ class TaskArtifacts:
             reviewer_errors=list(errored_reviews),
             errored_reviews=errored_reviews,
             note_dispositions=tuple(note_dispositions),
+            defect_rulings=tuple(defect_rulings),
         )
 
     def validate_plan_prerequisites(self) -> None:

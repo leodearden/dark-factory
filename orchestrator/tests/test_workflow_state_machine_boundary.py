@@ -500,6 +500,7 @@ class _WideningReplanStub(AgentStub):
             self._blocked = True
             review = _make_review(role, 'ISSUES_FOUND', [{
                 'severity': 'blocking',
+                'kind': 'test_quality',
                 'location': 'lib.py:5',
                 'category': 'missing_edge_case',
                 'description': 'No test for empty name',

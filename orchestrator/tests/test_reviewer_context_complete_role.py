@@ -54,8 +54,8 @@ class TestRoster:
         role = _context_complete()
 
         assert role.name == REVIEWER_COMPREHENSIVE.name == 'reviewer_comprehensive'
-        assert role.prompt_harness_version == 'reviewer-d2-v2'
-        assert REVIEWER_COMPREHENSIVE.prompt_harness_version == 'reviewer-v2'
+        assert role.prompt_harness_version == 'reviewer-d2-v3'
+        assert REVIEWER_COMPREHENSIVE.prompt_harness_version == 'reviewer-v3'
 
 
 class TestPromptSplit:
@@ -66,6 +66,8 @@ class TestPromptSplit:
 
         assert role.prompt_spec.contract == REVIEWER_COMPREHENSIVE.prompt_spec.contract
         assert '**note_dispositions**' in role.prompt_spec.contract
+        assert '`kind`' in role.prompt_spec.contract
+        assert '**defect_rulings**' in role.prompt_spec.contract
 
     def test_the_generations_differ_only_in_rule_2(self):
         role = _context_complete()
@@ -113,7 +115,7 @@ class TestResolvedText:
         assert REVIEWER_COMPREHENSIVE.prompt_spec is not None
 
         store.pin(
-            REVIEWER_COMPREHENSIVE.prompt_spec.prompt_id, 'opus', 'reviewer-v2',
+            REVIEWER_COMPREHENSIVE.prompt_spec.prompt_id, 'opus', 'reviewer-v3',
             heuristics='PINNED: an optimised incumbent heuristics block.',
             provenance=ArtifactProvenance(
                 optimizer_model='claude-opus-4',
@@ -123,7 +125,7 @@ class TestResolvedText:
                 accept_delta=0.05,
                 git_sha='abc1234',
                 date='2026-10-18',
-                harness_version='reviewer-v2',
+                harness_version='reviewer-v3',
             ),
         )
 
@@ -151,4 +153,4 @@ def test_build_reviewer_role_shares_the_incumbent_tooling():
     assert role.allowed_tools == REVIEWER_COMPREHENSIVE.allowed_tools
     assert role.disallowed_tools == REVIEWER_COMPREHENSIVE.disallowed_tools
     assert role.mcp_families == REVIEWER_COMPREHENSIVE.mcp_families
-    assert role.prompt_harness_version == 'reviewer-d2-v2'
+    assert role.prompt_harness_version == 'reviewer-d2-v3'

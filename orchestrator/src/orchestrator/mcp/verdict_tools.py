@@ -21,7 +21,7 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
@@ -46,13 +46,16 @@ from shared.mcp_missing_arguments import MissingArgumentMiddleware
 from orchestrator.artifacts import TaskArtifacts, _validate_verdict_role
 from orchestrator.mcp import markup_journal, markup_sink
 from orchestrator.review_issue_contract import (
+    REQUIRED_ISSUE_FIELDS,
     REVIEW_ISSUE_OFF_CONTRACT_FACT,
     IssueIntake,
     check_issues,
 )
 from orchestrator.review_payload import (
     ReviewPayloadError,
+    defect_rulings_record,
     note_dispositions_record,
+    parse_defect_rulings,
     parse_note_dispositions,
 )
 
@@ -82,10 +85,10 @@ def _envelope(role: str, session_id: str, payload: dict) -> dict:
 #
 # Only _submit_review_verdict has constrained/validated fields (the
 # reviewer==role identity check, the verdict enum, the note_dispositions
-# shape below, and each issue checked against the contract in
-# orchestrator/review_issue_contract.py) — the other three payloads
-# (completion/triage/merge) have no enum-like fields today,
-# so they write whatever they receive. Booleans and lists are still
+# and defect_rulings shapes below, and each issue's severity, kind and other fields checked
+# against the contract in orchestrator/review_issue_contract.py) — the
+# other three payloads (completion/triage/merge) have no enum-like fields
+# today, so they write whatever they receive. Booleans and lists are still
 # type-checked at the pydantic MCP tool boundary in create_server(). Add
 # parallel validation here if any of those payloads gain a constrained
 # field in the future.
@@ -112,6 +115,7 @@ def _submit_review_verdict(
     issues: list[dict],
     summary: str,
     note_dispositions: list[dict] | None = None,
+    defect_rulings: list[dict] | None = None,
 ) -> dict[str, Any]:
     if reviewer != role:
         return {
@@ -129,6 +133,7 @@ def _submit_review_verdict(
         }
     try:
         parsed_notes = parse_note_dispositions(note_dispositions, reviewer=reviewer)
+        parsed_rulings = parse_defect_rulings(defect_rulings, reviewer=reviewer)
     except ReviewPayloadError as exc:
         return {'status': 'error', 'message': str(exc)}
     intake = check_issues(issues)
@@ -140,6 +145,7 @@ def _submit_review_verdict(
         'issues': list(intake.issues),
         'summary': summary,
         **note_dispositions_record(parsed_notes),
+        **defect_rulings_record(parsed_rulings),
     }
     ack = _write_and_ack(artifacts, role, session_id, payload)
     if intake.normalised:
@@ -158,16 +164,24 @@ class IssueIntakeOutcome(StrEnum):
     REFUSED = 'refused'
 
 
+def _in_prose(names: Sequence[str]) -> str:
+    *leading, last = names
+    return f'{", ".join(leading)} and {last}' if leading else last
+
+
+_REQUIRED_FIELDS_TEXT = _in_prose([str(field) for field in REQUIRED_ISSUE_FIELDS])
+
+
 def _issue_contract_refusal(intake: IssueIntake) -> dict[str, Any]:
     deviations = [d.describe() for d in intake.unusable]
     return {
         'status': 'error',
         'message': (
             'nothing was written: every issue must be an object carrying a '
-            'severity and a description, and these are not: '
+            f'{_REQUIRED_FIELDS_TEXT}. These are not: '
             + '; '.join(deviations) + '. Call submit_review_verdict again with '
-            'severity and description on every issue (or drop the issue) and '
-            'the verdict will land.'
+            f'a {_REQUIRED_FIELDS_TEXT} on every issue, as the contract '
+            'states (or drop the issue), and the verdict will land.'
         ),
         'issue_contract': {'outcome': IssueIntakeOutcome.REFUSED, 'deviations': deviations},
     }
@@ -562,6 +576,7 @@ def create_server(
             issues: list[dict],
             summary: str,
             note_dispositions: list[dict] | None = None,
+            defect_rulings: list[dict] | None = None,
         ) -> dict[str, Any]:
             """Submit a reviewer's verdict for this task.
 
@@ -572,20 +587,26 @@ def create_server(
                 verdict: One of "PASS" or "ISSUES_FOUND".
                 issues: Structured list of issues found (empty if PASS),
                     each shaped as the reviewer contract in your
-                    instructions states. An issue lacking severity or
-                    description is refused (status: error); other
-                    off-contract fields are normalised and reported back
-                    under issue_contract.
+                    instructions states. An issue lacking severity, kind
+                    or description, or with an unknown kind, is refused
+                    (status: error); other off-contract fields are
+                    normalised and reported back under issue_contract.
                 summary: One-paragraph summary of the review.
                 note_dispositions: One entry per info note your briefing lists, each
                     {escalation_id, disposition: "addressed" | "no_action" |
                     "work", rationale}. Omit it when the briefing lists no
                     notes. A malformed list is rejected (status: error)
                     rather than written.
+                defect_rulings: One entry per defect closure or defect-test
+                    retirement your briefing asks you to rule on, each
+                    shaped as the reviewer contract in your instructions
+                    states. Omit it when the briefing asks for none. A
+                    malformed list is rejected (status: error) rather than
+                    written.
             """
             response = _submit_review_verdict(
                 artifacts, role, session_id, reviewer, verdict, issues, summary,
-                note_dispositions,
+                note_dispositions, defect_rulings,
             )
             if 'issue_contract' in response:
                 await fact_journal({
