@@ -8,7 +8,12 @@ from _defects import reported, ruled
 
 from client_feed.contract import Degradation, InboxLine, RevealRequested, Source
 from client_feed.defect_ref import portal_ref
-from client_feed.unfiled import still_unfiled, unfiled_degradation
+from client_feed.unfiled import (
+    deferred_gate_degradation,
+    still_behind_deferred_gates,
+    still_unfiled,
+    unfiled_degradation,
+)
 
 PROJECT = 'acme'
 EPOCH = datetime(2026, 10, 21, 12, 0, tzinfo=UTC)
@@ -124,6 +129,84 @@ class TestUnfiledDegradation:
     @pytest.mark.parametrize('grace_seconds', [0, 60, 3_600])
     def test_the_reason_names_the_grace_it_was_judged_against(self, grace_seconds: int) -> None:
         degradation = unfiled_degradation(
+            {REF: at(0)}, now=at(grace_seconds + 1), grace_seconds=grace_seconds
+        )
+
+        assert degradation is not None
+        assert f' past {grace_seconds}s: ' in degradation.reason
+
+
+def behind(
+    held: dict[str, datetime], waiting: AbstractSet[str] | None, *, now: datetime = at(500)
+) -> dict[str, datetime]:
+    return still_behind_deferred_gates(held, waiting, now=now)
+
+
+class TestStillBehindDeferredGates:
+    def test_a_ref_newly_waiting_is_held_since_now(self) -> None:
+        assert behind({}, {REF}, now=at(500)) == {REF: at(500)}
+
+    def test_a_held_ref_still_waiting_keeps_its_first_time(self) -> None:
+        assert behind({REF: at(10)}, {REF}, now=at(500)) == {REF: at(10)}
+
+    def test_a_held_ref_no_longer_waiting_is_dropped(self) -> None:
+        assert behind({REF: at(10), OTHER_REF: at(20)}, {OTHER_REF}) == {OTHER_REF: at(20)}
+
+    def test_unreadable_carriers_hand_back_the_held_refs_and_add_nothing(self) -> None:
+        assert behind({REF: at(10)}, None, now=at(500)) == {REF: at(10)}
+
+    def test_nothing_waiting_empties_the_map(self) -> None:
+        assert behind({REF: at(10), OTHER_REF: at(20)}, frozenset()) == {}
+
+    def test_the_held_map_is_never_mutated(self) -> None:
+        held = {REF: at(10)}
+
+        behind(held, {OTHER_REF})
+        behind(held, None)
+
+        assert held == {REF: at(10)}
+
+
+class TestDeferredGateDegradation:
+    def test_nothing_held_names_nothing(self) -> None:
+        assert deferred_gate_degradation({}, now=at(10_000), grace_seconds=GRACE) is None
+
+    def test_a_ref_held_exactly_the_grace_is_not_yet_overdue(self) -> None:
+        assert deferred_gate_degradation({REF: at(0)}, now=at(GRACE), grace_seconds=GRACE) is None
+
+    def test_a_ref_held_longer_than_the_grace_names_the_filer(self) -> None:
+        degradation = deferred_gate_degradation(
+            {REF: at(0)}, now=at(GRACE + 1), grace_seconds=GRACE
+        )
+
+        assert degradation == Degradation(
+            source=Source.FILER,
+            reason=f'1 defect report(s) waiting on a deferred gate past 600s: {REF}',
+        )
+
+    def test_overdue_refs_are_named_oldest_first_ties_in_ref_order_and_a_young_one_is_not(
+        self,
+    ) -> None:
+        held = {
+            'portal:acme:2:1': at(200),
+            'portal:acme:9:9': at(100),
+            'portal:acme:3:3': at(100),
+            'portal:acme:5:5': at(2_000),
+        }
+
+        degradation = deferred_gate_degradation(held, now=at(2_100), grace_seconds=GRACE)
+
+        assert degradation == Degradation(
+            source=Source.FILER,
+            reason=(
+                '3 defect report(s) waiting on a deferred gate past 600s:'
+                ' portal:acme:3:3, portal:acme:9:9, portal:acme:2:1'
+            ),
+        )
+
+    @pytest.mark.parametrize('grace_seconds', [0, 60, 3_600])
+    def test_the_reason_names_the_grace_it_was_judged_against(self, grace_seconds: int) -> None:
+        degradation = deferred_gate_degradation(
             {REF: at(0)}, now=at(grace_seconds + 1), grace_seconds=grace_seconds
         )
 
