@@ -13,6 +13,7 @@ import math
 from collections.abc import Awaitable, Callable
 
 import pytest
+
 from shared.status_paging import StatusPage, StatusPagingError, walk_status_pages
 
 _LABEL = '/proj/paged'
