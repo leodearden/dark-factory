@@ -703,7 +703,7 @@ _WALL_CLOCK_DEADLINE_DEBT: dict[str, int] = {
     'orchestrator/tests/test_merge_queue_rebased_landing_dead_base.py': 2,
     'orchestrator/tests/test_merge_skew_tripwire.py': 2,
     'orchestrator/tests/test_merge_worktree_lifecycle_integration_gate.py': 2,
-    'orchestrator/tests/test_offline_lane_infra_integration.py': 2,
+    'orchestrator/tests/test_offline_lane_infra_integration.py': 1,
     'orchestrator/tests/test_verify_cancel_unwind.py': 2,
     'orchestrator/tests/test_verify_ruff_config_boundary.py': 2,
     'orchestrator/tests/test_before_done_script.py': 1,
