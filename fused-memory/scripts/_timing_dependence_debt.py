@@ -27,7 +27,7 @@
 # Re-measured 2026-11-23 over main dfae8ef060: main grew test_steward_outcome.py
 # by 2 and test_info_l2_never_gates.py by 1, so 1,880 in 442.  Re-measured over
 # main 873e979e48: main added one sleep in test_main_ticket_janitor_wiring.py, so
-# 1,881 in 443.
+# 1,881 in 443.  Task 11733 removed that sleep, and with it that file's entry.
 TIMING_DEPENDENCE_DEBT: dict[str, int] = {
     # orchestrator/tests
     'orchestrator/tests/test_merge_queue_request_liveness.py': 46,
@@ -353,7 +353,6 @@ TIMING_DEPENDENCE_DEBT: dict[str, int] = {
     'fused-memory/tests/test_ticket_parking.py': 1,
     'fused-memory/tests/test_write_triage_judge_wording.py': 1,
     'fused-memory/tests/test_link_heal_theta_seam.py': 1,
-    'fused-memory/tests/test_main_ticket_janitor_wiring.py': 1,
     # shared/tests
     'shared/tests/test_concurrency.py': 46,
     'shared/tests/test_probe_loop.py': 24,
