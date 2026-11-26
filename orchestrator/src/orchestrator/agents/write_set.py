@@ -32,9 +32,11 @@ Everything else is read-only. The common dir's ``rr-cache`` is deliberately
 not granted; sandboxed agents run with rerere off instead
 (``orchestrator/src/orchestrator/agents/sandbox_git_config.py``).
 ``compute_write_set`` is a PURE derivation —
-no filesystem side effects (no makedirs); existence/creation remains the
-backend's job. ``WriteSet.is_foreign_task_meta`` is the query plan-tools uses
-to flag a plan step naming another task's ``.task-meta`` (task 4825).
+no filesystem side effects (no makedirs). The backends skip a nonexistent
+writable path, so the carve-outs that must pre-exist are created outside the
+sandbox by ``ensure_sandbox_dirs``. ``WriteSet.is_foreign_task_meta`` is the
+query plan-tools uses to flag a plan step naming another task's
+``.task-meta`` (task 4825).
 """
 from __future__ import annotations
 
@@ -349,30 +351,37 @@ def _docs_shape_refusal(root: Path, target: Path, grant: Path) -> str | None:
     return None
 
 
-def ensure_claude_fleet_dir(write_set: WriteSet) -> bool:
-    """Best-effort, side-effecting pre-creation of ``write_set.claude_fleet``.
+def ensure_sandbox_dirs(write_set: WriteSet) -> list[Path]:
+    """Best-effort, side-effecting pre-creation of every carve-out that must
+    exist before the sandbox is built: ``claude_fleet`` (task 2996) and
+    ``tree_sitter_cache`` (task 3382).
 
     ``compute_write_set`` is intentionally PURE (no makedirs — pinned by
-    ``test_purity_no_makedirs_side_effect``), yet the ``~/.claude/fleet``
-    carve-out is load-bearing and must EXIST on disk before the sandbox is
-    built: neither backend can grant a nonexistent writable path from INSIDE
-    the sandbox — bwrap ``build_bwrap_command`` binds a writable extra only if
-    it is an existing file or dir (sandbox.py), and landlock ``_add_path``
-    skips any other path (landlock_exec.py) — and the agent
-    cannot create it itself because the parent ``~/.claude`` is read-only under
-    both backends. So the orchestrator must materialize it OUTSIDE the sandbox,
-    once, before dispatch (task 2996). This helper is co-located with the
-    single-source ``WriteSet`` (PRD D11) but kept SEPARATE from the pure
-    derivation.
+    ``test_purity_no_makedirs_side_effect``), yet neither backend can grant a
+    nonexistent writable path: bwrap ``build_bwrap_command`` binds a writable
+    extra only if it is an existing file or dir (sandbox.py), and landlock
+    ``_add_path`` skips any other path (landlock_exec.py). Both merely warn and
+    drop the grant. The agent cannot create these dirs from inside either,
+    because their parents ``~/.claude`` and ``~/.cache`` are read-only under
+    both backends. So the orchestrator materializes them OUTSIDE the sandbox,
+    once, before dispatch. Kept SEPARATE from the pure derivation but
+    co-located with the single-source ``WriteSet`` (PRD D11).
 
-    Returns ``True`` when the directory exists after the call (created or
-    already present — ``exist_ok=True``), ``False`` when ``mkdir`` raises
-    ``OSError``. Does no logging: the caller
-    (``TaskWorkflow._ensure_sandbox_dirs``) owns the operator-facing warning
-    and the ``task_id`` triage context.
+    ``uv_cache`` is deliberately absent: ``uv`` itself runs outside the sandbox
+    (verify, cold pre-provisioning) and materializes ``~/.cache/uv`` there.
+    Tree-sitter grammar builds run INSIDE the sandbox, so nothing outside it
+    would ever create ``~/.cache/tree-sitter``.
+
+    Returns the paths whose ``mkdir`` raised ``OSError``; an empty list means
+    every carve-out exists after the call (created or already present). Each
+    path is attempted independently, so one failure never suppresses the
+    rest. Does no logging: the caller (``TaskWorkflow._ensure_sandbox_dirs``)
+    owns the operator-facing warning and the ``task_id`` triage context.
     """
-    try:
-        write_set.claude_fleet.mkdir(parents=True, exist_ok=True)
-        return True
-    except OSError:
-        return False
+    failed: list[Path] = []
+    for path in (write_set.claude_fleet, write_set.tree_sitter_cache):
+        try:
+            path.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            failed.append(path)
+    return failed

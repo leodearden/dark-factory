@@ -90,7 +90,7 @@ from orchestrator.agents.roles import (
 from orchestrator.agents.write_set import (
     WriteSet,
     compute_write_set,
-    ensure_claude_fleet_dir,
+    ensure_sandbox_dirs,
 )
 from orchestrator.architect_phase_verdict import (
     clear_exit_reports,
@@ -17377,7 +17377,7 @@ class TaskWorkflow:
         recording, not the agent's task, so aborting the whole dispatch would be
         a disproportionate fail-closed.
         """
-        if not ensure_claude_fleet_dir(write_set):
+        if ensure_sandbox_dirs(write_set):
             logger.warning(
                 'task %s: could not pre-create %s outside the sandbox — both '
                 'backends will skip the claude_fleet carve-out and in-sandbox '
