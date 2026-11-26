@@ -25,7 +25,7 @@ import traceback
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeVar
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 PROGRAM_DIR = REPO_ROOT / 'skills' / 'review-all' / 'scripts' / 'program'
@@ -39,9 +39,11 @@ ISOLATION_FLAGS = ('-I', '-S')
 ISOLATED_ENV_NAMES = frozenset({'PATH', 'HOME', 'REVIEW_ALL_HOME', 'FUSED_MEMORY_URL'})
 SCRIPT_TIMEOUT_SECS = 60
 STORE_START_TIMEOUT_SECS = 30
-STORE_STOP_GRACE_SECS = 10
+CHILD_STOP_GRACE_SECS = 10
 DIAGNOSTIC_TAIL_LINES = 20
 SCRATCH_PREFIX = 'review-all-fixture-walk-'
+
+T = TypeVar('T')
 
 
 class ScenarioFailed(Exception):
@@ -107,6 +109,14 @@ def expect_exit(invocation: Invocation, code: int, invariant: str) -> Invocation
     return invocation
 
 
+def the_one(items: Iterable[T], what: str) -> T:
+    """The single item a fixture fact names; anything else fails, naming *what* and the items found."""
+    found = list(items)
+    if len(found) != 1:
+        raise ScenarioFailed(f'the fixture should hold exactly one {what}, holds {len(found)}: {found}')
+    return found[0]
+
+
 def isolated_env(cwd: Path, homes_root: Path, store_url: str) -> dict[str, str]:
     return {
         'PATH': os.environ.get('PATH', ''),
@@ -131,11 +141,12 @@ def _refuse_cwd_inside_checkout(cwd: Path) -> None:
 
 @contextlib.contextmanager
 def _sigterm_held() -> Iterator[None]:
-    signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})
+    """Block SIGTERM for the body, then restore the mask in force on entry, so a nested hold stays held."""
+    entry_mask = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})
     try:
         yield
     finally:
-        signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGTERM})
+        signal.pthread_sigmask(signal.SIG_SETMASK, entry_mask)
 
 
 def _release_sigterm() -> None:
@@ -146,7 +157,7 @@ def _stop(proc: subprocess.Popen[str]) -> None:
     with _sigterm_held():
         proc.terminate()
         try:
-            proc.wait(timeout=STORE_STOP_GRACE_SECS)
+            proc.wait(timeout=CHILD_STOP_GRACE_SECS)
         except subprocess.TimeoutExpired:
             proc.kill()
             proc.wait()
@@ -244,9 +255,9 @@ def fixture_return(name: str) -> dict[str, Any]:
     return read_json(FIXTURE_RETURNS / name)
 
 
-def store_task(task_id: int, store_fixture: str = 'store.json') -> dict[str, Any]:
-    (task,) = [task for task in read_json(FIXTURE_DIR / store_fixture)['tasks'] if task['id'] == task_id]
-    return task
+def store_task(task_id: int) -> dict[str, Any]:
+    tasks = read_json(FIXTURE_DIR / 'store.json')['tasks']
+    return the_one((task for task in tasks if task['id'] == task_id), f'store.json task {task_id}')
 
 
 def check_names(task: Mapping[str, Any]) -> list[str]:
@@ -259,6 +270,10 @@ def snapshot(directory: Path) -> dict[str, bytes]:
         return {}
     return {str(path.relative_to(directory)): path.read_bytes()
             for path in sorted(directory.rglob('*')) if path.is_file()}
+
+
+def same_bytes(path: Path, original: Path) -> bool:
+    return path.is_file() and path.read_bytes() == original.read_bytes()
 
 
 def output(invocation: Invocation) -> str:
@@ -330,9 +345,9 @@ class ProgramRun:
             cwd=self.cwd, env=isolated_env(self.cwd, self.homes_root, self.store_url),
         )
 
-    def init(self, program_overrides: Mapping[str, Any] | None = None) -> None:
+    def init(self) -> None:
         """``record.py init`` a copy of the fixture program whose project_root is this run's project."""
-        program = {**read_json(FIXTURE_PROGRAM), 'project_root': str(self.project), **(program_overrides or {})}
+        program = {**read_json(FIXTURE_PROGRAM), 'project_root': str(self.project)}
         (self.project / 'plans').mkdir(parents=True, exist_ok=True)
         copy = self.root / 'program.json'
         copy.write_text(json.dumps(program, indent=2), encoding='utf-8')
@@ -346,7 +361,7 @@ class ProgramRun:
         shutil.copyfile(FIXTURE_RETURNS / fixture_return, target)
         return target
 
-    def applied(self, *fixture_returns: str, amend: bool = False) -> None:
+    def apply_returns(self, *fixture_returns: str, amend: bool = False) -> None:
         for fixture_return in fixture_returns:
             inbox = self.put_inbox(fixture_return)
             args = (inbox, '--amend') if amend else (inbox,)
@@ -408,10 +423,8 @@ def _streams_sharing_a_key(program: Mapping[str, Any]) -> tuple[str, tuple[str, 
     for stream in program['streams']:
         for key in stream['keys']:
             owners.setdefault(key, []).append(stream['id'])
-    shared = [(key, tuple(streams)) for key, streams in owners.items() if len(streams) > 1]
-    if len(shared) != 1:
-        raise ValueError(f'the dupkey fixture should share exactly one key, shares {shared}')
-    return shared[0]
+    shared = ((key, tuple(streams)) for key, streams in owners.items() if len(streams) > 1)
+    return the_one(shared, 'key two program-dupkey.json streams share')
 
 
 def b1_init(walk: Walk) -> str:
@@ -452,7 +465,7 @@ def _candidate_rows(stdout: str) -> dict[int, str]:
 def _expect_author_applied(run: ProgramRun, applied: Invocation) -> str:
     authored = fixture_return('S1.author.json')
     moved = run.home / 'returns' / 'S1.author.json'
-    expect(moved.is_file() and moved.read_bytes() == (FIXTURE_RETURNS / 'S1.author.json').read_bytes(),
+    expect(same_bytes(moved, FIXTURE_RETURNS / 'S1.author.json'),
            'returns/S1.author.json is the fixture return, byte for byte', applied)
     expect(not any((run.home / 'inbox').iterdir()), 'inbox/ is empty after the apply', applied)
     expect(any(line.get('op') == 'stream_status' and line.get('stream') == 'S1'
@@ -470,7 +483,7 @@ def _expect_seam_candidates(run: ProgramRun) -> None:
     rows = _candidate_rows(scanned.stdout)
     expect('metadata.files' in rows.get(SEAM_DECLARER, ''),
            f'seam_scan names task {SEAM_DECLARER}, declaring a touched path in metadata.files', scanned)
-    (anchor_check,) = check_names(store_task(SEAM_ANCHOR))
+    anchor_check = the_one(check_names(store_task(SEAM_ANCHOR)), f'delivered check on task {SEAM_ANCHOR}')
     expect(anchor_check in rows.get(SEAM_ANCHOR, ''),
            f'seam_scan names task {SEAM_ANCHOR}, anchoring a touched path in check {anchor_check}', scanned)
 
@@ -511,7 +524,7 @@ def _expect_rejected(run: ProgramRun, fixture: str, prefix: str, fragment: str) 
 def b3_decompose_rejected(walk: Walk) -> str:
     run = walk.new_run('b3-rejected')
     run.init()
-    run.applied('S1.author.json')
+    run.apply_returns('S1.author.json')
     for fixture, prefix, fragment in B3_REJECTIONS:
         _expect_rejected(run, fixture, prefix, fragment)
     return 'form error on notes and store contradiction on filed[0].task_id; --check agrees; home untouched'
@@ -523,8 +536,9 @@ def _expect_scan_repaths(run: ProgramRun) -> None:
     ledger = run.ledger()
     repaths = {line['task']: line for line in ledger
                if line.get('op') == 'action' and line.get('lead_op') == 'repath'}
-    (moved_from,) = [move['from'] for move in fixture_return('S1.decompose.json')['moves'] if move['to']]
-    (check,) = check_names(store_task(REPATHED_TASK))
+    moved_from = the_one((move['from'] for move in fixture_return('S1.decompose.json')['moves'] if move['to']),
+                         'S1.decompose move with a destination')
+    check = the_one(check_names(store_task(REPATHED_TASK)), f'delivered check on task {REPATHED_TASK}')
     text = repaths.get(REPATHED_TASK, {}).get('text', '')
     expect(check in text and moved_from in text,
            f'a repath action for task {REPATHED_TASK} names check {check} and {moved_from}', scan)
@@ -536,8 +550,12 @@ def _expect_scan_repaths(run: ProgramRun) -> None:
         scan)
 
 
+def _held_leaf() -> dict[str, Any]:
+    return the_one(fixture_return('S1.decompose.json')['held'], 'held leaf in S1.decompose.json')
+
+
 def _expect_held_on_roster(run: ProgramRun) -> str:
-    (leaf,) = fixture_return('S1.decompose.json')['held']
+    leaf = _held_leaf()
     roster = expect_exit(run.run('program_doc.py', '--run', RUN_ID, '--roster'), 0, 'program_doc.py --roster')
     held = [line for line in roster.stdout.splitlines() if line.startswith(f'held {leaf["task_id"]} ')]
     expect(len(held) == 1 and f'release owner {leaf["release_owner"]}' in held[0],
@@ -548,7 +566,7 @@ def _expect_held_on_roster(run: ProgramRun) -> str:
 def b4_decompose_applied(walk: Walk) -> str:
     run = walk.new_run('b4-decompose')
     run.init()
-    run.applied('S1.author.json')
+    run.apply_returns('S1.author.json')
     decomposed = expect_exit(run.run('apply_return.py', run.put_inbox('S1.decompose.json')), 0,
                              'apply_return.py applies S1.decompose')
     actions = [line for line in run.ledger()
@@ -570,7 +588,7 @@ MOVED_TO_DONE, KEYLESS_PROGRAM_TASK = 101, 107
 
 def _decomposed_s1(run: ProgramRun) -> ProgramRun:
     run.init()
-    run.applied('S1.author.json', 'S1.decompose.json')
+    run.apply_returns('S1.author.json', 'S1.decompose.json')
     return run
 
 
@@ -614,8 +632,7 @@ def _expect_published(run: ProgramRun) -> list[str]:
            'publish prints the three .state snapshot paths and the doc path', published)
     for path in paths:
         counterpart = run.render_doc if path == program['doc_path'] else run.render / '.state' / Path(path).name
-        copy = run.project / path
-        expect(copy.is_file() and copy.read_bytes() == counterpart.read_bytes(),
+        expect(same_bytes(run.project / path, counterpart),
                f'{path} is published byte-equal to {counterpart.relative_to(run.home)}', published)
     return paths
 
@@ -660,7 +677,7 @@ def _expect_inherited_duties(text: str, handoff: Invocation) -> None:
 
 def _expect_remaining_work(run: ProgramRun, text: str, handoff: Invocation) -> None:
     remaining = section(text, '## Remaining work')
-    (leaf,) = fixture_return('S1.decompose.json')['held']
+    leaf = _held_leaf()
     expect(any(line.startswith(f'- held {leaf["task_id"]} ') and f'release owner {leaf["release_owner"]}' in line
                for line in remaining),
            f'Remaining work names held leaf {leaf["task_id"]} and its release owner', handoff)
@@ -702,7 +719,7 @@ def _names_task(invocation: Invocation, verdict: str, task_id: int) -> bool:
 
 def _both_authored(run: ProgramRun) -> None:
     run.init()
-    run.applied('S1.author.json', 'S2.author.json')
+    run.apply_returns('S1.author.json', 'S2.author.json')
 
 
 def _expect_interim_gate(walk: Walk) -> None:
@@ -806,13 +823,9 @@ def b12_rulings(walk: Walk) -> str:
     return 'D2 supersedes D1; D1 line unchanged; only D2 rendered'
 
 
-def same_bytes(path: Path, original: Path) -> bool:
-    return path.is_file() and path.read_bytes() == original.read_bytes()
-
-
 def _program_stream(stream_id: str) -> dict[str, Any]:
-    (stream,) = [stream for stream in read_json(FIXTURE_PROGRAM)['streams'] if stream['id'] == stream_id]
-    return stream
+    streams = read_json(FIXTURE_PROGRAM)['streams']
+    return the_one((stream for stream in streams if stream['id'] == stream_id), f'program.json stream {stream_id}')
 
 
 def _brief(run: ProgramRun, *args: str) -> Invocation:
@@ -848,8 +861,8 @@ S1_FILING = {
 
 
 def _expect_disputed_verdict_beside_its_dispute(text: str, written: Invocation) -> None:
-    (disputed,) = [finding for finding in read_json(FIXTURE_DIR / 'record.json')['findings']
-                   if 'calibration_disputes_verdict' in finding]
+    disputed = the_one((finding for finding in read_json(FIXTURE_DIR / 'record.json')['findings']
+                        if 'calibration_disputes_verdict' in finding), 'record.json finding a calibration disputes')
     dispute = disputed['calibration_disputes_verdict']
     expect(any(disputed['verdict'] in line and dispute['to'] in line and dispute['note'] in line
                for line in text.splitlines()),
@@ -880,7 +893,7 @@ def _expect_upstream_gate_and_duties(text: str, written: Invocation) -> None:
     upstream = {task['id'] for task in read_json(FIXTURE_DIR / 'store.json')['tasks']
                 if task['metadata'].get('prd_path') == s1_prd}
     listed = {line.split()[1] for line in section(text, '## Upstream program tasks') if line.startswith('- ')}
-    expect({str(task_id) for task_id in upstream} <= listed,
+    expect(bool(upstream) and {str(task_id) for task_id in upstream} <= listed,
            f"the decompose brief lists S1's store tasks {sorted(upstream)}", written)
     expect(re.search(rf'\b{GATE}\b', '\n'.join(section(text, '## Gate'))) is not None,
            f'the decompose brief names gate {GATE}', written)
@@ -892,7 +905,7 @@ def _expect_upstream_gate_and_duties(text: str, written: Invocation) -> None:
 
 def _expect_decompose_brief(run: ProgramRun) -> None:
     applied = ('S1.author.json', 'S1.decompose.json', 'S2.author.json')
-    run.applied(*applied)
+    run.apply_returns(*applied)
     written = expect_exit(_brief(run, 'S2', 'decompose'), 0, 'gen_brief.py S2 decompose')
     text = (run.home / 'briefs' / 'S2.decompose.md').read_text(encoding='utf-8')
     _expect_return_section(run, text, 'S2.decompose', written)
@@ -959,8 +972,8 @@ def _b10_spawned(walk: Walk) -> ProgramRun:
     run = walk.new_run('b10-watch')
     run.init()
     run.record_copy()
-    run.applied('S1.author.json')
-    run.applied('S1.author.amend.json', amend=True)
+    run.apply_returns('S1.author.json')
+    run.apply_returns('S1.author.amend.json', amend=True)
     for title, brief_args, _, _ in B10_SESSIONS:
         expect_exit(_brief(run, *brief_args, '--spawn', title), 0, f'gen_brief.py --spawn {title!r}')
     for _, _, label, slug in B10_SESSIONS:
@@ -1057,8 +1070,8 @@ def _expect_first_sitting(run: ProgramRun) -> None:
 def b16_sitting(walk: Walk) -> str:
     run = walk.new_run('b16-sitting')
     run.init()
-    run.applied('S1.author.json')
-    run.applied('S1.author.amend.json', amend=True)
+    run.apply_returns('S1.author.json')
+    run.apply_returns('S1.author.amend.json', amend=True)
     _expect_first_sitting(run)
     for ruling, by, extra in (('alpha owns C1', 'human', ('--answers', 'S1:Q1')),
                               ('new_name.py', 'lead', ('--answers', 'S1:Q3')),
