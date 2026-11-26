@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import socket
 import subprocess
 import sys
@@ -2516,3 +2517,44 @@ class TestBuildEvalEnvSharedPool:
             "states the roster for the run it is launching, and the ambient "
             f"value here rosters the retired interactive account: {env['USAGE_ACCOUNTS_FILE']!r}"
         )
+
+
+LAUNCHER_IMPORT_TIMEOUT_SECONDS = 120
+
+_FAKE_TOOLKIT_MODULES = {
+    "__init__.py": "",
+    "compute.py": "class PodStatus:\n    RUNNING = 'RUNNING'\n\n\nclass RunPodClient:\n    pass\n",
+    "config.py": "class RunPodConfig:\n    pass\n",
+}
+
+_IMPORT_THEN_READ_THE_PUBLIC_KEY = """\
+import run_vllm_eval as launcher
+print(launcher.PROJECT_ROOT)
+try:
+    launcher.read_ssh_pubkey()
+except RuntimeError as exc:
+    print(exc)
+"""
+
+
+def test_the_launcher_imports_on_a_host_with_nothing_in_the_operators_home(tmp_path: Path) -> None:
+    """Importing reads no home file; the pod's public key is read only when asked for."""
+    home = tmp_path / "home"
+    home.mkdir()
+    toolkit = tmp_path / "toolkit"
+    (toolkit / "runpod_toolkit").mkdir(parents=True)
+    for name, text in _FAKE_TOOLKIT_MODULES.items():
+        (toolkit / "runpod_toolkit" / name).write_text(text)
+    proc = subprocess.run(
+        [sys.executable, "-c", _IMPORT_THEN_READ_THE_PUBLIC_KEY],
+        cwd=_SCRIPTS,
+        env={"HOME": str(home), "RUNPOD_TOOLKIT_PATH": str(toolkit), "PATH": os.environ["PATH"]},
+        capture_output=True,
+        text=True,
+        timeout=LAUNCHER_IMPORT_TIMEOUT_SECONDS,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    project_root, key_error = proc.stdout.splitlines()
+    assert Path(project_root) == Path(__file__).resolve().parents[2]
+    assert str(home / ".ssh" / "id_runpod.pub") in key_error
