@@ -878,8 +878,11 @@ carries no `execution_class`, and one of two arms matches:
   `metadata.finding_set_hold {ruling}`, whatever its `source`, `prd_path`
   or `human_decomposed`. The marker records a ruling that a review-finding
   cleanup set is not to be scheduled individually; `ruling` names who ruled,
-  when, and on which finding. A malformed marker holds nothing and logs one
-  WARNING naming `finding_set_hold`.
+  when, and on which finding. A marker that holds nothing logs one WARNING
+  naming `finding_set_hold` and the task (the backfill names the task id; a
+  filing not yet created is named `None`). That covers a malformed marker
+  and a valid one on a task the rule refuses, such as a medium priority or a
+  missing `x_finding_key`, and the WARNING says which condition failed.
 
 Every planning-mode birth carries `human_decomposed`, so the first arm never
 holds a PRD decompose, and neither arm holds a task that a finding cites
@@ -904,7 +907,11 @@ is journaled beside `task_created`, and the ticket's stored outcome
 not return it. A `planning_mode` submission the rule matches, which can only
 be a marked finding-set member, is born `deferred` AND held the same way and
 journals the same `followup_held` event, so the set stays held after
-`commit_planning`. Both paths share one helper,
+`commit_planning`. Its synchronous answer carries `held_by`, the holder's
+id, and an answer without `held_by` means the birth was not held. A failure
+of the hold, such as `DuplicateFollowupHolderError`, is answered like any
+failed planning insert, `{error, error_type}`, and the task is not created.
+Both paths share one helper,
 `followup_hold.py::hold_birth`. The holder is minted the first time a project needs one, and
 its mint journals a `task_created` event with `source:
 'followup-holder-mint'`, whether a filing or the backfill minted it.

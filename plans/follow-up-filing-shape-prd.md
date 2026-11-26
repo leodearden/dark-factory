@@ -194,8 +194,10 @@ Lead's decisions under those rulings:
    - **The finding-set arm** (amended 2026-11-26, §11). The task carries `x_finding_key` and a valid
      `metadata.finding_set_hold {ruling}`, whatever its `source`, `prd_path` or `human_decomposed`.
      The marker records a ruling that a review-finding cleanup set is not to be scheduled
-     individually. It is structured metadata the filing instrument stamps, never parsed from prose,
-     and a malformed marker holds nothing and logs one WARNING. Such a member is held at birth on
+     individually. It is structured metadata the filing instrument stamps, never parsed from prose.
+     A marker that holds nothing logs one WARNING naming the task and why, whether it is malformed
+     or valid on a task the rule refuses (a medium priority, no `x_finding_key`), so an unenforced
+     ruling is never silent. Such a member is held at birth on
      BOTH filing paths, the ticket path and `planning_mode`, so this arm is the one exception to "a
      planning-mode birth is never held". The backfill (decision 12) holds it too.
 10. **Holder shape: deterministic pure gate with `deferred_watch`.** One per project, minted
@@ -208,7 +210,9 @@ Lead's decisions under those rulings:
 11. **The hold is born with the task.** The holder id is appended to `dependencies` in
     `_dispatch_ticket_decision`'s create branch before `tm.add_task`, so edge and row are one write
     unit and the scheduler never sees the follow-up as ready; a `followup_hold` record is stamped and
-    a `followup_held` event emitted.
+    a `followup_held` event emitted. Both creation paths, the ticket create branch and
+    `planning_mode`, do this through `followup_hold.py::hold_birth` under the write lock (amended
+    2026-11-26 for decision 9's finding-set arm, §11).
 12. **Backfill runs once per project at fused-memory server startup after deploy** (the process is
     `fused-memory/src/fused_memory/server/main.py`, after the interceptor's `start()` and before
     the server begins serving, over the project list `known_project_roots_from_env` yields, falling
@@ -355,7 +359,8 @@ class PromotionRecord(BaseModel):
 class FindingSetHold(BaseModel):          # metadata.finding_set_hold, caller-written at filing (decision 9)
     ruling: str                           # non-empty: who ruled, when, on which finding
 
-def hold_scope(metadata: object, priority: object) -> bool     # decision 9, pure; both arms
+def hold_scope(metadata: object, priority: object, *, task_id: object = None) -> bool
+    # decision 9, pure but for one WARNING naming task_id when a finding_set_hold marker holds nothing
 def ensure_holder(tm, project_root) -> int      # idempotent mint; refuses a second live marker
 def is_holder(task) -> bool
 def hold_at_create(kwargs, metadata, holder_id, *, held_at) -> tuple[dict, dict]
@@ -620,3 +625,5 @@ Task 11873 implements the ruling:
   §8 step 1a). `dependent` still promotes, so no pending dependent of a set member jams silently;
   `human` is the release, and `pack` is the intended future drain.
 - Boundary rows 7 and 11 are narrowed to unmarked tasks, and rows 7b and 11b are added.
+- A held `planning_mode` birth answers with `held_by`, the holder's id, so the filing instrument
+  can confirm the hold synchronously (`docs/quality-findings-contract.md` §8).

@@ -196,7 +196,13 @@ metadata.finding_set_hold = {ruling: "<who, when, which finding>"}
 the write boundary. Stamped on every member of a low cleanup set, it holds
 the set behind its project's follow-up holder on either filing path, the
 ticket path or `planning_mode` (`plans/follow-up-filing-shape-prd.md` §3
-decision 9).
+decision 9). The instrument confirms the hold on every member it files. A
+`planning_mode` answer carries `held_by` when the member was held. On the
+ticket path `resolve_ticket` does not return it, so read the task's
+`metadata.followup_hold` with `get_task`. The ruling is not enforced on a
+member left unheld. The fused-memory log carries a WARNING naming the task
+and why, for example a priority above `low`. The report records the member
+as unheld rather than assuming it was held.
 
 Before filing, in this order, and the report records the step that
 decided each finding:
