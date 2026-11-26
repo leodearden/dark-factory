@@ -3,8 +3,9 @@
 Task 5408. Four of the nine discovered module configs ran their pytest leg
 single-process at the merge role while ``orchestrator`` and ``fused-memory``
 had carried ``-n auto --dist loadgroup`` in their own addopts for some time.
-Task 5408 brought four onto that same footing and task 5470 brought in a fifth,
-``tests/scripts``. This guard pins those five, and pins the exclusions that
+Task 5408 brought four onto that same footing, task 5470 brought in a fifth,
+``tests/scripts``, and task 11846 a sixth, ``client-feed``. This guard pins
+those six, and pins the exclusions that
 were left serial DELIBERATELY, so a later reader cannot tell a ruled-out module
 from a forgotten one.
 
@@ -65,7 +66,7 @@ REPO_ROOT = pathlib.Path(__file__).parents[2]
 # flags. `scripts` and `tests/scripts` are absent on purpose and are covered
 # separately (PARALLEL_TEST_COMMAND_LEGS): neither has a pyproject.toml of its
 # own, so their flags live on their test_command instead.
-PARALLEL_ADDOPTS_MEMBERS = ('dashboard', 'escalation', 'cockpit')
+PARALLEL_ADDOPTS_MEMBERS = ('dashboard', 'escalation', 'cockpit', 'client-feed')
 
 # The spelling every parallel module shares, copied from
 # `fused-memory/pyproject.toml::[tool.pytest.ini_options]` so all of them read
@@ -119,7 +120,7 @@ def _declared_addopts(member: str) -> str:
 def _addopts(member: str) -> str:
     """*member*'s addopts, asserted PRESENT.
 
-    The asserting entry point, for the three members this file pins by name. A
+    The asserting entry point, for the members PARALLEL_ADDOPTS_MEMBERS names. A
     missing addopts key there is the defect, not an absence to tolerate.
     """
     addopts = _declared_addopts(member)
