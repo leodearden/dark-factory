@@ -10,6 +10,8 @@ import dataclasses
 import hashlib
 import json
 import random
+import subprocess
+import sys
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -579,8 +581,8 @@ def test_the_same_records_and_seed_give_identical_comparisons():
     assert _compare(records, seed=7) == _compare(records, seed=7)
 
 
-def _balanced_fleet_specs(n_per_arm=25, *, salt=SALT):
-    """Tasks split by the real split_bucket; the i-th task of each arm carries identical values."""
+def _arm_task_ids(n_per_arm=25, *, salt=SALT):
+    """The first *n_per_arm* task ids the real split_bucket puts in each of two arms."""
     arms = {0: [], 1: []}
     task_id = 0
     while min(len(ids) for ids in arms.values()) < n_per_arm:
@@ -588,21 +590,31 @@ def _balanced_fleet_specs(n_per_arm=25, *, salt=SALT):
         bucket = split_bucket(salt, str(task_id), 2)
         if len(arms[bucket]) < n_per_arm:
             arms[bucket].append(task_id)
+    return arms
+
+
+def _fleet_task(task_id, i, *, outcome=None, cost=None, verify_duration=True):
+    """The i-th task of an arm; arms built from the same i carry identical values."""
+    verify_data = {'duration_ms': 60_000 * (i % 7)} if verify_duration else {'passed': True}
+    return TaskSpec(
+        task_id,
+        results=(
+            ResultRow(outcome or ('blocked' if i % 4 == 0 else 'done'), review_cycles=i % 2,
+                      execute_iterations=i % 3),
+        ),
+        invocations=(Invocation('implementer', 'sonnet', float(i) if cost is None else cost),),
+        events=(
+            Event('workflow_verify', verify_data),
+            Event('merge_verify', {'duration_ms': 30_000 * (i % 5)}),
+            Event('review_completed', {'blocking_count': i % 2}),
+        ),
+    )
+
+
+def _balanced_fleet_specs(n_per_arm=25):
     return [
-        TaskSpec(
-            task_id,
-            results=(
-                ResultRow('blocked' if i % 4 == 0 else 'done', review_cycles=i % 2,
-                          execute_iterations=i % 3),
-            ),
-            invocations=(Invocation('implementer', 'sonnet', float(i)),),
-            events=(
-                Event('workflow_verify', {'duration_ms': 60_000 * (i % 7)}),
-                Event('merge_verify', {'duration_ms': 30_000 * (i % 5)}),
-                Event('review_completed', {'blocking_count': i % 2}),
-            ),
-        )
-        for ids in arms.values()
+        _fleet_task(task_id, i)
+        for ids in _arm_task_ids(n_per_arm).values()
         for i, task_id in enumerate(ids)
     ]
 
@@ -662,3 +674,88 @@ def test_json_carries_the_per_task_records_and_the_same_comparisons(balanced_roo
     assert report['comparisons'] == json.loads(
         json.dumps([dataclasses.asdict(comparison) for comparison in expected])
     )
+
+
+# --- the A/A verdict --------------------------------------------------------
+
+SCRIPT = Path(readout.__file__)
+
+
+def _skewed_fleet_specs(n_per_arm=25):
+    """Arm 1 all blocked at cost 10, arm 0 all done at cost 1; the other headline metrics balanced."""
+    arms = _arm_task_ids(n_per_arm)
+    return [
+        *(_fleet_task(task_id, i, outcome='done', cost=1.0) for i, task_id in enumerate(arms[0])),
+        *(_fleet_task(task_id, i, outcome='blocked', cost=10.0)
+          for i, task_id in enumerate(arms[1])),
+    ]
+
+
+def _table_line(out, metric):
+    (line,) = [line for line in out.splitlines() if line.split()[1:2] == [metric]]
+    return line
+
+
+def test_aa_on_a_balanced_split_passes(balanced_root, capsys):
+    assert _run_main([balanced_root], '--aa', '--resamples', '400') == readout.EXIT_OK
+
+    out = capsys.readouterr().out
+    assert 'A/A check passed' in out
+    assert 'SKEWED' not in out
+    assert '--aa fails when a headline metric has |diff| > null p99' in _rule_line(out)
+
+
+def test_aa_on_a_skewed_split_exits_one_from_a_real_child_process(fleet_root):
+    root = fleet_root('proj-a', _skewed_fleet_specs())
+
+    completed = subprocess.run(
+        [sys.executable, str(SCRIPT), '--aa', '--roots', str(root), '--salt', SALT,
+         '--buckets', '2', '--days', '30', '--until', UNTIL],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+
+    assert completed.returncode == readout.EXIT_AA_SKEWED, completed.stderr
+    skewed = [
+        line for line in (completed.stdout + completed.stderr).splitlines() if 'SKEWED' in line
+    ]
+    blocked = [line for line in skewed if 'blocked_or_escalated' in line]
+    cost = [line for line in skewed if 'cost_usd' in line]
+    assert blocked and cost
+    assert all('|diff| 1.000' in line and 'null p99' in line for line in blocked)
+    assert all('|diff| 9.000' in line and 'null p99' in line for line in cost)
+    assert not [line for line in skewed if 'review_cycles_ge1' in line]
+
+
+def test_without_aa_a_skewed_split_exits_zero_and_marks_the_rows_over_p99(fleet_root, capsys):
+    root = fleet_root('proj-a', _skewed_fleet_specs())
+
+    assert _run_main([root], '--resamples', '400') == readout.EXIT_OK
+
+    out = capsys.readouterr().out
+    assert _table_line(out, 'blocked_or_escalated').endswith('>p99')
+    assert _table_line(out, 'cost_usd').endswith('>p99')
+    assert not _table_line(out, 'review_cycles_ge1').endswith('>p99')
+    assert 'A/A check' not in out
+
+
+def test_aa_with_a_headline_metric_below_the_eligibility_floor_exits_unproven(
+    fleet_root, capsys,
+):
+    arms = _arm_task_ids()
+    root = fleet_root(
+        'proj-a',
+        [
+            *(_fleet_task(task_id, i) for i, task_id in enumerate(arms[0])),
+            *(_fleet_task(task_id, i, verify_duration=i < 5) for i, task_id in enumerate(arms[1])),
+        ],
+    )
+
+    assert _run_main([root], '--aa', '--resamples', '400') == readout.EXIT_UNPROVEN
+
+    err = capsys.readouterr().err
+    (line,) = [line for line in err.splitlines() if 'workflow_verify_minutes' in line]
+    assert 'eligible n0=25 n1=5' in line
+    assert f'below {readout.MIN_ELIGIBLE_PER_ARM}' in line
