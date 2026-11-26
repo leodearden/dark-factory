@@ -14,7 +14,7 @@ from orchestrator.event_store import EventType
 from orchestrator.narrow_gate_class import GateMiss, MergeGateResolution, MissReason
 from orchestrator.narrow_gate_plan import NarrowGateDecision
 from orchestrator.verify import VerifyResult, narrow_merge_gate_decision, run_scoped_verification
-from orchestrator.verify_cmd import render
+from orchestrator.verify_cmd import VerifyCmd, parse_config_command
 from orchestrator.verify_plan import PlannedRun, ScopeKind, VerifyPlan
 
 _GUARD = 'pkg/tests/test_guard.py'
@@ -234,16 +234,17 @@ class _Execution:
         return [data['resolution'] for data in self.events.of(EventType.trivial_pass_escalated)]
 
 
-def _prescribed(plan: VerifyPlan) -> list[str]:
-    return sorted(render(run.cmd) for run in plan.runs if run.cmd is not None)
+def _invocation(cmd: VerifyCmd) -> tuple[object, ...]:
+    """What a command runs, on what: execution adds only reporting flags (junit, the defect plugin)."""
+    return cmd.tool, cmd.uv_project, cmd.cwd_rel, cmd.targets
 
 
-def _executed_as_prescribed(calls: list[str], plan: VerifyPlan) -> bool:
-    """Each call is one prescribed command, verbatim up to the flags execution appends, and none is missing."""
-    prescribed = _prescribed(plan)
-    return len(calls) == len(prescribed) and all(
-        sum(call == cmd or call.startswith(cmd + ' ') for call in calls) == 1 for cmd in prescribed
-    )
+def _prescribed(plan: VerifyPlan) -> list[tuple[object, ...]]:
+    return sorted(_invocation(run.cmd) for run in plan.runs if run.cmd is not None)
+
+
+def _executed(calls: list[str]) -> list[tuple[object, ...]]:
+    return sorted(_invocation(parse_config_command(call)) for call in calls)
 
 
 async def _merged_decision(scene: _Scene, files: dict[str, str]) -> tuple[Path, OrchestratorConfig, NarrowGateDecision]:
@@ -272,7 +273,7 @@ class TestNarrowGateExecution:
 
         result = await execution.verify(worktree, config, list(decision.changed_paths), narrow_gate=decision)
 
-        assert _executed_as_prescribed(execution.calls, decision.plan), (execution.calls, _prescribed(decision.plan))
+        assert _executed(execution.calls) == _prescribed(decision.plan)
         assert (result.passed, result.trivial, result.narrow_gate) == (True, False, resolution)
         assert result.plan == decision.plan.to_dict()
         assert execution.escalations() == []

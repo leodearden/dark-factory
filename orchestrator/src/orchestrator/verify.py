@@ -68,7 +68,7 @@ from orchestrator.config import ModuleConfig, OrchestratorConfig
 # flake_ledger depends only on shared.sqlite_sync_base, so there is no cycle.
 from orchestrator.flake_ledger import FlakeCallSite, FlakeSuppression, FlakeVerdict
 from orchestrator.main_tip_sweep_cadence import SweepSeedMode
-from orchestrator.narrow_gate_class import ChangedPath, GateMiss, MissReason
+from orchestrator.narrow_gate_class import ChangedPath, GateMiss, MergeGateResolution, MissReason
 from orchestrator.narrow_gate_plan import NarrowGateDecision
 from orchestrator.relocated_scopes import relocated_scopes
 from orchestrator.scope_launch_handshake import ScopeLaunchHandshake
@@ -5450,6 +5450,8 @@ class VerifyResult:
     cache_record: CacheRecord | None = remote_gate.off_wire_field(default=None, compare=False)
     # The runner's report of its units for the dispatcher's recorder, on the wire (task 9123).
     cache_report: CacheReport | None = field(default=None, compare=False)
+    # Task 5411: the narrow merge gate this verdict ran, or None for every other verify.
+    narrow_gate: MergeGateResolution | None = None
 
     def __post_init__(self) -> None:
         mismatch = _module_attribution_mismatch(
@@ -5465,6 +5467,13 @@ class VerifyResult:
         if self.units is not None:
             self.units = verify_evidence.units_from_wire(self.units)
         self.cache_mode = CacheMode(self.cache_mode)
+        if self.narrow_gate is not None:
+            self.narrow_gate = MergeGateResolution(self.narrow_gate)
+
+    @property
+    def is_whole_tree_evidence(self) -> bool:
+        """Whether this verdict ran a gate over the whole tree: not a trivial pass, nor a narrow gate's."""
+        return not self.trivial and self.narrow_gate is None
 
     @property
     def plan_hash(self) -> str | None:
@@ -9850,6 +9859,33 @@ def _settled_against(replay: ReplayPlan, result: VerifyResult) -> VerifyResult:
     return replace(result, units=units, cache_record=record, cache_mode=mode)
 
 
+async def _run_narrow_gate(
+    decision: NarrowGateDecision | None,
+    registry: list[ModuleConfig],
+    execute: Callable[[verify_plan.VerifyPlan, list[ModuleConfig]], Awaitable[VerifyResult]],
+    persist: Callable[[dict], None],
+) -> VerifyResult | None:
+    """The verdict of *decision*'s narrow plan over *registry*; None when the full gate must run instead.
+
+    A full decision carries no plan. A plan the registry would run no command of is refused too:
+    a merge verdict never vouches for a tree nothing ran on (INV-1).
+    """
+    if decision is None or decision.plan is None:
+        return None
+    scoped = _executed_module_configs_from_plan(registry, decision.plan)
+    commands = sum(cmd is not None for mc in scoped for cmd in (mc.test_command, mc.lint_command, mc.type_check_command))
+    if not commands:
+        logger.warning('Verification mode: %s has no registered command to run; full gate', decision.resolution)
+        return None
+    logger.info('Verification mode: %s (%d command(s))', decision.resolution, commands)
+    plan_dict = decision.plan.to_dict()
+    persist(plan_dict)
+    result = await execute(decision.plan, scoped)
+    result.plan = plan_dict
+    result.narrow_gate = decision.resolution
+    return result
+
+
 async def run_scoped_verification(
     worktree: Path,
     config: OrchestratorConfig,
@@ -9866,8 +9902,11 @@ async def run_scoped_verification(
     event_store: 'EventStore | None' = None,
     admission_plan: AdmissionPlan | None = None,
     verify_cache: CacheAccess | None = None,
+    narrow_gate: NarrowGateDecision | None = None,
 ) -> VerifyResult:
     """Run verification scoped to specific subprojects and optionally to task files.
+
+    A narrow *narrow_gate* at role ``'merge'`` runs exactly its plan instead (docs/narrow-merge-gate.md).
 
     *verify_cache* joins the verify-result cache: dispatcher-side callers pass
     the harness's one ``CacheAccess.on_dispatcher``, keyed on its deployed sha;
@@ -9928,6 +9967,7 @@ async def run_scoped_verification(
         event_store=event_store,
         admission_plan=admission_plan,
         verify_cache=verify_cache,
+        narrow_gate=narrow_gate,
     )
     return await _recorded_admission_plan(config, event_store, admission_plan, scoped_verify)
 
@@ -9948,6 +9988,7 @@ async def _run_scoped_verification_body(
     event_store: 'EventStore | None',
     admission_plan: AdmissionPlan | None,
     verify_cache: CacheAccess | None,
+    narrow_gate: NarrowGateDecision | None = None,
 ) -> VerifyResult:
     """``run_scoped_verification``'s scoping and execution; every leg joins *admission_plan*,
     and every execution goes through the verify-result cache's funnel."""
@@ -10093,6 +10134,16 @@ async def _run_scoped_verification_body(
         # their work. The artifact widening and both planner sites below read
         # this one on-disk set.
         existing_files = [f for f in task_files or () if (worktree / f).exists()]
+        narrowed = await _run_narrow_gate(
+            narrow_gate if role == 'merge' else None,
+            list(config.module_configs_or_empty.values()),
+            lambda plan, scoped: _execute(plan, scoped, _verify_planned(plan)),
+            lambda plan_dict: _persist_verify_plan(
+                plan_dict, worktree, attempt_id=attempt_id, task_id=task_id, archive_root=archive_root,
+            ),
+        )
+        if narrowed is not None:
+            return narrowed
         if task_files:
             # Task 5296: a touched behavioural artifact (a skills/ script, an
             # agent-prompt SKILL.md, the root yaml) runs the registered
