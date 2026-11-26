@@ -142,8 +142,8 @@ test_command: "uv run --project shared pytest tests/scripts/ --tb=short -q --tim
 #     = mc`), not by command, so a SCOPED verify whose touched files span both
 #     scripts/ and tests/scripts/ also runs it twice.
 #
-# That cuts against this file's own premise — the budget below was sized
-# (1000s, task 4320; 1600s since task 8402's FAMILY-CEILING FLOOR) for a 2.91x
+# That cuts against this file's own premise — the budget below was first sized
+# (task 4320; the FAMILY-CEILING FLOOR since task 8402) for a 2.91x
 # run-to-run spread attributed to host oversubscription, and duplicate
 # execution is itself a contributor to that oversubscription.
 #   CORRECTED IN PLACE (task 4320): this paragraph said "the 600s budget below
@@ -325,9 +325,9 @@ type_check_command: "uv run --project shared pyright tests/scripts/"
 # guard's floor sit at 300s while this block recorded 233.50s.
 #
 #   SERIAL-FORM runs — the test_command above WITHOUT `-n auto --dist
-#   loadgroup`. Every one was the verbatim command until task 5470, and they
-#   remain the sizing basis because the serial form is what verify's
-#   ENV_TRANSIENT recovery re-runs under this SAME budget:
+#   loadgroup`. Every one was the verbatim command until task 5470. The budget
+#   must never be sized below their worst, because the serial form is what
+#   verify's ENV_TRANSIENT recovery re-runs under this SAME budget:
 #   verify.py::_serial_pytest_str sheds -n/--dist, then _run_or_skip_timed
 #   applies the same per-command timeout.
 #     233.50s, 167.73s               two runs, 369 passed / 1 skipped each, on
@@ -353,8 +353,8 @@ type_check_command: "uv run --project shared pyright tests/scripts/"
 #     283.00s wall / 270.40s pytest  architect run 3, same base/counts, rc=0;
 #                                    loadavg 69.83 -> 119.24
 #     397.47s wall                   architect run 4, same base/counts, rc=0;
-#                                    loadavg 119.24 -> 187.04.  <-- WORST ON
-#                                    RECORD; this is the figure sized against
+#                                    loadavg 119.24 -> 187.04.  <-- the SERIAL
+#                                    form's WORST; sized against until task 11824
 #     323.88s wall                   architect run 5, same base/counts, rc=0;
 #                                    loadavg 187.04 -> 130.22
 #     234.34s wall / 230.67s pytest  task 4320 pre-1 run 1, same base; rc=0,
@@ -372,7 +372,17 @@ type_check_command: "uv run --project shared pyright tests/scripts/"
 #                                    54a84fba86; rc=0, 2535 passed / 2 skipped
 #                                    / 10 deselected; loadavg 51.04 -> 139.61
 #
-#   PARALLEL runs (verbatim since task 5470) — NOT a sizing input:
+#   PARALLEL runs (verbatim since task 5470). They were left out of sizing
+#   while they ran FASTER than the serial form; the archive run below does not,
+#   and the family floor's W is the leg's worst green run of EITHER form:
+#     735.04s green                  ARCHIVE: task 9123 attempt 2, task role,
+#                                    the verbatim test_command; read on
+#                                    2026-11-26 by
+#                                    `scripts/timeout_headroom_selfcheck.py
+#                                    --dry-run` (task 11824); summary, in the
+#                                    main checkout:
+#                                    data/verify-logs/9123/attempt-2.tests_scripts.summary-20261124T210358_428905Z.json
+#                                    <-- WORST ON RECORD; W, sized against
 #     70.12s wall / 68.16s pytest    task 5470 architect run, base 54a84fba86,
 #                                    PYTEST_XDIST_AUTO_NUM_WORKERS=16; rc=0,
 #                                    2535 passed / 2 skipped; loadavg
@@ -391,23 +401,26 @@ type_check_command: "uv run --project shared pyright tests/scripts/"
 #   tests/scripts diff. Kept for history, never for sizing:
 #     105-127s                       four runs (task 3062, esc-3062-3)
 #
-# SIZING (task 4320). Size against 397.47s — the largest figure across every
-# SERIAL-FORM run above, because the serial form is what the ENV_TRANSIENT
-# recovery runs inside this budget (sizing against the faster parallel form
-# would re-create the false-infra_timeout trap on that recovery path). 1000s,
-# the convention-sized figure, is 2.52x it, which is this family's own
+# SIZING (task 11824). W is the largest figure across EVERY row above, either
+# form: since task 11824, the parallel-form archive run. The binding floor is
+# min_leg_budget_for_family(W), the FAMILY-CEILING FLOOR stated just above the
+# key, and the key declares exactly that floor. Task 4320's argument still
+# bounds it from below: the serial form is what the ENV_TRANSIENT recovery runs
+# inside this budget, so the budget must never be sized below the serial worst
+# (sizing against a faster form would re-create the false-infra_timeout trap on
+# that recovery path). The budget stays strictly under the repo-root warm
+# ceiling (dark-factory-orchestrator.yaml::verify_command_timeout_secs), tight
+# enough to surface a genuine hang before the whole-fleet ceiling would.
+# HISTORY (task 4320): sized against 397.47s, the serial worst. 1000s, the
+# convention-sized figure, was 2.52x it, which is this family's own
 # convention for the multiple (this module sat at 600/233.50 = 2.57x until
-# task 4320; scripts/ sits at 2400/930.59 = 2.58x),
-# and it clears the 700s floor the owning guard DERIVES from the same figure
-# (2 * 397.47 -> 794.94 -> 700) by 1.43x — scripts/ sits at 1.33x above its own.
-# Sizing at exactly 700 would leave 1.76x headroom over the worst run, THINNER
-# than the 2.91x band measured below on byte-identical input, i.e. it would
-# re-create the false-infra_timeout-on-the-green-path failure this per-module
-# budget exists to stop. The declared budget is now the higher FAMILY-CEILING
-# FLOOR (1600s, task 8402; stated in the paragraph just above the key), which
-# is 2.25x under the repo-root 3600s warm ceiling (1000s was 3.6x), and
-# still tight enough to surface a genuine hang in minutes rather than in the ~50
-# the whole-fleet ceiling permits.
+# task 4320; scripts/ sat at 2400/930.59 = 2.58x),
+# and it cleared the 700s floor the owning guard then DERIVED from the same
+# figure by 1.43x. Sizing at exactly 700 would have left 1.76x headroom over
+# the worst run, THINNER than the 2.91x band measured below on byte-identical
+# input, i.e. it would have re-created the false-infra_timeout-on-the-green-path
+# failure this per-module budget exists to stop. Task 8402's FAMILY-CEILING
+# FLOOR then overtook the convention figure.
 #
 # THE BAND IS 2.91x ON IDENTICAL INPUT, which is what makes "the worst RUN,
 # never the mean and never the freshest" operative rather than stylistic: the
@@ -448,12 +461,12 @@ type_check_command: "uv run --project shared pyright tests/scripts/"
 # ~2 min") was left standing in the root yaml until it was off by an order of
 # magnitude.
 #
-# RAISE-TOGETHER RULE. If this suite's measured cost grows toward the value
-# declared below, re-measure and raise BOTH that value and
-# MEASURED_SUITE_WORST_SECS in tests/scripts/test_tests_scripts_module_config.py,
-# from which MIN_MODULE_BUDGET_SECS follows BY DERIVATION (_min_budget: ~2x the
-# worst run, floored to the nearest 100s) — never quietly widen one without the
-# other.
+# RAISE-TOGETHER RULE. Whenever a re-measure (the selfcheck dry-run of the
+# ARCHIVE row above) moves W, raise BOTH the value declared below, to
+# min_leg_budget_for_family(W), and MEASURED_SUITE_WORST_SECS in
+# tests/scripts/test_tests_scripts_module_config.py, from which
+# MIN_MODULE_BUDGET_SECS follows BY DERIVATION (min_budget: ~2x the worst run,
+# floored to the nearest 100s) — never quietly widen one without the other.
 #   IT HAS NOW FIRED ONCE, and this records how it was discharged (task 4320).
 #   The re-measurement moved MEASURED_SUITE_WORST_SECS 233.50 -> 397.47, the
 #   derived floor followed 400 -> 700 with no hand edit, and the then-declared
@@ -468,6 +481,9 @@ type_check_command: "uv run --project shared pyright tests/scripts/"
 #   it — and naming one would re-create the very drift this rule is for: the
 #   300s floor and this block's 233.50s figure had already fallen out of step,
 #   caught by a reviewer rather than by anything in the repo.
+#   IT FIRED AGAIN (task 11824): MEASURED_SUITE_WORST_SECS 397.47 -> 735.04
+#   and the budget below moved in the same change; the derived floor followed
+#   700 -> 1400 with no hand edit.
 #
 # This is where the root yaml's "tight timeouts surface hangs" intent actually
 # lives now. It could never hold at the whole-fleet level, because a ceiling
@@ -481,13 +497,14 @@ type_check_command: "uv run --project shared pyright tests/scripts/"
 # verify_cold_command_timeout_secs is deliberately left UNSET here: this suite
 # has no build step whose cold cost would justify a separate cold budget. An
 # unset module cold knob falls through to
-# config.verify_cold_command_timeout_secs (5400) — per the
+# config.verify_cold_command_timeout_secs (set in
+# dark-factory-orchestrator.yaml) — per the
 # verify._resolve_verify_timeout cascade, cited by SYMBOL, not file:line, since
 # a prior numeric pin here had already rotted onto unrelated code within a week
-# of being written — NOT to the 1600 below, which is the warm budget only. Under
+# of being written — NOT to the budget below, which is the warm budget only. Under
 # a merge-role cold verify (this file's commands run VERBATIM under
 # merge_verify_breadth: "full", noted above), the cascade instead consults
-# config.merge_verify_cold_command_timeout_secs (7200) FIRST: that value ships
+# config.merge_verify_cold_command_timeout_secs FIRST: that value ships
 # from the package-bundled orchestrator/src/orchestrator/defaults.yaml, not
 # dark-factory-orchestrator.yaml, so it stays invisible to a reader checking
 # only the root config — the same defaults.yaml-shadows-root blind spot
@@ -503,4 +520,4 @@ type_check_command: "uv run --project shared pyright tests/scripts/"
 # binding floor is min_leg_budget_for_family(W), above the convention-sized
 # figure of SIZING, and the key below declares exactly that floor. Gated by
 # tests/scripts/test_module_verify_budgets.py::test_every_leg_running_the_family_outlasts_its_ceiling.
-verify_command_timeout_secs: 1600
+verify_command_timeout_secs: 2000
