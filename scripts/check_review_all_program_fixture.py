@@ -12,6 +12,7 @@ import argparse
 import contextlib
 import json
 import os
+import re
 import select
 import shutil
 import signal
@@ -263,6 +264,28 @@ def output(invocation: Invocation) -> str:
     return invocation.stdout + invocation.stderr
 
 
+def doc_name() -> str:
+    return Path(read_json(FIXTURE_PROGRAM)['doc_path']).name
+
+
+def table_rows(lines: Sequence[str]) -> list[dict[str, str]]:
+    """The first markdown table among *lines*, one mapping per body row keyed by its header cells."""
+    rows = [[cell.strip() for cell in re.split(r'(?<!\\)\|', line.strip())[1:-1]]
+            for line in lines if line.startswith('|')]
+    return [dict(zip(rows[0], row, strict=False)) for row in rows[2:]] if len(rows) >= 2 else []
+
+
+def section(text: str, heading_prefix: str) -> list[str]:
+    """The lines after the first ``## `` heading opening with *heading_prefix*, up to the next one."""
+    lines = text.splitlines()
+    starts = [i for i, line in enumerate(lines) if line.startswith('## ') and line.startswith(heading_prefix)]
+    if not starts:
+        raise ScenarioFailed(f'no {heading_prefix!r} heading', text)
+    body = lines[starts[0] + 1:]
+    ends = [i for i, line in enumerate(body) if line.startswith('## ')]
+    return body[:ends[0]] if ends else body
+
+
 @dataclass(frozen=True)
 class ProgramRun:
     """One scenario's homes root, cwd and project checkout, all under *root*, and the store it reads."""
@@ -286,6 +309,14 @@ class ProgramRun:
     @property
     def home(self) -> Path:
         return self.homes_root / RUN_ID
+
+    @property
+    def render(self) -> Path:
+        return self.home / 'render'
+
+    @property
+    def render_doc(self) -> Path:
+        return self.render / doc_name()
 
     @property
     def own_store(self) -> Path:
@@ -531,11 +562,162 @@ def b4_decompose_applied(walk: Walk) -> str:
     return f'{len(actions)} actions, scan repaths {REPATHED_TASK} and keeps {DELETED_PATH_TASK} for a human; {held}'
 
 
+# store.json's S1 α task, moved to done between renders; and its keyless program task, the one
+# FILED buckets as unstreamed.
+MOVED_TO_DONE, KEYLESS_PROGRAM_TASK = 101, 107
+
+
+def _decomposed_s1(run: ProgramRun) -> ProgramRun:
+    run.init()
+    run.applied('S1.author.json', 'S1.decompose.json')
+    return run
+
+
+def _render(run: ProgramRun, *args: str | Path) -> Invocation:
+    return run.run('program_doc.py', '--run', RUN_ID, *args)
+
+
+def _rendered_text(run: ProgramRun, *args: str | Path) -> str:
+    expect_exit(_render(run, *args), 0, f'program_doc.py {" ".join(map(str, args))} renders'.strip())
+    return run.render_doc.read_text(encoding='utf-8')
+
+
+def b5_render(walk: Walk) -> str:
+    with walk.own_run('b5-render', 'store.json') as run:
+        _decomposed_s1(run)
+        first = expect_exit(_render(run), 0, 'the first render')
+        expect(run.render_doc.is_file() and (run.render / '.state').is_dir(),
+               f'the render writes render/{doc_name()} and render/.state/', first)
+        before = snapshot(run.render)
+        edit_store(run.own_store, {MOVED_TO_DONE: {'status': 'done'}})
+        second = expect_exit(_render(run), 0, f'the render after task {MOVED_TO_DONE} moved to done')
+        expect(snapshot(run.render) == before, 'a render after the store moved a status is byte-identical', second)
+        filed = table_rows(section(run.render_doc.read_text(encoding='utf-8'), '## FILED'))
+        unstreamed = [row['Tasks'] for row in filed if row.get('Stream') == 'unstreamed']
+        expect(len(unstreamed) == 1 and str(KEYLESS_PROGRAM_TASK) in unstreamed[0].replace(',', ' ').split(),
+               f'FILED has an unstreamed row naming task {KEYLESS_PROGRAM_TASK}', second)
+    return f'render/ byte-identical after task {MOVED_TO_DONE} moved to done; {KEYLESS_PROGRAM_TASK} unstreamed'
+
+
+LEDGER_HEADING = '## Ledger'
+
+
+def _expect_published(run: ProgramRun) -> list[str]:
+    published = expect_exit(_render(run, '--publish'), 0, 'program_doc.py --publish')
+    program = read_json(FIXTURE_PROGRAM)
+    paths = [line.strip() for line in published.stdout.splitlines()
+             if line.strip().startswith(f'{program["plans_dir"]}/')]
+    snapshots = [path for path in paths if path != program['doc_path']]
+    expect(len(paths) == 4 and program['doc_path'] in paths
+           and all(Path(path).parent.name.endswith('.state') for path in snapshots),
+           'publish prints the three .state snapshot paths and the doc path', published)
+    for path in paths:
+        counterpart = run.render_doc if path == program['doc_path'] else run.render / '.state' / Path(path).name
+        copy = run.project / path
+        expect(copy.is_file() and copy.read_bytes() == counterpart.read_bytes(),
+               f'{path} is published byte-equal to {counterpart.relative_to(run.home)}', published)
+    return paths
+
+
+def _template_without(heading: str, directory: Path) -> Path:
+    lines = (PROGRAM_DIR / 'program_doc_template.md').read_text(encoding='utf-8').splitlines(keepends=True)
+    scratch = directory / 'template-without-heading.md'
+    scratch.write_text(''.join(line for line in lines if line.rstrip('\n') != heading), encoding='utf-8')
+    return scratch
+
+
+def _expect_heading_self_check(run: ProgramRun) -> None:
+    template = _template_without(LEDGER_HEADING, run.root)
+    before = snapshot(run.render)
+    refused = expect_exit(_render(run, '--template', template), 1,
+                          f'a render dropping the published {LEDGER_HEADING} is refused')
+    expect(LEDGER_HEADING in refused.stderr, f'the refusal names {LEDGER_HEADING}', refused)
+    expect(snapshot(run.render) == before, 'a refused render writes nothing', refused)
+    allowed = expect_exit(_render(run, '--template', template, '--allow-drop', LEDGER_HEADING), 0,
+                          f'--allow-drop {LEDGER_HEADING!r} lets the render drop it')
+    expect(LEDGER_HEADING not in run.render_doc.read_text(encoding='utf-8').splitlines(),
+           f'the allowed render has no {LEDGER_HEADING} heading', allowed)
+
+
+def b6_publish_and_heading_check(walk: Walk) -> str:
+    run = _decomposed_s1(walk.new_run('b6-publish'))
+    paths = _expect_published(run)
+    _expect_heading_self_check(run)
+    return f'published {len(paths)} paths; dropping {LEDGER_HEADING} refused, then allowed by --allow-drop'
+
+
+HANDOFF_HEADINGS = ['## Sources of truth', '## State', '## Inherited duties', '## Remaining work']
+
+
+def _expect_inherited_duties(text: str, handoff: Invocation) -> None:
+    extra = read_json(FIXTURE_DIR / 'record.json')['method']['extra']
+    duties = '\n'.join(section(text, '## Inherited duties'))
+    expect(extra['launched_from'] in duties and all(seat in duties for seat in extra['fable_seats'])
+           and 'launched_from' in duties and 'fable_seats' in duties and '--yes' in duties,
+           "Inherited duties carry the record's launched_from, fable_seats and --yes", handoff)
+
+
+def _expect_remaining_work(run: ProgramRun, text: str, handoff: Invocation) -> None:
+    remaining = section(text, '## Remaining work')
+    (leaf,) = fixture_return('S1.decompose.json')['held']
+    expect(any(line.startswith(f'- held {leaf["task_id"]} ') and f'release owner {leaf["release_owner"]}' in line
+               for line in remaining),
+           f'Remaining work names held leaf {leaf["task_id"]} and its release owner', handoff)
+    ledger = run.ledger()
+    resulted = {line['id'] for line in ledger if line.get('op') == 'action_result'}
+    for action in (line['id'] for line in ledger if line.get('op') == 'action' and line['id'] not in resulted):
+        expect(any(line.startswith(f'- action {action} ') for line in remaining),
+               f'Remaining work names unapplied action {action}', handoff)
+    expect(any(line.split()[:3] == ['-', 'stream', 'S3'] for line in remaining),
+           'Remaining work names stream S3', handoff)
+
+
+def b8_handoff(walk: Walk) -> str:
+    run = _decomposed_s1(walk.new_run('b8-handoff'))
+    run.record_copy()
+    handoff = expect_exit(_render(run, '--handoff'), 0, 'program_doc.py --handoff')
+    text = (run.home / 'HANDOFF.md').read_text(encoding='utf-8')
+    headings = [line for line in text.splitlines() if line.startswith('## ')]
+    expect(headings == HANDOFF_HEADINGS, f'HANDOFF.md has exactly {HANDOFF_HEADINGS}, not {headings}', handoff)
+    _expect_inherited_duties(text, handoff)
+    _expect_remaining_work(run, text, handoff)
+    return 'HANDOFF.md carries the four sections, the inherited duties and the remaining work'
+
+
+def _rule(run: ProgramRun, ruling: str, *extra: str) -> Invocation:
+    return run.run(
+        'record.py', 'rule', '--run', RUN_ID, '--by', 'human', '--question', 'Does alpha or beta own C1?',
+        '--ruling', ruling, '--source', 'fixture walk', '--option', 'a', '--option', 'b',
+        '--consequence', 'c', *extra,
+    )
+
+
+def b12_rulings(walk: Walk) -> str:
+    run = walk.new_run('b12-rulings')
+    run.init()
+    first = expect_exit(_rule(run, 'alpha owns C1'), 0, 'record.py rule records a ruling')
+    expect('ruling D1' in first.stdout, 'the first human ruling is D1', first)
+    rulings = run.home / 'rulings.jsonl'
+    d1_line = rulings.read_bytes().splitlines()[0]
+    second = expect_exit(_rule(run, 'beta owns C1', '--supersedes', 'D1'), 0, 'record.py rule --supersedes D1')
+    expect('ruling D2' in second.stdout, 'the superseding ruling is D2', second)
+    expect(rulings.read_bytes().splitlines()[0] == d1_line, "D1's line in rulings.jsonl is unchanged", second)
+    decisions = section(_rendered_text(run), '## Resolved decisions')
+    d2 = [line for line in decisions if line.startswith('- D2 ')]
+    expect(len(d2) == 1 and 'supersedes D1' in d2[0], 'Resolved decisions shows D2 naming D1 as superseded', second)
+    expect(not [line for line in decisions if line.startswith('- D1 ')], 'Resolved decisions shows no D1 entry', second)
+    return 'D2 supersedes D1; D1 line unchanged; only D2 rendered'
+
+
 SCENARIOS = (
     Scenario('B1', 'init', b1_init),
     Scenario('B2', 'author return applied', b2_author_applied),
     Scenario('B3', 'decompose return rejected, both classes', b3_decompose_rejected),
     Scenario('B4', 'decompose return applied', b4_decompose_applied),
+    Scenario('B5', 'render', b5_render),
+    Scenario('B6', 'heading self-check and publish', b6_publish_and_heading_check),
+    Scenario('B8', 'handoff', b8_handoff),
+    Scenario('B12', 'rulings', b12_rulings),
 )
 
 
