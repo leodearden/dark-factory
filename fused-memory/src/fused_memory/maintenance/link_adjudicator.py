@@ -438,13 +438,17 @@ def _shard_reply(result: AgentResult) -> ShardReply:
 
 
 class LinkAdjudicator(Protocol):
-    """Judges pairs, naming the model and the prompt version its verdicts come from."""
+    """Judges pairs, naming the model and the prompt version its verdicts come from, and the
+    invocations-ledger run its calls are written under, or None when they are written nowhere."""
 
     @property
     def model(self) -> str: ...
 
     @property
     def prompt_sha256(self) -> str: ...
+
+    @property
+    def invocation_run_id(self) -> str | None: ...
 
     async def __call__(
         self, pairs: Sequence[LinkPair], *, on_failure_storm: StormHook | None = None,
@@ -461,6 +465,7 @@ class ConfiguredAdjudicator:
     field_chars: int
     failure_streak: int
     ask: ShardAsker
+    invocation_run_id: str | None = None
 
     async def __call__(
         self, pairs: Sequence[LinkPair], *, on_failure_storm: StormHook | None = None,
@@ -489,14 +494,21 @@ def configured_adjudicator(
 
     *brief_text* defaults to the brief at *brief_path*, read once here; *ask*
     defaults to a :class:`ClaudeShardAsker` over that same text, calling the CLI
-    through *invoke* and writing each call's row to *ledger* (unused with *ask*).
+    through *invoke* and writing each call's row to *ledger*, whose ``run_id`` the
+    adjudicator then names as its ``invocation_run_id`` (*ledger* is unused with *ask*).
     """
     brief = brief_path.read_text(encoding='utf-8') if brief_text is None else brief_text
+    if ask is None:
+        ask = ClaudeShardAsker(brief_text=brief, invoke=invoke, ledger=ledger)
+        invocation_run_id = None if ledger is None else ledger.run_id
+    else:
+        invocation_run_id = None
     return ConfiguredAdjudicator(
         model=config.adjudicator_model,
         prompt_sha256=prompt_sha256(brief, config.field_chars),
         shard_size=config.shard_size,
         field_chars=config.field_chars,
         failure_streak=config.shard_failure_streak,
-        ask=ClaudeShardAsker(brief_text=brief, invoke=invoke, ledger=ledger) if ask is None else ask,
+        ask=ask,
+        invocation_run_id=invocation_run_id,
     )
