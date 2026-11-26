@@ -1067,7 +1067,9 @@ token (`migration`, `architecture`, `integration test`, `design ... new`,
 **Hard escape:** `metadata.force_full_path = true` always forces the full
 architect path regardless of `complexity`.
 
-**Curator complexity hint:** on every curated `create` the curator stamps
+**Curator complexity hint:** not on main yet; task 8376 adds it, and this
+paragraph describes that task's specification. Once it lands, on every curated
+`create` the curator stamps
 `metadata.x_curator_complexity_hint` (`"simple"` or null) from the criteria
 above. On the treated arm of experiment `routing-exp-2` it also applies
 `metadata.complexity = "simple"` when the hint is `simple` and the task names

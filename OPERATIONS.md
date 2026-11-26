@@ -3091,7 +3091,8 @@ automatically on main:
   `orchestrator/src/orchestrator/digest.py::model_role_rollup` aggregates
   invocation count, done, blocked and cap-hit rates, cost and cost-per-done
   for each (model, role) cell, plus per-role turn-cap saturation. The digest
-  renders it and the dashboard serves it at `/costs/by_model_role`.
+  renders it, and the dashboard serves it as the `by_model_role` block of
+  `GET /api/v2/dashboard/costs`, drawn on the overview tab.
 
 **What the rollup does and does not attribute.** It counts per invocation: one
 row per invocation, joined to its run's `task_results` outcome, so a task's
@@ -3101,11 +3102,12 @@ a cell holding mostly large plans reads worse than one holding small ones
 regardless of the model. Read it as a descriptive cost and outcome table, not
 as a causal comparison of models.
 
-The `split` condition (see the condition table above) and the readout script
-`scripts/routing_experiment_readout.py` are the experiment substrate: the
-split assigns tasks to arms deterministically, and the readout computes
-per-task, per-arm metrics (with the plan-size covariates the rollup lacks)
-across every project ledger. Compare arms with the readout, not the rollup.
+The `split` condition (see the condition table above) is the experiment
+substrate on main: it assigns tasks to arms deterministically. Its reader,
+`scripts/routing_experiment_readout.py`, is not on main yet; task 8374 adds
+it. That script computes per-task, per-arm metrics (with the plan-size
+covariates the rollup lacks) across every project ledger. Once it lands,
+compare arms with the readout, not the rollup.
 
 ---
 
