@@ -12,10 +12,9 @@ from typing import Any
 
 import pytest
 from cli_subprocess_timeout import cli_timeout_from_env
-from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
-
 from orchestrator.agents.landlock import SYS_landlock_create_ruleset
 from orchestrator.agents.landlock_exec import LANDLOCK_CREATE_RULESET_VERSION
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
