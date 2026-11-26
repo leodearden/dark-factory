@@ -5,6 +5,7 @@ import errno
 import socket
 
 import pytest
+
 from shared.testing_sockets import refused_port
 
 
@@ -20,7 +21,7 @@ def _dual_stack_rival() -> socket.socket:
 
 def test_a_connect_to_a_held_refused_port_is_refused():
     with refused_port() as port, pytest.raises(ConnectionRefusedError):
-        socket.create_connection(('127.0.0.1', port), timeout=5)
+        socket.create_connection(('127.0.0.1', port))
 
 
 @pytest.mark.parametrize(
