@@ -534,6 +534,70 @@ class TestPostMergeVerify:
         assert verifier.verified == ['vd-1']
 
 
+def _recorded_per_call(dispatcher: VerifyDispatcher) -> list[dict[str, Any]]:
+    """Each post_merge_verify call's per-call keywords, recorded on the way into the real one."""
+    calls: list[dict[str, Any]] = []
+    real = dispatcher.post_merge_verify
+
+    def recording(git_ops: GitOps, req: MergeRequest, merge_wt: Path, **per_call: Any) -> Any:
+        calls.append(per_call)
+        return real(git_ops, req, merge_wt, **per_call)
+
+    dispatcher.post_merge_verify = recording  # type: ignore[method-assign]
+    return calls
+
+
+@pytest.mark.asyncio
+class TestNarrowGateBase:
+    """Task 5411: an in-flight verify offers the narrow gate its item's frozen merge-time base."""
+
+    async def test_a_local_verify_offers_the_items_base(self, scene: _Scene) -> None:
+        dispatcher = scene.dispatcher(FakeVerifier(passes()))
+        calls = _recorded_per_call(dispatcher)
+        item = await scene.merged_item()
+
+        await _verify(dispatcher, item, _local_lease())
+
+        assert [call['narrow_gate_base'] for call in calls] == [item.base_sha]
+
+    async def test_a_remote_verify_offers_the_items_base(self, scene: _Scene) -> None:
+        dispatcher = scene.dispatcher(FakeVerifier(passes()))
+        calls = _recorded_per_call(dispatcher)
+        item = await scene.merged_item()
+        lease = HostLease(name='laptop', runner=cast(Any, FakeRemoteRunner('laptop')), is_local=False)
+
+        await _verify(dispatcher, item, lease)
+
+        assert [call['narrow_gate_base'] for call in calls] == [item.base_sha]
+
+    async def test_a_probe_base_relabels_attribution_but_not_the_gate_base(self, scene: _Scene) -> None:
+        dispatcher = scene.dispatcher(FakeVerifier(passes()))
+        calls = _recorded_per_call(dispatcher)
+        item = await scene.merged_item()
+        probe_base = 'e' * 40
+
+        await asyncio.wait_for(
+            dispatcher.run_inflight_verify(item, _local_lease(), probe_base=probe_base), timeout=30.0,
+        )
+
+        [call] = calls
+        assert (call['narrow_gate_base'], call['main_sha']) == (item.base_sha, probe_base)
+
+    async def test_a_gate_history_leg_offers_no_base(self, scene: _Scene) -> None:
+        dispatcher = scene.dispatcher(FakeVerifier(passes()))
+        calls = _recorded_per_call(dispatcher)
+        item = await scene.merged_item()
+
+        await dispatcher.gate_history_leg(
+            scene.git_ops, item.request, item.merge_wt,
+            timeouts={}, enospc_retries={}, max_timeouts=3, max_enospc=1,
+            merge_sha=item.merge_result.merge_commit,
+        )
+
+        [call] = calls
+        assert 'narrow_gate_base' not in call
+
+
 async def _launched(entry: InflightEntry | NoHost) -> InflightEntry:
     assert isinstance(entry, InflightEntry) and entry.verify_task is not None, entry
     await asyncio.wait_for(entry.verify_task, timeout=30.0)
