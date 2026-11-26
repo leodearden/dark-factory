@@ -114,6 +114,7 @@ from fused_memory.middleware.done_provenance import (
 from fused_memory.middleware.followup_hold import (
     HOLDER_GATE_KEYS,
     HOLDER_MINT_SOURCE,
+    DuplicateFollowupHolderError,
     FollowupHolders,
     HoldEmit,
     HolderEdgeStripRefusedError,
@@ -121,7 +122,7 @@ from fused_memory.middleware.followup_hold import (
     PromotionDeferredError,
     backfill,
     carry_hold_record,
-    hold_at_create,
+    hold_birth,
     hold_scope,
     is_holder,
     judge_update,
@@ -4403,6 +4404,11 @@ class TaskInterceptor:
         transitions can defensively skip these tasks, and the ``planning``
         deferral record attributed to the submitter.
 
+        A birth the hold rule matches is born deferred AND held behind the
+        follow-up holder, and journals ``followup_held``. Since every planning
+        birth carries ``human_decomposed``, only a marked finding-set member
+        matches (plans/follow-up-filing-shape-prd.md §3 decision 9).
+
         Returns ``{'task_id', 'status', 'planning_mode'}`` synchronously.
         """
         normalized_metadata: dict[str, Any]
@@ -4434,7 +4440,7 @@ class TaskInterceptor:
             stamped_by=attribution.agent_id, now=datetime.now(UTC),
         )
         try:
-            metadata_json = json.dumps(normalized_metadata)
+            json.dumps(normalized_metadata)
         except (TypeError, ValueError) as exc:
             return {
                 'error': f'submit_task[planning_mode]: metadata not JSON-serialisable: {exc}',
@@ -4445,11 +4451,17 @@ class TaskInterceptor:
         task_id_str: str | None = None
         async with self._write_lock(project_id):
             try:
+                held_kwargs, held_metadata, birth_holder = await hold_birth(
+                    tm, project_root, self._followup_holders, kwargs, normalized_metadata,
+                )
+            except DuplicateFollowupHolderError as exc:
+                return {'error': str(exc), 'error_type': type(exc).__name__}
+            try:
                 add_result = await tm.add_task(
                     project_root=project_root,
-                    metadata=metadata_json,
+                    metadata=json.dumps(held_metadata),
                     status='deferred',
-                    **kwargs,
+                    **held_kwargs,
                 )
             except DuplicateCandidateKeyError as exc:
                 # The partial UNIQUE index rejected this insert — resolve as
@@ -4485,6 +4497,11 @@ class TaskInterceptor:
             {'operation': 'add_task', 'task_id': task_id_str, 'planning_mode': True},
         )
         await self._journal(event)
+        if birth_holder is not None:
+            await self._journal(self._make_event(
+                EventType.followup_held, project_root,
+                {'task_id': task_id_str, 'holder_id': str(birth_holder)},
+            ))
         await self._journal_creation_outcome(
             project_root=project_root,
             status=TicketStatus.CREATED,
@@ -5116,12 +5133,9 @@ class TaskInterceptor:
         tm = await self._ensure_taskmaster()
 
         async with self._write_lock(project_id):
-            birth_holder: int | None = None
-            if hold_scope(metadata, kwargs.get('priority')):
-                birth_holder = await self._followup_holders.ensure_holder(tm, project_root)
-                kwargs, metadata = hold_at_create(
-                    kwargs, metadata, birth_holder, held_at=datetime.now(UTC).isoformat(),
-                )
+            kwargs, metadata, birth_holder = await hold_birth(
+                tm, project_root, self._followup_holders, kwargs, metadata,
+            )
             metadata_json: str | None = None
             if metadata:
                 metadata_json = metadata if isinstance(metadata, str) else json.dumps(metadata)

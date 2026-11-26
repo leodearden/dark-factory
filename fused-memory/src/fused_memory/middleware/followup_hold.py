@@ -68,6 +68,7 @@ __all__ = [
     'held_by',
     'held_count',
     'hold_at_create',
+    'hold_birth',
     'hold_scope',
     'is_holder',
     'judge_update',
@@ -168,6 +169,28 @@ def hold_at_create(
     }
     held_kwargs = {**kwargs, 'dependencies': _with_holder_edge(kwargs.get('dependencies'), holder_id)}
     return held_kwargs, held_metadata
+
+
+async def hold_birth(
+    tm: TaskBackendProtocol,
+    project_root: str,
+    holders: FollowupHolders,
+    kwargs: Mapping[str, object],
+    metadata: object,
+) -> tuple[dict[str, Any], object, int | None]:
+    """Decision 9 at either creation path: the ``add_task`` arguments, metadata and holder of a birth.
+
+    A birth the hold rule matches is held behind the project's holder, minted on first need; any
+    other comes back unchanged with no holder. The caller holds the project's write lock, as
+    :meth:`FollowupHolders.ensure_holder` requires.
+    """
+    if not hold_scope(metadata, kwargs.get('priority')):
+        return dict(kwargs), metadata, None
+    holder_id = await holders.ensure_holder(tm, project_root)
+    held_kwargs, held_metadata = hold_at_create(
+        kwargs, metadata, holder_id, held_at=datetime.now(UTC).isoformat(),
+    )
+    return held_kwargs, held_metadata, holder_id
 
 
 def held_by(task: Mapping[str, object]) -> int | None:
