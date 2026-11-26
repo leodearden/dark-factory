@@ -1,9 +1,10 @@
-"""The task id a test must use to land in a routing rule's split arm.
+"""The task id a test must use to land in a split bucket, or in a routing
+rule's split arm.
 
-Read off the loaded config, so the experiment salt and bucket have one home
-(``orchestrator/src/orchestrator/defaults.yaml``) and a test agrees with the
-resolver by construction (both go through
-``shared/src/shared/routing_split.py::split_bucket``).
+Both go through ``shared/src/shared/routing_split.py::split_bucket``, so a test
+agrees with the resolver by construction. The rule-level helper reads the split
+off the loaded config, so the experiment salt and bucket have one home
+(``orchestrator/src/orchestrator/defaults.yaml``).
 """
 
 from __future__ import annotations
@@ -15,6 +16,15 @@ from orchestrator.config import OrchestratorConfig
 _CANDIDATE_TASK_IDS = range(1, 1001)
 
 
+def task_id_in_bucket(salt: str, buckets: int, bucket: int) -> str:
+    for i in _CANDIDATE_TASK_IDS:
+        if split_bucket(salt, str(i), buckets) == bucket:
+            return str(i)
+    raise LookupError(
+        f'no task id in {_CANDIDATE_TASK_IDS} falls in bucket {bucket} of salt {salt!r}'
+    )
+
+
 def task_id_in_rule_arm(cfg: OrchestratorConfig, rule_id: str) -> str:
     rule = next((r for r in cfg.routing.rules if r.id == rule_id), None)
     if rule is None:
@@ -23,9 +33,4 @@ def task_id_in_rule_arm(cfg: OrchestratorConfig, rule_id: str) -> str:
     split = rule.match.split
     if split is None:
         return '1'
-    for i in _CANDIDATE_TASK_IDS:
-        if split_bucket(split.salt, str(i), split.buckets) == split.bucket:
-            return str(i)
-    raise LookupError(
-        f'no task id in {_CANDIDATE_TASK_IDS} falls in arm {split.bucket} of rule {rule_id!r}'
-    )
+    return task_id_in_bucket(split.salt, split.buckets, split.bucket)
